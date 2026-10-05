@@ -1,0 +1,107 @@
+;; compiler/tests/fibref/heaptk.fib: the toolkit of the heap unit programs (heap-*.fib): a test is a function returning "" (it held) or the text of the
+;; first check that failed; a suite runs a table of tests, prints each failure and the counts, and returns the number of failures (the program's exit
+;; status is that number capped at 100, so a failing suite fails the script). Port of the helpers of crates/fibref/src/heap/tests/mod.rs.
+(ns heaptk
+  (:use fibref.value fibref.heap fibref.heap.state fibref.trace))
+
+(defstruct Tc (name: str run: (fn () str)))
+
+;; ---- checks ----
+(defun ck (what: str ok: bool) -> str (if ok "" what))
+
+;; The first failed check of a list, "" if none.
+(defun all (xs: (Vec str)) -> str
+  (loop [i 0]
+    (cond (>= i (count xs)) ""
+          (not= (nth xs i) "") (nth xs i)
+          :else (recur (+ i 1)))))
+
+;; The value of an Ok; an Err stops the test program with the error's text (the Rust `.expect(..)`).
+(defun ok! (r: (Result a HpErr)) -> a
+  (match r
+    ((Ok v) v)
+    ((Err e) (trap (str "unexpected audit error: " (hp-err-text e))))))
+
+;; "ok" for an Ok, the error's text for an Err: what a test compares with `(= (res r) "...")`.
+(defun res (r: (Result a HpErr)) -> str
+  (match r
+    ((Ok _) "ok")
+    ((Err e) (hp-err-text e))))
+
+;; A check that `r` failed with exactly this error text.
+(defun is-err (what: str r: (Result a HpErr) text: str) -> str
+  (let [got (res r)]
+    (if (= got text) "" (str what ": expected [" text "], got [" got "]"))))
+
+(defun is-ok (what: str r: (Result a HpErr)) -> str
+  (let [got (res r)]
+    (if (= got "ok") "" (str what ": expected ok, got [" got "]"))))
+
+(defun is-int (what: str r: (Result i64 HpErr) want: i64) -> str
+  (match r
+    ((Ok v) (if (= v want) "" (str what ": expected " want ", got " v)))
+    ((Err e) (str what ": expected " want ", got error [" (hp-err-text e) "]"))))
+
+(defun is-val (what: str r: (Result IVal HpErr) want: IVal) -> str
+  (match r
+    ((Ok v) (if (ival-eq v want) "" (str what ": value differs from the expected one")))
+    ((Err e) (str what ": expected a value, got error [" (hp-err-text e) "]"))))
+
+(defun is-bool (what: str r: (Result bool HpErr) want: bool) -> str
+  (match r
+    ((Ok v) (if (= v want) "" (str what ": expected " want ", got " v)))
+    ((Err e) (str what ": expected " want ", got error [" (hp-err-text e) "]"))))
+
+;; ---- building heaps ----
+(defun obj (id: i64) -> IVal (IObj id))
+(defun i (n: i64) -> IVal (IInt n 64))
+(defun imm (h: Heap fields: (Vec IVal)) -> i64 (ok! (heap-alloc h IImmutable 0 fields)))
+(defun cell-of (h: Heap v: IVal) -> i64 (ok! (heap-alloc h ICell 0 [v])))
+(defun atom-of (h: Heap v: IVal) -> i64 (ok! (heap-alloc h IAtom 0 [v])))
+(defun lit (h: Heap fields: (Vec IVal)) -> i64 (ok! (heap-alloc-immortal h IImmutable 0 fields)))
+(defun stk (h: Heap s: i64 kind: IKind fields: (Vec IVal)) -> i64 (ok! (heap-alloc-in-scope h s kind 0 fields)))
+(defun rel (h: Heap id: i64) -> unit (do (ok! (heap-release h id)) ()))
+(defun ret (h: Heap id: i64) -> unit (do (ok! (heap-retain h id)) ()))
+(defun wr (h: Heap id: i64 f: i64 v: IVal) -> unit (do (ok! (heap-write h id f v)) ()))
+
+;; Counts, field and event views.
+(defun cnt (h: Heap id: i64) -> i64 (ok! (heap-count h id)))
+(defun rd (h: Heap id: i64 f: i64) -> IVal (ok! (heap-read h id f)))
+(defun nev (h: Heap) -> i64 (count @(. h log)))
+(defun evs (h: Heap) -> str (str-join (mapv (fn (e: HpEvent) (str-concat (event-text e) ";")) @(. h log))))
+(defun n-frees (h: Heap) -> i64 (count (filter (fn (e: HpEvent) (match e ((EvFree _) true) (_ false))) @(. h log))))
+;; The events from index `from` on, as one text: "release #3 -> 0;free #3;".
+(defun evs-from (h: Heap from: i64) -> str
+  (let [log @(. h log)]
+    (str-join (mapv (fn (i: i64) (str-concat (event-text (nth log i)) ";")) (range from (count log))))))
+;; The Rust test helper `forge_field`: overwrites a field behind the audit's back, to build a state the heap would refuse.
+(defun forge (h: Heap id: i64 f: i64 v: IVal) -> unit (hp-set-field h id f v))
+
+(defun is-up (what: str r: (Result (Option i64) HpErr) want: i64) -> str
+  (match r
+    ((Ok (some v)) (if (= v want) "" (str what ": upgraded to #" v ", expected #" want)))
+    ((Ok nil) (if (< want 0) "" (str what ": upgrade gave nothing, expected #" want)))
+    ((Err e) (str what ": error [" (hp-err-text e) "]"))))
+
+;; ---- reports ----
+(defun clean? (h: Heap) -> bool (report-clean? (heap-finish h)))
+
+(defun ids-text (ids: (Vec i64)) -> str (str-join (mapv (fn (i: i64) (str "#" i " ")) ids)))
+
+(defun leak-ids (r: HpReport c: HpLeakClass) -> str (ids-text (report-ids-in r c)))
+
+;; ---- running ----
+(defun tc (name: str run: (fn () str)) -> Tc (Tc name run))
+
+(defun run-one (t: Tc) -> bool
+  (let [f (. t run)
+        msg (f)]
+    (if (= msg "")
+        true
+        (do (println (str "FAIL " (. t name) ": " msg)) false))))
+
+;; Runs every test; prints the failures and one summary line; returns the number of failures.
+(defun run-suite (suite: str tests: (Vec Tc)) -> i64
+  (let [failed (count (filter (fn (t: Tc) (not (run-one t))) tests))]
+    (do (println (str suite ": " (count tests) " tests, " failed " failed"))
+        failed)))

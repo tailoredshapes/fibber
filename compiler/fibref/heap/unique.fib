@@ -1,0 +1,58 @@
+;; compiler/fibref/heap/unique.fib: unique writes (types section 6.6, 8.2). OWNER: package F1. Rust: heap/unique.rs.
+;; `set-field!` and `array-set!` write an Immutable object in place when `fib.unique?` holds, and otherwise copy. The copy is the interpreter's business;
+;; the heap checks that an in-place write happens only under the test. The primitive is given the PLACE, the cell whose content it updates, not the
+;; object: that is what makes the audit's cycle rule hold (a unique write closes a cycle only through a cell). The one path the count cannot see is the
+;; value being the object itself (the caller holds it, so its count is at least 2): refused as StoresItself.
+(ns fibref.heap.unique
+  (:use fibref.value fibref.heap.types fibref.heap.state fibref.heap.store fibref.heap.access))
+
+;; Why `fib.unique?` is false on `id`, testing the flags before the count as section 8.2 does, or nil if it is true (unique.rs not_unique).
+(defun hp-not-unique (h: Heap id: i64) -> (Option HpWhy)
+  (cond (hp-shared? h id) (some HpShared)
+        (hp-immortal? h id) (some HpImmortal)
+        (hp-stack? h id) (some HpStackData)
+        (hp-flag? h id fl-hasweak) (some HpHasWeak)
+        (not= (hp-count-of h id) 1) (some (HpCount (hp-count-of h id)))
+        :else nil))
+
+;; `fib.unique?` on a live object: none of SHARED, IMMORTAL, STACK, HAS-WEAK, and a count of exactly 1.
+(defun heap-is-unique (h: Heap id: i64) -> (Result bool HpErr)
+  (match (hp-live-object h id HpInspect)
+    ((Err e) (Err e))
+    ((Ok _) (Ok (match (hp-not-unique h id) ((some _) false) (nil true))))))
+
+;; The object a Cell `place` holds, if it is a live Immutable object on which `fib.unique?` holds (unique.rs unique_content). `why` is reported for the
+;; first failing test.
+(defun hp-unique-content (h: Heap place: i64) -> (Result i64 HpErr)
+  (match (hp-live-object h place HpWrite)
+    ((Err e) (Err e))
+    ((Ok _)
+     (cond (not= (kind-code (hp-kind-of h place)) 1) (Err (HeNotUnique place HpPlaceNotCell))
+           :else (match (nth (hp-fields-of h place) 0)
+                   ((IObj id) (hp-unique-object h id))
+                   ((ITaken) (Err (HeTakenSlot place 0)))
+                   (_ (Err (HeNotUnique place HpContentNotImmutable))))))))
+
+(defun hp-unique-object (h: Heap id: i64) -> (Result i64 HpErr)
+  (match (hp-live-object h id HpWrite)
+    ((Err e) (Err e))
+    ((Ok _)
+     (cond (not= (kind-code (hp-kind-of h id)) 0) (Err (HeNotUnique id HpContentNotImmutable))
+           :else (match (hp-not-unique h id)
+                   ((some why) (Err (HeNotUnique id why)))
+                   (nil (Ok id)))))))
+
+;; Writes field `field` of the Immutable object held by the cell `place`, in place. Legal iff `place` is a live Cell holding a Ref to a live Immutable
+;; object that is unique, `v` is not a Ref to that object, and `v` may be stored into a heap object. Returns the object written. Events: Retain of the
+;; new value, WriteUnique, then the release events of the old value.
+(defun heap-write-unique (h: Heap place: i64 field: i64 v: IVal) -> (Result i64 HpErr)
+  (match (hp-unique-content h place)
+    ((Err e) (Err e))
+    ((Ok id)
+     (cond (not (hp-field-in-range? h id field)) (Err (HeBadField id field))
+           (= (ival-obj v) (some id)) (Err (HeNotUnique id HpStoresItself))
+           :else (match (hp-check-storable h v holder-heap)
+                   ((Err e) (Err e))
+                   ((Ok _) (match (hp-store-field h id field v false (EvWriteUnique place id field))
+                             ((Err e) (Err e))
+                             ((Ok _) (Ok id)))))))))

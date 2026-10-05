@@ -1,0 +1,107 @@
+;; compiler/fibref/heap/cascade.fib: release cascades (spec/ownership.md section 2). OWNER: package F1. Rust: heap/cascade.rs.
+;; An object whose count reaches zero is freed and releases every Ref it holds, which may free more. A cascade is PLANNED before it is applied: the plan
+;; walks the objects in exactly the order the cascade will release them and fails, having changed nothing, if the cascade would release an object that is
+;; already freed (a Ref left dangling by an earlier over-release, or an object the cascade freed and reaches again). So a failing release, and a write
+;; whose old value's release would fail, leave the heap as it was. Both walks use an explicit worklist, never recursion.
+(ns fibref.heap.cascade
+  (:use fibref.value fibref.heap.types fibref.heap.state))
+
+;; A write that is decided but not yet done: the plan reads the heap as if the slot held `value` and `value`'s target counted one more.
+(defstruct HpPending (id: i64 field: i64 value: IVal))
+;; A cascade being planned: the counts as the plan has left them, and the release order so far.
+(defstruct HpPlan (counts: (Map i64 i64) order: (Vec i64)))
+(defstruct HpVisit (plan: HpPlan push: (Vec i64)))
+
+(defun hp-vec-rev (v: (Vec i64)) -> (Vec i64)
+  (loop [i (- (count v) 1) acc (vec-empty)]
+    (if (< i 0) acc (recur (- i 1) (conj acc (nth v i))))))
+
+;; The counted Refs in `id`'s fields as the cascade will see them, in REVERSE so that a worklist pops them in field order (cascade.rs held_refs_reversed).
+(defun hp-held-refs-rev (h: Heap id: i64 pending: (Option HpPending)) -> (Vec i64)
+  (let [fs (hp-fields-of h id)]
+    (loop [i (- (count fs) 1) acc (vec-empty)]
+      (if (< i 0)
+          acc
+          (let [v (match pending
+                    ((some p) (if (and (= (. p id) id) (= (. p field) i)) (. p value) (nth fs i)))
+                    (nil (nth fs i)))]
+            (match (hp-counted-target h v)
+              ((some t) (recur (- i 1) (conj acc t)))
+              (nil (recur (- i 1) acc))))))))
+
+;; One release of `id` in the plan: ReleaseOfFreed if it is freed or the plan has taken its count to zero; at zero, its held Refs are pushed.
+(defun hp-plan-visit (h: Heap plan: HpPlan id: i64 pending: (Option HpPending)) -> (Result HpVisit HpErr)
+  (if (not (hp-known? h id))
+      (Err (HeUnknownId id))
+      (let [c (match (get (. plan counts) id) ((some n) n) (nil (hp-count-of h id)))]
+        (if (or (not (hp-live? h id)) (= c 0))
+            (Err (HeReleaseOfFreed id))
+            (let [c2 (- c 1)
+                  p2 (HpPlan (assoc (. plan counts) id c2) (conj (. plan order) id))]
+              (Ok (HpVisit p2 (if (= c2 0) (hp-held-refs-rev h id pending) (vec-empty)))))))))
+
+;; Plans releasing each of `roots` once, in order, each with its whole cascade before the next.
+(defun hp-plan-into (h: Heap plan: HpPlan roots: (Vec i64) pending: (Option HpPending)) -> (Result HpPlan HpErr)
+  (loop [p plan work (hp-vec-rev roots)]
+    (if (= (count work) 0)
+        (Ok p)
+        (let [id (nth work (- (count work) 1))
+              rest (pop work)]
+          (match (hp-plan-visit h p id pending)
+            ((Err e) (Err e))
+            ((Ok r) (recur (. r plan) (into rest (. r push)))))))))
+
+(defun hp-plan-start (h: Heap pending: (Option HpPending)) -> HpPlan
+  (match pending
+    ((some p) (match (hp-counted-target h (. p value))
+                ((some t) (HpPlan {t (+ (hp-count-of h t) 1)} (vec-empty)))
+                (nil (HpPlan {} (vec-empty)))))
+    (nil (HpPlan {} (vec-empty)))))
+
+;; The order in which releasing `root` once would release objects, depth first in field order, or the error the cascade would hit. `root` must be a
+;; counted object (cascade.rs plan_release).
+(defun hp-plan-release (h: Heap root: i64 pending: (Option HpPending)) -> (Result (Vec i64) HpErr)
+  (match (hp-plan-into h (hp-plan-start h pending) [root] pending)
+    ((Err e) (Err e))
+    ((Ok p) (Ok (. p order)))))
+
+;; The counted Refs an object holds, in field order (the roots of its drop).
+(defun hp-held-refs (h: Heap id: i64) -> (Vec i64)
+  (let [fs (hp-fields-of h id)]
+    (loop [i 0 acc (vec-empty)]
+      (if (>= i (count fs))
+          acc
+          (match (hp-counted-target h (nth fs i))
+            ((some t) (recur (+ i 1) (conj acc t)))
+            (nil (recur (+ i 1) acc)))))))
+
+;; The release cascades of the drops of `dropped`, run one after another: for each object, the releases of the counted Refs it holds, in field order.
+;; Planned as one cascade, so a later drop sees the counts the earlier ones left and the whole end of a scope fails, having changed nothing, if any part
+;; would release a freed object (cascade.rs plan_drops).
+(defun hp-plan-drops (h: Heap dropped: (Vec i64)) -> (Result (Vec (Vec i64)) HpErr)
+  (loop [i 0 plan (HpPlan {} (vec-empty)) segs (vec-empty)]
+    (if (>= i (count dropped))
+        (Ok segs)
+        (let [start (count (. plan order))]
+          (match (hp-plan-into h plan (hp-held-refs h (nth dropped i)) nil)
+            ((Err e) (Err e))
+            ((Ok p2) (recur (+ i 1) p2 (conj segs (subvec-of (. p2 order) start)))))))))
+
+(defun subvec-of (v: (Vec i64) start: i64) -> (Vec i64)
+  (loop [i start acc (vec-empty)]
+    (if (>= i (count v)) acc (recur (+ i 1) (conj acc (nth v i))))))
+
+;; Applies a plan from `hp-plan-release`: count -= 1 on each object in order, freeing it at zero. Events: Release, then Free when the count reached zero.
+;; The plan checked that every object is live with a count above zero when its turn comes (cascade.rs apply_release).
+(defun hp-apply-release (h: Heap order: (Vec i64)) -> unit
+  (loop [i 0]
+    (if (>= i (count order))
+        ()
+        (let [id (nth order i)
+              n (- (hp-count-of h id) 1)]
+          (do (hp-set-count h id n)
+              (hp-emit h (EvRelease id n))
+              (if (= n 0)
+                  (do (hp-free-slot h id) (hp-emit h (EvFree id)))
+                  ())
+              (recur (+ i 1)))))))

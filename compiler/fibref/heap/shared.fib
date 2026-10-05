@@ -1,0 +1,71 @@
+;; compiler/fibref/heap/shared.fib: thread crossing (types section 7): marking an object and everything reachable from it as shared. OWNER: package F1.
+;; Rust: heap/shared.rs.
+(ns fibref.heap.shared
+  (:use fibref.value fibref.heap.types fibref.heap.state))
+
+;; The live object a field value lets another thread reach: the target of a Ref, or of a Weak whose target is still live (the other thread could
+;; upgrade it). `mark-shared` and a write into a shared atom decide crossing with this one function (shared.rs crossing_target).
+(defun hp-crossing-target (h: Heap v: IVal) -> (Option i64)
+  (match (ival-obj v)
+    ((some id) (some id))
+    (nil (match (ival-weak v)
+           ((some id) (if (hp-live? h id) (some id) nil))
+           (nil nil)))))
+
+;; The fields of `id` pushed on the DFS stack in reverse (so the first is searched first); UseAfterFree for the first Ref field whose target is freed.
+(defun hp-share-push (h: Heap id: i64 stack: (Vec i64)) -> (Result (Vec i64) HpErr)
+  (let [fs (hp-fields-of h id)]
+    (loop [i (- (count fs) 1) st stack]
+      (if (< i 0)
+          (Ok st)
+          (let [v (nth fs i)
+                ok (match (ival-obj v)
+                     ((some t) (hp-live-object h t HpShare))
+                     (nil (Ok ())))]
+            (match ok
+              ((Err e) (Err e))
+              ((Ok _) (match (hp-crossing-target h v)
+                        ((some t) (recur (- i 1) (conj st t)))
+                        (nil (recur (- i 1) st))))))))))
+
+;; Every live object reachable from `root` (included), in the order a depth-first search reaches them, or UseAfterFree for the first Ref field met
+;; whose target is freed, or SharedStack for the first stack object reached. Immortal objects are neither included nor searched through.
+(defun hp-reachable (h: Heap root: i64) -> (Result (Vec i64) HpErr)
+  (loop [seen #{} order (vec-empty) stack [root]]
+    (if (= (count stack) 0)
+        (Ok order)
+        (let [id (nth stack (- (count stack) 1))
+              rest (pop stack)]
+          (cond (or (hp-immortal? h id) (contains? seen id)) (recur seen order rest)
+                (hp-stack? h id) (Err (HeSharedStack id))
+                :else (match (hp-share-push h id rest)
+                        ((Err e) (Err e))
+                        ((Ok st) (recur (conj seen id) (conj order id) st))))))))
+
+(defun hp-first-cell (h: Heap ids: (Vec i64)) -> (Option i64)
+  (loop [i 0]
+    (cond (>= i (count ids)) nil
+          (= (kind-code (hp-kind-of h (nth ids i))) 1) (some (nth ids i))
+          :else (recur (+ i 1)))))
+
+;; `mark-shared` on an object known to be live: SharedCell if a Cell is reachable (nothing is marked); one Shared event per object newly marked.
+(defun hp-share-from (h: Heap root: i64) -> (Result unit HpErr)
+  (match (hp-reachable h root)
+    ((Err e) (Err e))
+    ((Ok reached)
+     (match (hp-first-cell h reached)
+       ((some c) (Err (HeSharedCell c)))
+       (nil (do (loop [i 0]
+                  (if (>= i (count reached))
+                      ()
+                      (let [id (nth reached i)]
+                        (do (if (hp-shared? h id)
+                                ()
+                                (do (hp-set-flag h id fl-shared) (hp-emit h (EvShared id))))
+                            (recur (+ i 1))))))
+                (Ok ())))))))
+
+(defun heap-mark-shared (h: Heap id: i64) -> (Result unit HpErr)
+  (match (hp-live-object h id HpShare)
+    ((Err e) (Err e))
+    ((Ok _) (hp-share-from h id))))

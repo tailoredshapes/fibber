@@ -1,0 +1,347 @@
+;; compiler/tests/fibref/heap-core.fib: the heap's counting, freeing, error and leak-class rules, driven directly (alloc, retain, release, write, finish).
+;; Ports crates/fibref/src/heap/tests/{free,errors,dangling,masked,leaks,weak}.rs at seed-1: each Rust test is one function here, with the same
+;; arrangement and the same expectations (events as text: "release #3 -> 0;free #3;"). Object ids start at #0. Exit status: the number of failed tests.
+(ns main (:use fibref.value fibref.heap fibref.trace heaptk))
+
+;; ================= free.rs =================
+(defun t-alloc-retains-each-ref-field () -> str
+  (let [h (heap-new) a (imm h []) parent (imm h [(obj a) (i 1) (obj a)])]
+    (all [(is-int "count a" (heap-count h a) 3) (is-int "count parent" (heap-count h parent) 1)])))
+
+(defun t-free-releases-children-exactly-once () -> str
+  (let [h (heap-new) a (imm h []) b (imm h [])
+        parent (imm h [(obj a) (obj a) (obj b)])
+        c0 (all [(is-int "a" (heap-count h a) 3) (is-int "b" (heap-count h b) 2)])
+        s (nev h)
+        r1 (is-ok "release parent" (heap-release h parent))]
+    (all [c0 r1
+          (ck "parent freed" (not (heap-is-live h parent)))
+          (is-int "a after" (heap-count h a) 1) (is-int "b after" (heap-count h b) 1)
+          (ck (str "events: " (evs-from h s)) (= (evs-from h s) "release #2 -> 0;free #2;release #0 -> 2;release #0 -> 1;release #1 -> 1;"))
+          (is-ok "release a" (heap-release h a)) (is-ok "release b" (heap-release h b))
+          (ck "clean" (clean? h))])))
+
+(defun t-release-above-zero-does-not-free () -> str
+  (let [h (heap-new) a (imm h [(i 9)])]
+    (all [(is-ok "retain" (heap-retain h a)) (is-int "two" (heap-count h a) 2)
+          (is-ok "release" (heap-release h a)) (ck "live" (heap-is-live h a))
+          (is-val "read" (heap-read h a 0) (i 9))
+          (ck "no free event" (= (n-frees h) 0))
+          (is-int "one" (heap-count h a) 1)])))
+
+(defun cons-list (h: Heap len: i64) -> i64
+  (loop [k 1 head (imm h [(i 0) INone])]
+    (if (>= k len)
+        head
+        (let [next (imm h [(i k) (obj head)])]
+          (do (rel h head) (recur (+ k 1) next))))))
+
+(defun t-a-long-list-frees-iteratively () -> str
+  (let [h (heap-new) len 20000 head (cons-list h len) r (is-ok "release head" (heap-release h head))
+        rep (heap-finish h)]
+    (all [r (ck "clean" (report-clean? rep))
+          (ck "allocated" (= (. rep allocated) len)) (ck "freed" (= (. rep freed) len))
+          (ck "free events" (= (count (filter (fn (e: HpEvent) (match e ((EvFree _) true) (_ false))) @(. h log))) len))])))
+
+(defun t-write-retains-new-and-releases-old () -> str
+  (let [h (heap-new) old (imm h []) new (imm h []) c (cell-of h (obj old))
+        r0 (is-ok "release old" (heap-release h old))]
+    (all [r0 (is-ok "write" (heap-write h c 0 (obj new)))
+          (ck "old freed" (not (heap-is-live h old)))
+          (is-int "new count" (heap-count h new) 2)
+          (is-val "read" (heap-read h c 0) (obj new))])))
+
+(defun t-writing-the-value-already-held-keeps-it-alive () -> str
+  (let [h (heap-new) v (imm h []) c (cell-of h (obj v)) r0 (is-ok "release" (heap-release h v))]
+    (all [r0 (is-ok "write" (heap-write h c 0 (obj v))) (ck "live" (heap-is-live h v)) (is-int "count" (heap-count h v) 1)])))
+
+(defun t-releasing-a-cell-releases-its-slot () -> str
+  (let [h (heap-new) v (imm h []) c (cell-of h (obj v)) c0 (is-int "two" (heap-count h v) 2)]
+    (all [c0 (is-ok "rel c" (heap-release h c)) (is-int "one" (heap-count h v) 1)
+          (is-ok "rel v" (heap-release h v)) (ck "clean" (clean? h))])))
+
+(defun t-cascade-releases-in-field-order-depth-first () -> str
+  (let [h (heap-new) leaf (imm h []) left (imm h [(obj leaf)]) right (imm h []) root (imm h [(obj left) (obj right)])]
+    (do (rel h leaf) (rel h left) (rel h right)
+        (let [start (nev h) r (is-ok "release root" (heap-release h root))]
+          (all [r (ck (str "order: " (evs-from h start))
+                      (= (evs-from h start) "release #3 -> 0;free #3;release #1 -> 0;free #1;release #0 -> 0;free #0;release #2 -> 0;free #2;"))])))))
+
+;; ================= errors.rs =================
+(defun t-unknown-id-is-an-error-everywhere () -> str
+  (let [h (heap-new) m "unknown object #7"]
+    (all [(is-err "retain" (heap-retain h 7) m) (is-err "release" (heap-release h 7) m) (is-err "read" (heap-read h 7 0) m)
+          (is-err "write" (heap-write h 7 0 INone) m) (is-err "weak" (heap-weak h 7) m) (is-err "upgrade" (heap-upgrade h 7) m)
+          (is-err "share" (heap-mark-shared h 7) m) (is-err "count" (heap-count h 7) m) (is-err "kind" (heap-kind h 7) m)
+          (is-err "alloc ref" (heap-alloc h IImmutable 0 [(obj 7)]) m)
+          (is-err "alloc weak" (heap-alloc h IImmutable 0 [(IWeak 7)]) m)
+          (ck "not live" (not (heap-is-live h 7))) (ck "no events" (= (nev h) 0))])))
+
+(defun t-use-after-free-fires-for-each-operation () -> str
+  (let [h (heap-new) c (cell-of h (i 1)) r0 (is-ok "release" (heap-release h c))
+        m (fn (op: str) (str "use after free: " op " of freed object #0"))]
+    (all [r0 (is-err "retain" (heap-retain h c) (m "retain")) (is-err "read" (heap-read h c 0) (m "read"))
+          (is-err "write" (heap-write h c 0 INone) (m "write")) (is-err "weak" (heap-weak h c) (m "weak"))
+          (is-err "share" (heap-mark-shared h c) (m "share")) (is-err "count" (heap-count h c) (m "inspect"))
+          (is-err "kind" (heap-kind h c) (m "inspect")) (is-err "is-shared" (heap-is-shared h c) (m "inspect"))
+          (is-err "field-count" (heap-field-count h c) (m "inspect")) (is-err "check-access" (heap-check-access h c HpRead) (m "read"))
+          (is-err "alloc" (heap-alloc h IImmutable 0 [(obj c)]) (m "store"))
+          (ck "not live" (not (heap-is-live h c)))])))
+
+(defun t-storing-a-freed-ref-in-a-cell-is-use-after-free () -> str
+  (let [h (heap-new) dead (imm h []) c (cell-of h INone) r0 (is-ok "release" (heap-release h dead))]
+    (all [r0 (is-err "write" (heap-write h c 0 (obj dead)) "use after free: store of freed object #0")
+          (is-val "slot kept" (heap-read h c 0) INone)])))
+
+(defun t-release-of-freed-is-double-free () -> str
+  (let [h (heap-new) a (imm h [(i 1)]) r0 (is-ok "release" (heap-release h a))]
+    (all [r0 (is-err "again" (heap-release h a) "double free: release of freed object #0")
+          (ck "one release event" (= (evs h) "alloc #0 immutable;release #0 -> 0;free #0;"))])))
+
+(defun t-write-to-immutable-is-an-error () -> str
+  (let [h (heap-new) a (imm h [(i 1)])]
+    (all [(is-err "write" (heap-write h a 0 (i 2)) "write to immutable object #0") (is-val "unchanged" (heap-read h a 0) (i 1))])))
+
+(defun t-bad-field-on-read-and-write () -> str
+  (let [h (heap-new) a (imm h [(i 1) (i 2)]) c (cell-of h (i 3))]
+    (all [(is-err "read" (heap-read h a 2) "object #0 has no field 2") (is-err "write" (heap-write h c 1 INone) "object #1 has no field 1")
+          (is-val "cell kept" (heap-read h c 0) (i 3))])))
+
+(defun t-shared-cell-is-an-error () -> str
+  (let [h (heap-new) c (cell-of h (i 1))]
+    (all [(is-err "share" (heap-mark-shared h c) "cell #0 would cross a thread boundary") (is-bool "not shared" (heap-is-shared h c) false)])))
+
+(defun t-cell-and-atom-take-exactly-one-slot () -> str
+  (let [h (heap-new)
+        a (all [(is-err "cell 0" (heap-alloc h ICell 0 []) "a cell has exactly one slot, not 0")
+                (is-err "cell 2" (heap-alloc h ICell 0 [INone INone]) "a cell has exactly one slot, not 2")
+                (is-err "atom 0" (heap-alloc h IAtom 0 []) "a atom has exactly one slot, not 0")
+                (is-err "atom 2" (heap-alloc h IAtom 0 [INone INone]) "a atom has exactly one slot, not 2")
+                (ck "no events" (= (nev h) 0))])
+        at (atom-of h INone)]
+    (all [a (is-int "one field" (heap-field-count h at) 1)])))
+
+(defun t-failed-alloc-retains-nothing-and-allocates-nothing () -> str
+  (let [h (heap-new) live (imm h []) dead (imm h []) r0 (is-ok "release" (heap-release h dead))
+        before (nev h)
+        r (heap-alloc h IImmutable 0 [(obj live) (obj dead)])]
+    (all [r0 (is-err "alloc" r "use after free: store of freed object #1") (is-int "live count" (heap-count h live) 1)
+          (ck "events" (= (nev h) before)) (ck "next id is #2" (= (imm h []) 2))])))
+
+(defun t-errors-display-their-object () -> str
+  (all [(ck "uaf text" (= (hp-err-text (HeUseAfterFree 3 HpRead)) "use after free: read of freed object #3"))
+        (ck "slot text" (= (hp-err-text (HeWrongSlotCount ICell 2)) "a cell has exactly one slot, not 2"))
+        (ck "unique text" (= (hp-err-text (HeNotUnique 5 (HpCount 3))) "unique write refused on #5: Count(3)"))]))
+
+;; ================= dangling.rs =================
+(defun dangling-parent (h: Heap) -> (Vec i64)
+  (let [x (imm h [(i 1)]) parent (imm h [(obj x)])]
+    (do (rel h x) (rel h x) [parent x])))
+
+(defun t-a-cascade-into-a-freed-object-is-release-of-freed-and-changes-nothing () -> str
+  (let [h (heap-new) px (dangling-parent h) parent (nth px 0) x (nth px 1) before (nev h)]
+    (all [(ck "x freed" (not (heap-is-live h x)))
+          (is-err "release" (heap-release h parent) "double free: release of freed object #0")
+          (ck "parent live" (heap-is-live h parent)) (is-int "parent count" (heap-count h parent) 1) (ck "events" (= (nev h) before))])))
+
+(defun t-a-cascade-that-reaches-what-it-just-freed-is-refused-whole () -> str
+  (let [h (heap-new) c (cell-of h INone) w (is-ok "self ref" (heap-write h c 0 (obj c)))
+        r1 (is-ok "binding's count" (heap-release h c)) before (nev h)]
+    (all [w r1 (is-err "release" (heap-release h c) "double free: release of freed object #0")
+          (ck "live" (heap-is-live h c)) (is-int "count" (heap-count h c) 1) (ck "events" (= (nev h) before))])))
+
+(defun t-a-write-whose-old-value-dangles-retains-and-stores-nothing () -> str
+  (let [h (heap-new) x (imm h []) c (cell-of h (obj x)) _a (rel h x) _b (rel h x) y (imm h []) before (nev h)]
+    (all [(is-err "write" (heap-write h c 0 (obj y)) "double free: release of freed object #0")
+          (is-int "y not retained" (heap-count h y) 1) (is-val "slot kept" (heap-read h c 0) (obj x))
+          (ck "only the read" (= (nev h) (+ before 1)))])))
+
+(defun t-a-write-plans-the-release-with-the-slot-already-replaced () -> str
+  (let [h (heap-new) c (cell-of h INone) v (imm h [(obj c)]) _w (wr h c 0 (obj v)) _a (rel h v) _b (rel h c)]
+    (all [(is-ok "write nil" (heap-write h c 0 INone)) (ck "v freed" (not (heap-is-live h v))) (ck "c freed" (not (heap-is-live h c)))
+          (ck "clean" (clean? h))])))
+
+(defun t-mark-shared-through-a-dangling-ref-is-use-after-free-and-marks-nothing () -> str
+  (let [h (heap-new) px (dangling-parent h) parent (nth px 0) holder (imm h [(obj parent)]) before (nev h)]
+    (all [(is-err "share" (heap-mark-shared h holder) "use after free: share of freed object #0")
+          (is-bool "holder" (heap-is-shared h holder) false) (is-bool "parent" (heap-is-shared h parent) false) (ck "events" (= (nev h) before))])))
+
+(defun t-a-dangling-ref-to-a-freed-cell-is-use-after-free-before-shared-cell () -> str
+  (let [h (heap-new) c (cell-of h INone) holder (imm h [(obj c)]) _a (rel h c) _b (rel h c)]
+    (is-err "share" (heap-mark-shared h holder) "use after free: share of freed object #0")))
+
+(defun t-finish-lists-a-dangling-ref-and-is-neither-clean-nor-cycle-leak-only () -> str
+  (let [h (heap-new) x (imm h []) c (cell-of h INone) v (imm h [(obj c) (obj x)]) _w (wr h c 0 (obj v))
+        _a (rel h v) _b (rel h c) _d (rel h x) _e (rel h x)
+        r (heap-finish h) d (nth (. r dangling) 0)]
+    (all [(ck "one dangling" (= (count (. r dangling)) 1))
+          (ck "dangling row" (and (= (. d holder) v) (= (. d field) 1) (= (. d target) x)))
+          (ck (leak-ids r HpLeakCycle) (= (report-ids-in r HpLeakCycle) [c v]))
+          (ck "not clean" (not (report-clean? r))) (ck "not cycle only" (not (report-cycle-leak-only? r))) (ck "freed" (= (. r freed) 1))])))
+
+;; ================= masked.rs (a count that does not match the live refs) =================
+(defun t-a-self-holding-cell-with-a-surplus-count-is-a-leak () -> str
+  (let [h (heap-new) c (cell-of h INone) _w (wr h c 0 (obj c)) r (heap-finish h) l (nth (. r leaks) 0)]
+    (all [(ck "Leak [c]" (= (report-ids-in r HpLeak) [c])) (ck "count 2 held 1" (and (= (. l count) 2) (= (. l held) 1)))
+          (ck "not cycle only" (not (report-cycle-leak-only? r)))])))
+
+(defun t-a-cycle-member-with-a-surplus-count-is-a-leak () -> str
+  (let [h (heap-new) c (cell-of h INone) v (imm h [(obj c)]) _w (wr h c 0 (obj v)) _r (rel h c) r (heap-finish h) l (nth (. r leaks) 1)]
+    (all [(ck "LeakCycle [c]" (= (report-ids-in r HpLeakCycle) [c])) (ck "Leak [v]" (= (report-ids-in r HpLeak) [v]))
+          (ck "count 2 held 1" (and (= (. l count) 2) (= (. l held) 1)))])))
+
+(defun t-a-cycle-member-with-a-deficit-count-is-a-leak () -> str
+  (let [h (heap-new) c (cell-of h INone) v (imm h [(obj c)]) _w (wr h c 0 (obj v)) other (imm h [(obj v)])
+        _r (rel h c) a (is-int "binding's count on v" (heap-count h v) 3)
+        r1 (is-ok "rel v" (heap-release h v)) r2 (is-ok "rel v again" (heap-release h v))
+        r (heap-finish h) l (nth (. r leaks) 1)]
+    (all [a r1 r2 (ck "LeakCycle [c]" (= (report-ids-in r HpLeakCycle) [c])) (ck "Leak [v other]" (= (report-ids-in r HpLeak) [v other]))
+          (ck "count 1 held 2" (and (= (. l count) 1) (= (. l held) 2)))])))
+
+(defun t-a-tail-with-a-surplus-count-hanging-off-a-cycle-is-a-leak () -> str
+  (let [h (heap-new) tail (imm h [(i 7)]) c (cell-of h INone) v (imm h [(obj c) (obj tail)]) _w (wr h c 0 (obj v)) _a (rel h v) _b (rel h c)
+        r (heap-finish h)]
+    (all [(ck "LeakCycle [c v]" (= (report-ids-in r HpLeakCycle) [c v])) (ck "Leak [tail]" (= (report-ids-in r HpLeak) [tail]))
+          (ck "not cycle only" (not (report-cycle-leak-only? r)))])))
+
+(defun t-a-matching-count-on-a-cycle-stays-leak-cycle () -> str
+  (let [h (heap-new) tail (imm h [(i 7)]) c (cell-of h INone) v (imm h [(obj c) (obj tail)]) _w (wr h c 0 (obj v))
+        _a (rel h tail) _b (rel h v) _d (rel h c) r (heap-finish h)]
+    (all [(ck "LeakCycle [tail c v]" (= (report-ids-in r HpLeakCycle) [tail c v]))
+          (ck "count = held" (every? (fn (l: HpLeakRow) (= (. l count) (. l held))) (. r leaks)))
+          (ck "cycle only" (report-cycle-leak-only? r))])))
+
+;; ================= leaks.rs =================
+(defun t-clean-run-reports-nothing () -> str
+  (let [h (heap-new) a (imm h [(i 1)]) b (imm h [(obj a)]) _a (rel h a) _b (rel h b) r (heap-finish h)]
+    (all [(ck "clean" (report-clean? r)) (ck "not cycle only" (not (report-cycle-leak-only? r)))
+          (ck "allocated 2 freed 2" (and (= (. r allocated) 2) (= (. r freed) 2)))])))
+
+(defun t-cycle-through-a-cell-is-a-leak-cycle () -> str
+  (let [h (heap-new) empty (imm h []) c (cell-of h (obj empty)) _a (rel h empty) v (imm h [(obj c)]) _w (wr h c 0 (obj v))
+        _b (rel h v) _d (rel h c) r (heap-finish h)]
+    (all [(ck "cycle only" (report-cycle-leak-only? r)) (ck "LeakCycle [c v]" (= (report-ids-in r HpLeakCycle) [c v]))
+          (ck "freed 1" (= (. r freed) 1))])))
+
+(defun t-cycle-through-an-atom-is-a-leak-cycle () -> str
+  (let [h (heap-new) a (atom-of h INone) holder (imm h [(obj a)]) _w (wr h a 0 (obj holder)) _b (rel h holder) _d (rel h a) r (heap-finish h)]
+    (all [(ck "cycle only" (report-cycle-leak-only? r)) (ck "two leaks" (= (count (. r leaks)) 2))])))
+
+(defun t-objects-hanging-off-a-cell-cycle-are-leak-cycle-too () -> str
+  (let [h (heap-new) payload (imm h [(i 7)]) c (cell-of h INone) node (imm h [(obj c) (obj payload)]) _w (wr h c 0 (obj node))
+        _a (rel h payload) _b (rel h node) _d (rel h c) r (heap-finish h)]
+    (all [(ck "cycle only" (report-cycle-leak-only? r)) (ck "LeakCycle [payload c node]" (= (report-ids-in r HpLeakCycle) [payload c node]))])))
+
+(defun t-acyclic-live-object-is-a-leak () -> str
+  (let [h (heap-new) a (imm h [(i 1)]) forgotten (imm h [(obj a)]) _a (rel h a) r (heap-finish h)]
+    (all [(ck "not clean" (not (report-clean? r))) (ck "not cycle only" (not (report-cycle-leak-only? r)))
+          (ck "Leak ids" (= (count (report-ids-in r HpLeak)) 2)) (ck "bugs 2" (= (count (report-bugs r)) 2)) (ck "unused" (>= forgotten 0))])))
+
+(defun t-a-leaked-cell-with-no-cycle-is-a-plain-leak () -> str
+  (let [h (heap-new) c (cell-of h (i 1)) r (heap-finish h)]
+    (all [(ck "Leak [c]" (= (report-ids-in r HpLeak) [c])) (ck "no LeakCycle" (= (count (report-ids-in r HpLeakCycle)) 0))])))
+
+(defun t-a-bug-beside-a-cycle-leak-is-still-reported () -> str
+  (let [h (heap-new) c (cell-of h INone) node (imm h [(obj c)]) _w (wr h c 0 (obj node)) _a (rel h node) _b (rel h c)
+        forgotten (imm h []) r (heap-finish h)]
+    (all [(ck "not cycle only" (not (report-cycle-leak-only? r))) (ck "LeakCycle [c node]" (= (report-ids-in r HpLeakCycle) [c node]))
+          (ck "Leak [forgotten]" (= (report-ids-in r HpLeak) [forgotten]))])))
+
+(defun t-a-cycle-with-no-cell-is-an-immutable-cycle () -> str
+  (let [h (heap-new) a (imm h [INone]) b (imm h [(obj a)]) _r (ret h b) _f (forge h a 0 (obj b)) _a (rel h a) _b (rel h b) r (heap-finish h)]
+    (all [(ck "ImmutableCycle [a b]" (= (report-ids-in r HpImmutableCycle) [a b])) (ck "not cycle only" (not (report-cycle-leak-only? r)))
+          (ck "bugs 2" (= (count (report-bugs r)) 2))])))
+
+(defun t-immutable-cycle-wins-over-leak-cycle () -> str
+  (let [h (heap-new) a (imm h [INone]) b (imm h [(obj a)]) _r (ret h b) _f (forge h a 0 (obj b))
+        c (cell-of h INone) node (imm h [(obj c) (obj a)]) _w (wr h c 0 (obj node))
+        _1 (rel h a) _2 (rel h b) _3 (rel h c) _4 (rel h node) r (heap-finish h)]
+    (all [(ck "ImmutableCycle [a b]" (= (report-ids-in r HpImmutableCycle) [a b])) (ck "LeakCycle [c node]" (= (report-ids-in r HpLeakCycle) [c node]))])))
+
+(defun t-report-records-kind-and-count () -> str
+  (let [h (heap-new) c (cell-of h (i 1)) _r (ret h c) r (heap-finish h) l (nth (. r leaks) 0)]
+    (all [(ck "kind" (= (. l kind) ICell)) (ck "count 2" (= (. l count) 2))])))
+
+;; ================= weak.rs =================
+(defun t-weak-does-not-count () -> str
+  (let [h (heap-new) v (imm h [])]
+    (all [(is-val "weak" (heap-weak h v) (IWeak v)) (is-int "count" (heap-count h v) 1) (ck "weak event last" (= (evs-from h 1) "weak #0;"))])))
+
+(defun t-upgrade-before-free-retains () -> str
+  (let [h (heap-new) v (imm h []) _w (heap-weak h v) start (nev h)]
+    (all [(is-up "upgrade" (heap-upgrade h v) v) (is-int "count" (heap-count h v) 2) (ck "events" (= (evs-from h start) "upgrade #0 live;retain #0 -> 2;"))])))
+
+(defun t-upgrade-after-free-is-none-and-traced () -> str
+  (let [h (heap-new) v (imm h []) _w (heap-weak h v) _r (rel h v) start (nev h)]
+    (all [(is-up "upgrade" (heap-upgrade h v) -1) (ck "events" (= (evs-from h start) "upgrade #0 dead;")) (ck "clean" (clean? h))])))
+
+(defun t-ids-are-never-reused-so-a-stale-weak-stays-dead () -> str
+  (let [h (heap-new) v (imm h []) _w (heap-weak h v) _r (rel h v) newer (imm h [])]
+    (all [(ck "newer differs" (not= newer v)) (is-up "stale" (heap-upgrade h v) -1) (is-int "newer count" (heap-count h newer) 1)])))
+
+(defun t-weak-of-freed-is-use-after-free () -> str
+  (let [h (heap-new) v (imm h []) _r (rel h v)]
+    (is-err "weak" (heap-weak h v) "use after free: weak of freed object #0")))
+
+(defun t-a-weak-field-keeps-nothing-alive () -> str
+  (let [h (heap-new) parent (cell-of h INone) w (ok! (heap-weak h parent)) child (imm h [w])
+        a (is-ok "write" (heap-write h parent 0 (obj child))) _r (rel h child)]
+    (all [a (is-int "parent count" (heap-count h parent) 1) (is-ok "release parent" (heap-release h parent))
+          (ck "child freed" (not (heap-is-live h child))) (ck "clean" (clean? h))])))
+
+(defun t-a-weak-field-may-outlive-its-target () -> str
+  (let [h (heap-new) target (imm h [(i 1)]) w (ok! (heap-weak h target)) holder (imm h [w]) _r (rel h target)
+        stored (rd h holder 0)]
+    (all [(ck "stored is weak" (ival-eq stored (IWeak target))) (is-up "upgrade" (heap-upgrade h target) -1)
+          (is-ok "release holder" (heap-release h holder)) (ck "clean" (clean? h))])))
+
+(defun main () -> i64
+  (min 100
+    (run-suite "heap-core"
+      [(tc "alloc-retains-each-ref-field" t-alloc-retains-each-ref-field)
+       (tc "free-releases-children-exactly-once" t-free-releases-children-exactly-once)
+       (tc "release-above-zero-does-not-free" t-release-above-zero-does-not-free)
+       (tc "a-long-list-frees-iteratively" t-a-long-list-frees-iteratively)
+       (tc "write-retains-new-and-releases-old" t-write-retains-new-and-releases-old)
+       (tc "writing-the-value-already-held-keeps-it-alive" t-writing-the-value-already-held-keeps-it-alive)
+       (tc "releasing-a-cell-releases-its-slot" t-releasing-a-cell-releases-its-slot)
+       (tc "cascade-releases-in-field-order-depth-first" t-cascade-releases-in-field-order-depth-first)
+       (tc "unknown-id-is-an-error-everywhere" t-unknown-id-is-an-error-everywhere)
+       (tc "use-after-free-fires-for-each-operation" t-use-after-free-fires-for-each-operation)
+       (tc "storing-a-freed-ref-in-a-cell-is-use-after-free" t-storing-a-freed-ref-in-a-cell-is-use-after-free)
+       (tc "release-of-freed-is-double-free" t-release-of-freed-is-double-free)
+       (tc "write-to-immutable-is-an-error" t-write-to-immutable-is-an-error)
+       (tc "bad-field-on-read-and-write" t-bad-field-on-read-and-write)
+       (tc "shared-cell-is-an-error" t-shared-cell-is-an-error)
+       (tc "cell-and-atom-take-exactly-one-slot" t-cell-and-atom-take-exactly-one-slot)
+       (tc "failed-alloc-retains-nothing-and-allocates-nothing" t-failed-alloc-retains-nothing-and-allocates-nothing)
+       (tc "errors-display-their-object" t-errors-display-their-object)
+       (tc "cascade-into-a-freed-object" t-a-cascade-into-a-freed-object-is-release-of-freed-and-changes-nothing)
+       (tc "cascade-reaches-what-it-just-freed" t-a-cascade-that-reaches-what-it-just-freed-is-refused-whole)
+       (tc "write-whose-old-value-dangles" t-a-write-whose-old-value-dangles-retains-and-stores-nothing)
+       (tc "write-plans-with-the-slot-replaced" t-a-write-plans-the-release-with-the-slot-already-replaced)
+       (tc "mark-shared-through-a-dangling-ref" t-mark-shared-through-a-dangling-ref-is-use-after-free-and-marks-nothing)
+       (tc "dangling-ref-to-a-freed-cell-before-shared-cell" t-a-dangling-ref-to-a-freed-cell-is-use-after-free-before-shared-cell)
+       (tc "finish-lists-a-dangling-ref" t-finish-lists-a-dangling-ref-and-is-neither-clean-nor-cycle-leak-only)
+       (tc "self-holding-cell-surplus" t-a-self-holding-cell-with-a-surplus-count-is-a-leak)
+       (tc "cycle-member-surplus" t-a-cycle-member-with-a-surplus-count-is-a-leak)
+       (tc "cycle-member-deficit" t-a-cycle-member-with-a-deficit-count-is-a-leak)
+       (tc "tail-surplus-off-a-cycle" t-a-tail-with-a-surplus-count-hanging-off-a-cycle-is-a-leak)
+       (tc "matching-count-stays-leak-cycle" t-a-matching-count-on-a-cycle-stays-leak-cycle)
+       (tc "clean-run-reports-nothing" t-clean-run-reports-nothing)
+       (tc "cycle-through-a-cell" t-cycle-through-a-cell-is-a-leak-cycle)
+       (tc "cycle-through-an-atom" t-cycle-through-an-atom-is-a-leak-cycle)
+       (tc "objects-hanging-off-a-cell-cycle" t-objects-hanging-off-a-cell-cycle-are-leak-cycle-too)
+       (tc "acyclic-live-object-is-a-leak" t-acyclic-live-object-is-a-leak)
+       (tc "leaked-cell-no-cycle" t-a-leaked-cell-with-no-cycle-is-a-plain-leak)
+       (tc "bug-beside-a-cycle-leak" t-a-bug-beside-a-cycle-leak-is-still-reported)
+       (tc "cycle-with-no-cell" t-a-cycle-with-no-cell-is-an-immutable-cycle)
+       (tc "immutable-cycle-wins" t-immutable-cycle-wins-over-leak-cycle)
+       (tc "report-records-kind-and-count" t-report-records-kind-and-count)
+       (tc "weak-does-not-count" t-weak-does-not-count)
+       (tc "upgrade-before-free-retains" t-upgrade-before-free-retains)
+       (tc "upgrade-after-free-is-none" t-upgrade-after-free-is-none-and-traced)
+       (tc "ids-never-reused" t-ids-are-never-reused-so-a-stale-weak-stays-dead)
+       (tc "weak-of-freed" t-weak-of-freed-is-use-after-free)
+       (tc "weak-field-keeps-nothing-alive" t-a-weak-field-keeps-nothing-alive)
+       (tc "weak-field-may-outlive-its-target" t-a-weak-field-may-outlive-its-target)])))

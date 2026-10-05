@@ -1,0 +1,87 @@
+;; compiler/fibref/heap/scc.fib: the nodes of a directed graph that lie on a cycle, by Tarjan's strongly connected components written with an explicit
+;; stack so that a graph of any depth (a long list) does not overflow the call stack. OWNER: package F1. Rust: heap/scc.rs. A component is a cycle iff
+;; it has more than one node, or its one node has an edge to itself. The search state lives in cells of one record, passed in.
+(ns fibref.heap.scc)
+
+(defstruct HpTarjan
+  (index: (Cell (Vec i64)) low: (Cell (Vec i64)) onstk: (Cell (Vec i64)) stk: (Cell (Vec i64))
+   next: (Cell i64) cyclic: (Cell (Vec i64))))
+
+(defun hp-t-visit (t: HpTarjan node: i64) -> unit
+  (let [n @(. t next)]
+    (do (update! (. t index) (fn (v: (Vec i64)) (assoc v node n)))
+        (update! (. t low) (fn (v: (Vec i64)) (assoc v node n)))
+        (update! (. t next) (fn (x: i64) (+ x 1)))
+        (update! (. t stk) (fn (v: (Vec i64)) (conj v node)))
+        (update! (. t onstk) (fn (v: (Vec i64)) (assoc v node 1))))))
+
+(defun hp-t-lower (t: HpTarjan node: i64 x: i64) -> unit
+  (if (< x (nth @(. t low) node))
+      (update! (. t low) (fn (v: (Vec i64)) (assoc v node x)))
+      ()))
+
+(defun hp-self-loop? (adj: (Vec (Vec i64)) node: i64) -> bool
+  (let [succ (nth adj node)]
+    (loop [i 0]
+      (cond (>= i (count succ)) false
+            (= (nth succ i) node) true
+            :else (recur (+ i 1))))))
+
+;; Pops the component rooted at `node` off the Tarjan stack; its members are recorded when it is a cycle.
+(defun hp-t-pop-component (t: HpTarjan adj: (Vec (Vec i64)) node: i64) -> unit
+  (let [stk @(. t stk)
+        cut (loop [i (- (count stk) 1)] (if (= (nth stk i) node) i (recur (- i 1))))
+        members (loop [j cut acc (vec-empty)] (if (>= j (count stk)) acc (recur (+ j 1) (conj acc (nth stk j)))))]
+    (do (update! (. t stk) (fn (v: (Vec i64)) (loop [w v] (if (> (count w) cut) (recur (pop w)) w))))
+        (loop [k 0]
+          (if (>= k (count members))
+              ()
+              (let [m (nth members k)]
+                (do (update! (. t onstk) (fn (v: (Vec i64)) (assoc v m 0)))
+                    (recur (+ k 1))))))
+        (if (or (> (count members) 1) (hp-self-loop? adj node))
+            (update! (. t cyclic) (fn (v: (Vec i64)) (into v members)))
+            ()))))
+
+;; A frame finished: lower the parent's low-link, and close a component when `node` is its root.
+(defun hp-t-finish (t: HpTarjan adj: (Vec (Vec i64)) node: i64 parent: (Option i64)) -> unit
+  (do (match parent
+        ((some p) (hp-t-lower t p (nth @(. t low) node)))
+        (nil ()))
+      (if (= (nth @(. t low) node) (nth @(. t index) node))
+          (hp-t-pop-component t adj node)
+          ())))
+
+;; The depth-first search from an unvisited root, iteratively: frames are a node and how many of its edges have been followed.
+(defun hp-t-run (t: HpTarjan adj: (Vec (Vec i64)) root: i64) -> unit
+  (do (hp-t-visit t root)
+      (loop [nodes [root] edges [0]]
+        (if (= (count nodes) 0)
+            ()
+            (let [top (- (count nodes) 1)
+                  node (nth nodes top)
+                  e (nth edges top)
+                  succ (nth adj node)]
+              (if (< e (count succ))
+                  (let [target (nth succ e)
+                        edges2 (assoc edges top (+ e 1))]
+                    (cond (= (nth @(. t index) target) -1) (do (hp-t-visit t target) (recur (conj nodes target) (conj edges2 0)))
+                          (= (nth @(. t onstk) target) 1) (do (hp-t-lower t node (nth @(. t index) target)) (recur nodes edges2))
+                          :else (recur nodes edges2)))
+                  (let [rest (pop nodes)]
+                    (do (hp-t-finish t adj node (if (= (count rest) 0) nil (some (nth rest (- (count rest) 1)))))
+                        (recur rest (pop edges))))))))))
+
+(defun hp-fill (n: i64 x: i64) -> (Vec i64)
+  (loop [i 0 acc (vec-empty)] (if (>= i n) acc (recur (+ i 1) (conj acc x)))))
+
+;; The nodes of `adj` (adjacency lists, adj[v] the successors of v) that lie on a cycle.
+(defun hp-cyclic-nodes (adj: (Vec (Vec i64))) -> (Set i64)
+  (let [n (count adj)
+        t (HpTarjan (cell (hp-fill n -1)) (cell (hp-fill n 0)) (cell (hp-fill n 0)) (cell (vec-empty)) (cell 0) (cell (vec-empty)))]
+    (do (loop [root 0]
+          (if (>= root n)
+              ()
+              (do (if (= (nth @(. t index) root) -1) (hp-t-run t adj root) ())
+                  (recur (+ root 1)))))
+        (into #{} @(. t cyclic)))))

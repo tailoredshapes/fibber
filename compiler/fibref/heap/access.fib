@@ -1,0 +1,106 @@
+;; compiler/fibref/heap/access.fib: audited access to objects: reading and writing fields, weak references, and inspection. OWNER: package F1.
+;; Rust: heap/access.rs.
+(ns fibref.heap.access
+  (:use fibref.value fibref.heap.types fibref.heap.state fibref.heap.store fibref.heap.cascade fibref.heap.shared))
+
+(defun hp-field-in-range? (h: Heap id: i64 field: i64) -> bool
+  (and (>= field 0) (< field (hp-field-count h id))))
+
+;; Reads a field. The value is returned without retaining it: the caller decides whether the reference escapes. A slot whose content was moved out is
+;; HeTakenSlot (new). Event: Read.
+(defun heap-read (h: Heap id: i64 field: i64) -> (Result IVal HpErr)
+  (match (hp-live-object h id HpRead)
+    ((Err e) (Err e))
+    ((Ok _)
+     (if (not (hp-field-in-range? h id field))
+         (Err (HeBadField id field))
+         (let [v (nth (hp-fields-of h id) field)]
+           (match v
+             ((ITaken) (Err (HeTakenSlot id field)))
+             (_ (do (hp-emit h (EvRead id field)) (Ok v)))))))))
+
+;; The common tail of `heap-write` and `heap-write-unique`, once `field` exists and `v` is storable there: plans the old value's release, shares what the
+;; value lets another thread reach when `share`, then retains the new value, stores it, pushes `ev` and applies the planned release. On Err nothing has
+;; changed (access.rs store_field).
+(defun hp-store-field (h: Heap id: i64 field: i64 v: IVal share: bool ev: HpEvent) -> (Result unit HpErr)
+  (let [old (nth (hp-fields-of h id) field)
+        cascade (match (hp-counted-target h old)
+                  ((some t) (hp-plan-release h t (some (HpPending id field v))))
+                  (nil (Ok (vec-empty))))]
+    (match cascade
+      ((Err e) (Err e))
+      ((Ok order)
+       (match (hp-share-new h v share)
+         ((Err e) (Err e))
+         ((Ok _) (do (hp-retain-stored h v)
+                     (hp-set-field h id field v)
+                     (hp-emit h ev)
+                     (hp-apply-release h order)
+                     (Ok ()))))))))
+
+(defun hp-share-new (h: Heap v: IVal share: bool) -> (Result unit HpErr)
+  (if share
+      (match (hp-crossing-target h v)
+        ((some t) (hp-share-from h t))
+        (nil (Ok ())))
+      (Ok ())))
+
+;; Writes the slot of a Cell or Atom. The new value is retained if it is a Ref; the old value is released afterwards, which may free it and whatever it
+;; held. Writing into a shared Atom makes whatever the value lets the other thread reach shared (SharedCell if a Cell is reachable). Events: Retain of
+;; the new value, Write, then the release events of the old one (access.rs write).
+(defun heap-write (h: Heap id: i64 field: i64 v: IVal) -> (Result unit HpErr)
+  (match (hp-live-object h id HpWrite)
+    ((Err e) (Err e))
+    ((Ok _)
+     (cond (not (kind-mutable? (hp-kind-of h id))) (Err (HeWriteToImmutable id))
+           (not (hp-field-in-range? h id field)) (Err (HeBadField id field))
+           :else (match (hp-check-storable h v (hp-holder-of h id))
+                   ((Err e) (Err e))
+                   ((Ok _) (hp-store-field h id field v (hp-shared? h id) (EvWrite id field))))))))
+
+;; A weak reference to a live object. No count change; sets HAS-WEAK on a counted object, which `fib.unique?` then refuses for good. A stack object is
+;; WeakToStack. An immortal object may have one (access.rs weak). Event: Weak.
+(defun heap-weak (h: Heap id: i64) -> (Result IVal HpErr)
+  (match (hp-live-object h id HpWeak)
+    ((Err e) (Err e))
+    ((Ok _)
+     (if (hp-stack? h id)
+         (Err (HeWeakToStack id))
+         (do (if (hp-immortal? h id) () (hp-set-flag h id fl-hasweak))
+             (hp-emit h (EvWeak id))
+             (Ok (IWeak id)))))))
+
+;; Turns a weak reference back into a counted one: Some with the object retained if it is still live, nil if freed. Ids are never reused. Events:
+;; Upgrade, then Retain when live and counted (access.rs upgrade).
+(defun heap-upgrade (h: Heap id: i64) -> (Result (Option i64) HpErr)
+  (cond (not (hp-known? h id)) (Err (HeUnknownId id))
+        (hp-stack? h id) (Err (HeWeakToStack id))
+        :else (let [live (hp-live? h id)]
+                (do (hp-emit h (EvUpgrade id live))
+                    (cond (not live) (Ok nil)
+                          :else (do (if (hp-counted? h id) (do (hp-bump h id) ()) ())
+                                    (Ok (some id))))))))
+
+;; ---- inspection (no event) ----
+(defun heap-check-access (h: Heap id: i64 op: HpOp) -> (Result unit HpErr) (hp-live-object h id op))
+(defun heap-is-live (h: Heap id: i64) -> bool (hp-live? h id))
+
+(defun heap-count (h: Heap id: i64) -> (Result i64 HpErr)
+  (match (hp-live-object h id HpInspect) ((Err e) (Err e)) ((Ok _) (Ok (hp-count-of h id)))))
+(defun heap-kind (h: Heap id: i64) -> (Result IKind HpErr)
+  (match (hp-live-object h id HpInspect) ((Err e) (Err e)) ((Ok _) (Ok (hp-kind-of h id)))))
+(defun heap-tid (h: Heap id: i64) -> (Result i64 HpErr)
+  (match (hp-live-object h id HpInspect) ((Err e) (Err e)) ((Ok _) (Ok (hp-tid-of h id)))))
+(defun heap-is-shared (h: Heap id: i64) -> (Result bool HpErr)
+  (match (hp-live-object h id HpInspect) ((Err e) (Err e)) ((Ok _) (Ok (hp-shared? h id)))))
+(defun heap-field-count (h: Heap id: i64) -> (Result i64 HpErr)
+  (match (hp-live-object h id HpInspect) ((Err e) (Err e)) ((Ok _) (Ok (hp-field-count h id)))))
+(defun heap-is-immortal (h: Heap id: i64) -> (Result bool HpErr)
+  (match (hp-live-object h id HpInspect) ((Err e) (Err e)) ((Ok _) (Ok (hp-immortal? h id)))))
+(defun heap-is-roomy (h: Heap id: i64) -> (Result bool HpErr)
+  (match (hp-live-object h id HpInspect) ((Err e) (Err e)) ((Ok _) (Ok (hp-flag? h id fl-roomy)))))
+;; The scope of a live STACK object, nil for any other.
+(defun heap-stack-scope (h: Heap id: i64) -> (Result (Option i64) HpErr)
+  (match (hp-live-object h id HpInspect)
+    ((Err e) (Err e))
+    ((Ok _) (Ok (if (hp-stack? h id) (some (hp-scope-of h id)) nil)))))

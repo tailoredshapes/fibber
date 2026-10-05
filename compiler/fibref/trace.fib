@@ -1,9 +1,126 @@
-;; compiler/fibref/trace.fib: the free trace of spec/compiler.md section 4 from a heap's events. OWNER: package F1. Rust: crates/fibc/src/trace.rs
-;; and heap/event.rs `traced`. After the last InitDone, ordinals renumbered in order of first allocation, immortal objects skipped.
+;; compiler/fibref/trace.fib: the free trace of spec/compiler.md section 4 from a heap's events, the event log as text, and the audit summary line.
+;; OWNER: package F1. Rust: crates/fibc/src/trace.rs (Trace::from_events), heap/event.rs `traced`, eval/pipeline.rs `summary`.
+;; The free trace: after the last Immortalised or InitDone (what precedes is the evaluation of the `def`s, which neither side traces), ordinals are
+;; renumbered in order of first allocation (heap and stack objects), immortal objects have none, and lines are `A n k`, `F n`, `S n k`, `D n` with the
+;; class k `o` (immutable) `c` (cell) `a` (atom). A Free or Drop of an object with no ordinal (made before the slice) has no line.
 (ns fibref.trace
-  (:use fibref.heap fibref.error))
+  (:use fibref.value fibref.heap fibref.error))
 
-(defun trace-lines (h: Heap) -> (Vec ITraceLine) (trap "todo: fibref.trace trace-lines"))
-(defun trace-text (lines: (Vec ITraceLine)) -> str (trap "todo: fibref.trace trace-text"))
-;; The whole event log, one line per event (retain, release, read, write too): what `fibref trace --events` prints. New (not in the compiled trace).
-(defun events-text (h: Heap) -> str (trap "todo: fibref.trace events-text"))
+(defun class-letter (k: IKind) -> str
+  (match k ((IImmutable) "o") ((ICell) "c") ((IAtom) "a")))
+
+;; The events of the free trace: those after the last Immortalised or InitDone (event.rs `traced`).
+(defun traced-events (events: (Vec HpEvent)) -> (Vec HpEvent)
+  (let [start (loop [i (- (count events) 1)]
+                (if (< i 0)
+                    0
+                    (match (nth events i)
+                      ((EvImmortalised _) (+ i 1))
+                      ((EvInitDone) (+ i 1))
+                      (_ (recur (- i 1))))))]
+    (loop [j start acc (vec-empty)]
+      (if (>= j (count events)) acc (recur (+ j 1) (conj acc (nth events j)))))))
+
+(defstruct HpNumbering (ids: (Map i64 i64) next: i64 lines: (Vec ITraceLine)))
+
+(defun number-alloc (n: HpNumbering id: i64 kind: str k: IKind) -> HpNumbering
+  (let [o (+ (. n next) 1)]
+    (HpNumbering (assoc (. n ids) id o) o (conj (. n lines) (ITraceLine kind o (class-letter k))))))
+
+(defun number-ended (n: HpNumbering id: i64 kind: str) -> HpNumbering
+  (match (get (. n ids) id)
+    ((some o) (HpNumbering (. n ids) (. n next) (conj (. n lines) (ITraceLine kind o ""))))
+    (nil n)))
+
+(defun trace-step (n: HpNumbering e: HpEvent) -> HpNumbering
+  (match e
+    ((EvAlloc id k) (number-alloc n id "A" k))
+    ((EvAllocStack id k _) (number-alloc n id "S" k))
+    ((EvFree id) (number-ended n id "F"))
+    ((EvDrop id) (number-ended n id "D"))
+    (_ n)))
+
+;; The free trace of the heap's run so far.
+(defun trace-lines (h: Heap) -> (Vec ITraceLine)
+  (let [events (traced-events @(. h log))]
+    (loop [i 0 n (HpNumbering {} 0 (vec-empty))]
+      (if (>= i (count events))
+          (. n lines)
+          (recur (+ i 1) (trace-step n (nth events i)))))))
+
+(defun trace-line-text (l: ITraceLine) -> str
+  (if (= (. l class) "")
+      (str (. l kind) " " (. l ordinal))
+      (str (. l kind) " " (. l ordinal) " " (. l class))))
+
+;; One line each, every line ended by a newline (the text of `Trace::render`).
+(defun trace-text (lines: (Vec ITraceLine)) -> str
+  (str-join (mapv (fn (l: ITraceLine) (str-concat (trace-line-text l) "\n")) lines)))
+
+;; The number of heap objects the run allocated: the A lines of its free trace (event.rs trace_allocs).
+(defun trace-allocs (h: Heap) -> i64
+  (count (filter (fn (l: ITraceLine) (= (. l kind) "A")) (trace-lines h))))
+
+;; ---- the whole event log ----
+(defun id-text (id: i64) -> str (str "#" id))
+
+(defun event-text-1 (e: HpEvent) -> (Option str)
+  (match e
+    ((EvAlloc id k) (some (str "alloc " (id-text id) " " (hp-kind-text k))))
+    ((EvRetain id c) (some (str "retain " (id-text id) " -> " c)))
+    ((EvRelease id c) (some (str "release " (id-text id) " -> " c)))
+    ((EvFree id) (some (str "free " (id-text id))))
+    ((EvRead id f) (some (str "read " (id-text id) "." f)))
+    ((EvWrite id f) (some (str "write " (id-text id) "." f)))
+    ((EvWeak id) (some (str "weak " (id-text id))))
+    ((EvUpgrade id live) (some (str "upgrade " (id-text id) (if live " live" " dead"))))
+    ((EvShared id) (some (str "shared " (id-text id))))
+    ((EvAllocImmortal id k) (some (str "alloc-immortal " (id-text id) " " (hp-kind-text k))))
+    ((EvAllocStack id k s) (some (str "alloc-stack " (id-text id) " " (hp-kind-text k) " scope " s)))
+    ((EvWriteUnique p id f) (some (str "write-unique " (id-text p) " " (id-text id) "." f)))
+    (_ nil)))
+
+(defun event-text-2 (e: HpEvent) -> str
+  (match e
+    ((EvScopeOpen s) (str "scope-open " s))
+    ((EvScopeEnd s) (str "scope-end " s))
+    ((EvDrop id) (str "drop " (id-text id)))
+    ((EvImmortalised id) (str "immortalised " (id-text id)))
+    ((EvInitDone) "init-done")
+    ((EvSteal id f moved) (str "steal " (id-text id) "." f (if moved " moved" " retained")))
+    ((EvTake id f) (str "take " (id-text id) "." f))
+    ((EvPut id f) (str "put " (id-text id) "." f))
+    ((EvPeek id) (str "peek " (id-text id)))
+    ((EvMoveIn p id) (str "move-in " (id-text p) " -> " (id-text id)))
+    ((EvArrayOp op p id i inplace) (str "array-" op " " (id-text p) " " (id-text id) "[" i "]" (if inplace " in-place" " copy")))
+    (_ "event")))
+
+(defun event-text (e: HpEvent) -> str
+  (match (event-text-1 e)
+    ((some s) s)
+    (nil (event-text-2 e))))
+
+;; The whole event log, one line per event (retain, release, read, write too): what `fibref trace --events` prints.
+(defun events-text (h: Heap) -> str
+  (str-join (mapv (fn (e: HpEvent) (str-concat (event-text e) "\n")) @(. h log))))
+
+;; ---- the audit summary ----
+(defun dangling-text (d: HpDangling) -> str
+  (str "dangling reference #" (. d holder) "." (. d field) " -> #" (. d target)))
+
+(defun class-count (r: HpReport c: HpLeakClass) -> i64
+  (count (filter (fn (l: HpLeakRow) (= (. l class) c)) (. r leaks))))
+
+;; The audit errors the harness counts (pipeline.rs `summary`): dangling references, scopes never ended, objects on a cycle of immutable objects.
+(defun audit-errors (r: HpReport) -> (Vec str)
+  (into (into (mapv dangling-text (. r dangling))
+              (mapv (fn (s: i64) (str "scope " s " never ended")) (. r open-scopes)))
+        (mapv (fn (l: HpLeakRow) (str "#" (. l id) " is on a cycle of immutable objects"))
+              (filter (fn (l: HpLeakRow) (= (. l class) HpImmutableCycle)) (. r leaks)))))
+
+;; The line `fibref run` prints: `clean=true leak-cycles=0 leaks=0 errors=0`, then each error in brackets (evaluator.rs AuditSummary Display).
+(defun audit-line (r: HpReport) -> str
+  (let [errs (audit-errors r)]
+    (str "clean=" (report-clean? r) " leak-cycles=" (class-count r HpLeakCycle)
+         " leaks=" (+ (class-count r HpLeak) (class-count r HpImmutableCycle)) " errors=" (count errs)
+         (str-join (mapv (fn (e: str) (str " [" e "]")) errs)))))

@@ -1,0 +1,209 @@
+;; compiler/fibref/heap/inplace.fib: the heap rules new since seed-1 (docs/design/in-place-update.md, spec/types.md sections 2.13.1, 6.3, 6.6). OWNER: package F1.
+;; Slots whose content was MOVED out hold `ITaken` (the null of the compiled code, which `fib.release` skips). Nothing here exists in the Rust at seed-1.
+;;  - steal: the field of a unique Immutable shell moves out (the slot is nulled, the count moves with the value); on a shared shell the field is retained;
+;;  - take / put: the content of a Cell moves out and back (`cell-update!`), no count change;
+;;  - peek: a cell read with no count (types section 6.3, "Cell peeks");
+;;  - move-in: `&` copy-in without a retain (PsMoveIn): the content of the variable's cell moves into the new private stack cell;
+;;  - array-take! array-push! array-pop!: on the array held by a Cell, in place iff `fib.unique?` (and, for push, ROOMY with len < 32), else on a copy
+;;    that takes the cell's place (the old array released); a copy of take or pop is not ROOMY, a copy made by push is ROOMY iff len < 32.
+(ns fibref.heap.inplace
+  (:use fibref.value fibref.heap.types fibref.heap.state fibref.heap.store fibref.heap.cascade fibref.heap.access fibref.heap.unique fibref.heap.life))
+
+;; ---- steal ----
+;; The field `field` of the Immutable shell `id`, at its last use: moved out of a unique shell (slot nulled, no count change, event Steal true), or
+;; retained when the shell is shared (event Steal false, then Retain).
+(defun heap-steal (h: Heap id: i64 field: i64) -> (Result IVal HpErr)
+  (match (hp-live-object h id HpRead)
+    ((Err e) (Err e))
+    ((Ok _)
+     (cond (not= (kind-code (hp-kind-of h id)) 0) (Err (HeNotUnique id HpContentNotImmutable))
+           (not (hp-field-in-range? h id field)) (Err (HeBadField id field))
+           :else (hp-steal-field h id field (nth (hp-fields-of h id) field))))))
+
+(defun hp-steal-field (h: Heap id: i64 field: i64 v: IVal) -> (Result IVal HpErr)
+  (match v
+    ((ITaken) (Err (HeTakenSlot id field)))
+    (_ (match (hp-not-unique h id)
+         (nil (do (hp-set-field h id field ITaken)
+                  (hp-emit h (EvSteal id field true))
+                  (Ok v)))
+         ((some _) (do (hp-emit h (EvSteal id field false))
+                       (hp-retain-stored h v)
+                       (Ok v)))))))
+
+;; ---- take, put, peek ----
+;; The place must be a live Cell (stack or heap) with `field` in range.
+(defun hp-cell-slot (h: Heap id: i64 field: i64 op: HpOp) -> (Result unit HpErr)
+  (match (hp-live-object h id op)
+    ((Err e) (Err e))
+    ((Ok _) (cond (not= (kind-code (hp-kind-of h id)) 1) (Err (HeNotUnique id HpPlaceNotCell))
+                  (not (hp-field-in-range? h id field)) (Err (HeBadField id field))
+                  :else (Ok ())))))
+
+;; Moves the content of a Cell out: the slot becomes ITaken, no count change (`cell-update!`, move-in). Event: Take.
+(defun heap-take (h: Heap id: i64 field: i64) -> (Result IVal HpErr)
+  (match (hp-cell-slot h id field HpWrite)
+    ((Err e) (Err e))
+    ((Ok _) (let [v (nth (hp-fields-of h id) field)]
+              (match v
+                ((ITaken) (Err (HeTakenSlot id field)))
+                (_ (do (hp-set-field h id field ITaken) (hp-emit h (EvTake id field)) (Ok v))))))))
+
+;; Puts a value into a slot emptied by `heap-take`, without a retain: the value's count is the one `heap-take` moved out, or the one the callee's result
+;; owns. HeSlotNotTaken if the slot holds a value (the old one would leak). Event: Put.
+(defun heap-put (h: Heap id: i64 field: i64 v: IVal) -> (Result unit HpErr)
+  (match (hp-cell-slot h id field HpWrite)
+    ((Err e) (Err e))
+    ((Ok _)
+     (match (nth (hp-fields-of h id) field)
+       ((ITaken) (match (hp-check-storable h v (hp-holder-of h id))
+                 ((Err e) (Err e))
+                 ((Ok _) (do (hp-set-field h id field v) (hp-emit h (EvPut id field)) (Ok ())))))
+       (_ (Err (HeSlotNotTaken id field)))))))
+
+;; Reads the content of a Cell with no count (a peek). The Cell's content must be there. Event: Peek.
+(defun heap-peek (h: Heap id: i64) -> (Result IVal HpErr)
+  (match (hp-cell-slot h id 0 HpRead)
+    ((Err e) (Err e))
+    ((Ok _) (let [v (nth (hp-fields-of h id) 0)]
+              (match v
+                ((ITaken) (Err (HeTakenSlot id 0)))
+                (_ (do (hp-emit h (EvPeek id)) (Ok v))))))))
+
+;; ---- move-in ----
+;; `&` copy-in that takes the content of the variable's cell `place` without a retain (PsMoveIn): a new private STACK cell of `scope` holds it, the
+;; variable's slot is emptied. The write-back is an ordinary `heap-write` into the emptied slot (nothing old to release). Events: AllocStack, MoveIn.
+(defun heap-move-in (h: Heap scope: i64 place: i64 tid: i64) -> (Result i64 HpErr)
+  (match (hp-check-open h scope)
+    ((Err e) (Err e))
+    ((Ok _)
+     (match (hp-cell-slot h place 0 HpWrite)
+       ((Err e) (Err e))
+       ((Ok _) (hp-move-in-content h scope place tid (nth (hp-fields-of h place) 0)))))))
+
+(defun hp-move-in-content (h: Heap scope: i64 place: i64 tid: i64 v: IVal) -> (Result i64 HpErr)
+  (match v
+    ((ITaken) (Err (HeTakenSlot place 0)))
+    (_ (match (hp-check-storable h v scope)
+         ((Err e) (Err e))
+         ((Ok _)
+          (let [id (hp-push h ICell tid 0 fl-live scope [v])]
+            (do (update! (. h scope-objs) (fn (s: (Vec (Vec i64))) (assoc s scope (conj (nth s scope) id))))
+                (hp-emit h (EvAllocStack id ICell scope))
+                (hp-set-field h place 0 ITaken)
+                (hp-emit h (EvMoveIn place id))
+                (Ok id))))))))
+
+;; ---- arrays held by a Cell ----
+;; The array a Cell `place` holds: a live Immutable object (HeNotUnique with the place or content named otherwise).
+(defun hp-array-of (h: Heap place: i64) -> (Result i64 HpErr)
+  (match (hp-cell-slot h place 0 HpWrite)
+    ((Err e) (Err e))
+    ((Ok _) (match (nth (hp-fields-of h place) 0)
+              ((IObj arr) (hp-array-object h arr))
+              ((ITaken) (Err (HeTakenSlot place 0)))
+              (_ (Err (HeNotUnique place HpContentNotImmutable)))))))
+
+(defun hp-array-object (h: Heap arr: i64) -> (Result i64 HpErr)
+  (match (hp-live-object h arr HpWrite)
+    ((Err e) (Err e))
+    ((Ok _) (if (= (kind-code (hp-kind-of h arr)) 0) (Ok arr) (Err (HeNotUnique arr HpContentNotImmutable))))))
+
+(defun hp-take-prefix (fs: (Vec IVal) n: i64) -> (Vec IVal)
+  (loop [i 0 acc (vec-empty)] (if (>= i n) acc (recur (+ i 1) (conj acc (nth fs i))))))
+
+;; A copy of the array `arr` with its first `keep` fields and then `extra` (each retained by the copy), count 1, ROOMY iff `roomy`; stored into the
+;; Cell `place` in the place of `arr` without a retain, then `arr` is released (the copy of `fib.array-set!`, `array-take!`, `array-pop!`, a growing push).
+(defun hp-array-copy-into (h: Heap place: i64 arr: i64 keep: i64 extra: (Vec IVal) roomy: bool op: str index: i64) -> (Result i64 HpErr)
+  (let [fs (into (hp-take-prefix (hp-fields-of h arr) keep) extra)]
+    (match (hp-plan-release h arr nil)
+      ((Err e) (Err e))
+      ((Ok _)
+       (let [copy (hp-install h IImmutable (hp-tid-of h arr) 1 (if roomy (bit-or fl-live fl-roomy) fl-live) -1 fs (EvAlloc (hp-size h) IImmutable))]
+         (hp-swap-in-copy h place arr copy op index))))))
+
+;; The copy takes the cell's place and the old array is released. The release is planned AFTER the copy retained its elements (the counts it reads are
+;; the counts the apply sees); the first plan in `hp-array-copy-into` only validates before anything changes.
+(defun hp-swap-in-copy (h: Heap place: i64 arr: i64 copy: i64 op: str index: i64) -> (Result i64 HpErr)
+  (match (hp-plan-release h arr nil)
+    ((Err e) (Err e))
+    ((Ok order) (do (hp-set-field h place 0 (IObj copy))
+                    (hp-emit h (EvArrayOp op place copy index false))
+                    (hp-apply-release h order)
+                    (Ok copy)))))
+
+(defun hp-array-unique? (h: Heap arr: i64) -> bool
+  (match (hp-not-unique h arr) ((some _) false) (nil true)))
+
+;; The array to work on in place: `arr` if unique, else a full copy that takes the cell's place.
+(defun hp-array-unique-or-copy (h: Heap place: i64 arr: i64 op: str index: i64) -> (Result i64 HpErr)
+  (if (hp-array-unique? h arr)
+      (Ok arr)
+      (hp-array-copy-into h place arr (hp-field-count h arr) (vec-empty) false op index)))
+
+;; `array-take!`: element `i` of the array in the cell, owned. An object element of a unique array is moved out (slot nulled, no retain); a scalar is
+;; read and the slot left. A shared array is copied first (the copy is not ROOMY).
+(defun heap-array-take (h: Heap place: i64 i: i64) -> (Result IVal HpErr)
+  (match (hp-array-of h place)
+    ((Err e) (Err e))
+    ((Ok arr)
+     (if (not (hp-field-in-range? h arr i))
+         (Err (HeBadField arr i))
+         (let [u (hp-array-unique? h arr)]
+           (match (hp-array-unique-or-copy h place arr "take" i)
+             ((Err e) (Err e))
+             ((Ok a) (hp-take-element h place a i u))))))))
+
+(defun hp-take-element (h: Heap place: i64 a: i64 i: i64 inplace: bool) -> (Result IVal HpErr)
+  (let [v (nth (hp-fields-of h a) i)]
+    (match v
+      ((ITaken) (Err (HeTakenSlot a i)))
+      (_ (do (match (ival-obj v)
+               ((some _) (hp-set-field h a i ITaken))
+               (nil ()))
+             (if inplace (hp-emit h (EvArrayOp "take" place a i true)) ())
+             (Ok v))))))
+
+;; `array-push!`: appends `x` (a store: retained) to the array in the cell. In place iff the array is unique and ROOMY with len < 32; otherwise a copy
+;; takes the cell's place: for len < 32 a block flagged ROOMY, for len >= 32 an exact block of len + 1, not flagged.
+(defun heap-array-push (h: Heap place: i64 x: IVal) -> (Result unit HpErr)
+  (match (hp-array-of h place)
+    ((Err e) (Err e))
+    ((Ok arr)
+     (match (hp-check-storable h x holder-heap)
+       ((Err e) (Err e))
+       ((Ok _)
+        (let [n (hp-field-count h arr)]
+          (if (and (hp-array-unique? h arr) (hp-flag? h arr fl-roomy) (< n roomy-capacity))
+              (do (hp-retain-stored h x)
+                  (hp-set-fields h arr (conj (hp-fields-of h arr) x))
+                  (hp-emit h (EvArrayOp "push" place arr n true))
+                  (Ok ()))
+              (match (hp-array-copy-into h place arr n [x] (< n roomy-capacity) "push" n)
+                ((Err e) (Err e))
+                ((Ok _) (Ok ()))))))))))
+
+;; `array-pop!`: removes and returns the last element, owned. On a unique array the element is moved out (length minus one, no retain); on a shared one
+;; the last element is retained and a copy of length minus one takes the cell's place. The trap on an empty array is the evaluator's; the heap says
+;; HeBadField.
+(defun heap-array-pop (h: Heap place: i64) -> (Result IVal HpErr)
+  (match (hp-array-of h place)
+    ((Err e) (Err e))
+    ((Ok arr)
+     (let [n (hp-field-count h arr)]
+       (cond (= n 0) (Err (HeBadField arr 0))
+             (hp-array-unique? h arr)
+             (let [v (nth (hp-fields-of h arr) (- n 1))]
+               (do (hp-set-fields h arr (hp-take-prefix (hp-fields-of h arr) (- n 1)))
+                   (hp-emit h (EvArrayOp "pop" place arr (- n 1) true))
+                   (Ok v)))
+             :else (hp-pop-copy h place arr n))))))
+
+(defun hp-pop-copy (h: Heap place: i64 arr: i64 n: i64) -> (Result IVal HpErr)
+  (let [v (nth (hp-fields-of h arr) (- n 1))]
+    (match (hp-plan-release h arr nil)
+      ((Err e) (Err e))
+      ((Ok _) (do (hp-retain-stored h v)
+                  (match (hp-array-copy-into h place arr (- n 1) (vec-empty) false "pop" (- n 1))
+                    ((Err e) (Err e))
+                    ((Ok _) (Ok v))))))))
