@@ -9,6 +9,30 @@ and every compiler bug became two.
 Nothing on this page counts as done until an executable test says so
 (spec/method.md).
 
+## State of play (2026-10-05)
+
+Stage 2, the compiler in fibber, is the compiler; the Rust tools are frozen as the seed and legacy oracles. `scripts/gate.sh --full` is the
+judge of main, and every merge since 2026-10-04 passed it (fixed point, 354 ownership and 27 module cases, the stdlib suite with only the
+recorded expected failure, case 1707). Streams since the bootstrap:
+
+- **Performance**: the shootout against Java, Clojure and C ([docs/shootout.md](docs/shootout.md)); ranked remaining gaps in
+  [docs/shootout/improvements.md](docs/shootout/improvements.md) (k-nucleotide, binary-trees, n-body, pidigits are still 2.6 to 4.2x Java).
+- **SIMD and tensors**: lane vectors (`<<..>>` literals, checked integer arithmetic, masks, reductions, `fma`/`muladd`, `has-fma`),
+  `fib.tensor` with a packed fma GEMM and fused dense layers ([docs/shootout/simd.md](docs/shootout/simd.md),
+  [docs/shootout/tensor.md](docs/shootout/tensor.md)). Matrix multiplication is within about 1.15x of NumPy with OpenBLAS (single thread).
+- **Exclusive views**: scoped writable windows with ownership rules and disjoint parallel tiles
+  ([docs/design/exclusive-views.md](docs/design/exclusive-views.md)).
+- **Development loop**: `fibc run -O 0` uses the fast code generator; the compile server, REPL and editor services of
+  [docs/design/dev-loop.md](docs/design/dev-loop.md) are designed, not built (DV2 onward). The interpreter design
+  (docs/design/fibber-interpreter.md) is superseded: no rule 6 oracle.
+- **aarch64**: cross-emission and a native, self-hosting compiler on an Apple M1 Ultra; macOS packaging works; no darwin-arm64 release yet;
+  iOS, aarch64 Linux, the NEON GEMM tile and the aarch64 CPU rows are open ([docs/design/aarch64.md](docs/design/aarch64.md)).
+- **Libraries beyond the core**: `fib.os`, `fib.http`, `fib.logic` and `fib.logic.fd`, `fib.lacinia`, `fib.regex` (regex literals compile at compile time).
+
+**Open work, in the order I would take it:** reverse-mode autodiff on `fib.tensor` (design not written); the darwin-arm64 release; the
+remaining dev-loop packages (DV2 to DV10); the shootout gaps; last-axis reductions in `fib.tensor`; the port of meshql to fibber (deferred by
+the owner); `scripts/package.sh` and CI do not yet run the `muladd.sh` check; the Rust retirement (stage 10).
+
 ## M1. Specification — done
 
 spec/ownership.md, spec/syntax.md, spec/types.md, decided by the owner
@@ -604,7 +628,7 @@ Binary releases of `fibc` on GitHub (README.md, Install; `scripts/package.sh`,
 4. `package.sh` builds for `FIB_TARGET_CPU=x86-64-v2` unless told otherwise (README, Install), and, when
    `objdump` is present, fails if the shipped `fibc` uses `ymm` or `zmm` registers.
 5. The seed moves forward deliberately: a commit changes `SEED` to a newer release's url and sha256
-   (v0.1.3 is the `SEED` now: commit `0a86093`).
+   (v0.1.5 is the `SEED` now; it was v0.1.3 until the flip, commit `0a86093`).
 
 **Lessons: a seed is only usable if it runs on every CPU.** v0.1.2 died with SIGILL on a CPU other than the CI
 runner's (code generated for the build host), so v0.1.3 is built for a baseline CPU; v0.1.1 failed the unpack check.
@@ -632,7 +656,9 @@ in-place primitives (spec/types.md section 2.13.1) and is built for a baseline C
 
 ## Open decisions
 
-None. The last two (the colour argument inside an `impl` on a
+None that block work. Waiting on the owner: publishing a darwin-arm64 release; when to start the meshql port; whether to build reverse-mode autodiff next.
+
+Older note: none. The last two (the colour argument inside an `impl` on a
 colour-parameterised type, and a forwarded `&` cell written through a
 closure passed to the same call) were decided by the owner on
 2026-09-28 (types §10).

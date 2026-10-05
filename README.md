@@ -113,6 +113,19 @@ Recent compiler and library changes include:
   The compiler server, incremental checking and session work are described in
   [the development-loop design](docs/design/dev-loop.md); that design is not
   a claim that every planned command exists.
+- Exclusive views: `with-view` lends a writable window over an `Array` that the
+  checker proves nothing else can reach, so a loop writes in place with no
+  copy and no per-element uniqueness test; `with-tiles` hands disjoint windows
+  to tasks. Windows run at about the speed of the array loop at `-O 2`.
+  See [the design](docs/design/exclusive-views.md).
+- aarch64: `--target TRIPLE` (or `FIB_TARGET_TRIPLE`) emits objects and
+  assembly for Linux, macOS and iOS triples. On an Apple M1 Ultra the cross-built
+  compiler runs, builds itself, and reaches the same fixed point as on x86;
+  `scripts/package.sh` builds a macOS tarball. No darwin-arm64 release has been
+  published, and iOS and aarch64 Linux have not been run. See
+  [the aarch64 design](docs/design/aarch64.md) and [the first numbers](docs/shootout/aarch64.md).
+- A GraphQL query engine, [`fib.lacinia`](lib/fib/lacinia/README.md), with
+  variables, defaults, input objects, fragments and operation selection.
 
 The standard library in `lib/` follows Clojure's names and argument shapes,
 within fibber's static types and ownership model. Its specification and
@@ -128,7 +141,13 @@ matrix multiplication uses register tiles and reusable packed panels. Explicit `
 permit reassociated reductions. After rebuilding stage 2, try
 `./F run examples/tensor.fib`; see the
 library README for API, safety contracts, and reproducible NumPy comparisons.
-This is a dense numerical foundation, not NumPy feature or performance parity.
+Fused `t/dense` layers apply bias and an activation as each output tile is
+stored, and `t/softmax` and `t/layernorm` work row by row. On the recorded
+single-thread runs, matrix multiplication is within about 1.15x of NumPy with
+OpenBLAS, a float32 MLP forward pass is at parity with it, and softmax and
+layernorm are faster than NumPy; reductions along the last axis are still
+slower ([the comparison](docs/shootout/tensor.md)). This is a dense numerical
+foundation, not NumPy feature or performance parity.
 
 The explicit [`fib.logic` relational library](lib/fib/logic/README.md) adds
 finite typed terms, persistent unification with occurs checking, fair sequential
@@ -149,8 +168,9 @@ operations, directories, TCP sockets, polling, clocks, environment variables,
 process identity, executable discovery, system information, secure entropy, and
 bounded native memory streams. Shared errors and selected platform backends
 keep libc flags, layouts, and symbols out of application code. Linux is tested
-natively; Darwin backend work is included, with macOS execution and toolchain
-validation still pending. See the [OS design record](docs/design/os.md).
+natively; the Darwin backend ran on Apple Silicon during the aarch64 work (see
+[its design](docs/design/aarch64.md)), but is not yet part of any automated
+gate. See the [OS design record](docs/design/os.md).
 
 The explicit [`fib.http` library](lib/fib/http/README.md) provides shared HTTP
 messages, a Ring-style HTTP/1.1 server with a fixed native worker pool, and a

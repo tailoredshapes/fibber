@@ -32,7 +32,9 @@ test says so; claims in docs, commit messages and chat carry no weight.
 | `lib/` | `prelude.fib` and the implicit library `fib/` (facades `fib.core fib.seq fib.coll fib.print` and their parts): M7, design in `spec/stdlib.md` |
 | `compiler/` | the compiler in fibber (M6, spec/bootstrap.md), bootstrapped: `syntax/` reader, `expand/` expander, `macros/` macro runner, `types/` type checker, `own/` ownership checker, `emit/` lIR emitter, `driver/` commands, `lir/` lIR reader, AST and whole-module checker, `llvm/` bindings of LLVM-C, `native/` lair (lowering, passes, JIT, AOT, the `native.api` and `native.call` that `emit.defs.jit`, `macros.runner` and `driver.native` use, the case harness `cases`, `cli`), `lairf.fib` the tool (`lairf check|run|build|emit-llvm|dump-ast|cases`; renamed `lair` when the Rust one goes), `lair/` legacy bindings of `liblair.so` (`lair.ffi` is still the byte and word helpers; `lair.jit`, `lair.call`, `lair.err` and the old `lair.fibm`/`lair.expand` serve `jit-demo.fib` only), tools `fibc.fib read.fib expand.fib types.fib own.fib explain.fib emit.fib`, `tests/` edge inputs, golden programs and compare scripts, `mirror-pending/` what the ports still owe the Rust |
 | `editors/vscode/` | the VS Code language pack for `.fib`: a TextMate grammar, language configuration and snippets; no build step |
-| `scripts/` | release engineering: `package.sh` (the relocatable tarball of stage 2), `package-rust.sh`, `fetch-seed.sh` (the seed named by `SEED`), `check-version.sh` (`VERSION` against `compiler/driver/version.fib`); `.github/workflows/release.yml` runs them on a `v*` tag; `SEED` at the root names the release (url, sha256) that builds stage 2 in CI and for releases (v0.1.3 now). `FIB_TARGET_CPU` (read by lair) picks the CPU code is generated for: `package.sh` sets `x86-64-v2` so a release runs on any CPU; unset, code is for the host. See README.md, Install and ROADMAP.md, Releases |
+| `scripts/` | release engineering: `package.sh` (the relocatable tarball of stage 2), `package-rust.sh`, `fetch-seed.sh` (the seed named by `SEED`), `check-version.sh` (`VERSION` against `compiler/driver/version.fib`); `.github/workflows/release.yml` runs them on a `v*` tag; `SEED` at the root names the release (url, sha256) that builds stage 2 in CI and for releases (v0.1.5 now; per-platform rows `url.PLATFORM=`/`sha256.PLATFORM=`). `FIB_TARGET_CPU` (read by lair) picks the CPU code is generated for: `package.sh` sets `x86-64-v2` so a release runs on any CPU; unset, code is for the host. See README.md, Install and ROADMAP.md, Releases |
+| `lib/fib/tensor/` | the explicit numerical library `fib.tensor` (dense tensors, strided views, fma GEMM, fused dense layers, vector math), design in `docs/design/numerical-library.md`; `lib/fib/simd.fib` (`fib.simd`), `lib/fib/view.fib` (exclusive windows: `with-view`, `with-tiles`) |
+| `docs/` | `design/` (one file per design, decisions in `decisions-2026-10-04.md`), `shootout/` (measurements with their commands: `simd.md`, `tensor.md`, `aarch64.md`), `shootout.md` |
 | `lir-audit/` | findings from auditing liar's lIR, each re-established as a case in `cases/lir/audit` |
 
 ## Rust standards
@@ -77,6 +79,14 @@ test says so; claims in docs, commit messages and chat carry no weight.
 - Fibber source follows the same limits as Rust where it can (files under
   500 lines, functions under 50) and uses the library's own tools: flat
   `cond`, `try-let`, `if-some`, destructuring, `defrecord`.
+
+- **The self-hosting trap.** A new core form or builtin name (`splat`, `native-lanes` so far) must not equal the name of a function the
+  compiler itself defines: once stage 2 compiles the compiler, the form captures the function and the fixed point breaks (F builds F3 but
+  they disagree, or F3 fails to build). Grep `compiler/` for the name first; the full gate catches it, the quick gate may not.
+- `--target TRIPLE` / `FIB_TARGET_TRIPLE` cross-compiles (objects and assembly; linking another target's executable is refused). A Mac
+  (Apple Silicon, `llvm@21` from Homebrew) is the real-hardware test for aarch64: `scripts/mac-check.sh`.
+- Vector fma: `simd/fma` is exact (a libm call per lane without hardware FMA); `simd/muladd` is fused where the target has FMA; library code
+  chooses with `(has-fma)`, never with the lane count.
 
 ## Performance cycle
 
