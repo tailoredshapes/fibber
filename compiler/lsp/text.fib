@@ -82,6 +82,37 @@
   (let ((w (widen src (. d start) (. d end))))
     (LsRange (offset->pos src (. w fst)) (offset->pos src (. w snd)))))
 
+;; ---- many positions in one text: an index of the line starts, so that each is found in the length of its line (a request that answers with
+;; thousands of ranges, document symbols or diagnostics of a big buffer, must not rescan the text from its start for each).
+(defstruct LsIndex (src: str starts: (Vec i64)))
+
+(defun index-new (src: str) -> LsIndex
+  (LsIndex src (loop ((k 0) (out [0]))
+                 (if (>= k (str-len src))
+                     out
+                     (recur (+ k 1) (if (= (tbyte src k) 10) (conj out (+ k 1)) out))))))
+
+;; The index of the last line that starts at or before `off`.
+(defun index-line :private (ix: LsIndex off: i64) -> i64
+  (loop ((lo 0) (hi (- (count (. ix starts)) 1)))
+    (if (>= lo hi)
+        lo
+        (let ((mid (quot (+ lo hi 1) 2)))
+          (if (<= (nth (. ix starts) mid) off) (recur mid hi) (recur lo (- mid 1)))))))
+
+(defun index-pos (ix: LsIndex off: i64) -> LsPos
+  (let ((src (. ix src))
+        (end (tclamp (. ix src) off))
+        (line (index-line ix (tclamp (. ix src) off))))
+    (loop ((k (nth (. ix starts) line)) (units 0))
+      (if (>= k end)
+          (LsPos line units)
+          (recur (+ k (tbytes (tbyte src k))) (+ units (tunits (tbyte src k))))))))
+
+(defun index-diag-range (ix: LsIndex d: LsDiag) -> LsRange
+  (let ((w (widen (. ix src) (. d start) (. d end))))
+    (LsRange (index-pos ix (. w fst)) (index-pos ix (. w snd)))))
+
 ;; ---- file URIs ----
 
 (defun thex :private (b: i64) -> i64
