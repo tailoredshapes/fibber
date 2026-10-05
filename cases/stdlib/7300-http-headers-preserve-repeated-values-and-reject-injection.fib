@@ -1,0 +1,20 @@
+;; spec: docs/design/http.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check) (:require [fib.http :as h]))
+(defun main () -> i64
+  (let [c (checks)
+        first (h/header-add (h/header-set {} "Content-Type" "text/plain") "Set-Cookie" "a=1")
+        headers (h/header-add first "SET-cookie" "b=2")]
+    (do (check c (= (h/header headers "CONTENT-TYPE") (some "text/plain")))
+        (check c (= (h/header-values headers "set-cookie") ["a=1" "b=2"]))
+        (check c (= (h/header-values (h/header-set headers "SET-COOKIE" "c=3") "set-cookie") ["c=3"]))
+        (check c (match (h/validate-headers headers) ((Ok _) true) ((Err _) false)))
+        (check c (match (h/validate-headers {"bad name" ["value"]}) ((Ok _) false) ((Err _) true)))
+        (check c (match (h/validate-headers {"é" ["value"]}) ((Ok _) false) ((Err _) true)))
+        (check c (match (h/validate-headers {"x-test" ["ok\r\ninjected: yes"]}) ((Ok _) false) ((Err _) true)))
+        (check c (match (h/validate-headers {"x-test" ["nul\0value"]}) ((Ok _) false) ((Err _) true)))
+        (checks-result c))))

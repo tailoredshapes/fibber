@@ -1,0 +1,27 @@
+(ns fib.os.net.connect (:use fib.core fib.os.errors)
+  (:require [fib.os.native :as n] [fib.os.abi :as a] [fib.os.backend :as b] [fib.os.io :as io]
+            [fib.os.net.address :as addr] [fib.os.net.poll :as p]))
+(extern connect :private (i32 ptr i32) -> i32)
+(extern getsockopt :private (i32 i32 i32 ptr ptr) -> i32)
+(defun check-connected :private (fd: i64) -> (Result unit OSError)
+  (unsafe (let [error (alloc 4) size (alloc 4)]
+    (do (store-i32 size 4i32)
+      (let [result (getsockopt (trunc i32 fd) (trunc i32 (. a/host socket-level))
+                    (trunc i32 (. a/host socket-error)) error size) saved (n/errno) code (sext i64 (load-i32 error))]
+        (do (free size) (free error)
+          (cond (< result 0i32) (Err (error-from-code saved "getsockopt"))
+                (!= code 0) (Err (error-from-code code "connect")) :else (Ok ()))))))))
+(defun start :private (fd: i64 host: str port: i64 timeout-ms: i64) -> (Result unit OSError)
+  (unsafe (let [address (alloc 128)]
+    (let [result (try-let [length (addr/encode host port address)]
+      (let [r (connect (trunc i32 fd) address (trunc i32 length)) saved (n/errno)]
+        (cond (= r 0i32) (Ok ())
+              (= saved (. a/host in-progress)) (try-let [ready (p/ready? fd true timeout-ms)]
+                (if ready (check-connected fd) (Err (timeout-error "connect"))))
+              :else (Err (error-from-code saved "connect")))))]
+      (do (free address) result)))))
+(defun connect-tcp (host: str port: i64 timeout-ms: i64) -> (Result i64 OSError)
+  (if (or (not (n/valid-text? host)) (< port 1) (> port 65535) (< timeout-ms 1) (> timeout-ms 3600000))
+    (Err (invalid-input "connect" "invalid connect options"))
+    (try-let [fd (checked (b/socket-new (addr/family host)) "socket")]
+      (match (start fd host port timeout-ms) ((Ok _) (Ok fd)) ((Err error) (do (io/close-fd fd) (Err error)))))))

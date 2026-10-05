@@ -1,0 +1,19 @@
+;; spec: docs/design/os.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll) (:require [fib.os :as os]))
+(defun main () -> i64
+  (let [c (checks) path (str "/tmp/fib-os-7401-" (os/process-id)) bytes (str-bytes "a\0b")]
+    (do (check c (= (os/write-file-bytes path bytes) (Ok ())))
+        (check c (match (os/read-file-bytes path 3) ((Ok data) (= (str-from-bytes data) "a\0b")) (_ false)))
+        (check c (match (os/read-file-bytes path 2) ((Err error) (= (. error kind) os/LimitExceeded)) (_ false)))
+        (check c (match (os/open-file path (with (os/default-file-options) (access os/WriteOnly) (create-new true)))
+          ((Err error) (= (. error kind) os/AlreadyExists)) (_ false)))
+        (check c (= (os/remove-file path) (Ok ())))
+        (check c (match (os/read-file-bytes path 10) ((Err error) (= (. error kind) os/NotFound)) (_ false)))
+        (check c (match (os/open-file "/tmp/no\0suffix" (os/default-file-options))
+          ((Err error) (= (. error kind) os/InvalidInput)) (_ false)))
+        (checks-result c))))

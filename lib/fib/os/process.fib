@@ -1,0 +1,32 @@
+(ns fib.os.process (:use fib.os.errors)
+  (:require [fib.os.native :as n] [fib.os.backend :as b]))
+(extern getpid :private () -> i32)
+(extern getppid :private () -> i32)
+(extern getcwd :private (ptr i64) -> ptr)
+(extern chdir :private (ptr) -> i32)
+(extern realpath :private (ptr ptr) -> ptr)
+(defun process-id () -> i64 (unsafe (sext i64 (getpid))))
+(defun parent-process-id () -> i64 (unsafe (sext i64 (getppid))))
+(defun absolute-path :private (path: str) -> (Result str OSError)
+  (if (starts-with? path "/") (Ok path)
+    (unsafe (let [text (n/c-text path) result (realpath text (n/pointer 0)) saved (n/errno)]
+      (do (free text)
+        (if (= (n/address result) 0) (Err (error-from-code saved "realpath"))
+          (let [resolved (n/c-string result)] (do (free result) (Ok resolved)))))))))
+(defun executable-path () -> (Result str OSError)
+  (unsafe (loop [size 256]
+    (let [buffer (alloc (+ size 1)) result (b/executable-path buffer size)]
+      (cond (>= result 0) (let [path (str-from-bytes (n/bytes-at buffer result))]
+                           (do (free buffer) (absolute-path path)))
+            (and (= result -34) (< size 1048576)) (do (free buffer) (recur (* size 2)))
+            :else (do (free buffer) (Err (error-from-code (- 0 result) "executable-path"))))))))
+(defun current-directory () -> (Result str OSError)
+  (unsafe (loop [size 256]
+    (let [buffer (alloc size) result (n/address (getcwd buffer size)) saved (n/errno)]
+      (cond (!= result 0) (let [path (n/c-string buffer)] (do (free buffer) (Ok path)))
+            (and (= saved 34) (< size 1048576)) (do (free buffer) (recur (* size 2)))
+            :else (do (free buffer) (Err (error-from-code saved "getcwd"))))))))
+(defun change-directory (path: str) -> (Result unit OSError)
+  (if (not (n/valid-text? path)) (Err (invalid-input "chdir" "NUL in path"))
+    (let [text (n/c-text path) result (unsafe (chdir text)) saved (n/errno)]
+      (unsafe (do (free text) (if (< result 0i32) (Err (error-from-code saved "chdir")) (Ok ())))))))

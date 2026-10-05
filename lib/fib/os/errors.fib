@@ -1,0 +1,30 @@
+(ns fib.os.errors (:require [fib.os.abi :as a] [fib.os.native :as n]))
+(defenum ErrorKind (NotFound) (PermissionDenied) (AlreadyExists) (InvalidInput)
+  (InvalidData) (WouldBlock) (Interrupted) (TimedOut) (BrokenPipe) (BadDescriptor)
+  (ConnectionReset) (ConnectionAborted) (ConnectionRefused) (AddressInUse)
+  (NotDirectory) (NotSupported) (LimitExceeded) (Cancelled) (Other))
+(defstruct OSError (kind: ErrorKind code: i64 operation: str message: str))
+(derive Eq OSError)
+(defun kind-for-code (code: i64) -> ErrorKind
+  (let [abi a/host]
+    (cond (= code 2) NotFound (or (= code 1) (= code 13)) PermissionDenied
+      (= code 17) AlreadyExists (= code 22) InvalidInput (= code 9) BadDescriptor
+      (= code 4) Interrupted (= code 32) BrokenPipe (= code 20) NotDirectory
+      (= code (. abi would-block)) WouldBlock (= code (. abi timed-out)) TimedOut
+      (= code (. abi connection-reset)) ConnectionReset
+      (= code (. abi connection-aborted)) ConnectionAborted
+      (= code (. abi connection-refused)) ConnectionRefused
+      (= code (. abi address-in-use)) AddressInUse
+      (= code (. abi not-supported)) NotSupported :else Other)))
+(defun error-from-code (code: i64 operation: str) -> OSError
+  (OSError (kind-for-code code) code operation (sys-errno-text code)))
+(defun last-error (operation: str) -> OSError (error-from-code (n/errno) operation))
+(defun invalid-input (operation: str message: str) -> OSError (OSError InvalidInput 22 operation message))
+(defun timeout-error (operation: str) -> OSError
+  (OSError TimedOut (. a/host timed-out) operation "operation timed out"))
+(defun checked (result: i64 operation: str) -> (Result i64 OSError)
+  (if (< result 0) (Err (error-from-code (- 0 result) operation)) (Ok result)))
+(defun checked-unit (result: i64 operation: str) -> (Result unit OSError)
+  (try-let [_ (checked result operation)] (Ok ())))
+(defun c-result (result: i64 operation: str) -> (Result i64 OSError)
+  (if (< result 0) (Err (last-error operation)) (Ok result)))

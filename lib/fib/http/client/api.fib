@@ -1,0 +1,67 @@
+;; Local closures keep the native handle private and the client on one thread.
+(ns fib.http.client.api (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes fib.http.url fib.http.client.types)
+  (:require [fib.http.client.ffi :as f] [fib.http.client.setup :as setup] [fib.http.wire :as w]))
+(defstruct State :private (handle: (Cell i64) options: Options))
+(defun build-http-client (o: Options) -> (Result Client Error)
+  (if (not (valid-options? o)) (Err (InvalidRequest "invalid HTTP client options"))
+    (try-let [handle (f/open-handle)]
+      (let [state (State (cell handle) o)]
+        (Ok (Client (fn (request: ClientRequest) (request-state state request))
+                    (fn () (close-state state))))))))
+(defun close-state :private (client: State) -> unit
+  (let [handle @(. client handle)]
+    (if (= handle 0) () (do (f/close-handle handle) (set! (. client handle) 0)))))
+(defun close-http-client (client: Client) -> unit ((. client close)))
+(defun completed :private (handle: i64 o: Options body: f/Buffer headers: f/Buffer) -> (Result Response Error)
+  (let [result (f/perform handle)]
+    (cond (f/buffer-full? body) (Err (LimitError "HTTP response body is too large"))
+          (f/buffer-full? headers) (Err (LimitError "HTTP response headers are too large"))
+          :else (try-let [_ result bytes (f/buffer-bytes body) fields (f/buffer-bytes headers)
+                          parsed (w/parse-response-headers (latin1-text fields)) code (f/status handle)]
+            (let [response (Response code (. parsed snd) bytes)]
+              (if (and (. o throw-exceptions) (>= code 400)) (Err (StatusError response)) (Ok response)))))))
+(defun with-buffers :private (client: State request: ClientRequest body: f/Buffer headers: f/Buffer) -> (Result Response Error)
+  (try-let [list (setup/header-list (. request headers))]
+    (let [handle @(. client handle)
+          result (try-let [_ (setup/configure handle request (. client options) body headers list)]
+                   (completed handle (. client options) body headers))]
+      (do (f/reset-handle handle) (f/free-headers list) result))))
+(defun with-body-buffer :private (client: State request: ClientRequest body: f/Buffer) -> (Result Response Error)
+  (try-let [headers (f/open-buffer (. (. client options) max-header-bytes))]
+    (let [result (with-buffers client request body headers)] (do (f/close-buffer headers) result))))
+(defun request-state :private (client: State request: ClientRequest) -> (Result Response Error)
+  (if (= @(. client handle) 0) (Err Closed)
+    (try-let [_ (setup/validate-request request) body (f/open-buffer (. (. client options) max-response-bytes))]
+      (let [result (with-body-buffer client request body)] (do (f/close-buffer body) result)))))
+(defun request-with (client: Client request: ClientRequest) -> (Result Response Error)
+  ((. client execute) request))
+(defun request (request: ClientRequest o: Options) -> (Result Response Error)
+  (try-let [client (build-http-client o)]
+    (let [result (request-with client request)] (do (close-http-client client) result))))
+(defun request-async (req: ClientRequest o: Options) -> (Task (Result Response Error))
+  (spawn (fn () (request req o))))
+(defn get
+  ([url: str] -> (Result Response Error) (request (ClientRequest "GET" url {} (array 0 0i8)) (default-options)))
+  ([url: str o: Options] -> (Result Response Error) (request (ClientRequest "GET" url {} (array 0 0i8)) o)))
+(defn post
+  ([url: str body: str] -> (Result Response Error)
+    (request (ClientRequest "POST" url {} (str-bytes body)) (default-options)))
+  ([url: str body: str o: Options] -> (Result Response Error) (request (ClientRequest "POST" url {} (str-bytes body)) o)))
+(defun form-request (method: str url: str params: (Vec (Pair str str))) -> ClientRequest
+  (ClientRequest method url {"content-type" ["application/x-www-form-urlencoded"]} (form-body params)))
+(defun head (url: str o: Options) -> (Result Response Error)
+  (request (ClientRequest "HEAD" url {} (array 0 0i8)) o))
+(defun put (url: str body: str o: Options) -> (Result Response Error)
+  (request (ClientRequest "PUT" url {} (str-bytes body)) o))
+(defun patch (url: str body: str o: Options) -> (Result Response Error)
+  (request (ClientRequest "PATCH" url {} (str-bytes body)) o))
+(defun delete (url: str o: Options) -> (Result Response Error)
+  (request (ClientRequest "DELETE" url {} (array 0 0i8)) o))
+(defun bearer-auth (request: ClientRequest token: str) -> ClientRequest
+  (with request (headers (header-set (. request headers) "authorization" (str "Bearer " token)))))
+(defun basic-auth (request: ClientRequest username: str password: str) -> ClientRequest
+  (with request (headers (header-set (. request headers) "authorization"
+    (str "Basic " (base64-encode (str-bytes (str username ":" password))))))))
+(defun wrap-header (handler: (fn :send (ClientRequest) (Result Response Error)) name: str value: str)
+  -> (fn :send (ClientRequest) (Result Response Error))
+  (fn (r: ClientRequest) (handler (with r (headers (header-set (. r headers) name value))))))

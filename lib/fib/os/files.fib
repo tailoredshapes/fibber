@@ -1,0 +1,39 @@
+(ns fib.os.files (:use fib.core fib.seq fib.coll fib.os.errors)
+  (:require [fib.os.io :as io] [fib.os.abi :as a]))
+(defenum FileAccess (ReadOnly) (WriteOnly) (ReadWrite))
+(defstruct FileOptions (access: FileAccess create: bool create-new: bool truncate: bool append: bool mode: i64))
+(defun default-file-options () -> FileOptions (FileOptions ReadOnly false false false false 420))
+(defun flags :private (o: FileOptions) -> i64
+  (let [abi a/host access (match (. o access) ((ReadOnly) 0) ((WriteOnly) 1) ((ReadWrite) 2))]
+    (bit-or access (bit-or (. abi cloexec-flag)
+      (bit-or (if (or (. o create) (. o create-new)) (. abi create-flag) 0)
+        (bit-or (if (. o create-new) (. abi exclusive-flag) 0)
+          (bit-or (if (. o truncate) (. abi truncate-flag) 0) (if (. o append) (. abi append-flag) 0))))))))
+(defun open-file (path: str o: FileOptions) -> (Result i64 OSError)
+  (if (or (< (. o mode) 0) (> (. o mode) 4095)
+          (and (= (. o access) ReadOnly) (or (. o truncate) (. o append))))
+      (Err (invalid-input "open" "invalid file options"))
+      (checked (sys-open path (flags o) (. o mode)) "open")))
+(defun remove-file (path: str) -> (Result unit OSError) (checked-unit (sys-unlink path) "unlink"))
+(defun create-directory (path: str mode: i64) -> (Result unit OSError)
+  (if (or (< mode 0) (> mode 4095)) (Err (invalid-input "mkdir" "invalid directory mode"))
+      (checked-unit (sys-mkdir path mode) "mkdir")))
+(defun remove-directory (path: str) -> (Result unit OSError) (checked-unit (sys-rmdir path) "rmdir"))
+(defun read-open :private (fd: i64 limit: i64) -> (Result (Array i8) OSError)
+  (let [out (cell (array 0 0i8))]
+    (loop []
+      (match (io/read-fd fd (min 4096 (+ 1 (- limit (array-len @out)))))
+        ((Err error) (if (= (. error kind) Interrupted) (recur) (Err error)))
+        ((Ok bytes)
+          (cond (= (array-len bytes) 0) (Ok @out)
+                (> (array-len bytes) (- limit (array-len @out))) (Err (OSError LimitExceeded 0 "read" "file exceeds byte limit"))
+                :else (do (dotimes (i (array-len bytes)) (array-push! &out (array-get bytes i))) (recur))))))))
+(defun read-file-bytes (path: str limit: i64) -> (Result (Array i8) OSError)
+  (if (or (< limit 0) (> limit 1073741824)) (Err (invalid-input "read" "invalid file byte limit"))
+    (try-let [fd (open-file path (default-file-options))]
+      (let [result (read-open fd limit) closed (io/close-fd fd)]
+        (match result ((Err error) (Err error)) ((Ok bytes) (try-let [_ closed] (Ok bytes))))))))
+(defun write-file-bytes (path: str bytes: (Array i8)) -> (Result unit OSError)
+  (try-let [fd (open-file path (with (default-file-options) (access WriteOnly) (create true) (truncate true)))]
+    (let [result (io/write-all fd bytes) closed (io/close-fd fd)]
+      (try-let [_ result _ closed] (Ok ())))))

@@ -1,0 +1,27 @@
+;; spec: docs/design/http.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check) (:require [fib.http :as h] [fib.http.wire :as w]))
+(defun main () -> i64
+  (let [c (checks)]
+    (do (check c (match (w/parse-request-head "POST /echo?q=one HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\n")
+          ((Ok r) (and (= (. r request-method) "POST") (= (. r uri) "/echo")
+                       (= (. r query-string) (some "q=one")) (= (. r version) "HTTP/1.1"))) ((Err _) false)))
+        (check c (match (w/request-framing {"content-length" ["3"]} 10) ((Ok (w/Fixed n)) (= n 3)) (_ false)))
+        (check c (match (w/request-framing {"transfer-encoding" ["chunked"]} 10) ((Ok (w/Chunked)) true) (_ false)))
+        (check c (match (w/request-framing {"content-length" ["3" "3"]} 10) ((Err _) true) (_ false)))
+        (check c (match (w/request-framing {"content-length" ["3"] "transfer-encoding" ["chunked"]} 10) ((Err _) true) (_ false)))
+        (check c (match (w/request-framing {"content-length" ["-1"]} 10) ((Err _) true) (_ false)))
+        (check c (match (w/request-framing {"content-length" ["999999999999999999999999"]} 10) ((Err _) true) (_ false)))
+        (check c (match (w/request-framing {"content-length" ["11"]} 10) ((Err (h/LimitError _)) true) (_ false)))
+        (check c (match (w/parse-request-head "GET / HTTP/1.1\r\n\r\n") ((Err _) true) (_ false)))
+        (check c (match (w/parse-request-head "GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n") ((Err _) true) (_ false)))
+        (check c (match (w/parse-request-head "GET / HTTP/1.1\r\nHost: x\r\n folded: no\r\n\r\n") ((Err _) true) (_ false)))
+        (check c (match (w/parse-request-head "GET / HTTP/1.1\nHost: x\n\n") ((Err _) true) (_ false)))
+        (check c (match (w/parse-chunk-size "a;name=value" 10) ((Ok n) (= n 10)) (_ false)))
+        (check c (match (w/parse-chunk-size "b" 10) ((Err _) true) (_ false)))
+        (check c (match (w/parse-chunk-size "ffffffffffffffffffffffff" 10) ((Err _) true) (_ false)))
+        (checks-result c))))

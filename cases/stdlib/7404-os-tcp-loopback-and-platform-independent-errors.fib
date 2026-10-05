@@ -1,0 +1,28 @@
+;; spec: docs/design/os.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check) (:require [fib.os :as os] [fib.os.net :as net]))
+(defun main () -> i64
+  (let [c (checks)]
+    (do (match (net/listen-tcp "127.0.0.1" 0 8)
+      ((Err _) (check c false))
+      ((Ok listener) (do
+        (check c (> (. listener port) 0))
+        (check c (match (net/accept-tcp (. listener fd)) ((Err error) (= (. error kind) os/WouldBlock)) (_ false)))
+        (match (net/connect-tcp "127.0.0.1" (. listener port) 1000)
+          ((Err _) (check c false))
+          ((Ok client) (do
+            (check c (= (net/send-all client (str-bytes "socket") 1000 (atom false)) (Ok ())))
+            (match (net/accept-tcp (. listener fd))
+              ((Err _) (check c false))
+              ((Ok accepted) (do
+                (check c (= (. accepted peer) "127.0.0.1"))
+                (check c (match (os/read-fd (. accepted fd) 64) ((Ok bytes) (= (str-from-bytes bytes) "socket")) (_ false)))
+                (check c (= (os/close-fd (. accepted fd)) (Ok ()))))))
+            (check c (= (os/close-fd client) (Ok ()))))))
+        (check c (= (os/close-fd (. listener fd)) (Ok ()))))))
+        (check c (match (net/listen-tcp "bad\0address" 0 8) ((Err error) (= (. error kind) os/InvalidInput)) (_ false)))
+        (checks-result c))))

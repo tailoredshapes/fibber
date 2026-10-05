@@ -1,0 +1,22 @@
+;; Shared immutable HTTP values. Body bytes are never implicitly decoded.
+(ns fib.http.types (:use fib.core))
+(defstruct Response (status: i64 headers: (Map str (Vec str)) body: (Array i8)))
+(impl Eq Response
+  (= (self other)
+    (and (= (. self status) (. other status)) (= (. self headers) (. other headers))
+      (= (array-len (. self body)) (array-len (. other body)))
+      (loop [i 0]
+        (if (= i (array-len (. self body))) true
+          (if (= (array-get (. self body) i) (array-get (. other body) i)) (recur (+ i 1)) false))))))
+(defenum Error (InvalidRequest message: str) (ProtocolError message: str)
+  (LimitError message: str) (TransportError code: i64 message: str)
+  (StatusError response: Response) (Closed) (Cancelled))
+(derive Eq Error)
+(defstruct Request (request-method: str uri: str query-string: (Option str)
+  headers: (Map str (Vec str)) body: (Array i8) trailers: (Map str (Vec str))
+  version: str remote-addr: str server-port: i64))
+(defstruct ClientRequest (method: str url: str headers: (Map str (Vec str)) body: (Array i8)))
+(defun error-message (error: Error) -> str
+  (match error ((InvalidRequest s) s) ((ProtocolError s) s) ((LimitError s) s)
+    ((TransportError _ s) s) ((StatusError r) (str "HTTP status " (. r status)))
+    ((Closed) "HTTP handle is closed") ((Cancelled) "HTTP operation cancelled")))

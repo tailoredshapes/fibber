@@ -1,0 +1,38 @@
+;; Fixed native worker pool: no unbounded task per connection.
+(ns fib.http.server.api (:use fib.core fib.seq fib.coll fib.http.types fib.http.server.types)
+  (:require [fib.http.server.transport :as t] [fib.http.server.connection :as c] [fib.os.errors :as os]))
+(defstruct Server (port: i64 stop: (fn () (Result unit Error)) wait: (fn () (Result unit Error))))
+(defstruct State :private (listener: (Cell i64) stopping: (Atom bool) tasks: (Vec (Task i64))))
+(defun worker :private (fd: i64 handler: (fn :send (Request) Response) o: Options stop: (Atom bool)) -> i64
+  (loop []
+    (if @stop 0
+      (match (t/ready? fd false 100)
+        ((Err _) (do (reset! stop true) 1))
+        ((Ok false) (recur))
+        ((Ok true) (match (t/accept-connection fd)
+          ((Err (TransportError e _)) (if (includes? (os/kind-for-code e) [os/Interrupted os/WouldBlock os/ConnectionAborted])
+            (recur) (do (reset! stop true) 1)))
+          ((Err _) (do (reset! stop true) 1))
+          ((Ok accepted) (do (c/serve-connection (. accepted fd) (. accepted peer) handler o stop)
+                            (t/close-fd (. accepted fd)) (recur)))))))))
+(defun run-server (handler: (fn :send (Request) Response) o: Options) -> (Result Server Error)
+  (if (not (valid-options? o)) (Err (InvalidRequest "invalid HTTP server options"))
+    (try-let [listener (t/open-listener (. o host) (. o port) (. o backlog))]
+      (let [fd (. listener fd) actual (with o (port (. listener port))) stop (atom false)
+            tasks (loop [i 0 out: (Vec (Task i64)) []]
+              (if (= i (. o workers)) out
+                (recur (+ i 1) (conj out (spawn (fn () (worker fd handler actual stop)))))))]
+        (let [state (State (cell fd) stop tasks)]
+          (Ok (Server (. listener port) (fn () (stop-state state)) (fn () (join-workers state)))))))))
+(defun port (server: Server) -> i64 (. server port))
+(defun join-workers :private (server: State) -> (Result unit Error)
+  (let [failed (reduce (fn (n: i64 task: (Task i64)) (+ n (join task))) 0 (. server tasks))]
+    (if (= failed 0) (Ok ()) (Err (TransportError 5 "HTTP server worker failed")))))
+(defun stop-state :private (server: State) -> (Result unit Error)
+  (let [fd @(. server listener)]
+    (if (< fd 0) (Ok ())
+      (do (reset! (. server stopping) true)
+          (let [result (join-workers server)]
+            (do (t/close-fd fd) (set! (. server listener) -1) result))))))
+(defun stop-server (server: Server) -> (Result unit Error) ((. server stop)))
+(defun wait-server (server: Server) -> (Result unit Error) ((. server wait)))

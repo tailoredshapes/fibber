@@ -1,0 +1,12 @@
+;; A reentrant UTC conversion supplies HTTP's Date header on native servers.
+(ns fib.http.server.date (:require [fib.http.native :as n] [fib.os.time :as u]))
+(extern gmtime_r :private (ptr ptr) -> ptr)
+(extern strftime :private (ptr i64 ptr ptr) -> i64)
+(defun http-date () -> str
+  (unsafe (let [seconds (alloc 8) tm (alloc 128) out (alloc 64)
+                format (n/c-text "%a, %d %b %Y %H:%M:%S GMT")]
+    (do (store-i64 seconds (quot (u/wall-now) 1000000000))
+      (let [converted (n/address (gmtime_r seconds tm))
+            size (if (= converted 0) 0 (strftime out 64 format tm))
+            text (str-from-bytes (n/bytes-at out size))]
+        (do (free format) (free out) (free tm) (free seconds) text))))))

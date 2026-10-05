@@ -1,0 +1,35 @@
+(ns fib.os.directories (:use fib.core fib.seq fib.coll fib.os.errors)
+  (:require [fib.os.native :as n] [fib.os.abi :as a] [fib.os.backend :as b]))
+(extern opendir :private (ptr) -> ptr)
+(extern closedir :private (ptr) -> i32)
+(extern mkdtemp :private (ptr) -> ptr)
+(defenum EntryKind (RegularFile) (Directory) (SymbolicLink) (UnknownEntry) (OtherEntry))
+(defstruct DirectoryEntry (name: str kind: EntryKind))
+(defun entry-at :private (entry: ptr) -> DirectoryEntry
+  (unsafe (let [kind (load-i8 (ptr+ entry (. a/host dirent-type)))]
+    (DirectoryEntry (n/c-string (ptr+ entry (. a/host dirent-name)))
+      (cond (= kind 8i8) RegularFile (= kind 4i8) Directory (= kind 10i8) SymbolicLink
+            (= kind 0i8) UnknownEntry :else OtherEntry)))))
+(defun collect :private (directory: ptr) -> (Result (Vec DirectoryEntry) OSError)
+  (loop [entries: (Vec DirectoryEntry) []]
+    (do (b/clear-errno)
+      (let [entry (b/directory-next directory) saved (n/errno)]
+        (if (= (n/address entry) 0)
+          (if (= saved 0) (Ok entries) (Err (error-from-code saved "readdir")))
+          (let [item (entry-at entry)]
+            (recur (if (or (= (. item name) ".") (= (. item name) "..")) entries (conj entries item)))))))))
+(defun list-directory (path: str) -> (Result (Vec DirectoryEntry) OSError)
+  (if (not (n/valid-text? path)) (Err (invalid-input "opendir" "NUL in directory path"))
+    (unsafe (let [text (n/c-text path) directory (opendir text) saved (n/errno)]
+      (do (free text)
+        (if (= (n/address directory) 0) (Err (error-from-code saved "opendir"))
+          (let [result (collect directory) closed (closedir directory) close-error (n/errno)]
+            (match result ((Err error) (Err error))
+              ((Ok entries) (if (< closed 0i32) (Err (error-from-code close-error "closedir")) (Ok entries)))))))))))
+(defun create-temp-directory (template: str) -> (Result str OSError)
+  (if (or (not (n/valid-text? template)) (< (str-len template) 6)
+          (not (= (str-slice template (max 0 (- (str-len template) 6)) (str-len template)) "XXXXXX")))
+    (Err (invalid-input "mkdtemp" "template must end in XXXXXX and contain no NUL"))
+    (unsafe (let [text (n/c-text template) result (mkdtemp text) saved (n/errno)]
+      (if (= (n/address result) 0) (do (free text) (Err (error-from-code saved "mkdtemp")))
+        (let [path (n/c-string text)] (do (free text) (Ok path))))))))

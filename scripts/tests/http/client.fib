@@ -1,0 +1,59 @@
+;; Integration fixture: deterministic output, including binary bodies.
+(ns main (:use fib.core fib.seq fib.coll fib.print)
+  (:require [fib.http :as h] [fib.http.client :as c] [fib.unix :as u]))
+(defun hex (bytes: (Array i8)) -> str
+  (let [digits "0123456789abcdef"]
+    (str-join (loop [i 0 out: (Vec str) []]
+      (if (= i (array-len bytes)) out
+        (let [b (zext i64 (array-get bytes i))]
+          (recur (+ i 1) (conj out (str (str-slice digits (shr b 4) (+ (shr b 4) 1))
+                                        (str-slice digits (bit-and b 15) (+ (bit-and b 15) 1)))))))))))
+(defun print-response (r: h/Response) -> unit
+  (do (println (str "status=" (. r status))) (println (str "body=" (hex (. r body))))
+      (println (str "cookies=" (str-join (h/header-values (. r headers) "set-cookie"))))
+      (println (str "peer=" (unwrap-or (h/header (. r headers) "x-peer") "")))))
+(defun print-result (result: (Result h/Response h/Error)) -> i64
+  (match result
+    ((Ok r) (do (print-response r) 0))
+    ((Err (h/StatusError r)) (do (print-response r) (println "error=status") 2))
+    ((Err (h/LimitError s)) (do (println (str "error=limit " s)) 3))
+    ((Err (h/Closed)) (do (println "error=closed") 4))
+    ((Err error) (do (println (str "error=transport " (h/error-message error))) 5))))
+(defun options () -> c/Options
+  (with (c/default-options)
+    (follow-redirects (= (u/getenv "FIB_HTTP_FOLLOW") (some "1")))
+    (throw-exceptions (!= (u/getenv "FIB_HTTP_THROW") (some "0")))
+    (decompress (!= (u/getenv "FIB_HTTP_DECOMPRESS") (some "0")))
+    (timeout-ms (unwrap-or (parse-long (unwrap-or (u/getenv "FIB_HTTP_TIMEOUT") "3000")) 3000))
+    (max-response-bytes (unwrap-or (parse-long (unwrap-or (u/getenv "FIB_HTTP_LIMIT") "1048576")) 1048576))
+    (max-header-bytes (unwrap-or (parse-long (unwrap-or (u/getenv "FIB_HTTP_HEADER_LIMIT") "65536")) 65536))
+    (ca-file (u/getenv "FIB_HTTP_CA"))))
+(defun body (mode: str) -> (Array i8)
+  (if (= mode "binary")
+    (let [bytes (cell (array 4 0i8))]
+      (do (array-set! &bytes 1 -1i8) (array-set! &bytes 2 -128i8) (array-set! &bytes 3 65i8) @bytes))
+    (str-bytes (unwrap-or (u/getenv "FIB_HTTP_BODY") ""))))
+(defun reuse (request: h/ClientRequest o: c/Options) -> i64
+  (match (c/build-http-client o)
+    ((Err error) (print-result (Err error)))
+    ((Ok client)
+      (let [result (loop [i 0]
+        (if (= i 3) 0 (let [code (print-result (c/request-with client request))]
+          (if (= code 0) (recur (+ i 1)) code))))]
+        (do (c/close-http-client client) (c/close-http-client client) result)))))
+(defun parallel (request: h/ClientRequest o: c/Options) -> i64
+  (let [tasks (loop [i 0 out: (Vec (Task (Result h/Response h/Error))) []]
+    (if (= i 4) out (recur (+ i 1) (conj out (c/request-async request o)))))]
+    (reduce (fn (code: i64 task: (Task (Result h/Response h/Error))) (+ code (print-result (join task)))) 0 tasks)))
+(defun main () -> i64
+  (let [mode (unwrap-or (u/getenv "FIB_HTTP_MODE") "single") o (options)
+        request (h/ClientRequest (unwrap-or (u/getenv "FIB_HTTP_METHOD") "GET")
+          (unwrap-or (u/getenv "FIB_HTTP_URL") "http://127.0.0.1:8080/") {} (body mode))]
+    (cond (= mode "reuse") (reuse request o) (= mode "async") (parallel request o)
+          (= mode "closed") (match (c/build-http-client o)
+            ((Err error) (print-result (Err error)))
+            ((Ok client) (do (c/close-http-client client) (print-result (c/request-with client request)))))
+          (= mode "form") (print-result (c/request (c/form-request "POST" (. request url) [(Pair "q" "a b+é") (Pair "tag" "x") (Pair "tag" "y")]) o))
+          (= mode "bearer") (print-result (c/request (c/bearer-auth request "test-token") o))
+          (= mode "basic") (print-result (c/request (c/basic-auth request "username" "password") o))
+          :else (print-result (c/request request o)))))

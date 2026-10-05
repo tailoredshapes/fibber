@@ -1,0 +1,23 @@
+;; spec: docs/design/os.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check) (:require [fib.os :as os] [fib.os.platform :as p]))
+(defun main () -> i64
+  (let [c (checks) key (str "FIB_OS_TEST_7403_" (os/process-id)) start (os/clock-now)]
+    (do (check c (> (os/process-id) 0)) (check c (> (os/parent-process-id) 0))
+        (check c (= (os/setenv key "value") (Ok ())))
+        (check c (= (os/getenv key) (some "value")))
+        (check c (= (os/unsetenv key) (Ok ()))) (check c (= (os/getenv key) nil))
+        (check c (match (os/setenv "bad=name" "x") ((Err error) (= (. error kind) os/InvalidInput)) (_ false)))
+        (check c (= (os/sleep-ns 2000000) (Ok ())))
+        (check c (>= (- (os/clock-now) start) 2000000)) (check c (> (os/wall-now) 1600000000000000000))
+        (check c (match (os/system-info) ((Ok info) (and (= (. info system) (p/name (p/current))) (> (str-len (. info machine)) 0))) (_ false)))
+        (check c (match (os/page-size) ((Ok n) (> n 0)) (_ false)))
+        (check c (match (os/available-cpus) ((Ok n) (> n 0)) (_ false)))
+        (check c (match (os/current-directory) ((Ok path) (starts-with? path "/")) (_ false)))
+        (check c (match (os/random-bytes 513) ((Ok bytes) (= (array-len bytes) 513)) (_ false)))
+        (check c (match (os/random-bytes -1) ((Err error) (= (. error kind) os/InvalidInput)) (_ false)))
+        (checks-result c))))

@@ -1,0 +1,10 @@
+(ns fib.os.random (:use fib.core fib.os.errors) (:require [fib.os.native :as n]))
+(extern getentropy :private (ptr i64) -> i32)
+(defun random-bytes (size: i64) -> (Result (Array i8) OSError)
+  (if (or (< size 0) (> size 67108864)) (Err (invalid-input "getentropy" "invalid random byte count"))
+    (unsafe (let [buffer (alloc (+ size 1))
+                  result (loop [offset 0]
+                    (if (= offset size) (Ok ())
+                      (let [count (min 256 (- size offset)) r (getentropy (ptr+ buffer offset) count)]
+                        (if (< r 0i32) (Err (last-error "getentropy")) (recur (+ offset count))))))]
+      (let [answer (try-let [_ result] (Ok (n/bytes-at buffer size)))] (do (free buffer) answer))))))

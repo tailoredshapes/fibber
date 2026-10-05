@@ -1,0 +1,24 @@
+;; Integration fixture: stdin controls shutdown, stdout reports the bound port.
+(ns main (:use fib.core fib.seq fib.coll fib.print)
+  (:require [fib.http :as h] [fib.http.server :as s] [fib.unix :as u]))
+(defun handler (request: h/Request) -> h/Response
+  (cond (= (. request uri) "/health") (h/response "ok")
+        (= (. request uri) "/echo") (h/Response 200 {} (. request body))
+        (= (. request uri) "/query") (h/response (unwrap-or (. request query-string) ""))
+        (= (. request uri) "/trailers") (h/response (unwrap-or (h/header (. request trailers) "x-trailer") ""))
+        (= (. request uri) "/port") (h/response (str (. request server-port)))
+        (= (. request uri) "/cookies") (h/Response 200 {"set-cookie" ["a=1" "b=2"]} (str-bytes "cookies"))
+        (= (. request uri) "/slow") (do (u/sleep-ns 150000000) (h/response "slow"))
+        (= (. request uri) "/large") (h/Response 200 {} (array 8388608 65i8))
+        (= (. request uri) "/no-content") (h/text-response 204 "ignored")
+        (= (. request uri) "/not-modified") (h/text-response 304 "ignored")
+        (= (. request uri) "/bad-response") (h/with-header (h/response "no") "x" "bad\r\nInjected: true")
+        :else (h/text-response 404 "missing")))
+(defun main () -> i64
+  (let [options (with (s/default-options) (port 0) (workers 4) (max-body-bytes 1024)
+                     (max-header-bytes 2048) (max-line-bytes 256) (request-timeout-ms 500)
+                     (max-requests-per-connection 4))]
+    (match (s/run-server (s/wrap-header handler "x-server" "fibber") options)
+      ((Err error) (do (eprintln (h/error-message error)) 1))
+      ((Ok server) (do (println (s/port server)) (u/fd-read 0 1)
+        (match (s/stop-server server) ((Ok _) 0) ((Err error) (do (eprintln (h/error-message error)) 1))))))))

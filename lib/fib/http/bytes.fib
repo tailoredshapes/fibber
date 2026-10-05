@@ -1,0 +1,44 @@
+;; UTF-8 validation precedes conversion; arbitrary HTTP bodies remain bytes.
+(ns fib.http.bytes (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers))
+(defun utf8? (bytes: (Array i8)) -> bool
+  (loop [i 0]
+    (if (= i (array-len bytes)) true
+      (let [b (zext i64 (array-get bytes i))
+            width (cond (< b 128) 1 (and (>= b 194) (<= b 223)) 2
+                        (and (>= b 224) (<= b 239)) 3 (and (>= b 240) (<= b 244)) 4 :else 0)]
+        (if (or (= width 0) (> width (- (array-len bytes) i))) false
+          (let [second (if (> width 1) (zext i64 (array-get bytes (+ i 1))) 0)]
+            (if (or (and (= b 224) (< second 160)) (and (= b 237) (>= second 160))
+                    (and (= b 240) (< second 144)) (and (= b 244) (>= second 144))) false
+              (if (loop [j 1]
+                    (if (= j width) true
+                      (let [c (zext i64 (array-get bytes (+ i j)))]
+                        (if (and (>= c 128) (<= c 191)) (recur (+ j 1)) false))))
+                  (recur (+ i width)) false))))))))
+(defun decode-text (bytes: (Array i8)) -> (Result str Error)
+  (if (utf8? bytes) (Ok (str-from-bytes bytes)) (Err (ProtocolError "HTTP body is not valid UTF-8"))))
+(defun body-text (response: Response) -> (Result str Error) (decode-text (. response body)))
+(defun text-response (status: i64 text: str) -> Response
+  (Response status {"content-type" ["text/plain; charset=utf-8"]} (str-bytes text)))
+(defun response (text: str) -> Response (text-response 200 text))
+(defun with-header (response: Response name: str value: str) -> Response
+  (Response (. response status) (header-set (. response headers) name value) (. response body)))
+(defun concat-bytes (parts: (Vec (Array i8))) -> (Array i8)
+  (let [size (reduce (fn (n: i64 p: (Array i8)) (+ n (array-len p))) 0 parts)
+        out (cell (array size 0i8))]
+    (do (loop [i 0 offset 0]
+          (if (= i (count parts)) ()
+            (let [p (nth parts i)]
+              (do (dotimes (j (array-len p)) (array-set! &out (+ offset j) (array-get p j)))
+                  (recur (+ i 1) (+ offset (array-len p))))))) @out)))
+(defun latin1-text (bytes: (Array i8)) -> str
+  (let [out (cell (array (* 2 (array-len bytes)) 0i8))
+        end (loop [i 0 j 0]
+          (if (= i (array-len bytes)) j
+            (let [b (zext i64 (array-get bytes i))]
+              (if (< b 128)
+                (do (array-set! &out j (trunc i8 b)) (recur (+ i 1) (+ j 1)))
+                (do (array-set! &out j (trunc i8 (bit-or 192 (shr b 6))))
+                    (array-set! &out (+ j 1) (trunc i8 (bit-or 128 (bit-and b 63))))
+                    (recur (+ i 1) (+ j 2)))))))]
+    (str-from-bytes (array-copy @out 0 end))))

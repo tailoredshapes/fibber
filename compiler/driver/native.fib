@@ -6,7 +6,7 @@
 ;; LD_LIBRARY_PATH.
 ;; `run` calls `main` on the stack of the driver's thread through `call-i64`, as the Rust calls it on its own.
 (ns driver.native
-  (:require [native.api :as jit] [native.call :as call] [lair.ffi :as ffi]))
+  (:require [native.api :as jit] [native.call :as call] [lair.ffi :as ffi] [fib.os.native :as os]))
 
 (extern getenv :private (ptr) -> ptr)
 (extern setenv :private (ptr ptr i32) -> i32)
@@ -15,7 +15,6 @@
 (extern open :private (ptr i32) -> i32)
 (extern read :private (i32 ptr i64) -> i64)
 (extern close :private (i32) -> i32)
-(extern __errno_location :private () -> ptr)
 (extern strerror :private (i32) -> ptr)
 (extern signal :private (i32 i64) -> i64)
 (extern write :private (i32 ptr i64) -> i64)
@@ -40,9 +39,9 @@
         (f (unsafe
              (let ((fd (sext i64 (open p 0i32))))
                (if (< fd 0)
-                   (errno-fault (sext i64 (load-i32 (__errno_location))))
+                   (errno-fault (os/errno))
                    (let ((n (read (trunc i32 fd) buf 1))
-                         (code (sext i64 (load-i32 (__errno_location)))))
+                         (code (os/errno)))
                      (do (close (trunc i32 fd))
                          (if (< n 0) (errno-fault code) (Fault 0 "stream did not contain valid UTF-8")))))))))
     (do (ffi/free-addr (ffi/ptr->addr p))
@@ -60,7 +59,7 @@
                 (recur (+ done w))
                 (if (= w 0)
                     (Fault 1 "failed to write whole buffer")
-                    (let ((code (sext i64 (load-i32 (__errno_location)))))
+                    (let ((code (os/errno)))
                       (if (= code 4) (recur done) (errno-fault code))))))
           (Fault 0 "")))))
 

@@ -1,21 +1,11 @@
 ;; compiler/expand/libdir.fib: where the library source is, for a tool that is installed and moved (scripts/package.sh). The release
 ;; layout is `bin/fibc`, `lib/liblair.so`, `share/fibber/lib/` (the library, `prelude.fib` and `fib/`): when the file `share/fibber/lib/prelude.fib`
-;; is there beside the directory of the running executable (/proc/self/exe), that directory is the library; else it is `lib` of the working
+;; is there beside the directory of the running executable, that directory is the library; else it is `lib` of the working
 ;; directory, as it always was (the repository root). A FIB_LIB that names a directory with a `prelude.fib` wins over both. No Rust counterpart: the Rust tools embed the library.
-(ns expand.libdir
-  (:require [lair.ffi :as ffi]))
+(ns expand.libdir (:require [fib.os.process :as os]))
 
-(extern readlink :private (ptr ptr i64) -> i64)
-
-;; The path the running executable has, or nil if the system does not say (not Linux).
 (defun exe-path :private () -> (Option str)
-  (let ((link (ffi/bytes-new "/proc/self/exe"))
-        (buf (unsafe (alloc 4096)))
-        (n (unsafe (readlink link buf 4096)))
-        (text (if (> n 0) (some (ffi/text-at (ffi/ptr->addr buf) n)) nil)))
-    (do (ffi/free-addr (ffi/ptr->addr link))
-        (ffi/free-addr (ffi/ptr->addr buf))
-        text)))
+  (match (os/executable-path) ((Ok path) (some path)) ((Err _) nil)))
 
 ;; The path with its last component taken off: `/a/b/c` is `/a/b`; "" for none.
 (defun parent :private (path: str) -> str

@@ -1,0 +1,21 @@
+;; spec: docs/design/os.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check) (:require [fib.os :as os]))
+(defun main () -> i64
+  (let [c (checks)]
+    (do (match (os/make-pipe)
+      ((Err _) (check c false))
+      ((Ok fds) (let [r (. fds fst) w (. fds snd)]
+        (do (check c (= (os/set-nonblocking r true) (Ok ())))
+            (check c (match (os/read-fd r 8) ((Err error) (= (. error kind) os/WouldBlock)) (_ false)))
+            (check c (= (os/write-all w (str-bytes "pipe")) (Ok ())))
+            (check c (match (os/read-fd r 8) ((Ok bytes) (= (str-from-bytes bytes) "pipe")) (_ false)))
+            (check c (= (os/close-fd w) (Ok ())))
+            (check c (match (os/read-fd r 8) ((Ok bytes) (= (array-len bytes) 0)) (_ false)))
+            (check c (= (os/close-fd r) (Ok ())))
+            (check c (match (os/read-fd r 1) ((Err error) (= (. error kind) os/BadDescriptor)) (_ false)))))))
+        (checks-result c))))

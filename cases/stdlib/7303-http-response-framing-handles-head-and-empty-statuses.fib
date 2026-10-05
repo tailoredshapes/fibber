@@ -1,0 +1,22 @@
+;; spec: docs/design/http.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check) (:require [fib.http :as h] [fib.http.wire :as w]))
+(defun encoded (response: h/Response method: str keep: bool) -> str
+  (match (w/response-bytes response method keep) ((Ok bytes) (str-from-bytes bytes)) ((Err _) "error")))
+(defun main () -> i64
+  (let [c (checks) response (h/with-header (h/text-response 200 "hé") "Content-Length" "999")]
+    (do (check c (some? (str-find (encoded response "GET" true) "content-length: 3\r\n" 0)))
+        (check c (some? (str-find (encoded response "GET" true) "\r\n\r\nhé" 0)))
+        (check c (some? (str-find (encoded response "HEAD" false) "content-length: 3\r\n" 0)))
+        (check c (not (some? (str-find (encoded response "HEAD" false) "hé" 0))))
+        (check c (not (some? (str-find (encoded (h/text-response 204 "ignored") "GET" true) "content-length:" 0))))
+        (check c (not (some? (str-find (encoded (h/text-response 304 "ignored") "GET" true) "ignored" 0))))
+        (check c (match (w/response-bytes (h/with-header response "x" "a\r\nb: c") "GET" false) ((Err _) true) (_ false)))
+        (check c (match (w/parse-response-headers "HTTP/1.1 100 Continue\r\n\r\nHTTP/2 200\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nX-Trailer: yes\r\n")
+          ((Ok p) (and (= (. p fst) 200) (= (h/header-values (. p snd) "set-cookie") ["a=1" "b=2"])
+                       (= (h/header (. p snd) "x-trailer") (some "yes")))) (_ false)))
+        (checks-result c))))

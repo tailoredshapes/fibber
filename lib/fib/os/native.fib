@@ -1,0 +1,20 @@
+;; Internal unsafe C boundary shared by OS services and native consumers.
+(ns fib.os.native (:require [fib.os.backend :as b]))
+(extern setenv (ptr ptr i32) -> i32)
+(extern unsetenv (ptr) -> i32)
+(defun errno () -> i64 (b/errno))
+(defun address (p: ptr) -> i64
+  (unsafe (let [slot (alloc 8)] (do (store-ptr slot p) (let [n (load-i64 slot)] (do (free slot) n))))))
+(defun pointer (n: i64) -> ptr
+  (unsafe (let [slot (alloc 8)] (do (store-i64 slot n) (let [p (load-ptr slot)] (do (free slot) p))))))
+(defun bytes-new (bytes: (Array i8)) -> ptr
+  (unsafe (let [p (alloc (+ (array-len bytes) 1))]
+    (do (dotimes (i (array-len bytes)) (store-i8 (ptr+ p i) (array-get bytes i))) p))))
+(defun c-text (text: str) -> ptr (bytes-new (str-bytes text)))
+(defun bytes-at (p: ptr n: i64) -> (Array i8)
+  (let [out (cell (array n 0i8))]
+    (unsafe (do (dotimes (i n) (array-set! &out i (load-i8 (ptr+ p i)))) @out))))
+(defun c-string (p: ptr) -> str
+  (unsafe (let [n (loop [i 0] (if (= (load-i8 (ptr+ p i)) 0i8) i (recur (+ i 1))))]
+    (str-from-bytes (bytes-at p n)))))
+(defun valid-text? (text: str) -> bool (not (some? (str-find text "\0" 0))))

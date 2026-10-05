@@ -1,0 +1,24 @@
+;; sockaddr layout is contained here, never in a protocol library.
+(ns fib.os.net.address (:use fib.core fib.os.errors)
+  (:require [fib.os.native :as n] [fib.os.abi :as a]))
+(extern inet_pton :private (i32 ptr ptr) -> i32)
+(extern inet_ntop :private (i32 ptr ptr i32) -> ptr)
+(defun family (host: str) -> i64 (if (some? (str-find host ":" 0)) (. a/host ipv6-family) 2))
+(defun size (family: i64) -> i64 (if (= family 2) 16 28))
+(defun encode (host: str port: i64 address: ptr) -> (Result i64 OSError)
+  (if (or (not (n/valid-text? host)) (< port 0) (> port 65535)) (Err (invalid-input "socket" "invalid address or port"))
+    (let [kind (family host) length (size kind) text (n/c-text host)
+          parsed (unsafe (inet_pton (trunc i32 kind) text (ptr+ address (if (= kind 2) 4 8))))]
+      (unsafe (do (free text)
+        (if (. a/host sockaddr-length)
+            (do (store-i8 address (trunc i8 length)) (store-i8 (ptr+ address 1) (trunc i8 kind)))
+            (store-i16 address (trunc i16 kind)))
+        (store-i8 (ptr+ address 2) (trunc i8 (shr port 8))) (store-i8 (ptr+ address 3) (trunc i8 port))
+        (if (= parsed 1i32) (Ok length) (Err (invalid-input "socket" "expected an IPv4 or IPv6 address"))))))))
+(defun port-at (address: ptr) -> i64
+  (unsafe (+ (shl (zext i64 (load-i8 (ptr+ address 2))) 8) (zext i64 (load-i8 (ptr+ address 3))))))
+(defun peer-at (address: ptr) -> str
+  (unsafe (let [kind (if (. a/host sockaddr-length) (zext i64 (load-i8 (ptr+ address 1))) (zext i64 (load-i16 address)))
+                out (alloc 64) result (n/address (inet_ntop (trunc i32 kind) (ptr+ address (if (= kind 2) 4 8)) out 64i32))
+                text (if (= result 0) "" (n/c-string out))]
+    (do (free out) text))))

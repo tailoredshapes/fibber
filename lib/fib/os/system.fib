@@ -1,0 +1,15 @@
+(ns fib.os.system (:use fib.os.errors) (:require [fib.os.native :as n] [fib.os.abi :as a]))
+(extern uname :private (ptr) -> i32)
+(extern getpagesize :private () -> i32)
+(extern sysconf :private (i32) -> i64)
+(defstruct SystemInfo (system: str hostname: str release: str version: str machine: str))
+(defun system-info () -> (Result SystemInfo OSError)
+  (unsafe (let [buffer (alloc 4096) result (uname buffer) saved (n/errno) width (. a/host uname-width)]
+    (if (< result 0i32) (do (free buffer) (Err (error-from-code saved "uname")))
+      (let [info (SystemInfo (n/c-string buffer) (n/c-string (ptr+ buffer width))
+        (n/c-string (ptr+ buffer (* width 2))) (n/c-string (ptr+ buffer (* width 3)))
+        (n/c-string (ptr+ buffer (* width 4))))]
+        (do (free buffer) (Ok info)))))))
+(defun page-size () -> (Result i64 OSError) (c-result (unsafe (sext i64 (getpagesize))) "getpagesize"))
+(defun available-cpus () -> (Result i64 OSError)
+  (c-result (unsafe (sysconf (trunc i32 (. a/host online-cpus)))) "sysconf"))

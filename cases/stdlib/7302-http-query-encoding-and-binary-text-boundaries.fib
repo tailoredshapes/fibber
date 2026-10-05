@@ -1,0 +1,38 @@
+;; spec: docs/design/http.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check) (:require [fib.http :as h]))
+(defun invalid-bytes? (values: (Vec i64)) -> bool
+  (let [bytes (cell (array (vec-count values) 0i8))]
+    (do (dotimes (i (vec-count values)) (array-set! &bytes i (trunc i8 (vec-nth values i))))
+        (match (h/decode-text @bytes) ((Err _) true) (_ false)))))
+(defun main () -> i64
+  (let [c (checks)]
+    (do (check c (= (h/form-encode "a b+&/é") "a+b%2B%26%2F%C3%A9"))
+        (check c (= (h/query-string [(Pair "q" "a b") (Pair "tag" "x") (Pair "tag" "y")]) "q=a+b&tag=x&tag=y"))
+        (check c (= (h/with-query "http://localhost/x?old=1#part" [(Pair "q" "a b")]) "http://localhost/x?old=1&q=a+b#part"))
+        (check c (= (h/with-query "http://localhost/x" []) "http://localhost/x"))
+        (check c (= (h/form-decode "a+b%2B%26%2F%C3%A9") (Ok "a b+&/é")))
+        (check c (= (h/parse-query "q=a+b&tag=x&tag=y") (Ok [(Pair "q" "a b") (Pair "tag" "x") (Pair "tag" "y")])))
+        (check c (= (h/parse-query "flag&empty=&") (Ok [(Pair "flag" "") (Pair "empty" "")])))
+        (check c (match (h/form-decode "%") ((Err _) true) (_ false)))
+        (check c (match (h/form-decode "%GG") ((Err _) true) (_ false)))
+        (check c (match (h/form-decode "%FF") ((Err _) true) (_ false)))
+        (check c (= (h/body-text (h/text-response 200 "λ🙂")) (Ok "λ🙂")))
+        (check c (match (h/body-text (h/Response 200 {} (array 1 -1i8))) ((Err _) true) (_ false)))
+        (check c (match (h/body-text (h/Response 200 {} (array 2 -128i8))) ((Err _) true) (_ false)))
+        (check c (match (h/body-text (h/Response 200 {} (array 1 0i8))) ((Ok s) (= (str-len s) 1)) (_ false)))
+        (check c (= (h/base64-encode (str-bytes "")) ""))
+        (check c (= (h/base64-encode (str-bytes "f")) "Zg=="))
+        (check c (= (h/base64-encode (str-bytes "fo")) "Zm8="))
+        (check c (= (h/base64-encode (str-bytes "foo")) "Zm9v"))
+        (check c (= (h/base64-encode (str-bytes "username:password")) "dXNlcm5hbWU6cGFzc3dvcmQ="))
+        (check c (invalid-bytes? [192 128]))
+        (check c (invalid-bytes? [224 128 128]))
+        (check c (invalid-bytes? [237 160 128]))
+        (check c (invalid-bytes? [244 144 128 128]))
+        (check c (invalid-bytes? [240 159 153]))
+        (checks-result c))))

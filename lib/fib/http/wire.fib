@@ -1,0 +1,126 @@
+;; HTTP/1 framing. Ambiguous messages fail before any body is consumed.
+(ns fib.http.wire (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes)
+  (:require [fib.string :as s]))
+(defstruct RequestHead (request-method: str uri: str query-string: (Option str)
+  version: str headers: (Map str (Vec str))))
+(defenum BodyMode (NoBody) (Fixed length: i64) (Chunked))
+(defun parse-header-line (line: str) -> (Result (Pair str str) Error)
+  (match (str-find line ":" 0)
+    (nil (Err (ProtocolError "HTTP header has no colon")))
+    ((some at)
+      (let [name (str-slice line 0 at) value (trim-ows (str-slice line (+ at 1) (str-len line)))]
+        (if (and (token? name) (header-value? value)) (Ok (Pair (ascii-lower name) value))
+            (Err (ProtocolError "invalid HTTP header field")))))))
+(defun parse-header-lines (lines: (Vec str) start: i64 end: i64) -> (Result (Map str (Vec str)) Error)
+  (if (> (- end start) 100) (Err (LimitError "too many HTTP headers"))
+    (loop [i start out: (Map str (Vec str)) {}]
+      (if (= i end) (Ok out)
+        (if (> (str-len (nth lines i)) 8192) (Err (LimitError "HTTP header line is too long"))
+          (try-let [entry (parse-header-line (nth lines i))]
+            (recur (+ i 1) (header-add out (. entry fst) (. entry snd)))))))))
+(defun valid-target? :private (target: str) -> bool
+  (and (> (str-len target) 0) (or (starts-with? target "/") (= target "*"))
+    (loop [i 0]
+      (if (= i (str-len target)) true
+        (let [b (zext i64 (str-byte-at target i))]
+          (if (and (> b 32) (< b 127) (!= b 35)) (recur (+ i 1)) false))))))
+(defun request-line :private (line: str) -> (Result (Triple str str str) Error)
+  (let [parts (s/split line " " -1)]
+    (cond (!= (count parts) 3) (Err (ProtocolError "invalid HTTP request line"))
+          (not (token? (nth parts 0))) (Err (ProtocolError "invalid HTTP method"))
+          (not (valid-target? (nth parts 1))) (Err (ProtocolError "expected an origin-form HTTP target"))
+          (not (or (= (nth parts 2) "HTTP/1.1") (= (nth parts 2) "HTTP/1.0")))
+          (Err (ProtocolError "unsupported HTTP version"))
+          :else (Ok (Triple (nth parts 0) (nth parts 1) (nth parts 2))))))
+(defun valid-host? :private (value: str) -> bool
+  (and (> (str-len value) 0)
+    (loop [i 0]
+      (if (= i (str-len value)) true
+        (let [b (zext i64 (str-byte-at value i))]
+          (if (and (> b 32) (< b 127) (!= b 47) (!= b 92) (!= b 44)) (recur (+ i 1)) false))))))
+(defun checked-host :private (headers: (Map str (Vec str)) version: str) -> (Result unit Error)
+  (let [hosts (header-values headers "host")]
+    (if (or (> (count hosts) 1) (and (= version "HTTP/1.1") (!= (count hosts) 1))
+            (and (= (count hosts) 1) (not (valid-host? (nth hosts 0)))))
+        (Err (ProtocolError "HTTP request needs one valid Host header")) (Ok ()))))
+(defun parse-request-head (text: str) -> (Result RequestHead Error)
+  (cond (> (str-len text) 65536) (Err (LimitError "HTTP headers are too large"))
+        (not (s/ends-with? text "\r\n\r\n")) (Err (ProtocolError "HTTP headers need CRLF framing"))
+        :else
+        (let [lines (s/split text "\r\n" -1) end (- (count lines) 2)]
+          (try-let [line (request-line (nth lines 0))
+                    headers (parse-header-lines lines 1 end)
+                    _ (checked-host headers (. line thd))]
+            (let [target (. line snd) question (str-find target "?" 0)
+                  uri (match question (nil target) ((some at) (str-slice target 0 at)))
+                  query (match question (nil nil) ((some at) (some (str-slice target (+ at 1) (str-len target)))))]
+              (Ok (RequestHead (. line fst) uri query (. line thd) headers)))))))
+(defun digit :private (b: i64 base: i64) -> i64
+  (let [n (cond (and (>= b 48) (<= b 57)) (- b 48)
+               (and (>= b 65) (<= b 70)) (+ 10 (- b 65))
+               (and (>= b 97) (<= b 102)) (+ 10 (- b 97)) :else -1)]
+    (if (< n base) n -1)))
+(defun parse-size :private (text: str base: i64 limit: i64) -> (Result i64 Error)
+  (if (= (str-len text) 0) (Err (ProtocolError "empty HTTP body length"))
+    (loop [i 0 n 0]
+      (if (= i (str-len text)) (Ok n)
+        (let [d (digit (zext i64 (str-byte-at text i)) base)]
+          (cond (< d 0) (Err (ProtocolError "invalid HTTP body length"))
+                (or (> d limit) (> n (quot (- limit d) base))) (Err (LimitError "HTTP body exceeds its size limit"))
+                :else (recur (+ i 1) (+ (* n base) d))))))))
+(defun request-framing (headers: (Map str (Vec str)) limit: i64) -> (Result BodyMode Error)
+  (let [lengths (header-values headers "content-length") encodings (header-values headers "transfer-encoding")]
+    (cond (and (> (count lengths) 0) (> (count encodings) 0)) (Err (ProtocolError "ambiguous HTTP body framing"))
+          (> (count lengths) 1) (Err (ProtocolError "duplicate Content-Length"))
+          (> (count encodings) 0)
+          (if (and (= (count encodings) 1) (= (ascii-lower (trim-ows (nth encodings 0))) "chunked"))
+              (Ok Chunked) (Err (ProtocolError "unsupported HTTP transfer encoding")))
+          (= (count lengths) 1) (try-let [n (parse-size (trim-ows (nth lengths 0)) 10 limit)] (Ok (Fixed n)))
+          :else (Ok NoBody))))
+(defun parse-chunk-size (line: str limit: i64) -> (Result i64 Error)
+  (let [end (unwrap-or (str-find line ";" 0) (str-len line))]
+    (if (not (header-value? line)) (Err (ProtocolError "invalid HTTP chunk extension"))
+      (parse-size (str-slice line 0 end) 16 limit))))
+(defun keep-alive? (head: RequestHead) -> bool
+  (and (not (header-token? (. head headers) "connection" "close"))
+       (or (= (. head version) "HTTP/1.1") (header-token? (. head headers) "connection" "keep-alive"))))
+(defun reason-phrase (status: i64) -> str
+  (cond (= status 200) "OK" (= status 201) "Created" (= status 204) "No Content"
+        (= status 205) "Reset Content" (= status 301) "Moved Permanently" (= status 302) "Found" (= status 304) "Not Modified"
+        (= status 307) "Temporary Redirect" (= status 308) "Permanent Redirect"
+        (= status 400) "Bad Request" (= status 404) "Not Found" (= status 405) "Method Not Allowed"
+        (= status 408) "Request Timeout" (= status 413) "Content Too Large" (= status 417) "Expectation Failed"
+        (= status 431) "Request Header Fields Too Large" (= status 500) "Internal Server Error"
+        (= status 501) "Not Implemented" (= status 503) "Service Unavailable" :else "Response"))
+(defun header-lines (headers: (Map str (Vec str))) -> (Vec str)
+  (reduce (fn (out: (Vec str) entry: (Pair str (Vec str)))
+    (reduce (fn (lines: (Vec str) value: str) (conj lines (str (. entry fst) ": " value "\r\n")))
+      out (. entry snd))) [] (normalize-headers headers)))
+(defun response-bytes (response: Response method: str keep: bool) -> (Result (Array i8) Error)
+  (try-let [_ (validate-headers (. response headers))]
+    (let [status (. response status) body (. response body)
+          headers (dissoc (dissoc (normalize-headers (. response headers)) "transfer-encoding") "content-length")
+          framed (cond (or (= status 204) (= status 304)) headers
+                       (= status 205) (header-set headers "content-length" "0")
+                       :else (header-set headers "content-length" (str (array-len body))))
+          final (header-set framed "connection" (if keep "keep-alive" "close"))]
+      (if (or (< status 200) (> status 599)) (Err (InvalidRequest "HTTP response status must be between 200 and 599"))
+        (let [head (str-join (into [(str "HTTP/1.1 " status " " (reason-phrase status) "\r\n")]
+                                  (conj (header-lines final) "\r\n")))]
+          (Ok (concat-bytes [(str-bytes head) (if (or (= method "HEAD") (= status 204) (= status 205) (= status 304)) (array 0 0i8) body)])))))))
+(defun response-status :private (line: str) -> (Result i64 Error)
+  (let [parts (s/split line " " -1)]
+    (if (and (>= (count parts) 2) (starts-with? (nth parts 0) "HTTP/") (= (str-len (nth parts 1)) 3))
+        (try-let [status (parse-size (nth parts 1) 10 599)]
+          (if (>= status 100) (Ok status) (Err (ProtocolError "invalid HTTP response status"))))
+        (Err (ProtocolError "invalid HTTP response status line")))))
+(defun parse-response-headers (text: str) -> (Result (Pair i64 (Map str (Vec str))) Error)
+  (let [lines (s/split text "\r\n" -1)]
+    (loop [i 0 status 0 headers: (Map str (Vec str)) {}]
+      (if (= i (count lines))
+        (if (>= status 200) (Ok (Pair status headers)) (Err (ProtocolError "no final HTTP response headers")))
+        (let [line (nth lines i)]
+          (cond (= line "") (recur (+ i 1) status headers)
+                (starts-with? line "HTTP/") (try-let [next (response-status line)] (recur (+ i 1) next {}))
+                :else (try-let [entry (parse-header-line line)]
+                  (recur (+ i 1) status (header-add headers (. entry fst) (. entry snd))))))))))

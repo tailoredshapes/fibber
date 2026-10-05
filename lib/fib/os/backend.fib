@@ -1,0 +1,27 @@
+;; Linux implementation of the internal backend interface.
+(ns fib.os.backend (:require [fib.os.abi-data :as a]))
+(extern __errno_location :private () -> ptr)
+(extern socket :private (i32 i32 i32) -> i32)
+(extern accept4 :private (i32 ptr ptr i32) -> i32)
+(extern pipe2 :private (ptr i32) -> i32)
+(extern readdir :private (ptr) -> ptr)
+(extern readlink :private (ptr ptr i64) -> i64)
+(def abi: a/Abi (a/linux-abi))
+(def platform-name: str "Linux")
+(defun errno () -> i64 (unsafe (sext i64 (load-i32 (__errno_location)))))
+(defun clear-errno () -> unit (unsafe (store-i32 (__errno_location) 0i32)))
+(defun directory-next (directory: ptr) -> ptr (unsafe (readdir directory)))
+(defun executable-path (buffer: ptr size: i64) -> i64
+  (unsafe (let [bytes (str-bytes "/proc/self/exe") path (alloc (+ (array-len bytes) 1))]
+    (do (dotimes (i (array-len bytes)) (store-i8 (ptr+ path i) (array-get bytes i)))
+      (let [result (readlink path buffer size) saved (errno)]
+        (do (free path) (cond (< result 0) (- 0 saved) (= result size) -34 :else result)))))))
+(defun socket-new (family: i64) -> i64
+  (let [fd (unsafe (sext i64 (socket (trunc i32 family) 526337i32 0i32)))]
+    (if (< fd 0) (- 0 (errno)) fd)))
+(defun socket-accept (fd: i64 address: ptr size: ptr) -> i64
+  (let [accepted (unsafe (sext i64 (accept4 (trunc i32 fd) address size 526336i32)))]
+    (if (< accepted 0) (- 0 (errno)) accepted)))
+(defun pipe-cloexec (fds: ptr) -> i32
+  (let [result (unsafe (pipe2 fds 524288i32))]
+    (if (< result 0i32) (trunc i32 (- 0 (errno))) result)))

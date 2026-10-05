@@ -1,0 +1,21 @@
+(ns fib.os.net.poll (:use fib.core fib.os.errors)
+  (:require [fib.os.native :as n] [fib.os.time :as time]))
+(extern poll :private (ptr i64 i32) -> i32)
+(defun ready? (fd: i64 writing: bool timeout-ms: i64) -> (Result bool OSError)
+  (if (or (< timeout-ms 0) (> timeout-ms 3600000)) (Err (invalid-input "poll" "invalid poll timeout"))
+    (unsafe (let [slot (alloc 8) deadline (+ (time/clock-now) (* timeout-ms 1000000))]
+      (do (store-i32 slot (trunc i32 fd)) (store-i16 (ptr+ slot 4) (if writing 4i16 1i16))
+        (let [result (loop [remaining timeout-ms]
+          (let [r (poll slot 1 (trunc i32 remaining)) saved (n/errno)]
+            (cond (>= r 0i32) (Ok (> r 0i32))
+                  (= saved 4) (if (>= (time/clock-now) deadline) (Ok false)
+                    (recur (max 1 (quot (- deadline (time/clock-now)) 1000000))))
+                  :else (Err (error-from-code saved "poll")))))]
+          (do (free slot) result)))))))
+(defun wait-readable (fd: i64 deadline: i64 stop: (Atom bool)) -> (Result unit OSError)
+  (loop []
+    (let [remaining (- deadline (time/clock-now))]
+      (cond @stop (Err (OSError Cancelled 0 "poll" "operation cancelled"))
+            (<= remaining 0) (Err (timeout-error "read"))
+            :else (try-let [ready (ready? fd false (min 100 (max 1 (quot remaining 1000000))))]
+              (if ready (Ok ()) (recur)))))))

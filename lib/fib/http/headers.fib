@@ -1,0 +1,55 @@
+;; Names are ASCII tokens; values preserve separate occurrences.
+(ns fib.http.headers (:use fib.core fib.seq fib.coll fib.http.types))
+(defun ascii-lower (s: str) -> str
+  (let [out (cell (str-bytes s))]
+    (do (dotimes (i (str-len s))
+          (let [b (str-byte-at s i)]
+            (if (and (>= b 65i8) (<= b 90i8)) (array-set! &out i (+ b 32i8)) ())))
+        (str-from-bytes @out))))
+(defun token? (s: str) -> bool
+  (and (> (str-len s) 0)
+    (loop [i 0]
+      (if (= i (str-len s)) true
+        (let [b (zext i64 (str-byte-at s i))]
+          (if (or (and (>= b 48) (<= b 57)) (and (>= b 65) (<= b 90))
+                  (and (>= b 97) (<= b 122))
+                  (includes? b [33 35 36 37 38 39 42 43 45 46 94 95 96 124 126]))
+              (recur (+ i 1)) false))))))
+(defun header-value? (s: str) -> bool
+  (loop [i 0]
+    (if (= i (str-len s)) true
+      (let [b (zext i64 (str-byte-at s i))]
+        (if (or (= b 9) (and (>= b 32) (!= b 127))) (recur (+ i 1)) false)))))
+(defun normalize-headers (headers: (Map str (Vec str))) -> (Map str (Vec str))
+  (reduce (fn (out: (Map str (Vec str)) entry: (Pair str (Vec str)))
+    (let [key (ascii-lower (. entry fst)) old (unwrap-or (get out key) [])]
+      (assoc out key (into old (. entry snd))))) {} headers))
+(defun header-values (headers: (Map str (Vec str)) name: str) -> (Vec str)
+  (unwrap-or (get (normalize-headers headers) (ascii-lower name)) []))
+(defun header (headers: (Map str (Vec str)) name: str) -> (Option str)
+  (let [values (header-values headers name)] (if (= (count values) 0) nil (some (nth values 0)))))
+(defun header-set (headers: (Map str (Vec str)) name: str value: str) -> (Map str (Vec str))
+  (assoc (normalize-headers headers) (ascii-lower name) [value]))
+(defun header-add (headers: (Map str (Vec str)) name: str value: str) -> (Map str (Vec str))
+  (let [out (normalize-headers headers) key (ascii-lower name)]
+    (assoc out key (conj (unwrap-or (get out key) []) value))))
+(defun validate-headers (headers: (Map str (Vec str))) -> (Result unit Error)
+  (let [entries (to-vec headers)]
+    (loop [i 0]
+      (if (= i (count entries)) (Ok ())
+        (let [entry (nth entries i)]
+          (cond (not (token? (. entry fst))) (Err (InvalidRequest "invalid HTTP header name"))
+                (not (every? header-value? (. entry snd))) (Err (InvalidRequest "invalid HTTP header value"))
+                :else (recur (+ i 1))))))))
+(defun trim-ows (s: str) -> str
+  (let [space? (fn (b: i8) (or (= b 32i8) (= b 9i8)))
+        start (loop [i 0] (if (and (< i (str-len s)) (space? (str-byte-at s i))) (recur (+ i 1)) i))
+        end (loop [i (str-len s)] (if (and (> i start) (space? (str-byte-at s (- i 1)))) (recur (- i 1)) i))]
+    (str-slice s start end)))
+(defun header-token? (headers: (Map str (Vec str)) name: str token: str) -> bool
+  (let [wanted (ascii-lower token)]
+    (some? (some-p (fn (value: str)
+      (loop [start 0]
+        (let [end (unwrap-or (str-find value "," start) (str-len value))]
+          (cond (= (ascii-lower (trim-ows (str-slice value start end))) wanted) (some true)
+                (= end (str-len value)) nil :else (recur (+ end 1)))))) (header-values headers name)))))

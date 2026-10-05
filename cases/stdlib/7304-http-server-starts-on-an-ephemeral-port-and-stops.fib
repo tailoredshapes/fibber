@@ -1,0 +1,19 @@
+;; spec: docs/design/http.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll) (:require [fib.http :as h] [fib.http.server :as s]))
+(defun main () -> i64
+  (let [c (checks) opts (with (s/default-options) (port 0) (workers 2))]
+    (do (match (s/run-server (fn (request: h/Request) (h/response "hello")) opts)
+          ((Err _) (check c false))
+          ((Ok server) (do (check c (> (s/port server) 0))
+            (check c (match (s/stop-server server) ((Ok _) true) (_ false)))
+            (check c (match (s/stop-server server) ((Ok _) true) (_ false))))))
+        (check c (match (s/run-server (fn (request: h/Request) (h/response "hello")) (with opts (workers 0)))
+          ((Err (h/InvalidRequest _)) true) (_ false)))
+        (check c (match (s/run-server (fn (request: h/Request) (h/response "hello")) (with opts (host "127.0.0.1\0extra")))
+          ((Err (h/InvalidRequest _)) true) (_ false)))
+        (checks-result c))))

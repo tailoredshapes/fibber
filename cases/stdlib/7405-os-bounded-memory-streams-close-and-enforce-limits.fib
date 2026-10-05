@@ -1,0 +1,20 @@
+;; spec: docs/design/os.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check) (:require [fib.os :as os] [fib.os.memory-stream :as m]))
+(defun main () -> i64
+  (let [c (checks)]
+    (do (match (m/open-stream 4)
+      ((Err _) (check c false))
+      ((Ok stream) (do
+        (check c (= (m/write-bytes stream (str-bytes "a\0bc")) (Ok ())))
+        (check c (match (m/bytes stream) ((Ok bytes) (= (str-from-bytes bytes) "a\0bc")) (_ false)))
+        (check c (match (m/write-bytes stream (str-bytes "x")) ((Err error) (= (. error kind) os/LimitExceeded)) (_ false)))
+        (check c (= (m/close-stream stream) (Ok ())))
+        (check c (= (m/close-stream stream) (Ok ())))
+        (check c (match (m/bytes stream) ((Err error) (= (. error kind) os/BadDescriptor)) (_ false))))))
+        (check c (match (m/open-stream -1) ((Err error) (= (. error kind) os/InvalidInput)) (_ false)))
+        (checks-result c))))

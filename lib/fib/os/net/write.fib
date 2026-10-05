@@ -1,0 +1,20 @@
+(ns fib.os.net.write (:use fib.core fib.os.errors)
+  (:require [fib.os.native :as n] [fib.os.abi :as a] [fib.os.time :as time] [fib.os.net.poll :as p]))
+(extern send :private (i32 ptr i64 i32) -> i64)
+(defun send-loop :private (fd: i64 buffer: ptr size: i64 deadline: i64 stop: (Atom bool)) -> (Result unit OSError)
+  (loop [offset 0]
+    (let [remaining (- deadline (time/clock-now))]
+      (cond (= offset size) (Ok ()) @stop (Err (OSError Cancelled 0 "send" "operation cancelled"))
+            (<= remaining 0) (Err (timeout-error "send"))
+            :else (try-let [ready (p/ready? fd true (min 100 (max 1 (quot remaining 1000000))))]
+              (if (not ready) (recur offset)
+                (let [r (unsafe (send (trunc i32 fd) (ptr+ buffer offset) (- size offset) (trunc i32 (. a/host no-signal))))
+                      saved (n/errno) kind (kind-for-code saved)]
+                  (cond (> r 0) (recur (+ offset r))
+                        (or (= kind Interrupted) (= kind WouldBlock)) (recur offset)
+                        :else (Err (error-from-code (if (= r 0) 32 saved) "send"))))))))))
+(defun send-all (fd: i64 bytes: (Array i8) timeout-ms: i64 stop: (Atom bool)) -> (Result unit OSError)
+  (if (or (< timeout-ms 1) (> timeout-ms 3600000)) (Err (invalid-input "send" "invalid send timeout"))
+    (let [buffer (n/bytes-new bytes)
+          result (send-loop fd buffer (array-len bytes) (+ (time/clock-now) (* timeout-ms 1000000)) stop)]
+      (unsafe (do (free buffer) result)))))

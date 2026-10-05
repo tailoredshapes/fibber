@@ -1,0 +1,29 @@
+;; spec: docs/design/os.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check) (:require [fib.os :as os]))
+(defun main () -> i64
+  (let [c (checks)]
+    (do (check c (match (os/executable-path) ((Ok path) (starts-with? path "/")) (_ false)))
+      (check c (match (os/create-temp-directory "/tmp/fib-os-7407-XXXXXX")
+        ((Err _) false)
+        ((Ok dir)
+          (let [file (str dir "/data") child (str dir "/nested")]
+            (do (check c (= (os/write-file-bytes file (str-bytes "x")) (Ok ())))
+              (check c (= (os/create-directory child 448) (Ok ())))
+              (check c (match (os/list-directory dir)
+                ((Ok entries) (and (= (count entries) 2)
+                  (= (count (filter (fn (e: os/DirectoryEntry) (and (= (. e name) "nested") (= (. e kind) os/Directory))) entries)) 1)
+                  (= (count (filter (fn (e: os/DirectoryEntry) (and (= (. e name) "data") (= (. e kind) os/RegularFile))) entries)) 1)))
+                (_ false)))
+              (check c (match (os/list-directory file) ((Err error) (= (. error kind) os/NotDirectory)) (_ false)))
+              (check c (= (os/remove-file file) (Ok ())))
+              (check c (= (os/remove-directory child) (Ok ())))
+              (check c (= (os/remove-directory dir) (Ok ())))
+              true)))))
+      (check c (match (os/list-directory "bad\0path") ((Err error) (= (. error kind) os/InvalidInput)) (_ false)))
+      (check c (match (os/create-temp-directory "/tmp/invalid-template") ((Err error) (= (. error kind) os/InvalidInput)) (_ false)))
+      (checks-result c))))

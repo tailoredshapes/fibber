@@ -8,18 +8,16 @@
 
 (ns native.link
   (:use native.error)
-  (:require [llvm.ffi :as ffi]))
+  (:require [llvm.ffi :as ffi] [fib.os.native :as os] [fib.os.backend :as backend]))
 
 (extern realpath :private (ptr ptr) -> ptr)
 (extern opendir :private (ptr) -> ptr)
 (extern closedir :private (ptr) -> i32)
 (extern strerror :private (i32) -> ptr)
-(extern __errno_location :private () -> ptr)
 (extern fopen :private (ptr ptr) -> ptr)
 (extern fwrite :private (ptr i64 i64 ptr) -> i64)
 (extern fclose :private (ptr) -> i32)
 (extern unlink :private (ptr) -> i32)
-(extern pipe2 :private (ptr i32) -> i32)
 (extern fork :private () -> i32)
 (extern execvp :private (ptr ptr) -> i32)
 (extern dup2 :private (i32 i32) -> i32)
@@ -31,15 +29,13 @@
 (extern _exit :private (i32) -> unit)
 
 (def enotdir: i64 20)
-(def o-cloexec: i32 524288i32)
 
 ;; The text of an operating-system error as Rust's `io::Error` displays it: `No such file or directory (os error 2)`.
 (defun os-error :private (e: i64) -> str
   (str (ffi/c-string-at (unsafe (ffi/ptr->addr (strerror (trunc i32 e))))) " (os error " (show e) ")"))
 
 ;; errno, read at once after the call that set it.
-(defun errno :private () -> i64
-  (unsafe (sext i64 (load-i32 (__errno_location)))))
+(defun errno :private () -> i64 (os/errno))
 
 ;; The canonical path of `dir`, or the errno that refused it.
 (defun canonical :private (dir: str) -> (Result str i64)
@@ -122,7 +118,7 @@
 (defun become :private (file: ptr av: ptr fo: i32 fe: i32 status-fd: i32 ebuf: ptr) -> i64
   (unsafe
     (do (dup2 fo 1i32) (dup2 fe 2i32) (execvp file av)
-        (store-i32 ebuf (load-i32 (__errno_location)))
+        (store-i32 ebuf (trunc i32 (os/errno)))
         (write status-fd ebuf 4)
         (_exit 127i32)
         0)))
@@ -138,7 +134,7 @@
         (fds (ffi/slot-new))
         (ebuf (ffi/slot-new))
         (st (ffi/slot-new))
-        (made (unsafe (pipe2 fds o-cloexec)))
+        (made (backend/pipe-cloexec fds))
         (fo (unsafe (creat pn 384i32)))
         (fe (unsafe (creat pe 384i32)))
         (rfd (unsafe (load-i32 fds)))

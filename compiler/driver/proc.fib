@@ -1,10 +1,6 @@
-;; compiler/driver/proc.fib: what the case harness (driver.harness) asks of the operating system through the C library, as the standard
-;; library of Rust gave crates/fibc/src/harness/child.rs and fibref's cases runner: the entries of a directory, a scratch directory,
-;; and a child process (this very executable, `/proc/self/exe`) run with its standard output and error in files, with a time limit.
-;; S5's `sys-*` builtins are not in stage 2, so these are `extern`s as driver.native's are. Linux and glibc: `/proc/self/exe`, the layout
-;; of `struct dirent` (d_type at 18, d_name at 19).
+;; Compiler process harness: directory and executable discovery use fib.os.
 (ns driver.proc
-  (:require [lair.ffi :as ffi]))
+  (:require [lair.ffi :as ffi] [fib.os :as os]))
 
 (extern fork :private () -> i32)
 (extern execv :private (ptr ptr) -> i32)
@@ -14,59 +10,26 @@
 (extern waitpid :private (i32 ptr i32) -> i32)
 (extern _exit :private (i32) -> unit)
 (extern alarm :private (i32) -> i32)
-(extern mkdtemp :private (ptr) -> ptr)
-(extern unlink :private (ptr) -> i32)
-(extern rmdir :private (ptr) -> i32)
-(extern opendir :private (ptr) -> ptr)
-(extern closedir :private (ptr) -> i32)
-(extern readdir :private (ptr) -> ptr)
 
-;; The offsets in a glibc `struct dirent` of its type byte and its name, and the type of a directory.
-(def dirent-type: i64 18)
-(def dirent-name: i64 19)
-(def dt-dir: i8 4i8)
-
-;; An entry of a directory: its name and whether it is a directory (or of unknown type, which the caller looks into).
 (defstruct Entry (name: str dir: bool))
 
-(defun entry-at :private (a: i64) -> Entry
-  (let ((t (unsafe (load-i8 (ptr+ (ffi/addr->ptr a) dirent-type)))))
-    (Entry (ffi/c-string-at (+ a dirent-name)) (or (= t dt-dir) (= t 0i8)))))
-
-;; The entries of `dir` but `.` and `..`, in no order; nil if it cannot be opened.
+;; Unknown filesystem entry types still need recursive inspection by the harness.
 (defun list-dir (dir: str) -> (Option (Vec Entry))
-  (let ((p (ffi/bytes-new dir))
-        (d (unsafe (ffi/ptr->addr (opendir p)))))
-    (do (ffi/free-addr (ffi/ptr->addr p))
-        (if (= d 0)
-            nil
-            (let ((dp (ffi/addr->ptr d))
-                  (found (loop ((acc []))
-                           (let ((e (unsafe (ffi/ptr->addr (readdir dp)))))
-                             (if (= e 0)
-                                 acc
-                                 (let ((en (entry-at e)))
-                                   (recur (if (or (= (. en name) ".") (= (. en name) "..")) acc (conj acc en)))))))))
-              (do (unsafe (closedir dp)) (some found)))))))
+  (match (os/list-directory dir)
+    ((Err _) nil)
+    ((Ok entries) (some (mapv (fn (entry: os/DirectoryEntry)
+      (Entry (. entry name) (or (= (. entry kind) os/Directory) (= (. entry kind) os/UnknownEntry)))) entries)))))
 
 ;; The exit status as `waitpid`'s word says it: the code of a process that exited, 128 and the signal of one that was killed.
 (defun decode-status :private (w: i64) -> i64
   (if (= (bit-and w 127) 0) (bit-and (quot w 256) 255) (+ 128 (bit-and w 127))))
 
-;; A new directory under `base`, its name made by mkdtemp.
 (defun make-temp-dir (base: str) -> (Option str)
-  (let ((t (ffi/bytes-new (str-concat base "/fibcases-XXXXXX")))
-        (r (unsafe (ffi/ptr->addr (mkdtemp t))))
-        (name (if (= r 0) nil (some (ffi/c-string-at r)))))
-    (do (ffi/free-addr (ffi/ptr->addr t)) name)))
+  (match (os/create-temp-directory (str-concat base "/fibcases-XXXXXX"))
+    ((Ok path) (some path)) ((Err _) nil)))
 
-(defun remove-file (path: str) -> unit
-  (let ((p (ffi/bytes-new path)))
-    (do (unsafe (unlink p)) (ffi/free-addr (ffi/ptr->addr p)))))
-
-(defun remove-dir (path: str) -> unit
-  (let ((p (ffi/bytes-new path)))
-    (do (unsafe (rmdir p)) (ffi/free-addr (ffi/ptr->addr p)))))
+(defun remove-file (path: str) -> unit (do (os/remove-file path) ()))
+(defun remove-dir (path: str) -> unit (do (os/remove-directory path) ()))
 
 ;; In the child: standard output and error to the files, the alarm set, this executable run with `argv`.
 (defun become :private (pp: ptr av: ptr fo: i32 fe: i32 secs: i64) -> i64
@@ -77,9 +40,14 @@
 ;; killed by SIGALRM after `secs` seconds (status 142); its process id, or -1 if there was no process. The parent's copies of the
 ;; words are freed at once (the child has its own after the fork), so a caller can start several and `wait-pid` for each later.
 (defun spawn-start (argv: (Vec str) out: str err: str secs: i64) -> i64
+  (match (os/executable-path)
+    ((Err _) -1)
+    ((Ok executable) (spawn-executable executable argv out err secs))))
+
+(defun spawn-executable :private (executable: str argv: (Vec str) out: str err: str secs: i64) -> i64
   (let ((po (ffi/bytes-new out))
         (pe (ffi/bytes-new err))
-        (pp (ffi/bytes-new "/proc/self/exe"))
+        (pp (ffi/bytes-new executable))
         (cs (mapv (fn (w: str) (ffi/ptr->addr (ffi/bytes-new w))) argv))
         (av (ffi/words-new cs))
         (pid (unsafe

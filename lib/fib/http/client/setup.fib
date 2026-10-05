@@ -1,0 +1,49 @@
+(ns fib.http.client.setup (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.client.types)
+  (:require [fib.http.client.ffi :as f] [fib.http.native :as n]))
+(defun valid-url? :private (url: str) -> bool
+  (and (or (starts-with? url "http://") (starts-with? url "https://"))
+    (loop [i 0]
+      (if (= i (str-len url)) true
+        (let [b (zext i64 (str-byte-at url i))]
+          (if (and (> b 32) (!= b 127)) (recur (+ i 1)) false))))))
+(defun validate-request (request: ClientRequest) -> (Result unit Error)
+  (try-let [_ (validate-headers (. request headers))]
+    (cond (not (token? (. request method))) (Err (InvalidRequest "invalid HTTP method"))
+          (not (valid-url? (. request url))) (Err (InvalidRequest "expected an absolute HTTP or HTTPS URL"))
+          (or (some? (header (. request headers) "content-length")) (some? (header (. request headers) "transfer-encoding")))
+          (Err (InvalidRequest "HTTP client derives body framing from the body bytes"))
+          :else (Ok ()))))
+(defun header-list (headers: (Map str (Vec str))) -> (Result i64 Error)
+  (let [lines (reduce (fn (out: (Vec str) entry: (Pair str (Vec str)))
+          (reduce (fn (xs: (Vec str) value: str) (conj xs (str (. entry fst) ": " value))) out (. entry snd)))
+          [] (normalize-headers headers))]
+    (loop [i 0 list 0]
+      (if (= i (count lines)) (Ok list)
+        (match (f/append-header list (nth lines i))
+          ((Err error) (do (f/free-headers list) (Err error)))
+          ((Ok next) (recur (+ i 1) next)))))))
+(defun method :private (handle: i64 request: ClientRequest) -> (Result unit Error)
+  (let [verb (. request method) bytes (. request body)]
+    (cond (= verb "HEAD") (f/set-long handle 44i32 1)
+          (or (> (array-len bytes) 0) (= verb "POST") (= verb "PUT") (= verb "PATCH"))
+          (try-let [_ (f/set-body handle bytes)]
+            (if (= verb "POST") (Ok ()) (f/set-text handle 10036i32 verb)))
+          (= verb "GET") (f/set-long handle 80i32 1)
+          :else (f/set-text handle 10036i32 verb))))
+(defun configure (handle: i64 request: ClientRequest o: Options body: f/Buffer headers: f/Buffer list: i64) -> (Result unit Error)
+  (do (f/reset-handle handle)
+    (try-let [body-pointer (f/buffer-pointer body) header-pointer (f/buffer-pointer headers)
+              _ (f/set-text handle 10002i32 (. request url))
+              _ (f/set-text handle 10318i32 "http,https")
+              _ (f/set-text handle 10319i32 "http,https")
+              _ (f/set-long handle 99i32 1)
+              _ (f/set-long handle 155i32 (. o timeout-ms))
+              _ (f/set-long handle 156i32 (. o connect-timeout-ms))
+              _ (f/set-long handle 52i32 (if (. o follow-redirects) 1 0))
+              _ (f/set-long handle 68i32 (. o max-redirects))
+              _ (f/set-pointer handle 10001i32 body-pointer)
+              _ (f/set-pointer handle 10029i32 header-pointer)
+              _ (f/set-pointer handle 10023i32 (n/pointer list))
+              _ (if (. o decompress) (f/set-text handle 10102i32 "") (Ok ()))
+              _ (match (. o ca-file) (nil (Ok ())) ((some path) (f/set-text handle 10065i32 path)))
+              _ (method handle request)] (Ok ()))))

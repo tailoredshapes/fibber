@@ -1,0 +1,38 @@
+(ns fib.os.net.socket (:use fib.core fib.os.errors)
+  (:require [fib.os.native :as n] [fib.os.backend :as b] [fib.os.abi :as a] [fib.os.io :as io]
+            [fib.os.net.address :as addr]))
+(extern bind :private (i32 ptr i32) -> i32)
+(extern listen :private (i32 i32) -> i32)
+(extern getsockname :private (i32 ptr ptr) -> i32)
+(extern setsockopt :private (i32 i32 i32 ptr i32) -> i32)
+(defstruct Listener (fd: i64 port: i64))
+(defstruct Accepted (fd: i64 peer: str port: i64))
+(defun configure :private (fd: i64 host: str port: i64 backlog: i64) -> (Result unit OSError)
+  (unsafe (let [address (alloc 128) reuse (alloc 4)]
+    (do (store-i32 reuse 1i32)
+      (let [result (try-let [length (addr/encode host port address)
+        _ (c-result (sext i64 (setsockopt (trunc i32 fd) (trunc i32 (. a/host socket-level))
+             (trunc i32 (. a/host reuse-address)) reuse 4i32)) "setsockopt")
+        _ (c-result (sext i64 (bind (trunc i32 fd) address (trunc i32 length))) "bind")
+        _ (c-result (sext i64 (listen (trunc i32 fd) (trunc i32 backlog))) "listen")] (Ok ()))]
+        (do (free reuse) (free address) result))))))
+(defun bound-port :private (fd: i64) -> (Result i64 OSError)
+  (unsafe (let [address (alloc 128) size (alloc 4)]
+    (do (store-i32 size 128i32)
+      (let [result (getsockname (trunc i32 fd) address size) saved (n/errno) port (addr/port-at address)]
+        (do (free size) (free address)
+          (if (< result 0i32) (Err (error-from-code saved "getsockname")) (Ok port))))))))
+(defun listen-tcp (host: str port: i64 backlog: i64) -> (Result Listener OSError)
+  (if (or (not (n/valid-text? host)) (< port 0) (> port 65535) (< backlog 1) (> backlog 65535))
+    (Err (invalid-input "listen" "invalid listener options"))
+    (try-let [fd (checked (b/socket-new (addr/family host)) "socket")]
+      (match (configure fd host port backlog)
+        ((Err error) (do (io/close-fd fd) (Err error)))
+        ((Ok _) (match (bound-port fd) ((Err error) (do (io/close-fd fd) (Err error)))
+          ((Ok actual) (Ok (Listener fd actual)))))))))
+(defun accept-tcp (fd: i64) -> (Result Accepted OSError)
+  (unsafe (let [address (alloc 128) size (alloc 4)]
+    (do (store-i32 size 128i32)
+      (let [accepted (b/socket-accept fd address size)
+            result (try-let [client (checked accepted "accept")] (Ok (Accepted client (addr/peer-at address) (addr/port-at address))))]
+        (do (free size) (free address) result))))))

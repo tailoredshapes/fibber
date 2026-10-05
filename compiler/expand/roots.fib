@@ -54,7 +54,7 @@
 ;;   `compiler/tests/expand/` and a Rust program run over the same
 ;;   strings are what says so.
 (ns expand.roots
-  (:require [expand.libdir :as libdir]))
+  (:require [expand.libdir :as libdir] [fib.os.platform :as platform]))
 
 ;; The directories searched after the main file's, in order, and the
 ;; directory of the built-in root's files (`nil`: none).
@@ -123,7 +123,7 @@
 ;; Looks for module `ns` (`a.b` is `a/b.fib`) beside the main file (in
 ;; `main-dir`), under each directory, and last in the built-in root.
 (defun roots-find (roots: Roots main-dir: str ns: str) -> Lookup
-  (let ((rel (relative-file ns))
+  (let ((rel (if (= ns "fib.os.backend") (backend-relative (platform/name (platform/current))) (relative-file ns)))
         (all (vec (concat [main-dir] (. roots dirs))))
         (n (+ 1 (count (. roots dirs)))))
     (loop ((i 0))
@@ -133,6 +133,12 @@
               ((some source) (LookupFound file source))
               (nil (recur (+ i 1)))))
           (find-builtin (. roots builtin) ns rel (path-join main-dir rel))))))
+
+;; Only the internal OS backend uses an overlay; other module precedence is unchanged.
+(defun backend-relative (platform: str) -> str
+  (cond (= platform "Linux") "fib/os/backend.fib"
+        (= platform "Darwin") "platform/darwin/fib/os/backend.fib"
+        :else "platform/unsupported/fib/os/backend.fib"))
 
 ;; The module in the built-in root, if the name is one it carries; else
 ;; the missing module at `missing`.

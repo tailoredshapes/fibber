@@ -1,0 +1,61 @@
+;; Form encoding is byte based; repeated parameters retain their order.
+(ns fib.http.url (:use fib.core fib.seq fib.coll fib.http.types fib.http.bytes))
+(defun form-encode (text: str) -> str
+  (let [hex "0123456789ABCDEF"]
+    (str-join (loop [i 0 out: (Vec str) []]
+      (if (= i (str-len text)) out
+        (let [b (zext i64 (str-byte-at text i))]
+          (recur (+ i 1) (conj out
+            (cond (= b 32) "+"
+                  (or (and (>= b 48) (<= b 57)) (and (>= b 65) (<= b 90))
+                      (and (>= b 97) (<= b 122)) (= b 45) (= b 46) (= b 95) (= b 126))
+                  (str-slice text i (+ i 1))
+                  :else (str "%" (str-slice hex (shr b 4) (+ (shr b 4) 1))
+                                 (str-slice hex (bit-and b 15) (+ (bit-and b 15) 1))))))))))))
+(defun query-string (params: (Vec (Pair str str))) -> str
+  (let [parts (mapv (fn (p: (Pair str str)) (str (form-encode (. p fst)) "=" (form-encode (. p snd)))) params)]
+    (str-join (loop [i 0 out: (Vec str) []]
+      (if (= i (count parts)) out (recur (+ i 1) (conj (if (= i 0) out (conj out "&")) (nth parts i))))))))
+(defun with-query (url: str params: (Vec (Pair str str))) -> str
+  (if (= (count params) 0) url
+    (let [end (unwrap-or (str-find url "#" 0) (str-len url)) base (str-slice url 0 end)]
+      (str base (if (some? (str-find base "?" 0)) "&" "?") (query-string params) (str-slice url end (str-len url))))))
+(defun form-body (params: (Vec (Pair str str))) -> (Array i8) (str-bytes (query-string params)))
+(defun hex-value :private (b: i8) -> i64
+  (let [n (zext i64 b)]
+    (cond (and (>= n 48) (<= n 57)) (- n 48) (and (>= n 65) (<= n 70)) (+ 10 (- n 65))
+          (and (>= n 97) (<= n 102)) (+ 10 (- n 97)) :else -1)))
+(defun form-decode (text: str) -> (Result str Error)
+  (let [out (cell (array (str-len text) 0i8))]
+    (loop [i 0 j 0]
+      (if (= i (str-len text)) (decode-text (array-copy @out 0 j))
+        (let [b (str-byte-at text i)]
+          (cond (= b 37i8)
+                (if (> (+ i 3) (str-len text)) (Err (InvalidRequest "truncated percent escape"))
+                  (let [hi (hex-value (str-byte-at text (+ i 1))) lo (hex-value (str-byte-at text (+ i 2)))]
+                    (if (or (< hi 0) (< lo 0)) (Err (InvalidRequest "invalid percent escape"))
+                      (do (array-set! &out j (trunc i8 (+ (* hi 16) lo))) (recur (+ i 3) (+ j 1))))))
+                :else (do (array-set! &out j (if (= b 43i8) 32i8 b)) (recur (+ i 1) (+ j 1)))))))))
+(defun parse-query (text: str) -> (Result (Vec (Pair str str)) Error)
+  (loop [i 0 out: (Vec (Pair str str)) []]
+    (if (>= i (str-len text)) (Ok out)
+      (let [end (unwrap-or (str-find text "&" i) (str-len text)) part (str-slice text i end)
+            equal (unwrap-or (str-find part "=" 0) (str-len part))]
+        (if (= part "") (recur (+ end 1) out)
+          (try-let [key (form-decode (str-slice part 0 equal))
+                    value (form-decode (if (= equal (str-len part)) "" (str-slice part (+ equal 1) (str-len part))))]
+            (recur (+ end 1) (conj out (Pair key value)))))))))
+(defun base64-encode (bytes: (Array i8)) -> str
+  (let [alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        size (* 4 (quot (+ (array-len bytes) 2) 3)) out (cell (array size 61i8))]
+    (do (loop [i 0 j 0]
+          (if (>= i (array-len bytes)) ()
+            (let [a (zext i64 (array-get bytes i))
+                  b (if (< (+ i 1) (array-len bytes)) (zext i64 (array-get bytes (+ i 1))) 0)
+                  c (if (< (+ i 2) (array-len bytes)) (zext i64 (array-get bytes (+ i 2))) 0)]
+              (do (array-set! &out j (str-byte-at alphabet (shr a 2)))
+                  (array-set! &out (+ j 1) (str-byte-at alphabet (bit-or (shl (bit-and a 3) 4) (shr b 4))))
+                  (if (< (+ i 1) (array-len bytes))
+                      (array-set! &out (+ j 2) (str-byte-at alphabet (bit-or (shl (bit-and b 15) 2) (shr c 6)))) ())
+                  (if (< (+ i 2) (array-len bytes)) (array-set! &out (+ j 3) (str-byte-at alphabet (bit-and c 63))) ())
+                  (recur (+ i 3) (+ j 4)))))) (str-from-bytes @out))))

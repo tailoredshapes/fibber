@@ -1,0 +1,15 @@
+;; Runtime platform identity; backend selection belongs to the module loader.
+(ns fib.os.platform.detect)
+(extern uname :private (ptr) -> i32)
+(defenum Platform (Linux) (Darwin) (Unsupported name: str))
+(derive Eq Platform)
+(defun from-name (name: str) -> Platform
+  (cond (= name "Linux") Linux (= name "Darwin") Darwin :else (Unsupported name)))
+(defun name (platform: Platform) -> str
+  (match platform ((Linux) "Linux") ((Darwin) "Darwin") ((Unsupported name) name)))
+(defun current () -> Platform
+  (unsafe (let [buffer (alloc 4096) result (uname buffer)
+                size (loop [i 0] (if (or (= i 4096) (= (load-i8 (ptr+ buffer i)) 0i8)) i (recur (+ i 1))))
+                bytes (cell (array size 0i8))]
+    (do (dotimes (i size) (array-set! &bytes i (load-i8 (ptr+ buffer i))))
+        (free buffer) (if (= result 0i32) (from-name (str-from-bytes @bytes)) (Unsupported "unknown"))))))

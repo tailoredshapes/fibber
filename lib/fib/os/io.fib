@@ -1,0 +1,38 @@
+;; Descriptors are explicit resources; close them on every ordinary exit.
+(ns fib.os.io (:use fib.core fib.os.errors)
+  (:require [fib.unix :as u] [fib.os.native :as n] [fib.os.abi :as a] [fib.os.backend :as b]))
+(extern fcntl :private (i32 i32 i64) -> i32 :varargs)
+(def stdin: i64 0)
+(def stdout: i64 1)
+(def stderr: i64 2)
+(defenum SeekFrom (Start) (Current) (End))
+(defun close-fd (fd: i64) -> (Result unit OSError) (checked-unit (sys-close fd) "close"))
+(defun read-fd (fd: i64 size: i64) -> (Result (Array i8) OSError)
+  (match (u/fd-read fd size) ((Ok bytes) (Ok bytes)) ((Err code) (Err (error-from-code code "read")))))
+(defun write-fd-range (fd: i64 bytes: (Array i8) offset: i64 size: i64) -> (Result i64 OSError)
+  (checked (sys-write fd bytes offset size) "write"))
+(defun write-fd (fd: i64 bytes: (Array i8)) -> (Result i64 OSError)
+  (write-fd-range fd bytes 0 (array-len bytes)))
+(defun write-all (fd: i64 bytes: (Array i8)) -> (Result unit OSError)
+  (loop [offset 0]
+    (if (= offset (array-len bytes)) (Ok ())
+      (match (write-fd-range fd bytes offset (- (array-len bytes) offset))
+        ((Err error) (if (= (. error kind) Interrupted) (recur offset) (Err error)))
+        ((Ok size) (if (= size 0) (Err (OSError Other 0 "write" "write made no progress")) (recur (+ offset size))))))))
+(defun seek-fd (fd: i64 offset: i64 from: SeekFrom) -> (Result i64 OSError)
+  (checked (sys-seek fd offset (match from ((Start) 0) ((Current) 1) ((End) 2))) "seek"))
+(defun duplicate-fd (fd: i64) -> (Result i64 OSError) (checked (sys-dup fd) "dup"))
+(defun terminal? (fd: i64) -> bool (sys-isatty fd))
+(defun make-pipe () -> (Result (Pair i64 i64) OSError)
+  (unsafe (let [fds (alloc 8) result (b/pipe-cloexec fds)
+                read-fd (sext i64 (load-i32 fds)) write-fd (sext i64 (load-i32 (ptr+ fds 4)))]
+    (do (free fds) (try-let [_ (checked (sext i64 result) "pipe")] (Ok (Pair read-fd write-fd)))))))
+(defun set-nonblocking (fd: i64 enabled: bool) -> (Result unit OSError)
+  (try-let [flags (c-result (unsafe (sext i64 (fcntl (trunc i32 fd) 3i32 0))) "fcntl")]
+    (let [next (if enabled (bit-or flags (. a/host nonblock-flag))
+                  (bit-and flags (bit-not (. a/host nonblock-flag))))]
+      (try-let [_ (c-result (unsafe (sext i64 (fcntl (trunc i32 fd) 4i32 next))) "fcntl")] (Ok ())))))
+(defun set-inheritable (fd: i64 enabled: bool) -> (Result unit OSError)
+  (try-let [flags (c-result (unsafe (sext i64 (fcntl (trunc i32 fd) 1i32 0))) "fcntl")]
+    (try-let [_ (c-result (unsafe (sext i64 (fcntl (trunc i32 fd) 2i32
+      (if enabled (bit-and flags (bit-not 1)) (bit-or flags 1))))) "fcntl")] (Ok ()))))

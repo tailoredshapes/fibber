@@ -144,6 +144,23 @@ The [finite-domain design note](docs/design/finite-domains-and-sudoku.md) record
 the API, provenance, validation cases, and a comparison with the original
 Clojure/core.logic implementation.
 
+The [`fib.os` library](lib/fib/os/README.md) provides typed file and descriptor
+operations, directories, TCP sockets, polling, clocks, environment variables,
+process identity, executable discovery, system information, secure entropy, and
+bounded native memory streams. Shared errors and selected platform backends
+keep libc flags, layouts, and symbols out of application code. Linux is tested
+natively; Darwin backend work is included, with macOS execution and toolchain
+validation still pending. See the [OS design record](docs/design/os.md).
+
+The explicit [`fib.http` library](lib/fib/http/README.md) provides shared HTTP
+messages, a Ring-style HTTP/1.1 server with a fixed native worker pool, and a
+Hato-style client backed by libcurl. It includes binary bodies, repeated headers,
+query and form encoding, keep-alive, chunked requests, verified HTTPS on the
+client, timeouts, and asynchronous requests. Build the
+[server example](examples/http-server.fib) with `./F build examples/http-server.fib -I lib`;
+the [client example](examples/http-client.fib) also needs `-l curl`.
+See the library README for API contracts and the current scope.
+
 ### Build and validate
 
 With a seed compiler on `PATH` and LLVM 21 development libraries installed:

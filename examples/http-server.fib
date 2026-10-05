@@ -1,0 +1,17 @@
+;; F build examples/http-server.fib -I lib -o /tmp/http-server
+;; FIB_HTTP_PORT=8080 /tmp/http-server
+(ns main (:use fib.core fib.seq fib.coll fib.print)
+  (:require [fib.http :as h] [fib.http.server :as s] [fib.os.environment :as os]))
+(defun handler (request: h/Request) -> h/Response
+  (cond (= (. request uri) "/") (h/response "Hello from Fibber\n")
+        (= (. request uri) "/echo") (h/Response 200 {"content-type" ["application/octet-stream"]} (. request body))
+        (= (. request uri) "/query") (h/response (unwrap-or (. request query-string) ""))
+        :else (h/text-response 404 "Not found\n")))
+(defun main () -> i64
+  (let [port (unwrap-or (parse-long (unwrap-or (os/getenv "FIB_HTTP_PORT") "8080")) 8080)]
+    (match (s/run-server handler (with (s/default-options) (port port)))
+      ((Err error) (do (eprintln (h/error-message error)) 1))
+      ((Ok server) (do (println (str "Listening on http://127.0.0.1:" (s/port server)))
+        (let [result (s/wait-server server)]
+          (do (s/stop-server server)
+            (match result ((Ok _) 0) ((Err error) (do (eprintln (h/error-message error)) 1))))))))))

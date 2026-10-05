@@ -1,0 +1,15 @@
+(ns fib.os.environment (:use fib.os.errors) (:require [fib.os.native :as n]))
+(defun valid-name? :private (name: str) -> bool
+  (and (> (str-len name) 0) (n/valid-text? name) (not (some? (str-find name "=" 0)))))
+(defun getenv (name: str) -> (Option str) (if (valid-name? name) (sys-getenv name) nil))
+(defun setenv (name: str value: str) -> (Result unit OSError)
+  (if (not (and (valid-name? name) (n/valid-text? value))) (Err (invalid-input "setenv" "invalid environment name or value"))
+    (let [key (n/c-text name) text (n/c-text value)
+          result (unsafe (n/setenv key text 1i32)) saved (n/errno)]
+      (unsafe (do (free key) (free text)
+        (if (< result 0i32) (Err (error-from-code saved "setenv")) (Ok ())))))))
+(defun unsetenv (name: str) -> (Result unit OSError)
+  (if (not (valid-name? name)) (Err (invalid-input "unsetenv" "invalid environment name"))
+    (let [key (n/c-text name) result (unsafe (n/unsetenv key)) saved (n/errno)]
+      (unsafe (do (free key) (if (< result 0i32) (Err (error-from-code saved "unsetenv")) (Ok ())))))))
+(defun temp-directory () -> str (unwrap-or (getenv "TMPDIR") "/tmp"))

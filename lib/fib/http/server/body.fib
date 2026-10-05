@@ -1,0 +1,25 @@
+;; Chunked decoding shares the connection's buffer, including pipelined bytes.
+(ns fib.http.server.body (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes)
+  (:require [fib.http.server.reader :as r] [fib.http.wire :as w]))
+(defun trailers :private (in: r/Input limit: i64) -> (Result (Map str (Vec str)) Error)
+  (loop [out: (Map str (Vec str)) {} count 0 size 0]
+    (try-let [line (r/required-line in)]
+      (cond (> (+ size (str-len line)) limit) (Err (LimitError "HTTP trailers are too large"))
+            (= line "") (Ok out) (>= count 100) (Err (LimitError "too many HTTP trailers"))
+            :else (try-let [entry (w/parse-header-line line)]
+              (if (includes? (. entry fst) ["content-length" "transfer-encoding" "host" "connection" "trailer" "expect"])
+                  (Err (ProtocolError "forbidden HTTP trailer field"))
+                  (recur (header-add out (. entry fst) (. entry snd)) (+ count 1) (+ size (+ (str-len line) 2)))))))))
+(defun chunked :private (in: r/Input limit: i64 header-limit: i64) -> (Result (Pair (Array i8) (Map str (Vec str))) Error)
+  (loop [parts: (Vec (Array i8)) [] size 0]
+    (try-let [line (r/required-line in) n (w/parse-chunk-size line (- limit size))]
+      (cond (= n 0) (try-let [headers (trailers in header-limit)] (Ok (Pair (concat-bytes parts) headers)))
+            (>= (count parts) 4096) (Err (LimitError "too many HTTP body chunks"))
+            :else (try-let [bytes (r/read-exact in n) ending (r/read-exact in 2)]
+              (if (and (= (array-get ending 0) 13i8) (= (array-get ending 1) 10i8))
+                  (recur (conj parts bytes) (+ size n)) (Err (ProtocolError "HTTP chunk needs CRLF"))))))))
+(defun read-body (in: r/Input mode: w/BodyMode limit: i64 header-limit: i64)
+  -> (Result (Pair (Array i8) (Map str (Vec str))) Error)
+  (match mode ((w/NoBody) (Ok (Pair (array 0 0i8) {})))
+    ((w/Fixed n) (try-let [bytes (r/read-exact in n)] (Ok (Pair bytes {}))))
+    ((w/Chunked) (chunked in limit header-limit))))

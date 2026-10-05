@@ -1,0 +1,19 @@
+(ns fib.os.time (:use fib.core fib.os.errors) (:require [fib.os.native :as n] [fib.os.abi :as a]))
+(extern clock_gettime :private (i32 ptr) -> i32)
+(extern nanosleep :private (ptr ptr) -> i32)
+(defun clock :private (id: i64) -> (Result i64 OSError)
+  (unsafe (let [slot (alloc 16) result (clock_gettime (trunc i32 id) slot) saved (n/errno)
+                value (+ (* (load-i64 slot) 1000000000) (load-i64 (ptr+ slot 8)))]
+    (do (free slot) (if (< result 0i32) (Err (error-from-code saved "clock_gettime")) (Ok value))))))
+(defun monotonic-ns () -> (Result i64 OSError) (clock (. a/host monotonic-clock)))
+(defun wall-ns () -> (Result i64 OSError) (clock 0))
+(defun clock-now () -> i64 (sys-clock-now))
+(defun wall-now () -> i64 (sys-wall-now))
+(defun sleep-ns (ns: i64) -> (Result unit OSError)
+  (if (< ns 0) (Err (invalid-input "sleep" "negative sleep duration"))
+    (unsafe (let [slot (alloc 16)]
+      (do (store-i64 slot (quot ns 1000000000)) (store-i64 (ptr+ slot 8) (rem ns 1000000000))
+        (let [result (loop []
+          (let [r (nanosleep slot slot) code (n/errno)]
+            (cond (= r 0i32) (Ok ()) (= code 4) (recur) :else (Err (error-from-code code "nanosleep")))))]
+          (do (free slot) result)))))))
