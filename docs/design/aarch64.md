@@ -249,7 +249,22 @@ selects through `Target.has-fma`, and nothing in `lib/` consumes `has-fma` yet. 
 
 ### 6.5 `scripts/mac-check.sh`
 
-Written for the owner; run once on the Mac in `--quick` mode as part of this package (FIBC = the cross seed). Its result is in the package report.
+Written for the owner; run on the Mac in `--quick` mode with FIBC = the cross seed. Output (ran on the Mac):
+
+```
+ok   step 1      (arm64, cc, libLLVM-21.dylib, seed runs: fibc 0.1.5)
+ok   step 2      (stage 2 built by the seed)
+ok   step 3      (F builds F3; same lIR)
+ok   step 4      (hello: AOT and JIT)
+311 cases: 311 pass, 0 fail, 0 pending, 0 header error
+ok   step 5
+209 cases: 202 pass, 7 fail, 0 pending, 0 header error     (--only 62 70 74 42 36; all 7 are in KNOWN)
+ok   step 6
+  JIT -O 0: exit 139   JIT -O 1: exit 0   JIT -O 2: exit 0   AOT: exit 0      (case 6223)
+mac-check: 0 step(s) failed
+```
+
+Step 6 passes by listing the known failures; a failure outside `KNOWN` is printed and fails the step.
 
 ## 7. Open findings (the Mac and the census)
 

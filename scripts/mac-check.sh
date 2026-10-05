@@ -45,10 +45,10 @@ s4() {
 }
 cases() { # DIR [--only ..]: the `fibc cases` table; the lines that are not pass/open are printed; fails on a FAIL line not in KNOWN
   "$scratch/F" cases "$@" -j "$jobs" > "$scratch/cases.out" 2>&1
-  local fails new=
+  local fails new= f n
   fails=$(grep -E ' FAIL ' "$scratch/cases.out" | awk '{print $1}')
   for f in $fails; do n=${f%%-*}; case " $KNOWN " in *" $n "*) ;; *) new="$new $f" ;; esac; done
-  tail -n 3 "$scratch/cases.out" | head -1
+  grep -E '^[0-9]+ cases: ' "$scratch/cases.out"
   [ -z "$new" ] || { echo "  new failures:"; for f in $new; do grep "^$f " "$scratch/cases.out" | cut -c1-220; done; return 1; }
 }
 s5() { cases cases/ownership; }
