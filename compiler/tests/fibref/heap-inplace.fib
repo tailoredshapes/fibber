@@ -1,0 +1,244 @@
+;; compiler/tests/fibref/heap-inplace.fib: the heap rules new since seed-1 (docs/design/in-place-update.md, spec/types.md sections 2.13.1, 6.3, 6.6): steal,
+;; take and put (`cell-update!`), peek, move-in (`&` copy-in without a retain), ROOMY arrays and the in-place primitives array-take! array-push!
+;; array-pop!. No Rust test exists for these; each test names the rule and shows the count or the audit error that a wrong implementation would change.
+;; Exit status: the number of failed tests.
+(ns main (:use fibref.value fibref.heap fibref.trace heaptk))
+
+(defun taken-msg (id: i64 f: i64) -> str (str "slot " f " of #" id " was moved out and not put back"))
+
+;; ================= steal =================
+;; x is held by the shell alone (count 1); the shell is unique.
+(defun shell-of-x (h: Heap) -> (Vec i64)
+  (let [x (imm h []) shell (imm h [(obj x) (i 7)])] (do (rel h x) [x shell])))
+
+(defun t-steal-from-a-unique-shell-moves-the-field () -> str
+  (let [h (heap-new) xs (shell-of-x h) x (nth xs 0) shell (nth xs 1) s (nev h)
+        got (is-val "steal" (heap-steal h shell 0) (obj x))]
+    (all [got (is-int "count unchanged" (heap-count h x) 1) (ck (evs-from h s) (= (evs-from h s) "steal #1.0 moved;"))
+          (is-err "slot is empty" (heap-read h shell 0) (taken-msg shell 0))
+          (is-val "other field" (heap-read h shell 1) (i 7))
+          (is-err "steal twice" (heap-steal h shell 0) (taken-msg shell 0))])))
+
+(defun t-the-release-of-a-stolen-shell-skips-the-field () -> str
+  (let [h (heap-new) xs (shell-of-x h) x (nth xs 0) shell (nth xs 1) _s (ok! (heap-steal h shell 0)) s (nev h)
+        r1 (is-ok "release shell" (heap-release h shell))
+        e0 (ck (evs-from h s) (= (evs-from h s) "release #1 -> 0;free #1;"))
+        e1 (ck "x still live" (heap-is-live h x))
+        e2 (is-int "x count" (heap-count h x) 1)
+        r2 (is-ok "stealer releases x" (heap-release h x))]
+    (all [r1 e0 e1 e2 r2 (ck "clean" (clean? h))])))
+
+(defun t-steal-from-a-shared-shell-retains () -> str
+  (let [h (heap-new) xs (shell-of-x h) x (nth xs 0) shell (nth xs 1) _r (ret h shell) s (nev h)
+        got (is-val "steal" (heap-steal h shell 0) (obj x))]
+    (all [got (is-int "x retained" (heap-count h x) 2) (ck (evs-from h s) (= (evs-from h s) "steal #1.0 retained;retain #0 -> 2;"))
+          (is-val "field kept" (heap-read h shell 0) (obj x))])))
+
+(defun t-steal-from-a-thread-shared-shell-retains () -> str
+  (let [h (heap-new) xs (shell-of-x h) x (nth xs 0) shell (nth xs 1) _m (ok! (heap-mark-shared h shell))
+        got (is-val "steal" (heap-steal h shell 0) (obj x))]
+    (all [got (is-int "x retained" (heap-count h x) 2) (is-val "field kept" (heap-read h shell 0) (obj x))])))
+
+(defun t-steal-from-a-shell-that-had-a-weak-reference-retains () -> str
+  (let [h (heap-new) xs (shell-of-x h) x (nth xs 0) shell (nth xs 1) _w (ok! (heap-weak h shell))
+        got (is-val "steal" (heap-steal h shell 0) (obj x))]
+    (all [got (is-int "x retained" (heap-count h x) 2) (is-val "field kept" (heap-read h shell 0) (obj x))])))
+
+(defun t-steal-from-an-immortal-or-stack-shell-retains () -> str
+  (let [h (heap-new) l (lit h []) lshell (lit h [(obj l)]) s (heap-open-scope h) x (imm h []) sh (stk h s IImmutable [(obj x)])
+        g1 (is-val "immortal" (heap-steal h lshell 0) (obj l)) g2 (is-val "stack" (heap-steal h sh 0) (obj x))]
+    (all [g1 g2 (is-val "immortal kept" (heap-read h lshell 0) (obj l)) (is-val "stack kept" (heap-read h sh 0) (obj x))
+          (is-int "x retained once for the stack shell's drop and once for the steal" (heap-count h x) 3)])))
+
+(defun t-steal-refuses-a-cell-a-bad-field-and-a-freed-shell () -> str
+  (let [h (heap-new) c (cell-of h (i 1)) xs (shell-of-x h) shell (nth xs 1)]
+    (all [(is-err "cell" (heap-steal h c 0) "unique write refused on #0: ContentNotImmutable")
+          (is-err "bad field" (heap-steal h shell 5) "object #2 has no field 5")
+          (is-ok "release" (heap-release h shell))
+          (is-err "freed" (heap-steal h shell 0) "use after free: read of freed object #2")])))
+
+;; ================= take and put (cell-update!) =================
+(defun t-take-then-put-moves-the-content-without-counting () -> str
+  (let [h (heap-new) x (imm h []) c (cell-of h (obj x)) _r (rel h x) s (nev h)
+        got (is-val "take" (heap-take h c 0) (obj x))
+        e0 (all [got (is-int "count unchanged" (heap-count h x) 1) (is-err "slot empty" (heap-read h c 0) (taken-msg c 0))])
+        y (imm h [])
+        _f (rel h x)
+        put (is-ok "put" (heap-put h c 0 (obj y)))]
+    (all [e0 put (is-int "y not retained by put" (heap-count h y) 1) (is-val "slot" (heap-read h c 0) (obj y))
+          (ck (evs-from h s) (= (evs-from h s) "take #1.0;alloc #2 immutable;release #0 -> 0;free #0;put #1.0;read #1.0;"))
+          (is-ok "release c" (heap-release h c)) (ck "clean" (clean? h))])))
+
+(defun t-put-needs-an-empty-slot () -> str
+  (let [h (heap-new) c (cell-of h (i 1))]
+    (all [(is-err "put into a full slot" (heap-put h c 0 (i 2)) "slot 0 of #0 holds a value: put needs an empty slot")
+          (is-val "unchanged" (heap-read h c 0) (i 1))
+          (is-val "take" (heap-take h c 0) (i 1)) (is-err "take twice" (heap-take h c 0) (taken-msg c 0))
+          (is-ok "put" (heap-put h c 0 (i 3))) (is-val "now" (heap-read h c 0) (i 3))])))
+
+(defun t-take-and-put-want-a-cell () -> str
+  (let [h (heap-new) a (atom-of h (i 1)) v (imm h [(i 1)])]
+    (all [(is-err "take atom" (heap-take h a 0) "unique write refused on #0: PlaceNotCell") (is-err "take imm" (heap-take h v 0) "unique write refused on #1: PlaceNotCell")
+          (is-err "put atom" (heap-put h a 0 (i 1)) "unique write refused on #0: PlaceNotCell")
+          (is-err "bad field" (heap-take h (cell-of h (i 1)) 3) "object #2 has no field 3")])))
+
+(defun t-put-of-a-stack-ref-into-a-heap-cell-is-refused () -> str
+  (let [h (heap-new) c (cell-of h (i 1)) s (heap-open-scope h) sx (stk h s IImmutable []) _t (ok! (heap-take h c 0))]
+    (all [(is-err "put" (heap-put h c 0 (obj sx)) "stack object #1 stored into a heap object") (is-err "still empty" (heap-read h c 0) (taken-msg c 0))])))
+
+(defun t-writing-into-a-taken-slot-retains-and-releases-nothing () -> str
+  (let [h (heap-new) x (imm h []) c (cell-of h (obj x)) _r (rel h x) _t (ok! (heap-take h c 0)) y (imm h []) s (nev h)]
+    (all [(is-ok "write" (heap-write h c 0 (obj y))) (is-int "y retained" (heap-count h y) 2) (is-int "x untouched" (heap-count h x) 1)
+          (ck (evs-from h s) (= (evs-from h s) "retain #2 -> 2;write #1.0;"))])))
+
+(defun t-a-cell-with-a-taken-slot-frees-without-releasing () -> str
+  (let [h (heap-new) x (imm h []) c (cell-of h (obj x)) _r (rel h x) _t (ok! (heap-take h c 0)) _x (rel h x)]
+    (all [(is-ok "release c" (heap-release h c)) (ck "freed" (not (heap-is-live h c))) (ck "clean" (clean? h))])))
+
+;; ================= peek =================
+(defun t-a-peek-reads-a-cell-with-no-count () -> str
+  (let [h (heap-new) x (imm h []) c (cell-of h (obj x)) _r (rel h x) s (nev h)]
+    (all [(is-val "peek" (heap-peek h c) (obj x)) (is-int "no count" (heap-count h x) 1) (ck (evs-from h s) (= (evs-from h s) "peek #1;"))
+          (is-ok "release c" (heap-release h c)) (ck "clean" (clean? h))])))
+
+(defun t-peek-wants-a-live-cell-with-content () -> str
+  (let [h (heap-new) a (atom-of h (i 1)) v (imm h [(i 1)]) c (cell-of h (i 2)) _t (ok! (heap-take h c 0))]
+    (all [(is-err "atom" (heap-peek h a) "unique write refused on #0: PlaceNotCell") (is-err "immutable" (heap-peek h v) "unique write refused on #1: PlaceNotCell")
+          (is-err "taken" (heap-peek h c) (taken-msg c 0)) (is-ok "release" (heap-release h c))
+          (is-err "freed" (heap-peek h c) "use after free: read of freed object #2")])))
+
+;; ================= move-in =================
+(defun t-move-in-takes-the-content-without-a-retain () -> str
+  (let [h (heap-new) x (imm h []) v (cell-of h (obj x)) _r (rel h x) s (heap-open-scope h) p (ok! (heap-move-in h s v 0))
+        c0 (all [(is-int "x not retained" (heap-count h x) 1) (is-int "private cell is a stack object" (heap-count h p) 0)
+                 (is-err "variable slot empty" (heap-read h v 0) (taken-msg v 0)) (is-val "private content" (heap-read h p 0) (obj x))])
+        y (imm h []) _w (wr h p 0 (obj y)) c1 (is-ok "x freed by the private cell's write" (heap-release h y)) _b (ok! (heap-write h v 0 (rd h p 0)))
+        _e (ok! (heap-end-scope h s))]
+    (all [c0 c1 (ck "x freed" (not (heap-is-live h x))) (is-int "y: variable only" (heap-count h y) 1) (is-ok "release v" (heap-release h v))
+          (ck "clean" (clean? h))])))
+
+(defun t-the-copying-copy-in-counts-what-move-in-does-not () -> str
+  (let [h (heap-new) x (imm h []) v (cell-of h (obj x)) _r (rel h x) s (heap-open-scope h) p (stk h s ICell [(obj x)])]
+    (all [(is-int "copy-in retains" (heap-count h x) 2) (is-val "variable keeps it" (heap-read h v 0) (obj x)) (ck "p" (>= p 0))
+          (is-ok "end" (heap-end-scope h s)) (is-int "the drop releases" (heap-count h x) 1)])))
+
+(defun t-move-in-refusals () -> str
+  (let [h (heap-new) a (atom-of h (i 1)) v (cell-of h (i 1)) s (heap-open-scope h) _p (ok! (heap-move-in h s v 0))]
+    (all [(is-err "taken" (heap-move-in h s v 0) (taken-msg v 0)) (is-err "atom" (heap-move-in h s a 0) "unique write refused on #0: PlaceNotCell")
+          (is-err "unknown scope" (heap-move-in h 9 (cell-of h (i 1)) 0) "unknown scope 9")
+          (is-ok "end" (heap-end-scope h s)) (is-err "ended scope" (heap-move-in h s (cell-of h (i 2)) 0) "scope 0 has already ended")])))
+
+;; ================= arrays in a cell =================
+;; An array of `elems` held by a cell; returns [cell array].
+(defun arr-in-cell (h: Heap elems: (Vec IVal)) -> (Vec i64)
+  (let [a (imm h elems) c (cell-of h (obj a))] (do (rel h a) [c a])))
+
+(defun cur (h: Heap c: i64) -> i64 (match (raw h c 0) ((IObj a) a) (_ -1)))
+
+(defun t-take-moves-an-object-element-out-of-a-unique-array () -> str
+  (let [h (heap-new) e (imm h []) ca (arr-in-cell h [(obj e) (i 5)]) c (nth ca 0) a (nth ca 1) _r (rel h e) s (nev h)
+        got (is-val "take" (heap-array-take h c 0) (obj e)) evt (evs-from h s) y (imm h [])]
+    (all [got (is-int "count moved, not retained" (heap-count h e) 1) (ck "same array" (= (cur h c) a))
+          (ck evt (= evt "array-take #2 #1[0] in-place;"))
+          (is-err "slot null" (heap-read h a 0) (taken-msg a 0))
+          (is-val "scalar read, slot kept" (heap-array-take h c 1) (i 5)) (is-val "scalar again" (heap-read h a 1) (i 5))
+          (is-int "refill by array-set!" (heap-write-unique h c 0 (obj y)) a) (ck "release y" (do (rel h y) true))
+          (is-ok "caller releases e" (heap-release h e)) (ck "e freed" (not (heap-is-live h e)))
+          (is-ok "release c" (heap-release h c)) (ck "clean" (clean? h))])))
+
+(defun t-take-from-a-shared-array-copies-first () -> str
+  (let [h (heap-new) e (imm h []) ca (arr-in-cell h [(obj e) (i 5)]) c (nth ca 0) a (nth ca 1) _r (rel h e) _o (ret h a) s (nev h)
+        got (is-val "take" (heap-array-take h c 0) (obj e)) evt (evs-from h s)
+        a2 (cur h c)]
+    (all [got (ck "the cell holds a copy" (not= a2 a)) (is-int "other holder keeps a" (heap-count h a) 1) (is-val "a intact" (heap-read h a 0) (obj e))
+          (is-int "e: a, the caller" (heap-count h e) 2) (is-err "copy slot null" (heap-read h a2 0) (taken-msg a2 0))
+          (is-bool "copy is not roomy" (heap-is-roomy h a2) false)
+          (ck evt (= evt "alloc #3 immutable;retain #0 -> 2;array-take #2 #3[0] copy;release #1 -> 1;"))])))
+
+(defun t-take-checks-the-index-and-the-slot () -> str
+  (let [h (heap-new) e (imm h []) ca (arr-in-cell h [(obj e)]) c (nth ca 0) a (nth ca 1)]
+    (all [(is-err "range" (heap-array-take h c 1) "object #1 has no field 1") (is-err "negative" (heap-array-take h c -1) "object #1 has no field -1")
+          (is-val "take" (heap-array-take h c 0) (obj e)) (is-err "taken" (heap-array-take h c 0) (taken-msg a 0))])))
+
+(defun t-push-grows-a-roomy-block-in-place-and_copies_past_32 () -> str
+  (let [h (heap-new) ca (arr-in-cell h []) c (nth ca 0)
+        _p (loop [k 0] (if (>= k 40) () (do (ok! (heap-array-push h c (i k))) (recur (+ k 1)))))
+        a (cur h c)]
+    (all [(is-int "length" (heap-field-count h a) 40) (is-bool "not roomy past 32" (heap-is-roomy h a) false)
+          (is-val "last" (heap-read h a 39) (i 39)) (is-val "first" (heap-read h a 0) (i 0))
+          (ck "31 in place" (= (count (filter (fn (e: HpEvent) (match e ((EvArrayOp op _ _ _ ip) (and (= op "push") ip)) (_ false))) @(. h log))) 31))
+          (ck "9 copies" (= (count (filter (fn (e: HpEvent) (match e ((EvArrayOp op _ _ _ ip) (and (= op "push") (not ip))) (_ false))) @(. h log))) 9))
+          (is-ok "release" (heap-release h c)) (ck "clean" (clean? h))])))
+
+(defun t-the-first-push-makes-a-roomy-copy () -> str
+  (let [h (heap-new) ca (arr-in-cell h [(i 1)]) c (nth ca 0) a (nth ca 1) s (nev h)]
+    (all [(is-ok "push" (heap-array-push h c (i 2))) (ck "new array" (not= (cur h c) a)) (is-bool "roomy" (heap-is-roomy h (cur h c)) true)
+          (ck (evs-from h s) (= (evs-from h s) "alloc #2 immutable;array-push #1 #2[1] copy;release #0 -> 0;free #0;"))
+          (is-ok "second push" (heap-array-push h c (i 3))) (ck "same array" (= (cur h c) 2)) (is-int "length 3" (heap-field-count h 2) 3)])))
+
+(defun t-push-retains-an-object-element-and-a-shared-roomy-array-copies () -> str
+  (let [h (heap-new) ca (arr-in-cell h []) c (nth ca 0) _p1 (ok! (heap-array-push h c (i 0))) a (cur h c) e (imm h [])
+        r0 (is-ok "push e" (heap-array-push h c (obj e)))
+        c0 (all [r0 (is-int "e retained by the store" (heap-count h e) 2) (ck "in place" (= (cur h c) a))])
+        _o (ret h a) r1 (is-ok "push on shared" (heap-array-push h c (i 9)))]
+    (all [c0 r1 (ck "copied" (not= (cur h c) a)) (is-int "a still has two elements" (heap-field-count h a) 2) (is-int "copy has three" (heap-field-count h (cur h c)) 3)
+          (is-int "e: a and the copy and the caller" (heap-count h e) 3)])))
+
+(defun t-pop-moves-the-last-element-out-of-a-unique-array () -> str
+  (let [h (heap-new) e (imm h []) ca (arr-in-cell h [(i 1) (obj e)]) c (nth ca 0) a (nth ca 1) _r (rel h e) s (nev h)
+        got (is-val "pop" (heap-array-pop h c) (obj e))]
+    (all [got (is-int "moved, not retained" (heap-count h e) 1) (ck "same array" (= (cur h c) a)) (is-int "length 1" (heap-field-count h a) 1)
+          (ck (evs-from h s) (= (evs-from h s) "array-pop #2 #1[1] in-place;"))
+          (is-val "pop scalar" (heap-array-pop h c) (i 1)) (is-err "empty" (heap-array-pop h c) "object #1 has no field 0")
+          (is-ok "release e" (heap-release h e)) (is-ok "release c" (heap-release h c)) (ck "clean" (clean? h))])))
+
+(defun t-pop-on-a-shared-array-copies-and-retains-the-element () -> str
+  (let [h (heap-new) e1 (imm h []) e2 (imm h []) ca (arr-in-cell h [(obj e1) (obj e2)]) c (nth ca 0) a (nth ca 1) _a (rel h e1) _b (rel h e2) _o (ret h a)
+        got (is-val "pop" (heap-array-pop h c) (obj e2))
+        a2 (cur h c)]
+    (all [got (ck "copy" (not= a2 a)) (is-int "copy length" (heap-field-count h a2) 1) (is-int "a intact" (heap-field-count h a) 2)
+          (is-int "e2: a and the caller" (heap-count h e2) 2) (is-int "e1: a and the copy" (heap-count h e1) 2) (is-bool "not roomy" (heap-is-roomy h a2) false)])))
+
+(defun t-pop-on-an-array-that-had-a-weak-reference-copies () -> str
+  (let [h (heap-new) e (imm h []) ca (arr-in-cell h [(obj e)]) c (nth ca 0) a (nth ca 1) _r (rel h e) _w (ok! (heap-weak h a))
+        got (is-val "pop" (heap-array-pop h c) (obj e))]
+    (all [got (ck "a was released by the cell and freed" (not (heap-is-live h a))) (is-int "e: the caller only" (heap-count h e) 1)
+          (is-ok "release e" (heap-release h e)) (is-ok "release c" (heap-release h c)) (ck "clean" (clean? h))])))
+
+(defun t-array-primitives-want-a-cell-holding-an-immutable () -> str
+  (let [h (heap-new) a (atom-of h (i 1)) v (imm h [(i 1)]) c (cell-of h (i 1)) cc (cell-of h (obj c))]
+    (all [(is-err "take on atom" (heap-array-take h a 0) "unique write refused on #0: PlaceNotCell") (is-err "push on imm" (heap-array-push h v (i 1)) "unique write refused on #1: PlaceNotCell")
+          (is-err "pop on scalar content" (heap-array-pop h c) "unique write refused on #2: ContentNotImmutable")
+          (is-err "take on a cell of a cell" (heap-array-take h cc 0) "unique write refused on #2: ContentNotImmutable")])))
+
+(defun main () -> i64
+  (min 100
+    (run-suite "heap-inplace"
+      [(tc "steal-unique-moves" t-steal-from-a-unique-shell-moves-the-field)
+       (tc "stolen-shell-release-skips" t-the-release-of-a-stolen-shell-skips-the-field)
+       (tc "steal-shared-retains" t-steal-from-a-shared-shell-retains)
+       (tc "steal-thread-shared-retains" t-steal-from-a-thread-shared-shell-retains)
+       (tc "steal-weak-retains" t-steal-from-a-shell-that-had-a-weak-reference-retains)
+       (tc "steal-immortal-stack-retains" t-steal-from-an-immortal-or-stack-shell-retains)
+       (tc "steal-refusals" t-steal-refuses-a-cell-a-bad-field-and-a-freed-shell)
+       (tc "take-put" t-take-then-put-moves-the-content-without-counting)
+       (tc "put-needs-empty-slot" t-put-needs-an-empty-slot)
+       (tc "take-put-want-a-cell" t-take-and-put-want-a-cell)
+       (tc "put-stack-ref-refused" t-put-of-a-stack-ref-into-a-heap-cell-is-refused)
+       (tc "write-into-taken-slot" t-writing-into-a-taken-slot-retains-and-releases-nothing)
+       (tc "cell-with-taken-slot-frees" t-a-cell-with-a-taken-slot-frees-without-releasing)
+       (tc "peek-no-count" t-a-peek-reads-a-cell-with-no-count)
+       (tc "peek-wants-a-cell" t-peek-wants-a-live-cell-with-content)
+       (tc "move-in" t-move-in-takes-the-content-without-a-retain)
+       (tc "copy-in-counts" t-the-copying-copy-in-counts-what-move-in-does-not)
+       (tc "move-in-refusals" t-move-in-refusals)
+       (tc "array-take-unique" t-take-moves-an-object-element-out-of-a-unique-array)
+       (tc "array-take-shared-copies" t-take-from-a-shared-array-copies-first)
+       (tc "array-take-checks" t-take-checks-the-index-and-the-slot)
+       (tc "array-push-roomy" t-push-grows-a-roomy-block-in-place-and_copies_past_32)
+       (tc "array-first-push-roomy-copy" t-the-first-push-makes-a-roomy-copy)
+       (tc "array-push-retains-shared-copies" t-push-retains-an-object-element-and-a-shared-roomy-array-copies)
+       (tc "array-pop-unique" t-pop-moves-the-last-element-out-of-a-unique-array)
+       (tc "array-pop-shared" t-pop-on-a-shared-array-copies-and-retains-the-element)
+       (tc "array-pop-weak" t-pop-on-an-array-that-had-a-weak-reference-copies)
+       (tc "array-prims-want-a-cell" t-array-primitives-want-a-cell-holding-an-immutable)])))
