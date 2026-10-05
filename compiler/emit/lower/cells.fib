@@ -4,7 +4,7 @@
 ;; is Rust's: a `gep` before the access it feeds, an operand's retain before the call it is passed to.
 (ns emit.lower.cells
   (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.layout emit.ir emit.objects emit.program
-        emit.lower.cx emit.lower.ops emit.lower.objects))
+        emit.lower.cx emit.lower.ops emit.lower.objects emit.lower.window))
 
 ;; The content of a cell, atom, weak reference or task type; `nil` for any other type.
 (defun content-of :private (t: Ty) -> (Option Ty)
@@ -238,7 +238,16 @@
                          (lcx-gep cx (. o sname) p slot-atom-value))
                      (lcx-gep cx (. o sname) p slot-cell-value))))
       (do (lcx-store cx v field)
-          (Ok (VVal p LirPtr))))))
+          (try-let ((u (lcx-window-slot cx t (VVal p LirPtr) v atom))) (Ok (VVal p LirPtr)))))))
+
+;; A cell whose content is a window of fib.view: the window's base and length are read once, here (emit.lower.window).
+(defun lcx-window-slot :private (cx: LowerCx t: Ty cell: V w: V atom: bool) -> (Result unit str)
+  (match t
+    ((TCon (KCell) args)
+     (if (and (not atom) (window-ty? cx (nth args 0)))
+         (window-register cx (nth args 0) cell w)
+         (Ok ())))
+    (_ (Ok ()))))
 
 ;; `(set-field! &s f v)`: a unique write when `fib.unique?` holds, else a changed copy stored into the cell (§8.3, §6.6).
 ;; Rust: lower/cells.rs:272 LowerCx::set_field

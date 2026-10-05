@@ -1,0 +1,117 @@
+;; compiler/emit/lower/window.fib: exclusive-view windows as registers (types §6.15, spec/stdlib.md fib.view; package EV2).
+;; Not in the Rust (the frozen Rust does not know `fib.view`).
+;;
+;; A window (`Win`, `RoWin` of the library `fib.view`) is an object of a base address, a length and a seed. Every access of the library
+;; (`win-get`, `win-set!`, `vlen`) reads those two fields and compares the index with the length. Here the compiler reads them ONCE, where
+;; the window's cell is made (`window-register`: the base and the length are two SSA values that dominate the whole extent, since a view cell
+;; is never assigned and a window is immutable), and lowers a call of those library functions at an element type of 4 or 8 bytes inline:
+;; an unsigned compare of the index with the length, an address, a load or a store. No call, no count, no private cell; the loads of the
+;; fields are not repeated after a store through the base, so LLVM sees a loop of plain loads and stores it can vectorise. The failing
+;; branch is a call of the library's own function (its trap message is the library's, `window index I out of range for a window of N`).
+;; A window that was not registered (a parameter of a kernel) loads the two fields at the access.
+(ns emit.lower.window
+  (:use types.ty types.ast types.decls own.program emit.value emit.layout emit.ir emit.objects emit.program emit.lower.cx emit.lower.ops
+        emit.lower.objects))
+
+;; Whether `t` is a window type of the library `fib.view`.
+(defun window-ty? (cx: LowerCx t: Ty) -> bool
+  (match t
+    ((TCon (KNominal id) _)
+     (let ((g (program-g (. cx p))))
+       (let ((d (g-ty g id)))
+         (and (= (g-module-name g (. d module)) "fib.view") (or (= (. d name) "Win") (= (. d name) "RoWin"))))))
+    (_ false)))
+
+;; The base address and the length of the window `w` of type `t`, read from its object.
+(defun window-fields :private (cx: LowerCx t: Ty w: V) -> (Result (Pair V V) str)
+  (try-let ((o (lcx-object-of cx t)) (bf (field-at cx t "window" "base")) (lf (field-at cx t "window" "len")))
+    (Ok (Pair (lcx-load cx LirRaw (lcx-gep cx (. o sname) (v-text w) (. bf slot)))
+              (lcx-load cx LirI64 (lcx-gep cx (. o sname) (v-text w) (. lf slot)))))))
+
+;; The window `w` has just been made and stored in the cell `cell` (a cell of type `(Cell t)`): its two fields are read once, kept under the
+;; window's address, and a read of the cell's content is the window itself (the table of a hoisted array, emit.lower.hoist, is the same
+;; shape: a cell's text to its content, the content's text to what is known of it).
+(defun window-register (cx: LowerCx t: Ty cell: V w: V) -> (Result unit str)
+  (try-let ((fl (window-fields cx t w)))
+    (do (set! (. cx hoisted) (assoc @(. cx hoisted) (v-text w) fl))
+        (set! (. cx hoisted) (assoc @(. cx hoisted) (v-text cell) (Pair w w)))
+        (Ok ()))))
+
+;; The base and length of `w`: the registered ones, else read now.
+(defun window-regs :private (cx: LowerCx t: Ty w: V) -> (Result (Pair V V) str)
+  (match (get @(. cx hoisted) (v-text w))
+    ((some h) (Ok h))
+    (nil (window-fields cx t w))))
+
+;; The window in a cell: the registered content, else a load of the cell's slot.
+(defun window-of-cell :private (cx: LowerCx cell-ty: Ty cell: V) -> (Result V str)
+  (match (get @(. cx hoisted) (v-text cell))
+    ((some h) (Ok (. h fst)))
+    (nil (try-let ((o (lcx-object-of cx cell-ty))) (Ok (lcx-load cx LirPtr (lcx-gep cx (. o sname) (v-text cell) slot-cell-value)))))))
+
+;; The index is below the length as an unsigned number (so a negative index fails too), else the library's own failure runs.
+(defun window-check :private (cx: LowerCx i: V n: V slow: (fn () (Result V str))) -> (Result unit str)
+  (let ((b (. cx b))
+        (ok (fb-val (. cx b) (str-join ["(icmp ult " (v-text i) " " (v-text n) ")"]) LirI1))
+        (lo (fb-label (. cx b) "winb")) (lt (fb-label (. cx b) "wino")))
+    (do (fb-term b (str-join ["(br " (v-text ok) " " lo " " lt ")"]))
+        (fb-open b lt)
+        (try-let ((c (slow)))
+          (do (fb-term b "(unreachable)")
+              (fb-open b lo)
+              (Ok ()))))))
+
+;; The address of element `i` of 4- or 8-byte elements from `base`.
+(defun window-addr :private (cx: LowerCx base: V i: V width: i64) -> str
+  (let ((off (fb-val (. cx b) (str-join ["(mul " (v-text i) " (i64 " (str width) "))"]) LirI64)))
+    (v-text (fb-val (. cx b) (str-join ["(getelementptr i8 " (v-text base) " " (v-text off) ")"]) LirRaw))))
+
+;; The element types the library's `ViewElem` has an instance for and a lane of 4 or 8 bytes: the ones lowered here.
+(defun window-elem? :private (l: (Option LirTy)) -> bool
+  (match l
+    ((some (LirDouble)) true) ((some (LirFloat)) true) ((some (LirI64)) true) ((some (LirI32)) true)
+    (_ false)))
+
+;; The lowering of a direct call of the library function `name`, or `nil` when it is none of the ones lowered here (the call is then made as
+;; usual). `slow` makes the ordinary call, for the failing branch. `tys` are the types of the arguments, `rt` of the result.
+(defun lcx-window-call (cx: LowerCx name: str vals: (Vec V) tys: (Vec Ty) rt: Ty slow: (fn () (Result V str))) -> (Result (Option V) str)
+  (cond (starts-with? name "f.fib.view.win-get.") (window-get cx vals tys rt slow)
+        (starts-with? name "f.fib.view.win-set!.") (window-set cx vals tys slow)
+        (starts-with? name "m.fib.view.Windowed.win-len.") (window-len cx vals tys)
+        :else (Ok nil)))
+
+(defun window-get :private (cx: LowerCx vals: (Vec V) tys: (Vec Ty) rt: Ty slow: (fn () (Result V str))) -> (Result (Option V) str)
+  (if (not (window-ty? cx (nth tys 0)))
+      (Ok nil)
+      (try-let ((l (program-lir (. cx p) rt)))
+        (if (not (window-elem? l))
+            (Ok nil)
+            (try-let ((r (window-regs cx (nth tys 0) (nth vals 0))))
+              (match l
+                ((some el)
+                 (try-let ((c (window-check cx (nth vals 1) (. r snd) slow)))
+                   (Ok (some (lcx-load cx el (window-addr cx (. r fst) (nth vals 1) (. (size-align el) fst)))))))
+                (nil (Ok nil))))))))
+
+;; `win-set!`: the first value is the view cell itself (the plan hands a cell of scoped type over unchanged, own.walk.call `amp-pass`).
+(defun window-set :private (cx: LowerCx vals: (Vec V) tys: (Vec Ty) slow: (fn () (Result V str))) -> (Result (Option V) str)
+  (match (nth tys 0)
+    ((TCon (KCell) cargs)
+     (if (not (window-ty? cx (nth cargs 0)))
+         (Ok nil)
+         (try-let ((l (program-lir (. cx p) (nth tys 2))))
+           (if (not (window-elem? l))
+               (Ok nil)
+               (try-let ((w (window-of-cell cx (nth tys 0) (nth vals 0))) (r (window-regs cx (nth cargs 0) w)))
+                 (match l
+                   ((some el)
+                    (try-let ((c (window-check cx (nth vals 1) (. r snd) slow)))
+                      (do (lcx-store cx (nth vals 2) (window-addr cx (. r fst) (nth vals 1) (. (size-align el) fst)))
+                          (Ok (some VUnit)))))
+                   (nil (Ok nil))))))))
+    (_ (Ok nil))))
+
+(defun window-len :private (cx: LowerCx vals: (Vec V) tys: (Vec Ty)) -> (Result (Option V) str)
+  (if (not (window-ty? cx (nth tys 0)))
+      (Ok nil)
+      (try-let ((r (window-regs cx (nth tys 0) (nth vals 0)))) (Ok (some (. r snd))))))
