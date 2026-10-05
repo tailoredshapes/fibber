@@ -1,0 +1,42 @@
+;; Request validation finishes before any resolver executes.
+(ns fib.lacinia.plan (:use fib.core fib.seq fib.coll fib.lacinia.types)
+  (:require [fib.lacinia.coerce :as c]))
+(defstruct GqlPreparedField (name: str response-key: str field: GqlField arguments: (Map str GqlValue)
+  children: (Vec GqlPreparedField) location: GqlLocation))
+(defun merge-one :private (fields: (Vec GqlSelection) item: GqlSelection index: i64) -> (Result (Vec GqlSelection) GqlError)
+  (let [old (nth fields index)]
+    (if (or (!= (. old name) (. item name)) (!= (. old arguments) (. item arguments)))
+      (Err (GqlError ValidationFailure (str "Conflicting fields for response key " (. item response-key))
+        [(. old location) (. item location)] []))
+      (Ok (assoc fields index (with old (children (vec (concat (. old children) (. item children))))))))))
+(defun merge-fields :private (input: (Vec GqlSelection)) -> (Result (Vec GqlSelection) GqlError)
+  (loop [i 0 fields: (Vec GqlSelection) [] indices: (Map str i64) {}]
+    (if (= i (count input)) (Ok fields)
+      (let [item (nth input i) key (. item response-key)]
+        (match (get indices key)
+          (nil (recur (+ i 1) (conj fields item) (assoc indices key (count fields))))
+          ((some index) (try-let [merged (merge-one fields item index)] (recur (+ i 1) merged indices))))))))
+(defun lookup-field :private (schema: GqlCompiledSchema owner: str selection: GqlSelection) -> (Result GqlField GqlError)
+  (let [name (. selection name) pos (. selection location)]
+    (cond (= name "__typename") (Ok (field (non-null (named "String"))))
+      (or (= name "__schema") (= name "__type")) (Err (located-error UnsupportedFeature "Schema introspection is not implemented yet" pos))
+      :else (match (get (. schema objects) owner)
+        (nil (Err (located-error ValidationFailure (str "Unknown object type " owner) pos)))
+        ((some object) (match (get (. object fields) name)
+          ((some field) (Ok field))
+          (nil (Err (located-error ValidationFailure (str "Unknown field " owner "/" name) pos)))))))))
+(defun prepare-field :private (schema: GqlCompiledSchema owner: str selection: GqlSelection) -> (Result GqlPreparedField GqlError)
+  (try-let [field (lookup-field schema owner selection)]
+    (let [name (base-name (. field type)) scalar (c/scalar? name) pos (. selection location)]
+      (cond (and scalar (not (empty? (. selection children)))) (Err (located-error ValidationFailure "A scalar field cannot have a selection set" pos))
+        (and (not scalar) (empty? (. selection children))) (Err (located-error ValidationFailure "An object field requires a selection set" pos))
+        :else (match (c/arguments field (. selection arguments))
+          ((Err message) (Err (located-error ValidationFailure message pos)))
+          ((Ok arguments)
+            (try-let [children (if scalar (Ok []) (prepare schema name (. selection children)))]
+              (Ok (GqlPreparedField (. selection name) (. selection response-key) field arguments children pos)))))))))
+(defun prepare (schema: GqlCompiledSchema owner: str selections: (Vec GqlSelection)) -> (Result (Vec GqlPreparedField) GqlError)
+  (try-let [fields (merge-fields selections)]
+    (loop [i 0 out: (Vec GqlPreparedField) []]
+      (if (= i (count fields)) (Ok out)
+        (try-let [item (prepare-field schema owner (nth fields i))] (recur (+ i 1) (conj out item)))))))

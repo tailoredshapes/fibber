@@ -1,0 +1,52 @@
+(ns fib.lacinia.coerce (:use fib.core fib.seq fib.coll fib.lacinia.types))
+(defun scalar? (name: str) -> bool
+  (or (= name "String") (= name "Int") (= name "Float") (= name "Boolean") (= name "ID")))
+(defun finite? (number: f64) -> bool (and (>= number -1.7976931348623157e308) (<= number 1.7976931348623157e308)))
+(defun int-value :private (value: GqlValue input: bool) -> (Result GqlValue str)
+  (match value
+    ((IntValue number) (if (and (>= number -2147483648) (<= number 2147483647)) (Ok value) (Err "Int is outside its 32-bit range")))
+    ((FloatValue number)
+      (if (and (not input) (>= number -2147483648.0) (<= number 2147483647.0))
+        (let [integer (fptosi i64 number)]
+          (if (= number (sitofp f64 integer)) (Ok (IntValue integer)) (Err "Int requires a whole number")))
+        (Err "Expected an Int")))
+    (_ (Err "Expected an Int"))))
+(defun string-value :private (value: GqlValue input: bool) -> (Result GqlValue str)
+  (match value ((StringValue _) (Ok value))
+    ((IntValue number) (if input (Err "Expected a String") (Ok (StringValue (str number)))))
+    ((FloatValue number) (if (or input (not (finite? number))) (Err "Expected a String") (Ok (StringValue (str number)))))
+    ((BooleanValue value) (if input (Err "Expected a String") (Ok (StringValue (if value "true" "false")))))
+    (_ (Err "Expected a String"))))
+(defun scalar-value (name: str value: GqlValue input: bool) -> (Result GqlValue str)
+  (cond (= name "Int") (int-value value input)
+    (= name "String") (string-value value input)
+    (= name "ID") (match value ((StringValue _) (Ok value)) ((IntValue number) (Ok (StringValue (str number)))) (_ (Err "Expected an ID")))
+    (= name "Float") (match value
+      ((IntValue number) (Ok (FloatValue (sitofp f64 number))))
+      ((FloatValue number) (if (finite? number) (Ok value) (Err "Float must be finite"))) (_ (Err "Expected a Float")))
+    (= name "Boolean") (match value ((BooleanValue _) (Ok value)) (_ (Err "Expected a Boolean")))
+    :else (Err (str "Unsupported scalar " name))))
+(defun input-value (type: GqlType value: GqlValue) -> (Result GqlValue str)
+  (match type
+    ((NonNullType element) (if (null? value) (Err "A non-null input cannot be null") (input-value element value)))
+    (_ (if (null? value) (Ok NullValue)
+      (match type
+        ((NamedType name) (scalar-value name value true))
+        ((ListType element)
+          (let [items (match value ((ListValue items) items) (_ [value]))]
+            (loop [i 0 out: (Vec GqlValue) []]
+              (if (= i (count items)) (Ok (ListValue out))
+                (try-let [item (input-value element (nth items i))] (recur (+ i 1) (conj out item)))))))
+        (_ (Err "Invalid input type")))))))
+(defun arguments (field: GqlField supplied: (Map str GqlValue)) -> (Result (Map str GqlValue) str)
+  (if (some? (first (filter (fn (key: str) (not (contains? (. field arguments) key))) (keys supplied))))
+    (Err "Unknown argument")
+    (let [names (vec (sort (keys (. field arguments))))]
+      (loop [i 0 out: (Map str GqlValue) {}]
+        (if (= i (count names)) (Ok out)
+          (let [name (nth names i) definition (get (. field arguments) name (argument (named "String")))
+                value (match (get supplied name) ((some value) (some value)) (nil (. definition default-value)))]
+            (match value
+              ((some value) (try-let [coerced (input-value (. definition type) value)]
+                (recur (+ i 1) (assoc out name coerced))))
+              (nil (if (required? (. definition type)) (Err (str "Required argument " name " is missing")) (recur (+ i 1) out))))))))))

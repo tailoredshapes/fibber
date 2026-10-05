@@ -1,0 +1,24 @@
+;; spec: docs/design/lacinia.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use fib.core fib.seq fib.coll fib.print tl.check) (:require [fib.lacinia :as g]))
+(defun main () -> i64
+  (let [c (checks) calls (atom 0) text (g/named "String")
+        definition (g/schema {"User" (g/object-type {"name" (g/field text) "id" (g/field (g/named "ID"))})}
+          {"user" (g/resolving (g/named "User")
+            (fn (context: g/GqlValue arguments: (Map str g/GqlValue) parent: g/GqlValue)
+              (do (swap! calls (fn (n: i64) (+ n 1))) (Ok (g/object {"name" (g/StringValue "Ada") "id" (g/IntValue 1)})))))
+           "other" (g/field text)})]
+    (do (match (g/compile-schema definition)
+      ((Err _) (check c false))
+      ((Ok compiled) (do
+        (check c (= (g/result-json (g/execute compiled "{ user { name } user { id } }" {} g/NullValue))
+          "{\"data\":{\"user\":{\"name\":\"Ada\",\"id\":\"1\"}}}"))
+        (check c (= @calls 1))
+        (let [bad (g/execute compiled "{ same: user { name } same: other }" {} g/NullValue)]
+          (do (check c (= (. bad data) nil)) (check c (= (count (. bad errors)) 1))))
+        (check c (= @calls 1)))))
+      (checks-result c))))

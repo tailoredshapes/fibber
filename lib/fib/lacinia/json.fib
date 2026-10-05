@@ -1,0 +1,33 @@
+;; Ordered response serialization; validation errors omit data entirely.
+(ns fib.lacinia.json (:use fib.core fib.seq fib.coll fib.lacinia.types)
+  (:require [fib.string.join :as strings]))
+(defun join :private (parts: (Vec str)) -> str
+  (strings/join "," parts))
+(defun quote-text (text: str) -> str
+  (let [hex "0123456789abcdef"]
+    (str "\"" (str-join (mapv (fn (c: char)
+      (let [code (long c)]
+        (cond (= code 34) "\\\"" (= code 92) "\\\\" (= code 10) "\\n" (= code 13) "\\r" (= code 9) "\\t"
+          (< code 32) (str "\\u00" (char->str (nth hex (quot code 16))) (char->str (nth hex (rem code 16))))
+          :else (char->str c)))) (str-chars text))) "\"")))
+(defun value-json (value: GqlValue) -> str
+  (match value
+    ((NullValue) "null") ((BooleanValue value) (if value "true" "false")) ((IntValue value) (str value))
+    ((FloatValue value) (str value)) ((StringValue value) (quote-text value)) ((EnumValue value) (quote-text value))
+    ((ListValue values) (str "[" (join (mapv value-json values)) "]"))
+    ((ObjectValue fields order) (str "{" (join (mapv (fn (key: str)
+      (str (quote-text key) ":" (value-json (unwrap-or (get fields key) NullValue)))) order)) "}"))))
+(defun location-value :private (location: GqlLocation) -> GqlValue
+  (object {"line" (IntValue (. location line)) "column" (IntValue (. location column))}))
+(defun path-value :private (path: GqlPath) -> GqlValue
+  (match path ((FieldPath name) (StringValue name)) ((IndexPath index) (IntValue index))))
+(defun error-value :private (error: GqlError) -> GqlValue
+  (let [base: (Map str GqlValue) {"message" (StringValue (. error message))}
+        located (if (empty? (. error locations)) base (assoc base "locations" (ListValue (mapv location-value (. error locations)))))
+        pathed (if (empty? (. error path)) located (assoc located "path" (ListValue (mapv path-value (. error path)))))]
+    (object pathed)))
+(defun result-json (result: GqlResult) -> str
+  (let [data (match (. result data) ((some value) [(str "\"data\":" (value-json value))]) (nil []))
+        errors (if (empty? (. result errors)) data
+          (conj data (str "\"errors\":" (value-json (ListValue (mapv error-value (. result errors)))))))]
+    (str "{" (join errors) "}")))

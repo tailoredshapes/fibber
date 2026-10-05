@@ -1,0 +1,48 @@
+(ns fib.lacinia.schema (:use fib.core fib.seq fib.coll fib.lacinia.types)
+  (:require [fib.lacinia.coerce :as c]))
+(defun name-start? (code: i64) -> bool
+  (or (= code 95) (and (>= code 65) (<= code 90)) (and (>= code 97) (<= code 122))))
+(defun name-part? (code: i64) -> bool (or (name-start? code) (and (>= code 48) (<= code 57))))
+(defun valid-name? (name: str) -> bool
+  (let [bytes (str-bytes name)]
+    (and (> (array-len bytes) 0) (not (starts-with? name "__"))
+      (name-start? (zext i64 (array-get bytes 0)))
+      (loop [i 1] (if (= i (array-len bytes)) true
+        (if (name-part? (zext i64 (array-get bytes i))) (recur (+ i 1)) false))))))
+(defun valid-type :private (objects: (Map str GqlObjectType) type: GqlType input: bool depth: i64) -> (Result unit str)
+  (if (> depth 64) (Err "Type nesting exceeds 64")
+    (match type
+      ((NamedType name) (if (or (c/scalar? name) (and (not input) (contains? objects name))) (Ok ()) (Err (str "Unknown or invalid type " name))))
+      ((ListType element) (valid-type objects element input (+ depth 1)))
+      ((NonNullType element) (if (required? element) (Err "Non-null cannot wrap non-null") (valid-type objects element input (+ depth 1)))))))
+(defun argument-errors :private (objects: (Map str GqlObjectType) owner: str arguments: (Map str GqlArgument)) -> (Vec GqlError)
+  (reduce (fn (errors: (Vec GqlError) name: str)
+    (let [definition (get arguments name (argument (named "String"))) label (str owner "(" name ")")]
+      (let [next (if (valid-name? name) errors (conj errors (schema-error (str "Invalid argument name " label))))]
+        (match (valid-type objects (. definition type) true 0)
+          ((Err message) (conj next (schema-error (str label ": " message))))
+          ((Ok _) (match (. definition default-value)
+            (nil next)
+            ((some value) (match (c/input-value (. definition type) value)
+              ((Ok _) next) ((Err message) (conj next (schema-error (str label ": " message))))))))))))
+    [] (vec (sort (keys arguments)))))
+(defun field-errors :private (objects: (Map str GqlObjectType) owner: str fields: (Map str GqlField)) -> (Vec GqlError)
+  (reduce (fn (errors: (Vec GqlError) name: str)
+    (let [definition (get fields name (field (named "String"))) label (str owner "/" name)
+          next (if (valid-name? name) errors (conj errors (schema-error (str "Invalid field name " label))))
+          checked (match (valid-type objects (. definition type) false 0)
+            ((Ok _) next) ((Err message) (conj next (schema-error (str label ": " message)))))]
+      (vec (concat checked (argument-errors objects label (. definition arguments))))))
+    [] (vec (sort (keys fields)))))
+(defun compile-schema (definition: GqlSchemaDefinition) -> (Result GqlCompiledSchema (Vec GqlError))
+  (let [objects (assoc (. definition objects) "Query" (object-type (. definition queries)))
+        start (if (= (count (. definition queries)) 0) [(schema-error "A schema requires at least one query field")] [])
+        reserved (if (contains? (. definition objects) "Query") (conj start (schema-error "Query is supplied by the queries map")) start)
+        errors (reduce (fn (errors: (Vec GqlError) name: str)
+          (let [object (get objects name (object-type {}))
+                named-errors (if (and (valid-name? name) (not (c/scalar? name))) errors
+                  (conj errors (schema-error (str "Invalid object type name " name))))
+                field-count (if (= (count (. object fields)) 0) (conj named-errors (schema-error (str name " has no fields"))) named-errors)]
+            (vec (concat field-count (field-errors objects name (. object fields))))))
+          reserved (vec (sort (keys objects))))]
+    (if (empty? errors) (Ok (GqlCompiledSchema objects)) (Err errors))))

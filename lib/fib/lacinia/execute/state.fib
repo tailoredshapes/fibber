@@ -1,0 +1,11 @@
+(ns fib.lacinia.execute.state (:use fib.core fib.seq fib.coll fib.lacinia.types))
+(defstruct GqlExecution (context: GqlValue errors: (Cell (Vec GqlError)) visits: (Cell i64)))
+(defun execution (context: GqlValue) -> GqlExecution (GqlExecution context (cell []) (cell 0)))
+(defun exhausted? (state: GqlExecution) -> bool (> @(. state visits) 65536))
+(defun record-error (state: GqlExecution kind: GqlErrorKind message: str location: GqlLocation path: (Vec GqlPath)) -> unit
+  (set! (. state errors) (conj @(. state errors) (GqlError kind message [location] path))))
+(defun spend (state: GqlExecution location: GqlLocation path: (Vec GqlPath)) -> bool
+  (let [visited @(. state visits)]
+    (do (set! (. state visits) (+ visited 1))
+      (if (< visited 65536) true
+        (do (if (= visited 65536) (record-error state ResourceLimit "Execution exceeds completion limit" location path) ()) false)))))

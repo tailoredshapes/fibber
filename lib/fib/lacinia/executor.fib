@@ -1,0 +1,53 @@
+;; Completion propagates a failed non-null value to its nearest nullable parent.
+(ns fib.lacinia.executor (:use fib.core fib.seq fib.coll fib.lacinia.types)
+  (:require [fib.lacinia.plan :as p] [fib.lacinia.coerce :as c] [fib.lacinia.execute.state :as s]))
+(defun complete-list :private (state: s/GqlExecution element: GqlType items: (Vec GqlValue)
+  children: (Vec p/GqlPreparedField) location: GqlLocation path: (Vec GqlPath)) -> (Option GqlValue)
+  (loop [i 0 out: (Vec GqlValue) []]
+    (cond (s/exhausted? state) (some NullValue)
+      (= i (count items)) (some (ListValue out))
+      :else (match (complete state element (nth items i) children location (conj path (IndexPath i)) true)
+        (nil (some NullValue)) ((some value) (recur (+ i 1) (conj out value)))))))
+(defun named-value :private (state: s/GqlExecution name: str value: GqlValue children: (Vec p/GqlPreparedField)
+  location: GqlLocation path: (Vec GqlPath)) -> (Option GqlValue)
+  (if (c/scalar? name)
+    (match (c/scalar-value name value false)
+      ((Ok value) (some value))
+      ((Err message) (do (s/record-error state CompletionFailure message location path) (some NullValue))))
+    (match value
+      ((ObjectValue _ _) (some (unwrap-or (project state name value children path) NullValue)))
+      (_ (do (s/record-error state CompletionFailure "Expected an object result" location path) (some NullValue))))))
+(defun complete (state: s/GqlExecution type: GqlType value: GqlValue children: (Vec p/GqlPreparedField)
+  location: GqlLocation path: (Vec GqlPath) report-null: bool) -> (Option GqlValue)
+  (if (not (s/spend state location path)) (if (required? type) nil (some NullValue))
+    (match type
+      ((NonNullType element)
+        (let [before (count @(. state errors)) completed (complete state element value children location path report-null)]
+          (match completed
+            ((some value) (if (null? value)
+              (do (if (and report-null (= before (count @(. state errors))))
+                (s/record-error state CompletionFailure "Cannot return null for a non-null field" location path) ()) nil)
+              (some value))) (nil nil))))
+      (_ (if (null? value) (some NullValue)
+        (match type
+          ((NamedType name) (named-value state name value children location path))
+          ((ListType element) (match value
+            ((ListValue items) (complete-list state element items children location path))
+            (_ (do (s/record-error state CompletionFailure "Expected a list result" location path) (some NullValue)))))
+          (_ (some NullValue))))))))
+(defun resolve-field :private (state: s/GqlExecution owner: str parent: GqlValue node: p/GqlPreparedField) -> (Result GqlValue str)
+  (if (= (. node name) "__typename") (Ok (StringValue owner))
+    (match (. (. node field) resolver)
+      (nil (Ok (field-value parent (. node name))))
+      ((some resolver) (resolver (. state context) (. node arguments) parent)))))
+(defun project (state: s/GqlExecution owner: str parent: GqlValue nodes: (Vec p/GqlPreparedField) path: (Vec GqlPath)) -> (Option GqlValue)
+  (loop [i 0 fields: (Map str GqlValue) {} order: (Vec str) []]
+    (if (= i (count nodes)) (some (ObjectValue fields order))
+      (let [node (nth nodes i) target (conj path (FieldPath (. node response-key))) pos (. node location)]
+        (if (not (s/spend state pos target)) nil
+          (let [resolved (resolve-field state owner parent node)
+                value (match resolved ((Ok value) value) ((Err message) (do (s/record-error state ResolverFailure message pos target) NullValue)))
+                report (match resolved ((Ok _) true) (_ false))]
+            (match (complete state (. (. node field) type) value (. node children) pos target report)
+              (nil nil)
+              ((some completed) (recur (+ i 1) (assoc fields (. node response-key) completed) (conj order (. node response-key)))))))))))

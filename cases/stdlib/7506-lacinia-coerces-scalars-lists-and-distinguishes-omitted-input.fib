@@ -1,0 +1,34 @@
+;; spec: docs/design/lacinia.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use fib.core fib.seq fib.coll fib.print tl.check) (:require [fib.lacinia :as g]))
+(defun main () -> i64
+  (let [c (checks) integer (g/named "Int")
+        definition (g/schema {} {
+          "sum" (with (g/resolving integer
+            (fn (ctx: g/GqlValue args: (Map str g/GqlValue) parent: g/GqlValue)
+              (match (get args "items")
+                ((some (g/ListValue values)) (Ok (g/IntValue (reduce (fn (sum: i64 v: g/GqlValue)
+                  (match v ((g/IntValue n) (+ sum n)) (_ sum))) 0 values)))) (_ (Err "missing items")))))
+            (arguments {"items" (g/argument (g/non-null (g/list-of (g/non-null integer))))}))
+          "present" (with (g/resolving (g/named "Boolean")
+            (fn (ctx: g/GqlValue args: (Map str g/GqlValue) parent: g/GqlValue) (Ok (g/BooleanValue (contains? args "text")))))
+            (arguments {"text" (g/argument (g/named "String"))}))
+          "float" (g/resolving (g/named "Float") (fn (ctx: g/GqlValue args: (Map str g/GqlValue) parent: g/GqlValue) (Ok (g/IntValue 5))))
+          "integer" (g/resolving integer (fn (ctx: g/GqlValue args: (Map str g/GqlValue) parent: g/GqlValue) (Ok (g/FloatValue 3.0))))
+          "invalid" (g/resolving (g/named "Float") (fn (ctx: g/GqlValue args: (Map str g/GqlValue) parent: g/GqlValue) (Ok (g/FloatValue (/ 0.0 0.0)))))})]
+    (do (match (g/compile-schema definition)
+      ((Err _) (check c false))
+      ((Ok compiled) (do
+        (check c (= (g/result-json (g/execute compiled "{ sum(items: 3) absent: present supplied: present(text: null) }" {} g/NullValue))
+          "{\"data\":{\"sum\":3,\"absent\":false,\"supplied\":true}}"))
+        (let [result (g/execute compiled "{ float integer invalid }" {} g/NullValue)]
+          (do (check c (= (count (. result errors)) 1))
+            (check c (= (g/field-value (unwrap-or (. result data) g/NullValue) "float") (g/FloatValue 5.0)))
+            (check c (= (g/field-value (unwrap-or (. result data) g/NullValue) "integer") (g/IntValue 3)))))
+        (doseq [query ["{ sum }" "{ sum(items: [1, null]) }" "{ sum(items: 2147483648) }"]]
+          (check c (= (. (g/execute compiled query {} g/NullValue) data) nil))))))
+      (checks-result c))))

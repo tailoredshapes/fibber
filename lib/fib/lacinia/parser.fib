@@ -1,0 +1,30 @@
+(ns fib.lacinia.parser (:use fib.core fib.seq fib.coll fib.lacinia.types)
+  (:require [fib.lacinia.lexer :as lexer] [fib.lacinia.parse.cursor :as p] [fib.lacinia.parse.values :as v]))
+(defun selection :private (parser: p/GqlParser depth: i64) -> (Result GqlSelection GqlError)
+  (let [location (. (p/token parser) location)]
+    (try-let [first-name (p/name parser)
+      field-name (if (p/at? parser ":") (do (p/advance parser) (p/name parser)) (Ok first-name))
+      arguments (v/arguments parser)]
+      (if (p/at? parser "@") (Err (p/unsupported parser "Directives are not implemented yet"))
+        (try-let [children (if (p/at? parser "{") (selections parser (+ depth 1)) (Ok []))]
+          (Ok (GqlSelection field-name first-name arguments children location)))))))
+(defun selections :private (parser: p/GqlParser depth: i64) -> (Result (Vec GqlSelection) GqlError)
+  (if (> depth 64) (Err (located-error ResourceLimit "Selection nesting exceeds 64" (. (p/token parser) location)))
+    (try-let [_ (p/expect parser "{")]
+      (if (p/at? parser "}") (Err (p/failure parser "Selection set cannot be empty"))
+        (loop [out: (Vec GqlSelection) []]
+          (try-let [item (selection parser depth)]
+            (let [next (conj out item)]
+              (if (p/at? parser "}") (do (p/advance parser) (Ok next)) (recur next)))))))))
+(defun operation :private (parser: p/GqlParser) -> (Result unit GqlError)
+  (cond (p/at? parser "{") (Ok ())
+    (p/at? parser "query") (do (p/advance parser)
+      (if (= (. (p/token parser) kind) "name") (p/advance parser) ())
+      (cond (p/at? parser "(") (Err (p/unsupported parser "Variables are not implemented yet"))
+        (p/at? parser "@") (Err (p/unsupported parser "Directives are not implemented yet")) :else (Ok ())))
+    :else (Err (p/unsupported parser "Only a single query operation is implemented in this milestone"))))
+(defun parse (text: str) -> (Result (Vec GqlSelection) GqlError)
+  (try-let [tokens (lexer/tokenize text)]
+    (let [parser (p/parser tokens)]
+      (try-let [_ (operation parser) out (selections parser 0)]
+        (if (= (. (p/token parser) kind) "end") (Ok out) (Err (p/failure parser "Unexpected trailing document")))))))

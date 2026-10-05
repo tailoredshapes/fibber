@@ -1,0 +1,28 @@
+;; spec: docs/design/lacinia.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use fib.core fib.seq fib.coll fib.print tl.check) (:require [fib.lacinia :as g]))
+(defun main () -> i64
+  (let [c (checks) text (g/named "String") required (g/non-null text)
+        definition (g/schema {"Child" (g/object-type {"bad" (g/resolving required
+          (fn (context: g/GqlValue arguments: (Map str g/GqlValue) parent: g/GqlValue) (Err "resolver failed")))})}
+          {"child" (g/resolving (g/named "Child") (fn (context: g/GqlValue arguments: (Map str g/GqlValue) parent: g/GqlValue) (Ok (g/object {}))))
+           "required" (g/resolving required (fn (context: g/GqlValue arguments: (Map str g/GqlValue) parent: g/GqlValue) (Ok g/NullValue)))
+           "items" (g/resolving (g/list-of (g/non-null (g/named "Int")))
+             (fn (context: g/GqlValue arguments: (Map str g/GqlValue) parent: g/GqlValue) (Ok (g/ListValue [(g/IntValue 1) g/NullValue]))))})]
+    (do (match (g/compile-schema definition)
+      ((Err _) (check c false))
+      ((Ok compiled) (let [partial (g/execute compiled "{ x: child { bad } }" {} g/NullValue)
+                           root (g/execute compiled "{ required }" {} g/NullValue)
+                           list (g/execute compiled "{ items }" {} g/NullValue)]
+        (do (check c (= (. partial data) (some (g/object {"x" g/NullValue}))))
+          (check c (= (count (. partial errors)) 1))
+          (check c (= (. (nth (. partial errors) 0) path) [(g/FieldPath "x") (g/FieldPath "bad")]))
+          (check c (= (. (nth (. partial errors) 0) message) "resolver failed"))
+          (check c (= (. root data) (some g/NullValue))) (check c (= (count (. root errors)) 1))
+          (check c (= (. list data) (some (g/object {"items" g/NullValue}))))
+          (check c (= (. (nth (. list errors) 0) path) [(g/FieldPath "items") (g/IndexPath 1)]))))))
+      (checks-result c))))

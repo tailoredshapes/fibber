@@ -1,0 +1,26 @@
+;; Build: F build examples/lacinia.fib -I lib -o /tmp/fibber-lacinia
+(ns main (:use fib.core fib.seq fib.coll fib.print)
+  (:require [fib.lacinia :as g]))
+
+(defun greet (context: g/GqlValue arguments: (Map str g/GqlValue) parent: g/GqlValue) -> (Result g/GqlValue str)
+  (match (get arguments "name")
+    ((some (g/StringValue name)) (Ok (g/StringValue (str "Hello, " name))))
+    (_ (Err "Expected a name"))))
+
+(defun main () -> i64
+  (let [text (g/named "String")
+        person (g/object {"id" (g/IntValue 7) "name" (g/StringValue "Ada")})
+        definition (g/schema
+          {"Person" (g/object-type {"name" (g/field text) "id" (g/field (g/non-null (g/named "ID")))})}
+          {"hello" (with (g/resolving (g/non-null text) greet)
+             (arguments {"name" (with (g/argument (g/non-null text))
+               (default-value (some (g/StringValue "world"))))}))
+           "person" (g/resolving (g/named "Person")
+             (fn (context: g/GqlValue arguments: (Map str g/GqlValue) parent: g/GqlValue) (Ok person)))})]
+    (match (g/compile-schema definition)
+      ((Err errors) (do (println (str "Schema errors: " (count errors))) 1))
+      ((Ok compiled)
+        (let [result (g/execute compiled
+                "query Welcome { greeting: hello(name: \"Fibber\") person { name id __typename } }"
+                {} g/NullValue)]
+          (do (println (g/result-json result)) (if (empty? (. result errors)) 0 1)))))))
