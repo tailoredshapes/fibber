@@ -26,17 +26,18 @@
       n))
 
 ;; 1 when the count never fell, until the Vec has `limit` elements
-(defun watch (a: (Atom (Vec i64)) limit: i64) -> i64
+(defun watch (a: (Atom (Vec i64)) limit: i64 stop: (Atom bool)) -> i64
   (loop ((last 0) (ok 1))
     (let ((k (count @a)))
-      (if (>= k limit) ok (recur k (if (< k last) 0 ok))))))
+      (if (or (>= k limit) @stop) ok (recur k (if (< k last) 0 ok))))))
 
 (defun main () -> i64
-  (let ((c (checks)) (a (atom (vec-empty))))
-    (let ((reader (future (watch a 1800)))
+  (let ((c (checks)) (a (atom (vec-empty))) (stop (atom false)))
+    (let ((reader (future (watch a 1800 stop)))
           (ws [(future (add-swap a 1 300)) (future (add-swap a 2 300)) (future (add-swap a 3 300))
                (future (add-cas a 4 300)) (future (add-cas a 5 300)) (future (add-cas a 6 300))]))
       (do (dotimes (i 6) (join (nth ws i)))
+          (reset! stop true)
           (check c (= (count @a) 1800))
           (check c (= (reduce + 0 @a) (* 300 21)))
           (check c (= (join reader) 1))

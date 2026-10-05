@@ -1,0 +1,58 @@
+;; scripts/bench/atom-contention.fib: atoms under contention (P-count-a). usage: atom-contention MODE T N
+;; T tasks each do N operations; prints three rounds as `t US` (microseconds) and the final value as `v X` (a wrong total is a failure, not a speedup).
+;; MODE: swap      T tasks `swap!` one shared (atom 0)                  v = 3*T*N (three rounds)
+;;       cas       T tasks increment one shared atom with a compare-and-set! loop    v = 3*T*N (three rounds)
+;;       read      T tasks read one shared (atom 0)
+;;       adder     T tasks `inc!` one shared fib.adder                  v = 3*T*N (three rounds)
+;;       oswap     T tasks `swap!` one shared atom holding a Vec (the lock path): conj a 1 then pop    v = 1 (the Vec's length)
+;;       oread     T tasks read one shared atom holding a Vec (the lock path)
+;;       swap-own, read-own: the same on an atom of the task's own (the uncontended rows)
+;; scripts/bench/atoms.sh runs the table. Rows quoted in docs/shootout/atoms.md.
+(ns main (:use fib.adder))
+
+(defun do-swap (a: (Atom i64) n: i64) -> i64
+  (do (dotimes (i n) (swap! a (fn (v) (+ v 1)))) 0))
+
+(defun do-cas (a: (Atom i64) n: i64) -> i64
+  (do (dotimes (i n)
+        (loop ((done false))
+          (if done true (let ((v @a)) (recur (compare-and-set! a v (+ v 1)))))))
+      0))
+
+(defun do-read (a: (Atom i64) n: i64) -> i64
+  (loop ((i 0) (s 0)) (if (< i n) (recur (+ i 1) (+ s @a)) s)))
+
+(defun do-adder (a: Adder n: i64) -> i64
+  (do (dotimes (i n) (inc! a)) 0))
+
+(defun do-oswap (a: (Atom (Vec i64)) n: i64) -> i64
+  (do (dotimes (i n) (swap! a (fn (v) (pop (conj v 1))))) 0))
+
+(defun do-oread (a: (Atom (Vec i64)) n: i64) -> i64
+  (loop ((i 0) (s 0)) (if (< i n) (recur (+ i 1) (+ s (count @a))) s)))
+
+(defun spawn-mode (mode: str t: i64 n: i64 shared: (Atom i64) ad: Adder ov: (Atom (Vec i64))) -> i64
+  (let ((t0 (sys-clock-now)))
+    (let ((ts (loop ((j 0) (acc (vec-empty)))
+                (if (< j t)
+                    (recur (+ j 1)
+                           (conj acc
+                             (cond (= mode "swap") (spawn (fn () (do-swap shared n)))
+                                   (= mode "cas") (spawn (fn () (do-cas shared n)))
+                                   (= mode "read") (spawn (fn () (do-read shared n)))
+                                   (= mode "adder") (spawn (fn () (do-adder ad n)))
+                                   (= mode "oswap") (spawn (fn () (do-oswap ov n)))
+                                   (= mode "oread") (spawn (fn () (do-oread ov n)))
+                                   (= mode "swap-own") (spawn (fn () (let ((own (atom 0))) (do (do-swap own n) @own))))
+                                   :else (spawn (fn () (let ((own (atom 1))) (do-read own n)))))))
+                    acc))))
+      (do (loop ((j 0) (s 0)) (if (< j t) (recur (+ j 1) (+ s (join (nth ts j)))) s))
+          (println "t " (quot (- (sys-clock-now) t0) 1000))
+          0))))
+
+(defun main () -> i64
+  (let ((mode (nth (args) 0)) (t (unwrap (parse-long (nth (args) 1)))) (n (unwrap (parse-long (nth (args) 2)))))
+    (let ((shared (atom 0)) (ad (adder)) (ov (atom [0])))
+      (do (dotimes (r 3) (spawn-mode mode t n shared ad ov))
+          (println "v " (cond (or (= mode "swap") (= mode "cas")) @shared (= mode "adder") (sum ad) (= mode "oswap") (count @ov) :else 0))
+          0))))
