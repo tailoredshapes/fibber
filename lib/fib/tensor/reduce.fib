@@ -2,10 +2,16 @@
 (ns fib.tensor.reduce
   (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage))
 
+;; A dense tensor's logical element i is the buffer element offset+i, so the walk skips the per-element index decode of `flat-at`
+;; (which re-validates the descriptor each time); the buffer read is still bounds-checked and the order is the logical one.
 (defun fold (f: (fn (a t) a) :borrow initial: a x: (Tensor t)) -> a
   (let ((n (fib.tensor.storage/size x)))
-    (loop ((i 0) (acc initial))
-      (if (< i n) (recur (+ i 1) (f acc (flat-at x i))) acc))))
+    (if (contiguous? x)
+        (let ((off (array-get (. x meta) 0)) (buf (. x buffer)))
+          (loop ((i 0) (acc initial))
+            (if (< i n) (recur (+ i 1) (f acc (array-get buf (+ off i)))) acc)))
+        (loop ((i 0) (acc initial))
+          (if (< i n) (recur (+ i 1) (f acc (flat-at x i))) acc)))))
 
 (defun sum (x: (Tensor t)) :where ((Element t) (Num t)) -> t
   (fold (fn (a: t b: t) (+ a b)) (element-zero (. x seed)) x))
