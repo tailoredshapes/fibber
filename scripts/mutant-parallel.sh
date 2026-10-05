@@ -26,6 +26,12 @@ case $MODE in
   scope-first-wins)     CASES=(7532-) ;;
   scope-stops-at-trap)  CASES=(7532-) ;;
   scope-swallows-trap)  CASES=(7532- 7533-) ;;
+  chunks-lost-task)     CASES=(7534- 7535-) ;;
+  chunks-double-run)    CASES=(7534- 7535-) ;;
+  chunks-tail-bounds)   CASES=(7534- 7535-) ;;
+  chunks-order)         CASES=(7534- 7535-) ;;
+  chunks-task-per-chunk) CASES=(7537-) ;;
+  chunks-trap-message)  CASES=(7538- 7539-) ;;
   *) echo "mutant-parallel: unknown MODE $MODE" >&2; exit 2 ;;
 esac
 rm -rf "$OUT/tree"; mkdir -p "$OUT/tree/cases" "$OUT/tmp"
@@ -43,6 +49,12 @@ mutate() {
     scope-first-wins)     mut lib/fib/parallel/scope.fib 's/\(if \(some\? first-message\) first-message \(some \(\. trap message\)\)\)/(some (. trap message))/' ;;
     scope-stops-at-trap)  mut lib/fib/parallel/scope.fib 's/\(if \(< i \(vec-count ts\)\)/(if (and (< i (vec-count ts)) (not (some? first-message)))/' ;;
     scope-swallows-trap)  mut lib/fib/parallel/scope.fib 's/\(\(Err trap\) \(if \(some\? first-message\) first-message \(some \(\. trap message\)\)\)\)/((Err trap) first-message)/' ;;
+    chunks-lost-task)     mut lib/fib/parallel/chunks.fib 's/\(if \(< k w\) \(recur/(if (< k (- w 1)) (recur/' ;;
+    chunks-double-run)    mut lib/fib/parallel/chunks.fib 's/\(recur \(\+ c step\) \(conj out/(recur (+ c (max 1 (- step 1))) (conj out/' ;;
+    chunks-tail-bounds)   mut lib/fib/parallel/chunks.fib 's/\(min n \(\* \(\+ c 1\) grain\)\)/(* (+ c 1) grain)/' ;;
+    chunks-order)         mut lib/fib/parallel/chunks.fib 's/\(nth \(nth parts \(rem c w\)\) \(quot c w\)\)/(nth (nth parts (- w 1 (rem c w))) (quot c w))/' ;;
+    chunks-task-per-chunk) mut lib/fib/parallel/chunks.fib 's/\(max 1 \(min workers nc\)\)/(max 1 nc)/' ;;
+    chunks-trap-message)  mut lib/fib/parallel/chunks.fib 's/\(trap \(nth \@fails 0\)\)/(trap "a chunk failed")/' ;;
   esac
 }
 mutate
