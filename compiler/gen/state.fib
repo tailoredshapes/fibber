@@ -1,0 +1,62 @@
+;; compiler/gen/state.fib: the generator's state and its core grammar, as crates/fibgen/src/gen/mod.rs (seed-1). OWNER: package G (core).
+;;
+;; `Gen` is a record whose mutable parts are Cells (no global mutable state; design section 4.3). Production modules take `g: FgGen` and
+;; `cx: FgCtx` and return a FgExpr, exactly as the Rust takes `&mut Gen` and `&Ctx`. THE ORDER OF DRAWS FROM `rng` IS THE CONTRACT: a port that
+;; draws in another order generates other programs (design section 3).
+;; `expr` (the dispatcher) calls the productions, which call `expr` back: modules cannot be cyclic, so the dispatcher is the one function of
+;; this file that is NOT a stub-by-package: see design section 4.4, the `FgHooks` record of function values that `gen.core` fills in.
+(ns gen.state
+  (:use gen.ty gen.ctx gen.ast gen.rng))
+
+(defstruct FgHooks
+  (expr: (fn (FgGen FgCtx FgTy i64) FgExpr)
+   leaf: (fn (FgGen FgCtx FgTy) FgExpr)
+   leaf-value: (fn (FgGen FgCtx FgTy) FgExpr)
+   ;; the back-edges of the production graph (design section 4.4: 11 calls that go from a lower module to a higher one in the layering)
+   scalar-literal-text: (fn (FgGen) str)
+   vpat-guarded-match: (fn (FgGen FgCtx FgTy i64) FgExpr)
+   vpat-vector-match: (fn (FgGen FgCtx FgTy i64) FgExpr)
+   vpat-rest-match: (fn (FgGen FgCtx FgTy i64) FgExpr)
+   inout-stmt-call: (fn (FgGen FgCtx i64) (Option FgExpr))
+   inout-inout-int: (fn (FgGen FgCtx i64) (Option FgExpr))
+   funcs-literal: (fn (FgGen FgCtx (Vec FgTy) FgTy bool i64) FgExpr)
+   funcs-const-fn: (fn (FgGen i64) FgExpr)
+   funcs-map-form: (fn (FgGen FgCtx i64) FgExpr)
+   observe-observe: (fn (FgGen FgCtx FgExpr i64) FgExpr)
+   jobs-observe-job: (fn (FgGen FgExpr) FgExpr)
+   effects-stmt: (fn (FgGen FgCtx i64) FgExpr)
+   protos-int-form: (fn (FgGen FgCtx i64) (Option FgExpr))))
+
+(defstruct FgGen
+  (rng: FgRng
+   next: (Cell i64)                 ; the fresh-name counter
+   funs: (Cell (Vec FgFun))         ; helper functions made so far
+   max-funs: i64                    ; 1 + 2 * size
+   nodes: (Cell i64)                ; nodes generated so far
+   node-budget: i64                 ; 60 * size
+   universe: (Vec FgTy)
+   defs: (Cell (Vec FgVar))         ; the top-level constants in scope
+   impls: (Cell (Vec FgImpl))
+   methods-ok: (Cell bool)
+   hooks: FgHooks))                 ; gen.core's dispatcher, leaf functions and 13 back-edge productions: breaks the module cycles
+
+;; generate (seed, size) allocates one of these: size max 1; the fields are as the Rust initialiser; `hooks` are gen.core's `core-expr`, `core-leaf`, `core-leaf-value`.
+(defun gen-new (seed: i64 size: i64 hooks: FgHooks) -> FgGen (trap "todo: gen.state gen-new"))
+
+(defun gen-body-ctx (g: FgGen params: (Vec FgParam)) -> FgCtx (trap "todo: gen.state gen-body-ctx"))
+;; Gen::fresh: `prefix` and the next number, 1 first.
+(defun gen-fresh (g: FgGen prefix: str) -> str (trap "todo: gen.state gen-fresh"))
+;; Gen::any_type and send_type draw until a universe type passes the filter (each draw is one rng-below of the universe size).
+(defun gen-any-type (g: FgGen cx: FgCtx) -> FgTy (trap "todo: gen.state gen-any-type"))
+(defun gen-send-type (g: FgGen) -> FgTy (trap "todo: gen.state gen-send-type"))
+(defun gen-may-make? (g: FgGen t: FgTy) -> bool (trap "todo: gen.state gen-may-make?"))
+(defun gen-in-universe? (g: FgGen t: FgTy) -> bool (trap "todo: gen.state gen-in-universe?"))
+;; Gen::small: rng-range -3 9.
+(defun gen-small (g: FgGen) -> i64 (trap "todo: gen.state gen-small"))
+(defun gen-var-of (g: FgGen cx: FgCtx ty: FgTy) -> (Option FgExpr) (trap "todo: gen.state gen-var-of"))
+;; Gen::leaf and leaf_value as the productions see them: they call the hooks (the bodies are core-leaf and core-leaf-value in gen.core).
+(defun gen-leaf (g: FgGen cx: FgCtx ty: FgTy) -> FgExpr (trap "todo: gen.state gen-leaf"))
+(defun gen-leaf-value (g: FgGen cx: FgCtx ty: FgTy) -> FgExpr (trap "todo: gen.state gen-leaf-value"))
+;; Gen::expr as the productions see it: calls `(. (. g hooks) expr)`. The dispatcher itself (the weighted choice over variable, let, if, do, match,
+;; loop, helper call, type-specific, join, await, and `specific`) is `core-expr` and `core-specific` in gen.core.
+(defun gen-expr (g: FgGen cx: FgCtx ty: FgTy d: i64) -> FgExpr (trap "todo: gen.state gen-expr"))
