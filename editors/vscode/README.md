@@ -50,3 +50,12 @@ over stdio. The server is `$FIBREF` (a `fibref`), else `$FIBC` (a `fibc`), else 
 the Rust build at `target/debug/fibref`. **With none of them the test fails**: a test that passes when there
 is nothing to test cannot fail. `FIBREF_SKIP=1 npm test` skips on purpose (it prints `SKIPPED` and exits 0).
 The recorded transcripts of the Rust server are replayed by `compiler/tests/lsp/server.sh`.
+
+The real client: `npm run test:host` (`test/host.js`) downloads a VS Code with `@vscode/test-electron` into
+`$VSCODE_CACHE` (default `~/.cache/fibber-vscode`, about 330 MB, nothing is installed on the system), starts it
+under `xvfb-run` when there is no display, loads this extension (so the `vscode-languageclient` in `node_modules`
+is the client) and, in the extension host (`test/host/index.js`), opens a `.fib` file and asks through the
+VS Code commands for document symbols, hover, definition, completion and diagnostics, then edits the file and
+waits for the diagnostics to clear. Install the runner first with `npm install --no-save @vscode/test-electron`
+(`package.json` and the lockfile do not carry it). `FIBC` names the server; it exits 2, in words, when the
+runner or a display is missing. A server that does not start fails the test after 60 s.
