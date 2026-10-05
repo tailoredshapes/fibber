@@ -131,7 +131,13 @@ once per row and the inner loop advances by a constant stride. Reads stay
 bounds-checked, so a forged descriptor still traps at the first bad read.
 
 `sum`, `prod`, and `fold f initial tensor` are ordered scalar reductions in
-logical row-major order. Empty sums/products return typed zero/one.
+logical row-major order. The order is the contract (a floating-point sum is
+reproducible and equals the loop `acc = acc + x[i]`), so the sum is one chain of
+dependent adds: about one add latency (4 cycles) per element, which is what makes
+it several times slower than `sum-fast` on large inputs. `mean` is that ordered sum
+over the count and stays so; `mean-fast` (`f64`) is `sum-fast` over the count, which
+reassociates like `sum-fast` and can differ from `mean` in the last bits or more
+under cancellation. Empty sums/products return typed zero/one.
 `maximum`, `minimum`, and `mean` trap on empty input; `mean` currently accepts
 `f64`. Integer arithmetic retains Fibber's checked-overflow behavior.
 
