@@ -35,10 +35,18 @@
 (global internal fibm.trap-hook ptr (ptr null))
 (global internal fibm.hook-cx ptr (ptr null))
 (global internal fib.ordinal i64 (i64 0))
+;; The pthread key under which a spawned task's thread keeps its task (fib.thread-enter): what a trap on that thread
+;; completes as failed (fib.trap-bytes). Created by fib.init; the main thread and the pool's workers have no value.
+(global internal fib.task-key i32 (i32 0))
+(declare pthread_key_create i32 (ptr ptr))
+(declare pthread_setspecific i32 (i32 ptr))
+(declare pthread_getspecific ptr (i32))
+(declare pthread_exit void (ptr))
 
 (define internal (fib.init void) ()
   (block entry
     (call @fib.rq-init)
+    (call @pthread_key_create @fib.task-key (ptr null))
     (let ((v (call @getenv (string "FIB_TRACE"))))
       (br (icmp eq v (ptr null)) done set)))
   (block set (store (i32 1) @fib.tracing) (br done))
@@ -158,7 +166,7 @@
       (call @fib.trace-line (i8 65) n (call @fib.class tid))
       (ret p2)))
   (block oom
-    (call @fib.trap-c (string "out of memory"))
+    (call @fib.fatal-c (string "out of memory"))
     (unreachable)))
 
 ;; Gives a dead object's block back: onto its class's list while there is
@@ -186,7 +194,7 @@
   (block ok (ret p))
   (block none (br (icmp eq n (i64 0)) ok oom))
   (block oom
-    (call @fib.trap-c (string "out of memory"))
+    (call @fib.fatal-c (string "out of memory"))
     (unreachable)))
 
 (define internal (fib.init-hdr void) ((ptr p) (i32 tid) (i32 flags))
@@ -349,7 +357,7 @@
   (block old (call @free base) (br done))
   (block done (ret))
   (block oom
-    (call @fib.trap-c (string "out of memory"))
+    (call @fib.fatal-c (string "out of memory"))
     (unreachable)))
 
 ;; Frees the heap buffer, if the worklist moved to one.
@@ -506,13 +514,9 @@
     (call @fib.trap-hooked pos msg (call @strlen msg))
     (unreachable)))
 
-(define internal (fib.trap-bytes void) ((ptr bytes) (i64 n))
+;; "trap: MESSAGE\n" to fd 2, then abort: what a trap is where it is not isolated, and what a fatal failure is everywhere.
+(define internal (fib.fatal-bytes void) ((ptr bytes) (i64 n))
   (block entry
-    (br (icmp ne (load ptr @fibm.trap-hook) (ptr null)) hooked plain))
-  (block hooked
-    (call @fib.trap-hooked (ptr null) bytes n)
-    (unreachable))
-  (block plain
     (call @write (i32 2) (string "trap: ") (i64 6))
     (let ((pre (load ptr @fib.initdef)))
       (br (icmp eq pre (ptr null)) body named)))
@@ -523,6 +527,54 @@
     (call @write (i32 2) bytes n)
     (call @write (i32 2) (string "\n") (i64 1))
     (call @abort)
+    (unreachable)))
+
+;; A failure the program cannot survive whatever runs it: out of memory (a handler and the unwinder allocate), a thread or a
+;; worker that cannot be started. Never isolated, never caught (docs/design/exceptions.md 1.2, the owner's list of 2026-10-05).
+(define internal (fib.fatal-c void) ((ptr msg))
+  (block entry
+    (call @fib.fatal-bytes msg (call @strlen msg))
+    (unreachable)))
+
+;; A trap on the thread of a spawned task ends that task, not the process (docs/design/exceptions.md 4.1, stage 1): the message
+;; goes to fd 2 as `trap in task: MESSAGE` in ONE write (a trace line of another thread must not land inside it), a share-marked copy of it is stored as the task's failure, the task completes (state
+;; done, its waiters woken: a joiner finds the failure and traps in its turn, or try-join returns it), the thread releases its
+;; count of the task and ends. What the task's frames owned is abandoned (never freed): audit: abandoned.
+(define internal (fib.fail-task void) ((ptr task) (ptr bytes) (i64 n))
+  (block entry
+    (let ((line (call @malloc (add n (i64 16)))))
+      (br (icmp eq line (ptr null)) record print)))
+  (block print
+    (call @memcpy line (string "trap in task: ") (i64 14))
+    (call @memcpy (getelementptr i8 line (i64 14)) bytes n)
+    (store (i8 10) (getelementptr i8 line (add n (i64 14))))
+    (call @write (i32 2) line (add n (i64 15)))
+    (call @free line)
+    (br record))
+  (block record
+    (let ((msg (call @fib.str-from-bytes bytes n)))
+      (call @fib.share msg)
+      (atomic-store release msg (getelementptr %struct.fib.task task (i32 0) (i32 10)))
+      (call @fib.task-complete task)
+      (call @fib.release task)
+      (call @fib.thread-done)
+      (call @pthread_exit (ptr null))
+      (unreachable))))
+
+(define internal (fib.trap-bytes void) ((ptr bytes) (i64 n))
+  (block entry
+    (br (icmp ne (load ptr @fibm.trap-hook) (ptr null)) hooked check))
+  (block hooked
+    (call @fib.trap-hooked (ptr null) bytes n)
+    (unreachable))
+  (block check
+    (let ((tk (call @pthread_getspecific (load i32 @fib.task-key))))
+      (br (icmp ne tk (ptr null)) in-task plain)))
+  (block in-task
+    (call @fib.fail-task (call @pthread_getspecific (load i32 @fib.task-key)) bytes n)
+    (unreachable))
+  (block plain
+    (call @fib.fatal-bytes bytes n)
     (unreachable)))
 
 (define internal (fib.trap-c void) ((ptr msg))

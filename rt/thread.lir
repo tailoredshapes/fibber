@@ -24,13 +24,19 @@
           (rc (call @pthread_create handle (ptr null) entry task)))
       (br (icmp ne rc (i32 0)) failed started)))
   (block failed
-    (call @fib.trap-c (string "spawn: cannot start a thread"))
+    (call @fib.fatal-c (string "spawn: cannot start a thread"))
     (unreachable))
   (block started
     (call @pthread_detach (load i64 handle))
     (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced done))
   (block traced (call @write (i32 2) (string "T\n") (i64 2)) (br done))
   (block done (ret)))
+
+;; The first runtime call of a thread entry: the task this thread runs is what a trap on it fails (fib.trap-bytes).
+(define internal (fib.thread-enter void) ((ptr task))
+  (block entry
+    (call @pthread_setspecific (load i32 @fib.task-key) task)
+    (ret)))
 
 ;; The last runtime call of a thread entry: one thread fewer, and
 ;; whoever waits in fib.join-all is told.

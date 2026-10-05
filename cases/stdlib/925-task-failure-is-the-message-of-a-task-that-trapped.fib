@@ -1,0 +1,23 @@
+;; spec:   docs/design/exceptions.md 4.1 (the runtime half: isolation at the thread entry); stdlib §2.10
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; The builtin under `try-join`: `(task-failure t)` waits for the task as `join` does and answers `(some message)` when a trap ended it and
+;; `nil` when it finished; it does not trap itself, and asked again it says the same. A trap on a task's thread completes the task (state
+;; done, its waiters woken) instead of ending the process, so the task that never traps and the one whose neighbour trapped are unaffected.
+;; Killed by: scripts/mutant-task-trap.sh `no-isolate` (the process aborts), `ok-failed` (the answer is always nil).
+(ns main (:use fib.core tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (bad (spawn (fn () (trap "kaput"))))
+        (good (spawn (fn () 3)))
+        (zero (spawn (fn () (quot 1 (- 4 4))))))
+    (do (check c (= (task-failure bad) (some "kaput")))
+        (check c (= (task-failure bad) (some "kaput")))
+        (check c (nil? (task-failure good)))
+        (check c (= (join good) 3))
+        (check c (= (task-failure zero) (some "integer / by zero")))
+        (checks-result c))))

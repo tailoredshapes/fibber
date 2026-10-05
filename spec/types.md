@@ -710,6 +710,25 @@ a trap as its verdict (`expect: trap`, method.md rule 3): it must
 type-check, pass the ownership checker, and trap with a message
 containing the stated text, with that audit clean.
 
+**Amended 2026-10-05, stage 1 of exceptions** (decided by the lead on the
+owner's delegation, docs/design/decisions-2026-10-04.md "Exceptions (§7)",
+docs/design/exceptions.md 4.1; the stage 2 amendment, `try`/`catch`, is not
+made). A trap on the thread of a **spawned task** no longer ends the
+program: it ends that task. The message goes to standard error as
+`trap in task: MESSAGE`, the task completes as *failed*, and what its
+frames owned is abandoned (never freed: the audit verdict `abandoned`,
+method.md rule 3). A joiner that waits with `try-join` receives
+`(Err (Trap message))`; `join` and `@t` of a failed task trap in the
+joiner with the task's own message, so a failure travels up through joins
+until somebody asks with `try-join` (cases 911, 915 to 926). Everything
+above holds otherwise: a trap on `main`, in a pool worker (an `async` body
+run there) and in a macro module aborts as before, and **out of memory, a
+thread or worker that cannot be started and a stack overflow stay fatal on
+every thread**, never isolated. The `trap` builtin and every primitive keep
+their type; `try-join` and the builtin `task-failure : ∀a. (fn ((Task a))
+(Option str))`, which waits as `join` does and answers the message of a
+failed task, are the only new names.
+
 `(Object a)` is the built-in structural predicate "`a` is not a scalar"
 (a field-less enum is a scalar, §1); `(Weakable a)` is "`a` is an
 object type and not an `(Option ..)`", and implies `(Object a)`. Both

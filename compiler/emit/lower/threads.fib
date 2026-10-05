@@ -55,7 +55,7 @@
   (let ((t (v-text task)))
     (do (doseq [k (range 3)]
           (store-at cx tsname t (+ slot-task-state k) (nth ["(i32 1)" "(i32 1)" "(i32 0)"] k)))
-        (doseq [i [(+ slot-task-state 3) (+ slot-task-result 1)]]
+        (doseq [i [(+ slot-task-state 3) (+ slot-task-result 1) slot-task-failure]]
           (store-at cx tsname t i "(ptr null)"))
         (lcx-store cx atom (lcx-gep cx tsname t slot-task-result))
         (lcx-store cx f (lcx-gep cx tsname t slot-task-closure)))))
@@ -102,7 +102,7 @@
            (let ((task (fb-val (. cx b) (alloc-text (str-join ["(call @fib.size-of (i32 " (str ttid) "))"]) ttid) LirPtr))
                  (t (v-text task)))
              (do (doseq [k (range 3)] (store-at cx tsname t (+ slot-task-state k) "(i32 0)"))
-                 (doseq [i [(+ slot-task-result 1) slot-task-closure]] (store-at cx tsname t i "(ptr null)"))
+                 (doseq [i [(+ slot-task-result 1) slot-task-closure slot-task-failure]] (store-at cx tsname t i "(ptr null)"))
                  (lcx-store cx atom (lcx-gep cx tsname t slot-task-result))
                  (store-at cx tsname t slot-task-resume (str-join ["@" code]))
                  (lcx-store-fields cx tsname t slot-task-capture0 vals)
@@ -130,6 +130,14 @@
                    (set! (. cx async-frame) (some (AsyncFrame (. frame tsname) (. frame point) (conj (. frame states) lcont))))
                    (task-value cx t result-ty)))))))))
 
+;; `(task-failure t)`: drives the executor until the task is done, then the message it failed with, or nil when it did not fail. The
+;; Option of a str is the str or null; the count passes to the caller. Unlike `join`, it never traps for the task's failure.
+(defun lcx-task-failure (cx: LowerCx t: V) -> (Result V str)
+  (do (fb-stmt (. cx b) (str-join ["(call @fib.drive " (v-text t) ")"]))
+      (let ((v (fb-val (. cx b) (str-join ["(call @fib.task-failure " (v-text t) ")"]) LirPtr)))
+        (do (lcx-retain cx v)
+            (Ok v)))))
+
 ;; `(join t)`: drives the executor until the task is done (§8.8), then its result, retained. Rust: lower/threads.rs:214
 (defun lcx-join (cx: LowerCx e: Expr t: V) -> (Result V str)
   (try-let ((result-ty (lcx-ty cx e)))
@@ -141,8 +149,13 @@
   (do (fb-stmt (. cx b) (str-join ["(call @fib.drive " (v-text t) ")"]))
       (task-value cx t result-ty)))
 
-;; The result of a task that is done, retained (under its atom's lock, as any atom read). Rust: lower/threads.rs:228
+;; The result of a task that is done, retained (under its atom's lock, as any atom read). A task that failed (a trap on its thread,
+;; docs/design/exceptions.md 4.1) has no result: reading it traps in the reader with the task's own message. Rust: lower/threads.rs:228
 (defun task-value :private (cx: LowerCx t: V result-ty: Ty) -> (Result V str)
+  (do (fb-stmt (. cx b) (str-join ["(call @fib.raise-failed " (v-text t) ")"]))
+      (task-result-value cx t result-ty)))
+
+(defun task-result-value :private (cx: LowerCx t: V result-ty: Ty) -> (Result V str)
   (try-let ((aobj (program-object (. cx p) (TCon KAtom [result-ty])))
             (tobj (program-object (. cx p) (TCon KTask [result-ty]))))
     (let ((rp (lcx-gep cx (. tobj snd) (v-text t) slot-task-result))
@@ -161,7 +174,7 @@
   (let ((name (str-join ["fib.thread." (mangle (program-g (. cx p)) result-ty)])))
     (if (program-has-helper (. cx p) name)
         (Ok name)
-        (let ((head (str-join ["(define internal (" name " ptr) ((ptr task))\n  (block entry\n    (let ((f (load ptr (getelementptr %struct."
+        (let ((head (str-join ["(define internal (" name " ptr) ((ptr task))\n  (block entry\n    (call @fib.thread-enter task)\n    (let ((f (load ptr (getelementptr %struct."
                                tsname " task (i32 0) (i32 " (str slot-task-closure) "))))\n          (code (load ptr (getelementptr "
                                "%struct.fib.closure f (i32 0) (i32 3))))"]))
               (call (fn (r: str) (str-join ["(indirect-call code (fn tailcc " r " (ptr)) f)"])))
