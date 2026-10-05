@@ -1,2 +1,33 @@
 ;; fib.parallel: structured parallelism on today's runtime (P-struct of docs/design/parallelism.md 3.2). Explicit: `(:use fib.parallel)`.
-(ns fib.parallel (:use fib.core fib.seq fib.coll) (:export-from fib.parallel.cpu))
+;;
+;;   (cpu-count)                                  workers a call uses by default (fib.parallel.cpu)
+;;   (with-tasks [s] ..) (fork s f)               structured scopes (fib.parallel.scope)
+;;
+;; The macros live here, in the facade, and name the parts' functions as `fib.parallel/NAME`: a macro's qualified names are
+;; resolved in the module that uses it, which has `(:use fib.parallel)` and nothing of the parts.
+(ns fib.parallel (:use fib.core fib.seq fib.coll) (:export-from fib.parallel.cpu fib.parallel.scope))
+
+(defmacro with-tasks (spec ... body)
+  (match spec
+    ((Vec items)
+     (if (= (vec-count items) 1)
+         (let ((r (gensym "scope-result")))
+           `(let ((~(vec-nth items 0) (fib.parallel/new-scope)))
+              (let ((~r (do ~@body)))
+                (do (fib.parallel/scope-exit ~(vec-nth items 0)) ~r))))
+         (trap "with-tasks: the spec is [scope]")))
+    (_ (trap "with-tasks: the spec is [scope]"))))
+
+;; Like with-tasks, for a program that wants to handle the trap: `(Ok body-value)` or `(Err (Trap message))`.
+(defmacro try-with-tasks (spec ... body)
+  (match spec
+    ((Vec items)
+     (if (= (vec-count items) 1)
+         (let ((r (gensym "scope-result")))
+           `(let ((~(vec-nth items 0) (fib.parallel/new-scope)))
+              (let ((~r (do ~@body)))
+                (match (fib.parallel/scope-failure ~(vec-nth items 0))
+                  ((some message) (Err (fib.async/Trap message)))
+                  (nil (Ok ~r))))))
+         (trap "try-with-tasks: the spec is [scope]")))
+    (_ (trap "try-with-tasks: the spec is [scope]"))))
