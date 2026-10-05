@@ -31,9 +31,12 @@ The current API is:
 
 Domains are canonical values, rather than mutable solver objects. An interval
 or explicit set whose values fit in a 63-value window is stored as `(base,
-mask)` and tested with integer bit operations. A wide or irregular set is stored
-as sorted unique values. Intersections preserve the compact form when both
-inputs fit it; sparse intersections use binary membership checks.
+mask)` and tested with integer bit operations. A large interval stays as lazy
+`(lo, hi)` bounds; an irregular explicit set uses sorted unique values.
+Intersections preserve compact or interval forms when possible, and sparse
+intersections use binary membership checks. Removing an interior value from a
+large interval currently materializes the remaining values; split intervals are
+an obvious next representation improvement.
 
 Each search work item carries a `State` and a finite-domain `Store`. The store
 contains variable-id to domain entries and posted constraints. Propagation
@@ -45,10 +48,15 @@ enqueues one equality goal for each remaining value. This is a first-fail
 heuristic with immutable branches, so an abandoned branch cannot mutate a
 sibling.
 
-The arithmetic propagators currently use value enumeration for pairwise sums
-and interval bounds. That is deliberately straightforward and correct for the
-reference implementation; it is also the largest source of avoidable work on
-larger arithmetic models.
+Ordering and disequality use bound filtering. Addition keeps exact support
+enumeration for small domains and switches to sound interval bounds for wide
+domains, avoiding a Cartesian product when the candidate sets are large.
+The bounds are intentionally weaker than full arc consistency, so later search
+still verifies every concrete assignment.
+
+The domain representation and bound-propagation shape are adapted from
+`clojure.core.logic.fd` 1.0.1 under EPL-1.0; the Fibber implementation uses
+its own typed terms, immutable stores, and ownership rules.
 
 ## Sudoku port
 
@@ -74,7 +82,7 @@ Both fixtures produce one valid solution. The executable prints the solve time
 in nanoseconds and the solved grid. The executable case
 `cases/stdlib/7204-sudoku-port-solves-both-original-fixtures.fib` checks both
 solutions against the preserved answers; the domain and constraint cases are
-7200–7203.
+7200–7206.
 
 ## Performance comparison
 
@@ -88,14 +96,14 @@ with Clojure 1.11.1 and core.logic 1.0.1.
 
 | puzzle | Fibber median | Clojure/core.logic median | Fibber / Clojure |
 |---|---:|---:|---:|
-| test | 6,127,672 ns | 81,476 ns | 75.2× |
-| hard | 6,257,579 ns | 60,235 ns | 103.9× |
+| test | 5,059,899 ns | 81,476 ns | 62.1× |
+| hard | 5,141,594 ns | 60,235 ns | 85.4× |
 
 The Fibber samples were:
 
 ```text
-test: 8579142 8785095 7669252 6036126 5792330 6086034 6169309
-hard: 6098106 6212691 6296737 5947995 6331919 6353612 6228420
+test: 5466769 5055998 5252116 5213102 4873191 4991404 5063799
+hard: 5158261 5035874 5313196 5105503 5052749 5177685 5403333
 ```
 
 The Clojure samples were:
@@ -130,8 +138,9 @@ single executable runs include startup and allocation noise.
 The measured gap points to solver work rather than SIMD throughput. The useful
 sequence of improvements is:
 
-1. Replace the pairwise sum enumeration with interval and residue-aware bounds,
-   then cache each constraint's last domains.
+1. Extend the current wide-domain sum bounds with residue-aware filtering and
+   cache each constraint's last domains; exact support remains useful for small
+   domains.
 2. Add a propagation queue with watched variables so a changed domain revisits
    only affected constraints instead of rescanning the whole store.
 3. Use a trail or compact copy-on-write store for branch updates, reducing map

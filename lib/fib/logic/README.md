@@ -52,7 +52,8 @@ Finite-domain constraints are available from `fib.logic.fd`:
 
 The solver propagates domains before choosing a value, uses a smallest-domain
 first branch heuristic, and keeps each branch immutable. Compact domains use a
-63-bit window; wide or irregular domains use sorted sparse values. For example:
+63-bit window; large intervals stay lazy as bounds, while irregular values use
+sorted sparse storage. For example:
 
 ```clojure
 (let ((d (fd/interval 1 9)))
@@ -64,6 +65,12 @@ The [finite-domain design and Sudoku port](../../../docs/design/finite-domains-a
 describes propagation, the port of `tsmarsh/sudoku`, and reproducible
 performance measurements. SIMD and parallel search are still separate concerns:
 Sudoku's irregular branch tree does not automatically benefit from either.
+
+Run the finite-domain and Sudoku cases with:
+
+```sh
+fibc cases cases/stdlib --only 7200 7201 7202 7203 7204 7205 7206 -j 4
+```
 
 See [the design and validation record](../../../docs/design/relational-search.md).
 Each scheduler step forces at most one goal; it does not bound the CPU time of
