@@ -53,3 +53,13 @@ first (the editor pack is broken without it), then the heap and audit, evaluator
 Rust per seed and size until the port is accepted, then the manifests freeze. 3 the model's object limit is 4 million (the Rust has none:
 seed 1409, kind programs, size 5, asks for one 2.3 GB allocation and killed the session on 2026-10-05; the port bounds it). 4 no threads in
 the generator. 5 classification from the compiled run only; a compiled outcome with a failed audit is an audit failure.
+
+## Exceptions (docs/design/exceptions.md §7), decided by the lead on 2026-10-05
+
+The owner: catching a trap "seems like a big one". Decisions: (1) mechanism (b), a transitively inferred "may throw" effect with a hidden
+`{T,i1}` result reusing the scope-exit release code; landing pads (a) held in reserve. (2) Stage 1 first: a trapping task is isolated at
+the thread entry and `try-join` returns the trap as a `Result`; plain `join` and `@t` keep trapping in the joiner (case 911 changes to use
+`try-join`). (3) Fatal and uncatchable: out-of-memory, stack overflow, thread-start failure, and `(trap)` in the runtime's own five sites.
+(4) `&` in-out cells are written back on unwind; `cell-update!` poisons the cell as Rust's `Mutex` does; an `array-take!` region must be
+provably trap-free. (5) A trap inside a `finally` that runs during unwinding is fatal. (6) `fib.spawn` never detaches finished threads (20,000
+spawns used 165 MB; ~2,000 live threads abort under a 16 GB cap): fixed first, independent of the rest.
