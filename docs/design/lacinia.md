@@ -71,7 +71,7 @@ depends on libc's decimal locale.
 
 Cases were introduced before implementation: the initial executor cases failed
 on the absent module, and the query-language cases failed on the absent input
-object API. Cases `7500`–`7522` exercise the following behaviors:
+object API. Cases `7500`–`7529` exercise the following behaviors:
 
 | Case | Behavior |
 | --- | --- |
@@ -98,6 +98,13 @@ object API. Cases `7500`–`7522` exercise the following behaviors:
 | 7520 | Dynamic argument/directive failures, partial data, response paths and skip short-circuiting |
 | 7521 | Shared input schema graphs, large supplied-variable work limits and supplied-value depth limits |
 | 7522 | Named fragment visit history, skipped first spreads and separate nested selection scopes |
+| 7523 | Scalar and list variables, explicit null, singleton-list coercion, declaration and usage errors with no resolver calls |
+| 7524 | Variable defaults against argument defaults, null defaults reaching non-null arguments (a field error at the path, as 7520), invalid defaults |
+| 7525 | Named operation selection with resolver-call counts, whole-document validation and native-task selection |
+| 7526 | A variable default inside an input object inside a conditional inline fragment, including a skipped fragment |
+| 7527 | The same variable name declared with different types in two operations: only the selected operation's declaration applies; `""` is not an operation name |
+| 7528 | Undefined variables inside skipped fragments are request errors; a variable used only in a skipped fragment counts as used |
+| 7529 | Variable types nested 66 deep through `[` and `!` and malformed or non-constant defaults |
 
 Run `LACINIA_FIBC=./F scripts/test-lacinia.sh`. Accepted native cases require
 clean memory audits; the rejected case checks its compiler diagnostic. The

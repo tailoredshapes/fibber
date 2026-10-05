@@ -1,0 +1,20 @@
+;; spec: docs/design/lacinia.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use fib.core fib.seq fib.coll tl.check) (:require [fib.lacinia :as g] [tl.lacinia-query :as f]))
+(defun main () -> i64
+  (let [c (checks) calls (atom 0)]
+    (do (match (g/compile-schema (f/definition calls))
+      ((Err _) (check c false))
+      ((Ok schema) (do
+        (check c (f/request-error? (g/execute schema "{ count ... on Query @skip(if: true) { echo(text: $nope) } }" {} g/NullValue)))
+        (check c (f/request-error? (g/execute schema "{ ...F @skip(if: true) count } fragment F on Query { echo(text: $nope) }" {} g/NullValue)))
+        (check c (= @calls 0))
+        (check c (= (g/result-json (g/execute schema "query($x: String) { ... on Query @skip(if: true) { echo(text: $x) } count }" {} g/NullValue))
+          "{\"data\":{\"count\":0}}"))
+        (check c (= (g/result-json (g/execute schema "query($x: String, $s: Boolean!) { ... on Query @skip(if: $s) { echo(text: $x) } count }" {"s" (g/BooleanValue true)} g/NullValue))
+          "{\"data\":{\"count\":0}}"))
+        (check c (= @calls 2))))) (checks-result c))))

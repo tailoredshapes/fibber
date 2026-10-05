@@ -1,0 +1,22 @@
+;; spec: docs/design/lacinia.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use fib.core fib.seq fib.coll tl.check) (:require [fib.lacinia :as g] [tl.lacinia-query :as f]))
+(defun main () -> i64
+  (let [c (checks) calls (atom 0)
+    wrapped (str "query Q($x: " (str-join (vec (repeat 33 "["))) "String" (str-join (vec (repeat 33 "]!"))) ") { echo(text: $x) }")]
+    (do (match (g/compile-schema (f/definition calls))
+      ((Err _) (check c false))
+      ((Ok schema) (do
+        ;; Merge decision: `!` wrappers count toward the variable type depth in the other line (ResourceLimit at parse);
+        ;; here only `[` recurses, and a type this deep is refused by the input-type check as a ValidationFailure.
+        (let [result (g/execute schema wrapped {} g/NullValue)]
+          (do (check c (f/request-error? result))
+            (check c (= (. (nth (. result errors) 0) kind) g/ValidationFailure))))
+        (doseq [query ["query Q($x: String = ) { echo(text: $x) }" "query Q($x: String = $y) { echo(text: $x) }"
+          "query Q($x: [String] = [$y]) { echo(text: $x) }"]]
+          (check c (f/request-error? (g/execute schema query {} g/NullValue))))
+        (check c (= @calls 0))))) (checks-result c))))

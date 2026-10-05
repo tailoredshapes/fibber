@@ -1,0 +1,25 @@
+;; spec: docs/design/lacinia.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use fib.core fib.seq fib.coll tl.check) (:require [fib.lacinia :as g] [tl.lacinia-query :as f]))
+(defun main () -> i64
+  (let [c (checks) calls (atom 0)]
+    (do (match (g/compile-schema (f/definition calls))
+      ((Err _) (check c false))
+      ((Ok schema) (do
+        (check c (= (g/result-json (g/execute schema "query($on: Boolean = true, $limit: Int = 4, $text: String = \"dflt\") { ... on Query @include(if: $on) { filter(input: {limit: $limit, nested: {text: $text}}) } }" {} g/NullValue))
+          "{\"data\":{\"filter\":\"{\\\"input\\\":{\\\"limit\\\":4,\\\"nested\\\":{\\\"limit\\\":10,\\\"text\\\":\\\"dflt\\\"},\\\"text\\\":\\\"base\\\"}}\"}}"))
+        (check c (= (g/result-json (g/execute schema "query($on: Boolean = true, $limit: Int = 4, $text: String = \"dflt\") { ... on Query @include(if: $on) { filter(input: {limit: $limit, nested: {text: $text}}) } }" {"limit" (g/IntValue 9)} g/NullValue))
+          "{\"data\":{\"filter\":\"{\\\"input\\\":{\\\"limit\\\":9,\\\"nested\\\":{\\\"limit\\\":10,\\\"text\\\":\\\"dflt\\\"},\\\"text\\\":\\\"base\\\"}}\"}}"))
+        (check c (= (g/result-json (g/execute schema "query($on: Boolean = true, $limit: Int = 4, $text: String = \"dflt\") { ... on Query @include(if: $on) { filter(input: {limit: $limit, nested: {text: $text}}) } }" {"text" g/NullValue} g/NullValue))
+          "{\"data\":{\"filter\":\"{\\\"input\\\":{\\\"limit\\\":4,\\\"nested\\\":{\\\"limit\\\":10,\\\"text\\\":null},\\\"text\\\":\\\"base\\\"}}\"}}"))
+        (check c (= @calls 3))
+        (check c (= (g/result-json (g/execute schema "query($on: Boolean = true, $limit: Int = 4, $text: String = \"dflt\") { ... on Query @include(if: $on) { filter(input: {limit: $limit, nested: {text: $text}}) } }" {"on" (g/BooleanValue false)} g/NullValue))
+          "{\"data\":{}}"))
+        (check c (= @calls 3))
+        (check c (= (g/result-json (g/execute schema "query($limit: Int = null) { ... on Query @include(if: true) { filter(input: {limit: $limit}) } }" {} g/NullValue))
+          "{\"data\":{\"filter\":null},\"errors\":[{\"locations\":[{\"column\":63,\"line\":1}],\"message\":\"Non-null input supplied by $limit is null\",\"path\":[\"filter\"]}]}"))
+        (check c (= @calls 3))))) (checks-result c))))

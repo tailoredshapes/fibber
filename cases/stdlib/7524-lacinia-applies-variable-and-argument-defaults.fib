@@ -1,0 +1,54 @@
+;; spec: docs/design/lacinia.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use fib.core fib.seq fib.coll fib.print tl.check) (:require [fib.lacinia :as g]))
+(defun definition (calls: (Atom i64)) -> g/GqlSchemaDefinition
+  (let [text (g/named "String")]
+    (g/schema {} {"echo" (with (g/resolving text
+      (fn (context: g/GqlValue args: (Map str g/GqlValue) parent: g/GqlValue)
+        (do (swap! calls (fn (n: i64) (+ n 1)))
+          (Ok (unwrap-or (get args "text") (g/StringValue "absent"))))))
+      (arguments {"text" (g/argument text)}))
+      "required" (with (g/resolving text
+        (fn (context: g/GqlValue args: (Map str g/GqlValue) parent: g/GqlValue)
+          (do (swap! calls (fn (n: i64) (+ n 1))) (Ok (get args "text" g/NullValue)))))
+        (arguments {"text" (with (g/argument (g/non-null text)) (default-value (some (g/StringValue "field"))))}))
+      "strict" (with (g/resolving text
+        (fn (context: g/GqlValue args: (Map str g/GqlValue) parent: g/GqlValue)
+          (do (swap! calls (fn (n: i64) (+ n 1))) (Ok (get args "text" g/NullValue)))))
+        (arguments {"text" (g/argument (g/non-null text))}))
+      "numbers" (with (g/resolving (g/list-of (g/named "Int"))
+        (fn (context: g/GqlValue args: (Map str g/GqlValue) parent: g/GqlValue)
+          (do (swap! calls (fn (n: i64) (+ n 1))) (Ok (get args "items" g/NullValue)))))
+        (arguments {"items" (g/argument (g/list-of (g/named "Int")))}))})))
+(defun failed? (result: g/GqlResult) -> bool
+  (and (= (. result data) nil) (> (count (. result errors)) 0)))
+(defun main () -> i64
+  (let [c (checks) calls (atom 0)]
+    (do (match (g/compile-schema (definition calls))
+      ((Err _) (check c false))
+      ((Ok schema) (do
+        (check c (= (g/result-json (g/execute schema "query Q($x: String = \"variable\") { required(text: $x) }" {} g/NullValue)) "{\"data\":{\"required\":\"variable\"}}"))
+        (check c (= (g/result-json (g/execute schema "query Q($x: String) { required(text: $x) }" {} g/NullValue)) "{\"data\":{\"required\":\"field\"}}"))
+        (check c (= (g/result-json (g/execute schema "query Q($x: String = \"variable\") { echo(text: $x) }" {"x" (g/StringValue "supplied")} g/NullValue)) "{\"data\":{\"echo\":\"supplied\"}}"))
+        (check c (= (g/result-json (g/execute schema "query Q($x: String = \"variable\") { echo(text: $x) }" {"x" g/NullValue} g/NullValue)) "{\"data\":{\"echo\":null}}"))
+        (check c (= (g/result-json (g/execute schema "query Q($xs: [Int!]! = 3) { numbers(items: $xs) }" {} g/NullValue)) "{\"data\":{\"numbers\":[3]}}"))
+        (check c (= (g/result-json (g/execute schema "query Q($x: String = \"variable\") { strict(text: $x) }" {} g/NullValue)) "{\"data\":{\"strict\":\"variable\"}}"))
+        (check c (= (g/result-json (g/execute schema "query Q($x: String = null) { echo(text: $x) }" {} g/NullValue)) "{\"data\":{\"echo\":null}}"))
+        (let [before @calls]
+          (do (doseq [query ["query Q($x: String! = null) { echo(text: $x) }" "query Q($x: String = 1) { echo(text: $x) }"
+            "query Q($x: String = $y) { echo(text: $x) }" "query Q($x: [String] = [$y]) { echo(text: $x) }"]]
+            (check c (failed? (g/execute schema query {} g/NullValue))))
+            ;; Merge decision: a null reaching a non-null argument is a field error at the response path
+            ;; (data present, resolver not called), as case 7520 pins; the other line made it a request error.
+            (check c (= (g/result-json (g/execute schema "query Q($x: String = null) { required(text: $x) }" {} g/NullValue))
+              "{\"data\":{\"required\":null},\"errors\":[{\"locations\":[{\"column\":30,\"line\":1}],\"message\":\"Non-null input supplied by $x is null\",\"path\":[\"required\"]}]}"))
+            (check c (= (g/result-json (g/execute schema "query Q($x: String = \"variable\") { required(text: $x) }" {"x" g/NullValue} g/NullValue))
+              "{\"data\":{\"required\":null},\"errors\":[{\"locations\":[{\"column\":36,\"line\":1}],\"message\":\"Non-null input supplied by $x is null\",\"path\":[\"required\"]}]}"))
+            (check c (failed? (g/execute schema "query Q($x: String) { strict(text: $x) }" {"x" (g/StringValue "valid-value")} g/NullValue)))
+            (check c (failed? (g/execute schema "query Q($x: String!) { echo(text: $x) }" {} g/NullValue)))
+            (check c (= @calls before)))))))
+      (checks-result c))))
