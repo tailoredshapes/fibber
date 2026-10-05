@@ -92,7 +92,7 @@ Validation and argument preparation finish before any resolver runs. Repeated co
 conflicting aliases fail validation. Result objects follow selection order.
 
 `g/execute-operation` takes the same four arguments followed by an operation
-name. Use it for documents with several named query operations. `g/execute`
+name; the empty string is not a name and selects nothing (case 7527). Use it for documents with several named query operations. `g/execute`
 accepts a single operation, named or anonymous. The entire document is validated,
 including unselected operations and skipped fields, before execution.
 
@@ -152,7 +152,7 @@ with upstream Lacinia yet.
 LACINIA_FIBC=./F scripts/test-lacinia.sh
 ```
 
-The script runs native cases `7500`–`7522`, builds the example, and checks its
+The script runs native cases `7500`–`7529`, builds the example, and checks its
 response with Python's JSON parser. See the [design and roadmap](../../../docs/design/lacinia.md)
 for architecture, provenance, and the next milestones.
 
