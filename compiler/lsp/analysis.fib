@@ -15,6 +15,15 @@
 
 (defstruct LsAnalysis (typed: (Option TypedProgram) own: bool diags: (Vec LsDiag)))
 
+;; The server's memo of whole runs of the front end, keyed by the text run and whether it is a program with a `main`: a request after the
+;; edit that made the diagnostics (completion, hover, definition on the same text) costs no second check of the library. A few entries only
+;; (a checked program is large); full, it is emptied. One per server; `analyse` makes a throwaway one.
+(defstruct LsCache (runs: (Cell (Map str (Result Checked (Vec LsDiag)))) hits: (Cell i64)))
+(def cache-max: i64 4)
+;; ... but two for a buffer over `cache-big` bytes: a checked program of a big buffer is hundreds of MB.
+(def cache-big: i64 100000)
+(defun cache-new () -> LsCache (LsCache (cell (map-empty)) (cell 0)))
+
 ;; ---- diagnostics from the front end's positions ----
 
 (defun first-line-end :private (source: str) -> i64
@@ -94,7 +103,7 @@
 ;; Whether `text` from i begins with `(ns` and then whitespace or `)`.
 (defun ns-at? :private (text: str i: i64) -> bool
   (and (<= (+ i 4) (str-len text))
-       (= (str-slice text i (+ i 3)) "(ns")
+       (and (= (str-byte-at text i) 40i8) (and (= (str-byte-at text (+ i 1)) 110i8) (= (str-byte-at text (+ i 2)) 115i8)))
        (let ((b (zext i64 (str-byte-at text (+ i 3))))) (or (ws-byte? b) (= b 41)))))
 
 (defun type-form? :private (src: str c: LsChunk) -> bool
@@ -155,18 +164,58 @@
      (ns-form source)
      ""]))
 
-(defun first-program :private (rs: (Vec str) path: str roots: Roots) -> (Option TypedProgram)
+;; The largest buffer the front end is run on. The checkers are not linear (a `match` of n arms is checked in about n squared steps, a `let` of
+;; n bindings likewise: 10000 arms took 8 s) and walk the expanded program on the native stack, so an editor buffer of megabytes (a generated
+;; file, a data table) is not checked: its one diagnostic says so, and requests that need a program get the library and the reader's scope (the last rungs of the ladder are small). The
+;; largest source of this repository is 290 KB.
+(def max-analysed-bytes: i64 524288)
+
+(defun too-large-diag :private (source: str) -> LsDiag
+  (plain-diag source (str-join ["the buffer is " (str (str-len source)) " bytes: the language server checks buffers up to "
+                                (str max-analysed-bytes) " bytes, so this one is not checked"])))
+
+(defun run-cached :private (cache: LsCache source: str path: str roots: Roots main: bool) -> (Result Checked (Vec LsDiag))
+  (if (> (str-len source) max-analysed-bytes)
+      (Err [(too-large-diag source)])
+      (run-cached-small cache source path roots main)))
+
+(defun run-cached-small :private (cache: LsCache source: str path: str roots: Roots main: bool) -> (Result Checked (Vec LsDiag))
+  (let ((key (str-join [(if main "m" "x") (str (str-len path)) ":" path source])))
+    (match (get @(. cache runs) key)
+      ((some r) (do (set! (. cache hits) (+ @(. cache hits) 1)) r))
+      (nil (let ((r (run-front source path roots main)))
+             (do (set! (. cache runs) (assoc (if (>= (count @(. cache runs)) (if (> (str-len source) cache-big) 2 cache-max)) (map-empty) @(. cache runs)) key r))
+                 r))))))
+
+(defun first-program :private (cache: LsCache rs: (Vec str) path: str roots: Roots) -> (Option TypedProgram)
   (loop ((i 0))
     (if (>= i (count rs))
         nil
-        (match (run-front (nth rs i) path roots false)
+        (match (run-cached cache (nth rs i) path roots false)
           ((Ok c) (some (. c typed)))
           ((Err _) (recur (+ i 1)))))))
 
 ;; Reads, expands, types and ownership-checks `source` (the text of the file `path`) as the main module, with the library found through `roots`;
 ;; on any failure the diagnostics, and a program for the library and what of the buffer still checks. `cursor` is a byte offset.
-(defun analyse (source: str path: str roots: Roots cursor: (Option i64)) -> LsAnalysis
+;; Whether the diagnostics are all of errors in other files (`at-range` shows those at the top of the buffer, as `FILE:L:C: message`). A buffer
+;; that requires a module that does not check fails the same way with any of its forms left out, so the rungs that keep its `ns` form cannot
+;; help: only the last rung (the library) is tried. (Each rung costs a whole check of the library.)
+(defun foreign? :private (diags: (Vec LsDiag)) -> bool
+  (and (not (empty? diags))
+       (every? (fn (d: LsDiag) (match (str-find (. d message) ".fib:" 0) ((some i) (< i 200)) (nil false))) diags)))
+
+(defun analyse-with (cache: LsCache source: str path: str roots: Roots cursor: (Option i64)) -> LsAnalysis
   (let ((main (match (str-find source "(defun main" 0) ((some _) true) (nil false))))
-    (match (run-front source path roots main)
+    (match (run-cached cache source path roots main)
       ((Ok c) (LsAnalysis (some (. c typed)) true []))
-      ((Err diags) (LsAnalysis (first-program (rungs source cursor) path roots) false diags)))))
+      ((Err diags) (LsAnalysis (first-program cache (if (foreign? diags) [""] (rungs source cursor)) path roots) false diags)))))
+
+(defun analyse (source: str path: str roots: Roots cursor: (Option i64)) -> LsAnalysis
+  (analyse-with (cache-new) source path roots cursor))
+
+;; The diagnostics alone: no program is built for a buffer that does not check (the ladder is for the requests that need names and types).
+(defun diagnose (cache: LsCache source: str path: str roots: Roots) -> (Vec LsDiag)
+  (let ((main (match (str-find source "(defun main" 0) ((some _) true) (nil false))))
+    (match (run-cached cache source path roots main)
+      ((Ok _) [])
+      ((Err diags) diags))))

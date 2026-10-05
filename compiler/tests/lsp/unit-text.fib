@@ -14,12 +14,22 @@
 (defun round-trips (src: str offs: (Vec i64)) -> i64
   (reduce + 0 (mapv (fn (o: i64) (if (= (pos->offset src (offset->pos src o)) o) 0 1)) offs)))
 
+;; the line index gives the position offset->pos gives, for every offset of the text (and some past its end)
+(defun index-agrees (src: str) -> i64
+  (let ((ix (index-new src)))
+    (reduce + 0 (mapv (fn (o: i64) (if (= (ps (index-pos ix o)) (at src o)) 0 1)) (range (+ (str-len src) 3))))))
+
 (defun main () -> i64
   (let ((src "ab\ncé😀d\n")
         (comb "e\u{301}xy")
         (crlf "ab\r\ncd"))
     (finish
-      [;; the Rust's round trip over lines and wide characters (a 4-byte character is two units)
+      [(eq-int "index agrees on wide characters" (index-agrees src) 0)
+       (eq-int "index agrees with CRLF and combining" (+ (index-agrees crlf) (index-agrees comb)) 0)
+       (eq-int "index agrees on empty and newline-only text" (+ (index-agrees "") (index-agrees "\n\n\n")) 0)
+       (eq-str "index position of the emoji" (ps (index-pos (index-new src) 6)) "1:2")
+       (eq-str "index range of a diagnostic" (rng (index-diag-range (index-new src) (LsDiag 6 6 "m"))) (dr src 6 6))
+       ;; the Rust's round trip over lines and wide characters (a 4-byte character is two units)
        (eq-int "round trip" (round-trips src [0 1 2 3 4 6 10 11]) 0)
        (eq-str "d after the emoji" (at src 10) "1:4")
        (eq-str "emoji start" (at src 6) "1:2")

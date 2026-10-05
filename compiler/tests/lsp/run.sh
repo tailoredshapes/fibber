@@ -11,7 +11,7 @@ fibc=${FIBC:-fibc}
 command -v "$fibc" >/dev/null 2>&1 || [ -x "$fibc" ] || { echo "lsp tests: no fibc: set FIBC" >&2; exit 2; }
 export FIB_LIB=${FIB_LIB:-$root/lib}
 cd "$root" || exit 2
-declare -A want=([json]=69 [text]=56 [scope]=62 [analysis]=39)
+declare -A want=([json]=69 [text]=61 [scope]=62 [analysis]=46)
 names=("$@"); [ ${#names[@]} -gt 0 ] || names=(json text scope analysis)
 rc=0
 for n in "${names[@]}"; do

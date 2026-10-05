@@ -4,16 +4,28 @@
 ;; the position; `-32600` for a request after `shutdown`; `-32700` for a body that is not JSON. Exit status 0 after `shutdown`, 1 without it.
 ;; Shapes decided where Rust and fibber differ:
 ;; - a fibber trap aborts: there is no `catch_unwind`, so `-32603` (a handler that failed answers its request and the server goes on) is not
-;;   produced; decision D5 says the front end must be total on garbage input and a fuzz run decides whether a child process is needed.
-;;   `internal-error` is the one place the reply is built, for the day a handler can fail without aborting.
-;; - the Rust serves on a thread with a 256 MiB stack; fibber has the process stack (docs/design/fibref-port.md R2).
+;;   produced; `internal-error` is the one place the reply is built, for the day a handler can fail without aborting (docs/design/exceptions.md).
+;;   Decision D5 (the front end is total on garbage input) is kept by construction: the requests are validated before a handler runs (the
+;;   position and the uri are checked, a body that is not JSON or not UTF-8 is -32700), the work is bounded (`max-analysed-bytes` in lsp.analysis, the
+;;   reader's nesting limit of 1000, JSON depth 128, 20000 items per answer, 64 MiB per message) and the stack is raised once at start (below). What
+;;   can still abort the process (with the default settings): a trap in any handler, a defect not yet found (compiler/tests/lsp/fuzz.js is the net for them: every one it found is a case in hardening.js);
+;;   an out-of-memory under the host's limit (a buffer under the 512 KiB bound may still use a few hundred MB: the checked program is large);
+;;   and no request is bounded in time (a `match` of tens of thousands of arms is checked in quadratic time: 10000 arms took 8 s), so a client
+;;   needs its own timeout. Every request kind goes through the front end except initialize, shutdown, documentSymbol (the reader only) and the
+;;   notifications didClose and didSave of an unknown document; completion, hover, definition and the diagnostics of didOpen, didChange and
+;;   didSave are the ones a defect would abort.
+;;   With FIB_LSP_ISOLATE=1 (`request-in-task`, `notify-in-task`) a trap in a handler is answered -32603 and the server goes on; only a stack
+;;   overflow, an out-of-memory and a hang still end it. It is off by default because a task cannot share the analysis cache (a `Cell` is not
+;;   Send): every request then checks the library again (about 0.8 s against 20 ms).
+;; - the Rust serves on a thread with a 256 MiB stack; fibber has the process stack, so `lsp-main` re-executes the process once with the soft
+;;   stack limit raised to 1 GiB (docs/design/fibref-port.md R2; `stack-wanted`, `raise-and-exec`).
 ;; - `read-message` reads the header a byte at a time (the descriptor is read without a buffer so that nothing is lost between calls); the body
 ;;   is read to its length and must be UTF-8 (checked here: `str-from-bytes` traps on invalid bytes). The largest body is 64 MiB.
 ;; - the capabilities add `definitionProvider` and `documentSymbolProvider` to the Rust's; `textDocument/definition` answers a Location or null,
 ;;   `textDocument/documentSymbol` a flat array of DocumentSymbol.
 ;; - `server-handle` is pure of the descriptors: one message in, the replies out; the loop (`lsp-main`) owns the reading and writing.
 (ns lsp.server
-  (:require [fib.unix :as unix] [lsp.features :as ft] [lsp.text :as tx] [lsp.definition :as defn] [driver.native :as native] [fib.string :as s])
+  (:require [fib.unix :as unix] [lsp.features :as ft] [lsp.text :as tx] [lsp.definition :as defn] [lsp.analysis :as an] [driver.native :as native] [fib.string :as s] [fib.os :as os] [fib.async :as as] [lair.ffi :as ffi])
   (:use expand.roots lsp.json lsp.types))
 
 (def err-parse: i64 -32700)
@@ -22,10 +34,13 @@
 (def err-invalid-params: i64 -32602)
 (def err-internal: i64 -32603)
 (def max-body: i64 67108864)
+;; The most completion items and document symbols one answer holds: a generated 10 MB file made answers of 20 to 46 MB and 5 to 14 s.
+(def max-items: i64 20000)
+(def not-utf8: str "message is not UTF-8")
 
-(defstruct LsServer (docs: (Cell (Map str str)) roots: Roots shutdown: (Cell bool)))
+(defstruct LsServer (docs: (Cell (Map str str)) roots: Roots shutdown: (Cell bool) cache: an/LsCache isolate: bool))
 
-(defun server-new (roots: Roots) -> LsServer (LsServer (cell (map-empty)) roots (cell false)))
+(defun server-new (roots: Roots) -> LsServer (LsServer (cell (map-empty)) roots (cell false) (an/cache-new) (= (unwrap-or (native/getenv-opt "FIB_LSP_ISOLATE") "") "1")))
 
 ;; One message in, the messages to send out and an exit code once the client said `exit`.
 (defstruct LsReply (out: (Vec JVal) exit: (Option i64)))
@@ -49,6 +64,16 @@
 
 (defun internal-error (id: JVal) -> JVal (failure id err-internal "internal error while handling the request"))
 
+;; With FIB_LSP_ISOLATE=1 each handler runs in a task and is asked with `try-join` (docs/design/exceptions.md section 8): a trap in it becomes the
+;; reply `-32603` with the trap's message and the server goes on. A task may capture only data that can cross threads, and a `Cell` cannot: the
+;; open documents and the roots are copied in, the handler runs on a server of its own with an empty cache (every request checks the library
+;; again: 0.4 to 1 s, which is why this is off by default), and what it changed (the documents) is copied back. A trapped task abandons what
+;; its closure captured (bounded by the request). Stack overflow and out-of-memory are fatal by decision and are not isolated.
+(defun isolated :private (f: (fn :send () a)) -> (Result a str)
+  (match (as/try-join (as/spawn f))
+    ((Ok v) (Ok v))
+    ((Err t) (Err (. t message)))))
+
 (defun one :private (m: JVal) -> LsReply (LsReply [m] nil))
 (defun none :private () -> LsReply (LsReply [] nil))
 
@@ -71,11 +96,11 @@
 (defun range-json :private (r: tx/LsRange) -> JVal
   (obj [(Pair "start" (pos-json (. r start))) (Pair "end" (pos-json (. r end)))]))
 
-(defun span-json :private (text: str start: i64 end: i64) -> JVal
-  (range-json (tx/LsRange (tx/offset->pos text start) (tx/offset->pos text end))))
+(defun span-json :private (ix: tx/LsIndex start: i64 end: i64) -> JVal
+  (range-json (tx/LsRange (tx/index-pos ix start) (tx/index-pos ix end))))
 
-(defun diag-json :private (src: str d: LsDiag) -> JVal
-  (obj [(Pair "range" (range-json (tx/diag-range src d))) (Pair "severity" (JInt 1)) (Pair "source" (jstr "fibref"))
+(defun diag-json :private (src: tx/LsIndex d: LsDiag) -> JVal
+  (obj [(Pair "range" (range-json (tx/index-diag-range src d))) (Pair "severity" (JInt 1)) (Pair "source" (jstr "fibref"))
         (Pair "message" (jstr (. d message)))]))
 
 (defun publish :private (uri: str diags: (Vec JVal)) -> JVal
@@ -135,22 +160,22 @@
   (let ((own (= (. loc path) (tx/path-of-uri (. a uri))))
         (text (if own (. a text) (unwrap-or (read-file (. loc path)) ""))))
     (obj [(Pair "uri" (jstr (if own (. a uri) (file-uri (. loc path)))))
-          (Pair "range" (span-json text (. loc start) (. loc end)))])))
+          (Pair "range" (span-json (tx/index-new text) (. loc start) (. loc end)))])))
 
 (defun request-at :private (s: LsServer method: str a: LsAt) -> JVal
   (let ((path (tx/path-of-uri (. a uri))))
     (cond (= method "textDocument/completion")
-            (JArr (mapv item-json (ft/complete (. a text) path (. a line) (. a col) (. s roots))))
+            (JArr (mapv item-json (take max-items (ft/complete (. s cache) (. a text) path (. a line) (. a col) (. s roots)))))
           (= method "textDocument/hover")
-            (match (ft/hover (. a text) path (. a line) (. a col) (. s roots))
+            (match (ft/hover (. s cache) (. a text) path (. a line) (. a col) (. s roots))
               ((some t) (hover-json t))
               (nil JNull))
           :else
-            (match (ft/definition (. a text) path (. a line) (. a col) (. s roots))
+            (match (ft/definition (. s cache) (. a text) path (. a line) (. a col) (. s roots))
               ((some loc) (location-json a loc))
               (nil JNull)))))
 
-(defun symbol-json :private (text: str sym: defn/LsSymbol) -> JVal
+(defun symbol-json :private (text: tx/LsIndex sym: defn/LsSymbol) -> JVal
   (obj [(Pair "name" (jstr (. sym name))) (Pair "kind" (JInt (symbol-kind (. sym kind))))
         (Pair "range" (span-json text (. sym start) (. sym end)))
         (Pair "selectionRange" (span-json text (. sym sel-start) (. sym sel-end)))]))
@@ -161,7 +186,7 @@
     ((some u)
      (match (get @(. s docs) u)
        (nil (Ok JNull))
-       ((some text) (Ok (JArr (mapv (fn (sym: defn/LsSymbol) (symbol-json text sym)) (ft/document-ranges text (tx/path-of-uri u))))))))))
+       ((some text) (Ok (JArr (mapv (let ((ix (tx/index-new text))) (fn (sym: defn/LsSymbol) (symbol-json ix sym))) (take max-items (ft/document-ranges text (tx/path-of-uri u)))))))))))
 
 (defun request :private (s: LsServer method: str params: JVal) -> (Result JVal (Pair i64 str))
   (cond (= method "initialize") (Ok (initialize-result))
@@ -178,7 +203,7 @@
 
 (defun changed :private (s: LsServer uri: str text: str) -> LsReply
   (do (set! (. s docs) (assoc @(. s docs) uri text))
-      (one (publish uri (mapv (fn (d: LsDiag) (diag-json text d)) (ft/diagnostics text (tx/path-of-uri uri) (. s roots)))))))
+      (one (publish uri (mapv (let ((ix (tx/index-new text))) (fn (d: LsDiag) (diag-json ix d))) (ft/diagnostics (. s cache) text (tx/path-of-uri uri) (. s roots)))))))
 
 (defun last-text :private (params: JVal) -> (Option str)
   (match (json-get params "contentChanges")
@@ -204,18 +229,37 @@
                  (do (set! (. s docs) (dissoc @(. s docs) uri)) (one (publish uri [])))
                :else (none))))))
 
+;; The request in a task of its own when the server isolates handlers, else here (`Err` is then never returned).
+(defun request-in-task :private (s: LsServer method: str params: JVal) -> (Result (Result JVal (Pair i64 str)) str)
+  (if (or (not (. s isolate)) (= method "shutdown"))
+      (Ok (request s method params))
+      (let ((docs @(. s docs)) (roots (. s roots)))
+        (isolated (fn () (request (LsServer (cell docs) roots (cell false) (an/cache-new) false) method params))))))
+
+;; The notification in a task of its own when the server isolates handlers: a trap answers nothing (there is no id) and leaves the documents as
+;; they were.
+(defun notify-in-task :private (s: LsServer method: str params: JVal) -> LsReply
+  (if (or (not (. s isolate)) (= method "exit"))
+      (notify s method params)
+      (let ((docs @(. s docs)) (roots (. s roots)))
+        (match (isolated (fn () (let ((s2 (LsServer (cell docs) roots (cell false) (an/cache-new) false)))
+                                  (let ((r (notify s2 method params))) (Pair r @(. s2 docs))))))
+          ((Ok (Pair r d)) (do (set! (. s docs) d) r))
+          ((Err _) (none))))))
+
 ;; One message in, the replies out. Rust: lsp.rs `handle`/`dispatch`
 (defun server-handle (s: LsServer msg: JVal) -> LsReply
   (let ((method (match (json-get msg "method") ((some (JStr m)) m) (_ "")))
         (params (unwrap-or (json-get msg "params") JNull)))
     (match (json-get msg "id")
-      (nil (notify s method params))
+      (nil (if @(. s shutdown) (notify s method params) (notify-in-task s method params)))
       ((some id)
        (cond (= method "") (none)
              (and @(. s shutdown) (not (= method "shutdown"))) (one (failure id err-invalid-request "the server is shut down"))
-             :else (match (request s method params)
-                     ((Ok r) (one (response id r)))
-                     ((Err (Pair code message)) (one (failure id code message)))))))))
+             :else (match (request-in-task s method params)
+                     ((Ok (Ok r)) (one (response id r)))
+                     ((Ok (Err (Pair code message))) (one (failure id code message)))
+                     ((Err why) (one (failure id err-internal (str "internal error: " why))))))))))
 
 ;; ---- framing
 
@@ -266,7 +310,7 @@
   (let ((buf (cell (array n 0i8))))
     (loop ((got 0))
       (if (= got n)
-          (if (utf8-valid? @buf) (Ok (some (str-from-bytes @buf))) (Err "message is not UTF-8"))
+          (if (utf8-valid? @buf) (Ok (some (str-from-bytes @buf))) (Err not-utf8))
           (match (unix/fd-read fd (- n got))
             ((Err e) (Err (str "read failed: " (unix/errno-text e))))
             ((Ok chunk)
@@ -286,7 +330,7 @@
        (if (= line "")
            (match len
              (nil (Err "no Content-Length"))
-             ((some n) (if (> n max-body) (Err "message too large") (read-body fd n))))
+             ((some n) (if (or (< n 0) (> n max-body)) (Err "bad or too large Content-Length") (read-body fd n))))
            (match (header-length line)
              ((Err e) (Err e))
              ((Ok l) (recur false (if (some? l) l len)))))))))
@@ -311,7 +355,10 @@
 (defun serve :private (s: LsServer) -> i64
   (loop ()
     (match (read-message unix/stdin)
-      ((Err _) 1)
+      ((Err e) (if (= e not-utf8)
+                   ;; the body was read in full, so the stream is in step: answer -32700 and go on (found by fuzz: it used to end the server)
+                   (if (send-all [(failure JNull err-parse e)]) (recur) 1)
+                   1))
       ((Ok nil) 1)
       ((Ok (some body))
        (let ((reply (match (json-parse body)
@@ -320,5 +367,42 @@
          (cond (not (send-all (. reply out))) 1
                :else (match (. reply exit) ((some code) code) (nil (recur)))))))))
 
+;; ---- the stack (docs/design/fibref-port.md R2)
+;; The front end recurses on the depth of the expanded program (the reader refuses source nested deeper than 1000, but a macro such as `and`
+;; or `or` over thousands of arguments expands to that many nested forms, and the ownership checker walks them on the native stack: the 8 MiB
+;; of a default process overflowed at about 9000 arguments). The process re-executes itself once with the soft stack limit raised to
+;; `want-stack` (or the hard limit); the new process finds the limit raised and goes on. A failed `setrlimit` or `execv` is not an error:
+;; the server runs on the stack it has, and `max-analysed-bytes` (lsp.analysis) still keeps the depth far below an overflow.
+(extern getrlimit :private (i32 ptr) -> i32)
+(extern setrlimit :private (i32 ptr) -> i32)
+(extern execv :private (ptr ptr) -> i32)
+(def want-stack: i64 1073741824)
+(def rlimit-stack: i32 3i32)
+
+(defun stack-wanted :private () -> (Option i64)
+  (let ((lim (ffi/words-new [0 0])))
+    (let ((r (unsafe (getrlimit rlimit-stack lim)))
+          (cur (unsafe (load-i64 lim)))
+          (hard (unsafe (load-i64 (ptr+ lim 8)))))
+      (do (ffi/free-addr (ffi/ptr->addr lim))
+          (let ((target (if (or (< hard 0) (> hard want-stack)) want-stack hard)))
+            (if (and (= r 0i32) (and (>= cur 0) (< cur target))) (some target) nil))))))
+
+(defun raise-and-exec :private (target: i64) -> unit
+  (match (os/executable-path)
+    ((Err _) ())
+    ((Ok exe)
+     (let ((old (ffi/words-new [0 0])))
+       (let ((hard (unsafe (do (getrlimit rlimit-stack old) (load-i64 (ptr+ old 8))))))
+         (let ((lim (ffi/words-new [target hard])))
+           (if (= (unsafe (setrlimit rlimit-stack lim)) 0i32)
+               (let ((pp (ffi/bytes-new exe))
+                     (cs (mapv (fn (w: str) (ffi/ptr->addr (ffi/bytes-new w))) (into [exe] (vec (args))))))
+                 (let ((av (ffi/words-new (conj cs 0))))
+                   (do (unsafe (execv pp av)) ())))
+               ())))))))
+
 ;; `fibref lsp` / `fibc lsp`: serves standard input and output; the exit status.
-(defun lsp-main (roots: Roots) -> i64 (serve (server-new roots)))
+(defun lsp-main (roots: Roots) -> i64
+  (do (match (stack-wanted) ((some t) (raise-and-exec t)) (nil ()))
+      (serve (server-new roots))))

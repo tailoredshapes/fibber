@@ -72,10 +72,10 @@
 
 ;; The candidates of the right class at `line` (1-based) and `col` (0-based) of `src`, the text of the file `path`. Never fails: a buffer that
 ;; does not read or check gets the scope the reader can give, then the library's names; prefix filtering is the client's. Rust: complete.rs
-(defun complete (src: str path: str line: i64 col: i64 roots: Roots) -> (Vec LsItem)
+(defun complete (cache: LsCache src: str path: str line: i64 col: i64 roots: Roots) -> (Vec LsItem)
   (let ((off (cursor-offset src line col))
         (ctx (classify (str-slice src 0 (cursor-offset src line col))))
-        (a (analyse src path roots (some (cursor-offset src line col))))
+        (a (analyse-with cache src path roots (some (cursor-offset src line col))))
         (scope (scope-at src (. ctx word-start) path)))
     (dedupe
       (match (. ctx ask)
@@ -99,13 +99,13 @@
 
 ;; The text to show when the cursor rests on a name: a local's type or the checker's scheme of a global, as `name : type`; none when it is no
 ;; name the program knows. Rust: complete.rs hover
-(defun hover (src: str path: str line: i64 col: i64 roots: Roots) -> (Option str)
+(defun hover (cache: LsCache src: str path: str line: i64 col: i64 roots: Roots) -> (Option str)
   (let ((off (cursor-offset src line col))
         (w (defn/word-bounds src (cursor-offset src line col))))
     (if (= (. w fst) (. w snd))
         nil
         (let ((word (str-slice src (. w fst) (. w snd)))
-              (a (analyse src path roots (some off))))
+              (a (analyse-with cache src path roots (some off))))
           (match (. a typed)
             (nil nil)
             ((some tp)
@@ -114,12 +114,12 @@
                (nil (global-text tp word)))))))))
 
 ;; The problems in `src`, the text of the file `path`. Rust: diagnostics.rs diagnostics
-(defun diagnostics (src: str path: str roots: Roots) -> (Vec LsDiag)
-  (. (analyse src path roots nil) diags))
+(defun diagnostics (cache: LsCache src: str path: str roots: Roots) -> (Vec LsDiag)
+  (diagnose cache src path roots))
 
 ;; The definition of the name under the cursor (lsp.definition).
-(defun definition (src: str path: str line: i64 col: i64 roots: Roots) -> (Option LsLocation)
-  (defn/find-definition src path (cursor-offset src line col) roots))
+(defun definition (cache: LsCache src: str path: str line: i64 col: i64 roots: Roots) -> (Option LsLocation)
+  (defn/find-definition cache src path (cursor-offset src line col) roots))
 
 (defun document-symbols (src: str path: str) -> (Vec LsItem)
   (mapv (fn (s: defn/LsSymbol) (LsItem (. s name) (. s kind) "" "")) (defn/symbols src path)))
