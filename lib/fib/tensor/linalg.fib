@@ -42,12 +42,11 @@
 (impl MatrixKernel i32 (matrix-multiply (self a b) (mmul-scalar a b)))
 (impl MatrixKernel i64 (matrix-multiply (self a b) (mmul-scalar a b)))
 
-;; The fused kernels need a hardware fma: an fma without one is a libm call (200 ms against 6 ms for a 512 product at
-;; x86-64-v2). A target whose native f64 vector is narrower than four lanes (SSE: x86-64, x86-64-v2) has no AVX2 and
-;; so takes the multiply-then-add tiles. The condition is a constant of the target, folded at compile time.
-(defun fused-target? () -> bool (>= (native-lanes f64) 4))
-(impl MatrixKernel f32 (matrix-multiply (self a b) (if (fused-target?) (gf32/multiply a b) (g32/multiply a b))))
-(impl MatrixKernel f64 (matrix-multiply (self a b) (if (fused-target?) (gf64/multiply a b) (g64/multiply a b))))
+;; The fused kernels need a hardware fma: a `simd/fma` without one is a libm call per lane (200 ms against 6 ms for a 512 product at
+;; x86-64-v2). `(has-fma)` is a constant of the target (x86: the fma feature or a v3 CPU; aarch64: always), folded at compile time, so a
+;; target without takes the multiply-then-add tiles. The tile shape (6x8 f64, 6x16 f32) is sized for AVX2's sixteen 256-bit registers.
+(impl MatrixKernel f32 (matrix-multiply (self a b) (if (has-fma) (gf32/multiply a b) (g32/multiply a b))))
+(impl MatrixKernel f64 (matrix-multiply (self a b) (if (has-fma) (gf64/multiply a b) (g64/multiply a b))))
 
 (defun mmul (a: (Tensor t) b: (Tensor t)) :where ((Element t) (Num t) (MatrixKernel t)) -> (Tensor t)
   (matrix-multiply (. a seed) a b))

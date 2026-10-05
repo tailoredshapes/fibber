@@ -247,8 +247,7 @@ broadcast add, which are still the generic elementwise kernels (a `where` and a 
    **Rounding changes**: an fma rounds once, so f64/f32 `mmul` can differ in the last bits from `mmul-scalar` (README updated). Each output is still one ordered chain
    (inner index increasing), pinned bit for bit by cases 7077/7078 against `fma-reference`.
    **Blocker found and handled, not worked around in the compiler:** on a target without hardware FMA (`FIB_TARGET_CPU=x86-64-v2`, which `package.sh` sets for releases) `simd/fma`
-   lowers to a libm `fma` call: the 512 f64 product took **203 ms instead of 6 ms**. `mmul` therefore takes the fma kernels only when `(native-lanes f64) >= 4` (AVX2 and up, a
-   compile-time constant) and the earlier multiply-then-add tiles otherwise (measured at x86-64-v2: 13.7 ms / 7.1 ms for 512 f64 / f32). A target with AVX2 but no FMA does not exist
+   lowers to a libm `fma` call: the 512 f64 product took **203 ms instead of 6 ms**. `mmul` therefore took the fma kernels only when `(native-lanes f64) >= 4` (SC1 replaced that proxy by the `(has-fma)` constant of the Target record, which is also true on aarch64; vmath's exp/log/tanh use `simd/muladd` and `simd/bitcast`, 1e7 exp at x86-64-v2 270 ms -> 41 ms) and the earlier multiply-then-add tiles otherwise (measured at x86-64-v2: 13.7 ms / 7.1 ms for 512 f64 / f32). A target with AVX2 but no FMA does not exist
    in practice; if it did, it would hit the slow path. The proper fix is in the compiler (lower `simd/fma` to mul+add, or expose a `has-fma` constant); I did not touch it.
 2. **Dense fast path and row walks** for `map-as`, `zip-with`, `copy`, `to-array`, `to-vec`, `mean-axis` (`flat-at` per element is gone from them; `argmax`/`argmin`, `where`
    and the mask paths still use it). Micro (`scripts/bench/tensor/micro-walk.fib`, 2048x2048 f64, best of 5, before -> after ms): map 28.2 -> 9.6, zip-with 48.5 -> 10.5,

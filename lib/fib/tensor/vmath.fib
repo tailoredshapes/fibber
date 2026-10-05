@@ -16,19 +16,19 @@
 (defun nan :private () -> f64 (bits->f64 9221120237041090560))
 (defun inf :private () -> f64 (bits->f64 9218868437227405312))
 
-;; 2^e for e in [-1022, 1023], by building the exponent field lane by lane
+;; 2^e for e in [-1022, 1023], by building the exponent field and reinterpreting it as the double (no lane leaves the vector register)
 (defun pow2 :private (e: i64x4) -> f64x4
   (let ((b: i64x4 (shl (unchecked-add e (splat i64x4 1023)) 52)))
-    (simd (bits->f64 (lane b 0)) (bits->f64 (lane b 1)) (bits->f64 (lane b 2)) (bits->f64 (lane b 3)))))
+    (simd/bitcast b)))
 
 ;; exp(x) = 2^k * exp(r), k = round(x log2 e), r = x - k ln2 (two fused steps), exp(r) a degree-13 Taylor polynomial on |r| <= ln2/2.
 ;; 2^k is applied as 2^(k -+ 1) and a factor 2 or 1/2 on the polynomial so that k = 1024 and k = -1022 stay representable.
 (defun exp4 :private (x: f64x4) -> f64x4
   (let ((xc (simd/min (simd/max x (splat f64x4 -708.4)) (splat f64x4 709.8)))
         (kf (simd/round-even (* xc (splat f64x4 1.4426950408889634))))
-        (r1 (simd/fma kf (splat f64x4 (neg 0.693147180559663)) xc))
-        (r (simd/fma kf (splat f64x4 (neg 2.8235290563031577e-13)) r1))
-        (p (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (splat f64x4 1.6059043836821613e-10) r (splat f64x4 2.08767569878681e-09)) r (splat f64x4 2.505210838544172e-08)) r (splat f64x4 2.755731922398589e-07)) r (splat f64x4 2.7557319223985893e-06)) r (splat f64x4 2.48015873015873e-05)) r (splat f64x4 0.0001984126984126984)) r (splat f64x4 0.001388888888888889)) r (splat f64x4 0.008333333333333333)) r (splat f64x4 0.041666666666666664)) r (splat f64x4 0.16666666666666666)) r (splat f64x4 0.5)) r (splat f64x4 1.0)) r (splat f64x4 1.0)))
+        (r1 (simd/muladd kf (splat f64x4 (neg 0.693147180559663)) xc))
+        (r (simd/muladd kf (splat f64x4 (neg 2.8235290563031577e-13)) r1))
+        (p (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (splat f64x4 1.6059043836821613e-10) r (splat f64x4 2.08767569878681e-09)) r (splat f64x4 2.505210838544172e-08)) r (splat f64x4 2.755731922398589e-07)) r (splat f64x4 2.7557319223985893e-06)) r (splat f64x4 2.48015873015873e-05)) r (splat f64x4 0.0001984126984126984)) r (splat f64x4 0.001388888888888889)) r (splat f64x4 0.008333333333333333)) r (splat f64x4 0.041666666666666664)) r (splat f64x4 0.16666666666666666)) r (splat f64x4 0.5)) r (splat f64x4 1.0)) r (splat f64x4 1.0)))
         (ki: i64x4 (simd/convert kf))
         (pos (simd/gt kf (splat f64x4 0.0)))
         (m (simd/blend pos (splat i64x4 -1) (splat i64x4 1)))
@@ -43,20 +43,20 @@
   (let ((small (simd/lt x (splat f64x4 2.2250738585072014e-308)))
         (xs (simd/blend small (* x (splat f64x4 18014398509481984.0)) x))
         (adj (simd/blend small (splat f64x4 54.0) (splat f64x4 0.0)))
-        (hx: i64x4 (simd (f64->bits (lane xs 0)) (f64->bits (lane xs 1)) (f64->bits (lane xs 2)) (f64->bits (lane xs 3))))
+        (hx: i64x4 (simd/bitcast xs))
         (tmp (unchecked-subtract hx (splat i64x4 4604544271217802189)))
         (ki (sar tmp 52))
         (mb: i64x4 (unchecked-subtract hx (shl ki 52)))
-        (m (simd (bits->f64 (lane mb 0)) (bits->f64 (lane mb 1)) (bits->f64 (lane mb 2)) (bits->f64 (lane mb 3))))
+        (m: f64x4 (simd/bitcast mb))
         (ef0: f64x4 (simd/convert ki))
         (ef (- ef0 adj))
         (f (- m (splat f64x4 1.0)))
         (s (fdiv f (+ m (splat f64x4 1.0))))
         (z (* s s))
-        (q (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (splat f64x4 0.047619047619047616) z (splat f64x4 0.05263157894736842)) z (splat f64x4 0.058823529411764705)) z (splat f64x4 0.06666666666666667)) z (splat f64x4 0.07692307692307693)) z (splat f64x4 0.09090909090909091)) z (splat f64x4 0.1111111111111111)) z (splat f64x4 0.14285714285714285)) z (splat f64x4 0.2)) z (splat f64x4 0.3333333333333333)))
+        (q (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (splat f64x4 0.047619047619047616) z (splat f64x4 0.05263157894736842)) z (splat f64x4 0.058823529411764705)) z (splat f64x4 0.06666666666666667)) z (splat f64x4 0.07692307692307693)) z (splat f64x4 0.09090909090909091)) z (splat f64x4 0.1111111111111111)) z (splat f64x4 0.14285714285714285)) z (splat f64x4 0.2)) z (splat f64x4 0.3333333333333333)))
         (s2 (* s (splat f64x4 2.0)))
-        (logm (simd/fma (* s2 z) q s2))
-        (y (simd/fma ef (splat f64x4 0.693147180559663) (simd/fma ef (splat f64x4 2.8235290563031577e-13) logm)))
+        (logm (simd/muladd (* s2 z) q s2))
+        (y (simd/muladd ef (splat f64x4 0.693147180559663) (simd/muladd ef (splat f64x4 2.8235290563031577e-13) logm)))
         (zero (splat f64x4 0.0)))
     (simd/blend (simd/ne x x) x
                 (simd/blend (simd/eq x zero) (splat f64x4 (- 0.0 (inf)))
@@ -67,8 +67,8 @@
 (defun tanh4 :private (x: f64x4) -> f64x4
   (let ((a (simd/abs x)) (zero (splat f64x4 0.0)) (one (splat f64x4 1.0))
         (z (* x x))
-        (g (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (simd/fma (splat f64x4 1.1502191446949632e-06) z (splat f64x4 -5.273641022066474e-06)) z (splat f64x4 1.531458042362091e-05)) z (splat f64x4 -3.9068724399643e-05)) z (splat f64x4 9.686461378957666e-05)) z (splat f64x4 -0.0002391204040613736)) z (splat f64x4 0.0005900263819919156)) z (splat f64x4 -0.0014558342969834689)) z (splat f64x4 0.00359212803135852)) z (splat f64x4 -0.008863235529706255)) z (splat f64x4 0.021869488536150786)) z (splat f64x4 -0.053968253968253915)) z (splat f64x4 0.13333333333333333)) z (splat f64x4 -0.3333333333333333)))
-        (small (simd/fma (* x z) g x))
+        (g (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (splat f64x4 1.1502191446949632e-06) z (splat f64x4 -5.273641022066474e-06)) z (splat f64x4 1.531458042362091e-05)) z (splat f64x4 -3.9068724399643e-05)) z (splat f64x4 9.686461378957666e-05)) z (splat f64x4 -0.0002391204040613736)) z (splat f64x4 0.0005900263819919156)) z (splat f64x4 -0.0014558342969834689)) z (splat f64x4 0.00359212803135852)) z (splat f64x4 -0.008863235529706255)) z (splat f64x4 0.021869488536150786)) z (splat f64x4 -0.053968253968253915)) z (splat f64x4 0.13333333333333333)) z (splat f64x4 -0.3333333333333333)))
+        (small (simd/muladd (* x z) g x))
         (t (exp4 (* a (splat f64x4 2.0))))
         (th (- one (fdiv (splat f64x4 2.0) (+ t one))))
         (large (simd/blend (simd/lt x zero) (neg th) th)))
