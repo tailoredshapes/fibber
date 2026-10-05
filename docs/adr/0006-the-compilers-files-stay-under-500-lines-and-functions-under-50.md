@@ -19,7 +19,8 @@ to be written down, not an edit of the list.
 
 ## Consequences
 
-- Today's exceptions, honestly: `compiler/emit/runtime.fib` (2440 lines) is generated from `rt/*.lir`; `lib/prelude.fib` (721) is the
+- Today's exceptions, honestly: `compiler/emit/runtime.fib` is generated from `rt/*.lir` (compiler/tests/emit/runtime.sh checks that it equals
+  what the generator makes), so the limit does not apply to it and it is excluded from the rule; `lib/prelude.fib` (721) is the
   language's embedded prelude; `compiler/expand/ctx.fib` (525) is over by 25. Functions: `compiler/native/support.fib:mailbox-source`
   (333, a function that holds the text of a runtime source), `compiler/types/lower/call.fib:special-kind` (52) and the `scenario`
   macro of `fib.test.core` (73: a stage-2 macro sees the prelude only and cannot call a helper, docs/design/test-harness.md §10).
@@ -30,9 +31,9 @@ to be written down, not an edit of the list.
 
 ```fibber fitness
 (limit "every .fib file of compiler/ and lib/ outside the tests has fewer than 500 lines (shrink-only allow-list)"
-  (file-lengths repo ["compiler/**.fib" "lib/**.fib" "!compiler/tests/**"])
+  (file-lengths repo ["compiler/**.fib" "lib/**.fib" "!compiler/tests/**" "!compiler/emit/runtime.fib"])
   499
-  ["compiler/emit/runtime.fib=2440" "compiler/expand/ctx.fib=525" "lib/prelude.fib=721"]
+  ["compiler/expand/ctx.fib=525" "lib/prelude.fib=721"]
   (plant-file "compiler/emit/zz-plant.fib" (join "\n" (mapv (fn (i: i64) ";; a line") (range 600))))
   (plant "compiler/expand/ctx.fib" "\n;; one line more than the list allows\n"))
 
@@ -48,5 +49,5 @@ to be written down, not an edit of the list.
 
 The tests (`compiler/tests/`) and `cases/`; Rust (there is none); that a function is *readable* (a 49-line function can be bad);
 that a split is by responsibility rather than by line count (taste, not checkable); `lib/fib/**/README.md` and other prose;
-generated files other than `runtime.fib` (none today). A function written with a head the light reader does not know (`defn` is
+generated files other than `runtime.fib` (none today; `runtime.fib` itself is excluded because its size follows `rt/`). A function written with a head the light reader does not know (`defn` is
 counted; a `defmacro`-generated function is not).
