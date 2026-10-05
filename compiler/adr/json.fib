@@ -1,0 +1,80 @@
+;; adr.json: the JSON that fib.test.run prints (`--format json`, docs/design/test-harness.md §6.3), read into a tree. Only what that
+;; reporter writes: objects, arrays, strings with the escapes of `js`, integers, and the words true/false/null.
+(ns adr.json (:use fib.core fib.seq fib.coll fib.print))
+
+(defenum J
+  (JStr s: str)
+  (JNum n: i64)
+  (JArr xs: (Vec J))
+  (JObj ks: (Vec str) vs: (Vec J))
+  JOther)
+
+(defstruct JP (j: J i: i64))
+(defstruct SP (s: str i: i64))
+
+(defun at :private (s: str i: i64) -> i64 (if (< i (str-len s)) (sext i64 (str-byte-at s i)) -1))
+
+(defun ws :private (s: str i: i64) -> i64
+  (loop ((k i)) (if (or (or (= (at s k) 32) (= (at s k) 10)) (or (= (at s k) 9) (= (at s k) 13))) (recur (+ k 1)) k)))
+
+(defun escape-text :private (c: i64) -> str
+  (cond (= c 110) "\n" (= c 116) "\t" (= c 114) "\r" (= c 34) "\"" (= c 92) "\\" (= c 47) "/" :else " "))
+
+;; The string that starts at the quote at i: its text and the index after the closing quote.
+(defun read-string :private (s: str i: i64) -> SP
+  (loop ((k (+ i 1)) (from (+ i 1)) (out ""))
+    (let ((c (at s k)))
+      (cond (< c 0) (SP out k)
+            (= c 34) (SP (str out (str-slice s from k)) (+ k 1))
+            (= c 92) (let ((e (at s (+ k 1))))
+                       (if (= e 117)
+                           (recur (+ k 6) (+ k 6) (str out (str-slice s from k) " "))
+                           (recur (+ k 2) (+ k 2) (str out (str-slice s from k) (escape-text e)))))
+            :else (recur (+ k 1) from out)))))
+
+(defun read-number :private (s: str i: i64) -> JP
+  (loop ((k i) (n 0) (neg false))
+    (let ((c (at s k)))
+      (cond (and (= c 45) (= k i)) (recur (+ k 1) n true)
+            (and (>= c 48) (<= c 57)) (recur (+ k 1) (+ (* n 10) (- c 48)) neg)
+            :else (JP (JNum (if neg (- 0 n) n)) k)))))
+
+(defun skip-word :private (s: str i: i64) -> i64
+  (loop ((k i)) (if (and (>= (at s k) 97) (<= (at s k) 122)) (recur (+ k 1)) k)))
+
+(defun read-value (s: str i0: i64) -> JP
+  (let ((i (ws s i0)) (c (at s (ws s i0))))
+    (cond (= c 34) (let ((r (read-string s i))) (JP (JStr (. r s)) (. r i)))
+          (= c 91) (read-array s (+ i 1))
+          (= c 123) (read-object s (+ i 1))
+          (or (= c 45) (and (>= c 48) (<= c 57))) (read-number s i)
+          :else (JP JOther (skip-word s i)))))
+
+(defun read-array :private (s: str i: i64) -> JP
+  (loop ((k (ws s i)) (acc []))
+    (let ((c (at s k)))
+      (cond (or (< c 0) (= c 93)) (JP (JArr acc) (+ k 1))
+            (= c 44) (recur (ws s (+ k 1)) acc)
+            :else (let ((v (read-value s k))) (recur (ws s (. v i)) (conj acc (. v j))))))))
+
+(defun read-object :private (s: str i: i64) -> JP
+  (loop ((k (ws s i)) (ks []) (vs []))
+    (let ((c (at s k)))
+      (cond (or (< c 0) (= c 125)) (JP (JObj ks vs) (+ k 1))
+            (= c 44) (recur (ws s (+ k 1)) ks vs)
+            (= c 34) (let ((key (read-string s k))
+                           (colon (ws s (. key i)))
+                           (v (read-value s (+ colon 1))))
+                       (recur (ws s (. v i)) (conj ks (. key s)) (conj vs (. v j))))
+            :else (JP (JObj ks vs) (+ k 1))))))
+
+(defun json-parse (s: str) -> J (. (read-value s 0) j))
+
+(defun jget (j: J key: str) -> J
+  (match j
+    ((JObj ks vs) (loop ((i 0)) (cond (>= i (count ks)) JOther (= (nth ks i) key) (nth vs i) :else (recur (+ i 1)))))
+    (_ JOther)))
+
+(defun jtext (j: J) -> str (match j ((JStr s) s) (_ "")))
+(defun jnum (j: J) -> i64 (match j ((JNum n) n) (_ 0)))
+(defun jitems (j: J) -> (Vec J) (match j ((JArr xs) xs) (_ [])))

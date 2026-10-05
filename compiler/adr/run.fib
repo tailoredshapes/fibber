@@ -1,0 +1,157 @@
+;; adr.run: build the program of a set of ADR blocks, run it with a fibc, read its JSON back (docs/design/executable-adrs.md §3). The
+;; program is run by `fibc test` (the JIT) of the executable named by $FIBC (default `fibc` on the PATH); inside `fibc adr` that will be
+;; the running executable. A module that does not compile is attributed to its block, left out, and the rest run again, so one broken
+;; ADR cannot hide the verdicts of the others.
+(ns adr.run
+  (:use fib.core fib.seq fib.coll fib.print fib.string adr.md adr.gen adr.json)
+  (:require [fib.os :as os] [fib.os.native :as n]))
+
+(extern system :private (ptr) -> i32)
+
+;; What running one block came to: scenarios that held and that did not, an error that kept it from running, and a line for each
+;; failure.
+(defstruct BlockOut (tag: str pass: i64 fail: i64 error: str lines: (Vec str)))
+
+(defstruct Opts (root: str jobs: i64 rerun: bool keep: bool))
+
+(defun sh (cmd: str) -> i64
+  (unsafe (let ((p (n/c-text cmd))) (let ((rc (system p))) (do (free p) (sext i64 rc))))))
+
+(defun fibc-path () -> str (unwrap-or (os/getenv "FIBC") "fibc"))
+
+(defun write-text (path: str text: str) -> bool
+  (match (os/write-file-bytes path (str-bytes text)) ((Ok _) true) ((Err _) false)))
+
+;; The units: the executable blocks of the docs, numbered in order within each.
+(defun kind-run? (k: str) -> bool (or (= k "spec") (or (= k "fitness") (= k "measure"))))
+
+(defun executable? (b: Block) -> bool (and (= (. b lang) "fibber") (kind-run? (. b kind))))
+
+(defun units-of (d: Doc) -> (Vec Unit)
+  (let ((bs (filterv executable? (. d blocks))))
+    (mapv (fn (i: i64) (Unit (. d number) (+ i 1) (. (nth bs i) kind) (tag-of (. d number) (+ i 1)) (. d path) (. (nth bs i) line) (. (nth bs i) body)))
+          (range (count bs)))))
+
+;; ---- the program ---------------------------------------------------------------------------------------------------------------
+
+(defun write-program (dir: str us: (Vec Unit)) -> bool
+  (do (os/create-directory (str dir "/adrgen") 493)
+      (and (write-text (str dir "/adr-spec.fib") (main-text us))
+           (every? (fn (u: Unit) (write-text (str dir "/adrgen/" (. u tag) ".fib") (module-text u))) us))))
+
+(defun remove-program :private (dir: str us: (Vec Unit)) -> unit
+  (do (doseq [u us] (os/remove-file (str dir "/adrgen/" (. u tag) ".fib")))
+      (os/remove-file (str dir "/adr-spec.fib")) (os/remove-file (str dir "/out.json")) (os/remove-file (str dir "/err.txt"))
+      (os/remove-directory (str dir "/adrgen")) (os/remove-directory dir) ()))
+
+(defun command (o: Opts dir: str) -> str
+  (str "cd " (. o root) " && " (if (. o rerun) "FIB_ADR_RERUN=1 " "") "FIB_LIB=" (. o root) "/lib " (fibc-path) " test " dir "/adr-spec.fib -I "
+       (. o root) "/compiler -I " (. o root) "/lib -I " dir " --jobs " (. o jobs) " --format json > " dir "/out.json 2> " dir "/err.txt"))
+
+;; ---- reading the verdicts ------------------------------------------------------------------------------------------------------
+
+(defun tag-in :private (id: str) -> str
+  (match (str-find id "/" 0) (nil id) ((some k) (str-slice id 0 k))))
+
+(defun broken-step :private (st: J) -> (Vec str)
+  (if (= (jtext (jget st "status")) "broke")
+      [(str (jtext (jget st "text")) ": expected " (jtext (jget st "expected")) ", got " (jtext (jget st "actual")))]
+      []))
+
+(defun failure-lines :private (r: J) -> (Vec str)
+  (let ((steps (reduce (fn (acc: (Vec str) st: J) (into acc (broken-step st))) [] (jitems (jget r "steps"))))
+        (msg (jtext (jget r "message"))))
+    (mapv (fn (l: str) (str (jtext (jget r "text")) " -> " l)) (if (and (empty? steps) (not (= msg ""))) [msg] (if (empty? steps) ["failed"] steps)))))
+
+(defun block-out :private (tag: str rs: (Vec J)) -> BlockOut
+  (let ((mine (filterv (fn (r: J) (= (tag-in (jtext (jget r "id"))) tag)) rs))
+        (bad (filterv (fn (r: J) (not (= (jtext (jget r "status")) "pass"))) (filterv (fn (r: J) (= (tag-in (jtext (jget r "id"))) tag)) rs))))
+    (BlockOut tag (- (count mine) (count bad)) (count bad) ""
+              (reduce (fn (acc: (Vec str) r: J) (into acc (mapv (fn (l: str) (str (jtext (jget r "status")) ": " l)) (failure-lines r)))) [] bad))))
+
+;; The JSON line of the program's output.
+(defun json-of :private (out: str) -> (Option J)
+  (let ((ls (filterv (fn (l: str) (starts-with? l "{\"schema\"")) (split-lines out))))
+    (if (empty? ls) nil (some (json-parse (nth ls 0))))))
+
+;; ---- compile failures ------------------------------------------------------------------------------------------------------------
+
+(defun ident-end :private (s: str from: i64) -> i64
+  (loop ((i from)) (if (and (< i (str-len s)) (not (= (sext i64 (str-byte-at s i)) 46))) (recur (+ i 1)) i)))
+
+;; The tag of the block a compiler message is about (`.../adrgen/b0001-02.fib:LINE:COL: text`), or "".
+(defun culprit (err: str) -> str
+  (match (str-find err "adrgen/b" 0)
+    (nil "")
+    ((some k) (let ((e (ident-end err (+ k 8)))) (str-slice err (+ k 8 -1) e)))))
+
+;; The message with the module's line turned into the Markdown line (module line L is Markdown line L + fence - 2).
+(defun mapped-message (err: str u: Unit) -> str
+  (let ((line (first-line-after err "rejected:")))
+    (match (str-find line (str (. u tag) ".fib:") 0)
+      (nil line)
+      ((some k) (let ((from (+ k (str-len (. u tag)) 5))
+                      (colon (unwrap-or (str-find line ":" from) (str-len line))))
+                  (str (. u doc) ":" (+ (unwrap-or (parse-long (str-slice line from colon)) 0) (- (. u line) 2)) (str-slice line colon (str-len line))))))))
+
+(defun first-line-after :private (err: str marker: str) -> str
+  (let ((ls (mapv trim (split-lines err))) (k (loop ((i 0)) (cond (>= i (count ls)) -1 (starts-with? (nth ls i) marker) i :else (recur (+ i 1))))))
+    (cond (< k 0) (if (empty? ls) "no output from fibc" (nth ls 0))
+          (< (+ k 1) (count ls)) (nth ls (+ k 1))
+          :else (nth ls k))))
+
+(defun failed-block :private (u: Unit msg: str) -> BlockOut
+  (BlockOut (. u tag) 0 0 (str "does not compile: " msg) []))
+
+;; ---- running -------------------------------------------------------------------------------------------------------------------
+
+(defun scratch (o: Opts) -> (Option str)
+  (match (os/create-temp-directory (str (os/temp-directory) "/fibadr-XXXXXX")) ((Ok d) (some d)) ((Err _) nil)))
+
+(defun without :private (us: (Vec Unit) tag: str) -> (Vec Unit) (filterv (fn (u: Unit) (not (= (. u tag) tag))) us))
+
+(defun unit-of :private (us: (Vec Unit) tag: str) -> (Option Unit)
+  (let ((hit (filterv (fn (u: Unit) (= (. u tag) tag)) us))) (if (empty? hit) nil (some (nth hit 0)))))
+
+;; Runs the units; one BlockOut per unit.
+(defun run-units (o: Opts us: (Vec Unit)) -> (Vec BlockOut)
+  (match (scratch o)
+    (nil (mapv (fn (u: Unit) (failed-block u "no scratch directory")) us))
+    ((some dir) (run-in o dir us us []))))
+
+(defun errored? :private (j: J) -> bool
+  (some? (first (filter (fn (f: J) (= (jtext (jget f "outcome")) "error")) (jitems (jget j "files"))))))
+
+;; `fibc test` reports a spec that does not compile only in its plain format (the JSON says "error"): run it again for the text.
+(defun explain-error :private (o: Opts dir: str) -> str
+  (do (sh (replace-format (command o dir) dir))
+      (unwrap-or (read-file (str dir "/out.json")) "")))
+
+(defun replace-format :private (cmd: str dir: str) -> str
+  (let ((k (unwrap-or (str-find cmd " --format json" 0) (str-len cmd))))
+    (str (str-slice cmd 0 k) " --format plain > " dir "/out.json 2> " dir "/err.txt")))
+
+(defun finish :private (o: Opts dir: str all: (Vec Unit)) -> unit
+  (if (. o keep) (println (str "adr: program kept in " dir)) (remove-program dir all)))
+
+(defun run-in :private (o: Opts dir: str all: (Vec Unit) us: (Vec Unit) dead: (Vec BlockOut)) -> (Vec BlockOut)
+  (if (empty? us)
+      (do (finish o dir all) dead)
+      (do (write-program dir us)
+          (sh (command o dir))
+          (let ((out (unwrap-or (read-file (str dir "/out.json")) "")))
+            (match (json-of out)
+              ((some j)
+               (if (errored? j)
+                   (broken o dir all us dead (explain-error o dir))
+                   (let ((rs (jitems (jget j "results"))))
+                     (do (finish o dir all) (into dead (mapv (fn (u: Unit) (block-out (. u tag) rs)) us))))))
+              (nil (broken o dir all us dead (unwrap-or (read-file (str dir "/err.txt")) ""))))))))
+
+;; The program did not compile or did not run: leave out the block the message is about and run the rest again.
+(defun broken :private (o: Opts dir: str all: (Vec Unit) us: (Vec Unit) dead: (Vec BlockOut) err: str) -> (Vec BlockOut)
+  (let ((bad (culprit err)))
+    (match (unit-of us bad)
+      ((some u) (run-in o dir all (without us bad) (conj dead (failed-block u (mapped-message err u)))))
+      (nil (do (finish o dir all)
+               (into dead (mapv (fn (u: Unit) (BlockOut (. u tag) 0 0 (str "the program did not run (" (fibc-path) "): " (first-line-after err "rejected:")) [])) us)))))))

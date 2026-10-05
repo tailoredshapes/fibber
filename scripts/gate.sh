@@ -66,6 +66,17 @@ while IFS= read -r l; do case $l in ok\ *|FAIL\ *) timings+=("tools $l") ;; esac
 [ "$tools_ok" -eq 1 ] || fail "tools FAILED (log: $GATE_OUT/tools.log)"
 timings+=("tools total $(elapsed "$t0" "$(now)") s")
 
+# The executable ADRs (docs/adr, compiler/adr.fib, docs/design/executable-adrs.md), full gate only: about six seconds (build of the tool, one
+# program for every block). --strict: an accepted ADR with no check that runs is a failure too. Failures are not compared with
+# scripts/ci-stage2.expected: a violated decision is a regression.
+if [ "$mode" = full ]; then
+  t0=$(now)
+  if "$F" build compiler/adr.fib -I compiler -I lib -o "$GATE_OUT/adr" > "$GATE_OUT/adr.log" 2>&1 \
+     && FIBC="$F" FIB_LIB="$root/lib" "$GATE_OUT/adr" --strict >> "$GATE_OUT/adr.log" 2>&1; then
+    timings+=("adr $(grep -E '^[0-9]+ ADRs:' "$GATE_OUT/adr.log" | head -1) $(elapsed "$t0" "$(now)") s")
+  else tail -n 30 "$GATE_OUT/adr.log"; fail "executable ADRs FAILED (log: $GATE_OUT/adr.log)"; timings+=("adr FAILED $(elapsed "$t0" "$(now)") s"); fi
+fi
+
 # The sample of the quick gate: every 10th stdlib case by name (the order of `ls`, bytes), and the expected failures among them, so a
 # sample still shows the harness reporting one. A case is a *.fib or a directory with a main.fib; its name is what `--only` matches.
 sample=

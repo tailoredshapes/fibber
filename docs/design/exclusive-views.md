@@ -417,3 +417,42 @@ the rule "a window is borrowed, never moved".
    include it in P10b or later?
 4. Windows over `(Array a)` and `Vec` as well as tensors (the quicksort of section 8), or tensors only?
 5. Parallel disjoint windows: schedule the `Send` region type after P10b, or leave to the tensor threads package?
+
+## 12. Recorded measures
+
+The claims of section 8 and ADR 0007 (`docs/adr/0007-windows-run-within-1-3x-of-the-array-loop.md`) are checked against the numbers recorded
+here: one line per measurement, **newest last** (the last line of a key is the record that counts; the earlier ones are history). A line is
+`<!-- measure KEY VALUE UNIT DATE | cmd: COMMAND -->`; `fibc adr` reads them, and `adr --rerun` runs the command and compares the fresh value
+(the command prints `measure KEY VALUE`). Ratios are window time over array time (or over the SIMD kernel), medians of the runs of
+`scripts/bench/windows.sh` on the 28-core machine, cache-resident kernels of 1,000 elements.
+
+First record, 2026-10-05, median of 3 runs, taken while another agent's full gate was running on the same machine (loaded; the script
+holds `/tmp/fibsuite.lock` but the gate's own jobs ran outside it):
+
+<!-- measure rmw-window/array 1.43 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 3 -->
+<!-- measure fill-window/array 0.97 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 3 -->
+<!-- measure saxpy-window/array 0.99 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 3 -->
+<!-- measure saxpy-window/simd 1.00 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 3 -->
+<!-- measure tile-window/array 1.83 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 3 -->
+
+Three more records the same evening, each the median of more runs (5, 7, 9), all on the shared machine (other agents' gates and benchmarks were
+queued on the lock around them); the kernels are sub-nanosecond per element, so the ratios move with the machine's state. The 5-run median had
+`fill` at 1.31 and the 7-run median `rmw` at 1.48, both over the limit, both with their other ratios near 1.0; the 9-run median is the newest and
+is the one that counts. **The limit of 1.3 has little margin for these two kernels on a loaded machine** (a finding of ADR 0007, not resolved
+here: a quiet machine, or a larger limit, is the owner's call):
+
+<!-- measure rmw-window/array 1.01 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 5 -->
+<!-- measure fill-window/array 1.31 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 5 -->
+<!-- measure saxpy-window/array 1.02 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 5 -->
+<!-- measure saxpy-window/simd 1.01 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 5 -->
+<!-- measure tile-window/array 1.60 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 5 -->
+<!-- measure rmw-window/array 1.48 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 7 -->
+<!-- measure fill-window/array 0.97 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 7 -->
+<!-- measure saxpy-window/array 1.07 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 7 -->
+<!-- measure saxpy-window/simd 1.04 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 7 -->
+<!-- measure tile-window/array 1.63 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 7 -->
+<!-- measure rmw-window/array 1.15 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 9 -->
+<!-- measure fill-window/array 1.01 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 9 -->
+<!-- measure saxpy-window/array 1.01 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 9 -->
+<!-- measure saxpy-window/simd 0.96 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 9 -->
+<!-- measure tile-window/array 1.78 ratio 2026-10-05 | cmd: FIBC=$FIBC scripts/bench/windows.sh -n 9 -->

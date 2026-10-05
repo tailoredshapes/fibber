@@ -1,0 +1,158 @@
+;; fib.test.arch.scan: a light reader of fibber (and lIR) source for the fitness rules of fib.test.arch (docs/design/executable-adrs.md §4).
+;; It is NOT the compiler's reader: the library cannot depend on compiler/. It reads what the rules need, the nesting of ( [ { with the
+;; lines of each form, and it is checked against the real reader by compiler/tests/adr/reader-agree.fib (same top-level forms and
+;; names on every file of compiler/ and lib/). Comments are dropped; a string is one atom with its quotes; the prefix characters
+;; ' ` ~ @ & ^ and the # of #( #[ #{ #" are skipped, so `~@xs` reads as the atom xs and `#(f %)` as the list (f %).
+(ns fib.test.arch.scan (:use fib.core fib.seq fib.coll fib.print))
+
+;; An atom (a symbol, a number, a keyword, a string with its quotes) at a line, or a sequence with the line it opens and closes on.
+;; `open` is "(" "[" or "{".
+(defenum Node
+  (Atom text: str line: i64)
+  (Seq open: str items: (Vec Node) line: i64 end: i64))
+
+;; A top-level form: its head symbol, its name (the atom after the head, a trailing `:` of a `def` dropped), its first and last line.
+(defstruct Top (head: str name: str line: i64 end: i64 node: Node))
+
+(defstruct Cur (i: i64 line: i64))
+(defstruct Got (items: (Vec Node) cur: Cur))
+(defstruct One (node: Node cur: Cur))
+
+(defun byte-at :private (s: str i: i64) -> i64
+  (if (and (>= i 0) (< i (str-len s))) (sext i64 (str-byte-at s i)) -1000))
+
+(defun space? :private (b: i64) -> bool (or (or (= b 32) (= b 9)) (or (or (= b 10) (= b 13)) (= b 44))))
+(defun opener? :private (b: i64) -> bool (or (= b 40) (or (= b 91) (= b 123))))
+(defun closer? :private (b: i64) -> bool (or (= b 41) (or (= b 93) (= b 125))))
+(defun prefix? :private (b: i64) -> bool (or (or (= b 39) (= b 96)) (or (or (= b 126) (= b 64)) (or (= b 38) (or (= b 94) (= b 35))))))
+(defun delim? :private (b: i64) -> bool (or (or (space? b) (or (opener? b) (closer? b))) (or (= b 59) (= b 34))))
+
+(defun after-line :private (s: str c: Cur) -> Cur
+  (loop ((i (. c i)))
+    (if (or (>= i (str-len s)) (= (byte-at s i) 10)) (Cur i (. c line)) (recur (+ i 1)))))
+
+;; Past whitespace and comments.
+(defun skip-ws :private (s: str c: Cur) -> Cur
+  (loop ((i (. c i)) (ln (. c line)))
+    (let ((b (byte-at s i)))
+      (cond (= b 10) (recur (+ i 1) (+ ln 1))
+            (space? b) (recur (+ i 1) ln)
+            (= b 59) (recur (. (after-line s (Cur i ln)) i) ln)
+            :else (Cur i ln)))))
+
+;; Past a string that starts at c (on its quote): the cursor after the closing quote.
+(defun skip-string :private (s: str c: Cur) -> Cur
+  (loop ((i (+ (. c i) 1)) (ln (. c line)))
+    (let ((b (byte-at s i)))
+      (cond (< b -500) (Cur (min i (str-len s)) ln)
+            (= b 92) (recur (+ i 2) (if (= (byte-at s (+ i 1)) 10) (+ ln 1) ln))
+            (= b 34) (Cur (+ i 1) ln)
+            (= b 10) (recur (+ i 1) (+ ln 1))
+            :else (recur (+ i 1) ln)))))
+
+;; Past the character that starts at i: its lead byte and the continuation bytes of a multi-byte one.
+(defun past-char :private (s: str i: i64) -> i64
+  (loop ((k (min (+ i 1) (str-len s))))
+    (if (and (<= (byte-at s k) -65) (>= (byte-at s k) -128)) (recur (+ k 1)) k)))
+
+;; Past a bare atom: a backslash takes the next byte whatever it is (`\(`).
+(defun skip-atom :private (s: str c: Cur) -> Cur
+  (let ((start (if (= (byte-at s (. c i)) 92) (past-char s (+ (. c i) 1)) (. c i))))
+    (loop ((i start))
+      (if (or (< (byte-at s i) -500) (delim? (byte-at s i))) (Cur i (. c line)) (recur (+ i 1))))))
+
+;; Past the prefix characters before an item. A prefix character on its own (`&`, `@`, `#`) is an atom, so it stays.
+(defun prefix-here? :private (b: i64 n: i64) -> bool
+  (cond (not (prefix? b)) false
+        (= b 35) (or (opener? n) (= n 34))
+        :else (and (> n -500) (and (not (space? n)) (and (not (closer? n)) (not (= n 59)))))))
+
+(defun skip-prefix :private (s: str c: Cur) -> Cur
+  (loop ((i (. c i)))
+    (if (prefix-here? (byte-at s i) (byte-at s (+ i 1))) (recur (+ i 1)) (Cur i (. c line)))))
+
+(defun read-one :private (s: str c: Cur) -> One
+  (let ((p (skip-prefix s c)) (b (byte-at s (. p i))))
+    (cond (opener? b) (read-seq s p)
+          (= b 34) (let ((e (skip-string s p))) (One (Atom (str-slice s (. p i) (. e i)) (. p line)) e))
+          :else (let ((e (skip-atom s p))) (One (Atom (str-slice s (. p i) (. e i)) (. p line)) e)))))
+
+(defun read-seq :private (s: str c: Cur) -> One
+  (let ((open (str-slice s (. c i) (+ (. c i) 1)))
+        (g (read-items s (Cur (+ (. c i) 1) (. c line)))))
+    (let ((end (skip-ws s (. g cur))))
+      (One (Seq open (. g items) (. c line) (. end line))
+           (if (closer? (byte-at s (. end i))) (Cur (+ (. end i) 1) (. end line)) end)))))
+
+;; The items up to a closer or the end of the text (the closer is not consumed).
+(defun read-items :private (s: str c: Cur) -> Got
+  (loop ((cur c) (acc []))
+    (let ((w (skip-ws s cur)) (b (byte-at s (. w i))))
+      (cond (< b -500) (Got acc w)
+            (closer? b) (Got acc w)
+            :else (let ((o (read-one s w))) (recur (. o cur) (conj acc (. o node))))))))
+
+;; The top-level forms of a source text, as nodes (a stray closer at top level is skipped).
+(defun read-nodes (s: str) -> (Vec Node)
+  (loop ((cur (Cur 0 1)) (acc []))
+    (let ((g (read-items s cur)))
+      (if (closer? (byte-at s (. (. g cur) i)))
+          (recur (Cur (+ (. (. g cur) i) 1) (. (. g cur) line)) (into acc (. g items)))
+          (into acc (. g items))))))
+
+(defun node-line (n: Node) -> i64 (match n ((Atom _ l) l) ((Seq _ _ l _) l)))
+(defun node-end (n: Node) -> i64 (match n ((Atom _ l) l) ((Seq _ _ _ e) e)))
+
+;; The text of an atom, or "" for a sequence.
+(defun atom-text (n: Node) -> str (match n ((Atom t _) t) ((Seq _ _ _ _) "")))
+
+(defun items-of (n: Node) -> (Vec Node) (match n ((Atom _ _) []) ((Seq _ is _ _) is)))
+
+(defun strip-colon :private (t: str) -> str
+  (if (and (> (str-len t) 1) (= (byte-at t (- (str-len t) 1)) 58)) (str-slice t 0 (- (str-len t) 1)) t))
+
+(defun top-of :private (n: Node) -> (Option Top)
+  (match n
+    ((Atom _ _) nil)
+    ((Seq open items line end)
+     (if (and (= open "(") (> (count items) 0))
+         (some (Top (atom-text (nth items 0)) (if (> (count items) 1) (strip-colon (atom-text (nth items 1))) "") line end n))
+         nil))))
+
+;; The top-level forms of a text that are lists, with their positions.
+(defun read-tops (s: str) -> (Vec Top)
+  (reduce (fn (acc: (Vec Top) n: Node) (match (top-of n) (nil acc) ((some t) (conj acc t)))) [] (read-nodes s)))
+
+;; Every atom of a node, in order.
+(defun atoms-of (n: Node) -> (Vec Node)
+  (match n
+    ((Atom _ _) [n])
+    ((Seq _ items _ _) (reduce (fn (acc: (Vec Node) x: Node) (into acc (atoms-of x))) [] items))))
+
+(defun string-atom? (n: Node) -> bool
+  (match n ((Atom t _) (= (byte-at t 0) 34)) ((Seq _ _ _ _) false)))
+
+;; The modules a top-level `ns` form names in `:use`, `:require` and `:export-from`, with the line each is named on.
+(defstruct ModRef (name: str line: i64))
+
+(defun key-of :private (n: Node) -> str
+  (match n ((Seq _ items _ _) (if (> (count items) 0) (atom-text (nth items 0)) "")) ((Atom _ _) "")))
+
+(defun module-names :private (n: Node) -> (Vec ModRef)
+  (match n
+    ((Atom t l) (if (or (= (byte-at t 0) 58) (= (byte-at t 0) 34)) [] [(ModRef t l)]))
+    ((Seq open items _ _)
+     (if (= open "[")
+         (if (> (count items) 0) (module-names (nth items 0)) [])
+         []))))
+
+(defun refs-of-clause :private (c: Node) -> (Vec ModRef)
+  (let ((items (items-of c)))
+    (reduce (fn (acc: (Vec ModRef) x: Node) (into acc (module-names x))) [] (drop 1 items))))
+
+(defun ns-refs (t: Top) -> (Vec ModRef)
+  (reduce (fn (acc: (Vec ModRef) c: Node)
+            (let ((k (key-of c)))
+              (if (or (or (= k ":use") (= k ":require")) (= k ":export-from")) (into acc (refs-of-clause c)) acc)))
+          []
+          (drop 2 (items-of (. t node)))))

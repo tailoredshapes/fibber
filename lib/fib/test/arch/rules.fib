@@ -1,0 +1,222 @@
+;; fib.test.arch.rules: fitness rules and measures as fib.test scenarios (docs/design/executable-adrs.md §4, §5). A rule is a function of the
+;; Repo returning Findings; it passes when there are none. Every rule must also SHIP A PLANTED VIOLATION: a change to the Repo (in memory,
+;; never on disk) under which the same rule must report something. A rule with no plant, or whose plant it does not notice, is a failed
+;; scenario: it cannot fail, so it is worth less than no rule (spec/method.md).
+;;   (rule "text" check-expr (plant "path" "text appended") ..)      check-expr sees the Repo as `repo`
+;;   (forbid "text" findings-expr (plant ..))                       the findings are the violations
+;;   (limit "text" measures max allow (plant ..))                    allow: ["key=cap" ..], shrink-only
+;;   (measure "text" :recorded "file.md" :key "k" :under 1.3)       a recorded number against a threshold (§5)
+(ns fib.test.arch.rules
+  (:use fib.core fib.seq fib.coll fib.print fib.string fib.test.core fib.test.arch.repo)
+  (:require [fib.os :as os] [fib.os.native :as n]))
+
+(extern system :private (ptr) -> i32)
+
+;; A change to a file of the Repo: `mode` 0 appends `text` to it, 1 replaces (or creates) it with `text`, 2 removes it.
+(defstruct Plant (path: str text: str mode: i64))
+
+;; A rule: its text, the check, the planted Repos' recipe, why it has none (when it does not), and the check that re-measures
+;; (measures only; the fast check reads the recorded number).
+(defstruct RuleDef (text: str check: (fn :send (Repo) (Vec Finding)) plants: (Vec Plant) why: str remeasure: (Option (fn :send (Repo) (Vec Finding)))))
+
+(defun rule-def (text: str check: (fn :send (Repo) (Vec Finding)) plants: (Vec Plant) why: str) -> RuleDef
+  (RuleDef text check plants why nil))
+
+(defun planted (r: Repo p: Plant) -> Repo
+  (cond (= (. p mode) 1) (plant-file r (. p path) (. p text))
+        (= (. p mode) 2) (plant-remove r (. p path))
+        :else (plant-append r (. p path) (. p text))))
+
+;; ---- reporting -----------------------------------------------------------------------------------------------------------------
+
+(defun shown (fs: (Vec Finding)) -> str
+  (let ((head (mapv finding-text (take 6 fs))))
+    (str (join " | " head) (if (> (count fs) 6) (str " | ... and " (- (count fs) 6) " more") ""))))
+
+(defun step-of (kind: str text: str j: Judged) -> StepRun (StepRun kind text j ""))
+
+(defun held (text: str) -> StepRun (step-of "Then" text Held))
+
+(defun judged-no-findings (fs: (Vec Finding)) -> StepRun
+  (step-of "Then" "no violations" (if (empty? fs) Held (Broke "no violations" (shown fs)))))
+
+(defun plant-step (rd: RuleDef r: Repo p: Plant) -> StepRun
+  (let ((fs ((. rd check) (planted r p))))
+    (step-of "Then" (str "planted violation in " (. p path) " is reported")
+             (if (empty? fs) (Broke "the rule to report the planted violation" "nothing: the rule cannot fail here (vacuous)") Held))))
+
+(defun plant-steps (rd: RuleDef r: Repo) -> (Vec StepRun)
+  (cond (> (count (. rd plants)) 0) (mapv (fn (p: Plant) (plant-step rd r p)) (. rd plants))
+        (not (= (. rd why) "")) [(step-of "Given" (str "no planted violation: " (. rd why)) Held)]
+        :else [(step-of "Then" "the rule ships a planted violation" (Broke "(plant ..) or (no-plant \"why\")" "neither: a rule that was never shown to fail"))]))
+
+(defun rerun? () -> bool (some? (os/getenv "FIB_ADR_RERUN")))
+
+(defun run-rule (rd: RuleDef r: Repo) -> (Vec StepRun)
+  (match (. rd remeasure)
+    ((some again)
+     (if (rerun?)
+         (let ((fs (again r)))
+           (into (mapv (fn (f: Finding) (step-of "Given" (finding-text f) Held)) (filterv note? fs))
+                 [(judged-no-findings (filterv (fn (f: Finding) (not (note? f))) fs))]))
+         (into [(judged-no-findings ((. rd check) r))] (plant-steps rd r))))
+    (nil (into [(judged-no-findings ((. rd check) r))] (plant-steps rd r)))))
+
+(defun rule-scenario (rd: RuleDef r: Repo) -> Scenario
+  (Scenario (slugify (. rd text)) (. rd text) [] ["Then no violations"] (fn (seed: i64) (run-rule rd r)) ""))
+
+;; The same suites with each scenario's id prefixed by `tag/` (adr.gen: which block of which ADR a scenario belongs to).
+(defun retag (tag: str ss: (Vec Suite)) -> (Vec Suite)
+  (mapv (fn (s: Suite)
+          (Suite (. s head) (. s impl)
+                 (mapv (fn (sc: Scenario) (Scenario (str tag "/" (. sc id)) (. sc text) (. sc covers) (. sc steps) (. sc run) (. sc at))) (. s scenarios))))
+        ss))
+
+;; The suite of the rules of one block of an ADR, against the Repo.
+(defun arch-suite (head: str r: Repo rules: (Vec RuleDef)) -> Suite
+  (feature-suite head (mapv (fn (rd: RuleDef) (rule-scenario rd r)) rules)))
+
+;; ---- limits with a shrink-only allow-list ---------------------------------------------------------------------------------------
+
+(defstruct Allowed (key: str cap: i64))
+
+(defun last-eq :private (s: str) -> i64
+  (loop ((i (- (str-len s) 1)))
+    (cond (< i 0) -1
+          (= (sext i64 (str-byte-at s i)) 61) i
+          :else (recur (- i 1)))))
+
+(defun allowed-of (e: str) -> Allowed
+  (let ((k (last-eq e)))
+    (if (< k 0) (Allowed e 0) (Allowed (str-slice e 0 k) (unwrap-or (parse-long (str-slice e (+ k 1) (str-len e))) 0)))))
+
+(defun cap-of (as: (Vec Allowed) key: str) -> (Option i64)
+  (let ((hit (filterv (fn (a: Allowed) (= (. a key) key)) as)))
+    (if (empty? hit) nil (some (. (nth hit 0) cap)))))
+
+(defun limit-finding :private (m: Measure max: i64 as: (Vec Allowed)) -> (Vec Finding)
+  (cond (<= (. m value) max) []
+        :else (match (cap-of as (. m key))
+                (nil [(Finding (. m file) (. m line) (str (. m key) " is " (. m value) ", the limit is " max))])
+                ((some cap) (cond (> (. m value) cap) [(Finding (. m file) (. m line) (str (. m key) " grew to " (. m value) " (allowed " cap "): the allow-list only shrinks"))]
+                                  (< (. m value) cap) [(Finding "allow-list" 0 (str (. m key) " is down to " (. m value) ": lower its cap from " cap))]
+                                  :else [])))))
+
+(defun stale-finding :private (ms: (Vec Measure) max: i64 a: Allowed) -> (Vec Finding)
+  (let ((hit (filterv (fn (m: Measure) (= (. m key) (. a key))) ms)))
+    (if (or (empty? hit) (<= (. (nth hit 0) value) max))
+        [(Finding "allow-list" 0 (str (. a key) " is within the limit or gone: remove it from the allow-list"))]
+        [])))
+
+;; The measures over `max`, except those the allow-list names with a cap (`key=cap`), which may not grow, must be lowered when they
+;; shrink, and are removed when they no longer exceed the limit.
+(defun over-limit (ms: (Vec Measure) max: i64 allow: (Vec str)) -> (Vec Finding)
+  (let ((as (mapv allowed-of allow)))
+    (into (reduce (fn (acc: (Vec Finding) m: Measure) (into acc (limit-finding m max as))) [] ms)
+          (reduce (fn (acc: (Vec Finding) a: Allowed) (into acc (stale-finding ms max a))) [] as))))
+
+;; ---- measures: a recorded number against a threshold ---------------------------------------------------------------------------
+
+;; A record is one line of the recorded file:   <!-- measure KEY VALUE UNIT DATE | cmd: COMMAND -->
+;; the command prints a line `measure KEY VALUE` among its output (scripts/bench/windows.sh does).
+(defstruct Recorded (value: f64 text: str line: i64 cmd: str))
+
+(defun digit :private (b: i64) -> bool (and (>= b 48) (<= b 57)))
+
+;; A decimal (-12, 1.25) as f64.
+(defun parse-decimal (s: str) -> (Option f64)
+  (loop ((i (if (starts-with? s "-") 1 0)) (m 0) (k 0) (dot false))
+    (if (>= i (str-len s))
+        (if (and (> (str-len s) 0) (> i (if (starts-with? s "-") 1 0)))
+            (some (let ((v (/ (sitofp f64 m) (pow10 k)))) (if (starts-with? s "-") (- 0.0 v) v)))
+            nil)
+        (let ((b (sext i64 (str-byte-at s i))))
+          (cond (digit b) (recur (+ i 1) (+ (* m 10) (- b 48)) (if dot (+ k 1) k) dot)
+                (and (= b 46) (not dot)) (recur (+ i 1) m k true)
+                :else nil)))))
+
+(defun pow10 :private (k: i64) -> f64
+  (loop ((i 0) (v 1.0)) (if (< i k) (recur (+ i 1) (* v 10.0)) v)))
+
+(defun token-end :private (s: str from: i64) -> i64
+  (match (str-find s " " from) (nil (str-len s)) ((some k) k)))
+
+(defun record-of :private (key: str n: NumLine) -> (Option Recorded)
+  (let ((pre (str "<!-- measure " key " ")))
+    (if (starts-with? (. n text) pre)
+        (let ((from (str-len pre))
+              (e (token-end (. n text) from))
+              (cmd (match (str-find (. n text) "cmd: " 0)
+                     (nil "")
+                     ((some c) (let ((rest (str-slice (. n text) (+ c 5) (str-len (. n text)))))
+                                 (if (ends-with? rest " -->") (str-slice rest 0 (- (str-len rest) 4)) rest))))))
+          (match (parse-decimal (str-slice (. n text) from e))
+            (nil nil)
+            ((some v) (some (Recorded v (str-slice (. n text) from e) (. n n) cmd)))))
+        nil)))
+
+(defun find-record (r: Repo path: str key: str) -> (Option Recorded)
+  (match (file-text r path)
+    (nil nil)
+    ((some t) (let ((hits (reduce (fn (acc: (Vec Recorded) n: NumLine) (match (record-of key n) (nil acc) ((some x) (conj acc x)))) [] (numbered t))))
+                (if (empty? hits) nil (some (nth hits (- (count hits) 1))))))))
+
+(defun judge-value :private (path: str line: i64 key: str v: f64 under: f64 has-under: bool over: f64 has-over: bool) -> (Vec Finding)
+  (cond (and has-under (not (< v under))) [(Finding path line (str key " = " v ", it must be under " under))]
+        (and has-over (not (> v over))) [(Finding path line (str key " = " v ", it must be over " over))]
+        :else []))
+
+(defun recorded-check (r: Repo path: str key: str under: f64 has-under: bool over: f64 has-over: bool) -> (Vec Finding)
+  (match (find-record r path key)
+    (nil [(Finding path 0 (str "no record of " key ": a line <!-- measure " key " VALUE UNIT DATE | cmd: COMMAND -->"))])
+    ((some rec) (judge-value path (. rec line) key (. rec value) under has-under over has-over))))
+
+;; ---- --rerun: the quoted command, run again --------------------------------------------------------------------------------------
+
+(defun shell (cmd: str out: str) -> i64
+  (unsafe (let ((p (n/c-text (str "(" cmd ") > " out " 2>&1")))) (let ((rc (system p))) (do (free p) (sext i64 rc))))))
+
+(defun measured-in :private (key: str output: str) -> (Option f64)
+  (let ((hits (filterv (fn (n: NumLine) (starts-with? (. n text) (str "measure " key " "))) (numbered output))))
+    (if (empty? hits) nil (parse-decimal (trim (str-slice (. (nth hits (- (count hits) 1)) text) (+ 9 (str-len key)) (str-len (. (nth hits (- (count hits) 1)) text))))))))
+
+(defun rerun-check (r: Repo path: str key: str under: f64 has-under: bool over: f64 has-over: bool) -> (Vec Finding)
+  (match (find-record r path key)
+    (nil [(Finding path 0 (str "no record of " key))])
+    ((some rec)
+     (match (os/create-temp-directory (str (os/temp-directory) "/adr-rerun-XXXXXX"))
+       ((Err _) [(Finding path (. rec line) "cannot make a scratch directory for the command")])
+       ((Ok dir) (rerun-in r dir path key rec under has-under over has-over))))))
+
+(defun rerun-in :private (r: Repo dir: str path: str key: str rec: Recorded under: f64 has-under: bool over: f64 has-over: bool) -> (Vec Finding)
+  (let ((out (str dir "/out.txt"))
+        (rc (shell (. rec cmd) out))
+        (text (unwrap-or (read-file out) "")))
+    (do (os/remove-file out) (os/remove-directory dir)
+        (match (measured-in key text)
+          (nil [(Finding path (. rec line) (str "the command (exit " rc ") printed no `measure " key " VALUE` line: " (. rec cmd)))])
+          ((some v) (into [(Finding path (. rec line) (str "re-measured " key " = " v " (recorded " (. rec text) ")"))]
+                          (judge-value path (. rec line) key v under has-under over has-over)))))))
+
+(defun note? :private (f: Finding) -> bool (starts-with? (. f text) "re-measured "))
+
+(defun measure-def (text: str path: str key: str under: f64 has-under: bool over: f64 has-over: bool) -> RuleDef
+  (RuleDef text
+           (fn (r: Repo) (recorded-check r path key under has-under over has-over))
+           [(Plant path (str "\n<!-- measure " key " " (if has-under (str (+ (* under 2.0) 1.0)) "0") " ratio plant | cmd: none -->\n") 0)]
+           ""
+           (some (fn (r: Repo) (rerun-check r path key under has-under over has-over)))))
+
+;; ---- allow-lists for findings ----------------------------------------------------------------------------------------------------
+
+(defun first-word :private (t: str) -> str
+  (match (str-find t " " 0) (nil t) ((some k) (str-slice t 0 k))))
+
+(defun finding-key :private (f: Finding) -> str (str (. f file) ":" (first-word (. f text))))
+
+;; The findings except those the allow-list names (`file:name`, the file and the first word of the finding's text); an entry that
+;; no longer matches a finding is itself a finding, so the list can only shrink.
+(defun allowing (fs: (Vec Finding) allow: (Vec str)) -> (Vec Finding)
+  (into (filterv (fn (f: Finding) (not (member? allow (finding-key f)))) fs)
+        (mapv (fn (a: str) (Finding "allow-list" 0 (str a " no longer matches a finding: remove it")))
+              (filterv (fn (a: str) (not (member? (mapv finding-key fs) a))) allow))))
