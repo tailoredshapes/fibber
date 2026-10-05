@@ -1,0 +1,76 @@
+;; compiler/tests/gen/unit-gen-pipelines.fib: the tests of crates/fibgen/src/gen/pipelines/tests.rs (seed-1) that need no interpreter and no coverage table, ported:
+;; same seed same program and different seeds differ; the model evaluates every generated pipeline (only the two traps a pipeline makes); `main` is an i64 and the
+;; text names the facades; a function always uses its argument; a threaded pipeline is written threaded. (The interpreter-agreement and faulty-library tests need
+;; fibref and the library copy; the coverage test needs package V.) Returns the number of failed checks (0 = pass). Build and run with unit.sh.
+(ns main
+  (:use gen.ty gen.ast gen.pipelines gen.print gen.model.value gen.model gen.model.expected tests.gen.check)
+  (:require [fib.string :as s]))
+
+(defun size-of (seed: i64) -> i64 (+ 1 (rem (- seed 1) 6)))
+(defun prog (seed: i64) -> FgProgram (pipelines-generate seed (size-of seed)))
+(defun seeds (n: i64) -> (Vec i64) (mapv (fn (i: i64) (+ i 1)) (range n)))
+
+(defun find-pipe (e: FgExpr) -> (Option FgPipe)
+  (match (. e kind)
+    ((EkPipe p) (some p))
+    (_ (first (keep find-pipe (expr-children e))))))
+
+(defun pipe-of (p: FgProgram) -> FgPipe
+  (match (find-pipe (. p main)) ((some q) q) (nil (trap "the program holds no pipeline"))))
+
+(defun t-determinism () -> i64
+  (let ((a (print-program (pipelines-generate 42 4)))
+        (b (print-program (pipelines-generate 42 4)))
+        (texts (into #{} (mapv (fn (sd: i64) (print-program (prog sd))) (seeds 40)))))
+    (+ (check-text "same seed, same program" a b)
+       (check-int "forty seeds, forty programs" (count texts) 40))))
+
+(defun trap-kind :private (r: (Result i64 FgModelError)) -> i64
+  (match r
+    ((Ok n) 0)
+    ((Err e) (match e
+               ((MeTrap m) (if (or (= m "nth: index out of range") (= m "reduce: empty collection")) 1 -1000))
+               (_ -1000)))))
+
+(defun t-model-evaluates () -> i64
+  (let ((traps (reduce + 0 (mapv (fn (sd: i64) (trap-kind (model-expected (prog sd)))) (seeds 300)))))
+    ;; `nth` past the end and `reduce` of nothing are the only traps a pipeline makes
+    (check-bool (str "the model evaluates every pipeline (" traps " traps in 300 programs)") (and (> traps 0) (< traps 80)) true)))
+
+(defun t-main-and-facades () -> i64
+  (reduce + 0 (mapv (fn (sd: i64)
+                      (let ((p (prog sd)) (text (print-program (prog sd))))
+                        (+ (check-bool (str "seed " sd ": main is i64") (= (. (. p main) ty) YInt) true)
+                           (check-bool (str "seed " sd ": uses the library") (program-uses-library? p) true)
+                           (check-bool (str "seed " sd ": facades") (s/starts-with? text "(ns main (:use fib.core fib.seq fib.coll fib.print))") true)
+                           (check-bool (str "seed " sd ": main") (s/includes? text "(defun main () -> i64") true))))
+                    (seeds 30))))
+
+(defun uses-x? (f: FgExpr) -> bool (expr-any? f (fn (n: FgExpr) (match (. n kind) ((EkVar v) (= v "x")) (_ false)))))
+
+(defun stage-fn-uses-x :private (st: FgStage) -> bool
+  (match st
+    ((SgMap f) (uses-x? f)) ((SgFilter f) (uses-x? f)) ((SgRemove f) (uses-x? f)) ((SgTakeWhile f) (uses-x? f))
+    (_ true)))
+
+(defun t-uses-argument () -> i64
+  (reduce + 0 (mapv (fn (sd: i64)
+                      (check-bool (str "seed " sd ": every function uses its argument")
+                                  (every? stage-fn-uses-x (. (. (pipe-of (prog sd)) chain) stages)) true))
+                    (seeds 300))))
+
+(defun threaded? (sh: FgShape) -> bool (match sh ((ShThread) true) (_ false)))
+
+(defun t-threaded () -> i64
+  (let ((per (mapv (fn (sd: i64)
+                     (let ((p (pipe-of (prog sd)))
+                           (wants (and (threaded? (. p shape)) (= (vec-count (. p terms)) 1)))
+                           (text (print-program (prog sd))))
+                       [(check-bool (str "seed " sd ": ->> iff threaded") (s/includes? text "(->>") wants) (if wants 1 0)]))
+                   (seeds 300))))
+    (+ (reduce + 0 (mapv (fn (r: (Vec i64)) (vec-nth r 0)) per))
+       (check-bool "more than 30 of 300 are threaded" (> (reduce + 0 (mapv (fn (r: (Vec i64)) (vec-nth r 1)) per)) 30) true))))
+
+(defun main () -> i64
+  (let ((failed (+ (t-determinism) (t-model-evaluates) (t-main-and-facades) (t-uses-argument) (t-threaded))))
+    (do (println (if (= failed 0) "ok" (str "FAILED " failed))) failed)))

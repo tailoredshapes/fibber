@@ -1,0 +1,58 @@
+;; compiler/tests/gen/check.fib: what the unit tests of the fibgen port share: a check that prints FAIL and counts, and builders for small programs
+;; (crates/fibgen/src/pipe/fixtures.rs of seed-1: lambdas over `x`, literal vectors, counting programs). A unit test file returns the number of failed checks.
+(ns tests.gen.check
+  (:use gen.ty gen.ast gen.model.value gen.model gen.model.expected))
+
+;; Prints `FAIL name: got X, want Y` and returns 1 when the two texts differ; 0 when they agree.
+(defun check-text (name: str got: str want: str) -> i64
+  (if (= got want)
+      0
+      (do (println (str "FAIL " name ": got " got ", want " want)) 1)))
+
+(defun check-int (name: str got: i64 want: i64) -> i64 (check-text name (str got) (str want)))
+(defun check-bool (name: str got: bool want: bool) -> i64 (check-text name (str got) (str want)))
+
+;; The Rust Debug text of the model's answer: Ok(5), Err(Trap("..")).
+(defun result-text (r: (Result i64 FgModelError)) -> str
+  (match r
+    ((Ok n) (str "Ok(" n ")"))
+    ((Err e) (match e
+               ((MeTrap msg) (str "Err(Trap(" msg "))"))
+               ((MeUnsupported msg) (str "Err(Unsupported(" msg "))"))
+               ((MeBudget) "Err(Budget)")))))
+
+(defun check-model (name: str p: FgProgram want: str) -> i64 (check-text name (result-text (model-expected p)) want))
+
+;; ---- builders
+(defun fx-x () -> FgExpr (expr-var "x" YInt))
+(defun fx-a () -> FgExpr (expr-var "a" YInt))
+(defun fx-n (v: i64) -> FgExpr (expr-int v))
+(defun fx-op (h: str l: FgExpr r: FgExpr) -> FgExpr (expr-call YInt h [l r]))
+(defun fx-cmp (h: str l: FgExpr r: FgExpr) -> FgExpr (expr-call YBool h [l r]))
+(defun fx-func (params: (Vec str) ret: FgTy body: FgExpr) -> FgExpr
+  (expr-new (YFunc (mapv (fn (p: str) YInt) params) ret) (EkFn (mapv (fn (p: str) (FgNameTy p YInt)) params) body)))
+(defun fx-lam (body: FgExpr) -> FgExpr (fx-func ["x"] YInt body))
+(defun fx-plam (body: FgExpr) -> FgExpr (fx-func ["x"] YBool body))
+(defun fx-vec-of (items: (Vec FgExpr)) -> FgExpr (expr-new (YVec YInt) (EkVecLit items)))
+(defun fx-vlam (items: (Vec FgExpr)) -> FgExpr (fx-func ["x"] (YVec YInt) (fx-vec-of items)))
+(defun fx-step (body: FgExpr) -> FgExpr (fx-func ["a" "x"] YInt body))
+(defun fx-vecs (items: (Vec i64)) -> FgExpr (fx-vec-of (mapv fx-n items)))
+(defun fx-src (items: (Vec i64)) -> FgSrc (SrVec (fx-vecs items)))
+(defun fx-cells () -> FgExpr (expr-var "calls" (YCell YInt)))
+;; `body` after `(set! calls (+ @calls w))`.
+(defun fx-counted (w: i64 body: FgExpr) -> FgExpr
+  (let ((read (expr-new YInt (EkDeref (fx-cells))))
+        (set (expr-new YUnit (EkSet (fx-cells) (fx-op "+" read (fx-n w))))))
+    (expr-new (. body ty) (EkDo [set body]))))
+(defun fx-pipe (items: (Vec i64) stages: (Vec FgStage) term: FgTerm shape: FgShape) -> FgPipe
+  (FgPipe (FgChain (fx-src items) stages) [term] shape))
+(defun fx-program (main: FgExpr) -> FgProgram (FgProgram [] [] [] main))
+(defun fx-pipe-program (p: FgPipe) -> FgProgram (fx-program (expr-new YInt (EkPipe p))))
+;; A program that binds the call counter and returns the pipeline's answer times 1000 plus the calls.
+(defun fx-counting (p: FgPipe) -> FgProgram
+  (let ((pipe (expr-new YInt (EkPipe p)))
+        (calls (expr-new YInt (EkDeref (fx-cells))))
+        (both (fx-op "+" (fx-op "*" (expr-var "r" YInt) (fx-n 1000)) calls))
+        (inner (expr-new YInt (EkLet [(FgBind (GpBind "r") pipe)] both)))
+        (cell (expr-call (YCell YInt) "cell" [(fx-n 0)])))
+    (fx-program (expr-new YInt (EkLet [(FgBind (GpBind "calls") cell)] inner)))))

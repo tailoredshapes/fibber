@@ -1,0 +1,94 @@
+;; compiler/tests/gen/unit-types.fib: the unit tests of crates/fibgen/src/{ty.rs, gen/ctx.rs, ast.rs, pipe/tests.rs} (seed-1), ported: type text, `send_follows_types_5_1`,
+;; `cell_reach_is_conservative_for_closures`, the `&` and region rules of Ctx, `shadowing_replaces_the_older_binding`, `children_skip_inout_arguments`, and the
+;; pipeline's two accessors giving one order. Also the universe's size and the macro table. Returns the number of failed checks (0 = pass). Build and run with unit.sh.
+(ns main
+  (:use gen.ty gen.ctx gen.ast tests.gen.check))
+
+(defun t-ty-text () -> i64
+  (+ (check-text "cell of vec" (ty-text (YCell (YVec YInt))) "(Cell (Vec i64))")
+     (check-text "box of fn" (ty-text (YBoxed (ty-fn-i))) "(Box (fn (i64) i64))")
+     (check-text "dyn send" (ty-text (YDyn PrScore true)) "(dyn Score :send)")
+     (check-text "dyn local" (ty-text (YDyn PrRank false)) "(dyn Rank)")
+     (check-text "vec of hook local" (ty-text (YVec (YHook false))) "(Vec (Hook :local))")
+     (check-text "fn 0" (ty-text (ty-fn-0)) "(fn () i64)")
+     (check-text "number" (ty-text (YNum NmF32)) "f32")
+     (check-bool "Rank entails Score, not the reverse" (and (proto-entails? PrRank PrScore) (not (proto-entails? PrScore PrRank))) true)))
+
+(defun t-send () -> i64
+  (+ (check-bool "vec of Wrap" (ty-send? (YVec YWrap)) true)
+     (check-bool "atom of int" (ty-send? (YAtom YInt)) true)
+     (check-bool "cell of int" (ty-send? (YCell YInt)) false)
+     (check-bool "Holder" (ty-send? YHolder) false)
+     (check-bool "box of fn" (ty-send? (YBoxed (ty-fn-i))) false)
+     (check-bool "vec of dyn send" (ty-send? (YVec (YDyn PrScore true))) true)
+     (check-bool "dyn rank local" (ty-send? (YDyn PrRank false)) false)
+     (check-bool "hook send" (ty-send? (YHook true)) true)
+     (check-bool "hook local" (ty-send? (YHook false)) false)
+     (check-bool "job send" (ty-send? (YJob true)) true)
+     (check-bool "job local" (ty-send? (YJob false)) false)
+     (check-bool "weak of dyn send" (ty-send? (YWeak (YDyn PrScore true))) true)
+     (check-bool "atom of dyn rank needs protocols" (ty-needs-protocols? (YAtom (YDyn PrRank true))) true)))
+
+(defun t-reach () -> i64
+  (+ (check-bool "vec of fn reaches a cell" (ty-may-reach-cell? (YVec (ty-fn-i))) true)
+     (check-bool "vec of Wrap does not" (ty-may-reach-cell? (YVec YWrap)) false)
+     (check-bool "weak of Wrap does not" (ty-may-reach-cell? (YWeak YWrap)) false)
+     (check-bool "an int is not an object" (ty-object? YInt) false)
+     (check-bool "a str is an object" (ty-object? YStr) true)
+     (check-bool "universe size" (= (vec-count (ty-universe)) 43) true)))
+
+(defun t-ctx-inout () -> i64
+  (let ((c (ctx-top [(var-new "v" YInt VkInOut)] false)))
+    (+ (check-int "an & parameter is not a value" (vec-count (ctx-vars-of c YInt)) 0)
+       (check-int "but it is a cell argument" (vec-count (ctx-cell-args c YInt)) 1)
+       (check-int "not in an escaping closure" (vec-count (ctx-cell-args (ctx-for-closure c true) YInt)) 0))))
+
+(defun t-ctx-region () -> i64
+  (let ((c (ctx-top [(var-new "c" (YCell YInt) VkLet) (var-new "a" (YAtom YInt) VkLet) (var-new "s" YStr VkLet)] false)))
+    (+ (check-int "a task drops cells and atoms" (vec-count (. (ctx-for-region c RgTask true) vars)) 1)
+       (check-int "a pool keeps atoms" (vec-count (. (ctx-for-region c RgPool false) vars)) 2))))
+
+(defun t-ctx-shadow () -> i64
+  (let ((c (ctx-with (ctx-top [(var-new "x" YInt VkLet)] false) (var-new "x" YStr VkLet))))
+    (+ (check-int "shadowing replaces" (vec-count (. c vars)) 1)
+       (check-int "the old type is gone" (vec-count (ctx-vars-of c YInt)) 0))))
+
+(defun t-children-inout () -> i64
+  (let ((e (expr-new YUnit (EkCall "f" [(ArInOut "x") (ArVal (expr-int 1))]))))
+    (+ (check-int "children skip & arguments" (vec-count (expr-children e)) 1)
+       (check-int "size" (expr-size e) 2))))
+
+(defun full-pipe () -> FgPipe
+  (let ((lazy (FgChain (fx-src [7]) [(SgMap (fx-lam (fx-x)))]))
+        (stages [(SgMap (fx-lam (fx-x))) (SgTake (fx-n 2)) (SgConcat (OpLazy lazy) true) (SgFilter (fx-plam (fx-cmp "<" (fx-x) (fx-n 5))))]))
+    (fx-pipe [1 2 3] stages (TmEvery (fx-plam (fx-cmp "<" (fx-x) (fx-n 9)))) ShThread)))
+
+(defun int-of-expr (e: FgExpr) -> i64 (match (. e kind) ((EkInt v) v) (_ -1)))
+
+(defun t-pipe-accessors () -> i64
+  (let ((p (full-pipe))
+        (es (pipe-exprs (full-pipe)))
+        (p2 (pipe-with-exprs p (mapv expr-int (range (vec-count es)))))
+        (node (expr-new YInt (EkPipe p))))
+    ;; source, map, take, the operand's source and map, filter, every?
+    (+ (check-int "seven expressions" (vec-count es) 7)
+       (check-text "replaced in one order" (str (mapv int-of-expr (pipe-exprs p2))) "[0 1 2 3 4 5 6]")
+       (check-int "a pipeline node has its parts as children" (vec-count (expr-children node)) 7)
+       (check-int "size counts them" (expr-size node) (+ 1 (reduce + 0 (mapv expr-size (expr-children node)))))
+       (check-text "with-children keeps the tree" (str (expr-size (expr-with-children node (expr-children node)))) (str (expr-size node))))))
+
+(defun t-with-children () -> i64
+  (let ((e (expr-new YInt (EkLet [(FgBind (GpBind "a") (expr-int 1)) (FgBind GpWild (expr-int 2))]
+                                 (expr-new YInt (EkIf (expr-new YBool (EkBool true)) (expr-int 3) (expr-int 4))))))
+        (kids [(expr-int 10) (expr-int 20) (expr-int 30)]))
+    (+ (check-int "let has two inits and a body" (vec-count (expr-children e)) 3)
+       (check-text "children replaced in order" (str (mapv int-of-expr (expr-children (expr-with-children e kids)))) "[10 20 30]"))))
+
+(defun t-macros () -> i64
+  (+ (check-int "seven macros" (vec-count (mac-all)) 7)
+     (check-text "macro name" (mac-name McSwapSub) "swap-sub")))
+
+(defun main () -> i64
+  (let ((failed (+ (t-ty-text) (t-send) (t-reach) (t-ctx-inout) (t-ctx-region) (t-ctx-shadow) (t-children-inout) (t-pipe-accessors)
+                   (t-with-children) (t-macros))))
+    (do (println (if (= failed 0) "ok" (str "FAILED " failed))) failed)))

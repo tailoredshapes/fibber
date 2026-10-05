@@ -1,7 +1,7 @@
 ;; compiler/gen/model/builtins.fib: port of crates/fibgen/src/model/builtins.rs and arrays.rs: the builtins, constructors and prelude functions the generator calls, and arrays with derived Eq/Ord.
 ;;  OWNER: see design section 5.
 ;; FIRST SLICE: the integer arithmetic with the Rust trap texts (`+ - * rem`), the comparisons of integers and booleans, `not`, `list`, `cell`, `count`, `nth`, `conj`, `range`, `vec`,
-;; `some`, `unwrap-or`, `inc1`, `deref`: what the pipeline programs call. Any other name answers `StUnsupported` (M1 and the other packages add theirs).
+;; `push!`: what the pipeline programs call. Any other name answers `StUnsupported` (M1 and the other packages add theirs).
 (ns gen.model.builtins
   (:use gen.ty gen.ast gen.model.value gen.model))
 
@@ -52,6 +52,12 @@
 (defun builtins-items :private (v: FgV) -> (Option (Vec FgV))
   (match v ((VlVector xs) (some xs)) ((VlList xs) (some xs)) (_ nil)))
 
+(defun builtins-conj :private (c: FgV x: FgV) -> (Result FgV FgStop)
+  (match c
+    ((VlVector xs) (Ok (VlVector (conj xs x))))
+    ((VlList xs) (Ok (VlList (vec (concat [x] xs)))))
+    (_ (Err (StUnsupported "conj")))))
+
 (defun builtins-collection :private (m: FgMachine h: str a: (Vec FgV)) -> (Result FgV FgStop)
   (cond (and (= h "count") (= (vec-count a) 1))
         (match (builtins-items (vec-nth a 0))
@@ -67,6 +73,11 @@
         (match (vec-nth a 0)
           ((VlInt n) (try-let [u (machine-alloc m (max n 0))] (Ok (VlVector (mapv (fn (i: i64) (VlInt i)) (range (max n 0)))))))
           (_ (Err (StUnsupported "range"))))
+        (and (= h "conj") (= (vec-count a) 2)) (builtins-conj (vec-nth a 0) (vec-nth a 1))
+        (and (= h "push!") (= (vec-count a) 2))
+        (match (vec-nth a 0)
+          ((VlCell c) (try-let [v (builtins-conj @c (vec-nth a 1))] (do (set! c v) (Ok VlUnit))))
+          (_ (Err (StUnsupported "push! on a value that is not a cell"))))
         (and (= h "vec") (= (vec-count a) 1))
         (match (vec-nth a 0) ((VlVector xs) (Ok (vec-nth a 0))) (_ (Err (StUnsupported "vec"))))
         :else (Err (StUnsupported (str "builtin " h)))))

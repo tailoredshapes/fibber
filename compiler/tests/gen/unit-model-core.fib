@@ -1,0 +1,65 @@
+;; compiler/tests/gen/unit-model-core.fib: the tests of crates/fibgen/src/model/tests.rs (seed-1) that the first slice of the model can run, ported: a later write-back wins,
+;; a read after an `&` call sees the write-back, overflow and rem by zero trap with the Rust texts; and the new bound of decision 3 (the object limit: `Err(Budget)`,
+;; not a 2.3 GB allocation). The tests of loop/recur and weak references wait for the packages that implement them (the model answers StUnsupported).
+;; Returns the number of failed checks (0 = pass). Build and run with unit.sh.
+(ns main
+  (:use gen.ty gen.ast gen.model.value gen.model gen.model.expected tests.gen.check))
+
+(defun vt () -> FgTy (YVec YInt))
+(defun let1 (name: str init: FgExpr body: FgExpr) -> FgExpr
+  (expr-new (. body ty) (EkLet [(FgBind (GpBind name) init)] body)))
+(defun push-call (arg: FgArg x: i64) -> FgExpr (expr-new YUnit (EkCall "push!" [arg (ArVal (expr-int x))])))
+(defun inout-call (h: str cells: (Vec str)) -> FgExpr (expr-new YUnit (EkCall h (mapv (fn (c: str) (ArInOut c)) cells))))
+(defun deref-of (name: str) -> FgExpr (expr-new (vt) (EkDeref (expr-var name (YCell (vt))))))
+(defun param (n: str) -> FgParam (FgParam n (vt) true))
+(defun prog-of (funs: (Vec FgFun) main: FgExpr) -> FgProgram (FgProgram [] [] funs main))
+
+;; `(defun bar (&a &b) (do (push! &a 1) (push! &b 2)))`.
+(defun bar () -> FgFun
+  (FgFun "bar" [(param "a") (param "b")] YUnit (expr-new YUnit (EkDo [(push-call (ArInOut "a") 1) (push-call (ArInOut "b") 2)]))))
+
+(defun t-write-back () -> i64
+  (let ((cell (expr-call (YCell (vt)) "cell" [(fx-vecs [3 4])]))
+        (nth (expr-call YInt "nth" [(deref-of "x") (expr-int 2)]))
+        (body (expr-new YInt (EkDo [(inout-call "bar" ["x" "y"]) nth])))
+        (main (let1 "x" cell (let1 "y" (expr-var "x" (YCell (vt))) body))))
+    ;; x and y are one cell: bar pushes 1 on a copy and 2 on a copy; the later write-back wins, so the vector is [3 4 2]
+    (check-model "later write-back wins" (prog-of [(bar)] main) "Ok(2)")))
+
+(defun t-read-after-call () -> i64
+  (let ((f (FgFun "p" [(param "v")] YUnit (push-call (ArInOut "v") 9)))
+        (cell (expr-call (YCell (vt)) "cell" [(fx-vecs [1 2 3])]))
+        (body (expr-new YInt (EkDo [(inout-call "p" ["c"]) (expr-call YInt "count" [(deref-of "c")])]))))
+    (check-model "a read after the call sees the write-back" (prog-of [f] (let1 "c" cell body)) "Ok(4)")))
+
+(defun t-arith () -> i64
+  (+ (check-model "multiplication overflows" (prog-of [] (expr-call YInt "*" [(expr-int 9223372036854775807) (expr-int 2)]))
+                  "Err(Trap(integer overflow in * at i64))")
+     (check-model "rem by zero" (prog-of [] (expr-call YInt "rem" [(expr-int 1) (expr-int 0)])) "Err(Trap(integer rem by zero))")
+     (check-model "addition overflows" (prog-of [] (expr-call YInt "+" [(expr-int 9223372036854775807) (expr-int 1)]))
+                  "Err(Trap(integer overflow in + at i64))")
+     (check-model "subtraction overflows" (prog-of [] (expr-call YInt "-" [(expr-int -9223372036854775807) (expr-int 2)]))
+                  "Err(Trap(integer overflow in - at i64))")
+     (check-model "rem of the minimum by -1 overflows" (prog-of [] (expr-call YInt "rem" [(expr-int -9223372036854775808) (expr-int -1)]))
+                  "Err(Trap(integer overflow in rem at i64))")
+     (check-model "the largest product that fits" (prog-of [] (expr-call YInt "*" [(expr-int 3037000499) (expr-int 3037000499)]))
+                  "Ok(9223372030926249001)")
+     (check-model "one more does not" (prog-of [] (expr-call YInt "*" [(expr-int 3037000500) (expr-int 3037000500)]))
+                  "Err(Trap(integer overflow in * at i64))")
+     (check-model "negative products" (prog-of [] (expr-call YInt "*" [(expr-int -4611686018427387904) (expr-int 2)])) "Ok(-9223372036854775808)")
+     (check-model "rem keeps the sign of the dividend" (prog-of [] (expr-call YInt "rem" [(expr-int -7) (expr-int 2)])) "Ok(-1)")))
+
+(defun t-object-limit () -> i64
+  (let ((big (fx-pipe-program (FgPipe (FgChain (SrRange (expr-int 5000000)) []) [TmCount] ShNested)))
+        (small (fx-pipe-program (FgPipe (FgChain (SrRange (expr-int 100)) []) [TmCount] ShNested))))
+    (+ (check-model "a range past the object limit is a gap, not an allocation" big "Err(Budget)")
+       (check-model "a small range is fine" small "Ok(100)"))))
+
+(defun t-unsupported () -> i64
+  (check-text "recur is not in the slice and says so"
+              (result-text (model-expected (prog-of [] (expr-new YInt (EkRecur [])))))
+              "Err(Unsupported(this kind of expression is not in the first slice of the model))"))
+
+(defun main () -> i64
+  (let ((failed (+ (t-write-back) (t-read-after-call) (t-arith) (t-object-limit) (t-unsupported))))
+    (do (println (if (= failed 0) "ok" (str "FAILED " failed))) failed)))
