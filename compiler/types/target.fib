@@ -24,17 +24,26 @@
       (= cpu "meteorlake") (= cpu "graniterapids") (= cpu "znver1") (= cpu "znver2") (= cpu "znver3") (= cpu "znver4")
       (= cpu "znver5") (= cpu "bdver4") (= cpu "core-avx2") (= cpu "x86-64-v3")))
 
-;; The target of the CPU named `cpu` (FIB_TARGET_CPU), with no features of its own.
+;; The aarch64 CPUs, by name or name prefix (LLVM's): every one has the fused multiply-add of NEON (`fmla`, `fmadd`; the ARMv8 baseline) and 128-bit
+;; vectors, so `has-fma` is true with only two f64 lanes: the fused tiles do not depend on the lane count.
+(defun cpu-aarch64? :private (cpu: str) -> bool
+  (or (starts-with? cpu "apple-") (starts-with? cpu "cortex-a") (starts-with? cpu "neoverse-") (starts-with? cpu "ampere")
+      (starts-with? cpu "armv8") (starts-with? cpu "armv9") (starts-with? cpu "exynos-") (starts-with? cpu "thunderx")
+      (starts-with? cpu "carmel") (starts-with? cpu "falkor") (starts-with? cpu "kryo") (starts-with? cpu "saphira")
+      (starts-with? cpu "oryon") (starts-with? cpu "a64fx") (= cpu "aarch64") (= cpu "native-aarch64")))
+
+;; The target of the CPU named `cpu` (FIB_TARGET_CPU), with no features of its own: x86-64-v3 and the AVX2 CPUs are 256 bits with FMA, an aarch64 CPU is
+;; 128 bits with FMA, any other name is a baseline x86-64.
 (defun target-of-cpu (cpu: str) -> Target
-  (if (cpu-avx2? cpu)
-      (Target cpu "" 256 true)
-      (Target cpu "" 128 false)))
+  (cond (cpu-avx2? cpu) (Target cpu "" 256 true)
+        (cpu-aarch64? cpu) (Target cpu "" 128 true)
+        :else (Target cpu "" 128 false)))
 
 ;; The target of a CPU named `cpu` whose feature list is `features` (LLVM's `+avx2,+fma,..`): 256 bits when it has AVX2, else 128.
 (defun target-of-features (cpu: str features: str) -> Target
   (let ((wrapped (str-join ["," features ","])))
     (let ((has (fn (f: str) (match (str-find wrapped (str-join ["," f ","]) 0) ((some _) true) (nil false)))))
-      (Target cpu features (if (has "+avx2") 256 128) (has "+fma")))))
+      (Target cpu features (if (has "+avx2") 256 128) (or (has "+fma") (cpu-aarch64? cpu) (has "+fp-armv8") (has "+neon"))))))
 
 ;; The baseline every x86-64 has: SSE2, 128-bit vectors, no fma.
 (defun target-baseline () -> Target (target-of-cpu "x86-64"))

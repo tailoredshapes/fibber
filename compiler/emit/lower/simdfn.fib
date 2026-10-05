@@ -1,7 +1,9 @@
 ;; compiler/emit/lower/simdfn.fib: the functions of a float or an integer, scalar or vector, that are one lIR instruction (spec/lir.md 6.1, "Floating-point
 ;; functions and integer min/max"), the conversions between lane types (6.3), the shuffles and the constants of a vector type:
-;;   simd/fma simd/sqrt simd/floor simd/ceil simd/trunc simd/round simd/round-even simd/abs simd/min simd/max simd/min-num simd/max-num
-;;   simd/convert simd/reverse simd/shuffle simd/lanes simd/kind
+;;   simd/fma simd/muladd simd/sqrt simd/floor simd/ceil simd/trunc simd/round simd/round-even simd/abs simd/min simd/max simd/min-num simd/max-num
+;;   simd/convert simd/bitcast simd/reverse simd/shuffle simd/lanes simd/kind
+;; `simd/fma` is correctly rounded (one rounding, exactly IEEE `fma`): on a target without FMA hardware it is a libm call per lane. `simd/muladd` is `fmuladd`:
+;; one fused instruction where the target has FMA, a multiply and an add where it has not, so its result may differ in the last bit between targets.
 ;; `simd/min` and `simd/max` are the NaN-propagating pair (`fmin`, `fmax`: a NaN operand gives NaN, `-0.0` is below `+0.0`), as the library's `min` and `max`;
 ;; `simd/min-num` and `simd/max-num` are IEEE minNum and maxNum (a NaN operand loses). `simd/abs` of an integer traps on the minimum, as `neg` does.
 ;; `simd/round` is to nearest with ties away from zero, `simd/round-even` ties to even. Memory access to arrays is emit.lower.simdmem.
@@ -13,6 +15,7 @@
 ;; The lIR instruction of a one-instruction function, `nil` when `name` is none.
 (defun fn-instr :private (name: str fl: bool) -> (Option str)
   (cond (= name "simd/fma") (some "fma")
+        (= name "simd/muladd") (some "fmuladd")
         (= name "simd/sqrt") (some "fsqrt")
         (= name "simd/floor") (some "ffloor")
         (= name "simd/ceil") (some "fceil")
@@ -68,6 +71,17 @@
                   (nil (Ok x))
                   ((some op) (Ok (val cx (str-join ["(" op " " (lir-ty-text to) " " (v-text x) ")"]) to)))))))
 
+;; `(simd/bitcast v)` to the vector type `to` (the lane count is the same by the checker's signature): the bits of each lane are the bits of the lane of the
+;; result, so the lanes must be as wide as each other (`f64x4` and `i64x4`, `f32x8` and `i32x8`); a mask is not a lane type here.
+(defun lcx-simd-bitcast (cx: LowerCx x: V to: LirTy) -> (Result V str)
+  (let ((from (ty-of x)))
+    (cond (not (and (vec? from) (vec? to))) (Err "simd/bitcast reinterprets a vector as a vector")
+          (or (= (elem-of from) LirI1) (= (elem-of to) LirI1)) (Err "simd/bitcast does not reinterpret a mask")
+          (not (= (elem-bits (elem-of from)) (elem-bits (elem-of to))))
+            (Err (str-join ["simd/bitcast: the lanes of " (vec-name from) " and " (vec-name to) " differ in width"]))
+          (= from to) (Ok x)
+          :else (Ok (val cx (str-join ["(bitcast " (lir-ty-text to) " " (v-text x) ")"]) to)))))
+
 ;; ---- shuffles and constants
 
 ;; The literal integer lanes of the call's argument `i`, when it is a vector literal of integer literals.
@@ -110,5 +124,5 @@
     (v-int LirI64 (if (= name "simd/lanes") (lanes-of t) (lane-kind (elem-of t))))))
 
 (defun simd-fn-name? (name: str) -> bool
-  (contains? (set ["simd/fma" "simd/sqrt" "simd/floor" "simd/ceil" "simd/trunc" "simd/round" "simd/round-even" "simd/abs" "simd/min" "simd/max"
+  (contains? (set ["simd/fma" "simd/muladd" "simd/bitcast" "simd/sqrt" "simd/floor" "simd/ceil" "simd/trunc" "simd/round" "simd/round-even" "simd/abs" "simd/min" "simd/max"
                    "simd/min-num" "simd/max-num" "simd/convert" "simd/reverse" "simd/shuffle" "simd/lanes" "simd/kind"]) name))

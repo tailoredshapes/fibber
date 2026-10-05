@@ -1,0 +1,25 @@
+;; compiler/tests/types/unit-target.fib: the Target record of types.target, per architecture (SC1). `has-fma` is the compile-time constant `(has-fma)` and is
+;; independent of the lane count: every aarch64 CPU has NEON's fused multiply-add with 128-bit vectors (2 f64 lanes), x86 has it with the `fma` feature or a v3+ CPU.
+;; Build: fibc build compiler/tests/types/unit-target.fib -I compiler -I lib -o OUT     (no aarch64 code is generated: only the record is checked)
+(ns main (:use types.target types.check))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do
+      (check cs "x86-64 baseline: 128 bits, no fma" (and (= (. (target-of-cpu "x86-64") vector-bits) 128) (not (. (target-of-cpu "x86-64") has-fma))))
+      (check cs "x86-64-v2: 128 bits, no fma" (and (= (. (target-of-cpu "x86-64-v2") vector-bits) 128) (not (. (target-of-cpu "x86-64-v2") has-fma))))
+      (check cs "x86-64-v3: 256 bits, fma" (and (= (. (target-of-cpu "x86-64-v3") vector-bits) 256) (. (target-of-cpu "x86-64-v3") has-fma)))
+      (check cs "haswell and znver4 have fma" (and (. (target-of-cpu "haswell") has-fma) (. (target-of-cpu "znver4") has-fma)))
+      (check cs "apple-m1: fma with only 128-bit vectors (2 f64 lanes)"
+             (let ((t (target-of-cpu "apple-m1")))
+               (and (. t has-fma) (= (. t vector-bits) 128) (= (target-lanes t 64) 2))))
+      (check cs "apple-m2, cortex-a76, neoverse-n1, aarch64: fma"
+             (every? (fn (c: str) (. (target-of-cpu c) has-fma)) ["apple-m2" "cortex-a76" "neoverse-n1" "aarch64" "armv8.2-a"]))
+      (check cs "a host x86 with +avx2,+fma: fma, 256 bits"
+             (let ((t (target-of-features "skylake" "+avx2,+fma,+sse4.2"))) (and (. t has-fma) (= (. t vector-bits) 256))))
+      (check cs "a host x86 with avx2 but fma switched off has none" (not (. (target-of-features "haswell" "+avx2,-fma") has-fma)))
+      (check cs "a host x86 with no features: no fma" (not (. (target-of-features "x86-64" "+sse2,+sse4.2") has-fma)))
+      (check cs "an aarch64 host: fma, 128 bits, from the CPU name or the NEON feature"
+             (and (. (target-of-features "apple-m1" "+neon,+fp-armv8") has-fma) (. (target-of-features "generic" "+neon,+fp-armv8") has-fma)
+                  (= (. (target-of-features "apple-m1" "+neon") vector-bits) 128)))
+      (finish cs))))
