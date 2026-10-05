@@ -1,11 +1,242 @@
 ;; compiler/lsp/catalog.fib: completion candidates from a checked program (docs/design/fibref-port.md section 6). OWNER: package L3.
 ;; Rust: editor/catalog.rs (241). What each module exports, with the type checker's scheme as the detail, read from the `TypedProgram` tables
 ;; (types.program, types.display), not from a second front end.
+;; Shapes decided where Rust and fibber differ:
+;; - the Rust functions take a `ModuleId` and a `TypeId`; the stub's take names, so `catalog-value` reads `module` as the alias the main
+;;   module gives ("" for the main module itself; a namespace that is not an alias is looked for among the modules) and `catalog-fields` the
+;;   type name as the main module sees it. `value-item`, `type-item`, `proto-item` and `visible` take the id and are public for features.
+;; - arity overloading (X9): the clauses of `map` are the functions `map$2` and `map$3` in the tables, and the bare name is not one (it is "its
+;;   smallest clause" as a value). The Rust predates it, so the catalog folds the clauses of a name into one item labelled with the base name and
+;;   carrying the smallest clause's scheme, unless a plain function of that name exists; `catalog-clauses` gives every clause for hover, and
+;;   `catalog-value` resolves a bare overloaded name to its smallest clause.
+;; - `catalog-local-type` (Rust `local_type`) is added: the checked type of the nearest binding of a name.
+;; - the tables are read with `table-find`/`get`, never `table-get`: an id the tables lack (a program built from a degraded buffer) is an
+;;   item with an empty detail, not a trap (a trap would abort the server, decision D5).
 (ns lsp.catalog
-  (:use types.program lsp.types))
+  (:use syntax.pos types.ty types.ast types.decls types.names types.table types.display types.dump.scheme types.program util.sort lsp.types))
 
-(defun catalog-names (t: TypedProgram) -> (Vec LsItem) (trap "todo: lsp.catalog catalog-names"))
-(defun catalog-types (t: TypedProgram) -> (Vec LsItem) (trap "todo: lsp.catalog catalog-types"))
-(defun catalog-exports (t: TypedProgram alias: str) -> (Vec LsItem) (trap "todo: lsp.catalog catalog-exports"))
-(defun catalog-fields (t: TypedProgram type-name: str) -> (Vec LsItem) (trap "todo: lsp.catalog catalog-fields"))
-(defun catalog-value (t: TypedProgram module: str name: str) -> (Option LsItem) (trap "todo: lsp.catalog catalog-value"))
+(def scalar-names: (Vec str) ["i8" "i16" "i32" "i64" "u8" "u16" "u32" "u64" "f32" "f64" "bool" "str"])
+
+(defun opt-vec :private (o: (Option LsItem)) -> (Vec LsItem)
+  (match o
+    ((some x) [x])
+    (nil [])))
+
+(defun module-name-of :private (g: Globals m: i64) -> str
+  (match (table-find (. g modules) m)
+    ((some mi) (. mi ns))
+    (nil "")))
+
+(defun scheme-text :private (tp: TypedProgram f: i64) -> str
+  (match (get (. tp fun-schemes) f)
+    ((some s) (program-show-scheme tp s))
+    (nil "")))
+
+;; The kind, detail and owner module of a reference to a value.
+(defun ref-item :private (tp: TypedProgram m: i64 name: str r: GlobalRef) -> LsItem
+  (let ((g (. tp globals)))
+    (match r
+      ((GFun f)
+       (match (table-find (. g funs) f)
+         ((some d) (LsItem name (if (. d is-macro) "macro" "function") (scheme-text tp f) (module-name-of g (. d module))))
+         (nil (LsItem name "function" "" ""))))
+      ((GCtor id v)
+       (match (table-find (. g types) id)
+         ((some td)
+          (match v
+            ((some _) (LsItem name "variant" (str "variant of " (. td name)) (module-name-of g (. td module))))
+            (nil (LsItem name "struct" (str "constructor of " (. td name)) (module-name-of g (. td module))))))
+         (nil (LsItem name "struct" "" ""))))
+      ((GMethod p i)
+       (match (table-find (. g protos) p)
+         ((some pd)
+          (LsItem name "method"
+                  (if (< i (count (. pd methods))) (program-show-scheme tp (. (nth (. pd methods) i) scheme)) "")
+                  (module-name-of g (. pd module))))
+         (nil (LsItem name "method" "" ""))))
+      ((GBuiltin b)
+       (LsItem name "function"
+               (match (table-find (. g builtin-schemes) b) ((some s) (program-show-scheme tp s)) (nil ""))
+               (module-name-of g module-builtin)))
+      ((GDef d)
+       (LsItem name "variable"
+               (match (get (. tp def-types) d) ((some ty) (printer-ty (printer-new g) ty)) (nil ""))
+               (match (table-find (. g defs) d) ((some dd) (module-name-of g (. dd module))) (nil ""))))
+      ((GExtern x)
+       (LsItem name "function"
+               (match (table-find (. g externs) x) ((some e) (printer-ty (printer-new g) (. e ty))) (nil ""))
+               (module-name-of g m))))))
+
+;; An item for the value `name` as module `m` sees it. Rust: catalog.rs value_item
+(defun value-item (tp: TypedProgram m: i64 name: str) -> (Option LsItem)
+  (match (g-value (. tp globals) m name)
+    (nil nil)
+    ((some r) (some (ref-item tp m name r)))))
+
+;; An item for the type `name` as `m` sees it.
+(defun type-item (g: Globals m: i64 name: str) -> (Option LsItem)
+  (match (g-type-name g m name)
+    (nil nil)
+    ((some id)
+     (match (table-find (. g types) id)
+       ((some td)
+        (some (LsItem name (match (. td shape) ((TsStruct _) "struct") ((TsEnum _) "enum"))
+                      (str-join (vec (interpose " " (. td params))))
+                      (module-name-of g (. td module)))))
+       (nil nil)))))
+
+(defun proto-item (g: Globals m: i64 name: str) -> (Option LsItem)
+  (match (g-proto-name g m name)
+    (nil nil)
+    ((some id)
+     (match (table-find (. g protos) id)
+       ((some pd) (some (LsItem name "protocol" "" (module-name-of g (. pd module)))))
+       (nil nil)))))
+
+;; The names `m` sees by itself and through its chain, private ones of its own included: sorted, each once.
+(defun visible (g: Globals m: i64) -> (Vec str)
+  (let ((n (g-names g m))
+        (add (fn (acc: (Set str) k: str) (conj acc k)))
+        (own (concat (vec (keys @(. n values))) (concat (vec (keys @(. n types))) (vec (keys @(. n protos))))))
+        (deps (filterv (fn (d: i64) (not (= d m))) (. (g-module g m) chain)))
+        (base (reduce add (set-empty) (concat (g-exports g m) own))))
+    (sort-strs (vec (reduce (fn (acc: (Set str) d: i64) (reduce add acc (g-exports g d))) base deps)))))
+
+;; `base$N` (N digits only) as (base, N).
+(defun clause-split (label: str) -> (Option (Pair str i64))
+  (let ((n (str-len label)))
+    (loop ((i (- n 1)))
+      (cond (< i 1) nil
+            (= (str-byte-at label i) 36i8)
+              (if (and (< (+ i 1) n) (every? (fn (k: i64) (and (>= (str-byte-at label k) 48i8) (<= (str-byte-at label k) 57i8))) (range (+ i 1) n)))
+                  (some (Pair (str-slice label 0 i) (unwrap-or (parse-long (str-slice label (+ i 1) n)) 0)))
+                  nil)
+            :else (recur (- i 1))))))
+
+(defun with-label :private (i: LsItem label: str) -> LsItem (LsItem label (. i kind) (. i detail) (. i doc)))
+
+;; The clauses `name$1` to `name$12` that exist as module `m` sees them, each labelled `name`, in arity order.
+(defun catalog-clauses (tp: TypedProgram m: i64 name: str) -> (Vec LsItem)
+  (reduce (fn (acc: (Vec LsItem) n: i64)
+            (match (value-item tp m (str-join [name "$" (str n)]))
+              ((some it) (conj acc (with-label it name)))
+              (nil acc)))
+          [] (range 1 13)))
+
+;; The items with the clauses of one name folded into one item: the smallest clause's, labelled with the base name, where no plain item of
+;; that name stands.
+(defun fold-clauses :private (items: (Vec LsItem)) -> (Vec LsItem)
+  (let ((plain (reduce (fn (a: (Set str) i: LsItem) (conj a (. i label))) (set-empty) items))
+        (best (reduce (fn (acc: (Map str (Pair i64 LsItem)) i: LsItem)
+                        (match (clause-split (. i label))
+                          (nil acc)
+                          ((some (Pair base n))
+                           (match (get acc base)
+                             ((some (Pair m _)) (if (< n m) (assoc acc base (Pair n i)) acc))
+                             (nil (assoc acc base (Pair n i)))))))
+                      (map-empty) items)))
+    (. (reduce (fn (acc: (Pair (Set str) (Vec LsItem)) i: LsItem)
+                 (match (clause-split (. i label))
+                   (nil (Pair (. acc fst) (conj (. acc snd) i)))
+                   ((some (Pair base n))
+                    (if (or (contains? plain base) (contains? (. acc fst) base))
+                        acc
+                        (Pair (conj (. acc fst) base) (conj (. acc snd) (with-label (. (unwrap-or (get best base) (Pair n i)) snd) base)))))))
+               (Pair (set-empty) []) items)
+       snd)))
+
+(defun all-items :private (tp: TypedProgram m: i64 name: str) -> (Vec LsItem)
+  (let ((g (. tp globals)))
+    (into (into (opt-vec (value-item tp m name)) (opt-vec (type-item g m name))) (opt-vec (proto-item g m name)))))
+
+;; Every value, type and protocol visible in the main module, then the aliases (as `alias/`).
+(defun catalog-names (tp: TypedProgram) -> (Vec LsItem)
+  (let ((g (. tp globals))
+        (m @(. g main))
+        (aliases (. (g-module g @(. g main)) aliases))
+        (named (fold-clauses (reduce (fn (acc: (Vec LsItem) name: str) (into acc (all-items tp m name))) [] (visible g m)))))
+    (into named
+          (mapv (fn (a: str) (LsItem (str a "/") "module" "" (module-name-of g (nth-alias aliases a))))
+                (sort-strs (vec (keys aliases)))))))
+
+(defun nth-alias :private (aliases: (Map str i64) a: str) -> i64
+  (match (get aliases a)
+    ((some id) id)
+    (nil 0)))
+
+;; Every type and protocol visible in the main module, and the scalars.
+(defun catalog-types (tp: TypedProgram) -> (Vec LsItem)
+  (let ((g (. tp globals))
+        (m @(. g main)))
+    (reduce (fn (acc: (Vec LsItem) name: str) (into (into acc (opt-vec (type-item g m name))) (opt-vec (proto-item g m name))))
+            (mapv (fn (s: str) (LsItem s "type" "" "builtin")) scalar-names)
+            (visible g m))))
+
+;; What the module aliased `alias` in the main module exports.
+(defun catalog-exports (tp: TypedProgram alias: str) -> (Vec LsItem)
+  (let ((g (. tp globals)))
+    (match (get (. (g-module g @(. g main)) aliases) alias)
+      (nil [])
+      ((some m) (fold-clauses (reduce (fn (acc: (Vec LsItem) name: str) (into acc (all-items tp m name))) [] (g-exports g m)))))))
+
+;; The fields of the struct named `type-name` in the main module.
+(defun catalog-fields (tp: TypedProgram type-name: str) -> (Vec LsItem)
+  (let ((g (. tp globals)))
+    (match (g-type-name g @(. g main) type-name)
+      (nil [])
+      ((some id) (type-fields g id)))))
+
+(defun type-fields (g: Globals id: i64) -> (Vec LsItem)
+  (match (table-find (. g types) id)
+    (nil [])
+    ((some td)
+     (match (. td shape)
+       ((TsEnum _) [])
+       ((TsStruct fs)
+        (let ((p (printer-with-names g (. td params) [])))
+          (mapv (fn (f: FieldDef) (LsItem (. f name) "field" (printer-ty p (. f ty)) (. td name))) fs)))))))
+
+;; The item for `name` as the module `module` (an alias of the main module, "" for the main module) sees it.
+(defun catalog-value (tp: TypedProgram module: str name: str) -> (Option LsItem)
+  (match (catalog-module tp module)
+    (nil nil)
+    ((some m) (match (value-item tp m name)
+                ((some it) (some it))
+                (nil (first (catalog-clauses tp m name)))))))
+
+;; The module id of `module`: an alias of the main module, "" for the main module, else a namespace.
+(defun catalog-module :private (tp: TypedProgram module: str) -> (Option i64)
+  (let ((g (. tp globals))
+        (main @(. g main)))
+    (if (= module "")
+        (some main)
+        (match (get (. (g-module g main) aliases) module)
+          ((some m) (some m))
+          (nil (g-module-id g module))))))
+
+;; Every clause of the overloaded function `name` as `module` sees it (empty for a name that is not overloaded), each labelled `name`.
+(defun catalog-all-clauses (tp: TypedProgram module: str name: str) -> (Vec LsItem)
+  (match (catalog-module tp module)
+    (nil [])
+    ((some m) (catalog-clauses tp m name))))
+
+;; The checked type of the nearest binding named `name` at or before byte `off` of the file `path`: its nominal type id (if it has one) and its
+;; text. Rust: catalog.rs local_type
+(defun catalog-local-type (tp: TypedProgram name: str path: str off: i64) -> (Option (Pair (Option i64) str))
+  (let ((g (. tp globals))
+        (rows (table-rows (. g bindings)))
+        (best (loop ((i 0) (best -1))
+                (if (>= i (count rows))
+                    best
+                    (let ((b (nth rows i)))
+                      (recur (+ i 1)
+                             (if (and (= (. b name) name) (and (= (. (. b pos) file) path) (<= (. (. b pos) start) off))
+                                      (or (< best 0) (>= (. (. b pos) start) (. (. (nth rows best) pos) start))))
+                                 i
+                                 best)))))))
+    (if (< best 0)
+        nil
+        (match (get (. tp binding-types) best)
+          (nil nil)
+          ((some ty)
+           (some (Pair (match ty ((TCon (KNominal n) _) (some n)) (_ nil)) (printer-ty (printer-new g) ty))))))))

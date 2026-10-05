@@ -11,7 +11,7 @@
 (def usage: str
   "usage: fibc <command>
 
-Every command that reads a program (run, build, emit, emit-dump, explain) takes
+Every command that reads a program (run, build, emit, emit-dump, explain, lsp) takes
 -I dir (or -Idir), any number of times, anywhere before --: a module is found
 beside the file, then under each -I dir in order, then under each directory of
 $FIB_LIB, then in the library directory `lib` (spec/syntax.md §5).
@@ -33,6 +33,9 @@ build defaults to 2, run to 0.
                          the layout of its types, or one macro module (spec/bootstrap.md
                          section 8); exit 0, 1 a record, 2 unreadable, 3 unsupported
   explain <file>         print the ownership checker's decisions (types §9)
+  lsp                    serve the language server (LSP over standard input and
+                         output: completion, hover, diagnostics, definition,
+                         document symbols); takes -I; exit 0 after shutdown, 1 without
   help                   print this message
   --version, -V          print the version
 
@@ -52,6 +55,7 @@ itrace and gen are commands of the Rust compiler (the test harness).")
 
 ;; What the command line asks for. Rust: command.rs:81 Command
 (defenum Command
+  (CmdLsp)
   (CmdRun file: str trace: bool args: (Vec str) opt: i64)
   (CmdBuild file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64)
   (CmdEmit file: str)
@@ -71,6 +75,7 @@ itrace and gen are commands of the Rust compiler (the test harness).")
     ((CmdEmit _) true)
     ((CmdEmitDump _ _) true)
     ((CmdExplain _) true)
+    ((CmdLsp) true)
     ((CmdHarness w) (= w "itrace"))
     (_ false)))
 
@@ -199,6 +204,7 @@ itrace and gen are commands of the Rust compiler (the test harness).")
                                  (nil CmdInvalid)
                                  ((some p) (CmdEmitDump (. p opts) (. p files))))
           (and (= head "explain") (= n 2)) (CmdExplain (nth words 1))
+          (and (= head "lsp") (= n 1)) CmdLsp
           (and (= head "itrace") (= n 2)) (CmdHarness head)
           (= head "cases") (let ((j (take-jobs words))) (parse-cases (. j rest) (. j n)))
           (= head "gen") (CmdHarness head)

@@ -1,6 +1,6 @@
 'use strict';
-// The fibber extension: starts `fibref lsp` and lets vscode-languageclient
-// speak to it (completion, hover, diagnostics). Plain JS, no bundler.
+// The fibber extension: starts the language server (`fibc lsp` by default, or `fibref lsp`) and lets vscode-languageclient
+// speak to it (completion, hover, diagnostics, go to definition, document symbols). Plain JS, no bundler.
 
 const vscode = require('vscode');
 const { LanguageClient } = require('vscode-languageclient/node');
@@ -16,7 +16,9 @@ function serverOptions() {
   const env = { ...process.env };
   const lib = cfg.get('libraryPath', '');
   if (lib) env.FIB_LIB = lib;
-  return { command: cfg.get('fibrefPath', 'fibref') || 'fibref', args, options: { env } };
+  // `fibber.fibrefPath` (the old setting, empty by default) wins when set, so a configuration that named a fibref keeps working.
+  const command = cfg.get('fibrefPath', '') || cfg.get('serverPath', 'fibc') || 'fibc';
+  return { command, args, options: { env } };
 }
 
 /** One quiet status-bar item when the server cannot start. */
@@ -26,7 +28,7 @@ function warn(reason) {
     warning.command = 'fibber.restartServer';
   }
   warning.text = '$(warning) fibber: no language server';
-  warning.tooltip = `fibber: ${reason}. Set fibber.fibrefPath, then click to restart.`;
+  warning.tooltip = `fibber: ${reason}. Set fibber.serverPath, then click to restart.`;
   warning.show();
 }
 

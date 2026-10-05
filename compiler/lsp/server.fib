@@ -1,17 +1,324 @@
 ;; compiler/lsp/server.fib: the JSON-RPC server over stdio (docs/design/fibref-port.md section 6). OWNER: package L5. Rust: editor/{lsp,transport,cli}.rs
-;; (359 + 95 + 94). Content-Length framing both ways; full-text sync; initialize / shutdown / exit; completion, hover; publishDiagnostics on open,
-;; change, save and close; `-32601` for any other request; a handler that traps answers its request with `-32603` and the server goes on (a fibber
-;; trap aborts, so each handler runs in a child process or the front end is made total: decision D5). Exit status 0 after `shutdown`, 1 without it.
+;; (359 + 95 + 94). Content-Length framing both ways; full-text sync; initialize / shutdown / exit; completion, hover, definition, document
+;; symbols; publishDiagnostics on open, change, save and close; `-32601` for any other request; `-32602` for parameters that lack the document or
+;; the position; `-32600` for a request after `shutdown`; `-32700` for a body that is not JSON. Exit status 0 after `shutdown`, 1 without it.
+;; Shapes decided where Rust and fibber differ:
+;; - a fibber trap aborts: there is no `catch_unwind`, so `-32603` (a handler that failed answers its request and the server goes on) is not
+;;   produced; decision D5 says the front end must be total on garbage input and a fuzz run decides whether a child process is needed.
+;;   `internal-error` is the one place the reply is built, for the day a handler can fail without aborting.
+;; - the Rust serves on a thread with a 256 MiB stack; fibber has the process stack (docs/design/fibref-port.md R2).
+;; - `read-message` reads the header a byte at a time (the descriptor is read without a buffer so that nothing is lost between calls); the body
+;;   is read to its length and must be UTF-8 (checked here: `str-from-bytes` traps on invalid bytes). The largest body is 64 MiB.
+;; - the capabilities add `definitionProvider` and `documentSymbolProvider` to the Rust's; `textDocument/definition` answers a Location or null,
+;;   `textDocument/documentSymbol` a flat array of DocumentSymbol.
+;; - `server-handle` is pure of the descriptors: one message in, the replies out; the loop (`lsp-main`) owns the reading and writing.
 (ns lsp.server
-  (:use expand.roots lsp.json))
+  (:require [fib.unix :as unix] [lsp.features :as ft] [lsp.text :as tx] [lsp.definition :as defn] [driver.native :as native] [fib.string :as s])
+  (:use expand.roots lsp.json lsp.types))
+
+(def err-parse: i64 -32700)
+(def err-invalid-request: i64 -32600)
+(def err-method-not-found: i64 -32601)
+(def err-invalid-params: i64 -32602)
+(def err-internal: i64 -32603)
+(def max-body: i64 67108864)
 
 (defstruct LsServer (docs: (Cell (Map str str)) roots: Roots shutdown: (Cell bool)))
 
-(defun server-new (roots: Roots) -> LsServer (trap "todo: lsp.server server-new"))
+(defun server-new (roots: Roots) -> LsServer (LsServer (cell (map-empty)) roots (cell false)))
+
 ;; One message in, the messages to send out and an exit code once the client said `exit`.
 (defstruct LsReply (out: (Vec JVal) exit: (Option i64)))
-(defun server-handle (s: LsServer msg: JVal) -> LsReply (trap "todo: lsp.server server-handle"))
-(defun read-message (fd: i64) -> (Result (Option str) str) (trap "todo: lsp.server read-message"))
-(defun write-message (fd: i64 body: str) -> (Result unit str) (trap "todo: lsp.server write-message"))
+
+(defstruct LsAt :private (uri: str text: str line: i64 col: i64))
+
+;; ---- JSON builders
+
+(defun obj :private (pairs: (Vec (Pair str JVal))) -> JVal (json-obj pairs))
+(defun jstr :private (s: str) -> JVal (JStr s))
+
+(defun response :private (id: JVal result: JVal) -> JVal
+  (obj [(Pair "jsonrpc" (jstr "2.0")) (Pair "id" id) (Pair "result" result)]))
+
+(defun failure :private (id: JVal code: i64 message: str) -> JVal
+  (obj [(Pair "jsonrpc" (jstr "2.0")) (Pair "id" id)
+        (Pair "error" (obj [(Pair "code" (JInt code)) (Pair "message" (jstr message))]))]))
+
+(defun notification :private (method: str params: JVal) -> JVal
+  (obj [(Pair "jsonrpc" (jstr "2.0")) (Pair "method" (jstr method)) (Pair "params" params)]))
+
+(defun internal-error (id: JVal) -> JVal (failure id err-internal "internal error while handling the request"))
+
+(defun one :private (m: JVal) -> LsReply (LsReply [m] nil))
+(defun none :private () -> LsReply (LsReply [] nil))
+
+;; The LSP `CompletionItemKind` of an item kind of the protocol.
+(defun completion-kind (kind: str) -> i64
+  (cond (= kind "method") 2 (= kind "function") 3 (= kind "field") 5 (= kind "variable") 6 (= kind "protocol") 8 (= kind "module") 9
+        (= kind "enum") 13 (= kind "macro") 14 (= kind "variant") 20 (= kind "struct") 22 (= kind "type") 25 :else 12))
+
+;; The LSP `SymbolKind` of an item kind of the protocol.
+(defun symbol-kind (kind: str) -> i64
+  (cond (= kind "function") 12 (= kind "macro") 12 (= kind "struct") 23 (= kind "enum") 10 (= kind "protocol") 11 (= kind "variable") 13 :else 13))
+
+(defun item-json :private (i: LsItem) -> JVal
+  (obj [(Pair "label" (jstr (. i label))) (Pair "kind" (JInt (completion-kind (. i kind))))
+        (Pair "detail" (jstr (. i detail))) (Pair "documentation" (jstr (. i doc)))]))
+
+(defun pos-json :private (p: tx/LsPos) -> JVal
+  (obj [(Pair "line" (JInt (. p line))) (Pair "character" (JInt (. p character)))]))
+
+(defun range-json :private (r: tx/LsRange) -> JVal
+  (obj [(Pair "start" (pos-json (. r start))) (Pair "end" (pos-json (. r end)))]))
+
+(defun span-json :private (text: str start: i64 end: i64) -> JVal
+  (range-json (tx/LsRange (tx/offset->pos text start) (tx/offset->pos text end))))
+
+(defun diag-json :private (src: str d: LsDiag) -> JVal
+  (obj [(Pair "range" (range-json (tx/diag-range src d))) (Pair "severity" (JInt 1)) (Pair "source" (jstr "fibref"))
+        (Pair "message" (jstr (. d message)))]))
+
+(defun publish :private (uri: str diags: (Vec JVal)) -> JVal
+  (notification "textDocument/publishDiagnostics" (obj [(Pair "uri" (jstr uri)) (Pair "diagnostics" (JArr diags))])))
+
+(defun hover-json :private (text: str) -> JVal
+  (obj [(Pair "contents" (obj [(Pair "kind" (jstr "markdown")) (Pair "value" (jstr (str-join ["```fibber\n" text "\n```"])))]))]))
+
+(defun initialize-result :private () -> JVal
+  (obj [(Pair "capabilities"
+              (obj [(Pair "textDocumentSync" (JInt 1))
+                    (Pair "completionProvider" (obj [(Pair "triggerCharacters" (JArr (mapv jstr ["(" "/" "." ":" " "])))]))
+                    (Pair "hoverProvider" (JBool true))
+                    (Pair "definitionProvider" (JBool true))
+                    (Pair "documentSymbolProvider" (JBool true))]))
+        (Pair "serverInfo" (obj [(Pair "name" (jstr "fibref lsp"))]))]))
+
+;; ---- requests
+
+(def bad-position: (Pair i64 str) (Pair err-invalid-params "expected textDocument.uri and position"))
+
+(defun uri-of :private (params: JVal) -> (Option str)
+  (match (json-path params ["textDocument" "uri"])
+    ((some (JStr s)) (some s))
+    (_ nil)))
+
+(defun int-of :private (v: (Option JVal)) -> (Option i64)
+  (match v
+    ((some (JInt n)) (some n))
+    (_ nil)))
+
+;; The open buffer and the position a request names: an error when the document or the position is missing from the parameters, Ok nil when
+;; the document is not open.
+(defun locate :private (s: LsServer params: JVal) -> (Result (Option LsAt) (Pair i64 str))
+  (let ((uri (uri-of params))
+        (line (int-of (json-path params ["position" "line"])))
+        (col (int-of (json-path params ["position" "character"]))))
+    (match uri
+      (nil (Err bad-position))
+      ((some u)
+       (match line
+         (nil (Err bad-position))
+         ((some l)
+          (match col
+            (nil (Err bad-position))
+            ((some c)
+             (match (get @(. s docs) u)
+               ((some text) (Ok (some (LsAt u text (+ l 1) c))))
+               (nil (Ok nil)))))))))))
+
+(defun file-uri :private (path: str) -> str
+  (if (and (> (str-len path) 0) (= (str-byte-at path 0) 47i8))
+      (str "file://" path)
+      (str "file://" (unwrap-or (native/getenv-opt "PWD") "") "/" path)))
+
+(defun location-json :private (a: LsAt loc: LsLocation) -> JVal
+  (let ((own (= (. loc path) (tx/path-of-uri (. a uri))))
+        (text (if own (. a text) (unwrap-or (read-file (. loc path)) ""))))
+    (obj [(Pair "uri" (jstr (if own (. a uri) (file-uri (. loc path)))))
+          (Pair "range" (span-json text (. loc start) (. loc end)))])))
+
+(defun request-at :private (s: LsServer method: str a: LsAt) -> JVal
+  (let ((path (tx/path-of-uri (. a uri))))
+    (cond (= method "textDocument/completion")
+            (JArr (mapv item-json (ft/complete (. a text) path (. a line) (. a col) (. s roots))))
+          (= method "textDocument/hover")
+            (match (ft/hover (. a text) path (. a line) (. a col) (. s roots))
+              ((some t) (hover-json t))
+              (nil JNull))
+          :else
+            (match (ft/definition (. a text) path (. a line) (. a col) (. s roots))
+              ((some loc) (location-json a loc))
+              (nil JNull)))))
+
+(defun symbol-json :private (text: str sym: defn/LsSymbol) -> JVal
+  (obj [(Pair "name" (jstr (. sym name))) (Pair "kind" (JInt (symbol-kind (. sym kind))))
+        (Pair "range" (span-json text (. sym start) (. sym end)))
+        (Pair "selectionRange" (span-json text (. sym sel-start) (. sym sel-end)))]))
+
+(defun symbols-request :private (s: LsServer params: JVal) -> (Result JVal (Pair i64 str))
+  (match (uri-of params)
+    (nil (Err (Pair err-invalid-params "expected textDocument.uri")))
+    ((some u)
+     (match (get @(. s docs) u)
+       (nil (Ok JNull))
+       ((some text) (Ok (JArr (mapv (fn (sym: defn/LsSymbol) (symbol-json text sym)) (ft/document-ranges text (tx/path-of-uri u))))))))))
+
+(defun request :private (s: LsServer method: str params: JVal) -> (Result JVal (Pair i64 str))
+  (cond (= method "initialize") (Ok (initialize-result))
+        (= method "shutdown") (do (set! (. s shutdown) true) (Ok JNull))
+        (= method "textDocument/documentSymbol") (symbols-request s params)
+        (or (= method "textDocument/completion") (or (= method "textDocument/hover") (= method "textDocument/definition")))
+          (match (locate s params)
+            ((Err e) (Err e))
+            ((Ok (some a)) (Ok (request-at s method a)))
+            ((Ok nil) (Ok JNull)))
+        :else (Err (Pair err-method-not-found (str "unsupported method " method)))))
+
+;; ---- notifications
+
+(defun changed :private (s: LsServer uri: str text: str) -> LsReply
+  (do (set! (. s docs) (assoc @(. s docs) uri text))
+      (one (publish uri (mapv (fn (d: LsDiag) (diag-json text d)) (ft/diagnostics text (tx/path-of-uri uri) (. s roots)))))))
+
+(defun last-text :private (params: JVal) -> (Option str)
+  (match (json-get params "contentChanges")
+    ((some (JArr cs))
+     (if (empty? cs)
+         nil
+         (match (json-get (nth cs (- (count cs) 1)) "text") ((some (JStr t)) (some t)) (_ nil))))
+    (_ nil)))
+
+(defun notify :private (s: LsServer method: str params: JVal) -> LsReply
+  (if (= method "exit")
+      (LsReply [] (some (if @(. s shutdown) 0 1)))
+      (match (uri-of params)
+        (nil (none))
+        ((some uri)
+         (cond (= method "textDocument/didOpen")
+                 (changed s uri (match (json-path params ["textDocument" "text"]) ((some (JStr t)) t) (_ "")))
+               (= method "textDocument/didChange")
+                 (match (last-text params) ((some t) (changed s uri t)) (nil (none)))
+               (= method "textDocument/didSave")
+                 (match (get @(. s docs) uri) ((some t) (changed s uri t)) (nil (none)))
+               (= method "textDocument/didClose")
+                 (do (set! (. s docs) (dissoc @(. s docs) uri)) (one (publish uri [])))
+               :else (none))))))
+
+;; One message in, the replies out. Rust: lsp.rs `handle`/`dispatch`
+(defun server-handle (s: LsServer msg: JVal) -> LsReply
+  (let ((method (match (json-get msg "method") ((some (JStr m)) m) (_ "")))
+        (params (unwrap-or (json-get msg "params") JNull)))
+    (match (json-get msg "id")
+      (nil (notify s method params))
+      ((some id)
+       (cond (= method "") (none)
+             (and @(. s shutdown) (not (= method "shutdown"))) (one (failure id err-invalid-request "the server is shut down"))
+             :else (match (request s method params)
+                     ((Ok r) (one (response id r)))
+                     ((Err (Pair code message)) (one (failure id code message)))))))))
+
+;; ---- framing
+
+(defun utf8-valid? :private (bs: (Array i8)) -> bool
+  (let ((n (array-len bs))
+        (b (fn (i: i64) (zext i64 (array-get bs i))))
+        (cont? (fn (i: i64 lo: i64 hi: i64) (and (< i (array-len bs)) (and (>= (zext i64 (array-get bs i)) lo) (<= (zext i64 (array-get bs i)) hi))))))
+    (loop ((i 0))
+      (if (>= i n)
+          true
+          (let ((c (b i)))
+            (cond (< c 128) (recur (+ i 1))
+                  (and (>= c 194) (<= c 223)) (if (cont? (+ i 1) 128 191) (recur (+ i 2)) false)
+                  (= c 224) (if (and (cont? (+ i 1) 160 191) (cont? (+ i 2) 128 191)) (recur (+ i 3)) false)
+                  (and (>= c 225) (<= c 236)) (if (and (cont? (+ i 1) 128 191) (cont? (+ i 2) 128 191)) (recur (+ i 3)) false)
+                  (= c 237) (if (and (cont? (+ i 1) 128 159) (cont? (+ i 2) 128 191)) (recur (+ i 3)) false)
+                  (and (>= c 238) (<= c 239)) (if (and (cont? (+ i 1) 128 191) (cont? (+ i 2) 128 191)) (recur (+ i 3)) false)
+                  (= c 240) (if (and (cont? (+ i 1) 144 191) (and (cont? (+ i 2) 128 191) (cont? (+ i 3) 128 191))) (recur (+ i 4)) false)
+                  (and (>= c 241) (<= c 243)) (if (and (cont? (+ i 1) 128 191) (and (cont? (+ i 2) 128 191) (cont? (+ i 3) 128 191))) (recur (+ i 4)) false)
+                  (= c 244) (if (and (cont? (+ i 1) 128 143) (and (cont? (+ i 2) 128 191) (cont? (+ i 3) 128 191))) (recur (+ i 4)) false)
+                  :else false))))))
+
+;; The next header line without its line end: Ok nil at the end of input before any byte of it, an error when the input ends inside it.
+(defun read-line :private (fd: i64) -> (Result (Option str) str)
+  (loop ((out []))
+    (match (unix/fd-read fd 1)
+      ((Err e) (Err (str "read failed: " (unix/errno-text e))))
+      ((Ok bs)
+       (cond (= (array-len bs) 0) (if (empty? out) (Ok nil) (Err "input ended in a header"))
+             (= (array-get bs 0) 10i8) (Ok (some (str-join out)))
+             (= (array-get bs 0) 13i8) (recur out)
+             :else (recur (conj out (char->str (i32->char (zext i32 (array-get bs 0)))))))))))
+
+(defun ascii-lower :private (text: str) -> str
+  (str-join (mapv (fn (c: char) (let ((k (long c))) (if (and (>= k 65) (<= k 90)) (char->str (i32->char (trunc i32 (+ k 32)))) (char->str c)))) (str-chars text))))
+
+(defun header-length :private (line: str) -> (Result (Option i64) str)
+  (match (str-find line ":" 0)
+    (nil (Err "malformed header"))
+    ((some i)
+     (if (= (ascii-lower (str-slice line 0 i)) "content-length")
+         (match (parse-long (s/trim (str-slice line (+ i 1) (str-len line))))
+           ((some n) (Ok (some n)))
+           (nil (Err "bad Content-Length")))
+         (Ok nil)))))
+
+(defun read-body :private (fd: i64 n: i64) -> (Result (Option str) str)
+  (let ((buf (cell (array n 0i8))))
+    (loop ((got 0))
+      (if (= got n)
+          (if (utf8-valid? @buf) (Ok (some (str-from-bytes @buf))) (Err "message is not UTF-8"))
+          (match (unix/fd-read fd (- n got))
+            ((Err e) (Err (str "read failed: " (unix/errno-text e))))
+            ((Ok chunk)
+             (if (= (array-len chunk) 0)
+                 (Err "input ended in a body")
+                 (do (dotimes (k (array-len chunk)) (array-set! &buf (+ got k) (array-get chunk k)))
+                     (recur (+ got (array-len chunk)))))))))))
+
+;; The next message body: Ok nil at the end of input. Headers other than `Content-Length` are skipped; a malformed header, a missing or bad
+;; length, a body over 64 MiB, a body that is not UTF-8 or input that ends in a header or body is an error. Rust: transport.rs read_message
+(defun read-message (fd: i64) -> (Result (Option str) str)
+  (loop ((first true) (len nil))
+    (match (read-line fd)
+      ((Err e) (Err e))
+      ((Ok nil) (if first (Ok nil) (Err "input ended in a header")))
+      ((Ok (some line))
+       (if (= line "")
+           (match len
+             (nil (Err "no Content-Length"))
+             ((some n) (if (> n max-body) (Err "message too large") (read-body fd n))))
+           (match (header-length line)
+             ((Err e) (Err e))
+             ((Ok l) (recur false (if (some? l) l len)))))))))
+
+;; Writes one framed message. Rust: transport.rs write_message
+(defun write-message (fd: i64 body: str) -> (Result unit str)
+  (let ((bytes (str-bytes (str-join ["Content-Length: " (str (str-len body)) "\r\n\r\n" body])))
+        (n (array-len (str-bytes (str-join ["Content-Length: " (str (str-len body)) "\r\n\r\n" body])))))
+    (loop ((off 0))
+      (if (= off n)
+          (Ok ())
+          (match (unix/fd-write-range fd bytes off (- n off))
+            ((Err e) (Err (str "write failed: " (unix/errno-text e))))
+            ((Ok 0) (Err "write made no progress"))
+            ((Ok k) (recur (+ off k))))))))
+
+;; ---- the loop
+
+(defun send-all :private (out: (Vec JVal)) -> bool
+  (every? (fn (m: JVal) (match (write-message unix/stdout (json-text m)) ((Ok _) true) ((Err _) false))) out))
+
+(defun serve :private (s: LsServer) -> i64
+  (loop ()
+    (match (read-message unix/stdin)
+      ((Err _) 1)
+      ((Ok nil) 1)
+      ((Ok (some body))
+       (let ((reply (match (json-parse body)
+                      ((Ok msg) (server-handle s msg))
+                      ((Err e) (one (failure JNull err-parse e))))))
+         (cond (not (send-all (. reply out))) 1
+               :else (match (. reply exit) ((some code) code) (nil (recur)))))))))
+
 ;; `fibref lsp` / `fibc lsp`: serves standard input and output; the exit status.
-(defun lsp-main (roots: Roots) -> i64 (trap "todo: lsp.server lsp-main"))
+(defun lsp-main (roots: Roots) -> i64 (serve (server-new roots)))
