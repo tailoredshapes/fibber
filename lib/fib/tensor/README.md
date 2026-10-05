@@ -167,16 +167,32 @@ and `mmul` accepts compatible rank-two inputs. They support strided and reversed
 views. Empty inner dimensions produce typed zeros. `mmul-scalar` exposes the
 checked, ordered reference implementation for comparisons.
 
-Floating `mmul` uses 4×8 register tiles for widths at least 32 and 4×4
-for smaller widths, with inner blocks of 128 and output blocks of 64
-(or 32 for packed `f64` panels).
-Strided input materialization copies 32×32 tiles. Matrices with at least 256 rows, 128 inner elements, and 128 columns pack B
-panels directly from original strides into one reusable scratch buffer per call;
-scalar edges cover incomplete tiles. The safe internal tuning interface also
-exposes 8×4 tiles and cache/inner sizes 32, 64, and 128. Integer multiplication
-uses the checked scalar reference. Each output traverses the inner dimension
-in order; no FMA is introduced explicitly. Batched multiplication,
-decompositions, and BLAS integration remain future work.
+Floating `mmul` on a target with a vector of at least four `f64` lanes (AVX2 and
+FMA; `(native-lanes f64)`) runs a blocked kernel in the GotoBLAS shape
+(`gemm-fma-f64`, `gemm-fma-f32`): B is packed per (column block, inner block)
+into panels of 8 columns (`f64`) or 16 (`f32`), A per (row block, inner block)
+into panels of 6 rows, both zero padded to whole panels and read from their
+original strides, so any view is accepted without a copy. The micro-kernel is a
+6x8 (`f64`) or 6x16 (`f32`) tile of twelve vector accumulators updated with
+`simd/fma`, a broadcast of A and two vector loads of B per inner step; an
+incomplete tile at the right or bottom edge goes through a scratch tile and the
+same kernel. Blocks are 256 (`f64`) or 512 (`f32`) inner steps, 96 rows and
+1024 columns. Pointers into the packed buffers are unchecked; shapes and the
+reachable range of both inputs are validated once per call and every buffer is
+sized from the loop bounds.
+**Rounding:** each output is one chain of fused multiply-adds over the inner index
+in increasing order, whatever its tile or block (a block continues the chain
+from C), so `gemm-fma-f64/fma-reference` (a checked scalar loop) gives the same
+bits. An fma rounds once, so the result can differ in the last bits from
+`mmul-scalar` (multiply, then add), which is unchanged. A target without a wide
+vector (SSE: `x86-64`, `x86-64-v2`) has no hardware fma, where an fma is a libm
+call 30 times slower; there `mmul` keeps the earlier multiply-then-add tiles
+(4×8 for widths at least 32 and 4×4 below, inner blocks of 128, output blocks of 64
+or 32 for packed `f64` panels, scalar edges), which the safe tuning interface
+(`gemm-f64/multiply-mode`, 8×4 tiles, sizes 32, 64, 128) also exposes on every target. No cross-target
+bitwise reproducibility is promised. Integer multiplication uses the checked
+scalar reference. Batched multiplication, decompositions, and BLAS integration
+remain future work.
 
 `sum-fast` and `dot-fast` use four independent SIMD accumulators: 32 `f32`
 elements or 16 `f64` elements per unrolled iteration, followed by vector and

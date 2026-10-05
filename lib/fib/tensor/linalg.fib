@@ -1,7 +1,7 @@
 ;; Scalar reference kernels support arbitrary checked strides and empty inner dimensions.
 (ns fib.tensor.linalg
   (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage)
-  (:require [fib.tensor.gemm-f32 :as g32] [fib.tensor.gemm-f64 :as g64]))
+  (:require [fib.tensor.gemm-f32 :as g32] [fib.tensor.gemm-fma-f32 :as gf32] [fib.tensor.gemm-f64 :as g64] [fib.tensor.gemm-fma-f64 :as gf64]))
 
 (defun dot (a: (Tensor t) b: (Tensor t)) :where ((Element t) (Num t)) -> t
   (do (when (or (!= (rank a) 1) (!= (rank b) 1)) (trap "tensor: dot requires rank one"))
@@ -41,8 +41,13 @@
   (matrix-multiply (self a: (Tensor Self) b: (Tensor Self)) -> (Tensor Self)))
 (impl MatrixKernel i32 (matrix-multiply (self a b) (mmul-scalar a b)))
 (impl MatrixKernel i64 (matrix-multiply (self a b) (mmul-scalar a b)))
-(impl MatrixKernel f32 (matrix-multiply (self a b) (g32/multiply a b)))
-(impl MatrixKernel f64 (matrix-multiply (self a b) (g64/multiply a b)))
+
+;; The fused kernels need a hardware fma: an fma without one is a libm call (200 ms against 6 ms for a 512 product at
+;; x86-64-v2). A target whose native f64 vector is narrower than four lanes (SSE: x86-64, x86-64-v2) has no AVX2 and
+;; so takes the multiply-then-add tiles. The condition is a constant of the target, folded at compile time.
+(defun fused-target? () -> bool (>= (native-lanes f64) 4))
+(impl MatrixKernel f32 (matrix-multiply (self a b) (if (fused-target?) (gf32/multiply a b) (g32/multiply a b))))
+(impl MatrixKernel f64 (matrix-multiply (self a b) (if (fused-target?) (gf64/multiply a b) (g64/multiply a b))))
 
 (defun mmul (a: (Tensor t) b: (Tensor t)) :where ((Element t) (Num t) (MatrixKernel t)) -> (Tensor t)
   (matrix-multiply (. a seed) a b))
