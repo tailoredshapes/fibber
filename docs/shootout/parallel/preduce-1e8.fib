@@ -1,0 +1,33 @@
+;; preduce of 1e8 f64: the sequential scalar loop, the fixed tree (pfold-chunks, chunk loops written out) at 1, 2, 4, 8, 16, 28 workers, and the
+;; closure-per-element preduce-n at 8 workers and the macro preduce-range at 28. The data is ((11 i mod 101) - 50)/7 in an (Array f64) (800 MB).
+;; Run: ulimit -v 16000000; MALLOC_ARENA_MAX=2 flock /tmp/fibsuite.lock fibc run preduce-1e8.fib -I lib
+(ns main (:use fib.core fib.parallel fib.os))
+(defun unwrap-ok (r: (Result i64 OSError)) -> i64 (match r ((Ok v) v) ((Err e) 0)))
+(defun now-us () -> i64 (quot (unwrap-ok (monotonic-ns)) 1000))
+(defun ms (a: i64 b: i64) -> i64 (quot (- b a) 1000))
+(defun make (n: i64) -> (Array f64)
+  (let [a (cell (array n 0.0))]
+    (do (dotimes (i n) (array-set! &a i (/ (double (- (rem (* 11 i) 101) 50)) 7.0))) @a)))
+(defun sum-range (a: (Array f64) lo: i64 hi: i64) -> f64
+  (loop [i lo acc 0.0] (if (< i hi) (recur (+ i 1) (+ acc (array-get a i))) acc)))
+(defun psum (a: (Array f64) w: i64) -> f64
+  (pfold-chunks (Par w 0 false) (array-len a) + 0.0 (fn (lo hi) (sum-range a lo hi))))
+(defun main () -> i64
+  (let [n 100000000
+        a (make n)
+        t0 (now-us) s (sum-range a 0 n)
+        t1 (now-us) r1 (psum a 1)
+        t2 (now-us) r2 (psum a 2)
+        t3 (now-us) r4 (psum a 4)
+        t4 (now-us) r8 (psum a 8)
+        t5 (now-us) r16 (psum a 16)
+        t6 (now-us) r28 (psum a 28)
+        t7 (now-us) rc (preduce-n (Par 8 0 false) + 0.0 (fn (i) (array-get a i)) n)
+        t8 (now-us) rr (preduce-range [i n (Par 28 0 false)] + 0.0 (array-get a i))
+        t9 (now-us)]
+    (do (println "sequential scalar loop" (ms t0 t1) "ms" s)
+        (println "fixed tree workers 1:" (ms t1 t2) " 2:" (ms t2 t3) " 4:" (ms t3 t4) " 8:" (ms t4 t5) " 16:" (ms t5 t6) " 28:" (ms t6 t7))
+        (println "values" r1 r2 r4 r8 r16 r28 (= r1 r2) (= r2 r4) (= r4 r8) (= r8 r16) (= r16 r28))
+        (println "preduce-n (closure per element) workers 8:" (ms t7 t8) rc)
+        (println "preduce-range (step made inside the chunk) workers 28:" (ms t8 t9) rr (= rr r1))
+        0)))

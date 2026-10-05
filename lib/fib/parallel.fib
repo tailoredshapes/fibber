@@ -73,3 +73,33 @@
               (fn (~lo ~hi) (fib.parallel/each-chunk (fn (~(vec-nth items 0)) (do ~@body ())) ~lo ~hi))))
          (trap "pfor-range: the spec is [i n] or [i n par]")))
     (_ (trap "pfor-range: the spec is [i n] or [i n par]"))))
+
+;; The reductions' per-element forms, for the same reason as above: the element step is made inside each chunk, so a closure shared by the workers is
+;; called once per chunk. `combine` is called as an operator (`+`, `max`, a function name or a lambda) and is also the combiner of the tree.
+;;   (preduce-each [x xs] + 0.0 (* x x))        the sum of the squares of a Vec
+;;   (preduce-range [i n] + 0.0 (array-get a i))  the sum over the indices [0, n)
+;; The spec is `[x xs]` or `[x xs par]`. The tree is the deterministic one of fib.parallel.reduce.
+(defmacro preduce-each (spec combine init ... body)
+  (match spec
+    ((Vec items)
+     (if (or (= (vec-count items) 2) (= (vec-count items) 3))
+         (let ((v (gensym "preduce-vec")) (lo (gensym "preduce-lo")) (hi (gensym "preduce-hi")) (acc (gensym "preduce-acc"))
+               (z (gensym "preduce-init"))
+               (p (if (= (vec-count items) 3) (vec-nth items 2) `(fib.parallel/par))))
+           `(let ((~v ~(vec-nth items 1)) (~z ~init))
+              (fib.parallel/pfold-chunks ~p (fib.prelude/vec-count ~v) ~combine ~z
+                (fn (~lo ~hi) (fib.parallel/fold-chunk (fn (~acc ~(vec-nth items 0)) (~combine ~acc (do ~@body))) ~z ~v ~lo ~hi)))))
+         (trap "preduce-each: the spec is [x xs] or [x xs par]")))
+    (_ (trap "preduce-each: the spec is [x xs] or [x xs par]"))))
+
+(defmacro preduce-range (spec combine init ... body)
+  (match spec
+    ((Vec items)
+     (if (or (= (vec-count items) 2) (= (vec-count items) 3))
+         (let ((lo (gensym "preduce-lo")) (hi (gensym "preduce-hi")) (acc (gensym "preduce-acc")) (z (gensym "preduce-init"))
+               (p (if (= (vec-count items) 3) (vec-nth items 2) `(fib.parallel/par))))
+           `(let ((~z ~init))
+              (fib.parallel/pfold-chunks ~p ~(vec-nth items 1) ~combine ~z
+                (fn (~lo ~hi) (fib.parallel/fold-index-chunk (fn (~acc ~(vec-nth items 0)) (~combine ~acc (do ~@body))) ~z ~lo ~hi)))))
+         (trap "preduce-range: the spec is [i n] or [i n par]")))
+    (_ (trap "preduce-range: the spec is [i n] or [i n par]"))))

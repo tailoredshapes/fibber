@@ -32,7 +32,7 @@ case $MODE in
   chunks-order)         CASES=(7534- 7535-) ;;
   chunks-task-per-chunk) CASES=(7537-) ;;
   chunks-trap-message)  CASES=(7538- 7539-) ;;
-  reduce-grain-by-workers) CASES=(7540-) ;;
+  reduce-grain-by-workers) CASES=(7540- 7544-) ;;
   reduce-left-combine)  CASES=(7540- 7541-) ;;
   scan-wrong-carry)     CASES=(7542-) ;;
   seq-window-overlap)   CASES=(7543-) ;;
