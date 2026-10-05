@@ -1,0 +1,50 @@
+;; A vector of i64 as a linked list, written for the test: the second implementation of the Vec contract. Every update rebuilds the
+;; list (so nothing is shared and every version is persistent by construction); lookup and append walk it.
+(ns listvec)
+
+(defstruct ListVec (xs: (List i64)))
+(derive Eq ListVec)
+
+(defun lv-empty () -> ListVec (ListVec Empty))
+
+(defun at :private (l: (List i64) i: i64) -> (Option i64)
+  (match l
+    ((Empty) nil)
+    ((Cons h t) (cond (< i 0) nil (= i 0) (some h) :else (at t (- i 1))))))
+
+(defun append :private (l: (List i64) x: i64) -> (List i64)
+  (match l
+    ((Empty) (Cons x Empty))
+    ((Cons h t) (Cons h (append t x)))))
+
+(defun put :private (l: (List i64) i: i64 x: i64) -> (List i64)
+  (match l
+    ((Empty) (if (= i 0) (Cons x Empty) (trap "assoc: index out of range")))
+    ((Cons h t) (if (= i 0) (Cons x t) (Cons h (put t (- i 1) x))))))
+
+;; Everything but the last element.
+(defun init :private (l: (List i64)) -> (List i64)
+  (match l
+    ((Empty) (trap "pop: empty"))
+    ((Cons h t) (match t ((Empty) Empty) (_ (Cons h (init t)))))))
+
+(defun walk :private (l: (List i64) k: (fn (i64) bool) :borrow) -> bool
+  (match l
+    ((Empty) true)
+    ((Cons h t) (if (k h) (walk t k) false))))
+
+(impl (Collection ListVec i64) ListVec
+  (conj (self x) (ListVec (append (. self xs) x))))
+
+(impl (Lookup i64 i64) ListVec
+  (get (self i) (at (. self xs) i)))
+
+(impl (Assoc i64 i64) ListVec
+  (assoc (self i x) (ListVec (put (. self xs) i x))))
+
+(impl (Stack i64) ListVec
+  (peek (self) (last (. self xs)))
+  (pop (self) (ListVec (init (. self xs)))))
+
+(impl (Reducible i64) ListVec
+  (each-while (self k) (walk (. self xs) k)))

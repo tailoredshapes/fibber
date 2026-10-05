@@ -1,0 +1,61 @@
+;; The Vec contract: what any persistent vector of i64 must do, whoever implements it (docs/design/test-harness.md 2.5). It names no
+;; implementation: `make` builds an empty one, and the library's protocols (Collection conj, Lookup get, Assoc assoc, Stack peek and pop,
+;; Reducible count and nth, Eq) are all the scenarios call, so each implementation gets its own monomorphised copy. PERSISTENCE is the
+;; point of most scenarios: an update returns a new version and the version it was made from keeps what it held.
+;; The out-of-range `nth` is a trap by the spec (stdlib §2.3), so its scenario runs the call in a task and asks `try-join` whether it trapped.
+(ns vec-contract (:use fib.test.core) (:require [fib.async :as as]))
+
+(defun traps? (f: (fn :send () i64)) -> bool
+  (match (as/try-join (spawn f)) ((Err _) true) ((Ok _) false)))
+
+(defcontract VecContract [make]
+  (scenario "an empty vector holds nothing"
+    (covers "count" "get" "peek")
+    (given [v (make)])
+    (then (expect = 0 (count v)) (expect = nil (get v 0)) (expect = nil (peek v))))
+  (scenario "conj appends at the end, in order"
+    (covers "conj" "nth" "get" "peek")
+    (given [v (conj (conj (conj (make) 10) 20) 30)])
+    (then (expect = 3 (count v)) (expect = [10 20 30] (vec v)) (expect = (some 20) (get v 1)) (expect = (some 30) (peek v))))
+  (scenario "conj leaves the version it was made from unchanged"
+    (covers "conj")
+    (given [a (conj (conj (make) 1) 2)])
+    (upon [b (conj a 3)])
+    (then (expect = 2 (count a)) (expect = [1 2] (vec a)) (expect = nil (get a 2))))
+  (scenario "assoc replaces the element at an index"
+    (covers "assoc")
+    (given [v (conj (conj (conj (make) 1) 2) 3)])
+    (upon [w (assoc v 1 20)])
+    (then (expect = [1 20 3] (vec w)) (expect = 3 (count w))))
+  (scenario "assoc leaves the version it was made from unchanged"
+    (covers "assoc")
+    (given [v (conj (conj (conj (make) 1) 2) 3)])
+    (upon [w (assoc v 1 20)])
+    (then (expect = [1 2 3] (vec v)) (expect = (some 2) (get v 1))))
+  (scenario "assoc at the count appends"
+    (covers "assoc")
+    (given [v (conj (make) 1)])
+    (upon [w (assoc v 1 2)])
+    (then (expect = [1 2] (vec w)) (expect = [1] (vec v))))
+  (scenario "pop removes the last element"
+    (covers "pop" "peek")
+    (given [v (conj (conj (conj (make) 1) 2) 3)])
+    (upon [p (pop v)])
+    (then (expect = [1 2] (vec p)) (expect = (some 2) (peek p)) (expect = 2 (count p))))
+  (scenario "pop leaves the version it was made from unchanged"
+    (covers "pop")
+    (given [v (conj (conj (make) 1) 2)])
+    (upon [p (pop v)])
+    (then (expect = [1 2] (vec v)) (expect = (some 2) (peek v))))
+  (scenario "get outside the vector is nil"
+    (covers "get")
+    (given [v (conj (conj (make) 1) 2)])
+    (then (expect = nil (get v 2)) (expect = nil (get v -1)) (expect = nil (get v 100))))
+  (scenario "nth outside the vector traps"
+    (covers "nth")
+    (given [v (conj (conj (make) 1) 2)])
+    (then (expect = true (traps? (fn () (nth v 2)))) (expect = true (traps? (fn () (nth v -1)))) (expect = 2 (nth v 1))))
+  (scenario "vectors built the same way are equal, and differ when an element does"
+    (covers "=")
+    (given [a (conj (conj (make) 1) 2) b (conj (conj (make) 1) 2) c (conj (conj (make) 1) 3)])
+    (then (expect = true (= a b)) (expect = false (= a c)) (expect = false (= a (conj b 3))))))
