@@ -1,0 +1,46 @@
+;; Undefined nullable variables omit object/argument members; in lists they become null.
+(ns fib.lacinia.input.resolve (:use fib.core fib.seq fib.coll fib.lacinia.types fib.lacinia.syntax)
+  (:require [fib.lacinia.input.core :as input]))
+(defun failure :private (message: str location: GqlLocation) -> GqlError (located-error ValidationFailure message location))
+(defun object-fields (state: input/GqlInputContext definitions: (Map str GqlArgument) supplied: (Map str GqlInput)
+  variables: (Map str GqlValue) location: GqlLocation depth: i64) -> (Result (Map str GqlValue) GqlError)
+  (let [names (vec (sort (keys definitions)))]
+    (loop [i 0 out: (Map str GqlValue) {}]
+      (if (= i (count names)) (Ok out)
+        (let [name (nth names i) definition (get definitions name (argument (named "String")))]
+          (try-let [given (match (get supplied name) (nil (Ok nil))
+            ((some expr) (value-at state (. definition type) expr variables location depth)))
+            value (match given ((some value) (Ok (some value)))
+              (nil (match (. definition default-value) (nil (Ok nil))
+                ((some value) (match (input/coerce state (. definition type) value)
+                  ((Ok value) (Ok (some value))) ((Err error) (Err (input/located error location))))))))]
+            (match value
+              ((some value) (recur (+ i 1) (assoc out name value)))
+              (nil (if (required? (. definition type)) (Err (failure (str "Required input " name " is missing") location)) (recur (+ i 1) out))))))))))
+(defun list-items :private (state: input/GqlInputContext element: GqlType values: (Vec GqlInput)
+  variables: (Map str GqlValue) location: GqlLocation depth: i64) -> (Result (Option GqlValue) GqlError)
+  (loop [i 0 out: (Vec GqlValue) []]
+    (if (= i (count values)) (Ok (some (ListValue out)))
+      (try-let [value (value-at state element (nth values i) variables location (+ depth 1))]
+        (let [item (unwrap-or value NullValue)]
+          (if (and (required? element) (null? item)) (Err (failure "A non-null list input cannot be null" location))
+            (recur (+ i 1) (conj out item))))))))
+(defun value-at (state: input/GqlInputContext expected: GqlType value: GqlInput variables: (Map str GqlValue)
+  location: GqlLocation depth: i64) -> (Result (Option GqlValue) GqlError)
+  (try-let [_ (match (input/spend state depth) ((Ok value) (Ok value)) ((Err error) (Err (input/located error location))))]
+    (match value
+      ((VariableInput name) (let [value (get variables name)]
+        (if (and (required? expected) (match value ((some value) (null? value)) (nil false)))
+          (Err (failure (str "Non-null input supplied by $" name " is null") location)) (Ok value))))
+      ((LiteralInput value) (match (input/coerce state expected value)
+        ((Ok value) (Ok (some value))) ((Err error) (Err (input/located error location)))))
+      (_ (match expected
+        ((NonNullType element) (value-at state element value variables location (+ depth 1)))
+        ((ListType element) (match value
+          ((ListInput values) (list-items state element values variables location depth))
+          (_ (try-let [item (value-at state element value variables location (+ depth 1))] (Ok (some (ListValue [(unwrap-or item NullValue)])))))))
+        ((NamedType name) (match value
+          ((ObjectInput fields) (match (get (. state objects) name)
+            ((some definition) (try-let [fields (object-fields state (. definition fields) fields variables location (+ depth 1))] (Ok (some (object fields)))))
+            (nil (Err (failure (str "Unknown input object " name) location)))))
+          (_ (Err (failure "Invalid input expression" location))))))))))

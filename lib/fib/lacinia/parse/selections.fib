@@ -1,0 +1,25 @@
+(ns fib.lacinia.parse.selections (:use fib.core fib.seq fib.coll fib.lacinia.types fib.lacinia.syntax)
+  (:require [fib.lacinia.parse.cursor :as p] [fib.lacinia.parse.values :as v] [fib.lacinia.parse.directives :as d]))
+(defun field-node :private (parser: p/GqlParser depth: i64 location: GqlLocation) -> (Result GqlNode GqlError)
+  (try-let [first-name (p/name parser)
+    field-name (if (p/at? parser ":") (do (p/advance parser) (p/name parser)) (Ok first-name))
+    args (v/arguments parser) directives (d/directives parser)
+    children (if (p/at? parser "{") (selections parser (+ depth 1)) (Ok []))]
+    (Ok (FieldNode field-name first-name args directives children location))))
+(defun spread-node :private (parser: p/GqlParser depth: i64 location: GqlLocation) -> (Result GqlNode GqlError)
+  (do (p/advance parser)
+    (if (or (p/at? parser "on") (p/at? parser "@") (p/at? parser "{"))
+      (try-let [condition (if (p/at? parser "on")
+        (do (p/advance parser) (try-let [name (p/name parser)] (Ok (some name)))) (Ok nil))
+        directives (d/directives parser) children (selections parser (+ depth 1))]
+        (Ok (InlineNode condition directives children location)))
+      (try-let [name (p/name parser) directives (d/directives parser)] (Ok (SpreadNode name directives location))))))
+(defun selections (parser: p/GqlParser depth: i64) -> (Result (Vec GqlNode) GqlError)
+  (if (> depth 64) (Err (located-error ResourceLimit "Selection nesting exceeds 64" (. (p/token parser) location)))
+    (try-let [_ (p/expect parser "{")]
+      (if (p/at? parser "}") (Err (p/failure parser "Selection set cannot be empty"))
+        (loop [out: (Vec GqlNode) []]
+          (let [location (. (p/token parser) location)]
+            (try-let [node (if (p/at? parser "...") (spread-node parser depth location) (field-node parser depth location))]
+              (let [next (conj out node)]
+                (if (p/at? parser "}") (do (p/advance parser) (Ok next)) (recur next))))))))))

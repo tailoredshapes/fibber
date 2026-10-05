@@ -1,0 +1,20 @@
+(ns fib.lacinia.plan.merge (:use fib.core fib.seq fib.coll fib.lacinia.types fib.lacinia.syntax))
+(defun merge-one :private (fields: (Vec GqlSelection) item: GqlSelection index: i64) -> (Result (Vec GqlSelection) GqlError)
+  (let [old (nth fields index)]
+    (if (or (!= (. old name) (. item name)) (!= (. old arguments) (. item arguments)))
+      (Err (GqlError ValidationFailure (str "Conflicting fields for response key " (. item response-key))
+        [(. old location) (. item location)] []))
+      (Ok (assoc fields index (with old (children
+        (reduce (fn (all: (Vec GqlSelection) child: GqlSelection) (conj all child)) (. old children) (. item children)))))))))
+(defun fields (input: (Vec GqlSelection)) -> (Result (Vec GqlSelection) GqlError)
+  (loop [i 0 fields: (Vec GqlSelection) [] indices: (Map str i64) {}]
+    (if (= i (count input)) (Ok fields)
+      (let [item (nth input i) key (. item response-key)]
+        (match (get indices key)
+          (nil (recur (+ i 1) (conj fields item) (assoc indices key (count fields))))
+          ((some index) (try-let [merged (merge-one fields item index)] (recur (+ i 1) merged indices))))))))
+(defun validate (selections: (Vec GqlSelection)) -> (Result unit GqlError)
+  (try-let [merged (fields selections)]
+    (loop [i 0]
+      (if (= i (count merged)) (Ok ())
+        (try-let [_ (validate (. (nth merged i) children))] (recur (+ i 1)))))))

@@ -1,0 +1,33 @@
+;; spec: docs/design/lacinia.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use fib.core fib.seq fib.coll tl.check) (:require [fib.lacinia :as g] [tl.lacinia-query :as f]))
+(defun main () -> i64
+  (let [c (checks) calls (atom 0)
+        inputs (loop [i 26 types: (Map str g/GqlInputObjectType) {}]
+          (if (< i 0) types
+            (let [next (g/non-null (g/named (str "Layer" (+ i 1))))
+                  fields (if (= i 26) {"value" (g/argument (g/non-null (g/named "Int")))}
+                    {"left" (g/argument next) "right" (g/argument next)})]
+              (recur (- i 1) (assoc types (str "Layer" i) (g/input-object fields))))))]
+    (do (check c (match (g/compile-schema (with (g/schema {} {"count" (g/field (g/named "Int"))})
+      (input-objects inputs))) ((Ok _) true) ((Err _) false)))
+      (match (g/compile-schema (f/definition calls))
+        ((Err _) (check c false))
+        ((Ok schema)
+          (let [items (loop [i 0 out: (Vec g/GqlValue) []]
+                  (if (= i 70000) out (recur (+ i 1) (conj out (g/StringValue "one")))))
+                nested (loop [i 0 value (g/object {})]
+                  (if (= i 70) value (recur (+ i 1) (g/object {"nested" value}))))
+                wide (g/execute schema "query($terms: [String!]) { filter(input: {terms: $terms}) }"
+                  {"terms" (g/ListValue items)} g/NullValue)
+                deep (g/execute schema "query($input: Filter) { filter(input: $input) }" {"input" nested} g/NullValue)]
+            (do (check c (f/request-error? wide))
+              (check c (= (. (nth (. wide errors) 0) kind) g/ResourceLimit))
+              (check c (f/request-error? deep))
+              (check c (= (. (nth (. deep errors) 0) kind) g/ResourceLimit))
+              (check c (= @calls 0))))))
+      (checks-result c))))

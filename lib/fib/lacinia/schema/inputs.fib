@@ -1,0 +1,31 @@
+(ns fib.lacinia.schema.inputs (:use fib.core fib.seq fib.coll fib.lacinia.types)
+  (:require [fib.lacinia.input.core :as input] [fib.lacinia.coerce :as c]))
+(defun required-link :private (type: GqlType) -> (Option str)
+  (match type ((NonNullType (NamedType name)) (some name)) (_ nil)))
+(defun acyclic? :private (objects: (Map str GqlInputObjectType) name: str path: (Set str)
+  checked: (Cell (Set str)) depth: i64) -> bool
+  (cond (or (contains? path name) (> depth 64)) false
+    (contains? @checked name) true
+    :else
+    (match (get objects name) (nil true)
+      ((some definition) (let [valid (every? (fn (key: str)
+        (match (required-link (. (get (. definition fields) key (argument (named "String"))) type))
+          (nil true) ((some next) (acyclic? objects next (conj path name) checked (+ depth 1))))) (keys (. definition fields)))]
+        (do (if valid (set! checked (conj @checked name)) ()) valid))))))
+(defun validate (objects: (Map str GqlObjectType) inputs: (Map str GqlInputObjectType)
+  valid-name: (fn (str) bool)) -> (Vec GqlError)
+  (let [state (input/context inputs) checked: (Cell (Set str)) (cell #{})]
+    (reduce (fn (errors: (Vec GqlError) name: str)
+      (let [definition (get inputs name (input-object {}))
+            first (if (or (not (valid-name name)) (c/scalar? name) (contains? objects name))
+              (conj errors (schema-error (str "Invalid or duplicate input type " name))) errors)
+            next (if (or (empty? (. definition fields)) (not (acyclic? inputs name #{} checked 0)))
+              (conj first (schema-error (str "Empty input object or non-null input cycle at " name))) first)]
+        (reduce (fn (errors: (Vec GqlError) field-name: str)
+          (let [field (get (. definition fields) field-name (argument (named "String")))
+                typed (if (and (valid-name field-name) (input/input-type? inputs (. field type) 0)) errors
+                  (conj errors (schema-error (str "Invalid input field " name "/" field-name))))]
+            (match (. field default-value) (nil typed)
+              ((some value) (match (input/coerce state (. field type) value)
+                ((Ok _) typed) ((Err error) (conj typed (schema-error (. error message)))))))))
+          next (vec (sort (keys (. definition fields))))))) [] (vec (sort (keys inputs))))))

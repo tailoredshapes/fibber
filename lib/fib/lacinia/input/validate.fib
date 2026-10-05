@@ -1,0 +1,47 @@
+;; Checks every expression, including variable uses beneath skipped selections.
+(ns fib.lacinia.input.validate (:use fib.core fib.seq fib.coll fib.lacinia.types fib.lacinia.syntax)
+  (:require [fib.lacinia.input.core :as input] [fib.lacinia.variables :as vars]))
+(defun object-fields :private (state: input/GqlInputContext variables: (Map str GqlVariable) definitions: (Map str GqlArgument)
+  supplied: (Map str GqlInput) used: (Cell (Set str)) location: GqlLocation depth: i64) -> (Result unit GqlError)
+  (if (some? (first (filter (fn (name: str) (not (contains? definitions name))) (keys supplied))))
+    (Err (located-error ValidationFailure "Unknown input field or argument" location))
+    (let [names (vec (sort (keys definitions)))]
+      (loop [i 0]
+        (if (= i (count names)) (Ok ())
+          (let [name (nth names i) definition (get definitions name (argument (named "String")))]
+            (match (get supplied name)
+              (nil (if (and (required? (. definition type)) (= (. definition default-value) nil))
+                (Err (located-error ValidationFailure (str "Required input " name " is missing") location)) (recur (+ i 1))))
+              ((some value) (try-let [_ (value-at state variables (. definition type) (some? (. definition default-value)) value used location depth)]
+                (recur (+ i 1)))))))))))
+(defun list-items :private (state: input/GqlInputContext variables: (Map str GqlVariable) element: GqlType
+  values: (Vec GqlInput) used: (Cell (Set str)) location: GqlLocation depth: i64) -> (Result unit GqlError)
+  (loop [i 0]
+    (if (= i (count values)) (Ok ())
+      (try-let [_ (value-at state variables element false (nth values i) used location (+ depth 1))] (recur (+ i 1))))))
+(defun variable-use :private (variables: (Map str GqlVariable) name: str expected: GqlType has-default: bool
+  used: (Cell (Set str)) location: GqlLocation) -> (Result unit GqlError)
+  (match (get variables name)
+    (nil (Err (located-error ValidationFailure (str "Undefined variable $" name) location)))
+    ((some variable) (if (vars/allowed? (. variable definition) expected has-default)
+      (do (set! used (conj @used name)) (Ok ()))
+      (Err (located-error ValidationFailure (str "Variable $" name " has an incompatible type") location))))))
+(defun value-at (state: input/GqlInputContext variables: (Map str GqlVariable) expected: GqlType has-default: bool
+  value: GqlInput used: (Cell (Set str)) location: GqlLocation depth: i64) -> (Result unit GqlError)
+  (try-let [_ (match (input/spend state depth) ((Ok value) (Ok value)) ((Err error) (Err (input/located error location))))]
+    (match value
+      ((VariableInput name) (variable-use variables name expected has-default used location))
+      ((LiteralInput value) (match (input/coerce state expected value) ((Ok _) (Ok ())) ((Err error) (Err (input/located error location)))))
+      (_ (match expected
+        ((NonNullType element) (value-at state variables element false value used location (+ depth 1)))
+        ((ListType element) (match value
+          ((ListInput values) (list-items state variables element values used location depth))
+          (_ (value-at state variables element false value used location (+ depth 1)))))
+        ((NamedType name) (match value
+          ((ObjectInput fields) (match (get (. state objects) name)
+            (nil (Err (located-error ValidationFailure (str "Expected a scalar " name) location)))
+            ((some definition) (object-fields state variables (. definition fields) fields used location (+ depth 1)))))
+          (_ (Err (located-error ValidationFailure "Expected a scalar or input object" location))))))))))
+(defun arguments (state: input/GqlInputContext variables: (Map str GqlVariable) definitions: (Map str GqlArgument)
+  supplied: (Map str GqlInput) used: (Cell (Set str)) location: GqlLocation) -> (Result unit GqlError)
+  (object-fields state variables definitions supplied used location 0))

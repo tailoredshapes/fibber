@@ -1,36 +1,37 @@
-(ns fib.lacinia.parse.values (:use fib.core fib.seq fib.coll fib.lacinia.types)
+(ns fib.lacinia.parse.values (:use fib.core fib.seq fib.coll fib.lacinia.types fib.lacinia.syntax)
   (:require [fib.lacinia.parse.cursor :as p] [fib.lacinia.lex.numbers :as n]))
-(defun list-value :private (parser: p/GqlParser depth: i64) -> (Result GqlValue GqlError)
+(defun list-value :private (parser: p/GqlParser depth: i64) -> (Result GqlInput GqlError)
   (do (p/advance parser)
-    (loop [items: (Vec GqlValue) []]
-      (if (p/at? parser "]") (do (p/advance parser) (Ok (ListValue items)))
+    (loop [items: (Vec GqlInput) []]
+      (if (p/at? parser "]") (do (p/advance parser) (Ok (ListInput items)))
         (try-let [item (value parser (+ depth 1))] (recur (conj items item)))))))
-(defun object-value :private (parser: p/GqlParser depth: i64) -> (Result GqlValue GqlError)
+(defun object-value :private (parser: p/GqlParser depth: i64) -> (Result GqlInput GqlError)
   (do (p/advance parser)
-    (loop [fields: (Map str GqlValue) {}]
-      (if (p/at? parser "}") (do (p/advance parser) (Ok (object fields)))
+    (loop [fields: (Map str GqlInput) {}]
+      (if (p/at? parser "}") (do (p/advance parser) (Ok (ObjectInput fields)))
         (try-let [name (p/name parser) _ (p/expect parser ":")]
           (if (contains? fields name) (Err (p/failure parser "Duplicate input object field"))
             (try-let [item (value parser (+ depth 1))] (recur (assoc fields name item)))))))))
-(defun value (parser: p/GqlParser depth: i64) -> (Result GqlValue GqlError)
+(defun value (parser: p/GqlParser depth: i64) -> (Result GqlInput GqlError)
   (let [token (p/token parser)]
     (if (> depth 64) (Err (located-error ResourceLimit "Input nesting exceeds 64" (. token location)))
-      (cond (p/at? parser "$") (Err (p/unsupported parser "Variables are not implemented yet"))
+      (cond (p/at? parser "$") (do (p/advance parser) (try-let [name (p/name parser)] (Ok (VariableInput name))))
         (p/at? parser "[") (list-value parser depth) (p/at? parser "{") (object-value parser depth)
-        (= (. token kind) "string") (do (p/advance parser) (Ok (StringValue (. token text))))
+        (= (. token kind) "string") (do (p/advance parser) (Ok (LiteralInput (StringValue (. token text)))))
         (= (. token kind) "int") (do (p/advance parser)
-          (match (parse-long (. token text)) ((some number) (Ok (IntValue number)))
+          (match (parse-long (. token text)) ((some number) (Ok (LiteralInput (IntValue number))))
             (nil (Err (located-error ParseFailure "Integer literal exceeds native i64" (. token location))))))
-        (= (. token kind) "float") (do (p/advance parser) (n/float-value token))
+        (= (. token kind) "float") (do (p/advance parser)
+          (try-let [value (n/float-value token)] (Ok (LiteralInput value))))
         (= (. token kind) "name") (do (p/advance parser)
-          (Ok (cond (= (. token text) "null") NullValue (= (. token text) "true") (BooleanValue true)
-            (= (. token text) "false") (BooleanValue false) :else (EnumValue (. token text)))))
+          (Ok (LiteralInput (cond (= (. token text) "null") NullValue (= (. token text) "true") (BooleanValue true)
+            (= (. token text) "false") (BooleanValue false) :else (EnumValue (. token text))))))
         :else (Err (p/failure parser "Expected an input value"))))))
-(defun arguments (parser: p/GqlParser) -> (Result (Map str GqlValue) GqlError)
+(defun arguments (parser: p/GqlParser) -> (Result (Map str GqlInput) GqlError)
   (if (not (p/at? parser "(")) (Ok {})
     (do (p/advance parser)
       (if (p/at? parser ")") (Err (p/failure parser "Argument list cannot be empty"))
-        (loop [arguments: (Map str GqlValue) {}]
+        (loop [arguments: (Map str GqlInput) {}]
           (try-let [name (p/name parser) _ (p/expect parser ":")]
             (if (contains? arguments name) (Err (p/failure parser "Duplicate argument"))
               (try-let [item (value parser 0)]

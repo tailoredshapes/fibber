@@ -26,27 +26,3 @@
       ((FloatValue number) (if (finite? number) (Ok value) (Err "Float must be finite"))) (_ (Err "Expected a Float")))
     (= name "Boolean") (match value ((BooleanValue _) (Ok value)) (_ (Err "Expected a Boolean")))
     :else (Err (str "Unsupported scalar " name))))
-(defun input-value (type: GqlType value: GqlValue) -> (Result GqlValue str)
-  (match type
-    ((NonNullType element) (if (null? value) (Err "A non-null input cannot be null") (input-value element value)))
-    (_ (if (null? value) (Ok NullValue)
-      (match type
-        ((NamedType name) (scalar-value name value true))
-        ((ListType element)
-          (let [items (match value ((ListValue items) items) (_ [value]))]
-            (loop [i 0 out: (Vec GqlValue) []]
-              (if (= i (count items)) (Ok (ListValue out))
-                (try-let [item (input-value element (nth items i))] (recur (+ i 1) (conj out item)))))))
-        (_ (Err "Invalid input type")))))))
-(defun arguments (field: GqlField supplied: (Map str GqlValue)) -> (Result (Map str GqlValue) str)
-  (if (some? (first (filter (fn (key: str) (not (contains? (. field arguments) key))) (keys supplied))))
-    (Err "Unknown argument")
-    (let [names (vec (sort (keys (. field arguments))))]
-      (loop [i 0 out: (Map str GqlValue) {}]
-        (if (= i (count names)) (Ok out)
-          (let [name (nth names i) definition (get (. field arguments) name (argument (named "String")))
-                value (match (get supplied name) ((some value) (some value)) (nil (. definition default-value)))]
-            (match value
-              ((some value) (try-let [coerced (input-value (. definition type) value)]
-                (recur (+ i 1) (assoc out name coerced))))
-              (nil (if (required? (. definition type)) (Err (str "Required argument " name " is missing")) (recur (+ i 1) out))))))))))

@@ -1,0 +1,27 @@
+;; spec: docs/design/lacinia.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use fib.core fib.seq fib.coll tl.check) (:require [fib.lacinia :as g] [tl.lacinia-query :as f]))
+(defun main () -> i64
+  (let [c (checks) calls (atom 0)]
+    (do (match (g/compile-schema (f/definition calls))
+      ((Err _) (check c false))
+      ((Ok schema)
+        (let [query "query($x: Boolean = true) { ...P ...P @include(if: $x) } fragment P on Query { count person { name } }"
+              repeated (g/execute schema query {"x" g/NullValue} g/NullValue)
+              empty (g/execute schema "query($x: Boolean = true) { ...P ...P @include(if: $x) } fragment P on Query { count @skip(if: true) }" {"x" g/NullValue} g/NullValue)
+              skipped (g/execute schema "query($x: Boolean = true) { ...P @skip(if: true) ...P @include(if: $x) } fragment P on Query { count }" {"x" g/NullValue} g/NullValue)
+              scopes (g/execute schema "{ person { ...P friend { ...P } } } fragment P on Person { name }" {} g/NullValue)]
+          (do (check c (empty? (. repeated errors)))
+            (check c (= (f/member repeated "count") (g/IntValue 0)))
+            (check c (= (g/field-value (f/member repeated "person") "name") (g/StringValue "Ada")))
+            (check c (= (. empty data) (some (g/object {}))))
+            (check c (empty? (. empty errors)))
+            (check c (= (. skipped data) (some g/NullValue)))
+            (check c (= (count (. skipped errors)) 1))
+            (check c (= (g/field-value (g/field-value (f/member scopes "person") "friend") "name") (g/StringValue "Bob")))
+            (check c (= @calls 3))))))
+      (checks-result c))))

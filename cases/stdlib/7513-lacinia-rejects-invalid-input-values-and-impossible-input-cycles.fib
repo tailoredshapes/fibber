@@ -1,0 +1,27 @@
+;; spec: docs/design/lacinia.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use fib.core fib.seq fib.coll tl.check) (:require [fib.lacinia :as g] [tl.lacinia-query :as f]))
+(defun main () -> i64
+  (let [c (checks) calls (atom 0) root (g/schema {} {"count" (g/field (g/named "Int"))})]
+    (do (match (g/compile-schema (f/definition calls))
+      ((Err _) (check c false))
+      ((Ok schema) (do
+        (doseq [query ["{ filter(input: {extra: 1}) }" "{ filter(input: {limit: null}) }"
+          "{ filter(input: {terms: [null]}) }" "{ filter(input: {nested: {limit: \"bad\"}}) }"
+          "{ filter(input: {limit: 1, limit: 2}) }"]]
+          (check c (f/request-error? (g/execute schema query {} g/NullValue))))
+        (doseq [value [(g/StringValue "not an object") (g/object {"extra" (g/IntValue 1)}) (g/object {"limit" g/NullValue})]]
+          (check c (f/request-error? (g/execute schema "query($x: Filter) { filter(input: $x) }" {"x" value} g/NullValue))))
+        (check c (= @calls 0)))) )
+      (doseq [inputs [{"Loop" (g/input-object {"next" (g/argument (g/non-null (g/named "Loop")))})}
+        {"Bad" (g/input-object {"x" (g/argument (g/named "Missing"))})}
+        {"Bad" (g/input-object {"x" (with (g/argument (g/named "String")) (default-value (some (g/IntValue 1))))})}
+        {"Loop" (g/input-object {"next" (with (g/argument (g/named "Loop")) (default-value (some (g/object {}))))})}]]
+        (check c (match (g/compile-schema (with root (input-objects inputs))) ((Err _) true) (_ false))))
+      (let [loop-input (g/input-object {"next" (g/argument (g/list-of (g/non-null (g/named "Loop"))))})]
+        (check c (match (g/compile-schema (with root (input-objects {"Loop" loop-input}))) ((Ok _) true) (_ false))))
+      (checks-result c))))

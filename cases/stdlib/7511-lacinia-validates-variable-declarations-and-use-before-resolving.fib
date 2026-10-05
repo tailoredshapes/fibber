@@ -1,0 +1,22 @@
+;; spec: docs/design/lacinia.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use fib.core fib.seq fib.coll tl.check) (:require [fib.lacinia :as g] [tl.lacinia-query :as f]))
+(defun main () -> i64
+  (let [c (checks) calls (atom 0)]
+    (do (match (g/compile-schema (f/definition calls))
+      ((Err _) (check c false))
+      ((Ok schema) (do
+        (doseq [query ["query($x: String, $x: String) { echo(text: $x) }" "query($unused: Int) { count }"
+          "{ echo(text: $missing) }" "query($x: Missing) { echo(text: $x) }" "query($x: Person) { echo(text: $x) }"
+          "query($x: Int) { echo(text: $x) }" "query($x: String) { required(text: $x) }"
+          "query($x: String! = null) { required(text: $x) }" "query($x: String = $y) { echo(text: $x) }"
+          "query($x: [String]) { filter(input: {terms: $x}) }"]]
+          (check c (f/request-error? (g/execute schema query {"x" (g/StringValue "value")} g/NullValue))))
+        (check c (f/request-error? (g/execute schema "query($x: String!) { required(text: $x) }" {} g/NullValue)))
+        (check c (f/request-error? (g/execute schema "query($x: String!) { required(text: $x) }" {"x" g/NullValue} g/NullValue)))
+        (check c (f/request-error? (g/execute schema "query($x: String) { echo(text: $x) }" {"x" (g/IntValue 4)} g/NullValue)))
+        (check c (= @calls 0))))) (checks-result c))))
