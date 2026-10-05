@@ -103,25 +103,26 @@
         (let ((x ((. g make) (rng-new (stream-seed seed i)) (case-size i))))
           (if (holds x) (recur (+ i 1)) (some (Pair i x)))))))
 
-(defun run-prop (g: (Gen a) holds: (fn (a) bool) seed: i64 n: i64) -> (Vec StepRun)
+(defun run-prop (g: (Gen a) holds: (fn (a) bool) seed: i64 n: i64 at: str) -> (Vec StepRun)
   (match (first-failure g holds seed n)
-    (nil [(StepRun "Then" (str "For all x, " n " cases") Held)])
+    (nil [(StepRun "Then" (str "For all x, " n " cases") Held at)])
     ((some f)
      (let ((small (shrink-failing g holds (. f snd))))
        [(StepRun "Then" (str "For all x, " n " cases")
                  (Broke "the property to hold"
                         (str "it fails for x = " (pr-str (. small fst)) " (case " (. f fst) " drew " (pr-str (. f snd)) ", shrunk in " (. small snd)
-                             " steps)")))]))))
+                             " steps)"))
+                 at)]))))
 
 ;; A property as a scenario, so it is listed, selected, isolated and reported like any other.
-(defun prop-scenario (text: str plan: str g: (Gen a) holds: (fn (a) bool)) -> Scenario
+(defun prop-scenario (text: str plan: str at: str g: (Gen a) holds: (fn (a) bool)) -> Scenario
   (Scenario (slugify text) text [] [(str "For all x in the generator: " plan)]
-            (fn (seed: i64) (run-prop g holds seed default-cases))))
+            (fn (seed: i64) (run-prop g holds seed default-cases at)) at))
 
 ;; (prop "text" [x generator] body ..): body is a boolean form over x.
 (defmacro prop (text binding ... body)
   (match binding
     ((Vec bs)
-     `[(fib.test.gen/prop-scenario ~text (fib.test.core/form-text (quote (do ~@body))) ~(vec-nth bs 1)
+     `[(fib.test.gen/prop-scenario ~text (fib.test.core/form-text (quote (do ~@body))) (call-pos) ~(vec-nth bs 1)
                                   (fn (~(vec-nth bs 0)) (do ~@body)))])
     (_ (trap "prop: the binding is [x generator]"))))

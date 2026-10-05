@@ -29,8 +29,8 @@
 
 (defun encode-step :private (s: StepRun) -> str
   (match (. s judged)
-    ((Held) (str (esc (. s kind)) "\t" (esc (. s text)) "\tH\t\t\n"))
-    ((Broke e a) (str (esc (. s kind)) "\t" (esc (. s text)) "\tB\t" (esc e) "\t" (esc a) "\n"))))
+    ((Held) (str (esc (. s kind)) "\t" (esc (. s text)) "\tH\t\t\t" (esc (. s at)) "\n"))
+    ((Broke e a) (str (esc (. s kind)) "\t" (esc (. s text)) "\tB\t" (esc e) "\t" (esc a) "\t" (esc (. s at)) "\n"))))
 
 (defun encode (steps: (Vec StepRun)) -> str
   (str-join (mapv encode-step steps)))
@@ -47,13 +47,13 @@
 
 (defun decode (text: str) -> (Vec StepRun)
   (mapv (fn (f: (Vec str))
-          (StepRun (nth f 0) (nth f 1) (if (= (nth f 2) "H") Held (Broke (nth f 3) (nth f 4)))))
+          (StepRun (nth f 0) (nth f 1) (if (= (nth f 2) "H") Held (Broke (nth f 3) (nth f 4))) (nth f 5)))
         (. (reduce cut-step (WireCut [] [] "" false) (s/chars text)) lines)))
 
 ;; ---- one scenario, isolated -------------------------------------------------------------------------------------------------------
 
 ;; The report row of one scenario: what a reporter needs, nothing it must recompute.
-(defstruct ScenarioRow (head: str impl: str id: str text: str covers: (Vec str) plan: (Vec str) status: str steps: (Vec StepRun) message: str))
+(defstruct ScenarioRow (head: str impl: str id: str text: str covers: (Vec str) plan: (Vec str) status: str steps: (Vec StepRun) message: str at: str))
 
 (defun broken? :private (steps: (Vec StepRun)) -> bool
   (some? (first (filter (fn (s: StepRun) (match (. s judged) ((Held) false) ((Broke _ _) true))) steps))))
@@ -63,12 +63,12 @@
 
 ;; The status of a row from the steps it ran. A scenario with no Then cannot fail, and is refused as a failure.
 (defun judged-row :private (sc: Scenario head: str impl: str steps: (Vec StepRun)) -> ScenarioRow
-  (cond (not (thens? steps)) (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) "fail" steps "no Then step: a scenario that cannot fail")
-        (broken? steps) (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) "fail" steps "")
-        :else (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) "pass" steps "")))
+  (cond (not (thens? steps)) (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) "fail" steps "no Then step: a scenario that cannot fail" (. sc at))
+        (broken? steps) (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) "fail" steps "" (. sc at))
+        :else (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) "pass" steps "" (. sc at))))
 
 (defun failed-row :private (sc: Scenario head: str impl: str status: str message: str) -> ScenarioRow
-  (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) status [] message))
+  (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) status [] message (. sc at)))
 
 (defun last-line :private (text: str) -> str
   (let ((ls (filter (fn (l: str) (not (= l ""))) (s/split-lines text))))
@@ -99,7 +99,7 @@
 (defun jobs-of :private (suites: (Vec Suite) o: SpecOpts) -> (Vec ScenarioJob)
   (vec (filter (fn (j: ScenarioJob) (s/includes? (. (. j sc) id) (. o only)))
                (mapcat (fn (s: Suite)
-                         (mapv (fn (sc: Scenario) (ScenarioJob s (Scenario (full-id s sc) (. sc text) (. sc covers) (. sc steps) (. sc run)) (stream-seed (. o seed) (hash (. sc id))))) (. s scenarios)))
+                         (mapv (fn (sc: Scenario) (ScenarioJob s (Scenario (full-id s sc) (. sc text) (. sc covers) (. sc steps) (. sc run) (. sc at)) (stream-seed (. o seed) (hash (. sc id))))) (. s scenarios)))
                        suites))))
 
 (defun run-here :private (j: ScenarioJob) -> ScenarioRow
@@ -169,13 +169,14 @@
   (str-join (mapv (fn (s: StepRun)
                     (match (. s judged)
                       ((Held) (str "        " (. s text) "\n"))
-                      ((Broke e a) (str "      > " (. s text) "\n          expected: " e "\n          actual:   " a "\n"))))
+                      ((Broke e a) (str "      > " (. s text) "\n          expected: " e "\n          actual:   " a "\n"
+                                         (if (= (. s at) "") "" (str "          at " (. s at) "\n"))))))
                   (. r steps))))
 
 (defun row-plain :private (r: ScenarioRow) -> str
   (str (pad (mark (. r status)) 6) (. r text) "\n"
        (if (= (. r status) "pass") "" (str (step-lines r) (if (= (. r message) "") "" (str "        " (. r message) "\n"))
-                                           "        at " (. r id) "\n"))))
+                                           "        id " (. r id) (if (= (. r at) "") "" (str "  (" (. r at) ")")) "\n"))))
 
 (defun count-of (rows: (Vec ScenarioRow) status: str) -> i64
   (count (filter (fn (r: ScenarioRow) (= (. r status) status)) rows)))
@@ -206,12 +207,12 @@
 
 (defun step-json :private (s: StepRun) -> str
   (match (. s judged)
-    ((Held) (str "{\"kind\":" (js (. s kind)) ",\"text\":" (js (. s text)) ",\"status\":\"held\"}"))
-    ((Broke e a) (str "{\"kind\":" (js (. s kind)) ",\"text\":" (js (. s text)) ",\"status\":\"broke\",\"expected\":" (js e) ",\"actual\":" (js a) "}"))))
+    ((Held) (str "{\"kind\":" (js (. s kind)) ",\"text\":" (js (. s text)) ",\"status\":\"held\",\"at\":" (js (. s at)) "}"))
+    ((Broke e a) (str "{\"kind\":" (js (. s kind)) ",\"text\":" (js (. s text)) ",\"status\":\"broke\",\"expected\":" (js e) ",\"actual\":" (js a) ",\"at\":" (js (. s at)) "}"))))
 
 (defun row-json :private (r: ScenarioRow) -> str
   (str "{\"suite\":" (js (. r head)) ",\"impl\":" (js (. r impl)) ",\"id\":" (js (. r id)) ",\"text\":" (js (. r text))
-       ",\"covers\":" (js-list (. r covers)) ",\"status\":" (js (. r status)) ",\"message\":" (js (. r message))
+       ",\"covers\":" (js-list (. r covers)) ",\"status\":" (js (. r status)) ",\"message\":" (js (. r message)) ",\"at\":" (js (. r at))
        ",\"steps\":[" (str-join (vec (interpose "," (mapv step-json (. r steps))))) "]}"))
 
 ;; The run as one JSON document; the schema is in the design, §5.

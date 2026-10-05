@@ -41,6 +41,7 @@ sed -i '/(assoc (self k v)/,/(Dissoc i64)/ s/(if (< i 0)/(if (< i 1000)/' "$S/pl
 check "3 the plant is in the copy only" "$(diff "$R/compiler/tests/harness-proto/alist.fib" "$S/plant/alist.fib" | grep -c '^>')" 1
 "$FIBC" build "$S/plant/map-spec.fib" -o "$S/spec-plant" || exit 2
 out=$("$S/spec-plant" --only MapContract --format json); st=$?
+out_plant=$(echo "$out" | grep -o '"status":"broke","expected":"[^"]*","actual":"[^"]*","at":"[^"]*"' | sed 's|.*"at":".*/||')
 check "3 planted fault: exit" "$st" 1
 check "3 planted fault: one failure" "$(echo "$out" | grep -o '"summary":{[^}]*}')" '"summary":{"total":12,"pass":11,"fail":1,"trap":0,"timeout":0}'
 check "3 planted fault: in the AList, in the replace scenario" \
@@ -69,5 +70,7 @@ check "6 tap: the plan, then one not ok line" "$(echo "$out" | grep -E '^(1\.\.1
 "$S/spec" --no-isolate >/dev/null 2>&1; check "6 without isolation the same trap ends the run (so check 1 can fail): exit 134" "$?" 134
 "$S/spec" --isolate bogus >/dev/null 2>&1; check "6 a bad --isolate is a usage error (2)" "$?" 2
 
+# 7. locations: the planted fault's broken step names the line of its `expect` in the CONTRACT file (the macro's call-pos), not the spec's
+check "7 the broken step's position is the expect in the contract (file:line:col)" "$out_plant" 'map-contract.fib:18:11"'
 echo "harness-proto: $fails failed"
 exit $((fails > 0))

@@ -394,8 +394,14 @@
   (let ((items (unwrap-or (items-of form) (vec-empty)))
         (pos (. form pos))
         (argc (- (count (unwrap-or (items-of form) (vec-empty))) 1)))
-    (if (and (= name "gensym") (= argc 0) (not (some? (map-get @(. ctx own) "gensym"))))
+    (cond
+      (and (= name "gensym") (= argc 0) (not (some? (map-get @(. ctx own) "gensym"))))
         (Ok (Stx (SList (conj items (string "G__" pos))) pos))
+      ;; `(call-pos)`: the position of the call as a string literal "FILE:LINE:COL". A form a macro built carries the position of the
+      ;; macro call (syntax §1.3), so `(call-pos)` in a macro's template is the position of the call of that macro.
+      (and (= name "call-pos") (= argc 0) (not (some? (map-get @(. ctx own) "call-pos"))))
+        (Ok (string (str-join [(. pos file) ":" (show (. pos line)) ":" (show (. pos col))]) pos))
+      :else
         (match (pick-clause ctx name argc pos)
           ((Err e) (Err e))
           ((Ok nil) (Ok form))

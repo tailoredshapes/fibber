@@ -64,12 +64,13 @@
   (Held)
   (Broke expected: str actual: str))
 
-;; One step as it ran: its kind (`Given`, `When`, `Then`), its text, and what it came to (a Given and a When are Held).
-(defstruct StepRun (kind: str text: str judged: Judged))
+;; One step as it ran: its kind (`Given`, `When`, `Then`), its text, what it came to (a Given and a When are Held) and where it is: "FILE:LINE:COL"
+;; of its `expect` (`(call-pos)` of the macro), of the `scenario` or `prop` for a `then` item that is a plain boolean form, "" for a Given or When.
+(defstruct StepRun (kind: str text: str judged: Judged at: str))
 
 ;; A scenario: `id` is stable (the slug of feature and text, or the `(id ..)` the author wrote), `covers` links it to spec rows, `steps`
-;; is the plan (the text of each step) and `run` takes the seed of the run and executes it.
-(defstruct Scenario (id: str text: str covers: (Vec str) steps: (Vec str) run: (fn :send (i64) (Vec StepRun))))
+;; is the plan (the text of each step), `run` takes the seed of the run and executes it, and `at` is "FILE:LINE:COL" of the `scenario` form.
+(defstruct Scenario (id: str text: str covers: (Vec str) steps: (Vec str) run: (fn :send (i64) (Vec StepRun)) at: str))
 
 ;; A set of scenarios under one head: a feature (impl is "") or a contract run against one implementation.
 (defstruct Suite (head: str impl: str scenarios: (Vec Scenario)))
@@ -85,14 +86,14 @@
 
 ;; A Given or a When happened.
 (defun note (r: StepLog kind: str text: str) -> unit
-  (add-step r (StepRun kind text Held)))
+  (add-step r (StepRun kind text Held "")))
 
-;; A Then: `ok` is what the relation said; both sides are text for the report.
-(defun judge (r: StepLog text: str ok: bool expected: str actual: str) -> unit
-  (add-step r (StepRun "Then" text (if ok Held (Broke expected actual)))))
+;; A Then: `ok` is what the relation said; both sides are text for the report; `at` is where the `expect` stands.
+(defun judge (r: StepLog text: str at: str ok: bool expected: str actual: str) -> unit
+  (add-step r (StepRun "Then" text (if ok Held (Broke expected actual)) at)))
 
-(defun judge-true (r: StepLog text: str ok: bool) -> unit
-  (judge r text ok "true" "false"))
+(defun judge-true (r: StepLog text: str at: str ok: bool) -> unit
+  (judge r text at ok "true" "false"))
 
 ;; The id of a name: letters and digits kept, every other run of characters one `-`.
 (defun slugify (s: str) -> str
@@ -105,7 +106,7 @@
         out)))
 
 (defun scenario-in :private (head: str sc: Scenario) -> Scenario
-  (Scenario (str-concat (slugify head) (str-concat "/" (. sc id))) (. sc text) (. sc covers) (. sc steps) (. sc run)))
+  (Scenario (str-concat (slugify head) (str-concat "/" (. sc id))) (. sc text) (. sc covers) (. sc steps) (. sc run) (. sc at)))
 
 ;; The scenarios of a feature or contract, their ids prefixed with its slug.
 (defun in-feature (head: str scs: (Vec Scenario)) -> (Vec Scenario)
@@ -151,14 +152,10 @@
                                                            (match (vec-nth xs 0)
                                                              ((Sym r)
                                                               (if (= r "expect")
-                                                                  (let ((e (gensym "e")) (a (gensym "a")))
-                                                                    `(do (let ((~e ~(vec-nth xs 2)) (~a ~(vec-nth xs 3)))
-                                                                           (fib.test.core/judge ~log (fib.test.core/then-line (quote ~(vec-nth items j)))
-                                                                                                (~(vec-nth xs 1) ~e ~a) (pr-str ~e) (pr-str ~a)))
-                                                                         ~o))
-                                                                  `(do (fib.test.core/judge-true ~log (fib.test.core/then-line (quote ~(vec-nth items j))) ~(vec-nth items j)) ~o)))
-                                                             (_ `(do (fib.test.core/judge-true ~log (fib.test.core/then-line (quote ~(vec-nth items j))) ~(vec-nth items j)) ~o))))
-                                                          (x `(do (fib.test.core/judge-true ~log (fib.test.core/then-line (quote ~x)) ~x) ~o))))
+                                                                  `(do (~(vec-nth items j) ~log) ~o)
+                                                                  `(do (fib.test.core/judge-true ~log (fib.test.core/then-line (quote ~(vec-nth items j))) (call-pos) ~(vec-nth items j)) ~o)))
+                                                             (_ `(do (fib.test.core/judge-true ~log (fib.test.core/then-line (quote ~(vec-nth items j))) (call-pos) ~(vec-nth items j)) ~o))))
+                                                          (x `(do (fib.test.core/judge-true ~log (fib.test.core/then-line (quote ~x)) (call-pos) ~x) ~o))))
                                                  o)))
                                   :else (recur (- i 1) acc)))
                            (_ (recur (- i 1) acc))))
@@ -201,7 +198,16 @@
                                 (_ out)))
                        out))))
       `[(fib.test.core/Scenario (fib.test.core/slugify ~ident) ~text [~@covers] [~@plan]
-          (fn (~seed) (let ((~log (fib.test.core/new-rec))) ~body)))])))
+          (fn (~seed) (let ((~log (fib.test.core/new-rec))) ~body)) (call-pos))])))
+
+;; (expect rel expected actual): what a `then` of a scenario holds, a function of the scenario's log, so that `(call-pos)` here is the position of the
+;; `expect` as the author wrote it (a macro's template carries the position of the macro call, syntax §1.3) and a failure prints `file:line:col`. `scenario`
+;; reads the same form as text for the plan (`then-line`) and calls what it expands to with its log.
+(defmacro expect (rel expected actual)
+  (let ((e (gensym "e")) (a (gensym "a")) (r (gensym "r")))
+    `(fn (~r) (let ((~e ~expected) (~a ~actual))
+                (fib.test.core/judge ~r (fib.test.core/then-line (quote (expect ~rel ~expected ~actual))) (call-pos)
+                                     (~rel ~e ~a) (pr-str ~e) (pr-str ~a))))))
 
 ;; (outline "text" [a b] [[1 2] [3 4]] step ..): a scenario outline (Gherkin's Scenario Outline, a table of examples): one scenario for
 ;; each row, its text the outline's text and the row, a (given [a 1 b 2]) of the row's values before the steps.
