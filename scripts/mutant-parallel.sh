@@ -21,21 +21,21 @@ FIBC=${FIBC:-}
 unset LD_LIBRARY_PATH
 # MODE) CASES=(prefixes that must fail)     the edit is made in the function `mutate` below
 case $MODE in
-  cpu-ignores-affinity) CASES=(7531-) ;;
-  scope-no-join)        CASES=(7532-) ;;
-  scope-first-wins)     CASES=(7532-) ;;
-  scope-stops-at-trap)  CASES=(7532-) ;;
-  scope-swallows-trap)  CASES=(7532- 7533-) ;;
-  chunks-lost-task)     CASES=(7534- 7535-) ;;
-  chunks-double-run)    CASES=(7534- 7535-) ;;
-  chunks-tail-bounds)   CASES=(7534- 7535-) ;;
-  chunks-order)         CASES=(7534- 7535-) ;;
-  chunks-task-per-chunk) CASES=(7537-) ;;
-  chunks-trap-message)  CASES=(7538- 7539-) ;;
-  reduce-grain-by-workers) CASES=(7540- 7544-) ;;
-  reduce-left-combine)  CASES=(7540- 7541-) ;;
-  scan-wrong-carry)     CASES=(7542-) ;;
-  seq-window-overlap)   CASES=(7543-) ;;
+  cpu-ignores-affinity) CASES=(7600-) ;;
+  scope-no-join)        CASES=(7601-) ;;
+  scope-first-wins)     CASES=(7601-) ;;
+  scope-stops-at-trap)  CASES=(7601-) ;;
+  scope-swallows-trap)  CASES=(7601- 7602-) ;;
+  chunks-lost-task)     CASES=(7603- 7604-) ;;
+  chunks-double-run)    CASES=(7603- 7604-) ;;
+  chunks-tail-bounds)   CASES=(7603- 7604-) ;;
+  chunks-order)         CASES=(7603- 7604-) ;;
+  chunks-task-per-chunk) CASES=(7606-) ;;
+  chunks-trap-message)  CASES=(7607- 7608-) ;;
+  reduce-grain-by-workers) CASES=(7609- 7613-) ;;
+  reduce-left-combine)  CASES=(7609- 7610-) ;;
+  scan-wrong-carry)     CASES=(7611-) ;;
+  seq-window-overlap)   CASES=(7612-) ;;
   *) echo "mutant-parallel: unknown MODE $MODE" >&2; exit 2 ;;
 esac
 rm -rf "$OUT/tree"; mkdir -p "$OUT/tree/cases" "$OUT/tmp"

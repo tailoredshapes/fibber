@@ -67,5 +67,5 @@ package). The closure-per-element `preduce-n` is 75x slower than its chunk-loop 
 
 ## Determinism
 
-Case 7540 runs `preduce` and `pfold-chunks` over 400 003 inexact f64 values at 1, 2, 3, 4, 7, 8, 16 and 28 workers and compares the bits with each other and
+Case 7609 runs `preduce` and `pfold-chunks` over 400 003 inexact f64 values at 1, 2, 3, 4, 7, 8, 16 and 28 workers and compares the bits with each other and
 with a reference tree written out with plain loops. The `:fast` mode (one chunk per worker, left to right) fails the same check, which the case records.

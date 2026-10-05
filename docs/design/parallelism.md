@@ -392,7 +392,7 @@ element work with tiles) before P-sched. (5) P-sched, which the fine-grained and
 ## 7. P-struct as built (`fib.parallel`, 2026-10-05)
 
 What exists, on the runtime as it is (one OS thread per `spawn`), with no change to `rt/` or `compiler/`: `lib/fib/parallel.fib` and `lib/fib/parallel/*`,
-explicit `(:use fib.parallel)`; cases 7531 to 7544 (`cases/stdlib`, stage 2); the planted faults in `scripts/mutant-parallel.sh`; measurements in
+explicit `(:use fib.parallel)`; cases 7600 to 7613 (`cases/stdlib`, stage 2); the planted faults in `scripts/mutant-parallel.sh`; measurements in
 `docs/shootout/parallel.md`.
 
 | Piece | Where | Differences from section 3.2 |
