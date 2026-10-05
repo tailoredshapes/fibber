@@ -1,0 +1,292 @@
+;; fib.test.arch.repo: the repository as data for fitness rules (docs/design/executable-adrs.md §4): every path, the text of the source
+;; files, their top-level forms (read once: the cache), and queries that return Findings (file:line: what). A Repo is a value: a rule
+;; takes it and returns findings, and `plant-append` / `plant-file` make another Repo with one file changed (how a rule shows it can fail).
+(ns fib.test.arch.repo
+  (:use fib.core fib.seq fib.coll fib.print fib.string fib.test.arch.scan)
+  (:require [fib.os :as os]))
+
+(defstruct SrcFile (path: str text: str lines: i64 tops: (Vec Top)))
+(defstruct Repo (root: str names: (Vec str) files: (Vec SrcFile)))
+
+;; A thing a rule objects to: where, and what.
+(defstruct Finding (file: str line: i64 text: str))
+
+;; A number measured of one thing: `key` names it (a path, or path:function), `where` is the file and line to look at.
+(defstruct Measure (key: str file: str line: i64 value: i64))
+
+(defun finding-text (f: Finding) -> str
+  (if (> (. f line) 0) (str (. f file) ":" (. f line) ": " (. f text)) (str (. f file) ": " (. f text))))
+
+;; ---- reading the tree ----------------------------------------------------------------------------------------------------------
+
+(defun line-count :private (text: str) -> i64
+  (loop ((i 0) (n 0))
+    (match (str-find text "\n" i)
+      (nil (if (< i (str-len text)) (+ n 1) n))
+      ((some k) (recur (+ k 1) (+ n 1))))))
+
+(defun make-file (path: str text: str) -> SrcFile
+  (SrcFile path text (line-count text) (if (ends-with? path ".fib") (read-tops text) [])))
+
+(defun skipped-dir? :private (name: str) -> bool
+  (or (or (= name ".git") (= name ".claude")) (or (= name "target") (= name "node_modules"))))
+
+;; Text is loaded for these (everything else is a name only): source and prose a rule reads.
+(defun text-ext? :private (path: str) -> bool
+  (or (or (ends-with? path ".fib") (ends-with? path ".sh")) (or (or (ends-with? path ".md") (ends-with? path ".yml")) (or (ends-with? path ".lir") (ends-with? path ".tsv")))))
+
+(defun text-path? :private (path: str dirs: (Vec str)) -> bool
+  (and (text-ext? path)
+       (and (not (starts-with? path "compiler/tests/golden/"))
+            (or (not (some? (str-find path "/" 0))) (some? (find-first (fn (d: str) (starts-with? path (str d "/"))) dirs))))))
+
+(defun find-first :private (p: (fn (str) bool) :borrow xs: (Vec str)) -> (Option str)
+  (loop ((i 0))
+    (cond (>= i (count xs)) nil
+          (p (nth xs i)) (some (nth xs i))
+          :else (recur (+ i 1)))))
+
+(defun join-path :private (dir: str name: str) -> str (if (= dir "") name (str dir "/" name)))
+
+;; Every path under `dir` (relative to the root), files and directories alike, in byte order.
+(defun walk (root: str) -> (Vec str)
+  (loop ((todo [""]) (acc []))
+    (if (empty? todo)
+        (vec (sort acc))
+        (let ((dir (nth todo (- (count todo) 1)))
+              (rest (pop todo)))
+          (match (os/list-directory (if (= dir "") root (str root "/" dir)))
+            ((Err _) (recur rest acc))
+            ((Ok es)
+             (let ((es2 (filter (fn (e: os/DirectoryEntry) (not (skipped-dir? (. e name)))) es)))
+               (recur (into rest (mapv (fn (e: os/DirectoryEntry) (join-path dir (. e name)))
+                                       (filter (fn (e: os/DirectoryEntry) (= (. e kind) os/Directory)) es2)))
+                      (into acc (mapv (fn (e: os/DirectoryEntry) (join-path dir (. e name))) es2))))))))))
+
+;; The repository at `root`; text and forms are read for the files of the root itself and of `dirs`.
+(defun load-repo (root: str dirs: (Vec str)) -> Repo
+  (let ((names (vec (walk root))))
+    (Repo root names
+          (reduce (fn (acc: (Vec SrcFile) p: str)
+                    (if (text-path? p dirs)
+                        (match (read-file (str root "/" p)) (nil acc) ((some t) (conj acc (make-file p t))))
+                        acc))
+                  [] names))))
+
+(defun default-dirs () -> (Vec str) ["compiler" "lib" "scripts" "docs" "spec" "rt" ".github" "editors"])
+
+;; ---- another Repo with one file changed (planted violations) -----------------------------------------------------------------------
+
+(defun plant-file (r: Repo path: str text: str) -> Repo
+  (Repo (. r root)
+        (if (some? (find-first (fn (n: str) (= n path)) (. r names))) (. r names) (conj (. r names) path))
+        (conj (filterv (fn (f: SrcFile) (not (= (. f path) path))) (. r files)) (make-file path text))))
+
+(defun file-text (r: Repo path: str) -> (Option str)
+  (let ((hit (filterv (fn (f: SrcFile) (= (. f path) path)) (. r files))))
+    (cond (not (empty? hit)) (some (. (nth hit 0) text))
+          (some? (find-first (fn (n: str) (= n path)) (. r names))) (read-file (str (. r root) "/" path))
+          :else nil)))
+
+;; Another Repo without the file.
+(defun plant-remove (r: Repo path: str) -> Repo
+  (Repo (. r root) (filterv (fn (n: str) (and (not (= n path)) (not (starts-with? n (str path "/"))))) (. r names))
+        (filterv (fn (f: SrcFile) (not (= (. f path) path))) (. r files))))
+
+(defun plant-append (r: Repo path: str text: str) -> Repo
+  (plant-file r path (str (unwrap-or (file-text r path) "") text)))
+
+;; ---- selecting paths -----------------------------------------------------------------------------------------------------------
+
+(defun bt :private (s: str i: i64) -> i64 (if (and (>= i 0) (< i (str-len s))) (sext i64 (str-byte-at s i)) -1))
+
+(defun glob-at :private (p: str i: i64 s: str j: i64) -> bool
+  (let ((c (bt p i)))
+    (cond (< c 0) (>= j (str-len s))
+          (and (= c 42) (= (bt p (+ i 1)) 42))
+            (let ((skip (if (= (bt p (+ i 2)) 47) 3 2)))
+              (loop ((k j))
+                (cond (glob-at p (+ i skip) s k) true
+                      (>= k (str-len s)) false
+                      :else (recur (+ k 1)))))
+          (= c 42)
+            (loop ((k j))
+              (cond (glob-at p (+ i 1) s k) true
+                    (>= k (str-len s)) false
+                    (= (bt s k) 47) false
+                    :else (recur (+ k 1))))
+          (>= j (str-len s)) false
+          (or (= c 63) (= c (bt s j))) (glob-at p (+ i 1) s (+ j 1))
+          :else false)))
+
+;; `*` is any run without `/`, `**` any run, `?` one character; a path matches when the whole path does.
+(defun glob? (pattern: str path: str) -> bool (glob-at pattern 0 path 0))
+
+(defun any-glob? (globs: (Vec str) path: str) -> bool
+  (some? (find-first (fn (g: str) (glob? g path)) globs)))
+
+;; A path is selected by a list of globs when one glob matches and no glob written `!GLOB` does.
+(defun selects? (globs: (Vec str) path: str) -> bool
+  (and (any-glob? (filterv (fn (g: str) (not (starts-with? g "!"))) globs) path)
+       (not (any-glob? (mapv (fn (g: str) (str-slice g 1 (str-len g))) (filterv (fn (g: str) (starts-with? g "!")) globs)) path))))
+
+;; The source files a rule reads: those matching one of the globs (and none of the `!GLOB` ones).
+(defun select (r: Repo globs: (Vec str)) -> (Vec SrcFile)
+  (filterv (fn (f: SrcFile) (selects? globs (. f path))) (. r files)))
+
+(defun names-matching (r: Repo globs: (Vec str)) -> (Vec str)
+  (filterv (fn (n: str) (selects? globs n)) (. r names)))
+
+;; ---- findings -----------------------------------------------------------------------------------------------------------------
+
+(defun comment-line? :private (t: str) -> bool
+  (or (or (starts-with? t "#") (starts-with? t ";")) (starts-with? t "//")))
+
+(defstruct NumLine (n: i64 text: str))
+
+;; Every (line number, trimmed line) of a text.
+(defun numbered (text: str) -> (Vec NumLine)
+  (loop ((i 0) (n 1) (acc []))
+    (match (str-find text "\n" i)
+      (nil (if (< i (str-len text)) (conj acc (NumLine n (trim (str-slice text i (str-len text))))) acc))
+      ((some k) (recur (+ k 1) (+ n 1) (conj acc (NumLine n (trim (str-slice text i k)))))))))
+
+(defun grep-in :private (r: Repo globs: (Vec str) text: str live: bool) -> (Vec Finding)
+  (if (empty? (select r globs))
+      [(Finding (join " " globs) 0 "no file in the tree matches these globs: a search of nothing finds nothing")]
+      (grep-all r globs text live)))
+
+(defun grep-all :private (r: Repo globs: (Vec str) text: str live: bool) -> (Vec Finding)
+  (reduce (fn (acc: (Vec Finding) f: SrcFile)
+            (into acc (mapv (fn (p: NumLine) (Finding (. f path) (. p n) (. p text)))
+                            (filterv (fn (p: NumLine)
+                                       (and (some? (str-find (. p text) text 0))
+                                            (not (and live (comment-line? (. p text))))))
+                                     (numbered (. f text))))))
+          [] (select r globs)))
+
+;; The lines of the files that contain `text`.
+(defun grep (r: Repo globs: (Vec str) text: str) -> (Vec Finding) (grep-in r globs text false))
+
+;; The same without the lines that are only a comment (`#`, `;`, `//`).
+(defun grep-live (r: Repo globs: (Vec str) text: str) -> (Vec Finding) (grep-in r globs text true))
+
+;; A finding for each of the paths that is not in the tree.
+(defun missing (r: Repo paths: (Vec str)) -> (Vec Finding)
+  (mapv (fn (p: str) (Finding p 0 "is not in the tree"))
+        (filterv (fn (p: str) (not (some? (find-first (fn (n: str) (= n p)) (. r names))))) paths)))
+
+;; A finding for each path that matches a glob.
+(defun present (r: Repo globs: (Vec str)) -> (Vec Finding)
+  (mapv (fn (p: str) (Finding p 0 "is in the tree and must not be")) (names-matching r globs)))
+
+;; A finding when fewer than `n` paths match the globs.
+(defun at-least (r: Repo globs: (Vec str) n: i64) -> (Vec Finding)
+  (if (>= (count (names-matching r globs)) n) []
+      [(Finding (str (first globs)) 0 (str "matches " (count (names-matching r globs)) " paths, at least " n " wanted"))]))
+
+;; A finding when the file does not contain the text (or is missing).
+(defun must-contain (r: Repo path: str text: str) -> (Vec Finding)
+  (match (file-text r path)
+    (nil [(Finding path 0 "is not in the tree")])
+    ((some t) (if (some? (str-find t text 0)) [] [(Finding path 0 (str "does not contain " (pr-str text)))]))))
+
+;; ---- forms ---------------------------------------------------------------------------------------------------------------------
+
+(defun def-head? :private (h: str) -> bool
+  (or (or (or (= h "defun") (= h "defmacro")) (or (= h "defn") (= h "def")))
+      (or (or (= h "defstruct") (= h "defenum")) (or (= h "defprotocol") (= h "defrecord")))))
+
+(defun fn-head? :private (h: str) -> bool (or (or (= h "defun") (= h "defmacro")) (= h "defn")))
+
+;; What the files define at top level, as Measures whose key is the name and value the line count of the form.
+(defun definitions (r: Repo globs: (Vec str) heads: (Vec str)) -> (Vec Measure)
+  (reduce (fn (acc: (Vec Measure) f: SrcFile)
+            (into acc (mapv (fn (t: Top) (Measure (. t name) (. f path) (. t line) (+ (- (. t end) (. t line)) 1)))
+                            (filterv (fn (t: Top) (some? (find-first (fn (h: str) (= h (. t head))) heads))) (. f tops)))))
+          [] (select r globs)))
+
+(defun function-heads () -> (Vec str) ["defun" "defmacro" "defn"])
+
+;; The functions (defun, defmacro, defn) of the files, key `path:name`, value the number of lines of the form.
+(defun fn-lengths (r: Repo globs: (Vec str)) -> (Vec Measure)
+  (mapv (fn (m: Measure) (Measure (str (. m file) ":" (. m key)) (. m file) (. m line) (. m value))) (definitions r globs (function-heads))))
+
+(defun file-lengths (r: Repo globs: (Vec str)) -> (Vec Measure)
+  (mapv (fn (f: SrcFile) (Measure (. f path) (. f path) 1 (. f lines))) (select r globs)))
+
+;; The top-level forms of the files that mention every one of the names as an atom (strings and comments do not count).
+(defun forms-mentioning (r: Repo globs: (Vec str) names: (Vec str)) -> (Vec Finding)
+  (reduce (fn (acc: (Vec Finding) f: SrcFile)
+            (into acc (mapv (fn (t: Top) (Finding (. f path) (. t line) (str (. t head) " " (. t name) " mentions " (pr-str names))))
+                            (filterv (fn (t: Top)
+                                       (let ((as (mapv (fn (a: Node) (atom-text a)) (filterv (fn (a: Node) (not (string-atom? a))) (atoms-of (. t node))))))
+                                         (every? (fn (n: str) (some? (find-first (fn (a: str) (= a n)) as))) names)))
+                                     (. f tops)))))
+          [] (select r globs)))
+
+;; ---- the module graph ---------------------------------------------------------------------------------------------------------
+
+(defstruct Edge (file: str from: str to: str line: i64))
+
+;; The module a file declares: the name of its first `ns` form, or "" for a file without one.
+(defun module-of (f: SrcFile) -> str
+  (let ((ns (filterv (fn (t: Top) (= (. t head) "ns")) (. f tops))))
+    (if (empty? ns) "" (. (nth ns 0) name))))
+
+;; One edge for each module a file's `ns` form names.
+(defun edges (r: Repo globs: (Vec str)) -> (Vec Edge)
+  (reduce (fn (acc: (Vec Edge) f: SrcFile)
+            (reduce (fn (a: (Vec Edge) t: Top)
+                      (into a (mapv (fn (m: ModRef) (Edge (. f path) (module-of f) (. m name) (. m line))) (ns-refs t))))
+                    acc (filterv (fn (t: Top) (= (. t head) "ns")) (. f tops))))
+          [] (select r globs)))
+
+(defun module-files (r: Repo globs: (Vec str)) -> (Vec SrcFile)
+  (filterv (fn (f: SrcFile) (not (= (module-of f) ""))) (select r globs)))
+
+;; Edges from the files matching `from-globs` to a module whose name starts with `to-prefix`, other than from the files matching `except`.
+(defun requires-into (r: Repo from-globs: (Vec str) to-prefix: str except: (Vec str)) -> (Vec Finding)
+  (mapv (fn (e: Edge) (Finding (. e file) (. e line) (str (. e from) " requires " (. e to))))
+        (filterv (fn (e: Edge) (and (starts-with? (. e to) to-prefix) (not (any-glob? except (. e file))))) (edges r from-globs))))
+
+;; ---- names and strings out of the source -------------------------------------------------------------------------------------------
+
+(defun strip-quotes :private (t: str) -> str (str-slice t 1 (- (str-len t) 1)))
+
+(defun uniq :private (xs: (Vec str)) -> (Vec str)
+  (reduce (fn (acc: (Vec str) x: str) (if (some? (find-first (fn (y: str) (= y x)) acc)) acc (conj acc x))) [] xs))
+
+;; The string literals (unquoted) inside the top-level form of that name in the file.
+(defun string-atoms-in (r: Repo path: str name: str) -> (Vec str)
+  (uniq (reduce (fn (acc: (Vec str) f: SrcFile)
+                  (reduce (fn (a: (Vec str) t: Top)
+                            (if (= (. t name) name)
+                                (into a (mapv (fn (x: Node) (strip-quotes (atom-text x))) (filterv string-atom? (atoms-of (. t node)))))
+                                a))
+                          acc (. f tops)))
+                [] (select r [path]))))
+
+(defun lists-headed :private (n: Node head: str) -> (Vec Node)
+  (match n
+    ((Atom _ _) [])
+    ((Seq _ items _ _)
+     (let ((below (reduce (fn (acc: (Vec Node) x: Node) (into acc (lists-headed x head))) [] items)))
+       (if (and (> (count items) 1) (= (atom-text (nth items 0)) head)) (into [n] below) below)))))
+
+;; The string that is the second element of every list `(HEAD "string" ..)` in the file (the rows of a table, say).
+(defun row-strings (r: Repo path: str head: str) -> (Vec str)
+  (uniq (reduce (fn (acc: (Vec str) f: SrcFile)
+                  (reduce (fn (a: (Vec str) t: Top)
+                            (into a (mapv (fn (l: Node) (strip-quotes (atom-text (nth (items-of l) 1))))
+                                          (filterv (fn (l: Node) (string-atom? (nth (items-of l) 1))) (lists-headed (. t node) head)))))
+                          acc (. f tops)))
+                [] (select r [path]))))
+
+(defun member? (xs: (Vec str) x: str) -> bool (some? (find-first (fn (y: str) (= y x)) xs)))
+
+;; The top-level definitions of the files (defun, defmacro, def, defstruct, defenum, defprotocol, defrecord) whose name is one of `names`.
+(defun defined-among (r: Repo globs: (Vec str) names: (Vec str)) -> (Vec Finding)
+  (mapv (fn (m: Measure) (Finding (. m file) (. m line) (str (. m key) " is defined here, and it is the name of a core form or builtin")))
+        (filterv (fn (m: Measure) (member? names (. m key)))
+                 (definitions r globs ["defun" "defmacro" "defn" "def" "defstruct" "defenum" "defprotocol" "defrecord"]))))

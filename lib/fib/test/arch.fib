@@ -1,0 +1,65 @@
+;; fib.test.arch: fitness rules over the repository, for the `fibber fitness` and `fibber measure` blocks of an executable ADR and for any spec
+;; (docs/design/executable-adrs.md §4, §5). This module holds the forms; the data and queries are in fib.test.arch.repo (the tree, file and
+;; function lengths, grep, definitions, the module graph, planted changes) and fib.test.arch.scan (the light reader), the rule engine in
+;; fib.test.arch.rules. `(:use fib.test.arch)` brings all of them.
+;;
+;;   (rule   "text" check-expr step ..)     passes when check-expr (a (Vec Finding), the Repo is `repo`) is empty
+;;   (forbid "text" findings-expr step ..)  the same, worded as a prohibition
+;;   (limit  "text" measures max allow step ..)   measures over max are findings unless allowed by "key=cap", which only shrinks
+;;   (measure "text" :recorded "file.md" :key "k" :under 1.3)   (or :over) a recorded number, §5
+;; steps: (plant "path" "text")  appends text to the file in a copy of the Repo, and the check must then report something;
+;;        (plant-file "path" "text")  replaces or creates it;  (plant-remove "path") removes it;   (no-plant "why")  admits that no plant is possible, and says why.
+;; A rule with none of these fails: it was never shown to fail. The macros call fib.test.arch.rules at run time only.
+(ns fib.test.arch
+  (:use fib.core fib.seq fib.coll fib.print fib.test.core fib.test.arch.repo fib.test.arch.rules)
+  (:export-from fib.test.arch.scan fib.test.arch.repo fib.test.arch.rules))
+
+;; the steps of a rule as the vector of its plants, and its reason for having none. `kind` is the step head asked for.
+(defmacro rule (text check ... steps)
+  (let ((plants (loop ((i 0) (out (vec-empty)))
+                  (if (< i (vec-count steps))
+                      (recur (+ i 1)
+                             (match (vec-nth steps i)
+                               ((List xs)
+                                (match (vec-nth xs 0)
+                                  ((Sym h)
+                                   (cond (= h "plant") (vec-conj out `(fib.test.arch/Plant ~(vec-nth xs 1) ~(vec-nth xs 2) 0))
+                                         (= h "plant-file") (vec-conj out `(fib.test.arch/Plant ~(vec-nth xs 1) ~(vec-nth xs 2) 1))
+                                         (= h "plant-remove") (vec-conj out `(fib.test.arch/Plant ~(vec-nth xs 1) "" 2))
+                                         :else out))
+                                  (_ out)))
+                               (_ out)))
+                      out)))
+        (why (loop ((i 0) (out (Str "")))
+               (if (< i (vec-count steps))
+                   (recur (+ i 1)
+                          (match (vec-nth steps i)
+                            ((List xs)
+                             (match (vec-nth xs 0)
+                               ((Sym h) (if (= h "no-plant") (vec-nth xs 1) out))
+                               (_ out)))
+                            (_ out)))
+                   out))))
+    `(fib.test.arch/rule-def ~text (fn (repo) ~check) [~@plants] ~why)))
+
+(defmacro forbid (text findings ... steps)
+  `(rule ~text ~findings ~@steps))
+
+(defmacro limit (text measures max allow ... steps)
+  `(rule ~text (fib.test.arch/over-limit ~measures ~max ~allow) ~@steps))
+
+;; (measure "text" :recorded "file" :key "k" :under N :over M)
+(defmacro measure (text ... opts)
+  (let ((pick (fn (name dflt)
+                (loop ((i 0) (out dflt))
+                  (if (< (+ i 1) (vec-count opts))
+                      (recur (+ i 2)
+                             (match (vec-nth opts i) ((Kw k) (if (= k name) (vec-nth opts (+ i 1)) out)) (_ out)))
+                      out))))
+        (has (fn (name)
+               (loop ((i 0) (out false))
+                 (if (< (+ i 1) (vec-count opts))
+                     (recur (+ i 2) (match (vec-nth opts i) ((Kw k) (if (= k name) true out)) (_ out)))
+                     out)))))
+    `(fib.test.arch/measure-def ~text ~(pick "recorded" (Str "")) ~(pick "key" (Str ""))
+                                      ~(pick "under" (Flt 0.0 :f64)) ~(Bool (has "under")) ~(pick "over" (Flt 0.0 :f64)) ~(Bool (has "over")))))
