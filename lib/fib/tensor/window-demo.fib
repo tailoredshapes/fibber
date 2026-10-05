@@ -1,0 +1,31 @@
+;; fib.tensor.window-demo: rows of a dense matrix written through a window instead of copied out and back (exclusive views, types 6.15).
+;; A new file: it adds to fib.tensor and changes none of its modules (the owner is changing lib/fib/tensor elsewhere). Not exported by `fib.tensor`;
+;; a program writes `(:use fib.view fib.tensor.window-demo)`.
+;;
+;; A dense row-major `(Tensor f64)` keeps its elements in one `(Array f64)`. The elements of rows [lo, hi) are the contiguous range
+;; [off + lo c, off + hi c) of it, so a window over that range of the buffer is a window over the rows. The tensor's buffer is taken out into a
+;; cell, lent, and put back, so a unique tensor is written in place and a tensor whose buffer is shared is copied once at the lend.
+(ns fib.tensor.window-demo (:use fib.core fib.seq fib.coll fib.view fib.tensor.storage))
+
+;; Sets every element of rows [lo, hi) of the dense matrix `t` to `x`, and returns the matrix.
+(defun fill-rows! (t: (Tensor f64) lo: i64 hi: i64 x: f64) -> (Tensor f64)
+  (let ((ds (shape t)))
+    (do (when (!= (count ds) 2) (trap "fill-rows!: a matrix is required"))
+        (when (not (contiguous? t)) (trap "fill-rows!: a dense matrix is required"))
+        (when (or (< lo 0) (> lo hi) (> hi (nth ds 0))) (trap "fill-rows!: rows outside the matrix"))
+        (let ((cols (nth ds 1)) (off (array-get (. t meta) 0)) (buf (cell (. t buffer))))
+          (do (with-view [w (array-window! &buf (+ off (* lo cols)) (+ off (* hi cols)))]
+                (fill! w x))
+              (from-parts @buf off ds (strides t) 0.0))))))
+
+;; Adds `x` to every element of rows [lo, hi): a read-modify-write of each element through the window.
+(defun add-to-rows! (t: (Tensor f64) lo: i64 hi: i64 x: f64) -> (Tensor f64)
+  (let ((ds (shape t)))
+    (do (when (!= (count ds) 2) (trap "add-to-rows!: a matrix is required"))
+        (when (not (contiguous? t)) (trap "add-to-rows!: a dense matrix is required"))
+        (when (or (< lo 0) (> lo hi) (> hi (nth ds 0))) (trap "add-to-rows!: rows outside the matrix"))
+        (let ((cols (nth ds 1)) (off (array-get (. t meta) 0)) (buf (cell (. t buffer))))
+          (do (with-view [w (array-window! &buf (+ off (* lo cols)) (+ off (* hi cols)))]
+                (loop ((i 0))
+                  (when (< i (vlen w)) (do (vset! w i (+ (vget w i) x)) (recur (+ i 1))))))
+              (from-parts @buf off ds (strides t) 0.0))))))

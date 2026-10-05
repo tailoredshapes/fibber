@@ -1,0 +1,46 @@
+;; fib.view.tiles: disjoint windows on native tasks (decision 5 of 2026-10-04; types 6.15). Not implicit: `(:use fib.view fib.view.tiles)`.
+;;
+;;   (with-tiles [w a 4]                    ; four tasks; each gets its own window of a, a cell it cannot let go of
+;;     (fill! w 1.0))
+;;
+;; `a` is lent to the combinator for the call, which joins every task before it returns, so no task outlives the owner's frozen extent. A
+;; task's window is a view cell made inside the task from the array and a range of it, with the same rules as any other view cell
+;; (it is never a value, no closure mentions it, `fib.view`'s checker applies to the task's body). The body is a `:send` closure, so what it
+;; captures must be sendable (a cell or a view cell of the outer function is refused by `spawn`'s own rule), and a window is not
+;; sendable: only the array and two integers cross into the task, and the window is built there. The tiles are the ranges
+;; [n t / k, n (t + 1) / k) for t in 0 .. k, so they are disjoint and cover the array.
+;;
+;; The unique-write protocol is applied once, before any task starts; the tasks then store through raw pointers into disjoint ranges of
+;; one buffer that each of them holds a count of (so the buffer is *shared* for the duration, which is why the checks of `fib.view` do
+;; not apply to the combinator's own body: it is the trusted kernel). Only `f64` is provided; the shape is the same for `i64`.
+(ns fib.view.tiles (:use fib.core fib.seq fib.coll fib.view))
+
+(defun header-bytes :private () -> i64 24)
+
+;; The window [lo, hi) of the array, for a task. Private: a window made from an array and a range, with no lender and no owner, is only safe
+;; where the array is known to be held for as long as the window, which `run-tiles-f64!` and the macro below ensure.
+(defun tile-window :private (arr: (Array f64) lo: i64 hi: i64) -> (Win f64)
+  (unsafe (Win (ptr+ (raw arr) (+ (header-bytes) (* 8 lo))) (- hi lo) 0.0)))
+
+;; Runs `f arr lo hi` for each of k tiles of the array lent through `&a`, one task each, and joins them all.
+(defun run-tiles-f64! (&a: (Array f64) k: i64 f: (fn :send ((Array f64) i64 i64) unit)) -> unit
+  (do (when (< k 1) (trap "with-tiles: the number of tiles is at least 1"))
+      (when (> (array-len @a) 0) (array-set! &a 0 (array-get @a 0)))
+      (let ((n (array-len @a)) (tasks (cell [])))
+        (do (dotimes (t k)
+              (let ((arr @a) (lo (quot (* n t) k)) (hi (quot (* n (+ t 1)) k)))
+                (set! tasks (conj @tasks (spawn (fn () (f arr lo hi)))))))
+            (doseq [t @tasks] (join t))))))
+
+;; (with-tiles [w a k] body+): `w` names the tile's window in the body; `a` is the owner (a private cell, as for with-view); k the number of tiles.
+(defmacro with-tiles (spec ... body)
+  (match spec
+    ((Vec items)
+     (if (= (vec-count items) 3)
+         (let ((arr (gensym "tile-array")) (lo (gensym "tile-lo")) (hi (gensym "tile-hi")))
+           `(fib.view.tiles/run-tiles-f64! (& ~(vec-nth items 1)) ~(vec-nth items 2)
+              (fn (~arr ~lo ~hi)
+                (let ((~(vec-nth items 0) (fib.prelude/cell (fib.view/view-sub ((var fib.view.tiles/tile-window) ~arr ~lo ~hi)))))
+                  (do ~@body)))))
+         (trap "with-tiles: the spec is [w a k]")))
+    (_ (trap "with-tiles: the spec is [w a k]"))))
