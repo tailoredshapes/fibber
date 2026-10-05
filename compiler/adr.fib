@@ -1,0 +1,84 @@
+;; compiler/adr.fib: executable architecture decision records (docs/design/executable-adrs.md), as a standalone tool until it joins the
+;; driver as `fibc adr`:   adr [PATH..] [--only N[,N..]] [--format plain|json] [--status] [--stamp] [--root DIR] [--rerun] [--strict] [--keep] [-j N]
+;; Reads ADRs (Markdown, docs/adr by default), runs the `fibber spec`, `fibber fitness` and `fibber measure` blocks of every accepted one
+;; through fib.test, and derives each ADR's status from the evidence: accepted, violated, unverified, invalid (the file's form is wrong),
+;; or what the file declares (proposed, deprecated, superseded by N: not run). Exit 0 when every ADR holds, 1 when one is violated or
+;; invalid (or, with --strict, unverified), 2 for a usage error. Run from the repository root; $FIBC names the fibc that runs the blocks.
+;; Build: fibc build compiler/adr.fib -I compiler -I lib -o adr
+(ns main (:use fib.core fib.seq fib.coll fib.print fib.string adr.md adr.gen adr.run adr.report) (:require [fib.os :as os]))
+
+(defstruct Args (paths: (Vec str) only: (Vec str) format: str status: bool stamp: bool rerun: bool strict: bool keep: bool jobs: i64 root: str))
+
+(defun usage () -> str
+  "usage: adr [PATH..] [--only N[,N..]] [--format plain|json] [--status] [--stamp] [--root DIR] [--rerun] [--strict] [--keep] [-j N]")
+
+(defun split-commas :private (s: str) -> (Vec str) (filterv (fn (x: str) (> (str-len x) 0)) (mapv trim (split-on s ","))))
+
+(defun split-on :private (s: str sep: str) -> (Vec str)
+  (loop ((i 0) (out []))
+    (match (str-find s sep i)
+      (nil (conj out (str-slice s i (str-len s))))
+      ((some k) (recur (+ k (str-len sep)) (conj out (str-slice s i k)))))))
+
+(defun parse-args (as: (Vec str)) -> (Result Args str)
+  (loop ((i 0) (a (Args [] [] "plain" false false false false false 4 "")))
+    (if (>= i (count as))
+        (Ok a)
+        (let ((w (nth as i)) (v (if (< (+ i 1) (count as)) (nth as (+ i 1)) "")))
+          (cond (= w "--only") (recur (+ i 2) (Args (. a paths) (into (. a only) (split-commas v)) (. a format) (. a status) (. a stamp) (. a rerun) (. a strict) (. a keep) (. a jobs) (. a root)))
+                (= w "--format") (if (or (= v "plain") (= v "json"))
+                                     (recur (+ i 2) (Args (. a paths) (. a only) v (. a status) (. a stamp) (. a rerun) (. a strict) (. a keep) (. a jobs) (. a root)))
+                                     (Err "--format is plain or json"))
+                (= w "--status") (recur (+ i 1) (Args (. a paths) (. a only) (. a format) true (. a stamp) (. a rerun) (. a strict) (. a keep) (. a jobs) (. a root)))
+                (= w "--stamp") (recur (+ i 1) (Args (. a paths) (. a only) (. a format) (. a status) true (. a rerun) (. a strict) (. a keep) (. a jobs) (. a root)))
+                (= w "--rerun") (recur (+ i 1) (Args (. a paths) (. a only) (. a format) (. a status) (. a stamp) true (. a strict) (. a keep) (. a jobs) (. a root)))
+                (= w "--strict") (recur (+ i 1) (Args (. a paths) (. a only) (. a format) (. a status) (. a stamp) (. a rerun) true (. a keep) (. a jobs) (. a root)))
+                (= w "--keep") (recur (+ i 1) (Args (. a paths) (. a only) (. a format) (. a status) (. a stamp) (. a rerun) (. a strict) true (. a jobs) (. a root)))
+                (= w "--root") (recur (+ i 2) (Args (. a paths) (. a only) (. a format) (. a status) (. a stamp) (. a rerun) (. a strict) (. a keep) (. a jobs) v))
+                (= w "-j") (match (parse-long v)
+                             (nil (Err "-j wants an integer"))
+                             ((some n) (recur (+ i 2) (Args (. a paths) (. a only) (. a format) (. a status) (. a stamp) (. a rerun) (. a strict) (. a keep) n (. a root)))))
+                (starts-with? w "-") (Err (str "unknown option " w))
+                :else (recur (+ i 1) (Args (conj (. a paths) w) (. a only) (. a format) (. a status) (. a stamp) (. a rerun) (. a strict) (. a keep) (. a jobs) (. a root))))))))
+
+;; The ADR files named by the paths: a directory's `NNNN-*.md` in name order, or the file itself.
+(defun files-of (p: str) -> (Vec str)
+  (match (os/list-directory p)
+    ((Ok es) (vec (sort (mapv (fn (e: os/DirectoryEntry) (str p "/" (. e name))) (filterv (fn (e: os/DirectoryEntry) (adr-file? (. e name))) es)))))
+    ((Err _) [p])))
+
+(defun load-docs (paths: (Vec str)) -> (Result (Vec Doc) str)
+  (loop ((i 0) (acc []) (fs (reduce (fn (a: (Vec str) p: str) (into a (files-of p))) [] paths)))
+    (cond (empty? fs) (Ok acc)
+          :else (match (read-file (nth fs 0))
+                  (nil (Err (str "cannot read " (nth fs 0))))
+                  ((some t) (recur 0 (conj acc (parse (nth fs 0) t)) (vec (drop 1 fs))))))))
+
+(defun main () -> i64
+  (match (parse-args (vec (args)))
+    ((Err m) (do (eprintln (str "adr: " m)) (eprintln (usage)) 2))
+    ((Ok a)
+     (match (enter (. a root))
+       ((Err m) (do (eprintln (str "adr: " m)) 2))
+       ((Ok _) (run-docs a))))))
+
+;; Work from the repository root: --root DIR changes to it first, so every path (and the program that runs the blocks) is relative to it.
+(defun enter :private (root: str) -> (Result unit str)
+  (if (= root "") (Ok ())
+      (match (os/change-directory root) ((Ok _) (Ok ())) ((Err _) (Err (str "cannot enter " root))))))
+
+(defun run-docs :private (a: Args) -> i64
+  (match (load-docs (if (empty? (. a paths)) ["docs/adr"] (. a paths)))
+    ((Err m) (do (eprintln (str "adr: " m)) 2))
+    ((Ok docs) (if (empty? docs) (do (eprintln "adr: no ADR files found") 2) (report-all a docs)))))
+
+(defun report-all (a: Args docs: (Vec Doc)) -> i64
+  (let ((chosen (selected docs (. a only))))
+    (if (empty? chosen)
+        (do (eprintln "adr: --only matches no ADR") 2)
+        (let ((rows (rows-of (Opts "." (. a jobs) (. a rerun) (. a keep)) docs chosen)))
+          (do (if (. a stamp) (stamp-all rows) ())
+              (print (cond (= (. a format) "json") (json-report rows)
+                           (. a status) (status-lines rows)
+                           :else (plain-report rows)))
+              (exit-code rows (. a strict)))))))

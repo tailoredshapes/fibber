@@ -1,0 +1,137 @@
+;; adr.report: derive each ADR's status from what its blocks came to, and say it (docs/design/executable-adrs.md §2.3).
+;;   accepted    declared accepted and every executable block held (at least one scenario ran)
+;;   violated    declared accepted and a scenario failed, trapped or timed out, or a block would not compile
+;;   unverified  declared accepted and no executable block ran a scenario: a decision nothing checks
+;;   invalid     the file breaks the format (no status, a block outside Governance, an unknown block kind, a missing superseder)
+;;   proposed, deprecated, `superseded by N`: as declared, the blocks are not run
+(ns adr.report
+  (:use fib.core fib.seq fib.coll fib.print fib.string adr.md adr.gen adr.run)
+  (:require [fib.os :as os]))
+
+(defstruct Row (doc: Doc status: str blocks: i64 pass: i64 fail: i64 notes: (Vec str)))
+
+(defun selected (docs: (Vec Doc) only: (Vec str)) -> (Vec Doc)
+  (if (empty? only)
+      docs
+      (filterv (fn (d: Doc) (some? (find-num only (. d number)))) docs)))
+
+(defun find-num :private (only: (Vec str) number: str) -> (Option str)
+  (let ((hit (filterv (fn (o: str) (= (unwrap-or (parse-long o) -1) (unwrap-or (parse-long number) -2))) only)))
+    (if (empty? hit) nil (some (nth hit 0)))))
+
+;; What is wrong with the file's form beyond the Markdown's own (adr.md): blocks and the superseder.
+(defun form-problems (d: Doc all: (Vec Doc)) -> (Vec str)
+  (into (into (. d problems)
+              (reduce (fn (acc: (Vec str) b: Block) (into acc (block-problems b))) [] (. d blocks)))
+        (if (and (= (. d declared) "superseded") (empty? (filterv (fn (o: Doc) (= (unwrap-or (parse-long (. o number)) -1) (unwrap-or (parse-long (. d by)) -2))) all)))
+            [(str "superseded by " (. d by) ", which is not among the ADRs")]
+            [])))
+
+(defun block-problems :private (b: Block) -> (Vec str)
+  (cond (and (= (. b lang) "fibber") (kind-run? (. b kind)))
+          (if (= (. b section) "governance") [] [(str "line " (. b line) ": an executable block outside the Governance section")])
+        (and (= (. b lang) "fibber") (not (= (. b kind) "")))
+          [(str "line " (. b line) ": unknown block kind `fibber " (. b kind) "` (spec, fitness, measure)")]
+        (and (= (. b lang) "shell") (= (. b kind) "check"))
+          [(str "line " (. b line) ": `shell check` blocks are not run; write the check in fibber")]
+        :else []))
+
+(defun derived (d: Doc probs: (Vec str) outs: (Vec BlockOut) nunits: i64) -> str
+  (cond (not (empty? probs)) "invalid"
+        (not (= (. d declared) "accepted")) (if (= (. d declared) "superseded") (str "superseded by " (. d by)) (. d declared))
+        (= nunits 0) "unverified"
+        (not (empty? (filterv (fn (o: BlockOut) (or (not (= (. o error) "")) (> (. o fail) 0))) outs))) "violated"
+        (= (reduce (fn (n: i64 o: BlockOut) (+ n (. o pass))) 0 outs) 0) "unverified"
+        :else "accepted"))
+
+(defun notes-of :private (outs: (Vec BlockOut)) -> (Vec str)
+  (reduce (fn (acc: (Vec str) o: BlockOut)
+            (into (if (= (. o error) "") acc (conj acc (str (. o tag) ": " (. o error)))) (mapv (fn (l: str) (str (. o tag) ": " l)) (. o lines))))
+          [] outs))
+
+(defun doc-row :private (d: Doc all: (Vec Doc) outs: (Vec BlockOut) us: (Vec Unit)) -> Row
+  (let ((mine (filterv (fn (o: BlockOut) (some? (find-unit us (. d number) (. o tag)))) outs))
+        (probs (form-problems d all)))
+    (Row d (derived d probs mine (count (units-of d))) (count (units-of d))
+         (reduce (fn (n: i64 o: BlockOut) (+ n (. o pass))) 0 mine) (reduce (fn (n: i64 o: BlockOut) (+ n (. o fail) (if (= (. o error) "") 0 1))) 0 mine)
+         (into probs (notes-of mine)))))
+
+(defun find-unit :private (us: (Vec Unit) number: str tag: str) -> (Option Unit)
+  (let ((hit (filterv (fn (u: Unit) (and (= (. u number) number) (= (. u tag) tag))) us))) (if (empty? hit) nil (some (nth hit 0)))))
+
+(defun runnable? :private (d: Doc all: (Vec Doc)) -> bool
+  (and (= (. d declared) "accepted") (empty? (form-problems d all))))
+
+;; The rows of the chosen docs; the blocks of every runnable one run together in one program.
+(defun rows-of (o: Opts all: (Vec Doc) chosen: (Vec Doc)) -> (Vec Row)
+  (let ((us (reduce (fn (a: (Vec Unit) d: Doc) (if (runnable? d all) (into a (units-of d)) a)) [] chosen))
+        (outs (if (empty? us) [] (run-units o us))))
+    (mapv (fn (d: Doc) (doc-row d all outs us)) chosen)))
+
+;; ---- output --------------------------------------------------------------------------------------------------------------------
+
+(defun pad (s: str w: i64) -> str (if (< (str-len s) w) (str s (str-repeat " " (- w (str-len s)))) s))
+
+(defun str-repeat :private (s: str n: i64) -> str (loop ((i 0) (out "")) (if (< i n) (recur (+ i 1) (str out s)) out)))
+
+(defun plain-report (rows: (Vec Row)) -> str
+  (str (pad "ADR" 6) (pad "status" 20) (pad "blocks" 8) (pad "pass" 6) (pad "fail" 6) "title\n"
+       (join "" (mapv (fn (r: Row) (str (pad (. (. r doc) number) 6) (pad (. r status) 20) (pad (str (. r blocks)) 8) (pad (str (. r pass)) 6) (pad (str (. r fail)) 6) (. (. r doc) title) "\n")) rows))
+       (join "" (mapv (fn (r: Row) (if (empty? (. r notes)) "" (str "\n" (. (. r doc) number) " " (. r status) ":\n" (join "" (mapv (fn (n: str) (str "  " n "\n")) (. r notes)))))) rows))
+       "\n" (count-line rows) "\n"))
+
+(defun count-of :private (rows: (Vec Row) st: str) -> i64 (count (filterv (fn (r: Row) (= (. r status) st)) rows)))
+
+(defun count-line :private (rows: (Vec Row)) -> str
+  (str (count rows) " ADRs: " (count-of rows "accepted") " accepted, " (count-of rows "violated") " violated, " (count-of rows "unverified") " unverified, "
+       (count-of rows "invalid") " invalid, " (- (count rows) (+ (count-of rows "accepted") (+ (count-of rows "violated") (+ (count-of rows "unverified") (count-of rows "invalid"))))) " not run"))
+
+(defun status-lines (rows: (Vec Row)) -> str
+  (join "" (mapv (fn (r: Row) (str (. (. r doc) number) " " (. r status) "\n")) rows)))
+
+(defun jesc (s: str) -> str
+  (loop ((i 0) (from 0) (out ""))
+    (if (>= i (str-len s))
+        (str out (str-slice s from (str-len s)))
+        (let ((b (sext i64 (str-byte-at s i))))
+          (cond (= b 34) (recur (+ i 1) (+ i 1) (str out (str-slice s from i) "\\\""))
+                (= b 92) (recur (+ i 1) (+ i 1) (str out (str-slice s from i) "\\\\"))
+                (= b 10) (recur (+ i 1) (+ i 1) (str out (str-slice s from i) "\\n"))
+                (< b 32) (recur (+ i 1) (+ i 1) (str out (str-slice s from i) " "))
+                :else (recur (+ i 1) from out))))))
+
+(defun jq (s: str) -> str (str "\"" (jesc s) "\""))
+
+(defun row-json :private (r: Row) -> str
+  (str "{\"adr\":" (jq (. (. r doc) number)) ",\"title\":" (jq (. (. r doc) title)) ",\"declared\":" (jq (. (. r doc) declared))
+       ",\"status\":" (jq (. r status)) ",\"blocks\":" (. r blocks) ",\"pass\":" (. r pass) ",\"fail\":" (. r fail)
+       ",\"notes\":[" (join "," (mapv jq (. r notes))) "]}"))
+
+(defun json-report (rows: (Vec Row)) -> str
+  (str "{\"schema\":1,\"adrs\":[" (join "," (mapv row-json rows)) "],\"summary\":{\"total\":" (count rows)
+       ",\"accepted\":" (count-of rows "accepted") ",\"violated\":" (count-of rows "violated") ",\"unverified\":" (count-of rows "unverified")
+       ",\"invalid\":" (count-of rows "invalid") "}}\n"))
+
+(defun exit-code (rows: (Vec Row) strict: bool) -> i64
+  (if (or (> (count-of rows "violated") 0) (or (> (count-of rows "invalid") 0) (and strict (> (count-of rows "unverified") 0)))) 1 0))
+
+;; ---- --stamp: the derived status in the file, on the line after `Status:`, only when it differs --------------------------------------
+
+(defun stamp-line (r: Row) -> str (str "<!-- derived: " (. r status) " -->"))
+
+(defun stamped (text: str line: str) -> str
+  (let ((ls (split-lines text))
+        (k (loop ((i 0)) (cond (>= i (count ls)) -1 (starts-with? (nth ls i) "Status:") i :else (recur (+ i 1))))))
+    (if (< k 0)
+        text
+        (let ((has (and (< (+ k 1) (count ls)) (starts-with? (nth ls (+ k 1)) "<!-- derived:")))
+              (head (take (+ k 1) ls))
+              (tail (drop (if (and (< (+ k 1) (count ls)) (starts-with? (nth ls (+ k 1)) "<!-- derived:")) (+ k 2) (+ k 1)) ls)))
+          (str (join "\n" (into (conj (vec head) line) tail)) (if (ends-with? text "\n") "\n" ""))))))
+
+(defun stamp-all (rows: (Vec Row)) -> unit
+  (doseq [r rows]
+    (match (read-file (. (. r doc) path))
+      (nil ())
+      ((some t) (let ((new (stamped t (stamp-line r))))
+                  (if (= new t) () (do (os/write-file-bytes (. (. r doc) path) (str-bytes new)) (println (str "adr: stamped " (. (. r doc) path))))))))))

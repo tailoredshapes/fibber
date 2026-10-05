@@ -1,0 +1,77 @@
+;; compiler/tests/adr/reader-agree.fib: the light reader of fib.test.arch (lib/fib/test/arch/scan.fib) against the compiler's own reader
+;; (compiler/syntax/reader.fib), on every .fib file of compiler/ and lib/ (docs/design/executable-adrs.md §4.2). For each file both give
+;; the top-level list forms; they must agree on each form's head, name and first line, and on the modules an `ns` form names. Files the
+;; real reader rejects (the reader's own negative tests) are counted and left out. Exit 0 when every readable file agrees.
+;; Run: fibc run compiler/tests/adr/reader-agree.fib -I compiler -I lib      (from the repository root)
+(ns main
+  (:use fib.core fib.seq fib.coll fib.print fib.string fib.test.arch syntax.form syntax.pos)
+  (:require [syntax.reader :as rd]))
+
+;; head, name and line of one top-level form, and the modules an ns form names: one text per form.
+(defun real-name :private (s: Stx) -> str
+  (match (. s kind) ((SSym n) n) ((SKw n) (str ":" n)) (_ "")))
+
+(defun strip-colon :private (t: str) -> str
+  (if (and (> (str-len t) 1) (= (sext i64 (str-byte-at t (- (str-len t) 1))) 58)) (str-slice t 0 (- (str-len t) 1)) t))
+
+(defun real-items :private (s: Stx) -> (Vec Stx) (match (. s kind) ((SList is) is) ((SVec is) is) (_ [])))
+
+(defun real-module :private (x: Stx) -> (Vec str)
+  (match (. x kind)
+    ((SSym n) [n])
+    ((SVec is) (if (> (count is) 0) (real-module (nth is 0)) []))
+    (_ [])))
+
+(defun real-refs :private (s: Stx) -> str
+  (join "," (reduce (fn (acc: (Vec str) c: Stx)
+                      (let ((is (real-items c)))
+                        (if (and (> (count is) 0) (or (= (real-name (nth is 0)) ":use") (or (= (real-name (nth is 0)) ":require") (= (real-name (nth is 0)) ":export-from"))))
+                            (into acc (reduce (fn (a: (Vec str) x: Stx) (into a (real-module x))) [] (drop 1 is)))
+                            acc)))
+                    [] (drop 2 (real-items s)))))
+
+(defun real-top :private (s: Stx) -> (Option str)
+  (let ((is (real-items s)))
+    (match (. s kind)
+      ((SList _) (if (> (count is) 0)
+                     (some (str (real-name (nth is 0)) " " (if (> (count is) 1) (strip-colon (real-name (nth is 1))) "") " @" (. (. s pos) line)
+                                (if (= (real-name (nth is 0)) "ns") (str " refs " (real-refs s)) "")))
+                     nil))
+      (_ nil))))
+
+(defun light-top :private (t: Top) -> str
+  (str (. t head) " " (. t name) " @" (. t line)
+       (if (= (. t head) "ns") (str " refs " (join "," (mapv (fn (m: ModRef) (. m name)) (ns-refs t)))) "")))
+
+(defun compare-file :private (f: SrcFile) -> (Option (Vec str))
+  (match (rd/read-all (. f text) (. f path))
+    ((Err _) nil)
+    ((Ok stxs)
+     (let ((real (reduce (fn (acc: (Vec str) s: Stx) (match (real-top s) (nil acc) ((some t) (conj acc t)))) [] stxs))
+           (light (mapv light-top (. f tops))))
+       (some (if (= real light) [] [(str (. f path) ": real " (count real) " forms, light " (count light) " forms; first difference: " (first-difference real light))]))))))
+
+(defun first-difference :private (a: (Vec str) b: (Vec str)) -> str
+  (loop ((i 0))
+    (cond (and (>= i (count a)) (>= i (count b))) "none"
+          (or (>= i (count a)) (or (>= i (count b)) (not (= (nth a i) (nth b i)))))
+            (str "[" (if (< i (count a)) (nth a i) "-") "] against [" (if (< i (count b)) (nth b i) "-") "]")
+          :else (recur (+ i 1)))))
+
+(defun disagreements :private (files: (Vec SrcFile)) -> (Vec str)
+  (reduce (fn (acc: (Vec str) f: SrcFile) (match (compare-file f) (nil acc) ((some xs) (into acc xs)))) [] files))
+
+(defun readable :private (files: (Vec SrcFile)) -> i64
+  (count (filterv (fn (f: SrcFile) (some? (compare-file f))) files)))
+
+;; The files that matter (compiler/ and lib/ outside the tests) must agree; the test inputs are counted: some are malformed on purpose
+;; (an `ns` with a number for a name), which is where the two readers are meant to differ.
+(defun main () -> i64
+  (let ((repo (load-repo "." (default-dirs)))
+        (files (select repo ["compiler/**.fib" "lib/**.fib" "!compiler/tests/**"]))
+        (tests (select repo ["compiler/tests/**.fib"]))
+        (bad (disagreements files)))
+    (do (doseq [b (take 10 bad)] (println b))
+        (println (str (count files) " source files, " (readable files) " read by both, " (count bad) " disagree"))
+        (println (str (count tests) " test inputs, " (readable tests) " read by both, " (count (disagreements tests)) " disagree (informational)"))
+        (if (or (> (count bad) 0) (< (readable files) 500)) 1 0))))

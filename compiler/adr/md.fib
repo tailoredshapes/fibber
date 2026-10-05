@@ -1,0 +1,104 @@
+;; adr.md: the Markdown of an executable ADR (docs/design/executable-adrs.md §2): the title, the declared status, the sections and the
+;; fenced blocks with their info strings. Only the structure the tool needs is read; the prose is left alone.
+(ns adr.md (:use fib.core fib.seq fib.coll fib.print fib.string))
+
+;; One fenced block: `lang` and `kind` are the first two words of the info string ("fibber" "spec"), `line` is the line of the opening
+;; fence, `body` the text between the fences, `section` the lower-cased heading it sits under.
+(defstruct Block (lang: str kind: str line: i64 body: str section: str))
+
+;; An ADR file: its number (from the file name), title, the status as declared (`accepted`, `proposed`, `deprecated`, `superseded by
+;; NNNN`), the number it is superseded by ("" if none), its blocks, and what is wrong with the file's form.
+(defstruct Doc (path: str number: str title: str declared: str by: str blocks: (Vec Block) problems: (Vec str)))
+
+(defun base-name (path: str) -> str
+  (let ((parts (split-lines (str-replace-all path "/" "\n"))))
+    (if (empty? parts) path (nth parts (- (count parts) 1)))))
+
+(defun str-replace-all :private (s: str from: str to: str) -> str
+  (loop ((i 0) (out ""))
+    (match (str-find s from i)
+      (nil (str out (str-slice s i (str-len s))))
+      ((some k) (recur (+ k (str-len from)) (str out (str-slice s i k) to))))))
+
+(defun digits? (s: str) -> bool
+  (and (> (str-len s) 0)
+       (loop ((i 0)) (cond (>= i (str-len s)) true
+                           (and (>= (sext i64 (str-byte-at s i)) 48) (<= (sext i64 (str-byte-at s i)) 57)) (recur (+ i 1))
+                           :else false))))
+
+;; The ADR number of a file name `0007-windows-run-fast.md`: its leading digits, or "".
+(defun number-of (path: str) -> str
+  (let ((b (base-name path)))
+    (loop ((i 0))
+      (cond (>= i (str-len b)) ""
+            (digits? (str-slice b 0 (+ i 1))) (recur (+ i 1))
+            :else (str-slice b 0 i)))))
+
+(defun adr-file? (path: str) -> bool
+  (and (ends-with? path ".md") (>= (str-len (number-of path)) 4)))
+
+;; "# 0001. Title" and "# Title" give "Title".
+(defun title-of :private (line: str) -> str
+  (let ((t (trim (str-slice line 2 (str-len line)))))
+    (match (str-find t ". " 0)
+      (nil t)
+      ((some k) (if (digits? (str-slice t 0 k)) (trim (str-slice t (+ k 2) (str-len t))) t)))))
+
+;; The text after `Status:` on a line, lower-cased and trimmed; nil when the line is not a status line.
+(defun status-line :private (line: str) -> (Option str)
+  (if (starts-with? line "Status:") (some (lower (trim (str-slice line 7 (str-len line))))) nil))
+
+(defun ascii? :private (s: str) -> bool
+  (loop ((i 0)) (cond (>= i (str-len s)) true (< (sext i64 (str-byte-at s i)) 0) false :else (recur (+ i 1)))))
+
+(defun lower (s: str) -> str
+  (if (not (ascii? s)) s (lower-ascii s)))
+
+(defun lower-ascii :private (s: str) -> str
+  (loop ((i 0) (out ""))
+    (if (< i (str-len s))
+        (let ((b (sext i64 (str-byte-at s i))))
+          (recur (+ i 1) (str out (if (and (>= b 65) (<= b 90)) (str-slice "abcdefghijklmnopqrstuvwxyz" (- b 65) (- b 64)) (str-slice s i (+ i 1))))))
+        out)))
+
+(defun words (s: str) -> (Vec str)
+  (filterv (fn (w: str) (> (str-len w) 0)) (split-by-space s)))
+
+(defun split-by-space :private (s: str) -> (Vec str)
+  (loop ((i 0) (start 0) (out []))
+    (cond (>= i (str-len s)) (if (> i start) (conj out (str-slice s start i)) out)
+          (= (sext i64 (str-byte-at s i)) 32) (recur (+ i 1) (+ i 1) (if (> i start) (conj out (str-slice s start i)) out))
+          :else (recur (+ i 1) start out))))
+
+(defstruct Scan (blocks: (Vec Block) title: str status: str open: bool section: str info: str start: i64 body: (Vec str)))
+
+(defun heading? :private (line: str) -> bool (starts-with? line "## "))
+
+(defun step :private (sc: Scan n: i64 line: str) -> Scan
+  (cond (. sc open)
+          (if (starts-with? line "```")
+              (let ((ws (words (. sc info))))
+                (Scan (conj (. sc blocks) (Block (if (> (count ws) 0) (nth ws 0) "") (if (> (count ws) 1) (nth ws 1) "") (. sc start) (join "\n" (. sc body)) (. sc section)))
+                      (. sc title) (. sc status) false (. sc section) "" 0 []))
+              (Scan (. sc blocks) (. sc title) (. sc status) true (. sc section) (. sc info) (. sc start) (conj (. sc body) line)))
+        (starts-with? line "```")
+          (Scan (. sc blocks) (. sc title) (. sc status) true (. sc section) (trim (str-slice line 3 (str-len line))) n [])
+        (and (= (. sc title) "") (starts-with? line "# ")) (Scan (. sc blocks) (title-of line) (. sc status) false (. sc section) "" 0 [])
+        (heading? line) (Scan (. sc blocks) (. sc title) (. sc status) false (lower (trim (str-slice line 3 (str-len line)))) "" 0 [])
+        (and (= (. sc status) "") (some? (status-line line))) (Scan (. sc blocks) (. sc title) (unwrap-or (status-line line) "") false (. sc section) "" 0 [])
+        :else sc))
+
+(defun problems-of :private (path: str sc: Scan) -> (Vec str)
+  (let ((st (words (. sc status))))
+    (into (into (if (= (. sc title) "") ["no `# Title` line"] [])
+                (cond (= (. sc status) "") ["no `Status:` line"]
+                      (or (= (nth st 0) "accepted") (or (= (nth st 0) "proposed") (= (nth st 0) "deprecated"))) []
+                      (and (= (nth st 0) "superseded") (and (= (count st) 3) (= (nth st 1) "by"))) []
+                      :else [(str "the status `" (. sc status) "` is none of accepted, proposed, deprecated, superseded by NNNN")]))
+          (if (. sc open) ["a code fence is not closed"] []))))
+
+(defun parse (path: str text: str) -> Doc
+  (let ((lines (split-lines text))
+        (sc (reduce (fn (s: Scan i: i64) (step s (+ i 1) (nth lines i))) (Scan [] "" "" false "" "" 0 []) (range (count lines))))
+        (st (words (. sc status))))
+    (Doc path (number-of path) (. sc title) (if (> (count st) 0) (nth st 0) "") (if (= (count st) 3) (nth st 2) "") (. sc blocks) (problems-of path sc))))
