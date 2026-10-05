@@ -1,8 +1,15 @@
 ;; compiler/lsp/scope.fib: what the reader sees at a cursor, and what kind of name is asked for (docs/design/fibref-port.md section 6). OWNER: package L2.
 ;; Rust: editor/scope.rs (409) and editor/context.rs (107). The text before the cursor, closed by the delimiters still open, reads even when the rest of
 ;; the buffer does not. `classify` works on the text before the cursor alone.
+;;
+;; Differences from the Rust, each deliberate: `top-defs` takes the reader's `Stx` (the stub named a type `Form` that is not the reader's); a local and a
+;; definition carry the byte range of the name where it is bound (for go-to-definition); a local's `ty` is the head of its annotation (`Vec` for
+;; `(Vec str)`), "" when none is written; `classify` answers `AskNone` when the text ends inside a string or a comment (the Rust asked for names there);
+;; the delimiter scan (`Delims` of editor/analysis.rs) lives here as `LsDelims`, because lsp.analysis needs it too.
+;; `scope-at` lists the locals outermost first, so a shadowing local comes after the one it shadows.
 (ns lsp.scope
-  (:use syntax.form))
+  (:use syntax.form syntax.pos)
+  (:require [syntax.reader :as rd]))
 
 (defstruct LsLocal (name: str start: i64 end: i64 ty: str))             ;; a parameter or `let` binding in scope; ty "" when not written
 (defstruct LsDef (name: str kind: str start: i64 end: i64 signature: str))  ;; a top-level definition of the buffer
@@ -12,6 +19,345 @@
 (defenum LsAsk (AskValue) (AskType) (AskField receiver: str) (AskExport alias: str) (AskKeyword) (AskNone))
 (defstruct LsCtx (ask: LsAsk prefix: str word-start: i64))
 
-(defun scope-at (src: str word-start: i64 path: str) -> LsScope (trap "todo: lsp.scope scope-at"))
-(defun classify (before: str) -> LsCtx (trap "todo: lsp.scope classify"))
-(defun top-defs (forms: (Vec Form) text: str) -> (Vec LsDef) (trap "todo: lsp.scope top-defs"))
+;; ---- delimiters: what a scan of text leaves open, aware of strings, comments and character literals ----
+
+;; `open` holds the opening bytes still open (40 ( 91 [ 123 {), innermost last.
+(defstruct LsDelims (open: (Vec i64) in-string: bool in-comment: bool escaped: bool))
+
+(defun delims-new () -> LsDelims (LsDelims [] false false false))
+
+(defun delims-code :private (d: LsDelims b: i64) -> LsDelims
+  (cond (= b 59) (LsDelims (. d open) false true false)
+        (= b 34) (LsDelims (. d open) true false false)
+        (= b 92) (LsDelims (. d open) false false true)
+        (or (= b 40) (or (= b 91) (= b 123))) (LsDelims (conj (. d open) b) false false false)
+        (and (or (= b 41) (or (= b 93) (= b 125))) (> (count (. d open)) 0)) (LsDelims (pop (. d open)) false false false)
+        :else d))
+
+;; Reads one more byte.
+(defun delims-step (d: LsDelims b: i64) -> LsDelims
+  (cond (. d in-comment) (LsDelims (. d open) false (not (= b 10)) false)
+        (. d escaped) (LsDelims (. d open) (. d in-string) false false)
+        (. d in-string) (cond (= b 92) (LsDelims (. d open) true false true)
+                              (= b 34) (LsDelims (. d open) false false false)
+                              :else d)
+        :else (delims-code d b)))
+
+(defun delims-scan (text: str) -> LsDelims
+  (loop ((d (delims-new)) (i 0))
+    (if (>= i (str-len text)) d (recur (delims-step d (zext i64 (str-byte-at text i))) (+ i 1)))))
+
+;; Whether nothing is open: not in a form, a string or a comment.
+(defun delims-idle? (d: LsDelims) -> bool
+  (and (= (count (. d open)) 0) (not (. d in-string)) (not (. d in-comment)) (not (. d escaped))))
+
+;; The text that closes what is open, innermost first.
+(defun delims-closers (d: LsDelims) -> str
+  (str-join (vec (map (fn (i: i64) (let ((b (nth (. d open) (- (- (count (. d open)) 1) i)))) (if (= b 40) ")" (if (= b 91) "]" "}"))))
+                      (range (count (. d open)))))))
+
+;; ---- reading the tree ----
+
+(defun seq-of :private (f: Stx) -> (Option (Vec Stx))
+  (match (. f kind)
+    ((SList v) (some v))
+    ((SVec v) (some v))
+    ((SMap v) (some v))
+    (_ nil)))
+
+(defun sym-of :private (f: Stx) -> str
+  (match (. f kind) ((SSym s) s) (_ "")))
+
+(defun head-of :private (items: (Vec Stx)) -> str
+  (if (= (count items) 0) "" (sym-of (nth items 0))))
+
+(defun seq-head :private (f: Stx) -> str
+  (match (seq-of f) ((some i) (head-of i)) (nil "")))
+
+(defun colon-name? :private (s: str) -> bool
+  (and (> (str-len s) 1) (= (str-byte-at s (- (str-len s) 1)) 58i8)))
+
+(defun trim-colons :private (s: str) -> str
+  (loop ((n (str-len s)))
+    (if (and (> n 0) (= (str-byte-at s (- n 1)) 58i8)) (recur (- n 1)) (str-slice s 0 n))))
+
+;; The head of a type as written: `i64`, or `Vec` of `(Vec str)`.
+(defun type-head :private (f: Stx) -> str
+  (match (. f kind) ((SSym s) s) (_ (seq-head f))))
+
+(defun local-at :private (name: str f: Stx ty: str) -> LsLocal
+  (LsLocal name (. (. f pos) start) (+ (. (. f pos) start) (str-len name)) ty))
+
+(defun type-after :private (items: (Vec Stx) i: i64) -> str
+  (if (< i (count items)) (type-head (nth items i)) ""))
+
+;; The names a pattern binds (syntax §3.6).
+(defun pattern :private (f: Stx out: (Vec LsLocal)) -> (Vec LsLocal)
+  (match (. f kind)
+    ((SSym s) (if (or (= s "_") (or (= s "&") (= s "nil"))) out (conj out (local-at (trim-colons s) f ""))))
+    ((SList items)
+     (if (and (> (count items) 1) (match (. (nth items 1) kind) ((SKw k) (= k "as")) (_ false)))
+         (let ((o1 (pattern (nth items 0) out)))
+           (if (> (count items) 2) (pattern (nth items 2) o1) o1))
+         (reduce (fn (o: (Vec LsLocal) p: Stx) (pattern p o)) out (drop 1 items))))
+    ((SVec items) (reduce (fn (o: (Vec LsLocal) p: Stx) (pattern p o)) out items))
+    (_ out)))
+
+;; `x: T` binds x with its type, anything else is a pattern; `item` is items[from..].
+(defun annotated-or-pattern :private (items: (Vec Stx) from: i64 out: (Vec LsLocal)) -> (Vec LsLocal)
+  (let ((f (nth items from)) (name (sym-of (nth items from))))
+    (if (colon-name? name)
+        (conj out (local-at (trim-colons name) f (type-after items (+ from 1))))
+        (pattern f out))))
+
+;; The flat binding list `[p e ..]` of items[0..to]: `p:` takes a type, so three items.
+(defun flat-bindings :private (items: (Vec Stx) to: i64 out: (Vec LsLocal)) -> (Vec LsLocal)
+  (loop ((i 0) (o out))
+    (if (>= i to)
+        o
+        (let ((w (if (colon-name? (sym-of (nth items i))) 3 2)))
+          (recur (+ i w) (if (<= (+ i w) to) (annotated-or-pattern items i o) o))))))
+
+;; The names a binding list binds, from its first `done` items: pairs `((p e) ..)` or the flat `[p e ..]`.
+(defun bindings :private (b: (Option Stx) done: i64 out: (Vec LsLocal)) -> (Vec LsLocal)
+  (match b
+    (nil out)
+    ((some bf)
+     (match (seq-of bf)
+       (nil out)
+       ((some items)
+        (let ((to (min done (count items))))
+          (match (. bf kind)
+            ((SVec _) (flat-bindings items to out))
+            (_ (loop ((i 0) (o out))
+                 (if (>= i to)
+                     o
+                     (recur (+ i 1)
+                            (match (seq-of (nth items i))
+                              ((some pair) (if (>= (count pair) 2) (annotated-or-pattern pair 0 o) o))
+                              (nil o)))))))))))))
+
+;; The parameters of a parameter list: `x: T` and plain `x`, with `&` and `:borrow` skipped.
+(defun params-of :private (list: Stx out: (Vec LsLocal)) -> (Vec LsLocal)
+  (match (seq-of list)
+    (nil out)
+    ((some items)
+     (loop ((i 0) (o out))
+       (if (>= i (count items))
+           o
+           (let ((f (nth items i)) (s (sym-of (nth items i))))
+             (cond (= s "->") o
+                   (colon-name? s) (recur (+ i 2) (conj o (local-at (trim-colons s) f (type-after items (+ i 1)))))
+                   (and (> (str-len s) 0) (not (= s "&"))) (recur (+ i 1) (conj o (local-at s f "")))
+                   :else (recur (+ i 1) o))))))))
+
+;; ---- the open forms on the way to the cursor ----
+
+;; An open form: its items and the index of the item being written.
+(defstruct LsFrame (items: (Vec Stx) idx: i64))
+
+;; The `open` forms the cursor is inside, outermost first: the last top-level form, then each last item, `open` deep.
+(defun frames :private (forms: (Vec Stx) open: i64) -> (Vec LsFrame)
+  (loop ((level 0) (cur (if (> (count forms) 0) (some (nth forms (- (count forms) 1))) nil)) (out []))
+    (if (>= level open)
+        out
+        (match (match cur (nil nil) ((some c) (seq-of c)))
+          (nil out)
+          ((some items)
+           (recur (+ level 1)
+                  (if (> (count items) 0) (some (nth items (- (count items) 1))) nil)
+                  (conj out (LsFrame items (if (= (+ level 1) open) (count items) (max 0 (- (count items) 1)))))))))))
+
+(defun let-form :private (c: (Vec Stx) idx: i64 next: (Option LsFrame) out: (Vec LsLocal)) -> (Vec LsLocal)
+  (cond (> idx 1) (bindings (nth-or c 1) 1000000000 out)
+        (= idx 1) (match next (nil out) ((some inner) (bindings (nth-or c 1) (. inner idx) out)))
+        :else out))
+
+(defun nth-or :private (items: (Vec Stx) i: i64) -> (Option Stx)
+  (if (< i (count items)) (some (nth items i)) nil))
+
+(defun pair-form :private (c: (Vec Stx) idx: i64 out: (Vec LsLocal)) -> (Vec LsLocal)
+  (match (nth-or c 1)
+    (nil out)
+    ((some b)
+     (if (<= idx 1)
+         out
+         (match (seq-of b)
+           (nil out)
+           ((some items)
+            (cond (and (> (count items) 0) (match (seq-of (nth items 0)) ((some _) true) (nil false)))
+                  (bindings (some b) 1000000000 out)
+                  (> (count items) 0) (pattern (nth items 0) out)
+                  :else out)))))))
+
+(defun def-params :private (c: (Vec Stx) idx: i64 out: (Vec LsLocal)) -> (Vec LsLocal)
+  (let ((p (loop ((i 2)) (cond (>= i (count c)) -1 (match (seq-of (nth c i)) ((some _) true) (nil false)) i :else (recur (+ i 1))))))
+    (if (and (>= p 0) (> idx p)) (params-of (nth c p) out) out)))
+
+(defun fn-params :private (c: (Vec Stx) idx: i64 out: (Vec LsLocal)) -> (Vec LsLocal)
+  (let ((p (if (and (> (count c) 1) (> (str-len (sym-of (nth c 1))) 0)) 2 1)))
+    (if (and (< p (count c)) (> idx p)) (params-of (nth c p) out) out)))
+
+(defun frame-locals :private (path: (Vec LsFrame) k: i64 out: (Vec LsLocal)) -> (Vec LsLocal)
+  (let ((fr (nth path k))
+        (parent (if (> k 0) (head-of (. (nth path (- k 1)) items)) ""))
+        (has-parent (> k 0)))
+    (let ((c (. fr items)) (idx (. fr idx)) (h (head-of (. fr items))))
+      (cond (and (and has-parent (= parent "match")) (>= idx 1)) (pattern (nth c 0) out)
+            (and (and has-parent (= parent "defn")) (>= idx 1)) (params-of (nth c 0) out)
+            (or (= h "let") (= h "let*")) (let-form c idx (if (< (+ k 1) (count path)) (some (nth path (+ k 1))) nil) out)
+            (and (= h "loop") (> idx 1)) (bindings (nth-or c 1) 1000000000 out)
+            (or (= h "defun") (= h "defmacro")) (def-params c idx out)
+            (= h "fn") (fn-params c idx out)
+            (includes? h ["if-let" "when-let" "if-some" "when-some" "try-let" "dotimes"]) (pair-form c idx out)
+            :else out))))
+
+(defun locals-of :private (path: (Vec LsFrame)) -> (Vec LsLocal)
+  (loop ((k 0) (out []))
+    (if (>= k (count path)) out (recur (+ k 1) (frame-locals path k out)))))
+
+;; ---- top-level definitions ----
+
+;; `(x: i64) -> i64` as written in the source: the first list of the form after its name, and the type after `->`.
+(defun signature :private (items: (Vec Stx) text: str) -> str
+  (let ((p (loop ((i 2)) (cond (>= i (count items)) -1 (match (seq-of (nth items i)) ((some _) true) (nil false)) i :else (recur (+ i 1))))))
+    (if (< p 0)
+        ""
+        (let ((start (. (. (nth items p) pos) start))
+              (ret (if (and (< (+ p 2) (count items)) (= (sym-of (nth items (+ p 1))) "->")) (some (nth items (+ p 2))) nil)))
+          (let ((end (match ret (nil (. (. (nth items p) pos) end)) ((some r) (. (. r pos) end)))))
+            (if (and (<= start end) (<= end (str-len text))) (str-slice text start end) ""))))))
+
+;; The form that names a definition: the symbol, or the head of a list (`(defstruct (Box a) ..)`).
+(defun name-form :private (f: Stx) -> (Option Stx)
+  (match (. f kind)
+    ((SSym _) (some f))
+    (_ (match (seq-of f)
+         ((some items) (if (and (> (count items) 0) (> (str-len (sym-of (nth items 0))) 0)) (some (nth items 0)) nil))
+         (nil nil)))))
+
+(defun def-of :private (f: Stx kind: str detail: str) -> LsDef
+  (let ((name (trim-colons (sym-of f))))
+    (LsDef name kind (. (. f pos) start) (+ (. (. f pos) start) (str-len name)) detail)))
+
+(defun upper? :private (s: str) -> bool
+  (and (> (str-len s) 0) (>= (str-byte-at s 0) 65i8) (<= (str-byte-at s 0) 90i8)))
+
+(defun variants :private (items: (Vec Stx) n: str out: (Vec LsDef)) -> (Vec LsDef)
+  (reduce (fn (o: (Vec LsDef) v: Stx)
+            (match (name-form v) (nil o) ((some nf) (if (upper? (sym-of nf)) (conj o (def-of nf "variant" n)) o))))
+          out (drop 2 items)))
+
+(defun methods :private (items: (Vec Stx) n: str out: (Vec LsDef)) -> (Vec LsDef)
+  (reduce (fn (o: (Vec LsDef) m: Stx)
+            (match (seq-of m)
+              (nil o)
+              ((some mi) (match (name-form (nth mi 0)) (nil o) ((some nf) (conj o (def-of nf "method" n)))))))
+          out (drop 2 items)))
+
+(defun defs-of-form :private (items: (Vec Stx) text: str out: (Vec LsDef)) -> (Vec LsDef)
+  (match (name-form (nth items 1))
+    (nil out)
+    ((some nf)
+     (let ((h (head-of items)) (n (sym-of nf)))
+       (cond (or (= h "defun") (= h "defn")) (conj out (def-of nf "function" (signature items text)))
+             (= h "defmacro") (conj out (def-of nf "macro" (signature items text)))
+             (= h "def") (conj out (def-of nf "variable" ""))
+             (or (= h "defstruct") (= h "defrecord")) (conj out (def-of nf "struct" ""))
+             (= h "defenum") (variants items n (conj out (def-of nf "enum" "")))
+             (= h "defprotocol") (methods items n (conj out (def-of nf "protocol" "")))
+             :else out)))))
+
+;; The definitions among top-level `forms` read from `text`.
+(defun top-defs (forms: (Vec Stx) text: str) -> (Vec LsDef)
+  (reduce (fn (out: (Vec LsDef) f: Stx)
+            (match (. f kind)
+              ((SList items) (if (>= (count items) 2) (defs-of-form items text out) out))
+              (_ out)))
+          [] forms))
+
+;; ---- the scope at a cursor ----
+
+(defun whole-buffer :private (src: str path: str) -> LsScope
+  (match (rd/read-all src path)
+    ((Ok forms) (LsScope [] (top-defs forms src)))
+    ((Err _) (LsScope [] []))))
+
+;; A character that may sit between the text before the cursor and a prefix form: whitespace and the reader's prefix characters.
+(defun skip-char? :private (b: i64) -> bool
+  (or (ws? b) (includes? b [39 96 126 64 35 94])))
+
+;; `n` moved back to the start of its character.
+(defun char-start :private (src: str n: i64) -> i64
+  (loop ((k (max 0 (min n (str-len src)))))
+    (if (and (> k 0) (< k (str-len src)) (= (bit-and (zext i64 (str-byte-at src k)) 192) 128)) (recur (- k 1)) k)))
+
+;; The text before a position, without the whitespace and prefix characters just before it.
+(defun trim-prefix :private (src: str word-start: i64) -> str
+  (loop ((n (char-start src word-start)))
+    (if (and (> n 0) (skip-char? (zext i64 (str-byte-at src (- n 1))))) (recur (- n 1)) (str-slice src 0 n))))
+
+;; The scope at byte offset `word-start` of `src` (the start of the partial word at the cursor).
+(defun scope-at (src: str word-start: i64 path: str) -> LsScope
+  (let ((prefix (trim-prefix src word-start))
+        (d (delims-scan (trim-prefix src word-start))))
+    (if (. d in-string)
+        (LsScope [] [])
+        (let ((closed (str prefix (if (. d in-comment) "\n" "") (delims-closers d)))
+              (whole (whole-buffer src path)))
+          (match (rd/read-all closed path)
+            ((Err _) whole)
+            ((Ok forms)
+             (LsScope (locals-of (frames forms (count (. d open))))
+                      (if (= (count (. whole defs)) 0) (top-defs forms closed) (. whole defs)))))))))
+
+;; ---- what kind of name the cursor asks for ----
+
+(defun ws? :private (b: i64) -> bool (or (= b 32) (or (and (>= b 9) (<= b 13)) false)))
+
+(defun break? :private (b: i64) -> bool (or (ws? b) (includes? b [40 41 91 93 123 125 34 59 44 39 96 126 64 94])))
+
+;; The start of the last word of `text`, which ends it.
+(defun word-start-of :private (text: str) -> i64
+  (loop ((i (str-len text)))
+    (cond (<= i 0) 0
+          (break? (zext i64 (str-byte-at text (- i 1)))) i
+          :else (recur (- i 1)))))
+
+(defun rtrim :private (s: str) -> str
+  (loop ((n (str-len s)))
+    (if (and (> n 0) (ws? (zext i64 (str-byte-at s (- n 1))))) (recur (- n 1)) (str-slice s 0 n))))
+
+(defun last-slash :private (w: str) -> i64
+  (loop ((i (- (str-len w) 1)))
+    (cond (< i 0) -1
+          (= (str-byte-at w i) 47i8) i
+          :else (recur (- i 1)))))
+
+(defun ends-with-char? :private (s: str c: i8) -> bool
+  (and (> (str-len s) 0) (= (str-byte-at s (- (str-len s) 1)) c)))
+
+;; The wish given the text before the partial word.
+(defun after-word :private (rest: str) -> LsAsk
+  (if (not (and (> (str-len rest) 0) (ws? (zext i64 (str-byte-at rest (- (str-len rest) 1))))))
+      AskValue
+      (let ((trimmed (rtrim rest)))
+        (let ((p (word-start-of trimmed)))
+          (let ((prev (str-slice trimmed p (str-len trimmed)))
+                (head (rtrim (str-slice trimmed 0 p))))
+            (let ((field-form (and (ends-with-char? head 46i8) (ends-with-char? (str-slice head 0 (- (str-len head) 1)) 40i8))))
+              (cond (or (= prev "->") (and (colon-name? prev) (not (= (str-byte-at prev 0) 58i8)))) AskType
+                    (and field-form (and (> (str-len prev) 0) (not (ends-with-char? prev 58i8)))) (AskField prev)
+                    :else AskValue)))))))
+
+;; The kind of candidate wanted at the end of `before`.
+(defun classify (before: str) -> LsCtx
+  (let ((start (word-start-of before))
+        (d (delims-scan before)))
+    (let ((word (str-slice before start (str-len before))))
+      (let ((slash (last-slash word)))
+        (LsCtx (cond (or (. d in-string) (. d in-comment)) AskNone
+                     (and (> (str-len word) 0) (= (str-byte-at word 0) 58i8)) AskKeyword
+                     (> slash 0) (AskExport (str-slice word 0 slash))
+                     :else (after-word (str-slice before 0 start)))
+               word start)))))

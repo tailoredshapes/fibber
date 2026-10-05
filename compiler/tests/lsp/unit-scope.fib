@@ -1,0 +1,103 @@
+;; compiler/tests/lsp/unit-scope.fib: lsp.scope. SOURCE: the four tests of crates/fibref/src/editor/scope.rs (parameters_and_let_bindings_..., match_clauses_loops_and_
+;; fns_..., a_closed_form_before_the_cursor_binds_nothing_there, top_level_definitions_are_found_with_their_kinds) and the three of editor/context.rs, widened:
+;; shadowing, binding ranges, unbalanced buffers, a cursor inside a string, the other binding forms (if-let, try-let, dotimes, defn clauses, `:as` patterns).
+;; In a case string `|` marks the cursor and is removed.
+(ns main (:use lsp.scope ck) (:require [syntax.reader :as rd]))
+
+(defun before (src: str) -> str (match (str-find src "|" 0) ((some i) (str-slice src 0 i)) (nil src)))
+(defun text-of (src: str) -> str (match (str-find src "|" 0) ((some i) (str (str-slice src 0 i) (str-slice src (+ i 1) (str-len src)))) (nil src)))
+(defun cursor (src: str) -> i64 (str-len (before src)))
+
+(defun locals (src: str) -> (Vec LsLocal) (. (scope-at (text-of src) (cursor src) "t.fib") locals))
+(defun names (src: str) -> str (str-join (vec (interpose "," (mapv (fn (l: LsLocal) (. l name)) (locals src))))))
+(defun tys (src: str) -> str (str-join (vec (interpose "," (mapv (fn (l: LsLocal) (str (. l name) ":" (. l ty))) (locals src))))))
+(defun ranges (src: str) -> str
+  (let ((text (text-of src)))
+    (str-join (vec (interpose "," (mapv (fn (l: LsLocal) (str-slice text (. l start) (. l end))) (locals src)))))))
+
+(defun defs-of (src: str) -> (Vec LsDef)
+  (match (rd/read-all src "t") ((Ok forms) (top-defs forms src)) ((Err _) (trap "unreadable test source"))))
+(defun def-line (d: LsDef) -> str (str (. d name) "/" (. d kind) "/" (. d signature)))
+(defun defs-text (src: str) -> str (str-join (vec (interpose ";" (mapv def-line (defs-of src))))))
+
+(defun ask-str (a: LsAsk) -> str
+  (match a
+    ((AskValue) "value") ((AskType) "type") ((AskField r) (str "field " r)) ((AskExport x) (str "export " x)) ((AskKeyword) "keyword") ((AskNone) "none")))
+(defun want (src: str) -> str (ask-str (. (classify src) ask)))
+(defun ws (src: str) -> i64 (. (classify src) word-start))
+(defun pre (src: str) -> str (. (classify src) prefix))
+
+(defun main () -> i64
+  (finish
+    [;; the Rust's scope tests
+     (eq-str "params and let" (names "(defun f (a: i64 b: str) -> i64 (let ((x 1) (y 2)) |") "a,b,x,y")
+     (eq-str "let value position" (names "(defun f (a: i64) -> i64 (let ((x 1) (y |") "a,x")
+     (eq-str "let value not yet bound" (names "(defun f (a: i64) -> i64 (let ((x 1) (y (+ x |") "a,x")
+     (eq-str "flat let" (names "(defun f (a: i64) -> i64 (let [x 1 y: i64 2 z |") "a,x,y")
+     (eq-str "match clause" (names "(match v ((some w) |") "w")
+     (eq-str "match nil clause" (names "(match v ((some w) 1) (nil |") "")
+     (eq-str "loop and fn" (names "(loop ((i 0)) (fn (e) |") "i,e")
+     (eq-str "loop binding position" (names "(loop ((i |") "")
+     (eq-str "closed form before" (names "(defun f (a: i64) -> i64 a)\n(defun g (b: i64) -> i64 |") "b")
+     (eq-str "closed let before" (names "(defun g (b: i64) -> i64 (let ((x 1)) x) |") "b")
+     (eq-str "defs kinds" (defs-text "(defun f (a: i64) -> i64 a)\n(defstruct P (x: i64))\n(defenum E A (B i64))\n(defprotocol Q (m (self) -> i64))")
+             "f/function/(a: i64) -> i64;P/struct/;E/enum/;A/variant/E;B/variant/E;Q/protocol/;m/method/Q")
+     ;; shadowing: the inner binding comes after the outer, and is a different place
+     (eq-str "shadow names" (names "(defun f () -> i64 (let ((x 1)) (let ((x 2)) |") "x,x")
+     (eq-int "shadow places differ" (let ((ls (locals "(defun f () -> i64 (let ((x 1)) (let ((x 2)) |"))) (- (. (nth ls 1) start) (. (nth ls 0) start))) 13)
+     (eq-str "shadow param" (names "(defun f (x: i64) -> i64 (let ((x 1)) |") "x,x")
+     ;; binding ranges and written types
+     (eq-str "ranges" (ranges "(defun f (a: i64 bb: (Vec str)) -> i64 (let ((x 1)) |") "a,bb,x")
+     (eq-str "types" (tys "(defun f (a: i64 bb: (Vec str) c) -> i64 (let [x 1 y: str \"s\"] |") "a:i64,bb:Vec,c:,x:,y:str")
+     ;; other binding forms
+     (eq-str "if-let" (names "(defun f () -> i64 (if-let (v (g)) |") "v")
+     (eq-str "if-let before" (names "(defun f () -> i64 (if-let (v |") "")
+     (eq-str "try-let binds its first pattern only, as the Rust" (names "(defun f () -> i64 (try-let [x (g) y (h)] |") "x")
+     (eq-str "dotimes" (names "(defun f () -> i64 (dotimes (i 10) |") "i")
+     (eq-str "defn clause" (names "(defn f ([x: i64] -> i64 |") "x")
+     (eq-str "defun skips arrow and &" (names "(defun f (a: i64 & rest) -> i64 |") "a,rest")
+     (eq-str "named fn" (names "(defun f () -> i64 (fn loop (a b) |") "a,b")
+     (eq-str "as pattern" (names "(match v ((p :as q) |") "p,q")
+     (eq-str "constructor pattern" (names "(match v ((Pair a (Some b)) |") "a,b")
+     (eq-str "vec pattern" (names "(match v ([a b _] |") "a,b")
+     (eq-str "match nested in let" (names "(let ((x 1)) (match v ((some w) |") "x,w")
+     ;; a buffer that does not read
+     (eq-str "unclosed before" (names "(defun f (a: i64) -> i64 (let ((x 1)) (g |") "a,x")
+     (eq-str "garbage after" (names "(defun f (a: i64) -> i64 |  )))) ((((\"") "a")
+     (eq-str "inside a string" (names "(defun f (a: i64) -> i64 \"abc |") "")
+     (eq-str "after a comment line" (names "(defun f (a: i64) -> i64 ; (note\n  |") "a")
+     (eq-str "empty buffer" (names "|") "")
+     (eq-str "prefix characters before the word" (names "(defun f (a: i64) -> i64 '|") "a")
+     (eq-int "cursor past the end" (count (. (scope-at "(defun f (a: i64) -> i64 a)" 999 "t") locals)) 0)
+     ;; definitions: from the whole buffer when it reads, else from the text before the cursor
+     (eq-str "defs whole buffer" (str-join (vec (interpose "," (mapv (fn (d: LsDef) (. d name)) (. (scope-at "(defun a () -> i64 1)\n(defun b () -> i64 )\n(defun c () -> i64 2)" 40 "t") defs))))) "a,b,c")
+     (eq-str "defs before when the rest does not read" (str-join (vec (interpose "," (mapv (fn (d: LsDef) (. d name)) (. (scope-at "(defun a () -> i64 1)\n(defun b () -> i64 \n(defun c ( 2" 40 "t") defs))))) "a,b")
+     (eq-str "def ranges" (let ((src "(defun fun1 (a: i64) -> i64 a)") (d (nth (defs-of "(defun fun1 (a: i64) -> i64 a)") 0))) (str-slice src (. d start) (. d end))) "fun1")
+     (eq-str "defs more kinds" (defs-text "(def k: i64 1)\n(defmacro mm (x) x)\n(defrecord R (a: i64))\n(defenum (Opt a) :private None (Some v: a))\n(foo bar)\n(defun)")
+             "k/variable/;mm/macro/(x);R/struct/;Opt/enum/;None/variant/Opt;Some/variant/Opt")
+     ;; what the cursor asks for: the Rust's three tests
+     (eq-str "type after colon" (want "(defun f (x: ") "type")
+     (eq-str "type after arrow" (want "(defun f (x: i64) -> ") "type")
+     (eq-str "type being typed" (want "(defun f (x: i6") "type")
+     (eq-str "keyword arg then space" (want "(f :k ") "value")
+     (eq-str "field after dot form" (want "(. p ") "field p")
+     (eq-str "field with a partial name" (want "(foo (. p na") "field p")
+     (eq-str "dot form without value" (want "(. p") "value")
+     (eq-str "dot not at the head" (want "(x . p ") "value")
+     (eq-str "alias" (want "(seq/ma") "export seq")
+     (eq-str "keyword" (want "(f :ke") "keyword")
+     (eq-int "word start" (ws "(foo bar") 5)
+     (eq-int "word start at space" (ws "(foo ") 5)
+     ;; more
+     (eq-str "word prefix" (pre "(foo bar") "bar")
+     (eq-str "empty prefix" (pre "(foo ") "")
+     (eq-str "plain name" (want "(foo ba") "value")
+     (eq-str "slash alone is a name" (want "(/") "value")
+     (eq-str "alias with a dot in the module" (want "(a.b/c") "export a.b")
+     (eq-str "in a string" (want "(f \"ab") "none")
+     (eq-str "in a comment" (want "(f ; ab") "none")
+     (eq-str "after a comment line" (want "; c\n(f ") "value")
+     (eq-str "after a string" (want "(f \"a\" ") "value")
+     (eq-int "word start after multibyte" (ws "(é ab") 4)
+     (eq-str "type after an annotated name and newline" (want "(defun f (x:\n   ") "type")
+     (eq-str "empty before" (want "") "value")]))
