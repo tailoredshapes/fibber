@@ -1,0 +1,16 @@
+;; spec:   types §2.13.1, §8.3, emit.lower.hoist
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; Two cells start with the same array (count 2). The loop writes only the first cell: it gets a copy once, the second still holds the
+;; original, all zeros. A hoist that skipped the make-unique step would write through to the second cell too: result 1. The loop also
+;; reads the first cell (`array-get @a i`) and a plain array `y`, so the hoisted length is used for both reads.
+(defun main () -> i64
+  (let ((shared (array 6 0)) (y (array 6 3)))
+    (let ((a (cell shared)) (b (cell shared)))
+      (do (dotimes (i 6) (array-set! &a i (+ (array-get @a i) (array-get y i) i)))
+          (if (and (= (array-get @b 0) 0) (= (array-get @b 5) 0)
+                   (= (array-get @a 0) 3) (= (array-get @a 5) 8)
+                   (= (array-get shared 5) 0))
+              0
+              1)))))

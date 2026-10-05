@@ -1,0 +1,147 @@
+;; compiler/emit/lower/hoist.fib: the unique-write check of `array-set!` hoisted out of a loop (spec/types.md §8.3, in-place-update.md).
+;; A loop whose body writes elements of a local cell `&c` with `array-set!` and touches `c` in no other way (a read `(array-get @c i)` or
+;; `(array-len @c)` is the only other use allowed) cannot make the array in `c` shared: nothing takes a count on it. So the cell's array
+;; is made unique ONCE, before the loop (`array-own`: a copy takes its place if it is shared, which is what the first write would do),
+;; its length is loaded once, and every `array-set!` of `c` in the loop is the bounds check against that length and the store (no
+;; flags and count test, no copy path, no reload of the length after each store). The trap of a bad index is the same trap at the
+;; same index. A loop that is in an async body or mentions `await`/`async` is left alone (an SSA value would have to live in the frame).
+;; The one visible difference: a zero-trip loop over a shared array still copies it.
+(ns emit.lower.hoist
+  (:use types.ty types.ast types.init own.program emit.value emit.layout emit.ir emit.program emit.lower.cx emit.lower.ctrl emit.lower.builtins))
+
+(defun builtin-name :private (cx: LowerCx h: Expr) -> str
+  (match (. h kind)
+    ((EGlobal (GBuiltin b)) (. (nth (. (. (. cx p) typed) builtins) b) name))
+    (_ "")))
+
+(defun has-id? :private (xs: (Vec i64) x: i64) -> bool
+  (loop ((i 0)) (cond (>= i (count xs)) false (= (nth xs i) x) true :else (recur (+ i 1)))))
+
+(defun place-is :private (p: Place c: i64) -> bool
+  (match p
+    ((PlAmp b) (= b c))
+    ((PlExpr e) (match (. e kind) ((ELocal b) (= b c)) (_ false)))))
+
+(defun amp-of :private (a: Arg c: i64) -> bool
+  (match a ((ArgAmp b _) (= b c)) (_ false)))
+
+;; `@c` as an argument.
+(defun deref-of :private (a: Arg c: i64) -> bool
+  (match a
+    ((ArgExpr x) (match (. x kind) ((EDeref p _) (place-is p c)) (_ false)))
+    (_ false)))
+
+(defun uses-ok :private (cx: LowerCx e: Expr c: i64) -> bool
+  (match (. e kind)
+    ((ECall h args) (call-uses-ok cx h args c))
+    ((ELocal b) (not (= b c)))
+    ((EDeref p _) (and (not (place-is p c)) (all-uses-ok cx (expr-children e) c)))
+    ((ESet p _) (and (not (place-is p c)) (all-uses-ok cx (expr-children e) c)))
+    ((ESetField b _ x) (and (not (= b c)) (uses-ok cx x c)))
+    ((EFn lit) (not (has-id? (. lit captures) c)))
+    ((EAsync _ _) false)
+    ((EAwait _) false)
+    (_ (all-uses-ok cx (expr-children e) c))))
+
+(defun all-uses-ok :private (cx: LowerCx es: (Vec Expr) c: i64) -> bool
+  (loop ((i 0)) (cond (>= i (count es)) true (not (uses-ok cx (nth es i) c)) false :else (recur (+ i 1)))))
+
+;; The arguments from `from` on: an expression's uses, no `&c`.
+(defun args-uses-ok :private (cx: LowerCx args: (Vec Arg) from: i64 c: i64) -> bool
+  (loop ((i from))
+    (if (>= i (count args))
+        true
+        (match (nth args i)
+          ((ArgExpr x) (if (uses-ok cx x c) (recur (+ i 1)) false))
+          ((ArgAmp b _) (if (= b c) false (recur (+ i 1))))))))
+
+(defun call-uses-ok :private (cx: LowerCx h: Expr args: (Vec Arg) c: i64) -> bool
+  (let ((name (builtin-name cx h)))
+    (cond (and (= name "array-set!") (> (count args) 0) (amp-of (nth args 0) c)) (args-uses-ok cx args 1 c)
+          (and (or (= name "array-get") (= name "array-len")) (> (count args) 0) (deref-of (nth args 0) c)) (args-uses-ok cx args 1 c)
+          :else (and (uses-ok cx h c) (args-uses-ok cx args 0 c)))))
+
+;; The cells some `array-set!` of the body writes.
+(defun written-cells :private (cx: LowerCx e: Expr acc: (Vec i64)) -> (Vec i64)
+  (let ((acc2 (match (. e kind)
+                ((ECall h args)
+                 (match (get args 0)
+                   ((some (ArgAmp b _)) (if (and (= (builtin-name cx h) "array-set!") (not (has-id? acc b))) (conj acc b) acc))
+                   (_ acc)))
+                (_ acc))))
+    (reduce (fn (a: (Vec i64) x: Expr) (written-cells cx x a)) acc2 (expr-children e))))
+
+(defun cell-of-array? :private (t: Ty) -> bool
+  (match t ((TCon (KCell) [(TCon (KArray) _)]) true) (_ false)))
+
+;; Makes the cell unique and loads its length; the entry for `cell-v`.
+(defun hoist-one :private (cx: LowerCx e: Expr c: i64) -> (Result (Vec str) str)
+  (try-let ((t (lcx-binding-ty cx c)))
+    (match (get @(. cx locals) c)
+      ((some (LocalVal cv))
+       (if (and (cell-of-array? t) (nil? (get @(. cx hoisted) (v-text cv))))
+           (try-let ((r (arr-info cx "array-set!" e [t])) (content (array-own cx r t [cv] false)))
+             (let ((n (lcx-load cx LirI64 (array-len-ptr cx r content))))
+               (do (set! (. cx hoisted) (assoc (assoc @(. cx hoisted) (v-text cv) (Pair content n)) (v-text content) (Pair content n)))
+                   (Ok [(v-text cv) (v-text content)]))))
+           (Ok [])))
+      (_ (Ok [])))))
+
+(defun hoist-all :private (cx: LowerCx e: Expr cs: (Vec i64) body: Expr) -> (Result (Vec str) str)
+  (loop ((i 0) (out []))
+    (if (>= i (count cs))
+        (Ok out)
+        (let ((c (nth cs i)))
+          (if (uses-ok cx body c)
+              (try-let ((k (hoist-one cx e c)))
+                (recur (+ i 1) (into out k)))
+              (recur (+ i 1) out))))))
+
+;; The immutable array locals the body reads with `array-get` or `array-len` (an array bound to a live local never changes length: a write
+;; to it would be a write to a copy), outside closures.
+(defun read-arrays :private (cx: LowerCx e: Expr acc: (Vec i64)) -> (Vec i64)
+  (match (. e kind)
+    ((EFn _) acc)
+    ((EAsync _ _) acc)
+    (_ (let ((acc2 (match (. e kind)
+                     ((ECall h args)
+                      (match (get args 0)
+                        ((some (ArgExpr x))
+                         (match (. x kind)
+                           ((ELocal b) (if (and (or (= (builtin-name cx h) "array-get") (= (builtin-name cx h) "array-len")) (not (has-id? acc b)))
+                                           (conj acc b)
+                                           acc))
+                           (_ acc)))
+                        (_ acc)))
+                     (_ acc))))
+         (reduce (fn (a: (Vec i64) x: Expr) (read-arrays cx x a)) acc2 (expr-children e))))))
+
+(defun array-ty? :private (t: Ty) -> bool
+  (match t ((TCon (KArray) _) true) (_ false)))
+
+;; Loads the length of each such array once; the entry is keyed by the array's value.
+(defun hoist-lengths :private (cx: LowerCx e: Expr bs: (Vec i64)) -> (Result (Vec str) str)
+  (loop ((i 0) (out []))
+    (if (>= i (count bs))
+        (Ok out)
+        (try-let ((t (lcx-binding-ty cx (nth bs i))))
+          (match (get @(. cx locals) (nth bs i))
+            ((some (LocalVal av))
+             (if (and (array-ty? t) (nil? (get @(. cx hoisted) (v-text av))))
+                 (try-let ((r (arr-info cx "array-get" e [t])))
+                   (let ((n (lcx-load cx LirI64 (array-len-ptr cx r av))))
+                     (do (set! (. cx hoisted) (assoc @(. cx hoisted) (v-text av) (Pair av n)))
+                         (recur (+ i 1) (conj out (v-text av))))))
+                 (recur (+ i 1) out)))
+            (_ (recur (+ i 1) out)))))))
+
+;; `loop`, with the hoist around it: see the header.
+(defun lcx-loop-hoisted (cx: LowerCx e: Expr vs: (Vec LoopBind) body: Expr) -> (Result Flow str)
+  (match @(. cx async-frame)
+    ((some _) (lcx-loop-form cx e vs body))
+    (nil
+     (try-let ((ks (hoist-all cx e (written-cells cx body []) body))
+               (ls (if (> (count ks) 0) (hoist-lengths cx e (read-arrays cx body [])) (Ok []))))
+       (let ((flow (lcx-loop-form cx e vs body)))
+         (do (doseq [k (into ks ls)] (set! (. cx hoisted) (dissoc @(. cx hoisted) k)))
+             flow))))))
