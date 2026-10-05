@@ -418,7 +418,12 @@ the wrapping family of stdlib §7 L10 for integers and integer vectors, `uncheck
 which rewrites every call of `+ - *` and `neg` in its body to those builtins (more than two operands fold to the left; one operand of `-` or `neg` is the negation, of
 `+` or `*` the operand) and does not look into a `fn`, `quote` or `quasiquote` form. **`Show` of a vector** is native (the instance of §2.12): the literal with the element type
 visible, `<<1 2 3 4>>i32`, `<<1.5 2.5>>f32`, `<<1.0 2.0>>` for `f64` and `<<7 8>>` for `i64` (no suffix), `<<true false>>` for a mask; the reader reads the text back to
-the same vector. **Not there yet:** vector loads and stores, shuffles, conversions, `fma`/`sqrt` and kin (the lIR has the instructions; no builtin row), and a vector in a `def`.
+the same vector. **Vector memory** (builtins `emit.lower.simdmem`, on an `(Array T)` of integers or floats, the vector type being the context's): `simd-load a i` traps
+`simd-load: lanes out of range of the array` unless `0 <= i` and `i + n <= len` (one check per vector); `simd-store! &a i v` is checked the same and copies a shared array first;
+`simd-load-unchecked` and `simd-store-unchecked!` skip the bounds check (unsafe; the store still copies a shared array); `simd-load-masked a i m passthru` and `simd-store-masked! &a i v m` touch
+only the active lanes and trap if an active lane is outside the array; `simd-load-tail a i` (lanes past the end 0) and `simd-store-tail! &a i v` need `0 <= i <= len`. Alignment promised is the element's.
+`simd-load-vec` and `simd-store-vec` of `fib.simd` do a `Vec` lane by lane. `simd/shuffle a b <<i ..>>` (indices a vector literal of integer literals, checked by the checker; the result lane count is the index count),
+`simd/reverse`, `simd/lanes` and `simd/kind` (constants). `Debug` and `ToStr` of a vector are in `fib.simd`. **Not there yet:** conversions, `fma`/`sqrt` and kin, `(native-lanes T)`, and a vector in a `def`; `MArray` does not exist in the library.
 A vector argument or result of an `extern` is a type error (`an extern position cannot be a vector`). The head `simd` of the
 literal's form is reserved: no local variable named `simd` shadows it (spec/syntax.md 1).
 An integer literal against an `i8`/`i16`/`i32` *scalar* parameter is still the L26

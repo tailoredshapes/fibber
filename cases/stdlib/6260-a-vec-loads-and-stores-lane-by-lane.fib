@@ -1,0 +1,20 @@
+;; spec:   types §1.9, lib/fib/simd.fib (simd-load-vec, simd-store-vec)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; A Vec is not one buffer, so fib.simd loads and stores it lane by lane: simd-load-vec reads the lanes from an index, simd-store-vec returns a copy with the lanes written and leaves the original alone; both agree with the element-by-element reference written here.
+(ns main (:use fib.core fib.seq fib.coll fib.simd tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (v [1.0 2.0 3.0 4.0 5.0 6.0]))
+    (do (doseq [i (range 3)]
+          (let ((x: f64x4 (simd-load-vec v i)))
+            (doseq [k (range 4)] (check c (= (lane x k) (nth v (+ i k)))))))
+        (let ((w (simd-store-vec v 1 <<9.0 8.0>>)) (y: f64x2 (simd-load-vec w 1)))
+          (do (doseq [i (range 6)] (check c (= (nth w i) (if (or (= i 1) (= i 2)) (nth [9.0 8.0] (- i 1)) (nth v i)))))
+              (check c (= (nth v 1) 2.0)) (check c (= y <<9.0 8.0>>))))
+        (let ((p (checks)))
+          (do (check p (= (nth (simd-store-vec v 0 <<7.0 7.0>>) 0) 1.0)) (check-detects c p)))
+        (checks-result c))))

@@ -7,11 +7,43 @@
 ;;    type `Simd`, so it lives where only the tools of stage 2 read it. Integer `/` is not provided (no instruction; the scalar rule's two
 ;;    traps would cost a branch per lane).
 ;;  - `reduce-add`, `reduce-min`, `reduce-max`: the Clojure-shaped names of `hsum`, `hmin`, `hmax`.
-;;  - `lanewise-min`, `lanewise-max` are not here yet (they need the lIR `fmin`/`smin` through a builtin); nor are loads and stores.
-(ns fib.simd (:use fib.core.protocols))
+;;  - `Debug` and `ToStr` of a vector (`Show` is native): the literal with the element type visible, `<<1 2 3 4>>i32`, `<<1.5 2.5>>f32`, `<<1.0 2.0>>` for the
+;;    default element types (i64, f64) and `<<true false>>` for a mask: text the reader reads back to the same vector.
+;;  - the loads and stores of a `Vec`, which is not one contiguous buffer: `simd-load-vec` and `simd-store-vec` go lane by lane through `nth` and `assoc`.
+;;    (The builtins `simd-load`, `simd-store!` and the rest read and write an `(Array T)`, spec/types.md 1.9.)
+(ns fib.simd (:use fib.core.protocols fib.core fib.seq fib.coll))
 
 (impl (Div (Simd a n)) (Simd a n) :where ((Float a)) (/ (self y) (fdiv self y)))
 
 (defun reduce-add (v: (Simd t n)) :where ((Num t)) -> t (hsum v))
 (defun reduce-min (v: (Simd t n)) :where ((Num t)) -> t (hmin v))
 (defun reduce-max (v: (Simd t n)) :where ((Num t)) -> t (hmax v))
+
+;; ---- Show
+
+(defun lane-suffix :private (k: i64) -> str
+  (cond (= k 8) "i8" (= k 16) "i16" (= k 32) "i32" (= k 132) "f32" :else ""))
+
+(defun lanes-text :private (v: (Simd t n) f: (fn (t) str)) -> str
+  (str-join (into ["<<"]
+                  (into (loop ((i 0) (acc []))
+                          (if (< i (simd/lanes v))
+                              (recur (+ i 1) (vec-conj acc (str-concat (if (= i 0) "" " ") (f (lane v i)))))
+                              acc))
+                        [">>" (lane-suffix (simd/kind v))]))))
+
+(impl Debug (Simd a n) :where ((Debug a)) (debug (self) (lanes-text self (fn (x) (debug x)))))
+(impl ToStr (Simd a n) :where ((Debug a)) (to-str (self) (debug self)))
+
+;; ---- a Vec
+
+;; The `n` elements of `v` from index `i` as a vector (`n` is the context's); every element is bounds-checked as `nth` is.
+(defun simd-load-vec (v: (Vec t) i: i64) -> (Simd t n) :where ((Num t))
+  (let ((z (simd-load-tail (array 1 (nth v i)) 1)))
+    (loop ((j 0) (acc z))
+      (if (< j (simd/lanes z)) (recur (+ j 1) (with-lane acc j (nth v (+ i j)))) acc))))
+
+;; A copy of `v` with the lanes of `x` written to indices `i ..`; every index must exist.
+(defun simd-store-vec (v: (Vec t) i: i64 x: (Simd t n)) -> (Vec t) :where ((Num t))
+  (loop ((j 0) (acc v))
+    (if (< j (simd/lanes x)) (recur (+ j 1) (assoc acc (+ i j) (lane x j))) acc)))

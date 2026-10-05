@@ -1,0 +1,50 @@
+;; spec:   types §1.9 (loads and stores), docs/design/simd-and-tensors.md 2.7
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; simd-load reads lanes i .. i+n-1 of an array and simd-store! writes them: every lane of every load is compared with the element read by array-get, for f64x4, f32x4, i32x4 and i8x4 at every start index of an array of 11 elements, and the array after a store holds, element by element, what a scalar loop that writes the lanes one at a time leaves. The unchecked variants read and write the same.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun fill-f64 (n: i64) -> (Array f64)
+  (let ((a (cell (array n 0.0))))
+    (do (doseq [i (range n)] (array-set! &a i (+ 0.5 (* 1.25 (sitofp f64 i))))) @a)))
+
+(defun fill-i32 (n: i64) -> (Array i32)
+  (let ((a (cell (array n 0i32))))
+    (do (doseq [i (range n)] (array-set! &a i (trunc i32 (- (* i i) 40)))) @a)))
+
+(defun fill-i8 (n: i64) -> (Array i8)
+  (let ((a (cell (array n 0i8))))
+    (do (doseq [i (range n)] (array-set! &a i (trunc i8 (- (* 7 i) 30)))) @a)))
+
+(defun fill-f32 (n: i64) -> (Array f32)
+  (let ((a (cell (array n 0.0f32))))
+    (do (doseq [i (range n)] (array-set! &a i (fptrunc f32 (+ 0.25 (sitofp f64 i))))) @a)))
+
+(defun main () -> i64
+  (let ((c (checks)) (f (fill-f64 11)) (g (fill-i32 11)) (h (fill-i8 11)) (s (fill-f32 11)))
+    (do (doseq [i (range 8)]
+          (let ((v: f64x4 (simd-load f i)) (w: i32x4 (simd-load g i)) (x: i8x4 (simd-load h i)) (y: f32x4 (simd-load s i))
+                (u: f64x4 (unsafe (simd-load-unchecked f i))))
+            (doseq [k (range 4)]
+              (do (check c (= (lane v k) (array-get f (+ i k))))
+                  (check c (= (lane w k) (array-get g (+ i k))))
+                  (check c (= (lane x k) (array-get h (+ i k))))
+                  (check c (= (lane y k) (array-get s (+ i k))))
+                  (check c (= (lane u k) (array-get f (+ i k))))))))
+        (let ((a (cell (fill-f64 11))) (ref (cell (fill-f64 11))) (v: f64x4 <<-1.0 -2.0 -3.0 -4.0>>))
+          (do (simd-store! &a 5 v)
+              (doseq [k (range 4)] (array-set! &ref (+ 5 k) (lane v k)))
+              (doseq [i (range 11)] (check c (= (array-get @a i) (array-get @ref i))))
+              (unsafe (simd-store-unchecked! &a 0 v))
+              (doseq [k (range 4)] (check c (= (array-get @a k) (lane v k))))
+              (check c (= (array-get @a 4) (array-get @ref 4)))))
+        (let ((a (cell (fill-i8 9))) (v: i8x4 <<100 -100 5 -5>>i8))
+          (do (simd-store! &a 5 v)
+              (doseq [k (range 4)] (check c (= (array-get @a (+ 5 k)) (lane v k))))
+              (check c (= (array-get @a 4) (trunc i8 (- 28 30))))))
+        (let ((p (checks)))
+          (let ((v: f64x4 (simd-load f 1))) (do (check p (= (lane v 0) (array-get f 0))) (check-detects c p))))
+        (checks-result c))))

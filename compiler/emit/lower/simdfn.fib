@@ -1,0 +1,58 @@
+;; compiler/emit/lower/simdfn.fib: the shuffles and the constants of a vector type (spec/lir.md 6.4, spec/types.md 1.9):
+;;   simd/reverse simd/shuffle simd/lanes simd/kind
+;; `simd/shuffle a b <<i0 i1 ..>>` takes the mask from a vector literal of integer literals (a lIR shuffle mask is a constant; types.lower.call checks the form);
+;; `simd/lanes` is the lane count and `simd/kind` a code of the lane type (the width of an integer, 100 plus the width of a float, 1 for a mask), both constants.
+;; Memory access to arrays is emit.lower.simdmem.
+(ns emit.lower.simdfn
+  (:use types.ty types.ast emit.value emit.ir emit.program emit.layout emit.lower.cx emit.lower.simd))
+
+(defun ty-of :private (x: V) -> LirTy (unwrap-or (v-ty x) LirI64))
+
+;; ---- shuffles and constants
+
+;; The literal integer lanes of the call's argument `i`, when it is a vector literal of integer literals.
+(defun literal-lanes :private (e: Expr i: i64) -> (Option (Vec i64))
+  (match (. e kind)
+    ((ECall _ args)
+     (match (get args i)
+       ((some (ArgExpr x))
+        (match (. x kind)
+          ((ESimd _ es)
+           (let ((vs (mapv (fn (l: Expr) (match (. l kind) ((ELit (LitInt v _)) (some v)) (_ nil))) es)))
+             (if (some? (find-first (fn (o: (Option i64)) (nil? o)) vs))
+                 nil
+                 (some (mapv (fn (o: (Option i64)) (unwrap-or o 0)) vs)))))
+          (_ nil)))
+       (_ nil)))
+    (_ nil)))
+
+;; `(simd/shuffle a b <<i0 i1 ..>>)`: lane k of the result is lane ik of the concatenation of `a` and `b`; the indices are a vector literal of
+;; integer literals below twice the lane count.
+(defun lcx-simd-shuffle (cx: LowerCx e: Expr a: V b: V) -> (Result V str)
+  (let ((t (ty-of a)))
+    (match (literal-lanes e 2)
+      (nil (Err "simd/shuffle: the indices must be a vector literal of integer literals"))
+      ((some idx)
+       (if (some? (find-first (fn (i: i64) (or (< i 0) (>= i (* 2 (lanes-of t))))) idx))
+           (Err (str-join ["simd/shuffle: an index is outside 0 .. " (str (- (* 2 (lanes-of t)) 1))]))
+           (Ok (val cx (str-join ["(shufflevector " (v-text a) " " (v-text b) " " (mask-text idx) ")"]) (LirVec (elem-of t) (count idx)))))))))
+
+(defun lcx-simd-reverse (cx: LowerCx x: V) -> V
+  (let ((t (ty-of x)))
+    (val cx (str-join ["(shufflevector " (v-text x) " " (v-text x) " " (mask-text (mapv (fn (i: i64) (- (- (lanes-of t) 1) i)) (range (lanes-of t)))) ")"]) t)))
+
+(defun elem-bits :private (e: LirTy) -> i64
+  (cond (= e LirFloat) 32 (= e LirDouble) 64 :else (lir-ty-bits e)))
+
+(defun float-lane? :private (e: LirTy) -> bool (or (= e LirFloat) (= e LirDouble)))
+
+;; The code of a lane type: the width of an integer, 100 plus the width of a float, 1 for a mask.
+(defun lane-kind :private (e: LirTy) -> i64
+  (cond (= e LirI1) 1 (float-lane? e) (+ 100 (elem-bits e)) :else (lir-ty-bits e)))
+
+(defun lcx-simd-const (name: str x: V) -> V
+  (let ((t (ty-of x)))
+    (v-int LirI64 (if (= name "simd/lanes") (lanes-of t) (lane-kind (elem-of t))))))
+
+(defun simd-fn-name? (name: str) -> bool
+  (contains? (set ["simd/reverse" "simd/shuffle" "simd/lanes" "simd/kind"]) name))

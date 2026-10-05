@@ -82,8 +82,26 @@
                           ((GMethod p i) (if (and (= i 0) (= (some p) @(. (. lw g) deref-proto))) (some SfDeref) nil))
                           (_ nil)))))))
 
-;; Rust: lower/call.rs:106 call: a list form that is not a core form.
+;; `(simd/shuffle a b <<i ..>>)`: the indices are a vector literal of integer literals (lIR's shuffle mask is a constant), checked here so that
+;; the error is the checker's, at the indices.
+(defun shuffle-indices? :private (x: Stx) -> bool
+  (match (. x kind)
+    ((SList xs)
+     (and (> (count xs) 1) (= (stx-as-sym (nth xs 0)) (some "simd"))
+          (loop ((i 1))
+            (cond (>= i (count xs)) true
+                  (match (. (nth xs i) kind) ((SInt _ _) true) (_ false)) (recur (+ i 1))
+                  :else false))))
+    (_ false)))
+
 (defun lw-call (lw: Lowerer items: (Vec Stx) form: Stx) -> (Result Expr TypeError)
+  (if (and (= (stx-as-sym (nth items 0)) (some "simd/shuffle")) (= (count items) 4) (not (shuffle-indices? (nth items 3)))
+           (not (lw-is-local lw "simd/shuffle")))
+      (Err (type-error-other (. (nth items 3) pos) "simd/shuffle: the indices must be a vector literal of integer literals"))
+      (lw-call-plain lw items form)))
+
+;; Rust: lower/call.rs:106 call: a list form that is not a core form.
+(defun lw-call-plain :private (lw: Lowerer items: (Vec Stx) form: Stx) -> (Result Expr TypeError)
   (match (match (stx-as-sym (nth items 0)) ((some name) (special lw name)) (nil nil))
     ((some s) (special-call lw s items form))
     (nil

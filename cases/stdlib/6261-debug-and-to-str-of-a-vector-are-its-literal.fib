@@ -1,0 +1,24 @@
+;; spec:   types §1.9 (Show), lib/fib/simd.fib (Debug, ToStr)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; With (:use fib.simd) a vector has Debug and ToStr, whose text is the literal as Show's is: compared with the text built here lane by lane (n known at each call), for an integer, a float, a narrower-integer and a mask vector, and equal to Show's text.
+(ns main (:use fib.core fib.seq fib.coll fib.simd tl.check))
+
+(defun joined (v: (Simd t n) lanes: i64 suffix: str) :where ((Debug t)) -> str
+  (let ((parts (loop ((i 0) (acc [])) (if (< i lanes) (recur (+ i 1) (conj acc (debug (lane v i)))) acc))))
+    (str-join ["<<" (str-join (into [] (interpose " " parts))) ">>" suffix])))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (to-str <<1 2>>i16) "<<1 2>>i16"))
+        (check c (= (debug <<1 2 3>>i16) (joined <<1 2 3>>i16 3 "i16")))
+        (check c (= (debug <<1.5 2.5>>) (joined <<1.5 2.5>> 2 "")))
+        (check c (= (debug <<1.5 2.5>>) (show <<1.5 2.5>>)))
+        (check c (= (debug <<-7 8 9 10>>i8) (show <<-7 8 9 10>>i8)))
+        (check c (= (to-str (simd/lt <<1 2>> <<2 1>>)) "<<true false>>"))
+        (let ((p (checks)))
+          (do (check p (= (debug <<1 2>>i16) "<<1 2>>")) (check-detects c p)))
+        (checks-result c))))
