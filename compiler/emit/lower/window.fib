@@ -49,7 +49,8 @@
     ((some h) (Ok (. h fst)))
     (nil (try-let ((o (lcx-object-of cx cell-ty))) (Ok (lcx-load cx LirPtr (lcx-gep cx (. o sname) (v-text cell) slot-cell-value)))))))
 
-;; The index is below the length as an unsigned number (so a negative index fails too), else the library's own failure runs.
+;; The index is below the length as an unsigned number (so a negative index fails too), else the library's own failure runs (and, were it
+;; ever to return, the runtime's trap: an access that failed the compare is never made).
 (defun window-check :private (cx: LowerCx i: V n: V slow: (fn () (Result V str))) -> (Result unit str)
   (let ((b (. cx b))
         (ok (fb-val (. cx b) (str-join ["(icmp ult " (v-text i) " " (v-text n) ")"]) LirI1))
@@ -57,7 +58,8 @@
     (do (fb-term b (str-join ["(br " (v-text ok) " " lo " " lt ")"]))
         (fb-open b lt)
         (try-let ((c (slow)))
-          (do (fb-term b "(unreachable)")
+          (do (fb-stmt b (str-join ["(call @fib.trap-index " (v-text i) " " (v-text n) ")"]))   ; the library's call traps; if it did not, this does
+              (fb-term b "(unreachable)")
               (fb-open b lo)
               (Ok ()))))))
 
