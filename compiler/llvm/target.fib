@@ -1,7 +1,8 @@
 ;; compiler/llvm/target.fib: llvm-c/Target.h and llvm-c/TargetMachine.h as crates/lair/src/llvm/target.rs uses them: the host
 ;; target, a target machine (position-independent, so that `cc` links a PIE), its data layout, and the object file it emits.
 ;;
-;; `init` registers the x86-64 target only: LLVM-C's `LLVMInitializeNativeTarget` and its siblings are `static inline` functions of
+;; `init` registers the x86-64 and AArch64 targets (the second so that an AArch64 object can be cross-compiled from any host, docs/design/aarch64.md;
+;; it needs the AArch64 backend linked in: the shared libLLVM has it, `scripts/llvm-static.sh` names it). LLVM-C's `LLVMInitializeNativeTarget` and its siblings are `static inline` functions of
 ;; the headers (they expand to the per-target `LLVMInitializeX86Target` ...), so there is no symbol to bind and a port for another
 ;; host adds its own initialisers beside these five.
 ;;
@@ -14,6 +15,11 @@
 (extern LLVMInitializeX86TargetMC () -> unit)
 (extern LLVMInitializeX86AsmPrinter () -> unit)
 (extern LLVMInitializeX86AsmParser () -> unit)
+(extern LLVMInitializeAArch64TargetInfo () -> unit)
+(extern LLVMInitializeAArch64Target () -> unit)
+(extern LLVMInitializeAArch64TargetMC () -> unit)
+(extern LLVMInitializeAArch64AsmPrinter () -> unit)
+(extern LLVMInitializeAArch64AsmParser () -> unit)
 (extern getenv :private (ptr) -> ptr)
 (extern fopen :private (ptr ptr) -> ptr)
 (extern fwrite :private (ptr i64 i64 ptr) -> i64)
@@ -40,14 +46,19 @@
 
 ;; ---------------------------------------------------------------------------------------------------------------------------------
 
-;; Registers the x86-64 target, its machine-code layer, assembly printer and parser. Idempotent in LLVM; call it once.
+;; Registers the x86-64 and AArch64 targets, their machine-code layers, assembly printer and parser. Idempotent in LLVM; call it once.
 (defun init () -> unit
   (unsafe
     (do (LLVMInitializeX86TargetInfo)
         (LLVMInitializeX86Target)
         (LLVMInitializeX86TargetMC)
         (LLVMInitializeX86AsmPrinter)
-        (LLVMInitializeX86AsmParser))))
+        (LLVMInitializeX86AsmParser)
+        (LLVMInitializeAArch64TargetInfo)
+        (LLVMInitializeAArch64Target)
+        (LLVMInitializeAArch64TargetMC)
+        (LLVMInitializeAArch64AsmPrinter)
+        (LLVMInitializeAArch64AsmParser))))
 
 ;; A target machine and what a module it makes code for is told: the triple, the data layout.
 (defstruct Machine (tm: i64 triple: str layout: str))
@@ -115,6 +126,54 @@
           ((Ok target)
            (let ((tm (create-machine target triple (requested-cpu) opt)))
              (Ok (Machine tm (core/take-message triple) (layout-of tm)))))))))
+
+;; The triple FIB_TARGET_TRIPLE asks to generate code for (`aarch64-apple-darwin`, `arm64-apple-ios`, ..): nil for an unset, empty or `host` value. Only
+;; `cross-machine` and what builds on it read it; the JIT is always the host's (docs/design/aarch64.md 2).
+(defun requested-triple () -> (Option str)
+  (if-some [v (env "FIB_TARGET_TRIPLE")]
+    (if (or (= v "") (= v "host")) nil (some v))
+    nil))
+
+;; The architecture of a triple: the text before the first `-`.
+(defun triple-arch (triple: str) -> str
+  (match (str-find triple "-" 0)
+    ((some i) (str-slice triple 0 i))
+    (nil triple)))
+
+;; Whether the triple is for 64-bit ARM (`aarch64`, or Apple's name for it, `arm64`).
+(defun aarch64-triple? (triple: str) -> bool
+  (let ((a (triple-arch triple))) (or (= a "aarch64") (= a "arm64"))))
+
+;; Whether the triple is for an Apple OS (the Mach-O object format, apple CPUs).
+(defun apple-triple? (triple: str) -> bool
+  (or (contains-text? triple "-apple-") (contains-text? triple "-darwin") (contains-text? triple "-ios") (contains-text? triple "-macos")))
+
+(defun contains-text? :private (s: str t: str) -> bool
+  (some? (str-find s t 0)))
+
+;; The CPU a cross target is built for when FIB_TARGET_CPU names none: `apple-m1` for the Apple triples (NEON, FMA and the rest of ARMv8.4), else LLVM's
+;; `generic` (NEON and FP are baseline in AArch64; a Linux server CPU can be named with FIB_TARGET_CPU).
+(defun default-cpu-of (triple: str) -> str
+  (cond (not (aarch64-triple? triple)) "generic"
+        (apple-triple? triple) "apple-m1"
+        :else "generic"))
+
+;; The CPU of a cross target: FIB_TARGET_CPU when set, else the default of the triple.
+(defun cross-cpu (triple: str) -> str
+  (match (requested-cpu)
+    ((some c) c)
+    (nil (default-cpu-of triple))))
+
+;; A machine for the triple `triple` (not the host's), position-independent, with `cpu` and no extra features. Its data layout is LLVM's for the
+;; triple, so a module lowered with it is laid out as the target lays it out. The machine makes objects and assembly; it cannot run here.
+(defun cross-machine (triple: str opt: i64) -> (Result Machine str)
+  (do (init)
+      (let ((t (ffi/bytes-new triple)))
+        (match (target-of-triple (ffi/ptr->addr t))
+          ((Err m) (do (unsafe (free t)) (Err (str "no target for the triple " triple ": " m))))
+          ((Ok target)
+           (let ((tm (create-machine target (ffi/ptr->addr t) (some (cross-cpu triple)) opt)))
+             (do (unsafe (free t)) (Ok (Machine tm triple (layout-of tm))))))))))
 
 ;; The host's CPU name (`znver4`, `skylake`, ..) and its feature list (`+avx2,+fma,..`), as LLVM reports them.
 (defun host-cpu-name () -> str

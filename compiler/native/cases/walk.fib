@@ -3,15 +3,16 @@
 ;; `Path` order: component by component, not byte by byte (so `a/b` sorts before `a-b/c`).
 
 (ns native.cases.walk
-  (:require [llvm.ffi :as ffi] [fib.string :as s]))
+  (:require [llvm.ffi :as ffi] [fib.string :as s] [fib.os.platform.detect :as plat]))
 
 (extern opendir :private (ptr) -> ptr)
 (extern closedir :private (ptr) -> i32)
 (extern readdir :private (ptr) -> ptr)
 (extern access :private (ptr i32) -> i32)
 
-;; In a glibc `struct dirent` the name starts at byte 19.
-(def dirent-name: i64 19)
+;; In a glibc `struct dirent` the name starts at byte 19; in macOS's (64-bit inode) one at byte 21.
+(defun dirent-name () -> i64
+  (if (= (plat/name (plat/current)) "Darwin") 21 19))
 
 ;; The names in `dir` but `.` and `..`, in no order; nil when `dir` does not open as a directory.
 (defun list-dir (dir: str) -> (Option (Vec str))
@@ -25,7 +26,7 @@
                            (let ((e (unsafe (ffi/ptr->addr (readdir dp)))))
                              (if (= e 0)
                                  acc
-                                 (let ((n (ffi/c-string-at (+ e dirent-name))))
+                                 (let ((n (ffi/c-string-at (+ e (dirent-name)))))
                                    (recur (if (or (= n ".") (= n "..")) acc (conj acc n)))))))))
               (do (unsafe (closedir dp)) (some names)))))))
 

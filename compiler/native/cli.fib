@@ -9,8 +9,10 @@
 
 (extern exit :private (i32) -> unit)
 (extern getpid :private () -> i32)
+(extern setenv :private (ptr ptr i32) -> i32)
 
 (def usage: str "usage:
+  lair [--target TRIPLE] ..     the target of check/build/emit-llvm: FIB_TARGET_TRIPLE (docs/design/aarch64.md); `build` then needs --emit
   lair check FILE.lir
   lair run [-O n] FILE.lir [ARGS..]
   lair build FILE.lir -o OUT [-O n] [--emit obj|asm|llvm] [-L DIR].. [-l LIB]..
@@ -217,8 +219,21 @@
 
 ;; -------------------------------------------------------------------------------------------------- dispatch
 
+;; `--target TRIPLE` anywhere in the words: removed, and FIB_TARGET_TRIPLE set to the triple (the code generator and the checker's target read it).
+(defun take-target :private (args: (Vec str)) -> (Result (Vec str) str)
+  (loop ((i 0) (out []))
+    (cond (>= i (count args)) (Ok out)
+          (not (= (nth args i) "--target")) (recur (+ i 1) (conj out (nth args i)))
+          (>= (+ i 1) (count args)) (Err "--target needs a triple")
+          :else (let ((k (ffi/bytes-new "FIB_TARGET_TRIPLE")) (v (ffi/bytes-new (nth args (+ i 1)))))
+                  (do (unsafe (setenv k v 1i32)) (recur (+ i 2) out))))))
+
 ;; Runs the command; the exit status, or the usage error. (cli.rs `dispatch`)
-(defun dispatch (args: (Vec str)) -> (Result i64 str)
+(defun dispatch (words: (Vec str)) -> (Result i64 str)
+  (try-let [args (take-target words)]
+    (dispatch-cmd args)))
+
+(defun dispatch-cmd :private (args: (Vec str)) -> (Result i64 str)
   (if (empty? args)
       (Err usage)
       (let ((cmd (nth args 0))

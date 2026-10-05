@@ -8,7 +8,7 @@ identity, executable discovery, system information, and secure random bytes.
 The native Linux implementation is exercised by the test suite. A Darwin backend
 and runtime adaptation are included and checked for source typing and emission;
 macOS linking, execution, and compiler bootstrap still need validation on a Mac.
-The current Darwin directory binding uses Intel macOS's `readdir$INODE64` alias.
+The Darwin directory binding is plain `readdir`: on Apple Silicon there is no `$INODE64` alias (the 64-bit-inode layout is the only one), and Intel macOS is not a target.
 Apple Silicon also needs its libc symbol selection and compiler target setup.
 These bindings assume LP64; Windows and 32-bit platforms have no backend yet.
 

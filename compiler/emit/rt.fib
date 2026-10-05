@@ -2,12 +2,20 @@
 ;; section and the runtime's own `declare` of a C function. The text is the data of emit.runtime, generated from crates/fibc/rt/*.lir.
 ;; Replaces compile.rs:20 RUNTIME and compile.rs:36 runtime_declaration.
 (ns emit.rt
-  (:use emit.runtime) (:require [emit.os :as os] [fib.os.platform :as platform]))
+  (:use emit.runtime) (:require [emit.os :as os] [expand.targetos :as tos]))
 
 ;; The eleven parts in the order compile.rs:20 `include_str!`s them: core str array vec vecbuild atom thread task weak io sys.
-(defun runtime-parts () -> (Vec str)
+(defun runtime-parts-for (os-name: str) -> (Vec str)
   [RT-CORE RT-STR RT-ARRAY RT-VEC RT-VECBUILD RT-ATOM RT-THREAD RT-TASK RT-WEAK RT-IO
-   (os/sys-for (platform/name (platform/current)) RT-SYS)])
+   (os/sys-for os-name RT-SYS)])
+
+;; The runtime of the program being generated: for the OS of FIB_TARGET_TRIPLE, else the host's (expand.targetos).
+(defun runtime-parts () -> (Vec str)
+  (runtime-parts-for (tos/target-platform-name)))
+
+;; The runtime of what runs in this process, the macro modules and `def`s the JIT runs while the program is compiled: the host's, whatever the target.
+(defun runtime-text-host () -> str
+  (str-join (vec (mapcat (fn (part: str) [part "\n"]) (runtime-parts-for (tos/host-platform-name))))))
 
 ;; The first section of a module: every part followed by a line break. Rust: compile.rs:249 `runtime` of module_parts
 (defun runtime-text () -> str
