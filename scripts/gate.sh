@@ -4,6 +4,7 @@
 # it), prints a timing line for each stage and ends with PASS or FAIL (exit 0 or 1; 2 for a usage or setup error).
 #   scripts/gate.sh [--quick|--full] [-j N]
 #   --quick (default)  stage 2, ownership, modules and a deterministic sample of about 100 stdlib cases (every expected failure among them)
+#   GATE_SPECS=1       quick gate: also run `fibc test specs` (the full gate always does)
 #   --full             stage 2 built by the seed, the fixed point (F builds F3, both emit the same lIR), the golden checks of the passes
 #                      (compiler/tests/golden/golden.sh), and all three directories in full
 #   -j N               cases run at a time (default 12; the machine has 28 cores and 61 GB, and no more than about 12 heavy jobs at once)
@@ -80,6 +81,15 @@ dirs=$(awk '/^== / { d=$4; sub("cases/", "", d) } /^exit [0-9]+ after/ { printf 
 timings+=("cases: $dirs")
 if [ "$code" -ne 0 ]; then fail "cases: ci-stage2.sh failed (the non-passing set differs from scripts/ci-stage2.expected, or a directory timed out)"; fi
 timings+=("cases total $(elapsed "$t0" "$(now)") s")
+
+# The specs (fib.test, docs/design/test-harness.md 6.5): `F test specs`, deterministic (--seed 1), every scenario must hold. Not compared with
+# scripts/ci-stage2.expected: a failing spec is a regression, not a known gap. Full gate, or GATE_SPECS=1 for a quick one; skipped when there is no specs/.
+if { [ "$mode" = full ] || [ "${GATE_SPECS:-0}" = 1 ]; } && [ -d specs ]; then
+  t0=$(now)
+  if "$F" test specs -j "$jobs" --seed 1 > "$GATE_OUT/specs.log" 2>&1; then
+    timings+=("specs $(grep '^total:' "$GATE_OUT/specs.log" | sed 's/^total: //; s/ (seed 1)//') $(elapsed "$t0" "$(now)") s")
+  else tail -n 30 "$GATE_OUT/specs.log"; fail "specs FAILED (log: $GATE_OUT/specs.log)"; timings+=("specs FAILED $(elapsed "$t0" "$(now)") s"); fi
+fi
 
 echo
 echo "== timing"

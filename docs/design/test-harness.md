@@ -295,16 +295,19 @@ fibc test [PATH..] [--only SUBSTR] [--seed N] [-j N] [--format plain|tap|json] [
           [--covers FILE.md]
 ```
 
-`PATH` is a spec file or a directory (every `*.fib` that defines `specs`; `fibc test` writes a stub `main` that requires them all and
-calls `(run-main (concat (a/specs) (b/specs)))`, as `driver.harness` walks a directory of cases). **Implemented in the prototype:**
-`--only`, `--seed`, `-j`/`--jobs`, `--format plain|json`, `--list`, `--no-isolate`, `--timeout`. **Not built:** the `fibc test` command
-itself, `PATH` handling, `tap`, `--covers`. `--only` is a substring of the full id (`MapContract[AList]/assoc`), `-j` is the existing
-convention (default 1 here, as `fibc cases`). `--seed` defaults to 1: **deterministic runs, not time-seeded** (a flaky test must be
-reproducible); a CI or a soak run passes a fresh seed and the report prints it.
+`PATH` is a spec file, or a directory searched (at any depth, in name order) for files named **`*-spec.fib`** (the convention: hyphenated like the
+rest of the tree, one suffix, so `fibc test specs/` and a shell glob agree; no PATH means `specs`). Each spec file is a program whose `main` is
+`(run-main (specs))`; `fibc test` runs each as `fibc run FILE -- OPTIONS` in a child process of itself (the JIT: no build step; `run` prints
+`main`'s result as its last line, which is where the status comes from) and puts the reports together. **Built (2026-10-05):**
+`compiler/driver/test.fib`, `--only`, `--seed`, `-j`/`--jobs` (several files: N files at a time; one file: N scenarios at a time),
+`--format plain|tap|json`, `--list`, `--isolate task|fork|none`, `--timeout` (selects fork), `-I`. **Not built:** `--covers`. `--only` is a substring of the full
+id (`MapContract[AList]/assoc-on`), a file where it matches nothing is skipped while another matches. `--seed` defaults to 1: **deterministic runs,
+not time-seeded** (a flaky test must be reproducible); a CI or a soak run passes a fresh seed and the report prints it.
 
-Exit status: **0** every selected scenario held; **1** one failed, trapped or timed out; **2** a usage error, an unreadable path, a
-selection that matches nothing ("a run with nothing to run is not a pass", the harness's rule), or duplicate ids. Measured: 0 for a
-holding run, 1 for the planted ones, 2 for `--only nothing-here`.
+Exit status: **0** every selected scenario held; **1** one failed, trapped or timed out, or a spec process died (a fatal runtime error, a
+signal); **2** a usage error, an unreadable PATH, no spec file, a spec that does not compile, or a selection that matches nothing anywhere ("a
+run with nothing to run is not a pass"), or duplicate ids. Checked by `compiler/tests/driver/test-cmd.sh` (29 checks over a holding, failing, trapping,
+hanging and non-compiling spec, a directory, `--only`, the three formats, `-j`).
 
 ### 6.2 Plain reporter
 
@@ -326,13 +329,14 @@ Colourless, one row per scenario, failures expanded with the steps and the two s
                               "status": "held"|"broke", "expected": str, "actual": str } ] } ] }
 ```
 
-`expected` and `actual` appear on a `broke` step. **Location is the id, not a file:line**: a stage-2 macro receives no source
-position, so the prototype cannot print `file:line` of an `expect`. **Request to the expander**: a macro builtin `(call-pos)` returning
-`"FILE:LINE"` (the position the expansion already carries, spec/syntax §1.2 "a form produced by a macro carries the position of the
-macro call"); the schema then gains `"at": "FILE:LINE"` per scenario and step, which the editor can use to jump. Until then the editor maps
-an `id` to its scenario by `--list`. (Not built.)
+`expected` and `actual` appear on a `broke` step. **Location (built):** a step's `"at"` is `"FILE:LINE:COL"`: of its `expect` (the macro's `(call-pos)`, spec/syntax.md §1.3, so an `expect` in a contract
+reports the line in the contract's file), of the `scenario` or `prop` for a `then` that is a plain boolean form, `""` for a Given or When; a result's
+`"at"` is its `scenario` or `prop`. A stage-2 macro still sees no position of a form it is handed, which is why `expect` became a macro of its own
+(it expands to a function of the scenario's log; `scenario` calls it) and the surface forms did not change. The plain report prints the
+step's `at` under the broken step and the scenario's after its id. `fibc test --format json` adds a top-level `"files"` array
+(`{"file","status","outcome"}`) to the schema, whose `results` are those of all files.
 
-TAP (`1..N`, `ok`/`not ok`, `# diag`) is a 20-line reporter over the same rows; not built.
+TAP (`TAP version 13`, `1..N`, `# seed S`, `ok N - id` / `not ok N - id # status: message`, `# step: expected .., actual ..`) is built; `fibc test` renumbers across files.
 
 ### 6.4 Parallelism
 
