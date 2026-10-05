@@ -1585,6 +1585,56 @@ no macro or function can), and it is the form a macro's expansion uses
 to reach a private helper of its own module. `(var x)` where no
 definition is named `x` is `var: no definition named x`.
 
+### 3.21 `with-view` (exclusive views; library `fib.view`)
+
+```
+(with-view    [binding+] body+)      ; writable lend
+(with-view-ro [binding+] body+)      ; read-only lend
+binding ::= v      (lender &place arg*)
+          | (lo hi) (lender &place arg*)
+```
+
+`with-view` lends the cell `place` for the evaluation of `body` and binds the window the lender returns (**Decided**, owner decisions of
+2026-10-04; rules in types §6.15). It is **not a core form** (the number of core forms, §4.2, is unchanged): `fib.view` defines it, and
+`with-view-ro`, as macros (§3.16) over `let`, `cell` and the marker functions `view-lend`, `view-lend-ro` and `view-sub`, so that
+the checker finds a lend by the marker and the extent by the `let`. The draft rows of `docs/design/exclusive-views/syntax-draft.md` proposed a
+core form; the checker needs only what the expansion shows, and this is the one respect in which the rows differ (§4.1 is met by the marker).
+A program writes `(:use fib.view)`; the module is not implicit.
+
+Expansion of one binding `v (lender &t e..)`:
+
+```
+(let ((v (cell (fib.view/view-lend (lender &t e..)))))      ; view-lend-ro for with-view-ro
+  <the rest of the form>)                                    ; the last body is (let ((r (do body+))) r)
+```
+
+so `v` is a **view cell**, a private cell that is never a value, and the body is the initialiser of a `let`: never in tail position, so
+no call in it is a tail call (types §6.15, L5). Bindings nest left to right, as `let*`. A pair pattern `(lo hi)` binds two view cells
+from the one lend of a lender that returns a pair of windows (`array-split!`: the halves `[0, k)` and `[k, n)`). The value of the form is
+the value of the last body; it cannot be a window.
+
+The lender is a `defun` with an `&` parameter and a declared result of a *scoped* type (types §1.10). Called outside a `with-view`
+binding it is `lender call outside with-view: f`, except inside `unsafe`. The window operations are library functions over a view cell:
+
+| call | meaning |
+|---|---|
+| `(vget v i)` | the element `i` of the window `v` (a read: `(win-get @v i)`) |
+| `(vset! v i x)` | `v[i] = x`; `i` and `x` are evaluated first, then `(win-set! &v i x)` |
+| `(fill! v x)` | every element of `v` is `x` |
+| `(copy-into! dst src)` | `dst[i] = src[i]`; the lengths must be equal; `dst` and `src` are different views |
+| `(vlen v)` | the number of elements |
+
+`vget`, `vset!`, `fill!`, `copy-into!`, `vlen` are macros whose argument `v` is the name of a view cell, or of an `&` parameter of a
+window type; the sigils stay in the expansion, so the checker sees every write. Lenders of `fib.view`: `(array-window! &a lo hi)`
+(writable, makes `a` unique once), `(array-window &a lo hi)` (read-only, no copy), `(array-split! &a k)` (two disjoint writable
+windows), over an `(Array T)` of `f64`, `i64`, `f32` or `i32`. Not provided: windows over `Vec` (decision 4 of 2026-10-04), windows used by a
+closure or a task (decision 2), a window of a window.
+
+Errors (types §6.14): `lent place must be a private cell: a is used as a value at F:L:C`, `a is lent to v and cannot be used here`,
+`lender call outside with-view: f`, `view cell v can only be read as a call argument`, `view cell v cannot be assigned`, `view cell v
+cannot be captured by a closure`, `view cell v is passed in-out and used again in the same call`, `await inside with-view`,
+`scoped type T can only be constructed inside unsafe`, `scoped value consumed: owned parameter p of f ...`.
+
 ## 4. Core versus macro versus library
 
 ### 4.1 The rule (Decided)
