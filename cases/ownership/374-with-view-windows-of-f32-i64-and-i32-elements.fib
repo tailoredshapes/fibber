@@ -1,0 +1,38 @@
+;; spec:   types §6.15, syntax §3.21; docs/design/exclusive-views.md
+;; expect: accept
+;; result:  0
+;; audit:   clean
+;; stage:  2
+;; Package EV2, the inline access at the three other element widths: a window of an f32, an i64 and an i32 array at a nonzero offset is written and
+;; read through vset! and vget, and every element outside the window keeps its value (a wrong width or base moves a store into a neighbour).
+(ns main (:use fib.view))
+
+(defun f32s () -> bool
+  (let ((a (cell (array 10 0.5f32))))
+    (do (with-view [v (array-window! &a 3 7)]
+          (dotimes (i 4) (vset! v i (+ (vget v i) (sitofp f32 (+ i 1))))))
+        (loop ((i 0) (ok true))
+          (if (< i 10)
+              (recur (+ i 1) (and ok (= (array-get @a i) (if (and (>= i 3) (< i 7)) (+ 0.5f32 (sitofp f32 (- i 2))) 0.5f32))))
+              ok)))))
+
+(defun i64s () -> bool
+  (let ((a (cell (array 10 -1))))
+    (do (with-view [v (array-window! &a 2 9)]
+          (dotimes (i 7) (vset! v i (* (+ i 1) 1000000000000))))
+        (loop ((i 0) (ok true))
+          (if (< i 10)
+              (recur (+ i 1) (and ok (= (array-get @a i) (if (and (>= i 2) (< i 9)) (* (- i 1) 1000000000000) -1))))
+              ok)))))
+
+(defun i32s () -> bool
+  (let ((a (cell (array 10 (trunc i32 -1)))))
+    (do (with-view [v (array-window! &a 1 6)]
+          (dotimes (i 5) (vset! v i (trunc i32 (* (+ i 1) 70000)))))
+        (loop ((i 0) (ok true))
+          (if (< i 10)
+              (recur (+ i 1) (and ok (= (array-get @a i) (if (and (>= i 1) (< i 6)) (trunc i32 (* i 70000)) (trunc i32 -1)))))
+              ok)))))
+
+(defun main () -> i64
+  (if (and (f32s) (i64s) (i32s)) 0 1))

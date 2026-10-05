@@ -1,8 +1,17 @@
 ;; Exclusive views: writable windows of an array (spec/types.md 6.15, syntax 3.21; docs/design/exclusive-views.md).
 ;; Run it:  fibc run examples/exclusive-views.fib     It prints, for 1000-element windows swept 20000 times, the time of a read-modify-write through a
 ;; window (vget, vset!) against the same loop on the array (array-get, array-set!), a fill! against an array-set! loop, and four tiles on four tasks
-;; against one window, each with its checksum so that a wrong answer is visible. The numbers are this machine's, measured by the program itself.
-(ns main (:use fib.view fib.view.tiles))
+;; against one window, each with its checksum so that a wrong answer is visible, and then a compute-bound kernel on one tile and on four tiles of four tasks.
+;; The numbers are this machine's, measured by the program itself. `fibc run` compiles at -O0; `fibc build` (-O2) is the speed a program has when shipped
+;; (scripts/bench/windows.sh times that, with the checks).
+(ns main (:use fib.view fib.view.tiles) (:require [fib.math :as math]))
+
+(defun churn (x: f64) -> f64
+  (loop ((k 0) (y x)) (if (< k 60) (recur (+ k 1) (+ (* 0.5 (math/sqrt (+ (* y y) 1.0))) 0.25)) y)))
+
+(defun par-run (&a: (Array f64) k: i64) -> f64
+  (do (with-tiles [w a k] (dotimes (i (vlen w)) (vset! w i (churn (+ (vget w i) 1.0)))))
+      (array-get @a 7)))
 
 (defun sweep-window (&a: (Array f64) n: i64 reps: i64) -> f64
   (do (with-view [v (array-window! &a 0 n)]
@@ -33,7 +42,7 @@
 
 (defun main () -> i64
   (let ((n 1000) (reps 20000) (a (cell (array 1000 0.0))) (b (cell (array 1000 0.0))) (c (cell (array 1000 0.0))) (d (cell (array 1000 0.0)))
-        (e (cell (array 4000 0.0))))
+        (e (cell (array 4000 0.0))) (p1 (cell (array 100000 0.0))) (p4 (cell (array 100000 0.0))))
     (let ((t0 (sys-clock-now)))
       (let ((x (sweep-window &a n reps)) (t1 (sys-clock-now)))
         (let ((y (sweep-array &b n reps)) (t2 (sys-clock-now)))
@@ -45,4 +54,9 @@
                     (println (str-join ["window fill  " (str f) "  ns/element " (str (ns-per (- t3 t2) (* n reps)))]))
                     (println (str-join ["array  fill  " (str g) "  ns/element " (str (ns-per (- t4 t3) (* n reps)))]))
                     (println (str-join ["4 tiles      " (str h) "  ns/element " (str (ns-per (- t5 t4) (* 4000 20000)))]))
-                    0)))))))))
+                    (let ((t6 (sys-clock-now)))
+                      (let ((u (par-run &p1 1)) (t7 (sys-clock-now)))
+                        (let ((v (par-run &p4 4)) (t8 (sys-clock-now)))
+                          (do (println (str-join ["compute 1 tile  " (str u) "  ns/element " (str (ns-per (- t7 t6) 100000))]))
+                              (println (str-join ["compute 4 tiles " (str v) "  ns/element " (str (ns-per (- t8 t7) 100000))]))
+                              0)))))))))))))

@@ -1,0 +1,23 @@
+;; spec:   types §6.15, syntax §3.21; docs/design/exclusive-views.md
+;; expect: accept
+;; result:  0
+;; audit:   clean
+;; stage:  2
+;; Package EV2, the two halves of one lend are accessed element by element, alternately, through vget and vset! (the access that the emitter
+;; lowers inline from a base and a length read once per window): each half writes to its own base, and reads what it wrote and nothing else.
+(ns main (:use fib.view))
+
+(defun check (n: i64 k: i64) -> bool
+  (let ((a (cell (array n 0))))
+    (do (with-view [(lo hi) (array-split! &a k)]
+          (do (dotimes (i (vlen lo)) (vset! lo i (+ i 100)))
+              (dotimes (j (vlen hi)) (vset! hi j (+ j 200)))
+              (dotimes (i (vlen lo)) (vset! lo i (+ (vget lo i) 1)))
+              (dotimes (j (vlen hi)) (vset! hi j (+ (vget hi j) 2)))))
+        (loop ((i 0) (ok true))
+          (if (< i n)
+              (recur (+ i 1) (and ok (= (array-get @a i) (if (< i k) (+ i 101) (+ (- i k) 202)))))
+              ok)))))
+
+(defun main () -> i64
+  (if (and (check 7 3) (check 7 1) (check 7 6) (check 8 4) (check 5 5) (check 5 0) (check 1 0)) 0 1))

@@ -1630,6 +1630,11 @@ window type; the sigils stay in the expansion, so the checker sees every write. 
 windows), over an `(Array T)` of `f64`, `i64`, `f32` or `i32`. Not provided: windows over `Vec` (decision 4 of 2026-10-04), windows used by a
 closure or a task (decision 2), a window of a window.
 
+`(with-tiles [w a k] body+)` (library `fib.view.tiles`, decision 5 of 2026-10-04; `(:use fib.view fib.view.tiles)`) lends the array in the private cell `a` to `k`
+native tasks, one tile each: the body runs once per task with `w` bound to a window of its own tile, the tiles are `[n t / k, n (t + 1) / k)` for `t` in `0 .. k`
+(disjoint, covering the array), and the form returns when every task has finished. The element type is any of `fib.view` (`f64`, `f32`, `i64`, `i32`); an empty
+array traps (`with-tiles: the array is empty`), and the body must not mention the owner (a task's closure may not capture a cell).
+
 Errors (types §6.14): `lent place must be a private cell: a is used as a value at F:L:C`, `a is lent to v and cannot be used here`,
 `lender call outside with-view: f`, `view cell v can only be read as a call argument`, `view cell v cannot be assigned`, `view cell v
 cannot be captured by a closure`, `view cell v is passed in-out and used again in the same call`, `await inside with-view`,

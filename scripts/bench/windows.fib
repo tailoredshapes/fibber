@@ -1,0 +1,149 @@
+;; Exclusive-view windows against the array loops they replace (package EV2; types 6.15, docs/design/exclusive-views.md). Stage 2 only.
+;; Each line is `NAME<TAB>ns per element<TAB>checksum`; a window line and its array line print the same checksum, so a wrong answer is visible.
+;; scripts/bench/windows.sh runs it under the suite lock, takes medians and checks the ratios. Arguments: none (all kernels), or one kernel name.
+;;
+;;   rmw-window / rmw-array      v[i] = v[i] + 1.5 over 1000 elements, 20000 sweeps (cache resident)
+;;   fill-window / fill-array    v[i] = r over 1000 elements, 20000 sweeps
+;;   saxpy-window                y = 0.5 x + y over 32768 elements through a read-only and a writable window, 2000 sweeps
+;;   saxpy-array                 the same on the arrays with array-get / array-set!
+;;   saxpy-simd                  the same on (Array f64x4), four vectors a trip (the kernel of scripts/shootout/saxpy/saxpy-simd.fib)
+;;   tile-window / tile-array    a blocked write: 64-element tiles of a 262144-element array, each tile lent once and incremented, 40 sweeps
+;;   par-1 / par-4               a compute-bound tile kernel (60 sqrt-and-multiply steps per element) on 1 tile / 4 tiles on 4 tasks
+(ns main (:use fib.view fib.view.tiles fib.simd) (:require [fib.math :as math]))
+
+(defun ns-per (t: i64 count: i64) -> f64 (/ (sitofp f64 t) (sitofp f64 count)))
+(defun report (name: str t: i64 count: i64 sum: f64) -> unit
+  (println (str-join [name "\t" (str (ns-per t count)) "\t" (str sum)])))
+
+(defun sum-of (a: (Array f64) n: i64) -> f64
+  (loop ((i 0) (s 0.0)) (if (< i n) (recur (+ i 1) (+ s (array-get a i))) s)))
+
+;; ---- read-modify-write and fill
+
+(defun rmw-window (&a: (Array f64) n: i64 reps: i64) -> unit
+  (with-view [v (array-window! &a 0 n)]
+    (dotimes (r reps) (dotimes (i n) (vset! v i (+ (vget v i) 1.5))))))
+
+(defun rmw-array (&a: (Array f64) n: i64 reps: i64) -> unit
+  (dotimes (r reps) (dotimes (i n) (array-set! &a i (+ (array-get @a i) 1.5)))))
+
+(defun fill-window (&a: (Array f64) n: i64 reps: i64) -> unit
+  (with-view [v (array-window! &a 0 n)] (dotimes (r reps) (fill! v (sitofp f64 r)))))
+
+(defun fill-array (&a: (Array f64) n: i64 reps: i64) -> unit
+  (dotimes (r reps) (dotimes (i n) (array-set! &a i (sitofp f64 r)))))
+
+;; ---- saxpy
+
+(defun saxpy-window (&y: (Array f64) &x: (Array f64) n: i64 reps: i64) -> unit
+  (with-view-ro [xs (array-window &x 0 n)]
+    (with-view [ys (array-window! &y 0 n)]
+      (dotimes (r reps)
+        (dotimes (i n) (vset! ys i (+ (* 0.5 (vget xs i)) (vget ys i))))))))
+
+(defun saxpy-array (&y: (Array f64) x: (Array f64) n: i64 reps: i64) -> unit
+  (dotimes (r reps)
+    (dotimes (i n) (array-set! &y i (+ (* 0.5 (array-get x i)) (array-get @y i))))))
+
+(defun saxpy-simd (&y: (Array f64x4) x: (Array f64x4) nv: i64 reps: i64) -> unit
+  (dotimes (r reps)
+    (loop [i 0]
+      (if (< i nv)
+          (do (array-set! &y i (+ (* 0.5 (array-get x i)) (array-get @y i)))
+              (array-set! &y (+ i 1) (+ (* 0.5 (array-get x (+ i 1))) (array-get @y (+ i 1))))
+              (array-set! &y (+ i 2) (+ (* 0.5 (array-get x (+ i 2))) (array-get @y (+ i 2))))
+              (array-set! &y (+ i 3) (+ (* 0.5 (array-get x (+ i 3))) (array-get @y (+ i 3))))
+              (recur (+ i 4)))
+          0))))
+
+(defun simd-total (y: (Array f64x4) nv: i64) -> f64
+  (loop [i 0 s (splat f64x4 0.0)] (if (< i nv) (recur (+ i 1) (+ s (array-get y i))) (hsum s))))
+
+;; ---- a blocked write
+
+(defun tile-window (&a: (Array f64) n: i64 tile: i64 reps: i64) -> unit
+  (dotimes (r reps)
+    (loop ((lo 0))
+      (when (< lo n)
+        (do (with-view [w (array-window! &a lo (+ lo tile))]
+              (dotimes (i tile) (vset! w i (+ (vget w i) 1.0))))
+            (recur (+ lo tile)))))))
+
+(defun tile-array (&a: (Array f64) n: i64 tile: i64 reps: i64) -> unit
+  (dotimes (r reps)
+    (loop ((lo 0))
+      (when (< lo n)
+        (do (dotimes (i tile) (array-set! &a (+ lo i) (+ (array-get @a (+ lo i)) 1.0)))
+            (recur (+ lo tile)))))))
+
+;; ---- tiles on tasks: a compute-bound kernel, the same total work on 1 and on 4 tasks
+
+(defun churn (x: f64) -> f64
+  (loop ((k 0) (y x)) (if (< k 60) (recur (+ k 1) (+ (* 0.5 (math/sqrt (+ (* y y) 1.0))) 0.25)) y)))
+
+(defun par-run (&a: (Array f64) k: i64) -> unit
+  (with-tiles [w a k]
+    (dotimes (i (vlen w)) (vset! w i (churn (+ (vget w i) 1.0))))))
+
+(defun want? (args: (Vec str) name: str) -> bool
+  (or (= (count args) 0) (= (nth args 0) name)))
+
+(defun main () -> i64
+  (let ((all (args)) (n 1000) (reps 20000))
+    (do
+      (when (want? all "rmw")
+        (let ((a (cell (array n 0.0))) (b (cell (array n 0.0))) (t0 (sys-clock-now)))
+          (do (rmw-window &a n reps)
+              (let ((t1 (sys-clock-now)))
+                (do (rmw-array &b n reps)
+                    (let ((t2 (sys-clock-now)))
+                      (do (report "rmw-window" (- t1 t0) (* n reps) (sum-of @a n))
+                          (report "rmw-array" (- t2 t1) (* n reps) (sum-of @b n)))))))))
+      (when (want? all "fill")
+        (let ((a (cell (array n 0.0))) (b (cell (array n 0.0))) (t0 (sys-clock-now)))
+          (do (fill-window &a n reps)
+              (let ((t1 (sys-clock-now)))
+                (do (fill-array &b n reps)
+                    (let ((t2 (sys-clock-now)))
+                      (do (report "fill-window" (- t1 t0) (* n reps) (sum-of @a n))
+                          (report "fill-array" (- t2 t1) (* n reps) (sum-of @b n)))))))))
+      (when (want? all "saxpy")
+        (let ((m 32768) (sreps 2000)
+              (x (cell (array 32768 0.0))) (y1 (cell (array 32768 0.0))) (y2 (cell (array 32768 0.0)))
+              (yv (cell (array 8192 (splat f64x4 0.0)))))
+          (do (dotimes (i m) (do (array-set! &x i (sitofp f64 (rem i 7))) (array-set! &y1 i (sitofp f64 (rem i 5)))
+                                 (array-set! &y2 i (sitofp f64 (rem i 5)))))
+              (let ((xa (cell (array 8192 (splat f64x4 0.0)))))
+                (do (dotimes (k 8192)
+                      (let ((i (* k 4)))
+                        (array-set! &xa k <<(sitofp f64 (rem i 7)) (sitofp f64 (rem (+ i 1) 7)) (sitofp f64 (rem (+ i 2) 7)) (sitofp f64 (rem (+ i 3) 7))>>)))
+                    (dotimes (k 8192)
+                      (let ((i (* k 4)))
+                        (array-set! &yv k <<(sitofp f64 (rem i 5)) (sitofp f64 (rem (+ i 1) 5)) (sitofp f64 (rem (+ i 2) 5)) (sitofp f64 (rem (+ i 3) 5))>>)))
+                    (let ((t0 (sys-clock-now)))
+                      (do (saxpy-window &y1 &x m sreps)
+                          (let ((t1 (sys-clock-now)))
+                            (do (saxpy-array &y2 @x m sreps)
+                                (let ((t2 (sys-clock-now)))
+                                  (do (saxpy-simd &yv @xa 8192 sreps)
+                                      (let ((t3 (sys-clock-now)))
+                                        (do (report "saxpy-window" (- t1 t0) (* m sreps) (sum-of @y1 m))
+                                            (report "saxpy-array" (- t2 t1) (* m sreps) (sum-of @y2 m))
+                                            (report "saxpy-simd" (- t3 t2) (* m sreps) (simd-total @yv 8192)))))))))))))))
+      (when (want? all "tile")
+        (let ((m 262144) (a (cell (array 262144 0.0))) (b (cell (array 262144 0.0))) (t0 (sys-clock-now)))
+          (do (tile-window &a m 64 40)
+              (let ((t1 (sys-clock-now)))
+                (do (tile-array &b m 64 40)
+                    (let ((t2 (sys-clock-now)))
+                      (do (report "tile-window" (- t1 t0) (* m 40) (sum-of @a m))
+                          (report "tile-array" (- t2 t1) (* m 40) (sum-of @b m)))))))))
+      (when (want? all "par")
+        (let ((m 400000) (a (cell (array 400000 0.0))) (b (cell (array 400000 0.0))) (t0 (sys-clock-now)))
+          (do (par-run &a 1)
+              (let ((t1 (sys-clock-now)))
+                (do (par-run &b 4)
+                    (let ((t2 (sys-clock-now)))
+                      (do (report "par-1" (- t1 t0) m (sum-of @a m))
+                          (report "par-4" (- t2 t1) m (sum-of @b m)))))))))
+      0)))

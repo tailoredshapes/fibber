@@ -92,34 +92,48 @@
         (unsafe (WinPair (Win base k seed) (Win (ptr+ base (* w k)) (- n k) seed))))))
 
 ;; ---- operations: every index is checked against the window, not the buffer
+;;
+;; Written so that nothing is counted and nothing is copied: a read of a window is a borrowed argument, a write takes the view cell itself (the
+;; checker hands a callee the cell of a scoped `&` argument without a private copy, compiler/own/walk/call.fib `amp-pass`), the fields that are
+;; read are scalars (a base, a length), and the element type is dispatched on the value being stored, never on a seed read out of the window
+;; (a generic field read would take a count). The failure is its own function, named `-slow` so that the compiler never inlines it and the
+;; access itself is a compare, a branch, an address and a load or store.
+
+(defun win-oob-slow (n: i64 i: i64) -> unit
+  (trap (str-join ["window index " (str i) " out of range for a window of " (str n)])))
 
 (defun win-check :private (n: i64 i: i64) -> unit
-  (when (or (< i 0) (>= i n)) (trap (str-join ["window index " (str i) " out of range for a window of " (str n)]))))
+  (when (or (< i 0) (>= i n)) (win-oob-slow n i)))
+
+;; The address of element i, for an element `e` of any value of the type: the width is a constant of the type.
+(defun win-addr :private (base: ptr width: i64 i: i64) -> ptr
+  (unsafe (ptr+ base (unchecked-multiply width i))))
 
 (defun win-get (w: s i: i64) :where ((Windowed s e) (ViewElem e)) -> e
   (do (win-check (win-len w) i)
       (let ((seed (win-seed w)))
-        (view-load seed (unsafe (ptr+ (win-base w) (* (view-width seed) i)))))))
+        (view-load seed (win-addr (win-base w) (view-width seed) i)))))
 
 (defun win-set! (&w: (Win a) i: i64 x: a) :where ((ViewElem a)) -> unit
-  (do (win-check (. @w len) i)
-      (view-store (. @w seed) (unsafe (ptr+ (. @w base) (* (view-width (. @w seed)) i))) x)))
+  (let ((n (. @w len)) (base (. @w base)))
+    (do (win-check n i)
+        (view-store x (win-addr base (view-width x) i) x))))
 
 (defun win-fill! (&w: (Win a) x: a) :where ((ViewElem a)) -> unit
-  (let ((n (. @w len)) (base (. @w base)) (width (view-width (. @w seed))) (seed (. @w seed)))
+  (let ((n (. @w len)) (base (. @w base)) (width (view-width x)))
     (loop ((i 0))
       (when (< i n)
-        (do (view-store seed (unsafe (ptr+ base (* width i))) x)
-            (recur (+ i 1)))))))
+        (do (view-store x (win-addr base width i) x)
+            (recur (unchecked-add i 1)))))))
 
 ;; dst[i] = src[i]; the lengths must be equal. The two windows are different views (the checker keeps one view out of a call twice).
 (defun win-copy! (&dst: (Win a) src: s) :where ((Windowed s a) (ViewElem a)) -> unit
   (do (when (!= (. @dst len) (win-len src)) (trap "copy-into!: windows of different lengths"))
-      (let ((n (. @dst len)) (seed (. @dst seed)))
+      (let ((n (. @dst len)))
         (loop ((i 0))
           (when (< i n)
             (do (win-set! &dst i (win-get src i))
-                (recur (+ i 1))))))))
+                (recur (unchecked-add i 1))))))))
 
 ;; ---- the macros: the sigil-free surface over the sigiled core (decision 1 of 2026-10-04)
 

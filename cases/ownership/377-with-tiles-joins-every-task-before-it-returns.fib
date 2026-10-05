@@ -1,0 +1,20 @@
+;; spec:   types §6.15, syntax §3.21; docs/design/exclusive-views.md
+;; expect: accept
+;; result:  0
+;; audit:   clean
+;; stage:  2
+;; Package EV2, each tile does enough work (a few million steps per element) that a with-tiles which returned before its tasks had finished would
+;; hand the array back with elements still at 0.0: the combinator joins every task, so every element is final when the next line reads it.
+(ns main (:use fib.view fib.view.tiles))
+
+(defun churn (x: f64) -> f64
+  (loop ((k 0) (y x)) (if (< k 3000000) (recur (+ k 1) (+ (* 0.5 y) 1.0)) y)))
+
+(defun main () -> i64
+  (let ((a (cell (array 8 0.0))))
+    (do (with-tiles [w a 4]
+          (dotimes (i (vlen w)) (vset! w i (churn (+ (vget w i) 1.0)))))
+        (loop ((i 0) (ok true))
+          (if (< i 8)
+              (recur (+ i 1) (and ok (> (array-get @a i) 1.9) (< (array-get @a i) 2.1)))
+              (if ok 0 1))))))
