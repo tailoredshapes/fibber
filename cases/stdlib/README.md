@@ -165,7 +165,8 @@ shows with fixtures that a bound of 0 does fail a program that allocates.
 ;; spec:   stdlib §4.4 (rows map filter)           the section that decides the case
 ;; expect: accept                                   or reject / trap, as method.md rule 3
 ;; result: 0                                        the integer main returns (a bit mask of failed checks for ref- and law-)
-;; audit:  clean                                    or leak-cycle
+;; audit:  clean                                    or leak-cycle, or abandoned (a trapped task's objects: needs leaks:)
+;; leaks:  5                                        with abandoned or leak-cycle: exactly this many objects leaked
 ;; allocs: <= 4                                     count- and bound- cases; the A lines of the free trace
 ;; roots:  ../../lib support                        library roots, relative to the case's directory
 ;; covers: map filter remove                        the Clojure-name cells of the rows of §4 this case calls

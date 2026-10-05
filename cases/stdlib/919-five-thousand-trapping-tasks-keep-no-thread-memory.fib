@@ -1,0 +1,30 @@
+;; spec:   docs/design/exceptions.md 4.1 test 5, F1
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; 5,000 tasks that trap, each asked with `try-join` before the next starts: a task's trap ends its thread through the same exit as a task that
+;; finishes (the thread is detached and counted), so the resident set grows by less than 32 MB and the process, under the 16 GB cap, starts
+;; its 5,000th thread. The tasks own nothing at the trap, so nothing is abandoned. Killed by: scripts/mutant-task-trap.sh `no-isolate`
+;; (the first trap aborts), `ok-failed`, `leak-message`.
+(ns main (:use fib.core fib.async tl.check) (:require [tl.procstat :as ps]))
+
+(defun run (n: i64) -> i64
+  (loop ((i 0) (failed 0))
+    (if (= i n)
+        failed
+        (recur (+ i 1) (match (try-join (spawn (fn () (trap "again")))) ((Err _) (+ failed 1)) ((Ok _) failed))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (warm (run 200))
+        (before (ps/rss-kb))
+        (failed (run 5000))
+        (after (ps/rss-kb)))
+    (do (check c (= warm 200))
+        (check c (= failed 5000))
+        (check c (> before 0))
+        (check c (< (- after before) 32768))
+        (check c (< (ps/settled-threads 8) 8))
+        (checks-result c))))

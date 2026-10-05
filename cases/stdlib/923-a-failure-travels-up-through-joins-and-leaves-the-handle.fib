@@ -1,0 +1,20 @@
+;; spec:   docs/design/exceptions.md 4.1 test 6 (a joiner of a task that traps), S1c
+;; expect: accept
+;; result: 0
+;; audit:  abandoned
+;; leaks:  4
+;; stage:  2
+;; roots:  ../../lib support
+;; A task that `join`s a task that trapped traps in its turn with the same message, and its own joiner sees that as `(Err ..)` whose message
+;; is the inner one's: a failure travels up through the joins and stops where somebody asks with `try-join`. The outer task trapped while its
+;; frame held the handle of the inner one, so that handle (the task, its result atom, its closure and what they hold) is abandoned:
+;; `leaks: 4` counted by FIB_TRACE=1 (case 918 says how the count is read). Killed by: scripts/mutant-task-trap.sh `join-ignores` (the
+;; outer task would finish with the empty result of the inner one), `no-isolate`.
+(ns main (:use fib.core fib.async tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (up (spawn (fn () (join (spawn (fn () (trap "from below"))))))))
+    (do (check c (= (match (try-join up) ((Err e) (. e message)) ((Ok _) "")) "from below"))
+        (check c (= (match (try-join up) ((Err e) (. e message)) ((Ok _) "")) "from below"))
+        (checks-result c))))

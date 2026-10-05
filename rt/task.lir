@@ -163,7 +163,7 @@
           (rc (call @pthread_create handle (ptr null) @fib.worker (ptr null))))
       (br (icmp ne rc (i32 0)) failed next)))
   (block failed
-    (call @fib.trap-c (string "async: cannot start a worker thread"))
+    (call @fib.fatal-c (string "async: cannot start a worker thread"))
     (unreachable))
   (block next (let ((i2 (add i (i64 1)))) (br loop)))
   (block done (ret)))
@@ -281,3 +281,19 @@
       (call @fib.enqueue w)
       (br wake)))
   (block done (call @fib.rq-lock) (call @fib.rq-broadcast) (call @fib.rq-unlock) (ret)))
+
+;; The message a task failed with (a share-marked str, null when it did not fail). `task-failure` and `fib.raise-failed` read it
+;; after the task is done: the store of fib.fail-task precedes the release store of the state.
+(define internal (fib.task-failure ptr) ((ptr task))
+  (block entry
+    (ret (atomic-load acquire ptr (getelementptr %struct.fib.task task (i32 0) (i32 10))))))
+
+;; `join` and `@t` of a task that failed trap in the joiner with the task's own message; a task that did not fail is left alone.
+(define internal (fib.raise-failed void) ((ptr task))
+  (block entry
+    (let ((msg (call @fib.task-failure task)))
+      (br (icmp ne msg (ptr null)) failed done)))
+  (block failed
+    (call @fib.trap msg)
+    (unreachable))
+  (block done (ret)))

@@ -1,0 +1,20 @@
+;; spec:   types §8.8 (threads), compiler §4 (the trace holds every free before the process ends)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; main spawns 40 tasks that each own a vector and a string, sleep 150 ms and finish, and joins none of them: main's
+;; return waits for them (the threads are detached, so what waits is the runtime's count of live threads), and every object
+;; they held is freed before the process ends, which the audit reads from the trace: `audit: clean`.
+;; Killed by: scripts/mutant-spawn-leak.sh `join-all` (the end of main does not wait: the trace then lacks the frees).
+(ns main (:use fib.core fib.async) (:require [fib.os :as os]))
+
+(defun main () -> i64
+  (do (doseq [k (range 40)]
+        (future-call (fn ()
+                       (let ((v (mapv (fn (i: i64) (+ i k)) (range 20)))
+                             (s (str "task " (show k))))
+                         (do (os/sleep-ns 150000000)
+                             (+ (count v) (str-len s)))))))
+      0))

@@ -1,0 +1,34 @@
+;; spec:   docs/design/exceptions.md 4.1 (how to use it); stdlib §2.10
+;; expect: accept
+;; result: 0
+;; audit:  abandoned
+;; leaks:  3
+;; stage:  2
+;; roots:  ../../lib support
+;; The shape a server uses before `try`/`catch` exists (the language server's request loop, docs/design/exceptions.md "Isolating a
+;; handler"): each request runs in a task, `try-join` says whether the handler answered or trapped, and a trap becomes the error reply
+;; (-32603, internal error) while the loop goes on to the next request. What a trapped handler's task owned is abandoned (case 918):
+;; here the closures of the handlers that trapped, which hold the request, `leaks: 3` objects in all (counted with FIB_TRACE=1);
+;; the tasks, their results and the answers that came back are all freed, and the loop is not affected.
+(ns main (:use fib.core fib.async tl.check))
+
+(defun handle (method: str n: i64) -> i64
+  (cond (= method "double") (* n 2)
+        (= method "divide") (quot 100 n)
+        :else (trap (str "unknown method " method))))
+
+;; The reply to one request: the handler's answer, or an error reply naming what trapped.
+(defun reply (method: str n: i64) -> str
+  (match (try-join (spawn (fn () (handle method n))))
+    ((Ok v) (str "result " (show v)))
+    ((Err trap) (str "error -32603 " (. trap message)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (replies [(reply "double" 21) (reply "divide" 0) (reply "double" 4) (reply "frobnicate" 1) (reply "divide" 5)]))
+    (do (check c (= (nth replies 0) "result 42"))
+        (check c (= (nth replies 1) "error -32603 integer / by zero"))
+        (check c (= (nth replies 2) "result 8"))
+        (check c (= (nth replies 3) "error -32603 unknown method frobnicate"))
+        (check c (= (nth replies 4) "result 20"))
+        (checks-result c))))

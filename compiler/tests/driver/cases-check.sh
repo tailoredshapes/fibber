@@ -23,6 +23,20 @@ ckp "a run that leaked nothing fails a leak-cycle verdict" "$(row)" "a.fib FAIL 
 cp $leak $t/a.fib; ck "a leaked cycle passes leak-cycle" "$(row)" "a.fib pass"
 sed -E 's/^;; audit: *leak-cycle$/;; audit: clean/' $leak > $t/a.fib
 ckp "a leak fails audit: clean" "$(row)" "a.fib FAIL audit: expected clean, got"
+# `audit: abandoned` (docs/design/exceptions.md 4.1): what a trapped task's frames owned. The case runs a task that traps owning 5 objects.
+aband=cases/stdlib/918-a-trap-abandons-what-the-task-owned.fib; clean_task=cases/stdlib/911-a-task-that-traps-is-isolated-by-try-join.fib
+absroots() { sed -E "s|^;; roots:.*|;; roots: $PWD/lib $PWD/cases/stdlib/support|" "$1"; }
+absroots $aband > $t/a.fib; ck "an abandoned verdict with the right leak count passes" "$(row)" "a.fib pass"
+absroots $aband | sed -E 's/^;; leaks: *5$/;; leaks: 4/' > $t/a.fib
+ckp "a wrong leaks count fails abandoned" "$(row)" "a.fib FAIL audit: expected abandoned with leaks=4, got"
+absroots $aband | sed -E 's/^;; audit: *abandoned$/;; audit: clean/; /^;; leaks:/d' > $t/a.fib
+ckp "a task that abandoned objects fails audit: clean" "$(row)" "a.fib FAIL audit: expected clean, got"
+absroots $aband | sed -E '/^;; leaks:/d' > $t/a.fib
+ckp "abandoned without a leaks count is a HEADER row" "$(row)" "a.fib HEADER line 6: missing required header key \`leaks\`"
+absroots $clean_task | sed -E 's/^;; audit: *clean$/;; audit: clean\n;; leaks: 1/' > $t/a.fib
+ckp "audit: clean with a leaks count is a HEADER row" "$(row)" "a.fib HEADER line"
+absroots $clean_task | sed -E 's/^;; audit: *clean$/;; audit: abandoned\n;; leaks: 1/' > $t/a.fib
+ckp "a trapped task that owned nothing fails abandoned" "$(row)" "a.fib FAIL audit: expected abandoned with leaks=1, got"
 sed -E 's/^;; result: *1$/;; result: 1\n;; allocs: <= 0/' $ok > $t/a.fib
 ckp "allocs <= 0 fails a program that allocates" "$(row)" "a.fib FAIL allocs: expected at most"
 cp $rej $t/a.fib; ck "a reject case passes" "$(row)" "a.fib pass"

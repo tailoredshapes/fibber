@@ -1,0 +1,21 @@
+;; spec:   docs/design/exceptions.md 4.1 test 6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; Two shapes. (a) A task that spawns a task that traps and asks with `try-join` finishes normally: a trap in a task nested in a task
+;; ends only the inner one. (b) A task traps at once while another, on another thread, is still running (it sleeps 100 ms): the
+;; second finishes with its value. Nothing is owned at a trap, so the audit is clean. Killed by: scripts/mutant-task-trap.sh
+;; `no-isolate`, `ok-failed`.
+(ns main (:use fib.core fib.async tl.check) (:require [fib.os :as os]))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (nested (spawn (fn () (match (try-join (spawn (fn () (trap "inner")))) ((Err e) (str-len (. e message))) ((Ok _) 0)))))
+        (slow (spawn (fn () (do (os/sleep-ns 100000000) 99))))
+        (quick (spawn (fn () (trap "quick")))))
+    (do (check c (= (match (try-join nested) ((Ok n) n) ((Err _) -1)) 5))
+        (check c (= (match (try-join quick) ((Err e) (. e message)) ((Ok _) "")) "quick"))
+        (check c (= (match (try-join slow) ((Ok n) n) ((Err _) -1)) 99))
+        (checks-result c))))

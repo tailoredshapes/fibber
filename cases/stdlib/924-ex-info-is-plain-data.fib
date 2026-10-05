@@ -1,0 +1,30 @@
+;; spec:   stdlib §2.10 (step 1), §4.3 rows ex-info ex-data ex-message ex-cause; docs/design/exceptions.md 4.1
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; `ex-info` makes a plain value of a message, data and an optional cause, usable as the error of a `Result`; `ex-message`, `ex-data` and
+;; `ex-cause` read it back, and `ex-cause` is `nil` when there was none (Clojure's). The data is any one type `d` the program picks (the
+;; page's `Val` is fib.data's, not here yet), so `(ex-info "m" 1)` and `(ex-info "m" "x")` are two types. An `ExInfo` is equal to another
+;; with the same parts; it crosses a function and a `Result` like any struct.
+(ns main (:use fib.core fib.ex tl.check))
+
+(defun risky (n: i64) -> (Result i64 (ExInfo i64))
+  (if (< n 0) (Err (ex-info "negative" n)) (Ok (* n 2))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (e (ex-info "bad input" 7))
+        (wrapped (ex-info-cause "while parsing" "line 3" (ex-info "bad input" "col 9"))))
+    (do (check c (= (ex-message e) "bad input"))
+        (check c (= (ex-data e) 7))
+        (check c (nil? (ex-cause e)))
+        (check c (= (ex-message wrapped) "while parsing"))
+        (check c (= (ex-data wrapped) "line 3"))
+        (check c (match (ex-cause wrapped) ((some inner) (and (= (ex-message inner) "bad input") (= (ex-data inner) "col 9"))) (nil false)))
+        (check c (= e (ex-info "bad input" 7)))
+        (check c (not (= e (ex-info "bad input" 8))))
+        (check c (= (risky 4) (Ok 8)))
+        (check c (match (risky -1) ((Err x) (and (= (ex-message x) "negative") (= (ex-data x) -1))) ((Ok _) false)))
+        (checks-result c))))

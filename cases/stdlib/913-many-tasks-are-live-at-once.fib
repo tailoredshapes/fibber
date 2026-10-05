@@ -1,0 +1,36 @@
+;; spec:   types §8.8 (threads); docs/design/exceptions.md §3.3 F1
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; Twelve rounds of 150 tasks that each sleep 100 ms: in every round the 150 are alive together (the peak count a task
+;; records for itself at its start is above 100), each returns its own number, and when the rounds are done the process holds
+;; few threads again. 1,800 threads in all, which a runtime that keeps its finished threads cannot start under the 16 GB
+;; address-space cap this suite runs under (8 MB of stack each). 150 live at once is what fits under that cap: a thread that
+;; allocates gets a 64 MB malloc arena besides its stack, so about 250 live threads exhaust 16 GB whatever the runtime does;
+;; 1,000 live tasks were run once by hand without the cap (the report of the change that added this case quotes it).
+;; Killed by: scripts/mutant-spawn-leak.sh `detach`.
+(ns main (:use fib.core fib.async tl.check) (:require [tl.procstat :as ps] [fib.os :as os]))
+
+(defun start (live: (Atom i64) peak: (Atom i64) k: i64) -> (Task i64)
+  (spawn (fn ()
+           (let ((now (swap! live (fn (x) (+ x 1)))))
+             (do (swap! peak (fn (p) (max p now)))
+                 (os/sleep-ns 100000000)
+                 (swap! live (fn (x) (- x 1)))
+                 k)))))
+
+;; The sum of the numbers 150 tasks return, and the peak of tasks alive at once.
+(defun round (n: i64) -> (Pair i64 i64)
+  (let ((live (atom 0)) (peak (atom 0))
+        (tasks (mapv (fn (k: i64) (start live peak k)) (range n))))
+    (Pair (reduce (fn (acc: i64 t: (Task i64)) (+ acc (join t))) 0 tasks) @peak)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (rounds (mapv (fn (i: i64) (round 150)) (range 12))))
+    (do (check c (every? (fn (r: (Pair i64 i64)) (= (. r fst) 11175)) rounds))
+        (check c (every? (fn (r: (Pair i64 i64)) (> (. r snd) 100)) rounds))
+        (check c (< (ps/settled-threads 8) 8))
+        (checks-result c))))
