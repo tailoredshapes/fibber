@@ -1,0 +1,19 @@
+;; spec:   types §6.15, syntax §3.21; docs/design/exclusive-views.md
+;; expect: accept
+;; result:  0
+;; audit:   clean
+;; stage:  2
+;; Check R9, a window loop of vget and vset! over [3, 1003) against the same arithmetic done on a plain array with array-get and array-set!.
+(ns main (:use fib.view))
+
+(defun main () -> i64
+  (let ((a (cell (array 1010 0))) (b (cell (array 1000 0))))
+    (do (with-view [v (array-window! &a 3 1003)]
+          (loop ((i 0))
+            (when (< i 1000) (do (vset! v i (+ (* i 3) 1)) (recur (+ i 1))))))
+        (loop ((i 0))
+          (when (< i 1000) (do (array-set! &b i (+ (* i 3) 1)) (recur (+ i 1)))))
+        (loop ((i 0) (ok true))
+          (if (< i 1000)
+              (recur (+ i 1) (and ok (= (array-get @a (+ i 3)) (array-get @b i))))
+              (if (and ok (= (array-get @a 2) 0) (= (array-get @a 1003) 0)) 0 1))))))

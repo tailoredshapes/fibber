@@ -1,0 +1,48 @@
+;; Exclusive views: writable windows of an array (spec/types.md 6.15, syntax 3.21; docs/design/exclusive-views.md).
+;; Run it:  fibc run examples/exclusive-views.fib     It prints, for 1000-element windows swept 20000 times, the time of a read-modify-write through a
+;; window (vget, vset!) against the same loop on the array (array-get, array-set!), a fill! against an array-set! loop, and four tiles on four tasks
+;; against one window, each with its checksum so that a wrong answer is visible. The numbers are this machine's, measured by the program itself.
+(ns main (:use fib.view fib.view.tiles))
+
+(defun sweep-window (&a: (Array f64) n: i64 reps: i64) -> f64
+  (do (with-view [v (array-window! &a 0 n)]
+        (dotimes (r reps)
+          (dotimes (i n) (vset! v i (+ (vget v i) 1.5)))))
+      (array-get @a 7)))
+
+(defun sweep-array (&a: (Array f64) n: i64 reps: i64) -> f64
+  (do (dotimes (r reps)
+        (dotimes (i n) (array-set! &a i (+ (array-get @a i) 1.5))))
+      (array-get @a 7)))
+
+(defun fill-window (&a: (Array f64) n: i64 reps: i64) -> f64
+  (do (with-view [v (array-window! &a 0 n)] (dotimes (r reps) (fill! v (sitofp f64 r))))
+      (array-get @a 7)))
+
+(defun fill-array (&a: (Array f64) n: i64 reps: i64) -> f64
+  (do (dotimes (r reps) (dotimes (i n) (array-set! &a i (sitofp f64 r))))
+      (array-get @a 7)))
+
+(defun tiles-sweep (&a: (Array f64)) -> f64
+  (do (with-tiles [w a 4]
+        (dotimes (r 20000)
+          (dotimes (i (vlen w)) (vset! w i (+ (vget w i) 1.5)))))
+      (array-get @a 7)))
+
+(defun ns-per (t: i64 count: i64) -> f64 (/ (sitofp f64 t) (sitofp f64 count)))
+
+(defun main () -> i64
+  (let ((n 1000) (reps 20000) (a (cell (array 1000 0.0))) (b (cell (array 1000 0.0))) (c (cell (array 1000 0.0))) (d (cell (array 1000 0.0)))
+        (e (cell (array 4000 0.0))))
+    (let ((t0 (sys-clock-now)))
+      (let ((x (sweep-window &a n reps)) (t1 (sys-clock-now)))
+        (let ((y (sweep-array &b n reps)) (t2 (sys-clock-now)))
+          (let ((f (fill-window &c n reps)) (t3 (sys-clock-now)))
+            (let ((g (fill-array &d n reps)) (t4 (sys-clock-now)))
+              (let ((h (tiles-sweep &e)) (t5 (sys-clock-now)))
+                (do (println (str-join ["window sweep " (str x) "  ns/element " (str (ns-per (- t1 t0) (* n reps)))]))
+                    (println (str-join ["array  sweep " (str y) "  ns/element " (str (ns-per (- t2 t1) (* n reps)))]))
+                    (println (str-join ["window fill  " (str f) "  ns/element " (str (ns-per (- t3 t2) (* n reps)))]))
+                    (println (str-join ["array  fill  " (str g) "  ns/element " (str (ns-per (- t4 t3) (* n reps)))]))
+                    (println (str-join ["4 tiles      " (str h) "  ns/element " (str (ns-per (- t5 t4) (* 4000 20000)))]))
+                    0)))))))))

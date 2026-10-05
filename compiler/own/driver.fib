@@ -15,7 +15,7 @@
 (ns own.driver
   (:require [syntax.reader :as reader] [expand.program :as prog] [expand.error :as ee])
   (:use syntax.pos syntax.form syntax.error expand.ctx expand.types expand.error
-        types.error types.program types.driver types.target own.error own.program own.syntactic own.top))
+        types.error types.program types.driver types.target own.error own.program own.syntactic own.views own.top))
 
 ;; A program that passed the whole front end: its types (§3) and its ownership decisions (§6).
 (defstruct Checked (typed: TypedProgram owned: OwnedProgram))
@@ -24,7 +24,7 @@
 ;; ownership pass. `library` (one flag for each module, or none) says which modules are the library's, whose units not reached from the
 ;; rest of the program are neither inferred nor analysed (types.infer.demand); with none every unit is.
 (defun own-check-lowered-with (l: Lowered main: bool library: (Option (Vec bool))) -> (Result Checked CheckError)
-  (let ((amp (syntactic-check (. l globals))))
+  (let ((amp (into (syntactic-check (. l globals)) (views-syntactic (. l globals)))))
     (if (not (empty? amp))
         (Err (CeOwn amp))
         (match (infer-lowered-with l main library)
@@ -32,7 +32,9 @@
           ((Ok typed)
            (match (analyse typed)
              ((Err errs) (Err (CeOwn errs)))
-             ((Ok owned) (Ok (Checked typed owned)))))))))
+             ((Ok owned)
+              (let ((view-errs (views-owned typed owned)))
+                (if (empty? view-errs) (Ok (Checked typed owned)) (Err (CeOwn view-errs)))))))))))
 
 (defun own-check-lowered (l: Lowered main: bool) -> (Result Checked CheckError)
   (own-check-lowered-with l main nil))

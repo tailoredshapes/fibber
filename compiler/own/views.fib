@@ -1,0 +1,394 @@
+;; compiler/own/views.fib: the rules of exclusive views (spec/types.md 6.15, spec/syntax.md 3.21; design in
+;; docs/design/exclusive-views.md). Not in the Rust: `fibref` does not know the library `fib.view` and the frozen Rust has no row for it.
+;;
+;; `with-view` is a macro of fib.view over `let` and `cell`: `(with-view [v (lender &t e..)] body)` is
+;; `(let ((v (cell (fib.view/view-lend (lender &t e..))))) (let ((r (do body))) r))`. The checker finds a *lend* by the marker call
+;; `view-lend` (writable), `view-lend-ro` (read-only) or `view-sub` (a window made from another lend's result) under a `cell` that a
+;; `let` binds: that cell is a *view cell*. The extent of the lend is the body of that `let`. Two passes:
+;;
+;; - `views-syntactic`, after lowering and before inference (with the `&` checks of own.syntactic): L1 the lent place is a private cell,
+;;   L2 the lent place is not used in the extent (for a read-only lend: not written), L3 a lender is called only under a marker, L6 a
+;;   scoped type is constructed only in `unsafe`, VC1 a view cell is never a value, VC2 no closure mentions it, VC3 it is not assigned,
+;;   VC4 in a call with `&v` no other operand mentions `v`, L5 no `await` in the extent, and a marker is used only by `with-view`.
+;; - `views-owned`, after the ownership pass: VC1 for what the syntax cannot see: every `@v` of a view cell, and of an `&` parameter
+;;   of scoped type, is a peek (spec/types.md 6.3: a borrowed argument of a call that is not a tail call), so a window is never given
+;;   to an owned position; and S1 for a parameter of scoped type: it must not be owned or escape.
+;;
+;; A scoped type is one that has an instance of the protocol `Scoped` of `fib.view`.
+(ns own.views
+  (:require [expand.error :as ee])
+  (:use syntax.pos types.ast types.ty types.decls types.table types.program types.builtins own.error own.program own.peek))
+
+;; ---- what is scoped, what is a marker, what is a lender
+
+;; The type ids with an instance of the protocol `Scoped` of the module `fib.view`.
+(defun scoped-types :private (g: Globals) -> (Set i64)
+  (if (some? (find-first (fn (m: ModuleInfo) (= (. m ns) "fib.view")) (table-rows (. g modules))))
+      (scoped-instances g)
+      (set-empty)))
+
+(defun scoped-instances :private (g: Globals) -> (Set i64)
+  (reduce (fn (acc: (Set i64) i: InstanceDef)
+            (let [p (g-proto g (. i proto))]
+              (if (and (= (. p name) "Scoped") (= (g-module-name g (. p module)) "fib.view"))
+                  (match (. i con) ((KNominal id) (conj acc id)) (_ acc))
+                  acc)))
+          (set-empty) (table-rows (. g instances))))
+
+;; Whether the type is scoped: a scoped nominal type, or a cell or array of one.
+(defun scoped-ty? :private (scoped: (Set i64) t: Ty) -> bool
+  (match t
+    ((TCon (KNominal id) _) (contains? scoped id))
+    ((TCon (KCell) args) (and (= (count args) 1) (scoped-ty? scoped (nth args 0))))
+    ((TCon (KArray) args) (and (= (count args) 1) (scoped-ty? scoped (nth args 0))))
+    (_ false)))
+
+;; The marker a call of the function f is: 1 `view-lend`, 2 `view-lend-ro`, 3 `view-sub`, 0 none.
+(defun marker-kind :private (g: Globals f: i64) -> i64
+  (let [d (g-fun g f)]
+    (if (= (g-module-name g (. d module)) "fib.view")
+        (cond (= (. d name) "view-lend") 1
+              (= (. d name) "view-lend-ro") 2
+              (= (. d name) "view-sub") 3
+              :else 0)
+        0)))
+
+;; The marker kind of the call e, and its operand.
+(defstruct Marker :private (kind: i64 inner: Expr))
+
+(defun marker-call :private (g: Globals e: Expr) -> (Option Marker)
+  (match (. e kind)
+    ((ECall h args)
+     (match (. h kind)
+       ((EGlobal (GFun f))
+        (let [k (marker-kind g f)]
+          (if (and (> k 0) (= (count args) 1))
+              (match (nth args 0) ((ArgExpr x) (some (Marker k x))) (_ nil))
+              nil)))
+       (_ nil)))
+    (_ nil)))
+
+;; Whether e is `(cell x)`: x.
+(defun cell-operand :private (e: Expr) -> (Option Expr)
+  (match (. e kind)
+    ((ECall h args)
+     (match (. h kind)
+       ((EGlobal (GBuiltin b))
+        (if (and (= (. (nth (builtin-table) b) name) "cell") (= (count args) 1))
+            (match (nth args 0) ((ArgExpr x) (some x)) (_ nil))
+            nil))
+       (_ nil)))
+    (_ nil)))
+
+;; The marker under the `(cell ..)` that the initialiser of a `let` binding is.
+(defun lend-init :private (g: Globals b: LetBind) -> (Option (Pair i64 Marker))
+  (match (. (. b pat) kind)
+    ((PBind v)
+     (match (cell-operand (. b init))
+       ((some x) (match (marker-call g x) ((some m) (some (Pair v m))) (_ nil)))
+       (_ nil)))
+    (_ nil)))
+
+;; Whether f is a lender: it has an `&` parameter and its declared result is a scoped type.
+(defun lender? :private (g: Globals scoped: (Set i64) f: i64) -> bool
+  (let [d (g-fun g f)]
+    (and (some? (find-first (fn (p: ParamDecl) (. p amp)) (. d params)))
+         (match (. d ret)
+           ((some (ANominal id _)) (contains? scoped id))
+           (_ false)))))
+
+;; ---- searches: the position of the first expression of a kind that mentions the binding b
+
+;; The searches, by mode: 0 any mention of the cell b (`@b`, `&b`, `set!`, a value, a capture); 1 a mention that writes or aliases it
+;; (anything but `@b`); 2 b as a value (not the place of `@` or `set!`); 3 a closure or task that captures b; 4 an assignment of b;
+;; 5 a call with `&b` whose other operands mention b; 6 an `await`.
+(defun mentions-b? :private (g: Globals e: Expr b: i64) -> bool (some? (find-hit g 0 b e)))
+
+(defun amp-arg-pos :private (args: (Vec Arg) b: i64) -> (Option Pos)
+  (loop ((i 0))
+    (if (= i (count args))
+        nil
+        (match (nth args i)
+          ((ArgAmp x p) (if (= x b) (some p) (recur (+ i 1))))
+          (_ (recur (+ i 1)))))))
+
+(defun local-of? :private (e: Expr b: i64) -> bool
+  (match (. e kind) ((ELocal x) (= x b)) (_ false)))
+
+(defun other-operand-mentions? :private (g: Globals args: (Vec Arg) b: i64) -> bool
+  (some? (find-first (fn (a: Arg) (match a ((ArgExpr x) (mentions-b? g x b)) (_ false))) args)))
+
+;; The hit of the search `mode` at e itself, not below it.
+(defun hit-here :private (g: Globals mode: i64 b: i64 e: Expr) -> (Option Pos)
+  (let [pos (. e pos)]
+    (match (. e kind)
+      ((EDeref (PlAmp x) _) (if (and (= mode 0) (= x b)) (some pos) nil))
+      ((ESet (PlAmp x) _) (if (and (or (= mode 0) (= mode 1) (= mode 4)) (= x b)) (some pos) nil))
+      ((ESet (PlExpr x) _) (if (and (or (= mode 4)) (local-of? x b)) (some pos) nil))
+      ((ESetField x _ _) (if (and (or (= mode 0) (= mode 1) (= mode 4)) (= x b)) (some pos) nil))
+      ((ELocal x) (if (and (or (= mode 0) (= mode 1) (= mode 2)) (= x b)) (some pos) nil))
+      ((ECall _ args)
+       (cond (or (= mode 0) (= mode 1)) (amp-arg-pos args b)
+             (= mode 5) (if (and (some? (amp-arg-pos args b)) (other-operand-mentions? g args b)) (some pos) nil)
+             :else nil))
+      ((EFn lit) (if (and (= mode 3) (contains? (into (set-empty) (. lit captures)) b)) (some pos) nil))
+      ((EAsync _ caps) (if (and (= mode 3) (contains? (into (set-empty) caps) b)) (some pos) nil))
+      ((EAwait _) (if (= mode 6) (some pos) nil))
+      (_ nil))))
+
+;; Whether e is the place of a read `@b` or of a `set!` of the cell b: the one occurrence of the variable that is not a value.
+(defun read-of-b? :private (e: Expr b: i64) -> bool
+  (match (. e kind)
+    ((EDeref (PlExpr x) _) (local-of? x b))
+    (_ false)))
+
+;; The arguments of the lender call of a read-only lend `(view-lend-ro (lender args..))`: a second read-only lend of the same place
+;; does not write it, so the search for writes looks at its other operands only.
+(defun ro-lender-args :private (g: Globals e: Expr) -> (Option (Vec Arg))
+  (match (marker-call g e)
+    ((some m) (if (= (. m kind) 2)
+                  (match (. (. m inner) kind) ((ECall _ args) (some args)) (_ nil))
+                  nil))
+    (_ nil)))
+
+;; The position of the first hit of the search `mode` for b in e, in pre-order.
+(defun find-hit :private (g: Globals mode: i64 b: i64 e: Expr) -> (Option Pos)
+  (cond (and (read-of-b? e b) (not (= mode 0))) nil
+        (and (= mode 2) (set-of-b? e b)) (find-hit g 2 b (set-value e))
+        (and (= mode 1) (some? (ro-lender-args g e))) (operands-hit g (unwrap (ro-lender-args g e)) b 1)
+        (and (read-of-b? e b) (= mode 0)) (some (. e pos))
+        :else
+        (let [h (hit-here g mode b e)]
+          (if (some? h)
+              h
+              (let [cs (expr-children e)]
+                (loop ((i 0))
+                  (if (= i (count cs))
+                      nil
+                      (let [r (find-hit g mode b (nth cs i))]
+                        (if (some? r) r (recur (+ i 1)))))))))))
+
+;; In mode 2 the place of an assignment `(set! b ..)` is not a value either.
+(defun set-of-b? :private (e: Expr b: i64) -> bool
+  (match (. e kind) ((ESet (PlExpr x) _) (local-of? x b)) (_ false)))
+(defun set-value :private (e: Expr) -> Expr
+  (match (. e kind) ((ESet _ v) v) (_ e)))
+(defun value-use :private (g: Globals b: i64 e: Expr) -> (Option Pos) (find-hit g 2 b e))
+
+;; ---- the pass before inference
+
+(defun view-error :private (pos: Pos msg: str) -> OwnError (own-error ViewRule pos msg))
+
+(defun at :private (pos: Pos) -> str (str-join [(. pos file) ":" (show (. pos line)) ":" (show (. pos col))]))
+
+;; What the walk of one body knows: the body, its private cells (own.peek) and the scoped types.
+(defstruct Ctx :private (g: Globals scoped: (Set i64) private: (Set i64) body: Expr))
+
+(defun bname :private (cx: Ctx b: i64) -> str (. (g-binding (. cx g) b) name))
+
+;; The error of the search `mode` for b in e, if it hits.
+(defun search-error :private (g: Globals mode: i64 b: i64 e: Expr text: str) -> (Vec OwnError)
+  (match (find-hit g mode b e) ((some p) [(view-error p text)]) (nil [])))
+
+;; L1: why the place t is not a private cell of the body, or nil when it is.
+(defun place-reason :private (cx: Ctx t: i64) -> (Option str)
+  (if (contains? (. cx private) t)
+      nil
+      (match (find-hit (. cx g) 3 t (. cx body))
+        ((some p) (some (str-join [(bname cx t) " is captured by a closure at " (at p)])))
+        (nil (match (value-use (. cx g) t (. cx body))
+               ((some p) (some (str-join [(bname cx t) " is used as a value at " (at p)])))
+               (nil (some (str-join [(bname cx t) " is not a cell of this function"]))))))))
+
+;; The binding of the first `&x` argument.
+(defun amp-first :private (args: (Vec Arg)) -> (Option i64)
+  (loop ((i 0))
+    (if (= i (count args))
+        nil
+        (match (nth args i)
+          ((ArgAmp x _) (some x))
+          (_ (recur (+ i 1)))))))
+
+;; The first mention (by `mode`) of t in an operand of the call, other than the `&t` argument itself.
+(defun operands-hit :private (g: Globals args: (Vec Arg) t: i64 mode: i64) -> (Option Pos)
+  (loop ((i 0))
+    (if (= i (count args))
+        nil
+        (match (nth args i)
+          ((ArgExpr x) (let [h (find-hit g mode t x)] (if (some? h) h (recur (+ i 1)))))
+          (_ (recur (+ i 1)))))))
+
+;; L1 and L2 of the lender call of a writable or read-only lend `v`: the place `&t`, its other operands, the extent.
+(defun place-errors :private (cx: Ctx v: i64 m: Marker ext: Expr pos: Pos) -> (Vec OwnError)
+  (let [no-call "with-view needs a call of a function with an & parameter and a scoped result"]
+    (match (. (. m inner) kind)
+      ((ECall _ args)
+       (match (amp-first args)
+         ((some t)
+          (let [text (str-join [(bname cx t) " is lent to " (bname cx v) " and cannot be used here"])
+                mode (if (= (. m kind) 2) 1 0)
+                l1 (match (place-reason cx t)
+                     ((some why) [(view-error pos (str-join ["lent place must be a private cell: " why]))])
+                     (nil []))
+                l2a (match (operands-hit (. cx g) args t mode) ((some p) [(view-error p text)]) (nil []))
+                l2b (match (find-hit (. cx g) mode t ext) ((some p) [(view-error p text)]) (nil []))]
+            (into (into l1 l2a) l2b)))
+         (nil [(view-error pos no-call)])))
+      (_ [(view-error pos no-call)]))))
+
+;; The rules of one lend `v` made from `m`, whose extent is `ext`: L1, L2, VC1 (syntactic half), VC2, VC3, VC4, L5.
+(defun lend-errors :private (cx: Ctx v: i64 m: Marker ext: Expr pos: Pos) -> (Vec OwnError)
+  (let [vn (bname cx v)]
+    (reduce (fn (acc: (Vec OwnError) es: (Vec OwnError)) (into acc es))
+            []
+            [(if (= (. m kind) 3) [] (place-errors cx v m ext pos))
+             (match (value-use (. cx g) v ext)
+               ((some p) [(view-error p (str-join ["view cell " vn " can only be read as a call argument"]))])
+               (nil []))
+             (search-error (. cx g) 3 v ext (str-join ["view cell " vn " cannot be captured by a closure"]))
+             (search-error (. cx g) 4 v ext (str-join ["view cell " vn " cannot be assigned"]))
+             (search-error (. cx g) 5 v ext (str-join ["view cell " vn " is passed in-out and used again in the same call"]))
+             (search-error (. cx g) 6 v ext "await inside with-view")])))
+
+(defun walk-all :private (cx: Ctx es: (Vec Expr) unsafe: bool) -> (Vec OwnError)
+  (reduce (fn (acc: (Vec OwnError) c: Expr) (into acc (walk cx c unsafe false))) [] es))
+
+;; The bindings of a `let` and its body: a lend binding is checked and its lender call walked as a lender under a marker.
+(defun walk-let :private (cx: Ctx binds: (Vec LetBind) body: Expr unsafe: bool) -> (Vec OwnError)
+  (let [errs (reduce (fn (acc: (Vec OwnError) b: LetBind)
+                       (match (lend-init (. cx g) b)
+                         ((some pr)
+                          (let [m (. pr snd)]
+                            (into (into acc (lend-errors cx (. pr fst) m body (. (. b init) pos)))
+                                  (walk cx (. m inner) unsafe true))))
+                         (nil (into acc (walk cx (. b init) unsafe false)))))
+                     [] binds)]
+    (into errs (walk cx body unsafe false))))
+
+;; The errors of a call: a marker outside `with-view`, a lender outside a marker, a scoped constructor outside `unsafe`.
+(defun call-errors :private (cx: Ctx e: Expr head: Expr unsafe: bool under: bool) -> (Vec OwnError)
+  (let [g (. cx g)]
+    (match (. head kind)
+      ((EGlobal (GFun f))
+       (cond (> (marker-kind g f) 0)
+             [(view-error (. e pos) (str-join [(. (g-fun g f) name) " is only for with-view"]))]
+             (and (not unsafe) (not under) (lender? g (. cx scoped) f))
+             [(view-error (. e pos) (str-join ["lender call outside with-view: " (. (g-fun g f) name)]))]
+             :else []))
+      ((EGlobal (GCtor t _))
+       (if (and (not unsafe) (contains? (. cx scoped) t))
+           [(view-error (. e pos) (str-join ["scoped type " (. (g-ty g t) name) " can only be constructed inside unsafe"]))]
+           []))
+      (_ []))))
+
+;; `under` says that e is the lender call of a marker.
+(defun walk :private (cx: Ctx e: Expr unsafe: bool under: bool) -> (Vec OwnError)
+  (match (. e kind)
+    ((EUnsafe x) (walk cx x true false))
+    ((ELet binds body) (walk-let cx binds body unsafe))
+    ((ECall head _) (into (call-errors cx e head unsafe under) (walk-all cx (expr-children e) unsafe)))
+    (_ (walk-all cx (expr-children e) unsafe))))
+
+;; The rules of one body.
+(defun body-errors :private (g: Globals scoped: (Set i64) body: Expr amps: (Vec i64)) -> (Vec OwnError)
+  (walk (Ctx g scoped (peekable-cells body amps) body) body false false))
+
+;; The view-rule errors of the whole lowered program, before inference. Nothing is scanned unless `fib.view` is in the program.
+(defun views-syntactic (g: Globals) -> (Vec OwnError)
+  (let [scoped (scoped-types g)]
+    (if (empty? (vec scoped))
+        []
+        (let [in-funs (reduce (fn (acc: (Vec OwnError) f: FunDef)
+                                (into acc (body-errors g scoped (. f body)
+                                                       (mapv (fn (p: ParamDecl) (. p binding))
+                                                             (filterv (fn (p: ParamDecl) (. p amp)) (. f params))))))
+                              [] (table-rows (. g funs)))
+              in-impls (reduce (fn (acc: (Vec OwnError) i: InstanceDef)
+                                 (reduce (fn (a: (Vec OwnError) m: ImplMethod)
+                                           (into a (body-errors g scoped (. m body) [])))
+                                         acc (. i methods)))
+                               in-funs (table-rows (. g instances)))]
+          (reduce (fn (acc: (Vec OwnError) d: DefDef) (into acc (body-errors g scoped (. d init) [])))
+                  in-impls (table-rows (. g defs)))))))
+
+;; ---- the pass after the ownership pass
+
+;; The view cells of a body: the variables of the lend bindings.
+(defun view-cells :private (g: Globals e: Expr acc: (Set i64)) -> (Set i64)
+  (let [here (match (. e kind)
+               ((ELet binds _)
+                (reduce (fn (a: (Set i64) b: LetBind)
+                          (match (lend-init g b) ((some pr) (conj a (. pr fst))) (nil a)))
+                        acc binds))
+               (_ acc))]
+    (reduce (fn (a: (Set i64) c: Expr) (view-cells g c a)) here (expr-children e))))
+
+(defstruct Pair2 :private (cell: i64 pos: Pos))
+
+;; The reads `@c` of the cells in `cells` that are not peeks.
+(defun non-peeks :private (e: Expr cells: (Set i64) peeks: (Set i64) acc: (Vec Pair2)) -> (Vec Pair2)
+  (let [b (match (. e kind)
+            ((EDeref (PlAmp x) _) (some x))
+            ((EDeref (PlExpr x) _) (match (. x kind) ((ELocal y) (some y)) (_ nil)))
+            (_ nil))
+        here (match b
+               ((some x) (if (and (contains? cells x) (not (contains? peeks (. e id)))) (conj acc (Pair2 x (. e pos))) acc))
+               (nil acc))]
+    (reduce (fn (a: (Vec Pair2) c: Expr) (non-peeks c cells peeks a)) here (expr-children e))))
+
+;; Whether the binding b of a body has a scoped type (through a cell).
+(defun scoped-binding? :private (p: TypedProgram scoped: (Set i64) b: i64) -> bool
+  (match (get (. p binding-types) b) ((some t) (scoped-ty? scoped t)) (nil false)))
+
+;; The cells whose `@` is a peek only at a position that does not escape: the view cells of the body and its `&` parameters of scoped type.
+(defun view-strict-cells (p: TypedProgram body: Expr amps: (Vec i64)) -> (Set i64)
+  (let [scoped (scoped-types (. p globals))]
+    (if (empty? (vec scoped))
+        (set-empty)
+        (view-cells (. p globals) body
+                    (into (set-empty) (filterv (fn (b: i64) (scoped-binding? p scoped b)) amps))))))
+
+;; VC1 and S1 over the bodies of the `defun`s: a view cell, and an `&` parameter of scoped type, is read only by peeks; a parameter
+;; of scoped type is neither owned nor escapes. The library `fib.view` is trusted as `unsafe` code is.
+(defun views-owned (p: TypedProgram o: OwnedProgram) -> (Vec OwnError)
+  (let [g (. p globals) scoped (scoped-types g)]
+    (if (empty? (vec scoped))
+        []
+        (reduce (fn (acc: (Vec OwnError) key: BodyKey)
+                  (match key
+                    ((BodyFun f)
+                     (let [d (g-fun g f)]
+                       (if (= (g-module-name g (. d module)) "fib.view")
+                           acc
+                           (into acc (fun-view-errors p o scoped f d)))))
+                    (_ acc)))
+                [] (. o order)))))
+
+(defun fun-view-errors :private (p: TypedProgram o: OwnedProgram scoped: (Set i64) f: i64 d: FunDef) -> (Vec OwnError)
+  (let [g (. p globals)
+        amps (into (set-empty) (mapv (fn (q: ParamDecl) (. q binding))
+                                     (filterv (fn (q: ParamDecl) (and (. q amp) (scoped-binding? p scoped (. q binding)))) (. d params))))
+        cells (view-cells g (. d body) amps)
+        peeks (match (owned-fun o f) ((some bo) (. bo peeks)) (nil (set-empty)))
+        reads (if (empty? (vec cells)) [] (non-peeks (. d body) cells peeks []))
+        summary (match (get (. o summaries) f) ((some s) (. s params)) (nil []))
+        reads-errs (mapv (fn (r: Pair2)
+                           (view-error (. r pos) (str-join ["view cell " (. (g-binding g (. r cell)) name)
+                                                            " can only be read as a call argument: scoped value consumed, "
+                                                            "not borrowed, at this position"])))
+                         reads)]
+    (into reads-errs (param-view-errors p scoped d summary))))
+
+;; S1 on the parameters of scoped type: a parameter that is owned or escapes would let a window be consumed.
+(defun param-view-errors :private (p: TypedProgram scoped: (Set i64) d: FunDef summary: (Vec (Pair bool bool))) -> (Vec OwnError)
+  (loop ((i 0) (out []))
+    (if (= i (count (. d params)))
+        out
+        (let [q (nth (. d params) i)
+              bad (and (not (. q amp)) (scoped-binding? p scoped (. q binding)) (< i (count summary))
+                       (or (. (nth summary i) fst) (. (nth summary i) snd)))]
+          (recur (+ i 1)
+                 (if bad
+                     (conj out (view-error (. d pos) (str-join ["scoped value consumed: owned parameter " (. q name)
+                                                                " of " (. d name) " is consumed or escapes"])))
+                     out))))))

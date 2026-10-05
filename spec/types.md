@@ -433,6 +433,13 @@ literal's form is reserved: no local variable named `simd` shadows it (spec/synt
 An integer literal against an `i8`/`i16`/`i32` *scalar* parameter is still the L26
 limit (so `(with-lane v 0 5)` on `i32x4` needs `5i32`).
 
+### 1.10 Scoped types (exclusive views)
+
+A type is **scoped** when the protocol `Scoped` of `fib.view` has an instance for it (`(impl Scoped (Win a) ..)`): the window types `Win`, `RoWin` and
+`WinPair` are. Scopedness extends to a cell or an array of a scoped type (`Scoped((Cell T)) = Scoped((Array T)) = Scoped(T)`); a type
+variable is not scoped. A value of scoped type is **borrowed, never consumed** (rule S1, §6.15). The draft marked the type with a
+`:scoped` flag on `defstruct`; the implemented marker is the instance, which needs no change to the type declarations. (**Decided**, with §6.15.)
+
 ## 2. Typing rules for the core forms and builtins
 
 Judgement: `Γ ⊢ e : T | C` — under an environment Γ (variables to types,
@@ -3156,6 +3163,59 @@ and a double release as a count going negative.
 | impl P for T is missing the method m (a method with no default) | §2.7, §4.1 |
 | x is private to m; it is not exported | syntax §5, §3.9 |
 | var: no definition named x | syntax §3.20 |
+| lent place must be a private cell: t is used as a value at L:C (or is captured by a closure, or is not a cell of this function) | §6.15 L1 |
+| t is lent to v and cannot be used here | §6.15 L2 |
+| lender call outside with-view: f; view-lend is only for with-view | §6.15 L3 |
+| scoped type T can only be constructed inside unsafe | §6.15 L6 |
+| view cell v can only be read as a call argument (: scoped value consumed, not borrowed, at this position) | §6.15 VC1, S1 |
+| view cell v cannot be assigned / cannot be captured by a closure / is passed in-out and used again in the same call | §6.15 VC3, VC2, VC4 |
+| await inside with-view | §6.15 L5 |
+| scoped value consumed: owned parameter p of f is consumed or escapes | §6.15 S1 |
+
+### 6.15 Exclusive views: lends, scoped values, view cells (Decided; stage 2 only)
+
+Implemented in `compiler/own/views.fib` (two passes: before inference with the `&` checks of §6.5, and after the ownership pass) and in
+`compiler/own/walk/call.fib` (one condition). The frozen Rust front end does not know `fib.view` and does not check any of it; cases
+are marked `;; stage: 2`. Rationale and soundness argument: `docs/design/exclusive-views.md`; decisions: `docs/design/decisions-2026-10-04.md`.
+
+A **lend** is a `let` binding `(v (cell (fib.view/view-lend (lender &t e..))))` made by the macro `with-view` (syntax §3.21), or the same with
+`view-lend-ro` (read-only), or with `view-sub` (a window of a pair made by another lend). `v` is a **view cell**. The **extent** is the body of
+that `let`. For a lend of `t`:
+
+- **L1, the lent place is private.** `t` is an `&` parameter of the enclosing `defun`, or a `let` cell initialised by `(cell e)`, every occurrence of `t` is
+  the place of `@`, `set!`, `&t` or `set-field!`, and no `fn` or `async` literal captures it (the conditions P1 of §6.3, `own.peek`). Else
+  `lent place must be a private cell: t is used as a value at L:C`, `.. is captured by a closure at L:C` or `.. is not a cell of this function`.
+- **L2, freeze.** `t` does not occur in the other operands of the lender call or in the extent, at any depth, closure literals included. Else
+  `t is lent to v and cannot be used here`, at the first mention. So a second lend of the same place inside the extent of the first is the same
+  error. For a **read-only** lend only *writes* are excluded: `@t` is allowed in the extent and a second read-only lend of `t` is allowed (many
+  readers while no writer exists); `&t`, `set!`, `set-field!` and a value use are errors, so a writable lend inside a read-only one is
+  `t is lent to r and cannot be used here`.
+- **L3, lenders under a lend.** A call of a lender (a `defun` with an `&` parameter whose declared result is scoped) outside the lender position of a marker is
+  `lender call outside with-view: f`; a marker anywhere else is `view-lend is only for with-view`. Inside `unsafe` neither applies (the library's obligation).
+- **L5, the extent never suspends and never tail-calls.** The extent is the initialiser of a `let`, so no call in it is a tail call and `recur` in it is
+  `recur not in tail position` (§6.10); `await` in it is `await inside with-view`.
+- **L6, constructors are unsafe.** A constructor of a scoped type outside `unsafe` is `scoped type T can only be constructed inside unsafe` (a window cannot be
+  forged from the fields of another).
+- **VC1, a view cell is never a value.** It occurs only as `&v` (an in-out argument) or `@v`, and `@v` must be a *peek* (§6.3 P1 to P3: a borrowed argument of a
+  call that is not a tail call, with no sibling operand mentioning `v`) **at a position that does not escape**: for these cells the walker takes a peek
+  only where the callee does not retain the argument (`strict`, `own.walk.state`). A `@v` that is not such a peek is
+  `view cell v can only be read as a call argument: scoped value consumed, not borrowed, at this position`; a view cell used as a value is
+  `view cell v can only be read as a call argument`. The same holds for an `&` parameter of scoped type.
+- **VC2** no `fn` or `async` literal mentions `v`: `view cell v cannot be captured by a closure` (decision 2: no closures over views in v1).
+- **VC3** `(set! v ..)` is `view cell v cannot be assigned`.
+- **VC4** in a call with `&v` no other operand mentions `v`: `view cell v is passed in-out and used again in the same call`. (`vset!` and `fill!`
+  bind their index and value first, so `(vset! v i (+ (vget v i) 1))` is one legal write.)
+- **S1, a scoped value is borrowed, never consumed.** Every read of a view cell is a non-escaping peek (VC1); a parameter of scoped type that is owned or
+  escapes (the summary of §6.4) is `scoped value consumed: owned parameter p of f is consumed or escapes`. So a window is not returned, stored, captured
+  by a heap closure or passed to an owned position. The library `fib.view` is exempt from VC1 and S1, as `unsafe` code is.
+
+**The lender's contract** (an obligation of the library, tested by cases): a lender takes the lent array through its `&` parameter, makes it unique **once**
+(a shared array is copied at the lend, an unshared one is not), returns windows holding the address and the length and no count, every access is checked
+against the window's own length, windows of one lend are disjoint, and the owner is not resized during the extent (L2).
+
+**Not implemented, and therefore not claimed:** parallel disjoint windows over tasks and `Send` for windows (no task receives a window); windows over
+`Tensor` storage in the library proper (`lib/fib/tensor/window-demo.fib` shows one); a window of a window; a window as a scalar-class value in registers
+(a window is a heap or stack struct of `(base, len, seed)`); `dyn` and `weak` of a window as S1 positions of their own.
 
 ---
 
