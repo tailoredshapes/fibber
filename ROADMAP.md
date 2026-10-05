@@ -369,7 +369,7 @@ from main; the code stays in git (tag `seed-1`) and docs/rust-legacy.md says how
 lost. The runtime source `crates/fibc/rt/*.lir` is data that stage 2 consumes, and moved to `rt/`. The compare scripts became golden
 outputs recorded once from the Rust oracles (`compiler/tests/golden/`: 16 suites, 4873 inputs on which stage 2 and the Rust agreed
 byte for byte, 392 left out where they differed; `emit/resume.golden`; reference outputs of the Rust audit and language server for
-the ports); `scripts/gate.sh --full` runs them. Judged by: the full gate with no cargo on `PATH` and no `crates/` (PASS), and
+the ports); `scripts/gate.sh --full` runs them. Judged by: the full gate with no cargo on `PATH` and no `crates/` (PASS, 492 s), and
 `scripts/package.sh` building the tarball (no `bin/fibref`). **Lost:** the independent oracle (the goldens are stage 2's own after
 the next intended change), the interpreter and memory audit (method rules 1, 2, 6 have no executable form until the port), the
 generator (rule 5), the `covers:` header check, the Rust language server (the editor pack is grammar and snippets). **Scheduled, not

@@ -117,9 +117,12 @@ Measured 2026-10-05 on the 28-core machine (other agents' jobs running), `ulimit
 | all of the above in one target directory | | 7.1 GB |
 | `cargo test -p fibc` (the rule-6 harness, interpreted and compiled) | not measured; the CI limit was 45 min | |
 
-The full gate never ran cargo: stage 2 is built by the seed in `SEED`. Full gate, the same tree before and after (no cargo on `PATH`,
-no `crates/`, fresh scratch, `-j 8`): 857 s of its own time (build 73 s, fixed point 82 s, golden 482 s in this first version,
-cases 221 s); the golden step was then run in parallel and takes about a minute with the tools built. What the Rust cost was in
+The full gate never ran cargo: stage 2 is built by the seed in `SEED`, so the gate's own time did not change except for the golden
+step this change adds. Full gate on the committed tree with no cargo on `PATH`, no `crates/`, a fresh scratch and `-j 8`: PASS in
+492 s of its own time (build 66 s, fixed point 80 s, golden 124 s with the 7 tools built in parallel and 16 suites, cases 222 s:
+ownership 354 pass, modules 27 pass, stdlib 1229 pass, 21 open, 1 expected failure, case 1707); 883 s of wall time with the wait
+for `/tmp/fibsuite.lock`. `scripts/package.sh` with the seed and static LLVM: 291 s, the tarball holds `bin/fibc`, `share/fibber/lib`,
+`LICENSE`, `README.txt` and no `bin/fibref`; the unpacked `fibc run hello.fib` works with `env -i`. What the Rust cost was in
 the CI jobs that built it (the `lair` job links LLVM statically through `llvm-sys`; limits of 90 and 45 minutes), in a target
 directory per worktree, and in every agent that had to keep a Rust build current for the compare scripts.
 Checkout: 7371 files, 18.4 MB of tracked files before; 6673 files, 16.7 MB after (the Rust: 699 files, 4.7 MB; the goldens add 2.9 MB).
