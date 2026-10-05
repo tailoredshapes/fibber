@@ -1,0 +1,79 @@
+;; spec: lib/fib/tensor/README.md (Arithmetic and reductions): map-as, zip-with, copy, to-array, to-vec and mean-axis read a dense tensor from its buffer and any other layout row by row
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; Expected values come from t/at, one index tuple at a time (a path the walks do not use), over views with every kind of
+;; layout: transposed, flipped, stepped, offset, broadcast, permuted, singleton axes, scalar, empty.
+(ns main (:require [fib.tensor :as t]) (:use tl.check))
+
+(defun gen (n: i64) -> (t/Tensor f64)
+  (let ((buf (cell (array n 0.0))))
+    (do (dotimes (i n) (array-set! &buf i (fdiv (double (- (rem (* i 37) 101) 50)) 7.0)))
+        (t/from-array [n] @buf 0.0))))
+
+(defun mat (m: i64 n: i64) -> (t/Tensor f64) (t/reshape [m n] (gen (* m n))))
+
+;; row-major logical values by indexed reads
+(defun expected (x: (t/Tensor f64)) -> (Vec f64)
+  (let ((dims (t/shape x)) (r (count dims)) (n (loop ((i 0) (p 1)) (if (< i r) (recur (+ i 1) (* p (nth dims i))) p))))
+    (loop ((k 0) (out (vec-empty)))
+      (if (< k n)
+          (let ((idx (loop ((a (- r 1)) (left k) (acc (vec-empty)))
+                       (if (>= a 0)
+                           (recur (- a 1) (quot left (nth dims a)) (cons-front (rem left (nth dims a)) acc))
+                           acc))))
+            (recur (+ k 1) (conj out (t/at x idx))))
+          out))))
+
+(defun cons-front (x: i64 v: (Vec i64)) -> (Vec i64) (into [x] v))
+
+(defun arr->vec (a: (Array f64)) -> (Vec f64)
+  (loop ((i 0) (out (vec-empty))) (if (< i (array-len a)) (recur (+ i 1) (conj out (array-get a i))) out)))
+
+;; the same logical tensor with other strides: transposed twice through a copy of the transpose
+(defun restrided (x: (t/Tensor f64)) -> (t/Tensor f64)
+  (if (< (t/rank x) 2) x (t/transpose (t/copy (t/transpose x)))))
+
+(defun views () -> (Vec (t/Tensor f64))
+  (let ((a (mat 5 7)) (c (t/reshape [3 4 5] (gen 60))))
+    [a (t/transpose a) (t/flip 0 a) (t/flip 1 a) (t/flip 1 (t/flip 0 a)) (t/slice 1 1 7 2 a) (t/slice 0 1 4 1 (t/transpose a))
+     (t/slice 1 2 6 1 (t/slice 0 1 5 2 a)) (t/broadcast-to [3 5 7] (t/slice 0 2 3 1 a)) (t/broadcast-to [6 7] (t/slice 0 0 1 1 a))
+     (t/permute [2 0 1] c) (t/permute [1 2 0] c) (t/flip 2 (t/permute [2 1 0] c)) (t/reshape [1 7] (t/slice 0 0 1 1 a))
+     (t/transpose (t/reshape [1 7] (t/slice 0 0 1 1 a))) (t/full [] 3.5) (t/slice 0 2 4 1 a) (t/slice 0 4 5 1 a) (t/slice 0 2 2 1 a) (mat 0 3) (mat 4 1) (mat 1 1)]))
+
+(defun check-view (c: Checks x: (t/Tensor f64)) -> unit
+  (let ((e (expected x)) (y (restrided x)))
+    (do (check c (= (t/to-vec x) e))
+        (check c (= (t/to-vec (t/copy x)) e))
+        (check c (= (arr->vec (t/to-array x)) e))
+        (check c (= (t/shape (t/copy x)) (t/shape x)))
+        (check c (= (t/to-vec (t/map-as (fn (v: f64) (+ (* 2.0 v) 1.0)) 0.0 x)) (mapv (fn (v: f64) (+ (* 2.0 v) 1.0)) e)))
+        (check c (= (t/shape (t/map (fn (v: f64) v) x)) (t/shape x)))
+        (check c (= (t/to-vec (t/zip-with (fn (p: f64 q: f64) (- (* p 3.0) q)) 0.0 x y))
+                    (mapv (fn (v: f64) (- (* v 3.0) v)) e)))
+        (check c (= (t/to-vec (t/zip-with (fn (p: f64 q: f64) (- p q)) 0.0 y x)) (mapv (fn (v: f64) (- v v)) e))))))
+
+;; mean-axis of a matrix view: the ordered sum of each slice over the extent
+(defun check-mean (c: Checks x: (t/Tensor f64)) -> unit
+  (let ((e (expected x)) (m (nth (t/shape x) 0)) (n (nth (t/shape x) 1)))
+    (do (check c (= (t/to-vec (t/mean-axis -1 false x))
+                    (mapv (fn (i: i64) (fdiv (loop ((j 0) (s 0.0)) (if (< j n) (recur (+ j 1) (+ s (nth e (+ (* i n) j)))) s)) (double n)))
+                         (range m))))
+        (check c (= (t/to-vec (t/mean-axis 0 false x))
+                    (mapv (fn (j: i64) (fdiv (loop ((i 0) (s 0.0)) (if (< i m) (recur (+ i 1) (+ s (nth e (+ (* i n) j)))) s)) (double m)))
+                         (range n)))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (vs (views)))
+    (do (dotimes (i (count vs)) (check-view c (nth vs i)))
+        (let ((a (mat 5 7)))
+          (do (check-mean c a) (check-mean c (t/transpose a)) (check-mean c (t/flip 0 a)) (check-mean c (t/slice 1 1 7 2 a))))
+        ;; i64 elements take the same walks
+        (let ((q (t/transpose (t/reshape [3 4] (t/arange 0 12 1)))))
+          (do (check c (= (t/to-vec q) [0 4 8 1 5 9 2 6 10 3 7 11]))
+              (check c (= (t/to-vec (t/copy q)) [0 4 8 1 5 9 2 6 10 3 7 11]))
+              (check c (= (t/to-vec (t/map-as (fn (v: i64) (* v 2)) 0 q)) [0 8 16 2 10 18 4 12 20 6 14 22]))))
+        (check c (= (checks-made c) 187))
+        (checks-result c))))

@@ -1,6 +1,6 @@
 ;; Public low-level descriptor with checked constructors and scalar access.
 ;; Raw numerical kernels must validate every input before deriving pointers.
-(ns fib.tensor.storage (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.memory))
+(ns fib.tensor.storage (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.memory fib.tensor.plan))
 
 ;; A scalar witness supplies dtype and identities even for zero-element buffers.
 (defprotocol Element
@@ -67,15 +67,31 @@
 (defun tensor-i64 (values: (Vec i64)) -> (Tensor i64) (from-vec [(count values)] values 0))
 
 (defun to-vec (x: (Tensor t)) -> (Vec t)
-  (loop ((i 0) (out (vec-empty)))
-    (if (< i (size x)) (recur (+ i 1) (conj out (flat-at x i))) out)))
+  (let ((src (. x buffer)) (off (array-get (. x meta) 0)) (n (size x)))
+    (if (contiguous? x)
+        (loop ((i 0) (out (vec-empty)))
+          (if (< i n) (recur (+ i 1) (conj out (array-get src (+ off i)))) out))
+        (let ((plan (traversal (shape x) (strides x) (strides x))) (inner (inner-length plan)) (step (left-step plan)))
+          (loop ((r 0) (out (vec-empty)))
+            (if (< r (rows plan))
+                (let ((base (+ off (row-offset plan (. plan left) r))))
+                  (recur (+ r 1) (loop ((i 0) (o out))
+                                   (if (< i inner) (recur (+ i 1) (conj o (array-get src (+ base (* i step))))) o))))
+                out))))))
 
-;; Copy materializes logical elements only, not an entire parent buffer.
+;; Copy materializes logical elements only, not an entire parent buffer. A dense source is read straight from its buffer;
+;; any other layout is walked row by row (outer coordinates decoded once per row, constant stride inside it).
 (defun copy (x: (Tensor t)) :where ((Element t)) -> (Tensor t)
   (if (= (size x) 0)
       (from-array (shape x) (array 0 (. x seed)) (. x seed))
-      (let ((buf (cell (array (checked-size (shape x) (. x seed)) (flat-at x 0)))))
-        (do (dotimes (i (size x)) (array-set! &buf i (flat-at x i)))
+      (let ((n (size x)) (src (. x buffer)) (off (array-get (. x meta) 0))
+            (buf (cell (array (checked-size (shape x) (. x seed)) (array-get (. x buffer) (array-get (. x meta) 0))))))
+        (do (if (contiguous? x)
+                (dotimes (i n) (array-set! &buf i (array-get src (+ off i))))
+                (let ((plan (traversal (shape x) (strides x) (strides x))) (inner (inner-length plan)) (step (left-step plan)))
+                  (dotimes (r (rows plan))
+                    (let ((base (+ off (row-offset plan (. plan left) r))) (out (* r inner)))
+                      (dotimes (i inner) (array-set! &buf (+ out i) (array-get src (+ base (* i step)))))))))
             (from-array (shape x) @buf (. x seed))))))
 
 (defun contiguous (x: (Tensor t)) :where ((Element t)) -> (Tensor t)

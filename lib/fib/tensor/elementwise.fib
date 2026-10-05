@@ -1,12 +1,21 @@
 ;; Eager, checked scalar kernels. Broadcasting is planned once per operation.
 (ns fib.tensor.elementwise
-  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.views fib.tensor.kernels))
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.views fib.tensor.kernels fib.tensor.plan))
 
 ;; Explicit output seed supports dtype-changing maps and empty results without calling f.
+;; A dense input is read straight from its buffer (logical element i is buffer element offset+i); any other layout is walked
+;; row by row, the outer coordinates decoded once per row and the inner loop advancing by a constant stride (the plan of
+;; fib.tensor.plan, as the arithmetic kernels do). Reads stay bounds-checked; callbacks run once per element in row-major order.
 (defun map-as (f: (fn (a) b) :borrow seed: b x: (Tensor a)) :where ((Element b)) -> (Tensor b)
-  (let ((n (checked-size (shape x) seed)) (buf (cell (array n seed))))
-    (do (dotimes (i n) (array-set! &buf i (f (flat-at x i))))
-        (from-array (shape x) @buf seed))))
+  (let ((dims (shape x)) (n (checked-size (shape x) seed)) (buf (cell (array n seed)))
+        (src (. x buffer)) (off (array-get (. x meta) 0)))
+    (do (if (contiguous? x)
+            (dotimes (i n) (array-set! &buf i (f (array-get src (+ off i)))))
+            (let ((plan (traversal dims (strides x) (strides x))) (inner (inner-length plan)) (step (left-step plan)))
+              (dotimes (r (rows plan))
+                (let ((base (+ off (row-offset plan (. plan left) r))) (out (* r inner)))
+                  (dotimes (i inner) (array-set! &buf (+ out i) (f (array-get src (+ base (* i step))))))))))
+        (from-array dims @buf seed))))
 
 (defun map (f: (fn (t) t) :borrow x: (Tensor t)) :where ((Element t)) -> (Tensor t)
   (map-as f (. x seed) x))
@@ -15,8 +24,18 @@
   :where ((Element a) (Element b) (Element c)) -> (Tensor c)
   (let ((dims (broadcast-shape (shape a) (shape b)))
         (left (broadcast-to dims a)) (right (broadcast-to dims b))
-        (n (checked-size dims seed)) (buf (cell (array n seed))))
-    (do (dotimes (i n) (array-set! &buf i (f (flat-at left i) (flat-at right i))))
+        (n (checked-size dims seed)) (buf (cell (array n seed)))
+        (as (. left buffer)) (bs (. right buffer))
+        (ao (array-get (. left meta) 0)) (bo (array-get (. right meta) 0)))
+    (do (if (and (contiguous? left) (contiguous? right))
+            (dotimes (i n) (array-set! &buf i (f (array-get as (+ ao i)) (array-get bs (+ bo i)))))
+            (let ((plan (traversal dims (strides left) (strides right))) (inner (inner-length plan))
+                  (lstep (left-step plan)) (rstep (right-step plan)))
+              (dotimes (r (rows plan))
+                (let ((abase (+ ao (row-offset plan (. plan left) r))) (bbase (+ bo (row-offset plan (. plan right) r)))
+                      (out (* r inner)))
+                  (dotimes (i inner)
+                    (array-set! &buf (+ out i) (f (array-get as (+ abase (* i lstep))) (array-get bs (+ bbase (* i rstep))))))))))
         (from-array dims @buf seed))))
 
 (defun add (a: (Tensor t) b: (Tensor t)) :where ((Element t) (Num t) (Arithmetic t)) -> (Tensor t)

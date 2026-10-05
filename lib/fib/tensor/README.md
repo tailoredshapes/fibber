@@ -124,6 +124,11 @@ one numeric dtype. It does not introduce FMA or fuse arbitrary callbacks:
 once per logical output element, in row-major order, and never run on an
 empty output. They may have effects. These kernels are not fused and arbitrary
 callbacks are not automatically SIMD-vectorized.
+`map-as`, `zip-with`, `copy`, `to-array`, `to-vec` and `mean-axis` read a dense
+tensor straight from its buffer (logical element `i` is buffer element
+`offset + i`) and any other layout row by row: outer coordinates are decoded
+once per row and the inner loop advances by a constant stride. Reads stay
+bounds-checked, so a forged descriptor still traps at the first bad read.
 
 `sum`, `prod`, and `fold f initial tensor` are ordered scalar reductions in
 logical row-major order. Empty sums/products return typed zero/one.
