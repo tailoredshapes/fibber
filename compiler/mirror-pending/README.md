@@ -1,6 +1,6 @@
 # Mirror pending (retired)
 
-The mirror rule is retired (ROADMAP M6, 2026-10-03): Rust is frozen as the seed (tag `seed-1`) and new work starts in
+The mirror rule is retired (ROADMAP M6, 2026-10-03): Rust was frozen as the seed (tag `seed-1`) and removed from main on 2026-10-05 (docs/rust-legacy.md); new work starts in
 `compiler/`. What is left here is backlog, not a queue of ports:
 
 - `H1-gaps.md`: cases the fibber case harness fails today, with the reason each fails.

@@ -79,13 +79,13 @@ The shim is lIR compiled by LLVM for the target, so it follows the target's conv
 integer arguments, or a call to a *variadic* C function through the shim (it declares none).
 The mailbox lays out a `pthread_mutex_t` as 5 words and a `pthread_cond_t` as 6 (`support.fib:68`, offsets 32-43, glibc x86-64 sizes 40 and 48). Darwin's are 64 and 48 bytes
 (`_opaque[56]` plus a signature word; `__sig` + `_opaque[40]`), so the mutex would overflow into the first condition variable. This is analysis from the header sizes, not a measured fault (the macro cases pass natively); A64-4 should enlarge the record and re-run them.
-The runtime's own mutex (`crates/fibc/rt/task.lir:26-34`) allocates 64 bytes each: large enough for Darwin.
+The runtime's own mutex (`rt/task.lir:26-34`) allocates 64 bytes each: large enough for Darwin.
 
 ### 2.5 `extern`, varargs
 
 Externs lower to LLVM declarations with a variadic function type when `:varargs` (`native/lower/types.fib:39`, `emit/program.fib:144`); the call
 instruction uses that function type (`native/lower/calls.fib:50`), so LLVM applies the Darwin rule (variadic arguments on the stack) at every call site.
-Uses: `fcntl` (`lib/platform/darwin/fib/os/backend.fib:11`), `openat` with a mode (`crates/fibc/rt/sys.lir:7`, `declare openat i32 (i32 ptr i32 ...)`),
+Uses: `fcntl` (`lib/platform/darwin/fib/os/backend.fib:11`), `openat` with a mode (`rt/sys.lir:7`, `declare openat i32 (i32 ptr i32 ...)`),
 `printf`-style externs written by users. **Ran on the Mac**: the `openat` path (every `read-file`, `write-file`) and the Darwin `fcntl` (pipes, sockets: 7402 and 7404
 time out, 7.3, so the `fcntl` path itself is *not* yet shown to work). The rule for authors: a C function that is variadic must be declared `:varargs`
 or the call is wrong on Apple arm64 and right on Linux x86-64 and aarch64: the opposite of how it fails on x86, where a missing `...` is only a missing `%al`.

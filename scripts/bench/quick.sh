@@ -35,7 +35,6 @@ names=${*:-$QUICK}
 
 if [ -n "${BENCH_FIBC:-}" ]; then fibc=$BENCH_FIBC; used="$BENCH_FIBC"; pick_builder >/dev/null 2>&1 || true
 else stage2_ensure || exit 2; fibc=$GATE_OUT/F; used="stage 2 of tree $(tree_stamp)"; fi
-export LD_LIBRARY_PATH=${LAIR_DIR:-${LD_LIBRARY_PATH:-}}
 work=$GATE_OUT/bench; mkdir -p "$work"
 median() { sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}'; }
 

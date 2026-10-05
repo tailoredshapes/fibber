@@ -7,7 +7,7 @@
 #   sha256.PLATFORM=...   64 hex digits
 # The unqualified `url=` and `sha256=` lines are linux-x86_64's (the original format; they are read when `url.linux-x86_64=` is absent). The platform
 # is this machine's, or FIB_PLATFORM. A platform with no row is an error that says so: nothing is guessed. A seed is the tarball of an earlier
-# release: the Rust tools (v0.0.x, scripts/package-rust.sh) or a stage 2 (scripts/package.sh); both have bin/fibc.
+# release: the Rust tools (v0.0.x, scripts/package-rust.sh) or a stage 2 (scripts/package.sh); both have bin/fibc. (The Rust tools of v0.0.x had scripts/package-rust.sh; it went with the Rust, docs/rust-legacy.md.)
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 dir=${1:?usage: fetch-seed.sh DIR [SEEDFILE]}

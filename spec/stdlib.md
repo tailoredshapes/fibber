@@ -758,7 +758,7 @@ route the evidence supports, and C7 is the route that keeps the enum.
 spec/types.md §2.13.1 has the primitives.
 
 1. **In place means: the value has one holder at the moment of the update, and the update takes that holder's
-   reference.** The test is made at run time, by `fib.unique?` (`crates/fibc/rt/core.lir`): none of the flags `SHARED`,
+   reference.** The test is made at run time, by `fib.unique?` (`rt/core.lir`): none of the flags `SHARED`,
    `IMMORTAL`, `STACK`, `HAS-WEAK`, and count exactly 1. If it fails, the primitive copies, stores the copy into the
    place and releases the old value; the old value is not written. So a value that anyone else holds is never mutated,
    whatever the program does, and a wrong guess by the compiler about uniqueness can only cost a copy.
@@ -865,7 +865,7 @@ Clojure's. A refutable pattern in a binding position is an explicit trap, as `nt
   less, then element by element** (`(sort [[1 2 3] [9 9] [1 2]])` is `[[1 2] [9 9] [1 2 3]]`, A11 t1r); `Ord (List a)`
   is lexicographic (Clojure's lists are not comparable, so Rust's order).
 * **`Ord str` is code-point order** (**Decided**, owner-invited, 2026-10-01, the owner may overrule; §5 D5, §9.1): the order of the
-  UTF-8 bytes, which is the builtin instance (`memcmp` in `crates/fibc/rt/str.lir`, `fibref`'s own compare) and the lexicographic
+  UTF-8 bytes, which is the builtin instance (`memcmp` in `rt/str.lir`, `fibref`'s own compare) and the lexicographic
   order of the string's own `char`s, a `char` being a Unicode scalar (types §1.1, **Decided**): with `a` the one-character string
   U+FFFF and `b` the string U+1F600, `(< a b)` and `(< (i32->char 65535i32) (i32->char 128512i32))` are both true and `(< b a)` false
   ([R] A13 ordstr, `true true false true` under both tools), where Clojure, comparing UTF-16 units, puts the surrogate pair first
@@ -2191,7 +2191,7 @@ The predicates that Clojure asks of a run-time tag (`string?`, `vector?`, `seq?`
 ### 4.19 `fib.unix`: the sys primitives (package S5)
 
 The groundwork of an io library written in fibber: unix file descriptors, small enough that the interpreter
-(`crates/fibref/src/eval/sys.rs`, through the `libc` crate) and the compiled runtime (`crates/fibc/rt/sys.lir`,
+(`crates/fibref/src/eval/sys.rs`, through the `libc` crate) and the compiled runtime (`rt/sys.lir`,
 through the C library) give the same answers, so a library built on them is judged by both tools (method rule 6;
 `extern` is refused by the interpreter and cannot be). The module is `lib/fib/unix.fib`, not `fib.sys`, which §4.16
 keeps for the Java names of tranche 4. The case block is 3600 to 3649.
@@ -2675,7 +2675,7 @@ programs that justify each item.
 | C9 | **a runtime mutex** `(Mutex a)` that owns its value, the identity-keyed reentrant monitor table that `locking` needs (an entry made on the first lock and dropped when the last holder leaves), and a run-once `LSeq`/`Delay` that crosses tasks | two tasks writing one `Cell` is rejected, `cell cannot be shared between threads` ([R] A11 t41); the `Cell` memo cannot cross (e8d), the `Atom` memo can but may run a thunk twice under a race (e8e) | medium | `locking` (T5); the run-once cell for a global `LSeq` or `Delay` (§5 M1), recommended for T3 (§9.2 Q41) |
 | C10 | **an ASCII flag in the `str` header**, computed in the UTF-8 validation pass that already scans every constructed `str`: `count`, `nth`, `subs` and `index-of` by character offset are O(1) for ASCII text and a byte walk otherwise; a layout change in both tools **[sketch]** | validation happens at construction: `str-from-bytes: invalid UTF-8`, `str-slice [0, 1) splits a character` ([R] A11 t13, t12); a user `Reducible char` over `str` gives the semantics today (e3a, e3b) at O(n) | medium | the cost of Clojure's string unit (§9.1 Q37) |
 | C11 | **a per-task binding slot** in the task header, copied into a spawned task's header from a `Send` capture | none: depends on L29 | medium | `binding`, `*out*` (T5) |
-| C12 | **the text of a float is Clojure's** (`Double.toString`: positional for `1e-3 <= \|x\| < 1e7` with at least one digit after the point, otherwise `d.dddE<exp>` with no plus sign, the shortest digits that read back, `NaN`, `Infinity`, `-Infinity`, `-0.0`; **Decided**, owner, 2026-10-01, §2.7) in both tools: `float_text` in `crates/fibref/src/eval/arith.rs` and `fib.show-fp` in `crates/fibc/rt/str.lir`; the reader dump prints floats through `show` (the `flt` line of spec/bootstrap.md §2), so the dump and the reader tests that pin float dumps change with it; cases 169, 178 and 187 pin the old texts; the printer's Rust `{:?}` layout is its own and stays | `(show 1e21)` is `1000000000000000000000.0`, `(show 1e7)` `10000000.0`, `(show (/ 1.0 0.0))` `inf` ([R] A13 fl); a library function over `show` gives the fifteen Clojure texts ([R] A13 fltfmt), which is the specification both runtimes implement | small | T0: the text of a float is observable by everything (§5 S18) |
+| C12 | **the text of a float is Clojure's** (`Double.toString`: positional for `1e-3 <= \|x\| < 1e7` with at least one digit after the point, otherwise `d.dddE<exp>` with no plus sign, the shortest digits that read back, `NaN`, `Infinity`, `-Infinity`, `-0.0`; **Decided**, owner, 2026-10-01, §2.7) in both tools: `float_text` in `crates/fibref/src/eval/arith.rs` and `fib.show-fp` in `rt/str.lir`; the reader dump prints floats through `show` (the `flt` line of spec/bootstrap.md §2), so the dump and the reader tests that pin float dumps change with it; cases 169, 178 and 187 pin the old texts; the printer's Rust `{:?}` layout is its own and stays | `(show 1e21)` is `1000000000000000000000.0`, `(show 1e7)` `10000000.0`, `(show (/ 1.0 0.0))` `inf` ([R] A13 fl); a library function over `show` gives the fifteen Clojure texts ([R] A13 fltfmt), which is the specification both runtimes implement | small | T0: the text of a float is observable by everything (§5 S18) |
 
 An alternative to C1 that was proposed, specialising a callee on a literal closure passed to a
 non-escaping `:borrow` parameter, makes the visitors of `each-while` direct but not a closure stored
@@ -2703,7 +2703,7 @@ of 2026-10-01 are first (§9.1).
 | Q42 (**Decided**, owner-invited) | strings order by code point: the builtin instance stays; types §2.12 may say so in words | types §2.12 (`Ord` for `str`): no change of behaviour |
 | L2, E14 | `& xs` as the rest marker; Clojure's reader (`~x`, the comma as whitespace, `#'x`, `^T`, ...) | syntax §1.1, §1.2; spec/bootstrap.md §2 (the dump); the 218 pinned reader tests |
 | Q34 (**Decided**) | sequence functions return memoised lazy seqs; the fusion rewrite E16 is an expander pass; no other chapter changes (`LSeq` is a library type), and ROADMAP M7 may note that the zero-cost path is an optimisation | ROADMAP M7 (a note) |
-| C12, Q43 (**Decided**) | the text of a float is Clojure's `Double.toString`: amends "written positionally (never with an exponent, however large or small) ... `NaN`, `inf` and `-inf`" (Decided, owner, 2026-09-30) | types §2.12 (`show` of a float); `crates/fibref/src/eval/arith.rs` (`float_text`); `crates/fibc/rt/str.lir` (`fib.show-fp`); cases 169, 178, 187; spec/bootstrap.md §2 (the `flt` dump line) and the reader tests that pin float dumps |
+| C12, Q43 (**Decided**) | the text of a float is Clojure's `Double.toString`: amends "written positionally (never with an exponent, however large or small) ... `NaN`, `inf` and `-inf`" (Decided, owner, 2026-09-30) | types §2.12 (`show` of a float); `crates/fibref/src/eval/arith.rs` (`float_text`); `rt/str.lir` (`fib.show-fp`); cases 169, 178, 187; spec/bootstrap.md §2 (the `flt` dump line) and the reader tests that pin float dumps |
 | C1 (the erasure rule), L21, L24 (a), L25 | each coerces where types §1.7 says a `(dyn P)` "is produced only by the explicit primitive `(dyn P e)` (**Decided**, D3: no subtyping, no coercion anywhere in the type system)": two arms unified at `(dyn (Reducible e))`, two closure types at `(fn (A) R)`, a value wrapped by `to-val`, a collection eta-expanded to a function; the owner signs each, and the T-rows of §5 stand until then (§1.1) | types §1.7, §1.1 (D3) |
 | C1 | a closure gets a nominal type whose captures are fields, where types §1.4 says "Closure types carry no capture list, no escape summary and no count kinds (**Decided**)"; the owner signs | types §1.4, §6.4 |
 

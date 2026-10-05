@@ -2,7 +2,7 @@
 # `cases` of the compiler in fibber (compiler/driver/harness.fib) judged on planted faults: each check copies a real case into a scratch
 # directory, breaks one verdict of its header (or its program), and requires the harness to say so (a test that cannot fail is worse than
 # none), after requiring the unbroken copy to pass. Also the refusals: a bad header, a prefix no case starts with, a directory with no case.
-# usage: cases-check.sh STAGE2   Run from the repository root with LD_LIBRARY_PATH holding liblair.so in the environment.
+# usage: cases-check.sh STAGE2   Run from the repository root.
 # Prints `ok NAME` or `FAIL NAME`; exit status 0 only if none failed.
 s2=$1; fail=0
 t=$(mktemp -d "$HOME/.cache/fibber-scratch/cases-check.XXXXXX"); trap 'rm -rf "$t"' EXIT

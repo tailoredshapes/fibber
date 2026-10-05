@@ -11,7 +11,7 @@ Nothing on this page counts as done until an executable test says so
 
 ## State of play (2026-10-05)
 
-Stage 2, the compiler in fibber, is the compiler; the Rust tools are frozen as the seed and legacy oracles. `scripts/gate.sh --full` is the
+Stage 2, the compiler in fibber, is the compiler; the Rust tools were retired on 2026-10-05 (stage 10, below; docs/rust-legacy.md). `scripts/gate.sh --full` is the
 judge of main, and every merge since 2026-10-04 passed it (fixed point, 354 ownership and 27 module cases, the stdlib suite with only the
 recorded expected failure, case 1707). Streams since the bootstrap:
 
@@ -31,7 +31,7 @@ recorded expected failure, case 1707). Streams since the bootstrap:
 
 **Open work, in the order I would take it:** reverse-mode autodiff on `fib.tensor` (design not written); the darwin-arm64 release; the
 remaining dev-loop packages (DV2 to DV10); the shootout gaps; last-axis reductions in `fib.tensor`; the port of meshql to fibber (deferred by
-the owner); `scripts/package.sh` and CI do not yet run the `muladd.sh` check; the Rust retirement (stage 10).
+the owner); `scripts/package.sh` and CI do not yet run the `muladd.sh` check; the ports the Rust retirement scheduled (`fibref`'s interpreter and memory audit, `fibgen`, `fibc lsp`: docs/rust-legacy.md, Follow-ups).
 
 ## M1. Specification — done
 
@@ -156,7 +156,7 @@ State (spec/compiler.md, **Decided**, owner, 2026-09-30; `crates/fibc`):
 - [x] `fibc` reuses `fibref`'s front end and lowers the plan to lIR
       text that `crates/lir` re-reads and re-checks (`tests/emit.rs`,
       no LLVM needed); `lair` compiles it (`fibc run`, `fibc build`)
-- [x] the runtime `fib.rt` as lIR source (`crates/fibc/rt`): header,
+- [x] the runtime `fib.rt` as lIR source (`rt`): header,
       counts, drop, unique test, traps, stack objects, strings, arrays,
       the prelude's `Vec`, atoms and share marking, weak references,
       threads, tasks; and a trace mode for the free trace of
@@ -360,8 +360,22 @@ fibber (owner, 2026-10-01). Lair in fibber (docs/design/lair-in-fibber.md,
 compiler's users of lair call `native.api` and `native.call`, a stage 2
 links LLVM itself (shared for development, static for the release) and
 has no `liblair.so`; the Rust `crates/lair`, `crates/lir`, `liblair.so`
-and the Rust `fibc` remain as oracles until stage 10, when this line and
-the interface go.
+and the Rust `fibc` remained as oracles until stage 10, when this line and
+the interface went (below).
+
+**Stage 10, retire the Rust: done 2026-10-05 (package RR1).** `crates/` (fibref, fibgen, fibmut, fibc, lair, lir), `Cargo.toml`,
+`Cargo.lock`, the Rust CI jobs (`rust-seed`, `lairf`; GitHub's `fibref`, `lair`, `lairf`) and the scripts that needed them are removed
+from main; the code stays in git (tag `seed-1`) and docs/rust-legacy.md says how to build it again, what each tool gave and what was
+lost. The runtime source `crates/fibc/rt/*.lir` is data that stage 2 consumes, and moved to `rt/`. The compare scripts became golden
+outputs recorded once from the Rust oracles (`compiler/tests/golden/`: 16 suites, 4873 inputs on which stage 2 and the Rust agreed
+byte for byte, 392 left out where they differed; `emit/resume.golden`; reference outputs of the Rust audit and language server for
+the ports); `scripts/gate.sh --full` runs them. Judged by: the full gate with no cargo on `PATH` and no `crates/` (PASS, 492 s), and
+`scripts/package.sh` building the tarball (no `bin/fibref`). **Lost:** the independent oracle (the goldens are stage 2's own after
+the next intended change), the interpreter and memory audit (method rules 1, 2, 6 have no executable form until the port), the
+generator (rule 5), the `covers:` header check, the Rust language server (the editor pack is grammar and snippets). **Scheduled, not
+dropped:** the ports of `fibref`'s interpreter and audit and of `fibgen`, and `fibc lsp`. Cost of the Rust, measured on the 28-core
+machine: `cargo build --workspace` 14 s cold, test binaries 28 s (lair and fibc 44 s), `cargo test -p lair` 24 s, a target directory
+of 1.7 GB (build) to 7.1 GB (all test binaries) in every worktree that built; the gate itself never called cargo.
 
 ## M7. A standard library as ergonomic as Clojure's, as fast as Rust's
 

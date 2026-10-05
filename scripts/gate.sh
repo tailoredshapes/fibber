@@ -4,12 +4,13 @@
 # it), prints a timing line for each stage and ends with PASS or FAIL (exit 0 or 1; 2 for a usage or setup error).
 #   scripts/gate.sh [--quick|--full] [-j N]
 #   --quick (default)  stage 2, ownership, modules and a deterministic sample of about 100 stdlib cases (every expected failure among them)
-#   --full             stage 2 built by the seed, the fixed point (F builds F3, both emit the same lIR), and all three directories in full
+#   --full             stage 2 built by the seed, the fixed point (F builds F3, both emit the same lIR), the golden checks of the passes
+#                      (compiler/tests/golden/golden.sh), and all three directories in full
 #   -j N               cases run at a time (default 12; the machine has 28 cores and 61 GB, and no more than about 12 heavy jobs at once)
 # Environment (scripts/lib/stage2.sh has the whole list): FIBC or SEED = the fibc that builds stage 2 (CI gives the seed); without
 # them a previous F of the same prelude builds it (the line `build:` says which); GATE_OUT = scratch (F and case output are kept there,
 # and a build is skipped when compiler/ and lib/ are what the cached F was built from); LLVM_LINK = shared (default) or static: how F links
-# LLVM; LAIR_DIR = where the liblair.so of a pre-flip builder is (a builder that is a stage 2 needs none).
+# LLVM.
 # Takes /tmp/fibsuite.lock for its whole run, so a benchmark (scripts/bench/quick.sh) never overlaps it.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -45,6 +46,14 @@ note "stage build done"
 if [ "$mode" = full ]; then
   t0=$(now)
   if stage3_check; then timings+=("fixed point $(elapsed "$t0" "$(now)") s"); else fail "fixed point FAILED"; timings+=("fixed point FAILED $(elapsed "$t0" "$(now)") s"); fi
+fi
+
+# The golden checks of the passes (compiler/tests/golden: reader, expander, type checker, ownership checker, emitter, lair), full gate only.
+if [ "$mode" = full ]; then
+  t0=$(now)
+  if GOLDEN_JOBS=$jobs GOLDEN_OUT=$GATE_OUT/golden "$root/compiler/tests/golden/golden.sh" --fibc "$F" > "$GATE_OUT/golden.log" 2>&1; then
+    timings+=("golden $(grep -c '^ok' "$GATE_OUT/golden.log") suites ok $(elapsed "$t0" "$(now)") s")
+  else tail -n 20 "$GATE_OUT/golden.log"; fail "golden checks FAILED (log: $GATE_OUT/golden.log)"; timings+=("golden FAILED $(elapsed "$t0" "$(now)") s"); fi
 fi
 
 # The sample of the quick gate: every 10th stdlib case by name (the order of `ls`, bytes), and the expected failures among them, so a

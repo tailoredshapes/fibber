@@ -4,161 +4,12 @@ on:
   push:
   pull_request:
 
-env:
-  CARGO_TERM_COLOR: always
-  # Pinned: the Rust is frozen (seed-1), and a newer stable's new lints
-  # would fail it without a change in it. Bump deliberately.
-  RUST_TOOLCHAIN: 1.97.1
-
+# The Rust jobs (fibref, lair, lairf) went with the Rust, ROADMAP stage 10; docs/rust-legacy.md says how to bring them back.
 jobs:
-  # The interpreter, the generator and lIR's checker: no LLVM, so this
-  # job stays fast and is the one to watch.
-  fibref:
-    runs-on: ubuntu-latest
-    # A hung test would hold the job for GitHub's default of 6 hours;
-    # every job and every step that runs something has a limit, a few
-    # times what it takes on a cold cache.
-    timeout-minutes: 30
-    steps:
-      # The Rust is frozen as the seed (tag seed-1) and the data it tests
-      # (cases/, lib/, spec/, compiler/) has moved on; the Rust tests judge the Rust
-      # against the data of its own time. The stage2 job judges main.
-      - uses: actions/checkout@v4
-        timeout-minutes: 5
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: Overlay the seed's data (tag seed-1)
-        timeout-minutes: 5
-        run: scripts/ci-seed-overlay.sh
-
-      - name: Install the pinned toolchain with rustfmt and clippy
-        timeout-minutes: 10
-        run: |
-          rustup toolchain install $RUST_TOOLCHAIN --profile minimal -c rustfmt -c clippy
-          rustup default $RUST_TOOLCHAIN
-
-      - uses: Swatinem/rust-cache@v2
-        timeout-minutes: 10
-        with:
-          prefix-key: fibref
-
-      - name: Format
-        timeout-minutes: 5
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        timeout-minutes: 15
-        run: cargo clippy -p fibref -p fibgen -p lir --all-targets --all-features -- -D warnings
-
-      - name: Test
-        timeout-minutes: 20
-        run: cargo test -p fibref -p fibgen -p lir
-
-      # Pending cases exit 0 and are listed; a Fail, a bad header or a
-      # run that found no cases exits 1 and must fail the build.
-      - name: Ownership cases
-        timeout-minutes: 10
-        run: |
-          cargo run -p fibref -- cases cases/ownership
-          cargo run -p fibref -- cases cases/modules
-
-  # lair links LLVM 21 statically through llvm-sys (crates/lair), which
-  # takes minutes per link, so it is a job of its own. fibc links lair,
-  # so its tests are here too, after lair's own, and the whole job
-  # builds the workspace once: one LLVM install, one cache.
-  lair:
-    runs-on: ubuntu-latest
-    # The sum of the step limits below is more than this; a cold cache
-    # builds LLVM's static link once, in the first step that needs it.
-    timeout-minutes: 90
-    env:
-      LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
-    steps:
-      # The Rust is frozen as the seed (tag seed-1) and the data it tests
-      # (cases/, lib/, spec/, compiler/) has moved on; the Rust tests judge the Rust
-      # against the data of its own time. The stage2 job judges main.
-      - uses: actions/checkout@v4
-        timeout-minutes: 5
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: Overlay the seed's data (tag seed-1)
-        timeout-minutes: 5
-        run: scripts/ci-seed-overlay.sh
-
-      - name: Install the pinned toolchain with clippy
-        timeout-minutes: 10
-        run: |
-          rustup toolchain install $RUST_TOOLCHAIN --profile minimal -c clippy
-          rustup default $RUST_TOOLCHAIN
-
-      # apt.llvm.org's llvm.sh installs LLVM 21's tools and adds the
-      # repository; llvm-sys then needs the development package (for
-      # llvm-config and the static archives), Polly's archives, which
-      # `llvm-config --libs` lists, and the system libraries
-      # `llvm-config --system-libs --link-static` lists: zlib, zstd
-      # (as /usr/lib/x86_64-linux-gnu/libzstd.a) and libxml2.
-      - name: Install LLVM 21
-        timeout-minutes: 15
-        run: |
-          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 21
-          sudo apt-get install -y llvm-21-dev libpolly-21-dev libzstd-dev zlib1g-dev libxml2-dev
-          /usr/lib/llvm-21/bin/llvm-config --version
-          /usr/lib/llvm-21/bin/llvm-config --system-libs --link-static
-
-      - uses: Swatinem/rust-cache@v2
-        timeout-minutes: 10
-        with:
-          prefix-key: lair
-
-      - name: Clippy
-        timeout-minutes: 30
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      # cargo test -p lair runs every lIR case through the JIT and AOT
-      # (crates/lair/tests/cases.rs, spec/lir.md §13), the JIT's library
-      # tests, the macro mechanism among them, the C interface and the
-      # link step (crates/lair/tests/link.rs). It is the quick one, so it
-      # goes first.
-      - name: Test lair
-        timeout-minutes: 45
-        run: cargo test -p lair
-
-      # The legacy oracle of the lairf job (crates/lair is frozen until stage 10): the `lair` command line, which links LLVM statically.
-      - name: Build the lair binary
-        timeout-minutes: 30
-        run: cargo build -p lair --bin lair
-
-      - uses: actions/upload-artifact@v4
-        timeout-minutes: 5
-        with:
-          name: rust-lair
-          path: target/debug/lair
-          retention-days: 3
-
-      # crates/fibc is not in the fibref job: it needs LLVM. Its tests
-      # are the compiler itself: the rule-6 suites (tests/cases.rs runs
-      # cases/ownership and cases/modules interpreted and compiled, as
-      # `fibc cases DIR` does, and fails on a Fail, a bad header or no
-      # cases), the generated programs, the fibber reader of the
-      # bootstrap (tests/bootstrap.rs), the C interface from fibber
-      # (tests/capi.rs, which builds liblair.so) and `fibc build`'s flags
-      # (tests/cli.rs). Two test threads: each case and each generated
-      # program runs a child process that compiles through the JIT, and
-      # the generator's jobs each hold an interpreter's heap trace.
-      - name: Test fibc
-        timeout-minutes: 45
-        run: cargo test -p fibc -- --test-threads=2
-
-  # The truth about main: the released seed (the one SEED names: a stage 2 binary; before the flip it carries its own liblair.so, which it uses to
-  # compile) builds stage 2 from main's compiler/ and lib/; stage 2 links LLVM 21 itself (the static archives of llvm-dev, as the release does,
-  # through scripts/llvm-static.sh) and needs no liblair.so and no Rust; the fixed point holds; stage 2 runs the case directories, and the
-  # cases that do not pass are exactly those in scripts/ci-stage2.expected.
+  # The truth about main: the released seed (the one SEED names: a stage 2 binary) builds stage 2 from main's compiler/ and lib/; stage 2 links
+  # LLVM 21 itself (the static archives of llvm-dev, as the release does, through scripts/llvm-static.sh); there is no Rust in the repository
+  # (docs/rust-legacy.md); the fixed point holds; stage 2 runs the case directories, and the cases that do not pass are exactly those in
+  # scripts/ci-stage2.expected; the golden checks of the passes hold (compiler/tests/golden).
   stage2:
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -173,7 +24,6 @@ jobs:
         run: |
           fibc=$(scripts/fetch-seed.sh "$RUNNER_TEMP/seed")
           echo "SEED_FIBC=$fibc" >> "$GITHUB_ENV"
-          echo "SEED_LIB=$(cd "$(dirname "$fibc")/../lib" && pwd)" >> "$GITHUB_ENV"
 
       # LLVM 21 for the link: llvm-21-dev has the static archives and llvm-config; zstd and zlib are the system libraries they name.
       - name: Install LLVM 21
@@ -191,11 +41,8 @@ jobs:
           set -eu
           export FIB_LIB=$PWD/lib
           read -r -a llvm < <(scripts/llvm-static.sh "$RUNNER_TEMP/llvm")
-          # Only the seed (a release made before the flip) loads a liblair.so; F and F3 have none and must not find one.
-          build() { if [ "$1" = "$SEED_FIBC" ]; then LD_LIBRARY_PATH=$SEED_LIB "$1" build compiler/fibc.fib -I compiler -I lib "${llvm[@]}" -o "$2"
-                    else "$1" build compiler/fibc.fib -I compiler -I lib "${llvm[@]}" -o "$2"; fi; }
-          emit() { if [ "$1" = "$SEED_FIBC" ]; then LD_LIBRARY_PATH=$SEED_LIB "$1" emit -I compiler -I lib compiler/fibc.fib
-                   else "$1" emit -I compiler -I lib compiler/fibc.fib; fi; }
+          build() { "$1" build compiler/fibc.fib -I compiler -I lib "${llvm[@]}" -o "$2"; }
+          emit() { "$1" emit -I compiler -I lib compiler/fibc.fib; }
           build "$SEED_FIBC" "$RUNNER_TEMP/F"
           ! ldd "$RUNNER_TEMP/F" | grep -q -E 'liblair|libLLVM'
           emit "$SEED_FIBC" > "$RUNNER_TEMP/emit.seed"
@@ -220,6 +67,16 @@ jobs:
           export FIB_LIB=$PWD/lib
           scripts/ci-stage2.sh "$RUNNER_TEMP/F"
 
+      - name: Golden checks of the passes
+        timeout-minutes: 20
+        run: |
+          export FIB_LIB=$PWD/lib
+          mkdir -p "$RUNNER_TEMP/golden"
+          read -r -a llvm < <(scripts/llvm-static.sh "$RUNNER_TEMP/llvm")
+          mkdir -p "$RUNNER_TEMP/golden/tools"
+          for t in read expand types own explain emit lairf; do "$RUNNER_TEMP/F" build "compiler/$t.fib" -I compiler -I lib "${llvm[@]}" -o "$RUNNER_TEMP/golden/tools/$t"; done
+          GOLDEN_OUT="$RUNNER_TEMP/golden" compiler/tests/golden/golden.sh --tools "$RUNNER_TEMP/golden/tools"
+
       - name: Native OS services and ABI conformance
         timeout-minutes: 5
         run: OS_FIBC="$RUNNER_TEMP/F" OS_TEST_OUT="$RUNNER_TEMP/os" bash scripts/test-os.sh
@@ -227,45 +84,3 @@ jobs:
       - name: Native HTTP interoperability and TLS
         timeout-minutes: 10
         run: HTTP_FIBC="$RUNNER_TEMP/F" HTTP_TEST_OUT="$RUNNER_TEMP/http" bash scripts/test-http.sh
-
-  # lairf, lair written in fibber (compiler/lairf.fib, built by the seed through the shared libLLVM-21, no liblair), against the Rust lair on the
-  # same inputs: the five compare scripts over cases/lir and 30 emitted programs (scripts/ci-lairf.sh). The Rust lair is the `lair` job's binary,
-  # handed over as an artifact: building it here would bring back the Rust toolchain and minutes of LLVM linking that stage2 shed, and storing hashes of its
-  # output instead would go stale with every change of the emitter or the library (the emitted programs are inputs). Its own job, so that the legacy
-  # Rust build neither delays nor fails the stage2 job. Removed with the Rust lair (stage 10).
-  lairf:
-    needs: lair
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-        timeout-minutes: 5
-
-      - uses: actions/download-artifact@v4
-        timeout-minutes: 5
-        with:
-          name: rust-lair
-          path: rust-lair
-
-      - name: Fetch the seed
-        timeout-minutes: 10
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          fibc=$(scripts/fetch-seed.sh "$RUNNER_TEMP/seed")
-          echo "SEED_FIBC=$fibc" >> "$GITHUB_ENV"
-          echo "SEED_LIB=$(cd "$(dirname "$fibc")/../lib" && pwd)" >> "$GITHUB_ENV"
-
-      - name: Install LLVM 21
-        timeout-minutes: 15
-        run: |
-          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 21
-          sudo apt-get install -y llvm-21-dev zlib1g-dev libzstd-dev
-
-      - name: Build lairf and compare it with the Rust lair
-        timeout-minutes: 40
-        run: |
-          chmod +x rust-lair/lair
-          FIBC=$SEED_FIBC SEED_LIB=$SEED_LIB LAIR=$PWD/rust-lair/lair scripts/ci-lairf.sh "$RUNNER_TEMP/lairf"

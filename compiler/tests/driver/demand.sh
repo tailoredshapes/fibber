@@ -3,7 +3,7 @@
 # inferred and analysed) and in full by `emit-dump` (every unit): the two must give the same lIR. This compares `FIBC emit FILE` with the
 # sections of `FIBC emit-dump FILE`, minus its marker lines (`== FILE` and `;; == section NAME`), and with no file takes a sample of the cases.
 # A unit the demand leaves out that the emitter then asks for shows as a rejection or a difference here. It exits 1 on any difference.
-# usage: demand.sh FIBC [FILE..]    run from the repository root, FIB_LIB=lib and LD_LIBRARY_PATH holding liblair.so in the environment
+# usage: demand.sh FIBC [FILE..]    run from the repository root, FIB_LIB=lib
 fibc=${1:?usage: demand.sh FIBC [FILE..]}; shift
 if [ $# -eq 0 ]; then
   set -- scripts/bench/hello.fib cases/ownership/01-return-part-of-argument.fib cases/stdlib/001-*.fib cases/stdlib/002-*.fib \

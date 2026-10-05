@@ -1,9 +1,8 @@
 name: release
 
 # A pushed tag v* builds the release for that tag and attaches the tarball and SHA256SUMS to a GitHub release of the same name.
-#   v0.0.*  the Rust tools (scripts/package-rust.sh): the seed of the bootstrap.
 #   v0.1.*  and later: fibc written in fibber (scripts/package.sh), built by the seed that SEED names (scripts/fetch-seed.sh); the tag
-#           has to equal v + the file VERSION.
+#           has to equal v + the file VERSION. (The v0.0.* releases, the Rust tools, are built from tag seed-1; docs/rust-legacy.md.)
 # workflow_dispatch does the same for an existing tag given as input.
 
 on:
@@ -18,9 +17,6 @@ on:
 permissions:
   contents: write
 
-env:
-  LLVM_SYS_211_PREFIX: /usr/lib/llvm-21   # only for the Rust tools of v0.0.* tags
-
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -33,16 +29,7 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      # The Rust toolchain and its cache are for the Rust tools of a v0.0.* tag alone: fibc (v0.1 and later) links LLVM itself and builds no Rust.
-      - name: Install stable toolchain
-        if: startsWith(env.TAG, 'v0.0.')
-        timeout-minutes: 10
-        run: |
-          rustup update stable
-          rustup default stable
-
       # LLVM 21 from apt.llvm.org and its development package: the static archives scripts/package.sh links into fibc (scripts/llvm-static.sh).
-      # (llvm-sys of the v0.0.* Rust tools also wants Polly's archives.)
       - name: Install LLVM 21
         timeout-minutes: 15
         run: |
@@ -52,27 +39,14 @@ jobs:
           sudo apt-get install -y llvm-21-dev libpolly-21-dev libzstd-dev zlib1g-dev libxml2-dev
           /usr/lib/llvm-21/bin/llvm-config --version
 
-      - uses: Swatinem/rust-cache@v2
-        if: startsWith(env.TAG, 'v0.0.')
-        timeout-minutes: 10
-        with:
-          prefix-key: release
-
-      - name: Package the Rust tools (v0.0.*)
-        if: startsWith(env.TAG, 'v0.0.')
-        timeout-minutes: 60
-        run: scripts/package-rust.sh "${TAG#v}" dist
-
-      - name: Fetch the seed (v0.1 and later)
+      - name: Fetch the seed
         id: seed
-        if: ${{ !startsWith(env.TAG, 'v0.0.') }}
         timeout-minutes: 5
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "fibc=$(scripts/fetch-seed.sh seed)" >> "$GITHUB_OUTPUT"
 
-      - name: Package fibc (v0.1 and later)
-        if: ${{ !startsWith(env.TAG, 'v0.0.') }}
+      - name: Package fibc
         timeout-minutes: 90
         env:
           FIBC: ${{ steps.seed.outputs.fibc }}
@@ -126,7 +100,6 @@ jobs:
         timeout-minutes: 5
         working-directory: editors/vscode
         run: |
-          npm ci
           npx --yes @vscode/vsce package --out "fibber-vscode.vsix"
 
       - name: Attach it to the release

@@ -1242,7 +1242,7 @@ it printed before the parts had names).
 
 | Section | The part | Source |
 |---|---|---|
-| `runtime` | the ten files `crates/fibc/rt/*.lir`, each followed by a line break, in the order core str array vec vecbuild atom thread task weak io | `compile.rs` `RUNTIME` |
+| `runtime` | the ten files `rt/*.lir`, each followed by a line break, in the order core str array vec vecbuild atom thread task weak io | `compile.rs` `RUNTIME` |
 | `externs` | one `(declare ..)` per `extern` the bodies reached, in first-use order, but those the runtime declares itself | `Program::render_externs` |
 | `types` | every object struct, the `drop`, `trace` and `share` walkers of every type id, and the type and class tables | `Objects::render` |
 | `statics` | the strings `@str.N` in first-use order, the immortal closures of named functions and the vtables | `Statics::render` |

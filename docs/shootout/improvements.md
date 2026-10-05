@@ -38,7 +38,7 @@ is 1 to 3 MB on most programs against Java's 40 MB and Clojure's 100+ MB, and st
 ## The proposals, in order of payoff for effort
 
 Layers: **own** = ownership checker (`compiler/own`), **emit** = emitter (`compiler/emit`), **rt** = runtime
-(`crates/fibc/rt/*.lir`), **lib** = standard library, **lang** = language or reader, **tool** = tooling.
+(`rt/*.lir`), **lib** = standard library, **lang** = language or reader, **tool** = tooling.
 
 ### 1. A scalar read through `@cell` should not retain and release the cell's content (own, emit)
 - Evidence: n-body does a retain and release of the array around every `(array-get @a i)` (about 17 pairs per body pair,

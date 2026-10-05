@@ -22,33 +22,25 @@ test says so; claims in docs, commit messages and chat carry no weight.
 
 | Path | What |
 |------|------|
-| `spec/` | the specification; its executable form is `fibref` |
-| `cases/` | test programs with verdicts fixed in their headers: `ownership/` (`fibref cases`, and `fibc cases` interpreted and compiled), `modules/` (programs of several modules), `stdlib/` (the library's cases), `lir/` (`lair cases`) |
-| `crates/fibref` | the reference interpreter and memory audit |
-| `crates/fibgen` | the random program generator (method rule 5) |
-| `crates/lir` | LEGACY oracle (until the Rust `fibc` goes): lIR's reader, AST and whole-module checker in Rust, no LLVM; its fibber port is `compiler/lir/` |
-| `crates/lair` | LEGACY oracle (until the Rust `fibc` goes): lIR to native through LLVM 21: JIT, AOT, the lIR case harness; also a `cdylib`, `liblair.so`, with the 23-function C interface in `include/lair.h` (spec/compiler.md §9, retired by `compiler/native`). Needs `LLVM_SYS_211_PREFIX`. The compiler in fibber does not link it |
-| `crates/fibc` | the compiler in Rust (stage 1): `fibref`'s front end lowered to lIR through `lair`, the runtime `fib.rt` in `rt/*.lir`, the rule-6 harness (`fibc cases`, `fibc gen`); `tests/bootstrap` compares stage 2's reader with the Rust one |
+| `spec/` | the specification (its executable form, the Rust `fibref`, is retired: docs/rust-legacy.md) |
+| `cases/` | test programs with verdicts fixed in their headers: `ownership/` (`fibc cases`), `modules/` (programs of several modules), `stdlib/` (the library's cases), `lir/` (`lair cases`) |
+| `rt/` | the runtime `fib.rt` as lIR source (`rt/*.lir`): data that stage 2 consumes (`compiler/emit/runtime.fib` is generated from it by `compiler/tests/emit/gen-runtime.fib`; `compiler/tests/emit/runtime.sh` checks the drift) |
+| `docs/rust-legacy.md` | the Rust (`crates/fibref fibgen fibmut fibc lair lir`) was retired in RR1 and lives in git (tag `seed-1`): how to get it back, what each tool gave, what was lost, the ports scheduled (`fibref`'s interpreter and audit, `fibgen`, `fibc lsp`) |
 | `lib/` | `prelude.fib` and the implicit library `fib/` (facades `fib.core fib.seq fib.coll fib.print` and their parts): M7, design in `spec/stdlib.md` |
 | `compiler/` | the compiler in fibber (M6, spec/bootstrap.md), bootstrapped: `syntax/` reader, `expand/` expander, `macros/` macro runner, `types/` type checker, `own/` ownership checker, `emit/` lIR emitter, `driver/` commands, `lir/` lIR reader, AST and whole-module checker, `llvm/` bindings of LLVM-C, `native/` lair (lowering, passes, JIT, AOT, the `native.api` and `native.call` that `emit.defs.jit`, `macros.runner` and `driver.native` use, the case harness `cases`, `cli`), `lairf.fib` the tool (`lairf check|run|build|emit-llvm|dump-ast|cases`; renamed `lair` when the Rust one goes), `lair/` legacy bindings of `liblair.so` (`lair.ffi` is still the byte and word helpers; `lair.jit`, `lair.call`, `lair.err` and the old `lair.fibm`/`lair.expand` serve `jit-demo.fib` only), tools `fibc.fib read.fib expand.fib types.fib own.fib explain.fib emit.fib`, `tests/` edge inputs, golden programs and compare scripts, `mirror-pending/` what the ports still owe the Rust |
-| `editors/vscode/` | the VS Code language pack for `.fib`: a TextMate grammar, language configuration and snippets; no build step |
-| `scripts/` | release engineering: `package.sh` (the relocatable tarball of stage 2), `package-rust.sh`, `fetch-seed.sh` (the seed named by `SEED`), `check-version.sh` (`VERSION` against `compiler/driver/version.fib`); `.github/workflows/release.yml` runs them on a `v*` tag; `SEED` at the root names the release (url, sha256) that builds stage 2 in CI and for releases (v0.1.5 now; per-platform rows `url.PLATFORM=`/`sha256.PLATFORM=`). `FIB_TARGET_CPU` (read by lair) picks the CPU code is generated for: `package.sh` sets `x86-64-v2` so a release runs on any CPU; unset, code is for the host. See README.md, Install and ROADMAP.md, Releases |
+| `editors/vscode/` | the VS Code language pack for `.fib`: a TextMate grammar, language configuration, snippets, and the language client for `fibc lsp` (server in `compiler/lsp/`; `test/lsp.js` fails when no server is found unless `FIBREF_SKIP=1`) |
+| `scripts/` | release engineering: `package.sh` (the relocatable tarball of stage 2), `fetch-seed.sh` (the seed named by `SEED`), `check-version.sh` (`VERSION` against `compiler/driver/version.fib`); `.github/workflows/release.yml` runs them on a `v*` tag; `SEED` at the root names the release (url, sha256) that builds stage 2 in CI and for releases (v0.1.5 now; per-platform rows `url.PLATFORM=`/`sha256.PLATFORM=`). `FIB_TARGET_CPU` (read by lair) picks the CPU code is generated for: `package.sh` sets `x86-64-v2` so a release runs on any CPU; unset, code is for the host. See README.md, Install and ROADMAP.md, Releases |
 | `lib/fib/tensor/` | the explicit numerical library `fib.tensor` (dense tensors, strided views, fma GEMM, fused dense layers, vector math), design in `docs/design/numerical-library.md`; `lib/fib/simd.fib` (`fib.simd`), `lib/fib/view.fib` (exclusive windows: `with-view`, `with-tiles`) |
 | `docs/` | `design/` (one file per design, decisions in `decisions-2026-10-04.md`), `shootout/` (measurements with their commands: `simd.md`, `tensor.md`, `aarch64.md`), `shootout.md` |
 | `lir-audit/` | findings from auditing liar's lIR, each re-established as a case in `cases/lir/audit` |
 
-## Rust standards
+## The Rust is gone
 
-- Edition 2021. `cargo fmt --check`, `cargo clippy --all-targets -- -D
-  warnings` and `cargo test` must all pass before every commit.
-- Files under 500 lines, functions under 50 lines; split by
-  responsibility, not by section comments.
-- No thread-local or global mutable state. Passes take and return
-  data; all context is an explicit parameter.
-- Unit tests live next to the code. Every audit check has a test that
-  shows it firing.
-- No `unwrap`/`expect` outside tests unless a comment says why it
-  cannot fail.
+`crates/`, `Cargo.toml` and `Cargo.lock` were removed in RR1 (ROADMAP stage 10); there is no cargo in the build, the gate or CI.
+The code is in git: tag `seed-1`. docs/rust-legacy.md says how to build it again (outside the tree: `CARGO_TARGET_DIR` under
+`~/.cache/fibber-scratch`, `ulimit -v`, `nice`, a few jobs), what each tool gave and what was lost. The old Rust standards
+(edition 2021, `cargo fmt`, `clippy -D warnings`, files under 500 lines, no global state) apply to anyone who revives it.
+Ports scheduled, not dropped: `fibref`'s interpreter and heap audit, `fibgen`, `fibc lsp`.
 
 ## Commits
 
@@ -57,25 +49,19 @@ test says so; claims in docs, commit messages and chat carry no weight.
 
 ## `compiler/` is where the work is
 
-- The Rust `fibc` and the front end shared with `fibref` are frozen as the
-  seed (tag `seed-1`); do not add language features there. New language and
-  library work starts in `compiler/` and the library in `lib/`. The mirror
-  rule is retired; `compiler/mirror-pending/` is backlog of what the Rust
-  has and stage 2 lacks.
+- New language and library work starts in `compiler/` and the library in `lib/`. `compiler/mirror-pending/` is the backlog of what the
+  Rust had and stage 2 lacks, kept as history: there is no Rust to mirror any more (docs/rust-legacy.md).
 - Build stage 2 with the seed: `fibc build compiler/fibc.fib -I compiler -I
-  lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o F` (F links LLVM, no liblair; a seed
-  made before the flip needs its own `liblair.so` on `LD_LIBRARY_PATH` to compile;
-  `LLVM_LINK=static` in the scripts uses `scripts/llvm-static.sh`). The stage check is the fixed point: F
+  lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o F` (F links LLVM; `LLVM_LINK=static` in the scripts uses `scripts/llvm-static.sh`). The stage check is the fixed point: F
   builds F3, and `F emit compiler/fibc.fib` equals `F3 emit compiler/fibc.fib`.
   F's emit equals the seed's only while `lib/prelude.fib` is the one the
   seed embedded (a seed built before a prelude change emits the old one), so
   that comparison is a note, not a gate.
-- The in-place primitives `array-take!`, `array-push!`, `array-pop!` and `cell-update!` (spec/types.md §2.13.1) exist in the
-  compiler in fibber only: the Rust sources under `crates/` have no row for them, and `lib/prelude.fib` calls them.
-- Each pass has a Rust dump as its oracle for the language the seed knows
-  (`fibref read|expand|types|own`, `fibc emit-dump`) and a compare script
-  under `compiler/tests/`. Rebuild the binaries after any edit of
-  `lib/prelude.fib` (it is embedded).
+- The in-place primitives `array-take!`, `array-push!`, `array-pop!` and `cell-update!` (spec/types.md §2.13.1) exist in the compiler in
+  fibber only; `lib/prelude.fib` calls them.
+- Each pass has golden outputs under `compiler/tests/golden/` (recorded once from the Rust oracles, since stage 2's own; README there):
+  `compiler/tests/golden/golden.sh --fibc F` checks them, `--update` regenerates them from stage 2 after an intended change (read the
+  diff). `scripts/gate.sh --full` runs them. Rebuild the tools after any edit of `lib/prelude.fib` (it is embedded).
 - Fibber source follows the same limits as Rust where it can (files under
   500 lines, functions under 50) and uses the library's own tools: flat
   `cond`, `try-let`, `if-some`, destructuring, `defrecord`.
@@ -90,12 +76,12 @@ test says so; claims in docs, commit messages and chat carry no weight.
 
 ## Performance cycle
 
-Make many changes, then build and test once. Rust is frozen; the tools are shell scripts over stage 2 (`F` below).
+Make many changes, then build and test once. The tools are shell scripts over stage 2 (`F` below).
 
 - `F cases DIR [--only PREFIX..] -j N` runs N cases at a time (default 1); the rows and counts are the same, in the same order.
 - `scripts/gate.sh [--quick|--full]`: builds stage 2 (cached while compiler/ and lib/ are unchanged), the fixed point (full), the case
   directories with `-j`, compares the non-passing set with `scripts/ci-stage2.expected`; one timing line per stage and PASS or FAIL.
-  `--quick` is ownership, modules and about 100 stdlib cases.
+  `--quick` is ownership, modules and about 100 stdlib cases; `--full` adds the fixed point and the golden checks.
 - `scripts/bench/quick.sh [--record]`: 10 benchmarks of 1-2 s, median of 3, against `scripts/bench/baseline.tsv`; flags a delta over 10%
   and a changed checksum (a wrong answer is a failure, not a speedup).
 - `scripts/batch.sh BRANCH..`: the lead's integrator (scratch branch from main, cherry-picks, one gate, one bench, halving on failure).

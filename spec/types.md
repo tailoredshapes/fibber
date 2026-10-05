@@ -1006,8 +1006,8 @@ passes its argument on without a copy; callers that read their array afterwards 
 
 Source of each statement: `compiler/emit/lower/builtins.fib` (`array-own`,
 `array-take`, `array-push`, `array-pop`), `compiler/emit/lower/cells.fib`
-(`lcx-cell-update`), `crates/fibc/rt/array.lir` (`fib.array-room`,
-`fib.array-roomy?`), `crates/fibc/rt/core.lir` (`fib.unique?`).
+(`lcx-cell-update`), `rt/array.lir` (`fib.array-room`,
+`fib.array-roomy?`), `rt/core.lir` (`fib.unique?`).
 
 The three array primitives take the array through an `&` position, as
 `array-set!` does, and use the same test as the unique write (§6.6): they read
