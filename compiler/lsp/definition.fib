@@ -65,11 +65,37 @@
           ((some t) (Pair t p))
           (nil (Pair "" p))))))
 
+;; The last `(defn NAME` (or `(defun NAME`, `(defmacro NAME`) before byte `before` of `text`: the head of the definition that an arity clause
+;; belongs to, when the clause's own `Pos` (`([x] ..)`) does not hold the name. The span of NAME in it.
+(defun head-from :private (text: str before: i64 name: str head: str) -> (Option (Pair i64 i64))
+  (let ((pat (str-join ["(" head " " name])))
+    (loop ((from 0) (best nil))
+      (match (if (<= from (str-len text)) (str-find text pat from) nil)
+        (nil best)
+        ((some i)
+         (let ((at (+ i (+ (str-len head) 2)))
+               (stop (+ at (str-len name)))
+               (ok (and (< i before) (or (= stop (str-len text)) (word-break? (str-byte-at text stop))))))
+           (recur (+ i 1) (if ok (some (Pair at stop)) best))))))))
+
+(defun head-before :private (text: str before: i64 name: str) -> (Option (Pair i64 i64))
+  (reduce (fn (best: (Option (Pair i64 i64)) head: str)
+            (match (head-from text before name head)
+              (nil best)
+              ((some h) (match best
+                          (nil (some h))
+                          ((some o) (if (> (. h fst) (. o fst)) (some h) (some o)))))))
+          nil ["defn" "defun" "defmacro"]))
+
 ;; The location of `name` defined at `pos`, narrowed to the name.
 (defun location-of :private (src: str path: str roots: Roots pos: Pos name: str) -> LsLocation
   (let ((tx (text-of src path (. pos file) roots))
-        (sp (name-span (. tx fst) (. pos start) (. pos end) name)))
-    (LsLocation (. tx snd) (. sp fst) (. sp snd))))
+        (sp (name-span (. tx fst) (. pos start) (. pos end) name))
+        (found (and (<= (. sp snd) (str-len (. tx fst))) (and (<= (. sp fst) (. sp snd)) (= (str-slice (. tx fst) (. sp fst) (. sp snd)) name))))
+        (back (if found nil (head-before (. tx fst) (. pos start) name))))
+    (match back
+      ((some b) (LsLocation (. tx snd) (. b fst) (. b snd)))
+      (nil (LsLocation (. tx snd) (. sp fst) (. sp snd))))))
 
 (defun ref-pos :private (g: Globals r: GlobalRef) -> (Option Pos)
   (match r

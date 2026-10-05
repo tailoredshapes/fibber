@@ -2,8 +2,8 @@
 # Planted faults in the server's own source: each mutant is a copy of compiler/ with one wrong line, built and replayed (server.sh); the replay must FAIL.
 # A replay that passes a mutant cannot see that fault. The comparator's own faults (a range, a dropped diagnostic, a code, the framing) are
 # `server.sh OUT planted`; these are faults in the code the tests are about.
-# usage: mutants.sh [NAME..]    FIBC names the fibc; REAL=1 as in server.sh; SCRATCH the directory the copies go in (default $TMPDIR or /tmp)
-# mutants: code (-32601 becomes -32600), range (a diagnostic's end is one character short), definition (a definition is found one byte late),
+# usage: mutants.sh [NAME..]    FIBC names the fibc; SCRATCH the directory the copies go in (default $TMPDIR or /tmp)
+# mutants: code (-32601 becomes -32600), range (a diagnostic's start is one byte late), definition (a definition is found one byte late),
 #          filter (completion keeps only the library's names: the buffer's own items are dropped), initialize (the hover capability is lost)
 # Exit: 0 every mutant was caught; 1 one was not, or did not build; 2 usage.
 set -u
@@ -29,7 +29,7 @@ for n in "${names[@]}"; do
   ln -s "$root/lib" "$scratch/$n/lib"
   case $n in
     code) mutate $n lsp/server.fib '(def err-method-not-found: i64 -32601)' '(def err-method-not-found: i64 -32600)' ;;
-    range) mutate $n tests/lsp/standin/lsp/analysis.fib '(max j (min (+ start 1) n))' '(max (- j 1) (min (+ start 1) n))' ;;
+    range) mutate $n lsp/server.fib '(range-json (tx/diag-range src d))' '(range-json (tx/diag-range src (LsDiag (+ (. d start) 1) (. d end) (. d message))))' ;;
     definition) mutate $n lsp/definition.fib '(Pair i (+ i len))' '(Pair (+ i 1) (+ i len))' ;;
     filter) mutate $n lsp/features.fib '(into (into (into (into locals own) globals) core) macros)' '(into (into (into globals core) macros) [])' ;;
     initialize) mutate $n lsp/server.fib '(Pair "hoverProvider" (JBool true))' '(Pair "hoverProvider" (JBool false))' ;;

@@ -1,8 +1,7 @@
 #!/bin/bash
 # The language server's tests: builds the server (build.sh) and replays the recorded transcripts and this port's own scenarios against it
 # (replay.js), then, with `planted`, shows the comparator failing on each planted fault (range, drop, code, framing).
-# usage: server.sh [OUT] [planted]      FIBC names the fibc (default `fibc`); REAL=1 uses the real L0 to L2 modules instead of standin/;
-#                                    SERVER=PATH skips the build and replays against PATH (with SERVER_ARGS, e.g. `lsp`, for `fibc`)
+# usage: server.sh [OUT] [planted]      FIBC names the fibc (default `fibc`); SERVER=PATH skips the build and replays against PATH (with SERVER_ARGS, e.g. `lsp`, for `fibc`)
 # Exit: 0 all held (and every planted fault was caught); 1 a check failed or a fault went unnoticed; 2 no node or no fibc.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
