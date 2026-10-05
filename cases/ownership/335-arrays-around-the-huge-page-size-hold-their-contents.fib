@@ -1,0 +1,16 @@
+;; spec:   types §8.2 (allocation), crates/fibc/rt/core.lir fib.advise-huge
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; An array of 524285 doubles is 24 + 8 * 524285 = 4194304 bytes, the size from which the runtime asks the kernel for transparent huge
+;; pages (an advice on the whole pages inside the block). Arrays one element below, at and above it, and a larger one, must be written
+;; and read back whole: the advice may not change what a block holds or how it is freed.
+(defun fill-check (n: i64) -> bool
+  (let ((buf (cell (array n 0.0))))
+    (do (dotimes (i n) (array-set! &buf i (double i)))
+        (let ((a @buf))
+          (and (= (array-len a) n) (= (array-get a 0) 0.0) (= (array-get a (- n 1)) (double (- n 1)))
+               (= (array-get a (quot n 2)) (double (quot n 2))))))))
+
+(defun main () -> i64
+  (if (and (fill-check 524284) (fill-check 524285) (fill-check 524286) (fill-check 3000001)) 0 1))

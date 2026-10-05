@@ -2,10 +2,16 @@
 (ns fib.tensor.reduce
   (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage))
 
+;; A dense tensor's logical element i is the buffer element offset+i, so the walk skips the per-element index decode of `flat-at`
+;; (which re-validates the descriptor each time); the buffer read is still bounds-checked and the order is the logical one.
 (defun fold (f: (fn (a t) a) :borrow initial: a x: (Tensor t)) -> a
   (let ((n (fib.tensor.storage/size x)))
-    (loop ((i 0) (acc initial))
-      (if (< i n) (recur (+ i 1) (f acc (flat-at x i))) acc))))
+    (if (contiguous? x)
+        (let ((off (array-get (. x meta) 0)) (buf (. x buffer)))
+          (loop ((i 0) (acc initial))
+            (if (< i n) (recur (+ i 1) (f acc (array-get buf (+ off i)))) acc)))
+        (loop ((i 0) (acc initial))
+          (if (< i n) (recur (+ i 1) (f acc (flat-at x i))) acc)))))
 
 (defun sum (x: (Tensor t)) :where ((Element t) (Num t)) -> t
   (fold (fn (a: t b: t) (+ a b)) (element-zero (. x seed)) x))
@@ -32,6 +38,23 @@
                             (conj out (nth dims i))))
         out)))
 
+;; An axis that is not the fastest-varying one: visiting each output's whole axis in turn strides across memory (a column walk of a
+;; matrix, one cache line per element and, at a power-of-two stride, one cache set). Instead each step of the axis is applied to every
+;; output in turn, reading `n` neighbouring elements; every output still folds its axis in increasing index order, from the
+;; initial value already in `out`, so the results are bit-for-bit those of the output-at-a-time walk.
+(defun plane-bases (base-meta: (Array i64) n: i64) -> (Array i64)
+  (let ((bases (cell (array n 0))))
+    (do (dotimes (i n) (array-set! &bases i (flat-offset base-meta i)))
+        @bases)))
+
+;; Steps `from` to `extent - 1` of the axis, applied to every output in `out` in turn.
+(defun fold-planes (f: (fn (a t) a) :borrow bases: (Array i64) step: i64 from: i64 extent: i64 n: i64 src: (Array t) &out: (Array a))
+  :where ((Element a)) -> unit
+  (dotimes (k (- extent from))
+    (let ((off (* (+ k from) step)))
+      (dotimes (i n)
+        (array-set! &out i (f (array-get @out i) (array-get src (+ (array-get bases i) off))))))))
+
 ;; Each logical output element folds its source axis in increasing index order.
 (defun fold-axis (f: (fn (a t) a) :borrow initial: a axis: i64 keepdims: bool x: (Tensor t))
   :where ((Element a)) -> (Tensor a)
@@ -42,13 +65,15 @@
           (let ((base-meta (make-meta (array-len (. x buffer)) (array-get (. x meta) 0)
                                      (axis-shape dims ax false) (axis-shape (strides x) ax false)))
                 (step (nth (strides x) ax)))
-            (dotimes (i n)
-              (let ((base (flat-offset base-meta i))
-                    (value (loop ((j 0) (acc initial))
-                             (if (< j extent)
-                                 (recur (+ j 1) (f acc (array-get (. x buffer) (+ base (* j step)))))
-                                 acc))))
-                (array-set! &buf i value)))))
+            (if (> step 1)
+                (fold-planes f (plane-bases base-meta n) step 0 extent n (. x buffer) &buf)
+                (dotimes (i n)
+                  (let ((base (flat-offset base-meta i))
+                        (value (loop ((j 0) (acc initial))
+                                 (if (< j extent)
+                                     (recur (+ j 1) (f acc (array-get (. x buffer) (+ base (* j step)))))
+                                     acc))))
+                    (array-set! &buf i value))))))
         (from-array out-dims @buf initial))))
 
 (defun sum-axis (axis: i64 keepdims: bool x: (Tensor t)) :where ((Element t) (Num t)) -> (Tensor t)

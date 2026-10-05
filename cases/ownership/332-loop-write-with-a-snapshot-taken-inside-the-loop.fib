@@ -1,0 +1,16 @@
+;; spec:   types §2.13.1, §8.3, emit.lower.hoist (a loop that touches the cell other than by array-set! and array-get/array-len of it is not hoisted)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; Each trip takes a snapshot `s` of the cell's array, then writes element i, then reads the snapshot: the read must see the OLD value
+;; (0) because the write went to a copy. The loop takes a count on the array every trip, so the array is never unique at the write. A
+;; hoist that assumed uniqueness for the whole loop would write in place and the snapshot would read 7: result 1.
+(defun main () -> i64
+  (let ((buf (cell (array 4 0))))
+    (let ((seen (loop ((i 0) (acc 0))
+                  (if (< i 4)
+                      (let ((s @buf))
+                        (do (array-set! &buf i 7)
+                            (recur (+ i 1) (+ acc (array-get s i)))))
+                      acc))))
+      (if (and (= seen 0) (= (array-get @buf 0) 7) (= (array-get @buf 3) 7)) 0 1))))

@@ -150,7 +150,7 @@
 
 ;; An element of `unit` has no value, but takes the `i1` slot a cell of `unit` takes (program.rs `elem_lir`), so that the array has
 ;; its length and a place for every element, and `array-get` reads a unit.
-(defun arr-info :private (cx: LowerCx name: str e: Expr tys: (Vec Ty)) -> (Result Arr str)
+(defun arr-info (cx: LowerCx name: str e: Expr tys: (Vec Ty)) -> (Result Arr str)
   (try-let ((arr-ty (array-ty-of cx name e tys)))
     (match arr-ty
       ((TCon (KArray) args)
@@ -194,7 +194,17 @@
 ;; The address of element `i`, after the bounds check (a trap with the interpreter's message, `eval/arrays.rs`).
 ;; Rust: lower/builtins.rs:396 array_index
 (defun array-index :private (cx: LowerCx r: Arr arr: str i: V) -> str
-  (let ((b (. cx b)) (n (lcx-load cx LirI64 (lcx-gep cx (. r sname) arr slot-len)))
+  (array-index-n cx r arr i (array-length cx r arr)))
+
+;; The length of an array: the one loaded before the loop when the array is hoisted (emit.lower.hoist), else a load.
+(defun array-length :private (cx: LowerCx r: Arr arr: str) -> V
+  (match (get @(. cx hoisted) arr)
+    ((some h) (. h snd))
+    (nil (lcx-load cx LirI64 (lcx-gep cx (. r sname) arr slot-len)))))
+
+;; `array-index` against a length already loaded (a hoisted array, emit.lower.hoist).
+(defun array-index-n :private (cx: LowerCx r: Arr arr: str i: V n: V) -> str
+  (let ((b (. cx b))
         (ok (fb-val b (str-join ["(icmp ult " (v-text i) " " (v-text n) ")"]) LirI1))
         (lo (fb-label b "inb")) (lt (fb-label b "oob")))
     (do (fb-term b (str-join ["(br " (v-text ok) " " lo " " lt ")"]))
@@ -213,6 +223,18 @@
 
 ;; `(array-set! &a i x)`: in place when unique, else a changed copy stored into the cell (§8.3). Rust: lower/builtins.rs:441 array_set
 (defun array-set :private (cx: LowerCx r: Arr cell-ty: Ty a: (Vec V)) -> (Result V str)
+  (match (get @(. cx hoisted) (v-text (nth a 0)))
+    ((some h) (array-set-hoisted cx r h a))
+    (nil (array-set-checked cx r cell-ty a))))
+
+;; In a loop that hoisted this cell (emit.lower.hoist): the array is known unique and of fixed length, held in `h` (array, length), so
+;; the write is the bounds check against that length and the store. The trap is the checked one's, at the same index.
+(defun array-set-hoisted :private (cx: LowerCx r: Arr h: (Pair V V) a: (Vec V)) -> (Result V str)
+  (let ((ep (array-index-n cx r (v-text (. h fst)) (nth a 1) (. h snd))))
+    (let ((old (lcx-load cx (. r el) ep)))
+      (do (lcx-store cx (nth a 2) ep) (lcx-release cx old) (Ok VUnit)))))
+
+(defun array-set-checked :private (cx: LowerCx r: Arr cell-ty: Ty a: (Vec V)) -> (Result V str)
   (try-let ((co (program-object (. cx p) cell-ty)))
     (let ((cell-s (. co snd)) (cell (v-text (nth a 0))))
       (try-let ((content ((. (. cx hub) cell-load) cx cell-s cell (TCon KArray [(. r elem)]))))
@@ -241,7 +263,7 @@
 ;; The array in the cell of `&a`, unique: when it is not (or, for `array-push!`, when it has no room: `roomy`), a copy takes its place in
 ;; the cell and the old one is released (in-place-update.md §2). Returns the array now in the cell. A copy for a push has room for 32
 ;; elements and the flag ROOMY (`fib.array-room`); a copy for the others has none.
-(defun array-own :private (cx: LowerCx r: Arr cell-ty: Ty a: (Vec V) roomy: bool) -> (Result V str)
+(defun array-own (cx: LowerCx r: Arr cell-ty: Ty a: (Vec V) roomy: bool) -> (Result V str)
   (try-let ((co (program-object (. cx p) cell-ty)))
     (let ((cell-s (. co snd)) (cell (v-text (nth a 0))) (aty (TCon KArray [(. r elem)])))
       (try-let ((content ((. (. cx hub) cell-load) cx cell-s cell aty)))
@@ -260,7 +282,7 @@
               (fb-open b lj)
               ((. (. cx hub) cell-load) cx cell-s cell aty)))))))
 
-(defun array-len-ptr :private (cx: LowerCx r: Arr arr: V) -> str
+(defun array-len-ptr (cx: LowerCx r: Arr arr: V) -> str
   (lcx-gep cx (. r sname) (v-text arr) slot-len))
 
 ;; `(array-push! &a x)`: appended in place when the array is unique and has room, else to a copy with room.
@@ -343,7 +365,7 @@
       ("array" (let ((n (nth a 0))
                      (p (fb-val (. cx b) (str-join ["(call @fib.array-alloc " (v-text n) " (i32 " (str (. r tid)) ") (i64 " (str (. r esize)) "))"]) LirPtr)))
                  (do (array-fill cx r p n (nth a 1)) (Ok p))))
-      ("array-len" (Ok (lcx-load cx LirI64 (lcx-gep cx (. r sname) (v-text (nth a 0)) slot-len))))
+      ("array-len" (Ok (array-length cx r (v-text (nth a 0)))))
       ("array-get" (let ((ep (array-index cx r (v-text (nth a 0)) (nth a 1))))
                      (if (. r unit)
                          (Ok VUnit)

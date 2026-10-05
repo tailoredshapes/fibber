@@ -1,0 +1,21 @@
+;; spec: lib/fib/tensor/README.md (axis reductions visit each slice in increasing axis index order)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib
+;; An axis that is not the last is reduced a step of the axis at a time across all outputs; each output must still fold its axis in
+;; increasing index order. Column 0 below is 1e16, 1, -1e16, 1: in that order the sum is 1 (1e16 + 1 rounds back to 1e16), reversed or
+;; pairwise it is 0 or 2. Also the middle axis of a 2x3x2 tensor (sum and maximum), and keepdims.
+(ns main (:require [fib.tensor :as t]))
+
+(defun main () -> i64
+  (let ((m (t/reshape [4 2] (t/tensor [1e16 1.0 1.0 1.0 -1e16 1.0 1.0 1.0])))
+        (c (t/reshape [2 3 2] (t/linspace 0.0 11.0 12))))
+    (if (and (= (t/to-vec (t/sum-axis 0 false m)) [1.0 4.0])
+             (= (t/shape (t/sum-axis 0 true m)) [1 2])
+             (= (t/to-vec (t/sum-axis 1 false c)) [6.0 9.0 24.0 27.0])
+             (= (t/to-vec (t/maximum-axis 1 false c)) [4.0 5.0 10.0 11.0])
+             (= (t/to-vec (t/sum-axis -1 false m)) [1e16 2.0 -1e16 2.0]))
+        0
+        1)))
