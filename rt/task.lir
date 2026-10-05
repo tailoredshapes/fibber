@@ -148,7 +148,7 @@
     (let ((r (cmpxchg acq_rel acquire @fib.pool-started (i32 0) (i32 1))))
       (br (extractvalue r 1) start done)))
   (block start
-    (store (i32 1) @fib.mt)
+    (atomic-store monotonic (i32 1) @fib.mt)
     (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced spawn))
   (block traced (call @write (i32 2) (string "T\n") (i64 2)) (br spawn))
   (block spawn
@@ -228,6 +228,26 @@
   (block run (call @fib.run-one u) (br loop))
   (block done (ret)))
 
+;; A task that another thread is about to reach is SHARED first (its count atomic, what it captured marked too), as a spawned task is
+;; (lcx-spawn): an `async` task is made, driven and released on one thread until it is awaited, so its counts are plain; from
+;; await-or-park on, the awaited task is queued for a worker and the awaiting one is registered for a waker on another thread, and
+;; their counts, read and written from several threads with plain loads and stores, were a data race (scripts/tsan.sh, cases
+;; ownership/24, 32, 44, 174, 233: `fib.release` against `fib.release`, and a task freed while another thread still read it). The
+;; mark must come BEFORE the other thread can have the task (a waker sets the state and queues it; after that a joiner may drive
+;; it), so await-or-park does it while it still holds the task alone. The waiters of the task are not objects (nodes of a
+;; list, slot 8), though the type's walker visits the slot: they are taken out of the task for the walk and put back.
+(define internal (fib.share-task void) ((ptr t))
+  (block entry
+    (br (icmp ne (and (call @fib.flags t) (i32 9)) (i32 0)) done mark))
+  (block mark
+    (let ((wp (getelementptr %struct.fib.task t (i32 0) (i32 8))))
+      (let ((saved (load ptr wp)))
+        (store (ptr null) wp)
+        (call @fib.share t)
+        (store saved wp)
+        (br done))))
+  (block done (ret)))
+
 ;; `await e` from the running task `self`: 0 when `e` is done (the
 ;; result can be read at once), else `self` is registered as a waiter
 ;; of `e`, marked parked, and 1 says return from the resume. A pending
@@ -244,10 +264,12 @@
   (block pending? (br (icmp eq s (i32 0)) start register))
   (block start
     (atomic-store release (i32 1) sp)
+    (call @fib.share-task e)
     (call @fib.retain e)
     (call @fib.enqueue e)
     (br register))
   (block register
+    (call @fib.share-task self)
     (let ((node (call @malloc (i64 16)))
           (wp (getelementptr %struct.fib.task e (i32 0) (i32 8))))
       (call @fib.retain self)

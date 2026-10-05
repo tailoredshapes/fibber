@@ -55,7 +55,10 @@
       (ret nb))))
 
 ;; @w: the target retained if alive (a cmpxchg loop refusing zero),
-;; or null.
+;; or null. The count is read atomically (monotonic): a SHARED target's count is
+;; changed by other threads' atomic read-modify-writes at the same time, and a plain
+;; read of it is a data race (found by scripts/tsan.sh, case 110); the cmpxchg
+;; that follows decides, so no stronger order is needed for the read.
 (define internal (fib.upgrade ptr) ((ptr b))
   (block entry
     (let ((lockp (getelementptr %struct.fib.weakbox b (i32 0) (i32 3))))
@@ -71,7 +74,7 @@
     (let ((cp (getelementptr %struct.fib.hdr t (i32 0) (i32 0))))
       (br retry)))
   (block retry
-    (let ((c (load i64 cp)))
+    (let ((c (atomic-load monotonic i64 cp)))
       (br (icmp eq c (i64 0)) gone bump)))
   (block gone (call @fib.unlock lockp) (ret (ptr null)))
   (block bump
