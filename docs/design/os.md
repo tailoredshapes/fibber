@@ -108,9 +108,9 @@ changed to accommodate them.
 
 Native behavior is validated on Linux LP64. Darwin ABI values and backend
 typing/emission are checked, but no macOS host or SDK was used to execute or
-bootstrap the compiler. The Darwin directory binding currently uses the Intel
-macOS `readdir$INODE64` symbol. Apple Silicon uses a different symbol-selection
-rule and needs compiler target initialization beyond the current x86 setup.
+bootstrap the compiler. The Darwin directory binding is plain `readdir` (Apple Silicon has
+no `$INODE64` alias; Intel macOS is not supported). Compiler target
+initialisation for AArch64 is in docs/design/aarch64.md.
 Complete macOS support also requires validating the linker, packaging scripts,
 thread runtime, SIMD lowering, HTTP integration, and C-header conformance there.
 macOS memory streams require the libc version that provides fmemopen (10.13+).
