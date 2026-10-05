@@ -1,18 +1,28 @@
 'use strict';
-// Spawns the real `fibref lsp` and does initialize, didOpen (a broken
-// buffer, then a good one), completion, hover, shutdown and exit over
-// stdio, asserting what comes back. No vscode needed. The binary is
-// $FIBREF, else $CARGO_TARGET_DIR/debug/fibref, else ../../target/debug/fibref;
-// with none of them the test says so and exits 0 (skipped, not passed).
+// Spawns the real language server (`fibc lsp`, or `fibref lsp`) and does initialize, didOpen (a broken
+// buffer, then a good one), completion, hover, definition, document symbols, shutdown and exit over
+// stdio, asserting what comes back. No vscode needed. The server is, in order: $FIBREF (a `fibref`, or any
+// executable that takes `lsp`), $FIBC (a `fibc`), `fibc` on the PATH, $CARGO_TARGET_DIR/debug/fibref,
+// ../../target/debug/fibref. With none of them the test FAILS (exit 1): a test that passes when there is
+// nothing to test cannot fail. Only FIBREF_SKIP=1 turns that into "SKIPPED" and exit 0, on purpose.
 
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
+function onPath(name) {
+  return (process.env.PATH || '')
+    .split(path.delimiter)
+    .map((d) => path.join(d, name))
+    .find((p) => fs.existsSync(p));
+}
+
 function findBinary() {
   const candidates = [
     process.env.FIBREF,
+    process.env.FIBC,
+    onPath('fibc'),
     process.env.CARGO_TARGET_DIR && path.join(process.env.CARGO_TARGET_DIR, 'debug', 'fibref'),
     path.join(__dirname, '..', '..', '..', 'target', 'debug', 'fibref'),
   ];
@@ -23,6 +33,10 @@ function findBinary() {
 class Client {
   constructor(bin) {
     this.child = spawn(bin, ['lsp'], { stdio: ['pipe', 'pipe', 'inherit'] });
+    this.child.on('error', (e) => {
+      console.error(e);
+      process.exit(1);
+    });
     this.buf = Buffer.alloc(0);
     this.waiting = [];
     this.seen = [];
@@ -82,12 +96,17 @@ const isDiagnostics = (n) => (m) =>
 async function main() {
   const bin = findBinary();
   if (!bin) {
-    console.log('SKIPPED: no fibref binary (set FIBREF or build with cargo build -p fibref)');
-    return;
+    if (process.env.FIBREF_SKIP === '1') {
+      console.log('SKIPPED (FIBREF_SKIP=1): no language server found');
+      return;
+    }
+    throw new Error('no language server found: set FIBREF (a fibref) or FIBC (a fibc), or put fibc on the PATH; FIBREF_SKIP=1 skips on purpose');
   }
   const c = new Client(bin);
   const init = await c.request(1, 'initialize', { processId: null, rootUri: null, capabilities: {} });
   assert.strictEqual(init.result.capabilities.hoverProvider, true);
+  assert.strictEqual(init.result.capabilities.definitionProvider, true);
+  assert.strictEqual(init.result.capabilities.documentSymbolProvider, true);
   assert.deepStrictEqual(init.result.capabilities.completionProvider.triggerCharacters, ['(', '/', '.', ':', ' ']);
   c.send({ method: 'initialized', params: {} });
 
@@ -118,13 +137,24 @@ async function main() {
   });
   assert(hover.result.contents.value.includes('inc : (fn'), JSON.stringify(hover.result));
 
+  const def = await c.request(6, 'textDocument/definition', {
+    textDocument: { uri: URI },
+    position: { line: 1, character: 21 },
+  });
+  assert.deepStrictEqual(def.result, {
+    uri: URI,
+    range: { start: { line: 0, character: 7 }, end: { line: 0, character: 10 } },
+  });
+  const symbols = await c.request(7, 'textDocument/documentSymbol', { textDocument: { uri: URI } });
+  assert.deepStrictEqual(symbols.result.map((x) => x.name), ['inc', 'g']);
+
   const bad = await c.request(4, 'textDocument/nonsense', {});
   assert.strictEqual(bad.error.code, -32601);
 
   assert.strictEqual((await c.request(5, 'shutdown', null)).result, null);
   c.send({ method: 'exit' });
   assert.strictEqual(await c.exited, 0);
-  console.log('ok: initialize, didOpen, completion, didChange, hover, errors, shutdown, exit');
+  console.log('ok: initialize, didOpen, completion, didChange, hover, definition, symbols, errors, shutdown, exit');
 }
 
 main().catch((e) => {

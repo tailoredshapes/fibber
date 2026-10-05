@@ -1,12 +1,129 @@
 ;; compiler/lsp/features.fib: the requests the server answers (docs/design/fibref-port.md section 6). OWNER: packages L3 (complete, hover) and L4
 ;; (definition, document symbols). Rust: editor/complete.rs (189), diagnostics.rs. Each is a pure function of a buffer, a position and the roots.
 ;; `line` is 1-based and `col` 0-based in UTF-16 units as in the Rust `fibref complete`; the server converts.
+;; `definition` and `document-symbols` are lsp.definition's (their own file: this one was at 120 lines before them); the names here are the contract.
+;; Shapes decided where Rust and fibber differ:
+;; - the reader's scope comes from lsp.scope (`scope-at`, `classify`), the checked program from lsp.analysis, the items from lsp.catalog.
+;; - `AskNone` (what the cursor asks for is nothing: inside a string or comment) completes nothing.
 (ns lsp.features
-  (:use expand.roots lsp.types))
+  (:require [expand.heads :as heads] [expand.prelude :as pm] [lsp.definition :as defn])
+  (:use expand.roots types.program lsp.types lsp.text lsp.scope lsp.analysis lsp.catalog))
 
-(defun complete (src: str path: str line: i64 col: i64 roots: Roots) -> (Vec LsItem) (trap "todo: lsp.features complete"))
-(defun hover (src: str path: str line: i64 col: i64 roots: Roots) -> (Option str) (trap "todo: lsp.features hover"))
-(defun diagnostics (src: str path: str roots: Roots) -> (Vec LsDiag) (trap "todo: lsp.features diagnostics"))
-;; New. The definition of the name under the cursor: a local, a top-level definition of the buffer, or one of a module found through the roots.
-(defun definition (src: str path: str line: i64 col: i64 roots: Roots) -> (Option LsLocation) (trap "todo: lsp.features definition"))
-(defun document-symbols (src: str path: str) -> (Vec LsItem) (trap "todo: lsp.features document-symbols"))
+(defun cursor-offset :private (src: str line: i64 col: i64) -> i64
+  (pos->offset src (LsPos (max 0 (- line 1)) (max 0 col))))
+
+(defun dedupe :private (items: (Vec LsItem)) -> (Vec LsItem)
+  (. (reduce (fn (acc: (Pair (Set str) (Vec LsItem)) i: LsItem)
+               (if (contains? (. acc fst) (. i label))
+                   acc
+                   (Pair (conj (. acc fst) (. i label)) (conj (. acc snd) i))))
+             (Pair (set-empty) []) items)
+     snd))
+
+;; The keywords written in `src`, but not the word being typed.
+(defun keywords :private (src: str word-start: i64) -> (Vec LsItem)
+  (let ((n (str-len src)))
+    (loop ((i 0) (from -1) (out []))
+      (cond (> i n) out
+            (or (= i n) (defn/word-break? (str-byte-at src i)))
+              (recur (+ i 1) -1
+                     (if (and (>= from 0) (and (> (- i from) 1) (and (= (str-byte-at src from) 58i8) (not (= from word-start)))))
+                         (conj out (LsItem (str-slice src from i) "keyword" "" "this file"))
+                         out))
+            :else (recur (+ i 1) (if (< from 0) i from) out)))))
+
+(defun own-defs :private (scope: LsScope kinds: (Vec str)) -> (Vec LsItem)
+  (mapv (fn (d: LsDef) (LsItem (. d name) (. d kind) (. d signature) "this module"))
+        (filterv (fn (d: LsDef) (contains? (set-of kinds) (. d kind))) (. scope defs))))
+
+(defun set-of :private (kinds: (Vec str)) -> (Set str) (reduce (fn (a: (Set str) k: str) (conj a k)) (set-empty) kinds))
+
+(defun local-detail :private (a: LsAnalysis l: LsLocal path: str off: i64) -> str
+  (let ((checked (if (. a own)
+                     (match (. a typed)
+                       ((some tp) (catalog-local-type tp (. l name) path off))
+                       (nil nil))
+                     nil)))
+    (match checked
+      ((some p) (. p snd))
+      (nil (. l ty)))))
+
+(defun value-names :private (scope: LsScope a: LsAnalysis path: str off: i64) -> (Vec LsItem)
+  (let ((locals (mapv (fn (l: LsLocal) (LsItem (. l name) "variable" (local-detail a l path off) "local")) (reverse (. scope locals))))
+        (own (mapv (fn (d: LsDef) (LsItem (. d name) (. d kind) (. d signature) "this module")) (. scope defs)))
+        (globals (match (. a typed) ((some tp) (catalog-names tp)) (nil [])))
+        (core (mapv (fn (f: str) (LsItem f "macro" "special form" "core")) heads/core-forms))
+        (macros (mapv (fn (m: str) (LsItem m "macro" "macro" "prelude")) pm/prelude-macros)))
+    (into (into (into (into locals own) globals) core) macros)))
+
+(defun field-items :private (x: str scope: LsScope a: LsAnalysis path: str off: i64) -> (Vec LsItem)
+  (match (. a typed)
+    (nil [])
+    ((some tp)
+     (let ((checked (if (. a own)
+                        (match (catalog-local-type tp x path off) ((some p) (. p fst)) (nil nil))
+                        nil))
+           (ann (match (first (filterv (fn (l: LsLocal) (= (. l name) x)) (reverse (. scope locals))))
+                  ((some l) (. l ty))
+                  (nil ""))))
+       (match checked
+         ((some id) (type-fields (. tp globals) id))
+         (nil (if (= ann "") [] (catalog-fields tp ann))))))))
+
+;; The candidates of the right class at `line` (1-based) and `col` (0-based) of `src`, the text of the file `path`. Never fails: a buffer that
+;; does not read or check gets the scope the reader can give, then the library's names; prefix filtering is the client's. Rust: complete.rs
+(defun complete (src: str path: str line: i64 col: i64 roots: Roots) -> (Vec LsItem)
+  (let ((off (cursor-offset src line col))
+        (ctx (classify (str-slice src 0 (cursor-offset src line col))))
+        (a (analyse src path roots (some (cursor-offset src line col))))
+        (scope (scope-at src (. ctx word-start) path)))
+    (dedupe
+      (match (. ctx ask)
+        ((AskKeyword) (keywords src (. ctx word-start)))
+        ((AskType) (into (own-defs scope ["struct" "enum" "protocol"]) (match (. a typed) ((some tp) (catalog-types tp)) (nil []))))
+        ((AskExport alias) (match (. a typed) ((some tp) (catalog-exports tp alias)) (nil [])))
+        ((AskField x) (field-items x scope a path off))
+        ((AskValue) (value-names scope a path off))
+        ((AskNone) [])))))
+
+(defun global-text :private (tp: TypedProgram word: str) -> (Option str)
+  (let ((module (match (str-find word "/" 0) ((some i) (str-slice word 0 i)) (nil "")))
+        (base (match (str-find word "/" 0) ((some i) (str-slice word (+ i 1) (str-len word))) (nil word))))
+    (match (catalog-value tp module base)
+      (nil nil)
+      ((some it)
+       (let ((clauses (catalog-all-clauses tp module base))
+             (shown (if (< (count clauses) 2) [it] clauses)))
+         (some (str-join (into (vec (interpose "\n" (mapv (fn (c: LsItem) (str-join [(. c label) " : " (. c detail)])) shown)))
+                               ["\n(" (. it kind) ", " (. it doc) ")"]))))))))
+
+;; The text to show when the cursor rests on a name: a local's type or the checker's scheme of a global, as `name : type`; none when it is no
+;; name the program knows. Rust: complete.rs hover
+(defun hover (src: str path: str line: i64 col: i64 roots: Roots) -> (Option str)
+  (let ((off (cursor-offset src line col))
+        (w (defn/word-bounds src (cursor-offset src line col))))
+    (if (= (. w fst) (. w snd))
+        nil
+        (let ((word (str-slice src (. w fst) (. w snd)))
+              (a (analyse src path roots (some off))))
+          (match (. a typed)
+            (nil nil)
+            ((some tp)
+             (match (if (. a own) (catalog-local-type tp word path off) nil)
+               ((some p) (some (str-join [word " : " (. p snd)])))
+               (nil (global-text tp word)))))))))
+
+;; The problems in `src`, the text of the file `path`. Rust: diagnostics.rs diagnostics
+(defun diagnostics (src: str path: str roots: Roots) -> (Vec LsDiag)
+  (. (analyse src path roots nil) diags))
+
+;; The definition of the name under the cursor (lsp.definition).
+(defun definition (src: str path: str line: i64 col: i64 roots: Roots) -> (Option LsLocation)
+  (defn/find-definition src path (cursor-offset src line col) roots))
+
+(defun document-symbols (src: str path: str) -> (Vec LsItem)
+  (mapv (fn (s: defn/LsSymbol) (LsItem (. s name) (. s kind) "" "")) (defn/symbols src path)))
+
+;; New (the contract's `document-symbols` has no ranges, which the protocol's DocumentSymbol needs): the same with the range of each form and of
+;; its name, as byte offsets.
+(defun document-ranges (src: str path: str) -> (Vec defn/LsSymbol) (defn/symbols src path))

@@ -1,0 +1,239 @@
+;; compiler/lsp/definition.fib: go to definition and document symbols (docs/design/fibref-port.md sections 6.2, 10.1; package L4). New: the Rust has
+;; neither. lsp.features' `definition` and `document-symbols` are these functions at the contract's types.
+;; What it answers, in order, for the word under the cursor:
+;;   1. after `(. x `: the field of the type of `x` (the checked type of the binding, else its written annotation), found in the type's text;
+;;   2. a local or parameter of the reader's scope (lsp.scope `scope-at`): the nearest binding of the name before the cursor;
+;;   3. a top-level definition of the buffer (the reader's scope again);
+;;   4. a name of the checked program, `alias/name` too: a function, constructor, method, `def`, `extern`, type or protocol, at the `Pos` the
+;;      tables hold, in the file that `Pos` names (read through the roots when it is not the buffer).
+;; Every location is narrowed to the name itself (`name-span`) because a definition's `Pos` is its whole form, and the reader scope's ranges
+;; are taken as either the name or the form: the name is searched for in the range, never assumed at a fixed offset.
+;; Shapes decided: positions are byte offsets of the file's text; a file that cannot be read gives the whole range the tables hold; a name of
+;; the builtins (no source) answers nothing.
+(ns lsp.definition
+  (:use syntax.pos syntax.form syntax.reader expand.roots types.program types.decls types.names types.ast types.table lsp.types lsp.scope lsp.analysis lsp.catalog))
+
+(defstruct LsSymbol (name: str kind: str start: i64 end: i64 sel-start: i64 sel-end: i64))
+
+(defun word-break? (b: i8) -> bool
+  (or (= b 32i8) (or (= b 10i8) (or (= b 9i8) (or (= b 13i8)
+      (or (= b 40i8) (or (= b 41i8) (or (= b 91i8) (or (= b 93i8) (or (= b 123i8) (or (= b 125i8)
+      (or (= b 34i8) (or (= b 59i8) (or (= b 44i8) (or (= b 39i8) (or (= b 96i8) (or (= b 126i8) (or (= b 64i8) (= b 94i8)))))))))))))))))))
+
+;; The word under byte `off`: its start and end.
+(defun word-bounds (src: str off: i64) -> (Pair i64 i64)
+  (let ((n (str-len src))
+        (off (min off (str-len src)))
+        (s (loop ((i off)) (if (and (> i 0) (not (word-break? (str-byte-at src (- i 1))))) (recur (- i 1)) i)))
+        (e (loop ((i off)) (if (and (< i n) (not (word-break? (str-byte-at src i)))) (recur (+ i 1)) i))))
+    (Pair s e)))
+
+;; Where `name` stands as a token in text[start, end): after the first byte (the head of a form is not the name), or the whole range when it is
+;; not found or the range is already the name.
+(defun name-span (text: str start: i64 end: i64 name: str) -> (Pair i64 i64)
+  (let ((n (str-len text))
+        (len (str-len name))
+        (end (min end (str-len text))))
+    (if (or (= len 0) (or (> start end) (and (= (- end start) len) (= (str-slice text start end) name))))
+        (Pair start end)
+        (loop ((from (min (+ start 1) n)))
+          (match (if (<= from n) (str-find text name from) nil)
+            (nil (Pair start end))
+            ((some i)
+             (cond (>= i end) (Pair start end)
+                   (and (or (= i 0) (word-break? (str-byte-at text (- i 1))))
+                        (or (= (+ i len) n) (word-break? (str-byte-at text (+ i len)))))
+                     (Pair i (+ i len))
+                   :else (recur (+ i len)))))))))
+
+;; The file a `Pos` names, as a path that reads: the file itself, else the same name under each root (the library's `lib/a/b.fib` is `a/b.fib`
+;; under a root, or under the built-in directory).
+(defun resolve-path (file: str roots: Roots) -> str
+  (if (some? (read-file file))
+      file
+      (let ((rel (if (and (> (str-len file) 4) (= (str-slice file 0 4) "lib/")) (str-slice file 4 (str-len file)) file))
+            (dirs (match (. roots builtin) ((some b) (conj (. roots dirs) b)) (nil (. roots dirs)))))
+        (match (first (filterv (fn (p: str) (some? (read-file p))) (mapv (fn (d: str) (path-join d rel)) dirs)))
+          ((some p) p)
+          (nil file)))))
+
+(defun text-of :private (src: str path: str file: str roots: Roots) -> (Pair str str)
+  (if (= file path)
+      (Pair src path)
+      (let ((p (resolve-path file roots)))
+        (match (read-file p)
+          ((some t) (Pair t p))
+          (nil (Pair "" p))))))
+
+;; The last `(defn NAME` (or `(defun NAME`, `(defmacro NAME`) before byte `before` of `text`: the head of the definition that an arity clause
+;; belongs to, when the clause's own `Pos` (`([x] ..)`) does not hold the name. The span of NAME in it.
+(defun head-from :private (text: str before: i64 name: str head: str) -> (Option (Pair i64 i64))
+  (let ((pat (str-join ["(" head " " name])))
+    (loop ((from 0) (best nil))
+      (match (if (<= from (str-len text)) (str-find text pat from) nil)
+        (nil best)
+        ((some i)
+         (let ((at (+ i (+ (str-len head) 2)))
+               (stop (+ at (str-len name)))
+               (ok (and (< i before) (or (= stop (str-len text)) (word-break? (str-byte-at text stop))))))
+           (recur (+ i 1) (if ok (some (Pair at stop)) best))))))))
+
+(defun head-before :private (text: str before: i64 name: str) -> (Option (Pair i64 i64))
+  (reduce (fn (best: (Option (Pair i64 i64)) head: str)
+            (match (head-from text before name head)
+              (nil best)
+              ((some h) (match best
+                          (nil (some h))
+                          ((some o) (if (> (. h fst) (. o fst)) (some h) (some o)))))))
+          nil ["defn" "defun" "defmacro"]))
+
+;; The location of `name` defined at `pos`, narrowed to the name.
+(defun location-of :private (src: str path: str roots: Roots pos: Pos name: str) -> LsLocation
+  (let ((tx (text-of src path (. pos file) roots))
+        (sp (name-span (. tx fst) (. pos start) (. pos end) name))
+        (found (and (<= (. sp snd) (str-len (. tx fst))) (and (<= (. sp fst) (. sp snd)) (= (str-slice (. tx fst) (. sp fst) (. sp snd)) name))))
+        (back (if found nil (head-before (. tx fst) (. pos start) name))))
+    (match back
+      ((some b) (LsLocation (. tx snd) (. b fst) (. b snd)))
+      (nil (LsLocation (. tx snd) (. sp fst) (. sp snd))))))
+
+(defun ref-pos :private (g: Globals r: GlobalRef) -> (Option Pos)
+  (match r
+    ((GFun f) (match (table-find (. g funs) f) ((some d) (some (. d pos))) (nil nil)))
+    ((GCtor id _) (match (table-find (. g types) id) ((some d) (some (. d pos))) (nil nil)))
+    ((GMethod p i)
+     (match (table-find (. g protos) p)
+       ((some pd) (if (< i (count (. pd methods))) (some (. (nth (. pd methods) i) pos)) (some (. pd pos))))
+       (nil nil)))
+    ((GBuiltin _) nil)
+    ((GDef d) (match (table-find (. g defs) d) ((some x) (some (. x pos))) (nil nil)))
+    ((GExtern x) (match (table-find (. g externs) x) ((some e) (some (. e pos))) (nil nil)))))
+
+;; The `Pos` of a value, type or protocol `base` as module `m` sees it.
+(defun clause-ref :private (g: Globals m: i64 base: str) -> (Option GlobalRef)
+  (first (filterv (fn (r: GlobalRef) true)
+                  (reduce (fn (acc: (Vec GlobalRef) n: i64)
+                            (match (g-value g m (str-join [base "$" (str n)])) ((some r) (conj acc r)) (nil acc)))
+                          [] (range 1 13)))))
+
+;; An overloaded name (arity clauses `base$N`) has no plain name in the tables: its smallest clause stands for it, as it does as a value.
+(defun global-pos :private (g: Globals m: i64 base: str) -> (Option Pos)
+  (match (match (g-value g m base) ((some r) (some r)) (nil (clause-ref g m base)))
+    ((some r) (ref-pos g r))
+    (nil (match (g-type-name g m base)
+           ((some id) (match (table-find (. g types) id) ((some td) (some (. td pos))) (nil nil)))
+           (nil (match (g-proto-name g m base)
+                  ((some id) (match (table-find (. g protos) id) ((some pd) (some (. pd pos))) (nil nil)))
+                  (nil nil)))))))
+
+(defun global-location :private (src: str path: str roots: Roots tp: TypedProgram word: str) -> (Option LsLocation)
+  (let ((g (. tp globals))
+        (main @(. g main)))
+    (match (str-find word "/" 0)
+      ((some i)
+       (let ((alias (str-slice word 0 i))
+             (base (str-slice word (+ i 1) (str-len word))))
+         (match (get (. (g-module g main) aliases) alias)
+           (nil nil)
+           ((some m) (match (global-pos g m base) ((some p) (some (location-of src path roots p base))) (nil nil))))))
+      (nil (match (global-pos g main word) ((some p) (some (location-of src path roots p word))) (nil nil))))))
+
+;; The field `field` of the struct type `id`, found in the text of the type.
+(defun field-location :private (src: str path: str roots: Roots tp: TypedProgram id: i64 field: str) -> (Option LsLocation)
+  (match (table-find (. (. tp globals) types) id)
+    (nil nil)
+    ((some td)
+     (let ((tx (text-of src path (. (. td pos) file) roots))
+           (sp (name-span (. tx fst) (. (. td pos) start) (. (. td pos) end) (str field ":"))))
+       (some (LsLocation (. tx snd) (. sp fst) (min (+ (. sp fst) (str-len field)) (. sp snd))))))))
+
+(defun field-target :private (a: LsAnalysis scope: LsScope recv: str path: str off: i64) -> (Option i64)
+  (match (. a typed)
+    (nil nil)
+    ((some tp)
+     (let ((checked (if (. a own) (match (catalog-local-type tp recv path off) ((some p) (. p fst)) (nil nil)) nil)))
+       (match checked
+         ((some id) (some id))
+         (nil (match (first (filterv (fn (l: LsLocal) (= (. l name) recv)) (reverse (. scope locals))))
+                ((some l) (g-type-name (. tp globals) @(. (. tp globals) main) (. l ty)))
+                (nil nil))))))))
+
+(defun local-location :private (src: str path: str scope: LsScope word: str) -> (Option LsLocation)
+  (match (first (filterv (fn (l: LsLocal) (= (. l name) word)) (reverse (. scope locals))))
+    (nil nil)
+    ((some l) (let ((sp (name-span src (. l start) (. l end) word))) (some (LsLocation path (. sp fst) (. sp snd)))))))
+
+(defun def-location :private (src: str path: str scope: LsScope word: str) -> (Option LsLocation)
+  (match (first (filterv (fn (d: LsDef) (= (. d name) word)) (. scope defs)))
+    (nil nil)
+    ((some d) (let ((sp (name-span src (. d start) (. d end) word))) (some (LsLocation path (. sp fst) (. sp snd)))))))
+
+(defun first-some :private (a: (Option LsLocation) b: (fn () (Option LsLocation))) -> (Option LsLocation)
+  (match a
+    ((some x) (some x))
+    (nil (b))))
+
+;; The definition of the name at byte `off` of `src`, the text of the file `path`.
+(defun find-definition (src: str path: str off: i64 roots: Roots) -> (Option LsLocation)
+  (let ((w (word-bounds src off)))
+    (if (= (. w fst) (. w snd))
+        nil
+        (let ((word (str-slice src (. w fst) (. w snd)))
+              (ctx (classify (str-slice src 0 (. w fst))))
+              (scope (scope-at src (. w fst) path))
+              (a (analyse src path roots (some off))))
+          (first-some
+            (match (. ctx ask)
+              ((AskField recv)
+               (match (field-target a scope recv path off)
+                 ((some id) (match (. a typed) ((some tp) (field-location src path roots tp id word)) (nil nil)))
+                 (nil nil)))
+              (_ nil))
+            (fn ()
+              (first-some (local-location src path scope word)
+                (fn ()
+                  (first-some (def-location src path scope word)
+                    (fn () (match (. a typed) ((some tp) (global-location src path roots tp word)) (nil nil))))))))))))
+
+;; ---- document symbols
+
+(defun symbol-kind :private (head: str) -> str
+  (cond (or (= head "defun") (= head "defn")) "function"
+        (= head "defn-") "function"
+        (or (= head "defmacro") (= head "defmacro-")) "macro"
+        (or (= head "defstruct") (= head "defrecord")) "struct"
+        (= head "defenum") "enum"
+        (= head "defprotocol") "protocol"
+        (= head "def") "variable"
+        :else ""))
+
+(defun symbol-of :private (f: Stx) -> (Option LsSymbol)
+  (match (. f kind)
+    ((SList items)
+     (if (< (count items) 2)
+         nil
+         (match (. (nth items 0) kind)
+           ((SSym head)
+            (let ((kind (symbol-kind head)))
+              (if (= kind "")
+                  nil
+                  (match (. (nth items 1) kind)
+                    ((SSym name)
+                     (let ((typed (and (> (str-len name) 1) (= (str-byte-at name (- (str-len name) 1)) 58i8)))
+                           (np (. (nth items 1) pos)))
+                       (some (LsSymbol (if typed (str-slice name 0 (- (str-len name) 1)) name) kind (. (. f pos) start) (. (. f pos) end)
+                                       (. np start) (if typed (- (. np end) 1) (. np end))))))
+                    (_ nil)))))
+           (_ nil))))
+    (_ nil)))
+
+;; The buffer's own top-level definitions in order, with the range of each form and of its name. When the buffer does not read (the reader stops
+;; at its first error) the reader scope's definitions stand in, each over the range the scope gives.
+(defun symbols (src: str path: str) -> (Vec LsSymbol)
+  (match (read-all src path)
+    ((Ok forms) (reduce (fn (acc: (Vec LsSymbol) f: Stx) (match (symbol-of f) ((some s) (conj acc s)) (nil acc))) [] forms))
+    ((Err _)
+     (mapv (fn (d: LsDef)
+             (let ((sp (name-span src (. d start) (. d end) (. d name))))
+               (LsSymbol (. d name) (. d kind) (. d start) (. d end) (. sp fst) (. sp snd))))
+           (. (scope-at src (str-len src) path) defs)))))
