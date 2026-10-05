@@ -1,0 +1,41 @@
+;; spec: docs/design/finite-domains-and-sudoku.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.core fib.seq fib.coll)
+  (:require [fib.logic :as l] [fib.logic.fd :as fd]))
+
+(defun model (seed: i64 qs: (Vec l/Term)) -> (Vec l/Goal)
+  (let ((a (nth qs 0)) (b (nth qs 1)) (c (nth qs 2))
+        (goals [(fd/+ a b c)]))
+    (let ((ordered (if (!= (bit-and seed 1) 0) (conj goals (fd/<= a b)) goals)))
+      (let ((distinct (if (!= (bit-and seed 2) 0) (conj ordered (fd/distinct qs)) ordered)))
+        (let ((unequal (if (!= (bit-and seed 4) 0) (conj distinct (fd/!= c (l/integer 0))) distinct)))
+          (let ((aliased (if (!= (bit-and seed 8) 0) (conj unequal (l/== a c)) unequal)))
+            (let ((grounded (if (!= (bit-and seed 16) 0)
+                                (conj aliased (l/== (l/pair a b) (l/pair a (l/integer -1)))) aliased)))
+              (conj grounded (fd/in-all qs (fd/interval -1 2))))))))))
+(defun valid? (seed: i64 a: i64 b: i64 c: i64) -> bool
+  (and (= (+ a b) c)
+       (or (= (bit-and seed 1) 0) (<= a b))
+       (or (= (bit-and seed 2) 0) (and (!= a b) (!= a c) (!= b c)))
+       (or (= (bit-and seed 4) 0) (!= c 0))
+       (or (= (bit-and seed 8) 0) (= a c))
+       (or (= (bit-and seed 16) 0) (= b -1))))
+(defun text (terms: (Vec l/Term)) -> str (l/term-text (l/list-term terms)))
+(defun expected (seed: i64) -> (Set str)
+  (let ((out (cell #{})))
+    (do (doseq (a (range -1 3)) (doseq (b (range -1 3)) (doseq (c (range -1 3))
+          (when (valid? seed a b c) (set! out (conj @out (text [(l/integer a) (l/integer b) (l/integer c)])))))))
+        @out)))
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (dotimes (seed 32)
+          (let ((reference (expected seed))
+                (plain (l/run-many 100 3 (fn (qs) (l/all (model seed qs)))))
+                (batch (l/run-many 100 3 (fn (qs) (fd/batch (model seed qs))))))
+            (do (check c (= (set (mapv text plain)) reference))
+                (check c (= (set (mapv text batch)) reference)))))
+        (checks-result c))))

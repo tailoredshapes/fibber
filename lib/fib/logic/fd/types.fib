@@ -1,27 +1,44 @@
-(ns fib.logic.fd.types (:use fib.core fib.seq fib.coll fib.logic.terms fib.logic.unify fib.logic.fd.domain))
+(ns fib.logic.fd.types (:use fib.core fib.seq fib.coll fib.logic.terms fib.logic.unify fib.logic.fd.domain fib.logic.fd.slots))
 (defenum Constraint (In term: Term domain: Domain) (AllDifferent terms: (Vec Term))
   (NotEqual left: Term right: Term) (Less left: Term right: Term strict: bool)
   (Sum left: Term right: Term result: Term))
-(defstruct Store (domains: (Map i64 Domain) constraints: (Vec Constraint)))
+(defenum Setup (Post constraint: Constraint) (Bind left: Term right: Term))
+(defstruct Scheduler (watches: (Slots (Vec i64)) constraints: (Vec (Option Constraint))
+                     queue: (Vec i64) queued: (Vec bool)))
+(defstruct Store (domains: (Slots Domain) domain-ids: (Vec i64) dirty: (Vec i64)
+                 scheduler: Scheduler runs: i64 updates: i64))
 (defstruct Snapshot (state: State store: Store))
-(defun empty-store () -> Store (Store {} []))
+(defun empty-store () -> Store
+  (Store (empty-slots) [] [] (Scheduler (empty-slots) [] [] []) 0 0))
+(defun with-scheduler (store: Store scheduler: Scheduler) -> Store
+  (Store (. store domains) (. store domain-ids) (. store dirty) scheduler (. store runs) (. store updates)))
+(defun changed (store: Store id: i64) -> Store
+  (Store (. store domains) (. store domain-ids) (conj (. store dirty) id) (. store scheduler) (. store runs) (. store updates)))
+(defun store-domain (store: Store id: i64 d: Domain) -> Store
+  (let ((old (slot-get (. store domains) id)))
+    (match old
+      ((some previous) (if (= previous d) store
+        (Store (slot-put (. store domains) id d) (. store domain-ids) (conj (. store dirty) id)
+               (. store scheduler) (. store runs) (+ (. store updates) 1))))
+      (nil (Store (slot-put (. store domains) id d) (conj (. store domain-ids) id) (conj (. store dirty) id)
+                  (. store scheduler) (. store runs) (+ (. store updates) 1))))))
 (defun numeric? (term: Term state: State) -> bool
   (match (walk term (. state bindings)) ((Integer _) true) ((Var _) true) (_ false)))
 (defun known-domain (term: Term snapshot: Snapshot) -> (Option Domain)
   (match (walk term (. (. snapshot state) bindings))
     ((Integer n) (some (Small n 1)))
-    ((Var id) (get (. (. snapshot store) domains) id))
+    ((Var id) (slot-get (. (. snapshot store) domains) id))
     (_ nil)))
 (defun restrict (snapshot: Snapshot term: Term d: Domain) -> (Option Snapshot)
   (if (= (domain-size d) 0) nil
       (let ((state (. snapshot state)) (store (. snapshot store)))
         (match (walk term (. state bindings))
           ((Integer n) (if (contains-value? d n) (some snapshot) nil))
-          ((Var id) (let ((old (get (. store domains) id))
+          ((Var id) (let ((old (slot-get (. store domains) id))
                           (next (match old ((some previous) (intersection previous d)) (nil d))))
             (if (= (domain-size next) 0) nil
                 (match old
                   ((some previous) (if (= previous next) (some snapshot)
-                                      (some (Snapshot state (Store (assoc (. store domains) id next) (. store constraints))))))
-                  (nil (some (Snapshot state (Store (assoc (. store domains) id next) (. store constraints)))))))))
+                      (some (Snapshot state (store-domain store id next)))))
+                  (nil (some (Snapshot state (store-domain store id next))))))))
           (_ nil)))))

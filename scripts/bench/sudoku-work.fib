@@ -1,0 +1,17 @@
+;; Untimed setup diagnostics, separate from sudoku.fib's completed-solve timings.
+;; Build: F build scripts/bench/sudoku-work.fib -I examples -I lib -o /tmp/sudoku-work
+;; Counts cover initial propagation only; later search and failed branches are excluded.
+(ns main (:use fib.core fib.seq fib.coll fib.print fib.logic.terms fib.logic.unify fib.logic.fd.types)
+  (:require [fib.logic.search :as l] [fib.logic.fd.engine :as e]
+            [sudoku.puzzles :as p] [sudoku.solver :as s]))
+(defun measure :private (name: str puzzle: (Vec i64)) -> unit
+  (let ((variables (mapv (fn (id: i64) (Var id)) (range 81))))
+    (match (s/model puzzle variables)
+      ((l/ConstrainAll steps) (match (e/post-all (State {} 81) (empty-store) steps)
+        (nil (trap "sudoku diagnostics: initial propagation failed"))
+        ((some snapshot) (do
+          (println name "initial-constraint-runs=" (. (. snapshot store) runs)
+                        "initial-domain-updates=" (. (. snapshot store) updates))
+          (println "needs-labeling=" (match (e/choose snapshot) (nil false) ((some _) true)))))))
+      (_ (trap "sudoku diagnostics: expected FD batch")))))
+(defun main () -> i64 (do (measure "test" p/test-puzzle) (measure "hard" p/hard-puzzle) 0))

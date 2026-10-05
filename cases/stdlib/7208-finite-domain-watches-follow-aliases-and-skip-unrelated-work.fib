@@ -1,0 +1,37 @@
+;; spec: docs/design/finite-domains-and-sudoku.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.logic.terms fib.logic.unify fib.logic.fd.types)
+  (:require [fib.logic.fd.engine :as e] [fib.logic.fd.domain :as d]))
+
+(defun require-snapshot (value: (Option Snapshot)) -> Snapshot
+  (match value ((some s) s) (nil (trap "expected a consistent store"))))
+(defun bind (snapshot: Snapshot a: Term b: Term) -> Snapshot
+  (match (unify-changed a b (. (. snapshot state) bindings))
+    (nil (trap "expected successful unification"))
+    ((some update) (require-snapshot
+      (e/after-unify (State (. update bindings) (. (. snapshot state) next-id))
+                     (. snapshot store) (. update changed))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (initial (require-snapshot (e/post-all (State {} 4) (empty-store)
+          [(Post (In (Var 0) (d/interval 1 4))) (Post (In (Var 1) (d/interval 1 4)))
+           (Post (In (Var 2) (d/interval 1 4))) (Post (In (Var 3) (d/interval 1 4)))
+           (Post (Less (Var 0) (Var 1) true)) (Post (Less (Var 2) (Var 3) true))])))
+        (narrowed (bind initial (Var 0) (Integer 1)))
+        (again (require-snapshot (e/propagate narrowed)))
+        (alias (bind initial (Var 0) (Var 10)))
+        (fixed (bind alias (Var 10) (Integer 3))))
+    (do (check c (= (- (. (. narrowed store) runs) (. (. initial store) runs)) 1))
+        (check c (= (. (. again store) runs) (. (. narrowed store) runs)))
+        (check c (= (known-domain (Var 2) narrowed) (known-domain (Var 2) initial)))
+        (check c (= (known-domain (Var 3) narrowed) (known-domain (Var 3) initial)))
+        (check c (= (walk (Var 1) (. (. fixed state) bindings)) (Integer 4)))
+        (check c (= (walk (Var 0) (. (. fixed state) bindings)) (Integer 3)))
+        (check c (= (count (. (. fixed store) dirty)) 0))
+        (check c (= (count (. (. (. fixed store) scheduler) queue)) 0))
+        (checks-result c))))

@@ -33,6 +33,29 @@
                        (_ nil)))
                     (_ nil)))))))))
 
+;; FD synchronization needs only the roots extended by this unification.
+;; Keep ordinary unification's occurs check and avoid diffing whole maps.
+(defstruct BindingUpdate (bindings: (Map i64 Term) changed: (Vec i64)))
+(defun extend-changed :private (id: i64 term: Term update: BindingUpdate) -> (Option BindingUpdate)
+  (match (extend id term (. update bindings))
+    (nil nil)
+    ((some bindings) (some (BindingUpdate bindings (conj (. update changed) id))))))
+(defun unify-update :private (left: Term right: Term update: BindingUpdate) -> (Option BindingUpdate)
+  (let ((a (walk left (. update bindings))) (b (walk right (. update bindings))))
+    (if (same-term? a b) (some update)
+        (match a
+          ((Var id) (extend-changed id b update))
+          (_ (match b
+            ((Var id) (extend-changed id a update))
+            (_ (match a
+              ((Cons ah at) (match b
+                ((Cons bh bt) (match (unify-update ah bh update)
+                  (nil nil) ((some next) (unify-update at bt next))))
+                (_ nil)))
+              (_ nil)))))))))
+(defun unify-changed (left: Term right: Term bindings: (Map i64 Term)) -> (Option BindingUpdate)
+  (unify-update left right (BindingUpdate bindings [])))
+
 ;; Shared renaming across all query terms preserves aliasing in each answer.
 (defun reify-term :private (term: Term bindings: (Map i64 Term) names: (Map i64 Term)) -> (Pair Term (Map i64 Term))
   (match (walk term bindings)

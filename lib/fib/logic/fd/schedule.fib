@@ -1,0 +1,43 @@
+;; Stable constraint IDs, variable watches, and a deduplicated FIFO work queue.
+(ns fib.logic.fd.schedule (:use fib.core fib.seq fib.coll fib.logic.terms fib.logic.unify
+                                fib.logic.fd.types fib.logic.fd.slots))
+(defun terms :private (constraint: Constraint) -> (Vec Term)
+  (match constraint
+    ((In term _) [term]) ((AllDifferent xs) xs)
+    ((NotEqual a b) [a b]) ((Less a b _) [a b]) ((Sum a b c) [a b c])))
+(defun enqueue (scheduler: Scheduler id: i64) -> Scheduler
+  (if (nth (. scheduler queued) id) scheduler
+      (match (nth (. scheduler constraints) id)
+        (nil scheduler)
+        ((some _) (Scheduler (. scheduler watches) (. scheduler constraints)
+                             (conj (. scheduler queue) id) (assoc (. scheduler queued) id true))))))
+(defun wake (scheduler: Scheduler variable: i64) -> Scheduler
+  (match (slot-get (. scheduler watches) variable)
+    (nil scheduler)
+    ((some ids) (reduce (fn (s: Scheduler id: i64) (enqueue s id)) scheduler ids))))
+(defun add (scheduler: Scheduler state: State constraint: Constraint) -> Scheduler
+  (let ((id (count (. scheduler constraints)))
+        (watches (reduce (fn (w: (Slots (Vec i64)) term: Term)
+          (match (walk term (. state bindings))
+            ((Var variable) (let ((old (match (slot-get w variable) (nil []) ((some ids) ids))))
+              (slot-put w variable (if (includes? id old) old (conj old id)))))
+            (_ w))) (. scheduler watches) (terms constraint))))
+    (Scheduler watches (conj (. scheduler constraints) (some constraint))
+               (conj (. scheduler queue) id) (conj (. scheduler queued) true))))
+(defun move-watch (scheduler: Scheduler from: i64 to: i64) -> Scheduler
+  (match (slot-get (. scheduler watches) from)
+    (nil scheduler)
+    ((some ids)
+      (let ((old (match (slot-get (. scheduler watches) to) (nil []) ((some xs) xs)))
+            (merged (reduce (fn (out: (Vec i64) id: i64)
+                        (if (includes? id out) out (conj out id))) old ids)))
+        (Scheduler (slot-put (slot-remove (. scheduler watches) from) to merged)
+                   (. scheduler constraints) (. scheduler queue) (. scheduler queued))))))
+(defun take-id (scheduler: Scheduler id: i64) -> Scheduler
+  (Scheduler (. scheduler watches) (. scheduler constraints) (. scheduler queue)
+             (assoc (. scheduler queued) id false)))
+(defun retire (scheduler: Scheduler id: i64) -> Scheduler
+  (Scheduler (. scheduler watches) (assoc (. scheduler constraints) id nil)
+             (. scheduler queue) (. scheduler queued)))
+(defun clear-queue (scheduler: Scheduler) -> Scheduler
+  (Scheduler (. scheduler watches) (. scheduler constraints) [] (. scheduler queued)))

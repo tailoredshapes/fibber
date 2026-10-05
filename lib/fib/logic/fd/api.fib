@@ -2,7 +2,16 @@
 (defun size (d: Domain) -> i64 (domain-size d))
 (defun in (term: Term d: Domain) -> Goal (Constrain (In term d)))
 (defun in-all (terms: (Vec Term) d: Domain) -> Goal
-  (All (mapv (fn (term: Term) (in term d)) terms)))
+  (ConstrainAll (mapv (fn (term: Term) (Post (In term d))) terms)))
+(defun batch-steps :private (goal: Goal out: (Vec Setup)) -> (Vec Setup)
+  (match goal
+    ((Constrain constraint) (conj out (Post constraint)))
+    ((ConstrainAll steps) (into out steps))
+    ((Equal a b) (conj out (Bind a b)))
+    ((All goals) (reduce (fn (steps: (Vec Setup) g: Goal) (batch-steps g steps)) out goals))
+    (_ (trap "fd: batch accepts only equality and finite-domain goals"))))
+(defun batch (goals: (Vec Goal)) -> Goal
+  (ConstrainAll (reduce (fn (out: (Vec Setup) goal: Goal) (batch-steps goal out)) [] goals)))
 (defun distinct (terms: (Vec Term)) -> Goal (Constrain (AllDifferent terms)))
 (defun != (left: Term right: Term) -> Goal (Constrain (NotEqual left right)))
 (defun < (left: Term right: Term) -> Goal (Constrain (Less left right true)))

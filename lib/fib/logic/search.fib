@@ -3,7 +3,8 @@
   (:require [fib.logic.fd.engine :as fd] [fib.logic.fd.domain :as domain]))
 
 (defenum Goal (Equal left: Term right: Term) (All goals: (Vec Goal)) (Any goals: (Vec Goal))
-  (Fresh build: (fn (Term) Goal)) (Delayed build: (fn () Goal)) (Constrain constraint: Constraint))
+  (Fresh build: (fn (Term) Goal)) (Delayed build: (fn () Goal)) (Constrain constraint: Constraint)
+  (ConstrainAll steps: (Vec Setup)))
 (defenum Goals (NoGoals) (NextGoal goal: Goal tail: Goals))
 (defstruct Work (state: State goals: Goals store: Store))
 (defstruct Search (front: (Vec Work) position: i64 back: (Vec Work)))
@@ -50,20 +51,23 @@
 
 (defun evaluate :private (goal: Goal state: State store: Store tail: Goals rest: Search) -> Transition
   (match goal
-    ((Equal a b) (match (unify a b (. state bindings))
-      ((some bindings)
-        (let ((next (State bindings (. state next-id))))
-          (if (and (= (count (. store domains)) 0) (= (count (. store constraints)) 0))
-              (continue-work next store tail rest)
-              (after-constraint (fd/propagate (Snapshot next store)) tail rest))))
-      (nil (SearchProgress rest))))
+    ((Equal a b)
+      (if (and (= (count (. store domain-ids)) 0) (= (count (. (. store scheduler) constraints)) 0))
+          (match (unify a b (. state bindings))
+            ((some bindings) (continue-work (State bindings (. state next-id)) store tail rest))
+            (nil (SearchProgress rest)))
+          (match (unify-changed a b (. state bindings))
+            ((some update) (after-constraint
+              (fd/after-unify (State (. update bindings) (. state next-id)) store (. update changed)) tail rest))
+            (nil (SearchProgress rest)))))
     ((All goals) (continue-work state store (prepend goals tail) rest))
     ((Any goals) (SearchProgress (alternatives goals state store tail rest)))
     ((Fresh build) (SearchProgress
       (enqueue rest (Work (State (. state bindings) (+ (. state next-id) 1))
                           (NextGoal (build (Var (. state next-id))) tail) store))))
     ((Delayed build) (SearchProgress (enqueue rest (Work state (NextGoal (build) tail) store))))
-    ((Constrain constraint) (after-constraint (fd/post state store constraint) tail rest))))
+    ((Constrain constraint) (after-constraint (fd/post state store constraint) tail rest))
+    ((ConstrainAll steps) (after-constraint (fd/post-all state store steps) tail rest))))
 
 ;; No recursive stepping, flattening, or forcing another branch in this call.
 (defun step (search: Search) -> Transition

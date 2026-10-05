@@ -137,8 +137,8 @@ enumerate answers; try `./F run examples/logic.fib`. Parallel search remains
 future work, with this engine serving as its tested reference.
 
 Its [`fib.logic.fd` extension](lib/fib/logic/README.md) adds compact and sparse
-finite integer domains, propagation for all-different and arithmetic constraints,
-and smallest-domain-first search. The port of [tsmarsh/sudoku](examples/sudoku/solver.fib)
+finite integer domains, watched propagation for all-different and arithmetic
+constraints, batched model setup, and smallest-domain-first search. The port of [tsmarsh/sudoku](examples/sudoku/solver.fib)
 uses those constraints; build it with `./F build examples/sudoku.fib -I examples -I lib`.
 The [finite-domain design note](docs/design/finite-domains-and-sudoku.md) records
 the API, provenance, validation cases, and a comparison with the original

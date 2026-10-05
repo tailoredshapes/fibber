@@ -1,0 +1,32 @@
+;; spec: docs/design/finite-domains-and-sudoku.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:require [fib.logic :as l] [fib.logic.fd :as fd]) (:use tl.check))
+
+(defun model (qs: (Vec l/Term)) -> (Vec l/Goal)
+  [(fd/in-all qs (fd/interval 1 3)) (fd/distinct qs)
+   (fd/< (nth qs 0) (nth qs 1))])
+
+(defun main () -> i64
+  (let ((c (checks))
+        (plain (l/run-many 10 3 (fn (qs) (l/all (model qs)))))
+        (batched (l/run-many 10 3 (fn (qs) (fd/batch (model qs))))))
+    (do (check c (= plain batched))
+        (check c (= (count batched) 3))
+        (check c (= (l/run-many 3 2 (fn (qs)
+          (fd/batch [(fd/in (nth qs 0) (fd/interval 1 3))
+                     (l/== (nth qs 0) (nth qs 1))
+                     (fd/in (nth qs 1) (fd/interval 3 5))])))
+          [[(l/integer 3) (l/integer 3)]]))
+        (check c (= (l/run 2 (fn (q) (l/any
+          [(fd/batch [(fd/in q (fd/interval 1 2)) (l/== q (l/integer 9))])
+           (fd/batch [(fd/in q (fd/interval 1 2)) (l/== q (l/integer 2))])])))
+          [(l/integer 2)]))
+        (check c (= (l/run 1 (fn (q)
+          (fd/batch [(l/== q (l/symbol "x")) (fd/in q (fd/interval 1 2))]))) []))
+        (check c (= (l/run 1 (fn (q) (fd/batch []))) [(l/Var 0)]))
+        (check c (= (l/run 0 (fn (q) (trap "zero demand must not build a batch"))) []))
+        (checks-result c))))

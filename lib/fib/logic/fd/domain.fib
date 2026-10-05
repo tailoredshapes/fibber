@@ -79,14 +79,41 @@
                            (if (= i hi) (if (= i value) out (conj out i))
                                (recur (+ i 1) (if (= i value) out (conj out i))))))))
     ((Sparse xs) (Sparse (filterv (fn (n: i64) (!= n value)) xs)))))
+(defun aligned-mask :private (base: i64 other: i64 bits: i64) -> i64
+  (let ((delta (unchecked-subtract other base)))
+    (cond (and (> other base) (< delta 0)) 0
+          (and (< other base) (> delta 0)) 0
+          (> delta 62) 0
+          (< delta -62) 0
+          (>= delta 0) (shl bits delta)
+          :else (sar bits (- delta)))))
+(defun adjoin-value (d: Domain value: i64) -> Domain
+  (if (contains-value? d value) d
+      (match d
+        ((Small base mask)
+          (let ((offset (unchecked-subtract value base)))
+            (cond (= mask 0) (Small value 1)
+                  (and (>= value base) (>= offset 0) (<= offset 62)) (Small base (bit-or mask (shl 1 offset)))
+                  (< value base)
+                  (let ((span (unchecked-subtract (maximum d) value)))
+                    (if (and (>= span 0) (<= span 62))
+                        (Small value (bit-or 1 (shl mask (- base value))))
+                        (domain (conj (values d) value))))
+                  :else (domain (conj (values d) value)))))
+        (_ (domain (conj (values d) value))))))
+(defun difference (a: Domain banned: Domain) -> Domain
+  (if (= (domain-size banned) 0) a (match a
+    ((Small base mask) (match banned
+      ((Small other bits) (Small base (bit-and mask (bit-not (aligned-mask base other bits)))))
+      (_ (domain (filterv (fn (v: i64) (not (contains-value? banned v))) (values a))))))
+    ((Range _ _) (reduce (fn (out: Domain v: i64) (remove-value out v)) a (values banned)))
+    (_ (domain (filterv (fn (v: i64) (not (contains-value? banned v))) (values a)))))))
 (defun intersection (a: Domain b: Domain) -> Domain
   (if (or (= (domain-size a) 0) (= (domain-size b) 0)) (Small 0 0)
       (match a
         ((Small base mask) (match b
           ((Small other bits)
-            (if (or (< (maximum a) other) (< (maximum b) base)) (Small base 0)
-                (let ((delta (- other base)))
-                  (Small base (bit-and mask (if (>= delta 0) (shl bits delta) (sar bits (- delta))))))))
+            (Small base (bit-and mask (aligned-mask base other bits))))
           (_ (domain (filterv (fn (v: i64) (contains-value? b v)) (values a))))))
         ((Range lo hi) (match b
           ((Range other-lo other-hi)
@@ -94,7 +121,7 @@
                   (> lo other-hi) (Small 0 0)
                   :else (Range (if (> lo other-lo) lo other-lo)
                                (if (< hi other-hi) hi other-hi))))
-          (_ (domain (filterv (fn (v: i64) (contains-value? b v)) (values a))))))
+          (_ (intersection b a))))
         (_ (domain (filterv (fn (v: i64) (contains-value? b v)) (values a)))))))
 (defun equal-domain? (a: Domain b: Domain) -> bool
   (match a ((Range lo hi) (match b
