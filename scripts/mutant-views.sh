@@ -64,7 +64,9 @@ mutant strict-peek-off compiler/own/walk/call.fib 's/(or (not (contains? @(. w s
 L=lib/fib/view.fib
 mutant lender-no-unique $L 's/^  (when (> (array-len @a) 0) (array-set! &a 0 (array-get @a 0))))/  unit)/' 356- 358-
 mutant lender-always-copies $L 's/^  (when (> (array-len @a) 0) (array-set! &a 0 (array-get @a 0))))/  (when (> (array-len @a) 0) (let ((keep @a)) (do (array-set! \&a 0 (array-get @a 0)) (array-len keep)))))/' 357-
-mutant window-bounds-of-the-buffer $L 's/(do (win-check (win-len w) i)/(do (win-check 1000000 i)/' 359-
+# the library's own checks (the slow path of the inline access, the whole access for a type the lowering leaves alone): against the buffer, not the window
+mutant window-get-bounds-of-the-buffer $L 's/(do (win-check (win-len w) i)/(do (win-check 1000000 i)/' 373-
+mutant window-set-bounds-of-the-buffer $L 's/(do (win-check n i)$/(do (win-check 1000000 i)/' 359- 372-
 mutant split-cut-off-by-one $L 's/(unsafe (WinPair (Win base k seed) (Win (ptr+ base (\* w k)) (- n k) seed)))/(unsafe (WinPair (Win base (+ k 1) seed) (Win (ptr+ base (* w k)) (- n k) seed)))/' 362-
 mutant range-check-off $L 's/(when (or (< lo 0) (> lo hi) (> hi n))/(when false/' 361-
 # the inline lowering of windows (emit.lower.window): the bound off by one, no bound, one register pair for every window (a store to the wrong base
