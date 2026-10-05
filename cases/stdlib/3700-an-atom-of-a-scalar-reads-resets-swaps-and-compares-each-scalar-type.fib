@@ -1,0 +1,44 @@
+;; spec:   stdlib §2.6 (atoms), types §2.10, §8.6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: atom, swap!, reset!, compare-and-set!
+;; An atom of a scalar (i64, i32, i8, f64, f32, bool, char) is lock-free: `@a` is one atomic load, `reset!` one atomic store, `swap!` a
+;; compare-and-swap loop and `compare-and-set!` one compare-and-swap. Run alone, each answers as it always did: `swap!` the new value,
+;; `compare-and-set!` whether the atom held the old value, a failed one leaving the atom as it was. A float compares by its bits: -0.0 is
+;; not 0.0 (so `(compare-and-set! a 0.0 ..)` on an atom holding -0.0 fails). The `bool` case is the one that is stored as a byte.
+(ns main (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (i (atom 5)) (n (atom 7i32)) (b (atom 3i8)) (f (atom 1.5)) (g (atom 2.5f32)) (t (atom true)) (h (atom \a)))
+    (do ;; reads and resets
+        (check c (= @i 5)) (check c (= @n 7i32)) (check c (= @b 3i8)) (check c (= @f 1.5)) (check c (= @g 2.5f32)) (check c @t) (check c (= @h \a))
+        (reset! i -9) (reset! n -1i32) (reset! b -3i8) (reset! f -0.25) (reset! g 0.5f32) (reset! t false) (reset! h \z)
+        (check c (= @i -9)) (check c (= @n -1i32)) (check c (= @b -3i8)) (check c (= @f -0.25)) (check c (= @g 0.5f32))
+        (check c (not @t)) (check c (= @h \z))
+        ;; swap! answers the new value
+        (check c (= (swap! i (fn (x) (* x 2))) -18)) (check c (= @i -18))
+        (check c (= (swap! n (fn (x) (+ x 100i32))) 99i32))
+        (check c (= (swap! f (fn (x) (* x 4.0))) -1.0)) (check c (= @f -1.0))
+        (check c (swap! t (fn (x) (not x)))) (check c @t)
+        (check c (not (swap! t (fn (x) (not x))))) (check c (not @t))
+        ;; compare-and-set! answers whether it swapped, and a failed one changes nothing
+        (check c (compare-and-set! i -18 4)) (check c (= @i 4))
+        (check c (not (compare-and-set! i -18 5))) (check c (= @i 4))
+        (check c (compare-and-set! t false true)) (check c @t)
+        (check c (not (compare-and-set! t false true))) (check c @t)
+        (check c (compare-and-set! h \z \y)) (check c (= @h \y))
+        (check c (compare-and-set! g 0.5f32 8.0f32)) (check c (= @g 8.0f32))
+        (check c (compare-and-set! b -3i8 100i8)) (check c (= @b 100i8))
+        (check c (not (compare-and-set! b -3i8 1i8))) (check c (= @b 100i8))
+        ;; floats compare by bits: -0.0 is not 0.0, and 0.0 is 0.0
+        (reset! f (* -1.0 0.0))
+        (check c (not (compare-and-set! f 0.0 1.0))) (check c (= @f (* -1.0 0.0)))
+        (check c (compare-and-set! f (* -1.0 0.0) 2.0)) (check c (= @f 2.0))
+        (reset! f 0.0)
+        (check c (compare-and-set! f 0.0 3.0)) (check c (= @f 3.0))
+        (check c (= (checks-made c) 45))
+        (checks-result c))))

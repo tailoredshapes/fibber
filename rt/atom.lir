@@ -4,6 +4,14 @@
 ;; SHARED through the type table's trace functions.
 (declare sched_yield i32 ())
 
+;; The lock of an object atom, a weak box and a task's result (the atom of a scalar takes none: emit.lower.atoms): a `cmpxchg` (acquire) that
+;; takes it when the word is 0, and a `sched_yield` after each failure, so that a waiter gives its CPU to the holder and does not hammer the
+;; line. P-count-a measured the alternatives (docs/shootout/atoms.md, "the lock"): test-and-test-and-set with bounded spinning (read the word
+;; up to K times, K from 16 to 1024 and doubling, then yield; K 16 to 64; K from 4 to 16; 4 or 32 loads then yield each round) was no faster
+;; than this at 28 tasks and 1.5 to 4 times slower at 2 to 8 (an `@a` of a Vec: 5.0, 22, 105 ms at 2, 4, 8 tasks here, 12-19, 46-71, 166-190 ms
+;; with the spinners): what a waiter waits for is the holder's retain of a shared count (a contended atomic), not the lock word, and a waiter
+;; that sleeps in `sched_yield` keeps its traffic off that line. The cost of an object atom under contention is the count of the object
+;; (P-count-b: `freeze`, borrowed reads), not this lock. Held for a load and a retain, or a compare and a store; never across a call of `f`.
 (define internal (fib.lock void) ((ptr lockp))
   (block entry (br spin))
   (block spin

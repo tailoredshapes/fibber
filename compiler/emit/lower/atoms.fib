@@ -1,0 +1,80 @@
+;; compiler/emit/lower/atoms.fib: the lock-free operations of an atom that holds a scalar (P-count-a, docs/design/parallelism.md 2.6, 3.6).
+;; An atom of `bool`, `i8`, `i16`, `i32`, `i64`, `f32`, `f64` (and so `char`) holds no object, so nothing has to be retained while a
+;; reader loads it: `@a` is one atomic load, `reset!` one atomic store, `swap!` a compare-and-swap loop and `compare-and-set!` one
+;; compare-and-swap. The lock word of such an atom is never touched. An atom of anything else (an object, a `dyn`, an `Option` of a scalar,
+;; which is a pair, `unit`) keeps the lock of rt/atom.lir (emit.lower.cells).
+;;
+;; Ordering: every access is `seq_cst`. Reads and writes of one atom are then linearizable (one total order of the operations on it, each
+;; reading the last write before it) and the operations on several atoms are in one total order too, which Clojure's atoms promise and a
+;; program that spins on one atom while another task writes two of them relies on (cases 166-168). On x86-64 a `seq_cst` load is a plain
+;; `mov` (the cost the design asks for: 28 readers must not slow each other down); the store is an `xchg` and a compare-and-swap is a locked
+;; instruction either way. An `acquire` load with `release` stores would suffice for one flag; they would not order two atoms (store
+;; buffering), so they are not used. A scalar carries no pointer, so no other ordering is needed for memory safety.
+;;
+;; `bool` is `i1` in the object, stored as one byte (0 or 1): LLVM atomics need a byte-sized type, so it is accessed as `i8`. A float is
+;; accessed as the integer of the same size (`cmpxchg` takes no float), so a float compares by bit pattern: `-0.0` differs from `0.0` and a
+;; `NaN` equals itself when the bits agree.
+(ns emit.lower.atoms
+  (:use types.ty types.scheme types.ast own.program emit.value emit.layout emit.ir emit.objects emit.program
+        emit.lower.cx emit.lower.ops))
+
+;; Whether an atom of this representation is lock-free.
+(defun scalar-atom-lir? (l: LirTy) -> bool
+  (match l
+    ((LirI1) true) ((LirI8) true) ((LirI16) true) ((LirI32) true) ((LirI64) true) ((LirFloat) true) ((LirDouble) true)
+    (_ false)))
+
+;; The integer type an access to a slot of `l` uses.
+(defun atomic-int-ty :private (l: LirTy) -> LirTy
+  (match l ((LirI1) LirI8) ((LirFloat) LirI32) ((LirDouble) LirI64) (_ l)))
+
+;; A value of `l` as the integer an atomic instruction takes.
+(defun to-atomic-int :private (cx: LowerCx v: V l: LirTy) -> V
+  (let ((it (atomic-int-ty l)))
+    (match l
+      ((LirI1) (fb-val (. cx b) (str-join ["(zext i8 " (v-text v) ")"]) it))
+      ((LirFloat) (fb-val (. cx b) (str-join ["(bitcast i32 " (v-text v) ")"]) it))
+      ((LirDouble) (fb-val (. cx b) (str-join ["(bitcast i64 " (v-text v) ")"]) it))
+      (_ v))))
+
+;; The inverse of to-atomic-int.
+(defun from-atomic-int :private (cx: LowerCx v: V l: LirTy) -> V
+  (match l
+    ((LirI1) (fb-val (. cx b) (str-join ["(trunc i1 " (v-text v) ")"]) l))
+    ((LirFloat) (fb-val (. cx b) (str-join ["(bitcast float " (v-text v) ")"]) l))
+    ((LirDouble) (fb-val (. cx b) (str-join ["(bitcast double " (v-text v) ")"]) l))
+    (_ v)))
+
+;; `@a`: one atomic load of the value slot.
+(defun scalar-atom-load (cx: LowerCx vp: str l: LirTy) -> V
+  (let ((it (atomic-int-ty l)))
+    (from-atomic-int cx (fb-val (. cx b) (str-join ["(atomic-load seq_cst " (lir-ty-text it) " " vp ")"]) it) l)))
+
+;; `(reset! a v)`: one atomic store.
+(defun scalar-atom-store (cx: LowerCx vp: str l: LirTy v: V) -> unit
+  (fb-stmt (. cx b) (str-join ["(atomic-store seq_cst " (v-text (to-atomic-int cx v l)) " " vp ")"])))
+
+;; The `i1` of one compare-and-swap of the value slot from `old` to `new`.
+(defun scalar-atom-cas (cx: LowerCx vp: str l: LirTy old: V new: V) -> V
+  (let ((o (to-atomic-int cx old l)) (n (to-atomic-int cx new l)))
+    (fb-val (. cx b) (str-join ["(extractvalue (cmpxchg seq_cst seq_cst " vp " " (v-text o) " " (v-text n) ") 1)"]) LirI1)))
+
+;; `(compare-and-set! a old new)`: the answer is whether the swap happened.
+(defun lcx-scalar-compare-and-set (cx: LowerCx vp: str l: LirTy old: V new: V) -> V
+  (scalar-atom-cas cx vp l old new))
+
+;; `(swap! a f)` on a scalar atom: read, call `f` on the value, and swap the result in only if the atom still holds the value `f` was called
+;; with; else read again and call `f` again. `f` may therefore run more than once (and on a value another task has already replaced), as in
+;; Clojure: it must be pure. The value of the expression is the result of the `f` call whose swap succeeded. A swap that fails means another
+;; task's swap succeeded, so one task is always making progress (lock-free).
+(defun lcx-scalar-swap (cx: LowerCx vp: str l: LirTy content: Ty f: V) -> (Result V str)
+  (let ((b (. cx b)) (head (fb-label (. cx b) "swap")) (done (fb-label (. cx b) "swapped")))
+    (do (fb-term b (str-join ["(br " head ")"]))
+        (fb-open b head)
+        (let ((old (scalar-atom-load cx vp l)))
+          (do (lcx-retain cx f)
+              (try-let ((new ((. (. cx hub) emit-call) cx (TgValue f) [old] content false)))
+                (let ((ok (scalar-atom-cas cx vp l old new)))
+                  (do (fb-term b (str-join ["(br " (v-text ok) " " done " " head ")"]))
+                      (fb-open b done)
+                      (Ok new)))))))))

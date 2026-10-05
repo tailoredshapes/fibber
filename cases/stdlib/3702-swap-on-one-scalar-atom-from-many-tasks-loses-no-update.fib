@@ -1,0 +1,49 @@
+;; spec:   stdlib §2.6 (atoms), types §8.6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: atom, swap!
+;; Six tasks add 1 to one scalar atom 20 000 times each through `swap!`: the compare-and-swap loop loses no update, so the total is exactly
+;; 120 000 (an i64 atom) and 120 000.0 (an f64 atom), and an even number of toggles of a bool atom leaves it as it was. The function of a
+;; `swap!` may be run again when another task got in first, as in Clojure: the count of its runs (kept in a second atom) is at least the
+;; number of swaps, and the value the atom ends with does not depend on how many extra runs there were. A seventh task reads the i64 atom
+;; while the writers run: what it reads never goes backwards (reads are linearizable with the swaps). A lock-free atom that lost an update
+;; (a blind store in place of the compare-and-swap, a swap that does not retry) ends below 120 000.
+(ns main (:use tl.check fib.async))
+
+(defun bump (a: (Atom i64) calls: (Atom i64) n: i64) -> i64
+  (do (dotimes (i n)
+        (swap! a (fn (x) (do (swap! calls (fn (k) (+ k 1))) (+ x 1)))))
+      n))
+
+(defun bump-f (a: (Atom f64) n: i64) -> i64
+  (do (dotimes (i n) (swap! a (fn (x) (+ x 1.0)))) n))
+
+(defun toggle (a: (Atom bool) n: i64) -> i64
+  (do (dotimes (i n) (swap! a (fn (x) (not x)))) n))
+
+;; 1 when every read was at least the one before it, until the value reached `limit`
+(defun watch (a: (Atom i64) limit: i64) -> i64
+  (loop ((last 0) (ok 1))
+    (let ((v @a))
+      (if (>= v limit) ok (recur v (if (< v last) 0 ok))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (a (atom 0)) (calls (atom 0)) (f (atom 0.0)) (t (atom false)))
+    (let ((reader (future (watch a 120000)))
+          (ws [(future (bump a calls 20000)) (future (bump a calls 20000)) (future (bump a calls 20000))
+               (future (bump a calls 20000)) (future (bump a calls 20000)) (future (bump a calls 20000))])
+          (fs [(future (bump-f f 20000)) (future (bump-f f 20000)) (future (bump-f f 20000))
+               (future (bump-f f 20000)) (future (bump-f f 20000)) (future (bump-f f 20000))])
+          (ts [(future (toggle t 10001)) (future (toggle t 9999)) (future (toggle t 20000))]))
+      (do (dotimes (i 6) (join (nth ws i)))
+          (dotimes (i 6) (join (nth fs i)))
+          (dotimes (i 3) (join (nth ts i)))
+          (check c (= @a 120000))
+          (check c (= @f 120000.0))
+          (check c (not @t))
+          (check c (>= @calls 120000))
+          (check c (= (join reader) 1))
+          (checks-result c)))))

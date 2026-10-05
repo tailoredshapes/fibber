@@ -1,0 +1,52 @@
+;; spec:   stdlib §2.6 (atoms), types §8.6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: atom, compare-and-set!
+;; Two races on scalar atoms, each repeated 200 times with fresh atoms. (1) Eight tasks wait for a start flag (a bool atom) and then each try ONE `(compare-and-set! flag 0 id)`: exactly
+;; one answers true, and the flag ends holding that task's id. (2) A ticket dispenser: six tasks take 3 000 tickets each from one atom with a
+;; `compare-and-set!` loop (read v, try v -> v+1, retry when it fails); every number from 0 to 17 999 is handed out exactly once, and none
+;; twice (a compare-and-swap that succeeded for two tasks, or an update lost, makes a ticket appear twice or never).
+(ns main (:use tl.check fib.async))
+
+(defun race (flag: (Atom i64) go: (Atom bool) id: i64) -> i64
+  (do (loop () (if @go () (recur)))
+      (if (compare-and-set! flag 0 id) id 0)))
+
+(defun take-tickets (a: (Atom i64) n: i64) -> (Vec i64)
+  (loop ((k 0) (got []))
+    (if (< k n)
+        (let ((v @a))
+          (if (compare-and-set! a v (+ v 1)) (recur (+ k 1) (conj got v)) (recur k got)))
+        got)))
+
+(defun tally (ts: (Vec (Task i64))) -> (Pair i64 i64)
+  (loop ((i 0) (s 0) (n 0))
+    (if (< i 8)
+        (let ((r (join (nth ts i)))) (recur (+ i 1) (+ s r) (if (> r 0) (+ n 1) n)))
+        (Pair s n))))
+
+(defun one-race () -> bool
+  (let ((flag (atom 0)) (go (atom false)))
+    (let ((ts [(future (race flag go 1)) (future (race flag go 2)) (future (race flag go 3)) (future (race flag go 4))
+               (future (race flag go 5)) (future (race flag go 6)) (future (race flag go 7)) (future (race flag go 8))]))
+      (do (sys-sleep 1000000)
+          (reset! go true)
+          (let ((won (tally ts)))
+            (and (= (. won snd) 1) (= (. won fst) @flag)))))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (dotimes (r 200) (check c (one-race)))
+        (let ((a (atom 0)))
+          (let ((ts [(future (take-tickets a 3000)) (future (take-tickets a 3000)) (future (take-tickets a 3000))
+                     (future (take-tickets a 3000)) (future (take-tickets a 3000)) (future (take-tickets a 3000))]))
+            (let ((seen (loop ((i 0) (seen (vec (repeat 18000 0))))
+                          (if (< i 6)
+                              (recur (+ i 1) (reduce (fn (s t) (assoc s t (+ 1 (nth s t)))) seen (join (nth ts i))))
+                              seen))))
+              (do (check c (= @a 18000))
+                  (check c (every? (fn (k) (= k 1)) seen))
+                  (checks-result c))))))))
