@@ -1,14 +1,19 @@
 (ns fib.lacinia.engine (:use fib.core fib.seq fib.coll fib.lacinia.types)
   (:require [fib.lacinia.parser :as parser] [fib.lacinia.plan :as plan]
+            [fib.lacinia.document :as document] [fib.lacinia.variables :as vars]
             [fib.lacinia.executor :as executor] [fib.lacinia.execute.state :as s]))
+(defun request :private (schema: GqlCompiledSchema query: str variables: (Map str GqlValue) name: str) -> (Result (Vec plan/GqlPreparedField) GqlError)
+  (try-let [operations (parser/parse-document query) _ (document/validate schema operations)
+    operation (document/select operations name) coerced (vars/coerce (. operation variables) variables)]
+    (plan/prepare-with schema "Query" (. operation selections) coerced)))
+(defun execute-operation (schema: GqlCompiledSchema query: str variables: (Map str GqlValue) context: GqlValue name: str) -> GqlResult
+  (match (request schema query variables name)
+    ((Err error) (GqlResult nil [error]))
+    ((Ok nodes) (let [state (s/execution context) value (executor/project state "Query" NullValue nodes [])]
+      (GqlResult (some (unwrap-or value NullValue)) @(. state errors))))))
 (defun execute (schema: GqlCompiledSchema query: str variables: (Map str GqlValue) context: GqlValue) -> GqlResult
-  (if (> (count variables) 0)
-    (GqlResult nil [(located-error UnsupportedFeature "Variables are not implemented yet" (GqlLocation 1 1))])
-    (match (parser/parse query)
-      ((Err error) (GqlResult nil [error]))
-      ((Ok parsed) (match (plan/prepare schema "Query" parsed)
-        ((Err error) (GqlResult nil [error]))
-        ((Ok nodes) (let [state (s/execution context) value (executor/project state "Query" NullValue nodes [])]
-          (GqlResult (some (unwrap-or value NullValue)) @(. state errors)))))))))
+  (execute-operation schema query variables context ""))
+(defun execute-operation-async (schema: GqlCompiledSchema query: str variables: (Map str GqlValue) context: GqlValue name: str) -> (Task GqlResult)
+  (spawn (fn () (execute-operation schema query variables context name))))
 (defun execute-async (schema: GqlCompiledSchema query: str variables: (Map str GqlValue) context: GqlValue) -> (Task GqlResult)
-  (spawn (fn () (execute schema query variables context))))
+  (execute-operation-async schema query variables context ""))

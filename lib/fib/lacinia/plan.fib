@@ -1,6 +1,6 @@
 ;; Request validation finishes before any resolver executes.
 (ns fib.lacinia.plan (:use fib.core fib.seq fib.coll fib.lacinia.types)
-  (:require [fib.lacinia.coerce :as c]))
+  (:require [fib.lacinia.coerce :as c] [fib.lacinia.inputs :as inputs]))
 (defstruct GqlPreparedField (name: str response-key: str field: GqlField arguments: (Map str GqlValue)
   children: (Vec GqlPreparedField) location: GqlLocation))
 (defun merge-one :private (fields: (Vec GqlSelection) item: GqlSelection index: i64) -> (Result (Vec GqlSelection) GqlError)
@@ -25,18 +25,33 @@
         ((some object) (match (get (. object fields) name)
           ((some field) (Ok field))
           (nil (Err (located-error ValidationFailure (str "Unknown field " owner "/" name) pos)))))))))
-(defun prepare-field :private (schema: GqlCompiledSchema owner: str selection: GqlSelection) -> (Result GqlPreparedField GqlError)
+(defun prepare-field :private (schema: GqlCompiledSchema owner: str selection: GqlSelection variables: (Map str GqlValue)) -> (Result GqlPreparedField GqlError)
   (try-let [field (lookup-field schema owner selection)]
     (let [name (base-name (. field type)) scalar (c/scalar? name) pos (. selection location)]
       (cond (and scalar (not (empty? (. selection children)))) (Err (located-error ValidationFailure "A scalar field cannot have a selection set" pos))
         (and (not scalar) (empty? (. selection children))) (Err (located-error ValidationFailure "An object field requires a selection set" pos))
-        :else (match (c/arguments field (. selection arguments))
+        :else (match (c/arguments field (inputs/arguments (. selection arguments) variables))
           ((Err message) (Err (located-error ValidationFailure message pos)))
           ((Ok arguments)
-            (try-let [children (if scalar (Ok []) (prepare schema name (. selection children)))]
+            (try-let [children (if scalar (Ok []) (prepare-with schema name (. selection children) variables))]
               (Ok (GqlPreparedField (. selection name) (. selection response-key) field arguments children pos)))))))))
-(defun prepare (schema: GqlCompiledSchema owner: str selections: (Vec GqlSelection)) -> (Result (Vec GqlPreparedField) GqlError)
+(defun prepare-with (schema: GqlCompiledSchema owner: str selections: (Vec GqlSelection) variables: (Map str GqlValue)) -> (Result (Vec GqlPreparedField) GqlError)
   (try-let [fields (merge-fields selections)]
     (loop [i 0 out: (Vec GqlPreparedField) []]
       (if (= i (count fields)) (Ok out)
-        (try-let [item (prepare-field schema owner (nth fields i))] (recur (+ i 1) (conj out item)))))))
+        (try-let [item (prepare-field schema owner (nth fields i) variables)] (recur (+ i 1) (conj out item)))))))
+(defun prepare (schema: GqlCompiledSchema owner: str selections: (Vec GqlSelection)) -> (Result (Vec GqlPreparedField) GqlError)
+  (prepare-with schema owner selections {}))
+(defun validate-field :private (schema: GqlCompiledSchema owner: str selection: GqlSelection scope: inputs/GqlInputScope) -> (Result unit GqlError)
+  (try-let [field (lookup-field schema owner selection)]
+    (let [name (base-name (. field type)) scalar (c/scalar? name) pos (. selection location)]
+      (cond (and scalar (not (empty? (. selection children)))) (Err (located-error ValidationFailure "A scalar field cannot have a selection set" pos))
+        (and (not scalar) (empty? (. selection children))) (Err (located-error ValidationFailure "An object field requires a selection set" pos))
+        :else (match (inputs/validate-arguments scope field (. selection arguments))
+          ((Err message) (Err (located-error ValidationFailure message pos)))
+          ((Ok _) (if scalar (Ok ()) (validate schema name (. selection children) scope))))))))
+(defun validate (schema: GqlCompiledSchema owner: str selections: (Vec GqlSelection) scope: inputs/GqlInputScope) -> (Result unit GqlError)
+  (try-let [fields (merge-fields selections)]
+    (loop [i 0]
+      (if (= i (count fields)) (Ok ())
+        (try-let [_ (validate-field schema owner (nth fields i) scope)] (recur (+ i 1)))))))

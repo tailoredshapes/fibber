@@ -1,0 +1,43 @@
+(ns fib.lacinia.parse.variables (:use fib.core fib.seq fib.coll fib.lacinia.types)
+  (:require [fib.lacinia.parse.cursor :as p] [fib.lacinia.parse.values :as v]))
+(defun type-depth :private (type: GqlType) -> i64
+  (match type ((NamedType _) 0) ((ListType element) (+ 1 (type-depth element))) ((NonNullType element) (+ 1 (type-depth element)))))
+(defun type-reference (parser: p/GqlParser depth: i64) -> (Result GqlType GqlError)
+  (if (> depth 64) (Err (located-error ResourceLimit "Type nesting exceeds 64" (. (p/token parser) location)))
+    (try-let [type (if (p/at? parser "[")
+      (do (p/advance parser) (try-let [element (type-reference parser (+ depth 1)) _ (p/expect parser "]")] (Ok (ListType element))))
+      (try-let [name (p/name parser)] (Ok (NamedType name))))]
+      (let [wrapped (if (p/at? parser "!") (do (p/advance parser) (NonNullType type)) type)]
+        (if (> (+ depth (type-depth wrapped)) 64)
+          (Err (located-error ResourceLimit "Type nesting exceeds 64" (. (p/token parser) location)))
+          (Ok wrapped))))))
+(defun constant (input: GqlInput location: GqlLocation) -> (Result GqlValue GqlError)
+  (match input
+    ((LiteralInput value) (Ok value))
+    ((VariableInput _) (Err (located-error ParseFailure "Variable defaults must be constant" location)))
+    ((ListInput items)
+      (loop [i 0 out: (Vec GqlValue) []]
+        (if (= i (count items)) (Ok (ListValue out))
+          (try-let [item (constant (nth items i) location)] (recur (+ i 1) (conj out item))))))
+    ((ObjectInput fields)
+      (let [names (vec (keys fields))]
+        (loop [i 0 out: (Map str GqlValue) {}]
+          (if (= i (count names)) (Ok (object out))
+            (let [name (nth names i)]
+              (try-let [item (constant (get fields name (LiteralInput NullValue)) location)]
+                (recur (+ i 1) (assoc out name item))))))))))
+(defun definition :private (parser: p/GqlParser) -> (Result GqlVariable GqlError)
+  (let [location (. (p/token parser) location)]
+    (try-let [_ (p/expect parser "$") name (p/name parser) _ (p/expect parser ":") type (type-reference parser 0)
+      default (if (p/at? parser "=") (do (p/advance parser)
+        (try-let [input (v/value parser 0) value (constant input location)] (Ok (some value)))) (Ok nil))]
+      (Ok (GqlVariable name type default location)))))
+(defun definitions (parser: p/GqlParser) -> (Result (Map str GqlVariable) GqlError)
+  (if (not (p/at? parser "(")) (Ok {})
+    (do (p/advance parser)
+      (if (p/at? parser ")") (Err (p/failure parser "Variable definition list cannot be empty"))
+        (loop [out: (Map str GqlVariable) {}]
+          (try-let [item (definition parser)]
+            (if (contains? out (. item name)) (Err (located-error ValidationFailure "Duplicate variable definition" (. item location)))
+              (let [next (assoc out (. item name) item)]
+                (if (p/at? parser ")") (do (p/advance parser) (Ok next)) (recur next))))))))))

@@ -1,0 +1,48 @@
+;; spec: docs/design/lacinia.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use fib.core fib.seq fib.coll fib.print tl.check) (:require [fib.lacinia :as g]))
+(defun definition (calls: (Atom i64)) -> g/GqlSchemaDefinition
+  (let [text (g/named "String")]
+    (g/schema {} {"echo" (with (g/resolving text
+      (fn (context: g/GqlValue args: (Map str g/GqlValue) parent: g/GqlValue)
+        (do (swap! calls (fn (n: i64) (+ n 1)))
+          (Ok (unwrap-or (get args "text") (g/StringValue "absent"))))))
+      (arguments {"text" (g/argument text)}))
+      "required" (with (g/resolving text
+        (fn (context: g/GqlValue args: (Map str g/GqlValue) parent: g/GqlValue)
+          (do (swap! calls (fn (n: i64) (+ n 1))) (Ok (get args "text" g/NullValue)))))
+        (arguments {"text" (with (g/argument (g/non-null text)) (default-value (some (g/StringValue "field"))))}))
+      "strict" (with (g/resolving text
+        (fn (context: g/GqlValue args: (Map str g/GqlValue) parent: g/GqlValue)
+          (do (swap! calls (fn (n: i64) (+ n 1))) (Ok (get args "text" g/NullValue)))))
+        (arguments {"text" (g/argument (g/non-null text))}))
+      "numbers" (with (g/resolving (g/list-of (g/named "Int"))
+        (fn (context: g/GqlValue args: (Map str g/GqlValue) parent: g/GqlValue)
+          (do (swap! calls (fn (n: i64) (+ n 1))) (Ok (get args "items" g/NullValue)))))
+        (arguments {"items" (g/argument (g/list-of (g/named "Int")))}))})))
+(defun failed? (result: g/GqlResult) -> bool
+  (and (= (. result data) nil) (> (count (. result errors)) 0)))
+(defun main () -> i64
+  (let [c (checks) calls (atom 0) document "query First { echo(text: \"first\") } query Second($x: String = \"second\") { echo(text: $x) }"]
+    (do (match (g/compile-schema (definition calls))
+      ((Err _) (check c false))
+      ((Ok schema) (do
+        (check c (failed? (g/execute schema document {} g/NullValue)))
+        (check c (failed? (g/execute-operation schema document {} g/NullValue "Missing")))
+        (check c (= @calls 0))
+        (check c (= (g/result-json (g/execute-operation schema document {} g/NullValue "First")) "{\"data\":{\"echo\":\"first\"}}"))
+        (check c (= (g/result-json (g/execute-operation schema document {} g/NullValue "Second")) "{\"data\":{\"echo\":\"second\"}}"))
+        (check c (= (g/result-json (join (g/execute-operation-async schema document {"x" (g/StringValue "task")} g/NullValue "Second"))) "{\"data\":{\"echo\":\"task\"}}"))
+        (check c (= @calls 3))
+        (check c (= (g/result-json (g/execute-operation schema "query First { echo } query Other($x: String!) { echo(text: $x) }" {} g/NullValue "First")) "{\"data\":{\"echo\":\"absent\"}}"))
+        (let [before @calls]
+          (do (doseq [query ["query First { echo } query First { echo }" "{ echo } query First { echo }"
+            "query First { echo } query Other { missing }" "query First { echo } query Other($x: String) { echo }"
+            "query First { echo } query Other($x: Int) { echo(text: $x) }"]]
+            (check c (failed? (g/execute-operation schema query {} g/NullValue "First"))))
+            (check c (= @calls before)))))))
+      (checks-result c))))

@@ -1,0 +1,24 @@
+(ns fib.lacinia.document (:use fib.core fib.seq fib.coll fib.lacinia.types)
+  (:require [fib.lacinia.inputs :as inputs] [fib.lacinia.variables :as vars] [fib.lacinia.plan :as plan]))
+(defun validate-operation :private (schema: GqlCompiledSchema operation: GqlOperation) -> (Result unit GqlError)
+  (let [definitions (. operation variables) scope (inputs/GqlInputScope definitions (cell {}))]
+    (try-let [_ (vars/validate definitions) _ (plan/validate schema "Query" (. operation selections) scope)]
+      (let [unused (first (filter (fn (name: str) (not (contains? @(. scope used) name))) (sort (keys definitions))))]
+        (match unused
+          (nil (Ok ()))
+          ((some name) (let [definition (get definitions name (GqlVariable "" (named "String") nil (. operation location)))]
+            (Err (located-error ValidationFailure (str "Unused variable $" name) (. definition location))))))))))
+(defun validate (schema: GqlCompiledSchema operations: (Vec GqlOperation)) -> (Result unit GqlError)
+  (loop [i 0 names: (Map str bool) {}]
+    (if (= i (count operations)) (Ok ())
+      (let [operation (nth operations i) name (. operation name) pos (. operation location)]
+        (cond (and (= name "") (> (count operations) 1)) (Err (located-error ValidationFailure "An anonymous operation must be the only operation" pos))
+          (contains? names name) (Err (located-error ValidationFailure "Duplicate operation name" pos))
+          :else (try-let [_ (validate-operation schema operation)] (recur (+ i 1) (assoc names name true))))))))
+(defun select (operations: (Vec GqlOperation) name: str) -> (Result GqlOperation GqlError)
+  (let [pos (. (nth operations 0) location)]
+    (if (= name "")
+      (if (= (count operations) 1) (Ok (nth operations 0)) (Err (located-error ValidationFailure "Operation name is required for multiple operations" pos)))
+      (match (first (filter (fn (operation: GqlOperation) (= (. operation name) name)) operations))
+        ((some operation) (Ok operation))
+        (nil (Err (located-error ValidationFailure (str "Unknown operation " name) pos)))))))

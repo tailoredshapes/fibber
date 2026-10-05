@@ -1,0 +1,56 @@
+(ns fib.lacinia.inputs (:use fib.core fib.seq fib.coll fib.lacinia.types)
+  (:require [fib.lacinia.coerce :as c]))
+(defstruct GqlInputScope (definitions: (Map str GqlVariable) used: (Cell (Map str bool))))
+(defun compatible? :private (variable: GqlType expected: GqlType) -> bool
+  (match expected
+    ((NonNullType target) (match variable ((NonNullType source) (compatible? source target)) (_ false)))
+    (_ (match variable
+      ((NonNullType source) (compatible? source expected))
+      ((ListType source) (match expected ((ListType target) (compatible? source target)) (_ false)))
+      ((NamedType source) (match expected ((NamedType target) (= source target)) (_ false)))))))
+(defun variable-use :private (scope: GqlInputScope name: str expected: GqlType defaulted: bool) -> (Result unit str)
+  (match (get (. scope definitions) name)
+    (nil (Err (str "Undefined variable $" name)))
+    ((some definition)
+      (let [non-null-default (match (. definition default-value) ((some value) (not (null? value))) (nil false))
+            target (if (and (required? expected) (not (required? (. definition type))) (or defaulted non-null-default))
+              (match expected ((NonNullType element) element) (_ expected)) expected)]
+        (if (compatible? (. definition type) target)
+          (do (set! (. scope used) (assoc @(. scope used) name true)) (Ok ()))
+          (Err (str "Variable $" name " has an incompatible type at its use")))))))
+(defun validate (scope: GqlInputScope input: GqlInput type: GqlType defaulted: bool) -> (Result unit str)
+  (match input
+    ((VariableInput name) (variable-use scope name type defaulted))
+    ((LiteralInput value) (try-let [_ (c/input-value type value)] (Ok ())))
+    ((ObjectInput _) (Err "Input objects are not implemented yet"))
+    ((ListInput items)
+      (match type
+        ((NonNullType element) (validate scope input element false))
+        ((ListType element)
+          (loop [i 0]
+            (if (= i (count items)) (Ok ())
+              (try-let [_ (validate scope (nth items i) element false)] (recur (+ i 1))))))
+        (_ (Err "Expected a scalar input"))))))
+(defun resolve (input: GqlInput variables: (Map str GqlValue)) -> (Option GqlValue)
+  (match input
+    ((LiteralInput value) (some value)) ((VariableInput name) (get variables name))
+    ((ListInput items) (some (ListValue (mapv (fn (item: GqlInput) (unwrap-or (resolve item variables) NullValue)) items))))
+    ((ObjectInput _) nil)))
+(defun arguments (inputs: (Map str GqlInput) variables: (Map str GqlValue)) -> (Map str GqlValue)
+  (let [names (vec (keys inputs))]
+    (loop [i 0 out: (Map str GqlValue) {}]
+      (if (= i (count names)) out
+        (let [name (nth names i) value (resolve (get inputs name (LiteralInput NullValue)) variables)]
+          (recur (+ i 1) (match value ((some value) (assoc out name value)) (nil out))))))))
+(defun validate-arguments (scope: GqlInputScope field: GqlField supplied: (Map str GqlInput)) -> (Result unit str)
+  (let [unknown (first (filter (fn (name: str) (not (contains? (. field arguments) name))) (keys supplied)))
+        names (vec (keys (. field arguments)))]
+    (if (some? unknown) (Err "Unknown argument")
+      (loop [i 0]
+        (if (= i (count names)) (Ok ())
+          (let [name (nth names i) definition (get (. field arguments) name (argument (named "String")))]
+            (try-let [_ (match (get supplied name)
+              ((some input) (validate scope input (. definition type) (some? (. definition default-value))))
+              (nil (if (and (required? (. definition type)) (= (. definition default-value) nil))
+                (Err (str "Required argument " name " is missing")) (Ok ()))))]
+              (recur (+ i 1)))))))))

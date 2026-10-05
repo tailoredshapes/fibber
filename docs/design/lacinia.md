@@ -13,8 +13,8 @@ Rust compiler changes and no JVM dependency. The
 | --- | --- |
 | `types`, `schema`, `coerce` | Typed schema/value models; schema and scalar/input validation |
 | `lex/*`, `lexer` | Bounded tokenization, UTF-8 positions, string escapes, number grammar |
-| `parse/*`, `parser` | Literal arguments and one query operation with nested selections |
-| `plan` | Field merging, argument coercion, and validation before resolution |
+| `parse/*`, `parser` | Input expressions, variable definitions/defaults, and query documents |
+| `inputs`, `variables`, `document`, `plan` | Variable use/type validation, operation selection, field merging, and coercion before resolution |
 | `execute/state`, `executor` | Per-query errors, completion budget, serial resolution, non-null propagation |
 | `engine` | Synchronous execution and native-task execution of independent queries |
 | `json` | Ordered response data and GraphQL error envelopes |
@@ -40,8 +40,9 @@ resolvers. Native float parsing currently depends on libc's decimal locale.
 
 ## Executable acceptance criteria
 
-Cases were introduced before implementation and initially failed on the absent
-module. Cases `7500`–`7509` exercise the following behaviors:
+The initial cases were introduced before implementation and failed on the absent
+module. The operation-selection case failed on the absent `execute-operation`
+API before this extension. Cases `7500`–`7512` exercise the following behaviors:
 
 | Case | Behavior |
 | --- | --- |
@@ -55,6 +56,9 @@ module. Cases `7500`–`7509` exercise the following behaviors:
 | 7507 | Independent executions on native tasks with shared atomic resolver state |
 | 7508 | Compile-time rejection of a resolver capturing a local mutable cell |
 | 7509 | Document/depth/completion limits and termination of oversized list completion |
+| 7510 | Variable coercion, omitted/null inputs, list expressions, type checking, native tasks |
+| 7511 | Variable/argument defaults, supplied-value precedence, constant/default validation |
+| 7512 | Operation selection, name uniqueness, whole-document validation, native tasks |
 
 Run `LACINIA_FIBC=./F scripts/test-lacinia.sh`. Accepted native cases require
 clean memory audits; the rejected case checks its compiler diagnostic. The
@@ -62,20 +66,36 @@ script also builds the example and independently parses its response as JSON.
 This verifies the stated subset; upstream suite parity and comparative
 performance have not been measured.
 
+## Variables, defaults, and operation selection
+
+Input expressions (`GqlInput`) are separate from resolver values (`GqlValue`),
+so variables preserve their identity during field merging. Validation checks
+all operations, including variable declarations, defaults, usage compatibility,
+and unused variables, before coercing the selected operation's supplied values.
+Nullable variables can be used at non-null locations when a non-null variable
+default or a location default permits it; explicit null still fails coercion
+at a non-null location. Missing variables inside list literals become null list
+items and must satisfy the element type.
+
+`execute` keeps its four-argument API and chooses a sole operation automatically.
+`execute-operation` and `execute-operation-async` add a final operation-name
+argument. Documents with multiple operations require a name. Unselected queries
+are validated but their variables are not coerced and their resolvers do not run.
+Requests still reject fragments, directives, mutation/subscription operations,
+and types outside the documented scalar/list subset.
+
 ## Next milestones
 
-1. Add variable definitions, supplied-variable coercion, default values, and
-   operation selection. Start with request-error and omitted/null cases.
-2. Add named/inline fragments and `@skip`/`@include`; validate fragment cycles,
+1. Add named/inline fragments and `@skip`/`@include`; validate fragment cycles,
    merge compatibility, and selections before invoking resolvers.
-3. Extend schemas with enums, input objects, custom scalars, interfaces, and
+2. Extend schemas with enums, input objects, custom scalars, interfaces, and
    unions. Add introspection and a compatible schema loading format.
-4. Add mutations with serial root execution. Define an asynchronous resolver
+3. Add mutations with serial root execution. Define an asynchronous resolver
    result and cancellation before adding parallel field completion or batching.
-5. Connect to `fib.http.server` through a GraphQL request/response adapter;
+4. Connect to `fib.http.server` through a GraphQL request/response adapter;
    cover malformed request envelopes and transport behavior separately from
    query execution. Subscriptions need a separate streaming lifecycle.
-6. Compare equivalent fixtures against upstream Lacinia, then measure parser,
+5. Compare equivalent fixtures against upstream Lacinia, then measure parser,
    planning, completion, and resolver costs separately. Optimize from those
    measurements; consider reusable validated plans before SIMD specialization.
 

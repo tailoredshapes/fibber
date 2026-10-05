@@ -12,7 +12,7 @@ fi
 mkdir -p "$scratch"
 exec 9>/tmp/fibsuite.lock
 if command -v flock >/dev/null 2>&1; then flock 9; fi
-"$fibc" cases cases/stdlib --only 7500 7501 7502 7503 7504 7505 7506 7507 7508 7509 -j 8
+"$fibc" cases cases/stdlib --only 7500 7501 7502 7503 7504 7505 7506 7507 7508 7509 7510 7511 7512 -j 8
 "$fibc" build examples/lacinia.fib -I lib -o "$scratch/example"
 "$scratch/example" > "$scratch/response.json"
 PYTHONDONTWRITEBYTECODE=1 python3 - "$scratch/response.json" <<'PY'

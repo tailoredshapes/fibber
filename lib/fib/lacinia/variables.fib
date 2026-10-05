@@ -1,0 +1,27 @@
+(ns fib.lacinia.variables (:use fib.core fib.seq fib.coll fib.lacinia.types)
+  (:require [fib.lacinia.coerce :as c]))
+(defun validate (definitions: (Map str GqlVariable)) -> (Result unit GqlError)
+  (let [names (vec (sort (keys definitions)))]
+    (loop [i 0]
+      (if (= i (count names)) (Ok ())
+        (let [item (get definitions (nth names i) (GqlVariable "" (named "String") nil (GqlLocation 1 1)))]
+          (if (not (c/scalar? (base-name (. item type))))
+            (Err (located-error ValidationFailure "Variable type must be a supported input type" (. item location)))
+            (try-let [_ (match (. item default-value)
+              (nil (Ok ()))
+              ((some value) (match (c/input-value (. item type) value)
+                ((Ok _) (Ok ())) ((Err message) (Err (located-error ValidationFailure message (. item location)))))))]
+              (recur (+ i 1)))))))))
+(defun coerce (definitions: (Map str GqlVariable) supplied: (Map str GqlValue)) -> (Result (Map str GqlValue) GqlError)
+  (let [names (vec (sort (keys definitions)))]
+    (loop [i 0 out: (Map str GqlValue) {}]
+      (if (= i (count names)) (Ok out)
+        (let [name (nth names i) item (get definitions name (GqlVariable "" (named "String") nil (GqlLocation 1 1)))
+              value (match (get supplied name) ((some value) (some value)) (nil (. item default-value)))]
+          (match value
+            (nil (if (required? (. item type))
+              (Err (located-error ValidationFailure (str "Required variable $" name " is missing") (. item location)))
+              (recur (+ i 1) out)))
+            ((some value) (match (c/input-value (. item type) value)
+              ((Err message) (Err (located-error ValidationFailure (str "Variable $" name ": " message) (. item location))))
+              ((Ok coerced) (recur (+ i 1) (assoc out name coerced)))))))))))

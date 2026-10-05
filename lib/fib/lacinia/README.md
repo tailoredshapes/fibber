@@ -66,9 +66,29 @@ allowed; capturing a local `Cell` is rejected by the compiler.
 
 `g/execute` takes `(compiled-schema, query, variables, context)` and returns
 `GqlResult`, with `data: (Option GqlValue)` and `errors: (Vec GqlError)`.
-For this milestone, pass an empty variables map. Validation and argument
+Pass supplied variable values in the variables map. Validation and argument
 coercion finish before any resolver runs. Repeated compatible fields merge;
 conflicting aliases fail validation. Result objects follow selection order.
+
+Variables declare built-in scalar or list types, for example:
+
+```graphql
+query Welcome($name: String! = "Fibber") { hello(name: $name) }
+```
+
+Supply `{"name" (g/StringValue "Ada")}` to override that default. Omitted
+variables use their declaration default; an omitted variable without a default
+leaves its argument absent so the argument's default can apply. Explicit null
+never selects a default. Variable types are checked at every use, independently
+of the supplied value; undefined and unused variables fail validation.
+
+`g/execute` automatically chooses the query when the document has one operation.
+For multiple operations, use `g/execute-operation` with
+`(compiled-schema, query, variables, context, operation-name)`.
+`g/execute-operation-async` takes the same arguments and returns a task.
+Operation names must be unique, and anonymous operations must stand alone.
+The whole document is validated before execution, including unselected queries;
+only the selected query's supplied variables are coerced and resolvers invoked.
 
 `g/result-json` serializes the response envelope. Request errors omit `data`.
 Execution errors retain partial data when possible; failed non-null values
@@ -83,8 +103,9 @@ aborts the process; return `Err` for recoverable failures.
 
 ## Supported query subset and limits
 
-One shorthand or named query, aliases, nested selections, lists, scalar
-literals, argument defaults, field merging, and `__typename` are supported.
+Shorthand and named queries, variable definitions and defaults, operation
+selection, aliases, nested selections, lists, scalar literals, argument defaults,
+field merging, and `__typename` are supported.
 Strings support standard escapes and Unicode escapes. The lexer tracks UTF-8
 byte offsets and one-based source locations, accepts comments and commas, and
 rejects malformed numbers and strings.
@@ -95,7 +116,7 @@ and completion visits. These budgets cover engine work, not time or memory
 spent inside user resolvers. Float literals currently use libc `strtod` after
 grammar validation; they require a locale that accepts the decimal point.
 
-Variables, fragments, directives, mutations, subscriptions, schema
+Fragments, directives, mutations, subscriptions, schema
 introspection beyond `__typename`, enums, input objects, interfaces, unions,
 custom scalars, block strings, SDL/EDN loading, and field-level asynchronous
 resolvers are future work. There is no HTTP adapter or performance comparison
@@ -107,6 +128,6 @@ with upstream Lacinia yet.
 LACINIA_FIBC=./F scripts/test-lacinia.sh
 ```
 
-The script runs native cases `7500`–`7509`, builds the example, and checks its
+The script runs native cases `7500`–`7512`, builds the example, and checks its
 response with Python's JSON parser. See the [design and roadmap](../../../docs/design/lacinia.md)
 for architecture, provenance, and the next milestones.
