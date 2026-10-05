@@ -550,12 +550,15 @@ fibc test: two scenarios have the same id; give one an (id "..")        [exit 2]
 
 ## 10. Not done, risks, decisions for the owner
 
-**Not built** (everything not named in 8): the `fibc test` command (path handling, a stub `main`, `fibc test` returning the run's
-status, `--format tap`, `--covers`); the coverage report; the checked-in id list and its gate diff; `(open ..)`; `(call-pos)` and
-`file:line`; `Arbitrary` derivation and `gen-f64`; multi-binding `prop`; stdout capture of children; the Vec contract, the
-interpreter contract, the language-server contract, fibgen contracts; a matrix report; the oracle generator script; any gate edit or
-mutant-script edit (recommendations only). The prototype ran on `F` from the RR1 tree (`rr1/tools/F`) with `FIB_LIB` set; **it was not
-built with the seed v0.1.5** (`unchecked-add` is not there: gen.fib needs a stage 2 from this tree, as `compiler/gen` does) and not on the Mac.
+**Built since the prototype (2026-10-05, the owner's decisions 2 to 5):** `fib.os.process` fork primitives (5.3), task isolation as the default
+(5.2), `(call-pos)` and `file:line:col` (6.3), `fibc test` with tap and json (6.1), `fib.rng` shared with fibgen (4), the Vec contract in `specs/`
+(S2's first half), a `specs` gate stage (full gate, or `GATE_SPECS=1`). **Still not built:** `--covers` and the coverage report; the checked-in id
+list and its gate diff; `(open ..)`; `Arbitrary` derivation and `gen-f64`; multi-binding `prop`; stdout capture of children; the interpreter
+contract, the language-server contract, fibgen contracts; a matrix report; the oracle generator script; mutant scripts that name specs; a
+`(call-pos)` for a plain boolean `then` item (it reports the scenario's position); `pthread_atfork` (fork is refused while other threads
+exist instead). The surface (`feature`/`scenario`/`given`/`upon`/`then`/`outline`/`defcontract`/`prop`) is under discussion with the owner and
+was not changed or renamed; `expect` became a macro without changing how it is written. The prototype ran on a stage 2 built from this tree (`gen.fib`
+needs `unchecked-add`: not in the v0.1.5 seed) and not on the Mac.
 
 **Risks.** (1) `fork` in a parent with a started thread pool is undefined for the child; the runner starts none, but a spec file's
 top-level `def` that spawns would. (2) `scenario`'s macro body is one 80-line function (a stage-2 macro cannot call a helper): it passes
