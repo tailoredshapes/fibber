@@ -1,0 +1,34 @@
+;; spec:   stdlib §2.10 (step 2), §5.5 S16; docs/design/exceptions.md 4.1 tests 3 and 6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; `(try-join t)` is `(Ok v)` for a task that finished and `(Err (Trap message))` for one that trapped, whatever the trap (a `trap` call,
+;; a division by zero); asked twice it says the same both times; a task that does not trap is unaffected by
+;; its neighbours' traps; a value that is an object (a string, a vector) comes back intact. The tasks that trap own nothing, so the audit
+;; is clean. Killed by: scripts/mutant-task-trap.sh `no-isolate` (the process aborts), `ok-failed` (a failed task reads as Ok).
+(ns main (:use fib.core fib.async tl.check))
+
+(defun msg (r: (Result i64 Trap)) -> str
+  (match r ((Err e) (. e message)) ((Ok _) "")))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (zero (spawn (fn () 0)))
+        (user (spawn (fn () (trap "boom"))))
+        (div (spawn (fn () (quot 10 (- (count [1 2 3]) 3)))))
+        (fine (spawn (fn () 42)))
+        (text (spawn (fn () (str "ab" "cd"))))
+        (vv (spawn (fn () [1 2 3 4]))))
+    (do (check c (= (try-join fine) (Ok 42)))
+        (check c (= (try-join fine) (Ok 42)))
+        (check c (= (msg (try-join user)) "boom"))
+        (check c (= (msg (try-join user)) "boom"))
+        (check c (= (try-join user) (Err (Trap "boom"))))
+        (check c (= (msg (try-join div)) "integer / by zero"))
+        (check c (= (try-join text) (Ok "abcd")))
+        (check c (= (match (try-join vv) ((Ok v) (count v)) ((Err _) -1)) 4))
+        (check c (= (try-join zero) (Ok 0)))
+        (check c (= (try-join fine) (Ok 42)))
+        (checks-result c))))

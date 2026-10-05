@@ -449,3 +449,49 @@ analysis), the share-marking of the closure's captures walks the reachable docum
 4. **The `&` write-back on unwind** (basic guarantee) as the language rule, and **poisoning** for `cell-update!`.
 5. **Trap in `finally` while unwinding is fatal** in v1.
 6. Do F1 (detach finished threads) now: it is a defect with or without exceptions.
+
+## 8. Stage 1 as built (2026-10-05)
+
+Built on the lead's decisions of 2026-10-05 (docs/design/decisions-2026-10-04.md, "Exceptions (§7)"): J1 (`try-join` returns the trap, `join` and `@t`
+trap in the joiner), the fatal list of 1.2, and F1 fixed first. What exists, and where its cases are:
+
+| Piece | Where | Cases |
+|---|---|---|
+| finished threads are detached; main's return waits on a count of live threads (F1) | `rt/thread.lir` (`fib.spawn`, `fib.thread-done`, `fib.join-all`) | 912, 913, 914; `scripts/mutant-spawn-leak.sh` |
+| a trap on a spawned task's thread completes the task as failed (message in a new task slot, `slot-task-failure`), releases the thread's count and ends the thread | `rt/core.lir` (`fib.fail-task`, `fib.trap-bytes`, `fib.fatal-bytes`), `rt/thread.lir` (`fib.thread-enter`), `rt/task.lir` (`fib.task-failure`, `fib.raise-failed`) | 916, 917, 921, 922, 925 |
+| fatal, never isolated: out of memory (3 sites), a thread or pool worker that cannot start (2 sites) | `fib.fatal-c` | 922 |
+| builtin `task-failure`, the trapping `join`/`@t` | `compiler/emit/lower/threads.fib`, `compiler/types/builtins.fib` | 925, 916, 917 |
+| `Trap`, `try-join` | `lib/fib/async.fib` | 911, 915, 919, 920, 923, 926 |
+| `ExInfo`, `ex-info`, `ex-message`, `ex-data`, `ex-cause` | `lib/fib/ex.fib` | 924 |
+| `audit: abandoned` with `leaks: N` | `compiler/driver/header.fib`, `verdict.fib` | 918, 923, 926; `compiler/tests/driver/cases-check.sh` |
+
+Every case names the planted fault that kills it in its header; `scripts/mutant-task-trap.sh MODE` builds each mutant and shows the cases fail.
+
+**Differences from the sketch above, and what is not done.** The task's failure is the message only: `Trap` has a `message` and no `kind` (kinds need the
+emit sites of stage 2, 1.2). `ExInfo` is generic in its data (`(ExInfo d)`) since `Val` of fib.data does not exist. What a trapped task's frames owned
+is abandoned, and so is the closure environment of a task that trapped (its captures): `try-join` of the same program reports 3 leaked objects for a
+handler that captured a request string (case 926). An `async` task that traps on a pool worker is not isolated (the worker has no task of its own):
+the process aborts as before. `pthread_exit` unwinds the task's frames with the C++ forced-unwind machinery, so a static binary needs `libgcc_s`.
+`try`/`catch`/`finally`, `throw`, unwinding, may-throw inference, `future-cancel`: not started (stage 2).
+
+### Isolating a handler with `try-join`
+
+A server that must survive a bad request runs each handler in a task and asks with `try-join`; the trap becomes the reply, and the loop goes on
+(case 926 is this program):
+
+```
+(ns main (:use fib.core fib.async))
+
+(defun handle (method: str n: i64) -> i64
+  (cond (= method "double") (* n 2)
+        (= method "divide") (quot 100 n)
+        :else (trap (str "unknown method " method))))
+
+(defun reply (method: str n: i64) -> str
+  (match (try-join (spawn (fn () (handle method n))))
+    ((Ok v) (str "result " (show v)))
+    ((Err trap) (str "error -32603 " (. trap message)))))
+```
+
+`(reply "divide" 0)` is `error -32603 integer / by zero`; the next `(reply "double" 4)` is `result 8`. Cost: one thread per request (about 27 us); each trap
+abandons what that handler owned, so this is for a server that restarts daily, not for one that traps in a loop (W3 above); stage 2 replaces it.

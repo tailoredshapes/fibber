@@ -24,3 +24,17 @@
 
 (defun future-call (f: (fn :send () a)) -> (Task a)
   (fib.prelude/spawn f))
+
+;; A task that trapped (stage 1 of exceptions, docs/design/exceptions.md 4.1, stdlib §2.10): the trap of a task ends that task and not
+;; the process. `try-join` waits for the task as `join` does and returns what it came to: `(Ok v)`, or `(Err trap)` when a trap ended it.
+;; `join` and `@t` of a task that trapped trap in the joiner with the task's own message (Clojure's `deref` of a failed future throws).
+;; What the task's frames owned when it trapped is never freed (the audit calls it abandoned, `;; audit: abandoned`). The kind of the trap
+;; (index, overflow, ...) comes with the catching form of stage 2; today a trap is its message. Out of memory, a thread that cannot be
+;; started and a stack overflow are not traps a task survives: they end the process, whoever's they are.
+(defstruct Trap (message: str))
+(derive Eq Trap)
+
+(defun try-join (t: (Task a)) -> (Result a Trap)
+  (match (task-failure t)
+    ((some message) (Err (Trap message)))
+    (nil (Ok (join t)))))
