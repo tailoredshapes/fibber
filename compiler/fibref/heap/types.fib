@@ -4,7 +4,8 @@
   (:use fibref.value))
 
 ;; The operation that was attempted on an object, for error reports (error.rs Op).
-(defenum HpOp HpRetain HpRelease HpRead HpWrite HpWeak HpShare HpStore HpInspect)
+;; HpMove is a take or a move-in (the content leaves a cell): new with the peek audit.
+(defenum HpOp HpRetain HpRelease HpRead HpWrite HpWeak HpShare HpStore HpInspect HpMove)
 
 ;; Why `write-unique` (or a steal, take or in-place array primitive) refused: the first failing test of `fib.unique?` (types section 8.2), flags before
 ;; count, or a place the primitive cannot take (error.rs Uniqueness).
@@ -34,7 +35,9 @@
   (HeUnknownScope scope: i64)
   (HeScopeEnded scope: i64)
   (HeTakenSlot id: i64 index: i64)         ;; NEW: the slot's content was moved out and not put back
-  (HeSlotNotTaken id: i64 index: i64))     ;; NEW: `heap-put` into a slot that holds a value
+  (HeSlotNotTaken id: i64 index: i64)      ;; NEW: `heap-put` into a slot that holds a value
+  (HePeeked id: i64 op: HpOp)              ;; NEW: the cell has a peek outstanding (`heap-peek-begin`) and is written, moved out of or released
+  (HePeekNotOutstanding id: i64))          ;; NEW: `heap-peek-end` of a cell with no peek outstanding
 
 ;; The events of heap/event.rs, in the order they happened (what `fibref trace` prints and what a unit test replays), and the events of the new rules.
 (defenum HpEvent
@@ -45,6 +48,7 @@
   (EvSteal id: i64 field: i64 moved: bool)                    ;; NEW: a steal; `moved` false means the shell was shared and a Retain follows
   (EvTake id: i64 field: i64) (EvPut id: i64 field: i64)      ;; NEW: content moved out of / into a slot, no count change
   (EvPeek id: i64)                                            ;; NEW: a cell read with no count
+  (EvPeekEnd id: i64)                                         ;; NEW: the borrow of a peek ended (`heap-peek-end`)
   (EvMoveIn place: i64 id: i64)                               ;; NEW: `&` copy-in without a retain: the content of `place` moved into the new private cell `id`
   (EvArrayOp op: str place: i64 id: i64 index: i64 inplace: bool))   ;; NEW: array-take! array-push! array-pop! on the array `id` held by the cell `place`
 
@@ -54,7 +58,8 @@
 (defstruct HpLeakRow (id: i64 kind: IKind count: i64 held: i64 class: HpLeakClass))
 ;; A live Ref field whose target was freed (audit.rs DanglingRef).
 (defstruct HpDangling (holder: i64 field: i64 target: i64))
-(defstruct HpReport (leaks: (Vec HpLeakRow) dangling: (Vec HpDangling) open-scopes: (Vec i64) live-tally: (Vec i64) allocated: i64 freed: i64))   ;; tally: live o c a
+(defstruct HpReport (leaks: (Vec HpLeakRow) dangling: (Vec HpDangling) open-scopes: (Vec i64) live-tally: (Vec i64) allocated: i64 freed: i64
+                     open-peeks: (Vec i64)))   ;; open-peeks (new): the cells with a peek never ended   ;; tally: live o c a
 
 ;; The heap: one cell per column of the object table (indexed by object id, never reused), the event log and the scope tables. Opaque to everyone but
 ;; `fibref.heap.*`. Columns: kind 0 immutable 1 cell 2 atom; flags (fl-* below); scope the scope id of a STACK object or -1.
@@ -63,13 +68,15 @@
    scopes: (Cell (Vec i64)) fields: (Cell (Vec (Vec IVal)))
    log: (Cell (Vec HpEvent))
    scope-objs: (Cell (Vec (Vec i64))) scope-ended: (Cell (Vec i64)) open: (Cell (Vec i64))
-   pinned: (Cell (Vec i64))))
+   pinned: (Cell (Vec i64))
+   peeks: (Cell (Vec i64))))   ;; per object: the peeks outstanding on it (a cell), see `heap-peek-begin`
 
 (defun heap-new () -> Heap
   (Heap (cell (vec-empty)) (cell (vec-empty)) (cell (vec-empty)) (cell (vec-empty))
         (cell (vec-empty)) (cell (vec-empty))
         (cell (vec-empty))
         (cell (vec-empty)) (cell (vec-empty)) (cell (vec-empty))
+        (cell (vec-empty))
         (cell (vec-empty))))
 
 ;; Header flag bits of types section 8.2 (live is the model's own).

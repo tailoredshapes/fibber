@@ -1,0 +1,299 @@
+;; compiler/tests/fibref/heap-dang.fib: the adversarial heap tests of crates/fibref/tests/heap_adversarial/{dangling,deficit,errors,free,reentrant}.rs at
+;; seed-1, one fibber test per Rust test (the names say which). Each tries to make the audit miss a misuse or change state on a failing call. The Rust
+;; tests that accepted either of two errors (ReleaseOfFreed or UseAfterFree) are pinned here to the one this heap gives. Exit status: failures.
+(ns main (:use fibref.value fibref.heap fibref.trace heaptk))
+
+;; ================= dangling.rs =================
+;; x, parent: parent holds x, x was released once too often and is freed, the field dangles. Returns [parent x].
+(defun dp (h: Heap) -> (Vec i64)
+  (let [x (imm h [(i 1)]) parent (imm h [(obj x)]) c2 (cnt h x) _a (rel h x) r (ok! (heap-release h x))]
+    (if (and (= c2 2) (not (heap-is-live h x)) (heap-is-live h parent)) [parent x] (trap "dp: the fixture is wrong"))))
+
+(defun t-dang-read-out-of-its-holder () -> str
+  (let [h (heap-new) pp (dp h) parent (nth pp 0) x (nth pp 1) stale (rd h parent 0)]
+    (all [(ck "the field dangles" (ival-eq stale (obj x)))
+          (is-err "read x" (heap-read h x 0) "use after free: read of freed object #0")
+          (is-err "alloc with stale" (heap-alloc h IImmutable 0 [stale]) "use after free: store of freed object #0")
+          (is-err "retain x" (heap-retain h x) "use after free: retain of freed object #0")])))
+
+(defun t-dang-cascade-into-an-over-released-child () -> str
+  (let [h (heap-new) pp (dp h) parent (nth pp 0) x (nth pp 1)]
+    (all [(is-err "release parent" (heap-release h parent) "double free: release of freed object #0") (ck "x stays freed" (not (heap-is-live h x)))])))
+
+(defun t-dang-write-cascade-into-an-over-released-grandchild () -> str
+  (let [h (heap-new) pp (dp h) parent (nth pp 0) c (cell-of h (obj parent)) _r (rel h parent) pc (cnt h parent)]
+    (all [(same "parent count" pc 1) (is-err "write nil" (heap-write h c 0 INone) "double free: release of freed object #0")])))
+
+(defun t-dang-releasing-a-self-holding-cell-past-its-owner-count () -> str
+  (let [h (heap-new) c (cell-of h INone) _w (wr h c 0 (obj c)) c2 (cnt h c) _r (rel h c) n (nev h)]
+    (all [(same "count with slot" c2 2) (failed? "over-release" (heap-release h c)) (ck "live" (heap-is-live h c))
+          (is-int "count" (heap-count h c) 1) (same "events" (nev h) n)])))
+
+(defun t-dang-mark-shared-through-a-dangling-ref () -> str
+  (let [h (heap-new) pp (dp h) parent (nth pp 0) x (nth pp 1) n (nev h)]
+    (all [(is-err "share" (heap-mark-shared h parent) "use after free: share of freed object #0")
+          (is-bool "parent unshared" (heap-is-shared h parent) false) (same "events" (nev h) n)
+          (ck "x never traced shared" (not (contains? (into #{} (shared-evs h)) x)))])))
+
+(defun t-dang-mark-shared-through-a-dangling-ref-to-a-freed-cell () -> str
+  (let [h (heap-new) c (cell-of h (i 1)) holder (imm h [(obj c)]) _a (rel h c) _b (rel h c)]
+    (all [(ck "c freed" (not (heap-is-live h c)))
+          (is-err "share" (heap-mark-shared h holder) "use after free: share of freed object #0")])))
+
+(defun t-dang-finish-does-not-accept-a-permitted-cycle-holding-a-dangling-ref () -> str
+  (let [h (heap-new) x (imm h [(i 1)]) c (cell-of h INone) v (imm h [(obj c) (obj x)]) _w (wr h c 0 (obj v)) _r (release-all h [v c x])
+        cx (cnt h x) _f (rel h x) rv (rd h v 1) rep (heap-finish h)]
+    (all [(same "x held by v only" cx 1) (ck "v field dangles" (ival-eq rv (obj x)))
+          (ck (leak-ids rep HpLeakCycle) (= (leak-ids rep HpLeakCycle) "#1 #2 "))
+          (ck "not a permitted cycle leak" (not (report-cycle-leak-only? rep)))])))
+
+(defun t-dang-a-dangling-ref-does-not-make-the-freed-object-live-again () -> str
+  (let [h (heap-new) cv (cell-cycle h) pp (dp h) rep (heap-finish h)]
+    (all [(ck (leak-ids rep HpLeakCycle) (= (leak-ids rep HpLeakCycle) "#0 #1 ")) (ck (leak-ids rep HpLeak) (= (leak-ids rep HpLeak) "#3 "))
+          (ck "freed is no leak" (= (count (filter (fn (l: HpLeakRow) (= (. l id) 2)) (. rep leaks))) 0)) (same "freed" (. rep freed) 1)])))
+
+;; ================= deficit.rs =================
+(defun t-def-an-over-release-hidden-by-a-second-holder () -> str
+  (let [h (heap-new) c (cell-of h INone) v (imm h [(obj c)]) hh (imm h [(obj v) (obj v)]) _w (wr h c 0 (obj hh)) _r (release-all h [v hh c])
+        cv (cnt h v) _x (rel h v) rep (heap-finish h) row (nth (vec (filter (fn (l: HpLeakRow) (= (. l id) v)) (. rep leaks))) 0)]
+    (all [(same "v count before" cv 2) (ck (leak-ids rep HpLeakCycle) (= (leak-ids rep HpLeakCycle) "#0 #2 ")) (ck (leak-ids rep HpLeak) (= (leak-ids rep HpLeak) "#1 "))
+          (same "row count" (. row count) 1) (same "row held" (. row held) 2) (ck "not permitted" (not (report-cycle-leak-only? rep)))
+          (same "nothing dangles" (count (. rep dangling)) 0)])))
+
+(defun t-def-a-cascade-that-reaches-an-over-released-leaf-twice-is-refused-whole () -> str
+  (let [h (heap-new) x (imm h [(i 1)]) root (imm h [(obj x) (obj x)]) _a (rel h x) _b (rel h x) n (nev h) r (heap-release h root) after (nev h) rep (heap-finish h)]
+    (all [(is-err "release root" r "double free: release of freed object #0") (ck "root live" (heap-is-live h root)) (ck "x live" (heap-is-live h x))
+          (is-int "root" (heap-count h root) 1) (is-int "x" (heap-count h x) 1) (same "events" after n)
+          (ck (leak-ids rep HpLeak) (= (leak-ids rep HpLeak) "#0 #1 ")) (same "dangling" (count (. rep dangling)) 0)])))
+
+;; The Rust test accepted both outcomes of the write; both are checked, the heap takes the first.
+(defun t-def-a-write-whose-cascade-frees-the-cell-under-a-deficit () -> str
+  (let [h (heap-new) c (cell-of h INone) _s (wr h c 0 (obj c)) v (imm h [(obj c)]) _a (rel h c) _b (rel h c) w (heap-write h c 0 (obj v))]
+    (match w
+      ((Ok _) (let [live (heap-is-live h c) cv (cnt h v) r (heap-release h v) rep (heap-finish h)]
+                (all [(ck "the slot's count was c's last" (not live)) (same "c gave v's count back" cv 1) (is-err "release v" r "double free: release of freed object #0")
+                      (ck "v live" (heap-is-live h v)) (ck (leak-ids rep HpLeak) (= (leak-ids rep HpLeak) "#1 ")) (same "one dangling" (count (. rep dangling)) 1)
+                      (ck "dangling v -> c" (= (dangling-text (nth (. rep dangling) 0)) "dangling reference #1.0 -> #0"))])))
+      ((Err e) (all [(ck (hp-err-text e) (= (hp-err-text e) "double free: release of freed object #0")) (ck "c live" (heap-is-live h c)) (is-int "v" (heap-count h v) 1)])))))
+
+(defun t-def-an-object-cannot-hold-itself-through-a-forged-future-id () -> str
+  (let [h (heap-new) older (imm h []) n (nev h)]
+    (all [(ck "forged is not live" (not (heap-is-live h 1)))
+          (is-err "ref" (heap-alloc h IImmutable 0 [(obj 1)]) "unknown object #1")
+          (is-err "older and ref" (heap-alloc h IImmutable 0 [(obj older) (obj 1)]) "unknown object #1")
+          (is-err "weak" (heap-alloc h IImmutable 0 [(IWeak 1)]) "unknown object #1")
+          (is-err "cell" (heap-alloc h ICell 0 [(obj 1)]) "unknown object #1")
+          (is-int "older count" (heap-count h older) 1) (same "events" (nev h) n)
+          (let [next (imm h [])] (all [(same "next is the forged id" next 1) (do (rel h older) (rel h next) "")
+                                        (let [rep (heap-finish h)] (all [(ck "clean" (report-clean? rep)) (same "allocated" (. rep allocated) 2)]))]))])))
+
+(defun t-def-a-forged-weak-never-upgrades-into-a-newer-object () -> str
+  (let [h (heap-new) doomed (imm h []) holder (cell-of h (IWeak doomed)) _r (rel h doomed)
+        _f (loop [k 0] (if (>= k 1000) () (let [fl (imm h [(i k)])] (do (rel h fl) (recur (+ k 1))))))
+        stale (rd h holder 0) _h (rel h holder) rep (heap-finish h)]
+    (all [(ck "stale weak" (ival-eq stale (IWeak doomed))) (is-up "upgrade" (heap-upgrade h doomed) -1) (ck "not live" (not (heap-is-live h doomed)))
+          (ck "clean" (report-clean? rep)) (same "allocated" (. rep allocated) 1002)])))
+
+;; ================= errors.rs =================
+(defun t-err-stale-ref-read-after-count-hit-zero () -> str
+  (let [h (heap-new) child (imm h [(i 7)]) holder (imm h [(obj child)]) stale (rd h holder 0) _a (rel h child) c1 (cnt h child) _b (rel h holder) c (cell-of h INone)]
+    (all [(ck "stale" (ival-eq stale (obj child))) (same "child count" c1 1) (ck "child freed" (not (heap-is-live h child)))
+          (is-err "read" (heap-read h child 0) "use after free: read of freed object #0") (is-err "retain" (heap-retain h child) "use after free: retain of freed object #0")
+          (is-err "weak" (heap-weak h child) "use after free: weak of freed object #0") (is-err "share" (heap-mark-shared h child) "use after free: share of freed object #0")
+          (is-err "count" (heap-count h child) "use after free: inspect of freed object #0") (is-err "kind" (heap-kind h child) "use after free: inspect of freed object #0")
+          (is-err "is-shared" (heap-is-shared h child) "use after free: inspect of freed object #0")
+          (is-err "field-count" (heap-field-count h child) "use after free: inspect of freed object #0")
+          (is-err "alloc" (heap-alloc h IImmutable 0 [stale]) "use after free: store of freed object #0")
+          (is-err "write" (heap-write h c 0 stale) "use after free: store of freed object #0") (is-val "nothing stored" (heap-read h c 0) INone)])))
+
+(defun t-err-release-after-free-is-double-free-and-stays-one () -> str
+  (let [h (heap-new) a (imm h []) _r (rel h a) n (nev h)]
+    (all [(is-err "1" (heap-release h a) "double free: release of freed object #0") (is-err "2" (heap-release h a) "double free: release of freed object #0")
+          (is-err "3" (heap-release h a) "double free: release of freed object #0") (same "events" (nev h) n) (ck "not live" (not (heap-is-live h a)))])))
+
+(defun t-err-release-of-a-child-freed-through-its-parent () -> str
+  (let [h (heap-new) child (imm h []) parent (imm h [(obj child)]) _a (rel h child) _b (rel h parent)]
+    (is-err "release child" (heap-release h child) "double free: release of freed object #0")))
+
+(defun t-err-write-to-immutable-without-retaining-the-value () -> str
+  (let [h (heap-new) x (imm h []) v (imm h [(i 1)]) n (nev h) w (heap-write h v 0 (obj x)) cx (cnt h x) r (rd h v 0) n2 (nev h) e (imm h [])]
+    (all [(is-err "write" w "write to immutable object #1") (same "x count" cx 1) (ck "field unchanged" (ival-eq r (i 1))) (same "only the read traced" n2 (+ n 1))
+          (failed? "empty" (heap-write h e 0 INone))])))
+
+(defun t-err-write-to-freed-cell-without-retaining-the-value () -> str
+  (let [h (heap-new) x (imm h []) c (cell-of h (i 1)) _r (rel h c) n (nev h)]
+    (all [(is-err "write" (heap-write h c 0 (obj x)) "use after free: write of freed object #1") (is-int "x" (heap-count h x) 1) (same "events" (nev h) n)])))
+
+(defun t-err-bad-field-on-read-and-write-changes-nothing () -> str
+  (let [h (heap-new) x (imm h []) pair (imm h [(i 1) (i 2)]) empty (imm h []) c (cell-of h INone) a (atom-of h INone) n (nev h)]
+    (all [(is-err "read pair 2" (heap-read h pair 2) "object #1 has no field 2") (is-err "read empty" (heap-read h empty 0) "object #2 has no field 0")
+          (is-err "write cell 1" (heap-write h c 1 (obj x)) "object #3 has no field 1")
+          (is-err "write atom max" (heap-write h a 9223372036854775807 (obj x)) "object #4 has no field 9223372036854775807")
+          (is-err "write atom -1" (heap-write h a -1 (obj x)) "object #4 has no field -1")
+          (is-int "x" (heap-count h x) 1) (same "events" (nev h) n)])))
+
+(defun t-err-freed-object-with-bad-index-is-still-an-error () -> str
+  (let [h (heap-new) c (cell-of h INone) _r (rel h c)]
+    (all [(failed? "read" (heap-read h c 99)) (failed? "write" (heap-write h c 99 INone))])))
+
+(defun t-err-unknown-id-is-rejected-by-every-operation () -> str
+  (let [h (heap-new) s 100 u "unknown object #100"]
+    (all [(is-err "read" (heap-read h s 0) u) (is-err "write" (heap-write h s 0 INone) u) (is-err "retain" (heap-retain h s) u)
+          (is-err "release" (heap-release h s) u) (is-err "weak" (heap-weak h s) u) (is-err "upgrade" (heap-upgrade h s) u)
+          (is-err "share" (heap-mark-shared h s) u) (is-err "count" (heap-count h s) u) (is-err "kind" (heap-kind h s) u)
+          (is-err "is-shared" (heap-is-shared h s) u) (is-err "field-count" (heap-field-count h s) u)
+          (is-err "alloc ref" (heap-alloc h IImmutable 0 [(obj s)]) u) (is-err "alloc weak" (heap-alloc h ICell 0 [(IWeak s)]) u)
+          (ck "not live" (not (heap-is-live h s))) (same "nothing traced" (nev h) 0)])))
+
+(defun t-err-alloc-with-a-freed-ref-allocates-and-retains-nothing () -> str
+  (let [h (heap-new) live (imm h []) dead (imm h []) _r (rel h dead) n (nev h)
+        e (heap-alloc h IImmutable 0 [(obj live) (obj dead)]) c1 (cnt h live) n2 (nev h) after (imm h [(obj live)])]
+    (all [(is-err "alloc" e "use after free: store of freed object #1") (same "live count" c1 1) (same "no events" n2 n)
+          (ck "fresh id" (and (not= after live) (not= after dead))) (is-int "live count after" (heap-count h live) 2)])))
+
+(defun t-err-cell-and-atom-take-exactly-one-slot () -> str
+  (let [h (heap-new) x (imm h [])]
+    (all [(is-err "cell none" (heap-alloc h ICell 0 []) "a cell has exactly one slot, not 0")
+          (is-err "atom two" (heap-alloc h IAtom 0 [(obj x) (obj x)]) "a atom has exactly one slot, not 2")
+          (is-int "x" (heap-count h x) 1) (is-ok "imm none" (heap-alloc h IImmutable 0 [])) (is-ok "imm two" (heap-alloc h IImmutable 0 [(obj x) (obj x)]))])))
+
+(defun t-err-shared-cell-fires-for-a-cell-crossing-directly () -> str
+  (let [h (heap-new) c (cell-of h (i 1)) n (nev h)]
+    (all [(is-err "share" (heap-mark-shared h c) "cell #0 would cross a thread boundary") (is-bool "unshared" (heap-is-shared h c) false) (same "events" (nev h) n)])))
+
+(defun t-err-errors-display-the-object-they-are-about () -> str
+  (let [h (heap-new) a (imm h []) _r (rel h a)]
+    (match (heap-release h a)
+      ((Err e) (ck (hp-err-text e) (= (hp-err-text e) "double free: release of freed object #0")))
+      ((Ok _) "expected a double free"))))
+
+;; ================= free.rs =================
+(defun t-free-releases-each-child-exactly-once () -> str
+  (let [h (heap-new) a (imm h [(i 1)]) parent (imm h [(obj a) (i 2)]) c2 (cnt h a) _r (rel h parent)]
+    (all [(same "a count before" c2 2) (ck "parent freed" (not (heap-is-live h parent))) (ck "a live" (heap-is-live h a)) (is-int "a count" (heap-count h a) 1)
+          (same "releases of a" (releases-of h 0 a) 1) (same "frees of a" (frees-of h 0 a) 0)])))
+
+(defun t-free-a-child-held-twice-by-one-parent-is-released-twice () -> str
+  (let [h (heap-new) a (imm h []) parent (imm h [(obj a) (obj a)]) c3 (cnt h a) _x (rel h a) _y (rel h parent)]
+    (all [(same "count" c3 3) (ck "a freed" (not (heap-is-live h a))) (same "releases of a" (releases-of h 0 a) 3) (same "frees of a" (frees-of h 0 a) 1)])))
+
+(defun two-parents (first-p1: bool) -> str
+  (let [h (heap-new) a (imm h []) p1 (imm h [(obj a)]) p2 (imm h [(i 0) (obj a)]) c3 (cnt h a) _x (rel h a)
+        first (if first-p1 p1 p2) second (if first-p1 p2 p1) _f (rel h first) live1 (heap-is-live h a) c1 (cnt h a) _s (rel h second)]
+    (all [(same "count" c3 3) (ck "a live after the first" live1) (same "a count" c1 1) (ck "a freed" (not (heap-is-live h a)))
+          (same "releases" (releases-of h 0 a) 3) (same "frees" (frees-of h 0 a) 1)])))
+(defun t-free-child-released-once-per-parent-first-parent-first () -> str (two-parents true))
+(defun t-free-child-released-once-per-parent-second-parent-first () -> str (two-parents false))
+
+(defun t-free-diamond-frees-the-shared-leaf-once-depth-first () -> str
+  (let [h (heap-new) x (imm h []) l (imm h [(obj x)]) r (imm h [(obj x)]) p (imm h [(obj l) (obj r)]) _a (release-all h [x l r]) n (nev h) _b (rel h p)]
+    (all [(ck (evs-from h n) (= (evs-from h n) "release #3 -> 0;free #3;release #1 -> 0;free #1;release #0 -> 1;release #2 -> 0;free #2;release #0 -> 0;free #0;"))
+          (same "frees p" (frees-of h 0 p) 1) (same "frees l" (frees-of h 0 l) 1) (same "frees r" (frees-of h 0 r) 1) (same "frees x" (frees-of h 0 x) 1)
+          (ck "none live" (not (or (heap-is-live h p) (heap-is-live h l) (heap-is-live h r) (heap-is-live h x))))])))
+
+(defun t-free-release-above-zero-frees-nothing () -> str
+  (let [h (heap-new) child (imm h []) a (imm h [(obj child)]) _r (ret h a) _s (rel h a)]
+    (all [(ck "live" (heap-is-live h a)) (is-int "child untouched" (heap-count h child) 2) (same "frees" (frees-of h 0 a) 0) (same "child releases" (releases-of h 0 child) 0)])))
+
+(defun t-free-writing-over-a-ref-releases-it-and-cascades () -> str
+  (let [h (heap-new) x (imm h []) v (imm h [(obj x)]) c (cell-of h (obj v)) _a (release-all h [x v]) cv (cnt h v) _w (wr h c 0 INone)]
+    (all [(same "v count" cv 1) (ck "v freed" (not (heap-is-live h v))) (ck "x freed" (not (heap-is-live h x))) (same "frees v" (frees-of h 0 v) 1)
+          (same "frees x" (frees-of h 0 x) 1) (failed? "stale read" (heap-read h v 0)) (do (rel h c) (ck "clean" (clean? h)))])))
+
+(defun t-free-writing-the-same-ref-back-neither-frees-nor-leaks () -> str
+  (let [h (heap-new) x (imm h []) c (cell-of h (obj x)) _a (rel h x) c1 (cnt h x) _w (wr h c 0 (obj x)) live (heap-is-live h x) c2 (cnt h x) _r (rel h c)]
+    (all [(same "before" c1 1) (ck "live" live) (same "after" c2 1) (ck "freed with the cell" (not (heap-is-live h x))) (ck "clean" (clean? h))])))
+
+(defun t-free-a-cell-holding-itself-frees-once-the-cycle-is-broken () -> str
+  (let [h (heap-new) c (cell-of h INone) _s (wr h c 0 (obj c)) c2 (cnt h c) _b (wr h c 0 INone) c1 (cnt h c) _r (rel h c)]
+    (all [(same "with slot" c2 2) (same "after break" c1 1) (ck "freed" (not (heap-is-live h c))) (same "frees" (frees-of h 0 c) 1) (ck "clean" (clean? h))])))
+
+(defun t-free-freeing-a-holder-of-a-weak-does-not-release-the-target () -> str
+  (let [h (heap-new) t (imm h []) w (ok! (heap-weak h t)) holder (imm h [w (i 1)]) _r (rel h holder)]
+    (all [(ck "target live" (heap-is-live h t)) (is-int "count" (heap-count h t) 1) (same "releases" (releases-of h 0 t) 0)])))
+
+(defun t-free-cascade-releases-in-field-order-depth-first () -> str
+  (let [h (heap-new) x (imm h []) a (imm h [(obj x)]) b (imm h []) v (imm h [(obj a) (obj b)]) _r (release-all h [x a b]) n (nev h) _g (rel h v)
+        frees (filter (fn (e: HpEvent) (match e ((EvFree _) true) (_ false))) (events-from h n))]
+    (ck (evs-from h n) (= (str-join (mapv (fn (e: HpEvent) (event-text e)) (vec frees))) "free #3free #1free #0free #2"))))
+
+;; ================= reentrant.rs =================
+(defun t-re-set-nil-on-a-self-holding-cell-frees-it-during-the-write () -> str
+  (let [h (heap-new) c (cell-of h INone) _s (wr h c 0 (obj c)) _r (rel h c) c1 (cnt h c) n (nev h) w (heap-write h c 0 INone) rep (heap-finish h)]
+    (all [(same "count" c1 1) (is-ok "write" w) (ck "freed" (not (heap-is-live h c))) (ck (evs-from h n) (= (evs-from h n) "write #0.0;release #0 -> 0;free #0;"))
+          (ck "clean" (report-clean? rep)) (same "freed count" (. rep freed) 1)])))
+
+(defun t-re-breaking-a-cycle-by-writing-a-fresh-value-frees-the-cell () -> str
+  (let [h (heap-new) cv (cell-cycle h) c (nth cv 0) v (nth cv 1) y (imm h [(i 9)]) n (nev h) w (heap-write h c 0 (obj y))]
+    (all [(is-ok "write" w) (ck "v freed" (not (heap-is-live h v))) (ck "c freed" (not (heap-is-live h c))) (ck "y live" (heap-is-live h y))
+          (is-int "y count" (heap-count h y) 1)
+          (ck (evs-from h n) (= (evs-from h n) "retain #2 -> 2;write #0.0;release #1 -> 0;free #1;release #0 -> 0;free #0;release #2 -> 1;"))
+          (do (rel h y) (let [rep (heap-finish h)] (all [(ck "clean" (report-clean? rep)) (same "freed" (. rep freed) 3)])))])))
+
+(defun t-re-writing-a-self-holding-cell-into-itself-keeps-its-count () -> str
+  (let [h (heap-new) c (cell-of h INone) _s (wr h c 0 (obj c)) _r (rel h c) n (nev h) w (heap-write h c 0 (obj c)) c1 (cnt h c) rep (heap-finish h)]
+    (all [(is-ok "write" w) (ck "live" (heap-is-live h c)) (is-int "count" (heap-count h c) 1) (same "count" c1 1)
+          (ck (evs-from h n) (= (evs-from h n) "retain #0 -> 2;write #0.0;release #0 -> 1;"))
+          (ck (leak-ids rep HpLeakCycle) (= (leak-ids rep HpLeakCycle) "#0 ")) (ck "cycle only" (report-cycle-leak-only? rep))])))
+
+(defun t-re-a-cascade-that-reaches-the-written-cell-twice () -> str
+  (let [h (heap-new) c (cell-of h INone) a (imm h [(obj c) (obj c)]) _w (wr h c 0 (obj a)) _r (release-all h [a c]) ca (cnt h a) cc (cnt h c) n (nev h) w (heap-write h c 0 INone)]
+    (all [(same "a" ca 1) (same "c" cc 2) (is-ok "write" w) (ck "a freed" (not (heap-is-live h a))) (ck "c freed" (not (heap-is-live h c)))
+          (ck (evs-from h n) (= (evs-from h n) "write #0.0;release #1 -> 0;free #1;release #0 -> 1;release #0 -> 0;free #0;"))
+          (same "releases of c" (releases-of h n c) 2) (same "frees of c" (frees-of h n c) 1) (ck "clean" (clean? h))])))
+
+(defun t-re-a-shared-self-holding-atom-frees-itself-on-reset-to-nil () -> str
+  (let [h (heap-new) a (atom-of h INone) _s (wr h a 0 (obj a)) _m (ok! (heap-mark-shared h a)) _r (rel h a) c1 (cnt h a) n (nev h) w (heap-write h a 0 INone)]
+    (all [(same "count" c1 1) (is-ok "write" w) (ck "freed" (not (heap-is-live h a))) (ck (evs-from h n) (= (evs-from h n) "write #0.0;release #0 -> 0;free #0;")) (ck "clean" (clean? h))])))
+
+(defun t-re-the-new-value-survives-a-cascade-that-frees-the-cell () -> str
+  (let [h (heap-new) y (imm h [(i 1)]) c (cell-of h INone) v (imm h [(obj c) (obj y)]) _w (wr h c 0 (obj v)) _r (release-all h [y v c]) cy (cnt h y) w (heap-write h c 0 (obj y))
+        rep (heap-finish h)]
+    (all [(same "held by v only" cy 1) (is-ok "write" w) (ck "v freed" (not (heap-is-live h v))) (ck "c freed" (not (heap-is-live h c)))
+          (ck "y freed with them" (not (heap-is-live h y))) (ck (str (count (. rep leaks)) " leaks") (report-clean? rep)) (same "freed" (. rep freed) 3)])))
+
+(defun main () -> i64
+  (min 100
+    (run-suite "heap-dang"
+      [(tc "dang-read-out-of-its-holder" t-dang-read-out-of-its-holder)
+       (tc "dang-cascade-into-an-over-released-child" t-dang-cascade-into-an-over-released-child)
+       (tc "dang-write-cascade-into-an-over-released-grandchild" t-dang-write-cascade-into-an-over-released-grandchild)
+       (tc "dang-releasing-a-self-holding-cell-past-its-owner-count" t-dang-releasing-a-self-holding-cell-past-its-owner-count)
+       (tc "dang-mark-shared-through-a-dangling-ref" t-dang-mark-shared-through-a-dangling-ref)
+       (tc "dang-mark-shared-dangling-freed-cell" t-dang-mark-shared-through-a-dangling-ref-to-a-freed-cell)
+       (tc "dang-finish-rejects-a-cycle-holding-a-dangling-ref" t-dang-finish-does-not-accept-a-permitted-cycle-holding-a-dangling-ref)
+       (tc "dang-freed-object-is-not-live-again" t-dang-a-dangling-ref-does-not-make-the-freed-object-live-again)
+       (tc "def-over-release-hidden-by-a-second-holder" t-def-an-over-release-hidden-by-a-second-holder)
+       (tc "def-cascade-over-released-leaf-twice-refused-whole" t-def-a-cascade-that-reaches-an-over-released-leaf-twice-is-refused-whole)
+       (tc "def-write-cascade-frees-the-cell-under-a-deficit" t-def-a-write-whose-cascade-frees-the-cell-under-a-deficit)
+       (tc "def-forged-future-id" t-def-an-object-cannot-hold-itself-through-a-forged-future-id)
+       (tc "def-forged-weak-never-upgrades" t-def-a-forged-weak-never-upgrades-into-a-newer-object)
+       (tc "err-stale-ref-read-after-count-zero" t-err-stale-ref-read-after-count-hit-zero)
+       (tc "err-release-after-free-stays-one" t-err-release-after-free-is-double-free-and-stays-one)
+       (tc "err-release-of-a-child-freed-through-its-parent" t-err-release-of-a-child-freed-through-its-parent)
+       (tc "err-write-to-immutable-retains-nothing" t-err-write-to-immutable-without-retaining-the-value)
+       (tc "err-write-to-freed-cell-retains-nothing" t-err-write-to-freed-cell-without-retaining-the-value)
+       (tc "err-bad-field-changes-nothing" t-err-bad-field-on-read-and-write-changes-nothing)
+       (tc "err-freed-object-with-bad-index" t-err-freed-object-with-bad-index-is-still-an-error)
+       (tc "err-unknown-id-every-operation" t-err-unknown-id-is-rejected-by-every-operation)
+       (tc "err-alloc-with-a-freed-ref" t-err-alloc-with-a-freed-ref-allocates-and-retains-nothing)
+       (tc "err-cell-and-atom-one-slot" t-err-cell-and-atom-take-exactly-one-slot)
+       (tc "err-shared-cell-directly" t-err-shared-cell-fires-for-a-cell-crossing-directly)
+       (tc "err-display-the-object" t-err-errors-display-the-object-they-are-about)
+       (tc "free-each-child-exactly-once" t-free-releases-each-child-exactly-once)
+       (tc "free-child-held-twice" t-free-a-child-held-twice-by-one-parent-is-released-twice)
+       (tc "free-two-parents-first-first" t-free-child-released-once-per-parent-first-parent-first)
+       (tc "free-two-parents-second-first" t-free-child-released-once-per-parent-second-parent-first)
+       (tc "free-diamond-depth-first" t-free-diamond-frees-the-shared-leaf-once-depth-first)
+       (tc "free-release-above-zero" t-free-release-above-zero-frees-nothing)
+       (tc "free-writing-over-a-ref-cascades" t-free-writing-over-a-ref-releases-it-and-cascades)
+       (tc "free-writing-the-same-ref-back" t-free-writing-the-same-ref-back-neither-frees-nor-leaks)
+       (tc "free-cell-holding-itself" t-free-a-cell-holding-itself-frees-once-the-cycle-is-broken)
+       (tc "free-holder-of-a-weak" t-free-freeing-a-holder-of-a-weak-does-not-release-the-target)
+       (tc "free-cascade-field-order" t-free-cascade-releases-in-field-order-depth-first)
+       (tc "re-set-nil-on-a-self-holding-cell" t-re-set-nil-on-a-self-holding-cell-frees-it-during-the-write)
+       (tc "re-break-a-cycle-by-a-fresh-value" t-re-breaking-a-cycle-by-writing-a-fresh-value-frees-the-cell)
+       (tc "re-self-holding-cell-into-itself" t-re-writing-a-self-holding-cell-into-itself-keeps-its-count)
+       (tc "re-cascade-reaches-the-written-cell-twice" t-re-a-cascade-that-reaches-the-written-cell-twice)
+       (tc "re-shared-self-holding-atom" t-re-a-shared-self-holding-atom-frees-itself-on-reset-to-nil)
+       (tc "re-new-value-survives-the-cascade" t-re-the-new-value-survives-a-cascade-that-frees-the-cell)])))

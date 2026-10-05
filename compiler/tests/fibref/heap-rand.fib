@@ -1,0 +1,386 @@
+;; compiler/tests/fibref/heap-rand.fib: the random-program checks of crates/fibref/tests/heap_adversarial/{replay,acyclic,cyclic,fault}.rs at seed-1: a
+;; deterministic generator, a plain reference counter written from spec/ownership.md section 2 that never trusts the heap's counts (the model), a replay of
+;; the heap's own event log that checks the log is well formed as it goes, one random legal step (alloc, retain, release, write, read, weak, upgrade) and
+;; the check that heap, model and replay agree on every object after every step. On top: random acyclic programs, random cyclic programs against an
+;; independent classifier of the end-of-run leaks, and one injected fault (an over-release or a forgotten release) that must always be caught.
+;; The replay of the Rust (heap_adversarial/replay.rs) is not a test of its own there; here its machinery is exercised by every test of this file.
+;; Exit status: failures.
+(ns main (:use fibref.value fibref.heap fibref.trace heaptk))
+
+;; The model per object: count, live (0 1), kind (0 imm 1 cell 2 atom), fields, owned (counts the program's bindings hold). The replay per object: count, live.
+(defstruct Rn
+  (h: Heap count: (Cell (Vec i64)) live: (Cell (Vec i64)) kind: (Cell (Vec i64)) fields: (Cell (Vec (Vec IVal))) owned: (Cell (Vec i64))
+   rc: (Cell (Vec i64)) rl: (Cell (Vec i64)) pfree: (Cell i64) pretain: (Cell i64) seen: (Cell i64) rng: (Cell i64)))
+
+(defun rn-new (seed: i64) -> Rn
+  (Rn (heap-new) (cell (vec-empty)) (cell (vec-empty)) (cell (vec-empty)) (cell (vec-empty)) (cell (vec-empty))
+      (cell (vec-empty)) (cell (vec-empty)) (cell -1) (cell -1) (cell 0) (cell seed)))
+
+(defun below (z: Rn n: i64) -> i64
+  (do (update! (. z rng) (fn (s: i64) (rem (+ (* s 1103515245) 12345) 2147483648)))
+      (rem (quot @(. z rng) 16) n)))
+(defun pick (z: Rn xs: (Vec i64)) -> i64 (if (= (count xs) 0) -1 (nth xs (below z (count xs)))))
+(defun starts? (s: str p: str) -> bool (and (>= (count s) (count p)) (= (subs s 0 (count p)) p)))
+(defun refused-text (e: HpErr) -> str (str "refused: " (hp-err-text e)))
+(defun dfree? (s: str) -> bool (or (starts? s "double free") (starts? s "use after free") (starts? s "refused: double free") (starts? s "refused: use after free")))
+
+;; ---- the model ----
+(defun m-size (z: Rn) -> i64 (count @(. z count)))
+(defun m-live? (z: Rn id: i64) -> bool (= 1 (nth @(. z live) id)))
+(defun m-count (z: Rn id: i64) -> i64 (nth @(. z count) id))
+(defun m-kind (z: Rn id: i64) -> i64 (nth @(. z kind) id))
+(defun m-fields (z: Rn id: i64) -> (Vec IVal) (nth @(. z fields) id))
+(defun m-setv (c: (Cell (Vec i64)) id: i64 x: i64) -> unit (update! c (fn (v: (Vec i64)) (assoc v id x))))
+(defun m-add-count (z: Rn id: i64 d: i64) -> unit (m-setv (. z count) id (+ (m-count z id) d)))
+(defun m-owned-add (z: Rn id: i64 d: i64) -> unit (m-setv (. z owned) id (+ (nth @(. z owned) id) d)))
+(defun live-ids (z: Rn) -> (Vec i64) (vec (filter (fn (id: i64) (m-live? z id)) (range (m-size z)))))
+(defun owned-ids (z: Rn) -> (Vec i64) (vec (filter (fn (id: i64) (> (nth @(. z owned) id) 0)) (range (m-size z)))))
+(defun target-of (v: IVal) -> i64 (match (ival-obj v) ((some t) t) (nil -1)))
+
+(defun m-alloc (z: Rn kind: i64 fs: (Vec IVal)) -> unit
+  (do (update! (. z count) (fn (v: (Vec i64)) (conj v 1)))
+      (update! (. z live) (fn (v: (Vec i64)) (conj v 1)))
+      (update! (. z kind) (fn (v: (Vec i64)) (conj v kind)))
+      (update! (. z fields) (fn (v: (Vec (Vec IVal))) (conj v fs)))
+      (update! (. z owned) (fn (v: (Vec i64)) (conj v 1)))
+      (loop [k 0] (if (>= k (count fs)) () (do (if (>= (target-of (nth fs k)) 0) (m-add-count z (target-of (nth fs k)) 1) ()) (recur (+ k 1)))))))
+
+;; One release of `root` with its cascade (a worklist, fields in field order); "" or the model's own complaint.
+(defun m-release (z: Rn root: i64) -> str
+  (loop [work [root]]
+    (if (= (count work) 0)
+        ""
+        (let [id (nth work (- (count work) 1)) rest (pop work)]
+          (if (or (not (m-live? z id)) (<= (m-count z id) 0))
+              (str "model over-release of #" id)
+              (let [n (- (m-count z id) 1)]
+                (do (m-setv (. z count) id n)
+                    (if (> n 0)
+                        (recur rest)
+                        (let [fs (m-fields z id)]
+                          (do (m-setv (. z live) id 0)
+                              (update! (. z fields) (fn (v: (Vec (Vec IVal))) (assoc v id (vec-empty))))
+                              (recur (into rest (vec (reverse (filter (fn (t: i64) (>= t 0)) (mapv target-of fs))))))))))))))))
+
+(defun m-write (z: Rn id: i64 v: IVal) -> str
+  (let [old (nth (m-fields z id) 0)]
+    (do (if (>= (target-of v) 0) (m-add-count z (target-of v) 1) ())
+        (update! (. z fields) (fn (a: (Vec (Vec IVal))) (assoc a id [v])))
+        (if (>= (target-of old) 0) (m-release z (target-of old)) ""))))
+
+;; ---- the replay: the heap's own event log must be well formed as it goes ----
+(defun rp-live (z: Rn id: i64 what: str) -> str
+  (cond (>= id (count @(. z rl))) (str what " of never-allocated #" id)
+        (= 0 (nth @(. z rl) id)) (str what " of freed #" id)
+        :else ""))
+
+(defun rp-release (z: Rn id: i64 c: i64) -> str
+  (let [live (rp-live z id "Release") n (if (= live "") (nth @(. z rc) id) 0)]
+    (cond (not= live "") live
+          (or (= n 0) (not= c (- n 1))) (str "Release of #" id ": " n " -> " c)
+          :else (do (m-setv (. z rc) id c) (if (= c 0) (update! (. z pfree) (fn (x: i64) id)) ()) ""))))
+
+(defun rp-retain (z: Rn id: i64 c: i64) -> str
+  (let [live (rp-live z id "Retain") n (if (= live "") (nth @(. z rc) id) 0)]
+    (cond (not= live "") live
+          (not= c (+ n 1)) (str "Retain of #" id ": " n " -> " c)
+          :else (do (m-setv (. z rc) id c) ""))))
+
+(defun rp-upgrade (z: Rn id: i64 live: bool) -> str
+  (cond (>= id (count @(. z rl))) (str "Upgrade of never-allocated #" id)
+        (not= live (= 1 (nth @(. z rl) id))) (str "Upgrade of #" id " says live=" live ", the trace says otherwise")
+        :else (do (if live (update! (. z pretain) (fn (x: i64) id)) ()) "")))
+
+(defun rp-plain (z: Rn e: HpEvent) -> str
+  (match e
+    ((EvAlloc id _) (if (not= id (count @(. z rc)))
+                        (str "Alloc of #" id " out of order")
+                        (do (update! (. z rc) (fn (v: (Vec i64)) (conj v 1))) (update! (. z rl) (fn (v: (Vec i64)) (conj v 1))) "")))
+    ((EvRetain id c) (rp-retain z id c))
+    ((EvRelease id c) (rp-release z id c))
+    ((EvFree id) (str "Free of #" id " without a Release to zero"))
+    ((EvRead id _) (rp-live z id "access"))
+    ((EvWrite id _) (rp-live z id "access"))
+    ((EvWeak id) (rp-live z id "access"))
+    ((EvShared id) (rp-live z id "access"))
+    ((EvUpgrade id live) (rp-upgrade z id live))
+    (_ (str (event-text e) " is outside the counted model"))))
+
+(defun rp-apply (z: Rn e: HpEvent) -> str
+  (let [pf @(. z pfree) pr @(. z pretain)]
+    (cond (>= pf 0)
+          (do (update! (. z pfree) (fn (x: i64) -1))
+              (match e
+                ((EvFree id) (if (= id pf) (do (m-setv (. z rl) id 0) "") (str "Release of #" pf " to zero followed by " (event-text e) ", not Free")))
+                (_ (str "Release of #" pf " to zero followed by " (event-text e) ", not Free"))))
+          (>= pr 0)
+          (do (update! (. z pretain) (fn (x: i64) -1))
+              (match e
+                ((EvRetain id _) (if (= id pr) (rp-plain z e) (str "live Upgrade of #" pr " followed by " (event-text e))))
+                (_ (str "live Upgrade of #" pr " followed by " (event-text e) ", not Retain"))))
+          :else (rp-plain z e))))
+
+;; Replays the events the heap logged since the last call; the first malformed one, or "".
+(defun catch-up (z: Rn) -> str
+  (let [log @(. (. z h) log) from @(. z seen)]
+    (do (update! (. z seen) (fn (x: i64) (count log)))
+        (loop [k from]
+          (if (>= k (count log))
+              ""
+              (let [r (rp-apply z (nth log k))] (if (= r "") (recur (+ k 1)) (str "malformed trace: " r))))))))
+
+;; Heap, model and replay agree on the liveness of every object and on the count of every live one.
+(defun agree (z: Rn) -> str
+  (loop [id 0]
+    (cond (>= id (m-size z)) ""
+          (not= (heap-is-live (. z h) id) (m-live? z id)) (str "#" id ": heap and model disagree on liveness")
+          (not= (= 1 (nth @(. z rl) id)) (m-live? z id)) (str "#" id ": trace and model disagree on liveness")
+          (and (m-live? z id) (not= (ok! (heap-count (. z h) id)) (m-count z id))) (str "#" id ": heap " (ok! (heap-count (. z h) id)) " model " (m-count z id))
+          (and (m-live? z id) (not= (nth @(. z rc) id) (m-count z id))) (str "#" id ": trace and model disagree on the count")
+          :else (recur (+ id 1)))))
+
+;; ---- the random steps; each returns "" or "refused: ..." (the heap said no) or "check: ..." (the heap disagreed with the model) ----
+(defun random-value (z: Rn targets: (Vec i64)) -> IVal
+  (let [r (below z 10)]
+    (cond (< r 4) (if (= (count targets) 0) (IInt -1 64) (IObj (pick z targets)))
+          (< r 6) (if (= (m-size z) 0) INone (IWeak (below z (m-size z))))
+          (= r 6) INone
+          :else (IInt (below z 1000) 64))))
+
+(defun step-alloc (z: Rn) -> str
+  (let [r (below z 20) code (cond (< r 12) 0 (< r 17) 1 :else 2) width (if (> code 0) 1 (below z 4)) live (live-ids z)
+        fs (mapv (fn (k: i64) (random-value z live)) (range width))]
+    (match (heap-alloc (. z h) (code-kind code) 0 fs)
+      ((Err e) (refused-text e))
+      ((Ok id) (if (= id (m-size z)) (do (m-alloc z code fs) "") (str "check: alloc gave #" id))))))
+(defun code-kind (c: i64) -> IKind (cond (= c 1) ICell (= c 2) IAtom :else IImmutable))
+
+(defun step-write (z: Rn cyclic: bool) -> str
+  (let [id (pick z (vec (filter (fn (x: i64) (> (m-kind z x) 0)) (live-ids z))))]
+    (if (< id 0)
+        ""
+        (let [targets (if cyclic (live-ids z) (vec (filter (fn (x: i64) (< x id)) (live-ids z)))) v (random-value z targets)]
+          (match (heap-write (. z h) id 0 v)
+            ((Err e) (refused-text e))
+            ((Ok _) (let [r (m-write z id v)] (if (= r "") "" (str "check: " r)))))))))
+
+(defun step-read (z: Rn) -> str
+  (let [id (pick z (live-ids z))]
+    (if (or (< id 0) (= (count (m-fields z id)) 0))
+        ""
+        (let [f (below z (count (m-fields z id)))]
+          (match (heap-read (. z h) id f)
+            ((Err e) (refused-text e))
+            ((Ok v) (if (ival-eq v (nth (m-fields z id) f)) "" (str "check: read of #" id "." f))))))))
+
+(defun step-release (z: Rn) -> str
+  (let [id (pick z (owned-ids z))]
+    (if (< id 0)
+        ""
+        (match (heap-release (. z h) id)
+          ((Err e) (refused-text e))
+          ((Ok _) (do (m-owned-add z id -1) (let [r (m-release z id)] (if (= r "") "" (str "check: " r)))))))))
+
+(defun step-retain (z: Rn) -> str
+  (let [id (pick z (live-ids z))]
+    (if (< id 0)
+        ""
+        (match (heap-retain (. z h) id)
+          ((Err e) (refused-text e))
+          ((Ok _) (do (m-add-count z id 1) (m-owned-add z id 1) ""))))))
+
+(defun step-upgrade (z: Rn) -> str
+  (if (= (m-size z) 0)
+      ""
+      (let [id (below z (m-size z)) live (m-live? z id)]
+        (match (heap-upgrade (. z h) id)
+          ((Err e) (refused-text e))
+          ((Ok got) (do (if live (do (m-add-count z id 1) (m-owned-add z id 1)) ())
+                        (match got
+                          ((some x) (if (and live (= x id)) "" (str "check: upgrade of #" id)))
+                          (nil (if live (str "check: upgrade of #" id " lost") "")))))))))
+
+(defun step-weak (z: Rn) -> str
+  (let [id (pick z (live-ids z))]
+    (if (< id 0)
+        ""
+        (match (heap-weak (. z h) id)
+          ((Err e) (refused-text e))
+          ((Ok w) (if (ival-eq w (IWeak id)) "" (str "check: weak of #" id)))))))
+
+(defun step-once (z: Rn cyclic: bool) -> str
+  (let [r (below z 100)]
+    (cond (< r 30) (step-alloc z) (< r 45) (step-retain z) (< r 65) (step-release z) (< r 80) (step-write z cyclic) (< r 90) (step-read z) (< r 95) (step-weak z)
+          :else (step-upgrade z))))
+
+;; ---- whole runs ----
+(defun run-loop (z: Rn cyclic: bool ops: i64) -> str
+  (loop [k 0]
+    (if (>= k ops)
+        ""
+        (let [m (step-once z cyclic) c (if (= m "") (catch-up z) m) a (if (= c "") (agree z) c)]
+          (if (= a "") (recur (+ k 1)) (str "step " k ": " a))))))
+
+;; Releases every count the program's bindings hold, in random order, except one on `forgotten`.
+(defun drain (z: Rn id: i64 keep: i64) -> str
+  (loop [g 0]
+    (if (<= (nth @(. z owned) id) keep)
+        ""
+        (match (heap-release (. z h) id)
+          ((Err e) (refused-text e))
+          ((Ok _) (do (m-owned-add z id -1) (let [r (m-release z id)] (if (= r "") (recur (+ g 1)) (str "check: " r)))))))))
+
+(defun teardown (z: Rn forgotten: i64) -> str
+  (loop [ids (owned-ids z)]
+    (if (= (count ids) 0)
+        ""
+        (let [k (below z (count ids)) id (nth ids k) rest (pop (assoc ids k (nth ids (- (count ids) 1)))) r (drain z id (if (= id forgotten) 1 0))]
+          (if (= r "") (recur rest) r)))))
+
+;; ---- acyclic.rs ----
+(defun run-acyclic (seed: i64 ops: i64) -> str
+  (let [z (rn-new seed) a (run-loop z false ops)]
+    (if (not= a "")
+        (str "seed " seed " " a)
+        (let [t (teardown z -1) c (catch-up z) g (agree z) rep (heap-finish (. z h)) n (m-size z)]
+          (cond (not= t "") (str "seed " seed " teardown: " t)
+                (not= c "") (str "seed " seed ": " c)
+                (not= g "") (str "seed " seed ": " g)
+                (not= (count (live-ids z)) 0) (str "seed " seed ": the model still has live objects")
+                (or (>= @(. z pfree) 0) (>= @(. z pretain) 0)) (str "seed " seed ": the trace ends mid-operation")
+                (not (report-clean? rep)) (str "seed " seed ": an acyclic program with every binding released leaked " (count (. rep leaks)))
+                (or (not= (. rep allocated) n) (not= (. rep freed) n)) (str "seed " seed ": allocated " (. rep allocated) " freed " (. rep freed) " of " n)
+                :else "")))))
+
+(defun first-failure (rs: (Vec str)) -> str
+  (let [bad (vec (filter (fn (r: str) (not= r "")) rs))] (if (= (count bad) 0) "" (nth bad 0))))
+
+(defun t-random-acyclic-programs-agree-with-the-model-and-their-own-trace () -> str
+  (first-failure (mapv (fn (seed: i64) (run-acyclic seed 1500)) (range 1 13))))
+
+(defun t-a-long-random-program-agrees-with-the-model-and-its-own-trace () -> str (run-acyclic 15842023 6000))
+
+;; ---- cyclic.rs: the expected class of every live object, computed without the heap's classifier ----
+(defun m-succ (z: Rn id: i64) -> (Vec i64) (vec (filter (fn (t: i64) (>= t 0)) (mapv target-of (m-fields z id)))))
+
+(defun reach (z: Rn from: (Vec i64)) -> (Set i64)
+  (loop [seen #{} stack from]
+    (if (= (count stack) 0)
+        seen
+        (let [id (nth stack (- (count stack) 1)) rest (pop stack)]
+          (if (contains? seen id) (recur seen rest) (recur (conj seen id) (into rest (m-succ z id))))))))
+
+(defun held-map (z: Rn) -> (Map i64 i64)
+  (loop [ids (live-ids z) m {}]
+    (if (= (count ids) 0)
+        m
+        (recur (pop ids) (loop [ts (m-succ z (nth ids (- (count ids) 1))) acc m]
+                           (if (= (count ts) 0)
+                               acc
+                               (let [t (nth ts (- (count ts) 1))] (recur (pop ts) (assoc acc t (+ 1 (match (get acc t) ((some n) n) (nil 0))))))))))))
+
+(defun check-row (z: Rn path: (Set i64) held: (Map i64 i64) l: HpLeakRow) -> str
+  (let [hd (match (get held (. l id)) ((some n) n) (nil 0))
+        cls (if (and (contains? path (. l id)) (= (m-count z (. l id)) hd)) HpLeakCycle HpLeak)]
+    (if (and (= (. l class) cls) (= (. l count) (m-count z (. l id))) (= (. l held) hd))
+        ""
+        (str "#" (. l id) " misclassified: count " (. l count) " held " (. l held) " model count " (m-count z (. l id)) " held " hd))))
+
+(defun check-report (z: Rn rep: HpReport) -> str
+  (let [live (live-ids z) roots (vec (filter (fn (m: i64) (and (> (m-kind z m) 0) (contains? (reach z (m-succ z m)) m))) live))
+        path (reach z roots) held (held-map z) rows (mapv (fn (l: HpLeakRow) (check-row z path held l)) (. rep leaks))]
+    (cond (not= (mapv (fn (l: HpLeakRow) (. l id)) (. rep leaks)) live) "the leaks are not the live objects"
+          (> (count (. rep dangling)) 0) "a legal program dangles"
+          (> (count (report-ids-in rep HpImmutableCycle)) 0) "an immutable cycle"
+          :else (first-failure rows))))
+
+;; "" a clean run, "leaked" a run whose leaks are permitted cycles; anything else is a failure. `forget`: one binding is not released.
+(defun run-cyclic (seed: i64 ops: i64 forget: bool) -> str
+  (let [z (rn-new seed) a (run-loop z true ops) owned (owned-ids z) f (if forget (pick z owned) -1)]
+    (if (not= a "")
+        (str "seed " seed " " a)
+        (let [t (teardown z f) c (catch-up z) g (agree z) rep (heap-finish (. z h)) k (check-report z rep)]
+          (cond (not= t "") (str "seed " seed " teardown: " t)
+                (not= c "") (str "seed " seed ": " c)
+                (not= g "") (str "seed " seed ": " g)
+                (not= k "") (str "seed " seed ": " k)
+                (< f 0) (if (> (count (. rep leaks)) 0) (if (report-cycle-leak-only? rep) "leaked" (str "seed " seed ": a leak that is not a cycle")) "")
+                (not (> (count (filter (fn (l: HpLeakRow) (and (= (. l id) f) (not= (. l class) HpLeakCycle))) (. rep leaks))) 0)) (str "seed " seed ": the forgotten binding on #" f " was not a bug")
+                (report-cycle-leak-only? rep) (str "seed " seed ": forgotten but cycle-only")
+                (report-clean? rep) (str "seed " seed ": forgotten but clean")
+                :else "forgotten-caught")))))
+
+(defun t-random-cyclic-programs-leak-only-permitted-cycles () -> str
+  (let [rs (mapv (fn (seed: i64) (run-cyclic seed 800 false)) (range 1 25))
+        bad (vec (filter (fn (r: str) (and (not= r "") (not= r "leaked"))) rs)) leaked (count (filter (fn (r: str) (= r "leaked")) rs))]
+    (cond (> (count bad) 0) (nth bad 0)
+          (= leaked 0) "no run built a cycle; the test exercised nothing"
+          :else (do (println (str "  cyclic: " leaked " of " (count rs) " runs ended with a permitted cycle leak")) ""))))
+
+(defun t-one-forgotten-binding-in-a-random-cyclic-program-is-a-bug () -> str
+  (let [rs (mapv (fn (seed: i64) (run-cyclic seed 800 true)) (range 1 25))
+        bad (vec (filter (fn (r: str) (and (not= r "forgotten-caught") (not= r "") (not= r "leaked"))) rs)) caught (count (filter (fn (r: str) (= r "forgotten-caught")) rs))]
+    (cond (> (count bad) 0) (nth bad 0)
+          (= caught 0) "no run had a binding to forget"
+          :else "")))
+
+;; ---- fault.rs: one injected fault must always be caught ----
+;; "injected", "nofault", "at-injection" (the heap refused the injected over-release), or a failure.
+(defun inject (z: Rn fault: i64) -> str
+  (let [v (pick z (live-ids z))]
+    (cond (< v 0) "nofault"
+          (= fault 0) (match (heap-release (. z h) v)
+                        ((Err e) (if (dfree? (hp-err-text e)) "at-injection" (str "refused with " (hp-err-text e))))
+                        ((Ok _) (let [r (m-release z v)] (if (= r "") "injected" r))))
+          :else (match (heap-retain (. z h) v)
+                  ((Err e) (str "a retain was refused: " (hp-err-text e)))
+                  ((Ok _) (do (m-add-count z v 1) "injected"))))))
+
+(defun fault-finish (z: Rn seed: i64 fault: i64 injected: bool) -> str
+  (let [t (teardown z -1)]
+    (cond (not injected) "nofault"
+          (not= t "") (if (dfree? t) "refused" (str "seed " seed ": teardown: " t))
+          :else (let [rep (heap-finish (. z h))]
+                  (if (or (> (count (report-bugs rep)) 0) (> (count (. rep dangling)) 0))
+                      "finish"
+                      (str "seed " seed ": an injected fault " fault " went unreported"))))))
+
+(defun run-fault (seed: i64 ops: i64 fault: i64) -> str
+  (let [z (rn-new seed) at (+ (quot ops 4) (below z (quot ops 2)))]
+    (loop [k 0 injected false]
+      (if (>= k ops)
+          (fault-finish z seed fault injected)
+          (let [inj (if (= k at) (inject z fault) "")]
+            (cond (= inj "nofault") "nofault"
+                  (= inj "at-injection") "at-injection"
+                  (and (not= inj "") (not= inj "injected")) (str "seed " seed ": " inj)
+                  :else (let [inj2 (or injected (= inj "injected")) m (step-once z true) c (catch-up z)]
+                          (cond (not= c "") (str "seed " seed " step " k ": " c)
+                                (= m "") (let [a (agree z)] (if (= a "") (recur (+ k 1) inj2) (str "seed " seed " step " k ": " a)))
+                                (and inj2 (dfree? m)) "refused"
+                                :else (str "seed " seed " step " k ": " m)))))))))
+
+(defun sweep (fault: i64) -> (Vec str) (mapv (fn (seed: i64) (run-fault seed 600 fault)) (range 1 49)))
+(defun tally (rs: (Vec str) what: str) -> i64 (count (filter (fn (r: str) (= r what)) rs)))
+
+(defun t-one-injected-over-release-is-always-caught () -> str
+  (let [rs (sweep 0) bad (vec (filter (fn (r: str) (not (or (= r "at-injection") (= r "refused") (= r "finish")))) rs))]
+    (do (println (str "  over-release: refused at injection " (tally rs "at-injection") ", refused later " (tally rs "refused") ", reported at finish " (tally rs "finish") " of " (count rs)))
+        (cond (> (count bad) 0) (str (count bad) " not caught, first: " (nth bad 0))
+              (= (+ (tally rs "refused") (tally rs "finish")) 0) "every fault was refused on the spot; nothing was exercised"
+              :else ""))))
+
+(defun t-one-forgotten-release-is-always-caught-at-finish () -> str
+  (let [rs (sweep 1) bad (vec (filter (fn (r: str) (not= r "finish")) rs))]
+    (do (println (str "  forgotten release: reported at finish " (tally rs "finish") " of " (count rs)))
+        (if (> (count bad) 0) (str (count bad) " not caught at finish, first: " (nth bad 0)) ""))))
+
+(defun main () -> i64
+  (min 100
+    (run-suite "heap-rand"
+      [(tc "acyclic-programs-agree-with-model-and-trace" t-random-acyclic-programs-agree-with-the-model-and-their-own-trace)
+       (tc "a-long-program-agrees-with-model-and-trace" t-a-long-random-program-agrees-with-the-model-and-its-own-trace)
+       (tc "cyclic-programs-leak-only-permitted-cycles" t-random-cyclic-programs-leak-only-permitted-cycles)
+       (tc "a-forgotten-binding-is-a-bug" t-one-forgotten-binding-in-a-random-cyclic-program-is-a-bug)
+       (tc "an-injected-over-release-is-caught" t-one-injected-over-release-is-always-caught)
+       (tc "a-forgotten-release-is-caught-at-finish" t-one-forgotten-release-is-always-caught-at-finish)])))

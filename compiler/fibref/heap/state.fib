@@ -29,6 +29,13 @@
 ;; Counted: neither IMMORTAL nor STACK. True of a freed heap object too, so that releasing one is caught as a double free (object.rs `counted`).
 (defun hp-counted? (h: Heap id: i64) -> bool (and (not (hp-immortal? h id)) (not (hp-stack? h id))))
 (defun hp-field-count (h: Heap id: i64) -> i64 (count (hp-fields-of h id)))
+(defun hp-peeks-of (h: Heap id: i64) -> i64 (nth @(. h peeks) id))
+(defun hp-set-peeks (h: Heap id: i64 n: i64) -> unit (update! (. h peeks) (fn (v: (Vec i64)) (assoc v id n))))
+
+;; The peek audit (types section 6.3, "Cell peeks"): a cell with a peek outstanding is borrowed by one expression, which holds its content without a
+;; count, so the cell must not be written, moved out of or released until `heap-peek-end`. Err (HePeeked id op) otherwise, having changed nothing.
+(defun hp-check-not-peeked (h: Heap id: i64 op: HpOp) -> (Result unit HpErr)
+  (if (> (hp-peeks-of h id) 0) (Err (HePeeked id op)) (Ok ())))
 
 ;; ---- writing the columns ----
 (defun hp-set-count (h: Heap id: i64 n: i64) -> unit
@@ -56,6 +63,7 @@
         (update! (. h flags) (fn (v: (Vec i64)) (conj v flags)))
         (update! (. h scopes) (fn (v: (Vec i64)) (conj v scope)))
         (update! (. h fields) (fn (v: (Vec (Vec IVal))) (conj v fs)))
+        (update! (. h peeks) (fn (v: (Vec i64)) (conj v 0)))
         id)))
 
 ;; Marks the object freed (or, for a stack object, ended) and drops its fields: the references among them are released by the cascade that planned

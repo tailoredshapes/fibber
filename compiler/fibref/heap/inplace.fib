@@ -143,25 +143,36 @@
 
 ;; `array-take!`: element `i` of the array in the cell, owned. An object element of a unique array is moved out (slot nulled, no retain); a scalar is
 ;; read and the slot left. A shared array is copied first (the copy is not ROOMY).
-(defun heap-array-take (h: Heap place: i64 i: i64) -> (Result IVal HpErr)
+(defun heap-array-take (h: Heap place: i64 i: i64) -> (Result IVal HpErr) (hp-array-take-with h place i false))
+
+;; `array-take!` of an element of type `(dyn P)` (spec/types.md section 2.13.1): the value is RETAINED and the slot is unchanged, because the two words of a
+;; `dyn` are not a single object pointer to null out. A dyn value is an `IObj` of the object behind it (dispatch is by type id), so the heap cannot tell
+;; the element type by itself: the evaluator calls this function for an array whose element type is a `dyn`. Events: Array take-dyn (in place iff the array
+;; was unique), then Retain of the element.
+(defun heap-array-take-dyn (h: Heap place: i64 i: i64) -> (Result IVal HpErr) (hp-array-take-with h place i true))
+
+(defun hp-array-take-with (h: Heap place: i64 i: i64 dyn: bool) -> (Result IVal HpErr)
   (match (hp-array-of h place)
     ((Err e) (Err e))
     ((Ok arr)
      (if (not (hp-field-in-range? h arr i))
          (Err (HeBadField arr i))
          (let [u (hp-array-unique? h arr)]
-           (match (hp-array-unique-or-copy h place arr "take" i)
+           (match (hp-array-unique-or-copy h place arr (if dyn "take-dyn" "take") i)
              ((Err e) (Err e))
-             ((Ok a) (hp-take-element h place a i u))))))))
+             ((Ok a) (hp-take-element h place a i u dyn))))))))
 
-(defun hp-take-element (h: Heap place: i64 a: i64 i: i64 inplace: bool) -> (Result IVal HpErr)
+(defun hp-take-element (h: Heap place: i64 a: i64 i: i64 inplace: bool dyn: bool) -> (Result IVal HpErr)
   (let [v (nth (hp-fields-of h a) i)]
     (match v
       ((ITaken) (Err (HeTakenSlot a i)))
-      (_ (do (match (ival-obj v)
-               ((some _) (hp-set-field h a i ITaken))
-               (nil ()))
-             (if inplace (hp-emit h (EvArrayOp "take" place a i true)) ())
+      (_ (do (if dyn
+                 ()
+                 (match (ival-obj v)
+                   ((some _) (hp-set-field h a i ITaken))
+                   (nil ())))
+             (if inplace (hp-emit h (EvArrayOp (if dyn "take-dyn" "take") place a i true)) ())
+             (if dyn (hp-retain-stored h v) ())
              (Ok v))))))
 
 ;; `array-push!`: appends `x` (a store: retained) to the array in the cell. In place iff the array is unique and ROOMY with len < 32; otherwise a copy
@@ -194,7 +205,7 @@
        (cond (= n 0) (Err (HeBadField arr 0))
              (hp-array-unique? h arr)
              (let [v (nth (hp-fields-of h arr) (- n 1))]
-               (do (hp-set-fields h arr (hp-take-prefix (hp-fields-of h arr) (- n 1)))
+               (do (hp-set-fields h arr (pop (hp-fields-of h arr)))
                    (hp-emit h (EvArrayOp "pop" place arr (- n 1) true))
                    (Ok v)))
              :else (hp-pop-copy h place arr n))))))

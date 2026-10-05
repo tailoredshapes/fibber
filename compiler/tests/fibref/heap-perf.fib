@@ -1,0 +1,79 @@
+;; compiler/tests/fibref/heap-perf.fib: measures the heap at scale (F1 completion, item 5): a graph of N objects, N retains and N releases, the audit at the
+;; end, the free trace and the event text of a long log. Prints "NAME n=N ms=T"; heap-perf.sh runs it. Not a pass/fail test: the timings are the evidence
+;; that the operations are linear (doubling N should about double T). Exit status 0.
+(ns main (:use fibref.value fibref.heap fibref.trace heaptk))
+
+(defun ms-since (t0: i64) -> i64 (quot (- (sys-clock-now) t0) 1000000))
+(defun report (name: str n: i64 t0: i64) -> unit (println (str name " n=" n " ms=" (ms-since t0))))
+
+;; N objects, each holding the previous one and a scalar (a list): the allocs retain a field each.
+(defun build-list (h: Heap n: i64) -> i64
+  (loop [k 0 prev -1 ids (vec-empty)]
+    (if (>= k n)
+        (count ids)
+        (let [id (ok! (heap-alloc h IImmutable 0 [(if (< prev 0) INone (obj prev)) (i k)]))]
+          (do (if (>= prev 0) (rel h prev) ()) (recur (+ k 1) id ids))))))
+
+(defun alloc-n (n: i64) -> unit
+  (let [h (heap-new) t0 (sys-clock-now) _a (loop [k 0] (if (>= k n) () (do (ok! (heap-alloc h IImmutable 0 [(i k) (i 1)])) (recur (+ k 1)))))]
+    (report "alloc" n t0)))
+
+(defun retain-release-n (n: i64) -> unit
+  (let [h (heap-new) ids (mapv (fn (k: i64) (imm h [(i k)])) (range n)) t0 (sys-clock-now)
+        _r (loop [k 0] (if (>= k n) () (do (ret h k) (recur (+ k 1))))) _s (loop [k 0] (if (>= k n) () (do (rel h k) (recur (+ k 1)))))]
+    (report "retain+release" n t0)))
+
+(defun list-n (n: i64) -> unit
+  (let [h (heap-new) t0 (sys-clock-now) _b (build-list h n) t1 (sys-clock-now) head (- n 1) _r (rel h head)]
+    (do (report "list-build" n t0) (println (str "list-free n=" n " ms=" (ms-since t1))))))
+
+;; Each object a cell written N times: a field vector copied on every write if the heap copies on write.
+(defun cell-writes-n (n: i64) -> unit
+  (let [h (heap-new) c (cell-of h INone) t0 (sys-clock-now) _w (loop [k 0] (if (>= k n) () (do (wr h c 0 (i k)) (recur (+ k 1)))))]
+    (report "cell-writes" n t0)))
+
+(defun wide-n (n: i64) -> unit
+  (let [h (heap-new) kids (mapv (fn (k: i64) (obj (imm h []))) (range n)) t0 (sys-clock-now) parent (imm h kids) _r (rel h parent)]
+    (report "wide-object-free" n t0)))
+
+(defun finish-n (n: i64) -> unit
+  (let [h (heap-new) _b (build-list h n) t0 (sys-clock-now) rep (heap-finish h)]
+    (report "finish-leaked-list" n t0)))
+
+;; A log of about 10 events per object: trace-lines and the event text.
+(defun trace-n (n: i64) -> unit
+  (let [h (heap-new) _w (loop [k 0] (if (>= k n) () (let [x (imm h [(i k)])] (do (ret h x) (rel h x) (rel h x) (recur (+ k 1))))))
+        t0 (sys-clock-now) lines (trace-lines h) t1 (sys-clock-now) txt (trace-text lines) t2 (sys-clock-now) ev (events-text h)]
+    (do (println (str "events=" (nev h)))
+        (println (str "trace-lines n=" n " ms=" (quot (- t1 t0) 1000000)))
+        (println (str "trace-text n=" n " ms=" (quot (- t2 t1) 1000000)))
+        (println (str "events-text n=" n " ms=" (ms-since t2))))))
+
+;; The in-place array primitives on one big unique array held by a cell: take every element, then pop every element (field vectors copied on write
+;; would make each of these quadratic).
+(defun array-take-n (n: i64) -> unit
+  (let [h (heap-new) a (imm h (mapv (fn (k: i64) (obj (imm h []))) (range n))) c (cell-of h (obj a)) _r (rel h a) t0 (sys-clock-now)
+        _t (loop [k 0] (if (>= k n) () (do (ok! (heap-array-take h c k)) (recur (+ k 1)))))]
+    (report "array-take-all" n t0)))
+
+(defun array-pop-n (n: i64) -> unit
+  (let [h (heap-new) a (imm h (mapv (fn (k: i64) (i k)) (range n))) c (cell-of h (obj a)) _r (rel h a) t0 (sys-clock-now)
+        _t (loop [k 0] (if (>= k n) () (do (ok! (heap-array-pop h c)) (recur (+ k 1)))))]
+    (report "array-pop-all" n t0)))
+
+;; Unique writes into one wide object held by a cell: one field per write.
+(defun write-unique-n (n: i64) -> unit
+  (let [h (heap-new) x (imm h (mapv (fn (k: i64) (i k)) (range n))) c (cell-of h (obj x)) _r (rel h x) t0 (sys-clock-now)
+        _w (loop [k 0] (if (>= k n) () (do (ok! (heap-write-unique h c k (i 0))) (recur (+ k 1)))))]
+    (report "write-unique-wide" n t0)))
+
+(defun main () -> i64
+  (do (write-unique-n 5000) (write-unique-n 10000) (write-unique-n 20000) (array-take-n 5000) (array-take-n 10000) (array-take-n 20000) (array-pop-n 5000) (array-pop-n 10000) (array-pop-n 20000)
+      (alloc-n 25000) (alloc-n 50000) (alloc-n 100000)
+      (retain-release-n 25000) (retain-release-n 50000) (retain-release-n 100000)
+      (list-n 25000) (list-n 50000) (list-n 100000) (list-n 200000) (list-n 400000)
+      (cell-writes-n 25000) (cell-writes-n 50000) (cell-writes-n 100000)
+      (wide-n 25000) (wide-n 50000) (wide-n 100000) (wide-n 200000) (wide-n 400000)
+      (finish-n 25000) (finish-n 50000) (finish-n 100000) (finish-n 200000) (finish-n 400000)
+      (trace-n 25000) (trace-n 50000) (trace-n 100000) (trace-n 200000)
+      0))
