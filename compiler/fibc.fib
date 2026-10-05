@@ -31,9 +31,19 @@
     ((a/CmdVersion) (do (println (v/version-line)) 0))
     ((a/CmdInvalid) (do (eprintln a/usage) 2))))
 
+;; `--target TRIPLE` before the first `--`: removed, and FIB_TARGET_TRIPLE set (the front end's lane counts and the code generator read it;
+;; docs/design/aarch64.md). The JIT that runs macros stays on the host.
+(defun take-target :private (words: (Vec str)) -> (Vec str)
+  (loop ((i 0) (out []))
+    (cond (>= i (count words)) out
+          (= (nth words i) "--") (into out (drop i words))
+          (and (= (nth words i) "--target") (< (+ i 1) (count words)))
+            (do (native/setenv-set "FIB_TARGET_TRIPLE" (nth words (+ i 1))) (recur (+ i 2) out))
+          :else (recur (+ i 1) (conj out (nth words i))))))
+
 (defun main () -> i64
   (let ((_ (native/ignore-sigpipe))
-        (nr (mk/take-no-runner (vec (args))))
+        (nr (mk/take-no-runner (take-target (vec (args)))))
         (split (a/split-roots (. nr words)))
         (cmd (a/parse (. split rest))))
     (if (and (not (empty? (. split dirs))) (not (a/takes-roots? cmd)))

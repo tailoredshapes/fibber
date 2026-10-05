@@ -52,7 +52,7 @@
 
 ;; Compiles a checked module for the host: lower, optimise, emit. (aot.rs `emit`)
 (defun aot-emit (m: LModule name: str out: AotOutput opts: AotOptions) -> (Result (Array i8) LairError)
-  (match (target/machine-host (. opts opt-level))
+  (match (target/machine-target (. opts opt-level))
     ((Err e) (Err e))
     ((Ok host) (let ((r (match (nl/lower m name (. host triple) (. host data-layout))
                           ((Err e) (Err e))
@@ -71,6 +71,13 @@
 
 ;; Compiles a module that satisfies the `main` rule and links it into an executable at `path`. (aot.rs `build_executable`)
 (defun aot-build-executable (m: LModule name: str path: str opts: AotOptions) -> (Result unit LairError)
+  (match (check/check-main m)
+    ((Err d) (Err (lair-error-diag d)))
+    ((Ok _) (if (target/cross-target?)
+                (Err (ErrBackend "FIB_TARGET_TRIPLE is set: an executable cannot be linked for another target here; use --emit obj or asm and link where the target runs"))
+                (aot-build-executable-host m name path opts)))))
+
+(defun aot-build-executable-host :private (m: LModule name: str path: str opts: AotOptions) -> (Result unit LairError)
   (match (check/check-main m)
     ((Err d) (Err (lair-error-diag d)))
     ((Ok _) (match (library-dirs (. opts lib-dirs))
