@@ -1059,7 +1059,7 @@ on every iteration.
 
 ```
 (unsafe body)
-(extern name private? (type*) -> type opt*)      ; opt: :varargs
+(extern name private? (type*) -> type opt*)      ; opt: :varargs, :fixed N
 ```
 
 `extern` declares a foreign function with the C calling convention; its
@@ -1110,6 +1110,10 @@ extern, an argument past the fixed parameters of type `bool`, `i8`,
 `i16` or `f32` is widened to `i32` or `f64` before the call, as C
 promotes it; lIR rejects the unpromoted argument (lir.md §7.1,
 **Decided**, owner, 2026-09-28).
+`:varargs :fixed N` (stage 2; the Rust seed ignores `:fixed`) says the C function has N parameters before its `...`: the extern still declares every
+parameter the calls pass, and the lIR `declare` has the first N then `...`, so the later arguments are variadic ones. The difference is the C ABI of
+Apple arm64, which passes variadic arguments on the stack but fixed ones in registers: `fcntl(fd, F_SETFL, flags)` declared with all three fixed
+read a garbage third argument there (docs/design/aarch64.md 7). Without `:fixed` every declared parameter is fixed, as before. x86-64 is the same either way.
 
 **`alloc` is zeroed** (**Proposed**, implemented at the owner's request, 2026-10-01). `(alloc n)` is `n`
 bytes of raw memory, every byte of them zero, in the reference interpreter

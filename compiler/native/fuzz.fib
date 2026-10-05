@@ -6,20 +6,17 @@
 (ns native.fuzz
   (:require [native.fuzz.rng :as rng] [native.fuzz.tree :as tree] [native.fuzz.mutate :as mutate] [native.fuzz.verdict :as vd]
             [native.fuzz.case :as fcase] [native.cases :as cases] [native.cases.walk :as walk] [native.cases.header :as hdr]
-            [native.cases.exec :as exec] [llvm.ffi :as ffi] [fib.string :as s] [native.cases.text :as text] [lir.sexp :as sexp] [lir.diag :as diag])
+            [native.cases.exec :as exec] [llvm.ffi :as ffi] [fib.os :as os] [fib.string :as s] [native.cases.text :as text] [lir.sexp :as sexp] [lir.diag :as diag])
   (:use native.fuzz.verdict))
 
 (extern getpid :private () -> i32)
-(extern readlink :private (ptr ptr i64) -> i64)
 
-;; The path of this program (`std::env::current_exe`): the target of /proc/self/exe, which a shell would take for itself.
-(defun self-path :private () -> str
-  (let ((p (ffi/bytes-new "/proc/self/exe"))
-        (buf (ffi/bytes-new (str-join (mapv (fn (k: i64) " ") (range 4096)))))
-        (n (unsafe (readlink p buf 4095))))
-    (do (ffi/free-addr (ffi/ptr->addr p))
-        (let ((r (if (> n 0) (ffi/text-at (ffi/ptr->addr buf) n) "/proc/self/exe")))
-          (do (ffi/free-addr (ffi/ptr->addr buf)) r)))))
+;; The path of this program (`std::env::current_exe`): `fib.os`'s `executable-path` (readlink of /proc/self/exe on Linux, `_NSGetExecutablePath` on macOS), else
+;; /proc/self/exe, which a shell would take for itself. Public: native.cli's `cases` runs this program for each case.
+(defun self-path () -> str
+  (match (os/executable-path)
+    ((Ok p) p)
+    ((Err _) "/proc/self/exe")))
 
 ;; The usage text of the whole tool (cli.rs `USAGE`; native.cli has it too, and cannot be required from here: it requires this module).
 (def usage: str "usage:

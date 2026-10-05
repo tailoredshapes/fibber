@@ -62,11 +62,11 @@
 
 ;; The lIR module of the mailbox: worker thread entry (`pthread_create`, 64 MiB stack), a mutex and two condition variables, the hooks of arity 1 and 2, and the state machine of `exchange.rs` with its defined misuse behaviour. It declares `lair_shim_run`, so the shim module is added first. (capi/exchange.rs, capi/mailbox.rs)
 (defun mailbox-source () -> str
-  ";; The mailbox (crates/lair/src/capi/exchange.rs and mailbox.rs). A mailbox is 50 words: 0 state (0 idle, 1 running, 2 hook, 3 replied,
+  ";; The mailbox (crates/lair/src/capi/exchange.rs and mailbox.rs). A mailbox is 64 words: 0 state (0 idle, 1 running, 2 hook, 3 replied,
 ;; 4 done), 1 arity, 2 a, 3 b, 4 reply, 5 result, 6 the worker's pthread_t, 7 1 when a worker has been made and not yet joined or
 ;; detached, 8 the fault text or null, 9 its length, 10 1 for a fault wait has not reported, 11 the reference count (the handle's and
-;; the running worker's), 12 the worker's own pthread_self (0 until it runs), 13..31 the call shim's record, 32..36 the mutex,
-;; 37..42 the condition the compiler's thread sleeps on, 43..48 the condition the worker sleeps on.
+;; the running worker's), 12 the worker's own pthread_self (0 until it runs), 13..31 the call shim's record, 32..39 the mutex (8 words: Darwin's pthread_mutex_t is 64 bytes, glibc's 40),
+;; 40..47 the condition the compiler's thread sleeps on, 48..55 the condition the worker sleeps on.
 (declare lair_shim_run void (ptr))
 (declare malloc ptr (i64))
 (declare free void (ptr))
@@ -99,13 +99,13 @@
 (define private (unlock void) ((ptr mb))
   (block entry (call @pthread_mutex_unlock (call @w mb (i64 32))) (ret)))
 (define private (wake-main void) ((ptr mb))
-  (block entry (call @pthread_cond_broadcast (call @w mb (i64 37))) (ret)))
+  (block entry (call @pthread_cond_broadcast (call @w mb (i64 40))) (ret)))
 (define private (wake-worker void) ((ptr mb))
-  (block entry (call @pthread_cond_broadcast (call @w mb (i64 43))) (ret)))
+  (block entry (call @pthread_cond_broadcast (call @w mb (i64 48))) (ret)))
 (define private (sleep-main void) ((ptr mb))
-  (block entry (call @pthread_cond_wait (call @w mb (i64 37)) (call @w mb (i64 32))) (ret)))
+  (block entry (call @pthread_cond_wait (call @w mb (i64 40)) (call @w mb (i64 32))) (ret)))
 (define private (sleep-worker void) ((ptr mb))
-  (block entry (call @pthread_cond_wait (call @w mb (i64 43)) (call @w mb (i64 32))) (ret)))
+  (block entry (call @pthread_cond_wait (call @w mb (i64 48)) (call @w mb (i64 32))) (ret)))
 
 ;; Records a misuse (the first text stays), has the next wait report it and wakes the compiler's thread. The lock is held.
 (define private (fault void) ((ptr mb) (ptr msg))
@@ -125,8 +125,8 @@
     (br (icmp eq (atomicrmw sub seq_cst (call @w mb (i64 11)) (i64 1)) (i64 1)) last more))
   (block last
     (call @pthread_mutex_destroy (call @w mb (i64 32)))
-    (call @pthread_cond_destroy (call @w mb (i64 37)))
-    (call @pthread_cond_destroy (call @w mb (i64 43)))
+    (call @pthread_cond_destroy (call @w mb (i64 40)))
+    (call @pthread_cond_destroy (call @w mb (i64 48)))
     (call @free mb)
     (ret))
   (block more (ret)))
@@ -134,12 +134,12 @@
 ;; lair_call_new: a new, idle mailbox.
 (define (lair_mb_new ptr) ()
   (block entry
-    (let ((mb (call @malloc (i64 400))))
-      (call @memset mb (i32 0) (i64 400))
+    (let ((mb (call @malloc (i64 512))))
+      (call @memset mb (i32 0) (i64 512))
       (call @wr mb (i64 11) (i64 1))
       (call @pthread_mutex_init (call @w mb (i64 32)) (ptr null))
-      (call @pthread_cond_init (call @w mb (i64 37)) (ptr null))
-      (call @pthread_cond_init (call @w mb (i64 43)) (ptr null))
+      (call @pthread_cond_init (call @w mb (i64 40)) (ptr null))
+      (call @pthread_cond_init (call @w mb (i64 48)) (ptr null))
       (ret mb))))
 
 ;; The worker's body: the call, then the result.

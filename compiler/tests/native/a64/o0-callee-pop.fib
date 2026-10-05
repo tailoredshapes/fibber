@@ -1,0 +1,10 @@
+;; A64-1 regression: a call to a function with more vector arguments than registers (`tailcc`: the callee pops the stack arguments), with a spilled
+;; value (`c`) needed by the next call. At -O 0 LLVM 21's FastISel + RegAllocFast on AArch64 reloaded `c` before the `sub sp` that restores the popped bytes,
+;; so `check` got a wrong pointer and the program crashed (exit 139) on arm64 macOS. Exit 0 when the sum holds, 1 when it does not
+;; (a64-o0.sh plants a wrong expected value to see it exit 1).
+(ns main (:use fib.core tl.check))
+(defun mix (a: f64x7 b: i32x16 c: f32x16) -> f64 (+ (hsum a) (+ (sitofp f64 (hsum b)) (fpext f64 (hsum c)))))
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (mix (splat f64x7 1.0) (splat i32x16 2i32) (splat f32x16 0.5f32)) 47.0))
+        (checks-result c))))

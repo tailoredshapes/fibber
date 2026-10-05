@@ -11,7 +11,7 @@
 #   4  hello world: fibc build (the AOT path, links with cc) and fibc run (the ORC JIT: no entitlements, ad-hoc signed by ld)
 #   5  fibc cases cases/ownership -j N (310 of 311 pass natively with spec/method.md absent; case 188 reads a repo file by a relative path)
 #   6  fibc cases cases/stdlib --only PREFIXES (SIMD 62, tensors 70, OS 74, fmt 42, mkdir 36); the allowed failures are listed in KNOWN below
-#   7  JIT at every -O level on the cases that crashed it (6223 at -O 0), AOT of the same
+#   7  JIT at every -O level and AOT at -O 0 and -O 2 on the case that crashed at -O 0 (6223), and compiler/tests/native/a64-o0.sh: all must exit 0 (A64-1)
 # Writes under $HOME/fibber-a64-scratch only (override with MAC_SCRATCH). Never installs anything. Written for, and first run on, an M1 Ultra (macOS 27).
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd); cd "$root"
@@ -21,7 +21,7 @@ jobs=${JOBS:-8}; quick=; [ "${1:-}" = --quick ] && quick=1
 bad=0
 step() { local n=$1; shift; if "$@"; then echo "ok   step $n"; else echo "FAIL step $n"; bad=$((bad+1)); fi; }
 # KNOWN: cases that fail on the Mac for a named reason (docs/design/aarch64.md 6.3); anything else that fails is new.
-KNOWN='1707 3607 4205 6223 7077 7078 7402 7404'
+KNOWN='1707'   # also expected to fail on x86 (scripts/ci-stage2.expected); A64-1 fixed 3607 4205 6223 7077 7078 7402 7404 (docs/design/aarch64.md 7)
 
 seed() { for c in "${FIBC:-}" "$root/../fibc" "$scratch/../fibc" "$(command -v fibc || true)"; do [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return; }; done; }
 s1() {
@@ -54,10 +54,13 @@ cases() { # DIR [--only ..]: the `fibc cases` table; the lines that are not pass
 s5() { cases cases/ownership; }
 s6() { if [ -n "$quick" ]; then cases cases/stdlib --only 62 70 74 42 36; else cases cases/stdlib; fi; }
 s7() {
-  local c=cases/stdlib/6223-vectors-cross-calls-and-loops-at-odd-widths.fib o r=0
-  for o in 0 1 2; do "$scratch/F" run -O $o -I cases/stdlib/support "$c" > /dev/null 2>&1; st=$?; echo "  JIT -O $o: exit $st"; done
-  "$scratch/F" build -I cases/stdlib/support "$c" -o "$scratch/v6223" && "$scratch/v6223" > /dev/null 2>&1; echo "  AOT: exit $?"
-  return 0   # measured, not gated: a JIT -O 0 crash is a known finding (docs/design/aarch64.md 6.3)
+  local c=cases/stdlib/6223-vectors-cross-calls-and-loops-at-odd-widths.fib o st r=0
+  for o in 0 1 2; do "$scratch/F" run -O $o -I cases/stdlib/support "$c" > /dev/null 2>&1; st=$?; echo "  JIT -O $o: exit $st"; [ $st -eq 0 ] || r=1; done
+  for o in 0 2; do
+    "$scratch/F" build -I cases/stdlib/support "$c" -o "$scratch/v6223" -O $o > /dev/null 2>&1 && "$scratch/v6223" > /dev/null 2>&1; st=$?; echo "  AOT -O $o: exit $st"; [ $st -eq 0 ] || r=1
+  done
+  F="$scratch/F" compiler/tests/native/a64-o0.sh || r=1
+  return $r
 }
 step 1 s1 || exit 1
 step 2 s2; [ -x "$scratch/F" ] || exit 1
