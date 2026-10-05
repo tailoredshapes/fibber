@@ -45,5 +45,29 @@ mutant wrapping-negate lib/fib/core/forms.fib 's/(and (or (= s "-") (= s "neg"))
 mutant show-suffix compiler/emit/lower/show.fib 's/((SI32) "i32")/((SI32) "")/' 6243-
 # (2) the separator of the lanes is a comma
 mutant show-separator compiler/emit/lower/show.fib 's/(simd-piece cx " ")/(simd-piece cx ",")/' 6243-
+# (3) the bounds check of a whole-vector load compares the end with itself, so it never fires
+mutant load-bounds compiler/emit/lower/simdmem.fib 's/(cmp cx "icmp sgt" (v-text hi) (v-text len) LirI1)/(cmp cx "icmp sgt" (v-text hi) (v-text hi) LirI1)/' 6247- 6249-
+# (3) a store into a shared array is made in place
+mutant store-shared compiler/emit/lower/simdmem.fib '/lj " " lc ")"\]))/s/(v-text ok)/"(i1 1)"/' 6246-
+# (3) the tail mask is one lane too long
+mutant tail-mask compiler/emit/lower/simdmem.fib 's/(cmp cx "icmp slt" (iota r)/(cmp cx "icmp sle" (iota r)/' 6245- 6251-
+# (3) the active-lane check of a masked access lets the lane one past the end through
+mutant masked-check compiler/emit/lower/simdmem.fib 's/(cmp cx "icmp ult" (v-text idx)/(cmp cx "icmp ule" (v-text idx)/' 6250-
+# (3) reverse is the identity
+mutant reverse compiler/emit/lower/simdfn.fib 's/(- (- (lanes-of t) 1) i)/i/' 6252-
+# (3) shuffle takes its operands in the other order
+mutant shuffle-order compiler/emit/lower/simdfn.fib 's/(v-text a) " " (v-text b) " " (mask-text idx)/(v-text b) " " (v-text a) " " (mask-text idx)/' 6252-
+# (4) floor is ceil
+mutant floor-ceil compiler/emit/lower/simdfn.fib 's/(some "ffloor")/(some "fceil")/' 6255-
+# (4) min is the NaN-ignoring one
+mutant min-nan compiler/emit/lower/simdfn.fib 's/(some (if fl "fmin" "smin"))/(some (if fl "fminnum" "smin"))/' 6256-
+# (4) abs of the minimum does not trap
+mutant abs-check compiler/emit/lower/simdfn.fib 's/(when (and (= name "simd\/abs") (not (float-elem? t)))/(when (and (= name "simd\/abs") (not true))/' 6257-
+# (5) int to float conversion is unsigned
+mutant convert-unsigned compiler/emit/lower/simdfn.fib 's/tf (some "sitofp")/tf (some "uitofp")/' 6254-
+# (5) native-lanes counts the wrong width
+mutant native-lanes compiler/types/lower/call.fib 's/(target-lanes (g-target (. lw g)) (scalar-bits s))/(target-lanes (g-target (. lw g)) (+ 8 (scalar-bits s)))/' 6258-
+# (5) the slot of a vector def is not a vector
+mutant def-vector compiler/emit/inits.fib 's/((LirVec _ _) (str-join \["(zeroinitializer " (lir-ty-text l) ")"\]))/((LirVec _ _) "(i64 0)")/' 6259-
 [ $survived -eq 0 ] && echo "mutant-simd-p4b: every mutant was killed"
 exit $survived

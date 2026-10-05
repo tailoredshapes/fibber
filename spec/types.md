@@ -426,7 +426,8 @@ only the active lanes and trap if an active lane is outside the array; `simd-loa
 `simd/reverse`, `simd/lanes` and `simd/kind` (constants). `Debug` and `ToStr` of a vector are in `fib.simd`. **Float and integer functions** on a scalar or every lane (`emit.lower.simdfn`, one lIR instruction each, spec/lir.md 6.1): `simd/fma` (one rounding), `simd/sqrt`, `simd/floor`, `simd/ceil`, `simd/trunc`,
 `simd/round` (ties away from zero), `simd/round-even`, `simd/abs` (integers trap on the minimum), `simd/min` and `simd/max` (**NaN rule:** a NaN operand gives NaN; `-0.0` is below `+0.0`; integers signed), `simd/min-num` and `simd/max-num`
 (a NaN operand loses). `simd/convert v` converts every lane to the lane type of the context: int to float (`sitofp`), float to int (`fptosi-sat`: saturates, NaN is 0), wider integer `sext`, narrower `trunc`, `fpext`, `fptrunc`.
-**Not there yet:** `(native-lanes T)` and a vector in a `def`; `MArray` does not exist in the library.
+**`(native-lanes T)`** is a primitive form, an `i64` literal made by the checker: the lane count of `:native` / `f32xn` / `f64xn` for the element `T` on the target the checker was given.
+**A vector in a `def`** is a value initialised before `main` (not static data; a vector is never counted). **Not in the library:** `MArray`; `MArray` does not exist in the library.
 A vector argument or result of an `extern` is a type error (`an extern position cannot be a vector`). The head `simd` of the
 literal's form is reserved: no local variable named `simd` shadows it (spec/syntax.md 1).
 An integer literal against an `i8`/`i16`/`i32` *scalar* parameter is still the L26
