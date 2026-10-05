@@ -1,0 +1,187 @@
+;; fib.view: scoped exclusive borrows of contiguous buffers (spec/types.md 6.15, spec/syntax.md 3.21; design in
+;; docs/design/exclusive-views.md, decisions of 2026-10-04). Not an implicit module: a program writes `(:use fib.view)`.
+;;
+;;   (with-view [v (array-window! &a 0 8)]        ; a is lent, exclusively, for the body; v is a writable window of it
+;;     (fill! v 0.0)                              ; sigil-free macros over the sigiled functions
+;;     (vset! v 3 1.0)
+;;     (vget v 3))
+;;   (with-view-ro [r (array-window &a 0 8)] ..)  ; a read-only lend: no unique test, no copy; the owner may be read, not written
+;;   (with-view [(lo hi) (array-split! &a 4)] ..) ; two disjoint windows of one lend
+;;
+;; What the language checks (compiler/own/views.fib, rules L1 to L5, VC1 to VC4, S1): the lent place is a private cell and is
+;; frozen for the body, a window is a view cell that is only ever passed (`@v`, `&v`), a value of a `Scoped` type is never
+;; consumed, and the constructor of such a type is `unsafe`. What this file proves, as a trusted library: the window stays inside
+;; the buffer (every access is checked against the window's own length), the lender applies the unique-write protocol once
+;; (an `Array` that is shared is copied at the lend, so a counted holder never sees a write), windows of one lend are disjoint.
+;;
+;; A window is (base pointer, length, seed): the address of its first element, with no count, the number of elements, and one
+;; element for dispatch. `with-view` is a macro over `let` and `cell`: the cell is the *view cell*, never a value (types 6.15).
+(ns fib.view (:use fib.core fib.seq fib.coll))
+
+;; A scoped type: its values are borrowed, never consumed (types 1.9). The marker is an instance of this protocol.
+(defprotocol Scoped (scoped-tag (self) -> i64))
+
+;; The element types a window can hold: raw access at an address, and the width in bytes.
+(defprotocol ViewElem
+  (view-load (self p: ptr) -> Self)
+  (view-store (self p: ptr x: Self) -> unit)
+  (view-width (self) -> i64))
+(impl ViewElem f64 (view-load (self p) (unsafe (load-f64 p))) (view-store (self p x) (unsafe (store-f64 p x))) (view-width (self) 8))
+(impl ViewElem i64 (view-load (self p) (unsafe (load-i64 p))) (view-store (self p x) (unsafe (store-i64 p x))) (view-width (self) 8))
+(impl ViewElem f32 (view-load (self p) (unsafe (load-f32 p))) (view-store (self p x) (unsafe (store-f32 p x))) (view-width (self) 4))
+(impl ViewElem i32 (view-load (self p) (unsafe (load-i32 p))) (view-store (self p x) (unsafe (store-i32 p x))) (view-width (self) 4))
+
+;; A writable window and a read-only window. The constructors are `unsafe` (checked, types 6.15 rule L6).
+(defstruct (Win a) (base: ptr len: i64 seed: a))
+(impl Scoped (Win a) (scoped-tag (self) 1))
+(defstruct (RoWin a) (base: ptr len: i64 seed: a))
+(impl Scoped (RoWin a) (scoped-tag (self) 2))
+;; The two windows of one `array-split!`.
+(defstruct (WinPair a) (lo: (Win a) hi: (Win a)))
+(impl Scoped (WinPair a) (scoped-tag (self) 3))
+
+;; What a reader of a window needs, for both kinds.
+(defprotocol (Windowed w e)
+  (win-base (self :borrow) -> ptr)
+  (win-len (self :borrow) -> i64)
+  (win-seed (self :borrow) -> e))
+(impl (Windowed a) (Win a) (win-base (self) (. self base)) (win-len (self) (. self len)) (win-seed (self) (. self seed)))
+(impl (Windowed a) (RoWin a) (win-base (self) (. self base)) (win-len (self) (. self len)) (win-seed (self) (. self seed)))
+
+;; The markers `with-view` puts around a lender call; the checker finds them by name (compiler/own/views.fib). At run time each is the identity.
+(defun view-lend (w: a) -> a w)
+(defun view-lend-ro (w: a) -> a w)
+(defun view-sub (w: a) -> a w)
+
+(defun win-first (p: (WinPair a)) -> (Win a) (. p lo))
+(defun win-second (p: (WinPair a)) -> (Win a) (. p hi))
+
+;; ---- lenders: a function with an `&` parameter and a scoped result, called only as the initialiser of a with-view binding
+
+(defun header-bytes :private () -> i64 24)
+(defun check-range :private (n: i64 lo: i64 hi: i64 who: str) -> unit
+  (when (or (< lo 0) (> lo hi) (> hi n)) (trap (str-join [who ": range [" (str lo) ", " (str hi) ") outside an array of " (str n)]))))
+
+;; Makes the array unique once, so that raw stores through a window are not seen by any other holder: a shared array is copied
+;; here (the unique-write protocol, types 6.6, applied by the first write), an unshared one is left alone.
+(defun make-unique! :private (&a: (Array a)) -> unit
+  (when (> (array-len @a) 0) (array-set! &a 0 (array-get @a 0))))
+
+;; A writable window of [lo, hi) of the array lent through `&a`.
+(defun array-window! (&a: (Array a) lo: i64 hi: i64) :where ((ViewElem a)) -> (Win a)
+  (do (check-range (array-len @a) lo hi "array-window!")
+      (when (= (array-len @a) 0) (trap "array-window!: the array is empty"))
+      (make-unique! &a)
+      (let ((seed (array-get @a 0)))
+        (unsafe (Win (ptr+ (raw @a) (+ (header-bytes) (* (view-width seed) lo))) (- hi lo) seed)))))
+
+;; A read-only window: no unique test, no copy; the owner is frozen against writes for the extent.
+(defun array-window (&a: (Array a) lo: i64 hi: i64) :where ((ViewElem a)) -> (RoWin a)
+  (do (check-range (array-len @a) lo hi "array-window")
+      (when (= (array-len @a) 0) (trap "array-window: the array is empty"))
+      (let ((seed (array-get @a 0)))
+        (unsafe (RoWin (ptr+ (raw @a) (+ (header-bytes) (* (view-width seed) lo))) (- hi lo) seed)))))
+
+;; Two disjoint writable windows: [0, k) and [k, n).
+(defun array-split! (&a: (Array a) k: i64) :where ((ViewElem a)) -> (WinPair a)
+  (do (check-range (array-len @a) 0 k "array-split!")
+      (when (= (array-len @a) 0) (trap "array-split!: the array is empty"))
+      (make-unique! &a)
+      (let ((seed (array-get @a 0)) (n (array-len @a)) (w (view-width (array-get @a 0)))
+            (base (unsafe (ptr+ (raw @a) (header-bytes)))))
+        (unsafe (WinPair (Win base k seed) (Win (ptr+ base (* w k)) (- n k) seed))))))
+
+;; ---- operations: every index is checked against the window, not the buffer
+
+(defun win-check :private (n: i64 i: i64) -> unit
+  (when (or (< i 0) (>= i n)) (trap (str-join ["window index " (str i) " out of range for a window of " (str n)]))))
+
+(defun win-get (w: s i: i64) :where ((Windowed s e) (ViewElem e)) -> e
+  (do (win-check (win-len w) i)
+      (let ((seed (win-seed w)))
+        (view-load seed (unsafe (ptr+ (win-base w) (* (view-width seed) i)))))))
+
+(defun win-set! (&w: (Win a) i: i64 x: a) :where ((ViewElem a)) -> unit
+  (do (win-check (. @w len) i)
+      (view-store (. @w seed) (unsafe (ptr+ (. @w base) (* (view-width (. @w seed)) i))) x)))
+
+(defun win-fill! (&w: (Win a) x: a) :where ((ViewElem a)) -> unit
+  (let ((n (. @w len)) (base (. @w base)) (width (view-width (. @w seed))) (seed (. @w seed)))
+    (loop ((i 0))
+      (when (< i n)
+        (do (view-store seed (unsafe (ptr+ base (* width i))) x)
+            (recur (+ i 1)))))))
+
+;; dst[i] = src[i]; the lengths must be equal. The two windows are different views (the checker keeps one view out of a call twice).
+(defun win-copy! (&dst: (Win a) src: s) :where ((Windowed s a) (ViewElem a)) -> unit
+  (do (when (!= (. @dst len) (win-len src)) (trap "copy-into!: windows of different lengths"))
+      (let ((n (. @dst len)) (seed (. @dst seed)))
+        (loop ((i 0))
+          (when (< i n)
+            (do (win-set! &dst i (win-get src i))
+                (recur (+ i 1))))))))
+
+;; ---- the macros: the sigil-free surface over the sigiled core (decision 1 of 2026-10-04)
+
+(defmacro vget (v i) `(fib.view/win-get @~v ~i))
+;; The index and the value are bound first, so that `(vset! v i (+ (vget v i) 1))` is one write whose operands are read before the call
+;; that takes `&v` (the checker keeps `&v` apart from every other mention of v in one call, types 6.15 VC4).
+(defmacro vset! (v i x)
+  (let ((ix (gensym "ix")) (val (gensym "val")))
+    `(let ((~ix ~i) (~val ~x)) (fib.view/win-set! (& ~v) ~ix ~val))))
+(defmacro fill! (v x)
+  (let ((val (gensym "val")))
+    `(let ((~val ~x)) (fib.view/win-fill! (& ~v) ~val))))
+(defmacro copy-into! (dst src) `(fib.view/win-copy! (& ~dst) @~src))
+(defmacro vlen (v) `(fib.view/win-len @~v))
+
+;; (with-view [binding+] body+): binding is `v (lender &place arg*)` or `(lo hi) (lender &place arg*)`. Nested left to right.
+;; Each view is a cell, the body is the initialiser of a `let` so that it is never in tail position, and the lender's result is
+;; wrapped in the marker the checker looks for (`view-lend`, `view-lend-ro`).
+(defmacro with-view (bindings ... body)
+  (let ((items (match bindings
+                 ((Vec xs) xs)
+                 (_ (trap "with-view: the bindings are a vector [v (lender &place arg ..) ..]"))))
+        (r (gensym "view-result")))
+    (do (when (!= (vec-count items) (* 2 (quot (vec-count items) 2))) (trap "with-view: the bindings are pairs"))
+        (loop ((i (- (vec-count items) 2))
+               (acc `(let ((~r (do ~@body))) ~r)))
+          (if (< i 0)
+              acc
+              (let ((pat (vec-nth items i)) (init (vec-nth items (+ i 1))))
+                (recur (- i 2)
+                       (match pat
+                         ((Sym _) `(let ((~pat (fib.prelude/cell (fib.view/view-lend ~init)))) ~acc))
+                         ((List ps)
+                          (if (= (vec-count ps) 2)
+                              (let ((p (gensym "view-pair")))
+                                `(let ((~p (fib.prelude/cell (fib.view/view-lend ~init))))
+                                   (let ((~(vec-nth ps 0) (fib.prelude/cell (fib.view/view-sub (fib.view/win-first @~p))))
+                                                     (~(vec-nth ps 1) (fib.prelude/cell (fib.view/view-sub (fib.view/win-second @~p)))))
+                                     ~acc)))
+                              (trap "with-view: a pair pattern is (lo hi)")))
+                         (_ (trap "with-view: a binding is a symbol or (lo hi)"))))))))))
+
+(defmacro with-view-ro (bindings ... body)
+  (let ((items (match bindings
+                 ((Vec xs) xs)
+                 (_ (trap "with-view-ro: the bindings are a vector [v (lender &place arg ..) ..]"))))
+        (r (gensym "view-result")))
+    (do (when (!= (vec-count items) (* 2 (quot (vec-count items) 2))) (trap "with-view-ro: the bindings are pairs"))
+        (loop ((i (- (vec-count items) 2))
+               (acc `(let ((~r (do ~@body))) ~r)))
+          (if (< i 0)
+              acc
+              (let ((pat (vec-nth items i)) (init (vec-nth items (+ i 1))))
+                (recur (- i 2)
+                       (match pat
+                         ((Sym _) `(let ((~pat (fib.prelude/cell (fib.view/view-lend-ro ~init)))) ~acc))
+                         ((List ps)
+                          (if (= (vec-count ps) 2)
+                              (let ((p (gensym "view-pair")))
+                                `(let ((~p (fib.prelude/cell (fib.view/view-lend-ro ~init))))
+                                   (let ((~(vec-nth ps 0) (fib.prelude/cell (fib.view/view-sub (fib.view/win-first @~p))))
+                                                     (~(vec-nth ps 1) (fib.prelude/cell (fib.view/view-sub (fib.view/win-second @~p)))))
+                                     ~acc)))
+                              (trap "with-view-ro: a pair pattern is (lo hi)")))
+                         (_ (trap "with-view-ro: a binding is a symbol or (lo hi)"))))))))))
