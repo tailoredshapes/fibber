@@ -49,3 +49,10 @@ The reader refuses source nested deeper than 1000 levels with a diagnostic, and 
 can make depth from a flat source: `and` or `or` over about 9000 arguments overflowed the 8 MiB stack in the ownership checker (SIGSEGV, found
 by `fuzz.js`). The server now re-executes itself once with the soft stack limit at 1 GiB: `and` over 500000 arguments (2.5 MB, 28 s) checks;
 over 2000000 it still overflowed, which the size bound keeps out of reach (512 KiB is at most about 100000 arguments).
+
+## Handler isolation
+
+`FIB_LSP_ISOLATE=1` runs each handler in a task and asks it with `try-join` (docs/design/exceptions.md section 8): a trap becomes `-32603` with the
+trap's message. The task copies in the open documents and the roots and gets an empty cache (a `Cell` cannot cross to a task: the compiler
+refuses the closure that captures the server), so every request checks the library again. `scope.fib`, completion after `didOpen`: 17 ms default,
+793 ms isolated (a check is 546 to 795 ms); the spawn and join itself is not visible in those numbers. Off by default for that reason.

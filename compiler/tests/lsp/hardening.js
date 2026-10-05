@@ -51,7 +51,23 @@ const URI = 'file:///tmp/hardening.fib';
 const at = (line, character) => ({ textDocument: { uri: URI }, position: { line, character } });
 const alive = async (c) => assert.strictEqual((await c.request('initialize', {})).result.serverInfo.name, 'fibref lsp', 'the server still answers');
 
-const CASES = {
+// Only against a server built with a planted trap (mutants.sh `isolated`: the `(ns` slice fault) and run with FIB_LSP_ISOLATE=1: the handler traps,
+// the request is answered -32603 with the trap's message, and the server goes on (a later request on a good buffer answers).
+const TRAP_CASES = {
+  async 'isolation: a handler that traps answers -32603 with the message and the server goes on'(c) {
+    await c.request('initialize', {});
+    await c.open('(\u4e2d', 60000);
+    const r = await c.request('textDocument/completion', at(0, 1), 60000);
+    assert.strictEqual(r.error && r.error.code, -32603, JSON.stringify(r));
+    assert(/splits a character/.test(r.error.message), r.error.message);
+    const p = await c.open('(ns x)\n(defun f () -> i64 1)\n', 60000);
+    assert.deepStrictEqual(p.diagnostics, []);
+    const ok = await c.request('textDocument/completion', at(1, 5), 60000);
+    assert(Array.isArray(ok.result) && ok.result.length > 0, 'completion answers after the trap');
+  },
+};
+
+const CASES = process.env.HARDEN_TRAP_BUILD === '1' ? TRAP_CASES : {
   // finding: a body that is not UTF-8 ended the server (exit 1); it must answer -32700 and go on
   async 'framing: a body that is not UTF-8 is answered with -32700 and the server goes on'(c) {
     c.raw(Buffer.from([0x7b, 0xff, 0xfe, 0x7d]));

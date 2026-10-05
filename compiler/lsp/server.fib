@@ -8,12 +8,15 @@
 ;;   Decision D5 (the front end is total on garbage input) is kept by construction: the requests are validated before a handler runs (the
 ;;   position and the uri are checked, a body that is not JSON or not UTF-8 is -32700), the work is bounded (`max-analysed-bytes` in lsp.analysis, the
 ;;   reader's nesting limit of 1000, JSON depth 128, 20000 items per answer, 64 MiB per message) and the stack is raised once at start (below). What
-;;   can still abort the process: a defect not yet found (compiler/tests/lsp/fuzz.js is the net for them: every one it found is a case in hardening.js);
+;;   can still abort the process (with the default settings): a trap in any handler, a defect not yet found (compiler/tests/lsp/fuzz.js is the net for them: every one it found is a case in hardening.js);
 ;;   an out-of-memory under the host's limit (a buffer under the 512 KiB bound may still use a few hundred MB: the checked program is large);
 ;;   and no request is bounded in time (a `match` of tens of thousands of arms is checked in quadratic time: 10000 arms took 8 s), so a client
 ;;   needs its own timeout. Every request kind goes through the front end except initialize, shutdown, documentSymbol (the reader only) and the
 ;;   notifications didClose and didSave of an unknown document; completion, hover, definition and the diagnostics of didOpen, didChange and
 ;;   didSave are the ones a defect would abort.
+;;   With FIB_LSP_ISOLATE=1 (`request-in-task`, `notify-in-task`) a trap in a handler is answered -32603 and the server goes on; only a stack
+;;   overflow, an out-of-memory and a hang still end it. It is off by default because a task cannot share the analysis cache (a `Cell` is not
+;;   Send): every request then checks the library again (about 0.8 s against 20 ms).
 ;; - the Rust serves on a thread with a 256 MiB stack; fibber has the process stack, so `lsp-main` re-executes the process once with the soft
 ;;   stack limit raised to 1 GiB (docs/design/fibref-port.md R2; `stack-wanted`, `raise-and-exec`).
 ;; - `read-message` reads the header a byte at a time (the descriptor is read without a buffer so that nothing is lost between calls); the body
@@ -22,7 +25,7 @@
 ;;   `textDocument/documentSymbol` a flat array of DocumentSymbol.
 ;; - `server-handle` is pure of the descriptors: one message in, the replies out; the loop (`lsp-main`) owns the reading and writing.
 (ns lsp.server
-  (:require [fib.unix :as unix] [lsp.features :as ft] [lsp.text :as tx] [lsp.definition :as defn] [lsp.analysis :as an] [driver.native :as native] [fib.string :as s] [fib.os :as os] [lair.ffi :as ffi])
+  (:require [fib.unix :as unix] [lsp.features :as ft] [lsp.text :as tx] [lsp.definition :as defn] [lsp.analysis :as an] [driver.native :as native] [fib.string :as s] [fib.os :as os] [fib.async :as as] [lair.ffi :as ffi])
   (:use expand.roots lsp.json lsp.types))
 
 (def err-parse: i64 -32700)
@@ -35,9 +38,9 @@
 (def max-items: i64 20000)
 (def not-utf8: str "message is not UTF-8")
 
-(defstruct LsServer (docs: (Cell (Map str str)) roots: Roots shutdown: (Cell bool) cache: an/LsCache))
+(defstruct LsServer (docs: (Cell (Map str str)) roots: Roots shutdown: (Cell bool) cache: an/LsCache isolate: bool))
 
-(defun server-new (roots: Roots) -> LsServer (LsServer (cell (map-empty)) roots (cell false) (an/cache-new)))
+(defun server-new (roots: Roots) -> LsServer (LsServer (cell (map-empty)) roots (cell false) (an/cache-new) (= (unwrap-or (native/getenv-opt "FIB_LSP_ISOLATE") "") "1")))
 
 ;; One message in, the messages to send out and an exit code once the client said `exit`.
 (defstruct LsReply (out: (Vec JVal) exit: (Option i64)))
@@ -60,6 +63,16 @@
   (obj [(Pair "jsonrpc" (jstr "2.0")) (Pair "method" (jstr method)) (Pair "params" params)]))
 
 (defun internal-error (id: JVal) -> JVal (failure id err-internal "internal error while handling the request"))
+
+;; With FIB_LSP_ISOLATE=1 each handler runs in a task and is asked with `try-join` (docs/design/exceptions.md section 8): a trap in it becomes the
+;; reply `-32603` with the trap's message and the server goes on. A task may capture only data that can cross threads, and a `Cell` cannot: the
+;; open documents and the roots are copied in, the handler runs on a server of its own with an empty cache (every request checks the library
+;; again: 0.4 to 1 s, which is why this is off by default), and what it changed (the documents) is copied back. A trapped task abandons what
+;; its closure captured (bounded by the request). Stack overflow and out-of-memory are fatal by decision and are not isolated.
+(defun isolated :private (f: (fn :send () a)) -> (Result a str)
+  (match (as/try-join (as/spawn f))
+    ((Ok v) (Ok v))
+    ((Err t) (Err (. t message)))))
 
 (defun one :private (m: JVal) -> LsReply (LsReply [m] nil))
 (defun none :private () -> LsReply (LsReply [] nil))
@@ -216,18 +229,37 @@
                  (do (set! (. s docs) (dissoc @(. s docs) uri)) (one (publish uri [])))
                :else (none))))))
 
+;; The request in a task of its own when the server isolates handlers, else here (`Err` is then never returned).
+(defun request-in-task :private (s: LsServer method: str params: JVal) -> (Result (Result JVal (Pair i64 str)) str)
+  (if (or (not (. s isolate)) (= method "shutdown"))
+      (Ok (request s method params))
+      (let ((docs @(. s docs)) (roots (. s roots)))
+        (isolated (fn () (request (LsServer (cell docs) roots (cell false) (an/cache-new) false) method params))))))
+
+;; The notification in a task of its own when the server isolates handlers: a trap answers nothing (there is no id) and leaves the documents as
+;; they were.
+(defun notify-in-task :private (s: LsServer method: str params: JVal) -> LsReply
+  (if (or (not (. s isolate)) (= method "exit"))
+      (notify s method params)
+      (let ((docs @(. s docs)) (roots (. s roots)))
+        (match (isolated (fn () (let ((s2 (LsServer (cell docs) roots (cell false) (an/cache-new) false)))
+                                  (let ((r (notify s2 method params))) (Pair r @(. s2 docs))))))
+          ((Ok (Pair r d)) (do (set! (. s docs) d) r))
+          ((Err _) (none))))))
+
 ;; One message in, the replies out. Rust: lsp.rs `handle`/`dispatch`
 (defun server-handle (s: LsServer msg: JVal) -> LsReply
   (let ((method (match (json-get msg "method") ((some (JStr m)) m) (_ "")))
         (params (unwrap-or (json-get msg "params") JNull)))
     (match (json-get msg "id")
-      (nil (notify s method params))
+      (nil (if @(. s shutdown) (notify s method params) (notify-in-task s method params)))
       ((some id)
        (cond (= method "") (none)
              (and @(. s shutdown) (not (= method "shutdown"))) (one (failure id err-invalid-request "the server is shut down"))
-             :else (match (request s method params)
-                     ((Ok r) (one (response id r)))
-                     ((Err (Pair code message)) (one (failure id code message)))))))))
+             :else (match (request-in-task s method params)
+                     ((Ok (Ok r)) (one (response id r)))
+                     ((Ok (Err (Pair code message))) (one (failure id code message)))
+                     ((Err why) (one (failure id err-internal (str "internal error: " why))))))))))
 
 ;; ---- framing
 
