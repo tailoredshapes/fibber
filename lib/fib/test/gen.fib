@@ -1,35 +1,24 @@
 ;; fib.test.gen: generators with shrinking, and `prop` (docs/design/test-harness.md §3). A generator is a value of two functions: `make`
 ;; draws a value from a seeded generator and a size, `shrink` lists simpler values that might still fail, simplest first. The random
-;; source is SplitMix64, the constants and the output function of compiler/gen/rng.fib (fibgen's), so a seed means one stream in both.
+;; source is fib.rng's SplitMix64 (fibgen's too), so a seed means one stream in both.
 ;; A property runs `cases` values; the first failure is shrunk (greedily: the first candidate that still fails replaces the value) and
 ;; reported with the seed, so `--seed N --only ID` reproduces it exactly.
-(ns fib.test.gen (:use fib.core fib.seq fib.coll fib.print fib.test.core))
+(ns fib.test.gen (:use fib.core fib.seq fib.coll fib.print fib.rng fib.test.core))
 
-(defstruct TRng (state: (Cell i64)))
-
-(defun rng-new (seed: i64) -> TRng (TRng (cell seed)))
-
-;; The next 64 random bits (as the i64 with those bits): SplitMix64.
-(defun rng-next (r: TRng) -> i64
-  (let ((s (unchecked-add @(. r state) -7046029254386353131)))
-    (do (set! (. r state) s)
-        (let ((z1 (unchecked-multiply (bit-xor s (shr s 30)) -4658895280553007687))
-              (z2 (unchecked-multiply (bit-xor z1 (shr z1 27)) -7723592293110705685)))
-          (bit-xor z2 (shr z2 31))))))
-
-;; A number in 0..n (n > 0): the high bits, so no unsigned remainder is needed.
-(defun rng-below (r: TRng n: i64) -> i64
+;; A number in 0..n (n > 0): the high bits, so no unsigned remainder is needed. (fib.rng's `rng-below` takes the low bits with an unsigned
+;; remainder, as fibgen does; this one is what the replay seeds of fib.test reports have always meant, so it stays.)
+(defun draw-below :private (r: Rng n: i64) -> i64
   (if (<= n 0) 0 (rem (shr (rng-next r) 1) n)))
 
 ;; A number in lo..=hi.
-(defun rng-between (r: TRng lo: i64 hi: i64) -> i64
-  (+ lo (rng-below r (+ (- hi lo) 1))))
+(defun rng-between (r: Rng lo: i64 hi: i64) -> i64
+  (+ lo (draw-below r (+ (- hi lo) 1))))
 
 ;; The seed of stream `i` of a run: independent streams from one seed, the same whatever else runs.
 (defun stream-seed (seed: i64 i: i64) -> i64
   (rng-next (rng-new (unchecked-add seed (unchecked-multiply (+ i 1) -7046029254386353131)))))
 
-(defstruct (Gen a) (make: (fn :send (TRng i64) a) shrink: (fn :send (a) (Vec a))))
+(defstruct (Gen a) (make: (fn :send (Rng i64) a) shrink: (fn :send (a) (Vec a))))
 
 ;; ---- the generators ---------------------------------------------------------------------------------------------------------
 
@@ -41,14 +30,14 @@
         :else (vec (distinct [0 (quot n 2) (if (> n 0) (- n 1) (+ n 1))]))))
 
 (defun gen-i64 () -> (Gen i64)
-  (Gen (fn (r: TRng size: i64) (rng-between r (* -4 size) (* 4 size))) shrink-i64))
+  (Gen (fn (r: Rng size: i64) (rng-between r (* -4 size) (* 4 size))) shrink-i64))
 
 (defun gen-i64-between (lo: i64 hi: i64) -> (Gen i64)
-  (Gen (fn (r: TRng size: i64) (rng-between r lo hi))
+  (Gen (fn (r: Rng size: i64) (rng-between r lo hi))
        (fn (n: i64) (vec (filter (fn (m: i64) (and (>= m lo) (<= m hi))) (shrink-i64 n))))))
 
 (defun gen-bool () -> (Gen bool)
-  (Gen (fn (r: TRng size: i64) (= (rng-below r 2) 1)) (fn (b: bool) (if b [false] []))))
+  (Gen (fn (r: Rng size: i64) (= (draw-below r 2) 1)) (fn (b: bool) (if b [false] []))))
 
 ;; A vector of up to `size` elements; shrinks by dropping elements, then by shrinking one element.
 (defun drop-at :private (v: (Vec a) i: i64) -> (Vec a)
@@ -61,20 +50,20 @@
           (mapcat (fn (i: i64) (mapv (fn (x: a) (assoc v i x)) ((. g shrink) (nth v i)))) (range (min n 4))))))
 
 (defun gen-vec (g: (Gen a)) -> (Gen (Vec a))
-  (Gen (fn (r: TRng size: i64)
-         (mapv (fn (i: i64) ((. g make) r size)) (range (rng-below r (+ size 1)))))
+  (Gen (fn (r: Rng size: i64)
+         (mapv (fn (i: i64) ((. g make) r size)) (range (draw-below r (+ size 1)))))
        (fn (v: (Vec a)) (shrink-vec g v))))
 
 ;; A lower-case ASCII string of up to `size` letters; shrinks by dropping characters.
 (defun gen-str () -> (Gen str)
-  (Gen (fn (r: TRng size: i64)
-         (str-join (mapv (fn (i: i64) (let ((k (rng-below r 26))) (str-slice "abcdefghijklmnopqrstuvwxyz" k (+ k 1))))
-                         (range (rng-below r (+ size 1))))))
+  (Gen (fn (r: Rng size: i64)
+         (str-join (mapv (fn (i: i64) (let ((k (draw-below r 26))) (str-slice "abcdefghijklmnopqrstuvwxyz" k (+ k 1))))
+                         (range (draw-below r (+ size 1))))))
        (fn (s: str) (if (= (str-len s) 0) [] [(str-slice s 1 (str-len s)) (str-slice s 0 (- (str-len s) 1))]))))
 
 ;; A pair of values: shrinks one side at a time.
 (defun gen-pair (ga: (Gen a) gb: (Gen b)) -> (Gen (Pair a b))
-  (Gen (fn (r: TRng size: i64) (Pair ((. ga make) r size) ((. gb make) r size)))
+  (Gen (fn (r: Rng size: i64) (Pair ((. ga make) r size) ((. gb make) r size)))
        (fn (p: (Pair a b))
          (vec (concat (mapv (fn (x: a) (Pair x (. p snd))) ((. ga shrink) (. p fst)))
                       (mapv (fn (y: b) (Pair (. p fst) y)) ((. gb shrink) (. p snd))))))))

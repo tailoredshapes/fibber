@@ -236,9 +236,11 @@ are small); `shrink` returns simpler candidates, simplest first. Built-ins: `gen
 `Scenario` (so it is listed, selected, isolated and reported like any): 100 cases, the first failing value shrunk greedily (the first
 candidate that still fails replaces it, at most 500 steps), the report quoting the shrunk value and the original draw.
 
-- **Seeds.** SplitMix64 with fibgen's constants and output function (`compiler/gen/rng.fib`; the prototype *copies* the 12 lines
-  because the library cannot depend on `compiler/`; **move `gen.rng` to `lib/fib/test/rng.fib` and have fibgen require it** so one stream
-  means one thing). A scenario's seed is `stream-seed(run seed, hash(local id))`: independent of which other scenarios were selected
+- **Seeds.** SplitMix64 with fibgen's constants and output function (**built:** `lib/fib/rng.fib`, module `fib.rng`, moved from `compiler/gen/rng.fib`; fibgen and `fib.test.gen` both `:use` it. It is
+  `lib/fib/rng.fib` and not `lib/fib/test/rng.fib` because fibgen is a compiler tool and must not depend on a test library, and a seeded
+  stream is a library facility of its own; `Rng`, `rng-new`, `rng-next`, `rng-below`/`rng-range`/`rng-chance`/`rng-weighted`/`rng-pick-index`
+  keep fibgen's draws byte for byte (rng-check.sh, `compare.sh pipelines 1 300`: `ok 300 rows`). `fib.test.gen` keeps its own
+  high-bits `draw-below`, so no replay seed changed: case 7534 and run.sh check 8). A scenario's seed is `stream-seed(run seed, hash(local id))`: independent of which other scenarios were selected
   and **identical across the implementations of a contract** (the id is without the `[impl]` part), so every implementation sees the
   same random values. Case `i` uses `stream-seed(scenario seed, i)`. The run prints its seed (`... (seed 1)`) and a `replay:` line.
 - **Records via `derive`** (not built): `(derive Arbitrary T)` generates `gen-T` from the fields' generators the way `defrecord`

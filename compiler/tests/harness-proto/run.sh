@@ -72,5 +72,8 @@ check "6 tap: the plan, then one not ok line" "$(echo "$out" | grep -E '^(1\.\.1
 
 # 7. locations: the planted fault's broken step names the line of its `expect` in the CONTRACT file (the macro's call-pos), not the spec's
 check "7 the broken step's position is the expect in the contract (file:line:col)" "$out_plant" 'map-contract.fib:18:11"'
+# 8. replay seeds: the draw of seed 1 for the false property is what the report printed before the random source moved into fib.rng
+check "8 replay: seed 1 draws and shrinks as before the move to fib.rng" "$("$S/spec" --only every-vector --seed 1 | grep -o 'it fails for x = .*')" \
+  "it fails for x = [0 0 0] (case 5 drew [6 9 15 -14 14], shrunk in 5 steps)"
 echo "harness-proto: $fails failed"
 exit $((fails > 0))
