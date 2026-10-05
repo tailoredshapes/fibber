@@ -1,20 +1,27 @@
 ;; Repeated Sudoku timings for the Fibber finite-domain solver.
 ;; Build with: F build scripts/bench/sudoku.fib -I examples -I lib -o /tmp/sudoku-fib-bench
-;; The first sample is a warm-up; compare medians of the remaining samples.
+;; One hundred untimed warmups precede thirty-one measured solves; report their median.
 (ns main (:use fib.core fib.seq fib.coll)
   (:require [sudoku.puzzles :as p] [sudoku.solver :as s]))
 
 (defun checksum :private (solution: (Vec (Vec i64))) -> i64
   (reduce (fn (total: i64 row: (Vec i64)) (+ total (reduce + 0 row))) 0 solution))
 
+(defun check-answer :private (puzzle: (Vec i64) answer: (Vec (Vec i64))) -> unit
+  (do (when (!= (count answer) 1) (trap "sudoku benchmark: expected one answer"))
+      (when (not (s/valid-solution? puzzle (nth answer 0)))
+        (trap "sudoku benchmark: invalid solution"))))
+
 (defun measure :private (name: str puzzle: (Vec i64) runs: i64) -> unit
-  (dotimes (i runs)
-    (let ((start (sys-clock-now))
-          (solution (s/sudokufd puzzle))
-          (elapsed (- (sys-clock-now) start)))
-      (println name " sample=" i " ns=" elapsed " checksum=" (checksum solution)))))
+  (do (dotimes (i 100) (check-answer puzzle (s/sudokufd puzzle)))
+      (dotimes (i runs)
+        (let ((start (sys-clock-now))
+              (solution (s/sudokufd puzzle))
+              (elapsed (- (sys-clock-now) start)))
+          (do (check-answer puzzle solution)
+              (println name " sample=" i " ns=" elapsed " checksum=" (checksum solution)))))))
 
 (defun main () -> i64
-  (do (measure "test" p/test-puzzle 7)
-      (measure "hard" p/hard-puzzle 7)
+  (do (measure "test" p/test-puzzle 31)
+      (measure "hard" p/hard-puzzle 31)
       0))

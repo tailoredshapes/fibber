@@ -87,38 +87,49 @@ solutions against the preserved answers; the domain and constraint cases are
 ## Performance comparison
 
 The comparison below uses the same two 81-cell fixtures and asks for one
-solution. Each implementation is run repeatedly in one process and the first
-sample is discarded. The Fibber benchmark reports seven samples and takes the
-median of the remaining six; the original Clojure harness reports six samples
-and takes the median of its remaining five. The Fibber numbers came from
-`scripts/bench/sudoku.fib`; the Clojure numbers came from the original source
-with Clojure 1.11.1 and core.logic 1.0.1.
+solution. Both harnesses discard 100 warm-up solves, then report the median of
+31 measured solves in the same process. Clojure's lazy result stream and each
+solution grid are fully realized with `mapv vec` before stopping the clock.
+Both harnesses check answer count, all clues, and all row/column/box constraints
+outside the timed region. Compilation, JVM startup, file I/O, validation, and
+printing are excluded.
+
+These measurements were taken on 2026-10-05 on an Intel Core i7-14700KF, with
+Fibber native code at the default build optimization level (`-O 2`), Clojure
+1.11.1, core.logic 1.0.1, and Temurin OpenJDK 27+35. The runs were serialized
+through `/tmp/fibsuite.lock`.
+
+**Correction:** the previous Clojure harness stopped the clock before forcing
+its lazy answer stream. It measured stream construction while Fibber measured
+the completed solve. The previously reported 62–85× ratios are invalid and are
+superseded by the completed-solve measurements below.
 
 | puzzle | Fibber median | Clojure/core.logic median | Fibber / Clojure |
 |---|---:|---:|---:|
-| test | 5,059,899 ns | 81,476 ns | 62.1× |
-| hard | 5,141,594 ns | 60,235 ns | 85.4× |
+| test | 4,953,288 ns | 4,386,633 ns | 1.13× |
+| hard | 4,976,612 ns | 1,808,488 ns | 2.75× |
 
 The Fibber samples were:
 
 ```text
-test: 5466769 5055998 5252116 5213102 4873191 4991404 5063799
-hard: 5158261 5035874 5313196 5105503 5052749 5177685 5403333
+test: 4972059 5236678 5078854 4894657 5142293 4974061 5014874 5231808 5057992 5204466 4966094 5210570 5259382 4903832 4838445 4953288 4864087 4837361 4957312 4691772 4482733 5074920 4775218 4783549 4830599 5026174 4621484 4850433 4830275 4794615 4804881
+hard: 4974351 4979687 4980572 4953833 5112635 4951673 4754056 4956499 4976612 4900576 4961018 5158577 5183690 5033048 5300706 5273961 5114450 4976887 5039082 4911419 4867872 5079784 4950129 4894270 5051437 4957414 4971481 4943766 4971347 4988203 5022749
 ```
 
 The Clojure samples were:
 
 ```text
-test: 681297 76727 87202 81476 101830 53840
-hard: 64250 52073 63884 67055 58056 60235
+test: 4408320 4409764 4231522 4320286 4288162 4307365 4254569 4256812 11445538 4813257 4590775 4640558 4329382 4189268 4582921 4470034 4160046 4462256 4359601 4386633 4457148 4384032 4529761 4303141 4293948 4736299 4063923 4234886 4392855 4534702 4423388
+hard: 1863407 1824703 1795361 1806113 1867477 1781691 1779427 1796556 1796433 1793574 1876641 1977956 1808488 1792745 1741171 1795007 1906721 1882023 1839315 1823679 1823806 1797232 1762587 1824957 1935352 1998688 1805896 1792750 1823318 1860870 1762358
 ```
 
-These are development measurements, not a claim of language-level parity.
-Clojure benefits from a mature core.logic finite-domain implementation and a
-warmed JVM JIT. Fibber's solver is native code with immutable maps and vectors,
-simple propagation, and no specialized Sudoku representation. The current
-solver does not use SIMD or threads: the work is branch-heavy and irregular,
-and SIMD is useful only after a constraint has a dense numeric kernel.
+These results compare two particular puzzle fixtures and solver implementations.
+They do not establish a general language performance ratio or identify which
+component causes the remaining gap. Clojure runs after repeated JVM warm-up;
+Fibber's native solver uses immutable maps and vectors with no specialized
+Sudoku representation. Both are sequential. Profiling and counts of propagation
+and search work are needed to distinguish solver overhead from differing amounts
+of search.
 
 Reproduce the Fibber side with:
 
@@ -129,14 +140,22 @@ Reproduce the Fibber side with:
 
 For the original comparison harness, check out the cited commit and run
 [`scripts/bench/sudoku.clj`](../../scripts/bench/sudoku.clj) with Clojure and
-the core.logic dependency on the classpath. Keep the compiler,
-CPU, optimization flags, and process warm-up policy with any new measurements;
-single executable runs include startup and allocation noise.
+the core.logic dependency on the classpath. Include Clojure's spec.alpha and
+core.specs.alpha dependencies as well. For example, with the jars in the current
+directory and the original repository checked out at `sudoku/`:
+
+```sh
+java -cp clojure-1.11.1.jar:core.logic-1.0.1.jar:spec.alpha-0.3.218.jar:core.specs.alpha-0.2.62.jar:sudoku/src clojure.main scripts/bench/sudoku.clj
+```
+
+Record the compiler, CPU, optimization flags, JDK, and warm-up policy with new
+measurements. A longer warm-up may change JIT behavior; timings also vary with
+CPU scheduling and frequency.
 
 ## Next performance steps
 
-The measured gap points to solver work rather than SIMD throughput. The useful
-sequence of improvements is:
+The implementation contains several potential sources of excess solver work.
+Profiling should establish their priority before the next optimization pass:
 
 1. Extend the current wide-domain sum bounds with residue-aware filtering and
    cache each constraint's last domains; exact support remains useful for small
