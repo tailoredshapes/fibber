@@ -1,11 +1,172 @@
 ;; compiler/lsp/analysis.fib: the front end on an editor buffer (docs/design/fibref-port.md section 6). OWNER: package L1. Rust: editor/analysis.rs (360).
-;; Reads, expands, types and ownership-checks the buffer as the main module with the library through `roots` (driver.front's `front-check`, with
-;; `--no-runner` unless the macro runner is allowed: a server must not JIT on every keystroke). When the buffer does not check, a program is still built
-;; from the library, the `ns` form and the top-level forms other than the one under the cursor (the ladder of `analyse_at`), so names and types still
-;; complete. The checked program is kept as `typed`.
+;; Reads, expands, types and ownership-checks the buffer as the main module with the library through `roots` (the steps of driver.front's `front-check`, but
+;; keeping the positions of the errors, which `front-check` turns into text; always with no macro runner: a server must not JIT on every keystroke, so a
+;; user macro call is pending and reported). When the buffer does not check, a program is still built from the library, the `ns` form and the top-level
+;; forms other than the one under the cursor (the ladder of `analyse_at`), so names and types still complete. The checked program is kept as `typed`.
+;;
+;; Differences from the Rust: a form that never closes is always left out of the first two rungs (with no cursor the Rust kept it, so the buffer still
+;; did not read and the program held no function of the buffer); every error of the type checker and of the ownership checker is a diagnostic (the Rust did too); an error in another
+;; file (a module the buffer requires) is shown at the top of this buffer with its place, as the Rust; the whole library is checked (not on demand), so
+;; the tables hold the scheme of every library name.
 (ns lsp.analysis
-  (:use expand.roots types.program lsp.types))
+  (:use syntax.pos syntax.form syntax.error expand.ctx expand.types expand.error types.error types.program types.driver own.error own.driver
+        expand.roots lsp.types)
+  (:require [lsp.scope :as sc] [expand.modules :as mods]))
 
 (defstruct LsAnalysis (typed: (Option TypedProgram) own: bool diags: (Vec LsDiag)))
 
-(defun analyse (source: str path: str roots: Roots cursor: (Option i64)) -> LsAnalysis (trap "todo: lsp.analysis analyse"))
+;; ---- diagnostics from the front end's positions ----
+
+(defun first-line-end :private (source: str) -> i64
+  (match (str-find source "\n" 0) ((some i) i) (nil (str-len source))))
+
+(defun plain-diag :private (source: str message: str) -> LsDiag (LsDiag 0 (first-line-end source) message))
+
+;; An error at `pos`; one in another file is shown at the top of this buffer with its place.
+(defun at-range :private (source: str path: str pos: Pos message: str) -> LsDiag
+  (if (not (= (. pos file) path))
+      (plain-diag source (str (pos-display pos) ": " message))
+      (let ((start (min (. pos start) (str-len source)))
+            (end (min (max (. pos end) (. pos start)) (str-len source))))
+        (LsDiag start (max end start) message))))
+
+(defun load-diag :private (source: str path: str e: LoadErr) -> LsDiag
+  (match e
+    ((LoadRead r) (at-range source path (. r pos) (err-message (. r kind))))
+    ((LoadSpec pos what) (at-range source path pos what))
+    (_ (plain-diag source (mods/load-err-message e)))))
+
+(defun check-diags :private (source: str path: str e: CheckError) -> (Vec LsDiag)
+  (match e
+    ((CeType es) (mapv (fn (x: TypeError) (at-range source path (. x pos) (. x message))) es))
+    ((CeOwn es) (mapv (fn (x: OwnError) (at-range source path (. x pos) (. x message))) es))
+    (_ [(plain-diag source (check-error-text e))])))
+
+;; ---- one run of the front end ----
+
+(defun run-lowered :private (source: str path: str modules: (Vec Expanded) prelude: (Vec Stx) main: bool) -> (Result Checked (Vec LsDiag))
+  (match (lower-modules-for modules prelude nil)
+    ((Err es) (Err (check-diags source path (CeType es))))
+    ((Ok l) (match (own-check-lowered l main)
+              ((Err e) (Err (check-diags source path e)))
+              ((Ok c) (Ok c))))))
+
+(defun run-expanded :private (source: str path: str loaded: (Vec Loaded) c: ExpandCtx prelude: (Vec Stx) main: bool)
+    -> (Result Checked (Vec LsDiag))
+  (match (mods/expand-all loaded c (no-runner))
+    ((Err e) (Err [(at-range source path (. e pos) (expand-err-message (. e kind)))]))
+    ((Ok modules) (run-lowered source path modules prelude main))))
+
+;; Reads, expands, types and checks `source` as the main module: the checked program or the diagnostics.
+(defun run-front :private (source: str path: str roots: Roots main: bool) -> (Result Checked (Vec LsDiag))
+  (let ((c (ctx-new)))
+    (match (prelude-forms c)
+      ((Err m) (Err [(plain-diag source m)]))
+      ((Ok prelude)
+       (match (mods/try-load-in source path roots)
+         ((Err e) (Err [(load-diag source path e)]))
+         ((Ok loaded) (run-expanded source path loaded c prelude main)))))))
+
+;; ---- the ladder for a buffer that does not check ----
+
+;; A top-level form of a buffer, as a byte range; `closed` is false for the one that runs to the end of the text unclosed.
+(defstruct LsChunk (start: i64 end: i64 closed: bool))
+
+;; Whether the cursor is in it (at its end counts: the form is still being typed).
+(defun chunk-has? :private (c: LsChunk off: i64) -> bool (and (< (. c start) off) (<= off (. c end))))
+
+;; The top-level forms of `src`, found by delimiters alone, so that an unclosed form is one that runs to the end.
+(defun chunks :private (src: str) -> (Vec LsChunk)
+  (let ((n (str-len src)))
+    (loop ((i 0) (d (sc/delims-new)) (start -1) (out []))
+      (if (>= i n)
+          (if (>= start 0) (conj out (LsChunk start n false)) out)
+          (let ((b (zext i64 (str-byte-at src i)))
+                (idle (sc/delims-idle? d)))
+            (let ((d2 (sc/delims-step d b)))
+              (let ((start2 (if (and (< start 0) (and idle (= b 40))) i start)))
+                (if (and (>= start2 0) (sc/delims-idle? d2))
+                    (recur (+ i 1) d2 -1 (conj out (LsChunk start2 (+ i 1) true)))
+                    (recur (+ i 1) d2 start2 out)))))))))
+
+(defun ws-byte? :private (b: i64) -> bool (or (= b 32) (and (>= b 9) (<= b 13))))
+
+;; Whether `text` from i begins with `(ns` and then whitespace or `)`.
+(defun ns-at? :private (text: str i: i64) -> bool
+  (and (<= (+ i 4) (str-len text))
+       (= (str-slice text i (+ i 3)) "(ns")
+       (let ((b (zext i64 (str-byte-at text (+ i 3))))) (or (ws-byte? b) (= b 41)))))
+
+(defun type-form? :private (src: str c: LsChunk) -> bool
+  (let ((text (str-slice src (. c start) (. c end))))
+    (or (starts-with? text "(defstruct") (or (starts-with? text "(defenum") (or (starts-with? text "(defprotocol") (starts-with? text "(defrecord"))))))
+
+;; The same length as `text`, with the newlines kept, so that offsets and lines do not move.
+(defun blank :private (text: str) -> str
+  (str-join (mapv (fn (i: i64) (if (= (str-byte-at text i) 10i8) "\n" " ")) (range (str-len text)))))
+
+;; `src` with the top-level forms that `keep` rejects blanked out. `keep` is given the form and whether it is the ns form.
+(defun mask :private (src: str keep: (fn (LsChunk bool) bool)) -> str
+  (let ((all (chunks src)))
+    (let ((ns-first (and (> (count all) 0) (ns-at? src (. (nth all 0) start)))))
+      (loop ((i 0) (at 0) (parts []))
+        (if (>= i (count all))
+            (str-join (conj parts (str-slice src at (str-len src))))
+            (let ((c (nth all i)))
+              (let ((text (str-slice src (. c start) (. c end)))
+                    (is-ns (and ns-first (= i 0))))
+                (recur (+ i 1) (. c end)
+                       (conj (conj parts (str-slice src at (. c start))) (if (keep c is-ns) text (blank text)))))))))))
+
+;; The offset of the first top-level form: the first line that is neither blank nor a comment, past its indentation.
+(defun first-form-start :private (src: str) -> (Option i64)
+  (loop ((off 0))
+    (if (>= off (str-len src))
+        nil
+        (let ((end (match (str-find src "\n" off) ((some i) (+ i 1)) (nil (str-len src))))
+              (k (loop ((k off)) (if (and (< k (str-len src)) (and (not (= (str-byte-at src k) 10i8)) (ws-byte? (zext i64 (str-byte-at src k))))) (recur (+ k 1)) k))))
+          (if (and (< k end) (and (not (= (str-byte-at src k) 10i8)) (not (= (str-byte-at src k) 59i8))))
+              (some k)
+              (recur end))))))
+
+;; The text of the first top-level form when it is `(ns ..)`, else empty: the part of a broken buffer that says what it imports. A form that
+;; never closes is closed here.
+(defun ns-form (source: str) -> str
+  (match (first-form-start source)
+    (nil "")
+    ((some start)
+     (if (not (ns-at? source start))
+         ""
+         (let ((n (str-len source)))
+           (loop ((i start) (d (sc/delims-new)))
+             (if (>= i n)
+                 (str (str-slice source start n) (sc/delims-closers d))
+                 (let ((d2 (sc/delims-step d (zext i64 (str-byte-at source i)))))
+                   (if (= (count (. d2 open)) 0)
+                       (str-slice source start (+ i 1))
+                       (recur (+ i 1) d2))))))))))
+
+;; The sources to try, in order, for a buffer that does not check: all forms but the one at the cursor, then the type forms among them,
+;; then the ns form alone, then nothing.
+(defun rungs :private (source: str cursor: (Option i64)) -> (Vec str)
+  (let ((at (match cursor ((some c) c) (nil 9223372036854775807))))
+    [(mask source (fn (c: LsChunk is-ns: bool) (or is-ns (and (. c closed) (not (chunk-has? c at))))))
+     (mask source (fn (c: LsChunk is-ns: bool) (or is-ns (and (type-form? source c) (and (. c closed) (not (chunk-has? c at)))))))
+     (ns-form source)
+     ""]))
+
+(defun first-program :private (rs: (Vec str) path: str roots: Roots) -> (Option TypedProgram)
+  (loop ((i 0))
+    (if (>= i (count rs))
+        nil
+        (match (run-front (nth rs i) path roots false)
+          ((Ok c) (some (. c typed)))
+          ((Err _) (recur (+ i 1)))))))
+
+;; Reads, expands, types and ownership-checks `source` (the text of the file `path`) as the main module, with the library found through `roots`;
+;; on any failure the diagnostics, and a program for the library and what of the buffer still checks. `cursor` is a byte offset.
+(defun analyse (source: str path: str roots: Roots cursor: (Option i64)) -> LsAnalysis
+  (let ((main (match (str-find source "(defun main" 0) ((some _) true) (nil false))))
+    (match (run-front source path roots main)
+      ((Ok c) (LsAnalysis (some (. c typed)) true []))
+      ((Err diags) (LsAnalysis (first-program (rungs source cursor) path roots) false diags)))))

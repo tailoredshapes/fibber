@@ -1,0 +1,98 @@
+;; compiler/tests/lsp/unit-analysis.fib: lsp.analysis. SOURCE: the four tests of crates/fibref/src/editor/analysis.rs (a_good_buffer_has_no_diagnostics_..., a_type_error_
+;; is_located_in_the_buffer_..., an_unreadable_buffer_is_one_read_error_at_its_place, the_ns_form_of_a_broken_buffer_is_closed_for_reading), widened: every error of
+;; the type checker, errors in another module, a missing module, a user macro (no runner), an ownership error, and each rung of the ladder (a planted fault that
+;; skips a rung makes one of these fail). The fixtures are in compiler/tests/lsp/fix/. Run from the repository root (run.sh does).
+(ns main (:use lsp.analysis lsp.types expand.roots types.program types.names ck))
+
+(defun roots () -> Roots (roots-new ["compiler/tests/lsp/fix"]))
+(defun path () -> str "/nonexistent/a.fib")
+
+(defun run (src: str) -> LsAnalysis (analyse src (path) (roots) nil))
+(defun run-at (src: str cursor: i64) -> LsAnalysis (analyse src (path) (roots) (some cursor)))
+
+(defun is-some? (o: (Option i64)) -> bool (match o ((some _) true) (nil false)))
+
+(defun has-fun? (a: LsAnalysis name: str) -> bool
+  (match (. a typed) ((some t) (is-some? (program-fun t name))) (nil false)))
+
+(defun has-type? (a: LsAnalysis name: str) -> bool
+  (match (. a typed) ((some t) (is-some? (g-type-name (. t globals) @(. (. t globals) main) name))) (nil false)))
+
+(defun has-program? (a: LsAnalysis) -> bool (match (. a typed) ((some _) true) (nil false)))
+
+;; "start-end [text] message" of each diagnostic
+(defun diags-text (src: str a: LsAnalysis) -> str
+  (str-join (vec (interpose " | " (mapv (fn (d: LsDiag) (str (. d start) "-" (. d end) " [" (str-slice src (. d start) (. d end)) "] " (. d message))) (. a diags))))))
+
+(defun contains? (s: str part: str) -> bool (match (str-find s part 0) ((some _) true) (nil false)))
+
+(def good: str "(defun inc (x: i64) -> i64 (+ x 1))\n")
+(def one-bad: str "(defun a () -> i64 1)\n(defun bad () -> i64 \"s\")\n(defun cur () -> i64 1)\n")
+(def struct-bad: str "(defstruct P (x: i64))\n(defun a () -> i64 1)\n(defun bad () -> i64 \"s\")\n")
+(def bad-type: str "(ns main)\n(defstruct Q (x: NoSuchType))\n(defun a () -> i64 1)\n")
+(def bad-ns: str "(ns main (:require [no.such.module :as n]))\n(defun a () -> i64 1)\n")
+
+(defun main () -> i64
+  (let ((good-a (run good))
+        (bad-a (run "(defun inc (x: i64) -> i64 (+ x \"a\"))\n"))
+        (read-src "(defun a () -> i64 1)\n(defun b (\n")
+        (read-a (run "(defun a () -> i64 1)\n(defun b (\n"))
+        (two (run "(defun a () -> i64 \"s\")\n(defun b () -> i64 \"t\")\n"))
+        (multi "(defun a () -> str \"é😀\")\n(defun b (\n")
+        (cursor-in-bad (+ (str-len "(defun a () -> i64 1)\n(defun bad () -> i64 ") 2)))
+    (finish
+      [;; the Rust's four tests
+       (eq-str "good: no diagnostics" (diags-text good good-a) "")
+       (eq-int "good: no diagnostics count" (count (. good-a diags)) 0)
+       (holds "good: own definitions" (and (. good-a own) (has-program? good-a)))
+       (holds "good: the buffer's function is in the program" (has-fun? good-a "inc"))
+       (eq-str "type error located" (diags-text "(defun inc (x: i64) -> i64 (+ x \"a\"))\n" bad-a) "32-35 [\"a\"] cannot unify str with i64")
+       (holds "type error: not own, program kept" (and (not (. bad-a own)) (has-program? bad-a)))
+       (eq-str "unreadable: one read error at its place" (diags-text read-src read-a) "31-32 [(] unclosed (")
+       (holds "unreadable: program kept" (and (not (. read-a own)) (has-program? read-a)))
+       (eq-str "ns form closed" (ns-form "; c\n(ns a (:require [x :as y]))\n(defun") "(ns a (:require [x :as y]))")
+       (eq-str "ns form with a paren in a string" (ns-form "(ns a (:use \"b)\"\n") "(ns a (:use \"b)\"\n))")
+       (eq-str "ns form absent" (ns-form "(defun f)") "")
+       ;; more on the ns form
+       (eq-str "ns form of nothing" (ns-form "") "")
+       (eq-str "ns form after comments and blank lines" (ns-form "\n; one\n  ; two\n\n  (ns b)\n(x)") "(ns b)")
+       (eq-str "ns form is not nsx" (ns-form "(nsx a)") "")
+       (eq-str "ns form bare" (ns-form "(ns)") "(ns)")
+       (eq-str "ns form unclosed with a bracket" (ns-form "(ns a (:use [x") "(ns a (:use [x]))")
+       ;; every error of the checker, in order
+       (eq-str "two type errors" (diags-text "(defun a () -> i64 \"s\")\n(defun b () -> i64 \"t\")\n" two) "19-22 [\"s\"] cannot unify str with i64 | 43-46 [\"t\"] cannot unify str with i64")
+       ;; offsets are bytes: the error after multi-byte text is in the right place
+       (eq-str "read error after multibyte text" (diags-text multi (run multi)) (str (str-len "(defun a () -> str \"é😀\")\n(defun b ") "-" (+ 1 (str-len "(defun a () -> str \"é😀\")\n(defun b ")) " [(] unclosed ("))
+       ;; other files: shown at the top of this buffer with their place
+       (holds "error in another module: first line" (let ((s "(ns main (:require [badmod :as b]))\n(defun g () -> i64 (b/f))\n") (a (run "(ns main (:require [badmod :as b]))\n(defun g () -> i64 (b/f))\n")))
+                                                    (and (= (count (. a diags)) 1) (= (. (nth (. a diags) 0) start) 0) (= (. (nth (. a diags) 0) end) (str-len "(ns main (:require [badmod :as b]))")))))
+       (holds "error in another module: names it" (let ((a (run "(ns main (:require [badmod :as b]))\n(defun g () -> i64 (b/f))\n")))
+                                                    (contains? (. (nth (. a diags) 0) message) "badmod.fib:2:20: cannot unify str with i64")))
+       (eq-int "a good module required" (count (. (run "(ns main (:require [goodmod :as b]))\n(defun g () -> i64 (b/gf))\n") diags)) 0)
+       (eq-str "missing module" (let ((a (run "(ns main (:require [nomod :as n]))\n"))) (str (. (nth (. a diags) 0) start) " " (. (nth (. a diags) 0) message)))
+               "0 module nomod is not at /nonexistent/nomod.fib")
+       ;; a user macro is pending: no runner in a server
+       (eq-str "macro pending" (let ((src "(defmacro m (x) x)\n(defun f () -> i64 (m 1))\n")) (diags-text src (run src))) "38-43 [(m 1)] macro m needs the evaluator to expand (pending)")
+       ;; an ownership error
+       (eq-str "ownership error" (let ((src "(defun f (x: (Vec i64) :borrow) -> (Vec i64) x)\n")) (diags-text src (run src)))
+               "0-47 [(defun f (x: (Vec i64) :borrow) -> (Vec i64) x)] parameter x of f is declared :borrow but escapes")
+       ;; the ladder: rung 1, the forms but the one at the cursor
+       (holds "rung 1: forms but the cursor's are kept" (let ((a (run-at one-bad cursor-in-bad))) (and (has-fun? a "a") (has-fun? a "cur") (not (has-fun? a "bad")) (not (. a own)))))
+       (eq-int "rung 1: the diagnostic is still the whole buffer's" (count (. (run-at one-bad cursor-in-bad) diags)) 1)
+       (holds "rung 1 with no cursor fails and rung 2 has no functions" (let ((a (run one-bad))) (and (has-program? a) (not (has-fun? a "a")) (not (has-fun? a "cur")))))
+       (holds "rung 1: a form at the end of the buffer being typed" (let ((a (run-at "(defun a () -> i64 1)\n(defun b () -> i64 (+ a" (str-len "(defun a () -> i64 1)\n(defun b () -> i64 (+ a")))) (and (has-fun? a "a") (not (has-fun? a "b")))))
+       (holds "rung 1: a missing paren still completes the other forms" (let ((a (run "(defun a () -> i64 1)\n(defun b () -> i64 (+ a\n"))) (has-fun? a "a")))
+       ;; rung 2: the type forms
+       (holds "rung 2: type forms kept, functions not" (let ((a (run struct-bad))) (and (has-type? a "P") (not (has-fun? a "a")) (not (. a own)))))
+       ;; rung 3: the ns form alone
+       (holds "rung 3: a bad type form falls to the ns form" (let ((a (run bad-type))) (and (has-program? a) (not (has-type? a "Q")) (not (has-fun? a "a")))))
+       ;; rung 4: nothing, the library alone
+       (holds "rung 4: a bad ns form falls to the library" (let ((a (run bad-ns))) (and (has-program? a) (not (has-fun? a "a")) (not (. a own)))))
+       (holds "rung 4: nothing but the library" (let ((a (run "(defun (("))) (has-program? a)))
+       ;; the cursor edge: at the start of a form it is not in it, at its end it is
+       (holds "cursor at the start of the bad form is not in it" (let ((a (run-at one-bad (str-len "(defun a () -> i64 1)\n")))) (not (has-fun? a "a"))))
+       (holds "cursor at the end of the bad form is in it" (let ((a (run-at one-bad (str-len "(defun a () -> i64 1)\n(defun bad () -> i64 \"s\")")))) (and (has-fun? a "a") (has-fun? a "cur"))))
+       (holds "cursor in the first form" (let ((a (run-at one-bad 5))) (not (has-fun? a "a"))))
+       (holds "main in the buffer is checked as main" (let ((a (run "(defun main () -> i64 0)\n"))) (and (. a own) (has-fun? a "main"))))
+       (holds "no main is fine" (. (run "(defun a () -> i64 0)\n") own))
+       (holds "empty buffer checks" (. (run "") own))])))
