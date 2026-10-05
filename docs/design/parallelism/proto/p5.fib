@@ -1,0 +1,25 @@
+(ns main)
+;; atoms under contention: args MODE T N  (MODE: swap = T threads swap! one shared atom; swap-own = one atom each; read = T threads read one shared atom;
+;; read-own = one atom each)
+(defun do-swap (a: (Atom i64) n: i64) -> i64
+  (do (dotimes (i n) (swap! a (fn (v) (+ v 1)))) 0))
+(defun do-read (a: (Atom i64) n: i64) -> i64
+  (loop ((i 0) (s 0)) (if (< i n) (recur (+ i 1) (+ s @a)) s)))
+
+(defun main () -> i64
+  (let ((mode (nth (args) 0)) (t (unwrap (parse-long (nth (args) 1)))) (n (unwrap (parse-long (nth (args) 2)))))
+    (let ((shared (atom 0)))
+      (do (dotimes (r 3)
+            (let ((t0 (sys-clock-now)))
+              (let ((ts (loop ((j 0) (acc (vec-empty)))
+                          (if (< j t)
+                              (recur (+ j 1)
+                                     (vec-conj acc
+                                       (cond (= mode "swap") (spawn (fn () (do-swap shared n)))
+                                             (= mode "swap-own") (spawn (fn () (let ((own (atom 0))) (do (do-swap own n) @own))))
+                                             (= mode "read") (spawn (fn () (do-read shared n)))
+                                             :else (spawn (fn () (let ((own (atom 1))) (do-read own n)))))))
+                              acc))))
+                (do (loop ((j 0) (s 0)) (if (< j t) (recur (+ j 1) (+ s (join (vec-nth ts j)))) s))
+                    (println "t " (- (sys-clock-now) t0)) (println "v " @shared)))))
+          0))))

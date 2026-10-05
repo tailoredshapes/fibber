@@ -1,0 +1,71 @@
+(ns main (:use fib.view fib.view.tiles))
+
+(defun sfib (n: i64) -> i64 (if (< n 2) n (+ (sfib (- n 1)) (sfib (- n 2)))))
+(defun pfib (n: i64 d: i64) -> i64
+  (if (or (= d 0) (< n 2)) (sfib n)
+      (let ((t (spawn (fn () (pfib (- n 1) (- d 1))))) (b (pfib (- n 2) (- d 1))))
+        (+ (join t) b))))
+
+(defun fill-input (n: i64) -> (Array i64)
+  (let ((buf (cell (array n 0))))
+    (do (dotimes (i n) (array-set! &buf i (rem (* (+ i 1) 2654435761) 1000003)))
+        @buf)))
+
+(defun sum-range (a: (Array i64) lo: i64 hi: i64) -> i64
+  (loop ((i lo) (acc 0)) (if (< i hi) (recur (+ i 1) (+ acc (rem (+ (* (array-get a i) (array-get a i)) 1) 7))) acc)))
+
+(defun map-range (a: (Array i64) lo: i64 hi: i64) -> (Array i64)
+  (let ((out (cell (array (- hi lo) 0))))
+    (do (dotimes (i (- hi lo)) (array-set! &out i (rem (+ (* (array-get a (+ lo i)) (array-get a (+ lo i))) 1) 7)))
+        @out)))
+
+(defun lap (name: str start: i64) -> unit (println name " " (- (sys-clock-now) start)))
+
+;; k chunk tasks, joined in order; reduce
+(defun psum (a: (Array i64) k: i64) -> i64
+  (let ((n (array-len a))
+        (ts (loop ((t 0) (acc (vec-empty)))
+              (if (< t k)
+                  (let ((lo (quot (* n t) k)) (hi (quot (* n (+ t 1)) k)))
+                    (recur (+ t 1) (vec-conj acc (spawn (fn () (sum-range a lo hi))))))
+                  acc))))
+    (loop ((t 0) (s 0)) (if (< t k) (recur (+ t 1) (+ s (join (vec-nth ts t)))) s))))
+
+(defun pmapk (a: (Array i64) k: i64) -> i64
+  (let ((n (array-len a))
+        (ts (loop ((t 0) (acc (vec-empty)))
+              (if (< t k)
+                  (let ((lo (quot (* n t) k)) (hi (quot (* n (+ t 1)) k)))
+                    (recur (+ t 1) (vec-conj acc (spawn (fn () (map-range a lo hi))))))
+                  acc)))
+        (out (cell (array n 0))))
+    (do (loop ((t 0) (pos 0))
+          (when (< t k)
+            (let ((part (join (vec-nth ts t))) (m (array-len part)))
+              (do (dotimes (i m) (array-set! &out (+ pos i) (array-get part i)))
+                  (recur (+ t 1) (+ pos m))))))
+        (loop ((i 0) (s 0)) (if (< i n) (recur (+ i 1) (+ s (array-get @out i))) s)))))
+
+(defun pfork (n: i64 k: i64) -> i64
+  (let ((out (cell (array n 0))))
+    (do (with-tiles [w out k] (dotimes (i (vlen w)) (vset! w i (rem (+ (* i i) 1) 7))))
+        (loop ((i 0) (s 0)) (if (< i n) (recur (+ i 1) (+ s (array-get @out i))) s)))))
+
+(defun main () -> i64
+  (let ((kern (nth (args) 0)) (n (unwrap (parse-long (nth (args) 1)))) (k (unwrap (parse-long (nth (args) 2)))) (runs (unwrap (parse-long (nth (args) 3)))))
+    (let ((a (if (or (= kern "sum") (= kern "map") (= kern "seqsum") (= kern "seqmap")) (fill-input n) (array 1 0))))
+      (do (dotimes (r runs)
+            (let ((t0 (sys-clock-now)))
+              (let ((v (cond (= kern "spawnjoin") (loop ((i 0) (s 0)) (if (< i n) (recur (+ i 1) (+ s (join (spawn (fn () i))))) s))
+                             (= kern "asyncjoin") (loop ((i 0) (s 0)) (if (< i n) (recur (+ i 1) (+ s (join (async i)))) s))
+                             (= kern "pmap") (let ((xs (vec (range n)))) (count (pmap (fn (x) (+ x 1)) xs)))
+                             (= kern "seqsum") (sum-range a 0 n)
+                             (= kern "sum") (psum a k)
+                             (= kern "seqmap") (let ((o (map-range a 0 n))) (loop ((i 0) (s 0)) (if (< i n) (recur (+ i 1) (+ s (array-get o i))) s)))
+                             (= kern "map") (pmapk a k)
+                             (= kern "for") (pfork n k)
+                             (= kern "sfib") (sfib n)
+                             (= kern "pfib") (pfib n k)
+                             :else (trap "kernel"))))
+                (do (lap "t" t0) (println "v " v)))))
+          0))))

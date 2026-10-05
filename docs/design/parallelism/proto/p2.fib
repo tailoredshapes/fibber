@@ -1,0 +1,56 @@
+(ns main)
+;; reference-count contention: T threads each do n iterations of "take a count of a node, hold it in a fresh Vec, drop the Vec"
+;; mode private: each thread builds its own K nodes (never shared: non-atomic counts)
+;; mode shared:  one K-node Vec built by main and captured by every task (SHARED: atomic counts on the node headers)
+;; mode static:  the node is a `def` (IMMORTAL: retain and release do nothing)
+;; mode none:    the same loop without taking a count (reads the field through the Vec)
+(defstruct Node (a: i64 b: i64))
+(def gnode (Node 3 4))
+
+(defun make-nodes (k: i64) -> (Vec Node)
+  (loop ((i 0) (v (vec-empty))) (if (< i k) (recur (+ i 1) (vec-conj v (Node i (* i 2)))) v)))
+
+(defun hold (nodes: (Vec Node) n: i64 salt: i64) -> i64
+  (let ((k (vec-count nodes)))
+    (loop ((i 0) (s 0))
+      (if (< i n)
+          (let ((x (vec-nth nodes (rem (+ i salt) k))))
+            (let ((v (vec-conj (vec-empty) x)))
+              (recur (+ i 1) (+ s (. (vec-nth v 0) a)))))
+          s))))
+
+(defun hold-static (n: i64) -> i64
+  (loop ((i 0) (s 0))
+    (if (< i n)
+        (let ((v (vec-conj (vec-empty) gnode)))
+          (recur (+ i 1) (+ s (. (vec-nth v 0) a))))
+        s)))
+
+(defun hold-none (nodes: (Vec Node) n: i64 salt: i64) -> i64
+  (let ((k (vec-count nodes)))
+    (loop ((i 0) (s 0))
+      (if (< i n)
+          (let ((v (vec-conj (vec-empty) i)))
+            (recur (+ i 1) (+ s (. (vec-nth nodes (rem (+ i salt) k)) a) (vec-nth v 0))))
+          s))))
+
+(defun spawn-all (mode: str shared: (Vec Node) k: i64 n: i64 t: i64) -> i64
+  (let ((ts (loop ((j 0) (acc (vec-empty)))
+              (if (< j t)
+                  (recur (+ j 1)
+                         (vec-conj acc
+                           (cond (= mode "private") (spawn (fn () (hold (make-nodes k) n j)))
+                                 (= mode "shared") (spawn (fn () (hold shared n j)))
+                                 (= mode "none") (spawn (fn () (hold-none shared n j)))
+                                 :else (spawn (fn () (hold-static n))))))
+                  acc))))
+    (loop ((j 0) (s 0)) (if (< j t) (recur (+ j 1) (+ s (join (vec-nth ts j)))) s))))
+
+(defun main () -> i64
+  (let ((mode (nth (args) 0)) (k (unwrap (parse-long (nth (args) 1)))) (t (unwrap (parse-long (nth (args) 2)))) (n (unwrap (parse-long (nth (args) 3)))))
+    (let ((shared (make-nodes k)))
+      (do (dotimes (r 3)
+            (let ((t0 (sys-clock-now)))
+              (let ((v (spawn-all mode shared k n t)))
+                (do (println "t " (- (sys-clock-now) t0)) (println "v " v)))))
+          0))))

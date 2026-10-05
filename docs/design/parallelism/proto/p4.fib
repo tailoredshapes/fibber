@@ -1,0 +1,102 @@
+(ns main (:require [fib.tensor :as t]))
+;; parallel fib.tensor kernels by row/range blocks on `spawn`: args KERNEL N W RUNS  (kernels: mm seqmm fma seqfma sumfast seqsumfast)
+(defun gen64 (i: i64 flavor: i64) -> f64
+  (cond (= flavor 0) (fdiv (double (- (rem i 97) 48)) 8.0)
+        (= flavor 1) (fdiv (double (- (rem (* i 7) 89) 44)) 16.0)
+        (= flavor 2) (fdiv (double (- (rem (* i 5) 83) 41)) 32.0)
+        :else (fdiv (double (- (rem (* i 11) 101) 50)) 7.0)))
+
+(defun make64 (dims: (Vec i64) flavor: i64) -> (t/Tensor f64)
+  (let ((n (loop ((i 0) (n 1)) (if (< i (count dims)) (recur (+ i 1) (* n (nth dims i))) n))) (buf (cell (array (loop ((i 0) (n 1)) (if (< i (count dims)) (recur (+ i 1) (* n (nth dims i))) n)) 0.0))))
+    (do (dotimes (i n) (array-set! &buf i (gen64 i flavor)))
+        (t/from-array dims @buf 0.0))))
+
+(defun cs64 (x: (t/Tensor f64)) -> f64
+  (let ((a (t/to-array x)) (n (t/size x)))
+    (loop ((i 0) (acc 0.0)) (if (< i n) (let ((v (array-get a i))) (recur (+ i 1) (+ acc (* v v)))) acc))))
+
+(defun block-mm (a: (t/Tensor f64) b: (t/Tensor f64) lo: i64 hi: i64) -> (t/Tensor f64)
+  (t/mmul (t/slice 0 lo hi 1 a) b))
+
+(defun pmm (a: (t/Tensor f64) b: (t/Tensor f64) n: i64 w: i64) -> (t/Tensor f64)
+  (let ((ts (loop ((k 0) (acc (vec-empty)))
+              (if (< k w)
+                  (let ((lo (quot (* n k) w)) (hi (quot (* n (+ k 1)) w)))
+                    (recur (+ k 1) (vec-conj acc (spawn (fn () (block-mm a b lo hi))))))
+                  acc)))
+        (out (cell (array (* n n) 0.0))))
+    (do (loop ((k 0) (pos 0))
+          (when (< k w)
+            (let ((part (t/to-array (join (vec-nth ts k)))) (m (array-len part)))
+              (do (dotimes (i m) (array-set! &out (+ pos i) (array-get part i)))
+                  (recur (+ k 1) (+ pos m))))))
+        (t/from-array [n n] @out 0.0))))
+
+(defun block-fma (a: (t/Tensor f64) b: (t/Tensor f64) c: (t/Tensor f64) lo: i64 hi: i64) -> (t/Tensor f64)
+  (t/add (t/mul (t/slice 0 lo hi 1 a) (t/slice 0 lo hi 1 b)) (t/slice 0 lo hi 1 c)))
+
+(defun pfma (a: (t/Tensor f64) b: (t/Tensor f64) c: (t/Tensor f64) n: i64 w: i64) -> i64
+  (let ((ts (loop ((k 0) (acc (vec-empty)))
+              (if (< k w)
+                  (let ((lo (quot (* n k) w)) (hi (quot (* n (+ k 1)) w)))
+                    (recur (+ k 1) (vec-conj acc (spawn (fn () (block-fma a b c lo hi))))))
+                  acc))))
+    (loop ((k 0) (s 0)) (if (< k w) (recur (+ k 1) (+ s (t/size (join (vec-nth ts k))))) s))))
+
+(defun psumfast (a: (t/Tensor f64) n: i64 w: i64) -> f64
+  (let ((ts (loop ((k 0) (acc (vec-empty)))
+              (if (< k w)
+                  (let ((lo (quot (* n k) w)) (hi (quot (* n (+ k 1)) w)))
+                    (recur (+ k 1) (vec-conj acc (spawn (fn () (t/sum-fast (t/slice 0 lo hi 1 a)))))))
+                  acc))))
+    (loop ((k 0) (s 0.0)) (if (< k w) (recur (+ k 1) (+ s (join (vec-nth ts k)))) s))))
+
+
+;; deterministic reduction: fixed chunks of g elements (independent of w), each summed by sum-fast, the chunk sums combined in a fixed pairwise tree
+(defun dparts (a: (t/Tensor f64) n: i64 w: i64 g: i64 nw: i64) -> (Array f64)
+  (let ((k (quot (+ n (- g 1)) g)) (m (quot (+ (- k w) (- nw 1)) nw)) (out (cell (array (quot (+ (- (quot (+ n (- g 1)) g) w) (- nw 1)) nw) 0.0))))
+    (do (dotimes (j m)
+          (let ((c (+ w (* j nw))))
+            (let ((lo (* c g)) (hi (min n (* (+ c 1) g))))
+              (array-set! &out j (t/sum-fast (t/slice 0 lo hi 1 a))))))
+        @out)))
+
+(defun tree-sum (p: (Array f64)) -> f64
+  (let ((cur (cell p)))
+    (loop ((len (array-len p)))
+      (if (<= len 1)
+          (array-get @cur 0)
+          (let ((half (quot (+ len 1) 2)) (next (cell (array (quot (+ len 1) 2) 0.0))))
+            (do (dotimes (i half)
+                  (array-set! &next i (if (< (+ (* 2 i) 1) len) (+ (array-get @cur (* 2 i)) (array-get @cur (+ (* 2 i) 1))) (array-get @cur (* 2 i)))))
+                (set! cur @next)
+                (recur half)))))))
+
+(defun dsumfast (a: (t/Tensor f64) n: i64 w: i64) -> f64
+  (let ((g 65536) (k (quot (+ n 65535) 65536))
+        (ts (loop ((j 0) (acc (vec-empty)))
+              (if (< j w) (recur (+ j 1) (vec-conj acc (spawn (fn () (dparts a n j 65536 w))))) acc)))
+        (all (cell (array (quot (+ n 65535) 65536) 0.0))))
+    (do (dotimes (j w)
+          (let ((part (join (vec-nth ts j))))
+            (dotimes (i (array-len part)) (array-set! &all (+ j (* i w)) (array-get part i)))))
+        (tree-sum @all))))
+
+(defun main () -> i64
+  (let ((kern (nth (args) 0)) (n (unwrap (parse-long (nth (args) 1)))) (w (unwrap (parse-long (nth (args) 2)))) (runs (unwrap (parse-long (nth (args) 3)))))
+    (let ((mm (or (= kern "mm") (= kern "seqmm")))
+          (a (if (or (= kern "mm") (= kern "seqmm")) (make64 [n n] 0) (make64 [n] (if (or (= kern "sumfast") (= kern "dsumfast") (= kern "seqsumfast")) 3 0))))
+          (b (if (or (= kern "mm") (= kern "seqmm")) (make64 [n n] 1) (make64 [n] 1)))
+          (c (if (or (= kern "fma") (= kern "seqfma")) (make64 [n] 2) (make64 [1] 2))))
+      (do (dotimes (r runs)
+            (let ((t0 (sys-clock-now)))
+              (let ((v (cond (= kern "seqmm") (cs64 (t/mmul a b))
+                             (= kern "mm") (cs64 (pmm a b n w))
+                             (= kern "seqfma") (double (t/size (t/add (t/mul a b) c)))
+                             (= kern "fma") (double (pfma a b c n w))
+                             (= kern "seqsumfast") (t/sum-fast a)
+                             (= kern "sumfast") (psumfast a n w)
+                             (= kern "dsumfast") (dsumfast a n w)
+                             :else (trap "kernel"))))
+                (do (println "t " (- (sys-clock-now) t0)) (println "v " v)))))
+          0))))
