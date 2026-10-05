@@ -58,8 +58,17 @@ Measured, **ran on the Mac**: the cross-built `fibc` (signature: ad-hoc, linker-
 `fibc run` (JIT at `-O0` through the fast code generator, `-O1`, `-O2`) and the macro runner (every case that expands a user macro passed), with no
 `MAP_JIT` code of ours. So a developer-run `fibc` needs nothing. What is *not* known: a hardened-runtime or notarised `fibc` (needs
 `com.apple.security.cs.allow-jit`, and `allow-unsigned-executable-memory` is not needed because LLVM uses `MAP_JIT`); the distribution decision is A64-5.
-One failure is JIT-specific: `cases/stdlib/6223-vectors-cross-calls-and-loops-at-odd-widths.fib` crashes (exit 139) under `fibc run -O 0`
-(`jit-new-fast-codegen`, FastISel) and passes under `-O 1`, `-O 2`, and as an AOT executable at `-O 0` and `-O 2`. A64-4.
+One failure was found here and fixed in A64-1: `cases/stdlib/6223-vectors-cross-calls-and-loops-at-odd-widths.fib` crashed (exit 139) under `fibc run -O 0`
+(`jit-new-fast-codegen`, FastISel) and passed under `-O 1`, `-O 2` and as an AOT executable at `-O 2`.
+*Root cause* (a LLVM 21 bug, not ORC, the memory manager or alignment): the lIR functions are `tailcc`, where the callee pops its stack arguments. A call that passes
+more vector data than the eight vector registers hold (`mix`: `<7 x double>`, `<16 x i32>`, `<16 x float>`: 112 bytes on the stack) is followed by a `sub sp, sp, #112` that restores the
+caller's `sp`. At code generation level None (FastISel and RegAllocFast) the reload of a spilled value that the next call needs (`ldr x0, [sp, #264]`, the `Checks` pointer) was placed
+*before* that `sub`, so it read 112 bytes above the frame and `check` crashed. An AOT executable built with `-O 0` crashed the same way (the earlier claim that it passed was an
+`-O 2` build). `lairf build --target arm64-apple-macosx13.0.0 -O 0 --emit asm` on x86 shows the bad order. x86 is not affected: its FastISel does not select `tailcc` calls, and `case 6223` passes there at `-O 0`.
+*Fix*: a machine for an AArch64 triple at `-O 0` is created at code generation level Less (`machine-level` in `compiler/llvm/target.fib`; IR optimisation stays off): the same program then keeps
+the pointer in a callee-saved register and the `sub sp` follows the `bl`. That covers the JIT, the macro runner's fast sessions and AOT. Test: `compiler/tests/native/a64-o0.sh`
+(on the Mac: before the change `exit 139` for JIT and AOT, after it `prints 0`; the assembly check and its planted fault run on any host). Not shown: that level Less can never hit a similar order (the
+whole `-O 1` suite passes on the Mac; a spill between a callee-pop call and its `sub` has not been seen there).
 
 ### 2.4 The call shim and the mailbox
 

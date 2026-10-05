@@ -80,6 +80,14 @@
 (defun codegen-level :private (opt: i64) -> i32
   (cond (= opt 0) 0i32 (= opt 1) 1i32 (= opt 2) 2i32 true 3i32))
 
+;; The level a machine for `triple` uses for -O `opt`. At -O 0 LLVM 21 would use FastISel and RegAllocFast; on AArch64 that pair
+;; miscompiles a call to a `tailcc` function whose stack arguments the callee pops (vectors wider than the registers left, as in
+;; cases/stdlib/6223 and 6224): the reload of a spilled value for the next call's argument is placed before the `sub sp, sp, #N` that
+;; restores the callee-popped bytes, so it reads the wrong slot and the program crashes (docs/design/aarch64.md 2.3). On AArch64 -O 0
+;; therefore generates code at level Less (the selector and register allocator of -O 1; IR optimisation stays off). x86 is unchanged.
+(defun machine-level :private (triple: i64 opt: i64) -> i32
+  (if (and (= opt 0) (aarch64-triple? (ffi/c-string-at triple))) (codegen-level 1) (codegen-level opt)))
+
 ;; The `llvm::Target` of the triple at address `triple` (LLVM's own string): its handle, or the message.
 (defun target-of-triple :private (triple: i64) -> (Result i64 str)
   (let ((out (ffi/slot-new))
@@ -101,7 +109,7 @@
 ;; The machine for `target` and the triple at address `triple`, with the CPU `cpu` and no extra features when it is named, else the
 ;; host's name and features.
 (defun create-machine :private (target: i64 triple: i64 cpu: (Option str) opt: i64) -> i64
-  (let ((level (codegen-level opt))
+  (let ((level (machine-level triple opt))
         (tp (ffi/addr->ptr triple)))
     (if-some [name cpu]
       (let ((c (ffi/bytes-new name))
