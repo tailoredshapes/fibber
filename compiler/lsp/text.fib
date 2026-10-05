@@ -1,13 +1,154 @@
 ;; compiler/lsp/text.fib: positions in a buffer (docs/design/fibref-port.md section 6). OWNER: package L0. Rust: editor/text.rs (59), diagnostics.rs `range`.
 ;; Everything inside works in byte offsets; LSP counts lines from 0 and characters in UTF-16 code units. An empty diagnostic range is widened to the
 ;; character at it (or before it at the end of the text) so the editor has something to underline.
+;;
+;; Differences from the Rust: lines count from 0 here (the Rust's `line_col` counted from 1 for its command line); an empty range at the very end of
+;; the text is widened to the character before it (the Rust left it empty: its comment said the same as this one, its code did not).
+;; A column inside a surrogate pair (the middle of a character outside the Basic Multilingual Plane) rounds up to after the character, as in the Rust.
 (ns lsp.text
   (:use lsp.types))
 
 (defstruct LsPos (line: i64 character: i64))
 (defstruct LsRange (start: LsPos end: LsPos))
 
-(defun offset->pos (src: str off: i64) -> LsPos (trap "todo: lsp.text offset->pos"))
-(defun pos->offset (src: str p: LsPos) -> i64 (trap "todo: lsp.text pos->offset"))
-(defun diag-range (src: str d: LsDiag) -> LsRange (trap "todo: lsp.text diag-range"))
-(defun path-of-uri (uri: str) -> str (trap "todo: lsp.text path-of-uri"))     ;; percent escapes decoded; a non-file URI stands for itself
+(defun tbyte :private (s: str i: i64) -> i64 (zext i64 (str-byte-at s i)))
+
+;; Whether byte i of s starts a character (or is the end).
+(defun tstart? :private (s: str i: i64) -> bool
+  (or (>= i (str-len s)) (not (= (bit-and (tbyte s i) 192) 128))))
+
+;; The UTF-16 units of the character that starts with byte b (0 for a continuation byte).
+(defun tunits :private (b: i64) -> i64
+  (cond (< b 128) 1
+        (< b 192) 0
+        (< b 240) 1
+        :else 2))
+
+;; The bytes of the character that starts with byte b.
+(defun tbytes :private (b: i64) -> i64
+  (cond (< b 128) 1
+        (< b 224) 2
+        (< b 240) 3
+        :else 4))
+
+;; `off` clamped to the text and moved back to the start of its character.
+(defun tclamp :private (s: str off: i64) -> i64
+  (loop ((k (max 0 (min off (str-len s)))))
+    (if (tstart? s k) k (recur (- k 1)))))
+
+(defun offset->pos (src: str off: i64) -> LsPos
+  (let ((end (tclamp src off)))
+    (loop ((k 0) (line 0) (units 0))
+      (if (>= k end)
+          (LsPos line units)
+          (let ((b (tbyte src k)))
+            (if (= b 10)
+                (recur (+ k 1) (+ line 1) 0)
+                (recur (+ k 1) line (+ units (tunits b)))))))))
+
+;; The byte offset where line `line` (from 0) starts; the length of the text when the text has fewer lines.
+(defun tline-start :private (src: str line: i64) -> i64
+  (loop ((l 0) (start 0))
+    (if (>= l line)
+        start
+        (match (str-find src "\n" start)
+          (nil (str-len src))
+          ((some i) (recur (+ l 1) (+ i 1)))))))
+
+;; A position past the end of its line is the end of the line, one past the last line the end of the text.
+(defun pos->offset (src: str p: LsPos) -> i64
+  (let ((start (tline-start src (max 0 (. p line))))
+        (n (str-len src)))
+    (loop ((k start) (units 0))
+      (cond (>= k n) n
+            (= (tbyte src k) 10) k
+            (>= units (. p character)) k
+            :else (recur (+ k (tbytes (tbyte src k))) (+ units (tunits (tbyte src k))))))))
+
+;; The start of the character that ends at `end` (a boundary after the first byte).
+(defun tprev :private (s: str end: i64) -> i64
+  (loop ((k (- end 1)))
+    (if (or (<= k 0) (tstart? s k)) k (recur (- k 1)))))
+
+;; The range of a diagnostic: its bytes as positions; an empty one is widened to the character at it, or before it at the end of the text.
+(defun widen :private (src: str start: i64 end: i64) -> (Pair i64 i64)
+  (let ((n (str-len src)))
+    (cond (> end start) (Pair start end)
+          (and (>= start 0) (< start n) (tstart? src start)) (Pair start (+ start (tbytes (tbyte src start))))
+          (and (>= start n) (> n 0)) (Pair (tprev src n) n)
+          :else (Pair start start))))
+
+(defun diag-range (src: str d: LsDiag) -> LsRange
+  (let ((w (widen src (. d start) (. d end))))
+    (LsRange (offset->pos src (. w fst)) (offset->pos src (. w snd)))))
+
+;; ---- file URIs ----
+
+(defun thex :private (b: i64) -> i64
+  (cond (and (>= b 48) (<= b 57)) (- b 48)
+        (and (>= b 97) (<= b 102)) (- b 87)
+        (and (>= b 65) (<= b 70)) (- b 55)
+        :else -1))
+
+;; Whether byte k of s begins a %XX escape.
+(defun tescape? :private (s: str k: i64) -> bool
+  (and (= (tbyte s k) 37) (< (+ k 2) (str-len s)) (>= (thex (tbyte s (+ k 1))) 0) (>= (thex (tbyte s (+ k 2))) 0)))
+
+(defun tbyte-at :private (s: str k: i64) -> i64
+  (if (tescape? s k) (+ (* 16 (thex (tbyte s (+ k 1)))) (thex (tbyte s (+ k 2)))) (tbyte s k)))
+
+(defun tstep :private (s: str k: i64) -> i64 (if (tescape? s k) 3 1))
+
+;; The bytes of s from byte i on, each %XX replaced by its byte.
+(defun tdecode :private (s: str i: i64) -> (Array i8)
+  (let ((total (loop ((k i) (c 0)) (if (>= k (str-len s)) c (recur (+ k (tstep s k)) (+ c 1)))))
+        (out (cell (array total 0i8))))
+    (do (loop ((k i) (j 0))
+          (if (< k (str-len s))
+              (do (array-set! &out j (trunc i8 (tbyte-at s k))) (recur (+ k (tstep s k)) (+ j 1)))
+              ()))
+        @out)))
+
+;; The length of the valid UTF-8 character at i of bs, or 0 (the table of the Unicode standard, 3.9).
+(defun tvalid :private (bs: (Array i8) i: i64) -> i64
+  (let ((n (array-len bs))
+        (b (zext i64 (array-get bs i)))
+        (c1 (if (< (+ i 1) (array-len bs)) (zext i64 (array-get bs (+ i 1))) 0))
+        (c2 (if (< (+ i 2) (array-len bs)) (zext i64 (array-get bs (+ i 2))) 0))
+        (c3 (if (< (+ i 3) (array-len bs)) (zext i64 (array-get bs (+ i 3))) 0)))
+    (let ((k1 (and (>= c1 128) (<= c1 191)))
+          (k2 (and (>= c2 128) (<= c2 191)))
+          (k3 (and (>= c3 128) (<= c3 191))))
+      (cond (< b 128) 1
+            (< b 194) 0
+            (< b 224) (if (and (< (+ i 1) n) k1) 2 0)
+            (< b 240) (let ((lo (if (= b 224) 160 128)) (hi (if (= b 237) 159 191)))
+                        (if (and (< (+ i 2) n) (>= c1 lo) (<= c1 hi) k2) 3 0))
+            (< b 245) (let ((lo (if (= b 240) 144 128)) (hi (if (= b 244) 143 191)))
+                        (if (and (< (+ i 3) n) (>= c1 lo) (<= c1 hi) k2 k3) 4 0))
+            :else 0))))
+
+;; The text of bytes, each byte that is not part of a valid character replaced by U+FFFD.
+(defun tlossy :private (bs: (Array i8)) -> str
+  (let ((n (array-len bs))
+        (out (cell (array (* 3 (array-len bs)) 0i8))))
+    (let ((end (loop ((i 0) (j 0))
+                 (if (>= i n)
+                     j
+                     (let ((w (tvalid bs i)))
+                       (if (= w 0)
+                           (do (array-set! &out j -17i8) (array-set! &out (+ j 1) -65i8) (array-set! &out (+ j 2) -67i8)
+                               (recur (+ i 1) (+ j 3)))
+                           (do (dotimes (m w) (array-set! &out (+ j m) (array-get bs (+ i m))))
+                               (recur (+ i w) (+ j w)))))))))
+      (str-from-bytes (array-copy @out 0 end)))))
+
+(defun thas-prefix? :private (s: str i: i64 word: str) -> bool
+  (and (<= (+ i (str-len word)) (str-len s))
+       (loop ((k 0)) (cond (= k (str-len word)) true (not (= (str-byte-at s (+ i k)) (str-byte-at word k))) false :else (recur (+ k 1))))))
+
+;; The file a `file:` URI names (percent escapes decoded; `localhost` as the host is dropped); any other URI stands for itself.
+(defun path-of-uri (uri: str) -> str
+  (if (thas-prefix? uri 0 "file://")
+      (tlossy (tdecode uri (if (thas-prefix? uri 7 "localhost") 16 7)))
+      uri))

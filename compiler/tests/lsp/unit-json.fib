@@ -1,0 +1,141 @@
+;; compiler/tests/lsp/unit-json.fib: lsp.json. SOURCE: the three tests of crates/fibref/src/json.rs (a_document_survives_a_round_trip,
+;; malformed_documents_are_errors_not_panics, control_characters_are_escaped), widened: numbers, \u escapes and surrogate pairs, the nesting bound,
+;; error positions, escapes on writing, a round trip over generated documents.
+;; Run: compiler/tests/lsp/run.sh   (builds and runs with F; expects `checks 69 failed 0`)
+(ns main (:use lsp.json ck))
+
+;; the document as text after one read, or the error
+(defun rt (text: str) -> str
+  (match (json-parse text) ((Ok v) (json-text v)) ((Err e) (str "ERR " e))))
+
+(defun err-of (text: str) -> str
+  (match (json-parse text) ((Ok _) "accepted") ((Err e) e)))
+
+(defun str-of (text: str) -> str
+  (match (json-parse text)
+    ((Ok v) (match (json-as-str v) ((some s) s) (nil "not a string")))
+    ((Err e) (str "ERR " e))))
+
+(defun oi (o: (Option i64)) -> str (match o ((some n) (str n)) (nil "nil")))
+
+(defun nest (open: str close: str n: i64) -> str
+  (str-join [(str-join (vec (repeat n open))) (str-join (vec (repeat n close)))]))
+
+;; ---- generated documents: a linear congruential generator, so the run is the same each time ----
+
+(defun next (seed: i64) -> i64 (mod (+ (* seed 1103515245) 12345) 2147483648))
+
+(defun mix (a: i64 b: i64) -> i64 (mod (+ (* (mod a 1000003) 31) b) 2147483648))
+
+(defun pick-str (r: i64) -> str
+  (let ((pool ["a" "\"" "\\" "\n" "\r" "\t" "é" "😀" "\u{1}" "/" " " "x" "\u{7f}" "中" "\u{1f}"]))
+    (nth pool (mod (shr r 8) (count pool)))))
+
+(defun gen-str (seed: i64 n: i64) -> str
+  (loop ((s seed) (k 0) (parts []))
+    (if (>= k n) (str-join parts) (recur (next s) (+ k 1) (conj parts (pick-str (next s)))))))
+
+(defun gen-val (seed: i64 depth: i64) -> JVal
+  (let ((r (shr (next seed) 4))
+        (kind (mod (shr (next seed) 4) (if (> depth 3) 5 7))))
+    (cond (= kind 0) JNull
+          (= kind 1) (JBool (= (mod r 2) 0))
+          (= kind 2) (JInt (- (mod r 100000) 50000))
+          (= kind 3) (JFloat (/ (sitofp f64 (mod r 1000)) 8.0))
+          (= kind 4) (JStr (gen-str (next seed) (mod r 6)))
+          (= kind 5) (JArr (mapv (fn (i: i64) (gen-val (mix seed (+ i 7)) (+ depth 1))) (range (mod r 4))))
+          :else (JObj (mapv (fn (i: i64) (gen-str (+ seed i) 3)) (range (mod r 4)))
+                      (mapv (fn (i: i64) (gen-val (mix seed (+ i 3)) (+ depth 1))) (range (mod r 4)))))))
+
+(defun round-trips? (seed: i64) -> bool
+  (let ((v (gen-val seed 0))
+        (text (json-text (gen-val seed 0))))
+    (match (json-parse text)
+      ((Ok back) (and (= back v) (= (json-text back) text)))
+      ((Err _) false))))
+
+(defun all-round-trip (n: i64) -> i64
+  (loop ((i 0) (bad 0))
+    (if (>= i n) bad (recur (+ i 1) (if (round-trips? (+ (* i 7919) 1)) bad (+ bad 1))))))
+
+(defun main () -> i64
+  (let ((doc "{\"a\":[1,2.5,-3,true,null],\"b\":\"x\\n\\\"y\\\" \\u00e9 \\ud83d\\ude00\",\"c\":{}}")
+        (v (match (json-parse doc) ((Ok v) v) ((Err e) (trap e)))))
+    (finish
+      [;; the Rust's round trip test
+       (eq-str "doc b" (match (json-path v ["b"]) ((some b) (match (json-as-str b) ((some s) s) (nil "?"))) (nil "missing")) "x\n\"y\" é 😀")
+       (eq-str "doc text" (json-text v) "{\"a\":[1,2.5,-3,true,null],\"b\":\"x\\n\\\"y\\\" é 😀\",\"c\":{}}")
+       (eq-str "doc again" (rt (json-text v)) (json-text v))
+       ;; malformed documents: an error, with a position
+       (eq-str "empty" (err-of "") "unexpected end at byte 0")
+       (eq-str "open brace" (err-of "{") "expected a key at byte 1")
+       (eq-str "open array" (err-of "[1,") "unexpected end at byte 3")
+       (eq-str "key only" (err-of "{\"a\"}") "expected : at byte 4")
+       (eq-str "tru" (err-of "tru") "bad literal at byte 0")
+       (eq-str "bad escape" (err-of "\"\\q\"") "bad escape at byte 3")
+       (eq-str "two values" (err-of "1 2") "trailing text at byte 2")
+       (eq-str "trailing comma" (err-of "{\"a\":1,}") "expected a key at byte 7")
+       (eq-str "unterminated" (err-of "\"abc") "unterminated string at byte 4")
+       (eq-str "unterminated escape" (err-of "\"abc\\") "unterminated string at byte 5")
+       (eq-str "array separator" (err-of "[1 2]") "expected , or ] at byte 3")
+       (eq-str "object separator" (err-of "{\"a\":1 \"b\":2}") "expected , or } at byte 7")
+       (eq-str "error after multibyte" (err-of "[\"é\", x]") "bad value at byte 7")
+       ;; the nesting bound: 129 brackets deep read (depth 128 is the deepest value), 130 do not, 1000 does not (and does not overflow the stack)
+       (eq-str "depth 129" (rt (nest "[" "]" 129)) (nest "[" "]" 129))
+       (eq-str "depth 130" (err-of (nest "[" "]" 130)) "nested too deeply at byte 129")
+       (eq-str "depth 1000" (err-of (str-join (vec (repeat 1000 "[")))) "nested too deeply at byte 129")
+       (eq-str "depth objects" (err-of (str-join (vec (repeat 200 "{\"a\":")))) "nested too deeply at byte 645")
+       ;; numbers
+       (eq-str "int" (rt "12") "12")
+       (eq-str "negative" (rt "-3") "-3")
+       (eq-str "zero" (rt "0") "0")
+       (eq-str "float" (rt "2.5") "2.5")
+       (eq-str "exponent" (rt "1e3") "1000.0")
+       (eq-str "exponent sign" (rt "25E-1") "2.5")
+       (eq-str "int is int" (match (json-parse "7") ((Ok (JInt n)) (str "int " n)) ((Ok _) "other") ((Err e) e)) "int 7")
+       (eq-str "float is float" (match (json-parse "7.0") ((Ok (JFloat _)) "float") ((Ok _) "other") ((Err e) e)) "float")
+       (eq-str "i64 max" (rt "9223372036854775807") "9223372036854775807")
+       (eq-str "i64 min" (rt "-9223372036854775808") "-9223372036854775808")
+       (eq-str "past i64 is a float" (match (json-parse "9223372036854775808") ((Ok (JFloat _)) "float") ((Ok _) "other") ((Err e) e)) "float")
+       (eq-str "lone minus" (err-of "-") "bad value at byte 0")
+       (eq-str "leading zero" (err-of "01") "trailing text at byte 1")
+       (eq-str "bare dot" (err-of "1.") "bad value at byte 0")
+       (eq-str "plus" (err-of "+1") "bad value at byte 0")
+       (eq-str "empty exponent" (err-of "1e") "bad value at byte 0")
+       ;; \u escapes and surrogate pairs
+       (eq-str "u escape" (str-of "\"\\u00e9\"") "é")
+       (eq-int "u escape bytes" (str-len (str-of "\"\\u00e9\"")) 2)
+       (eq-str "u upper F" (str-of "\"\\u00FF\"") "ÿ")
+       (eq-str "u lower f" (str-of "\"\\u00ff\"") "ÿ")
+       (eq-str "u mixed digits" (str-of "\"\\uAbCd\"") "\u{abcd}")
+       (eq-str "u ascii" (str-of "\"\\u0041\"") "A")
+       (eq-str "u 3 bytes" (str-of "\"\\u4e2d\"") "中")
+       (eq-str "pair" (str-of "\"\\ud83d\\ude00\"") "😀")
+       (eq-int "pair bytes" (str-len (str-of "\"\\ud83d\\ude00\"")) 4)
+       (eq-str "pair upper case" (str-of "\"\\uD83D\\uDE00\"") "😀")
+       (eq-str "pair edge low" (str-of "\"\\ud800\\udc00\"") "\u{10000}")
+       (eq-str "pair edge high" (str-of "\"\\udbff\\udfff\"") "\u{10ffff}")
+       (eq-str "lone high" (str-of "\"a\\ud83dz\"") "a\u{fffd}z")
+       (eq-str "high then other escape" (str-of "\"\\ud83d\\u0041\"") "\u{fffd}A")
+       (eq-str "lone low" (str-of "\"\\ude00\"") "\u{fffd}")
+       (eq-str "short u" (err-of "\"\\u00\"") "bad \\u escape at byte 3")
+       (eq-str "bad hex" (err-of "\"\\u00zz\"") "bad \\u escape at byte 3")
+       (eq-str "simple escapes" (str-of "\"\\b\\f\\n\\r\\t\\/\\\\\\\"\"") "\u{8}\u{c}\n\r\t/\\\"")
+       ;; writing
+       (eq-str "control" (json-text (JStr "a\u{1}b")) "\"a\\u0001b\"")
+       (eq-str "control 1f" (json-text (JStr "\u{1f}")) "\"\\u001f\"")
+       (eq-str "escapes" (json-text (JStr "q\"b\\n\nr\rt\t")) "\"q\\\"b\\\\n\\nr\\rt\\t\"")
+       (eq-str "non-ascii raw" (json-text (JStr "é😀中")) "\"é😀中\"")
+       (eq-str "del raw" (json-text (JStr "\u{7f}")) "\"\u{7f}\"")
+       (eq-str "nan" (json-text (JFloat (/ 0.0 0.0))) "null")
+       ;; objects keep their order; get and path
+       (eq-str "order" (rt "{\"b\":1,\"a\":2,\"c\":{\"z\":[]}}") "{\"b\":1,\"a\":2,\"c\":{\"z\":[]}}")
+       (eq-str "duplicate key first" (match (json-get v "c") ((some c) (json-text c)) (nil "-")) "{}")
+       (eq-str "get missing" (match (json-get v "zz") ((some c) (json-text c)) (nil "none")) "none")
+       (eq-str "get of non-object" (match (json-get (JInt 1) "a") ((some c) (json-text c)) (nil "none")) "none")
+       (eq-str "path deep" (match (json-path (json-obj [(Pair "a" (json-obj [(Pair "b" (json-int 5))]))]) ["a" "b"]) ((some c) (json-text c)) (nil "none")) "5")
+       (eq-str "path empty" (match (json-path (JInt 3) []) ((some c) (json-text c)) (nil "none")) "3")
+       (eq-str "path broken" (match (json-path (json-obj [(Pair "a" (json-int 5))]) ["a" "b"]) ((some c) (json-text c)) (nil "none")) "none")
+       (eq-str "as-int" (str (oi (json-as-int (JInt 4))) "," (oi (json-as-int (JInt -1))) "," (oi (json-as-int (JFloat 5.0))) "," (oi (json-as-int (JFloat 5.5)))) "4,nil,5,nil")
+       ;; 200 generated documents survive text and back, in value and in text
+       (eq-int "round trips" (all-round-trip 200) 0)])))

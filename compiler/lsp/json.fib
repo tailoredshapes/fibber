@@ -1,7 +1,14 @@
 ;; compiler/lsp/json.fib: JSON values, reader and writer (docs/design/fibref-port.md section 6). OWNER: package L0. Rust: crates/fibref/src/json.rs (362
 ;; lines). The library has no JSON module (only lib/fib/lacinia/json.fib, a writer of GraphQL values). Object keys keep their order (the writer's output
 ;; is what the recorded transcripts compare). Numbers are i64 or f64; \u escapes and surrogate pairs decode to UTF-8.
+;;
+;; Differences from the Rust, each deliberate: a number must follow RFC 8259 (the Rust took whatever f64 parsing took: "+1", ".5"); an integer that
+;; does not fit i64 reads as a float; a lone surrogate escape reads as U+FFFD and does not swallow the escape after it; a float prints as the library
+;; prints it (`2.5`, `3.0`, `1.0E21`), so a float and an integer differ after a round trip as they do in the value. Errors say "WHAT at byte N"
+;; (N counts bytes of the text), as the Rust did. A document nests at most 128 deep.
 (ns lsp.json)
+
+(extern strtod :private (ptr ptr) -> f64)
 
 (defenum JVal
   JNull
@@ -12,8 +19,299 @@
   (JArr items: (Vec JVal))
   (JObj keys: (Vec str) vals: (Vec JVal)))
 
-(defun json-parse (text: str) -> (Result JVal str) (trap "todo: lsp.json json-parse"))
-(defun json-text (v: JVal) -> str (trap "todo: lsp.json json-text"))
-(defun json-get (v: JVal key: str) -> (Option JVal) (trap "todo: lsp.json json-get"))
-(defun json-path (v: JVal keys: (Vec str)) -> (Option JVal) (trap "todo: lsp.json json-path"))
-(defun json-obj (pairs: (Vec (Pair str JVal))) -> JVal (trap "todo: lsp.json json-obj"))
+(derive Eq JVal)
+
+(def json-max-depth: i64 128)
+
+;; ---- reading: a value and the byte after it ----
+
+(defstruct JRd (v: JVal at: i64))
+(defstruct JRs (s: str at: i64))
+
+;; The byte at i as 0 to 255, or -1 past the end.
+(defun jb :private (s: str i: i64) -> i64
+  (if (and (>= i 0) (< i (str-len s))) (zext i64 (str-byte-at s i)) -1))
+
+(defun jws :private (s: str i: i64) -> i64
+  (loop ((k i))
+    (let ((b (jb s k)))
+      (if (or (= b 32) (= b 9) (= b 10) (= b 13)) (recur (+ k 1)) k))))
+
+(defun jfail :private (what: str i: i64) -> (Result JRd str) (Err (str what " at byte " i)))
+
+(defun jmatch :private (s: str i: i64 word: str) -> bool
+  (let ((n (str-len word)))
+    (loop ((k 0))
+      (cond (= k n) true
+            (not (= (jb s (+ i k)) (jb word k))) false
+            :else (recur (+ k 1))))))
+
+(defun jlit :private (s: str i: i64 word: str v: JVal) -> (Result JRd str)
+  (if (jmatch s i word) (Ok (JRd v (+ i (str-len word)))) (jfail "bad literal" i)))
+
+(defun jdigits :private (s: str i: i64) -> i64
+  (loop ((k i))
+    (let ((b (jb s k))) (if (and (>= b 48) (<= b 57)) (recur (+ k 1)) k))))
+
+(defun jfinite? :private (x: f64) -> bool (= (- x x) 0.0))
+
+(defun jstrtod :private (text: str) -> f64
+  (unsafe
+    (let ((bs (str-bytes text))
+          (n (array-len bs))
+          (p (alloc (+ n 1)))
+          (e (alloc 8)))
+      (do (dotimes (i n) (store-i8 (ptr+ p i) (array-get bs i)))
+          (store-i8 (ptr+ p n) 0i8)
+          (let ((r (strtod p e))) (do (free e) (free p) r))))))
+
+;; The end of the integer part at a (a `-` already passed), or -1.
+(defun jint-end :private (s: str a: i64) -> i64
+  (let ((b (jb s a)))
+    (cond (= b 48) (+ a 1)
+          (and (>= b 49) (<= b 57)) (jdigits s a)
+          :else -1)))
+
+;; The end of the fraction at a (`.` then digits) when there is one; a itself when none; -1 when malformed.
+(defun jfrac-end :private (s: str a: i64) -> i64
+  (if (= (jb s a) 46)
+      (let ((d (jdigits s (+ a 1)))) (if (= d (+ a 1)) -1 d))
+      a))
+
+(defun jexp-end :private (s: str a: i64) -> i64
+  (let ((b (jb s a)))
+    (if (or (= b 101) (= b 69))
+        (let ((k (if (or (= (jb s (+ a 1)) 43) (= (jb s (+ a 1)) 45)) (+ a 2) (+ a 1)))
+              (d (jdigits s k)))
+          (if (= d k) -1 d))
+        a)))
+
+(defun jnum-value :private (text: str float: bool) -> JVal
+  (if float
+      (JFloat (jstrtod text))
+      (match (parse-long text)
+        ((some n) (JInt n))
+        (nil (JFloat (jstrtod text))))))
+
+(defun jnumber :private (s: str i: i64) -> (Result JRd str)
+  (let ((ie (jint-end s (if (= (jb s i) 45) (+ i 1) i))))
+    (if (< ie 0)
+        (jfail "bad value" i)
+        (let ((fe (jfrac-end s ie)))
+          (if (< fe 0)
+              (jfail "bad value" i)
+              (let ((xe (jexp-end s fe)))
+                (if (< xe 0)
+                    (jfail "bad value" i)
+                    (Ok (JRd (jnum-value (str-slice s i xe) (> xe ie)) xe)))))))))
+
+;; ---- strings ----
+
+(defun jhex1 :private (b: i64) -> i64
+  (cond (and (>= b 48) (<= b 57)) (- b 48)
+        (and (>= b 97) (<= b 102)) (- b 87)
+        (and (>= b 65) (<= b 70)) (- b 55)
+        :else -1))
+
+;; The value of the four hex digits at k, or -1.
+(defun jhex4 :private (s: str k: i64) -> i64
+  (loop ((j 0) (acc 0))
+    (if (= j 4)
+        acc
+        (let ((d (jhex1 (jb s (+ k j)))))
+          (if (< d 0) -1 (recur (+ j 1) (+ (* acc 16) d)))))))
+
+(defun jchar-str :private (cp: i64) -> str (str (i32->char (trunc i32 cp))))
+
+(defun jsr :private (text: str at: i64) -> (Result JRs str) (Ok (JRs text at)))
+
+;; The escape `\u` whose four digits start at k: one character, or a surrogate pair of two escapes.
+(defun junicode :private (s: str k: i64) -> (Result JRs str)
+  (let ((hi (jhex4 s k)))
+    (cond (< hi 0) (Err (str "bad \\u escape at byte " k))
+          (and (>= hi 55296) (<= hi 56319))
+          (if (and (= (jb s (+ k 4)) 92) (= (jb s (+ k 5)) 117))
+              (let ((lo (jhex4 s (+ k 6))))
+                (cond (< lo 0) (Err (str "bad \\u escape at byte " (+ k 6)))
+                      (and (>= lo 56320) (<= lo 57343))
+                      (jsr (jchar-str (+ 65536 (+ (shl (- hi 55296) 10) (- lo 56320)))) (+ k 10))
+                      :else (jsr (jchar-str 65533) (+ k 4))))
+              (jsr (jchar-str 65533) (+ k 4)))
+          (and (>= hi 56320) (<= hi 57343)) (jsr (jchar-str 65533) (+ k 4))
+          :else (jsr (jchar-str hi) (+ k 4)))))
+
+;; The escape whose letter is at k (just after the backslash): its text and the byte after it.
+(defun jescape :private (s: str k: i64) -> (Result JRs str)
+  (let ((b (jb s k)))
+    (cond (< b 0) (Err (str "unterminated string at byte " k))
+          (= b 110) (jsr "\n" (+ k 1))
+          (= b 114) (jsr "\r" (+ k 1))
+          (= b 116) (jsr "\t" (+ k 1))
+          (= b 98) (jsr (jchar-str 8) (+ k 1))
+          (= b 102) (jsr (jchar-str 12) (+ k 1))
+          (= b 47) (jsr "/" (+ k 1))
+          (= b 92) (jsr "\\" (+ k 1))
+          (= b 34) (jsr "\"" (+ k 1))
+          (= b 117) (junicode s (+ k 1))
+          :else (Err (str "bad escape at byte " (+ k 1))))))
+
+;; The string whose opening quote is at i. Raw runs between escapes are copied whole.
+(defun jstring :private (s: str i: i64) -> (Result JRs str)
+  (let ((parts0: (Vec str) []))
+    (loop ((k (+ i 1)) (run (+ i 1)) (parts parts0))
+      (let ((b (jb s k)))
+        (cond (< b 0) (Err (str "unterminated string at byte " k))
+              (= b 34) (Ok (JRs (str-join (conj parts (str-slice s run k))) (+ k 1)))
+              (= b 92) (match (jescape s (+ k 1))
+                         ((Err e) (Err e))
+                         ((Ok r) (recur (. r at) (. r at) (conj (conj parts (str-slice s run k)) (. r s)))))
+              :else (recur (+ k 1) run parts))))))
+
+;; ---- values ----
+
+(defun jvalue :private (s: str i: i64 depth: i64) -> (Result JRd str)
+  (if (> depth json-max-depth)
+      (jfail "nested too deeply" i)
+      (let ((j (jws s i))
+            (b (jb s (jws s i))))
+        (cond (< b 0) (jfail "unexpected end" j)
+              (= b 110) (jlit s j "null" JNull)
+              (= b 116) (jlit s j "true" (JBool true))
+              (= b 102) (jlit s j "false" (JBool false))
+              (= b 34) (match (jstring s j)
+                         ((Err e) (Err e))
+                         ((Ok r) (Ok (JRd (JStr (. r s)) (. r at)))))
+              (= b 91) (jarray s j depth)
+              (= b 123) (jobject s j depth)
+              :else (jnumber s j)))))
+
+(defun jarray :private (s: str i: i64 depth: i64) -> (Result JRd str)
+  (let ((j (jws s (+ i 1)))
+        (items0: (Vec JVal) []))
+    (if (= (jb s j) 93)
+        (Ok (JRd (JArr items0) (+ j 1)))
+        (loop ((k j) (items items0))
+          (match (jvalue s k (+ depth 1))
+            ((Err e) (Err e))
+            ((Ok r)
+             (let ((n (jws s (. r at))))
+               (cond (= (jb s n) 44) (recur (+ n 1) (conj items (. r v)))
+                     (= (jb s n) 93) (Ok (JRd (JArr (conj items (. r v))) (+ n 1)))
+                     :else (jfail "expected , or ]" n)))))))))
+
+(defun jmember :private (s: str k: i64 depth: i64) -> (Result (Pair str JRd) str)
+  (let ((q (jws s k)))
+    (if (not (= (jb s q) 34))
+        (Err (str "expected a key at byte " q))
+        (match (jstring s q)
+          ((Err e) (Err e))
+          ((Ok key)
+           (let ((c (jws s (. key at))))
+             (if (not (= (jb s c) 58))
+                 (Err (str "expected : at byte " c))
+                 (match (jvalue s (+ c 1) (+ depth 1))
+                   ((Err e) (Err e))
+                   ((Ok r) (Ok (Pair (. key s) r)))))))))))
+
+(defun jobject :private (s: str i: i64 depth: i64) -> (Result JRd str)
+  (let ((j (jws s (+ i 1)))
+        (keys0: (Vec str) [])
+        (vals0: (Vec JVal) []))
+    (if (= (jb s j) 125)
+        (Ok (JRd (JObj keys0 vals0) (+ j 1)))
+        (loop ((k j) (keys keys0) (vals vals0))
+          (match (jmember s k depth)
+            ((Err e) (Err e))
+            ((Ok m)
+             (let ((r (. m snd))
+                   (n (jws s (. (. m snd) at))))
+               (cond (= (jb s n) 44) (recur (+ n 1) (conj keys (. m fst)) (conj vals (. r v)))
+                     (= (jb s n) 125) (Ok (JRd (JObj (conj keys (. m fst)) (conj vals (. r v))) (+ n 1)))
+                     :else (jfail "expected , or }" n)))))))))
+
+;; Reads one JSON document; the error says what and where.
+(defun json-parse (text: str) -> (Result JVal str)
+  (match (jvalue text 0 0)
+    ((Err e) (Err e))
+    ((Ok r)
+     (let ((e (jws text (. r at))))
+       (if (= e (str-len text)) (Ok (. r v)) (Err (str "trailing text at byte " e)))))))
+
+;; ---- writing ----
+
+(defun jhex2 :private (b: i64) -> str
+  (str (str-slice "0123456789abcdef" (shr b 4) (+ (shr b 4) 1)) (str-slice "0123456789abcdef" (bit-and b 15) (+ (bit-and b 15) 1))))
+
+;; The escape of byte b, or "" when it stands for itself.
+(defun jesc-of :private (b: i64) -> str
+  (cond (= b 34) "\\\""
+        (= b 92) "\\\\"
+        (= b 10) "\\n"
+        (= b 13) "\\r"
+        (= b 9) "\\t"
+        (< b 32) (str "\\u00" (jhex2 b))
+        :else ""))
+
+;; `s` as a JSON string. Bytes of 128 and above are the parts of a character, which stands for itself.
+(defun jquote :private (s: str) -> str
+  (let ((n (str-len s))
+        (parts0: (Vec str) ["\""]))
+    (loop ((k 0) (run 0) (parts parts0))
+      (if (= k n)
+          (str-join (conj (conj parts (str-slice s run n)) "\""))
+          (let ((e (jesc-of (jb s k))))
+            (if (= (str-len e) 0)
+                (recur (+ k 1) run parts)
+                (recur (+ k 1) (+ k 1) (conj (conj parts (str-slice s run k)) e))))))))
+
+(defun jmember-text :private (key: str v: JVal) -> str (str-join [(jquote key) ":" (json-text v)]))
+
+;; The document as compact text.
+(defun json-text (v: JVal) -> str
+  (match v
+    ((JNull) "null")
+    ((JBool b) (if b "true" "false"))
+    ((JInt n) (str n))
+    ((JFloat x) (if (jfinite? x) (str x) "null"))
+    ((JStr s) (jquote s))
+    ((JArr items) (str-join ["[" (str-join (vec (interpose "," (mapv json-text items)))) "]"]))
+    ((JObj keys vals)
+     (str-join ["{" (str-join (vec (interpose "," (mapv (fn (i: i64) (jmember-text (nth keys i) (nth vals i))) (range (count keys)))))) "}"]))))
+
+;; ---- access ----
+
+(defun json-get (v: JVal key: str) -> (Option JVal)
+  (match v
+    ((JObj keys vals)
+     (loop ((i 0))
+       (cond (>= i (count keys)) nil
+             (= (nth keys i) key) (some (nth vals i))
+             :else (recur (+ i 1)))))
+    (_ nil)))
+
+(defun json-path (v: JVal keys: (Vec str)) -> (Option JVal)
+  (loop ((cur (some v)) (i 0))
+    (match cur
+      (nil nil)
+      ((some c) (if (>= i (count keys)) (some c) (recur (json-get c (nth keys i)) (+ i 1)))))))
+
+;; An object from (key, value) pairs, in order.
+(defun json-obj (pairs: (Vec (Pair str JVal))) -> JVal
+  (JObj (mapv (fn (p: (Pair str JVal)) (. p fst)) pairs) (mapv (fn (p: (Pair str JVal)) (. p snd)) pairs)))
+
+;; Added by L0 beyond the stub (the Rust's `Json::str`, `int`, `as_str`, `as_usize`, `as_arr`).
+(defun json-str (s: str) -> JVal (JStr s))
+(defun json-int (n: i64) -> JVal (JInt n))
+
+(defun json-as-str (v: JVal) -> (Option str)
+  (match v ((JStr s) (some s)) (_ nil)))
+
+;; A non-negative whole number below 1e15, as the Rust's `as_usize`: an integer, or a float with no fraction.
+(defun json-as-int (v: JVal) -> (Option i64)
+  (match v
+    ((JInt n) (if (>= n 0) (some n) nil))
+    ((JFloat x) (if (and (>= x 0.0) (< x 1.0e15) (= x (sitofp f64 (fptosi i64 x)))) (some (fptosi i64 x)) nil))
+    (_ nil)))
+
+(defun json-as-arr (v: JVal) -> (Option (Vec JVal))
+  (match v ((JArr items) (some items)) (_ nil)))

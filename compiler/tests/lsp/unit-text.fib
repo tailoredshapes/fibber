@@ -1,0 +1,86 @@
+;; compiler/tests/lsp/unit-text.fib: lsp.text. SOURCE: the two tests of crates/fibref/src/editor/text.rs (offsets_and_positions_agree_across_lines_and_wide_
+;; characters, positions_past_the_end_clamp) and the `uris_become_paths_with_escapes_decoded` test of editor/lsp/tests.rs, widened: emoji (two UTF-16
+;; units, four bytes), combining characters (one unit each), a column inside a surrogate pair, widening of empty ranges, bad percent escapes.
+;; Lines count from 0 here; the Rust's command line counted from 1.
+(ns main (:use lsp.text lsp.types ck))
+
+(defun ps (p: LsPos) -> str (str (. p line) ":" (. p character)))
+(defun at (src: str off: i64) -> str (ps (offset->pos src off)))
+(defun off (src: str line: i64 col: i64) -> i64 (pos->offset src (LsPos line col)))
+(defun rng (r: LsRange) -> str (str (ps (. r start)) "-" (ps (. r end))))
+(defun dr (src: str start: i64 end: i64) -> str (rng (diag-range src (LsDiag start end "m"))))
+
+;; offset -> position -> offset is the identity on character starts
+(defun round-trips (src: str offs: (Vec i64)) -> i64
+  (reduce + 0 (mapv (fn (o: i64) (if (= (pos->offset src (offset->pos src o)) o) 0 1)) offs)))
+
+(defun main () -> i64
+  (let ((src "ab\ncé😀d\n")
+        (comb "e\u{301}xy")
+        (crlf "ab\r\ncd"))
+    (finish
+      [;; the Rust's round trip over lines and wide characters (a 4-byte character is two units)
+       (eq-int "round trip" (round-trips src [0 1 2 3 4 6 10 11]) 0)
+       (eq-str "d after the emoji" (at src 10) "1:4")
+       (eq-str "emoji start" (at src 6) "1:2")
+       (eq-str "after the emoji" (at src 10) "1:4")
+       (eq-str "e acute is one unit" (at src 6) "1:2")
+       (eq-str "start of line 2" (at src 3) "1:0")
+       (eq-str "end of text" (at src 12) "2:0")
+       (eq-str "offset 0" (at src 0) "0:0")
+       ;; an offset inside a character stands for the character
+       (eq-str "inside e acute" (at src 5) "1:1")
+       (eq-str "inside the emoji" (at src 8) "1:2")
+       (eq-str "past the end" (at src 99) "2:0")
+       (eq-str "before the start" (at src -5) "0:0")
+       ;; positions back to bytes
+       (eq-int "col 1 line 1" (off src 1 1) 4)
+       (eq-int "col 2 line 1" (off src 1 2) 6)
+       (eq-int "col 4 line 1" (off src 1 4) 10)
+       (eq-int "inside a surrogate pair rounds up" (off src 1 3) 10)
+       (eq-int "line 0 col 2" (off src 0 2) 2)
+       ;; the Rust's clamping test
+       (eq-int "column past the line end" (off "ab\ncd" 0 99) 2)
+       (eq-int "line past the text" (off "ab\ncd" 9 0) 5)
+       (eq-int "column past the last line" (off "ab\ncd" 1 99) 5)
+       (eq-int "negative line" (off "ab\ncd" -3 1) 1)
+       (eq-int "empty text" (off "" 0 0) 0)
+       ;; combining characters: one unit each, two bytes for U+0301
+       (eq-str "combining x" (at comb 3) "0:2")
+       (eq-str "combining mark" (at comb 1) "0:1")
+       (eq-int "combining back" (off comb 0 2) 3)
+       (eq-int "combining mid" (off comb 0 1) 1)
+       ;; CR counts as a unit, as in the Rust (only \n breaks a line)
+       (eq-str "crlf" (at crlf 4) "1:0")
+       (eq-str "cr counts" (at crlf 2) "0:2")
+       (eq-int "crlf line 1" (off crlf 1 1) 5)
+       ;; diagnostics ranges
+       (eq-str "range ordinary" (dr "(f x)" 1 2) "0:1-0:2")
+       (eq-str "range over lines" (dr src 1 11) "0:1-1:5")
+       (eq-str "range after emoji" (dr src 10 11) "1:4-1:5")
+       (eq-str "range over the emoji" (dr src 6 10) "1:2-1:4")
+       (eq-str "empty widened" (dr "(f x)" 1 1) "0:1-0:2")
+       (eq-str "empty on e acute" (dr src 4 4) "1:1-1:2")
+       (eq-str "empty on the emoji" (dr src 6 6) "1:2-1:4")
+       (eq-str "empty before a newline" (dr src 11 11) "1:5-2:0")
+       (eq-str "empty at the end" (dr "ab" 2 2) "0:1-0:2")
+       (eq-str "empty at the end after emoji" (dr "a😀" 5 5) "0:1-0:3")
+       (eq-str "empty in nothing" (dr "" 0 0) "0:0-0:0")
+       (eq-str "end before start" (dr "abc" 2 1) "0:2-0:3")
+       (eq-str "range past the end" (dr "ab" 5 6) "0:2-0:2")
+       ;; the diagnostics transcript: the emoji before the error shifts the UTF-16 column by one more than the code points
+       (eq-str "transcript utf-16" (dr "(defun f () -> i64 \"😀\" 1)" 26 27) "0:24-0:25")
+       ;; file URIs
+       (eq-str "uri" (path-of-uri "file:///nonexistent/dir/a%20b.fib") "/nonexistent/dir/a b.fib")
+       (eq-str "uri untitled" (path-of-uri "untitled:1") "untitled:1")
+       (eq-str "uri localhost" (path-of-uri "file://localhost/x%2Fy") "/x/y")
+       (eq-str "uri utf-8" (path-of-uri "file:///d/%C3%A9%F0%9F%98%80.fib") "/d/é😀.fib")
+       (eq-str "uri raw utf-8" (path-of-uri "file:///d/é.fib") "/d/é.fib")
+       (eq-str "uri bad hex" (path-of-uri "file:///a%zzb%2") "/a%zzb%2")
+       (eq-str "uri lowercase hex" (path-of-uri "file:///a%2fb") "/a/b")
+       (eq-str "uri invalid utf-8" (path-of-uri "file:///a%FFb") "/a\u{fffd}b")
+       (eq-str "uri truncated utf-8" (path-of-uri "file:///a%C3") "/a\u{fffd}")
+       (eq-str "uri overlong" (path-of-uri "file:///%C0%80") "/\u{fffd}\u{fffd}")
+       (eq-str "uri empty path" (path-of-uri "file://") "")
+       (eq-str "short non-ascii" (path-of-uri "éé") "éé")
+       (eq-str "http stays" (path-of-uri "http://x/a%20b") "http://x/a%20b")])))
