@@ -32,6 +32,8 @@ case $MODE in
   chunks-order)         CASES=(7534- 7535-) ;;
   chunks-task-per-chunk) CASES=(7537-) ;;
   chunks-trap-message)  CASES=(7538- 7539-) ;;
+  reduce-grain-by-workers) CASES=(7540-) ;;
+  reduce-left-combine)  CASES=(7540- 7541-) ;;
   *) echo "mutant-parallel: unknown MODE $MODE" >&2; exit 2 ;;
 esac
 rm -rf "$OUT/tree"; mkdir -p "$OUT/tree/cases" "$OUT/tmp"
@@ -55,6 +57,8 @@ mutate() {
     chunks-order)         mut lib/fib/parallel/chunks.fib 's/\(nth \(nth parts \(rem c w\)\) \(quot c w\)\)/(nth (nth parts (- w 1 (rem c w))) (quot c w))/' ;;
     chunks-task-per-chunk) mut lib/fib/parallel/chunks.fib 's/\(max 1 \(min workers nc\)\)/(max 1 nc)/' ;;
     chunks-trap-message)  mut lib/fib/parallel/chunks.fib 's/\(trap \(nth \@fails 0\)\)/(trap "a chunk failed")/' ;;
+    reduce-grain-by-workers) mut lib/fib/parallel/reduce.fib 's/:else \(reduce-grain\)\)\)/:else (max 1 (quot (+ n (- (max 1 (. p workers)) 1)) (max 1 (. p workers)))))) /' ;;
+    reduce-left-combine)  mut lib/fib/parallel/reduce.fib 's/\(tree-combine combine init parts\)\)\)\)/(left-combine combine init parts))))/' ;;
   esac
 }
 mutate
