@@ -34,6 +34,8 @@ case $MODE in
   chunks-trap-message)  CASES=(7538- 7539-) ;;
   reduce-grain-by-workers) CASES=(7540-) ;;
   reduce-left-combine)  CASES=(7540- 7541-) ;;
+  scan-wrong-carry)     CASES=(7542-) ;;
+  seq-window-overlap)   CASES=(7543-) ;;
   *) echo "mutant-parallel: unknown MODE $MODE" >&2; exit 2 ;;
 esac
 rm -rf "$OUT/tree"; mkdir -p "$OUT/tree/cases" "$OUT/tmp"
@@ -59,6 +61,8 @@ mutate() {
     chunks-trap-message)  mut lib/fib/parallel/chunks.fib 's/\(trap \(nth \@fails 0\)\)/(trap "a chunk failed")/' ;;
     reduce-grain-by-workers) mut lib/fib/parallel/reduce.fib 's/:else \(reduce-grain\)\)\)/:else (max 1 (quot (+ n (- (max 1 (. p workers)) 1)) (max 1 (. p workers)))))) /' ;;
     reduce-left-combine)  mut lib/fib/parallel/reduce.fib 's/\(tree-combine combine init parts\)\)\)\)/(left-combine combine init parts))))/' ;;
+    scan-wrong-carry)     mut lib/fib/parallel/scan.fib 's/\(conj out acc\)/(conj out (combine acc (nth totals c)))/' ;;
+    seq-window-overlap)   mut lib/fib/parallel/pmap.fib 's/\(recur \(drop k s\)/(recur (drop (max 0 (- k 1)) s)/' ;;
   esac
 }
 mutate
