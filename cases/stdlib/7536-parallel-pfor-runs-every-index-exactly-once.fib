@@ -1,0 +1,28 @@
+;; spec:   docs/design/parallelism.md 3.2 (P-struct); lib/fib/parallel/pmap.fib
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; `pfor` and `pfor-range` run the body once for every index of [0, n): the indices are collected in an atom, sorted, and compared with the
+;; range. A lost chunk leaves a gap, a repeated one a duplicate, a bad tail an index beyond n or a missing last index.
+(ns main (:use fib.core fib.parallel tl.check))
+
+(defun collect (w: i64 grain: i64 n: i64) -> (Vec i64)
+  (let [seen (atom (vec-empty))]
+    (do (pfor (Par w grain false) n (fn (i) (do (swap! seen (fn (v) (conj v i))) ())))
+        (vec (sort @seen)))))
+
+(defun collect-range (w: i64 grain: i64 n: i64) -> (Vec i64)
+  (let [seen (atom (vec-empty))]
+    (do (pfor-range [i n (Par w grain false)] (swap! seen (fn (v) (conj v i))))
+        (vec (sort @seen)))))
+
+(defun main () -> i64
+  (let [c (checks)]
+    (do (doseq [n [0 1 5 64 333 1000]]
+          (doseq [w [1 2 3 8 28]]
+            (doseq [grain [0 1 10 100 5000]]
+              (do (check c (= (collect w grain n) (vec (range n))))
+                  (check c (= (collect-range w grain n) (vec (range n))))))))
+        (checks-result c))))

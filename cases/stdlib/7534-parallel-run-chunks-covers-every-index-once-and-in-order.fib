@@ -1,0 +1,29 @@
+;; spec:   docs/design/parallelism.md 3.2 (P-struct); lib/fib/parallel/chunks.fib
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; `run-chunks` cuts [0, n) into chunks of `grain` (the last one shorter) and returns the chunk results in chunk order, whatever the number of
+;; workers. The body returns its own bounds, so the check is exact: chunk c is [c grain, min(n, (c+1) grain)), the list has ceil(n/grain)
+;; entries, and no worker count changes it. Planted faults (scripts/mutant-parallel.sh): a lost task (a worker's chunks missing), a chunk run
+;; twice (a repeated stride), a tail that runs past n or stops short of it, results interleaved in the wrong order, all fail this case.
+(ns main (:use fib.core fib.parallel tl.check))
+
+(defun bounds (workers: i64 n: i64 grain: i64) -> (Vec (Vec i64))
+  (run-chunks workers n grain (fn (lo hi) [lo hi])))
+
+;; the expected chunk list, computed by the plainest loop
+(defun expected (n: i64 grain: i64) -> (Vec (Vec i64))
+  (loop [lo 0 out []] (if (< lo n) (recur (+ lo grain) (conj out [lo (min n (+ lo grain))])) out)))
+
+(defun main () -> i64
+  (let [c (checks)]
+    (do (doseq [n [1 2 7 64 100 1000 1001]]
+          (doseq [grain [1 3 10 64 1000 5000]]
+            (doseq [w [1 2 3 4 7 8 16 28]]
+              (check c (= (bounds w n grain) (expected n grain))))))
+        (check c (= (count (bounds 4 0 10)) 0))
+        (check c (= (bounds 28 1 1) [[0 1]]))
+        (check c (= (bounds 8 10 4) [[0 4] [4 8] [8 10]]))
+        (checks-result c))))

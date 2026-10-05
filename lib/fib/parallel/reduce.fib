@@ -1,0 +1,73 @@
+;; fib.parallel.reduce: preduce and pfold with a deterministic fixed tree (P-struct and P-det, docs/design/parallelism.md 3.5).
+;;
+;;   (pfold combine reducef init xs)          ; Clojure's fold: `reducef` folds a chunk from `init`, `combine` joins chunk results
+;;   (preduce combine init f xs)              ; (combine acc (f x)) over xs
+;;   (preduce-n combine init f n)             ; the same over the indices [0, n)
+;;   (pfold-chunks p n combine init chunk-fn) ; the engine: `(chunk-fn lo hi)` is the result of the indices [lo, hi); no per-element call
+;;
+;; THE TREE. The indices are cut into chunks of a fixed GRAIN (`reduce-grain`, 65 536, unless the `Par` says otherwise), each chunk is
+;; reduced by the sequential kernel from `init`, and the chunk results are combined by a fixed balanced pairwise tree: level by level,
+;; adjacent pairs (r0 r1) (r2 r3) ..., an odd last result carried up unchanged, until one is left. Neither the grain nor the tree depends on
+;; the number of workers, and the sequential path (one worker) runs the same chunks and the same tree, so the result bits are the same for
+;; every worker count, for floating point too, where the order of the additions changes the bits. It differs from the strict left to
+;; right fold (`reduce`), which is a serial chain: it is the same value only for an exact (integer) or associative-in-practice combine.
+;; `combine` must be associative and `init` its identity (every chunk starts from it; the result for n = 0 is `init`).
+;;
+;; `:fast` (`(with (par) (fast true))`): one chunk per worker (grain = ceil(n / workers)) and a left to right combine. The result then
+;; depends on the worker count (the bits of a floating point sum differ); use it when the combine is exact or the bits do not matter.
+;;
+;; The per-element closures of `pfold` and `preduce` are called from several threads: a shared closure's count is an atomic, and with 8
+;; threads each call costs about 60 ns instead of 1 (measured; docs/design/parallelism.md 3.2). For a body that is cheap per element
+;; write a chunk function that loops itself and use `pfold-chunks`; the closure is then called once per chunk.
+(ns fib.parallel.reduce (:use fib.core fib.seq fib.coll fib.parallel.cpu fib.parallel.chunks))
+
+;; One level of the tree: the results in pairs, the odd one carried.
+(defun pair-up (combine: (fn (r r) r) level: (Vec r)) -> (Vec r)
+  (loop [i 0 out []]
+    (cond (>= i (vec-count level)) out
+          (= (+ i 1) (vec-count level)) (recur (+ i 2) (conj out (nth level i)))
+          :else (recur (+ i 2) (conj out (combine (nth level i) (nth level (+ i 1))))))))
+
+(defun tree-combine (combine: (fn (r r) r) init: r parts: (Vec r)) -> r
+  (if (= (vec-count parts) 0)
+      init
+      (loop [level parts]
+        (if (= (vec-count level) 1) (nth level 0) (recur (pair-up combine level))))))
+
+(defun left-combine (combine: (fn (r r) r) init: r parts: (Vec r)) -> r
+  (loop [i 0 acc init] (if (< i (vec-count parts)) (recur (+ i 1) (combine acc (nth parts i))) acc)))
+
+(defun fold-grain (p: Par n: i64) -> i64
+  (cond (> (. p grain) 0) (. p grain)
+        (. p fast) (max 1 (quot (+ n (- (max 1 (. p workers)) 1)) (max 1 (. p workers))))
+        :else (reduce-grain)))
+
+(defun pfold-chunks (p: Par n: i64 combine: (fn (r r) r) init: r chunk-fn: (fn :send (i64 i64) r)) -> r
+  (if (<= n 0)
+      init
+      (let [parts (run-chunks (. p workers) n (fold-grain p n) chunk-fn)]
+        (if (. p fast) (left-combine combine init parts) (tree-combine combine init parts)))))
+
+(defun fold-chunk (reducef: (fn (r a) r) init: r xs: (Vec a) lo: i64 hi: i64) -> r
+  (loop [i lo acc init] (if (< i hi) (recur (+ i 1) (reducef acc (nth xs i))) acc)))
+
+(defun fold-index-chunk (step: (fn (r i64) r) init: r lo: i64 hi: i64) -> r
+  (loop [i lo acc init] (if (< i hi) (recur (+ i 1) (step acc i)) acc)))
+
+(defn pfold
+  ([combine: (fn (r r) r) reducef: (fn :send (r a) r) init: r xs: (Vec a)] -> r
+    (pfold-chunks (par) (vec-count xs) combine init (fn (lo hi) (fold-chunk reducef init xs lo hi))))
+  ([p: Par combine: (fn (r r) r) reducef: (fn :send (r a) r) init: r xs: (Vec a)] -> r
+    (pfold-chunks p (vec-count xs) combine init (fn (lo hi) (fold-chunk reducef init xs lo hi)))))
+
+(defn preduce
+  ([combine: (fn :send (r r) r) init: r f: (fn :send (a) r) xs: (Vec a)] -> r
+    (pfold-chunks (par) (vec-count xs) combine init (fn (lo hi) (fold-chunk (fn (acc x) (combine acc (f x))) init xs lo hi))))
+  ([p: Par combine: (fn :send (r r) r) init: r f: (fn :send (a) r) xs: (Vec a)] -> r
+    (pfold-chunks p (vec-count xs) combine init (fn (lo hi) (fold-chunk (fn (acc x) (combine acc (f x))) init xs lo hi)))))
+
+(defn preduce-n
+  ([combine: (fn :send (r r) r) init: r f: (fn :send (i64) r) n: i64] -> r
+    (pfold-chunks (par) n combine init (fn (lo hi) (fold-index-chunk (fn (acc i) (combine acc (f i))) init lo hi))))
+  ([p: Par combine: (fn :send (r r) r) init: r f: (fn :send (i64) r) n: i64] -> r
+    (pfold-chunks p n combine init (fn (lo hi) (fold-index-chunk (fn (acc i) (combine acc (f i))) init lo hi)))))

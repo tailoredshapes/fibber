@@ -1,0 +1,26 @@
+;; pmap over 1e6 elements with a compute-bound body: 60 sqrt steps per element. Sequential Vec loop against pmap-each at 1, 2, 4, 8, 16, 28 workers.
+;; Run: ulimit -v 16000000; MALLOC_ARENA_MAX=2 flock /tmp/fibsuite.lock fibc run pmap-compute.fib -I lib
+(ns main (:use fib.core fib.parallel fib.os) (:require [fib.math :as math]))
+(defun unwrap-ok (r: (Result i64 OSError)) -> i64 (match r ((Ok v) v) ((Err e) 0)))
+(defun now-us () -> i64 (quot (unwrap-ok (monotonic-ns)) 1000))
+(defun ms (a: i64 b: i64) -> i64 (quot (- b a) 1000))
+(defun body (x: i64) -> f64
+  (loop [k 0 v (double x)] (if (< k 60) (recur (+ k 1) (math/sqrt (+ v 1.0))) v)))
+(defun seq-map (xs: (Vec i64)) -> (Vec f64)
+  (loop [i 0 out []] (if (< i (vec-count xs)) (recur (+ i 1) (conj out (body (nth xs i)))) out)))
+(defun main () -> i64
+  (let [xs (vec (range 1000000))
+        t0 (now-us) a (seq-map xs)
+        t1 (now-us) b1 (pmap-each [x xs (with (par) (workers 1))] (body x))
+        t2 (now-us) b2 (pmap-each [x xs (with (par) (workers 2))] (body x))
+        t3 (now-us) b4 (pmap-each [x xs (with (par) (workers 4))] (body x))
+        t4 (now-us) b8 (pmap-each [x xs (with (par) (workers 8))] (body x))
+        t5 (now-us) b16 (pmap-each [x xs (with (par) (workers 16))] (body x))
+        t6 (now-us) b28 (pmap-each [x xs (with (par) (workers 28))] (body x))
+        t7 (now-us) c (pmap body xs)
+        t8 (now-us)]
+    (do (println "sequential" (ms t0 t1) "ms")
+        (println "pmap-each workers 1:" (ms t1 t2) " 2:" (ms t2 t3) " 4:" (ms t3 t4) " 8:" (ms t4 t5) " 16:" (ms t5 t6) " 28:" (ms t6 t7))
+        (println "pmap (shared closure) default workers:" (ms t7 t8))
+        (println "equal" (= a b1) (= a b2) (= a b4) (= a b8) (= a b16) (= a b28) (= a c))
+        0)))

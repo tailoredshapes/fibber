@@ -1,0 +1,45 @@
+;; fib.parallel.scope: structured scopes (P-struct, docs/design/parallelism.md 3.2).
+;;
+;;   (with-tasks [s]                      ; a scope: every task forked in it is joined when the body is done
+;;     (let [a (fork s (fn () (parse x)))
+;;           b (fork s (fn () (parse y)))]
+;;       (+ @a @b)))
+;;
+;; `fork` is `spawn` that records the task in the scope. On exit `with-tasks` joins every task of the scope in the order of
+;; creation with `try-join` (so a trap in one does not stop the others being joined), then, if any of them trapped, traps in
+;; the scope's joiner with the FIRST trap's message, exactly as `join` of that task would. `try-with-tasks` returns
+;; `(Err (Trap message))` instead of trapping; the body's own value is `(Ok v)` otherwise.
+;;
+;; What it does not do (stage 1 of exceptions, docs/design/exceptions.md 8): the siblings of a task that trapped are NOT
+;; cancelled (there is no interrupt flag yet; they run to completion and are joined), a task that trapped abandons what its
+;; frames and its closure owned (the audit says `abandoned`), and a trap in the BODY of the scope (not in a task) ends the
+;; process as every trap outside a task does, without joining the scope's tasks. The scope has no bound on live tasks (every
+;; `fork` is an OS thread, one per task): code that forks per item must use `pmap`/`pfor`, which run at most `workers` tasks.
+;; A scope holds tasks of one result type `a` (a scope of `unit` tasks is the usual one for effects).
+(ns fib.parallel.scope (:use fib.core fib.seq fib.coll fib.async))
+
+(defstruct (Scope a) (tasks: (Cell (Vec (Task a)))))
+
+(defun new-scope () -> (Scope a) (Scope (cell [])))
+
+;; Starts `f` on a thread of its own and records it in the scope; the task can be waited for at once with `@t`.
+(defun fork (s: (Scope a) f: (fn :send () a)) -> (Task a)
+  (let [t (spawn f)]
+    (do (set! (. s tasks) (conj @(. s tasks) t)) t)))
+
+;; Joins every task of the scope, in the order of creation, and says what the first that trapped said, if any.
+(defun scope-failure (s: (Scope a)) -> (Option str)
+  (let [ts @(. s tasks)]
+    (loop [i 0 first-message nil]
+      (if (< i (vec-count ts))
+          (recur (+ i 1)
+                 (match (try-join (nth ts i))
+                   ((Err trap) (if (some? first-message) first-message (some (. trap message))))
+                   ((Ok v) first-message)))
+          first-message))))
+
+;; The exit of `with-tasks`: join everything, then trap with the first message.
+(defun scope-exit (s: (Scope a)) -> unit
+  (match (scope-failure s)
+    ((some message) (trap message))
+    (nil ())))
