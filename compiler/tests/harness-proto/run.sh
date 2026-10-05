@@ -6,7 +6,8 @@
 #   2. the Map contract passes against both implementations (12 of 12);
 #   3. a planted fault in the association list (assoc appends a duplicate key) fails exactly that scenario of that implementation and
 #      nothing of the library's Map: the fault is shown, then the tree's alist.fib is untouched (the plant is made in a copy);
-#   4. replay: the same seed gives the same report, another seed gives another counterexample draw.
+#   4. replay: the same seed gives the same report, another seed gives another counterexample draw;
+#   5. cases/: a spec file is also a `fibc cases` case, its verdict the exit value of `main`, its memory audit clean through the forks.
 # usage: compiler/tests/harness-proto/run.sh        environment: FIBC (a stage 2 with `unchecked-add`; default the tree's gate F), FIB_LIB
 #   (default this tree's lib), SCRATCH (default ~/.cache/fibber-scratch/harness-proto). Exit 0 when every check held.
 set -uo pipefail
@@ -46,6 +47,11 @@ check "3 planted fault: in the AList, in the replace scenario" \
 a=$("$S/spec" --only every-vector --seed 7); b=$("$S/spec" --only every-vector --seed 7); c=$("$S/spec" --only every-vector --seed 8)
 check "4 same seed, same report" "$a" "$b"
 check "4 another seed, another draw" "$([ "$a" != "$c" ] && echo differ || echo same)" differ
+
+out=$("$FIBC" cases "$R/compiler/tests/harness-proto/cases"); st=$?
+echo "$out"
+check "5 spec files as cases (verdict = the run's exit value, audit clean in the parent and the forked children)" \
+  "$(echo "$out" | grep -E '^[0-9]+ cases:')" "3 cases: 3 pass, 0 fail, 0 pending, 0 header error"
 
 echo "harness-proto: $fails failed"
 exit $((fails > 0))
