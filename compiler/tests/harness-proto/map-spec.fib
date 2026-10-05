@@ -1,0 +1,29 @@
+;; The prototype's spec file: the Map contract against two implementations, a plain feature with a scenario that fails and one that
+;; traps, and two properties (one false). `fibc run map-spec.fib -- [--only S] [--seed N] [-j N] [--format json] [--list]`.
+(ns main (:use fib.test.core fib.test.gen fib.test.run map-contract alist))
+
+(defun std-map () -> (Map i64 i64) (map-empty))
+
+(defspecs specs
+  (implements MapContract "Map" (fn () (std-map)))
+  (implements MapContract "AList" (fn () (alist-empty)))
+  (feature "Vec"
+    (scenario "conj appends"
+      (given [v [1 2]])
+      (upon [w (conj v 3)])
+      (then (expect = [1 2 3] w) (expect = 3 (count w))))
+    (scenario "a wrong claim is reported, not fatal (planted)"
+      (given [v [1 2]])
+      (then (expect = 5 (count v))))
+    (scenario "a trap is isolated (planted)"
+      (given [v [1 2]])
+      (then (expect = 9 (nth v 7))))
+    (outline "quot and rem follow Clojure's truncation" [a b q r] [[7 2 3 1] [-7 2 -3 -1] [7 -2 -3 1] [-7 -2 3 -1]]
+      (covers "quot" "rem")
+      (then (expect = q (quot a b)) (expect = r (rem a b))))
+    (prop "reverse twice is the identity" [x (gen-vec (gen-i64))]
+      (= (vec (reverse (vec (reverse x)))) x))
+    (prop "every vector is shorter than 3 (planted, false)" [x (gen-vec (gen-i64))]
+      (< (count x) 3))))
+
+(defun main () -> i64 (run-main (specs)))

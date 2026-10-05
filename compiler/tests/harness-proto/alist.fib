@@ -1,0 +1,36 @@
+;; A trivial association-list map from i64 to i64, written for the test: the second implementation of the Map contract. Newest
+;; entry first; lookup scans.
+(ns alist)
+
+(defstruct AList (ks: (Vec i64) vs: (Vec i64)))
+
+(defun alist-empty () -> AList (AList [] []))
+
+(defun alist-find :private (a: AList k: i64) -> i64
+  (loop ((i 0))
+    (cond (>= i (count (. a ks))) -1
+          (= (nth (. a ks) i) k) i
+          :else (recur (+ i 1)))))
+
+(impl (Lookup i64 i64) AList
+  (get (self k)
+    (let ((i (alist-find self k)))
+      (if (< i 0) nil (some (nth (. self vs) i))))))
+
+(impl (Keyed i64) AList
+  (contains? (self k) (>= (alist-find self k) 0)))
+
+(impl (Assoc i64 i64) AList
+  (assoc (self k v)
+    (let ((i (alist-find self k)))
+      (if (< i 0)
+          (AList (conj (. self ks) k) (conj (. self vs) v))
+          (AList (. self ks) (assoc (. self vs) i v))))))
+
+(impl (Dissoc i64) AList
+  (dissoc (self k)
+    (let ((i (alist-find self k)))
+      (if (< i 0)
+          self
+          (AList (vec (concat (take i (. self ks)) (drop (+ i 1) (. self ks))))
+                 (vec (concat (take i (. self vs)) (drop (+ i 1) (. self vs)))))))))
