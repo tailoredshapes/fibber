@@ -18,6 +18,11 @@
         (t/from-array [n] @buf 0.0f32))))
 (defun mat (m: i64 n: i64 seed: i64) -> (t/Tensor f32) (t/reshape [m n] (gen (* m n) seed)))
 
+;; The product the target's kernel computes (lib/fib/tensor/linalg.fib; `(has-fma)` is a constant of the target): the fused chain with a hardware fma, else the
+;; ordered multiply-then-add chain of `mmul-scalar`.
+(defun reference (a: (t/Tensor f32) b: (t/Tensor f32)) -> (t/Tensor f32)
+  (if (has-fma) (g/fma-reference a b) (t/mmul-scalar a b)))
+
 (defun act (name: keyword x: f32) -> f32
   (let ((d (double x)))
     (cond (= name :identity) x
@@ -47,13 +52,13 @@
             (dotimes (ni (count ns))
               (dotimes (ki (count ks))
                 (let ((m (nth ms mi)) (n (nth ns ni)) (k (nth ks ki)) (a (mat m k 1)) (b (mat k n 2)) (bias (gen n 3)))
-                  (check c (matches? :relu (t/dense a b bias :relu) (g/fma-reference a b) bias)))))))
+                  (check c (matches? :relu (t/dense a b bias :relu) (reference a b) bias)))))))
         ;; every activation on a shape with tails in all three directions and two inner blocks
         (let ((a (mat 13 700 1)) (b (mat 700 40 2)) (bias (gen 40 3)) (ns (names)))
           (dotimes (i (count ns))
-            (check c (matches? (nth ns i) (t/dense a b bias (nth ns i)) (g/fma-reference a b) bias))))
+            (check c (matches? (nth ns i) (t/dense a b bias (nth ns i)) (reference a b) bias))))
         ;; a scalar bias, a stepped slice and a broadcast row as bias, mmul-bias
-        (let ((a (mat 7 9 4)) (b (mat 9 21 5)) (p (g/fma-reference a b)))
+        (let ((a (mat 7 9 4)) (b (mat 9 21 5)) (p (reference a b)))
           (do (check c (matches? :relu (t/dense a b (t/full [] -0.5f32) :relu) p (t/full [] -0.5f32)))
               (let ((wide (gen 42 6)) (sl (t/slice 0 1 42 2 wide)))
                 (check c (matches? :identity (t/mmul-bias a b sl) p sl)))
@@ -61,12 +66,12 @@
                 (check c (matches? :relu (t/dense a b (t/reshape [21] (t/copy row)) :relu) p (t/copy row))))))
         ;; views as operands: transposed, flipped, a slice
         (let ((a (mat 19 23 5)) (b (mat 23 21 6)) (at (t/transpose (mat 23 19 5))) (bt (t/transpose (mat 21 23 6))) (bias (gen 21 8)))
-          (do (check c (matches? :relu (t/dense at b bias :relu) (g/fma-reference at b) bias))
-              (check c (matches? :gelu (t/dense a bt bias :gelu) (g/fma-reference a bt) bias))
+          (do (check c (matches? :relu (t/dense at b bias :relu) (reference at b) bias))
+              (check c (matches? :gelu (t/dense a bt bias :gelu) (reference a bt) bias))
               (let ((fa (t/flip 1 a)) (fb (t/flip 0 b)))
-                (check c (matches? :silu (t/dense fa fb bias :silu) (g/fma-reference fa fb) bias)))
+                (check c (matches? :silu (t/dense fa fb bias :silu) (reference fa fb) bias)))
               (let ((sa (t/slice 1 1 23 2 a)) (sb (t/slice 0 1 23 2 b)))
-                (check c (matches? :relu (t/dense sa sb bias :relu) (g/fma-reference sa sb) bias)))))
+                (check c (matches? :relu (t/dense sa sb bias :relu) (reference sa sb) bias)))))
         ;; negative pre-activations stay negative for identity and become +0.0 for relu (the sign of zero is part of `where`)
         (let ((a (t/full [3 4] -1.0f32)) (b (t/full [4 5] 1.0f32)) (bias (t/full [5] 0.0f32)))
           (do (check c (= (t/to-vec (t/dense a b bias :relu)) (t/to-vec (t/zeros-f32 [3 5]))))
