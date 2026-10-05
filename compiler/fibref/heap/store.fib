@@ -1,0 +1,60 @@
+;; compiler/fibref/heap/store.fib: what may be stored where (types section 6.7, 6.11, 8.2), and the one place that installs a new object and retains its
+;; fields. OWNER: package F1. Rust: heap/store.rs. The holders: a counted heap object, an IMMORTAL object, a STACK object of a scope.
+;;  - a heap object may hold a Ref to a live heap or immortal object, never to a stack object (StackRefInHeap);
+;;  - a stack object of scope s may also hold a Ref to a stack object of s or of an earlier scope, never of a later one (StackRefIntoOuterScope);
+;;  - an immortal object holds only immortal objects (ImmortalHoldsMortal); no one holds a Weak to a stack object (WeakToStack).
+(ns fibref.heap.store
+  (:use fibref.value fibref.heap.types fibref.heap.state))
+
+;; A holder is encoded as an i64: -1 a heap object, -2 an immortal object, n >= 0 a stack object of scope n.
+(def holder-heap: i64 -1)
+(def holder-immortal: i64 -2)
+
+(defun hp-holder-of (h: Heap id: i64) -> i64
+  (cond (hp-stack? h id) (hp-scope-of h id)
+        (hp-immortal? h id) holder-immortal
+        :else holder-heap))
+
+;; Whether a holder may hold a Ref to the live object `id`.
+(defun hp-check-ref-target (h: Heap id: i64 holder: i64) -> (Result unit HpErr)
+  (cond (hp-immortal? h id) (Ok ())
+        (= holder holder-immortal) (Err (HeImmortalHoldsMortal id))
+        (and (= holder holder-heap) (hp-stack? h id)) (Err (HeStackRefInHeap id))
+        (and (>= holder 0) (hp-stack? h id) (> (hp-scope-of h id) holder)) (Err (HeStackRefIntoOuterScope id holder))
+        :else (Ok ())))
+
+(defun hp-check-weak-target (h: Heap id: i64 holder: i64) -> (Result unit HpErr)
+  (cond (not (hp-known? h id)) (Err (HeUnknownId id))
+        (hp-stack? h id) (Err (HeWeakToStack id))
+        (and (= holder holder-immortal) (not (hp-immortal? h id))) (Err (HeImmortalHoldsMortal id))
+        :else (Ok ())))
+
+;; Whether `v` may be stored into an object of `holder`: a Ref must name a live object the holder may hold, a Weak a known object that is not on the
+;; stack, scalars always (store.rs check_storable).
+(defun hp-check-storable (h: Heap v: IVal holder: i64) -> (Result unit HpErr)
+  (match (ival-obj v)
+    ((some id) (try-let [_ (hp-live-object h id HpStore)] (hp-check-ref-target h id holder)))
+    (nil (match (ival-weak v)
+           ((some id) (hp-check-weak-target h id holder))
+           (nil (Ok ()))))))
+
+;; A new object's fields: a Cell or Atom has exactly one, and each must be storable into `holder` (store.rs check_new).
+(defun hp-check-new (h: Heap kind: IKind fields: (Vec IVal) holder: i64) -> (Result unit HpErr)
+  (if (and (kind-mutable? kind) (not= (count fields) 1))
+      (Err (HeWrongSlotCount kind (count fields)))
+      (loop [i 0]
+        (if (>= i (count fields))
+            (Ok ())
+            (match (hp-check-storable h (nth fields i) holder)
+              ((Err e) (Err e))
+              ((Ok _) (recur (+ i 1))))))))
+
+;; Adds an already validated object: the event first (built by the caller with the id the object will get), then one Retain per field that is a Ref
+;; to a counted object, in field order. Returns the new id (store.rs install).
+(defun hp-install (h: Heap kind: IKind tid: i64 cnt: i64 flags: i64 scope: i64 fields: (Vec IVal) ev: HpEvent) -> i64
+  (let [id (hp-push h kind tid cnt flags scope fields)]
+    (do (hp-emit h ev)
+        (loop [i 0]
+          (if (>= i (count fields))
+              id
+              (do (hp-retain-stored h (nth fields i)) (recur (+ i 1))))))))

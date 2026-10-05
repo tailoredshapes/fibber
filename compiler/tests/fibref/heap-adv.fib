@@ -1,0 +1,150 @@
+;; compiler/tests/fibref/heap-adv.fib: the adversarial heap cases: the graph search the audit uses (scc.rs unit tests), scale (long chains, long cycles, a wide
+;; object: no recursion, so no stack overflow), the order of events (alloc retains in field order, sharing depth first, share before retain and write) and
+;; rollback (a refused operation changes nothing). Ports crates/fibref/src/heap/scc.rs tests and crates/fibref/tests/heap_adversarial/{scale,order,
+;; rollback}.rs at seed-1; the chains are 30000 long, not 200000 (the Rust ran them in release builds). Exit status: the number of failed tests.
+(ns main (:use fibref.value fibref.heap fibref.heap.scc fibref.trace heaptk))
+
+;; ================= scc.rs =================
+(defun adj-chain (n: i64) -> (Vec (Vec i64))
+  (mapv (fn (k: i64) (if (< (+ k 1) n) [(+ k 1)] (vec-empty))) (range n)))
+
+(defun t-scc-acyclic-graph-has-no-cyclic-nodes () -> str
+  (ck "none" (= (count (hp-cyclic-nodes [[1] [2] []])) 0)))
+
+(defun t-scc-two-cycle () -> str
+  (let [c (hp-cyclic-nodes [[1] [0] [0]])]
+    (all [(ck "0 in" (contains? c 0)) (ck "1 in" (contains? c 1)) (ck "2 out" (not (contains? c 2)))])))
+
+(defun t-scc-self-loop-is-cyclic () -> str
+  (ck "self loop" (contains? (hp-cyclic-nodes [[0]]) 0)))
+
+(defun t-scc-a-long-chain-does-not-overflow () -> str
+  (ck "chain" (= (count (hp-cyclic-nodes (adj-chain 50000))) 0)))
+
+(defun t-scc-a-long-cycle-is-one-component () -> str
+  (let [n 50000 adj (mapv (fn (k: i64) [(rem (+ k 1) n)]) (range n))]
+    (ck "all cyclic" (= (count (hp-cyclic-nodes adj)) n))))
+
+(defun t-scc-two-separate-cycles-and-a-bridge () -> str
+  (let [c (hp-cyclic-nodes [[1] [0 2] [3] [2 4] []])]
+    (ck "0 1 2 3 cyclic, 4 not" (and (= (count c) 4) (not (contains? c 4))))))
+
+;; ================= scale.rs =================
+(defun chain-of-cells (h: Heap n: i64) -> i64
+  (loop [k 1 head (cell-of h INone)]
+    (if (>= k n)
+        head
+        (let [next (cell-of h (obj head))] (do (rel h head) (recur (+ k 1) next))))))
+
+(defun t-a-long-chain-of-cells-frees-without-stack-overflow () -> str
+  (let [h (heap-new) n 30000 head (chain-of-cells h n) r (is-ok "release" (heap-release h head)) rep (heap-finish h)]
+    (all [r (ck "clean" (report-clean? rep)) (ck "freed all" (= (. rep freed) n))])))
+
+(defun t-a-long-tail-off-a-cycle-is-leak-cycle-without-overflow () -> str
+  (let [h (heap-new) n 30000 c (cell-of h INone) tail (chain-of-cells h n) node (imm h [(obj c) (obj tail)]) _w (wr h c 0 (obj node))
+        _a (rel h tail) _b (rel h node) _d (rel h c) r (heap-finish h)]
+    (all [(ck "cycle only" (report-cycle-leak-only? r)) (ck "all leak-cycle" (= (count (report-ids-in r HpLeakCycle)) (+ n 2)))])))
+
+(defun t-a-long-leaked-chain-is-classified-without-overflow () -> str
+  (let [h (heap-new) n 30000 _head (chain-of-cells h n) r (heap-finish h)]
+    (all [(ck "leaks" (= (count (report-ids-in r HpLeak)) n)) (ck "no cycle class" (= (count (report-ids-in r HpLeakCycle)) 0))])))
+
+(defun t-a-long-cycle-through-one-cell-is-leak-cycle-without-overflow () -> str
+  (let [h (heap-new) n 30000 c (cell-of h INone) head (loop [k 1 hd (imm h [(obj c)])] (if (>= k n) hd (let [nx (imm h [(obj hd)])] (do (rel h hd) (recur (+ k 1) nx)))))
+        _w (wr h c 0 (obj head)) _a (rel h head) _b (rel h c) r (heap-finish h)]
+    (all [(ck "cycle only" (report-cycle-leak-only? r)) (ck "all leak-cycle" (= (count (report-ids-in r HpLeakCycle)) (+ n 1)))])))
+
+(defun t-a-wide-object-frees-every-child () -> str
+  (let [h (heap-new) n 20000 kids (mapv (fn (k: i64) (obj (imm h []))) (range n)) parent (imm h kids)
+        _r (loop [k 0] (if (>= k n) () (do (rel h k) (recur (+ k 1))))) rep0 (is-ok "release parent" (heap-release h parent)) rep (heap-finish h)]
+    (all [rep0 (ck "clean" (report-clean? rep)) (ck "freed all" (= (. rep freed) (+ n 1)))])))
+
+(defun t-a-long-chain-crosses-a-thread-without-overflow () -> str
+  (let [h (heap-new) n 30000 head (loop [k 1 hd (imm h [])] (if (>= k n) hd (let [nx (imm h [(obj hd)])] (do (rel h hd) (recur (+ k 1) nx)))))
+        r (is-ok "share" (heap-mark-shared h head))]
+    (all [r (is-bool "tail shared" (heap-is-shared h 0) true) (is-ok "release" (heap-release h head)) (ck "clean" (clean? h))])))
+
+;; ================= order.rs =================
+(defun t-alloc-traces-one-retain-per-ref-field-in-field-order () -> str
+  (let [h (heap-new) a (imm h []) b (imm h []) c (imm h []) s (nev h) _p (imm h [(obj b) (i 1) (obj a) (obj b) (obj c)])]
+    (ck (evs-from h s) (= (evs-from h s) "alloc #3 immutable;retain #1 -> 2;retain #0 -> 2;retain #1 -> 3;retain #2 -> 2;"))))
+
+(defun t-mark-shared-traces-depth-first-in-field-order () -> str
+  (let [h (heap-new) l1 (imm h []) l2 (imm h []) l3 (imm h []) m1 (imm h [(obj l1) (obj l2)]) root (imm h [(obj m1) (obj l3)]) s (nev h)
+        r (is-ok "share" (heap-mark-shared h root))]
+    (all [r (ck (evs-from h s) (= (evs-from h s) "shared #4;shared #3;shared #0;shared #1;shared #2;"))])))
+
+(defun t-write-into-a-shared-atom-traces-shared-before-retain-and-write () -> str
+  (let [h (heap-new) a (atom-of h INone) _s (ok! (heap-mark-shared h a)) v (imm h []) s (nev h)]
+    (all [(is-ok "write" (heap-write h a 0 (obj v))) (ck (evs-from h s) (= (evs-from h s) "shared #1;retain #1 -> 2;write #0.0;"))])))
+
+(defun t-ids-stay-unique-across-interleaved-alloc-and-free () -> str
+  (let [h (heap-new) ids (loop [k 0 acc (vec-empty)] (if (>= k 100) acc (let [x (imm h [])] (do (if (= (rem k 3) 0) (rel h x) ()) (recur (+ k 1) (conj acc x))))))]
+    (ck "all distinct and increasing" (= ids (vec (range 100))))))
+
+;; ================= rollback.rs =================
+(defun t-a-write-of-nil-over-a-dangling-slot-reports-the-double-free-once () -> str
+  (let [h (heap-new) x (imm h []) c (cell-of h (obj x)) _a (rel h x) _b (rel h x) before (nev h)]
+    (all [(is-err "write" (heap-write h c 0 INone) "double free: release of freed object #0") (ck "no events" (= (nev h) before))
+          (is-val "slot kept" (heap-read h c 0) (obj x))])))
+
+(defun t-a-write-into-a-shared-atom-that-fails-on-a-cell-retains-and-shares-nothing () -> str
+  (let [h (heap-new) a (atom-of h (i 0)) _s (ok! (heap-mark-shared h a)) c (cell-of h INone) inner (imm h [(obj c)]) outer (imm h [(obj inner)]) before (nev h)]
+    (all [(is-err "write" (heap-write h a 0 (obj outer)) "cell #1 would cross a thread boundary") (ck "no events" (= (nev h) before))
+          (is-int "outer count" (heap-count h outer) 1) (is-int "inner count" (heap-count h inner) 2)
+          (is-bool "outer" (heap-is-shared h outer) false) (is-bool "inner" (heap-is-shared h inner) false)])))
+
+(defun t-a-failed-alloc-after-a-valid-prefix-retains-nothing () -> str
+  (let [h (heap-new) a (imm h []) b (imm h []) dead (imm h []) _r (rel h dead) before (nev h)]
+    (all [(is-err "alloc" (heap-alloc h IImmutable 0 [(obj a) (obj b) (obj dead) (obj a)]) "use after free: store of freed object #2")
+          (is-int "a" (heap-count h a) 1) (is-int "b" (heap-count h b) 1) (ck "events" (= (nev h) before))])))
+
+(defun t-writing-a-ref-that-only-the-old-value-kept-alive-keeps-it-alive () -> str
+  (let [h (heap-new) v (imm h []) holder (imm h [(obj v)]) c (cell-of h (obj holder)) _a (rel h v) _b (rel h holder)]
+    (all [(is-ok "write v over holder" (heap-write h c 0 (obj v))) (ck "v live" (heap-is-live h v)) (is-int "v count" (heap-count h v) 1)
+          (ck "holder freed" (not (heap-is-live h holder)))])))
+
+;; ================= the audit line (compiler/tests/golden/fibref/run-ownership.txt formats) =================
+(defun t-the-audit-line-of-a-clean-run () -> str
+  (let [h (heap-new) a (imm h []) _r (rel h a) l (audit-line (heap-finish h))]
+    (ck l (= l "clean=true leak-cycles=0 leaks=0 errors=0"))))
+
+(defun t-the-audit-line-of-a-cycle-leak () -> str
+  (let [h (heap-new) c (cell-of h INone) v (imm h [(obj c)]) _w (wr h c 0 (obj v)) _a (rel h v) _b (rel h c) l (audit-line (heap-finish h))]
+    (ck l (= l "clean=false leak-cycles=2 leaks=0 errors=0"))))
+
+(defun t-the-audit-line-of-a-leak-a-dangling-ref-and-an-open-scope () -> str
+  (let [h1 (heap-new) _a (imm h1 [])
+        h2 (heap-new) x (imm h2 []) c (cell-of h2 INone) v (imm h2 [(obj c) (obj x)]) _w (wr h2 c 0 (obj v)) _1 (rel h2 v) _2 (rel h2 c) _3 (rel h2 x) _4 (rel h2 x)
+        h3 (heap-new) _s (heap-open-scope h3)
+        l1 (audit-line (heap-finish h1)) l2 (audit-line (heap-finish h2)) l3 (audit-line (heap-finish h3))]
+    (all [(ck l1 (= l1 "clean=false leak-cycles=0 leaks=1 errors=0"))
+          (ck l2 (= l2 "clean=false leak-cycles=2 leaks=0 errors=1 [dangling reference #2.1 -> #0]"))
+          (ck l3 (= l3 "clean=false leak-cycles=0 leaks=0 errors=1 [scope 0 never ended]"))])))
+
+(defun main () -> i64
+  (min 100
+    (run-suite "heap-adv"
+      [(tc "scc-acyclic" t-scc-acyclic-graph-has-no-cyclic-nodes)
+       (tc "scc-two-cycle" t-scc-two-cycle)
+       (tc "scc-self-loop" t-scc-self-loop-is-cyclic)
+       (tc "scc-long-chain" t-scc-a-long-chain-does-not-overflow)
+       (tc "scc-long-cycle" t-scc-a-long-cycle-is-one-component)
+       (tc "scc-two-cycles-and-a-bridge" t-scc-two-separate-cycles-and-a-bridge)
+       (tc "scale-chain-of-cells" t-a-long-chain-of-cells-frees-without-stack-overflow)
+       (tc "scale-tail-off-a-cycle" t-a-long-tail-off-a-cycle-is-leak-cycle-without-overflow)
+       (tc "scale-leaked-chain" t-a-long-leaked-chain-is-classified-without-overflow)
+       (tc "scale-long-cycle" t-a-long-cycle-through-one-cell-is-leak-cycle-without-overflow)
+       (tc "scale-wide-object" t-a-wide-object-frees-every-child)
+       (tc "scale-chain-crosses-thread" t-a-long-chain-crosses-a-thread-without-overflow)
+       (tc "order-alloc-retains" t-alloc-traces-one-retain-per-ref-field-in-field-order)
+       (tc "order-shared-dfs" t-mark-shared-traces-depth-first-in-field-order)
+       (tc "order-shared-before-retain-and-write" t-write-into-a-shared-atom-traces-shared-before-retain-and-write)
+       (tc "order-ids-unique" t-ids-stay-unique-across-interleaved-alloc-and-free)
+       (tc "rollback-nil-over-dangling" t-a-write-of-nil-over-a-dangling-slot-reports-the-double-free-once)
+       (tc "rollback-shared-atom-cell" t-a-write-into-a-shared-atom-that-fails-on-a-cell-retains-and-shares-nothing)
+       (tc "rollback-failed-alloc-prefix" t-a-failed-alloc-after-a-valid-prefix-retains-nothing)
+       (tc "rollback-old-value-kept-alive" t-writing-a-ref-that-only-the-old-value-kept-alive-keeps-it-alive)
+       (tc "audit-line-clean" t-the-audit-line-of-a-clean-run)
+       (tc "audit-line-cycle" t-the-audit-line-of-a-cycle-leak)
+       (tc "audit-line-leak-dangling-scope" t-the-audit-line-of-a-leak-a-dangling-ref-and-an-open-scope)])))

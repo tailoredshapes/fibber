@@ -13,6 +13,8 @@
   (IKw name: str)
   (IPtr addr: i64)                ;; an address in the interpreter's raw arena (fibref.builtins), 0 is null
   (ITag tag: i64)
+  (IWeak id: i64)                 ;; a weak reference to an object of the heap (not counted); the heap's `Weak` of seed-1 (heap/value.rs)
+  ITaken                          ;; a slot whose content was moved out (steal, take, move-in): the null of the compiled code; the heap audits it
   (IObj id: i64)                  ;; a counted, stack or immortal object of the heap
   INone
   (ISome v: IVal))
@@ -21,4 +23,32 @@
 (defenum IKind IImmutable ICell IAtom)
 
 ;; The object id a value carries, if any (a retain or release of a value with none is a no-op, as in the emitter). Rust: value.rs
-(defun ival-obj (v: IVal) -> (Option i64) (trap "todo: fibref.value ival-obj"))
+(defun ival-obj (v: IVal) -> (Option i64)
+  (match v
+    ((IObj id) (some id))
+    ((ISome x) (ival-obj x))
+    (_ nil)))
+
+;; The object a weak value names, if it is one (an `IWeak`, or an `ISome` of one).
+(defun ival-weak (v: IVal) -> (Option i64)
+  (match v
+    ((IWeak id) (some id))
+    ((ISome x) (ival-weak x))
+    (_ nil)))
+
+;; Structural equality of two values (floats by value, an object by id): the model has no derived Eq.
+(defun ival-eq (a: IVal b: IVal) -> bool
+  (match a
+    ((IUnit) (match b ((IUnit) true) (_ false)))
+    ((IBool x) (match b ((IBool y) (= x y)) (_ false)))
+    ((IInt x w) (match b ((IInt y v) (and (= x y) (= w v))) (_ false)))
+    ((IFloat x w) (match b ((IFloat y v) (and (= x y) (= w v))) (_ false)))
+    ((IChar x) (match b ((IChar y) (= x y)) (_ false)))
+    ((IKw x) (match b ((IKw y) (= x y)) (_ false)))
+    ((IPtr x) (match b ((IPtr y) (= x y)) (_ false)))
+    ((ITag x) (match b ((ITag y) (= x y)) (_ false)))
+    ((IWeak x) (match b ((IWeak y) (= x y)) (_ false)))
+    ((IObj x) (match b ((IObj y) (= x y)) (_ false)))
+    ((ITaken) (match b ((ITaken) true) (_ false)))
+    ((INone) (match b ((INone) true) (_ false)))
+    ((ISome x) (match b ((ISome y) (ival-eq x y)) (_ false)))))

@@ -1,0 +1,111 @@
+;; compiler/fibref/heap/state.fib: the object table, its columns and the checks every operation starts with. OWNER: package F1.
+;; Rust: heap/mod.rs (object, live_object, check_count_op), object.rs, value.rs. Every column is a cell updated with `update!` (in place when unique).
+(ns fibref.heap.state
+  (:use fibref.value fibref.heap.types))
+
+(defun kind-code (k: IKind) -> i64
+  (match k ((IImmutable) 0) ((ICell) 1) ((IAtom) 2)))
+
+(defun code-kind (c: i64) -> IKind
+  (cond (= c 1) ICell (= c 2) IAtom :else IImmutable))
+
+(defun kind-mutable? (k: IKind) -> bool
+  (match k ((IImmutable) false) (_ true)))
+
+;; ---- reading the columns ----
+(defun hp-size (h: Heap) -> i64 (count @(. h kinds)))
+(defun hp-known? (h: Heap id: i64) -> bool (and (>= id 0) (< id (hp-size h))))
+(defun hp-count-of (h: Heap id: i64) -> i64 (nth @(. h counts) id))
+(defun hp-flags-of (h: Heap id: i64) -> i64 (nth @(. h flags) id))
+(defun hp-kind-of (h: Heap id: i64) -> IKind (code-kind (nth @(. h kinds) id)))
+(defun hp-tid-of (h: Heap id: i64) -> i64 (nth @(. h tids) id))
+(defun hp-scope-of (h: Heap id: i64) -> i64 (nth @(. h scopes) id))
+(defun hp-fields-of (h: Heap id: i64) -> (Vec IVal) (nth @(. h fields) id))
+(defun hp-flag? (h: Heap id: i64 bit: i64) -> bool (not= 0 (bit-and (hp-flags-of h id) bit)))
+(defun hp-live? (h: Heap id: i64) -> bool (and (hp-known? h id) (hp-flag? h id fl-live)))
+(defun hp-immortal? (h: Heap id: i64) -> bool (hp-flag? h id fl-immortal))
+(defun hp-shared? (h: Heap id: i64) -> bool (hp-flag? h id fl-shared))
+(defun hp-stack? (h: Heap id: i64) -> bool (>= (hp-scope-of h id) 0))
+;; Counted: neither IMMORTAL nor STACK. True of a freed heap object too, so that releasing one is caught as a double free (object.rs `counted`).
+(defun hp-counted? (h: Heap id: i64) -> bool (and (not (hp-immortal? h id)) (not (hp-stack? h id))))
+(defun hp-field-count (h: Heap id: i64) -> i64 (count (hp-fields-of h id)))
+
+;; ---- writing the columns ----
+(defun hp-set-count (h: Heap id: i64 n: i64) -> unit
+  (update! (. h counts) (fn (v: (Vec i64)) (assoc v id n))))
+(defun hp-set-flags (h: Heap id: i64 f: i64) -> unit
+  (update! (. h flags) (fn (v: (Vec i64)) (assoc v id f))))
+(defun hp-set-flag (h: Heap id: i64 bit: i64) -> unit
+  (hp-set-flags h id (bit-or (hp-flags-of h id) bit)))
+(defun hp-clear-flag (h: Heap id: i64 bit: i64) -> unit
+  (hp-set-flags h id (- (bit-or (hp-flags-of h id) bit) bit)))
+(defun hp-set-fields (h: Heap id: i64 fs: (Vec IVal)) -> unit
+  (update! (. h fields) (fn (v: (Vec (Vec IVal))) (assoc v id fs))))
+(defun hp-set-field (h: Heap id: i64 field: i64 x: IVal) -> unit
+  (hp-set-fields h id (assoc (hp-fields-of h id) field x)))
+
+(defun hp-emit (h: Heap ev: HpEvent) -> unit
+  (update! (. h log) (fn (v: (Vec HpEvent)) (conj v ev))))
+
+;; A new object's row, count and flags as given; returns its id (ids are never reused).
+(defun hp-push (h: Heap kind: IKind tid: i64 cnt: i64 flags: i64 scope: i64 fs: (Vec IVal)) -> i64
+  (let [id (hp-size h)]
+    (do (update! (. h kinds) (fn (v: (Vec i64)) (conj v (kind-code kind))))
+        (update! (. h tids) (fn (v: (Vec i64)) (conj v tid)))
+        (update! (. h counts) (fn (v: (Vec i64)) (conj v cnt)))
+        (update! (. h flags) (fn (v: (Vec i64)) (conj v flags)))
+        (update! (. h scopes) (fn (v: (Vec i64)) (conj v scope)))
+        (update! (. h fields) (fn (v: (Vec (Vec IVal))) (conj v fs)))
+        id)))
+
+;; Marks the object freed (or, for a stack object, ended) and drops its fields: the references among them are released by the cascade that planned
+;; this free (object.rs `free`).
+(defun hp-free-slot (h: Heap id: i64) -> unit
+  (do (hp-clear-flag h id fl-live)
+      (hp-set-count h id 0)
+      (hp-set-fields h id (vec-empty))))
+
+;; ---- the checks every operation starts with ----
+(defun hp-object (h: Heap id: i64) -> (Result unit HpErr)
+  (if (hp-known? h id) (Ok ()) (Err (HeUnknownId id))))
+
+;; The object must be live for `op`: not freed (UseAfterFree) and, for a stack object, its scope not ended (StackUseAfterScope).
+(defun hp-live-object (h: Heap id: i64 op: HpOp) -> (Result unit HpErr)
+  (cond (not (hp-known? h id)) (Err (HeUnknownId id))
+        (hp-flag? h id fl-live) (Ok ())
+        (hp-stack? h id) (Err (HeStackUseAfterScope id op))
+        :else (Err (HeUseAfterFree id op))))
+
+;; Whether a count operation on `id` counts: false for an immortal object or a live stack object (types section 8.2); StackUseAfterScope once a stack
+;; object's scope has ended (mod.rs check_count_op).
+(defun hp-check-count-op (h: Heap id: i64 op: HpOp) -> (Result bool HpErr)
+  (cond (not (hp-known? h id)) (Err (HeUnknownId id))
+        (hp-stack? h id) (if (hp-flag? h id fl-live) (Ok false) (Err (HeStackUseAfterScope id op)))
+        :else (Ok (not (hp-immortal? h id)))))
+
+;; The object `v` holds a count on, if any: the target of a Ref that is neither IMMORTAL nor STACK. A Ref to a freed heap object still counts, so that
+;; releasing it is caught (store.rs counted_target).
+(defun hp-counted-target (h: Heap v: IVal) -> (Option i64)
+  (match (ival-obj v)
+    ((some id) (if (and (hp-known? h id) (hp-counted? h id)) (some id) nil))
+    (nil nil)))
+
+;; Count += 1 on an object known to be live and counted; returns the count after (mod.rs bump).
+(defun hp-bump (h: Heap id: i64) -> i64
+  (let [n (+ (hp-count-of h id) 1)]
+    (do (hp-set-count h id n)
+        (hp-emit h (EvRetain id n))
+        n)))
+
+;; Retains what storing `v` counts: +1 and a Retain event for a Ref to a counted object, nothing otherwise (store.rs retain_stored).
+(defun hp-retain-stored (h: Heap v: IVal) -> unit
+  (match (hp-counted-target h v)
+    ((some t) (do (hp-bump h t) ()))
+    (nil ())))
+
+;; Every live counted object's id, in allocation order (mod.rs live_counted_ids).
+(defun hp-live-counted-ids (h: Heap) -> (Vec i64)
+  (loop [i 0 acc (vec-empty)]
+    (cond (>= i (hp-size h)) acc
+          (and (hp-live? h i) (hp-counted? h i)) (recur (+ i 1) (conj acc i))
+          :else (recur (+ i 1) acc))))

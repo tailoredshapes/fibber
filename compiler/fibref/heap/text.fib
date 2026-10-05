@@ -1,0 +1,51 @@
+;; compiler/fibref/heap/text.fib: the text of an audit error (heap/error.rs Display), as `fibref run` prints it. OWNER: package F1.
+(ns fibref.heap.text
+  (:use fibref.value fibref.heap.types))
+
+(defun hp-op-text (op: HpOp) -> str
+  (match op
+    ((HpRetain) "retain") ((HpRelease) "release") ((HpRead) "read") ((HpWrite) "write")
+    ((HpWeak) "weak") ((HpShare) "share") ((HpStore) "store") ((HpInspect) "inspect")))
+
+(defun hp-kind-text (k: IKind) -> str
+  (match k ((IImmutable) "immutable") ((ICell) "cell") ((IAtom) "atom")))
+
+;; The Debug text of the reason, as the Rust printed it (`{why:?}`).
+(defun hp-why-text (w: HpWhy) -> str
+  (match w
+    ((HpPlaceNotCell) "PlaceNotCell") ((HpContentNotImmutable) "ContentNotImmutable") ((HpShared) "Shared")
+    ((HpImmortal) "Immortal") ((HpStackData) "Stack") ((HpHasWeak) "HasWeak")
+    ((HpCount n) (str "Count(" n ")"))
+    ((HpStoresItself) "StoresItself")))
+
+(defun hp-err-text-1 (e: HpErr) -> (Option str)
+  (match e
+    ((HeUnknownId id) (some (str "unknown object #" id)))
+    ((HeUseAfterFree id op) (some (str "use after free: " (hp-op-text op) " of freed object #" id)))
+    ((HeReleaseOfFreed id) (some (str "double free: release of freed object #" id)))
+    ((HeWriteToImmutable id) (some (str "write to immutable object #" id)))
+    ((HeBadField id i) (some (str "object #" id " has no field " i)))
+    ((HeSharedCell id) (some (str "cell #" id " would cross a thread boundary")))
+    ((HeWrongSlotCount k n) (some (str "a " (hp-kind-text k) " has exactly one slot, not " n)))
+    ((HeNotUnique id why) (some (str "unique write refused on #" id ": " (hp-why-text why))))
+    (_ nil)))
+
+(defun hp-err-text-2 (e: HpErr) -> str
+  (match e
+    ((HeStackUseAfterScope id op) (str "stack use after scope: " (hp-op-text op) " of stack object #" id))
+    ((HeStackRefInHeap id) (str "stack object #" id " stored into a heap object"))
+    ((HeStackRefIntoOuterScope id s) (str "stack object #" id " stored into an object of earlier scope " s))
+    ((HeWeakToStack id) (str "weak reference to stack object #" id))
+    ((HeSharedStack id) (str "stack object #" id " would be shared"))
+    ((HeImmortalHoldsMortal id) (str "immortal object would hold non-immortal #" id))
+    ((HeMutableImmortal k) (str "an immortal " (hp-kind-text k)))
+    ((HeUnknownScope s) (str "unknown scope " s))
+    ((HeScopeEnded s) (str "scope " s " has already ended"))
+    ((HeTakenSlot id i) (str "slot " i " of #" id " was moved out and not put back"))
+    ((HeSlotNotTaken id i) (str "slot " i " of #" id " holds a value: put needs an empty slot"))
+    (_ "audit error")))
+
+(defun hp-err-text (e: HpErr) -> str
+  (match (hp-err-text-1 e)
+    ((some s) s)
+    (nil (hp-err-text-2 e))))

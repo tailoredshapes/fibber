@@ -1,0 +1,92 @@
+;; compiler/fibref/heap/immortal.fib: `fib.immortalise` (types section 8.2, syntax section 3.19): the value of a `def` is evaluated as ordinary counted
+;; objects and then made static data, with everything reachable from it. OWNER: package F1. Rust: heap/immortalise.rs.
+(ns fibref.heap.immortal
+  (:use fibref.value fibref.heap.types fibref.heap.state fibref.heap.shared))
+
+;; The Refs among the fields of `id`, pushed in reverse so the first is searched first.
+(defun hp-push-refs-rev (h: Heap id: i64 stack: (Vec i64)) -> (Vec i64)
+  (let [fs (hp-fields-of h id)]
+    (loop [i (- (count fs) 1) st stack]
+      (if (< i 0)
+          st
+          (match (ival-obj (nth fs i))
+            ((some t) (recur (- i 1) (conj st t)))
+            (nil (recur (- i 1) st)))))))
+
+;; The live counted objects reachable from `root` (included), stopping at immortal ones, depth first; or the first reason one cannot become static
+;; data: a stack object is StackRefInHeap, a Cell or Atom MutableImmortal, a freed object UseAfterFree (immortalise.rs immortal_graph).
+(defun hp-immortal-graph (h: Heap root: i64) -> (Result (Vec i64) HpErr)
+  (loop [seen #{} order (vec-empty) stack [root]]
+    (if (= (count stack) 0)
+        (Ok order)
+        (let [id (nth stack (- (count stack) 1))
+              rest (pop stack)]
+          (match (hp-live-object h id HpStore)
+            ((Err e) (Err e))
+            ((Ok _)
+             (cond (or (hp-immortal? h id) (contains? seen id)) (recur seen order rest)
+                   (hp-stack? h id) (Err (HeStackRefInHeap id))
+                   (kind-mutable? (hp-kind-of h id)) (Err (HeMutableImmortal (hp-kind-of h id)))
+                   :else (recur (conj seen id) (conj order id) (hp-push-refs-rev h id rest)))))))))
+
+;; A Weak field of a reached object must name an immortal object or one of the objects being made immortal.
+(defun hp-check-weak-fields (h: Heap reached: (Vec i64)) -> (Result unit HpErr)
+  (let [set (into #{} reached)]
+    (loop [i 0 j 0]
+      (cond (>= i (count reached)) (Ok ())
+            (>= j (hp-field-count h (nth reached i))) (recur (+ i 1) 0)
+            :else (match (ival-weak (nth (hp-fields-of h (nth reached i)) j))
+                    ((some t) (cond (not (hp-known? h t)) (Err (HeUnknownId t))
+                                    (and (not (hp-immortal? h t)) (not (contains? set t))) (Err (HeImmortalHoldsMortal t))
+                                    :else (recur i (+ j 1))))
+                    (nil (recur i (+ j 1))))))))
+
+;; Makes `root` and every object reachable from it through Ref fields IMMORTAL: count 0, never freed, not audited at exit, count operations no-ops. The
+;; whole graph is validated before anything changes: on Err nothing is marked. Events: one Immortalised per object marked, in the order reached.
+(defun heap-immortalise (h: Heap root: i64) -> (Result unit HpErr)
+  (match (hp-immortal-graph h root)
+    ((Err e) (Err e))
+    ((Ok reached)
+     (match (hp-check-weak-fields h reached)
+       ((Err e) (Err e))
+       ((Ok _) (do (loop [i 0]
+                     (if (>= i (count reached))
+                         ()
+                         (let [id (nth reached i)]
+                           (do (hp-set-flag h id fl-immortal)
+                               (hp-set-count h id 0)
+                               (hp-emit h (EvImmortalised id))
+                               (recur (+ i 1))))))
+                   (Ok ())))))))
+
+;; Whether an Atom is reachable from `root` through Ref fields, not searching through immortal objects: a `def` value that holds one cannot become static
+;; data (its atom is written at run time), so it is pinned instead (immortalise.rs holds_atom).
+(defun heap-holds-atom (h: Heap root: i64) -> bool
+  (loop [seen #{} stack [root]]
+    (if (= (count stack) 0)
+        false
+        (let [id (nth stack (- (count stack) 1))
+              rest (pop stack)]
+          (cond (or (not (hp-known? h id)) (hp-immortal? h id) (not (hp-live? h id)) (contains? seen id)) (recur seen rest)
+                (= (kind-code (hp-kind-of h id)) 2) true
+                :else (recur (conj seen id) (hp-push-refs-rev h id rest)))))))
+
+;; Pins the value of a `def` that holds an Atom: the graph from `root` is marked shared and never released, so it lives to the end of the run; the
+;; audit does not report what is reachable from it as a leak. A Cell in the graph is SharedCell (immortalise.rs pin).
+(defun heap-pin (h: Heap root: i64) -> (Result unit HpErr)
+  (match (heap-mark-shared h root)
+    ((Err e) (Err e))
+    ((Ok _) (do (update! (. h pinned) (fn (v: (Vec i64)) (conj v root))) (Ok ())))))
+
+;; The objects reachable from the pinned roots, the roots included (immortalise.rs pinned_graph).
+(defun hp-pinned-graph (h: Heap) -> (Set i64)
+  (loop [seen #{} stack @(. h pinned)]
+    (if (= (count stack) 0)
+        seen
+        (let [id (nth stack (- (count stack) 1))
+              rest (pop stack)]
+          (cond (or (not (hp-known? h id)) (not (hp-live? h id)) (contains? seen id)) (recur seen rest)
+                :else (recur (conj seen id) (hp-push-refs-rev h id rest)))))))
+
+;; Ends the evaluation of the `def`s: the free trace starts here.
+(defun heap-init-done (h: Heap) -> unit (hp-emit h EvInitDone))

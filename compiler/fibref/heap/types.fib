@@ -1,0 +1,83 @@
+;; compiler/fibref/heap/types.fib: the types of the audited heap (docs/design/fibref-port.md section 4). OWNER: package F1. Rust: heap/error.rs, event.rs, audit.rs.
+;; Names carry the prefixes Hp (types), He (errors), Ev (events): type and variant names are global when linked. `fibref.heap` re-exports this module.
+(ns fibref.heap.types
+  (:use fibref.value))
+
+;; The operation that was attempted on an object, for error reports (error.rs Op).
+(defenum HpOp HpRetain HpRelease HpRead HpWrite HpWeak HpShare HpStore HpInspect)
+
+;; Why `write-unique` (or a steal, take or in-place array primitive) refused: the first failing test of `fib.unique?` (types section 8.2), flags before
+;; count, or a place the primitive cannot take (error.rs Uniqueness).
+(defenum HpWhy
+  HpPlaceNotCell HpContentNotImmutable HpShared HpImmortal HpStackData HpHasWeak
+  (HpCount n: i64)
+  HpStoresItself)
+
+;; The audit errors of heap/error.rs (the 17 of seed-1) and two new with the in-place rules: a read of a slot whose content was moved out (steal,
+;; take, move-in), and a put into a slot that is not empty.
+(defenum HpErr
+  (HeUnknownId id: i64)
+  (HeUseAfterFree id: i64 op: HpOp)
+  (HeReleaseOfFreed id: i64)
+  (HeWriteToImmutable id: i64)
+  (HeBadField id: i64 index: i64)
+  (HeSharedCell id: i64)
+  (HeWrongSlotCount kind: IKind given: i64)
+  (HeNotUnique id: i64 why: HpWhy)
+  (HeStackUseAfterScope id: i64 op: HpOp)
+  (HeStackRefInHeap id: i64)
+  (HeStackRefIntoOuterScope id: i64 scope: i64)
+  (HeWeakToStack id: i64)
+  (HeSharedStack id: i64)
+  (HeImmortalHoldsMortal id: i64)
+  (HeMutableImmortal kind: IKind)
+  (HeUnknownScope scope: i64)
+  (HeScopeEnded scope: i64)
+  (HeTakenSlot id: i64 index: i64)         ;; NEW: the slot's content was moved out and not put back
+  (HeSlotNotTaken id: i64 index: i64))     ;; NEW: `heap-put` into a slot that holds a value
+
+;; The events of heap/event.rs, in the order they happened (what `fibref trace` prints and what a unit test replays), and the events of the new rules.
+(defenum HpEvent
+  (EvAlloc id: i64 kind: IKind) (EvRetain id: i64 count: i64) (EvRelease id: i64 count: i64) (EvFree id: i64)
+  (EvRead id: i64 field: i64) (EvWrite id: i64 field: i64) (EvWeak id: i64) (EvUpgrade id: i64 live: bool) (EvShared id: i64)
+  (EvAllocImmortal id: i64 kind: IKind) (EvAllocStack id: i64 kind: IKind scope: i64) (EvWriteUnique place: i64 id: i64 field: i64)
+  (EvScopeOpen scope: i64) (EvScopeEnd scope: i64) (EvDrop id: i64) (EvImmortalised id: i64) (EvInitDone)
+  (EvSteal id: i64 field: i64 moved: bool)                    ;; NEW: a steal; `moved` false means the shell was shared and a Retain follows
+  (EvTake id: i64 field: i64) (EvPut id: i64 field: i64)      ;; NEW: content moved out of / into a slot, no count change
+  (EvPeek id: i64)                                            ;; NEW: a cell read with no count
+  (EvMoveIn place: i64 id: i64)                               ;; NEW: `&` copy-in without a retain: the content of `place` moved into the new private cell `id`
+  (EvArrayOp op: str place: i64 id: i64 index: i64 inplace: bool))   ;; NEW: array-take! array-push! array-pop! on the array `id` held by the cell `place`
+
+;; What is live at exit (audit.rs LeakClass): kept alive only by a cycle through a cell or atom (count = live Ref fields), another leak, or an
+;; immutable cycle (a bug: the language cannot build one).
+(defenum HpLeakClass HpLeakCycle HpLeak HpImmutableCycle)
+(defstruct HpLeakRow (id: i64 kind: IKind count: i64 held: i64 class: HpLeakClass))
+;; A live Ref field whose target was freed (audit.rs DanglingRef).
+(defstruct HpDangling (holder: i64 field: i64 target: i64))
+(defstruct HpReport (leaks: (Vec HpLeakRow) dangling: (Vec HpDangling) open-scopes: (Vec i64) live-tally: (Vec i64) allocated: i64 freed: i64))   ;; tally: live o c a
+
+;; The heap: one cell per column of the object table (indexed by object id, never reused), the event log and the scope tables. Opaque to everyone but
+;; `fibref.heap.*`. Columns: kind 0 immutable 1 cell 2 atom; flags (fl-* below); scope the scope id of a STACK object or -1.
+(defstruct Heap
+  (kinds: (Cell (Vec i64)) tids: (Cell (Vec i64)) counts: (Cell (Vec i64)) flags: (Cell (Vec i64))
+   scopes: (Cell (Vec i64)) fields: (Cell (Vec (Vec IVal)))
+   log: (Cell (Vec HpEvent))
+   scope-objs: (Cell (Vec (Vec i64))) scope-ended: (Cell (Vec i64)) open: (Cell (Vec i64))
+   pinned: (Cell (Vec i64))))
+
+(defun heap-new () -> Heap
+  (Heap (cell (vec-empty)) (cell (vec-empty)) (cell (vec-empty)) (cell (vec-empty))
+        (cell (vec-empty)) (cell (vec-empty))
+        (cell (vec-empty))
+        (cell (vec-empty)) (cell (vec-empty)) (cell (vec-empty))
+        (cell (vec-empty))))
+
+;; Header flag bits of types section 8.2 (live is the model's own).
+(def fl-live: i64 1)
+(def fl-shared: i64 2)
+(def fl-immortal: i64 4)
+(def fl-hasweak: i64 8)
+(def fl-roomy: i64 16)
+
+;; The capacity of a ROOMY array block (types section 2.13.1).
+(def roomy-capacity: i64 32)

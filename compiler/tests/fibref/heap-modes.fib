@@ -1,0 +1,354 @@
+;; compiler/tests/fibref/heap-modes.fib: immortal, shared, stack-scope, trace and unique-write rules of the heap, driven directly. Ports
+;; crates/fibref/src/heap/tests/{immortal,shared,stack,trace,unique}.rs at seed-1, plus the free-trace renumbering test of crates/fibc/src/trace.rs.
+;; Events as text; ids start at #0. Exit status: the number of failed tests.
+(ns main (:use fibref.value fibref.heap fibref.trace heaptk))
+
+;; ================= immortal.rs =================
+(defun t-an-immortal-has-count-zero-and-one-untraced-alloc () -> str
+  (let [h (heap-new) s (ok! (heap-alloc-immortal h IImmutable 0 [(i 104)]))]
+    (all [(is-int "count" (heap-count h s) 0) (is-bool "immortal" (heap-is-immortal h s) true)
+          (ck "events" (= (evs h) "alloc-immortal #0 immutable;"))])))
+
+(defun t-retain-and-release-on-an-immortal-are-untraced-no-ops () -> str
+  (let [h (heap-new) s (lit h []) before (nev h)]
+    (all [(is-ok "retain" (heap-retain h s)) (is-ok "release" (heap-release h s)) (is-ok "release" (heap-release h s))
+          (ck "events" (= (nev h) before)) (ck "live" (heap-is-live h s)) (is-int "count" (heap-count h s) 0)])))
+
+(defun t-storing-an-immortal-counts-nothing () -> str
+  (let [h (heap-new) s (lit h []) v (imm h [(obj s)]) c (cell-of h (obj s)) _w (wr h c 0 (obj s)) _a (rel h v) _b (rel h c)
+        r (heap-finish h)]
+    (all [(ck "clean" (report-clean? r)) (ck "allocated 2 freed 2" (and (= (. r allocated) 2) (= (. r freed) 2)))
+          (ck (evs h) (= (evs h) "alloc-immortal #0 immutable;alloc #1 immutable;alloc #2 cell;write #2.0;release #1 -> 0;free #1;release #2 -> 0;free #2;"))])))
+
+(defun t-immortals-are-never-leaks () -> str
+  (let [h (heap-new) inner (lit h []) _o (lit h [(obj inner)]) r (heap-finish h)]
+    (all [(ck "clean" (report-clean? r)) (ck "allocated 0" (= (. r allocated) 0))])))
+
+(defun t-an-immortal-may-hold-only-immortals () -> str
+  (let [h (heap-new) mortal (imm h []) before (nev h) m "immortal object would hold non-immortal #0"]
+    (all [(is-err "ref" (heap-alloc-immortal h IImmutable 0 [(obj mortal)]) m) (is-err "weak" (heap-alloc-immortal h IImmutable 0 [(IWeak mortal)]) m)
+          (ck "events" (= (nev h) before)) (is-int "count" (heap-count h mortal) 1)])))
+
+(defun t-an-immortal-is-immutable () -> str
+  (let [h (heap-new)
+        a (all [(is-err "cell" (heap-alloc-immortal h ICell 0 [INone]) "an immortal cell") (is-err "atom" (heap-alloc-immortal h IAtom 0 [INone]) "an immortal atom")])
+        s (lit h [(i 1)])]
+    (all [a (is-err "write" (heap-write h s 0 (i 2)) "write to immutable object #0")])))
+
+(defun t-a-weak-to-an-immortal-always-upgrades-without-a-count () -> str
+  (let [h (heap-new) s (lit h []) w (ok! (heap-weak h s)) up (heap-upgrade h s) cnt0 (heap-count h s) tail (evs-from h 1)
+        holder (imm h [w]) _r (rel h holder)]
+    (all [(is-up "upgrade" up s) (is-int "count" cnt0 0) (ck tail (= tail "weak #0;upgrade #0 live;")) (ck "clean" (clean? h))])))
+
+(defun t-sharing-stops-at-an-immortal () -> str
+  (let [h (heap-new) s (lit h []) v (imm h [(obj s)])]
+    (all [(is-ok "share v" (heap-mark-shared h v)) (is-bool "v shared" (heap-is-shared h v) true) (is-bool "s not shared" (heap-is-shared h s) false)
+          (is-ok "share s" (heap-mark-shared h s)) (is-bool "s still not" (heap-is-shared h s) false)])))
+
+(defun t-immortalise-marks-the-whole-counted-graph-and-stops-at-immortals () -> str
+  (let [h (heap-new) l (lit h []) leaf (imm h [(i 1) (obj l)]) root (imm h [(obj leaf)]) _r (rel h leaf) before (nev h)
+        r1 (is-ok "immortalise" (heap-immortalise h root))]
+    (all [r1 (ck (evs-from h before) (= (evs-from h before) "immortalised #2;immortalised #1;")) (is-bool "leaf" (heap-is-immortal h leaf) true)
+          (is-int "root count" (heap-count h root) 0) (is-ok "release" (heap-release h root)) (ck "clean" (clean? h))])))
+
+(defun t-immortalise-refuses-a-cell-and-marks-nothing () -> str
+  (let [h (heap-new) c (cell-of h (i 0)) root (imm h [(obj c)]) before (nev h)]
+    (all [(is-err "immortalise" (heap-immortalise h root) "an immortal cell") (ck "events" (= (nev h) before)) (is-bool "root" (heap-is-immortal h root) false)])))
+
+(defun t-immortalise-refuses-a-weak-to-a-mortal-outside-the-graph () -> str
+  (let [h (heap-new) other (imm h []) w (ok! (heap-weak h other)) root (imm h [w])]
+    (is-err "immortalise" (heap-immortalise h root) "immortal object would hold non-immortal #0")))
+
+(defun t-a-def-value-that-holds-an-atom-is-pinned () -> str
+  (let [h (heap-new) v (imm h [(i 1)]) a (atom-of h (obj v)) _r (rel h v)
+        ha (heap-holds-atom h a) hv (heap-holds-atom h v) p (heap-pin h a) r (heap-finish h)]
+    (all [(ck "holds atom" ha) (ck "plain does not" (not hv)) (is-ok "pin" p) (is-bool "shared" (heap-is-shared h a) true)
+          (is-bool "not immortal" (heap-is-immortal h a) false) (ck "no leaks" (= (count (. r leaks)) 0))])))
+
+(defun t-a-value-that-was-not-pinned-is-still-a-leak () -> str
+  (let [h (heap-new) _a (atom-of h (i 0)) r (heap-finish h)]
+    (ck "one leak" (= (count (. r leaks)) 1))))
+
+;; ================= shared.rs =================
+(defun t-mark-shared-propagates-through-refs () -> str
+  (let [h (heap-new) leaf (imm h [(i 1)]) mid (imm h [(obj leaf)]) root (imm h [(obj mid)]) aside (imm h []) s (nev h)
+        r (is-ok "share" (heap-mark-shared h root))]
+    (all [r (is-bool "root" (heap-is-shared h root) true) (is-bool "mid" (heap-is-shared h mid) true) (is-bool "leaf" (heap-is-shared h leaf) true)
+          (is-bool "aside" (heap-is-shared h aside) false) (ck (evs-from h s) (= (evs-from h s) "shared #2;shared #1;shared #0;"))])))
+
+(defun t-already-shared-objects-are-not-marked-twice () -> str
+  (let [h (heap-new) leaf (imm h []) root (imm h [(obj leaf)]) _a (ok! (heap-mark-shared h root)) before (nev h)]
+    (all [(is-ok "again" (heap-mark-shared h root)) (ck "events" (= (nev h) before))])))
+
+(defun t-a-reachable-cell-rejects-the-crossing-and-marks-nothing () -> str
+  (let [h (heap-new) c (cell-of h (i 1)) mid (imm h [(obj c)]) root (imm h [(obj mid)]) before (nev h)]
+    (all [(is-err "share" (heap-mark-shared h root) "cell #0 would cross a thread boundary")
+          (is-bool "root" (heap-is-shared h root) false) (is-bool "mid" (heap-is-shared h mid) false) (is-bool "c" (heap-is-shared h c) false)
+          (ck "events" (= (nev h) before))])))
+
+(defun t-a-reachable-atom-may-cross () -> str
+  (let [h (heap-new) inner (imm h []) a (atom-of h (obj inner)) root (imm h [(obj a)])]
+    (all [(is-ok "share" (heap-mark-shared h root)) (is-bool "atom" (heap-is-shared h a) true) (is-bool "inner" (heap-is-shared h inner) true)])))
+
+(defun t-a-cycle-through-an-atom-terminates () -> str
+  (let [h (heap-new) a (atom-of h INone) node (imm h [(obj a)]) _w (wr h a 0 (obj node))]
+    (all [(is-ok "share" (heap-mark-shared h a)) (is-bool "node" (heap-is-shared h node) true)])))
+
+(defun t-writing-into-a-shared-atom-shares-the-value () -> str
+  (let [h (heap-new) a (atom-of h INone) _s (ok! (heap-mark-shared h a)) v (imm h [])
+        c0 (is-bool "v before" (heap-is-shared h v) false)]
+    (all [c0 (is-ok "write" (heap-write h a 0 (obj v))) (is-bool "v after" (heap-is-shared h v) true)])))
+
+(defun t-writing-a-cell-into-a-shared-atom-is-rejected-unchanged () -> str
+  (let [h (heap-new) a (atom-of h (i 0)) _s (ok! (heap-mark-shared h a)) c (cell-of h INone) holder (imm h [(obj c)])]
+    (all [(is-err "write" (heap-write h a 0 (obj holder)) "cell #1 would cross a thread boundary") (is-val "slot" (heap-read h a 0) (i 0))
+          (is-int "holder count" (heap-count h holder) 1) (is-bool "holder shared" (heap-is-shared h holder) false)])))
+
+(defun t-writing-into-an-unshared-atom-shares-nothing () -> str
+  (let [h (heap-new) a (atom-of h INone) c (cell-of h INone)]
+    (all [(is-ok "write" (heap-write h a 0 (obj c))) (is-bool "c" (heap-is-shared h c) false)])))
+
+(defun t-a-live-weak-target-counts-as-reachable () -> str
+  (let [h (heap-new) c (cell-of h INone) w (ok! (heap-weak h c)) root (imm h [w])
+        a (is-err "share live" (heap-mark-shared h root) "cell #0 would cross a thread boundary") _r (rel h c)]
+    (all [a (is-ok "share dead" (heap-mark-shared h root))])))
+
+(defun t-writing-a-weak-to-a-live-cell-into-a-shared-atom-is-rejected () -> str
+  (let [h (heap-new) a (atom-of h INone) _s (ok! (heap-mark-shared h a)) c (cell-of h (i 1)) w (ok! (heap-weak h c)) events (nev h)
+        e1 (is-err "write" (heap-write h a 0 w) "cell #1 would cross a thread boundary")
+        e2 (is-val "slot untouched" (heap-read h a 0) INone)
+        e3 (is-bool "c shared" (heap-is-shared h c) false) e4 (ck "only the read" (= (nev h) (+ events 1)))
+        _r (rel h c)]
+    (all [e1 e2 e3 e4 (is-ok "dead target crosses" (heap-write h a 0 w))])))
+
+;; ================= stack.rs =================
+(defun t-a-scope-ends-its-objects-and-releases-what-they-hold () -> str
+  (let [h (heap-new) child (imm h []) s (heap-open-scope h) hh (stk h s IImmutable [(obj child)]) c (stk h s ICell [(i 0)])
+        e0 (all [(is-int "stack count" (heap-count h hh) 0) (ck "scope of h" (= (ok! (heap-stack-scope h hh)) (some s)))])
+        _r (rel h child) e1 (is-ok "end" (heap-end-scope h s))
+        r (heap-finish h)]
+    (all [e0 e1 (ck "all gone" (not (or (heap-is-live h hh) (heap-is-live h c) (heap-is-live h child)))) (ck "clean" (report-clean? r))
+          (ck "allocated 1 freed 1" (and (= (. r allocated) 1) (= (. r freed) 1)))
+          (ck (evs h) (= (evs h) (str "alloc #0 immutable;scope-open 0;alloc-stack #1 immutable scope 0;retain #0 -> 2;alloc-stack #2 cell scope 0;"
+                                      "release #0 -> 1;scope-end 0;drop #2;drop #1;release #0 -> 0;free #0;")))])))
+
+(defun t-retain-and-release-of-a-live-stack-object-are-untraced-no-ops () -> str
+  (let [h (heap-new) s (heap-open-scope h) hh (stk h s IImmutable []) before (nev h)
+        e0 (all [(is-ok "retain" (heap-retain h hh)) (is-ok "release" (heap-release h hh)) (is-ok "release" (heap-release h hh))
+                 (ck "live" (heap-is-live h hh)) (ck "events" (= (nev h) before))])
+        _e (ok! (heap-end-scope h s))]
+    (all [e0 (is-err "retain after" (heap-retain h hh) "stack use after scope: retain of stack object #0")])))
+
+(defun t-every-access-after-the-scope-ended-is-stack-use-after-scope () -> str
+  (let [h (heap-new) s (heap-open-scope h) hh (stk h s ICell [INone]) _e (ok! (heap-end-scope h s))
+        m (fn (op: str) (str "stack use after scope: " op " of stack object #0"))]
+    (all [(is-err "read" (heap-read h hh 0) (m "read")) (is-err "write" (heap-write h hh 0 INone) (m "write"))
+          (is-err "check" (heap-check-access h hh HpWrite) (m "write")) (is-err "retain" (heap-retain h hh) (m "retain"))
+          (is-err "release" (heap-release h hh) (m "release")) (is-err "weak" (heap-weak h hh) (m "weak"))
+          (is-err "share" (heap-mark-shared h hh) (m "share")) (is-err "count" (heap-count h hh) (m "inspect"))
+          (is-err "write-unique" (heap-write-unique h hh 0 INone) (m "write"))
+          (is-err "alloc" (heap-alloc h IImmutable 0 [(obj hh)]) (m "store"))])))
+
+(defun t-a-stack-ref-stored-into-a-heap-object-is-an-error () -> str
+  (let [h (heap-new) c (cell-of h INone) a (atom-of h INone) s (heap-open-scope h) hh (stk h s IImmutable [])
+        m "stack object #2 stored into a heap object"
+        x (imm h [INone]) place (cell-of h (obj x)) _r (rel h x)]
+    (all [(is-err "alloc" (heap-alloc h IImmutable 0 [(obj hh)]) m) (is-err "cell" (heap-write h c 0 (obj hh)) m)
+          (is-err "atom" (heap-write h a 0 (obj hh)) m) (is-err "unique" (heap-write-unique h place 0 (obj hh)) m)
+          (is-val "x kept" (heap-read h x 0) INone)])))
+
+(defun t-a-stack-ref-into-an-outer-scope-object-is-an-error () -> str
+  (let [h (heap-new) outer (heap-open-scope h) o (stk h outer ICell [INone]) inner (heap-open-scope h) ii (stk h inner IImmutable [])
+        m "stack object #1 stored into an object of earlier scope 0"
+        e0 (all [(is-err "write" (heap-write h o 0 (obj ii)) m) (is-err "alloc" (heap-alloc-in-scope h outer IImmutable 0 [(obj ii)]) m)])
+        _a (stk h inner IImmutable [(obj o)]) same (stk h inner ICell [(obj ii)])
+        e1 (is-ok "outer into inner" (heap-write h same 0 (obj o)))
+        _e (ok! (heap-end-scope h inner)) _f (ok! (heap-end-scope h outer))]
+    (all [e0 e1 (ck "clean" (clean? h))])))
+
+(defun t-a-weak-to-a-stack-object-is-an-error () -> str
+  (let [h (heap-new) s (heap-open-scope h) hh (stk h s IImmutable []) m "weak reference to stack object #0"]
+    (all [(is-err "weak" (heap-weak h hh) m) (is-err "upgrade" (heap-upgrade h hh) m) (is-err "alloc" (heap-alloc h IImmutable 0 [(IWeak hh)]) m)])))
+
+(defun t-sharing-a-stack-object-is-an-error () -> str
+  (let [h (heap-new) s (heap-open-scope h) hh (stk h s IAtom [INone])]
+    (all [(is-err "share" (heap-mark-shared h hh) "stack object #0 would be shared") (is-bool "not shared" (heap-is-shared h hh) false)])))
+
+(defun t-scopes-end-once () -> str
+  (let [h (heap-new) outer (heap-open-scope h) inner (heap-open-scope h) o0 (heap-open-scopes h) _e (ok! (heap-end-scope h inner))]
+    (all [(ck "open scopes" (= o0 [outer inner])) (is-err "end again" (heap-end-scope h inner) "scope 1 has already ended")
+          (is-err "alloc ended" (heap-alloc-in-scope h inner IImmutable 0 []) "scope 1 has already ended")
+          (is-err "end unknown" (heap-end-scope h 9) "unknown scope 9") (is-err "alloc unknown" (heap-alloc-in-scope h 9 IImmutable 0 []) "unknown scope 9")
+          (is-ok "end outer" (heap-end-scope h outer)) (ck "clean" (clean? h))])))
+
+(defun t-an-open-scope-at-finish-is-reported-and-its-objects-are-not-leaks () -> str
+  (let [h (heap-new) s (heap-open-scope h) _a (stk h s ICell [(i 1)]) r (heap-finish h)]
+    (all [(ck "open scopes" (= (. r open-scopes) [s])) (ck "no leaks" (= (count (. r leaks)) 0)) (ck "not clean" (not (report-clean? r)))
+          (ck "not cycle only" (not (report-cycle-leak-only? r)))])))
+
+(defun t-a-drop-that-would-release-a-freed-object-ends-nothing () -> str
+  (let [h (heap-new) child (imm h []) s (heap-open-scope h) hh (stk h s IImmutable [(obj child)]) _a (rel h child) _b (rel h child) before (nev h)]
+    (all [(is-err "end" (heap-end-scope h s) "double free: release of freed object #0") (ck "events" (= (nev h) before)) (ck "h live" (heap-is-live h hh))
+          (ck "scope open" (= (heap-open-scopes h) [s]))])))
+
+(defun t-stack-errors-display-distinctly () -> str
+  (let [after (hp-err-text (HeStackUseAfterScope 4 HpRead)) freed (hp-err-text (HeUseAfterFree 4 HpRead))]
+    (all [(ck after (= after "stack use after scope: read of stack object #4")) (ck "distinct" (not= after freed))
+          (ck "outer" (= (hp-err-text (HeStackRefIntoOuterScope 4 2)) "stack object #4 stored into an object of earlier scope 2"))])))
+
+;; ================= trace.rs (and fibc trace.rs) =================
+(defun t-a-scripted-run-traces-every-event-in-order () -> str
+  (let [h (heap-new) v (imm h [(i 1)]) c (cell-of h (obj v))
+        e0 (is-val "read" (heap-read h c 0) (obj v)) e1 (is-ok "release v" (heap-release h v)) _w (ok! (heap-weak h v))
+        e2 (is-ok "write" (heap-write h c 0 INone)) e3 (is-up "upgrade" (heap-upgrade h v) -1)
+        e4 (is-err "share" (heap-mark-shared h c) "cell #1 would cross a thread boundary") e5 (is-ok "release c" (heap-release h c))
+        want "alloc #0 immutable;alloc #1 cell;retain #0 -> 2;read #1.0;release #0 -> 1;weak #0;write #1.0;release #0 -> 0;free #0;upgrade #0 dead;release #1 -> 0;free #1;"]
+    (all [e0 e1 e2 e3 e4 e5 (ck (evs h) (= (evs h) want)) (ck "clean" (clean? h))])))
+
+(defun t-failed-operations-leave-no-trace () -> str
+  (let [h (heap-new) v (imm h []) before (nev h)
+        a (heap-write h v 0 INone) b (heap-read h v 5) c (heap-alloc h ICell 0 [])]
+    (all [(ck "write fails" (not= (res a) "ok")) (ck "read fails" (not= (res b) "ok")) (ck "alloc fails" (not= (res c) "ok")) (ck "events" (= (nev h) before))])))
+
+(defun t-allocs-are-the-a-lines-of-the-trace () -> str
+  (let [h (heap-new) z (trace-allocs h) _l (lit h []) a (imm h []) _c (cell-of h (i 0)) _t (atom-of h (i 0)) s (heap-open-scope h) _s (stk h s IImmutable [(obj a)])]
+    (all [(ck "empty" (= z 0)) (ck "three A lines" (= (trace-allocs h) 3))])))
+
+(defun t-what-the-defs-allocated-is-not-traced () -> str
+  (let [h (heap-new) leaf (imm h []) root (imm h [(obj leaf)]) _r (rel h leaf) _i (ok! (heap-immortalise h root))
+        z (trace-allocs h) kept (imm h []) _o (imm h [(obj kept)])]
+    (all [(ck "defs untraced" (= z 0)) (ck "two" (= (trace-allocs h) 2)) (ck (trace-text (trace-lines h)) (= (trace-text (trace-lines h)) "A 1 o\nA 2 o\n"))])))
+
+(defun t-the-free-trace-renumbers-and-skips-immortals () -> str
+  (let [h (heap-new) _l (lit h []) c (cell-of h INone) s (heap-open-scope h) _x (stk h s IImmutable []) _r (ret h c) _e (ok! (heap-end-scope h s))
+        _a (rel h c) _b (rel h c)]
+    (ck (trace-text (trace-lines h)) (= (trace-text (trace-lines h)) "A 1 c\nS 2 o\nD 2\nF 1\n"))))
+
+(defun t-init-done-starts-the-free-trace () -> str
+  (let [h (heap-new) a (imm h []) _i (heap-init-done h) b (imm h [])]
+    (all [(ck "only b" (= (trace-text (trace-lines h)) "A 1 o\n")) (is-ok "release a" (heap-release h a)) (ck "a's free has no ordinal" (= (trace-text (trace-lines h)) "A 1 o\n"))
+          (is-ok "release b" (heap-release h b)) (ck (trace-text (trace-lines h)) (= (trace-text (trace-lines h)) "A 1 o\nF 1\n"))])))
+
+;; ================= unique.rs =================
+(defun place-of (h: Heap fields: (Vec IVal)) -> (Vec i64)
+  (let [x (imm h fields) c (cell-of h (obj x))] (do (rel h x) [c x])))
+
+(defun t-a-unique-object-is-written-in-place () -> str
+  (let [h (heap-new) cx (place-of h [(i 1) (i 2)]) c (nth cx 0) x (nth cx 1)]
+    (all [(is-bool "unique" (heap-is-unique h x) true) (is-int "write" (heap-write-unique h c 1 (i 9)) x) (is-val "read" (heap-read h x 1) (i 9))
+          (is-ok "release" (heap-release h c)) (ck "clean" (clean? h))])))
+
+(defun t-a-unique-write-retains-new-writes-then-releases-old () -> str
+  (let [h (heap-new) old (imm h []) cx (place-of h [(obj old)]) c (nth cx 0) x (nth cx 1) _r (rel h old) new (imm h []) start (nev h)]
+    (all [(is-int "write" (heap-write-unique h c 0 (obj new)) x)
+          (ck (evs-from h start) (= (evs-from h start) "retain #3 -> 2;write-unique #2 #1.0;release #0 -> 0;free #0;"))])))
+
+(defun t-a-unique-write-whose-old-release-would-fail-changes-nothing () -> str
+  (let [h (heap-new) y (imm h []) cx (place-of h [(obj y)]) c (nth cx 0) x (nth cx 1) _a (rel h y) _b (rel h y) new (imm h []) before (nev h)]
+    (all [(is-err "write" (heap-write-unique h c 0 (obj new)) "double free: release of freed object #0") (ck "events" (= (nev h) before))
+          (is-int "new count" (heap-count h new) 1) (is-val "slot" (heap-read h x 0) (obj y))])))
+
+(defun t-count-above-one-is-refused () -> str
+  (let [h (heap-new) cx (place-of h [(i 1)]) c (nth cx 0) x (nth cx 1) _r (ret h x)]
+    (all [(is-bool "not unique" (heap-is-unique h x) false) (is-err "write" (heap-write-unique h c 0 (i 2)) "unique write refused on #0: Count(2)")
+          (is-val "unchanged" (heap-read h x 0) (i 1))])))
+
+(defun t-shared-is-refused-before-the-count () -> str
+  (let [h (heap-new) cx (place-of h [(i 1)]) c (nth cx 0) x (nth cx 1) _s (ok! (heap-mark-shared h x))]
+    (all [(is-int "count" (heap-count h x) 1) (is-err "write" (heap-write-unique h c 0 (i 2)) "unique write refused on #0: Shared")])))
+
+(defun t-immortal-is-refused () -> str
+  (let [h (heap-new) l (lit h [(i 1)]) c (cell-of h (obj l))]
+    (all [(is-bool "not unique" (heap-is-unique h l) false) (is-err "write" (heap-write-unique h c 0 (i 2)) "unique write refused on #0: Immortal")])))
+
+(defun t-stack-is-refused () -> str
+  (let [h (heap-new) s (heap-open-scope h) x (stk h s IImmutable [(i 1)]) c (stk h s ICell [(obj x)])]
+    (is-err "write" (heap-write-unique h c 0 (i 2)) "unique write refused on #0: Stack")))
+
+(defun t-the-place-must-be-a-cell-holding-an-immutable () -> str
+  (let [h (heap-new) x (imm h [(i 1)]) a (atom-of h (obj x)) num (cell-of h (i 3)) inner (cell-of h INone) outer (cell-of h (obj inner)) v (i 2)]
+    (all [(is-err "imm place" (heap-write-unique h x 0 v) "unique write refused on #0: PlaceNotCell")
+          (is-err "atom place" (heap-write-unique h a 0 v) "unique write refused on #1: PlaceNotCell")
+          (is-err "scalar content" (heap-write-unique h num 0 v) "unique write refused on #2: ContentNotImmutable")
+          (is-err "cell content" (heap-write-unique h outer 0 v) "unique write refused on #3: ContentNotImmutable")])))
+
+(defun t-a-bad-field-is-refused-by-unique () -> str
+  (let [h (heap-new) cx (place-of h [(i 1)]) c (nth cx 0)]
+    (is-err "write" (heap-write-unique h c 1 INone) "object #0 has no field 1")))
+
+(defun t-a-unique-write-closes-a-cycle-only-through-the-cell () -> str
+  (let [h (heap-new) cx (place-of h [INone]) c (nth cx 0) k (nth cx 1) w (is-int "write" (heap-write-unique h c 0 (obj c)) k) _r (rel h c) r (heap-finish h)]
+    (all [w (ck "cycle only" (report-cycle-leak-only? r)) (ck "LeakCycle [k c]" (= (report-ids-in r HpLeakCycle) [k c]))
+          (ck "no immutable cycle" (= (count (report-ids-in r HpImmutableCycle)) 0))])))
+
+(defun t-a-unique-write-cannot-tie-an-immutable-cycle () -> str
+  (let [h (heap-new) cx (place-of h [INone]) c (nth cx 0) x (nth cx 1)
+        e0 (is-err "self" (heap-write-unique h c 0 (obj x)) "unique write refused on #0: StoresItself")
+        z (imm h [(obj x)])
+        e1 (is-err "via z" (heap-write-unique h c 0 (obj z)) "unique write refused on #0: Count(2)")
+        _w (wr h c 0 INone)
+        e2 (is-int "x count" (heap-count h x) 1)
+        e3 (is-err "imm place" (heap-write-unique h z 0 (obj z)) "unique write refused on #2: PlaceNotCell")
+        _a (rel h z) _b (rel h c) r (heap-finish h)]
+    (all [e0 e1 e2 e3 (ck "clean" (report-clean? r))])))
+
+(defun t-an-object-that-had-a-weak-reference-is-never-unique () -> str
+  (let [h (heap-new) cx (place-of h [(i 0)]) c (nth cx 0) x (nth cx 1) u0 (is-bool "before" (heap-is-unique h x) true) _w (ok! (heap-weak h x))]
+    (all [u0 (is-bool "after" (heap-is-unique h x) false) (is-err "write" (heap-write-unique h c 0 (i 9)) "unique write refused on #0: HasWeak")
+          (is-val "unchanged" (heap-read h x 0) (i 0)) (is-ok "release" (heap-release h c)) (ck "clean" (clean? h))])))
+
+(defun main () -> i64
+  (min 100
+    (run-suite "heap-modes"
+      [(tc "immortal-count-zero-one-alloc" t-an-immortal-has-count-zero-and-one-untraced-alloc)
+       (tc "immortal-retain-release-no-ops" t-retain-and-release-on-an-immortal-are-untraced-no-ops)
+       (tc "immortal-store-counts-nothing" t-storing-an-immortal-counts-nothing)
+       (tc "immortals-never-leaks" t-immortals-are-never-leaks)
+       (tc "immortal-holds-only-immortals" t-an-immortal-may-hold-only-immortals)
+       (tc "immortal-is-immutable" t-an-immortal-is-immutable)
+       (tc "weak-to-immortal" t-a-weak-to-an-immortal-always-upgrades-without-a-count)
+       (tc "sharing-stops-at-immortal" t-sharing-stops-at-an-immortal)
+       (tc "immortalise-whole-graph" t-immortalise-marks-the-whole-counted-graph-and-stops-at-immortals)
+       (tc "immortalise-refuses-a-cell" t-immortalise-refuses-a-cell-and-marks-nothing)
+       (tc "immortalise-refuses-weak-to-mortal" t-immortalise-refuses-a-weak-to-a-mortal-outside-the-graph)
+       (tc "def-with-atom-is-pinned" t-a-def-value-that-holds-an-atom-is-pinned)
+       (tc "unpinned-is-a-leak" t-a-value-that-was-not-pinned-is-still-a-leak)
+       (tc "shared-propagates" t-mark-shared-propagates-through-refs)
+       (tc "shared-not-twice" t-already-shared-objects-are-not-marked-twice)
+       (tc "shared-cell-rejects" t-a-reachable-cell-rejects-the-crossing-and-marks-nothing)
+       (tc "shared-atom-may-cross" t-a-reachable-atom-may-cross)
+       (tc "shared-cycle-terminates" t-a-cycle-through-an-atom-terminates)
+       (tc "write-into-shared-atom-shares" t-writing-into-a-shared-atom-shares-the-value)
+       (tc "write-cell-into-shared-atom-rejected" t-writing-a-cell-into-a-shared-atom-is-rejected-unchanged)
+       (tc "write-into-unshared-atom" t-writing-into-an-unshared-atom-shares-nothing)
+       (tc "live-weak-target-reachable" t-a-live-weak-target-counts-as-reachable)
+       (tc "weak-to-live-cell-into-shared-atom" t-writing-a-weak-to-a-live-cell-into-a-shared-atom-is-rejected)
+       (tc "scope-ends-objects" t-a-scope-ends-its-objects-and-releases-what-they-hold)
+       (tc "stack-count-ops-no-ops" t-retain-and-release-of-a-live-stack-object-are-untraced-no-ops)
+       (tc "stack-use-after-scope" t-every-access-after-the-scope-ended-is-stack-use-after-scope)
+       (tc "stack-ref-in-heap" t-a-stack-ref-stored-into-a-heap-object-is-an-error)
+       (tc "stack-ref-into-outer-scope" t-a-stack-ref-into-an-outer-scope-object-is-an-error)
+       (tc "weak-to-stack" t-a-weak-to-a-stack-object-is-an-error)
+       (tc "shared-stack" t-sharing-a-stack-object-is-an-error)
+       (tc "scopes-end-once" t-scopes-end-once)
+       (tc "open-scope-at-finish" t-an-open-scope-at-finish-is-reported-and-its-objects-are-not-leaks)
+       (tc "drop-releasing-freed-ends-nothing" t-a-drop-that-would-release-a-freed-object-ends-nothing)
+       (tc "stack-errors-display" t-stack-errors-display-distinctly)
+       (tc "scripted-run-traced" t-a-scripted-run-traces-every-event-in-order)
+       (tc "failed-ops-no-trace" t-failed-operations-leave-no-trace)
+       (tc "allocs-are-a-lines" t-allocs-are-the-a-lines-of-the-trace)
+       (tc "defs-not-traced" t-what-the-defs-allocated-is-not-traced)
+       (tc "free-trace-renumbers" t-the-free-trace-renumbers-and-skips-immortals)
+       (tc "init-done-starts-trace" t-init-done-starts-the-free-trace)
+       (tc "unique-in-place" t-a-unique-object-is-written-in-place)
+       (tc "unique-retains-writes-releases" t-a-unique-write-retains-new-writes-then-releases-old)
+       (tc "unique-old-release-fails" t-a-unique-write-whose-old-release-would-fail-changes-nothing)
+       (tc "unique-count-above-one" t-count-above-one-is-refused)
+       (tc "unique-shared-before-count" t-shared-is-refused-before-the-count)
+       (tc "unique-immortal" t-immortal-is-refused)
+       (tc "unique-stack" t-stack-is-refused)
+       (tc "unique-place-must-be-cell" t-the-place-must-be-a-cell-holding-an-immutable)
+       (tc "unique-bad-field" t-a-bad-field-is-refused-by-unique)
+       (tc "unique-closes-cycle-through-cell" t-a-unique-write-closes-a-cycle-only-through-the-cell)
+       (tc "unique-no-immutable-cycle" t-a-unique-write-cannot-tie-an-immutable-cycle)
+       (tc "unique-weak-never-unique" t-an-object-that-had-a-weak-reference-is-never-unique)])))

@@ -1,0 +1,107 @@
+;; compiler/fibref/heap/life.fib: allocation, retain, release, and stack scopes (types section 6.11). OWNER: package F1.
+;; Rust: heap/mod.rs (alloc, alloc_immortal, retain, release), heap/scope.rs.
+;; A scope is the lifetime of the stack objects of a `let` or `match` binding, a temporary of a step or a private `&` cell. Scopes need not nest: any
+;; open one may end (the compiled program's do not, types section 8.2). What the audit must catch is a use after the end (StackUseAfterScope) and a
+;; reference that could outlive its target (StackRefInHeap, StackRefIntoOuterScope).
+(ns fibref.heap.life
+  (:use fibref.value fibref.heap.types fibref.heap.state fibref.heap.store fibref.heap.cascade))
+
+;; Allocates an object with count 1 for the caller. Every Ref in `fields` is retained (storing is +1), except a Ref to an immortal object; a Cell or Atom
+;; has exactly one field; no field may name a stack object. Events: Alloc, then one Retain per Ref field to a counted object, in field order. Nothing is
+;; allocated or retained if any field fails validation.
+(defun heap-alloc (h: Heap kind: IKind tid: i64 fields: (Vec IVal)) -> (Result i64 HpErr)
+  (match (hp-check-new h kind fields holder-heap)
+    ((Err e) (Err e))
+    ((Ok _) (Ok (hp-install h kind tid 1 fl-live -1 fields (EvAlloc (hp-size h) kind))))))
+
+;; Allocates an IMMORTAL object (types section 8.2): count 0, never freed, never reported at exit; its kind is Immutable and its fields name only immortal
+;; objects, so building one retains nothing. Event: AllocImmortal. Count operations on it are no-ops and not traced.
+(defun heap-alloc-immortal (h: Heap kind: IKind tid: i64 fields: (Vec IVal)) -> (Result i64 HpErr)
+  (cond (kind-mutable? kind) (Err (HeMutableImmortal kind))
+        :else (match (hp-check-new h kind fields holder-immortal)
+                ((Err e) (Err e))
+                ((Ok _) (Ok (hp-install h kind tid 0 (bit-or fl-live fl-immortal) -1 fields
+                                        (EvAllocImmortal (hp-size h) kind)))))))
+
+;; Count += 1. On an immortal or a live stack object a no-op with no event (types section 8.2; section 6.11 relies on it). Event: Retain.
+(defun heap-retain (h: Heap id: i64) -> (Result unit HpErr)
+  (match (hp-check-count-op h id HpRetain)
+    ((Err e) (Err e))
+    ((Ok false) (Ok ()))
+    ((Ok true) (match (hp-live-object h id HpRetain)
+                 ((Err e) (Err e))
+                 ((Ok _) (do (hp-bump h id) (Ok ())))))))
+
+;; Count -= 1. At zero the object is freed and every Ref it held is released in turn (explicit worklist). The whole cascade is planned before anything
+;; changes: if it would release an object already freed the result is ReleaseOfFreed and nothing is released. Events: Release, then for a count of
+;; zero Free followed by the events of releasing each held Ref in field order, depth first.
+(defun heap-release (h: Heap id: i64) -> (Result unit HpErr)
+  (match (hp-check-count-op h id HpRelease)
+    ((Err e) (Err e))
+    ((Ok false) (Ok ()))
+    ((Ok true) (match (hp-plan-release h id nil)
+                 ((Err e) (Err e))
+                 ((Ok order) (do (hp-apply-release h order) (Ok ())))))))
+
+;; ---- scopes ----
+;; Opens a scope. Event: ScopeOpen.
+(defun heap-open-scope (h: Heap) -> i64
+  (let [s (count @(. h scope-objs))]
+    (do (update! (. h scope-objs) (fn (v: (Vec (Vec i64))) (conj v (vec-empty))))
+        (update! (. h scope-ended) (fn (v: (Vec i64)) (conj v 0)))
+        (update! (. h open) (fn (v: (Vec i64)) (conj v s)))
+        (hp-emit h (EvScopeOpen s))
+        s)))
+
+;; `scope` was opened by this heap and has not ended.
+(defun hp-check-open (h: Heap scope: i64) -> (Result unit HpErr)
+  (cond (or (< scope 0) (>= scope (count @(. h scope-objs)))) (Err (HeUnknownScope scope))
+        (= 1 (nth @(. h scope-ended) scope)) (Err (HeScopeEnded scope))
+        :else (Ok ())))
+
+;; Allocates a STACK object of `scope` (count 0, no count operation ever, ended by `heap-end-scope`). Every Ref to a counted object in `fields` is
+;; retained (the drop releases it); a Ref may also name a stack object of this scope or an earlier one. Events: AllocStack, then one Retain per Ref field.
+(defun heap-alloc-in-scope (h: Heap scope: i64 kind: IKind tid: i64 fields: (Vec IVal)) -> (Result i64 HpErr)
+  (match (hp-check-open h scope)
+    ((Err e) (Err e))
+    ((Ok _) (match (hp-check-new h kind fields scope)
+              ((Err e) (Err e))
+              ((Ok _) (let [id (hp-install h kind tid 0 fl-live scope fields (EvAllocStack (hp-size h) kind scope))]
+                        (do (update! (. h scope-objs)
+                                     (fn (v: (Vec (Vec i64))) (assoc v scope (conj (nth v scope) id))))
+                            (Ok id))))))))
+
+;; The drops of a scope's objects, most recently allocated first: each object is ended and its drop releases what it held (with cascades).
+(defun hp-run-drops (h: Heap dropped: (Vec i64) cascades: (Vec (Vec i64))) -> unit
+  (loop [i 0]
+    (if (>= i (count dropped))
+        ()
+        (let [id (nth dropped i)]
+          (do (hp-free-slot h id)
+              (hp-emit h (EvDrop id))
+              (hp-apply-release h (nth cascades i))
+              (recur (+ i 1)))))))
+
+(defun hp-reversed (v: (Vec i64)) -> (Vec i64)
+  (loop [i (- (count v) 1) acc (vec-empty)]
+    (if (< i 0) acc (recur (- i 1) (conj acc (nth v i))))))
+
+;; Ends `scope`, which must be open (not necessarily the last opened). The whole drop is planned first: if it would release a freed object the result is
+;; ReleaseOfFreed and nothing changes. An ended object is never freed; any later use of it is StackUseAfterScope. Events: ScopeEnd, then for each
+;; object Drop followed by the release events of what it held.
+(defun heap-end-scope (h: Heap scope: i64) -> (Result unit HpErr)
+  (match (hp-check-open h scope)
+    ((Err e) (Err e))
+    ((Ok _)
+     (let [dropped (hp-reversed (nth @(. h scope-objs) scope))]
+       (match (hp-plan-drops h dropped)
+         ((Err e) (Err e))
+         ((Ok cascades)
+          (do (update! (. h open) (fn (v: (Vec i64)) (vec (filter (fn (s: i64) (not= s scope)) v))))
+              (update! (. h scope-ended) (fn (v: (Vec i64)) (assoc v scope 1)))
+              (hp-emit h (EvScopeEnd scope))
+              (hp-run-drops h dropped cascades)
+              (Ok ()))))))))
+
+;; The scopes still open, in the order they were opened.
+(defun heap-open-scopes (h: Heap) -> (Vec i64) @(. h open))

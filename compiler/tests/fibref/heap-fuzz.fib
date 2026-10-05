@@ -1,0 +1,205 @@
+;; compiler/tests/fibref/heap-fuzz.fib: a seeded random program against the heap and an independent shadow model of counting (the model is the plain
+;; semantics of spec/ownership.md section 2, written here without the heap's plans, flags or events). Fault-free runs must agree after every step and end in
+;; a clean or cycle-only report whose leaks are exactly the model's live objects. Fault runs inject ONE over-release or ONE forgotten release into both
+;; the heap and the model at a random step: the heap must refuse a later operation as a double free or use after free, or report a bug or a dangling ref at
+;; finish; a fault the audit lets through is a failure. Port in spirit of crates/fibref/tests/heap_adversarial/{replay,fault}.rs. Exit status: failures.
+(ns main (:use fibref.value fibref.heap fibref.trace heaptk))
+
+;; The model: per object count, live, kind (0 imm 1 cell), fields (targets, -1 for a scalar or nil); `owned` is how many references the program holds.
+(defstruct Fz (h: Heap count: (Cell (Vec i64)) live: (Cell (Vec i64)) kind: (Cell (Vec i64)) fields: (Cell (Vec (Vec i64))) owned: (Cell (Vec i64)) rng: (Cell i64)))
+
+(defun fz-new () -> Fz
+  (Fz (heap-new) (cell (vec-empty)) (cell (vec-empty)) (cell (vec-empty)) (cell (vec-empty)) (cell (vec-empty)) (cell 0)))
+
+(defun below (z: Fz n: i64) -> i64
+  (do (update! (. z rng) (fn (s: i64) (rem (+ (* s 1103515245) 12345) 2147483648)))
+      (rem (quot @(. z rng) 16) n)))
+
+(defun m-count (z: Fz id: i64) -> i64 (nth @(. z count) id))
+(defun m-live? (z: Fz id: i64) -> bool (= 1 (nth @(. z live) id)))
+(defun m-set (c: (Cell (Vec i64)) id: i64 x: i64) -> unit (update! c (fn (v: (Vec i64)) (assoc v id x))))
+(defun m-size (z: Fz) -> i64 (count @(. z count)))
+(defun m-fields (z: Fz id: i64) -> (Vec i64) (nth @(. z fields) id))
+
+;; The model's release of one count on `root`, with the cascade: a worklist, fields released in field order.
+(defun m-release (z: Fz root: i64) -> unit
+  (loop [work [root]]
+    (if (= (count work) 0)
+        ()
+        (let [id (nth work (- (count work) 1)) rest (pop work) n (- (m-count z id) 1)]
+          (do (m-set (. z count) id n)
+              (if (= n 0)
+                  (let [fs (m-fields z id)]
+                    (do (m-set (. z live) id 0)
+                        (update! (. z fields) (fn (v: (Vec (Vec i64))) (assoc v id (vec-empty))))
+                        (recur (into rest (vec (reverse (filter (fn (t: i64) (>= t 0)) fs)))))))
+                  (recur rest)))))))
+
+(defun m-alloc (z: Fz kind: i64 fs: (Vec i64)) -> i64
+  (let [id (m-size z)]
+    (do (update! (. z count) (fn (v: (Vec i64)) (conj v 1)))
+        (update! (. z live) (fn (v: (Vec i64)) (conj v 1)))
+        (update! (. z kind) (fn (v: (Vec i64)) (conj v kind)))
+        (update! (. z fields) (fn (v: (Vec (Vec i64))) (conj v fs)))
+        (update! (. z owned) (fn (v: (Vec i64)) (conj v 1)))
+        (loop [k 0] (if (>= k (count fs)) () (do (if (>= (nth fs k) 0) (m-set (. z count) (nth fs k) (+ (m-count z (nth fs k)) 1)) ()) (recur (+ k 1)))))
+        id)))
+
+;; A random object the program holds a reference to, or -1.
+(defun pick-owned (z: Fz) -> i64
+  (let [ids (vec (filter (fn (id: i64) (> (nth @(. z owned) id) 0)) (range (m-size z))))]
+    (if (= (count ids) 0) -1 (nth ids (below z (count ids))))))
+
+(defun pick-cell (z: Fz) -> i64
+  (let [ids (vec (filter (fn (id: i64) (and (> (nth @(. z owned) id) 0) (= (nth @(. z kind) id) 1))) (range (m-size z))))]
+    (if (= (count ids) 0) -1 (nth ids (below z (count ids))))))
+
+(defun val-of (t: i64) -> IVal (if (>= t 0) (IObj t) (IInt 0 64)))
+(defun m-owned-add (z: Fz id: i64 d: i64) -> unit (m-set (. z owned) id (+ (nth @(. z owned) id) d)))
+
+;; ---- the steps; each returns "" when the heap agreed, else the error text ----
+(defun s-alloc (z: Fz) -> str
+  (let [kind (below z 2) nf (if (= kind 1) 1 (below z 4))
+        fs (mapv (fn (k: i64) (if (= (below z 3) 0) -1 (pick-owned z))) (range nf))]
+    (match (heap-alloc (. z h) (if (= kind 1) ICell IImmutable) 0 (mapv val-of fs))
+      ((Err e) (hp-err-text e))
+      ((Ok id) (let [mid (m-alloc z kind fs)] (if (= id mid) "" (str "heap id " id " model id " mid)))))))
+
+(defun s-release (z: Fz) -> str
+  (let [id (pick-owned z)]
+    (if (< id 0)
+        ""
+        (match (heap-release (. z h) id)
+          ((Err e) (hp-err-text e))
+          ((Ok _) (do (m-owned-add z id -1) (m-release z id) ""))))))
+
+(defun s-retain (z: Fz) -> str
+  (let [id (pick-owned z)]
+    (if (< id 0)
+        ""
+        (match (heap-retain (. z h) id)
+          ((Err e) (hp-err-text e))
+          ((Ok _) (do (m-owned-add z id 1) (m-set (. z count) id (+ (m-count z id) 1)) ""))))))
+
+(defun s-write (z: Fz) -> str
+  (let [c (pick-cell z)]
+    (if (< c 0)
+        ""
+        (let [t (if (= (below z 4) 0) -1 (pick-owned z)) old (if (> (count (m-fields z c)) 0) (nth (m-fields z c) 0) -1)]
+          (match (heap-write (. z h) c 0 (val-of t))
+            ((Err e) (hp-err-text e))
+            ((Ok _) (do (if (>= t 0) (m-set (. z count) t (+ (m-count z t) 1)) ())
+                        (update! (. z fields) (fn (v: (Vec (Vec i64))) (assoc v c [t])))
+                        (if (>= old 0) (m-release z old) ())
+                        "")))))))
+
+(defun step (z: Fz) -> str
+  (let [r (below z 10)]
+    (cond (< r 4) (s-alloc z) (< r 6) (s-release z) (< r 7) (s-retain z) (< r 9) (s-write z) :else (s-alloc z))))
+
+;; The heap and the model agree on liveness and counts.
+(defun agree (z: Fz) -> str
+  (loop [id 0]
+    (cond (>= id (m-size z)) ""
+          (not= (heap-is-live (. z h) id) (m-live? z id)) (str "#" id " liveness differs: heap " (heap-is-live (. z h) id) " model " (m-live? z id))
+          (and (m-live? z id) (not= (ok! (heap-count (. z h) id)) (m-count z id)))
+          (str "#" id " count differs: heap " (ok! (heap-count (. z h) id)) " model " (m-count z id))
+          :else (recur (+ id 1)))))
+
+(defun double-free-text? (s: str) -> bool (or (starts-with-str? s "double free") (starts-with-str? s "use after free")))
+
+(defun starts-with-str? (s: str p: str) -> bool
+  (and (>= (count s) (count p)) (= (subs s 0 (count p)) p)))
+
+;; The program ends: it releases every reference it holds, in a random order.
+(defun teardown (z: Fz) -> str
+  (loop [guard 0]
+    (let [id (pick-owned z)]
+      (if (or (< id 0) (> guard 100000))
+          ""
+          (match (heap-release (. z h) id)
+            ((Err e) (hp-err-text e))
+            ((Ok _) (do (m-owned-add z id -1) (m-release z id) (recur (+ guard 1)))))))))
+
+;; ---- a fault-free run ----
+(defun run-clean (seed: i64 ops: i64) -> str
+  (let [z (fz-new)]
+    (do (update! (. z rng) (fn (s: i64) seed))
+        (loop [k 0]
+          (if (>= k ops)
+              (let [t (teardown z)]
+                (if (not= t "")
+                    (str "seed " seed ": teardown: " t)
+                    (let [rep (heap-finish (. z h))
+                          live (vec (filter (fn (id: i64) (m-live? z id)) (range (m-size z))))
+                          leaked (mapv (fn (l: HpLeakRow) (. l id)) (. rep leaks))]
+                      (cond (not (or (report-clean? rep) (report-cycle-leak-only? rep))) (str "seed " seed ": a correct program's report has a bug")
+                            (not= live leaked) (str "seed " seed ": leaks differ from the model's live objects")
+                            :else ""))))
+              (let [m (step z) a (if (= m "") (agree z) m)]
+                (if (= a "") (recur (+ k 1)) (str "seed " seed " step " k ": " a))))))))
+
+;; ---- a faulty run: 0 over-release, 1 forgotten release; returns "caught:..." or a failure text ----
+(defun inject (z: Fz fault: i64) -> str
+  (let [live (vec (filter (fn (id: i64) (m-live? z id)) (range (m-size z))))]
+    (if (= (count live) 0)
+        "nofault"
+        (let [victim (nth live (below z (count live)))]
+          (if (= fault 0)
+              (match (heap-release (. z h) victim)
+                ((Err e) (if (double-free-text? (hp-err-text e)) "caught-at-injection" (str "wrong error " (hp-err-text e))))
+                ((Ok _) (do (m-release z victim) "injected")))
+              (match (heap-retain (. z h) victim)
+                ((Err e) (str "retain refused: " (hp-err-text e)))
+                ((Ok _) (do (m-set (. z count) victim (+ (m-count z victim) 1)) "injected"))))))))
+
+(defun run-fault (seed: i64 ops: i64 fault: i64) -> str
+  (let [z (fz-new) _s (update! (. z rng) (fn (s: i64) seed)) at (+ (quot ops 4) (below z (quot ops 2)))]
+    (loop [k 0 injected false]
+      (if (>= k ops)
+          (let [t (teardown z)]
+            (cond (not injected) "nofault"
+                  (not= t "") (if (double-free-text? t) "caught-refused" (str "seed " seed ": wrong error " t))
+                  :else (let [rep (heap-finish (. z h))]
+                          (if (or (> (count (report-bugs rep)) 0) (> (count (. rep dangling)) 0))
+                              "caught-at-finish"
+                              (str "seed " seed ": an injected fault " fault " went unreported")))))
+          (let [inj (if (= k at) (inject z fault) "")]
+            (cond (= inj "nofault") "nofault"
+                  (= inj "caught-at-injection") "caught-at-injection"
+                  (and (not= inj "") (not= inj "injected")) (str "seed " seed ": " inj)
+                  :else (let [m (step z)]
+                          (cond (= m "") (recur (+ k 1) (or injected (= inj "injected")))
+                                (and (or injected (= inj "injected")) (double-free-text? m)) "caught-refused"
+                                :else (str "seed " seed " step " k ": " m)))))))))
+
+(defun t-fault-free-runs-agree-with-the-model () -> str
+  (loop [seed 1]
+    (if (> seed 60)
+        ""
+        (let [r (run-clean seed 300)] (if (= r "") (recur (+ seed 1)) r)))))
+
+(defun sweep (fault: i64) -> (Vec str) (mapv (fn (seed: i64) (run-fault seed 300 fault)) (range 1 49)))
+
+(defun failures-of (rs: (Vec str)) -> str
+  (let [bad (filter (fn (r: str) (not (starts-with-str? r "caught"))) rs)]
+    (if (= (count bad) 0) "" (str (count bad) " uncaught or failed, first: " (nth (vec bad) 0)))))
+
+(defun t-an-injected-over-release-is-always-caught () -> str
+  (let [rs (sweep 0)]
+    (do (println (str "  over-release: refused at injection " (count (filter (fn (r: str) (= r "caught-at-injection")) rs))
+                      ", refused later " (count (filter (fn (r: str) (= r "caught-refused")) rs))
+                      ", reported at finish " (count (filter (fn (r: str) (= r "caught-at-finish")) rs)) " of " (count rs)))
+        (failures-of rs))))
+
+(defun t-an-injected-forgotten-release-is-always-caught-at-finish () -> str
+  (let [rs (sweep 1)]
+    (do (println (str "  forgotten release: reported at finish " (count (filter (fn (r: str) (= r "caught-at-finish")) rs)) " of " (count rs)))
+        (failures-of rs))))
+
+(defun main () -> i64
+  (min 100
+    (run-suite "heap-fuzz"
+      [(tc "fault-free-runs-agree-with-the-model" t-fault-free-runs-agree-with-the-model)
+       (tc "injected-over-release-is-caught" t-an-injected-over-release-is-always-caught)
+       (tc "injected-forgotten-release-is-caught" t-an-injected-forgotten-release-is-always-caught-at-finish)])))

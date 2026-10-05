@@ -1,0 +1,131 @@
+;; compiler/fibref/heap/audit.fib: the end-of-run audit: every object still live is a leak, classified so that the one leak the spec permits, a cycle
+;; through cells (spec/ownership.md section 6), is told apart from every other failure. OWNER: package F1. Rust: heap/audit.rs, heap/graph.rs.
+;; At the end of the run every binding is gone, so a live object's count must equal the number of live Ref fields that name it. A surplus is a count some
+;; binding never gave back; a deficit is an over-release not yet caught. Either is a bug even on or under a cycle, so LeakCycle requires count = held.
+;; A live Ref to a freed object (dangling after an over-release) is the double free seen late. Only counted objects are audited: immortal objects are
+;; static data, stack objects end with their scope (one still live at exit is an open scope, never a leak).
+(ns fibref.heap.audit
+  (:use fibref.value fibref.heap.types fibref.heap.state fibref.heap.scc fibref.heap.immortal))
+
+;; The live-object graph: nodes are live counted objects (allocation order), edges are Ref fields between them (Weak fields keep nothing alive).
+(defstruct HpGraph
+  (ids: (Vec i64) kinds: (Vec IKind) counts: (Vec i64) held: (Vec i64) adj: (Vec (Vec i64)) dangling: (Vec HpDangling)))
+
+(defstruct HpEdges (held: (Vec i64) adj: (Vec (Vec i64)) dangling: (Vec HpDangling)))
+
+(defun hp-position-map (ids: (Vec i64)) -> (Map i64 i64)
+  (loop [i 0 m {}] (if (>= i (count ids)) m (recur (+ i 1) (assoc m (nth ids i) i)))))
+
+;; Records the Ref in field `field` of `holder` (node `from`): an edge if its target is live, a dangling reference otherwise (graph.rs add_edge).
+(defun hp-add-edge (pos: (Map i64 i64) e: HpEdges from: i64 holder: i64 field: i64 target: i64) -> HpEdges
+  (match (get pos target)
+    ((some to) (HpEdges (assoc (. e held) to (+ (nth (. e held) to) 1))
+                        (assoc (. e adj) from (conj (nth (. e adj) from) to))
+                        (. e dangling)))
+    (nil (HpEdges (. e held) (. e adj) (conj (. e dangling) (HpDangling holder field target))))))
+
+(defun hp-node-edges (h: Heap pos: (Map i64 i64) e: HpEdges from: i64 id: i64) -> HpEdges
+  (let [fs (hp-fields-of h id)]
+    (loop [f 0 acc e]
+      (if (>= f (count fs))
+          acc
+          (match (hp-counted-target h (nth fs f))
+            ((some t) (recur (+ f 1) (hp-add-edge pos acc from id f t)))
+            (nil (recur (+ f 1) acc)))))))
+
+(defun hp-empty-adj (n: i64) -> (Vec (Vec i64))
+  (loop [i 0 acc (vec-empty)] (if (>= i n) acc (recur (+ i 1) (conj acc (vec-empty))))))
+
+(defun hp-build-graph (h: Heap) -> HpGraph
+  (let [ids (hp-live-counted-ids h)
+        n (count ids)
+        pos (hp-position-map ids)
+        e (loop [from 0 acc (HpEdges (hp-fill n 0) (hp-empty-adj n) (vec-empty))]
+            (if (>= from n)
+                acc
+                (recur (+ from 1) (hp-node-edges h pos acc from (nth ids from)))))]
+    (HpGraph ids
+             (mapv (fn (id: i64) (hp-kind-of h id)) ids)
+             (mapv (fn (id: i64) (hp-count-of h id)) ids)
+             (. e held) (. e adj) (. e dangling))))
+
+(defun hp-immutable-kind? (k: IKind) -> bool (not (kind-mutable? k)))
+
+;; The graph with only the edges between Immutable objects (graph.rs immutable_edges).
+(defun hp-immutable-edges (g: HpGraph) -> (Vec (Vec i64))
+  (loop [from 0 acc (vec-empty)]
+    (if (>= from (count (. g ids)))
+        acc
+        (recur (+ from 1)
+               (conj acc (if (hp-immutable-kind? (nth (. g kinds) from))
+                             (vec (filter (fn (to: i64) (hp-immutable-kind? (nth (. g kinds) to))) (nth (. g adj) from)))
+                             (vec-empty)))))))
+
+;; Nodes reachable from a Cell or Atom that lies on a cycle (graph.rs cell_cycle_nodes).
+(defun hp-cell-cycle-nodes (g: HpGraph) -> (Set i64)
+  (let [cyc (hp-cyclic-nodes (. g adj))
+        roots (vec (filter (fn (n: i64) (kind-mutable? (nth (. g kinds) n))) (vec cyc)))]
+    (loop [reached #{} stack roots]
+      (if (= (count stack) 0)
+          reached
+          (let [node (nth stack (- (count stack) 1))
+                rest (pop stack)]
+            (if (contains? reached node)
+                (recur reached rest)
+                (recur (conj reached node) (into rest (nth (. g adj) node)))))))))
+
+;; The class of every node. ImmutableCycle wins over LeakCycle, which wins over Leak; LeakCycle also needs the node's count to equal the number of live
+;; Ref fields naming it (audit.rs classify).
+(defun hp-classify (g: HpGraph) -> (Vec HpLeakClass)
+  (let [imm (hp-cyclic-nodes (hp-immutable-edges g))
+        cel (hp-cell-cycle-nodes g)]
+    (mapv (fn (n: i64)
+            (cond (contains? imm n) HpImmutableCycle
+                  (and (contains? cel n) (= (nth (. g counts) n) (nth (. g held) n))) HpLeakCycle
+                  :else HpLeak))
+          (range (count (. g ids))))))
+
+(defun hp-leak-rows (g: HpGraph classes: (Vec HpLeakClass) pinned: (Set i64)) -> (Vec HpLeakRow)
+  (loop [n 0 acc (vec-empty)]
+    (cond (>= n (count (. g ids))) acc
+          (contains? pinned (nth (. g ids) n)) (recur (+ n 1) acc)
+          :else (recur (+ n 1) (conj acc (HpLeakRow (nth (. g ids) n) (nth (. g kinds) n) (nth (. g counts) n) (nth (. g held) n) (nth classes n)))))))
+
+;; Live objects per class, in the order object, cell, atom.
+(defun hp-tally (g: HpGraph) -> (Vec i64)
+  (let [of (fn (k: i64) (count (filter (fn (x: IKind) (= (kind-code x) k)) (. g kinds))))]
+    [(of 0) (of 1) (of 2)]))
+
+(defun hp-count-counted (h: Heap live: bool) -> i64
+  (loop [i 0 n 0]
+    (cond (>= i (hp-size h)) n
+          (not (hp-counted? h i)) (recur (+ i 1) n)
+          (and (not live) (hp-live? h i)) (recur (+ i 1) n)
+          :else (recur (+ i 1) (+ n 1)))))
+
+;; Ends the run. Every still-live object is reported as a leak with its class, every dangling Ref is listed, every scope still open is listed.
+;; Immortal and stack objects are never leaks; what is reachable from a pinned root is not reported. The heap is not consumed (audit.rs finish).
+(defun heap-finish (h: Heap) -> HpReport
+  (let [g (hp-build-graph h)]
+    (HpReport (hp-leak-rows g (hp-classify g) (hp-pinned-graph h))
+              (. g dangling)
+              @(. h open)
+              (hp-tally g)
+              (hp-count-counted h true)
+              (hp-count-counted h false))))
+
+;; ---- reading a report (audit.rs AuditReport methods) ----
+(defun report-clean? (r: HpReport) -> bool
+  (and (= (count (. r leaks)) 0) (= (count (. r dangling)) 0) (= (count (. r open-scopes)) 0)))
+
+;; The leaks that are failures: everything but LeakCycle.
+(defun report-bugs (r: HpReport) -> (Vec HpLeakRow)
+  (vec (filter (fn (l: HpLeakRow) (not= (. l class) HpLeakCycle)) (. r leaks))))
+
+;; Something was live, all of it is on the permitted leak path (`audit: leak-cycle`), and nothing dangles.
+(defun report-cycle-leak-only? (r: HpReport) -> bool
+  (and (> (count (. r leaks)) 0) (= (count (report-bugs r)) 0) (= (count (. r dangling)) 0) (= (count (. r open-scopes)) 0)))
+
+;; The ids of the leaks in one class, in allocation order.
+(defun report-ids-in (r: HpReport c: HpLeakClass) -> (Vec i64)
+  (mapv (fn (l: HpLeakRow) (. l id)) (filter (fn (l: HpLeakRow) (= (. l class) c)) (. r leaks))))
