@@ -24,6 +24,7 @@ for k in rmw-window rmw-array fill-window fill-array saxpy-window saxpy-array sa
 done
 ratio() { # NAME A B LIMIT: A/B at most LIMIT
   local r; r=$(awk -v a="$(med "$2")" -v b="$(med "$3")" 'BEGIN{printf "%.2f", a/b}')
+  echo "measure ${1// /-} $r"   # the line a `fibber measure` block's --rerun reads (docs/design/executable-adrs.md §5)
   if awk -v r="$r" -v l="$4" 'BEGIN{exit !(r<=l)}'; then echo "ok    $1: $r (limit $4)"; else echo "FAIL  $1: $r (limit $4)"; bad=1; fi
 }
 ratio "rmw window/array" rmw-window rmw-array 1.3
