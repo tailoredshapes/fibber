@@ -10,13 +10,13 @@
 #   --fibc F     (default: FIBC, else the gate's F) builds the tools it needs into $GOLDEN_OUT/tools first (about a minute)
 # --update keeps each suite's list of inputs (the ones the Rust agreed on); --rescan takes every file the suite's globs match now, and so
 # adds the inputs stage 2 alone has judged.
-# Environment: GOLDEN_OUT scratch (default ~/.cache/fibber-scratch/golden), FIB_LIB is set to lib/ of this tree.
+# Environment: GOLDEN_JOBS suites (and tool builds) at a time, default 4; GOLDEN_OUT scratch (default ~/.cache/fibber-scratch/golden), FIB_LIB is set to lib/ of this tree.
 # Prints `ok SUITE (N inputs)` or `FAIL SUITE: first differing input` for each suite; exit 0 only if none failed; 2 for a usage error.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 . "$here/suites.sh"
-show=; showf=; update=0; rescan=0; only=(); tools=; fibc=${FIBC:-}
+jobs=${GOLDEN_JOBS:-4}; show=; showf=; update=0; rescan=0; only=(); tools=; fibc=${FIBC:-}
 while [ $# -gt 0 ]; do
   case $1 in
     --update) update=1 ;;
@@ -38,41 +38,53 @@ if [ -z "$tools" ]; then
   tools=$out/tools; mkdir -p "$tools"
   stamp=$(sha1sum < "$fibc" | cut -c1-16)-$(cat "$root"/compiler/*/*.fib "$root"/lib/prelude.fib | sha1sum | cut -c1-16)   # the tools are rebuilt when the fibc or the sources change
   if [ "$(cat "$tools/.stamp" 2>/dev/null)" != "$stamp" ]; then
+    pids=()
     for t in read expand types own explain emit lairf; do
-      "$fibc" build "compiler/$t.fib" -I compiler -I lib -L "${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" -l LLVM-21 -o "$tools/$t" || { echo "golden: could not build $t" >&2; exit 2; }
+      "$fibc" build "compiler/$t.fib" -I compiler -I lib -L "${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" -l LLVM-21 -o "$tools/$t" &
+      pids+=($!)
+      if [ ${#pids[@]} -ge "$jobs" ]; then wait "${pids[0]}" || { echo "golden: could not build a tool" >&2; exit 2; }; pids=("${pids[@]:1}"); fi
     done
+    for p in "${pids[@]}"; do wait "$p" || { echo "golden: could not build a tool" >&2; exit 2; }; done
     echo "$stamp" > "$tools/.stamp"
   fi
 fi
 
-# block TOOL OPTIONS FILE: one input's block (the `#### FILE` line, the output, the `status N` line) in $out/block
+# block TOOL OPTIONS FILE BLOCKFILE: one input's block (the `#### FILE` line, the output, the `status N` line) in BLOCKFILE
 block() {
-  { echo "#### $3"; (ulimit -v 8000000; timeout 120 "$tools/$1" $2 "$3" 2>&1; echo "status $?") | sed "s|$root|<root>|g"; } > "$out/block"
+  { echo "#### $3"; (ulimit -v 8000000; timeout 120 "$tools/$1" $2 "$3" 2>&1; echo "status $?") | sed "s|$root|<root>|g"; } > "$4"
 }
 
 if [ -n "$show" ]; then   # --show SUITE FILE: stage 2's output for one input of a suite
   while IFS='|' read -r name tool opts _rust _globs; do
-    if [ "$name" = "$show" ]; then block "$tool" "$opts" "$showf"; cat "$out/block"; exit 0; fi
+    if [ "$name" = "$show" ]; then block "$tool" "$opts" "$showf" "$out/block"; cat "$out/block"; exit 0; fi
   done < <(suite_table)
   echo "golden: no suite $show" >&2; exit 2
 fi
-bad=0
-while IFS='|' read -r name tool opts _rust globs; do
-  [ -z "$name" ] && continue
-  if [ ${#only[@]} -gt 0 ] && [[ " ${only[*]} " != *" $name "* ]]; then continue; fi
-  files=$here/$name.files; gold=$here/$name.golden
+# run_suite NAME TOOL OPTIONS GLOBS: one suite; prints its lines, returns 1 if it failed (run in the background, $jobs at a time)
+run_suite() {
+  local name=$1 tool=$2 opts=$3 globs=$4 files=$here/$1.files gold=$here/$1.golden new=$out/$1.new f
   if [ "$rescan" -eq 1 ]; then
     # the input list: every file the suite's globs match now, in byte order (a new input joins the suite on --update)
     # shellcheck disable=SC2086
     ls -1 $globs 2>/dev/null | LC_ALL=C sort > "$files"
   fi
-  [ -f "$files" ] && [ -f "$gold" ] || { [ "$rescan" -eq 1 ] || { echo "FAIL $name: no golden ($name.golden)"; bad=1; continue; }; }
-  new=$out/$name.new; : > "$new"
-  while read -r f; do block "$tool" "$opts" "$f"; shape "$name" "$out/block" "$f" >> "$new"; done < "$files"
-  if [ "$update" -eq 1 ]; then cp "$new" "$gold"; echo "updated $name ($(wc -l < "$files") inputs)"; continue; fi
-  if cmp -s "$new" "$gold"; then echo "ok $name ($(wc -l < "$files") inputs)"
-  else
-    echo "FAIL $name: $(diff "$gold" "$new" | grep -m1 '^[<>]' | cut -c1-160)"; diff "$gold" "$new" | head -8; bad=1
-  fi
+  [ -f "$files" ] && [ -f "$gold" ] || { [ "$rescan" -eq 1 ] || { echo "FAIL $name: no golden ($name.golden)"; return 1; }; }
+  : > "$new"
+  while read -r f; do block "$tool" "$opts" "$f" "$out/block.$name"; shape "$name" "$out/block.$name" "$f" >> "$new"; done < "$files"
+  if [ "$update" -eq 1 ]; then cp "$new" "$gold"; echo "updated $name ($(wc -l < "$files") inputs)"; return 0; fi
+  if cmp -s "$new" "$gold"; then echo "ok $name ($(wc -l < "$files") inputs)"; return 0; fi
+  echo "FAIL $name: $(diff "$gold" "$new" | grep -m1 '^[<>]' | cut -c1-160)"; diff "$gold" "$new" | head -8; return 1
+}
+
+bad=0; names=(); running=0
+while IFS='|' read -r name tool opts _rust globs; do
+  [ -z "$name" ] && continue
+  if [ ${#only[@]} -gt 0 ] && [[ " ${only[*]} " != *" $name "* ]]; then continue; fi
+  names+=("$name")
+  ( run_suite "$name" "$tool" "$opts" "$globs" > "$out/res.$name"; echo $? > "$out/res.$name.status" ) &
+  running=$((running + 1))
+  if [ "$running" -ge "$jobs" ]; then wait -n; running=$((running - 1)); fi
 done < <(suite_table)
+wait
+for name in "${names[@]}"; do cat "$out/res.$name"; [ "$(cat "$out/res.$name.status")" = 0 ] || bad=1; done
 exit $bad

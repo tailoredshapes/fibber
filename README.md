@@ -22,7 +22,7 @@ the way; a small working language is one of them, not the destination.
 
 Releases are on the [GitHub releases page](https://github.com/tailoredshapes/fibber/releases):
 `fibc-VERSION-linux-x86_64.tar.gz` and `SHA256SUMS`. The 0.0.x releases are
-the Rust tools; from 0.1.0 `fibc` is the compiler written in fibber, built by
+the Rust tools (tag `seed-1`, docs/rust-legacy.md); from 0.1.0 `fibc` is the compiler written in fibber, built by
 itself, and stays 0.x until the owner says 1.0.0. The current release is
 0.1.5 (the file `VERSION`). Download both files, then:
 
@@ -40,7 +40,6 @@ The tarball holds one directory, `fibc-VERSION-linux-x86_64/`:
 | Path | What |
 |------|------|
 | `bin/fibc` | the compiler |
-| `bin/fibref` | the frozen reference interpreter, which also serves `fibref lsp` to the editor pack; present when the seed that built the release had one beside its `fibc` |
 | `share/fibber/lib/` | the standard library source, found beside `bin/` by `fibc` itself |
 | `LICENSE`, `README.txt` | the licence (BSD 3-Clause) and a short layout note |
 
@@ -56,7 +55,7 @@ yourself, see `scripts/package.sh`.
 **Which CPU the code is for.** A release is built with `FIB_TARGET_CPU=x86-64-v2`
 (`scripts/package.sh` sets it unless it is already set), so that the `fibc`
 binary in the tarball runs on any x86-64 CPU with those instructions and not
-only on the one that built it. `FIB_TARGET_CPU` is read by lair (`crates/lair/src/llvm/target.rs`)
+only on the one that built it. `FIB_TARGET_CPU` is read by lair (`compiler/llvm/target.fib`)
 whenever it generates code, so it also applies to the programs you compile: with the
 variable unset, empty or `host`, `fibc run` and `fibc build` on your machine generate code
 for **your host CPU** (its name and its features), and a program built that way may
@@ -74,10 +73,10 @@ Any other value is passed to LLVM as a CPU name with no extra features.
 (highlighting of comments, strings, numbers, keywords, special forms, the
 library's macros, `x:` annotations, reader macros), language configuration
 (brackets, comments) and snippets. It has no build step; copy or symlink the
-directory to `~/.vscode/extensions/tailoredshapes.fibber-0.1.0` and reload the window.
-Since its 0.2.0 it also starts `fibref lsp` for completion, hover and diagnostics;
-that needs `npm install` in the directory and a `fibref` on `PATH` (the tarball's
-`bin/fibref`, when it has one) or the setting `fibber.fibrefPath`. The release workflow also
+directory to `~/.vscode/extensions/tailoredshapes.fibber-0.3.0` and reload the window.
+Versions 0.2.x also started `fibref lsp` for completion, hover and diagnostics; the Rust
+`fibref` is gone, so since 0.3.0 the pack is the grammar, configuration and snippets only
+(a language server, `fibc lsp`, is planned: docs/design/dev-loop.md). The release workflow also
 attaches the extension as `fibber-vscode-VERSION.vsix` to each release
 (`code --install-extension FILE.vsix`). Details: `editors/vscode/README.md`.
 
@@ -86,9 +85,11 @@ attaches the extension as `fibber-vscode-VERSION.vsix` to each release
 The active compiler is written in fibber: `compiler/fibc.fib` contains the
 front end and emitter, `compiler/lir/` checks lIR, and `compiler/native/`
 lowers it through the LLVM-C bindings in `compiler/llvm/`. The runtime
-remains lIR source. The Rust tools in `crates/` are frozen as the bootstrap
-seed and legacy comparison tools; new language work belongs in `compiler/`
-and `lib/`.
+remains lIR source (`rt/`). The Rust tools were retired on 2026-10-05: they are
+in git (tag `seed-1`), and docs/rust-legacy.md says how to build them again,
+what each gave and what was lost. New language work belongs in `compiler/`
+and `lib/`. The passes are checked against golden outputs recorded from the
+Rust oracles (`compiler/tests/golden/`).
 
 The current release and bootstrap seed are **0.1.5**, recorded in `VERSION`
 and `SEED`. The bootstrap check is a fixed point: stage 2 builds stage 3,
@@ -215,11 +216,11 @@ fails the gate, including a known failure that starts passing.
 
 The [October 4 decisions](docs/design/decisions-2026-10-04.md) supersede the
 interpreter-oracle requirement: the interpreter is now a development
-and editor tool. The frozen Rust interpreter does not implement the newer
-stage-2 features. The earlier interpreter/compiler comparison rules in
-[spec/method.md](spec/method.md) remain historical text pending consolidation;
-use the stage-2 gate for current compiler validation. `cargo test --workspace`
-checks the legacy Rust tools and requires LLVM 21 for `lair`.
+and editor tool. The Rust interpreter is retired, and a port of its interpreter and
+memory audit to fibber is scheduled. The earlier interpreter/compiler
+comparison rules in [spec/method.md](spec/method.md) remain historical text
+pending consolidation; use the stage-2 gate for current compiler validation.
+There is no cargo anywhere in the build or the gate.
 
 ## Performance
 

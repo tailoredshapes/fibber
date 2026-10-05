@@ -51,7 +51,7 @@ fi
 # The golden checks of the passes (compiler/tests/golden: reader, expander, type checker, ownership checker, emitter, lair), full gate only.
 if [ "$mode" = full ]; then
   t0=$(now)
-  if "$root/compiler/tests/golden/golden.sh" --fibc "$F" > "$GATE_OUT/golden.log" 2>&1; then
+  if GOLDEN_JOBS=$jobs GOLDEN_OUT=$GATE_OUT/golden "$root/compiler/tests/golden/golden.sh" --fibc "$F" > "$GATE_OUT/golden.log" 2>&1; then
     timings+=("golden $(grep -c '^ok' "$GATE_OUT/golden.log") suites ok $(elapsed "$t0" "$(now)") s")
   else tail -n 20 "$GATE_OUT/golden.log"; fail "golden checks FAILED (log: $GATE_OUT/golden.log)"; timings+=("golden FAILED $(elapsed "$t0" "$(now)") s"); fi
 fi

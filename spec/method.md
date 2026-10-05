@@ -24,7 +24,7 @@ rests on anyone's word, including the author's.
    - `accept`: must type-check, run, produce the stated result, and
      finish with a clean memory audit. A header may add `allocs: <= N`:
      the run allocates at most `N` heap objects, the `A` lines of its
-     free trace (compiler.md §4). `fibref cases` counts them in the
+     free trace (compiler.md §4). `fibref cases` (the Rust, retired: docs/rust-legacy.md) counted them in the
      interpreter's trace and `fibc cases` in the `FIB_TRACE=1` trace of
      the compiled run; the two traces are the same lines, so the counts
      are the same, except in a threaded run, where the compiled program
