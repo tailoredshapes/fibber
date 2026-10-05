@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds and runs the heap unit programs of package F1 (compiler/tests/fibref/heap-{core,modes,inplace,adv,fuzz}.fib): each drives fibref.heap directly and
+# Builds and runs the heap unit programs of package F1 (compiler/tests/fibref/heap-{core,modes,inplace,adv,fuzz,dang,leak,stk,rand,peek,big}.fib): each drives fibref.heap directly and
 # prints one summary line "NAME: N tests, M failed" (and one FAIL line per failing test); its exit status is the number of failures.
 # usage: heap.sh [OVERLAY]    FIBC names the fibc to build with (default `fibc` on the PATH); FIB_LIB the library (default the tree's lib/)
 #   OVERLAY is a directory searched before compiler/ (-I): the mutation script (heap-mutants.sh) puts a mutated copy of compiler/fibref there.
@@ -18,7 +18,7 @@ incs=(-I compiler -I lib)
 [ -n "$overlay" ] && incs=(-I "$overlay" "${incs[@]}")
 cd "$root" || exit 2
 bad=0
-for p in core modes inplace adv fuzz; do
+for p in core modes inplace adv fuzz dang leak stk rand peek big; do
   if ! "$fibc" build "compiler/tests/fibref/heap-$p.fib" "${incs[@]}" -L "$llvmdir" -l LLVM-21 -o "$tmp/$p" 2> "$tmp/$p.err"; then
     head -5 "$tmp/$p.err" >&2; echo "heap-$p: FAILED to build"; bad=1; continue
   fi

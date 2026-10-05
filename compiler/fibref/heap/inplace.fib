@@ -40,9 +40,15 @@
                   (not (hp-field-in-range? h id field)) (Err (HeBadField id field))
                   :else (Ok ())))))
 
+;; A cell slot that may also be changed: no peek is outstanding on the cell (`op` names the change in the error).
+(defun hp-cell-unpeeked (h: Heap id: i64 field: i64 op: HpOp) -> (Result unit HpErr)
+  (match (hp-cell-slot h id field HpWrite)
+    ((Err e) (Err e))
+    ((Ok _) (hp-check-not-peeked h id op))))
+
 ;; Moves the content of a Cell out: the slot becomes ITaken, no count change (`cell-update!`, move-in). Event: Take.
 (defun heap-take (h: Heap id: i64 field: i64) -> (Result IVal HpErr)
-  (match (hp-cell-slot h id field HpWrite)
+  (match (hp-cell-unpeeked h id field HpMove)
     ((Err e) (Err e))
     ((Ok _) (let [v (nth (hp-fields-of h id) field)]
               (match v
@@ -52,7 +58,7 @@
 ;; Puts a value into a slot emptied by `heap-take`, without a retain: the value's count is the one `heap-take` moved out, or the one the callee's result
 ;; owns. HeSlotNotTaken if the slot holds a value (the old one would leak). Event: Put.
 (defun heap-put (h: Heap id: i64 field: i64 v: IVal) -> (Result unit HpErr)
-  (match (hp-cell-slot h id field HpWrite)
+  (match (hp-cell-unpeeked h id field HpWrite)
     ((Err e) (Err e))
     ((Ok _)
      (match (nth (hp-fields-of h id) field)
@@ -70,6 +76,29 @@
                 ((ITaken) (Err (HeTakenSlot id 0)))
                 (_ (do (hp-emit h (EvPeek id)) (Ok v))))))))
 
+;; ---- the peek audit (types section 6.3, "Cell peeks") ----
+;; `heap-peek` above is the untracked read the evaluator was written against. A peek borrows the content of a private cell for ONE expression, with no
+;; count; the heap cannot otherwise see the borrow, so `heap-peek-begin` records it and `heap-peek-end` ends it. While a peek is outstanding on a cell, a
+;; `heap-write`, `heap-write-unique`, `heap-take`, `heap-put`, `heap-move-in`, an array primitive on the cell, the release that would free the cell and
+;; the end of the scope of a stack cell are `HePeeked` (the sibling that writes the cell: `(f @a (do (set! a ..) 0))`, rule P3; a cell freed under the
+;; call, rule P2). `heap-finish` lists a peek never ended (`open-peeks`). The syntactic rules P1 (a private cell: only the kind is checked here, an atom is
+;; refused) and P2 are the checker's; this is the dynamic half. The borrowed content must be live: a dangling one is UseAfterFree at the begin.
+(defun heap-peek-begin (h: Heap id: i64) -> (Result IVal HpErr)
+  (match (hp-cell-slot h id 0 HpRead)
+    ((Err e) (Err e))
+    ((Ok _) (let [v (nth (hp-fields-of h id) 0)]
+              (match v
+                ((ITaken) (Err (HeTakenSlot id 0)))
+                (_ (match (hp-check-storable h v (hp-holder-of h id))
+                     ((Err e) (Err e))
+                     ((Ok _) (do (hp-set-peeks h id (+ (hp-peeks-of h id) 1)) (hp-emit h (EvPeek id)) (Ok v))))))))))
+
+;; Ends the borrow of the latest peek of the cell. HePeekNotOutstanding if there is none.
+(defun heap-peek-end (h: Heap id: i64) -> (Result unit HpErr)
+  (cond (not (hp-known? h id)) (Err (HeUnknownId id))
+        (= (hp-peeks-of h id) 0) (Err (HePeekNotOutstanding id))
+        :else (do (hp-set-peeks h id (- (hp-peeks-of h id) 1)) (hp-emit h (EvPeekEnd id)) (Ok ()))))
+
 ;; ---- move-in ----
 ;; `&` copy-in that takes the content of the variable's cell `place` without a retain (PsMoveIn): a new private STACK cell of `scope` holds it, the
 ;; variable's slot is emptied. The write-back is an ordinary `heap-write` into the emptied slot (nothing old to release). Events: AllocStack, MoveIn.
@@ -77,7 +106,7 @@
   (match (hp-check-open h scope)
     ((Err e) (Err e))
     ((Ok _)
-     (match (hp-cell-slot h place 0 HpWrite)
+     (match (hp-cell-unpeeked h place 0 HpMove)
        ((Err e) (Err e))
        ((Ok _) (hp-move-in-content h scope place tid (nth (hp-fields-of h place) 0)))))))
 
@@ -97,7 +126,7 @@
 ;; ---- arrays held by a Cell ----
 ;; The array a Cell `place` holds: a live Immutable object (HeNotUnique with the place or content named otherwise).
 (defun hp-array-of (h: Heap place: i64) -> (Result i64 HpErr)
-  (match (hp-cell-slot h place 0 HpWrite)
+  (match (hp-cell-unpeeked h place 0 HpWrite)
     ((Err e) (Err e))
     ((Ok _) (match (nth (hp-fields-of h place) 0)
               ((IObj arr) (hp-array-object h arr))

@@ -41,7 +41,7 @@ M = [
  ("stack-ref-into-outer-scope-accepted", "heap/store.fib", "(and (>= holder 0) (hp-stack? h id) (> (hp-scope-of h id) holder))", "false"),
  ("weak-to-stack-accepted", "heap/store.fib", "(hp-stack? h id) (Err (HeWeakToStack id))", "false (Err (HeWeakToStack id))"),
  ("wrong-slot-count-accepted", "heap/store.fib", "(and (kind-mutable? kind) (not= (count fields) 1))", "false"),
- ("scope-ends-in-allocation-order", "heap/life.fib", "(let [dropped (hp-reversed (nth @(. h scope-objs) scope))]", "(let [dropped (nth @(. h scope-objs) scope)]"),
+ ("scope-ends-in-allocation-order", "heap/life.fib", "(let [dropped (hp-reversed (nth @(. h scope-objs) scope))\n           peeked", "(let [dropped (nth @(. h scope-objs) scope)\n           peeked"),
  ("mutable-immortal-accepted", "heap/life.fib", "(cond (kind-mutable? kind) (Err (HeMutableImmortal kind))", "(cond false (Err (HeMutableImmortal kind))"),
  ("sharing-passes-through-immortal", "heap/shared.fib", "(cond (or (hp-immortal? h id) (contains? seen id)) (recur seen order rest)", "(cond (contains? seen id) (recur seen order rest)"),
  ("sharing-ignores-dangling-ref", "heap/shared.fib", "((some t) (hp-live-object h t HpShare))", "((some t) (Ok ()))"),
@@ -61,9 +61,34 @@ M = [
  ("array-take-does-not-null-the-slot", "heap/inplace.fib", "((some _) (hp-set-field h a i ITaken))", "((some _) ())"),
  ("array-pop-copy-does-not-retain", "heap/inplace.fib", "(do (hp-retain-stored h v)", "(do ()"),
  ("array-copy-does-not-release-the-old", "heap/inplace.fib", "(hp-apply-release h order)", "()"),
+ # ---- F1 completion: the peek audit, dyn take, the array-pop fix and the adversarial ports ----
+ ("peek-write-allowed", "heap/access.fib", "(> (hp-peeks-of h id) 0) (Err (HePeeked id HpWrite))", "false (Err (HePeeked id HpWrite))"),
+ ("peek-unique-write-allowed", "heap/unique.fib", "(> (hp-peeks-of h place) 0) (Err (HePeeked place HpWrite))", "false (Err (HePeeked place HpWrite))"),
+ ("peek-take-put-array-allowed", "heap/state.fib", "(if (> (hp-peeks-of h id) 0) (Err (HePeeked id op)) (Ok ()))", "(Ok ())"),
+ ("peek-release-allowed", "heap/cascade.fib", "(if (and (= c2 0) (> (hp-peeks-of h id) 0))", "(if false"),
+ ("peek-end-scope-allowed", "heap/life.fib", "(match (if (> (count peeked) 0) (Err (HePeeked (nth (vec peeked) 0) HpRelease)) (hp-plan-drops h dropped))", "(match (hp-plan-drops h dropped)"),
+ ("peek-begin-does-not-record", "heap/inplace.fib", "(do (hp-set-peeks h id (+ (hp-peeks-of h id) 1)) (hp-emit h (EvPeek id)) (Ok v))", "(do (hp-emit h (EvPeek id)) (Ok v))"),
+ ("peek-end-without-begin-accepted", "heap/inplace.fib", "(= (hp-peeks-of h id) 0) (Err (HePeekNotOutstanding id))", "false (Err (HePeekNotOutstanding id))"),
+ ("peek-end-does-not-decrement", "heap/inplace.fib", ":else (do (hp-set-peeks h id (- (hp-peeks-of h id) 1)) (hp-emit h (EvPeekEnd id)) (Ok ()))", ":else (do (hp-emit h (EvPeekEnd id)) (Ok ()))"),
+ ("peek-begin-dangling-content-accepted", "heap/inplace.fib", "(_ (match (hp-check-storable h v (hp-holder-of h id))\n                     ((Err e) (Err e))\n                     ((Ok _) (do (hp-set-peeks", "(_ (match (Ok ())\n                     ((Err e) (Err e))\n                     ((Ok _) (do (hp-set-peeks"),
+ ("peek-open-not-reported", "heap/audit.fib", "(vec (filter (fn (id: i64) (> (hp-peeks-of h id) 0)) (range (hp-size h))))", "(vec-empty)"),
+ ("peek-open-is-clean", "heap/audit.fib", "(= (count (. r open-scopes)) 0) (= (count (. r open-peeks)) 0)))\n\n;; The leaks", "(= (count (. r open-scopes)) 0)))\n\n;; The leaks"),
+ ("dyn-take-does-not-retain", "heap/inplace.fib", "(if dyn (hp-retain-stored h v) ())", "()"),
+ ("dyn-take-nulls-the-slot", "heap/inplace.fib", "(if dyn\n                 ()\n                 (match (ival-obj v)", "(if false\n                 ()\n                 (match (ival-obj v)"),
+ ("array-pop-leaves-the-length", "heap/inplace.fib", "(hp-set-fields h arr (pop (hp-fields-of h arr)))", "(hp-set-fields h arr (hp-fields-of h arr))"),
+ ("mark-shared-marks-twice", "heap/shared.fib", "(do (if (hp-shared? h id)\n                                ()", "(do (if false\n                                ()"),
+ ("scope-ended-check-dropped", "heap/life.fib", "(= 1 (nth @(. h scope-ended) scope)) (Err (HeScopeEnded scope))", "false (Err (HeScopeEnded scope))"),
+ ("unknown-scope-check-dropped", "heap/life.fib", "(or (< scope 0) (>= scope (count @(. h scope-objs)))) (Err (HeUnknownScope scope))", "false (Err (HeUnknownScope scope))"),
+ ("weak-of-unknown-id-accepted", "heap/store.fib", "(cond (not (hp-known? h id)) (Err (HeUnknownId id))\n        (hp-stack? h id) (Err (HeWeakToStack id))", "(cond false (Err (HeUnknownId id))\n        (hp-stack? h id) (Err (HeWeakToStack id))"),
+ ("dead-weak-blocks-a-crossing", "heap/shared.fib", "((some id) (if (hp-live? h id) (some id) nil))", "((some id) (some id))"),
+ ("unique-write-bad-field-accepted", "heap/unique.fib", "(cond (not (hp-field-in-range? h id field)) (Err (HeBadField id field))", "(cond false (Err (HeBadField id field))"),
+ ("finish-ignores-open-scopes", "heap/audit.fib", "              @(. h open)\n", "              (vec-empty)\n"),
+ ("held-counts-one-per-holder", "heap/audit.fib", "(HpEdges (assoc (. e held) to (+ (nth (. e held) to) 1))", "(HpEdges (assoc (. e held) to 1)"),
+ ("failed-alloc-still-takes-an-id", "heap/life.fib", "(match (hp-check-new h kind fields holder-heap)\n    ((Err e) (Err e))", "(match (hp-check-new h kind fields holder-heap)\n    ((Err e) (do (hp-push h kind 0 0 0 -1 []) (Err e)))"),
+ ("upgrade-of-dead-emits-live", "heap/access.fib", "(do (hp-emit h (EvUpgrade id live))", "(do (hp-emit h (EvUpgrade id true))"),
 ]
 
-PROGRAMS = ["core", "modes", "inplace", "adv", "fuzz"]
+PROGRAMS = ["core", "modes", "inplace", "adv", "fuzz", "dang", "leak", "stk", "rand", "peek", "big"]
 
 def run_mutant(args):
     root, fibc, scratch, k, (name, rel, old, new) = args
@@ -72,6 +97,7 @@ def run_mutant(args):
     shutil.copytree(os.path.join(root, "compiler", "fibref"), os.path.join(ov, "fibref"))
     path = os.path.join(ov, "fibref", rel)
     text = open(path).read()
+    old, new = old.replace("\\n", "\n"), new.replace("\\n", "\n")
     if text.count(old) != 1:
         return name, "INVALID", "pattern found %d times in %s" % (text.count(old), rel)
     open(path, "w").write(text.replace(old, new))

@@ -353,3 +353,18 @@ the two tracks share only the front end and the driver, so they never block each
 
 No stub has a body. No fibber port of any part exists yet. The speeds are plans. The golden outputs are seed-1's: they fix behaviour for the language
 as it was then, not for primitives added since. The 0.7 ratio is the project's, not measured for an interpreter.
+
+## 11. F1 completion (heap): inventory, peeks, dyn, performance
+
+Rust heap tests at seed-1 (`grep -c '#\[test\]'`): unit `heap/tests/*.rs` and `heap/scc.rs` 103, adversarial `tests/heap_adversarial/*.rs`,
+`heap_stack_adversarial.rs`, `heap_unique_adversarial.rs` 151 (254 in all; `replay.rs` and `heap_adversarial.rs` hold helpers, no tests).
+Every one has a fibber test: the unit files in `heap-{core,modes,inplace,adv}.fib`; the adversarial files in `heap-dang.fib` (dangling, deficit, errors,
+free, reentrant), `heap-leak.fib` (leaks, masked, report, weak, shared, trace), `heap-stk.fib` (stack, unique), `heap-rand.fib` (replay, acyclic, cyclic,
+fault), `heap-big.fib` (bigweak and the 200000 case of order; the other scale cases run at 30000 in `heap-adv.fib`). Exception: rollback.rs
+`a_write_whose_old_value_release_fails...` has no test of its own (the unit test `a_write_plans_the_release_with_the_slot_already_replaced` and
+`dang-write-cascade-into-an-over-released-grandchild` cover it).
+
+New rules (contract additions, nothing removed): `heap-peek-begin`/`heap-peek-end` (a peek outstanding on a cell makes a write, unique write, take,
+put, move-in, array primitive, freeing release or scope end `HePeeked`; `heap-finish` lists `open-peeks`); `heap-array-take-dyn` (retain, slot
+unchanged). `heap-peek` stays as the untracked read; F2 should call begin/end. `array-pop!` of a unique array copied the prefix (quadratic); now `pop`.
+Tests: `heap-peek.fib`; goldens: `heap-gold.sh` (20 hand-built graphs against `golden/fibref/itrace-ownership.txt`).
