@@ -1,0 +1,150 @@
+;; compiler/gen/print/pipelines.fib: printing a pipeline node as the forms a program writes, crates/fibgen/src/print/pipelines.rs (seed-1). OWNER: package P.
+;; Threaded with `->>`, as nested calls, with the stages bound by `let`, or bound once and read by two terminals. `ex` prints an expression (gen.print's `print-expr`:
+;; the pipeline's functions are ordinary expressions and a pipeline is an expression; the function value breaks the cycle).
+(ns gen.print.pipelines
+  (:use gen.ty gen.ast gen.print.sexp))
+
+(defun pp-bound :private (k: i64) -> FgSexp (sx-atom (str "sq" k)))
+(defun pp-digest :private (e: FgSexp) -> FgSexp (sx-form "digest" [e]))
+
+(defun pp-src :private (s: FgSrc ex: (fn (FgExpr) FgSexp)) -> FgSexp
+  (match s
+    ((SrVec e) (ex e)) ((SrList e) (ex e))
+    ((SrRange n) (sx-form "range" [(ex n)]))))
+
+(defun pp-operand :private (o: FgOperand ex: (fn (FgExpr) FgSexp)) -> FgSexp
+  (match o
+    ((OpVec e) (ex e))
+    ((OpLazy c) (pp-nested c (vec-count (. c stages)) (pp-src (. c src) ex) ex))
+    ((OpEager c) (sx-form "vec" [(pp-nested c (vec-count (. c stages)) (pp-src (. c src) ex) ex)]))))
+
+(defun pp-stage-name :private (s: FgStage) -> str
+  (match s
+    ((SgMap e) "map") ((SgFilter e) "filter") ((SgRemove e) "remove") ((SgTake e) "take") ((SgDrop e) "drop")
+    ((SgTakeWhile e) "take-while") ((SgMapcat e) "mapcat") ((SgConcat o f) "concat")))
+
+;; The items of `s` before the seq it is applied to: `[map f]`.
+(defun pp-stage-step :private (s: FgStage ex: (fn (FgExpr) FgSexp)) -> (Vec FgSexp)
+  (let ((head (sx-atom (pp-stage-name s))))
+    (match s
+      ((SgMap e) [head (ex e)]) ((SgFilter e) [head (ex e)]) ((SgRemove e) [head (ex e)])
+      ((SgTake e) [head (ex e)]) ((SgDrop e) [head (ex e)]) ((SgTakeWhile e) [head (ex e)])
+      ((SgMapcat e) [head (ex e)])
+      ((SgConcat o f) [head (pp-operand o ex)]))))
+
+;; The call of `s` over `prev`.
+(defun pp-stage-call :private (s: FgStage prev: FgSexp ex: (fn (FgExpr) FgSexp)) -> FgSexp
+  (match s
+    ((SgConcat o first)
+      (if first
+          (sx-list (conj (pp-stage-step s ex) prev))
+          (sx-form "concat" [prev (pp-operand o ex)])))
+    (_ (sx-list (conj (pp-stage-step s ex) prev)))))
+
+;; The first `k` stages of `c` as nested calls over `base`.
+(defun pp-nested (c: FgChain k: i64 base: FgSexp ex: (fn (FgExpr) FgSexp)) -> FgSexp
+  (reduce (fn (prev: FgSexp s: FgStage) (pp-stage-call s prev ex)) base (vec (take k (. c stages)))))
+
+;; The step of a `reduce`, with its body under the `reduced` test when the term has a `stop`.
+(defun pp-reduce-fn :private (f: FgExpr stop: (Option i64) ex: (fn (FgExpr) FgSexp)) -> FgSexp
+  (match stop
+    ((some limit)
+      (match (. f kind)
+        ((EkFn params body)
+          (let ((over (sx-form ">" [(sx-atom "a") (sx-atom (str limit))]))
+                (test (sx-form "if" [over (sx-form "reduced" [(sx-atom "a")]) (ex body)]))
+                (bare (mapv (fn (p: FgNameTy) (sx-atom (. p name))) params)))
+            (sx-form "fn" [(sx-list bare) test])))
+        (_ (ex f))))
+    (nil (ex f))))
+
+;; The calls of the terminal, each as the items before the seq (the library's argument order puts the seq last), or nil for `nth`.
+(defun pp-term-steps :private (t: FgTerm ex: (fn (FgExpr) FgSexp)) -> (Option (Vec (Vec FgSexp)))
+  (let ((one (fn (items: (Vec FgSexp)) (some [items])))
+        (a (fn (s: str) (sx-atom s))))
+    (match t
+      ((TmReduce f init stop) (one [(a "reduce") (pp-reduce-fn f stop ex) (ex init)]))
+      ((TmReduce1 f) (one [(a "reduce") (ex f)]))
+      ((TmCount) (one [(a "count")]))
+      ((TmVec) (one [(a "vec")]))
+      ((TmFirst) (one [(a "first")]))
+      ((TmLast) (one [(a "last")]))
+      ((TmEmpty) (one [(a "empty?")]))
+      ((TmSum) (one [(a "sum")]))
+      ((TmSort) (some [[(a "sort")] [(a "vec")]]))
+      ((TmEvery p) (one [(a "every?") (ex p)]))
+      ((TmFindFirst p) (one [(a "find-first") (ex p)]))
+      ((TmSortBy k) (some [[(a "sort-by") (ex k)] [(a "vec")]]))
+      ((TmNth i) nil))))
+
+(defun pp-some-v :private (body: FgSexp) -> FgSexp (sx-list [(sx-list [(sx-atom "some") (sx-atom "v")]) body]))
+
+;; The number the terminal's answer `s` stands for.
+(defun pp-fold :private (t: FgTerm s: FgSexp) -> FgSexp
+  (let ((none (sx-atom (str (pipe-none)))))
+    (match t
+      ((TmVec) (pp-digest s)) ((TmSort) (pp-digest s)) ((TmSortBy k) (pp-digest s))
+      ((TmFirst) (sx-form "match" [s (sx-list [(sx-atom "nil") none]) (pp-some-v (sx-atom "v"))]))
+      ((TmLast) (sx-form "unwrap-or" [s none]))
+      ((TmEmpty) (sx-form "if" [s (sx-atom "1") (sx-atom "0")]))
+      ((TmEvery p) (sx-form "if" [s (sx-atom "1") (sx-atom "0")]))
+      ((TmFindFirst p)
+        (let ((plus (sx-form "+" [(sx-atom "v") (sx-atom "1")])))
+          (sx-form "match" [s (sx-list [(sx-atom "nil") none]) (pp-some-v plus)])))
+      (_ s))))
+
+;; The terminal applied to the seq `s` as a call: its answer, folded.
+(defun pp-term-call :private (t: FgTerm s: FgSexp ex: (fn (FgExpr) FgSexp)) -> FgSexp
+  (let ((answer (match (pp-term-steps t ex)
+                  ((some steps) (reduce (fn (prev: FgSexp step: (Vec FgSexp)) (sx-list (conj step prev))) s steps))
+                  (nil (match t ((TmNth i) (sx-form "nth" [s (ex i)])) (_ s))))))
+    (pp-fold t answer)))
+
+(defun pp-seq-last? :private (s: FgStage) -> bool
+  (match s ((SgConcat o first) (not first)) (_ false)))
+
+;; `(->> src step ..)`, or nil when something cannot be threaded last: `nth`, and a `concat` whose seq is its first argument.
+(defun pp-thread :private (p: FgPipe ex: (fn (FgExpr) FgSexp)) -> (Option FgSexp)
+  (let ((t0 (vec-nth (. p terms) 0))
+        (stages (. (. p chain) stages)))
+    (match (pp-term-steps t0 ex)
+      (nil nil)
+      ((some steps)
+        (if (some? (find-first pp-seq-last? stages))
+            nil
+            (let ((head [(sx-atom "->>") (pp-src (. (. p chain) src) ex)])
+                  (mid (mapv (fn (s: FgStage) (sx-list (pp-stage-step s ex))) stages))
+                  (tail (mapv sx-list steps)))
+              (some (pp-fold t0 (sx-list (vec (concat (vec (concat head mid)) tail)))))))))))
+
+;; The first `k` stages bound by a `let`, the others nested over the last name, under the terminal.
+(defun pp-bound-stages :private (p: FgPipe k: i64 ex: (fn (FgExpr) FgSexp)) -> FgSexp
+  (let ((c (. p chain))
+        (firsts (vec (take k (. c stages))))
+        (rest (vec (drop k (. c stages))))
+        (st (reduce (fn (acc: (Vec FgSexp) s: FgStage)
+                      (let ((prev (if (= (vec-count acc) 0) (pp-src (. c src) ex) (pp-bound (vec-count acc)))))
+                        (conj acc (sx-list [(pp-bound (+ (vec-count acc) 1)) (pp-stage-call s prev ex)]))))
+                    [] firsts))
+        (prev (if (= k 0) (pp-src (. c src) ex) (pp-bound (vec-count firsts))))
+        (tail (pp-nested (FgChain (. c src) rest) (vec-count rest) prev ex))
+        (call (pp-term-call (vec-nth (. p terms) 0) tail ex)))
+    (if (= (vec-count st) 0) call (sx-form "let" [(sx-list st) call]))))
+
+;; One seq bound to a name and read by two terminals, in order.
+(defun pp-twice :private (p: FgPipe ex: (fn (FgExpr) FgSexp)) -> FgSexp
+  (let ((c (. p chain))
+        (seq (pp-nested c (vec-count (. c stages)) (pp-src (. c src) ex) ex))
+        (first (sx-form "*" [(pp-term-call (vec-nth (. p terms) 0) (pp-bound 0) ex) (sx-atom "7")]))
+        (sum (sx-form "+" [first (pp-term-call (vec-nth (. p terms) 1) (pp-bound 0) ex)])))
+    (sx-form "let" [(sx-list [(sx-list [(pp-bound 0) seq])]) sum])))
+
+;; The pipeline as one `i64` form.
+(defun pipes-sexp (p: FgPipe ex: (fn (FgExpr) FgSexp)) -> FgSexp
+  (let ((n (vec-count (. (. p chain) stages))))
+    (cond (= (vec-count (. p terms)) 2) (pp-twice p ex)
+          :else (match (. p shape)
+                  ((ShThread) (match (pp-thread p ex) ((some s) s) (nil (pp-bound-stages p 0 ex))))
+                  ((ShNested) (pp-bound-stages p 0 ex))
+                  ((ShBound) (pp-bound-stages p n ex))
+                  ((ShSplit k) (pp-bound-stages p (min k n) ex))))))

@@ -4,8 +4,9 @@
 ;; - variants carry a prefix: `Y` for `Ty`, `Nm` for `NumTy`, `Pr` for `Proto`; the Rust name is beside each;
 ;; - `Box<Ty>` is a plain field; `Derived(&'static str)` is `YDerived` of a str;
 ;; - `Func(Vec<Ty>, Box<Ty>)` is `YFunc` of a vector of parameter types and a result.
-;; The Rust associated functions are `ty-*`, `proto-*`, `num-*`; the functions here are stubs (trap).
-(ns gen.ty)
+;; The Rust associated functions are `ty-*`, `proto-*`, `num-*`; the functions are implemented (package T).
+(ns gen.ty
+  (:use fib.string))
 
 (defenum FgNum NmI8 NmI16 NmI32 NmF32 NmF64)
 (derive Eq FgNum)
@@ -26,29 +27,106 @@
   (YGen proto: FgProto send: bool))
 (derive Eq FgTy)
 
-;; NumTy::name, bits, is_float.
-(defun num-name (n: FgNum) -> str (trap "todo: gen.ty num-name"))
-(defun num-bits (n: FgNum) -> i64 (trap "todo: gen.ty num-bits"))
-(defun num-float? (n: FgNum) -> bool (trap "todo: gen.ty num-float?"))
 
-;; Proto::name, methods, entails.
-(defun proto-name (p: FgProto) -> str (trap "todo: gen.ty proto-name"))
-(defun proto-methods (p: FgProto) -> (Vec str) (trap "todo: gen.ty proto-methods"))
-(defun proto-entails? (p: FgProto q: FgProto) -> bool (trap "todo: gen.ty proto-entails?"))
+(defun num-name (n: FgNum) -> str
+  (match n ((NmI8) "i8") ((NmI16) "i16") ((NmI32) "i32") ((NmF32) "f32") ((NmF64) "f64")))
 
-;; Ty::fn_i, fn_0, inner, is_send, may_reach_cell, is_atom, needs_protocols, is_object.
-(defun ty-fn-i () -> FgTy (trap "todo: gen.ty ty-fn-i"))
-(defun ty-fn-0 () -> FgTy (trap "todo: gen.ty ty-fn-0"))
-(defun ty-inner (t: FgTy) -> (Option FgTy) (trap "todo: gen.ty ty-inner"))
-(defun ty-send? (t: FgTy) -> bool (trap "todo: gen.ty ty-send?"))
-(defun ty-may-reach-cell? (t: FgTy) -> bool (trap "todo: gen.ty ty-may-reach-cell?"))
-(defun ty-atom? (t: FgTy) -> bool (trap "todo: gen.ty ty-atom?"))
-(defun ty-needs-protocols? (t: FgTy) -> bool (trap "todo: gen.ty ty-needs-protocols?"))
-(defun ty-object? (t: FgTy) -> bool (trap "todo: gen.ty ty-object?"))
+(defun num-bits (n: FgNum) -> i64
+  (match n ((NmI8) 8) ((NmI16) 16) ((NmI32) 32) ((NmF32) 32) ((NmF64) 64)))
 
-;; `impl Display for Ty`: the type as the program writes it, e.g. `(Cell (Vec i64))`, `(dyn Score :send)`, `(Hook :local)`.
-(defun ty-text (t: FgTy) -> str (trap "todo: gen.ty ty-text"))
+(defun num-float? (n: FgNum) -> bool
+  (match n ((NmF32) true) ((NmF64) true) (_ false)))
 
-;; `universe()` (42 types, in the Rust order: the order is part of the determinism contract) and `inout_contents()`.
-(defun ty-universe () -> (Vec FgTy) (trap "todo: gen.ty ty-universe"))
-(defun ty-inout-contents () -> (Vec FgTy) (trap "todo: gen.ty ty-inout-contents"))
+(defun proto-name (p: FgProto) -> str
+  (match p ((PrScore) "Score") ((PrRank) "Rank")))
+
+(defun proto-methods (p: FgProto) -> (Vec str)
+  (match p
+    ((PrScore) ["score" "bonus"])
+    ((PrRank) ["score" "bonus" "rank" "tier"])))
+
+(defun proto-entails? (p: FgProto q: FgProto) -> bool
+  (or (= p q) (and (= p PrRank) (= q PrScore))))
+
+(defun ty-fn-i () -> FgTy (YFunc [YInt] YInt))
+(defun ty-fn-0 () -> FgTy (YFunc [] YInt))
+
+(defun ty-inner (t: FgTy) -> (Option FgTy)
+  (match t
+    ((YBoxed x) (some x)) ((YOpt x) (some x)) ((YVec x) (some x)) ((YCell x) (some x))
+    ((YAtom x) (some x)) ((YWeak x) (some x)) ((YArray x) (some x)) ((YTask x) (some x))
+    (_ nil)))
+
+;; types section 5.1: whether a value may cross a thread.
+(defun ty-send? (t: FgTy) -> bool
+  (match t
+    ((YHolder) false) ((YCell x) false) ((YFunc ps r) false) ((YGen p s) false)
+    ((YDyn p s) s) ((YHook s) s) ((YJob s) s)
+    ((YBoxed x) (ty-send? x)) ((YOpt x) (ty-send? x)) ((YVec x) (ty-send? x)) ((YWeak x) (ty-send? x))
+    ((YTask x) (ty-send? x)) ((YArray x) (ty-send? x))
+    (_ true)))
+
+;; Whether a value may hold a strong reference to a cell (directly or through a closure's captures).
+(defun ty-may-reach-cell? (t: FgTy) -> bool
+  (match t
+    ((YHolder) true) ((YCell x) true) ((YFunc ps r) true) ((YGen p s) true)
+    ((YDyn p s) (not s)) ((YHook s) (not s)) ((YJob s) (not s))
+    ((YBoxed x) (ty-may-reach-cell? x)) ((YOpt x) (ty-may-reach-cell? x)) ((YVec x) (ty-may-reach-cell? x))
+    ((YArray x) (ty-may-reach-cell? x))
+    (_ false)))
+
+(defun ty-atom? (t: FgTy) -> bool
+  (match t ((YAtom x) true) (_ false)))
+
+(defun ty-needs-protocols? (t: FgTy) -> bool
+  (match t
+    ((YDyn p s) true) ((YGen p s) true)
+    ((YVec x) (ty-needs-protocols? x)) ((YWeak x) (ty-needs-protocols? x)) ((YAtom x) (ty-needs-protocols? x))
+    (_ false)))
+
+;; Whether `weak` accepts the type.
+(defun ty-object? (t: FgTy) -> bool
+  (match t ((YUnit) false) ((YInt) false) ((YBool) false) ((YNum n) false) (_ true)))
+
+(defun ty-colour-text :private (send: bool) -> str (if send ":send" ":local"))
+
+(defun ty-text (t: FgTy) -> str
+  (match t
+    ((YUnit) "unit") ((YInt) "i64") ((YBool) "bool") ((YStr) "str") ((YPt) "Pt") ((YWrap) "Wrap")
+    ((YHolder) "Holder") ((YShape) "Shape")
+    ((YBoxed x) (str "(Box " (ty-text x) ")"))
+    ((YOpt x) (str "(Option " (ty-text x) ")"))
+    ((YVec x) (str "(Vec " (ty-text x) ")"))
+    ((YList) "(List i64)")
+    ((YCell x) (str "(Cell " (ty-text x) ")"))
+    ((YAtom x) (str "(Atom " (ty-text x) ")"))
+    ((YWeak x) (str "(Weak " (ty-text x) ")"))
+    ((YTask x) (str "(Task " (ty-text x) ")"))
+    ((YFunc ps r) (str "(fn (" (join " " (mapv ty-text ps)) ") " (ty-text r) ")"))
+    ((YDyn p s) (if s (str "(dyn " (proto-name p) " :send)") (str "(dyn " (proto-name p) ")")))
+    ((YHook s) (str "(Hook " (ty-colour-text s) ")"))
+    ((YJob s) (str "(Job " (ty-colour-text s) ")"))
+    ((YGen p s) "a")
+    ((YNum n) (num-name n))
+    ((YArray x) (str "(Array " (ty-text x) ")"))
+    ((YDerived n) n)))
+
+;; universe(): the order is part of the determinism contract.
+(defun ty-universe () -> (Vec FgTy)
+  (let ((dsl (YDyn PrScore false)) (dss (YDyn PrScore true)))
+    [YInt YBool YStr YPt YWrap YHolder YShape
+     (YBoxed YStr) (YBoxed (YVec YInt)) (YBoxed YWrap) (YBoxed (ty-fn-i))
+     (YOpt YInt) (YOpt YStr) (YOpt YWrap)
+     (YVec YInt) (YVec YStr) (YVec YWrap) (YVec (ty-fn-i))
+     YList
+     (YCell YInt) (YCell (YVec YInt)) (YCell YStr) (YCell (ty-fn-i)) (YCell YPt) (YCell YWrap)
+     (YAtom YInt) (YAtom (YVec YInt))
+     (ty-fn-i) (ty-fn-0)
+     (YTask YInt) (YTask YStr)
+     (YHook true) (YHook false)
+     dsl dss (YDyn PrRank false) (YDyn PrRank true)
+     (YVec dsl) (YVec dss)
+     (YJob true) (YJob false)
+     (YWeak dss) (YAtom (YDyn PrRank true))]))
+
+(defun ty-inout-contents () -> (Vec FgTy) [YInt YStr (YVec YInt) YPt YWrap])

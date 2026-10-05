@@ -1,0 +1,119 @@
+;; compiler/tests/gen/unit-print.fib: the unit tests of crates/fibgen/src/print/{mod,items,pipelines/tests}.rs (seed-1), ported: the text of each pipeline shape, of each
+;; terminal's fold, calls, derefs and `&`, the preamble that a program names, vector patterns, guards, `dyn`, impls on colour-parameterised structs, the layout rule.
+;; Returns the number of failed checks (0 = pass). Build and run with unit.sh.
+(ns main
+  (:use gen.ty gen.ast gen.print gen.print.sexp tests.gen.check)
+  (:require [fib.string :as s]))
+
+(defun flat (e: FgExpr) -> str (print-flat (print-expr e)))
+(defun pipe-text (p: FgPipe) -> str (flat (expr-new YInt (EkPipe p))))
+(defun pt (stages: (Vec FgStage) term: FgTerm shape: FgShape) -> str (pipe-text (fx-pipe [1 2] stages term shape)))
+
+(defun stages3 () -> (Vec FgStage)
+  [(SgMap (fx-lam (fx-op "+" (fx-x) (fx-n 1)))) (SgFilter (fx-plam (fx-cmp ">" (fx-x) (fx-n 2)))) (SgTake (fx-n 3))])
+(defun map-text () -> str "(map (fn (x: i64) (+ x 1))")
+(defun filter-text () -> str "(filter (fn (x: i64) (> x 2))")
+
+(defun t-shapes () -> i64
+  (+ (check-text "threaded" (pt (stages3) TmCount ShThread)
+                 "(->> [1 2] (map (fn (x: i64) (+ x 1))) (filter (fn (x: i64) (> x 2))) (take 3) (count))")
+     (check-text "nested" (pt (stages3) TmCount ShNested) (str "(count (take 3 " (filter-text) " " (map-text) " [1 2]))))"))
+     (check-text "bound" (pt (stages3) TmCount ShBound)
+                 (str "(let ((sq1 " (map-text) " [1 2])) (sq2 " (filter-text) " sq1)) (sq3 (take 3 sq2))) (count sq3))"))
+     (check-text "split 1" (pt (stages3) TmCount (ShSplit 1))
+                 (str "(let ((sq1 " (map-text) " [1 2]))) (count (take 3 " (filter-text) " sq1))))"))))
+
+(defun t-no-stages () -> i64
+  (let ((range (FgPipe (FgChain (SrRange (fx-n 5)) []) [TmCount] ShNested)))
+    (+ (check-text "no stages nested" (pipe-text (fx-pipe [4] [] TmCount ShNested)) "(count [4])")
+       (check-text "no stages threaded" (pipe-text (fx-pipe [4] [] TmCount ShThread)) "(->> [4] (count))")
+       (check-text "range" (pipe-text range) "(count (range 5))"))))
+
+(defun term-text (t: FgTerm) -> str (pipe-text (fx-pipe [1] [] t ShNested)))
+
+(defun t-terminals () -> i64
+  (let ((lt2 (fx-plam (fx-cmp "<" (fx-x) (fx-n 2))))
+        (stepf (fx-step (fx-op "+" (fx-a) (fx-x)))))
+    (+ (check-text "vec" (term-text TmVec) "(digest (vec [1]))")
+       (check-text "sort" (term-text TmSort) "(digest (vec (sort [1])))")
+       (check-text "sort-by" (term-text (TmSortBy (fx-lam (fx-x)))) "(digest (vec (sort-by (fn (x: i64) x) [1])))")
+       (check-text "first" (term-text TmFirst) "(match (first [1]) (nil 1000001) ((some v) v))")
+       (check-text "last" (term-text TmLast) "(unwrap-or (last [1]) 1000001)")
+       (check-text "empty?" (term-text TmEmpty) "(if (empty? [1]) 1 0)")
+       (check-text "sum" (term-text TmSum) "(sum [1])")
+       (check-text "every?" (term-text (TmEvery lt2)) "(if (every? (fn (x: i64) (< x 2)) [1]) 1 0)")
+       (check-text "find-first" (term-text (TmFindFirst lt2))
+                   "(match (find-first (fn (x: i64) (< x 2)) [1]) (nil 1000001) ((some v) (+ v 1)))")
+       (check-text "nth" (term-text (TmNth (fx-n 2))) "(nth [1] 2)")
+       (check-text "reduce" (term-text (TmReduce stepf (fx-n 0) nil)) "(reduce (fn (a: i64 x: i64) (+ a x)) 0 [1])")
+       (check-text "reduce with reduced" (term-text (TmReduce stepf (fx-n 0) (some 5)))
+                   "(reduce (fn (a x) (if (> a 5) (reduced a) (+ a x))) 0 [1])")
+       (check-text "reduce of two arguments" (term-text (TmReduce1 stepf)) "(reduce (fn (a: i64 x: i64) (+ a x)) [1])"))))
+
+(defun t-threaded-fallbacks () -> i64
+  (let ((th (fn (stages: (Vec FgStage) term: FgTerm) (pipe-text (fx-pipe [1] stages term ShThread))))
+        (cat (fn (first: bool) (SgConcat (OpVec (fx-vecs [9])) first))))
+    (+ (check-text "threaded nth is nested" (th [(SgTake (fx-n 2))] (TmNth (fx-n 0))) "(nth (take 2 [1]) 0)")
+       (check-text "seq-last concat is nested" (th [(cat false)] TmCount) "(count (concat [1] [9]))")
+       (check-text "seq-first concat threads" (th [(cat true)] TmCount) "(->> [1] (concat [9]) (count))"))))
+
+(defun t-operands () -> i64
+  (let ((inner (fn () (FgChain (fx-src [7]) [(SgTake (fx-n 1))])))
+        (t (fn (other: FgOperand) (pipe-text (fx-pipe [1] [(SgConcat other true)] TmCount ShNested)))))
+    (+ (check-text "lazy operand" (t (OpLazy (inner))) "(count (concat (take 1 [7]) [1]))")
+       (check-text "eager operand" (t (OpEager (inner))) "(count (concat (vec (take 1 [7])) [1]))"))))
+
+(defun t-two-terminals () -> i64
+  (let ((p (FgPipe (FgChain (fx-src [1 2]) [(SgTake (fx-n 1))]) [TmFirst TmCount] ShThread)))
+    (check-text "two terminals" (pipe-text p)
+                "(let ((sq0 (take 1 [1 2]))) (+ (* (match (first sq0) (nil 1000001) ((some v) v)) 7) (count sq0)))")))
+
+(defun starts-with-text (t: str prefix: str) -> bool (s/starts-with? t prefix))
+(defun has-text (t: str part: str) -> bool (s/includes? t part))
+
+(defun t-program-text () -> i64
+  (let ((with (print-program (fx-pipe-program (fx-pipe [1] [] TmVec ShNested))))
+        (none (print-program (fx-pipe-program (fx-pipe [1] [] TmCount ShNested)))))
+    (+ (check-bool "facades and digest first" (starts-with-text with "(ns main (:use fib.core fib.seq fib.coll fib.print))\n\n(defun digest") true)
+       (check-bool "the digest does not use the library" (and (has-text with "vec-count") (has-text with "vec-nth")) true)
+       (check-bool "no digest without a terminal that folds" (has-text none "digest") false))))
+
+(defun t-calls-and-inout () -> i64
+  (let ((e (expr-new YUnit (EkCall "push!" [(ArInOut "c") (ArVal (fx-n 3))])))
+        (d (expr-new YInt (EkDeref (expr-var "c" (YCell YInt))))))
+    (+ (check-text "call with &" (print-expr-text e) "(push! &c 3)")
+       (check-text "deref" (print-expr-text d) "@c"))))
+
+(defun t-preamble () -> i64
+  (let ((f (FgFun "f2" [(FgParam "p" YPt false)] YInt (expr-new YInt (EkField (expr-var "p" YPt) "x"))))
+        (text (print-program (FgProgram [] [] [f] (fx-n 1)))))
+    (+ (check-bool "only the named preamble"
+                   (starts-with-text text "(defstruct Pt (x: i64 y: i64))\n\n(defun f2 (p: Pt) -> i64 (. p x))") true)
+       (check-bool "Wrap is not named" (has-text text "Wrap") false))))
+
+(defun t-layout () -> i64
+  (let ((long (expr-new YStr (EkStr (str-join (mapv (fn (i: i64) "a") (range 90))))))
+        (e (expr-call YInt "str-len" [(expr-new YStr (EkStr (str-join (mapv (fn (i: i64) "a") (range 90)))))])))
+    (+ (check-bool "long forms break across lines" (has-text (print-expr-text e) "\n") true)
+       (check-bool "a form of 80 columns stays on one line"
+                   (has-text (print-expr-text (expr-call YInt "f" [(expr-new YStr (EkStr (str-join (mapv (fn (i: i64) "a") (range 70)))))])) "\n") false)
+       (check-text "string escapes" (print-expr-text (expr-new YStr (EkStr "a\"b\\c\nd"))) "\"a\\\"b\\\\c\\nd\""))))
+
+(defun t-patterns-guards-dyn () -> i64
+  (let ((p (GpVector [(GpLit 0) (GpBind "x")] (some (RsBind "r"))))
+        (c (FgClause p (some (expr-new YBool (EkBool true))) (fx-n 1)))
+        (m (expr-new YInt (EkGMatch (expr-new (YVec YInt) (EkVecLit [])) [c])))
+        (d (expr-new (YDyn PrScore true) (EkDyn PrScore true (fx-n 1)))))
+    (+ (check-text "vector pattern, guard" (print-expr-text m) "(match [] ([0 x & r] :when true 1))")
+       (check-text "dyn :send" (print-expr-text d) "(dyn Score :send 1)"))))
+
+(defun t-impls () -> i64
+  (let ((i (FgImpl PrScore (YHook false) [(FgMethod "score" [] (fx-n 2))] true))
+        (local (FgImpl PrScore (YHook false) [(FgMethod "score" [] (fx-n 2))] false)))
+    (+ (check-text "impl on (Hook k)" (print-layout (print-impl i) 0) "(impl Score (Hook k) (score (self) 2))")
+       (check-text "impl on (Hook :local)" (print-layout (print-impl local) 0) "(impl Score (Hook :local) (score (self) 2))"))))
+
+(defun main () -> i64
+  (let ((failed (+ (t-shapes) (t-no-stages) (t-terminals) (t-threaded-fallbacks) (t-operands) (t-two-terminals) (t-program-text)
+                   (t-calls-and-inout) (t-preamble) (t-layout) (t-patterns-guards-dyn) (t-impls))))
+    (do (println (if (= failed 0) "ok" (str "FAILED " failed))) failed)))

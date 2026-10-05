@@ -1,0 +1,135 @@
+;; compiler/tests/gen/unit-model-pipelines.fib: the 12 cases of crates/fibgen/src/model/pipelines/tests.rs (seed-1), ported: the model of a pipeline against numbers
+;; worked out by hand: what each adaptor and terminal gives, and how often each function runs (the `counting` programs return the answer times 1000 plus the
+;; weighted call count). Returns the number of failed checks (0 = pass). Build and run with unit.sh.
+(ns main
+  (:use gen.ty gen.ast gen.model.value gen.model gen.model.expected tests.gen.check))
+
+(defun six () -> (Vec i64) [1 2 3 4 5 6])
+(defun answer (stages: (Vec FgStage) term: FgTerm) -> str
+  (result-text (model-expected (fx-pipe-program (fx-pipe (six) stages term ShNested)))))
+(defun calls (stages: (Vec FgStage) term: FgTerm) -> str
+  (result-text (model-expected (fx-counting (fx-pipe (six) stages term ShNested)))))
+(defun ok (n: i64) -> str (str "Ok(" n ")"))
+(defun even () -> FgExpr (fx-cmp "=" (fx-op "rem" (fx-x) (fx-n 2)) (fx-n 0)))
+(defun sum-of (n: i64) -> str (ok n))
+
+(defun t-adaptors () -> i64
+  (let ((double (SgMap (fx-lam (fx-op "*" (fx-x) (fx-n 2)))))
+        (below4 (SgTakeWhile (fx-plam (fx-cmp "<" (fx-x) (fx-n 4)))))
+        (twice (SgMapcat (fx-vlam [(fx-x) (fx-x)]))))
+    (+ (check-text "map" (answer [double] TmSum) (ok 42))
+       (check-text "filter" (answer [(SgFilter (fx-plam (even)))] TmSum) (ok 12))
+       (check-text "remove" (answer [(SgRemove (fx-plam (even)))] TmSum) (ok 9))
+       (check-text "take 2" (answer [(SgTake (fx-n 2))] TmSum) (ok 3))
+       (check-text "take -1" (answer [(SgTake (fx-n -1))] TmSum) (ok 0))
+       (check-text "take 99" (answer [(SgTake (fx-n 99))] TmSum) (ok 21))
+       (check-text "drop 2" (answer [(SgDrop (fx-n 2))] TmSum) (ok 18))
+       (check-text "drop -3" (answer [(SgDrop (fx-n -3))] TmSum) (ok 21))
+       (check-text "drop 99" (answer [(SgDrop (fx-n 99))] TmSum) (ok 0))
+       (check-text "take-while" (answer [below4] TmSum) (ok 6))
+       (check-text "mapcat" (answer [twice] TmSum) (ok 42)))))
+
+(defun cat-stage (first: bool) -> FgStage (SgConcat (OpVec (fx-vecs [10 20])) first))
+
+(defun t-concat () -> i64
+  (+ (check-text "concat first, first" (answer [(cat-stage true)] TmFirst) (ok 10))
+     (check-text "concat first, last" (answer [(cat-stage true)] TmLast) (ok 6))
+     (check-text "concat last, first" (answer [(cat-stage false)] TmFirst) (ok 1))
+     (check-text "concat last, last" (answer [(cat-stage false)] TmLast) (ok 20))
+     (check-text "concat first, vec" (answer [(cat-stage true)] TmVec) (ok 257013))
+     (check-text "concat last, vec" (answer [(cat-stage false)] TmVec) (ok 621360))))
+
+(defun t-terminals () -> i64
+  (let ((none (str (pipe-none)))
+        (square-sum (TmReduce (fx-step (fx-op "+" (fx-a) (fx-op "*" (fx-x) (fx-x)))) (fx-n 0) nil))
+        (take0 (SgTake (fx-n 0))))
+    (+ (check-text "count" (answer [] TmCount) (ok 6))
+       (check-text "vec" (answer [] TmVec) (ok 76609))
+       (check-text "first" (answer [] TmFirst) (ok 1))
+       (check-text "last" (answer [] TmLast) (ok 6))
+       (check-text "empty?" (answer [] TmEmpty) (ok 0))
+       (check-text "empty? of take 0" (answer [take0] TmEmpty) (ok 1))
+       (check-text "first of nothing" (answer [take0] TmFirst) (ok (pipe-none)))
+       (check-text "last of nothing" (answer [take0] TmLast) (ok (pipe-none)))
+       (check-text "reduce" (answer [] square-sum) (ok 91))
+       (check-text "every true" (answer [] (TmEvery (fx-plam (fx-cmp "<" (fx-x) (fx-n 7))))) (ok 1))
+       (check-text "every false" (answer [] (TmEvery (fx-plam (fx-cmp "<" (fx-x) (fx-n 3))))) (ok 0))
+       (check-text "find-first hit" (answer [] (TmFindFirst (fx-plam (fx-cmp ">" (fx-x) (fx-n 3))))) (ok 5))
+       (check-text "find-first miss" (answer [] (TmFindFirst (fx-plam (fx-cmp ">" (fx-x) (fx-n 9))))) (ok (pipe-none)))
+       (check-text "nth" (answer [] (TmNth (fx-n 2))) (ok 3)))))
+
+(defun t-sort-and-nth () -> i64
+  (let ((by-parity (TmSortBy (fx-lam (fx-op "rem" (fx-x) (fx-n 2)))))
+        (backwards (SgMap (fx-lam (fx-op "-" (fx-n 7) (fx-x))))))
+    ;; keys 1 0 1 0 1 0: the evens first, each group in input order
+    (+ (check-text "sort-by is stable" (answer [] by-parity) (ok 639139))
+       (check-text "sort" (answer [backwards] TmSort) (ok 76609))
+       (check-text "nth past the end" (answer [] (TmNth (fx-n 9))) "Err(Trap(nth: index out of range))"))))
+
+(defun t-call-counts () -> i64
+  (let ((f (fn (w: i64) (SgMap (fx-lam (fx-counted w (fx-x))))))
+        (p (fn (w: i64) (SgFilter (fx-plam (fx-counted w (even))))))
+        (odd-first [(SgMap (fx-lam (fx-counted 1 (fx-x)))) (SgRemove (fx-plam (fx-counted 10 (even))))])
+        (below3 (SgTakeWhile (fx-plam (fx-counted 1 (fx-cmp "<" (fx-x) (fx-n 3))))))
+        (big (TmFindFirst (fx-plam (fx-counted 1 (fx-cmp ">" (fx-x) (fx-n 3))))))
+        (small (TmEvery (fx-plam (fx-counted 1 (fx-cmp "<" (fx-x) (fx-n 3)))))))
+    (+ (check-text "take 2 of a map: two calls" (calls [(f 2) (SgTake (fx-n 2))] TmCount) (ok (+ 2000 4)))
+       (check-text "first of remove over map" (calls odd-first TmFirst) (ok (+ 1000 11)))
+       (check-text "filter sees a miss and a hit" (calls [(f 1) (p 10)] TmFirst) (ok (+ 2000 22)))
+       (check-text "drop runs the map on what it skips" (calls [(f 1) (SgDrop (fx-n 2))] TmFirst) (ok (+ 3000 3)))
+       (check-text "take-while asks the element that stops it" (calls [below3] TmCount) (ok (+ 2000 3)))
+       (check-text "find-first stops at the element that decides" (calls [] big) (ok (+ 5000 4)))
+       (check-text "every? stops at the element that decides" (calls [] small) (ok 3)))))
+
+(defun t-take-zero-and-mapcat () -> i64
+  (let ((f (SgMap (fx-lam (fx-counted 1 (fx-x)))))
+        (keep-even (expr-new (YFunc [YInt] (YVec YInt))
+                             (EkFn [(FgNameTy "x" YInt)] (expr-new (YVec YInt) (EkIf (even) (fx-vec-of [(fx-x)]) (fx-vec-of []))))))
+        (fan (SgMapcat (fx-vlam [(fx-counted 1 (fx-x)) (fx-x)]))))
+    (+ (check-text "take 0 never touches its source" (calls [f (SgTake (fx-n 0))] TmCount) (ok 0))
+       (check-text "mapcat skips empty results" (answer [(SgMapcat keep-even)] TmSum) (ok 12))
+       ;; elements 1 1 2: the function ran for 1 and 2 only
+       (check-text "mapcat asks for the next element when the result is used up" (calls [fan (SgTake (fx-n 3))] TmCount) (ok (+ 3000 2)))
+       (check-text "mapcat of empty vectors" (answer [(SgMapcat (fx-vlam []))] TmCount) (ok 0)))))
+
+(defun t-reduce () -> i64
+  (let ((sum (fn (w: i64) (fx-step (fx-counted w (fx-op "+" (fx-a) (fx-x))))))
+        (upstream [(SgMap (fx-lam (fx-counted 10 (fx-x))))]))
+    ;; the accumulator is 1, 3, 6 after three elements; the fourth is pulled (ten calls of the map) and the test sees 6 > 5 before the step runs again
+    (+ (check-text "reduce stops at reduced" (calls upstream (TmReduce (sum 1) (fx-n 0) (some 5))) (ok (+ 6000 40 3)))
+       (check-text "reduce without stop" (calls upstream (TmReduce (sum 1) (fx-n 0) nil)) (ok (+ 21000 60 6)))
+       (check-text "reduce of two arguments" (calls [] (TmReduce1 (sum 1))) (ok (+ 21000 5)))
+       (check-text "reduce of nothing" (answer [(SgTake (fx-n 0))] (TmReduce1 (sum 1))) "Err(Trap(reduce: empty collection))"))))
+
+(defun t-bound-seq () -> i64
+  (let ((chain (FgChain (fx-src [1 2 3]) [(SgMap (fx-lam (fx-counted 1 (fx-x))))]))
+        (twice (fn (terms: (Vec FgTerm)) (FgPipe chain terms ShBound))))
+    ;; first realises one node, count the other two: three calls, not four
+    (+ (check-text "bound seq, first then count" (result-text (model-expected (fx-counting (twice [TmFirst TmCount])))) (ok (+ 10000 3)))
+       (check-text "bound seq, count then first" (result-text (model-expected (fx-counting (twice [TmCount TmFirst])))) (ok (+ 22000 3))))))
+
+(defun operand-stages (eager: bool) -> (Vec FgStage)
+  (let ((c (FgChain (fx-src [7 8]) [(SgMap (fx-lam (fx-counted 1 (fx-x))))])))
+    [(SgConcat (if eager (OpEager c) (OpLazy c)) false)]))
+
+(defun t-operands () -> i64
+  ;; (first (concat s other)) is 1 either way; the realised one ran its map on both
+  (+ (check-text "lazy operand" (calls (operand-stages false) TmFirst) (ok 1000))
+     (check-text "eager operand" (calls (operand-stages true) TmFirst) (ok 1002))))
+
+(defun run-src (s: FgSrc) -> str
+  (result-text (model-expected (fx-pipe-program (FgPipe (FgChain s []) [TmVec] ShNested)))))
+
+(defun t-sources () -> i64
+  (+ (check-text "range 3" (run-src (SrRange (fx-n 3))) (ok 208570))
+     (check-text "range -2" (run-src (SrRange (fx-n -2))) (ok 7))
+     (check-text "list" (run-src (SrList (expr-call YList "list" [(fx-n 1) (fx-n 2) (fx-n 3)]))) (ok 209563))))
+
+(defun t-uses-library () -> i64
+  (check-bool "a pipeline program uses the library"
+              (program-uses-library? (fx-pipe-program (fx-pipe (six) [] TmCount ShThread))) true))
+
+(defun main () -> i64
+  (let ((failed (+ (t-adaptors) (t-concat) (t-terminals) (t-sort-and-nth) (t-call-counts) (t-take-zero-and-mapcat)
+                   (t-reduce) (t-bound-seq) (t-operands) (t-sources) (t-uses-library))))
+    (do (println (if (= failed 0) "ok" (str "FAILED " failed))) failed)))

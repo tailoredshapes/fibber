@@ -5,15 +5,107 @@
 ;;   fibgen emit --seed S --count N [--size K] [--kind K] --write DIR
 ;; Exit: run 0 clean, 1 a finding, 2 usage. The `show` output format is the contract of compiler/tests/golden/gen.
 (ns gen.cli
-  (:use gen.ast gen.model.value gen.report gen.driver))
+  (:use gen.ast gen.model.value gen.report gen.driver gen.print gen.print.sexp fib.string))
 
 (defenum FgCmd (CmRun cfg: FgConfig write: (Option str)) (CmShow cfg: FgConfig) (CmEmit cfg: FgConfig write: (Option str)) (CmUsage msg: str))
 
+(defun cli-usage () -> str
+  (str-join ["usage:\n"
+             "  fibgen run  --seed S --count N [--size K] [--jobs J] [--timeout SECS] [--no-shrink] [--shrink-budget R] [--exemplars E] [--write DIR] [--kind programs|pipelines] [--lib DIR]..\n"
+             "  fibgen show --seed S [--size K] [--kind K]\n"
+             "      print the program for seed S and the result the model expects\n"
+             "  fibgen emit --seed S --count N [--size K] [--kind K] --write DIR\n"]))
+
+(defstruct FgOpts (cfg: FgConfig write: (Option str)))
+
+(defun cli-default-config () -> FgConfig
+  (FgConfig 1 100 nil 2 20 true 1500 1 GkPrograms "" []))
+
+(defun cli-with-seed :private (c: FgConfig v: i64) -> FgConfig
+  (FgConfig v (. c count) (. c size) (. c jobs) (. c timeout-secs) (. c shrink) (. c shrink-budget) (. c exemplars) (. c kind) (. c dir) (. c libs)))
+(defun cli-with-count :private (c: FgConfig v: i64) -> FgConfig
+  (FgConfig (. c seed) v (. c size) (. c jobs) (. c timeout-secs) (. c shrink) (. c shrink-budget) (. c exemplars) (. c kind) (. c dir) (. c libs)))
+(defun cli-with-size :private (c: FgConfig v: i64) -> FgConfig
+  (FgConfig (. c seed) (. c count) (some v) (. c jobs) (. c timeout-secs) (. c shrink) (. c shrink-budget) (. c exemplars) (. c kind) (. c dir) (. c libs)))
+(defun cli-with-jobs :private (c: FgConfig v: i64) -> FgConfig
+  (FgConfig (. c seed) (. c count) (. c size) v (. c timeout-secs) (. c shrink) (. c shrink-budget) (. c exemplars) (. c kind) (. c dir) (. c libs)))
+(defun cli-with-timeout :private (c: FgConfig v: i64) -> FgConfig
+  (FgConfig (. c seed) (. c count) (. c size) (. c jobs) v (. c shrink) (. c shrink-budget) (. c exemplars) (. c kind) (. c dir) (. c libs)))
+(defun cli-with-budget :private (c: FgConfig v: i64) -> FgConfig
+  (FgConfig (. c seed) (. c count) (. c size) (. c jobs) (. c timeout-secs) (. c shrink) v (. c exemplars) (. c kind) (. c dir) (. c libs)))
+(defun cli-with-exemplars :private (c: FgConfig v: i64) -> FgConfig
+  (FgConfig (. c seed) (. c count) (. c size) (. c jobs) (. c timeout-secs) (. c shrink) (. c shrink-budget) v (. c kind) (. c dir) (. c libs)))
+(defun cli-with-noshrink :private (c: FgConfig) -> FgConfig
+  (FgConfig (. c seed) (. c count) (. c size) (. c jobs) (. c timeout-secs) false (. c shrink-budget) (. c exemplars) (. c kind) (. c dir) (. c libs)))
+(defun cli-with-kind :private (c: FgConfig k: FgGenKind) -> FgConfig
+  (FgConfig (. c seed) (. c count) (. c size) (. c jobs) (. c timeout-secs) (. c shrink) (. c shrink-budget) (. c exemplars) k (. c dir) (. c libs)))
+(defun cli-with-lib :private (c: FgConfig v: str) -> FgConfig
+  (FgConfig (. c seed) (. c count) (. c size) (. c jobs) (. c timeout-secs) (. c shrink) (. c shrink-budget) (. c exemplars) (. c kind) (. c dir) (conj (. c libs) v)))
+
+(defun cli-number :private (flag: str val: str k: (fn (FgConfig i64) FgConfig) o: FgOpts) -> (Result FgOpts str)
+  (match (parse-long val)
+    ((some n) (if (>= n 0) (Ok (FgOpts (k (. o cfg) n) (. o write))) (Err (str flag " " val ": not an unsigned number"))))
+    (nil (Err (str flag " " val ": not a number")))))
+
+(defun cli-kind :private (val: str o: FgOpts) -> (Result FgOpts str)
+  (cond (= val "programs") (Ok (FgOpts (cli-with-kind (. o cfg) GkPrograms) (. o write)))
+        (= val "pipelines") (Ok (FgOpts (cli-with-kind (. o cfg) GkPipelines) (. o write)))
+        :else (Err (str "--kind " val ": programs or pipelines"))))
+
+(defun cli-flag :private (flag: str val: str o: FgOpts) -> (Result FgOpts str)
+  (cond (= flag "--seed") (cli-number flag val cli-with-seed o)
+        (= flag "--count") (cli-number flag val cli-with-count o)
+        (= flag "--size") (cli-number flag val cli-with-size o)
+        (= flag "--jobs") (cli-number flag val cli-with-jobs o)
+        (= flag "--timeout") (cli-number flag val cli-with-timeout o)
+        (= flag "--shrink-budget") (cli-number flag val cli-with-budget o)
+        (= flag "--exemplars") (cli-number flag val cli-with-exemplars o)
+        (= flag "--write") (Ok (FgOpts (. o cfg) (some val)))
+        (= flag "--kind") (cli-kind val o)
+        (= flag "--lib") (Ok (FgOpts (cli-with-lib (. o cfg) val) (. o write)))
+        :else (Err (str "unknown option " flag))))
+
+(defun cli-flags :private (args: (Vec str)) -> (Result FgOpts str)
+  (loop ((i 1) (o (FgOpts (cli-default-config) nil)))
+    (cond (>= i (vec-count args)) (Ok o)
+          (= (vec-nth args i) "--no-shrink") (recur (+ i 1) (FgOpts (cli-with-noshrink (. o cfg)) (. o write)))
+          (>= (+ i 1) (vec-count args)) (Err (str (vec-nth args i) " needs a value"))
+          :else (try-let [o2 (cli-flag (vec-nth args i) (vec-nth args (+ i 1)) o)] (recur (+ i 2) o2)))))
+
 ;; main.rs parse: defaults seed 1, count 100, jobs 2, timeout 20, shrink on, budget 1500, exemplars 1.
-(defun cli-parse (args: (Vec str)) -> FgCmd (trap "todo: gen.cli cli-parse"))
-;; The `show` output: print-program then `;; model: ` + model-debug.
-(defun cli-show-text (p: FgProgram) -> str (trap "todo: gen.cli cli-show-text"))
+(defun cli-parse (args: (Vec str)) -> FgCmd
+  (if (= (vec-count args) 0)
+      (CmUsage "no command")
+      (match (cli-flags args)
+        ((Err msg) (CmUsage msg))
+        ((Ok o)
+          (let ((cmd (vec-nth args 0)))
+            (cond (= cmd "show") (CmShow (. o cfg))
+                  (= cmd "run") (CmRun (. o cfg) (. o write))
+                  (= cmd "emit") (CmEmit (. o cfg) (. o write))
+                  :else (CmUsage (str "unknown command " cmd))))))))
+
 ;; Rust Debug of Result<i64, ModelError>: Ok(5), Err(Trap("integer overflow in + at i64")), Err(Unsupported("..")), Err(Budget).
-(defun cli-model-debug (r: (Result i64 FgModelError)) -> str (trap "todo: gen.cli cli-model-debug"))
-;; main.rs main.
-(defun cli-main (args: (Vec str)) -> i64 (trap "todo: gen.cli cli-main"))
+(defun cli-model-debug (r: (Result i64 FgModelError)) -> str
+  (match r
+    ((Ok n) (str "Ok(" n ")"))
+    ((Err e) (match e
+               ((MeTrap msg) (str "Err(Trap(" (sx-debug-str msg) "))"))
+               ((MeUnsupported msg) (str "Err(Unsupported(" (sx-debug-str msg) "))"))
+               ((MeBudget) "Err(Budget)")))))
+
+;; The `show` output: print-program then `;; model: ` + model-debug.
+(defun cli-show-text (p: FgProgram) -> str
+  (str (print-program p) ";; model: " (cli-model-debug (driver-check p)) "\n"))
+
+(defun cli-show (cfg: FgConfig) -> i64
+  (let ((p (driver-generate (. cfg kind) (. cfg seed) (match (. cfg size) ((some k) k) (nil 3)))))
+    (do (print (cli-show-text p)) 0)))
+
+;; main.rs main. First slice: `show` only; `run` and `emit` need the harness half (wave 3).
+(defun cli-main (args: (Vec str)) -> i64
+  (match (cli-parse args)
+    ((CmShow cfg) (cli-show cfg))
+    ((CmUsage msg) (do (eprintln msg) (eprintln (cli-usage)) 2))
+    ((CmRun cfg write) (do (eprintln "fibgen run: not in the first slice of the port (show only)") 2))
+    ((CmEmit cfg write) (do (eprintln "fibgen emit: not in the first slice of the port (show only)") 2))))

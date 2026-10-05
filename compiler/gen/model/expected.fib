@@ -1,0 +1,40 @@
+;; compiler/gen/model/expected.fib: model::expected and expected_traced (crates/fibgen/src/model/mod.rs, seed-1), run_main included. OWNER: package M0.
+;; It sits above gen.model, gen.model.builtins and gen.model.pipelines because it fills the machine's two hooks with them (design 4.4: the stub put `model-expected`
+;; in gen.model, which cannot call the modules that call it back). The Rust ran on a 256 MB-stack thread; the port runs with a step budget (2 million), a depth
+;; budget (400) and an object budget (4 million, decision 3): MeBudget on any of them, so seed 1409 of kind programs prints `Err(Budget)` instead of growing without bound.
+(ns gen.model.expected
+  (:use gen.ty gen.ast gen.model.value gen.model gen.model.builtins gen.model.pipelines))
+
+(defun expected-error :private (s: FgStop) -> FgModelError
+  (match s
+    ((StTrap msg) (MeTrap msg))
+    ((StUnsupported msg) (MeUnsupported msg))
+    ((StBudget) MeBudget)))
+
+(defun expected-defs :private (m: FgMachine defs: (Vec FgDef)) -> (Result unit FgStop)
+  (loop ((i 0))
+    (if (< i (vec-count defs))
+        (let ((d (vec-nth defs i)))
+          (try-let [v (machine-eval m (. d init) nil)]
+            (do (set! (. m globals) (conj @(. m globals) (FgNameVal (. d name) v)))
+                (recur (+ i 1)))))
+        (Ok ()))))
+
+(defun expected-run :private (m: FgMachine p: FgProgram) -> (Result i64 FgModelError)
+  (match (expected-defs m (. p defs))
+    ((Err s) (Err (expected-error s)))
+    ((Ok u)
+      (match (machine-eval m (. p main) nil)
+        ((Err s) (Err (expected-error s)))
+        ((Ok v) (match v
+                  ((VlInt n) (Ok n))
+                  (_ (Err (MeUnsupported "main returned a value that is not an i64")))))))))
+
+;; model::expected_traced: the result and the labels of what the run did.
+(defun model-expected-traced (p: FgProgram) -> FgTraced
+  (let ((m (machine-new-with p builtins-call pipelines-ev))
+        (r (expected-run m p)))
+    (FgTraced r @(. m trace))))
+
+;; model::expected.
+(defun model-expected (p: FgProgram) -> (Result i64 FgModelError) (. (model-expected-traced p) result))

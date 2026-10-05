@@ -2,8 +2,21 @@
 ;; OWNER: packages M0 (eval, mod), M1 (nums, builtins, arrays), M2 (patterns, protos), M3 (pipelines): see design section 5. The model is a plain
 ;; value interpreter over gen.ast: strict left to right, copy-in/copy-out `&`, cells shared, lazily run tasks, checked integer arithmetic at
 ;; every width, IEEE floats. It must trap with the Rust model's message texts: the harness compares them ("trap: MESSAGE").
+;;
+;; FIRST SLICE (kind pipelines): implemented here are the literals, variables, let (with the patterns that need no vector rest), if, do, match, fn, calls, apply,
+;; deref, set!, async/await, plet, weak-dead and pipelines. `loop`/`recur`, fields, `set-field!`, dyn, guarded match, macros, number widths and conversions answer
+;; `StUnsupported` until the packages that own them land (FgStop has no `recur`: M0 proper adds the loop).
+;; The machine has three fields the stub did not: `depth` (the Rust DEPTH_BUDGET of 400 nested calls), and the two hooks `builtin` and `pipe`: modules cannot be
+;; cyclic and the evaluator calls the builtins and the pipeline model, which call the evaluator back (the FgHooks pattern of gen.state, design 4.4).
 (ns gen.model
   (:use gen.ty gen.ast gen.model.value))
+
+;; The budgets: the Rust STEP_BUDGET and DEPTH_BUDGET, and decision 3 of docs/design/decisions-2026-10-04.md (4 million objects).
+(defun model-step-budget () -> i64 2000000)
+(defun model-depth-budget () -> i64 400)
+(defun model-object-limit () -> i64 4000000)
+
+(defenum FgStop (StTrap msg: str) (StUnsupported msg: str) StBudget)
 
 ;; The machine: a record of Cells (funs and impls tables, globals, the coverage trace, the step counter and the allocation counter).
 (defstruct FgMachine
@@ -12,22 +25,274 @@
    impls: (Vec FgImpl)
    trace: (Cell (Vec str))
    steps: (Cell i64)
-   cells-made: (Cell i64)))
+   cells-made: (Cell i64)
+   depth: (Cell i64)
+   builtin: (fn (FgMachine str (Vec FgV)) (Result FgV FgStop))
+   pipe: (fn (FgMachine FgPipe (Option FgEnv)) (Result FgV FgStop))))
 (defstruct FgNameVal (name: str val: FgV))
 
-;; model::expected and expected_traced. The Rust runs on a 256 MB-stack thread; the port runs with a step budget AND an allocation budget
-;; (MeBudget on either) and the stack the compiled program has (design section 3.4).
-(defun model-expected (p: FgProgram) -> (Result i64 FgModelError) (trap "todo: gen.model model-expected"))
 ;; The result and the labels of what the run did (a guard that was false, a default method that ran).
 (defstruct FgTraced (result: (Result i64 FgModelError) trace: (Vec str)))
-(defenum FgStop (StTrap msg: str) (StUnsupported msg: str) StBudget)
 
-(defun model-expected-traced (p: FgProgram) -> FgTraced (trap "todo: gen.model model-expected-traced"))
+(defstruct FgEnvBox (env: (Option FgEnv)))
+
+(defun stop-trap (msg: str) -> FgStop (StTrap msg))
+(defun stop-unsupported (msg: str) -> FgStop (StUnsupported msg))
+
+(defun hook-no-builtin :private (m: FgMachine h: str vals: (Vec FgV)) -> (Result FgV FgStop)
+  (Err (StUnsupported (str "no builtin hook for " h))))
+(defun hook-no-pipe :private (m: FgMachine p: FgPipe env: (Option FgEnv)) -> (Result FgV FgStop)
+  (Err (StUnsupported "no pipeline hook")))
+
+;; Machine::new with the hooks the caller gives: globals Low and Idle preloaded.
+(defun machine-new-with (p: FgProgram builtin: (fn (FgMachine str (Vec FgV)) (Result FgV FgStop)) pipe: (fn (FgMachine FgPipe (Option FgEnv)) (Result FgV FgStop))) -> FgMachine
+  (FgMachine (cell (. p funs))
+             (cell [(FgNameVal "Low" (VlData "Low" [])) (FgNameVal "Idle" (VlData "Idle" []))])
+             (. p impls) (cell []) (cell 0) (cell 0) (cell 0) builtin pipe))
+
 ;; Machine::new: globals Low and Idle preloaded.
-(defun machine-new (p: FgProgram) -> FgMachine (trap "todo: gen.model machine-new"))
+(defun machine-new (p: FgProgram) -> FgMachine (machine-new-with p hook-no-builtin hook-no-pipe))
+
+;; Counts one step; the step budget is a gap, not a finding.
+(defun machine-tick :private (m: FgMachine) -> (Result unit FgStop)
+  (let ((n (+ @(. m steps) 1)))
+    (do (set! (. m steps) n)
+        (if (> n (model-step-budget)) (Err StBudget) (Ok ())))))
+
+;; Counts `n` objects made (cells, closures, vector and list elements); past the limit the run is a gap (decision 3).
+(defun machine-alloc (m: FgMachine n: i64) -> (Result unit FgStop)
+  (let ((total (+ @(. m cells-made) n)))
+    (do (set! (. m cells-made) total)
+        (if (> total (model-object-limit)) (Err StBudget) (Ok ())))))
+
+(defun machine-global :private (m: FgMachine name: str) -> (Option FgV)
+  (match (find-first (fn (g: FgNameVal) (= (. g name) name)) @(. m globals))
+    ((some g) (some (. g val)))
+    (nil nil)))
+
+;; Evaluates `e` one call level deeper (a stray `recur` cannot arise in this slice).
+(defun machine-eval (m: FgMachine e: FgExpr env: (Option FgEnv)) -> (Result FgV FgStop)
+  (if (>= @(. m depth) (model-depth-budget))
+      (Err StBudget)
+      (do (set! (. m depth) (+ @(. m depth) 1))
+          (let ((r (machine-ev m e env)))
+            (do (set! (. m depth) (- @(. m depth) 1)) r)))))
+
+(defun ev-all (m: FgMachine es: (Vec FgExpr) env: (Option FgEnv)) -> (Result (Vec FgV) FgStop)
+  (loop ((i 0) (out []))
+    (if (< i (vec-count es))
+        (try-let [v (machine-ev m (vec-nth es i) env)] (recur (+ i 1) (conj out v)))
+        (Ok out))))
+
+;; Binds `p` against `v`: nil when it does not match.
+(defun bind-pat (p: FgPat v: FgV env: (Option FgEnv)) -> (Result (Option FgEnvBox) FgStop)
+  (let ((same (Ok (some (FgEnvBox env)))))
+    (match p
+      ((GpWild) same)
+      ((GpBind n) (Ok (some (FgEnvBox (some (env-bind env n v))))))
+      ((GpNil) (match v ((VlOpt o) (match o (nil same) ((some x) (Ok nil)))) (_ (Ok nil))))
+      ((GpSome q) (match v ((VlOpt o) (match o ((some x) (bind-pat q x env)) (nil (Ok nil)))) (_ (Ok nil))))
+      ((GpLit n) (match v ((VlInt k) (if (= n k) same (Ok nil))) (_ (Ok nil))))
+      ((GpAs q n) (bind-pat q v (some (env-bind env n v))))
+      ((GpCtor c ps) (bind-ctor c ps v env))
+      ((GpVector items rest) (Err (StUnsupported "vector pattern: not in this slice"))))))
+
+(defun bind-all :private (ps: (Vec FgPat) xs: (Vec FgV) env: (Option FgEnv)) -> (Result (Option FgEnvBox) FgStop)
+  (loop ((i 0) (cur env))
+    (if (< i (min (vec-count ps) (vec-count xs)))
+        (try-let [b (bind-pat (vec-nth ps i) (vec-nth xs i) cur)]
+          (match b
+            (nil (Ok nil))
+            ((some bx) (recur (+ i 1) (. bx env)))))
+        (Ok (some (FgEnvBox cur))))))
+
+(defun bind-ctor :private (c: str ps: (Vec FgPat) v: FgV env: (Option FgEnv)) -> (Result (Option FgEnvBox) FgStop)
+  (match v
+    ((VlData name fields) (if (= name c) (bind-all ps fields env) (Ok nil)))
+    ((VlList items)
+      (cond (and (= c "Empty") (= (vec-count items) 0)) (Ok (some (FgEnvBox env)))
+            (and (= c "Cons") (> (vec-count items) 0) (= (vec-count ps) 2))
+            (bind-all ps [(vec-nth items 0) (VlList (vec (drop 1 items)))] env)
+            :else (Ok nil)))
+    (_ (Ok nil))))
+
+(defun ev-let :private (m: FgMachine bs: (Vec FgBind) body: FgExpr env: (Option FgEnv)) -> (Result FgV FgStop)
+  (loop ((i 0) (cur env))
+    (if (< i (vec-count bs))
+        (let ((b (vec-nth bs i)))
+          (try-let [v (machine-ev m (. b init) cur)
+                    bound (bind-pat (. b pat) v cur)]
+            (match bound
+              (nil (Err (StUnsupported "refutable let pattern")))
+              ((some bx) (recur (+ i 1) (. bx env))))))
+        (machine-ev m body cur))))
+
+(defun ev-match :private (m: FgMachine s: FgExpr cl: (Vec FgArm) env: (Option FgEnv)) -> (Result FgV FgStop)
+  (try-let [v (machine-ev m s env)]
+    (loop ((i 0))
+      (if (< i (vec-count cl))
+          (let ((a (vec-nth cl i)))
+            (try-let [bound (bind-pat (. a pat) v env)]
+              (match bound
+                (nil (recur (+ i 1)))
+                ((some bx) (machine-ev m (. a body) (. bx env))))))
+          (Err (StTrap "match: no clause"))))))
+
+(defun ev-do :private (m: FgMachine es: (Vec FgExpr) env: (Option FgEnv)) -> (Result FgV FgStop)
+  (loop ((i 0) (last VlUnit))
+    (if (< i (vec-count es))
+        (try-let [v (machine-ev m (vec-nth es i) env)] (recur (+ i 1) v))
+        (Ok last))))
+
+(defun ev-plet :private (m: FgMachine bs: (Vec FgNameInit) body: FgExpr env: (Option FgEnv)) -> (Result FgV FgStop)
+  (loop ((i 0) (cur env))
+    (if (< i (vec-count bs))
+        (let ((b (vec-nth bs i)))
+          (try-let [v (machine-ev m (. b init) env)] (recur (+ i 1) (some (env-bind cur (. b name) v)))))
+        (machine-ev m body cur))))
+
+(defun ev-deref :private (v: FgV) -> (Result FgV FgStop)
+  (match v
+    ((VlCell c) (Ok @c))
+    ((VlAtom c) (Ok @c))
+    ((VlWeak w) (Ok (VlOpt w)))
+    (_ (Err (StUnsupported "deref of a value that is not a cell")))))
+
+(defun ev-set :private (m: FgMachine t: FgExpr v: FgExpr env: (Option FgEnv)) -> (Result FgV FgStop)
+  (try-let [tv (machine-ev m t env)
+            vv (machine-ev m v env)]
+    (match tv
+      ((VlCell c) (do (set! c vv) (Ok VlUnit)))
+      (_ (Err (StUnsupported "set! on a value that is not a cell"))))))
+
+(defun ev-closure :private (m: FgMachine self-name: (Option str) ps: (Vec FgNameTy) body: FgExpr env: (Option FgEnv)) -> (Result FgV FgStop)
+  (try-let [u (machine-alloc m 1)]
+    (Ok (VlClosure (FgClosure self-name (mapv (fn (p: FgNameTy) (. p name)) ps) body env)))))
+
+;; A call by name: every argument is evaluated first; then, at call entry, the `&` arguments are copied in, in parameter order, and after the
+;; call written back in parameter order (syntax 2, 3.13).
+(defun ev-call :private (m: FgMachine h: str args: (Vec FgArg) env: (Option FgEnv)) -> (Result FgV FgStop)
+  (try-let [vals (ev-args m args env)
+            copied (copy-in m args vals env)
+            r (machine-call-named m h (. copied vals))]
+    (do (write-back (. copied backs)) (Ok r))))
+
+(defun ev-args :private (m: FgMachine args: (Vec FgArg) env: (Option FgEnv)) -> (Result (Vec FgV) FgStop)
+  (loop ((i 0) (out []))
+    (if (< i (vec-count args))
+        (match (vec-nth args i)
+          ((ArVal e) (try-let [v (machine-ev m e env)] (recur (+ i 1) (conj out v))))
+          ((ArInOut n) (recur (+ i 1) (conj out VlUnit))))
+        (Ok out))))
+
+(defstruct FgBack (outer: (Cell FgV) private: (Cell FgV)))
+(defstruct FgCopied (vals: (Vec FgV) backs: (Vec FgBack)))
+
+(defun copy-in :private (m: FgMachine args: (Vec FgArg) vals: (Vec FgV) env: (Option FgEnv)) -> (Result FgCopied FgStop)
+  (loop ((i 0) (out []) (backs []))
+    (if (< i (vec-count args))
+        (match (vec-nth args i)
+          ((ArVal e) (recur (+ i 1) (conj out (vec-nth vals i)) backs))
+          ((ArInOut n)
+            (match (env-get env n)
+              ((some v) (match v
+                          ((VlCell outer)
+                            (let ((private (cell @outer)))
+                              (try-let [u (machine-alloc m 1)]
+                                (recur (+ i 1) (conj out (VlCell private)) (conj backs (FgBack outer private))))))
+                          (_ (Err (StUnsupported (str "&" n " is not a cell"))))))
+              (nil (Err (StUnsupported (str "&" n " is not a cell")))))))
+        (Ok (FgCopied out backs)))))
+
+(defun write-back :private (backs: (Vec FgBack)) -> unit
+  (loop ((i 0))
+    (if (< i (vec-count backs))
+        (let ((b (vec-nth backs i)))
+          (do (set! (. b outer) @(. b private)) (recur (+ i 1))))
+        ())))
+
 ;; Machine::ev: one node; counts one step.
-(defun machine-ev (m: FgMachine e: FgExpr env: (Option FgEnv)) -> (Result FgV FgStop) (trap "todo: gen.model machine-ev"))
-(defun machine-call-named (m: FgMachine h: str vals: (Vec FgV)) -> (Result FgV FgStop) (trap "todo: gen.model machine-call-named"))
-(defun machine-apply (m: FgMachine f: FgV args: (Vec FgV)) -> (Result FgV FgStop) (trap "todo: gen.model machine-apply"))
+(defun machine-ev (m: FgMachine e: FgExpr env: (Option FgEnv)) -> (Result FgV FgStop)
+  (try-let [u (machine-tick m)]
+    (match (. e kind)
+      ((EkInt n) (Ok (VlInt n)))
+      ((EkBool b) (Ok (VlBool b)))
+      ((EkStr s) (Ok (VlStr s)))
+      ((EkUnit) (Ok VlUnit))
+      ((EkNil) (Ok (VlOpt nil)))
+      ((EkEmpty) (Ok (VlList [])))
+      ((EkVecLit es)
+        (try-let [u2 (machine-alloc m (+ 1 (vec-count es)))
+                  vs (ev-all m es env)]
+          (Ok (VlVector vs))))
+      ((EkVar n)
+        (match (env-get env n)
+          ((some v) (Ok v))
+          (nil (match (machine-global m n) ((some v) (Ok v)) (nil (Err (StUnsupported (str "unbound " n))))))))
+      ((EkGlobal n) (Ok (VlNamed n)))
+      ((EkLet bs b) (ev-let m bs b env))
+      ((EkIf c t f)
+        (try-let [cv (machine-ev m c env)]
+          (match cv
+            ((VlBool b) (if b (machine-ev m t env) (machine-ev m f env)))
+            (_ (Err (StUnsupported "if on a value that is not a bool"))))))
+      ((EkDo es) (ev-do m es env))
+      ((EkMatch s cl) (ev-match m s cl env))
+      (_ (machine-ev-more m e env)))))
+
+(defun machine-ev-more :private (m: FgMachine e: FgExpr env: (Option FgEnv)) -> (Result FgV FgStop)
+  (match (. e kind)
+    ((EkFn ps b) (ev-closure m nil ps b env))
+    ((EkFnNamed n ps b) (ev-closure m (some n) ps b env))
+    ((EkCall h args) (ev-call m h args env))
+    ((EkApply f args)
+      (try-let [fv (machine-ev m f env)
+                vs (ev-all m args env)]
+        (machine-apply m fv vs)))
+    ((EkDeref c) (try-let [v (machine-ev m c env)] (ev-deref v)))
+    ((EkSet t v) (ev-set m t v env))
+    ((EkAsync b)
+      (try-let [u (machine-alloc m 1)]
+        (Ok (VlTask (cell (TsPending b env))))))
+    ((EkAwait t) (try-let [tv (machine-ev m t env)] (machine-force m tv)))
+    ((EkPlet bs b) (ev-plet m bs b env))
+    ((EkWeakDead n t) (try-let [v (machine-ev m t env)] (Ok (VlWeak nil))))
+    ((EkPipe p) ((. m pipe) m p env))
+    (_ (Err (StUnsupported "this kind of expression is not in the first slice of the model")))))
+
+;; Calls the helper or builtin `h`.
+(defun machine-call-named (m: FgMachine h: str vals: (Vec FgV)) -> (Result FgV FgStop)
+  (match (find-first (fn (f: FgFun) (= (. f name) h)) @(. m funs))
+    ((some f)
+      (let ((env (loop ((i 0) (cur nil))
+                   (if (< i (min (vec-count (. f params)) (vec-count vals)))
+                       (recur (+ i 1) (some (env-bind cur (. (vec-nth (. f params) i) name) (vec-nth vals i))))
+                       cur))))
+        (machine-eval m (. f body) env)))
+    (nil ((. m builtin) m h vals))))
+
+;; Calls a function value.
+(defun machine-apply (m: FgMachine f: FgV args: (Vec FgV)) -> (Result FgV FgStop)
+  (match f
+    ((VlClosure c)
+      (let ((env0 (match (. c self-name) ((some n) (some (env-bind (. c env) n f))) (nil (. c env))))
+            (env (loop ((i 0) (cur env0))
+                   (if (< i (min (vec-count (. c params)) (vec-count args)))
+                       (recur (+ i 1) (some (env-bind cur (vec-nth (. c params) i) (vec-nth args i))))
+                       cur))))
+        (machine-eval m (. c body) env)))
+    ((VlNamed n) (machine-call-named m n args))
+    (_ (Err (StUnsupported "apply of a value that is not a function")))))
+
 ;; Machine::force: runs a pending task once.
-(defun machine-force (m: FgMachine t: FgV) -> (Result FgV FgStop) (trap "todo: gen.model machine-force"))
+(defun machine-force (m: FgMachine t: FgV) -> (Result FgV FgStop)
+  (match t
+    ((VlTask c)
+      (let ((state @c))
+        (do (set! c (TsDone VlUnit))
+            (match state
+              ((TsDone v) (do (set! c (TsDone v)) (Ok v)))
+              ((TsPending body env)
+                (try-let [v (machine-eval m body env)]
+                  (do (set! c (TsDone v)) (Ok v))))))))
+    (_ (Err (StUnsupported "await of a value that is not a task")))))

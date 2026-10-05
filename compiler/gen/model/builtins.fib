@@ -1,10 +1,101 @@
 ;; compiler/gen/model/builtins.fib: port of crates/fibgen/src/model/builtins.rs and arrays.rs: the builtins, constructors and prelude functions the generator calls, and arrays with derived Eq/Ord.
 ;;  OWNER: see design section 5.
+;; FIRST SLICE: the integer arithmetic with the Rust trap texts (`+ - * rem`), the comparisons of integers and booleans, `not`, `list`, `cell`, `count`, `nth`, `conj`, `range`, `vec`,
+;; `push!`: what the pipeline programs call. Any other name answers `StUnsupported` (M1 and the other packages add theirs).
 (ns gen.model.builtins
   (:use gen.ty gen.ast gen.model.value gen.model))
 
-;; Machine::builtin.
-(defun builtins-call (m: FgMachine h: str a: (Vec FgV)) -> (Result FgV FgStop) (trap "todo: gen.model.builtins builtins-call"))
+(defun i64-min () -> i64 -9223372036854775808)
+
+(defun overflow-stop :private (h: str) -> FgStop (StTrap (str "integer overflow in " h " at i64")))
+
+;; Integer arithmetic as Rust's: a result that does not fit i64 traps, as does `rem` by zero and `rem` of the minimum by -1.
+(defun arith-add :private (x: i64 y: i64) -> (Result i64 FgStop)
+  (let ((r (unchecked-add x y)))
+    (if (< (bit-and (bit-xor x r) (bit-xor y r)) 0) (Err (overflow-stop "+")) (Ok r))))
+
+(defun arith-sub :private (x: i64 y: i64) -> (Result i64 FgStop)
+  (let ((r (unchecked-subtract x y)))
+    (if (< (bit-and (bit-xor x y) (bit-xor x r)) 0) (Err (overflow-stop "-")) (Ok r))))
+
+(defun arith-mul :private (x: i64 y: i64) -> (Result i64 FgStop)
+  (cond (or (= x 0) (= y 0)) (Ok 0)
+        (= y -1) (if (= x (i64-min)) (Err (overflow-stop "*")) (Ok (- 0 x)))
+        (= x -1) (if (= y (i64-min)) (Err (overflow-stop "*")) (Ok (- 0 y)))
+        :else (let ((r (unchecked-multiply x y)))
+                (if (= (quot r y) x) (Ok r) (Err (overflow-stop "*"))))))
+
+(defun arith-rem :private (x: i64 y: i64) -> (Result i64 FgStop)
+  (cond (= y 0) (Err (StTrap "integer rem by zero"))
+        (and (= x (i64-min)) (= y -1)) (Err (overflow-stop "rem"))
+        :else (Ok (rem x y))))
+
+(defun builtins-arith :private (h: str x: i64 y: i64) -> (Result FgV FgStop)
+  (try-let [n (cond (= h "+") (arith-add x y)
+                    (= h "-") (arith-sub x y)
+                    (= h "*") (arith-mul x y)
+                    :else (arith-rem x y))]
+    (Ok (VlInt n))))
+
+;; -1, 0, 1 of two values of one comparable kind, or nil.
+(defun builtins-order :private (x: FgV y: FgV) -> (Option i64)
+  (match x
+    ((VlInt a) (match y ((VlInt b) (some (cond (< a b) -1 (> a b) 1 :else 0))) (_ nil)))
+    ((VlBool a) (match y ((VlBool b) (some (cond (= a b) 0 a 1 :else -1))) (_ nil)))
+    (_ nil)))
+
+(defun builtins-compare :private (h: str x: FgV y: FgV) -> (Result FgV FgStop)
+  (match (builtins-order x y)
+    ((some o) (Ok (VlBool (cond (= h "=") (= o 0) (= h "!=") (not (= o 0)) (= h "<") (< o 0) (= h "<=") (<= o 0) (= h ">") (> o 0) :else (>= o 0)))))
+    (nil (Err (StUnsupported (str "compare " h))))))
+
+(defun builtins-items :private (v: FgV) -> (Option (Vec FgV))
+  (match v ((VlVector xs) (some xs)) ((VlList xs) (some xs)) (_ nil)))
+
+(defun builtins-conj :private (c: FgV x: FgV) -> (Result FgV FgStop)
+  (match c
+    ((VlVector xs) (Ok (VlVector (conj xs x))))
+    ((VlList xs) (Ok (VlList (vec (concat [x] xs)))))
+    (_ (Err (StUnsupported "conj")))))
+
+(defun builtins-collection :private (m: FgMachine h: str a: (Vec FgV)) -> (Result FgV FgStop)
+  (cond (and (= h "count") (= (vec-count a) 1))
+        (match (builtins-items (vec-nth a 0))
+          ((some xs) (Ok (VlInt (vec-count xs))))
+          (nil (match (vec-nth a 0) ((VlStr s) (Ok (VlInt (count s)))) (_ (Err (StUnsupported "count"))))))
+        (and (= h "nth") (= (vec-count a) 2))
+        (match (builtins-items (vec-nth a 0))
+          ((some xs) (match (vec-nth a 1)
+                       ((VlInt i) (if (and (>= i 0) (< i (vec-count xs))) (Ok (vec-nth xs i)) (Err (StTrap "nth: index out of range"))))
+                       (_ (Err (StUnsupported "nth")))))
+          (nil (Err (StUnsupported "nth"))))
+        (and (= h "range") (= (vec-count a) 1))
+        (match (vec-nth a 0)
+          ((VlInt n) (try-let [u (machine-alloc m (max n 0))] (Ok (VlVector (mapv (fn (i: i64) (VlInt i)) (range (max n 0)))))))
+          (_ (Err (StUnsupported "range"))))
+        (and (= h "conj") (= (vec-count a) 2)) (builtins-conj (vec-nth a 0) (vec-nth a 1))
+        (and (= h "push!") (= (vec-count a) 2))
+        (match (vec-nth a 0)
+          ((VlCell c) (try-let [v (builtins-conj @c (vec-nth a 1))] (do (set! c v) (Ok VlUnit))))
+          (_ (Err (StUnsupported "push! on a value that is not a cell"))))
+        (and (= h "vec") (= (vec-count a) 1))
+        (match (vec-nth a 0) ((VlVector xs) (Ok (vec-nth a 0))) (_ (Err (StUnsupported "vec"))))
+        :else (Err (StUnsupported (str "builtin " h)))))
+
+;; Machine::builtin: the slice.
+(defun builtins-call (m: FgMachine h: str a: (Vec FgV)) -> (Result FgV FgStop)
+  (let ((two (= (vec-count a) 2)) (one (= (vec-count a) 1)))
+    (cond (and two (or (= h "+") (= h "-") (= h "*") (= h "rem")))
+          (match (vec-nth a 0)
+            ((VlInt x) (match (vec-nth a 1) ((VlInt y) (builtins-arith h x y)) (_ (Err (StUnsupported h)))))
+            (_ (Err (StUnsupported h))))
+          (and two (or (= h "=") (= h "!=") (= h "<") (= h "<=") (= h ">") (= h ">=")))
+          (builtins-compare h (vec-nth a 0) (vec-nth a 1))
+          (and one (= h "not")) (match (vec-nth a 0) ((VlBool b) (Ok (VlBool (not b)))) (_ (Err (StUnsupported "not"))))
+          (= h "list") (try-let [u (machine-alloc m (+ 1 (vec-count a)))] (Ok (VlList a)))
+          (and one (= h "cell")) (try-let [u (machine-alloc m 1)] (Ok (VlCell (cell (vec-nth a 0)))))
+          :else (builtins-collection m h a))))
+
 ;; arrays.rs op.
 (defun arrays-op (h: str a: (Vec FgV)) -> (Option (Result FgV FgStop)) (trap "todo: gen.model.builtins arrays-op"))
 ;; arrays.rs derived_cmp: -1, 0, 1 or nil.
