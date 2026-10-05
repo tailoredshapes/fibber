@@ -185,7 +185,7 @@ into panels of 8 columns (`f64`) or 16 (`f32`), A per (row block, inner block)
 into panels of 6 rows, both zero padded to whole panels and read from their
 original strides, so any view is accepted without a copy. The micro-kernel is a
 6x8 (`f64`) or 6x16 (`f32`) tile of twelve vector accumulators updated with
-`simd/fma`, a broadcast of A and two vector loads of B per inner step; an
+`simd/fma` (a target without FMA, `(has-fma)` false, takes the multiply-then-add tiles of `gemm-f64`/`gemm-f32` instead; the tile shapes are sized for the sixteen 256-bit registers of AVX2, aarch64 would want its own), a broadcast of A and two vector loads of B per inner step; an
 incomplete tile at the right or bottom edge goes through a scratch tile and the
 same kernel. Blocks are 256 (`f64`) or 512 (`f32`) inner steps, 96 rows and
 1024 columns. Pointers into the packed buffers are unchecked; shapes and the
@@ -195,9 +195,9 @@ sized from the loop bounds.
 in increasing order, whatever its tile or block (a block continues the chain
 from C), so `gemm-fma-f64/fma-reference` (a checked scalar loop) gives the same
 bits. An fma rounds once, so the result can differ in the last bits from
-`mmul-scalar` (multiply, then add), which is unchanged. A target without a wide
-vector (SSE: `x86-64`, `x86-64-v2`) has no hardware fma, where an fma is a libm
-call 30 times slower; there `mmul` keeps the earlier multiply-then-add tiles
+`mmul-scalar` (multiply, then add), which is unchanged. A target without hardware
+FMA (`(has-fma)` false: x86-64, x86-64-v2; every aarch64 CPU has it, with 128-bit vectors) would call libm per lane, 30 times
+slower; there `mmul` keeps the earlier multiply-then-add tiles
 (4×8 for widths at least 32 and 4×4 below, inner blocks of 128, output blocks of 64
 or 32 for packed `f64` panels, scalar edges), which the safe tuning interface
 (`gemm-f64/multiply-mode`, 8×4 tiles, sizes 32, 64, 128) also exposes on every target. No cross-target
@@ -225,7 +225,8 @@ subnormals; above 709.7827 it is +inf), `log` at most 2 ULP over the whole posit
 range including subnormal inputs, `tanh` at most 2 ULP. `f32` is computed in `f64`
 and rounded back, within 1 ULP of `expf`/`logf`/`tanhf`. Special values follow libm:
 NaN in gives NaN, `log 0 = -inf`, `log x<0 = NaN`, `tanh +-inf = +-1`,
-`tanh -0.0 = -0.0`. Results can differ from the scalar libm in the last place. A
+`tanh -0.0 = -0.0`. The polynomials use `simd/muladd` (fused with FMA, multiply-then-add without: the bounds hold on both, case 7080 passes at
+`FIB_TARGET_CPU=x86-64-v2` too) and `simd/bitcast` for 2^k and the exponent split. Results can differ from the scalar libm in the last place. A
 strided input is first made contiguous.
 
 ## Safety and validation

@@ -1,0 +1,30 @@
+;; spec:   types §1.9 (simd/muladd, has-fma), docs/design/simd-and-tensors.md 2.9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; (simd/muladd a b c) is a*b+c fused (one rounding, equal to simd/fma) on a target with FMA hardware and a multiply then an add (two roundings) on one without; which
+;; one is a fact of the target, `(has-fma)`, a compile-time constant. The data are chosen so that the two differ in every lane: a = 1+e, b = 1-e, c = -1; a*b = 1-e^2
+;; is not a double, the multiply rounds it to 1 and the sum is 0, the fused sum is -e^2. compiler/tests/driver/muladd.sh pins both kinds of target through FIB_TARGET_CPU.
+;; simd/fma stays exact on every target.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (e (fdiv 1.0 1073741824.0)) (e32 (fdiv 1.0f32 8192.0f32)))
+    (let ((a: f64x4 (splat f64x4 (+ 1.0 e))) (b: f64x4 (splat f64x4 (- 1.0 e))) (k: f64x4 (splat f64x4 -1.0)))
+      (let ((m (simd/muladd a b k)) (f (simd/fma a b k)) (u (+ (* a b) k)))
+        (do (check c (= (lane f 0) (neg (* e e))))
+            (check c (= (lane u 0) 0.0))
+            (check c (not (= f u)))
+            (check c (if (has-fma) (= m f) (= m u)))
+            (check c (= (lane m 3) (lane m 0)))
+            (check c (= (simd/muladd (+ 1.0 e) (- 1.0 e) -1.0) (lane m 0)))))
+      (let ((a: f32x4 (splat f32x4 (+ 1.0f32 e32))) (b: f32x4 (splat f32x4 (- 1.0f32 e32))) (k: f32x4 (splat f32x4 -1.0f32)))
+        (let ((m (simd/muladd a b k)) (f (simd/fma a b k)) (u (+ (* a b) k)))
+          (do (check c (not (= f u)))
+              (check c (if (has-fma) (= m f) (= m u))))))
+      ;; teeth: a claim that muladd were always the unfused answer fails on an FMA host and one that it were always fused fails on the other
+      (let ((p (checks)) (m (simd/muladd (splat f64x4 (+ 1.0 e)) (splat f64x4 (- 1.0 e)) (splat f64x4 -1.0))))
+        (do (check p (if (has-fma) (= m (splat f64x4 0.0)) (= m (splat f64x4 (neg (* e e)))))) (check-detects c p)))
+      (checks-result c))))

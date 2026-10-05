@@ -55,6 +55,7 @@
     ((DkDeref t r _) (solve-deref cx d t r))
     ((DkFloat t) (solve-float cx d t))
     ((DkSimdElem t n) (solve-simd-elem cx d t n))
+    ((DkBitcast from to) (solve-bitcast cx d from to))
     ((DkKeyword site s k r dflt) (solve-keyword cx d site s k r dflt))
     ((DkVecPat s parts) (solve-vec-pat cx d s parts))))
 
@@ -86,6 +87,29 @@
                                  (cx-show cx rt) " are " (show (* n (scalar-bits s))) " bits"])))
              :else (Ok (AtSolved []))))
       (_ (simd-bad-elem cx d rt)))))
+
+;; `simd/bitcast` once both vector types are known: the lane widths agree and neither is a mask (the lane counts are one variable in the signature).
+(defun solve-bitcast :private (cx: Cx d: Deferred from: Ty to: Ty) -> (Result Attempt TypeError)
+  (let ((f (ty-simd-parts (store-resolve (. cx st) from))) (t (ty-simd-parts (store-resolve (. cx st) to))))
+    (match f
+      (nil (Ok AtStuck))
+      ((some fp)
+       (match t
+         (nil (Ok AtStuck))
+         ((some tp)
+          (match (store-resolve (. cx st) (. fp fst))
+            ((TCon (KScalar a) _)
+             (match (store-resolve (. cx st) (. tp fst))
+               ((TCon (KScalar b) _)
+                (cond (or (= a types.ty/SBool) (= b types.ty/SBool))
+                        (Err (type-error Unify (. d pos) "simd/bitcast does not reinterpret a mask"))
+                      (not (= (scalar-bits a) (scalar-bits b)))
+                        (Err (type-error Unify (. d pos)
+                               (str-join ["simd/bitcast: the lanes of " (cx-show cx (store-resolve (. cx st) from)) " and "
+                                          (cx-show cx (store-resolve (. cx st) to)) " differ in width"])))
+                      :else (Ok (AtSolved []))))
+               (_ (Ok AtStuck))))
+            (_ (Ok AtStuck)))))))))
 
 (defun simd-bad-elem :private (cx: Cx d: Deferred t: Ty) -> (Result Attempt TypeError)
   (Err (type-error Unify (. d pos)

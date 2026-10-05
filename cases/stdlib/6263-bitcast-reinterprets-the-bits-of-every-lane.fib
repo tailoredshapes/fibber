@@ -1,0 +1,31 @@
+;; spec:   types §1.9 (simd/bitcast)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; (simd/bitcast v) reinterprets each lane of a vector as the lane type of the context, of the same width: f64xN <-> i64xN, f32xN <-> i32xN. Every lane equals the scalar
+;; f64->bits / f32->bits of the lane, the round trip is the identity (NaN payload and -0.0 included), and with an integer shift it builds 2^k and splits an exponent.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (let ((x: f64x4 <<1.5 -0.0 3.25e300 -7.0e-310>>) (n: f64x4 (splat f64x4 (bits->f64 9221120237041090561))))
+      (let ((i: i64x4 (simd/bitcast x)) (back: f64x4 (simd/bitcast i)) (ni: i64x4 (simd/bitcast n)))
+        (do (dotimes (l 4) (check c (= (lane i l) (f64->bits (lane x l)))))
+            (check c (= (lane i 1) -9223372036854775808))
+            (dotimes (l 4) (check c (= (f64->bits (lane back l)) (f64->bits (lane x l)))))
+            (check c (= (lane ni 2) 9221120237041090561))
+            (let ((k: i64x4 <<0 1 -3 10>>) (p: f64x4 (simd/bitcast (shl (unchecked-add k (splat i64x4 1023)) 52))))
+              (check c (= p <<1.0 2.0 0.125 1024.0>>)))
+            (let ((ex: i64x4 (bit-and (shr i 52) (splat i64x4 2047))))
+              (check c (= (lane ex 0) 1023)) (check c (= (lane ex 1) 0))))))
+    (let ((y: f32x8 <<1.5f32 -0.0f32 3.25f32 100.0f32 0.5f32 2.0f32 -8.0f32 1.0e-40f32>>))
+      (let ((j: i32x8 (simd/bitcast y)) (back: f32x8 (simd/bitcast j)))
+        (do (dotimes (l 8) (check c (= (lane j l) (f32->bits (lane y l)))))
+            (dotimes (l 8) (check c (= (f32->bits (lane back l)) (f32->bits (lane y l)))))
+            (check c (= (lane j 0) 1069547520i32)))))
+    (let ((p (checks)) (z: f64x4 (splat f64x4 1.0)))
+      (let ((i: i64x4 (simd/bitcast z)))
+        (do (check p (= (lane i 0) 1)) (check-detects c p))))
+    (checks-result c)))
