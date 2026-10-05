@@ -1,13 +1,11 @@
 #!/bin/bash
 # Builds the release tarball of fibc, the compiler in fibber (stage 2), for the platform it runs on: linux-x86_64 or darwin-arm64 (Apple silicon macOS).
 # usage: FIBC=/path/to/seed/fibc scripts/package.sh [OUT]       (run from anywhere; OUT defaults to ./dist)
-#   FIBC                 the seed: any fibc that can build compiler/fibc.fib (the Rust one, or an unpacked release). Required. A seed made before the
-#                        flip (v0.1.x) compiles with its own liblair.so: it is found in LAIR_DIR, else in ../lib of the seed's bin/ (a release layout).
+#   FIBC                 the seed: any fibc that can build compiler/fibc.fib (an unpacked release: scripts/fetch-seed.sh fetches the one SEED names). Required.
 #   LLVM_LINK            static (default) or shared: how the compiler links LLVM 21. static is the release: the archives of `llvm-config-21
 #                        --link-static` (LLVM 21 dev, with its static libraries, must be installed; on macOS Homebrew's llvm@21 and zstd), through the
 #                        library scripts/llvm-static.sh makes. shared (`-L /usr/lib/llvm-21/lib -l LLVM-21`, on macOS /opt/homebrew/opt/llvm@21/lib; LLVM_LIBDIR for another directory) is for trying this script
 #                        only: the result needs the LLVM shared library and the checks of the shipped binary that forbid it are skipped.
-#   LAIR_DIR             the directory with the seed's liblair.so (see FIBC); no stage 2 of this tree needs one
 # Steps, each of which stops the script if it fails:
 #   1. VERSION and compiler/driver/version.fib agree (scripts/check-version.sh).
 #   2. Stage 2 (F) built by the seed; the stage check is the fixed point: F builds F3 and F3 emits the same lIR for compiler/fibc.fib as F (the seed's own emit is a note: its embedded prelude lags).
@@ -28,7 +26,6 @@ case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)  plat=darwin-arm64;  default_cpu=apple-m1;  llvm_prefix=/opt/homebrew/opt/llvm@21; llvm_libdir=/opt/homebrew/opt/llvm@21/lib ;;
   *) echo "package: no release platform for $(uname -s)-$(uname -m) (linux-x86_64 and darwin-arm64)" >&2; exit 2 ;;
 esac
-export LLVM_SYS_211_PREFIX=${LLVM_SYS_211_PREFIX:-$llvm_prefix}
 # lair generates code for the host CPU unless told otherwise; a release must run on machines other than the one that built it
 # (a tarball built on a CI runner died with SIGILL on a desktop CPU), so everything this script builds targets a baseline:
 # x86-64-v2 on x86, apple-m1 (the first Apple silicon: every later one runs its code) on a Mac.
@@ -46,23 +43,17 @@ case $LLVM_LINK in
   shared) llvm_args=(-L "${LLVM_LIBDIR:-$llvm_libdir}" -l LLVM-21) ;;
   *) echo "package: LLVM_LINK is static or shared, not $LLVM_LINK" >&2; exit 2 ;;
 esac
-# The seed's own code generator, if it has one (a release before the flip): found by LD_LIBRARY_PATH when the seed compiles. The stages built here need none.
-seed_lair=${LAIR_DIR:-$(dirname "$FIBC")/../lib}
-seed_env=()
-[ -f "$seed_lair/liblair.so" ] && seed_env=(env "LD_LIBRARY_PATH=$(cd "$seed_lair" && pwd)")
-
 build() { # build FIBC OUT
-  if [ "$1" = "$FIBC" ]; then ${seed_env[@]+"${seed_env[@]}"} "$1" build compiler/fibc.fib -I compiler -I lib "${llvm_args[@]}" -o "$2"
-  else "$1" build compiler/fibc.fib -I compiler -I lib "${llvm_args[@]}" -o "$2"; fi
+  "$1" build compiler/fibc.fib -I compiler -I lib "${llvm_args[@]}" -o "$2"
 }
-emit() { if [ "$1" = "$FIBC" ]; then ${seed_env[@]+"${seed_env[@]}"} "$1" emit -I compiler -I lib compiler/fibc.fib; else "$1" emit -I compiler -I lib compiler/fibc.fib; fi; }
+emit() { "$1" emit -I compiler -I lib compiler/fibc.fib; }
 
 echo "== stage 2 from the seed: $FIBC (LLVM $LLVM_LINK)"
 build "$FIBC" "$work/F"
 echo "== stage check"
 emit "$FIBC" > "$work/emit.seed"
 emit "$work/F" > "$work/emit.F"
-if cmp -s "$work/emit.seed" "$work/emit.F"; then echo "note: F emits the seed's lIR"; else echo "note: F emits different lIR from the seed (its embedded prelude lags this tree's, or the seed is older than the flip)"; fi
+if cmp -s "$work/emit.seed" "$work/emit.F"; then echo "note: F emits the seed's lIR"; else echo "note: F emits different lIR from the seed (its embedded prelude lags this tree's)"; fi
 build "$work/F" "$work/F3"
 emit "$work/F3" > "$work/emit.F3"
 cmp "$work/emit.F" "$work/emit.F3" || { echo "package: STAGE CHECK FAILED: F3 emit differs from F's (no fixed point)" >&2; exit 1; }
@@ -120,10 +111,6 @@ if [ "$plat" = linux-x86_64 ] && command -v objdump >/dev/null 2>&1 && [ "$FIB_T
 fi
 emit "$tree/bin/fibc" > "$work/emit.ship"
 cmp "$work/emit.F" "$work/emit.ship" || { echo "package: the shipped fibc emits something else" >&2; exit 1; }
-# The seed's fibref (the frozen reference interpreter, which also serves `fibref lsp` to the editor extension) rides along when
-# the seed has one beside its fibc: the bootstrapped tarball has no interpreter of its own.
-seed_fibref=$(dirname "$FIBC")/fibref
-if [ -x "$seed_fibref" ]; then cp "$seed_fibref" "$tree/bin/fibref"; fi
 cp -r lib "$tree/share/fibber/lib"
 cp LICENSE "$tree/LICENSE"
 sed "s/@VERSION@/$version/g" > "$tree/README.txt" <<'README'
@@ -131,7 +118,6 @@ fibc @VERSION@: the fibber compiler, written in fibber (stage 2).
 
 Layout
   bin/fibc                 the compiler
-  bin/fibref               the frozen reference interpreter and `fibref lsp` for editors (when the seed had one)
   share/fibber/lib/        the standard library source, found beside bin/ by fibc itself
 
 Use it where it is unpacked; no environment variable is needed:

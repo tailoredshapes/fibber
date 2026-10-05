@@ -9,7 +9,7 @@
 # that changes only cases or the tree it already built costs no build. Prints one report at the end. Exit 0 the batch is good, 1 it
 # is not (the report names the branch), 2 setup or a conflict.
 # Never touches main or any branch you name, never pushes: the scratch worktree and branch are deleted at the end (--keep keeps them).
-# Environment: BATCH_BASE (default main); GATE_OUT (default ~/.cache/fibber-scratch/gate-batch); FIBC/SEED/LAIR_DIR as for gate.sh.
+# Environment: BATCH_BASE (default main); GATE_OUT (default ~/.cache/fibber-scratch/gate-batch); FIBC/SEED as for gate.sh.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/.." && pwd)

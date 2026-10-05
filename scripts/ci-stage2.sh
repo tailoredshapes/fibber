@@ -4,7 +4,7 @@
 # A new failure fails; so does an expected failure that now passes (remove its line then). The expected file has one line per case,
 # `DIR/CASE STATUS`, status as the table prints it (FAIL, PENDING, HEADER); an OPEN case is one whose own header says it fails
 # today (a known gap kept honest in the case itself: if it starts to pass the harness reports FAIL), so it is not listed; lines starting with # and blank lines are ignored.
-# usage: scripts/ci-stage2.sh F      F is a stage 2 fibc; FIB_LIB must name lib/ (no liblair.so: F links LLVM; with `-l LLVM-21` shared, LLVM's directory is F's rpath)
+# usage: scripts/ci-stage2.sh F      F is a stage 2 fibc; FIB_LIB must name lib/ (F links LLVM; with `-l LLVM-21` shared, LLVM's directory is F's rpath)
 # Limits (seconds), each the time a directory may take: LIMIT_OWNERSHIP, LIMIT_MODULES, LIMIT_STDLIB.
 # Also (scripts/gate.sh sets them; CI does not): CI_STAGE2_JOBS=N runs N cases at a time (`cases -j N`); CI_STAGE2_ONLY=FILE holds the
 # names (one per line, as `cases --only` takes them) of the stdlib cases to run, and the expected set is then the lines of the expected

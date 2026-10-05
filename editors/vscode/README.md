@@ -1,42 +1,23 @@
 # fibber for VS Code
 
 Syntax highlighting, bracket and comment handling, and snippets for fibber (`.fib`).
-Plain TextMate grammar: no build step.
+Plain TextMate grammar: no build step, no node dependency, nothing to run.
 
 Install without publishing: copy or symlink this directory to
-`~/.vscode/extensions/tailoredshapes.fibber-0.1.0` and reload the window.
+`~/.vscode/extensions/tailoredshapes.fibber-0.3.0` and reload the window.
 
 Highlighted: `;` and `#_` comments, strings with escapes, characters, integers (widths, `0x`, `0b`, `_`),
 floats, ratios, keywords, `true false nil`, definition names, special forms, the library's macros,
 `x:` annotations, `->`, capitalised type names, `ns/name` aliases, reader macros (`@ & ~ ~@ ' \` #(`).
 
-## Language server (completion, hover, diagnostics)
+## No language server (since 0.3.0)
 
-Since 0.2.0 the extension starts `fibref lsp` (protocol: spec/bootstrap.md section 9) through
-`vscode-languageclient`. There is no bundler: `extension.js` is plain JS and the one npm dependency is
-the client library.
+Versions 0.2.x started `fibref lsp` for completion, hover and diagnostics. `fibref` was the Rust reference interpreter, which is
+gone (ROADMAP stage 10, docs/rust-legacy.md), and it could not read the current library any more. The extension therefore starts
+no server and has no setting that names an executable: it is the grammar, the language configuration and the snippets, and
+those work as before. Completion, hover and diagnostics are not available.
 
-```
-cd editors/vscode
-npm install
-```
-
-then install the directory as above (the `node_modules` directory must be there). You need a `fibref`
-that has `lsp`: `cargo build -p fibref` and put `target/debug/fibref` on `PATH`, or set the path below.
-
-- **Completion** (triggers `(`, `/`, `.`, `:` and space): locals and parameters in scope, the file's own
-  definitions, the library with the checker's scheme as detail, special forms and macros, `alias/` exports,
-  the fields after `(. x `, the types after `x: ` and `->`, the file's keywords after `:`. It works while the
-  buffer is broken: the scope degrades from the checked program to the reader's, then to the library.
-- **Hover**: the checker's scheme for a global, the type for a local (when the buffer checks).
-- **Diagnostics**: the front end's errors, refreshed on every edit.
-
-Settings: `fibber.fibrefPath` (default `fibref`), `fibber.libraryPath` (becomes `FIB_LIB` for the server;
-empty means the library fibref carries), `fibber.includePaths` (each becomes `-I`). A change to any of them
-restarts the server; so does the command "fibber: Restart the language server". If the executable is
-missing there is one status-bar warning (click it to restart after fixing the path) and nothing else:
-no output channel and no toasts.
-
-Tests: `npm test` spawns the real `fibref lsp` (from `$FIBREF`, `$CARGO_TARGET_DIR/debug/fibref` or
-`../../target/debug/fibref`; skipped with a message when there is none) and runs an initialize, didOpen
-(broken buffer, one diagnostic), completion, didChange, hover, shutdown and exit round trip over stdio.
+The planned replacement is a language server in the compiler itself, `fibc lsp` (docs/design/dev-loop.md): it will run the same
+front end that `fibc` runs, so the editor and the compiler cannot disagree. When it exists the extension will start it again
+(the client of 0.2.x is in git history: `editors/vscode/extension.js` before the commit that removed it, and its protocol is
+spec/bootstrap.md section 9).

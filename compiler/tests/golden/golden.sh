@@ -36,9 +36,13 @@ if [ -z "$tools" ]; then
   [ -z "$fibc" ] && fibc=$HOME/.cache/fibber-scratch/gate-$(basename "$root")/F
   [ -x "$fibc" ] || { echo "golden: no fibc to build the tools with: give --tools DIR or --fibc F (or FIBC)" >&2; exit 2; }
   tools=$out/tools; mkdir -p "$tools"
-  for t in read expand types own explain emit lairf; do
-    "$fibc" build "compiler/$t.fib" -I compiler -I lib -L "${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" -l LLVM-21 -o "$tools/$t" || { echo "golden: could not build $t" >&2; exit 2; }
-  done
+  stamp=$(sha1sum < "$fibc" | cut -c1-16)-$(cat "$root"/compiler/*/*.fib "$root"/lib/prelude.fib | sha1sum | cut -c1-16)   # the tools are rebuilt when the fibc or the sources change
+  if [ "$(cat "$tools/.stamp" 2>/dev/null)" != "$stamp" ]; then
+    for t in read expand types own explain emit lairf; do
+      "$fibc" build "compiler/$t.fib" -I compiler -I lib -L "${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" -l LLVM-21 -o "$tools/$t" || { echo "golden: could not build $t" >&2; exit 2; }
+    done
+    echo "$stamp" > "$tools/.stamp"
+  fi
 fi
 
 # block TOOL OPTIONS FILE: one input's block (the `#### FILE` line, the output, the `status N` line) in $out/block

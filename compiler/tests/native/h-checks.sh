@@ -1,6 +1,6 @@
 #!/bin/bash
-# Package H's checks: the unit tests of the header (h-header.fib) and of exec (h-exec.fib), then, with LAIR (the Rust lair) and LAIRF (lairf)
-# set, the case harness on the fixtures of h-cases/ (every verdict rule, every header error, every path; compare-cases.sh) and the CLI (h-cli.sh).
+# Package H's checks: the unit tests of the header (h-header.fib) and of exec (h-exec.fib). (They also ran the case harness on the fixtures
+# of h-cases/ and the CLI of lairf against the Rust lair, which is gone; docs/rust-legacy.md. `lairf cases cases/lir` still runs the lIR cases; it is not part of the gate.)
 # usage: h-checks.sh [OUTDIR]     FIBC names the seed fibc, FIB_LIB the library; run from anywhere. Exit 0 when everything passes.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -17,8 +17,4 @@ for t in h-header h-exec; do
   echo "$t: $(grep -c '^ok' "$out/$t.out") ok, $(grep -c '^FAIL' "$out/$t.out") FAIL (status $s)"
   [ "$s" -eq 0 ] || { grep '^FAIL' "$out/$t.out"; rc=1; }
 done
-if [ -n "${LAIR:-}" ] && [ -n "${LAIRF:-}" ]; then
-  compiler/tests/native/compare-cases.sh compiler/tests/native/h-cases/sub-a compiler/tests/native/h-cases/sub-b || rc=1
-  compiler/tests/native/h-cli.sh | tail -n 1; [ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
-fi
 exit $rc

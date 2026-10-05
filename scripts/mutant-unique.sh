@@ -16,8 +16,8 @@
 #            cases must then pass unmutated and fail under the mutant. Drop it once the library is in place itself.
 #   PREFIX   cases of cases/stdlib to run (default 4000- .. 4007-, the persistence cases T1..T7); `ownership/264-` names a case of
 #            cases/ownership (default also 264-, 266-: the shell reuse and the steal through an Option payload)
-# environment: FIBC (the fibc that builds the mutant; default the gate's F of this tree, else target/debug/fibc of the main
-#   checkout), LAIR_DIR (the directory with liblair.so), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-unique-MODE),
+# environment: FIBC (the fibc that builds the mutant; default the gate's F of this tree, else none: run the gate first or set it),
+#   MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-unique-MODE),
 #   MUT_J (cases at once, default 2).
 # exit: 0 when every case failed under the mutant, 1 when one survived, 2 for a setup error. That the cases pass UNmutated is
 #   shown by an ordinary `F cases cases/stdlib --only 4000- ..`; this script does not repeat it.
@@ -28,13 +28,10 @@ CASES=("$@")
 [ ${#CASES[@]} -gt 0 ] || CASES=(4000- 4001- 4002- 4003- 4004- 4005- 4006- 4007- ownership/264- ownership/266-)
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-unique-$MODE}
-main_target=$(cd "$R" && git rev-parse --git-common-dir | sed 's|/\.git$||')/target/debug
 gate_f=$HOME/.cache/fibber-scratch/gate-$(basename "$R")/F
-if [ -z "${FIBC:-}" ]; then if [ -x "$gate_f" ]; then FIBC=$gate_f; else FIBC=$main_target/fibc; fi; fi
-LAIR_DIR=${LAIR_DIR:-$main_target}
+if [ -z "${FIBC:-}" ]; then if [ -x "$gate_f" ]; then FIBC=$gate_f; else echo "mutant-unique: no fibc: set FIBC (a stage 2, or the seed scripts/fetch-seed.sh fetches) or run scripts/gate.sh first" >&2; exit 2; fi; fi
 [ -x "$FIBC" ] || { echo "mutant-unique: no fibc to build with: set FIBC" >&2; exit 2; }
-[ -e "$LAIR_DIR/liblair.so" ] || { echo "mutant-unique: no liblair.so in $LAIR_DIR: set LAIR_DIR" >&2; exit 2; }
-export LD_LIBRARY_PATH=$LAIR_DIR
+unset LD_LIBRARY_PATH
 
 rm -rf "$OUT/tree"
 mkdir -p "$OUT/tree" "$OUT/tree/cases" "$OUT/tmp"
@@ -65,7 +62,7 @@ grep -A5 'define internal (fib.unique? i1)' "$OUT/tree/rt/core.lir"
 
 cd "$OUT/tree" || exit 2
 echo "mutant-unique[$MODE]: building the mutant stage 2 with $FIBC"
-"$FIBC" build compiler/fibc.fib -I compiler -I lib -L "$LAIR_DIR" -l lair -o "$OUT/F" || { echo "mutant-unique: the mutant did not build" >&2; exit 2; }
+"$FIBC" build compiler/fibc.fib -I compiler -I lib -L "${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" -l LLVM-21 -o "$OUT/F" || { echo "mutant-unique: the mutant did not build" >&2; exit 2; }
 
 export FIB_LIB=$OUT/tree/lib
 survived=0

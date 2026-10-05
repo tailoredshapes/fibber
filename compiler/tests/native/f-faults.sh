@@ -1,8 +1,7 @@
 #!/bin/bash
 # Package F's planted faults: f-unit.fib is built and run as it is (it must pass), then once per fault with one module of native/fuzz/ changed in a
 # shadow directory that comes first on the module path; each must make f-unit.fib fail (exit 1 with a FAIL line). A fault that does not fail is a hole.
-# usage: f-faults.sh [WORKDIR]        (FIBC names the fibc, default `fibc`; FIB_LIB the library; LLVM_LIBDIR the directory of libLLVM-21.so;
-#                                      LIBLAIR, when the fibc needs it to build, the flags that link liblair, e.g. "-L DIR -l lair")
+# usage: f-faults.sh [WORKDIR]        (FIBC names the fibc, default `fibc`; FIB_LIB the library; LLVM_LIBDIR the directory of libLLVM-21.so)
 # Exit: 0 the clean run passes and every fault is caught; 1 not; 2 a tool is missing.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -17,7 +16,7 @@ export LD_LIBRARY_PATH=$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 cd "$root" || exit 2
 build() { # SHADOWDIR OUT
   # shellcheck disable=SC2086
-  "$fibc" build compiler/tests/native/f-unit.fib -I "$1" -I compiler -I compiler/tests/native -I lib -L "$libdir" -l LLVM-21 ${LIBLAIR:-} -o "$2"
+  "$fibc" build compiler/tests/native/f-unit.fib -I "$1" -I compiler -I compiler/tests/native -I lib -L "$libdir" -l LLVM-21 -o "$2"
 }
 mkdir -p "$work/clean"
 build "$work/clean" "$work/clean/f-unit" || { echo "f-faults: FAILED to build the clean test" >&2; exit 1; }

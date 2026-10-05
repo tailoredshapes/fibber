@@ -10,7 +10,7 @@
 #                        argument the implementation stores must stay on the heap) fail
 #         wrong-instance a call reads the facts of the first instance of the protocol, not the one it resolves to: 283 fails
 #         not-ready      an impl method is decided ahead of its caller even when a `defun` it names has no summary yet: 284 fails
-# environment: FIBC (the fibc that builds the mutant; default the gate's F of this tree), LAIR_DIR (the directory with liblair.so),
+# environment: FIBC (the fibc that builds the mutant; default the gate's F of this tree),
 #   MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-impl-escape-MODE), MUT_J (cases at once, default 2).
 # exit: 0 when every case failed under the mutant, 1 when one survived, 2 for a setup error. That the cases pass UNmutated is shown by
 #   an ordinary `F cases cases/ownership --only 280- ..`; this script does not repeat it.
@@ -25,13 +25,10 @@ esac
 CASES=("$@"); [ ${#CASES[@]} -gt 0 ] || CASES=("${DEFAULT[@]}")
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-impl-escape-$MODE}
-main_target=$(cd "$R" && git rev-parse --git-common-dir | sed 's|/\.git$||')/target/debug
 gate_f=$HOME/.cache/fibber-scratch/gate-$(basename "$R")/F
-if [ -z "${FIBC:-}" ]; then if [ -x "$gate_f" ]; then FIBC=$gate_f; else FIBC=$main_target/fibc; fi; fi
-LAIR_DIR=${LAIR_DIR:-$main_target}
+if [ -z "${FIBC:-}" ]; then if [ -x "$gate_f" ]; then FIBC=$gate_f; else echo "mutant-impl-escape: no fibc: set FIBC (a stage 2, or the seed scripts/fetch-seed.sh fetches) or run scripts/gate.sh first" >&2; exit 2; fi; fi
 [ -x "$FIBC" ] || { echo "mutant-impl-escape: no fibc to build with: set FIBC" >&2; exit 2; }
-[ -e "$LAIR_DIR/liblair.so" ] || { echo "mutant-impl-escape: no liblair.so in $LAIR_DIR: set LAIR_DIR" >&2; exit 2; }
-export LD_LIBRARY_PATH=$LAIR_DIR
+unset LD_LIBRARY_PATH
 
 rm -rf "$OUT/tree"
 mkdir -p "$OUT/tree" "$OUT/tree/cases" "$OUT/tmp"
@@ -75,7 +72,7 @@ EOF
 esac
 cd "$OUT/tree" || exit 2
 echo "mutant-impl-escape: building the $MODE mutant"
-if ! "$FIBC" build compiler/fibc.fib -I compiler -I lib -L "$LAIR_DIR" -l lair -o "$OUT/F" > "$OUT/build.log" 2>&1; then
+if ! "$FIBC" build compiler/fibc.fib -I compiler -I lib -L "${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" -l LLVM-21 -o "$OUT/F" > "$OUT/build.log" 2>&1; then
   tail -n 20 "$OUT/build.log"; echo "mutant-impl-escape: the mutant did not build"; exit 2
 fi
 export FIB_LIB=$OUT/tree/lib

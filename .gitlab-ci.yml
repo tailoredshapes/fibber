@@ -2,26 +2,22 @@
 # cannot run while the account's Actions billing limit is exceeded; both stay in the tree until that is settled.
 #
 # What each job judges (CLAUDE.md): `stage2` is the truth about main (the released seed in SEED builds stage 2, the fixed point holds, the
-# case suites pass except the expected ones); `lairf` checks the fibber lair against the Rust one while the Rust one exists (until stage 10);
-# `rust-seed` judges the frozen Rust against the data of its own time (tag seed-1); `release` builds the tarball on a v* tag.
+# case suites pass except the expected ones); `release` builds the tarball on a v* tag. The Rust jobs (`lairf`, `rust-seed`) went with the
+# Rust (ROADMAP stage 10); docs/rust-legacy.md says how to bring them back.
 # The seed comes from the cache directory FIB_SEED_CACHE (DIR/SHA256/seed.tar.gz): the runner has no GitHub login. Put a new seed there
 # (and its sha256 in SEED) when SEED moves.
 
 stages: [test, release]
 
 variables:
-  GIT_DEPTH: "0"                      # the Rust job needs the tag seed-1
-  GIT_FETCH_EXTRA_FLAGS: --tags
-  LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
+  GIT_DEPTH: "0"
   FIB_SEED_CACHE: /tank/repos/tailoredshapes/_ci-cache/fibber/seeds
-  CARGO_TARGET_DIR: /home/gitlab-runner/.cache/fibber-ci/cargo-target
   FIB_LAIR_WORKERS: "4"
 
 default:
   tags: [shell]
   timeout: 90m
   before_script:
-    - source ~/.cargo/env 2>/dev/null || export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
     - ulimit -v 24000000 || true
 
 # One heavy job at a time on the shared machine (the agents and the benchmarks use it too).
@@ -40,32 +36,6 @@ stage2:
     when: on_failure
     expire_in: 3 days
     paths: [.gate/*.log]
-
-lairf:
-  extends: .heavy
-  stage: test
-  timeout: 60m
-  needs: []
-  script:
-    - fibc=$(scripts/fetch-seed.sh "$CI_PROJECT_DIR/.seed")
-    - cargo build -p lair --bin lair
-    - FIBC=$fibc LAIR="$CARGO_TARGET_DIR/debug/lair" LEVELS="0 2" scripts/ci-lairf.sh "$CI_PROJECT_DIR/.lairf"
-
-rust-seed:
-  extends: .heavy
-  stage: test
-  timeout: 90m
-  needs: []
-  rules:
-    - changes: [crates/**/*, Cargo.toml, Cargo.lock, scripts/ci-seed-overlay.sh, .gitlab-ci.yml]
-  script:
-    - scripts/ci-seed-overlay.sh
-    - cargo fmt --all --check
-    - cargo clippy --workspace --all-targets --all-features -- -D warnings
-    - cargo test -p fibref -p fibgen -p lir
-    - cargo test -p lair
-    - cargo run -p fibref -- cases cases/ownership
-    - cargo run -p fibref -- cases cases/modules
 
 # A v* tag builds the release tarball (package.sh: static LLVM, no liblair, x86-64-v2) and publishes it to this project's releases.
 release:

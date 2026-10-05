@@ -12,8 +12,8 @@
 #   no-derived-read own.lastuse: reading a derived binding no longer reads its root, so the root may be moved or released early
 #   keep-temp-part  own.walk.call: a read through a part of the step's own temporary stays `Derived` of it, though the temporary is
 #                   released at the end of the step
-# environment: FIBC (the fibc that builds the mutant; default the gate's F of this tree, else target/debug/fibc of the main
-#   checkout), LAIR_DIR (the directory with liblair.so), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-elem-get),
+# environment: FIBC (the fibc that builds the mutant; default the gate's F of this tree, else none: run the gate first or set it),
+#   MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-elem-get),
 #   MUT_J (cases at once, default 2), MUT_CASES.
 # exit: 0 when every mutant was killed, 1 when one survived, 2 for a setup error.
 set -uo pipefail
@@ -22,13 +22,10 @@ MUTANTS=("$@")
 [ ${#MUTANTS[@]} -gt 0 ] || MUTANTS=(never-retain always-retain no-pend no-derived-read keep-temp-part)
 CASES=${MUT_CASES:-"270- 271- 272- 273- 274- 275- 276- 277- 278-"}
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-elem-get}
-main_target=$(cd "$R" && git rev-parse --git-common-dir | sed 's|/\.git$||')/target/debug
 gate_f=$HOME/.cache/fibber-scratch/gate-$(basename "$R")/F
-if [ -z "${FIBC:-}" ]; then if [ -x "$gate_f" ]; then FIBC=$gate_f; else FIBC=$main_target/fibc; fi; fi
-LAIR_DIR=${LAIR_DIR:-$main_target}
+if [ -z "${FIBC:-}" ]; then if [ -x "$gate_f" ]; then FIBC=$gate_f; else echo "mutant-elem-get: no fibc: set FIBC (a stage 2, or the seed scripts/fetch-seed.sh fetches) or run scripts/gate.sh first" >&2; exit 2; fi; fi
 [ -x "$FIBC" ] || { echo "mutant-elem-get: no fibc to build with: set FIBC" >&2; exit 2; }
-[ -e "$LAIR_DIR/liblair.so" ] || { echo "mutant-elem-get: no liblair.so in $LAIR_DIR: set LAIR_DIR" >&2; exit 2; }
-export LD_LIBRARY_PATH=$LAIR_DIR
+unset LD_LIBRARY_PATH
 
 # mutate NAME TREE: edits the copy; a pattern that is not found is a setup error (the source changed under the mutant).
 sub() { # sub FILE PERL-SUBSTITUTION
@@ -69,7 +66,7 @@ for m in "${MUTANTS[@]}"; do
   mutate "$m" "$T/tree" || exit 2
   # `F cases` finds the implicit library through FIB_LIB, else the one beside the binary
   export FIB_LIB=$T/tree/lib
-  if ! (cd "$T/tree" && ulimit -v 16000000 && "$FIBC" build compiler/fibc.fib -I compiler -I lib -L "$LAIR_DIR" -l lair -o "$T/F") > "$T/build.log" 2>&1; then
+  if ! (cd "$T/tree" && ulimit -v 16000000 && "$FIBC" build compiler/fibc.fib -I compiler -I lib -L "${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" -l LLVM-21 -o "$T/F") > "$T/build.log" 2>&1; then
     echo "mutant $m: KILLED (the mutant does not even build: $(tail -n 1 "$T/build.log"))"; killed=$((killed+1)); continue
   fi
   (cd "$T/tree" && ulimit -v 16000000 && "$T/F" cases cases/ownership --only $CASES -j "${MUT_J:-2}") > "$T/cases.log" 2>&1
