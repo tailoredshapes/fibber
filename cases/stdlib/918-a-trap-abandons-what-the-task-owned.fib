@@ -1,0 +1,25 @@
+;; spec:   docs/design/exceptions.md 4.1 (S1c), 4.3; stdlib §2.10
+;; expect: accept
+;; result: 7
+;; audit:  abandoned
+;; leaks:  5
+;; stage:  2
+;; roots:  ../../lib support
+;; A task traps while it owns a vector (an object and its array) and a string: the unwinding that would free them is stage 2, so they are
+;; abandoned, never freed, and the audit says so: `audit: abandoned` holds when something leaked, nothing erred (no double free, no free of
+;; what was not allocated), and, with `leaks: 5`, exactly five objects did: counted by running the program with FIB_TRACE=1, they are the objects the task's frames
+;; made and still owned at the trap (the vector and its array, the string and its parts, the message string being built); the
+;; same task that owns nothing at its trap leaks nothing (cases 911, 915). What the runtime itself made for the failure (the task, its
+;; result atom, its closure, the message copy) is freed: a sixth leak would be the runtime's. Killed by: scripts/mutant-task-trap.sh
+;; `no-release` (the thread keeps its count of the task: leaks above 5), `double-release` (an audit error).
+(ns main (:use fib.core fib.async))
+
+(defun main () -> i64
+  (let ((t (spawn (fn ()
+                    (let ((v (mapv (fn (i: i64) (* i i)) (range 4)))
+                          (s (str "abc" (show (count v)))))
+                      (do (trap (str "owned " s))
+                          0))))))
+    (match (try-join t)
+      ((Err e) (if (= (. e message) "owned abc4") 7 1))
+      ((Ok _) 0))))

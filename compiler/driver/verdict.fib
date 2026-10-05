@@ -3,7 +3,9 @@
 ;; Shapes decided: stage 2 has no interpreter, so there is no second side to disagree with: the outcome is the compiled run's alone, its
 ;; audit read from the free trace (every `A n` freed once by an `F n`, none freed that was not allocated, `I k` restarting the count
 ;; as Rust's `Trace::parse` does). The trace cannot tell a leaked cycle from another leak, so `audit: leak-cycle` holds when something
-;; leaked and nothing erred, and an `open` case whose audit leaks without error counts as the program's own failure.
+;; leaked and nothing erred, as does `audit: abandoned` (the objects the frames of a trapped task owned, which a task's trap leaves
+;; behind, docs/design/exceptions.md 4.1), and either of them with `leaks: N` holds only when exactly N objects leaked, so a runtime
+;; that frees too much or too little under a trap is seen. An `open` case whose audit leaks without error counts as the program's own failure.
 (ns driver.verdict
   (:require [fib.string :as s])
   (:use driver.header))
@@ -53,20 +55,24 @@
 
 (defun audit-clean? :private (a: CsAudit) -> bool (and (= (. a leaks) 0) (empty? (. a errors))))
 
-(defun audit-mismatch :private (clean: bool a: CsAudit) -> (Vec str)
-  (let ((holds (if clean (audit-clean? a) (and (> (. a leaks) 0) (empty? (. a errors))))))
-    (if holds [] [(str-join ["audit: expected " (if clean "clean" "leak-cycle") ", got " (audit-text a)])])))
+(defun audit-mismatch :private (want: str leaks: i64 a: CsAudit) -> (Vec str)
+  (let ((holds (if (= want "clean")
+                   (audit-clean? a)
+                   (and (> (. a leaks) 0) (empty? (. a errors)) (or (< leaks 0) (= leaks (. a leaks)))))))
+    (if holds
+        []
+        [(str-join ["audit: expected " want (if (< leaks 0) "" (str-join [" with leaks=" (show leaks)])) ", got " (audit-text a)])])))
 
 (defun allocs-mismatch :private (maximum: i64 counted: i64) -> (Vec str)
   (if (or (< maximum 0) (<= counted maximum))
       []
       [(str-join ["allocs: expected at most " (show maximum) " heap objects, the run allocated " (show counted)])]))
 
-(defun judge-accept :private (expected: i64 clean: bool maximum: i64 o: CsOutcome) -> CsStatus
+(defun judge-accept :private (expected: i64 want: str maximum: i64 leaks: i64 o: CsOutcome) -> CsStatus
   (match o
     ((OutCompiled result audit counted)
      (let ((ms (into (into (if (= expected result) [] [(str-join ["result: expected " (show expected) ", got " (show result)])])
-                           (audit-mismatch clean audit))
+                           (audit-mismatch want leaks audit))
                      (allocs-mismatch maximum counted))))
        (if (empty? ms) StPass (StFail (str-join (vec (interpose "; " ms)))))))
     ((OutRejected m) (StFail (str-concat "expected accept, but rejected: " m)))
@@ -110,7 +116,7 @@
   (match o
     ((OutUnsupported r) (StPending r))
     (_ (match v
-         ((CsAccept result clean maximum) (judge-accept result clean maximum o))
+         ((CsAccept result audit maximum leaks) (judge-accept result audit maximum leaks o))
          ((CsReject e) (judge-reject e o))
          ((CsTrap t) (judge-trap t o))))))
 

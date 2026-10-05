@@ -36,6 +36,14 @@ rests on anyone's word, including the author's.
      count goes up, so a bound is worth having when `N` is the count,
      and a case that claims that has a test that lowers `N` by one and
      requires the failure.
+     A header may also say `audit: leak-cycle`, a run that leaked and
+     erred nowhere, or `audit: abandoned`, the objects a spawned task's
+     frames owned when it trapped (a task's trap ends the task and
+     abandons them, docs/design/exceptions.md 4.1): both hold when
+     something leaked and nothing erred, and `abandoned` must say how
+     many with `leaks: N`, which then holds only when exactly `N` leaked
+     (so a runtime that frees too much or too little under a trap
+     fails). `clean` takes no `leaks`.
    - `reject`: must fail to compile, with an error containing the
      stated text.
    - `trap`: must type-check and pass the ownership checker, then

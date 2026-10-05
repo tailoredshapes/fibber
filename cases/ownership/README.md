@@ -6,7 +6,8 @@ Each file starts with a header that fixes the expected verdict:
 ;; spec:   the section of spec/ownership.md that decides this case
 ;; expect: accept | reject | trap
 ;; result: value main returns (accept only)
-;; audit:  clean | leak-cycle (accept only)
+;; audit:  clean | leak-cycle | abandoned (accept only; abandoned needs leaks: N)
+;; leaks:  N      exactly N heap objects leaked (accept only; with leak-cycle or abandoned, optional for the first)
 ;; allocs: <= N   at most N heap objects allocated (accept only, optional)
 ;; error:  text the compile error must contain (reject only)
 ;; trap:   text the run-time trap must contain (trap only)

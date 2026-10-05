@@ -2,8 +2,8 @@
 ;; cases/stdlib/README.md): the run of `;; key: value` lines at the top of the file, validated against its verdict (`accept` has `result`
 ;; and `audit`, `reject` an `error`, `trap` a `trap`), with the optional `allocs`, `roots`, `covers` and `open`. A header that does not
 ;; parse is a `CsHdrError` (the line and the words of the Rust's Display), never a verdict.
-;; Shapes decided: `allocs` is -1 when the header gives none; the verdict's audit is the word (`clean` or `leak-cycle`) as a bool
-;; `clean`; `roots` are already joined to the case's directory (`case_roots`).
+;; Shapes decided: `allocs` and `leaks` are -1 when the header gives none; the verdict's audit is the word (`clean`, `leak-cycle` or
+;; `abandoned`, the objects a trapped task's frames owned, docs/design/exceptions.md 4.1; `abandoned` needs `leaks: N`, how many); `roots` are already joined to the case's directory (`case_roots`).
 (ns driver.header
   (:require [fib.string :as s])
   (:use expand.roots))
@@ -16,14 +16,14 @@
 
 ;; The verdict a header fixes. Rust: header.rs Verdict
 (defenum CsVerdict
-  (CsAccept result: i64 clean: bool allocs: i64)
+  (CsAccept result: i64 audit: str allocs: i64 leaks: i64)
   (CsReject error: str)
   (CsTrap trap: str))
 
 ;; A parsed header. `open` are the §7 items that excuse a failing `accept` case.
 (defstruct CsHeader (spec: str verdict: CsVerdict roots: (Vec str) open: (Vec str)))
 
-(def known-keys: (Vec str) ["spec" "expect" "result" "audit" "allocs" "roots" "error" "trap" "covers" "open" "stage"])
+(def known-keys: (Vec str) ["spec" "expect" "result" "audit" "allocs" "leaks" "roots" "error" "trap" "covers" "open" "stage"])
 
 (defun key-char? :private (b: i32) -> bool
   (or (and (>= b 48i32) (<= b 57i32)) (and (>= b 65i32) (<= b 90i32)) (and (>= b 97i32) (<= b 122i32)) (= b 45i32) (= b 95i32)))
@@ -112,21 +112,32 @@
         (Ok (allocs-max (. f value))))
       (Ok -1)))
 
+;; The count a `leaks` header gives (a positive decimal), -1 when it has none; required by `audit: abandoned`, refused by `audit: clean`.
+(defun leaks-of :private (fields: (Vec CsField) audit: str) -> (Result i64 CsHdrError)
+  (cond (some? (find-field fields "leaks"))
+          (if (= audit "clean")
+              (try-let ((_ (forbid fields "leaks"))) (Ok -1))
+              (try-let ((f (checked fields "leaks" (fn (v: str) (and (all-bytes? v digit?) (> (unwrap-or (parse-long v) 0) 0))))))
+                (Ok (unwrap-or (parse-long (. f value)) -1))))
+        (= audit "abandoned") (Err (hdr-err (end-line fields) "missing required header key `leaks` (`audit: abandoned` says how many objects)"))
+        :else (Ok -1)))
+
 (defun accept :private (fields: (Vec CsField)) -> (Result CsVerdict CsHdrError)
   (try-let ((r (checked fields "result" (fn (v: str) (some? (parse-long v)))))
-            (a (checked fields "audit" (fn (v: str) (or (= v "clean") (= v "leak-cycle")))))
+            (a (checked fields "audit" (fn (v: str) (or (= v "clean") (= v "leak-cycle") (= v "abandoned")))))
             (n (allocs-of fields))
+            (l (leaks-of fields (. a value)))
             (_ (forbid-all fields ["error" "trap"])))
-    (Ok (CsAccept (unwrap-or (parse-long (. r value)) 0) (= (. a value) "clean") n))))
+    (Ok (CsAccept (unwrap-or (parse-long (. r value)) 0) (. a value) n l))))
 
 (defun reject :private (fields: (Vec CsField)) -> (Result CsVerdict CsHdrError)
   (try-let ((e (checked fields "error" nonempty?))
-            (_ (forbid-all fields ["result" "audit" "allocs" "trap" "open"])))
+            (_ (forbid-all fields ["result" "audit" "allocs" "leaks" "trap" "open"])))
     (Ok (CsReject (. e value)))))
 
 (defun trap :private (fields: (Vec CsField)) -> (Result CsVerdict CsHdrError)
   (try-let ((t (checked fields "trap" nonempty?))
-            (_ (forbid-all fields ["result" "audit" "allocs" "error" "open"])))
+            (_ (forbid-all fields ["result" "audit" "allocs" "leaks" "error" "open"])))
     (Ok (CsTrap (. t value)))))
 
 ;; The names a list key holds, each once; `open` may not be empty. Rust: header/labels.rs `names`
