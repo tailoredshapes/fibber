@@ -1,0 +1,198 @@
+;; compiler/tests/fibref/heap-stk.fib: the adversarial stack-scope and unique-write heap tests of crates/fibref/tests/heap_stack_adversarial.rs and
+;; heap_unique_adversarial.rs at seed-1, one fibber test per Rust test. Each tries to make the audit miss a stack reference that outlives its scope, or an
+;; in-place write that a second holder could see. Exit status: failures.
+(ns main (:use fibref.value fibref.heap fibref.trace heaptk))
+
+(defun is-str (what: str got: str want: str) -> str (if (= got want) "" (str what ": [" got "] <> [" want "]")))
+(defun sref-in-heap (id: i64) -> str (str "stack object #" id " stored into a heap object"))
+(defun sref-outer (id: i64 s: i64) -> str (str "stack object #" id " stored into an object of earlier scope " s))
+(defun sdead (op: str id: i64) -> str (str "stack use after scope: " op " of stack object #" id))
+(defun unchanged (h: Heap n: i64) -> str (same "a failing call left events" (nev h) n))
+
+;; ================= heap_stack_adversarial.rs =================
+(defun t-st-laundering-a-stack-ref-through-a-stack-cell () -> str
+  (let [h (heap-new) hc (cell-of h INone) s (heap-open-scope h) hh (stk h s IImmutable []) sc (stk h s ICell [(obj hh)]) laundered (rd h sc 0) n (nev h)]
+    (all [(is-err "write" (heap-write h hc 0 laundered) (sref-in-heap hh)) (unchanged h n) (is-val "slot" (heap-read h hc 0) INone)])))
+
+(defun t-st-a-stack-ref-cannot-reach-another-thread-through-a-shared-atom () -> str
+  (let [h (heap-new) a (atom-of h INone) _m (ok! (heap-mark-shared h a)) s (heap-open-scope h) hh (stk h s IImmutable []) n (nev h)]
+    (all [(is-err "write" (heap-write h a 0 (obj hh)) (sref-in-heap hh)) (unchanged h n) (is-bool "unshared" (heap-is-shared h hh) false)])))
+
+(defun t-st-a-forged-weak-to-a-stack-object-is-caught-everywhere () -> str
+  (let [h (heap-new) hc (cell-of h INone) outer (heap-open-scope h) oc (stk h outer ICell [INone]) inner (heap-open-scope h) hh (stk h inner IImmutable [])
+        forged (IWeak hh) e (str "weak reference to stack object #" hh) n (nev h)
+        f1 (all [(is-err "weak" (heap-weak h hh) e) (is-err "write heap cell" (heap-write h hc 0 forged) e) (is-err "write outer stack cell" (heap-write h oc 0 forged) e)
+                    (is-err "alloc" (heap-alloc h IImmutable 0 [forged]) e) (is-err "alloc in scope" (heap-alloc-in-scope h inner IImmutable 0 [forged]) e)
+                    (is-err "upgrade" (heap-upgrade h hh) e) (unchanged h n)])
+        _e (ok! (heap-end-scope h inner))]
+    (all [f1 (is-err "upgrade after the end" (heap-upgrade h hh) e) (is-err "write after the end" (heap-write h hc 0 forged) e)])))
+
+(defun t-st-a-stack-ref-nested-inside-stack-structs-cannot-reach-the-heap () -> str
+  (let [h (heap-new) s (heap-open-scope h) leaf (stk h s IImmutable [(i 1)]) mid (stk h s IImmutable [(obj leaf)]) top (stk h s IImmutable [(obj mid)]) n (nev h)
+        e (heap-alloc h IImmutable 0 [(i 0) (obj top)]) m (nev h) _x (ok! (heap-end-scope h s)) r (heap-finish h)]
+    (all [(is-err "alloc" e (sref-in-heap top)) (same "events" m n) (ck "clean" (report-clean? r)) (same "allocated" (. r allocated) 0)])))
+
+(defun t-st-an-inner-ref-cannot-hide-in-an-outer-object-through-an-inner-cell () -> str
+  (let [h (heap-new) outer (heap-open-scope h) oc (stk h outer ICell [INone]) inner (heap-open-scope h) ii (stk h inner IImmutable []) ic (stk h inner ICell [(obj ii)])
+        a (is-err "cell" (heap-write h oc 0 (obj ic)) (sref-outer ic outer)) b (is-err "imm" (heap-write h oc 0 (obj ii)) (sref-outer ii outer))
+        c (is-err "alloc" (heap-alloc-in-scope h outer IImmutable 0 [(obj ii)]) (sref-outer ii outer))
+        deepest (heap-open-scope h) d (stk h deepest IImmutable []) e (is-err "deepest" (heap-write h ic 0 (obj d)) (sref-outer d inner))
+        _1 (ok! (heap-end-scope h deepest)) _2 (ok! (heap-end-scope h inner)) _3 (ok! (heap-end-scope h outer))]
+    (all [a b c e (ck "clean" (clean? h))])))
+
+(defun t-st-a-ref-to-an-ended-object-cannot-be-stored-anywhere () -> str
+  (let [h (heap-new) hc (cell-of h INone) outer (heap-open-scope h) oc (stk h outer ICell [INone]) inner (heap-open-scope h) gone (stk h inner IImmutable []) _e (ok! (heap-end-scope h inner))
+        e (sdead "store" gone)]
+    (all [(is-err "outer cell" (heap-write h oc 0 (obj gone)) e) (is-err "heap cell" (heap-write h hc 0 (obj gone)) e)
+          (is-err "alloc in scope" (heap-alloc-in-scope h outer IImmutable 0 [(obj gone)]) e)])))
+
+(defun t-st-a-scope-ended-out-of-order-is-dead-at-once () -> str
+  (let [h (heap-new) child (imm h []) early (heap-open-scope h) e (stk h early IImmutable [(obj child)]) late (heap-open-scope h) l (stk h late ICell [INone])
+        _a (ok! (heap-end-scope h early)) open1 (heap-open-scopes h) c1 (cnt h child)
+        r1 (is-err "read" (heap-read h e 0) (sdead "read" e)) r2 (is-err "store" (heap-write h l 0 (obj e)) (sdead "store" e))
+        early2 (heap-open-scope h) _b (stk h early2 ICell [INone]) late2 (heap-open-scope h) l2 (stk h late2 IImmutable []) _c (ok! (heap-end-scope h early2)) n (nev h)
+        r3 (is-err "outer" (heap-write h l 0 (obj l2)) (sref-outer l2 late)) m (nev h)
+        _d (ok! (heap-end-scope h late2)) _e (ok! (heap-end-scope h late)) _f (rel h child)]
+    (all [(ck "open scopes" (= open1 [late])) (same "drop released child" c1 1) r1 r2 r3 (same "events" m n) (ck "clean" (clean? h))])))
+
+(defun t-st-a-scope-id-used-after-its-end-is-refused-and-never-names-a-new-scope () -> str
+  (let [h (heap-new) s (heap-open-scope h) _e (ok! (heap-end-scope h s)) t (heap-open-scope h) n (nev h)]
+    (all [(ck "ids are never reused" (not= s t)) (is-err "alloc" (heap-alloc-in-scope h s IImmutable 0 []) "scope 0 has already ended")
+          (is-err "end" (heap-end-scope h s) "scope 0 has already ended") (unchanged h n) (ck "open" (= (heap-open-scopes h) [t]))])))
+
+(defun t-st-a-scope-id-from-another-heap-is-unknown () -> str
+  (let [other (heap-new) _a (heap-open-scope other) _b (heap-open-scope other) _c (heap-open-scope other) foreign (heap-open-scope other) h (heap-new) _d (heap-open-scope h)]
+    (is-err "alloc" (heap-alloc-in-scope h foreign IImmutable 0 []) "unknown scope 3")))
+
+(defun t-st-a-stack-object-read-after-its-scope-is-not-a-plain-use-after-free () -> str
+  (let [h (heap-new) child (imm h []) s (heap-open-scope h) hh (stk h s IImmutable [(obj child)]) _e (ok! (heap-end-scope h s))
+        s2 (heap-open-scope h) h2 (stk h s2 IImmutable [(obj child)]) r1 (heap-read h hh 0) r2 (heap-read h h2 0)]
+    (all [(ck "distinct" (not= hh h2)) (is-err "read" r1 (sdead "read" hh)) (ck "not a plain use after free" (not= (res r1) (str "use after free: read of freed object #" hh)))
+          (is-val "live one" r2 (obj child)) (do (ok! (heap-end-scope h s2)) (rel h child) (ck "clean" (clean? h)))])))
+
+(defun t-st-sharing-a-heap-object-through-a-stack-object-marks-nothing () -> str
+  (let [h (heap-new) x (imm h []) s (heap-open-scope h) sa (stk h s IAtom [(obj x)]) n (nev h)]
+    (all [(is-err "mark" (heap-mark-shared h sa) (str "stack object #" sa " would be shared")) (unchanged h n) (is-bool "x" (heap-is-shared h x) false)])))
+
+(defun t-st-counting-a-stack-object-through-a-read-ref-is-a-no-op () -> str
+  (let [h (heap-new) s (heap-open-scope h) hh (stk h s IImmutable []) sc (stk h s ICell [(obj hh)]) v (rd h sc 0)]
+    (match (ival-obj v)
+      ((some id) (all [(is-ok "retain" (heap-retain h id)) (is-int "count" (heap-count h hh) 0) (is-ok "scope ends" (heap-end-scope h s)) (ck "ended" (not (heap-is-live h hh)))]))
+      (nil "a ref"))))
+
+(defun t-st-a-self-holding-stack-cell-ends-cleanly () -> str
+  (let [h (heap-new) s (heap-open-scope h) c (stk h s ICell [INone]) _w (wr h c 0 (obj c)) e (heap-end-scope h s)]
+    (all [(is-ok "end" e) (ck "clean" (clean? h))])))
+
+(defun t-st-an-unended-scope-is-reported-and-what-it-holds-is-a-plain-leak () -> str
+  (let [h (heap-new) x (imm h []) s (heap-open-scope h) _c (stk h s ICell [(obj x)]) _r (rel h x) r (heap-finish h)]
+    (all [(ck "open scopes" (= (. r open-scopes) [s])) (same "one leak" (count (. r leaks)) 1) (same "it is x" (. (nth (. r leaks) 0) id) x)
+          (ck "a plain leak" (= (. (nth (. r leaks) 0) class) HpLeak)) (ck "not clean" (not (report-clean? r)))])))
+
+(defun t-st-a-stack-cycle-through-a-heap-cell-cannot-form () -> str
+  (let [h (heap-new) hc (cell-of h INone) s (heap-open-scope h) sc (stk h s ICell [(obj hc)]) w (heap-write h hc 0 (obj sc)) _e (ok! (heap-end-scope h s)) c (cnt h hc) _r (rel h hc)]
+    (all [(is-err "write" w (sref-in-heap sc)) (same "hc count" c 1) (ck "clean" (clean? h))])))
+
+(defun t-st-scope-events-are-recorded-in-order-with-drops-most-recent-first () -> str
+  (let [h (heap-new) outer (heap-open-scope h) a (stk h outer IImmutable []) inner (heap-open-scope h) b (stk h inner IImmutable []) c (stk h inner IImmutable [])
+        _1 (ok! (heap-end-scope h inner)) _2 (ok! (heap-end-scope h outer))]
+    (is-str "events" (evs h) "scope-open 0;alloc-stack #0 immutable scope 0;scope-open 1;alloc-stack #1 immutable scope 1;alloc-stack #2 immutable scope 1;scope-end 1;drop #2;drop #1;scope-end 0;drop #0;")))
+
+;; ================= heap_unique_adversarial.rs =================
+;; [c x]: a cell holding a fresh immutable object x with the given fields (the Rust `place`).
+(defun place (h: Heap fields: (Vec IVal)) -> (Vec i64)
+  (let [x (imm h fields) c (cell-of h (obj x)) _r (rel h x)] [c x]))
+(defun refused (x: i64 why: str) -> str (str "unique write refused on #" x ": " why))
+
+;; A unique write of a fresh probe is refused with `text`, changes no event, no field and no count.
+(defun refused-cleanly (h: Heap c: i64 x: i64 text: str) -> str
+  (let [new (imm h []) old (rd h x 0) n (nev h) w (heap-write-unique h c 0 (obj new)) m (nev h) back (rd h x 0) cn (cnt h new) _r (rel h new)]
+    (all [(is-err "write-unique" w text) (same "events" m n) (ck "field" (ival-eq old back)) (same "probe count" cn 1)])))
+
+(defun t-un-two-variables-holding-one-object-see-no-in-place-write () -> str
+  (let [h (heap-new) cx (place h [(i 1)]) c1 (nth cx 0) x (nth cx 1) c2 (cell-of h (obj x))]
+    (all [(refused-cleanly h c1 x (refused x "Count(2)")) (refused-cleanly h c2 x (refused x "Count(2)"))])))
+
+(defun t-un-a-temporary-count-on-the-object-blocks-the-write () -> str
+  (let [h (heap-new) cx (place h [(i 1)]) c (nth cx 0) x (nth cx 1) _r (ret h x)]
+    (is-err "write-unique" (heap-write-unique h c 0 (obj x)) (refused x "Count(2)"))))
+
+(defun t-un-an-object-another-thread-can-upgrade-to-is-shared-and-refused () -> str
+  (let [h (heap-new) cx (place h [(i 1)]) c (nth cx 0) x (nth cx 1) a (atom-of h INone) _m (ok! (heap-mark-shared h a)) w (ok! (heap-weak h x)) wr1 (heap-write h a 0 w)]
+    (all [(is-ok "reset with the weak" wr1) (is-int "count" (heap-count h x) 1) (is-bool "shared" (heap-is-shared h x) true) (refused-cleanly h c x (refused x "Shared"))])))
+
+(defun t-un-a-literal-and-its-immortal-tail-are-never-written () -> str
+  (let [h (heap-new) tail (lit h [(i 2)]) l (lit h [(obj tail)]) c (cell-of h (obj tail)) c2 (cell-of h (obj l))]
+    (all [(refused-cleanly h c tail (refused tail "Immortal")) (refused-cleanly h c2 l (refused l "Immortal")) (is-int "no retain reached a literal" (heap-count h l) 0)])))
+
+(defun t-un-a-stack-object-is-never-written-in-place () -> str
+  (let [h (heap-new) s (heap-open-scope h) x (stk h s IImmutable [INone]) c (stk h s ICell [(obj x)])]
+    (refused-cleanly h c x (refused x "Stack"))))
+
+(defun t-un-a-private-stack-cell-may-write-its-unique-heap-content () -> str
+  (let [h (heap-new) cc (place h [(i 1)]) copy (nth cc 1) s (heap-open-scope h) p (stk h s ICell [(obj copy)]) c2 (cnt h copy)
+        a (refused-cleanly h p copy (refused copy "Count(2)")) fresh (imm h [(i 1)]) _w (wr h p 0 (obj fresh)) _r (rel h fresh) w (heap-write-unique h p 0 (i 9))
+        sv (stk h s IImmutable []) bad (heap-write-unique h p 0 (obj sv))]
+    (all [(same "variable and private cell" c2 2) a (is-int "unique write" w fresh) (is-err "stack value" bad (sref-in-heap sv))])))
+
+(defun t-un-an-object-on-a-cell-cycle-with-a-second-holder-is-refused () -> str
+  (let [h (heap-new) cx (place h [INone]) c (nth cx 0) x (nth cx 1) y (imm h [(obj x) (obj c)]) a (refused-cleanly h c x (refused x "Count(2)")) _r (rel h y)
+        w (heap-write-unique h c 0 (obj c)) _s (rel h c) r (heap-finish h)]
+    (all [a (is-int "write" w x) (ck "cycle only" (report-cycle-leak-only? r)) (is-str "leak-cycle" (leak-ids r HpLeakCycle) (str "#" x " #" c " "))])))
+
+(defun t-un-an-object-held-only-through-the-place-on-a-cycle-is-written () -> str
+  (let [h (heap-new) cx (place h [INone INone]) c (nth cx 0) x (nth cx 1) w1 (heap-write-unique h c 0 (obj c)) w2 (heap-write-unique h c 1 (i 5))
+        other (imm h []) w3 (heap-write-unique h c 1 (obj other)) _a (rel h other) _b (rel h c) r (heap-finish h)]
+    (all [(is-int "w1" w1 x) (is-int "w2" w2 x) (is-int "w3" w3 x) (ck "cycle only" (report-cycle-leak-only? r)) (is-str "no immutable cycle" (leak-ids r HpImmutableCycle) "")])))
+
+(defun t-un-no-legal-sequence-of-unique-writes-ties-an-immutable-cycle () -> str
+  (let [h (heap-new) pa (place h [INone]) ca (nth pa 0) a (nth pa 1) pb (place h [INone]) cb (nth pb 0) b (nth pb 1)
+        w1 (heap-write-unique h ca 0 (obj b)) w2 (heap-write-unique h cb 0 (obj a)) w3 (heap-write-unique h ca 0 (obj a)) _r (rel h ca) _s (rel h cb)]
+    (all [(is-int "w1" w1 a) (is-err "w2" w2 (refused b "Count(2)")) (is-err "w3" w3 (refused a "StoresItself")) (ck "clean" (clean? h))])))
+
+(defun t-un-an-over-release-that-fakes-a-count-of-one-is-still-caught () -> str
+  (let [h (heap-new) cx (place h [INone]) c (nth cx 0) x (nth cx 1) z (imm h [(obj x)]) _o (rel h x) w (heap-write-unique h c 0 (obj z)) _r (rel h z)
+        e (heap-release h c) rep (heap-finish h)]
+    (all [(is-int "write" w x) (is-err "release c" e (str "double free: release of freed object #" x)) (ck "not clean" (not (report-clean? rep))) (ck "not cycle-only" (not (report-cycle-leak-only? rep)))
+          (ck "x on an immutable cycle" (contains? (into #{} (report-ids-in rep HpImmutableCycle)) x))])))
+
+(defun t-un-a-freed-place-or-content-is-use-after-free () -> str
+  (let [h (heap-new) cx (place h [INone]) c (nth cx 0) x (nth cx 1) _o (rel h x) w1 (heap-write-unique h c 0 (i 1)) pc (place h [INone]) c2 (nth pc 0) _f (rel h c2)
+        w2 (heap-write-unique h c2 0 (i 1))]
+    (all [(is-err "content" w1 (str "use after free: write of freed object #" x)) (is-err "place" w2 (str "use after free: write of freed object #" c2))])))
+
+(defun t-un-storing-a-literal-by-unique-write-retains-nothing () -> str
+  (let [h (heap-new) l (lit h []) cx (place h [INone]) c (nth cx 0) x (nth cx 1) start (nev h) w (heap-write-unique h c 0 (obj l))]
+    (all [(is-int "write" w x) (is-str "events" (evs-from h start) (str "write-unique #" c " #" x ".0;")) (do (rel h c) (ck "clean" (clean? h)))])))
+
+(defun main () -> i64
+  (min 100
+    (run-suite "heap-stk"
+      [(tc "st-laundering-through-a-stack-cell" t-st-laundering-a-stack-ref-through-a-stack-cell)
+       (tc "st-through-a-shared-atom" t-st-a-stack-ref-cannot-reach-another-thread-through-a-shared-atom)
+       (tc "st-forged-weak-to-a-stack-object" t-st-a-forged-weak-to-a-stack-object-is-caught-everywhere)
+       (tc "st-nested-stack-structs" t-st-a-stack-ref-nested-inside-stack-structs-cannot-reach-the-heap)
+       (tc "st-inner-ref-in-an-outer-object" t-st-an-inner-ref-cannot-hide-in-an-outer-object-through-an-inner-cell)
+       (tc "st-ref-to-an-ended-object" t-st-a-ref-to-an-ended-object-cannot-be-stored-anywhere)
+       (tc "st-scope-ended-out-of-order" t-st-a-scope-ended-out-of-order-is-dead-at-once)
+       (tc "st-scope-id-after-its-end" t-st-a-scope-id-used-after-its-end-is-refused-and-never-names-a-new-scope)
+       (tc "st-scope-id-from-another-heap" t-st-a-scope-id-from-another-heap-is-unknown)
+       (tc "st-read-after-scope-is-not-use-after-free" t-st-a-stack-object-read-after-its-scope-is-not-a-plain-use-after-free)
+       (tc "st-sharing-through-a-stack-object" t-st-sharing-a-heap-object-through-a-stack-object-marks-nothing)
+       (tc "st-counting-a-stack-object" t-st-counting-a-stack-object-through-a-read-ref-is-a-no-op)
+       (tc "st-self-holding-stack-cell" t-st-a-self-holding-stack-cell-ends-cleanly)
+       (tc "st-unended-scope" t-st-an-unended-scope-is-reported-and-what-it-holds-is-a-plain-leak)
+       (tc "st-stack-cycle-through-a-heap-cell" t-st-a-stack-cycle-through-a-heap-cell-cannot-form)
+       (tc "st-scope-events-in-order" t-st-scope-events-are-recorded-in-order-with-drops-most-recent-first)
+       (tc "un-two-variables-one-object" t-un-two-variables-holding-one-object-see-no-in-place-write)
+       (tc "un-temporary-count" t-un-a-temporary-count-on-the-object-blocks-the-write)
+       (tc "un-another-thread-can-upgrade" t-un-an-object-another-thread-can-upgrade-to-is-shared-and-refused)
+       (tc "un-literal-and-immortal-tail" t-un-a-literal-and-its-immortal-tail-are-never-written)
+       (tc "un-stack-object" t-un-a-stack-object-is-never-written-in-place)
+       (tc "un-private-stack-cell" t-un-a-private-stack-cell-may-write-its-unique-heap-content)
+       (tc "un-cell-cycle-with-a-second-holder" t-un-an-object-on-a-cell-cycle-with-a-second-holder-is-refused)
+       (tc "un-held-only-through-the-place" t-un-an-object-held-only-through-the-place-on-a-cycle-is-written)
+       (tc "un-no-immutable-cycle" t-un-no-legal-sequence-of-unique-writes-ties-an-immutable-cycle)
+       (tc "un-over-release-fakes-a-count-of-one" t-un-an-over-release-that-fakes-a-count-of-one-is-still-caught)
+       (tc "un-freed-place-or-content" t-un-a-freed-place-or-content-is-use-after-free)
+       (tc "un-literal-store-retains-nothing" t-un-storing-a-literal-by-unique-write-retains-nothing)])))

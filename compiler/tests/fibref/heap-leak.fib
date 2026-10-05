@@ -1,0 +1,333 @@
+;; compiler/tests/fibref/heap-leak.fib: the adversarial heap tests of crates/fibref/tests/heap_adversarial/{leaks,masked,report,weak,shared,trace}.rs at
+;; seed-1, one fibber test per Rust test: the end-of-run classification (a leak a permitted cycle could hide), the report's parts agreeing with each other,
+;; weak references, thread crossing and the order of events. The fibber report has no `trace` field: the event log (`nev`, `evs`) is read from the heap.
+;; Exit status: failures.
+(ns main (:use fibref.value fibref.heap fibref.trace heaptk))
+
+(defun lc (r: HpReport) -> str (leak-ids r HpLeakCycle))
+(defun lk (r: HpReport) -> str (leak-ids r HpLeak))
+(defun bug-ids (r: HpReport) -> str (ids-text (mapv (fn (l: HpLeakRow) (. l id)) (report-bugs r))))
+(defun is-str (what: str got: str want: str) -> str (if (= got want) "" (str what ": [" got "] <> [" want "]")))
+(defun row-of (r: HpReport id: i64) -> HpLeakRow (nth (vec (filter (fn (l: HpLeakRow) (= (. l id) id)) (. r leaks))) 0))
+(defun same-ids (what: str got: (Vec i64) want: (Vec i64)) -> str
+  (if (and (= (count got) (count want)) (= (into #{} got) (into #{} want))) "" (str what ": " (ids-text got) "<> " (ids-text want))))
+
+;; ================= leaks.rs =================
+(defun t-lk-clean-run-is-clean () -> str
+  (let [h (heap-new) a (imm h [(i 1)]) c (cell-of h (obj a)) _r (release-all h [a c]) r (heap-finish h)]
+    (all [(ck "clean" (report-clean? r)) (ck "not cycle-only" (not (report-cycle-leak-only? r))) (same "bugs" (count (report-bugs r)) 0)
+          (same "allocated" (. r allocated) 2) (same "freed" (. r freed) 2)])))
+
+(defun t-lk-cell-to-vector-back-to-cell-is-leak-cycle-not-leak () -> str
+  (let [h (heap-new) cv (cell-cycle h) c (nth cv 0) v (nth cv 1) live (and (heap-is-live h c) (heap-is-live h v)) r (heap-finish h)]
+    (all [(ck "both live" live) (is-str "leak-cycle" (lc r) "#0 #1 ") (is-str "leak" (lk r) "") (is-str "immutable-cycle" (leak-ids r HpImmutableCycle) "")
+          (ck "cycle only" (report-cycle-leak-only? r)) (same "bugs" (count (report-bugs r)) 0)])))
+
+(defun t-lk-unrelated-acyclic-live-object-beside-a-cycle-is-leak () -> str
+  (let [h (heap-new) cv (cell-cycle h) stray (imm h [(i 3)]) r (heap-finish h)]
+    (all [(is-str "leak-cycle" (lc r) "#0 #1 ") (is-str "leak" (lk r) "#2 ") (ck "not cycle-only" (not (report-cycle-leak-only? r))) (is-str "bugs" (bug-ids r) "#2 ")])))
+
+(defun t-lk-two-disjoint-cycles-are-both-leak-cycle () -> str
+  (let [h (heap-new) a (cell-cycle h) b (cell-cycle h) r (heap-finish h)]
+    (all [(is-str "leak-cycle" (lc r) "#0 #1 #2 #3 ") (ck "cycle only" (report-cycle-leak-only? r))])))
+
+(defun t-lk-a-tail-hanging-off-a-cycle-is-leak-cycle-too () -> str
+  (let [h (heap-new) c (cell-of h INone) tail2 (imm h [(i 2)]) tail1 (imm h [(obj tail2)]) v (imm h [(obj c) (obj tail1)]) _w (wr h c 0 (obj v))
+        _r (release-all h [tail2 tail1 v c]) r (heap-finish h)]
+    (all [(is-str "leak-cycle" (lc r) "#0 #1 #2 #3 ") (is-str "leak" (lk r) "") (ck "cycle only" (report-cycle-leak-only? r))])))
+
+(defun t-lk-a-cell-hanging-off-a-cycle-is-leak-cycle () -> str
+  (let [h (heap-new) c2 (cell-of h (i 9)) c (cell-of h INone) v (imm h [(obj c) (obj c2)]) _w (wr h c 0 (obj v)) _r (release-all h [c2 v c]) r (heap-finish h)]
+    (all [(is-str "leak-cycle" (lc r) "#0 #1 #2 ") (ck "cycle only" (report-cycle-leak-only? r))])))
+
+(defun t-lk-a-parent-of-a-cycle-that-the-cycle-cannot-reach-is-leak () -> str
+  (let [h (heap-new) cv (cell-cycle h) c (nth cv 0) parent (imm h [(obj c)]) cc (cnt h c) r (heap-finish h)]
+    (all [(same "c count" cc 2) (is-str "leak-cycle" (lc r) "#0 #1 ") (is-str "leak" (lk r) "#2 ") (ck "not cycle-only" (not (report-cycle-leak-only? r)))])))
+
+(defun t-lk-a-weak-back-pointer-does-not-make-a-cycle () -> str
+  (let [h (heap-new) c (cell-of h INone) w (ok! (heap-weak h c)) v (imm h [w]) _w (wr h c 0 (obj v)) _r (rel h v) r (heap-finish h)]
+    (all [(is-str "leak" (lk r) "#0 #1 ") (is-str "leak-cycle" (lc r) "") (ck "not cycle-only" (not (report-cycle-leak-only? r)))])))
+
+(defun t-lk-a-weak-edge-out-of-a-cycle-does-not-launder-a-leak () -> str
+  (let [h (heap-new) t (imm h [(i 1)]) w (ok! (heap-weak h t)) c (cell-of h INone) v (imm h [(obj c) w]) _w (wr h c 0 (obj v)) _r (release-all h [v c]) r (heap-finish h)]
+    (all [(is-str "leak-cycle" (lc r) "#1 #2 ") (is-str "leak" (lk r) "#0 ") (ck "not cycle-only" (not (report-cycle-leak-only? r)))])))
+
+(defun t-lk-breaking-a-cycle-before-finish-is-clean () -> str
+  (let [h (heap-new) cv (cell-cycle h) c (nth cv 0) v (nth cv 1) _b (wr h c 0 INone) r (heap-finish h)]
+    (all [(ck "v freed" (not (heap-is-live h v))) (ck "c freed" (not (heap-is-live h c))) (ck "clean" (report-clean? r)) (same "freed" (. r freed) 2)])))
+
+(defun t-lk-an-atom-holding-itself-is-a-leak-cycle () -> str
+  (let [h (heap-new) a (atom-of h INone) _w (wr h a 0 (obj a)) _r (rel h a) r (heap-finish h) row (nth (. r leaks) 0)]
+    (all [(is-str "leak-cycle" (lc r) "#0 ") (ck "cycle only" (report-cycle-leak-only? r)) (is-str "kind" (hp-kind-text (. row kind)) "atom") (same "count" (. row count) 1)])))
+
+(defun t-lk-a-cycle-through-two-cells-is-leak-cycle-for-all-members () -> str
+  (let [h (heap-new) c1 (cell-of h INone) c2 (cell-of h (obj c1)) v (imm h [(obj c2)]) _w (wr h c1 0 (obj v)) _r (release-all h [v c2 c1]) r (heap-finish h)]
+    (all [(is-str "leak-cycle" (lc r) "#0 #1 #2 ") (ck "cycle only" (report-cycle-leak-only? r))])))
+
+(defun t-lk-a-leaked-cell-with-no-cycle-is-a-plain-leak-with-its-contents () -> str
+  (let [h (heap-new) x (imm h []) c (cell-of h (obj x)) _r (rel h x) r (heap-finish h)]
+    (all [(is-str "leak" (lk r) "#0 #1 ") (is-str "leak-cycle" (lc r) "") (same "bugs" (count (report-bugs r)) 2)])))
+
+(defun t-lk-an-immutable-cycle-cannot-be-built-through-the-public-api () -> str
+  (let [h (heap-new) a (imm h [INone]) b (imm h [(obj a)]) w (heap-write h a 0 (obj b)) r (heap-finish h)]
+    (all [(is-err "write" w "write to immutable object #0") (is-str "immutable-cycle" (leak-ids r HpImmutableCycle) "") (is-str "leak" (lk r) "#0 #1 ")])))
+
+(defun t-lk-report-lists-leaks-in-allocation-order-with-kind-and-count () -> str
+  (let [h (heap-new) a (imm h [(i 1)]) c (cell-of h (obj a)) at (atom-of h (obj c)) _r (ret h at) r (heap-finish h)
+        summary (str-join (mapv (fn (l: HpLeakRow) (str "#" (. l id) " " (hp-kind-text (. l kind)) " " (. l count) " " (if (= (. l class) HpLeak) "leak" "other") ";")) (. r leaks)))]
+    (all [(is-str "rows" summary "#0 immutable 2 leak;#1 cell 2 leak;#2 atom 2 leak;") (same "allocated" (. r allocated) 3) (same "freed" (. r freed) 0)])))
+
+;; ================= masked.rs =================
+(defun t-mk-a-self-holding-cell-whose-binding-was-never-released-is-a-bug () -> str
+  (let [h (heap-new) c (cell-of h INone) _w (wr h c 0 (obj c)) c2 (cnt h c) r (heap-finish h)]
+    (all [(same "count" c2 2) (same "one leak" (count (. r leaks)) 1) (same "row count" (. (nth (. r leaks) 0) count) 2)
+          (ck "reported as a bug" (> (count (report-bugs r)) 0)) (ck "not cycle-only" (not (report-cycle-leak-only? r)))])))
+
+(defun t-mk-a-cycle-member-with-a-surplus-count-is-a-leak-not-leak-cycle () -> str
+  (let [h (heap-new) c (cell-of h INone) v (imm h [(obj c)]) _w (wr h c 0 (obj v)) _r (rel h c) cv (cnt h v) cc (cnt h c) r (heap-finish h)]
+    (all [(same "v count" cv 2) (same "c count" cc 1) (ck (lk r) (contains? (into #{} (report-ids-in r HpLeak)) v)) (ck "not cycle-only" (not (report-cycle-leak-only? r)))])))
+
+(defun t-mk-a-surplus-count-on-a-tail-hanging-off-a-cycle-is-a-leak () -> str
+  (let [h (heap-new) tail (imm h [(i 7)]) c (cell-of h INone) v (imm h [(obj c) (obj tail)]) _w (wr h c 0 (obj v)) _r (release-all h [v c]) ct (cnt h tail) r (heap-finish h)]
+    (all [(same "tail count" ct 2) (is-str "leak-cycle" (lc r) "#1 #2 ") (is-str "leak" (lk r) "#0 ")])))
+
+(defun t-mk-a-cycle-reaching-a-second-cycle-is-leak-cycle-throughout () -> str
+  (let [h (heap-new) cv2 (cell-cycle h) c2 (nth cv2 0) c1 (cell-of h INone) v1 (imm h [(obj c1) (obj c2)]) _w (wr h c1 0 (obj v1)) _r (release-all h [v1 c1]) r (heap-finish h)]
+    (all [(is-str "leak-cycle" (lc r) "#0 #1 #2 #3 ") (ck "cycle only" (report-cycle-leak-only? r))])))
+
+(defun t-mk-cells-that-only-point-into-a-cycle-are-leaks-not-cycle-roots () -> str
+  (let [h (heap-new) cv (cell-cycle h) c (nth cv 0) p2 (cell-of h (obj c)) p1 (cell-of h (obj p2)) _r (rel h p2) r (heap-finish h)]
+    (all [(is-str "leak-cycle" (lc r) "#0 #1 ") (is-str "leak" (lk r) "#2 #3 ") (ck "not cycle-only" (not (report-cycle-leak-only? r)))])))
+
+(defun t-mk-a-cycle-whose-only-cell-holds-a-weak-is-not-a-cycle () -> str
+  (let [h (heap-new) c (cell-of h INone) v (imm h [(obj c)]) w (ok! (heap-weak h v)) _w (wr h c 0 w) _a (rel h c) cc (cnt h c) _b (rel h v)]
+    (all [(same "c count" cc 1) (ck "v freed" (not (heap-is-live h v))) (ck "c freed" (not (heap-is-live h c))) (ck "clean" (clean? h))])))
+
+(defun t-mk-an-object-held-only-by-a-cycle-and-a-weak-holder-is-leak-cycle () -> str
+  (let [h (heap-new) t (imm h [(i 1)]) w (ok! (heap-weak h t)) wh (imm h [w]) c (cell-of h INone) v (imm h [(obj c) (obj t)]) _w (wr h c 0 (obj v)) _r (release-all h [t v c]) r (heap-finish h)]
+    (all [(is-str "leak-cycle" (lc r) "#0 #2 #3 ") (is-str "leak" (lk r) "#1 ")])))
+
+;; ================= report.rs =================
+(defun count-evs (h: Heap alloc: bool) -> i64
+  (count (filter (fn (e: HpEvent) (match e ((EvAlloc _ _) alloc) ((EvFree _) (not alloc)) (_ false))) (events-from h 0))))
+
+(defun t-rp-allocated-freed-and-leaks-agree-with-each-other-and-the-trace () -> str
+  (let [h (heap-new) cv (cell-cycle h) dead (imm h [(i 1)]) gone (imm h []) parent (imm h [(obj gone)]) forgotten (atom-of h (obj dead)) _r (release-all h [dead gone parent])
+        r (heap-finish h)]
+    (all [(same "allocated vs trace" (. r allocated) (count-evs h true)) (same "freed vs trace" (. r freed) (count-evs h false))
+          (same "leaks are the unfreed" (- (. r allocated) (. r freed)) (count (. r leaks)))
+          (is-str "leak-cycle" (lc r) "#0 #1 ") (is-str "leak" (lk r) "#2 #5 ") (same "dangling" (count (. r dangling)) 0)])))
+
+(defun t-rp-an-empty-run-and-a-fully-freed-run-are-both-clean () -> str
+  (let [e (heap-finish (heap-new)) h (heap-new) a (imm h []) b (cell-of h (obj a)) _r (release-all h [a b]) r (heap-finish h)]
+    (all [(ck "empty clean" (report-clean? e)) (ck "empty is no cycle leak" (not (report-cycle-leak-only? e))) (same "empty allocated" (. e allocated) 0) (same "empty freed" (. e freed) 0)
+          (ck "clean" (report-clean? r)) (ck "not cycle-only" (not (report-cycle-leak-only? r))) (same "allocated" (. r allocated) 2) (same "freed" (. r freed) 2)
+          (same "bugs" (count (report-bugs r)) 0)])))
+
+(defun t-rp-dangling-refs-are-listed-by-holder-then-field-and-all-of-them () -> str
+  (let [h (heap-new) x (imm h []) y (imm h []) h1 (imm h [(obj y) (i 0) (obj x)]) h2 (imm h [(obj x)]) _r (release-all h [x y]) cx (cnt h x) cy (cnt h y)
+        _a (rel h x) _b (rel h x) _c (rel h y) r (heap-finish h)
+        listed (str-join (mapv (fn (d: HpDangling) (str "(" (. d holder) "," (. d field) "," (. d target) ")")) (. r dangling)))]
+    (all [(same "x" cx 2) (same "y" cy 1) (is-str "listed" listed "(2,0,1)(2,2,0)(3,0,0)") (ck "not clean" (not (report-clean? r))) (ck "not cycle-only" (not (report-cycle-leak-only? r)))
+          (is-str "leak" (lk r) "#2 #3 ") (same "freed" (. r freed) 2)])))
+
+(defun t-rp-held-counts-duplicate-ref-fields-and-ignores-weak-fields () -> str
+  (let [h (heap-new) x (imm h []) w (ok! (heap-weak h x)) a (imm h [(obj x) w (obj x)]) b (cell-of h w) _r (rel h x) cx (cnt h x) r (heap-finish h)
+        rx (row-of r x) ra (row-of r a) rb (row-of r b)]
+    (all [(same "x count" cx 2) (same "x row count" (. rx count) 2) (same "x row held" (. rx held) 2) (is-str "x kind" (hp-kind-text (. rx kind)) "immutable")
+          (same "a count" (. ra count) 1) (same "a held" (. ra held) 0) (same "b count" (. rb count) 1) (same "b held" (. rb held) 0) (is-str "b kind" (hp-kind-text (. rb kind)) "cell")
+          (same "all plain leaks" (count (filter (fn (l: HpLeakRow) (= (. l class) HpLeak)) (. r leaks))) (count (. r leaks)))])))
+
+(defun t-rp-a-cycle-member-held-also-by-a-leaked-outsider () -> str
+  (let [h (heap-new) cv (cell-cycle h) v (nth cv 1) _a (ret h v) hh (imm h [(obj v)]) _b (rel h v) cvv (cnt h v) r (heap-finish h)]
+    (all [(same "v count" cvv 2) (is-str "leak-cycle" (lc r) "#0 #1 ") (is-str "leak" (lk r) "#2 ") (ck "not cycle-only" (not (report-cycle-leak-only? r))) (is-str "bugs" (bug-ids r) "#2 ")])))
+
+;; ================= weak.rs =================
+(defun t-wk-upgrade-before-free-retains-and-that-count-must-be-released () -> str
+  (let [h (heap-new) a (imm h [(i 1)]) w (ok! (heap-weak h a)) c1 (cnt h a) n (nev h) u (heap-upgrade h a) c2 (cnt h a)]
+    (all [(ck "weak value" (ival-eq w (IWeak a))) (same "weak does not count" c1 1) (is-up "upgrade" u a) (same "upgrade retains" c2 2)
+          (ck (evs-from h n) (= (evs-from h n) "upgrade #0 live;retain #0 -> 2;")) (do (rel h a) "") (ck "live" (heap-is-live h a)) (do (rel h a) "")
+          (ck "freed" (not (heap-is-live h a))) (ck "clean" (clean? h))])))
+
+(defun t-wk-upgrade-after-free-is-none-traced-and-retains-nothing () -> str
+  (let [h (heap-new) a (imm h []) _w (ok! (heap-weak h a)) _r (rel h a) n (nev h) u1 (heap-upgrade h a) u2 (heap-upgrade h a)]
+    (all [(is-up "first" u1 -1) (is-up "again" u2 -1) (ck (evs-from h n) (= (evs-from h n) "upgrade #0 dead;upgrade #0 dead;")) (same "retains" (retains-of h 0 a) 0) (ck "dead" (not (heap-is-live h a)))])))
+
+(defun t-wk-ids-are-never-reused-so-a-stale-weak-stays-dead () -> str
+  (let [h (heap-new) a (imm h []) w (ok! (heap-weak h a)) _r (rel h a) fresh (mapv (fn (k: i64) (imm h [(i k)])) (range 5000))]
+    (all [(ck "no fresh id equals a" (not (contains? (into #{} fresh) a))) (ck "all fresh live" (= (count (filter (fn (id: i64) (heap-is-live h id)) fresh)) (count fresh)))
+          (ck "weak value" (ival-eq w (IWeak a))) (is-up "upgrade" (heap-upgrade h a) -1) (ck "a dead" (not (heap-is-live h a))) (failed? "read" (heap-read h a 0))
+          (do (release-all h fresh) (ck "clean" (clean? h)))])))
+
+(defun t-wk-weak-of-freed-is-use-after-free () -> str
+  (let [h (heap-new) a (imm h []) _r (rel h a)] (is-err "weak" (heap-weak h a) "use after free: weak of freed object #0")))
+
+(defun t-wk-a-weak-field-does-not-keep-its-target-alive () -> str
+  (let [h (heap-new) t (imm h [(i 1)]) w (ok! (heap-weak h t)) holder (imm h [w]) c1 (cnt h t) _r (rel h t) live-t (heap-is-live h t) live-h (heap-is-live h holder) r (rd h holder 0)
+        u (heap-upgrade h t) _g (rel h holder)]
+    (all [(same "storing a weak is not +1" c1 1) (ck "t freed" (not live-t)) (ck "holder live" live-h) (ck "weak read" (ival-eq r (IWeak t))) (is-up "upgrade" u -1)
+          (same "only the caller's release" (releases-of h 0 t) 1) (ck "clean" (clean? h))])))
+
+(defun t-wk-overwriting-a-weak-in-a-cell-releases-nothing () -> str
+  (let [h (heap-new) t (imm h []) w (ok! (heap-weak h t)) c (cell-of h w) n (nev h) _w (wr h c 0 INone) ct (cnt h t) ev (evs-from h n)
+        x (imm h []) _x (wr h c 0 (obj x)) _y (rel h x) _z (wr h c 0 w)]
+    (all [(same "count" ct 1) (ck ev (= ev "write #1.0;")) (ck "x freed" (not (heap-is-live h x))) (is-int "t count" (heap-count h t) 1)])))
+
+(defun t-wk-upgrade-of-a-weak-read-from-a-cell-after-the-target-died-is-none () -> str
+  (let [h (heap-new) t (imm h []) w (ok! (heap-weak h t)) c (cell-of h w) _r (rel h t) v (rd h c 0)]
+    (match v
+      ((IWeak id) (all [(same "id" id t) (is-up "upgrade" (heap-upgrade h id) -1) (failed? "retain through a dead weak" (heap-retain h id))]))
+      (_ "the cell holds a weak"))))
+
+(defun t-wk-a-weak-stored-at-alloc-and-upgraded-keeps-counts-straight () -> str
+  (let [h (heap-new) t (imm h []) w (ok! (heap-weak h t)) holder (imm h [w w]) v (rd h holder 1)]
+    (match v
+      ((IWeak id) (let [u (heap-upgrade h id) c2 (cnt h t) _a (rel h t) live1 (heap-is-live h t) _b (rel h t) live2 (heap-is-live h t) _c (rel h holder)]
+                    (all [(is-up "upgrade" u t) (same "count" c2 2) (ck "live after the original" live1) (ck "freed after the upgraded" (not live2)) (ck "clean" (clean? h))])))
+      (_ "weak"))))
+
+;; ================= shared.rs =================
+(defun t-sh-mark-shared-through-a-vector-reaching-an-atom-marks-everything () -> str
+  (let [h (heap-new) x (imm h [(i 1)]) a (atom-of h (obj x)) _r (rel h x) v (imm h [(obj a) (i 2)]) cv (cnt h v) ca (cnt h a) cx (cnt h x) m (heap-mark-shared h v)]
+    (all [(is-ok "mark" m) (is-bool "v" (heap-is-shared h v) true) (is-bool "a" (heap-is-shared h a) true) (is-bool "x" (heap-is-shared h x) true)
+          (same-ids "marked" (shared-evs h) [x a v]) (same "v count" (cnt h v) cv) (same "a count" (cnt h a) ca) (same "x count" (cnt h x) cx)])))
+
+(defun t-sh-mark-shared-through-a-vector-reaching-a-cell-marks-nothing () -> str
+  (let [h (heap-new) a (atom-of h (i 1)) c (cell-of h (i 2)) v (imm h [(obj a) (obj c)]) n (nev h) m (heap-mark-shared h v)]
+    (all [(is-err "mark" m "cell #1 would cross a thread boundary") (is-bool "v" (heap-is-shared h v) false) (is-bool "a" (heap-is-shared h a) false) (is-bool "c" (heap-is-shared h c) false)
+          (same "nothing traced" (nev h) n) (same "no shared events" (count (shared-evs h)) 0)])))
+
+(defun t-sh-an-atom-holding-a-cell-may-not-cross () -> str
+  (let [h (heap-new) c (cell-of h INone) a (atom-of h (obj c))]
+    (all [(is-err "mark" (heap-mark-shared h a) "cell #0 would cross a thread boundary") (is-bool "unshared" (heap-is-shared h a) false)])))
+
+(defun t-sh-mark-shared-twice-marks-once () -> str
+  (let [h (heap-new) x (imm h []) v (imm h [(obj x)]) _a (ok! (heap-mark-shared h v)) n (nev h) _b (ok! (heap-mark-shared h v)) _c (ok! (heap-mark-shared h x))]
+    (all [(same "no new events" (nev h) n) (same "two shared events" (count (shared-evs h)) 2)])))
+
+(defun t-sh-mark-shared-over-a-cycle-through-an-atom-terminates () -> str
+  (let [h (heap-new) a (atom-of h INone) v (imm h [(obj a)]) _w (wr h a 0 (obj v)) m (heap-mark-shared h a)]
+    (all [(is-ok "mark" m) (is-bool "v" (heap-is-shared h v) true) (same "two shared events" (count (shared-evs h)) 2)])))
+
+(defun t-sh-writing-a-ref-into-a-shared-atom-shares-it-and-its-children () -> str
+  (let [h (heap-new) a (atom-of h INone) _m (ok! (heap-mark-shared h a)) y (imm h []) x (imm h [(obj y)]) before (ok! (heap-is-shared h x)) _w (wr h a 0 (obj x))]
+    (all [(ck "x was local" (not before)) (is-bool "x" (heap-is-shared h x) true) (is-bool "y" (heap-is-shared h y) true) (same-ids "marked" (shared-evs h) [a y x]) (is-int "x count" (heap-count h x) 2)])))
+
+(defun t-sh-writing-a-value-reaching-a-cell-into-a-shared-atom-changes-nothing () -> str
+  (let [h (heap-new) old (imm h []) a (atom-of h (obj old)) _m (ok! (heap-mark-shared h a)) c (cell-of h INone) x (imm h [(i 1) (obj c)]) n (nev h)
+        w (heap-write h a 0 (obj x)) r (rd h a 0)]
+    (all [(is-err "write" w "cell #2 would cross a thread boundary") (ck "slot unchanged" (ival-eq r (obj old))) (is-int "old" (heap-count h old) 2) (is-int "x" (heap-count h x) 1)
+          (is-int "c" (heap-count h c) 2) (is-bool "x unshared" (heap-is-shared h x) false) (is-bool "c unshared" (heap-is-shared h c) false) (same "only the read" (nev h) (+ n 1))])))
+
+(defun t-sh-writing-into-an-unshared-atom-shares-nothing () -> str
+  (let [h (heap-new) a (atom-of h INone) c (cell-of h INone) x (imm h [(obj c)]) w (heap-write h a 0 (obj x))]
+    (all [(is-ok "write" w) (is-bool "x" (heap-is-shared h x) false) (same "no shared events" (count (shared-evs h)) 0)
+          (is-err "mark" (heap-mark-shared h a) "cell #1 would cross a thread boundary")])))
+
+(defun t-sh-the-shared-flag-survives-count-operations () -> str
+  (let [h (heap-new) x (imm h []) _m (ok! (heap-mark-shared h x)) _a (ret h x) _b (rel h x) s1 (heap-is-shared h x) u (heap-upgrade h x) s2 (heap-is-shared h x) _c (rel h x) _d (rel h x)]
+    (all [(is-bool "after retain release" s1 true) (is-up "upgrade" u x) (is-bool "after upgrade" s2 true) (is-err "freed" (heap-is-shared h x) "use after free: inspect of freed object #0")])))
+
+(defun t-sh-a-new-object-pointing-at-a-shared-one-is-not-itself-shared () -> str
+  (let [h (heap-new) x (imm h []) _m (ok! (heap-mark-shared h x)) local (imm h [(obj x)])]
+    (all [(is-bool "local" (heap-is-shared h local) false) (is-bool "x" (heap-is-shared h x) true)])))
+
+(defun t-sh-a-weak-to-a-cell-crosses-the-same-way-by-mark-and-by-atom-write () -> str
+  (let [h (heap-new) c1 (cell-of h (i 1)) w1 (ok! (heap-weak h c1)) holder (imm h [w1]) by-mark (heap-mark-shared h holder)
+        c2 (cell-of h (i 2)) w2 (ok! (heap-weak h c2)) a (atom-of h INone) _m (ok! (heap-mark-shared h a)) by-write (heap-write h a 0 w2)]
+    (all [(is-err "mark" by-mark "cell #0 would cross a thread boundary") (is-err "write" by-write "cell #2 would cross a thread boundary")])))
+
+(defun t-sh-a-weak-to-a-dead-object-never-blocks-a-crossing () -> str
+  (let [h (heap-new) c (cell-of h INone) w (ok! (heap-weak h c)) holder (imm h [w]) _r (rel h c)]
+    (all [(is-ok "mark" (heap-mark-shared h holder)) (is-bool "holder" (heap-is-shared h holder) true)])))
+
+;; ================= trace.rs =================
+(defun t-tr-alloc-store-release-is-traced-in-order () -> str
+  (let [h (heap-new) child (imm h [(i 1)]) v (imm h [(obj child) INone]) _a (rel h child) _b (rel h v)]
+    (is-str "trace" (evs h) "alloc #0 immutable;alloc #1 immutable;retain #0 -> 2;release #0 -> 1;release #1 -> 0;free #1;release #0 -> 0;free #0;")))
+
+(defun t-tr-write-is-traced-as-retain-new-write-release-old () -> str
+  (let [h (heap-new) a (imm h []) c (cell-of h (obj a)) _r (rel h a) b (imm h []) n (nev h) _w (wr h c 0 (obj b))]
+    (all [(is-str "tail" (evs-from h n) "retain #2 -> 2;write #1.0;release #0 -> 0;free #0;") (is-str "before" (event-text (nth @(. h log) (- n 1))) "alloc #2 immutable")])))
+
+(defun t-tr-read-is-traced-and-changes-no-count () -> str
+  (let [h (heap-new) a (imm h []) v (imm h [(i 0) (obj a)]) n (nev h) r1 (heap-read h v 1) r0 (heap-read h v 0)]
+    (all [(is-val "ref" r1 (obj a)) (is-val "int" r0 (i 0)) (is-str "trace" (evs-from h n) "read #1.1;read #1.0;") (is-int "a count" (heap-count h a) 2)])))
+
+(defun t-tr-count-after-in-events-matches-the-count () -> str
+  (let [h (heap-new) a (imm h [])]
+    (all [(all (mapv (fn (e: i64) (do (ret h a) (all [(is-int "count" (heap-count h a) e) (is-str "last" (event-text (nth @(. h log) (- (nev h) 1))) (str "retain #0 -> " e))]))) (range 2 6)))
+          (all (mapv (fn (e: i64) (let [_r (rel h a)]
+                                    (if (> e 0)
+                                        (all [(is-str "last" (event-text (nth @(. h log) (- (nev h) 1))) (str "release #0 -> " e)) (is-int "count" (heap-count h a) e)])
+                                        (is-str "tail" (evs-from h (- (nev h) 2)) "release #0 -> 0;free #0;"))))
+                     [4 3 2 1 0]))])))
+
+(defun t-tr-the-report-carries-the-whole-trace () -> str
+  (let [h (heap-new) a (imm h []) _w (ok! (heap-weak h a)) _u (ok! (heap-upgrade h a)) _r (rel h a) _m (ok! (heap-mark-shared h a)) snapshot (evs h) r (heap-finish h)]
+    (all [(same "events" (nev h) 6) (is-str "all name a" snapshot "alloc #0 immutable;weak #0;upgrade #0 live;retain #0 -> 2;release #0 -> 1;shared #0;") (is-str "finish keeps the log" (evs h) snapshot)
+          (ck "report" (not (report-clean? r)))])))
+
+(defun t-tr-failed-operations-leave-no-trace () -> str
+  (let [h (heap-new) a (imm h [(i 1)]) c (cell-of h INone) dead (imm h []) _r (rel h dead) before (evs h)
+        _1 (heap-write h a 0 INone) _2 (heap-read h a 7) _3 (heap-write h c 3 INone) _4 (heap-write h c 0 (obj dead)) _5 (heap-mark-shared h c) _6 (heap-retain h dead)
+        _7 (heap-release h dead) _8 (heap-weak h dead) _9 (heap-read h dead 0) _a (heap-release h 100) _b (heap-upgrade h 100) _c (heap-alloc h ICell 0 [])
+        _d (heap-alloc h IImmutable 0 [(obj dead)]) _e (heap-alloc h IImmutable 0 [(obj 100)])]
+    (is-str "log" (evs h) before)))
+
+(defun main () -> i64
+  (min 100
+    (run-suite "heap-leak"
+      [(tc "lk-clean-run" t-lk-clean-run-is-clean)
+       (tc "lk-cell-to-vector-back-to-cell" t-lk-cell-to-vector-back-to-cell-is-leak-cycle-not-leak)
+       (tc "lk-acyclic-beside-a-cycle" t-lk-unrelated-acyclic-live-object-beside-a-cycle-is-leak)
+       (tc "lk-two-disjoint-cycles" t-lk-two-disjoint-cycles-are-both-leak-cycle)
+       (tc "lk-a-tail-off-a-cycle" t-lk-a-tail-hanging-off-a-cycle-is-leak-cycle-too)
+       (tc "lk-a-cell-off-a-cycle" t-lk-a-cell-hanging-off-a-cycle-is-leak-cycle)
+       (tc "lk-a-parent-of-a-cycle" t-lk-a-parent-of-a-cycle-that-the-cycle-cannot-reach-is-leak)
+       (tc "lk-weak-back-pointer" t-lk-a-weak-back-pointer-does-not-make-a-cycle)
+       (tc "lk-weak-edge-out-of-a-cycle" t-lk-a-weak-edge-out-of-a-cycle-does-not-launder-a-leak)
+       (tc "lk-breaking-a-cycle-before-finish" t-lk-breaking-a-cycle-before-finish-is-clean)
+       (tc "lk-atom-holding-itself" t-lk-an-atom-holding-itself-is-a-leak-cycle)
+       (tc "lk-cycle-through-two-cells" t-lk-a-cycle-through-two-cells-is-leak-cycle-for-all-members)
+       (tc "lk-leaked-cell-no-cycle" t-lk-a-leaked-cell-with-no-cycle-is-a-plain-leak-with-its-contents)
+       (tc "lk-immutable-cycle-cannot-be-built" t-lk-an-immutable-cycle-cannot-be-built-through-the-public-api)
+       (tc "lk-report-lists-leaks-in-order" t-lk-report-lists-leaks-in-allocation-order-with-kind-and-count)
+       (tc "mk-self-holding-cell-never-released" t-mk-a-self-holding-cell-whose-binding-was-never-released-is-a-bug)
+       (tc "mk-cycle-member-surplus" t-mk-a-cycle-member-with-a-surplus-count-is-a-leak-not-leak-cycle)
+       (tc "mk-surplus-on-a-tail" t-mk-a-surplus-count-on-a-tail-hanging-off-a-cycle-is-a-leak)
+       (tc "mk-cycle-reaching-a-second-cycle" t-mk-a-cycle-reaching-a-second-cycle-is-leak-cycle-throughout)
+       (tc "mk-cells-pointing-into-a-cycle" t-mk-cells-that-only-point-into-a-cycle-are-leaks-not-cycle-roots)
+       (tc "mk-cycle-whose-only-cell-holds-a-weak" t-mk-a-cycle-whose-only-cell-holds-a-weak-is-not-a-cycle)
+       (tc "mk-held-by-a-cycle-and-a-weak-holder" t-mk-an-object-held-only-by-a-cycle-and-a-weak-holder-is-leak-cycle)
+       (tc "rp-allocated-freed-leaks-agree" t-rp-allocated-freed-and-leaks-agree-with-each-other-and-the-trace)
+       (tc "rp-empty-and-freed-runs-are-clean" t-rp-an-empty-run-and-a-fully-freed-run-are-both-clean)
+       (tc "rp-dangling-listed-by-holder-then-field" t-rp-dangling-refs-are-listed-by-holder-then-field-and-all-of-them)
+       (tc "rp-held-counts-duplicates-ignores-weak" t-rp-held-counts-duplicate-ref-fields-and-ignores-weak-fields)
+       (tc "rp-cycle-member-held-by-an-outsider" t-rp-a-cycle-member-held-also-by-a-leaked-outsider)
+       (tc "wk-upgrade-before-free" t-wk-upgrade-before-free-retains-and-that-count-must-be-released)
+       (tc "wk-upgrade-after-free" t-wk-upgrade-after-free-is-none-traced-and-retains-nothing)
+       (tc "wk-ids-never-reused" t-wk-ids-are-never-reused-so-a-stale-weak-stays-dead)
+       (tc "wk-weak-of-freed" t-wk-weak-of-freed-is-use-after-free)
+       (tc "wk-weak-field-keeps-nothing-alive" t-wk-a-weak-field-does-not-keep-its-target-alive)
+       (tc "wk-overwriting-a-weak-in-a-cell" t-wk-overwriting-a-weak-in-a-cell-releases-nothing)
+       (tc "wk-upgrade-of-a-weak-read-from-a-cell" t-wk-upgrade-of-a-weak-read-from-a-cell-after-the-target-died-is-none)
+       (tc "wk-weak-stored-at-alloc-and-upgraded" t-wk-a-weak-stored-at-alloc-and-upgraded-keeps-counts-straight)
+       (tc "sh-vector-reaching-an-atom" t-sh-mark-shared-through-a-vector-reaching-an-atom-marks-everything)
+       (tc "sh-vector-reaching-a-cell" t-sh-mark-shared-through-a-vector-reaching-a-cell-marks-nothing)
+       (tc "sh-atom-holding-a-cell" t-sh-an-atom-holding-a-cell-may-not-cross)
+       (tc "sh-mark-twice" t-sh-mark-shared-twice-marks-once)
+       (tc "sh-cycle-through-an-atom" t-sh-mark-shared-over-a-cycle-through-an-atom-terminates)
+       (tc "sh-write-ref-into-a-shared-atom" t-sh-writing-a-ref-into-a-shared-atom-shares-it-and-its-children)
+       (tc "sh-write-reaching-a-cell-into-a-shared-atom" t-sh-writing-a-value-reaching-a-cell-into-a-shared-atom-changes-nothing)
+       (tc "sh-write-into-an-unshared-atom" t-sh-writing-into-an-unshared-atom-shares-nothing)
+       (tc "sh-flag-survives-count-ops" t-sh-the-shared-flag-survives-count-operations)
+       (tc "sh-new-object-pointing-at-a-shared-one" t-sh-a-new-object-pointing-at-a-shared-one-is-not-itself-shared)
+       (tc "sh-weak-to-a-cell-both-ways" t-sh-a-weak-to-a-cell-crosses-the-same-way-by-mark-and-by-atom-write)
+       (tc "sh-weak-to-a-dead-object" t-sh-a-weak-to-a-dead-object-never-blocks-a-crossing)
+       (tc "tr-alloc-store-release" t-tr-alloc-store-release-is-traced-in-order)
+       (tc "tr-write-order" t-tr-write-is-traced-as-retain-new-write-release-old)
+       (tc "tr-read" t-tr-read-is-traced-and-changes-no-count)
+       (tc "tr-count-after-matches-the-count" t-tr-count-after-in-events-matches-the-count)
+       (tc "tr-report-carries-the-whole-trace" t-tr-the-report-carries-the-whole-trace)
+       (tc "tr-failed-operations-leave-no-trace" t-tr-failed-operations-leave-no-trace)])))

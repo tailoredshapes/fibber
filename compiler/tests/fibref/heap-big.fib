@@ -1,0 +1,66 @@
+;; compiler/tests/fibref/heap-big.fib: the 200000-long adversarial tests of crates/fibref/tests/heap_adversarial/{bigweak,order}.rs at seed-1, at the Rust's
+;; size (heap-adv.fib runs its scale cases at 30000): nothing is recursive, so no length overflows the stack, and nothing is quadratic. Exit status: failures.
+(ns main (:use fibref.value fibref.heap fibref.trace heaptk))
+
+(def long: i64 200000)
+(defun is-str (what: str got: str want: str) -> str (if (= got want) "" (str what ": [" got "] <> [" want "]")))
+(defun same (what: str a: i64 b: i64) -> str (if (= a b) "" (str what ": " a " <> " b)))
+
+;; chain(len, tail): a list of immutables [i, prev], each released by its successor's alloc; returns the head (the Rust `chain`).
+(defun chain (h: Heap n: i64 tail: IVal) -> i64
+  (loop [k 1 head (imm h [(i 0) tail])]
+    (if (>= k n) head (let [nx (imm h [(i k) (obj head)])] (do (rel h head) (recur (+ k 1) nx))))))
+
+;; A list of nodes [i, prev, back] whose back cell holds a weak pointer to the NEXT node (the Rust weak_backed_list). Returns the nodes in order.
+(defun weak-list (h: Heap n: i64) -> (Vec i64)
+  (loop [k 0 prev INone prev-back -1 nodes (vec-empty)]
+    (if (>= k n)
+        nodes
+        (let [back (cell-of h INone) node (imm h [(i k) prev (obj back)]) _a (rel h back)
+              _b (match prev ((IObj older) (rel h older)) (_ ()))
+              _c (if (>= prev-back 0) (wr h prev-back 0 (ok! (heap-weak h node))) ())]
+          (recur (+ k 1) (obj node) back (conj nodes node))))))
+
+(defun count-frees (h: Heap) -> i64 (count (filter (fn (e: HpEvent) (match e ((EvFree _) true) (_ false))) (events-from h 0))))
+
+(defun t-bw-a-long-list-with-weak-back-pointers-frees-and-every-weak-dies () -> str
+  (let [h (heap-new) nodes (weak-list h long) head (nth nodes (- long 1)) c1 (cnt h head) c0 (cnt h (nth nodes 0)) _r (rel h head)
+        probes (mapv (fn (k: i64) (nth nodes (* k (quot long 16)))) (range 16))
+        checks (mapv (fn (id: i64) (if (and (not (heap-is-live h id)) (= (res (heap-upgrade h id)) "ok")) "" (str "#" id " came back"))) probes)
+        rep (heap-finish h)]
+    (all [(same "head count" c1 1) (same "first node held by its successor only" c0 1) (same "frees" (count-frees h) (* 2 long)) (first-failure checks)
+          (ck "clean" (report-clean? rep)) (same "allocated" (. rep allocated) (* 2 long)) (same "freed" (. rep freed) (* 2 long))])))
+(defun first-failure (rs: (Vec str)) -> str (let [bad (vec (filter (fn (r: str) (not= r "")) rs))] (if (= (count bad) 0) "" (nth bad 0))))
+
+(defun t-bw-a-weak-back-pointer-upgrades-while-the-list-lives () -> str
+  (let [h (heap-new) nodes (weak-list h 1000) head (nth nodes 999) back (rd h (nth nodes 499) 2)]
+    (match back
+      ((IObj bc) (let [w (rd h bc 0) n500 (nth nodes 500) u (heap-upgrade h n500) c (cnt h n500) _a (rel h n500) _b (rel h head) u2 (heap-upgrade h n500)]
+                   (all [(ck "the weak" (ival-eq w (IWeak n500))) (is-up "upgrade" u n500) (same "upgrade retained" c 2) (is-up "after the list" u2 -1) (ck "clean" (clean? h))])))
+      (_ "field 2 is the back cell"))))
+
+(defun t-bw-breaking-a-long-cycle-with-one-write-frees-it-all () -> str
+  (let [h (heap-new) c (cell-of h INone) head (chain h long (obj c)) _w (wr h c 0 (obj head)) _r (release-all h [head c]) cc (cnt h c) ch (cnt h head)
+        w (heap-write h c 0 INone) rep (heap-finish h)]
+    (all [(same "c" cc 1) (same "head" ch 1) (is-ok "write" w) (ck "head freed" (not (heap-is-live h head))) (ck "c freed" (not (heap-is-live h c))) (ck "clean" (report-clean? rep))
+          (same "freed" (. rep freed) (+ long 1))])))
+
+(defun t-bw-a-thread-crossing-over-a-long-cycle-through-an-atom-marks-once () -> str
+  (let [h (heap-new) a (atom-of h INone) head (chain h long (obj a)) _w (wr h a 0 (obj head)) _r (release-all h [head a]) m (heap-mark-shared h a)
+        marked (shared-evs h) m2 (heap-mark-shared h head) rep (heap-finish h)]
+    (all [(is-ok "mark" m) (same "each object once" (count marked) (+ long 1)) (same "first is the atom" (nth marked 0) a) (is-bool "head" (heap-is-shared h head) true)
+          (is-ok "again" m2) (same "a second crossing marks nothing" (count (shared-evs h)) (+ long 1)) (same "leaks" (count (. rep leaks)) (+ long 1))
+          (ck "all leak-cycle" (= (count (report-ids-in rep HpLeakCycle)) (+ long 1))) (ck "cycle only" (report-cycle-leak-only? rep))])))
+
+(defun t-ord-a-long-chain-is-freed-by-the-last-upgraded-count-going-away () -> str
+  (let [h (heap-new) head (chain h long INone) _w (ok! (heap-weak h head)) u (heap-upgrade h head) _r (rel h head) live (heap-is-live h head) _s (rel h head) u2 (heap-upgrade h head)]
+    (all [(is-up "upgrade" u head) (ck "the upgraded count keeps it" live) (ck "freed" (not (heap-is-live h head))) (is-up "after" u2 -1) (ck "clean" (clean? h))])))
+
+(defun main () -> i64
+  (min 100
+    (run-suite "heap-big"
+      [(tc "bw-weak-list-frees-and-every-weak-dies" t-bw-a-long-list-with-weak-back-pointers-frees-and-every-weak-dies)
+       (tc "bw-weak-back-pointer-upgrades" t-bw-a-weak-back-pointer-upgrades-while-the-list-lives)
+       (tc "bw-break-a-long-cycle" t-bw-breaking-a-long-cycle-with-one-write-frees-it-all)
+       (tc "bw-crossing-a-long-cycle" t-bw-a-thread-crossing-over-a-long-cycle-through-an-atom-marks-once)
+       (tc "ord-chain-freed-by-the-last-upgraded-count" t-ord-a-long-chain-is-freed-by-the-last-upgraded-count-going-away)])))

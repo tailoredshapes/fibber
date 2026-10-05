@@ -1,0 +1,140 @@
+;; compiler/tests/fibref/heap-peek.fib: the borrow audit for peeks (heap-peek-begin, heap-peek-end; spec/types.md section 6.3 "Cell peeks": a peek borrows the
+;; content of a private cell for one expression with no count, so the cell must not be written, moved out of or released while it is outstanding) and the
+;; `dyn` element of array-take! (heap-array-take-dyn: the element is retained and the slot unchanged, section 2.13.1). Exit status: failures.
+(ns main (:use fibref.value fibref.heap fibref.heap.state fibref.trace heaptk))
+
+(defun is-str (what: str got: str want: str) -> str (if (= got want) "" (str what ": [" got "] <> [" want "]")))
+(defun same (what: str a: i64 b: i64) -> str (if (= a b) "" (str what ": " a " <> " b)))
+(defun pk (h: Heap c: i64) -> IVal (ok! (heap-peek-begin h c)))
+(defun pe (h: Heap c: i64) -> unit (do (ok! (heap-peek-end h c)) ()))
+(defun refused (c: i64 op: str) -> str (str "peek outstanding on cell #" c ": " op " refused"))
+;; A cell holding an immutable x with a field; [c x].
+(defun cx (h: Heap) -> (Vec i64) (let [x (imm h [(i 1)]) c (cell-of h (obj x)) _r (rel h x)] [c x]))
+
+;; ================= the audit =================
+(defun t-pk-begin-reads-with-no-count-and-end-is-traced () -> str
+  (let [h (heap-new) p (cx h) c (nth p 0) x (nth p 1) n (nev h) v (pk h c) _e (pe h c)]
+    (all [(ck "value" (ival-eq v (obj x))) (is-int "no count" (heap-count h x) 1) (is-str "events" (evs-from h n) "peek #1;peek-end #1;")])))
+
+(defun t-pk-a-write-while-peeked-is-refused-and-changes-nothing () -> str
+  (let [h (heap-new) p (cx h) c (nth p 0) x (nth p 1) y (imm h []) _v (pk h c) n (nev h) w (heap-write h c 0 (obj y))
+        r (heap-read h c 0) m (nev h) _e (pe h c) w2 (heap-write h c 0 (obj y))]
+    (all [(is-err "write" w (refused c "write")) (same "read traced only" m (+ n 1)) (is-val "content" r (obj x)) (is-int "y" (heap-count h y) 2) (is-ok "after the end" w2)
+          (ck "x freed by the write" (not (heap-is-live h x)))])))
+
+(defun t-pk-a-unique-write-through-the-cell-is-refused () -> str
+  (let [h (heap-new) p (cx h) c (nth p 0) _v (pk h c) n (nev h) w (heap-write-unique h c 0 (i 5)) m (nev h) _e (pe h c)]
+    (all [(is-err "write-unique" w (refused c "write")) (same "events" m n) (is-ok "after the end" (heap-write-unique h c 0 (i 5)))])))
+
+(defun t-pk-take-put-and-move-in-are-refused () -> str
+  (let [h (heap-new) p (cx h) c (nth p 0) s (heap-open-scope h) _v (pk h c) n (nev h)
+        a (all [(is-err "take" (heap-take h c 0) (refused c "move")) (is-err "put" (heap-put h c 0 INone) (refused c "write"))
+                (is-err "move-in" (heap-move-in h s c 0) (refused c "move")) (same "events" (nev h) n)]) _e (pe h c)]
+    (all [a (is-ok "take after the end" (heap-take h c 0))])))
+
+(defun t-pk-the-array-primitives-are-refused () -> str
+  (let [h (heap-new) a (imm h [(i 1) (i 2)]) c (cell-of h (obj a)) _r (rel h a) _v (pk h c) n (nev h)
+        x (all [(is-err "take" (heap-array-take h c 0) (refused c "write")) (is-err "push" (heap-array-push h c (i 3)) (refused c "write"))
+                (is-err "pop" (heap-array-pop h c) (refused c "write")) (same "events" (nev h) n)]) _e (pe h c)]
+    (all [x (is-ok "pop after the end" (heap-array-pop h c))])))
+
+(defun t-pk-releasing-the-cell-is-refused-when-it-would-free-it () -> str
+  (let [h (heap-new) c (cell-of h (i 1)) _v (pk h c) n (nev h) r1 (heap-release h c) _t (ret h c) r2 (heap-release h c) m (nev h) k (cnt h c)]
+    (all [(is-err "free under the borrow" r1 (refused c "release")) (is-ok "a release that does not free" r2) (same "events" m (+ n 2)) (same "count" k 1)
+          (do (pe h c) (is-ok "after the end" (heap-release h c))) (ck "freed" (not (heap-is-live h c)))])))
+
+(defun t-pk-a-cascade-that-frees-the-cell-is-refused-whole () -> str
+  (let [h (heap-new) c (cell-of h (i 1)) holder (imm h [(obj c)]) _r (rel h c) _v (pk h c) n (nev h) e (heap-release h holder)]
+    (all [(is-err "release holder" e (refused c "release")) (same "events" (nev h) n) (ck "holder live" (heap-is-live h holder)) (is-int "holder count" (heap-count h holder) 1)
+          (do (pe h c) (is-ok "after the end" (heap-release h holder)))])))
+
+(defun t-pk-the-end-of-scope-of-a-peeked-stack-cell-is-refused () -> str
+  (let [h (heap-new) s (heap-open-scope h) c (stk h s ICell [(i 1)]) _v (pk h c) n (nev h) e (heap-end-scope h s)]
+    (all [(is-err "end scope" e (refused c "release")) (same "events" (nev h) n) (ck "still open" (= (heap-open-scopes h) [s])) (do (pe h c) (is-ok "after the end" (heap-end-scope h s)))])))
+
+(defun t-pk-end-without-a-peek-and-on-unknown-ids () -> str
+  (let [h (heap-new) c (cell-of h (i 1)) n (nev h) e1 (is-err "no peek" (heap-peek-end h c) "no peek outstanding on cell #0") e2 (is-err "unknown" (heap-peek-end h 9) "unknown object #9") m (nev h)
+        _v (pk h c) _e (pe h c)]
+    (all [e1 e2 (same "events" m n) (is-err "second end" (heap-peek-end h c) "no peek outstanding on cell #0")])))
+
+(defun t-pk-only-a-live-cell-with-content-can-be-peeked () -> str
+  (let [h (heap-new) a (atom-of h INone) v (imm h []) c (cell-of h (i 1)) _t (ok! (heap-take h c 0)) d (cell-of h (i 2)) _r (rel h d)]
+    (all [(is-err "atom" (heap-peek-begin h a) "unique write refused on #0: PlaceNotCell") (is-err "immutable" (heap-peek-begin h v) "unique write refused on #1: PlaceNotCell")
+          (is-err "taken" (heap-peek-begin h c) "slot 0 of #2 was moved out and not put back") (is-err "freed" (heap-peek-begin h d) "use after free: read of freed object #3")])))
+
+(defun t-pk-a-dangling-content-is-use-after-free-at-the-begin () -> str
+  (let [h (heap-new) p (cx h) c (nth p 0) x (nth p 1) _o (rel h x) n (nev h)]
+    (all [(is-err "begin" (heap-peek-begin h c) "use after free: store of freed object #0") (same "events" (nev h) n)])))
+
+(defun t-pk-two-peeks-need-two-ends () -> str
+  (let [h (heap-new) c (cell-of h (i 1)) _a (pk h c) _b (pk h c) _e (pe h c) w1 (heap-write h c 0 (i 2)) _f (pe h c) w2 (heap-write h c 0 (i 2))]
+    (all [(is-err "one end is not enough" w1 (refused c "write")) (is-ok "both ended" w2)])))
+
+(defun t-pk-reads-counts-and-retains-of-a-peeked-cell-are-allowed () -> str
+  (let [h (heap-new) c (cell-of h (i 1)) _v (pk h c) r (heap-read h c 0) _t (ret h c) k (cnt h c) _s (rel h c) _e (pe h c)]
+    (all [(is-val "read" r (i 1)) (same "count" k 2)])))
+
+(defun t-pk-a-peek-never-ended-is-reported-at-finish () -> str
+  (let [h (heap-new) c (cell-of h (i 1)) _v (pk h c) rep (heap-finish h)]
+    (all [(ck "not clean" (not (report-clean? rep))) (ck "open peeks" (= (. rep open-peeks) [c]))
+          (is-str "audit line" (audit-line rep) "clean=false leak-cycles=0 leaks=1 errors=1 [peek on cell #0 never ended]")])))
+
+;; The peek is the ONLY thing wrong with the run (the cell is gone, its peek count forged back): the report is still not clean.
+(defun t-pk-an-open-peek-alone-makes-the-report-unclean () -> str
+  (let [h (heap-new) c (cell-of h (i 1)) _v (pk h c) _f (hp-set-peeks h c 0) _r (rel h c) _g (hp-set-peeks h c 1) rep (heap-finish h)]
+    (all [(same "no leaks" (count (. rep leaks)) 0) (ck "not clean" (not (report-clean? rep))) (ck "not cycle-only" (not (report-cycle-leak-only? rep)))
+          (is-str "audit line" (audit-line rep) "clean=false leak-cycles=0 leaks=0 errors=1 [peek on cell #0 never ended]")])))
+
+;; ================= dyn elements =================
+(defun obj7 (h: Heap) -> i64 (ok! (heap-alloc h IImmutable 7 [])))
+;; [c a e0 e1]: a cell holding an array of n elements of type id 7 that only the array holds.
+(defun arr (h: Heap n: i64) -> (Vec i64)
+  (let [es (mapv (fn (k: i64) (obj7 h)) (range n)) a (imm h (mapv obj es)) c (cell-of h (obj a)) _r (rel h a) _s (release-all h es)] [c a (nth es 0) (nth es 1)]))
+(defun taken? (h: Heap a: i64 f: i64) -> bool (match (raw h a f) ((ITaken) true) (_ false)))
+
+(defun t-dyn-take-of-a-unique-array-retains-and-leaves-the-slot () -> str
+  (let [h (heap-new) p (arr h 3) c (nth p 0) a (nth p 1) e1 (nth p 3) n (nev h) v (heap-array-take-dyn h c 1)]
+    (all [(is-val "value" v (obj e1)) (ck "slot unchanged" (ival-eq (raw h a 1) (obj e1))) (is-int "count" (heap-count h e1) 2)
+          (is-str "events" (evs-from h n) (str "array-take-dyn #" c " #" a "[1] in-place;retain #" e1 " -> 2;"))])))
+
+(defun t-dyn-take-of-a-shared-array-copies-then-retains () -> str
+  (let [h (heap-new) p (arr h 2) c (nth p 0) a (nth p 1) e0 (nth p 2) _t (ret h a) v (heap-array-take-dyn h c 0) ca (rd h c 0)]
+    (all [(is-val "value" v (obj e0)) (ck "the cell holds a copy" (not (ival-eq ca (obj a)))) (is-int "old array" (heap-count h a) 1) (is-int "element" (heap-count h e0) 3)])))
+
+(defun t-dyn-take-differs-from-take-of-an-object () -> str
+  (let [h (heap-new) p (arr h 2) c (nth p 0) a (nth p 1) e0 (nth p 2) e1 (nth p 3) _v (ok! (heap-array-take h c 0)) w (heap-array-take-dyn h c 1)]
+    (all [(ck "take moved the slot out" (taken? h a 0)) (is-int "moved element keeps its count" (heap-count h e0) 1) (is-int "dyn element retained" (heap-count h e1) 2) (is-val "dyn" w (obj e1))
+          (ck "dyn slot unchanged" (not (taken? h a 1)))])))
+
+(defun t-dyn-take-checks () -> str
+  (let [h (heap-new) p (arr h 2) c (nth p 0) a (nth p 1) _t (ok! (heap-array-take h c 0))]
+    (all [(is-err "bad index" (heap-array-take-dyn h c 5) (str "object #" a " has no field 5")) (is-err "taken slot" (heap-array-take-dyn h c 0) (str "slot 0 of #" a " was moved out and not put back"))])))
+
+(defun t-dyn-push-and-pop-move-objects-like-any-other () -> str
+  (let [h (heap-new) a (imm h []) c (cell-of h (obj a)) _r (rel h a) e (obj7 h) _p (ok! (heap-array-push h c (obj e))) ce (cnt h e) _q (rel h e)
+        v (heap-array-pop h c) c2 (cnt h e)]
+    (all [(same "push retains" ce 2) (is-val "pop returns the element" v (obj e)) (same "pop moves the count out" c2 1) (do (rel h e) (rel h c) (ck "clean" (clean? h)))])))
+
+(defun main () -> i64
+  (min 100
+    (run-suite "heap-peek"
+      [(tc "pk-begin-and-end" t-pk-begin-reads-with-no-count-and-end-is-traced)
+       (tc "pk-write" t-pk-a-write-while-peeked-is-refused-and-changes-nothing)
+       (tc "pk-unique-write" t-pk-a-unique-write-through-the-cell-is-refused)
+       (tc "pk-take-put-move-in" t-pk-take-put-and-move-in-are-refused)
+       (tc "pk-array-primitives" t-pk-the-array-primitives-are-refused)
+       (tc "pk-release-of-the-cell" t-pk-releasing-the-cell-is-refused-when-it-would-free-it)
+       (tc "pk-cascade-frees-the-cell" t-pk-a-cascade-that-frees-the-cell-is-refused-whole)
+       (tc "pk-end-scope" t-pk-the-end-of-scope-of-a-peeked-stack-cell-is-refused)
+       (tc "pk-end-without-a-peek" t-pk-end-without-a-peek-and-on-unknown-ids)
+       (tc "pk-only-a-cell" t-pk-only-a-live-cell-with-content-can-be-peeked)
+       (tc "pk-dangling-content" t-pk-a-dangling-content-is-use-after-free-at-the-begin)
+       (tc "pk-two-peeks" t-pk-two-peeks-need-two-ends)
+       (tc "pk-reads-allowed" t-pk-reads-counts-and-retains-of-a-peeked-cell-are-allowed)
+       (tc "pk-reported-at-finish" t-pk-a-peek-never-ended-is-reported-at-finish)
+       (tc "pk-open-peek-alone" t-pk-an-open-peek-alone-makes-the-report-unclean)
+       (tc "dyn-take-unique" t-dyn-take-of-a-unique-array-retains-and-leaves-the-slot)
+       (tc "dyn-take-shared" t-dyn-take-of-a-shared-array-copies-then-retains)
+       (tc "dyn-take-vs-take" t-dyn-take-differs-from-take-of-an-object)
+       (tc "dyn-take-checks" t-dyn-take-checks)
+       (tc "dyn-push-pop" t-dyn-push-and-pop-move-objects-like-any-other)])))

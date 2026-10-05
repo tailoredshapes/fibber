@@ -106,3 +106,24 @@
   (let [failed (count (filter (fn (t: Tc) (not (run-one t))) tests))]
     (do (println (str suite ": " (count tests) " tests, " failed " failed"))
         failed)))
+
+;; ---- event counts (the Rust helpers frees_of, releases_of, retains_of of heap_adversarial.rs), over the events from index `from` on ----
+(defun events-from (h: Heap from: i64) -> (Vec HpEvent)
+  (let [log @(. h log)] (mapv (fn (k: i64) (nth log k)) (range from (count log)))))
+(defun frees-of (h: Heap from: i64 id: i64) -> i64
+  (count (filter (fn (e: HpEvent) (match e ((EvFree x) (= x id)) (_ false))) (events-from h from))))
+(defun releases-of (h: Heap from: i64 id: i64) -> i64
+  (count (filter (fn (e: HpEvent) (match e ((EvRelease x _) (= x id)) (_ false))) (events-from h from))))
+(defun retains-of (h: Heap from: i64 id: i64) -> i64
+  (count (filter (fn (e: HpEvent) (match e ((EvRetain x _) (= x id)) (_ false))) (events-from h from))))
+(defun shared-evs (h: Heap) -> (Vec i64)
+  (vec (filter (fn (x: i64) (>= x 0)) (mapv (fn (e: HpEvent) (match e ((EvShared x) x) (_ -1))) (events-from h 0)))))
+;; A check that a Result failed (whatever the error).
+(defun failed? (what: str r: (Result a HpErr)) -> str
+  (match r ((Err _) "") ((Ok _) (str what ": expected an error"))))
+(defun same (what: str a: i64 b: i64) -> str (if (= a b) "" (str what ": " a " <> " b)))
+(defun release-all (h: Heap ids: (Vec i64)) -> unit
+  (loop [k 0] (if (>= k (count ids)) () (do (rel h (nth ids k)) (recur (+ k 1))))))
+;; Cell holding an immutable holding the cell, closed by a write and both bindings released (the Rust cell_cycle): returns [c v].
+(defun cell-cycle (h: Heap) -> (Vec i64)
+  (let [c (cell-of h INone) v (imm h [(obj c)]) _w (wr h c 0 (obj v)) _r (release-all h [v c])] [c v]))

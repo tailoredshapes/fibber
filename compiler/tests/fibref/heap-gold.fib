@@ -1,0 +1,109 @@
+;; compiler/tests/fibref/heap-gold.fib: the free trace the heap gives for 20 object graphs built BY HAND from cases/ownership, to be compared byte for byte
+;; with compiler/tests/golden/fibref/itrace-ownership.txt (the interpreter's recorded trace; heap-gold.sh does the comparison). There is no evaluator yet
+;; (package F2), so each case below is the allocation, retain, write and release sequence its source performs under plain counting (a temporary that is
+;; moved into a constructor or a cell is released after the heap's store retained it; a private `&` cell is a stack cell; a borrowed position retains and
+;; releases around the call, section 6.12), written out by hand from the case. The printed text is `=== NAME`, then the `trace-text` of the heap's run.
+;; Prints, does not judge: heap-gold.sh judges. Exit status 0.
+(ns main (:use fibref.value fibref.heap fibref.trace heaptk))
+
+(defun lit-str (h: Heap) -> IVal (obj (lit h [])))   ;; a string literal: immortal, no ordinal
+
+;; --- structs and strings only ---
+(defun c228 (h: Heap) -> unit
+  (let [z (imm h [(i 7)]) w (imm h [(i 7)]) c1 (imm h [(obj z) (obj w)]) _a (rel h w) p (imm h [(obj c1) (obj z)]) _b (rel h c1) _c (rel h z)] (rel h p)))
+
+(defun c204 (h: Heap) -> unit
+  (let [end (imm h [])
+        head (loop [k 0 acc end] (if (>= k 6) acc (let [nx (imm h [(i k) (obj acc)])] (do (rel h acc) (recur (+ k 1) nx)))))]
+    (rel h head)))
+
+(defun c63 (h: Heap) -> unit
+  (let [s1 (imm h []) b1 (imm h [(obj s1)]) _a (rel h s1) s2 (imm h []) b2 (imm h [(obj s2)]) _b (rel h s2)
+        _r (do (ret h b1) (rel h b2) (ret h b1) (rel h b1) (rel h b1))] (rel h b1)))
+
+(defun c75 (h: Heap) -> unit
+  (let [s (imm h []) named (imm h [(obj s)]) _a (rel h s) xs (imm h []) _b (rel h xs)] (rel h named)))
+
+(defun c39 (h: Heap) -> unit
+  (let [p1 (imm h [(i 1) (lit-str h)]) p2 (imm h [(i 1) (lit-str h)]) _a (rel h p2)] (rel h p1)))
+(defun c48 (h: Heap) -> unit
+  (let [p1 (imm h [(IFloat 1.0 64)]) p2 (imm h [(IFloat 1.0 64)]) _a (rel h p2)] (rel h p1)))
+(defun c122 (h: Heap) -> unit
+  (let [p1 (imm h [(i 1)]) p2 (imm h [(i 2)]) _a (rel h p2)] (rel h p1)))
+(defun c45 (h: Heap) -> unit
+  (let [t (imm h [(lit-str h)]) _a (rel h t) b (imm h [(i 1)])] (rel h b)))
+(defun c154 (h: Heap) -> unit
+  (let [a (imm h [(IFloat 0.0 64)]) b (imm h [(IFloat 1.0 64)]) _x (rel h b) _y (rel h a)
+        c (imm h [(IFloat 0.0 64)]) d (imm h [(IFloat 1.0 64)]) _z (rel h d)] (rel h c)))
+
+;; --- stack objects and private cells ---
+(defun c99 (h: Heap) -> unit
+  (let [step (heap-open-scope h) body (heap-open-scope h) pt (stk h step IImmutable [(i 1) (i 2)]) holder (stk h body IImmutable [(i 1)]) _a (ok! (heap-end-scope h step))]
+    (do (ok! (heap-end-scope h body)) ())))
+
+(defun c79 (h: Heap) -> unit
+  (let [arr (imm h [(i 0) (i 0) (i 0)]) s (heap-open-scope h) c (stk h s ICell [(obj arr)]) _a (rel h arr) s2 (heap-open-scope h) holder (stk h s2 IImmutable [(obj arr)])
+        _b (ok! (heap-end-scope h s2))]
+    (do (ok! (heap-end-scope h s)) ())))
+
+;; main passes (array 3 0) to a function that makes a cell of it and `array-set!`s through the cell: the array is shared (the caller's count and the cell's), so
+;; the update copies it into the cell and releases the old one; the function's owned parameter is released at its return.
+(defun c58 (h: Heap) -> unit
+  (let [a1 (imm h [(i 0) (i 0) (i 0)] ) s (heap-open-scope h) c (stk h s ICell [(obj a1)]) a3 (imm h [(i 9) (i 0) (i 0)]) _w (wr h c 0 (obj a3)) _r (rel h a3) _e (ok! (heap-end-scope h s))]
+    (rel h a1)))
+
+(defun c73 (h: Heap) -> unit
+  (let [a1 (imm h [(i 0) (i 0) (i 0)]) s (heap-open-scope h) c (stk h s ICell [(obj a1)]) a3 (imm h [(i 7)]) _w (wr h c 0 (obj a3)) _r (rel h a3) _e (ok! (heap-end-scope h s))]
+    (rel h a1)))
+
+(defun c72 (h: Heap) -> unit
+  (let [b9 (imm h [(i 9)]) s (heap-open-scope h) c (stk h s ICell [(obj b9)]) _a (rel h b9) b5 (imm h [(i 5)]) _w1 (wr h c 0 (obj b5)) b0 (imm h [(i 0)]) _w2 (wr h c 0 (obj b0))
+        _r (rel h b0) _q (rel h b5)]
+    (do (ok! (heap-end-scope h s)) ())))
+
+(defun c76 (h: Heap) -> unit
+  (let [s1 (imm h []) b1 (imm h [(obj s1)]) _a (rel h s1) s (heap-open-scope h) out (stk h s ICell [(obj b1)]) _b (rel h b1)
+        s2 (imm h []) b2 (imm h [(obj s2)]) _c (rel h s2) _w (wr h out 0 (obj b2)) _d (rel h b2)]
+    (do (ok! (heap-end-scope h s)) ())))
+
+;; `(array-get (. @s arr) (do (set! s ..) 0))`: under plain counting the read of @s and of its field retain, the set! replaces the cell's content, the temporaries
+;; are released after the call.
+(defun c23 (h: Heap) -> unit
+  (let [a1 (imm h [(i 0)]) a2 (imm h [(obj a1)]) _a (rel h a1) s (heap-open-scope h) c (stk h s ICell [(obj a2)]) _b (rel h a2)
+        _t1 (ret h a2) _t2 (ret h a1) a4 (imm h [(i 7)]) a5 (imm h [(obj a4)]) _d (rel h a4) _w (wr h c 0 (obj a5)) _e (rel h a5) _f (rel h a1) _g (rel h a2)]
+    (do (ok! (heap-end-scope h s)) ())))
+
+(defun c244 (h: Heap) -> unit
+  (let [s (heap-open-scope h) a (stk h s ICell [(i 0)]) n (stk h s ICell [(i 0)])] (do (ok! (heap-end-scope h s)) ())))
+
+;; main's cell, f's copy-in cell, the closure capturing it, g's copy-in cell: four scopes ended innermost first (cases 162, 163 and 165 record the same trace).
+(defun in-out-chain (h: Heap) -> unit
+  (let [s1 (heap-open-scope h) c1 (stk h s1 ICell [(i 0)]) s2 (heap-open-scope h) c2 (stk h s2 ICell [(i 0)]) s3 (heap-open-scope h) cl (stk h s3 IImmutable [(obj c2)])
+        s4 (heap-open-scope h) c4 (stk h s4 ICell [(i 0)]) _a (ok! (heap-end-scope h s4)) _b (ok! (heap-end-scope h s3)) _c (ok! (heap-end-scope h s2))]
+    (do (ok! (heap-end-scope h s1)) ())))
+
+(defun show-case (name: str f: (fn (Heap) unit)) -> unit
+  (let [h (heap-new) _r (f h)] (do (println (str "=== " name)) (print (trace-text (trace-lines h))))))
+
+(defun main () -> i64
+  (do (show-case "228-frees-follow-field-order-with-shared-children" c228)
+      (show-case "204-allocs-bound-met-exactly" c204)
+      (show-case "63-recur-retains-binding-outside-loop" c63)
+      (show-case "75-loop-returns-its-parameter" c75)
+      (show-case "39-derive-eq-on-generic-struct" c39)
+      (show-case "48-derive-eq-on-enum" c48)
+      (show-case "122-default-resolves-names-where-its-protocol-is" c122)
+      (show-case "45-bounded-generic-at-two-ptr-class-types" c45)
+      (show-case "154-float-comparisons-are-ieee-not-ord-defaults" c154)
+      (show-case "99-stack-temporary-ends-before-later-binding" c99)
+      (show-case "79-scope-local-object-dropped-at-its-scope-exit" c79)
+      (show-case "58-owned-parameter-at-ordinary-call" c58)
+      (show-case "73-owned-parameter-in-cell-read-after" c73)
+      (show-case "72-owned-parameter-stored-then-read" c72)
+      (show-case "76-loop-initialised-from-scope-local-binding" c76)
+      (show-case "23-cell-read-beside-sibling-write" c23)
+      (show-case "244-own-operators-do-not-capture-the-loops-and-folds-the-prelude-writes" c244)
+      (show-case "162-captured-inout-parameter-not-forwarded" in-out-chain)
+      (show-case "163-captured-by-let-bound-closure-not-forwarded" in-out-chain)
+      (show-case "165-captured-inout-at-non-tail-call-unchanged" in-out-chain)
+      0))
