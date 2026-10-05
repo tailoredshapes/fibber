@@ -3,9 +3,9 @@
 # with `cases -j N`, compares the cases that do not pass with scripts/ci-stage2.expected (scripts/ci-stage2.sh does that part, as CI runs
 # it), prints a timing line for each stage and ends with PASS or FAIL (exit 0 or 1; 2 for a usage or setup error).
 #   scripts/gate.sh [--quick|--full] [-j N]
-#   --quick (default)  stage 2, ownership, modules and a deterministic sample of about 100 stdlib cases (every expected failure among them)
+#   --quick (default)  stage 2, the tool skeletons (scripts/tools.sh), ownership, modules and a deterministic sample of about 100 stdlib cases (every expected failure among them)
 #   --full             stage 2 built by the seed, the fixed point (F builds F3, both emit the same lIR), the golden checks of the passes
-#                      (compiler/tests/golden/golden.sh), and all three directories in full
+#                      (compiler/tests/golden/golden.sh), the tool tests (scripts/tools.sh: language server, fibref and fibgen ports), and all three directories in full
 #   -j N               cases run at a time (default 12; the machine has 28 cores and 61 GB, and no more than about 12 heavy jobs at once)
 # Environment (scripts/lib/stage2.sh has the whole list): FIBC or SEED = the fibc that builds stage 2 (CI gives the seed); without
 # them a previous F of the same prelude builds it (the line `build:` says which); GATE_OUT = scratch (F and case output are kept there,
@@ -55,6 +55,15 @@ if [ "$mode" = full ]; then
     timings+=("golden $(grep -c '^ok' "$GATE_OUT/golden.log") suites ok $(elapsed "$t0" "$(now)") s")
   else tail -n 20 "$GATE_OUT/golden.log"; fail "golden checks FAILED (log: $GATE_OUT/golden.log)"; timings+=("golden FAILED $(elapsed "$t0" "$(now)") s"); fi
 fi
+
+# The tool tests (scripts/tools.sh): the skeletons of the fibref and fibgen ports in the quick gate; in the full gate also the language server's unit
+# programs, replay and hardening cases, the fibref heap programs, and the fibgen port's rng check, pipelines comparison and planted faults. One
+# timing line for each script; a failing one fails the gate.
+t0=$(now)
+if "$here/tools.sh" "--$mode" "$F" "$GATE_OUT/tools" > "$GATE_OUT/tools.log" 2>&1; then tools_ok=1; else tools_ok=0; tail -n 40 "$GATE_OUT/tools.log"; fi
+while IFS= read -r l; do case $l in ok\ *|FAIL\ *) timings+=("tools $l") ;; esac; done < "$GATE_OUT/tools.log"
+[ "$tools_ok" -eq 1 ] || fail "tools FAILED (log: $GATE_OUT/tools.log)"
+timings+=("tools total $(elapsed "$t0" "$(now)") s")
 
 # The sample of the quick gate: every 10th stdlib case by name (the order of `ls`, bytes), and the expected failures among them, so a
 # sample still shows the harness reporting one. A case is a *.fib or a directory with a main.fib; its name is what `--only` matches.
