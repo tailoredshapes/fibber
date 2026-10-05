@@ -11,6 +11,7 @@
 (declare memcmp i32 (ptr ptr i64))
 (declare write i64 (i32 ptr i64))
 (declare abort void ())
+(declare madvise i32 (ptr i64 i32))
 (declare getenv ptr (ptr))
 (declare strlen i64 (ptr))
 (declare snprintf i32 (ptr i64 ptr ...))
@@ -102,6 +103,19 @@
     (ret head))
   (block miss (ret (call @fib.alloc-slow size tid))))
 
+;; A block of 4 MiB or more asks for transparent huge pages (madvise MADV_HUGEPAGE, 14) on the whole pages inside it, as NumPy does for
+;; its arrays: a fresh array of 1e7 doubles is otherwise 20000 page faults of 4 KiB, which cost more than the arithmetic that fills it.
+;; Advice only: a kernel without THP, or one set to `never`, ignores it, and the result of madvise is not used.
+(define internal (fib.advise-huge void) ((ptr p) (i64 size))
+  (block entry
+    (let ((lo (and (add (ptrtoint i64 p) (i64 4095)) (i64 -4096)))
+          (hi (and (add (ptrtoint i64 p) size) (i64 -4096))))
+      (br (icmp ult lo hi) go done)))
+  (block go
+    (call @madvise (inttoptr ptr lo) (sub hi lo) (i32 14))
+    (br done))
+  (block done (ret)))
+
 (define internal (fib.alloc-slow ptr) ((i64 size) (i32 tid))
   (block entry (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced plain))
   (block plain
@@ -128,7 +142,11 @@
       (br (icmp eq p1 (ptr null)) oom bigok)))
   (block bigok
     (call @fib.init-hdr p1 tid (i32 0))
-    (ret p1))
+    (br (icmp uge size (i64 4194304)) huge fin))
+  (block huge
+    (call @fib.advise-huge p1 size)
+    (br fin))
+  (block fin (ret p1))
   (block traced
     (let ((q2 (call @malloc (add size (i64 16)))))
       (br (icmp eq q2 (ptr null)) oom tracedok)))
