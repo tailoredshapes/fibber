@@ -3213,9 +3213,25 @@ that `let`. For a lend of `t`:
 (a shared array is copied at the lend, an unshared one is not), returns windows holding the address and the length and no count, every access is checked
 against the window's own length, windows of one lend are disjoint, and the owner is not resized during the extent (L2).
 
-**Not implemented, and therefore not claimed:** parallel disjoint windows over tasks and `Send` for windows (no task receives a window); windows over
-`Tensor` storage in the library proper (`lib/fib/tensor/window-demo.fib` shows one); a window of a window; a window as a scalar-class value in registers
-(a window is a heap or stack struct of `(base, len, seed)`); `dyn` and `weak` of a window as S1 positions of their own.
+**Lowering (package EV2; `compiler/own/walk/call.fib` `amp-pass`, `compiler/emit/lower/window.fib`; read off the lIR by `compiler/tests/emit/windows.sh`).**
+These change no rule above and no verdict; they change what the emitter makes of a window.
+
+- **A scoped `&` argument is the cell itself.** An `&v` argument whose binding is a view cell, or an `&` parameter of scoped type, is handed to the callee
+  as the cell (pass `own cell`, the pass of a builtin's `&` argument): no private cell, no copy-in, no write-back, no count on the window. This is the
+  same program as the copy-in and write-back it replaces, because the callee can only read the window and store through it (VC1, S1), no other operand of the
+  call mentions `v` (VC4), and a view cell is never assigned (VC3).
+- **A window's base and length are registers.** Where the cell of a window of `fib.view` is made, the emitter reads the base and the length once; they dominate
+  the whole extent (the cell is never assigned and the window is immutable), and a read of the cell's content is the window itself. A call of `win-get`,
+  `win-set!` or the `win-len` of `Windowed` at an element type of 4 or 8 bytes (`f64`, `f32`, `i64`, `i32`) is then lowered inline: an unsigned compare of the
+  index with the length, an address, a load or a store. The failing branch is the call of the library's own function, so the trap is the library's
+  (`window index I out of range for a window of N`). Any other call, and a window that was not registered (a kernel's `&` parameter), takes the
+  library's code, or loads the two fields at the access.
+- **Not a scalar-class value.** The window is still an object (a base, a length and a seed) made once at the lend and held by its view cell; what is in
+  registers is the pair of fields a loop reads. `fill!` and `copy-into!` are loops of the library that read the fields once.
+
+**Not implemented, and therefore not claimed:** `Send` for windows (a task receives an array and a range, and makes its window itself: `fib.view.tiles`);
+windows over `Tensor` storage in the library proper (`lib/fib/tensor/window-demo.fib` shows one); a window of a window; a window as a scalar-class value
+(see above); registers for a window that is a parameter of a kernel; `dyn` and `weak` of a window as S1 positions of their own.
 
 ---
 
