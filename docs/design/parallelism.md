@@ -389,3 +389,29 @@ element work with tiles) before P-sched. (5) P-sched, which the fine-grained and
 - 250 simultaneous threads under `ulimit -v 16000000`: not lifted. The 1024-thread `pfib` depth-10 run failed under the cap as expected and was not repeated without it; `MALLOC_ARENA_MAX` was not used.
 - ThreadSanitizer: run on six kernels and the deque, not on the case suite; the two findings are not fixed (design task).
 - The `fib.share` unique-move optimisation, striped adders, adaptive splitting and the helping-depth bound are described, not measured.
+
+---
+
+## 7. P-struct as built (`fib.parallel`, 2026-10-05)
+
+What exists, on the runtime as it is (one OS thread per `spawn`), with no change to `rt/` or `compiler/`: `lib/fib/parallel.fib` and `lib/fib/parallel/*`,
+explicit `(:use fib.parallel)`; cases 7600 to 7613 (`cases/stdlib`, stage 2); the planted faults in `scripts/mutant-parallel.sh`; measurements in
+`docs/shootout/parallel.md`.
+
+| Piece | Where | Differences from section 3.2 |
+|---|---|---|
+| `(cpu-count)`, `(max-workers)` = 64 | `parallel/cpu.fib` | least of sysconf(84), the `Cpus_allowed_list` of /proc/self/status, ceil of cgroup v2 `cpu.max` (else v1 cfs files). Only the cgroup root file is read, not the process's own cgroup path. No `FIB_THREADS`. |
+| `with-tasks [s]`, `fork`, `try-with-tasks` | `parallel/scope.fib`, macros in `parallel.fib` | the scope is dynamic (`fork s f`), homogeneous in the result type; no cancellation (the siblings run to completion and are joined); trap in the body is not isolated. |
+| `run-chunks` | `parallel/chunks.fib` | W tasks, task w runs chunks w, w+W, ...; the caller waits; W = 1 runs on the caller. At most W live tasks per call (nested calls multiply). |
+| `pmap`, `pmap-n`, `pfor`, `pmap-seq`, `pmap-chunks`, `pfor-chunks` | `parallel/pmap.fib` | options are a `Par` struct (`(Par workers grain fast)`, `(with (par) (workers 8))`), as an optional first argument; no `:chunk`/`:window` keywords. `pmap-seq` returns the whole Vec of a finite source. |
+| `pmap-each`, `pmap-range`, `pfor-range`, `preduce-each`, `preduce-range` | macros in `parallel.fib` | not in the sketch: they make the body inside the chunk, because a closure shared by W threads costs an atomic count per call (60 ns at 8 threads). |
+| `pfold`, `preduce`, `preduce-n`, `pfold-chunks` | `parallel/reduce.fib` | fixed grain 65 536, fixed pairwise tree, same tree sequentially; `:fast` is `(fast true)`. |
+| `pscan` | `parallel/scan.fib` | chunk totals, left to right carries, chunk scans; W-independent. |
+
+`pmap` here shadows the prelude's `pmap` for a program that uses `fib.parallel`; the prelude's (a thread per element, Vec only) is unchanged and is not made to delegate:
+the prelude cannot depend on a library module, and `fib.parallel` is not implicit. Not done: `pcalls`, `pvalues`, `par-scope`, `Splittable`, a `:window` for `pmap` over
+a Vec, the cost-hint grain, adaptive splitting, cancellation. `pmap` over arrays and ranges: arrays through `pmap-chunks` or a closure over the array and `pmap-n`; there is no
+`(Array)` overload. The sequential `t/sum` of `fib.tensor` is not rewired to the fixed tree.
+
+What this showed that the design did not say: the per-call cost of a closure shared between threads (`docs/shootout/parallel.md`), which makes the closure forms of
+`pmap` 5x slower than the macro forms for a trivial body and `preduce-n` 75x slower at 1e8 elements; P-count-b is what removes it.

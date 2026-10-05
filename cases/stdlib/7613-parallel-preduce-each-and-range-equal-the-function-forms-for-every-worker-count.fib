@@ -1,0 +1,26 @@
+;; spec:   docs/design/parallelism.md 3.2, 3.5; lib/fib/parallel.fib (preduce-each, preduce-range)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; The macros that make the element step inside each chunk give the bits of the function forms (`preduce`, `preduce-n`), which are the fixed
+;; tree's, for 1, 2, 3, 8 and 28 workers over inexact f64 data (300 001 elements: 5 chunks). A macro that chunked by workers, or combined left to
+;; right, would differ from `preduce-n` at some worker count.
+(ns main (:use fib.core fib.parallel tl.check))
+
+(defun datum (i: i64) -> f64 (/ (double (- (rem (* 11 i) 101) 50)) 7.0))
+
+(defun main () -> i64
+  (let [c (checks)
+        n 300001
+        xs (mapv datum (vec (range n)))
+        want (preduce-n (Par 1 0 false) + 0.0 (fn (i) (datum i)) n)]
+    (do (doseq [w [1 2 3 8 28]]
+          (let [p (Par w 0 false)]
+            (do (check c (= (preduce-range [i n p] + 0.0 (datum i)) want))
+                (check c (= (preduce-each [x xs p] + 0.0 x) want))
+                (check c (= (preduce (Par w 0 false) + 0.0 (fn (x) x) xs) want))
+                (check c (= (preduce-each [x xs p] max -1000.0 x) (preduce (Par 1 0 false) max -1000.0 (fn (x) x) xs))))))
+        (check c (= (preduce-range [i 0] + 7 i) 7))
+        (checks-result c))))

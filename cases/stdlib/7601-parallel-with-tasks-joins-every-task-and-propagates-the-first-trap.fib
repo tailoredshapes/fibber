@@ -1,0 +1,41 @@
+;; spec:   docs/design/parallelism.md 3.2, docs/design/exceptions.md 8 (try-join); lib/fib/parallel/scope.fib
+;; expect: accept
+;; result: 0
+;; stage:  2
+;; audit:  clean
+;; roots:  ../../lib support
+;; `with-tasks` joins every task forked in the scope before it returns, in order of creation, and a trap in a task reaches the scope's
+;; joiner as an `Err (Trap message)` under `try-with-tasks` (and as a trap of the same message under `with-tasks`, case 7602) with the
+;; ORIGINAL message; the siblings of the task that trapped are still joined (their effect is visible after the scope).
+;; (What a task that trapped owned is abandoned, stage 1 of exceptions; these closures capture only the shared atom, so the audit is clean.)
+;; Each check can fail: a scope that forgets to join leaves `done` short of 4 at the read after exit (the late tasks sleep first); a trap that
+;; is not propagated gives `Ok`; a scope that stops at the first trap leaves the later tasks unjoined (done short); the first message
+;; is the one of the earliest task in creation order, not of the earliest to fail.
+(ns main (:use fib.parallel fib.async fib.os tl.check))
+
+(defun pause (ms: i64) -> unit (do (sleep-ns (* ms 1000000)) ()))
+
+;; four tasks add to a shared atom after a pause; the second and the third trap
+(defun run (c: Checks) -> unit
+  (let [done (atom 0)
+        r (try-with-tasks [s]
+            (do (fork s (fn () (do (pause 30) (swap! done inc) 1)))
+                (fork s (fn () (do (pause 5) (swap! done inc) (trap "second failed"))))
+                (fork s (fn () (do (swap! done inc) (trap "third failed"))))
+                (fork s (fn () (do (pause 60) (swap! done inc) 4)))
+                7))]
+    (do (check c (= @done 4))
+        (check c (match r ((Err t) (= (. t message) "second failed")) ((Ok v) false))))))
+
+(defun clean (c: Checks) -> unit
+  (let [done (atom 0)
+        r (try-with-tasks [s]
+            (let [a (fork s (fn () (do (pause 20) (swap! done inc) 20)))
+                  b (fork s (fn () (do (swap! done inc) 22)))]
+              (+ @a @b)))]
+    (do (check c (= @done 2))
+        (check c (match r ((Ok v) (= v 42)) ((Err t) false))))))
+
+(defun main () -> i64
+  (let [c (checks)]
+    (do (run c) (clean c) (checks-result c))))

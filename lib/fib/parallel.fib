@@ -1,0 +1,105 @@
+;; fib.parallel: structured parallelism on today's runtime (P-struct of docs/design/parallelism.md 3.2). Explicit: `(:use fib.parallel)`.
+;;
+;;   (cpu-count)                                  workers a call uses by default (fib.parallel.cpu)
+;;   (with-tasks [s] ..) (fork s f)               structured scopes (fib.parallel.scope)
+;;   (pmap f xs) (pmap-n f n) (pfor n f)          chunked, ordered (fib.parallel.pmap), over the engine of fib.parallel.chunks
+;;
+;; The macros live here, in the facade, and name the parts' functions as `fib.parallel/NAME`: a macro's qualified names are
+;; resolved in the module that uses it, which has `(:use fib.parallel)` and nothing of the parts.
+(ns fib.parallel (:use fib.core fib.seq fib.coll)
+  (:export-from fib.parallel.cpu fib.parallel.scope fib.parallel.chunks fib.parallel.pmap fib.parallel.reduce fib.parallel.scan))
+(defmacro with-tasks (spec ... body)
+  (match spec
+    ((Vec items)
+     (if (= (vec-count items) 1)
+         (let ((r (gensym "scope-result")))
+           `(let ((~(vec-nth items 0) (fib.parallel/new-scope)))
+              (let ((~r (do ~@body)))
+                (do (fib.parallel/scope-exit ~(vec-nth items 0)) ~r))))
+         (trap "with-tasks: the spec is [scope]")))
+    (_ (trap "with-tasks: the spec is [scope]"))))
+
+;; Like with-tasks, for a program that wants to handle the trap: `(Ok body-value)` or `(Err (Trap message))`.
+(defmacro try-with-tasks (spec ... body)
+  (match spec
+    ((Vec items)
+     (if (= (vec-count items) 1)
+         (let ((r (gensym "scope-result")))
+           `(let ((~(vec-nth items 0) (fib.parallel/new-scope)))
+              (let ((~r (do ~@body)))
+                (match (fib.parallel/scope-failure ~(vec-nth items 0))
+                  ((some message) (Err (fib.async/Trap message)))
+                  (nil (Ok ~r))))))
+         (trap "try-with-tasks: the spec is [scope]")))
+    (_ (trap "try-with-tasks: the spec is [scope]"))))
+
+;; The per-element forms: the body is a function made INSIDE each chunk, so that no closure of the caller's is shared between the
+;; workers and called once per element. A closure shared by W threads has an atomic count that every call touches: with 8 threads that
+;; is about 60 ns a call instead of 1 (docs/design/parallelism.md 3.2, measured). `(pmap f xs)` with an `f` made by the caller pays that;
+;; `(pmap-each [x xs] body)` does not. The spec is `[x xs]` or `[x xs par]`; `x` names one element in the body.
+;;   (pmap-each [x xs] (* x 2))             a Vec of (* x 2) for each x, in order
+;;   (pmap-range [i n] (* i i))             a Vec of the body for each index in [0, n)
+;;   (pfor-range [i n] (swap! hits inc))    the body for effect (its value is dropped) for each index
+(defmacro pmap-each (spec ... body)
+  (match spec
+    ((Vec items)
+     (if (or (= (vec-count items) 2) (= (vec-count items) 3))
+         (let ((v (gensym "pmap-vec")) (lo (gensym "pmap-lo")) (hi (gensym "pmap-hi"))
+               (p (if (= (vec-count items) 3) (vec-nth items 2) `(fib.parallel/par))))
+           `(let ((~v ~(vec-nth items 1)))
+              (fib.parallel/pmap-chunks ~p (fib.prelude/vec-count ~v)
+                (fn (~lo ~hi) (fib.parallel/map-chunk (fn (~(vec-nth items 0)) (do ~@body)) ~v ~lo ~hi)))))
+         (trap "pmap-each: the spec is [x xs] or [x xs par]")))
+    (_ (trap "pmap-each: the spec is [x xs] or [x xs par]"))))
+
+(defmacro pmap-range (spec ... body)
+  (match spec
+    ((Vec items)
+     (if (or (= (vec-count items) 2) (= (vec-count items) 3))
+         (let ((lo (gensym "pmap-lo")) (hi (gensym "pmap-hi"))
+               (p (if (= (vec-count items) 3) (vec-nth items 2) `(fib.parallel/par))))
+           `(fib.parallel/pmap-chunks ~p ~(vec-nth items 1)
+              (fn (~lo ~hi) (fib.parallel/index-chunk (fn (~(vec-nth items 0)) (do ~@body)) ~lo ~hi))))
+         (trap "pmap-range: the spec is [i n] or [i n par]")))
+    (_ (trap "pmap-range: the spec is [i n] or [i n par]"))))
+
+(defmacro pfor-range (spec ... body)
+  (match spec
+    ((Vec items)
+     (if (or (= (vec-count items) 2) (= (vec-count items) 3))
+         (let ((lo (gensym "pfor-lo")) (hi (gensym "pfor-hi"))
+               (p (if (= (vec-count items) 3) (vec-nth items 2) `(fib.parallel/par))))
+           `(fib.parallel/pfor-chunks ~p ~(vec-nth items 1)
+              (fn (~lo ~hi) (fib.parallel/each-chunk (fn (~(vec-nth items 0)) (do ~@body ())) ~lo ~hi))))
+         (trap "pfor-range: the spec is [i n] or [i n par]")))
+    (_ (trap "pfor-range: the spec is [i n] or [i n par]"))))
+
+;; The reductions' per-element forms, for the same reason as above: the element step is made inside each chunk, so a closure shared by the workers is
+;; called once per chunk. `combine` is called as an operator (`+`, `max`, a function name or a lambda) and is also the combiner of the tree.
+;;   (preduce-each [x xs] + 0.0 (* x x))        the sum of the squares of a Vec
+;;   (preduce-range [i n] + 0.0 (array-get a i))  the sum over the indices [0, n)
+;; The spec is `[x xs]` or `[x xs par]`. The tree is the deterministic one of fib.parallel.reduce.
+(defmacro preduce-each (spec combine init ... body)
+  (match spec
+    ((Vec items)
+     (if (or (= (vec-count items) 2) (= (vec-count items) 3))
+         (let ((v (gensym "preduce-vec")) (lo (gensym "preduce-lo")) (hi (gensym "preduce-hi")) (acc (gensym "preduce-acc"))
+               (z (gensym "preduce-init"))
+               (p (if (= (vec-count items) 3) (vec-nth items 2) `(fib.parallel/par))))
+           `(let ((~v ~(vec-nth items 1)) (~z ~init))
+              (fib.parallel/pfold-chunks ~p (fib.prelude/vec-count ~v) ~combine ~z
+                (fn (~lo ~hi) (fib.parallel/fold-chunk (fn (~acc ~(vec-nth items 0)) (~combine ~acc (do ~@body))) ~z ~v ~lo ~hi)))))
+         (trap "preduce-each: the spec is [x xs] or [x xs par]")))
+    (_ (trap "preduce-each: the spec is [x xs] or [x xs par]"))))
+
+(defmacro preduce-range (spec combine init ... body)
+  (match spec
+    ((Vec items)
+     (if (or (= (vec-count items) 2) (= (vec-count items) 3))
+         (let ((lo (gensym "preduce-lo")) (hi (gensym "preduce-hi")) (acc (gensym "preduce-acc")) (z (gensym "preduce-init"))
+               (p (if (= (vec-count items) 3) (vec-nth items 2) `(fib.parallel/par))))
+           `(let ((~z ~init))
+              (fib.parallel/pfold-chunks ~p ~(vec-nth items 1) ~combine ~z
+                (fn (~lo ~hi) (fib.parallel/fold-index-chunk (fn (~acc ~(vec-nth items 0)) (~combine ~acc (do ~@body))) ~z ~lo ~hi)))))
+         (trap "preduce-range: the spec is [i n] or [i n par]")))
+    (_ (trap "preduce-range: the spec is [i n] or [i n par]"))))
