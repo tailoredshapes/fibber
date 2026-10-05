@@ -196,3 +196,77 @@ GATE PASS (full)        total 331.9 s
 An earlier gate run the same afternoon (also `GATE PASS`) overlapped an edit of `lib/fib/tensor/reduce.fib` and is not counted.
 `scripts/bench/quick.sh` was not run (the lock was held by this package's benchmarks; the hoist changes the emitted code only for loops
 of the shape in section 5).
+
+## 8. Package TP2: matmul, index decode, vector exp (after TP1)
+
+Four library commits on top of TP1 (`lib/fib/tensor`, `scripts/bench/tensor`; no compiler change; stage 2 built by the v0.1.5 seed
+from this tree). Sections 1 to 7 above are the TP1 record and are not rewritten; this section replaces their "after" column.
+
+### 8.1 Table
+
+Same method as section 1 (`run.py`, median of 5, one thread, `flock /tmp/fibsuite.lock`, checksums compared; every row `ok`):
+
+```
+python3 scripts/bench/tensor/run.py --fibc <F> --openblas ~/.cache/fibber-scratch/tp1/ob --tsv rows.tsv
+```
+
+| kernel | numpy | numpy + OpenBLAS | TP1 after | TP2 after | TP2 / numpy | TP2 / OpenBLAS |
+|---|---:|---:|---:|---:|---:|---:|
+| matmul f64 512 | 20.3 | 3.83 | 6.05 | 4.30 | 0.21 | 1.12 |
+| matmul f64 1024 | 191.3 | 30.8 | 46.0 | 31.7 | 0.17 | 1.03 |
+| matmul f64 2048 | 3479 | 247.9 | 453.9 | 285.8 | 0.08 | 1.15 |
+| matmul f32 512 | 10.9 | 2.06 | 3.36 | 1.99 | 0.18 | 0.97 |
+| matmul f32 1024 | 100.6 | 16.4 | 29.0 | 17.8 | 0.18 | 1.09 |
+| matmul f32 2048 | 820.3 | 120.9 | 234.9 | 135.6 | 0.17 | 1.12 |
+| softmax rows 4096x4096 f64 (t/exp) | 117.0 | - | 251.2 | 138.9 | 1.19 | - |
+| layernorm 4096x1024 f64 | 33.3 | - | 32.3 | 38.0 | 1.14 | - |
+| MLP f32 b256 784-512-10 | 9.56 | 1.72 | 5.52 | 3.56 | 0.37 | 2.07 |
+| a*b+c f64 1e7 / f32 1e7 | 21.8 / 10.7 | - | 22.9 / 12.0 | 29.4 / 14.1 | 1.35 / 1.31 | - |
+| a*b+c f64 1e8 | 217.8 | - | 273.6 | 2054 (see below) | 9.4 | - |
+| sum / sum-fast / mean / max 1e8, axis rows, broadcast | | | | within 10% of TP1 except as noted | | |
+
+Reductions and axis rows are unchanged from TP1 (ordered sum 108.9, sum-fast 37.0, mean 114.5, max 138.0, axis 19 to 34 ms,
+broadcast 21.0 ms). The a*b+c rows are slower in this run than in TP1 and are **not** a change of this package: those kernels are the
+untouched SIMD ones, and on the same machine state the **pre-TP2 binary** (built from the TP1 tree before commit 1 of this package)
+gives 2866 ms for a*b+c f64 1e8 against 2749 ms for the TP2 binary (`tm.sh` median of 5, same minute); free memory was 18 GB of 61 GB
+with 17 GB cache, a state in which the 2.4 GB working set is slow (page and huge-page compaction), which TP1 also saw once (section 6).
+Re-measure on an idle machine before reading anything into those rows. The matmul rows were stable across runs (1024 f64: 29.6-33.9 ms).
+
+**Goal (1) met:** every matmul is within 1.15x of OpenBLAS single-thread (target 1.3x). **Not met:** the MLP, 2.07x OpenBLAS: its two products
+are 1.9 ms of the 3.6 ms (micro-timed: 256x784x512 in 1.86 ms, 256x512x10 in 0.07 ms); the rest is the bias add, the relu `where` and a
+broadcast add, which are still the generic elementwise kernels (a `where` and a comparison per element, three passes). Fusing those is not done.
+
+### 8.2 Commits, evidence
+
+1. **Blocked fma GEMM** (`gemm-fma-f64.fib`, `gemm-fma-f32.fib`, linalg dispatch). GotoBLAS loop nest; A packed to 6-row panels and B to 8-column (f64) or
+   16-column (f32) panels, both zero padded, read from the original strides, so views need no copy; the micro-kernel is 6x8 / 6x16 with 12 vector accumulators and
+   `simd/fma`; edge tiles use a scratch tile and the same kernel; blocks 256/512 x 96 x 1024 (tuned: f64 kc 256/384/512 gave 32.1-36.7 ms at 1024, f32 kc 256/512 gave
+   15.1/14.4). **Asm:** the built benchmark's kernel loop is `vfmadd231pd ymm0..ymm11` x 4 unrolled with ymm12-15 for B and the broadcast, no `vmulpd`/`vaddpd` pair
+   in it (`objdump -d -M intel`; the other 42 `vmulpd`/`vaddpd` in the binary are other kernels). Before/after, 1024 f64 49 -> 32 ms, 2048 f64 483 -> 268, 1024 f32 28 -> 14.4, 2048 f32 216 -> 115
+   (`tm.sh`, one run each, mean noise 5%; `scripts/bench/tensor/bench.fib matmul64 1024 6`).
+   **Rounding changes**: an fma rounds once, so f64/f32 `mmul` can differ in the last bits from `mmul-scalar` (README updated). Each output is still one ordered chain
+   (inner index increasing), pinned bit for bit by cases 7077/7078 against `fma-reference`.
+   **Blocker found and handled, not worked around in the compiler:** on a target without hardware FMA (`FIB_TARGET_CPU=x86-64-v2`, which `package.sh` sets for releases) `simd/fma`
+   lowers to a libm `fma` call: the 512 f64 product took **203 ms instead of 6 ms**. `mmul` therefore takes the fma kernels only when `(native-lanes f64) >= 4` (AVX2 and up, a
+   compile-time constant) and the earlier multiply-then-add tiles otherwise (measured at x86-64-v2: 13.7 ms / 7.1 ms for 512 f64 / f32). A target with AVX2 but no FMA does not exist
+   in practice; if it did, it would hit the slow path. The proper fix is in the compiler (lower `simd/fma` to mul+add, or expose a `has-fma` constant); I did not touch it.
+2. **Dense fast path and row walks** for `map-as`, `zip-with`, `copy`, `to-array`, `to-vec`, `mean-axis` (`flat-at` per element is gone from them; `argmax`/`argmin`, `where`
+   and the mask paths still use it). Micro (`scripts/bench/tensor/micro-walk.fib`, 2048x2048 f64, best of 5, before -> after ms): map 28.2 -> 9.6, zip-with 48.5 -> 10.5,
+   copy 23.9 -> 6.9, to-array 23.1 -> 6.0, transposed map 104.9 -> 49.6, transposed zip 140.1 -> 41.6, transposed copy 103.5 -> 48.8, to-vec 1e6 15.6 -> 12.7 (the `conj`
+   dominates). a*b+c and layernorm did not move (they are not on these paths); softmax 255 -> 189 ms. Case 7079 (indexed reads as oracle, 19 views); 8 planted faults all fail it.
+3. **Vector exp, log, tanh** (`fib.tensor.vmath`, `t/exp t/log t/tanh`, f64 and f32). Measured maxima against libm over 1e6 to 2e6 points: **exp 1 ULP, log 2 ULP, tanh 2 ULP (f64),
+   1 ULP (f32)**; documented in the module header and README; case 7080 asserts them (so a worse implementation fails) plus special values and tails; 8 planted faults fail it.
+   Speed, 1e7 f64 exp: map over libm 50.9 ms, `t/exp` 34.0 ms (about 1.5x; memory traffic is about 15 ms of that); softmax 187 -> 145 ms (`softmaxlibm` and `softmax` kernels of
+   `bench.fib`). The gain is smaller than a SIMD library's because 2^k is built by moving each of the four lanes through a scalar `bits->f64`: the language has no vector bitcast
+   (a candidate for the compiler side: `simd/bitcast`), which also costs `log`. Flush-to-zero below -708.396 (libm returns subnormals) is a documented difference.
+4. **`mean-fast`**, ordered-sum contract. `mean` keeps its ordered semantics: using `sum-fast` in it would change results, which the README forbids ("stop and report"), so I did not;
+   `mean-fast` is the offered alternative. Cases 7081/7082.
+
+### 8.3 Not done
+
+- The MLP elementwise stages (bias, relu) are not fused; `where`/`greater` still decode per element. `argmax`, masks, `where`: `flat-at`.
+- No vector bitcast, so exp/log have lane-by-lane scalar steps; an f32-native (8 lane) exp/log/tanh does not exist (f32 goes through f64).
+- Last-axis reductions (2.7-4.5x NumPy), the ordered sum's 4-cycle chain (floor, by contract) and a*b+c / max over 1e8 are as in TP1.
+- The fma-less x86 targets run the old kernels (1.5x slower than the new on this CPU: 1024 f64 49 ms against 32 ms) until the compiler gives `simd/fma` a non-libm lowering there.
+- No other kernel shapes tuned (tall/skinny products, small n, are padded to whole panels: 256x512x10 spends most of its work on zeros).
+- Timing rows for a*b+c are not trustworthy in this run (see 8.1).

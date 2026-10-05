@@ -1,0 +1,49 @@
+;; spec: lib/fib/tensor/README.md (Linear algebra and SIMD): every output of f64 mmul is one fma chain over the inner index in increasing order
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; A fault in the tail tiles, the packing strides, the block continuation (accumulation order) or a sign in an edge tile changes
+;; some bit of some output of these shapes; the data are not dyadic, so rounding order and fma-versus-multiply-add both show.
+(ns main (:require [fib.tensor :as t] [fib.tensor.gemm-fma-f64 :as g]) (:use tl.check))
+
+(defun gen (n: i64 seed: i64) -> (t/Tensor f64)
+  (let ((buf (cell (array n 0.0))))
+    (do (dotimes (i n) (array-set! &buf i (fdiv (double (- (rem (+ (* i 7919) (* seed 104729)) 1013) 500)) 37.0)))
+        (t/from-array [n] @buf 0.0))))
+
+(defun mat (m: i64 n: i64 seed: i64) -> (t/Tensor f64) (t/reshape [m n] (gen (* m n) seed)))
+
+;; the same shape and exactly equal elements (no tolerance)
+(defun same? (x: (t/Tensor f64) y: (t/Tensor f64)) -> bool
+  (and (= (t/shape x) (t/shape y)) (= (t/to-vec x) (t/to-vec y))))
+
+(defun main () -> i64
+  (let ((c (checks)) (ms [1 5 6 7 13 97 110]) (ns [1 7 8 9 17 40]) (ks [1 3 255 257 300]))
+    (do (dotimes (mi (count ms))
+          (dotimes (ni (count ns))
+            (dotimes (ki (count ks))
+              (let ((m (nth ms mi)) (n (nth ns ni)) (k (nth ks ki)) (a (mat m k 1)) (b (mat k n 2)))
+                (check c (same? (t/mmul a b) (g/fma-reference a b)))))))
+        ;; more than one column block (1024 columns), a column block edge
+        (let ((a (mat 7 5 3)) (b (mat 5 1030 4))) (check c (same? (t/mmul a b) (g/fma-reference a b))))
+        ;; strided inputs: transposed, flipped, stepped slices, a view with offset
+        (let ((a (mat 19 23 5)) (b (mat 23 21 6)) (at (t/transpose (mat 23 19 5))) (bt (t/transpose (mat 21 23 6))))
+          (do (check c (same? (t/mmul at b) (g/fma-reference at b)))
+              (check c (same? (t/mmul a bt) (g/fma-reference a bt)))
+              (check c (same? (t/mmul (t/flip 1 a) (t/flip 0 b)) (g/fma-reference (t/flip 1 a) (t/flip 0 b))))
+              (check c (same? (t/mmul (t/flip 0 a) (t/flip 1 b)) (g/fma-reference (t/flip 0 a) (t/flip 1 b))))
+              (let ((sa (t/slice 1 1 23 2 a)) (sb (t/slice 0 1 23 2 b)))
+                (check c (same? (t/mmul sa sb) (g/fma-reference sa sb))))
+              (let ((sa (t/slice 0 3 17 1 a)) (sb (t/slice 1 2 20 3 b)) (sa2 (t/slice 1 0 22 1 sa)) (sb2 (t/slice 0 0 22 1 sb)))
+                (check c (same? (t/mmul sa2 sb2) (g/fma-reference sa2 sb2))))))
+        ;; empty extents
+        (check c (same? (t/mmul (mat 0 5 1) (mat 5 7 2)) (g/fma-reference (mat 0 5 1) (mat 5 7 2))))
+        (check c (same? (t/mmul (mat 4 5 1) (mat 5 0 2)) (g/fma-reference (mat 4 5 1) (mat 5 0 2))))
+        (check c (same? (t/mmul (mat 4 0 1) (mat 0 7 2)) (t/zeros [4 7])))
+        ;; the data discriminate: an fma chain is not the multiply-then-add chain of mmul-scalar
+        (let ((a (mat 40 300 1)) (b (mat 300 40 2)))
+          (check c (not (same? (t/mmul a b) (t/mmul-scalar a b)))))
+        (check c (= (checks-made c) 221))
+        (checks-result c))))

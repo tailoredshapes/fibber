@@ -116,10 +116,22 @@
         (ex (t/map (fn (v: f64) (unsafe (libm/exp v))) (t/sub x m))))
     (t/div ex (t/sum-axis -1 true ex))))
 
-(defun k-softmax (n: i64 runs: i64) -> unit
+;; the same with the library's vector exp
+(defun softmax-vec (x: (t/Tensor f64)) -> (t/Tensor f64)
+  (let ((m (t/maximum-axis -1 true x))
+        (ex (t/exp (t/sub x m))))
+    (t/div ex (t/sum-axis -1 true ex))))
+
+(defun k-softmax-libm (n: i64 runs: i64) -> unit
   (let ((a (make64 [n n] 2)))
     (dotimes (r runs)
       (let ((s (sys-clock-now)) (v (softmax a)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs64 v))))))))
+
+(defun k-softmax (n: i64 runs: i64) -> unit
+  (let ((a (make64 [n n] 2)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (v (softmax-vec a)) (e (- (sys-clock-now) s)))
         (do (println "t " e) (when (= r 0) (println "cs " (cs64 v))))))))
 
 ;; layernorm over the last axis of rows x 1024 (rows = n): (x - mu)/sqrt(var + 1e-5) * gamma + beta
@@ -151,6 +163,19 @@
       (let ((s (sys-clock-now)) (v (mlp x w1 b1 w2 b2)) (e (- (sys-clock-now) s)))
         (do (println "t " e) (when (= r 0) (println "cs " (cs32 v))))))))
 
+;; exp over n elements: the library's vector exp, and a map over libm's scalar exp
+(defun k-expvec (n: i64 runs: i64) -> unit
+  (let ((a (make64 [n] 0)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (v (t/exp a)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs64 v))))))))
+
+(defun k-explibm (n: i64 runs: i64) -> unit
+  (let ((a (make64 [n] 0)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (v (t/map (fn (x: f64) (unsafe (libm/exp x))) a)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs64 v))))))))
+
 (defun main () -> i64
   (let ((k (nth (args) 0)) (n (unwrap (parse-long (nth (args) 1)))) (runs (unwrap (parse-long (nth (args) 2)))))
     (do (cond (= k "matmul64") (k-matmul64 n runs)
@@ -167,6 +192,9 @@
               (= k "max1") (k-axis 3 n runs)
               (= k "bcast") (k-bcast n runs)
               (= k "softmax") (k-softmax n runs)
+              (= k "softmaxlibm") (k-softmax-libm n runs)
+              (= k "expvec") (k-expvec n runs)
+              (= k "explibm") (k-explibm n runs)
               (= k "layernorm") (k-layernorm n runs)
               (= k "mlp") (k-mlp n runs)
               :else (println "unknown kernel " k))

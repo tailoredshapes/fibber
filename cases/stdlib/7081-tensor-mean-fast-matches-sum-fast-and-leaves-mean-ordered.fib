@@ -1,0 +1,31 @@
+;; spec: lib/fib/tensor/README.md (Arithmetic and reductions, Linear algebra and SIMD): mean is the ordered sum over the count; mean-fast is sum-fast over the count
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; mean keeps its ordered semantics: on data where reassociation changes the sum, mean equals the ordered loop and mean-fast equals sum-fast / n,
+;; and the two differ. A mean that used the fast sum, or a mean-fast that used the ordered one, fails one of these.
+(ns main (:require [fib.tensor :as t]) (:use tl.check))
+
+(defun cancelling (n: i64) -> (t/Tensor f64)
+  (let ((buf (cell (array n 0.0))))
+    (do (dotimes (i n) (array-set! &buf i (cond (= (rem i 4) 0) 1.0e16 (= (rem i 4) 1) 1.0 (= (rem i 4) 2) -1.0e16 :else 3.0)))
+        (t/from-array [n] @buf 0.0))))
+
+(defun ordered-mean (x: (t/Tensor f64)) -> f64
+  (let ((v (t/to-vec x)) (n (count v)))
+    (fdiv (loop ((i 0) (s 0.0)) (if (< i n) (recur (+ i 1) (+ s (nth v i))) s)) (double n))))
+
+(defun main () -> i64
+  (let ((c (checks)) (x (cancelling 4096)))
+    (do (check c (= (t/mean x) (ordered-mean x)))
+        (check c (= (t/mean-fast x) (fdiv (t/sum-fast x) 4096.0)))
+        (check c (!= (t/mean x) (t/mean-fast x)))
+        ;; exact data: both agree for every length, tails included
+        (dotimes (len 70)
+          (let ((y (t/from-array [(+ len 1)] (let ((b (cell (array (+ len 1) 0.0)))) (do (dotimes (i (+ len 1)) (array-set! &b i (double (- (rem (* i 5) 13) 6)))) @b)) 0.0)))
+            (check c (= (t/mean-fast y) (t/mean y)))))
+        (check c (= (t/mean-fast (t/transpose (t/reshape [2 3] (t/tensor [1.0 2.0 3.0 4.0 5.0 6.0])))) 3.5))
+        (check c (= (checks-made c) 74))
+        (checks-result c))))

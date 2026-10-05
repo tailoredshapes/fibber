@@ -124,9 +124,20 @@ one numeric dtype. It does not introduce FMA or fuse arbitrary callbacks:
 once per logical output element, in row-major order, and never run on an
 empty output. They may have effects. These kernels are not fused and arbitrary
 callbacks are not automatically SIMD-vectorized.
+`map-as`, `zip-with`, `copy`, `to-array`, `to-vec` and `mean-axis` read a dense
+tensor straight from its buffer (logical element `i` is buffer element
+`offset + i`) and any other layout row by row: outer coordinates are decoded
+once per row and the inner loop advances by a constant stride. Reads stay
+bounds-checked, so a forged descriptor still traps at the first bad read.
 
 `sum`, `prod`, and `fold f initial tensor` are ordered scalar reductions in
-logical row-major order. Empty sums/products return typed zero/one.
+logical row-major order. The order is the contract (a floating-point sum is
+reproducible and equals the loop `acc = acc + x[i]`), so the sum is one chain of
+dependent adds: about one add latency (4 cycles) per element, which is what makes
+it several times slower than `sum-fast` on large inputs. `mean` is that ordered sum
+over the count and stays so; `mean-fast` (`f64`) is `sum-fast` over the count, which
+reassociates like `sum-fast` and can differ from `mean` in the last bits or more
+under cancellation. Empty sums/products return typed zero/one.
 `maximum`, `minimum`, and `mean` trap on empty input; `mean` currently accepts
 `f64`. Integer arithmetic retains Fibber's checked-overflow behavior.
 
@@ -167,16 +178,32 @@ and `mmul` accepts compatible rank-two inputs. They support strided and reversed
 views. Empty inner dimensions produce typed zeros. `mmul-scalar` exposes the
 checked, ordered reference implementation for comparisons.
 
-Floating `mmul` uses 4×8 register tiles for widths at least 32 and 4×4
-for smaller widths, with inner blocks of 128 and output blocks of 64
-(or 32 for packed `f64` panels).
-Strided input materialization copies 32×32 tiles. Matrices with at least 256 rows, 128 inner elements, and 128 columns pack B
-panels directly from original strides into one reusable scratch buffer per call;
-scalar edges cover incomplete tiles. The safe internal tuning interface also
-exposes 8×4 tiles and cache/inner sizes 32, 64, and 128. Integer multiplication
-uses the checked scalar reference. Each output traverses the inner dimension
-in order; no FMA is introduced explicitly. Batched multiplication,
-decompositions, and BLAS integration remain future work.
+Floating `mmul` on a target with a vector of at least four `f64` lanes (AVX2 and
+FMA; `(native-lanes f64)`) runs a blocked kernel in the GotoBLAS shape
+(`gemm-fma-f64`, `gemm-fma-f32`): B is packed per (column block, inner block)
+into panels of 8 columns (`f64`) or 16 (`f32`), A per (row block, inner block)
+into panels of 6 rows, both zero padded to whole panels and read from their
+original strides, so any view is accepted without a copy. The micro-kernel is a
+6x8 (`f64`) or 6x16 (`f32`) tile of twelve vector accumulators updated with
+`simd/fma`, a broadcast of A and two vector loads of B per inner step; an
+incomplete tile at the right or bottom edge goes through a scratch tile and the
+same kernel. Blocks are 256 (`f64`) or 512 (`f32`) inner steps, 96 rows and
+1024 columns. Pointers into the packed buffers are unchecked; shapes and the
+reachable range of both inputs are validated once per call and every buffer is
+sized from the loop bounds.
+**Rounding:** each output is one chain of fused multiply-adds over the inner index
+in increasing order, whatever its tile or block (a block continues the chain
+from C), so `gemm-fma-f64/fma-reference` (a checked scalar loop) gives the same
+bits. An fma rounds once, so the result can differ in the last bits from
+`mmul-scalar` (multiply, then add), which is unchanged. A target without a wide
+vector (SSE: `x86-64`, `x86-64-v2`) has no hardware fma, where an fma is a libm
+call 30 times slower; there `mmul` keeps the earlier multiply-then-add tiles
+(4×8 for widths at least 32 and 4×4 below, inner blocks of 128, output blocks of 64
+or 32 for packed `f64` panels, scalar edges), which the safe tuning interface
+(`gemm-f64/multiply-mode`, 8×4 tiles, sizes 32, 64, 128) also exposes on every target. No cross-target
+bitwise reproducibility is promised. Integer multiplication uses the checked
+scalar reference. Batched multiplication, decompositions, and BLAS integration
+remain future work.
 
 `sum-fast` and `dot-fast` use four independent SIMD accumulators: 32 `f32`
 elements or 16 `f64` elements per unrolled iteration, followed by vector and
@@ -186,6 +213,20 @@ complete reachable range. Addition order differs from ordered reductions, so
 results can differ in the last bits or more on cancellation-sensitive inputs.
 No cross-target bitwise reproducibility is promised. `sum` and `dot` preserve
 ordered scalar semantics.
+
+## Vector exp, log and tanh
+
+`exp`, `log` and `tanh` map an `f64` or `f32` tensor to a fresh tensor of the same
+shape, four lanes at a time, without a libm call (`fib.tensor.vmath`; the constants
+come from `scripts/bench/tensor/gen-vmath.py`). Measured against libm over dense
+sweeps (case 7080, which asserts these bounds): `exp` at most 1 ULP in
+[-708.396, 709.78] (below, the result is flushed to +0.0, where libm returns
+subnormals; above 709.7827 it is +inf), `log` at most 2 ULP over the whole positive
+range including subnormal inputs, `tanh` at most 2 ULP. `f32` is computed in `f64`
+and rounded back, within 1 ULP of `expf`/`logf`/`tanhf`. Special values follow libm:
+NaN in gives NaN, `log 0 = -inf`, `log x<0 = NaN`, `tanh +-inf = +-1`,
+`tanh -0.0 = -0.0`. Results can differ from the scalar libm in the last place. A
+strided input is first made contiguous.
 
 ## Safety and validation
 
