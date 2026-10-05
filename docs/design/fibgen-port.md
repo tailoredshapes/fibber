@@ -132,7 +132,7 @@ the program and `;; model: Err(Budget)` instead of dying; (c) every tool that ru
 
 ### 4.1 RNG: the exact algorithm, written (not stubbed)
 
-`compiler/gen/rng.fib` is real code: SplitMix64 (`state += 0x9E3779B97F4A7C15; z = (z ^ z>>30) * 0xBF58476D1CE4E5B9; z = (z ^ z>>27) * 0x94D049BB133111EB; z ^ z>>31`),
+`lib/fib/rng.fib` (module `fib.rng`, moved from `compiler/gen/rng.fib` on 2026-10-05 so `fib.test.gen` shares the stream) is real code: SplitMix64 (`state += 0x9E3779B97F4A7C15; z = (z ^ z>>30) * 0xBF58476D1CE4E5B9; z = (z ^ z>>27) * 0x94D049BB133111EB; z ^ z>>31`),
 state held as the i64 with the same bits (`unchecked-add`, `unchecked-multiply`, logical `shr`). The one unsigned operation, `u64 % n`, is `rng-umod`: for a negative
 `z` it computes `q = ((z >>> 1) quot n) << 1`, `r = z - q*n` (wrapping), and subtracts `n` once if `r >= n` (valid for `0 < n < 2^62`; every use of `below` has `n` far below that).
 `below`, `range` (`lo + below(max(hi-lo+1, 1))`), `chance` (`below(100) < pct`), `weighted`, `pick-index` follow `rng.rs`. Verified against the Python of the same algorithm for 7 seeds including `-1` and `-2^63`

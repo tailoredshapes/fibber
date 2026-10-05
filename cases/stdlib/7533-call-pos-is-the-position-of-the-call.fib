@@ -1,0 +1,30 @@
+;; spec: docs/design/test-harness.md 6.3; syntax §1.3 (positions survive macro expansion); the core form `(call-pos)`
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; `(call-pos)` is the string "FILE:LINE:COL" of the call, made by the expander. In a macro's template it is the position of the macro CALL (a form
+;; a macro builds carries the position of the macro call), so a macro that stamps `(call-pos)` gives the caller's position: how `expect` reports.
+;; Planted faults (scripts/mutant-call-pos.sh): the column one too high, the line one too high: every check here fails.
+(ns main (:use tl.check) (:require [fib.string :as s]))
+
+(defmacro here () `(call-pos))
+(defmacro twice () `[(call-pos) (here)])
+
+(defun at-suffix? (p: str tail: str) -> bool (s/ends-with? p tail))
+
+(defun main () -> i64
+  (let [c (checks)
+        direct (call-pos)
+        via-macro (here)
+        pair (twice)
+        nested [(call-pos) (here)]]
+    (do (check c (at-suffix? direct "7533-call-pos-is-the-position-of-the-call.fib:19:16"))
+        (check c (at-suffix? via-macro "7533-call-pos-is-the-position-of-the-call.fib:20:19"))
+        (check c (= (nth pair 0) (nth pair 1)))
+        (check c (at-suffix? (nth pair 0) "7533-call-pos-is-the-position-of-the-call.fib:21:14"))
+        (check c (at-suffix? (nth nested 0) "7533-call-pos-is-the-position-of-the-call.fib:22:17"))
+        (check c (at-suffix? (nth nested 1) "7533-call-pos-is-the-position-of-the-call.fib:22:28"))
+        (check c (not (= direct via-macro)))
+        (checks-result c))))

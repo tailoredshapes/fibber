@@ -10,16 +10,16 @@
 ;; the default is the macro runner of macros.runner, which JITs each macro through lair); for `emit-dump` the statuses of
 ;; compiler/emit.fib (0, 1, 2, 3, 70 pending).
 ;; `lsp` serves the language server (lsp.server `lsp-main`, packages L0 to L5) on standard input and output; it takes `-I`.
-;; `cases DIR [--only PREFIX..]` is driver.harness (H1). Not ported (the Rust test harness stays Rust): `itrace`, `gen`: each is refused with status 2.
+;; `test [PATH..] [options]` is driver.test (docs/design/test-harness.md 6). `cases DIR [--only PREFIX..]` is driver.harness (H1). Not ported (the Rust test harness stays Rust): `itrace`, `gen`: each is refused with status 2.
 ;; Build: `fibc build compiler/fibc.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o OUT`, run from the repository root (lair is native.*, fibber over LLVM: no liblair).
 (ns main
   (:require [driver.args :as a] [driver.commands :as c] [driver.native :as native] [expand.roots :as roots] [expand.maker :as mk]
-            [macros.runner :as mr] [driver.harness :as hn] [driver.version :as v] [lsp.server :as lsp]))
+            [macros.runner :as mr] [driver.harness :as hn] [driver.test :as dt] [driver.version :as v] [lsp.server :as lsp]))
 
 (defun refuse (word: str) -> i64
   (do (eprintln (str-join ["fibc: `" word "` is a command of the Rust compiler (the test harness)"])) 2))
 
-(defun dispatch (cmd: a/Command rts: roots/Roots rm: mk/RunnerMaker) -> i64
+(defun dispatch (cmd: a/Command rts: roots/Roots rm: mk/RunnerMaker dirs: (Vec str)) -> i64
   (match cmd
     ((a/CmdRun file trace args opt) (c/cmd-run file trace args opt rts rm))
     ((a/CmdBuild file out dirs libs opt) (c/cmd-build file out dirs libs opt rts rm))
@@ -28,6 +28,7 @@
     ((a/CmdExplain file) (c/cmd-explain file rts rm))
     ((a/CmdLsp) (lsp/lsp-main rts))
     ((a/CmdCases dir only jobs) (hn/cmd-cases dir only jobs))
+    ((a/CmdTest words) (dt/cmd-test words dirs))
     ((a/CmdHarness word) (refuse word))
     ((a/CmdHelp) (do (println a/usage) 0))
     ((a/CmdVersion) (do (println (v/version-line)) 0))
@@ -52,4 +53,4 @@
         (cmd (a/parse (. split rest))))
     (if (and (not (empty? (. split dirs))) (not (a/takes-roots? cmd)))
         (do (eprintln (str-join ["fibc: -I belongs to a command that reads a program\n" a/usage])) 2)
-        (dispatch cmd (roots/roots-from-env (. split dirs) (native/getenv-opt "FIB_LIB")) (mr/maker-for (. nr no-runner))))))
+        (dispatch cmd (roots/roots-from-env (. split dirs) (native/getenv-opt "FIB_LIB")) (mr/maker-for (. nr no-runner)) (. split dirs)))))

@@ -1,15 +1,19 @@
-;; compiler/gen/rng.fib: SplitMix64, as crates/fibgen/src/rng.rs (seed-1). OWNER: G0 (real, not a stub: it is the determinism contract and one
-;; page long). The state is one u64 held as the i64 with the same bits: fibber has no unsigned type, so the wrapping family does the
-;; arithmetic (`unchecked-add`, `unchecked-multiply`), `shr` is the logical shift, and the one unsigned operation, `u64 % n`, is
-;; `rng-umod`. Checked against compiler/tests/golden/gen/rng.tsv by compiler/tests/gen/rng-check.fib.
-(ns gen.rng)
+;; fib.rng: SplitMix64, a seeded pseudo-random stream (not for secrets: `fib.os` `random-bytes` is the entropy source). The ONE stream of the
+;; project: fibgen (compiler/gen, which must draw exactly as crates/fibgen/src/rng.rs did: the corpus in compiler/tests/golden/gen is the oracle) and
+;; fib.test.gen (the seeds a failing property prints) both `:use` it, so a seed means one sequence in both. Moved here from compiler/gen/rng.fib
+;; because the library cannot depend on compiler/ and fibgen should not depend on a test library; it is a library facility of its own.
+;; The state is one u64 held as the i64 with the same bits: fibber has no unsigned type, so the wrapping family does the arithmetic
+;; (`unchecked-add`, `unchecked-multiply`), `shr` is the logical shift, and the one unsigned operation, `u64 % n`, is `rng-umod`. Checked against
+;; compiler/tests/golden/gen/rng.tsv by compiler/tests/gen/rng-check.fib. A change of any constant, shift or draw order changes every seed's
+;; stream: fibgen's manifests and every replay seed in a report would change with it.
+(ns fib.rng (:use fib.core fib.seq fib.coll))
 
-(defstruct FgRng (state: (Cell i64)))
+(defstruct Rng (state: (Cell i64)))
 
-(defun rng-new (seed: i64) -> FgRng (FgRng (cell seed)))
+(defun rng-new (seed: i64) -> Rng (Rng (cell seed)))
 
 ;; The next 64 random bits (as the i64 with those bits).
-(defun rng-next (r: FgRng) -> i64
+(defun rng-next (r: Rng) -> i64
   (let ((s (unchecked-add @(. r state) -7046029254386353131)))
     (do (set! (. r state) s)
         (let ((z1 (unchecked-multiply (bit-xor s (shr s 30)) -4658895280553007687))
@@ -25,21 +29,21 @@
         (if (>= r n) (- r n) r))))
 
 ;; A number in 0..n; 0 when n is 0 (Rng::below).
-(defun rng-below (r: FgRng n: i64) -> i64
+(defun rng-below (r: Rng n: i64) -> i64
   (if (= n 0) 0 (rng-umod (rng-next r) n)))
 
 ;; A number in lo..=hi (Rng::range).
-(defun rng-range (r: FgRng lo: i64 hi: i64) -> i64
+(defun rng-range (r: Rng lo: i64 hi: i64) -> i64
   (let ((span (max (+ (- hi lo) 1) 1)))
     (+ lo (rng-below r span))))
 
 ;; True with probability pct percent (Rng::chance). The draw is made even when pct is 0 or 100.
-(defun rng-chance (r: FgRng pct: i64) -> bool
+(defun rng-chance (r: Rng pct: i64) -> bool
   (< (rng-below r 100) pct))
 
 ;; The index chosen with probability proportional to its weight, or nil when every weight is zero (Rng::weighted).
 ;; No draw is made when the total is zero.
-(defun rng-weighted (r: FgRng weights: (Vec i64)) -> (Option i64)
+(defun rng-weighted (r: Rng weights: (Vec i64)) -> (Option i64)
   (let ((total (reduce + 0 weights)))
     (if (= total 0)
         nil
@@ -49,5 +53,5 @@
               (recur (+ i 1) (- x (vec-nth weights i))))))))
 
 ;; Rng::pick over a collection of n elements: the index of the one picked, nil when n is 0 (no draw is made then). Callers index their vector.
-(defun rng-pick-index (r: FgRng n: i64) -> (Option i64)
+(defun rng-pick-index (r: Rng n: i64) -> (Option i64)
   (if (= n 0) nil (some (rng-below r n))))

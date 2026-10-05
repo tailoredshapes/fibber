@@ -107,6 +107,12 @@ macro expansion: a form produced by a macro carries the position of the
 macro call, unless the macro built it from an input form, which keeps
 its own. Every compile error names a position. (**Decided**.)
 
+`(call-pos)` (no operands) is a form the expander replaces by the string literal `"FILE:LINE:COL"` of the form itself, `FILE` as the compiler was
+given it, `LINE` and `COL` 1-based as in the first paragraph. In a macro's template it is therefore the position of the *call of that macro*
+(the form a macro builds carries the call's position); a macro that puts `(call-pos)` in its template reports where it was used, which is how
+`fib.test`'s `expect` prints `file:line:col`. A function or local named `call-pos` hides the form. It is not in the type checker's builtin
+table: no later pass sees it. (Case 7533, `scripts/mutant-call-pos.sh`.)
+
 ### 1.4 Literal collections are library calls
 
 `[e ...]` and `{k v ...}` in expression position are not core forms. After

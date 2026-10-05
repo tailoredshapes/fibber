@@ -1,0 +1,321 @@
+;; compiler/driver/test.fib: `fibc test [PATH..] [--only SUBSTR] [--seed N] [--jobs N] [--format plain|tap|json] [--list] [--isolate MODE]
+;; [--timeout SECS]` (docs/design/test-harness.md 6). A spec file is a program whose `main` calls `fib.test.run/run-main` over its suites (it
+;; takes the options after `--`). A PATH is a spec file, or a directory searched for files named `*-spec.fib` (at any depth, in name order);
+;; with no PATH, `specs`. Each spec file is run as `fibc run [-I DIR..] FILE -- OPTIONS` in a child process (this very executable, through
+;; the JIT: no second build step, and `run` returns the exit status of `main`), its standard output and error in files; the counts
+;; are read from its report, and the reports are put together: plain (each file's report under `== FILE`, then a total line), tap (one plan,
+;; the lines renumbered) or json (the schema of 6.3 with a `files` array and the results of all files).
+;; Exit status: 0 every selected scenario held; 1 a scenario failed, trapped or timed out, or a spec process died; 2 a usage error, a PATH that
+;; cannot be read, no spec file, a spec that does not compile, or nothing selected anywhere ("a run with nothing to run is not a pass").
+;; `--jobs N`: with several files, N files at a time and each file's scenarios one at a time; with one file, its scenarios N at a time.
+;; A file with no scenario matching `--only` is not an error while another file has one: its child says so with status 2 and
+;; "no scenario matches" on standard error, which is what this module reads.
+(ns driver.test
+  (:require [fib.string :as s] [driver.proc :as p] [driver.native :as native])
+  (:use expand.roots))
+
+(def spec-suffix: str "-spec.fib")
+(def default-dir: str "specs")
+(def file-limit-secs: i64 900)
+
+;; What the command line asked for; words that go to each spec's `main` are in `passed`.
+(defstruct TestOpts (paths: (Vec str) only: str seed: i64 jobs: i64 format: str list: bool isolate: str timeout: str))
+
+(defun flag-value? :private (w: str) -> bool
+  (some? (first (filter (fn (f: str) (= f w)) ["--only" "--seed" "--jobs" "-j" "--format" "--isolate" "--timeout"]))))
+
+(defun positive :private (text: str flag: str) -> (Result i64 str)
+  (match (parse-long text)
+    (nil (Err (str flag " wants a whole number")))
+    ((some n) (if (> n 0) (Ok n) (Err (str flag " wants a number of at least 1"))))))
+
+;; The options of `test`'s words (after `test`). Err is the usage message.
+(defun parse-test (words: (Vec str)) -> (Result TestOpts str)
+  (loop ((i 0) (o (TestOpts [] "" 1 1 "plain" false "" "")))
+    (if (>= i (count words))
+        (cond (not (or (= (. o format) "plain") (or (= (. o format) "tap") (= (. o format) "json")))) (Err "--format is plain, tap or json")
+              (not (or (= (. o isolate) "") (or (= (. o isolate) "task") (or (= (. o isolate) "fork") (= (. o isolate) "none"))))) (Err "--isolate is task, fork or none")
+              :else (Ok o))
+        (let ((w (nth words i))
+              (v (if (< (+ i 1) (count words)) (nth words (+ i 1)) "")))
+          (cond (and (flag-value? w) (>= (+ i 1) (count words))) (Err (str w " wants a value"))
+                (= w "--only") (recur (+ i 2) (TestOpts (. o paths) v (. o seed) (. o jobs) (. o format) (. o list) (. o isolate) (. o timeout)))
+                (= w "--seed") (match (parse-long v)
+                                 (nil (Err "--seed wants a whole number"))
+                                 ((some n) (recur (+ i 2) (TestOpts (. o paths) (. o only) n (. o jobs) (. o format) (. o list) (. o isolate) (. o timeout)))))
+                (or (= w "--jobs") (= w "-j")) (match (positive v w)
+                                 ((Err m) (Err m))
+                                 ((Ok n) (recur (+ i 2) (TestOpts (. o paths) (. o only) (. o seed) n (. o format) (. o list) (. o isolate) (. o timeout)))))
+                (= w "--format") (recur (+ i 2) (TestOpts (. o paths) (. o only) (. o seed) (. o jobs) v (. o list) (. o isolate) (. o timeout)))
+                (= w "--isolate") (recur (+ i 2) (TestOpts (. o paths) (. o only) (. o seed) (. o jobs) (. o format) (. o list) v (. o timeout)))
+                (= w "--timeout") (match (positive v w)
+                                 ((Err m) (Err m))
+                                 ((Ok _) (recur (+ i 2) (TestOpts (. o paths) (. o only) (. o seed) (. o jobs) (. o format) (. o list) (. o isolate) v))))
+                (= w "--list") (recur (+ i 1) (TestOpts (. o paths) (. o only) (. o seed) (. o jobs) (. o format) true (. o isolate) (. o timeout)))
+                (starts-with? w "-") (Err (str "unknown option " w))
+                :else (recur (+ i 1) (TestOpts (conj (. o paths) w) (. o only) (. o seed) (. o jobs) (. o format) (. o list) (. o isolate) (. o timeout))))))))
+
+;; ---- finding the spec files --------------------------------------------------------------------------------------------------------
+
+;; The spec files under `path`: itself when it is a file, else every `*-spec.fib` below it. Err names a path that cannot be read.
+(defun spec-files-in (path: str) -> (Result (Vec str) str)
+  (if (some? (read-file path))
+      (Ok [path])
+      (match (p/list-dir path)
+        (nil (Err (str "cannot read " path)))
+        ((some es)
+         (loop ((rest (vec (sort-by (fn (e: p/Entry) (. e name)) es))) (out []))
+           (if (empty? rest)
+               (Ok out)
+               (let ((e (nth rest 0))
+                     (full (path-join path (. e name))))
+                 (cond (and (. e dir) (not (s/ends-with? (. e name) ".fib")))
+                         (match (spec-files-in full) ((Err m) (Err m)) ((Ok fs) (recur (vec (drop 1 rest)) (into out fs))))
+                       (s/ends-with? (. e name) spec-suffix) (recur (vec (drop 1 rest)) (conj out full))
+                       :else (recur (vec (drop 1 rest)) out)))))))))
+
+(defun spec-files (paths: (Vec str)) -> (Result (Vec str) str)
+  (loop ((rest (if (empty? paths) [default-dir] paths)) (out []))
+    (if (empty? rest)
+        (if (empty? out) (Err (str "no spec files (*" spec-suffix ") found")) (Ok out))
+        (match (spec-files-in (nth rest 0))
+          ((Err m) (Err m))
+          ((Ok fs) (recur (vec (drop 1 rest)) (into out fs)))))))
+
+;; ---- running them -------------------------------------------------------------------------------------------------------------------
+
+;; What a spec file's process came to.
+(defstruct FileRun (file: str status: i64 out: str err: str))
+
+;; The words after `--` that a spec's `main` reads.
+(defun passed (o: TestOpts child-jobs: i64) -> (Vec str)
+  (into (into (into ["--format" (. o format) "--seed" (show (. o seed)) "-j" (show child-jobs)]
+                    (if (= (. o only) "") [] ["--only" (. o only)]))
+              (if (. o list) ["--list"] []))
+        (into (if (= (. o isolate) "") [] ["--isolate" (. o isolate)])
+              (if (= (. o timeout) "") [] ["--timeout" (. o timeout)]))))
+
+(defun child-argv :private (file: str dirs: (Vec str) args: (Vec str)) -> (Vec str)
+  (into (conj (reduce (fn (acc: (Vec str) d: str) (conj (conj acc "-I") d)) ["fibc" "run"] dirs) file) (into ["--"] args)))
+
+(defstruct Split (body: str result: (Option i64)))
+
+;; `fibc run` ends 0 and prints what `main` returned as the last line of standard output (cli.sh: "run prints main's result and exits 0"):
+;; the report is the text before that line, the spec's own exit value the number.
+(defun split-result :private (out: str) -> Split
+  (let ((lines (s/split-lines out)))
+    (if (empty? lines)
+        (Split "" nil)
+        (let ((last (nth lines (- (count lines) 1))))
+          (Split (str-join (mapv (fn (l: str) (str l "\n")) (vec (take (- (count lines) 1) lines)))) (parse-long (s/trim last)))))))
+
+(defun file-of-child :private (file: str out: str err: str status: i64) -> FileRun
+  (let ((so (unwrap-or (read-file out) ""))
+        (se (unwrap-or (read-file err) "")))
+    (do (p/remove-file out) (p/remove-file err)
+        (if (= status 0)
+            (let ((sp (split-result so)))
+              (match (. sp result)
+                (nil (FileRun file 134 so (str se "no result line from main")))
+                ((some r) (FileRun file r (. sp body) se))))
+            (FileRun file status so se)))))
+
+;; The runs of `files`, in order, `jobs` processes at a time.
+(defun run-files (files: (Vec str) dirs: (Vec str) args: (Vec str) tmp: str jobs: i64) -> (Vec FileRun)
+  (let ((runs (loop ((next 0) (running {}) (done {}))
+                (cond (and (< next (count files)) (< (count running) jobs))
+                        (let ((out (str tmp "/" next "-out"))
+                              (err (str tmp "/" next "-err"))
+                              (pid (p/spawn-start (child-argv (nth files next) dirs args) out err file-limit-secs)))
+                          (if (< pid 0)
+                              (recur (+ next 1) running (assoc done next (FileRun (nth files next) -1 "" "cannot start a process")))
+                              (recur (+ next 1) (assoc running pid (Pair next (Pair out err))) done)))
+                      (empty? running) done
+                      :else (let ((e (p/wait-any)))
+                              (match (get running (. e pid))
+                                (nil (recur next (if (< (. e pid) 0) {} running) done))
+                                ((some slot)
+                                 (recur next (dissoc running (. e pid))
+                                        (assoc done (. slot fst) (file-of-child (nth files (. slot fst)) (. (. slot snd) fst) (. (. slot snd) snd) (. e status)))))))))))
+    (mapv (fn (i: i64) (unwrap-or (get runs i) (FileRun (nth files i) -1 "" "its process was lost"))) (range (count files)))))
+
+;; ---- reading a report ----------------------------------------------------------------------------------------------------------------
+
+(defstruct Tally (total: i64 pass: i64 fail: i64 trap: i64 timeout: i64))
+
+(def no-tally: Tally (Tally 0 0 0 0 0))
+
+(defun add-tally :private (a: Tally b: Tally) -> Tally
+  (Tally (+ (. a total) (. b total)) (+ (. a pass) (. b pass)) (+ (. a fail) (. b fail)) (+ (. a trap) (. b trap)) (+ (. a timeout) (. b timeout))))
+
+;; The whole number after `key` in `text`, 0 when there is none.
+(defun number-after :private (text: str key: str) -> i64
+  (match (s/index-of text key)
+    (nil 0)
+    ((some i) (let ((from (+ i (str-len key)))
+                    (to (loop ((j from)) (if (and (< j (str-len text)) (>= (str-byte-at text j) 48i8) (<= (str-byte-at text j) 57i8)) (recur (+ j 1)) j))))
+                (unwrap-or (parse-long (str-slice text from to)) 0)))))
+
+(defun tally-json :private (out: str) -> Tally
+  (Tally (number-after out "\"total\":") (number-after out "\"pass\":") (number-after out "\"fail\":") (number-after out "\"trap\":") (number-after out "\"timeout\":")))
+
+(defun count-lines :private (out: str prefix: str) -> i64
+  (count (filter (fn (l: str) (starts-with? l prefix)) (s/split-lines out))))
+
+(defun tally-tap :private (out: str) -> Tally
+  (let ((ok (count-lines out "ok "))
+        (bad (count-lines out "not ok ")))
+    (Tally (+ ok bad) ok (- bad (+ (count-lines-with out " # trap") (count-lines-with out " # timeout")))
+           (count-lines-with out " # trap") (count-lines-with out " # timeout"))))
+
+(defun count-lines-with :private (out: str needle: str) -> i64
+  (count (filter (fn (l: str) (and (starts-with? l "not ok ") (some? (s/index-of l needle)))) (s/split-lines out))))
+
+;; The summary line of a plain report: `N scenarios: A pass, B fail, C trap, D timeout (seed S)`.
+(defun tally-plain :private (out: str) -> Tally
+  (match (first (filter (fn (l: str) (and (some? (s/index-of l " scenarios: ")) (some? (s/index-of l " timeout (seed")))) (s/split-lines out)))
+    (nil no-tally)
+    ((some l) (Tally (number-after l "") (number-after l ": ") (number-after l " pass, ") (number-after l " fail, ") (number-after l " trap, ")))))
+
+(defun tally-of :private (format: str out: str) -> Tally
+  (cond (= format "json") (tally-json out)
+        (= format "tap") (tally-tap out)
+        :else (tally-plain out)))
+
+;; ---- what a spec process's end means -----------------------------------------------------------------------------------------------
+
+;; Ran: the report is a report (status 0 or 1); NoMatch: `--only` selected nothing in this file; Error: it did not compile or was refused
+;; (status 2 to 5 of `run`: usage, rejected, unsupported, lair); Died: it ended some other way (a signal, a fatal runtime error, the alarm).
+(defenum Outcome (Ran) (NoMatch) (Error) (Died))
+
+(defun outcome-of :private (r: FileRun) -> Outcome
+  (cond (or (= (. r status) 0) (= (. r status) 1)) Ran
+        (and (= (. r status) 2) (some? (s/index-of (. r err) "no scenario matches"))) NoMatch
+        (and (>= (. r status) 2) (<= (. r status) 5)) Error
+        :else Died))
+
+(defun outcome-name :private (o: Outcome) -> str
+  (match o ((Ran) "ran") ((NoMatch) "no-match") ((Error) "error") ((Died) "died")))
+
+(defun tally-run :private (r: FileRun format: str list: bool) -> Tally
+  (match (outcome-of r) ((Ran) (if list no-tally (tally-of format (. r out)))) (_ no-tally)))
+
+(defun total-of :private (rs: (Vec FileRun) format: str list: bool) -> Tally
+  (reduce (fn (a: Tally r: FileRun) (add-tally a (tally-run r format list))) no-tally rs))
+
+(defun count-outcome :private (rs: (Vec FileRun) which: str) -> i64
+  (count (filter (fn (r: FileRun) (= (outcome-name (outcome-of r)) which)) rs)))
+
+;; The status of the whole run.
+(defun exit-of :private (rs: (Vec FileRun) o: TestOpts) -> i64
+  (let ((t (total-of rs (. o format) (. o list)))
+        (ran (count-outcome rs "ran")))
+    (cond (> (count-outcome rs "error") 0) 2
+          (and (. o list) (> ran 0)) 0
+          (= ran 0) 2
+          (or (> (. t fail) 0) (> (+ (. t trap) (. t timeout)) 0) (> (count-outcome rs "died") 0)) 1
+          :else 0)))
+
+;; The last lines of a stream, for a process that did not make a report.
+(defun tail-lines :private (text: str n: i64) -> str
+  (let ((ls (filter (fn (l: str) (not (= l ""))) (s/split-lines text))))
+    (str-join (mapv (fn (l: str) (str "  " l "\n")) (vec (drop (max 0 (- (count ls) n)) ls))))))
+
+;; ---- the three reports --------------------------------------------------------------------------------------------------------------
+
+(defun file-head :private (r: FileRun many: bool) -> str
+  (if many (str "== " (. r file) "\n") ""))
+
+(defun plain-of-run :private (r: FileRun many: bool) -> str
+  (match (outcome-of r)
+    ((Ran) (str (file-head r many) (. r out)))
+    ((NoMatch) "")
+    ((Error) (str "== " (. r file) "\n  ERROR: " (if (= (. r status) 3) "does not compile" "cannot be run") " (status " (. r status) ")\n" (tail-lines (. r err) 12)))
+    ((Died) (str "== " (. r file) "\n  DIED: the spec process ended with status " (. r status) "\n" (tail-lines (. r err) 12)))))
+
+(defun total-line :private (t: Tally rs: (Vec FileRun) seed: i64) -> str
+  (str "\ntotal: " (. t total) " scenarios: " (. t pass) " pass, " (. t fail) " fail, " (. t trap) " trap, " (. t timeout) " timeout in "
+       (count-outcome rs "ran") " spec files (seed " seed ")\n"))
+
+(defun plain-report :private (rs: (Vec FileRun) o: TestOpts) -> str
+  (let ((many (> (count rs) 1)))
+    (str (str-join (mapv (fn (r: FileRun) (plain-of-run r many)) rs))
+         (if (. o list) "" (total-line (total-of rs (. o format) false) rs (. o seed))))))
+
+(defun jstr :private (text: str) -> str
+  (str "\"" (str-join (mapv (fn (c: char) (cond (= c \") "\\\"" (= c \\) "\\\\" (= c \newline) "\\n" (= c \tab) "\\t" (< (char->i32 c) 32i32) " " :else (str c))) (vec (s/chars text)))) "\""))
+
+;; The text of a json report's `results` array, without the brackets.
+(defun results-of :private (out: str) -> str
+  (match (s/index-of out "\"results\":[")
+    (nil "")
+    ((some i) (str-slice out (+ i 11) (max (+ i 11) (- (str-len (s/trimr out)) 2))))))
+
+(defun json-report :private (rs: (Vec FileRun) o: TestOpts) -> str
+  (let ((t (total-of rs "json" false)))
+    (str "{\"schema\":1,\"seed\":" (. o seed) ",\"summary\":{\"total\":" (. t total) ",\"pass\":" (. t pass) ",\"fail\":" (. t fail)
+         ",\"trap\":" (. t trap) ",\"timeout\":" (. t timeout) "},\"files\":["
+         (str-join (vec (interpose "," (mapv (fn (r: FileRun) (str "{\"file\":" (jstr (. r file)) ",\"status\":" (. r status) ",\"outcome\":\"" (outcome-name (outcome-of r)) "\"}")) rs))))
+         "],\"results\":["
+         (str-join (vec (interpose "," (filter (fn (x: str) (not (= x "")))
+                                               (mapv (fn (r: FileRun) (match (outcome-of r) ((Ran) (results-of (. r out))) (_ ""))) rs)))))
+         "]}\n")))
+
+;; `ok 3 - id` as `ok N - id`: the line after its prefix without the number it had.
+(defun renumbered :private (l: str prefix: str n: i64) -> str
+  (let ((rest (str-slice l (str-len prefix) (str-len l))))
+    (str prefix n (match (s/index-of rest " ") (nil "") ((some i) (str-slice rest i (str-len rest)))))))
+
+(defun tap-lines :private (r: FileRun) -> (Vec str)
+  (vec (filter (fn (l: str) (not (or (starts-with? l "TAP version") (or (starts-with? l "1..") (starts-with? l "# seed ")))))
+               (s/split-lines (. r out)))))
+
+;; TAP: one plan, the `ok` and `not ok` lines of every file numbered afresh, the `#` lines kept.
+(defun tap-body :private (rs: (Vec FileRun)) -> (Pair str i64)
+  (reduce (fn (acc: (Pair str i64) r: FileRun)
+            (match (outcome-of r)
+              ((Ran)
+               (reduce (fn (a: (Pair str i64) l: str)
+                         (cond (starts-with? l "ok ") (Pair (str (. a fst) (renumbered l "ok " (+ (. a snd) 1)) "\n") (+ (. a snd) 1))
+                               (starts-with? l "not ok ") (Pair (str (. a fst) (renumbered l "not ok " (+ (. a snd) 1)) "\n") (+ (. a snd) 1))
+                               :else (Pair (str (. a fst) l "\n") (. a snd))))
+                       acc (tap-lines r)))
+              (_ acc)))
+          (Pair "" 0) rs))
+
+(defun tap-report :private (rs: (Vec FileRun) o: TestOpts) -> str
+  (let ((b (tap-body rs)))
+    (str "TAP version 13\n1.." (. b snd) "\n# seed " (. o seed) "\n" (. b fst)
+         (str-join (mapv (fn (r: FileRun) (match (outcome-of r) ((Ran) "") (_ (plain-of-run r true)))) (filter (fn (r: FileRun) (not (= (outcome-name (outcome-of r)) "no-match"))) rs))))))
+
+;; ---- the command ---------------------------------------------------------------------------------------------------------------------
+
+(defun report-text :private (rs: (Vec FileRun) o: TestOpts) -> str
+  (cond (= (. o format) "json") (json-report rs o)
+        (= (. o format) "tap") (tap-report rs o)
+        :else (plain-report rs o)))
+
+(defun usage-error :private (m: str) -> i64
+  (do (eprintln (str "fibc test: " m)) 2))
+
+(defun run-all :private (files: (Vec str) dirs: (Vec str) o: TestOpts tmp: str) -> i64
+  (let ((many (> (count files) 1))
+        (rs (run-files files dirs (passed o (if many 1 (. o jobs))) tmp (if many (. o jobs) 1))))
+    (do (p/remove-dir tmp)
+        (let ((w (native/write-stdout (report-text rs o)))
+              (code (exit-of rs o)))
+          (do (when (and (= code 2) (= (count-outcome rs "ran") 0) (= (count-outcome rs "error") 0))
+                (eprintln "fibc test: no scenario matches in any spec file; a run with nothing to run is not a pass"))
+              (if (= w 0) code w))))))
+
+;; `test [PATH..] [options]`; `dirs` are the `-I` directories of the command line, passed on to each spec's compile.
+(defun cmd-test (words: (Vec str) dirs: (Vec str)) -> i64
+  (match (parse-test words)
+    ((Err m) (usage-error m))
+    ((Ok o)
+     (match (spec-files (. o paths))
+       ((Err m) (usage-error m))
+       ((Ok files)
+        (match (p/make-temp-dir (unwrap-or (native/getenv-opt "TMPDIR") "/tmp"))
+          (nil (usage-error "cannot make a scratch directory"))
+          ((some tmp) (run-all files dirs o tmp))))))))

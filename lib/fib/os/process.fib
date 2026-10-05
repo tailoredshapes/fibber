@@ -1,5 +1,5 @@
-(ns fib.os.process (:use fib.os.errors)
-  (:require [fib.os.native :as n] [fib.os.backend :as b]))
+(ns fib.os.process (:use fib.core fib.seq fib.coll fib.os.errors)
+  (:require [fib.os.native :as n] [fib.os.backend :as b] [fib.os.files :as files] [fib.os.time :as time] [fib.string :as s]))
 (extern getpid :private () -> i32)
 (extern getppid :private () -> i32)
 (extern getcwd :private (ptr i64) -> ptr)
@@ -30,3 +30,108 @@
   (if (not (n/valid-text? path)) (Err (invalid-input "chdir" "NUL in path"))
     (let [text (n/c-text path) result (unsafe (chdir text)) saved (n/errno)]
       (unsafe (do (free text) (if (< result 0i32) (Err (error-from-code saved "chdir")) (Ok ())))))))
+
+;; ---- fork: a closure run in a child process (docs/design/test-harness.md §5, exceptions.md §8) ------------------------------------
+;; The narrowest safe form of fork. The child is a copy of this process that runs ONE closure and `_exit`s: it never returns into the
+;; caller's frames, runs no `at-exit` work and no memory audit (the parent's audit judges the parent's objects), and what it allocates
+;; dies with it. Reference counts are copies, so nothing the child does to an object is seen by the parent; that is the point.
+;; What it is for: a hang (`alarm`, status 142), a crash the process cannot survive (stack exhaustion, a signal) and a scenario that must
+;; not share memory. An ordinary trap is better isolated by a task (`fib.async/try-join`): no process, no files.
+;; THREADS. POSIX keeps only the calling thread in the child, so a lock another thread held stays locked forever and the run queue's
+;; workers are gone: a `spawn` or `async` in the child would wait for a worker that does not exist. `fork-start` therefore REFUSES
+;; (an `Err`) while this process has another thread, as /proc/self/status counts them. A finished `spawn`ed task's thread is detached
+;; and gone, so fork after `try-join` works; the pool's workers, once an `async` has started them, stay for good, so fork before
+;; the first `async`. Where /proc is absent (macOS) the count is unknown and fork is allowed: the guard is then the caller's.
+;; The closure's value (a str) is the child's result: written to a file of `dir` (named by `tag`), as are its standard output and error.
+(extern fork :private () -> i32)
+(extern dup2 :private (i32 i32) -> i32)
+(extern creat :private (ptr i32) -> i32)
+(extern waitpid :private (i32 ptr i32) -> i32)
+(extern _exit :private (i32) -> unit)
+(extern alarm :private (i32) -> i32)
+
+;; The threads of this process, from /proc/self/status; nil where that cannot be read.
+(defun thread-count () -> (Option i64)
+  (match (read-file "/proc/self/status")
+    (nil nil)
+    ((some text)
+     (match (str-find text "Threads:" 0)
+       (nil nil)
+       ((some i) (let [rest (str-slice text (+ i 8) (str-len text))
+                       line (str-slice rest 0 (unwrap-or (str-find rest "\n" 0) (str-len rest)))]
+                   (parse-long (s/trim line))))))))
+
+;; A forked child: its process id and the files it writes (`dir/tag.res`, `.out`, `.err`).
+(defstruct ForkChild (pid: i64 base: str))
+;; What a finished child came to: `status` is its exit code, or 128 plus the signal that killed it (a trap is SIGABRT, 134; the alarm 142);
+;; `result` the closure's value (nil if the child left none: it trapped, was killed or hung), and its standard output and error.
+(defstruct Forked (status: i64 timed-out: bool result: (Option str) out: str err: str))
+(defstruct ChildEnded (pid: i64 status: i64))
+
+;; In the child: standard output and error to the files the parent named, the alarm, the closure, its value to the result file, out.
+;; The child allocates nothing before its own standard error exists: under FIB_TRACE the parent's trace would see its allocations
+;; under ordinals the parent also uses, so the paths are made in the parent.
+(defun child-run :private (f: (fn () str) outp: ptr errp: ptr res: str secs: i64) -> i64
+  (unsafe
+    (let [fo (creat outp 384i32) fe (creat errp 384i32)]
+      (do (dup2 fo 1i32) (dup2 fe 2i32)
+          (when (> secs 0) (alarm (trunc i32 secs)))
+          (write-file res (f))
+          (_exit 0i32)
+          0))))
+
+(defun threaded? :private () -> bool
+  (loop [tries 0]
+    (match (thread-count)
+      (nil false)
+      ((some n) (cond (<= n 1) false
+                      (>= tries 50) true
+                      :else (do (time/sleep-ns 1000000) (recur (+ tries 1))))))))
+
+;; Starts `f` in a child process; `tag` names its files under `dir` (which must exist). `secs` > 0 kills it with SIGALRM after that
+;; long (0: no limit). A thread that has just finished may still be leaving: the count is asked again for up to 50 ms. An Err when this process has other threads (see above) or the fork failed.
+(defun fork-start (dir: str tag: str secs: i64 f: (fn () str)) -> (Result ForkChild OSError)
+  (if (threaded?)
+      (Err (invalid-input "fork" "this process has other threads; fork before the first async, or after the tasks have been joined"))
+      (let [base (str dir "/" tag)
+            outp (n/c-text (str base ".out"))
+            errp (n/c-text (str base ".err"))
+            res (str base ".res")
+            pid (unsafe (fork))]
+        (cond (< pid 0i32) (let [e (last-error "fork")] (unsafe (do (free outp) (free errp) (Err e))))
+              (= pid 0i32) (do (child-run f outp errp res secs) (Err (invalid-input "fork" "unreachable")))
+              :else (unsafe (do (free outp) (free errp) (Ok (ForkChild (sext i64 pid) base))))))))
+
+;; The exit status as `waitpid` says it: the code, or 128 and the signal.
+(defun decode-status :private (w: i64) -> i64
+  (if (= (bit-and w 127) 0) (bit-and (quot w 256) 255) (+ 128 (bit-and w 127))))
+
+;; Waits for whichever child ends first; the pid is -1 when there is none left.
+(defun wait-any-child () -> ChildEnded
+  (unsafe
+    (let [st (alloc 8)
+          r (waitpid -1i32 st 0i32)
+          status (if (< r 0i32) -1 (decode-status (sext i64 (load-i32 st))))]
+      (do (free st) (ChildEnded (sext i64 r) status)))))
+
+;; Waits for one child.
+(defun wait-child (c: ForkChild) -> i64
+  (unsafe
+    (let [st (alloc 8)
+          r (waitpid (trunc i32 (. c pid)) st 0i32)
+          status (if (< r 0i32) -1 (decode-status (sext i64 (load-i32 st))))]
+      (do (free st) status))))
+
+;; What the child left, and its files removed.
+(defun fork-collect (c: ForkChild status: i64) -> Forked
+  (let [res (read-file (str (. c base) ".res"))
+        out (unwrap-or (read-file (str (. c base) ".out")) "")
+        err (unwrap-or (read-file (str (. c base) ".err")) "")]
+    (do (doseq [ext [".res" ".out" ".err"]] (files/remove-file (str (. c base) ext)))
+        (Forked status (= status 142) res out err))))
+
+;; `f` in a child, waited for.
+(defun fork-run (dir: str tag: str secs: i64 f: (fn () str)) -> (Result Forked OSError)
+  (match (fork-start dir tag secs f)
+    ((Err e) (Err e))
+    ((Ok c) (Ok (fork-collect c (wait-child c))))))

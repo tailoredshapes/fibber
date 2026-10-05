@@ -32,6 +32,7 @@ fibc build FILE.fib -o OUT [-O N] [-L DIR].. [-l LIB]..
 fibc emit  FILE.fib            ; print the lIR module
 fibc explain FILE.fib          ; the plan, as `fibref explain` prints it (types §9)
 fibc cases [DIR]               ; the rule-6 harness (§5); default cases/ownership
+fibc test [PATH..] [options]   ; fib.test specs (compiler/driver/test.fib, docs/design/test-harness.md §6); exit 0 held, 1 failed, 2 usage/compile/nothing to run
 ```
 
 `fibc run` prints `main`'s result as one decimal line on standard

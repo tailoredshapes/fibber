@@ -1,0 +1,28 @@
+;; spec: docs/design/test-harness.md 4 (seeds); docs/design/fibgen-port.md 3 (the draw order is the contract); lib/fib/rng.fib
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; fib.rng is SplitMix64, the stream fibgen draws from (its values are those of compiler/tests/golden/gen/rng.tsv, row seed 0, which the Rust
+;; fibgen printed) and the stream fib.test.gen derives its seeds from. The literals for fib.test.gen were taken from the code BEFORE the
+;; move to the library and are unchanged by it, so every replay seed a report ever printed still draws what it drew.
+;; Planted faults: any constant, shift or draw order changed in rng.fib (the shift 27 as 28 fails every check below; rng-check.sh and the
+;; fibgen manifests also fail), `rng-umod` without its unsigned correction (the second check).
+(ns main (:use tl.check fib.rng fib.test.gen))
+
+(defun draws (seed: i64 n: i64 f: (fn (Rng) i64)) -> (Vec i64)
+  (let ((r (rng-new seed))) (mapv (fn (i: i64) (f r)) (range n))))
+
+(defun main () -> i64
+  (let [c (checks)]
+    (do (check c (= (draws 0 5 (fn (r: Rng) (rng-next r)))
+                    [-2152535657050944081 7960286522194355700 487617019471545679 -537132696929009172 1961750202426094747]))
+        (check c (= (draws 0 8 (fn (r: Rng) (rng-below r 7))) [2 1 2 4 2 2 1 2]))
+        (check c (= (draws 0 8 (fn (r: Rng) (rng-below r 1000003))) [4995 431482 875807 598123 143168 700991 94490 842454]))
+        (check c (= (draws 0 8 (fn (r: Rng) (rng-range r -3 9))) [6 -3 -2 9 1 0 7 5]))
+        (check c (= (draws 0 8 (fn (r: Rng) (if (rng-chance r 60) 1 0))) [1 1 0 1 1 0 1 1]))
+        (check c (= [(stream-seed 1 0) (stream-seed 1 5) (stream-seed 7 3)] [-4689498862643123097 -2262517385565684571 8346079845500723674]))
+        (check c (let ((r (rng-new 1))) (= [(rng-between r 0 100) (rng-between r 0 100) (rng-between r -50 50) (rng-between r 0 1000)] [7 17 30 157])))
+        (check c (= (rng-umod -1 10) 5))
+        (checks-result c))))

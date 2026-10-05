@@ -236,9 +236,11 @@ are small); `shrink` returns simpler candidates, simplest first. Built-ins: `gen
 `Scenario` (so it is listed, selected, isolated and reported like any): 100 cases, the first failing value shrunk greedily (the first
 candidate that still fails replaces it, at most 500 steps), the report quoting the shrunk value and the original draw.
 
-- **Seeds.** SplitMix64 with fibgen's constants and output function (`compiler/gen/rng.fib`; the prototype *copies* the 12 lines
-  because the library cannot depend on `compiler/`; **move `gen.rng` to `lib/fib/test/rng.fib` and have fibgen require it** so one stream
-  means one thing). A scenario's seed is `stream-seed(run seed, hash(local id))`: independent of which other scenarios were selected
+- **Seeds.** SplitMix64 with fibgen's constants and output function (**built:** `lib/fib/rng.fib`, module `fib.rng`, moved from `compiler/gen/rng.fib`; fibgen and `fib.test.gen` both `:use` it. It is
+  `lib/fib/rng.fib` and not `lib/fib/test/rng.fib` because fibgen is a compiler tool and must not depend on a test library, and a seeded
+  stream is a library facility of its own; `Rng`, `rng-new`, `rng-next`, `rng-below`/`rng-range`/`rng-chance`/`rng-weighted`/`rng-pick-index`
+  keep fibgen's draws byte for byte (rng-check.sh, `compare.sh pipelines 1 300`: `ok 300 rows`). `fib.test.gen` keeps its own
+  high-bits `draw-below`, so no replay seed changed: case 7534 and run.sh check 8). A scenario's seed is `stream-seed(run seed, hash(local id))`: independent of which other scenarios were selected
   and **identical across the implementations of a contract** (the id is without the `[impl]` part), so every implementation sees the
   same random values. Case `i` uses `stream-seed(scenario seed, i)`. The run prints its seed (`... (seed 1)`) and a `replay:` line.
 - **Records via `derive`** (not built): `(derive Arbitrary T)` generates `gen-T` from the fields' generators the way `defrecord`
@@ -255,17 +257,23 @@ candidate that still fails replaces it, at most 500 steps), the report quoting t
 
 1. Assertions are values (2.2): `expect` appends `Broke`; no trap. Measured: a scenario with a wrong claim and the scenarios after it all
    report (8.1).
-2. Unexpected traps (`nth` out of range, overflow, `(trap ..)`) abort the process (spec/types.md §2.11: no handler). L28 step 1 will
-   return a task's trap from `join`; then `run-isolated` becomes `(try-join (spawn (fn () (run sc seed))))`, per scenario, and nothing
-   else changes. Until then:
-3. **Interim: `fork` without `exec`.** The child *calls the scenario closure itself* (no re-entry by name, so no second compile and no
-   selection logic), writes `encode(steps)` to a file in the run's scratch directory (a tab-separated line per step, `\`, tab and
-   newline escaped), and `_exit`s. Its standard error is a second file (the trap message is the last line), an `alarm` kills a hang
-   (status 142, reported `TIME`). The parent runs `-j N` children at a time, `wait`s for whichever ends, and reads the files; a missing
-   result file or a non-zero status is a `TRAP` row. `fib.os` has no spawn or fork (it has `process-id`, `executable-path`, directories,
-   files, `create-temp-directory`); `driver.proc` has fork+exec of *this executable*, private to the compiler. The prototype declares
-   its own `fork dup2 creat waitpid _exit alarm` externs in `fib.test.run` (7 lines). **Proposal:** a `fib.os.process` `spawn-self` /
-   `fork-run` is the right home; then `driver.proc` and `fib.test.run` share it.
+2. Unexpected traps (`nth` out of range, overflow, `(trap ..)`) end the process (spec/types.md §2.11: no handler), unless they happen on a
+   task's thread: exceptions stage 1 returns a task's trap from `try-join`. **Built (2026-10-05): the default isolation is the task**,
+   `(try-join (spawn (fn () (run seed))))` per scenario, `-j N` tasks at a time; `Scenario.run` and the `Gen` closures are `:send`.
+   Measured (1000 trivial scenarios, `compiler/tests/harness-proto/stress.fib`): in-process 8 ms; task `-j 1` 113 ms, `-j 4` 41 ms, `-j 12`
+   28 ms; fork `-j 1` 233 ms, `-j 4` 149 ms, `-j 12` 124 ms. What the task does not give: a trapped task's frames are abandoned (the audit
+   reports `leaks`, case 003 of the prototype: 10 objects), a hang cannot be stopped, stack exhaustion and out-of-memory are fatal for the
+   process, and the runtime also prints the trap on standard error.
+3. **Fork, for a time limit or a crash** (`--isolate fork`, implied by `--timeout SECS`): `fib.os.process` has `fork-start`, `wait-any-child`,
+   `fork-collect`, `fork-run` (cases 7531, 7532, mutants in `scripts/mutant-fork.sh`). The child *calls the scenario closure itself* (no
+   re-entry by name, no second compile), writes `encode(steps)` to `DIR/N.res`, its standard output and error to `N.out`, `N.err`, and
+   `_exit`s without the audit; an `alarm` kills a hang (status 142, reported `TIME`). A trap is exit 134 with the message as the last line of
+   `N.err`. **Threads:** POSIX keeps only the calling thread in the child, so a lock another thread held stays locked and the run queue's
+   workers are gone; `fork-start` refuses (an `Err`) while `/proc/self/status` shows another thread. A finished `spawn`'s thread is detached
+   and gone, so fork after `join` is allowed; the pool's workers stay, so fork before the first `async`. No `pthread_atfork` is used (it
+   would need the runtime to reset `fib.pool-started`, an `rt/` change this work did not make). Where `/proc` is absent (macOS) the count is
+   unknown and the guard is the caller's. A runner that forks must not have started tasks first; hence `--isolate task` and `fork` are
+   alternatives per run, not mixed.
 4. **Why not re-enter the binary by name** (`fibc test FILE --only NAME`, the other option the owner named): it pays a process start and,
    under `fibc run`, a *whole front end and JIT* per scenario (0.18 s for `hello`, 1.8 s for the 29-line prototype spec, measured), so
    100 scenarios would cost minutes; with an AOT-built spec binary it is about 1 ms. Fork-without-exec (0.2 ms, measured) is about 5x cheaper than even
@@ -289,16 +297,19 @@ fibc test [PATH..] [--only SUBSTR] [--seed N] [-j N] [--format plain|tap|json] [
           [--covers FILE.md]
 ```
 
-`PATH` is a spec file or a directory (every `*.fib` that defines `specs`; `fibc test` writes a stub `main` that requires them all and
-calls `(run-main (concat (a/specs) (b/specs)))`, as `driver.harness` walks a directory of cases). **Implemented in the prototype:**
-`--only`, `--seed`, `-j`/`--jobs`, `--format plain|json`, `--list`, `--no-isolate`, `--timeout`. **Not built:** the `fibc test` command
-itself, `PATH` handling, `tap`, `--covers`. `--only` is a substring of the full id (`MapContract[AList]/assoc`), `-j` is the existing
-convention (default 1 here, as `fibc cases`). `--seed` defaults to 1: **deterministic runs, not time-seeded** (a flaky test must be
-reproducible); a CI or a soak run passes a fresh seed and the report prints it.
+`PATH` is a spec file, or a directory searched (at any depth, in name order) for files named **`*-spec.fib`** (the convention: hyphenated like the
+rest of the tree, one suffix, so `fibc test specs/` and a shell glob agree; no PATH means `specs`). Each spec file is a program whose `main` is
+`(run-main (specs))`; `fibc test` runs each as `fibc run FILE -- OPTIONS` in a child process of itself (the JIT: no build step; `run` prints
+`main`'s result as its last line, which is where the status comes from) and puts the reports together. **Built (2026-10-05):**
+`compiler/driver/test.fib`, `--only`, `--seed`, `-j`/`--jobs` (several files: N files at a time; one file: N scenarios at a time),
+`--format plain|tap|json`, `--list`, `--isolate task|fork|none`, `--timeout` (selects fork), `-I`. **Not built:** `--covers`. `--only` is a substring of the full
+id (`MapContract[AList]/assoc-on`), a file where it matches nothing is skipped while another matches. `--seed` defaults to 1: **deterministic runs,
+not time-seeded** (a flaky test must be reproducible); a CI or a soak run passes a fresh seed and the report prints it.
 
-Exit status: **0** every selected scenario held; **1** one failed, trapped or timed out; **2** a usage error, an unreadable path, a
-selection that matches nothing ("a run with nothing to run is not a pass", the harness's rule), or duplicate ids. Measured: 0 for a
-holding run, 1 for the planted ones, 2 for `--only nothing-here`.
+Exit status: **0** every selected scenario held; **1** one failed, trapped or timed out, or a spec process died (a fatal runtime error, a
+signal); **2** a usage error, an unreadable PATH, no spec file, a spec that does not compile, or a selection that matches nothing anywhere ("a
+run with nothing to run is not a pass"), or duplicate ids. Checked by `compiler/tests/driver/test-cmd.sh` (29 checks over a holding, failing, trapping,
+hanging and non-compiling spec, a directory, `--only`, the three formats, `-j`).
 
 ### 6.2 Plain reporter
 
@@ -320,13 +331,14 @@ Colourless, one row per scenario, failures expanded with the steps and the two s
                               "status": "held"|"broke", "expected": str, "actual": str } ] } ] }
 ```
 
-`expected` and `actual` appear on a `broke` step. **Location is the id, not a file:line**: a stage-2 macro receives no source
-position, so the prototype cannot print `file:line` of an `expect`. **Request to the expander**: a macro builtin `(call-pos)` returning
-`"FILE:LINE"` (the position the expansion already carries, spec/syntax §1.2 "a form produced by a macro carries the position of the
-macro call"); the schema then gains `"at": "FILE:LINE"` per scenario and step, which the editor can use to jump. Until then the editor maps
-an `id` to its scenario by `--list`. (Not built.)
+`expected` and `actual` appear on a `broke` step. **Location (built):** a step's `"at"` is `"FILE:LINE:COL"`: of its `expect` (the macro's `(call-pos)`, spec/syntax.md §1.3, so an `expect` in a contract
+reports the line in the contract's file), of the `scenario` or `prop` for a `then` that is a plain boolean form, `""` for a Given or When; a result's
+`"at"` is its `scenario` or `prop`. A stage-2 macro still sees no position of a form it is handed, which is why `expect` became a macro of its own
+(it expands to a function of the scenario's log; `scenario` calls it) and the surface forms did not change. The plain report prints the
+step's `at` under the broken step and the scenario's after its id. `fibc test --format json` adds a top-level `"files"` array
+(`{"file","status","outcome"}`) to the schema, whose `results` are those of all files.
 
-TAP (`1..N`, `ok`/`not ok`, `# diag`) is a 20-line reporter over the same rows; not built.
+TAP (`TAP version 13`, `1..N`, `# seed S`, `ok N - id` / `not ok N - id # status: message`, `# step: expected .., actual ..`) is built; `fibc test` renumbers across files.
 
 ### 6.4 Parallelism
 
@@ -538,12 +550,15 @@ fibc test: two scenarios have the same id; give one an (id "..")        [exit 2]
 
 ## 10. Not done, risks, decisions for the owner
 
-**Not built** (everything not named in 8): the `fibc test` command (path handling, a stub `main`, `fibc test` returning the run's
-status, `--format tap`, `--covers`); the coverage report; the checked-in id list and its gate diff; `(open ..)`; `(call-pos)` and
-`file:line`; `Arbitrary` derivation and `gen-f64`; multi-binding `prop`; stdout capture of children; the Vec contract, the
-interpreter contract, the language-server contract, fibgen contracts; a matrix report; the oracle generator script; any gate edit or
-mutant-script edit (recommendations only). The prototype ran on `F` from the RR1 tree (`rr1/tools/F`) with `FIB_LIB` set; **it was not
-built with the seed v0.1.5** (`unchecked-add` is not there: gen.fib needs a stage 2 from this tree, as `compiler/gen` does) and not on the Mac.
+**Built since the prototype (2026-10-05, the owner's decisions 2 to 5):** `fib.os.process` fork primitives (5.3), task isolation as the default
+(5.2), `(call-pos)` and `file:line:col` (6.3), `fibc test` with tap and json (6.1), `fib.rng` shared with fibgen (4), the Vec contract in `specs/`
+(S2's first half), a `specs` gate stage (full gate, or `GATE_SPECS=1`). **Still not built:** `--covers` and the coverage report; the checked-in id
+list and its gate diff; `(open ..)`; `Arbitrary` derivation and `gen-f64`; multi-binding `prop`; stdout capture of children; the interpreter
+contract, the language-server contract, fibgen contracts; a matrix report; the oracle generator script; mutant scripts that name specs; a
+`(call-pos)` for a plain boolean `then` item (it reports the scenario's position); `pthread_atfork` (fork is refused while other threads
+exist instead). The surface (`feature`/`scenario`/`given`/`upon`/`then`/`outline`/`defcontract`/`prop`) is under discussion with the owner and
+was not changed or renamed; `expect` became a macro without changing how it is written. The prototype ran on a stage 2 built from this tree (`gen.fib`
+needs `unchecked-add`: not in the v0.1.5 seed) and not on the Mac.
 
 **Risks.** (1) `fork` in a parent with a started thread pool is undefined for the child; the runner starts none, but a spec file's
 top-level `def` that spawns would. (2) `scenario`'s macro body is one 80-line function (a stage-2 macro cannot call a helper): it passes
