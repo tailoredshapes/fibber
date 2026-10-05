@@ -46,3 +46,10 @@ D4 a compiled `FIB_AUDIT=1` mode: after F1, not now. D5 no catch in fibber: fuzz
 `editors/vscode/test/lsp.js` fails rather than skips when no server exists (unless `FIBREF_SKIP=1`). D7 keep the `;; stage: 2` labels.
 R1 measure at F2's first milestone, plan B below 1M nodes/s. R2 re-exec under `setrlimit` for stack depth. Order: the language server
 first (the editor pack is broken without it), then the heap and audit, evaluator, builtins, tasks, commands.
+
+## fibgen port (docs/design/fibgen-port.md §6), decided by the lead on 2026-10-05
+
+1 a standalone tool `compiler/fibgen.fib` beside `fibc` (a `fibc gen` entry later, at no cost). 2 bit-for-bit equality with the seed-1
+Rust per seed and size until the port is accepted, then the manifests freeze. 3 the model's object limit is 4 million (the Rust has none:
+seed 1409, kind programs, size 5, asks for one 2.3 GB allocation and killed the session on 2026-10-05; the port bounds it). 4 no threads in
+the generator. 5 classification from the compiled run only; a compiled outcome with a failed audit is an audit failure.
