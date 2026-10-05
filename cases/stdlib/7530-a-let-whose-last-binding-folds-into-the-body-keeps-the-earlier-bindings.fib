@@ -1,0 +1,29 @@
+;; spec:   stdlib §2.1 rule 2 (the let rule), syntax §3.3 (let: initialisers in order, each seeing the earlier bindings)
+;; expect: accept
+;; result: 333
+;; audit:  clean
+;; The last binding of a `let` is folded into the one body form (expand.fuselet) while an earlier binding stays: `c` is read once, by
+;; the terminal `reduce`, and `a` is read by `c`'s `concat`, which is no chain stage (two collections) so `a` stays bound. The fold
+;; once replaced the bindings and kept the old body, so the body read `c`, no longer bound: "unbound name c". Found by the generator
+;; (kind pipelines, seed 71). `from-take` is the same shape with a sequence for `a`, `staged` has a stage between the last binding
+;; and the consumer.
+(ns main (:use fib.core fib.seq fib.coll fib.print))
+
+(defun plain () -> i64
+  (let ((a [1 2 3])
+        (c (concat [1 2] a)))
+    (reduce + 0 c)))
+
+(defun from-take () -> i64
+  (let ((x (take 2 [5 6 7]))
+        (b (concat [10] x)))
+    (reduce + 0 b)))
+
+(defun staged () -> i64
+  (let ((e [100 200])
+        (g (concat [0] e))
+        (f (map inc g)))
+    (reduce + 0 f)))
+
+(defun main () -> i64
+  (+ (plain) (+ (from-take) (staged))))
