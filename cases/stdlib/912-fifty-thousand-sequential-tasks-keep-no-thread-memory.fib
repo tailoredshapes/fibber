@@ -1,0 +1,31 @@
+;; spec:   docs/design/exceptions.md §3.3 F1 (the spawn leak), types §8.8 (threads); stdlib §2.11
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; Finished threads give their resources back. 50,000 tasks, each spawned and joined before the next, must not
+;; leave 50,000 threads' stacks and descriptors behind: the resident set grows by less than 48 MB over the run
+;; (a joinable thread nobody joins keeps about 8 KB resident each, 400 MB for this loop, and under the 16 GB address-space
+;; cap the program traps `spawn: cannot start a thread` near 2,000 tasks). The count of live threads at the end is small.
+;; Killed by: scripts/mutant-spawn-leak.sh (the thread is not detached when it ends).
+(ns main (:use fib.core fib.async tl.check) (:require [tl.procstat :as ps]))
+
+(defun run (n: i64) -> i64
+  (loop ((i 0) (sum 0))
+    (if (= i n)
+        sum
+        (recur (+ i 1) (+ sum (join (spawn (fn () (+ i 1)))))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (warm (run 500))
+        (before (ps/rss-kb))
+        (total (run 50000))
+        (after (ps/rss-kb)))
+    (do (check c (= warm 125250))
+        (check c (= total 1250025000))
+        (check c (> before 0))
+        (check c (< (- after before) 49152))
+        (check c (< (ps/settled-threads 8) 8))
+        (checks-result c))))

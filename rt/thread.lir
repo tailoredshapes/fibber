@@ -1,44 +1,54 @@
 ;; fib.rt, threads (types §8.8): a spawned task runs on an OS thread of
-;; its own (pthreads); the threads are kept in a list so that main's
-;; return joins every one still running. Tasks, the run queue and the
-;; joins are in task.lir.
+;; its own (pthreads). The thread is detached when it starts, so the
+;; system reclaims its stack and descriptor the moment it ends (a
+;; program that spawns in a loop keeps no thread's resources for the
+;; tasks that are done); what main's return needs is only to wait until
+;; every thread has finished its releases, so the threads are counted:
+;; fib.threads-live, under the run queue's mutex, is incremented before
+;; a thread starts and decremented, with a broadcast, by the thread
+;; entry's last runtime call (fib.thread-done), after the task is
+;; released. Tasks, the run queue and the joins are in task.lir.
 (declare pthread_create i32 (ptr ptr ptr ptr))
-(declare pthread_join i32 (i64 ptr))
-(global internal fib.threads ptr (ptr null))
-(global internal fib.threads-lock i32 (i32 0))
+(declare pthread_detach i32 (i64))
+(global internal fib.threads-live i32 (i32 0))
 
-;; Starts entry(task) on a new thread and records it; in trace mode
-;; writes the T line (compiler.md §4).
+;; Starts entry(task) on a new detached thread and counts it; in trace
+;; mode writes the T line (compiler.md §4).
 (define internal (fib.spawn void) ((ptr task) (ptr entry))
   (block entry
     (store (i32 1) @fib.mt)
-    (let ((node (call @malloc (i64 16)))
-          (rc (call @pthread_create node (ptr null) entry task)))
+    (call @fib.rq-lock)
+    (store (add (load i32 @fib.threads-live) (i32 1)) @fib.threads-live)
+    (call @fib.rq-unlock)
+    (let ((handle (alloca i64))
+          (rc (call @pthread_create handle (ptr null) entry task)))
       (br (icmp ne rc (i32 0)) failed started)))
   (block failed
     (call @fib.trap-c (string "spawn: cannot start a thread"))
     (unreachable))
   (block started
-    (call @fib.lock @fib.threads-lock)
-    (store (load ptr @fib.threads) (getelementptr i8 node (i64 8)))
-    (store node @fib.threads)
-    (call @fib.unlock @fib.threads-lock)
+    (call @pthread_detach (load i64 handle))
     (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced done))
   (block traced (call @write (i32 2) (string "T\n") (i64 2)) (br done))
   (block done (ret)))
 
-;; Joins every thread started so far, including those started while
-;; joining.
+;; The last runtime call of a thread entry: one thread fewer, and
+;; whoever waits in fib.join-all is told.
+(define internal (fib.thread-done void) ()
+  (block entry
+    (call @fib.rq-lock)
+    (store (sub (load i32 @fib.threads-live) (i32 1)) @fib.threads-live)
+    (call @fib.rq-broadcast)
+    (call @fib.rq-unlock)
+    (ret)))
+
+;; Waits until every thread started so far, including those started
+;; while waiting, has finished.
 (define internal (fib.join-all void) ()
-  (block entry (br next))
-  (block next
-    (call @fib.lock @fib.threads-lock)
-    (let ((node (load ptr @fib.threads)))
-      (br (icmp eq node (ptr null)) empty take)))
-  (block empty (call @fib.unlock @fib.threads-lock) (ret))
-  (block take
-    (store (load ptr (getelementptr i8 node (i64 8))) @fib.threads)
-    (call @fib.unlock @fib.threads-lock)
-    (call @pthread_join (load i64 node) (ptr null))
-    (call @free node)
-    (br next)))
+  (block entry (call @fib.rq-lock) (br test))
+  (block test
+    (br (icmp sgt (load i32 @fib.threads-live) (i32 0)) sleep done))
+  (block sleep
+    (call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))
+    (br test))
+  (block done (call @fib.rq-unlock) (ret)))

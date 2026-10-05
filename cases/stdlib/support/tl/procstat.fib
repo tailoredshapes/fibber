@@ -1,0 +1,35 @@
+;; tl.procstat: numbers of this process from /proc/self/status (Linux), for the cases that bound what the runtime keeps
+;; (cases 912 to 914: finished threads must give their memory back).
+(ns tl.procstat (:require [fib.os :as os] [fib.string :as s]))
+
+;; The number after `key` (`VmRSS:` or `Threads:`) in the status text, or -1 when the line is missing.
+(defun status-number :private (text: str key: str) -> i64
+  (let ((lines (s/split-lines text)))
+    (loop ((i 0))
+      (cond (>= i (count lines)) -1
+            (starts-with? (nth lines i) key)
+              (let ((rest (s/trim (str-slice (nth lines i) (str-len key) (str-len (nth lines i)))))
+                    (parts (s/split rest " ")))
+                (unwrap-or (parse-long (nth parts 0)) -1))
+            :else (recur (+ i 1))))))
+
+;; `key`'s number, -1 when /proc/self/status cannot be read or has no such line.
+(defun status (key: str) -> i64
+  (match (os/read-file-bytes "/proc/self/status" 65536)
+    ((Ok bytes) (status-number (str-from-bytes bytes) key))
+    ((Err _) -1)))
+
+;; The resident set in kilobytes.
+(defun rss-kb () -> i64 (status "VmRSS:"))
+
+;; The number of threads of the process.
+(defun threads () -> i64 (status "Threads:"))
+
+;; The number of threads once the tasks that were joined have finished leaving: a task's result is published before its thread has left,
+;; so the count is polled (10 ms apart, 3 s at most) until it is below `limit`, and the last count read is returned.
+(defun settled-threads (limit: i64) -> i64
+  (loop ((tries 0))
+    (let ((n (threads)))
+      (if (or (< n limit) (>= tries 300))
+          n
+          (do (os/sleep-ns 10000000) (recur (+ tries 1)))))))
