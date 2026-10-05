@@ -1,6 +1,6 @@
 #!/bin/bash
 # scripts/mutant-impl-escape.sh: the mutation review of static dispatch on the implementation's escape facts (spec/types.md §6.4,
-# lever C of batch 4). Copies compiler/, lib/ and crates/fibc/rt of this tree to a scratch directory, breaks one rule of
+# lever C of batch 4). Copies compiler/, lib/ and rt of this tree to a scratch directory, breaks one rule of
 # compiler/own/walk/callee.fib or compiler/own/top.fib, builds a stage 2 from the copy (nothing in the tree changes), and runs the
 # cases that rule is for against it: every one of them must FAIL (a wrong answer, an audit failure or a crash all count). A case that
 # still passes survived the mutant and is a bad case.
@@ -34,10 +34,10 @@ LAIR_DIR=${LAIR_DIR:-$main_target}
 export LD_LIBRARY_PATH=$LAIR_DIR
 
 rm -rf "$OUT/tree"
-mkdir -p "$OUT/tree/crates/fibc" "$OUT/tree/cases" "$OUT/tmp"
+mkdir -p "$OUT/tree" "$OUT/tree/cases" "$OUT/tmp"
 export TMPDIR=$OUT/tmp
 cp -r "$R/compiler" "$R/lib" "$OUT/tree/"
-cp -r "$R/crates/fibc/rt" "$OUT/tree/crates/fibc/"
+cp -r "$R/rt" "$OUT/tree/"
 cp -r "$R/cases/ownership" "$OUT/tree/cases/"
 callee=$OUT/tree/compiler/own/walk/callee.fib
 top=$OUT/tree/compiler/own/top.fib

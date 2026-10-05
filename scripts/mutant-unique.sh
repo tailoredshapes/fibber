@@ -1,6 +1,6 @@
 #!/bin/bash
 # scripts/mutant-unique.sh: the mutation review of the in-place update (docs/design/in-place-update.md §6, "Mutation").
-# Copies compiler/, lib/ and crates/fibc/rt of this tree to a scratch directory, makes `fib.unique?` answer true where it must
+# Copies compiler/, lib/ and rt of this tree to a scratch directory, makes `fib.unique?` answer true where it must
 # not, builds a stage 2 from the copy (nothing in the tree changes), and runs the persistence cases against it: every one of
 # them must FAIL (a wrong answer, a trap or a crash all count). A case that still passes survived the mutant and is a bad case.
 #
@@ -37,10 +37,10 @@ LAIR_DIR=${LAIR_DIR:-$main_target}
 export LD_LIBRARY_PATH=$LAIR_DIR
 
 rm -rf "$OUT/tree"
-mkdir -p "$OUT/tree/crates/fibc" "$OUT/tree/cases" "$OUT/tmp"
+mkdir -p "$OUT/tree" "$OUT/tree/cases" "$OUT/tmp"
 export TMPDIR=$OUT/tmp
 cp -r "$R/compiler" "$R/lib" "$OUT/tree/"
-cp -r "$R/crates/fibc/rt" "$OUT/tree/crates/fibc/"
+cp -r "$R/rt" "$OUT/tree/"
 cp -r "$R/cases/stdlib" "$R/cases/ownership" "$OUT/tree/cases/"
 if [ -n "${MUT_DEMO:-}" ]; then
   perl -0pi -e 's/\(array-with /(awx /g; s/(\(defun vec-empty \(\) VecEmpty\))/$1\n\n(defun awx :private (items: (Array a) i: i64 x: a) -> (Array a)\n  (let ((c (cell items))) (do (array-set! &c i x) \@c)))/' "$OUT/tree/lib/prelude.fib"
@@ -59,9 +59,9 @@ mutate() { # mutate FILE
   fi
   grep -q '(block test (ret (i1 1))))' "$f" || { echo "mutant-unique: fib.unique? not found in $f (the runtime changed?)" >&2; exit 2; }
 }
-mutate "$OUT/tree/crates/fibc/rt/core.lir"
+mutate "$OUT/tree/rt/core.lir"
 mutate "$OUT/tree/compiler/emit/runtime.fib"
-grep -A5 'define internal (fib.unique? i1)' "$OUT/tree/crates/fibc/rt/core.lir"
+grep -A5 'define internal (fib.unique? i1)' "$OUT/tree/rt/core.lir"
 
 cd "$OUT/tree" || exit 2
 echo "mutant-unique[$MODE]: building the mutant stage 2 with $FIBC"

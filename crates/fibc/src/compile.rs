@@ -15,17 +15,17 @@ pub struct Unsupported(pub String);
 
 /// The runtime module `fib.rt` (compiler.md §3), lIR source.
 const RUNTIME: &[&str] = &[
-    include_str!("../rt/core.lir"),
-    include_str!("../rt/str.lir"),
-    include_str!("../rt/array.lir"),
-    include_str!("../rt/vec.lir"),
-    include_str!("../rt/vecbuild.lir"),
-    include_str!("../rt/atom.lir"),
-    include_str!("../rt/thread.lir"),
-    include_str!("../rt/task.lir"),
-    include_str!("../rt/weak.lir"),
-    include_str!("../rt/io.lir"),
-    include_str!("../rt/sys.lir"),
+    include_str!("../../../rt/core.lir"),
+    include_str!("../../../rt/str.lir"),
+    include_str!("../../../rt/array.lir"),
+    include_str!("../../../rt/vec.lir"),
+    include_str!("../../../rt/vecbuild.lir"),
+    include_str!("../../../rt/atom.lir"),
+    include_str!("../../../rt/thread.lir"),
+    include_str!("../../../rt/task.lir"),
+    include_str!("../../../rt/weak.lir"),
+    include_str!("../../../rt/io.lir"),
+    include_str!("../../../rt/sys.lir"),
 ];
 
 /// The runtime's own `declare` of the C function `name`, if any:

@@ -283,7 +283,7 @@ and the two dumps must match.
 The lIR the compiler emits is the representative input: 14,667 functions, 19.1 MB for the compiler's own source (measured
 above), and every case of `cases/` is another program. `scripts/lair-corpus.sh` (stage 0) runs the seed `fibc emit` over
 `cases/ownership` (263 files), `cases/modules` (28), a fixed sample of every tenth `cases/stdlib` file (992 files, so about 100),
-`compiler/fibc.fib`, and each of the `crates/fibc/rt/*.lir` parts alone, into `~/.cache/fibber-scratch/lair-corpus/` (the big
+`compiler/fibc.fib`, and each of the `rt/*.lir` parts alone, into `~/.cache/fibber-scratch/lair-corpus/` (the big
 disk, per the owner's rule, never `/tmp`; never committed). The `cases/lir` files (323) are the rejecting and the odd inputs the
 emitter never produces; together they exercise the checker's messages, which the emitted corpus does not. Both sets
 run through every script. Sweeps follow the owner's limit: no more than 8 jobs at a time, a few hundred files per run.

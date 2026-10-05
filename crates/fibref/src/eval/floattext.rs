@@ -22,7 +22,7 @@
 //! - `##NaN`, `##Inf`, `##-Inf` (Clojure's reader forms, X3), and `-0.0`.
 //!
 //! The compiled runtime has the same text (`fib.show-fp` in
-//! `crates/fibc/rt/str.lir`); `crates/fibc/tests/floats.rs` compares the
+//! `rt/str.lir`); `crates/fibc/tests/floats.rs` compares the
 //! two over tens of thousands of values and against Java's text of
 //! hand-written ones.
 

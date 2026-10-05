@@ -156,7 +156,7 @@ State (spec/compiler.md, **Decided**, owner, 2026-09-30; `crates/fibc`):
 - [x] `fibc` reuses `fibref`'s front end and lowers the plan to lIR
       text that `crates/lir` re-reads and re-checks (`tests/emit.rs`,
       no LLVM needed); `lair` compiles it (`fibc run`, `fibc build`)
-- [x] the runtime `fib.rt` as lIR source (`crates/fibc/rt`): header,
+- [x] the runtime `fib.rt` as lIR source (`rt`): header,
       counts, drop, unique test, traps, stack objects, strings, arrays,
       the prelude's `Vec`, atoms and share marking, weak references,
       threads, tasks; and a trace mode for the free trace of

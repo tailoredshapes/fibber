@@ -1,6 +1,6 @@
 #!/bin/bash
 # scripts/mutant-elem-get.sh: the mutation review of the borrowing element read (spec/types.md §6.3, "Element reads"; lever B of
-# performance batch 4). Copies compiler/, lib/ and crates/fibc/rt of this tree to a scratch directory, applies ONE mutant of a rule
+# performance batch 4). Copies compiler/, lib/ and rt of this tree to a scratch directory, applies ONE mutant of a rule
 # of the element read, builds a stage 2 from the copy (nothing in the tree changes) and runs the ownership cases that guard the rule
 # against it: at least one must FAIL (a wrong answer, a trap, a crash, an audit failure or a build error all count). A case that
 # still passes survived the mutant; a mutant under which every case passes means the rule has no case.
@@ -61,10 +61,10 @@ mutate() {
 killed=0; survived=0
 for m in "${MUTANTS[@]}"; do
   T=$OUT/$m; rm -rf "$T"
-  mkdir -p "$T/tree/crates/fibc" "$T/tree/cases" "$T/tmp"
+  mkdir -p "$T/tree" "$T/tree/cases" "$T/tmp"
   export TMPDIR=$T/tmp
   cp -r "$R/compiler" "$R/lib" "$T/tree/"
-  cp -r "$R/crates/fibc/rt" "$T/tree/crates/fibc/"
+  cp -r "$R/rt" "$T/tree/"
   cp -r "$R/cases/ownership" "$T/tree/cases/"
   mutate "$m" "$T/tree" || exit 2
   # `F cases` finds the implicit library through FIB_LIB, else the one beside the binary

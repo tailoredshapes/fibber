@@ -157,7 +157,7 @@ string literal `str.N`; the type table `fib.types`; a vtable
 
 ## 3. The runtime module `fib.rt`
 
-`crates/fibc/rt/*.lir` is lIR source, included in the module verbatim
+`rt/*.lir` is lIR source, included in the module verbatim
 (with `internal` linkage), in front of the emitted code. It declares
 the C functions it uses (`malloc`, `free`, `memcpy`, `write`, `abort`,
 `getenv`, `pthread_create`, `pthread_join`, `sched_yield`, `printf`,

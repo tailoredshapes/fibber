@@ -35,7 +35,7 @@ expander, type checker, ownership checker. Both executions consume that one obje
 `compiler/driver/front.fib` `front-check`, fields `typed` and `owned`). What can differ between the two executions is everything after
 it: how counts are changed, when objects are freed, how values are represented, what the builtins do, how calls dispatch, how threads
 run. So the independence rule 6 wants lives in the **back half**: the second implementation must share no code with the emitter, the
-runtime `fib.rt` (`crates/fibc/rt/*.lir`, `compiler/emit/runtime.fib`), `lair` or LLVM. It need not, and cannot, be independent of the
+runtime `fib.rt` (`rt/*.lir`, `compiler/emit/runtime.fib`), `lair` or LLVM. It need not, and cannot, be independent of the
 front end: a front-end bug is the same in both executions and the audit cannot see it, except where it shows as a memory error (below).
 
 ### 1.2 The options

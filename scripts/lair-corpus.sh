@@ -7,7 +7,7 @@
 #   emit/own-NAME.lir        the emitted lIR of each cases/ownership/*.fib
 #   emit/mod-NAME.lir        the emitted lIR of cases/modules/NAME/main.fib
 #   emit/std-NAME.lir        every STDLIB_EVERY-th (default 10th) of cases/stdlib/*.fib, in name order: a deterministic sample
-#   rt/NAME.lir              each crates/fibc/rt/*.lir part
+#   rt/NAME.lir              each rt/*.lir part
 #   fuzz/seedS-mI.lir        the mutants of `lair fuzz --keep` (FUZZ_COUNT, default 200, seed FUZZ_SEED, default 1)
 #   MANIFEST.tsv             one line per file: CLASS, path relative to the directory, bytes, sha256; then `# N files`
 #   skipped.txt              every program the emitter refused (a rejecting case has no lIR): path and the first error line
@@ -36,7 +36,7 @@ rm -rf "$out"; mkdir -p "$out/lir" "$out/emit" "$out/rt" "$out/fuzz"
 for f in $(find cases/lir -name '*.lir' | sort); do
   rel=${f#cases/lir/}; mkdir -p "$out/lir/$(dirname "$rel")"; cp "$f" "$out/lir/$rel"
 done
-for f in crates/fibc/rt/*.lir; do cp "$f" "$out/rt/$(basename "$f")"; done
+for f in rt/*.lir; do cp "$f" "$out/rt/$(basename "$f")"; done
 
 # emit one program: emit_one SRC DEST [fibc args]; a refusal is recorded, not an error
 emit_one() {

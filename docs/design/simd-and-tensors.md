@@ -428,7 +428,7 @@ with malloc, so the payload is 8-byte aligned and not 32-byte aligned.
   honours with slower code where the target needs it). x86 has had fast unaligned vector loads since Haswell; there is no
   aligned variant in the surface, so there is no way to write an aligned-access promise that is false. ADR 016's open
   question 2 (alignment syntax) is answered by *no syntax*: lines that straddle two cache lines cost, and the
-  later remedy is to allocate large array payloads on a 64-byte boundary in the runtime (`crates/fibc/rt/array.lir`), not to
+  later remedy is to allocate large array payloads on a 64-byte boundary in the runtime (`rt/array.lir`), not to
   add syntax.
 - **Tails.** `(simd/load-masked V a i m passthru)`: lanes where `m` is false are *not read at all* (LLVM's
   `masked.load` guarantee) and take `passthru`; active lanes are range-checked: the highest active lane `k` is the position of the highest set bit of `(simd/mask-bits m)`,
@@ -1082,7 +1082,7 @@ parallel with the first SIMD packages, which is the one place the order is relax
 | **P4b** the wrapping family: `unchecked-add/subtract/multiply`, `wrapping` macro (L10) | P1 (flag in the lowering) | `compiler/emit/lower/arith`, `lib/`, `spec/stdlib.md` 7 L10 |
 | **P5** SIMD kernels of the shootout (2.13) and their measurement | P4 | `scripts/shootout/*/*-simd.fib`, `docs/shootout/` (the first end-to-end evidence; run this **before** P7 and P8) |
 | **P6** tensor core: struct, invariants, construction, views, `aget/aset/aset!`, broadcast, printing, equality, interop, scalar kernels, cases 6300+ | none for scalar code | `lib/fib/tensor.fib` and `lib/fib/tensor/`, `spec/stdlib.md` (a new section), `cases/stdlib/63xx`; includes the **stack-allocation measurement** of views (3.4) |
-| **P6b** trusted-kernel primitives: `array-data`, `array-make-unique!`, unchecked vector load/store | P0/P1 for the vector ones | `compiler/types/builtins.fib` (rows, unsafe-only), `compiler/emit/lower/builtins.fib`, `crates/fibc/rt/array.lir` (regenerate `compiler/emit/runtime.fib`), `spec/types.md` 2.13.1 |
+| **P6b** trusted-kernel primitives: `array-data`, `array-make-unique!`, unchecked vector load/store | P0/P1 for the vector ones | `compiler/types/builtins.fib` (rows, unsafe-only), `compiler/emit/lower/builtins.fib`, `rt/array.lir` (regenerate `compiler/emit/runtime.fib`), `spec/types.md` 2.13.1 |
 | **P7** SIMD elementwise and reduction kernels (`ew-kernel`, `sum`, axis reductions) and cases | P4, P6, P6b | `lib/fib/tensor/` |
 | **P8** fusion rewrite for tensor functions | P6, P7 | `compiler/expand/{fusetab,fuse,fusescan,fuselet,fuserun}.fib`, `compiler/tests/expand/` (the Rust expander is frozen, so only the stage-2 compare scripts see it; `fibref` stays unfused and must give the same values) |
 | **P9** matmul: packing, micro-kernels, blocking, edges, cases, benchmark | P4, P6b, P7 | `lib/fib/tensor/gemm.fib` |

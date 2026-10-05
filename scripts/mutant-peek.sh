@@ -1,6 +1,6 @@
 #!/bin/bash
 # scripts/mutant-peek.sh: the mutation review of cell peeks (spec/types.md §6.3, "Cell peeks"; performance batch 6, P6). Copies compiler/, lib/
-# and crates/fibc/rt of this tree to a scratch directory, applies ONE mutant of a rule of the peek, builds a stage 2 from the copy (nothing in the
+# and rt of this tree to a scratch directory, applies ONE mutant of a rule of the peek, builds a stage 2 from the copy (nothing in the
 # tree changes) and runs the ownership cases that guard the rule (and compiler/tests/own/peek.sh for the mutants that only lose the elision):
 # at least one must FAIL (a wrong answer, a trap, a crash, an audit failure or a build error all count). A mutant under which every case passes
 # means the rule has no case.
@@ -77,10 +77,10 @@ mutate() {
 killed=0; survived=0
 for m in "${MUTANTS[@]}"; do
   T=$OUT/$m; rm -rf "$T"
-  mkdir -p "$T/tree/crates/fibc" "$T/tree/cases" "$T/tree/compiler/tests" "$T/tmp"
+  mkdir -p "$T/tree" "$T/tree/cases" "$T/tree/compiler/tests" "$T/tmp"
   export TMPDIR=$T/tmp
   cp -r "$R/compiler" "$R/lib" "$T/tree/"
-  cp -r "$R/crates/fibc/rt" "$T/tree/crates/fibc/"
+  cp -r "$R/rt" "$T/tree/"
   cp -r "$R/cases/ownership" "$T/tree/cases/"
   mutate "$m" "$T/tree" || exit 2
   export FIB_LIB=$T/tree/lib
