@@ -1,0 +1,46 @@
+;; fib.adder: a counter that many tasks add to without slowing each other down (P-count-a, docs/design/parallelism.md 2.6, 3.6). Java's
+;; `LongAdder`. It is `:use`d or `:require`d, never implicit.
+;;
+;;   (adder)        a new adder holding 0
+;;   (add! a n)     add n (an i64) to it
+;;   (inc! a)       add 1
+;;   (sum a)        the total
+;;
+;; Why: every task that does `(swap! counter (fn (v) (+ v 1)))` on ONE atom makes the processor's cache hand the atom's line from core to core
+;; for each increment, so the total rate falls as tasks are added (measured, docs/shootout/atoms.md: 28 tasks on one atom). An adder keeps
+;; 32 cells, each in a line of its own, and a task adds to the cell its thread's stripe picks (`sys-thread-stripe`: the address of a local,
+;; hashed, the same for one thread's calls); `sum` adds the cells up. Two tasks then share a cell only when their stripes collide, and
+;; each cell is a scalar atom, so an `add!` is one compare-and-swap with no lock and no retain.
+;;
+;; What `sum` promises: the cells are read one after another, not all at one instant, so a `sum` taken while other tasks add is a total of
+;; some of their adds (every add that finished before `sum` began is in it; an add that started after `sum` ended is not; one in between
+;; may or may not be). Once every adding task has been joined, `sum` is exact. That is Java's `LongAdder.sum` and it is why an adder is for
+;; statistics and counts read at the end, and an atom is for a value that decisions are taken on (a `compare-and-set!` loop on one atom
+;; is the tool when "the total is exactly N" must be seen at once). The additions are checked (a total that does not fit an i64 traps,
+;; as `+` does); the order of adds does not matter, so the total does not depend on the schedule.
+;;
+;; The cells are allocated two to a line's worth of memory and only every second is used, so that two stripes do not share a cache line
+;; (false sharing cost the design's measurement 40% at K=64). The allocator does not promise the placement; the benchmark
+;; (scripts/bench/atom-contention.fib) is what shows it worked.
+(ns fib.adder (:use fib.core fib.coll fib.seq))
+
+(defstruct Adder (cells: (Vec (Atom i64))))
+
+;; A new adder holding 0.
+(defun adder () -> Adder
+  (Adder (loop ((i 0) (v (vec-empty))) (if (< i 64) (recur (+ i 1) (conj v (atom 0))) v))))
+
+;; Adds n.
+(defun add! (a: Adder n: i64) -> unit
+  (do (swap! (nth (. a cells) (* 2 (bit-and (sys-thread-stripe) 31))) (fn (v) (+ v n)))
+      ()))
+
+;; Adds 1.
+(defun inc! (a: Adder) -> unit
+  (add! a 1))
+
+;; The total of the cells (exact when no task is adding; see above).
+(defun sum (a: Adder) -> i64
+  (let ((cells (. a cells)))
+    (loop ((i 0) (s 0))
+      (if (< i (count cells)) (recur (+ i 1) (+ s @(nth cells i))) s))))
