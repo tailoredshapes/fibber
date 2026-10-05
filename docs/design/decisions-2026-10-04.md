@@ -37,3 +37,12 @@ time, a REPL, `run` without an LLVM compile, readable errors and traces, complet
 back in-process. 3. Yes: the JSON diagnostics schema of §4.1 with a stable `code` per error kind. 4. Yes: session values are borrowed
 by later inputs, consumed only by explicit `take!` or `clone`. 5. Yes: `fibber-interpreter.md` is superseded; no `fibi`, no
 `compare`; the interpreter decisions D1 to D9 above are void.
+
+## fibref port (docs/design/fibref-port.md §11), decided by the lead on 2026-10-05
+
+The owner asked for fibref and fibgen to be ported and the Rust oracles left to git history. D1 `fibref`, source `compiler/fibref.fib`.
+D2 the language server in both `fibc` and `fibref` (one `lsp.server`). D3 the interpreter links LLVM in v1 (macros via the JIT).
+D4 a compiled `FIB_AUDIT=1` mode: after F1, not now. D5 no catch in fibber: fuzz the front end on garbage buffers first. D6
+`editors/vscode/test/lsp.js` fails rather than skips when no server exists (unless `FIBREF_SKIP=1`). D7 keep the `;; stage: 2` labels.
+R1 measure at F2's first milestone, plan B below 1M nodes/s. R2 re-exec under `setrlimit` for stack depth. Order: the language server
+first (the editor pack is broken without it), then the heap and audit, evaluator, builtins, tasks, commands.
