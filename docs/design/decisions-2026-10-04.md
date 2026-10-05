@@ -63,3 +63,12 @@ the thread entry and `try-join` returns the trap as a `Result`; plain `join` and
 (4) `&` in-out cells are written back on unwind; `cell-update!` poisons the cell as Rust's `Mutex` does; an `array-take!` region must be
 provably trap-free. (5) A trap inside a `finally` that runs during unwinding is fatal. (6) `fib.spawn` never detaches finished threads (20,000
 spawns used 165 MB; ~2,000 live threads abort under a 16 GB cap): fixed first, independent of the rest.
+
+## Parallelism (docs/design/parallelism.md), decided by the lead on 2026-10-05
+
+The owner: "I also want best in class parallelism". Decisions: three tiers with one `Task` type (`async` as it is; a new pool tier with work-stealing deques and
+help-while-waiting joins; `spawn`/`future` stay the OS-thread tier); structured `with-tasks` scopes with `try-join` trap semantics and chunked
+`pmap`/`pfor`/`preduce`/`pscan`; a fixed-tree deterministic reduction as the DEFAULT (identical bits for any worker count, measured free);
+tensor kernels parallelise themselves above a size threshold; refcount contention is the main hazard (lock-free scalar atoms, `freeze`, no
+counts on peeked reads). Order: P-race (two real races TSAN found: the plain `fib.mt` global; `tile-window`'s element-0 seed), then P-struct
+and P-count-a in parallel, then P-tensor, P-sched, P-chan, P-det, P-count-b.
