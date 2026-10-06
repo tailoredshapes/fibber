@@ -1,0 +1,122 @@
+;; Lane kernels of the axis reductions `sum-axis`, `maximum-axis` and `minimum-axis` (fib.tensor.reduce, fib.tensor.reduce-extra) for f32 and f64 tensors.
+;; Applies to a dense tensor reduced over an axis that has fastest-varying elements after it (`inner` > 1 elements per step of the axis): the tensor is outer x extent x inner,
+;; and every output element (o, i) folds x[o, 0..extent, i] in increasing index order, as the generic walk does. The kernel does it a vector of `inner` at a time:
+;; the accumulator vector for columns c..c+L stays in registers while the rows j = 0.. are added in order, four vectors (4 L columns) at once so that the add latency is hidden.
+;; The order of every output element's additions is therefore exactly the generic fold's (acc = 0 + x0 + x1 + ..), and the results are bit-for-bit the same (case 7742
+;; compares them on random data and signed zeros); there is no reassociation. maximum and minimum replicate `(max acc x)` and `(min acc x)` of fib.core exactly (a NaN
+;; accumulator stays NaN, a NaN element makes the accumulator NaN, a tie takes the later element, so max(+0.0, -0.0) is -0.0 and max(-0.0, +0.0) is +0.0): a compare and blend,
+;; not simd/max (whose zero ordering differs). The columns past the last whole vector run the scalar chain. A tensor that is not dense, an axis with inner = 1 (the last axis),
+;; an empty axis and the integer types take the generic path in reduce.fib. The kernels are generated from one template for the two widths; edit both.
+(ns fib.tensor.axis-lanes
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage))
+
+;; op: 0 sum, 2 maximum, 3 minimum (1 is unused)
+
+;; ---- f32 (8 lanes)
+(defun lop-f32 :private (op: i64 a: f32x8 b: f32x8) -> f32x8
+  (cond (= op 0) (+ a b)
+        (= op 2) (simd/blend (simd/or (simd/ne a a) (simd/gt a b)) a b)
+        :else (simd/blend (simd/or (simd/ne a a) (simd/lt a b)) a b)))
+
+(defun sop-f32 :private (op: i64 a: f32 b: f32) -> f32 (cond (= op 0) (+ a b) (= op 2) (max a b) :else (min a b)))
+
+;; four vectors at columns c, c+L, c+2L, c+3L
+(defun block4-f32 :private (op: i64 extent: i64 inner: i64 src: (Array f32) base: i64 c: i64 &out: (Array f32) at: i64) -> unit
+  (let ((z: f32x8 (splat f32x8 0.0f32)) (first (= op 0)) (j0 (if (= op 0) 0 1))
+        (a0: f32x8 (if first z (simd-load src (+ base c)))) (a1: f32x8 (if first z (simd-load src (+ base (+ c 8)))))
+        (a2: f32x8 (if first z (simd-load src (+ base (+ c 16))))) (a3: f32x8 (if first z (simd-load src (+ base (+ c 24))))))
+    (loop ((j j0) (p0 a0) (p1 a1) (p2 a2) (p3 a3))
+      (if (< j extent)
+          (let ((r (+ base (* j inner))))
+            (recur (+ j 1) (lop-f32 op p0 (simd-load src (+ r c))) (lop-f32 op p1 (simd-load src (+ r (+ c 8))))
+                   (lop-f32 op p2 (simd-load src (+ r (+ c 16)))) (lop-f32 op p3 (simd-load src (+ r (+ c 24))))))
+          (do (simd-store! &out at p0) (simd-store! &out (+ at 8) p1) (simd-store! &out (+ at 16) p2) (simd-store! &out (+ at 24) p3))))))
+
+(defun block1-f32 :private (op: i64 extent: i64 inner: i64 src: (Array f32) base: i64 c: i64 &out: (Array f32) at: i64) -> unit
+  (let ((j0 (if (= op 0) 0 1)) (a0: f32x8 (if (= op 0) (splat f32x8 0.0f32) (simd-load src (+ base c)))))
+    (loop ((j j0) (p a0))
+      (if (< j extent) (recur (+ j 1) (lop-f32 op p (simd-load src (+ base (+ (* j inner) c))))) (simd-store! &out at p)))))
+
+;; one column, the scalar chain
+(defun column-f32 :private (op: i64 extent: i64 inner: i64 src: (Array f32) base: i64 c: i64) -> f32
+  (loop ((j (if (= op 0) 0 1)) (acc (if (= op 0) 0.0f32 (array-get src (+ base c)))))
+    (if (< j extent) (recur (+ j 1) (sop-f32 op acc (array-get src (+ base (+ (* j inner) c))))) acc)))
+
+(defun reduce-f32 :private (op: i64 outer: i64 extent: i64 inner: i64 src: (Array f32) off: i64) -> (Array f32)
+  (let ((out (cell (array (* outer inner) 0.0f32))) (n4 (- inner (rem inner 32))) (n1 (- inner (rem inner 8))))
+    (do (dotimes (o outer)
+          (let ((base (+ off (* (* o extent) inner))) (ob (* o inner)))
+            (do (loop ((c 0)) (when (< c n4) (do (block4-f32 op extent inner src base c &out (+ ob c)) (recur (+ c 32)))))
+                (loop ((c n4)) (when (< c n1) (do (block1-f32 op extent inner src base c &out (+ ob c)) (recur (+ c 8)))))
+                (loop ((c n1)) (when (< c inner) (do (array-set! &out (+ ob c) (column-f32 op extent inner src base c)) (recur (+ c 1))))))))
+        @out)))
+
+;; ---- f64 (4 lanes)
+(defun lop-f64 :private (op: i64 a: f64x4 b: f64x4) -> f64x4
+  (cond (= op 0) (+ a b)
+        (= op 2) (simd/blend (simd/or (simd/ne a a) (simd/gt a b)) a b)
+        :else (simd/blend (simd/or (simd/ne a a) (simd/lt a b)) a b)))
+
+(defun sop-f64 :private (op: i64 a: f64 b: f64) -> f64 (cond (= op 0) (+ a b) (= op 2) (max a b) :else (min a b)))
+
+;; four vectors at columns c, c+L, c+2L, c+3L
+(defun block4-f64 :private (op: i64 extent: i64 inner: i64 src: (Array f64) base: i64 c: i64 &out: (Array f64) at: i64) -> unit
+  (let ((z: f64x4 (splat f64x4 0.0)) (first (= op 0)) (j0 (if (= op 0) 0 1))
+        (a0: f64x4 (if first z (simd-load src (+ base c)))) (a1: f64x4 (if first z (simd-load src (+ base (+ c 4)))))
+        (a2: f64x4 (if first z (simd-load src (+ base (+ c 8))))) (a3: f64x4 (if first z (simd-load src (+ base (+ c 12))))))
+    (loop ((j j0) (p0 a0) (p1 a1) (p2 a2) (p3 a3))
+      (if (< j extent)
+          (let ((r (+ base (* j inner))))
+            (recur (+ j 1) (lop-f64 op p0 (simd-load src (+ r c))) (lop-f64 op p1 (simd-load src (+ r (+ c 4))))
+                   (lop-f64 op p2 (simd-load src (+ r (+ c 8)))) (lop-f64 op p3 (simd-load src (+ r (+ c 12))))))
+          (do (simd-store! &out at p0) (simd-store! &out (+ at 4) p1) (simd-store! &out (+ at 8) p2) (simd-store! &out (+ at 12) p3))))))
+
+(defun block1-f64 :private (op: i64 extent: i64 inner: i64 src: (Array f64) base: i64 c: i64 &out: (Array f64) at: i64) -> unit
+  (let ((j0 (if (= op 0) 0 1)) (a0: f64x4 (if (= op 0) (splat f64x4 0.0) (simd-load src (+ base c)))))
+    (loop ((j j0) (p a0))
+      (if (< j extent) (recur (+ j 1) (lop-f64 op p (simd-load src (+ base (+ (* j inner) c))))) (simd-store! &out at p)))))
+
+;; one column, the scalar chain
+(defun column-f64 :private (op: i64 extent: i64 inner: i64 src: (Array f64) base: i64 c: i64) -> f64
+  (loop ((j (if (= op 0) 0 1)) (acc (if (= op 0) 0.0 (array-get src (+ base c)))))
+    (if (< j extent) (recur (+ j 1) (sop-f64 op acc (array-get src (+ base (+ (* j inner) c))))) acc)))
+
+(defun reduce-f64 :private (op: i64 outer: i64 extent: i64 inner: i64 src: (Array f64) off: i64) -> (Array f64)
+  (let ((out (cell (array (* outer inner) 0.0))) (n4 (- inner (rem inner 16))) (n1 (- inner (rem inner 4))))
+    (do (dotimes (o outer)
+          (let ((base (+ off (* (* o extent) inner))) (ob (* o inner)))
+            (do (loop ((c 0)) (when (< c n4) (do (block4-f64 op extent inner src base c &out (+ ob c)) (recur (+ c 16)))))
+                (loop ((c n4)) (when (< c n1) (do (block1-f64 op extent inner src base c &out (+ ob c)) (recur (+ c 4)))))
+                (loop ((c n1)) (when (< c inner) (do (array-set! &out (+ ob c) (column-f64 op extent inner src base c)) (recur (+ c 1))))))))
+        @out)))
+
+(defprotocol AxisLanes
+  (axis-lanes? (self) -> bool)
+  (axis-reduce (self op: i64 outer: i64 extent: i64 inner: i64 src: (Array Self) off: i64) -> (Array Self)))
+(impl AxisLanes f32 (axis-lanes? (self) true) (axis-reduce (self op outer extent inner src off) (reduce-f32 op outer extent inner src off)))
+(impl AxisLanes f64 (axis-lanes? (self) true) (axis-reduce (self op outer extent inner src off) (reduce-f64 op outer extent inner src off)))
+(impl AxisLanes i32 (axis-lanes? (self) false) (axis-reduce (self op outer extent inner src off) (trap "tensor: no lane kernel for this element type")))
+(impl AxisLanes i64 (axis-lanes? (self) false) (axis-reduce (self op outer extent inner src off) (trap "tensor: no lane kernel for this element type")))
+(impl AxisLanes bool (axis-lanes? (self) false) (axis-reduce (self op outer extent inner src off) (trap "tensor: no lane kernel for this element type")))
+
+(defun dims-product :private (dims: (Vec i64) from: i64 to: i64) -> i64
+  (loop ((i from) (n 1)) (if (< i to) (recur (+ i 1) (* n (nth dims i))) n)))
+
+;; the output shape: the axis removed, or kept as 1
+(defun out-dims :private (dims: (Vec i64) ax: i64 keepdims: bool) -> (Vec i64)
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (count dims)) (recur (+ i 1) (if (= i ax) (if keepdims (conj out 1) out) (conj out (nth dims i)))) out)))
+
+;; whether the lane kernel applies: lane element type, dense layout, elements after the axis (inner > 1), a nonempty axis and a nonempty output
+(defun lane-axis? (axis: i64 x: (Tensor t)) :where ((Element t) (AxisLanes t)) -> bool
+  (and (axis-lanes? (. x seed)) (contiguous? x) (> (fib.tensor.storage/size x) 0)
+       (let ((dims (shape x)) (ax (normalize-axis (count dims) axis)))
+         (and (> (nth dims ax) 0) (> (dims-product dims (+ ax 1) (count dims)) 1)))))
+
+;; op 0 sum, 2 maximum, 3 minimum; call only when lane-axis? is true
+(defun lane-axis (op: i64 axis: i64 keepdims: bool x: (Tensor t)) :where ((Element t) (AxisLanes t)) -> (Tensor t)
+  (do (validate x)
+      (let ((dims (shape x)) (ax (normalize-axis (count dims) axis)))
+        (from-array (out-dims dims ax keepdims)
+                    (axis-reduce (. x seed) op (dims-product dims 0 ax) (nth dims ax) (dims-product dims (+ ax 1) (count dims)) (. x buffer) (array-get (. x meta) 0))
+                    (. x seed)))))

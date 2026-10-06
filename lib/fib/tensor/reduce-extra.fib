@@ -1,6 +1,6 @@
 ;; Nonidentity axis reductions begin with each slice's first element.
 (ns fib.tensor.reduce-extra
-  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.reduce))
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.reduce fib.tensor.axis-lanes))
 
 (defun prod-axis (axis: i64 keepdims: bool x: (Tensor t))
   :where ((Element t) (Num t) (Unit t)) -> (Tensor t)
@@ -28,10 +28,11 @@
                     (array-set! &buf i value))))))
         (from-array out-dims @buf (. x seed)))))
 
-(defun maximum-axis (axis: i64 keepdims: bool x: (Tensor t)) :where ((Element t) (Ord t)) -> (Tensor t)
-  (fold-axis-first (fn (a: t b: t) (max a b)) axis keepdims x))
-(defun minimum-axis (axis: i64 keepdims: bool x: (Tensor t)) :where ((Element t) (Ord t)) -> (Tensor t)
-  (fold-axis-first (fn (a: t b: t) (min a b)) axis keepdims x))
+;; The lane kernel (fib.tensor.axis-lanes) replicates `(max acc x)` and `(min acc x)` exactly, so both give the generic fold's bits (zero signs and NaN included).
+(defun maximum-axis (axis: i64 keepdims: bool x: (Tensor t)) :where ((Element t) (Ord t) (AxisLanes t)) -> (Tensor t)
+  (if (lane-axis? axis x) (lane-axis 2 axis keepdims x) (fold-axis-first (fn (a: t b: t) (max a b)) axis keepdims x)))
+(defun minimum-axis (axis: i64 keepdims: bool x: (Tensor t)) :where ((Element t) (Ord t) (AxisLanes t)) -> (Tensor t)
+  (if (lane-axis? axis x) (lane-axis 3 axis keepdims x) (fold-axis-first (fn (a: t b: t) (min a b)) axis keepdims x)))
 
 (defun mean-axis (axis: i64 keepdims: bool x: (Tensor f64)) -> (Tensor f64)
   (let ((ax (normalize-axis (rank x) axis)) (extent (nth (shape x) ax)))

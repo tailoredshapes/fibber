@@ -351,3 +351,85 @@ matmul path is unchanged (`multiply` calls `multiply-with` with code -1; 512 and
 - **`dense` for integer tensors** is not provided (the GEMM is f32/f64); `dense` on an empty inner dimension or without hardware FMA composes the unfused ops.
 - Cases 7083 and the older fma-reference cases (7077, 7078) compare against `fma-reference` bit for bit, so they pass on the host (FMA) target only: at `FIB_TARGET_CPU=x86-64-v2`
   7078 fails already at the base commit and 7083 fails the same way (7080, 7084, 7085 pass there).
+
+## 10. Package TP4: the gaps the autodiff benchmark found (2026-10-06)
+
+`docs/shootout/autodiff.md` found elementwise glue that cost more than the matrix products it surrounds. Each commit of the package closes one gap in `lib/fib/tensor`;
+the rows below are microseconds per call, **median of 5 samples** (a sample is 100 to 200 calls), one thread pinned to CPU 3 under `flock /tmp/fibsuite.lock`, `ulimit -v 16000000`,
+inputs 784x256 or 128x256 `f32` unless stated. Before: `scripts/bench/tensor/gaps-before.fib` (only the API of main); after: `scripts/bench/tensor/gaps.fib`.
+
+```sh
+~/.cache/fibber-scratch/t4/b.sh scripts/bench/tensor/gaps-before.fib gb   # F build SRC -I lib -o OUT, then flock /tmp/fibsuite.lock taskset -c 3 OUT
+~/.cache/fibber-scratch/t4/b.sh scripts/bench/tensor/gaps.fib ga
+```
+
+### 10.1 Vector sqrt, abs, sign, rsqrt (`fib.tensor.unary`)
+
+| 784x256 `f32` | before (us) | after (us) | ratio |
+|---|---|---|---|
+| `sqrt`: scalar `t/map` with `math/sqrt` (what `fib.autodiff` used) | 385.4 | 39.5 (`t/sqrt`) | 9.8x |
+| `sqrt`: `exp(log(x) / 2)` (the first version) | 1069.1 | 39.5 | 27x |
+| `abs`: scalar `t/map` | 374.8 | 38.8 (`t/abs`) | 9.7x |
+| `neg` (unchanged: a scalar map) | 360.8 | not changed | |
+| `rsqrt`, `sign` | no function | 61.1, 45.4 | |
+| `sqrt` of a transposed view (one extra pass) | | 193.97 | |
+| `sqrt` 784x256 `f64` | | 139.9 | |
+| `mul` (the reference elementwise pass) | 16.1 | 17.2 | |
+
+The vector `sqrt` is about 2.3 times a `mul`: the unary kernels allocate a zero-filled output (`(array n 0.0)`) where the arithmetic kernels use the internal uninitialised array (README, Safety). Not measured separately, so this is the likely cause, not a finding.
+
+### 10.2 Masks: comparisons, `where`, `relu-grad`, `relu-mask` (`fib.tensor.select`, `fib.tensor.masks`)
+
+128x256 `f32`, 200 calls a sample.
+
+| row | before (us) | after (us) | ratio |
+|---|---|---|---|
+| `greater x (full [] 0.0)` (scalar operand) | 61.8 | 18.7 | 3.3x |
+| `greater x y` (two tensors) | 51.3 | 19.1 | 2.7x |
+| `where (greater x y) x zero` (compare and select) | 92.3 | 39.1 | 2.4x |
+| relu backward as `where (greater x 0) g 0` (compare and select) | 103.3 | 42.1 | 2.5x |
+| relu backward as `relu-grad g x` (one pass, new) | 103.3 | 9.5 | 10.9x |
+| relu backward as `mul g (relu-mask x)` (new) | 103.3 | 11.8 | 8.8x |
+| the workaround `mul g (relu (div x x))` (wrong at `+inf`) | 45.9 | 21.3 | not changed |
+| `mul` of two 784x256 (reference, same run) | 16.1 | 18.7 | noise (the machine is shared) |
+
+The first version of `where` built the lane mask with a loop of `with-lane`; it made `where` slower than before (119 us against 41 us for the select alone), and a vector literal
+of eight byte tests replaced it. The "after" column is the second version. The ratios of 2x and above are the ones to trust; the machine's noise on a repeat run was about 15%.
+
+### 10.3 Axis reductions (`fib.tensor.axis-lanes`)
+
+`f32`, 100 to 200 calls a sample. Before: the generic closure walk (`fold-planes` for a non-last axis). After: the lane kernel, **bit-identical** (case 7742 compares both over random data).
+
+| row | before (us) | after (us) | ratio |
+|---|---|---|---|
+| `sum-axis 0` 128x256 (the bias gradient) | 42.0 | 2.84 | 14.8x |
+| `sum-axis 0` 784x256 | 246.6 | 15.6 | 15.8x |
+| `sum-axis 1` of 8x32x256 | 89.1 | 6.3 | 14x |
+| `sum-axis 0` of 8x32x256 | 120.9 | 7.7 | 15.7x |
+| `mean-axis 0` 128x256 `f64` (through `sum-axis`) | 49.7 | 4.4 | 11x |
+| `maximum-axis 0` 128x256 | 56.0 | 3.3 | 17x |
+| `minimum-axis 0` 784x256 | 325.6 | 19.1 | 17x |
+| `sum-axis 1` 128x256 and `sum-axis 2` of 8x32x256 (last axis: unchanged, ordered chain) | 41.6 and 75.2 | 39.1 and 78.8 | none |
+| the workaround: row of ones times the matrix, `mmul` 128x256 | 7.1 | 7.2 | not changed |
+
+The 784x256 sum moves 0.8 MB in 15.6 us (51 GB/s: the matrix is in L2). The ordered contract needs no `sum-axis-fast` for these axes; for the last axis the dependent chain is the floor and the ordered result keeps it (a fast variant would be new API; not added).
+
+### 10.4 Fused Adam and SGD-momentum steps (`fib.tensor.optim`)
+
+The four tensors of the MLP of `docs/shootout/autodiff.md` (784x256, 256, 256x10, 10: 203 530 `f32`), one thread; the state (`m`, `v`) is shared with the caller's vector, so each result buffer is a fresh copy
+(the unique-write protocol copies a shared buffer once). Before: the nine tensor calls (`axpby`, `mul`, `axpby`, `sqrt`, `scale`, `shift`, `div`, `axpby`) with the scalar-map sqrt that `fib.autodiff` used, and with the vector `t/sqrt`
+(`gaps-before.fib`; the second row is only possible with commit 1 of this package). After: `t/adam-step` (`gaps.fib`, the shipped version below). The machine was loaded (load average 14 to 18 from other agents' gates) when these
+were run, under the lock but not isolated; the ratios are above 7x, which is the part to trust.
+
+| row | before (us) | after (us) | ratio |
+|---|---|---|---|
+| Adam update of the 4 MLP tensors, scalar-map sqrt, nine passes | 1666.5 | 157.4 | 10.6x |
+| the same with the vector `t/sqrt`, nine passes | 1121.3 | 157.4 | 7.1x |
+| one 784x256 tensor, vector `t/sqrt`, nine passes | 1144.5 | 156.8 | 7.3x |
+| `sgd-momentum-step`, one 784x256 tensor (no before row measured) | | 87.1 | |
+
+**Second version (the one shipped).** The first version wrote the three results through the unique-write protocol (`(cell (. p buffer))`), which copies a shared buffer before overwriting all of it: 189.7 us for the four tensors and 173.9 us for one
+784x256. The shipped version allocates uninitialised outputs and only reads its inputs: 157.4 us for the four, 156.8 us for one 784x256, 87.1 us for `sgd-momentum-step` on one 784x256. The remaining 0.78 ns an element is the division and square root (about 11 cycles per
+eight `f32`) and the memory traffic of four reads and three writes (5.6 MB). An in-place update was probed and **not achieved**: `(cell (. p buffer))` in a function that owns `p` (also through a helper returning the field) left the buffer shared in all three
+variants tried, measured by comparing the array's address before and after; so no `adam-step!` is offered, and the functions are named without the bang. Chained as training chains them (outputs become inputs), the step took 0.367 ms in `scripts/bench/autodiff/adam-chain.fib` and 0.176 ms with a large-block malloc cache
+(`docs/shootout/autodiff.md` 8.3): the rest of the cost of a fresh 800 KB result is the allocator, not the kernel.

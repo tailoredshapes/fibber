@@ -1,0 +1,15 @@
+;; The Adam update of the four MLP tensors with the state chained as training chains it (each step's outputs are the next step's inputs): median ms of steps 11..300.
+;;   F build scripts/bench/autodiff/adam-chain.fib -I lib -o probe && flock /tmp/fibsuite.lock taskset -c 3 ./probe    (docs/shootout/autodiff.md 8.3: run also with MALLOC_MMAP_THRESHOLD_=67108864 MALLOC_TRIM_THRESHOLD_=268435456 MALLOC_TOP_PAD_=67108864)
+(ns main (:require [fib.tensor :as t] [fib.autodiff :as ad]))
+(defun fill (n: i64 seed: i64) -> (t/Tensor f32)
+  (let [buf (cell (array n 0.0f32))]
+    (do (dotimes (i n) (array-set! &buf i (fdiv (float (- (rem (+ (* i 7919) (* seed 104729)) 1013) 500)) 3700.0f32)))
+        (t/from-array [n] @buf 0.0f32))))
+(defun median (v: (Vec i64)) -> i64 (nth (sort v) (quot (count v) 2)))
+(defun main () -> i64
+  (let [gs [(t/reshape [784 256] (fill 200704 6)) (t/zeros-f32 [256]) (t/reshape [256 10] (fill 2560 7)) (t/zeros-f32 [10])]]
+    (loop [s 0 ps [(t/reshape [784 256] (fill 200704 3)) (t/zeros-f32 [256]) (t/reshape [256 10] (fill 2560 5)) (t/zeros-f32 [10])] st (ad/adam-init ps) times []]
+      (if (< s 300)
+          (let [t0 (sys-clock-now) r (ad/adam-step 0.001 0.9 0.999 1.0e-8 st ps gs) dt (- (sys-clock-now) t0)]
+            (recur (+ s 1) (. r params) (. r state) (conj times dt)))
+          (do (println "adam-step ms (median of steps 11..300, chained state)" (/ (double (median (vec (drop 10 times)))) 1000000.0)) 0)))))

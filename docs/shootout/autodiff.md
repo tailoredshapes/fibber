@@ -153,3 +153,67 @@ claimed here.
 - The machine is shared; the lock excludes the other agents' gates and benchmarks but not unrelated processes (a game-streaming server and a web service were running on the machine; each configuration ran 5 times and the spread is under 1%, which suggests low noise on the pinned CPU).
 - The `relu(h/h)` mask has a known limit (`h = +inf` gives 0), and the bias-gradient trick changes the f32 summation order from `sum-axis`'s to an fma chain (both fixed orders).
 - Allocations per step were not measured for Python; RSS was read once per process with `wait4`.
+
+
+## 8. 2026-10-06, second run: the tensor-library gaps of sections 3 and 4 closed
+
+Sections 1 to 7 above are the first run and are kept as they were. This section is the same benchmark after the package of `lib/fib/tensor` (`docs/shootout/tensor.md` section 10): vector `sqrt`, `relu-grad`/`relu-mask` over lane compares,
+lane kernels for `sum-axis`/`maximum-axis`/`minimum-axis`, and a fused `adam-step`; `fib.autodiff` now calls `t/adam-step`, `t/relu-grad` and `t/sum-axis 0` (its three workarounds are gone: the scalar-map `sqrt`, `relu(y/y)` and the
+bias gradient as a product with a row of ones). The Adam results are bit-identical to the first run's (same operations in the same order); the relu gradient differs only for a NaN or infinite incoming gradient under a zero mask (now 0, as
+PyTorch's `threshold_backward`), and the bias gradient is now the ordered column sum (`t/sum-axis 0`) instead of a fused-multiply-add chain, so its last bits differ. The machine was **loaded** (load average 5 to 18 from other agents' gates; the lock excludes
+benchmarks, not unrelated processes), so the spreads below are wider than in section 2 and a difference under about 10% is not established.
+
+```sh
+F build compiler/fibc.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o F      # F from this tree, built with the v0.1.7 seed
+FIB_LIB=$PWD/lib python3 scripts/bench/autodiff/run.py --fibc F --python ~/.cache/fibber-scratch/ad/venv/bin/python --cpu 3 --out ~/.cache/fibber-scratch/t4/run     # the table (same venv: no installs)
+FIB_LIB=$PWD/lib F build scripts/bench/autodiff/kernels.fib -I lib -o kern && flock /tmp/fibsuite.lock taskset -c 3 ./kern                                    # the kernel rows
+```
+
+### 8.1 Results (median of 5 runs, ms per step, one thread)
+
+| optimiser | implementation | ms/step | min..max over runs | max rel. loss diff vs NumPy | allocations/step |
+|---|---|---|---|---|---|
+| sgd | fibber tape (fib.autodiff) | 0.972 | 0.929..0.980 | 2.7e-06 | 1983 |
+| sgd | fibber hand-written backward | 0.922 | 0.901..0.975 | 2.7e-06 | 1071 |
+| sgd | NumPy hand-written backward | 0.955 | 0.905..1.046 | 0 (reference) | |
+| sgd | PyTorch autograd | 0.985 | 0.921..1.023 | 4.2e-06 | |
+| sgd | JAX jit(value_and_grad) | 0.953 | 0.911..0.996 | 2.4e-06 | |
+| adam | fibber tape (fib.autodiff) | **1.220** | 1.210..1.301 | 6.0e-05 | 2152 |
+| adam | fibber hand-written backward | 1.199 | 1.194..1.283 | 5.7e-05 | 1240 |
+| adam | NumPy hand-written backward | 1.631 | 1.545..1.794 | 0 (reference) | |
+| adam | PyTorch autograd | 1.262 | 1.170..1.283 | 9.9e-05 | |
+| adam | JAX jit(value_and_grad) | 1.125 | 1.023..1.251 | 5.9e-05 | |
+
+The loss curves still match NumPy's within the tolerances of section 2 (SGD 1e-5, Adam 1e-3): the largest relative differences are 2.7e-6 and 6.0e-5, the same as in the first run (the Adam update is bit-identical to the old one). Peak RSS: fibber 20 MB.
+Allocations per step fell from 3314 to 2152 (Adam, tape).
+
+**Does Adam match PyTorch and JAX now?** The fibber Adam step went from 1.649 to 1.220 ms (-26%). In this run it is **3% faster than PyTorch (1.262) and 8% slower than JAX (1.125)**; the run-to-run ranges of the three overlap (fibber 1.210..1.301, PyTorch 1.170..1.283,
+JAX 1.023..1.251), so the honest reading is "level with PyTorch, behind JAX by a margin the noise of this run does not settle". In the first run (quiet machine) PyTorch took 1.155 and JAX 1.030; those two did not get faster, the machine got noisier. A rerun on a quiet machine is needed to claim more.
+The Adam step costs 0.25 ms more than the SGD step in fibber (0.28 for PyTorch, 0.17 for JAX in the same run); it was 0.72 ms.
+
+### 8.2 The kernel rows (best of 100 to 200, ms, `kern`)
+
+| piece | first run | now |
+|---|---|---|
+| relu mask of 128x256 (`where`/`greater` -> `relu-grad` is one pass: 0.0079 in `gaps.fib`) | 0.135 (`where`), 0.020 (`relu(h/h)`) | 0.039 (`where`, still measured in `kern`), 0.025 (`relu(h/h)`); `t/relu-grad` 0.008 |
+| bias gradient 128x256: `sum-axis 0` | 0.040 | 0.0035 (product with ones: 0.0084) |
+| Adam update of the 4 tensors, `ad/adam-step` including the two zero-state allocations | 1.48 | 0.806 |
+| `log` then `exp` of 784x256 | 0.938 | 1.053 (not changed; the vector `sqrt` replaces it) |
+| three matrix products (0.357, 0.339, 0.381 first run) | | 0.427, 0.382, 0.439 (the machine is slower now: +12%) |
+
+(`kern` runs `ad/adam-step` once per call from a fresh zero state; the end-to-end step reuses chained state.) In `gaps.fib` the update of the four tensors alone is 0.157 ms (`t/adam-step`), against 1.121 ms for the nine-pass composition with a vector `sqrt` and 1.666 ms with the scalar-map `sqrt`.
+
+### 8.3 Where the remaining time goes (profile)
+
+One Adam step is 1.22 ms. By section 3's pieces: the two big products, 0.43 + 0.38 ms in the loaded `kern` run (0.70 ms in the quiet first run), are about 65% of it, and they are at OpenBLAS parity (`docs/shootout/tensor.md`); the Adam update is the next piece, then the glue.
+**A large part of the update is not arithmetic.** `adam-step` on the four MLP tensors takes 0.157 ms in a loop that reuses its inputs, but a probe that chains the state as training does (`scripts/bench/autodiff/adam-chain.fib`: each step's outputs are the next step's inputs) took **0.367 ms**, and with glibc's large-block cache enlarged
+
+```sh
+MALLOC_MMAP_THRESHOLD_=67108864 MALLOC_TRIM_THRESHOLD_=268435456 MALLOC_TOP_PAD_=67108864 ./probe     # 0.176 ms; without the variables 0.367 ms
+MALLOC_MMAP_THRESHOLD_=67108864 MALLOC_TRIM_THRESHOLD_=268435456 MALLOC_TOP_PAD_=67108864 taskset -c 3 ./mlp tape adam 300     # step_ms 1.001; without: 1.200 (SGD: 0.909 against 0.901)
+```
+
+it took 0.176 ms; the whole Adam step went from 1.200 to 1.001 ms (17%) and the SGD step did not change (the SGD update allocates no large block). The explanation consistent with this is that each 800 KB tensor is above glibc's mmap threshold, so every fresh result is an `mmap`, a run of page faults and an `munmap`.
+That is the runtime's allocator, not `fib.tensor`: the lever is outside this package (a size-class cache or a raised threshold in the runtime would help every program that allocates large tensors, the GEMM outputs included). Not done here; the experiment above is the evidence (one machine, glibc malloc, `perf` was not permitted, so this is inferred from the experiment, not profiled).
+With the allocator effect removed, fibber's Adam step would be about 1.00 ms against JAX's 1.12 and PyTorch's 1.26 measured in the same run (different moments, loaded machine: indicative only).
+The rest is small: the softmax cross-entropy on 128x10 (about 600 allocations), 2152 allocations per step in all, the tape (0.016 ms).

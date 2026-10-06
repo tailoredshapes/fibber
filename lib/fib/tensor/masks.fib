@@ -1,17 +1,7 @@
-;; Comparisons create boolean tensors; selection broadcasts all three operands.
+;; Comparisons create boolean tensors; selection broadcasts all three operands. Operands that one linear walk covers (dense, or a broadcast scalar) run the
+;; lane kernels of fib.tensor.select (f32 and f64 eight and four lanes at a time); every other layout keeps the element-by-element path.
 (ns fib.tensor.masks
-  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.views fib.tensor.elementwise))
-
-(defun equal (a: (Tensor t) b: (Tensor t)) :where ((Eq t)) -> (Tensor bool)
-  (zip-with (fn (x: t y: t) (= x y)) false a b))
-(defun less (a: (Tensor t) b: (Tensor t)) :where ((Ord t)) -> (Tensor bool)
-  (zip-with (fn (x: t y: t) (< x y)) false a b))
-(defun less-equal (a: (Tensor t) b: (Tensor t)) :where ((Ord t)) -> (Tensor bool)
-  (zip-with (fn (x: t y: t) (<= x y)) false a b))
-(defun greater (a: (Tensor t) b: (Tensor t)) :where ((Ord t)) -> (Tensor bool)
-  (zip-with (fn (x: t y: t) (> x y)) false a b))
-(defun greater-equal (a: (Tensor t) b: (Tensor t)) :where ((Ord t)) -> (Tensor bool)
-  (zip-with (fn (x: t y: t) (>= x y)) false a b))
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.views fib.tensor.elementwise fib.tensor.select))
 
 ;; An operand that one linear walk covers: a dense layout (step 1) or a broadcast scalar (every stride zero, step 0); anything else is -1.
 (defun linear-step :private (x: (Tensor t)) -> i64
@@ -19,20 +9,53 @@
         (= (reduce + 0 (map abs (strides x))) 0) 0
         :else -1))
 
-(defun where (mask: (Tensor bool) a: (Tensor t) b: (Tensor t)) :where ((Element t)) -> (Tensor t)
+;; op: 0 equal, 1 less, 2 less-equal, 3 greater, 4 greater-equal. `slow` is the same comparison on two scalars, for the layouts the lane kernels do not walk.
+(defun compare-masks :private (op: i64 slow: (fn (t t) bool) :borrow a: (Tensor t) b: (Tensor t)) :where ((Linear t) (Ord t)) -> (Tensor bool)
+  (let ((dims (broadcast-shape (shape a) (shape b))) (left (broadcast-to dims a)) (right (broadcast-to dims b))
+        (ls (linear-step left)) (rs (linear-step right)))
+    (if (and (>= ls 0) (>= rs 0))
+        (from-array dims (compare-linear (. a seed) op (checked-size dims false) (. left buffer) (array-get (. left meta) 0) ls
+                                          (. right buffer) (array-get (. right meta) 0) rs)
+                    false)
+        (zip-with slow false a b))))
+
+(defun equal (a: (Tensor t) b: (Tensor t)) :where ((Eq t) (Ord t) (Linear t)) -> (Tensor bool)
+  (compare-masks 0 (fn (x: t y: t) (= x y)) a b))
+(defun less (a: (Tensor t) b: (Tensor t)) :where ((Ord t) (Linear t)) -> (Tensor bool)
+  (compare-masks 1 (fn (x: t y: t) (< x y)) a b))
+(defun less-equal (a: (Tensor t) b: (Tensor t)) :where ((Ord t) (Linear t)) -> (Tensor bool)
+  (compare-masks 2 (fn (x: t y: t) (<= x y)) a b))
+(defun greater (a: (Tensor t) b: (Tensor t)) :where ((Ord t) (Linear t)) -> (Tensor bool)
+  (compare-masks 3 (fn (x: t y: t) (> x y)) a b))
+(defun greater-equal (a: (Tensor t) b: (Tensor t)) :where ((Ord t) (Linear t)) -> (Tensor bool)
+  (compare-masks 4 (fn (x: t y: t) (>= x y)) a b))
+
+(defun where (mask: (Tensor bool) a: (Tensor t) b: (Tensor t)) :where ((Element t) (Linear t)) -> (Tensor t)
   (let ((dims (broadcast-shape (shape mask) (broadcast-shape (shape a) (shape b))))
         (condition (broadcast-to dims mask)) (left (broadcast-to dims a)) (right (broadcast-to dims b))
-        (n (checked-size dims (. a seed))) (buf (cell (array n (. a seed))))
+        (n (checked-size dims (. a seed)))
         (cs (linear-step condition)) (ls (linear-step left)) (rs (linear-step right)))
-    (do (if (and (>= cs 0) (>= ls 0) (>= rs 0))
-            ;; a linear walk: logical element i is buffer element offset + step * i, reads stay bounds-checked
-            (let ((cb (array-get (. condition meta) 0)) (lb (array-get (. left meta) 0)) (rb (array-get (. right meta) 0))
-                  (cx (. condition buffer)) (lx (. left buffer)) (rx (. right buffer)))
-              (dotimes (i n)
-                (array-set! &buf i (if (array-get cx (+ cb (* cs i))) (array-get lx (+ lb (* ls i))) (array-get rx (+ rb (* rs i)))))))
-            (dotimes (i n)
-              (array-set! &buf i (if (flat-at condition i) (flat-at left i) (flat-at right i)))))
-        (from-array dims @buf (. a seed)))))
+    (if (and (>= cs 0) (>= ls 0) (>= rs 0))
+        ;; a linear walk: logical element i is buffer element offset + step * i, reads stay bounds-checked
+        (from-array dims (select-linear (. a seed) n (. condition buffer) (array-get (. condition meta) 0) cs
+                                        (. left buffer) (array-get (. left meta) 0) ls (. right buffer) (array-get (. right meta) 0) rs)
+                    (. a seed))
+        (let ((buf (cell (array n (. a seed)))))
+          (do (dotimes (i n)
+                (array-set! &buf i (if (flat-at condition i) (flat-at left i) (flat-at right i))))
+              (from-array dims @buf (. a seed)))))))
+
+;; The relu backward in one pass: `g` where `x > 0`, else 0 (a select, as PyTorch's threshold_backward: x = 0, -0.0 and NaN give 0, and so does a NaN or infinite g
+;; under a zero mask, where `g * (x > 0)` would give NaN). `relu-mask x` is the 1 or 0 of `x > 0` in x's dtype. Both broadcast their operands and read any layout
+;; (a non-dense operand is first made contiguous). With the output y of `relu`, `y > 0` equals `x > 0` for every x, +inf included.
+(defun relu-grad (g: (Tensor t) x: (Tensor t)) :where ((Element t) (FloatLinear t)) -> (Tensor t)
+  (let ((dims (broadcast-shape (shape g) (shape x))) (gc (contiguous (broadcast-to dims g))) (xc (contiguous (broadcast-to dims x))))
+    (from-array dims (relu-grad-linear (. g seed) (checked-size dims (. g seed)) (. gc buffer) (array-get (. gc meta) 0) (. xc buffer) (array-get (. xc meta) 0))
+                (. g seed))))
+
+(defun relu-mask (x: (Tensor t)) :where ((Element t) (FloatLinear t)) -> (Tensor t)
+  (let ((xc (contiguous x)))
+    (from-array (shape x) (relu-mask-linear (. x seed) (checked-size (shape x) (. x seed)) (. xc buffer) (array-get (. xc meta) 0)) (. x seed))))
 
 (defun any? (mask: (Tensor bool)) -> bool
   (loop ((i 0))

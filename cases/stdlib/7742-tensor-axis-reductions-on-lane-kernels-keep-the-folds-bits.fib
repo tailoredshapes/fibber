@@ -1,0 +1,155 @@
+;; spec: lib/fib/tensor/README.md (Axis reductions): sum-axis, maximum-axis and minimum-axis of dense f32 and f64 tensors on the lane kernel give the generic fold's bits, every axis of ranks 2 and 3
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; The oracle is `t/fold-axis` (the generic closure walk, which does not use the lane kernel): for the sums from 0, for maximum and minimum from -inf and +inf (the first step of
+;; `(max -inf x)` is x, NaN included, so it equals a fold from the first element). Data has a wide dynamic range (1e6 next to 1e-3, so an addition order other than the fold's
+;; changes f32 bits), negative zeros and NaNs; shapes cover column counts around the 32-column block, the 8-column block and the scalar tail, every axis of rank 3, keepdims
+;; both ways, an offset slice (dense), a transposed view (generic path) and a last-axis reduction (generic path). A kernel that reorders the additions, starts from the wrong
+;; element, drops the tail columns or orders zeros differently changes some bit; planted wrong oracles must be detected.
+(ns main (:require [fib.tensor :as t]) (:use tl.check))
+
+;; ---- f32
+(defun gen-f32 (n: i64 seed: i64 specials: bool) -> (t/Tensor f32)
+  (let ((b (cell (array n 0.0f32))) (inf (/ 1.0 0.0)))
+    (do (dotimes (i n)
+          (let ((base (fdiv (double (- (rem (+ (* i 7919) (* seed 104729)) 1013) 500)) 37.0))
+                (big (cond (= (rem (+ i seed) 11) 0) 1.0e6 (= (rem (+ i seed) 7) 0) 1.0e-3 :else 1.0)))
+            (array-set! &b i
+              (cond (and specials (= (rem (+ i (* 3 seed)) 53) 5)) (bits->f32 -2147483648i32)
+                    (and specials (= (rem (+ i (* 5 seed)) 211) 9)) (fptrunc f32 (- inf inf))
+                    (and specials (= (rem (+ i (* 7 seed)) 89) 4)) (fptrunc f32 inf)
+                    :else (fptrunc f32 (* base big))))))
+        (t/from-array [n] @b 0.0f32))))
+(defun bits-f32 (x: (t/Tensor f32)) -> (Vec i64) (mapv (fn (v: f32) (if (!= v v) 0 (zext i64 (f32->bits v)))) (t/to-vec x)))
+(defun osum-f32 (axis: i64 keepdims: bool x: (t/Tensor f32)) -> (t/Tensor f32)
+  (t/fold-axis (fn (a: f32 b: f32) (+ a b)) 0.0f32 axis keepdims x))
+(defun omax-f32 (axis: i64 keepdims: bool x: (t/Tensor f32)) -> (t/Tensor f32)
+  (t/fold-axis (fn (a: f32 b: f32) (max a b)) (fptrunc f32 (- 0.0 (/ 1.0 0.0))) axis keepdims x))
+(defun omin-f32 (axis: i64 keepdims: bool x: (t/Tensor f32)) -> (t/Tensor f32)
+  (t/fold-axis (fn (a: f32 b: f32) (min a b)) (fptrunc f32 (/ 1.0 0.0)) axis keepdims x))
+
+;; all three reductions of x over `axis`, both keepdims, against the oracle
+(defun check-axis-f32 (c: Checks axis: i64 x: (t/Tensor f32)) -> unit
+  (do (dotimes (k 2)
+        (let ((kd (= k 1)))
+          (do (check c (= (bits-f32 (t/sum-axis axis kd x)) (bits-f32 (osum-f32 axis kd x))))
+              (check c (= (bits-f32 (t/maximum-axis axis kd x)) (bits-f32 (omax-f32 axis kd x))))
+              (check c (= (bits-f32 (t/minimum-axis axis kd x)) (bits-f32 (omin-f32 axis kd x))))
+              (check c (= (t/shape (t/sum-axis axis kd x)) (t/shape (osum-f32 axis kd x)))))))))
+
+(defun check-shapes-f32 (c: Checks) -> unit
+  (do ;; rank 2, axis 0: rows 1..17, columns around 4, 8 and 32
+      (dotimes (ri 6)
+        (let ((r (nth [1 2 5 17 64 130] ri)))
+          (dotimes (ci 14)
+            (let ((cols (nth [1 2 3 7 8 9 15 31 32 33 35 64 100 257] ci)))
+              (do (check-axis-f32 c 0 (t/reshape [r cols] (gen-f32 (* r cols) (+ ri ci) false)))
+                  (check-axis-f32 c -2 (t/reshape [r cols] (gen-f32 (* r cols) (+ ri ci 1) true))))))))
+      ;; rank 3, every axis
+      (dotimes (si 5)
+        (let ((dims (nth [[3 5 11] [4 6 33] [2 3 40] [5 1 9] [2 7 64]] si)))
+          (dotimes (ax 3)
+            (do (check-axis-f32 c ax (t/reshape dims (gen-f32 (* (nth dims 0) (* (nth dims 1) (nth dims 2))) si false)))
+                (check-axis-f32 c ax (t/reshape dims (gen-f32 (* (nth dims 0) (* (nth dims 1) (nth dims 2))) (+ si 9) true)))))))
+      ;; an offset slice of a dense buffer, a transposed view and a broadcast (the generic path), all the same bits
+      (let ((m (t/reshape [40 37] (gen-f32 1480 3 true))))
+        (do (check-axis-f32 c 0 (t/slice 0 5 31 1 m))
+            (check-axis-f32 c 0 (t/transpose m))
+            (check-axis-f32 c 1 (t/slice 1 3 35 1 m))
+            (check-axis-f32 c 0 (t/broadcast-to [6 37] (t/slice 0 2 3 1 m)))))
+      ;; an empty axis and an empty output
+      (check c (= (t/shape (t/sum-axis 0 false (t/reshape [0 5] (t/from-array [0] (array 0 0.0f32) 0.0f32)))) [5]))
+      (check c (= (t/to-vec (t/sum-axis 0 false (t/reshape [0 5] (t/from-array [0] (array 0 0.0f32) 0.0f32)))) [0.0f32 0.0f32 0.0f32 0.0f32 0.0f32]))
+      (check c (= (t/size (t/sum-axis 0 false (t/reshape [4 0] (t/from-array [0] (array 0 0.0f32) 0.0f32)))) 0))))
+
+;; ---- f64
+(defun gen-f64 (n: i64 seed: i64 specials: bool) -> (t/Tensor f64)
+  (let ((b (cell (array n 0.0))) (inf (/ 1.0 0.0)))
+    (do (dotimes (i n)
+          (let ((base (fdiv (double (- (rem (+ (* i 7919) (* seed 104729)) 1013) 500)) 37.0))
+                (big (cond (= (rem (+ i seed) 11) 0) 1.0e6 (= (rem (+ i seed) 7) 0) 1.0e-3 :else 1.0)))
+            (array-set! &b i
+              (cond (and specials (= (rem (+ i (* 3 seed)) 53) 5)) (bits->f64 -9223372036854775808)
+                    (and specials (= (rem (+ i (* 5 seed)) 211) 9)) (+ 0.0 (- inf inf))
+                    (and specials (= (rem (+ i (* 7 seed)) 89) 4)) (+ 0.0 inf)
+                    :else (+ 0.0 (* base big))))))
+        (t/from-array [n] @b 0.0))))
+(defun bits-f64 (x: (t/Tensor f64)) -> (Vec i64) (mapv (fn (v: f64) (if (!= v v) 0 (f64->bits v))) (t/to-vec x)))
+(defun osum-f64 (axis: i64 keepdims: bool x: (t/Tensor f64)) -> (t/Tensor f64)
+  (t/fold-axis (fn (a: f64 b: f64) (+ a b)) 0.0 axis keepdims x))
+(defun omax-f64 (axis: i64 keepdims: bool x: (t/Tensor f64)) -> (t/Tensor f64)
+  (t/fold-axis (fn (a: f64 b: f64) (max a b)) (+ 0.0 (- 0.0 (/ 1.0 0.0))) axis keepdims x))
+(defun omin-f64 (axis: i64 keepdims: bool x: (t/Tensor f64)) -> (t/Tensor f64)
+  (t/fold-axis (fn (a: f64 b: f64) (min a b)) (+ 0.0 (/ 1.0 0.0)) axis keepdims x))
+
+;; all three reductions of x over `axis`, both keepdims, against the oracle
+(defun check-axis-f64 (c: Checks axis: i64 x: (t/Tensor f64)) -> unit
+  (do (dotimes (k 2)
+        (let ((kd (= k 1)))
+          (do (check c (= (bits-f64 (t/sum-axis axis kd x)) (bits-f64 (osum-f64 axis kd x))))
+              (check c (= (bits-f64 (t/maximum-axis axis kd x)) (bits-f64 (omax-f64 axis kd x))))
+              (check c (= (bits-f64 (t/minimum-axis axis kd x)) (bits-f64 (omin-f64 axis kd x))))
+              (check c (= (t/shape (t/sum-axis axis kd x)) (t/shape (osum-f64 axis kd x)))))))))
+
+(defun check-shapes-f64 (c: Checks) -> unit
+  (do ;; rank 2, axis 0: rows 1..17, columns around 4, 8 and 32
+      (dotimes (ri 6)
+        (let ((r (nth [1 2 5 17 64 130] ri)))
+          (dotimes (ci 14)
+            (let ((cols (nth [1 2 3 7 8 9 15 31 32 33 35 64 100 257] ci)))
+              (do (check-axis-f64 c 0 (t/reshape [r cols] (gen-f64 (* r cols) (+ ri ci) false)))
+                  (check-axis-f64 c -2 (t/reshape [r cols] (gen-f64 (* r cols) (+ ri ci 1) true))))))))
+      ;; rank 3, every axis
+      (dotimes (si 5)
+        (let ((dims (nth [[3 5 11] [4 6 33] [2 3 40] [5 1 9] [2 7 64]] si)))
+          (dotimes (ax 3)
+            (do (check-axis-f64 c ax (t/reshape dims (gen-f64 (* (nth dims 0) (* (nth dims 1) (nth dims 2))) si false)))
+                (check-axis-f64 c ax (t/reshape dims (gen-f64 (* (nth dims 0) (* (nth dims 1) (nth dims 2))) (+ si 9) true)))))))
+      ;; an offset slice of a dense buffer, a transposed view and a broadcast (the generic path), all the same bits
+      (let ((m (t/reshape [40 37] (gen-f64 1480 3 true))))
+        (do (check-axis-f64 c 0 (t/slice 0 5 31 1 m))
+            (check-axis-f64 c 0 (t/transpose m))
+            (check-axis-f64 c 1 (t/slice 1 3 35 1 m))
+            (check-axis-f64 c 0 (t/broadcast-to [6 37] (t/slice 0 2 3 1 m)))))
+      ;; an empty axis and an empty output
+      (check c (= (t/shape (t/sum-axis 0 false (t/reshape [0 5] (t/from-array [0] (array 0 0.0) 0.0)))) [5]))
+      (check c (= (t/to-vec (t/sum-axis 0 false (t/reshape [0 5] (t/from-array [0] (array 0 0.0) 0.0)))) [0.0 0.0 0.0 0.0 0.0]))
+      (check c (= (t/size (t/sum-axis 0 false (t/reshape [4 0] (t/from-array [0] (array 0 0.0) 0.0)))) 0))))
+
+(defun zrows (top: f64 bottom: f64) -> (t/Tensor f64)
+  (let ((b (cell (array 18 0.0)))) (do (dotimes (i 18) (array-set! &b i (if (< i 9) top bottom))) (t/from-array [2 9] @b 0.0))))
+(defun zrows32 (top: f32 bottom: f32) -> (t/Tensor f32)
+  (let ((b (cell (array 80 0.0f32)))) (do (dotimes (i 80) (array-set! &b i (if (< i 40) top bottom))) (t/from-array [2 40] @b 0.0f32))))
+(defun bits32 (x: (t/Tensor f32) i: i64) -> i64 (zext i64 (f32->bits (nth (t/to-vec x) i))))
+(defun bits0 (x: (t/Tensor f64) i: i64) -> i64 (f64->bits (nth (t/to-vec x) i)))
+
+(defun main () -> i64
+  (let ((c (checks)) (q (checks)))
+    (do (check-shapes-f32 c) (check-shapes-f64 c)
+        ;; named values: the sum starts from +0.0 (a column of -0.0 sums to +0.0); maximum and minimum take the later of two zeros, as (max acc x) and (min acc x) do
+        (check c (= (bits0 (t/sum-axis 0 false (zrows -0.0 -0.0)) 0) 0))
+        (check c (= (bits0 (t/sum-axis 0 false (zrows -0.0 -0.0)) 8) 0))
+        (check c (= (bits0 (t/maximum-axis 0 false (zrows 0.0 -0.0)) 0) (f64->bits -0.0)))
+        (check c (= (bits0 (t/maximum-axis 0 false (zrows 0.0 -0.0)) 8) (f64->bits -0.0)))
+        (check c (= (bits0 (t/maximum-axis 0 false (zrows -0.0 0.0)) 0) 0))
+        (check c (= (bits0 (t/maximum-axis 0 false (zrows -0.0 0.0)) 8) 0))
+        (check c (= (bits0 (t/minimum-axis 0 false (zrows 0.0 -0.0)) 0) (f64->bits -0.0)))
+        (check c (= (bits0 (t/minimum-axis 0 false (zrows 0.0 -0.0)) 8) (f64->bits -0.0)))
+        (check c (= (bits0 (t/minimum-axis 0 false (zrows -0.0 0.0)) 0) 0))
+        (check c (= (bits0 (t/minimum-axis 0 false (zrows -0.0 0.0)) 8) 0))
+        (dotimes (k 2)
+          (let ((i (if (= k 0) 3 35)))
+            (do (check c (= (bits32 (t/maximum-axis 0 false (zrows32 0.0f32 -0.0f32)) i) (zext i64 (f32->bits -0.0f32))))
+                (check c (= (bits32 (t/maximum-axis 0 false (zrows32 -0.0f32 0.0f32)) i) 0))
+                (check c (= (bits32 (t/minimum-axis 0 false (zrows32 0.0f32 -0.0f32)) i) (zext i64 (f32->bits -0.0f32))))
+                (check c (= (bits32 (t/minimum-axis 0 false (zrows32 -0.0f32 0.0f32)) i) 0)))))
+        ;; the order is the fold's: 1e8 + 1 + -1e8 + 1 in f32 is 1.0 in this order and 2.0 in any other grouping
+        (let ((col (t/reshape [4 9] (t/from-array [36] (let ((b (cell (array 36 0.0f32))))
+                                                        (do (dotimes (i 36) (array-set! &b i (nth [1.0e8f32 1.0f32 -1.0e8f32 1.0f32] (quot i 9)))) @b)) 0.0f32))))
+          (do (check c (= (nth (t/to-vec (t/sum-axis 0 false col)) 3) 1.0f32))
+              (check q (= (nth (t/to-vec (t/sum-axis 0 false col)) 3) 2.0f32))
+              (check-detects c q)))
+        (checks-result c))))

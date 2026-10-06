@@ -13,11 +13,10 @@
 (defun leading-sum? (gd: (Vec i64) dims: (Vec i64)) -> bool
   (and (= (count gd) 2) (or (= dims [(nth gd 1)]) (= dims [1 (nth gd 1)]))))
 
-;; The common case, a bias: [m n] summed to [n] or [1 n]. A product of a row of ones with g is one fused-multiply-add chain per column over
-;; the rows in increasing order (so as reproducible as t/sum-axis) and runs through the vector GEMM, about six times faster than
-;; t/sum-axis 0 on 128 x 256 (docs/shootout/autodiff.md).
+;; The common case, a bias: [m n] summed to [n] or [1 n]: the ordered column sum of t/sum-axis 0, which adds row by row into a vector of columns (fib.tensor.axis-lanes;
+;; the earlier version was a product with a row of ones, because t/sum-axis 0 was a scalar walk).
 (defun column-sums (g: (t/Tensor a) dims: (Vec i64)) -> (t/Tensor a)
-  (t/reshape dims (t/mmul (t/full [1 (nth (t/shape g) 0)] (one (. g seed))) g)))
+  (t/reshape dims (t/sum-axis 0 false g)))
 
 (defun unbroadcast (g: (t/Tensor a) dims: (Vec i64)) -> (t/Tensor a)
   (let [gd (t/shape g)]
@@ -79,15 +78,13 @@
   (let [out (t/activate :sigmoid (. a val))]
     (record1 a out (fn (g) (t/mul g (t/mul out (t/sub (scalar out 1.0) out)))))))
 
-;; 1 where y > 0, else 0, from vector kernels only (t/where and t/greater are scalar loops, five times slower than this): y/y is 1 for
-;; y > 0 and NaN for y = 0, and the relu of a NaN is +0.0 (fib.tensor: ":relu means (where (greater x 0) x 0) exactly").
-;; Known limit: y = +inf gives inf/inf = NaN, so a mask of 0 where the exact answer is 1 (an overflowed activation).
-(defun relu-mask (y: (t/Tensor a)) -> (t/Tensor a) (t/relu (t/div y y)))
+;; 1 where y > 0, else 0 (t/relu-mask): exact for every y, +inf included (the earlier relu(y/y) workaround gave 0 at +inf).
+(defun relu-mask (y: (t/Tensor a)) -> (t/Tensor a) (t/relu-mask y))
 
-;; relu: the gradient passes where the output is positive, so x = 0 has gradient 0 (the usual convention)
+;; relu: the gradient passes where the output is positive (one pass, t/relu-grad: a select, so x = 0 has gradient 0 as in PyTorch, and a NaN or infinite g under a zero mask gives 0)
 (defun relu (a: (Tracked a)) -> (Tracked a)
   (let [out (t/relu (. a val))]
-    (record1 a out (fn (g) (t/mul g (relu-mask out))))))
+    (record1 a out (fn (g) (t/relu-grad g out)))))
 
 ;; ---- reductions
 (defun sum (a: (Tracked a)) -> (Tracked a)

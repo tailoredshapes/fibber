@@ -148,6 +148,18 @@ Empty-axis sum/product produce zero/one; extrema and mean trap on an empty
 reduction axis. `mean-axis` accepts `f64`. `fold-axis f initial axis keepdims
 tensor` supports a different accumulator dtype with an `Element` instance.
 
+**Lane kernels for the axis reductions** (`fib.tensor.axis-lanes`). `sum-axis`, `maximum-axis` and `minimum-axis` of a dense `f32` or `f64` tensor over an
+axis that has elements after it (`axis` is not the last, or the last of extent... precisely: the product of the later extents is above 1; `sum-axis 0` of a matrix,
+every axis but the last of a rank-3 tensor) view the tensor as `outer x extent x inner` and add row by row into a vector of `inner` accumulators, four vectors at
+a time, so a 784x256 sum reads each element once at memory speed. **The order contract is unchanged**: every output element still adds its slice in increasing
+axis index starting from `+0.0` (`acc = 0 + x0 + x1 + ...`), so the results are bit-for-bit those of the generic fold (case 7742 compares both over random data
+spanning 1e-3 to 1e6, negative zeros and NaNs, every column count around the 8 and 32 column blocks, every axis of rank 3). `maximum-axis` and `minimum-axis`
+replicate `(max acc x)` and `(min acc x)` exactly (a compare and blend, not `simd/max`): a NaN accumulator stays NaN, a NaN element makes the accumulator NaN,
+a tie takes the later element, so `max(+0.0, -0.0)` is `-0.0` and `max(-0.0, +0.0)` is `+0.0`. The generic walk is kept for the other cases: a tensor that is not
+dense (views, broadcasts), the last axis (`inner = 1`: one chain of dependent adds per output, which is the ordered contract), an empty axis, and the integer and
+boolean types (checked overflow). `mean-axis` (`f64`) takes the lane kernel through `sum-axis`. No `sum-axis-fast` was added: the ordered kernel already runs at the speed
+the reassociated one would have, since the vectors are across outputs, not along the axis.
+
 `argmax` and `argmin` return the first flat logical index on a tie and trap
 on empty input. They use ordinary comparisons: an initial NaN remains the
 winner, and a later NaN does not replace it. NumPy NaN behavior is not promised.
@@ -170,6 +182,21 @@ selected values. Both value operands must have the same dtype. `any?` and
 ```clojure
 (t/where (t/greater matrix (t/full [] 0.0)) matrix (t/full [] 0.0))
 ```
+
+**Lane kernels** (`fib.tensor.select`). The five comparisons and `where` walk operands that one linear pass covers (a dense layout, or a broadcast
+scalar such as `(t/full [] 0.0)` on either side: step 0) with no closure per element: for `f32` and `f64` a comparison compares eight or four lanes at
+once and stores the lanes into the boolean tensor, and `where` builds the lane mask from the mask's bytes and blends the two value vectors (`simd/blend`),
+with a scalar tail; `i32`, `i64` and `bool` tensors run the same walk as scalar loops. Any other layout (a transposed view, a row broadcast) takes the earlier
+element-by-element path with the same results. Floating comparisons are IEEE: a NaN compares false in all five, `-0.0` equals `+0.0`. `where` copies the
+selected element bit for bit (a NaN or a signed zero is kept). The comparisons and `where` now also require the element type to have the internal
+`Linear` instance, which the five standard element types (`i32 i64 f32 f64 bool`) have.
+
+`relu-grad g x` is the relu backward in one pass: `g` where `x > 0`, else `+0.0` (`f32` and `f64`; operands broadcast, any layout). It is a **select**, as
+PyTorch's `threshold_backward`: at `x = 0`, `x = -0.0` and `x = NaN` the gradient is 0 (PyTorch's convention: the relu gradient at 0 is 0), and a NaN or infinite
+`g` under a zero mask gives 0 where `g * (x > 0)` would give NaN; under `x > 0` a NaN `g` stays NaN. `relu-mask x` is the `1` or `0` of `x > 0` in `x`'s dtype.
+`relu y` of NaN or `-0.0` is `+0.0` as before (`:relu` means `(where (greater x 0) x 0)`), so `(relu-mask (relu x))` equals `(relu-mask x)` for every `x`,
+`+inf` included (the earlier workaround `(relu (div y y))` gave 0 at `+inf`). Case 7741 compares everything against scalar oracles over every pair of 19
+special values (both zeros, infinities, NaN, subnormals) and every tail length; `scripts/mutant-tensor-gaps.sh` plants 13 faults in these kernels.
 
 ## Linear algebra and SIMD
 
@@ -229,6 +256,23 @@ NaN in gives NaN, `log 0 = -inf`, `log x<0 = NaN`, `tanh +-inf = +-1`,
 `FIB_TARGET_CPU=x86-64-v2` too) and `simd/bitcast` for 2^k and the exponent split. Results can differ from the scalar libm in the last place. A
 strided input is first made contiguous.
 
+## Vector sqrt, rsqrt, abs and sign
+
+`sqrt`, `rsqrt`, `abs` and `sign` map an `f64` or `f32` tensor to a fresh tensor of the same shape in one pass and one allocation
+(`fib.tensor.unary`): eight (`f32`) or four (`f64`) lanes at a time over `simd/sqrt` and `simd/abs`, a masked tail, no closure and no libm call.
+A dense input (including an offset slice) is read from its buffer; any other layout (a transposed view, a broadcast) is first made contiguous, as the
+vector `exp` does, so it costs one more pass. `neg` and `square` already existed (`neg` is a scalar map, `square` is `mul x x`).
+
+| Function | Result |
+|---|---|
+| `sqrt x` | IEEE `sqrt`, correctly rounded, so **bit-identical to libm** `sqrt` (an `f32` result equals the `f64` sqrt rounded to `f32`). A negative gives NaN, `sqrt(-0.0)` is `-0.0`, `sqrt(+inf)` is `+inf`, NaN gives NaN |
+| `rsqrt x` | `1 / sqrt(x)`: a correctly rounded sqrt then a correctly rounded division, two roundings (within 1 ULP of the true value, not always correctly rounded). `rsqrt(+0.0)` is `+inf`, `rsqrt(-0.0)` is `-inf`, a negative gives NaN |
+| `abs x` | clears the sign bit: `abs(-0.0)` is `+0.0`, NaN stays NaN, exact |
+| `sign x` | `-1.0` or `+1.0`; a zero gives itself (`sign(-0.0)` is `-0.0`) and NaN gives NaN |
+
+Case 7740 compares all four with scalar oracles bit for bit over 4096 pseudo-random bit patterns of every exponent (subnormals, infinities and NaNs
+included), the special values, every tail length 0 to 19, an offset slice, a transposed view and a broadcast; `scripts/mutant-tensor-gaps.sh` plants 9 faults in them.
+
 ## Fused dense layers and activations
 
 A neural-network layer is `activation(x * w + b)`. Written as `mmul`, `add`, `where`, it makes three
@@ -275,9 +319,26 @@ bits; the variance is the population variance from the centred second pass, not 
 (which cancels for a large mean: case 7085 has a mean of 1e6 over a spread of 27). `exp` is the vector `exp` above
 (`f32` computed in `f64` and rounded). A NaN in a row gives a NaN softmax row. A strided input is first made
 contiguous. Case 7085 compares both against a scalar oracle with libm over every tail length, ranks one to three,
-views, empty tensors and extreme values; `scripts/mutant-tensor-fused.sh` plants 10 faults in them.
+views, empty tensors and extreme values; `scripts/mutant-tensor-fused.sh` plants 11 faults in them.
 Softmax 4096x4096 `f64`: 74.7 ms against 145.1 ms composed (NumPy 126.8); layernorm 4096x1024: 9.7 ms against
 42.9 ms composed (NumPy 35.2): `docs/shootout/tensor.md`, section 9.
+
+## Fused optimiser steps
+
+```clojure
+(t/adam-step lr b1 b2 eps bc1 bc2 p g m v)   ; -> [p' m' v']      bc1 = 1 - b1^t, bc2 = 1 - b2^t for step t (the caller computes them)
+(t/sgd-momentum-step lr mu p g buf)          ; -> [p' buf']
+```
+
+One pass over the parameter, its gradient and its state (eight `f32` or four `f64` lanes at a time, a scalar tail), no temporary tensor: the composition it replaces
+(`axpby`, `mul`, `axpby`, `sqrt`, `scale`, `shift`, `div`, `axpby`) makes nine passes and eight temporaries per parameter. PyTorch's Adam without amsgrad or weight decay:
+`m' = b1 m + (1 - b1) g`, `v' = b2 v + (1 - b2) g^2`, `denom = sqrt(v') / sqrt(bc2) + eps` (**eps is added after the square root and the bias correction**, as PyTorch does, not inside
+the root), `p' = p - (lr / bc1) m' / denom`. SGD with momentum is PyTorch's (`buf' = mu buf + g`, `p' = p - lr buf'`; a zero `buf` at the first step gives `buf' = g`; no dampening, no Nesterov).
+`f32` and `f64` tensors of one shape (a different shape traps; no broadcasting); scalars are `f64` and are rounded to the element type; a tensor that is not dense is made
+contiguous first. **Rounding contract:** the kernel does the same multiplies, adds, one `sqrt` and one division, in the same order, as the unfused composition (no fused multiply-add;
+`1 / sqrt(bc2)` is one reciprocal multiplied in, where PyTorch divides by `sqrt(bc2)`: at most one rounding apart), so the results are **bit-identical to the composition** and
+within a few ULP of PyTorch 2.14 (case 7743: `f64` to 1e-12, `f32` to 3e-6 relative, on three steps of ten parameters). **Memory:** the three results are fresh buffers written once each (uninitialised arrays: the kernel stores every element), and the inputs are only read, so another holder of a tensor (a tape, a caller's `Vec`) never sees a change and no input buffer is copied first. The steps do **not** update in place: moving a unique tensor's buffer into a cell (`(cell (. p buffer))`, also through a helper that returns the field) left the buffer shared in every variant probed, so an in-place `adam-step!` would have copied anyway; this is reported, not solved (`docs/shootout/tensor.md` 10.4).
+Case 7743 compares bit for bit over lengths 0 to 40, a matrix, a dense slice with an offset and a transposed view; `scripts/mutant-tensor-gaps.sh` plants 11 faults in them.
 
 ## Safety and validation
 

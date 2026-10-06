@@ -1,0 +1,237 @@
+;; spec: lib/fib/tensor/README.md (Masks and selection; Fused relu backward): comparisons, where, relu-mask and relu-grad on lane kernels equal the scalar oracle, NaN and signed zero included
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; Every pair of 19 special values (zeros of both signs, infinities, NaN, subnormals) through the five comparisons for f32, f64 and i64 on dense tensors, a broadcast scalar on
+;; either side, an offset slice and a transposed view, at every length 0..19 around the lane widths; where over patterned masks, scalar branches and slices; relu-mask and relu-grad
+;; at 0, -0.0, NaN, +-inf, with a NaN or infinite g under a zero mask (0, not NaN), broadcast operands and views. Planted wrong oracles must be detected.
+(ns main (:require [fib.tensor :as t]) (:use tl.check))
+
+(defun vecs-same (a: (Vec t) b: (Vec t)) :where ((Eq t)) -> bool (= a b))
+(defun pattern (i: i64) -> bool (= (rem (* i 5) 3) 0))
+(defun bool-array (n: i64) -> (Array bool)
+  (let ((b (cell (array n false)))) (do (dotimes (i n) (array-set! &b i (pattern i))) @b)))
+(defun mask (n: i64) -> (t/Tensor bool) (t/from-array [n] (bool-array n) false))
+(defun ocmp (op: i64 a: t b: t) :where ((Ord t)) -> bool
+  (cond (= op 0) (= a b) (= op 1) (< a b) (= op 2) (<= a b) (= op 3) (> a b) :else (>= a b)))
+
+(defun tcmp-f32 (op: i64 a: (t/Tensor f32) b: (t/Tensor f32)) -> (t/Tensor bool)
+  (cond (= op 0) (t/equal a b) (= op 1) (t/less a b) (= op 2) (t/less-equal a b) (= op 3) (t/greater a b) :else (t/greater-equal a b)))
+
+;; ---- f32
+(defun sp-f32 () -> (Array f32)
+  (let ((inf (/ 1.0f32 0.0f32)))
+    (arr-f32 [0.0f32 -0.0f32 1.0f32 -1.0f32 0.5f32 2.0f32 -2.0f32 inf (- 0.0f32 inf) (- inf inf) 1.0e-30f32 -1.0e-30f32 3.0f32 -3.0f32 7.5f32 1.0e30f32 -1.0e30f32 0.25f32 -0.25f32])))
+(defun arr-f32 (v: (Vec f32)) -> (Array f32)
+  (let ((b (cell (array (count v) 0.0f32)))) (do (dotimes (i (count v)) (array-set! &b i (nth v i))) @b)))
+(defun pairs-x-f32 () -> (Array f32) (let ((s (sp-f32)) (k (array-len s)) (b (cell (array (* k k) 0.0f32)))) (do (dotimes (i (* k k)) (array-set! &b i (array-get s (rem i k)))) @b)))
+(defun pairs-y-f32 () -> (Array f32) (let ((s (sp-f32)) (k (array-len s)) (b (cell (array (* k k) 0.0f32)))) (do (dotimes (i (* k k)) (array-set! &b i (array-get s (quot i k)))) @b)))
+(defun take-f32 (a: (Array f32) n: i64) -> (Array f32) (let ((b (cell (array n 0.0f32)))) (do (dotimes (i n) (array-set! &b i (array-get a i))) @b)))
+(defun same-f32 (a: (Vec f32) b: (Vec f32)) -> bool (= (mapv (fn (x: f32) (f32->bits x)) a) (mapv (fn (x: f32) (f32->bits x)) b)))
+(defun oracle-f32 (op: i64 xs: (Vec f32) ys: (Vec f32)) -> (Vec bool) (mapv (fn (i: i64) (ocmp op (nth xs i) (nth ys i))) (range (count xs))))
+
+(defun check-compare-f32 (c: Checks) -> unit
+  (let ((px (pairs-x-f32)) (py (pairs-y-f32)))
+    (dotimes (op 5)
+      (do ;; every pair of specials, dense
+          (let ((n (array-len px)) (x (t/from-array [(array-len px)] px 0.0f32)) (y (t/from-array [(array-len py)] py 0.0f32)))
+            (do (check c (= (t/to-vec (tcmp-f32 op x y)) (oracle-f32 op (t/to-vec x) (t/to-vec y))))
+                ;; a transposed view of each side (not dense), and a slice with an offset
+                (let ((xm (t/reshape [19 19] x)) (ym (t/reshape [19 19] y)))
+                  (check c (= (t/to-vec (tcmp-f32 op (t/transpose xm) ym)) (oracle-f32 op (t/to-vec (t/transpose xm)) (t/to-vec ym)))))
+                (let ((xs (t/slice 0 7 300 1 x)) (ys (t/slice 0 3 296 1 y)))
+                  (check c (= (t/to-vec (tcmp-f32 op xs ys)) (oracle-f32 op (t/to-vec xs) (t/to-vec ys)))))))
+          ;; a broadcast scalar on either side, every special as the scalar
+          (let ((s (sp-f32)) (x (t/from-array [(array-len px)] px 0.0f32)))
+            (dotimes (k (array-len s))
+              (let ((v (array-get s k)) (sv (t/full [] (array-get s k))) (full (t/to-vec x)))
+                (do (check c (= (t/to-vec (tcmp-f32 op x sv)) (mapv (fn (a: f32) (ocmp op a v)) full)))
+                    (check c (= (t/to-vec (tcmp-f32 op sv x)) (mapv (fn (a: f32) (ocmp op v a)) full)))))))
+          ;; every length around the lane width, tensor against tensor and against a scalar
+          (dotimes (len 20)
+            (let ((x (t/from-array [len] (take-f32 px len) 0.0f32)) (y (t/from-array [len] (take-f32 (arr-f32 (vec (reverse (t/to-vec (t/from-array [361] py 0.0f32))))) len) 0.0f32)))
+              (do (check c (= (t/to-vec (tcmp-f32 op x y)) (oracle-f32 op (t/to-vec x) (t/to-vec y))))
+                  (check c (= (t/shape (tcmp-f32 op x y)) [len])))))))))
+
+(defun check-where-f32 (c: Checks) -> unit
+  (let ((px (pairs-x-f32)) (py (pairs-y-f32)))
+    (dotimes (len 40)
+      (let ((m (mask len)) (x (t/from-array [len] (take-f32 px len) 0.0f32)) (y (t/from-array [len] (take-f32 py len) 0.0f32))
+            (pv (mapv pattern (range len))))
+        (do (check c (same-f32 (t/to-vec (t/where m x y)) (mapv (fn (i: i64) (if (nth pv i) (nth (t/to-vec x) i) (nth (t/to-vec y) i))) (range len))))
+            ;; scalar branches
+            (let ((zs (t/full [] (array-get (sp-f32) 1))))
+              (do (check c (same-f32 (t/to-vec (t/where m x zs)) (mapv (fn (i: i64) (if (nth pv i) (nth (t/to-vec x) i) (array-get (sp-f32) 1))) (range len))))
+                  (check c (same-f32 (t/to-vec (t/where m zs y)) (mapv (fn (i: i64) (if (nth pv i) (array-get (sp-f32) 1) (nth (t/to-vec y) i))) (range len))))))
+            ;; a mask made by a comparison, selecting from the same operands (min by select)
+            (check c (same-f32 (t/to-vec (t/where (t/less x y) x y)) (mapv (fn (i: i64) (if (< (nth (t/to-vec x) i) (nth (t/to-vec y) i)) (nth (t/to-vec x) i) (nth (t/to-vec y) i))) (range len)))))))
+    ;; an offset slice of the mask and of both operands
+    (let ((m (t/slice 0 2 40 1 (mask 60))) (x (t/slice 0 5 43 1 (t/from-array [361] px 0.0f32))) (y (t/slice 0 9 47 1 (t/from-array [361] py 0.0f32))))
+      (check c (same-f32 (t/to-vec (t/where m x y)) (mapv (fn (i: i64) (if (pattern (+ i 2)) (nth (t/to-vec x) i) (nth (t/to-vec y) i))) (range 38)))))
+    ;; a transposed operand falls back to the indexed walk and gives the same logical values
+    (let ((x (t/transpose (t/reshape [19 19] (t/from-array [361] px 0.0f32)))) (y (t/reshape [19 19] (t/from-array [361] py 0.0f32)))
+          (m (t/reshape [19 19] (mask 361))))
+      (check c (same-f32 (t/to-vec (t/where m x y)) (mapv (fn (i: i64) (if (nth (t/to-vec m) i) (nth (t/to-vec x) i) (nth (t/to-vec y) i))) (range 361)))))))
+
+(defun relu-oracle-f32 (g: f32 x: f32) -> f32 (if (> x 0.0f32) g 0.0f32))
+(defun check-relu-f32 (c: Checks) -> unit
+  (let ((px (pairs-x-f32)) (py (pairs-y-f32)))
+    (do (let ((x (t/from-array [361] px 0.0f32)) (g (t/from-array [361] py 0.0f32)))
+          (do ;; the select semantics over every pair: g where x > 0, else +0.0, whatever g is (NaN, inf)
+              (check c (= (mapv (fn (v: f32) (f32->bits v)) (t/to-vec (t/relu-grad g x)))
+                          (mapv (fn (i: i64) (f32->bits (relu-oracle-f32 (nth (t/to-vec g) i) (nth (t/to-vec x) i)))) (range 361))))
+              (check c (= (mapv (fn (v: f32) (f32->bits v)) (t/to-vec (t/relu-mask x)))
+                          (mapv (fn (i: i64) (f32->bits (if (> (nth (t/to-vec x) i) 0.0f32) 1.0f32 0.0f32))) (range 361))))
+              ;; the mask of relu's output is the mask of its input, +inf included
+              (check c (= (t/to-vec (t/relu-mask (t/relu x))) (t/to-vec (t/relu-mask x))))
+              ;; views: transposed g, an offset slice of x, a broadcast g
+              (let ((gm (t/reshape [19 19] g)) (xm (t/reshape [19 19] x)))
+                (check c (= (mapv (fn (v: f32) (f32->bits v)) (t/to-vec (t/relu-grad (t/transpose gm) xm)))
+                            (mapv (fn (i: i64) (f32->bits (relu-oracle-f32 (nth (t/to-vec (t/transpose gm)) i) (nth (t/to-vec xm) i)))) (range 361)))))
+              (let ((xs (t/slice 0 3 100 1 x)) (gs (t/slice 0 11 108 1 g)))
+                (check c (= (mapv (fn (v: f32) (f32->bits v)) (t/to-vec (t/relu-grad gs xs)))
+                            (mapv (fn (i: i64) (f32->bits (relu-oracle-f32 (nth (t/to-vec gs) i) (nth (t/to-vec xs) i)))) (range 97)))))
+              (let ((row (t/from-array [1 19] (take-f32 py 19) 0.0f32)) (xm (t/reshape [19 19] x)))
+                (check c (= (mapv (fn (v: f32) (f32->bits v)) (t/to-vec (t/relu-grad row xm)))
+                            (mapv (fn (i: i64) (f32->bits (relu-oracle-f32 (nth (t/to-vec row) (rem i 19)) (nth (t/to-vec xm) i)))) (range 361)))))))
+        ;; every length around the lane width
+        (dotimes (len 20)
+          (let ((x (t/from-array [len] (take-f32 px len) 0.0f32)) (g (t/from-array [len] (take-f32 py len) 0.0f32)))
+            (check c (= (mapv (fn (v: f32) (f32->bits v)) (t/to-vec (t/relu-grad g x)))
+                        (mapv (fn (i: i64) (f32->bits (relu-oracle-f32 (nth (t/to-vec g) i) (nth (t/to-vec x) i)))) (range len))))))
+        ;; named points: relu(-0.0), relu(NaN), gradient at 0 is 0 (PyTorch), +inf passes, a NaN gradient under x <= 0 is 0, under x > 0 it stays NaN
+        (let ((nan (- (/ 1.0f32 0.0f32) (/ 1.0f32 0.0f32))) (inf (/ 1.0f32 0.0f32)))
+          (do (check c (= (f32->bits (t/item (t/relu (t/full [] (- 0.0f32 1.0f32 ) )))) (f32->bits 0.0f32)))
+              (check c (= (f32->bits (t/item (t/relu (t/full [] nan)))) (f32->bits 0.0f32)))
+              (check c (= (t/item (t/relu-grad (t/full [] 1.0f32) (t/full [] 0.0f32))) 0.0f32))
+              (check c (= (t/item (t/relu-grad (t/full [] 1.0f32) (t/full [] inf))) 1.0f32))
+              (check c (= (f32->bits (t/item (t/relu-grad (t/full [] nan) (t/full [] (- 0.0f32 1.0f32))))) (f32->bits 0.0f32)))
+              (check c (!= (t/item (t/relu-grad (t/full [] nan) (t/full [] 1.0f32))) (t/item (t/relu-grad (t/full [] nan) (t/full [] 1.0f32)))))
+              (check c (= (t/item (t/relu-grad (t/full [] 1.0f32) (t/full [] nan))) 0.0f32))
+              (check c (= (t/item (t/relu-mask (t/full [] inf))) 1.0f32)))))))
+
+(defun tcmp-f64 (op: i64 a: (t/Tensor f64) b: (t/Tensor f64)) -> (t/Tensor bool)
+  (cond (= op 0) (t/equal a b) (= op 1) (t/less a b) (= op 2) (t/less-equal a b) (= op 3) (t/greater a b) :else (t/greater-equal a b)))
+
+;; ---- f64
+(defun sp-f64 () -> (Array f64)
+  (let ((inf (/ 1.0 0.0)))
+    (arr-f64 [0.0 -0.0 1.0 -1.0 0.5 2.0 -2.0 inf (- 0.0 inf) (- inf inf) 1.0e-30 -1.0e-30 3.0 -3.0 7.5 1.0e30 -1.0e30 0.25 -0.25])))
+(defun arr-f64 (v: (Vec f64)) -> (Array f64)
+  (let ((b (cell (array (count v) 0.0)))) (do (dotimes (i (count v)) (array-set! &b i (nth v i))) @b)))
+(defun pairs-x-f64 () -> (Array f64) (let ((s (sp-f64)) (k (array-len s)) (b (cell (array (* k k) 0.0)))) (do (dotimes (i (* k k)) (array-set! &b i (array-get s (rem i k)))) @b)))
+(defun pairs-y-f64 () -> (Array f64) (let ((s (sp-f64)) (k (array-len s)) (b (cell (array (* k k) 0.0)))) (do (dotimes (i (* k k)) (array-set! &b i (array-get s (quot i k)))) @b)))
+(defun take-f64 (a: (Array f64) n: i64) -> (Array f64) (let ((b (cell (array n 0.0)))) (do (dotimes (i n) (array-set! &b i (array-get a i))) @b)))
+(defun same-f64 (a: (Vec f64) b: (Vec f64)) -> bool (= (mapv (fn (x: f64) (f64->bits x)) a) (mapv (fn (x: f64) (f64->bits x)) b)))
+(defun oracle-f64 (op: i64 xs: (Vec f64) ys: (Vec f64)) -> (Vec bool) (mapv (fn (i: i64) (ocmp op (nth xs i) (nth ys i))) (range (count xs))))
+
+(defun check-compare-f64 (c: Checks) -> unit
+  (let ((px (pairs-x-f64)) (py (pairs-y-f64)))
+    (dotimes (op 5)
+      (do ;; every pair of specials, dense
+          (let ((n (array-len px)) (x (t/from-array [(array-len px)] px 0.0)) (y (t/from-array [(array-len py)] py 0.0)))
+            (do (check c (= (t/to-vec (tcmp-f64 op x y)) (oracle-f64 op (t/to-vec x) (t/to-vec y))))
+                ;; a transposed view of each side (not dense), and a slice with an offset
+                (let ((xm (t/reshape [19 19] x)) (ym (t/reshape [19 19] y)))
+                  (check c (= (t/to-vec (tcmp-f64 op (t/transpose xm) ym)) (oracle-f64 op (t/to-vec (t/transpose xm)) (t/to-vec ym)))))
+                (let ((xs (t/slice 0 7 300 1 x)) (ys (t/slice 0 3 296 1 y)))
+                  (check c (= (t/to-vec (tcmp-f64 op xs ys)) (oracle-f64 op (t/to-vec xs) (t/to-vec ys)))))))
+          ;; a broadcast scalar on either side, every special as the scalar
+          (let ((s (sp-f64)) (x (t/from-array [(array-len px)] px 0.0)))
+            (dotimes (k (array-len s))
+              (let ((v (array-get s k)) (sv (t/full [] (array-get s k))) (full (t/to-vec x)))
+                (do (check c (= (t/to-vec (tcmp-f64 op x sv)) (mapv (fn (a: f64) (ocmp op a v)) full)))
+                    (check c (= (t/to-vec (tcmp-f64 op sv x)) (mapv (fn (a: f64) (ocmp op v a)) full)))))))
+          ;; every length around the lane width, tensor against tensor and against a scalar
+          (dotimes (len 20)
+            (let ((x (t/from-array [len] (take-f64 px len) 0.0)) (y (t/from-array [len] (take-f64 (arr-f64 (vec (reverse (t/to-vec (t/from-array [361] py 0.0))))) len) 0.0)))
+              (do (check c (= (t/to-vec (tcmp-f64 op x y)) (oracle-f64 op (t/to-vec x) (t/to-vec y))))
+                  (check c (= (t/shape (tcmp-f64 op x y)) [len])))))))))
+
+(defun check-where-f64 (c: Checks) -> unit
+  (let ((px (pairs-x-f64)) (py (pairs-y-f64)))
+    (dotimes (len 40)
+      (let ((m (mask len)) (x (t/from-array [len] (take-f64 px len) 0.0)) (y (t/from-array [len] (take-f64 py len) 0.0))
+            (pv (mapv pattern (range len))))
+        (do (check c (same-f64 (t/to-vec (t/where m x y)) (mapv (fn (i: i64) (if (nth pv i) (nth (t/to-vec x) i) (nth (t/to-vec y) i))) (range len))))
+            ;; scalar branches
+            (let ((zs (t/full [] (array-get (sp-f64) 1))))
+              (do (check c (same-f64 (t/to-vec (t/where m x zs)) (mapv (fn (i: i64) (if (nth pv i) (nth (t/to-vec x) i) (array-get (sp-f64) 1))) (range len))))
+                  (check c (same-f64 (t/to-vec (t/where m zs y)) (mapv (fn (i: i64) (if (nth pv i) (array-get (sp-f64) 1) (nth (t/to-vec y) i))) (range len))))))
+            ;; a mask made by a comparison, selecting from the same operands (min by select)
+            (check c (same-f64 (t/to-vec (t/where (t/less x y) x y)) (mapv (fn (i: i64) (if (< (nth (t/to-vec x) i) (nth (t/to-vec y) i)) (nth (t/to-vec x) i) (nth (t/to-vec y) i))) (range len)))))))
+    ;; an offset slice of the mask and of both operands
+    (let ((m (t/slice 0 2 40 1 (mask 60))) (x (t/slice 0 5 43 1 (t/from-array [361] px 0.0))) (y (t/slice 0 9 47 1 (t/from-array [361] py 0.0))))
+      (check c (same-f64 (t/to-vec (t/where m x y)) (mapv (fn (i: i64) (if (pattern (+ i 2)) (nth (t/to-vec x) i) (nth (t/to-vec y) i))) (range 38)))))
+    ;; a transposed operand falls back to the indexed walk and gives the same logical values
+    (let ((x (t/transpose (t/reshape [19 19] (t/from-array [361] px 0.0)))) (y (t/reshape [19 19] (t/from-array [361] py 0.0)))
+          (m (t/reshape [19 19] (mask 361))))
+      (check c (same-f64 (t/to-vec (t/where m x y)) (mapv (fn (i: i64) (if (nth (t/to-vec m) i) (nth (t/to-vec x) i) (nth (t/to-vec y) i))) (range 361)))))))
+
+(defun relu-oracle-f64 (g: f64 x: f64) -> f64 (if (> x 0.0) g 0.0))
+(defun check-relu-f64 (c: Checks) -> unit
+  (let ((px (pairs-x-f64)) (py (pairs-y-f64)))
+    (do (let ((x (t/from-array [361] px 0.0)) (g (t/from-array [361] py 0.0)))
+          (do ;; the select semantics over every pair: g where x > 0, else +0.0, whatever g is (NaN, inf)
+              (check c (= (mapv (fn (v: f64) (f64->bits v)) (t/to-vec (t/relu-grad g x)))
+                          (mapv (fn (i: i64) (f64->bits (relu-oracle-f64 (nth (t/to-vec g) i) (nth (t/to-vec x) i)))) (range 361))))
+              (check c (= (mapv (fn (v: f64) (f64->bits v)) (t/to-vec (t/relu-mask x)))
+                          (mapv (fn (i: i64) (f64->bits (if (> (nth (t/to-vec x) i) 0.0) 1.0 0.0))) (range 361))))
+              ;; the mask of relu's output is the mask of its input, +inf included
+              (check c (= (t/to-vec (t/relu-mask (t/relu x))) (t/to-vec (t/relu-mask x))))
+              ;; views: transposed g, an offset slice of x, a broadcast g
+              (let ((gm (t/reshape [19 19] g)) (xm (t/reshape [19 19] x)))
+                (check c (= (mapv (fn (v: f64) (f64->bits v)) (t/to-vec (t/relu-grad (t/transpose gm) xm)))
+                            (mapv (fn (i: i64) (f64->bits (relu-oracle-f64 (nth (t/to-vec (t/transpose gm)) i) (nth (t/to-vec xm) i)))) (range 361)))))
+              (let ((xs (t/slice 0 3 100 1 x)) (gs (t/slice 0 11 108 1 g)))
+                (check c (= (mapv (fn (v: f64) (f64->bits v)) (t/to-vec (t/relu-grad gs xs)))
+                            (mapv (fn (i: i64) (f64->bits (relu-oracle-f64 (nth (t/to-vec gs) i) (nth (t/to-vec xs) i)))) (range 97)))))
+              (let ((row (t/from-array [1 19] (take-f64 py 19) 0.0)) (xm (t/reshape [19 19] x)))
+                (check c (= (mapv (fn (v: f64) (f64->bits v)) (t/to-vec (t/relu-grad row xm)))
+                            (mapv (fn (i: i64) (f64->bits (relu-oracle-f64 (nth (t/to-vec row) (rem i 19)) (nth (t/to-vec xm) i)))) (range 361)))))))
+        ;; every length around the lane width
+        (dotimes (len 20)
+          (let ((x (t/from-array [len] (take-f64 px len) 0.0)) (g (t/from-array [len] (take-f64 py len) 0.0)))
+            (check c (= (mapv (fn (v: f64) (f64->bits v)) (t/to-vec (t/relu-grad g x)))
+                        (mapv (fn (i: i64) (f64->bits (relu-oracle-f64 (nth (t/to-vec g) i) (nth (t/to-vec x) i)))) (range len))))))
+        ;; named points: relu(-0.0), relu(NaN), gradient at 0 is 0 (PyTorch), +inf passes, a NaN gradient under x <= 0 is 0, under x > 0 it stays NaN
+        (let ((nan (- (/ 1.0 0.0) (/ 1.0 0.0))) (inf (/ 1.0 0.0)))
+          (do (check c (= (f64->bits (t/item (t/relu (t/full [] (- 0.0 1.0 ) )))) (f64->bits 0.0)))
+              (check c (= (f64->bits (t/item (t/relu (t/full [] nan)))) (f64->bits 0.0)))
+              (check c (= (t/item (t/relu-grad (t/full [] 1.0) (t/full [] 0.0))) 0.0))
+              (check c (= (t/item (t/relu-grad (t/full [] 1.0) (t/full [] inf))) 1.0))
+              (check c (= (f64->bits (t/item (t/relu-grad (t/full [] nan) (t/full [] (- 0.0 1.0))))) (f64->bits 0.0)))
+              (check c (!= (t/item (t/relu-grad (t/full [] nan) (t/full [] 1.0))) (t/item (t/relu-grad (t/full [] nan) (t/full [] 1.0)))))
+              (check c (= (t/item (t/relu-grad (t/full [] 1.0) (t/full [] nan))) 0.0))
+              (check c (= (t/item (t/relu-mask (t/full [] inf))) 1.0)))))))
+
+;; ---- i64: the comparisons and where on the scalar instance
+(defun check-i64 (c: Checks) -> unit
+  (let ((vals [0 1 -1 5 -5 9223372036854775807 -9223372036854775807 3]))
+    (dotimes (op 5)
+      (dotimes (len 20)
+        (let ((xs (mapv (fn (i: i64) (nth vals (rem i 8))) (range len))) (ys (mapv (fn (i: i64) (nth vals (rem (+ i 3) 8))) (range len))))
+          (let ((x (t/from-array [len] (t/to-array (t/tensor-i64 xs)) 0)) (y (t/from-array [len] (t/to-array (t/tensor-i64 ys)) 0)))
+            (do (check c (= (t/to-vec (tcmp-i64 op x y)) (mapv (fn (i: i64) (ocmp op (nth xs i) (nth ys i))) (range len))))
+                (check c (= (t/to-vec (t/where (mask len) x y)) (mapv (fn (i: i64) (if (pattern i) (nth xs i) (nth ys i))) (range len)))))))))))
+
+(defun tcmp-i64 (op: i64 a: (t/Tensor i64) b: (t/Tensor i64)) -> (t/Tensor bool)
+  (cond (= op 0) (t/equal a b) (= op 1) (t/less a b) (= op 2) (t/less-equal a b) (= op 3) (t/greater a b) :else (t/greater-equal a b)))
+
+(defun main () -> i64
+  (let ((c (checks)) (p (checks)))
+    (do (check-compare-f32 c) (check-compare-f64 c) (check-where-f32 c) (check-where-f64 c) (check-relu-f32 c) (check-relu-f64 c) (check-i64 c)
+        ;; planted faults: oracles that are wrong in one way, run against the same library calls, must be detected
+        (let ((x (t/tensor [1.0 2.0 3.0])) (y (t/tensor [3.0 2.0 1.0])) (q (checks)))
+          (do (check q (= (t/to-vec (t/greater x y)) [false false true]))      ; the oracle is wrong: it should be [false false true] for greater? (1>3 f, 2>2 f, 3>1 t) -- right
+              (check q (= (t/to-vec (t/greater-equal x y)) [false false true])) ; wrong: 2 >= 2 is true
+              (check-detects c q)))
+        (let ((q (checks)))
+          (do (check q (= (t/to-vec (t/relu-grad (t/tensor [1.0 1.0]) (t/tensor [0.0 1.0]))) [1.0 1.0])) ; wrong: x = 0 gives 0
+              (check-detects c q)))
+        (let ((q (checks)))
+          (do (check q (= (t/to-vec (t/where (mask 3) (t/tensor [1.0 2.0 3.0]) (t/tensor [4.0 5.0 6.0]))) [4.0 2.0 3.0])) ; wrong: pattern 0 is true: [1 5 6]
+              (check-detects c q)))
+        (checks-result c))))

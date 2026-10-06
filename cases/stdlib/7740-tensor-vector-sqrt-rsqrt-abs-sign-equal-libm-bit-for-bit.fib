@@ -1,0 +1,116 @@
+;; spec: lib/fib/tensor/unary.fib (header) and README.md (Vector sqrt, rsqrt, abs and sign): sqrt is IEEE and bit-identical to libm for f32 and f64 over every exponent, NaN and signed zero
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; The oracle is the scalar libm sqrt (fib.math/sqrt) and bit tests written here. Inputs are 4096 pseudo-random bit patterns of every exponent (including
+;; subnormals, infinities and NaNs), the special values, every tail length 0..19, a transposed view and a broadcast. A sqrt that rounds wrongly, loses the sign
+;; of -0.0, returns a number for a negative, or mishandles a tail changes some element; two planted wrong oracles must be detected.
+(ns main (:require [fib.tensor :as t] [fib.math :as math]) (:use tl.check))
+
+(defun nan64? (x: f64) -> bool (!= x x))
+(defun same64 (a: f64 b: f64) -> bool (or (= (f64->bits a) (f64->bits b)) (and (nan64? a) (nan64? b))))
+(defun nan32? (x: f32) -> bool (!= x x))
+(defun same32 (a: f32 b: f32) -> bool (or (= (f32->bits a) (f32->bits b)) (and (nan32? a) (nan32? b))))
+
+(defun mix (i: i64) -> i64 (unchecked-add (unchecked-multiply (+ i 12345) 2862933555777941757) 3037000493))
+(defun bits64 (i: i64) -> f64 (bits->f64 (mix (mix i))))
+(defun bits32 (i: i64) -> f32 (bits->f32 (trunc i32 (shr (mix (mix i)) 20))))
+
+(defun gen64 (n: i64) -> (Array f64)
+  (let ((b (cell (array n 0.0)))) (do (dotimes (i n) (array-set! &b i (bits64 i))) @b)))
+(defun gen32 (n: i64) -> (Array f32)
+  (let ((b (cell (array n 0.0f32)))) (do (dotimes (i n) (array-set! &b i (bits32 i))) @b)))
+
+;; scalar oracles
+(defun sqrt64 (x: f64) -> f64 (math/sqrt x))
+(defun sqrt32 (x: f32) -> f32 (fptrunc f32 (math/sqrt (double x))))
+(defun abs64 (x: f64) -> f64 (bits->f64 (bit-and (f64->bits x) 9223372036854775807)))
+(defun abs32 (x: f32) -> f32 (bits->f32 (bit-and (f32->bits x) 2147483647i32)))
+(defun sign64 (x: f64) -> f64 (cond (> x 0.0) 1.0 (< x 0.0) -1.0 :else x))
+(defun sign32 (x: f32) -> f32 (cond (> x 0.0f32) 1.0f32 (< x 0.0f32) -1.0f32 :else x))
+(defun rsqrt64 (x: f64) -> f64 (fdiv 1.0 (math/sqrt x)))
+(defun rsqrt32 (x: f32) -> f32 (fdiv 1.0f32 (sqrt32 x)))
+
+(defun all64 (got: (t/Tensor f64) want: (Array f64)) -> bool
+  (let ((g (t/to-array got)))
+    (and (= (array-len g) (array-len want))
+         (loop ((i 0)) (if (< i (array-len g)) (if (same64 (array-get g i) (array-get want i)) (recur (+ i 1)) false) true)))))
+(defun all32 (got: (t/Tensor f32) want: (Array f32)) -> bool
+  (let ((g (t/to-array got)))
+    (and (= (array-len g) (array-len want))
+         (loop ((i 0)) (if (< i (array-len g)) (if (same32 (array-get g i) (array-get want i)) (recur (+ i 1)) false) true)))))
+
+(defun map64 (f: (fn (f64) f64) :borrow xs: (Array f64)) -> (Array f64)
+  (let ((b (cell (array (array-len xs) 0.0)))) (do (dotimes (i (array-len xs)) (array-set! &b i (f (array-get xs i)))) @b)))
+(defun map32 (f: (fn (f32) f32) :borrow xs: (Array f32)) -> (Array f32)
+  (let ((b (cell (array (array-len xs) 0.0f32)))) (do (dotimes (i (array-len xs)) (array-set! &b i (f (array-get xs i)))) @b)))
+
+(defun arr64 (v: (Vec f64)) -> (Array f64) (t/to-array (t/tensor v)))
+(defun arr32 (v: (Vec f32)) -> (Array f32)
+  (let ((b (cell (array (count v) 0.0f32)))) (do (dotimes (i (count v)) (array-set! &b i (nth v i))) @b)))
+
+(defun special64 () -> (Array f64)
+  (let ((inf (/ 1.0 0.0)))
+    (arr64 [0.0 -0.0 1.0 4.0 -1.0 2.0 0.25 3.0 1.0e-310 -1.0e-310 4.9e-324 1.0e300 1.7976931348623157e308 inf (- 0.0 inf) (- inf inf) 1.0e-5 123456789.0 -4.0])))
+(defun special32 () -> (Array f32)
+  (arr32 [0.0f32 -0.0f32 1.0f32 4.0f32 -1.0f32 2.0f32 0.25f32 3.0f32 1.0e-40f32 -1.0e-40f32 1.0e-45f32 1.0e30f32 3.4028235e38f32
+                                    (bits->f32 2139095040i32) (bits->f32 -8388608i32) (bits->f32 2143289344i32) 1.0e-5f32 123456789.0f32 -4.0f32]))
+
+(defun check64 (c: Checks xs: (Array f64)) -> unit
+  (let ((v (t/from-array [(array-len xs)] xs 0.0)))
+    (do (check c (all64 (t/sqrt v) (map64 sqrt64 xs)))
+        (check c (all64 (t/rsqrt v) (map64 rsqrt64 xs)))
+        (check c (all64 (t/abs v) (map64 abs64 xs)))
+        (check c (all64 (t/sign v) (map64 sign64 xs))))))
+(defun check32 (c: Checks xs: (Array f32)) -> unit
+  (let ((v (t/from-array [(array-len xs)] xs 0.0f32)))
+    (do (check c (all32 (t/sqrt v) (map32 sqrt32 xs)))
+        (check c (all32 (t/rsqrt v) (map32 rsqrt32 xs)))
+        (check c (all32 (t/abs v) (map32 abs32 xs)))
+        (check c (all32 (t/sign v) (map32 sign32 xs))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p (checks)))
+    (do (check64 c (gen64 4096)) (check32 c (gen32 4096))
+        (check64 c (special64)) (check32 c (special32))
+        ;; every tail length, both widths
+        (dotimes (len 20) (do (check64 c (gen64 len)) (check32 c (gen32 len))))
+        ;; named values: sqrt of a negative is NaN, of -0.0 is -0.0 (the sign bit survives), of +inf is +inf
+        (check c (nan64? (t/item (t/sqrt (t/full [] -1.0)))))
+        (check c (= (f64->bits (t/item (t/sqrt (t/full [] -0.0)))) (f64->bits -0.0)))
+        (check c (= (f32->bits (t/item (t/sqrt (t/full [] -0.0f32)))) (f32->bits -0.0f32)))
+        (check c (= (t/item (t/sqrt (t/full [] 2.25))) 1.5))
+        (check c (= (f64->bits (t/item (t/abs (t/full [] -0.0)))) 0))
+        (check c (= (f64->bits (t/item (t/sign (t/full [] -0.0)))) (f64->bits -0.0)))
+        (check c (nan64? (t/item (t/sign (t/full [] (- (/ 1.0 0.0) (/ 1.0 0.0)))))))
+        ;; a transposed view (non-dense) and a broadcast read in logical order
+        (let ((xs (gen64 35)) (m (t/reshape [5 7] (t/from-array [35] xs 0.0))))
+          (let ((tv (t/to-array (t/transpose m))))
+            (do (check c (all64 (t/sqrt (t/transpose m)) (map64 sqrt64 tv)))
+                (check c (all64 (t/sign (t/transpose m)) (map64 sign64 tv)))
+                (check c (= (t/shape (t/sqrt (t/transpose m))) [7 5])))))
+        (let ((xs (gen32 7)) (r (t/broadcast-to [3 7] (t/from-array [7] xs 0.0f32))))
+          (do (check c (all32 (t/abs r) (map32 abs32 (t/to-array r))))
+              (check c (= (t/shape (t/abs r)) [3 7]))))
+        ;; an offset slice of a dense buffer (dense, nonzero offset), both widths
+        (let ((xs (gen64 40)) (ys (gen32 40)))
+          (do (check c (all64 (t/sqrt (t/slice 0 5 37 1 (t/from-array [40] xs 0.0)))
+                              (map64 sqrt64 (t/to-array (t/slice 0 5 37 1 (t/from-array [40] xs 0.0))))))
+              (check c (all32 (t/sqrt (t/slice 0 3 35 1 (t/from-array [40] ys 0.0f32)))
+                              (map32 sqrt32 (t/to-array (t/slice 0 3 35 1 (t/from-array [40] ys 0.0f32))))))
+              (check c (= (f64->bits (t/item (t/sqrt (t/slice 0 5 6 1 (t/from-array [40] xs 0.0))))) (f64->bits (sqrt64 (array-get xs 5)))))))
+        ;; empty
+        (check c (= (t/size (t/sqrt (t/from-array [0] (array 0 0.0) 0.0))) 0))
+        ;; planted faults: an oracle that is wrong in one way must be detected
+        (check64 p (map64 (fn (x: f64) (+ x 0.0)) (gen64 0)))
+        (check c (= (checks-result p) 0))
+        (let ((v (t/from-array [3] (arr64 [4.0 9.0 16.0]) 0.0)))
+          (let ((q (checks)))
+            (do (check q (all64 (t/sqrt v) (arr64 [2.0 3.0 5.0])))
+                (check-detects c q))))
+        (let ((v (t/from-array [2] (arr64 [-0.0 1.0]) 0.0)) (q (checks)))
+          (do (check q (all64 (t/abs v) (arr64 [-0.0 1.0])))
+              (check-detects c q)))
+        (checks-result c))))
