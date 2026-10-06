@@ -1,7 +1,7 @@
 #!/bin/bash
 # Planted faults of the fibgen port (docs/design/fibgen-port.md 5.2 rule 3): each fault is an exact one-place change to a source file; the script applies it, runs the check that must
 # catch it, requires that check to FAIL, restores the file and requires the restored file to equal the saved copy. A fault that does not fail its check is a check that cannot fail.
-# usage: planted.sh [NAME..]       (no name: all)     FIBC names a stage 2 built from the tree; TMPDIR is the scratch directory.
+# usage: planted.sh [NAME..]       (no name: all)     FIBC names a stage 2 built from the tree; TMPDIR is the scratch directory.  The faults go into a copy of the tree under TMPDIR; the tree itself is not touched.
 # Faults:  draw-order    two draws of lambdas.fib swapped                      caught by compare.sh pipelines
 #          size-rule     the source length bound 3 + 2*size becomes 4 + 2*size    caught by compare.sh pipelines
 #          escape        the printer's backslash escape loses a backslash      caught by unit-print
@@ -15,6 +15,10 @@ root=$(cd "$here/../../.." && pwd)
 fibc=${FIBC:-fibc}
 export FIB_LIB=${FIB_LIB:-$root/lib}
 tmp=${TMPDIR:-/tmp}/planted-$$; mkdir -p "$tmp"; trap 'rm -rf "$tmp"' EXIT
+# The faults are planted in a private copy of compiler/ and lib/, never in the tree itself: other scripts (the gate runs them side by side) read
+# the tree while this one runs, and a fault planted in it would be a fault they compile in.
+mkdir -p "$tmp/tree"; cp -a "$root/compiler" "$root/lib" "$tmp/tree/"
+root=$tmp/tree; here=$root/compiler/tests/gen; export FIB_LIB=$root/lib
 cd "$root" || exit 2
 
 build_tool() { "$fibc" build compiler/fibgen.fib -I compiler -I lib -o "$tmp/fibgen" 2> "$tmp/build.err" || { cat "$tmp/build.err"; return 1; }; }

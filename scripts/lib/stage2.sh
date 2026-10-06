@@ -49,8 +49,10 @@ llvm_link_args() {
   esac
 }
 
+# SLOTS_SH runs a command under a slot of the gate's budget (scripts/lib/slots.sh); without GATE_SLOTS it just runs it
+SLOTS_SH=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/slots.sh
 build_with() { # build_with FIBC OUT: stage 2 from the tree with FIBC
-  (cd "$root" && "$1" build compiler/fibc.fib -I compiler -I lib "${LLVM_ARGS[@]}" -o "$2")
+  (cd "$root" && "$SLOTS_SH" "$1" build compiler/fibc.fib -I compiler -I lib "${LLVM_ARGS[@]}" -o "$2")
 }
 
 # stage2_ensure: F built from this tree at $GATE_OUT/F (cached by stamp). Prints what it did.
@@ -68,7 +70,7 @@ stage2_ensure() {
   echo "build: built in $(elapsed "$t0" "$(now)") s"
 }
 
-emit_with() { (cd "$root" && "$1" emit -I compiler -I lib compiler/fibc.fib); }
+emit_with() { (cd "$root" && "$SLOTS_SH" "$1" emit -I compiler -I lib compiler/fibc.fib); }
 
 # stage3_check: F builds F3, and F and F3 emit the same lIR (the fixed point of CI's stage check). Cached by stamp.
 stage3_check() {
