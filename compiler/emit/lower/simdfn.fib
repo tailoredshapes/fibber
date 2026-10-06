@@ -109,6 +109,25 @@
           (= from to) (Ok x)
           :else (Ok (val cx (str-join ["(bitcast " (lir-ty-text to) " " (v-text x) ")"]) to)))))
 
+;; ---- movemask, ctz, clz (JSON-2)
+
+;; `(simd/movemask m)`: the lanes of the mask as the low bits of an i64, lane 0 the lowest bit: `(bitcast iN m)` of the `<N x i1>` (one `pmovmskb`, `vpmovmskb`
+;; or `kmov` on x86), the mask padded with false lanes up to 8, 16, 32 or 64 when it has other than those (the lIR has no `i3`), then `zext` to i64.
+(defun lcx-movemask (cx: LowerCx x: V) -> V
+  (let ((n (lanes-of (ty-of x))))
+    (let ((w (cond (<= n 8) 8 (<= n 16) 16 (<= n 32) 32 :else 64)))
+      (let ((wt (cond (= w 8) LirI8 (= w 16) LirI16 (= w 32) LirI32 :else LirI64))
+            (m (if (= n w)
+                   x
+                   (val cx (str-join ["(shufflevector " (v-text x) " (zeroinitializer " (lir-ty-text (ty-of x)) ") "
+                                      (mask-text (mapv (fn (i: i64) (if (< i n) i n)) (range w))) ")"]) (LirVec LirI1 w)))))
+        (let ((b (val cx (str-join ["(bitcast " (lir-ty-text wt) " " (v-text m) ")"]) wt)))
+          (if (= w 64) b (val cx (str-join ["(zext i64 " (v-text b) ")"]) LirI64)))))))
+
+;; `ctz x` and `clz x` of an integer: the lIR `cttz` and `ctlz` (a zero has as many zeros as the type has bits, never poison).
+(defun lcx-count-zeros (cx: LowerCx name: str x: V) -> V
+  (val cx (str-join ["(" (if (= name "ctz") "cttz" "ctlz") " " (v-text x) ")"]) (ty-of x)))
+
 ;; ---- shuffles and constants
 
 ;; The literal integer lanes of the call's argument `i`, when it is a vector literal of integer literals.
@@ -152,4 +171,4 @@
 
 (defun simd-fn-name? (name: str) -> bool
   (contains? (set ["simd/fma" "simd/muladd" "simd/bitcast" "simd/sqrt" "simd/floor" "simd/ceil" "simd/trunc" "simd/round" "simd/round-even" "simd/abs" "simd/min" "simd/max"
-                   "simd/min-num" "simd/max-num" "simd/convert" "simd/reverse" "simd/shuffle" "simd/lanes" "simd/kind"]) name))
+                   "simd/min-num" "simd/max-num" "simd/movemask" "ctz" "clz" "simd/convert" "simd/reverse" "simd/shuffle" "simd/lanes" "simd/kind"]) name))

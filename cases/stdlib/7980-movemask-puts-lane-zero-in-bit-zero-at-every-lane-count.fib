@@ -1,0 +1,56 @@
+;; spec:   types §1.9 (simd/movemask)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; `(simd/movemask m)` is the lanes of a mask as the low bits of an i64, lane 0 the lowest bit, 1 to 64 lanes (lIR `bitcast` of `<n x i1>`; lane counts that are
+;; not 8, 16, 32 or 64 are padded with false lanes). The masks are made by comparisons with known answers; `planted` expects the mask of a reversed lane order to differ.
+(ns main (:use fib.core tl.check))
+
+(defun m8 (c: Checks) -> unit
+  (let ((a: i8x16 <<0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15>>i8))
+    (do (check c (= (simd/movemask (simd/lt a (splat i8x16 3i8))) 7))          ; lanes 0 1 2
+        (check c (= (simd/movemask (simd/eq a (splat i8x16 15i8))) 32768))     ; lane 15 only
+        (check c (= (simd/movemask (simd/eq a (splat i8x16 0i8))) 1))          ; lane 0 only
+        (check c (= (simd/movemask (simd/ge a (splat i8x16 0i8))) 65535))      ; all
+        (check c (= (simd/movemask (simd/lt a (splat i8x16 0i8))) 0)))))
+
+(defun odd-counts (c: Checks) -> unit
+  (let ((a: i32x4 <<5 1 5 1>>i32) (b: i16x8 <<9 0 0 9 0 0 0 9>>i16) (d: i64x2 <<7 0>>i64))
+    (do (check c (= (simd/movemask (simd/eq a (splat i32x4 5i32))) 5))         ; lanes 0 2
+        (check c (= (simd/movemask (simd/eq b (splat i16x8 9i16))) 137))       ; lanes 0 3 7 = 1+8+128
+        (check c (= (simd/movemask (simd/eq d (splat i64x2 7i64))) 1))
+        (check c (= (simd/movemask (simd/ne d (splat i64x2 7i64))) 2))
+        (let ((t: i32x8 <<1 0 0 0 0 0 0 1>>i32) (u: i8x1 <<4>>i8))
+          (do (check c (= (simd/movemask (simd/eq t (splat i32x8 1i32))) 129))
+              (check c (= (simd/movemask (simd/eq u (splat i8x1 4i8))) 1)))))))
+
+(defun m32-64 (c: Checks) -> unit
+  (let ((arr (cell (array 64 0i8))))
+    (do (dotimes (k 64) (array-set! &arr k (if (>= k 32) 1i8 0i8)))
+        (let ((x: i8x32 (simd-load @arr 0)) (y: i8x32 (simd-load @arr 32)) (v: i8x64 (simd-load @arr 0)))
+          (do (check c (= (simd/movemask (simd/eq y (splat i8x32 1i8))) 4294967295))
+              (check c (= (simd/movemask (simd/eq x (splat i8x32 1i8))) 0))
+              (check c (= (simd/movemask (simd/eq v (splat i8x64 1i8))) -4294967296))     ; the upper 32 lanes: 0xFFFFFFFF00000000
+              (check c (= (simd/movemask (simd/eq v (splat i8x64 0i8))) 4294967295))
+              (check c (= (simd/movemask (simd/eq v (splat i8x64 5i8))) 0)))))))
+
+(defun alternate (c: Checks) -> unit
+  (let ((arr (cell (array 32 0i8))))
+    (do (dotimes (k 32) (array-set! &arr k (if (= (bit-and k 1) 1) 1i8 0i8)))
+        (let ((x: i8x32 (simd-load @arr 0)))
+          (check c (= (simd/movemask (simd/eq x (splat i8x32 1i8))) 2863311530))))))   ; odd lanes: 0xAAAAAAAA, zero-extended
+
+(defun counts (c: Checks) -> unit
+  (do (check c (= (ctz 8) 3)) (check c (= (ctz 1) 0)) (check c (= (ctz 0) 64)) (check c (= (ctz -9223372036854775808) 63))
+      (check c (= (clz 1) 63)) (check c (= (clz 0) 64)) (check c (= (clz -1) 0)) (check c (= (clz 4096) 51))
+      (check c (= (ctz 0i32) 32i32)) (check c (= (clz 1i32) 31i32)) (check c (= (ctz 12i8) 2i8)) (check c (= (clz 0i8) 8i8))
+      (check c (= (lane (ctz <<8 1 0 64>>i32) 3) 6i32)) (check c (= (lane (clz <<8 1 0 64>>i32) 2) 32i32))))
+
+(defun planted (c: Checks) -> unit
+  (let ((p (checks)) (a: i8x16 <<0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15>>i8))
+    (do (check p (= (simd/movemask (simd/lt (simd/reverse a) (splat i8x16 3i8))) 7))
+        (check-detects c p))))
+
+(defun main () -> i64 (let ((c (checks))) (do (m8 c) (odd-counts c) (m32-64 c) (alternate c) (counts c) (planted c) (checks-result c))))
