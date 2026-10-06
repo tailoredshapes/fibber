@@ -1,0 +1,133 @@
+;; compiler/js/scalar.fib: the JS text of lIR's scalar operations on operand texts (docs/design/js-backend.md, decision 1). Each function
+;; takes the operands' JS texts and the scalar type; each operand text appears exactly once in the result, in lIR's order, so an operand
+;; with an effect (a call) runs once and in order. A vector operation maps one of these over the lanes (js.expr).
+;;
+;; Values: i1 is 0 or 1; i8, i16, i32 a JS number holding the signed value; i64 a BigInt holding the signed value; float a number Math.fround
+;; has rounded; double a number; ptr a number (the address).
+(ns js.scalar
+  (:use lir.types lir.lit lir.ast js.jx))
+
+(defun p :private (a: str) -> str (str "(" a ")"))
+
+;; The signed value of the low `bits` bits of a 32-bit JS integer text.
+(defun wrap-small (bits: i64 a: str) -> str
+  (cond (= bits 32) (str "(" a "|0)")
+        (= bits 1) (str "(" a "&1)")
+        :else (str "((" a ")<<" (- 32 bits) ">>" (- 32 bits) ")")))
+
+(defun mask-text :private (bits: i64) -> str (str (- (shl 1 bits) 1)))
+
+;; The unsigned value of an iK text (K < 64).
+(defun unsigned-small (bits: i64 a: str) -> str
+  (cond (= bits 32) (str "(" a ">>>0)")
+        (= bits 1) a
+        :else (str "(" a "&" (mask-text bits) ")")))
+
+(defun big (a: str) -> str (str "BigInt.asIntN(64," a ")"))
+
+;; ---------------------------------------------------------------- integer literals
+
+;; The canonical JS text of the iK value of a literal: signed for K from 8 to 64, 0 or 1 for i1.
+(defun int-literal (bits: i64 v: LLit) -> str
+  (let ((w (lit-low v bits)))
+    (cond (= bits 64) (if (< w 0) (str "(" w "n)") (str w "n"))
+          (= bits 1) (str w)
+          :else (let ((s (if (>= w (shl 1 (- bits 1))) (- w (shl 1 bits)) w)))
+                  (if (< s 0) (str "(" s ")") (str s))))))
+
+;; ---------------------------------------------------------------- integer arithmetic
+
+(defun bin64 :private (op: LBinOp a: str b: str) -> str
+  (match op
+    ((BAdd) (big (str a "+" b))) ((BSub) (big (str a "-" b))) ((BMul) (big (str a "*" b)))
+    ((BSDiv) (str "$sdiv64(" a "," b ")")) ((BUDiv) (str "$udiv64(" a "," b ")"))
+    ((BSRem) (str "$srem64(" a "," b ")")) ((BURem) (str "$urem64(" a "," b ")"))
+    ((BAnd) (p (str a "&" b))) ((BOr) (p (str a "|" b))) ((BXor) (p (str a "^" b)))
+    ((BShl) (big (str a "<<(" b "&63n)")))
+    ((BAShr) (p (str a ">>(" b "&63n)")))
+    ((BLShr) (big (str "BigInt.asUintN(64," a ")>>(" b "&63n)")))
+    (_ "$unsupported('float op on i64')")))
+
+(defun bin32 :private (op: LBinOp a: str b: str) -> str
+  (match op
+    ((BAdd) (str "(" a "+" b "|0)")) ((BSub) (str "(" a "-" b "|0)")) ((BMul) (str "Math.imul(" a "," b ")"))
+    ((BSDiv) (str "$sdiv32(" a "," b ")")) ((BUDiv) (str "$udiv32(" a "," b ")"))
+    ((BSRem) (str "$srem32(" a "," b ")")) ((BURem) (str "$urem32(" a "," b ")"))
+    ((BAnd) (p (str a "&" b))) ((BOr) (p (str a "|" b))) ((BXor) (p (str a "^" b)))
+    ((BShl) (p (str a "<<" b))) ((BAShr) (p (str a ">>" b))) ((BLShr) (str "(" a ">>>" b "|0)"))
+    (_ "$unsupported('float op on i32')")))
+
+;; i8 and i16: computed as i32 and cut back to the signed value.
+(defun bin-small :private (bits: i64 op: LBinOp a: str b: str) -> str
+  (let ((m (mask-text bits)))
+    (match op
+      ((BAdd) (wrap-small bits (str a "+" b))) ((BSub) (wrap-small bits (str a "-" b)))
+      ((BMul) (wrap-small bits (str "Math.imul(" a "," b ")")))
+      ((BSDiv) (wrap-small bits (str "$sdivn(" a "," b ")"))) ((BSRem) (wrap-small bits (str "$sremn(" a "," b ")")))
+      ((BUDiv) (wrap-small bits (str "$udiv32(" a "&" m "," b "&" m ")")))
+      ((BURem) (wrap-small bits (str "$urem32(" a "&" m "," b "&" m ")")))
+      ((BAnd) (p (str a "&" b))) ((BOr) (p (str a "|" b))) ((BXor) (p (str a "^" b)))
+      ((BShl) (wrap-small bits (str a "<<" b))) ((BAShr) (p (str a ">>" b)))
+      ((BLShr) (wrap-small bits (str "(" a "&" m ")>>>" b)))
+      (_ "$unsupported('float op on a small integer')"))))
+
+;; i1: arithmetic modulo 2.
+(defun bin1 :private (op: LBinOp a: str b: str) -> str
+  (match op
+    ((BAdd) (p (str a "^" b))) ((BSub) (p (str a "^" b))) ((BXor) (p (str a "^" b)))
+    ((BMul) (p (str a "&" b))) ((BAnd) (p (str a "&" b))) ((BOr) (p (str a "|" b)))
+    ((BSDiv) (str "$udiv32(" a "," b ")")) ((BUDiv) (str "$udiv32(" a "," b ")"))
+    ((BSRem) (str "$urem32(" a "," b ")")) ((BURem) (str "$urem32(" a "," b ")"))
+    ((BShl) (str "(" a "<<" b "&1)")) ((BLShr) (str "(" a ">>>" b "&1)")) ((BAShr) (str "(" a "+0*" b ")"))
+    (_ "$unsupported('float op on i1')")))
+
+(defun float-bin :private (op: LBinOp a: str b: str) -> str
+  (match op
+    ((BFAdd) (p (str a "+" b))) ((BFSub) (p (str a "-" b))) ((BFMul) (p (str a "*" b)))
+    ((BFDiv) (p (str a "/" b))) ((BFRem) (p (str a "%" b)))
+    (_ "$unsupported('integer op on a float')")))
+
+;; A binary operation on scalars of type t.
+(defun bin-js (op: LBinOp t: LType a: str b: str) -> str
+  (match t
+    ((TInt 64) (bin64 op a b))
+    ((TInt 32) (bin32 op a b))
+    ((TInt 1) (bin1 op a b))
+    ((TInt k) (bin-small k op a b))
+    ((TFloat) (str "Math.fround" (float-bin op a b)))
+    (_ (float-bin op a b))))
+
+;; ---------------------------------------------------------------- comparisons
+
+(defun bool01 :private (c: str) -> str (str "(" c "?1:0)"))
+
+(defun icmp-op :private (pr: LIPred) -> str
+  (match pr ((IEq) "===") ((INe) "!==") ((ISlt) "<") ((ISle) "<=") ((ISgt) ">") ((ISge) ">=")
+            ((IUlt) "<") ((IUle) "<=") ((IUgt) ">") ((IUge) ">=")))
+
+(defun icmp-signed? :private (pr: LIPred) -> bool
+  (match pr ((ISlt) true) ((ISle) true) ((ISgt) true) ((ISge) true) (_ false)))
+
+(defun icmp-unsigned? :private (pr: LIPred) -> bool
+  (match pr ((IUlt) true) ((IUle) true) ((IUgt) true) ((IUge) true) (_ false)))
+
+;; The operand as compared: unsigned for an unsigned predicate, -v for a signed one on i1 (whose 1 is -1).
+(defun cmp-operand :private (pr: LIPred t: LType a: str) -> str
+  (match t
+    ((TInt 64) (if (icmp-unsigned? pr) (str "BigInt.asUintN(64," a ")") a))
+    ((TInt 1) (if (icmp-signed? pr) (str "(-" a ")") a))
+    ((TInt k) (if (icmp-unsigned? pr) (unsigned-small k a) a))
+    (_ a)))
+
+(defun icmp-js (pr: LIPred t: LType a: str b: str) -> str
+  (bool01 (str (cmp-operand pr t a) (icmp-op pr) (cmp-operand pr t b))))
+
+;; An ordered predicate is false on NaN, which JS's comparisons are; an unordered one is the negation of the ordered opposite.
+(defun fcmp-js (pr: LFPred a: str b: str) -> str
+  (match pr
+    ((FOeq) (bool01 (str a "===" b))) ((FOgt) (bool01 (str a ">" b))) ((FOge) (bool01 (str a ">=" b)))
+    ((FOlt) (bool01 (str a "<" b))) ((FOle) (bool01 (str a "<=" b)))
+    ((FUne) (bool01 (str a "!==" b))) ((FUgt) (str "(" a "<=" b "?0:1)")) ((FUge) (str "(" a "<" b "?0:1)"))
+    ((FUlt) (str "(" a ">=" b "?0:1)")) ((FUle) (str "(" a ">" b "?0:1)"))
+    ((FOne) (str "$fone(" a "," b ")")) ((FUeq) (str "$fueq(" a "," b ")"))
+    ((FOrd) (str "$ford(" a "," b ")")) ((FUno) (str "$funo(" a "," b ")"))))

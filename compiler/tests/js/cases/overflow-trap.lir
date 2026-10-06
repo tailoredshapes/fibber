@@ -1,0 +1,36 @@
+;; expect: accept
+;; signal: SIGABRT
+;; out: small 3 0
+;; out: i32 -2147483648 1
+;; out: i8 -128 1
+;; out: mul64 -2 1
+;; The checked arithmetic fibber emits (types.md 8.12): sadd/ssub/smul-overflow, and a trap when the flag is set. Each line prints the
+;; wrapped value and the flag; the last add overflows at i64 and the program writes its message with write(2) and aborts (SIGABRT), as
+;; fib.trap does. A backend that misses the overflow prints `after` and exits 0.
+(declare printf i32 (ptr ...))
+(declare fflush i32 (ptr))
+(declare write i64 (i32 ptr i64))
+(declare abort void ())
+(define (opq i64) ((i64 x)) (block entry (let ((s (alloca i64))) (store volatile x s) (ret (load volatile i64 s)))))
+(define (checked-add i64) ((i64 a) (i64 b))
+  (block entry
+    (let ((r (sadd-overflow a b)))
+      (br (extractvalue r 1) bad ok)))
+  (block ok (ret (extractvalue (sadd-overflow a b) 0)))
+  (block bad
+    (call @fflush (ptr null))
+    (call @write (i32 2) (string "integer overflow\n") (i64 17))
+    (call @abort)
+    (unreachable)))
+(define (main i32) ()
+  (block entry
+    (let ((s (sadd-overflow (call @opq (i64 1)) (i64 2)))
+          (t (ssub-overflow (trunc i32 (call @opq (i64 2147483647))) (i32 -1)))
+          (u (sadd-overflow (trunc i8 (call @opq (i64 127))) (i8 1)))
+          (v (smul-overflow (call @opq (i64 9223372036854775807)) (i64 2))))
+      (call @printf (string "small %lld %d\n") (extractvalue s 0) (zext i32 (extractvalue s 1)))
+      (call @printf (string "i32 %d %d\n") (extractvalue t 0) (zext i32 (extractvalue t 1)))
+      (call @printf (string "i8 %d %d\n") (sext i32 (extractvalue u 0)) (zext i32 (extractvalue u 1)))
+      (call @printf (string "mul64 %lld %d\n") (extractvalue v 0) (zext i32 (extractvalue v 1)))
+      (call @printf (string "after %lld\n") (call @checked-add (call @opq (i64 9223372036854775807)) (i64 1)))
+      (ret (i32 0)))))

@@ -1,0 +1,33 @@
+;; expect: accept
+;; out: sum 99.999046325683594
+;; out: prod 0.30000001192092896 3.3333332538604736
+;; out: sqrt 1.4142135381698608
+;; out: trunc 0.10000000149011612
+;; out: big 16777216 16777218
+;; Single precision: every result is rounded to float (the JS backend's Math.fround after each operation). The sum is 0.1f added 1000
+;; times in float, as C's `float s = 0; for (i = 0; i < 1000; i++) s += 0.1f;` gives it (every expected line is
+;; the output of the equivalent C program, cc -O0, glibc); 0.1f
+;; times 3, 1 / 0.3f, sqrt 2 and the double 0.1 narrowed are each one rounding; 2^24 + 1 is not a float (it rounds to even, 2^24) and
+;; 2^24 + 2 is.
+(declare printf i32 (ptr ...))
+(define (opq float) ((float x)) (block entry (let ((s (alloca float))) (store volatile x s) (ret (load volatile float s)))))
+(define (sum float) ((float step) (i32 n))
+  (block entry (br loop))
+  (block loop
+    (let ((s (phi float (entry (float 0.0)) (loop s2)))
+          (i (phi i32 (entry (i32 0)) (loop i2)))
+          (s2 (fadd s step))
+          (i2 (add i (i32 1))))
+      (br (icmp slt i2 n) loop done)))
+  (block done (ret s2)))
+(define (main i32) ()
+  (block entry
+    (let ((t (call @opq (float 0.1))))
+      (call @printf (string "sum %.17g\n") (fpext double (call @sum t (i32 1000))))
+      (call @printf (string "prod %.17g %.17g\n") (fpext double (fmul t (float 3.0)))
+            (fpext double (fdiv (call @opq (float 1.0)) (fmul t (float 3.0)))))
+      (call @printf (string "sqrt %.17g\n") (fpext double (fsqrt (call @opq (float 2.0)))))
+      (call @printf (string "trunc %.17g\n") (fpext double (fptrunc float (fpext double t))))
+      (call @printf (string "big %.17g %.17g\n") (fpext double (fadd (call @opq (float 16777216.0)) (float 1.0)))
+            (fpext double (fadd (call @opq (float 16777216.0)) (float 2.0))))
+      (ret (i32 0)))))
