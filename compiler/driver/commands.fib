@@ -45,17 +45,32 @@
            ((Err m) (compile-failed m))
            ((Ok code) code))))))
 
-;; `build`: the executable. A directory that cannot be read is refused first, before anything is compiled. Rust: main.rs:200 `build`
+;; The row of FIB_TARGET_TRIPLE when it is a target `build` refuses (docs/adr/0008: parked, or no row for its architecture) and
+;; FIB_ALLOW_UNSUPPORTED (`--allow-unsupported`) is not 1; nil for the host, a supported row and a portability target.
+(defun refused-target :private () -> (Option tt/TargetRow)
+  (match (native/getenv-opt "FIB_TARGET_TRIPLE")
+    (nil nil)
+    ((some t) (let ((r (tt/target-row-of-triple t)))
+                (if (or (= t "") (= t "host") (tt/row-buildable? r) (= (unwrap-or (native/getenv-opt "FIB_ALLOW_UNSUPPORTED") "") "1")) nil (some r))))))
+
+;; `build`: the executable. A directory that cannot be read is refused first, before anything is compiled, then a target outside ADR 0008.
+;; Rust: main.rs:200 `build`
 (defun cmd-build (file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64 emit: str roots: Roots rm: mk/RunnerMaker) -> i64
   (match (first (filter (fn (d: str) (not (native/readable-dir? d))) dirs))
     ((some d) (do (eprintln (str-join ["fibc: -L " d ": not a directory that can be read"])) front/exit-usage))
-    (nil
-     (match (front/lower-kind file roots rm true)
-       ((Err code) code)
-       ((Ok lir)
-        (match (if (= emit "exe") (native/build-lir lir out opt dirs libs) (native/emit-lir lir out opt emit))
-          ((Err m) (compile-failed m))
-          ((Ok _) 0)))))))
+    (nil (if-some [r (refused-target)]
+           (do (eprintln (str-join ["fibc: " (. r triple) " is not a supported target (" (tt/support-text r) "; docs/adr/0008-supported-isas-have-guaranteed-tail-calls-and-fma.md): "
+                                    "its code would lack a guaranteed tail call or a fused multiply-add; --allow-unsupported builds it anyway"]))
+               front/exit-usage)
+           (build-checked file out dirs libs opt emit roots rm)))))
+
+(defun build-checked :private (file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64 emit: str roots: Roots rm: mk/RunnerMaker) -> i64
+  (match (front/lower-kind file roots rm true)
+    ((Err code) code)
+    ((Ok lir)
+     (match (if (= emit "exe") (native/build-lir lir out opt dirs libs) (native/emit-lir lir out opt emit))
+       ((Err m) (compile-failed m))
+       ((Ok _) 0)))))
 
 ;; `targets`: the table of code generation targets (types.targets), a header line and one tab-separated line per row.
 (defun cmd-targets () -> i64

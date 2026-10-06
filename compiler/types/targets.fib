@@ -22,11 +22,15 @@
 ;; (docs/design/targets.md 3.2: a blocker for running, not for emission). `reloc` is the relocation model of the
 ;; machine (LLVMRelocMode): 2, position-independent, so that `cc` links a PIE; 1, static, on WebAssembly (PIC there imports `__memory_base`:
 ;; the dynamic-linking convention, not what wasm-ld makes an executable from). `libc-lacks` lists the
-;; functions of `runtime-c-functions` that the row's C library does not provide.
+;; functions of `runtime-c-functions` that the row's C library does not provide. `support` is the row's place under the owner's rule of
+;; 2026-10-06 (docs/adr/0008): "supported" only where LLVM guarantees a tail call between functions of any signature (tailcc, musttail) AND the
+;; instruction set has a fused multiply-add; "parked: WHY" for an architecture that fails the rule until the toolchain changes (`fibc build`
+;; refuses it without --allow-unsupported); "portability target: WHY" for wasm, built but outside the rule. `row-supported?` derives the status
+;; from the rule as well, so a row marked supported that breaks the rule is not supported.
 (defstruct TargetRow
   (triple: str arch: str os: str runtime-os: str data-layout: str pointer-bits: i64 little-endian: bool threads: str
    vector-bits: i64 default-cpu: str features: str has-fma: bool min-level: i64 tail-cc: i64 tail-kind: i64 reloc: i64 unwind: str object-format: str linker: str
-   sysroot: str libc: str libc-lacks: (Vec str) status: str))
+   sysroot: str libc: str libc-lacks: (Vec str) status: str support: str))
 (derive Eq TargetRow)
 
 ;; The C functions the runtime (rt/*.lir) declares: targets-emit.sh checks this list against the `declare`s of rt/.
@@ -39,43 +43,51 @@
 
 (def ELF64-LAYOUT-X86: str "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128")
 
+;; x86-64 is supported at the x86-64-v3 level and above (AVX2, FMA, BMI1/2, F16C, LZCNT, MOVBE: LLVM's x86-64-v3): the CPU a cross build and a
+;; release use. A build for the host keeps the host's CPU; a binary checks at start that the CPU running it has what it was built for (emit.cpucheck).
 (defun row-x86-64-linux :private () -> TargetRow
   (TargetRow "x86_64-unknown-linux-gnu" "x86_64" "linux" "Linux" ELF64-LAYOUT-X86 64 true "pthreads"
-             128 "generic" "" false 0 18 2 2 "dwarf-eh" "elf" "cc" "" "glibc" [] "runs"))
+             256 "x86-64-v3" "" true 0 18 2 2 "dwarf-eh" "elf" "cc" "" "glibc" [] "runs" "supported"))
 
 (defun row-aarch64-darwin :private () -> TargetRow
   (TargetRow "aarch64-apple-darwin" "aarch64" "darwin" "Darwin" "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32"
-             64 true "pthreads" 128 "apple-m1" "" true 1 18 2 2 "compact-unwind" "macho" "cc (ld64)" "" "libSystem" [] "runs"))
+             64 true "pthreads" 128 "apple-m1" "" true 1 18 2 2 "compact-unwind" "macho" "cc (ld64)" "" "libSystem" [] "runs" "supported"))
 
 (defun row-aarch64-linux :private () -> TargetRow
   (TargetRow "aarch64-unknown-linux-gnu" "aarch64" "linux" "Linux"
              "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32"
-             64 true "pthreads" 128 "generic" "" true 1 18 2 2 "dwarf-eh" "elf" "cc" "" "glibc" [] "emits"))
+             64 true "pthreads" 128 "generic" "" true 1 18 2 2 "dwarf-eh" "elf" "cc" "" "glibc" [] "emits" "supported"))
 
 (defun row-arm64-ios :private () -> TargetRow
   (TargetRow "arm64-apple-ios" "aarch64" "ios" "Darwin" "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32"
              64 true "pthreads" 128 "apple-m1" "" true 1 18 2 2 "compact-unwind" "macho" "xcrun clang (ld64), static library" "iPhoneOS SDK"
-             "libSystem" ["pipe"] "emits"))
+             "libSystem" ["pipe"] "emits" "supported"))
+
+;; wasm is outside the rule (no FMA in the instruction set; tail calls only through the tail-call extension's return_call, not tailcc) and kept
+;; as a portability target: built, its results the same, `simd/fma` a trap (warned at compile time) and `simd/muladd` a multiply and an add.
+(def PORTABILITY: str "portability target: no guaranteed FMA, tail calls by the wasm tail-call extension")
 
 ;; WASI preview 1, single-threaded: wasi-libc without threads (no pthread_create; the mutex and key functions are its single-thread stubs),
 ;; no pipe, dup or madvise. 32-bit pointers. SIMD128 and tail calls are on (wasmtime, node and the browsers have both); no fused multiply-add.
 (defun row-wasm32-wasip1 :private () -> TargetRow
   (TargetRow "wasm32-wasip1" "wasm32" "wasi" "Linux" "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"
              32 true "none" 128 "generic" "+simd128,+tail-call" false 0 0 1 1 "none" "wasm" "wasm-ld" "WASI_SYSROOT" "wasi-libc"
-             ["dup" "madvise" "pipe" "pthread_create" "pthread_detach" "pthread_exit"] "emits; runtime-os Linux is a stand-in"))
+             ["dup" "madvise" "pipe" "pthread_create" "pthread_detach" "pthread_exit"] "emits; runtime-os Linux is a stand-in" PORTABILITY))
 
 ;; The browser or another JavaScript host: no C library at all, every runtime C function is an import the host must provide.
 (defun row-wasm32-unknown :private () -> TargetRow
   (TargetRow "wasm32-unknown-unknown" "wasm32" "none" "Linux" "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"
              32 true "none" 128 "generic" "+simd128,+tail-call" false 0 0 1 1 "none" "wasm" "wasm-ld --no-entry --export-dynamic" "" "none"
-             (runtime-c-functions) "emits; runtime-os Linux is a stand-in"))
+             (runtime-c-functions) "emits; runtime-os Linux is a stand-in" PORTABILITY))
 
 ;; RV64GC Linux (the RVA20 profile: I M A F D C, Zicsr, Zifencei), the lp64d ABI. The V extension is not assumed (FIB_TARGET_CPU names a
 ;; CPU that has it); the scalar D extension has a fused multiply-add (fmadd.d), so `has-fma` is true.
+;; Parked (ADR 0008): LLVM 21 has no tailcc for RISC-V, so a tail call between functions of different signatures is not guaranteed. The emit
+;; check (compiler/tests/native/targets-emit.sh, with --allow-unsupported) stays, to notice when it lands.
 (defun row-riscv64-linux :private () -> TargetRow
   (TargetRow "riscv64-unknown-linux-gnu" "riscv64" "linux" "Linux" "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128"
              64 true "pthreads" 128 "generic-rv64" "+m,+a,+f,+d,+c,+zicsr,+zifencei" true 0 8 1 2 "dwarf-eh" "elf" "cc (riscv64 cross)"
-             "RISCV_SYSROOT" "glibc" [] "emits"))
+             "RISCV_SYSROOT" "glibc" [] "emits" "parked: LLVM has no tailcc for RISC-V"))
 
 ;; Every row, in the order `fibc targets` prints them. The rest of LLVM's backends have no row yet (docs/design/targets.md 5).
 (defun target-rows () -> (Vec TargetRow)
@@ -117,7 +129,25 @@
              (match (first (filter (fn (r: TargetRow) (= (. r arch) arch)) rows))
                ((some r) (with r (triple triple) (os os) (runtime-os rt) (data-layout "") (libc-lacks []) (status "unlisted")))
                (nil (TargetRow triple arch os rt "" 64 true "pthreads" 128 "generic" "" false 0 18 2 2 "unknown" "unknown" "cc" "" "unknown" []
-                               "unlisted"))))))))
+                               "unlisted" "unsupported: no row for the architecture"))))))))
+
+;; --- the rule (docs/adr/0008): a guaranteed tail call between functions of any signature, and a fused multiply-add
+
+;; Whether the row's facts meet the rule: LLVM's tailcc (18) with `musttail` (tail-kind 2), and FMA.
+(defun meets-rule? (r: TargetRow) -> bool
+  (and (= (. r tail-cc) 18) (= (. r tail-kind) 2) (. r has-fma)))
+
+;; Supported: marked so, and the facts meet the rule.
+(defun row-supported? (r: TargetRow) -> bool
+  (and (= (. r support) "supported") (meets-rule? r)))
+
+;; Whether `fibc build` makes code for the row without --allow-unsupported: a supported row or a portability target.
+(defun row-buildable? (r: TargetRow) -> bool
+  (or (row-supported? r) (starts-with? (. r support) "portability target")))
+
+;; The support column as printed: what the row says, or why a row marked supported is not.
+(defun support-text (r: TargetRow) -> str
+  (if (and (= (. r support) "supported") (not (meets-rule? r))) "unsupported: marked supported but breaks the rule" (. r support)))
 
 ;; --- CPUs by name (FIB_TARGET_CPU, the host's): the vector width the compiler prefers and whether fma is fused
 
@@ -158,6 +188,6 @@
              (if (. r little-endian) "little" "big") "\t" (. r threads) "\t" (str (. r vector-bits)) "\t" (. r default-cpu) "\t"
              (if (= (. r features) "") "-" (. r features)) "\t" (yes-no (. r has-fma)) "\t" (str (. r min-level)) "\t" (str (. r tail-cc)) "\t" (if (= (. r tail-kind) 2) "musttail" "tail") "\t" (str (. r reloc)) "\t" (. r unwind) "\t"
              (. r object-format) "\t" (. r linker) "\t" (if (= (. r sysroot) "") "-" (. r sysroot)) "\t" (. r libc) "\t"
-             (if (empty? (. r libc-lacks)) "-" (commas (. r libc-lacks))) "\t" (. r data-layout) "\t" (. r status)]))
+             (if (empty? (. r libc-lacks)) "-" (commas (. r libc-lacks))) "\t" (. r data-layout) "\t" (. r status) "\t" (support-text r)]))
 
-(def ROW-HEADER: str "triple\tarch\tos\truntime-os\tpointer-bits\tendian\tthreads\tvector-bits\tcpu\tfeatures\tfma\tmin-level\ttail-cc\ttail-call\treloc\tunwind\tobject\tlinker\tsysroot\tlibc\tlibc-lacks\tdata-layout\tstatus")
+(def ROW-HEADER: str "triple\tarch\tos\truntime-os\tpointer-bits\tendian\tthreads\tvector-bits\tcpu\tfeatures\tfma\tmin-level\ttail-cc\ttail-call\treloc\tunwind\tobject\tlinker\tsysroot\tlibc\tlibc-lacks\tdata-layout\tstatus\tsupport")

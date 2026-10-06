@@ -71,7 +71,7 @@ Ports scheduled, not dropped: `fibref`'s interpreter and heap audit, `fibgen`, `
   they disagree, or F3 fails to build). Grep `compiler/` for the name first; the full gate catches it, the quick gate may not.
 - `--target TRIPLE` / `FIB_TARGET_TRIPLE` cross-compiles (objects and assembly; linking another target's executable is refused). A Mac
   (Apple Silicon, `llvm@21` from Homebrew) is the real-hardware test for aarch64: `scripts/mac-check.sh`.
-- Vector fma: `simd/fma` is exact (a libm call per lane without hardware FMA); `simd/muladd` is fused where the target has FMA; library code
+- Vector fma: `simd/fma` is exact (without hardware FMA: a compile-time warning and a run-time trap, docs/adr/0008); `simd/muladd` is fused where the target has FMA; library code
   chooses with `(has-fma)`, never with the lane count.
 
 ## Performance cycle

@@ -56,7 +56,13 @@ libm, libstdc++, libgcc_s, libz and libzstd (`ldd bin/fibc` shows those
 and nothing else), and a C compiler (`cc`) for `fibc build`. To make a release
 yourself, see `scripts/package.sh`.
 
-**Which CPU the code is for.** A release is built with `FIB_TARGET_CPU=x86-64-v2`
+**Which CPU it needs.** `fibc` needs a 2013+ x86-64 CPU with AVX2 and FMA (x86-64-v3), or Apple
+Silicon/ARMv8, and on Linux glibc 2.33 or later. fibber supports only instruction sets with guaranteed tail calls and
+fused multiply-add (docs/adr/0008). On an older x86-64 CPU `fibc`, and every x86-64 program it
+builds, stops at start with `trap: this program needs x86-64-v3 (AVX2, FMA); this CPU lacks: ..`
+instead of crashing later with an illegal instruction.
+
+**Which CPU the code is for.** A release is built with `FIB_TARGET_CPU=x86-64-v3`
 (`scripts/package.sh` sets it unless it is already set), so that the `fibc`
 binary in the tarball runs on any x86-64 CPU with those instructions and not
 only on the one that built it. `FIB_TARGET_CPU` is read by lair (`compiler/llvm/target.fib`)
@@ -66,10 +72,14 @@ for **your host CPU** (its name and its features), and a program built that way 
 not run on an older CPU. To build a program that runs elsewhere, set it:
 
 ```
-FIB_TARGET_CPU=x86-64-v2 fibc build hello.fib -o hello
+FIB_TARGET_CPU=x86-64-v3 fibc build hello.fib -o hello
 ```
 
-Any other value is passed to LLVM as a CPU name with no extra features.
+Any other value is passed to LLVM as a CPU name with no extra features. A CPU below
+x86-64-v3 (`x86-64`, `x86-64-v2`) still builds, but it is outside the supported set: there
+`simd/fma` is a compile-time warning and a run-time trap (use `simd/muladd` for portable code).
+`fibc targets` lists the code generation targets and which are supported; riscv64 is parked
+(LLVM has no `tailcc` for RISC-V) and `fibc build --target` refuses it without `--allow-unsupported`.
 
 ## Projects and dependencies
 

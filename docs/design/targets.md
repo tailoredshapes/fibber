@@ -36,18 +36,18 @@ of data. It shows what each new row emits today and lists what stands between em
 (defstruct TargetRow
   (triple arch os runtime-os data-layout pointer-bits little-endian threads
    vector-bits default-cpu features has-fma min-level tail-cc tail-kind reloc
-   unwind object-format linker sysroot libc libc-lacks status))
+   unwind object-format linker sysroot libc libc-lacks status support))
 ```
 
-| triple | ptr | threads | vector, CPU, features | fma | -O0 floor | tailcc / kind | reloc | object, linker | libc (lacks) | runtime-os | status |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| x86_64-unknown-linux-gnu | 64 | pthreads | 128, generic (cross) / host | no (CPU table decides) | 0 | 18 musttail | PIC | ELF, cc | glibc | Linux | runs |
-| aarch64-apple-darwin | 64 | pthreads | 128, apple-m1 | yes | 1 | 18 musttail | PIC | Mach-O, cc (ld64) | libSystem | Darwin | runs (Mac) |
-| aarch64-unknown-linux-gnu | 64 | pthreads | 128, generic | yes | 1 | 18 musttail | PIC | ELF, cc | glibc | Linux | emits |
-| arm64-apple-ios | 64 | pthreads | 128, apple-m1 | yes | 1 | 18 musttail | PIC | Mach-O, xcrun clang, static library | libSystem (pipe) | Darwin | emits |
-| wasm32-wasip1 | 32 | none | 128, generic, `+simd128,+tail-call` | no | 0 | 0 (C) tail | static | wasm, wasm-ld, `$WASI_SYSROOT` | wasi-libc (dup madvise pipe pthread_create pthread_detach pthread_exit) | Linux (stand-in) | emits |
-| wasm32-unknown-unknown | 32 | none | 128, generic, `+simd128,+tail-call` | no | 0 | 0 (C) tail | static | wasm, `wasm-ld --no-entry --export-dynamic` | none (all 50) | Linux (stand-in) | emits |
-| riscv64-unknown-linux-gnu | 64 | pthreads | 128, generic-rv64, `+m,+a,+f,+d,+c,+zicsr,+zifencei` | yes (fmadd.d) | 0 | 8 (fastcc) tail | PIC | ELF lp64d, cc (riscv64 cross), `$RISCV_SYSROOT` | glibc | Linux | emits |
+| triple | ptr | threads | vector, CPU, features | fma | -O0 floor | tailcc / kind | reloc | object, linker | libc (lacks) | runtime-os | status | support (ADR 0008) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| x86_64-unknown-linux-gnu | 64 | pthreads | 256, x86-64-v3 (cross, release) / host | yes | 0 | 18 musttail | PIC | ELF, cc | glibc | Linux | runs | supported |
+| aarch64-apple-darwin | 64 | pthreads | 128, apple-m1 | yes | 1 | 18 musttail | PIC | Mach-O, cc (ld64) | libSystem | Darwin | runs (Mac) | supported |
+| aarch64-unknown-linux-gnu | 64 | pthreads | 128, generic | yes | 1 | 18 musttail | PIC | ELF, cc | glibc | Linux | emits | supported |
+| arm64-apple-ios | 64 | pthreads | 128, apple-m1 | yes | 1 | 18 musttail | PIC | Mach-O, xcrun clang, static library | libSystem (pipe) | Darwin | emits | supported |
+| wasm32-wasip1 | 32 | none | 128, generic, `+simd128,+tail-call` | no | 0 | 0 (C) tail | static | wasm, wasm-ld, `$WASI_SYSROOT` | wasi-libc (dup madvise pipe pthread_create pthread_detach pthread_exit) | Linux (stand-in) | emits | portability target |
+| wasm32-unknown-unknown | 32 | none | 128, generic, `+simd128,+tail-call` | no | 0 | 0 (C) tail | static | wasm, `wasm-ld --no-entry --export-dynamic` | none (all 50) | Linux (stand-in) | emits | portability target |
+| riscv64-unknown-linux-gnu | 64 | pthreads | 128, generic-rv64, `+m,+a,+f,+d,+c,+zicsr,+zifencei` | yes (fmadd.d) | 0 | 8 (fastcc) tail | PIC | ELF lp64d, cc (riscv64 cross), `$RISCV_SYSROOT` | glibc | Linux | emits | parked: LLVM has no tailcc for RISC-V |
 
 Data layouts (LLVM 21's, from the machine; checked by `targets-emit.sh` and `a64-emit.sh`):
 
@@ -87,6 +87,24 @@ How the readers use a row:
 * **`libc-lacks`** lists the functions of `runtime-c-functions` that the target's C library does not provide. `runtime-c-functions` is exactly
   the 50 `declare`s of `rt/*.lir`; `targets-emit.sh` checks this and plants a missing one. The wasm32-wasip1 list comes from knowledge of
   wasi-libc and has not been checked against a sysroot (section 5.1, step W1).
+
+* **`support`** (docs/adr/0008, the owner's rule of 2026-10-06): `supported` only where LLVM guarantees a tail call between functions of any
+  signature (tailcc 18 with `musttail`) and the instruction set has FMA; `row-supported?` checks the facts as well as the mark, so a row
+  marked supported that breaks the rule prints `unsupported: marked supported but breaks the rule`. riscv64 is `parked` (no tailcc in
+  LLVM 21): `fibc build --target riscv64-unknown-linux-gnu` refuses it unless `--allow-unsupported` (or `FIB_ALLOW_UNSUPPORTED=1`) is
+  given, which `targets-emit.sh` does to keep its emit check. The wasm rows are `portability target`s: built without the flag, `simd/fma`
+  a compile-time warning and a run-time trap there, `simd/muladd` a multiply and an add. x86-64 is supported at x86-64-v3: the row's CPU
+  (cross builds, releases) is `x86-64-v3`; a host build keeps the host's CPU, and every x86-64 executable checks at start that the CPU
+  has what it was built for (`emit.cpucheck`).
+
+* **The start-up CPU check** (`compiler/emit/cpucheck.fib`, ADR 0008). An executable for x86-64 Linux calls `fib.cpu-check` before anything
+  else in `main`. It asks glibc (`__x86_get_cpuid_feature_leaf`, glibc 2.33 and later; the `active` bits fold in the OS's register-state support) for each
+  feature the binary was built for: the level of a named CPU (x86-64-v2, v3, v4 and the CPU table's names) or the host's `+` features, among
+  SSE3 to SSE4.2, POPCNT, CX16, AVX, AVX2, BMI1, BMI2, F16C, FMA, LZCNT, MOVBE and the five AVX-512 features of v4. A missing one ends the
+  program with `trap: this program needs x86-64-v3 (AVX2, FMA); this CPU lacks: FMA` (status 134) instead of SIGILL. It costs one call at start.
+  The check is scalar code and `write` calls, so it runs on the CPU it refuses (`compiler/tests/driver/cpu-check.sh` runs a v3 binary under
+  `qemu-x86_64 -cpu Westmere`). There is no check for baseline x86-64, for an unknown CPU name, for a non-Linux OS, or for aarch64, whose baseline
+  has FMA. An aarch64 build for a CPU with more features (`FIB_TARGET_CPU=apple-m2`) is not checked; that is a known gap.
 
 **Adding a row.** For an architecture that already has one, add a `row-...` function and put it in `target-rows`. For a new architecture,
 also add the five `LLVMInitialize<Arch>{TargetInfo,Target,TargetMC,AsmPrinter,AsmParser}` externs and calls to `llvm.target`, and add the

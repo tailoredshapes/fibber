@@ -150,7 +150,9 @@
    deref-proto: (Cell (Option i64))
    expr-count: (Cell i64)
    ;; The code generation target the front end was told (nil: none, `target-default` stands for it); set once before lowering.
-   target: (Cell (Option Target))))
+   target: (Cell (Option Target))
+   ;; Compile-time warnings, `FILE:LINE:COL: warning: TEXT`, each once, in the order found; the driver prints them (driver.front).
+   warnings: (Cell (Vec str))))
 
 ;; Empty tables; `main` is the main module (2), `option` 0 until
 ;; `new_globals` declares it.
@@ -158,13 +160,17 @@
   (Globals (table-new) (table-new) (table-new) (table-new) (table-new)
            (table-new) (table-new) (table-new) (table-new)
            (cell module-main) (cell (map-empty)) (cell 0) (cell nil) (cell nil)
-           (cell nil) (cell 0) (cell nil)))
+           (cell nil) (cell 0) (cell nil) (cell [])))
 
 ;; The target `:native`, `f32xn` and `native-lanes` are resolved against: the one the front end was told, else the default.
 (defun g-target (g: Globals) -> Target
   (match @(. g target)
     ((some t) t)
     (nil (target-default))))
+
+;; Records the warning `w` unless it is already recorded: a call site lowered in several instances warns once.
+(defun g-warn (g: Globals w: str) -> unit
+  (if (some? (find-first (fn (x: str) (= x w)) @(. g warnings))) () (set! (. g warnings) (conj @(. g warnings) w))))
 
 ;; ---- TypeDef
 

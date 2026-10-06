@@ -1,0 +1,27 @@
+;; spec:   docs/adr/0008, types §1.9 (has-fma), compiler/emit/lower/ctrl.fib (a literal false condition lowers the else branch alone)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; `(has-fma)` is a constant of the target. Library code picks a fused kernel with `(if (has-fma) fused plain)` or `(and (has-fma) x)` (ADR 0004).
+;; On a supported target the fused branch is taken: the answers below are the fused ones (one rounding). On a target without FMA the
+;; condition is the literal false and the compiler lowers only the plain branch, so the fused one neither runs nor warns (no-fma.sh, muladd.sh).
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun fused-or-plain (a: f64 b: f64 c: f64) -> f64
+  (if (has-fma) (simd/fma a b c) (+ (* a b) c)))
+
+(defun fused-when-asked (a: f64 b: f64 c: f64 want: bool) -> f64
+  (if (and (has-fma) want) (simd/fma a b c) (+ (* a b) c)))
+
+(defun main () -> i64
+  (let ((c (checks)) (e (fdiv 1.0 1073741824.0)))
+    (let ((a (+ 1.0 e)) (b (- 1.0 e)))
+      (do (check c (= (fused-or-plain a b -1.0) (neg (* e e))))
+          (check c (= (fused-when-asked a b -1.0 true) (neg (* e e))))
+          (check c (= (fused-when-asked a b -1.0 false) 0.0))
+          ;; teeth: the plain branch's answer differs, so a dispatch that took it on this target fails the first check
+          (let ((p (checks)))
+            (do (check p (= (+ (* a b) -1.0) (neg (* e e)))) (check-detects c p)))
+          (checks-result c)))))

@@ -90,11 +90,13 @@
        ((FrontPending r) (do (eprintln r) (Err exit-pending)))))))
 
 ;; The front end and the lowering: the lIR text of `file` (of an executable when `executable`), or the exit status that says why
-;; not, its message already printed. Rust: main.rs:47 `lower_kind`
+;; not, its message already printed. The lowering's warnings (types.decls `warnings`: simd/fma without FMA) go to standard error first. Rust: main.rs:47 `lower_kind`
 (defun lower-kind (file: str roots: Roots rm: mk/RunnerMaker executable: bool) -> (Result str i64)
   (match (check-file file roots rm true)
     ((Err code) (Err code))
     ((Ok c)
-     (match (if executable (ec/compile-executable (. c typed) (. c owned)) (ec/compile (. c typed) (. c owned)))
-       ((Err m) (do (eprintln (str-concat "unsupported: " m)) (Err exit-unsupported)))
-       ((Ok text) (Ok text))))))
+     (let ((r (if executable (ec/compile-executable (. c typed) (. c owned)) (ec/compile (. c typed) (. c owned)))))
+       (do (doseq [w @(. (. (. c typed) globals) warnings)] (eprintln w))
+           (match r
+             ((Err m) (do (eprintln (str-concat "unsupported: " m)) (Err exit-unsupported)))
+             ((Ok text) (Ok text))))))))

@@ -34,8 +34,25 @@
                              (Ok (some (Pair at v))))))
           ((FlowJump) (Ok nil))))))
 
-;; Rust: lower/ctrl.rs:34 Cx::if_form
+;; Whether the condition is the literal `false`, as `(has-fma)` is on a target without FMA (types §1.9: a constant of the target), or an `if` of
+;; one whose else is `false`: `(and (has-fma) x)` as types.elab makes it, which evaluates nothing when its test is false.
+(defun literal-false? :private (c: Expr) -> bool
+  (match (. c kind)
+    ((ELit (LitBool b)) (not b))
+    ((EIf t _ f) (and (literal-false? t) (literal-false? f)))
+    (_ false)))
+
+;; Rust: lower/ctrl.rs:34 Cx::if_form. A condition that is the literal `false` lowers the else branch alone: the then branch is never run and is not
+;; lowered, so the bodies only it calls are not made (a `(has-fma)` dispatch on a target without FMA makes no fused kernel, and its `simd/fma`
+;; sites do not warn: docs/adr/0008).
 (defun lcx-if-form (cx: LowerCx e: Expr c: Expr t: Expr f: Expr) -> (Result Flow str)
+  (if (literal-false? c) (lcx-else-only cx e f) (lcx-if-both cx e c t f)))
+
+(defun lcx-else-only :private (cx: LowerCx e: Expr f: Expr) -> (Result Flow str)
+  (try-let ((rt (lcx-ty cx e)) (ty (program-lir (. cx p) rt)) (flow (lcx-expr cx f)))
+    (Ok (match flow ((FlowVal _) (if (nil? ty) (FlowVal VUnit) flow)) (_ flow)))))
+
+(defun lcx-if-both :private (cx: LowerCx e: Expr c: Expr t: Expr f: Expr) -> (Result Flow str)
   (try-let ((cv (lcx-value cx c)))
     (let ((lt (fb-label (. cx b) "then")) (lf (fb-label (. cx b) "else")) (lj (fb-label (. cx b) "join")))
       (do (fb-term (. cx b) (str-join ["(br " (v-text cv) " " lt " " lf ")"]))
