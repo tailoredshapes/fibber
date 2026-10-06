@@ -52,7 +52,8 @@
    cell-load: (fn (LowerCx str str Ty) (Result V str))
    emit-call: (fn (LowerCx Target (Vec V) Ty bool) (Result V str))
    join-value: (fn (LowerCx V Ty) (Result V str))
-   instance-of-pred: (fn (LowerCx Pred) (Result (Pair i64 (Vec Ty)) str))))
+   instance-of-pred: (fn (LowerCx Pred) (Result (Pair i64 (Vec Ty)) str))
+   unwind: (fn (LowerCx str) unit)))
 
 ;; The context of one function. Rust: lower/mod.rs:60 Cx (15 fields, and the hub)
 (defstruct LowerCx
@@ -62,7 +63,17 @@
    lits: (Map i64 Expr) rests: (Cell (Vec RestSlot)) closure-slots: (Cell (Set str))
    async-frame: (Cell (Option AsyncFrame)) hub: Hub
    at: (Cell (Option Expr)) origins: (Cell (Map i64 Origin))
-   hoisted: (Cell (Map str (Pair V V)))))
+   hoisted: (Cell (Map str (Pair V V)))
+   unwind-ops: (Cell (Option (Vec Op))) pending: (Cell (Vec V)) fatal: (Cell bool)
+   unwind-wb: (Cell (Option (Pair CallOwn (Pair (Vec V) (Vec Ty)))))))
+
+;; The unwinding state of a function that passes failures on (docs/design/exceptions.md 4.2, ADR 0009):
+;; - `unwind-ops`: while a call (or a `match` that found no clause) is being lowered, the plan's releases of what the frame holds
+;;   there (own.walk.call `unwind-ops`); `nil` elsewhere: a trap there is not caught (the trap as before).
+;; - `pending`: the counts of the arguments of the calls being lowered that are evaluated and not yet handed over (owned temporaries,
+;;   retained and stolen arguments): the plan does not see them (its temporaries are made after every argument is walked).
+;; - `fatal`: a failure here cannot be passed on (a `cell-update!` whose cell is moved from, a function with an `array-take!`).
+;; - `unwind-wb`: the write-backs of the `&` arguments of the call being made: done on the unwinding too.
 
 ;; The sites of `ops` that name an expression's value, added to `acc`.
 (defun add-sites :private (acc: (Set i64) ops: (Vec Op)) -> (Set i64)
@@ -97,8 +108,15 @@
 ;; body. Rust: lower/mod.rs:258 Cx::new (and `b.tailcc = false`, which FnBuilder here takes at construction)
 (defun lcx-build (p: Program inst: Inst own: BodyOwn name: str params: (Vec LirParam) tailcc: bool hub: Hub lits: (Map i64 Expr))
     -> LowerCx
-  (LowerCx p inst own name (fb-new name nil params tailcc) (cell (map-empty)) (cell (map-empty)) (value-sites own) (cell nil)
-           (cell []) (cell (map-empty)) lits (cell []) (cell (set-empty)) (cell nil) hub (cell nil) (cell (map-empty)) (cell (map-empty))))
+  (let ((cx (LowerCx p inst own name (fb-new name nil params tailcc) (cell (map-empty)) (cell (map-empty)) (value-sites own) (cell nil)
+                     (cell []) (cell (map-empty)) lits (cell []) (cell (set-empty)) (cell nil) hub (cell nil) (cell (map-empty))
+                     (cell (map-empty)) (cell nil) (cell []) (cell false) (cell nil))))
+    (do (lcx-set-unwind cx true) cx)))
+
+;; Whether the function passes failures on: the program catches and the function is called through the convention (`on`: not a
+;; `def`'s initialiser; `tailcc`: not an async body; not a macro module's code).
+(defun lcx-set-unwind (cx: LowerCx on: bool) -> unit
+  (set! (. (. cx b) unwind) (and on (. (. cx p) unwinding) (not @(. (. cx p) macro-module)) (. (. cx b) tailcc))))
 
 ;; The context of a generated body (a wrapper, a vtable function) of `parent`'s program, with the parent's hub. Rust: Cx::new of a
 ;; method of the parent's
@@ -160,13 +178,30 @@
 ;; module's hook and carries the position of the expression being lowered (`at`). Rust: lower/fault.rs:18 Cx::trap_c
 (defun lcx-trap-c (cx: LowerCx msg: str) -> unit
   (let ((plain (str-join ["(call @fib.trap-c (string \"" msg "\"))"])))
-    (do (fb-stmt (. cx b)
-                 (match @(. cx at)
+    (lcx-fail cx (match @(. cx at)
                    ((some e) (if @(. (. cx p) macro-module)
                                  (str-join ["(call @fib.trap-at-c (string \"" (lir-text (pos-text (. e pos))) "\") (string \"" msg "\"))"])
                                  plain))
-                   (nil plain)))
-        (fb-term (. cx b) "(unreachable)"))))
+                   (nil plain))
+              (str-join ["(call @fib.raise-c (string \"" msg "\"))"]))))
+
+;; Runs `f` with failures fatal (a region that leaves something moved from).
+(defun fatal-while (cx: LowerCx f: (fn () (Result V str))) -> (Result V str)
+  (let ((f0 @(. cx fatal)))
+    (do (set! (. cx fatal) true)
+        (let ((r (f)))
+          (do (set! (. cx fatal) f0) r)))))
+
+;; Whether a trap here is caught: the function passes failures on and the plan says what the frame holds here.
+(defun lcx-catchable? (cx: LowerCx) -> bool
+  (and @(. (. cx b) unwind) (not @(. cx fatal)) (some? @(. cx unwind-ops))))
+
+;; A trap: `plain` (a call that does not return) where it is not caught, else `raise` (a call giving the failure) and the unwinding.
+(defun lcx-fail (cx: LowerCx plain: str raise: str) -> unit
+  (if (lcx-catchable? cx)
+      ((. (. cx hub) unwind) cx (v-text (fb-val (. cx b) raise LirPtr)))
+      (do (fb-stmt (. cx b) plain)
+          (fb-term (. cx b) "(unreachable)"))))
 
 ;; `(getelementptr %struct.S p (i32 0) (i32 i))`. Rust: lower/mod.rs:439 Cx::gep
 (defun lcx-gep (cx: LowerCx sname: str p: str i: i64) -> str

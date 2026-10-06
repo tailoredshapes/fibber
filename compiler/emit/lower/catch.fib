@@ -1,0 +1,20 @@
+;; compiler/emit/lower/catch.fib: the builtin `catch-run` of exceptions stage 2 (docs/design/exceptions.md 4.2 and 9, docs/adr/0009): the
+;; function of a `try` called with a catch active on the thread. The unwinding itself (the failure returned next to every value, the
+;; releases of a failing call) is emit.lower.call's; the rest of the builtins (`caught-message`, `throw-object`, ..) are runtime calls of
+;; emit.lower.builtins.
+(ns emit.lower.catch
+  (:use emit.value emit.ir emit.program emit.objects.kinds emit.lower.cx emit.lower.ops))
+
+;; `(catch-run f)` (docs/design/exceptions.md 4.2): `f` called with a catch active on the thread; 0 when it returned, else the kind of
+;; the failure it returned (fib.catch-leave keeps it for `caught-message`/`caught-object`). In a program that does not pass failures on
+;; (a macro module) nothing can be caught: `f` is called and the answer is 0.
+(defun lcx-catch-run (cx: LowerCx f: V) -> V
+  (let ((b (. cx b)) (uw (and (. (. cx p) unwinding) (not @(. (. cx p) macro-module)))))
+    (do (lcx-retain cx f)
+        (let ((s (fb-val b "(call @fib.catch-enter)" LirPtr))
+              (code (lcx-load cx LirPtr (lcx-gep cx "fib.closure" (v-text f) slot-closure-code))))
+          (if uw
+              (let ((ex (fb-val b (str-join ["(indirect-call " (v-text code) " (fn tailcc ptr (ptr)) " (v-text f) ")"]) LirPtr)))
+                (fb-val b (str-join ["(call @fib.catch-leave " (v-text s) " " (v-text ex) ")"]) LirI64))
+              (do (fb-stmt b (str-join ["(indirect-call " (v-text code) " (fn tailcc void (ptr)) " (v-text f) ")"]))
+                  (fb-val b (str-join ["(call @fib.catch-leave " (v-text s) " (ptr null))"]) LirI64)))))))

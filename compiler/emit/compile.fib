@@ -16,12 +16,13 @@
 
 ;; The fixed end of a module: `main`, which §8.8 has join every thread still running before the result is printed (fibc run) or
 ;; returned (an executable), calling the program's entry function. Rust: compile.rs:296 main_text
-(defun main-text :private (entry: str executable: bool init: str check: str) -> str
+(defun main-text :private (entry: str executable: bool init: str check: str uw: bool) -> str
   (let ((end (if executable
                  "(ret (trunc i32 r))"
                  "(call @printf (string \"%lld\\n\") r)\n      (ret (i32 0))")))
     (str-join ["(declare printf i32 (ptr ...))\n(define (main i32) ((i32 argc) (ptr argv))\n  (block entry\n    " check "(call @fib.init)\n"
-               "    (call @fib.set-args argc argv)\n    " init "\n    (let ((r (call @" entry ")))\n      (call @fib.join-all)\n"
+               "    (call @fib.set-args argc argv)\n    " init "\n    (let ((r " (if uw (str-join ["(extractvalue (call @" entry ") 0)"]) (str-join ["(call @" entry ")"]))
+               "))\n      (call @fib.join-all)\n"
                "      (call @fib.pool-quiesce)\n      " end ")))\n"])))
 
 ;; The constant `def`s are made by `emit-defs`, which runs each through the JIT; a program with none has no defs to make (the Rust
@@ -38,7 +39,8 @@
   (let ((check (match (if executable @(. (program-g p) target) nil)
                  (nil (Pair "" ""))
                  ((some t) (Pair (cc/cpu-check-defs t) (cc/cpu-check-call t))))))
-    (str-join [(inits-render p) (. check fst) (main-text entry executable (if (empty? @(. p inits)) "" "(call @fib.defs-init)") (. check snd))])))
+    (str-join [(inits-render p) (. check fst) (main-text entry executable (if (empty? @(. p inits)) "" "(call @fib.defs-init)") (. check snd)
+                                    (and (. p unwinding) (not @(. p macro-module))))])))
 
 ;; A stub reached is an error whose message starts `todo: `: the module is then pending, with what needs no body.
 (defun pending-or-error :private (p: Program entry: str executable: bool m: str) -> (Result Module str)

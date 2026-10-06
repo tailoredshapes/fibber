@@ -18,7 +18,7 @@
 ;; - the methods of `FnBuilder` are `fb-NAME`; `targets` is `ir-targets`.
 ;; - the live labels are a `(Set str)`, as Rust's `HashSet`: it is only asked
 ;;   `contains?`, so no iteration order reaches the text.
-(ns emit.ir (:use emit.value))
+(ns emit.ir (:require [fib.string :as s]) (:use emit.value))
 
 ;; One instruction of a block, as it will be printed: a value bound to a fresh
 ;; name, or a void instruction or the terminator.
@@ -44,7 +44,7 @@
 (defstruct FnBuilder
   (name: str ret: (Cell (Option LirTy)) params: (Vec LirParam) tailcc: bool
    blocks: (Cell (Vec Block)) cur: (Cell i64) counter: (Cell i64)
-   allocas: (Cell (Vec Alloca)) live-targets: (Cell (Set str))))
+   allocas: (Cell (Vec Alloca)) live-targets: (Cell (Set str)) unwind: (Cell bool)))
 
 (defun block-new :private (label: str dead: bool) -> Block
   (Block label (cell []) (cell []) (cell false) dead))
@@ -52,7 +52,7 @@
 ;; A function with its entry block open. Rust: ir.rs:52 new
 (defun fb-new (name: str ret: (Option LirTy) params: (Vec LirParam) tailcc: bool) -> FnBuilder
   (FnBuilder name (cell ret) params tailcc (cell [(block-new "entry" false)]) (cell 0) (cell 0)
-             (cell []) (cell (set-empty))))
+             (cell []) (cell (set-empty)) (cell false)))
 
 ;; A fresh SSA name. Rust: ir.rs:70 fresh
 (defun fb-fresh (f: FnBuilder) -> str
@@ -100,9 +100,31 @@
 (defun fb-stmt (f: FnBuilder instr: str) -> unit
   (fb-push f (ItStmt instr)))
 
+;; A function that passes failures on (`unwind`, docs/design/exceptions.md 4.2) returns `{ T ptr }` (`ptr` for no value): a return
+;; of the body's value returns it with no failure (null).
+;; A result of two leaves (a `dyn`, an unboxed option) cannot take the failure as a third: LLVM would return it in memory, which no tail
+;; call can. Such a function takes the address of a failure slot as a last parameter `exs` instead (the caller's; a tail call passes its
+;; own on) and stores a failure there; its result type is the plain one.
+(defun lir-aggregate? (t: LirTy) -> bool
+  (match t ((LirDyn) true) ((LirOpt _) true) ((LirVec _ _) true) (_ false)))
+
+;; Whether the function passes failures on through a slot (`exs`), not its result.
+(defun fb-slot? (f: FnBuilder) -> bool
+  (and @(. f unwind) (match @(. f ret) ((some t) (lir-aggregate? t)) (nil false))))
+
+(defun unwind-ret :private (instr: str) -> str
+  (cond (= instr "(ret)") "(ret (ptr null))"
+        (and (starts-with? instr "(ret ") (s/ends-with? instr ")"))
+        (str-join ["(ret { " (str-slice instr 5 (- (str-len instr) 1)) " (ptr null) })"])
+        :else instr))
+
 ;; Emits the terminator of the current block; the labels it names are live
 ;; when the block is. Rust: ir.rs:121 term
 (defun fb-term (f: FnBuilder instr: str) -> unit
+  (fb-term-raw f (if (and @(. f unwind) (not (fb-slot? f))) (unwind-ret instr) instr)))
+
+;; `fb-term` without the rewrite of a return: the return of a failure.
+(defun fb-term-raw (f: FnBuilder instr: str) -> unit
   (let ((b (fb-block f)))
     (do (when (and (not @(. b closed)) (not (. b dead)))
           (doseq [l (ir-targets instr)]
@@ -191,11 +213,17 @@
           ["  )\n"])))
 
 ;; The function's text. Rust: ir.rs:185 render
+;; The text of the function's result type: `{ T ptr }` or `ptr` for one that passes failures on.
+(defun fb-ret-text (f: FnBuilder) -> str
+  (match @(. f ret)
+    ((some t) (if (and @(. f unwind) (not (lir-aggregate? t))) (str-join ["{ " (lir-ty-text t) " ptr }"]) (lir-ty-text t)))
+    (nil (if @(. f unwind) "ptr" "void"))))
+
 (defun fb-render (f: FnBuilder) -> str
   (let ((cc (if (. f tailcc) "tailcc " ""))
-        (ret (match @(. f ret) ((some t) (lir-ty-text t)) (nil "void")))
-        (params (mapv (fn (p: LirParam) (str-join ["(" (lir-ty-text (. p ty)) " " (. p name) ")"]))
-                      (. f params)))
+        (ret (fb-ret-text f))
+        (params (into (mapv (fn (p: LirParam) (str-join ["(" (lir-ty-text (. p ty)) " " (. p name) ")"])) (. f params))
+                      (if (fb-slot? f) ["(ptr exs)"] [])))
         (body (cell [])))
     (do (doseq [i (range (count @(. f blocks)))]
           (let ((b (nth @(. f blocks) i)))

@@ -45,6 +45,9 @@
 ;; The pthread key under which a spawned task's thread keeps its task (fib.thread-enter): what a trap on that thread
 ;; completes as failed (fib.trap-bytes). Created by fib.init; the main thread and the pool's workers have no value.
 (global internal fib.task-key i32 (i32 0))
+;; The pthread key under which a thread keeps its catch state (fib.exc-state): what `catch-run` and a trap read; made on the first
+;; catch of the thread and freed when the thread ends.
+(global internal fib.exc-key i32 (i32 0))
 (declare pthread_key_create i32 (ptr ptr))
 (declare pthread_setspecific i32 (i32 ptr))
 (declare pthread_getspecific ptr (i32))
@@ -54,6 +57,7 @@
   (block entry
     (call @fib.rq-init)
     (call @pthread_key_create @fib.task-key (ptr null))
+    (call @pthread_key_create @fib.exc-key @free)
     (call @fib.lc-init)
     (let ((v (call @getenv (string \"FIB_TRACE\"))))
       (br (icmp eq v (ptr null)) done set)))
@@ -592,6 +596,11 @@
     (call @fib.trap-hooked (ptr null) bytes n)
     (unreachable))
   (block check
+    (br (call @fib.in-finally) fin task))
+  (block fin
+    (call @fib.fatal-finally bytes n)
+    (unreachable))
+  (block task
     (let ((tk (call @pthread_getspecific (load i32 @fib.task-key))))
       (br (icmp ne tk (ptr null)) in-task plain)))
   (block in-task
@@ -628,6 +637,168 @@
           (len (call @snprintf buf (i64 96) (string \"array index %lld out of range 0..%lld\") i n)))
       (call @fib.trap-bytes buf (sext i64 len))
       (unreachable))))
+
+;; ---- catching traps (stage 2, docs/design/exceptions.md 4.2, ADR 0009)
+;; A program that calls `catch-run` is compiled so that its functions return a failure next to their value (`{ T ptr }`, or `ptr` for
+;; unit): null when they returned, else the failure in flight, which every caller releases its frame for and returns in its turn. The
+;; failure is a thrown object, or a str message tagged with bit 0 (a trap). A trap unwinds only while a catch-run is active on its
+;; thread and no finally clause runs for an unwinding; otherwise it is the trap of fib.trap-bytes, as before (abort, or the task's failure).
+
+;; The catch state of a thread: the number of catch-runs active, the failure caught last (until catch-run's caller takes it), and the
+;; number of finally clauses running for an unwinding.
+(defstruct fib.exc (i64 ptr i64))
+
+(define internal (fib.exc-state ptr) ()
+  (block entry
+    (let ((s (call @pthread_getspecific (load i32 @fib.exc-key))))
+      (br (icmp eq s (ptr null)) make done)))
+  (block make
+    (let ((n (call @calloc (i64 1) (i64 24))))
+      (br (icmp eq n (ptr null)) oom set)))
+  (block oom
+    (call @fib.fatal-c (string \"out of memory\"))
+    (unreachable))
+  (block set
+    (call @pthread_setspecific (load i32 @fib.exc-key) n)
+    (ret n))
+  (block done (ret s)))
+
+;; Whether a trap on this thread unwinds: a catch-run is active.
+(define internal (fib.catching i1) ()
+  (block entry
+    (let ((s (call @pthread_getspecific (load i32 @fib.exc-key))))
+      (br (icmp eq s (ptr null)) no yes)))
+  (block no (ret (i1 0)))
+  (block yes (ret (icmp sgt (load i64 (getelementptr %struct.fib.exc s (i32 0) (i32 0))) (i64 0)))))
+
+;; Whether a finally clause runs for an unwinding on this thread (a trap there is fatal).
+(define internal (fib.in-finally i1) ()
+  (block entry
+    (let ((s (call @pthread_getspecific (load i32 @fib.exc-key))))
+      (br (icmp eq s (ptr null)) no yes)))
+  (block no (ret (i1 0)))
+  (block yes (ret (icmp sgt (load i64 (getelementptr %struct.fib.exc s (i32 0) (i32 2))) (i64 0)))))
+
+(define internal (fib.catch-enter ptr) ()
+  (block entry
+    (let ((s (call @fib.exc-state))
+          (dp (getelementptr %struct.fib.exc s (i32 0) (i32 0))))
+      (store (add (load i64 dp) (i64 1)) dp)
+      (ret s))))
+
+;; The end of a catch-run: the depth restored; 0 when the body returned, else the failure is kept for the caller to take (1: a trap's
+;; message, 2: a thrown object).
+(define internal (fib.catch-leave i64) ((ptr s) (ptr ex))
+  (block entry
+    (let ((dp (getelementptr %struct.fib.exc s (i32 0) (i32 0))))
+      (store (sub (load i64 dp) (i64 1)) dp)
+      (br (icmp eq ex (ptr null)) ok caught)))
+  (block ok (ret (i64 0)))
+  (block caught
+    (let ((sp (getelementptr %struct.fib.exc s (i32 0) (i32 1))))
+      (call @fib.release (inttoptr ptr (and (ptrtoint i64 (load ptr sp)) (i64 -2))))
+      (store ex sp)
+      (ret (select (icmp ne (and (ptrtoint i64 ex) (i64 1)) (i64 0)) (i64 1) (i64 2))))))
+
+;; The failure caught last, taken (its count moves to the caller): `want` 1 the message str of a trap, 0 a thrown object; asking for the
+;; other kind, or when nothing was caught, is a trap.
+(define internal (fib.caught-take ptr) ((i64 want))
+  (block entry
+    (let ((s (call @fib.exc-state))
+          (sp (getelementptr %struct.fib.exc s (i32 0) (i32 1)))
+          (ex (load ptr sp))
+          (tag (and (ptrtoint i64 ex) (i64 1))))
+      (br (icmp eq ex (ptr null)) none kind)))
+  (block kind (br (icmp eq tag want) take none))
+  (block none
+    (call @fib.trap-c (string \"caught: no failure of that kind was caught\"))
+    (unreachable))
+  (block take
+    (store (ptr null) sp)
+    (ret (inttoptr ptr (and (ptrtoint i64 ex) (i64 -2))))))
+
+;; A trap of the message at bytes: the failure to unwind with when a catch is active (a fresh tagged str), else the trap as before.
+(define internal (fib.raise-bytes ptr) ((ptr bytes) (i64 n))
+  (block entry
+    (br (icmp ne (load ptr @fibm.trap-hook) (ptr null)) plain check))
+  (block check (br (call @fib.catching) unwind plain))
+  (block plain
+    (call @fib.trap-bytes bytes n)
+    (unreachable))
+  (block unwind
+    (let ((m (call @fib.str-from-bytes bytes n)))
+      (ret (inttoptr ptr (or (ptrtoint i64 m) (i64 1)))))))
+
+(define internal (fib.raise-c ptr) ((ptr msg))
+  (block entry (ret (call @fib.raise-bytes msg (call @strlen msg)))))
+
+(define internal (fib.raise ptr) ((ptr s))
+  (block entry
+    (ret (call @fib.raise-bytes (getelementptr %struct.fib.str s (i32 0) (i32 4) (i64 0))
+           (load i64 (getelementptr %struct.fib.str s (i32 0) (i32 3)))))))
+
+(define internal (fib.raise-index ptr) ((i64 i) (i64 n))
+  (block entry
+    (let ((buf (alloca i8 (i32 96)))
+          (len (call @snprintf buf (i64 96) (string \"array index %lld out of range 0..%lld\") i n)))
+      (ret (call @fib.raise-bytes buf (sext i64 len))))))
+
+;; `throw-object`: the object (its count) is the failure; outside a catch there is no one to take it.
+(define internal (fib.raise-object ptr) ((ptr p))
+  (block entry (br (call @fib.catching) unwind plain))
+  (block plain
+    (call @fib.trap-c (string \"throw: no catch is active\"))
+    (unreachable))
+  (block unwind (ret p)))
+
+;; A failure that reached a function that cannot pass it on (a def's initialiser, an async body, a region that left a slot moved from):
+;; the trap it was, reported as before.
+(define internal (fib.unwound-fatal void) ((ptr ex))
+  (block entry
+    (br (icmp ne (and (ptrtoint i64 ex) (i64 1)) (i64 0)) msg obj))
+  (block msg
+    (let ((s (inttoptr ptr (and (ptrtoint i64 ex) (i64 -2)))))
+      (call @fib.trap-bytes (getelementptr %struct.fib.str s (i32 0) (i32 4) (i64 0))
+        (load i64 (getelementptr %struct.fib.str s (i32 0) (i32 3))))
+      (unreachable)))
+  (block obj
+    (call @fib.trap-c (string \"a thrown exception reached code that cannot unwind\"))
+    (unreachable)))
+
+;; The failure a thread's entry finds (none can reach it: no catch is active below it).
+(define internal (fib.unwound-check void) ((ptr ex))
+  (block entry (br (icmp eq ex (ptr null)) done bad))
+  (block bad
+    (call @fib.unwound-fatal ex)
+    (unreachable))
+  (block done (ret)))
+
+;; A finally clause run for an unwinding: no catch is active inside it, and a trap there is fatal. Returns the depth to restore.
+(define internal (fib.finally-enter i64) ()
+  (block entry
+    (let ((s (call @fib.exc-state))
+          (dp (getelementptr %struct.fib.exc s (i32 0) (i32 0)))
+          (d (load i64 dp))
+          (fp (getelementptr %struct.fib.exc s (i32 0) (i32 2))))
+      (store (i64 0) dp)
+      (store (add (load i64 fp) (i64 1)) fp)
+      (ret d))))
+
+(define internal (fib.finally-leave void) ((i64 d))
+  (block entry
+    (let ((s (call @fib.exc-state))
+          (fp (getelementptr %struct.fib.exc s (i32 0) (i32 2))))
+      (store d (getelementptr %struct.fib.exc s (i32 0) (i32 0)))
+      (store (sub (load i64 fp) (i64 1)) fp)
+      (ret))))
+
+(define internal (fib.fatal-finally void) ((ptr bytes) (i64 n))
+  (block entry
+    (call @write (i32 2) (string \"trap: in a finally clause run while unwinding: \") (i64 47))
+    (call @write (i32 2) bytes n)
+    (call @write (i32 2) (string \"\\n\") (i64 1))
+    (call @abort)
+    (unreachable)))
 
 ;; (hash x) on a float (types §2.12): the bits of the value as a double,
 ;; except that -0.0 hashes as 0.0 and every NaN as the quiet NaN's bits

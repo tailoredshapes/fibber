@@ -49,11 +49,11 @@
 ;; Rust `Run::walk`: a walk over every body of the unit; `sites` are the tail sites once known,
 ;; `admit` whether rule (e) is applied to them with `facts`, `local` the scope-local sites.
 (defun run-walk :private (r: Run facts: Facts sites: (Option (Map i64 Tail)) admit: bool
-                          local: (Set Site) dead: (Set i64) steal: (Set i64) amp: (Set i64) reuse: (Map i64 i64)) -> Walked
+                          local: (Set Site) dead: (Set i64) steal: (Set i64) amp: (Set i64) reuse: (Map i64 i64) final: bool) -> Walked
   (let [unit (. r unit)]
     (reduce (fn (w: Walked pair: (Pair BodyKey BodySpec))
               (walk-one w (Ctx (. r p) (. r summaries) facts (. unit scc) (. unit all-owned)
-                               sites admit local dead steal amp reuse (. r bodies))
+                               sites admit local dead steal amp reuse (. r bodies) final)
                         (. pair snd)))
             (Walked [] [] (map-empty) (map-empty) (set-empty) (set-empty))
             (. unit bodies))))
@@ -61,7 +61,7 @@
 ;; The facts of the fixpoint: walks until a walk's events add nothing.
 (defun settle :private (r: Run sites: (Map i64 Tail) facts: Facts) -> Facts
   (loop [f facts]
-    (let [w (run-walk r f (some sites) false (set-empty) (set-empty) (set-empty) (set-empty) (map-empty))
+    (let [w (run-walk r f (some sites) false (set-empty) (set-empty) (set-empty) (set-empty) (map-empty) false)
           g (facts-absorb f (. r p) (. w events) (. w literals))]
       (if (= g f) f (recur g)))))
 
@@ -115,9 +115,9 @@
 ;; Rust: unit.rs:101 `decide`: decides a unit, starting from `facts`.
 (defun decide (p: TypedProgram summaries: (Map i64 Summary) bodies: (Map BodyKey BodyOwn) unit: Unit facts: Facts) -> Decided
   (let [r (Run p summaries bodies unit)
-        sites (. (run-walk r facts nil false (set-empty) (set-empty) (set-empty) (set-empty) (map-empty)) tails)
+        sites (. (run-walk r facts nil false (set-empty) (set-empty) (set-empty) (set-empty) (map-empty) false) tails)
         settled (settle r sites facts)
-        admitted (run-walk r settled (some sites) true (set-empty) (set-empty) (set-empty) (set-empty) (map-empty))
+        admitted (run-walk r settled (some sites) true (set-empty) (set-empty) (set-empty) (set-empty) (map-empty) false)
         done (facts-absorb settled p (. admitted events) (. admitted literals))
         local (scope-local (. admitted events) (. admitted candidates) (. admitted literals)
                            (. done heap))
@@ -128,7 +128,7 @@
         steal (reduce (fn (acc: (Set i64) l: LastUses) (into acc (vec (. l steal)))) (set-empty) lasts)
         amp (reduce (fn (acc: (Set i64) l: LastUses) (into acc (vec (. l amp)))) (set-empty) lasts)
         reuse (reduce (fn (acc: (Map i64 i64) l: LastUses) (merge acc (. l reuse))) (map-empty) lasts)
-        emitted (run-walk r done (some sites) true local dead steal amp reuse)
+        emitted (run-walk r done (some sites) true local dead steal amp reuse true)
         wanted (wanted-params unit (. emitted wants) done)]
     (if (not (empty? wanted))
       (decide p summaries bodies unit (reduce (fn (g: Facts b: i64) (facts-want-owned g b)) done wanted))

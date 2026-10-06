@@ -151,8 +151,16 @@
 
 ;; The result of a task that is done, retained (under its atom's lock, as any atom read). A task that failed (a trap on its thread,
 ;; docs/design/exceptions.md 4.1) has no result: reading it traps in the reader with the task's own message. Rust: lower/threads.rs:228
+;; Where a trap is caught (docs/design/exceptions.md 4.2), the joiner's trap unwinds to its `try` like any other.
 (defun task-value :private (cx: LowerCx t: V result-ty: Ty) -> (Result V str)
-  (do (fb-stmt (. cx b) (str-join ["(call @fib.raise-failed " (v-text t) ")"]))
+  (do (if (lcx-catchable? cx)
+          (let ((b (. cx b)) (lf (fb-label (. cx b) "failed")) (lk (fb-label (. cx b) "succeeded"))
+                (msg (fb-val (. cx b) (str-join ["(call @fib.task-failure " (v-text t) ")"]) LirPtr)))
+            (do (fb-term b (str-join ["(br (icmp ne " (v-text msg) " (ptr null)) " lf " " lk ")"]))
+                (fb-open b lf)
+                (lcx-fail cx (str-join ["(call @fib.trap " (v-text msg) ")"]) (str-join ["(call @fib.raise " (v-text msg) ")"]))
+                (fb-open b lk)))
+          (fb-stmt (. cx b) (str-join ["(call @fib.raise-failed " (v-text t) ")"])))
       (task-result-value cx t result-ty)))
 
 (defun task-result-value :private (cx: LowerCx t: V result-ty: Ty) -> (Result V str)
@@ -177,7 +185,15 @@
         (let ((head (str-join ["(define internal (" name " ptr) ((ptr task))\n  (block entry\n    (call @fib.thread-enter task)\n    (let ((f (load ptr (getelementptr %struct."
                                tsname " task (i32 0) (i32 " (str slot-task-closure) "))))\n          (code (load ptr (getelementptr "
                                "%struct.fib.closure f (i32 0) (i32 3))))"]))
-              (call (fn (r: str) (str-join ["(indirect-call code (fn tailcc " r " (ptr)) f)"])))
+              ;; In a program that catches the closure returns a failure too; none reaches a thread's entry (no catch is active below
+              ;; it: a trap there is the task's failure, fib.trap-bytes), so the value is all that is read.
+              (uw (and (. (. cx p) unwinding) (not @(. (. cx p) macro-module))))
+              (call (fn (r: str)
+                      (cond (not uw) (str-join ["(indirect-call code (fn tailcc " r " (ptr)) f)"])
+                            (= r "void") "(call @fib.unwound-check (indirect-call code (fn tailcc ptr (ptr)) f))"
+                            ;; a two-leaf result takes a failure slot: none is ever stored at a thread's entry
+                            (or (starts-with? r "{") (starts-with? r "<")) (str-join ["(indirect-call code (fn tailcc " r " (ptr ptr)) f (ptr null))"])
+                            :else (str-join ["(extractvalue (indirect-call code (fn tailcc { " r " ptr } (ptr)) f) 0)"]))))
               (tail "      (call @fib.release task)\n      (call @fib.thread-done)\n      (ret (ptr null)))))\n"))
           (try-let ((s (completion cx head call true tail result-ty)))
             (do (program-add-helper (. cx p) name s)

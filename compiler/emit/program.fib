@@ -8,7 +8,7 @@
 ;; The runtime's own `declare` (`runtime-declaration`) is emit.rt's.
 ;; E11 added the last field, `macro-module` (Rust `macro_module: bool`, set by `compile-macro`): a trap of a macro module fails the expansion.
 (ns emit.program
-  (:require [fib.string :as s])
+  (:require [fib.string :as s] [fib.unix :as unix])
   (:use types.ty types.ast types.decls types.display types.init types.program own.program emit.value emit.layout emit.names
         emit.mono emit.objects emit.statics emit.rt))
 
@@ -30,7 +30,20 @@
    helpers: (Cell (Map str bool)) def-values: (Cell (Map i64 DefValue)) quotes: (Cell (Map i64 str))
    quote-text: (Cell str) quote-counter: (Cell i64) keyword-helpers: (Cell bool)
    def-slots: (Cell (Map i64 DefValue)) inits: (Cell (Vec Init))
-   macro-module: (Cell bool)))
+   macro-module: (Cell bool) unwinding: bool))
+
+;; Whether the program catches (stage 2 of docs/design/exceptions.md, ADR 0009): some body calls `catch-run`. Only then do its functions
+;; return a failure next to their value (emit.lower.call); a program that never catches has no observer of a failure, so a trap aborts
+;; as before and no function pays for the convention. FIB_CATCH=all compiles every program as one that catches (to measure the cost).
+(defun program-unwinds? (typed: TypedProgram owned: OwnedProgram) -> bool
+  (or (= (unix/getenv "FIB_CATCH") (some "all"))
+      (some? (find-first (fn (body: BodyOwn)
+                           (some? (find-first (fn (c: CallOwn)
+                                                (match (. c callee)
+                                                  ((CalBuiltin b) (= (. (nth (. typed builtins) b) name) "catch-run"))
+                                                  (_ false)))
+                                              (vals (. body calls)))))
+                         (vals (. owned bodies))))))
 
 ;; `str` is type id 0: the literals need it before any body runs; the runtime's own text names the byte array and the weak box.
 ;; (E2 wrote this and the object functions below, which `--layout` needs; E3 owns the rest of this module.)
@@ -38,7 +51,7 @@
 (defun program-new (typed: TypedProgram owned: OwnedProgram) -> Program
   (let ((p (Program typed owned (objects-new) (statics-new) (queue-new) (cell []) (cell 0) (cell []) (cell [])
                     (cell (map-empty)) (cell (map-empty)) (cell (map-empty)) (cell "") (cell 0) (cell false)
-                    (cell (map-empty)) (cell []) (cell false))))
+                    (cell (map-empty)) (cell []) (cell false) (program-unwinds? typed owned))))
     (do (objects-intern (. p objects) "fib.str" "str" ObStr)
         (objects-intern (. p objects) "fib.array.i8" "(Array i8)" (ObArray LirI8))
         (objects-intern (. p objects) "fib.weakbox" "weak box" ObWeak)
