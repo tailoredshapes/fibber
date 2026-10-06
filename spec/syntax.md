@@ -1255,6 +1255,7 @@ level 1 (not under `~` or `~@`, not in a nested quasiquote, not inside `quote`,
 | a `:private` function, `def`, `extern` or method of `m` | `(var m/x)` (§3.20) |
 | `a/x` where `a` is a `:require` alias of `m` for module `n` | `n/x` |
 | a core form, `nil`, `&`, `...`, `_`, `true`, `false`, a gensym, a name ending in `:` | itself |
+| a prelude macro that `m` does not hide (§4.4: `str`, `when`, `cond` ..), even where a module `m` uses has a function of that name | itself |
 | a name the template binds anywhere: the names of a binding head (`let`, `loop`, `if-some`, `try-let`, `doseq` ..), of a `fn`, `defun`, `defn` or `defmacro` and their parameters, a `match` clause's pattern variables, an `impl` method's name and parameters, a `def`'s name, the field of `.` and `set-field!` | itself |
 | an enum or protocol name, a private struct, variant or macro, any other qualified name, a name `m` neither defines nor sees (the prelude's, the builtins', a name unknown in `m`) | itself: resolved at the expansion site, as before this rule |
 
@@ -1265,7 +1266,8 @@ expansion site cannot name, and `o` is the macro's module or one it depends on
 scope at once, so that `o/mac` is a macro call, and the module spec the checker
 reads; `o` was loaded before the macro's module, so the dependency order holds.
 In the macro's own module the qualification is taken off when the module ends
-(`m/x` is `x`, `(var m/x)` is `(var x)`; quoted data is kept), so a module that
+(`m/x` is `x`, `(var m/x)` is `(var x)`; quoted data is kept, except in the
+`defmacro` forms themselves), so a module that
 uses its own macros expands as it did before this rule, and `m/x` written in
 module `m` itself names its definition. So a library's macro works where the
 library is only `:require`d, a local at the site cannot capture a name the

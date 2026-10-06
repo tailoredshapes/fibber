@@ -22,8 +22,8 @@ to be written down, not an edit of the list.
 - Today's exceptions, honestly: `compiler/emit/runtime.fib` is generated from `rt/*.lir` (compiler/tests/emit/runtime.sh checks that it equals
   what the generator makes), so the limit does not apply to it and it is excluded from the rule; `lib/prelude.fib` (721) is the
   language's embedded prelude; `compiler/expand/ctx.fib` (525) is over by 25. Functions: `compiler/native/support.fib:mailbox-source`
-  (333, a function that holds the text of a runtime source), `compiler/types/lower/call.fib:special-kind` (52) and the `scenario`
-  macro of `fib.test.core` (73: a stage-2 macro sees the prelude only and cannot call a helper, docs/design/test-harness.md §10).
+  (333, a function that holds the text of a runtime source), and `compiler/types/lower/call.fib:special-kind` (52). (The `scenario` macro of `fib.test.core`, 73 lines while a macro could
+  call no helper, left the list when MACRO-NS gave macros helpers at expansion time: docs/design/macro-names.md.)
 - `compiler/tests/` is not measured: some test inputs are long on purpose (a reader test of nesting depth 1001 has 1001 lines).
 - "Lines" are physical lines of the file or of the form, counted by the light reader of `fib.test.arch`: a comment inside a function counts.
 
@@ -40,7 +40,7 @@ to be written down, not an edit of the list.
 (limit "every function of compiler/ and lib/ outside the tests has fewer than 50 lines (shrink-only allow-list)"
   (fn-lengths repo ["compiler/**.fib" "lib/**.fib" "!compiler/tests/**"])
   49
-  ["compiler/native/support.fib:mailbox-source=333" "compiler/types/lower/call.fib:special-kind=52" "lib/fib/test/core.fib:scenario=73"]
+  ["compiler/native/support.fib:mailbox-source=333" "compiler/types/lower/call.fib:special-kind=52"]
   (plant-file "compiler/emit/zz-plant.fib"
               (str "(defun zz-long () -> i64\n" (join "\n" (mapv (fn (i: i64) "  (+ 1 1)") (range 60))) "\n  0)\n")))
 ```

@@ -20,7 +20,8 @@ Clojure's syntax-quote, adapted to a language with no global namespace table:
    defining module); a :private function, `def`, `extern` or method of the macro's module becomes `(var m/x)` (§3.20); `alias/x` with
    an alias of the macro's module becomes `ns/x`. Unchanged: core forms, names the template binds (an over-approximation: every
    name a binding head, `fn`, `match` clause, `impl` method or `def` in the template binds, and the field of `.`), gensyms, other
-   qualified names, types (enum and protocol names) and private structs, variants and macros, and names the macro's module does not
+   qualified names, types (enum and protocol names) and private structs, variants and macros, a prelude macro the module does not hide
+   (`str` in fib.test.core is the prelude's variadic macro, not fib.core's one-argument function), and names the macro's module does not
    define or see (the prelude, the builtins): those resolve at the site as before. Templates built by plain functions are not
    rewritten: only `defmacro` bodies (so the compiler's own code, which has no macros, is untouched).
 2. **The site learns the module.** After a user macro runs, every module its expansion names by full name that the site cannot name,

@@ -59,9 +59,10 @@
 (defun put-ns :private (ctx: ExpandCtx m: MacroNs) -> unit
   (set! (. ctx macro-ns) (assoc @(. ctx macro-ns) (. (. m spec) ns) m)))
 
-;; Records the module that `begin-spec` begins.
+;; Records the module that `begin-spec` begins; it has gained no require yet.
 (defun macro-begin (ctx: ExpandCtx spec: ModuleSpec) -> unit
-  (put-ns ctx (MacroNs spec (map-empty) (vec-empty))))
+  (do (set! (. ctx gained) (vec-empty))
+      (put-ns ctx (MacroNs spec (map-empty) (vec-empty)))))
 
 ;; The record of the module being expanded, made from its scope if it has none.
 (defun current-ns (ctx: ExpandCtx) -> MacroNs
@@ -99,13 +100,13 @@
     (nil nil)))
 
 ;; Whether the form has a symbol `ns/x` anywhere (a walk with a queue, no native recursion).
-(defun has-own? :private (ns: str form: Stx) -> bool
+(defun has-own? :private (ns: str data: bool form: Stx) -> bool
   (loop ((work [form]) (i 0))
     (if (>= i (count work))
         false
         (match (. (nth work i) kind)
           ((SSym s) (if (some? (own-name ns s)) true (recur work (+ i 1))))
-          ((SList items) (if (quoted? (nth work i)) (recur work (+ i 1)) (recur (into work items) (+ i 1))))
+          ((SList items) (if (and (not data) (quoted? (nth work i))) (recur work (+ i 1)) (recur (into work items) (+ i 1))))
           ((SVec items) (recur (into work items) (+ i 1)))
           ((SMap items) (recur (into work items) (+ i 1)))
           (_ (recur work (+ i 1)))))))
@@ -114,18 +115,22 @@
 (defun quoted? :private (form: Stx) -> bool
   (= (unwrap-or (head-name form) "") "quote"))
 
-(defun plain-form :private (ns: str form: Stx) -> Stx
+(defun plain-form :private (ns: str data: bool form: Stx) -> Stx
   (let ((pos (. form pos)))
     (match (. form kind)
       ((SSym s) (match (own-name ns s) ((some x) (sym x pos)) (nil form)))
-      ((SList items) (if (quoted? form) form (Stx (SList (mapv (fn (f: Stx) (plain-form ns f)) items)) pos)))
-      ((SVec items) (Stx (SVec (mapv (fn (f: Stx) (plain-form ns f)) items)) pos))
-      ((SMap items) (Stx (SMap (mapv (fn (f: Stx) (plain-form ns f)) items)) pos))
+      ((SList items) (if (and (not data) (quoted? form)) form (Stx (SList (mapv (fn (f: Stx) (plain-form ns data f)) items)) pos)))
+      ((SVec items) (Stx (SVec (mapv (fn (f: Stx) (plain-form ns data f)) items)) pos))
+      ((SMap items) (Stx (SMap (mapv (fn (f: Stx) (plain-form ns data f)) items)) pos))
       (_ form))))
 
-;; The forms with every `ns/x` written `x` (and so `(var ns/x)` as `(var x)`), except in quoted data; a form with none is the same form.
+;; The forms with every `ns/x` written `x` (and so `(var ns/x)` as `(var x)`), except in quoted data outside a `defmacro` (a
+;; `defmacro` kept in the program shows its templates as quoted data, which read as before the rule; the macro runs from its own copy);
+;; a form with none is the same form.
 (defun own-plain (ns: str forms: (Vec Stx)) -> (Vec Stx)
-  (mapv (fn (f: Stx) (if (has-own? ns f) (plain-form ns f) f)) forms))
+  (mapv (fn (f: Stx) (let ((data (= (unwrap-or (head-name f) "") "defmacro")))
+                       (if (has-own? ns data f) (plain-form ns data f) f)))
+        forms))
 
 ;; ---------------------------------------------------------------- what an expansion names
 
