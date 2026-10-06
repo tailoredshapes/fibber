@@ -316,6 +316,7 @@ All seven are real decisions already made; none was invented to exercise the too
 | 0005 | The interpreter is a development tool | fitness (4) | 4 | decisions-2026-10-04.md amendment | **that spec/method.md rule 6 was updated (it was not)** |
 | 0006 | Files stay under 500 lines, functions under 50 | fitness (2, `limit`) | 2 | CLAUDE.md "Rust standards" | taste; tests; readability |
 | 0007 | Windows run within 1.3x of the array loop | measure (5) + fitness (2) | 7 | exclusive-views.md, `scripts/bench/windows.sh` | other machines; cold caches; that a record was measured |
+| 0008 | Supported ISAs have guaranteed tail calls and FMA | fitness (6) | 6 | the owner, 2026-10-06; targets.fib | that the rows are true of LLVM; the warning, trap and start-up check at run time (no-fma.sh, cpu-check.sh) |
 
 Things the pilots found (reported, not fixed):
 
