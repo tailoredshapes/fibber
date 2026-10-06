@@ -415,3 +415,31 @@ a Vec, the cost-hint grain, adaptive splitting, cancellation. `pmap` over arrays
 
 What this showed that the design did not say: the per-call cost of a closure shared between threads (`docs/shootout/parallel.md`), which makes the closure forms of
 `pmap` 5x slower than the macro forms for a trivial body and `preduce-n` 75x slower at 1e8 elements; P-count-b is what removes it.
+
+### 3.6.1 P-count-b: what was built and measured
+
+**`freeze` and `frozen?`** (built; spec/types.md 2.10.1). `scripts/bench/freeze.sh`, T tasks each doing 1e6 "take a node of a Vec, hold it in a fresh
+Vec, drop it" (the `p2` loop of 2.5; ms, median of three, one machine shared with other work, so trust ratios of 2x and more):
+
+| row | T=1 | T=4 | T=28 |
+|---|---:|---:|---:|
+| private copies | 34 | 45 | 79 |
+| shared Vec, K=1 node | 40 | 262 | 2365 |
+| frozen Vec, K=1 node | 34 | 47 | 105 |
+| shared Vec, K=64 nodes | 41 | 87 | 266 |
+| frozen Vec, K=64 nodes | 35 | 39 | 97 |
+| shared, plain field read (no hold) | 11 | 50 | 197 |
+| frozen, plain field read | 3 | 5 | 9 |
+
+Frozen at 28 threads is 1.3x the private copies (the target was within 3x); shared was 30x. The walk's mode lives in the worklist: a global, as
+`fib.immortalise` had, would have let a `freeze` on one thread and a `spawn` on another disturb each other.
+
+**Borrowed element reads** (measured, not extended). The existing rule (spec/types.md 6.3, "Element reads": the `Derived` mode of `array-get`) covers a builtin
+`array-get` on a borrowed array in a function body. It does not cover `(. (vec-nth v i) a)`: `vec-nth` is a prelude function that returns an owned
+element, and the emitted lIR of `field-read` (scripts/bench/freeze-contention.fib) has `call @f.fib.prelude.vec-nth.str` then `call @fib.release` on
+the result: a retain and a release of the element, atomic when the Vec is SHARED. That is the "shared, plain field read" row above (197 ms at 28
+threads against 79 private). Freezing removes it for data that lives to the end of the program (9 ms). For shared data that must still be freed, the
+fix is an interprocedural one (a function whose result is `Derived` from a parameter: a summary in the ownership pass and a second return convention
+in the emitter); it was **not built**: no measured benchmark here needs it once the data can be frozen or the element is a scalar (a Vec of scalars
+touches no count), and the change is a checker feature of its own.
+
