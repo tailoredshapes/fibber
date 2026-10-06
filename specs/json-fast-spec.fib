@@ -3,7 +3,7 @@
 ;; (a valid document that falls back is a silent slowdown, so it is a failure here); if the scalar builder rejects, so does the fast one. The inputs: the JSONTestSuite subset
 ;; files, random documents written compact, pretty and ASCII-only (blocks of 64 bytes cut them everywhere), a large document, and the same documents with one byte deleted,
 ;; replaced, inserted, or the text cut off (the mutations of a valid document are where a grammar check that is missing shows).
-(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.json.types fib.json.write fib.json.gen fib.json.tape fib.json.tapebuild fib.json.tapefast fib.json.utf8) (:require [fib.os :as os]))
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.json.types fib.json.write fib.json.gen fib.json.tape fib.json.tapebuild fib.json.tapefast fib.json.utf8 fib.json.domfast) (:require [fib.json.parse :as p] [fib.os :as os]))
 
 (defun same-words (a: Doc b: Doc) -> bool
   (and (= (. a len) (. b len))
@@ -11,10 +11,13 @@
 
 (defun agree (s: str) -> bool (agree-with s (default-options)))
 
+(defun same-dom (s: str d: Doc o: JsonOptions) -> bool
+  (match (dom-of-doc s d o) ((some j) (match (p/parse-with s o) ((Ok k) (= j k)) ((Err _) false))) (nil (match (p/parse-with s o) ((Ok _) false) ((Err _) true)))))
+
 (defun agree-with (s: str o: JsonOptions) -> bool
   (do
     (match (fast-tape-always s o)
-      ((some d) (match (build-tape-scalar s o) ((Ok e) (same-words d e)) ((Err _) false)))
+      ((some d) (match (build-tape-scalar s o) ((Ok e) (and (same-words d e) (same-dom s d o))) ((Err _) false)))
       (nil (match (build-tape-scalar s o) ((Ok _) false) ((Err _) true))))))
 
 (defun suite-files () -> (Vec str)

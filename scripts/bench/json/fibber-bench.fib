@@ -2,7 +2,7 @@
 ;;   dom     parse into Json            tape   the structural pass only         three  tape + three fields of twitter.json by path (no DOM)
 ;;   typed   decode twitter.json into records (no DOM)                          write  serialise the parsed document, compact
 ;;   lines   NDJSON file: parse every line (bounded memory: fib.json.io/reduce-lines); the third argument is the file size in bytes
-(ns main (:use fib.core fib.seq fib.coll fib.json.types fib.json.parse fib.json.write fib.json.tapebuild fib.json.view fib.json.io) (:require [fib.json.codec :as jc]))
+(ns main (:use fib.core fib.seq fib.coll fib.json.types fib.json.parse fib.json.domfast fib.json.write fib.json.tapebuild fib.json.view fib.json.io) (:require [fib.json.codec :as jc]))
 
 (jc/defjson User [screen_name: str followers_count: i64 verified: bool])
 (jc/defjson Status [id: i64 text: str retweet_count: i64 favorite_count: i64 user: User])
@@ -18,7 +18,7 @@
                  (+ (if (>= b 0) (if-some [x (node-i64 d b)] x 0) 0)
                     (if (>= c 0) (if-some [x (node-i64 d c)] (rem x 1000) 0) 0)))))
     ((Err _) -1)))
-(defun dom (s: str) -> i64 (match (parse s) ((Ok v) (match v ((JObj ks _) (count ks)) ((JArr xs) (count xs)) (_ 1))) ((Err _) -1)))
+(defun dom (s: str) -> i64 (match (parse-fast-default s) ((Ok v) (match v ((JObj ks _) (count ks)) ((JArr xs) (count xs)) (_ 1))) ((Err _) -1)))
 (defun tape (s: str) -> i64 (match (tape-of s) ((Ok d) (. d len)) ((Err _) -1)))
 
 (defun timed (name: str bytes: i64 reps: i64 f: (fn () i64)) -> unit
@@ -44,6 +44,6 @@
                   (= mode "tape") (do (timed "tape build" n reps (fn () (tape s))) 0)
                   (= mode "three") (do (timed "tape + 3 fields" n reps (fn () (three s))) 0)
                   (= mode "typed") (do (timed "typed decode" n reps (fn () (typed s))) 0)
-                  (= mode "write") (match (parse s) ((Ok j) (do (timed "write compact" (str-len (write j)) reps (fn () (str-len (write j)))) 0)) ((Err _) 1))
+                  (= mode "write") (match (parse-fast-default s) ((Ok j) (do (timed "write compact" (str-len (write j)) reps (fn () (str-len (write j)))) 0)) ((Err _) 1))
                   :else 1))
           1))))

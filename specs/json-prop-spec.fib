@@ -5,8 +5,23 @@
 (defun same (r: (Result Json JsonError) x: Json) -> bool (match r ((Ok y) (= x y)) ((Err _) false)))
 (defun via-tape (s: str) -> (Result Json JsonError) (match (tape-of s) ((Ok d) (Ok (node->json d 0))) ((Err e) (Err e))))
 
+(defun pad (n: i64) -> str (str-join (vec (map (fn (i: i64) "a") (range n)))))
+
+;; A special character at every offset of strings of 1 to 100 bytes (so each lands in each lane of a 32-byte vector compare, and in the tail): the text must read back as the
+;; same string, hold no raw control byte, and in ASCII-only mode no byte of 0x80 or more.
+(defun specials () -> (Vec str) ["\"" "\\" "\x01" "\x1f" "\n" "é" "😀" "/" "\x7f"])
+(defun long-string-bad () -> (Vec str)
+  (vec (filter (fn (t: str) (not (let [j (JStr t)
+                                       raw (write j) asc (write-with j (WriteOptions 0 true))]
+                                   (and (same (parse raw) j) (same (parse asc) j)
+                                        (loop [i 1] (cond (>= i (- (str-len raw) 1)) true (< (str-byte-at raw i) 32i8) (if (< (str-byte-at raw i) 0i8) (recur (+ i 1)) false) :else (recur (+ i 1))))
+                                        (loop [i 0] (cond (>= i (str-len asc)) true (< (str-byte-at asc i) 0i8) false :else (recur (+ i 1))))))))
+               (mapcat (fn (c: str) (mapcat (fn (off: i64) [(str (pad off) c (pad (- 40 (rem off 33)))) (str (pad off) c c (pad 3))]) (range 101))) (specials)))))
+
 (defspecs specs
   (feature "fib.json round trips"
+    (scenario "a special character at every offset of a long string: written, read back, no raw control byte, ASCII-only"
+      (then (expect = [] (vec (map (fn (t: str) (pr-str t)) (long-string-bad))))))
     (prop "parse of write is the value (compact)" [x (gen-json)] (same (parse (write x)) x))
     (prop "parse of write-pretty is the value" [x (gen-json)] (same (parse (write-pretty x)) x))
     (prop "parse of the ascii-only text is the value" [x (gen-json)] (same (parse (write-with x (WriteOptions 0 true))) x))

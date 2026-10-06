@@ -1,0 +1,149 @@
+;; fib.json.domfast: the DOM built from the tape in one pass (docs/design/json.md 3). The index-driven tape builder (fib.json.tapefast) validates the document at
+;; GB/s; this module turns the tape into a `Json` with as few allocations as the data type allows: an array or an object is two arrays of exactly its size (the child count is
+;; read off the tape, so nothing grows) made into `Vec`s by `vec-from-array` (up to 32 elements the array is the vector itself), a string is one `str-slice`, an integer of up to
+;; 18 digits is read in place, every other number goes through fib.json.number (Eisel-Lemire). The text is read through raw pointers. Duplicate keys are found without making
+;; a str (comparison of the slices of the text; a table of indices for objects of more than 8 keys) and the object is then given to the scalar reader, which owns the policy.
+;; A failure here (a number outside the range, say) answers nil and the caller runs the recursive-descent parser, which says exactly what is wrong.
+;;   (parse-fast s o) -> (Option Json)        (parse-with-fast s o) -> (Result Json JsonError)
+(ns fib.json.domfast (:use fib.core fib.seq fib.coll fib.json.types fib.json.number fib.json.tape fib.json.tapefast fib.json.view fib.json.buffer fib.json.utf8) (:require [fib.json.parse :as p] [fib.json.libc :as libc]))
+
+(def end-mask: i64 4611686018427387903)
+
+(def j-true: Json (JBool true))
+(def j-false: Json (JBool false))
+
+(defun skip-of (tp: ptr j: i64) -> i64 (if (>= (bit-and (tget tp j) 255) k-array) (tget tp (+ j 1)) (+ j 2)))
+
+(defun child-count (tp: ptr i: i64 end: i64) -> i64
+  (loop [j (+ i 2) c 0] (if (>= j end) c (recur (skip-of tp j) (+ c 1)))))
+
+;; The i64 of the at most 18 digits of s[a, b) (b - a <= 19 with the sign): no overflow is possible.
+(defun small-int (src: ptr a: i64 b: i64) -> i64
+  (let [neg (= (byte-at src a) 45)]
+    (loop [k (if neg (+ a 1) a) v 0]
+      (if (>= k b) (if neg (- 0 v) v) (recur (+ k 1) (+ (* v 10) (- (byte-at src k) 48)))))))
+
+(defun dom-string (s: str src: ptr tp: ptr i: i64) -> str
+  (let [w1 (tget tp (+ i 1)) a (shr (tget tp i) 8) b (bit-and w1 end-mask)]
+    (if (= (bit-and w1 esc-flag) 0) (str-slice s a b) (unescape s a b))))
+
+(defun dom-number (s: str src: ptr tp: ptr i: i64 o: JsonOptions &pos: i64 &fail: i64) -> Json
+  (let [a (shr (tget tp i) 8) b (tget tp (+ i 1))]
+    (cond (and (= (bit-and (tget tp i) 255) k-int) (<= (- b a) 19)) (JInt (small-int src a b))
+          (and (= (bit-and (tget tp i) 255) k-float) (= (. o numbers) 0)) (float-token s src a b (. o out-of-range) &pos &fail)
+          :else (do (set! pos a) (scan-number s (str-len s) &pos &fail (. o numbers) (. o out-of-range))))))
+
+;; The float of the token [a, b) (grammar already checked by the tape): the mantissa of at most 18 significant digits, their count, the decimal exponent; then fib.json.number's finish-float
+;; (Clinger, Eisel-Lemire, strtod). One pass over the digits, no cell.
+(defun float-token (s: str src: ptr a: i64 b: i64 out-of-range: bool &pos: i64 &fail: i64) -> Json
+  (let [neg (= (byte-at src a) 45)
+        i0 (if neg (+ a 1) a)]
+    (loop [k i0 w 0 nsig 0 seen-dot false fd 0]
+      (let [c (if (< k b) (byte-at src k) 0)]
+        (cond (and (>= c 48) (<= c 57))
+              (let [sig (or (> nsig 0) (> c 48))]
+                (recur (+ k 1) (if (and sig (< nsig 18)) (+ (* w 10) (- c 48)) w) (if sig (+ nsig 1) nsig) seen-dot (if seen-dot (+ fd 1) fd)))
+              (= c 46) (recur (+ k 1) w nsig true fd)
+              :else
+              (let [has-e (or (= c 101) (= c 69))
+                    eneg (and has-e (= (byte-at src (+ k 1)) 45))
+                    jx (if has-e (if (or (= (byte-at src (+ k 1)) 43) eneg) (+ k 2) (+ k 1)) k)
+                    ev (if has-e (exp-value s jx b) 0)]
+                (finish-float s i0 b neg w nsig (- (if eneg (- 0 ev) ev) fd) out-of-range &pos &fail b)))))))
+
+;; A key: the str of an earlier equal key (a direct-mapped cache of 256 slots by the hash of the bytes: the keys of an array of records repeat), else a new one.
+(defun dom-key (s: str src: ptr tp: ptr j: i64 &kc: (Array str)) -> str
+  (let [a (key-a tp j) b (key-b tp j)]
+    (if (key-esc? tp j) (dom-string s src tp j)
+        (let [slot (bit-and (hash-key src a b) 255)
+              e (array-get @kc slot)]
+          (if (and (= (str-len e) (- b a)) (> (- b a) 0) (= 0 (unsafe (sext i64 (libc/memcmp (ptr+ src a) (ptr+ (raw e) 24) (- b a))))))
+              e
+              (let [k (str-slice s a b)] (do (array-set! &kc slot k) k)))))))
+
+(defun slice-eq (src: ptr a1: i64 b1: i64 a2: i64 b2: i64) -> bool
+  (and (= (- b1 a1) (- b2 a2)) (= 0 (unsafe (sext i64 (libc/memcmp (ptr+ src a1) (ptr+ src a2) (- b1 a1)))))))
+
+(defun key-a (tp: ptr j: i64) -> i64 (shr (tget tp j) 8))
+(defun key-b (tp: ptr j: i64) -> i64 (bit-and (tget tp (+ j 1)) end-mask))
+(defun key-esc? (tp: ptr j: i64) -> bool (!= (bit-and (tget tp (+ j 1)) esc-flag) 0))
+
+;; Is the key at tape index j equal to one of the m keys before it (the keys are the nodes at `ks`)? Slices of the text; false for an escaped key is wrong, so those are screened first.
+(defun dup-before? (src: ptr tp: ptr ks: (Array i64) j: i64 m: i64) -> bool
+  (loop [q 0]
+    (cond (>= q m) false
+          (let [kq (array-get ks q)] (slice-eq src (key-a tp kq) (key-b tp kq) (key-a tp j) (key-b tp j))) true
+          :else (recur (+ q 1)))))
+
+(defun any-escaped-key? (tp: ptr i: i64 end: i64) -> bool
+  (loop [j (+ i 2)] (cond (>= j end) false (key-esc? tp j) true :else (recur (skip-of tp (+ j 2))))))
+
+;; Does the object at i (c pairs) repeat a key? Only for the policies that look (the keep-all policy never asks). Small objects compare pairwise; larger ones hash the slices.
+(defun hash-key (src: ptr a: i64 b: i64) -> i64
+  (loop [k a h -3750763034362895579]
+    (if (>= k b) h (recur (+ k 1) (unchecked-multiply (bit-xor h (byte-at src k)) 1099511628211)))))
+
+(defun dup-keys? (src: ptr tp: ptr i: i64 end: i64 c: i64) -> bool
+  (let [ks (cell (array (if (<= c 8) c 1) 0)) cap (shl 1 (+ 2 (- 64 (clz (- (* c 2) 1))))) table (cell (array (if (> c 8) cap 1) 0))]
+    (loop [j (+ i 2) m 0]
+      (if (>= j end) false
+          (if (<= c 8)
+              (if (dup-before? src tp @ks j m) true (do (array-set! &ks m j) (recur (skip-of tp (+ j 2)) (+ m 1))))
+              (let [h (hash-key src (key-a tp j) (key-b tp j))
+                    hit (loop [s (bit-and h (- cap 1))]
+                          (let [e (array-get @table s)]
+                            (cond (= e 0) -1
+                                  (slice-eq src (key-a tp (- e 1)) (key-b tp (- e 1)) (key-a tp j) (key-b tp j)) 1
+                                  :else (recur (bit-and (+ s 1) (- cap 1))))))]
+                (if (= hit 1) true
+                    (do (loop [s (bit-and h (- cap 1))] (if (= (array-get @table s) 0) (array-set! &table s (+ j 1)) (recur (bit-and (+ s 1) (- cap 1)))))
+                        (recur (skip-of tp (+ j 2)) (+ m 1))))))))))
+
+(defun dom-node (d: Doc s: str src: ptr tp: ptr i: i64 o: JsonOptions &kc: (Array str) &pos: i64 &fail: i64) -> Json
+  (let [k (bit-and (tget tp i) 255)]
+    (cond (= k k-str) (JStr (dom-string s src tp i))
+          (or (= k k-int) (= k k-float)) (dom-number s src tp i o &pos &fail)
+          (= k k-array) (dom-array d s src tp i o &kc &pos &fail)
+          (= k k-object) (dom-object d s src tp i o &kc &pos &fail)
+          (= k k-true) j-true
+          (= k k-false) j-false
+          :else JNull)))
+
+(defun dom-array (d: Doc s: str src: ptr tp: ptr i: i64 o: JsonOptions &kc: (Array str) &pos: i64 &fail: i64) -> Json
+  (let [end (tget tp (+ i 1)) c (child-count tp i end)]
+    (if (= c 0) (JArr [])
+        (let [arr (cell (array c JNull))]
+          (do (loop [j (+ i 2) m 0]
+                (when (< j end) (do (array-set! &arr m (dom-node d s src tp j o &kc &pos &fail)) (recur (skip-of tp j) (+ m 1)))))
+              (JArr (vec-from-array @arr)))))))
+
+(defun dom-object (d: Doc s: str src: ptr tp: ptr i: i64 o: JsonOptions &kc: (Array str) &pos: i64 &fail: i64) -> Json
+  (let [end (tget tp (+ i 1)) c (quot (child-count tp i end) 2)]
+    (cond (= c 0) (JObj [] [])
+          (and (!= (. o duplicates) 1) (or (any-escaped-key? tp i end) (and (> c 1) (dup-keys? src tp i end c)))) (object->json d i o)
+          :else
+          (let [keys (cell (array c "")) vals (cell (array c JNull))]
+            (do (loop [j (+ i 2) m 0]
+                  (when (< j end)
+                    (do (array-set! &keys m (dom-key s src tp j &kc))
+                        (array-set! &vals m (dom-node d s src tp (+ j 2) o &kc &pos &fail))
+                        (recur (skip-of tp (+ j 2)) (+ m 1)))))
+                (JObj (vec-from-array @keys) (vec-from-array @vals)))))))
+
+(defun dom-of-doc (s: str d: Doc o: JsonOptions) -> (Option Json)
+  (let [pos (cell 0) fail (cell 0) kc (cell (array 256 ""))
+        v (dom-node d s (unsafe (ptr+ (raw s) 24)) (unsafe (raw (. d words))) 0 o &kc &pos &fail)]
+    (if (= @fail 0) (some v) nil)))
+
+(defun parse-fast (s: str o: JsonOptions) -> (Option Json)
+  (if (= (. o duplicates) 2) nil
+      (match (fast-tape s o) ((some d) (dom-of-doc s d o)) (nil nil))))
+
+(defun parse-with-fast (s: str o: JsonOptions) -> (Result Json JsonError)
+  (match (parse-fast s o) ((some v) (Ok v)) (nil (p/parse-with s o))))
+
+(defun parse-fast-default (s: str) -> (Result Json JsonError) (parse-with-fast s (default-options)))
+
+(defun parse-bytes-with-fast (b: (Array i8) o: JsonOptions) -> (Result Json JsonError)
+  (let [bad (first-invalid b)]
+    (if (>= bad 0) (Err (make-error-bytes b e-utf8 bad)) (parse-with-fast (str-from-bytes b) o))))
