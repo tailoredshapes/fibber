@@ -1,0 +1,14 @@
+;; fib.otel.log: the bridge from a Context to a logger (docs/design/observability-and-databases.md 2.8, a hook for the OTLP log exporter of O3).
+;;
+;;   (let [lg (logger-with-trace lg ctx)] (log/info lg "inside the span"))     ; the records carry trace_id and span_id
+;;
+;; The logger is a value and so is the Context, so correlating the two is a function from one to the other, not an interceptor.
+(ns fib.otel.log (:use fib.core fib.seq fib.coll fib.datum fib.log.core fib.otel.ids fib.otel.propagation fib.otel.trace))
+
+;; The logger with `trace_id` and `span_id` added to its context fields when the Context has a valid current span; otherwise unchanged.
+(defun logger-with-trace (lg: Logger c: Context) -> Logger
+  (match (current-span-context c)
+    (nil lg)
+    ((some sc) (if (span-context-valid? sc)
+                   (add-context lg [(Pair :trace_id (DStr (trace-id-hex (. sc trace-id)))) (Pair :span_id (DStr (span-id-hex (. sc span-id))))])
+                   lg))))

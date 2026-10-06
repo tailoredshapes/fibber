@@ -7,7 +7,7 @@
 ;; (an unopenable file falls back to standard error; the reason is printed once).
 ;; Data (system-from-map): the same names as keys of a (Map str str): "level" "levels" "format" "file" "max-bytes" "keep" "async"
 ;; "queue" "overflow"; an error is an `Err` naming the key.
-(ns fib.log.config (:use fib.core fib.seq fib.coll fib.log.core fib.log.sinks fib.log.file fib.log.async) (:require [fib.os :as os]))
+(ns fib.log.config (:use fib.core fib.seq fib.coll fib.log.core fib.log.sinks fib.log.file fib.log.async) (:require [fib.os :as os] [fib.ex :as ex]))
 
 (defun int-or :private (text: (Option str) default: i64) -> i64
   (match text (nil default) ((some t) (match (parse-long t) ((some n) n) (nil default)))))
@@ -55,3 +55,10 @@
                    ((some t) (match (parse-level t) ((some l) (Ok l)) (nil (Err (str "unknown level " t))))))
             sink (sink-from (get m "format") (get m "file") max-bytes keep (truthy? (get m "async")) queue overflow)]
     (Ok (log-system sink (match (get m "levels") (nil (LevelTable root [])) ((some t) (parse-spec t root)))))))
+
+;; Runs `f` with the system and closes it afterwards (flushing an async sink), whatever `f` does: a trap or a throw goes on after the close.
+;; Use it in main: an async sink's worker is a task, and the runtime waits for tasks when main returns, so a system that is never closed
+;; keeps the program from ending.
+(defun with-log-system (sys: LogSystem f: (fn (LogSystem) a)) -> a
+  (ex/try (let [v (f sys)] (do (close-system sys) v))
+          (catch e (do (close-system sys) (ex/throw e)))))

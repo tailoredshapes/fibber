@@ -1,0 +1,131 @@
+;; fib.otel ids and W3C Trace Context (docs/design/observability-and-databases.md 3.2): the spec's own examples, every malformed header
+;; (never a trap, never a parent), the tracestate rules, and a mutation sweep over a valid header.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.parallel) (:require [fib.otel :as otel] [fib.string :as string] [fib.rng :as rng]))
+
+(def VALID: str "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+
+(defun parsed? (h: str) -> bool (some? (otel/parse-traceparent h)))
+
+(defun malformed-headers () -> (Vec str)
+  ["" "00" "garbage" (subs VALID 0 54)
+   "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01"                ; upper case hex
+   "00-4bf92f3577b34da6a3ce929d0e0e4736-00F067AA0BA902B7-01"
+   "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"                ; version ff
+   "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra"          ; version 00 is exactly 55
+   "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 "
+   " 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+   "00_4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"                ; wrong separators
+   "00-4bf92f3577b34da6a3ce929d0e0e4736_00f067aa0ba902b7-01"
+   "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7_01"
+   "00-00000000000000000000000000000000-00f067aa0ba902b7-01"                ; zero trace id
+   "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01"                ; zero span id
+   "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0g"                ; flags not hex
+   "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-"
+   "00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01"                 ; short trace id
+   "00-4bf92f3577b34da6a3ce929d0e0e47366-00f067aa0ba902b7-01"
+   "0g-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"                ; version not hex
+   "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01extra"           ; future version: extra data must start with -
+   "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0é"
+   "éééééééééééééééééééééééééééé"])
+
+(defun ts-ok? (text: str) -> bool (some? (otel/parse-tracestate text)))
+
+(defun members-text (text: str) -> str
+  (match (otel/parse-tracestate text) (nil "NONE") ((some m) (otel/format-tracestate m))))
+
+(defun lookup (headers: (Vec (Pair str str))) -> (fn (str) (Option str))
+  (fn (k: str) (let [hit (filter (fn (p: (Pair str str)) (= (. p fst) k)) headers)] (if (> (count hit) 0) (some (. (nth hit 0) snd)) nil))))
+
+(defspecs specs
+  (feature "ids"
+    (scenario "ids are valid, unique, and the right width in hex"
+      (given [g (otel/id-gen-seeded 7) tids (vec (map (fn (i: i64) (otel/new-trace-id g)) (range 0 5000)))
+              sids (vec (map (fn (i: i64) (otel/new-span-id g)) (range 0 5000)))])
+      (then (expect = true (every? otel/trace-id-valid? tids)) (expect = true (every? otel/span-id-valid? sids))
+            (expect = 5000 (count (set (map otel/trace-id-hex tids)))) (expect = 5000 (count (set sids)))
+            (expect = true (every? (fn (t: otel/TraceId) (= 32 (str-len (otel/trace-id-hex t)))) tids))
+            (expect = true (every? (fn (s: i64) (= 16 (str-len (otel/span-id-hex s)))) sids))))
+    (scenario "a seeded generator repeats; the OS-seeded ones differ"
+      (given [a (otel/id-gen-seeded 99) b (otel/id-gen-seeded 99) c (otel/id-gen) d (otel/id-gen)])
+      (then (expect = (otel/new-trace-id a) (otel/new-trace-id b)) (expect = (otel/new-span-id a) (otel/new-span-id b))
+            (expect = false (= (otel/new-trace-id c) (otel/new-trace-id d)))))
+    (scenario "8 tasks drawing from one generator never draw the same span id"
+      (given [g (otel/id-gen-seeded 3)])
+      (upon [ids (with-tasks [s] (let [ts (vec (map (fn (t: i64) (fork s (fn () (vec (map (fn (i: i64) (otel/new-span-id g)) (range 0 2000))))))
+                                                    (range 0 8)))]
+                                   (vec (mapcat (fn (t: (Task (Vec i64))) @t) ts))))])
+      (then (expect = 16000 (count (set ids)))))
+    (scenario "a draw of zero (the state that mixes to 0) is never an id"
+      (given [g (otel/id-gen-seeded 7046029254386353131) h (otel/id-gen-seeded 7046029254386353131)])
+      (then (expect = true (otel/span-id-valid? (otel/new-span-id g)))
+            (expect = true (otel/trace-id-valid? (otel/new-trace-id h)))))
+    (scenario "hex round trips"
+      (then (expect = "00000000000000ff" (otel/hex64 255)) (expect = "ffffffffffffffff" (otel/hex64 -1))
+            (expect = (some (otel/TraceId 5 -1)) (otel/parse-trace-id "0000000000000005ffffffffffffffff"))
+            (expect = nil (otel/parse-trace-id "0000000000000005fffffffffffffffg")))))
+  (feature "traceparent"
+    (scenario "the example of the W3C specification parses and formats back"
+      (given [c (otel/parse-traceparent VALID)])
+      (then (expect = true (some? c))
+            (expect = (some "4bf92f3577b34da6a3ce929d0e0e4736") (map-opt (fn (x: otel/SpanContext) (otel/trace-id-hex (. x trace-id))) c))
+            (expect = (some "00f067aa0ba902b7") (map-opt (fn (x: otel/SpanContext) (otel/span-id-hex (. x span-id))) c))
+            (expect = (some true) (map-opt (fn (x: otel/SpanContext) (otel/sampled-flag? x)) c))
+            (expect = (some true) (map-opt (fn (x: otel/SpanContext) (. x remote)) c))
+            (expect = (some VALID) (map-opt otel/format-traceparent c))))
+    (scenario "flags 00 is not sampled; other flag bits are kept"
+      (then (expect = (some false) (map-opt (fn (x: otel/SpanContext) (otel/sampled-flag? x)) (otel/parse-traceparent "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00")))
+            (expect = (some "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03")
+                    (map-opt otel/format-traceparent (otel/parse-traceparent "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03")))))
+    (scenario "a future version is read from the front; extra data must follow a dash"
+      (then (expect = true (parsed? "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"))
+            (expect = true (parsed? "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-what-the-future-holds"))
+            (expect = false (parsed? "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01what"))))
+    (scenario "every malformed header yields no parent and no trap"
+      (then (expect = 0 (count (filter parsed? (malformed-headers)))) (expect = true (> (count (malformed-headers)) 20))))
+    (scenario "changing any one character of a valid header gives a context only if it is still valid, and valid ones format back"
+      (given [r (rng/rng-new 5) chars ["0" "1" "9" "a" "f" "A" "F" "g" "-" "_" " " "é" "00" ""]])
+      (upon [outs (vec (map (fn (i: i64)
+                              (let [pos (rng/rng-below r (str-len VALID)) ch (nth chars (rng/rng-below r (count chars)))
+                                    h (str (subs VALID 0 pos) ch (subs VALID (min (str-len VALID) (+ pos 1)) (str-len VALID)))]
+                                (match (otel/parse-traceparent h)
+                                  (nil true)
+                                  ((some c) (or (= (otel/format-traceparent c) h) (not (= (subs h 0 2) "00")))))))
+                            (range 0 3000)))
+             valid-count (count (filter (fn (i: i64) (parsed? (str (subs VALID 0 i) "0" (subs VALID (+ i 1) (str-len VALID))))) (range 0 55)))])
+      (then (expect = true (every? (fn (b: bool) b) outs)) (expect = true (> valid-count 10)))))
+  (feature "tracestate"
+    (scenario "the examples of the specification"
+      (then (expect = "congo=t61rcWkgMzE,rojo=00f067aa0ba902b7" (members-text "congo=t61rcWkgMzE,rojo=00f067aa0ba902b7"))
+            (expect = "congo=t61rcWkgMzE,rojo=00f" (members-text " congo=t61rcWkgMzE , rojo=00f "))
+            (expect = "tenant@vendor=v,a=b" (members-text "tenant@vendor=v,a=b"))
+            (expect = "" (members-text ""))))
+    (scenario "malformed members make the whole value malformed"
+      (then (expect = false (ts-ok? "Congo=x")) (expect = false (ts-ok? "congo")) (expect = false (ts-ok? "congo="))
+            (expect = false (ts-ok? "a=b,a=c")) (expect = false (ts-ok? "a=b=c")) (expect = false (ts-ok? "1a=b"))
+            (expect = false (ts-ok? "a=bé")) (expect = false (ts-ok? "@vendor=x")) (expect = false (ts-ok? "a@=x"))
+            (expect = false (ts-ok? (string/join "," (map (fn (i: i64) (str "k" i "=v")) (range 0 33)))))
+            (expect = true (ts-ok? (string/join "," (map (fn (i: i64) (str "k" i "=v")) (range 0 32)))))))
+    (scenario "set puts the member first, replaces its older value, and ignores an invalid one"
+      (given [ts [(Pair "a" "1") (Pair "b" "2")]])
+      (then (expect = "b=9,a=1" (otel/format-tracestate (otel/tracestate-set ts "b" "9")))
+            (expect = "c=3,a=1,b=2" (otel/format-tracestate (otel/tracestate-set ts "c" "3")))
+            (expect = "a=1,b=2" (otel/format-tracestate (otel/tracestate-set ts "C" "3")))))
+    (scenario "a bad tracestate is dropped, a bad traceparent drops everything"
+      (given [good (otel/extract-span-context (some VALID) (some "congo=t61rcWkgMzE"))
+              bad-ts (otel/extract-span-context (some VALID) (some "Congo=;"))
+              bad-tp (otel/extract-span-context (some "nonsense") (some "congo=t61rcWkgMzE"))
+              none (otel/extract-span-context nil (some "congo=x"))])
+      (then (expect = (some "congo=t61rcWkgMzE") (map-opt (fn (c: otel/SpanContext) (. c tracestate)) good))
+            (expect = (some "") (map-opt (fn (c: otel/SpanContext) (. c tracestate)) bad-ts))
+            (expect = true (some? bad-ts)) (expect = nil bad-tp) (expect = nil none)))
+    (scenario "inject and extract: the headers of a context give the same remote context back"
+      (given [sc (otel/SpanContext (otel/TraceId 1 2) 3 1 "a=b" false)
+              hs (otel/inject-headers (otel/context-with-span-context (otel/empty-context) sc))
+              back (otel/extract-context (lookup hs))])
+      (then (expect = ["traceparent" "tracestate"] (vec (map (fn (p: (Pair str str)) (. p fst)) hs)))
+            (expect = (some (otel/SpanContext (otel/TraceId 1 2) 3 1 "a=b" true)) (otel/current-span-context back))
+            (expect = 0 (count (otel/inject-headers (otel/empty-context))))
+            (expect = nil (otel/current-span-context (otel/extract-context (lookup [(Pair "traceparent" "bad")])))))))
+  )
+
+(defun main () -> i64 (run-main (specs)))

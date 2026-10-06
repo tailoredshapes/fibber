@@ -1,0 +1,172 @@
+;; fib.otel exporters and span processors (docs/design/observability-and-databases.md 3.4): the Exporter contract against the memory and
+;; console exporters, the simple processor, the batch processor (size trigger, time trigger, flush, shutdown, the three overflow policies, 8
+;; producers with exact counts), and exporters that fail or trap.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.parallel otel-exporter-contract)
+  (:require [fib.otel :as otel] [fib.log :as log] [fib.os :as os] [fib.string :as string] [fib.ex :as ex]))
+
+;; ---- exporters that misbehave
+(defstruct BrokenExporter (tries: (Atom i64)))
+(impl otel/Exporter BrokenExporter
+  (export-spans (self spans) (do (swap! (. self tries) (fn (v: i64) (+ v (count spans)))) (Err "collector down")))
+  (exporter-flush (self) (Ok ()))
+  (exporter-shutdown (self) (Ok ())))
+
+(defstruct TrapExporter (tries: (Atom i64)))
+(impl otel/Exporter TrapExporter
+  (export-spans (self spans) (do (swap! (. self tries) (fn (v: i64) (+ v (count spans)))) (trap "exporter blew up")))
+  (exporter-flush (self) (Ok ()))
+  (exporter-shutdown (self) (Ok ())))
+
+;; Blocks inside its first export until the gate opens: a deterministic full queue.
+(defstruct GatedExporter (gate: (Atom bool) entered: (Atom i64) inner: otel/MemoryExporter))
+(impl otel/Exporter GatedExporter
+  (export-spans (self spans)
+    (do (swap! (. self entered) (fn (v: i64) (+ v 1)))
+        (loop [] (when (not @(. self gate)) (do (os/sleep-ns 100000) (recur))))
+        (otel/export-spans (dyn otel/Exporter :send (. self inner)) spans)))
+  (exporter-flush (self) (Ok ()))
+  (exporter-shutdown (self) (Ok ())))
+
+(defun gated () -> GatedExporter (GatedExporter (atom false) (atom 0) (otel/memory-exporter)))
+(defun wait-entered (g: GatedExporter) -> unit (loop [] (when (= @(. g entered) 0) (do (os/sleep-ns 100000) (recur)))))
+
+;; Polls `f` every millisecond for at most `ms` milliseconds.
+(defun wait-until (f: (fn () bool) ms: i64) -> bool
+  (loop [i 0] (cond (f) true (>= i ms) false :else (do (os/sleep-ns 1000000) (recur (+ i 1))))))
+
+(defun span-n (n: i64) -> otel/SpanData (sample-span (str "s" n) n))
+(defun names-of (m: otel/MemoryExporter) -> (Vec str) (vec (map (fn (d: otel/SpanData) (. d name)) (otel/memory-spans m))))
+(defun ids-of (m: otel/MemoryExporter) -> (Vec i64) (vec (map (fn (d: otel/SpanData) (. (. d trace-id) lo)) (otel/memory-spans m))))
+
+;; ---- probes for the Exporter contract
+(defun memory-probe () -> ExporterProbe
+  (let [m (otel/memory-exporter)]
+    (ExporterProbe (dyn otel/Exporter :send m) (fn () (vec (map otel/span-json (otel/memory-spans m)))))))
+
+(defun file-lines (path: str) -> (Vec str)
+  (vec (filter (fn (l: str) (> (str-len l) 0)) (string/split (match (os/read-file-bytes path 10000000) ((Ok b) (str-from-bytes b)) ((Err _) "")) "\n"))))
+
+(defun console-probe () -> ExporterProbe
+  (let [dir (match (os/create-temp-directory (str (os/temp-directory) "/fiboteXXXXXX")) ((Ok d) d) ((Err e) (trap (. e message))))
+        path (str dir "/spans.jsonl")
+        fd (match (os/open-file path (with (os/default-file-options) (access os/WriteOnly) (create true) (append true))) ((Ok f) f) ((Err e) (trap (. e message))))
+        got (atom []) done (atom false)]
+    (ExporterProbe (otel/console-json-exporter fd)
+                   (fn () (do (when (not @done)
+                                (do (swap! got (fn (_: (Vec str)) (file-lines path))) (swap! done (fn (_: bool) true))
+                                    (os/close-fd fd) (os/remove-file path) (os/remove-directory dir)))
+                              @got)))))
+
+(defun provider-with (processors: (Vec (dyn otel/SpanProcessor :send))) -> otel/TracerProvider
+  (otel/tracer-provider-with (otel/make-resource "spec" []) (otel/always-on) processors (otel/id-gen-seeded 5)))
+
+(defspecs specs
+  (feature "the console exporter"
+    (scenario "text and JSON renderings of a span"
+      (then (expect = true (string/includes? (otel/span-text (sample-span "b" 1)) " span b SERVER 0.002ms trace=1234567890abcdef0000000000000001 span=0000000000000065 parent=0000000000000007 status=ERROR(bad \"quote\") http.request.method=GET n=1 event=ev"))
+            (expect = true (string/starts-with? (otel/span-text (sample-span "b" 1)) "1970-01-01T00:00:01.000Z span b"))
+            (expect = "{\"trace_id\":\"1234567890abcdef0000000000000000\",\"span_id\":\"0000000000000064\",\"parent_span_id\":\"\",\"name\":\"a\",\"kind\":\"SERVER\",\"scope\":\"contract\",\"start_ns\":1000000000,\"end_ns\":1000002500,\"flags\":1,\"status\":{\"code\":\"UNSET\",\"message\":\"\"},\"attributes\":{\"http.request.method\":\"GET\",\"n\":0},\"events\":[{\"name\":\"ev\",\"time_ns\":1000000100,\"attributes\":{\"x\":true}}],\"links\":[{\"trace_id\":\"00000000000000050000000000000006\",\"span_id\":\"0000000000000009\",\"attributes\":{}}],\"resource\":{\"service.name\":\"contract\"}}"
+                    (otel/span-json (sample-span "a" 0)))))
+    (scenario "a console exporter on a closed descriptor is an Err, not a trap"
+      (given [e (otel/console-json-exporter 987654)])
+      (upon [r (otel/export-spans e [(sample-span "a" 0)])])
+      (then (expect = true (match r ((Err _) true) ((Ok _) false))))))
+  (feature "the simple processor"
+    (scenario "exports each ended span at once, in the caller"
+      (given [m (otel/memory-exporter) p (provider-with [(dyn otel/SpanProcessor :send (otel/simple-processor (dyn otel/Exporter :send m)))]) t (otel/get-tracer p "s")])
+      (upon [_ (do (otel/in-span a c t (otel/empty-context) "one" [] 1) (otel/in-span a c t (otel/empty-context) "two" [] 2))])
+      (then (expect = ["one" "two"] (names-of m))))
+    (scenario "an exporter that returns an Err or traps costs the span, not the program, and the next exporter still gets the span"
+      (given [b (BrokenExporter (atom 0)) x (TrapExporter (atom 0)) m (otel/memory-exporter)
+              sb (otel/simple-processor (dyn otel/Exporter :send b)) sx (otel/simple-processor (dyn otel/Exporter :send x))
+              p (provider-with [(dyn otel/SpanProcessor :send sb) (dyn otel/SpanProcessor :send sx)
+                                (dyn otel/SpanProcessor :send (otel/simple-processor (dyn otel/Exporter :send m)))])
+              t (otel/get-tracer p "s")])
+      (upon [v (otel/in-span a c t (otel/empty-context) "one" [] (do (otel/in-span a2 c2 t c "two" [] 0) 7))])
+      (then (expect = 7 v) (expect = ["two" "one"] (names-of m)) (expect = 2 @(. b tries)) (expect = 2 @(. x tries))
+            (expect = 2 (otel/simple-failed sb)) (expect = 2 (otel/simple-failed sx)))))
+  (feature "the batch processor"
+    (scenario "spans come out in order, 8 producers of 200 each arrive exactly once, flush returns when all are exported"
+      (covers "fib.otel batch-processor")
+      (given [m (otel/memory-exporter) bp (otel/batch-processor (dyn otel/Exporter :send m) 100000 64 5000000 log/BlockProducer)
+              p (provider-with [(dyn otel/SpanProcessor :send bp)]) t (otel/get-tracer p "s")])
+      (upon [_ (with-tasks [s] (do (dotimes (k 8) (fork s (fn () (dotimes (i 200) (otel/in-span a c t (otel/empty-context) (str "p" k "-" i) [] 0))))) ()))
+             f (otel/force-flush-provider p)
+             names (names-of m)
+             _ (otel/shutdown-provider p)
+             per (fn (k: i64) (vec (filter (fn (n: str) (string/starts-with? n (str "p" k "-"))) names)))])
+      (then (expect = true (match f ((Ok _) true) ((Err _) false)))
+            (expect = 1600 (count names)) (expect = 1600 (count (set names))) (expect = 0 (otel/batch-dropped bp))
+            (expect = true (every? (fn (k: i64) (= (per k) (vec (map (fn (i: i64) (str "p" k "-" i)) (range 0 200))))) (range 0 8)))))
+    (scenario "the size trigger exports without a flush, long before the interval"
+      (given [m (otel/memory-exporter) bp (otel/batch-processor (dyn otel/Exporter :send m) 1000 4 60000000000 log/BlockProducer)
+              p (provider-with [(dyn otel/SpanProcessor :send bp)]) t (otel/get-tracer p "s")])
+      (upon [_ (dotimes (i 8) (otel/in-span a c t (otel/empty-context) (str "n" i) [] 0))
+             ok (wait-until (fn () (= 8 (count (otel/memory-spans m)))) 1000)
+             _ (otel/in-span a c t (otel/empty-context) "extra" [] 0)
+             _ (os/sleep-ns 30000000)
+             exported (count (otel/memory-spans m)) queued (otel/batch-queued bp)
+             _ (otel/shutdown-provider p)])
+      (then (expect = true ok) (expect = 8 exported) (expect = 1 queued) (expect = 9 (count (otel/memory-spans m)))))
+    (scenario "the time trigger exports a partial batch after the interval"
+      (given [m (otel/memory-exporter) bp (otel/batch-processor (dyn otel/Exporter :send m) 1000 500 20000000 log/BlockProducer)
+              p (provider-with [(dyn otel/SpanProcessor :send bp)]) t (otel/get-tracer p "s")])
+      (upon [_ (dotimes (i 3) (otel/in-span a c t (otel/empty-context) (str "n" i) [] 0))
+             ok (wait-until (fn () (= 3 (count (otel/memory-spans m)))) 1000)
+             names (names-of m)
+             _ (otel/shutdown-provider p)])
+      (then (expect = true ok) (expect = ["n0" "n1" "n2"] names)))
+    (scenario "shutdown drains the queue, shuts the exporter down, and later spans are dropped and counted"
+      (given [m (otel/memory-exporter) bp (otel/batch-processor (dyn otel/Exporter :send m) 1000 500 60000000000 log/BlockProducer)
+              p (provider-with [(dyn otel/SpanProcessor :send bp)]) t (otel/get-tracer p "s")])
+      (upon [_ (dotimes (i 5) (otel/in-span a c t (otel/empty-context) (str "n" i) [] 0))
+             r (otel/shutdown-provider p)
+             after-shutdown (count (otel/memory-spans m))
+             _ (otel/in-span a c t (otel/empty-context) "late" [] 0)
+             again (otel/shutdown-provider p)])
+      (then (expect = true (match r ((Ok _) true) ((Err _) false))) (expect = 5 after-shutdown) (expect = 5 (count (otel/memory-spans m)))
+            (expect = 1 (otel/batch-dropped bp)) (expect = true (match again ((Ok _) true) ((Err _) false)))))
+    (scenario "with-provider drains and shuts the processor down when the body returns and when it traps"
+      (given [m1 (otel/memory-exporter) m2 (otel/memory-exporter)
+              p1 (provider-with [(dyn otel/SpanProcessor :send (otel/batch-processor (dyn otel/Exporter :send m1) 100 50 60000000000 log/BlockProducer))])
+              p2 (provider-with [(dyn otel/SpanProcessor :send (otel/batch-processor (dyn otel/Exporter :send m2) 100 50 60000000000 log/BlockProducer))])])
+      (upon [a (otel/with-provider p1 (fn (p: otel/TracerProvider) (otel/in-span s c (otel/get-tracer p "s") (otel/empty-context) "ok" [] 1)))
+             b (ex/try (otel/with-provider p2 (fn (p: otel/TracerProvider) (otel/in-span s c (otel/get-tracer p "s") (otel/empty-context) "bad" [] (trap "boom"))))
+                       (catch e -1))])
+      (then (expect = 1 a) (expect = -1 b) (expect = ["ok"] (names-of m1)) (expect = ["bad"] (names-of m2))
+            (expect = true @(. m1 shut)) (expect = true @(. m2 shut))))
+    (scenario "drop-newest: a full queue throws the arriving spans away and counts them"
+      (given [g (gated) bp (otel/batch-processor (dyn otel/Exporter :send g) 3 1 60000000000 log/DropNewest)
+              p (provider-with [(dyn otel/SpanProcessor :send bp)]) t (otel/get-tracer p "s")])
+      (upon [_ (do (otel/in-span a c t (otel/empty-context) "s0" [] 0) (wait-entered g)
+                   (dotimes (i 10) (otel/in-span a c t (otel/empty-context) (str "s" (+ i 1)) [] 0))
+                   (reset! (. g gate) true) (otel/shutdown-provider p))])
+      (then (expect = ["s0" "s1" "s2" "s3"] (names-of (. g inner))) (expect = 7 (otel/batch-dropped bp))))
+    (scenario "drop-oldest keeps the newest"
+      (given [g (gated) bp (otel/batch-processor (dyn otel/Exporter :send g) 3 1 60000000000 log/DropOldest)
+              p (provider-with [(dyn otel/SpanProcessor :send bp)]) t (otel/get-tracer p "s")])
+      (upon [_ (do (otel/in-span a c t (otel/empty-context) "s0" [] 0) (wait-entered g)
+                   (dotimes (i 10) (otel/in-span a c t (otel/empty-context) (str "s" (+ i 1)) [] 0))
+                   (reset! (. g gate) true) (otel/shutdown-provider p))])
+      (then (expect = ["s0" "s8" "s9" "s10"] (names-of (. g inner))) (expect = 7 (otel/batch-dropped bp))))
+    (scenario "block makes the ending task wait for room and loses nothing"
+      (given [g (gated) bp (otel/batch-processor (dyn otel/Exporter :send g) 2 1 60000000000 log/BlockProducer)
+              p (provider-with [(dyn otel/SpanProcessor :send bp)]) t (otel/get-tracer p "s")
+              _ (do (otel/in-span a c t (otel/empty-context) "s0" [] 0) (wait-entered g))
+              task (spawn (fn () (do (dotimes (i 5) (otel/in-span a c t (otel/empty-context) (str "s" (+ i 1)) [] 0)) 0)))
+              _ (os/sleep-ns 40000000)
+              queued (otel/batch-queued bp)])
+      (upon [_ (do (reset! (. g gate) true) (join task) (otel/shutdown-provider p))])
+      (then (expect = 2 queued) (expect = ["s0" "s1" "s2" "s3" "s4" "s5"] (names-of (. g inner))) (expect = 0 (otel/batch-dropped bp))))
+    (scenario "an exporter that fails or traps loses its batches, is counted, and the worker goes on"
+      (given [b (BrokenExporter (atom 0)) x (TrapExporter (atom 0))
+              pb (otel/batch-processor (dyn otel/Exporter :send b) 100 2 60000000000 log/BlockProducer)
+              px (otel/batch-processor (dyn otel/Exporter :send x) 100 2 60000000000 log/BlockProducer)
+              p (provider-with [(dyn otel/SpanProcessor :send pb) (dyn otel/SpanProcessor :send px)]) t (otel/get-tracer p "s")])
+      (upon [_ (do (dotimes (i 6) (otel/in-span a c t (otel/empty-context) "x" [] 0)) (otel/shutdown-provider p))])
+      (then (expect = 6 @(. b tries)) (expect = 6 @(. x tries)) (expect = true (>= (otel/batch-failed pb) 3)) (expect = true (>= (otel/batch-failed px) 3))
+            (expect = 6 (otel/batch-exported pb)))))
+  (implements ExporterContract "memory exporter" memory-probe)
+  (implements ExporterContract "console JSON exporter on a file" console-probe))
+
+(defun main () -> i64 (run-main (specs)))

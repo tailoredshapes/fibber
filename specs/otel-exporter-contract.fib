@@ -1,0 +1,47 @@
+;; The Exporter contract of fib.otel (docs/design/observability-and-databases.md 3.4, 6.3): what any span exporter must do, whoever
+;; implements it. A `make` builds a fresh `ExporterProbe`: the exporter and a function that returns the spans it produced so far, one JSON
+;; text each (for the memory exporter the spans rendered with `span-json`; for an exporter that writes a descriptor, the lines that came out).
+;; The O3 OTLP exporter joins the table with a probe over its fake receiver.
+(ns otel-exporter-contract (:use fib.core fib.seq fib.coll fib.test.core fib.parallel) (:require [fib.otel :as otel] [fib.string :as string]))
+
+(defstruct ExporterProbe (exporter: (dyn otel/Exporter :send) lines: (fn :send () (Vec str))))
+
+(defun sample-span (name: str n: i64) -> otel/SpanData
+  (otel/SpanData name otel/KindServer (otel/TraceId 1311768467294899695 n) (+ 100 n) (if (= n 0) 0 7) false 1 "k=v" "contract"
+                 (+ 1000000000 n) (+ 1000002500 n)
+                 [(Pair "http.request.method" (otel/->datum "GET")) (Pair "n" (otel/->datum n))]
+                 [(otel/SpanEvent "ev" (+ 1000000100 n) [(Pair "x" (otel/->datum true))])]
+                 [(otel/SpanLink (otel/SpanContext (otel/TraceId 5 6) 9 1 "" true) [])]
+                 (if (= (rem n 2) 0) otel/StatusUnset (otel/StatusError "bad \"quote\""))
+                 (otel/Resource [(Pair "service.name" (otel/->datum "contract"))])))
+
+(defun whole-span? (line: str) -> bool
+  (and (string/starts-with? line "{\"trace_id\":\"") (string/ends-with? line "}")))
+
+(defcontract ExporterContract [make]
+  (scenario "every span arrives once, whole, with its ids, name, parent and status"
+    (covers "fib.otel export-spans")
+    (given [p: ExporterProbe (make)])
+    (upon [r (otel/export-spans (. p exporter) [(sample-span "a" 0) (sample-span "b" 1) (sample-span "c" 2)])
+           _ (otel/exporter-flush (. p exporter))])
+    (then (expect = true (match r ((Ok _) true) ((Err _) false)))
+          (expect = 3 (count ((. p lines))))
+          (expect = true (every? whole-span? ((. p lines))))
+          (expect = true (string/includes? (nth ((. p lines)) 1) "\"span_id\":\"0000000000000065\",\"parent_span_id\":\"0000000000000007\",\"name\":\"b\""))
+          (expect = true (string/includes? (nth ((. p lines)) 1) "\"status\":{\"code\":\"ERROR\",\"message\":\"bad \\\"quote\\\"\"}"))
+          (expect = true (string/includes? (nth ((. p lines)) 0) "\"parent_span_id\":\"\""))))
+  (scenario "spans exported by several tasks at once arrive whole and complete"
+    (covers "fib.otel export-spans")
+    (given [p: ExporterProbe (make)])
+    (upon [_ (with-tasks [s]
+               (do (dotimes (t 4) (fork s (fn () (dotimes (i 25) (otel/export-spans (. p exporter) [(sample-span "t" (+ (* t 100) i))])))))
+                   ()))
+           _ (otel/exporter-flush (. p exporter))])
+    (then (expect = 100 (count ((. p lines)))) (expect = true (every? whole-span? ((. p lines))))))
+  (scenario "an empty batch, a second flush and a second shutdown are not errors, and nothing traps after shutdown"
+    (given [p: ExporterProbe (make)])
+    (upon [e (otel/export-spans (. p exporter) []) f1 (otel/exporter-flush (. p exporter)) f2 (otel/exporter-flush (. p exporter))
+           s1 (otel/exporter-shutdown (. p exporter)) s2 (otel/exporter-shutdown (. p exporter))
+           late (otel/export-spans (. p exporter) [(sample-span "late" 1)])])
+    (then (expect = true (every? (fn (r: (Result unit str)) (match r ((Ok _) true) ((Err _) false))) [e f1 f2 s1 s2]))
+          (expect = true (match late ((Ok _) true) ((Err _) true))))))

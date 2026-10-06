@@ -1,0 +1,70 @@
+;; fib.otel.trace: the data of a finished span and of the things a span holds (docs/design/observability-and-databases.md 3.1), and the
+;; Context that carries the current span from a caller to what it calls.
+;;
+;; All of it is plain data. Attributes are `(Vec (Pair str Datum))` (fib.datum: the one scalar type that log fields, span attributes and
+;; metric attributes share); times are nanoseconds since the Unix epoch.
+;;
+;; The Context is a VALUE, like the logger of fib.log (design 2.4, 3.2): `(with-span tracer ctx "name" attrs (fn (span ctx2) ..))` calls the
+;; body with a new Context whose current span is the new span. A task started inside the body captures `ctx2` in its closure, so its spans
+;; are children of the span it was started under: there is no task-local slot and no global.
+(ns fib.otel.trace (:use fib.core fib.seq fib.coll fib.datum fib.otel.ids fib.otel.propagation))
+
+;; The variant names carry a prefix: variant and type names are global across the linked modules (fib.http has a `Client` and a `Server`).
+(defenum SpanKind (KindInternal) (KindServer) (KindClient) (KindProducer) (KindConsumer))
+
+(defenum SpanStatus (StatusUnset) (StatusOk) (StatusError message: str))
+
+(defun kind-name (k: SpanKind) -> str
+  (match k ((KindInternal) "INTERNAL") ((KindServer) "SERVER") ((KindClient) "CLIENT") ((KindProducer) "PRODUCER") ((KindConsumer) "CONSUMER")))
+
+(defun status-name (s: SpanStatus) -> str
+  (match s ((StatusUnset) "UNSET") ((StatusOk) "OK") ((StatusError _) "ERROR")))
+
+(defun status-message (s: SpanStatus) -> str (match s ((StatusError m) m) (_ "")))
+
+(defstruct SpanEvent (name: str time-ns: i64 attributes: (Vec (Pair str Datum))))
+(defstruct SpanLink (context: SpanContext attributes: (Vec (Pair str Datum))))
+
+;; Who produced the telemetry: `service.name` and the like, shared by every span of a provider.
+(defstruct Resource (attributes: (Vec (Pair str Datum))))
+
+;; A finished (or, through `span-snapshot`, a running) span. `parent-span-id` 0 means none; `flags` bit 0 is the sampled flag.
+(defstruct SpanData (name: str kind: SpanKind trace-id: TraceId span-id: i64 parent-span-id: i64 parent-remote: bool flags: i64
+                     tracestate: str scope: str start-ns: i64 end-ns: i64 attributes: (Vec (Pair str Datum))
+                     events: (Vec SpanEvent) links: (Vec SpanLink) status: SpanStatus resource: Resource))
+
+(defun span-sampled? (d: SpanData) -> bool (= (bit-and (. d flags) 1) 1))
+(defun span-duration-ns (d: SpanData) -> i64 (- (. d end-ns) (. d start-ns)))
+(defun find-attribute (attrs: (Vec (Pair str Datum)) k: str) -> (Option Datum)
+  (loop [i 0] (cond (>= i (count attrs)) nil
+                    (= (. (nth attrs i) fst) k) (some (. (nth attrs i) snd))
+                    :else (recur (+ i 1)))))
+
+;; The first attribute of that name (nil when there is none).
+(defun attribute-of (d: SpanData k: str) -> (Option Datum) (find-attribute (. d attributes) k))
+(defun attribute-of-event (e: SpanEvent k: str) -> (Option Datum) (find-attribute (. e attributes) k))
+(defun attribute-of-resource (r: Resource k: str) -> (Option Datum) (find-attribute (. r attributes) k))
+
+;; ---- the Context
+
+;; What flows from a caller to its callees: today the current span's context (baggage is not built).
+(defstruct Context (span: (Option SpanContext)))
+
+(defun empty-context () -> Context (Context nil))
+(defun context-with-span-context (c: Context sc: SpanContext) -> Context (Context (some sc)))
+(defun current-span-context (c: Context) -> (Option SpanContext) (. c span))
+
+;; The hook the HTTP client of O3 uses: the headers that carry this context to another process (none when there is no valid current span).
+(defun inject-headers (c: Context) -> (Vec (Pair str str))
+  (match (. c span)
+    (nil [])
+    ((some sc) (if (span-context-valid? sc)
+                   (if (= (. sc tracestate) "")
+                       [(Pair "traceparent" (format-traceparent sc))]
+                       [(Pair "traceparent" (format-traceparent sc)) (Pair "tracestate" (. sc tracestate))])
+                   []))))
+
+;; The hook the HTTP server of O3 uses: the context a request carries, given a header lookup (a function, so any request type works). A
+;; request with no valid traceparent gives the empty context: the server span then starts a new trace.
+(defun extract-context (header: (fn (str) (Option str))) -> Context
+  (Context (extract-span-context (header "traceparent") (header "tracestate"))))

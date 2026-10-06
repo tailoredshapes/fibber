@@ -1,0 +1,51 @@
+;; fib.otel.queue: the bounded multi-producer queue behind the batch span processor and the periodic exporters (the design of the async log
+;; sink, fib.log.async, made generic: docs/design/observability-and-databases.md 2.6, 3.4).
+;;
+;; A chain of nodes, newest first, in one atom, under a spin lock (a scalar atom): an enqueue is one node linked to the old head (no copy of
+;; the items already queued; an atom holding a persistent vector retained every item of a path per enqueue, measured in L2), `queue-take-all`
+;; swaps the chain for an empty one in O(1) and the consumer turns it into a vector, oldest first, one node at a time (a long chain is never
+;; freed recursively). Items of one producer come out in the order that producer put them in.
+;;
+;; When the queue is full the policy decides (the same `Overflow` as the log sinks): DropNewest rejects the arriving item, DropOldest
+;; replaces the oldest queued one (O(capacity)), BlockProducer answers `QueueFull` and the caller waits and tries again.
+(ns fib.otel.queue (:use fib.core fib.seq fib.coll fib.log.async))
+
+(defenum (QChain a) (QNil) (QCons item: a next: (QChain a)))
+
+(defstruct (BQueue a) (chain: (Atom (QChain a)) len: (Atom i64) busy: (Atom bool) capacity: i64))
+
+;; What `queue-offer` did.
+(defenum Offered (Queued) (QueueDropped) (QueueFull))
+
+(defun queue-new (capacity: i64) -> (BQueue a) (BQueue (atom QNil) (atom 0) (atom false) (max 1 capacity)))
+
+(defun spin-lock :private (busy: (Atom bool)) -> unit
+  (loop [] (if (compare-and-set! busy false true) () (recur))))
+
+(defun queue-len (q: (BQueue a)) -> i64 @(. q len))
+
+;; The chain, newest first, as a vector oldest first, consuming the chain one node at a time.
+(defun chain-to-vec (c: (QChain a)) -> (Vec a)
+  (let [newest-first (loop [c c out []] (match c ((QNil) out) ((QCons x next) (recur next (conj out x)))))]
+    (vec (reverse newest-first))))
+
+;; The queue's items, oldest first; the queue is empty after it.
+(defun queue-take-all (q: (BQueue a)) -> (Vec a)
+  (do (spin-lock (. q busy))
+      (let [c @(. q chain)]
+        (do (reset! (. q chain) QNil) (reset! (. q len) 0) (reset! (. q busy) false)
+            (chain-to-vec c)))))
+
+(defun without-oldest :private (c: (QChain a)) -> (QChain a)
+  (let [v (chain-to-vec c)]
+    (loop [i 1 out QNil] (if (< i (count v)) (recur (+ i 1) (QCons (nth v i) out)) out))))
+
+(defun queue-offer (q: (BQueue a) x: a overflow: Overflow) -> Offered
+  (do (spin-lock (. q busy))
+      (let [n @(. q len)
+            full (>= n (. q capacity))
+            r (cond (not full) (do (reset! (. q chain) (QCons x @(. q chain))) (reset! (. q len) (+ n 1)) Queued)
+                    (= overflow DropNewest) QueueDropped
+                    (= overflow DropOldest) (do (reset! (. q chain) (QCons x (without-oldest @(. q chain)))) QueueDropped)
+                    :else QueueFull)]
+        (do (reset! (. q busy) false) r))))

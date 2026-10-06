@@ -1,0 +1,79 @@
+;; fib.otel.semconv: the attribute names of OpenTelemetry's semantic conventions that fibber's own libraries use (docs/design/observability-and-
+;; databases.md 3.5), as constants, so a typo is a compile error and not a silently different attribute. Names and meanings follow the
+;; stable HTTP conventions (v1.2x: `http.request.method`, `url.full`, `http.response.status_code`) and the database ones (`db.system.name`,
+;; `db.query.text` ... of the 1.26+ rename); metric names are in fib.otel.metrics.
+;;
+;; Rules the conventions set that the helpers below apply: an HTTP span is named `METHOD` or `METHOD /route` (the route template, never the
+;; raw path: a path with ids in it makes unbounded names); a server span's status is Error only for 5xx, a client span's for 4xx and 5xx;
+;; a DB span's name is `OPERATION collection` or the system name, and its query text must never carry the parameter values.
+(ns fib.otel.semconv (:use fib.core fib.seq fib.coll fib.datum fib.otel.trace))
+
+;; ---- HTTP
+(def http-request-method: str "http.request.method")
+(def http-response-status-code: str "http.response.status_code")
+(def http-route: str "http.route")
+(def url-full: str "url.full")
+(def url-path: str "url.path")
+(def url-scheme: str "url.scheme")
+(def url-query: str "url.query")
+(def server-address: str "server.address")
+(def server-port: str "server.port")
+(def client-address: str "client.address")
+(def network-protocol-version: str "network.protocol.version")
+(def user-agent-original: str "user_agent.original")
+(def error-type: str "error.type")
+
+;; ---- database
+(def db-system-name: str "db.system.name")
+(def db-namespace: str "db.namespace")
+(def db-operation-name: str "db.operation.name")
+(def db-collection-name: str "db.collection.name")
+(def db-query-text: str "db.query.text")
+(def db-response-status-code: str "db.response.status_code")
+(def db-system-sqlite: str "sqlite")
+(def db-system-postgresql: str "postgresql")
+
+;; ---- exceptions and the SDK
+(def exception-type: str "exception.type")
+(def exception-message: str "exception.message")
+(def exception-stacktrace: str "exception.stacktrace")
+(def service-name: str "service.name")
+(def service-version: str "service.version")
+(def host-name: str "host.name")
+(def process-pid: str "process.pid")
+
+;; ---- metric names (units in the comments)
+(def metric-http-server-request-duration: str "http.server.request.duration")   ; s, histogram
+(def metric-http-client-request-duration: str "http.client.request.duration")   ; s, histogram
+(def metric-http-server-active-requests: str "http.server.active_requests")     ; {request}, up-down counter
+(def metric-db-client-operation-duration: str "db.client.operation.duration")   ; s, histogram
+(def metric-db-client-connection-count: str "db.client.connection.count")       ; {connection}, up-down counter
+
+;; `GET /users/{id}`, or `GET` without a route.
+(defun http-span-name (method: str route: (Option str)) -> str
+  (match route (nil method) ((some r) (str method " " r))))
+
+;; The attributes of an HTTP server span at its start.
+(defun http-server-attributes (method: str route: (Option str) path: str scheme: str host: str port: i64) -> (Vec (Pair str Datum))
+  (let [base [(Pair http-request-method (DStr method)) (Pair url-path (DStr path)) (Pair url-scheme (DStr scheme))
+              (Pair server-address (DStr host)) (Pair server-port (DInt port))]]
+    (match route (nil base) ((some r) (conj base (Pair http-route (DStr r)))))))
+
+;; The attributes of an HTTP client span at its start (`url` is the full URL WITHOUT credentials).
+(defun http-client-attributes (method: str url: str host: str port: i64) -> (Vec (Pair str Datum))
+  [(Pair http-request-method (DStr method)) (Pair url-full (DStr url)) (Pair server-address (DStr host)) (Pair server-port (DInt port))])
+
+;; The status of an HTTP span from the response code: server spans fail on 5xx, client spans on 4xx and 5xx; otherwise Unset.
+(defun http-status (kind: SpanKind code: i64) -> SpanStatus
+  (let [bad (if (= kind KindServer) (>= code 500) (>= code 400))]
+    (if bad (StatusError (str code)) StatusUnset)))
+
+;; The attributes of a database span; the query text is the SQL with placeholders, never the bound values.
+(defun db-attributes (system: str operation: str collection: (Option str) query: str host: (Option str)) -> (Vec (Pair str Datum))
+  (let [base [(Pair db-system-name (DStr system)) (Pair db-operation-name (DStr operation)) (Pair db-query-text (DStr query))]
+        with-coll (match collection (nil base) ((some c) (conj base (Pair db-collection-name (DStr c)))))]
+    (match host (nil with-coll) ((some h) (conj with-coll (Pair server-address (DStr h)))))))
+
+;; `SELECT users`, or `SELECT` when no collection is known.
+(defun db-span-name (operation: str collection: (Option str)) -> str
+  (match collection (nil operation) ((some c) (str operation " " c))))

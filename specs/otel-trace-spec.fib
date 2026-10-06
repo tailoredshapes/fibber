@@ -1,0 +1,186 @@
+;; fib.otel tracing core (docs/design/observability-and-databases.md 3): spans, parents and children, the Context carried into tasks, the
+;; span that ends when its body traps, samplers, the log bridge, resources and the semantic-convention helpers.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.parallel)
+  (:require [fib.otel :as otel] [fib.log :as log] [fib.ex :as ex] [fib.os :as os] [fib.string :as string]))
+
+(defstruct Rig (tracer: otel/Tracer mem: otel/MemoryExporter))
+
+(defun rig-with (sampler: (dyn otel/Sampler :send)) -> Rig
+  (let [m (otel/memory-exporter)
+        p (otel/tracer-provider-with (otel/make-resource "spec" []) sampler
+                                     [(dyn otel/SpanProcessor :send (otel/simple-processor (dyn otel/Exporter :send m)))] (otel/id-gen-seeded 11))]
+    (Rig (otel/get-tracer p "spec") m)))
+
+(defun rig () -> Rig (rig-with (otel/parent-based (otel/always-on))))
+
+(defun spans-of (r: Rig) -> (Vec otel/SpanData) (otel/memory-spans (. r mem)))
+
+(defun named (r: Rig name: str) -> otel/SpanData
+  (let [hit (filter (fn (d: otel/SpanData) (= (. d name) name)) (spans-of r))]
+    (if (> (count hit) 0) (nth hit 0) (trap (str "no span named " name)))))
+
+(defun attr-text (d: otel/SpanData k: str) -> str (match (otel/attribute-of d k) ((some v) (otel/datum-text v)) (nil "-")))
+
+(defun decisions (s: (dyn otel/Sampler :send) n: i64) -> i64
+  (let [g (otel/id-gen-seeded 1234)]
+    (count (filter (fn (i: i64) (match (otel/should-sample s nil (otel/new-trace-id g) "x" otel/KindInternal) ((otel/SampleRecordAndSample) true) (_ false)))
+                   (range 0 n)))))
+
+(defspecs specs
+  (feature "spans, parents and children"
+    (scenario "a root span has no parent; a child shares its trace id and names its parent; times are ordered"
+      (covers "fib.otel with-span")
+      (given [r (rig)])
+      (upon [v (otel/in-span sp ctx (. r tracer) (otel/empty-context) "root" [(Pair "a" (otel/->datum 1))]
+                 (otel/in-span sp2 ctx2 (. r tracer) ctx "child" [] 5))])
+      (then (expect = 5 v)
+            (expect = 2 (count (spans-of r)))
+            (expect = 0 (. (named r "root") parent-span-id))
+            (expect = (otel/trace-id-hex (. (named r "root") trace-id)) (otel/trace-id-hex (. (named r "child") trace-id)))
+            (expect = (. (named r "root") span-id) (. (named r "child") parent-span-id))
+            (expect = true (!= (. (named r "root") span-id) (. (named r "child") span-id)))
+            (expect = true (and (> (. (named r "root") start-ns) 1700000000000000000) (<= (. (named r "root") start-ns) (. (named r "child") start-ns))))
+            (expect = true (<= (. (named r "child") end-ns) (. (named r "root") end-ns)))
+            (expect = true (>= (otel/span-duration-ns (named r "child")) 0))
+            (expect = "spec" (. (named r "root") scope))))
+    (scenario "attributes, events, links, kind and status are kept; Ok is final"
+      (given [r (rig) other (otel/SpanContext (otel/TraceId 9 9) 77 1 "" true)])
+      (upon [sp (otel/start-span-full (. r tracer) (otel/empty-context) "work" otel/KindClient [(Pair "k" (otel/->datum "v"))]
+                                      [(otel/SpanLink other [(Pair "why" (otel/->datum "retry"))])])
+             _ (do (otel/set-attribute! sp "n" (otel/->datum 3)) (otel/add-event! sp "tick" [(Pair "i" (otel/->datum 1))])
+                   (otel/set-status! sp (otel/StatusError "slow")) (otel/set-status! sp otel/StatusOk) (otel/set-status! sp (otel/StatusError "late"))
+                   (otel/set-name! sp "work2") (otel/end-span! sp))
+             d (named r "work2")])
+      (then (expect = "v" (attr-text d "k")) (expect = "3" (attr-text d "n"))
+            (expect = "CLIENT" (otel/kind-name (. d kind)))
+            (expect = ["tick"] (vec (map (fn (e: otel/SpanEvent) (. e name)) (. d events))))
+            (expect = true (>= (. (nth (. d events) 0) time-ns) (. d start-ns)))
+            (expect = 1 (count (. d links))) (expect = 77 (. (. (nth (. d links) 0) context) span-id))
+            (expect = "OK" (otel/status-name (. d status)))))
+    (scenario "ending twice exports once; a change after the end is ignored"
+      (given [r (rig) sp (otel/start-span (. r tracer) (otel/empty-context) "once" [])])
+      (upon [_ (do (otel/end-span! sp) (otel/set-attribute! sp "late" (otel/->datum 1)) (otel/end-span! sp))])
+      (then (expect = 1 (count (spans-of r))) (expect = "-" (attr-text (named r "once") "late"))))
+    (scenario "a Result body sets the error status for an Err"
+      (given [r (rig)])
+      (upon [a (otel/with-span-result (. r tracer) (otel/empty-context) "ok" [] (fn (e: str) e) (fn (sp: otel/Span c: otel/Context) (if true (Ok 1) (Err "x"))))
+             b (otel/with-span-result (. r tracer) (otel/empty-context) "err" [] (fn (e: str) (str "failed: " e)) (fn (sp: otel/Span c: otel/Context) (if false (Ok 1) (Err "nope"))))])
+      (then (expect = "UNSET" (otel/status-name (. (named r "ok") status)))
+            (expect = "ERROR" (otel/status-name (. (named r "err") status)))
+            (expect = "failed: nope" (otel/status-message (. (named r "err") status)))
+            (expect = true (match b ((Err _) true) ((Ok _) false))))))
+  (feature "a body that fails"
+    (scenario "a trap in the body ends the span with the exception recorded, and goes on to the caller's catch"
+      (covers "fib.otel with-span")
+      (given [r (rig)])
+      (upon [v (ex/try (otel/in-span sp ctx (. r tracer) (otel/empty-context) "boom" [] (trap "kaboom")) (catch e -1))])
+      (then (expect = -1 v) (expect = 1 (count (spans-of r)))
+            (expect = "ERROR" (otel/status-name (. (named r "boom") status)))
+            (expect = "kaboom" (otel/status-message (. (named r "boom") status)))
+            (expect = ["exception"] (vec (map (fn (e: otel/SpanEvent) (. e name)) (. (named r "boom") events))))
+            (expect = "kaboom" (match (otel/attribute-of-event (nth (. (named r "boom") events) 0) "exception.message") ((some v) (otel/datum-text v)) (nil "-")))
+            (expect = "user" (match (otel/attribute-of-event (nth (. (named r "boom") events) 0) "exception.type") ((some v) (otel/datum-text v)) (nil "-")))
+            (expect = true (> (. (named r "boom") end-ns) 0))))
+    (scenario "a thrown exception is recorded too, and a nested span that fails marks every span it passes through"
+      (given [r (rig)])
+      (upon [v (ex/try (otel/in-span sp ctx (. r tracer) (otel/empty-context) "outer" []
+                         (otel/in-span sp2 ctx2 (. r tracer) ctx "inner" [] (ex/throw (ex/ex "bad input"))))
+                       (catch e (string/join "|" [(ex/ex-message e) "caught"])))])
+      (then (expect = "bad input|caught" v) (expect = 2 (count (spans-of r)))
+            (expect = "bad input" (otel/status-message (. (named r "inner") status)))
+            (expect = "bad input" (otel/status-message (. (named r "outer") status)))
+            (expect = (. (named r "outer") span-id) (. (named r "inner") parent-span-id))))
+    (scenario "a body that returns normally leaves the status unset and records no event"
+      (given [r (rig)])
+      (upon [_ (otel/in-span sp ctx (. r tracer) (otel/empty-context) "fine" [] 1)])
+      (then (expect = "UNSET" (otel/status-name (. (named r "fine") status))) (expect = 0 (count (. (named r "fine") events))))))
+  (feature "context into tasks"
+    (scenario "spans started in tasks forked inside a span are its children, with the same trace"
+      (covers "fib.otel with-span")
+      (given [r (rig)])
+      (upon [_ (otel/in-span sp ctx (. r tracer) (otel/empty-context) "request" []
+                 (with-tasks [s]
+                   (do (dotimes (t 8)
+                         (fork s (fn () (otel/in-span sp2 ctx2 (. r tracer) ctx (str "task-" t) [(Pair "t" (otel/->datum t))]
+                                          (otel/in-span sp3 ctx3 (. r tracer) ctx2 (str "sub-" t) [] 0)))))
+                       ())))])
+      (then (expect = 17 (count (spans-of r)))
+            (expect = true (every? (fn (t: i64) (= (. (named r "request") span-id) (. (named r (str "task-" t)) parent-span-id))) (range 0 8)))
+            (expect = true (every? (fn (t: i64) (= (. (named r (str "task-" t)) span-id) (. (named r (str "sub-" t)) parent-span-id))) (range 0 8)))
+            (expect = 1 (count (set (map (fn (d: otel/SpanData) (otel/trace-id-hex (. d trace-id))) (spans-of r)))))
+            (expect = 17 (count (set (map (fn (d: otel/SpanData) (. d span-id)) (spans-of r)))))))
+    (scenario "a task that does not capture the context starts a new trace"
+      (given [r (rig)])
+      (upon [_ (otel/in-span sp ctx (. r tracer) (otel/empty-context) "request" []
+                 (with-tasks [s] (do (fork s (fn () (otel/in-span sp2 ctx2 (. r tracer) (otel/empty-context) "orphan" [] 0))) ())))])
+      (then (expect = 0 (. (named r "orphan") parent-span-id))
+            (expect = false (= (otel/trace-id-hex (. (named r "orphan") trace-id)) (otel/trace-id-hex (. (named r "request") trace-id))))))
+    (scenario "pmap children see the context their closure captured"
+      (given [r (rig)])
+      (upon [_ (otel/in-span sp ctx (. r tracer) (otel/empty-context) "batch" []
+                 (vec (pmap (fn (i: i64) (otel/in-span sp2 ctx2 (. r tracer) ctx (str "item-" i) [] i)) (vec (range 0 6)))))])
+      (then (expect = 7 (count (spans-of r)))
+            (expect = true (every? (fn (i: i64) (= (. (named r "batch") span-id) (. (named r (str "item-" i)) parent-span-id))) (range 0 6)))))
+    (scenario "a remote parent from a traceparent header: the server span is its child and says so"
+      (given [r (rig)
+              ctx (otel/extract-context (fn (k: str) (if (= k "traceparent") (some "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01") nil)))])
+      (upon [_ (otel/with-span-kind (. r tracer) ctx "GET /x" otel/KindServer [] (fn (sp: otel/Span c: otel/Context) 0))])
+      (then (expect = "4bf92f3577b34da6a3ce929d0e0e4736" (otel/trace-id-hex (. (named r "GET /x") trace-id)))
+            (expect = "00f067aa0ba902b7" (otel/span-id-hex (. (named r "GET /x") parent-span-id)))
+            (expect = true (. (named r "GET /x") parent-remote)))))
+  (feature "samplers"
+    (scenario "always-on and always-off"
+      (then (expect = 1000 (decisions (otel/always-on) 1000)) (expect = 0 (decisions (otel/always-off) 1000))))
+    (scenario "the ratio sampler keeps the fraction asked for, 0 and 1 are exact, and the answer is a function of the trace id"
+      (then (expect = true (let [n (decisions (otel/trace-id-ratio 0.25) 20000)] (and (> n 4600) (< n 5400))))
+            (expect = 0 (decisions (otel/trace-id-ratio 0.0) 5000)) (expect = 5000 (decisions (otel/trace-id-ratio 1.0) 5000))
+            (expect = (decisions (otel/trace-id-ratio 0.5) 3000) (decisions (otel/trace-id-ratio 0.5) 3000))
+            (expect = true (< (decisions (otel/trace-id-ratio 0.1) 5000) (decisions (otel/trace-id-ratio 0.6) 5000)))))
+    (scenario "parent-based follows the parent's flag and asks the root sampler only for a root"
+      (given [on (otel/parent-based (otel/always-on)) off (otel/parent-based (otel/always-off))
+              yes (some (otel/SpanContext (otel/TraceId 1 1) 1 1 "" true)) no (some (otel/SpanContext (otel/TraceId 1 1) 1 0 "" true))
+              t (otel/TraceId 3 3)
+              d (fn (s: (dyn otel/Sampler :send) p: (Option otel/SpanContext)) (match (otel/should-sample s p t "x" otel/KindServer)
+                                                                               ((otel/SampleRecordAndSample) "on") ((otel/SampleRecordOnly) "rec") ((otel/SampleDrop) "off")))])
+      (then (expect = "on" (d off yes)) (expect = "off" (d on no)) (expect = "on" (d on nil)) (expect = "off" (d off nil))
+            (expect = "on" (d on (some (otel/invalid-span-context)))) (expect = "off" (d off (some (otel/invalid-span-context)))) (expect = "ParentBased{root=AlwaysOnSampler}" (otel/sampler-description on))))
+    (scenario "a sampled-out span exports nothing, still has valid ids, and its children are sampled out with the same trace id"
+      (given [r (rig-with (otel/always-off)) sink (cell "")])
+      (upon [ids (otel/in-span sp ctx (. r tracer) (otel/empty-context) "dropped" []
+                   (otel/in-span sp2 ctx2 (. r tracer) ctx "child" []
+                     (Pair (otel/format-traceparent (otel/span-context-of sp)) (otel/format-traceparent (otel/span-context-of sp2)))))
+             rec (otel/in-span sp ctx (. r tracer) (otel/empty-context) "dropped2" [] (otel/recording? sp))])
+      (then (expect = 0 (count (spans-of r))) (expect = false rec)
+            (expect = true (string/ends-with? (. ids fst) "-00"))
+            (expect = (subs (. ids fst) 3 35) (subs (. ids snd) 3 35))
+            (expect = false (= (subs (. ids fst) 36 52) (subs (. ids snd) 36 52)))))
+    (scenario "the no-op tracer records nothing, draws no id, and passes the parent's context through"
+      (given [t (otel/noop-tracer) m (otel/MemoryExporter (atom []) (atom false))])
+      (upon [rec (otel/in-span sp ctx t (otel/empty-context) "x" [] (otel/recording? sp))
+             parent (otel/SpanContext (otel/TraceId 1 2) 3 1 "" true)
+             same (otel/in-span sp ctx t (otel/context-with-span-context (otel/empty-context) parent) "y" [] (otel/current-span-context ctx))])
+      (then (expect = false rec) (expect = (some (otel/SpanContext (otel/TraceId 1 2) 3 1 "" true)) same))))
+  (feature "bridges and helpers"
+    (scenario "the logger bridge puts the trace and span ids in the records"
+      (given [m (log/memory-sink) lg (log/get-logger (log/log-system (dyn log/Sink :send m) (log/LevelTable 0 [])) "app") r (rig)])
+      (upon [_ (otel/in-span sp ctx (. r tracer) (otel/empty-context) "work" []
+                 (do (log/info (otel/logger-with-trace lg ctx) "inside") (log/info (otel/logger-with-trace lg (otel/empty-context)) "outside")))])
+      (then (expect = ["trace_id" "span_id"] (vec (map (fn (p: (Pair keyword log/Datum)) (log/keyword-text (. p fst))) (. (nth (log/memory-records m) 0) fields))))
+            (expect = (otel/trace-id-hex (. (named r "work") trace-id)) (log/datum-text (. (nth (. (nth (log/memory-records m) 0) fields) 0) snd)))
+            (expect = (otel/span-id-hex (. (named r "work") span-id)) (log/datum-text (. (nth (. (nth (log/memory-records m) 0) fields) 1) snd)))
+            (expect = 0 (count (. (nth (log/memory-records m) 1) fields)))))
+    (scenario "resources: defaults, the attribute list of the environment, an explicit service name wins"
+      (then (expect = "unknown_service" (match (otel/attribute-of-resource (otel/make-resource "unknown_service" []) "service.name") ((some v) (otel/datum-text v)) (nil "-")))
+            (expect = ["a" "b"] (vec (map (fn (p: (Pair str log/Datum)) (. p fst)) (otel/parse-resource-attributes "a=1,junk,b=two=2"))))
+            (expect = "two=2" (otel/datum-text (. (nth (otel/parse-resource-attributes "a=1,junk,b=two=2") 1) snd)))
+            (expect = 1 (count (filter (fn (p: (Pair str log/Datum)) (= (. p fst) "service.name"))
+                                       (. (otel/make-resource "mine" [(Pair "service.name" (log/->datum "other"))]) attributes))))))
+    (scenario "semantic-convention helpers: names, statuses, no values in query text attributes"
+      (then (expect = "GET /users/{id}" (otel/http-span-name "GET" (some "/users/{id}"))) (expect = "GET" (otel/http-span-name "GET" nil))
+            (expect = "UNSET" (otel/status-name (otel/http-status otel/KindServer 404))) (expect = "ERROR" (otel/status-name (otel/http-status otel/KindServer 503)))
+            (expect = "ERROR" (otel/status-name (otel/http-status otel/KindClient 404))) (expect = "UNSET" (otel/status-name (otel/http-status otel/KindClient 302)))
+            (expect = "SELECT users" (otel/db-span-name "SELECT" (some "users")))
+            (expect = ["db.system.name" "db.operation.name" "db.query.text" "db.collection.name" "server.address"]
+                    (vec (map (fn (p: (Pair str log/Datum)) (. p fst)) (otel/db-attributes otel/db-system-sqlite "SELECT" (some "users") "SELECT * FROM users WHERE id = ?" (some "h")))))))))
+
+(defun main () -> i64 (run-main (specs)))

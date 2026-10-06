@@ -3,7 +3,7 @@
 ;; The Appender contract runs against the file sink, the async sink over a file, and a fanout. Everything is local files under a fresh
 ;; temporary directory; no sleep is longer than 60 ms.
 (ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.parallel log-appender-contract)
-  (:require [fib.log :as log] [fib.os :as os] [fib.string :as string]))
+  (:require [fib.log :as log] [fib.os :as os] [fib.string :as string] [fib.ex :as ex]))
 
 (defun fresh-dir () -> str
   (match (os/create-temp-directory (str (os/temp-directory) "/fiblogXXXXXX")) ((Ok d) d) ((Err e) (trap (. e message)))))
@@ -165,6 +165,14 @@
               queued-while-blocked @(. a accepted)])
       (upon [_ (do (reset! (. g gate) true) (join t) (log/sink-close (dyn log/Sink :send a)))])
       (then (expect = 4 queued-while-blocked) (expect = [0 1 2 3 4 5] (mem-lines-i (. g inner))) (expect = 0 (log/async-dropped a))))
+    (scenario "with-log-system flushes and closes the system when the body returns and when it traps"
+      (given [m1 (log/memory-sink) m2 (log/memory-sink)
+              s1 (log/log-system (dyn log/Sink :send (log/async-sink (dyn log/Sink :send m1) 1000 log/BlockProducer)) (log/LevelTable 0 []))
+              s2 (log/log-system (dyn log/Sink :send (log/async-sink (dyn log/Sink :send m2) 1000 log/BlockProducer)) (log/LevelTable 0 []))])
+      (upon [a (log/with-log-system s1 (fn (s: log/LogSystem) (do (dotimes (i 20) (log/info (log/get-logger s "t") "x" :i i)) 1)))
+             b (ex/try (log/with-log-system s2 (fn (s: log/LogSystem) (do (log/info (log/get-logger s "t") "x" :i 1) (trap "boom"))))
+                       (catch e -1))])
+      (then (expect = 1 a) (expect = -1 b) (expect = 20 (count (log/memory-records m1))) (expect = 1 (count (log/memory-records m2)))))
     (scenario "a failing or trapping inner sink is counted and the worker goes on"
       (given [b (BrokenSink (atom 0)) t (TrapSink (atom 0))
               a1 (log/async-sink (dyn log/Sink :send b) 100 log/BlockProducer) a2 (log/async-sink (dyn log/Sink :send t) 100 log/BlockProducer)
@@ -198,6 +206,9 @@
       (then (expect = log/WARN (. (log/parse-spec "warn,my.mod=debug,x=loud,junk" 2) root))
             (expect = [(log/Pair "my.mod" log/DEBUG)] (. (log/parse-spec "warn,my.mod=debug,x=loud,junk" 2) rules))
             (expect = log/INFO (. (log/parse-spec "my.mod=debug" 2) root))))
+    (scenario "rules and levels with non-ASCII names are read (str-find counts bytes, subs counts characters)"
+      (then (expect = [(log/Pair "é.x" log/DEBUG)] (. (log/parse-spec "é.x=debug" 2) rules))
+            (expect = log/ERROR (. (log/parse-spec "é,error" 2) root))))
     (scenario "FIB_LOG from the environment, with a rotating async file"
       (given [dir (fresh-dir) path (str dir "/e.log")
               _ (do (os/setenv "FIB_LOG" "error,app.db=trace") (os/setenv "FIB_LOG_FILE" path) (os/setenv "FIB_LOG_FILE_MAX" "100000")
