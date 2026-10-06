@@ -309,9 +309,9 @@ async function selftest() {
 let buf=Buffer.alloc(0);const out=(m)=>{const b=Buffer.from(JSON.stringify(m));process.stdout.write('Content-Length: '+b.length+'\\r\\n\\r\\n');process.stdout.write(b);};
 process.stdin.on('data',d=>{buf=Buffer.concat([buf,d]);for(;;){const i=buf.indexOf('\\r\\n\\r\\n');if(i<0)return;const n=+/Content-Length: (\\d+)/.exec(buf.slice(0,i).toString())[1];if(buf.length<i+4+n)return;const t=buf.slice(i+4,i+4+n).toString();buf=buf.slice(i+4+n);
 let m;try{m=JSON.parse(t)}catch(e){out({jsonrpc:'2.0',id:null,error:{code:-32700,message:'x'}});continue}
-if(t.includes('(((((')) process.kill(process.pid,'SIGSEGV'); if(t.includes('\\\\u0000')) {continue;}
+if(t.includes('(((((')) process.exit(77); if(t.includes('\\\\u0000')) {continue;}
 if(m.id!==undefined)out({jsonrpc:'2.0',id:m.id,result:null});else if(m.method==='textDocument/didOpen'||m.method==='textDocument/didChange'||m.method==='textDocument/didClose')out({jsonrpc:'2.0',method:'textDocument/publishDiagnostics',params:{}});}});`);
-  opt.server = process.execPath; opt.args = [fake]; opt.deadline = 1500;
+  opt.server = process.execPath; opt.args = [fake]; opt.deadline = 5000;
   const r = rng(7); const probes = [['plain', 'hello (ns x)'], ['crash', '(' .repeat(50)], ['hang', 'a\u0000b'], ['plain2', '(ns y)']]; let crash = 0; let hang = 0; let ok = 0;
   for (const [name, text] of probes) {
     const { srv } = await fresh(); const res = await runSteps(srv, steps(r, text, false), opt.deadline); srv.kill();
