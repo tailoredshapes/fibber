@@ -1,0 +1,56 @@
+;; Where the time of one training step goes (best of 200, ms): the tape's forward, its backward, the SGD update, and the kernels they call.
+;;   F build scripts/bench/autodiff/kernels.fib -I lib -o kern && taskset -c 3 ./kern
+(ns main (:require [fib.tensor :as t] [fib.autodiff :as ad] [fib.autodiff.tape :as tp] [fib.autodiff.run :as run] [fib.autodiff.forward :as fwd] [fib.math :as math]))
+
+(defun hash (n: i64 j: i64 salt: i64) -> f64
+  (let [h (rem (* (+ (+ (* 7919 n) (* 104729 j)) (+ (* 1299709 salt) 12345)) 2654435761) 4294967296)]
+    (/ (double (rem (shr h 7) 1000000)) 1000000.0)))
+
+(defun mk (rows: i64 cols: i64 salt: i64) -> (t/Tensor f32)
+  (let [buf (cell (array (* rows cols) 0.0f32))]
+    (do (dotimes (i rows) (dotimes (j cols) (array-set! &buf (+ (* i cols) j) (float (- (hash i j salt) 0.5)))))
+        (t/from-array [rows cols] @buf 0.0f32))))
+
+(defun best (name: str runs: i64 f: (fn () i64)) -> unit
+  (loop [r 0 b 1000000000000 chk 0]
+    (if (< r runs)
+        (let [s (sys-clock-now) v (f) e (- (sys-clock-now) s)] (recur (+ r 1) (min b e) v))
+        (println name "best_ms" (/ (double b) 1000000.0) "chk" chk))))
+
+(defun forward (ps: (Vec (ad/Tracked f32)) xb: (t/Tensor f32) labels: (Vec i64)) -> (ad/Tracked f32)
+  (let [x (ad/const-like (nth ps 0) xb)
+        h (ad/dense x (nth ps 0) (nth ps 1) :relu)
+        o (ad/dense h (nth ps 2) (nth ps 3) :identity)]
+    (ad/softmax-cross-entropy o labels)))
+
+(defun tape-forward (ps: (Vec (t/Tensor f32)) xb: (t/Tensor f32) labels: (Vec i64)) -> (Pair (ad/Tape f32) (ad/Tracked f32))
+  (let [tp (ad/new-tape) leaves (mapv (fn (p: (t/Tensor f32)) (ad/leaf tp p)) ps)] (Pair tp (forward leaves xb labels))))
+
+(defun jvp-net (xs: (Vec (fwd/Dual f32)) x: (t/Tensor f32)) -> (fwd/Dual f32)
+  (let [h (fwd/ddense (fwd/constant-dual x) (nth xs 0) (nth xs 1) :relu)
+        o (fwd/ddense h (nth xs 2) (nth xs 3) :identity)]
+    (fwd/dmean o)))
+
+(defun main () -> i64
+  (let [x (mk 128 784 1) w1 (mk 784 256 2) b1 (t/zeros-f32 [256]) w2 (mk 256 10 3) b2 (t/zeros-f32 [10])
+        ps [w1 b1 w2 b2] labels (mapv (fn (k: i64) (rem k 10)) (range 128))
+        h (t/dense x w1 b1 :relu) dz1 (t/dense x w1 b1 :identity) dz2 (mk 128 10 4) gs [(mk 784 256 5) (t/zeros-f32 [256]) (mk 256 10 6) (t/zeros-f32 [10])]]
+    (do (best "forward_tape_build" 200 (fn () (let [p (tape-forward ps x labels)] (t/size (ad/value (. p snd))))))
+        (best "forward_plus_backward" 200 (fn () (let [vg (ad/value-and-grad (fn (xs: (Vec (ad/Tracked f32))) (forward xs x labels)) ps)] (t/size (nth (. vg grads) 0)))))
+        (best "forward_plain_no_tape" 200 (fn () (t/size (t/dense (t/dense x w1 b1 :relu) w2 b2 :identity))))
+        (best "jvp_one_direction" 200 (fn () (t/size (. (fwd/jvp (fn (xs: (Vec (fwd/Dual f32))) (jvp-net xs x)) ps gs) d))))
+        (best "adam_update_4_tensors" 100 (fn () (t/size (nth (. (ad/adam-step 0.001 0.9 0.999 1.0e-8 (ad/adam-init ps) ps gs) params) 0))))
+        (best "log_then_exp_of_w1_sized_tensor_784x256" 100 (fn () (t/size (t/exp (t/log (nth gs 0))))))
+        (best "mul_of_w1_sized_tensors_784x256" 100 (fn () (t/size (t/mul (nth gs 0) (nth gs 0)))))
+        (best "sgd_update_4_tensors" 200 (fn () (t/size (nth (ad/sgd-step 0.1 ps gs) 0))))
+        (best "gemm_x_w1_dense_relu_128x784x256" 200 (fn () (t/size (t/dense x w1 b1 :relu))))
+        (best "gemm_x_w1_mmul" 200 (fn () (t/size (t/mmul x w1))))
+        (best "gemm_xT_dz1_784x128x256" 200 (fn () (t/size (t/mmul (t/transpose x) dz1))))
+        (best "gemm_dz1_w1T_128x256x784" 200 (fn () (t/size (t/mmul dz1 (t/transpose w1)))))
+        (best "relu_mask_where_128x256" 200 (fn () (t/size (t/where (t/greater h (t/full [] 0.0f32)) dz1 (t/full [] 0.0f32)))))
+        (best "relu_mask_vector_relu_of_h_div_h_128x256" 200 (fn () (t/size (t/mul dz1 (t/relu (t/div h h))))))
+        (best "bias_grad_ones_mmul_128x256" 200 (fn () (t/size (t/mmul (t/full [1 128] 1.0f32) dz1))))
+        (best "bias_grad_sum_axis0_128x256" 200 (fn () (t/size (t/sum-axis 0 false dz1))))
+        (best "dense2_128x256x10" 200 (fn () (t/size (t/dense h w2 b2 :identity))))
+        (best "dw2_256x128x10" 200 (fn () (t/size (t/mmul (t/transpose h) dz2))))
+        0)))

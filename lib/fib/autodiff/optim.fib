@@ -18,8 +18,11 @@
 
 (defun ipow (x: f64 n: i64) -> f64 (loop [i 0 acc 1.0] (if (< i n) (recur (+ i 1) (* acc x)) acc)))
 
-;; sqrt(v) without a scalar loop: exp(log(v) / 2) with the vector exp and log (v >= 0; log 0 = -inf, exp(-inf) = 0)
-(defun vsqrt (v: (t/Tensor a)) -> (t/Tensor a) (t/exp (t/scale (lit (. v seed) 0.5) (t/log v))))
+;; sqrt of every element. fib.tensor has no vector sqrt; a scalar map with the libm-exact `math/sqrt` takes about a third of the time of the vector
+;; exp(log(v)/2) it replaced (the vector log and exp cost 2.3 ns an element each: docs/shootout/autodiff.md), and is exact. A vector `t/sqrt` over
+;; `simd/sqrt` is the right fix (docs/design/autodiff.md 9).
+(defun vsqrt (v: (t/Tensor a)) -> (t/Tensor a)
+  (let [sd (. v seed)] (t/map (fn (x: a) (lit sd (math/sqrt (wide sd x)))) v)))
 
 (defun adam-one (lr: f64 b1: f64 b2: f64 eps: f64 c1: f64 c2: f64 p: (t/Tensor a) g: (t/Tensor a) m: (t/Tensor a) v: (t/Tensor a))
   -> (Vec (t/Tensor a))
