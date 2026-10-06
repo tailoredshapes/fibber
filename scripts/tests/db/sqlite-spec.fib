@@ -47,6 +47,39 @@
              n (match (execute! c ["select id, v from big"]) ((Ok rows) (count rows)) ((Err _) -1))
              h2 (proc-kb "VmHWM:")])
       (then (expect = 4999950000 sum) (expect = true (< (- h1 h0) 4096)) (expect = 100000 n) (expect = true (> (- h2 h1) 16384))))
+    (scenario "the statement cache keeps one statement per SQL text and is bounded"
+      (given [c (big 3) base (sqlite-cache-size c)])
+      (upon [_ (loop [i 0] (when (< i 100) (do (execute! c ["select id from big where id = ?" i]) (recur (+ i 1)))))
+             one (sqlite-cache-size c)
+             _ (loop [i 0] (when (< i 100) (do (execute! c [(str "select id + " i " as k from big")]) (recur (+ i 1)))))])
+      (then (expect = (+ base 1) one) (expect = 32 (sqlite-cache-size c))))
+    (scenario "the cache drops the least recently used statement"
+      (given [c (big 1)])
+      (upon [_ (loop [i 0] (when (< i 32) (do (execute! c [(str "select id + " i " as k from big")]) (recur (+ i 1)))))
+             _ (execute! c ["select id + 0 as k from big"])
+             _ (execute! c ["select id + 99 as k from big"])])
+      (then (expect = [true false true] [(sqlite-cached? c "select id + 0 as k from big") (sqlite-cached? c "select id + 1 as k from big")
+                                         (sqlite-cached? c "select id + 99 as k from big")])))
+    (scenario "a reused statement is bound afresh: different values, NULL after a value"
+      (given [c (fresh) _ (execute! c ["create table k (a integer, b text)"])])
+      (upon [_ (execute! c ["insert into k (a, b) values (?, ?)" 1 "x"])
+             _ (execute! c ["insert into k (a, b) values (?, ?)" DNil DNil])
+             r (execute! c ["select count(*) as n from k where b is null"])
+             s (execute! c ["select count(*) as n from k where a is null"])])
+      (then (expect = "1 1" (str (datum-text (unwrap-or (match r ((Ok rows) (get (nth rows 0) "n")) ((Err _) nil)) DNil)) " "
+                                 (datum-text (unwrap-or (match s ((Ok rows) (get (nth rows 0) "n")) ((Err _) nil)) DNil))))))
+    (scenario "a schema change drops the kept statements: select * sees a renamed column"
+      (given [c (fresh) _ (execute! c ["create table k (a integer)"]) _ (execute! c ["insert into k (a) values (1)"])
+              _ (execute! c ["select * from k"])])
+      (upon [_ (execute! c ["alter table k rename column a to z"])
+             r (execute! c ["select * from k"])])
+      (then (expect = true (match r ((Ok rows) (some? (get (nth rows 0) "z"))) ((Err _) false)))))
+    (scenario "the same statement text inside a plan's own walk runs on a statement of its own"
+      (given [c (big 5) base (sqlite-cache-size c)])
+      (upon [total (reduce (fn (a: i64 r: (Result (Map str Datum) DbError))
+                             (+ a (id-of r) (count (plan c ["select id from big"]))))
+                           0 (plan c ["select id from big"]))])
+      (then (expect = 35 total) (expect = (+ base 1) (sqlite-cache-size c))))
     (scenario "a plan stopped early finalizes its statement"
       (given [c (big 50)])
       (upon [ids (vec (map id-of (take 3 (plan c ["select id from big order by id"]))))])
