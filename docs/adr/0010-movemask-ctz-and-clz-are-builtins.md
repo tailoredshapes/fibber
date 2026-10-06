@@ -31,3 +31,32 @@ builtin, as for any builtin name.
 - Library code that uses them compiles only with a compiler that has them: the seed fibc 0.1.9 does not, so `fib.json`'s SIMD path needs the next release. The
   compiler itself does not use them, so the seed still builds stage 2 and the fixed point is not affected.
 - The JavaScript backend implements `cttz`/`ctlz` (`$cttz`, `$ctlz`); it has no vector mask moves beyond what it had.
+
+## Governance
+
+```fibber fitness
+(rule "nothing in compiler/ or lib/ defines a function named simd/movemask, ctz or clz (the builtin would capture it)"
+  (into (defined-among repo ["compiler/**.fib" "!compiler/tests/**"] ["simd/movemask" "ctz" "clz"])
+        (defined-among repo ["lib/**.fib"] ["simd/movemask" "ctz" "clz"]))
+  (plant "compiler/emit/zz-plant.fib" "\n(defun ctz (x: i64) -> i64 x)\n"))
+
+(rule "the three builtins are rows of types.builtins"
+  (into (must-contain repo "compiler/types/builtins.fib" "(BuiltinSig \"simd/movemask\"")
+        (into (must-contain repo "compiler/types/builtins.fib" "(BuiltinSig \"ctz\"")
+              (must-contain repo "compiler/types/builtins.fib" "(BuiltinSig \"clz\"")))
+  (plant-file "compiler/types/builtins.fib" "(ns types.builtins)\n"))
+
+(rule "the spec and the lIR spec say what they do"
+  (into (must-contain repo "spec/types.md" "simd/movemask")
+        (must-contain repo "spec/lir.md" "cttz"))
+  (plant-file "spec/lir.md" "# lir\n"))
+
+(rule "the planted-fault script has the movemask faults (a mutant that is not there cannot be killed)"
+  (must-contain repo "scripts/mutant-simd-lower.sh" "movemask-order")
+  (plant-file "scripts/mutant-simd-lower.sh" "#!/bin/bash\n"))
+```
+
+### What this does not check
+
+That the lowering is right (case 7980 and `scripts/mutant-simd-lower.sh` do, and `scripts/mac-check.sh` on a Mac for the aarch64 sequence); that library code stays portable
+(a program using `simd/movemask` needs a compiler that has it: the seed 0.1.9 does not).
