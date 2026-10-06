@@ -54,11 +54,14 @@ our blocks are whole mappings (no fragmentation to wait out) and a miss costs on
 
 **No background thread.** The clock is read (`CLOCK_MONOTONIC_COARSE` on Linux, `CLOCK_MONOTONIC_RAW_APPROX` on Darwin: a few
 nanoseconds, no system call) only while the cache holds something, at these points: every large allocation and free, every
-allocation and free of a block above 512 bytes (already a `malloc` or `free` call), and the return of `sys-sleep`. When the
-time passed is past the next deadline (the oldest block's filing time plus the decay), one sweep under the lock takes every
-expired block out and frees them after the lock is released. The small-object fast and slow paths do not read it. A program that
-does nothing at all keeps its cache until its next allocation, as jemalloc without background threads does; `fib.os.memory/trim!`
-gives everything back at once. A thread was rejected: it would make the program multi-threaded (`fork-run` refuses then) and
+allocation and free of a block above 512 bytes (already a `malloc` or `free` call), every small block that comes from `malloc`
+(`fib.alloc-slow`'s `fresh`: every small allocation once the program has threads, a free-list miss before), every 256th small free
+while the program has one thread (a plain countdown in `fib.free-block`'s push), and the return of `sys-sleep`. While the cache is empty each point costs one atomic load. When the time passed is past the next deadline (the
+oldest block's filing time plus the decay), one sweep under the lock takes every expired block out and frees them after the lock is
+released. The inlined fast path (a pop from a free list) does not read it. The `malloc` of a small block was added after the first
+measurement: the threaded HTTP server's small requests allocate nothing above 512 bytes, so without it a spike's blocks stayed
+cached for good (section 8). A program that does nothing at all keeps its cache until its next allocator event, as jemalloc without background threads does;
+`fib.os.memory/trim!` gives everything back at once. A thread was rejected: it would make the program multi-threaded (`fork-run` refuses then) and
 a lock held at a `fork` would be inherited by the child.
 
 **The cap.** `FIB_ALLOC_CACHE_MAX` bytes (default **1 GiB**): a block that would take the cache above it is freed at once. The
@@ -102,3 +105,52 @@ other block. It needs: (1) the get/put pair on raw blocks, not objects (here); (
 its drop: a flags bit (bit 5, beside ROOMY) or a class value, because `fib.free-block` must not `free` an interior pointer; (3) its
 chunk size to be a cache class (a multiple of 128 KiB in this scheme) so chunks are never rounded; (4) the stats split by owner if
 the arena's chunks are to be told apart from ordinary blocks in a measurement.
+
+## 8. Measured (2026-10-06, x86-64 Linux, glibc; shared machine, load average 2 to 4)
+
+Binaries: `F0` = stage 2 of main (700238b) built by the v0.1.7 seed (the runtime without the cache); `F1` = stage 2 of this branch
+built by the seed (its programs get the cache); `F3` = this branch built by `F1` (the compiler itself runs with the cache). Every
+timing is `ulimit -v 16000000`, `flock /tmp/fibsuite.lock taskset -c 3`, the median of 5 runs (each run's own number is a median of
+its steps).
+
+```sh
+F build scripts/bench/autodiff/adam-chain.fib -I lib -o probe;  F build scripts/bench/autodiff/mlp.fib -I lib -o mlp
+flock /tmp/fibsuite.lock taskset -c 3 ./probe;  flock /tmp/fibsuite.lock taskset -c 3 ./mlp tape adam 300   # and `tape sgd 300`
+```
+
+| ms per step | F0 | F0 with glibc's thresholds raised (the experiment of autodiff.md 8.3) | F1, cache on | F1, `FIB_ALLOC_DECAY_MS=0` |
+|---|---|---|---|---|
+| `adam-chain` (chained Adam update) | 0.293 (an earlier run: 0.337) | 0.113 | 0.114 (first build: 0.122) | 0.289 |
+| MLP step, Adam (tape) | 1.202 (earlier: 1.206) | 1.001 | 1.010 (first build: 1.019) | 1.209 |
+| MLP step, SGD (tape) | 0.910 | 0.912 | 0.921 (first build: 0.912) | 0.906 |
+
+The cache gives what the glibc experiment gave: the chained Adam update 2.6x faster, the Adam step 16% faster (1.20 to 1.01 ms),
+SGD unchanged (it allocates no large block per step). `FIB_ALLOC_STATS=1` on the MLP Adam run: hits 2990, misses 15, held 24 MB
+at the end, nothing returned (the loop never pauses for a second).
+
+**A server's resident memory after a spike** (`examples/http-server.fib`, 4 workers; a client sends small `GET /` at about 50 per
+second for 12 s and, at 3 s, eight `POST /echo` of 6 MB one after the other; VmRSS sampled every 50 ms; script
+`~/.cache/fibber-scratch/alloc1/httpload.py`):
+
+| server built by | baseline | peak | 1 s after the spike | 2 s | 4 s | 8 s |
+|---|---|---|---|---|---|---|
+| F0 (glibc) | 2.2 MB | 38.2 MB | 2.5 | 2.5 | 2.5 | 2.5 |
+| F1, first build (checks only at large and medium events) | 2.2 | 20.3 | 14.3 | 14.3 | 14.3 | 14.3 |
+| F1 (check also at a small malloc) | 2.2 | 14.3 | 14.3 | 2.2 | 2.2 | 2.2 |
+
+glibc returns 6 MB blocks at once (they are its own mappings), so the cache cannot beat F0's curve, only match it after the decay
+time: it does, within 1.3 s of the spike's end, with a lower peak. The first build never returned the 12 MB: the threaded server's
+small requests reached no check, which is why `fresh` (and, for one thread, the free countdown) check now.
+
+**The language server** (`F3 lsp -I compiler`, a 2 MB buffer opened, then a hover every 100 ms for 8 s; script
+`~/.cache/fibber-scratch/alloc1/lspload.js`): RSS 52 MB before the open, 102 MB after it and flat with the cache off, 105 MB and flat
+with it on. The 50 MB are the analysis the server keeps for the open document, not freed blocks; `FIB_ALLOC_STATS` at exit: hits 342,
+misses 8, 8 MB held (freed as the server shut down). There is no spike for the cache to return here; it costs 3 MB while the decay runs.
+
+**The small-object path** (`BENCH_FIBC=F scripts/bench/quick.sh -n 5`, F0 then F1 back to back): every row of F1 within 7% of F0's
+(num-f64 1.49/1.46, nbody 0.62/0.61, vec-conj-pop 0.89/0.85, vec-index 0.37/0.38, vec-sort 0.41/0.43, map-assoc-get 0.26/0.28,
+set-conj 0.24/0.22, lazy-fused 0.84/0.77, strings 0.63/0.66 s); lazy-fused is flagged against the checked-in baseline for both.
+
+**macOS** (the Mac Studio, arm64, macOS 27): cases 7790-7796 cross-built by F1 (`--target arm64-apple-macosx13.0.0 --emit obj`),
+linked with `cc` on the Mac and run natively: all exit 0; 7791 checks the cache's own counts there (no /proc), and its stats line shows
+the 32 blocks returned after the sleep.
