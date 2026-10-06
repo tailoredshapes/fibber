@@ -1,0 +1,32 @@
+;; Micro benchmarks of the tensor-library gaps that docs/shootout/autodiff.md found, AFTER the new functions (the rows grow with each commit of the series; gaps-before.fib times the old ways):
+;;   F build scripts/bench/tensor/gaps.fib -I lib -o ga && flock /tmp/fibsuite.lock taskset -c 3 ./ga
+;; Each row is the median of 5 samples, a sample being REPS calls; microseconds per call. `gaps-before.fib` times the same rows with the API of main.
+(ns main (:require [fib.tensor :as t] [fib.math :as math]))
+
+(defun fill (n: i64 seed: i64) -> (t/Tensor f32)
+  (let [buf (cell (array n 0.0f32))]
+    (do (dotimes (i n) (array-set! &buf i (fdiv (float (- (rem (+ (* i 7919) (* seed 104729)) 1013) 500)) 37.0f32)))
+        (t/from-array [n] @buf 0.0f32))))
+
+(defun median5 (v: (Vec i64)) -> i64 (nth (sort v) 2))
+
+(defun bench (name: str reps: i64 f: (fn () i64)) -> unit
+  (let [times (mapv (fn (s: i64) (let [t0 (sys-clock-now)
+                                       chk (loop [r 0 c 0] (if (< r reps) (recur (+ r 1) (+ c (f))) c))
+                                       dt (- (sys-clock-now) t0)]
+                                   (if (= chk -1) 0 dt)))
+                    (range 6))
+        ts (vec (rest times))]
+    (println name "us_per_call" (/ (double (median5 ts)) (* 1000.0 (double reps))))))
+
+(defun main () -> i64
+  (let [w (t/reshape [784 256] (fill 200704 3)) pos (t/map (fn (v: f32) (+ (abs v) 0.5f32)) w)
+        w64 (t/map-as (fn (v: f32) (double v)) 0.0 w) pos64 (t/map-as (fn (v: f32) (double v)) 0.0 pos)]
+    (do (bench "sqrt 784x256 f32" 100 (fn () (t/size (t/sqrt pos))))
+        (bench "sqrt 784x256 f64" 100 (fn () (t/size (t/sqrt pos64))))
+        (bench "sqrt of a transposed 784x256 f32 view" 100 (fn () (t/size (t/sqrt (t/transpose pos)))))
+        (bench "rsqrt 784x256 f32" 100 (fn () (t/size (t/rsqrt pos))))
+        (bench "abs 784x256 f32" 100 (fn () (t/size (t/abs w))))
+        (bench "sign 784x256 f32" 100 (fn () (t/size (t/sign w))))
+        (bench "mul 784x256 f32 (reference)" 200 (fn () (t/size (t/mul w w))))
+        0)))

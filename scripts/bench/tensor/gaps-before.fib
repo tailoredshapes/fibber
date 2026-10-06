@@ -1,0 +1,47 @@
+;; Micro benchmarks of the tensor-library gaps that docs/shootout/autodiff.md found, BEFORE the new functions (only the API that exists on main):
+;;   F build scripts/bench/tensor/gaps-before.fib -I lib -o gb && flock /tmp/fibsuite.lock taskset -c 3 ./gb
+;; Each row is the median of 5 samples, a sample being REPS calls; microseconds per call. `gaps.fib` times the same rows with the new functions.
+(ns main (:require [fib.tensor :as t] [fib.math :as math]))
+
+(defun fill (n: i64 seed: i64) -> (t/Tensor f32)
+  (let [buf (cell (array n 0.0f32))]
+    (do (dotimes (i n) (array-set! &buf i (fdiv (float (- (rem (+ (* i 7919) (* seed 104729)) 1013) 500)) 37.0f32)))
+        (t/from-array [n] @buf 0.0f32))))
+
+(defun median5 (v: (Vec i64)) -> i64 (nth (sort v) 2))
+
+(defun bench (name: str reps: i64 f: (fn () i64)) -> unit
+  (let [times (mapv (fn (s: i64) (let [t0 (sys-clock-now)
+                                       chk (loop [r 0 c 0] (if (< r reps) (recur (+ r 1) (+ c (f))) c))
+                                       dt (- (sys-clock-now) t0)]
+                                   (if (= chk -1) 0 dt)))
+                    (range 6))
+        ts (vec (rest times))]
+    (println name "us_per_call" (/ (double (median5 ts)) (* 1000.0 (double reps))))))
+
+(defun main () -> i64
+  (let [x (t/reshape [128 256] (fill 32768 1)) y (t/reshape [128 256] (fill 32768 2))
+        w (t/reshape [784 256] (fill 200704 3))
+        xd (t/map-as (fn (v: f32) (double v)) 0.0 x) zero (t/full [] 0.0f32) c3 (t/reshape [8 32 256] (fill 65536 4)) pos (t/map (fn (v: f32) (+ (abs v) 0.5f32)) w)]
+    (do (bench "greater-scalar 128x256 f32" 200 (fn () (t/size (t/greater x zero))))
+        (bench "greater-tensor 128x256 f32" 200 (fn () (t/size (t/greater x y))))
+        (bench "where mask x zero 128x256 f32" 200 (fn () (t/size (t/where (t/greater x y) x zero))))
+        (bench "greater+where relu grad (g*mask) 128x256" 200 (fn () (t/size (t/where (t/greater x zero) y zero))))
+        (bench "relu(y/y) mask workaround 128x256" 200 (fn () (t/size (t/mul y (t/relu (t/div x x))))))
+        (bench "sum-axis 0 128x256 f32" 200 (fn () (t/size (t/sum-axis 0 false x))))
+        (bench "sum-axis 0 784x256 f32" 100 (fn () (t/size (t/sum-axis 0 false w))))
+        (bench "sum-axis 1 128x256 f32" 200 (fn () (t/size (t/sum-axis 1 false x))))
+        (bench "sum-axis 1 of 8x32x256 f32" 100 (fn () (t/size (t/sum-axis 1 false c3))))
+        (bench "sum-axis 0 of 8x32x256 f32" 100 (fn () (t/size (t/sum-axis 0 false c3))))
+        (bench "sum-axis 2 of 8x32x256 f32" 100 (fn () (t/size (t/sum-axis 2 false c3))))
+        (bench "mean-axis 0 128x256 f64" 100 (fn () (t/size (t/mean-axis 0 false xd))))
+        (bench "maximum-axis 0 128x256 f32" 200 (fn () (t/size (t/maximum-axis 0 false x))))
+        (bench "minimum-axis 0 784x256 f32" 100 (fn () (t/size (t/minimum-axis 0 false w))))
+        (bench "bias grad: ones mmul 128x256" 200 (fn () (t/size (t/mmul (t/full [1 128] 1.0f32) x))))
+        (bench "sqrt via scalar map math/sqrt 784x256 f32" 50 (fn () (t/size (t/map (fn (v: f32) -> f32 (float (math/sqrt (double v)))) pos))))
+        (bench "sqrt via exp(log/2) 784x256 f32" 20 (fn () (t/size (t/exp (t/scale 0.5f32 (t/log pos))))))
+        (bench "neg 784x256 f32" 100 (fn () (t/size (t/neg w))))
+        (bench "square (mul x x) 784x256 f32" 100 (fn () (t/size (t/square w))))
+        (bench "abs via map 784x256 f32" 100 (fn () (t/size (t/map (fn (v: f32) (abs v)) w))))
+        (bench "mul 784x256 f32 (reference)" 200 (fn () (t/size (t/mul w w))))
+        0)))

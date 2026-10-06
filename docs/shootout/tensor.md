@@ -351,3 +351,29 @@ matmul path is unchanged (`multiply` calls `multiply-with` with code -1; 512 and
 - **`dense` for integer tensors** is not provided (the GEMM is f32/f64); `dense` on an empty inner dimension or without hardware FMA composes the unfused ops.
 - Cases 7083 and the older fma-reference cases (7077, 7078) compare against `fma-reference` bit for bit, so they pass on the host (FMA) target only: at `FIB_TARGET_CPU=x86-64-v2`
   7078 fails already at the base commit and 7083 fails the same way (7080, 7084, 7085 pass there).
+
+## 10. Package TP4: the gaps the autodiff benchmark found (2026-10-06)
+
+`docs/shootout/autodiff.md` found elementwise glue that cost more than the matrix products it surrounds. Each commit of the package closes one gap in `lib/fib/tensor`;
+the rows below are microseconds per call, **median of 5 samples** (a sample is 100 to 200 calls), one thread pinned to CPU 3 under `flock /tmp/fibsuite.lock`, `ulimit -v 16000000`,
+inputs 784x256 or 128x256 `f32` unless stated. Before: `scripts/bench/tensor/gaps-before.fib` (only the API of main); after: `scripts/bench/tensor/gaps.fib`.
+
+```sh
+~/.cache/fibber-scratch/t4/b.sh scripts/bench/tensor/gaps-before.fib gb   # F build SRC -I lib -o OUT, then flock /tmp/fibsuite.lock taskset -c 3 OUT
+~/.cache/fibber-scratch/t4/b.sh scripts/bench/tensor/gaps.fib ga
+```
+
+### 10.1 Vector sqrt, abs, sign, rsqrt (`fib.tensor.unary`)
+
+| 784x256 `f32` | before (us) | after (us) | ratio |
+|---|---|---|---|
+| `sqrt`: scalar `t/map` with `math/sqrt` (what `fib.autodiff` used) | 385.4 | 39.5 (`t/sqrt`) | 9.8x |
+| `sqrt`: `exp(log(x) / 2)` (the first version) | 1069.1 | 39.5 | 27x |
+| `abs`: scalar `t/map` | 374.8 | 38.8 (`t/abs`) | 9.7x |
+| `neg` (unchanged: a scalar map) | 360.8 | not changed | |
+| `rsqrt`, `sign` | no function | 61.1, 45.4 | |
+| `sqrt` of a transposed view (one extra pass) | | 193.97 | |
+| `sqrt` 784x256 `f64` | | 139.9 | |
+| `mul` (the reference elementwise pass) | 16.1 | 17.2 | |
+
+The vector `sqrt` is 2.3 times a `mul`: the output is zero-initialised before it is written (the same in every `fib.tensor` kernel here), which `mul`'s uninitialised-array path avoids.

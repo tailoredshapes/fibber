@@ -1,0 +1,59 @@
+;; Vector sqrt, rsqrt, abs and sign for f32 and f64 tensors, one pass and one allocation each, over simd/sqrt and simd/abs (no libm call, no closure).
+;;   sqrt   IEEE sqrt, correctly rounded: bit-identical to libm `sqrt` (f32: the f64 sqrt rounded to f32, which equals the f32 sqrt). sqrt of a
+;;          negative is NaN, sqrt(-0.0) is -0.0, sqrt(+inf) is +inf, sqrt(NaN) is NaN.
+;;   rsqrt  1/sqrt(x) as a correctly rounded sqrt followed by a correctly rounded division (two roundings, so within 1 ULP of the true value, not
+;;          always the correctly rounded 1/sqrt); rsqrt(+0.0) is +inf, rsqrt(-0.0) is -inf, rsqrt of a negative is NaN.
+;;   abs    clears the sign bit: abs(-0.0) is +0.0, abs(NaN) is NaN, exact.
+;;   sign   -1, +1, or x itself for a zero (so sign(-0.0) is -0.0) and for NaN (so sign(NaN) is NaN).
+;; `neg` and `square` already exist (fib.tensor.elementwise). A dense input is read straight from its buffer, eight (f32) or four (f64) lanes at a
+;; time with a masked tail; any other layout (view, broadcast) is first made contiguous, as the vector exp and log do.
+(ns fib.tensor.unary
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.views))
+
+(defun apply-f64 :private (op: i64 x: f64x4) -> f64x4
+  (cond (= op 0) (simd/sqrt x)
+        (= op 1) (fdiv (splat f64x4 1.0) (simd/sqrt x))
+        (= op 2) (simd/abs x)
+        :else (simd/blend (simd/gt x (splat f64x4 0.0)) (splat f64x4 1.0)
+                          (simd/blend (simd/lt x (splat f64x4 0.0)) (splat f64x4 -1.0) x))))
+
+(defun apply-f32 :private (op: i64 x: f32x8) -> f32x8
+  (cond (= op 0) (simd/sqrt x)
+        (= op 1) (fdiv (splat f32x8 1.0f32) (simd/sqrt x))
+        (= op 2) (simd/abs x)
+        :else (simd/blend (simd/gt x (splat f32x8 0.0f32)) (splat f32x8 1.0f32)
+                          (simd/blend (simd/lt x (splat f32x8 0.0f32)) (splat f32x8 -1.0f32) x))))
+
+(defun run-f64 :private (op: i64 x: (Tensor f64)) -> (Tensor f64)
+  (let ((d (contiguous x)) (n (fib.tensor.storage/size d)) (off (array-get (. d meta) 0)) (src (. d buffer))
+        (buf (cell (array (checked-size (shape d) 0.0) 0.0))))
+    (do (loop ((i 0))
+          (when (< i n)
+            (if (<= (+ i 4) n)
+                (let ((v: f64x4 (simd-load src (+ off i))))
+                  (do (simd-store! &buf i (apply-f64 op v)) (recur (+ i 4))))
+                (let ((v: f64x4 (simd-load-tail src (+ off i))))
+                  (simd-store-tail! &buf i (apply-f64 op v))))))
+        (from-array (shape d) @buf 0.0))))
+
+(defun run-f32 :private (op: i64 x: (Tensor f32)) -> (Tensor f32)
+  (let ((d (contiguous x)) (n (fib.tensor.storage/size d)) (off (array-get (. d meta) 0)) (src (. d buffer))
+        (buf (cell (array (checked-size (shape d) 0.0f32) 0.0f32))))
+    (do (loop ((i 0))
+          (when (< i n)
+            (if (<= (+ i 8) n)
+                (let ((v: f32x8 (simd-load src (+ off i))))
+                  (do (simd-store! &buf i (apply-f32 op v)) (recur (+ i 8))))
+                (let ((v: f32x8 (simd-load-tail src (+ off i))))
+                  (simd-store-tail! &buf i (apply-f32 op v))))))
+        (from-array (shape d) @buf 0.0f32))))
+
+(defprotocol UnaryLanes
+  (unary-lanes (self op: i64 x: (Tensor Self)) -> (Tensor Self)))
+(impl UnaryLanes f64 (unary-lanes (self op x) (run-f64 op x)))
+(impl UnaryLanes f32 (unary-lanes (self op x) (run-f32 op x)))
+
+(defun sqrt (x: (Tensor t)) :where ((Element t) (UnaryLanes t)) -> (Tensor t) (unary-lanes (. x seed) 0 x))
+(defun rsqrt (x: (Tensor t)) :where ((Element t) (UnaryLanes t)) -> (Tensor t) (unary-lanes (. x seed) 1 x))
+(defun abs (x: (Tensor t)) :where ((Element t) (UnaryLanes t)) -> (Tensor t) (unary-lanes (. x seed) 2 x))
+(defun sign (x: (Tensor t)) :where ((Element t) (UnaryLanes t)) -> (Tensor t) (unary-lanes (. x seed) 3 x))

@@ -229,6 +229,23 @@ NaN in gives NaN, `log 0 = -inf`, `log x<0 = NaN`, `tanh +-inf = +-1`,
 `FIB_TARGET_CPU=x86-64-v2` too) and `simd/bitcast` for 2^k and the exponent split. Results can differ from the scalar libm in the last place. A
 strided input is first made contiguous.
 
+## Vector sqrt, rsqrt, abs and sign
+
+`sqrt`, `rsqrt`, `abs` and `sign` map an `f64` or `f32` tensor to a fresh tensor of the same shape in one pass and one allocation
+(`fib.tensor.unary`): eight (`f32`) or four (`f64`) lanes at a time over `simd/sqrt` and `simd/abs`, a masked tail, no closure and no libm call.
+A dense input (including an offset slice) is read from its buffer; any other layout (a transposed view, a broadcast) is first made contiguous, as the
+vector `exp` does, so it costs one more pass. `neg` and `square` already existed (`neg` is a scalar map, `square` is `mul x x`).
+
+| Function | Result |
+|---|---|
+| `sqrt x` | IEEE `sqrt`, correctly rounded, so **bit-identical to libm** `sqrt` (an `f32` result equals the `f64` sqrt rounded to `f32`). A negative gives NaN, `sqrt(-0.0)` is `-0.0`, `sqrt(+inf)` is `+inf`, NaN gives NaN |
+| `rsqrt x` | `1 / sqrt(x)`: a correctly rounded sqrt then a correctly rounded division, two roundings (within 1 ULP of the true value, not always correctly rounded). `rsqrt(+0.0)` is `+inf`, `rsqrt(-0.0)` is `-inf`, a negative gives NaN |
+| `abs x` | clears the sign bit: `abs(-0.0)` is `+0.0`, NaN stays NaN, exact |
+| `sign x` | `-1.0` or `+1.0`; a zero gives itself (`sign(-0.0)` is `-0.0`) and NaN gives NaN |
+
+Case 7740 compares all four with scalar oracles bit for bit over 4096 pseudo-random bit patterns of every exponent (subnormals, infinities and NaNs
+included), the special values, every tail length 0 to 19, an offset slice, a transposed view and a broadcast; `scripts/mutant-tensor-gaps.sh` plants 9 faults in them.
+
 ## Fused dense layers and activations
 
 A neural-network layer is `activation(x * w + b)`. Written as `mmul`, `add`, `where`, it makes three
