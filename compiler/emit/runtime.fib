@@ -201,6 +201,7 @@
           (slot (getelementptr ptr @fib.fl cls2)))
       (store (load ptr slot) p)
       (store p slot)
+      (call @fib.lc-every)
       (ret)))
   (block plain (call @free p) (ret))
   (block large (call @fib.lc-put p) (ret)))
@@ -2740,6 +2741,20 @@
     (ret))
   (block plain
     (call @free p)
+    (call @fib.lc-tick)
+    (ret)))
+
+;; Every 256th small free while the program has one thread (fib.free-block's push, the only path that runs then): the decay check,
+;; so that a single-threaded server whose requests allocate only from the free lists still gives a spike's blocks back. A plain
+;; counter: the push path never runs once a second thread exists (fib.mt), and a thread's start orders it before that thread.
+(global internal fib.lc-count i32 (i32 256))
+(define internal (fib.lc-every void) ()
+  (block entry
+    (let ((c (sub (load i32 @fib.lc-count) (i32 1))))
+      (br (icmp eq c (i32 0)) check keep)))
+  (block keep (store c @fib.lc-count) (ret))
+  (block check
+    (store (i32 256) @fib.lc-count)
     (call @fib.lc-tick)
     (ret)))
 
