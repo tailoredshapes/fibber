@@ -71,6 +71,40 @@ FIB_TARGET_CPU=x86-64-v2 fibc build hello.fib -o hello
 
 Any other value is passed to LLVM as a CPU name with no extra features.
 
+## Projects and dependencies
+
+A project is a directory with a `deps.fib`; libraries come from git commits (or local directories). `fibc new`
+makes one:
+
+```
+fibc new hello                  # hello/deps.fib, src/hello/core.fib, src/main.fib, specs/hello-spec.fib
+cd hello
+fibc deps add acme/util --git https://github.com/acme/util.git --tag v1.2.0
+fibc run src/main.fib           # resolves, fetches, writes deps.lock; no -I needed
+fibc test                       # runs specs/*-spec.fib with the project's roots
+fibc deps tree
+```
+
+`deps.fib` is fibber data in the shape of Clojure's `deps.edn`:
+
+```clojure
+{:name "hello" :version "0.1.0"
+ :paths ["src"]
+ :deps {acme/util {:git/url "https://github.com/acme/util.git" :git/tag "v1.2.0"}
+        acme/json {:git/url "https://github.com/acme/json.git" :git/sha "<40-hex commit>"}
+        mine/x    {:local/root "../x"}}
+ :aliases {:test {:extra-paths ["specs"]}}}
+```
+
+Every command that compiles (`run`, `build`, `test`, `emit`, `explain`) finds `deps.fib` in the working directory or
+above, resolves it against `deps.lock` (commit it: it pins every commit and its git tree id) and adds the project's
+`:paths` and each library's to the module roots. The same library wanted at two commits is an error naming who
+asked for what (choose with `:override`); a tag that moved since it was locked is refused until `fibc deps update
+NAME`; two libraries defining one module are refused. `--locked` refuses a stale lock, `--offline` never fetches,
+`--frozen` is both. Checkouts are cached read-only under `~/.cache/fibber/git` (`$FIBBER_HOME`) and verified on
+every build. **A dependency's macros run at compile time** (like Rust's proc-macros): depend only on code you
+trust. Resolution itself runs only `git`. Design and limits: docs/design/packages.md.
+
 ## Editor
 
 `editors/vscode/` is a VS Code language pack for `.fib`: a TextMate grammar
