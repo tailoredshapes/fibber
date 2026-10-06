@@ -6,7 +6,7 @@
 ;;    heterogeneous values has no `Val` to put in them until fib.data, so it picks its own `d`.
 ;;  - Clojure's three-argument `(ex-info msg data cause)` is `ex-info-cause`: a function has one arity until L1.
 ;;  - `ex-cause` is `(Option (ExInfo d))`, Clojure's `nil` when there is no cause.
-(ns fib.ex)
+(ns fib.ex (:use fib.core fib.coll fib.datum))
 
 (defstruct (ExInfo d) (message: str data: d cause: (Option (ExInfo d))))
 (derive Eq ExInfo)
@@ -20,3 +20,109 @@
 (defun ex-data (e: (ExInfo d)) -> d (. e data))
 
 (defun ex-cause (e: (ExInfo d)) -> (Option (ExInfo d)) (. e cause))
+
+;; ---- stage 2: throw, try, catch, finally (docs/design/exceptions.md 4.2, stdlib §2.10 step 2, L28, S9; ADR 0009)
+;;
+;;   (try body.. (catch e handler..) (finally cleanup..))     catch and finally each optional, not both absent
+;;   (try body.. (catch pred e handler..))                    catches only when (pred e); else the failure goes on outwards
+;;   (throw (ex-info "bad input" (ex-data-of :field (->datum "age"))))
+;;
+;; A caught exception is an `Ex`, an `(ExInfo (Map keyword Datum))`: what `throw` threw, or for a trap (an index out of range, an overflow,
+;; `(trap msg)`, a failed `case`, ..) its message with the data `{:fib/kind (DStr KIND)}` (KIND one of "index" "overflow" "arith" "absent"
+;; "user", by the message). Fatal, never caught: out of memory, stack overflow, a thread that cannot start, a trap inside a `finally` run
+;; while unwinding, and a trap where a failure cannot be passed on (an async body, a def's initialiser, a `cell-update!` whose function
+;; fails, a function with an `array-take!`): those are the trap they were. `try` is a macro over the builtin `catch-run`: the body is a
+;; closure, so `recur` cannot leave it and `await` cannot be in it.
+
+
+
+;; The exception `try` catches and `throw` throws: the data is a map of keyword to Datum (fib.datum), Clojure's map of an `ex-info`.
+(defun ex (message: str) -> (ExInfo (Map keyword Datum)) (ExInfo message (map-empty) nil))
+
+;; `e` with the field `k` of its data set (`(ex-assoc (ex "bad") :field (->datum "age"))`).
+(defun ex-assoc (e: (ExInfo (Map keyword Datum)) k: keyword v: Datum) -> (ExInfo (Map keyword Datum))
+  (ExInfo (. e message) (assoc (. e data) k v) (. e cause)))
+
+;; The kind of a caught trap (its data's :fib/kind), nil for a thrown exception that has none.
+(defun ex-kind (e: (ExInfo (Map keyword Datum))) -> (Option str)
+  (match (get (. e data) :fib/kind) ((some d) (as-str d)) (nil nil)))
+
+(defun has-text? :private (s: str sub: str) -> bool
+  (let ((n (str-len s)) (m (str-len sub)))
+    (loop ((i 0))
+      (cond (> (+ i m) n) false
+            (= (subs s i (+ i m)) sub) true
+            :else (recur (+ i 1))))))
+
+;; The kind of a trap by its message (the messages are fixed by the cases): an index, an overflow, a zero divisor, nothing that matched.
+(defun trap-kind :private (m: str) -> str
+  (cond (has-text? m "out of range") "index"
+        (has-text? m "overflow") "overflow"
+        (has-text? m "by zero") "arith"
+        (or (has-text? m "no match") (has-text? m "unwrap")) "absent"
+        :else "user"))
+
+;; Throws `e`: the innermost `try` on this thread whose catch takes it gets it; with no catch active, the trap of its message (as before
+;; stage 2: on the main thread the program aborts, in a spawned task the task fails).
+(defun throw (e: (ExInfo (Map keyword Datum))) -> a
+  (if (catch-active?) (unsafe (throw-object e)) (trap (ex-message e))))
+
+;; What a `try` caught, for `catch-run`'s answer k (1: a trap, 2: a throw).
+(defun caught (k: i64) -> (ExInfo (Map keyword Datum))
+  (if (= k 1)
+      (let ((m (caught-message)))
+        (ExInfo m (assoc (map-empty) :fib/kind (DStr (trap-kind m))) nil))
+      (unsafe (caught-object))))
+
+;; The body's value, stored by the closure `try` ran.
+(defun try-value (r: (Cell (Option a))) -> a
+  (match @r ((some v) v) (nil (trap "try: the body stored no value"))))
+
+;; Runs a finally clause for an unwinding: no catch is active inside it and a trap there is fatal (decision of 2026-10-05).
+(defun run-finally (f: (fn () unit)) -> unit
+  (let ((d (finally-enter)))
+    (do (f) (finally-leave d))))
+
+;; `(try body.. (catch e handler..) (finally cleanup..))`; `(catch e :when cond handler..)` catches only when cond holds.
+(defmacro try (... forms)
+  (loop ((i 0) (body (vec-empty)) (handler (vec-empty)) (cleanup (vec-empty)))
+    (if (< i (vec-count forms))
+        (let ((f (vec-nth forms i)))
+          (match f
+            ((List xs)
+             (cond (and (> (vec-count xs) 2) (match (vec-nth xs 0) ((Sym n) (= n "catch")) (_ false))) (recur (+ i 1) body xs cleanup)
+                   (and (> (vec-count xs) 1) (match (vec-nth xs 0) ((Sym n) (= n "finally")) (_ false))) (recur (+ i 1) body handler xs)
+                   :else (recur (+ i 1) (vec-conj body f) handler cleanup)))
+            (_ (recur (+ i 1) (vec-conj body f) handler cleanup))))
+        (let ((r (gensym "try-r")) (k (gensym "try-k")) (x (gensym "try-x")) (fin (gensym "try-fin")))
+          (let ((caught
+                 (if (= (vec-count handler) 0)
+                     `(do ~@body)
+                     (let ((e (vec-nth handler 1))
+                           (guarded (and (> (vec-count handler) 4) (match (vec-nth handler 2) ((Kw n) (= n "when")) (_ false))))
+                           (hs (loop ((j (if (and (> (vec-count handler) 4) (match (vec-nth handler 2) ((Kw n) (= n "when")) (_ false))) 4 2)) (out (vec-empty)))
+                                 (if (< j (vec-count handler)) (recur (+ j 1) (vec-conj out (vec-nth handler j))) out))))
+                       `(let ((~r (fib.prelude/cell nil)))
+                          (let ((~k (catch-run (fn () (set! ~r (some (do ~@body)))))))
+                            (if (= ~k 0)
+                                (fib.ex/try-value ~r)
+                                (let ((~e (fib.ex/caught ~k)))
+                                  ~(if guarded `(if ~(vec-nth handler 3) (do ~@hs) (fib.ex/throw ~e)) `(do ~@hs))))))))))
+            (if (= (vec-count cleanup) 0)
+                (if (= (vec-count handler) 0) (trap "try: a catch or a finally clause is needed") caught)
+                (let ((cs (loop ((j 1) (out (vec-empty)))
+                            (if (< j (vec-count cleanup)) (recur (+ j 1) (vec-conj out (vec-nth cleanup j))) out))))
+                  `(let ((~fin (fn () (do ~@cs ()))))
+                     (let ((~r (fib.prelude/cell nil)))
+                       (let ((~k (catch-run (fn () (set! ~r (some ~caught))))))
+                         (if (= ~k 0)
+                             (do (~fin) (fib.ex/try-value ~r))
+                             (let ((~x (fib.ex/caught ~k)))
+                               (do (fib.ex/run-finally ~fin) (fib.ex/throw ~x))))))))))))))
+
+;; `(try-result body..)`: the body's value as `(Ok v)`, or `(Err e)` with what it threw or trapped (the bridge to `try-let`).
+(defmacro try-result (... body)
+  (let ((r (gensym "try-r")) (k (gensym "try-k")))
+    `(let ((~r (fib.prelude/cell nil)))
+       (let ((~k (catch-run (fn () (set! ~r (some (Ok (do ~@body))))))))
+         (if (= ~k 0) (fib.ex/try-value ~r) (Err (fib.ex/caught ~k)))))))

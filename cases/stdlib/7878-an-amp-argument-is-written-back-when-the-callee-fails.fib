@@ -1,0 +1,21 @@
+;; spec:   docs/design/exceptions.md 4.2 (stage 2), stdlib §2.10 step 2 (rows throw try catch finally); docs/adr/0009
+;; expect: accept
+;; result: 109
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; Test 8 of the design (decision of 2026-10-05): `bump` changes its `&` array, then traps; the caller's cell receives the callee's last
+;; state (element 0 is 7, element 1 was not reached) as a normal return would write it back, and nothing is freed twice or leaked. Killed by:
+;; scripts/mutant-catch.sh `no-write-back` (the private cell's content is neither written back nor freed: the old state and a leak).
+(ns main (:use fib.core fib.ex))
+
+(defun bump (&a: (Array i64) k: i64) -> unit
+  (do (array-set! &a 0 k)
+      (when (> k 2) (trap "bump failed"))
+      (array-set! &a 1 k)))
+
+(defun main () -> i64
+  (let ((c (cell (array 4 1))))
+    (do (bump &c 2)
+        (let ((r (try (do (bump &c 7) 0) (catch e 100))))
+          (+ r (+ (array-get @c 0) (array-get @c 1)))))))

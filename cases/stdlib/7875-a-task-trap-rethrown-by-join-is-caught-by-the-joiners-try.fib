@@ -1,0 +1,20 @@
+;; spec:   docs/design/exceptions.md 4.2 (stage 2), stdlib §2.10 step 2 (rows throw try catch finally); docs/adr/0009
+;; expect: accept
+;; result: 30
+;; audit:  abandoned
+;; leaks:  1
+;; stage:  2
+;; roots:  ../../lib support
+;; Test 5 of the design: a spawned task traps (its thread has no catch: the task fails, stage 1); `join` traps in the joiner with the task's
+;; message, and that trap unwinds to the joiner's try like any other; `try-join` still returns the failure as a Result. Killed by:
+;; scripts/mutant-catch.sh `catch-everywhere` (a trap unwinds even with no catch active on its thread: the task's trap reaches its thread's
+;; entry, which cannot pass it on, and the process aborts). The one leak is stage 1's: what the task that trapped "task boom" owned is
+;; abandoned (the same program with try-join in place of the try leaks the same one object, measured); the joiner's unwinding leaks
+;; nothing.
+(ns main (:use fib.core fib.ex fib.async))
+
+(defun main () -> i64
+  (let ((t (spawn (fn () (do (trap "task boom") 1)))))
+    (let ((a (try (join t) (catch e (if (= (ex-message e) "task boom") 10 0))))
+          (b (match (try-join (spawn (fn () (quot 7 0)))) ((Ok v) v) ((Err tr) 20))))
+      (+ a b))))

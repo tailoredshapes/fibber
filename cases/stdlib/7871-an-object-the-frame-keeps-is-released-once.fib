@@ -1,0 +1,22 @@
+;; spec:   docs/design/exceptions.md 4.2 (stage 2), stdlib §2.10 step 2 (rows throw try catch finally); docs/adr/0009
+;; expect: accept
+;; result: 125
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; Test 2 of the design (double release): `run` owns a string and a vector across a try whose body borrows them; the body traps with a
+;; message built from the string (an owned temporary argument of `trap`), the catch answers, the finally prints, and after the try the frame
+;; releases its own objects as on any path: each object is freed exactly once. Killed by: scripts/mutant-catch.sh `double-release` (the
+;; unwinding releases what the plan says twice: an audit error).
+(ns main (:use fib.core fib.ex))
+
+(defun risky (s: str n: i64) -> i64
+  (if (> n 2) (trap (str-concat "too big: " s)) (+ n (str-len s))))
+
+(defun run (n: i64) -> i64
+  (let ((s (str-concat "item-" (show n))) (v [n n n]))
+    (try (+ (risky s n) (count v))
+         (catch e (+ 100 (str-len (ex-message e))))
+         (finally (println (str-concat "done " s))))))
+
+(defun main () -> i64 (+ (run 1) (run 5)))

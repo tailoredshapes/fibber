@@ -1,0 +1,24 @@
+;; spec:   docs/design/exceptions.md 4.2 (stage 2), stdlib §2.10 step 2 (rows throw try catch finally); docs/adr/0009
+;; expect: accept
+;; result: 31
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; A caught trap is an exception whose data's :fib/kind names what failed: an index out of range, an integer overflow, a zero divisor,
+;; an unwrap of nil, a trap of the program; each is caught where it happened (an arithmetic builtin, the library's nth, a match).
+;; Killed by: scripts/mutant-catch.sh `no-catch`.
+(ns main (:use fib.core fib.ex))
+
+(defun big (n: i64) -> i64 (+ n 9223372036854775807))
+(defun divide (n: i64 d: i64) -> i64 (quot n d))
+(defun pick (n: i64) -> i64 (unwrap (if (= n 1) (some 10) nil)))
+
+(defun kind-of (f: (fn () i64)) -> str
+  (try (do (f) "none") (catch e (unwrap-or (ex-kind e) "?"))))
+
+(defun main () -> i64
+  (+ (if (= (kind-of (fn () (nth [1 2] 5))) "index") 1 0)
+     (+ (if (= (kind-of (fn () (big 1))) "overflow") 2 0)
+        (+ (if (= (kind-of (fn () (divide 1 0))) "arith") 4 0)
+           (+ (if (= (kind-of (fn () (pick 3))) "absent") 8 0)
+              (if (= (kind-of (fn () (trap "mine"))) "user") 16 0))))))
