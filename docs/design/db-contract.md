@@ -23,7 +23,7 @@ Rows come back as maps keyed by column label, every kind of `Datum` round-trippi
 parameters are bound and never spliced; `execute-one!` is the first row or nil; a statement without columns answers its update count;
 `with-transaction` commits on `Ok`, rolls back on `Err`, and rolls back a body that traps and lets the trap go on; errors carry SQLSTATE
 (`23505` unique, `23502` not null, class `42` syntax); a closed connection answers `08003` and closing twice is harmless; a connection
-works from another task after being used by this one.
+works from another task after being used by this one; `plan` walks the rows, stops when the consumer does and gives a failing statement as an Err.
 
 ## It can fail
 

@@ -216,15 +216,14 @@ Java's ~300 ns to 1 us. O1 measures it before anything is built on it.
 ### 4.1 Use (next.jdbc's shape)
 
 ```clojure
-(ns app.store (:require [fib.db :as db] [fib.sql :as sql]))
-(match (open-sqlite "/var/app/data.db")
-  ((Err e) (Err e))
-  ((Ok conn)
-   (with-transaction [tx conn]
-     (try-let [_ (execute! tx ["insert into people (name, age) values (?, ?)" name age])
-               r (execute-one! tx ["select id from people where name = ?" name])]
-       (Ok r)))))
-(execute! conn (format (sql {:select [:id :name] :from [:people] :where [:> :age min-age]})))
+(ns app.store (:require [fib.db :as db] [fib.sql :as sql] [sqlite :as sqlite]))   ; sqlite: the library fib-db-sqlite (4.10)
+(db/with-connection [conn (sqlite/open-sqlite "/var/app/data.db")]
+  (db/with-transaction [tx conn]
+    (try-let [_ (db/execute! tx ["insert into people (name, age) values (?, ?)" name age])
+              r (db/execute-one! tx ["select id from people where name = ?" name])]
+      (Ok r))))
+(db/execute! conn (sql/format (sql/sql {:select [:id :name] :from [:people] :where [:> :age min-age]})))
+(reduce f init (db/plan conn ["select id, name from people"]))      ; rows one by one, nothing materialised
 ```
 
 `execute!` returns `(Result (Vec (Map str Datum)) DbError)`; a statement without columns returns `[{"update-count" n}]`
@@ -266,14 +265,14 @@ A connection is an owned value; `conn-close` takes its handle out by compare-and
 and a closed connection answers `08003` instead of passing a freed pointer to C (scenario "a closed connection refuses work"; planted
 fault "closed flag never set" fails it). Statements in the prototype never outlive one `conn-execute` (prepare, bind, step, finalize on
 every path). D1's `with-connection` closes on every ordinary exit; when L12's scope-exit hook lands, `Connection` gets a drop impl and
-the macro becomes a convenience. What is not covered and cannot be without a catch: a TRAP between open and close abandons the handle
-(the OS closes the file at exit; a PostgreSQL socket is closed by the OS when the process ends, and the server rolls back).
+the macro becomes a convenience. A trap between open and close no longer abandons the handle: see 4.10 (`with-connection`).
 
 ### 4.6 Transactions, honestly
 
 `(with-transaction [tx conn] body)`: BEGIN; the body returns a `Result`; `Ok` commits (a failed COMMIT rolls back and returns its
-error), `Err` rolls back. Two scenarios check both (planted fault "rollback commits" fails one). A trap in the body: there is no
-unwinding, so `transact` cannot run ROLLBACK. Options:
+error), `Err` rolls back. Two scenarios check both (planted fault "rollback commits" fails one). A trap in the body: when this section
+was written there was no unwinding, so `transact` could not run ROLLBACK; since exceptions stage 2 (fibber v0.1.8) it does, see 4.10. The
+options considered then:
 
 - a. **`try-transact`** (D3): runs the body in a task with the connection moved in, `try-join`s it; on `Err (Trap ..)` the parent,
   which kept the driver's raw handle (an i64), issues ROLLBACK and closes it. The task's fibber objects are abandoned (the stage 1
@@ -283,11 +282,11 @@ unwinding, so `transact` cannot run ROLLBACK. Options:
   ends on a trap in `main` anyway.
 - c. Wait for stage 2 of exceptions (catch) and make `transact` unwind-safe then.
 
-Proposal: b by default (documented), a as `try-transact` in D3, c when it exists.
+Proposal then: b by default (documented), a as `try-transact` in D3, c when it exists. c exists; a is not needed.
 
 ### 4.7 Drivers
 
-- **SQLite** (D1, prototyped): the system `libsqlite3.so.0` through 21 externs (`lib/fib/db/sqlite/ffi.fib`); handles are i64 as
+- **SQLite** (D1; since 2026-10-07 the library fib-db-sqlite, 4.10): the system `libsqlite3.so.0` through 23 externs (`sqlite.ffi`); handles are i64 as
   `fib.http.client.ffi` does for libcurl; text and blobs bound with `SQLITE_TRANSIENT` so SQLite copies them before the C string is
   freed. All parameters fit registers, so no `:varargs :fixed` is needed (only `sqlite3_config` and `sqlite3_mprintf` are variadic,
   and neither is used). Darwin: the system libsqlite3 is present; the same externs.
@@ -325,6 +324,34 @@ The overhead is the prototype's: C strings built and read one byte at a time (`f
 slot per out-parameter, column names read per statement, a `Map` per row. D1 replaces them with a `memcpy`-based copy, a statement
 cache (no prepare per call) and names read once per statement; target: within 20% of C. Against a server (PostgreSQL over TCP, ~50 to
 100 us per round trip) the overhead is noise, as the brief expects.
+
+### 4.10 D1 as built, and the split of the SQLite driver (2026-10-07)
+
+- **Where things are.** The core (`fib.db`, `fib.db.core`), the Driver contract (`fib.db.contract`) and an in-memory fake driver
+  (`fib.db.memory`) are in fibber's library; their specs (`specs/db-*-spec.fib`) need no C library and run in the gate. The SQLite driver
+  is the library `fib-db-sqlite` in its own repository, `ssh://git@localhost:2222/tailoredshapes/fib-db-sqlite.git` (modules `sqlite`,
+  `sqlite.ffi`, `sqlite.stmt`; not `fib.db.sqlite`: a project's module may not have the name of a module of the bundled library, and the
+  v0.1.8 release bundles `fib.db.sqlite`), pulled in with `fibc deps add`. It runs the contract from `fib.db.contract` against itself.
+  Open question 3 is answered by this: C-library specs run in the driver's repository, not in fibber's gate.
+- **Traps.** `with-transaction` rolls back on a trap and re-raises it (contract scenario; case 7891). `with-connection` closes exactly
+  once on Ok, Err and trap (`specs/db-core-spec.fib`, planted: no close in the catch, a double close).
+- **`plan`.** `Connection` has a fourth method `conn-each` (rows to a callback, stop on false; the default walks `conn-execute`'s vector).
+  `(plan conn q)` is a `Reducible` of `(Result row DbError)`; reduce, run!, take, first and count work on it. SQLite overrides `conn-each`
+  with a cursor and releases the statement on every exit, a trap in the consumer included. Measured in the driver's spec: 100,000 rows
+  through `plan` leave the peak resident set (VmHWM) unchanged; `execute!` of the same rows raises it by 48 MB.
+- **Statement cache.** A bounded (32) LRU per connection, keyed by SQL text; a statement in use is busy, so the same text inside a walk
+  gets its own; DDL is not kept and drops the free ones. Measured as 4.9 measured it (200,000 operations, `:memory:`, three runs):
+
+| Operation | before (us/op) | after (us/op) | C, prepare per call | C, statement kept |
+|---|---|---|---|---|
+| insert, autocommit | 2.11, 1.79, 1.81 | 1.08, 1.01, 1.01 | 1.43 to 1.57 | 0.71 |
+| insert, one transaction | 1.44, 1.39, 1.39 | 0.64, 0.61, 0.60 | 1.00 to 1.04 | 0.30 |
+| select one row by id | 2.72, 2.77, 2.69 | 0.88, 0.85, 0.81 | 1.59 to 1.73 | 0.40 |
+| select 1 | 1.15, 1.15, 1.34 | 0.22, 0.23, 0.23 | | |
+
+  The target (within 20% of the C of 4.9, which prepares per call) is met with room: 40 to 50% below it. Against a C that also keeps its
+  statement the driver is about twice: what remains is a `Map` and a `Datum` vector per call and text copied byte by byte (fibber has no
+  pointer to an array's data, so no `memcpy`).
 
 ## 5. `fib.sql` (HoneySQL 2 in fibber)
 
@@ -418,12 +445,14 @@ tracer in their own configuration value (`fib.db` DataSource, `fib.http` server 
 
 - **fib.test specs and contracts.** An **Appender contract** (`specs/log-appender-contract.fib`: every record once and whole, 100
   records from 4 tasks arrive whole, fields in order) run against the memory sink and JSON lines through a pipe; a **Driver contract**
-  (`scripts/tests/db/driver-contract.fib`, 9 scenarios: types round trip, binding not splicing, execute-one!, update counts, commit,
-  rollback, SQLSTATE, close, use from another task) run against SQLite now and PostgreSQL in D2; an **Exporter contract** (O3) against
+  (`lib/fib/db/contract.fib`, 11 scenarios: types round trip, binding not splicing, execute-one!, plan, update counts, commit,
+  rollback, rollback on a trap, SQLSTATE, close, use from another task) run against the memory fake in fibber's gate, against SQLite
+  in its repository and against PostgreSQL in D2; `specs/db-contract-spec.fib` shows it can fail (4.10); an **Exporter contract** (O3) against
   the console exporter and OTLP to the fake receiver.
 - **Where they run.** Specs that need only libc are under `specs/` and run in the gate (`specs/log-spec.fib`, `specs/sql-spec.fib`).
-  Specs that need a C library run from a script (`scripts/test-db.sh`: `LD_PRELOAD=libsqlite3.so.0 fibc test scripts/tests/db`, then the
-  same spec built with `-l:libsqlite3.so.0`), as `scripts/test-http.sh` does for libcurl. A gate stage for them is open question 3.
+  Specs that need a C library run from a script (`scripts/test-http.sh` for libcurl; the SQLite driver's `scripts/test.sh` in its own
+  repository: `LD_PRELOAD=libsqlite3.so.0 fibc test`, then the same spec built with `-l:libsqlite3.so.0`). Open question 3 is answered: no C
+  library in fibber's gate.
 - **Real services.** PostgreSQL 17 and the OpenTelemetry Collector (contrib) in docker for D2 and O3, started by the test script with a
   random port and removed by it (`docker run --rm`), or downloaded binaries under `~/.cache/fibber-scratch/tools` where docker is absent
   (the Mac). The fake OTLP receiver (an in-process `fib.http.server`) is the unit-test path; the collector is the integration path
@@ -453,6 +482,8 @@ then O1 and C1 in parallel, then D2, O2, L2, O3, D3. Four agents can run L2, O1,
 (`fib.tls`) and `fib.time` are later packages of their own.
 
 ## 8. The prototype
+
+(As of 2026-10-07 the SQLite files and `scripts/test-db.sh` listed below live in the fib-db-sqlite repository, 4.10; this section is the record of the prototype.)
 
 Files (each under 500 lines, functions under 50):
 
@@ -511,7 +542,7 @@ Planted faults (each applied alone with `sed`, run, restored; scripts in `~/.cac
    template"). fib.log, fib.db and fib.sql now name their own functions bare in their templates and work through `:require` alone.
 2. **`Datum` vs `Val`.** Ship `fib.datum` now as the scalar value of these libraries, and make `Val` (when designed) a superset that
    embeds it? Or design `Val` first?
-3. **C-library specs in the gate.** A gate stage that runs `scripts/test-db.sh` (needs libsqlite3.so.0 on CI runners), or keep it a
+3. **C-library specs in the gate.** **Answered: no, they run in the driver repository (4.10).** A gate stage that runs `scripts/test-db.sh` (needs libsqlite3.so.0 on CI runners), or keep it a
    separate script like `test-http.sh`? Same question for docker-based PostgreSQL and collector tests.
 4. **A user sink that traps.** Accept "a sink must not trap" as a documented rule (the library's sinks do not), or pay a task per
    write for isolation until catch exists?
@@ -523,7 +554,7 @@ Planted faults (each applied alone with `sed`, run, restored; scripts in `~/.cac
 ## 10. Not done
 
 - No `fib.otel` code: sections 3 and 6.2's span cost are design and estimate only.
-- No PostgreSQL driver, no `fib.crypto`, no pool, no `plan`, no prepared-statement cache, no `try-transact`; no containers were started
+- No PostgreSQL driver, no `fib.crypto`, no pool, no `try-transact` (not needed since catch exists); `plan`, the statement cache and `with-connection` are done (4.10); no containers were started
   by this work (docker works; the host runs other, unrelated containers, which were not touched).
 - No file or async sink, no OTel log bridge.
 - fib.sql: only the clauses in the corpus; no `:inline`, `:cast`, `:case`, upsert, `Formatter` registry, or format timing.
