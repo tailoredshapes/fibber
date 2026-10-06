@@ -395,3 +395,21 @@ The vector `sqrt` is about 2.3 times a `mul`: the unary kernels allocate a zero-
 
 The first version of `where` built the lane mask with a loop of `with-lane`; it made `where` slower than before (119 us against 41 us for the select alone), and a vector literal
 of eight byte tests replaced it. The "after" column is the second version. The ratios of 2x and above are the ones to trust; the machine's noise on a repeat run was about 15%.
+
+### 10.3 Axis reductions (`fib.tensor.axis-lanes`)
+
+`f32`, 100 to 200 calls a sample. Before: the generic closure walk (`fold-planes` for a non-last axis). After: the lane kernel, **bit-identical** (case 7742 compares both over random data).
+
+| row | before (us) | after (us) | ratio |
+|---|---|---|---|
+| `sum-axis 0` 128x256 (the bias gradient) | 42.0 | 2.84 | 14.8x |
+| `sum-axis 0` 784x256 | 246.6 | 15.6 | 15.8x |
+| `sum-axis 1` of 8x32x256 | 89.1 | 6.3 | 14x |
+| `sum-axis 0` of 8x32x256 | 120.9 | 7.7 | 15.7x |
+| `mean-axis 0` 128x256 `f64` (through `sum-axis`) | 49.7 | 4.4 | 11x |
+| `maximum-axis 0` 128x256 | 56.0 | 3.3 | 17x |
+| `minimum-axis 0` 784x256 | 325.6 | 19.1 | 17x |
+| `sum-axis 1` 128x256 and `sum-axis 2` of 8x32x256 (last axis: unchanged, ordered chain) | 41.6 and 75.2 | 39.1 and 78.8 | none |
+| the workaround: row of ones times the matrix, `mmul` 128x256 | 7.1 | 7.2 | not changed |
+
+The 784x256 sum moves 0.8 MB in 15.6 us (51 GB/s: the matrix is in L2). The ordered contract needs no `sum-axis-fast` for these axes; for the last axis the dependent chain is the floor and the ordered result keeps it (a fast variant would be new API; not added).

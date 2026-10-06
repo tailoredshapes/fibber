@@ -1,6 +1,6 @@
 ;; Ordered scalar reductions. SIMD/reassociated reductions will use an explicit contract.
 (ns fib.tensor.reduce
-  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage))
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.axis-lanes))
 
 ;; A dense tensor's logical element i is the buffer element offset+i, so the walk skips the per-element index decode of `flat-at`
 ;; (which re-validates the descriptor each time); the buffer read is still bounds-checked and the order is the logical one.
@@ -76,5 +76,9 @@
                     (array-set! &buf i value))))))
         (from-array out-dims @buf initial))))
 
-(defun sum-axis (axis: i64 keepdims: bool x: (Tensor t)) :where ((Element t) (Num t)) -> (Tensor t)
-  (fold-axis (fn (a: t b: t) (+ a b)) (element-zero (. x seed)) axis keepdims x))
+;; f32 and f64 tensors that are dense with elements after the axis run the lane kernel of fib.tensor.axis-lanes (every output adds its slice in increasing index order, so
+;; the result is bit-for-bit the generic fold's); every other tensor takes the generic walk.
+(defun sum-axis (axis: i64 keepdims: bool x: (Tensor t)) :where ((Element t) (Num t) (AxisLanes t)) -> (Tensor t)
+  (if (lane-axis? axis x)
+      (lane-axis 0 axis keepdims x)
+      (fold-axis (fn (a: t b: t) (+ a b)) (element-zero (. x seed)) axis keepdims x)))

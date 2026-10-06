@@ -148,6 +148,18 @@ Empty-axis sum/product produce zero/one; extrema and mean trap on an empty
 reduction axis. `mean-axis` accepts `f64`. `fold-axis f initial axis keepdims
 tensor` supports a different accumulator dtype with an `Element` instance.
 
+**Lane kernels for the axis reductions** (`fib.tensor.axis-lanes`). `sum-axis`, `maximum-axis` and `minimum-axis` of a dense `f32` or `f64` tensor over an
+axis that has elements after it (`axis` is not the last, or the last of extent... precisely: the product of the later extents is above 1; `sum-axis 0` of a matrix,
+every axis but the last of a rank-3 tensor) view the tensor as `outer x extent x inner` and add row by row into a vector of `inner` accumulators, four vectors at
+a time, so a 784x256 sum reads each element once at memory speed. **The order contract is unchanged**: every output element still adds its slice in increasing
+axis index starting from `+0.0` (`acc = 0 + x0 + x1 + ...`), so the results are bit-for-bit those of the generic fold (case 7742 compares both over random data
+spanning 1e-3 to 1e6, negative zeros and NaNs, every column count around the 8 and 32 column blocks, every axis of rank 3). `maximum-axis` and `minimum-axis`
+replicate `(max acc x)` and `(min acc x)` exactly (a compare and blend, not `simd/max`): a NaN accumulator stays NaN, a NaN element makes the accumulator NaN,
+a tie takes the later element, so `max(+0.0, -0.0)` is `-0.0` and `max(-0.0, +0.0)` is `+0.0`. The generic walk is kept for the other cases: a tensor that is not
+dense (views, broadcasts), the last axis (`inner = 1`: one chain of dependent adds per output, which is the ordered contract), an empty axis, and the integer and
+boolean types (checked overflow). `mean-axis` (`f64`) takes the lane kernel through `sum-axis`. No `sum-axis-fast` was added: the ordered kernel already runs at the speed
+the reassociated one would have, since the vectors are across outputs, not along the axis.
+
 `argmax` and `argmin` return the first flat logical index on a tie and trap
 on empty input. They use ordinary comparisons: an initial NaN remains the
 winner, and a later NaN does not replace it. NumPy NaN behavior is not promised.
