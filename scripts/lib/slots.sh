@@ -4,7 +4,7 @@
 #   slots_init DIR N     (re)creates the N slot files and exports GATE_SLOTS=DIR
 #   slot_acquire         waits for a free slot and holds it in the current shell (descriptor SLOT_FD)
 #   slot_release         lets it go
-#   slots.sh CMD..       runs CMD while holding a slot; exit status is CMD's. A command already running under a slot (GATE_SLOT_HELD, set here)
+#   slots.sh CMD..       runs CMD at nice level GATE_NICE (default 10: the heavy work yields to the tests that have a clock, to others on the machine) while holding a slot; exit status is CMD's. A command already running under a slot (GATE_SLOT_HELD, set here)
 #                        runs at once: a program that a slot holder starts and that starts a fibc again must not wait for a second slot.
 slots_init() {
   GATE_SLOTS=$1; export GATE_SLOTS
@@ -27,7 +27,7 @@ slot_acquire() {
 slot_release() { [ -n "${SLOT_FD:-}" ] && exec {SLOT_FD}>&-; SLOT_FD=; return 0; }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   slot_acquire
-  GATE_SLOT_HELD=1 "$@"; rc=$?
+  if [ -n "${GATE_SLOTS:-}" ]; then GATE_SLOT_HELD=1 nice -n "${GATE_NICE:-10}" "$@"; rc=$?; else "$@"; rc=$?; fi
   slot_release
   exit $rc
 fi
