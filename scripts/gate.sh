@@ -68,11 +68,11 @@ dep_stamp() { (cd "$root" && find "$@" -type f 2> /dev/null | LC_ALL=C sort | xa
 skipped() {
   local name=$1; shift
   stamp=$(dep_stamp "$@")-$mode; [ "$incremental" -eq 1 ] || return 1
-  [ "$(cat "$GATE_OUT/stamps/$name" 2> /dev/null)" = "$stamp" ] || return 1
+  [ "$(cat "$GATE_OUT/stamps/$name.$mode" 2> /dev/null)" = "$stamp" ] || return 1
   echo "$name skipped (unchanged since PASS at $stamp)" > "$sd/$name.t"; touch "$sd/$name.ok"; return 0
 }
 # stage_done NAME: a stage that has passed (its .ok exists) keeps its stamp
-stage_done() { [ -f "$sd/$1.ok" ] && echo "$stamp" > "$GATE_OUT/stamps/$1"; echo "[$(elapsed "$t_all" "$(now)") s] stage $1 done ($([ -f "$sd/$1.ok" ] && echo ok || echo FAILED))"; }
+stage_done() { [ -f "$sd/$1.ok" ] && echo "$stamp" > "$GATE_OUT/stamps/$1.$mode"; echo "[$(elapsed "$t_all" "$(now)") s] stage $1 done ($([ -f "$sd/$1.ok" ] && echo ok || echo FAILED))"; }
 sfail() { echo "[$(elapsed "$t_all" "$(now)") s] $2" >> "$sd/$1.fail"; }
 
 stage_fixed() {
