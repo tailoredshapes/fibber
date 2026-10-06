@@ -102,6 +102,19 @@ timings+=("cases: $dirs")
 if [ "$code" -ne 0 ]; then fail "cases: ci-stage2.sh failed (the non-passing set differs from scripts/ci-stage2.expected, or a directory timed out)"; fi
 timings+=("cases total $(elapsed "$t0" "$(now)") s")
 
+# The case-count floor (scripts/case-floor.expected): a directory that runs fewer cases than its floor fails the gate; the stdlib floor applies to
+# the full run only (the quick gate runs a sample).
+{
+  while read -r d n; do
+    case $d in ''|'#'*) continue ;; esac
+    [ "$d" = stdlib ] && [ -n "$sample" ] && continue
+    got=$(awk -v want="cases/$d" '/^== / { cur=$4 } /^[0-9]+ cases:/ { if (cur == want) { print $1; exit } }' "$out/ci-stage2.log")
+    if [ -z "$got" ] || [ "$got" -lt "$n" ]; then
+      fail "cases: cases/$d ran ${got:-no} cases, the floor is $n (scripts/case-floor.expected): a merge may have lost cases"
+    fi
+  done < "$here/case-floor.expected"
+}
+
 # The specs (fib.test, docs/design/test-harness.md 6.5): `F test specs`, deterministic (--seed 1), every scenario must hold. Not compared with
 # scripts/ci-stage2.expected: a failing spec is a regression, not a known gap. Full gate, or GATE_SPECS=1 for a quick one; skipped when there is no specs/.
 if { [ "$mode" = full ] || [ "${GATE_SPECS:-0}" = 1 ]; } && [ -d specs ]; then
