@@ -1,0 +1,187 @@
+;; fib.json.parse: the DOM parser (docs/design/json.md 2a). Recursive descent over the bytes of a `str`; the position and the failure code are
+;; in/out cells, so a value costs no tuple and no `Result`; an error sets the code, every caller unwinds by returning JNull, and `parse` turns
+;; the code and the position into a `JsonError` at the top. Strings are validated as UTF-8 while they are scanned (a `str` made of
+;; arbitrary bytes is untrusted here), escapes decode into a byte buffer, a string with no escape is one slice.
+;;   (parse s)  (parse-with s opts)  -> (Result Json JsonError)         (parse-bytes bytes) likewise
+(ns fib.json.parse (:use fib.core fib.seq fib.coll fib.json.types fib.json.number fib.json.buffer fib.json.utf8))
+
+(defun skip-ws (s: str n: i64 i: i64) -> i64
+  (loop [k i] (let [b (at s n k)] (if (or (= b 32) (or (= b 10) (or (= b 13) (= b 9)))) (recur (+ k 1)) k))))
+
+(defun push-cp (&buf: (Array i8) &len: i64 c: i64) -> unit
+  (cond (< c 128) (put-byte &buf &len c)
+        (< c 2048) (do (put-byte &buf &len (+ 192 (shr c 6))) (put-byte &buf &len (+ 128 (bit-and c 63))))
+        (< c 65536) (do (put-byte &buf &len (+ 224 (shr c 12))) (put-byte &buf &len (+ 128 (bit-and (shr c 6) 63)))
+                        (put-byte &buf &len (+ 128 (bit-and c 63))))
+        :else (do (put-byte &buf &len (+ 240 (shr c 18))) (put-byte &buf &len (+ 128 (bit-and (shr c 12) 63)))
+                  (put-byte &buf &len (+ 128 (bit-and (shr c 6) 63))) (put-byte &buf &len (+ 128 (bit-and c 63))))))
+
+(defun hex4 (s: str n: i64 i: i64) -> i64
+  (loop [k 0 v 0]
+    (if (= k 4) v
+        (let [c (at s n (+ i k))
+              d (cond (and (>= c 48) (<= c 57)) (- c 48)
+                      (and (>= c 97) (<= c 102)) (- c 87)
+                      (and (>= c 65) (<= c 70)) (- c 55)
+                      :else -1)]
+          (if (< d 0) -1 (recur (+ k 1) (+ (* v 16) d)))))))
+
+;; After a backslash at i - 1 (i the escape letter): decode it into buf and answer the index after it, or -1 with fail set.
+(defun decode-escape (s: str n: i64 i: i64 &buf: (Array i8) &len: i64 &pos: i64 &fail: i64) -> i64
+  (let [c (at s n i)
+        simple (cond (= c 34) 34 (= c 92) 92 (= c 47) 47 (= c 98) 8 (= c 102) 12 (= c 110) 10 (= c 114) 13 (= c 116) 9 :else -1)]
+    (cond (>= simple 0) (do (put-byte &buf &len simple) (+ i 1))
+          (= c 117)
+          (let [u (hex4 s n (+ i 1))]
+            (cond (< u 0) (do (fail-at &pos &fail e-escape (- i 1)) -1)
+                  (and (>= u 55296) (< u 56320))
+                  (let [u2 (if (and (= (at s n (+ i 5)) 92) (= (at s n (+ i 6)) 117)) (hex4 s n (+ i 7)) -1)]
+                    (if (and (>= u2 56320) (< u2 57344))
+                        (do (push-cp &buf &len (+ 65536 (+ (shl (- u 55296) 10) (- u2 56320)))) (+ i 11))
+                        (do (fail-at &pos &fail e-surrogate (- i 1)) -1)))
+                  (and (>= u 56320) (< u 57344)) (do (fail-at &pos &fail e-surrogate (- i 1)) -1)
+                  :else (do (push-cp &buf &len u) (+ i 5))))
+          (= c -1) (do (fail-at &pos &fail e-eof i) -1)
+          :else (do (fail-at &pos &fail e-escape (- i 1)) -1))))
+
+;; The rest of a string that has an escape: from index `from` (a backslash); `start` is where the string began. Plain runs are copied whole.
+(defun string-slow (s: str n: i64 start: i64 from: i64 &pos: i64 &fail: i64) -> str
+  (let [buf (cell (new-buffer (* 2 (- from start)))) len (cell 0)]
+    (do (put-slice &buf &len s start from)
+        (loop [i from run from]
+          (let [b (at s n i)]
+            (cond (= b 34) (do (put-slice &buf &len s run i) (set! pos (+ i 1)) (buffer-str @buf @len))
+                  (= b 92) (let [_ (put-slice &buf &len s run i)
+                                 j (decode-escape s n (+ i 1) &buf &len &pos &fail)]
+                             (if (< j 0) "" (recur j j)))
+                  (= b -1) (do (fail-at &pos &fail e-eof i) "")
+                  (< b 32) (do (fail-at &pos &fail e-control i) "")
+                  :else (recur (+ i 1) run)))))))
+
+;; A string; pos is just after the opening quote.
+(defun scan-string (s: str n: i64 &pos: i64 &fail: i64) -> str
+  (let [start @pos]
+    (loop [i start]
+      (let [b (at s n i)]
+        (cond (= b 34) (do (set! pos (+ i 1)) (str-slice s start i))
+              (= b 92) (string-slow s n start i &pos &fail)
+              (= b -1) (do (fail-at &pos &fail e-eof i) "")
+              (< b 32) (do (fail-at &pos &fail e-control i) "")
+              :else (recur (+ i 1)))))))
+
+(defun literal (s: str n: i64 &pos: i64 &fail: i64 word: str v: Json) -> Json
+  (let [a @pos m (str-len word)]
+    (loop [k 0]
+      (cond (= k m) (do (set! pos (+ a m)) v)
+            (= (at s n (+ a k)) (zext i64 (str-byte-at word k))) (recur (+ k 1))
+            :else (do (fail-at &pos &fail (if (>= (+ a k) n) e-eof e-unexpected) (+ a k)) JNull)))))
+
+;; ---- arrays and objects
+
+(defun parse-array (s: str n: i64 &pos: i64 &fail: i64 depth: i64 o: JsonOptions) -> Json
+  (let [i (skip-ws s n (+ @pos 1))]
+    (if (= (at s n i) 93)
+        (do (set! pos (+ i 1)) (JArr []))
+        (do (set! pos i)
+            (loop [items: (Vec Json) []]
+              (let [v (parse-value s n &pos &fail depth o)]
+                (if (!= @fail 0) JNull
+                    (let [j (skip-ws s n @pos) c (at s n j)]
+                      (cond (= c 44) (do (set! pos (skip-ws s n (+ j 1))) (recur (conj items v)))
+                            (= c 93) (do (set! pos (+ j 1)) (JArr (conj items v)))
+                            :else (do (fail-at &pos &fail (if (= c -1) e-eof e-unexpected) j) JNull))))))))))
+
+;; Where `k` is among the first `m` keys, or -1 (a scan: objects are mostly small; see add-pair for the index of large ones).
+(defun find-key (keys: (Vec str) k: str) -> i64
+  (let [m (count keys)]
+    (loop [i 0] (cond (>= i m) -1 (str-eq (nth keys i) k) i :else (recur (+ i 1))))))
+
+;; The object so far: keys and values in source order, and a key index (empty until the object has 16 keys).
+(defstruct ObjAcc (keys: (Vec str) vals: (Vec Json) idx: (Map str i64)))
+
+(defun get-or (m: (Map str i64) k: str d: i64) -> i64 (if-some [x (get m k)] x d))
+
+(defun index-keys (keys: (Vec str)) -> (Map str i64)
+  (loop [i 0 m: (Map str i64) {}] (if (< i (count keys)) (recur (+ i 1) (assoc m (nth keys i) i)) m)))
+
+(defun key-index (acc: ObjAcc k: str dups: i64) -> i64
+  (cond (= dups 1) -1
+        (> (count (. acc keys)) 16) (get-or (. acc idx) k -1)
+        :else (find-key (. acc keys) k)))
+
+(defun add-pair (acc: ObjAcc at: i64 k: str v: Json) -> ObjAcc
+  (let [m (count (. acc keys))]
+    (cond (>= at 0) (ObjAcc (. acc keys) (assoc (. acc vals) at v) (. acc idx))
+          (> m 15) (ObjAcc (conj (. acc keys) k) (conj (. acc vals) v) (assoc (if (= m 16) (index-keys (. acc keys)) (. acc idx)) k m))
+          :else (ObjAcc (conj (. acc keys) k) (conj (. acc vals) v) (. acc idx)))))
+
+;; At the opening quote of a key.
+(defun parse-member (s: str n: i64 &pos: i64 &fail: i64 depth: i64 o: JsonOptions acc: ObjAcc) -> ObjAcc
+  (do (set! pos (+ @pos 1))
+      (let [k (scan-string s n &pos &fail)]
+        (if (!= @fail 0) acc
+            (let [j (skip-ws s n @pos)]
+              (if (!= (at s n j) 58)
+                  (do (fail-at &pos &fail (if (>= j n) e-eof e-unexpected) j) acc)
+                  (let [kpos @pos
+                        _ (set! pos (skip-ws s n (+ j 1)))
+                        v (parse-value s n &pos &fail depth o)
+                        at (key-index acc k (. o duplicates))]
+                    (cond (!= @fail 0) acc
+                          (and (>= at 0) (= (. o duplicates) 2)) (do (fail-at &pos &fail e-duplicate kpos) acc)
+                          :else (add-pair acc at k v)))))))))
+
+(defun parse-object (s: str n: i64 &pos: i64 &fail: i64 depth: i64 o: JsonOptions) -> Json
+  (let [i (skip-ws s n (+ @pos 1))
+        e (ObjAcc [] [] {})]
+    (if (= (at s n i) 125)
+        (do (set! pos (+ i 1)) (JObj [] []))
+        (do (set! pos i)
+            (loop [acc e]
+              (if (!= (at s n @pos) 34)
+                  (do (fail-at &pos &fail (if (>= @pos n) e-eof e-unexpected) @pos) JNull)
+                  (let [acc2 (parse-member s n &pos &fail depth o acc)]
+                    (if (!= @fail 0) JNull
+                        (let [j (skip-ws s n @pos) c (at s n j)]
+                          (cond (= c 44) (do (set! pos (skip-ws s n (+ j 1))) (recur acc2))
+                                (= c 125) (do (set! pos (+ j 1)) (JObj (. acc2 keys) (. acc2 vals)))
+                                :else (do (fail-at &pos &fail (if (= c -1) e-eof e-unexpected) j) JNull)))))))))))
+
+(defun parse-value (s: str n: i64 &pos: i64 &fail: i64 depth: i64 o: JsonOptions) -> Json
+  (let [c (at s n @pos)]
+    (cond (= c 34) (do (set! pos (+ @pos 1)) (let [x (scan-string s n &pos &fail)] (if (!= @fail 0) JNull (JStr x))))
+          (or (= c 45) (and (>= c 48) (<= c 57))) (scan-number s n &pos &fail (. o numbers) (. o out-of-range))
+          (= c 123) (if (>= depth (. o max-depth)) (do (fail-at &pos &fail e-depth @pos) JNull) (parse-object s n &pos &fail (+ depth 1) o))
+          (= c 91) (if (>= depth (. o max-depth)) (do (fail-at &pos &fail e-depth @pos) JNull) (parse-array s n &pos &fail (+ depth 1) o))
+          (= c 116) (literal s n &pos &fail "true" (JBool true))
+          (= c 102) (literal s n &pos &fail "false" (JBool false))
+          (= c 110) (literal s n &pos &fail "null" JNull)
+          (= c -1) (do (fail-at &pos &fail e-eof @pos) JNull)
+          :else (do (fail-at &pos &fail e-unexpected @pos) JNull))))
+
+;; ---- entry points
+
+(defun parse-with (s: str o: JsonOptions) -> (Result Json JsonError)
+  (let [n (str-len s)]
+    (if (> n (. o max-size))
+        (Err (make-error s e-size 0))
+        (let [pos (cell 0)
+              fail (cell 0)
+              bom (and (>= n 3) (and (= (at s n 0) 239) (and (= (at s n 1) 187) (= (at s n 2) 191))))
+              _ (set! pos (if (and bom (. o bom)) 3 0))
+              _ (set! pos (skip-ws s n @pos))
+              v (if (and bom (not (. o bom))) (do (set! fail e-bom) JNull) (parse-value s n &pos &fail 0 o))]
+          (if (!= @fail 0)
+              (Err (make-error s @fail @pos))
+              (let [e (skip-ws s n @pos)]
+                (if (< e n) (Err (make-error s e-trailing e)) (Ok v))))))))
+
+(defun parse (s: str) -> (Result Json JsonError) (parse-with s (default-options)))
+
+(defun parse-bytes-with (b: (Array i8) o: JsonOptions) -> (Result Json JsonError)
+  (let [bad (first-invalid b)]
+    (if (>= bad 0)
+        (Err (make-error-bytes b e-utf8 bad))
+        (parse-with (str-from-bytes b) o))))
+
+(defun parse-bytes (b: (Array i8)) -> (Result Json JsonError) (parse-bytes-with b (default-options)))

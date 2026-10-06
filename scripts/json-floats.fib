@@ -1,0 +1,103 @@
+;; scripts/json-floats.fib: verifies fib.json's float parser and printer against libc (docs/design/json.md 3, 4). Run by scripts/json-floats.sh.
+;;   json-floats N         N random decimal texts of every shape (1 to 19 digits, a dot anywhere, exponents of every size) and N doubles of uniformly random bits
+;;                         (and their neighbours): each text is parsed by fib.json and by strtod and the bits compared; each double is written by fib.json,
+;;                         read back by strtod and compared; the printed text must also be the same length as Python's repr or shorter is checked by the script.
+;;   json-floats FILE      each line is `TEXT HEXBITS` (python's float(TEXT).hex bits): the corpus of halfway cases and boundaries (scripts/json-floats.py)
+;; Prints one line per check with the number of cases and the number that disagreed; exits 1 on any disagreement.
+(ns main (:use fib.core fib.seq fib.coll fib.json.types fib.json.parse fib.json.write) (:require [fib.json.libc :as libc] [fib.json.number :as num] [fib.string :as string]))
+
+(defun next-rand (s: i64) -> i64
+  ;; xorshift64*: wrapping, deterministic
+  (let [a (bit-xor s (shr s 12)) b (bit-xor a (shl a 25)) c (bit-xor b (shr b 27))]
+    c))
+
+(defun rnd-out (s: i64) -> i64 (unchecked-multiply s 2685821657736338717))
+
+(defun strtod-str (t: str) -> f64 (num/strtod-token t 0 (str-len t)))
+
+(defun digit-text (&st: i64 n: i64) -> str
+  (loop [i 0 out ""]
+    (if (= i n) out
+        (do (set! st (next-rand @st))
+            (recur (+ i 1) (str out (rem (shr (rnd-out @st) 40) 10)))))))
+
+(defun rand-text (&st: i64) -> str
+  (let [_ (set! st (next-rand @st))
+        r (shr (rnd-out @st) 33)
+        nd (+ 1 (rem r 19))
+        digits (digit-text &st nd)
+        dot (rem (shr r 5) (+ nd 1))
+        mant (if (= (rem (shr r 9) 3) 0) digits (str (str-slice digits 0 dot) "." (if (= dot nd) "0" (str-slice digits dot nd))))
+        ek (rem (shr r 11) 8)
+        e (- (rem (shr r 15) 700) 350)
+        ex (cond (= ek 0) "" (< ek 5) (str "e" (rem e 40)) :else (str "E" e))]
+    (str mant ex)))
+
+(defun parse-bits (t: str) -> i64
+  (match (parse-with t (JsonOptions 8 1000 0 0 false true))
+    ((Ok (JFloat f)) (f64->bits f))
+    ((Ok (JInt i)) (f64->bits (double i)))
+    (_ -1)))
+
+(defun check-texts (n: i64 seed: i64) -> i64
+  (let [st (cell seed)]
+    (loop [i 0 bad 0 tested 0]
+      (if (= i n)
+          (do (println "random decimal texts:" tested "compared with strtod," bad "differ") bad)
+          (let [t (rand-text &st)
+                want (f64->bits (strtod-str t))
+                got (parse-bits t)
+                ;; a text that is an integer in range reads as an i64: compare through double only when the double is exactly that integer
+                skip (and (= got -1) false)]
+            (if (= want got)
+                (recur (+ i 1) bad (+ tested 1))
+                (do (when (< bad 10) (println "  MISMATCH" t "want" want "got" got))
+                    (recur (+ i 1) (+ bad 1) (+ tested 1)))))))))
+
+(defun fmt-double (x: f64) -> str (write (JFloat x)))
+
+(defun check-doubles (n: i64 seed: i64) -> i64
+  (let [st (cell seed)]
+    (loop [i 0 bad 0 tested 0]
+      (if (= i n)
+          (do (println "random doubles written, read back by strtod:" tested "cases," bad "differ") bad)
+          (let [_ (set! st (next-rand @st))
+                bits (rnd-out @st)
+                x (bits->f64 bits)]
+            (if (!= (- x x) 0.0)
+                (recur (+ i 1) bad tested)
+                (let [t (fmt-double x)
+                      back (strtod-str t)
+                      back2 (parse-bits t)]
+                  (if (and (= (f64->bits back) bits) (= back2 bits))
+                      (recur (+ i 1) bad (+ tested 1))
+                      (do (when (< bad 10) (println "  MISMATCH" t "bits" bits "strtod" (f64->bits back) "fib" back2))
+                          (recur (+ i 1) (+ bad 1) (+ tested 1)))))))))))
+
+(defun hex-bits (h: str) -> i64
+  (loop [k 0 v 0]
+    (if (= k (str-len h)) v
+        (let [c (zext i64 (str-byte-at h k))] (recur (+ k 1) (bit-or (shl v 4) (if (< c 58) (- c 48) (- c 87))))))))
+
+(defun check-file (path: str) -> i64
+  (if-some [txt (read-file path)]
+    (let [lines (filter (fn (l: str) (> (str-len l) 0)) (vec (string/split txt "\n")))
+          bad (loop [i 0 bad 0]
+                (if (= i (count lines)) bad
+                    (let [l (nth lines i)
+                          sp (if-some [k (str-find l " " 0)] k 0)
+                          t (str-slice l 0 sp)
+                          want (hex-bits (str-slice l (+ sp 1) (str-len l)))
+                          got (parse-bits t)]
+                      (if (= want got) (recur (+ i 1) bad)
+                          (do (when (< bad 10) (println "  MISMATCH" t "want" want "got" got)) (recur (+ i 1) (+ bad 1)))))))]
+      (do (println "corpus" path ":" (count lines) "cases," bad "differ") bad))
+    (do (println "cannot read" path) 1)))
+
+(defun main () -> i64
+  (let [a (args)
+        arg (nth a 0)]
+    (if-some [n (parse-long arg)]
+      (if (= 0 (+ (check-texts n 88172645463325252) (check-doubles n 1234567)))
+          0 1)
+      (if (= 0 (check-file arg)) 0 1))))

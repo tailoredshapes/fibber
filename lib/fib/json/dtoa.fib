@@ -1,0 +1,39 @@
+;; fib.json.dtoa: a double as the shortest decimal text that reads back as the same double (docs/design/json.md 4). First version: the
+;; exact method, `%.15g`, `%.16g`, `%.17g` through snprintf with the first that strtod reads back to the same bits; the language's own
+;; printer (`str`) is shortest too but measured at several microseconds a float (docs/shootout/json.md).
+(ns fib.json.dtoa (:use fib.core fib.seq fib.coll fib.json.buffer) (:require [fib.json.libc :as libc]))
+
+;; The C string "%.<p>g".
+(defun format-string (p: i64) -> ptr
+  (unsafe
+    (let [f (alloc 8)]
+      (do (store-i8 (ptr+ f 0) 37i8) (store-i8 (ptr+ f 1) 46i8)
+          (store-i8 (ptr+ f 2) (trunc i8 (+ 48 (quot p 10)))) (store-i8 (ptr+ f 3) (trunc i8 (+ 48 (rem p 10))))
+          (store-i8 (ptr+ f 4) 103i8) (store-i8 (ptr+ f 5) 0i8)
+          f))))
+
+;; Writes the text of x (finite) into out (at least 40 bytes) and answers its length.
+(defun shortest-text (x: f64 out: ptr) -> i64
+  (unsafe
+    (let [e (alloc 8)
+          r (loop [p 15]
+              (let [f (format-string p)
+                    n (zext i64 (libc/snprintf out 40 f x))
+                    _ (free f)
+                    back (libc/strtod out e)]
+                (if (or (= p 17) (= (f64->bits back) (f64->bits x))) n (recur (+ p 1)))))]
+      (do (free e) r))))
+
+(defun put-f64 (&buf: (Array i8) &len: i64 x: f64) -> unit
+  (if (!= (- x x) 0.0)
+      (put-str &buf &len "null")
+      (unsafe
+        (let [out (alloc 48)
+              n (shortest-text x out)
+              plain (loop [k 0] (cond (>= k n) true
+                                      (let [c (zext i64 (load-i8 (ptr+ out k)))] (or (= c 46) (or (= c 101) (= c 69)))) false
+                                      :else (recur (+ k 1))))]
+          (do (ensure &buf &len (+ n 3))
+              (loop [k 0] (when (< k n) (do (put-raw &buf &len (zext i64 (load-i8 (ptr+ out k)))) (recur (+ k 1)))))
+              (when plain (do (put-raw &buf &len 46) (put-raw &buf &len 48)))
+              (free out))))))

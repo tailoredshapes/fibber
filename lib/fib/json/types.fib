@@ -1,0 +1,73 @@
+;; fib.json.types: the data model of fib.json (docs/design/json.md 1). `Json` is a closed sum: null, bool, i64, f64, a number kept as text
+;; (`JBig`: an integer outside i64, or any non-i64 number when the options ask for raw numbers), a string, an array and an object whose
+;; keys keep their source order (parallel vectors: lookup is a scan of `keys`, fib.json.access).
+(ns fib.json.types (:use fib.core fib.seq fib.coll))
+
+(defenum Json
+  (JNull)
+  (JBool b: bool)
+  (JInt i: i64)
+  (JFloat f: f64)
+  (JBig text: str)
+  (JStr s: str)
+  (JArr items: (Vec Json))
+  (JObj keys: (Vec str) vals: (Vec Json)))
+
+(derive Eq Json)
+(derive Debug Json)
+(derive Show Json)
+
+;; A parse failure as a value: a stable code, the message of the code, the byte offset, and the 1-based line and column (columns count bytes).
+(defstruct JsonError (code: i64 message: str offset: i64 line: i64 column: i64))
+(derive Eq JsonError)
+(derive Debug JsonError)
+
+;; max-depth: nesting limit (default 1024). max-size: refuse longer input (default 1 GiB).
+;; duplicates: 0 the last value wins, at the key's first position (default); 1 keep every pair; 2 an error.
+;; numbers: 0 i64 when integral and in range, else f64 (default); 1 as 0 but an integer outside i64 is `JBig` text; 2 every number that is not an i64 is `JBig` text.
+;; bom: skip a leading UTF-8 byte order mark (default false: it is an error, as RFC 8259 permits).
+;; out-of-range: false (default) a number that overflows f64 (1e400) is an error; true it reads as an infinity.
+(defstruct JsonOptions (max-depth: i64 max-size: i64 duplicates: i64 numbers: i64 bom: bool out-of-range: bool))
+
+(defun default-options () -> JsonOptions (JsonOptions 1024 1073741824 0 0 false false))
+
+(def e-unexpected: i64 1)
+(def e-eof: i64 2)
+(def e-number: i64 3)
+(def e-escape: i64 4)
+(def e-control: i64 5)
+(def e-utf8: i64 6)
+(def e-depth: i64 7)
+(def e-trailing: i64 8)
+(def e-surrogate: i64 9)
+(def e-size: i64 10)
+(def e-duplicate: i64 11)
+(def e-range: i64 12)
+(def e-bom: i64 13)
+(def e-expected: i64 14)
+
+(defun error-message (code: i64) -> str
+  (cond (= code 1) "unexpected character"
+        (= code 2) "unexpected end of input"
+        (= code 3) "malformed number"
+        (= code 4) "bad escape sequence"
+        (= code 5) "control character in string"
+        (= code 6) "invalid UTF-8"
+        (= code 7) "nesting too deep"
+        (= code 8) "content after the document"
+        (= code 9) "unpaired surrogate escape"
+        (= code 10) "input too large"
+        (= code 11) "duplicate object key"
+        (= code 12) "number out of range"
+        (= code 13) "byte order mark"
+        (= code 14) "expected a different character"
+        :else "error"))
+
+;; The error for `code` at byte `offset` of `s`: line and column are found by one scan, only on this (failing) path.
+(defun make-error (s: str code: i64 offset: i64) -> JsonError
+  (let [n (str-len s)
+        stop (min offset n)]
+    (loop [i 0 line 1 col 1]
+      (if (< i stop)
+          (if (= (str-byte-at s i) 10i8) (recur (+ i 1) (+ line 1) 1) (recur (+ i 1) line (+ col 1)))
+          (JsonError code (error-message code) offset line col)))))
