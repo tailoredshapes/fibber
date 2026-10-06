@@ -1,0 +1,74 @@
+;; compiler/pkg/deps-cmd.fib: `fibc deps tree|fetch|update|add|path` (docs/design/packages.md §5). Each runs in the project found from the
+;; working directory upwards; `--locked`, `--offline` and `--frozen` are taken as for build. Exit status 0, 2 for usage or no project,
+;; 1 for a resolution that failed (the message says why).
+(ns pkg.deps-cmd
+  (:require [pkg.project-mode :as pm] [pkg.resolve :as rs] [pkg.project :as pj] [pkg.modules :as md] [pkg.add :as add] [pkg.paths :as pp]))
+
+(def deps-usage: str
+  "usage: fibc deps <command> [--locked] [--offline] [--frozen]
+  tree                   print the resolved libraries as a tree
+  fetch                  resolve, fetch every locked commit, check every tag, write deps.lock
+  update [NAME..]        resolve the tags of NAME (default: every library) afresh and write deps.lock
+  add NAME (--git URL (--tag T | --sha S | --tag T --sha S) | --local DIR)
+                         add a dependency to deps.fib, then resolve and lock
+  path                   print the module search path of the project, one directory a line")
+
+(defun fail :private (m: str) -> i64 (do (eprintln (str "fibc deps: " m)) 1))
+
+(defun short :private (sha: str) -> str (if (> (str-len sha) 12) (str-slice sha 0 12) sha))
+
+(defun lib-line :private (l: rs/PkgLib) -> str
+  (match (. l src)
+    ((pj/SrcGit url _ tag) (str (. l name) " " url " " (short (. l sha)) (match tag (nil "") ((some t) (str " (tag " t ")")))))
+    ((pj/SrcLocal _) (str (. l name) " " (. l dir)))))
+
+;; The tree under the names `names`, depth first; a library printed before is marked (*) and not entered again.
+(defun tree-lines :private (libs: (Vec rs/PkgLib) names: (Vec str) indent: str seen: (Cell (Vec str))) -> (Vec str)
+  (reduce (fn (acc: (Vec str) n: str)
+            (match (rs/find-lib libs n)
+              (nil acc)
+              ((some l) (if (some? (first (filter (fn (x: str) (= x n)) @seen)))
+                            (conj acc (str indent "  " (lib-line l) " (*)"))
+                            (do (set! seen (conj @seen n))
+                                (into (conj acc (str indent "  " (lib-line l))) (tree-lines libs (. l deps) (str indent "  ") seen)))))))
+          [] names))
+
+(defun cmd-tree :private (r: pm/PkgResolved) -> i64
+  (let ((p (. r project)))
+    (do (println (if (= (. p name) "") "the project" (str (. p name) " " (. p version))))
+        (doseq [line (tree-lines (. r libs) (mapv (fn (x: pj/PkgDep) (. x name)) (. p deps)) "" (cell []))] (println line))
+        0)))
+
+(defun with-project :private (f: pm/PkgFlags unpinned: (Vec str) check: bool k: (fn (pm/PkgResolved) i64)) -> i64
+  (match (pm/project-root)
+    (nil (do (eprintln "fibc deps: no deps.fib here or in a directory above (`fibc new NAME` makes a project)") 2))
+    ((some root) (match (pm/resolve-project root f unpinned check)
+                   ((Err m) (fail m))
+                   ((Ok r) (k r))))))
+
+;; `update NAME..`: each NAME must be a direct or locked dependency.
+(defun cmd-update :private (f: pm/PkgFlags names: (Vec str)) -> i64
+  (if (. f locked)
+      (fail "update changes deps.lock, which --locked forbids")
+      (with-project f (if (empty? names) ["*"] names) false
+        (fn (r: pm/PkgResolved)
+          (match (first (filter (fn (n: str) (nil? (rs/find-lib (. r libs) n))) names))
+            ((some n) (fail (str n " is not a library of this project")))
+            (nil (do (println (str "updated deps.lock: " (count (. r libs)) " libraries")) 0)))))))
+
+(defun dispatch :private (f: pm/PkgFlags words: (Vec str)) -> i64
+  (let ((head (if (empty? words) "" (nth words 0))) (n (count words)))
+    (cond (and (= head "tree") (= n 1)) (with-project f [] false cmd-tree)
+          (and (= head "fetch") (= n 1))
+            (with-project f [] true (fn (r: pm/PkgResolved) (do (println (str "fetched and verified " (count (. r libs)) " libraries; deps.lock is current")) 0)))
+          (= head "update") (cmd-update f (vec (drop 1 words)))
+          (and (= head "path") (= n 1))
+            (with-project f [] false (fn (r: pm/PkgResolved) (do (doseq [d (md/search-dirs (. r project) (. r libs) false)] (println d)) 0)))
+          (= head "add") (match (pm/project-root)
+                           (nil (do (eprintln "fibc deps: no deps.fib here or in a directory above") 2))
+                           ((some root) (add/cmd-add root f (vec (drop 1 words)))))
+          :else (do (eprintln deps-usage) 2))))
+
+;; `fibc deps WORDS`, the flags taken out of the words by the driver.
+(defun cmd-deps (f: pm/PkgFlags words: (Vec str)) -> i64
+  (dispatch f words))

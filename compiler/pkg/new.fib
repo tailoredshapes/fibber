@@ -1,0 +1,59 @@
+;; compiler/pkg/new.fib: `fibc new NAME [--lib]` (docs/design/packages.md §5): a project directory NAME with deps.fib, src/NAME/core.fib
+;; (and src/main.fib for an application), specs/NAME-spec.fib, README.md and .gitignore. NAME is a module name's part: a lower-case
+;; letter, then letters, digits and `-`. The directory must not exist.
+(ns pkg.new
+  (:require [pkg.paths :as pp] [pkg.exec :as x]))
+
+(defun valid-name? :private (n: str) -> bool
+  (let ((cs (str-chars n)))
+    (and (> (count cs) 0) (>= (nth cs 0) \a) (<= (nth cs 0) \z)
+         (every? (fn (c: char) (or (and (>= c \a) (<= c \z)) (and (>= c \0) (<= c \9)) (= c \-))) cs))))
+
+(defun deps-text :private (n: str) -> str
+  (str ";; deps.fib: the project (docs/design/packages.md). Add a library with\n"
+       ";;   fibc deps add acme/util --git https://example.org/acme/util.git --tag v1.0.0\n"
+       "{:name \"" n "\"\n :version \"0.1.0\"\n :paths [\"src\"]\n :deps {}\n :aliases {:test {:extra-paths [\"specs\"]}}}\n"))
+
+(defun core-text :private (n: str) -> str
+  (str "(ns " n ".core)\n\n;; A first function; the spec in specs/" n "-spec.fib says what it does.\n"
+       "(defun greeting (who: str) -> str\n  (str \"hello, \" who))\n"))
+
+(defun main-text :private (n: str) -> str
+  (str "(ns main (:require [" n ".core :as core]))\n\n(defun main () -> i64\n  (do (println (core/greeting \"world\")) 0))\n"))
+
+(defun spec-text :private (n: str) -> str
+  (str "(ns main (:use fib.test.core fib.test.run) (:require [" n ".core :as core]))\n\n(defspecs specs\n  (feature \"" n ".core\"\n"
+       "    (scenario \"greets by name\"\n      (given [who \"world\"])\n      (then (expect = \"hello, world\" (core/greeting who))))))\n\n"
+       "(defun main () -> i64 (run-main (specs)))\n"))
+
+(defun readme-text :private (n: str lib: bool) -> str
+  (str "# " n "\n\n" (if lib "A fibber library." "A fibber program.") "\n\n"
+       (if lib "" "    fibc run src/main.fib\n    fibc build src/main.fib -o " ) (if lib "" (str n "\n"))
+       "    fibc test\n    fibc deps tree\n"))
+
+;; Writes each file; the first that cannot be written, if one cannot.
+(defun write-all :private (files: (Vec (Pair str str))) -> (Option str)
+  (loop ((i 0))
+    (cond (>= i (count files)) nil
+          (write-file (. (nth files i) fst) (. (nth files i) snd)) (recur (+ i 1))
+          :else (some (. (nth files i) fst)))))
+
+(defun cmd-new (words: (Vec str)) -> i64
+  (let ((lib (some? (first (filter (fn (w: str) (= w "--lib")) words))))
+        (names (filter (fn (w: str) (not (= w "--lib"))) words))
+        (n (if (= (count names) 1) (nth (vec names) 0) ""))
+        (dir (pp/under (pp/cwd) n)))
+    (cond (not (= (count names) 1)) (do (eprintln "usage: fibc new NAME [--lib]") 2)
+          (not (valid-name? n)) (do (eprintln (str "fibc new: " n ": a name is a lower-case letter, then letters, digits and -")) 2)
+          (or (pp/dir? dir) (some? (read-file dir))) (do (eprintln (str "fibc new: " dir " exists")) 2)
+          :else (scaffold dir n lib))))
+
+(defun scaffold :private (dir: str n: str lib: bool) -> i64
+  (let ((_ (x/run ["mkdir" "-p" "--" (str dir "/src/" n) (str dir "/specs")]))
+        (files [(Pair (str dir "/deps.fib") (deps-text n)) (Pair (str dir "/src/" n "/core.fib") (core-text n))
+                (Pair (str dir "/specs/" n "-spec.fib") (spec-text n)) (Pair (str dir "/README.md") (readme-text n lib))
+                (Pair (str dir "/.gitignore") "/target/\n")])
+        (all (if lib files (conj files (Pair (str dir "/src/main.fib") (main-text n))))))
+    (match (write-all all)
+      ((some f) (do (eprintln (str "fibc new: cannot write " f)) 1))
+      (nil (do (println (str "made " (if lib "library" "program") " " n " in " dir)) 0)))))

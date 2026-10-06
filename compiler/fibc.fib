@@ -14,12 +14,13 @@
 ;; Build: `fibc build compiler/fibc.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o OUT`, run from the repository root (lair is native.*, fibber over LLVM: no liblair).
 (ns main
   (:require [driver.args :as a] [driver.commands :as c] [driver.native :as native] [expand.roots :as roots] [expand.maker :as mk]
-            [macros.runner :as mr] [driver.harness :as hn] [driver.test :as dt] [driver.version :as v] [lsp.server :as lsp]))
+            [macros.runner :as mr] [driver.harness :as hn] [driver.test :as dt] [driver.version :as v] [lsp.server :as lsp]
+            [pkg.project-mode :as pm] [pkg.deps-cmd :as deps] [pkg.new :as new]))
 
 (defun refuse (word: str) -> i64
   (do (eprintln (str-join ["fibc: `" word "` is a command of the Rust compiler (the test harness)"])) 2))
 
-(defun dispatch (cmd: a/Command rts: roots/Roots rm: mk/RunnerMaker dirs: (Vec str)) -> i64
+(defun dispatch (cmd: a/Command rts: roots/Roots rm: mk/RunnerMaker dirs: (Vec str) pf: pm/PkgFlags) -> i64
   (match cmd
     ((a/CmdRun file trace args opt) (c/cmd-run file trace args opt rts rm))
     ((a/CmdBuild file out dirs libs opt) (c/cmd-build file out dirs libs opt rts rm))
@@ -29,6 +30,8 @@
     ((a/CmdLsp) (lsp/lsp-main rts))
     ((a/CmdCases dir only jobs) (hn/cmd-cases dir only jobs))
     ((a/CmdTest words) (dt/cmd-test words dirs))
+    ((a/CmdDeps words) (deps/cmd-deps pf words))
+    ((a/CmdNew words) (new/cmd-new words))
     ((a/CmdHarness word) (refuse word))
     ((a/CmdHelp) (do (println a/usage) 0))
     ((a/CmdVersion) (do (println (v/version-line)) 0))
@@ -46,11 +49,27 @@
             (do (native/setenv-set "FIB_TARGET_TRIPLE" (nth words (+ i 1))) (recur (+ i 2) out))
           :else (recur (+ i 1) (conj out (nth words i))))))
 
+;; The module roots a project adds for a command that compiles a program (pkg.project-mode; none outside a project). `test` passes them to
+;; its children as -I, and FIB_NO_PROJECT keeps the children from resolving again.
+(defun project-dirs :private (cmd: a/Command pf: pm/PkgFlags) -> (Result (Vec str) str)
+  (match cmd
+    ((a/CmdTest _) (let ((r (pm/project-dirs pf true))) (do (native/setenv-set "FIB_NO_PROJECT" "1") r)))
+    ((a/CmdRun _ _ _ _) (pm/project-dirs pf false))
+    ((a/CmdBuild _ _ _ _ _) (pm/project-dirs pf false))
+    ((a/CmdEmit _) (pm/project-dirs pf false))
+    ((a/CmdExplain _) (pm/project-dirs pf false))
+    (_ (Ok []))))
+
 (defun main () -> i64
   (let ((_ (native/ignore-sigpipe))
         (nr (mk/take-no-runner (take-target (vec (args)))))
-        (split (a/split-roots (. nr words)))
+        (pt (pm/take-flags (. nr words)))
+        (split (a/split-roots (. pt words)))
         (cmd (a/parse (. split rest))))
     (if (and (not (empty? (. split dirs))) (not (a/takes-roots? cmd)))
         (do (eprintln (str-join ["fibc: -I belongs to a command that reads a program\n" a/usage])) 2)
-        (dispatch cmd (roots/roots-from-env (. split dirs) (native/getenv-opt "FIB_LIB")) (mr/maker-for (. nr no-runner)) (. split dirs)))))
+        (match (project-dirs cmd (. pt flags))
+          ((Err m) (do (eprintln (str "fibc: " m)) 2))
+          ((Ok extra)
+           (let ((dirs (into (. split dirs) extra)))
+             (dispatch cmd (roots/roots-from-env dirs (native/getenv-opt "FIB_LIB")) (mr/maker-for (. nr no-runner)) dirs (. pt flags))))))))

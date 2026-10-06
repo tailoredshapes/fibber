@@ -1,0 +1,65 @@
+;; compiler/pkg/add.fib: `fibc deps add NAME (--git URL [--tag T] [--sha S] | --local DIR)` (docs/design/packages.md §5). The text of
+;; deps.fib is edited, not reprinted: the new entry goes before the closing brace of :deps, on a line of its own indented as the first
+;; entry is (or `:deps {..}` is added before the project map's closing brace), so comments and layout stay. Then the project is resolved
+;; and locked; if that fails, deps.fib is put back as it was.
+(ns pkg.add
+  (:require [pkg.project :as pj] [pkg.project-mode :as pm] [pkg.lock :as lk] [pkg.data :as d])
+  (:use syntax.form syntax.pos))
+
+(defstruct PkgAddArgs :private (name: str url: str tag: str sha: str local: str))
+
+(defun parse-add :private (words: (Vec str)) -> (Result PkgAddArgs str)
+  (if (or (empty? words) (starts-with? (nth words 0) "-"))
+      (Err "add wants a NAME first")
+      (loop ((i 1) (a (PkgAddArgs (nth words 0) "" "" "" "")))
+        (if (>= i (count words))
+            (Ok a)
+            (let ((w (nth words i)) (v (if (< (+ i 1) (count words)) (nth words (+ i 1)) "")))
+              (cond (= v "") (Err (str "add: " w " wants a value"))
+                    (= w "--git") (recur (+ i 2) (PkgAddArgs (. a name) v (. a tag) (. a sha) (. a local)))
+                    (= w "--tag") (recur (+ i 2) (PkgAddArgs (. a name) (. a url) v (. a sha) (. a local)))
+                    (= w "--sha") (recur (+ i 2) (PkgAddArgs (. a name) (. a url) (. a tag) v (. a local)))
+                    (= w "--local") (recur (+ i 2) (PkgAddArgs (. a name) (. a url) (. a tag) (. a sha) v))
+                    :else (Err (str "add: unknown option " w))))))))
+
+(defun opt :private (s: str) -> (Option str) (if (= s "") nil (some s)))
+
+;; The coordinate the words name, as deps.fib writes it.
+(defun coord :private (a: PkgAddArgs) -> (Result str str)
+  (cond (and (not (= (. a local) "")) (not (= (. a url) ""))) (Err "add: --git and --local exclude each other")
+        (not (= (. a local) "")) (Ok (lk/coord-text (pj/SrcLocal (. a local))))
+        (= (. a url) "") (Err "add: name a source: --git URL or --local DIR")
+        (and (= (. a tag) "") (= (. a sha) "")) (Err "add: a git dependency names --tag or --sha (or both)")
+        (and (not (= (. a sha) "")) (not (pj/full-sha? (. a sha)))) (Err "add: --sha is a full 40-digit commit id")
+        :else (Ok (lk/coord-text (pj/SrcGit (. a url) (opt (. a sha)) (opt (. a tag)))))))
+
+;; The text with `entry` added to the :deps map of the project map `m`.
+(defun insert :private (text: str m: Stx entry: str) -> str
+  (match (d/lookup m "deps")
+    (nil (let ((end (- (. (. m pos) end) 1)))
+           (str (str-slice text 0 end) "\n :deps {" entry "}" (str-slice text end (str-len text)))))
+    ((some dm)
+     (let ((items (d/map-items dm))
+           (end (- (. (. dm pos) end) 1)))
+       (if (empty? items)
+           (str (str-slice text 0 end) entry (str-slice text end (str-len text)))
+           (let ((col (. (. (nth items 0) pos) col)))
+             (str (str-slice text 0 end) "\n" (str-join (mapv (fn (_: i64) " ") (range (- col 1)))) entry
+                  (str-slice text end (str-len text)))))))))
+
+(defun cmd-add (root: str f: pm/PkgFlags words: (Vec str)) -> i64
+  (let ((file (str root "/deps.fib")) (old (unwrap-or (read-file file) "")))
+    (match (try-let [a (parse-add words)
+                     c (coord a)
+                     m (d/read-map file)
+                     p (pj/parse-project m root)
+                     _ (if (some? (first (filter (fn (x: pj/PkgDep) (= (. x name) (. a name))) (. p deps))))
+                           (Err (str (. a name) " is already in :deps of " file "; edit it there"))
+                           (Ok ()))]
+             (Ok (insert old m (str (. a name) " " c))))
+      ((Err m) (do (eprintln (str "fibc deps: " m)) 2))
+      ((Ok text) (if (not (write-file file text))
+                     (do (eprintln (str "fibc deps: cannot write " file)) 1)
+                     (match (pm/resolve-project root f [] false)
+                       ((Err m) (do (write-file file old) (eprintln (str "fibc deps: " m "\n(deps.fib is unchanged)")) 1))
+                       ((Ok r) (do (println (str "added " (nth words 0) "; deps.lock: " (count (. r libs)) " libraries")) 0))))))))
