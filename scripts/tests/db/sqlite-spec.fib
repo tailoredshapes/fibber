@@ -1,0 +1,18 @@
+;; fib.db against SQLite: the Driver contract on a fresh `:memory:` database per scenario, and what is SQLite's own (opening a file that
+;; cannot be opened, SQLSTATE mapping). Needs libsqlite3 in the process: scripts/test-db.sh runs it (`LD_PRELOAD` under `fibc test`,
+;; `-l:libsqlite3.so.0` for a build). Not under specs/: the gate's `fibc test specs` runs through the JIT with no C library but libc.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.db driver-contract))
+
+(defun fresh () -> SqliteConn
+  (match (open-sqlite ":memory:") ((Ok c) c) ((Err e) (trap (str "cannot open :memory: " (. e message))))))
+
+(defspecs specs
+  (implements DriverContract "sqlite" fresh)
+  (feature "fib.db.sqlite"
+    (scenario "a database that cannot be opened is an Err with a connection SQLSTATE"
+      (then (expect = "08001" (match (open-sqlite "/nonexistent-dir/x/y.db") ((Err e) (. e sqlstate)) ((Ok _) "opened")))))
+    (scenario "result codes map onto SQLSTATE classes"
+      (then (expect = ["23505" "23505" "23502" "23503" "23000" "40001" "08001" "42000" "HY000"]
+                    (vec (map sqlstate-of [2067 1555 1299 787 19 5 14 1 21])))))))
+
+(defun main () -> i64 (run-main (specs)))

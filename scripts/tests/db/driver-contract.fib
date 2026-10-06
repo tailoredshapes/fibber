@@ -1,0 +1,76 @@
+;; The Driver contract of fib.db (docs/design/observability-and-databases.md 4.9): what every driver's connection must do, whoever implements
+;; it. `make` opens a connection to an EMPTY database (a fresh SQLite `:memory:`, a fresh PostgreSQL schema); every scenario creates its
+;; own table. The SQL is the subset SQLite and PostgreSQL share. Only the protocol `Connection` and the fib.db functions are called, so
+;; each driver gets its own monomorphised copy.
+(ns driver-contract (:use fib.core fib.seq fib.coll fib.test.core fib.db) (:require [fib.async :as as]))
+
+(defun rows (r: (Result (Vec (Map str Datum)) DbError)) -> (Vec (Map str Datum)) (match r ((Ok v) v) ((Err _) [])))
+(defun err-state (r: (Result a DbError)) -> str (match r ((Ok _) "ok") ((Err e) (. e sqlstate))))
+(defun cell-text (r: (Result (Vec (Map str Datum)) DbError) i: i64 k: keyword) -> str
+  (let [v (rows r)] (if (< i (count v)) (datum-text (unwrap-or (col (nth v i) k) DNil)) "<no row>")))
+(defun row-count (c: c table: str) :where ((Connection c)) -> i64
+  (unwrap-or (and-then as-int (and-then (fn (r: (Map str Datum)) (get r "n")) (first (rows (conn-execute c (str "select count(*) as n from " table) []))))) -1))
+(defun table! (c: c) :where ((Connection c)) -> unit
+  (do (execute! c ["create table people (id integer primary key, name text not null unique, score real, active integer, photo bytea)"]) ()))
+
+(defcontract DriverContract [make]
+  (scenario "a select returns its rows as maps keyed by column label, every type round-tripping"
+    (covers "fib.db execute!")
+    (given [c (make) _ (table! c)
+            _ (execute! c ["insert into people (id, name, score, active, photo) values (?, ?, ?, ?, ?)" 1 "ann" 2.5 true (DBytes (array 3 7i8))])
+            _ (execute! c ["insert into people (id, name, score, active, photo) values (?, ?, ?, ?, ?)" 2 "bob" DNil false DNil])])
+    (upon [r (execute! c ["select id, name, score, active, photo as pic from people order by id"])])
+    (then (expect = 2 (count (rows r)))
+          (expect = "1 ann 2.5 1 070707" (str (cell-text r 0 :id) " " (cell-text r 0 :name) " " (cell-text r 0 :score) " " (cell-text r 0 :active) " " (cell-text r 0 :pic)))
+          (expect = "2 bob nil 0 nil" (str (cell-text r 1 :id) " " (cell-text r 1 :name) " " (cell-text r 1 :score) " " (cell-text r 1 :active) " " (cell-text r 1 :pic)))))
+  (scenario "parameters are bound, never spliced into the text"
+    (covers "fib.db execute!")
+    (given [c (make) _ (table! c) evil "x'); drop table people; --"])
+    (upon [_ (execute! c ["insert into people (id, name) values (?, ?)" 1 evil])])
+    (then (expect = evil (cell-text (execute! c ["select name from people where id = ?" 1]) 0 :name))
+          (expect = 1 (row-count c "people"))))
+  (scenario "execute-one! is the first row, or nil"
+    (covers "fib.db execute-one!")
+    (given [c (make) _ (table! c) _ (execute! c ["insert into people (id, name) values (?, ?)" 7 "eve"])
+            _ (execute! c ["insert into people (id, name) values (?, ?)" 9 "zed"])])
+    (then (expect = (some "eve") (match (execute-one! c ["select name from people where id >= ? order by id" 7]) ((Ok (some r)) (and-then as-str (col r :name))) (_ nil)))
+          (expect = true (match (execute-one! c ["select name from people where id = ?" 8]) ((Ok nil) true) (_ false)))))
+  (scenario "a statement without columns reports its update count"
+    (covers "fib.db update-count")
+    (given [c (make) _ (table! c)])
+    (upon [a (execute! c ["insert into people (id, name) values (?, ?)" 1 "a"])
+           b (execute! c ["insert into people (id, name) values (?, ?)" 2 "b"])
+           u (execute! c ["update people set score = ? where id > ?" 1.0 0])
+           d (execute! c ["delete from people where id = ?" 9])])
+    (then (expect = [1 1 2 0] [(update-count (rows a)) (update-count (rows b)) (update-count (rows u)) (update-count (rows d))])))
+  (scenario "with-transaction commits when the body returns Ok"
+    (covers "fib.db with-transaction")
+    (given [c (make) _ (table! c)])
+    (upon [r (with-transaction [tx c]
+               (try-let [_ (execute! tx ["insert into people (id, name) values (?, ?)" 1 "a"])
+                         _ (execute! tx ["insert into people (id, name) values (?, ?)" 2 "b"])]
+                 (Ok 2)))])
+    (then (expect = "ok" (err-state r)) (expect = 2 (row-count c "people"))))
+  (scenario "with-transaction rolls back when the body returns Err"
+    (covers "fib.db with-transaction")
+    (given [c (make) _ (table! c)])
+    (upon [r (with-transaction [tx c]
+               (try-let [_ (execute! tx ["insert into people (id, name) values (?, ?)" 1 "a"])
+                         _ (execute! tx ["insert into people (id, name) values (?, ?)" 2 "a"])]
+                 (Ok 2)))])
+    (then (expect = "23505" (err-state r)) (expect = 0 (row-count c "people"))))
+  (scenario "errors carry SQLSTATE"
+    (covers "fib.db DbError")
+    (given [c (make) _ (table! c)])
+    (then (expect = "23502" (err-state (execute! c ["insert into people (id, name) values (?, ?)" 1 DNil])))
+          (expect = true (db-error? (match (execute! c ["selec 1"]) ((Err e) e) ((Ok _) (DbError "00000" 0 ""))) "42"))))
+  (scenario "a closed connection refuses work; closing twice is harmless"
+    (covers "fib.db conn-close")
+    (given [c (make)])
+    (upon [a (conn-close c) b (conn-close c)])
+    (then (expect = "ok ok" (str (err-state a) " " (err-state b))) (expect = "08003" (err-state (execute! c ["select 1"])))))
+  (scenario "a connection used by one task, then by another"
+    (covers "fib.db Connection")
+    (given [c (make) _ (table! c)])
+    (upon [n (as/try-join (spawn (fn () (update-count (rows (execute! c ["insert into people (id, name) values (?, ?)" 1 "t"]))))))])
+    (then (expect = true (match n ((Ok 1) true) (_ false))) (expect = 1 (row-count c "people")))))

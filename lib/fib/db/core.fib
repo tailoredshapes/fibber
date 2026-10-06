@@ -1,0 +1,57 @@
+;; fib.db.core: the driver-independent part of fib.db (docs/design/observability-and-databases.md 4): errors as values, rows as maps, the
+;; Connection protocol a driver implements, and the next.jdbc-shaped functions over it. The macros `execute!`, `execute-one!` and
+;; `with-transaction` are in the facade `fib.db`.
+;;
+;; Rows are `(Map str Datum)` keyed by the column's label as the database reports it (next.jdbc's unqualified maps). They are not keyed by
+;; keyword because the prelude cannot make a keyword at run time (no `keyword`, stdlib row 1505 is not built); `col` takes a keyword
+;; for the reader's sake and looks its text up.
+(ns fib.db.core (:use fib.core fib.seq fib.coll fib.datum))
+
+;; What a failed operation came to. `sqlstate` is the SQL standard's five-character class and code ("23505" a unique violation, "42601"
+;; a syntax error, "08006" a lost connection); a driver whose database has none (SQLite) maps its codes onto them (fib.db.sqlite), and
+;; `code` and `message` keep the database's own.
+(defstruct DbError (sqlstate: str code: i64 message: str))
+(derive Eq DbError)
+(derive Debug DbError)
+
+(defun db-error? (e: DbError class: str) -> bool (starts-with? (. e sqlstate) class))
+
+;; A statement and its parameters, as `(fib.sql/format q)` returns it and `execute!` takes it.
+(defstruct Query (sql: str params: (Vec Datum)))
+
+;; What a driver's connection does. A connection is used by one task at a time (it may move between tasks: it is Send when its fields
+;; are), and `conn-close` is called once, by `with-connection` or by the program; closing twice is the driver's no-op, never a crash.
+(defprotocol Connection
+  ;; Runs one statement with `?` parameters. A statement that yields columns returns its rows; one that does not (INSERT, UPDATE, DDL)
+  ;; returns one row `{"update-count" n}`, as next.jdbc does.
+  (conn-execute (self sql: str params: (Vec Datum)) -> (Result (Vec (Map str Datum)) DbError))
+  (conn-close (self) -> (Result unit DbError)))
+
+(defun col (row: (Map str Datum) k: keyword) -> (Option Datum) (get row (keyword-text k)))
+
+(defun execute-query (c: c q: Query) :where ((Connection c)) -> (Result (Vec (Map str Datum)) DbError)
+  (conn-execute c (. q sql) (. q params)))
+
+;; The first row, or nil when there is none (next.jdbc's execute-one!).
+(defun execute-one-query (c: c q: Query) :where ((Connection c)) -> (Result (Option (Map str Datum)) DbError)
+  (match (conn-execute c (. q sql) (. q params))
+    ((Err e) (Err e))
+    ((Ok rows) (Ok (first rows)))))
+
+;; The update count of a statement that has one: 0 for a statement that returned rows.
+(defun update-count (rows: (Vec (Map str Datum))) -> i64
+  (match (first rows) (nil 0) ((some r) (unwrap-or (and-then as-int (get r "update-count")) 0))))
+
+(defun finish :private (c: c r: (Result a DbError)) :where ((Connection c)) -> (Result a DbError)
+  (match r
+    ((Ok v) (match (conn-execute c "COMMIT" [])
+              ((Ok _) (Ok v))
+              ((Err e) (do (conn-execute c "ROLLBACK" []) (Err e)))))
+    ((Err e) (do (conn-execute c "ROLLBACK" []) (Err e)))))
+
+;; BEGIN, the body, then COMMIT when it returned Ok and ROLLBACK when it returned Err (or the COMMIT failed). There is no catch (design
+;; 4.6): a body that traps ends its task without either; `try-transact` (package D3) runs the body in a task and rolls back after it.
+(defun transact (c: c body: (fn (c) (Result a DbError)) :borrow) :where ((Connection c)) -> (Result a DbError)
+  (match (conn-execute c "BEGIN" [])
+    ((Err e) (Err e))
+    ((Ok _) (finish c (body c)))))

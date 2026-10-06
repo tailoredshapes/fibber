@@ -1,0 +1,104 @@
+;; fib.db.sqlite: the SQLite driver of fib.db over the system libsqlite3 (docs/design/observability-and-databases.md 4.7). Link with
+;; `-l sqlite3` or `-l:libsqlite3.so.0`; see fib.db.sqlite.ffi for `fibc run`.
+;;
+;;   (open-sqlite ":memory:")   (open-sqlite "/var/app/data.db")   -> (Result SqliteConn DbError)
+;;
+;; Types: INTEGER is DInt, REAL DFloat, TEXT DStr, BLOB DBytes, NULL DNil; a DBool parameter binds as 0 or 1 (SQLite has no boolean).
+;; A statement is prepared, bound, stepped to the end and finalized inside one `conn-execute`, so no statement handle outlives a call and
+;; none can leak on an Err path. SQLite has no SQLSTATE; `sqlstate-of` maps its result codes onto the classes a program tests.
+(ns fib.db.sqlite (:use fib.core fib.seq fib.coll fib.datum fib.db.core fib.db.sqlite.ffi) (:require [fib.os.native :as n]))
+
+;; `handle` is the sqlite3* (0 once closed: a closed connection refuses work instead of passing a freed pointer to C).
+(defstruct SqliteConn (handle: (Atom i64) path: str))
+
+;; SQLite's primary and extended result codes as SQLSTATE: constraint violations by kind (PostgreSQL's codes, which programs test),
+;; a busy or locked database as a serialization failure, cannot-open as a connection failure, everything else as a general error.
+(defun sqlstate-of (code: i64) -> str
+  (cond (or (= code 2067) (= code 1555)) "23505" (= code 1299) "23502" (= code 787) "23503" (= code 275) "23514"
+        (= (bit-and code 255) 19) "23000" (= (bit-and code 255) 5) "40001" (= (bit-and code 255) 6) "40001"
+        (= (bit-and code 255) 14) "08001" (= code 1) "42000" :else "HY000"))
+
+(defun last-error :private (db: i64) -> DbError
+  (let [code (sext i64 (unsafe (sqlite3_extended_errcode db)))]
+    (DbError (sqlstate-of code) code (unsafe (n/c-string (sqlite3_errmsg db))))))
+
+(defun open-sqlite (path: str) -> (Result SqliteConn DbError)
+  (let [p (n/c-text path) slot (unsafe (alloc 8))
+        rc (unsafe (sqlite3_open_v2 p slot 6i32 0))
+        db (unsafe (load-i64 slot))]
+    (do (unsafe (do (free p) (free slot)))
+        (cond (= rc SQLITE_OK) (Ok (SqliteConn (atom db) path))
+              (= db 0) (Err (DbError "08001" (sext i64 rc) "sqlite: out of memory opening the database"))
+              :else (let [e (last-error db)] (do (unsafe (sqlite3_close_v2 db)) (Err e)))))))
+
+(defun bind-bytes :private (st: i64 i: i32 bytes: (Array i8) text: bool) -> i32
+  (let [p (n/bytes-new bytes) len (trunc i32 (array-len bytes))
+        rc (unsafe (if text (sqlite3_bind_text st i p len SQLITE_TRANSIENT) (sqlite3_bind_blob st i p len SQLITE_TRANSIENT)))]
+    (do (unsafe (free p)) rc)))
+
+(defun bind-one :private (st: i64 i: i32 d: Datum) -> i32
+  (match d
+    ((DNil) (unsafe (sqlite3_bind_null st i)))
+    ((DBool b) (unsafe (sqlite3_bind_int64 st i (if b 1 0))))
+    ((DInt v) (unsafe (sqlite3_bind_int64 st i v)))
+    ((DFloat f) (unsafe (sqlite3_bind_double st i f)))
+    ((DStr s) (bind-bytes st i (str-bytes s) true))
+    ((DBytes b) (bind-bytes st i b false))))
+
+;; Binds every parameter (1-based in SQLite); the first failing code, or OK.
+(defun bind-all :private (st: i64 params: (Vec Datum)) -> i32
+  (loop [i 0]
+    (if (>= i (count params))
+        SQLITE_OK
+        (let [rc (bind-one st (trunc i32 (+ i 1)) (nth params i))]
+          (if (= rc SQLITE_OK) (recur (+ i 1)) rc)))))
+
+(defun column-bytes :private (st: i64 i: i32 p: ptr) -> (Array i8)
+  (n/bytes-at p (sext i64 (unsafe (sqlite3_column_bytes st i)))))
+
+(defun column-datum :private (st: i64 i: i32) -> Datum
+  (let [t (unsafe (sqlite3_column_type st i))]
+    (cond (= t 1i32) (DInt (unsafe (sqlite3_column_int64 st i)))
+          (= t 2i32) (DFloat (unsafe (sqlite3_column_double st i)))
+          (= t 3i32) (DStr (str-from-bytes (column-bytes st i (unsafe (sqlite3_column_text st i)))))
+          (= t 4i32) (DBytes (column-bytes st i (unsafe (sqlite3_column_blob st i))))
+          :else DNil)))
+
+(defun column-names :private (st: i64) -> (Vec str)
+  (vec (map (fn (i: i64) (unsafe (n/c-string (sqlite3_column_name st (trunc i32 i))))) (range (sext i64 (unsafe (sqlite3_column_count st)))))))
+
+(defun read-row :private (st: i64 names: (Vec str)) -> (Map str Datum)
+  (loop [i 0 row {}]
+    (if (>= i (count names)) row (recur (+ i 1) (assoc row (nth names i) (column-datum st (trunc i32 i)))))))
+
+;; Steps a bound statement to the end: its rows, or the update count when it has no columns.
+(defun step-all :private (db: i64 st: i64) -> (Result (Vec (Map str Datum)) DbError)
+  (let [names (column-names st)]
+    (loop [rows []]
+      (let [rc (unsafe (sqlite3_step st))]
+        (cond (= rc SQLITE_ROW) (recur (conj rows (read-row st names)))
+              (= rc SQLITE_DONE) (Ok (if (= (count names) 0) [{"update-count" (DInt (sext i64 (unsafe (sqlite3_changes db))))}] rows))
+              :else (Err (last-error db)))))))
+
+(defun run-statement :private (db: i64 sql: str params: (Vec Datum)) -> (Result (Vec (Map str Datum)) DbError)
+  (let [text (n/c-text sql) slot (unsafe (alloc 8))
+        rc (unsafe (sqlite3_prepare_v2 db text -1i32 slot 0))
+        st (unsafe (load-i64 slot))]
+    (do (unsafe (do (free text) (free slot)))
+        (cond (!= rc SQLITE_OK) (Err (last-error db))
+              (= st 0) (Ok [])
+              :else (let [b (bind-all st params)
+                          r (if (= b SQLITE_OK) (step-all db st) (Err (last-error db)))]
+                      (do (unsafe (sqlite3_finalize st)) r))))))
+
+(impl Connection SqliteConn
+  (conn-execute (self sql params)
+    (let [db @(. self handle)]
+      (if (= db 0) (Err (DbError "08003" 0 "sqlite: the connection is closed")) (run-statement db sql params))))
+  (conn-close (self)
+    ;; Takes the handle out first (compare-and-set from the value read), so a second close, or a racing one, finds 0 and does nothing.
+    (let [db @(. self handle)]
+      (if (and (!= db 0) (compare-and-set! (. self handle) db 0))
+          (let [rc (unsafe (sqlite3_close_v2 db))]
+            (if (= rc SQLITE_OK) (Ok ()) (Err (DbError "HY000" (sext i64 rc) "sqlite: close failed"))))
+          (Ok ())))))
