@@ -1,4 +1,4 @@
-# 0013. Every builtin has a spec row and a case
+# 0014. Every builtin has a spec row and a case
 
 Status: accepted
 Date: 2026-10-06

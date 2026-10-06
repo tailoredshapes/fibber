@@ -1,4 +1,4 @@
-# 0012. Library code has no global mutable state
+# 0013. Library code has no global mutable state
 
 Status: accepted
 Date: 2026-10-06

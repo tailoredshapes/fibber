@@ -1,4 +1,4 @@
-# 0018. A changed benchmark checksum is a failure, not a speedup
+# 0019. A changed benchmark checksum is a failure, not a speedup
 
 Status: accepted
 Date: 2026-10-06

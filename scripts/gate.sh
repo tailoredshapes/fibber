@@ -106,7 +106,7 @@ stage_tools() {
 }
 
 # The executable ADRs (docs/adr, compiler/adr.fib, docs/design/executable-adrs.md), full gate only: about fifteen seconds with the 20 ADRs of today (build of the tool, one
-# program for every block; the checks of 0013 and 0015 read the 2,200 case files). --strict: an accepted ADR with no check that runs is a failure too. Failures are not compared with
+# program for every block; the checks of 0014 and 0016 read the 2,200 case files). --strict: an accepted ADR with no check that runs is a failure too. Failures are not compared with
 # scripts/ci-stage2.expected: a violated decision is a regression.
 stage_adr() {
   skipped adr compiler lib docs spec scripts cases specs rt .github editors SEED VERSION && return

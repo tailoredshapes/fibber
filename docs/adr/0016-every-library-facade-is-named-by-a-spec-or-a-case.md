@@ -1,4 +1,4 @@
-# 0015. Every library facade is named by a spec or a case
+# 0016. Every library facade is named by a spec or a case
 
 Status: accepted
 Date: 2026-10-06

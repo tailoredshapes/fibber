@@ -1,4 +1,4 @@
-# 0021. Exclusive windows are over contiguous buffers, and the checker refuses closures over them
+# 0022. Exclusive windows are over contiguous buffers, and the checker refuses closures over them
 
 Status: accepted
 Date: 2026-10-06

@@ -1,4 +1,4 @@
-# 0020. Parallel reductions do not depend on the worker count
+# 0021. Parallel reductions do not depend on the worker count
 
 Status: accepted
 Date: 2026-10-06

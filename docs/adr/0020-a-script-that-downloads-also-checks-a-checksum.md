@@ -1,4 +1,4 @@
-# 0019. A script that downloads also checks a checksum
+# 0020. A script that downloads also checks a checksum
 
 Status: accepted
 Date: 2026-10-06

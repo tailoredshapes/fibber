@@ -1,4 +1,4 @@
-# 0016. The release files agree and the seed is pinned
+# 0017. The release files agree and the seed is pinned
 
 Status: accepted
 Date: 2026-10-06
