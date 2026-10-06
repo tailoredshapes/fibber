@@ -1,0 +1,58 @@
+;; fib.crypto.ops: what a program calls. Every function takes the provider as its first argument (a driver's value, or a `(dyn
+;; CryptoProvider :send ..)`), so a library that needs cryptography takes one provider parameter and stays independent of the driver.
+;; The functions are thin: digests, HMAC and key derivation are the provider's; this module only sequences start, update and finish and
+;; closes a hasher that an error leaves open.
+(ns fib.crypto.ops (:use fib.core fib.seq fib.coll fib.crypto.types))
+
+;; Does the provider list `what` (a digest, a key derivation function, :hmac, :random, :ct-equal)? Asking an unsupported operation is an
+;; error value as well, so this is for choosing, not for guarding.
+(defun supports? (p: p what: keyword) :where ((CryptoProvider p)) -> bool
+  (some? (first (filter (fn (c: keyword) (= c what)) (provider-capabilities p)))))
+
+;; ---- streaming. `(digest-start p :sha-256)`, then `feed` any number of times, then `hasher-finish`.
+(defun digest-start (p: p alg: keyword) :where ((CryptoProvider p)) -> (Result (dyn Hasher :send) CryptoError)
+  (provider-digest-start p alg))
+
+(defun hmac-start (p: p alg: keyword key: (Array i8)) :where ((CryptoProvider p)) -> (Result (dyn Hasher :send) CryptoError)
+  (provider-hmac-start p alg key))
+
+(defun feed (h: h data: (Array i8)) :where ((Hasher h)) -> (Result unit CryptoError)
+  (hasher-update h data 0 (array-len data)))
+
+;; The bytes `data[off, off+len)`: a large input is fed in pieces without copying it.
+(defun feed-range (h: h data: (Array i8) off: i64 len: i64) :where ((Hasher h)) -> (Result unit CryptoError)
+  (if (or (< off 0) (< len 0) (> (+ off len) (array-len data)))
+    (Err (invalid-argument "feed-range: the range is outside the bytes"))
+    (hasher-update h data off len)))
+
+;; Feeds the data and finishes; a failed update closes the hasher first.
+(defun run-hasher :private (h: h data: (Array i8)) :where ((Hasher h)) -> (Result (Array i8) CryptoError)
+  (match (hasher-update h data 0 (array-len data))
+    ((Err e) (do (hasher-close h) (Err e)))
+    ((Ok _) (hasher-finish h))))
+
+;; ---- one-shot
+(defun digest (p: p alg: keyword data: (Array i8)) :where ((CryptoProvider p)) -> (Result (Array i8) CryptoError)
+  (match (provider-digest-start p alg) ((Err e) (Err e)) ((Ok h) (run-hasher h data))))
+
+(defun hmac (p: p alg: keyword key: (Array i8) data: (Array i8)) :where ((CryptoProvider p)) -> (Result (Array i8) CryptoError)
+  (match (provider-hmac-start p alg key) ((Err e) (Err e)) ((Ok h) (run-hasher h data))))
+
+;; ---- key derivation. Each is `provider-derive` of a `Kdf` value; `length` is the number of output bytes.
+(defun pbkdf2 (p: p alg: keyword password: (Array i8) salt: (Array i8) iterations: i64 length: i64) :where ((CryptoProvider p)) -> (Result (Array i8) CryptoError)
+  (provider-derive p (KdfPbkdf2 alg password salt iterations length)))
+
+(defun hkdf (p: p alg: keyword ikm: (Array i8) salt: (Array i8) info: (Array i8) length: i64) :where ((CryptoProvider p)) -> (Result (Array i8) CryptoError)
+  (provider-derive p (KdfHkdf alg ikm salt info length)))
+
+(defun scrypt (p: p password: (Array i8) salt: (Array i8) n: i64 r: i64 par: i64 length: i64) :where ((CryptoProvider p)) -> (Result (Array i8) CryptoError)
+  (provider-derive p (KdfScrypt password salt n r par length)))
+
+(defun argon2id (p: p password: (Array i8) salt: (Array i8) iterations: i64 memory-kib: i64 lanes: i64 length: i64) :where ((CryptoProvider p)) -> (Result (Array i8) CryptoError)
+  (provider-derive p (KdfArgon2id password salt iterations memory-kib lanes length)))
+
+;; ---- random and comparison
+(defun random-bytes (p: p n: i64) :where ((CryptoProvider p)) -> (Result (Array i8) CryptoError) (provider-random p n))
+
+;; Constant-time equality of two byte arrays, by the driver's library. False for different lengths (the length is not secret).
+(defun ct= (p: p a: (Array i8) b: (Array i8)) :where ((CryptoProvider p)) -> bool (provider-ct-equal p a b))

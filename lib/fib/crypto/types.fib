@@ -1,0 +1,51 @@
+;; fib.crypto.types: the interface of fib.crypto (docs/design/crypto.md). This library has NO cryptography in it: a driver (its own
+;; repository: fib-crypto-openssl, fib-crypto-apple) implements `CryptoProvider` over a C library and a program passes the provider
+;; VALUE to whatever needs it. Errors are values; there is no global provider and no silent fallback.
+(ns fib.crypto.types (:use fib.core fib.seq fib.coll))
+
+;; What a failed operation came to. `kind` is one of "unsupported" (the provider does not have the algorithm: see `provider-capabilities`),
+;; "invalid-argument" (a size or count the operation refuses), "failed" (the library reported an error) and "closed" (a hasher used after
+;; finish or close). `message` is for people; a program branches on `kind`.
+(defstruct CryptoError (kind: str message: str))
+(derive Eq CryptoError)
+(derive Debug CryptoError)
+
+(defun unsupported (what: str) -> CryptoError (CryptoError "unsupported" (str what " is not supported by this provider")))
+(defun invalid-argument (message: str) -> CryptoError (CryptoError "invalid-argument" message))
+(defun crypto-failed (message: str) -> CryptoError (CryptoError "failed" message))
+(defun unsupported? (e: CryptoError) -> bool (= (. e kind) "unsupported"))
+
+;; A key derivation function and its parameters, a value a provider's `provider-derive` runs. `alg` is a digest name (`:sha-256`), the
+;; password, salt, ikm and info are bytes, `length` is the number of output bytes. Capability names: `:pbkdf2` `:hkdf` `:scrypt`
+;; `:argon2id`; a provider that has `:pbkdf2` also has to have the digest it is asked for, or the answer is an `unsupported` error.
+(defenum Kdf
+  (KdfPbkdf2 alg: keyword password: (Array i8) salt: (Array i8) iterations: i64 length: i64)
+  (KdfHkdf alg: keyword ikm: (Array i8) salt: (Array i8) info: (Array i8) length: i64)
+  (KdfScrypt password: (Array i8) salt: (Array i8) n: i64 r: i64 p: i64 length: i64)
+  (KdfArgon2id password: (Array i8) salt: (Array i8) iterations: i64 memory-kib: i64 lanes: i64 length: i64))
+
+;; The capability name of a key derivation function.
+(defun kdf-name (k: Kdf) -> keyword
+  (match k ((KdfPbkdf2 _ _ _ _ _) :pbkdf2) ((KdfHkdf _ _ _ _ _) :hkdf) ((KdfScrypt _ _ _ _ _ _) :scrypt) ((KdfArgon2id _ _ _ _ _ _) :argon2id)))
+
+;; A running digest or HMAC. A hasher is a handle on state the driver owns: `hasher-update` feeds the bytes `data[off, off+len)` (so a large
+;; input is never copied), `hasher-finish` returns the result and releases the state, `hasher-close` releases it without a result. Closing is
+;; idempotent and finishing twice is a "closed" error, never a crash; a hasher is used by one task at a time.
+(defprotocol Hasher
+  (hasher-update (self data: (Array i8) off: i64 len: i64) -> (Result unit CryptoError))
+  (hasher-finish (self) -> (Result (Array i8) CryptoError))
+  (hasher-close (self) -> unit))
+
+;; What a driver implements. Every operation returns a `Result`; an algorithm the provider does not list in `provider-capabilities` is an
+;; "unsupported" error from the operation that asked for it. Capability names are keywords: digests `:sha-256` `:sha-384` `:sha-512` and
+;; the legacy `:sha-1` `:md5` (not for security), the key derivation functions of `Kdf`, and `:hmac`, `:random`, `:ct-equal`. The
+;; constant-time comparison is the library's (CRYPTO_memcmp, timingsafe_bcmp), never a loop of ours: `provider-ct-equal` is false for
+;; bytes of different lengths (the length is not secret) and compares equal-length bytes in time that does not depend on where they differ.
+(defprotocol CryptoProvider
+  (provider-name (self) -> str)
+  (provider-capabilities (self) -> (Vec keyword))
+  (provider-digest-start (self alg: keyword) -> (Result (dyn Hasher :send) CryptoError))
+  (provider-hmac-start (self alg: keyword key: (Array i8)) -> (Result (dyn Hasher :send) CryptoError))
+  (provider-derive (self kdf: Kdf) -> (Result (Array i8) CryptoError))
+  (provider-random (self n: i64) -> (Result (Array i8) CryptoError))
+  (provider-ct-equal (self a: (Array i8) b: (Array i8)) -> bool))
