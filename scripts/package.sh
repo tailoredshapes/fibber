@@ -11,24 +11,28 @@
 #   2. Stage 2 (F) built by the seed; the stage check is the fixed point: F builds F3 and F3 emits the same lIR for compiler/fibc.fib as F (the seed's own emit is a note: its embedded prelude lags).
 #   3. The shipped fibc: built by F3 and linked to LLVM statically (macOS: the `libtool`-merged archive of llvm-static.sh). `fibc build` writes an absolute rpath for every -L directory, here a directory of
 #      this script's scratch that goes away with it; a `cc` shim drops it, so that bin/fibc has no RUNPATH at all. Checked on Linux: no RUNPATH/RPATH, no NEEDED
-#      liblair or libLLVM, and `ldd` shows only libc, libm, libstdc++, libgcc_s, libz and libzstd (and the loader); no AVX in the code. Checked on macOS
+#      liblair or libLLVM, and `ldd` shows only libc, libm, libstdc++, libgcc_s, libz and libzstd (and the loader); no AVX-512 in the code (x86-64-v3 has
+#      AVX2 and FMA, not AVX-512); the start-up CPU check is in it (docs/adr/0008) and passes here. Checked on macOS
 #      (`otool`): no LC_RPATH, and every dylib it loads is under /usr/lib or /System (nothing of Homebrew), and the signature (`codesign -v`: ld64 signs ad hoc).
 #   4. OUT/fibc-VERSION-PLATFORM.tar.gz holding fibc-VERSION-PLATFORM/{bin/fibc, share/fibber/lib/, LICENSE, README.txt} (no lib/: the
 #      code generator is in bin/fibc), and OUT/SHA256SUMS. The unpacked tree runs with no environment: the compiler finds the library by its own location
 #      (compiler/expand/libdir.fib).
-# The machine that runs fibc needs (Linux) libc, libm, libstdc++, libgcc_s, libz and libzstd, (macOS) only the system libraries, and `cc` for `fibc build`; not LLVM.
+#   5. The unpacked tree, in an empty environment, runs `bin/fibc --version` and builds and runs hello.
+# The machine that runs fibc needs (Linux) an x86-64-v3 CPU (2013 and later: AVX2, FMA, BMI1/2; docs/adr/0008) and glibc 2.33 or later, libc, libm,
+# libstdc++, libgcc_s, libz and libzstd, (macOS) Apple silicon and only the system libraries, and `cc` for `fibc build`; not LLVM.
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 : "${FIBC:?FIBC must name a seed fibc}"
 case "$(uname -s)-$(uname -m)" in
-  Linux-x86_64)  plat=linux-x86_64;  default_cpu=x86-64-v2; llvm_prefix=/usr/lib/llvm-21; llvm_libdir=/usr/lib/llvm-21/lib ;;
+  Linux-x86_64)  plat=linux-x86_64;  default_cpu=x86-64-v3; llvm_prefix=/usr/lib/llvm-21; llvm_libdir=/usr/lib/llvm-21/lib ;;
   Darwin-arm64)  plat=darwin-arm64;  default_cpu=apple-m1;  llvm_prefix=/opt/homebrew/opt/llvm@21; llvm_libdir=/opt/homebrew/opt/llvm@21/lib ;;
   *) echo "package: no release platform for $(uname -s)-$(uname -m) (linux-x86_64 and darwin-arm64)" >&2; exit 2 ;;
 esac
 # lair generates code for the host CPU unless told otherwise; a release must run on machines other than the one that built it
 # (a tarball built on a CI runner died with SIGILL on a desktop CPU), so everything this script builds targets a baseline:
-# x86-64-v2 on x86, apple-m1 (the first Apple silicon: every later one runs its code) on a Mac.
+# x86-64-v3 on x86 (docs/adr/0008: supported ISAs have tail calls and FMA; an older CPU gets the start-up check's message, not SIGILL),
+# apple-m1 (the first Apple silicon: every later one runs its code) on a Mac.
 export FIB_TARGET_CPU=${FIB_TARGET_CPU:-$default_cpu}
 out=$(mkdir -p "${1:-dist}" && cd "${1:-dist}" && pwd)
 "$root/scripts/check-version.sh"
@@ -100,14 +104,20 @@ elif [ "$LLVM_LINK" = static ]; then
 else
   echo "note: LLVM_LINK=shared: this binary needs the LLVM shared library; it is not a release"
 fi
-# No AVX in the code generated for x86-64-v2, by function: LLVM's static archives carry BLAKE3's AVX2 and AVX-512 kernels, which blake3 picks at run time
-# by cpuid (`_llvm_blake3_*_avx2`, `_avx512`), so those and only those are allowed to use ymm/zmm.
-if [ "$plat" = linux-x86_64 ] && command -v objdump >/dev/null 2>&1 && [ "$FIB_TARGET_CPU" = x86-64-v2 ]; then
-  avx=$(objdump -d --no-show-raw-insn "$tree/bin/fibc" | awk '/^[0-9a-f]+ <.*>:$/ { fn = $2 } /(ymm|zmm)[0-9]/ { c[fn]++ } END { for (f in c) print f }' \
-        | grep -v -E '^<_llvm_blake3_[a-z_]*(avx2|avx512)>:$' || true)
-  if [ -n "$avx" ]; then
-    echo "package: the shipped fibc uses AVX registers although it was built for $FIB_TARGET_CPU (FIB_TARGET_CPU did not take), in: $(echo "$avx" | head -n 5 | tr '\n' ' ')" >&2; exit 1
+# x86-64-v3 has AVX2 and FMA (ymm registers are expected) but not AVX-512: no zmm register and no opmask k register in the code generated for it, by
+# function. LLVM's static archives carry BLAKE3's AVX-512 kernels, which blake3 picks at run time by cpuid (`_llvm_blake3_*_avx512`), so those and only
+# those are allowed. The start-up check (emit.cpucheck) must be in the shipped fibc (it imports glibc's __x86_get_cpuid_feature_leaf) and pass here.
+if [ "$plat" = linux-x86_64 ] && command -v objdump >/dev/null 2>&1 && [ "$FIB_TARGET_CPU" = x86-64-v3 ]; then
+  avx512=$(objdump -d --no-show-raw-insn "$tree/bin/fibc" | awk '/^[0-9a-f]+ <.*>:$/ { fn = $2 } /zmm[0-9]|[{]%k[1-7][}]/ { c[fn]++ } END { for (f in c) print f }' \
+        | grep -v -E '^<_llvm_blake3_[a-z_]*avx512>:$' || true)
+  if [ -n "$avx512" ]; then
+    echo "package: the shipped fibc uses AVX-512 although it was built for $FIB_TARGET_CPU (FIB_TARGET_CPU did not take), in: $(echo "$avx512" | head -n 5 | tr '\n' ' ')" >&2; exit 1
   fi
+  echo "shipped fibc: no AVX-512 outside BLAKE3's own kernels; $(objdump -d --no-show-raw-insn "$tree/bin/fibc" | grep -c -E 'vfmadd|vfnmadd|vfmsub') FMA instructions"
+fi
+if [ "$plat" = linux-x86_64 ]; then
+  nm -D "$tree/bin/fibc" | grep -q __x86_get_cpuid_feature_leaf || { echo "package: the shipped fibc has no start-up CPU check (docs/adr/0008)" >&2; exit 1; }
+  echo "shipped fibc: the start-up CPU check is in it"
 fi
 emit "$tree/bin/fibc" > "$work/emit.ship"
 cmp "$work/emit.F" "$work/emit.ship" || { echo "package: the shipped fibc emits something else" >&2; exit 1; }
@@ -131,6 +141,12 @@ Needs only the system libraries (on Linux libc, libm, libstdc++, libgcc_s, libz 
 so it does not need LLVM installed.
 Licence: BSD 3-Clause, see LICENSE.
 README
+echo "== the unpacked tree, no environment: --version, hello"
+env -i PATH=/usr/bin:/bin "$tree/bin/fibc" --version || { echo "package: the shipped fibc does not start (the CPU check, or a library)" >&2; exit 1; }
+echo '(defun main () -> i64 (do (println "hello from fibber") 0))' > "$work/hello.fib"
+(cd "$work" && env -i PATH=/usr/bin:/bin "$tree/bin/fibc" build hello.fib -o hello && env -i ./hello) | grep -qx 'hello from fibber' \
+  || { echo "package: the shipped fibc cannot build and run hello" >&2; exit 1; }
+echo "the shipped fibc builds hello and it runs"
 rm -f "$out/$name.tar.gz"
 if tar --version 2>/dev/null | grep -q 'GNU tar'; then tar -C "$work" --owner=0 --group=0 --sort=name -czf "$out/$name.tar.gz" "$name"
 else tar -C "$work" --uid 0 --gid 0 -czf "$out/$name.tar.gz" "$name"; fi   # bsdtar (macOS) has no --sort

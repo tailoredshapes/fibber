@@ -639,8 +639,11 @@ Binary releases of `fibc` on GitHub (README.md, Install; `scripts/package.sh`,
    F3, and the stage check is the fixed point (F and F3 emit the same lIR for `compiler/fibc.fib`); the
    shipped `fibc` is built by F3. The unpacked tarball must run `hello.fib` under `env -i` before the
    release is created.
-4. `package.sh` builds for `FIB_TARGET_CPU=x86-64-v2` unless told otherwise (README, Install), and, when
-   `objdump` is present, fails if the shipped `fibc` uses `ymm` or `zmm` registers.
+4. `package.sh` builds for `FIB_TARGET_CPU=x86-64-v3` unless told otherwise (README, Install): a release
+   needs a 2013+ x86-64 CPU with AVX2 and FMA (x86-64-v3), or Apple Silicon/ARMv8 (docs/adr/0008; it was
+   x86-64-v2 until 2026-10-06). When `objdump` is present it fails if the shipped `fibc` uses AVX-512 (`zmm`, opmask
+   registers) outside BLAKE3's own kernels; it fails if the shipped `fibc` lacks the start-up CPU check, and it runs
+   the unpacked `fibc --version` and hello in an empty environment.
 5. The seed moves forward deliberately: a commit changes `SEED` to a newer release's url and sha256
    (v0.1.5 is the `SEED` now; it was v0.1.3 until the flip, commit `0a86093`).
 
