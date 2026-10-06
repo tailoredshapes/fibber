@@ -1,0 +1,20 @@
+;; compiler/emit/lower/freeze.fib: `freeze` and `frozen?` (P-count-b, docs/design/parallelism.md 2.5, 3.6; spec/types.md 8.2).
+;; `(freeze x)` publishes the value graph of `x` as IMMORTAL (rt/atom.lir, `fib.freeze`): afterwards a retain or release of any object in
+;; it is a flag test, whatever the number of threads. It answers `x` itself: the argument is consumed (E2) and the same reference comes
+;; back, so the call is the identity as far as counts go. A value that is no object (the unboxed `(Option i64)` is a pair of words, no
+;; header) has nothing to freeze and passes through; `(frozen? x)` of such a value is true. A `dyn` is frozen through its object.
+(ns emit.lower.freeze
+  (:use types.ty types.scheme types.ast own.program emit.value emit.layout emit.ir emit.objects emit.program
+        emit.lower.cx emit.lower.ops))
+
+;; `(freeze x)`: the call, then `x`.
+(defun lcx-freeze (cx: LowerCx x: V) -> (Result V str)
+  (match (lcx-obj-word cx x)
+    ((some w) (do (lcx-rt-call cx "fib.freeze" [(VVal w LirPtr)] nil) (Ok x)))
+    (nil (Ok x))))
+
+;; `(frozen? x)`: whether the flags of `x` say IMMORTAL.
+(defun lcx-frozen (cx: LowerCx x: V) -> (Result V str)
+  (match (lcx-obj-word cx x)
+    ((some w) (Ok (lcx-rt-call cx "fib.frozen" [(VVal w LirPtr)] (some LirI1))))
+    (nil (Ok (fb-val (. cx b) "(icmp eq (i1 1) (i1 1))" LirI1)))))

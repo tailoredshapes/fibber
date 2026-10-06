@@ -1,0 +1,48 @@
+;; scripts/bench/freeze-contention.fib: reference-count contention and what `freeze` removes (P-count-b; docs/shootout/parallel.md, "freeze").
+;; usage: freeze-contention MODE K T N
+;; T tasks each do N iterations of "take a node out of a Vec of K nodes, hold it in a fresh Vec, drop the Vec" (the p2 loop of
+;; docs/design/parallelism/proto/p2.fib, section 2.5); prints three rounds as `t US` (microseconds) and the checksum as `v X`.
+;; MODE: private  each task builds its own K nodes (counts never shared: the floor)
+;;       shared   one Vec of K nodes built by main and captured by every task (SHARED: an atomic count pair per read)
+;;       frozen   the same Vec, `freeze`d first (IMMORTAL: a flag test per count operation)
+;;       read     shared, a plain field read `(. (nth nodes i) a)` and no hold
+;;       readf    frozen, the same plain field read
+;; scripts/bench/freeze.sh runs the table.
+(defstruct Node (a: i64 b: i64))
+
+(defun make-nodes (k: i64) -> (Vec Node)
+  (loop ((i 0) (v (vec-empty))) (if (< i k) (recur (+ i 1) (vec-conj v (Node i (* i 2)))) v)))
+
+(defun hold (nodes: (Vec Node) n: i64 salt: i64) -> i64
+  (let ((k (vec-count nodes)))
+    (loop ((i 0) (s 0))
+      (if (< i n)
+          (let ((x (vec-nth nodes (rem (+ i salt) k))))
+            (let ((v (vec-conj (vec-empty) x)))
+              (recur (+ i 1) (+ s (. (vec-nth v 0) a)))))
+          s))))
+
+(defun field-read (nodes: (Vec Node) n: i64 salt: i64) -> i64
+  (let ((k (vec-count nodes)))
+    (loop ((i 0) (s 0))
+      (if (< i n) (recur (+ i 1) (+ s (. (vec-nth nodes (rem (+ i salt) k)) a))) s))))
+
+(defun spawn-all (mode: str shared: (Vec Node) k: i64 n: i64 t: i64) -> i64
+  (let ((ts (loop ((j 0) (acc (vec-empty)))
+              (if (< j t)
+                  (recur (+ j 1)
+                         (vec-conj acc
+                           (cond (= mode "private") (spawn (fn () (hold (make-nodes k) n j)))
+                                 (or (= mode "read") (= mode "readf")) (spawn (fn () (field-read shared n j)))
+                                 :else (spawn (fn () (hold shared n j))))))
+                  acc))))
+    (loop ((j 0) (s 0)) (if (< j t) (recur (+ j 1) (+ s (join (vec-nth ts j)))) s))))
+
+(defun main () -> i64
+  (let ((mode (nth (args) 0)) (k (unwrap (parse-long (nth (args) 1)))) (t (unwrap (parse-long (nth (args) 2)))) (n (unwrap (parse-long (nth (args) 3)))))
+    (let ((shared (if (or (= mode "frozen") (= mode "readf")) (freeze (make-nodes k)) (make-nodes k))))
+      (do (dotimes (r 3)
+            (let ((t0 (sys-clock-now)))
+              (let ((v (spawn-all mode shared k n t)))
+                (do (println "t " (quot (- (sys-clock-now) t0) 1000)) (println "v " v)))))
+          0))))

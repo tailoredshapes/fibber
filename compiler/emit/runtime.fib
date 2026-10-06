@@ -340,15 +340,18 @@
 ;; number of entries, the capacity, and the inline buffer that a drop
 ;; starts with on its own stack frame. It is private to one drop, so
 ;; there is no state shared between threads.
-(defstruct fib.wl (ptr i64 i64 ptr))
+(defstruct fib.wl (ptr i64 i64 ptr i64))
 
-;; A worklist on the buffer `buf` of `cap` entries.
+;; A worklist on the buffer `buf` of `cap` entries. Its fifth field, the mode, says what a share-marking does to the objects it queues
+;; (rt/atom.lir: 1 SHARED, 2 IMMORTAL for a `def`, 3 IMMORTAL for `freeze`); a drop does not read it. The mode lives in the worklist, which
+;; is private to one walk, and not in a global, so that a `freeze` and a `spawn` on two threads at once do not disturb each other.
 (define internal (fib.wl-init void) ((ptr wl) (ptr buf) (i64 cap))
   (block entry
     (store buf (getelementptr %struct.fib.wl wl (i32 0) (i32 0)))
     (store (i64 0) (getelementptr %struct.fib.wl wl (i32 0) (i32 1)))
     (store cap (getelementptr %struct.fib.wl wl (i32 0) (i32 2)))
     (store buf (getelementptr %struct.fib.wl wl (i32 0) (i32 3)))
+    (store (i64 1) (getelementptr %struct.fib.wl wl (i32 0) (i32 4)))
     (ret)))
 
 ;; Doubles the capacity, moving to the heap; the inline buffer is never
@@ -1618,21 +1621,56 @@
 ;; finds on a worklist (core.lir), so that a chain of a million objects
 ;; takes no native frame per link. An object is marked when it is queued,
 ;; so it is queued once.
-;; The flags a walk sets: SHARED (1), or SHARED and IMMORTAL (9) in
-;; fib.immortalise, which also zeroes the count (§8.2).
-(global internal fib.mark i32 (i32 1))
+;; What the walk does to an object it queues is the MODE of its worklist
+;; (core.lir, the fifth field; a field of the walk and no global, so that
+;; two threads may walk at once: a `freeze` on one and a `spawn` on another):
+;;   1 share:      flags |= SHARED; stops at SHARED and IMMORTAL objects.
+;;   2 def:        flags |= SHARED|IMMORTAL and count := 0 (§8.2, fib.immortalise);
+;;                 stops at IMMORTAL ones; runs before `main`.
+;;   3 freeze:     as 2, for `(freeze x)` while the program runs (P-count-b): stops at
+;;                 IMMORTAL and STACK objects, refuses a cell, atom, weak reference or
+;;                 task (fib.freeze-check), and in trace mode reports each object frozen
+;;                 as `F n`: it is never freed, and the audit counts it as intended, as a
+;;                 literal is (it was not allocated by the program's own account).
+(define internal (fib.walk-mode i64) ((ptr wl))
+  (block entry (ret (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 4))))))
+
+;; An object that `freeze` must not publish: a cell, an atom, a weak
+;; reference or a task is mutable in place (or observes its target); as
+;; IMMORTAL data it would be written by one thread while all others read it
+;; with no count and no lock to order them. Kind 0 is anything else
+;; (rt table `fib.kinds`, emitted with the type table).
+(define internal (fib.freeze-check void) ((ptr p))
+  (block entry
+    (let ((k (load i8 (getelementptr i8 @fib.kinds (zext i64 (call @fib.tid p))))))
+      (br (icmp eq k (i8 0)) done refuse)))
+  (block refuse (br (icmp eq k (i8 1)) cell r2))
+  (block r2 (br (icmp eq k (i8 2)) atom r3))
+  (block r3 (br (icmp eq k (i8 3)) weak task))
+  (block cell (call @fib.trap-c (string \"freeze: a cell is reachable from the value (a cell is mutable in place)\")) (unreachable))
+  (block atom (call @fib.trap-c (string \"freeze: an atom is reachable from the value (an atom is mutable in place)\")) (unreachable))
+  (block weak (call @fib.trap-c (string \"freeze: a weak reference is reachable from the value\")) (unreachable))
+  (block task (call @fib.trap-c (string \"freeze: a task is reachable from the value\")) (unreachable))
+  (block done (ret)))
 
 (define internal (fib.share-queue void) ((ptr wl) (ptr p))
   (block entry (br (icmp eq p (ptr null)) done check))
   (block check
-    (let ((f (call @fib.flags p)))
-      (br (icmp ne (and f (i32 9)) (i32 0)) done mark)))
-  (block mark
-    (let ((m (load i32 @fib.mark)))
-      (atomicrmw or monotonic (getelementptr %struct.fib.hdr p (i32 0) (i32 2)) m)
-      (br (icmp eq m (i32 9)) forever push)))
+    (let ((f (call @fib.flags p))
+          (mode (call @fib.walk-mode wl))
+          (skip (select (icmp eq mode (i64 1)) (i32 9) (select (icmp eq mode (i64 3)) (i32 12) (i32 8)))))
+      (br (icmp ne (and f skip) (i32 0)) done mark)))
+  (block mark (br (icmp eq mode (i64 3)) refuse set))
+  (block refuse (call @fib.freeze-check p) (br set))
+  (block set
+    (atomicrmw or monotonic (getelementptr %struct.fib.hdr p (i32 0) (i32 2)) (select (icmp eq mode (i64 1)) (i32 1) (i32 9)))
+    (br (icmp eq mode (i64 1)) push forever))
   (block forever
     (store (i64 0) (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))
+    (br (icmp eq mode (i64 3)) maybetrace push))
+  (block maybetrace (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced push))
+  (block traced
+    (call @fib.trace-line (i8 70) (load i64 (getelementptr i8 p (i64 -16))) (i8 0))
     (br push))
   (block push
     (call @fib.wl-push wl p)
@@ -1646,16 +1684,37 @@
 ;; before `main`.
 (define internal (fib.immortalise void) ((ptr p))
   (block entry
-    (store (i32 9) @fib.mark)
-    (call @fib.share p)
-    (store (i32 1) @fib.mark)
+    (call @fib.walk p (i64 2))
     (ret)))
 
+;; `(freeze x)` (P-count-b, spec/types.md 8.2): the value graph of x becomes
+;; IMMORTAL and SHARED, so that a retain or a release of any object in it is a
+;; flag test and nothing else, whatever the number of threads; and `fib.unique?`
+;; is false on each, so an update through a place that holds one copies. Never
+;; freed. Safe to call while other threads run: the walk keeps no global, an
+;; object of x's graph that other threads also hold is already SHARED (their
+;; counts are atomic) and a count they change after the flag is set is
+;; never read again. Traps (nothing is undone: the objects above the one
+;; refused stay frozen, which is safe) at a cell, atom, weak reference or task.
+(define internal (fib.freeze void) ((ptr p))
+  (block entry
+    (call @fib.walk p (i64 3))
+    (ret)))
+
+(define internal (fib.frozen i1) ((ptr p))
+  (block entry (ret (icmp ne (and (call @fib.flags p) (i32 8)) (i32 0)))))
+
 (define internal (fib.share void) ((ptr p))
+  (block entry
+    (call @fib.walk p (i64 1))
+    (ret)))
+
+(define internal (fib.walk void) ((ptr p) (i64 mode))
   (block entry
     (let ((wl (alloca %struct.fib.wl))
           (buf (alloca (align 8) i8 (i32 256))))
       (call @fib.wl-init wl buf (i64 32))
+      (store mode (getelementptr %struct.fib.wl wl (i32 0) (i32 4)))
       (call @fib.share-queue wl p)
       (br loop)))
   (block loop (br (call @fib.wl-empty wl) done walk))

@@ -1,0 +1,73 @@
+;; spec:   spec/types.md 8.2 (freeze, frozen?); docs/design/parallelism.md 2.5, 3.6 (P-count-b)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: freeze, frozen?
+;; `(freeze x)` makes x and everything reachable from it IMMORTAL: its header flags have bit 8 and its count word is 0 (read here through
+;; `raw`: the header is the count at +0 and the flags at +12), for the Vec, the records inside it and their strings, not only the root. A
+;; value built at run time is not frozen before and has count 1. Freezing answers the same value. An update of a frozen Vec, Map or Set
+;; (`conj`, `assoc`, `dissoc`) gives a new object that is not frozen and leaves the frozen one as it was: the unique-write protocol treats
+;; IMMORTAL as shared, so no write happens in place (a conj that wrote in place would give back the frozen object itself). A freeze
+;; that skips the children, or leaves the count, fails the checks of every node.
+(ns main (:use tl.check))
+
+(defstruct Node (a: i64 b: str))
+(defstruct Tree (name: str nodes: (Vec Node)))
+
+(defun rc (x) -> i64 (unsafe (load-i64 (raw x))))
+(defun flags (x) -> i32 (unsafe (load-i32 (ptr+ (raw x) 12))))
+(defun immortal? (x) -> bool (not (= (bit-and (flags x) 8i32) 0i32)))
+
+(defun make-tree (n: i64) -> Tree
+  (Tree (str "tree" n) (mapv (fn (i: i64) (Node i (str "n" i))) (range n))))
+
+(defun main () -> i64
+  (let ((c (checks)) (t (make-tree 40)))
+    (do (check c (not (frozen? t)))
+        (check c (= (rc t) 1))
+        (check c (= (rc (. t nodes)) 1))
+        (let ((f (freeze t)))
+          (do (check c (frozen? f))
+              (check c (immortal? f))
+              (check c (= (rc f) 0))
+              (check c (frozen? (. f name)))
+              (check c (frozen? (. f nodes)))
+              (check c (= (rc (. f nodes)) 0))
+              (check c (every? (fn (n: Node) (and (frozen? n) (= (rc n) 0) (immortal? n))) (. f nodes)))
+              (check c (every? (fn (n: Node) (and (frozen? (. n b)) (= (rc (. n b)) 0))) (. f nodes)))
+              (check c (= (. f name) "tree40"))
+              (check c (= (reduce + 0 (map (fn (n: Node) (. n a)) (. f nodes))) 780))
+              ;; reading a frozen graph does not touch a count
+              (dotimes (i 100) (check c (= (. (nth (. f nodes) (rem i 40)) a) (rem i 40))))
+              (check c (= (rc (. f nodes)) 0))))
+        ;; updates copy
+        (let ((v (freeze (mapv (fn (i: i64) (str "s" i)) (range 5)))))
+          (let ((w (conj v "x")))
+            (do (check c (frozen? v))
+                (check c (not (frozen? w)))
+                (check c (= (count v) 5))
+                (check c (= (count w) 6))
+                (check c (= (rc w) 1)))))
+        (let ((m (freeze (assoc (assoc {} "a" (str "1" 1)) "b" (str "2" 2)))))
+          (let ((m2 (assoc m "c" "3")) (m3 (dissoc m "a")))
+            (do (check c (frozen? m))
+                (check c (not (frozen? m2)))
+                (check c (not (frozen? m3)))
+                (check c (= (count m) 2))
+                (check c (= (count m2) 3))
+                (check c (= (count m3) 1))
+                (check c (= (get m "a") (some "11"))))))
+        (let ((s (freeze (conj (conj #{} (str "p" 1)) (str "p" 2)))))
+          (let ((s2 (conj s "q")))
+            (do (check c (frozen? s))
+                (check c (not (frozen? s2)))
+                (check c (= (count s) 2))
+                (check c (= (count s2) 3)))))
+        ;; a literal is frozen already; freezing a frozen value is a no-op
+        (check c (frozen? "literal"))
+        (check c (frozen? (freeze "literal")))
+        (let ((f (freeze (make-tree 3))))
+          (check c (frozen? (freeze f))))
+        (checks-result c))))

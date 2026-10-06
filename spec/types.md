@@ -689,6 +689,32 @@ under `crates/` have no row for, like `cell-update!` (§2.13.1). `(atom (cell 0)
 how "a cell that is not an atom may not cross" holds without inspecting
 atom contents at `spawn`.
 
+#### 2.10.1 `freeze` and `frozen?` (P-count-b)
+
+```
+freeze  : ∀a. (Object a, Send a) ⇒ (fn :send (a) a)      ; escapes [EscStore]: consumed, and the same reference comes back
+frozen? : ∀a. (Object a) ⇒ (fn :send (a) bool)           ; escapes [EscBorrow]
+```
+
+`(freeze x)` publishes the value graph of `x` as `IMMORTAL` (§8.2): `x` and every object reachable from it get the flags `SHARED|IMMORTAL`
+and count 0, so that a `retain` or `release` of any of them, from any number of threads, is one flag test and no write (8 ns flat at 28
+threads where an atomic pair costs 973 ns on one object, docs/design/parallelism.md 2.5), and `fib.unique?` is false on each, so an update
+through a place that holds one (`conj`, `assoc`, `dissoc`, `array-take!`, `array-push!`, the unique-write protocol of §6.6) copies and never
+writes. It answers `x` itself. Cost, **Decided** with the design: a frozen object is never freed, and the audit counts it as an intentional
+immortal as it counts a literal (in trace mode each object frozen is reported as `F n` at the freeze, so a clean audit holds). The call is
+for data that lives to the end of the program: model weights, tables, configuration.
+
+Refused: a **cell** inside the graph is refused by the type (`Send` fails at `freeze`, §5.3: `cell cannot be shared between threads: ..`); an
+**atom**, a **weak reference** or a **task** is refused at run time, when the walk reaches it, with the trap `freeze: an atom is reachable
+from the value (an atom is mutable in place)`, `freeze: a weak reference is reachable from the value` or `freeze: a task is reachable from the
+value` (the type table has a kind column, `fib.kinds`, §8.2). A trap leaves what the walk had marked frozen, which is safe (an immortal
+object only stops being freed). An atom that is already `IMMORTAL` (the value of a `def`) is not reached again and is no refusal. A value
+that is not an object (the unboxed `(Option i64)`) has nothing to freeze: `freeze` answers it and `frozen?` of it is true.
+`(frozen? x)` is the `IMMORTAL` bit of `x`'s header (a literal is frozen), so it says nothing of what `x` reaches; `freeze` of a graph
+whose objects are partly frozen already freezes the rest. `freeze` may run while other tasks run: the walk keeps its mode in its own
+worklist, the objects of a graph that other tasks hold are `SHARED` already, and a count that another task changes after the flag is set is
+never read again.
+
 ### 2.11 `weak`, `spawn`, `join`, `trap`
 
 ```
@@ -3529,6 +3555,11 @@ fib.share   (ptr p) -> void                      ; §8.8
 fib.immortalise (ptr p) -> void                  ; def initialisation (syntax §3.19): walk p through trace,
                                                  ; stopping at IMMORTAL objects; on each: count := 0,
                                                  ; flags |= IMMORTAL. Runs before main, single-threaded.
+fib.freeze  (ptr p) -> void                      ; `(freeze x)` (§2.10.1): the same walk while the program runs, through
+                                                 ; SHARED objects too (it stops at IMMORTAL and STACK ones), refusing a
+                                                 ; cell, atom, weak reference or task by fib.kinds[tid]; in trace mode `F n`
+                                                 ; for each object frozen. The walk's mode is a field of its worklist.
+fib.frozen  (ptr p) -> i1                        ; flags(p) & IMMORTAL
 ```
 
 A `STACK` object has the same layout in an `alloca` of the frame,

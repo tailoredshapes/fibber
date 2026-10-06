@@ -333,15 +333,18 @@
 ;; number of entries, the capacity, and the inline buffer that a drop
 ;; starts with on its own stack frame. It is private to one drop, so
 ;; there is no state shared between threads.
-(defstruct fib.wl (ptr i64 i64 ptr))
+(defstruct fib.wl (ptr i64 i64 ptr i64))
 
-;; A worklist on the buffer `buf` of `cap` entries.
+;; A worklist on the buffer `buf` of `cap` entries. Its fifth field, the mode, says what a share-marking does to the objects it queues
+;; (rt/atom.lir: 1 SHARED, 2 IMMORTAL for a `def`, 3 IMMORTAL for `freeze`); a drop does not read it. The mode lives in the worklist, which
+;; is private to one walk, and not in a global, so that a `freeze` and a `spawn` on two threads at once do not disturb each other.
 (define internal (fib.wl-init void) ((ptr wl) (ptr buf) (i64 cap))
   (block entry
     (store buf (getelementptr %struct.fib.wl wl (i32 0) (i32 0)))
     (store (i64 0) (getelementptr %struct.fib.wl wl (i32 0) (i32 1)))
     (store cap (getelementptr %struct.fib.wl wl (i32 0) (i32 2)))
     (store buf (getelementptr %struct.fib.wl wl (i32 0) (i32 3)))
+    (store (i64 1) (getelementptr %struct.fib.wl wl (i32 0) (i32 4)))
     (ret)))
 
 ;; Doubles the capacity, moving to the heap; the inline buffer is never

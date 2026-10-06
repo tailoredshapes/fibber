@@ -1,0 +1,48 @@
+;; spec:   spec/types.md 8.2, 8.8 (freeze; share-marking); docs/design/parallelism.md 3.6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: freeze, spawn
+;; (1) A graph that a task already captured is SHARED (atomic counts) when it is frozen. `freeze` goes through such objects (it stops only at
+;; IMMORTAL ones), so every node is frozen afterwards and has count 0 whatever its count was. (2) 16 tasks each build a graph and freeze it
+;; while the main task goes on spawning tasks that share-mark other graphs: the walk of a freeze and the walk of a share-marking keep their
+;; mode in the worklist of the walk and in no global, so none disturbs another. Were the mode a global, a share-marking caught by a freeze
+;; would make its objects immortal, or a freeze caught by a share-marking would leave its graph merely shared: the counts below would be
+;; wrong or the audit would not be clean.
+(ns main (:use tl.check))
+
+(defstruct Node (a: i64 b: str))
+
+(defun rc (x) -> i64 (unsafe (load-i64 (raw x))))
+
+(defun nodes (n: i64) -> (Vec Node) (mapv (fn (i: i64) (Node i (str "n" i))) (range n)))
+
+(defun sum-a (v: (Vec Node)) -> i64 (reduce + 0 (map (fn (n: Node) (. n a)) v)))
+
+;; builds a graph, freezes it, and answers how many of its nodes are frozen with count 0, with the sum
+(defun build-freeze (n: i64) -> (Pair i64 i64)
+  (let ((v (freeze (nodes n))))
+    (Pair (count (filter (fn (x: Node) (and (frozen? x) (= (rc x) 0) (frozen? (. x b)))) v)) (sum-a v))))
+
+(defun main () -> i64
+  (let ((c (checks)) (shared (nodes 30)))
+    (do (let ((t (spawn (fn () (sum-a shared)))))
+          (check c (= (join t) 435)))
+        (check c (not (frozen? shared)))
+        (check c (every? (fn (n: Node) (> (rc n) 0)) shared))
+        (let ((f (freeze shared)))
+          (do (check c (every? (fn (n: Node) (and (frozen? n) (= (rc n) 0) (frozen? (. n b)))) f))
+              (check c (= (rc f) 0))
+              (check c (= (sum-a f) 435))))
+        (let ((ts (mapv (fn (j: i64) (spawn (fn () (build-freeze (+ 20 j))))) (range 16)))
+              (others (mapv (fn (j: i64) (spawn (fn () (sum-a (nodes (+ 10 j)))))) (range 16))))
+          (do (dotimes (j 16)
+                (let ((r (join (nth ts j))) (n (+ 20 j)))
+                  (do (check c (= (. r fst) n))
+                      (check c (= (. r snd) (quot (* n (- n 1)) 2))))))
+              (dotimes (j 16)
+                (let ((n (+ 10 j)))
+                  (check c (= (join (nth others j)) (quot (* n (- n 1)) 2)))))))
+        (checks-result c))))

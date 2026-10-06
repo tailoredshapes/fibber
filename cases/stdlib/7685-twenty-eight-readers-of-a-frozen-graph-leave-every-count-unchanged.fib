@@ -1,0 +1,54 @@
+;; spec:   docs/design/parallelism.md 2.5, 3.6 (P-count-b); spec/types.md 8.2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: freeze, spawn
+;; 28 tasks each read a frozen Vec of records, a frozen Map and a frozen record many times, taking elements out and holding them (the reads
+;; that cost an atomic count pair when the graph is SHARED but not frozen). Every count word read through `raw` is 0 before and after, and the
+;; header flags are the same: nothing the readers did touched a count. The sums are exact. A graph whose children were not frozen would
+;; show a count of 1 or more in the check of the elements; a graph frozen by a walk that stopped at the root fails `frozen?` of the nodes.
+(ns main (:use tl.check))
+
+(defstruct Node (a: i64 b: i64))
+(defstruct Model (name: str nodes: (Vec Node) index: (Map i64 Node)))
+
+(defun rc (x) -> i64 (unsafe (load-i64 (raw x))))
+(defun flags (x) -> i32 (unsafe (load-i32 (ptr+ (raw x) 12))))
+
+(defun make-model (n: i64) -> Model
+  (let ((nodes (mapv (fn (i: i64) (Node i (* i 2))) (range n))))
+    (Model (str "model" n) nodes (reduce (fn (m: (Map i64 Node) nd: Node) (assoc m (. nd a) nd)) {} nodes))))
+
+;; the sum of the a fields of every node read through the Vec and through the Map, `rounds` times, holding each node in a fresh Vec
+(defun read-all (m: Model rounds: i64) -> i64
+  (let ((k (count (. m nodes))))
+    (loop ((r 0) (s 0))
+      (if (< r rounds)
+          (recur (+ r 1)
+                 (loop ((i 0) (acc s))
+                   (if (< i k)
+                       (let ((held (conj (vec-empty) (nth (. m nodes) i))))
+                         (recur (+ i 1) (+ acc (. (nth held 0) a) (. (unwrap (get (. m index) i)) b))))
+                       acc)))
+          s))))
+
+(defun counts (m: Model) -> (Vec i64)
+  (conj (mapv (fn (n: Node) (rc n)) (. m nodes)) (+ (rc m) (rc (. m nodes)) (rc (. m index)) (rc (. m name)))))
+
+(defun main () -> i64
+  (let ((c (checks)) (m (freeze (make-model 64))))
+    (do (check c (frozen? m))
+        (check c (frozen? (. m nodes)))
+        (check c (frozen? (. m index)))
+        (check c (every? (fn (n: Node) (frozen? n)) (. m nodes)))
+        (let ((before (counts m)) (fl (flags m)))
+          (let ((ts (mapv (fn (j: i64) (spawn (fn () (read-all m 200)))) (range 28))))
+            (let ((sums (mapv (fn (t: (Task i64)) (join t)) ts)))
+              (do (check c (every? (fn (s: i64) (= s (* 200 (+ 2016 4032)))) sums))
+                  (check c (= (counts m) before))
+                  (check c (every? (fn (n: i64) (= n 0)) before))
+                  (check c (= (flags m) fl))
+                  (check c (not (= (bit-and fl 8i32) 0i32)))))))
+        (checks-result c))))
