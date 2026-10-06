@@ -97,6 +97,15 @@ How the readers use a row:
   (cross builds, releases) is `x86-64-v3`; a host build keeps the host's CPU, and every x86-64 executable checks at start that the CPU
   has what it was built for (`emit.cpucheck`).
 
+* **The start-up CPU check** (`compiler/emit/cpucheck.fib`, ADR 0008). An executable for x86-64 Linux calls `fib.cpu-check` before anything
+  else in `main`. It asks glibc (`__x86_get_cpuid_feature_leaf`, glibc 2.33 and later; the `active` bits fold in the OS's register-state support) for each
+  feature the binary was built for: the level of a named CPU (x86-64-v2, v3, v4 and the CPU table's names) or the host's `+` features, among
+  SSE3 to SSE4.2, POPCNT, CX16, AVX, AVX2, BMI1, BMI2, F16C, FMA, LZCNT, MOVBE and the five AVX-512 features of v4. A missing one ends the
+  program with `trap: this program needs x86-64-v3 (AVX2, FMA); this CPU lacks: FMA` (status 134) instead of SIGILL. It costs one call at start.
+  The check is scalar code and `write` calls, so it runs on the CPU it refuses (`compiler/tests/driver/cpu-check.sh` runs a v3 binary under
+  `qemu-x86_64 -cpu Westmere`). There is no check for baseline x86-64, for an unknown CPU name, for a non-Linux OS, or for aarch64, whose baseline
+  has FMA. An aarch64 build for a CPU with more features (`FIB_TARGET_CPU=apple-m2`) is not checked; that is a known gap.
+
 **Adding a row.** For an architecture that already has one, add a `row-...` function and put it in `target-rows`. For a new architecture,
 also add the five `LLVMInitialize<Arch>{TargetInfo,Target,TargetMC,AsmPrinter,AsmParser}` externs and calls to `llvm.target`, and add the
 component to `scripts/llvm-static.sh`. LLVM-C's `LLVMInitializeAllTargets` is a `static inline` and has no symbol to bind.

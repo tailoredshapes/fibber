@@ -1,0 +1,113 @@
+;; compiler/emit/cpucheck.fib: the start-up CPU check of an x86-64 executable (docs/adr/0008). A binary built for x86-64-v3 (AVX2, FMA, BMI1/2, F16C,
+;; LZCNT, MOVBE) dies of SIGILL on an older CPU at the first instruction it lacks, wherever that is. Instead `main` first calls `fib.cpu-check`, which
+;; asks glibc which features are active (`__x86_get_cpuid_feature_leaf`, glibc 2.33 and later: CPUID with the OS's register-state support folded in, the
+;; `active` words of sys/platform/x86.h) and, when one the binary was built for is missing, writes
+;;   trap: this program needs x86-64-v3 (AVX2, FMA); this CPU lacks: AVX2, FMA
+;; and aborts (status 134, as a trap). The cost is one call at start; nothing after it. The check uses no vector code and no memcpy (written piece by
+;; piece with `write`), so it runs on the CPU it refuses.
+;; What is required comes from the target the binary is built for (the module's target, types.target): a named CPU's level (x86-64-v2, -v3, -v4 and the
+;; CPU names of types.targets' table), else the host's feature list (`+avx2,+fma,..`) intersected with the features below. x86-64 itself, a CPU the table
+;; does not know, any other architecture and any OS but Linux (glibc) get no check: aarch64 has FMA in its baseline, and a build for a CPU with more
+;; (FIB_TARGET_CPU=apple-m2, say) is not checked there (docs/adr/0008, Consequences).
+(ns emit.cpucheck (:use types.target types.targets) (:require [expand.targetos :as tos]))
+
+;; A feature: LLVM's name, the name the message shows, and where glibc keeps its active bit: leaf (0 is CPUID 1, 1 is CPUID 7, 2 is CPUID 0x80000001,
+;; glibc's CPUID_INDEX_*), register (0 eax, 1 ebx, 2 ecx, 3 edx) and bit.
+(defstruct CpuFeature (name: str shown: str leaf: i64 reg: i64 bit: i64))
+(derive Eq CpuFeature)
+
+(defun cpu-features () -> (Vec CpuFeature)
+  [(CpuFeature "avx2" "AVX2" 1 1 5) (CpuFeature "fma" "FMA" 0 2 12) (CpuFeature "avx512f" "AVX512F" 1 1 16)
+   (CpuFeature "avx512bw" "AVX512BW" 1 1 30) (CpuFeature "avx512cd" "AVX512CD" 1 1 28) (CpuFeature "avx512dq" "AVX512DQ" 1 1 17)
+   (CpuFeature "avx512vl" "AVX512VL" 1 1 31) (CpuFeature "avx" "AVX" 0 2 28) (CpuFeature "bmi" "BMI1" 1 1 3) (CpuFeature "bmi2" "BMI2" 1 1 8)
+   (CpuFeature "f16c" "F16C" 0 2 29) (CpuFeature "lzcnt" "LZCNT" 2 2 5) (CpuFeature "movbe" "MOVBE" 0 2 22) (CpuFeature "sse3" "SSE3" 0 2 0)
+   (CpuFeature "ssse3" "SSSE3" 0 2 9) (CpuFeature "sse4.1" "SSE4.1" 0 2 19) (CpuFeature "sse4.2" "SSE4.2" 0 2 20) (CpuFeature "popcnt" "POPCNT" 0 2 23)
+   (CpuFeature "cx16" "CX16" 0 2 13)])
+
+(defun level-v2 :private () -> (Vec str) ["sse3" "ssse3" "sse4.1" "sse4.2" "popcnt" "cx16"])
+(defun level-v3 :private () -> (Vec str) (into (level-v2) ["avx" "avx2" "bmi" "bmi2" "f16c" "fma" "lzcnt" "movbe"]))
+(defun level-v4 :private () -> (Vec str) (into (level-v3) ["avx512f" "avx512bw" "avx512cd" "avx512dq" "avx512vl"]))
+
+;; The CPUs of types.targets' x86 table that have AVX-512 (the rest of the table is x86-64-v3).
+(defun avx512-cpu? :private (cpu: str) -> bool
+  (contains? (set ["x86-64-v4" "skylake-avx512" "skx" "cascadelake" "cooperlake" "cannonlake" "icelake-client" "icelake-server" "tigerlake"
+                   "rocketlake" "sapphirerapids" "graniterapids" "znver4" "znver5"]) cpu))
+
+(defun x86-cpu? :private (cpu: str) -> bool
+  (or (starts-with? cpu "x86-64") (match (cpu-row cpu) ((some r) (= (. r family) "x86")) (nil false))))
+
+(defun split-commas :private (s: str) -> (Vec str)
+  (loop ((i 0) (from 0) (out []))
+    (cond (>= i (str-len s)) (if (> i from) (conj out (str-slice s from i)) out)
+          (= (str-byte-at s i) 44i8) (recur (+ i 1) (+ i 1) (if (> i from) (conj out (str-slice s from i)) out))
+          :else (recur (+ i 1) from out))))
+
+;; The LLVM names a target asks for: the `+name`s of its feature list, else its named CPU's level.
+(defun wanted-names (t: Target) -> (Vec str)
+  (cond (not (= (. t features) "")) (mapv (fn (f: str) (str-slice f 1 (str-len f))) (filterv (fn (f: str) (starts-with? f "+")) (split-commas (. t features))))
+        (= (. t cpu) "x86-64-v2") (level-v2)
+        (avx512-cpu? (. t cpu)) (level-v4)
+        (x86-cpu? (. t cpu)) (if (= (. t cpu) "x86-64") [] (level-v3))
+        :else []))
+
+;; The features the check requires of the CPU: the checkable ones the target asks for, in the table's order.
+(defun required-features (t: Target) -> (Vec CpuFeature)
+  (let ((want (set (wanted-names t))))
+    (filterv (fn (f: CpuFeature) (contains? want (. f name))) (cpu-features))))
+
+;; Whether the target is x86-64 Linux: FIB_TARGET_TRIPLE's arch and OS, else the host's OS and an x86 CPU or feature list.
+(defun x86-linux? (t: Target) -> bool
+  (match (sys-getenv "FIB_TARGET_TRIPLE")
+    ((some tr) (if (or (= tr "") (= tr "host")) (host-x86-linux? t) (and (= (arch-of-triple tr) "x86_64") (= (os-of-triple tr) "linux"))))
+    (nil (host-x86-linux? t))))
+
+(defun host-x86-linux? :private (t: Target) -> bool
+  (and (= (tos/host-platform-name) "Linux")
+       (or (x86-cpu? (. t cpu)) (some? (str-find (str-join ["," (. t features) ","]) ",+sse2," 0)))))
+
+;; The few features the message names after the CPU: AVX-512F, AVX2 and FMA when required, else all of them.
+(defun headline (fs: (Vec CpuFeature)) -> str
+  (let ((top (filterv (fn (f: CpuFeature) (contains? (set ["avx512f" "avx2" "fma"]) (. f name))) fs)))
+    (reduce (fn (acc: str f: CpuFeature) (if (= acc "") (. f shown) (str-join [acc ", " (. f shown)]))) "" (if (empty? top) fs top))))
+
+;; The text of the message up to the first missing feature.
+(defun message-head (t: Target fs: (Vec CpuFeature)) -> str
+  (str-join ["trap: this program needs " (. t cpu) " (" (headline fs) "); this CPU lacks: "]))
+
+;; ---- the lIR
+
+;; The mask of bit `b` of an i32, as lIR writes the constant (bit 31 is the sign).
+(defun bit-mask :private (b: i64) -> str
+  (if (= b 31) "-2147483648" (str (shl 1 b))))
+
+;; The test of feature `k` (block `cK`): its active word, the bit, on to `mK` when it is clear, else to the next test.
+(defun test-block :private (k: i64 f: CpuFeature) -> str
+  (let ((n (str k)) (next (str "c" (+ k 1))))
+    (str-join ["  (block c" n "\n    (let ((l" n " (call @__x86_get_cpuid_feature_leaf (i32 " (str (. f leaf)) ")))\n"
+               "          (w" n " (load i32 (getelementptr i8 l" n " (i64 " (str (+ 16 (* 4 (. f reg)))) ")))))\n"
+               "      (br (icmp eq (and w" n " (i32 " (bit-mask (. f bit)) ")) (i32 0)) m" n " " next ")))\n"
+               "  (block m" n "\n    (call @fib.cpu-lacks first (string \"" (. f shown) "\") (i64 " (str (str-len (. f shown))) "))\n    (br " next "))\n"])))
+
+;; `fib.cpu-check` and its helper for the target `t`, or "" when the target gets no check.
+(defun cpu-check-defs (t: Target) -> str
+  (let ((fs (required-features t)))
+    (if (or (empty? fs) (not (x86-linux? t)))
+        ""
+        (let ((head (message-head t fs)))
+          (str-join
+            ["(declare __x86_get_cpuid_feature_leaf ptr (i32))\n"
+             "(define internal (fib.cpu-lacks void) ((ptr first) (ptr name) (i64 n))\n"
+             "  (block entry (br (icmp eq (load i64 first) (i64 0)) head more))\n"
+             "  (block head (call @write (i32 2) (string \"" head "\") (i64 " (str (str-len head)) ")) (store (i64 1) first) (br put))\n"
+             "  (block more (call @write (i32 2) (string \", \") (i64 2)) (br put))\n"
+             "  (block put (call @write (i32 2) name n) (ret)))\n"
+             "(define internal (fib.cpu-check void) ()\n"
+             "  (block entry\n    (let ((first (alloca i64)))\n      (store (i64 0) first)\n      (br c0)))\n"
+             (str-join (mapv (fn (k: i64) (test-block k (nth fs k))) (range (count fs))))
+             "  (block c" (str (count fs)) " (br (icmp eq (load i64 first) (i64 0)) fine missing))\n"
+             "  (block fine (ret))\n"
+             "  (block missing (call @write (i32 2) (string \"\\n\") (i64 1)) (call @abort) (unreachable)))\n"])))))
+
+;; The first statement of an executable's `main` when the target has a check.
+(defun cpu-check-call (t: Target) -> str
+  (if (= (cpu-check-defs t) "") "" "(call @fib.cpu-check)\n    "))

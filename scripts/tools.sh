@@ -51,7 +51,7 @@ if [ "$mode" = full ]; then
   # the scripts under compiler/tests that nothing ran and that take seconds: the command line, the demand-driven check, the target and fma
   # checks, the `test` command, the runtime drift test, the resume builders, the window lowering, the cell peeks, the Vec contract's planted faults,
   # the heap golden traces, the lair header and exec checks, the L1 unit programs, the test harness's own check
-  for s in driver/cli driver/demand driver/muladd driver/no-fma driver/target driver/test-cmd emit/runtime own/peek specs/plant-vec; do
+  for s in driver/cli driver/demand driver/muladd driver/no-fma driver/cpu-check driver/target driver/test-cmd emit/runtime own/peek specs/plant-vec; do
     queue "sh-${s//\//-}" "$t/$s.sh" "$FIBC"
   done
   queue sh-emit-resume env RESUME_OUT="$out/resume" "$t/emit/resume.sh" "$FIBC"

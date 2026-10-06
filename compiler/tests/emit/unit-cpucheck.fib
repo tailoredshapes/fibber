@@ -1,0 +1,37 @@
+;; compiler/tests/emit/unit-cpucheck.fib: what the start-up CPU check of emit.cpucheck requires (docs/adr/0008): the x86-64-v3 level for x86-64-v3 and
+;; the AVX2 CPUs of the table, AVX-512 on top for x86-64-v4, the host's own `+` features, nothing for baseline x86-64 or an aarch64 CPU; the message's
+;; head; and that the lIR it makes names each required feature once with glibc's leaf and bit. Every check names a value a wrong table would change.
+;; Build: fibc build compiler/tests/emit/unit-cpucheck.fib -I compiler -I lib -o OUT
+(ns main (:use emit.cpucheck types.target types.check))
+
+(defun names (t: Target) -> (Vec str) (mapv (fn (f: CpuFeature) (. f name)) (required-features t)))
+
+(defun count-of (s: str sub: str) -> i64
+  (loop ((i 0) (n 0)) (match (str-find s sub i) (nil n) ((some k) (recur (+ k 1) (+ n 1))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)) (v3 (target-of-cpu "x86-64-v3")))
+    (do
+      (check cs "x86-64-v3 requires the v3 level: 14 features, AVX2 and FMA among them, no AVX-512"
+             (let ((n (names v3))) (and (= (count n) 14) (contains? (set n) "avx2") (contains? (set n) "fma") (contains? (set n) "lzcnt") (not (contains? (set n) "avx512f")))))
+      (check cs "an AVX2 CPU of the table (haswell, znver3) is the v3 level" (and (= (names (target-of-cpu "haswell")) (names v3)) (= (names (target-of-cpu "znver3")) (names v3))))
+      (check cs "x86-64-v4 and skylake-avx512 add the five AVX-512 features"
+             (and (= (count (names (target-of-cpu "x86-64-v4"))) 19) (contains? (set (names (target-of-cpu "skylake-avx512"))) "avx512f")))
+      (check cs "x86-64-v2 requires SSE3 to SSE4.2, POPCNT, CX16 and no AVX"
+             (= (set (names (target-of-cpu "x86-64-v2"))) (set ["sse3" "ssse3" "sse4.1" "sse4.2" "popcnt" "cx16"])))
+      (check cs "baseline x86-64, an unknown CPU and an aarch64 CPU require nothing"
+             (and (empty? (names (target-of-cpu "x86-64"))) (empty? (names (target-of-cpu "pentium4"))) (empty? (names (target-of-cpu "apple-m1")))))
+      (check cs "the host's list: its + features that are checkable, not its - ones"
+             (= (names (target-of-features "raptorlake" "+avx2,+fma,-avx512f,+sse2,+sse4.2,+cmov")) ["avx2" "fma" "sse4.2"]))
+      (check cs "the message head names the CPU and AVX2, FMA"
+             (= (message-head v3 (required-features v3)) "trap: this program needs x86-64-v3 (AVX2, FMA); this CPU lacks: "))
+      (check cs "the head of a v2 build lists its features (no AVX2 or FMA to name)"
+             (= (headline (required-features (target-of-cpu "x86-64-v2"))) "SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT, CX16"))
+      (check cs "FMA is CPUID 1 ECX bit 12, AVX2 CPUID 7 EBX bit 5, LZCNT CPUID 0x80000001 ECX bit 5 (glibc's leaf indices 0, 1, 2)"
+             (let ((by (fn (n: str) (unwrap (first (filter (fn (f: CpuFeature) (= (. f name) n)) (cpu-features)))))))
+               (and (= (by "fma") (CpuFeature "fma" "FMA" 0 2 12)) (= (by "avx2") (CpuFeature "avx2" "AVX2" 1 1 5)) (= (by "lzcnt") (CpuFeature "lzcnt" "LZCNT" 2 2 5)))))
+      (check cs "on this x86-64 Linux host the lIR of a v3 build tests each of the 14 features once and calls the main check"
+             (let ((d (cpu-check-defs v3)))
+               (and (= (count-of d "(call @__x86_get_cpuid_feature_leaf") 14) (= (count-of d "(string \"FMA\")") 1) (= (cpu-check-call v3) "(call @fib.cpu-check)\n    "))))
+      (check cs "a baseline x86-64 build has no check" (and (= (cpu-check-defs (target-of-cpu "x86-64")) "") (= (cpu-check-call (target-of-cpu "x86-64")) "")))
+      (finish cs))))

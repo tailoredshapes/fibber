@@ -7,7 +7,7 @@
 ;; set and holds what needs no body, the runtime and `main`.
 ;; `compile-macro` (E11) is the macro-time module of one `defmacro` (macros/abi.rs's text is emit.macros.abi's).
 (ns emit.compile
-  (:require [emit.defs.astmod :as am])
+  (:require [emit.defs.astmod :as am] [emit.cpucheck :as cc])
   (:use types.ty types.table types.decls types.program own.program emit.value emit.names emit.objects emit.statics emit.program emit.inits
         emit.assemble emit.defs.mod emit.lower.cx emit.lower.mod emit.macros.abi types.target))
 
@@ -16,11 +16,11 @@
 
 ;; The fixed end of a module: `main`, which §8.8 has join every thread still running before the result is printed (fibc run) or
 ;; returned (an executable), calling the program's entry function. Rust: compile.rs:296 main_text
-(defun main-text :private (entry: str executable: bool init: str) -> str
+(defun main-text :private (entry: str executable: bool init: str check: str) -> str
   (let ((end (if executable
                  "(ret (trunc i32 r))"
                  "(call @printf (string \"%lld\\n\") r)\n      (ret (i32 0))")))
-    (str-join ["(declare printf i32 (ptr ...))\n(define (main i32) ((i32 argc) (ptr argv))\n  (block entry\n    (call @fib.init)\n"
+    (str-join ["(declare printf i32 (ptr ...))\n(define (main i32) ((i32 argc) (ptr argv))\n  (block entry\n    " check "(call @fib.init)\n"
                "    (call @fib.set-args argc argv)\n    " init "\n    (let ((r (call @" entry ")))\n      (call @fib.join-all)\n"
                "      (call @fib.pool-quiesce)\n      " end ")))\n"])))
 
@@ -31,10 +31,14 @@
       (Ok (defs-new))
       (emit-defs p)))
 
-;; The `main` section: the init functions, then `main` calling the entry. Nothing in it depends on a body being emitted.
+;; The `main` section: the init functions, then `main` calling the entry. Nothing in it depends on a body being emitted. An executable for x86-64
+;; Linux first checks that the CPU has what it was built for (emit.cpucheck, docs/adr/0008).
 (defun main-part :private (p: Program entry: str executable: bool) -> str
   ;; §3.19, L15: the init functions of the `def`s made at run time come before `main`, which calls them after the arguments are known.
-  (str-join [(inits-render p) (main-text entry executable (if (empty? @(. p inits)) "" "(call @fib.defs-init)"))]))
+  (let ((check (match (if executable @(. (program-g p) target) nil)
+                 (nil (Pair "" ""))
+                 ((some t) (Pair (cc/cpu-check-defs t) (cc/cpu-check-call t))))))
+    (str-join [(inits-render p) (. check fst) (main-text entry executable (if (empty? @(. p inits)) "" "(call @fib.defs-init)") (. check snd))])))
 
 ;; A stub reached is an error whose message starts `todo: `: the module is then pending, with what needs no body.
 (defun pending-or-error :private (p: Program entry: str executable: bool m: str) -> (Result Module str)
