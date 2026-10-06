@@ -64,6 +64,8 @@ if [ "$mode" = full ]; then
   queue gen-rng "$t/gen/rng-check.sh"
   queue gen-compare bash -c "'$FIBC' build compiler/fibgen.fib -I compiler -I lib -o '$out/fibgen' && '$t/gen/compare.sh' '$out/fibgen' pipelines 1 300"
   queue gen-planted "$t/gen/planted.sh"
+  queue js-backend "$t/js/check.sh" "$out/js"
+  queue deps "$t/deps/run.sh" "$FIBC"
 fi
 wait
 bad=0
