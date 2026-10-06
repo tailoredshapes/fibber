@@ -1,6 +1,6 @@
 ;; fib.json.escape: a string as a JSON string literal. The common case, a string with nothing to escape, is one scan and one memcpy: the scan
 ;; reads eight bytes at a time (SWAR) and stops at a word holding a byte below 0x20, a quote, a backslash, or (for `ascii`) a byte of 0x80 or more.
-(ns fib.json.escape (:use fib.core fib.seq fib.coll fib.json.buffer))
+(ns fib.json.escape (:use fib.core fib.seq fib.coll fib.json.buffer) (:require [fib.json.libc :as libc]))
 
 (def hex-digits: str "0123456789abcdef")
 
@@ -57,8 +57,43 @@
                           (let [v (- cp 65536)] (do (put-u &buf &len (+ 55296 (shr v 10))) (put-u &buf &len (+ 56320 (bit-and v 1023))))))
                       (+ i @w))))))
 
-;; `s` as a JSON string literal with its quotes.
+;; The first index at which a vector of 32 bytes holds a quote, a backslash, a byte below 0x20 (or, for `ascii`, of 0x80 or more); the last multiple of 32 when there is none:
+;; the bytes after that are for `scan-plain`. One load, five compares and a movemask per 32 bytes.
+(defun vec-plain-prefix (s: str n: i64 ascii: bool) -> i64
+  (loop [i 0]
+    (if (<= (+ i 32) n)
+        (let [v: (Simd i8 32) (unsafe (load-simd (ptr+ (raw s) (+ 24 i))))
+              special (simd/or (simd/or (simd/eq v (splat (Simd i8 32) 34i8)) (simd/eq v (splat (Simd i8 32) 92i8)))
+                               (simd/eq (bit-and v (splat (Simd i8 32) -32i8)) (splat (Simd i8 32) 0i8)))
+              m (simd/movemask (if ascii (simd/or special (simd/lt v (splat (Simd i8 32) 0i8))) special))]
+          (if (= m 0) (recur (+ i 32)) (+ i (ctz m))))
+        i)))
+
+;; n bytes from src to dst (raw pointers, no overlap): up to 32 as two overlapping loads and stores, longer by memcpy.
+(defun copy-bytes (dst: ptr src: ptr n: i64) -> unit
+  (unsafe
+    (cond (> n 32) (do (libc/memcpy dst src n) ())
+          (>= n 16) (do (store-simd dst (load-simd16 src)) (store-simd (ptr+ dst (- n 16)) (load-simd16 (ptr+ src (- n 16)))))
+          (>= n 8) (do (store-i64 dst (load-i64 src)) (store-i64 (ptr+ dst (- n 8)) (load-i64 (ptr+ src (- n 8)))))
+          (>= n 4) (do (store-i32 dst (load-i32 src)) (store-i32 (ptr+ dst (- n 4)) (load-i32 (ptr+ src (- n 4)))))
+          :else (loop [k 0] (when (< k n) (do (store-i8 (ptr+ dst k) (load-i8 (ptr+ src k))) (recur (+ k 1))))))))
+
+(defun load-simd16 (p: ptr) -> (Simd i8 16) (unsafe (load-simd p)))
+
+;; `s` as a JSON string literal with its quotes: a string with nothing to escape (the common case) is a room check, two quotes and one copy.
 (defun put-string (&buf: (Array i8) &len: i64 s: str ascii: bool) -> unit
+  (let [n (str-len s)
+        p (scan-plain s n (vec-plain-prefix s n ascii) ascii)]
+    (if (>= p n)
+        (do (ensure &buf &len (+ n 2))
+            (put-raw &buf &len 34)
+            (copy-bytes (unsafe (ptr+ (raw @buf) (+ 24 @len))) (unsafe (ptr+ (raw s) 24)) n)
+            (set! len (+ @len n))
+            (put-raw &buf &len 34))
+        (put-string-slow &buf &len s ascii))))
+
+;; The same with escapes: plain runs are copied whole.
+(defun put-string-slow (&buf: (Array i8) &len: i64 s: str ascii: bool) -> unit
   (let [n (str-len s)]
     (do (put-byte &buf &len 34)
         (loop [from 0 i (scan-plain s n 0 ascii)]

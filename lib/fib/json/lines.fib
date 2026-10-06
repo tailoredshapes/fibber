@@ -1,0 +1,79 @@
+;; fib.json.lines: a text of one document per line (NDJSON) parsed line by line, sequentially or on all cores (docs/design/json.md 5).
+;; The lines are found with a 32-byte vector search for newlines; each line is a slice that goes through the index-driven DOM builder (fib.json.domfast) when it is long enough, and
+;; through the recursive-descent parser at its place in the whole text otherwise or on any failure, so an error carries the offset, line and column in the text exactly as `parse-at` gives.
+;; A line that is not a whole document (a pretty-printed document spread over lines) fails as a slice and is parsed by `parse-at`, which knows how far it reaches: the sequential fold is for
+;; any text of documents, the parallel one is for NDJSON (it needs the lines to be independent: a document that spans lines is an error there, with the offset of its first line).
+;;   (line-table s) -> LineTable   start, end, line number and beginning of line of every non-blank line
+;;   (parse-lines s o) -> (Vec (Result Json JsonError))   in parallel, in order        (fold-lines-seq s o f init)  one thread, any text of documents
+(ns fib.json.lines (:use fib.core fib.seq fib.coll fib.parallel fib.json.types fib.json.domfast fib.json.tapefast fib.json.tapebuild) (:require [fib.json.parse :as p]))
+
+;; The index of the next newline at or after `from`, or n.
+(defun newline-from (s: str n: i64 from: i64) -> i64
+  (loop [i from]
+    (if (<= (+ i 32) n)
+        (let [v: (Simd i8 32) (unsafe (load-simd (ptr+ (raw s) (+ 24 i))))
+              m (simd/movemask (simd/eq v (splat (Simd i8 32) 10i8)))]
+          (if (= m 0) (recur (+ i 32)) (+ i (ctz m))))
+        (loop [k i] (cond (>= k n) n (= (str-byte-at s k) 10i8) k :else (recur (+ k 1)))))))
+
+(defun white? (b: i8) -> bool (or (= b 32i8) (or (= b 10i8) (or (= b 13i8) (= b 9i8)))))
+
+(defun skip-white (s: str n: i64 from: i64) -> i64
+  (loop [k from] (if (and (< k n) (white? (str-byte-at s k))) (recur (+ k 1)) k)))
+
+;; The non-blank lines of s: where each starts (at its first byte that is not white space) and ends (at its newline or the end of the text), the 1-based number of the line
+;; it starts on and the offset where that line begins (so an error found in a slice can be placed in the whole text).
+(defstruct LineTable (starts: (Vec i64) ends: (Vec i64) numbers: (Vec i64) bols: (Vec i64)))
+
+(defun line-table (s: str) -> LineTable
+  (let [n (str-len s)]
+    (loop [at 0 no 1 bol 0 starts: (Vec i64) [] ends: (Vec i64) [] numbers: (Vec i64) [] bols: (Vec i64) []]
+      (let [w (skip-white-lines s n at no bol)
+            a (. w fst)]
+        (if (>= a n) (LineTable starts ends numbers bols)
+            (let [e (newline-from s n a)]
+              (recur e (. (. w snd) fst) (. (. w snd) snd) (conj starts a) (conj ends e) (conj numbers (. (. w snd) fst)) (conj bols (. (. w snd) snd)))))))))
+
+;; From `at`: the first byte that is not white space, with the line number and the beginning-of-line offset there. (Pair index (Pair line bol))
+(defun skip-white-lines (s: str n: i64 at: i64 no: i64 bol: i64) -> (Pair i64 (Pair i64 i64))
+  (loop [k at l no b bol]
+    (if (and (< k n) (white? (str-byte-at s k)))
+        (if (= (str-byte-at s k) 10i8) (recur (+ k 1) (+ l 1) (+ k 1)) (recur (+ k 1) l b))
+        (Pair k (Pair l b)))))
+
+;; An error found in the slice that starts at `start`, on line `no` of the text whose line begins at `bol`: its offset, line and column in the whole text.
+(defun place-error (e: JsonError start: i64 no: i64 bol: i64) -> JsonError
+  (JsonError (. e code) (. e message) (+ start (. e offset)) (+ no (- (. e line) 1)) (if (= (. e line) 1) (+ (. e column) (- start bol)) (. e column))))
+
+;; The document of the line i of the table: the DOM builder on the slice when it is long, else the scalar parser on the slice; an error is placed in the whole text.
+(defun parse-line (s: str o: JsonOptions t: LineTable i: i64) -> (Result Json JsonError)
+  (let [start (nth (. t starts) i) line (str-slice s start (nth (. t ends) i))
+        fast (if (< (str-len line) 512) nil (parse-fast line o))]
+    (match fast
+      ((some v) (Ok v))
+      (nil (match (p/parse-with line o)
+             ((Ok v) (Ok v))
+             ((Err e) (Err (place-error e start (nth (. t numbers) i) (nth (. t bols) i)))))))))
+
+(defun parse-lines (s: str o: JsonOptions) -> (Vec (Result Json JsonError))
+  (let [t (line-table s) m (count (. t starts))]
+    (pmap-range [i m] (parse-line s o t i))))
+
+;; Folds f over the documents of any text of documents (one thread): a line first as a slice, else the document that starts there, wherever it ends.
+(defun fold-lines-seq (s: str o: JsonOptions f: (fn (a (Result Json JsonError)) a) init: a) -> a
+  (let [n (str-len s)]
+    (loop [acc init at (skip-white s n 0)]
+      (if (>= at n) acc
+          (let [e (newline-from s n at)
+                fast (if (< (- e at) 512) nil (parse-fast (str-slice s at e) o))]
+            (match fast
+              ((some v) (recur (f acc (Ok v)) (skip-white s n e)))
+              (nil (match (p/parse-at s o at)
+                     ((some pr) (recur (f acc (. pr fst)) (skip-white s n (. pr snd))))
+                     (nil acc)))))))))
+
+;; Is each line a valid document? In parallel, without building a DOM (the tape builder allocates one array a line; the DOM builder allocates an object per value, and the
+;; runtime's allocator is not thread-local, so it is the allocation, not the parsing, that stops a DOM parse from scaling: docs/shootout/json.md).
+(defun validate-lines (s: str o: JsonOptions) -> (Vec bool)
+  (let [t (line-table s) m (count (. t starts))]
+    (pmap-range [i m] (match (build-tape (str-slice s (nth (. t starts) i) (nth (. t ends) i)) o) ((Ok _) true) ((Err _) false)))))

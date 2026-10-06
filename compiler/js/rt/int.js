@@ -49,6 +49,18 @@ function $ctpop(bits, v) {
   while (x) { n += x & 1; x >>>= 1; }
   return n;
 }
+// llvm.cttz / llvm.ctlz with is_zero_poison false: a zero has `bits` trailing and leading zeros.
+function $cttz(bits, v) {
+  let x = bits === 64 ? BigInt.asUintN(64, v) : BigInt($ux(bits, v));
+  if (x === 0n) return bits === 64 ? 64n : bits;
+  let n = 0; while ((x & 1n) === 0n) { n++; x >>= 1n; }
+  return bits === 64 ? BigInt(n) : n;
+}
+function $ctlz(bits, v) {
+  let x = bits === 64 ? BigInt.asUintN(64, v) : BigInt($ux(bits, v));
+  let n = 0; for (let i = bits - 1; i >= 0 && ((x >> BigInt(i)) & 1n) === 0n; i--) n++;
+  return bits === 64 ? BigInt(n) : n;
+}
 function $smin(bits, a, b) { return a < b ? a : b; }
 function $smax(bits, a, b) { return a > b ? a : b; }
 function $umin(bits, a, b) { return bits === 64 ? ($u64(a) < $u64(b) ? a : b) : ($ux(bits, a) < $ux(bits, b) ? a : b); }

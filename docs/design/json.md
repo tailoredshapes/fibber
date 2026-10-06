@@ -64,55 +64,31 @@ Findings that shaped it (each measured, commands in `docs/shootout/json.md`):
 then libc `strtod` on a NUL-terminated copy (long mantissas, near-ties it cannot decide). Verified bit for bit against strtod and against Python's `float()`
 (section 6).
 
-**Phase 2, SIMD structural indexing.** Implemented in `fib.json.stage1` and measured, **not integrated**: it does not win. Per 64 bytes it classifies with `(Simd i8 16)`
-compares, builds the 64-bit quote, backslash and structural masks, removes escaped quotes with simdjson's odd-backslash addition, makes the in-string mask with the
-prefix-XOR shift ladder, and extracts positions with a ctz loop. Its output equals a scalar reference at every alignment against the 64-byte blocks (`specs/json-simd-spec.fib`)
-and on all three corpora. Speed: about 700 MB/s for the index alone, slower than the whole validating scalar tape (about 800 MB/s). What the language lacked:
+**Phase 2, SIMD structural indexing (JSON-2, integrated).** The language got `simd/movemask`, `ctz` and `clz` (ADR 0010; the 64-byte `i8x64` already existed, 512 bits is the limit),
+and `fib.json.stage1` classifies 64 bytes per step: byte compares on an `(Simd i8 64)` (LLVM splits it to the target's width), each turned into a 64-bit mask by one `simd/movemask`,
+escaped quotes removed with simdjson's odd-backslash addition, the in-string mask by the prefix-XOR ladder, positions written by `ctz`, four at a time. The index holds, in order,
+every unescaped quote, every `{ } [ ] : ,` outside a string and the first byte of every other token (a number or a literal); a control byte inside a string and a string still open at the end
+are flagged. It is malloc'ed (no zero fill, `realloc` growth). Alone it runs at 4.9 GB/s on the Ryzen (1.3 GB/s with the default allocator: first-touch page faults, docs/shootout/json.md), against 700 MB/s when the mask-to-bits
+was emulated. It equals a scalar reference at every alignment against the 64-byte blocks (`specs/json-simd-spec.fib`).
 
-| missing | workaround | cost |
-|---|---|---|
-| mask to bits (`movemask`, `(Simd bool n)` to an integer) | mask to 0/1 lanes (`simd/blend`), widen to i32x16 (`simd/convert`), multiply by 2^lane, `hsum` | 4.4 GB/s for one class when alone (quote compare plus this), but three classes per 16 bytes plus the ladder bring the stage to 700 MB/s |
-| count trailing zeros | `popcount((x & -x) - 1)` | cheap (one popcount instruction on x86-64-v3 targets) |
-| a 64-lane i1 vector | exists: `(Simd bool 64)` is legal (n is 1 to 64); a vector is at most 512 bits wide, so i8x64 does not exist and 16 or 32 bytes is the unit | four loads per block |
-| carry-less multiply | shift/xor ladder of six steps | negligible |
-| unsigned 64-bit compare, add with carry | sign-bit flip, `unchecked-add` and compare | negligible |
-| shuffle-based nibble classification | `simd/eq` per character (6 compares for the structural class) | the compares are cheap; the mask-to-bits is not |
+`fib.json.tapefast` is stage 2: it walks only the index (a string is its two quote entries, a number is scanned eight digits at a time, a comma costs a compare), builds the same tape as
+the scalar builder, and on ANY failure answers "use the scalar builder" (`fib.json.tapebuild` then finds the same failure and gives its exact code and offset), so an error message cannot
+change and a bug in the fast path can only make a valid document slow or let an invalid one through; `specs/json-fast-spec.fib` compares the two builders (same verdict, same tape word for
+word) on the suite subset, random documents and their one-byte mutations. Below 512 bytes the scalar builder runs (nothing to amortise); targets without 256-bit vectors still run the same
+code (LLVM legalises the vectors), a wasm or JS target gets the scalar builder only if a `has-simd` gate is added: not done.
 
-A `simd/movemask` builtin (lowering to `bitcast <n x i1> to iN`, which LLVM selects as `pmovmskb`) would be small (compiler/types/builtins.fib, compiler/emit/lower/simd*.fib, one row in
-spec/types.md 1.9, cases 7980 to 7999) and would need a released seed before the library could use it. It is the one change I would make to the language for this library; I did not add it,
-because without it the measurement says the structural index loses, and with it I could not measure it in this session.
+`fib.json.domfast` builds the DOM from that tape (3 allocations fewer per container: the child count is read off the tape, so a Vec is made at its exact size by `vec-from-array`;
+integers of up to 18 digits are read in place; floats go to `finish-float` with the mantissa already gathered; duplicate keys are found by comparing slices of the text, no `str` is
+made; a key cache of 256 slots shares the `str` of repeated keys), and falls back to the recursive-descent parser on any failure. Strings are NOT zero-copy: a `str` is an owned
+array in this language, there is no slice type, so `str-slice` copies; a document-lifetime view would need a new type (an ownership question, not a library one).
 
-## 4. Serialiser
+**Lines.** `fib.json.lines` finds newlines 32 bytes at a time and parses each line (the DOM builder for lines of 512 bytes and more, else the scalar parser) sequentially or with
+`pmap-range` on all cores; errors are placed in the whole text. `validate-lines` runs the tape builder per line in parallel.
 
-Compact and pretty, into the growable buffer, linear. Integers: digit pairs from a 200-byte table, counted first and written backwards in place. Strings: one SWAR scan and one
-`memcpy` per escape-free run (the common case is one `memcpy`); `ascii` escapes non-ASCII as `\uXXXX` with surrogate pairs. Floats: Schubfach (Giulietti; the JDK's `Double.toString` since 19),
-`fib.json.dtoa` with the table of `fib.json.pow10` (generated by `scripts/gen-json-pow10.py`): shortest, closest, no libc. The language's own `str` of a float measured 6.9 microseconds per
-float (it searches precision upward) and the first version here, `%.15g/16g/17g` with a strtod round-trip test, printed 4.94065645841247e-324 for the smallest subnormal (not shortest) and
-cost two or three snprintf calls; Schubfach agrees with Python's `repr` digit for digit on 2 000 000 doubles. Layout: plain notation for decimal exponents -5 to 16 (`100.0`, `0.00001234`), else
-`d.ddde-7` / `1e21`; always a `.` or an exponent so a float reads back as a float. NaN and infinities are `null`.
-
-## 5. API
-
-See the header of `lib/fib/json.fib`. Names that would shadow the core (`get`, `nth`, `str`, `read-file`) are `get-key`, `get-index`, `node-str`; `read-file` is the exception and is the
-facade's own (`json/read-file`). Streams: `json/documents` (a text of several documents or NDJSON, a bad line is an `Err` and the next line goes on), `json/reduce-lines` (a file, 4 MiB chunks,
-bounded memory; the language has no lazy seq over a reader, so a fold is the shape). `json/reduce-events` is a SAX fold over a tape: it holds the tape (16 bytes per value), so for input larger
-than memory use `reduce-lines`. `JSON Pointer` (RFC 6901) and `get-in` (steps are keys; on an array a step is its decimal index, because a vector is homogeneous). `json/json->datum` and
-`json/datum->json` convert to fib.datum (an array or object becomes its JSON text as a `DStr`: a Datum is scalar); `ToJson` (`json/to-json`) covers i64 f64 bool str keyword Datum `(Vec a)` `(Option a)`
-and `defjson` records (`map->json` for string-keyed maps).
-
-## 6. Tests
-
-| what | where | result |
-|---|---|---|
-| JSONTestSuite (nst/JSONTestSuite 1ef36fa, 318 files): y_ parse, n_ rejected, i_ recorded; DOM and tape must agree | `scripts/json-testsuite.sh` (fetch + sha256 of every file: `scripts/fetch-json-testsuite.sh`, `specs/json-testsuite.sha256`); 48-file subset in the gate: `specs/json-testsuite-spec.fib` | y 95/95, n 188/188, i 35 (6 accepted, 29 rejected: `specs/json-testsuite-i.expected`) |
-| edge cases: surrogates, -0, 1e400, 1E2, leading zeros, trailing commas, BOM, NUL, invalid UTF-8, depth | `specs/json-spec.fib` | pass |
-| round trips with shrinking (random documents through every writer and reader) | `specs/json-prop-spec.fib` (`fib.json.gen`) | pass |
-| floats: 1 M random decimal texts vs strtod; 1 M doubles written and read back; 259 940 edge cases (halfway points, nudged neighbours, subnormals, 17-digit ties) vs Python `float()`; 1 999 801 printed doubles vs Python `repr` | `scripts/json-floats.sh`; hard cases in the gate: `specs/json-floats-spec.fib` | 0 differ in each |
-| fuzz: 100 000 mutated documents, no try/catch, DOM and tape agree | `scripts/json-fuzz.fib` | 88 763 rejected, 11 237 accepted, 0 traps, 0 disagreements |
-| planted faults (14): wrong escape, SWAR byte class, off-by-one at a block boundary, quote mask after backslashes, in-string carry, float tie, Schubfach bound, Clinger limit, depth, tape depth, leading zero, overlong UTF-8, lone surrogate, duplicate key | `scripts/mutant-json.sh` | 14 of 14 killed |
 | parse vs Python's json and Jackson on the corpus | `scripts/bench/json/` (same documents, outputs compared by the shootout's check column) | see the shootout |
 
-## 7. Not done
+## 7. Not done (after JSON-2)
 
-Streaming SAX over input larger than memory with a tape-free scanner; a lazy seq of documents over a reader; a hash-indexed `JObj`; `JBig` arithmetic; `json/write-to` takes a file descriptor only
-(not an arbitrary sink); the typed decoder reports a mismatch without a path; fib.log / fib.otel / fib.db / fib.http do not use fib.json yet (those directories were not touched).
+Streaming SAX over input larger than memory with a tape-free scanner; a lazy seq of documents over a reader (`reduce-lines` and `reduce-lines-par` fold; neither is a seq); a hash-indexed `JObj`
+(an index would have to live in the type: `JObj keys vals` is two vectors, lookups scan); zero-copy strings (no slice type); a `defjson` encoder that writes straight to the buffer without a DOM;
+`has-simd` gating for wasm and JS targets; `JBig` arithmetic; `json/write-to` takes a file descriptor only (not an arbitrary sink); fib.log / fib.otel / fib.db / fib.http do not use fib.json yet (those directories were not touched).

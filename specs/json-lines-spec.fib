@@ -1,0 +1,57 @@
+;; NDJSON: the line splitter, the sequential fold and the parallel parse of fib.json.lines against the recursive-descent parser's own `parse-at` loop (the definition of "the
+;; documents of a text"): same results, same errors with the same offsets, line and column. Lines are made long enough (512 bytes and more) that the index-driven DOM builder
+;; takes them, and short enough that the scalar parser does; blank lines, CRLF, a bad line in the middle, a final line without a newline, a document spread over lines.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.json.types fib.json.write fib.json.gen fib.json.lines) (:require [fib.json.parse :as p] [fib.json.io :as io]))
+
+(defun reference (s: str) -> (Vec (Result Json JsonError))
+  (loop [at 0 out: (Vec (Result Json JsonError)) []]
+    (match (p/parse-at s (default-options) at) (nil out) ((some r) (recur (. r snd) (conj out (. r fst)))))))
+
+;; The per-line meaning: every non-blank line is a document by itself; an error is the standalone error moved to the line's place in the whole text (make-error recomputes the line
+;; and the column from the offset, independently of how the library places it).
+(defun per-line (s: str) -> (Vec (Result Json JsonError))
+  (let [t (line-table s)]
+    (vec (map (fn (i: i64)
+                (let [a (nth (. t starts) i)]
+                  (match (p/parse-with (str-slice s a (nth (. t ends) i)) (default-options))
+                    ((Ok v) (Ok v))
+                    ((Err e) (Err (make-error s (. e code) (+ a (. e offset))))))))
+              (range (count (. t starts)))))))
+
+(defun seq-docs (s: str) -> (Vec (Result Json JsonError))
+  (io/fold-lines s (default-options) (fn (acc: (Vec (Result Json JsonError)) r: (Result Json JsonError)) (conj acc r)) []))
+
+(defun big-line (i: i64) -> str
+  (write (JObj ["id" "tags" "text"] [(JInt i) (JArr (mapv (fn (k: i64) (JStr (str "tag" k))) (range 40))) (JStr (str "line \"" i "\" \\ é\n" (str-join (vec (map (fn (k: i64) "x") (range 600))))))])))
+
+(defun same (a: (Vec (Result Json JsonError)) b: (Vec (Result Json JsonError))) -> bool (= a b))
+
+(defun text-of (lines: (Vec str) sep: str) -> str (str-join (vec (map (fn (l: str) (str l sep)) lines))))
+
+(defun lines-mixed () -> (Vec str)
+  [(big-line 1) "{\"a\":1}" "" (big-line 2) "[1,2,3]" "   " "{\"bad\":" (big-line 3) "null" "   {\"a\":01}" (big-line 4) "  [1,\n" "\"s\""])
+
+(defspecs specs
+  (feature "fib.json.lines"
+    (scenario "the sequential fold equals the parse-at loop on a mixed text (long and short lines, blank lines, a bad line, a bad number)"
+      (then (expect = true (same (reference (text-of (lines-mixed) "\n")) (seq-docs (text-of (lines-mixed) "\n"))))))
+    (scenario "the parallel parse equals it too, in order (errors keep their offsets in the whole text)"
+      (then (expect = true (same (per-line (text-of (lines-mixed) "\n")) (parse-lines (text-of (lines-mixed) "\n") (default-options))))))
+    (scenario "CRLF line ends, no newline after the last line"
+      (then (expect = true (same (per-line (text-of (lines-mixed) "\r\n")) (parse-lines (text-of (lines-mixed) "\r\n") (default-options))))
+            (expect = true (same (per-line (str (big-line 7) "\n" (big-line 8))) (parse-lines (str (big-line 7) "\n" (big-line 8)) (default-options))))))
+    (scenario "a document spread over several lines is read whole by the sequential fold"
+      (then (expect = true (same (reference (str "{\"a\":\n[1,2,\n3]}\n" (big-line 9) "\n")) (seq-docs (str "{\"a\":\n[1,2,\n3]}\n" (big-line 9) "\n"))))))
+    (scenario "the line table: starts and ends of the non-blank lines"
+      (then (expect = [0 4 14] (. (line-table "abc\nefg\n\n  \n  xy\n") starts))
+            (expect = [3 7 16] (. (line-table "abc\nefg\n\n  \n  xy\n") ends))
+            (expect = [1 2 5] (. (line-table "abc\nefg\n\n  \n  xy\n") numbers))
+            (expect = [0 4 12] (. (line-table "abc\nefg\n\n  \n  xy\n") bols))
+            (expect = [] (. (line-table "\n \n") starts))))
+    (scenario "validate-lines: which lines are documents"
+      (then (expect = [true false true true] (validate-lines (text-of ["{\"a\":1}" "{\"a\":" "[]" (big-line 5)] "\n") (default-options)))))
+    (prop "random documents, one per line" [x (gen-json)]
+          (let [t (str (write x) "\n" (write x) "\n")]
+            (and (= (per-line t) (parse-lines t (default-options))) (= (reference t) (seq-docs t)))))))
+
+(defun main () -> i64 (run-main (specs)))

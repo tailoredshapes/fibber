@@ -1,0 +1,145 @@
+;; fib.json.tapefast: the tape builder driven by the structural index (docs/design/json.md 3). Stage 1 (fib.json.stage1) has found, 64 bytes at a time, every quote, every
+;; structural character outside a string and the first byte of every other token; stage 2 here visits only those positions, in order, and never scans a byte of
+;; whitespace or of a string it does not have to: a string is the pair of quote entries, its length is the difference, and the one thing looked for in its bytes is a
+;; backslash (a vector compare of 32 bytes), because only a string with an escape needs the byte-at-a-time check of fib.json.tape.
+;; It builds the same tape as fib.json.tapebuild (node layout in fib.json.tape) and checks the same grammar: states 0 a value is next, 1 a value just ended, 2 after `{`,
+;; 3 after a comma in an object, 4 after `[`, 5 after a key (a colon is next). It reports only success or failure: on any failure (a control byte in a string, an open string,
+;; a grammar error, depth) it answers -1 and the caller runs the scalar builder, which finds the same failure and gives its exact code and offset. So a bug here can only
+;; make a valid document slower, never change an error message; a document it accepts is checked by the cases that compare the two tapes (specs/json-fast-spec.fib).
+;;   (fast-tape s o) -> (Option Doc)       nil: use the scalar builder
+(ns fib.json.tapefast (:use fib.core fib.seq fib.coll fib.json.types fib.json.number fib.json.tape fib.json.stage1))
+
+(defun byte-at (p: ptr i: i64) -> i64 (unsafe (zext i64 (load-i8 (ptr+ p i)))))
+
+(defun ws? (c: i64) -> bool (or (= c 32) (or (= c 10) (or (= c 13) (= c 9)))))
+
+;; Is there a backslash among the bytes [a, b) of the n-byte text at p? Vector compares of 32 bytes while 32 bytes remain in the text, bytes after that.
+(defun has-bs (p: ptr a: i64 b: i64 n: i64) -> bool
+  (loop [i a]
+    (cond (>= i b) false
+          (<= (+ i 32) n)
+          (let [m (simd/movemask (simd/eq (unsafe (load-simd (ptr+ p i))) (splat (Simd i8 32) 92i8)))
+                w (- b i)]
+            (if (>= w 32)
+                (if (= m 0) (recur (+ i 32)) true)
+                (!= (bit-and m (- (shl 1 w) 1)) 0)))
+          :else (loop [j i] (cond (>= j b) false (= (byte-at p j) 92) true :else (recur (+ j 1)))))))
+
+(defun tput (tp: ptr tl: i64 w0: i64 w1: i64) -> unit
+  (unsafe (do (store-i64 (ptr+ tp (+ 24 (shl tl 3))) w0) (store-i64 (ptr+ tp (+ 32 (shl tl 3))) w1))))
+
+(defun tget (tp: ptr i: i64) -> i64 (unsafe (load-i64 (ptr+ tp (+ 24 (shl i 3))))))
+
+(defun sget (sk: ptr d: i64) -> i64 (unsafe (load-i64 (ptr+ sk (shl d 3)))))
+(defun sput (sk: ptr d: i64 v: i64) -> unit (unsafe (store-i64 (ptr+ sk (shl d 3)) v)))
+
+;; The string whose quotes are the index entries a (opening) and b (closing): its tape node, and a check of the escapes when it has a backslash. The new tape length, or -1.
+(defun put-string (s: str p: ptr n: i64 tp: ptr tl: i64 a: i64 b: i64) -> i64
+  (if (has-bs p (+ a 1) b n)
+      (let [esc (cell 0) fail (cell 0) bad (cell 0)
+            e (scan-str s n (+ a 1) &esc &fail &bad)]
+        (if (= e b) (do (tput tp tl (node k-str (+ a 1)) (bit-or b esc-flag)) (+ tl 2)) -1))
+      (do (tput tp tl (node k-str (+ a 1)) b) (+ tl 2))))
+
+;; The end of the run of ASCII digits starting at i (i when there is none): eight bytes at a time (a byte is a digit when, xor 0x30, it is below 10), then byte by byte.
+(defun digit-run (p: ptr i: i64 n: i64) -> i64
+  (loop [k i]
+    (if (<= (+ k 8) n)
+        (let [x (bit-xor (unsafe (load-i64 (ptr+ p k))) 3472328296227680304)
+              bad (bit-and (bit-or (unchecked-add (bit-and x 9187201950435737471) 8536140394893047414) x) -9187201950435737472)]
+          (if (= bad 0) (recur (+ k 8)) (+ k (shr (ctz bad) 3))))
+        (loop [j k] (let [c (if (< j n) (byte-at p j) 0)] (if (and (>= c 48) (<= c 57)) (recur (+ j 1)) j))))))
+
+;; The number grammar at i, on raw bytes: the end of the token times 2, plus 1 when it has a fraction or an exponent; -1 when it is malformed (the scalar builder says how).
+(defun number-end (p: ptr n: i64 i: i64) -> i64
+  (let [i0 (if (= (byte-at p i) 45) (+ i 1) i)
+        i1 (digit-run p i0 n)]
+    (if (or (= i1 i0) (and (> (- i1 i0) 1) (= (byte-at p i0) 48))) -1
+        (let [dot (and (< i1 n) (= (byte-at p i1) 46))
+              i2 (if dot (digit-run p (+ i1 1) n) i1)
+              ec (if (< i2 n) (byte-at p i2) 0)
+              has-e (or (= ec 101) (= ec 69))
+              sg (if (< (+ i2 1) n) (byte-at p (+ i2 1)) 0)
+              jx (if has-e (if (or (= sg 43) (= sg 45)) (+ i2 2) (+ i2 1)) i2)
+              i3 (if has-e (digit-run p jx n) i2)]
+          (if (or (and dot (= i2 (+ i1 1))) (and has-e (= i3 jx))) -1
+              (+ (shl i3 1) (if (or dot has-e) 1 0)))))))
+
+;; The number at i: its tape node and the new tape length, or -1. The byte after it must end the token: whitespace, the next index entry, or the end.
+(defun put-number (p: ptr n: i64 tp: ptr tl: i64 i: i64 next: i64) -> i64
+  (let [r (number-end p n i)
+        e (shr r 1)]
+    (if (and (>= r 0) (or (= e n) (or (= e next) (ws? (byte-at p e)))))
+        (do (tput tp tl (node (if (= (bit-and r 1) 1) k-float k-int) i) e) (+ tl 2))
+        -1)))
+
+;; true, false, null at i.
+(defun put-word (s: str p: ptr n: i64 tp: ptr tl: i64 i: i64 c: i64 next: i64) -> i64
+  (let [w (cond (= c 116) "true" (= c 102) "false" :else "null")
+        e (+ i (str-len w))]
+    (if (and (word-at s n i w) (or (= e n) (or (= e next) (ws? (byte-at p e)))))
+        (do (tput tp tl (node (cond (= c 116) k-true (= c 102) k-false :else k-null) i) 0) (+ tl 2))
+        -1)))
+
+(defun entry-at (ix: Sidx k: i64 cnt: i64 n: i64) -> i64 (if (< k cnt) (sidx-at ix k) n))
+
+;; Close the container on top of the stack: the matching kind, and a state that allows it. The new depth or -1.
+(defun close-top (tp: ptr sk: ptr dp: i64 tl: i64 c: i64 st: i64) -> i64
+  (if (= dp 0) -1
+      (let [top (sget sk (- dp 1))
+            arr (= (bit-and (tget tp top) 255) k-array)]
+        (if (and (= arr (= c 93)) (or (= st 1) (= st (if arr 4 2))))
+            (do (unsafe (store-i64 (ptr+ tp (+ 32 (shl top 3))) tl)) (- dp 1))
+            -1))))
+
+(defun open-top (tp: ptr sk: ptr dp: i64 tl: i64 c: i64 pos: i64) -> unit
+  (do (sput sk dp tl) (tput tp tl (node (if (= c 91) k-array k-object) pos) 0)))
+
+;; The state machine over the entries. `tp` is the tape array, `sk` the stack of open containers (the tape index of each).
+(defun run-entries (s: str p: ptr n: i64 ix: Sidx tp: ptr sk: ptr max-depth: i64) -> i64
+  (let [cnt (. ix count)]
+    (loop [k 0 tl 0 dp 0 st 0]
+      (if (>= k cnt)
+          (if (and (= dp 0) (= st 1)) tl -1)
+          (let [pos (sidx-at ix k) c (byte-at p pos)]
+            (cond (= c 34)
+                  (let [r (put-string s p n tp tl pos (sidx-at ix (+ k 1)))]
+                    (cond (< r 0) -1
+                          (or (= st 0) (= st 4)) (recur (+ k 2) r dp 1)
+                          (or (= st 2) (= st 3)) (recur (+ k 2) r dp 5)
+                          :else -1))
+                  (= c 44) (if (and (= st 1) (> dp 0))
+                             (recur (+ k 1) tl dp (if (= (bit-and (tget tp (sget sk (- dp 1))) 255) k-array) 0 3))
+                             -1)
+                  (= c 58) (if (= st 5) (recur (+ k 1) tl dp 0) -1)
+                  (or (= c 123) (= c 91))
+                  (if (and (or (= st 0) (= st 4)) (< dp max-depth))
+                      (do (open-top tp sk dp tl c pos) (recur (+ k 1) (+ tl 2) (+ dp 1) (if (= c 91) 4 2)))
+                      -1)
+                  (or (= c 125) (= c 93))
+                  (let [d (close-top tp sk dp tl c st)] (if (< d 0) -1 (recur (+ k 1) tl d 1)))
+                  (or (= st 0) (= st 4))
+                  (let [next (entry-at ix (+ k 1) cnt n)
+                        r (cond (or (= c 45) (and (>= c 48) (<= c 57))) (put-number p n tp tl pos next)
+                                (or (= c 116) (or (= c 102) (= c 110))) (put-word s p n tp tl pos c next)
+                                :else -1)]
+                    (if (< r 0) -1 (recur (+ k 1) r dp 1)))
+                  :else -1))))))
+
+;; Below this many bytes the scalar builder is as fast and has no index to allocate.
+(def min-fast-size: i64 512)
+
+(defun fast-tape (s: str o: JsonOptions) -> (Option Doc) (if (< (str-len s) min-fast-size) nil (fast-tape-always s o)))
+
+;; The same without the size threshold (the specs use it, so that small documents run the SIMD path too).
+(defun fast-tape-always (s: str o: JsonOptions) -> (Option Doc)
+  (let [n (str-len s)]
+    (if false nil
+        (let [ix (structural-index s)]
+          (if (!= (. ix flags) 0)
+              (do (sidx-free ix) nil)
+              (let [nodes (- (. ix count) (. ix closing))
+                    t (array (+ 8 (* 2 nodes)) 0)
+                    sk (array (+ (. o max-depth) 2) 0)
+                    tl (run-entries s (unsafe (ptr+ (raw s) 24)) n ix (unsafe (raw t)) (unsafe (raw sk)) (. o max-depth))]
+                (do (sidx-free ix) (if (< tl 0) nil (some (Doc s t tl))))))))))

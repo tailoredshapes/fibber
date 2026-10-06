@@ -2,7 +2,7 @@
 ;; value just ended (a comma, a close or the end of the document); 2 just after `{` (a key or `}`); 3 after a comma in an object (a key); 4 just after `[`
 ;; (a value or `]`). A step answers the next index, -1 for a failure (code in `fail`, offset in `bad`) or -2 at the end of the document.
 ;;   (build-tape s opts) -> (Result Doc JsonError)       (tape-of s) with the default options
-(ns fib.json.tapebuild (:use fib.core fib.seq fib.coll fib.json.types fib.json.number fib.json.tape fib.json.buffer))
+(ns fib.json.tapebuild (:use fib.core fib.seq fib.coll fib.json.types fib.json.number fib.json.tape fib.json.buffer fib.json.tapefast))
 
 (defun skip-white (s: str n: i64 i: i64) -> i64
   (loop [k i] (let [b (at s n k)] (if (or (= b 32) (or (= b 10) (or (= b 13) (= b 9)))) (recur (+ k 1)) k))))
@@ -73,7 +73,7 @@
           (= c -1) (fail! &fail &bad e-eof i)
           :else (fail! &fail &bad e-unexpected i))))
 
-(defun build-tape (s: str o: JsonOptions) -> (Result Doc JsonError)
+(defun build-tape-scalar (s: str o: JsonOptions) -> (Result Doc JsonError)
   (let [n (str-len s)]
     (if (> n (. o max-size))
         (Err (make-error s e-size 0))
@@ -90,5 +90,11 @@
                                     :else (step-key s n i &t &tl &stk &st &dp &fail &bad))]
                         (if (>= r 0) (recur r) r))))]
           (if (= end -2) (Ok (Doc s @t @tl)) (Err (make-error s @fail @bad)))))))
+
+;; The tape of s: the index-driven builder (fib.json.tapefast) when the text is long enough and nothing in it needs the scalar builder's exact diagnosis, else
+;; the scalar builder. The only way a document differs is the failure it gets when it is invalid: both builders fail on it, the scalar one says how.
+(defun build-tape (s: str o: JsonOptions) -> (Result Doc JsonError)
+  (if (> (str-len s) (. o max-size)) (Err (make-error s e-size 0))
+      (match (fast-tape s o) ((some d) (Ok d)) (nil (build-tape-scalar s o)))))
 
 (defun tape-of (s: str) -> (Result Doc JsonError) (build-tape s (default-options)))

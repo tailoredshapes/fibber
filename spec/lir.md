@@ -412,6 +412,7 @@ that intrinsic's exact semantics.
 | `(fminnum a b)` `(fmaxnum a b)` | same float `F` | `F`: if one operand is NaN the result is the other; the order of `-0.0` and `+0.0` is not specified | `llvm.minnum` `llvm.maxnum` |
 | `(smin a b)` `(smax a b)` `(umin a b)` `(umax a b)` | same integer `I` | `I`, compared as signed or unsigned | `llvm.smin` `smax` `umin` `umax` |
 | `(abs a)` | integer `I` | `I`: the absolute value; `abs` of the minimum value is the minimum value (never poison) | `llvm.abs` with `is_int_min_poison` false |
+| `(cttz a)` `(ctlz a)` | integer `I` | `I`: the count of trailing (leading) zero bits; a zero has as many as `I` has bits (never poison) | `llvm.cttz`, `llvm.ctlz` with `is_zero_poison` false (JSON-2; the mask-to-integer move is `bitcast` of `<N x i1>` to `iN`) |
 
 `fmin`/`fmax` are the NaN-propagating pair and `fminnum`/`fmaxnum` the
 NaN-ignoring pair; the names follow LLVM's `minimum`/`minnum`. A scalar

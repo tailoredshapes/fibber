@@ -12,14 +12,17 @@ mkdir -p "$out/tmp"
 export FIB_LIB=$root/lib TMPDIR=$out/tmp
 ulimit -v 16000000
 f=$root/compiler/emit/lower/simd.fib
+g=$root/compiler/emit/lower/simdfn.fib
 cp "$f" "$out/simd.fib.orig"
-trap 'cp "$out/simd.fib.orig" "$f"' EXIT
+cp "$g" "$out/simdfn.fib.orig"
+trap 'cp "$out/simd.fib.orig" "$f"; cp "$out/simdfn.fib.orig" "$g"' EXIT
 survived=0
 mutant() { # NAME SED-EXPRESSION CASE-PREFIXES..   (ONLY=name runs one)
   local name=$1 expr=$2; shift 2; [ -n "${ONLY:-}" ] && [ "$ONLY" != "$name" ] && return 0
-  cp "$out/simd.fib.orig" "$f"
-  sed -i -e "$expr" "$f"
-  if cmp -s "$f" "$out/simd.fib.orig"; then echo "PLANT-FAILED $name: the sed expression changed nothing"; exit 2; fi
+  cp "$out/simd.fib.orig" "$f"; cp "$out/simdfn.fib.orig" "$g"
+  local tgt=$f orig=$out/simd.fib.orig; [ -n "${INFN:-}" ] && { tgt=$g; orig=$out/simdfn.fib.orig; }
+  sed -i -e "$expr" "$tgt"
+  if cmp -s "$tgt" "$orig"; then echo "PLANT-FAILED $name: the sed expression changed nothing"; exit 2; fi
   (cd "$root" && "$builder" build compiler/fibc.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o "$out/Fm") > "$out/$name.build" 2>&1 \
     || { echo "BUILD-FAILED $name: $(tail -2 "$out/$name.build" | tr '\n' ' ')"; exit 2; }
   local res; res=$(cd "$root" && "$out/Fm" cases cases/stdlib --only "$@" -j 3 2>&1 | tail -1)
@@ -48,5 +51,11 @@ mutant blend-order 's/" " (v-text p) " " (v-text q) ")"\]) (unwrap-or (v-ty p) t
 mutant shift-mask 's/(vconst t (str (- (lir-ty-bits (elem-of t)) 1)))/(vconst t (str (- (lir-ty-bits (elem-of t)) 2)))/' 6206- 6207- 6208-
 # the dynamic lane index is not checked
 mutant lane-bounds 's/(icmp uge " (v-text i) " (i64 " (str n) "))"/(icmp uge " (v-text i) " (i64 99999))"/' 6236- 6237-
+# JSON-2 (emit.lower.simdfn): movemask puts the lanes in the wrong order (the mask is reversed before the bitcast); a mask of an odd lane count is padded with true lanes;
+# the lanes are not zero-extended but sign-extended; ctz and clz are swapped
+INFN=1 mutant movemask-order 's/(let ((b (val cx (str-join \["(bitcast " (lir-ty-text wt) " " (v-text m) ")"\]) wt)))/(let ((b (val cx (str-join ["(bitcast " (lir-ty-text wt) " (shufflevector " (v-text m) " " (v-text m) " " (mask-text (mapv (fn (i: i64) (- (- w 1) i)) (range w))) "))"]) wt)))/' 7980-
+INFN=1 mutant movemask-pad 's/(mask-text (mapv (fn (i: i64) (if (< i n) i n)) (range w)))/(mask-text (mapv (fn (i: i64) (if (< i n) i 0)) (range w)))/' 7980-
+INFN=1 mutant movemask-sext 's/(val cx (str-join \["(zext i64 " (v-text b) ")"\]) LirI64)/(val cx (str-join ["(sext i64 " (v-text b) ")"]) LirI64)/' 7980-
+INFN=1 mutant ctz-clz-swapped 's/(if (= name "ctz") "cttz" "ctlz")/(if (= name "ctz") "ctlz" "cttz")/' 7980-
 [ $survived -eq 0 ] && echo "mutant-simd-lower: every mutant was killed"
 exit $survived

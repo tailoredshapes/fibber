@@ -21,3 +21,18 @@
 
 (defun field-name (s: Form) -> str (let ((x (sym-text s))) (str-slice x 0 (- (str-len x) 1))))
 
+
+;; The Option str expression that tells where the node `n` (path text `p`, both forms) does not decode as the type form t: nil when it does. A record type's own `diag-NAME`
+;; function is called for a record; the leaves ask the decoder itself, so the diagnosis cannot disagree with the decoding.
+(defun diagnoser (t: Form n: Form p: Form) -> Form
+  (match t
+    ((Sym s)
+     (cond (or (= s "i64") (or (= s "f64") (or (= s "str") (= s "bool"))))
+           `(if (some? ~(decoder t n)) nil (some (fib.json.codec/mismatch d ~n ~p ~(Str s))))
+           :else `(~(Sym (str-concat "diag-" s)) d ~n ~p)))
+    ((List parts)
+     (let ((head (sym-text (vec-nth parts 0))) (inner (diagnoser (vec-nth parts 1) (Sym "j") (Sym "q"))))
+       (cond (= head "Vec") `(fib.json.codec/diag-vec d ~n ~p (fn (j: i64 q: str) ~inner))
+             (= head "Option") `(fib.json.codec/diag-opt d ~n ~p (fn (j: i64 q: str) ~inner))
+             :else (trap "defjson: a field type is i64 f64 str bool (Vec T) (Option T) or a defjson record"))))
+    (_ (trap "defjson: a field type is i64 f64 str bool (Vec T) (Option T) or a defjson record"))))

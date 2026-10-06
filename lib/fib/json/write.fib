@@ -3,7 +3,7 @@
 ;; A float prints as the shortest decimal text that reads back as the same double, always with a `.` or an exponent so that it reads back as a float
 ;; (`100.0`, not `100`); a NaN or an infinity, which JSON cannot write, is `null` (as JavaScript's JSON.stringify). `JBig` text is written as it is.
 ;; Strings: `"` `\` and the control characters are escaped; everything else is copied as UTF-8, or, with `ascii`, escaped as \uXXXX (surrogate pairs above the BMP).
-(ns fib.json.write (:use fib.core fib.seq fib.coll fib.json.types fib.json.buffer fib.json.dtoa fib.json.escape))
+(ns fib.json.write (:use fib.core fib.seq fib.coll fib.json.types fib.json.buffer fib.json.dtoa fib.json.escape) (:require [fib.json.writefast :as wf]))
 
 (defun newline-indent (&buf: (Array i8) &len: i64 level: i64 w: WriteOptions) -> unit
   (when (> (. w indent) 0)
@@ -54,13 +54,9 @@
     ((JArr items) (put-array &buf &len items level w))
     ((JObj keys vals) (put-object &buf &len keys vals level w))))
 
-(defun write-with (j: Json w: WriteOptions) -> str
-  (let [buf (cell (new-buffer 256)) len (cell 0)]
-    (do (put-json &buf &len j 0 w) (buffer-str @buf @len))))
+(defun write-with (j: Json w: WriteOptions) -> str (wf/write-with j w))
 
-(defun write-bytes (j: Json) -> (Array i8)
-  (let [buf (cell (new-buffer 256)) len (cell 0)]
-    (do (put-json &buf &len j 0 (WriteOptions 0 false)) (buffer-bytes @buf @len))))
+(defun write-bytes (j: Json) -> (Array i8) (wf/write-bytes-with j (WriteOptions 0 false)))
 
 (defun write (j: Json) -> str (write-with j (WriteOptions 0 false)))
 (defun write-pretty (j: Json) -> str (write-with j (WriteOptions 2 false)))
