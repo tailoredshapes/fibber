@@ -8,36 +8,34 @@
 (defun address :private (p: ptr step: i64 i: i64) -> ptr
   (unsafe (ptr+ p (unchecked-multiply 4 (unchecked-multiply step i)))))
 
-(defun gather :private (p: ptr step: i64 i: i64) -> f32x8
+(defun gather :private (p: ptr step: i64 i: i64) -> f32xn
   (unsafe
-    (cond (= step 1) (load-f32x8 (address p step i))
-          (= step 0) (splat f32x8 (load-f32 p))
-          :else <<(load-f32 (address p step i)) (load-f32 (address p step (+ i 1)))
-                  (load-f32 (address p step (+ i 2))) (load-f32 (address p step (+ i 3)))
-                  (load-f32 (address p step (+ i 4))) (load-f32 (address p step (+ i 5)))
-                  (load-f32 (address p step (+ i 6))) (load-f32 (address p step (+ i 7)))>>)))
+    (cond (= step 1) (load-simd (address p step i))
+          (= step 0) (splat f32xn (load-f32 p))
+          :else (loop ((k 0) (acc (splat f32xn 0.0f32)))
+                  (if (< k (native-lanes f32)) (recur (+ k 1) (with-lane acc k (load-f32 (address p step (+ i k))))) acc)))))
 
 (defun short-sum :private (p: ptr n: i64) -> f32
   (unsafe
-    (let ((end (- n (rem n 4)))
-          (lanes (loop ((i 0) (acc (splat f32x4 0.0f32)))
-                   (if (< i end) (recur (+ i 4) (+ acc (load-f32x4 (address p 1 i)))) acc))))
+    (let ((end (- n (rem n (native-lanes f32))))
+          (lanes (loop ((i 0) (acc (splat f32xn 0.0f32)))
+                   (if (< i end) (recur (+ i (native-lanes f32)) (+ acc (load-simd (address p 1 i)))) acc))))
       (loop ((i end) (acc (hsum lanes)))
         (if (< i n) (recur (+ i 1) (+ acc (load-f32 (address p 1 i)))) acc)))))
 
 (defun long-sum :private (p: ptr n: i64) -> f32
   (unsafe
-    (let ((end (- n (rem n 32)))
-          (lanes (loop ((i 0) (a (splat f32x8 0.0f32)) (b (splat f32x8 0.0f32))
-                        (c (splat f32x8 0.0f32)) (d (splat f32x8 0.0f32)))
+    (let ((end (- n (rem n (* 4 (native-lanes f32)))))
+          (lanes (loop ((i 0) (a (splat f32xn 0.0f32)) (b (splat f32xn 0.0f32))
+                        (c (splat f32xn 0.0f32)) (d (splat f32xn 0.0f32)))
                    (if (< i end)
-                       (recur (+ i 32) (+ a (load-f32x8 (address p 1 i)))
-                              (+ b (load-f32x8 (address p 1 (+ i 8))))
-                              (+ c (load-f32x8 (address p 1 (+ i 16))))
-                              (+ d (load-f32x8 (address p 1 (+ i 24))))) (+ (+ a b) (+ c d)))))
-          (packed (- n (rem n 8)))
+                       (recur (+ i (* 4 (native-lanes f32))) (+ a (load-simd (address p 1 i)))
+                              (+ b (load-simd (address p 1 (+ i (native-lanes f32)))))
+                              (+ c (load-simd (address p 1 (+ i (* 2 (native-lanes f32))))))
+                              (+ d (load-simd (address p 1 (+ i (* 3 (native-lanes f32))))))) (+ (+ a b) (+ c d)))))
+          (packed (- n (rem n (native-lanes f32))))
           (rest (loop ((i end) (acc lanes))
-                  (if (< i packed) (recur (+ i 8) (+ acc (load-f32x8 (address p 1 i)))) acc))))
+                  (if (< i packed) (recur (+ i (native-lanes f32)) (+ acc (load-simd (address p 1 i)))) acc))))
       (loop ((i packed) (acc (hsum rest)))
         (if (< i n) (recur (+ i 1) (+ acc (load-f32 (address p 1 i)))) acc)))))
 
@@ -46,9 +44,9 @@
 
 (defun strided-row-sum :private (p: ptr step: i64 n: i64) -> f32
   (unsafe
-    (let ((end (- n (rem n 8)))
-          (lanes (loop ((i 0) (acc (splat f32x8 0.0f32)))
-                   (if (< i end) (recur (+ i 8) (+ acc (gather p step i))) acc))))
+    (let ((end (- n (rem n (native-lanes f32))))
+          (lanes (loop ((i 0) (acc (splat f32xn 0.0f32)))
+                   (if (< i end) (recur (+ i (native-lanes f32)) (+ acc (gather p step i))) acc))))
       (loop ((i end) (acc (hsum lanes)))
         (if (< i n) (recur (+ i 1) (+ acc (load-f32 (address p step i)))) acc)))))
 
@@ -66,38 +64,38 @@
 
 (defun dense-dot :private (ap: ptr bp: ptr n: i64) -> f32
   (unsafe
-    (let ((end (- n (rem n 32)))
-          (lanes (loop ((i 0) (a (splat f32x8 0.0f32)) (b (splat f32x8 0.0f32))
-                        (c (splat f32x8 0.0f32)) (d (splat f32x8 0.0f32)))
+    (let ((end (- n (rem n (* 4 (native-lanes f32)))))
+          (lanes (loop ((i 0) (a (splat f32xn 0.0f32)) (b (splat f32xn 0.0f32))
+                        (c (splat f32xn 0.0f32)) (d (splat f32xn 0.0f32)))
                    (if (< i end)
-                       (recur (+ i 32)
-                              (+ a (* (load-f32x8 (address ap 1 i)) (load-f32x8 (address bp 1 i))))
-                              (+ b (* (load-f32x8 (address ap 1 (+ i 8))) (load-f32x8 (address bp 1 (+ i 8)))))
-                              (+ c (* (load-f32x8 (address ap 1 (+ i 16))) (load-f32x8 (address bp 1 (+ i 16)))))
-                              (+ d (* (load-f32x8 (address ap 1 (+ i 24))) (load-f32x8 (address bp 1 (+ i 24))))))
+                       (recur (+ i (* 4 (native-lanes f32)))
+                              (+ a (* (load-simd (address ap 1 i)) (load-simd (address bp 1 i))))
+                              (+ b (* (load-simd (address ap 1 (+ i (native-lanes f32)))) (load-simd (address bp 1 (+ i (native-lanes f32))))))
+                              (+ c (* (load-simd (address ap 1 (+ i (* 2 (native-lanes f32))))) (load-simd (address bp 1 (+ i (* 2 (native-lanes f32)))))))
+                              (+ d (* (load-simd (address ap 1 (+ i (* 3 (native-lanes f32))))) (load-simd (address bp 1 (+ i (* 3 (native-lanes f32))))))))
                        (+ (+ a b) (+ c d)))))
-          (packed (- n (rem n 8)))
+          (packed (- n (rem n (native-lanes f32))))
           (rest (loop ((i end) (acc lanes))
-                  (if (< i packed) (recur (+ i 8) (+ acc (* (load-f32x8 (address ap 1 i)) (load-f32x8 (address bp 1 i))))) acc))))
+                  (if (< i packed) (recur (+ i (native-lanes f32)) (+ acc (* (load-simd (address ap 1 i)) (load-simd (address bp 1 i))))) acc))))
       (loop ((i packed) (acc (hsum rest)))
         (if (< i n) (recur (+ i 1) (+ acc (* (load-f32 (address ap 1 i))
                                           (load-f32 (address bp 1 i))))) acc)))))
 
 (defun strided-dot :private (ap: ptr bp: ptr n: i64 astep: i64 bstep: i64) -> f32
   (unsafe
-    (let ((end (- n (rem n 32)))
-          (lanes (loop ((i 0) (a (splat f32x8 0.0f32)) (b (splat f32x8 0.0f32))
-                        (c (splat f32x8 0.0f32)) (d (splat f32x8 0.0f32)))
+    (let ((end (- n (rem n (* 4 (native-lanes f32)))))
+          (lanes (loop ((i 0) (a (splat f32xn 0.0f32)) (b (splat f32xn 0.0f32))
+                        (c (splat f32xn 0.0f32)) (d (splat f32xn 0.0f32)))
                    (if (< i end)
-                       (recur (+ i 32)
+                       (recur (+ i (* 4 (native-lanes f32)))
                               (+ a (* (gather ap astep i) (gather bp bstep i)))
-                              (+ b (* (gather ap astep (+ i 8)) (gather bp bstep (+ i 8))))
-                              (+ c (* (gather ap astep (+ i 16)) (gather bp bstep (+ i 16))))
-                              (+ d (* (gather ap astep (+ i 24)) (gather bp bstep (+ i 24)))))
+                              (+ b (* (gather ap astep (+ i (native-lanes f32))) (gather bp bstep (+ i (native-lanes f32)))))
+                              (+ c (* (gather ap astep (+ i (* 2 (native-lanes f32)))) (gather bp bstep (+ i (* 2 (native-lanes f32))))))
+                              (+ d (* (gather ap astep (+ i (* 3 (native-lanes f32)))) (gather bp bstep (+ i (* 3 (native-lanes f32)))))))
                        (+ (+ a b) (+ c d)))))
-          (packed (- n (rem n 8)))
+          (packed (- n (rem n (native-lanes f32))))
           (rest (loop ((i end) (acc lanes))
-                  (if (< i packed) (recur (+ i 8) (+ acc (* (gather ap astep i) (gather bp bstep i)))) acc))))
+                  (if (< i packed) (recur (+ i (native-lanes f32)) (+ acc (* (gather ap astep i) (gather bp bstep i)))) acc))))
       (loop ((i packed) (acc (hsum rest)))
         (if (< i n) (recur (+ i 1) (+ acc (* (load-f32 (address ap astep i))
                                           (load-f32 (address bp bstep i))))) acc)))))

@@ -10,29 +10,29 @@
 (ns fib.tensor.unary
   (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.views))
 
-(defun apply-f64 :private (op: i64 x: f64x4) -> f64x4
+(defun apply-f64 :private (op: i64 x: f64xn) -> f64xn
   (cond (= op 0) (simd/sqrt x)
-        (= op 1) (fdiv (splat f64x4 1.0) (simd/sqrt x))
+        (= op 1) (fdiv (splat f64xn 1.0) (simd/sqrt x))
         (= op 2) (simd/abs x)
-        :else (simd/blend (simd/gt x (splat f64x4 0.0)) (splat f64x4 1.0)
-                          (simd/blend (simd/lt x (splat f64x4 0.0)) (splat f64x4 -1.0) x))))
+        :else (simd/blend (simd/gt x (splat f64xn 0.0)) (splat f64xn 1.0)
+                          (simd/blend (simd/lt x (splat f64xn 0.0)) (splat f64xn -1.0) x))))
 
-(defun apply-f32 :private (op: i64 x: f32x8) -> f32x8
+(defun apply-f32 :private (op: i64 x: f32xn) -> f32xn
   (cond (= op 0) (simd/sqrt x)
-        (= op 1) (fdiv (splat f32x8 1.0f32) (simd/sqrt x))
+        (= op 1) (fdiv (splat f32xn 1.0f32) (simd/sqrt x))
         (= op 2) (simd/abs x)
-        :else (simd/blend (simd/gt x (splat f32x8 0.0f32)) (splat f32x8 1.0f32)
-                          (simd/blend (simd/lt x (splat f32x8 0.0f32)) (splat f32x8 -1.0f32) x))))
+        :else (simd/blend (simd/gt x (splat f32xn 0.0f32)) (splat f32xn 1.0f32)
+                          (simd/blend (simd/lt x (splat f32xn 0.0f32)) (splat f32xn -1.0f32) x))))
 
 (defun run-f64 :private (op: i64 x: (Tensor f64)) -> (Tensor f64)
   (let ((d (contiguous x)) (n (fib.tensor.storage/size d)) (off (array-get (. d meta) 0)) (src (. d buffer))
         (buf (cell (array (checked-size (shape d) 0.0) 0.0))))
     (do (loop ((i 0))
           (when (< i n)
-            (if (<= (+ i 4) n)
-                (let ((v: f64x4 (simd-load src (+ off i))))
-                  (do (simd-store! &buf i (apply-f64 op v)) (recur (+ i 4))))
-                (let ((v: f64x4 (simd-load-tail src (+ off i))))
+            (if (<= (+ i (native-lanes f64)) n)
+                (let ((v: f64xn (simd-load src (+ off i))))
+                  (do (simd-store! &buf i (apply-f64 op v)) (recur (+ i (native-lanes f64)))))
+                (let ((v: f64xn (simd-load-tail src (+ off i))))
                   (simd-store-tail! &buf i (apply-f64 op v))))))
         (from-array (shape d) @buf 0.0))))
 
@@ -41,10 +41,10 @@
         (buf (cell (array (checked-size (shape d) 0.0f32) 0.0f32))))
     (do (loop ((i 0))
           (when (< i n)
-            (if (<= (+ i 8) n)
-                (let ((v: f32x8 (simd-load src (+ off i))))
-                  (do (simd-store! &buf i (apply-f32 op v)) (recur (+ i 8))))
-                (let ((v: f32x8 (simd-load-tail src (+ off i))))
+            (if (<= (+ i (native-lanes f32)) n)
+                (let ((v: f32xn (simd-load src (+ off i))))
+                  (do (simd-store! &buf i (apply-f32 op v)) (recur (+ i (native-lanes f32)))))
+                (let ((v: f32xn (simd-load-tail src (+ off i))))
                   (simd-store-tail! &buf i (apply-f32 op v))))))
         (from-array (shape d) @buf 0.0f32))))
 

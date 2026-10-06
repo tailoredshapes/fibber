@@ -155,12 +155,21 @@
 (defstruct CpuRow (name: str prefix?: bool family: str vector-bits: i64 has-fma: bool))
 
 ;; The x86 CPUs that have AVX2 and FMA (256-bit vectors). A name not in the table is taken to be a baseline x86-64 (128 bits, no fma): a
-;; wrong guess costs speed only.
+;; wrong guess costs speed only. The AVX-512 CPUs named here stay at 256: Skylake-X and Cascade Lake throttle under heavy 512-bit code and the
+;; client cores (Ice Lake, Tiger Lake, Rocket Lake) have one 512-bit fma unit against two 256-bit ones, so 512 is no gain there; they run
+;; explicit 512-bit vectors correctly all the same.
 (defun cpu-rows-x86 :private () -> (Vec CpuRow)
   (mapv (fn (n: str) (CpuRow n false "x86" 256 true))
-        ["x86-64-v3" "x86-64-v4" "haswell" "broadwell" "skylake" "skylake-avx512" "skx" "cascadelake" "cooperlake" "cannonlake"
-         "icelake-client" "icelake-server" "tigerlake" "rocketlake" "sapphirerapids" "alderlake" "raptorlake" "meteorlake" "graniterapids"
-         "znver1" "znver2" "znver3" "znver4" "znver5" "bdver4" "core-avx2"]))
+        ["x86-64-v3" "haswell" "broadwell" "skylake" "skylake-avx512" "skx" "cascadelake" "cooperlake" "cannonlake"
+         "icelake-client" "icelake-server" "tigerlake" "rocketlake" "alderlake" "raptorlake" "meteorlake"
+         "znver1" "znver2" "znver3" "bdver4" "core-avx2"]))
+
+;; The x86 CPUs whose 512-bit vectors are the width to prefer (docs/design/avx512.md; docs/shootout/avx512-2026-10-06.md): AVX-512 with two
+;; 512-bit fma units (Sapphire Rapids and Granite Rapids servers) or without a throttle (Zen 4 splits a 512-bit operation in two 256-bit halves,
+;; Zen 5 has it whole), and x86-64-v4, which says AVX-512 outright. `native-lanes f64` is 8 there, so a kernel written over the native width runs 512 bits.
+(defun cpu-rows-x86-512 :private () -> (Vec CpuRow)
+  (mapv (fn (n: str) (CpuRow n false "x86" 512 true))
+        ["x86-64-v4" "sapphirerapids" "graniterapids" "znver4" "znver5"]))
 
 ;; The aarch64 CPUs by LLVM's name or name prefix: every one has NEON's fused multiply-add and 128-bit vectors.
 (defun cpu-rows-aarch64 :private () -> (Vec CpuRow)
@@ -169,7 +178,7 @@
         [(CpuRow "aarch64" false "aarch64" 128 true) (CpuRow "native-aarch64" false "aarch64" 128 true)]))
 
 (defun cpu-rows () -> (Vec CpuRow)
-  (into (cpu-rows-x86) (cpu-rows-aarch64)))
+  (into (into (cpu-rows-x86) (cpu-rows-x86-512)) (cpu-rows-aarch64)))
 
 ;; The row of the CPU named `cpu`, if the table has it.
 (defun cpu-row (cpu: str) -> (Option CpuRow)

@@ -13,11 +13,24 @@
 ;; module's `(target ..)` form and the machine `lair` builds, so that they agree. (design 2.9)
 (defun target-info () -> Target
   (do (lt/init)
-      (match (lt/requested-triple)
-        ((some triple) (cross-target-info triple))
-        (nil (match (lt/requested-cpu)
-               ((some cpu) (target-of-cpu cpu))
-               (nil (target-of-features (lt/host-cpu-name) (lt/host-features))))))))
+      (with-vector-bits
+        (match (lt/requested-triple)
+          ((some triple) (cross-target-info triple))
+          (nil (match (lt/requested-cpu)
+                 ((some cpu) (target-of-cpu cpu))
+                 (nil (target-of-features (lt/host-cpu-name) (lt/host-features)))))))))
+
+;; `FIB_VECTOR_BITS` (128, 256 or 512) sets the vector width `:native`, `f64xn` and `native-lanes` stand for, whatever the CPU says: a kernel
+;; written over the native width then runs at that many lanes. A width the CPU lacks is legalised (split into the registers it has), so
+;; 512 on an AVX2 machine is correct and runs at 256-bit speed: the way to test the 512-bit shape of a kernel without AVX-512 hardware.
+;; Anything else is ignored.
+(defun with-vector-bits :private (t: Target) -> Target
+  (match (lt/env "FIB_VECTOR_BITS")
+    ((some v) (cond (= v "128") (Target (. t cpu) (. t features) 128 (. t has-fma))
+                    (= v "256") (Target (. t cpu) (. t features) 256 (. t has-fma))
+                    (= v "512") (Target (. t cpu) (. t features) 512 (. t has-fma))
+                    :else t))
+    (nil t)))
 
 ;; The target of FIB_TARGET_TRIPLE `triple`: its row of types.targets (docs/design/targets.md) with the CPU of `lt/cross-cpu`: AArch64 128-bit
 ;; vectors (NEON; SVE is not assumed) and fast fma, wasm32 SIMD128 and no fma, riscv64 RV64GC with fma; a CPU named by FIB_TARGET_CPU

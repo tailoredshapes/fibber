@@ -208,18 +208,22 @@ checked, ordered reference implementation for comparisons.
 Floating `mmul` on a target with a vector of at least four `f64` lanes (AVX2 and
 FMA; `(native-lanes f64)`) runs a blocked kernel in the GotoBLAS shape
 (`gemm-fma-f64`, `gemm-fma-f32`): B is packed per (column block, inner block)
-into panels of 8 columns (`f64`) or 16 (`f32`), A per (row block, inner block)
+into panels of NR columns, A per (row block, inner block)
 into panels of 6 rows, both zero padded to whole panels and read from their
-original strides, so any view is accepted without a copy. The micro-kernel is a
+original strides, so any view is accepted without a copy. The kernel is one source over a witness vector,
+so the tile follows the register file. At 256 bits (AVX2, sixteen ymm) it is a
 6x8 (`f64`) or 6x16 (`f32`) tile of twelve vector accumulators updated with
-`simd/fma` (a target without FMA, `(has-fma)` false, takes the multiply-then-add tiles of `gemm-f64`/`gemm-f32` instead; the tile shapes are sized for the sixteen 256-bit registers of AVX2, aarch64 would want its own), a broadcast of A and two vector loads of B per inner step; an
+`simd/fma`, a broadcast of A and two vector loads of B per inner step. Where the
+target's native width is 512 bits (`x86-64-v4`, Sapphire Rapids, Zen 4 and later: types.targets, docs/design/avx512.md; thirty-two zmm) it is a 6x32 (`f64`)
+or 6x64 (`f32`) tile of 24 accumulators, four vector loads of B and one broadcast: 29 of 32 registers, no spill. (A target without FMA, `(has-fma)` false, takes the multiply-then-add tiles of `gemm-f64`/`gemm-f32` instead; aarch64 would want its own tile.) An
 incomplete tile at the right or bottom edge goes through a scratch tile and the
-same kernel. Blocks are 256 (`f64`) or 512 (`f32`) inner steps, 96 rows and
-1024 columns. Pointers into the packed buffers are unchecked; shapes and the
+same kernel. Blocks are 256 (`f64` narrow tile) or 512 (every other tile) inner steps, 96 rows and
+1024 columns. `multiply-at` (`gemm-fma-f64`, `gemm-fma-f32`) takes the width as a witness vector, `(splat f64x8 0.0)`, so a program can
+run either shape on any target (the eight lanes are split into the registers an AVX2 CPU has) and compare them: cases 7960 and 7961 do, bit for bit. Pointers into the packed buffers are unchecked; shapes and the
 reachable range of both inputs are validated once per call and every buffer is
 sized from the loop bounds.
 **Rounding:** each output is one chain of fused multiply-adds over the inner index
-in increasing order, whatever its tile or block (a block continues the chain
+in increasing order, whatever its tile, block or vector width (a block continues the chain
 from C), so `gemm-fma-f64/fma-reference` (a checked scalar loop) gives the same
 bits. An fma rounds once, so the result can differ in the last bits from
 `mmul-scalar` (multiply, then add), which is unchanged. A target without hardware
@@ -232,14 +236,27 @@ bitwise reproducibility is promised. Integer multiplication uses the checked
 scalar reference. Batched multiplication, decompositions, and BLAS integration
 remain future work.
 
-`sum-fast` and `dot-fast` use four independent SIMD accumulators: 32 `f32`
-elements or 16 `f64` elements per unrolled iteration, followed by vector and
+`sum-fast` and `dot-fast` use four independent SIMD accumulators: four native vectors (32 `f32` elements or 16 `f64` elements at 256 bits, 64 or 32 at 512) per unrolled iteration, followed by vector and
 scalar tails. Small `f32` sums use a shorter four-lane loop. Contiguous inputs
 use native vector reads; strided inputs use raw gathers after validating their
 complete reachable range. Addition order differs from ordered reductions, so
 results can differ in the last bits or more on cancellation-sensitive inputs.
 No cross-target bitwise reproducibility is promised. `sum` and `dot` preserve
 ordered scalar semantics.
+
+## Vector width (AVX-512)
+
+The lane kernels are written over the target's native width: `(native-lanes f64)` is 4 at 256 bits and 8 at 512, `f32xn` 8 and 16. Which width a
+CPU gets is its row in `compiler/types/targets.fib` (`fibc targets` lists the targets; `x86-64-v4`, `sapphirerapids`, `graniterapids`, `znver4` and
+`znver5` prefer 512, every other AVX2 CPU 256, Skylake-X and the client AVX-512 cores stay at 256 because they throttle or have one 512-bit fma unit),
+and `FIB_VECTOR_BITS=128|256|512` overrides it for one run (a width the CPU lacks is split into the registers it has: correct, at that CPU's speed;
+this is how the 512-bit shape of every kernel is tested on an AVX2 machine, `compiler/tests/lanes/lanes.sh`). A program built for the host on an
+AVX-512 machine therefore gets 512-bit kernels; a release binary built for `x86-64-v3` keeps the 256-bit ones (docs/design/avx512.md).
+What does and does not depend on the width: the **ordered** results do not (matmul, the fused dense layer, every elementwise operation, exp, log, tanh, the
+unary functions, the axis reductions and the optimiser steps are bit-identical at every width; cases 7960 and 7961, `compiler/tests/lanes/lanes.sh`).
+The **reassociated** sums do: `sum-fast`, `dot-fast`, the f64 `softmax` and `layernorm` row sums add a lane at a time and then the lanes, so their last bits
+depend on the lane count (the README already promised no cross-target bitwise reproducibility for them). The f32 `softmax` and `layernorm`
+(eight-lane chunks at every width) and the mask kernels (`where`, `relu-grad`: byte-mask gathers of eight or four lanes) keep their 256-bit shape.
 
 ## Vector exp, log and tanh
 

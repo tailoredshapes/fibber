@@ -6,7 +6,8 @@
 ;; emitted module names (the `(target ..)` form) cannot disagree. `native.target/target-info` makes one from the environment and the
 ;; host; this module is pure, so that the checker needs no LLVM.
 ;;
-;; The width is the vector width the compiler *prefers* (a 512-bit machine prefers 256, as LLVM does on the client cores); a wrong
+;; The width is the vector width the compiler *prefers* (a Skylake-X or client AVX-512 machine prefers 256, as LLVM does; Sapphire Rapids, Zen 4 and
+;; later and x86-64-v4 prefer 512: types.targets, docs/design/avx512.md; FIB_VECTOR_BITS overrides it); a wrong
 ;; choice costs speed, never results, because every vector operation legalises on every target (design 0.4).
 (ns types.target (:use types.targets))
 
@@ -33,11 +34,18 @@
     ((some r) (Target cpu "" (. r vector-bits) (. r has-fma)))
     (nil (Target cpu (if named "" (. row features)) (. row vector-bits) (. row has-fma)))))
 
-;; The target of a CPU named `cpu` whose feature list is `features` (LLVM's `+avx2,+fma,..`): 256 bits when it has AVX2, else 128.
+;; The target of a CPU named `cpu` whose feature list is `features` (LLVM's `+avx2,+fma,..`): 512 bits when it has AVX-512 and the CPU table prefers
+;; 512 for it (a name whose row says 512: Sapphire Rapids, Zen 4, ..), else 256 bits when it has AVX2, else 128.
 (defun target-of-features (cpu: str features: str) -> Target
   (let ((wrapped (str-join ["," features ","])))
     (let ((has (fn (f: str) (match (str-find wrapped (str-join ["," f ","]) 0) ((some _) true) (nil false)))))
-      (Target cpu features (if (has "+avx2") 256 128) (or (has "+fma") (cpu-aarch64? cpu) (has "+fp-armv8") (has "+neon"))))))
+      (Target cpu features
+              (cond (and (has "+avx512f") (= (cpu-bits cpu) 512)) 512 (has "+avx2") 256 :else 128)
+              (or (has "+fma") (cpu-aarch64? cpu) (has "+fp-armv8") (has "+neon"))))))
+
+;; The vector width the CPU table prefers for the CPU named `cpu`; 0 when the table lacks it.
+(defun cpu-bits :private (cpu: str) -> i64
+  (match (cpu-row cpu) ((some r) (. r vector-bits)) (nil 0)))
 
 ;; The baseline every x86-64 has: SSE2, 128-bit vectors, no fma.
 (defun target-baseline () -> Target (target-of-cpu "x86-64"))

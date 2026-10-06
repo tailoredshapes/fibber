@@ -1,0 +1,25 @@
+;; A scalar loop LLVM auto-vectorises, compute bound and L1 resident: y[i] = ((((x*x + 1)*x + 2)*x + 3)*x + 4)*x + 5 over N f64, REPS times
+;; (docs/shootout/avx512-2026-10-06.md, "prefer-vector-width"). It measures the vector width the auto-vectoriser picks for scalar code: 256 bits by default on
+;; Sapphire Rapids and Skylake-X (the `prefer-256-bit` tuning), 512 on Zen 4, and 512 anywhere with the feature `-prefer-256-bit`.
+;;   poly N REPS     prints the sum of y with one decimal. x[i] = i mod 7, so every value is a small integer and the result is exact in any order.
+(ns main (:require [fib.fmt :as fmt]))
+
+(defun step (&y: (Array f64) x: (Array f64) n: i64) -> i64
+  (loop [i 0] (if (< i n)
+    (let [z (array-get x i)]
+      (do (array-set! &y i (* (+ (* (+ (* (+ (* (+ (* (+ (* z z) 1.0) z) 2.0) z) 3.0) z) 4.0) z) 5.0) 1.0))
+          (recur (+ i 1))))
+    0)))
+
+(defun total (y: (Array f64) n: i64) -> f64
+  (loop [i 0 s 0.0] (if (< i n) (recur (+ i 1) (+ s (array-get y i))) s)))
+
+(defun main () -> i64
+  (let [n (unwrap (parse-long (nth (args) 0)))
+        reps (if (> (count (args)) 1) (unwrap (parse-long (nth (args) 1))) 1)
+        x (cell (array n 0.0))
+        y (cell (array n 0.0))]
+    (do (loop [i 0] (if (< i n) (do (array-set! &x i (double (rem i 7))) (recur (+ i 1))) 0))
+        (loop [r 0] (if (< r reps) (do (step &y @x n) (recur (+ r 1))) 0))
+        (println (fmt/format-f64 (total @y n) 1))
+        0)))

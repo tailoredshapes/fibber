@@ -349,8 +349,9 @@ the checker cannot determine is `cannot infer the element type of a vector (a); 
 most 512 bits wide: 9 lanes of f64 are 576 bits`; no element is `a vector literal needs at least one element`.
 
 **`(splat V x)`** (a primitive form like `(sitofp T e)`): every lane of the vector type `V` is `x`; `V` must be a vector type with
-a known lane count (`splat's first operand is a vector type with a known lane count, as f64x4`). `x` is a literal (adopting the
-element as below) or an expression of the element type.
+a known lane count (`splat's first operand is a vector type with a known lane count, as f64x4`) or one that is a variable of the enclosing
+generic definition, `(splat (Simd f64 n) x)` inside a function over `(Simd f64 n)`: the lane count is the instance's. `x` is a literal (adopting the
+element as below) or an expression of the element type. (A bare literal does not broadcast to a vector *type variable* in a `let` annotation, `(v: (Simd f64 n) 1.0)`: write `(splat (Simd f64 n) 1.0)`; a literal operand of `+ * ..` still broadcasts.)
 
 **Instances** (§2.12): `Num` (`+ - * quot rem neg`) for a vector whose element has `Num`, `Float` (`fdiv`) for one whose element has
 `Float`, `Bits` for one whose element has `Bits`, `Eq` and `Show` for every vector. No `Ord` and no `Hash` (`(< v w)` is

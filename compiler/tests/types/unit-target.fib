@@ -22,4 +22,17 @@
       (check cs "an aarch64 host: fma, 128 bits, from the CPU name or the NEON feature"
              (and (. (target-of-features "apple-m1" "+neon,+fp-armv8") has-fma) (. (target-of-features "generic" "+neon,+fp-armv8") has-fma)
                   (= (. (target-of-features "apple-m1" "+neon") vector-bits) 128)))
+      ;; the AVX-512 wave (docs/design/avx512.md): 512 bits where it pays, 256 where AVX-512 throttles or has one fma unit
+      (check cs "x86-64-v4, sapphirerapids, graniterapids, znver4, znver5: 512 bits, fma"
+             (every? (fn (c: str) (and (= (. (target-of-cpu c) vector-bits) 512) (. (target-of-cpu c) has-fma)))
+                     ["x86-64-v4" "sapphirerapids" "graniterapids" "znver4" "znver5"]))
+      (check cs "skylake-avx512, cascadelake, icelake-server, tigerlake, haswell, znver3: 256 bits"
+             (every? (fn (c: str) (= (. (target-of-cpu c) vector-bits) 256)) ["skylake-avx512" "cascadelake" "icelake-server" "tigerlake" "haswell" "znver3"]))
+      (check cs "a host with +avx512f on a CPU the table prefers 512 for: 512 bits"
+             (= (. (target-of-features "sapphirerapids" "+avx2,+fma,+avx512f,+avx512vl") vector-bits) 512))
+      (check cs "a host with +avx512f on a CPU the table keeps at 256, or that it lacks: 256 bits"
+             (and (= (. (target-of-features "skylake-avx512" "+avx2,+fma,+avx512f") vector-bits) 256)
+                  (= (. (target-of-features "znver9" "+avx2,+fma,+avx512f") vector-bits) 256)))
+      (check cs "a CPU the table prefers 512 for but without +avx512f in the host's list: 256 bits"
+             (= (. (target-of-features "znver4" "+avx2,+fma") vector-bits) 256))
       (finish cs))))
