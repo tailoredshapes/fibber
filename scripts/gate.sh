@@ -165,6 +165,27 @@ stage_specs() {
   else tail -n 30 "$GATE_OUT/specs.log" > "$sd/specs.out"; sfail specs "specs FAILED (log: $GATE_OUT/specs.log)"; echo "specs FAILED $(elapsed "$t0" "$(now)") s" > "$sd/specs.t"; fi
 }
 
+# The static stage (docs/design/static-linking.md 4), full gate or GATE_STATIC=1: `fibc build --static` against the musl pieces (scripts/build-musl.sh; FIB_MUSL_DIR names them, or
+# they are beside the compiler). Only when the pieces are there, and reported as skipped, with the reason, when they are not: the toolchain is no dependency of the gate.
+# It runs the link-declaration checks (compiler/tests/driver/linklib.sh), cases/ownership and cases/modules as static executables (`FIB_STATIC_CASES=1`: each case is built
+# with --static and run), and the stdlib cases of the thread, atom, task and link blocks. Not compared with scripts/ci-stage2.expected: every one must pass.
+stage_static() {
+  skipped static compiler lib cases scripts && return
+  local t0 d log; t0=$(now); log=$GATE_OUT/static.log
+  if [ ! -r "${FIB_MUSL_DIR:-/nonexistent}/x86_64/libc.a" ] && [ ! -r "${FIB_MUSL_DIR:-/nonexistent}/libc.a" ]; then
+    echo "static SKIPPED: no musl pieces (set FIB_MUSL_DIR to a directory built by scripts/build-musl.sh x86_64 DIR/x86_64): the static build was not tested" > "$sd/static.t"; touch "$sd/static.ok"; return
+  fi
+  : > "$log"
+  F="$F" "$here/../compiler/tests/driver/linklib.sh" >> "$log" 2>&1 || sfail static "static: linklib.sh FAILED"
+  for d in ownership modules; do
+    FIB_STATIC=1 FIB_STATIC_CASES=1 "$SLOTS_SH" "$F" cases cases/$d -j "$jobs" >> "$log" 2>&1 || sfail static "static: cases/$d as static executables FAILED"
+  done
+  FIB_STATIC=1 FIB_STATIC_CASES=1 "$SLOTS_SH" "$F" cases cases/stdlib --only 655- 665- 1709- 2228- 2650- 4005- 6106- 6222- 7304- 8000- 8001- 8002- 8003- -j "$jobs" >> "$log" 2>&1 \
+    || sfail static "static: stdlib cases as static executables FAILED"
+  echo "static $(grep -E '^[0-9]+ cases:' "$log" | awk '{p+=$3; f+=$5} END {print p " pass, " f " fail"}') (log: $log) $(elapsed "$t0" "$(now)") s" > "$sd/static.t"
+  if [ -f "$sd/static.fail" ]; then tail -n 20 "$log" > "$sd/static.out"; else touch "$sd/static.ok"; fi
+}
+
 sample=
 [ "$mode" = quick ] && make_sample
 # the order of the report
@@ -173,11 +194,12 @@ order=()
 order+=(tools)
 [ "$mode" = full ] && order+=(adr)
 order+=(cases)
+if [ "$mode" = full ] || [ "${GATE_STATIC:-0}" = 1 ]; then order+=(static); fi
 if { [ "$mode" = full ] || [ "${GATE_SPECS:-0}" = 1 ]; } && [ -d specs ]; then order+=(specs); fi
 # The stages with the longest chains first (the fixed point is one build after another, golden builds its tools and then runs its suites, the cases
 # are shards), a moment before the many small scripts of tools, so that the slots they ask for are theirs and the wall time is not a late
 # straggler's: the report below is the same whichever order they start in.
-for s in fixed golden cases tools adr specs; do
+for s in fixed golden cases static tools adr specs; do
   [[ " ${order[*]} " == *" $s "* ]] || continue
   ( stage_"$s"; stage_done "$s" ) &
   [ "$s" = cases ] && sleep 3

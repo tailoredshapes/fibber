@@ -13,7 +13,7 @@
 ;; `test [PATH..] [options]` is driver.test (docs/design/test-harness.md 6). `cases DIR [--only PREFIX..]` is driver.harness (H1). Not ported (the Rust test harness stays Rust): `itrace`, `gen`: each is refused with status 2.
 ;; Build: `fibc build compiler/fibc.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o OUT`, run from the repository root (lair is native.*, fibber over LLVM: no liblair).
 (ns main
-  (:require [driver.args :as a] [driver.commands :as c] [driver.native :as native] [expand.roots :as roots] [expand.maker :as mk]
+  (:require [driver.static :as st] [driver.args :as a] [driver.commands :as c] [driver.native :as native] [expand.roots :as roots] [expand.maker :as mk]
             [macros.runner :as mr] [driver.harness :as hn] [driver.test :as dt] [driver.version :as v] [lsp.server :as lsp]
             [pkg.project-mode :as pm] [pkg.deps-cmd :as deps] [pkg.new :as new]))
 
@@ -39,15 +39,26 @@
     ((a/CmdInvalid) (do (eprintln a/usage) 2))))
 
 ;; `--exe` before the first `--` (with `emit`): the lIR of an executable, as `build` makes it (its `main` does not print the result), by FIB_EMIT_EXE.
-;; `--target TRIPLE` before the first `--`: removed, and FIB_TARGET_TRIPLE set (the front end's lane counts and the code generator read it;
+;; `--static` (FIB_STATIC=1: a fully static executable, driver.static), `--link LIB=static|dynamic` (FIB_LINK) and `--link-mode static|dynamic` (FIB_LINK_MODE): how `build` links the native libraries
+;; the program's modules declare (driver.linkdecl). `--target TRIPLE` before the first `--`: removed, and FIB_TARGET_TRIPLE set (the front end's lane counts and the code generator read it;
 ;; docs/design/aarch64.md). The JIT that runs macros stays on the host. `--allow-unsupported`: FIB_ALLOW_UNSUPPORTED=1, so that `build` makes code
 ;; for a target outside docs/adr/0008 (riscv64, parked); an environment variable as FIB_TARGET_TRIPLE is, so that a script can set it once.
 (defun take-target :private (words: (Vec str)) -> (Vec str)
+  (let ((rest (take-target-words words)))
+    (do (st/apply-static) rest)))
+
+(defun take-target-words :private (words: (Vec str)) -> (Vec str)
   (loop ((i 0) (out []))
     (cond (>= i (count words)) out
           (= (nth words i) "--") (into out (drop i words))
           (= (nth words i) "--exe") (do (native/setenv-set "FIB_EMIT_EXE" "1") (recur (+ i 1) out))
           (= (nth words i) "--allow-unsupported") (do (native/setenv-set "FIB_ALLOW_UNSUPPORTED" "1") (recur (+ i 1) out))
+          (and (= (nth words i) "--link-mode") (< (+ i 1) (count words)))
+            (do (native/setenv-set "FIB_LINK_MODE" (nth words (+ i 1))) (recur (+ i 2) out))
+          (and (= (nth words i) "--link") (< (+ i 1) (count words)))
+            (do (native/setenv-set "FIB_LINK" (str (unwrap-or (native/getenv-opt "FIB_LINK") "") (if (= (unwrap-or (native/getenv-opt "FIB_LINK") "") "") "" ",") (nth words (+ i 1))))
+                (recur (+ i 2) out))
+          (= (nth words i) "--static") (do (native/setenv-set "FIB_STATIC" "1") (recur (+ i 1) out))
           (and (= (nth words i) "--target") (< (+ i 1) (count words)))
             (do (native/setenv-set "FIB_TARGET_TRIPLE" (nth words (+ i 1))) (recur (+ i 2) out))
           :else (recur (+ i 1) (conj out (nth words i))))))

@@ -1,0 +1,43 @@
+;; compiler/driver/staticrun.fib: `run` of a case as a fully static executable (FIB_STATIC_CASES=1, docs/design/static-linking.md 4): the program is built as `build --static`
+;; builds it, run with FIB_TRACE=1 as `run --trace` runs it, and what the harness reads (the program's standard output, its trace and trap message on standard error, and on
+;; exit 0 the result as the last line of standard output) is the executable's own: it is built from the lIR `run` uses, whose `main` prints its result. So
+;; `FIB_STATIC_CASES=1 FIB_STATIC=1 fibc cases DIR` judges the same headers against the static build.
+(ns driver.staticrun
+  (:require [driver.native :as native] [driver.proc :as p] [driver.front :as front] [driver.linkdecl :as ld] [expand.maker :as mk])
+  (:use expand.roots driver.verdict))
+
+(defun static-cases? () -> bool
+  (= (unwrap-or (native/getenv-opt "FIB_STATIC_CASES") "") "1"))
+
+(defun eprint-raw :private (s: str) -> unit
+  (when (not (= s ""))
+    (eprintln (if (= (str-byte-at s (- (str-len s) 1)) 10i8) (str-slice s 0 (- (str-len s) 1)) s))))
+
+;; The streams of the executable, then its result: the program's output and its trace as the harness reads them.
+(defun report :private (exe-out: str exe-err: str status: i64) -> i64
+  (let ((out (unwrap-or (read-file exe-out) ""))
+        (err (unwrap-or (read-file exe-err) "")))
+    (do (print-raw out)
+        (eprint-raw err)
+        status)))
+
+;; Builds `lir` into `exe` and runs it, its streams in files beside it.
+(defun build-and-run :private (lir: str dir: str opt: i64 args: (Vec str)) -> i64
+  (let ((exe (str dir "/x")) (out (str dir "/out")) (err (str dir "/err")) (declared (ld/declared-libs lir)))
+    (match (ld/lib-words declared)
+      ((Err m) (do (eprintln m) 2))
+      ((Ok words)
+       (match (native/build-lir lir exe opt [] words)
+         ((Err m) (do (eprintln (str "compile failed: " (ld/explain-failure m declared))) 5))
+         ((Ok _) (do (native/setenv-set "FIB_TRACE" "1")
+                     (let ((pid (p/spawn-executable exe (into [exe] args) out err 300)))
+                       (if (< pid 0) 5 (report out err (p/wait-pid pid)))))))))))
+
+(defun run-static (file: str args: (Vec str) opt: i64 roots: Roots rm: mk/RunnerMaker) -> i64
+  (match (front/lower-kind file roots rm false)
+    ((Err code) code)
+    ((Ok lir)
+     (match (p/make-temp-dir (unwrap-or (native/getenv-opt "TMPDIR") "/tmp"))
+       (nil 5)
+       ((some dir) (let ((r (build-and-run lir dir opt args)))
+                     (do (p/remove-file (str dir "/x")) (p/remove-file (str dir "/out")) (p/remove-file (str dir "/err")) (p/remove-dir dir) r)))))))

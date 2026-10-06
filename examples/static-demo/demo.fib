@@ -1,0 +1,50 @@
+;; The static-binary demo (docs/design/static-linking.md 5): one program, built as `fibc build --static`, that runs in a `FROM scratch` image.
+;;   demo batch FILE.json   read a file, parse it as JSON, fan a sum out over tasks, print what it found
+;;   demo serve [PORT]      an HTTP server (fib.http.server, native sockets, no libcurl) answering / and /json
+;; Build: fibc build --static examples/static-demo/demo.fib -I lib -o demo        (scripts/static-demo.sh builds the image and runs both)
+(ns main (:use fib.core fib.seq fib.coll fib.print fib.async)
+  (:require [fib.json :as json] [fib.http :as h] [fib.http.server :as s] [fib.os :as os]))
+
+(defun sum-range (lo: i64 hi: i64) -> i64
+  (loop [i lo acc 0]
+    (if (>= i hi) acc (recur (+ i 1) (+ acc (* i i))))))
+
+;; Four tasks, each summing the squares of a quarter of 0..n, joined and added.
+(defun fan-out (n: i64) -> i64
+  (let [q (quot n 4)
+        a (future (sum-range 0 q))
+        b (future (sum-range q (* 2 q)))
+        c (future (sum-range (* 2 q) (* 3 q)))
+        d (future (sum-range (* 3 q) n))]
+    (+ (+ (deref a) (deref b)) (+ (deref c) (deref d)))))
+
+(defun batch (path: str) -> i64
+  (match (os/read-file-bytes path 1048576)
+    ((Err e) (do (eprintln (str "cannot read " path ": " (. e message))) 1))
+    ((Ok bytes)
+     (match (json/parse-bytes bytes)
+       ((Err e) (do (eprintln (str "not JSON: " (. e message))) 1))
+       ((Ok j) (do (println (str "file " path ": " (count bytes) " bytes, JSON " (json/type-name j)))
+                   (println (str "compact: " (json/write j)))
+                   (println (str "sum of squares below 1000000 over 4 tasks: " (fan-out 1000000)))
+                   0))))))
+
+(defun handler (request: h/Request) -> h/Response
+  (cond (= (. request uri) "/") (h/response "hello from a static fibber binary\n")
+        (= (. request uri) "/json")
+          (h/Response 200 {"content-type" ["application/json"]}
+                      (str-bytes "{\"static\":true,\"libc\":\"musl\"}\n"))
+        :else (h/text-response 404 "not found\n")))
+
+(defun serve (port: i64) -> i64
+  (match (s/run-server handler (with (s/default-options) (host "0.0.0.0") (port port)))
+    ((Err error) (do (eprintln (h/error-message error)) 1))
+    ((Ok server) (do (println (str "listening on port " (s/port server)))
+                     (match (s/wait-server server) ((Ok _) 0) ((Err error) (do (eprintln (h/error-message error)) 1)))))))
+
+(defun main () -> i64
+  (let [a (args)]
+    (cond (and (>= (count a) 2) (= (nth a 0) "batch")) (batch (nth a 1))
+          (and (>= (count a) 1) (= (nth a 0) "serve"))
+            (serve (if (>= (count a) 2) (unwrap-or (parse-long (nth a 1)) 8080) 8080))
+          :else (do (eprintln "usage: demo batch FILE.json | demo serve [PORT]") 2))))

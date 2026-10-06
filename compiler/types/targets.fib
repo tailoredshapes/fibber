@@ -36,8 +36,8 @@
 ;; The C functions the runtime (rt/*.lir) declares: targets-emit.sh checks this list against the `declare`s of rt/.
 (defun runtime-c-functions () -> (Vec str)
   ["__errno_location" "abort" "calloc" "clock_gettime" "close" "dup" "fclose" "ferror" "fopen" "fread" "free" "fwrite" "getenv" "isatty"
-   "lseek" "madvise" "malloc" "memcmp" "memcpy" "memset" "mkdir" "nanosleep" "openat" "pipe" "pthread_cond_broadcast" "pthread_cond_init"
-   "pthread_cond_wait" "pthread_create" "pthread_detach" "pthread_exit" "pthread_getspecific" "pthread_key_create" "pthread_mutex_init"
+   "lseek" "madvise" "malloc" "malloc_usable_size" "mallopt" "memcmp" "memcpy" "memset" "mkdir" "nanosleep" "openat" "pipe" "pthread_cond_broadcast" "pthread_cond_init"
+   "pthread_attr_destroy" "pthread_attr_init" "pthread_attr_setstacksize" "pthread_cond_wait" "pthread_create" "pthread_detach" "pthread_exit" "pthread_getspecific" "pthread_key_create" "pthread_mutex_init"
    "pthread_mutex_lock" "pthread_mutex_unlock" "pthread_setspecific" "read" "realloc" "rmdir" "sched_yield" "snprintf" "strerror" "strlen"
    "strtod" "strtof" "sysconf" "trunc" "truncf" "unlink" "write"])
 
@@ -89,10 +89,24 @@
              64 true "pthreads" 128 "generic-rv64" "+m,+a,+f,+d,+c,+zicsr,+zifencei" true 0 8 1 2 "dwarf-eh" "elf" "cc (riscv64 cross)"
              "RISCV_SYSROOT" "glibc" [] "emits" "parked: LLVM has no tailcc for RISC-V"))
 
+
+;; The same two Linux targets linked fully static against musl (`fibc build --static`, docs/design/static-linking.md): no dynamic loader, no shared library, the
+;; executable runs in an empty container (`FROM scratch`) or as an AWS Lambda `bootstrap`. The code is the Linux code; what differs is the C library: musl has no
+;; `mallopt` (emit.os drops the call), its default thread stack is 128 KiB (the runtime sets 8 MiB itself: rt/thread.lir) and glibc's start-up CPU query comes
+;; from the shim `fibshim.o` of the musl pieces (rt/static/cpuid.c). The linker is the system `ld` (x86-64) or an aarch64 `ld` (`aarch64-linux-gnu-ld`, `ld.lld`)
+;; and `sysroot` names the variable that finds the pieces (`crt1.o libc.a libgcc.a`): FIB_MUSL_DIR, else share/fibber/musl/ARCH beside the executable.
+(defun row-x86-64-musl :private () -> TargetRow
+  (with (row-x86-64-linux) (triple "x86_64-unknown-linux-musl") (linker "ld (static)") (sysroot "FIB_MUSL_DIR") (libc "musl") (libc-lacks ["mallopt"])
+        (status "runs; fully static")))
+
+(defun row-aarch64-musl :private () -> TargetRow
+  (with (row-aarch64-linux) (triple "aarch64-unknown-linux-musl") (linker "ld (static, aarch64)") (sysroot "FIB_MUSL_DIR") (libc "musl") (libc-lacks ["mallopt"])
+        (status "emits and runs (qemu-user); fully static")))
+
 ;; Every row, in the order `fibc targets` prints them. The rest of LLVM's backends have no row yet (docs/design/targets.md 5).
 (defun target-rows () -> (Vec TargetRow)
   [(row-x86-64-linux) (row-aarch64-darwin) (row-aarch64-linux) (row-arm64-ios) (row-wasm32-wasip1) (row-wasm32-unknown)
-   (row-riscv64-linux)])
+   (row-riscv64-linux) (row-x86-64-musl) (row-aarch64-musl)])
 
 ;; --- matching a triple
 
@@ -106,6 +120,9 @@
 ;; Whether a triple is for an Apple OS (Mach-O).
 (defun apple-triple? (triple: str) -> bool
   (or (has triple "-apple-") (has triple "-darwin") (has triple "-ios") (has triple "-macos")))
+
+;; Whether a triple is for musl (`-musl`, `-linux-musl`): its own row, with the Linux code and the musl C library.
+(defun musl-triple? (triple: str) -> bool (has triple "-musl"))
 
 ;; The OS of a triple as the rows name it: ios, darwin, wasi, none (a wasm triple with no OS), linux, else other (freebsd, windows, ..: no row).
 (defun os-of-triple (triple: str) -> str
@@ -123,7 +140,7 @@
   (let ((arch (arch-of-triple triple))
         (os (os-of-triple triple))
         (rows (target-rows)))
-    (match (first (filter (fn (r: TargetRow) (and (= (. r arch) arch) (= (. r os) os))) rows))
+    (match (first (filter (fn (r: TargetRow) (and (= (. r arch) arch) (= (. r os) os) (= (musl-triple? triple) (= (. r libc) "musl")))) rows))
       ((some r) r)
       (nil (let ((rt (if (apple-triple? triple) "Darwin" "Linux")))
              (match (first (filter (fn (r: TargetRow) (= (. r arch) arch)) rows))

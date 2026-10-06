@@ -1065,7 +1065,7 @@ on every iteration.
 
 ```
 (unsafe body)
-(extern name private? (type*) -> type opt*)      ; opt: :varargs, :fixed N
+(extern name private? (type*) -> type opt*)      ; opt: :varargs, :fixed N, :lib "NAME"
 ```
 
 `extern` declares a foreign function with the C calling convention; its
@@ -1127,6 +1127,11 @@ promotes it; lIR rejects the unpromoted argument (lir.md §7.1,
 parameter the calls pass, and the lIR `declare` has the first N then `...`, so the later arguments are variadic ones. The difference is the C ABI of
 Apple arm64, which passes variadic arguments on the stack but fixed ones in registers: `fcntl(fd, F_SETFL, flags)` declared with all three fixed
 read a garbage third argument there (docs/design/aarch64.md 7). Without `:fixed` every declared parameter is fixed, as before. x86-64 is the same either way.
+`:lib "NAME"` (stage 2) says which native library the C function lives in. It changes nothing about the call. When the program reaches the extern (a call that
+survives to the emitted code), the emitter notes the library and the module that declared it in the lIR (`;; link-lib: NAME MODULE`) and `fibc build` links it:
+dynamically (`-lNAME`) or bundled (the archive `libNAME.a`) by the mode of the build (`--link NAME=static|dynamic`, `--link-mode`, `--static`:
+docs/design/static-linking.md 3). A name is a non-empty string, else `extern option :lib takes a library name, a string`. Only a platform module or a driver
+may write an `extern` (docs/adr/0011). `c`, `m`, `pthread`, `dl`, `rt` and `util` are the C library's own and are never linked by name.
 
 **`alloc` is zeroed** (**Proposed**, implemented at the owner's request, 2026-10-01). `(alloc n)` is `n`
 bytes of raw memory, every byte of them zero, in the reference interpreter

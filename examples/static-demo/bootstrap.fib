@@ -1,0 +1,85 @@
+;; An AWS Lambda custom-runtime `bootstrap` (docs/design/static-linking.md 5), as a DEMO: the Runtime API loop of
+;; https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html over raw sockets, because the library has no HTTP client without libcurl yet (a Lambda runtime
+;; library and a native HTTP/1.1 client are later stages: this file is not a library). Build it as `fibc build --static bootstrap.fib -o bootstrap` and zip it.
+;;   GET  http://$AWS_LAMBDA_RUNTIME_API/2018-06-01/runtime/invocation/next             -> the event, with Lambda-Runtime-Aws-Request-Id
+;;   POST http://$AWS_LAMBDA_RUNTIME_API/2018-06-01/runtime/invocation/ID/response       <- the result
+;; The loop ends when the Runtime API cannot be reached (Lambda freezes the process instead; the local fake of scripts/static-demo.sh stops serving).
+(ns main (:use fib.core fib.seq fib.coll fib.print fib.async)
+  (:require [fib.json :as json] [fib.os :as os] [fib.os.net :as net] [fib.string :as s] [fib.http.headers :as hh]))
+
+(def timeout-ms: i64 5000)
+
+;; Reads a socket to its end.
+(defun read-all (fd: i64) -> (Array i8)
+  (loop [chunks: (Vec (Array i8)) []]
+    (match (net/ready? fd false timeout-ms)          ;; the socket is non-blocking: wait until it can be read
+      ((Ok true) (match (os/read-fd fd 65536)
+                   ((Err _) (join-bytes chunks))
+                   ((Ok b) (if (= (array-len b) 0) (join-bytes chunks) (recur (conj chunks b))))))
+      (_ (join-bytes chunks)))))
+
+(defun join-bytes (parts: (Vec (Array i8))) -> (Array i8)
+  (let [size (reduce (fn (n: i64 p: (Array i8)) (+ n (array-len p))) 0 parts)
+        out (cell (array size 0i8))]
+    (do (loop [i 0 offset 0]
+          (when (< i (count parts))
+            (do (dotimes (j (array-len (nth parts i))) (array-set! &out (+ offset j) (array-get (nth parts i) j)))
+                (recur (+ i 1) (+ offset (array-len (nth parts i)))))))
+        @out)))
+
+;; One request over a fresh connection (HTTP/1.0 semantics: the server closes at the end of its response): the whole response as text, or the reason.
+(defun exchange (host: str port: i64 request: str) -> (Result str str)
+  (match (net/connect-tcp host port timeout-ms)
+    ((Err e) (Err (. e message)))
+    ((Ok fd) (let [sent (net/send-all fd (str-bytes request) timeout-ms (atom false))]
+               (match sent
+                 ((Err e) (do (os/close-fd fd) (Err (. e message))))
+                 ((Ok _) (let [body (read-all fd)] (do (os/close-fd fd) (Ok (str-from-bytes body))))))))))
+
+(defun split-at-blank (text: str) -> (Pair str str)
+  (match (str-find text "\r\n\r\n" 0)
+    (nil (Pair text ""))
+    ((some i) (Pair (str-slice text 0 i) (str-slice text (+ i 4) (str-len text))))))
+
+;; The value of the header `name` (lower case) in a block of header lines.
+(defun header-of (head: str name: str) -> (Option str)
+  (loop [lines (s/split-lines head) i 0]
+    (if (>= i (count lines)) nil
+      (let [line (nth lines i) low (hh/ascii-lower line)]
+        (if (starts-with? low (str name ":"))
+            (some (s/trim (str-slice line (+ (str-len name) 1) (str-len line))))
+            (recur lines (+ i 1)))))))
+
+;; The handler: an event {"name": "..", "numbers": [..]} gives a greeting and the sum of the numbers, the sum computed on a task.
+(defun sum-of (items: (Vec json/Json)) -> i64
+  (reduce (fn (acc: i64 j: json/Json) (match j ((json/JInt n) (+ acc n)) (_ acc))) 0 items))
+
+(defun handle (event: str) -> str
+  (match (json/parse event)
+    ((Err e) (str "{\"error\":\"" (. e message) "\"}"))
+    ((Ok j) (let [name (match (json/get-key j "name") ((some (json/JStr s)) s) (_ "world"))
+                  items (match (json/get-key j "numbers") ((some (json/JArr xs)) xs) (_ []))
+                  total (future (sum-of items))]
+              (str "{\"greeting\":\"hello " name "\",\"sum\":" (deref total) ",\"runtime\":\"fibber, static musl\"}")))))
+
+(defun serve-one (host: str port: i64) -> (Result i64 str)
+  (try-let [reply (exchange host port "GET /2018-06-01/runtime/invocation/next HTTP/1.0\r\nHost: runtime\r\n\r\n")]
+    (let [parts (split-at-blank reply)
+          id (unwrap-or (header-of (. parts fst) "lambda-runtime-aws-request-id") "")
+          answer (handle (. parts snd))]
+      (if (= id "") (Err "no Lambda-Runtime-Aws-Request-Id in the invocation")
+        (try-let [_ (exchange host port (str "POST /2018-06-01/runtime/invocation/" id "/response HTTP/1.0\r\nHost: runtime\r\nContent-Length: "
+                                             (str-len answer) "\r\n\r\n" answer))]
+          (do (println (str "invocation " id " answered: " answer)) (Ok 1)))))))
+
+(defun loop-invocations (host: str port: i64 served: i64) -> i64
+  (match (serve-one host port)
+    ((Ok _) (loop-invocations host port (+ served 1)))
+    ((Err m) (do (println (str "runtime API gone after " served " invocations: " m)) (if (> served 0) 0 1)))))
+
+(defun main () -> i64
+  (match (os/getenv "AWS_LAMBDA_RUNTIME_API")
+    (nil (do (eprintln "AWS_LAMBDA_RUNTIME_API is not set: not running in Lambda") 2))
+    ((some api) (match (str-find api ":" 0)
+                  (nil (loop-invocations api 80 0))
+                  ((some i) (loop-invocations (str-slice api 0 i) (unwrap-or (parse-long (str-slice api (+ i 1) (str-len api))) 80) 0))))))

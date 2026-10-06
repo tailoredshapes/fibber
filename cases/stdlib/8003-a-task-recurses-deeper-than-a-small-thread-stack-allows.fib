@@ -1,0 +1,21 @@
+;; spec:   types §8.8 (threads), docs/design/static-linking.md 4 (musl's default thread stack is 128 KiB)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; A task runs on a thread of its own, and the runtime gives that thread an 8 MiB stack explicitly (rt/thread.lir, fib.thread-attr): musl's default for a thread is 128 KiB, and
+;; a task whose recursion needs a megabyte would fault there (a static executable, `FIB_STATIC_CASES=1 fibc cases`). A non-tail recursion 40000 deep, a few dozen bytes a frame
+;; and more, is run on a task and on a worker of the pool, and must return the sum.
+(ns main (:use fib.core fib.async tl.check))
+
+(defun down (n: i64) -> i64
+  (if (= n 0) 0 (+ n (down (- n 1)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (t (future (down 40000)))
+        (u (future (down 30000))))
+    (do (check c (= (deref t) 800020000))
+        (check c (= (deref u) 450015000))
+        (checks-result c))))
