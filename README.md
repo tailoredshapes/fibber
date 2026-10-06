@@ -200,6 +200,9 @@ Recent compiler and library changes include:
   [the aarch64 design](docs/design/aarch64.md) and [the first numbers](docs/shootout/aarch64.md).
 - GraphQL lives in its own repository, lacewing: `ssh://git@localhost:2222/tailoredshapes/lacewing.git`, pulled in with `fibc deps add`
   (see Projects and dependencies).
+- HOCON configuration lives in its own repository, fib-hocon: `ssh://git@localhost:2222/tailoredshapes/fib-hocon.git` (tag `v0.1.0`), module
+  `hocon`. It has the parser, substitutions, includes, merging, durations and sizes, a `config->record` macro, and a differential harness
+  against Typesafe Config; its README has the features and the measurements.
 - Databases: `fib.db` (next.jdbc's shape: `execute!`, `with-transaction`, `with-connection`, `plan`), the driver contract
   `fib.db.contract` and an in-memory fake driver `fib.db.memory` are in the library; drivers are libraries in their own repositories. The
   SQLite driver is `fib-db-sqlite`: `ssh://git@localhost:2222/tailoredshapes/fib-db-sqlite.git`, module `sqlite`. See
