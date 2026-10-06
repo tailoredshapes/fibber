@@ -27,7 +27,8 @@ recorded expected failure, case 1707). Streams since the bootstrap:
   (docs/design/fibber-interpreter.md) is superseded: no rule 6 oracle.
 - **aarch64**: cross-emission and a native, self-hosting compiler on an Apple M1 Ultra; macOS packaging works; no darwin-arm64 release yet;
   iOS, aarch64 Linux, the NEON GEMM tile and the aarch64 CPU rows are open ([docs/design/aarch64.md](docs/design/aarch64.md)).
-- **Libraries beyond the core**: `fib.os`, `fib.http`, `fib.logic` and `fib.logic.fd`, `fib.lacinia`, `fib.regex` (regex literals compile at compile time).
+- **Libraries beyond the core**: `fib.os`, `fib.http`, `fib.logic` and `fib.logic.fd`, `fib.regex` (regex literals compile at compile time). The GraphQL engine (once `fib.lacinia`) moved to its own
+  repository, lacewing (`ssh://git@localhost:2222/tailoredshapes/lacewing.git`), pulled in with `fibc deps add`.
 
 **Open work, in the order I would take it:** reverse-mode autodiff on `fib.tensor` (design not written); the darwin-arm64 release; the
 remaining dev-loop packages (DV2 to DV10); the shootout gaps; last-axis reductions in `fib.tensor`; the port of meshql to fibber (deferred by

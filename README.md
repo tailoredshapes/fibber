@@ -173,8 +173,8 @@ Recent compiler and library changes include:
   `scripts/package.sh` builds a macOS tarball. No darwin-arm64 release has been
   published, and iOS and aarch64 Linux have not been run. See
   [the aarch64 design](docs/design/aarch64.md) and [the first numbers](docs/shootout/aarch64.md).
-- A GraphQL query engine, [`fib.lacinia`](lib/fib/lacinia/README.md), with
-  variables, defaults, input objects, fragments and operation selection.
+- GraphQL lives in its own repository, lacewing: `ssh://git@localhost:2222/tailoredshapes/lacewing.git`, pulled in with `fibc deps add`
+  (see Projects and dependencies).
 
 The standard library in `lib/` follows Clojure's names and argument shapes,
 within fibber's static types and ownership model. Its specification and
