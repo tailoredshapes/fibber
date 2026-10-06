@@ -1089,6 +1089,13 @@ checks. Cases 7009, 7017, 7053, and 7056 in `cases/stdlib` pin the round trips
 and unsafe boundary. This extension is native-stage only, like the SIMD types; the frozen
 Rust reference does not implement it.
 
+**Width-generic vector memory** (AVX-512 wave, docs/design/avx512.md). `load-simd p` and `store-simd p v` read and write one vector through a raw
+`ptr` at the lane type and lane count the context says: `(load-simd p)` has the type `(Simd t n)` its use fixes (an annotation, or the other operand of a
+vector operation), and `store-simd` takes a value of any vector type. They are `load-f64x4` and its kin for every shape, with the same rules: lexical
+`unsafe`, byte alignment (`align 1`), no bounds or ownership checks, native stage only. A function generic over `n` (`(Simd f64 n)`) can therefore
+read and write any width, and `(splat (Simd f64 n) x)` is allowed inside it (spec/types.md 1.9). Case 7962 pins them at 2, 4 and 8 `f64` lanes and 4,
+8 and 16 `f32` lanes.
+
 `array-uninit-f32` and `array-uninit-f64` take an `i64` length and return
 `(Array f32)` and `(Array f64)`, respectively, only inside lexical `unsafe`.
 They allocate ordinary reference-counted native arrays without filling the

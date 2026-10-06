@@ -1,0 +1,79 @@
+;; spec: spec/types.md 1.9 (unsafe raw vector access, AVX-512 wave): `load-simd p` and `store-simd p v` read and write a vector of the lane type and count the context says through a raw pointer, unaligned; `(splat (Simd t n) x)` is allowed inside a function generic over n
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; One function over `(Simd f64 n)` and one over `(Simd f32 n)` copy `count` elements from a raw pointer one element past the array's start (so every access is unaligned) to
+;; another array, adding a splatted scalar, and return the horizontal sum; they run at 2, 4 and 8 f64 lanes and at 4, 8 and 16 f32 lanes. Each result and each copied element is
+;; compared with the scalar loop, so a store of the wrong width, a load that is not unaligned-safe, a splat that fills only some lanes or a lane count that is not the instance's fails.
+(ns main (:use tl.check))
+
+(defun copy-add (src: ptr dst: ptr count: i64 s: f64 w: (Simd f64 n)) -> f64
+  (unsafe
+    (let ((l (simd/lanes w)) (sv (splat (Simd f64 n) s)))
+      (loop ((i 0) (acc (splat (Simd f64 n) 0.0)))
+        (if (<= (+ i l) count)
+            (let ((x: (Simd f64 n) (load-simd (ptr+ src (* 8 i)))) (y (+ x sv)))
+              (do (store-simd (ptr+ dst (* 8 i)) y) (recur (+ i l) (+ acc y))))
+            (hsum acc))))))
+
+(defun copy-add32 (src: ptr dst: ptr count: i64 s: f32 w: (Simd f32 n)) -> f32
+  (unsafe
+    (let ((l (simd/lanes w)) (sv (splat (Simd f32 n) s)))
+      (loop ((i 0) (acc (splat (Simd f32 n) 0.0f32)))
+        (if (<= (+ i l) count)
+            (let ((x: (Simd f32 n) (load-simd (ptr+ src (* 4 i)))) (y (+ x sv)))
+              (do (store-simd (ptr+ dst (* 4 i)) y) (recur (+ i l) (+ acc y))))
+            (hsum acc))))))
+
+;; the elements 1 .. 1+count of a source of small integers, plus s: what the vector loop must have written, and its sum over the whole vectors only
+(defun expect64 (a: (Array f64) b: (Array f64) count: i64 whole: i64 s: f64) -> bool
+  (loop ((i 0)) (if (< i whole) (if (= (array-get b (+ i 1)) (+ (array-get a (+ i 1)) s)) (recur (+ i 1)) false) true)))
+
+(defun expect32 (a: (Array f32) b: (Array f32) count: i64 whole: i64 s: f32) -> bool
+  (loop ((i 0)) (if (< i whole) (if (= (array-get b (+ i 1)) (+ (array-get a (+ i 1)) s)) (recur (+ i 1)) false) true)))
+
+(defun sum64 (a: (Array f64) from: i64 n: i64 s: f64) -> f64
+  (loop ((i 0) (acc 0.0)) (if (< i n) (recur (+ i 1) (+ acc (+ (array-get a (+ from i)) s))) acc)))
+
+(defun sum32 (a: (Array f32) from: i64 n: i64 s: f32) -> f32
+  (loop ((i 0) (acc 0.0f32)) (if (< i n) (recur (+ i 1) (+ acc (+ (array-get a (+ from i)) s))) acc)))
+
+(defun reset64 (&b: (Array f64)) -> unit (dotimes (i 80) (array-set! &b i -1.0)))
+(defun reset32 (&b: (Array f32)) -> unit (dotimes (i 80) (array-set! &b i -1.0f32)))
+
+(defun main () -> i64
+  (let ((c (checks)) (n 70) (a (cell (array 80 0.0))) (b (cell (array 80 -1.0))) (a32 (cell (array 80 0.0f32))) (b32 (cell (array 80 -1.0f32))))
+    (do (dotimes (i 80) (array-set! &a i (double (rem (* i 7) 13))) (array-set! &a32 i (float (rem (* i 5) 11))))
+        (unsafe
+          (let ((pa (ptr+ (raw @a) (+ 24 8))) (pb (ptr+ (raw @b) (+ 24 8)))
+                (pa32 (ptr+ (raw @a32) (+ 24 4))) (pb32 (ptr+ (raw @b32) (+ 24 4))))
+            (do ;; 2 lanes: 70 elements are whole vectors
+                (reset64 &b)
+                (check c (= (copy-add pa pb n 0.5 (splat f64x2 0.0)) (sum64 @a 1 70 0.5)))
+                (check c (expect64 @a @b n 70 0.5))
+                (check c (= (array-get @b 0) -1.0))   ; nothing written before the pointer
+                (check c (= (array-get @b 71) -1.0))  ; nor past the last whole vector
+                ;; 4 lanes: 68 whole, a tail of 2 that the loop leaves alone
+                (reset64 &b)
+                (check c (= (copy-add pa pb n 0.25 (splat f64x4 0.0)) (sum64 @a 1 68 0.25)))
+                (check c (expect64 @a @b n 68 0.25))
+                (check c (= (array-get @b 69) -1.0))
+                ;; 8 lanes: 64 whole
+                (reset64 &b)
+                (check c (= (copy-add pa pb n 1.5 (splat f64x8 0.0)) (sum64 @a 1 64 1.5)))
+                (check c (expect64 @a @b n 64 1.5))
+                (check c (= (array-get @b 65) -1.0))
+                ;; f32: 4, 8 and 16 lanes
+                (reset32 &b32)
+                (check c (= (copy-add32 pa32 pb32 n 0.5f32 (splat f32x4 0.0f32)) (sum32 @a32 1 68 0.5f32)))
+                (check c (expect32 @a32 @b32 n 68 0.5f32))
+                (reset32 &b32)
+                (check c (= (copy-add32 pa32 pb32 n 2.0f32 (splat f32x8 0.0f32)) (sum32 @a32 1 64 2.0f32)))
+                (reset32 &b32)
+                (check c (= (copy-add32 pa32 pb32 n 1.0f32 (splat f32x16 0.0f32)) (sum32 @a32 1 64 1.0f32)))
+                (check c (expect32 @a32 @b32 n 64 1.0f32))
+                (check c (= (array-get @b32 65) -1.0f32)))))
+        (check c (= (checks-made c) 16))
+        (checks-result c))))

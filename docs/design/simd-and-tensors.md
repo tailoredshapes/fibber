@@ -478,7 +478,8 @@ count when the *front end* lowers. **Proposed:**
    (Set str) vector-bits: i64 has-fma: bool ...)`, computed in one place (`native.target/target-info`) from the same decision as
    `create-machine`: `FIB_TARGET_CPU` names a CPU (features from a small table in fibber for the CPUs we ship: `x86-64`
    128 bits, `x86-64-v2` 128, `x86-64-v3`/`haswell`/`znver*` 256 and FMA, `x86-64-v4`/`skylake-avx512` 512 but preferred 256
-   as LLVM's `prefer-vector-width` does on client cores), or the host's feature string is parsed for `+avx2`, `+avx512f`, `+fma`.
+   as LLVM's `prefer-vector-width` does on client cores; since the AVX-512 wave `x86-64-v4`, `sapphirerapids`, `graniterapids`, `znver4` and `znver5`
+   prefer 512, docs/design/avx512.md), or the host's feature string is parsed for `+avx2`, `+avx512f`, `+fma`.
 2. **The chosen CPU and features are written into the lIR module** (a new optional top-level form, e.g. `(target (cpu
    "x86-64-v3") (features "+avx2,+fma"))`) and `lair`/`lairf` honour it over the host when present. Without this, `fibc emit`
    on machine A piped to `lair build` on machine B would pick lane counts for A and code for B, and the golden-output
