@@ -1,0 +1,41 @@
+;; fib.log.route: sinks that pass records on: a level filter and a fanout (docs/design/observability-and-databases.md 2.6, package L2).
+;;
+;;   (level-filter min-level inner)   a sink that passes only records at or above `min-level` to `inner`
+;;   (fanout [sink ..])               a sink that writes each record to every sink; a failing sink does not stop the others
+;;
+;; Failure isolation uses `try` (docs/design/exceptions.md 9): a sink that traps is caught, its message becomes an `Err`, and the sinks
+;; after it still get the record. The fanout answers `Ok` when every sink did and otherwise an `Err` naming the first failure and the
+;; count (the logger counts one failure per record). `flush` and `close` go to every sink in the same way.
+(ns fib.log.route (:use fib.core fib.seq fib.coll fib.log.core) (:require [fib.ex :as ex]))
+
+(defstruct LevelFilter (min: i64 inner: (dyn Sink :send)))
+
+(impl Sink LevelFilter
+  (sink-write (self r) (if (>= (. r level) (. self min)) (sink-write (. self inner) r) (Ok ())))
+  (sink-flush (self) (sink-flush (. self inner)))
+  (sink-close (self) (sink-close (. self inner))))
+
+(defun level-filter (min: i64 inner: (dyn Sink :send)) -> (dyn Sink :send) (dyn Sink :send (LevelFilter min inner)))
+
+(defstruct Fanout (sinks: (Vec (dyn Sink :send))))
+
+(defun failure-summary :private (first: (Option str) n: i64) -> (Result unit str)
+  (match first
+    (nil (Ok ()))
+    ((some m) (Err (if (= n 1) m (str m " (and " (- n 1) " more sinks failed)"))))))
+
+;; Runs `f` on every sink, whatever the others do (a trap is caught and becomes an Err).
+(defun on-each :private (sinks: (Vec (dyn Sink :send)) f: (fn ((dyn Sink :send)) (Result unit str))) -> (Result unit str)
+  (let [res (reduce (fn (acc: (Pair (Option str) i64) k: (dyn Sink :send))
+                      (match (ex/try (f k) (catch e (Err (ex/ex-message e))))
+                        ((Ok _) acc)
+                        ((Err m) (Pair (if (some? (. acc fst)) (. acc fst) (some m)) (+ (. acc snd) 1)))))
+                    (Pair nil 0) sinks)]
+    (failure-summary (. res fst) (. res snd))))
+
+(impl Sink Fanout
+  (sink-write (self r) (on-each (. self sinks) (fn (k: (dyn Sink :send)) (sink-write k r))))
+  (sink-flush (self) (on-each (. self sinks) (fn (k: (dyn Sink :send)) (sink-flush k))))
+  (sink-close (self) (on-each (. self sinks) (fn (k: (dyn Sink :send)) (sink-close k)))))
+
+(defun fanout (sinks: (Vec (dyn Sink :send))) -> (dyn Sink :send) (dyn Sink :send (Fanout sinks)))

@@ -1,0 +1,50 @@
+;; fib.otel.sampler: which spans are recorded and exported (docs/design/observability-and-databases.md 3.3; OpenTelemetry's Sampler).
+;;
+;; A sampler answers for a span about to start: `SampleDrop` (not recorded: the span is a non-recording value that still carries ids so a
+;; child and a downstream service see a consistent trace, with the sampled flag clear), `SampleRecordOnly` (recorded, flag clear, not
+;; exported) or `SampleRecordAndSample` (recorded and exported). The built-in ones: `always-on`, `always-off`, `trace-id-ratio` (a
+;; deterministic function of the trace id, so every service of a trace decides alike: the low 63 bits of the id's low half against
+;; ratio * 2^63) and `parent-based` (a valid parent's sampled flag decides, local or remote; a root span asks the sampler given).
+;; A user sampler implements the protocol.
+(ns fib.otel.sampler (:use fib.core fib.seq fib.coll fib.otel.ids fib.otel.propagation fib.otel.trace))
+
+(defenum SamplingDecision (SampleDrop) (SampleRecordOnly) (SampleRecordAndSample))
+
+(defprotocol Sampler
+  (should-sample (self parent: (Option SpanContext) trace-id: TraceId name: str kind: SpanKind) -> SamplingDecision)
+  (sampler-description (self) -> str))
+
+(defstruct AlwaysOnSampler (n: i64))
+(impl Sampler AlwaysOnSampler
+  (should-sample (self parent trace-id name kind) SampleRecordAndSample)
+  (sampler-description (self) "AlwaysOnSampler"))
+
+(defstruct AlwaysOffSampler (n: i64))
+(impl Sampler AlwaysOffSampler
+  (should-sample (self parent trace-id name kind) SampleDrop)
+  (sampler-description (self) "AlwaysOffSampler"))
+
+(defstruct RatioSampler (ratio: f64 threshold: i64))
+(impl Sampler RatioSampler
+  (should-sample (self parent trace-id name kind)
+    (if (or (>= (. self ratio) 1.0) (< (bit-and (. trace-id lo) 9223372036854775807) (. self threshold))) SampleRecordAndSample SampleDrop))
+  (sampler-description (self) (str "TraceIdRatioBased{" (. self ratio) "}")))
+
+(defstruct ParentBasedSampler (root: (dyn Sampler :send)))
+(impl Sampler ParentBasedSampler
+  (should-sample (self parent trace-id name kind)
+    (match parent
+      ((some p) (if (span-context-valid? p)
+                    (if (sampled-flag? p) SampleRecordAndSample SampleDrop)
+                    (should-sample (. self root) parent trace-id name kind)))
+      (nil (should-sample (. self root) parent trace-id name kind))))
+  (sampler-description (self) (str "ParentBased{root=" (sampler-description (. self root)) "}")))
+
+(defun always-on () -> (dyn Sampler :send) (dyn Sampler :send (AlwaysOnSampler 0)))
+(defun always-off () -> (dyn Sampler :send) (dyn Sampler :send (AlwaysOffSampler 0)))
+
+;; Samples the fraction `ratio` of traces (1.0 or more: all; 0.0 or less: none). The threshold is ratio * 2^63 as an i64.
+(defun trace-id-ratio (ratio: f64) -> (dyn Sampler :send)
+  (dyn Sampler :send (RatioSampler ratio (cond (>= ratio 1.0) 9223372036854775807 (<= ratio 0.0) 0 :else (long (* ratio 9.223372036854775e18))))))
+
+(defun parent-based (root: (dyn Sampler :send)) -> (dyn Sampler :send) (dyn Sampler :send (ParentBasedSampler root)))

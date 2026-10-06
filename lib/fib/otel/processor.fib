@@ -1,0 +1,97 @@
+;; fib.otel.processor: what happens to a span when it ends (docs/design/observability-and-databases.md 3.4).
+;;
+;;   (simple-processor exporter)                         exports each ended span at once, in the caller (tests, console)
+;;   (batch-processor exporter capacity max-batch interval-ns overflow)   a queue and one worker task (the default for real exporters)
+;;
+;; The batch processor holds at most `capacity` finished spans. The worker exports when `max-batch` are waiting, when `interval-ns` has
+;; passed since the last export and something waits, on `processor-flush` and on `processor-shutdown`; it exports in chunks of at most
+;; `max-batch`. When the queue is full: DropNewest drops the arriving span, DropOldest the oldest, BlockProducer makes the caller wait
+;; (polling every 50 us); drops are counted (`batch-dropped`) and the count belongs in a metric (O2). `processor-flush` returns when every
+;; span ended before it was called has been given to the exporter; `processor-shutdown` flushes, stops and joins the worker and shuts
+;; the exporter down; a span ended after that is dropped and counted. Everything an exporter does runs under `try`: an `Err` or a trap is
+;; counted (`batch-failed`), reported once on standard error, and the batch is lost, never the program or the worker.
+(ns fib.otel.processor (:use fib.core fib.seq fib.coll fib.otel.trace fib.otel.export fib.otel.queue fib.log.async)
+  (:require [fib.os :as os] [fib.ex :as ex]))
+
+(defprotocol SpanProcessor
+  (on-end (self s: SpanData) -> unit)
+  (processor-flush (self) -> (Result unit str))
+  (processor-shutdown (self) -> (Result unit str)))
+
+(defun bump! :private (a: (Atom i64) n: i64) -> unit (do (swap! a (fn (v: i64) (+ v n))) ()))
+
+(defun report-failure :private (what: str failed: (Atom i64) message: str) -> unit
+  (let [n (swap! failed (fn (v: i64) (+ v 1)))]
+    (when (= n 1) (eprintln (str "fib.otel: " what " failed (further failures are counted, not printed): " message)))))
+
+;; One export call, isolated: the answer is Ok or the message of the Err or of the trap.
+(defun safe-export (exporter: (dyn Exporter :send) spans: (Vec SpanData)) -> (Result unit str)
+  (ex/try (export-spans exporter spans) (catch e (Err (ex/ex-message e)))))
+
+;; ---- simple
+
+(defstruct SimpleProcessor (exporter: (dyn Exporter :send) failed: (Atom i64)))
+
+(impl SpanProcessor SimpleProcessor
+  (on-end (self s)
+    (match (safe-export (. self exporter) [s])
+      ((Ok _) ())
+      ((Err m) (report-failure "a span export" (. self failed) m))))
+  (processor-flush (self) (ex/try (exporter-flush (. self exporter)) (catch e (Err (ex/ex-message e)))))
+  (processor-shutdown (self) (ex/try (exporter-shutdown (. self exporter)) (catch e (Err (ex/ex-message e))))))
+
+(defun simple-processor (exporter: (dyn Exporter :send)) -> SimpleProcessor (SimpleProcessor exporter (atom 0)))
+(defun simple-failed (p: SimpleProcessor) -> i64 @(. p failed))
+
+;; ---- batch
+
+(defstruct BatchProcessor (queue: (BQueue SpanData) capacity: i64 accepted: (Atom i64) exported: (Atom i64) dropped: (Atom i64)
+                           failed: (Atom i64) wanted: (Atom bool) closed: (Atom bool) worker: (Task unit)
+                           exporter: (dyn Exporter :send) overflow: Overflow))
+
+(defun export-chunks :private (exporter: (dyn Exporter :send) failed: (Atom i64) exported: (Atom i64) batch: (Vec SpanData) max: i64) -> unit
+  (loop [i 0]
+    (when (< i (count batch))
+      (let [chunk (vec (take max (drop i batch)))]
+        (do (match (safe-export exporter chunk) ((Ok _) ()) ((Err m) (report-failure "a span batch export" failed m)))
+            (bump! exported (count chunk))
+            (recur (+ i max)))))))
+
+(defun worker-loop :private (q: (BQueue SpanData) exported: (Atom i64) failed: (Atom i64) wanted: (Atom bool) closed: (Atom bool)
+                             exporter: (dyn Exporter :send) max: i64 interval-ns: i64) -> unit
+  (loop [last (os/clock-now)]
+    (let [n (queue-len q) now (os/clock-now)
+          due (or (>= n max) @wanted @closed (and (> n 0) (>= (- now last) interval-ns)))]
+      (cond (and due (> n 0)) (do (export-chunks exporter failed exported (queue-take-all q) max) (recur (os/clock-now)))
+            (and @closed (= n 0)) ()
+            :else (do (reset! wanted false) (os/sleep-ns 50000) (recur last))))))
+
+(defun batch-processor (exporter: (dyn Exporter :send) capacity: i64 max-batch: i64 interval-ns: i64 overflow: Overflow) -> BatchProcessor
+  (let [q (queue-new capacity) exported (atom 0) failed (atom 0) wanted (atom false) closed (atom false) m (max 1 max-batch)
+        w (spawn (fn () (worker-loop q exported failed wanted closed exporter m interval-ns)))]
+    (BatchProcessor q (max 1 capacity) (atom 0) exported (atom 0) failed wanted closed w exporter overflow)))
+
+(defun batch-dropped (p: BatchProcessor) -> i64 @(. p dropped))
+(defun batch-failed (p: BatchProcessor) -> i64 @(. p failed))
+(defun batch-exported (p: BatchProcessor) -> i64 @(. p exported))
+(defun batch-queued (p: BatchProcessor) -> i64 (queue-len (. p queue)))
+
+;; Queues the span, or applies the policy: 0 queued, 1 dropped, 2 full (the caller waits).
+(defun enqueue-span :private (p: BatchProcessor s: SpanData) -> unit
+  (if @(. p closed)
+      (bump! (. p dropped) 1)
+      (match (queue-offer (. p queue) s (. p overflow))
+        ((Queued) (bump! (. p accepted) 1))
+        ((QueueDropped) (do (bump! (. p dropped) 1) (when (= (. p overflow) DropOldest) ())))
+        ((QueueFull) (do (os/sleep-ns 50000) (enqueue-span p s))))))
+
+(defun wait-exported :private (p: BatchProcessor) -> unit
+  (loop [] (when (< @(. p exported) @(. p accepted)) (do (reset! (. p wanted) true) (os/sleep-ns 50000) (recur)))))
+
+(impl SpanProcessor BatchProcessor
+  (on-end (self s) (enqueue-span self s))
+  (processor-flush (self) (do (wait-exported self) (ex/try (exporter-flush (. self exporter)) (catch e (Err (ex/ex-message e))))))
+  (processor-shutdown (self)
+    (if (compare-and-set! (. self closed) false true)
+        (do (join (. self worker)) (ex/try (exporter-shutdown (. self exporter)) (catch e (Err (ex/ex-message e)))))
+        (Ok ()))))

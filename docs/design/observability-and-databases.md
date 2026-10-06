@@ -140,6 +140,52 @@ wall clock read, the context concatenation, a heap `Datum` per field and the dyn
   `fib.chan` when P-chan lands, an atom-guarded ring until then; policy drop-newest with a dropped counter, never block the caller;
   `flush!` and `shutdown!` drain it), `FanoutSink` (several sinks, each with its own level), and an OTel bridge (2.8).
 
+### 2.6.1 L2 as built (2026-10-06)
+
+`Sink` gained `sink-flush` and `sink-close`; `LogSystem` gained `flush-system`, `close-system` and `with-log-system` (closes on any exit).
+Files: `lib/fib/log/file.fib`, `async.fib`, `route.fib`, `config.fib`; spec `specs/log-sinks-spec.fib` (30 scenarios, the Appender contract
+against the file sink, the async sink over a file and a fanout); planted faults `scripts/mutant-obs.sh all '^(file-|async-|fanout-|filter-|env-)'`
+(14 modes, each killed); measurements `scripts/bench/obs-log.fib`.
+
+- **File sink** (`file-sink path max-bytes keep json?`): appends under a spin lock (a scalar atom; the section is a few system calls), rotates
+  before a line that would pass `max-bytes` (`path.(K-1)` over `path.K` ... `path` over `path.1`, each `rename(2)`; a file never holds a partial line;
+  a line longer than the limit goes whole into a file of its own). A write or rotation failure is an `Err` (counted and reported once by the
+  logger); a trap inside the section is caught (`try`) and the lock released, so the caller never traps (`/dev/full` is the test).
+- **Async sink** (`async-sink inner capacity overflow`): a chain of nodes in an atom under a spin lock (an enqueue is one node; the first version
+  held a persistent vector in the atom and cost 2 us per enqueue at 4,000 queued, because every enqueue retained every record of a path) and one
+  worker task. Policies `DropNewest`, `DropOldest` (O(capacity) per drop), `BlockProducer`; drops are counted. `sink-flush` waits for
+  `written == accepted`; `sink-close` drains, joins the worker and closes the inner sink; a write after that is an `Err`. The inner sink runs under
+  `try`: an `Err` or a trap is counted (`async-failed`), reported once, and the worker goes on (spec: a sink that traps).
+- **Fanout, level filter**: `fanout` writes to every sink and isolates each with `try` (the first failure is the answer, the others still got the
+  record); `level-filter` gives a sink its own level.
+- **Configuration**: `FIB_LOG=info,my.mod=debug` (a bare level is the root, `k=level` a rule; FIB_LOG_LEVEL(S) still work), `FIB_LOG_FORMAT`,
+  `FIB_LOG_FILE`, `FIB_LOG_FILE_MAX`, `FIB_LOG_FILE_KEEP`, `FIB_LOG_ASYNC`, `FIB_LOG_QUEUE`, `FIB_LOG_OVERFLOW`; the data form is
+  `(system-from-map {"level" "info" "file" ".." "async" "true" ..})` with an `Err` that names the bad key.
+- **The runtime waits for tasks.** A program whose `main` returns while an async sink's worker is running does not exit (measured: a batch
+  processor left running, `timeout 30` killed it). There is no finalizer, so `with-log-system` (and `with-provider`, `with-periodic-reader`)
+  close on every exit; an async sink must be closed.
+
+Measured (`scripts/bench/obs-log.fib`, 300,000 calls x 3 rounds, `info` with two fields, this shared machine, `ns/op`):
+
+| Sink | ns/op |
+|---|---|
+| level off (loop alone) | 0 (hoisted) |
+| no-op sink | 121 to 130 (design 2.5: 82 to 107; this loop has two fields, and the program now catches, see below) |
+| file sink, JSON lines, one `write(2)` each | 1,558 to 1,578 |
+| async over the file, queue 1M, `BlockProducer` | 484 to 820 (the queue grows to the length of the run: the worker, at ~1.5 us per line, is slower than the producer) |
+| async over the file, queue 4096, `DropNewest` | 251 to 276 (87 % of 900,000 records dropped, the rest written; `written + dropped == 900000` is checked) |
+| async over the no-op sink, queue 8192, `BlockProducer` | 1,746 to 1,779 |
+
+The last row is worse than the synchronous file sink, and `strace -c` says why: 18,630 `futex` calls for 60,000 records. A record is allocated by the
+producer and freed by the worker, and glibc's arena lock is contended by the two threads (`MALLOC_ARENA_MAX=2` helps by a quarter, a larger
+`tcache_count` does not). So the async sink buys isolation from a slow or blocking disk (the caller's cost no longer depends on the write) and
+not a lower cost per call; where the file is the bottleneck, `DropNewest` bounds the caller's cost at ~255 ns. A cross-thread free is the
+runtime's, not the sink's; a per-thread allocator or a record pool is the lever, not measured here.
+
+A program that contains `try` (every user of the file sink, the async sink, a fanout or fib.otel) is compiled with the catching convention
+(docs/design/exceptions.md 9: -5 to +14 % on the happy path, measured there), which is part of the no-op sink's 121 to 130 ns; a program that
+only uses the console sinks of L1 is unchanged.
+
 ### 2.7 Configuration
 
 Environment: `FIB_LOG_LEVEL` (root), `FIB_LOG_LEVELS` (`app.db=debug,app.http=warn`; an unreadable entry is skipped, a log
@@ -207,9 +253,121 @@ its `DataSource` value; no tracer, no cost.
 
 ### 3.6 Cost
 
-Not prototyped, so not measured. Expected from the measured parts: a sampled span start and end is an id generation (~10 ns), a record
-(~80 ns, the order of an enabled log record, 2.5) and an enqueue on the batch queue (~20 ns uncontended): ~100 to 150 ns, against OTel
-Java's ~300 ns to 1 us. O1 measures it before anything is built on it.
+Measured in O1, see 3.7: a sampled span start and end is 290 to 420 ns with an exporter that only counts and 560 ns to the in-memory exporter,
+against the estimate of 100 to 150 ns; a sampled-out span is 72 ns and a no-op tracer 54 ns.
+
+### 3.7 O1 and O2 as built (2026-10-06)
+
+Files `lib/fib/otel.fib` (the facade and the `in-span` macro) and `lib/fib/otel/*.fib`:
+
+| Module | What |
+|---|---|
+| `ids` | `TraceId` (two i64), span ids (i64), `IdGen`: one atom with a SplitMix64 state seeded from `getentropy` when the generator is made; an id is the mixed output of an atomic add, so tasks never draw one state twice and a draw is ~10 ns. Not secret (invertible from one output). A draw of 0 is skipped (a test seeds the state that mixes to 0) |
+| `propagation` | `SpanContext`; `parse-traceparent` and `parse-tracestate` (W3C rules: lower-case hex only, version `ff` invalid, `00` exactly 55 characters, a future version read from the front, 32 members, key and value grammar, no duplicates) and `format-*`; a malformed header is `nil`, a malformed tracestate drops only itself |
+| `trace` | `SpanKind` (`KindServer` ..: variant names are global, so prefixed), `SpanStatus`, `SpanData`, `Resource`, `Context`; the O3 hooks `inject-headers` and `extract-context` |
+| `sampler` | `Sampler` protocol; `always-on`, `always-off`, `trace-id-ratio` (low 63 bits of the id's low half against ratio x 2^63), `parent-based` |
+| `export` | `Exporter` protocol, console text and JSON, in-memory; `span-json` |
+| `queue`, `processor` | the generic bounded queue (L2's design); `simple-processor`; `batch-processor exporter capacity max-batch interval-ns overflow` |
+| `tracer` | `TracerProvider` (resource, sampler, processors, ids, a wall and monotonic clock pair), `Tracer`, `Span`, `with-span` / `in-span` / `with-span-kind` / `with-span-result`, `start-span-full`, `end-span!` (exactly once, a compare-and-set), `record-exception!`, `with-provider` |
+| `semconv`, `log` | attribute-name constants and helpers (`http-status`, `db-attributes`: the query text, never the values); `logger-with-trace` |
+| `metrics`, `reader` | O2: `MeterProvider`, `Meter`, `Counter`, `UpDownCounter`, `Histogram`, `observable-gauge`, `collect-metrics`, `periodic-reader`, the metric exporters |
+
+**The idiom for tasks.** The Context is a value; a task gets it by capture, exactly as a logger does:
+
+```clojure
+(otel/in-span sp ctx tracer (otel/empty-context) "request" []
+  (with-tasks [s]
+    (do (dotimes (t 8) (fork s (fn () (otel/in-span sp2 ctx2 tracer ctx (str "task-" t) [] (work ctx2)))))
+        ())))
+```
+
+`specs/otel-trace-spec.fib` checks it for `with-tasks` (8 children and their children: the right parents, one trace, 17 distinct span ids), for
+`pmap`, and that a task that does not capture the context starts a new trace.
+
+**Spans that fail.** `with-span` runs the body under `try`: a trap or a throw is recorded (status error, an `exception` event with
+`exception.type` from `ex-kind` and `exception.message`), the span is ended, and the failure goes on (spec: the caller's `catch` receives it; a
+nested span marks every span it passes through). Processor and exporter calls are isolated the same way; an exporter's `Err` or trap costs the
+batch.
+
+**Facts that surprised.** `subs` counts characters while `str-find`, `str-len` and `str-slice` count bytes: three places mixed them and
+trapped on a non-ASCII input (found by the tracestate and the log-rules specs; fixed with `str-slice`). `filter` returns a lazy sequence, not a
+`Vec`. A variant name used in a `match` through an alias needs the alias (`otel/SampleDrop`). A spec scenario that leaves a worker task running
+hangs the runner, for the reason in 2.6.1.
+
+**Cost.** `scripts/bench/obs-trace.fib`, 300,000 spans x 3 rounds, `ns/op` for start plus end:
+
+| Case | ns/op | Notes |
+|---|---|---|
+| no-op tracer | 53 to 59 | no id, no clock |
+| sampled out (`always-off`) | 71 to 77 | ids drawn, no state |
+| sampled in, simple processor, counting exporter | 287 to 423 | the cost of the span itself |
+| sampled in, in-memory exporter | 562 to 563 | the exporter conj's onto a vector held by an atom |
+| sampled in, batch processor (queue 4096, drop-newest) | 336 to 353 | 226,022 exported, 673,978 dropped: the worker is slower than the producer |
+| root and child per iteration | 420 to 567 | per span about half |
+| 2 attributes at start, one `set-attribute!`, one event | 575 to 584 | |
+
+Allocations per sampled span with the counting exporter: **18** (`F run --trace`: 54,666 allocations for 3 x 1,000 spans and 109,180 for
+3 x 2,000, so 18.17 per span). The span costs 2 to 3 times the estimate of 3.6. Where it goes, from the allocation list: the two contexts, the
+17-field `SpanData` and its copy at `end-span!` (the data lives in an atom), two atoms, the span state, the `Span`, the closure of `try` per
+processor call and the one-span vector the simple processor exports. The levers, none pulled: the end time in a scalar atom and one `SpanData`
+built at the end, an `on-end` that borrows the span, and no per-call `try` closure on the simple processor. The budget of 150 ns (6.2) is
+therefore **not met** for a sampled span; it is met for a no-op (54 ns) and a sampled-out (72 ns) span.
+
+O2 (`scripts/bench/obs-metrics.fib`; `ns/op` is wall time / (tasks x records), 3 rounds, 300,000 records per task):
+
+| Case | 1 task | 8 tasks |
+|---|---|---|
+| `fib.adder` `inc!` alone | 7 to 8 | 2 |
+| plain shared atom, `swap!` | 7 | 27 to 32 |
+| Counter add, no attributes | 12 to 17 | 11 |
+| Counter add, bound series (`bind-counter`) | 10 | not run |
+| Counter add, two attributes (canonicalise, key, look up) | 971 to 1,079 | 760 to 1,013 |
+| Histogram record, no attributes (15 bounds) | 37 to 54 | 56 to 64 |
+| Histogram record, one attribute | 306 to 314 | not run |
+
+A counter without attributes is within 5 ns of the adder alone and 2.8 times faster than a shared atom at 8 tasks. An attribute set costs
+about 1 us (the canonical sort, the key string, the map lookup): a hot path binds the series once. Found while measuring: the first version
+returned the series from a helper, which retains a shared object with an atomic increment per add, and 8 tasks cost 81 ns each; reading the
+fields by borrow all the way gave 11 ns. The same trap awaits any hot path that returns a shared struct.
+
+### 3.8 O3 (not built): where the exporter plugs in, and the OTLP JSON mapping
+
+**Hooks that exist.**
+
+| For O3 | Hook |
+|---|---|
+| a span exporter | implement `Exporter` (`export-spans`, `exporter-flush`, `exporter-shutdown`); the batch processor calls it from its worker task, so it may block on the network, and an `Err` or trap is counted and never reaches the program. It holds a `fib.http.client` value, an endpoint and headers (`OTEL_EXPORTER_OTLP_ENDPOINT`, `_HEADERS`) |
+| a metric exporter | implement `MetricExporter`; `periodic-reader` calls it from its task |
+| a log exporter | a `Sink` (fib.log) that maps `LogRecord` to a log record below and hands batches to an async sink; `logger-with-trace` already puts `trace_id` and `span_id` into the fields, and the sink moves them into the record's own fields |
+| propagation, client | `(inject-headers ctx)` gives the `traceparent` and `tracestate` header pairs; the middleware starts a `KindClient` span with `start-span-full` (attributes from `http-client-attributes`), injects the headers of `span-in-context`, sets `http-status` from the response, ends the span |
+| propagation, server | `(extract-context header-lookup)` takes a function `str -> (Option str)`, so any request type works; the middleware starts a `KindServer` span as its child (`parent-remote` is true) and puts the Context where the handler can read it (a field of the request or a pair, to be settled with the http owner) |
+| the Exporter contract | `specs/otel-exporter-contract.fib`: an `ExporterProbe` (the exporter and a function returning the spans it produced, one JSON text each); O3 adds a probe over the fake receiver |
+
+**OTLP/HTTP JSON** (`POST {endpoint}/v1/traces|metrics|logs`, `Content-Type: application/json`; the proto3 JSON mapping with OTLP's two
+exceptions: ids are lower-case hex strings, not base64, and enums are integers). 64-bit integers are strings in JSON.
+
+| fibber | OTLP JSON |
+|---|---|
+| `Datum` `DStr s` / `DBool b` / `DInt i` / `DFloat f` / `DBytes b` / `DNil` | AnyValue `{"stringValue":s}` / `{"boolValue":b}` / `{"intValue":"i"}` / `{"doubleValue":f}` (NaN and infinities as the strings `"NaN"`, `"Infinity"`) / `{"bytesValue":base64(b)}` / the attribute is omitted |
+| attribute `(Pair k d)` | `{"key":k,"value":AnyValue}` in an `attributes` array |
+| `Resource` | `"resource":{"attributes":[..]}` |
+| `SpanData` batch | `{"resourceSpans":[{"resource":R,"scopeSpans":[{"scope":{"name":scope},"spans":[S..]}]}]}`, spans grouped by resource and scope |
+| `SpanData` | `{"traceId":hex32,"spanId":hex16,"parentSpanId":hex16 (omitted for a root),"traceState":tracestate,"name":..,"kind":N,"startTimeUnixNano":"ns","endTimeUnixNano":"ns","attributes":[..],"events":[..],"links":[..],"status":{"code":N,"message":..},"flags":N}` |
+| `SpanKind` | KindInternal 1, KindServer 2, KindClient 3, KindProducer 4, KindConsumer 5 (0 is unspecified) |
+| `SpanStatus` | StatusUnset 0, StatusOk 1, StatusError 2 with `message` (the message only for error) |
+| `SpanEvent` | `{"timeUnixNano":"ns","name":..,"attributes":[..]}` |
+| `SpanLink` | `{"traceId":..,"spanId":..,"traceState":..,"attributes":[..]}` |
+| `parent-remote` | `flags` bit 8 (has-is-remote, 0x100) and bit 9 (is-remote, 0x200) on spans and links |
+| `Metric` | `{"name":..,"description":..,"unit":..}` plus one of `sum`, `histogram`, `gauge`; grouped `{"resourceMetrics":[{"resource":R,"scopeMetrics":[{"scope":{"name":..},"metrics":[..]}]}]}` |
+| `SumData` | `"sum":{"dataPoints":[{"attributes":[..],"startTimeUnixNano":"ns","timeUnixNano":"ns","asInt":"v"}],"aggregationTemporality":2,"isMonotonic":b}` (2 = cumulative, what the readers produce) |
+| `HistogramData` | `"histogram":{"dataPoints":[{"attributes":[..],"startTimeUnixNano":..,"timeUnixNano":..,"count":"n","sum":f,"bucketCounts":["c0",..],"explicitBounds":[b0,..],"min":f,"max":f}],"aggregationTemporality":2}` (`bucketCounts` has one more entry than `explicitBounds`, as `counts` and `bounds` do) |
+| `GaugeData` | `"gauge":{"dataPoints":[{"attributes":[..],"timeUnixNano":..,"asDouble":f}]}` |
+| `LogRecord` | `{"resourceLogs":[{"resource":R,"scopeLogs":[{"scope":{"name":logger},"logRecords":[{"timeUnixNano":"ns","observedTimeUnixNano":"ns","severityNumber":N,"severityText":"INFO","body":{"stringValue":msg},"attributes":[..],"traceId":hex32,"spanId":hex16}]}]}]}`; severity TRACE 1, DEBUG 5, INFO 9, WARN 13, ERROR 17, FATAL 21 |
+
+**Behaviour to implement**: a 200 with `partialSuccess` is logged and counted, not retried; 429, 502, 503 and 504 are retried with exponential
+backoff and `Retry-After`; other 4xx drop the batch; a timeout is 10 s; the worker task is the only caller, so nothing blocks the application. The
+collector integration test starts the collector with a file exporter (6.3) and compares ids, parents, attributes, status and metric totals with the
+in-process spans.
 
 ## 4. `fib.db`
 
@@ -432,10 +590,10 @@ tracer in their own configuration value (`fib.db` DataSource, `fib.http` server 
 | Operation | Budget | Measured (section) |
 |---|---|---|
 | log call, level off | ~1 ns | 0.33 ns/iter vs 0.27 to 0.31 loop alone (2.5) |
-| log call, level on, null sink | 100 ns | 83 to 107 ns (2.5) |
+| log call, level on, null sink | 100 ns | 83 to 107 ns (2.5); 121 to 130 ns in a catching program; file sink 1.6 us; async 250 ns (drop) to 1.8 us (2.6.1) |
 | task-local context read (option B) | n/a | 1.1 to 1.2 ns (2.4) |
-| span start and end, sampled | 150 ns | not measured (O1) |
-| counter add (adder) | 5 ns uncontended | `fib.adder`, docs/shootout/atoms.md |
+| span start and end, sampled | 150 ns | **290 to 420 ns** with a counting exporter, 560 ns in memory (3.7): not met; no-op 54 ns, sampled out 72 ns |
+| counter add (adder) | 5 ns uncontended | 12 to 17 ns one task, 11 ns at 8 tasks (a shared atom: 27 to 32 ns); with attributes ~1 us, bound 10 ns (3.7) |
 | SQLite insert, in memory | within 20% of C (D1) | 1.35 to 1.98 us vs 0.94 to 1.59 us in C (4.9) |
 | SQLite select by key | within 20% of C (D1) | 2.64 to 3.23 us vs 1.55 to 1.66 us in C (4.9) |
 | PostgreSQL round trip | server-bound | D2 |
@@ -477,7 +635,7 @@ tracer in their own configuration value (`fib.db` DataSource, `fib.http` server 
 | **D3** pool + transactions | Pool, validation, timeouts, `try-transact` (task isolation), savepoints, `db.*` spans | 500 | D1, (O1 for spans) | O3 |
 | **S2** fib.sql extension and properties | register clause/op on a Formatter, a random query generator differentially tested against HoneySQL | 400 | S1 | - |
 
-Order: L1 and D1 first (users can log and use SQLite: this prototype is most of both), S1 next (small, independent, oracle ready),
+**Status (2026-10-06):** L1, L2, O1 and O2 are built (2.6.1, 3.7); O3's hooks are listed in 3.8. Order: L1 and D1 first (users can log and use SQLite: this prototype is most of both), S1 next (small, independent, oracle ready),
 then O1 and C1 in parallel, then D2, O2, L2, O3, D3. Four agents can run L2, O1, C1 and S1 at once. MySQL, protobuf OTLP, TLS
 (`fib.tls`) and `fib.time` are later packages of their own.
 
@@ -553,9 +711,12 @@ Planted faults (each applied alone with `sed`, run, restored; scripts in `~/.cac
 
 ## 10. Not done
 
-- No `fib.otel` code: sections 3 and 6.2's span cost are design and estimate only.
-- No PostgreSQL driver, no `fib.crypto`, no pool, no `try-transact` (not needed since catch exists); `plan`, the statement cache and `with-connection` are done (4.10); no containers were started
+- `fib.otel` O3 is not built: no OTLP exporter, no `traceparent` middleware in `fib.http` (3.8 lists the hooks and the JSON mapping). No
+  baggage in the Context, no delta temporality, no views, no exemplars, no synchronous gauge, no instrument registry by name (a name
+  registered twice is two instruments).
+- A sampled span costs 2 to 3 times its 150 ns budget, and an async sink does not lower the caller's cost per call (3.7, 2.6.1).
+- No PostgreSQL driver, no `fib.crypto` in this library (the protocol is in `fib.crypto`, drivers in their own repos), no pool, no `try-transact` (not needed since catch exists); `plan`, the statement cache and `with-connection` are done (4.10); no containers were started
   by this work (docker works; the host runs other, unrelated containers, which were not touched).
-- No file or async sink, no OTel log bridge.
+- No OTLP log exporter; log-to-trace correlation is `logger-with-trace` only. No daily rotation (size only), no compression of archives.
 - fib.sql: only the clauses in the corpus; no `:inline`, `:cast`, `:case`, upsert, `Formatter` registry, or format timing.
 - No stdlib rows in `spec/stdlib.md` for the new modules (the libraries are explicit, not implicit; the rows come with L1/D1 proper).

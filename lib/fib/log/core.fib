@@ -37,7 +37,11 @@
 ;; Where records go. A sink must be safe to call from many tasks at once (each record is written whole or not at all) and must not trap:
 ;; a failure is an `Err` that the logger counts and reports once (log4j's StatusLogger), never the program's end.
 (defprotocol Sink
-  (sink-write (self rec: LogRecord) -> (Result unit str)))
+  (sink-write (self rec: LogRecord) -> (Result unit str))
+  ;; Waits until every record written so far has reached the place the sink writes to (an unbuffered sink: nothing to do).
+  (sink-flush (self) -> (Result unit str))
+  ;; Flushes, then releases what the sink holds (a descriptor, a worker task). A closed sink refuses further records with an `Err`.
+  (sink-close (self) -> (Result unit str)))
 
 ;; The levels: `root` for every logger no rule names, and rules by name prefix ("app.db" covers "app.db" and "app.db.pool"); the longest
 ;; matching prefix wins, as log4j's logger hierarchy does.
@@ -75,7 +79,17 @@
 
 (defun failures (sys: LogSystem) -> i64 @(. sys failures))
 
-(defun count-failure :private (sys: LogSystem message: str) -> unit
+;; Flushes the system's sink (the async sink waits for its queue; the others have nothing buffered). A failure is counted and returned.
+(defun flush-system (sys: LogSystem) -> (Result unit str)
+  (let [r (sink-flush (. sys sink))]
+    (match r ((Err m) (do (count-failure sys m) r)) ((Ok _) r))))
+
+;; Flushes, then closes the sink: a program calls this at the end of `main` (there is no finalizer to do it).
+(defun close-system (sys: LogSystem) -> (Result unit str)
+  (let [r (sink-close (. sys sink))]
+    (match r ((Err m) (do (count-failure sys m) r)) ((Ok _) r))))
+
+(defun count-failure (sys: LogSystem message: str) -> unit
   (let [n (swap! (. sys failures) (fn (v: i64) (+ v 1)))]
     (when (= n 1) (eprintln (str "fib.log: a sink failed (further failures are counted, not printed): " message)))))
 
@@ -94,15 +108,25 @@
   (reduce (fn (out: (Vec (Pair str i64)) entry: str)
             (match (str-find entry "=" 0)
               (nil out)
-              ((some i) (match (parse-level (subs entry (+ i 1) (str-len entry)))
+              ((some i) (match (parse-level (str-slice entry (+ i 1) (str-len entry)))
                           (nil out)
-                          ((some l) (conj out (Pair (string/trim (subs entry 0 i)) l)))))))
+                          ((some l) (conj out (Pair (string/trim (str-slice entry 0 i)) l)))))))
           [] (string/split text ",")))
 
-;; FIB_LOG_LEVEL (the root, default info) and FIB_LOG_LEVELS (rules as above).
+;; "info,my.mod=debug": the one-variable form (Rust's RUST_LOG): an entry with no `=` is the root level (the last such wins), an entry
+;; with `=` a rule. Unreadable entries are skipped. The root is `default` when no entry names one.
+(defun parse-spec (text: str default: i64) -> LevelTable
+  (LevelTable (reduce (fn (root: i64 entry: str)
+                        (if (some? (str-find entry "=" 0)) root (unwrap-or (parse-level entry) root)))
+                      default (string/split text ","))
+              (parse-rules text)))
+
+;; FIB_LOG ("info,my.mod=debug") when set; otherwise FIB_LOG_LEVEL (the root, default info) and FIB_LOG_LEVELS (rules as above).
 (defun levels-from-env () -> LevelTable
-  (LevelTable (unwrap-or (and-then parse-level (os/getenv "FIB_LOG_LEVEL")) 2)
-              (match (os/getenv "FIB_LOG_LEVELS") (nil []) ((some t) (parse-rules t)))))
+  (match (os/getenv "FIB_LOG")
+    ((some t) (parse-spec t 2))
+    (nil (LevelTable (unwrap-or (and-then parse-level (os/getenv "FIB_LOG_LEVEL")) 2)
+                     (match (os/getenv "FIB_LOG_LEVELS") (nil []) ((some t) (parse-rules t)))))))
 
 ;; The data form of a configuration: a root level name and a map of prefix to level name; Err names the first bad level.
 (defun levels-from-map (root: str rules: (Map str str)) -> (Result LevelTable str)

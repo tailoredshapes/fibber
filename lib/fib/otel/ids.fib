@@ -1,0 +1,78 @@
+;; fib.otel.ids: trace ids (16 bytes), span ids (8 bytes) and the generator that makes them (docs/design/observability-and-databases.md 3.1, 3.3).
+;;
+;; A trace id is two i64 halves (`TraceId hi lo`), a span id one i64; zero is the invalid id (W3C Trace Context). Ids come from an `IdGen`, a
+;; value built in main like the rest: ONE atom holding a SplitMix64 state that is seeded from the operating system's entropy (`getentropy`,
+;; fib.os `random-bytes`) when the generator is made. An id is the SplitMix64 output of the next state (the state steps by an atomic add, so
+;; tasks never draw the same state, and the output function is a bijection, so two draws of one generator never collide); this costs one
+;; atomic add and a few multiplications instead of a system call per span (design 3.3). The ids are unique and unpredictable enough for
+;; telemetry; they are NOT secret (SplitMix64 is invertible from one output): never use them for authentication, `fib.os/random-bytes`
+;; or `fib.crypto` are for that.
+(ns fib.otel.ids (:use fib.core fib.seq fib.coll) (:require [fib.os :as os]))
+
+(defstruct TraceId (hi: i64 lo: i64))
+(derive Eq TraceId) (derive Debug TraceId)
+
+(def INVALID-SPAN-ID: i64 0)
+
+(defun invalid-trace-id () -> TraceId (TraceId 0 0))
+(defun trace-id-valid? (t: TraceId) -> bool (or (!= (. t hi) 0) (!= (. t lo) 0)))
+(defun span-id-valid? (s: i64) -> bool (!= s 0))
+
+(defstruct IdGen (state: (Atom i64)))
+
+(defun bytes-to-i64 :private (b: (Array i8)) -> i64
+  (loop [i 0 acc 0]
+    (if (or (>= i 8) (>= i (array-len b))) acc (recur (+ i 1) (bit-or (shl acc 8) (bit-and (sext i64 (array-get b i)) 255))))))
+
+;; A generator seeded from the OS entropy (a failure to read it falls back to the monotonic clock: ids stay unique, only less
+;; unpredictable).
+(defun id-gen () -> IdGen
+  (IdGen (atom (match (os/random-bytes 8) ((Ok b) (bytes-to-i64 b)) ((Err _) (os/clock-now))))))
+
+;; A generator with a fixed seed: the ids of a test are reproducible.
+(defun id-gen-seeded (seed: i64) -> IdGen (IdGen (atom seed)))
+
+(defun next-u64 :private (g: IdGen) -> i64
+  (let [s (swap! (. g state) (fn (v: i64) (unchecked-add v -7046029254386353131)))
+        z1 (unchecked-multiply (bit-xor s (shr s 30)) -4658895280553007687)
+        z2 (unchecked-multiply (bit-xor z1 (shr z1 27)) -7723592293110705685)]
+    (bit-xor z2 (shr z2 31))))
+
+(defun new-span-id (g: IdGen) -> i64
+  (let [v (next-u64 g)] (if (= v 0) (next-u64 g) v)))
+
+(defun new-trace-id (g: IdGen) -> TraceId
+  (let [hi (next-u64 g) lo (next-u64 g)] (if (and (= hi 0) (= lo 0)) (TraceId hi (next-u64 g)) (TraceId hi lo))))
+
+(defun hex-digit :private (n: i64) -> str (subs "0123456789abcdef" n (+ n 1)))
+
+;; 16 lower-case hex digits of the 64 bits of x.
+(defun hex64 (x: i64) -> str
+  (loop [i 15 out ""]
+    (if (< i 0) out (recur (- i 1) (str out (hex-digit (bit-and (shr x (* 4 i)) 15)))))))
+
+(defun hex-byte (x: i64) -> str (str (hex-digit (bit-and (shr x 4) 15)) (hex-digit (bit-and x 15))))
+
+(defun trace-id-hex (t: TraceId) -> str (str (hex64 (. t hi)) (hex64 (. t lo))))
+(defun span-id-hex (s: i64) -> str (hex64 s))
+
+;; The value of a lower-case hex digit byte, -1 for anything else (W3C: upper case is not valid).
+(defun hex-value (b: i64) -> i64
+  (cond (and (>= b 48) (<= b 57)) (- b 48) (and (>= b 97) (<= b 102)) (- b 87) :else -1))
+
+;; The 64 bits of the 16 hex digits of s from `start`; nil when s is too short or a digit is not hex.
+(defun parse-hex64 (s: str start: i64) -> (Option i64)
+  (if (> (+ start 16) (str-len s))
+      nil
+      (loop [i 0 acc 0]
+        (if (= i 16)
+            (some acc)
+            (let [d (hex-value (bit-and (sext i64 (str-byte-at s (+ start i))) 255))]
+              (if (< d 0) nil (recur (+ i 1) (bit-or (shl acc 4) d))))))))
+
+(defun parse-trace-id (s: str) -> (Option TraceId)
+  (if (!= (str-len s) 32)
+      nil
+      (match (parse-hex64 s 0)
+        (nil nil)
+        ((some hi) (match (parse-hex64 s 16) (nil nil) ((some lo) (some (TraceId hi lo))))))))

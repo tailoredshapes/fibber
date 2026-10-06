@@ -1,0 +1,120 @@
+;; fib.otel.propagation: the W3C Trace Context headers `traceparent` and `tracestate`, as pure functions (docs/design/observability-and-
+;; databases.md 3.2; https://www.w3.org/TR/trace-context/). Parsing never traps: a malformed header is `nil`, and a request with no valid
+;; `traceparent` has no remote parent (a new trace starts). A malformed `tracestate` is dropped alone (the spec: the traceparent stays valid).
+;;
+;;   00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+;;   version - trace id (32 hex, not all zero) - parent span id (16 hex, not all zero) - flags (2 hex; bit 0 = sampled)
+;;
+;; Rules implemented: lower-case hex only; version `ff` is invalid; version `00` is exactly 55 characters; a higher version may be longer
+;; if the extra data starts with `-` (the known fields are read from the front, as the spec says for forward compatibility); no
+;; whitespace is trimmed (the HTTP layer trims). `tracestate` is up to 32 `key=value` members separated by commas (optional whitespace
+;; around members), keys `[a-z][a-z0-9_\-*/]{0,255}` or `tenant@system`, values 1 to 256 printable ASCII characters other than `,` and
+;; `=`, no duplicate keys.
+(ns fib.otel.propagation (:use fib.core fib.seq fib.coll fib.otel.ids) (:require [fib.string :as string]))
+
+;; The part of a span that crosses a boundary: its ids, the trace flags, the tracestate text, and whether it came from another process.
+(defstruct SpanContext (trace-id: TraceId span-id: i64 flags: i64 tracestate: str remote: bool))
+
+(derive Eq SpanContext) (derive Debug SpanContext)
+
+(defun invalid-span-context () -> SpanContext (SpanContext (invalid-trace-id) 0 0 "" false))
+(defun span-context-valid? (c: SpanContext) -> bool (and (trace-id-valid? (. c trace-id)) (span-id-valid? (. c span-id))))
+(defun sampled-flag? (c: SpanContext) -> bool (= (bit-and (. c flags) 1) 1))
+
+(defun format-traceparent (c: SpanContext) -> str
+  (str "00-" (trace-id-hex (. c trace-id)) "-" (span-id-hex (. c span-id)) "-" (hex-byte (bit-and (. c flags) 255))))
+
+(defun byte-at :private (s: str i: i64) -> i64 (bit-and (sext i64 (str-byte-at s i)) 255))
+
+(defun hex-byte-at :private (s: str i: i64) -> i64
+  (let [a (hex-value (byte-at s i)) b (hex-value (byte-at s (+ i 1)))] (if (or (< a 0) (< b 0)) -1 (+ (* 16 a) b))))
+
+;; The version byte and the length rule: 00 is exactly 55 characters; a future version is at least 55 and, if longer, continues with `-`.
+(defun length-ok? :private (h: str version: i64) -> bool
+  (let [n (str-len h)]
+    (cond (< n 55) false
+          (= version 0) (= n 55)
+          :else (or (= n 55) (= (byte-at h 55) 45)))))
+
+;; The span context a `traceparent` carries (remote: true), or nil when the header is malformed.
+(defun parse-traceparent (h: str) -> (Option SpanContext)
+  (if (< (str-len h) 55)
+      nil
+      (let [version (hex-byte-at h 0)]
+        (if (or (< version 0) (= version 255) (not (length-ok? h version))
+                (!= (byte-at h 2) 45) (!= (byte-at h 35) 45) (!= (byte-at h 52) 45))
+            nil
+            (match (parse-trace-id (str-slice h 3 35))
+              (nil nil)
+              ((some tid) (match (parse-hex64 h 36)
+                            (nil nil)
+                            ((some sid) (let [flags (hex-byte-at h 53)]
+                                          (if (or (< flags 0) (not (trace-id-valid? tid)) (= sid 0))
+                                              nil
+                                              (some (SpanContext tid sid flags "" true))))))))))))
+
+;; ---- tracestate
+
+(defun key-char? :private (b: i64) -> bool
+  (or (and (>= b 97) (<= b 122)) (and (>= b 48) (<= b 57)) (= b 95) (= b 45) (= b 42) (= b 47)))
+
+(defun all-key-chars? :private (s: str from: i64 to: i64) -> bool
+  (loop [i from] (cond (>= i to) true (not (key-char? (byte-at s i))) false :else (recur (+ i 1)))))
+
+(defun lower? :private (b: i64) -> bool (and (>= b 97) (<= b 122)))
+(defun alnum? :private (b: i64) -> bool (or (lower? b) (and (>= b 48) (<= b 57))))
+
+(defun valid-key? (k: str) -> bool
+  (let [n (str-len k)]
+    (if (= n 0)
+        false
+        (match (str-find k "@" 0)
+          (nil (and (<= n 256) (lower? (byte-at k 0)) (all-key-chars? k 1 n)))
+          ((some at) (and (> at 0) (<= at 241) (< (+ at 1) n) (<= (- n at 1) 14)
+                          (alnum? (byte-at k 0)) (all-key-chars? k 1 at)
+                          (lower? (byte-at k (+ at 1))) (all-key-chars? k (+ at 2) n)))))))
+
+(defun valid-value? (v: str) -> bool
+  (let [n (str-len v)]
+    (and (>= n 1) (<= n 256) (!= (byte-at v (- n 1)) 32)
+         (loop [i 0] (cond (>= i n) true
+                           (let [b (byte-at v i)] (or (< b 32) (> b 126) (= b 44) (= b 61))) false
+                           :else (recur (+ i 1)))))))
+
+(defun member-of :private (text: str) -> (Option (Pair str str))
+  (match (str-find text "=" 0)
+    (nil nil)
+    ((some i) (let [k (str-slice text 0 i) v (str-slice text (+ i 1) (str-len text))]
+                (if (and (valid-key? k) (valid-value? v)) (some (Pair k v)) nil)))))
+
+;; The members of a `tracestate` value, in order; nil when any member is malformed, a key repeats or there are more than 32.
+(defun parse-tracestate (text: str) -> (Option (Vec (Pair str str)))
+  (let [parts (filter (fn (p: str) (> (str-len p) 0)) (map string/trim (string/split text ",")))]
+    (if (> (count parts) 32)
+        nil
+        (let [members (map member-of parts)]
+          (if (some? (some (fn (m: (Option (Pair str str))) (if (some? m) nil (some true))) members))
+              nil
+              (let [pairs (vec (map (fn (m: (Option (Pair str str))) (unwrap-or m (Pair "" ""))) members))
+                    keys (map (fn (p: (Pair str str)) (. p fst)) pairs)]
+                (if (= (count (set keys)) (count pairs)) (some pairs) nil)))))))
+
+(defun format-tracestate (members: (Vec (Pair str str))) -> str
+  (string/join "," (map (fn (p: (Pair str str)) (str (. p fst) "=" (. p snd))) members)))
+
+;; `ts` with key set to value, as the spec says an updated member goes to the front; the oldest member is dropped past 32. An invalid key or
+;; value leaves `ts` as it was.
+(defun tracestate-set (ts: (Vec (Pair str str)) k: str v: str) -> (Vec (Pair str str))
+  (if (and (valid-key? k) (valid-value? v))
+      (vec (take 32 (cons (Pair k v) (filter (fn (p: (Pair str str)) (!= (. p fst) k)) ts))))
+      ts))
+
+;; The context a request carries: the `traceparent` header and the `tracestate` header, each optional (a missing or malformed traceparent
+;; gives nil; a malformed tracestate gives a context with none).
+(defun extract-span-context (traceparent: (Option str) tracestate: (Option str)) -> (Option SpanContext)
+  (match traceparent
+    (nil nil)
+    ((some h) (match (parse-traceparent h)
+                (nil nil)
+                ((some c) (let [ts (match tracestate (nil (some [])) ((some t) (parse-tracestate t)))]
+                            (some (SpanContext (. c trace-id) (. c span-id) (. c flags) (match ts (nil "") ((some m) (format-tracestate m))) true))))))))

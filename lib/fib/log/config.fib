@@ -1,0 +1,64 @@
+;; fib.log.config: building a LogSystem from the environment or from data (docs/design/observability-and-databases.md 2.7, package L2).
+;;
+;; Environment (system-from-env): FIB_LOG ("info,my.mod=debug", else FIB_LOG_LEVEL and FIB_LOG_LEVELS), FIB_LOG_FORMAT (`json` or text),
+;; FIB_LOG_FILE (a path: lines go to the file instead of standard error), FIB_LOG_FILE_MAX (bytes, default 10485760) and FIB_LOG_FILE_KEEP
+;; (archives, default 5), FIB_LOG_ASYNC (`1`/`true`: through an async sink), FIB_LOG_QUEUE (default 8192) and FIB_LOG_OVERFLOW
+;; (`drop-oldest`, `drop-newest` default, `block`). A bad value is skipped and the default used: a log configuration must not stop a program
+;; (an unopenable file falls back to standard error; the reason is printed once).
+;; Data (system-from-map): the same names as keys of a (Map str str): "level" "levels" "format" "file" "max-bytes" "keep" "async"
+;; "queue" "overflow"; an error is an `Err` naming the key.
+(ns fib.log.config (:use fib.core fib.seq fib.coll fib.log.core fib.log.sinks fib.log.file fib.log.async) (:require [fib.os :as os] [fib.ex :as ex]))
+
+(defun int-or :private (text: (Option str) default: i64) -> i64
+  (match text (nil default) ((some t) (match (parse-long t) ((some n) n) (nil default)))))
+
+(defun truthy? :private (text: (Option str)) -> bool
+  (match text (nil false) ((some t) (or (= t "1") (= t "true")))))
+
+;; The sink named by these settings; `Err` for the first unusable one.
+(defun sink-from :private (format: (Option str) file: (Option str) max-bytes: i64 keep: i64 async?: bool queue: i64 overflow: Overflow)
+  -> (Result (dyn Sink :send) str)
+  (let [json (= format (some "json"))
+        base (match file
+               (nil (Ok (if json (json-lines 2) (console-text))))
+               ((some path) (file-sink path max-bytes keep json)))]
+    (match base
+      ((Err e) (Err e))
+      ((Ok k) (Ok (if async? (dyn Sink :send (async-sink k queue overflow)) k))))))
+
+(defun system-from-env () -> LogSystem
+  (let [overflow (unwrap-or (and-then parse-overflow (os/getenv "FIB_LOG_OVERFLOW")) DropNewest)
+        made (sink-from (os/getenv "FIB_LOG_FORMAT") (os/getenv "FIB_LOG_FILE") (int-or (os/getenv "FIB_LOG_FILE_MAX") 10485760)
+                        (int-or (os/getenv "FIB_LOG_FILE_KEEP") 5) (truthy? (os/getenv "FIB_LOG_ASYNC"))
+                        (int-or (os/getenv "FIB_LOG_QUEUE") 8192) overflow)]
+    (log-system (match made
+                  ((Ok k) k)
+                  ((Err e) (do (eprintln (str "fib.log: " e "; logging to standard error")) (console-text))))
+                (levels-from-env))))
+
+(defun opt-int :private (m: (Map str str) key: str default: i64) -> (Result i64 str)
+  (match (get m key)
+    (nil (Ok default))
+    ((some t) (match (parse-long t) ((some n) (Ok n)) (nil (Err (str "bad number for " key ": " t)))))))
+
+;; A system from data: {"level" "info" "levels" "app.db=debug" "format" "json" "file" "/var/log/app.log" "max-bytes" "1000000" "keep" "3"
+;; "async" "true" "queue" "1024" "overflow" "block"}.
+(defun system-from-map (m: (Map str str)) -> (Result LogSystem str)
+  (try-let [max-bytes (opt-int m "max-bytes" 10485760)
+            keep (opt-int m "keep" 5)
+            queue (opt-int m "queue" 8192)
+            overflow (match (get m "overflow")
+                       (nil (Ok DropNewest))
+                       ((some t) (match (parse-overflow t) ((some o) (Ok o)) (nil (Err (str "unknown overflow policy " t))))))
+            root (match (get m "level")
+                   (nil (Ok 2))
+                   ((some t) (match (parse-level t) ((some l) (Ok l)) (nil (Err (str "unknown level " t))))))
+            sink (sink-from (get m "format") (get m "file") max-bytes keep (truthy? (get m "async")) queue overflow)]
+    (Ok (log-system sink (match (get m "levels") (nil (LevelTable root [])) ((some t) (parse-spec t root)))))))
+
+;; Runs `f` with the system and closes it afterwards (flushing an async sink), whatever `f` does: a trap or a throw goes on after the close.
+;; Use it in main: an async sink's worker is a task, and the runtime waits for tasks when main returns, so a system that is never closed
+;; keeps the program from ending.
+(defun with-log-system (sys: LogSystem f: (fn (LogSystem) a)) -> a
+  (ex/try (let [v (f sys)] (do (close-system sys) v))
+          (catch e (do (close-system sys) (ex/throw e)))))

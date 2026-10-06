@@ -1,0 +1,119 @@
+;; fib.log.async: the asynchronous sink (docs/design/observability-and-databases.md 2.6, package L2): a bounded queue and ONE worker task
+;; that writes to an inner sink.
+;;
+;;   (async-sink inner capacity overflow) -> AsyncSink          (use it as (dyn Sink :send a))
+;;
+;; `sink-write` appends the record to the queue and returns; the worker takes everything queued, writes it to the inner sink in order and
+;; goes round again (an empty queue: it sleeps 100 us, there is no condition variable yet). Because one task writes, an inner file or
+;; descriptor sees whole lines in the order the queue holds them, whatever the lengths. Order: records of one producer reach the inner sink
+;; in the order that producer wrote them (the queue is a FIFO taken under one lock); records of different producers are in the order the
+;; lock was won.
+;;
+;; When the queue holds `capacity` records the policy decides: `DropNewest` throws the arriving record away, `DropOldest` throws the
+;; oldest queued one away (an O(capacity) copy: use `DropNewest` or a big queue when drops are expected to be the norm), `BlockProducer` makes the
+;; producer wait (polling every 50 us) until the worker made room. Dropped records are counted (`async-dropped`), never silent.
+;; `sink-flush` waits until everything accepted so far has been written to the inner sink and then flushes it; `sink-close` drains,
+;; stops and joins the worker and closes the inner sink; after that a write is an `Err`. A failure or a trap of the inner sink is caught in
+;; the worker (`try`), counted in `async-failed` and reported once on standard error; the worker goes on.
+(ns fib.log.async (:use fib.core fib.seq fib.coll fib.log.core) (:require [fib.os :as os] [fib.ex :as ex]))
+
+(defenum Overflow (DropOldest) (DropNewest) (BlockProducer))
+
+(defun parse-overflow (text: str) -> (Option Overflow)
+  (cond (= text "drop-oldest") (some DropOldest) (= text "drop-newest") (some DropNewest) (= text "block") (some BlockProducer) :else nil))
+
+;; The queue is a chain, newest first: an enqueue is one node linked to the old head (no copy, no retain of the records already queued; an
+;; atom holding a persistent vector copied a path of nodes and retained every record in it per enqueue, 2 us at 4000 queued, measured).
+;; The worker takes the whole chain and reverses it into a vector, which is where its O(n) belongs.
+(defenum LogChain (QEnd) (QLink rec: LogRecord next: LogChain))
+
+(defstruct AsyncSink (queue: (Atom LogChain) len: (Atom i64) busy: (Atom bool) capacity: i64 overflow: Overflow
+                      accepted: (Atom i64) written: (Atom i64) dropped: (Atom i64) failed: (Atom i64) closed: (Atom bool)
+                      worker: (Task unit) inner: (dyn Sink :send)))
+
+(defun lock! :private (busy: (Atom bool)) -> unit
+  (loop [] (if (compare-and-set! busy false true) () (recur))))
+
+(defun bump! :private (a: (Atom i64) n: i64) -> unit (do (swap! a (fn (v: i64) (+ v n))) ()))
+
+(defun note-failure :private (failed: (Atom i64) message: str) -> unit
+  (let [n (swap! failed (fn (v: i64) (+ v 1)))]
+    (when (= n 1) (eprintln (str "fib.log: the inner sink of an async sink failed (further failures are counted, not printed): " message)))))
+
+;; One record to the inner sink; nothing it does ends the worker.
+(defun write-one :private (inner: (dyn Sink :send) failed: (Atom i64) r: LogRecord) -> unit
+  (match (ex/try (sink-write inner r) (catch e (Err (ex/ex-message e))))
+    ((Ok _) ())
+    ((Err m) (note-failure failed m))))
+
+;; Takes the whole queue (an O(1) swap of the vector for an empty one) under the lock.
+(defun take-chain :private (queue: (Atom LogChain) len: (Atom i64) busy: (Atom bool)) -> LogChain
+  (do (lock! busy)
+      (let [items @queue]
+        (do (reset! queue QEnd) (reset! len 0) (reset! busy false) items))))
+
+;; The chain, newest first, as a vector oldest first. The chain is consumed one node at a time (a long chain is never freed recursively).
+(defun chain-to-vec :private (c: LogChain) -> (Vec LogRecord)
+  (let [newest-first (loop [c c out []]
+                       (match c ((QEnd) out) ((QLink r next) (recur next (conj out r)))))]
+    (vec (reverse newest-first))))
+
+(defun take-all :private (queue: (Atom LogChain) len: (Atom i64) busy: (Atom bool)) -> (Vec LogRecord)
+  (chain-to-vec (take-chain queue len busy)))
+
+(defun worker-loop :private (queue: (Atom LogChain) len: (Atom i64) busy: (Atom bool) written: (Atom i64) failed: (Atom i64)
+                             closed: (Atom bool) inner: (dyn Sink :send)) -> unit
+  (loop []
+    (let [batch (take-all queue len busy)]
+      (if (= (count batch) 0)
+          (if @closed
+              (let [last (take-all queue len busy)]   ; a producer that got in between the empty take and the flag
+                (if (= (count last) 0) () (do (dotimes (i (count last)) (write-one inner failed (nth last i))) (bump! written (count last)) (recur))))
+              (do (os/sleep-ns 100000) (recur)))
+          (do (dotimes (i (count batch)) (write-one inner failed (nth batch i)))
+              (bump! written (count batch))
+              (recur))))))
+
+(defun async-sink (inner: (dyn Sink :send) capacity: i64 overflow: Overflow) -> AsyncSink
+  (let [queue (atom QEnd) len (atom 0) busy (atom false) accepted (atom 0) written (atom 0) dropped (atom 0) failed (atom 0) closed (atom false)
+        worker (spawn (fn () (worker-loop queue len busy written failed closed inner)))]
+    (AsyncSink queue len busy (max 1 capacity) overflow accepted written dropped failed closed worker inner)))
+
+;; Without the oldest record (the chain's last node): O(n), the price of DropOldest.
+(defun without-oldest :private (c: LogChain) -> LogChain
+  (let [v (chain-to-vec c)]
+    (loop [i 1 out QEnd] (if (< i (count v)) (recur (+ i 1) (QLink (nth v i) out)) out))))
+
+;; Under the lock: queue the record, or apply the policy. The answer: 0 queued, 1 dropped (the record or the oldest), 2 full (BlockProducer).
+(defun offer :private (s: AsyncSink r: LogRecord) -> i64
+  (do (lock! (. s busy))
+      (let [n @(. s len)
+            full (>= n (. s capacity))
+            outcome (cond (not full) (do (reset! (. s queue) (QLink r @(. s queue))) (reset! (. s len) (+ n 1)) 0)
+                          (= (. s overflow) DropNewest) 1
+                          (= (. s overflow) DropOldest) (do (reset! (. s queue) (QLink r (without-oldest @(. s queue)))) 1)
+                          :else 2)]
+        (do (reset! (. s busy) false) outcome))))
+
+(defun enqueue :private (s: AsyncSink r: LogRecord) -> (Result unit str)
+  (if @(. s closed)
+      (Err "the async log sink is closed")
+      (let [o (offer s r)]
+        (cond (= o 0) (do (bump! (. s accepted) 1) (Ok ()))
+              (= o 1) (do (bump! (. s dropped) 1) (Ok ()))   ; DropOldest: the new record took the dropped one's place, accepted stays
+              :else (do (os/sleep-ns 50000) (enqueue s r))))))
+
+(defun drain-wait :private (s: AsyncSink) -> unit
+  (loop [] (when (< @(. s written) @(. s accepted)) (do (os/sleep-ns 100000) (recur)))))
+
+(defun async-dropped (s: AsyncSink) -> i64 @(. s dropped))
+(defun async-failed (s: AsyncSink) -> i64 @(. s failed))
+(defun async-written (s: AsyncSink) -> i64 @(. s written))
+
+(impl Sink AsyncSink
+  (sink-write (self r) (enqueue self r))
+  (sink-flush (self) (do (drain-wait self) (sink-flush (. self inner))))
+  (sink-close (self)
+    (if (compare-and-set! (. self closed) false true)
+        (do (join (. self worker)) (sink-close (. self inner)))
+        (Ok ()))))

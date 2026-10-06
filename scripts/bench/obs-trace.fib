@@ -1,0 +1,48 @@
+;; scripts/bench/obs-trace.fib: what a span costs (package O1). usage: obs-trace MODE N
+;; MODE: noop      the no-op tracer: start + end
+;;       dropped   sampled out (always-off sampler): ids drawn, nothing recorded
+;;       counted   sampled in, a simple processor, an exporter that only counts (the cost of the span itself)
+;;       memory    sampled in, a simple processor, the in-memory exporter (it keeps every span in a vector held by an atom)
+;;       batch     sampled in, a batch processor (capacity 4096, drop-newest) over a counting exporter: the caller's cost
+;;       attrs     as counted, with 2 attributes at the start, one set-attribute! and one event
+;;       child     as counted, a root and a child per iteration (per-span cost is half the printed value)
+;; Prints three rounds as `ns/op X` and, for the sampled modes, how many spans reached the exporter (a wrong count is a failure).
+;; Build: F build scripts/bench/obs-trace.fib -I lib -o obs-trace; run: ./obs-trace counted 300000
+(ns main (:require [fib.otel :as otel] [fib.log :as log] [fib.os :as os]))
+
+(defstruct CountExporter (n: (Atom i64)))
+(impl otel/Exporter CountExporter
+  (export-spans (self spans) (do (swap! (. self n) (fn (v: i64) (+ v (count spans)))) (Ok ())))
+  (exporter-flush (self) (Ok ()))
+  (exporter-shutdown (self) (Ok ())))
+
+(defun provider-of (sampler: (dyn otel/Sampler :send) procs: (Vec (dyn otel/SpanProcessor :send))) -> otel/TracerProvider
+  (otel/tracer-provider-with (otel/make-resource "bench" []) sampler procs (otel/id-gen-seeded 1)))
+
+(defun round (mode: str t: otel/Tracer n: i64) -> unit
+  (let [root (otel/empty-context) t0 (os/clock-now)]
+    (do (cond (= mode "child")
+              (dotimes (i n) (let [a (otel/start-span t root "root" [])]
+                               (otel/end-span! (otel/start-span t (otel/span-in-context root a) "child" []))))
+              (= mode "attrs")
+              (dotimes (i n) (let [a (otel/start-span t root "x" [(Pair "a" (otel/->datum 1)) (Pair "b" (otel/->datum "v"))])]
+                               (do (otel/set-attribute! a "c" (otel/->datum i)) (otel/add-event! a "e" []) (otel/end-span! a))))
+              :else (dotimes (i n) (otel/end-span! (otel/start-span t root "x" []))))
+        (println (str "ns/op " (quot (* 10 (- (os/clock-now) t0)) (* 10 n)))))))
+
+(defun main () -> i64
+  (let [a (args) mode (nth a 0) n (unwrap-or (parse-long (nth a 1)) 100000)
+        c (CountExporter (atom 0)) m (otel/memory-exporter)
+        counting (dyn otel/Exporter :send c)
+        bp (otel/batch-processor counting 4096 512 100000000 log/DropNewest)
+        simple (dyn otel/SpanProcessor :send (otel/simple-processor counting))
+        provider (cond (= mode "noop") (provider-of (otel/always-off) [])
+                       (= mode "dropped") (provider-of (otel/always-off) [simple])
+                       (= mode "memory") (provider-of (otel/always-on) [(dyn otel/SpanProcessor :send (otel/simple-processor (dyn otel/Exporter :send m)))])
+                       (= mode "batch") (provider-of (otel/always-on) [(dyn otel/SpanProcessor :send bp)])
+                       :else (provider-of (otel/always-on) [simple]))
+        tracer (if (= mode "noop") (otel/noop-tracer) (otel/get-tracer provider "bench"))]
+    (do (dotimes (r 3) (round mode tracer n))
+        (otel/shutdown-provider provider) (otel/processor-shutdown bp)
+        (println (str "exported " (if (= mode "memory") (count (otel/memory-spans m)) @(. c n)) " dropped " (otel/batch-dropped bp)))
+        0)))

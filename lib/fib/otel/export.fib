@@ -1,0 +1,92 @@
+;; fib.otel.export: the Exporter protocol, the console exporter (text and JSON lines) and the in-memory exporter for tests
+;; (docs/design/observability-and-databases.md 3.4).
+;;
+;; An exporter takes a batch of finished spans and sends them somewhere. The CONTRACT (specs/otel-exporter-contract.fib): every span given
+;; arrives, whole, once; a failure is an `Err`, never a trap in the caller; `flush` and `shutdown` are safe to call more than once. The
+;; processors (fib.otel.processor) additionally run every call of an exporter under `try` (docs/design/exceptions.md 9), so an exporter
+;; that traps anyway costs the batch it was given, not the program. The OTLP/HTTP exporter of package O3 plugs in here.
+(ns fib.otel.export (:use fib.core fib.seq fib.coll fib.datum fib.otel.ids fib.otel.propagation fib.otel.trace)
+  (:require [fib.os :as os] [fib.log.sinks :as sinks]))
+
+(defprotocol Exporter
+  (export-spans (self spans: (Vec SpanData)) -> (Result unit str))
+  (exporter-flush (self) -> (Result unit str))
+  (exporter-shutdown (self) -> (Result unit str)))
+
+;; ---- rendering
+
+(defun attrs-json :private (attrs: (Vec (Pair str Datum))) -> str
+  (str "{" (reduce (fn (acc: str p: (Pair str Datum))
+                     (str acc (if (= acc "") "" ",") (json-quote (. p fst)) ":" (datum-json (. p snd))))
+                   "" attrs)
+       "}"))
+
+(defun event-json :private (e: SpanEvent) -> str
+  (str "{\"name\":" (json-quote (. e name)) ",\"time_ns\":" (. e time-ns) ",\"attributes\":" (attrs-json (. e attributes)) "}"))
+
+(defun link-json :private (l: SpanLink) -> str
+  (let [c (. l context)]
+    (str "{\"trace_id\":\"" (trace-id-hex (. c trace-id)) "\",\"span_id\":\"" (span-id-hex (. c span-id)) "\",\"attributes\":"
+         (attrs-json (. l attributes)) "}")))
+
+(defun list-json :private (items: (Vec str)) -> str
+  (str "[" (reduce (fn (acc: str s: str) (str acc (if (= acc "") "" ",") s)) "" items) "]"))
+
+;; One span as one JSON object (no newline): ids as lower-case hex, times in nanoseconds since the epoch, the parent's id empty for a root.
+(defun span-json (d: SpanData) -> str
+  (str "{\"trace_id\":\"" (trace-id-hex (. d trace-id)) "\",\"span_id\":\"" (span-id-hex (. d span-id)) "\",\"parent_span_id\":\""
+       (if (= (. d parent-span-id) 0) "" (span-id-hex (. d parent-span-id))) "\",\"name\":" (json-quote (. d name))
+       ",\"kind\":\"" (kind-name (. d kind)) "\",\"scope\":" (json-quote (. d scope))
+       ",\"start_ns\":" (. d start-ns) ",\"end_ns\":" (. d end-ns) ",\"flags\":" (. d flags)
+       ",\"status\":{\"code\":\"" (status-name (. d status)) "\",\"message\":" (json-quote (status-message (. d status))) "}"
+       ",\"attributes\":" (attrs-json (. d attributes))
+       ",\"events\":" (list-json (vec (map event-json (. d events))))
+       ",\"links\":" (list-json (vec (map link-json (. d links))))
+       ",\"resource\":" (attrs-json (. (. d resource) attributes)) "}"))
+
+(defun ms-text :private (ns: i64) -> str
+  (str (quot ns 1000000) "." (let [f (quot (rem ns 1000000) 1000)] (cond (< f 10) (str "00" f) (< f 100) (str "0" f) :else (str f))) "ms"))
+
+;; A human line: `2026-10-06T09:15:02.123Z span GET /users SERVER 1.234ms trace=.. span=.. parent=.. status=ERROR(boom) http.method=GET`.
+(defun span-text (d: SpanData) -> str
+  (str (sinks/iso-utc (. d start-ns)) " span " (. d name) " " (kind-name (. d kind)) " " (ms-text (span-duration-ns d))
+       " trace=" (trace-id-hex (. d trace-id)) " span=" (span-id-hex (. d span-id))
+       (if (= (. d parent-span-id) 0) "" (str " parent=" (span-id-hex (. d parent-span-id))))
+       (match (. d status) ((StatusUnset) "") ((StatusOk) " status=OK") ((StatusError m) (str " status=ERROR(" m ")")))
+       (reduce (fn (acc: str p: (Pair str Datum)) (str acc " " (. p fst) "=" (datum-text (. p snd)))) "" (. d attributes))
+       (reduce (fn (acc: str e: SpanEvent) (str acc " event=" (. e name))) "" (. d events))))
+
+;; ---- the console exporter
+
+(defstruct ConsoleExporter (fd: i64 json: bool))
+
+(defun console-line :private (e: ConsoleExporter d: SpanData) -> str
+  (str (if (. e json) (span-json d) (span-text d)) "\n"))
+
+;; All the lines of a batch are written with one write: a batch is not torn by another task writing the same descriptor.
+(impl Exporter ConsoleExporter
+  (export-spans (self spans)
+    (match (os/write-all (. self fd) (str-bytes (reduce (fn (acc: str d: SpanData) (str acc (console-line self d))) "" spans)))
+      ((Ok _) (Ok ()))
+      ((Err e) (Err (. e message)))))
+  (exporter-flush (self) (Ok ()))
+  (exporter-shutdown (self) (Ok ())))
+
+;; Spans as text on standard error (the default of development), or as JSON lines on a descriptor.
+(defun console-exporter () -> (dyn Exporter :send) (dyn Exporter :send (ConsoleExporter 2 false)))
+(defun console-json-exporter (fd: i64) -> (dyn Exporter :send) (dyn Exporter :send (ConsoleExporter fd true)))
+
+;; ---- the in-memory exporter
+
+(defstruct MemoryExporter (spans: (Atom (Vec SpanData)) shut: (Atom bool)))
+
+(impl Exporter MemoryExporter
+  (export-spans (self spans)
+    (if @(. self shut)
+        (Err "the memory exporter is shut down")
+        (do (swap! (. self spans) (fn (v: (Vec SpanData)) (into v spans))) (Ok ()))))
+  (exporter-flush (self) (Ok ()))
+  (exporter-shutdown (self) (do (reset! (. self shut) true) (Ok ()))))
+
+(defun memory-exporter () -> MemoryExporter (MemoryExporter (atom []) (atom false)))
+(defun memory-spans (m: MemoryExporter) -> (Vec SpanData) @(. m spans))

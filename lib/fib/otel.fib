@@ -1,0 +1,21 @@
+;; fib.otel: OpenTelemetry-shaped tracing for fibber (docs/design/observability-and-databases.md 3). Explicit: `(:require [fib.otel :as otel])`.
+;;
+;;   (let [exp      (otel/memory-exporter)                                         ; or (otel/console-exporter), or O3's OTLP exporter
+;;         provider (otel/tracer-provider (otel/resource-from-env) (otel/parent-based (otel/always-on))
+;;                                        [(dyn otel/SpanProcessor :send (otel/simple-processor (dyn otel/Exporter :send exp)))])
+;;         tracer   (otel/get-tracer provider "app")]
+;;     (otel/in-span sp ctx tracer (otel/empty-context) "work" [(Pair "k" (otel/->datum 1))]
+;;       (otel/set-attribute! sp "n" (otel/->datum 2))
+;;       (spawn (fn () (otel/in-span sp2 ctx2 tracer ctx "child" [] ...)))))      ; a task captures `ctx`: its span is a child
+;;
+;; Modules: ids (trace and span ids, the generator), propagation (W3C traceparent and tracestate), trace (span data, Context, the header
+;; hooks `inject-headers` and `extract-context` that O3's HTTP middleware uses), sampler, export (the Exporter protocol, console and memory
+;; exporters), queue, processor (simple and batch), tracer (provider, tracer, span), semconv (attribute names), log (the logger bridge),
+;; metrics (MeterProvider, Counter, UpDownCounter, Histogram, Gauge; attribute sets), reader (collect, periodic reader, metric exporters).
+(ns fib.otel (:export-from fib.datum fib.otel.ids fib.otel.propagation fib.otel.trace fib.otel.sampler fib.otel.export fib.otel.processor
+                           fib.otel.tracer fib.otel.semconv fib.otel.log fib.otel.metrics fib.otel.reader))
+
+;; (in-span sp ctx tracer parent name attrs body..): `with-span` with the body written inline; `sp` is the span and `ctx` the Context that
+;; holds it, both bound in the body. The span ends when the body does, and records a trap or a throw before it goes on.
+(defmacro in-span (sp ctx tracer parent name attrs ... body)
+  `(with-span ~tracer ~parent ~name ~attrs (fn (~sp ~ctx) ~@body)))

@@ -1,0 +1,238 @@
+;; fib.log sinks of package L2 (docs/design/observability-and-databases.md 2.6, 2.7): the rotating file sink, the async sink with its three
+;; overflow policies, the fanout and the level filter, a sink that fails or traps, and configuration from the environment and from data.
+;; The Appender contract runs against the file sink, the async sink over a file, and a fanout. Everything is local files under a fresh
+;; temporary directory; no sleep is longer than 60 ms.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.parallel log-appender-contract)
+  (:require [fib.log :as log] [fib.os :as os] [fib.string :as string] [fib.ex :as ex]))
+
+(defun fresh-dir () -> str
+  (match (os/create-temp-directory (str (os/temp-directory) "/fiblogXXXXXX")) ((Ok d) d) ((Err e) (trap (. e message)))))
+
+(defun slurp (path: str) -> str
+  (match (os/read-file-bytes path 10000000) ((Ok b) (str-from-bytes b)) ((Err _) "")))
+
+(defun lines-of (path: str) -> (Vec str)
+  (vec (filter (fn (l: str) (> (str-len l) 0)) (string/split (slurp path) "\n"))))
+
+(defun logger-for (k: (dyn log/Sink :send)) -> log/Logger (log/get-logger (log/log-system k (log/LevelTable 0 [])) "t"))
+
+(defun must-file (path: str max: i64 keep: i64) -> (dyn log/Sink :send)
+  (match (log/file-sink path max keep true) ((Ok k) k) ((Err e) (trap e))))
+
+(defun rm-all (dir: str names: (Vec str)) -> unit
+  (do (dotimes (i (count names)) (os/remove-file (str dir "/" (nth names i)))) (os/remove-directory dir) ()))
+
+
+;; ---- sinks that misbehave
+(defstruct BrokenSink (tries: (Atom i64)))
+(impl log/Sink BrokenSink
+  (sink-write (self r) (do (swap! (. self tries) (fn (v: i64) (+ v 1))) (Err "disk full")))
+  (sink-flush (self) (Ok ()))
+  (sink-close (self) (Ok ())))
+
+(defstruct TrapSink (tries: (Atom i64)))
+(impl log/Sink TrapSink
+  (sink-write (self r) (do (swap! (. self tries) (fn (v: i64) (+ v 1))) (trap "boom in a sink")))
+  (sink-flush (self) (Ok ()))
+  (sink-close (self) (Ok ())))
+
+;; Blocks inside its first write until the gate opens: a deterministic full queue.
+(defstruct GatedSink (gate: (Atom bool) entered: (Atom i64) inner: log/MemorySink))
+(impl log/Sink GatedSink
+  (sink-write (self r)
+    (do (swap! (. self entered) (fn (v: i64) (+ v 1)))
+        (loop [] (when (not @(. self gate)) (do (os/sleep-ns 100000) (recur))))
+        (log/sink-write (dyn log/Sink :send (. self inner)) r)))
+  (sink-flush (self) (Ok ()))
+  (sink-close (self) (Ok ())))
+
+(defun gated () -> GatedSink (GatedSink (atom false) (atom 0) (log/memory-sink)))
+
+(defun wait-entered (g: GatedSink) -> unit
+  (loop [] (when (= @(. g entered) 0) (do (os/sleep-ns 100000) (recur)))))
+
+;; A gated async sink whose worker is blocked in the write of record 0, then records 1..n written by the caller.
+(defun fill (g: GatedSink cap: i64 policy: log/Overflow n: i64) -> log/AsyncSink
+  (let [a (log/async-sink (dyn log/Sink :send g) cap policy) lg (logger-for (dyn log/Sink :send a))]
+    (do (log/info lg "r" :i 0)
+        (wait-entered g)
+        (dotimes (i n) (log/info lg "r" :i (+ i 1)))
+        a)))
+
+;; ---- probes for the Appender contract
+(defun file-probe () -> SinkProbe (file-probe-with false))
+
+(defun file-probe-with (async?: bool) -> SinkProbe
+  (let [dir (fresh-dir) path (str dir "/a.log") k (must-file path 0 0)
+        sink (if async? (dyn log/Sink :send (log/async-sink k 100000 log/BlockProducer)) k)
+        got (atom []) done (atom false)]
+    (SinkProbe sink
+               (fn () (do (when (not @done)
+                            (do (log/sink-close sink)
+                                (swap! got (fn (_: (Vec str)) (lines-of path)))
+                                (swap! done (fn (_: bool) true))
+                                (rm-all dir ["a.log"])))
+                          @got)))))
+
+(defun async-file-probe () -> SinkProbe (file-probe-with true))
+
+(defun fanout-probe () -> SinkProbe
+  (let [p (file-probe-with false) m (log/memory-sink)]
+    (SinkProbe (log/fanout [(dyn log/Sink :send m) (. p sink)]) (. p lines))))
+
+(defspecs specs
+  (feature "the file sink"
+    (scenario "rotates at the size limit, keeps K archives, and every file holds whole lines in order"
+      (covers "fib.log file-sink")
+      (given [dir (fresh-dir) path (str dir "/r.log") lg (logger-for (must-file path 300 2))])
+      (upon [_ (dotimes (i 40) (log/info lg "line" :i i))
+             all (concat (concat (lines-of (str path ".2")) (lines-of (str path ".1"))) (lines-of path))
+             ids (vec (map (fn (l: str) (let [k (+ 4 (unwrap-or (str-find l "\"i\":" 0) 0))] (unwrap-or (parse-long (subs l k (- (str-len l) 1))) -1))) all))
+             sizes [(str-len (slurp path)) (str-len (slurp (str path ".1"))) (str-len (slurp (str path ".2")))]
+             gone (str-len (slurp (str path ".3")))
+             _ (rm-all dir ["r.log" "r.log.1" "r.log.2" "r.log.3"])])
+      (then (expect = true (every? (fn (l: str) (whole-json? l)) all))
+            (expect = true (every? (fn (n: i64) (and (> n 0) (<= n 300))) sizes))
+            (expect = 0 gone)
+            (expect = 39 (nth ids (- (count ids) 1)))
+            (expect = true (> (count ids) 5))
+            (expect = (vec (range (nth ids 0) 40)) ids)))
+    (scenario "a line longer than the limit goes whole into a file of its own"
+      (given [dir (fresh-dir) path (str dir "/l.log") lg (logger-for (must-file path 50 3))])
+      (upon [_ (do (log/info lg "short") (log/info lg (string/join "" (repeat 100 "x"))) (log/info lg "after"))
+             a (lines-of path) b (lines-of (str path ".1")) c (lines-of (str path ".2"))
+             _ (rm-all dir ["l.log" "l.log.1" "l.log.2" "l.log.3"])])
+      (then (expect = 1 (count a)) (expect = 1 (count b)) (expect = 1 (count c))
+            (expect = true (string/includes? (nth b 0) "xxxxxxxxxx"))))
+    (scenario "a file that already has content is appended to and its size counts toward the limit"
+      (given [dir (fresh-dir) path (str dir "/p.log") _ (os/write-file-bytes path (str-bytes "{\"old\":1}\n"))
+              lg (logger-for (must-file path 160 1))])
+      (upon [_ (do (log/info lg "n" :i 1) (log/info lg "n" :i 2) (log/info lg "n" :i 3))
+             cur (lines-of path) arch (lines-of (str path ".1"))
+             _ (rm-all dir ["p.log" "p.log.1"])])
+      (then (expect = true (string/includes? (nth arch 0) "\"old\":1")) (expect = 4 (+ (count cur) (count arch)))))
+    (scenario "8 tasks writing at once through rotation lose no line and break none"
+      (given [dir (fresh-dir) path (str dir "/c.log") k (must-file path 4000 1000) lg (logger-for k)])
+      (upon [_ (with-tasks [s] (do (dotimes (t 8) (fork s (fn () (dotimes (i 100) (log/info lg "x" :t t :i i))))) ()))
+             names (vec (concat ["c.log"] (map (fn (i: i64) (str "c.log." i)) (range 1 1001))))
+             all (reduce (fn (acc: (Vec str) n: str) (into acc (lines-of (str dir "/" n)))) [] names)
+             _ (rm-all dir names)])
+      (then (expect = 800 (count all)) (expect = true (every? (fn (l: str) (whole-json? l)) all))))
+    (scenario "a failing disk write does not trap the caller: it is counted and the program goes on"
+      (given [k (must-file "/dev/full" 0 0) sys (log/log-system k (log/LevelTable 0 [])) lg (log/get-logger sys "t")])
+      (upon [_ (do (log/info lg "one") (log/info lg "two") (log/info lg "three"))])
+      (then (expect = 3 (log/failures sys))))
+    (scenario "a file that cannot be opened is an Err, not a trap"
+      (then (expect = true (match (log/file-sink "/nonexistent-dir-xyz/a.log" 100 1 true) ((Err _) true) ((Ok _) false)))))
+    (scenario "a closed file sink refuses records"
+      (given [dir (fresh-dir) path (str dir "/z.log") k (must-file path 0 0)])
+      (upon [_ (log/sink-close k) r (log/sink-write k (log/LogRecord 2 "t" "m" [] 0)) _ (rm-all dir ["z.log"])])
+      (then (expect = true (match r ((Err _) true) ((Ok _) false))))))
+  (feature "the async sink"
+    (scenario "8 producers of 500 records each arrive exactly once and in order per producer"
+      (covers "fib.log async-sink")
+      (given [m (log/memory-sink) a (log/async-sink (dyn log/Sink :send m) 100000 log/BlockProducer) lg (logger-for (dyn log/Sink :send a))])
+      (upon [_ (with-tasks [s] (do (dotimes (t 8) (fork s (fn () (dotimes (i 500) (log/info lg "x" :t t :i i))))) ()))
+             _ (log/sink-close (dyn log/Sink :send a))
+             recs (log/memory-records m)
+             per (fn (t: i64) (vec (map (fn (r: log/LogRecord) (unwrap-or (log/as-int (. (nth (. r fields) 1) snd)) -1))
+                                        (filter (fn (r: log/LogRecord) (= (log/as-int (. (nth (. r fields) 0) snd)) (some t))) recs))))])
+      (then (expect = 4000 (count recs)) (expect = 0 (log/async-dropped a)) (expect = 4000 (log/async-written a))
+            (expect = true (every? (fn (t: i64) (= (per t) (vec (range 0 500)))) (range 0 8)))))
+    (scenario "flush waits for the queue; close drains and then refuses"
+      (given [m (log/memory-sink) a (log/async-sink (dyn log/Sink :send m) 10000 log/BlockProducer) lg (logger-for (dyn log/Sink :send a))])
+      (upon [_ (dotimes (i 300) (log/info lg "x" :i i))
+             _ (log/sink-flush (dyn log/Sink :send a))
+             after-flush (count (log/memory-records m))
+             _ (dotimes (i 50) (log/info lg "y" :i i))
+             _ (log/sink-close (dyn log/Sink :send a))
+             after-close (count (log/memory-records m))
+             late (log/sink-write (dyn log/Sink :send a) (log/LogRecord 2 "t" "m" [] 0))])
+      (then (expect = 300 after-flush) (expect = 350 after-close) (expect = true (match late ((Err _) true) ((Ok _) false)))))
+    (scenario "drop-newest throws the arriving records away and counts them"
+      (given [g (gated) a (fill g 3 log/DropNewest 10)])
+      (upon [_ (do (reset! (. g gate) true) (log/sink-close (dyn log/Sink :send a)))])
+      (then (expect = [0 1 2 3] (mem-lines-i (. g inner))) (expect = 7 (log/async-dropped a))))
+    (scenario "drop-oldest keeps the newest and counts the dropped"
+      (given [g (gated) a (fill g 3 log/DropOldest 10)])
+      (upon [_ (do (reset! (. g gate) true) (log/sink-close (dyn log/Sink :send a)))])
+      (then (expect = [0 8 9 10] (mem-lines-i (. g inner))) (expect = 7 (log/async-dropped a))))
+    (scenario "block makes the producer wait until the worker makes room, and loses nothing"
+      (given [g (gated) a (log/async-sink (dyn log/Sink :send g) 3 log/BlockProducer) lg (logger-for (dyn log/Sink :send a))
+              _ (do (log/info lg "r" :i 0) (wait-entered g))
+              t (spawn (fn () (do (dotimes (i 5) (log/info lg "r" :i (+ i 1))) 0)))
+              _ (os/sleep-ns 40000000)
+              queued-while-blocked @(. a accepted)])
+      (upon [_ (do (reset! (. g gate) true) (join t) (log/sink-close (dyn log/Sink :send a)))])
+      (then (expect = 4 queued-while-blocked) (expect = [0 1 2 3 4 5] (mem-lines-i (. g inner))) (expect = 0 (log/async-dropped a))))
+    (scenario "with-log-system flushes and closes the system when the body returns and when it traps"
+      (given [m1 (log/memory-sink) m2 (log/memory-sink)
+              s1 (log/log-system (dyn log/Sink :send (log/async-sink (dyn log/Sink :send m1) 1000 log/BlockProducer)) (log/LevelTable 0 []))
+              s2 (log/log-system (dyn log/Sink :send (log/async-sink (dyn log/Sink :send m2) 1000 log/BlockProducer)) (log/LevelTable 0 []))])
+      (upon [a (log/with-log-system s1 (fn (s: log/LogSystem) (do (dotimes (i 20) (log/info (log/get-logger s "t") "x" :i i)) 1)))
+             b (ex/try (log/with-log-system s2 (fn (s: log/LogSystem) (do (log/info (log/get-logger s "t") "x" :i 1) (trap "boom"))))
+                       (catch e -1))])
+      (then (expect = 1 a) (expect = -1 b) (expect = 20 (count (log/memory-records m1))) (expect = 1 (count (log/memory-records m2)))))
+    (scenario "a failing or trapping inner sink is counted and the worker goes on"
+      (given [b (BrokenSink (atom 0)) t (TrapSink (atom 0))
+              a1 (log/async-sink (dyn log/Sink :send b) 100 log/BlockProducer) a2 (log/async-sink (dyn log/Sink :send t) 100 log/BlockProducer)
+              l1 (logger-for (dyn log/Sink :send a1)) l2 (logger-for (dyn log/Sink :send a2))])
+      (upon [_ (do (dotimes (i 5) (log/info l1 "x") (log/info l2 "x")) (log/sink-close (dyn log/Sink :send a1)) (log/sink-close (dyn log/Sink :send a2)))])
+      (then (expect = 5 (log/async-failed a1)) (expect = 5 @(. b tries))
+            (expect = 5 (log/async-failed a2)) (expect = 5 @(. t tries)))))
+  (feature "fanout and level filters"
+    (scenario "one failing sink, even one that traps, does not stop the others"
+      (covers "fib.log fanout")
+      (given [m (log/memory-sink) b (BrokenSink (atom 0)) t (TrapSink (atom 0))
+              sys (log/log-system (log/fanout [(dyn log/Sink :send b) (dyn log/Sink :send t) (dyn log/Sink :send m)]) (log/LevelTable 0 []))
+              lg (log/get-logger sys "t")])
+      (upon [_ (do (log/info lg "a") (log/info lg "b") (log/info lg "c"))])
+      (then (expect = 3 (count (log/memory-records m))) (expect = 3 (log/failures sys))
+            (expect = 3 @(. b tries)) (expect = 3 @(. t tries))))
+    (scenario "each sink filters on its own level"
+      (given [lo (log/memory-sink) hi (log/memory-sink)
+              lg (logger-for (log/fanout [(log/level-filter log/DEBUG (dyn log/Sink :send lo)) (log/level-filter log/WARN (dyn log/Sink :send hi))]))])
+      (upon [_ (do (log/trace lg "t") (log/debug lg "d") (log/info lg "i") (log/warn lg "w") (log/error lg "e"))])
+      (then (expect = 4 (count (log/memory-records lo))) (expect = 2 (count (log/memory-records hi)))
+            (expect = [log/WARN log/ERROR] (vec (map (fn (r: log/LogRecord) (. r level)) (log/memory-records hi))))))
+    (scenario "flush and close reach every sink of a fanout, failures included"
+      (given [dir (fresh-dir) path (str dir "/f.log") k (must-file path 0 0) b (BrokenSink (atom 0))
+              f (log/fanout [(dyn log/Sink :send b) k])])
+      (upon [_ (log/sink-write f (log/LogRecord 2 "t" "m" [] 0)) r (log/sink-close f) w (log/sink-write k (log/LogRecord 2 "t" "m" [] 0))
+             _ (rm-all dir ["f.log"])])
+      (then (expect = true (match r ((Ok _) true) ((Err _) false))) (expect = true (match w ((Err _) true) ((Ok _) false))))))
+  (feature "configuration"
+    (scenario "FIB_LOG sets the root and the rules in one variable"
+      (then (expect = log/WARN (. (log/parse-spec "warn,my.mod=debug,x=loud,junk" 2) root))
+            (expect = [(log/Pair "my.mod" log/DEBUG)] (. (log/parse-spec "warn,my.mod=debug,x=loud,junk" 2) rules))
+            (expect = log/INFO (. (log/parse-spec "my.mod=debug" 2) root))))
+    (scenario "rules and levels with non-ASCII names are read (str-find counts bytes, subs counts characters)"
+      (then (expect = [(log/Pair "é.x" log/DEBUG)] (. (log/parse-spec "é.x=debug" 2) rules))
+            (expect = log/ERROR (. (log/parse-spec "é,error" 2) root))))
+    (scenario "FIB_LOG from the environment, with a rotating async file"
+      (given [dir (fresh-dir) path (str dir "/e.log")
+              _ (do (os/setenv "FIB_LOG" "error,app.db=trace") (os/setenv "FIB_LOG_FILE" path) (os/setenv "FIB_LOG_FILE_MAX" "100000")
+                    (os/setenv "FIB_LOG_ASYNC" "1") (os/setenv "FIB_LOG_FORMAT" "json"))
+              sys (log/system-from-env) lg (log/get-logger sys "app.db.x") other (log/get-logger sys "app")])
+      (upon [_ (do (log/info lg "hello" :k 1) (log/info other "dropped by level") (log/close-system sys)
+                   (os/unsetenv "FIB_LOG") (os/unsetenv "FIB_LOG_FILE") (os/unsetenv "FIB_LOG_FILE_MAX") (os/unsetenv "FIB_LOG_ASYNC") (os/unsetenv "FIB_LOG_FORMAT"))
+             ls (lines-of path) _ (rm-all dir ["e.log"])])
+      (then (expect = 1 (count ls)) (expect = true (string/includes? (nth ls 0) "\"msg\":\"hello\",\"k\":1}"))))
+    (scenario "the data form builds a system or names the bad key"
+      (given [dir (fresh-dir) path (str dir "/m.log")
+              ok (log/system-from-map {"level" "debug" "levels" "a=warn" "file" path "format" "json" "max-bytes" "5000" "keep" "2"})])
+      (upon [lvl (match ok ((Ok s) (. (log/get-logger s "a.b") level)) ((Err _) -1))
+             _ (match ok ((Ok s) (log/close-system s)) ((Err _) (Ok ())))
+             _ (rm-all dir ["m.log"])])
+      (then (expect = log/WARN lvl)
+            (expect = (some "bad number for keep: lots") (match (log/system-from-map {"keep" "lots"}) ((Err e) (some e)) ((Ok _) nil)))
+            (expect = (some "unknown overflow policy sometimes") (match (log/system-from-map {"overflow" "sometimes"}) ((Err e) (some e)) ((Ok _) nil)))
+            (expect = (some "unknown level loud") (match (log/system-from-map {"level" "loud"}) ((Err e) (some e)) ((Ok _) nil))))))
+  (implements AppenderContract "file sink" file-probe)
+  (implements AppenderContract "async sink over a file" async-file-probe)
+  (implements AppenderContract "fanout of memory and file" fanout-probe))
+
+(defun mem-lines-i (m: log/MemorySink) -> (Vec i64)
+  (vec (map (fn (r: log/LogRecord) (unwrap-or (log/as-int (. (nth (. r fields) 0) snd)) -1)) (log/memory-records m))))
+
+(defun main () -> i64 (run-main (specs)))

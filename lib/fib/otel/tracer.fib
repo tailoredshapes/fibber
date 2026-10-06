@@ -1,0 +1,213 @@
+;; fib.otel.tracer: TracerProvider, Tracer and Span (docs/design/observability-and-databases.md 3.1, 3.2, 3.3).
+;;
+;;   (let [provider (tracer-provider (resource-from-env) (parent-based (always-on)) [(dyn SpanProcessor :send (simple-processor exp))])
+;;         tracer   (get-tracer provider "app.db")]
+;;     (with-span tracer (empty-context) "query" [(Pair "db.system.name" (->datum "sqlite"))]
+;;       (fn (span ctx) (do (set-attribute! span "rows" (->datum 3)) (run-query ctx)))))
+;;
+;; Nothing is global: the provider is a value built in main (it holds the resource, the sampler, the processors and the id generator) and a
+;; Tracer is a provider plus an instrumentation scope name. A span is started from a Context (the parent) and handed to the body together with
+;; a new Context that holds it; a task forked by the body captures that Context. `with-span` ends the span when the body returns, and when it
+;; traps or throws it records the exception on the span (status error, an `exception` event with `exception.message` and `exception.type`)
+;; and ends it before the failure goes on. A span can also be driven by hand: `start-span`, then `end-span!` exactly once (a second end is
+;; ignored).
+;;
+;; Times: the provider takes one pair of clocks when it is made, the wall clock and the monotonic clock. A span's start and end are
+;; `wall0 + (monotonic now - monotonic0)`, so durations are never negative when the wall clock is stepped and the epoch times are still real.
+;;
+;; Sampled out spans (the sampler says drop) carry ids, so children and downstream services see one consistent trace, and cost an id draw
+;; and a struct; they keep no attributes and call no processor. The no-op tracer (`noop-tracer`) draws nothing and keeps nothing.
+(ns fib.otel.tracer (:use fib.core fib.seq fib.coll fib.datum fib.otel.ids fib.otel.propagation fib.otel.trace fib.otel.sampler fib.otel.processor)
+  (:require [fib.os :as os] [fib.ex :as ex]))
+
+;; ---- resource
+
+(defstruct TracerProvider (resource: Resource sampler: (dyn Sampler :send) processors: (Vec (dyn SpanProcessor :send)) ids: IdGen
+                           wall0: i64 mono0: i64 enabled: bool))
+
+;; "k1=v1,k2=v2" as attributes (an entry with no `=` is skipped), the form of OTEL_RESOURCE_ATTRIBUTES.
+(defun parse-resource-attributes (text: str) -> (Vec (Pair str Datum))
+  (reduce (fn (out: (Vec (Pair str Datum)) entry: str)
+            (match (str-find entry "=" 0)
+              (nil out)
+              ((some i) (if (= i 0) out (conj out (Pair (str-slice entry 0 i) (DStr (str-slice entry (+ i 1) (str-len entry)))))))))
+          [] (split-commas text)))
+
+(defun split-commas :private (text: str) -> (Vec str)
+  (loop [i 0 start 0 out []]
+    (cond (>= i (str-len text)) (conj out (str-slice text start i))
+          (= (str-byte-at text i) 44i8) (recur (+ i 1) (+ i 1) (conj out (str-slice text start i)))
+          :else (recur (+ i 1) start out))))
+
+(defun sdk-attributes :private () -> (Vec (Pair str Datum))
+  [(Pair "telemetry.sdk.name" (DStr "fibber-otel")) (Pair "telemetry.sdk.language" (DStr "fibber")) (Pair "telemetry.sdk.version" (DStr "0.1"))])
+
+;; A resource of `service.name` and the SDK attributes, plus the given ones (a given `service.name` replaces the default).
+(defun make-resource (service-name: str extra: (Vec (Pair str Datum))) -> Resource
+  (Resource (into (into [(Pair "service.name" (DStr service-name))] (filter (fn (p: (Pair str Datum)) (!= (. p fst) "service.name")) extra))
+                  (sdk-attributes))))
+
+;; The resource of the environment: OTEL_SERVICE_NAME (default `unknown_service`) and OTEL_RESOURCE_ATTRIBUTES; the service name also
+;; comes from a `service.name` entry of the attributes when OTEL_SERVICE_NAME is not set.
+(defun resource-from-env () -> Resource
+  (let [attrs (match (os/getenv "OTEL_RESOURCE_ATTRIBUTES") (nil []) ((some t) (parse-resource-attributes t)))
+        from-attrs (filter (fn (p: (Pair str Datum)) (= (. p fst) "service.name")) attrs)
+        name (match (os/getenv "OTEL_SERVICE_NAME")
+               ((some n) n)
+               (nil (if (> (count from-attrs) 0) (unwrap-or (as-str (. (nth from-attrs 0) snd)) "unknown_service") "unknown_service")))]
+    (make-resource name attrs)))
+
+;; ---- provider and tracer
+
+(defstruct Tracer (scope: str provider: TracerProvider))
+
+(defun tracer-provider-with (resource: Resource sampler: (dyn Sampler :send) processors: (Vec (dyn SpanProcessor :send)) ids: IdGen)
+  -> TracerProvider
+  (TracerProvider resource sampler processors ids (os/wall-now) (os/clock-now) true))
+
+;; A provider with an id generator seeded from the OS entropy.
+(defun tracer-provider (resource: Resource sampler: (dyn Sampler :send) processors: (Vec (dyn SpanProcessor :send))) -> TracerProvider
+  (tracer-provider-with resource sampler processors (id-gen)))
+
+(defun get-tracer (p: TracerProvider scope: str) -> Tracer (Tracer scope p))
+
+;; A tracer that does nothing: every span is non-recording with the parent's context, no id is drawn and no clock is read.
+(defun noop-tracer () -> Tracer
+  (Tracer "noop" (TracerProvider (Resource []) (always-off) [] (id-gen-seeded 1) 0 0 false)))
+
+;; Flushes every processor (a batch processor waits for its queue); the first error, if any.
+(defun force-flush-provider (p: TracerProvider) -> (Result unit str)
+  (reduce (fn (acc: (Result unit str) k: (dyn SpanProcessor :send))
+            (let [r (ex/try (processor-flush k) (catch e (Err (ex/ex-message e))))] (match acc ((Err _) acc) ((Ok _) r))))
+          (Ok ()) (. p processors)))
+
+;; Flushes and shuts every processor down (and with them the exporters); call it at the end of main, there is no finalizer.
+(defun shutdown-provider (p: TracerProvider) -> (Result unit str)
+  (reduce (fn (acc: (Result unit str) k: (dyn SpanProcessor :send))
+            (let [r (ex/try (do (processor-flush k) (processor-shutdown k)) (catch e (Err (ex/ex-message e))))] (match acc ((Err _) acc) ((Ok _) r))))
+          (Ok ()) (. p processors)))
+
+;; ---- spans
+
+(defstruct SpanState (data: (Atom SpanData) ended: (Atom bool) start-mono: i64))
+
+;; A live span: its context (ids and flags: what a child or a remote service sees), the recorded state (nil when nothing is recorded) and the
+;; tracer that made it.
+(defstruct Span (context: SpanContext state: (Option SpanState) tracer: Tracer))
+
+(defun span-context-of (s: Span) -> SpanContext (. s context))
+(defun recording? (s: Span) -> bool (some? (. s state)))
+
+;; The context that holds this span: pass it to what the span's work calls.
+(defun span-in-context (c: Context s: Span) -> Context (context-with-span-context c (. s context)))
+
+(defun wall-of :private (p: TracerProvider mono: i64) -> i64 (+ (. p wall0) (- mono (. p mono0))))
+
+(defun parent-of :private (c: Context) -> (Option SpanContext)
+  (match (current-span-context c) ((some sc) (if (span-context-valid? sc) (some sc) nil)) (nil nil)))
+
+(defun begin-state :private (p: TracerProvider tracer: Tracer name: str kind: SpanKind tid: TraceId sid: i64 parent: (Option SpanContext)
+                             flags: i64 ts: str attrs: (Vec (Pair str Datum)) links: (Vec SpanLink)) -> SpanState
+  (let [mono (os/clock-now)]
+    (SpanState (atom (SpanData name kind tid sid (match parent ((some pc) (. pc span-id)) (nil 0))
+                               (match parent ((some pc) (. pc remote)) (nil false)) flags ts (. tracer scope) (wall-of p mono) 0
+                               attrs [] links StatusUnset (. p resource)))
+               (atom false) mono)))
+
+;; Starts a span as a child of the span in `parent` (a root when there is none, or it is not valid).
+(defun start-span-full (tracer: Tracer parent: Context name: str kind: SpanKind attrs: (Vec (Pair str Datum)) links: (Vec SpanLink)) -> Span
+  (let [p (. tracer provider) pc (parent-of parent)]
+    (if (not (. p enabled))
+        (Span (match pc ((some c) c) (nil (invalid-span-context))) nil tracer)
+        (let [tid (match pc ((some c) (. c trace-id)) (nil (new-trace-id (. p ids))))
+              sid (new-span-id (. p ids))
+              decision (should-sample (. p sampler) pc tid name kind)
+              flags (match decision ((SampleRecordAndSample) 1) (_ 0))
+              ts (match pc ((some c) (. c tracestate)) (nil ""))
+              ctx (SpanContext tid sid flags ts false)]
+          (match decision
+            ((SampleDrop) (Span ctx nil tracer))
+            (_ (Span ctx (some (begin-state p tracer name kind tid sid pc flags ts attrs links)) tracer)))))))
+
+(defun start-span-kind (tracer: Tracer parent: Context name: str kind: SpanKind attrs: (Vec (Pair str Datum))) -> Span
+  (start-span-full tracer parent name kind attrs []))
+
+(defun start-span (tracer: Tracer parent: Context name: str attrs: (Vec (Pair str Datum))) -> Span
+  (start-span-full tracer parent name KindInternal attrs []))
+
+(defun update-data :private (s: Span f: (fn (SpanData) SpanData)) -> unit
+  (match (. s state)
+    (nil ())
+    ((some st) (if @(. st ended) () (do (swap! (. st data) f) ())))))
+
+(defun set-attribute! (s: Span k: str v: Datum) -> unit
+  (update-data s (fn (d: SpanData) (with d (attributes (conj (. d attributes) (Pair k v)))))))
+
+(defun set-attributes! (s: Span attrs: (Vec (Pair str Datum))) -> unit
+  (update-data s (fn (d: SpanData) (with d (attributes (into (. d attributes) attrs))))))
+
+(defun set-name! (s: Span name: str) -> unit (update-data s (fn (d: SpanData) (with d (name name)))))
+
+(defun now-ns :private (s: Span) -> i64 (wall-of (. (. s tracer) provider) (os/clock-now)))
+
+(defun add-event! (s: Span name: str attrs: (Vec (Pair str Datum))) -> unit
+  (if (recording? s)
+      (let [t (now-ns s)] (update-data s (fn (d: SpanData) (with d (events (conj (. d events) (SpanEvent name t attrs)))))))
+      ()))
+
+;; Status: Unset can become Ok or Error, Error can become Ok, Ok is final (OpenTelemetry's rule).
+(defun set-status! (s: Span status: SpanStatus) -> unit
+  (update-data s (fn (d: SpanData)
+                   (match (. d status)
+                     ((StatusOk) d)
+                     (_ (match status ((StatusUnset) d) (_ (with d (status status)))))))))
+
+;; An `exception` event (exception.type, exception.message) and the error status.
+(defun record-exception! (s: Span e: (ex/ExInfo (Map keyword Datum))) -> unit
+  (do (add-event! s "exception" [(Pair "exception.type" (DStr (unwrap-or (ex/ex-kind e) "exception"))) (Pair "exception.message" (DStr (ex/ex-message e)))])
+      (set-status! s (StatusError (ex/ex-message e)))))
+
+;; What the span holds now (nil when it is not recording): a copy, for tests and for the logger bridge.
+(defun span-snapshot (s: Span) -> (Option SpanData)
+  (match (. s state) (nil nil) ((some st) (some @(. st data)))))
+
+;; Ends the span: the end time is taken, the span is handed to every processor if it is sampled. Only the first call has an effect.
+(defun end-span! (s: Span) -> unit
+  (match (. s state)
+    (nil ())
+    ((some st)
+     (when (compare-and-set! (. st ended) false true)
+       (let [p (. (. s tracer) provider)
+             d (with @(. st data) (end-ns (wall-of p (os/clock-now))))]
+         (do (reset! (. st data) d)
+             (when (span-sampled? d)
+               (dotimes (i (count (. p processors)))
+                 (ex/try (on-end (nth (. p processors) i) d) (catch e ()))))))))))
+
+;; ---- running a body inside a span
+
+;; Calls `f` with the new span and a context holding it; ends the span after the body, whatever the body does: a trap or a throw is recorded on
+;; the span (status error, an `exception` event) and goes on after the span has ended.
+(defun with-span-kind (tracer: Tracer parent: Context name: str kind: SpanKind attrs: (Vec (Pair str Datum)) f: (fn (Span Context) a)) -> a
+  (let [sp (start-span-full tracer parent name kind attrs []) ctx (span-in-context parent sp)]
+    (ex/try (let [v (f sp ctx)] (do (end-span! sp) v))
+            (catch e (do (record-exception! sp e) (end-span! sp) (ex/throw e))))))
+
+(defun with-span (tracer: Tracer parent: Context name: str attrs: (Vec (Pair str Datum)) f: (fn (Span Context) a)) -> a
+  (with-span-kind tracer parent name KindInternal attrs f))
+
+;; For a body that answers a `Result`: an `Err` sets the error status, with the text `err-text` makes of it; the Result is returned as it was.
+(defun with-span-result (tracer: Tracer parent: Context name: str attrs: (Vec (Pair str Datum)) err-text: (fn (e) str)
+                         f: (fn (Span Context) (Result a e))) -> (Result a e)
+  (with-span tracer parent name attrs
+    (fn (sp: Span ctx: Context)
+      (let [r (f sp ctx)]
+        (do (match r ((Err e) (set-status! sp (StatusError (err-text e)))) ((Ok _) ()))
+            r)))))
+
+;; Runs `f` with the provider and shuts it down afterwards, whatever `f` does (a trap or a throw goes on after the shutdown). Use it in main:
+;; a batch processor's worker is a task, and the runtime waits for tasks when main returns, so a provider that is never shut down keeps the
+;; program from ending.
+(defun with-provider (p: TracerProvider f: (fn (TracerProvider) a)) -> a
+  (ex/try (let [v (f p)] (do (shutdown-provider p) v))
+          (catch e (do (shutdown-provider p) (ex/throw e)))))
