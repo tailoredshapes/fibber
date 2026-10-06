@@ -1,11 +1,11 @@
 ;; Fused optimiser steps for f32 and f64 tensors: one pass over the parameter, its gradient and its state, eight (f32) or four (f64) lanes at a time, no temporary tensor.
 ;;
-;; adam-step! lr b1 b2 eps bc1 bc2 p g m v  ->  [p' m' v']      (PyTorch's Adam, no amsgrad, no weight decay; bc1 = 1 - b1^t and bc2 = 1 - b2^t for step t, given by the caller)
+;; adam-step lr b1 b2 eps bc1 bc2 p g m v  ->  [p' m' v']      (PyTorch's Adam, no amsgrad, no weight decay; bc1 = 1 - b1^t and bc2 = 1 - b2^t for step t, given by the caller)
 ;;     m' = b1 m + (1 - b1) g
 ;;     v' = b2 v + (1 - b2) (g g)
 ;;     denom = sqrt(v') (1 / sqrt(bc2)) + eps          eps is added AFTER the square root and the bias correction (PyTorch: sqrt(v)/sqrt(bc2) + eps)
 ;;     p' = p + (-(lr / bc1)) (m' / denom)
-;; sgd-momentum-step! lr mu p g buf  ->  [p' buf']              (PyTorch's SGD with momentum, no dampening, no Nesterov, no weight decay; buf = 0 at the first step gives buf' = g)
+;; sgd-momentum-step lr mu p g buf  ->  [p' buf']               (PyTorch's SGD with momentum, no dampening, no Nesterov, no weight decay; buf = 0 at the first step gives buf' = g)
 ;;     buf' = mu buf + g          p' = p + (-lr) buf'
 ;;
 ;; Rounding contract: the operations and their order are exactly those of the composition of fib.tensor calls
@@ -14,125 +14,127 @@
 ;; with the scalar `1/sqrt(bc2)` taken as a reciprocal multiply it differs from PyTorch's `sqrt(v) / sqrt(bc2)` by at most one rounding in the denominator (case 7743 compares
 ;; with PyTorch 2.14's values on a fixed example). The scalars are computed in f64 and rounded to the element type.
 ;;
-;; Memory. The result tensors are the buffers of p, m and v written through the unique-write protocol: when the caller's tensor holds the only count of its buffer
-;; the update is in place, and otherwise (another holder, a view, a tape) the buffer is copied once and the other holders keep the old values. A tensor that is not dense is made
-;; contiguous first (a copy). g is only read. All four tensors must have the same shape (no broadcasting). Elements past the last whole vector run the scalar formulas.
+;; Memory. The results are fresh buffers, written once each (an uninitialised array: the kernel stores every element, whole vectors and the scalar tail alike). The inputs are only
+;; read, so another holder of p, m, v or g (a tape, a caller's variable, a Vec) never sees a change, and no input buffer is copied first (the unique-write protocol would copy a
+;; shared buffer before overwriting all of it). A tensor that is not dense is made contiguous first (a copy); all tensors must have the same shape (no broadcasting). The functions
+;; do not update in place: probes that moved a unique tensor's buffer into a cell still found it shared (docs/shootout/tensor.md 10.4), so no in-place variant is offered.
 (ns fib.tensor.optim
   (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.views))
-
-;; the buffer of a tensor, moved out of it when the tensor is dead after the call
-(defun take-buffer :private (x: (Tensor t)) :where ((Element t)) -> (Array t) (. x buffer))
 
 (defun same-shape :private (a: (Tensor t) b: (Tensor t)) :where ((Element t)) -> unit
   (when (!= (shape a) (shape b)) (trap "tensor: optimiser step needs tensors of one shape")))
 
 ;; ---- f32 (8 lanes)
+(defun fresh-f32 :private (n: i64) -> (Array f32) (if (= n 0) (array 0 0.0f32) (unsafe (array-uninit-f32 n))))
+
 (defun adam-f32 :private (n: i64 b1: f32 omb1: f32 b2: f32 omb2: f32 rs: f32 eps: f32 nlr: f32
-                          &p: (Array f32) po: i64 g: (Array f32) go: i64 &m: (Array f32) mo: i64 &v: (Array f32) vo: i64) -> unit
+                          p: (Array f32) po: i64 g: (Array f32) go: i64 m: (Array f32) mo: i64 v: (Array f32) vo: i64
+                          &pn: (Array f32) &mn: (Array f32) &vn: (Array f32)) -> unit
   (let ((end (- n (rem n 8))) (b1v (splat f32x8 b1)) (omb1v (splat f32x8 omb1)) (b2v (splat f32x8 b2)) (omb2v (splat f32x8 omb2))
         (rsv (splat f32x8 rs)) (epsv (splat f32x8 eps)) (nlrv (splat f32x8 nlr)))
     (do (loop ((i 0))
           (when (< i end)
-            (let ((gv: f32x8 (simd-load g (+ go i))) (mv: f32x8 (simd-load @m (+ mo i))) (vv: f32x8 (simd-load @v (+ vo i))) (pv: f32x8 (simd-load @p (+ po i)))
+            (let ((gv: f32x8 (simd-load g (+ go i))) (mv: f32x8 (simd-load m (+ mo i))) (vv: f32x8 (simd-load v (+ vo i))) (pv: f32x8 (simd-load p (+ po i)))
                   (m2: f32x8 (+ (* b1v mv) (* omb1v gv)))
                   (v2: f32x8 (+ (* b2v vv) (* omb2v (* gv gv))))
                   (den: f32x8 (+ (* (simd/sqrt v2) rsv) epsv))
                   (p2: f32x8 (+ pv (* nlrv (fdiv m2 den)))))
-              (do (simd-store! &m (+ mo i) m2) (simd-store! &v (+ vo i) v2) (simd-store! &p (+ po i) p2) (recur (+ i 8))))))
+              (do (simd-store! &mn i m2) (simd-store! &vn i v2) (simd-store! &pn i p2) (recur (+ i 8))))))
         (loop ((i end))
           (when (< i n)
-            (let ((gx (array-get g (+ go i))) (mx (array-get @m (+ mo i))) (vx (array-get @v (+ vo i))) (px (array-get @p (+ po i)))
+            (let ((gx (array-get g (+ go i))) (mx (array-get m (+ mo i))) (vx (array-get v (+ vo i))) (px (array-get p (+ po i)))
                   (m2 (+ (* b1 mx) (* omb1 gx)))
                   (v2 (+ (* b2 vx) (* omb2 (* gx gx))))
                   (den (+ (* (simd/sqrt v2) rs) eps)))
-              (do (array-set! &m (+ mo i) m2) (array-set! &v (+ vo i) v2)
-                  (array-set! &p (+ po i) (+ px (* nlr (fdiv m2 den))))
+              (do (array-set! &mn i m2) (array-set! &vn i v2)
+                  (array-set! &pn i (+ px (* nlr (fdiv m2 den))))
                   (recur (+ i 1)))))))))
 
-(defun momentum-f32 :private (n: i64 mu: f32 nlr: f32 &p: (Array f32) po: i64 g: (Array f32) go: i64 &b: (Array f32) bo: i64) -> unit
+(defun momentum-f32 :private (n: i64 mu: f32 nlr: f32 p: (Array f32) po: i64 g: (Array f32) go: i64 b: (Array f32) bo: i64 &pn: (Array f32) &bn: (Array f32)) -> unit
   (let ((end (- n (rem n 8))) (muv (splat f32x8 mu)) (nlrv (splat f32x8 nlr)))
     (do (loop ((i 0))
           (when (< i end)
-            (let ((gv: f32x8 (simd-load g (+ go i))) (bv: f32x8 (simd-load @b (+ bo i))) (pv: f32x8 (simd-load @p (+ po i)))
+            (let ((gv: f32x8 (simd-load g (+ go i))) (bv: f32x8 (simd-load b (+ bo i))) (pv: f32x8 (simd-load p (+ po i)))
                   (b2: f32x8 (+ (* muv bv) gv)))
-              (do (simd-store! &b (+ bo i) b2) (simd-store! &p (+ po i) (+ pv (* nlrv b2))) (recur (+ i 8))))))
+              (do (simd-store! &bn i b2) (simd-store! &pn i (+ pv (* nlrv b2))) (recur (+ i 8))))))
         (loop ((i end))
           (when (< i n)
-            (let ((b2 (+ (* mu (array-get @b (+ bo i))) (array-get g (+ go i)))))
-              (do (array-set! &b (+ bo i) b2) (array-set! &p (+ po i) (+ (array-get @p (+ po i)) (* nlr b2))) (recur (+ i 1)))))))))
+            (let ((b2 (+ (* mu (array-get b (+ bo i))) (array-get g (+ go i)))))
+              (do (array-set! &bn i b2) (array-set! &pn i (+ (array-get p (+ po i)) (* nlr b2))) (recur (+ i 1)))))))))
 
 (defun adam-tensors-f32 :private (lr: f64 b1: f64 b2: f64 eps: f64 bc1: f64 bc2: f64 p: (Tensor f32) g: (Tensor f32) m: (Tensor f32) v: (Tensor f32)) -> (Vec (Tensor f32))
   (do (same-shape p g) (same-shape p m) (same-shape p v)
-      (let ((pd (contiguous p)) (gd (contiguous g)) (md (contiguous m)) (vd (contiguous v)) (n (fib.tensor.storage/size p)) (dims (shape p))
-            (po (array-get (. pd meta) 0)) (go (array-get (. gd meta) 0)) (mo (array-get (. md meta) 0)) (vo (array-get (. vd meta) 0))
-            (ps (strides pd)) (ms (strides md)) (vs (strides vd))
-            (pb (cell (take-buffer pd))) (mb (cell (take-buffer md))) (vb (cell (take-buffer vd))))
+      (let ((pd (contiguous p)) (gd (contiguous g)) (md (contiguous m)) (vd (contiguous v)) (n (checked-size (shape p) 0.0f32)) (dims (shape p))
+            (pn (cell (fresh-f32 n))) (mn (cell (fresh-f32 n))) (vn (cell (fresh-f32 n))))
         (do (when (> n 0)
               (adam-f32 n (fptrunc f32 b1) (fptrunc f32 (- 1.0 b1)) (fptrunc f32 b2) (fptrunc f32 (- 1.0 b2)) (fptrunc f32 (/ 1.0 (simd/sqrt bc2))) (fptrunc f32 eps) (fptrunc f32 (- 0.0 (/ lr bc1)))
-                        &pb po (. gd buffer) go &mb mo &vb vo))
-            [(from-parts @pb po dims ps 0.0f32) (from-parts @mb mo dims ms 0.0f32) (from-parts @vb vo dims vs 0.0f32)]))))
+                        (. pd buffer) (array-get (. pd meta) 0) (. gd buffer) (array-get (. gd meta) 0) (. md buffer) (array-get (. md meta) 0) (. vd buffer) (array-get (. vd meta) 0)
+                        &pn &mn &vn))
+            [(from-array dims @pn 0.0f32) (from-array dims @mn 0.0f32) (from-array dims @vn 0.0f32)]))))
 
 (defun momentum-tensors-f32 :private (lr: f64 mu: f64 p: (Tensor f32) g: (Tensor f32) b: (Tensor f32)) -> (Vec (Tensor f32))
   (do (same-shape p g) (same-shape p b)
-      (let ((pd (contiguous p)) (gd (contiguous g)) (bd (contiguous b)) (n (fib.tensor.storage/size p)) (dims (shape p))
-            (po (array-get (. pd meta) 0)) (go (array-get (. gd meta) 0)) (bo (array-get (. bd meta) 0)) (ps (strides pd)) (bs (strides bd))
-            (pb (cell (take-buffer pd))) (bb (cell (take-buffer bd))))
-        (do (when (> n 0) (momentum-f32 n (fptrunc f32 mu) (fptrunc f32 (- 0.0 lr)) &pb po (. gd buffer) go &bb bo))
-            [(from-parts @pb po dims ps 0.0f32) (from-parts @bb bo dims bs 0.0f32)]))))
+      (let ((pd (contiguous p)) (gd (contiguous g)) (bd (contiguous b)) (n (checked-size (shape p) 0.0f32)) (dims (shape p))
+            (pn (cell (fresh-f32 n))) (bn (cell (fresh-f32 n))))
+        (do (when (> n 0)
+              (momentum-f32 n (fptrunc f32 mu) (fptrunc f32 (- 0.0 lr)) (. pd buffer) (array-get (. pd meta) 0) (. gd buffer) (array-get (. gd meta) 0) (. bd buffer) (array-get (. bd meta) 0) &pn &bn))
+            [(from-array dims @pn 0.0f32) (from-array dims @bn 0.0f32)]))))
 
 ;; ---- f64 (4 lanes)
+(defun fresh-f64 :private (n: i64) -> (Array f64) (if (= n 0) (array 0 0.0) (unsafe (array-uninit-f64 n))))
+
 (defun adam-f64 :private (n: i64 b1: f64 omb1: f64 b2: f64 omb2: f64 rs: f64 eps: f64 nlr: f64
-                          &p: (Array f64) po: i64 g: (Array f64) go: i64 &m: (Array f64) mo: i64 &v: (Array f64) vo: i64) -> unit
+                          p: (Array f64) po: i64 g: (Array f64) go: i64 m: (Array f64) mo: i64 v: (Array f64) vo: i64
+                          &pn: (Array f64) &mn: (Array f64) &vn: (Array f64)) -> unit
   (let ((end (- n (rem n 4))) (b1v (splat f64x4 b1)) (omb1v (splat f64x4 omb1)) (b2v (splat f64x4 b2)) (omb2v (splat f64x4 omb2))
         (rsv (splat f64x4 rs)) (epsv (splat f64x4 eps)) (nlrv (splat f64x4 nlr)))
     (do (loop ((i 0))
           (when (< i end)
-            (let ((gv: f64x4 (simd-load g (+ go i))) (mv: f64x4 (simd-load @m (+ mo i))) (vv: f64x4 (simd-load @v (+ vo i))) (pv: f64x4 (simd-load @p (+ po i)))
+            (let ((gv: f64x4 (simd-load g (+ go i))) (mv: f64x4 (simd-load m (+ mo i))) (vv: f64x4 (simd-load v (+ vo i))) (pv: f64x4 (simd-load p (+ po i)))
                   (m2: f64x4 (+ (* b1v mv) (* omb1v gv)))
                   (v2: f64x4 (+ (* b2v vv) (* omb2v (* gv gv))))
                   (den: f64x4 (+ (* (simd/sqrt v2) rsv) epsv))
                   (p2: f64x4 (+ pv (* nlrv (fdiv m2 den)))))
-              (do (simd-store! &m (+ mo i) m2) (simd-store! &v (+ vo i) v2) (simd-store! &p (+ po i) p2) (recur (+ i 4))))))
+              (do (simd-store! &mn i m2) (simd-store! &vn i v2) (simd-store! &pn i p2) (recur (+ i 4))))))
         (loop ((i end))
           (when (< i n)
-            (let ((gx (array-get g (+ go i))) (mx (array-get @m (+ mo i))) (vx (array-get @v (+ vo i))) (px (array-get @p (+ po i)))
+            (let ((gx (array-get g (+ go i))) (mx (array-get m (+ mo i))) (vx (array-get v (+ vo i))) (px (array-get p (+ po i)))
                   (m2 (+ (* b1 mx) (* omb1 gx)))
                   (v2 (+ (* b2 vx) (* omb2 (* gx gx))))
                   (den (+ (* (simd/sqrt v2) rs) eps)))
-              (do (array-set! &m (+ mo i) m2) (array-set! &v (+ vo i) v2)
-                  (array-set! &p (+ po i) (+ px (* nlr (fdiv m2 den))))
+              (do (array-set! &mn i m2) (array-set! &vn i v2)
+                  (array-set! &pn i (+ px (* nlr (fdiv m2 den))))
                   (recur (+ i 1)))))))))
 
-(defun momentum-f64 :private (n: i64 mu: f64 nlr: f64 &p: (Array f64) po: i64 g: (Array f64) go: i64 &b: (Array f64) bo: i64) -> unit
+(defun momentum-f64 :private (n: i64 mu: f64 nlr: f64 p: (Array f64) po: i64 g: (Array f64) go: i64 b: (Array f64) bo: i64 &pn: (Array f64) &bn: (Array f64)) -> unit
   (let ((end (- n (rem n 4))) (muv (splat f64x4 mu)) (nlrv (splat f64x4 nlr)))
     (do (loop ((i 0))
           (when (< i end)
-            (let ((gv: f64x4 (simd-load g (+ go i))) (bv: f64x4 (simd-load @b (+ bo i))) (pv: f64x4 (simd-load @p (+ po i)))
+            (let ((gv: f64x4 (simd-load g (+ go i))) (bv: f64x4 (simd-load b (+ bo i))) (pv: f64x4 (simd-load p (+ po i)))
                   (b2: f64x4 (+ (* muv bv) gv)))
-              (do (simd-store! &b (+ bo i) b2) (simd-store! &p (+ po i) (+ pv (* nlrv b2))) (recur (+ i 4))))))
+              (do (simd-store! &bn i b2) (simd-store! &pn i (+ pv (* nlrv b2))) (recur (+ i 4))))))
         (loop ((i end))
           (when (< i n)
-            (let ((b2 (+ (* mu (array-get @b (+ bo i))) (array-get g (+ go i)))))
-              (do (array-set! &b (+ bo i) b2) (array-set! &p (+ po i) (+ (array-get @p (+ po i)) (* nlr b2))) (recur (+ i 1)))))))))
+            (let ((b2 (+ (* mu (array-get b (+ bo i))) (array-get g (+ go i)))))
+              (do (array-set! &bn i b2) (array-set! &pn i (+ (array-get p (+ po i)) (* nlr b2))) (recur (+ i 1)))))))))
 
 (defun adam-tensors-f64 :private (lr: f64 b1: f64 b2: f64 eps: f64 bc1: f64 bc2: f64 p: (Tensor f64) g: (Tensor f64) m: (Tensor f64) v: (Tensor f64)) -> (Vec (Tensor f64))
   (do (same-shape p g) (same-shape p m) (same-shape p v)
-      (let ((pd (contiguous p)) (gd (contiguous g)) (md (contiguous m)) (vd (contiguous v)) (n (fib.tensor.storage/size p)) (dims (shape p))
-            (po (array-get (. pd meta) 0)) (go (array-get (. gd meta) 0)) (mo (array-get (. md meta) 0)) (vo (array-get (. vd meta) 0))
-            (ps (strides pd)) (ms (strides md)) (vs (strides vd))
-            (pb (cell (take-buffer pd))) (mb (cell (take-buffer md))) (vb (cell (take-buffer vd))))
+      (let ((pd (contiguous p)) (gd (contiguous g)) (md (contiguous m)) (vd (contiguous v)) (n (checked-size (shape p) 0.0)) (dims (shape p))
+            (pn (cell (fresh-f64 n))) (mn (cell (fresh-f64 n))) (vn (cell (fresh-f64 n))))
         (do (when (> n 0)
               (adam-f64 n (double b1) (double (- 1.0 b1)) (double b2) (double (- 1.0 b2)) (double (/ 1.0 (simd/sqrt bc2))) (double eps) (double (- 0.0 (/ lr bc1)))
-                        &pb po (. gd buffer) go &mb mo &vb vo))
-            [(from-parts @pb po dims ps 0.0) (from-parts @mb mo dims ms 0.0) (from-parts @vb vo dims vs 0.0)]))))
+                        (. pd buffer) (array-get (. pd meta) 0) (. gd buffer) (array-get (. gd meta) 0) (. md buffer) (array-get (. md meta) 0) (. vd buffer) (array-get (. vd meta) 0)
+                        &pn &mn &vn))
+            [(from-array dims @pn 0.0) (from-array dims @mn 0.0) (from-array dims @vn 0.0)]))))
 
 (defun momentum-tensors-f64 :private (lr: f64 mu: f64 p: (Tensor f64) g: (Tensor f64) b: (Tensor f64)) -> (Vec (Tensor f64))
   (do (same-shape p g) (same-shape p b)
-      (let ((pd (contiguous p)) (gd (contiguous g)) (bd (contiguous b)) (n (fib.tensor.storage/size p)) (dims (shape p))
-            (po (array-get (. pd meta) 0)) (go (array-get (. gd meta) 0)) (bo (array-get (. bd meta) 0)) (ps (strides pd)) (bs (strides bd))
-            (pb (cell (take-buffer pd))) (bb (cell (take-buffer bd))))
-        (do (when (> n 0) (momentum-f64 n (double mu) (double (- 0.0 lr)) &pb po (. gd buffer) go &bb bo))
-            [(from-parts @pb po dims ps 0.0) (from-parts @bb bo dims bs 0.0)]))))
+      (let ((pd (contiguous p)) (gd (contiguous g)) (bd (contiguous b)) (n (checked-size (shape p) 0.0)) (dims (shape p))
+            (pn (cell (fresh-f64 n))) (bn (cell (fresh-f64 n))))
+        (do (when (> n 0)
+              (momentum-f64 n (double mu) (double (- 0.0 lr)) (. pd buffer) (array-get (. pd meta) 0) (. gd buffer) (array-get (. gd meta) 0) (. bd buffer) (array-get (. bd meta) 0) &pn &bn))
+            [(from-array dims @pn 0.0) (from-array dims @bn 0.0)]))))
 
 (defprotocol Optimiser
   (adam-impl (self lr: f64 b1: f64 b2: f64 eps: f64 bc1: f64 bc2: f64 p: (Tensor Self) g: (Tensor Self) m: (Tensor Self) v: (Tensor Self)) -> (Vec (Tensor Self)))
@@ -144,9 +146,9 @@
   (adam-impl (self lr b1 b2 eps bc1 bc2 p g m v) (adam-tensors-f64 lr b1 b2 eps bc1 bc2 p g m v))
   (momentum-impl (self lr mu p g b) (momentum-tensors-f64 lr mu p g b)))
 
-(defun adam-step! (lr: f64 b1: f64 b2: f64 eps: f64 bc1: f64 bc2: f64 p: (Tensor t) g: (Tensor t) m: (Tensor t) v: (Tensor t))
+(defun adam-step (lr: f64 b1: f64 b2: f64 eps: f64 bc1: f64 bc2: f64 p: (Tensor t) g: (Tensor t) m: (Tensor t) v: (Tensor t))
   :where ((Element t) (Optimiser t)) -> (Vec (Tensor t))
   (adam-impl (. p seed) lr b1 b2 eps bc1 bc2 p g m v))
 
-(defun sgd-momentum-step! (lr: f64 mu: f64 p: (Tensor t) g: (Tensor t) b: (Tensor t)) :where ((Element t) (Optimiser t)) -> (Vec (Tensor t))
+(defun sgd-momentum-step (lr: f64 mu: f64 p: (Tensor t) g: (Tensor t) b: (Tensor t)) :where ((Element t) (Optimiser t)) -> (Vec (Tensor t))
   (momentum-impl (. p seed) lr mu p g b))

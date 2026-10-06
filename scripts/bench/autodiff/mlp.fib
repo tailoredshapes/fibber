@@ -40,7 +40,7 @@
     (ad/softmax-cross-entropy o labels)))
 
 ;; ---- the same step written out: forward, loss, backward with fib.tensor calls only (the same kernels as fib.autodiff's backward: the relu mask
-;; as relu(h/h), the bias gradient as a product with a row of ones), so the difference between the two modes is the tape
+;; as relu-grad, the bias gradient as sum-axis 0; before 2026-10-06 the workarounds relu(h/h) and a product with a row of ones), so the difference between the two modes is the tape
 (defun onehot (labels: (Vec i64)) -> (t/Tensor f32)
   (let [buf (cell (array (* batch classes) 0.0f32))]
     (do (dotimes (i batch) (array-set! &buf (+ (* i classes) (nth labels i)) 1.0f32))
@@ -56,10 +56,9 @@
         p (t/softmax o) loss (hand-loss p labels)
         dz2 (t/scale (/ 1.0f32 128.0f32) (t/sub p (onehot labels)))
         dh (t/mmul dz2 (t/transpose w2))
-        dz1 (t/mul dh (t/relu (t/div h h)))
-        ones (t/full [1 128] 1.0f32)]
+        dz1 (t/relu-grad dh h)]
     (ad/ValueGrad (t/full [] loss)
-                  [(t/mmul (t/transpose xb) dz1) (t/reshape [256] (t/mmul ones dz1)) (t/mmul (t/transpose h) dz2) (t/reshape [10] (t/mmul ones dz2))])))
+                  [(t/mmul (t/transpose xb) dz1) (t/sum-axis 0 false dz1) (t/mmul (t/transpose h) dz2) (t/sum-axis 0 false dz2)])))
 
 (defun do-step (tape: bool ps: (Vec (t/Tensor f32)) xb: (t/Tensor f32) labels: (Vec i64)) -> (ad/ValueGrad f32)
   (if tape

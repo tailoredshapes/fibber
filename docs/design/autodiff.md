@@ -482,3 +482,5 @@ thousands of tiny ops (scalar autodiff) pays about 1 us per op (2.1); that is no
 autodiff work. (2) Whether `fib.autodiff` joins the `fib.tensor` facade or stays explicit. (3) The macro-time module (open since the flip of stdlib tranche 1): including the implicit
 library would reopen option (b). (4) Whether the next investment is the lIR pass (2.3) or A2 and A3 (a usable `fib.nn`): the recommendation is A2/A3 first, since users need layers
 before they need a compiler pass.
+
+**Update 2026-10-06.** Decision 1 and risk 3 are closed in `fib.tensor` (vector `where`/`greater`/`relu-grad`, `sum-axis` lane kernels, vector `sqrt`, fused `adam-step`): `fib.autodiff` no longer has the `relu(y/y)` mask, the product-with-ones bias gradient or the scalar-map `sqrt`; the Adam step is 1.220 ms (was 1.649) and level with PyTorch in the run of `docs/shootout/autodiff.md` section 8. In-place optimiser updates (section 5.4) were probed and not achieved: a tensor held by a `Vec` or reached through its struct field keeps its buffer shared.

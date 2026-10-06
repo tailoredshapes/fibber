@@ -1,4 +1,4 @@
-;; spec: lib/fib/tensor/optim.fib (header) and README.md (Fused optimiser steps): adam-step! and sgd-momentum-step! are bit-identical to the composition of fib.tensor calls with the same operation order, agree with PyTorch 2.14 on a fixed example, and never write into a buffer another holder still sees
+;; spec: lib/fib/tensor/optim.fib (header) and README.md (Fused optimiser steps): adam-step and sgd-momentum-step are bit-identical to the composition of fib.tensor calls with the same operation order, agree with PyTorch 2.14 on a fixed example, and never write into a buffer another holder still sees
 ;; expect: accept
 ;; result: 0
 ;; audit: clean
@@ -47,14 +47,14 @@
     (if (<= s 3)
         (let ((bc1 (- 1.0 (ipow 0.9 s))) (bc2 (- 1.0 (ipow 0.999 s)))
               (ga (t/scale (cv-f32 (double s)) g0))
-              (ra (t/adam-step! 0.01 0.9 0.999 1.0e-8 bc1 bc2 (nth a 0) (t/scale (cv-f32 (double s)) g0) (nth a 1) (nth a 2)))
+              (ra (t/adam-step 0.01 0.9 0.999 1.0e-8 bc1 bc2 (nth a 0) (t/scale (cv-f32 (double s)) g0) (nth a 1) (nth a 2)))
               (rb (comp-adam-f32 0.01 0.9 0.999 1.0e-8 bc1 bc2 (nth b 0) ga (nth b 1) (nth b 2))))
           (recur (+ s 1) ra rb (and ok (same-f32 ra rb))))
         ok)))
 (defun chain-mom-f32 (p0: (t/Tensor f32) g0: (t/Tensor f32) b0: (t/Tensor f32)) -> bool
   (loop ((s 1) (a [p0 b0]) (b [p0 b0]) (ok true))
     (if (<= s 3)
-        (let ((ga (t/scale (cv-f32 (double s)) g0)) (ra (t/sgd-momentum-step! 0.1 0.9 (nth a 0) (t/scale (cv-f32 (double s)) g0) (nth a 1)))
+        (let ((ga (t/scale (cv-f32 (double s)) g0)) (ra (t/sgd-momentum-step 0.1 0.9 (nth a 0) (t/scale (cv-f32 (double s)) g0) (nth a 1)))
               (rb (comp-mom-f32 0.1 0.9 (nth b 0) ga (nth b 1))))
           (recur (+ s 1) ra rb (and ok (same-f32 ra rb))))
         ok)))
@@ -70,15 +70,15 @@
                          (t/transpose (t/reshape [5 13] (gen-f32 65 3 false))) (t/transpose (t/reshape [5 13] (gen-f32 65 4 true)))))
       (check c (chain-mom-f32 (t/slice 0 3 40 1 (gen-f32 50 1 false)) (t/slice 0 5 42 1 (gen-f32 50 2 false)) (t/slice 0 7 44 1 (gen-f32 50 3 false))))
       ;; the result shapes are the inputs'
-      (check c (= (t/shape (nth (t/adam-step! 0.01 0.9 0.999 1.0e-8 0.1 0.001 (t/reshape [5 13] (gen-f32 65 1 false)) (t/reshape [5 13] (gen-f32 65 2 false))
+      (check c (= (t/shape (nth (t/adam-step 0.01 0.9 0.999 1.0e-8 0.1 0.001 (t/reshape [5 13] (gen-f32 65 1 false)) (t/reshape [5 13] (gen-f32 65 2 false))
                                               (t/reshape [5 13] (gen-f32 65 3 false)) (t/reshape [5 13] (gen-f32 65 4 true))) 0)) [5 13]))
       ;; a second holder of p, m, v and g keeps its values: the step never writes into a shared buffer
       (let ((p (gen-f32 33 1 false)) (g (gen-f32 33 2 false)) (m (gen-f32 33 3 false)) (v (gen-f32 33 4 true)))
-        (let ((p-before (bits-f32 p)) (m-before (bits-f32 m)) (v-before (bits-f32 v)) (g-before (bits-f32 g)) (r (t/adam-step! 0.01 0.9 0.999 1.0e-8 0.1 0.001 p g m v)))
+        (let ((p-before (bits-f32 p)) (m-before (bits-f32 m)) (v-before (bits-f32 v)) (g-before (bits-f32 g)) (r (t/adam-step 0.01 0.9 0.999 1.0e-8 0.1 0.001 p g m v)))
           (do (check c (= (bits-f32 p) p-before)) (check c (= (bits-f32 m) m-before)) (check c (= (bits-f32 v) v-before)) (check c (= (bits-f32 g) g-before))
               (check c (!= (bits-f32 (nth r 0)) p-before)))))
       (let ((p (gen-f32 33 1 false)) (g (gen-f32 33 2 false)) (b (gen-f32 33 3 false)))
-        (let ((p-before (bits-f32 p)) (b-before (bits-f32 b)) (r (t/sgd-momentum-step! 0.1 0.9 p g b)))
+        (let ((p-before (bits-f32 p)) (b-before (bits-f32 b)) (r (t/sgd-momentum-step 0.1 0.9 p g b)))
           (do (check c (= (bits-f32 p) p-before)) (check c (= (bits-f32 b) b-before)) (check c (!= (bits-f32 (nth r 0)) p-before)))))))
 
 ;; PyTorch: three Adam steps on ten parameters
@@ -87,17 +87,17 @@
         (g1 (arr-f32 [0.1 -0.2 0.3 -0.4 1.0e-5 50.0 -0.05 0.0 0.7 -1.5])) (g2 (arr-f32 [0.05 0.1 -0.3 0.2 2.0e-5 -40.0 0.07 0.01 -0.2 1.0]))
         (g3 (arr-f32 [-0.2 0.15 0.05 0.1 -1.0e-5 30.0 0.02 -0.01 0.9 0.5])))
     (let ((z (t/zeros-f32 [10])))
-      (let ((r1 (t/adam-step! 0.01 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 1)) (- 1.0 (ipow 0.999 1)) p (t/from-array [10] g1 0.0f32) z z)))
-        (let ((r2 (t/adam-step! 0.01 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 2)) (- 1.0 (ipow 0.999 2)) (nth r1 0) (t/from-array [10] g2 0.0f32) (nth r1 1) (nth r1 2))))
-          (let ((r3 (t/adam-step! 0.01 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 3)) (- 1.0 (ipow 0.999 3)) (nth r2 0) (t/from-array [10] g3 0.0f32) (nth r2 1) (nth r2 2))))
+      (let ((r1 (t/adam-step 0.01 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 1)) (- 1.0 (ipow 0.999 1)) p (t/from-array [10] g1 0.0f32) z z)))
+        (let ((r2 (t/adam-step 0.01 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 2)) (- 1.0 (ipow 0.999 2)) (nth r1 0) (t/from-array [10] g2 0.0f32) (nth r1 1) (nth r1 2))))
+          (let ((r3 (t/adam-step 0.01 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 3)) (- 1.0 (ipow 0.999 3)) (nth r2 0) (t/from-array [10] g3 0.0f32) (nth r2 1) (nth r2 2))))
             (do (check c (vclose (vals-f32 (nth r3 0)) [0.9827417731285095 -1.989188313484192 0.49018213152885437 3.013277292251587 -0.022833656519651413 99.98629760742188 -0.2452390044927597 -0.006989536806941032 2.4784975051879883 -6.989186763763428] tol))
                 (check c (vclose (vals-f32 (nth r3 1)) [-0.007400000002235174 0.007800000719726086 0.0022999995853751898 -0.004399999976158142 1.610000026630587e-06 3.450000047683716 0.004249999765306711 -9.999996109399945e-05 0.12870000302791595 0.01849999651312828] tol))
                 (check c (vclose (vals-f32 (nth r3 2)) [5.2477513236226514e-05 7.24100464140065e-05 0.00018223011284135282 0.00020964017312508076 5.994000868564386e-13 4.993402481079102 7.790103154547978e-06 1.999000005525886e-07 0.0013389805098995566 0.00349450227804482] tol)))))))))
 (defun torch-mom-f32 (c: Checks tol: f64) -> unit
   (let ((p (t/from-array [4] (arr-f32 [1.0 -2.0 0.5 3.0]) 0.0f32)) (z (t/zeros-f32 [4])))
-    (let ((r1 (t/sgd-momentum-step! 0.1 0.9 p (t/from-array [4] (arr-f32 [0.1 -0.2 0.3 -0.4]) 0.0f32) z)))
-      (let ((r2 (t/sgd-momentum-step! 0.1 0.9 (nth r1 0) (t/from-array [4] (arr-f32 [0.05 0.1 -0.3 0.2]) 0.0f32) (nth r1 1))))
-        (let ((r3 (t/sgd-momentum-step! 0.1 0.9 (nth r2 0) (t/from-array [4] (arr-f32 [-0.2 0.15 0.05 0.1]) 0.0f32) (nth r2 1))))
+    (let ((r1 (t/sgd-momentum-step 0.1 0.9 p (t/from-array [4] (arr-f32 [0.1 -0.2 0.3 -0.4]) 0.0f32) z)))
+      (let ((r2 (t/sgd-momentum-step 0.1 0.9 (nth r1 0) (t/from-array [4] (arr-f32 [0.05 0.1 -0.3 0.2]) 0.0f32) (nth r1 1))))
+        (let ((r3 (t/sgd-momentum-step 0.1 0.9 (nth r2 0) (t/from-array [4] (arr-f32 [-0.2 0.15 0.05 0.1]) 0.0f32) (nth r2 1))))
           (do (check c (vclose (vals-f32 (nth r3 0)) [0.9833999872207642 -1.9797999858856201 0.4706999957561493 3.0604000091552734] tol))
               (check c (vclose (vals-f32 (nth r3 1)) [-0.07400000095367432 0.0780000165104866 0.023000000044703484 -0.04399997740983963] tol))))))))
 (defun arr-f32 (v: (Vec f64)) -> (Array f32)
@@ -135,14 +135,14 @@
     (if (<= s 3)
         (let ((bc1 (- 1.0 (ipow 0.9 s))) (bc2 (- 1.0 (ipow 0.999 s)))
               (ga (t/scale (cv-f64 (double s)) g0))
-              (ra (t/adam-step! 0.01 0.9 0.999 1.0e-8 bc1 bc2 (nth a 0) (t/scale (cv-f64 (double s)) g0) (nth a 1) (nth a 2)))
+              (ra (t/adam-step 0.01 0.9 0.999 1.0e-8 bc1 bc2 (nth a 0) (t/scale (cv-f64 (double s)) g0) (nth a 1) (nth a 2)))
               (rb (comp-adam-f64 0.01 0.9 0.999 1.0e-8 bc1 bc2 (nth b 0) ga (nth b 1) (nth b 2))))
           (recur (+ s 1) ra rb (and ok (same-f64 ra rb))))
         ok)))
 (defun chain-mom-f64 (p0: (t/Tensor f64) g0: (t/Tensor f64) b0: (t/Tensor f64)) -> bool
   (loop ((s 1) (a [p0 b0]) (b [p0 b0]) (ok true))
     (if (<= s 3)
-        (let ((ga (t/scale (cv-f64 (double s)) g0)) (ra (t/sgd-momentum-step! 0.1 0.9 (nth a 0) (t/scale (cv-f64 (double s)) g0) (nth a 1)))
+        (let ((ga (t/scale (cv-f64 (double s)) g0)) (ra (t/sgd-momentum-step 0.1 0.9 (nth a 0) (t/scale (cv-f64 (double s)) g0) (nth a 1)))
               (rb (comp-mom-f64 0.1 0.9 (nth b 0) ga (nth b 1))))
           (recur (+ s 1) ra rb (and ok (same-f64 ra rb))))
         ok)))
@@ -158,15 +158,15 @@
                          (t/transpose (t/reshape [5 13] (gen-f64 65 3 false))) (t/transpose (t/reshape [5 13] (gen-f64 65 4 true)))))
       (check c (chain-mom-f64 (t/slice 0 3 40 1 (gen-f64 50 1 false)) (t/slice 0 5 42 1 (gen-f64 50 2 false)) (t/slice 0 7 44 1 (gen-f64 50 3 false))))
       ;; the result shapes are the inputs'
-      (check c (= (t/shape (nth (t/adam-step! 0.01 0.9 0.999 1.0e-8 0.1 0.001 (t/reshape [5 13] (gen-f64 65 1 false)) (t/reshape [5 13] (gen-f64 65 2 false))
+      (check c (= (t/shape (nth (t/adam-step 0.01 0.9 0.999 1.0e-8 0.1 0.001 (t/reshape [5 13] (gen-f64 65 1 false)) (t/reshape [5 13] (gen-f64 65 2 false))
                                               (t/reshape [5 13] (gen-f64 65 3 false)) (t/reshape [5 13] (gen-f64 65 4 true))) 0)) [5 13]))
       ;; a second holder of p, m, v and g keeps its values: the step never writes into a shared buffer
       (let ((p (gen-f64 33 1 false)) (g (gen-f64 33 2 false)) (m (gen-f64 33 3 false)) (v (gen-f64 33 4 true)))
-        (let ((p-before (bits-f64 p)) (m-before (bits-f64 m)) (v-before (bits-f64 v)) (g-before (bits-f64 g)) (r (t/adam-step! 0.01 0.9 0.999 1.0e-8 0.1 0.001 p g m v)))
+        (let ((p-before (bits-f64 p)) (m-before (bits-f64 m)) (v-before (bits-f64 v)) (g-before (bits-f64 g)) (r (t/adam-step 0.01 0.9 0.999 1.0e-8 0.1 0.001 p g m v)))
           (do (check c (= (bits-f64 p) p-before)) (check c (= (bits-f64 m) m-before)) (check c (= (bits-f64 v) v-before)) (check c (= (bits-f64 g) g-before))
               (check c (!= (bits-f64 (nth r 0)) p-before)))))
       (let ((p (gen-f64 33 1 false)) (g (gen-f64 33 2 false)) (b (gen-f64 33 3 false)))
-        (let ((p-before (bits-f64 p)) (b-before (bits-f64 b)) (r (t/sgd-momentum-step! 0.1 0.9 p g b)))
+        (let ((p-before (bits-f64 p)) (b-before (bits-f64 b)) (r (t/sgd-momentum-step 0.1 0.9 p g b)))
           (do (check c (= (bits-f64 p) p-before)) (check c (= (bits-f64 b) b-before)) (check c (!= (bits-f64 (nth r 0)) p-before)))))))
 
 ;; PyTorch: three Adam steps on ten parameters
@@ -175,17 +175,17 @@
         (g1 (arr-f64 [0.1 -0.2 0.3 -0.4 1.0e-5 50.0 -0.05 0.0 0.7 -1.5])) (g2 (arr-f64 [0.05 0.1 -0.3 0.2 2.0e-5 -40.0 0.07 0.01 -0.2 1.0]))
         (g3 (arr-f64 [-0.2 0.15 0.05 0.1 -1.0e-5 30.0 0.02 -0.01 0.9 0.5])))
     (let ((z (t/zeros [10])))
-      (let ((r1 (t/adam-step! 0.01 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 1)) (- 1.0 (ipow 0.999 1)) p (t/from-array [10] g1 0.0) z z)))
-        (let ((r2 (t/adam-step! 0.01 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 2)) (- 1.0 (ipow 0.999 2)) (nth r1 0) (t/from-array [10] g2 0.0) (nth r1 1) (nth r1 2))))
-          (let ((r3 (t/adam-step! 0.01 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 3)) (- 1.0 (ipow 0.999 3)) (nth r2 0) (t/from-array [10] g3 0.0) (nth r2 1) (nth r2 2))))
+      (let ((r1 (t/adam-step 0.01 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 1)) (- 1.0 (ipow 0.999 1)) p (t/from-array [10] g1 0.0) z z)))
+        (let ((r2 (t/adam-step 0.01 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 2)) (- 1.0 (ipow 0.999 2)) (nth r1 0) (t/from-array [10] g2 0.0) (nth r1 1) (nth r1 2))))
+          (let ((r3 (t/adam-step 0.01 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 3)) (- 1.0 (ipow 0.999 3)) (nth r2 0) (t/from-array [10] g3 0.0) (nth r2 1) (nth r2 2))))
             (do (check c (vclose (vals-f64 (nth r3 0)) [0.9827417759072247 -1.9891883247612172 0.4901821311153249 3.0132772586670757 -0.022833655328610723 99.98629989613359 -0.24523900674381746 -0.006989535870088916 2.478497695420468 -6.989186992922957] tol))
                 (check c (vclose (vals-f64 (nth r3 1)) [-0.0073999999999999995 0.007799999999999996 0.002300000000000002 -0.004400000000000002 1.61e-06 3.4499999999999993 0.0042499999999999994 -9.999999999999988e-05 0.12869999999999995 0.01849999999999999] tol))
                 (check c (vclose (vals-f64 (nth r3 2)) [5.2477510000000055e-05 7.241004000000008e-05 0.00018223009000000015 0.00020964016000000023 5.994001000000006e-13 4.993402500000004 7.790102500000009e-06 1.999000000000002e-07 0.0013389804900000011 0.003494502250000003] tol)))))))))
 (defun torch-mom-f64 (c: Checks tol: f64) -> unit
   (let ((p (t/from-array [4] (arr-f64 [1.0 -2.0 0.5 3.0]) 0.0)) (z (t/zeros [4])))
-    (let ((r1 (t/sgd-momentum-step! 0.1 0.9 p (t/from-array [4] (arr-f64 [0.1 -0.2 0.3 -0.4]) 0.0) z)))
-      (let ((r2 (t/sgd-momentum-step! 0.1 0.9 (nth r1 0) (t/from-array [4] (arr-f64 [0.05 0.1 -0.3 0.2]) 0.0) (nth r1 1))))
-        (let ((r3 (t/sgd-momentum-step! 0.1 0.9 (nth r2 0) (t/from-array [4] (arr-f64 [-0.2 0.15 0.05 0.1]) 0.0) (nth r2 1))))
+    (let ((r1 (t/sgd-momentum-step 0.1 0.9 p (t/from-array [4] (arr-f64 [0.1 -0.2 0.3 -0.4]) 0.0) z)))
+      (let ((r2 (t/sgd-momentum-step 0.1 0.9 (nth r1 0) (t/from-array [4] (arr-f64 [0.05 0.1 -0.3 0.2]) 0.0) (nth r1 1))))
+        (let ((r3 (t/sgd-momentum-step 0.1 0.9 (nth r2 0) (t/from-array [4] (arr-f64 [-0.2 0.15 0.05 0.1]) 0.0) (nth r2 1))))
           (do (check c (vclose (vals-f64 (nth r3 0)) [0.9833999999999999 -1.9798 0.47069999999999995 3.0604] tol))
               (check c (vclose (vals-f64 (nth r3 1)) [-0.07399999999999998 0.07799999999999997 0.023000000000000027 -0.04400000000000004] tol))))))))
 (defun arr-f64 (v: (Vec f64)) -> (Array f64)
@@ -197,9 +197,9 @@
         (torch-f64 c 1.0e-12) (torch-mom-f64 c 1.0e-12) (torch-f32 c 3.0e-6) (torch-mom-f32 c 3.0e-6)
         ;; planted: eps inside the square root is a different formula and must miss PyTorch's values by far more than the tolerance
         (let ((p (t/tensor [1.0 -2.0 0.5])) (g (t/tensor [0.1 -0.2 0.3])) (z (t/zeros [3])))
-          (let ((r (t/adam-step! 0.01 0.9 0.999 1.0e-8 0.1 0.001 p g z z)))
+          (let ((r (t/adam-step 0.01 0.9 0.999 1.0e-8 0.1 0.001 p g z z)))
             (do (check c (vclose (t/to-vec (nth r 0)) [0.99 -1.99 0.49] 1.0e-6))
                 ;; eps = 1 makes the denominator 2 instead of 1.0 and the first step 0.005 instead of 0.01; a wrong oracle that expects 0.01 there must be detected
-                (check q (vclose (t/to-vec (nth (t/adam-step! 0.01 0.9 0.999 1.0 0.1 0.001 p g z z) 0)) [0.99 -1.99 0.49] 1.0e-6))
+                (check q (vclose (t/to-vec (nth (t/adam-step 0.01 0.9 0.999 1.0 0.1 0.001 p g z z) 0)) [0.99 -1.99 0.49] 1.0e-6))
                 (check-detects c q))))
         (checks-result c))))

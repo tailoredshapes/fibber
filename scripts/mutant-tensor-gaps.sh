@@ -70,11 +70,12 @@ O=lib/fib/tensor/optim.fib
 mutant adam-eps-inside-the-sqrt $O 's/(den: f64x4 (+ (\* (simd\/sqrt v2) rsv) epsv))/(den: f64x4 (* (simd\/sqrt (+ v2 epsv)) rsv))/' 7743
 mutant adam-second-moment-without-square $O 's/(v2: f32x8 (+ (\* b2v vv) (\* omb2v (\* gv gv))))/(v2: f32x8 (+ (* b2v vv) (* omb2v gv)))/' 7743
 mutant adam-update-fused-multiply-add $O 's/(p2: f64x4 (+ pv (\* nlrv (fdiv m2 den))))/(p2: f64x4 (simd\/fma nlrv (fdiv m2 den) pv))/' 7743
-mutant adam-tail-keeps-old-second-moment $O 's/(array-set! &v (+ vo i) v2)/(array-set! \&v (+ vo i) vx)/' 7743
-mutant adam-parameter-offset-ignored $O 's/&pb po (. gd buffer) go &mb mo &vb vo))\(.*\)$/\&pb 0 (. gd buffer) go \&mb mo \&vb vo))\1/' 7743
-mutant adam-returns-second-moment-as-first $O 's/(from-parts @mb mo dims ms 0.0)/(from-parts @vb vo dims vs 0.0)/' 7743
+mutant adam-tail-keeps-old-second-moment $O 's/(array-set! &vn i v2)/(array-set! \&vn i vx)/' 7743
+mutant adam-parameter-offset-ignored $O 's/(. pd buffer) (array-get (. pd meta) 0) (. gd buffer)/(. pd buffer) 0 (. gd buffer)/' 7743
+mutant adam-first-moment-offset-ignored $O 's/(. md buffer) (array-get (. md meta) 0)/(. md buffer) 0/' 7743
+mutant adam-returns-second-moment-as-first $O 's/(from-array dims @mn 0.0)/(from-array dims @vn 0.0)/' 7743
 mutant adam-no-bias-correction-of-step-size $O 's/(@CONV@ (- 0.0 (\/ lr bc1)))//; s/(fptrunc f32 (- 0.0 (\/ lr bc1)))/(fptrunc f32 (- 0.0 lr))/' 7743
 mutant adam-reciprocal-sqrt-dropped $O 's/(double (\/ 1.0 (simd\/sqrt bc2)))/(double (simd\/sqrt bc2))/' 7743
 mutant momentum-ignores-mu $O 's/(b2: f32x8 (+ (\* muv bv) gv))/(b2: f32x8 (+ bv gv))/' 7743
-mutant momentum-tail-subtracts $O 's/(+ (array-get @p (+ po i)) (\* nlr b2))/(- (array-get @p (+ po i)) (* nlr b2))/' 7743
+mutant momentum-tail-subtracts $O 's/(+ (array-get p (+ po i)) (\* nlr b2))/(- (array-get p (+ po i)) (* nlr b2))/' 7743
 exit $survived

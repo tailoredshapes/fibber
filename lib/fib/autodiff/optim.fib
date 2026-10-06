@@ -1,9 +1,9 @@
 ;; fib.autodiff.optim: optimiser steps over a vector of parameter tensors. Each step returns fresh tensors (values, not mutation):
 ;; the old parameters are released when the caller rebinds them, and the gradients are consumed. In-place updates through a
-;; window (fib.view) are the stage-2 improvement named in docs/design/autodiff.md.
+;; window (fib.view) are the stage-2 improvement named in docs/design/autodiff.md; the Adam update is one fused pass per parameter (t/adam-step).
 (ns fib.autodiff.optim
   (:use fib.core fib.seq fib.coll fib.autodiff.real)
-  (:require [fib.tensor :as t] [fib.math :as math]))
+  (:require [fib.tensor :as t]))
 
 ;; p - lr g
 (defun sgd-step (lr: f64 params: (Vec (t/Tensor a)) grads: (Vec (t/Tensor a))) -> (Vec (t/Tensor a))
@@ -18,19 +18,11 @@
 
 (defun ipow (x: f64 n: i64) -> f64 (loop [i 0 acc 1.0] (if (< i n) (recur (+ i 1) (* acc x)) acc)))
 
-;; sqrt of every element. fib.tensor has no vector sqrt; a scalar map with the libm-exact `math/sqrt` takes about a third of the time of the vector
-;; exp(log(v)/2) it replaced (the vector log and exp cost 2.3 ns an element each: docs/shootout/autodiff.md), and is exact. A vector `t/sqrt` over
-;; `simd/sqrt` is the right fix (docs/design/autodiff.md 9).
-(defun vsqrt (v: (t/Tensor a)) -> (t/Tensor a)
-  (let [sd (. v seed)] (t/map (fn (x: a) (lit sd (math/sqrt (wide sd x)))) v)))
-
+;; One fused pass over a parameter, its gradient and its two moments (`t/adam-step`, fib.tensor.optim): the same operations in the same order as the nine tensor calls it replaced
+;; (axpby, mul, axpby, sqrt, scale, shift, div, axpby), so the results are bit-identical to them; PyTorch's placement of eps (after the square root and the bias correction).
 (defun adam-one (lr: f64 b1: f64 b2: f64 eps: f64 c1: f64 c2: f64 p: (t/Tensor a) g: (t/Tensor a) m: (t/Tensor a) v: (t/Tensor a))
   -> (Vec (t/Tensor a))
-  (let [sd (. p seed) m2 (t/axpby (lit sd b1) m (lit sd (- 1.0 b1)) g)
-        v2 (t/axpby (lit sd b2) v (lit sd (- 1.0 b2)) (t/mul g g))
-        den (t/shift (lit sd eps) (t/scale (lit sd (/ 1.0 (math/sqrt c2))) (vsqrt v2)))
-        p2 (t/axpby (one sd) p (lit sd (- 0.0 (/ lr c1))) (t/div m2 den))]
-    [p2 m2 v2]))
+  (t/adam-step lr b1 b2 eps c1 c2 p g m v))
 
 ;; Adam (Kingma and Ba) with bias correction folded into the step size and the denominator
 (defun adam-step (lr: f64 b1: f64 b2: f64 eps: f64 st: (AdamState a) params: (Vec (t/Tensor a)) grads: (Vec (t/Tensor a))) -> (Stepped a)

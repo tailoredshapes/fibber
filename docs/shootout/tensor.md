@@ -418,16 +418,18 @@ The 784x256 sum moves 0.8 MB in 15.6 us (51 GB/s: the matrix is in L2). The orde
 
 The four tensors of the MLP of `docs/shootout/autodiff.md` (784x256, 256, 256x10, 10: 203 530 `f32`), one thread; the state (`m`, `v`) is shared with the caller's vector, so each result buffer is a fresh copy
 (the unique-write protocol copies a shared buffer once). Before: the nine tensor calls (`axpby`, `mul`, `axpby`, `sqrt`, `scale`, `shift`, `div`, `axpby`) with the scalar-map sqrt that `fib.autodiff` used, and with the vector `t/sqrt`
-(`gaps-before.fib`; the second row is only possible with commit 1 of this package). After: `t/adam-step!` (`gaps.fib`). The machine was loaded (load average 14 to 18 from other agents' gates) when these
-were run, under the lock but not isolated; the ratios are above 5x, which is the part to trust.
+(`gaps-before.fib`; the second row is only possible with commit 1 of this package). After: `t/adam-step` (`gaps.fib`, the shipped version below). The machine was loaded (load average 14 to 18 from other agents' gates) when these
+were run, under the lock but not isolated; the ratios are above 7x, which is the part to trust.
 
 | row | before (us) | after (us) | ratio |
 |---|---|---|---|
-| Adam update of the 4 MLP tensors, scalar-map sqrt, nine passes | 1666.5 | 189.7 | 8.8x |
-| the same with the vector `t/sqrt`, nine passes | 1121.3 | 189.7 | 5.9x |
-| one 784x256 tensor, vector `t/sqrt`, nine passes | 1144.5 | 173.9 | 6.6x |
-| `sgd-momentum-step!`, one 784x256 tensor (no before row measured) | | 102.6 | |
+| Adam update of the 4 MLP tensors, scalar-map sqrt, nine passes | 1666.5 | 157.4 | 10.6x |
+| the same with the vector `t/sqrt`, nine passes | 1121.3 | 157.4 | 7.1x |
+| one 784x256 tensor, vector `t/sqrt`, nine passes | 1144.5 | 156.8 | 7.3x |
+| `sgd-momentum-step`, one 784x256 tensor (no before row measured) | | 87.1 | |
 
-The 174 us of one 784x256 Adam step is 0.87 ns an element: the kernel's division and square root (about 11 cycles per eight `f32` for both) and the three copies the shared buffers force. Whether the update runs in place
-when the caller holds the only count depends on the caller: probing `(cell (. p buffer))` in a function that owns `p` copied the buffer in every variant tried (the count of the tensor's field is not moved out of a live struct),
-so the step as called from `fib.autodiff` allocates its three results.
+**Second version (the one shipped).** The first version wrote the three results through the unique-write protocol (`(cell (. p buffer))`), which copies a shared buffer before overwriting all of it: 189.7 us for the four tensors and 173.9 us for one
+784x256. The shipped version allocates uninitialised outputs and only reads its inputs: 157.4 us for the four, 156.8 us for one 784x256, 87.1 us for `sgd-momentum-step` on one 784x256. The remaining 0.78 ns an element is the division and square root (about 11 cycles per
+eight `f32`) and the memory traffic of four reads and three writes (5.6 MB). An in-place update was probed and **not achieved**: `(cell (. p buffer))` in a function that owns `p` (also through a helper returning the field) left the buffer shared in all three
+variants tried, measured by comparing the array's address before and after; so no `adam-step!` is offered, and the functions are named without the bang. Chained as training chains them (outputs become inputs), the step took 0.367 ms in `scripts/bench/autodiff/adam-chain.fib` and 0.176 ms with a large-block malloc cache
+(`docs/shootout/autodiff.md` 8.3): the rest of the cost of a fresh 800 KB result is the allocator, not the kernel.

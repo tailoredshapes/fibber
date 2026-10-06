@@ -319,15 +319,15 @@ bits; the variance is the population variance from the centred second pass, not 
 (which cancels for a large mean: case 7085 has a mean of 1e6 over a spread of 27). `exp` is the vector `exp` above
 (`f32` computed in `f64` and rounded). A NaN in a row gives a NaN softmax row. A strided input is first made
 contiguous. Case 7085 compares both against a scalar oracle with libm over every tail length, ranks one to three,
-views, empty tensors and extreme values; `scripts/mutant-tensor-fused.sh` plants 10 faults in them.
+views, empty tensors and extreme values; `scripts/mutant-tensor-fused.sh` plants 11 faults in them.
 Softmax 4096x4096 `f64`: 74.7 ms against 145.1 ms composed (NumPy 126.8); layernorm 4096x1024: 9.7 ms against
 42.9 ms composed (NumPy 35.2): `docs/shootout/tensor.md`, section 9.
 
 ## Fused optimiser steps
 
 ```clojure
-(t/adam-step! lr b1 b2 eps bc1 bc2 p g m v)   ; -> [p' m' v']      bc1 = 1 - b1^t, bc2 = 1 - b2^t for step t (the caller computes them)
-(t/sgd-momentum-step! lr mu p g buf)          ; -> [p' buf']
+(t/adam-step lr b1 b2 eps bc1 bc2 p g m v)   ; -> [p' m' v']      bc1 = 1 - b1^t, bc2 = 1 - b2^t for step t (the caller computes them)
+(t/sgd-momentum-step lr mu p g buf)          ; -> [p' buf']
 ```
 
 One pass over the parameter, its gradient and its state (eight `f32` or four `f64` lanes at a time, a scalar tail), no temporary tensor: the composition it replaces
@@ -337,10 +337,8 @@ the root), `p' = p - (lr / bc1) m' / denom`. SGD with momentum is PyTorch's (`bu
 `f32` and `f64` tensors of one shape (a different shape traps; no broadcasting); scalars are `f64` and are rounded to the element type; a tensor that is not dense is made
 contiguous first. **Rounding contract:** the kernel does the same multiplies, adds, one `sqrt` and one division, in the same order, as the unfused composition (no fused multiply-add;
 `1 / sqrt(bc2)` is one reciprocal multiplied in, where PyTorch divides by `sqrt(bc2)`: at most one rounding apart), so the results are **bit-identical to the composition** and
-within a few ULP of PyTorch 2.14 (case 7743: `f64` to 1e-12, `f32` to 3e-6 relative, on three steps of ten parameters). **Memory:** the results are the buffers of `p`, `m` and `v` written
-through the unique-write protocol, so another holder of a tensor (a tape, a caller's variable) keeps its old values and the step copies that buffer once. Whether the update runs in place
-when the caller passes the only holder depends on the caller's counts: a tensor reached through a `Vec` or a closure has more than one; in the measured benchmark the step allocates the three results.
-Case 7743 compares bit for bit over lengths 0 to 40, a matrix, a dense slice with an offset and a transposed view; `scripts/mutant-tensor-gaps.sh` plants 10 faults in them.
+within a few ULP of PyTorch 2.14 (case 7743: `f64` to 1e-12, `f32` to 3e-6 relative, on three steps of ten parameters). **Memory:** the three results are fresh buffers written once each (uninitialised arrays: the kernel stores every element), and the inputs are only read, so another holder of a tensor (a tape, a caller's `Vec`) never sees a change and no input buffer is copied first. The steps do **not** update in place: moving a unique tensor's buffer into a cell (`(cell (. p buffer))`, also through a helper that returns the field) left the buffer shared in every variant probed, so an in-place `adam-step!` would have copied anyway; this is reported, not solved (`docs/shootout/tensor.md` 10.4).
+Case 7743 compares bit for bit over lengths 0 to 40, a matrix, a dense slice with an offset and a transposed view; `scripts/mutant-tensor-gaps.sh` plants 11 faults in them.
 
 ## Safety and validation
 

@@ -41,8 +41,8 @@ case-mutant() { # NAME FILE SED-EXPRESSION: killed by the audit of case 7710 (a 
 # wrong backward formulas
 mutant tanh-drops-the-one-minus $O 's/(t\/mul g (t\/sub (scalar out 1.0) (t\/mul out out)))/(t\/mul g (t\/mul out out))/'
 mutant sub-forgets-the-sign $O 's/(unbroadcast (t\/scale (lit (. g seed) -1.0) g) sb)/(unbroadcast g sb)/'
-mutant relu-mask-passes-zeros $O 's/(t\/relu (t\/div y y))/(t\/shift (lit (. y seed) 1.0) (t\/scale (lit (. y seed) 0.0) y))/'
-mutant bias-column-sums-doubled $O 's/(t\/mmul (t\/full \[1 (nth (t\/shape g) 0)\] (one (. g seed))) g)/(t\/mmul (t\/full [1 (nth (t\/shape g) 0)] (lit (. g seed) 2.0)) g)/'
+mutant relu-mask-passes-zeros $O 's/(record1 a out (fn (g) (t\/relu-grad g out)))/(record1 a out (fn (g) g))/'
+mutant bias-column-sums-doubled $O 's/(t\/reshape dims (t\/sum-axis 0 false g))/(t\/reshape dims (t\/scale (lit (. g seed) 2.0) (t\/sum-axis 0 false g)))/'
 mutant mean-divides-by-n-plus-one $O 's/k (\/ 1.0 (double n))/k (\/ 1.0 (double (+ n 1)))/'
 mutant matmul-right-gradient-is-doubled $N 's/(t\/mmul (t\/transpose av) g)/(t\/mmul (t\/transpose av) (t\/scale (lit (. g seed) 2.0) g))/'
 mutant dense-bias-gradient-ignores-the-activation $N 's/(if nb \[(unbroadcast gz bs)\] \[\])/(if nb [(unbroadcast g bs)] [])/'
