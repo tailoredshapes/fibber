@@ -19,6 +19,20 @@
         ts (vec (rest times))]
     (println name "us_per_call" (/ (double (median5 ts)) (* 1000.0 (double reps))))))
 
+
+;; the Adam update as nine tensor calls (what fib.autodiff did before t/adam-step!); vec-sqrt: the vector t/sqrt of fib.tensor.unary, else a scalar map with libm
+;; (the first prototype). The scalars are constants of the benchmark (lr 0.0001 after bias correction, 1/sqrt(bc2) = 31.6).
+(defun comp-adam (vec-sqrt: bool p: (t/Tensor f32) g: (t/Tensor f32) m: (t/Tensor f32) v: (t/Tensor f32)) -> (Vec (t/Tensor f32))
+  (let [m2 (t/axpby 0.9f32 m 0.1f32 g)
+        v2 (t/axpby 0.999f32 v 0.001f32 (t/mul g g))
+        sq (if vec-sqrt (t/sqrt v2) (t/map (fn (x: f32) -> f32 (float (math/sqrt (double x)))) v2))
+        den (t/shift 1.0e-8f32 (t/scale 31.6f32 sq))
+        p2 (t/axpby 1.0f32 p -0.0001f32 (t/div m2 den))]
+    [p2 m2 v2]))
+
+(defun adam-all (vec-sqrt: bool ps: (Vec (t/Tensor f32)) gs: (Vec (t/Tensor f32)) ms: (Vec (t/Tensor f32)) vs: (Vec (t/Tensor f32))) -> i64
+  (reduce + 0 (map-indexed (fn (i: i64 p: (t/Tensor f32)) (t/size (nth (comp-adam vec-sqrt p (nth gs i) (nth ms i) (nth vs i)) 0))) ps)))
+
 (defun main () -> i64
   (let [x (t/reshape [128 256] (fill 32768 1)) y (t/reshape [128 256] (fill 32768 2))
         w (t/reshape [784 256] (fill 200704 3))
@@ -44,4 +58,11 @@
         (bench "square (mul x x) 784x256 f32" 100 (fn () (t/size (t/square w))))
         (bench "abs via map 784x256 f32" 100 (fn () (t/size (t/map (fn (v: f32) (abs v)) w))))
         (bench "mul 784x256 f32 (reference)" 200 (fn () (t/size (t/mul w w))))
+        (let [ps [w (t/zeros-f32 [256]) (t/reshape [256 10] (fill 2560 5)) (t/zeros-f32 [10])]
+              gs [(t/reshape [784 256] (fill 200704 6)) (t/zeros-f32 [256]) (t/reshape [256 10] (fill 2560 7)) (t/zeros-f32 [10])]
+              ms (mapv (fn (p: (t/Tensor f32)) (t/zeros-f32 (t/shape p))) ps) vs (mapv (fn (p: (t/Tensor f32)) (t/full (t/shape p) 0.5f32)) ps)]
+          (do (bench "adam update, 4 MLP tensors (203 530 floats), scalar-map sqrt, nine passes" 20 (fn () (adam-all false ps gs ms vs)))
+              (bench "adam update, 4 MLP tensors, vector t/sqrt, nine passes" 20 (fn () (adam-all true ps gs ms vs)))
+              (bench "adam update, one 784x256 tensor, vector t/sqrt, nine passes" 50 (fn () (t/size (nth (comp-adam true w (nth gs 0) (nth ms 0) (nth vs 0)) 0))))
+              0))
         0)))

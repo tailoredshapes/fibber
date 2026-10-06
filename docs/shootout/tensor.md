@@ -413,3 +413,21 @@ of eight byte tests replaced it. The "after" column is the second version. The r
 | the workaround: row of ones times the matrix, `mmul` 128x256 | 7.1 | 7.2 | not changed |
 
 The 784x256 sum moves 0.8 MB in 15.6 us (51 GB/s: the matrix is in L2). The ordered contract needs no `sum-axis-fast` for these axes; for the last axis the dependent chain is the floor and the ordered result keeps it (a fast variant would be new API; not added).
+
+### 10.4 Fused Adam and SGD-momentum steps (`fib.tensor.optim`)
+
+The four tensors of the MLP of `docs/shootout/autodiff.md` (784x256, 256, 256x10, 10: 203 530 `f32`), one thread; the state (`m`, `v`) is shared with the caller's vector, so each result buffer is a fresh copy
+(the unique-write protocol copies a shared buffer once). Before: the nine tensor calls (`axpby`, `mul`, `axpby`, `sqrt`, `scale`, `shift`, `div`, `axpby`) with the scalar-map sqrt that `fib.autodiff` used, and with the vector `t/sqrt`
+(`gaps-before.fib`; the second row is only possible with commit 1 of this package). After: `t/adam-step!` (`gaps.fib`). The machine was loaded (load average 14 to 18 from other agents' gates) when these
+were run, under the lock but not isolated; the ratios are above 5x, which is the part to trust.
+
+| row | before (us) | after (us) | ratio |
+|---|---|---|---|
+| Adam update of the 4 MLP tensors, scalar-map sqrt, nine passes | 1666.5 | 189.7 | 8.8x |
+| the same with the vector `t/sqrt`, nine passes | 1121.3 | 189.7 | 5.9x |
+| one 784x256 tensor, vector `t/sqrt`, nine passes | 1144.5 | 173.9 | 6.6x |
+| `sgd-momentum-step!`, one 784x256 tensor (no before row measured) | | 102.6 | |
+
+The 174 us of one 784x256 Adam step is 0.87 ns an element: the kernel's division and square root (about 11 cycles per eight `f32` for both) and the three copies the shared buffers force. Whether the update runs in place
+when the caller holds the only count depends on the caller: probing `(cell (. p buffer))` in a function that owns `p` copied the buffer in every variant tried (the count of the tensor's field is not moved out of a live struct),
+so the step as called from `fib.autodiff` allocates its three results.

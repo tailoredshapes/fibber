@@ -323,6 +323,25 @@ views, empty tensors and extreme values; `scripts/mutant-tensor-fused.sh` plants
 Softmax 4096x4096 `f64`: 74.7 ms against 145.1 ms composed (NumPy 126.8); layernorm 4096x1024: 9.7 ms against
 42.9 ms composed (NumPy 35.2): `docs/shootout/tensor.md`, section 9.
 
+## Fused optimiser steps
+
+```clojure
+(t/adam-step! lr b1 b2 eps bc1 bc2 p g m v)   ; -> [p' m' v']      bc1 = 1 - b1^t, bc2 = 1 - b2^t for step t (the caller computes them)
+(t/sgd-momentum-step! lr mu p g buf)          ; -> [p' buf']
+```
+
+One pass over the parameter, its gradient and its state (eight `f32` or four `f64` lanes at a time, a scalar tail), no temporary tensor: the composition it replaces
+(`axpby`, `mul`, `axpby`, `sqrt`, `scale`, `shift`, `div`, `axpby`) makes nine passes and eight temporaries per parameter. PyTorch's Adam without amsgrad or weight decay:
+`m' = b1 m + (1 - b1) g`, `v' = b2 v + (1 - b2) g^2`, `denom = sqrt(v') / sqrt(bc2) + eps` (**eps is added after the square root and the bias correction**, as PyTorch does, not inside
+the root), `p' = p - (lr / bc1) m' / denom`. SGD with momentum is PyTorch's (`buf' = mu buf + g`, `p' = p - lr buf'`; a zero `buf` at the first step gives `buf' = g`; no dampening, no Nesterov).
+`f32` and `f64` tensors of one shape (a different shape traps; no broadcasting); scalars are `f64` and are rounded to the element type; a tensor that is not dense is made
+contiguous first. **Rounding contract:** the kernel does the same multiplies, adds, one `sqrt` and one division, in the same order, as the unfused composition (no fused multiply-add;
+`1 / sqrt(bc2)` is one reciprocal multiplied in, where PyTorch divides by `sqrt(bc2)`: at most one rounding apart), so the results are **bit-identical to the composition** and
+within a few ULP of PyTorch 2.14 (case 7743: `f64` to 1e-12, `f32` to 3e-6 relative, on three steps of ten parameters). **Memory:** the results are the buffers of `p`, `m` and `v` written
+through the unique-write protocol, so another holder of a tensor (a tape, a caller's variable) keeps its old values and the step copies that buffer once. Whether the update runs in place
+when the caller passes the only holder depends on the caller's counts: a tensor reached through a `Vec` or a closure has more than one; in the measured benchmark the step allocates the three results.
+Case 7743 compares bit for bit over lengths 0 to 40, a matrix, a dense slice with an offset and a transposed view; `scripts/mutant-tensor-gaps.sh` plants 10 faults in them.
+
 ## Safety and validation
 
 The `Tensor` descriptor is public so callers can name the generic type.

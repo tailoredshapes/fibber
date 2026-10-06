@@ -10,7 +10,7 @@ out=$HOME/.cache/fibber-scratch/mutant-tensor-gaps
 mkdir -p "$out/orig"
 export FIB_LIB=$root/lib
 ulimit -v 16000000
-files="lib/fib/tensor/unary.fib lib/fib/tensor/select.fib lib/fib/tensor/masks.fib lib/fib/tensor/axis-lanes.fib lib/fib/tensor/reduce-extra.fib"
+files="lib/fib/tensor/unary.fib lib/fib/tensor/select.fib lib/fib/tensor/masks.fib lib/fib/tensor/axis-lanes.fib lib/fib/tensor/reduce-extra.fib lib/fib/tensor/optim.fib"
 for f in $files; do mkdir -p "$out/orig/$(dirname "$f")"; cp "$root/$f" "$out/orig/$f"; done
 restore() { for f in $files; do cp "$out/orig/$f" "$root/$f"; done; }
 trap restore EXIT
@@ -66,4 +66,15 @@ mutant axis-max-nan-accumulator-replaced $A '/defun lop-f32/,/defun sop-f32/s/(s
 mutant axis-view-treated-as-dense $A 's/(and (axis-lanes? (. x seed)) (contiguous? x) /(and (axis-lanes? (. x seed)) /' 7742
 mutant axis-keepdims-ignored $A 's/(if keepdims (conj out 1) out)/out/' 7742
 mutant axis-maximum-runs-minimum lib/fib/tensor/reduce-extra.fib 's/(lane-axis 2 axis keepdims x)/(lane-axis 3 axis keepdims x)/' 7742
+O=lib/fib/tensor/optim.fib
+mutant adam-eps-inside-the-sqrt $O 's/(den: f64x4 (+ (\* (simd\/sqrt v2) rsv) epsv))/(den: f64x4 (* (simd\/sqrt (+ v2 epsv)) rsv))/' 7743
+mutant adam-second-moment-without-square $O 's/(v2: f32x8 (+ (\* b2v vv) (\* omb2v (\* gv gv))))/(v2: f32x8 (+ (* b2v vv) (* omb2v gv)))/' 7743
+mutant adam-update-fused-multiply-add $O 's/(p2: f64x4 (+ pv (\* nlrv (fdiv m2 den))))/(p2: f64x4 (simd\/fma nlrv (fdiv m2 den) pv))/' 7743
+mutant adam-tail-keeps-old-second-moment $O 's/(array-set! &v (+ vo i) v2)/(array-set! \&v (+ vo i) vx)/' 7743
+mutant adam-parameter-offset-ignored $O 's/&pb po (. gd buffer) go &mb mo &vb vo))\(.*\)$/\&pb 0 (. gd buffer) go \&mb mo \&vb vo))\1/' 7743
+mutant adam-returns-second-moment-as-first $O 's/(from-parts @mb mo dims ms 0.0)/(from-parts @vb vo dims vs 0.0)/' 7743
+mutant adam-no-bias-correction-of-step-size $O 's/(@CONV@ (- 0.0 (\/ lr bc1)))//; s/(fptrunc f32 (- 0.0 (\/ lr bc1)))/(fptrunc f32 (- 0.0 lr))/' 7743
+mutant adam-reciprocal-sqrt-dropped $O 's/(double (\/ 1.0 (simd\/sqrt bc2)))/(double (simd\/sqrt bc2))/' 7743
+mutant momentum-ignores-mu $O 's/(b2: f32x8 (+ (\* muv bv) gv))/(b2: f32x8 (+ bv gv))/' 7743
+mutant momentum-tail-subtracts $O 's/(+ (array-get @p (+ po i)) (\* nlr b2))/(- (array-get @p (+ po i)) (* nlr b2))/' 7743
 exit $survived
