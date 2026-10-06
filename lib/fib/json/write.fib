@@ -1,0 +1,66 @@
+;; fib.json.write: the serialiser (docs/design/json.md 4). Compact or pretty, into a growable byte buffer (fib.json.buffer), keys in source order.
+;;   (write j) (write-pretty j) (write-with j opts) -> str        (write-bytes j) -> (Array i8)
+;; A float prints as the shortest decimal text that reads back as the same double, always with a `.` or an exponent so that it reads back as a float
+;; (`100.0`, not `100`); a NaN or an infinity, which JSON cannot write, is `null` (as JavaScript's JSON.stringify). `JBig` text is written as it is.
+;; Strings: `"` `\` and the control characters are escaped; everything else is copied as UTF-8, or, with `ascii`, escaped as \uXXXX (surrogate pairs above the BMP).
+(ns fib.json.write (:use fib.core fib.seq fib.coll fib.json.types fib.json.buffer fib.json.dtoa fib.json.escape))
+
+(defun newline-indent (&buf: (Array i8) &len: i64 level: i64 w: WriteOptions) -> unit
+  (when (> (. w indent) 0)
+    (let [k (* level (. w indent))]
+      (do (ensure &buf &len (+ k 1))
+          (put-raw &buf &len 10)
+          (loop [i 0] (when (< i k) (do (put-raw &buf &len 32) (recur (+ i 1)))))))))
+
+(defun put-array (&buf: (Array i8) &len: i64 items: (Vec Json) level: i64 w: WriteOptions) -> unit
+  (let [m (count items)]
+    (if (= m 0)
+        (do (put-byte &buf &len 91) (put-byte &buf &len 93))
+        (do (put-byte &buf &len 91)
+            (loop [i 0]
+              (when (< i m)
+                (do (when (> i 0) (put-byte &buf &len 44))
+                    (newline-indent &buf &len (+ level 1) w)
+                    (put-json &buf &len (nth items i) (+ level 1) w)
+                    (recur (+ i 1)))))
+            (newline-indent &buf &len level w)
+            (put-byte &buf &len 93)))))
+
+(defun put-object (&buf: (Array i8) &len: i64 keys: (Vec str) vals: (Vec Json) level: i64 w: WriteOptions) -> unit
+  (let [m (count keys)]
+    (if (= m 0)
+        (do (put-byte &buf &len 123) (put-byte &buf &len 125))
+        (do (put-byte &buf &len 123)
+            (loop [i 0]
+              (when (< i m)
+                (do (when (> i 0) (put-byte &buf &len 44))
+                    (newline-indent &buf &len (+ level 1) w)
+                    (put-string &buf &len (nth keys i) (. w ascii))
+                    (put-byte &buf &len 58)
+                    (when (> (. w indent) 0) (put-byte &buf &len 32))
+                    (put-json &buf &len (nth vals i) (+ level 1) w)
+                    (recur (+ i 1)))))
+            (newline-indent &buf &len level w)
+            (put-byte &buf &len 125)))))
+
+(defun put-json (&buf: (Array i8) &len: i64 j: Json level: i64 w: WriteOptions) -> unit
+  (match j
+    ((JNull) (put-str &buf &len "null"))
+    ((JBool b) (put-str &buf &len (if b "true" "false")))
+    ((JInt i) (put-i64 &buf &len i))
+    ((JFloat f) (put-f64 &buf &len f))
+    ((JBig t) (put-str &buf &len t))
+    ((JStr s) (put-string &buf &len s (. w ascii)))
+    ((JArr items) (put-array &buf &len items level w))
+    ((JObj keys vals) (put-object &buf &len keys vals level w))))
+
+(defun write-with (j: Json w: WriteOptions) -> str
+  (let [buf (cell (new-buffer 256)) len (cell 0)]
+    (do (put-json &buf &len j 0 w) (buffer-str @buf @len))))
+
+(defun write-bytes (j: Json) -> (Array i8)
+  (let [buf (cell (new-buffer 256)) len (cell 0)]
+    (do (put-json &buf &len j 0 (WriteOptions 0 false)) (buffer-bytes @buf @len))))
+
+(defun write (j: Json) -> str (write-with j (WriteOptions 0 false)))
+(defun write-pretty (j: Json) -> str (write-with j (WriteOptions 2 false)))

@@ -1,0 +1,37 @@
+;; fib.json.utf8: strict UTF-8 validation of a byte array (docs/design/json.md 3). A `str` is always valid UTF-8 (str-from-bytes traps otherwise),
+;; so the parser needs this only where bytes enter: `parse-bytes` and `read-file` check the whole input once, before the str is made, and an invalid
+;; input is a `JsonError` with the byte offset. Rules (RFC 3629): no overlong forms (C0, C1, E0 80..9F, F0 80..8F), no surrogates (ED A0..BF), nothing above U+10FFFF
+;; (F4 90.., F5..FF). ASCII runs are skipped eight bytes at a time.
+(ns fib.json.utf8 (:use fib.core fib.seq fib.coll fib.json.types))
+
+(def high-bits: i64 -9187201950435737472)
+
+(defun byte-or-neg (b: (Array i8) n: i64 i: i64) -> i64 (if (< i n) (zext i64 (array-get b i)) -1))
+
+;; The length of the valid sequence starting at i (byte of 0x80 or more), or 0.
+(defun seq-len (b: (Array i8) n: i64 i: i64) -> i64
+  (let [b0 (byte-or-neg b n i) b1 (byte-or-neg b n (+ i 1))]
+    (cond (< b0 194) 0
+          (< b0 224) (if (and (>= b1 128) (< b1 192)) 2 0)
+          (< b0 240)
+          (let [lo (if (= b0 224) 160 128) hi (if (= b0 237) 160 192) b2 (byte-or-neg b n (+ i 2))]
+            (if (and (and (>= b1 lo) (< b1 hi)) (and (>= b2 128) (< b2 192))) 3 0))
+          (< b0 245)
+          (let [lo (if (= b0 240) 144 128) hi (if (= b0 244) 144 192) b2 (byte-or-neg b n (+ i 2)) b3 (byte-or-neg b n (+ i 3))]
+            (if (and (and (>= b1 lo) (< b1 hi)) (and (and (>= b2 128) (< b2 192)) (and (>= b3 128) (< b3 192)))) 4 0))
+          :else 0)))
+
+;; The offset of the first byte that is not part of valid UTF-8, or -1.
+(defun first-invalid (b: (Array i8)) -> i64
+  (let [n (array-len b)]
+    (loop [i 0]
+      (let [w (loop [k i] (if (and (<= (+ k 8) n) (= (bit-and (unsafe (load-i64 (ptr+ (raw b) (+ 24 k)))) high-bits) 0)) (recur (+ k 8)) k))
+            j (loop [k w] (if (and (< k n) (>= (array-get b k) 0i8)) (recur (+ k 1)) k))]
+        (if (>= j n) -1
+            (let [l (seq-len b n j)] (if (= l 0) j (recur (+ j l)))))))))
+
+(defun make-error-bytes (b: (Array i8) code: i64 offset: i64) -> JsonError
+  (loop [i 0 line 1 col 1]
+    (if (< i (min offset (array-len b)))
+        (if (= (array-get b i) 10i8) (recur (+ i 1) (+ line 1) 1) (recur (+ i 1) line (+ col 1)))
+        (JsonError code (error-message code) offset line col))))

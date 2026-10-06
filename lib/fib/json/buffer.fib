@@ -1,0 +1,71 @@
+;; fib.json.buffer: a growable byte buffer, linear in what is written (docs/design/json.md 4). `array-push!` is not one (it copies an array of 32
+;; elements or more on every push, spec/types.md 2.13.1), so the buffer is an `(Array i8)` of capacity `array-len` and a length in a second
+;; cell; both travel as in/out parameters. Bytes are written through raw pointers after `ensure` has made room: the unsafe is here, and a
+;; caller that says `ensure n` may write n bytes with `put-raw`. The data of an array or a str is 24 bytes after its raw pointer (rt/array.lir, rt/str.lir).
+(ns fib.json.buffer (:use fib.core fib.seq fib.coll) (:require [fib.json.libc :as libc]))
+
+(defun new-buffer (cap: i64) -> (Array i8) (array (max cap 64) 0i8))
+
+;; Room for `extra` more bytes after the first `len`.
+(defun ensure (&buf: (Array i8) &len: i64 extra: i64) -> unit
+  (let [need (+ @len extra) cap (array-len @buf)]
+    (when (> need cap)
+      (let [nb (array (max need (* cap 2)) 0i8)]
+        (do (unsafe (libc/memcpy (ptr+ (raw nb) 24) (ptr+ (raw @buf) 24) @len))
+            (set! buf nb))))))
+
+;; One byte, room already ensured.
+(defun put-raw (&buf: (Array i8) &len: i64 b: i64) -> unit
+  (do (unsafe (store-i8 (ptr+ (raw @buf) (+ 24 @len)) (trunc i8 b))) (set! len (+ @len 1))))
+
+(defun put-byte (&buf: (Array i8) &len: i64 b: i64) -> unit
+  (do (ensure &buf &len 1) (put-raw &buf &len b)))
+
+;; The bytes [from, to) of `s`.
+(defun put-slice (&buf: (Array i8) &len: i64 s: str from: i64 to: i64) -> unit
+  (when (> to from)
+    (do (ensure &buf &len (- to from))
+        (unsafe (libc/memcpy (ptr+ (raw @buf) (+ 24 @len)) (ptr+ (raw s) (+ 24 from)) (- to from)))
+        (set! len (+ @len (- to from))))))
+
+(defun put-str (&buf: (Array i8) &len: i64 s: str) -> unit (put-slice &buf &len s 0 (str-len s)))
+
+;; All of the bytes of `src`.
+(defun put-bytes (&buf: (Array i8) &len: i64 src: (Array i8)) -> unit
+  (let [m (array-len src)]
+    (when (> m 0)
+      (do (ensure &buf &len m)
+          (unsafe (libc/memcpy (ptr+ (raw @buf) (+ 24 @len)) (ptr+ (raw src) 24) m))
+          (set! len (+ @len m))))))
+
+;; The first `len` bytes as a str (one copy of the bytes; the buffer is not a str because its capacity is larger).
+(defun buffer-str (buf: (Array i8) len: i64) -> str (str-from-bytes (array-copy buf 0 len)))
+
+(defun buffer-bytes (buf: (Array i8) len: i64) -> (Array i8) (array-copy buf 0 len))
+
+;; ---- integers: two digits at a time from a table of the hundred pairs
+
+(def digit-pairs: str "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899")
+
+;; The digit count of the negative number x (x <= 0), 1 to 19.
+(defun neg-digits (x: i64) -> i64
+  (loop [n 1 p -10] (if (or (> x p) (>= n 19)) n (recur (+ n 1) (if (>= n 18) p (* p 10))))))
+
+;; The decimal text of v, two digits at a time, straight into the buffer: the digits are counted first and written from the last backwards.
+(defun put-i64 (&buf: (Array i8) &len: i64 v: i64) -> unit
+  (do (ensure &buf &len 21)
+      (when (< v 0) (put-raw &buf &len 45))
+      (let [w (if (< v 0) v (- 0 v))
+            n (neg-digits w)
+            base (+ 24 @len)]
+        (do (loop [k (+ base (- n 1)) x w]
+              (cond (<= x -100)
+                    (let [q (quot x 100) r (- (* q 100) x)]
+                      (do (unsafe (store-i8 (ptr+ (raw @buf) k) (str-byte-at digit-pairs (+ (* r 2) 1))))
+                          (unsafe (store-i8 (ptr+ (raw @buf) (- k 1)) (str-byte-at digit-pairs (* r 2))))
+                          (recur (- k 2) q)))
+                    (<= x -10)
+                    (do (unsafe (store-i8 (ptr+ (raw @buf) k) (str-byte-at digit-pairs (+ (* (- 0 x) 2) 1))))
+                        (unsafe (store-i8 (ptr+ (raw @buf) (- k 1)) (str-byte-at digit-pairs (* (- 0 x) 2)))))
+                    :else (unsafe (store-i8 (ptr+ (raw @buf) k) (trunc i8 (+ 48 (- 0 x)))))))
+            (set! len (+ @len n))))))

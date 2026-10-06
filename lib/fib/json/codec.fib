@@ -1,0 +1,58 @@
+;; fib.json.codec: typed records (docs/design/json.md 2, 5). `defjson` writes a struct, its `ToJson` instance (encode) and a decoder that reads the
+;; tape directly: no intermediate `Json` DOM is built, a field is found by key, converted in place and stored in the record.
+;;   (defjson Person [name: str age: i64 tags: (Vec str) boss: (Option Person) score: f64 ok: bool])
+;;   (->json p)                      -> Json            ; then fib.json/write
+;;   (decode-Person text)            -> (Result Person JsonError)       ; the function `decode-` + the name
+;;   (json->Person doc node)         -> (Option Person)                 ; for a record inside another document
+;; A field is i64, f64 (an integer is accepted), str, bool, (Vec T), (Option T) (a missing key or null is nil), or another defjson record. A missing
+;; key, a value of another kind or a number that does not fit is a mismatch: the result is an Err with code 16 (the key's offset is not tracked; the message names the type).
+;; Duplicate keys: the first one is read. Unknown keys are ignored.
+(ns fib.json.codec (:use fib.core fib.seq fib.coll fib.json.types fib.json.tape fib.json.tapebuild fib.json.view fib.json.convert) (:require [fib.json.codecform :as f]))
+
+(def e-mismatch: i64 16)
+
+(defun dec-i64 (d: Doc n: i64) -> (Option i64) (if (>= n 0) (node-i64 d n) nil))
+(defun dec-f64 (d: Doc n: i64) -> (Option f64) (if (>= n 0) (node-f64 d n) nil))
+(defun dec-str (d: Doc n: i64) -> (Option str) (if (>= n 0) (node-str d n) nil))
+(defun dec-bool (d: Doc n: i64) -> (Option bool) (if (>= n 0) (node-bool d n) nil))
+
+;; An array whose every element decodes through f.
+(defun dec-vec (d: Doc n: i64 f: (fn (i64) (Option a))) -> (Option (Vec a))
+  (if (and (>= n 0) (= (kind-of d n) k-array))
+      (let [end (word1 d n)]
+        (loop [j (+ n 2) out: (Vec a) []]
+          (if (>= j end) (some out)
+              (if-some [x (f j)] (recur (next-node d j) (conj out x)) nil))))
+      nil))
+
+;; Some of the inner Option when the key is there and not null; Some nil when it is missing or null; nil when the value does not decode.
+(defun dec-opt (d: Doc n: i64 f: (fn (i64) (Option a))) -> (Option (Option a))
+  (if (or (< n 0) (= (kind-of d n) k-null)) (some nil)
+      (if-some [x (f n)] (some (some x)) nil)))
+
+(defun decode-with (s: str what: str f: (fn (Doc i64) (Option a))) -> (Result a JsonError)
+  (match (tape-of s)
+    ((Err e) (Err e))
+    ((Ok d) (if-some [x (f d 0)] (Ok x) (Err (JsonError e-mismatch (str "the document does not match " what) 0 1 1))))))
+
+(defmacro defjson (head fields)
+  (let ((tag (match head ((Sym _) head) (_ (trap "defjson: the name is a symbol"))))
+        (items (match fields ((Vec xs) xs) (_ (trap "defjson: the fields are a vector [f: T ..]"))))
+        (name (f/sym-text head)))
+    (let ((n (quot (vec-count items) 2)))
+      (let ((names (loop ((i 0) (acc (vec-empty))) (if (< i n) (recur (+ i 1) (vec-conj acc (Sym (f/field-name (vec-nth items (* 2 i)))))) acc)))
+            (types (loop ((i 0) (acc (vec-empty))) (if (< i n) (recur (+ i 1) (vec-conj acc (vec-nth items (+ (* 2 i) 1)))) acc))))
+        (let ((keys (loop ((i 0) (acc (vec-empty))) (if (< i n) (recur (+ i 1) (vec-conj acc (Str (f/sym-text (vec-nth names i))))) acc)))
+              (encoded (loop ((i 0) (acc (vec-empty)))
+                         (if (< i n) (recur (+ i 1) (vec-conj acc `(->json (. self ~(vec-nth names i))))) acc)))
+              (built (loop ((i (- n 1)) (acc `(some (~tag ~@names))))
+                       (if (>= i 0)
+                           (recur (- i 1) `(if-some [~(vec-nth names i) ~(f/decoder (vec-nth types i) `(field d i ~(Str (f/sym-text (vec-nth names i)))))] ~acc nil))
+                           acc))))
+          `(do (defstruct ~head ~(List items))
+               (derive Eq ~tag)
+               (derive Debug ~tag)
+               (impl fib.json.convert/ToJson ~tag (->json (self) (JObj [~@keys] [~@encoded])))
+               (defun ~(Sym (str-concat "json->" name)) (d: Doc i: i64) -> (Option ~tag) ~built)
+               (defun ~(Sym (str-concat "decode-" name)) (s: str) -> (Result ~tag JsonError)
+                 (decode-with s ~(Str name) (fn (d: Doc i: i64) (~(Sym (str-concat "json->" name)) d i))))))))))

@@ -1,0 +1,26 @@
+;; scripts/json-testsuite.fib: runs fib.json over the files named on the command line (the JSONTestSuite's test_parsing files) and prints one line each:
+;;   NAME accept|reject CODE        (CODE is the JsonError code, 0 when accepted; a file that cannot be read prints `unreadable`)
+;; scripts/json-testsuite.sh compares the lines with the verdict the file name gives (y_ accept, n_ reject) and with specs/json-testsuite-i.expected (i_).
+;; Both readers are run: the DOM parser and the tape builder must agree on every file (except that a number out of double range, code 12, is the DOM's error and
+;; the tape's `nil` from node-f64: the tape defers the value of a number to the access).
+(ns main (:use fib.core fib.seq fib.coll fib.json.types fib.json.parse fib.json.tape fib.json.tapebuild) (:require [fib.os :as os]))
+
+(defun base-name (p: str) -> str
+  (loop [i (- (str-len p) 1)] (cond (< i 0) p (= (str-byte-at p i) 47i8) (str-slice p (+ i 1) (str-len p)) :else (recur (- i 1)))))
+
+(defun verdict (r: (Result Json JsonError)) -> i64 (match r ((Ok _) 0) ((Err e) (. e code))))
+(defun tape-verdict (r: (Result Doc JsonError)) -> i64 (match r ((Ok _) 0) ((Err e) (. e code))))
+
+(defun one (path: str) -> i64
+  (match (os/read-file-bytes path 1000000000)
+    ((Err _) (do (println (base-name path) "unreadable") 1))
+    ((Ok bytes)
+     (let [dom (verdict (parse-bytes bytes))
+           ;; the tape reader works on a str: invalid UTF-8 never reaches it (parse-bytes rejects it first), so it is run only when the bytes are valid
+           tape (if (= dom 6) 6 (tape-verdict (tape-of (str-from-bytes bytes))))]
+       (do (println (base-name path) (if (= dom 0) "accept" "reject") dom)
+           (if (= (or (= dom 0) (= dom 12)) (= tape 0)) 0 (do (println "DISAGREE" (base-name path) "dom" dom "tape" tape) 1)))))))
+
+(defun main () -> i64
+  (let [a (args)]
+    (loop [i 0 bad 0] (if (< i (count a)) (recur (+ i 1) (+ bad (one (nth a i)))) bad))))

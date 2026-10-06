@@ -1,0 +1,70 @@
+;; fib.json.escape: a string as a JSON string literal. The common case, a string with nothing to escape, is one scan and one memcpy: the scan
+;; reads eight bytes at a time (SWAR) and stops at a word holding a byte below 0x20, a quote, a backslash, or (for `ascii`) a byte of 0x80 or more.
+(ns fib.json.escape (:use fib.core fib.seq fib.coll fib.json.buffer))
+
+(def hex-digits: str "0123456789abcdef")
+
+(defun put-u (&buf: (Array i8) &len: i64 c: i64) -> unit
+  (do (ensure &buf &len 6)
+      (put-raw &buf &len 92) (put-raw &buf &len 117)
+      (put-raw &buf &len (zext i64 (str-byte-at hex-digits (bit-and (shr c 12) 15))))
+      (put-raw &buf &len (zext i64 (str-byte-at hex-digits (bit-and (shr c 8) 15))))
+      (put-raw &buf &len (zext i64 (str-byte-at hex-digits (bit-and (shr c 4) 15))))
+      (put-raw &buf &len (zext i64 (str-byte-at hex-digits (bit-and c 15))))))
+
+;; The byte at i, for a position known to be inside the str.
+(defun byte-at (s: str i: i64) -> i64 (zext i64 (str-byte-at s i)))
+
+;; The escape of the control or special byte c: the letter after the backslash, or 0 for \u00XX.
+(defun short-escape (c: i64) -> i64
+  (cond (= c 34) 34 (= c 92) 92 (= c 8) 98 (= c 12) 102 (= c 10) 110 (= c 13) 114 (= c 9) 116 :else 0))
+
+;; The code point of the UTF-8 sequence at i (valid: a str), and its length in the second cell.
+(defun decode-at (s: str i: i64 &w: i64) -> i64
+  (let [b0 (byte-at s i)]
+    (cond (< b0 224) (do (set! w 2) (+ (shl (bit-and b0 31) 6) (bit-and (byte-at s (+ i 1)) 63)))
+          (< b0 240) (do (set! w 3) (+ (shl (bit-and b0 15) 12) (+ (shl (bit-and (byte-at s (+ i 1)) 63) 6) (bit-and (byte-at s (+ i 2)) 63))))
+          :else (do (set! w 4) (+ (shl (bit-and b0 7) 18) (+ (shl (bit-and (byte-at s (+ i 1)) 63) 12)
+                                                              (+ (shl (bit-and (byte-at s (+ i 2)) 63) 6) (bit-and (byte-at s (+ i 3)) 63))))))))
+
+;; Does the 8-byte word x have a byte below 0x20, equal to 0x22 or 0x5c, or (when hi) with the top bit set? Each test is the exact
+;; "has byte less than" / "has byte equal" word trick of Hacker's Delight 6-2 without false positives on the lowest byte found.
+(defun has-special (x: i64 hi: bool) -> bool
+  (let [ones 72340172838076673
+        m80 -9187201950435737472
+        lt (bit-and (unchecked-subtract x (unchecked-multiply ones 32)) (bit-and (bit-not x) m80))
+        q (bit-xor x (unchecked-multiply ones 34))
+        eq1 (bit-and (unchecked-subtract q ones) (bit-and (bit-not q) m80))
+        b (bit-xor x (unchecked-multiply ones 92))
+        eq2 (bit-and (unchecked-subtract b ones) (bit-and (bit-not b) m80))
+        top (if hi (bit-and x m80) 0)]
+    (!= (bit-or (bit-or lt eq1) (bit-or eq2 top)) 0)))
+
+(defun plain-byte (b: i64 ascii: bool) -> bool (and (>= b 32) (and (!= b 34) (and (!= b 92) (or (not ascii) (< b 128))))))
+
+;; The index of the first byte at or after i that needs attention (or n).
+(defun scan-plain (s: str n: i64 i: i64 ascii: bool) -> i64
+  (let [wide (loop [k i] (if (and (<= (+ k 8) n) (not (has-special (unsafe (load-i64 (ptr+ (raw s) (+ 24 k)))) ascii))) (recur (+ k 8)) k))]
+    (loop [k wide] (if (and (< k n) (plain-byte (byte-at s k) ascii)) (recur (+ k 1)) k))))
+
+(defun put-escaped (&buf: (Array i8) &len: i64 s: str i: i64 ascii: bool) -> i64
+  (let [c (byte-at s i) e (short-escape c)]
+    (cond (> e 0) (do (ensure &buf &len 2) (put-raw &buf &len 92) (put-raw &buf &len e) (+ i 1))
+          (< c 128) (do (put-u &buf &len c) (+ i 1))
+          :else (let [w (cell 0) cp (decode-at s i &w)]
+                  (do (if (< cp 65536)
+                          (put-u &buf &len cp)
+                          (let [v (- cp 65536)] (do (put-u &buf &len (+ 55296 (shr v 10))) (put-u &buf &len (+ 56320 (bit-and v 1023))))))
+                      (+ i @w))))))
+
+;; `s` as a JSON string literal with its quotes.
+(defun put-string (&buf: (Array i8) &len: i64 s: str ascii: bool) -> unit
+  (let [n (str-len s)]
+    (do (put-byte &buf &len 34)
+        (loop [from 0 i (scan-plain s n 0 ascii)]
+          (if (>= i n)
+              (put-slice &buf &len s from n)
+              (do (put-slice &buf &len s from i)
+                  (let [j (put-escaped &buf &len s i ascii)]
+                    (recur j (scan-plain s n j ascii))))))
+        (put-byte &buf &len 34))))

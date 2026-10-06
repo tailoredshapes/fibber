@@ -1,0 +1,34 @@
+;; fib.json.convert: Json and the shared `Datum` (fib.datum), and `ToJson`, the protocol that makes plain data JSON (docs/design/json.md 5).
+;;   (json->datum j)   null to DNil, a bool, an integer, a float, a string to the Datum of its kind; an array or an object (a Datum is scalar) to a DStr of its compact JSON text
+;;   (datum->json d)   DNil null, DBool, DInt, DFloat (NaN and the infinities become JSON null: JSON has no such number), DStr, DBytes as a string of its hex digits
+;;   (->json x)        the protocol: i64 f64 bool str keyword Datum Json, `(Vec a)` and `(Option a)` of such (a `(Map str a)` through `map->json`); a library type adds an impl
+(ns fib.json.convert (:use fib.core fib.seq fib.coll fib.datum fib.json.types fib.json.write))
+
+(defun json->datum (j: Json) -> Datum
+  (match j
+    ((JNull) DNil) ((JBool b) (DBool b)) ((JInt i) (DInt i)) ((JFloat f) (DFloat f)) ((JStr s) (DStr s)) ((JBig t) (DStr t))
+    (_ (DStr (write j)))))
+
+(defun hex-of (b: (Array i8)) -> str (datum-text (DBytes b)))
+
+(defun datum->json (d: Datum) -> Json
+  (match d
+    ((DNil) JNull) ((DBool b) (JBool b)) ((DInt i) (JInt i)) ((DStr s) (JStr s)) ((DBytes b) (JStr (hex-of b)))
+    ((DFloat f) (if (= (- f f) 0.0) (JFloat f) JNull))))
+
+(defprotocol ToJson (->json (self) -> Json))
+(impl ToJson Json (->json (self) self))
+(impl ToJson i64 (->json (self) (JInt self)))
+(impl ToJson f64 (->json (self) (JFloat self)))
+(impl ToJson bool (->json (self) (JBool self)))
+(impl ToJson str (->json (self) (JStr self)))
+(impl ToJson keyword (->json (self) (JStr (keyword-text self))))
+(impl ToJson Datum (->json (self) (datum->json self)))
+(impl ToJson (Vec a) :where ((ToJson a)) (->json (self) (JArr (mapv (fn (x) (->json x)) self))))
+(impl ToJson (Option a) :where ((ToJson a)) (->json (self) (match self ((some x) (->json x)) (nil JNull))))
+
+;; A map with string keys as an object, each value through `f` (keys in the map's iteration order: sort them first for a stable text).
+(defun map->json (m: (Map str a) f: (fn (a) Json)) -> Json
+  (let [ks (vec (keys m))] (JObj ks (mapv (fn (k: str) (f (get-or-fail m k))) ks))))
+
+(defun get-or-fail (m: (Map str a) k: str) -> a (if-some [x (get m k)] x (trap "fib.json: key vanished")))

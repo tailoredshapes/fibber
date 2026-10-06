@@ -1,0 +1,77 @@
+;; The JSONTestSuite (nst/JSONTestSuite at 1ef36fa, test_parsing) as far as the gate can run it offline: 48 representative files committed under
+;; specs/json-testsuite-subset/ (y_ must parse, n_ must be rejected, i_ as recorded in specs/json-testsuite-i.expected). The whole suite (318 files) is
+;; scripts/json-testsuite.sh, which fetches it and verifies it against specs/json-testsuite.sha256.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.json.types fib.json.parse fib.json.tapebuild) (:require [fib.os :as os]))
+
+(defun cases () -> (Vec (Pair str bool))
+  [
+   (Pair "y_array_empty.json" true)
+   (Pair "y_array_with_several_null.json" true)
+   (Pair "y_number_negative_zero.json" true)
+   (Pair "y_number_real_capital_e_neg_exp.json" true)
+   (Pair "y_number_double_close_to_zero.json" true)
+   (Pair "y_object_duplicated_key.json" true)
+   (Pair "y_string_surrogates_U+1D11E_MUSICAL_SYMBOL_G_CLEF.json" true)
+   (Pair "y_string_unicode_2.json" true)
+   (Pair "y_string_nbsp_uescaped.json" true)
+   (Pair "y_string_escaped_control_character.json" true)
+   (Pair "y_string_accepted_surrogate_pair.json" true)
+   (Pair "y_structure_lonely_negative_real.json" true)
+   (Pair "y_structure_trailing_newline.json" true)
+   (Pair "y_string_null_escape.json" true)
+   (Pair "y_string_in_array.json" true)
+   (Pair "y_object_extreme_numbers.json" true)
+   (Pair "y_string_u+2028_line_sep.json" true)
+   (Pair "y_number_simple_int.json" true)
+   (Pair "y_string_last_surrogates_1_and_2.json" true)
+   (Pair "y_object_with_newlines.json" true)
+   (Pair "n_array_comma_after_close.json" false)
+   (Pair "n_array_extra_comma.json" false)
+   (Pair "n_array_unclosed.json" false)
+   (Pair "n_number_minus_sign_with_trailing_garbage.json" false)
+   (Pair "n_number_with_leading_zero.json" false)
+   (Pair "n_number_.2e-3.json" false)
+   (Pair "n_number_infinity.json" false)
+   (Pair "n_number_NaN.json" false)
+   (Pair "n_object_trailing_comma.json" false)
+   (Pair "n_object_single_quote.json" false)
+   (Pair "n_string_1_surrogate_then_escape_u1.json" false)
+   (Pair "n_string_invalid_backslash_esc.json" false)
+   (Pair "n_string_unescaped_ctrl_char.json" false)
+   (Pair "n_string_single_quote.json" false)
+   (Pair "n_structure_UTF8_BOM_no_data.json" false)
+   (Pair "n_structure_null-byte-outside-string.json" false)
+   (Pair "n_structure_object_with_trailing_garbage.json" false)
+   (Pair "n_string_invalid_utf8_after_escape.json" false)
+   (Pair "n_structure_100000_opening_arrays.json" false)
+   (Pair "n_incomplete_true.json" false)
+   (Pair "n_object_missing_colon.json" false)
+   (Pair "n_structure_comma_instead_of_closing_brace.json" false)
+   (Pair "n_string_escape_x.json" false)
+   (Pair "i_number_huge_exp.json" false)
+   (Pair "i_string_lone_second_surrogate.json" false)
+   (Pair "i_structure_500_nested_arrays.json" true)
+   (Pair "i_number_too_big_pos_int.json" true)
+   (Pair "i_string_UTF-8_invalid_sequence.json" false)
+  ])
+
+;; Does the parse (accepted?) differ from what the suite says, by the DOM parser or by the tape reader?
+(defun wrong (c: (Pair str bool) tape: bool) -> bool
+  (match (os/read-file-bytes (str "specs/json-testsuite-subset/" (. c fst)) 100000000)
+    ((Err _) true)
+    ((Ok b) (let [accepted (if tape
+                             (match (parse-bytes b) ((Err _) false) ((Ok _) (match (tape-of (str-from-bytes b)) ((Ok _) true) ((Err _) false))))
+                             (match (parse-bytes b) ((Ok _) true) ((Err _) false)))]
+              (!= accepted (. c snd))))))
+
+(defun wrong-names (tape: bool) -> (Vec str)
+  (vec (map (fn (c: (Pair str bool)) (. c fst)) (filter (fn (c: (Pair str bool)) (wrong c tape)) (cases)))))
+
+(defspecs specs
+  (feature "JSONTestSuite subset"
+    (scenario "the DOM parser agrees with the suite on every committed file"
+      (then (expect = [] (wrong-names false))))
+    (scenario "the tape reader agrees too"
+      (then (expect = [] (wrong-names true))))))
+
+(defun main () -> i64 (run-main (specs)))

@@ -1,0 +1,145 @@
+;; fib.json.view: the on-demand view over a tape (docs/design/json.md 2b). A node is the index of its first word in `(. doc words)`; nothing is
+;; read from the text until a function asks, and a key or a string that has no escape is not copied until `node-str` makes it a str (one slice).
+;;   (doc-root d)  (node-kind d i) -> "null" "boolean" "number" "string" "array" "object"
+;;   (node-str d i) (node-i64 d i) (node-f64 d i) (node-bool d i)   -> Option (nil when the node has another kind; node-i64 also nil outside i64)
+;;   (field d i "key") -> node index or -1 (the first pair with that key; the DOM reader's last-wins policy is not applied here)   (elem d i k) -> index or -1
+;;   (children d i) -> the number of elements of an array or pairs of an object          (next-node d i) -> the node after the whole subtree
+;;   (path d ["a" "0" "b"]) -> index or -1                                               (node->json d i) -> the subtree as a `Json` (the DOM reader's policies)
+(ns fib.json.view (:use fib.core fib.seq fib.coll fib.json.types fib.json.number fib.json.buffer fib.json.tape fib.json.parse))
+
+(defun doc-root (d: Doc) -> i64 0)
+
+(defun word0 (d: Doc i: i64) -> i64 (array-get (. d words) i))
+(defun word1 (d: Doc i: i64) -> i64 (array-get (. d words) (+ i 1)))
+(defun kind-of (d: Doc i: i64) -> i64 (bit-and (word0 d i) 255))
+(defun start-of (d: Doc i: i64) -> i64 (shr (word0 d i) 8))
+
+(defun node-kind (d: Doc i: i64) -> str
+  (let [k (kind-of d i)]
+    (cond (= k k-null) "null" (or (= k k-true) (= k k-false)) "boolean" (or (= k k-int) (= k k-float)) "number" (= k k-str) "string"
+          (= k k-array) "array" :else "object")))
+
+(defun container? (d: Doc i: i64) -> bool (>= (kind-of d i) k-array))
+
+(defun next-node (d: Doc i: i64) -> i64 (if (container? d i) (word1 d i) (+ i 2)))
+
+(defun children (d: Doc i: i64) -> i64
+  (let [end (word1 d i) obj (= (kind-of d i) k-object)]
+    (loop [j (+ i 2) c 0] (if (>= j end) c (recur (next-node d j) (+ c 1))))))
+
+;; ---- strings
+
+(defun end-of-str (d: Doc i: i64) -> i64 (bit-and (word1 d i) 4611686018427387903))
+(defun has-escape (d: Doc i: i64) -> bool (!= (bit-and (word1 d i) esc-flag) 0))
+
+;; Decodes the escapes of s[a, b) (already validated) into a str.
+(defun unescape (s: str a: i64 b: i64) -> str
+  (let [buf (cell (new-buffer (* 2 (- b a)))) len (cell 0) n (str-len s)]
+    (do (loop [i a run a]
+          (cond (>= i b) (put-slice &buf &len s run b)
+                (= (str-byte-at s i) 92i8)
+                (let [_ (put-slice &buf &len s run i)
+                      c (zext i64 (str-byte-at s (+ i 1)))
+                      simple (cond (= c 98) 8 (= c 102) 12 (= c 110) 10 (= c 114) 13 (= c 116) 9 (= c 117) -1 :else c)]
+                  (if (>= simple 0)
+                      (do (put-byte &buf &len simple) (recur (+ i 2) (+ i 2)))
+                      (let [u (hex4-value s n (+ i 2))]
+                        (if (and (>= u 55296) (< u 56320))
+                            (let [u2 (hex4-value s n (+ i 8))]
+                              (do (push-cp &buf &len (+ 65536 (+ (shl (- u 55296) 10) (- u2 56320)))) (recur (+ i 12) (+ i 12))))
+                            (do (push-cp &buf &len u) (recur (+ i 6) (+ i 6)))))))
+                :else (recur (+ i 1) run)))
+        (buffer-str @buf @len))))
+
+(defun node-str (d: Doc i: i64) -> (Option str)
+  (if (= (kind-of d i) k-str)
+      (some (if (has-escape d i) (unescape (. d src) (start-of d i) (end-of-str d i)) (str-slice (. d src) (start-of d i) (end-of-str d i))))
+      nil))
+
+;; Is the key node k equal to the text `key`? No copy when it has no escape.
+(defun key-is (d: Doc k: i64 key: str) -> bool
+  (if (has-escape d k)
+      (str-eq (unescape (. d src) (start-of d k) (end-of-str d k)) key)
+      (let [a (start-of d k) b (end-of-str d k) s (. d src)]
+        (and (= (- b a) (str-len key))
+             (loop [m 0] (cond (>= m (- b a)) true (= (str-byte-at s (+ a m)) (str-byte-at key m)) (recur (+ m 1)) :else false))))))
+
+;; ---- numbers and literals
+
+(defun node-i64 (d: Doc i: i64) -> (Option i64)
+  (if (= (kind-of d i) k-int)
+      (let [s (. d src) a (start-of d i) b (end-of-str d i) neg (= (str-byte-at s a) 45i8) ovf (cell false)
+            v (if (<= (- b a) 20) (digits-i64 s (if neg (+ a 1) a) b neg &ovf) 0)]
+        (if (or @ovf (> (- b a) 20)) nil (some v)))
+      nil))
+
+(defun node-f64 (d: Doc i: i64) -> (Option f64)
+  (let [k (kind-of d i)]
+    (if (or (= k k-int) (= k k-float))
+        (let [pos (cell (start-of d i)) fail (cell 0)
+              j (scan-number (. d src) (str-len (. d src)) &pos &fail 0 false)]
+          (match j ((JInt v) (some (double v))) ((JFloat f) (some f)) (_ nil)))
+        nil)))
+
+(defun node-bool (d: Doc i: i64) -> (Option bool)
+  (let [k (kind-of d i)] (cond (= k k-true) (some true) (= k k-false) (some false) :else nil)))
+
+;; ---- navigation
+
+(defun field (d: Doc i: i64 key: str) -> i64
+  (if (= (kind-of d i) k-object)
+      (let [end (word1 d i)]
+        (loop [j (+ i 2)]
+          (cond (>= j end) -1
+                (key-is d j key) (+ j 2)
+                :else (recur (next-node d (+ j 2))))))
+      -1))
+
+(defun elem (d: Doc i: i64 k: i64) -> i64
+  (if (and (= (kind-of d i) k-array) (>= k 0))
+      (let [end (word1 d i)]
+        (loop [j (+ i 2) c 0] (cond (>= j end) -1 (= c k) j :else (recur (next-node d j) (+ c 1)))))
+      -1))
+
+(defun path (d: Doc steps: (Vec str)) -> i64
+  (loop [i 0 cur 0]
+    (cond (< cur 0) -1
+          (= i (count steps)) cur
+          :else (let [st (nth steps i)
+                      nx (if (= (kind-of d cur) k-array) (let [k (index-of-text st)] (elem d cur k)) (field d cur st))]
+                  (recur (+ i 1) nx)))))
+
+(defun index-of-text (s: str) -> i64
+  (let [n (str-len s)]
+    (if (or (= n 0) (> n 15)) -1
+        (loop [i 0 v 0]
+          (if (= i n) v (let [c (zext i64 (str-byte-at s i))] (if (and (>= c 48) (<= c 57)) (recur (+ i 1) (+ (* v 10) (- c 48))) -1)))))))
+
+;; ---- to a Json
+
+(defun node-key (d: Doc k: i64) -> str
+  (if (has-escape d k) (unescape (. d src) (start-of d k) (end-of-str d k)) (str-slice (. d src) (start-of d k) (end-of-str d k))))
+
+(defun node->json-with (d: Doc i: i64 o: JsonOptions) -> Json
+  (let [k (kind-of d i)]
+    (cond (= k k-null) JNull (= k k-true) (JBool true) (= k k-false) (JBool false)
+          (= k k-str) (JStr (if-some [x (node-str d i)] x ""))
+          (or (= k k-int) (= k k-float))
+          (let [pos (cell (start-of d i)) fail (cell 0)] (scan-number (. d src) (str-len (. d src)) &pos &fail (. o numbers) (. o out-of-range)))
+          (= k k-array)
+          (let [end (word1 d i)]
+            (loop [j (+ i 2) items: (Vec Json) []] (if (>= j end) (JArr items) (recur (next-node d j) (conj items (node->json-with d j o))))))
+          :else (object->json d i o))))
+
+(defun object->json (d: Doc i: i64 o: JsonOptions) -> Json
+  (let [end (word1 d i)]
+    (loop [j (+ i 2) keys: (Vec str) [] vals: (Vec Json) [] idx: (Map str i64) {}]
+      (if (>= j end) (JObj keys vals)
+          (let [key (node-key d j) v (node->json-with d (+ j 2) o) dup (key-index keys idx key (. o duplicates))
+                m (count keys)]
+            (recur (next-node d (+ j 2))
+                   (if (>= dup 0) keys (conj keys key))
+                   (if (>= dup 0) (assoc vals dup v) (conj vals v))
+                   (if (>= dup 0) idx (next-index keys idx key m))))))))
+
+(defun node->json (d: Doc i: i64) -> Json (node->json-with d i (default-options)))

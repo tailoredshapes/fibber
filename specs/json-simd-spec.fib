@@ -1,0 +1,41 @@
+;; fib.json.stage1 (the SIMD structural index): its positions equal a scalar reference at every alignment of quotes, backslash runs and structural characters
+;; against the 64-byte blocks (a quote, an escape or a run of backslashes that straddles a block boundary is where an off-by-one or a lost carry shows), on random
+;; documents, and on a long string that spans many blocks.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.json.types fib.json.write fib.json.gen fib.json.stage1))
+
+(defun reference (a: (Array i8)) -> (Vec i64)
+  (loop [i 0 instr false esc false out: (Vec i64) []]
+    (if (>= i (array-len a)) out
+        (let [c (array-get a i)]
+          (cond esc (recur (+ i 1) instr false out)
+                (and instr (= c 92i8)) (recur (+ i 1) instr true out)
+                (= c 34i8) (recur (+ i 1) (not instr) false (conj out i))
+                (and (not instr) (or (= c 123i8) (or (= c 125i8) (or (= c 91i8) (or (= c 93i8) (or (= c 58i8) (= c 44i8))))))) (recur (+ i 1) instr false (conj out i))
+                :else (recur (+ i 1) instr false out))))))
+
+(defun index-of (s: str) -> (Vec i64)
+  (let [a (str-bytes s) r (structural-index a (array-len a))]
+    (vec (map (fn (i: i64) (array-get (. r fst) i)) (range (. r snd))))))
+
+(defun agrees (s: str) -> bool (= (index-of s) (reference (str-bytes s))))
+
+(defun snippets () -> (Vec str)
+  ["\"a\\\\\"" "\"\\\"\"" "\"x\\\\\\\"y\"" "[1,2]" "{\"k\":\"v\"}" "\"\\\\\\\\\\\\\"" "\"\\\\\\\\\\\"\"" ",:[]{}" "\"{[,:]}\""])
+
+;; Every snippet at every offset from 0 to 131 (so each lands across each boundary of the 64-byte blocks, and across 2 of them), after plain padding.
+(defun shifted-failures () -> (Vec str)
+  (vec (filter (fn (t: str) (not (agrees t)))
+               (mapcat (fn (sn: str) (map (fn (pad: i64) (str (str-join (vec (map (fn (i: i64) " ") (range pad)))) sn)) (range 132))) (snippets)))))
+
+(defspecs specs
+  (feature "fib.json.stage1"
+    (scenario "a quote, an escape or a backslash run at every alignment against the 64-byte blocks"
+      (then (expect = [] (vec (map (fn (t: str) (pr-str t)) (shifted-failures))))))
+    (scenario "one long string with backslash runs across many blocks"
+      (given [t (str "\"" (str-join (vec (map (fn (i: i64) (if (= (rem i 5) 0) "\\\\" (if (= (rem i 7) 0) "\\\"" "ab"))) (range 400)))) "\",[1]")])
+      (then (expect = true (agrees t))))
+    (scenario "the tail block shorter than 64 bytes, every length from 0 to 130"
+      (then (expect = [] (vec (filter (fn (n: i64) (not (agrees (str-join (vec (map (fn (i: i64) (if (= (rem i 3) 0) "[" (if (= (rem i 3) 1) "\"" ",")))  (range n))))))) (range 131))))))
+    (prop "random documents (compact and pretty)" [x (gen-json)] (and (agrees (write x)) (agrees (write-pretty x))))))
+
+(defun main () -> i64 (run-main (specs)))

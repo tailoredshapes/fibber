@@ -1,0 +1,21 @@
+;; fib.json properties (docs/design/json.md 6): random documents from fib.json.gen (fixed seed, shrinking) go through every writer and every reader
+;; and must come back equal. A planted fault in the writer, the parser, the tape or the float code makes one of these fail with a shrunk document.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.json.types fib.json.parse fib.json.write fib.json.tapebuild fib.json.view fib.json.gen))
+
+(defun same (r: (Result Json JsonError) x: Json) -> bool (match r ((Ok y) (= x y)) ((Err _) false)))
+(defun via-tape (s: str) -> (Result Json JsonError) (match (tape-of s) ((Ok d) (Ok (node->json d 0))) ((Err e) (Err e))))
+
+(defspecs specs
+  (feature "fib.json round trips"
+    (prop "parse of write is the value (compact)" [x (gen-json)] (same (parse (write x)) x))
+    (prop "parse of write-pretty is the value" [x (gen-json)] (same (parse (write-pretty x)) x))
+    (prop "parse of the ascii-only text is the value" [x (gen-json)] (same (parse (write-with x (WriteOptions 0 true))) x))
+    (prop "the ascii-only text is ASCII" [x (gen-json)]
+          (let [t (write-with x (WriteOptions 0 true))] (loop [i 0] (cond (>= i (str-len t)) true (< (str-byte-at t i) 0i8) false :else (recur (+ i 1))))))
+    (prop "the tape reader reads what the writer wrote" [x (gen-json)] (same (via-tape (write x)) x))
+    (prop "the tape reader reads the pretty text" [x (gen-json)] (same (via-tape (write-pretty x)) x))
+    (prop "writing what was parsed gives the same text" [x (gen-json)]
+          (let [t (write x)] (match (parse t) ((Ok y) (= (write y) t)) ((Err _) false))))
+    (prop "parse-bytes of the bytes written is the value" [x (gen-json)] (same (parse-bytes (write-bytes x)) x))))
+
+(defun main () -> i64 (run-main (specs)))

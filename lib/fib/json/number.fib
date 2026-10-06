@@ -1,0 +1,104 @@
+;; fib.json.number: the JSON number grammar and its value (docs/design/json.md 3). One pass validates and accumulates the digits into an
+;; i64 mantissa; an integer is an i64 when it fits; a float is exact by Clinger's fast path (mantissa below 2^53, power of ten up to 22),
+;; else by Eisel-Lemire (fib.json.eisel), else by libc's strtod on a NUL-terminated copy of the token (every path is checked against
+;; strtod, scripts/json-floats.sh).
+;;   (scan-number s n &pos &fail numbers out-of-range) -> Json     pos at the first byte; after it, pos is past the number, or fail is set and pos is the bad byte
+(ns fib.json.number (:use fib.core fib.seq fib.coll fib.json.types) (:require [fib.json.libc :as libc] [fib.json.eisel :as el]))
+
+(def pow10: (Vec f64) [1.0 1.0e1 1.0e2 1.0e3 1.0e4 1.0e5 1.0e6 1.0e7 1.0e8 1.0e9 1.0e10 1.0e11 1.0e12 1.0e13 1.0e14 1.0e15 1.0e16 1.0e17 1.0e18 1.0e19 1.0e20 1.0e21 1.0e22])
+
+;; The byte at i as 0 to 255, or -1 at the end.
+(defun at (s: str n: i64 i: i64) -> i64 (if (< i n) (unsafe (zext i64 (load-i8 (ptr+ (raw s) (+ 24 i))))) -1))
+
+(defun skip-digits (s: str n: i64 i: i64) -> i64
+  (loop [k i] (let [b (at s n k)] (if (and (>= b 48) (<= b 57)) (recur (+ k 1)) k))))
+
+;; The token s[a, b) as a double by libc's strtod.
+(defun strtod-token (s: str a: i64 b: i64) -> f64
+  (unsafe
+    (let [p (alloc (+ (- b a) 9))]
+      (do (loop [k a] (when (< k b) (do (store-i8 (ptr+ p (- k a)) (str-byte-at s k)) (recur (+ k 1)))))
+          (store-i8 (ptr+ p (- b a)) 0i8)
+          (let [r (libc/strtod p (ptr+ p (+ (- b a) 1)))] (do (free p) r))))))
+
+;; The i64 of the digits s[a, b) (at most 19), `neg` the sign; -1 flag in the second result is not available, so overflow answers 0 and sets `ovf`.
+;; Accumulated negatively so that i64's minimum is reachable.
+(defun digits-i64 (s: str a: i64 b: i64 neg: bool &ovf: bool) -> i64
+  (loop [k a acc 0]
+    (if (>= k b)
+        (cond neg acc
+              (= acc -9223372036854775808) (do (set! ovf true) 0)
+              :else (- 0 acc))
+        (let [d (- (zext i64 (str-byte-at s k)) 48)]
+          (cond (< acc -922337203685477580) (do (set! ovf true) 0)
+                (and (= acc -922337203685477580) (> d (if neg 8 7))) (do (set! ovf true) 0)
+                :else (recur (+ k 1) (- (* acc 10) d)))))))
+
+;; The exponent digits s[a, b) as a number, capped at 100000 so a hostile exponent cannot overflow.
+(defun exp-value (s: str a: i64 b: i64) -> i64
+  (loop [k a v 0]
+    (if (>= k b) v (recur (+ k 1) (if (> v 100000) v (+ (* v 10) (- (zext i64 (str-byte-at s k)) 48)))))))
+
+(defun fail-at (&pos: i64 &fail: i64 code: i64 at: i64) -> unit (do (set! pos at) (set! fail code)))
+
+;; The mantissa of the digits of s[a, b) with the dot at index `dot` removed (dot = b when there is none), leading zeros skipped: the count of
+;; significant digits in the second cell. Callers use it only when at most 19 significant digits remain.
+(defun mantissa (s: str a: i64 b: i64 &nd: i64) -> i64
+  (loop [k a w 0 nsig 0]
+    (if (>= k b)
+        (do (set! nd nsig) w)
+        (let [c (zext i64 (str-byte-at s k))]
+          (cond (= c 46) (recur (+ k 1) w nsig)
+                (and (= w 0) (= c 48)) (recur (+ k 1) w nsig)
+                (>= nsig 18) (recur (+ k 1) w (+ nsig 1))
+                :else (recur (+ k 1) (+ (* w 10) (- c 48)) (+ nsig 1)))))))
+
+(defun finish-float (s: str a: i64 b: i64 neg: bool w: i64 nd: i64 e10: i64 out-of-range: bool &pos: i64 &fail: i64 end: i64) -> Json
+  (let [x (cond (= w 0) 0.0
+                (and (<= nd 15) (>= e10 -22) (<= e10 22) (<= w 9007199254740992))
+                (if (< e10 0) (/ (double w) (nth pow10 (- 0 e10))) (* (double w) (nth pow10 e10)))
+                :else (let [r (if (<= nd 18) (el/eisel-lemire w e10) 0.0)]
+                        (if (> r 0.0) r (strtod-token s a b))))]
+    (if (and (> x 1.7976931348623157e308) (not out-of-range))
+        (do (fail-at &pos &fail e-range a) (JFloat 0.0))
+        (do (set! pos end) (JFloat (if neg (* x -1.0) x))))))
+
+(defun scan-number (s: str n: i64 &pos: i64 &fail: i64 numbers: i64 out-of-range: bool) -> Json
+  (let [a @pos
+        neg (= (at s n a) 45)
+        i0 (if neg (+ a 1) a)
+        i1 (skip-digits s n i0)
+        d1 (- i1 i0)]
+    (cond (= d1 0) (do (fail-at &pos &fail (if (>= i0 n) e-eof e-number) i0) JNull)
+          (and (> d1 1) (= (at s n i0) 48)) (do (fail-at &pos &fail e-number (+ i0 1)) JNull)
+          :else
+          (let [dot (= (at s n i1) 46)
+                i2 (if dot (skip-digits s n (+ i1 1)) i1)]
+            (if (and dot (= i2 (+ i1 1)))
+                (do (fail-at &pos &fail (if (>= i2 n) e-eof e-number) i2) JNull)
+                (let [ec (at s n i2)
+                      has-e (or (= ec 101) (= ec 69))
+                      sg (at s n (+ i2 1))
+                      jx (if has-e (if (or (= sg 43) (= sg 45)) (+ i2 2) (+ i2 1)) i2)
+                      i3 (if has-e (skip-digits s n jx) i2)]
+                  (if (and has-e (= i3 jx))
+                      (do (fail-at &pos &fail (if (>= i3 n) e-eof e-number) i3) JNull)
+                      (if (and (not dot) (not has-e))
+                          (finish-int s a i0 i1 neg numbers &pos &fail)
+                          (finish-frac s a i0 i1 i2 i3 neg dot has-e (= sg 45) jx out-of-range numbers &pos &fail)))))))))
+
+(defun finish-int (s: str a: i64 i0: i64 i1: i64 neg: bool numbers: i64 &pos: i64 &fail: i64) -> Json
+  (let [ovf (cell false)
+        v (if (<= (- i1 i0) 19) (digits-i64 s i0 i1 neg &ovf) 0)]
+    (if (or (> (- i1 i0) 19) @ovf)
+        (do (set! pos i1) (if (>= numbers 1) (JBig (str-slice s a i1)) (JFloat (strtod-token s a i1))))
+        (do (set! pos i1) (JInt v)))))
+
+(defun finish-frac (s: str a: i64 i0: i64 i1: i64 i2: i64 i3: i64 neg: bool dot: bool has-e: bool eneg: bool jx: i64 out-of-range: bool numbers: i64 &pos: i64 &fail: i64) -> Json
+  (if (= numbers 2)
+      (do (set! pos i3) (JBig (str-slice s a i3)))
+      (let [nd (cell 0)
+            w (mantissa s i0 i2 &nd)
+            ev (if has-e (exp-value s jx i3) 0)
+            e10 (- (if eneg (- 0 ev) ev) (if dot (- i2 (+ i1 1)) 0))]
+        (finish-float s i0 i3 neg w @nd e10 out-of-range &pos &fail i3))))

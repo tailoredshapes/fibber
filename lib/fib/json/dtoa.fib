@@ -1,0 +1,107 @@
+;; fib.json.dtoa: a double as the shortest decimal text that reads back as the same double (docs/design/json.md 4). Schubfach (Giulietti, "The Schubfach
+;; way to render doubles", the algorithm of the JDK's Double.toString since 19): three multiplications of the 126-bit table entry g(k) (fib.json.pow10) by
+;; the scaled mantissa and its two neighbours give the interval of decimals that round to the double; one of the candidates inside it is the answer, the
+;; closest to the double. No division, no big integers, no libc. Verified against Python's repr on millions of doubles (scripts/json-floats.sh).
+;; The text always has a `.` or an exponent, so that it reads back as a float: `100.0`, `1.5e-7`, `1e21`; plain notation for decimal exponents -5 to 16.
+(ns fib.json.dtoa (:use fib.core fib.seq fib.coll fib.json.buffer fib.json.eisel fib.json.pow10))
+
+(def mask63: i64 9223372036854775807)
+
+(defun flog10pow2 (e: i64) -> i64 (sar (* e 677859288149824) 51))
+(defun flog10-three-quarters-pow2 (e: i64) -> i64 (sar (- (* e 677859288149824) 281337023816640) 51))
+(defun flog2pow10 (e: i64) -> i64 (sar (* e 935039633142894) 48))
+
+;; Schubfach's rounding to odd of g * cp / 2^126, g = g1 2^63 + g0.
+(defun rop (g1: i64 g0: i64 cp: i64) -> i64
+  (let [l (cell 0)
+        x1 (mul128 g0 cp &l)
+        y0 (unchecked-multiply g1 cp)
+        y1 (mul128 g1 cp &l)
+        z (unchecked-add (shr y0 1) x1)
+        vbp (unchecked-add y1 (shr z 63))]
+    (bit-or vbp (shr (unchecked-add (bit-and z mask63) mask63) 63))))
+
+;; The decimal f * 10^k for the double with mantissa c and exponent q (c * 2^q), c > 0: f has at most 17 digits and may end in zeros. Answers f, k in `kout`.
+(defun to-decimal (c: i64 q: i64 &kout: i64) -> i64
+  (let [out (bit-and c 1)
+        cb (shl c 2)
+        cbr (+ cb 2)
+        regular (or (!= c 4503599627370496) (= q -1074))
+        cbl (if regular (- cb 2) (- cb 1))
+        k (if regular (flog10pow2 q) (flog10-three-quarters-pow2 q))
+        h (+ (+ q (flog2pow10 (- 0 k))) 2)
+        idx (* 2 (+ k 324))
+        g1 (array-get pow10 idx)
+        g0 (array-get pow10 (+ idx 1))
+        vb (rop g1 g0 (shl cb h))
+        vbl (rop g1 g0 (shl cbl h))
+        vbr (rop g1 g0 (shl cbr h))
+        s (sar vb 2)]
+    (do (set! kout k)
+        (let [sp10 (* 10 (quot s 10))
+              tp10 (+ sp10 10)
+              upin (<= (+ vbl out) (shl sp10 2))
+              wpin (<= (+ (shl tp10 2) out) vbr)]
+          (if (and (>= s 100) (!= upin wpin))
+              (if upin sp10 tp10)
+              (let [t (+ s 1)
+                    uin (<= (+ vbl out) (shl s 2))
+                    win (<= (+ (shl t 2) out) vbr)]
+                (if (!= uin win)
+                    (if uin s t)
+                    (let [cmp (- vb (shl (+ s t) 1))]
+                      (if (or (< cmp 0) (and (= cmp 0) (= (bit-and s 1) 0))) s t)))))))))
+
+(defun digit-count (f: i64) -> i64
+  (loop [n 1 p 10] (if (or (>= n 19) (< f p)) n (recur (+ n 1) (* p 10)))))
+
+(defun pow10-int (n: i64) -> i64 (loop [i 0 p 1] (if (= i n) p (recur (+ i 1) (* p 10)))))
+
+;; The digits of f (n of them) as bytes into the buffer.
+(defun put-digits (&buf: (Array i8) &len: i64 f: i64 n: i64) -> unit
+  (let [tmp (cell (array 20 0i8))]
+    (do (loop [i (- n 1) x f] (when (>= i 0) (do (array-set! &tmp i (trunc i8 (+ 48 (rem x 10)))) (recur (- i 1) (quot x 10)))))
+        (loop [i 0] (when (< i n) (do (put-raw &buf &len (zext i64 (array-get @tmp i))) (recur (+ i 1))))))))
+
+(defun put-zeros (&buf: (Array i8) &len: i64 n: i64) -> unit (loop [i 0] (when (< i n) (do (put-raw &buf &len 48) (recur (+ i 1))))))
+
+;; The n digits of v, with leading zeros.
+(defun put-digits-padded (&buf: (Array i8) &len: i64 v: i64 n: i64) -> unit (put-digits &buf &len v n))
+
+;; f (no trailing zeros, n digits) times 10^k, as JSON text.
+(defun put-decimal (&buf: (Array i8) &len: i64 f: i64 n: i64 k: i64) -> unit
+  (let [e (+ k (- n 1))]
+    (do (ensure &buf &len 40)
+        (cond (and (>= e 0) (< e 17))
+              (if (<= n (+ e 1))
+                  (do (put-digits &buf &len f n) (put-zeros &buf &len (- (+ e 1) n)) (put-raw &buf &len 46) (put-raw &buf &len 48))
+                  (let [ip (quot f (pow10-int (- n (+ e 1))))
+                        fp (- f (* ip (pow10-int (- n (+ e 1)))))]
+                    (do (put-digits &buf &len ip (+ e 1)) (put-raw &buf &len 46) (put-digits-padded &buf &len fp (- n (+ e 1))))))
+              (and (< e 0) (>= e -5))
+              (do (put-raw &buf &len 48) (put-raw &buf &len 46) (put-zeros &buf &len (- (- 0 e) 1)) (put-digits &buf &len f n))
+              :else
+              (let [lead (quot f (pow10-int (- n 1)))
+                    rest (- f (* lead (pow10-int (- n 1))))
+                    ae (if (< e 0) (- 0 e) e)]
+                (do (put-raw &buf &len (+ 48 lead))
+                    (when (> n 1) (do (put-raw &buf &len 46) (put-digits-padded &buf &len rest (- n 1))))
+                    (put-raw &buf &len 101)
+                    (when (< e 0) (put-raw &buf &len 45))
+                    (put-digits &buf &len ae (digit-count ae))))))))
+
+(defun put-f64 (&buf: (Array i8) &len: i64 x: f64) -> unit
+  (if (!= (- x x) 0.0)
+      (put-str &buf &len "null")
+      (let [bits (f64->bits x)
+            neg (< bits 0)
+            mag (bit-and bits mask63)
+            bq (shr mag 52)
+            frac (bit-and mag 4503599627370495)]
+        (do (when neg (put-byte &buf &len 45))
+            (if (= mag 0)
+                (put-str &buf &len "0.0")
+                (let [kc (cell 0)
+                      f0 (if (= bq 0) (to-decimal frac -1074 &kc) (to-decimal (bit-or frac 4503599627370496) (- bq 1075) &kc))
+                      fk (loop [f f0 k @kc] (if (= (rem f 10) 0) (recur (quot f 10) (+ k 1)) (Pair f k)))]
+                  (put-decimal &buf &len (. fk fst) (digit-count (. fk fst)) (. fk snd))))))))

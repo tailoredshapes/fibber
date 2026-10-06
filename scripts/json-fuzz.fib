@@ -1,0 +1,56 @@
+;; scripts/json-fuzz.fib N SEED: N mutated documents. Each starts from a random valid document (fib.json.gen) written compact or pretty, then gets 1 to 4
+;; mutations (flip a bit, replace a byte by a structural or random byte, insert, delete, truncate, duplicate a stretch, splice in a piece of another document).
+;; Every input goes to parse-bytes and, when it is valid UTF-8, to the tape reader; neither may trap (a trap aborts this program: no try/catch is used,
+;; the readers must answer with an Err), the two must agree on accept or reject (a number out of range aside), and when both accept, the DOM read through the tape must
+;; equal the DOM parse. Prints the counts; exits 1 on any disagreement.
+(ns main (:use fib.core fib.seq fib.coll fib.rng fib.test.gen fib.json.types fib.json.parse fib.json.write fib.json.tapebuild fib.json.view fib.json.gen fib.json.utf8))
+
+(def specials: (Vec i64) [34 92 91 93 123 125 44 58 45 48 49 101 69 46 43 116 102 110 117 32 10 0 255 128 192 237 240])
+
+(defun bytes-of (s: str) -> (Vec i64) (let [a (str-bytes s)] (mapv (fn (i: i64) (bit-and (zext i64 (array-get a i)) 255)) (range (array-len a)))))
+
+(defun to-array (v: (Vec i64)) -> (Array i8)
+  (let [a (cell (array (count v) 0i8))] (do (dotimes (i (count v)) (array-set! &a i (trunc i8 (nth v i)))) @a)))
+
+(defun mutate-once (r: Rng v: (Vec i64) other: (Vec i64)) -> (Vec i64)
+  (let [n (count v) k (rng-between r 0 6) at (if (> n 0) (rng-between r 0 (- n 1)) 0)]
+    (cond (= n 0) [(rng-between r 0 255)]
+          (= k 0) (assoc v at (bit-xor (nth v at) (shl 1 (rng-between r 0 7))))
+          (= k 1) (assoc v at (nth specials (rng-between r 0 (- (count specials) 1))))
+          (= k 2) (vec (concat (concat (take at v) [(nth specials (rng-between r 0 (- (count specials) 1)))]) (drop at v)))
+          (= k 3) (vec (concat (take at v) (drop (+ at 1) v)))
+          (= k 4) (vec (take at v))
+          (= k 5) (vec (concat (concat (take at v) (take (rng-between r 1 8) (drop at v))) (drop at v)))
+          :else (vec (concat (concat (take at v) (take (rng-between r 1 12) (drop (rng-between r 0 (max 0 (- (count other) 1))) other))) (drop at v))))))
+
+(defun mutate (r: Rng v: (Vec i64) other: (Vec i64)) -> (Vec i64)
+  (loop [i 0 cur v] (if (< i (rng-between r 1 4)) (recur (+ i 1) (mutate-once r cur other)) cur)))
+
+;; 0 agree and rejected, 1 agree and accepted, 2 disagree
+(defun judge (b: (Array i8)) -> i64
+  (let [dom (parse-bytes b)]
+    (match dom
+      ((Err e)
+       (if (= (. e code) 6) 0
+           (match (tape-of (str-from-bytes b)) ((Err _) 0) ((Ok _) (if (= (. e code) 12) 0 2)))))
+      ((Ok x)
+       (match (tape-of (str-from-bytes b)) ((Err _) 2) ((Ok d) (if (= (node->json d 0) x) 1 2)))))))
+
+(defun doc-bytes (r: Rng i: i64) -> (Vec i64)
+  (let [j (gen-json-at r (+ 1 (rem i 12)))] (bytes-of (if (= (rem i 3) 0) (write-pretty j) (write j)))))
+
+(defun main () -> i64
+  (let [a (args)
+        n (if-some [v (parse-long (nth a 0))] v 1000)
+        seed (if-some [v (parse-long (nth a 1))] v 1)
+        r (rng-new seed)]
+    (loop [i 0 rej 0 acc 0 bad 0]
+      (if (= i n)
+          (do (println "mutated inputs:" n "rejected" rej "accepted" acc "disagreements" bad) (if (= bad 0) 0 1))
+          (let [v (doc-bytes r i)
+                m (mutate r v (doc-bytes r (+ i 7)))
+                verdict (judge (to-array m))]
+            (do (when (= verdict 2) (println "DISAGREE on" (pr-str (str-from-bytes-lossy m))))
+                (recur (+ i 1) (+ rej (if (= verdict 0) 1 0)) (+ acc (if (= verdict 1) 1 0)) (+ bad (if (= verdict 2) 1 0)))))))))
+
+(defun str-from-bytes-lossy (v: (Vec i64)) -> str (str-join (mapv (fn (x: i64) (str x " ")) v)))

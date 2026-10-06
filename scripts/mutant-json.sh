@@ -1,0 +1,65 @@
+#!/bin/bash
+# scripts/mutant-json.sh: planted faults in fib.json (docs/design/json.md 6). Copies lib/ of this tree to a scratch directory, applies ONE mutant, runs the specs that
+# guard that part with a stage 2 (FIBC; default the gate's F of this tree) pointing FIB_LIB at the copy: at least one scenario must FAIL (a wrong answer, a trap or a build
+# error all count). A mutant under which every spec passes means a part has no test that can fail.
+# usage: scripts/mutant-json.sh [MUTANT..]        (default: all)
+#   escape-wrong      writer: the escape of a newline is `\m`                          (specs/json-spec.fib, json-prop-spec.fib)
+#   swar-control      writer: the eight-byte scan lets byte 0x1f through (< 31)          (specs/json-prop-spec.fib)
+#   simd-boundary     stage 1: the tail block keeps one byte too few (off by one)       (specs/json-simd-spec.fib)
+#   simd-backslash    stage 1: the odd-backslash-run mask loses the even/odd parity      (specs/json-simd-spec.fib)
+#   simd-instring     stage 1: the in-string state is not carried into the next block   (specs/json-simd-spec.fib)
+#   float-tie         Eisel-Lemire: an exact halfway case rounds up, not to even         (specs/json-floats-spec.fib)
+#   float-print       Schubfach: the lower interval bound is exclusive for even mantissas (specs/json-floats-spec.fib)
+#   clinger           Clinger fast path accepts a mantissa above 2^53                    (specs/json-floats-spec.fib)
+#   depth-off-by-one  parser: nesting limit is `>` where it must be `>=`                 (specs/json-spec.fib)
+#   tape-depth        tape reader: the same                                              (specs/json-api-spec.fib)
+#   leading-zero      number grammar: a leading zero is accepted                         (specs/json-spec.fib)
+#   utf8-overlong     UTF-8 check: C0 and C1 lead bytes are accepted                     (specs/json-spec.fib)
+#   lone-surrogate    a lone low surrogate escape is accepted                            (specs/json-spec.fib)
+#   dup-last-wins     duplicate keys: the first value wins                               (specs/json-spec.fib)
+# environment: FIBC, MUT_OUT (scratch). exit: 0 when every mutant was killed, 1 when one survived, 2 for a setup error.
+set -uo pipefail
+R=$(cd "$(dirname "$0")/.." && pwd)
+FIBC=${FIBC:-$HOME/.cache/fibber-scratch/gate-$(basename "$R")/F}
+[ -x "$FIBC" ] || { echo "mutant-json: no stage 2 fibc: set FIBC" >&2; exit 2; }
+OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-json}
+MUTANTS=("$@")
+[ ${#MUTANTS[@]} -gt 0 ] || MUTANTS=(escape-wrong swar-control simd-boundary simd-backslash simd-instring float-tie float-print clinger depth-off-by-one tape-depth leading-zero utf8-overlong lone-surrogate dup-last-wins)
+
+sub() { perl -0pi -e "$2" "$1"; cmp -s "$1" "$1.orig" && { echo "mutant-json: pattern not found in $1: $2" >&2; return 1; }; return 0; }
+mutate() { # mutate NAME TREE -> sets SPECS
+  local f t=$2; local j=$t/lib/fib/json
+  case $1 in
+    escape-wrong)     f=$j/escape.fib; cp $f $f.orig; SPECS="json-spec json-prop-spec"; sub $f 's/\(= c 10\) 110/(= c 10) 109/' ;;
+    swar-control)     f=$j/escape.fib; cp $f $f.orig; SPECS="json-prop-spec json-spec"; sub $f 's/\(unchecked-multiply ones 32\)/(unchecked-multiply ones 31)/' ;;
+    simd-boundary)    f=$j/stage1.fib; cp $f $f.orig; SPECS="json-simd-spec"; sub $f 's/\(shl 1 \(- n full\)\)/(shl 1 (- (- n full) 1))/' ;;
+    simd-backslash)   f=$j/stage1.fib; cp $f $f.orig; SPECS="json-simd-spec"; sub $f 's/\(bit-not even-bits\)\) \(bit-not follows\)/even-bits) (bit-not follows)/' ;;
+    simd-instring)    f=$j/stage1.fib; cp $f $f.orig; SPECS="json-simd-spec"; sub $f 's/\(set! instr \(sar in-string 63\)\)/(set! instr 0)/' ;;
+    float-tie)        f=$j/eisel.fib; cp $f $f.orig; SPECS="json-floats-spec"; sub $f 's/\(= \(bit-and mant 3\) 1\)/(= (bit-and mant 3) 7)/' ;;
+    float-print)      f=$j/dtoa.fib; cp $f $f.orig; SPECS="json-floats-spec json-prop-spec"; sub $f 's/upin \(<= \(\+ vbl out\) \(shl sp10 2\)\)/upin (<= (+ vbl 1) (shl sp10 2))/' ;;
+    clinger)          f=$j/number.fib; cp $f $f.orig; SPECS="json-floats-spec"; sub $f 's/\(<= nd 15\)/(<= nd 18)/; s/\(<= w 9007199254740992\)/(<= w 900719925474099200)/' ;;
+    depth-off-by-one) f=$j/parse.fib; cp $f $f.orig; SPECS="json-spec"; sub $f 's/\(>= depth \(\. o max-depth\)\)/(> depth (. o max-depth))/g' ;;
+    tape-depth)       f=$j/tapebuild.fib; cp $f $f.orig; SPECS="json-api-spec json-testsuite-spec"; sub $f 's/\(>= \@dp max-depth\)/(> @dp max-depth)/' ;;
+    leading-zero)     f=$j/number.fib; cp $f $f.orig; SPECS="json-spec"; sub $f 's/\(and \(> d1 1\) \(= \(at s n i0\) 48\)\)/(and false (= (at s n i0) 48))/' ;;
+    utf8-overlong)    f=$j/utf8.fib; cp $f $f.orig; SPECS="json-spec"; sub $f 's/\(< b0 194\) 0/(< b0 192) 0/' ;;
+    lone-surrogate)   f=$j/parse.fib; cp $f $f.orig; SPECS="json-spec"; sub $f 's/\(and \(>= u 56320\) \(< u 57344\)\) \(do \(fail-at/(and false (< u 57344)) (do (fail-at/' ;;
+    dup-last-wins)    f=$j/parse.fib; cp $f $f.orig; SPECS="json-spec"; sub $f 's/\(assoc vals dup \@vc\)/vals/' ;;
+    *) echo "mutant-json: unknown mutant $1" >&2; return 1 ;;
+  esac
+}
+
+survived=0
+for m in "${MUTANTS[@]}"; do
+  t=$OUT/$m; rm -rf "$t"; mkdir -p "$t"; cp -r "$R/lib" "$t/lib"
+  SPECS=""
+  mutate "$m" "$t" || { echo "SETUP ERROR $m"; exit 2; }
+  killed=0; why=""
+  for s in $SPECS; do
+    log=$t/$s.log
+    (cd "$R" && FIB_LIB=$t/lib "$FIBC" test "specs/$s.fib" > "$log" 2>&1) && rc=0 || rc=$?
+    if [ $rc -ne 0 ] || grep -q "^  FAIL\|^  TRAP\|ERROR" "$log"; then killed=1; why="$s: $(grep -m1 '^  FAIL\|^  TRAP\|ERROR' "$log" | sed 's/^ *//')"; break; fi
+  done
+  if [ $killed = 1 ]; then echo "killed   $m   ($why)"; else echo "SURVIVED $m   (every spec passed: $SPECS)"; survived=1; fi
+  rm -rf "$t/lib"
+done
+[ $survived = 0 ]

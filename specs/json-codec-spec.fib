@@ -1,0 +1,28 @@
+;; fib.json.codec: typed records without a DOM (docs/design/json.md 2, 5): decode reads the tape into the record, encode goes through `ToJson`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run) (:require [fib.json :as json] [fib.json.codec :as jc]))
+
+(jc/defjson Person [name: str age: i64 tags: (Vec str) boss: (Option Person) score: f64 ok: bool])
+
+(defun dec (s: str) -> (Option Person) (match (decode-Person s) ((Ok p) (some p)) ((Err _) nil)))
+(defun code (s: str) -> i64 (match (decode-Person s) ((Ok _) 0) ((Err e) (. e code))))
+(def ann: str "{\"name\":\"Ann\",\"extra\":[1,{\"x\":2}],\"age\":41,\"tags\":[\"a\",\"b\"],\"score\":2,\"ok\":true,\"boss\":{\"name\":\"B\\u00f3\",\"age\":50,\"tags\":[],\"score\":1.5,\"ok\":false}}")
+
+(defspecs specs
+  (feature "defjson decode"
+    (scenario "fields by key in any order, unknown keys ignored, nested record, an integer where a float is wanted"
+      (then (expect = (some (Person "Ann" 41 ["a" "b"] (some (Person "Bó" 50 [] nil 1.5 false)) 2.0 true)) (dec ann))))
+    (scenario "a null or missing Option is nil; a missing or mistyped required field is a mismatch (code 16), not a trap"
+      (then (expect = (some (Person "x" 1 [] nil 0.5 true)) (dec "{\"name\":\"x\",\"age\":1,\"tags\":[],\"boss\":null,\"score\":0.5,\"ok\":true}"))
+            (expect = 16 (code "{\"name\":\"x\",\"age\":1,\"tags\":[],\"score\":0.5}")) (expect = 16 (code "{\"name\":\"x\",\"age\":\"1\",\"tags\":[],\"score\":0.5,\"ok\":true}"))
+            (expect = 16 (code "{\"name\":\"x\",\"age\":1.5,\"tags\":[],\"score\":0.5,\"ok\":true}")) (expect = 16 (code "{\"name\":\"x\",\"age\":1,\"tags\":[1],\"score\":0.5,\"ok\":true}"))
+            (expect = 16 (code "[]")) (expect = 2 (code "{\"name\":"))))
+    (scenario "a number too big for i64 is a mismatch"
+      (then (expect = 16 (code "{\"name\":\"x\",\"age\":9223372036854775808,\"tags\":[],\"score\":0.5,\"ok\":true}")))))
+  (feature "defjson encode"
+    (scenario "a record is an object in field order; decode of encode is the record"
+      (given [p (Person "Zed" -3 ["x" "y\"z"] (some (Person "Q" 0 [] nil -0.25 false)) 1.0e21 true)])
+      (then (expect = "{\"name\":\"Zed\",\"age\":-3,\"tags\":[\"x\",\"y\\\"z\"],\"boss\":{\"name\":\"Q\",\"age\":0,\"tags\":[],\"boss\":null,\"score\":-0.25,\"ok\":false},\"score\":1e21,\"ok\":true}"
+                    (json/write (json/to-json p)))
+            (expect = (some p) (dec (json/write (json/to-json p))))))))
+
+(defun main () -> i64 (run-main (specs)))

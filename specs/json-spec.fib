@@ -1,0 +1,98 @@
+;; fib.json: the grammar, the data model and the writer (docs/design/json.md). Each scenario fails if the behaviour it names breaks: the
+;; mutants of scripts/json-mutants.sh plant a fault for each part and require a failure here.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.json.types fib.json.parse fib.json.write))
+
+(defun ok (s: str) -> Json (match (parse s) ((Ok v) v) ((Err _) (JStr "<error>"))))
+(defun code (s: str) -> i64 (match (parse s) ((Ok _) 0) ((Err e) (. e code))))
+(defun off (s: str) -> i64 (match (parse s) ((Ok _) -1) ((Err e) (. e offset))))
+(defun bytes (v: (Vec i64)) -> (Array i8)
+  (let [a (cell (array (count v) 0i8))]
+    (do (dotimes (i (count v)) (array-set! &a i (trunc i8 (nth v i)))) @a)))
+(defun rt (s: str) -> str (write (ok s)))
+(defun deep (n: i64 open: str close: str) -> str
+  (str (str-join (vec (map (fn (i: i64) open) (range n)))) (str-join (vec (map (fn (i: i64) close) (range n))))))
+
+(defspecs specs
+  (feature "fib.json values"
+    (scenario "the scalars"
+      (then (expect = JNull (ok "null")) (expect = (JBool true) (ok " true ")) (expect = (JBool false) (ok "false"))
+            (expect = (JInt 0) (ok "0")) (expect = (JInt -17) (ok "-17")) (expect = (JFloat 2.5) (ok "2.5"))
+            (expect = (JFloat 100.0) (ok "1E2")) (expect = (JFloat 0.01) (ok "1e-2")) (expect = (JFloat 150.0) (ok "1.5e+2"))
+            (expect = (JStr "") (ok "\"\"")) (expect = (JStr "a b") (ok "\"a b\""))))
+    (scenario "an integer is an i64 when it fits, else a float; the edges of i64"
+      (then (expect = (JInt 9223372036854775807) (ok "9223372036854775807"))
+            (expect = (JInt -9223372036854775808) (ok "-9223372036854775808"))
+            (expect = (JFloat 9.223372036854775808E18) (ok "9223372036854775808"))
+            (expect = (JFloat -9.223372036854775809E18) (ok "-9223372036854775809"))
+            (expect = (JBig "9223372036854775808")
+                    (match (parse-with "9223372036854775808" (JsonOptions 1024 1073741824 0 1 false false)) ((Ok v) v) ((Err _) JNull)))))
+    (scenario "negative zero stays a float; -0 is the integer 0"
+      (then (expect = "-0.0" (rt "-0.0")) (expect = (JInt 0) (ok "-0")) (expect = "1e300" (rt "1e300"))))
+    (scenario "a number that overflows a double is an error unless the options let it be an infinity"
+      (then (expect = 12 (code "1e400")) (expect = 12 (code "-1e999"))
+            (expect = (JFloat 0.0) (ok "1e-400"))
+            (expect = true (match (parse-with "1e400" (JsonOptions 1024 1073741824 0 0 false true)) ((Ok (JFloat f)) (> f 1.0e308)) (_ false)))))
+    (scenario "strings: escapes, surrogate pairs, UTF-8 passes through"
+      (then (expect = (JStr "a\nb\t\"\\/\x08\x0c\r") (ok "\"a\\nb\\t\\\"\\\\\\/\\b\\f\\r\""))
+            (expect = (JStr "é") (ok "\"\\u00e9\"")) (expect = (JStr "é€😀") (ok "\"é€😀\""))
+            (expect = (JStr "😀") (ok "\"\\ud83d\\ude00\"")) (expect = (JStr "\x01") (ok "\"\\u0001\""))))
+    (scenario "a lone surrogate escape is an error"
+      (then (expect = 9 (code "\"\\ud800\"")) (expect = 9 (code "\"\\udc00\"")) (expect = 9 (code "\"\\ud800\\u0041\""))))
+    (scenario "arrays and objects keep their order; the last of a duplicate key wins at the first position"
+      (then (expect = (JArr [(JInt 1) (JArr []) (JObj [] [])]) (ok "[1,[],{}]"))
+            (expect = (JObj ["b" "a"] [(JInt 1) (JInt 2)]) (ok "{\"b\":1,\"a\":2}"))
+            (expect = (JObj ["a" "b"] [(JInt 3) (JInt 2)]) (ok "{\"a\":1,\"b\":2,\"a\":3}"))
+            (expect = (JObj ["a" "b" "a"] [(JInt 1) (JInt 2) (JInt 3)])
+                    (match (parse-with "{\"a\":1,\"b\":2,\"a\":3}" (JsonOptions 1024 1073741824 1 0 false false)) ((Ok v) v) ((Err _) JNull)))
+            (expect = 11 (match (parse-with "{\"a\":1,\"a\":3}" (JsonOptions 1024 1073741824 2 0 false false)) ((Ok _) 0) ((Err e) (. e code))))))
+    (scenario "an object with many keys: duplicates are found through the index"
+      (given [txt (str "{" (str-join (vec (map (fn (i: i64) (str "\"k" i "\":" i ",")) (range 40)))) "\"k7\":-1,\"k39\":-2}")])
+      (then (expect = (JInt -1) (match (ok txt) ((JObj ks vs) (nth vs 7)) (_ JNull)))
+            (expect = (JInt -2) (match (ok txt) ((JObj ks vs) (nth vs 39)) (_ JNull)))
+            (expect = 40 (match (ok txt) ((JObj ks vs) (count ks)) (_ 0))))))
+  (feature "fib.json grammar: what must be rejected"
+    (scenario "trailing commas, leading zeros, bare tokens, comments, single quotes"
+      (then (expect = 1 (code "[1,]")) (expect = 1 (code "{\"a\":1,}")) (expect = 3 (code "01")) (expect = 3 (code "-01"))
+            (expect = 2 (code "1.")) (expect = 1 (code ".5")) (expect = 1 (code "+1")) (expect = 2 (code "1e")) (expect = 2 (code "-"))
+            (expect = 2 (code "nul")) (expect = 1 (code "[1 2]")) (expect = 1 (code "{'a':1}")) (expect = 1 (code "[/**/1]"))
+            (expect = 2 (code "")) (expect = 2 (code "  ")) (expect = 2 (code "[1,")) (expect = 2 (code "\"abc"))
+            (expect = 8 (code "1 2")) (expect = 8 (code "[]x")) (expect = 1 (code "{\"a\" 1}")) (expect = 1 (code "{1:2}"))))
+    (scenario "control characters in a string, bad escapes, a byte order mark"
+      (then (expect = 5 (code "\"a\nb\"")) (expect = 5 (code "\"\0\"")) (expect = 4 (code "\"\\x\"")) (expect = 4 (code "\"\\u12\""))
+            (expect = 13 (code "\u{FEFF}[]"))
+            (expect = (JArr []) (match (parse-with "\u{FEFF}[]" (JsonOptions 1024 1073741824 0 0 true false)) ((Ok v) v) ((Err _) JNull)))))
+    (scenario "invalid UTF-8 in a string is rejected (a str can hold bytes that are not UTF-8)"
+      (then (expect = 6 (match (parse-bytes (bytes [34 -64 -128 34])) ((Ok _) 0) ((Err e) (. e code))))
+            (expect = 6 (match (parse-bytes (bytes [34 -19 -96 -128 34])) ((Ok _) 0) ((Err e) (. e code))))
+            (expect = 6 (match (parse-bytes (bytes [34 -12 -112 -128 34])) ((Ok _) 0) ((Err e) (. e code))))
+            (expect = 6 (match (parse-bytes (bytes [34 -62 34])) ((Ok _) 0) ((Err e) (. e code))))
+            (expect = 0 (match (parse-bytes (bytes [34 -62 -128 34])) ((Ok _) 0) ((Err e) (. e code))))))
+    (scenario "errors carry the byte offset, line and column"
+      (then (expect = 3 (off "[1,]")) (expect = 3 (match (parse "[\n 1,\n]") ((Ok _) 0) ((Err e) (. e line))))
+            (expect = 1 (match (parse "[\n 1,\n]") ((Ok _) 0) ((Err e) (. e column)))))))
+  (feature "fib.json depth limit"
+    (scenario "1024 levels parse, 1025 do not, 1 000 000 return an error"
+      (then (expect = 0 (code (deep 1024 "[" "]"))) (expect = 7 (code (deep 1025 "[" "]"))) (expect = 7 (code (deep 1000000 "[" "]")))
+            (expect = 7 (code (deep 1000000 "{\"a\":" "}"))) (expect = 7 (code (str-join (vec (map (fn (i: i64) "[") (range 5000))))))))
+    (scenario "the limit is an option"
+      (then (expect = 7 (match (parse-with (deep 3 "[" "]") (JsonOptions 2 1073741824 0 0 false false)) ((Ok _) 0) ((Err e) (. e code))))
+            (expect = 0 (match (parse-with (deep 2 "[" "]") (JsonOptions 2 1073741824 0 0 false false)) ((Ok _) 0) ((Err e) (. e code))))
+            (expect = 10 (match (parse-with "[1,2,3]" (JsonOptions 2 5 0 0 false false)) ((Ok _) 0) ((Err e) (. e code)))))))
+  (feature "fib.json writer"
+    (scenario "compact output; strings escape what must be escaped"
+      (then (expect = "{\"a\":[1,2.5,true,null,\"x\"]}" (rt "{ \"a\" : [1, 2.5, true, null, \"x\"] }"))
+            (expect = "\"\\\"\\\\\\n\\u0001\"" (write (JStr "\"\\\n\x01")))
+            (expect = "\"é😀\"" (write (JStr "é😀"))) (expect = "100.0" (write (JFloat 100.0))) (expect = "null" (write (JFloat (/ 0.0 0.0))))
+            (expect = "-9223372036854775808" (write (JInt -9223372036854775808))) (expect = "0" (write (JInt 0)))
+            (expect = "1234567890" (write (JInt 1234567890))) (expect = "1000000000000000000" (write (JInt 1000000000000000000))) (expect = "-9223372036854775807" (write (JInt -9223372036854775807))) (expect = "9223372036854775807" (write (JInt 9223372036854775807))) (expect = "99" (write (JInt 99))) (expect = "100" (write (JInt 100)))))
+    (scenario "a long string with an escape late, after eight-byte words of plain text"
+      (given [plain (str-join (vec (map (fn (i: i64) "abcdefgh") (range 20)))) t (str plain "\"" plain)])
+      (then (expect = (str "\"" plain "\\\"" plain "\"") (write (JStr t)))))
+    (scenario "pretty output and the ascii option"
+      (then (expect = "{\n  \"a\": [\n    1,\n    {}\n  ]\n}" (write-pretty (ok "{\"a\":[1,{}]}")))
+            (expect = "\"\\u00e9\\ud83d\\ude00\"" (write-with (JStr "é😀") (WriteOptions 0 true)))))
+    (scenario "floats print shortest and read back the same"
+      (then (expect = "0.1" (write (JFloat 0.1))) (expect = "1.7976931348623157e308" (write (JFloat 1.7976931348623157e308)))
+            (expect = (JFloat 5.0e-324) (ok (write (JFloat 5.0e-324)))) (expect = (JFloat 123456789.12345679) (ok (write (JFloat 123456789.12345679))))))))
+
+(defun main () -> i64 (run-main (specs)))

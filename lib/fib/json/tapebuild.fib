@@ -1,0 +1,94 @@
+;; fib.json.tapebuild: the state machine that fills the tape (fib.json.tape has the node layout and the scans). States: 0 a value is next; 1 a
+;; value just ended (a comma, a close or the end of the document); 2 just after `{` (a key or `}`); 3 after a comma in an object (a key); 4 just after `[`
+;; (a value or `]`). A step answers the next index, -1 for a failure (code in `fail`, offset in `bad`) or -2 at the end of the document.
+;;   (build-tape s opts) -> (Result Doc JsonError)       (tape-of s) with the default options
+(ns fib.json.tapebuild (:use fib.core fib.seq fib.coll fib.json.types fib.json.number fib.json.tape fib.json.buffer))
+
+(defun skip-white (s: str n: i64 i: i64) -> i64
+  (loop [k i] (let [b (at s n k)] (if (or (= b 32) (or (= b 10) (or (= b 13) (= b 9)))) (recur (+ k 1)) k))))
+
+(defun fail! (&fail: i64 &bad: i64 code: i64 at: i64) -> i64 (do (set! fail code) (set! bad at) -1))
+
+;; Close the innermost container at tape length tl: its word 1 becomes the index past its last node.
+(defun close-container (&t: (Array i64) tl: i64 &stk: (Array i64) &dp: i64 &st: i64) -> unit
+  (do (tape-set &t (+ (array-get @stk (- @dp 1)) 1) tl) (set! dp (- @dp 1)) (set! st 1)))
+
+(defun open-container (&t: (Array i64) &tl: i64 &stk: (Array i64) &dp: i64 &st: i64 kind: i64 at: i64) -> unit
+  (do (array-set! &stk @dp @tl) (set! dp (+ @dp 1))
+      (tape-put &t &tl (node kind at) 0)
+      (set! st (if (= kind k-array) 4 2))))
+
+(defun emit-string (s: str n: i64 i: i64 &t: (Array i64) &tl: i64 &st: i64 &fail: i64 &bad: i64) -> i64
+  (let [esc (cell 0)
+        e (scan-str s n (+ i 1) &esc &fail &bad)]
+    (if (< e 0) -1
+        (do (tape-put &t &tl (node k-str (+ i 1)) (bit-or e (if (= @esc 1) esc-flag 0))) (+ e 1)))))
+
+(defun emit-number (s: str n: i64 i: i64 &t: (Array i64) &tl: i64 &fail: i64 &bad: i64) -> i64
+  (let [isf (cell 0)
+        e (scan-num s n i &isf &fail &bad)]
+    (if (< e 0) -1 (do (tape-put &t &tl (node (if (= @isf 1) k-float k-int) i) e) e))))
+
+(defun emit-word (s: str n: i64 i: i64 w: str kind: i64 &t: (Array i64) &tl: i64 &fail: i64 &bad: i64) -> i64
+  (if (word-at s n i w)
+      (do (tape-put &t &tl (node kind i) 0) (+ i (str-len w)))
+      (fail! &fail &bad (if (>= (+ i (str-len w)) n) e-eof e-unexpected) i)))
+
+(defun step-value (s: str n: i64 i0: i64 max-depth: i64 &t: (Array i64) &tl: i64 &stk: (Array i64) &st: i64 &dp: i64 &fail: i64 &bad: i64) -> i64
+  (let [i (skip-white s n i0)
+        c (at s n i)]
+    (cond (and (= @st 4) (= c 93)) (do (close-container &t (+ @tl 0) &stk &dp &st) (+ i 1))
+          (= c 34) (let [r (emit-string s n i &t &tl &st &fail &bad)] (do (when (>= r 0) (set! st 1)) r))
+          (or (= c 45) (and (>= c 48) (<= c 57))) (let [r (emit-number s n i &t &tl &fail &bad)] (do (when (>= r 0) (set! st 1)) r))
+          (or (= c 123) (= c 91))
+          (if (>= @dp max-depth) (fail! &fail &bad e-depth i)
+              (do (open-container &t &tl &stk &dp &st (if (= c 91) k-array k-object) i) (+ i 1)))
+          (= c 116) (let [r (emit-word s n i "true" k-true &t &tl &fail &bad)] (do (when (>= r 0) (set! st 1)) r))
+          (= c 102) (let [r (emit-word s n i "false" k-false &t &tl &fail &bad)] (do (when (>= r 0) (set! st 1)) r))
+          (= c 110) (let [r (emit-word s n i "null" k-null &t &tl &fail &bad)] (do (when (>= r 0) (set! st 1)) r))
+          (= c -1) (fail! &fail &bad e-eof i)
+          :else (fail! &fail &bad e-unexpected i))))
+
+(defun step-after (s: str n: i64 i0: i64 &t: (Array i64) &tl: i64 &stk: (Array i64) &st: i64 &dp: i64 &fail: i64 &bad: i64) -> i64
+  (let [i (skip-white s n i0)
+        c (at s n i)]
+    (if (= @dp 0)
+        (if (< i n) (fail! &fail &bad e-trailing i) -2)
+        (let [arr (= (bit-and (array-get @t (array-get @stk (- @dp 1))) 255) k-array)]
+          (cond (and arr (= c 44)) (do (set! st 0) (+ i 1))
+                (and (not arr) (= c 44)) (do (set! st 3) (+ i 1))
+                (= c (if arr 93 125)) (do (close-container &t @tl &stk &dp &st) (+ i 1))
+                (= c -1) (fail! &fail &bad e-eof i)
+                :else (fail! &fail &bad e-unexpected i))))))
+
+(defun step-key (s: str n: i64 i0: i64 &t: (Array i64) &tl: i64 &stk: (Array i64) &st: i64 &dp: i64 &fail: i64 &bad: i64) -> i64
+  (let [i (skip-white s n i0)
+        c (at s n i)]
+    (cond (and (= @st 2) (= c 125)) (do (close-container &t @tl &stk &dp &st) (+ i 1))
+          (= c 34)
+          (let [r (emit-string s n i &t &tl &st &fail &bad)]
+            (if (< r 0) -1
+                (let [j (skip-white s n r)]
+                  (if (= (at s n j) 58) (do (set! st 0) (+ j 1)) (fail! &fail &bad (if (>= j n) e-eof e-unexpected) j)))))
+          (= c -1) (fail! &fail &bad e-eof i)
+          :else (fail! &fail &bad e-unexpected i))))
+
+(defun build-tape (s: str o: JsonOptions) -> (Result Doc JsonError)
+  (let [n (str-len s)]
+    (if (> n (. o max-size))
+        (Err (make-error s e-size 0))
+        (let [t (cell (array (+ 64 (quot n 4)) 0)) tl (cell 0)
+              stk (cell (array (+ (. o max-depth) 2) 0))
+              st (cell 0) dp (cell 0) fail (cell 0) bad (cell 0)
+              start (if (and (>= n 3) (and (= (at s n 0) 239) (and (= (at s n 1) 187) (= (at s n 2) 191)))) (if (. o bom) 3 -1) 0)
+              end (if (< start 0)
+                    (fail! &fail &bad e-bom 0)
+                    (loop [i start]
+                      (let [r (cond (= @st 0) (step-value s n i (. o max-depth) &t &tl &stk &st &dp &fail &bad)
+                                    (= @st 4) (step-value s n i (. o max-depth) &t &tl &stk &st &dp &fail &bad)
+                                    (= @st 1) (step-after s n i &t &tl &stk &st &dp &fail &bad)
+                                    :else (step-key s n i &t &tl &stk &st &dp &fail &bad))]
+                        (if (>= r 0) (recur r) r))))]
+          (if (= end -2) (Ok (Doc s @t @tl)) (Err (make-error s @fail @bad)))))))
+
+(defun tape-of (s: str) -> (Result Doc JsonError) (build-tape s (default-options)))

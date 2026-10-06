@@ -1,0 +1,23 @@
+;; fib.json.codecform: what the `defjson` macro of fib.json.codec calls at expansion time (a macro body may use only the prelude and required modules).
+(ns fib.json.codecform)
+
+(defun sym-text (f: Form) -> str (match f ((Sym s) s) (_ (trap "defjson: a name was expected"))))
+
+;; The Option-valued expression that decodes the node `n` as the type form t.
+(defun decoder (t: Form n: Form) -> Form
+  (match t
+    ((Sym s)
+     (cond (= s "i64") `(fib.json.codec/dec-i64 d ~n)
+           (= s "f64") `(fib.json.codec/dec-f64 d ~n)
+           (= s "str") `(fib.json.codec/dec-str d ~n)
+           (= s "bool") `(fib.json.codec/dec-bool d ~n)
+           :else `(~(Sym (str-concat "json->" s)) d ~n)))
+    ((List parts)
+     (let ((head (sym-text (vec-nth parts 0))) (inner (decoder (vec-nth parts 1) (Sym "j"))))
+       (cond (= head "Vec") `(fib.json.codec/dec-vec d ~n (fn (j: i64) ~inner))
+             (= head "Option") `(fib.json.codec/dec-opt d ~n (fn (j: i64) ~inner))
+             :else (trap "defjson: a field type is i64 f64 str bool (Vec T) (Option T) or a defjson record"))))
+    (_ (trap "defjson: a field type is i64 f64 str bool (Vec T) (Option T) or a defjson record"))))
+
+(defun field-name (s: Form) -> str (let ((x (sym-text s))) (str-slice x 0 (- (str-len x) 1))))
+
