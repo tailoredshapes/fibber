@@ -105,11 +105,11 @@ stage_tools() {
   echo "tools total $(elapsed "$t0" "$(now)") s" >> "$sd/tools.t"
 }
 
-# The executable ADRs (docs/adr, compiler/adr.fib, docs/design/executable-adrs.md), full gate only: about six seconds (build of the tool, one
-# program for every block). --strict: an accepted ADR with no check that runs is a failure too. Failures are not compared with
+# The executable ADRs (docs/adr, compiler/adr.fib, docs/design/executable-adrs.md), full gate only: about fifteen seconds with the 20 ADRs of today (build of the tool, one
+# program for every block; the checks of 0013 and 0015 read the 2,200 case files). --strict: an accepted ADR with no check that runs is a failure too. Failures are not compared with
 # scripts/ci-stage2.expected: a violated decision is a regression.
 stage_adr() {
-  skipped adr compiler lib docs spec && return
+  skipped adr compiler lib docs spec scripts cases specs rt .github editors SEED VERSION && return
   local t0; t0=$(now)
   if "$SLOTS_SH" "$F" build compiler/adr.fib -I compiler -I lib -o "$GATE_OUT/adr" > "$GATE_OUT/adr.log" 2>&1 \
      && FIBC="$F" FIB_LIB="$root/lib" "$SLOTS_SH" "$GATE_OUT/adr" --strict >> "$GATE_OUT/adr.log" 2>&1; then
