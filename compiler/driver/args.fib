@@ -20,10 +20,16 @@ commands:
   run [--trace] [-O N] <file> [-- arg..]
                          compile file through the JIT and run its main; the
                          args after -- are (args)
-  build <file> -o <out> [-O N] [-L dir].. [-l lib]..
+  build <file> -o <out> [-O N] [-L dir].. [-l lib].. [--emit obj|asm|llvm]
                          compile file to an executable; each -l lib links
                          -llib, each -L dir is searched for libraries (-Ldir and
-                         -llib are also taken)
+                         -llib are also taken); --emit writes the object, the
+                         assembly or the LLVM IR instead and links nothing
+  targets                print the table of code generation targets (one row per
+                         target, tab-separated; docs/design/targets.md)
+
+--target TRIPLE (any command, before --) generates code for TRIPLE instead of
+the host (FIB_TARGET_TRIPLE); build then needs --emit
 
 -O N (N from 0 to 3, or -ON) is the LLVM optimisation level of run and build:
 build defaults to 2, run to 0.
@@ -76,7 +82,8 @@ itrace and gen are commands of the Rust compiler (the test harness).")
 (defenum Command
   (CmdLsp)
   (CmdRun file: str trace: bool args: (Vec str) opt: i64)
-  (CmdBuild file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64)
+  (CmdBuild file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64 emit: str)
+  (CmdTargets)
   (CmdEmit file: str)
   (CmdEmitDump opts: EmitOptions files: (Vec str))
   (CmdExplain file: str)
@@ -93,7 +100,7 @@ itrace and gen are commands of the Rust compiler (the test harness).")
 (defun takes-roots? (c: Command) -> bool
   (match c
     ((CmdRun _ _ _ _) true)
-    ((CmdBuild _ _ _ _ _) true)
+    ((CmdBuild _ _ _ _ _ _) true)
     ((CmdEmit _) true)
     ((CmdEmitDump _ _) true)
     ((CmdExplain _) true)
@@ -145,25 +152,27 @@ itrace and gen are commands of the Rust compiler (the test harness).")
           (nil nil)
           ((some v) (if (= v "") nil (some (FlagVal flag v 2))))))))
 
-;; `build FILE -o OUT` and any number of `-L DIR` and `-l LIB`, and at most one `-O N`, in any order after the file; `-o` exactly once.
+;; `build FILE -o OUT` and any number of `-L DIR` and `-l LIB`, and at most one `-O N` and one `--emit obj|asm|llvm`, in any order after the
+;; file; `-o` exactly once.
 ;; Rust: command.rs:218 `parse_build`
 (defun parse-build :private (file: str rest: (Vec str)) -> Command
-  (loop ((i 0) (out nil) (dirs (vec-empty)) (libs (vec-empty)) (opt nil))
+  (loop ((i 0) (out nil) (dirs (vec-empty)) (libs (vec-empty)) (opt nil) (emit nil))
     (if (>= i (count rest))
         (match out
           (nil CmdInvalid)
-          ((some o) (CmdBuild file o dirs libs (unwrap-or opt build-opt-level))))
+          ((some o) (CmdBuild file o dirs libs (unwrap-or opt build-opt-level) (unwrap-or emit "exe"))))
         (match (flag-value rest i)
           (nil CmdInvalid)
           ((some fv)
            (let ((name (. fv name)) (value (. fv value)) (next (+ i (. fv used))))
-             (cond (and (= name "-o") (nil? out)) (recur next (some value) dirs libs opt)
-                   (= name "-L") (recur next out (conj dirs value) libs opt)
-                   (= name "-l") (recur next out dirs (conj libs value) opt)
+             (cond (and (= name "-o") (nil? out)) (recur next (some value) dirs libs opt emit)
+                   (= name "-L") (recur next out (conj dirs value) libs opt emit)
+                   (= name "-l") (recur next out dirs (conj libs value) opt emit)
+                   (and (= name "--emit") (nil? emit) (in? value ["obj" "asm" "llvm"])) (recur next out dirs libs opt (some value))
                    (and (= name "-O") (nil? opt))
                      (match (opt-level value)
                        (nil CmdInvalid)
-                       ((some n) (recur next out dirs libs (some n))))
+                       ((some n) (recur next out dirs libs (some n) emit)))
                    :else CmdInvalid)))))))
 
 ;; The tail of `run`'s words from the file on. Rust: command.rs:266
@@ -228,6 +237,7 @@ itrace and gen are commands of the Rust compiler (the test harness).")
                                  ((some p) (CmdEmitDump (. p opts) (. p files))))
           (and (= head "explain") (= n 2)) (CmdExplain (nth words 1))
           (and (= head "lsp") (= n 1)) CmdLsp
+          (and (= head "targets") (= n 1)) CmdTargets
           (and (= head "itrace") (= n 2)) (CmdHarness head)
           (= head "cases") (let ((j (take-jobs words))) (parse-cases (. j rest) (. j n)))
           (= head "test") (CmdTest (vec (drop 1 words)))

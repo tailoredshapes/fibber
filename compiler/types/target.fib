@@ -8,36 +8,30 @@
 ;;
 ;; The width is the vector width the compiler *prefers* (a 512-bit machine prefers 256, as LLVM does on the client cores); a wrong
 ;; choice costs speed, never results, because every vector operation legalises on every target (design 0.4).
-(ns types.target)
+(ns types.target (:use types.targets))
 
 ;; `cpu` and `features` are the strings of the module's `(target (cpu ..) (features ..))`: `features` is empty for a named CPU (LLVM
 ;; knows what the name stands for) and the host's whole list for the host. `vector-bits` is 128, 256 or 512.
 (defstruct Target (cpu: str features: str vector-bits: i64 has-fma: bool))
 (derive Eq Target)
 
-;; The CPUs that have AVX2 and FMA (256-bit vectors), by name. A name not here is taken to be a baseline x86-64 (128 bits, no fma): a
-;; wrong guess costs speed only.
-(defun cpu-avx2? :private (cpu: str) -> bool
-  (or (= cpu "x86-64-v3") (= cpu "x86-64-v4") (= cpu "haswell") (= cpu "broadwell") (= cpu "skylake") (= cpu "skylake-avx512")
-      (= cpu "skx") (= cpu "cascadelake") (= cpu "cooperlake") (= cpu "cannonlake") (= cpu "icelake-client") (= cpu "icelake-server")
-      (= cpu "tigerlake") (= cpu "rocketlake") (= cpu "sapphirerapids") (= cpu "alderlake") (= cpu "raptorlake")
-      (= cpu "meteorlake") (= cpu "graniterapids") (= cpu "znver1") (= cpu "znver2") (= cpu "znver3") (= cpu "znver4")
-      (= cpu "znver5") (= cpu "bdver4") (= cpu "core-avx2") (= cpu "x86-64-v3")))
-
-;; The aarch64 CPUs, by name or name prefix (LLVM's): every one has the fused multiply-add of NEON (`fmla`, `fmadd`; the ARMv8 baseline) and 128-bit
-;; vectors, so `has-fma` is true with only two f64 lanes: the fused tiles do not depend on the lane count.
+;; Whether `cpu` is an aarch64 CPU by name (types.targets `cpu-row`).
 (defun cpu-aarch64? :private (cpu: str) -> bool
-  (or (starts-with? cpu "apple-") (starts-with? cpu "cortex-a") (starts-with? cpu "neoverse-") (starts-with? cpu "ampere")
-      (starts-with? cpu "armv8") (starts-with? cpu "armv9") (starts-with? cpu "exynos-") (starts-with? cpu "thunderx")
-      (starts-with? cpu "carmel") (starts-with? cpu "falkor") (starts-with? cpu "kryo") (starts-with? cpu "saphira")
-      (starts-with? cpu "oryon") (starts-with? cpu "a64fx") (= cpu "aarch64") (= cpu "native-aarch64")))
+  (match (cpu-row cpu) ((some r) (= (. r family) "aarch64")) (nil false)))
 
-;; The target of the CPU named `cpu` (FIB_TARGET_CPU), with no features of its own: x86-64-v3 and the AVX2 CPUs are 256 bits with FMA, an aarch64 CPU is
-;; 128 bits with FMA, any other name is a baseline x86-64.
+;; The target of the CPU named `cpu` (FIB_TARGET_CPU), with no features of its own: the width and fma of its row in the CPU table of
+;; types.targets (x86-64-v3 and the AVX2 CPUs 256 bits with FMA, an aarch64 CPU 128 bits with FMA); a name the table lacks is a baseline x86-64.
 (defun target-of-cpu (cpu: str) -> Target
-  (cond (cpu-avx2? cpu) (Target cpu "" 256 true)
-        (cpu-aarch64? cpu) (Target cpu "" 128 true)
-        :else (Target cpu "" 128 false)))
+  (match (cpu-row cpu)
+    ((some r) (Target cpu "" (. r vector-bits) (. r has-fma)))
+    (nil (Target cpu "" 128 false))))
+
+;; The target a cross compile for the row `row` uses, with the CPU `cpu` (FIB_TARGET_CPU when `named`, else the row's default): a named CPU
+;; the CPU table knows has its width and fma and no features; otherwise the row's width and fma, with the row's features when no CPU was named.
+(defun target-of-row (row: TargetRow cpu: str named: bool) -> Target
+  (match (if named (cpu-row cpu) nil)
+    ((some r) (Target cpu "" (. r vector-bits) (. r has-fma)))
+    (nil (Target cpu (if named "" (. row features)) (. row vector-bits) (. row has-fma)))))
 
 ;; The target of a CPU named `cpu` whose feature list is `features` (LLVM's `+avx2,+fma,..`): 256 bits when it has AVX2, else 128.
 (defun target-of-features (cpu: str features: str) -> Target

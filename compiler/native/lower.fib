@@ -2,7 +2,7 @@
 
 (ns native.lower
   (:use lir.diag lir.types lir.lit lir.ast native.error native.owned native.lower.lx native.lower.types native.lower.consts native.lower.func)
-  (:require [llvm.core :as core] [llvm.ffi :as ffi] [llvm.target :as lt] [llvm.analysis :as analysis] [fib.string :as s]))
+  (:require [llvm.core :as core] [llvm.ffi :as ffi] [llvm.target :as lt] [llvm.analysis :as analysis] [fib.string :as s] [types.targets :as tt]))
 
 
 ;; Lowers a module `lir.check/check` accepted, for the given triple and data layout, and runs the LLVM verifier on the result (`Internal` if it rejects). Declares structs, then every function and global, then initialisers, then bodies. (mod.rs `lower`)
@@ -14,7 +14,8 @@
         (fields: (Cell (Map str (Vec LType))) (cell {}))
         (funcs: (Cell (Map str FuncEntry)) (cell {}))
         (globals: (Cell (Map str i64)) (cell {})))
-    (let ((lx (Lx (. owned ctx) (. owned module) td structs fields funcs globals))
+    (let ((lx (Lx (. owned ctx) (. owned module) td structs fields funcs globals (. (tt/target-row-of-triple triple) tail-cc)
+                  (. (tt/target-row-of-triple triple) tail-kind)))
           (r (module-items lx m)))
       (do (unsafe (do (lt/LLVMDisposeTargetData td) (free dl)))
           (match r
@@ -91,7 +92,7 @@
 
 (defun add-function :private (lx: Lx name: str ty: LFnType mods: LModifiers tgt: (Option LTarget)) -> unit
   (let ((f (core/add-function (. lx module) name (lx-fn-ty lx ty))))
-    (do (unsafe (core/LLVMSetFunctionCallConv f (trunc i32 (cc-number (. ty cc)))))
+    (do (unsafe (core/LLVMSetFunctionCallConv f (trunc i32 (cc-number lx (. ty cc)))))
         (set-modifiers f mods)
         (if-some [t tgt] (target-attributes lx f t) ())
         (if (slow-path? name) (add-noinline lx f) ())

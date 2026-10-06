@@ -1,0 +1,58 @@
+;; compiler/tests/types/unit-targets.fib: the table of targets of types.targets and what the compiler reads from it (docs/design/targets.md 2):
+;; a triple finds its row (Apple's arm64 is aarch64, an OS version suffix is ignored), an unlisted triple falls back as the compiler did before
+;; the table (an Apple triple is Darwin, anything else Linux; an aarch64 triple keeps 128-bit fma), the cross Target of a row and of a named CPU,
+;; and the rows' facts that other code depends on (pointer width, threads, min level). Every check names a value a wrong row would change.
+;; Build: fibc build compiler/tests/types/unit-targets.fib -I compiler -I lib -o OUT
+(ns main (:use types.targets types.target types.check))
+
+(defun tabs (s: str) -> i64
+  (loop ((i 0) (n 0)) (cond (>= i (str-len s)) n (= (str-byte-at s i) 9i8) (recur (+ i 1) (+ n 1)) :else (recur (+ i 1) n))))
+
+(defun row (t: str) -> TargetRow (target-row-of-triple t))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do
+      (check cs "every row's triple finds itself"
+             (every? (fn (r: TargetRow) (= (. (row (. r triple)) triple) (. r triple))) (target-rows)))
+      (check cs "the host triples of x86-64 Linux find the x86 row"
+             (and (= (. (row "x86_64-pc-linux-gnu") triple) "x86_64-unknown-linux-gnu") (= (. (row "x86_64-unknown-linux-gnu") min-level) 0)))
+      (check cs "arm64-apple-macosx13.0.0 is the aarch64 Darwin row: apple-m1, level floor 1, Mach-O"
+             (let ((r (row "arm64-apple-macosx13.0.0")))
+               (and (= (. r triple) "aarch64-apple-darwin") (= (. r default-cpu) "apple-m1") (= (. r min-level) 1) (= (. r object-format) "macho"))))
+      (check cs "arm64-apple-ios is its own row, runtime Darwin" (and (= (. (row "arm64-apple-ios") os) "ios") (= (. (row "arm64-apple-ios") runtime-os) "Darwin")))
+      (check cs "aarch64 Linux: generic CPU, Linux runtime, floor 1"
+             (let ((r (row "aarch64-unknown-linux-gnu"))) (and (= (. r default-cpu) "generic") (= (. r runtime-os) "Linux") (= (. r min-level) 1))))
+      (check cs "wasm32-wasip1: 32-bit pointers, no threads, wasm objects, simd128, no fma"
+             (let ((r (row "wasm32-wasip1")))
+               (and (= (. r pointer-bits) 32) (= (. r threads) "none") (= (. r object-format) "wasm") (= (. r features) "+simd128,+tail-call") (= (. r tail-cc) 0) (= (. r reloc) 1) (not (. r has-fma)))))
+      (check cs "wasm32-wasi (the old name) is the WASI row; wasm32-unknown-unknown has no libc"
+             (and (= (. (row "wasm32-wasi") triple) "wasm32-wasip1") (= (. (row "wasm32-unknown-unknown") libc) "none")
+                  (= (count (. (row "wasm32-unknown-unknown") libc-lacks)) (count (runtime-c-functions)))))
+      (check cs "tailcc is LLVM's tailcc (18) and musttail on x86 and aarch64, fastcc (8) and a tail hint on riscv64"
+             (and (= (. (row "x86_64-pc-linux-gnu") tail-cc) 18) (= (. (row "arm64-apple-ios") tail-cc) 18) (= (. (row "riscv64-unknown-linux-gnu") tail-cc) 8)
+                  (= (. (row "mips64-unknown-linux-gnu") tail-cc) 18) (= (. (row "x86_64-pc-linux-gnu") reloc) 2)
+                  (= (. (row "x86_64-pc-linux-gnu") tail-kind) 2) (= (. (row "riscv64-unknown-linux-gnu") tail-kind) 1) (= (. (row "wasm32-wasip1") tail-kind) 1)))
+      (check cs "riscv64: RV64GC, fma, 64-bit" (let ((r (row "riscv64-unknown-linux-gnu")))
+                                                 (and (= (. r default-cpu) "generic-rv64") (. r has-fma) (= (. r pointer-bits) 64))))
+      (check cs "an Apple triple with another OS name (tvos) is the Darwin row of its arch"
+             (= (. (row "aarch64-apple-tvos") triple) "aarch64-apple-darwin"))
+      (check cs "an unlisted OS of a listed arch keeps the arch's facts, Linux runtime, status unlisted"
+             (let ((r (row "aarch64-unknown-freebsd"))) (and (= (. r runtime-os) "Linux") (= (. r status) "unlisted") (. r has-fma) (= (. r min-level) 1))))
+      (check cs "an unlisted architecture is generic: Linux, 128 bits, no fma"
+             (let ((r (row "mips64-unknown-linux-gnu"))) (and (= (. r runtime-os) "Linux") (= (. r vector-bits) 128) (not (. r has-fma)))))
+      (check cs "an x86-64 Apple triple is Darwin (as before the table)" (= (. (row "x86_64-apple-darwin") runtime-os) "Darwin"))
+      (check cs "the cross Target of a row with no CPU named: the row's CPU, features, width and fma"
+             (and (= (target-of-row (row "aarch64-apple-darwin") "apple-m1" false) (Target "apple-m1" "" 128 true))
+                  (= (target-of-row (row "x86_64-unknown-linux-gnu") "generic" false) (Target "generic" "" 128 false))
+                  (= (target-of-row (row "wasm32-wasip1") "generic" false) (Target "generic" "+simd128,+tail-call" 128 false))))
+      (check cs "a named CPU: the CPU table decides when it knows the name, the row otherwise; no features"
+             (and (= (target-of-row (row "x86_64-unknown-linux-gnu") "x86-64-v3" true) (Target "x86-64-v3" "" 256 true))
+                  (= (target-of-row (row "aarch64-unknown-linux-gnu") "generic" true) (Target "generic" "" 128 true))
+                  (= (target-of-row (row "riscv64-unknown-linux-gnu") "sifive-x280" true) (Target "sifive-x280" "" 128 true))))
+      (check cs "every libc-lacks name is a runtime C function"
+             (every? (fn (r: TargetRow) (every? (fn (f: str) (some? (first (filter (fn (g: str) (= g f)) (runtime-c-functions))))) (. r libc-lacks)))
+                     (target-rows)))
+      (check cs "a printed row has the header's 23 fields"
+             (every? (fn (r: TargetRow) (= (tabs (row-line r)) 22)) (target-rows)))
+      (finish cs))))

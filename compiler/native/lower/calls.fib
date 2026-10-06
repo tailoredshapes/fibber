@@ -31,10 +31,10 @@
      (try-let ((f (fx-val fx p)))
        (Ok (FuncEntry f ty))))))
 
-;; A tail call is `musttail` followed by `ret` (spec/lir.md 7.3).
+;; A tail call is `musttail` followed by `ret` (spec/lir.md 7.3); `tail` on a target without tailcc (types.targets `tail-kind`).
 (defun finish-tail :private (fx: Fx c: i64 ty: LFnType) -> unit
   (unsafe
-    (do (core/LLVMSetTailCallKind c 2i32)
+    (do (core/LLVMSetTailCallKind c (if (= (. (. fx lx) tail-kind) 2) 2i32 1i32))
         (match (. ty ret)
           ((some _) (core/LLVMBuildRet (. fx b) c))
           (nil (core/LLVMBuildRetVoid (. fx b))))
@@ -49,7 +49,7 @@
        (let ((ty (. fe ty))
              (fty (lx-fn-ty (. fx lx) ty))
              (c (core/build-call (. fx b) fty (. fe value) vals "")))
-         (do (unsafe (core/LLVMSetInstructionCallConv c (trunc i32 (cc-number (. ty cc)))))
+         (do (unsafe (core/LLVMSetInstructionCallConv c (trunc i32 (cc-number (. fx lx) (. ty cc)))))
              (cond (not tail) (Ok (match (. ty ret) ((some _) (some c)) (nil nil)))
                    :else (do (finish-tail fx c ty) (Ok nil)))))))
     (_ (Err (ErrInternal "not a call")))))

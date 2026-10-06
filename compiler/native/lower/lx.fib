@@ -23,7 +23,11 @@
    structs: (Cell (Map str i64))
    struct-fields: (Cell (Map str (Vec LType)))
    funcs: (Cell (Map str FuncEntry))
-   globals: (Cell (Map str i64))))
+   globals: (Cell (Map str i64))
+   ;; LLVM's number for lIR's `tailcc` on this module's target: the row's `tail-cc` (types.targets)
+   tail-cc: i64
+   ;; how a tail call is marked (LLVMTailCallKind): 2 musttail, 1 tail where the target has no tailcc: the row's `tail-kind`
+   tail-kind: i64))
 
 ;; A phi to fix up after every block is lowered: the LLVM phi and its incoming bindings (func.rs `Fx::phis`).
 (defstruct PhiFix (phi: i64 incoming: (Vec LBinding)))
@@ -44,9 +48,10 @@
 (defun tailcc-number () -> i64
   18)
 
-;; LLVM's calling convention number: 0 for ccc, 18 for tailcc. (mod.rs `cc_number`)
-(defun cc-number (cc: LCc) -> i64
-  (match cc ((CcC) 0) ((CcTail) 18)))
+;; LLVM's calling convention number: 0 for ccc; for tailcc the target's (`Lx` `tail-cc`: 18, LLVM's tailcc, where the backend has it; the C
+;; convention on WebAssembly, whose `musttail` is the tail-call feature's `return_call`; fastcc on RISC-V). (mod.rs `cc_number`)
+(defun cc-number (lx: Lx cc: LCc) -> i64
+  (match cc ((CcC) 0) ((CcTail) (. lx tail-cc))))
 
 ;; Lowers `e` through the dispatcher field. (expr.rs `Fx::expr`)
 (defun fx-expr (fx: Fx e: LExpr) -> (Result (Option i64) LairError)
