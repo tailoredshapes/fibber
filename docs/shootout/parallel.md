@@ -43,9 +43,36 @@ The closure `pmap` was 5.9x and 5.3x slower than `pmap-each` (W=28, 8) and is 1.
 and is 2.5x now (5 against 2 ms, the per-element call that remains). The `*-each` forms did not change. The `:scoped` colour was not built: the closure rows are within
 the 2x criterion of the design without it (`pmap`) or are a per-element call of a closure (`preduce-n`, which has no macro-free form faster than a call).
 
-The files `pmap-trivial.fib`, `pmap-compute.fib` and `preduce-1e8.fib` of `docs/shootout/parallel/` were written for v0.1.6 and no longer compile (the tile
-combinators of `fib.view.tiles` have another signature; `fibc` says `cannot unify (fn (a i64 i64) unit) with (fn :send ((Array i64) i64 i64 i64) unit)`): the
-rows above come from the program that replaced them for the closure question, not from re-running those.
+The files `pmap-trivial.fib`, `pmap-compute.fib` and `preduce-1e8.fib` of `docs/shootout/parallel/` were written for v0.1.6 and `pmap-trivial.fib` stopped compiling
+(the tile function of `run-tiles!` takes a fourth argument, the seed element, since the P-race fix: `fibc` said `cannot unify (fn (a i64 i64) unit) with (fn :send
+((Array i64) i64 i64 i64) unit)`). The rows above come from the program that replaced them for the closure question. **2026-10-06:** `pmap-trivial.fib` is fixed
+(`(fn (arr lo hi seed) ..)`), the other two compiled unchanged, and all three are re-run in the next section; `compiler/tests/shootout-compile.sh` (in the full
+gate's tools stage) builds every program of this directory so that the next API change shows.
+
+## The three programs again, 2026-10-06 (the tables above are kept as they were)
+
+Compiler: stage 2 built from this tree by the v0.1.7 seed; library from this tree (`-I lib`). Commands, from the repository root: `F build docs/shootout/parallel/NAME.fib
+-I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o OUT`, then `ulimit -v 16000000; MALLOC_ARENA_MAX=2 flock /tmp/fibsuite.lock OUT`. One run each, on the shared
+machine, after the unit-test survey had finished: read them to 20%. Every `equal` line is true, and the values of `preduce-1e8` are bit for bit the recorded ones
+(-7.142857139339605 sequential, -7.142857140969321 for the fixed tree at every worker count and for the closure and macro forms).
+
+| program | row | ms, v0.1.6 table | ms, now |
+|---|---|---:|---:|
+| `pmap-trivial` | sequential Vec loop | 57 | 17 |
+| | `pmap-each`, default workers (28) / 1 / 8 / 28 | 7 to 10 / 19 / 9 / 7 to 10 | 9 / 8 / 6 / 4 |
+| | `pmap` with a shared closure | 47 | 4 |
+| | tiles array, 8 tiles, then `vec-from-array` / 28 tiles, array only | 6 / 3 | 4 / 1 |
+| `pmap-compute` | sequential | 363 | 181 |
+| | `pmap-each` 1 / 2 / 4 / 8 / 16 / 28 workers | 344 / 184 / 100 / 64 / 37 / 37 | 171 / 125 / 57 / 36 / 20 / 52 |
+| | `pmap` (shared closure), 28 | 34 | 22 |
+| `preduce-1e8` | sequential scalar loop | 314 to 331 | 53 |
+| | fixed tree, 1 / 2 / 4 / 8 / 16 / 28 workers | 322 to 330 / 171 to 189 / 106 / 65 to 69 / 36 to 38 / 33 to 34 | 61 / 34 / 32 / 24 / 39 / 20 |
+| | `preduce-range`, 28 | 54 | 19 |
+| | `preduce-n` (closure per element), 8 | 4855 to 4891 | 70 |
+
+The ratios agree with the sections above: the shared-closure `pmap` is no longer slower than `pmap-each` (4 ms against 4 to 9), and `preduce-n` at 8 workers went from 75x
+slower than its chunk loop to 3x (70 against 24). The absolute times fell by 2 to 6x for the sequential loops, which is the compiler of today and not the library; the
+28-worker `pmap-each` of `pmap-compute` (52) is a noisy single run on a machine with other agents (16 workers gave 20).
 
 Per-chunk Vec results concatenated with a `conj` loop cost 60 ms for 1e6 elements; a chunk result as an array (filled at 3 ns an element) concatenated
 into one array and turned into a Vec with `vec-from-array` (5 ns an element) costs 3 + 5 ms. That is what `pmap` does. Writing straight into one pre-sized array
