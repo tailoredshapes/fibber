@@ -2,7 +2,7 @@
 ;; it. `make` opens a connection to an EMPTY database (a fresh SQLite `:memory:`, a fresh PostgreSQL schema); every scenario creates its
 ;; own table. The SQL is the subset SQLite and PostgreSQL share. Only the protocol `Connection` and the fib.db functions are called, so
 ;; each driver gets its own monomorphised copy.
-(ns driver-contract (:use fib.core fib.seq fib.coll fib.test.core fib.db) (:require [fib.async :as as]))
+(ns fib.db.contract (:use fib.core fib.seq fib.coll fib.ex fib.test.core fib.db) (:require [fib.async :as as]))
 
 (defun rows (r: (Result (Vec (Map str Datum)) DbError)) -> (Vec (Map str Datum)) (match r ((Ok v) v) ((Err _) [])))
 (defun err-state (r: (Result a DbError)) -> str (match r ((Ok _) "ok") ((Err e) (. e sqlstate))))
@@ -59,6 +59,18 @@
                          _ (execute! tx ["insert into people (id, name) values (?, ?)" 2 "a"])]
                  (Ok 2)))])
     (then (expect = "23505" (err-state r)) (expect = 0 (row-count c "people"))))
+  (scenario "with-transaction rolls back a body that traps, and the trap goes on"
+    (covers "fib.db with-transaction")
+    (given [c (make) _ (table! c)])
+    (upon [r (try (do (with-transaction [tx c]
+                        (do (execute! tx ["insert into people (id, name) values (?, ?)" 1 "a"])
+                            (nth [1] 5)
+                            (Ok 1)))
+                      "no trap")
+                  (catch e (str "trap " (unwrap-or (ex-kind e) "?"))))
+           n (row-count c "people")
+           again (execute! c ["insert into people (id, name) values (?, ?)" 1 "a"])])
+    (then (expect = "trap index" r) (expect = 0 n) (expect = "ok" (err-state again)) (expect = 1 (row-count c "people"))))
   (scenario "errors carry SQLSTATE"
     (covers "fib.db DbError")
     (given [c (make) _ (table! c)])
@@ -74,3 +86,11 @@
     (given [c (make) _ (table! c)])
     (upon [n (as/try-join (spawn (fn () (update-count (rows (execute! c ["insert into people (id, name) values (?, ?)" 1 "t"]))))))])
     (then (expect = true (match n ((Ok 1) true) (_ false))) (expect = 1 (row-count c "people")))))
+
+;; The scenarios of a suite that fail, by text, run in this process with seed 1: for the proof that the contract can fail (a planted broken
+;; driver must show up here) and for a driver that wants the names rather than a report. A scenario that traps takes the process with it:
+;; use `fibc test` for a driver that might.
+(defun failing-scenarios (scs: (Vec Scenario)) -> (Vec str)
+  (let [broke? (fn (s: StepRun) (match (. s judged) ((Held) false) ((Broke _ _) true)))]
+    (vec (map (fn (sc: Scenario) (. sc text))
+              (filter (fn (sc: Scenario) (some? (first (filter broke? ((. sc run) 1))))) scs)))))

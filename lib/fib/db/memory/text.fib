@@ -1,0 +1,93 @@
+;; fib.db.memory.text: the text side of the in-memory fake driver (fib.db.memory): tokens, values, where, the stored shapes.
+(ns fib.db.memory.text (:use fib.core fib.seq fib.coll fib.datum fib.db.core))
+
+(defstruct Column (name: str notnull: bool unique: bool))
+(defstruct Table (cols: (Vec Column) rows: (Vec (Map str Datum))))
+(defstruct Store (tables: (Map str Table) saved: (Option (Map str Table))))
+;; a statement's outcome: the database after it and the rows it answers
+(defstruct Outcome (store: Store rows: (Vec (Map str Datum))))
+;; where c OP v: the column, the operator and the value
+(defstruct Cond (col: str op: str val: Datum))
+
+
+(defun syntax (m: str) -> DbError (DbError "42601" 0 (str "memory: " m)))
+
+;; ---- tokens: words lower-cased, punctuation, and each `?` numbered ("?0", "?1") by position
+(defun byte-at (s: str i: i64) -> i64 (bit-and (sext i64 (str-byte-at s i)) 255))
+(defun space? (c: i64) -> bool (or (= c 32) (= c 10) (= c 9) (= c 13)))
+(defun punct? (c: i64) -> bool (or (= c 40) (= c 41) (= c 44) (= c 63) (= c 61) (= c 60) (= c 62) (= c 33)))
+
+(defun lower (s: str) -> str
+  (loop [i 0 out ""]
+    (if (>= i (str-len s))
+        out
+        (let [c (byte-at s i)]
+          (recur (+ i 1) (str out (if (and (>= c 65) (<= c 90)) (subs "abcdefghijklmnopqrstuvwxyz" (- c 65) (- c 64)) (subs s i (+ i 1)))))))))
+
+(defun word-end (s: str i: i64) -> i64
+  (loop [j i]
+    (if (and (< j (str-len s)) (not (space? (byte-at s j))) (not (punct? (byte-at s j)))) (recur (+ j 1)) j)))
+
+(defun tokenize (sql: str) -> (Vec str)
+  (let [n (str-len sql)]
+    (loop [i 0 out [] q 0]
+      (if (>= i n)
+          out
+          (let [c (byte-at sql i)]
+            (cond (space? c) (recur (+ i 1) out q)
+                  (= c 63) (recur (+ i 1) (conj out (str "?" q)) (+ q 1))
+                  (punct? c) (let [two (and (< (+ i 1) n) (= (byte-at sql (+ i 1)) 61) (or (= c 62) (= c 60) (= c 33)))
+                                   w (if two 2 1)]
+                               (recur (+ i w) (conj out (subs sql i (+ i w))) q))
+                  :else (let [e (word-end sql i)] (recur e (conj out (lower (subs sql i e))) q))))))))
+
+(defun tok-index (toks: (Vec str) w: str from: i64) -> i64
+  (loop [i from] (cond (>= i (count toks)) -1 (= (nth toks i) w) i :else (recur (+ i 1)))))
+
+(defun slice (toks: (Vec str) a: i64 b: i64) -> (Vec str)
+  (loop [i a out []] (if (< i b) (recur (+ i 1) (conj out (nth toks i))) out)))
+
+;; the groups of toks[a, b) between top-level commas
+(defun split-commas (toks: (Vec str) a: i64 b: i64) -> (Vec (Vec str))
+  (loop [i a start a out []]
+    (cond (>= i b) (if (> b start) (conj out (slice toks start b)) out)
+          (= (nth toks i) ",") (recur (+ i 1) (+ i 1) (conj out (slice toks start i)))
+          :else (recur (+ i 1) start out))))
+
+;; ---- values
+(defun param-or-literal (t: str params: (Vec Datum)) -> (Result Datum DbError)
+  (cond (starts-with? t "?") (match (parse-long (subs t 1 (str-len t)))
+                               ((some k) (if (< k (count params)) (Ok (stored (nth params k))) (Err (DbError "07001" 0 "memory: too few parameters"))))
+                               (nil (Err (syntax t))))
+        (= t "null") (Ok DNil)
+        :else (match (parse-long t) ((some n) (Ok (DInt n))) (nil (Err (syntax (str "cannot read " t)))))))
+
+(defun stored (d: Datum) -> Datum (match d ((DBool b) (DInt (if b 1 0))) (_ d)))
+
+;; the order of two values: -1 0 1, or 2 when they cannot be compared (a NULL, or kinds that differ)
+(defun dcmp (a: Datum b: Datum) -> i64
+  (match a
+    ((DStr x) (match b ((DStr y) (compare x y)) (_ 2)))
+    ((DNil) 2)
+    ((DBytes _) (if (datum= a b) 0 2))
+    (_ (match (as-float a) ((some x) (match (as-float b) ((some y) (compare x y)) (nil 2))) (nil 2)))))
+
+(defun op-holds? (op: str c: i64) -> bool
+  (cond (= c 2) false (= op "=") (= c 0) (= op "!=") (!= c 0) (= op ">") (> c 0) (= op ">=") (>= c 0) (= op "<") (< c 0) :else (<= c 0)))
+
+(defun row-matches? (c: (Option Cond) row: (Map str Datum)) -> bool
+  (match c (nil true) ((some k) (op-holds? (. k op) (dcmp (unwrap-or (get row (. k col)) DNil) (. k val))))))
+
+;; `where c OP v` at toks[w..], or nothing when w is -1
+(defun parse-where (toks: (Vec str) w: i64 end: i64 params: (Vec Datum)) -> (Result (Option Cond) DbError)
+  (cond (< w 0) (Ok nil)
+        (!= end (+ w 4)) (Err (syntax "where takes column OP value"))
+        :else (try-let [v (param-or-literal (nth toks (+ w 3)) params)]
+                (Ok (some (Cond (nth toks (+ w 1)) (nth toks (+ w 2)) v))))))
+
+(defun table-of (s: Store name: str) -> (Result Table DbError)
+  (match (get (. s tables) name) ((some t) (Ok t)) (nil (Err (DbError "42P01" 0 (str "memory: no table " name))))))
+
+(defun put-table (s: Store name: str t: Table) -> Store (Store (assoc (. s tables) name t) (. s saved)))
+(defun count-row (n: i64) -> (Vec (Map str Datum)) [{"update-count" (DInt n)}])
+(defun done (s: Store n: i64) -> (Result Outcome DbError) (Ok (Outcome s (count-row n))))

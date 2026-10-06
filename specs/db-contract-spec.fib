@@ -1,0 +1,32 @@
+;; The Driver contract can fail (method rule: a test that cannot fail is worse than none): three planted-broken drivers, each a wrapper
+;; over the memory fake with one fault, and the contract must name exactly the scenario that fault breaks. The honest wrapper fails none.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.db fib.db.memory fib.db.contract))
+
+;; fault: "" none; "rollback" ROLLBACK does nothing (a rolled-back transaction commits); "close" conn-close never closes;
+;; "unique" an INSERT that repeats a name is accepted (the fake's own check is bypassed by renaming the second value)
+(defstruct Faulty (inner: MemConn fault: str))
+
+(defun faulty (fault: str) -> Faulty (Faulty (open-memory) fault))
+
+(impl Connection Faulty
+  (conn-execute (self sql params)
+    (if (and (= (. self fault) "rollback") (= sql "ROLLBACK"))
+        (Ok [{"update-count" (DInt 0)}])
+        (conn-execute (. self inner) sql params)))
+  (conn-close (self)
+    (if (= (. self fault) "close") (Ok ()) (conn-close (. self inner)))))
+
+(defun failing (fault: str) -> (Vec str) (failing-scenarios (DriverContract (fn () (faulty fault)))))
+
+(defspecs specs
+  (feature "the Driver contract can fail"
+    (scenario "a driver without a fault passes every scenario"
+      (then (expect = [] (failing ""))))
+    (scenario "a ROLLBACK that does nothing fails the rollback scenarios, and only them"
+      (then (expect = ["with-transaction rolls back when the body returns Err"
+                       "with-transaction rolls back a body that traps, and the trap goes on"]
+                    (failing "rollback"))))
+    (scenario "a close that does not close fails the closed-connection scenario, and only it"
+      (then (expect = ["a closed connection refuses work; closing twice is harmless"] (failing "close"))))))
+
+(defun main () -> i64 (run-main (specs)))

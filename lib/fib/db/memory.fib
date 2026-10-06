@@ -1,0 +1,195 @@
+;; fib.db.memory: an in-memory FAKE driver for fib.db (docs/design/observability-and-databases.md 4.9, docs/design/db-contract.md): a Connection
+;; over a few tables held in an Atom, with no C library, so the core's specs and the Driver contract (fib.db.contract) run in the full gate.
+;;
+;;   (open-memory)       -> MemConn            a fresh, empty database
+;;   (memory-closes c)   -> i64                how many times conn-close was called on c (the specs of with-connection read it)
+;;
+;; It understands the SQL subset the contract uses, nothing more, and says 42601 to the rest: create table (column definitions with
+;; `not null`, `unique`, `primary key`), insert into .. (cols) values (? ..), select items [from t [where c OP ?] [order by c [desc]]]
+;; (items: a column, `c as label`, `count(*) as label`, `*`, an integer literal without from), update t set c = ? [, ..] [where ..],
+;; delete from t [where ..], BEGIN, COMMIT, ROLLBACK (a snapshot). Parameters are bound by position and never read as SQL. A boolean
+;; is stored as 0 or 1 (as SQLite does); a unique or not-null violation is 23505 or 23502, a syntax error 42601, an unknown table
+;; 42P01, a closed connection 08003. It is a test double: no indexes, no types, numbers and text compare, bytes only by equality.
+(ns fib.db.memory (:use fib.core fib.seq fib.coll fib.datum fib.db.core fib.db.memory.text))
+
+(defstruct MemConn (store: (Atom Store) open: (Atom bool) closes: (Atom i64)))
+
+(defun open-memory () -> MemConn (MemConn (atom (Store {} nil)) (atom true) (atom 0)))
+(defun memory-closes (c: MemConn) -> i64 @(. c closes))
+
+;; ---- statements: each takes the database, the tokens and the parameters and answers the database after it and its rows
+(defun col-def :private (toks: (Vec str)) -> Column
+  (let [has (fn (w: str) (>= (tok-index toks w 0) 0))]
+    (Column (nth toks 0) (and (has "not") (has "null")) (or (has "unique") (has "primary")))))
+
+(defun do-create :private (s: Store toks: (Vec str)) -> (Result Outcome DbError)
+  (let [open (tok-index toks "(" 0)]
+    (if (or (< (count toks) 4) (< open 3) (!= (nth toks 1) "table"))
+        (Err (syntax "create table NAME (columns)"))
+        (let [cols (vec (map col-def (split-commas toks (+ open 1) (- (count toks) 1))))]
+          (done (put-table s (nth toks 2) (Table cols [])) 0)))))
+
+(defun has-value? :private (t: Table k: str v: Datum) -> bool
+  (loop [i 0]
+    (cond (>= i (count (. t rows))) false
+          (datum= v (unwrap-or (get (nth (. t rows) i) k) DNil)) true
+          :else (recur (+ i 1)))))
+
+(defun violation :private (t: Table row: (Map str Datum)) -> (Option DbError)
+  (loop [i 0]
+    (if (>= i (count (. t cols)))
+        nil
+        (let [c (nth (. t cols) i) v (unwrap-or (get row (. c name)) DNil)]
+          (cond (and (. c notnull) (datum= v DNil)) (some (DbError "23502" 0 (str "memory: " (. c name) " is null")))
+                (and (. c unique) (not (datum= v DNil)) (has-value? t (. c name) v)) (some (DbError "23505" 0 (str "memory: " (. c name) " is not unique")))
+                :else (recur (+ i 1)))))))
+
+(defun build-row :private (names: (Vec (Vec str)) vals: (Vec (Vec str)) params: (Vec Datum)) -> (Result (Map str Datum) DbError)
+  (if (!= (count names) (count vals))
+      (Err (syntax "columns and values differ"))
+      (loop [i 0 row {}]
+        (if (>= i (count names))
+            (Ok row)
+            (match (param-or-literal (nth (nth vals i) 0) params)
+              ((Err e) (Err e))
+              ((Ok v) (recur (+ i 1) (assoc row (nth (nth names i) 0) v))))))))
+
+;; insert into T (c ..) values (v ..)
+(defun do-insert :private (s: Store toks: (Vec str) params: (Vec Datum)) -> (Result Outcome DbError)
+  (let [v (tok-index toks "values" 0)]
+    (if (or (< (count toks) 8) (< v 0) (!= (nth toks 1) "into"))
+        (Err (syntax "insert into T (columns) values (values)"))
+        (try-let [t (table-of s (nth toks 2))
+                  row (build-row (split-commas toks 4 (- v 1)) (split-commas toks (+ v 2) (- (count toks) 1)) params)]
+          (match (violation t row)
+            ((some e) (Err e))
+            (nil (done (put-table s (nth toks 2) (Table (. t cols) (conj (. t rows) row))) 1)))))))
+
+;; ---- select
+(defstruct Item (label: str src: str agg: bool))
+
+(defun parse-item :private (g: (Vec str)) -> Item
+  (cond (= (nth g 0) "count") (Item (if (>= (count g) 6) (nth g 5) "count") "*" true)
+        (>= (count g) 3) (Item (nth g 2) (nth g 0) false)
+        :else (Item (nth g 0) (nth g 0) false)))
+
+(defun before? :private (a: Datum b: Datum desc: bool) -> bool
+  (let [c (dcmp a b)] (and (!= c 2) (if desc (> c 0) (< c 0)))))
+
+(defun insert-sorted :private (out: (Vec (Map str Datum)) row: (Map str Datum) col: str desc: bool) -> (Vec (Map str Datum))
+  (let [v (unwrap-or (get row col) DNil)
+        at (loop [j 0] (cond (>= j (count out)) j (before? v (unwrap-or (get (nth out j) col) DNil) desc) j :else (recur (+ j 1))))]
+    (loop [k 0 res []]
+      (if (>= k (count out))
+          (if (= at k) (conj res row) res)
+          (recur (+ k 1) (if (= k at) (conj (conj res row) (nth out k)) (conj res (nth out k))))))))
+
+(defun sort-rows :private (rows: (Vec (Map str Datum)) col: str desc: bool) -> (Vec (Map str Datum))
+  (loop [i 0 out []] (if (>= i (count rows)) out (recur (+ i 1) (insert-sorted out (nth rows i) col desc)))))
+
+(defun has-col? :private (t: Table k: str) -> bool
+  (loop [i 0] (cond (>= i (count (. t cols))) false (= (. (nth (. t cols) i) name) k) true :else (recur (+ i 1)))))
+
+(defun project-row :private (t: Table items: (Vec Item) row: (Map str Datum)) -> (Map str Datum)
+  (loop [i 0 out {}]
+    (if (>= i (count items))
+        out
+        (let [it (nth items i)]
+          (recur (+ i 1)
+                 (if (= (. it src) "*")
+                     (reduce (fn (m: (Map str Datum) c: Column) (assoc m (. c name) (unwrap-or (get row (. c name)) DNil))) out (. t cols))
+                     (assoc out (. it label) (unwrap-or (get row (. it src)) DNil))))))))
+
+(defun check-items :private (t: Table items: (Vec Item)) -> (Option DbError)
+  (loop [i 0]
+    (cond (>= i (count items)) nil
+          (and (!= (. (nth items i) src) "*") (not (has-col? t (. (nth items i) src))))
+          (some (DbError "42703" 0 (str "memory: no column " (. (nth items i) src))))
+          :else (recur (+ i 1)))))
+
+(defun filter-rows :private (t: Table c: (Option Cond)) -> (Vec (Map str Datum))
+  (reduce (fn (out: (Vec (Map str Datum)) r: (Map str Datum)) (if (row-matches? c r) (conj out r) out)) [] (. t rows)))
+
+;; select items [from T [where c OP v] [order by c [desc]]]; without from, one row of integer literals (`select 1`)
+(defun do-select :private (s: Store toks: (Vec str) params: (Vec Datum)) -> (Result Outcome DbError)
+  (let [from (tok-index toks "from" 1)
+        o (tok-index toks "order" 1)
+        end (if (< o 0) (count toks) o)
+        items (vec (map parse-item (split-commas toks 1 (if (< from 0) (count toks) from))))]
+    (if (< from 0)
+        (Ok (Outcome s [(reduce (fn (m: (Map str Datum) it: Item) (assoc m (. it label) (DInt (unwrap-or (parse-long (. it src)) 0)))) {} items)]))
+        (try-let [t (table-of s (nth toks (+ from 1)))
+                  w (parse-where toks (tok-index toks "where" from) end params)]
+          (match (check-items t items)
+            ((some e) (Err e))
+            (nil (let [rows (filter-rows t w)
+                       ordered (if (< o 0) rows (sort-rows rows (nth toks (+ o 2)) (and (> (count toks) (+ o 3)) (= (nth toks (+ o 3)) "desc"))))]
+                   (Ok (Outcome s (if (. (nth items 0) agg)
+                                    [{(. (nth items 0) label) (DInt (count rows))}]
+                                    (vec (map (fn (r: (Map str Datum)) (project-row t items r)) ordered))))))))))))
+
+;; ---- update and delete
+(defun apply-sets :private (row: (Map str Datum) sets: (Vec (Vec str)) params: (Vec Datum)) -> (Result (Map str Datum) DbError)
+  (loop [i 0 r row]
+    (if (>= i (count sets))
+        (Ok r)
+        (match (param-or-literal (nth (nth sets i) 2) params)
+          ((Err e) (Err e))
+          ((Ok v) (recur (+ i 1) (assoc r (nth (nth sets i) 0) v)))))))
+
+(defstruct Updated (rows: (Vec (Map str Datum)) n: i64))
+
+(defun do-update :private (s: Store toks: (Vec str) params: (Vec Datum)) -> (Result Outcome DbError)
+  (let [w (tok-index toks "where" 0)
+        end (if (< w 0) (count toks) w)]
+    (if (or (< (count toks) 6) (!= (nth toks 2) "set"))
+        (Err (syntax "update T set c = v [where ..]"))
+        (try-let [t (table-of s (nth toks 1))
+                  c (parse-where toks w (count toks) params)]
+          (let [sets (split-commas toks 3 end)
+                step (fn (acc: (Result Updated DbError) r: (Map str Datum))
+                       (match acc
+                         ((Err e) (Err e))
+                         ((Ok p) (if (row-matches? c r)
+                                   (match (apply-sets r sets params) ((Err e) (Err e)) ((Ok r2) (Ok (Updated (conj (. p rows) r2) (+ (. p n) 1)))))
+                                   (Ok (Updated (conj (. p rows) r) (. p n)))))))]
+            (try-let [p (reduce step (Ok (Updated [] 0)) (. t rows))]
+              (done (put-table s (nth toks 1) (Table (. t cols) (. p rows))) (. p n))))))))
+
+(defun do-delete :private (s: Store toks: (Vec str) params: (Vec Datum)) -> (Result Outcome DbError)
+  (if (or (< (count toks) 3) (!= (nth toks 1) "from"))
+      (Err (syntax "delete from T [where ..]"))
+      (try-let [t (table-of s (nth toks 2))
+                c (parse-where toks (tok-index toks "where" 0) (count toks) params)]
+        (let [keep (reduce (fn (out: (Vec (Map str Datum)) r: (Map str Datum)) (if (row-matches? c r) out (conj out r))) [] (. t rows))]
+          (done (put-table s (nth toks 2) (Table (. t cols) keep)) (- (count (. t rows)) (count keep)))))))
+
+;; ---- transactions: BEGIN keeps a snapshot, ROLLBACK returns to it
+(defun do-txn :private (s: Store w: str) -> (Result Outcome DbError)
+  (cond (= w "begin") (match (. s saved)
+                        ((some _) (Err (DbError "25001" 0 "memory: a transaction is already open")))
+                        (nil (done (Store (. s tables) (some (. s tables))) 0)))
+        (= w "commit") (done (Store (. s tables) nil) 0)
+        :else (done (match (. s saved) ((some saved) (Store saved nil)) (nil s)) 0)))
+
+(defun run-sql :private (s: Store toks: (Vec str) params: (Vec Datum)) -> (Result Outcome DbError)
+  (if (= (count toks) 0)
+      (Err (syntax "empty statement"))
+      (let [w (nth toks 0)]
+        (cond (= w "create") (do-create s toks)
+              (= w "insert") (do-insert s toks params)
+              (= w "select") (do-select s toks params)
+              (= w "update") (do-update s toks params)
+              (= w "delete") (do-delete s toks params)
+              (or (= w "begin") (= w "commit") (= w "rollback")) (do-txn s w)
+              :else (Err (syntax (str "cannot run " w)))))))
+
+(impl Connection MemConn
+  (conn-execute (self sql params)
+    (if (not @(. self open))
+        (Err (DbError "08003" 0 "memory: the connection is closed"))
+        (match (run-sql @(. self store) (tokenize sql) params)
+          ((Err e) (Err e))
+          ((Ok o) (do (reset! (. self store) (. o store)) (Ok (. o rows)))))))
+  (conn-close (self)
+    (do (swap! (. self closes) (fn (n: i64) (+ n 1))) (reset! (. self open) false) (Ok ()))))
