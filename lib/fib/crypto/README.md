@@ -37,11 +37,11 @@ Streaming, without copying a large input:
 
 ```clojure
 (match (c/digest-start p :sha-256)
-  ((Ok h) (do (c/feed-range h big 0 1048576) (c/feed-range h big 1048576 1048576) (hasher-finish h)))   ; (Result (Array i8) CryptoError)
+  ((Ok h) (do (c/feed-range h big 0 1048576) (c/feed-range h big 1048576 1048576) (c/hasher-finish h)))   ; (Result (Array i8) CryptoError)
   ((Err e) (Err e)))
 ```
 
-A hasher is finished once (`hasher-finish`) or closed (`hasher-close`); a hasher that is abandoned leaks its native context until the process
+A hasher is finished once (`c/hasher-finish`) or closed (`c/hasher-close`); a hasher that is abandoned leaks its native context until the process
 ends (fibber has no scope-exit hook yet). The one-shot functions never leak.
 
 A library that needs cryptography takes the provider as a parameter (`:where ((c/CryptoProvider p))`, or a `(dyn c/CryptoProvider :send)` field)

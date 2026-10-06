@@ -172,16 +172,58 @@ Not built; named so the protocol leaves room.
 
 ## 10. Measurements
 
-(see the section "Measured" at the end of this file; numbers are quoted from the commands run.)
+See "Measured" at the end of this file: the numbers are quoted from the commands run.
 
 ## 11. Drivers
 
 | Driver | Repository | Library | Status |
 |---|---|---|---|
 | OpenSSL 3 | `tailoredshapes/fib-crypto-openssl` | libcrypto: `EVP_MD`, `EVP_MAC` (HMAC), `EVP_KDF` (PBKDF2, HKDF, scrypt, Argon2id), `RAND_bytes`, `CRYPTO_memcmp` | built; contract 15/15, faults 9/9, SCRAM 6/6 |
-| Apple CommonCrypto | `tailoredshapes/fib-crypto-apple` | libSystem: `CC_SHA256`, `CCHmac`, `CCKeyDerivationPBKDF`, `CCRandomGenerateBytes`; `timingsafe_bcmp` | see the end of this file |
+| Apple CommonCrypto | `tailoredshapes/fib-crypto-apple` | libSystem: `CC_SHA256`, `CCHmac`, `CCKeyDerivationPBKDF`, `CCRandomGenerateBytes`; `timingsafe_bcmp` | design only (below) |
 | libsodium | not planned | `crypto_generichash`, `sodium_memcmp`, `randombytes_buf` | the box has libsodium.so.23; BLAKE2b and Argon2 would be new capability names |
+
+### The Apple driver (design only, not built)
+
+CommonCrypto is in libSystem (no extra link): `CC_SHA256_Init/Update/Final` (and `CC_SHA384`, `CC_SHA512`, `CC_SHA1`, `CC_MD5`), `CCHmacInit/Update/Final`
+with `kCCHmacAlgSHA256` and friends, `CCKeyDerivationPBKDF(kCCPBKDF2, ..)` with `kCCPRFHmacAlgSHA256`, `CCRandomGenerateBytes`, and `timingsafe_bcmp` for
+`ct=`. The contexts are plain structs a driver allocates. **HKDF, scrypt and Argon2id are not in the public CommonCrypto API** (HKDF is in CryptoKit,
+a Swift API): writing HKDF over `CCHmac` ourselves is the cryptography the owner's rule forbids, so an Apple driver lists no `:hkdf`, and the contract,
+which today requires `:hkdf`, would first have to make it optional like scrypt. That and `DYLD_INSERT_LIBRARIES` for the JIT are the open points. Not
+built for want of budget, not for want of a machine: the Mac Studio (`ssh tmarsh@192.168.7.254`) answered.
 
 ## Measured
 
-(filled in below)
+All on this machine (28 cores, a CPU with SHA-NI), driver fib-crypto-openssl v0.1.0 built with `fibc build -O 2 -l:libcrypto.so.3`, OpenSSL 3.5.5.
+`scripts/bench.sh` in the driver repository; wall seconds for the whole command, process start included.
+
+```
+-- SHA-256, 100 MiB x 3
+fib.crypto openssl, one-shot                      0.166 s
+fib.crypto openssl, streamed 1 MiB                0.165 s
+sha256sum                                         0.181 s
+openssl dgst -sha256                              0.188 s
+python3 hashlib                                   0.199 s
+-- SHA-256, 1 MiB x 200
+fib.crypto openssl, one-shot                      0.103 s
+sha256sum (a process each time: includes start-up)    0.491 s
+python3 hashlib                                   0.109 s
+-- PBKDF2-HMAC-SHA256, 4096 iterations x 200
+fib.crypto openssl                                0.101 s
+python3 hashlib.pbkdf2_hmac                       0.112 s
+openssl kdf PBKDF2 (a process each time)          0.615 s
+```
+
+That is about 1.8 GB/s for SHA-256 (the binding adds nothing measurable: the data is passed by address, not copied) and 0.5 ms per
+4096-iteration PBKDF2, within the noise of python's `hashlib` (OpenSSL underneath) and well inside the 3x target.
+
+Differential check (`scripts/differential.sh`, seed 20261006): 1350 inputs against python3 `hashlib`/`hmac` and an HKDF written over python's `hmac`:
+random messages of lengths 0 to 5000 and every length around the 55/56/63/64/65 and 111/112/119/120/127/128/129 block boundaries for SHA-256,
+SHA-384, SHA-512, SHA-1 and MD5; HMAC with keys of lengths 0 to 300 for the three SHA-2 hashes; PBKDF2 (SHA-256 and SHA-512) with random salt,
+password, iterations 1 to 3000 and length; HKDF likewise. Result: `checked 1350 mismatches 0` (34 shards, `differential: PASS`).
+
+Found on the way, not fixed here (library, not crypto): `fib.os/read-file-bytes` and `fib.string/split` are quadratic in the size of the
+input (a 1.6 MB file takes 40 s to read; `split` of a 5 MB string did not finish in minutes), so the differential script shards its inputs.
+
+Planted faults. Encodings (`scripts/mutant-crypto-encoding.sh`, in this repository): ten mutants, all killed. Driver (`scripts/mutant-openssl.sh`):
+eleven mutants killed, one (`pkcs5-off`) equivalent on OpenSSL 3.2 and newer, where PBKDF2's minimum checks apply to FIPS only; it matters on 3.0
+and 3.1, so the parameter stays. The contract against `Faulty` wrappers: eight faults, each fails the scenario about the broken thing.
