@@ -1,0 +1,31 @@
+;; expect: accept
+;; out: add 9223372036854775807 -9223372036854775808
+;; out: sub -9223372036854775808 9223372036854775807
+;; out: mul -4294967296 -2
+;; out: shl -9223372036854775808 lshr 1 ashr -1
+;; out: hash 18112506748242246321
+;; The JS backend's i64 is a BigInt wrapped after every + - * << (docs/design/js-backend.md, decision 1); each line crosses the wrap.
+;; The hash line is FNV-1a over the bytes 0..99 (offset basis 14695981039346656037, prime 1099511628211), every multiply wrapping;
+;; the expected value is Python's `h = 0xcbf29ce484222325; for b in range(100): h = ((h ^ b) * 0x100000001b3) % 2**64`, printed unsigned (%llu).
+(declare printf i32 (ptr ...))
+(define (opq i64) ((i64 x)) (block entry (let ((s (alloca i64))) (store volatile x s) (ret (load volatile i64 s)))))
+(define (fnv i64) ((i64 n))
+  (block entry (br loop))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (loop i2)))
+          (h (phi i64 (entry (i64 -3750763034362895579)) (loop h2)))
+          (h2 (mul (xor h i) (i64 1099511628211)))
+          (i2 (add i (i64 1))))
+      (br (icmp slt i2 n) loop done)))
+  (block done (ret h2)))
+(define (main i32) ()
+  (block entry
+    (let ((max (call @opq (i64 9223372036854775807)))
+          (min (call @opq (i64 -9223372036854775808)))
+          (big (call @opq (i64 4294967296))))
+      (call @printf (string "add %lld %lld\n") max (add max (i64 1)))
+      (call @printf (string "sub %lld %lld\n") min (sub min (i64 1)))
+      (call @printf (string "mul %lld %lld\n") (mul big (i64 -1)) (mul max (i64 2)))
+      (call @printf (string "shl %lld lshr %lld ashr %lld\n") (shl (call @opq (i64 1)) (i64 63)) (lshr min (i64 63)) (ashr min (i64 63)))
+      (call @printf (string "hash %llu\n") (call @fnv (i64 100)))
+      (ret (i32 0)))))

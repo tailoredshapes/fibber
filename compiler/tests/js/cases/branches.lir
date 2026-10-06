@@ -1,0 +1,53 @@
+;; expect: accept
+;; out: collatz 27 111
+;; out: fib 90 2880067194370816120
+;; out: swap 5 3
+;; out: classify 0 1 2 3 3 1
+;; Control flow the loop-and-switch translation must keep: a loop with a conditional branch out of its middle (collatz: 111 steps from
+;; 27), two phis that read each other (fib by a pair swap; F(90) = 2880067194370816120), two phis that swap (5 3 after
+;; two swaps), a switch with a shared target and a default (classify).
+(declare printf i32 (ptr ...))
+(define (collatz i64) ((i64 n))
+  (block entry (br head))
+  (block head
+    (let ((x (phi i64 (entry n) (even x2) (odd x3)))
+          (k (phi i64 (entry (i64 0)) (even k1) (odd k1)))
+          (k1 (add k (i64 1))))
+      (br (icmp eq x (i64 1)) done step)))
+  (block step (br (icmp eq (and x (i64 1)) (i64 0)) even odd))
+  (block even (let ((x2 (sdiv x (i64 2)))) (br head)))
+  (block odd (let ((x3 (add (mul x (i64 3)) (i64 1)))) (br head)))
+  (block done (ret k)))
+(define (fib i64) ((i64 n))
+  (block entry (br loop))
+  (block loop
+    (let ((a (phi i64 (entry (i64 0)) (loop b)))
+          (b (phi i64 (entry (i64 1)) (loop c)))
+          (i (phi i64 (entry (i64 0)) (loop i2)))
+          (c (add a b))
+          (i2 (add i (i64 1))))
+      (br (icmp slt i2 n) loop done)))
+  (block done (ret b)))
+(define (swaps i32) ((i32 n))
+  (block entry (br loop))
+  (block loop
+    (let ((x (phi i32 (entry (i32 3)) (loop y)))
+          (y (phi i32 (entry (i32 5)) (loop x)))
+          (i (phi i32 (entry (i32 0)) (loop i2)))
+          (i2 (add i (i32 1))))
+      (br (icmp slt i2 n) loop done)))
+  (block done (call @printf (string "swap %d %d\n") y x) (ret (i32 0))))
+(define (classify i32) ((i32 v))
+  (block entry (switch v other ((i32 0) zero) ((i32 1) one) ((i32 7) one) ((i32 2) two)))
+  (block zero (ret (i32 0)))
+  (block one (ret (i32 1)))
+  (block two (ret (i32 2)))
+  (block other (ret (i32 3))))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "collatz 27 %lld\n") (call @collatz (i64 27)))
+    (call @printf (string "fib 90 %lld\n") (call @fib (i64 90)))
+    (call @swaps (i32 3))
+    (call @printf (string "classify %d %d %d %d %d %d\n") (call @classify (i32 0)) (call @classify (i32 1)) (call @classify (i32 2))
+          (call @classify (i32 3)) (call @classify (i32 -1)) (call @classify (i32 7)))
+    (ret (i32 0))))
