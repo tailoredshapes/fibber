@@ -22,6 +22,7 @@ mkdir -p "$out"
 # Under the gate (GATE_SLOTS, scripts/lib/slots.sh) every script runs at once and each fibc it starts holds a slot, through the wrapper
 # scripts/lib/fibc-slot.sh; alone, three scripts run at a time and FIBC is the fibc itself.
 if [ -n "${GATE_SLOTS:-}" ]; then export GATE_REAL_FIBC=$fibc; fibc=$here/lib/fibc-slot.sh; fi
+export FUZZ_SELFTEST_DEADLINE=${FUZZ_SELFTEST_DEADLINE:-8000}   # lsp/fuzz.js --selftest: the crash probe of its fake server must be seen as a crash, not a hang, on a busy machine
 export FIBC=$fibc FIB_LIB=${FIB_LIB:-$root/lib} TMPDIR=$out
 cd "$root" || exit 2
 t=compiler/tests

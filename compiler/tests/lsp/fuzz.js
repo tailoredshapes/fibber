@@ -311,7 +311,7 @@ process.stdin.on('data',d=>{buf=Buffer.concat([buf,d]);for(;;){const i=buf.index
 let m;try{m=JSON.parse(t)}catch(e){out({jsonrpc:'2.0',id:null,error:{code:-32700,message:'x'}});continue}
 if(t.includes('(((((')) process.kill(process.pid,'SIGSEGV'); if(t.includes('\\\\u0000')) {continue;}
 if(m.id!==undefined)out({jsonrpc:'2.0',id:m.id,result:null});else if(m.method==='textDocument/didOpen'||m.method==='textDocument/didChange'||m.method==='textDocument/didClose')out({jsonrpc:'2.0',method:'textDocument/publishDiagnostics',params:{}});}});`);
-  opt.server = process.execPath; opt.args = [fake]; opt.deadline = 1500;
+  opt.server = process.execPath; opt.args = [fake]; opt.deadline = Number(process.env.FUZZ_SELFTEST_DEADLINE) || 1500;  // a crashing child can take seconds to die when the machine is busy (the kernel waits for the core handler), so the gate gives it longer
   const r = rng(7); const probes = [['plain', 'hello (ns x)'], ['crash', '(' .repeat(50)], ['hang', 'a\u0000b'], ['plain2', '(ns y)']]; let crash = 0; let hang = 0; let ok = 0;
   for (const [name, text] of probes) {
     const { srv } = await fresh(); const res = await runSteps(srv, steps(r, text, false), opt.deadline); srv.kill();
