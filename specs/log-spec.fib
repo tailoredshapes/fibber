@@ -60,7 +60,13 @@
             (expect = INFO (. (mem-logger m INFO "app") level))))
     (scenario "levels parse in any case; rules skip what they cannot read"
       (then (expect = (some WARN) (parse-level " Warn ")) (expect = nil (parse-level "verbose"))
-            (expect = [(Pair "a.b" ERROR) (Pair "c" TRACE)] (parse-rules "a.b=error,junk,x=loud, c =trace")))))
+            (expect = [(Pair "a.b" ERROR) (Pair "c" TRACE)] (parse-rules "a.b=error,junk,x=loud, c =trace"))))
+    (scenario "the environment sets the root and the rules; the data form names a bad level"
+      (given [_ (do (os/setenv "FIB_LOG_LEVEL" "error") (os/setenv "FIB_LOG_LEVELS" "app.db=trace"))
+              sys (system-from-env)])
+      (then (expect = ERROR (. (get-logger sys "app") level)) (expect = TRACE (. (get-logger sys "app.db.x") level))
+            (expect = (some "unknown level loud for x") (match (levels-from-map "info" {"x" "loud"}) ((Err m) (some m)) ((Ok _) nil)))
+            (expect = WARN (match (levels-from-map "info" {"x" "warn"}) ((Ok t) (level-for t "x.y")) ((Err _) -1))))))
   (feature "fib.log records"
     (scenario "fields reach the sink as data, context first"
       (given [m (memory-sink) lg (with-context (mem-logger m INFO "app") :req "r-1")])
