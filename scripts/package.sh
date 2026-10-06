@@ -17,6 +17,7 @@
 #   4. OUT/fibc-VERSION-PLATFORM.tar.gz holding fibc-VERSION-PLATFORM/{bin/fibc, share/fibber/lib/, LICENSE, README.txt} (no lib/: the
 #      code generator is in bin/fibc), and OUT/SHA256SUMS. The unpacked tree runs with no environment: the compiler finds the library by its own location
 #      (compiler/expand/libdir.fib).
+#   (WITH_MUSL=1 adds share/fibber/musl/ARCH/, the pieces of `fibc build --static`; MUSL_TARBALL names a local musl-1.2.5.tar.gz.)
 #   5. The unpacked tree, in an empty environment, runs `bin/fibc --version` and builds and runs hello.
 # The machine that runs fibc needs (Linux) an x86-64-v3 CPU (2013 and later: AVX2, FMA, BMI1/2; docs/adr/0008) and glibc 2.33 or later, libc, libm,
 # libstdc++, libgcc_s, libz and libzstd, (macOS) Apple silicon and only the system libraries, and `cc` for `fibc build`; not LLVM.
@@ -123,6 +124,13 @@ emit "$tree/bin/fibc" > "$work/emit.ship"
 cmp "$work/emit.F" "$work/emit.ship" || { echo "package: the shipped fibc emits something else" >&2; exit 1; }
 cp -r lib "$tree/share/fibber/lib"
 cp LICENSE "$tree/LICENSE"
+# Optional (WITH_MUSL=1): the pieces `fibc build --static` links against, from the pinned musl source (scripts/build-musl.sh): share/fibber/musl/ARCH/ for the
+# platform's own architecture, and aarch64 too when an aarch64 C compiler is installed (about 6 MB each, 1 MB of it compressed; MIT licence in MUSL-LICENSE).
+# Off by default, so the release flow is as it was; docs/design/static-linking.md 6.
+if [ "${WITH_MUSL:-0}" = 1 ] && [ "$plat" = linux-x86_64 ]; then
+  "$root/scripts/build-musl.sh" x86_64 "$tree/share/fibber/musl/x86_64" ${MUSL_TARBALL:+"$MUSL_TARBALL"}
+  if command -v aarch64-linux-gnu-gcc > /dev/null 2>&1; then "$root/scripts/build-musl.sh" aarch64 "$tree/share/fibber/musl/aarch64" ${MUSL_TARBALL:+"$MUSL_TARBALL"}; fi
+fi
 sed "s/@VERSION@/$version/g" > "$tree/README.txt" <<'README'
 fibc @VERSION@: the fibber compiler, written in fibber (stage 2).
 

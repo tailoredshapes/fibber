@@ -42,6 +42,8 @@ of data. It shows what each new row emits today and lists what stands between em
 | triple | ptr | threads | vector, CPU, features | fma | -O0 floor | tailcc / kind | reloc | object, linker | libc (lacks) | runtime-os | status | support (ADR 0008) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | x86_64-unknown-linux-gnu | 64 | pthreads | 256, x86-64-v3 (cross, release) / host | yes | 0 | 18 musttail | PIC | ELF, cc | glibc | Linux | runs | supported |
+| x86_64-unknown-linux-musl | 64 | pthreads | 256, x86-64-v3 | yes | 0 | 18 musttail | PIC | ELF, ld (static) | musl (lacks mallopt) | Linux | runs; fully static | supported |
+| aarch64-unknown-linux-musl | 64 | pthreads | 128, generic | yes | 1 | 18 musttail | PIC | ELF, ld (static, aarch64) | musl (lacks mallopt) | Linux | emits and runs (qemu-user); fully static | supported |
 | aarch64-apple-darwin | 64 | pthreads | 128, apple-m1 | yes | 1 | 18 musttail | PIC | Mach-O, cc (ld64) | libSystem | Darwin | runs (Mac) | supported |
 | aarch64-unknown-linux-gnu | 64 | pthreads | 128, generic | yes | 1 | 18 musttail | PIC | ELF, cc | glibc | Linux | emits | supported |
 | arm64-apple-ios | 64 | pthreads | 128, apple-m1 | yes | 1 | 18 musttail | PIC | Mach-O, xcrun clang, static library | libSystem (pipe) | Darwin | emits | supported |

@@ -2,7 +2,7 @@
 ;; `explain` (spec/compiler.md §1): each takes what the command line gave and the roots, prints what the Rust prints and returns
 ;; the exit status. The macro runner (`rm`, expand.maker) is the tool's: macros.runner by default, none with `--no-runner` (driver.front).
 (ns driver.commands
-  (:require [types.targets :as tt] [driver.front :as front] [expand.maker :as mk] [driver.native :as native] [driver.linkdecl :as ld] [emit.args :as ea] [emit.dump :as ed] [own.explain :as oe])
+  (:require [types.targets :as tt] [driver.front :as front] [expand.maker :as mk] [driver.native :as native] [driver.linkdecl :as ld] [driver.staticrun :as sr] [emit.args :as ea] [emit.dump :as ed] [own.explain :as oe])
   (:use expand.roots driver.args))
 
 ;; The message and status of a lIR module that lair stopped at. Rust: main.rs `fail`
@@ -37,6 +37,11 @@
 
 ;; `run`: the module through the JIT, `main` called, its status the status. Rust: main.rs:154 `run`
 (defun cmd-run (file: str trace: bool args: (Vec str) opt: i64 roots: Roots rm: mk/RunnerMaker) -> i64
+  (if (sr/static-cases?)
+      (sr/run-static file args opt roots rm)
+      (cmd-run-jit file trace args opt roots rm)))
+
+(defun cmd-run-jit :private (file: str trace: bool args: (Vec str) opt: i64 roots: Roots rm: mk/RunnerMaker) -> i64
   (match (front/lower-kind file roots rm false)
     ((Err code) code)
     ((Ok lir)

@@ -1,4 +1,4 @@
-# 0010. Native access is confined to drivers and the platform layer
+# 0011. Native access is confined to drivers and the platform layer
 
 Status: accepted
 Date: 2026-10-06

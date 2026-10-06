@@ -45,11 +45,16 @@
                       (. l name) "=static, with lib" (. l name) ".a on -L) or leave it out of the program"))
           :else (Ok (unwrap-or asked (if (static-build?) "static" "dynamic"))))))
 
+;; The libraries the C library itself provides (glibc's `-lm -lpthread` are always on the link line; musl has them inside libc.a): declared, but never a link word.
+(defun libc-part? :private (name: str) -> bool
+  (some? (find-first (fn (y: str) (= y name)) ["c" "m" "pthread" "dl" "rt" "util"])))
+
 ;; The `-l` words for the libraries: `LIB` (dynamic) or `:libLIB.a` (static), the first failure otherwise.
 (defun lib-words (ls: (Vec LinkLib)) -> (Result (Vec str) str)
   (loop ((i 0) (out []))
-    (if (>= i (count ls))
-        (Ok out)
+    (cond (>= i (count ls)) (Ok out)
+          (libc-part? (. (nth ls i) name)) (recur (+ i 1) out)
+          :else
         (match (mode-of (nth ls i))
           ((Err m) (Err m))
           ((Ok mode) (recur (+ i 1) (conj out (if (= mode "static") (str ":lib" (. (nth ls i) name) ".a") (. (nth ls i) name)))))))))

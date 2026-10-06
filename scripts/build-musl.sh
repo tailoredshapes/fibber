@@ -34,6 +34,8 @@ cp "$work/inst/lib/libc.a" "$work/inst/lib/crt1.o" "$work/inst/lib/crti.o" "$wor
 cp "$work/musl-$MUSL_VERSION/COPYRIGHT" "$out/MUSL-LICENSE"
 libgcc=$("$cc" -print-libgcc-file-name)
 cp "$libgcc" "$out/libgcc.a"
+strip=${cc%gcc}strip   # debug sections only: the archives are for linking (the shipped copy is a third of the size)
+"$strip" --strip-debug "$out/libc.a" "$out/libgcc.a" 2> /dev/null || true
 if [ "$arch" = x86_64 ]; then   # the start-up CPU check's glibc function, which musl lacks (rt/static/cpuid.c)
   "$cc" -O2 -c "$here/../rt/static/cpuid.c" -o "$out/fibshim.o"
 fi
