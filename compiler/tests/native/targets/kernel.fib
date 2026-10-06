@@ -1,0 +1,21 @@
+;; The kernel of compiler/tests/native/targets-emit.sh: lanewise multiply and add, and fma, on f64x2 and f32x4 (128 bits: one SIMD128 register on
+;; wasm32, one RVV register group at VLEN 128 on riscv64). The assembly of wasm32 must hold f64x2.mul, f64x2.add, f32x4.mul and f32x4.add; of
+;; riscv64 RV64GC the scalar fmadd.d of `simd/fma`; of riscv64 with V the vector vfmul/vfadd and a vector fused multiply-add. The vectors depend
+;; on the argument count, so that the optimiser cannot fold the arithmetic away.
+(ns main (:use fib.core))
+
+(defun mul-add (a: f64x2 x: f64x2 y: f64x2) -> f64x2 (+ (* a x) y))
+(defun mul-add32 (a: f32x4 x: f32x4 y: f32x4) -> f32x4 (+ (* a x) y))
+(defun fused (a: f64x2 x: f64x2 y: f64x2) -> f64x2 (simd/fma a x y))
+
+(defun main () -> i64
+  (let ((n (count (args)))
+        (d (double n))
+        (f (float n))
+        (a (+ <<1.0 2.0>>f64 (splat f64x2 d)))
+        (s (+ <<1.0 2.0 3.0 4.0>>f32 (splat f32x4 f)))
+        (r (mul-add a <<3.5 4.5>>f64 (+ a a)))
+        (q (mul-add32 s <<1.5 2.5 3.5 4.5>>f32 (+ s s)))
+        (u (fused a r <<0.5 0.25>>f64)))
+    (do (println (lane r 0) (lane r 1) (lane q 0) (lane q 3) (lane u 1))
+        0)))
