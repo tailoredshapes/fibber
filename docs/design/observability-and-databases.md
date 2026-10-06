@@ -216,7 +216,7 @@ Java's ~300 ns to 1 us. O1 measures it before anything is built on it.
 ### 4.1 Use (next.jdbc's shape)
 
 ```clojure
-(ns app.store (:use fib.db fib.sql))
+(ns app.store (:require [fib.db :as db] [fib.sql :as sql]))
 (match (open-sqlite "/var/app/data.db")
   ((Err e) (Err e))
   ((Ok conn)
@@ -357,10 +357,10 @@ corpus is pasted into the fibber program as is by `scripts/tests/sql/gen.py`.
 
 `(-> (select :a [:b :bee]) (from :t) (where [:= :id 7]) (order-by [:a :desc]) (limit 3))` builds the same value as the literal
 (scenario "the helpers build what the literal builds"); `where` twice ANDs the conditions as `honey.sql.helpers/where` does (found by the
-oracle: the first version replaced). The helpers are macros because their arguments are HoneySQL data. Because a template's `fib.sql/..`
-names resolve only in a module that `:use`s `fib.sql` (section 1), the library is `:use`d, and its `format` shadows the implicit
-`fib.print/format` in that module (`fib.print/format` still names it). Clojure would write `(:require [honey.sql :as sql])` and
-`(sql/format ..)`; that needs syntax-quote to qualify names to the defining module (open question 1).
+oracle: the first version replaced). The helpers are macros because their arguments are HoneySQL data. Since MACRO-NS a template's names resolve in the module that defines
+the macro, so the library is used as HoneySQL is, `(:require [fib.sql :as sql])` and `(sql/format ..)`, `(sql/sql {..})`,
+`(-> (sql/select ..) (sql/from ..))`; nothing needs `:use`, and `format` no longer shadows `fib.print/format` anywhere (a module that
+wants both writes `sql/format`).
 
 ### 5.4 Dialects and extensibility
 
@@ -518,6 +518,7 @@ Planted faults (each applied alone with `sed`, run, restored; scripts in `~/.cac
 5. **Context as a value** (2.4 option A) rather than a task-local slot: confirm, knowing that every function that logs takes a logger.
 6. **`format` shadowing** `fib.print/format` in modules that `:use` fib.sql: acceptable, or rename to `sql-format` (HoneySQL's name is
    `format`)?
+   **Resolved by MACRO-NS: not forced.** `(:require [fib.sql :as sql])` and `sql/format`; `fib.sql` keeps HoneySQL's name.
 
 ## 10. Not done
 

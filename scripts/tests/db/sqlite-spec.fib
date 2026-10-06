@@ -1,7 +1,7 @@
 ;; fib.db against SQLite: the Driver contract on a fresh `:memory:` database per scenario, a fib.sql query executed, and what is SQLite's own (opening a file that
 ;; cannot be opened, SQLSTATE mapping). Needs libsqlite3 in the process: scripts/test-db.sh runs it (`LD_PRELOAD` under `fibc test`,
 ;; `-l:libsqlite3.so.0` for a build). Not under specs/: the gate's `fibc test specs` runs through the JIT with no C library but libc.
-(ns main (:use fib.core fib.seq fib.coll fib.ex fib.test.core fib.test.run fib.db fib.sql fib.db.contract))
+(ns main (:use fib.core fib.seq fib.coll fib.ex fib.test.core fib.test.run fib.db fib.db.contract) (:require [fib.sql :as sql]))
 
 (defun fresh () -> SqliteConn
   (match (open-sqlite ":memory:") ((Ok c) c) ((Err e) (trap (str "cannot open :memory: " (. e message))))))
@@ -36,9 +36,9 @@
   (feature "fib.db.sqlite"
     (scenario "a fib.sql query runs through execute!, its values bound"
       (given [c (fresh) _ (execute! c ["create table people (id integer primary key, name text, age integer)"])
-              _ (execute! c (format (sql {:insert-into :people :values [{:id 1 :name "ann" :age 30} {:id 2 :name "bob" :age 41}]})))
+              _ (execute! c (sql/format (sql/sql {:insert-into :people :values [{:id 1 :name "ann" :age 30} {:id 2 :name "bob" :age 41}]})))
               min-age 35])
-      (upon [r (execute! c (format-with (sql {:select [:name] :from [:people] :where [:> :age min-age]}) :ansi))])
+      (upon [r (execute! c (sql/format-with (sql/sql {:select [:name] :from [:people] :where [:> :age min-age]}) :ansi))])
       (then (expect = ["bob"] (match r ((Ok rows) (vec (map (fn (row: (Map str Datum)) (datum-text (unwrap-or (col row :name) DNil))) rows))) ((Err e) [(. e message)])))))
     (scenario "a plan over 100,000 rows streams them: the sum is right and the peak resident set does not grow; execute! of the same rows does"
       (given [c (big 100000) h0 (proc-kb "VmHWM:")])
