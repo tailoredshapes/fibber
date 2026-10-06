@@ -58,11 +58,11 @@ case $MODE in
   double-release)      mut compiler/emit/lower/call.fib 's/\(lcx-run-ops cx ops\)\)\)\)/(do (lcx-run-ops cx ops) (lcx-run-ops cx ops)))))/' ;;
   finally-catchable)   mut rt/core.lir 's/\(br \(call \@fib\.in-finally\) fin task\)/(br (i1 0) fin task)/; s/      \(store \(i64 0\) dp\)\n      \(store \(add \(load i64 fp\)/      (store (add (load i64 fp)/' ;;
   no-catch)            mut rt/core.lir 's/\(br \(icmp eq ex \(ptr null\)\) ok caught\)/(br (i1 1) ok caught)/' ;;
-  catch-everywhere)    mut rt/core.lir 's/\(block no \(ret \(i1 0\)\)\)/(block no (ret (i1 1)))/; s/\(br \(call \@fib\.catching\) unwind plain\)/(br (i1 1) unwind plain)/g' ;;
+  catch-everywhere)    mut rt/core.lir 's/\(block no \(ret \(i1 0\)\)\)\n  \(block yes \(ret \(icmp sgt \(load i64 \(getelementptr %struct\.fib\.exc s \(i32 0\) \(i32 0\)\)\) \(i64 0\)\)\)\)\)/(block no (ret (i1 1)))\n  (block yes (ret (i1 1))))/' ;;
   take-unwinds)        mut compiler/emit/lower/mod.fib 's/\(takes-slots\? p \(body-expr g \(\. inst key\)\)\)/false/; s/\(takes-slots\? p \(\. f body\)\)/false/' ;;
   update-unwinds)      mut compiler/emit/lower/cells.fib 's/\(fatal-while cx \(fn \(\) \(\(\. \(\. cx hub\) emit-call\) cx \(TgValue f\) \[old\] content false\)\)\)/((. (. cx hub) emit-call) cx (TgValue f) [old] content false)/' ;;
   no-write-back)       mut compiler/emit/lower/call.fib 's/\(\(some w\) \(call-write-backs cx \(\. w fst\) \(\. \(\. w snd\) fst\) \(\. \(\. w snd\) snd\)\)\)/((some w) (Ok ()))/' ;;
-  swap-keeps-snapshot) mut compiler/emit/lower/cells.fib 's/\(set! \(\. cx pending\) \(conj \@\(\. cx pending\) old\)\)/(set! (. cx pending) \@(. cx pending))/' ;;
+  swap-keeps-snapshot) mut compiler/emit/lower/cells.fib 's/\(set! \(\. cx pending\) \(conj \@\(\. cx pending\) old\)\)/(set! (. cx pending) (conj \@(. cx pending) VUnit))/' ;;
 esac
 
 cd "$OUT/tree" || exit 2
