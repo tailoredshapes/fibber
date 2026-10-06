@@ -1,0 +1,33 @@
+;; spec: docs/design/allocator.md section 2 (One global cache, one short lock): a block made on one thread and freed on another is filed in the one cache and reused by any thread; the lists are only touched under the lock (scripts/tsan-suite.txt runs this case under ThreadSanitizer)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib
+;; Four rounds: eight tasks each make a 512 KB array on their own thread and hand it back; the main thread checks and drops them
+;; (eight frees on main of blocks made elsewhere); then eight tasks make arrays of the same size again and drop them on their own
+;; threads (hits on blocks main freed, frees from many threads at once). Every array is checked whole where it is read. The hits
+;; show the cross-thread reuse happened.
+(ns main (:require [fib.os.memory :as m]))
+
+(defun make (n: i64 tag: i64) -> (Array i64)
+  (let [buf (cell (array n 0))]
+    (do (dotimes (i n) (array-set! &buf i (+ (* tag 7919) i))) @buf)))
+
+(defun intact? (a: (Array i64) tag: i64) -> bool
+  (loop [i 0] (cond (>= i (array-len a)) true (not (= (array-get a i) (+ (* tag 7919) i))) false :else (recur (+ i 1)))))
+
+(defun one-round (r: i64) -> bool
+  (let [made (mapv (fn (k: i64) (spawn (fn () (make 65536 (+ (* r 100) k))))) (range 8))
+        back (mapv (fn (t: (Task (Array i64))) (join t)) made)
+        ok1 (reduce (fn (acc: bool k: i64) (and acc (intact? (nth back k) (+ (* r 100) k)))) true (range 8))
+        again (mapv (fn (k: i64) (spawn (fn () (intact? (make 65536 (+ (* r 100) k 50)) (+ (* r 100) k 50))))) (range 8))]
+    (and ok1 (reduce (fn (acc: bool t: (Task bool)) (and acc (join t))) true again))))
+
+(defun main () -> i64
+  (let [h0 (. (m/alloc-stats) hits)
+        ok (reduce (fn (acc: bool r: i64) (and (one-round r) acc)) true (range 4))
+        h1 (. (m/alloc-stats) hits)]
+    (cond (not ok) 1
+          (< (- h1 h0) 8) 2
+          :else 0)))

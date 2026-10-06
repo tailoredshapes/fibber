@@ -1,0 +1,26 @@
+;; spec: docs/design/allocator.md section 2 (rt/alloc.lir fib.lc-get, fib.lc-put): a freed block of 128 KiB or more is kept in the list of its size class and handed to the next allocation of that class
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib
+;; Fifty arrays of 40000 f64 (320 KB), one after the other, each dropped before the next is made: the first is a miss, the rest are
+;; hits on the block the one before left, and the cache holds a block at the end. A runtime that never pops (every allocation a
+;; malloc) returns 1; one that never files a freed block returns 1 or 3. Each array is read back at both ends, so a reused block
+;; holds the array's own values. The audit stays clean: a cached block is runtime memory, in no trace line.
+(ns main (:require [fib.os.memory :as m]))
+
+(defun one-round (i: i64) -> f64
+  (let [a (array 40000 (double i))] (+ (array-get a 0) (array-get a 39999))))
+
+(defun main () -> i64
+  (let [s0 (m/alloc-stats)
+        total (reduce (fn (acc: f64 i: i64) (+ acc (one-round i))) 0.0 (range 50))
+        s1 (m/alloc-stats)
+        hits (- (. s1 hits) (. s0 hits))
+        misses (- (. s1 misses) (. s0 misses))]
+    (cond (< hits 48) 1
+          (> misses 2) 2
+          (= (. s1 held) 0) 3
+          (not (= total 2450.0)) 4
+          :else 0)))

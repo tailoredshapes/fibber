@@ -1,0 +1,40 @@
+;; spec: docs/design/allocator.md section 3 (rt/alloc.lir fib.lc-tick, fib.lc-sweep): a block kept longer than the decay time is given back to the system at the next allocator event after it, the end of sys-sleep among them, and the resident memory falls back
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib
+;; With a decay of 200 ms: 32 arrays of 2 MB are made, written whole and dropped together; the cache then holds them and the
+;; process's resident memory (VmRSS) is up by at least 48 MB. After a sys-sleep of 700 ms with no allocation the cache holds
+;; nothing, the stats count the 32 blocks as returned, and VmRSS is back within 16 MB of where it started. A runtime that never
+;; decays returns 3. Linux only for the VmRSS part: where /proc/self/status is absent (macOS) rss-bytes is nil and only the cache's
+;; own counts are checked.
+(ns main (:require [fib.os.memory :as m]))
+
+(defun burst () -> f64
+  (let [xs (mapv (fn (i: i64) (array 262000 (double i))) (range 32))]
+    (reduce (fn (acc: f64 a: (Array f64)) (+ acc (array-get a 261999))) 0.0 xs)))
+
+(defun grew? (r0: (Option i64) r1: (Option i64)) -> bool
+  (match r0 (nil true) ((some a) (match r1 (nil false) ((some b) (>= (- b a) 50331648))))))
+
+(defun back? (r0: (Option i64) r2: (Option i64)) -> bool
+  (match r0 (nil true) ((some a) (match r2 (nil false) ((some c) (<= (- c a) 16777216))))))
+
+(defun main () -> i64
+  (do (m/configure! 200 1073741824)
+      (let [r0 (m/rss-bytes)
+            s0 (m/alloc-stats)
+            sum (burst)
+            s1 (m/alloc-stats)
+            r1 (m/rss-bytes)
+            slept (sys-sleep 700000000)
+            s2 (m/alloc-stats)
+            r2 (m/rss-bytes)]
+        (cond (not (= sum 496.0)) 1
+              (< (. s1 held) 67108864) 2
+              (not (= (. s2 held) 0)) 3
+              (< (- (. s2 returned-blocks) (. s0 returned-blocks)) 32) 4
+              (not (grew? r0 r1)) 5
+              (not (back? r0 r2)) 6
+              :else slept))))
