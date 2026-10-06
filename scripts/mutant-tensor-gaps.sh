@@ -10,7 +10,7 @@ out=$HOME/.cache/fibber-scratch/mutant-tensor-gaps
 mkdir -p "$out/orig"
 export FIB_LIB=$root/lib
 ulimit -v 16000000
-files="lib/fib/tensor/unary.fib"
+files="lib/fib/tensor/unary.fib lib/fib/tensor/select.fib lib/fib/tensor/masks.fib"
 for f in $files; do mkdir -p "$out/orig/$(dirname "$f")"; cp "$root/$f" "$out/orig/$f"; done
 restore() { for f in $files; do cp "$out/orig/$f" "$root/$f"; done; }
 trap restore EXIT
@@ -20,8 +20,12 @@ mutant() { # NAME FILE SED-EXPRESSION CASE
   restore
   sed -i -e "$expr" "$root/$file"
   if cmp -s "$root/$file" "$out/orig/$file"; then echo "PLANT-FAILED $name: the sed expression changed nothing"; exit 2; fi
-  local res; res=$(cd "$root" && "$F" cases cases/stdlib --only $case -j 1 2>&1 | tail -1)
-  case $res in *" 0 fail"*) echo "SURVIVED $name: $res"; survived=1 ;; *) echo "killed   $name: $res" ;; esac
+  local out2 res row; out2=$(cd "$root" && "$F" cases cases/stdlib --only $case -j 1 2>&1)
+  res=$(echo "$out2" | tail -1); row=$(echo "$out2" | grep -E '^[0-9]+-' | sed 's/^[^ ]* *//' | cut -c1-110)
+  case $res in
+    *" 0 fail"*) echo "SURVIVED $name: $res"; survived=1 ;;
+    *) case $row in *rejected*|*"the run"*) echo "ERROR    $name: the mutant does not compile: $row"; survived=1 ;; *) echo "killed   $name: $row" ;; esac ;;
+  esac
 }
 U=lib/fib/tensor/unary.fib
 mutant sqrt-is-rsqrt $U 's/(= op 0) (simd\/sqrt x)/(= op 0) (fdiv (splat f64x4 1.0) (simd\/sqrt x))/' 7740
@@ -33,4 +37,20 @@ mutant f32-tail-not-computed $U 's/(simd-store-tail! &buf i (apply-f32 op v))/(s
 mutant f64-tail-not-computed $U 's/(simd-store-tail! &buf i (apply-f64 op v))/(simd-store-tail! \&buf i v)/' 7740
 mutant f64-view-not-made-contiguous $U '/defun run-f64/,/defun run-f32/s/(d (contiguous x))/(d x)/' 7740
 mutant f32-offset-ignored $U '/defun run-f32/,/defprotocol/s/(simd-load src (+ off i))/(simd-load src i)/' 7740
+S=lib/fib/tensor/select.fib
+M=lib/fib/tensor/masks.fib
+mutant cmp-less-is-less-equal $S 's/(= op 1) (simd\/lt x y)/(= op 1) (simd\/le x y)/' 7741
+mutant cmp-tail-lane-dropped $S '/defun compare-f32/,/defun select-f32/s/(dotimes (j cnt)/(dotimes (j (- cnt 1))/' 7741
+mutant cmp-scalar-operand-read-as-dense $S 's/(= step 0) (splat f32x8 (array-get a off))/(= step 0) (simd-load-tail a off)/' 7741
+mutant select-swaps-branches $S 's/(simd-store! &out i (simd\/blend m x y))/(simd-store! \&out i (simd\/blend m y x))/' 7741
+mutant select-tail-swaps-branches $S 's/(if (array-get c (+ co (\* cs i))) (array-get a (+ ao (\* as i))) (array-get b (+ bo (\* bs i))))/(if (array-get c (+ co (* cs i))) (array-get b (+ bo (* bs i))) (array-get a (+ ao (* as i))))/' 7741
+mutant select-mask-offset-ignored $S 's/(bytes-f32 c (+ co (\* cs i)) cs)/(bytes-f32 c (* cs i) cs)/' 7741
+mutant select-mask-lane-3-wrong $S '/defun bytes-f64/,/defun compare-f64/s/(array-get c (+ base (\* cs 3)))/(array-get c (+ base (* cs 2)))/' 7741
+mutant relu-grad-f32-passes-at-zero $S 's/(r: f32x8 (simd\/blend (simd\/gt xv (splat f32x8 0.0f32)) gv/(r: f32x8 (simd\/blend (simd\/ge xv (splat f32x8 0.0f32)) gv/' 7741
+mutant relu-grad-f64-multiplies-by-mask $S 's/(r: f64x4 (simd\/blend (simd\/gt xv (splat f64x4 0.0)) gv (splat f64x4 0.0)))/(r: f64x4 (* gv (simd\/blend (simd\/gt xv (splat f64x4 0.0)) (splat f64x4 1.0) (splat f64x4 0.0))))/' 7741
+mutant relu-mask-f32-passes-at-zero $S '/defun relu-mask-f32/,/defun compare-f64/s/(simd\/gt xv/(simd\/ge xv/' 7741
+mutant compare-ignores-right-step $M 's/(. right buffer) (array-get (. right meta) 0) rs)/(. right buffer) (array-get (. right meta) 0) 1)/' 7741
+mutant equal-is-less-equal $M 's/(compare-masks 0 (fn/(compare-masks 2 (fn/' 7741
+mutant relu-grad-reads-view-in-buffer-order $M 's/(gc (contiguous (broadcast-to dims g)))/(gc (broadcast-to dims g))/' 7741
+mutant where-ignores-slice-offset-of-values $M 's/(. left buffer) (array-get (. left meta) 0) ls/(. left buffer) 0 ls/' 7741
 exit $survived

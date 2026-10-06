@@ -171,6 +171,21 @@ selected values. Both value operands must have the same dtype. `any?` and
 (t/where (t/greater matrix (t/full [] 0.0)) matrix (t/full [] 0.0))
 ```
 
+**Lane kernels** (`fib.tensor.select`). The five comparisons and `where` walk operands that one linear pass covers (a dense layout, or a broadcast
+scalar such as `(t/full [] 0.0)` on either side: step 0) with no closure per element: for `f32` and `f64` a comparison compares eight or four lanes at
+once and stores the lanes into the boolean tensor, and `where` builds the lane mask from the mask's bytes and blends the two value vectors (`simd/blend`),
+with a scalar tail; `i32`, `i64` and `bool` tensors run the same walk as scalar loops. Any other layout (a transposed view, a row broadcast) takes the earlier
+element-by-element path with the same results. Floating comparisons are IEEE: a NaN compares false in all five, `-0.0` equals `+0.0`. `where` copies the
+selected element bit for bit (a NaN or a signed zero is kept). The comparisons and `where` now also require the element type to have the internal
+`Linear` instance, which the five standard element types (`i32 i64 f32 f64 bool`) have.
+
+`relu-grad g x` is the relu backward in one pass: `g` where `x > 0`, else `+0.0` (`f32` and `f64`; operands broadcast, any layout). It is a **select**, as
+PyTorch's `threshold_backward`: at `x = 0`, `x = -0.0` and `x = NaN` the gradient is 0 (PyTorch's convention: the relu gradient at 0 is 0), and a NaN or infinite
+`g` under a zero mask gives 0 where `g * (x > 0)` would give NaN; under `x > 0` a NaN `g` stays NaN. `relu-mask x` is the `1` or `0` of `x > 0` in `x`'s dtype.
+`relu y` of NaN or `-0.0` is `+0.0` as before (`:relu` means `(where (greater x 0) x 0)`), so `(relu-mask (relu x))` equals `(relu-mask x)` for every `x`,
+`+inf` included (the earlier workaround `(relu (div y y))` gave 0 at `+inf`). Case 7741 compares everything against scalar oracles over every pair of 19
+special values (both zeros, infinities, NaN, subnormals) and every tail length; `scripts/mutant-tensor-gaps.sh` plants 13 faults in these kernels.
+
 ## Linear algebra and SIMD
 
 `dot` accepts equal-length rank-one tensors, `outer` accepts rank-one inputs,

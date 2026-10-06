@@ -20,7 +20,8 @@
     (println name "us_per_call" (/ (double (median5 ts)) (* 1000.0 (double reps))))))
 
 (defun main () -> i64
-  (let [w (t/reshape [784 256] (fill 200704 3)) pos (t/map (fn (v: f32) (+ (abs v) 0.5f32)) w)
+  (let [x (t/reshape [128 256] (fill 32768 1)) y (t/reshape [128 256] (fill 32768 2)) zero (t/full [] 0.0f32)
+        w (t/reshape [784 256] (fill 200704 3)) pos (t/map (fn (v: f32) (+ (abs v) 0.5f32)) w)
         w64 (t/map-as (fn (v: f32) (double v)) 0.0 w) pos64 (t/map-as (fn (v: f32) (double v)) 0.0 pos)]
     (do (bench "sqrt 784x256 f32" 100 (fn () (t/size (t/sqrt pos))))
         (bench "sqrt 784x256 f64" 100 (fn () (t/size (t/sqrt pos64))))
@@ -28,5 +29,12 @@
         (bench "rsqrt 784x256 f32" 100 (fn () (t/size (t/rsqrt pos))))
         (bench "abs 784x256 f32" 100 (fn () (t/size (t/abs w))))
         (bench "sign 784x256 f32" 100 (fn () (t/size (t/sign w))))
+        (bench "greater-scalar 128x256 f32" 200 (fn () (t/size (t/greater x zero))))
+        (bench "greater-tensor 128x256 f32" 200 (fn () (t/size (t/greater x y))))
+        (bench "where mask x zero 128x256 f32" 200 (fn () (t/size (t/where (t/greater x y) x zero))))
+        (bench "greater+where relu grad (g*mask) 128x256" 200 (fn () (t/size (t/where (t/greater x zero) y zero))))
+        (bench "relu-grad g x 128x256 (new, one pass)" 200 (fn () (t/size (t/relu-grad y x))))
+        (bench "relu-mask x then mul 128x256 (new)" 200 (fn () (t/size (t/mul y (t/relu-mask x)))))
+        (bench "relu(y/y) mask workaround 128x256" 200 (fn () (t/size (t/mul y (t/relu (t/div x x))))))
         (bench "mul 784x256 f32 (reference)" 200 (fn () (t/size (t/mul w w))))
         0)))

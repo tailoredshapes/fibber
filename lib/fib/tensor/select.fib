@@ -1,0 +1,169 @@
+;; Lane kernels behind the comparison masks, `where`, `relu-mask` and `relu-grad` (fib.tensor.masks): f32 eight lanes at a time, f64 four, over the lane
+;; compares and `simd/blend`, no closure per element. A kernel walks operands that one linear pass covers: a dense layout (step 1: logical element i is buffer element
+;; offset + i) or a broadcast scalar (every stride zero, step 0). Any other layout is not handled here (the callers keep their general element-by-element path).
+;; A boolean mask is stored one byte per element; a mask read builds the lane mask from the bytes, a mask write stores the lanes of the compare. The tail of a
+;; vector is a masked load and only the live lanes are stored. Floating comparisons are IEEE: a NaN compares false for everything but `!=` (not provided), -0.0 equals +0.0.
+;; The kernels are generated from one template for the two widths; edit both.
+(ns fib.tensor.select
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.views))
+
+;; one comparison on scalars, for the element types without lane kernels (op: 0 equal, 1 less, 2 less-equal, 3 greater, 4 greater-equal)
+(defun compare-scalar (op: i64 a: t b: t) :where ((Ord t)) -> bool
+  (cond (= op 0) (= a b) (= op 1) (< a b) (= op 2) (<= a b) (= op 3) (> a b) :else (>= a b)))
+
+;; compare, where, relu-mask and relu-grad over operands of step 0 or 1; the element types without lane kernels run the scalar loops
+(defun linear-compare-scalar :private (op: i64 n: i64 a: (Array t) ao: i64 as: i64 b: (Array t) bo: i64 bs: i64) :where ((Ord t)) -> (Array bool)
+  (let ((out (cell (array n false))))
+    (do (dotimes (i n) (array-set! &out i (compare-scalar op (array-get a (+ ao (* as i))) (array-get b (+ bo (* bs i))))))
+        @out)))
+
+(defun linear-select-scalar :private (n: i64 c: (Array bool) co: i64 cs: i64 a: (Array t) ao: i64 as: i64 b: (Array t) bo: i64 bs: i64 seed: t)
+  :where ((Element t)) -> (Array t)
+  (let ((out (cell (array n seed))))
+    (do (dotimes (i n)
+          (array-set! &out i (if (array-get c (+ co (* cs i))) (array-get a (+ ao (* as i))) (array-get b (+ bo (* bs i))))))
+        @out)))
+
+;; ---- f32 (8 lanes)
+(defun ld-f32 :private (a: (Array f32) off: i64 step: i64 i: i64 cnt: i64) -> f32x8
+  (cond (= step 0) (splat f32x8 (array-get a off))
+        (= cnt 8) (simd-load a (+ off i))
+        :else (simd-load-tail a (+ off i))))
+
+;; the lane mask of the L bytes c[base + cs j], j < L: one byte test per lane, built as a vector literal (a dynamic loop of with-lane is three times slower)
+(defun bytes-f32 :private (c: (Array bool) base: i64 cs: i64) -> i32x8
+  (if (= cs 0)
+      (splat i32x8 (if (array-get c base) 1i32 0i32))
+      (let ((v: i32x8 <<(if (array-get c (+ base (* cs 0))) 1i32 0i32) (if (array-get c (+ base (* cs 1))) 1i32 0i32) (if (array-get c (+ base (* cs 2))) 1i32 0i32) (if (array-get c (+ base (* cs 3))) 1i32 0i32) (if (array-get c (+ base (* cs 4))) 1i32 0i32) (if (array-get c (+ base (* cs 5))) 1i32 0i32) (if (array-get c (+ base (* cs 6))) 1i32 0i32) (if (array-get c (+ base (* cs 7))) 1i32 0i32)>>)) v)))
+
+(defun compare-f32 :private (op: i64 n: i64 a: (Array f32) ao: i64 as: i64 b: (Array f32) bo: i64 bs: i64) -> (Array bool)
+  (let ((out (cell (array n false))))
+    (do (loop ((i 0))
+          (when (< i n)
+            (let ((cnt (min 8 (- n i))) (x: f32x8 (ld-f32 a ao as i cnt)) (y: f32x8 (ld-f32 b bo bs i cnt))
+                  (m (cond (= op 0) (simd/eq x y) (= op 1) (simd/lt x y) (= op 2) (simd/le x y) (= op 3) (simd/gt x y) :else (simd/ge x y))))
+              (do (dotimes (j cnt) (array-set! &out (+ i j) (lane m j)))
+                  (recur (+ i 8))))))
+        @out)))
+
+;; out[i] = c[i] ? a[i] : b[i]; whole vectors by lane blend, the tail by scalar selects
+(defun select-f32 :private (n: i64 c: (Array bool) co: i64 cs: i64 a: (Array f32) ao: i64 as: i64 b: (Array f32) bo: i64 bs: i64) -> (Array f32)
+  (let ((out (cell (array n 0.0f32))) (end (- n (rem n 8))))
+    (do (loop ((i 0))
+          (when (< i end)
+            (let ((x: f32x8 (ld-f32 a ao as i 8)) (y: f32x8 (ld-f32 b bo bs i 8))
+                  (m (simd/ne (bytes-f32 c (+ co (* cs i)) cs) (splat i32x8 0i32))))
+              (do (simd-store! &out i (simd/blend m x y)) (recur (+ i 8))))))
+        (loop ((i end))
+          (when (< i n)
+            (do (array-set! &out i (if (array-get c (+ co (* cs i))) (array-get a (+ ao (* as i))) (array-get b (+ bo (* bs i))))) (recur (+ i 1)))))
+        @out)))
+
+;; the relu backward: out[i] = x[i] > 0 ? g[i] : 0 (a select, so a NaN or infinite g under a zero mask gives 0, as PyTorch's threshold_backward; x = 0, -0.0 and NaN give 0)
+(defun relu-grad-f32 :private (n: i64 g: (Array f32) go: i64 x: (Array f32) xo: i64) -> (Array f32)
+  (let ((out (cell (array n 0.0f32))))
+    (do (loop ((i 0))
+          (when (< i n)
+            (let ((cnt (min 8 (- n i))) (gv: f32x8 (ld-f32 g go 1 i cnt)) (xv: f32x8 (ld-f32 x xo 1 i cnt))
+                  (r: f32x8 (simd/blend (simd/gt xv (splat f32x8 0.0f32)) gv (splat f32x8 0.0f32))))
+              (do (if (= cnt 8) (simd-store! &out i r) (simd-store-tail! &out i r))
+                  (recur (+ i 8))))))
+        @out)))
+
+;; out[i] = x[i] > 0 ? 1 : 0
+(defun relu-mask-f32 :private (n: i64 x: (Array f32) xo: i64) -> (Array f32)
+  (let ((out (cell (array n 0.0f32))))
+    (do (loop ((i 0))
+          (when (< i n)
+            (let ((cnt (min 8 (- n i))) (xv: f32x8 (ld-f32 x xo 1 i cnt))
+                  (r: f32x8 (simd/blend (simd/gt xv (splat f32x8 0.0f32)) (splat f32x8 1.0f32) (splat f32x8 0.0f32))))
+              (do (if (= cnt 8) (simd-store! &out i r) (simd-store-tail! &out i r))
+                  (recur (+ i 8))))))
+        @out)))
+
+;; ---- f64 (4 lanes)
+(defun ld-f64 :private (a: (Array f64) off: i64 step: i64 i: i64 cnt: i64) -> f64x4
+  (cond (= step 0) (splat f64x4 (array-get a off))
+        (= cnt 4) (simd-load a (+ off i))
+        :else (simd-load-tail a (+ off i))))
+
+;; the lane mask of the L bytes c[base + cs j], j < L: one byte test per lane, built as a vector literal (a dynamic loop of with-lane is three times slower)
+(defun bytes-f64 :private (c: (Array bool) base: i64 cs: i64) -> i64x4
+  (if (= cs 0)
+      (splat i64x4 (if (array-get c base) 1 0))
+      (let ((v: i64x4 <<(if (array-get c (+ base (* cs 0))) 1 0) (if (array-get c (+ base (* cs 1))) 1 0) (if (array-get c (+ base (* cs 2))) 1 0) (if (array-get c (+ base (* cs 3))) 1 0)>>)) v)))
+
+(defun compare-f64 :private (op: i64 n: i64 a: (Array f64) ao: i64 as: i64 b: (Array f64) bo: i64 bs: i64) -> (Array bool)
+  (let ((out (cell (array n false))))
+    (do (loop ((i 0))
+          (when (< i n)
+            (let ((cnt (min 4 (- n i))) (x: f64x4 (ld-f64 a ao as i cnt)) (y: f64x4 (ld-f64 b bo bs i cnt))
+                  (m (cond (= op 0) (simd/eq x y) (= op 1) (simd/lt x y) (= op 2) (simd/le x y) (= op 3) (simd/gt x y) :else (simd/ge x y))))
+              (do (dotimes (j cnt) (array-set! &out (+ i j) (lane m j)))
+                  (recur (+ i 4))))))
+        @out)))
+
+;; out[i] = c[i] ? a[i] : b[i]; whole vectors by lane blend, the tail by scalar selects
+(defun select-f64 :private (n: i64 c: (Array bool) co: i64 cs: i64 a: (Array f64) ao: i64 as: i64 b: (Array f64) bo: i64 bs: i64) -> (Array f64)
+  (let ((out (cell (array n 0.0))) (end (- n (rem n 4))))
+    (do (loop ((i 0))
+          (when (< i end)
+            (let ((x: f64x4 (ld-f64 a ao as i 4)) (y: f64x4 (ld-f64 b bo bs i 4))
+                  (m (simd/ne (bytes-f64 c (+ co (* cs i)) cs) (splat i64x4 0))))
+              (do (simd-store! &out i (simd/blend m x y)) (recur (+ i 4))))))
+        (loop ((i end))
+          (when (< i n)
+            (do (array-set! &out i (if (array-get c (+ co (* cs i))) (array-get a (+ ao (* as i))) (array-get b (+ bo (* bs i))))) (recur (+ i 1)))))
+        @out)))
+
+;; the relu backward: out[i] = x[i] > 0 ? g[i] : 0 (a select, so a NaN or infinite g under a zero mask gives 0, as PyTorch's threshold_backward; x = 0, -0.0 and NaN give 0)
+(defun relu-grad-f64 :private (n: i64 g: (Array f64) go: i64 x: (Array f64) xo: i64) -> (Array f64)
+  (let ((out (cell (array n 0.0))))
+    (do (loop ((i 0))
+          (when (< i n)
+            (let ((cnt (min 4 (- n i))) (gv: f64x4 (ld-f64 g go 1 i cnt)) (xv: f64x4 (ld-f64 x xo 1 i cnt))
+                  (r: f64x4 (simd/blend (simd/gt xv (splat f64x4 0.0)) gv (splat f64x4 0.0))))
+              (do (if (= cnt 4) (simd-store! &out i r) (simd-store-tail! &out i r))
+                  (recur (+ i 4))))))
+        @out)))
+
+;; out[i] = x[i] > 0 ? 1 : 0
+(defun relu-mask-f64 :private (n: i64 x: (Array f64) xo: i64) -> (Array f64)
+  (let ((out (cell (array n 0.0))))
+    (do (loop ((i 0))
+          (when (< i n)
+            (let ((cnt (min 4 (- n i))) (xv: f64x4 (ld-f64 x xo 1 i cnt))
+                  (r: f64x4 (simd/blend (simd/gt xv (splat f64x4 0.0)) (splat f64x4 1.0) (splat f64x4 0.0))))
+              (do (if (= cnt 4) (simd-store! &out i r) (simd-store-tail! &out i r))
+                  (recur (+ i 4))))))
+        @out)))
+
+;; Dispatch on the element type. The scalar instances (i32, i64, bool) run the scalar loops; relu-grad and relu-mask are for floats only.
+(defprotocol Linear
+  (compare-linear (self op: i64 n: i64 a: (Array Self) ao: i64 as: i64 b: (Array Self) bo: i64 bs: i64) -> (Array bool))
+  (select-linear (self n: i64 c: (Array bool) co: i64 cs: i64 a: (Array Self) ao: i64 as: i64 b: (Array Self) bo: i64 bs: i64) -> (Array Self)))
+(impl Linear f32
+  (compare-linear (self op n a ao as b bo bs) (compare-f32 op n a ao as b bo bs))
+  (select-linear (self n c co cs a ao as b bo bs) (select-f32 n c co cs a ao as b bo bs)))
+(impl Linear f64
+  (compare-linear (self op n a ao as b bo bs) (compare-f64 op n a ao as b bo bs))
+  (select-linear (self n c co cs a ao as b bo bs) (select-f64 n c co cs a ao as b bo bs)))
+(impl Linear i32
+  (compare-linear (self op n a ao as b bo bs) (linear-compare-scalar op n a ao as b bo bs))
+  (select-linear (self n c co cs a ao as b bo bs) (linear-select-scalar n c co cs a ao as b bo bs 0i32)))
+(impl Linear i64
+  (compare-linear (self op n a ao as b bo bs) (linear-compare-scalar op n a ao as b bo bs))
+  (select-linear (self n c co cs a ao as b bo bs) (linear-select-scalar n c co cs a ao as b bo bs 0)))
+(impl Linear bool
+  (compare-linear (self op n a ao as b bo bs) (linear-compare-scalar op n a ao as b bo bs))
+  (select-linear (self n c co cs a ao as b bo bs) (linear-select-scalar n c co cs a ao as b bo bs false)))
+
+(defprotocol FloatLinear
+  (relu-grad-linear (self n: i64 g: (Array Self) go: i64 x: (Array Self) xo: i64) -> (Array Self))
+  (relu-mask-linear (self n: i64 x: (Array Self) xo: i64) -> (Array Self)))
+(impl FloatLinear f32
+  (relu-grad-linear (self n g go x xo) (relu-grad-f32 n g go x xo))
+  (relu-mask-linear (self n x xo) (relu-mask-f32 n x xo)))
+(impl FloatLinear f64
+  (relu-grad-linear (self n g go x xo) (relu-grad-f64 n g go x xo))
+  (relu-mask-linear (self n x xo) (relu-mask-f64 n x xo)))

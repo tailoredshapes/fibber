@@ -376,4 +376,22 @@ inputs 784x256 or 128x256 `f32` unless stated. Before: `scripts/bench/tensor/gap
 | `sqrt` 784x256 `f64` | | 139.9 | |
 | `mul` (the reference elementwise pass) | 16.1 | 17.2 | |
 
-The vector `sqrt` is 2.3 times a `mul`: the output is zero-initialised before it is written (the same in every `fib.tensor` kernel here), which `mul`'s uninitialised-array path avoids.
+The vector `sqrt` is about 2.3 times a `mul`: the unary kernels allocate a zero-filled output (`(array n 0.0)`) where the arithmetic kernels use the internal uninitialised array (README, Safety). Not measured separately, so this is the likely cause, not a finding.
+
+### 10.2 Masks: comparisons, `where`, `relu-grad`, `relu-mask` (`fib.tensor.select`, `fib.tensor.masks`)
+
+128x256 `f32`, 200 calls a sample.
+
+| row | before (us) | after (us) | ratio |
+|---|---|---|---|
+| `greater x (full [] 0.0)` (scalar operand) | 61.8 | 18.7 | 3.3x |
+| `greater x y` (two tensors) | 51.3 | 19.1 | 2.7x |
+| `where (greater x y) x zero` (compare and select) | 92.3 | 39.1 | 2.4x |
+| relu backward as `where (greater x 0) g 0` (compare and select) | 103.3 | 42.1 | 2.5x |
+| relu backward as `relu-grad g x` (one pass, new) | 103.3 | 9.5 | 10.9x |
+| relu backward as `mul g (relu-mask x)` (new) | 103.3 | 11.8 | 8.8x |
+| the workaround `mul g (relu (div x x))` (wrong at `+inf`) | 45.9 | 21.3 | not changed |
+| `mul` of two 784x256 (reference, same run) | 16.1 | 18.7 | noise (the machine is shared) |
+
+The first version of `where` built the lane mask with a loop of `with-lane`; it made `where` slower than before (119 us against 41 us for the select alone), and a vector literal
+of eight byte tests replaced it. The "after" column is the second version. The ratios of 2x and above are the ones to trust; the machine's noise on a repeat run was about 15%.
