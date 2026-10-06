@@ -317,6 +317,21 @@ All seven are real decisions already made; none was invented to exercise the too
 | 0006 | Files stay under 500 lines, functions under 50 | fitness (2, `limit`) | 2 | CLAUDE.md "Rust standards" | taste; tests; readability |
 | 0007 | Windows run within 1.3x of the array loop | measure (5) + fitness (2) | 7 | exclusive-views.md, `scripts/bench/windows.sh` | other machines; cold caches; that a record was measured |
 | 0008 | Supported ISAs have guaranteed tail calls and FMA | fitness (6) | 6 | the owner, 2026-10-06; targets.fib | that the rows are true of LLVM; the warning, trap and start-up check at run time (no-fma.sh, cpu-check.sh) |
+| 0012 | The tree has no hand-written cryptography | fitness (5) | 5 | crypto.md; the owner's standing rule | primitives written without the well-known constants; that a provider passes the contract (it runs in the driver's repository) |
+| 0013 | Library code has no global mutable state | fitness (3) | 3 | bootstrap.md; observability-and-databases.md 6.1 | state that is not a top-level `def` (runtime globals, `extern`); one allowed entry in `compiler/` |
+| 0014 | Every builtin has a spec row and a case | fitness (3) | 3 | method.md; the builtin table | that a mention exercises the builtin; the mutant (prose); 7 builtins without a spec mention and 22 without a case are listed |
+| 0015 | The in-place primitives are called from a short list of library files | fitness (3) | 3 | spec/types.md 2.13.1 | that a permitted call meets the null-slot obligations |
+| 0016 | Every library facade is named by a spec or a case | fitness (2) | 2 | method.md | the depth of coverage; parts below a facade |
+| 0017 | The release files agree and the seed is pinned | fitness (5) | 5 | check-version.sh; SEED | that a url is published (needs the network) |
+| 0018 | An idle process gives its cached large blocks back | fitness (3) | 3 | allocator.md (the measuring case 7791 runs in the gate) | the RSS itself (it is the case's job) |
+| 0019 | A changed benchmark checksum is a failure, not a speedup | fitness (3) | 3 | scripts/bench/quick.sh | that quick.sh behaves (minutes, a quiet machine) |
+| 0020 | A script that downloads also checks a checksum | fitness (2) | 2 | the owner's tool-download rule | scratch only; two CI lines of LLVM's installer are listed |
+| 0021 | Parallel reductions do not depend on the worker count | fitness (3) | 3 | parallelism.md 3.5 | the bits themselves (cases 7609 to 7611) |
+| 0022 | Exclusive windows are over contiguous buffers, and the checker refuses closures over them | fitness (3) | 3 | decisions-2026-10-04.md, exclusive views | that the checker refuses every closure (the mutant script) |
+
+Rows 0012 to 0022 are the backfill (package ADR-2): decisions that were prose, memory notes or design paragraphs, each with a rule that
+ships a planted violation. What was left as a reviewer's judgement is in the package report: the mutant requirement of 0014, scratch-only
+downloads (0020), a hash written without the standard constants (0012), the depth of a case (0016).
 
 Things the pilots found (reported, not fixed):
 
