@@ -26,7 +26,7 @@
 ;; Rust: macros/mod.rs `JitRunner::{module, build, run}`, bridge.rs, module.rs `Fns::{input_object, input_items, to_form}`.
 (ns macros.runner
   (:require [native.api :as jit] [native.call :as call] [native.fibm :as fibm] [lair.ffi :as ffi] [fib.string :as s] [emit.compile :as ec]
-            [emit.macros.abi :as abi] [own.driver :as od] [own.error :as oerr])
+            [emit.macros.abi :as abi] [own.driver :as od] [own.error :as oerr] [expand.macrons :as macrons])
   (:use syntax.pos syntax.form expand.error expand.types expand.ctx expand.maker))
 
 ;; The state of one runner: the forms of the prelude the macros are checked with, the JIT session (made at the first macro), the
@@ -118,10 +118,68 @@
                      ((Err m) (Err (failed def m)))
                      ((Ok _) (Ok fm))))))))))))
 
-;; The module of macro `def`: its forms checked with the prelude, emitted and loaded. Rust: JitRunner::build
-(defun build-module :private (s: Session def: MacroDef) -> (Result fibm/Fibm ExpandErrKind)
+;; ---------------------------------------------------------------- macro-time helpers (syntax §3.16 "Phase separation")
+
+;; Whether a form is a `defmacro`: a module's macros are not part of the macro-time module (they ran already, and one of the same name
+;; as the macro would be taken for it).
+(defun macro-form? :private (f: Stx) -> bool
+  (match (. f kind)
+    ((SList items) (and (> (count items) 0) (match (. (nth items 0) kind) ((SSym h) (= h "defmacro")) (_ false))))
+    (_ false)))
+
+;; The modules a module depends on (requires, uses, re-exports and, for a module that sees them, the implicit ones).
+(defun spec-deps :private (spec: ModuleSpec) -> (Vec str)
+  (into (into (into (mapv (fn (r: Require) (. r ns)) (. spec requires)) (. spec uses)) (. spec exports)) (. spec implicit)))
+
+;; The modules `names` and those they depend on, each after its dependencies and once, as expanded (without their macros): what a
+;; macro of a module that names them may call at expansion time. A module with no expanded forms (the prelude, one not ended) is left out.
+(defun deps-in-order :private (ctx: ExpandCtx names: (Vec str) done: (Map str bool) out: (Vec Expanded)) -> (Pair (Map str bool) (Vec Expanded))
+  (reduce (fn (acc: (Pair (Map str bool) (Vec Expanded)) ns: str)
+            (if (some? (get (. acc fst) ns))
+                acc
+                (match (macrons/macro-ns-of ctx ns)
+                  (nil (Pair (assoc (. acc fst) ns true) (. acc snd)))
+                  ((some m)
+                   (let ((below (deps-in-order ctx (spec-deps (. m spec)) (assoc (. acc fst) ns true) (. acc snd))))
+                     (if (empty? (. m forms))
+                         below
+                         (Pair (. below fst) (conj (. below snd) (Expanded (. m spec) (vec (remove macro-form? (. m forms))))))))))))
+          (Pair done out) names))
+
+;; The macro-time program of `def` with helpers: the modules its module requires and uses (not its implicit ones, not itself), then the
+;; macro's own forms in a module of its name that sees them as its module does. None when its module names no module with forms.
+(defun helper-program :private (ctx: ExpandCtx def: MacroDef) -> (Option (Vec Expanded))
+  (match (macrons/macro-ns-of ctx (. def ns))
+    (nil nil)
+    ((some m)
+     (let ((spec (. m spec))
+           (deps (. (deps-in-order ctx (into (into (mapv (fn (r: Require) (. r ns)) (. spec requires)) (. spec uses)) (. spec exports))
+                                   (assoc (map-empty) (. def ns) true) (vec-empty))
+                    snd)))
+       (if (empty? deps)
+           nil
+           (let ((have (fn (ns: str) (some? (first (filter (fn (e: Expanded) (= (. (. e spec) ns) ns)) deps))))))
+             (some (conj deps (Expanded (ModuleSpec (. spec ns) (vec (filter (fn (r: Require) (have (. r ns))) (. spec requires)))
+                                                    (vec (filter have (. spec uses))) (vec (filter have (. spec exports))) (vec-empty))
+                                        (abi/macro-forms def))))))))))
+
+;; The macro's forms checked: with the prelude alone (Rust: JitRunner::build), else, when that fails and its module requires or uses
+;; modules, with those modules too; the first failure is the one reported.
+(defun check-macro :private (s: Session def: MacroDef ctx: ExpandCtx) -> (Result od/Checked ExpandErrKind)
   (match (od/own-check-forms (abi/macro-forms def) (. s prelude))
-    ((Err e) (Err (check-failure s def e)))
+    ((Ok c) (Ok c))
+    ((Err e)
+     (match (helper-program ctx def)
+       (nil (Err (check-failure s def e)))
+       ((some modules)
+        (match (od/own-check-modules-on-demand modules (. s prelude))
+          ((Ok c) (Ok c))
+          ((Err _) (Err (check-failure s def e)))))))))
+
+;; The module of macro `def`: its forms checked (`check-macro`), emitted and loaded.
+(defun build-module :private (s: Session def: MacroDef ctx: ExpandCtx) -> (Result fibm/Fibm ExpandErrKind)
+  (match (check-macro s def ctx)
+    ((Err k) (Err k))
     ((Ok c)
      (let ((k @(. s built))
            (n (+ (count (. def params)) (if (some? (. def rest)) 1 0))))
@@ -130,11 +188,11 @@
          ((Ok mm) (load-module s def k (. mm text))))))))
 
 ;; The module of the macro, built on its first use. Rust: JitRunner::module
-(defun session-module :private (s: Session def: MacroDef) -> (Result fibm/Fibm ExpandErrKind)
+(defun session-module :private (s: Session def: MacroDef ctx: ExpandCtx) -> (Result fibm/Fibm ExpandErrKind)
   (match (get @(. s mods) (. def key))
     ((some r) r)
     (nil
-     (let ((r (build-module s def)))
+     (let ((r (build-module s def ctx)))
        (do (set! (. s mods) (assoc @(. s mods) (. def key) r))
            r)))))
 
@@ -258,7 +316,7 @@
 
 ;; Runs `def` on its arguments in the context; its module is made once (`session-module`).
 (defun run-macro :private (s: Session def: MacroDef args: (Vec Stx) ctx: ExpandCtx) -> (Result Stx ExpandError)
-  (match (session-module s def)
+  (match (session-module s def ctx)
     ((Err k) (Err (ExpandError k @(. ctx call-pos))))
     ((Ok m) (call-macro m def args ctx))))
 

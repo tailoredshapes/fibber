@@ -86,3 +86,15 @@ every machine. A subdirectory of a case that holds roots has no
   `map-empty` and `map-assoc` that build the wrong collections, and the
   main module uses it: `[..]` and `{..}` are still the prelude's (23).
   Case 021's `conj` and `assoc` are no longer what a literal is built with.
+- 031 to 035 (stage 2, syntax §3.16 "Names in a template" and
+  "Macro-time helpers", docs/design/macro-names.md): a library's macros
+  through a `:require` alias alone, their templates naming the library's
+  functions bare, a function of a module the library requires through
+  its alias and a macro of its own (which recurses by name), a local the
+  template binds kept local (031, 1279); a template that names a
+  `:private` function and `def` of its module (032, 744); locals at the
+  site spelt like the template's names do not capture them (033, 1010;
+  resolved at the site it is 5007); the site's own functions spelt like
+  them are not called (034, 24; resolved at the site it is 598); a
+  macro calls, at expansion time, recursive helpers of a module its
+  module requires (035, 59).

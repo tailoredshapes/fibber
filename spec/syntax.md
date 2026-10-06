@@ -1204,6 +1204,16 @@ rejected at expansion time under both tools (`fibref` says `macro m calls count,
 implicit modules should join the macro-time module is an open decision of the owner (reported
 by the flip; it makes every macro run compile the library).
 
+**Macro-time helpers** (**Decided**, owner, 2026-10-06, MACRO-NS; stage 2). A macro's body is
+checked with the prelude alone first, as above. When that fails and the macro's module
+`:require`s, `:use`s or re-exports modules, the macro-time module is those modules and the
+modules they depend on, in dependency order and without their `defmacro`s, then the macro in
+a module that names them as its module does (aliases and `:use`s; no implicit module unless one
+of them names it), checked and compiled for expansion time; if that fails too, the first error
+is the one reported. So a macro calls a helper of a module its module requires (`h/helper`) or
+uses, a helper may recurse by name, and macros share helpers instead of each being one long
+function (cases/modules 035). The functions of the macro's own module are still not available (phase separation).
+
 `Form` is the built-in enum
 
 ```
