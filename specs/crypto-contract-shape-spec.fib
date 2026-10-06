@@ -1,0 +1,82 @@
+;; The shape of the fib.crypto contract, checked where there is no driver (fibber has none: no cryptography lives here). Three kinds of check:
+;;  1. the vector data: every hex string decodes, every length is the one its algorithm and parameters give (so the generated file is not
+;;     garbage and the contract's `message-of`/`bytes-hex` work on all of it);
+;;  2. the contract against a provider that supports NOTHING (every operation is an `unsupported` error): it has the expected number of
+;;     scenarios, the vector scenarios fail, and the honesty scenario holds: a contract that passed this provider could not fail;
+;;  3. the same contract against a provider that overclaims (lists :rot13): the honesty scenario fails.
+;; The vector contract itself runs in a driver's repository, against a real library. `fibc test specs`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.crypto.contract fib.crypto.fault fib.crypto.vectors)
+  (:require [fib.crypto :as c]))
+
+(defstruct Nothing (n: i64))
+(impl c/CryptoProvider Nothing
+  (provider-name (self) "nothing")
+  (provider-capabilities (self) [])
+  (provider-digest-start (self alg) (Err (c/unsupported (str alg))))
+  (provider-hmac-start (self alg key) (Err (c/unsupported (str alg))))
+  (provider-derive (self k) (Err (c/unsupported (str (c/kdf-name k)))))
+  (provider-random (self n) (Err (c/unsupported "random")))
+  (provider-ct-equal (self a b) false))
+
+(defstruct Overclaim (n: i64))
+(impl c/CryptoProvider Overclaim
+  (provider-name (self) "overclaim")
+  (provider-capabilities (self) [:rot13])
+  (provider-digest-start (self alg) (Err (c/unsupported (str alg))))
+  (provider-hmac-start (self alg key) (Err (c/unsupported (str alg))))
+  (provider-derive (self k) (Err (c/unsupported (str (c/kdf-name k)))))
+  (provider-random (self n) (Err (c/unsupported "random")))
+  (provider-ct-equal (self a b) false))
+
+(defun nothing () -> Nothing (Nothing 0))
+(defun overclaim () -> Overclaim (Overclaim 0))
+
+(defun hex-ok? (h: str) -> bool (match (c/unhex h) ((Ok _) true) ((Err _) false)))
+(defun hex-len (h: str) -> i64 (quot (str-len h) 2))
+(defun digest-size (alg: keyword) -> i64
+  (cond (= alg :sha-256) 32 (= alg :sha-384) 48 (= alg :sha-512) 64 (= alg :sha-1) 20 (= alg :md5) 16 :else -1))
+(defun rep-ok? (m: str) -> bool (or (hex-ok? m) (= m "rep:61:1000000")))
+
+(defun vectors-sound? () -> bool
+  (and (every? (fn (v: DigestVector) (and (rep-ok? (. v msg)) (hex-ok? (. v expected)) (= (hex-len (. v expected)) (digest-size (. v alg))))) (digest-vectors))
+       (every? (fn (v: MacVector) (and (hex-ok? (. v key)) (hex-ok? (. v msg)) (hex-ok? (. v expected))
+                                       (= (hex-len (. v expected)) (if (> (. v truncate) 0) (. v truncate) (digest-size (. v alg))))))
+               (mac-vectors))
+       (every? (fn (v: Pbkdf2Vector) (and (hex-ok? (. v password)) (hex-ok? (. v salt)) (hex-ok? (. v expected))
+                                          (= (hex-len (. v expected)) (. v length)) (> (. v iterations) 0))) (pbkdf2-vectors))
+       (every? (fn (v: HkdfVector) (and (hex-ok? (. v ikm)) (hex-ok? (. v salt)) (hex-ok? (. v info)) (hex-ok? (. v expected))
+                                        (= (hex-len (. v expected)) (. v length)))) (hkdf-vectors))))
+
+(defun scenario-ids (scs: (Vec Scenario)) -> (Vec str) (vec (map (fn (s: Scenario) (. s id)) scs)))
+(defun holds (scs: (Vec Scenario) id: str) -> bool
+  (not (some? (first (filter (fn (f: str) (= f id)) (contract-failures scs 1))))))
+(defun has-id? (scs: (Vec Scenario) id: str) -> bool (some? (first (filter (fn (s: str) (= s id)) (scenario-ids scs)))))
+
+(def honest-id: str "capabilities-are-honest-a-listed-name-works-an-unlisted-one-is-an-unsupported-error-never-an-answer")
+
+(defspecs specs
+  (feature "fib.crypto contract shape"
+    (scenario "the vector data is well formed and its sizes are the algorithms'"
+      (then (expect = true (vectors-sound?))
+            (expect = [23 24 8 3] [(count (digest-vectors)) (count (mac-vectors)) (count (pbkdf2-vectors)) (count (hkdf-vectors))])))
+    (scenario "the contract has its fifteen scenarios"
+      (given [scs (CryptoContract nothing)])
+      (then (expect = 15 (count scs))
+            (expect = true (has-id? scs honest-id))))
+    (scenario "against a provider with no capabilities, the vector scenarios fail and the honesty scenario holds"
+      (given [scs (CryptoContract nothing) failed (contract-failures scs 1)])
+      (then (expect = 13 (count failed))
+            (expect = ["the-legacy-digests-SHA-1-MD5-not-for-security-agree-with-RFC-3174-and-RFC-1321-when-the-provider-offers-them" honest-id]
+                      (vec (filter (fn (id: str) (not (some? (first (filter (fn (f: str) (= f id)) failed))))) (scenario-ids scs))))
+            (expect = true (holds scs honest-id))
+            (expect = false (holds scs "the-provider-has-a-name-and-lists-every-required-capability"))))
+    (scenario "against a provider that lists a name it cannot do, the honesty scenario fails"
+      (given [scs (CryptoContract overclaim)])
+      (then (expect = false (holds scs honest-id))))
+    (scenario "every fault the wrapper offers has a name, and the wrapper is a CryptoProvider over a dyn provider"
+      (given [w (Faulty (dyn c/CryptoProvider :send (Nothing 1)) :overclaim)])
+      (then (expect = 8 (count (faults)))
+            (expect = "faulty nothing" (c/provider-name w))
+            (expect = true (c/supports? w :rot13))))))
+
+(defun main () -> i64 (run-main (specs)))

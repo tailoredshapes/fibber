@@ -1,0 +1,74 @@
+;; fib.crypto.encoding against RFC 4648 section 10 (the test vectors), its refusals, and round trips over every length. Part of the gate:
+;; the encodings are the only code of ours in fib.crypto. `fibc test specs`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen) (:require [fib.crypto :as c]))
+
+(def rfc-inputs: (Vec str) ["" "f" "fo" "foo" "foob" "fooba" "foobar"])
+(def rfc-b64: (Vec str) ["" "Zg==" "Zm8=" "Zm9v" "Zm9vYg==" "Zm9vYmE=" "Zm9vYmFy"])
+(def rfc-b64-nopad: (Vec str) ["" "Zg" "Zm8" "Zm9v" "Zm9vYg" "Zm9vYmE" "Zm9vYmFy"])
+(def rfc-hex: (Vec str) ["" "66" "666f" "666f6f" "666f6f62" "666f6f6261" "666f6f626172"])
+
+(defun bytes-of (xs: (Vec i64)) -> (Array i8)
+  (let [out (cell (array (count xs) 0i8))] (do (dotimes (i (count xs)) (array-set! &out i (trunc i8 (nth xs i)))) @out)))
+(defun text-of (b: (Array i8)) -> str (str-from-bytes b))
+(defun ok-text (r: (Result (Array i8) c/CryptoError)) -> str (match r ((Ok b) (text-of b)) ((Err e) (str "ERR " (. e message)))))
+(defun refused? (r: (Result (Array i8) c/CryptoError)) -> bool (match r ((Err e) (= (. e kind) "invalid-argument")) ((Ok _) false)))
+(defun same? (b: (Array i8) r: (Result (Array i8) c/CryptoError)) -> bool
+  (match r ((Ok x) (= (c/hex b) (c/hex x))) ((Err _) false)))
+(defun b64-roundtrips? (xs: (Vec i64)) -> bool
+  (let [b (bytes-of xs)]
+    (and (same? b (c/unbase64 (c/base64 b))) (same? b (c/unbase64-nopad (c/base64-nopad b)))
+         (same? b (c/unbase64url (c/base64url b))) (same? b (c/unbase64url-nopad (c/base64url-nopad b)))
+         (same? b (c/unhex (c/hex b))))))
+(defun counting (n: i64) -> (Vec i64) (vec (map (fn (i: i64) (rem (* i 37) 256)) (range n))))
+
+(defspecs specs
+  (feature "fib.crypto.encoding"
+    (outline "base64 encodes the RFC 4648 vectors" [i] [[0] [1] [2] [3] [4] [5] [6]]
+      (then (expect = (nth rfc-b64 i) (c/base64 (str-bytes (nth rfc-inputs i))))
+            (expect = (nth rfc-b64-nopad i) (c/base64-nopad (str-bytes (nth rfc-inputs i))))
+            (expect = (nth rfc-b64 i) (c/base64url (str-bytes (nth rfc-inputs i))))))
+    (outline "base64 decodes the RFC 4648 vectors" [i] [[0] [1] [2] [3] [4] [5] [6]]
+      (then (expect = (nth rfc-inputs i) (ok-text (c/unbase64 (nth rfc-b64 i))))
+            (expect = (nth rfc-inputs i) (ok-text (c/unbase64-nopad (nth rfc-b64-nopad i))))
+            (expect = (nth rfc-inputs i) (ok-text (c/unbase64url (nth rfc-b64 i))))))
+    (outline "hex encodes and decodes the RFC 4648 vectors" [i] [[0] [1] [2] [3] [4] [5] [6]]
+      (then (expect = (nth rfc-hex i) (c/hex (str-bytes (nth rfc-inputs i))))
+            (expect = (nth rfc-inputs i) (ok-text (c/unhex (nth rfc-hex i))))))
+    (scenario "hex decodes upper case and encodes lower case"
+      (then (expect = "foobar" (ok-text (c/unhex "666F6F626172"))) (expect = "ff00ab" (c/hex (bytes-of [255 0 171])))))
+    (scenario "the url-safe alphabet differs from the standard one in the last two characters"
+      (given [b (bytes-of [251 255 254])])
+      (then (expect = "+//+" (c/base64 b)) (expect = "-__-" (c/base64url b))
+            (expect = true (refused? (c/unbase64url "+//+"))) (expect = true (refused? (c/unbase64 "-__-")))
+            (expect = true (same? b (c/unbase64url "-__-")))))
+    (scenario "a one-byte tail uses two sextets and a two-byte tail three, with the padding the RFC gives"
+      (then (expect = "-w==" (c/base64url (bytes-of [251]))) (expect = "-w" (c/base64url-nopad (bytes-of [251])))
+            (expect = "+/8=" (c/base64 (bytes-of [251 255])))))
+    (scenario "the decoders refuse what is not canonical"
+      (then (expect = true (refused? (c/unbase64 "Zg=")))          ; padding short
+            (expect = true (refused? (c/unbase64 "Zg")))           ; padding missing
+            (expect = true (refused? (c/unbase64 "Zg===")))        ; too much
+            (expect = true (refused? (c/unbase64 "Z===")))         ; one sextet carries no byte
+            (expect = true (refused? (c/unbase64 "Zh==")))         ; non-zero trailing bits (Zg== is "f")
+            (expect = true (refused? (c/unbase64 "Zm9=")))         ; non-zero trailing bits
+            (expect = true (refused? (c/unbase64 "Zm 9")))         ; a space
+            (expect = true (refused? (c/unbase64 "Zm9v\n")))       ; a newline
+            (expect = true (refused? (c/unbase64 "Zm=v")))         ; padding in the middle
+            (expect = true (refused? (c/unbase64-nopad "Zg==")))   ; padding where there is none
+            (expect = true (refused? (c/unbase64-nopad "Z")))      ; one character
+            (expect = true (refused? (c/unbase64-nopad "Zh")))))
+    (scenario "unhex refuses an odd length and a non-digit"
+      (then (expect = true (refused? (c/unhex "abc"))) (expect = true (refused? (c/unhex "zz"))) (expect = true (refused? (c/unhex "0g")))
+            (expect = true (refused? (c/unhex "a "))) (expect = true (refused? (c/unhex "ab\n\n")))))
+    (scenario "every byte value survives hex and base64, and every length from 0 to 300 round trips"
+      (given [all (counting 256)])
+      (then (expect = true (b64-roundtrips? all))
+            (expect = true (every? (fn (n: i64) (b64-roundtrips? (counting n))) (range 301)))))
+    (prop "a random byte vector round trips through every encoding" [xs (gen-vec (gen-i64-between 0 255))]
+      (b64-roundtrips? xs))
+    (prop "a base64 text of random bytes has the length 4*ceil(n/3), and its unpadded form drops only the = signs" [xs (gen-vec (gen-i64-between 0 255))]
+      (let [b (bytes-of xs) n (count xs)]
+        (and (= (str-len (c/base64 b)) (* 4 (quot (+ n 2) 3)))
+             (= (c/base64-nopad b) (subs (c/base64 b) 0 (- (str-len (c/base64 b)) (rem (- 3 (rem n 3)) 3)))))))))
+
+(defun main () -> i64 (run-main (specs)))

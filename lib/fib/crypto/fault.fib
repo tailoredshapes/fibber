@@ -1,0 +1,69 @@
+;; fib.crypto.fault: how a driver shows its contract run can fail (docs/design/crypto.md 8, method rule: a test that cannot fail is worse than none).
+;; `(Faulty real fault)` wraps a REAL provider and breaks one thing, a decorator, not a driver: it does no cryptography of its own.
+;; A driver repository runs the contract against each fault and expects `contract-failures` to be non-empty.
+;;   :truncate    every digest and HMAC loses its last byte
+;;   :flip-bit    every digest and HMAC has the low bit of its last byte flipped
+;;   :wrong-alg   a request for SHA-256 is answered with SHA-512's start
+;;   :zero-random random-bytes returns zeros
+;;   :ct-true     the comparison says equal for any two arrays of one length
+;;   :pbkdf2-plus PBKDF2 runs one iteration more than asked
+;;   :fallback    an algorithm the provider lacks is answered by SHA-256 instead of an error
+;;   :overclaim   the capability list names `:rot13`, which nothing implements
+(ns fib.crypto.fault
+  (:use fib.core fib.seq fib.coll fib.test.core fib.crypto.types fib.crypto.ops))
+
+(defun tampered (fault: keyword b: (Array i8)) -> (Array i8)
+  (cond (= fault :truncate) (array-copy b 0 (max 0 (- (array-len b) 1)))
+        (= fault :flip-bit)
+          (let [c (cell (array-copy b 0 (array-len b)))]
+            (do (when (> (array-len b) 0) (array-set! &c (- (array-len b) 1) (bit-xor (array-get b (- (array-len b) 1)) 1i8))) @c))
+        :else b))
+
+(defstruct FaultyHasher (inner: (dyn Hasher :send) fault: keyword))
+(impl Hasher FaultyHasher
+  (hasher-update (self data off len) (hasher-update (. self inner) data off len))
+  (hasher-finish (self)
+    (match (hasher-finish (. self inner))
+      ((Ok b) (Ok (tampered (. self fault) b)))
+      ((Err e) (Err e))))
+  (hasher-close (self) (hasher-close (. self inner))))
+
+(defstruct Faulty (inner: (dyn CryptoProvider :send) fault: keyword))
+
+(defun wrap-hasher :private (f: Faulty r: (Result (dyn Hasher :send) CryptoError)) -> (Result (dyn Hasher :send) CryptoError)
+  (match r
+    ((Err e) (Err e))
+    ((Ok h) (Ok (dyn Hasher :send (FaultyHasher h (. f fault)))))))
+
+(defun swapped-alg :private (f: Faulty alg: keyword) -> keyword
+  (cond (and (= (. f fault) :wrong-alg) (= alg :sha-256)) :sha-512
+        (and (= (. f fault) :fallback) (not (supports? (. f inner) alg))) :sha-256
+        :else alg))
+
+(impl CryptoProvider Faulty
+  (provider-name (self) (str "faulty " (provider-name (. self inner))))
+  (provider-capabilities (self)
+    (if (= (. self fault) :overclaim) (conj (provider-capabilities (. self inner)) :rot13) (provider-capabilities (. self inner))))
+  (provider-digest-start (self alg) (wrap-hasher self (provider-digest-start (. self inner) (swapped-alg self alg))))
+  (provider-hmac-start (self alg key) (wrap-hasher self (provider-hmac-start (. self inner) (swapped-alg self alg) key)))
+  (provider-derive (self k)
+    (match k
+      ((KdfPbkdf2 alg pw salt n len)
+       (provider-derive (. self inner) (KdfPbkdf2 alg pw salt (if (= (. self fault) :pbkdf2-plus) (+ n 1) n) len)))
+      (_ (provider-derive (. self inner) k))))
+  (provider-random (self n)
+    (if (= (. self fault) :zero-random)
+      (if (< n 0) (provider-random (. self inner) n) (Ok (array n 0i8)))
+      (provider-random (. self inner) n)))
+  (provider-ct-equal (self a b)
+    (if (= (. self fault) :ct-true) (= (array-len a) (array-len b)) (provider-ct-equal (. self inner) a b))))
+
+(defun faults () -> (Vec keyword) [:truncate :flip-bit :wrong-alg :zero-random :ct-true :pbkdf2-plus :fallback :overclaim])
+
+;; The ids of the scenarios that did not hold when run: a step that broke is a failure. A scenario that traps ends the run (a driver
+;; that traps has failed too; `fibc test` shows it as a trap row).
+(defun contract-failures (scs: (Vec Scenario) seed: i64) -> (Vec str)
+  (vec (map (fn (sc: Scenario) (. sc id))
+            (filter (fn (sc: Scenario)
+                      (some? (first (filter (fn (r: StepRun) (match (. r judged) ((Held) false) ((Broke _ _) true))) ((. sc run) seed)))))
+                    scs))))

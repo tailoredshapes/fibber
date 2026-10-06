@@ -1,0 +1,116 @@
+;; fib.crypto.encoding: hex and base64 (RFC 4648), the one part of fib.crypto that is written in fibber. They are encodings, not
+;; cryptography: no secret is compared or branched on here. Bytes are `(Array i8)`, text is `str`.
+;;
+;;   (hex bytes)                  "48656c6c6f"          (unhex "48656C6C6F")    (Ok bytes), upper or lower case accepted
+;;   (base64 bytes)               "Zm9vYg=="            (unbase64 "Zm9vYg==")   (Ok bytes)
+;;   (base64-nopad bytes)         "Zm9vYg"              (unbase64-nopad "Zm9vYg")
+;;   (base64url bytes)            "-_" for 62 and 63    (unbase64url ..) and the -nopad pair
+;;
+;; The decoders are strict: a character outside the alphabet, padding that is missing (or present where `-nopad` forbids it), a length
+;; that no input has, and trailing bits that are not zero are all `invalid-argument` errors (RFC 4648 section 3.5 lets a decoder
+;; reject non-canonical input; a signature or a token that decodes two ways is worse than one that is refused). No whitespace is skipped.
+(ns fib.crypto.encoding (:use fib.core fib.seq fib.coll fib.crypto.types))
+
+(def hex-digits: (Array i8) (str-bytes "0123456789abcdef"))
+(def std-alphabet: (Array i8) (str-bytes "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"))
+(def url-alphabet: (Array i8) (str-bytes "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"))
+
+(defun hex (bytes: (Array i8)) -> str
+  (let [out (cell (array (* 2 (array-len bytes)) 0i8))]
+    (do (dotimes (i (array-len bytes))
+          (let [b (bit-and (zext i64 (array-get bytes i)) 255)]
+            (do (array-set! &out (* 2 i) (array-get hex-digits (shr b 4)))
+                (array-set! &out (+ (* 2 i) 1) (array-get hex-digits (bit-and b 15))))))
+        (str-from-bytes @out))))
+
+(defun hex-value :private (c: i64) -> i64
+  (cond (and (>= c 48) (<= c 57)) (- c 48)
+        (and (>= c 97) (<= c 102)) (- c 87)
+        (and (>= c 65) (<= c 70)) (- c 55)
+        :else -1))
+
+(defun unhex (text: str) -> (Result (Array i8) CryptoError)
+  (let [src (str-bytes text) n (array-len src)]
+    (if (not (= (rem n 2) 0)) (Err (invalid-argument "unhex: an odd number of digits"))
+      (let [out (cell (array (quot n 2) 0i8))
+            bad (loop [i 0]
+                  (if (= i (quot n 2)) -1
+                    (let [hi (hex-value (bit-and (zext i64 (array-get src (* 2 i))) 255))
+                          lo (hex-value (bit-and (zext i64 (array-get src (+ (* 2 i) 1))) 255))]
+                      (if (or (< hi 0) (< lo 0)) (* 2 i)
+                        (do (array-set! &out i (trunc i8 (+ (* 16 hi) lo))) (recur (+ i 1)))))))]
+        (if (< bad 0) (Ok @out) (Err (invalid-argument (str "unhex: not a hex digit near offset " bad))))))))
+
+;; ---- base64
+;; Encodes with the alphabet; `pad` appends "=" up to a multiple of four.
+(defun b64-encode :private (bytes: (Array i8) alphabet: (Array i8) pad: bool) -> str
+  (let [n (array-len bytes)
+        full (quot n 3)
+        rest (- n (* 3 full))
+        size (+ (* 4 full) (if pad (if (= rest 0) 0 4) (cond (= rest 0) 0 (= rest 1) 2 :else 3)))
+        out (cell (array size 0i8))
+        byte-at (fn (i: i64) (bit-and (zext i64 (array-get bytes i)) 255))
+        put (fn (j: i64 v: i64) (array-set! &out j (array-get alphabet (bit-and v 63))))]
+    (do (dotimes (g full)
+          (let [w (+ (shl (byte-at (* 3 g)) 16) (shl (byte-at (+ (* 3 g) 1)) 8) (byte-at (+ (* 3 g) 2)))]
+            (do (put (* 4 g) (shr w 18)) (put (+ (* 4 g) 1) (shr w 12)) (put (+ (* 4 g) 2) (shr w 6)) (put (+ (* 4 g) 3) w))))
+        (when (> rest 0)
+          (let [a (byte-at (* 3 full)) b (if (= rest 2) (byte-at (+ (* 3 full) 1)) 0) w (+ (shl a 16) (shl b 8)) j (* 4 full)]
+            (do (put j (shr w 18)) (put (+ j 1) (shr w 12))
+                (if (= rest 2) (put (+ j 2) (shr w 6)) (when pad (array-set! &out (+ j 2) 61i8)))
+                (when pad (array-set! &out (+ j 3) 61i8)))))
+        (str-from-bytes @out))))
+
+(defun base64 (bytes: (Array i8)) -> str (b64-encode bytes std-alphabet true))
+(defun base64-nopad (bytes: (Array i8)) -> str (b64-encode bytes std-alphabet false))
+(defun base64url (bytes: (Array i8)) -> str (b64-encode bytes url-alphabet true))
+(defun base64url-nopad (bytes: (Array i8)) -> str (b64-encode bytes url-alphabet false))
+
+(defun b64-value :private (c: i64 url: bool) -> i64
+  (cond (and (>= c 65) (<= c 90)) (- c 65)
+        (and (>= c 97) (<= c 122)) (- c 71)
+        (and (>= c 48) (<= c 57)) (+ c 4)
+        (= c (if url 45 43)) 62
+        (= c (if url 95 47)) 63
+        :else -1))
+
+;; The number of "=" at the end of `src` (0, 1 or 2) and the number of data characters, or -1 when the shape is wrong.
+(defun b64-shape :private (src: (Array i8) pad: bool) -> (Pair i64 i64)
+  (let [n (array-len src)
+        pads (cond (and (>= n 2) (= (array-get src (- n 1)) 61i8) (= (array-get src (- n 2)) 61i8)) 2
+                   (and (>= n 1) (= (array-get src (- n 1)) 61i8)) 1
+                   :else 0)
+        m (- n pads)]
+    (cond pad (if (and (= (rem n 4) 0) (not (= (rem m 4) 1))) (Pair pads m) (Pair 0 -1))
+          (= pads 0) (if (= (rem m 4) 1) (Pair 0 -1) (Pair 0 m))
+          :else (Pair 0 -1))))
+
+(defun b64-decode :private (text: str url: bool pad: bool) -> (Result (Array i8) CryptoError)
+  (let [src (str-bytes text)
+        shape (b64-shape src pad)
+        m (. shape snd)
+        pads (. shape fst)]
+    (if (< m 0) (Err (invalid-argument "base64: the length or the padding is wrong"))
+      (let [rest (rem m 4)
+            size (+ (* 3 (quot m 4)) (cond (= rest 2) 1 (= rest 3) 2 :else 0))
+            out (cell (array size 0i8))
+            ;; the offset of the first character outside the alphabet, or -1; fills `out` as it goes
+            bad (loop [i 0 acc 0 bits 0 o 0]
+                  (if (= i m) -1
+                    (let [v (b64-value (bit-and (zext i64 (array-get src i)) 255) url)]
+                      (if (< v 0) i
+                        (let [acc2 (bit-or (shl acc 6) v) bits2 (+ bits 6)]
+                          (if (>= bits2 8)
+                            (do (array-set! &out o (trunc i8 (shr acc2 (- bits2 8))))
+                                (recur (+ i 1) (bit-and acc2 (- (shl 1 (- bits2 8)) 1)) (- bits2 8) (+ o 1)))
+                            (recur (+ i 1) acc2 bits2 o)))))))
+            last (if (> m 0) (b64-value (bit-and (zext i64 (array-get src (- m 1))) 255) url) 0)
+            slack (cond (= rest 2) (bit-and last 15) (= rest 3) (bit-and last 3) :else 0)]
+        (cond (>= bad 0) (Err (invalid-argument (str "base64: not an alphabet character near offset " bad)))
+              (not (= slack 0)) (Err (invalid-argument "base64: the unused trailing bits are not zero"))
+              :else (Ok @out))))))
+
+(defun unbase64 (text: str) -> (Result (Array i8) CryptoError) (b64-decode text false true))
+(defun unbase64-nopad (text: str) -> (Result (Array i8) CryptoError) (b64-decode text false false))
+(defun unbase64url (text: str) -> (Result (Array i8) CryptoError) (b64-decode text true true))
+(defun unbase64url-nopad (text: str) -> (Result (Array i8) CryptoError) (b64-decode text true false))
