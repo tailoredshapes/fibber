@@ -674,10 +674,18 @@ pinned that rejection and now pins the acceptance, and cases ownership/232 to
 atom    : ∀a. (Send a) ⇒ (fn :send (a) (Atom a))
 swap!   : ∀a. (fn :send ((Atom a) (fn ς (a) a)) a)      ; f's colour unconstrained: f runs on the calling thread; f is :borrow
 reset!  : ∀a. (fn :send ((Atom a) a) unit)
+compare-and-set! : ∀a. (fn :send ((Atom a) a a) bool)     ; escapes [EscBorrow EscBorrow EscStore]: old is borrowed, new consumed
 ```
 
-`set!` on an atom is a type error; atoms are written only by `swap!` and
-`reset!`. `(atom (cell 0))` fails `Send (Cell i64)` at `atom`, which is
+`set!` on an atom is a type error; atoms are written only by `swap!`,
+`reset!` and `compare-and-set!`. `(compare-and-set! a old new)` stores
+`new` and answers `true` if the atom holds `old` at that moment, else
+leaves the atom alone and answers `false`; "holds `old`" is the word
+compare of `swap!` (§8.6): a scalar's bits (so `-0.0` is not `0.0`), an
+object's address (Clojure's `identical?`: an equal `Vec` that is not the
+held one does not match). It is one atomic step. `compare-and-set!` is a
+compiler builtin (`compiler/types/builtins.fib`) that the Rust sources
+under `crates/` have no row for, like `cell-update!` (§2.13.1). `(atom (cell 0))` fails `Send (Cell i64)` at `atom`, which is
 how "a cell that is not an atom may not cross" holds without inspecting
 atom contents at `spawn`.
 
@@ -3734,7 +3742,7 @@ Retain and release of a `(dyn P)` value act on `obj`.
 
 ```
 (defstruct fib.cell (i64 i32 i32  T))             ; T = lIR type of the content (ptr for objects)
-(defstruct fib.atom (i64 i32 i32  i32  ptr))      ; header, spinlock, value
+(defstruct fib.atom (i64 i32 i32  i32  ptr))      ; header, lock word (unused by a scalar atom), value
 ```
 
 `fib.cell` is one `defstruct` per content layout. A `(dyn P)` content,
@@ -3769,9 +3777,53 @@ way, box then vtable (lir.md §2).
   vector loaded from `v` again, retained and stored through the
   field-3 `getelementptr`; `push-count` called with the `alloca`'s
   address; the content stored back into `v` afterwards.
-- `@a` on an atom: `fib.lock a` (`cmpxchg` spinlock, acquire), `v = load`,
-  `fib.retain v`, `fib.unlock a` (release store) — the single atomic step
-  §7 requires.
+- `@a` on an atom: for an atom of an object, a `dyn` or an `Option` of a
+  scalar (a pair), `fib.lock a` (a test-and-test-and-set lock, below),
+  `v = load`, `fib.retain v`, `fib.unlock a` (release store) — the single
+  atomic step §7 requires. For an atom of a **scalar** (`bool`, `i8`,
+  `i16`, `i32`, `i64`, `f32`, `f64`, so `char`) it is one `atomic-load
+  seq_cst` of the value slot, and the lock word is never touched: a scalar
+  holds nothing a reader would have to retain, so nothing has to be atomic
+  with the load. (P-count-a, docs/design/parallelism.md 2.6: 28 readers of
+  one atom took 1104 ms for 200 000 reads each under the lock.)
+- **Scalar atoms are lock-free** (`compiler/emit/lower/atoms.fib`). Every
+  access is `seq_cst`: the operations on one atom are one total order in
+  which each read sees the last write before it, and the operations on
+  several atoms are in one total order too (the guarantee Clojure's atoms
+  give, and what a program that spins on one atom while another task
+  writes two relies on); on x86-64 a `seq_cst` load is a plain `mov`, so
+  readers do not slow each other down. `(reset! a v)` is one `atomic-store`.
+  `(compare-and-set! a old new)` is one `cmpxchg` (strong) and answers its
+  success bit. `(swap! a f)` is the loop: `old = atomic-load`; `new =
+  f(old)` (the retains of the object loop are no-ops on scalars); `cmpxchg
+  old -> new`; on failure read again and call `f` again. **`f` may
+  therefore run more than once, and on a value another task has already
+  replaced: it must be pure** (as Clojure's `swap!`; this was already so
+  under the lock). The loop is lock-free: a failed `cmpxchg` means another
+  task's succeeded. `bool` is stored as one byte (`i1` in a struct) and
+  accessed as `i8`; a float is accessed as the integer of its size, so
+  `cmpxchg` compares bits. An atom of `unit` (a task's result holder) and
+  the atoms of tasks' results keep the lock (`compiler/emit/lower/threads.fib` completes them
+  under it).
+- **Object atoms keep the lock.** A reader that loads a pointer and then
+  retains it must not race a writer that releases the old value in
+  between: a lock-free design needs hazard pointers or epoch reclamation
+  (the retain must be atomic with the load), which is not built; so
+  `@a`, `reset!`, `swap!` and `compare-and-set!` of an object atom take
+  `fib.lock` (rt/atom.lir) around the load and retain, or the compare and
+  the store. The lock is the `cmpxchg` (acquire) lock of rt/atom.lir with
+  a `sched_yield` after each failed attempt; `fib.unlock` is a release
+  store of 0. Test-and-test-and-set variants with bounded spinning were
+  measured and were no faster at 28 tasks and slower at 2 to 8 (the cost
+  of an object atom under contention is the atomic count of its content,
+  docs/shootout/atoms.md "the lock"), so it was not changed. The lock is
+  held for a load and a retain, or a compare and a store: never across a
+  call of `f`.
+- `(compare-and-set! a old new)` on an object atom: share-mark `new` if
+  the atom is `SHARED`; lock; `cur = load`; if `cur == old` (the word)
+  { `store new` (consumed: the atom's count is the argument's); unlock;
+  `fib.release cur`; `true` } else { unlock; `fib.release new`; `false` }.
+  `old` is borrowed and never retained or released.
 - `@t` on a task (**Proposed**, §2.9): the lowering of `(join t)` (§8.8),
   nothing of its own: `fib.drive t`, then the result read from the task's
   result atom as `@a` reads an atom, retained for the caller. The task is
@@ -4081,8 +4133,9 @@ quantum.
 | named function used as a value | its `IMMORTAL` closure, whose code is the all-owned body `f.owned`, emitted by the monomorphiser for every function whose value is taken and for its SCC (§8.4) |
 | owned parameter | `fib.release` on every exit path, a tail call's jump included, unless it is the function's value or moved into the tail call (§8.9); a store, capture or `spawn` of it retains (E2–E4) and does not spare it the release |
 | non-final `do` step with an `Owned` value | `fib.release` at the step's end |
-| `@c`, `@a`, `@w` | as §8.6/§8.7 (always a `fib.retain`; atom under lock; weak "retain if alive") |
-| `set!`, `reset!`, `swap!` | as §8.6: `consume` new, share if `SHARED`, store, `fib.release` old |
+| `@c`, `@a`, `@w` | as §8.6/§8.7 (always a `fib.retain`; an object atom under lock, a scalar atom one `atomic-load`; weak "retain if alive") |
+| `set!`, `reset!`, `swap!` | as §8.6: `consume` new, share if `SHARED`, store, `fib.release` old; a scalar atom: `atomic-store` or `cmpxchg` loop, no counts |
+| `compare-and-set!` | as §8.6: scalar atom one `cmpxchg`; object atom under the lock, share if `SHARED`, store `new` and `fib.release` the old content, or `fib.release` `new` |
 | `&` copy-in | at call entry, after every argument, in parameter order: `fib.retain` the variable's content and store it into the private cell (§6.6), or, for a taken `&b` (§6.6), store it without the retain; nothing for a forwarded `&v` (§6.10 rule (b)), nor for the `&` operand of `array-set!` or `set-field!`, which update the variable's own cell (§2.13) |
 | `&` write-back | store the private cell's content into the variable; `fib.release` the variable's old content, unless the copy-in took it (§6.6) |
 | `array-set!`, `set-field!` | `fib.unique?` test (flags first, `HAS-WEAK` among them, then the count, §8.2); in-place write, or copy + store + `fib.release` old |

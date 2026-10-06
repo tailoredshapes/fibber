@@ -4,7 +4,7 @@
 ;; is Rust's: a `gep` before the access it feeds, an operand's retain before the call it is passed to.
 (ns emit.lower.cells
   (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.layout emit.ir emit.objects emit.program
-        emit.lower.cx emit.lower.ops emit.lower.objects emit.lower.window))
+        emit.lower.cx emit.lower.ops emit.lower.objects emit.lower.window emit.lower.atoms))
 
 ;; The content of a cell, atom, weak reference or task type; `nil` for any other type.
 (defun content-of :private (t: Ty) -> (Option Ty)
@@ -40,8 +40,16 @@
          (cell-load cx (. o sname) (v-text (. r fst)) (nth args 0))))
       (_ (Err "a peek of something that is not a cell")))))
 
-;; An atom's content under the lock: lock, load, retain, unlock: one atomic step (§8.6).
+;; An atom's content: for a scalar one atomic load (emit.lower.atoms); else under the lock: lock, load, retain, unlock: one atomic step (§8.6).
 (defun atom-deref :private (cx: LowerCx c: V sname: str content: Ty) -> (Result V str)
+  (try-let ((l (program-lir (. cx p) content)))
+    (match l
+      ((some lt) (if (scalar-atom-lir? lt)
+                     (Ok (scalar-atom-load cx (lcx-gep cx sname (v-text c) slot-atom-value) lt))
+                     (atom-deref-locked cx c sname content)))
+      (nil (atom-deref-locked cx c sname content)))))
+
+(defun atom-deref-locked :private (cx: LowerCx c: V sname: str content: Ty) -> (Result V str)
   (let ((lockp (lcx-gep cx sname (v-text c) slot-atom-lock)))
     (do (fb-stmt (. cx b) (str-join ["(call @fib.lock " lockp ")"]))
         (let ((vp (lcx-gep cx sname (v-text c) slot-atom-value)))
@@ -109,19 +117,27 @@
 (defun lcx-reset (cx: LowerCx a: V t: Ty v: V) -> (Result V str)
   (match t
     ((TCon (KAtom) args)
-     (try-let ((o (lcx-object-of cx t)))
-       (do (when-some [w (lcx-obj-word cx v)]
-             (fb-stmt (. cx b) (str-join ["(call @fib.share-into " (v-text a) " " w ")"])))
-           (let ((lockp (lcx-gep cx (. o sname) (v-text a) slot-atom-lock)))
-             (do (fb-stmt (. cx b) (str-join ["(call @fib.lock " lockp ")"]))
-                 (let ((vp (lcx-gep cx (. o sname) (v-text a) slot-atom-value)))
-                   (try-let ((l (program-lir (. cx p) (nth args 0))))
-                     (let ((old (match l ((some lt) (lcx-load cx lt vp)) (nil VUnit))))
-                       (do (lcx-store cx v vp)
-                           (fb-stmt (. cx b) (str-join ["(call @fib.unlock " lockp ")"]))
-                           (lcx-release cx old)
-                           (Ok VUnit))))))))))
+     (try-let ((o (lcx-object-of cx t)) (l (program-lir (. cx p) (nth args 0))))
+       (match l
+         ((some lt) (if (scalar-atom-lir? lt)
+                        (do (scalar-atom-store cx (lcx-gep cx (. o sname) (v-text a) slot-atom-value) lt v)
+                            (Ok VUnit))
+                        (reset-locked cx a args o v)))
+         (nil (reset-locked cx a args o v)))))
     (_ (Err "reset! on a non-atom"))))
+
+(defun reset-locked :private (cx: LowerCx a: V args: (Vec Ty) o: ObjAt v: V) -> (Result V str)
+  (do (when-some [w (lcx-obj-word cx v)]
+        (fb-stmt (. cx b) (str-join ["(call @fib.share-into " (v-text a) " " w ")"])))
+      (let ((lockp (lcx-gep cx (. o sname) (v-text a) slot-atom-lock)))
+        (do (fb-stmt (. cx b) (str-join ["(call @fib.lock " lockp ")"]))
+            (let ((vp (lcx-gep cx (. o sname) (v-text a) slot-atom-value)))
+              (try-let ((l (program-lir (. cx p) (nth args 0))))
+                (let ((old (match l ((some lt) (lcx-load cx lt vp)) (nil VUnit))))
+                  (do (lcx-store cx v vp)
+                      (fb-stmt (. cx b) (str-join ["(call @fib.unlock " lockp ")"]))
+                      (lcx-release cx old)
+                      (Ok VUnit)))))))))
 
 ;; Whether two values of one type are the same word (an object's address, a scalar's bits). Rust: lower/cells.rs:213 same_bits
 (defun same-bits :private (cx: LowerCx x: V y: V) -> V
@@ -168,32 +184,73 @@
          (match lt
            (nil (Err "swap! on an atom of unit"))
            ((some l)
-            (let ((lockp (lcx-gep cx (. o sname) (v-text a) slot-atom-lock)) (vp (lcx-gep cx (. o sname) (v-text a) slot-atom-value))
-                  (head (fb-label b "swap")) (done (fb-label b "swapped")))
-              (do (fb-term b (str-join ["(br " head ")"]))
-                  (fb-open b head)
-                  (fb-stmt b (str-join ["(call @fib.lock " lockp ")"]))
-                  (let ((old (lcx-load cx l vp)))
-                    (do (lcx-retain cx old)
-                        (fb-stmt b (str-join ["(call @fib.unlock " lockp ")"]))
-                        (lcx-retain cx old)
-                        (lcx-retain cx f)
-                        (try-let ((new ((. (. cx hub) emit-call) cx (TgValue f) [old] content false)))
-                          (do (fb-stmt b (str-join ["(call @fib.lock " lockp ")"]))
-                              (let ((cur (lcx-load cx l vp)))
-                                (let ((same (same-bits cx cur old)) (lyes (fb-label b "unchanged")) (lno (fb-label b "changed")))
-                                  (do (fb-term b (str-join ["(br " (v-text same) " " lyes " " lno ")"]))
-                                      (fb-open b lyes)
-                                      (swap-store cx a lockp vp old new)
-                                      (fb-term b (str-join ["(br " done ")"]))
-                                      (fb-open b lno)
-                                      (fb-stmt b (str-join ["(call @fib.unlock " lockp ")"]))
-                                      (lcx-release cx old)
-                                      (lcx-release cx new)
-                                      (fb-term b (str-join ["(br " head ")"]))
-                                      (fb-open b done)
-                                      (Ok new)))))))))))))))
+            (if (scalar-atom-lir? l)
+                (lcx-scalar-swap cx (lcx-gep cx (. o sname) (v-text a) slot-atom-value) l content f)
+                (swap-locked cx a o l content f)))))))
     (_ (Err "swap! on a non-atom"))))
+
+(defun swap-locked :private (cx: LowerCx a: V o: ObjAt l: LirTy content: Ty f: V) -> (Result V str)
+  (let ((b (. cx b)))
+    (let ((lockp (lcx-gep cx (. o sname) (v-text a) slot-atom-lock)) (vp (lcx-gep cx (. o sname) (v-text a) slot-atom-value))
+          (head (fb-label b "swap")) (done (fb-label b "swapped")))
+      (do (fb-term b (str-join ["(br " head ")"]))
+          (fb-open b head)
+          (fb-stmt b (str-join ["(call @fib.lock " lockp ")"]))
+          (let ((old (lcx-load cx l vp)))
+            (do (lcx-retain cx old)
+                (fb-stmt b (str-join ["(call @fib.unlock " lockp ")"]))
+                (lcx-retain cx old)
+                (lcx-retain cx f)
+                (try-let ((new ((. (. cx hub) emit-call) cx (TgValue f) [old] content false)))
+                  (do (fb-stmt b (str-join ["(call @fib.lock " lockp ")"]))
+                      (let ((cur (lcx-load cx l vp)))
+                        (let ((same (same-bits cx cur old)) (lyes (fb-label b "unchanged")) (lno (fb-label b "changed")))
+                          (do (fb-term b (str-join ["(br " (v-text same) " " lyes " " lno ")"]))
+                              (fb-open b lyes)
+                              (swap-store cx a lockp vp old new)
+                              (fb-term b (str-join ["(br " done ")"]))
+                              (fb-open b lno)
+                              (fb-stmt b (str-join ["(call @fib.unlock " lockp ")"]))
+                              (lcx-release cx old)
+                              (lcx-release cx new)
+                              (fb-term b (str-join ["(br " head ")"]))
+                              (fb-open b done)
+                              (Ok new))))))))))))
+
+;; `(compare-and-set! a old new)`: whether the atom held `old` (the same bits: a scalar's value, an object's address, as `swap!` compares) and now
+;; holds `new`. A scalar atom: one compare-and-swap (emit.lower.atoms). Else under the lock: when it matches, `new` (consumed) is share-marked
+;; if the atom is, stored, and the old content released; when it does not, `new` is released and nothing changes.
+(defun lcx-compare-and-set (cx: LowerCx a: V t: Ty old: V new: V) -> (Result V str)
+  (match t
+    ((TCon (KAtom) args)
+     (try-let ((o (lcx-object-of cx t)) (lt (program-lir (. cx p) (nth args 0))))
+       (match lt
+         (nil (Err "compare-and-set! on an atom of unit"))
+         ((some l)
+          (if (scalar-atom-lir? l)
+              (Ok (lcx-scalar-compare-and-set cx (lcx-gep cx (. o sname) (v-text a) slot-atom-value) l old new))
+              (cas-locked cx a o l old new))))))
+    (_ (Err "compare-and-set! on a non-atom"))))
+
+(defun cas-locked :private (cx: LowerCx a: V o: ObjAt l: LirTy old: V new: V) -> (Result V str)
+  (let ((b (. cx b)) (lockp (lcx-gep cx (. o sname) (v-text a) slot-atom-lock)) (vp (lcx-gep cx (. o sname) (v-text a) slot-atom-value))
+        (lyes (fb-label (. cx b) "casyes")) (lno (fb-label (. cx b) "casno")) (ljoin (fb-label (. cx b) "casdone")))
+    (do (when-some [w (lcx-obj-word cx new)]
+          (fb-stmt b (str-join ["(call @fib.share-into " (v-text a) " " w ")"])))
+        (fb-stmt b (str-join ["(call @fib.lock " lockp ")"]))
+        (let ((cur (lcx-load cx l vp)))
+          (do (fb-term b (str-join ["(br " (v-text (same-bits cx cur old)) " " lyes " " lno ")"]))
+              (fb-open b lyes)
+              (lcx-store cx new vp)
+              (fb-stmt b (str-join ["(call @fib.unlock " lockp ")"]))
+              (lcx-release cx cur)
+              (fb-term b (str-join ["(br " ljoin ")"]))
+              (fb-open b lno)
+              (fb-stmt b (str-join ["(call @fib.unlock " lockp ")"]))
+              (lcx-release cx new)
+              (fb-term b (str-join ["(br " ljoin ")"]))
+              (fb-open b ljoin)
+              (Ok (fb-phi b LirI1 [(PhiEdge lyes "(i1 1)") (PhiEdge lno "(i1 0)")])))))))
 
 ;; `(cell-update! c f)`: the content moved out of the cell (a null left in the slot, no retain), `f` called on it as an owned argument,
 ;; its result stored without a retain. The cell holds one count throughout, so a value unique before is unique inside `f`.

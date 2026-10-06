@@ -1,0 +1,31 @@
+;; spec:   stdlib §2.6 (atoms), types §8.6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: atom, compare-and-set!
+;; An atom of an object keeps its lock; `compare-and-set!` there compares the object's address (Clojure's `identical?`), not its contents. A
+;; `Vec` equal to the held one is not the held one. When it swaps, the atom now holds the new value and releases the old; when it does not,
+;; the new value is released: the audit (leaks and double releases) is the check of both counts. The held value read first (`@a`) is the same
+;; object, so `(compare-and-set! a v ..)` after `(let ((v @a)))` succeeds, and a second try with the same `v` fails: the atom has moved on.
+(ns main (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (a (atom [1 2])) (s (atom "ab")))
+    (do (let ((v @a))
+          (do (check c (not (compare-and-set! a [1 2] [9])))
+              (check c (= @a [1 2]))
+              (check c (compare-and-set! a v (conj v 3)))
+              (check c (= @a [1 2 3]))
+              (check c (not (compare-and-set! a v [7])))
+              (check c (= @a [1 2 3]))))
+        (let ((w @a))
+          (do (check c (compare-and-set! a w (conj w 4)))
+              (check c (= (count @a) 4))))
+        (let ((x @s))
+          (do (check c (compare-and-set! s x (str x "c")))
+              (check c (= @s "abc"))
+              (check c (not (compare-and-set! s x "zz")))
+              (check c (= @s "abc"))))
+        (checks-result c))))

@@ -1,0 +1,39 @@
+;; spec:   stdlib §2.6 (atoms; the adder is the library's tool for hot counters)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: adder
+;; `fib.adder`: a counter striped over 32 scalar atoms. A new adder sums to 0; `add!` adds any i64 (negative too), `inc!` adds 1; two adders
+;; do not share cells. Eight tasks each add 25 000 times to one adder (and ten tasks add and subtract in equal measure to a second one): once they are
+;; joined `sum` is exact, 200 000 and 0, whatever the stripes the tasks hashed to (an `add!` that read the stripe and wrote it back, or a
+;; `sum` that looked at one stripe only, is wrong). An adder crosses to tasks (its cells are atoms: Send), by capture or by argument.
+(ns main (:use tl.check fib.async fib.adder))
+
+(defun count-up (a: Adder n: i64) -> i64
+  (do (dotimes (i n) (inc! a)) n))
+
+(defun swing (a: Adder n: i64) -> i64
+  (do (dotimes (i n) (add! a 3) (add! a -3)) n))
+
+(defun bump-in-closure (a: Adder n: i64) -> i64
+  (do (dotimes (i n) (add! a 2)) n))
+
+(defun main () -> i64
+  (let ((c (checks)) (a (adder)) (b (adder)) (z (adder)))
+    (do (check c (= (sum z) 0))
+        (add! z 5) (add! z -7) (inc! z)
+        (check c (= (sum z) -1))
+        (let ((ts [(future (count-up a 25000)) (future (count-up a 25000)) (future (count-up a 25000)) (future (count-up a 25000))
+                   (future (count-up a 25000)) (future (count-up a 25000)) (future (count-up a 25000)) (future (count-up a 25000))])
+              (us [(future (swing b 5000)) (future (swing b 5000)) (future (swing b 5000)) (future (swing b 5000)) (future (swing b 5000))
+                   (future (swing b 5000)) (future (swing b 5000)) (future (swing b 5000)) (future (swing b 5000)) (future (swing b 5000))])
+              (cs [(future (bump-in-closure z 1000)) (future (bump-in-closure z 1000))]))
+          (do (dotimes (i 8) (join (nth ts i)))
+              (dotimes (i 10) (join (nth us i)))
+              (dotimes (i 2) (join (nth cs i)))
+              (check c (= (sum a) 200000))
+              (check c (= (sum b) 0))
+              (check c (= (sum z) 3999))
+              (checks-result c))))))
