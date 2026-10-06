@@ -1,0 +1,40 @@
+;; spec: docs/design/autodiff.md 3 (ownership of the tape), lib/fib/autodiff
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; The tape owns what the backward closures saved. (1) A forward pass whose backward is never run (an evaluation that forgot to use no-grad, an
+;; error between the forward and the backward) leaves the entries on the tape; when the last holder of the tape goes, every saved tensor goes
+;; with it: the audit shows no leak. A fault that made a closure hold a counted reference to its own tape (capturing a Tracked value, which
+;; carries the tape, instead of the tensor it needs) makes a cycle tape -> entry -> closure -> Tracked -> tape that nothing frees: this case
+;; fails on it (scripts/mutant-autodiff.sh plants it as `closure-captures-the-tape`). (2) A full backward pass, then an Adam step: clean too.
+(ns main (:require [fib.tensor :as t] [fib.autodiff :as ad]) (:use tl.check))
+
+(defun forward-only () -> i64
+  (let [tp (ad/new-tape)
+        x (ad/leaf tp (t/full [4 3] 0.5))
+        w (ad/leaf tp (t/full [3 2] 0.25))
+        b (ad/leaf tp (t/full [2] 0.1))
+        h (ad/exp (ad/dense x w b :relu))
+        l (ad/mean (ad/mul h h))]
+    (t/size (ad/value l))))
+
+(defun loss (ps: (Vec (ad/Tracked f64))) -> (ad/Tracked f64)
+  (let [x (ad/const-like (nth ps 0) (t/full [5 3] 0.5))
+        h (ad/dense x (nth ps 0) (nth ps 1) :tanh)]
+    (ad/softmax-cross-entropy (ad/matmul h (nth ps 2)) [0 1 1 0 1])))
+
+(defun train-two-steps () -> f64
+  (let [ps [(t/full [3 4] 0.1) (t/full [4] 0.0) (t/full [4 2] -0.1)]
+        st (ad/adam-init ps)
+        vg (ad/value-and-grad loss ps)
+        s1 (ad/adam-step 0.01 0.9 0.999 1.0e-8 st ps (. vg grads))
+        vg2 (ad/value-and-grad loss (. s1 params))]
+    (t/item (. vg2 value))))
+
+(defun main () -> i64
+  (let [c (checks)]
+    (do (check c (= 1 (forward-only)))
+        (check c (< (train-two-steps) 0.7))
+        (checks-result c))))

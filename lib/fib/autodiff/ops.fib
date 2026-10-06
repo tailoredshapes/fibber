@@ -1,0 +1,120 @@
+;; fib.autodiff.ops: tracked elementwise ops, reductions and views with their vector-Jacobian products (docs/design/autodiff.md, section 4).
+;; Each op computes its value with fib.tensor and records one closure that maps the output gradient to its inputs' gradients.
+;; Broadcasting: the backward of a broadcast is a reduction (`unbroadcast`): sum over the axes the forward stretched.
+(ns fib.autodiff.ops
+  (:use fib.core fib.seq fib.coll fib.autodiff.real fib.autodiff.tape fib.tensor.kernels)
+  (:require [fib.tensor :as t]))
+
+;; sum g down to `dims`, the shape an input had before it was broadcast: leading axes are summed away, axes the input had as 1 are
+;; summed with keepdims. Ordered sums (t/sum-axis), so the result is reproducible.
+(defun sum-leading (g: (t/Tensor a) k: i64) -> (t/Tensor a)
+  (loop [g g i 0] (if (< i k) (recur (t/sum-axis 0 false g) (+ i 1)) g)))
+
+(defun leading-sum? (gd: (Vec i64) dims: (Vec i64)) -> bool
+  (and (= (count gd) 2) (or (= dims [(nth gd 1)]) (= dims [1 (nth gd 1)]))))
+
+;; The common case, a bias: [m n] summed to [n] or [1 n]. A product of a row of ones with g is one fused-multiply-add chain per column over
+;; the rows in increasing order (so as reproducible as t/sum-axis) and runs through the vector GEMM, about six times faster than
+;; t/sum-axis 0 on 128 x 256 (docs/shootout/autodiff.md).
+(defun column-sums (g: (t/Tensor a) dims: (Vec i64)) -> (t/Tensor a)
+  (t/reshape dims (t/mmul (t/full [1 (nth (t/shape g) 0)] (one (. g seed))) g)))
+
+(defun unbroadcast (g: (t/Tensor a) dims: (Vec i64)) -> (t/Tensor a)
+  (let [gd (t/shape g)]
+    (cond (= gd dims) g
+          (leading-sum? gd dims) (column-sums g dims)
+          :else (let [g1 (sum-leading g (- (count gd) (count dims)))]
+                  (loop [g g1 ax 0]
+                    (if (< ax (count dims))
+                        (recur (if (and (= (nth dims ax) 1) (> (nth (t/shape g) ax) 1)) (t/sum-axis ax true g) g) (+ ax 1))
+                        g))))))
+
+(defun pick2 (na: bool nb: bool fa: (fn () (t/Tensor a)) :borrow fb: (fn () (t/Tensor a)) :borrow) -> (Vec (t/Tensor a))
+  (cond (and na nb) [(fa) (fb)] na [(fa)] :else [(fb)]))
+
+(defun shape-of (x: (Tracked a)) -> (Vec i64) (t/shape (. x val)))
+
+(defun add (a: (Tracked a) b: (Tracked a)) -> (Tracked a)
+  (let [sa (shape-of a) sb (shape-of b)]
+    (record2 a b (t/add (. a val) (. b val))
+             (fn (g na nb) (pick2 na nb (fn () (unbroadcast g sa)) (fn () (unbroadcast g sb)))))))
+
+(defun sub (a: (Tracked a) b: (Tracked a)) -> (Tracked a)
+  (let [sa (shape-of a) sb (shape-of b)]
+    (record2 a b (t/sub (. a val) (. b val))
+             (fn (g na nb) (pick2 na nb (fn () (unbroadcast g sa)) (fn () (unbroadcast (t/scale (lit (. g seed) -1.0) g) sb)))))))
+
+(defun mul (a: (Tracked a) b: (Tracked a)) -> (Tracked a)
+  (let [sa (shape-of a) sb (shape-of b) av (. a val) bv (. b val)]
+    (record2 a b (t/mul av bv)
+             (fn (g na nb) (pick2 na nb (fn () (unbroadcast (t/mul g bv) sa)) (fn () (unbroadcast (t/mul g av) sb)))))))
+
+;; d(a/b) = g/b for a; -g*out/b for b (out = a/b)
+(defun div (a: (Tracked a) b: (Tracked a)) -> (Tracked a)
+  (let [sa (shape-of a) sb (shape-of b) bv (. b val) out (t/div (. a val) bv)]
+    (record2 a b out
+             (fn (g na nb) (pick2 na nb (fn () (unbroadcast (t/div g bv) sa))
+                                  (fn () (unbroadcast (t/scale (lit (. g seed) -1.0) (t/div (t/mul g out) bv)) sb)))))))
+
+(defun neg (a: (Tracked a)) -> (Tracked a)
+  (record1 a (t/scale (lit (. (. a val) seed) -1.0) (. a val)) (fn (g) (t/scale (lit (. g seed) -1.0) g))))
+
+(defun scale (k: f64 a: (Tracked a)) -> (Tracked a)
+  (let [v (. a val) c (lit (. v seed) k)]
+    (record1 a (t/scale c v) (fn (g) (t/scale c g)))))
+
+(defun exp (a: (Tracked a)) -> (Tracked a)
+  (let [out (t/exp (. a val))] (record1 a out (fn (g) (t/mul g out)))))
+
+(defun log (a: (Tracked a)) -> (Tracked a)
+  (let [x (. a val)] (record1 a (t/log x) (fn (g) (t/div g x)))))
+
+;; d tanh = 1 - tanh^2
+(defun tanh (a: (Tracked a)) -> (Tracked a)
+  (let [out (t/tanh (. a val))]
+    (record1 a out (fn (g) (t/mul g (t/sub (scalar out 1.0) (t/mul out out)))))))
+
+;; d sigmoid = s (1 - s)
+(defun sigmoid (a: (Tracked a)) -> (Tracked a)
+  (let [out (t/activate :sigmoid (. a val))]
+    (record1 a out (fn (g) (t/mul g (t/mul out (t/sub (scalar out 1.0) out)))))))
+
+;; 1 where y > 0, else 0, from vector kernels only (t/where and t/greater are scalar loops, five times slower than this): y/y is 1 for
+;; y > 0 and NaN for y = 0, and the relu of a NaN is +0.0 (fib.tensor: ":relu means (where (greater x 0) x 0) exactly").
+;; Known limit: y = +inf gives inf/inf = NaN, so a mask of 0 where the exact answer is 1 (an overflowed activation).
+(defun relu-mask (y: (t/Tensor a)) -> (t/Tensor a) (t/relu (t/div y y)))
+
+;; relu: the gradient passes where the output is positive, so x = 0 has gradient 0 (the usual convention)
+(defun relu (a: (Tracked a)) -> (Tracked a)
+  (let [out (t/relu (. a val))]
+    (record1 a out (fn (g) (t/mul g (relu-mask out))))))
+
+;; ---- reductions
+(defun sum (a: (Tracked a)) -> (Tracked a)
+  (let [x (. a val) dims (t/shape x)]
+    (record1 a (t/full [] (total (. x seed) x)) (fn (g) (t/broadcast-to dims g)))))
+
+(defun mean (a: (Tracked a)) -> (Tracked a)
+  (let [x (. a val) dims (t/shape x) n (t/size x) k (/ 1.0 (double n))
+        c (lit (. x seed) k)]
+    (record1 a (t/full [] (lit (. x seed) (* (wide (. x seed) (total (. x seed) x)) k)))
+             (fn (g) (t/broadcast-to dims (t/scale c g))))))
+
+;; sum over one axis; the gradient is g, with the axis restored as 1, broadcast back
+(defun sum-axis (axis: i64 keepdims: bool a: (Tracked a)) -> (Tracked a)
+  (let [x (. a val) dims (t/shape x) ax (if (< axis 0) (+ axis (count dims)) axis)
+        kept (assoc dims ax 1)]
+    (record1 a (t/sum-axis ax keepdims x)
+             (fn (g) (t/broadcast-to dims (t/reshape kept (t/contiguous g)))))))
+
+;; ---- views
+(defun reshape (dims: (Vec i64) a: (Tracked a)) -> (Tracked a)
+  (let [x (. a val) old (t/shape x)]
+    (record1 a (t/reshape dims (t/contiguous x)) (fn (g) (t/reshape old (t/contiguous g))))))
+
+(defun transpose (a: (Tracked a)) -> (Tracked a)
+  (record1 a (t/transpose (. a val)) (fn (g) (t/transpose g))))
+
+(defun broadcast-to (dims: (Vec i64) a: (Tracked a)) -> (Tracked a)
+  (let [x (. a val) old (t/shape x)]
+    (record1 a (t/broadcast-to dims x) (fn (g) (unbroadcast g old)))))

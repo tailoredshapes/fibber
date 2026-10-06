@@ -1,0 +1,75 @@
+;; fib.autodiff.nn: tracked matrix products, fused dense layers, softmax and the cross-entropy loss with their backward formulas.
+;; The backward of a product is two products on transposed views (fib.tensor reads a view's strides while packing: no copy of the operand).
+(ns fib.autodiff.nn
+  (:use fib.core fib.seq fib.coll fib.autodiff.real fib.autodiff.tape fib.autodiff.ops fib.tensor.kernels)
+  (:require [fib.tensor :as t]))
+
+;; C = A B: dA = G B^T, dB = A^T G
+(defun matmul (a: (Tracked a) b: (Tracked a)) -> (Tracked a)
+  (let [av (. a val) bv (. b val)]
+    (record2 a b (t/mmul av bv)
+             (fn (g na nb) (pick2 na nb (fn () (t/mmul g (t/transpose bv))) (fn () (t/mmul (t/transpose av) g)))))))
+
+;; The gradient at the pre-activation z for each activation, from the output y (and z where the derivative needs it).
+(defun silu-grad (g: (t/Tensor a) z: (t/Tensor a)) -> (t/Tensor a)
+  (let [one (scalar z 1.0) s (t/activate :sigmoid z)]
+    (t/mul g (t/mul s (t/add one (t/mul z (t/sub one s)))))))
+
+;; gelu (the tanh form): y = z/2 (1 + th), th = tanh(c (z + 0.044715 z^3)); dy = (1 + th)/2 + z/2 (1 - th^2) c (1 + 3 0.044715 z^2)
+(defun gelu-grad (g: (t/Tensor a) z: (t/Tensor a)) -> (t/Tensor a)
+  (let [one (scalar z 1.0) half (scalar z 0.5) c (scalar z 0.7978845608028654) k (scalar z 0.044715) k3 (scalar z 0.134145)
+        z2 (t/mul z z)
+        th (t/tanh (t/mul c (t/mul z (t/add one (t/mul k z2)))))
+        left (t/mul half (t/add one th))
+        right (t/mul (t/mul half z) (t/mul (t/sub one (t/mul th th)) (t/mul c (t/add one (t/mul k3 z2)))))]
+    (t/mul g (t/add left right))))
+
+(defun act-grad (act: keyword g: (t/Tensor a) y: (t/Tensor a) z: (t/Tensor a)) -> (t/Tensor a)
+  (cond (= act :identity) g
+        (= act :relu) (t/mul g (relu-mask y))
+        (= act :tanh) (t/mul g (t/sub (scalar y 1.0) (t/mul y y)))
+        (= act :sigmoid) (t/mul g (t/mul y (t/sub (scalar y 1.0) y)))
+        (= act :silu) (silu-grad g z)
+        (= act :gelu) (gelu-grad g z)
+        :else (trap "autodiff dense: unknown activation")))
+
+;; y = act(x W + b). The activations with a derivative in terms of y use the fused kernel and save y; silu and gelu save the
+;; pre-activation z as well (the fused kernel does not return it, so they run as a product plus an activation).
+(defun dense-forward (x: (t/Tensor a) w: (t/Tensor a) b: (t/Tensor a) act: keyword) -> (Vec (t/Tensor a))
+  (if (or (= act :silu) (= act :gelu))
+      (let [z (t/mmul-bias x w b)] [(t/activate act z) z])
+      (let [y (t/dense x w b act)] [y y])))
+
+(defun dense (x: (Tracked a) w: (Tracked a) b: (Tracked a) act: keyword) -> (Tracked a)
+  (let [xv (. x val) wv (. w val) bs (shape-of b)
+        yz (dense-forward xv wv (. b val) act) y (nth yz 0) z (nth yz 1)]
+    (record3 x w b y
+             (fn (g nx nw nb)
+               (let [gz (act-grad act g y z)]
+                 (into [] (concat (concat (if nx [(t/mmul gz (t/transpose wv))] [])
+                                  (if nw [(t/mmul (t/transpose xv) gz)] []))
+                                  (if nb [(unbroadcast gz bs)] []))))))))
+
+;; softmax over the last axis: dx = y (g - sum(g y))
+(defun softmax (a: (Tracked a)) -> (Tracked a)
+  (let [y (t/softmax (. a val))]
+    (record1 a y (fn (g) (let [gy (t/mul g y)] (t/mul y (t/sub g (t/sum-axis -1 true gy)))))))) ;; see autodiff.md: y*(g - sum(g*y))
+
+(defun onehot (m: i64 c: i64 labels: (Vec i64) like: (t/Tensor a)) -> (t/Tensor a)
+  (let [zero (zero (. like seed)) buf (cell (array (* m c) zero))]
+    (do (dotimes (i m) (array-set! &buf (+ (* i c) (nth labels i)) (one zero)))
+        (t/from-array [m c] @buf zero))))
+
+;; mean over the batch of -log softmax(logits)[i, label_i]; stable (the row maximum is subtracted); the batch sum is accumulated in f64.
+;; backward: (softmax - onehot) g / m
+(defun softmax-cross-entropy (logits: (Tracked a) labels: (Vec i64)) -> (Tracked a)
+  (let [x (. logits val) dims (t/shape x) m (nth dims 0) c (nth dims 1)
+        sh (t/sub x (t/maximum-axis 1 true x)) e (t/exp sh) s (t/sum-axis 1 true e) p (t/div e s) lse (t/log s)
+        la (t/to-array lse) sa (t/to-array sh)
+        total (loop [i 0 acc 0.0]
+                (if (< i m)
+                    (recur (+ i 1) (+ acc (- (wide (. x seed) (array-get la i)) (wide (. x seed) (array-get sa (+ (* i c) (nth labels i)))))))
+                    acc))
+        k (/ 1.0 (double m))]
+    (record1 logits (t/full [] (lit (. x seed) (* total k)))
+             (fn (g) (t/mul (t/sub p (onehot m c labels p)) (t/scale (lit (. p seed) k) g))))))

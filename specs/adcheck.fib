@@ -1,0 +1,64 @@
+;; Gradient checking for fib.autodiff (docs/design/autodiff.md 6): the analytic gradient of a scalar function of f64 tensors against central
+;; finite differences, element by element. The step is H = 1e-5 (truncation error of a central difference is H^2 f''' / 6, about 1e-11 for the
+;; functions here; rounding error is about 1e-16 / H = 1e-11). A gradient element passes when |analytic - numeric| <= ATOL + RTOL |numeric|
+;; with ATOL = 1e-6 and RTOL = 1e-5, three to five orders of magnitude above the measured error and far below what a wrong formula gives.
+(ns adcheck (:use fib.core fib.seq fib.coll fib.rng) (:require [fib.tensor :as t] [fib.autodiff :as ad]))
+
+(def h-step: f64 1.0e-5)
+(def atol: f64 1.0e-6)
+(def rtol: f64 1.0e-5)
+
+;; ---- seeded data
+(defun unit (r: Rng) -> f64 (/ (double (shr (rng-next r) 11)) 9007199254740992.0))
+(defun between (r: Rng lo: f64 hi: f64) -> f64 (+ lo (* (- hi lo) (unit r))))
+(defun signed (r: Rng lo: f64 hi: f64) -> f64 (let [m (between r lo hi)] (if (< (unit r) 0.5) (- 0.0 m) m)))
+(defun dim (r: Rng) -> i64 (+ 1 (rng-below r 5)))
+
+;; a tensor of the shape with magnitudes in [lo, hi] and random signs (signed) or values in [lo, hi]
+(defun rand-tensor (r: Rng dims: (Vec i64) lo: f64 hi: f64 neg: bool) -> (t/Tensor f64)
+  (let [n (reduce * 1 dims)]
+    (t/from-vec dims (mapv (fn (i: i64) (if neg (signed r lo hi) (between r lo hi))) (range n)) 0.0)))
+
+;; ---- the check
+(defun with-element (p: (t/Tensor f64) j: i64 x: f64) -> (t/Tensor f64)
+  (t/from-vec (t/shape p) (assoc (t/to-vec p) j x) 0.0))
+
+(defun f-value (f: (fn ((Vec (ad/Tracked f64))) (ad/Tracked f64)) params: (Vec (t/Tensor f64))) -> f64
+  (t/item (. (ad/value-and-grad f params) value)))
+
+(defun numeric (f: (fn ((Vec (ad/Tracked f64))) (ad/Tracked f64)) params: (Vec (t/Tensor f64)) i: i64 j: i64) -> f64
+  (let [p (nth params i) x (t/flat-at p j)
+        up (f-value f (assoc params i (with-element p j (+ x h-step))))
+        dn (f-value f (assoc params i (with-element p j (- x h-step))))]
+    (/ (- up dn) (* 2.0 h-step))))
+
+;; the largest |analytic - numeric| / (ATOL + RTOL |numeric|) over every element of every parameter: below 1 passes
+(defun worst-ratio (f: (fn ((Vec (ad/Tracked f64))) (ad/Tracked f64)) params: (Vec (t/Tensor f64))) -> f64
+  (let [grads (ad/grad f params)]
+    (reduce max 0.0
+            (mapcat (fn (i: i64)
+                      (mapv (fn (j: i64)
+                              (let [a (t/flat-at (nth grads i) j) n (numeric f params i j)]
+                                (/ (abs (- a n)) (+ atol (* rtol (abs n))))))
+                            (range (t/size (nth params i)))))
+                    (range (count params))))))
+
+(defun gradcheck (f: (fn ((Vec (ad/Tracked f64))) (ad/Tracked f64)) params: (Vec (t/Tensor f64))) -> bool
+  (< (worst-ratio f params) 1.0))
+
+;; the largest absolute error itself (reported in the design document)
+(defun max-abs-error (f: (fn ((Vec (ad/Tracked f64))) (ad/Tracked f64)) params: (Vec (t/Tensor f64))) -> f64
+  (let [grads (ad/grad f params)]
+    (reduce max 0.0
+            (mapcat (fn (i: i64)
+                      (mapv (fn (j: i64) (abs (- (t/flat-at (nth grads i) j) (numeric f params i j))))
+                            (range (t/size (nth params i)))))
+                    (range (count params))))))
+
+;; loss = sum(out * w) with fixed random weights w of the output's shape: every output element has its own weight, so a gradient put
+;; in the wrong place or scaled wrongly changes the loss derivative
+(defun wsum (out: (ad/Tracked f64) w: (t/Tensor f64)) -> (ad/Tracked f64)
+  (ad/sum (ad/mul out (ad/const-like out w))))
+
+(defun weights-for (r: Rng out: (ad/Tracked f64)) -> (t/Tensor f64)
+  (rand-tensor r (t/shape (ad/value out)) 0.3 1.7 true))

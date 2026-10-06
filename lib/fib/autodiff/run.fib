@@ -1,0 +1,77 @@
+;; fib.autodiff.run: the backward pass and the user entry points `value-and-grad`, `grad`, `backward`.
+;;
+;; Moved and retained. The pass pops each TapeEntry off the tape (moved out of the tape's vector, so the tape never holds it again), empties
+;; the gradient slot of the entry's output (the gradient is moved to the closure's argument), calls the closure and drops the entry: the
+;; tensors the op saved are released at the end of that iteration unless something else still holds them (the forward values the caller
+;; kept, or the parameters). A gradient is moved into its slot when the slot is empty, and added (a fresh tensor, the old one released)
+;; when a tensor is used twice. Nothing is retained after the pass but the gradients of the leaves.
+(ns fib.autodiff.run
+  (:use fib.core fib.seq fib.coll fib.autodiff.tape)
+  (:require [fib.tensor :as t]))
+
+(defun pop-entry (tp: (Tape a)) -> (Option (TapeEntry a))
+  (match @(. tp entries)
+    ((Link e rest) (do (set! (. tp entries) rest) (some e)))
+    (End nil)))
+
+;; add g into the slot of `id`: stored when empty, summed with the old gradient otherwise (a tensor used twice)
+(defun accumulate (gs: (Vec (Option (t/Tensor a))) id: i64 g: (t/Tensor a)) -> (Vec (Option (t/Tensor a)))
+  (match (nth gs id)
+    (nil (assoc gs id (some g)))
+    ((some old) (assoc gs id (some (t/add old g))))))
+
+(defun spread (gs: (Vec (Option (t/Tensor a))) ins: (Vec i64) grads: (Vec (t/Tensor a))) -> (Vec (Option (t/Tensor a)))
+  (loop [gs gs i 0]
+    (if (< i (count ins))
+        (recur (accumulate gs (nth ins i) (nth grads i)) (+ i 1))
+        gs)))
+
+;; one step: run the entry whose output has a gradient, skip one that has none (a branch the loss does not read)
+(defun step (gs: (Vec (Option (t/Tensor a))) e: (TapeEntry a)) -> (Vec (Option (t/Tensor a)))
+  (match (nth gs (. e out))
+    (nil gs)
+    ((some g) (let [gs1 (assoc gs (. e out) nil)] (spread gs1 (. e ins) ((. e back) g))))))
+
+(defun run-tape (tp: (Tape a) gs0: (Vec (Option (t/Tensor a)))) -> (Vec (Option (t/Tensor a)))
+  (loop [gs gs0]
+    (match (pop-entry tp)
+      (nil gs)
+      ((some e) (recur (step gs e))))))
+
+;; Gradients of `out` (one element) with respect to every id: a vector indexed by id, None where nothing flowed.
+(defun backward (out: (Tracked a)) -> (Vec (Option (t/Tensor a)))
+  (let [tp (. out tape) n @(. tp next)
+        v (. out val)
+        _ (if (= (t/size v) 1) 0 (trap "backward: the output must have one element"))
+        seed (t/full (t/shape v) (one (. v seed)))
+        gs0 (vec (repeat n (nil-grad v)))]
+    (if (>= (. out id) 0)
+        (run-tape tp (accumulate gs0 (. out id) seed))
+        gs0)))
+
+(defun nil-grad (v: (t/Tensor a)) -> (Option (t/Tensor a)) nil)
+
+;; the gradient of leaf i as a dense tensor (zeros when the loss does not read it)
+(defun leaf-grad (gs: (Vec (Option (t/Tensor a))) i: i64 p: (t/Tensor a)) -> (t/Tensor a)
+  (match (nth gs i)
+    ((some g) (t/contiguous g))
+    (nil (t/full (t/shape p) (zero (. p seed))))))
+
+(defun run-grads (f: (fn ((Vec (Tracked a))) (Tracked a)) :borrow params: (Vec (t/Tensor a))) -> (ValueGrad a)
+  (let [tp (new-tape)
+        leaves (mapv (fn (p) (leaf tp p)) params)
+        out (f leaves)
+        gs (backward out)]
+    (ValueGrad (. out val) (vec (map-indexed (fn (i p) (leaf-grad gs i p)) params)))))
+
+(defn value-and-grad
+  ([f: (fn ((Vec (Tracked a))) (Tracked a))] -> (fn ((Vec (t/Tensor a))) (ValueGrad a))
+   (fn (params) (run-grads f params)))
+  ([f: (fn ((Vec (Tracked a))) (Tracked a)) params: (Vec (t/Tensor a))] -> (ValueGrad a)
+   (run-grads f params)))
+
+(defn grad
+  ([f: (fn ((Vec (Tracked a))) (Tracked a))] -> (fn ((Vec (t/Tensor a))) (Vec (t/Tensor a)))
+   (fn (params) (. (run-grads f params) grads)))
+  ([f: (fn ((Vec (Tracked a))) (Tracked a)) params: (Vec (t/Tensor a))] -> (Vec (t/Tensor a))
+   (. (run-grads f params) grads)))

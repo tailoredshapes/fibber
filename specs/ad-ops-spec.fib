@@ -1,0 +1,84 @@
+;; Gradient checks of every fib.autodiff op against central finite differences in f64 (docs/design/autodiff.md 6; tolerances in adcheck.fib).
+;; Each property draws a seed, builds random shapes and data from it (SplitMix64: the same data on every run) and fails if any element of any
+;; gradient is off. `fibc test specs --only ad-` runs these; scripts/mutant-autodiff.sh plants faults in lib/fib/autodiff and needs each to fail.
+(ns main (:use fib.core fib.seq fib.coll fib.rng fib.test.core fib.test.gen fib.test.run adcheck)
+  (:require [fib.tensor :as t] [fib.autodiff :as ad]))
+
+(defun seeds () -> (Gen i64) (gen-i64-between 1 1000000000))
+
+;; ---- binary ops over every broadcast pattern
+(defun bin-shapes (m: i64 n: i64 mode: i64) -> (Vec (Vec i64))
+  (cond (= mode 0) [[m n] [m n]]
+        (= mode 1) [[m n] [n]]
+        (= mode 2) [[m n] [m 1]]
+        (= mode 3) [[m n] []]
+        (= mode 4) [[1 n] [m 1]]
+        (= mode 5) [[n] [m n]]
+        :else [[] [m n]]))
+
+(defun check-binary (s: i64 lo: f64 hi: f64 op: (fn ((ad/Tracked f64) (ad/Tracked f64)) (ad/Tracked f64))) -> bool
+  (let [r (rng-new s) m (dim r) n (dim r) sh (bin-shapes m n (rng-below r 7))
+        a (rand-tensor r (nth sh 0) 0.3 1.5 true) b (rand-tensor r (nth sh 1) lo hi true)
+        f (fn (ps: (Vec (ad/Tracked f64)))
+            (let [out (op (nth ps 0) (nth ps 1))] (wsum out (weights-for (rng-new (+ s 7)) out))))]
+    (gradcheck f [a b])))
+
+(defun check-unary (s: i64 lo: f64 hi: f64 neg: bool op: (fn ((ad/Tracked f64)) (ad/Tracked f64))) -> bool
+  (let [r (rng-new s) m (dim r) n (dim r) x (rand-tensor r [m n] lo hi neg)
+        f (fn (ps: (Vec (ad/Tracked f64)))
+            (let [out (op (nth ps 0))] (wsum out (weights-for (rng-new (+ s 7)) out))))]
+    (gradcheck f [x])))
+
+(defun check-shaped (s: i64 build: (fn (i64 i64 Rng) (Vec (t/Tensor f64)))
+                     op: (fn ((Vec (ad/Tracked f64))) (ad/Tracked f64))) -> bool
+  (let [r (rng-new s) m (dim r) n (dim r) ps (build m n r)
+        f (fn (xs: (Vec (ad/Tracked f64)))
+            (let [out (op xs)] (wsum out (weights-for (rng-new (+ s 7)) out))))]
+    (gradcheck f ps)))
+
+(defspecs specs
+  (feature "ad-binary"
+    (prop "ad-add-gradient-matches-finite-differences-over-every-broadcast" [s (seeds)]
+      (check-binary s 0.3 1.5 (fn (a: (ad/Tracked f64) b: (ad/Tracked f64)) (ad/add a b))))
+    (prop "ad-sub-gradient-matches-finite-differences-over-every-broadcast" [s (seeds)]
+      (check-binary s 0.3 1.5 (fn (a: (ad/Tracked f64) b: (ad/Tracked f64)) (ad/sub a b))))
+    (prop "ad-mul-gradient-matches-finite-differences-over-every-broadcast" [s (seeds)]
+      (check-binary s 0.3 1.5 (fn (a: (ad/Tracked f64) b: (ad/Tracked f64)) (ad/mul a b))))
+    (prop "ad-div-gradient-matches-finite-differences-over-every-broadcast" [s (seeds)]
+      (check-binary s 0.5 2.0 (fn (a: (ad/Tracked f64) b: (ad/Tracked f64)) (ad/div a b)))))
+  (feature "ad-unary"
+    (prop "ad-neg-gradient" [s (seeds)] (check-unary s 0.3 1.5 true (fn (a: (ad/Tracked f64)) (ad/neg a))))
+    (prop "ad-scale-gradient" [s (seeds)] (check-unary s 0.3 1.5 true (fn (a: (ad/Tracked f64)) (ad/scale 2.5 a))))
+    (prop "ad-exp-gradient" [s (seeds)] (check-unary s 0.1 2.0 true (fn (a: (ad/Tracked f64)) (ad/exp a))))
+    (prop "ad-log-gradient" [s (seeds)] (check-unary s 0.2 3.0 false (fn (a: (ad/Tracked f64)) (ad/log a))))
+    (prop "ad-tanh-gradient" [s (seeds)] (check-unary s 0.1 2.0 true (fn (a: (ad/Tracked f64)) (ad/tanh a))))
+    (prop "ad-sigmoid-gradient" [s (seeds)] (check-unary s 0.1 3.0 true (fn (a: (ad/Tracked f64)) (ad/sigmoid a))))
+    (prop "ad-relu-gradient-away-from-the-kink" [s (seeds)] (check-unary s 0.1 2.0 true (fn (a: (ad/Tracked f64)) (ad/relu a)))))
+  (feature "ad-reduce-and-views"
+    (prop "ad-sum-gradient" [s (seeds)] (check-unary s 0.3 1.5 true (fn (a: (ad/Tracked f64)) (ad/sum a))))
+    (prop "ad-mean-gradient" [s (seeds)] (check-unary s 0.3 1.5 true (fn (a: (ad/Tracked f64)) (ad/mean a))))
+    (prop "ad-sum-axis-gradient-with-and-without-keepdims" [s (seeds)]
+      (check-unary s 0.3 1.5 true (fn (a: (ad/Tracked f64)) (ad/sum-axis (rem s 2) (= (rem s 3) 0) a))))
+    (prop "ad-reshape-gradient" [s (seeds)]
+      (check-unary s 0.3 1.5 true (fn (a: (ad/Tracked f64)) (ad/reshape [(t/size (ad/value a))] a))))
+    (prop "ad-transpose-gradient" [s (seeds)] (check-unary s 0.3 1.5 true (fn (a: (ad/Tracked f64)) (ad/transpose a))))
+    (prop "ad-broadcast-to-gradient-reduces-over-the-stretched-axes" [s (seeds)]
+      (check-shaped s (fn (m: i64 n: i64 r: Rng) [(rand-tensor r [1 n] 0.3 1.5 true)])
+                    (fn (xs: (Vec (ad/Tracked f64))) (ad/broadcast-to [3 2 (nth (t/shape (ad/value (nth xs 0))) 1)] (nth xs 0))))))
+  (feature "ad-matmul-and-layers"
+    (prop "ad-matmul-gradient" [s (seeds)]
+      (check-shaped s (fn (m: i64 n: i64 r: Rng) (let [k (dim r)] [(rand-tensor r [m k] 0.3 1.5 true) (rand-tensor r [k n] 0.3 1.5 true)]))
+                    (fn (xs: (Vec (ad/Tracked f64))) (ad/matmul (nth xs 0) (nth xs 1)))))
+    (prop "ad-dense-gradient-for-every-activation" [s (seeds)]
+      (check-shaped s (fn (m: i64 n: i64 r: Rng) (let [k (dim r)] [(rand-tensor r [m k] 0.3 1.5 true) (rand-tensor r [k n] 0.3 1.0 true) (rand-tensor r [n] 0.1 1.0 true)]))
+                    (fn (xs: (Vec (ad/Tracked f64)))
+                      (ad/dense (nth xs 0) (nth xs 1) (nth xs 2) (nth [:identity :relu :tanh :sigmoid :silu :gelu] (rem s 6))))))
+    (prop "ad-softmax-gradient" [s (seeds)]
+      (check-shaped s (fn (m: i64 n: i64 r: Rng) [(rand-tensor r [m n] 0.3 2.0 true)])
+                    (fn (xs: (Vec (ad/Tracked f64))) (ad/softmax (nth xs 0)))))
+    (prop "ad-softmax-cross-entropy-gradient" [s (seeds)]
+      (let [r (rng-new s) m (dim r) n (+ 1 (dim r)) labels (mapv (fn (i: i64) (rng-below r n)) (range m))
+            x (rand-tensor r [m n] 0.3 2.0 true)]
+        (gradcheck (fn (xs: (Vec (ad/Tracked f64))) (ad/softmax-cross-entropy (nth xs 0) labels)) [x])))))
+
+(defun main () -> i64 (run-main (specs)))

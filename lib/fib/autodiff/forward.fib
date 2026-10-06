@@ -1,0 +1,37 @@
+;; fib.autodiff.forward: forward mode, Jacobian-vector products (docs/design/autodiff.md 2.4). A Dual carries a value and its tangent, both whole tensors, so
+;; every tangent op is the same fib.tensor kernel as the value op (the vector units and the fused dense layer are reused, nothing is scalarised) and one
+;; JVP costs a small multiple of the forward pass with no tape and no saved activations. The elementwise derivative of an activation is the one the
+;; backward pass uses (fib.autodiff.nn/act-grad).
+(ns fib.autodiff.forward
+  (:use fib.core fib.seq fib.coll fib.autodiff.real fib.autodiff.nn fib.tensor.kernels)
+  (:require [fib.tensor :as t]))
+
+(defstruct (Dual a) (p: (t/Tensor a) d: (t/Tensor a)))
+
+(defun dual (p: (t/Tensor a) d: (t/Tensor a)) -> (Dual a) (Dual p d))
+(defun constant-dual (p: (t/Tensor a)) -> (Dual a) (Dual p (t/full (t/shape p) (zero (. p seed)))))
+
+(defun dadd (a: (Dual a) b: (Dual a)) -> (Dual a) (Dual (t/add (. a p) (. b p)) (t/add (. a d) (. b d))))
+(defun dsub (a: (Dual a) b: (Dual a)) -> (Dual a) (Dual (t/sub (. a p) (. b p)) (t/sub (. a d) (. b d))))
+(defun dmul (a: (Dual a) b: (Dual a)) -> (Dual a)
+  (Dual (t/mul (. a p) (. b p)) (t/add (t/mul (. a d) (. b p)) (t/mul (. a p) (. b d)))))
+(defun dtanh (a: (Dual a)) -> (Dual a)
+  (let [y (t/tanh (. a p))] (Dual y (t/mul (. a d) (t/sub (scalar y 1.0) (t/mul y y))))))
+(defun dexp (a: (Dual a)) -> (Dual a) (let [y (t/exp (. a p))] (Dual y (t/mul (. a d) y))))
+(defun dmatmul (a: (Dual a) b: (Dual a)) -> (Dual a)
+  (Dual (t/mmul (. a p) (. b p)) (t/add (t/mmul (. a d) (. b p)) (t/mmul (. a p) (. b d)))))
+
+;; act(x W + b): the tangent of the pre-activation is dx W + x dW + db, then the activation's elementwise derivative
+(defun ddense (x: (Dual a) w: (Dual a) b: (Dual a) act: keyword) -> (Dual a)
+  (let [yz (dense-forward (. x p) (. w p) (. b p) act) y (nth yz 0) z (nth yz 1)
+        dz (t/add (t/add (t/mmul (. x d) (. w p)) (t/mmul (. x p) (. w d))) (. b d))]
+    (Dual y (act-grad act dz y z))))
+
+(defun dsum (a: (Dual a)) -> (Dual a) (Dual (t/full [] (total (. (. a p) seed) (. a p))) (t/full [] (total (. (. a d) seed) (. a d)))))
+(defun dmean (a: (Dual a)) -> (Dual a)
+  (let [k (lit (. (. a p) seed) (/ 1.0 (double (t/size (. a p)))))]
+    (Dual (t/scale k (t/full [] (total (. (. a p) seed) (. a p)))) (t/scale k (t/full [] (total (. (. a d) seed) (. a d)))))))
+
+;; the value and the directional derivative of f at xs along vs
+(defun jvp (f: (fn ((Vec (Dual a))) (Dual a)) xs: (Vec (t/Tensor a)) vs: (Vec (t/Tensor a))) -> (Dual a)
+  (f (vec (map-indexed (fn (i x) (Dual x (nth vs i))) xs))))
