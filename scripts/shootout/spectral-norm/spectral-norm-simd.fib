@@ -1,36 +1,35 @@
-;; spectral-norm, SIMD version (SIMD wave 4, P5): f64x4 over four rows at once; same output as spectral-norm.fib.
+;; spectral-norm, SIMD version (SIMD wave 4, P5; lane-generic, the AVX-512 wave): f64xn over L rows at once (L = (native-lanes f64): 4 on AVX2, 8 at 512 bits); same output as spectral-norm.fib.
 ;; (scalar header follows) spectral-norm: the Benchmarks Game algorithm. Eigenvalue estimate of the infinite matrix
 ;; A(i,j) = 1 / ((i+j)(i+j+1)/2 + i + 1) by 10 rounds of the power method on AtA, printed as %.9f.
 ;; Vectors are `(Array f64)` read with array-get; each product builds its result in a `(Cell (Array f64))` written
 ;; in place by array-set! (safe: no unsafe, no raw pointers). spectral-norm-vec.fib is the same with `(Vec f64)`
 ;; (nth + assoc), about 5x slower: see README.md.
 (ns main (:use fib.simd))
-(def LANES: i64 4)
+(defun lanes () -> i64 (native-lanes f64))
 
 ;; Rows i0 .. i0+3 of A v (or of At v) at once: lane k is row i0+k. Every lane sums over j in order, adding
 ;; (1/den) * v[j] to its accumulator exactly as the scalar loop does, so the 9 printed digits are the scalar's by
 ;; construction, with no reduction across lanes. i+j and the denominator are integers below 2^53, exact in f64.
 ;; transposed: A(i,j) has den (i+j)(i+j+1)/2 + i + 1, At(i,j) = A(j,i) has + j + 1.
-(defun row-block (n: i64 v: (Array f64) iv: f64x4 transposed: bool) -> f64x4
-  (loop [j 0 acc (splat f64x4 0.0)]
+(defun row-block (n: i64 v: (Array f64) iv: f64xn transposed: bool) -> f64xn
+  (loop [j 0 acc (splat f64xn 0.0)]
     (if (< j n)
-      (let [fj (splat f64x4 (double j))
+      (let [fj (splat f64xn (double j))
             ij (+ iv fj)
             tri (/ (* ij (+ ij 1.0)) 2.0)
             den (+ (+ tri (if transposed fj iv)) 1.0)]
-        (recur (+ j 1) (+ acc (* (/ 1.0 den) (splat f64x4 (array-get v j))))))
+        (recur (+ j 1) (+ acc (* (/ 1.0 den) (splat f64xn (array-get v j))))))
       acc)))
 
-;; The product, n + 3 long (the last block's lanes past n are not used).
+;; The product, n + L - 1 long (the last block's lanes past n are not used).
 (defun mul (n: i64 v: (Array f64) transposed: bool) -> (Array f64)
-  (let [o (cell (array (+ n LANES) 0.0))]
+  (let [o (cell (array (+ n (lanes)) 0.0))]
     (do (loop [i 0]
           (if (< i n)
-            (let [iv (+ (splat f64x4 (double i)) <<0.0 1.0 2.0 3.0>>)
+            (let [iv (loop [k 0 x (splat f64xn (double i))] (if (< k (lanes)) (recur (+ k 1) (with-lane x k (double (+ i k)))) x))
                   r (row-block n v iv transposed)]
-              (do (array-set! &o i (lane r 0)) (array-set! &o (+ i 1) (lane r 1))
-                  (array-set! &o (+ i 2) (lane r 2)) (array-set! &o (+ i 3) (lane r 3))
-                  (recur (+ i LANES))))
+              (do (loop [k 0] (if (< k (lanes)) (do (array-set! &o (+ i k) (lane r k)) (recur (+ k 1))) 0))
+                  (recur (+ i (lanes)))))
             nil))
         @o)))
 (defun mul-atav (n: i64 v: (Array f64)) -> (Array f64)

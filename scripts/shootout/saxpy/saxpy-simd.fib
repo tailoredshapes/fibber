@@ -1,9 +1,16 @@
-;; saxpy, SIMD version (SIMD wave 4, P5): the arrays are (Array f64x4); y = 0.5*x + y one vector at a time, four vectors
-;; per trip. Results are exact (see saxpy.fib). N must be a multiple of 16. No vector load/store from an (Array f64) yet,
+;; saxpy, SIMD version (SIMD wave 4, P5; lane-generic, the AVX-512 wave): the arrays are (Array f64xn), L = (native-lanes f64) lanes (4 on
+;; AVX2, 8 at 512 bits); y = 0.5*x + y one vector at a time, four vectors per trip. Results are exact (see saxpy.fib). N must be a multiple of 4 L. No vector load/store from an (Array f64) yet,
 ;; so the data lives as vectors from the start (filled with a lane literal); `axpy` is the loop being measured.
 (ns main (:use fib.simd) (:require [fib.fmt :as fmt]))
 
-(defun axpy (&y: (Array f64x4) x: (Array f64x4) nv: i64) -> i64
+(defun lanes () -> i64 (native-lanes f64))
+
+;; the vector of lanes i0 .. i0+L-1 of the pattern rem i m
+(defun fill (i0: i64 m: i64) -> f64xn
+  (loop [j 0 v (splat f64xn 0.0)]
+    (if (< j (lanes)) (recur (+ j 1) (with-lane v j (double (rem (+ i0 j) m)))) v)))
+
+(defun axpy (&y: (Array f64xn) x: (Array f64xn) nv: i64) -> i64
   (loop [i 0] (if (< i nv)
     (do (array-set! &y i (+ (* 0.5 (array-get x i)) (array-get @y i)))
         (array-set! &y (+ i 1) (+ (* 0.5 (array-get x (+ i 1))) (array-get @y (+ i 1))))
@@ -12,20 +19,19 @@
         (recur (+ i 4)))
     0)))
 
-(defun total (y: (Array f64x4) nv: i64) -> f64
-  (loop [i 0 s (splat f64x4 0.0)] (if (< i nv) (recur (+ i 1) (+ s (array-get y i))) (hsum s))))
+(defun total (y: (Array f64xn) nv: i64) -> f64
+  (loop [i 0 s (splat f64xn 0.0)] (if (< i nv) (recur (+ i 1) (+ s (array-get y i))) (hsum s))))
 
 (defun main () -> i64
   (let [n (unwrap (parse-long (nth (args) 0)))
         reps (if (> (count (args)) 1) (unwrap (parse-long (nth (args) 1))) 1)
-        nv (quot n 4)
-        x (cell (array nv (splat f64x4 0.0)))
-        y (cell (array nv (splat f64x4 0.0)))]
+        nv (quot n (lanes))
+        x (cell (array nv (splat f64xn 0.0)))
+        y (cell (array nv (splat f64xn 0.0)))]
     (do (loop [k 0] (if (< k nv)
-          (let [i (* k 4)]
-            (do (array-set! &x k <<(double (rem i 7)) (double (rem (+ i 1) 7)) (double (rem (+ i 2) 7)) (double (rem (+ i 3) 7))>>)
-                (array-set! &y k <<(double (rem i 5)) (double (rem (+ i 1) 5)) (double (rem (+ i 2) 5)) (double (rem (+ i 3) 5))>>)
-                (recur (+ k 1))))
+          (do (array-set! &x k (fill (* k (lanes)) 7))
+              (array-set! &y k (fill (* k (lanes)) 5))
+              (recur (+ k 1)))
           0))
         (loop [r 0] (if (< r reps) (do (axpy &y @x nv) (recur (+ r 1))) 0))
         (println (fmt/format-f64 (total @y nv) 1))

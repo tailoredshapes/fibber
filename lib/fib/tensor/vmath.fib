@@ -17,89 +17,96 @@
 (defun inf :private () -> f64 (bits->f64 9218868437227405312))
 
 ;; 2^e for e in [-1022, 1023], by building the exponent field and reinterpreting it as the double (no lane leaves the vector register)
-(defun pow2 :private (e: i64x4) -> f64x4
-  (let ((b: i64x4 (shl (unchecked-add e (splat i64x4 1023)) 52)))
+(defun pow2 :private (e: (Simd i64 n)) -> (Simd f64 n)
+  (let ((b: (Simd i64 n) (shl (unchecked-add e (splat (Simd i64 n) 1023)) 52)))
     (simd/bitcast b)))
 
 ;; exp(x) = 2^k * exp(r), k = round(x log2 e), r = x - k ln2 (two fused steps), exp(r) a degree-13 Taylor polynomial on |r| <= ln2/2.
 ;; 2^k is applied as 2^(k -+ 1) and a factor 2 or 1/2 on the polynomial so that k = 1024 and k = -1022 stay representable.
-(defun exp4 :private (x: f64x4) -> f64x4
-  (let ((xc (simd/min (simd/max x (splat f64x4 -708.4)) (splat f64x4 709.8)))
-        (kf (simd/round-even (* xc (splat f64x4 1.4426950408889634))))
-        (r1 (simd/muladd kf (splat f64x4 (neg 0.693147180559663)) xc))
-        (r (simd/muladd kf (splat f64x4 (neg 2.8235290563031577e-13)) r1))
-        (p (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (splat f64x4 1.6059043836821613e-10) r (splat f64x4 2.08767569878681e-09)) r (splat f64x4 2.505210838544172e-08)) r (splat f64x4 2.755731922398589e-07)) r (splat f64x4 2.7557319223985893e-06)) r (splat f64x4 2.48015873015873e-05)) r (splat f64x4 0.0001984126984126984)) r (splat f64x4 0.001388888888888889)) r (splat f64x4 0.008333333333333333)) r (splat f64x4 0.041666666666666664)) r (splat f64x4 0.16666666666666666)) r (splat f64x4 0.5)) r (splat f64x4 1.0)) r (splat f64x4 1.0)))
-        (ki: i64x4 (simd/convert kf))
-        (pos (simd/gt kf (splat f64x4 0.0)))
-        (m (simd/blend pos (splat i64x4 -1) (splat i64x4 1)))
-        (c (simd/blend pos (splat f64x4 2.0) (splat f64x4 0.5)))
+(defun exp-lanes :private (x: (Simd f64 n)) -> (Simd f64 n)
+  (let ((xc (simd/min (simd/max x (splat (Simd f64 n) -708.4)) (splat (Simd f64 n) 709.8)))
+        (kf (simd/round-even (* xc (splat (Simd f64 n) 1.4426950408889634))))
+        (r1 (simd/muladd kf (splat (Simd f64 n) (neg 0.693147180559663)) xc))
+        (r (simd/muladd kf (splat (Simd f64 n) (neg 2.8235290563031577e-13)) r1))
+        (p (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (splat (Simd f64 n) 1.6059043836821613e-10) r (splat (Simd f64 n) 2.08767569878681e-09)) r (splat (Simd f64 n) 2.505210838544172e-08)) r (splat (Simd f64 n) 2.755731922398589e-07)) r (splat (Simd f64 n) 2.7557319223985893e-06)) r (splat (Simd f64 n) 2.48015873015873e-05)) r (splat (Simd f64 n) 0.0001984126984126984)) r (splat (Simd f64 n) 0.001388888888888889)) r (splat (Simd f64 n) 0.008333333333333333)) r (splat (Simd f64 n) 0.041666666666666664)) r (splat (Simd f64 n) 0.16666666666666666)) r (splat (Simd f64 n) 0.5)) r (splat (Simd f64 n) 1.0)) r (splat (Simd f64 n) 1.0)))
+        (ki: (Simd i64 n) (simd/convert kf))
+        (pos (simd/gt kf (splat (Simd f64 n) 0.0)))
+        (m (simd/blend pos (splat (Simd i64 n) -1) (splat (Simd i64 n) 1)))
+        (c (simd/blend pos (splat (Simd f64 n) 2.0) (splat (Simd f64 n) 0.5)))
         (y (* (* p c) (pow2 (unchecked-add ki m)))))
-    (simd/blend (simd/lt x (splat f64x4 -708.396)) (splat f64x4 0.0)
-                (simd/blend (simd/gt x (splat f64x4 709.782712893384)) (splat f64x4 (inf)) y))))
+    (simd/blend (simd/lt x (splat (Simd f64 n) -708.396)) (splat (Simd f64 n) 0.0)
+                (simd/blend (simd/gt x (splat (Simd f64 n) 709.782712893384)) (splat (Simd f64 n) (inf)) y))))
 
 ;; log(x) = e ln2 + log(m), x = m 2^e with m in [sqrt(1/2), sqrt 2) (integer bit trick on the exponent), log m = 2 s Q(s^2), s = (m-1)/(m+1).
 ;; Subnormal inputs are scaled by 2^54 first.
-(defun log4 :private (x: f64x4) -> f64x4
-  (let ((small (simd/lt x (splat f64x4 2.2250738585072014e-308)))
-        (xs (simd/blend small (* x (splat f64x4 18014398509481984.0)) x))
-        (adj (simd/blend small (splat f64x4 54.0) (splat f64x4 0.0)))
-        (hx: i64x4 (simd/bitcast xs))
-        (tmp (unchecked-subtract hx (splat i64x4 4604544271217802189)))
+(defun log-lanes :private (x: (Simd f64 n)) -> (Simd f64 n)
+  (let ((small (simd/lt x (splat (Simd f64 n) 2.2250738585072014e-308)))
+        (xs (simd/blend small (* x (splat (Simd f64 n) 18014398509481984.0)) x))
+        (adj (simd/blend small (splat (Simd f64 n) 54.0) (splat (Simd f64 n) 0.0)))
+        (hx: (Simd i64 n) (simd/bitcast xs))
+        (tmp (unchecked-subtract hx (splat (Simd i64 n) 4604544271217802189)))
         (ki (sar tmp 52))
-        (mb: i64x4 (unchecked-subtract hx (shl ki 52)))
-        (m: f64x4 (simd/bitcast mb))
-        (ef0: f64x4 (simd/convert ki))
+        (mb: (Simd i64 n) (unchecked-subtract hx (shl ki 52)))
+        (m: (Simd f64 n) (simd/bitcast mb))
+        (ef0: (Simd f64 n) (simd/convert ki))
         (ef (- ef0 adj))
-        (f (- m (splat f64x4 1.0)))
-        (s (fdiv f (+ m (splat f64x4 1.0))))
+        (f (- m (splat (Simd f64 n) 1.0)))
+        (s (fdiv f (+ m (splat (Simd f64 n) 1.0))))
         (z (* s s))
-        (q (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (splat f64x4 0.047619047619047616) z (splat f64x4 0.05263157894736842)) z (splat f64x4 0.058823529411764705)) z (splat f64x4 0.06666666666666667)) z (splat f64x4 0.07692307692307693)) z (splat f64x4 0.09090909090909091)) z (splat f64x4 0.1111111111111111)) z (splat f64x4 0.14285714285714285)) z (splat f64x4 0.2)) z (splat f64x4 0.3333333333333333)))
-        (s2 (* s (splat f64x4 2.0)))
+        (q (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (splat (Simd f64 n) 0.047619047619047616) z (splat (Simd f64 n) 0.05263157894736842)) z (splat (Simd f64 n) 0.058823529411764705)) z (splat (Simd f64 n) 0.06666666666666667)) z (splat (Simd f64 n) 0.07692307692307693)) z (splat (Simd f64 n) 0.09090909090909091)) z (splat (Simd f64 n) 0.1111111111111111)) z (splat (Simd f64 n) 0.14285714285714285)) z (splat (Simd f64 n) 0.2)) z (splat (Simd f64 n) 0.3333333333333333)))
+        (s2 (* s (splat (Simd f64 n) 2.0)))
         (logm (simd/muladd (* s2 z) q s2))
-        (y (simd/muladd ef (splat f64x4 0.693147180559663) (simd/muladd ef (splat f64x4 2.8235290563031577e-13) logm)))
-        (zero (splat f64x4 0.0)))
+        (y (simd/muladd ef (splat (Simd f64 n) 0.693147180559663) (simd/muladd ef (splat (Simd f64 n) 2.8235290563031577e-13) logm)))
+        (zero (splat (Simd f64 n) 0.0)))
     (simd/blend (simd/ne x x) x
-                (simd/blend (simd/eq x zero) (splat f64x4 (- 0.0 (inf)))
-                            (simd/blend (simd/lt x zero) (splat f64x4 (nan))
-                                        (simd/blend (simd/eq x (splat f64x4 (inf))) (splat f64x4 (inf)) y))))))
+                (simd/blend (simd/eq x zero) (splat (Simd f64 n) (- 0.0 (inf)))
+                            (simd/blend (simd/lt x zero) (splat (Simd f64 n) (nan))
+                                        (simd/blend (simd/eq x (splat (Simd f64 n) (inf))) (splat (Simd f64 n) (inf)) y))))))
 
 ;; tanh(x) = x + x z G(z), z = x^2, G a degree-13 fit of (tanh x - x)/x^3, for |x| < 0.55; else 1 - 2/(exp(2|x|) + 1) with the sign restored.
-(defun tanh4 :private (x: f64x4) -> f64x4
-  (let ((a (simd/abs x)) (zero (splat f64x4 0.0)) (one (splat f64x4 1.0))
+(defun tanh-lanes :private (x: (Simd f64 n)) -> (Simd f64 n)
+  (let ((a (simd/abs x)) (zero (splat (Simd f64 n) 0.0)) (one (splat (Simd f64 n) 1.0))
         (z (* x x))
-        (g (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (splat f64x4 1.1502191446949632e-06) z (splat f64x4 -5.273641022066474e-06)) z (splat f64x4 1.531458042362091e-05)) z (splat f64x4 -3.9068724399643e-05)) z (splat f64x4 9.686461378957666e-05)) z (splat f64x4 -0.0002391204040613736)) z (splat f64x4 0.0005900263819919156)) z (splat f64x4 -0.0014558342969834689)) z (splat f64x4 0.00359212803135852)) z (splat f64x4 -0.008863235529706255)) z (splat f64x4 0.021869488536150786)) z (splat f64x4 -0.053968253968253915)) z (splat f64x4 0.13333333333333333)) z (splat f64x4 -0.3333333333333333)))
+        (g (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (simd/muladd (splat (Simd f64 n) 1.1502191446949632e-06) z (splat (Simd f64 n) -5.273641022066474e-06)) z (splat (Simd f64 n) 1.531458042362091e-05)) z (splat (Simd f64 n) -3.9068724399643e-05)) z (splat (Simd f64 n) 9.686461378957666e-05)) z (splat (Simd f64 n) -0.0002391204040613736)) z (splat (Simd f64 n) 0.0005900263819919156)) z (splat (Simd f64 n) -0.0014558342969834689)) z (splat (Simd f64 n) 0.00359212803135852)) z (splat (Simd f64 n) -0.008863235529706255)) z (splat (Simd f64 n) 0.021869488536150786)) z (splat (Simd f64 n) -0.053968253968253915)) z (splat (Simd f64 n) 0.13333333333333333)) z (splat (Simd f64 n) -0.3333333333333333)))
         (small (simd/muladd (* x z) g x))
-        (t (exp4 (* a (splat f64x4 2.0))))
-        (th (- one (fdiv (splat f64x4 2.0) (+ t one))))
+        (t (exp-lanes (* a (splat (Simd f64 n) 2.0))))
+        (th (- one (fdiv (splat (Simd f64 n) 2.0) (+ t one))))
         (large (simd/blend (simd/lt x zero) (neg th) th)))
-    (simd/blend (simd/eq x zero) x (simd/blend (simd/lt a (splat f64x4 0.55)) small large))))
+    (simd/blend (simd/eq x zero) x (simd/blend (simd/lt a (splat (Simd f64 n) 0.55)) small large))))
 
-;; Activations (op 3 and up; `activation-code` names them). Built on exp4 and tanh4, so they are as accurate as those and as the f64 result
+;; Activations (op 3 and up; `activation-code` names them). Built on exp-lanes and tanh-lanes, so they are as accurate as those and as the f64 result
 ;; rounded to f32. relu keeps the `where (greater x 0) x 0` meaning: NaN and -0.0 give +0.0.
 ;;   sigmoid 1/(1+e^-x)   silu x*sigmoid(x)   gelu 0.5x(1+tanh(sqrt(2/pi)(x+0.044715x^3)))  (the tanh form, as GPT-2 and BERT use)
-(defun sigmoid4 :private (x: f64x4) -> f64x4
-  (let ((one (splat f64x4 1.0))) (fdiv one (+ one (exp4 (neg x))))))
+(defun sigmoid-lanes :private (x: (Simd f64 n)) -> (Simd f64 n)
+  (let ((one (splat (Simd f64 n) 1.0))) (fdiv one (+ one (exp-lanes (neg x))))))
 
-(defun gelu4 :private (x: f64x4) -> f64x4
-  (let ((inner (* (splat f64x4 0.7978845608028654) (simd/muladd (* (* x x) x) (splat f64x4 0.044715) x))))
-    (* (* (splat f64x4 0.5) x) (+ (splat f64x4 1.0) (tanh4 inner)))))
+(defun gelu-lanes :private (x: (Simd f64 n)) -> (Simd f64 n)
+  (let ((inner (* (splat (Simd f64 n) 0.7978845608028654) (simd/muladd (* (* x x) x) (splat (Simd f64 n) 0.044715) x))))
+    (* (* (splat (Simd f64 n) 0.5) x) (+ (splat (Simd f64 n) 1.0) (tanh-lanes inner)))))
 
-(defun apply4 :private (op: i64 x: f64x4) -> f64x4
-  (cond (= op 0) (exp4 x) (= op 1) (log4 x) (= op 2) (tanh4 x) (= op 3) (sigmoid4 x)
-        (= op 4) (* x (sigmoid4 x)) (= op 5) (gelu4 x)
-        (= op 6) (simd/blend (simd/gt x (splat f64x4 0.0)) x (splat f64x4 0.0))
+(defun apply-lanes :private (op: i64 x: (Simd f64 n)) -> (Simd f64 n)
+  (cond (= op 0) (exp-lanes x) (= op 1) (log-lanes x) (= op 2) (tanh-lanes x) (= op 3) (sigmoid-lanes x)
+        (= op 4) (* x (sigmoid-lanes x)) (= op 5) (gelu-lanes x)
+        (= op 6) (simd/blend (simd/gt x (splat (Simd f64 n) 0.0)) x (splat (Simd f64 n) 0.0))
         :else x))
 
 (defun activation-code (name: keyword) -> i64
   (cond (= name :tanh) 2 (= name :sigmoid) 3 (= name :silu) 4 (= name :gelu) 5 (= name :relu) 6 (= name :identity) 7
         :else (trap "tensor: unknown activation (:identity :relu :tanh :sigmoid :silu :gelu)")))
 
-;; One f32x8 through activation `op`: the GEMM epilogue's lane function. relu and identity stay in f32; the rest run as two f64x4 halves.
-(defun lift8 :private (op: i64 v: f32x8) -> f32x8
+;; One f32x8 through activation `op`: the GEMM epilogue's lane function and the f32 tensor kernels'. relu and identity stay in f32; the rest run in f64,
+;; as one f64x8 pass where the target's native width is 512 bits and as two f64x4 halves otherwise: the same lanes either way, so the same bits.
+(defun lift8-halves :private (op: i64 v: f32x8) -> f32x8
   (let ((lo: f32x4 (simd/shuffle v v <<0 1 2 3>>)) (hi: f32x4 (simd/shuffle v v <<4 5 6 7>>))
         (wl: f64x4 (simd/convert lo)) (wh: f64x4 (simd/convert hi))
-        (rl: f32x4 (simd/convert (apply4 op wl))) (rh: f32x4 (simd/convert (apply4 op wh))))
+        (rl: f32x4 (simd/convert (apply-lanes op wl))) (rh: f32x4 (simd/convert (apply-lanes op wh))))
     (simd/shuffle rl rh <<0 1 2 3 4 5 6 7>>)))
+
+(defun lift8-whole :private (op: i64 v: f32x8) -> f32x8
+  (let ((w: f64x8 (simd/convert v)) (r: f32x8 (simd/convert (apply-lanes op w)))) r))
+
+(defun lift8 :private (op: i64 v: f32x8) -> f32x8
+  (if (>= (native-lanes f64) 8) (lift8-whole op v) (lift8-halves op v)))
 
 (defun activate8 (op: i64 v: f32x8) -> f32x8
   (cond (= op 7) v
@@ -111,11 +118,11 @@
         (buf (cell (array (checked-size (shape d) 0.0) 0.0))))
     (do (loop ((i 0))
           (when (< i n)
-            (if (<= (+ i 4) n)
-                (let ((v: f64x4 (simd-load src (+ off i))))
-                  (do (simd-store! &buf i (apply4 op v)) (recur (+ i 4))))
-                (let ((v: f64x4 (simd-load-tail src (+ off i))))
-                  (simd-store-tail! &buf i (apply4 op v))))))
+            (if (<= (+ i (native-lanes f64)) n)
+                (let ((v: f64xn (simd-load src (+ off i))))
+                  (do (simd-store! &buf i (apply-lanes op v)) (recur (+ i (native-lanes f64)))))
+                (let ((v: f64xn (simd-load-tail src (+ off i))))
+                  (simd-store-tail! &buf i (apply-lanes op v))))))
         (from-array (shape d) @buf 0.0))))
 
 (defun run-f32 :private (op: i64 x: (Tensor f32)) -> (Tensor f32)
@@ -123,11 +130,11 @@
         (buf (cell (array (checked-size (shape d) 0.0f32) 0.0f32))))
     (do (loop ((i 0))
           (when (< i n)
-            (if (<= (+ i 4) n)
-                (let ((v: f32x4 (simd-load src (+ off i))) (w: f64x4 (simd/convert v)) (r: f32x4 (simd/convert (apply4 op w))))
-                  (do (simd-store! &buf i r) (recur (+ i 4))))
-                (let ((v: f32x4 (simd-load-tail src (+ off i))) (w: f64x4 (simd/convert v)) (r: f32x4 (simd/convert (apply4 op w))))
-                  (simd-store-tail! &buf i r)))))
+            (if (<= (+ i 8) n)
+                (let ((v: f32x8 (simd-load src (+ off i))))
+                  (do (simd-store! &buf i (lift8 op v)) (recur (+ i 8))))
+                (let ((v: f32x8 (simd-load-tail src (+ off i))))
+                  (simd-store-tail! &buf i (lift8 op v))))))
         (from-array (shape d) @buf 0.0f32))))
 
 (defprotocol Transcendental
@@ -150,31 +157,31 @@
 ;; with the population variance, from one pass of sums of (x - x0) and (x - x0)^2 (x0 the row's first element: the shift keeps the one-pass
 ;; variance from cancelling when the mean is large) and one pass that writes. Every read and write is bounds-checked.
 
-(defun expv-f64 :private (v: f64x4) -> f64x4 (exp4 v))
+(defun expv-f64 :private (v: f64xn) -> f64xn (exp-lanes v))
 
 (defun row-max-f64 :private (src: (Array f64) b: i64 n: i64) -> f64
-  (let ((end (- n (rem n 4)))
-        (v: f64x4 (loop ((i 0) (acc: f64x4 (splat f64x4 (array-get src b))))
-                    (if (< i end) (let ((x: f64x4 (simd-load src (+ b i)))) (recur (+ i 4) (simd/max acc x))) acc))))
+  (let ((end (- n (rem n (native-lanes f64))))
+        (v: f64xn (loop ((i 0) (acc: f64xn (splat f64xn (array-get src b))))
+                    (if (< i end) (let ((x: f64xn (simd-load src (+ b i)))) (recur (+ i (native-lanes f64)) (simd/max acc x))) acc))))
     (loop ((i end) (m (hmax v))) (if (< i n) (recur (+ i 1) (max m (array-get src (+ b i)))) m))))
 
 ;; out[ob..ob+n) = exp(src[sb..sb+n) - mx); returns the sum
 (defun row-exp-f64 :private (src: (Array f64) sb: i64 n: i64 mx: f64 &out: (Array f64) ob: i64) -> f64
-  (let ((end (- n (rem n 4))) (m (splat f64x4 mx))
-        (v: f64x4 (loop ((i 0) (acc: f64x4 (splat f64x4 0.0)))
+  (let ((end (- n (rem n (native-lanes f64)))) (m (splat f64xn mx))
+        (v: f64xn (loop ((i 0) (acc: f64xn (splat f64xn 0.0)))
                     (if (< i end)
-                        (let ((x: f64x4 (simd-load src (+ sb i))) (e: f64x4 (expv-f64 (- x m))))
-                          (do (simd-store! &out (+ ob i) e) (recur (+ i 4) (+ acc e))))
+                        (let ((x: f64xn (simd-load src (+ sb i))) (e: f64xn (expv-f64 (- x m))))
+                          (do (simd-store! &out (+ ob i) e) (recur (+ i (native-lanes f64)) (+ acc e))))
                         acc))))
     (loop ((i end) (acc (hsum v)))
       (if (< i n)
-          (let ((e (lane (expv-f64 (splat f64x4 (- (array-get src (+ sb i)) mx))) 0)))
+          (let ((e (lane (expv-f64 (splat f64xn (- (array-get src (+ sb i)) mx))) 0)))
             (do (array-set! &out (+ ob i) e) (recur (+ i 1) (+ acc e))))
           acc))))
 
 (defun row-divide-f64 :private (ob: i64 n: i64 d: f64 &out: (Array f64)) -> unit
-  (let ((end (- n (rem n 4))) (dv (splat f64x4 d)))
-    (do (loop ((i 0)) (when (< i end) (let ((e: f64x4 (simd-load @out (+ ob i)))) (do (simd-store! &out (+ ob i) (fdiv e dv)) (recur (+ i 4))))))
+  (let ((end (- n (rem n (native-lanes f64)))) (dv (splat f64xn d)))
+    (do (loop ((i 0)) (when (< i end) (let ((e: f64xn (simd-load @out (+ ob i)))) (do (simd-store! &out (+ ob i) (fdiv e dv)) (recur (+ i (native-lanes f64)))))))
         (loop ((i end)) (when (< i n) (do (array-set! &out (+ ob i) (fdiv (array-get @out (+ ob i)) d)) (recur (+ i 1))))))))
 
 (defun softmax-f64 :private (x: (Tensor f64)) -> (Tensor f64)
@@ -188,11 +195,11 @@
 
 ;; sum over src[sb..sb+n) of (x - c)^k, k = 1 or 2 (reassociated: 4 lanes, then a horizontal add and the tail)
 (defun row-sum-f64 :private (src: (Array f64) sb: i64 n: i64 c: f64 squared: bool) -> f64
-  (let ((end (- n (rem n 4))) (cv (splat f64x4 c))
-        (v: f64x4 (loop ((i 0) (acc: f64x4 (splat f64x4 0.0)))
+  (let ((end (- n (rem n (native-lanes f64)))) (cv (splat f64xn c))
+        (v: f64xn (loop ((i 0) (acc: f64xn (splat f64xn 0.0)))
                     (if (< i end)
-                        (let ((x: f64x4 (simd-load src (+ sb i))) (dx: f64x4 (- x cv)))
-                          (recur (+ i 4) (+ acc (if squared (* dx dx) dx))))
+                        (let ((x: f64xn (simd-load src (+ sb i))) (dx: f64xn (- x cv)))
+                          (recur (+ i (native-lanes f64)) (+ acc (if squared (* dx dx) dx))))
                         acc))))
     (loop ((i end) (acc (hsum v)))
       (if (< i n)
@@ -201,11 +208,11 @@
 
 ;; out[ob..) = (src - mu) * inv * gamma + beta, the order of operations of the composed layernorm
 (defun row-normalize-f64 :private (src: (Array f64) sb: i64 n: i64 mu: f64 inv: f64 gamma: (Array f64) beta: (Array f64) &out: (Array f64) ob: i64) -> unit
-  (let ((end (- n (rem n 4))) (m (splat f64x4 mu)) (iv (splat f64x4 inv)))
+  (let ((end (- n (rem n (native-lanes f64)))) (m (splat f64xn mu)) (iv (splat f64xn inv)))
     (do (loop ((i 0))
           (when (< i end)
-            (let ((x: f64x4 (simd-load src (+ sb i))) (g: f64x4 (simd-load gamma i)) (bt: f64x4 (simd-load beta i)))
-              (do (simd-store! &out (+ ob i) (+ (* (* (- x m) iv) g) bt)) (recur (+ i 4))))))
+            (let ((x: f64xn (simd-load src (+ sb i))) (g: f64xn (simd-load gamma i)) (bt: f64xn (simd-load beta i)))
+              (do (simd-store! &out (+ ob i) (+ (* (* (- x m) iv) g) bt)) (recur (+ i (native-lanes f64)))))))
         (loop ((i end))
           (when (< i n)
             (do (array-set! &out (+ ob i) (+ (* (* (- (array-get src (+ sb i)) mu) inv) (array-get gamma i)) (array-get beta i)))
@@ -221,7 +228,7 @@
             (let ((b (* r n)) (sb (+ off b))
                   (mu (fdiv (row-sum-f64 src sb n 0.0 false) (double n)))
                   (var (fdiv (row-sum-f64 src sb n mu true) (double n)))
-                  (inv (fdiv 1.0 (lane (simd/sqrt (splat f64x4 (+ var eps))) 0))))
+                  (inv (fdiv 1.0 (lane (simd/sqrt (splat f64xn (+ var eps))) 0))))
               (row-normalize-f64 src sb n mu inv (. g buffer) (. bt buffer) &buf b))))
         (from-array dims @buf 0.0))))
 

@@ -1,93 +1,128 @@
-;; Blocked f32 GEMM: fused multiply-add micro-kernel on packed panels (GotoBLAS/BLIS loop nest).
+;; Blocked f32 GEMM: fused multiply-add micro-kernel on packed panels (GotoBLAS/BLIS loop nest), one source for every vector width.
 ;;
-;; C = A*B for rank-two inputs of any strides. B is packed per (column block, inner block) into
-;; panels of 16 columns, A per (row block, inner block) into panels of 6 rows, both zero padded to
-;; whole panels, so the micro-kernel always runs a full 6x16 tile (twelve f32x8 accumulators, the
-;; sixteen ymm registers of AVX2 less two B vectors and one broadcast) with unchecked loads.
+;; C = A*B for rank-two inputs of any strides. B is packed per (column block, inner block) into panels of NR columns, A per
+;; (row block, inner block) into panels of 6 rows, both zero padded to whole panels, so the micro-kernel always runs a full 6xNR tile
+;; with unchecked loads. The width is the type of a witness vector `w: (Simd f32 n)` that every function takes: L = n lanes, and NR
+;; follows the register file. With L = 8 (AVX2, sixteen ymm) NR = 2L = 16: twelve accumulators, two B vectors and one broadcast make
+;; fifteen of sixteen. With L >= 16 (AVX-512, thirty-two zmm) NR = 4L, a 6x64 tile: 24 accumulators, four B vectors and one broadcast
+;; make 29 of 32 (BLIS's skx dgemm keeps 28 accumulators; this shape keeps A's panel at 6 rows, so the packing is the same at every
+;; width, and it has the fewest loads per fma of the shapes that fit: (6+4)/24 against (8+3)/24 for 8x24 and (12+2)/24 for 12x16).
+;; The inner block shrinks with the tile so a B panel (kc x NR) stays in L1: 128 for the wide tile, 512 for the narrow one.
+;; `multiply` takes the native width of the target (16 lanes where `native-lanes` says 512 bits, else 8, which a 128-bit NEON
+;; target legalises); `multiply-at` takes the witness, so a program can run any width on any target (the lanes are split into the
+;; registers the CPU has) and compare.
 ;; Pointers are in range by construction: `validate` proves every logical element of A and B is in
 ;; its array; packed buffers are sized from the loop bounds (roundup of the block to whole panels).
 ;; Every output element is one chain of fused multiply-adds over the inner index in increasing
-;; order, whatever the tile or block it falls in (a block continues the chain from C): the result
-;; equals `fma-reference` bit for bit. It differs from the ordered `mmul-scalar` (multiply, then add) in
+;; order, whatever the tile, block or width it falls in (a block continues the chain from C): the result
+;; equals `fma-reference` bit for bit at every width. It differs from the ordered `mmul-scalar` (multiply, then add) in
 ;; the last bits, because an fma rounds once.
 ;;
 ;; Epilogue (`multiply-with`): with an activation code >= 0 the last inner block finishes each output tile in place, right after the
-;; micro-kernel stored it (the tile is still in L1): C = act(C + bias), bias a row broadcast over the rows. Tiles are 6x16, so
-;; the bias is copied into a buffer zero padded to whole 16-column panels and every tile adds two full vectors of it. An edge tile is
-;; finished in the scratch tile, before the copy out, so the same code covers it and the padding is never written to C. Each output
-;; element gets the bias and the activation exactly once, whatever block or tile it falls in: the earlier inner blocks only accumulate.
-;; The product part is unchanged, so `multiply-with` equals `act(fma-reference + bias)`; code -1 is the plain product.
+;; micro-kernel stored it (the tile is still in L1): C = act(C + bias), bias a row broadcast over the rows. The bias is copied into a
+;; buffer zero padded to whole NR-column panels, and every tile adds it eight lanes at a time (`activate8` is the 8-lane lane function
+;; at every width). An edge tile is finished in the scratch tile, before the copy out, so the same code covers it and the padding is never
+;; written to C. Each output element gets the bias and the activation exactly once, whatever block or tile it falls in: the earlier
+;; inner blocks only accumulate. The product part is unchanged, so `multiply-with` equals `act(fma-reference + bias)`; code -1 is the plain product.
 (ns fib.tensor.gemm-fma-f32
   (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.memory fib.tensor.views fib.tensor.vmath))
 
 (defun mc :private () -> i64 96)   ; rows of A per block, a multiple of 6
-(defun kc :private () -> i64 512)  ; inner extent per block
-(defun nc :private () -> i64 1024) ; columns of B per block, a multiple of 16
+(defun nc :private () -> i64 1024) ; columns of B per block, a multiple of NR (16 or 64)
+(defun wide? :private (w: (Simd f32 n)) -> bool (>= (simd/lanes w) 16))
+(defun nr :private (w: (Simd f32 n)) -> i64 (* (simd/lanes w) (if (wide? w) 4 2)))  ; columns of a tile
+(defun kc :private (w: (Simd f32 n)) -> i64 (if (wide? w) 128 512))                 ; inner extent per block
 
 (defun ofs :private (p: ptr i: i64) -> ptr (unsafe (ptr+ p (unchecked-multiply 4 i))))
 (defun roundup :private (x: i64 q: i64) -> i64 (* q (quot (+ x (- q 1)) q)))
 (defun data :private (x: (Tensor f32)) -> ptr (ofs (unsafe (ptr+ (raw (. x buffer)) (array-header-size))) (array-get (. x meta) 0)))
 
-;; ---- micro-kernel: C[0..6)x[0..16) (row pitch ldc) = (load ? C : 0) + sum over p of ap[p*6+i] * bp[p*16+j]
-(defun kern6x16 :private (ap: ptr bp: ptr cp: ptr ldc: i64 kk: i64 load: bool) -> unit
-  (unsafe
-    (loop ((p 0)
-           (a00 (if load (load-f32x8 (ofs cp 0)) (splat f32x8 0.0f32)))
-           (a01 (if load (load-f32x8 (ofs cp 8)) (splat f32x8 0.0f32)))
-           (a10 (if load (load-f32x8 (ofs cp ldc)) (splat f32x8 0.0f32)))
-           (a11 (if load (load-f32x8 (ofs cp (unchecked-add ldc 8))) (splat f32x8 0.0f32)))
-           (a20 (if load (load-f32x8 (ofs cp (unchecked-multiply 2 ldc))) (splat f32x8 0.0f32)))
-           (a21 (if load (load-f32x8 (ofs cp (unchecked-add (unchecked-multiply 2 ldc) 8))) (splat f32x8 0.0f32)))
-           (a30 (if load (load-f32x8 (ofs cp (unchecked-multiply 3 ldc))) (splat f32x8 0.0f32)))
-           (a31 (if load (load-f32x8 (ofs cp (unchecked-add (unchecked-multiply 3 ldc) 8))) (splat f32x8 0.0f32)))
-           (a40 (if load (load-f32x8 (ofs cp (unchecked-multiply 4 ldc))) (splat f32x8 0.0f32)))
-           (a41 (if load (load-f32x8 (ofs cp (unchecked-add (unchecked-multiply 4 ldc) 8))) (splat f32x8 0.0f32)))
-           (a50 (if load (load-f32x8 (ofs cp (unchecked-multiply 5 ldc))) (splat f32x8 0.0f32)))
-           (a51 (if load (load-f32x8 (ofs cp (unchecked-add (unchecked-multiply 5 ldc) 8))) (splat f32x8 0.0f32))))
-      (if (< p kk)
-          (let ((b0 (load-f32x8 (ofs bp (unchecked-multiply 16 p))))
-                (b1 (load-f32x8 (ofs bp (unchecked-add (unchecked-multiply 16 p) 8))))
-                (ab (ofs ap (unchecked-multiply 6 p)))
-                (x0 (splat f32x8 (load-f32 ab)))
-                (x1 (splat f32x8 (load-f32 (ofs ab 1))))
-                (x2 (splat f32x8 (load-f32 (ofs ab 2))))
-                (x3 (splat f32x8 (load-f32 (ofs ab 3))))
-                (x4 (splat f32x8 (load-f32 (ofs ab 4))))
-                (x5 (splat f32x8 (load-f32 (ofs ab 5)))))
-            (recur (+ p 1)
-                   (simd/fma x0 b0 a00) (simd/fma x0 b1 a01)
-                   (simd/fma x1 b0 a10) (simd/fma x1 b1 a11)
-                   (simd/fma x2 b0 a20) (simd/fma x2 b1 a21)
-                   (simd/fma x3 b0 a30) (simd/fma x3 b1 a31)
-                   (simd/fma x4 b0 a40) (simd/fma x4 b1 a41)
-                   (simd/fma x5 b0 a50) (simd/fma x5 b1 a51)))
-          (do (store-f32x8 (ofs cp 0) a00) (store-f32x8 (ofs cp 8) a01)
-              (store-f32x8 (ofs cp ldc) a10) (store-f32x8 (ofs cp (unchecked-add ldc 8)) a11)
-              (store-f32x8 (ofs cp (unchecked-multiply 2 ldc)) a20) (store-f32x8 (ofs cp (unchecked-add (unchecked-multiply 2 ldc) 8)) a21)
-              (store-f32x8 (ofs cp (unchecked-multiply 3 ldc)) a30) (store-f32x8 (ofs cp (unchecked-add (unchecked-multiply 3 ldc) 8)) a31)
-              (store-f32x8 (ofs cp (unchecked-multiply 4 ldc)) a40) (store-f32x8 (ofs cp (unchecked-add (unchecked-multiply 4 ldc) 8)) a41)
-              (store-f32x8 (ofs cp (unchecked-multiply 5 ldc)) a50) (store-f32x8 (ofs cp (unchecked-add (unchecked-multiply 5 ldc) 8)) a51))))))
+;; the vector at row r, vector column v of a tile of row pitch ldc; its initial value is the loaded C or zero
+(defun at :private (cp: ptr ldc: i64 r: i64 v: i64 l: i64) -> ptr (ofs cp (unchecked-add (unchecked-multiply r ldc) (unchecked-multiply v l))))
+(defun init :private (load: bool p: ptr z: (Simd f32 n)) -> (Simd f32 n) (if load (unsafe (load-simd p)) z))
+(defun bcast :private (ab: ptr i: i64 w: (Simd f32 n)) -> (Simd f32 n) (unsafe (splat (Simd f32 n) (load-f32 (ofs ab i)))))
 
-;; ---- epilogue: C = act(C + bias) over one 6x16 tile; `bias` points at its 16 (padded) bias values
-(defun finish-tile :private (cp: ptr ldc: i64 bias: ptr code: i64) -> unit
+;; ---- micro-kernel, two vectors per row: C[0..6)x[0..2L) (row pitch ldc) = (load ? C : 0) + sum over p of ap[p*6+i] * bp[p*2L+j]
+(defun kern-n2 :private (ap: ptr bp: ptr cp: ptr ldc: i64 kk: i64 load: bool w: (Simd f32 n)) -> unit
   (unsafe
-    (let ((b0 (load-f32x8 bias)) (b1 (load-f32x8 (ofs bias 8))))
-      (dotimes (i 6)
-        (let ((r (ofs cp (unchecked-multiply i ldc))))
-          (do (store-f32x8 r (activate8 code (+ (load-f32x8 r) b0)))
-              (store-f32x8 (ofs r 8) (activate8 code (+ (load-f32x8 (ofs r 8)) b1)))))))))
+    (let ((l (simd/lanes w)) (z (splat (Simd f32 n) 0.0f32)))
+      (loop ((p 0)
+             (a00 (init load (at cp ldc 0 0 l) z)) (a01 (init load (at cp ldc 0 1 l) z))
+             (a10 (init load (at cp ldc 1 0 l) z)) (a11 (init load (at cp ldc 1 1 l) z))
+             (a20 (init load (at cp ldc 2 0 l) z)) (a21 (init load (at cp ldc 2 1 l) z))
+             (a30 (init load (at cp ldc 3 0 l) z)) (a31 (init load (at cp ldc 3 1 l) z))
+             (a40 (init load (at cp ldc 4 0 l) z)) (a41 (init load (at cp ldc 4 1 l) z))
+             (a50 (init load (at cp ldc 5 0 l) z)) (a51 (init load (at cp ldc 5 1 l) z)))
+        (if (< p kk)
+            (let ((bq (ofs bp (unchecked-multiply (unchecked-multiply 2 l) p)))
+                  (b0 (load-simd bq)) (b1 (load-simd (ofs bq l)))
+                  (ab (ofs ap (unchecked-multiply 6 p)))
+                  (x0 (bcast ab 0 w)) (x1 (bcast ab 1 w)) (x2 (bcast ab 2 w)) (x3 (bcast ab 3 w)) (x4 (bcast ab 4 w)) (x5 (bcast ab 5 w)))
+              (recur (+ p 1)
+                     (simd/fma x0 b0 a00) (simd/fma x0 b1 a01) (simd/fma x1 b0 a10) (simd/fma x1 b1 a11)
+                     (simd/fma x2 b0 a20) (simd/fma x2 b1 a21) (simd/fma x3 b0 a30) (simd/fma x3 b1 a31)
+                     (simd/fma x4 b0 a40) (simd/fma x4 b1 a41) (simd/fma x5 b0 a50) (simd/fma x5 b1 a51)))
+            (do (store-simd (at cp ldc 0 0 l) a00) (store-simd (at cp ldc 0 1 l) a01)
+                (store-simd (at cp ldc 1 0 l) a10) (store-simd (at cp ldc 1 1 l) a11)
+                (store-simd (at cp ldc 2 0 l) a20) (store-simd (at cp ldc 2 1 l) a21)
+                (store-simd (at cp ldc 3 0 l) a30) (store-simd (at cp ldc 3 1 l) a31)
+                (store-simd (at cp ldc 4 0 l) a40) (store-simd (at cp ldc 4 1 l) a41)
+                (store-simd (at cp ldc 5 0 l) a50) (store-simd (at cp ldc 5 1 l) a51)))))))
 
-;; ---- an incomplete tile goes through a 6x16 scratch tile (pitch 16) so the kernel is the same
-(defun edge-tile :private (ap: ptr bp: ptr cp: ptr ldc: i64 kk: i64 load: bool mr: i64 nr: i64 tp: ptr bias: ptr code: i64) -> unit
+;; ---- micro-kernel, four vectors per row: C[0..6)x[0..4L)
+(defun kern-n4 :private (ap: ptr bp: ptr cp: ptr ldc: i64 kk: i64 load: bool w: (Simd f32 n)) -> unit
   (unsafe
-    (do (dotimes (i 96) (store-f32 (ofs tp i) 0.0f32))
-        (when load
-          (dotimes (i mr) (dotimes (j nr) (store-f32 (ofs tp (unchecked-add (unchecked-multiply 16 i) j))
-                                                      (load-f32 (ofs cp (unchecked-add (unchecked-multiply ldc i) j)))))))
-        (kern6x16 ap bp tp 16 kk load)
-        (when (>= code 0) (finish-tile tp 16 bias code))
-        (dotimes (i mr) (dotimes (j nr) (store-f32 (ofs cp (unchecked-add (unchecked-multiply ldc i) j))
-                                                    (load-f32 (ofs tp (unchecked-add (unchecked-multiply 16 i) j)))))))))
+    (let ((l (simd/lanes w)) (z (splat (Simd f32 n) 0.0f32)))
+      (loop ((p 0)
+             (a00 (init load (at cp ldc 0 0 l) z)) (a01 (init load (at cp ldc 0 1 l) z)) (a02 (init load (at cp ldc 0 2 l) z)) (a03 (init load (at cp ldc 0 3 l) z))
+             (a10 (init load (at cp ldc 1 0 l) z)) (a11 (init load (at cp ldc 1 1 l) z)) (a12 (init load (at cp ldc 1 2 l) z)) (a13 (init load (at cp ldc 1 3 l) z))
+             (a20 (init load (at cp ldc 2 0 l) z)) (a21 (init load (at cp ldc 2 1 l) z)) (a22 (init load (at cp ldc 2 2 l) z)) (a23 (init load (at cp ldc 2 3 l) z))
+             (a30 (init load (at cp ldc 3 0 l) z)) (a31 (init load (at cp ldc 3 1 l) z)) (a32 (init load (at cp ldc 3 2 l) z)) (a33 (init load (at cp ldc 3 3 l) z))
+             (a40 (init load (at cp ldc 4 0 l) z)) (a41 (init load (at cp ldc 4 1 l) z)) (a42 (init load (at cp ldc 4 2 l) z)) (a43 (init load (at cp ldc 4 3 l) z))
+             (a50 (init load (at cp ldc 5 0 l) z)) (a51 (init load (at cp ldc 5 1 l) z)) (a52 (init load (at cp ldc 5 2 l) z)) (a53 (init load (at cp ldc 5 3 l) z)))
+        (if (< p kk)
+            (let ((bq (ofs bp (unchecked-multiply (unchecked-multiply 4 l) p)))
+                  (b0 (load-simd bq)) (b1 (load-simd (ofs bq l))) (b2 (load-simd (ofs bq (unchecked-multiply 2 l)))) (b3 (load-simd (ofs bq (unchecked-multiply 3 l))))
+                  (ab (ofs ap (unchecked-multiply 6 p)))
+                  (x0 (bcast ab 0 w)) (x1 (bcast ab 1 w)) (x2 (bcast ab 2 w)) (x3 (bcast ab 3 w)) (x4 (bcast ab 4 w)) (x5 (bcast ab 5 w)))
+              (recur (+ p 1)
+                     (simd/fma x0 b0 a00) (simd/fma x0 b1 a01) (simd/fma x0 b2 a02) (simd/fma x0 b3 a03)
+                     (simd/fma x1 b0 a10) (simd/fma x1 b1 a11) (simd/fma x1 b2 a12) (simd/fma x1 b3 a13)
+                     (simd/fma x2 b0 a20) (simd/fma x2 b1 a21) (simd/fma x2 b2 a22) (simd/fma x2 b3 a23)
+                     (simd/fma x3 b0 a30) (simd/fma x3 b1 a31) (simd/fma x3 b2 a32) (simd/fma x3 b3 a33)
+                     (simd/fma x4 b0 a40) (simd/fma x4 b1 a41) (simd/fma x4 b2 a42) (simd/fma x4 b3 a43)
+                     (simd/fma x5 b0 a50) (simd/fma x5 b1 a51) (simd/fma x5 b2 a52) (simd/fma x5 b3 a53)))
+            (do (store-simd (at cp ldc 0 0 l) a00) (store-simd (at cp ldc 0 1 l) a01) (store-simd (at cp ldc 0 2 l) a02) (store-simd (at cp ldc 0 3 l) a03)
+                (store-simd (at cp ldc 1 0 l) a10) (store-simd (at cp ldc 1 1 l) a11) (store-simd (at cp ldc 1 2 l) a12) (store-simd (at cp ldc 1 3 l) a13)
+                (store-simd (at cp ldc 2 0 l) a20) (store-simd (at cp ldc 2 1 l) a21) (store-simd (at cp ldc 2 2 l) a22) (store-simd (at cp ldc 2 3 l) a23)
+                (store-simd (at cp ldc 3 0 l) a30) (store-simd (at cp ldc 3 1 l) a31) (store-simd (at cp ldc 3 2 l) a32) (store-simd (at cp ldc 3 3 l) a33)
+                (store-simd (at cp ldc 4 0 l) a40) (store-simd (at cp ldc 4 1 l) a41) (store-simd (at cp ldc 4 2 l) a42) (store-simd (at cp ldc 4 3 l) a43)
+                (store-simd (at cp ldc 5 0 l) a50) (store-simd (at cp ldc 5 1 l) a51) (store-simd (at cp ldc 5 2 l) a52) (store-simd (at cp ldc 5 3 l) a53)))))))
+
+(defun kern :private (ap: ptr bp: ptr cp: ptr ldc: i64 kk: i64 load: bool w: (Simd f32 n)) -> unit
+  (if (wide? w) (kern-n4 ap bp cp ldc kk load w) (kern-n2 ap bp cp ldc kk load w)))
+
+;; ---- epilogue: C = act(C + bias) over one 6xNR tile (row pitch ldc); `bias` points at its NR (padded) bias values
+(defun finish-tile :private (cp: ptr ldc: i64 bias: ptr code: i64 q: i64) -> unit
+  (unsafe
+    (dotimes (i 6)
+      (let ((r (ofs cp (unchecked-multiply i ldc))))
+        (dotimes (v (quot q 8))
+          (let ((o (unchecked-multiply v 8)))
+            (store-f32x8 (ofs r o) (activate8 code (+ (load-f32x8 (ofs r o)) (load-f32x8 (ofs bias o)))))))))))
+
+;; ---- an incomplete tile goes through a 6xNR scratch tile (pitch NR) so the kernel is the same
+(defun edge-tile :private (ap: ptr bp: ptr cp: ptr ldc: i64 kk: i64 load: bool mr: i64 nc: i64 tp: ptr bias: ptr code: i64 w: (Simd f32 n)) -> unit
+  (let ((q (nr w)))
+    (unsafe
+      (do (dotimes (i (* 6 q)) (store-f32 (ofs tp i) 0.0f32))
+          (when load
+            (dotimes (i mr) (dotimes (j nc) (store-f32 (ofs tp (unchecked-add (unchecked-multiply q i) j))
+                                                        (load-f32 (ofs cp (unchecked-add (unchecked-multiply ldc i) j)))))))
+          (kern ap bp tp q kk load w)
+          (when (>= code 0) (finish-tile tp q bias code q))
+          (dotimes (i mr) (dotimes (j nc) (store-f32 (ofs cp (unchecked-add (unchecked-multiply ldc i) j))
+                                                      (load-f32 (ofs tp (unchecked-add (unchecked-multiply q i) j))))))))))
 
 ;; ---- packing: a panel of up to 6 rows of A over kk inner steps, p-major, rows beyond mr are zero
 (defun pack-a :private (dst: ptr src: ptr as0: i64 as1: i64 mr: i64 kk: i64) -> unit
@@ -97,95 +132,106 @@
         (store-f32 (ofs dst (unchecked-add (unchecked-multiply 6 p) i))
                    (if (< i mr) (load-f32 (ofs src (unchecked-add (unchecked-multiply i as0) (unchecked-multiply p as1)))) 0.0f32))))))
 
-;; a panel of up to 16 columns of B, p-major, columns beyond nr are zero
-(defun pack-b :private (dst: ptr src: ptr bs0: i64 bs1: i64 nr: i64 kk: i64) -> unit
-  (unsafe
-    (if (and (= nr 16) (= bs1 1))
-        (dotimes (p kk)
-          (let ((s (ofs src (unchecked-multiply p bs0))) (d (ofs dst (unchecked-multiply 16 p))))
-            (do (store-f32x8 d (load-f32x8 s)) (store-f32x8 (ofs d 8) (load-f32x8 (ofs s 8))))))
-        (dotimes (p kk)
-          (dotimes (j 16)
-            (store-f32 (ofs dst (unchecked-add (unchecked-multiply 16 p) j))
-                       (if (< j nr) (load-f32 (ofs src (unchecked-add (unchecked-multiply p bs0) (unchecked-multiply j bs1)))) 0.0f32)))))))
+;; a panel of up to NR columns of B, p-major, columns beyond ncol are zero
+(defun pack-b :private (dst: ptr src: ptr bs0: i64 bs1: i64 ncol: i64 kk: i64 w: (Simd f32 n)) -> unit
+  (let ((q (nr w)) (l (simd/lanes w)))
+    (unsafe
+      (if (and (= ncol q) (= bs1 1))
+          (dotimes (p kk)
+            (let ((s (ofs src (unchecked-multiply p bs0))) (d (ofs dst (unchecked-multiply q p))))
+              (dotimes (v (quot q l)) (store-simd (ofs d (unchecked-multiply v l)) (let ((x: (Simd f32 n) (load-simd (ofs s (unchecked-multiply v l))))) x)))))
+          (dotimes (p kk)
+            (dotimes (j q)
+              (store-f32 (ofs dst (unchecked-add (unchecked-multiply q p) j))
+                         (if (< j ncol) (load-f32 (ofs src (unchecked-add (unchecked-multiply p bs0) (unchecked-multiply j bs1)))) 0.0f32))))))))
 
 (defun pack-a-block :private (dst: ptr src: ptr as0: i64 as1: i64 rows: i64 kk: i64) -> unit
   (dotimes (q (quot (+ rows 5) 6))
     (pack-a (ofs dst (unchecked-multiply (unchecked-multiply 6 q) kk)) (ofs src (unchecked-multiply (unchecked-multiply 6 q) as0))
             as0 as1 (min 6 (- rows (* 6 q))) kk)))
 
-(defun pack-b-block :private (dst: ptr src: ptr bs0: i64 bs1: i64 cols: i64 kk: i64) -> unit
-  (dotimes (q (quot (+ cols 15) 16))
-    (pack-b (ofs dst (unchecked-multiply (unchecked-multiply 16 q) kk)) (ofs src (unchecked-multiply (unchecked-multiply 16 q) bs1))
-            bs0 bs1 (min 16 (- cols (* 16 q))) kk)))
+(defun pack-b-block :private (dst: ptr src: ptr bs0: i64 bs1: i64 cols: i64 kk: i64 w: (Simd f32 n)) -> unit
+  (let ((q (nr w)))
+    (dotimes (j (quot (+ cols (- q 1)) q))
+      (pack-b (ofs dst (unchecked-multiply (unchecked-multiply q j) kk)) (ofs src (unchecked-multiply (unchecked-multiply q j) bs1))
+              bs0 bs1 (min q (- cols (* q j))) kk w))))
 
 ;; ---- one (A block) x (B block) product into C
-(defun block-product :private (ap: ptr bp: ptr cp: ptr ldc: i64 rows: i64 cols: i64 kk: i64 load: bool tp: ptr bias: ptr code: i64) -> unit
-  (dotimes (jq (quot (+ cols 15) 16))
-    (dotimes (iq (quot (+ rows 5) 6))
-      (let ((mr (min 6 (- rows (* 6 iq)))) (nr (min 16 (- cols (* 16 jq))))
-            (a (ofs ap (unchecked-multiply (unchecked-multiply 6 iq) kk)))
-            (b (ofs bp (unchecked-multiply (unchecked-multiply 16 jq) kk)))
-            (c (ofs cp (unchecked-add (unchecked-multiply (unchecked-multiply 6 iq) ldc) (unchecked-multiply 16 jq)))))
-        (if (and (= mr 6) (= nr 16))
-            (do (kern6x16 a b c ldc kk load)
-                (when (>= code 0) (finish-tile c ldc (ofs bias (unchecked-multiply 16 jq)) code)))
-            (edge-tile a b c ldc kk load mr nr tp (ofs bias (unchecked-multiply 16 jq)) code))))))
+(defun block-product :private (ap: ptr bp: ptr cp: ptr ldc: i64 rows: i64 cols: i64 kk: i64 load: bool tp: ptr bias: ptr code: i64 w: (Simd f32 n)) -> unit
+  (let ((q (nr w)))
+    (dotimes (jq (quot (+ cols (- q 1)) q))
+      (dotimes (iq (quot (+ rows 5) 6))
+        (let ((mr (min 6 (- rows (* 6 iq)))) (ncol (min q (- cols (* q jq))))
+              (a (ofs ap (unchecked-multiply (unchecked-multiply 6 iq) kk)))
+              (b (ofs bp (unchecked-multiply (unchecked-multiply q jq) kk)))
+              (c (ofs cp (unchecked-add (unchecked-multiply (unchecked-multiply 6 iq) ldc) (unchecked-multiply q jq)))))
+          (if (and (= mr 6) (= ncol q))
+              (do (kern a b c ldc kk load w)
+                  (when (>= code 0) (finish-tile c ldc (ofs bias (unchecked-multiply q jq)) code q)))
+              (edge-tile a b c ldc kk load mr ncol tp (ofs bias (unchecked-multiply q jq)) code w)))))))
 
 ;; ---- the loop nest: column block, inner block (pack B), row block (pack A)
 (defun nest :private (ap: ptr bp: ptr cp: ptr abuf: ptr bbuf: ptr tp: ptr biasp: ptr code: i64
-                      as0: i64 as1: i64 bs0: i64 bs1: i64 m: i64 n: i64 k: i64) -> unit
+                      as0: i64 as1: i64 bs0: i64 bs1: i64 m: i64 n: i64 k: i64 w: (Simd f32 lanes)) -> unit
   (loop ((jj 0))
     (when (< jj n)
       (let ((cols (min (nc) (- n jj))))
         (do (loop ((pp 0))
               (when (< pp k)
-                (let ((kk (min (kc) (- k pp))))
-                  (do (pack-b-block bbuf (ofs bp (unchecked-add (unchecked-multiply pp bs0) (unchecked-multiply jj bs1))) bs0 bs1 cols kk)
+                (let ((kk (min (kc w) (- k pp))))
+                  (do (pack-b-block bbuf (ofs bp (unchecked-add (unchecked-multiply pp bs0) (unchecked-multiply jj bs1))) bs0 bs1 cols kk w)
                       (loop ((ii 0))
                         (when (< ii m)
                           (let ((rows (min (mc) (- m ii))))
                             (do (pack-a-block abuf (ofs ap (unchecked-add (unchecked-multiply ii as0) (unchecked-multiply pp as1))) as0 as1 rows kk)
-                                (block-product abuf bbuf (ofs cp (unchecked-add (unchecked-multiply ii n) jj)) n rows cols kk (> pp 0) tp (ofs biasp jj) (if (>= (+ pp kk) k) code -1))
+                                (block-product abuf bbuf (ofs cp (unchecked-add (unchecked-multiply ii n) jj)) n rows cols kk (> pp 0) tp (ofs biasp jj) (if (>= (+ pp kk) k) code -1) w)
                                 (recur (+ ii (mc)))))))
-                      (recur (+ pp (kc)))))))
+                      (recur (+ pp (kc w)))))))
             (recur (+ jj (nc))))))))
 
-(defun multiply (a: (Tensor f32) b: (Tensor f32)) -> (Tensor f32)
-  (multiply-with a b (zeros-f32 [1]) -1))
-
-;; The bias, broadcast to [n] and copied into a zero padded buffer of whole 16-column panels (reads are checked).
-(defun padded-bias :private (bias: (Tensor f32) n: i64) -> (Array f32)
+;; The bias, broadcast to [n] and copied into a zero padded buffer of whole NR-column panels (reads are checked).
+(defun padded-bias :private (bias: (Tensor f32) n: i64 q: i64) -> (Array f32)
   (let ((row (broadcast-to [n] bias)) (src (. row buffer)) (off (array-get (. row meta) 0)) (st (nth (strides row) 0))
-        (buf (cell (array (roundup n 16) 0.0f32))))
+        (buf (cell (array (roundup n q) 0.0f32))))
     (do (validate row)
         (dotimes (j n) (array-set! &buf j (array-get src (+ off (* j st)))))
         @buf)))
 
-;; C = act(A*B + bias) for activation code `code` (fib.tensor.vmath/activation-code) or the plain product for code -1; bias is
-;; any tensor that broadcasts to [n]. k = 0 is the caller's: the product is all zeros, but no tile would run the epilogue.
+;; C = act(A*B + bias) at the width of the witness `w` (a vector of 8 or 16 f32 lanes) for activation code `code`
+;; (fib.tensor.vmath/activation-code) or the plain product for code -1; bias is any tensor that broadcasts to [n]. k = 0 is the
+;; caller's: the product is all zeros, but no tile would run the epilogue.
 ;; Safety of the uninitialised output: the loop nest covers every tile of every block, the first inner block stores each of its
 ;; elements (load is false) and later blocks load before they store, so every element of C is written before it is read.
-(defun multiply-with (a: (Tensor f32) b: (Tensor f32) bias: (Tensor f32) code: i64) -> (Tensor f32)
+(defun multiply-with-at (a: (Tensor f32) b: (Tensor f32) bias: (Tensor f32) code: i64 w: (Simd f32 lanes)) -> (Tensor f32)
   (do (validate a) (validate b)
       (when (or (!= (rank a) 2) (!= (rank b) 2)) (trap "tensor: mmul requires rank two"))
-      (let ((ad (shape a)) (bd (shape b)) (m (nth ad 0)) (k (nth ad 1)) (n (nth bd 1)))
+      (let ((ad (shape a)) (bd (shape b)) (m (nth ad 0)) (k (nth ad 1)) (cn (nth bd 1)))
         (do (when (!= k (nth bd 0)) (trap "tensor: mmul inner dimension mismatch"))
             (when (and (>= code 0) (= k 0)) (trap "tensor: fused epilogue needs a nonzero inner dimension"))
-            (let ((length (checked-size [m n] 0.0f32))
+            (let ((length (checked-size [m cn] 0.0f32))
                   (output (if (= k 0) (array length 0.0f32) (unsafe (array-uninit-f32 length)))))
               (do (when (and (> length 0) (> k 0))
-                    (let ((kk (min (kc) k))
+                    (let ((kk (min (kc w) k))
                           (abuf (unsafe (array-uninit-f32 (* (roundup (min (mc) m) 6) kk))))
-                          (bbuf (unsafe (array-uninit-f32 (* (roundup (min (nc) n) 16) kk))))
-                          (tbuf (unsafe (array-uninit-f32 96)))
-                          (biasbuf (if (>= code 0) (padded-bias bias n) (array 16 0.0f32)))
+                          (bbuf (unsafe (array-uninit-f32 (* (roundup (min (nc) cn) (nr w)) kk))))
+                          (tbuf (unsafe (array-uninit-f32 (* 6 (nr w)))))
+                          (biasbuf (if (>= code 0) (padded-bias bias cn (nr w)) (array (nr w) 0.0f32)))
                           (as (strides a)) (bs (strides b)))
                       (nest (data a) (data b) (unsafe (ptr+ (raw output) (array-header-size)))
                             (unsafe (ptr+ (raw abuf) (array-header-size))) (unsafe (ptr+ (raw bbuf) (array-header-size)))
                             (unsafe (ptr+ (raw tbuf) (array-header-size))) (unsafe (ptr+ (raw biasbuf) (array-header-size))) code
-                            (nth as 0) (nth as 1) (nth bs 0) (nth bs 1) m n k)))
-                  (from-array [m n] output 0.0f32)))))))
+                            (nth as 0) (nth as 1) (nth bs 0) (nth bs 1) m cn k w)))
+                  (from-array [m cn] output 0.0f32)))))))
+
+(defun multiply-at (a: (Tensor f32) b: (Tensor f32) w: (Simd f32 n)) -> (Tensor f32)
+  (multiply-with-at a b (zeros-f32 [1]) -1 w))
+
+;; The same at the native width of the target: 16 lanes where it is 512 bits, else 8.
+(defun multiply-with (a: (Tensor f32) b: (Tensor f32) bias: (Tensor f32) code: i64) -> (Tensor f32)
+  (if (>= (native-lanes f32) 16) (multiply-with-at a b bias code (splat f32x16 0.0f32)) (multiply-with-at a b bias code (splat f32x8 0.0f32))))
+
+(defun multiply (a: (Tensor f32) b: (Tensor f32)) -> (Tensor f32)
+  (multiply-with a b (zeros-f32 [1]) -1))
 
 ;; The ordered fused reference: one fma chain per output, inner index increasing. Checked, scalar.
 (defun fma-reference (a: (Tensor f32) b: (Tensor f32)) -> (Tensor f32)

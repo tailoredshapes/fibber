@@ -13,7 +13,7 @@
 ;; op: 0 sum, 2 maximum, 3 minimum (1 is unused)
 
 ;; ---- f32 (8 lanes)
-(defun lop-f32 :private (op: i64 a: f32x8 b: f32x8) -> f32x8
+(defun lop-f32 :private (op: i64 a: f32xn b: f32xn) -> f32xn
   (cond (= op 0) (+ a b)
         (= op 2) (simd/blend (simd/or (simd/ne a a) (simd/gt a b)) a b)
         :else (simd/blend (simd/or (simd/ne a a) (simd/lt a b)) a b)))
@@ -22,18 +22,18 @@
 
 ;; four vectors at columns c, c+L, c+2L, c+3L
 (defun block4-f32 :private (op: i64 extent: i64 inner: i64 src: (Array f32) base: i64 c: i64 &out: (Array f32) at: i64) -> unit
-  (let ((z: f32x8 (splat f32x8 0.0f32)) (first (= op 0)) (j0 (if (= op 0) 0 1))
-        (a0: f32x8 (if first z (simd-load src (+ base c)))) (a1: f32x8 (if first z (simd-load src (+ base (+ c 8)))))
-        (a2: f32x8 (if first z (simd-load src (+ base (+ c 16))))) (a3: f32x8 (if first z (simd-load src (+ base (+ c 24))))))
+  (let ((z: f32xn (splat f32xn 0.0f32)) (first (= op 0)) (j0 (if (= op 0) 0 1))
+        (a0: f32xn (if first z (simd-load src (+ base c)))) (a1: f32xn (if first z (simd-load src (+ base (+ c (native-lanes f32))))))
+        (a2: f32xn (if first z (simd-load src (+ base (+ c (* 2 (native-lanes f32))))))) (a3: f32xn (if first z (simd-load src (+ base (+ c (* 3 (native-lanes f32))))))))
     (loop ((j j0) (p0 a0) (p1 a1) (p2 a2) (p3 a3))
       (if (< j extent)
           (let ((r (+ base (* j inner))))
-            (recur (+ j 1) (lop-f32 op p0 (simd-load src (+ r c))) (lop-f32 op p1 (simd-load src (+ r (+ c 8))))
-                   (lop-f32 op p2 (simd-load src (+ r (+ c 16)))) (lop-f32 op p3 (simd-load src (+ r (+ c 24))))))
-          (do (simd-store! &out at p0) (simd-store! &out (+ at 8) p1) (simd-store! &out (+ at 16) p2) (simd-store! &out (+ at 24) p3))))))
+            (recur (+ j 1) (lop-f32 op p0 (simd-load src (+ r c))) (lop-f32 op p1 (simd-load src (+ r (+ c (native-lanes f32)))))
+                   (lop-f32 op p2 (simd-load src (+ r (+ c (* 2 (native-lanes f32)))))) (lop-f32 op p3 (simd-load src (+ r (+ c (* 3 (native-lanes f32))))))))
+          (do (simd-store! &out at p0) (simd-store! &out (+ at (native-lanes f32)) p1) (simd-store! &out (+ at (* 2 (native-lanes f32))) p2) (simd-store! &out (+ at (* 3 (native-lanes f32))) p3))))))
 
 (defun block1-f32 :private (op: i64 extent: i64 inner: i64 src: (Array f32) base: i64 c: i64 &out: (Array f32) at: i64) -> unit
-  (let ((j0 (if (= op 0) 0 1)) (a0: f32x8 (if (= op 0) (splat f32x8 0.0f32) (simd-load src (+ base c)))))
+  (let ((j0 (if (= op 0) 0 1)) (a0: f32xn (if (= op 0) (splat f32xn 0.0f32) (simd-load src (+ base c)))))
     (loop ((j j0) (p a0))
       (if (< j extent) (recur (+ j 1) (lop-f32 op p (simd-load src (+ base (+ (* j inner) c))))) (simd-store! &out at p)))))
 
@@ -43,16 +43,16 @@
     (if (< j extent) (recur (+ j 1) (sop-f32 op acc (array-get src (+ base (+ (* j inner) c))))) acc)))
 
 (defun reduce-f32 :private (op: i64 outer: i64 extent: i64 inner: i64 src: (Array f32) off: i64) -> (Array f32)
-  (let ((out (cell (array (* outer inner) 0.0f32))) (n4 (- inner (rem inner 32))) (n1 (- inner (rem inner 8))))
+  (let ((out (cell (array (* outer inner) 0.0f32))) (n4 (- inner (rem inner (* 4 (native-lanes f32))))) (n1 (- inner (rem inner (native-lanes f32)))))
     (do (dotimes (o outer)
           (let ((base (+ off (* (* o extent) inner))) (ob (* o inner)))
-            (do (loop ((c 0)) (when (< c n4) (do (block4-f32 op extent inner src base c &out (+ ob c)) (recur (+ c 32)))))
-                (loop ((c n4)) (when (< c n1) (do (block1-f32 op extent inner src base c &out (+ ob c)) (recur (+ c 8)))))
+            (do (loop ((c 0)) (when (< c n4) (do (block4-f32 op extent inner src base c &out (+ ob c)) (recur (+ c (* 4 (native-lanes f32)))))))
+                (loop ((c n4)) (when (< c n1) (do (block1-f32 op extent inner src base c &out (+ ob c)) (recur (+ c (native-lanes f32))))))
                 (loop ((c n1)) (when (< c inner) (do (array-set! &out (+ ob c) (column-f32 op extent inner src base c)) (recur (+ c 1))))))))
         @out)))
 
 ;; ---- f64 (4 lanes)
-(defun lop-f64 :private (op: i64 a: f64x4 b: f64x4) -> f64x4
+(defun lop-f64 :private (op: i64 a: f64xn b: f64xn) -> f64xn
   (cond (= op 0) (+ a b)
         (= op 2) (simd/blend (simd/or (simd/ne a a) (simd/gt a b)) a b)
         :else (simd/blend (simd/or (simd/ne a a) (simd/lt a b)) a b)))
@@ -61,18 +61,18 @@
 
 ;; four vectors at columns c, c+L, c+2L, c+3L
 (defun block4-f64 :private (op: i64 extent: i64 inner: i64 src: (Array f64) base: i64 c: i64 &out: (Array f64) at: i64) -> unit
-  (let ((z: f64x4 (splat f64x4 0.0)) (first (= op 0)) (j0 (if (= op 0) 0 1))
-        (a0: f64x4 (if first z (simd-load src (+ base c)))) (a1: f64x4 (if first z (simd-load src (+ base (+ c 4)))))
-        (a2: f64x4 (if first z (simd-load src (+ base (+ c 8))))) (a3: f64x4 (if first z (simd-load src (+ base (+ c 12))))))
+  (let ((z: f64xn (splat f64xn 0.0)) (first (= op 0)) (j0 (if (= op 0) 0 1))
+        (a0: f64xn (if first z (simd-load src (+ base c)))) (a1: f64xn (if first z (simd-load src (+ base (+ c (native-lanes f64))))))
+        (a2: f64xn (if first z (simd-load src (+ base (+ c (* 2 (native-lanes f64))))))) (a3: f64xn (if first z (simd-load src (+ base (+ c (* 3 (native-lanes f64))))))))
     (loop ((j j0) (p0 a0) (p1 a1) (p2 a2) (p3 a3))
       (if (< j extent)
           (let ((r (+ base (* j inner))))
-            (recur (+ j 1) (lop-f64 op p0 (simd-load src (+ r c))) (lop-f64 op p1 (simd-load src (+ r (+ c 4))))
-                   (lop-f64 op p2 (simd-load src (+ r (+ c 8)))) (lop-f64 op p3 (simd-load src (+ r (+ c 12))))))
-          (do (simd-store! &out at p0) (simd-store! &out (+ at 4) p1) (simd-store! &out (+ at 8) p2) (simd-store! &out (+ at 12) p3))))))
+            (recur (+ j 1) (lop-f64 op p0 (simd-load src (+ r c))) (lop-f64 op p1 (simd-load src (+ r (+ c (native-lanes f64)))))
+                   (lop-f64 op p2 (simd-load src (+ r (+ c (* 2 (native-lanes f64)))))) (lop-f64 op p3 (simd-load src (+ r (+ c (* 3 (native-lanes f64))))))))
+          (do (simd-store! &out at p0) (simd-store! &out (+ at (native-lanes f64)) p1) (simd-store! &out (+ at (* 2 (native-lanes f64))) p2) (simd-store! &out (+ at (* 3 (native-lanes f64))) p3))))))
 
 (defun block1-f64 :private (op: i64 extent: i64 inner: i64 src: (Array f64) base: i64 c: i64 &out: (Array f64) at: i64) -> unit
-  (let ((j0 (if (= op 0) 0 1)) (a0: f64x4 (if (= op 0) (splat f64x4 0.0) (simd-load src (+ base c)))))
+  (let ((j0 (if (= op 0) 0 1)) (a0: f64xn (if (= op 0) (splat f64xn 0.0) (simd-load src (+ base c)))))
     (loop ((j j0) (p a0))
       (if (< j extent) (recur (+ j 1) (lop-f64 op p (simd-load src (+ base (+ (* j inner) c))))) (simd-store! &out at p)))))
 
@@ -82,11 +82,11 @@
     (if (< j extent) (recur (+ j 1) (sop-f64 op acc (array-get src (+ base (+ (* j inner) c))))) acc)))
 
 (defun reduce-f64 :private (op: i64 outer: i64 extent: i64 inner: i64 src: (Array f64) off: i64) -> (Array f64)
-  (let ((out (cell (array (* outer inner) 0.0))) (n4 (- inner (rem inner 16))) (n1 (- inner (rem inner 4))))
+  (let ((out (cell (array (* outer inner) 0.0))) (n4 (- inner (rem inner (* 4 (native-lanes f64))))) (n1 (- inner (rem inner (native-lanes f64)))))
     (do (dotimes (o outer)
           (let ((base (+ off (* (* o extent) inner))) (ob (* o inner)))
-            (do (loop ((c 0)) (when (< c n4) (do (block4-f64 op extent inner src base c &out (+ ob c)) (recur (+ c 16)))))
-                (loop ((c n4)) (when (< c n1) (do (block1-f64 op extent inner src base c &out (+ ob c)) (recur (+ c 4)))))
+            (do (loop ((c 0)) (when (< c n4) (do (block4-f64 op extent inner src base c &out (+ ob c)) (recur (+ c (* 4 (native-lanes f64)))))))
+                (loop ((c n4)) (when (< c n1) (do (block1-f64 op extent inner src base c &out (+ ob c)) (recur (+ c (native-lanes f64))))))
                 (loop ((c n1)) (when (< c inner) (do (array-set! &out (+ ob c) (column-f64 op extent inner src base c)) (recur (+ c 1))))))))
         @out)))
 

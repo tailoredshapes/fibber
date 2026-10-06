@@ -120,7 +120,8 @@
 
 ;; Every simd builtin of this module and of emit.lower.simdfn; `nil` when `name` is none of them. `tys` are the argument types, `e` the call.
 (defun lcx-simd-extra (cx: LowerCx name: str e: Expr a: (Vec V) tys: (Vec Ty)) -> (Result V str)
-  (cond (simd-mem-name? name)
+  (cond (simd-ptr-name? name) (lcx-simd-ptr cx name e a tys)
+        (simd-mem-name? name)
           (if (simd-store-name? name)
               (match (nth tys 0)
                 ((TCon (KCell) args)
@@ -138,4 +139,15 @@
         (or (= name "simd/lanes") (= name "simd/kind")) (Ok (lcx-simd-const name (nth a 0)))
         :else (lcx-simd-fn cx name a)))
 
-(defun simd-extra-name? (name: str) -> bool (or (simd-mem-name? name) (simd-fn-name? name)))
+(defun simd-ptr-name? :private (name: str) -> bool (or (= name "load-simd") (= name "store-simd")))
+
+;; `load-simd p` and `store-simd p v`: one unaligned vector access at the raw pointer, the vector type the context's (a load) or the value's (a store).
+(defun lcx-simd-ptr :private (cx: LowerCx name: str e: Expr a: (Vec V) tys: (Vec Ty)) -> (Result V str)
+  (if (= name "load-simd")
+      (try-let ((vt (lcx-ty cx e)) (l (program-lir (. cx p) vt)))
+        (match l
+          ((some lt) (Ok (val cx (str-join ["(load (align 1) " (lir-ty-text lt) " " (v-text (nth a 0)) ")"]) lt)))
+          (nil (Err "load-simd of unit"))))
+    (do (fb-stmt (. cx b) (str-join ["(store (align 1) " (v-text (nth a 1)) " " (v-text (nth a 0)) ")"])) (Ok VUnit))))
+
+(defun simd-extra-name? (name: str) -> bool (or (simd-mem-name? name) (simd-fn-name? name) (simd-ptr-name? name)))
