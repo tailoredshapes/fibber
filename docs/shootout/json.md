@@ -5,6 +5,73 @@ every fibber figure the median of 5 runs, every competitor's figure the median o
 for serialise). **The box this was developed on is shared and noisy (load average 12 to 30 while I worked); the table is from the owner's Ryzen 7 5800X (WSL, 16 threads,
 quiet, freshly started: Jackson's JIT had little warm-up there, see the note).** The same run on the development box (i7-14700KF, quiet at the time) is in the last section.
 
+## JSON-2: making it fast (AMD Ryzen 7 5800X, WSL2, 16 threads, quiet; 2026-10-06)
+
+Same corpora, same harness (`scripts/bench/json/run.sh`, single thread, `ulimit -v 16000000`, median of 5), fibber-bench built with `FIB_TARGET_CPU=x86-64-v3` from this tree by a stage 2 built
+from the same tree (the SIMD path needs the next release: the seed fibc 0.1.9 has no `simd/movemask`, so library code that uses it compiles only with this tree's compiler).
+**Two columns for fibber: the default allocator and glibc tuned with `MALLOC_MMAP_THRESHOLD_=1000000000 MALLOC_TRIM_THRESHOLD_=1000000000 MALLOC_TOP_PAD_=268435456`.** On this machine (WSL2: a page
+fault is a hypervisor round trip) every large `malloc` is a fresh `mmap` whose pages fault on first touch, and with equal-sized allocations in a loop glibc's dynamic threshold never
+stops it (a freed mmapped chunk raises the threshold to its own size, and the next request of that size is still `>=`): the same stage 1 binary runs at 1.3 GB/s by default and 4.9 GB/s tuned;
+on bare metal Linux (the i7 dev box) the same switch moves it 2.77 to 2.98 GB/s. simdjson and Jackson reuse their buffers across the loop, so they do not pay this; an application that parses
+documents of varying sizes pays it only on the large ones. The library does not change the allocator of the process (a `mallopt` call would be glibc-only and global). Both columns are measured, neither is hidden.
+
+| MB/s | twitter | citm_catalog | canada |
+|---|---:|---:|---:|
+| **tape (validate + structural pass)** JSON-1 | 694 | 704 | 446 |
+| fib.json tape, JSON-2, default allocator | 908 | 1 175 | 652 |
+| fib.json tape, JSON-2, tuned allocator | **1 803** | **2 342** | 1 051 |
+| tape + 3 fields by path, default / tuned (JSON-1: 692) | 908 / 1 792 | | |
+| typed decode, default / tuned (JSON-1: 655) | 826 / 1 530 | | |
+| **DOM parse** JSON-1 | 192 | 356 | 156 |
+| fib.json DOM, JSON-2, default allocator | 352 | 468 | 175 |
+| fib.json DOM, JSON-2, tuned allocator | 438 | 583 | 205 |
+| Jackson `readTree` | 591 | 852 | 99 |
+| Python `json.loads` | 308 | 324 | 102 |
+| orjson (dev box, no pip on this one) | 795 | 868 | 557 |
+| simdjson DOM (haswell, this box) | 3 977 | 4 362 | 1 421 |
+| simdjson On Demand (first key only: not the same work as the fib.json "3 fields") | 8 933 | 9 623 | 7 783 |
+| **serialise** (MB/s of output) JSON-1 | 258 | 160 | 95 |
+| fib.json write, JSON-2, default allocator | 330 | 284 | 98 |
+| fib.json write, JSON-2, tuned allocator | 412 | 318 | 104 |
+| Jackson `writeValueAsBytes` | 760 | 440 | 248 |
+| Python `json.dumps` | 455 | 208 | 59 |
+| orjson (dev box) | 3 020 | 1 500 | 1 079 |
+| **NDJSON 100 MB** JSON-1 (`reduce-lines`) | 77.7 | | |
+| fib.json `reduce-lines`, default / tuned | 98.7 / 120 | | |
+| fib.json `reduce-lines-par` (DOM per line on 16 threads), default / tuned | 100.6 / 125 | | |
+| fib.json `validate-lines` (tape per line, 16 threads), default / tuned | **1 599 / 1 396** | | |
+| simdjson `load_many` / Python line loop / Jackson line loop | 658 / 90.6 / 77.0 | | |
+
+**Against the targets** (set before the work): tape at least 1.5 GB/s: met on twitter and citm with the tuned allocator (1.8 and 2.3 GB/s), not by default (0.9 and 1.2) and not on canada (1.05 / 0.65: a float
+document, the time is the number scan and the index of 111 k numbers in 2 MB). Within 2 to 4 times of simdjson on parse: the tape is 2.2x, 1.9x and 1.4x behind simdjson's DOM (which builds a tape too)
+with the tuned allocator, 4.4x, 3.7x and 2.2x by default. **DOM at least 800 MB/s and on par with Jackson and orjson: not met**: 352 to 583 MB/s, 55 to 60 percent of Jackson on twitter and citm and ahead of it on
+canada (175 to 205 against 99), 40 to 55 percent of orjson on twitter and citm. Typed decode at least tape speed: not met (826 against 908, 1 530 against 1 803: it reads each field by key). **Serialiser at least 1 GB/s: not met**: 330 / 284 / 98
+(412 / 318 / 104 tuned), 1.0 to 1.8 times JSON-1, below Jackson everywhere and below Python's `json.dumps` on twitter, 5 to 11 times below orjson.
+
+### What each lever gave (default allocator unless said; each measured, kept only when it won)
+
+| lever | before | after | note |
+|---|---|---|---|
+| 1 `simd/movemask`, `ctz`, `clz` (ADR 0010) | stage 1 emulated: 700 MB/s (dev box) | 2.3 to 2.9 GB/s (dev box), 4.9 GB/s tuned and 1.3 default (Ryzen); a C version of the same block loop: 4.4 to 4.7 GB/s on the Ryzen | the classification alone runs at 8.5 to 9.9 GB/s (Ryzen), the extraction of positions is the rest |
+| 2 index-driven tape | 694 / 704 / 446 | 854 / 1 073 / 508 (first cut), 918 / 1 177 / 651 with eight-digit number scans | stage 1 + stage 2 + fallback to the scalar builder for exact errors; 12 planted faults |
+| 3 DOM from the tape | 192 / 356 / 156 | 341 / 435 / 138 (exact-size Vecs, in-place small ints), 352 / 468 / 175 (float token pass, key cache) | the allocation per value stays (a `Json` is a heap enum, a `str` is an owned array: no slice type) |
+| 4 serialiser | 258 / 160 / 95 | 263 / 223 / 88 (position-passing core, restart on a full block from 4 KiB by eight), 330 / 284 / 98 (4 KiB, then 4 MiB) | string scan 32 bytes at a time: +15 percent on twitter alone; the per-value cost (about 12 ns for a null in an array of 200 000) is the walk over `Vec`s and the enum, not the bytes |
+| 5 NDJSON | 77.7 | 98.7 sequential; parallel DOM 100.6; parallel validate 1 599 | the parallel DOM does not scale: the runtime's allocator is global (`fib.mt` takes the slow path for every allocation), and every value is an allocation; validation allocates one array per line and scales |
+| 6 typed path | no path | `$.members[1].tags[0]: expected str, found boolean`; a missing required record field no longer traps (JSON-1 bug: `json->Record d -1`) | `JObj` hash index: not done |
+
+**What lost or did nothing** (kept out of the code, recorded here): writing 16 positions at a time instead of eight (no change; four at a time inlines, an eight-at-a-time function is not inlined and costs
+a `vzeroupper` per call), the checked `+` and `*` in the block loop (the overflow branches stopped LLVM from inlining the position writer: `unchecked-add` and `shl` fixed it, 2.3 to 2.9 GB/s), a
+256-slot key cache for the DOM (no measurable change: kept, it is cheap), a pre-sized 8 MiB write buffer (no change: the cost is not the growth), a `str` copy in the writer's tail (replaced by overlapping
+loads and stores for up to 32 bytes). `perf` is blocked on both boxes (`perf_event_paranoid` 4, and gdb cannot attach), so there was no profile: the decisions above are from experiments that remove one piece
+at a time.
+
+**Mac Studio (M1 Ultra, aarch64, llvm@21)**: stage 2 built from this tree by the 0.1.8 darwin seed (1 min 24 s); case 7980 (`simd/movemask` at 4 to 64 lanes, `ctz`, `clz`) and the 88 other vector cases (62xx)
+pass; `json-simd-spec`, `json-fast-spec`, `json-lines-spec`, `json-prop-spec`, `json-codec-spec`, `json-api-spec`, `json-testsuite-spec`, `json-floats-spec` pass on the NEON lowering. `json-spec`
+dies with status 138 (SIGBUS) on the Mac with JSON-1's library as well (checked at 3f71c08): not caused by this work (the DOM parser's recursion to the depth limit against a thread stack).
+No aarch64 speed was measured.
+
+Ryzen results of this run (raw): `scripts/bench/json/` printed them with `fibber-bench dom|tape|write|three|typed|lines|linespar|validatepar FILE REPS`.
+
 ## Corpora and tools
 
 | | version | where from | sha256 |
