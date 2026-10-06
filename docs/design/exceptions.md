@@ -495,3 +495,52 @@ A server that must survive a bad request runs each handler in a task and asks wi
 
 `(reply "divide" 0)` is `error -32603 integer / by zero`; the next `(reply "double" 4)` is `result 8`. Cost: one thread per request (about 27 us); each trap
 abandons what that handler owned, so this is for a server that restarts daily, not for one that traps in a loop (W3 above); stage 2 replaces it.
+
+## 9. Stage 2 as built (2026-10-06)
+
+Built on the lead's decisions of 2026-10-05 (mechanism (b), the fatal list, `&` write-back, `cell-update!` poisoning, trap-free `array-take!`
+regions, a trap in a `finally` while unwinding fatal) and recorded as docs/adr/0009. Cases `stdlib/7870` to `7891`; planted faults
+`scripts/mutant-catch.sh MODE` (ten modes, each kills the cases its header names).
+
+| Piece | Where |
+|---|---|
+| the convention: in a program that calls `catch-run`, every body, closure code and vtable function returns `{ T ptr }` (`ptr` for unit); a result of two leaves or a SIMD vector keeps its type and takes a failure slot `exs` as a last parameter (`{ {i1,i64}, ptr }` has three leaves, which LLVM returns in memory, and no tail call can: found by compiling every ownership case with `FIB_CATCH=all`) | `compiler/emit/ir.fib` (`fb-ret-text`, `fb-slot?`, `unwind-ret`), `compiler/emit/lower/call.fib` (`callee-unwinds?`, `call-checked`, `fresh-slot`) |
+| the may-throw decision: per **program** (`emit.program` `program-unwinds?`); a program that never calls `catch-run` has no observer of a failure, so its code is byte-identical to before (12 bench programs compared, user code) and a trap aborts as before | `compiler/emit/program.fib` |
+| what a frame releases when a call fails: the ownership plan's, recorded by the final walk at every call and `match` (`w-put-unwind`: the scopes' owning sites and the owned parameters the path has not handed over, which is what a tail call's jump releases), kept in `guard-fail` under the key `-1 - e`; plus the arguments evaluated and not yet handed over (`pending`: owned temporaries, retained and stolen arguments, which the plan makes temporaries only after every argument is walked); plus the write-back of the call's `&` arguments | `compiler/own/walk/state.fib`, `call.fib`, `pattern.fib`; `compiler/emit/lower/call.fib` (`hold`, `lcx-unwind-exit`, `unwind-releases`) |
+| trap sites: `trap`, index, overflow, zero divisor, `array-pop!` of nothing, `array-uninit`, a `match` with no clause, `join` of a failed task, `throw-object` raise the failure (`fib.raise-*`) and unwind where the plan says what the frame holds; elsewhere the trap as before | `compiler/emit/lower/cx.fib` (`lcx-fail`, `lcx-catchable?`), `builtins.fib`, `ctrl.fib`, `threads.fib` |
+| runtime: the thread's catch state (a pthread key: depth, the failure caught last, finally depth); a trap unwinds only while a catch is active on its thread; `catch-enter/leave`, `caught-take`, `raise-bytes/-c/-index/-object`, `unwound-fatal`, `finally-enter/leave`, `fatal-finally` | `rt/core.lir` |
+| fatal where a failure cannot be passed on: a `def` initialiser and an async body (they are called by code that does not test), the function of `cell-update!` (`fatal-while`), a function that calls `array-take!` (`takes-slots?`) | `compiler/emit/lower/mod.fib`, `cells.fib` |
+| the library: `throw`, `try` (`catch`, `catch .. :when`, `finally`), `try-result`, `ex`, `ex-assoc`, `ex-kind`; `transact` of fib.db rolls back on a failure | `lib/fib/ex.fib`, `lib/fib/db/core.fib` |
+
+**Differences from 4.2, and why.** `try` is a library macro over the builtin `catch-run` and a closure, not a core form: the expander is
+another agent's, and a closure gives rules (iv) (no `recur` out of the body: case 7889) and the `await` rule for free. There is one exception
+type, `(ExInfo (Map keyword Datum))` (fib.datum, not the unbuilt `Val`); `(catch T e ..)` is `(catch e :when cond ..)`. The may-throw effect
+is a per-program switch, not a per-function inference: inside a catching program every function uses the convention (the inference would
+let leaves keep the plain one; not built). Poisoning (`cell-reset!`) and the trap-free-region checker are not built: both regions are fatal
+instead, which is sound and loses only catchability there. `with-view` needs nothing: a window is a base and a length into an array that never
+leaves its place (case 7879). Async bodies do not pass failures on (a trap in an `async` body run under a joiner's `try` is the trap it was).
+
+**Measured** (this machine, shared; `FIB_CATCH=all` compiles any program as one that catches):
+
+- Every ownership case passes compiled as a catching program (354 of 354, verdicts and audits included); stdlib 1294 pass, 20 open (as
+  without), 2 fail: 1707 fails on main too (`scripts/ci-stage2.expected`), 6221 failed with a vector result before vectors took the slot
+  (fixed).
+- Happy-path cost of a catching program, quick bench plus recursion and binary-trees, median of 5 under `/tmp/fibsuite.lock`
+  (`BENCH_FIBC=F3 scripts/bench/quick.sh -n 5 ..`, then the same with `FIB_CATCH=all`), seconds plain -> catching: num-f64 1.70 -> 1.62,
+  num-nbody 0.71 -> 0.69, vec-conj-pop 1.01 -> 0.98, vec-index 0.44 -> 0.42, vec-sort 0.48 -> 0.53 (+10 %), map-assoc-get 0.29 -> 0.33 (+14 %),
+  set-conj 0.24 -> 0.26 (+8 %), lazy-fused 0.92 -> 0.99 (+8 %), lazy-bound 0.04 -> 0.04, strings 0.71 -> 0.81 (+14 %), recursion 2.28 -> 2.41
+  (+6 %), binary-trees 1.46 -> 1.66 (+14 %); no checksum changed. Between -5 % and +14 %: the 0 to 13 % range section 3.1 measured for (a), not the
+  "within noise" of the micro; the plain run itself was 10 to 35 % off the recorded baseline for identical code, so the noise is of that size.
+  A program that does not catch pays nothing (identical user code).
+- Compile time: `emit compiler/fibc.fib`, median of 3: 17.00 s (main) and 17.01 s (this tree), once the unwinding releases are recorded by
+  the final walk only (recording them in every walk cost 14 %).
+- Caught failures (test 13): `scripts/bench/throw-catch.fib`, a million iterations each owning a vector and a string three frames deep,
+  750,000 of them failing (500,000 throws, 250,000 index traps) and caught in the loop: 0.25 0.25 0.25 0.27 0.29 s (5 runs, under the suite
+  lock; start-up 0.00 s), about 330 ns per caught failure including the loop's own work and the exception's allocation; maximum resident set
+  1.5 MB at a million and at ten million iterations (2.58 s): nothing grows. The audit of the 1,000-iteration run: 12,007 allocations, 12,007
+  frees. Native throws of 3.1 (58 ns through ten frames) were a micro without the exception object.
+- The JS backend (U6) needed no change: it sees lIR only. `compiler/tests/js/check.sh` with this tree's stage 2: 8121 runtime checks, 441 pass,
+  the listed differ/unsupported only; catching programs emitted with `fibc emit` run under node with the native answers (t1 53, the README's
+  example -1 and its `done`); a program with a spawned task stays unsupported there (no `pthread_create`).
+- Async: a trap in an `async` body joined inside a `try` is the trap it was (`trap: nth: index out of range`, exit 134); a `try` inside a
+  spawned task's function works as anywhere (its thread has its own catch state).

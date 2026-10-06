@@ -1,0 +1,23 @@
+;; spec:   docs/design/exceptions.md 4.2 (stage 2), stdlib §2.10 step 2 (rows throw try catch finally); docs/adr/0009
+;; expect: accept
+;; result: 42
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; Test 4 of the design (nested try): the inner catch throws a new exception made from the trap it caught; the outer catch gets that one;
+;; the inner finally runs before the outer; the objects owned at each level (a vector, a string, the exceptions) are freed. Killed by:
+;; scripts/mutant-catch.sh `no-release` (a leak) and `no-catch`.
+(ns main (:use fib.core fib.ex fib.datum))
+
+(defun main () -> i64
+  (let ((order (cell [])))
+    (let ((r (try
+               (let ((outer-owned [1 2 3]))
+                 (try
+                   (let ((inner-owned (str-concat "x" "y")))
+                     (+ (str-len inner-owned) (nth outer-owned 7)))
+                   (catch e (throw (ex-assoc (ex (str-concat "rethrown: " (ex-message e))) :level (DInt 1))))
+                   (finally (set! order (conj @order 1)))))
+               (catch e (if (= (ex-message e) "rethrown: nth: index out of range") 40 0))
+               (finally (set! order (conj @order 2))))))
+      (+ r (if (= @order [1 2]) 2 0)))))

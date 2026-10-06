@@ -65,11 +65,11 @@
 ;; finding them); whether tail sites are admitted by rule (e) with these facts; the
 ;; scope-local sites once known; the expressions that are the last use of the binding they read
 ;; (own.lastuse; none until the last walk), and the reads of field variables that are the last use of a field
-;; whose shell nothing else reads afterwards.
+;; whose shell nothing else reads afterwards; `unwinds`: the walk whose plan is kept records the releases of an unwinding (`w-put-unwind`).
 (defstruct Ctx
   (p: TypedProgram summaries: (Map i64 Summary) facts: Facts scc: (Vec i64) all-owned: bool
    tail-sites: (Option (Map i64 Tail)) admit: bool scope-local: (Set Site) dead: (Set i64) steal: (Set i64) amp: (Set i64) reuse: (Map i64 i64)
-   bodies: (Map BodyKey BodyOwn)))
+   bodies: (Map BodyKey BodyOwn) unwinds: bool))
 
 (defenum FrameKind FkDefun FkMethod FkFn FkAsync FkDef)
 (derive Eq FrameKind)
@@ -176,6 +176,14 @@
   (let [o @(. w out)] (set! (. w out) (with o (allocs (assoc (. o allocs) e a))))))
 (defun w-put-guard-fail (w: Walker e: i64 ops: (Vec Op)) -> unit
   (let [o @(. w out)] (set! (. w out) (with o (guard-fail (assoc (. o guard-fail) e ops))))))
+
+;; The releases of an unwinding at expression e (docs/design/exceptions.md 4.2, ADR 0009): when a call fails at e (or a `match` finds no
+;; clause), the frame releases what it holds there: every owning site of its scopes and every owned parameter that the path has not
+;; handed over, as a jump would (`moved`: what the call itself takes). Kept in `guard-fail` under the key `-1 - e` (no guard has a negative
+;; id), so the plan's shape and its dump do not change; emit.lower.call reads it.
+(defun w-put-unwind (w: Walker e: i64 moved: (Set Site)) -> unit
+  (when (. (. w cx) unwinds)
+    (w-put-guard-fail w (- -1 e) (into (w-release-scopes w 0 moved WhyJump) (w-release-params w moved false WhyJump)))))
 
 ;; The frame depth that owns a site, the §6.11 candidate it initialises, the decision at a call in
 ;; tail position.

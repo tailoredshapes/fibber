@@ -1,0 +1,25 @@
+;; The cost of a caught failure (docs/design/exceptions.md 9, test 13): N iterations, each owning a vector and a string three frames deep
+;; when the deepest frame throws (every second iteration) or traps (an index out of range, every fourth); every failure is caught by the
+;; try in the loop. Prints the sum of what the catches and the returns answered; the rate is N / the run time.
+;;   fibc build scripts/bench/throw-catch.fib -o tc && /usr/bin/time ./tc 1000000
+(ns main (:use fib.core fib.ex fib.datum))
+
+(defun leaf (v: (Vec i64) i: i64) -> i64
+  (cond (= (rem i 4) 0) (nth v 7)
+        (= (rem i 2) 0) (throw (ex-assoc (ex "even") :i (DInt i)))
+        :else (count v)))
+
+(defun mid (v: (Vec i64) i: i64) -> i64
+  (let ((s (str-concat "mid" (show (rem i 10)))))
+    (+ (str-len s) (leaf v i))))
+
+(defun top (i: i64) -> i64
+  (let ((v [i 1 2]))
+    (+ 1 (mid v i))))
+
+(defun main () -> i64
+  (let ((n (match (parse-long (unwrap-or (get (args) 0) "1000000")) ((some k) k) (nil 1000000))))
+    (loop ((i 0) (acc 0))
+      (if (= i n)
+          (do (println (show acc)) 0)
+          (recur (+ i 1) (+ acc (try (top i) (catch e (if (= (ex-kind e) (some "index")) 2 1)))))))))

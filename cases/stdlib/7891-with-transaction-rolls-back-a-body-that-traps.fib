@@ -1,0 +1,29 @@
+;; spec:   docs/design/exceptions.md 4.2 (stage 2), stdlib §2.10 step 2 (rows throw try catch finally); docs/adr/0009
+;; expect: accept
+;; result: 1107
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; U4 of the design: fib.db's with-transaction rolls back a body that traps or throws, and the failure goes on outwards to the caller's
+;; try. A connection written here records the statements it is given: BEGIN, the body's INSERT, ROLLBACK for the body that traps; BEGIN,
+;; INSERT, COMMIT for the one that returns Ok. Killed by: scripts/mutant-catch.sh `no-catch` (the transaction's catch never runs: no
+;; ROLLBACK, and the outer catch never answers).
+(ns main (:use fib.core fib.ex fib.datum fib.db))
+
+(defstruct Log (sql: (Cell (Vec str))))
+
+(impl Connection Log
+  (conn-execute (self sql params)
+    (do (set! (. self sql) (conj @(. self sql) sql)) (Ok [])))
+  (conn-close (self) (Ok ())))
+
+(defun code (s: str) -> i64
+  (cond (= s "BEGIN") 1 (= s "COMMIT") 2 (= s "ROLLBACK") 3 :else 0))
+
+(defun main () -> i64
+  (let ((lg (Log (cell []))))
+    (let ((a (try (match (with-transaction [tx lg] (do (conn-execute tx "INSERT" []) (nth [1] 5) (Ok 1)))
+                    ((Ok v) v) ((Err e) 50))
+                  (catch e (if (= (ex-kind e) (some "index")) 1000 0))))
+          (b (match (with-transaction [tx lg] (do (conn-execute tx "INSERT" []) (Ok 100))) ((Ok v) v) ((Err e) 0))))
+      (+ a (+ b (reduce (fn (acc: i64 s: str) (+ (* acc 1) (code s))) 0 @(. lg sql)))))))

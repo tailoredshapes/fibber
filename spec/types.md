@@ -779,6 +779,37 @@ their type; `try-join` and the builtin `task-failure : ∀a. (fn ((Task a))
 (Option str))`, which waits as `join` does and answers the message of a
 failed task, are the only new names.
 
+**Amended 2026-10-06, stage 2 of exceptions** (decisions-2026-10-04.md
+"Exceptions (§7)", docs/design/exceptions.md 4.2 and 9, docs/adr/0009; cases
+7870 to 7890). A trap can be **caught**: while a `catch-run` is active on a
+thread, a trap on that thread (the `trap` builtin, an index out of range,
+an integer overflow or zero divisor, a failed `match`, `unwrap` of `nil`,
+`join` of a failed task, and `throw-object`) unwinds the frames between it
+and the innermost `catch-run`, which answers 1 (a trap; `caught-message`
+takes its message) or 2 (a thrown object; `caught-object` takes it)
+instead of 0. Unwinding releases, in every unwound frame, what the
+ownership plan says the frame holds at the failing call (§6.3: the owning
+sites of its scopes and its owned parameters that the path has not handed
+over) and the arguments it had evaluated and not handed over, and writes
+the call's `&` arguments back (the callee's last state, §6.6): the audit
+of a run that caught is `clean`. Where no catch is active, or the failure
+reaches a frame that cannot pass it on, every rule above holds unchanged:
+the abort, or the task's failure. Fatal on every thread, never caught: out
+of memory, a thread or worker that cannot start, a stack overflow, a trap
+inside the runtime's own functions, a trap inside a finally clause run
+while unwinding (`finally-enter` makes the thread catch nothing until
+`finally-leave`), and a failure in a `def`'s initialiser, an `async` body,
+the function of a `cell-update!` (its cell is moved from) or a function that
+calls `array-take!` (a slot is moved from). "The objects live at the abort
+are not leaks" now reads: at an *uncaught* or fatal abort. The builtins are
+`catch-run : (fn ((fn () unit)) i64)`, `caught-message : (fn () str)`,
+`caught-object : ∀a. (Object a) ⇒ (fn () a)` and `throw-object : ∀a b.
+(Object a) ⇒ (fn (a) b)` (both `unsafe`), `catch-active? : (fn () bool)`,
+`finally-enter : (fn () i64)` and `finally-leave : (fn (i64) unit)`;
+`try`, `catch`, `finally` and `throw` are fib.ex's (stdlib §2.10). The
+compiled convention (§8) is in ADR 0009: only a program that calls
+`catch-run` returns failures next to its values.
+
 `(Object a)` is the built-in structural predicate "`a` is not a scalar"
 (a field-less enum is a scalar, §1); `(Weakable a)` is "`a` is an
 object type and not an `(Option ..)`", and implies `(Object a)`. Both

@@ -1,0 +1,19 @@
+;; spec:   docs/design/exceptions.md 4.2 (stage 2), stdlib §2.10 step 2 (rows throw try catch finally); docs/adr/0009
+;; expect: trap
+;; trap:   boom inside a take
+;; stage:  2
+;; roots:  ../../lib support
+;; Test 6 of the design (rule 1 of section 2): `refill` takes a slot of the caller's array with array-take! and traps before it stores the
+;; slot back. Unwinding would hand the caller an array whose slot is null, so a function with an array-take! does not pass failures on: the
+;; trap is the trap it was, even inside a try. Killed by: scripts/mutant-catch.sh `take-unwinds` (the catch answers and reads the moved-from
+;; slot: a null vector, a crash, not this trap).
+(ns main (:use fib.core fib.ex))
+
+(defun refill (&a: (Array (Vec i64))) -> unit
+  (let ((x (array-take! &a 0)))
+    (array-set! &a 0 (if (= (count x) 2) (trap "boom inside a take") x))))
+
+(defun main () -> i64
+  (let ((c (cell (array 2 [1 2]))))
+    (try (do (refill &c) 0)
+         (catch e (count (array-get @c 0))))))

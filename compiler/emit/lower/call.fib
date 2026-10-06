@@ -18,6 +18,7 @@
     ((CalValue)
      (try-let ((v (lcx-value cx head)))
        (do (when (= (. own head) PsRetain) (lcx-retain cx v))
+           (hold cx head (. own head) v)
            (Ok (some v)))))
     (_ (Ok nil))))
 
@@ -29,6 +30,7 @@
      (try-let ((v (lcx-value cx x)))
        (do (when (= pass PsRetain) (lcx-retain cx v))
            (when (= pass PsSteal) (lcx-steal-of cx x v))
+           (hold cx x pass v)
            (try-let ((t (lcx-ty cx x))) (Ok (Pair v t))))))
     ((ArgAmp b _)
      (try-let ((t (lcx-binding-ty cx b)))
@@ -38,6 +40,15 @@
          ((PsForward) (try-let ((v (lcx-local cx b))) (Ok (Pair v t))))
          ((PsOwnCell) (try-let ((v (lcx-local cx b))) (Ok (Pair v t))))
          (_ (Err "an & argument passed as a pass that is not acquire, forward or own-cell")))))))
+
+;; An argument (or the head) that holds a count the frame has not handed over yet: a retained or stolen value, or an owned temporary
+;; (an `Owned` binding's count is the plan's: own.walk.call `unwind-ops`). Kept in `pending` until the call, released if a later argument
+;; fails (docs/design/exceptions.md 4.2).
+(defun hold :private (cx: LowerCx x: Expr pass: Pass v: V) -> unit
+  (when @(. (. cx b) unwind)
+    (let ((owned-temp (= (match (get (. (. cx own) exprs) (. x id)) ((some o) (. o mode)) (nil MScalar)) (MOwned false))))
+      (when (or (= pass PsRetain) (= pass PsSteal) (and owned-temp (or (= pass PsMove) (= pass PsBorrow))))
+        (set! (. cx pending) (conj @(. cx pending) v))))))
 
 ;; Every argument in order: their values and their types.
 (defun call-arguments :private (cx: LowerCx args: (Vec Arg) passes: (Vec Pass)) -> (Result (Pair (Vec V) (Vec Ty)) str)
@@ -272,38 +283,107 @@
 (defun call-arg-texts :private (vals: (Vec V)) -> (Vec str)
   (vec (keep (fn (v: V) (match v ((VVal s _) (some s)) ((VUnit) nil))) vals)))
 
-(defun call-ret-text :private (ret: (Option LirTy)) -> str
-  (match ret ((some t) (lir-ty-text t)) (nil "void")))
+(defun call-ret-text :private (ret: (Option LirTy) uw: bool) -> str
+  (match ret
+    ((some t) (if (and uw (not (lir-aggregate? t))) (str-join ["{ " (lir-ty-text t) " ptr }"]) (lir-ty-text t)))
+    (nil (if uw "ptr" "void"))))
 
 ;; The types of the parameters after `this`: the texts of the types of the values that have one.
 (defun call-param-tys :private (vals: (Vec V)) -> str
   (s/join " " (into ["ptr"] (vec (keep (fn (v: V) (match v ((VVal _ t) (some (lir-ty-text t))) ((VUnit) nil))) vals)))))
 
 ;; The text of the call or tail call of `target` (§8.4): direct, an extern, a vtable's code or a closure's code pointer.
-(defun call-instr :private (cx: LowerCx target: Target vals: (Vec V) ret: (Option LirTy) tail: bool) -> (Result str str)
-  (let ((args (call-arg-texts vals)) (indirect (if tail "indirect-tailcall" "indirect-call")))
+(defun call-instr :private (cx: LowerCx target: Target vals0: (Vec V) ret: (Option LirTy) tail: bool uw: bool slot: (Option str)) -> (Result str str)
+  (let ((vals (match slot ((some s) (conj vals0 (VVal s LirPtr))) (nil vals0)))
+        (args (call-arg-texts vals)) (indirect (if tail "indirect-tailcall" "indirect-call")))
     (match target
       ((TgDirect name env)
        (Ok (str-join ["(" (if tail "tailcall" "call") " @" name (if env " (ptr null)" "") " " (s/join " " args) ")"])))
       ((TgExtern name) (Ok (str-join ["(call @" name " " (s/join " " args) ")"])))
       ((TgCode code this)
-       (Ok (str-join ["(" indirect " " code " (fn tailcc " (call-ret-text ret) " (" (call-param-tys (vec (drop 1 vals))) ")) " this " "
+       (Ok (str-join ["(" indirect " " code " (fn tailcc " (call-ret-text ret uw) " (" (call-param-tys (vec (drop 1 vals))) ")) " this " "
                       (s/join " " (vec (drop 1 args))) ")"])))
       ((TgValue clo)
        (let ((codep (lcx-gep cx "fib.closure" (v-text clo) slot-closure-code)))
          (let ((code (lcx-load cx LirPtr codep)))
-           (Ok (str-join ["(" indirect " " (v-text code) " (fn tailcc " (call-ret-text ret) " (" (call-param-tys vals) ")) " (v-text clo) " "
+           (Ok (str-join ["(" indirect " " (v-text code) " (fn tailcc " (call-ret-text ret uw) " (" (call-param-tys vals) ")) " (v-text clo) " "
                           (s/join " " args) ")"])))))
       (_ (Err "not a callable target")))))
 
+;; Whether the target returns a failure next to its value (docs/design/exceptions.md 4.2): in a program that catches, every body, closure
+;; code and vtable function does (a `def`'s initialiser and an async body are never called this way).
+(defun callee-unwinds? :private (cx: LowerCx target: Target) -> bool
+  (and (. (. cx p) unwinding) (not @(. (. cx p) macro-module))
+       (match target ((TgDirect _ _) true) ((TgValue _) true) ((TgCode _ _) true) (_ false))))
+
 ;; The call itself: `call` or `tailcall`, direct or through a closure's code pointer. Rust: lower/call.rs:342 LowerCx::emit_call
 (defun lcx-emit-call (cx: LowerCx target: Target vals: (Vec V) rt: Ty tail: bool) -> (Result V str)
-  (try-let ((ret (program-lir (. cx p) rt)) (instr (call-instr cx target vals ret tail)))
-    (if tail
-        (do (fb-term (. cx b) instr) (Ok VUnit))
-        (match ret
-          ((some t) (Ok (fb-val (. cx b) instr t)))
-          (nil (do (fb-stmt (. cx b) instr) (Ok VUnit)))))))
+  (let ((uw (callee-unwinds? cx target)))
+    (try-let ((ret (program-lir (. cx p) rt))
+              (slot (Ok (if (and uw (match ret ((some t) (lir-aggregate? t)) (nil false)))
+                            (some (if tail "exs" (fresh-slot cx)))
+                            nil)))
+              (instr (call-instr cx target vals ret tail uw slot)))
+      (cond
+        tail (do (fb-term (. cx b) instr) (Ok VUnit))
+        uw (Ok (call-checked cx instr ret slot))
+        :else (match ret
+                ((some t) (Ok (fb-val (. cx b) instr t)))
+                (nil (do (fb-stmt (. cx b) instr) (Ok VUnit))))))))
+
+;; The failure slot of one call of a function with a two-leaf result (emit.ir `lir-aggregate?`), null before the call.
+(defun fresh-slot :private (cx: LowerCx) -> str
+  (let ((s (fb-entry-alloca (. cx b) "ptr" 8)))
+    (do (fb-stmt (. cx b) (str-join ["(store (ptr null) " s ")"])) s)))
+
+;; A call of a function that may return a failure: its value, after the branch to the unwinding when the failure is not null.
+(defun call-checked :private (cx: LowerCx instr: str ret: (Option LirTy) slot: (Option str)) -> V
+  (let ((b (. cx b)))
+    (match ret
+      ((some t) :when (some? slot)
+       (let ((v (fb-val b instr t)))
+         (do (unwind-branch cx (fb-val b (str-join ["(load ptr " (unwrap slot) ")"]) LirPtr)) v)))
+      ((some t)
+       (let ((r (fb-val b instr t)))
+         (let ((v (fb-val b (str-join ["(extractvalue " (v-text r) " 0)"]) t))
+               (ex (fb-val b (str-join ["(extractvalue " (v-text r) " 1)"]) LirPtr)))
+           (do (unwind-branch cx ex) v))))
+      (nil (do (unwind-branch cx (fb-val b instr LirPtr)) VUnit)))))
+
+(defun unwind-branch :private (cx: LowerCx ex: V) -> unit
+  (let ((b (. cx b)) (lu (fb-label (. cx b) "unwind")) (lk (fb-label (. cx b) "returned")))
+    (do (fb-term b (str-join ["(br (icmp ne " (v-text ex) " (ptr null)) " lu " " lk ")"]))
+        (fb-open b lu)
+        (lcx-unwind-exit cx (v-text ex))
+        (fb-open b lk))))
+
+;; The unwinding of the frame with the failure `ex` (the hub's `unwind`): the `&` arguments of the call written back, the pending
+;; arguments and what the plan says the frame holds here released, the failure returned. Where the frame cannot pass it on, the trap
+;; it is, as before (fib.unwound-fatal).
+(defun lcx-unwind-exit (cx: LowerCx ex: str) -> unit
+  (let ((b (. cx b)))
+    (match (if (lcx-catchable? cx) @(. cx unwind-ops) nil)
+      (nil (unwind-fatal cx ex))
+      ((some ops)
+       (match (unwind-releases cx ops)
+         ((Err _) (unwind-fatal cx ex))
+         ((Ok _) (if (fb-slot? b)
+                     (do (fb-stmt b (str-join ["(store " ex " exs)"]))
+                         (fb-term-raw b (str-join ["(ret (zeroinitializer " (lir-ty-text (unwrap @(. b ret))) "))"])))
+                     (fb-term-raw b (match @(. b ret)
+                                      ((some t) (str-join ["(ret { (zeroinitializer " (lir-ty-text t) ") " ex " })"]))
+                                      (nil (str-join ["(ret " ex ")"])))))))))))
+
+(defun unwind-fatal :private (cx: LowerCx ex: str) -> unit
+  (do (fb-stmt (. cx b) (str-join ["(call @fib.unwound-fatal " ex ")"]))
+      (fb-term (. cx b) "(unreachable)")))
+
+(defun unwind-releases :private (cx: LowerCx ops: (Vec Op)) -> (Result unit str)
+  (try-let ((wb (match @(. cx unwind-wb)
+                  ((some w) (call-write-backs cx (. w fst) (. (. w snd) fst) (. (. w snd) snd)))
+                  (nil (Ok ())))))
+    (do (doseq [v (reverse @(. cx pending))] (lcx-release cx v))
+        (lcx-run-ops cx ops))))
 
 ;; ---- the site
 
@@ -339,7 +419,8 @@
     (try-let ((rt (lcx-ty cx e)) (ran (if tail (lcx-run-ops cx (. own jump)) (Ok ()))))
       (if (and tail (call-jumpable target))
           (try-let ((c (lcx-emit-call cx target vals rt true))) (Ok FlowJump))
-          (try-let ((r (call-result cx e target vals tys rt)))
+          (try-let ((r (with-unwind cx (unwind-ops-of cx e tail) (some (Pair own (Pair vals tys)))
+                                    (fn () (call-result cx e target vals tys rt)))))
             (match r
               (nil (Ok FlowJump))
               ((some result)
@@ -348,6 +429,22 @@
                      (do (fb-term (. cx b) (match result ((VUnit) "(ret)") ((VVal s _) (str-join ["(ret " s ")"]))))
                          (Ok FlowJump))
                      (Ok (FlowVal result)))))))))))
+
+;; What the plan says the frame holds at call `e` (own.walk.call `unwind-ops`, kept under the key `-1 - e`); a tail call that is not a
+;; jump has run its releases already.
+(defun unwind-ops-of :private (cx: LowerCx e: Expr tail: bool) -> (Option (Vec Op))
+  (if tail (some []) (get (. (. cx own) guard-fail) (- -1 (. e id)))))
+
+;; Runs `f` with the unwinding state of a call; the state of the enclosing code after.
+(defun with-unwind :private (cx: LowerCx ops: (Option (Vec Op)) wb: (Option (Pair CallOwn (Pair (Vec V) (Vec Ty))))
+                             f: (fn () (Result (Option V) str))) -> (Result (Option V) str)
+  (let ((o0 @(. cx unwind-ops)) (w0 @(. cx unwind-wb)))
+    (do (set! (. cx unwind-ops) ops)
+        (set! (. cx unwind-wb) wb)
+        (let ((r (f)))
+          (do (set! (. cx unwind-ops) o0)
+              (set! (. cx unwind-wb) w0)
+              r)))))
 
 ;; Whether the callee is a method of the protocol `Div` (whose vector instance is the library's, fib.simd).
 (defun div-method? :private (cx: LowerCx c: Callee) -> bool
@@ -360,7 +457,9 @@
   (match (get (. (. cx own) calls) (. e id))
     (nil (Err "no plan for a call"))
     ((some own)
-     (try-let ((hv (call-head-value cx head own)) (r (call-arguments cx args (. own args)))
-               (vals0 (call-copy-in cx args (. own args) (. r fst))) (vals (Ok (if (div-method? cx (. own callee)) (lcx-splat-pair cx vals0) vals0)))
-               (target (call-target cx head (. own callee) hv vals (. r snd))))
-       (call-site cx e own target vals (. r snd))))))
+     (let ((held (count @(. cx pending))))
+       (try-let ((hv (call-head-value cx head own)) (r (call-arguments cx args (. own args)))
+                 (vals0 (call-copy-in cx args (. own args) (. r fst))) (vals (Ok (if (div-method? cx (. own callee)) (lcx-splat-pair cx vals0) vals0)))
+                 (target (call-target cx head (. own callee) hv vals (. r snd))))
+         (do (set! (. cx pending) (vec (take held @(. cx pending))))
+             (call-site cx e own target vals (. r snd))))))))

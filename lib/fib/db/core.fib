@@ -5,7 +5,7 @@
 ;; Rows are `(Map str Datum)` keyed by the column's label as the database reports it (next.jdbc's unqualified maps). They are not keyed by
 ;; keyword because the prelude cannot make a keyword at run time (no `keyword`, stdlib row 1505 is not built); `col` takes a keyword
 ;; for the reader's sake and looks its text up.
-(ns fib.db.core (:use fib.core fib.seq fib.coll fib.datum))
+(ns fib.db.core (:use fib.core fib.seq fib.coll fib.datum fib.ex))
 
 ;; What a failed operation came to. `sqlstate` is the SQL standard's five-character class and code ("23505" a unique violation, "42601"
 ;; a syntax error, "08006" a lost connection); a driver whose database has none (SQLite) maps its codes onto them (fib.db.sqlite), and
@@ -49,9 +49,10 @@
               ((Err e) (do (conn-execute c "ROLLBACK" []) (Err e)))))
     ((Err e) (do (conn-execute c "ROLLBACK" []) (Err e)))))
 
-;; BEGIN, the body, then COMMIT when it returned Ok and ROLLBACK when it returned Err (or the COMMIT failed). There is no catch (design
-;; 4.6): a body that traps ends its task without either; `try-transact` (package D3) runs the body in a task and rolls back after it.
+;; BEGIN, the body, then COMMIT when it returned Ok and ROLLBACK when it returned Err (or the COMMIT failed). A body that traps or
+;; throws is rolled back and the failure goes on outwards (exceptions stage 2, docs/design/exceptions.md 9: catching a trap here makes the
+;; program one that catches, ADR 0009; case 7891).
 (defun transact (c: c body: (fn (c) (Result a DbError)) :borrow) :where ((Connection c)) -> (Result a DbError)
   (match (conn-execute c "BEGIN" [])
     ((Err e) (Err e))
-    ((Ok _) (finish c (body c)))))
+    ((Ok _) (finish c (try (body c) (catch x (do (conn-execute c "ROLLBACK" []) (throw x))))))))

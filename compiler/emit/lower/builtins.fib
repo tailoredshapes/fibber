@@ -6,7 +6,7 @@
 ;; one is the Rust's error. The `trap` arm of a macro module (`fib.trap-at`, Rust `p.macro_module`) is E11's.
 (ns emit.lower.builtins
   (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.layout emit.ir emit.program emit.objects.kinds
-        emit.lower.cx emit.lower.ops emit.lower.cells emit.lower.arith emit.lower.pattern emit.lower.strfind emit.lower.threads emit.lower.freeze emit.lower.simd emit.lower.simdmem))
+        emit.lower.cx emit.lower.ops emit.lower.cells emit.lower.arith emit.lower.pattern emit.lower.strfind emit.lower.threads emit.lower.freeze emit.lower.simd emit.lower.simdmem emit.lower.catch))
 
 ;; Argument `i` of the builtin `name`. Rust: the closure `arg` of lower/builtins.rs:16
 (defun arg :private (name: str a: (Vec V) i: i64) -> (Result V str)
@@ -19,15 +19,22 @@
 
 ;; A builtin call; `nil` when it does not return (`trap`). Rust: lower/builtins.rs:15 LowerCx::builtin
 (defun lcx-builtin (cx: LowerCx name: str e: Expr a: (Vec V) tys: (Vec Ty)) -> (Result (Option V) str)
-  (if (= name "trap")
-      (try-let ((m (arg name a 0)))
-        ;; In a macro module the trap fails the expansion with the interpreter's text, `POS: trap: MSG`, and does not return.
-        (do (fb-stmt (. cx b) (if @(. (. cx p) macro-module)
-                                  (str-join ["(call @fib.trap-at (string \"" (lir-text (pos-text (. e pos))) "\") " (v-text m) ")"])
-                                  (str-join ["(call @fib.trap " (v-text m) ")"])))
-            (fb-term (. cx b) "(unreachable)")
-            (Ok nil)))
-      (try-let ((v (builtin-core cx name e a tys))) (Ok (some v)))))
+  (cond
+    (= name "trap")
+    (try-let ((m (arg name a 0)))
+      ;; In a macro module the trap fails the expansion with the interpreter's text, `POS: trap: MSG`, and does not return.
+      (do (lcx-fail cx (if @(. (. cx p) macro-module)
+                           (str-join ["(call @fib.trap-at (string \"" (lir-text (pos-text (. e pos))) "\") " (v-text m) ")"])
+                           (str-join ["(call @fib.trap " (v-text m) ")"]))
+                    (str-join ["(call @fib.raise " (v-text m) ")"]))
+          (Ok nil)))
+    (= name "throw-object")
+    (try-let ((x (arg name a 0)))
+      (do (lcx-fail cx (str-join ["(call @fib.unwound-fatal (call @fib.raise-object " (v-text x) "))"])
+                    (str-join ["(call @fib.raise-object " (v-text x) ")"]))
+          (Ok nil)))
+    (= name "catch-run") (try-let ((f (arg name a 0))) (Ok (some (lcx-catch-run cx f))))
+    :else (try-let ((v (builtin-core cx name e a tys))) (Ok (some v)))))
 
 ;; ---- cells, weak references, the macro hooks, threads, `not`
 
@@ -102,6 +109,12 @@
     ("spawn" (try-let ((f (arg name a 0))) (lcx-spawn cx e f)))
     ("join" (try-let ((t (arg name a 0))) (lcx-join cx e t)))
     ("task-failure" (try-let ((t (arg name a 0))) (lcx-task-failure cx t)))
+    ;; the rest of the catching (docs/design/exceptions.md 4.2): runtime calls (rt/core.lir)
+    ("caught-message" (Ok (fb-val (. cx b) "(call @fib.caught-take (i64 1))" LirPtr)))
+    ("caught-object" (Ok (fb-val (. cx b) "(call @fib.caught-take (i64 0))" LirPtr)))
+    ("catch-active?" (Ok (fb-val (. cx b) "(call @fib.catching)" LirI1)))
+    ("finally-enter" (Ok (fb-val (. cx b) "(call @fib.finally-enter)" LirI64)))
+    ("finally-leave" (try-let ((d (arg name a 0))) (do (fb-stmt (. cx b) (str-join ["(call @fib.finally-leave " (v-text d) ")"])) (Ok VUnit))))
     ("not" (try-let ((x (arg name a 0))) (Ok (fb-val (. cx b) (str-join ["(xor " (v-text x) " (i1 1))"]) LirI1))))
     ("lane" (try-let ((v (arg name a 0)) (i (arg name a 1))) (Ok (lcx-lane cx v i))))
     ("with-lane" (try-let ((v (arg name a 0)) (i (arg name a 1)) (x (arg name a 2))) (Ok (lcx-with-lane cx v i x))))
@@ -214,8 +227,8 @@
         (lo (fb-label b "inb")) (lt (fb-label b "oob")))
     (do (fb-term b (str-join ["(br " (v-text ok) " " lo " " lt ")"]))
         (fb-open b lt)
-        (fb-stmt b (str-join ["(call @fib.trap-index " (v-text i) " " (v-text n) ")"]))
-        (fb-term b "(unreachable)")
+        (lcx-fail cx (str-join ["(call @fib.trap-index " (v-text i) " " (v-text n) ")"])
+                  (str-join ["(call @fib.raise-index " (v-text i) " " (v-text n) ")"]))
         (fb-open b lo)
         (v-text (fb-val b (elem-ptr r arr (v-text i)) LirPtr)))))
 
@@ -308,8 +321,7 @@
       (let ((n (lcx-load cx LirI64 lp)))
         (do (fb-term b (str-join ["(br " (v-text (fb-val b (str-join ["(icmp sgt " (v-text n) " (i64 0))"]) LirI1)) " " lo " " lt ")"]))
             (fb-open b lt)
-            (fb-stmt b "(call @fib.trap-c (string \"array-pop! on an empty array\"))")
-            (fb-term b "(unreachable)")
+            (lcx-trap-c cx "array-pop! on an empty array")
             (fb-open b lo)
             (let ((n1 (fb-val b (str-join ["(sub " (v-text n) " (i64 1))"]) LirI64)))
               (let ((ep (fb-val b (elem-ptr r (v-text arr) (v-text n1)) LirPtr)))
@@ -357,8 +369,7 @@
         (valid (fb-val b (str-join ["(icmp ule " (v-text n) " (i64 " (str limit) "))"]) LirI1)))
     (do (fb-term b (str-join ["(br " (v-text valid) " " ok " " bad ")"]))
         (fb-open b bad)
-        (fb-stmt b "(call @fib.trap-c (string \"array-uninit: invalid length\"))")
-        (fb-term b "(unreachable)")
+        (lcx-trap-c cx "array-uninit: invalid length")
         (fb-open b ok)
         (fb-val b (str-join ["(call @fib.array-alloc " (v-text n) " (i32 " (str (. r tid)) ") (i64 " (str (. r esize)) "))"]) LirPtr))))
 
