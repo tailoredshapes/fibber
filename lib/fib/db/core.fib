@@ -56,3 +56,15 @@
   (match (conn-execute c "BEGIN" [])
     ((Err e) (Err e))
     ((Ok _) (finish c (try (body c) (catch x (do (conn-execute c "ROLLBACK" []) (throw x))))))))
+
+;; Runs the body with the connection `opened` holds and closes it exactly once, whether the body returns, returns an Err or traps (the trap
+;; goes on outwards after the close). An Err from `opened` is returned as it is and the body does not run. When the body gave Ok and the
+;; close fails, the close's error is the result. Used as `(with-connection [c (open-x ..)] body ..)` (fib.db).
+(defun call-with-connection (opened: (Result c DbError) body: (fn (c) (Result a DbError)) :borrow) :where ((Connection c)) -> (Result a DbError)
+  (match opened
+    ((Err e) (Err e))
+    ((Ok conn)
+     (let [r (try (body conn) (catch x (do (conn-close conn) (throw x))))]
+       (match (conn-close conn)
+         ((Err e) (match r ((Ok _) (Err e)) ((Err b) (Err b))))
+         ((Ok _) r))))))

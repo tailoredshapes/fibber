@@ -1,0 +1,41 @@
+;; fib.db's core over the memory fake: with-connection closes exactly once on every way out, with-transaction on a trap, with a
+;; planted fault for each (checked by hand, see the commit message).
+(ns main (:use fib.core fib.seq fib.coll fib.ex fib.test.core fib.test.run fib.db fib.db.memory))
+
+(defun table! (c: MemConn) -> unit (do (execute! c ["create table t (id integer primary key, name text)"]) ()))
+(defun no-open () -> (Result MemConn DbError) (Err (DbError "08001" 14 "cannot open")))
+(defun closes (n: (Atom i64)) -> i64 @n)
+
+(defspecs specs
+  (feature "with-connection"
+    (scenario "closes once when the body returns Ok, and answers the body's value"
+      (given [n (atom 0)])
+      (upon [r (with-connection [c (Ok (open-memory-counting n))] (Ok 7))])
+      (then (expect = 1 (closes n)) (expect = 7 (match r ((Ok v) v) ((Err _) -1)))))
+    (scenario "closes once when the body returns an Err, and answers it"
+      (given [n (atom 0)])
+      (upon [r (with-connection [c (Ok (open-memory-counting n))] (execute! c ["selec 1"]))])
+      (then (expect = 1 (closes n)) (expect = "42601" (match r ((Err e) (. e sqlstate)) ((Ok _) "ok")))))
+    (scenario "closes once when the body traps, and the trap goes on"
+      (given [n (atom 0)])
+      (upon [r (try (do (with-connection [c (Ok (open-memory-counting n))] (do (nth [1] 5) (Ok 1))) "no trap")
+                    (catch e (str "trap " (unwrap-or (ex-kind e) "?"))))])
+      (then (expect = 1 (closes n)) (expect = "trap index" r)))
+    (scenario "an Err from the open is the result, the body does not run and nothing is closed"
+      (given [ran (atom 0)])
+      (upon [r (with-connection [c (no-open)]
+                 (do (swap! ran (fn (v: i64) (+ v 1))) (Ok 1)))])
+      (then (expect = 0 @ran) (expect = "08001" (match r ((Err e) (. e sqlstate)) ((Ok _) "ok")))))
+    (scenario "a transaction inside a connection, the body traps: closed once, the trap seen"
+      (given [n (atom 0)])
+      (upon [r (try (do (with-connection [c (Ok (open-memory-counting n))]
+                          (do (table! c)
+                              (with-transaction [tx c]
+                                (do (execute! tx ["insert into t (id, name) values (?, ?)" 1 "a"])
+                                    (nth [1] 9)
+                                    (Ok 1)))))
+                        "no trap")
+                    (catch e (str "trap " (unwrap-or (ex-kind e) "?"))))])
+      (then (expect = 1 (closes n)) (expect = "trap index" r)))))
+
+(defun main () -> i64 (run-main (specs)))

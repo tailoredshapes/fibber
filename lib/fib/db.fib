@@ -6,7 +6,8 @@
 ;;   (execute! conn ["select * from t where id = ?" id])                     ; (Result (Vec (Map str Datum)) DbError)
 ;;   (execute-one! conn ["select name from t where id = ?" id])              ; (Result (Option (Map str Datum)) DbError)
 ;;   (execute! conn q)                                                        ; q a Query: what fib.sql/format returns
-;;   (with-transaction [tx conn] (try-let [_ (execute! tx [..]) ..] (Ok v)))  ; COMMIT on Ok, ROLLBACK on Err
+;;   (with-transaction [tx conn] (try-let [_ (execute! tx [..]) ..] (Ok v)))  ; COMMIT on Ok, ROLLBACK on Err or on a trap (which goes on)
+;;   (with-connection [c (open-x ..)] body ..)                                ; closed exactly once, also when the body traps
 ;;
 ;; The parameters of a literal vector are converted with `->datum` (i64 f64 bool str keyword Datum), so `["... ?" 1 "x"]` reads as in
 ;; Clojure although fibber's vectors are homogeneous: the macro builds `(Query "..." [(->datum 1) (->datum "x")])`. Values are always
@@ -36,3 +37,10 @@
   (match spec
     ((Vec items) `(transact ~(vec-nth items 1) (fn (~(vec-nth items 0)) (do ~@body))))
     (_ (trap "with-transaction: the spec is [tx conn]"))))
+
+;; (with-connection [c (open-sqlite "x.db")] body ..): the body sees the open connection as `c` and returns a Result; the connection is closed
+;; exactly once afterwards, also when the body traps (the trap goes on). An Err from the open is the result and the body does not run.
+(defmacro with-connection (spec ... body)
+  (match spec
+    ((Vec items) `(call-with-connection ~(vec-nth items 1) (fn (~(vec-nth items 0)) (do ~@body))))
+    (_ (trap "with-connection: the spec is [c (open ..)]"))))
