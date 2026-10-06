@@ -176,7 +176,17 @@ printf '{:name "acme/l" :deps {lx {:local/root "../../locals/lx"} sh {:local/roo
 ck "shadow: a library with a module of the bundled library is refused" "$(run run src/main.fib)" 2
 has "shadow: says so" "$e" "the module fib.core of sh .* has the name of a module of the bundled library"
 
-# 12. Two fetches at once into a cold cache: both succeed, one whole checkout each, no partial directory left.
+# 12. A module file named deps.fib (a `(ns ..)`, not a map) does not make a project; a deps.fib map above it does.
+mkdir -p "$T/nm/sub"; printf '(ns deps)\n(defun d () -> i64 3)\n' > "$T/nm/sub/deps.fib"
+printf '(ns main (:require [deps :as d]))\n(defun main () -> i64 (d/d))\n' > "$T/nm/sub/m.fib"
+cd "$T/nm/sub" || exit 2
+ck "module deps.fib: not a project, the module is used" "$(run run m.fib; last)" "0
+3"
+printf '{:name "outer" :paths ["sub"]}\n' > "$T/nm/deps.fib"
+ck "module deps.fib: the project above is found" "$(run deps path; cat "$o")" "0
+$T/nm/sub"
+
+# 13. Two fetches at once into a cold cache: both succeed, one whole checkout each, no partial directory left.
 cd "$T/p/app" || exit 2
 export FIBBER_HOME=$T/race
 "$F" deps fetch > "$T/r1" 2>&1 & p1=$!

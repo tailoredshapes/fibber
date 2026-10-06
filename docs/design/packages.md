@@ -221,7 +221,7 @@ configuration does not run during checkout (it is your configuration).
 
 ## 7. Tests, the gate and agents
 
-- `compiler/tests/deps/run.sh STAGE2` (74 checks, about a minute, no network): `fixtures.sh` makes local bare repositories in a temp
+- `compiler/tests/deps/run.sh STAGE2` (76 checks, about a minute, no network): `fixtures.sh` makes local bare repositories in a temp
   directory (`git init --bare`, commits, tags, a tag moved with a forced push) reached by `file://` URLs, with a cache of the test's own
   (`FIBBER_HOME`). It covers: a transitive chain with a macro used across the library boundary; lock contents (commit, tag, tree);
   `deps tree` and `deps path`; the checkout is read-only; a library beats `FIB_LIB`; `--locked`/`--frozen` builds with the remotes moved

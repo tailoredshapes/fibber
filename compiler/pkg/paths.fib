@@ -49,9 +49,20 @@
 (defun dir? (path: str) -> bool
   (match (os/list-directory path) ((Ok _) true) ((Err _) false)))
 
-;; The directory that holds `deps.fib`, from `start` upwards: the project root, if there is one.
+;; Whether a text's first form starts with `{` (after blanks and `;` comments): a project file, not a module that happens to be named
+;; `deps` (compiler/types/infer/deps.fib is one).
+(defun map-text? (text: str) -> bool
+  (let ((bs (str-bytes text)) (n (array-len bs)))
+    (loop ((i 0) (comment false))
+      (cond (>= i n) false
+            comment (recur (+ i 1) (not (= (array-get bs i) 10i8)))
+            (= (array-get bs i) 59i8) (recur (+ i 1) true)
+            (or (= (array-get bs i) 32i8) (= (array-get bs i) 10i8) (= (array-get bs i) 9i8) (= (array-get bs i) 13i8)) (recur (+ i 1) false)
+            :else (= (array-get bs i) 123i8)))))
+
+;; The directory that holds a project's `deps.fib` (one whose first form is a map), from `start` upwards: the project root, if any.
 (defun find-root (start: str) -> (Option str)
   (loop ((dir (normal start)))
-    (cond (some? (read-file (str dir "/deps.fib"))) (some dir)
+    (cond (match (read-file (str dir "/deps.fib")) (nil false) ((some t) (map-text? t))) (some dir)
           (= dir "/") nil
           :else (recur (normal (str dir "/.."))))))
