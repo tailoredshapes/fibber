@@ -204,6 +204,11 @@ Recent compiler and library changes include:
   `fib.db.contract` and an in-memory fake driver `fib.db.memory` are in the library; drivers are libraries in their own repositories. The
   SQLite driver is `fib-db-sqlite`: `ssh://git@localhost:2222/tailoredshapes/fib-db-sqlite.git`, module `sqlite`. See
   [the contract](docs/design/db-contract.md).
+- Gherkin: `fib-gherkin` (`ssh://git@localhost:2222/tailoredshapes/fib-gherkin.git`, module `gherkin`) reads `.feature` files (Cucumber's
+  parser, all its languages, pickles, Cucumber Expressions) and runs them on `fib.test` with step definitions written in fibber, so
+  `fibc test` prints the scenarios under their Gherkin names and the `.feature` line that did not hold. It is a front end to the system in
+  [the test harness design](docs/design/test-harness.md); the design's "plain-text front end: rejected for now" (section 2.4) is this
+  library, built because a project asked for feature files.
 
 The standard library in `lib/` follows Clojure's names and argument shapes,
 within fibber's static types and ownership model. Its specification and
