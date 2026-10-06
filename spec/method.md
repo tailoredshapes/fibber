@@ -80,10 +80,17 @@ rests on anyone's word, including the author's.
    programs. Every one the checker accepts must pass the memory audit.
    Failures are minimised and added as cases.
 
-6. **The compiler is checked against the interpreter.** Every case and
-   generated program runs both in the reference interpreter and
-   compiled through lIR to native code. Results and memory audits must
-   match. A feature is done when this passes in CI, not before.
+6. **The compiler is checked by executable evidence.** (Amended
+   2026-10-06, the owner's decision of 2026-10-04: the comparison with a
+   reference interpreter is dropped; the Rust oracles are retired and live
+   in git, tag `seed-1`, docs/rust-legacy.md.) Every case runs compiled
+   through lIR to native code with its verdict and memory audit checked;
+   the compiler compiles itself to a fixed point; the golden outputs under
+   `compiler/tests/golden/` pin each pass; the behaviour specs
+   (`fibc test`) and the architecture decision records (`fibc adr`,
+   docs/adr/) pin the rest. A feature is done when `scripts/gate.sh --full`
+   passes, not before. An interpreter, when it returns (docs/design/fibref-port.md),
+   is a development tool and an additional audit, not the judge.
 
 7. **lIR verifies its input.** lIR type-checks whole modules and runs
    the LLVM verifier by default. Invalid lIR is an error with a message,

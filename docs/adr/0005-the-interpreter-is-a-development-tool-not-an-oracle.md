@@ -21,9 +21,9 @@ compares against it; the compiled program, the specs, the cases and the recorded
 
 - The interpreter may be slow, partial or missing without blocking a release; it may also diverge from stage 2 and that is a bug in
   the interpreter, found by a person, not a gate failure.
-- Rule 6 of spec/method.md still describes the old arrangement. **spec/method.md has not
-  been brought into line with this decision**: the rule and the decision disagree and the owner has not said which prose changes;
-  this ADR records the decision and checks only what can be checked about the tree.
+- Rule 6 of spec/method.md described the old arrangement; it was amended on 2026-10-06 (the owner agreed the edit) to say the compiler is
+  checked by cases, the fixed point, goldens, specs and ADRs. This ADR records the decision and checks only what can be checked about
+  the tree.
 - The development loop (`docs/design/dev-loop.md`) is where interpreter work is judged: by how fast it gets an agent to a result.
 
 ## Governance
@@ -48,5 +48,5 @@ compares against it; the compiled program, the specs, the cases and the recorded
 
 ### What this does not check
 
-That spec/method.md rule 6 is updated: it is **not**, and this ADR does not pretend it is (see Consequences). That the interpreter
+That the wording of spec/method.md rule 6 stays as amended (prose, not checkable here). That the interpreter
 works, is fast or exists. A comparison written in a language other than shell or fibber, or under a name the globs do not list.

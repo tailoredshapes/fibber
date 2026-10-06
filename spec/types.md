@@ -3944,7 +3944,7 @@ returned — a call in tail position included, which is an ordinary
 (below) and returns. The executor is multi-threaded
 (**Decided**, D7): a pool of worker threads takes tasks from a shared
 run queue, so any worker may resume any task, which is why a task's
-captures must be `Send` and are share-marked at creation (§5.5, §6.9).
+captures must be `Send` and are share-marked when the task is first handed to another thread (`fib.share-task`, called where a task is queued or awaited across threads; amended 2026-10-06: it was "at creation", which the runtime never did, and ThreadSanitizer found races until it shared at the hand-off: docs/design/parallelism.md 2.8) (§5.5, §6.9).
 
 **One driver at a time, any number of waiters** (**Decided**).
 `Send (Task T) = Send T` (§1.6), so one task can be joined from
@@ -3983,7 +3983,7 @@ rewrite its `state`, locals and `result`. Exclusion is the runtime's:
   retained result at once.
 - A task's `trace` covers its captures and its result, never its live
   locals, so `fib.share` (above) never reads a running frame: the
-  captures were share-marked at creation (§5.5), the result before
+  captures were share-marked before any other thread could reach the task (§5.5; at the first hand-off, 2026-10-06), the result before
   completion, and the locals belong to the current driver alone.
 
 `join`/`block-on` drive the executor until `state == done`, claiming
