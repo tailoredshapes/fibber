@@ -3,10 +3,11 @@
 # line each (`ok NAME N s` or `FAIL NAME N s`), exit 0 when every one passed. Called by scripts/gate.sh (the `tools` stage); also runnable alone.
 #   scripts/tools.sh [--quick|--full] FIBC [OUTDIR]
 #   --quick   the skeletons only (every module of the ports builds and links): fibref/skeleton.sh, gen/skeleton.sh
-#   --full    the skeletons, and: lsp/run.sh (the unit programs), lsp/server.sh (the replay of the recorded transcripts), lsp/hardening.js (the cases
+#   --full    the skeletons, and: units.sh in five parts (the unit programs of the passes; each unit-*.fib is run, or is listed as pending or run
+#             elsewhere in compiler/tests/units.*), shootout-compile.sh (the programs of docs/shootout/parallel compile), lsp/run.sh (the unit programs), lsp/server.sh (the replay of the recorded transcripts), lsp/hardening.js (the cases
 #             of the fuzz findings), lsp/fuzz.js --selftest, fibref/heap.sh, gen/rng-check.sh, gen/compare.sh pipelines 1 300, gen/planted.sh
 #   FIBC      a stage 2 built from this tree (several of the scripts need what is newer than the seed); FIB_LIB the library (default lib/)
-#   TOOLS_ONLY names (space separated: fibref-skeleton gen-skeleton lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted) to run only those
+#   TOOLS_ONLY names (space separated: fibref-skeleton gen-skeleton units-emit units-own units-types units-rest units-pending shootout-compile sh-* (the scripts of compiler/tests listed below: sh-driver-cli, sh-emit-resume, ..) lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted) to run only those
 #   TOOLS_JOBS how many run at once (default 3: each builds a program); TOOLS_TIMEOUT seconds per script (default 900)
 # The fuzz run itself (lsp/fuzz.sh) and the planted faults of the language server (lsp/mutants.sh) are slower and are not run here.
 set -u
@@ -39,6 +40,19 @@ queue() { if [ -n "${TOOLS_ONLY:-}" ] && [[ " $TOOLS_ONLY " != *" $1 "* ]]; then
 queue fibref-skeleton "$t/fibref/skeleton.sh" "$out/fibref-skeleton"
 queue gen-skeleton "$t/gen/skeleton.sh" "$out/gen-skeleton"
 if [ "$mode" = full ]; then
+  # the unit programs of the passes: every compiler/tests/*/unit-*.fib is run, or listed as pending (failing, with the reason) or run elsewhere
+  for part in emit own types rest pending; do queue "units-$part" env UNITS_DIR=$part "$t/units.sh" "$out/units-$part"; done
+  # the programs of docs/shootout/parallel are measurements, not tests, but they must keep compiling against the library's API
+  queue shootout-compile compiler/tests/shootout-compile.sh "$out/shootout-compile"
+  # the scripts under compiler/tests that nothing ran and that take seconds: the command line, the demand-driven check, the target and fma
+  # checks, the `test` command, the runtime drift test, the resume builders, the window lowering, the cell peeks, the Vec contract's planted faults,
+  # the heap golden traces, the lair header and exec checks, the L1 unit programs, the test harness's own check
+  for s in driver/cli driver/demand driver/muladd driver/target driver/test-cmd emit/runtime own/peek specs/plant-vec; do
+    queue "sh-${s//\//-}" "$t/$s.sh" "$FIBC"
+  done
+  queue sh-emit-resume env RESUME_OUT="$out/resume" "$t/emit/resume.sh" "$FIBC"
+  queue sh-emit-windows env WINDOWS_SCRATCH="$out/windows" "$t/emit/windows.sh" "$FIBC"
+  for s in fibref/heap-gold native/h-checks native/l1-unit harness-proto/run; do queue "sh-${s//\//-}" "$t/$s.sh"; done
   queue lsp-unit "$t/lsp/run.sh"
   queue lsp-server "$t/lsp/server.sh" "$out/lsp-server"
   queue lsp-hardening bash -c "'$t/lsp/build.sh' '$out/lsp-hard' && node '$t/lsp/hardening.js' --server '$out/lsp-hard' && node '$t/lsp/fuzz.js' --selftest"
