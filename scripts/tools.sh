@@ -8,7 +8,7 @@
 #             of the fuzz findings), lsp/fuzz.js --selftest, fibref/heap.sh, gen/rng-check.sh, gen/compare.sh pipelines 1 300, gen/planted.sh
 #   FIBC      a stage 2 built from this tree (several of the scripts need what is newer than the seed); FIB_LIB the library (default lib/)
 #   TOOLS_ONLY names (space separated: fibref-skeleton gen-skeleton units-emit units-own units-types units-rest units-pending shootout-compile sh-* (the scripts of compiler/tests listed below: sh-driver-cli, sh-emit-resume, ..) lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted) to run only those
-#   TOOLS_JOBS how many run at once (default 3: each builds a program); TOOLS_TIMEOUT seconds per script (default 900)
+#   TOOLS_JOBS how many run at once (default 3: each builds a program; 64 under the gate, whose slots limit the heavy processes); TOOLS_TIMEOUT seconds per script (default 900)
 # The fuzz run itself (lsp/fuzz.sh) and the planted faults of the language server (lsp/mutants.sh) are slower and are not run here.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -17,8 +17,11 @@ mode=full
 case ${1:-} in --quick) mode=quick; shift ;; --full) shift ;; esac
 fibc=${1:?usage: tools.sh [--quick|--full] FIBC [OUTDIR]}
 out=${2:-${TMPDIR:-/tmp}/tools-$$}
-jobs=${TOOLS_JOBS:-3}; limit=${TOOLS_TIMEOUT:-900}
+jobs=${TOOLS_JOBS:-$([ -n "${GATE_SLOTS:-}" ] && echo 64 || echo 3)}; limit=${TOOLS_TIMEOUT:-900}
 mkdir -p "$out"
+# Under the gate (GATE_SLOTS, scripts/lib/slots.sh) every script runs at once and each fibc it starts holds a slot, through the wrapper
+# scripts/lib/fibc-slot.sh; alone, three scripts run at a time and FIBC is the fibc itself.
+if [ -n "${GATE_SLOTS:-}" ]; then export GATE_REAL_FIBC=$fibc; fibc=$here/lib/fibc-slot.sh; fi
 export FIBC=$fibc FIB_LIB=${FIB_LIB:-$root/lib} TMPDIR=$out
 cd "$root" || exit 2
 t=compiler/tests
