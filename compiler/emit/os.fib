@@ -5,15 +5,25 @@
     (match (str-find text old offset)
       (nil (str-join (conj parts (str-slice text offset (str-len text)))))
       ((some at) (recur (+ at (str-len old)) (conj (conj parts (str-slice text offset at)) new))))))
+;; Darwin's pthread_key_t is an unsigned long (8 bytes; glibc's is 4): the two key globals of rt/core.lir are 8 bytes there, so
+;; pthread_key_create writes inside them, and the key is passed as an i64.
+(defun darwin-keys :private (text: str) -> str
+  (replace (replace (replace (replace (replace (replace text
+    "(global internal fib.task-key i32 (i32 0))" "(global internal fib.task-key i64 (i64 0))")
+    "(global internal fib.exc-key i32 (i32 0))" "(global internal fib.exc-key i64 (i64 0))")
+    "(declare pthread_setspecific i32 (i32 ptr))" "(declare pthread_setspecific i32 (i64 ptr))")
+    "(declare pthread_getspecific ptr (i32))" "(declare pthread_getspecific ptr (i64))")
+    "(load i32 @fib.task-key)" "(load i64 @fib.task-key)")
+    "(load i32 @fib.exc-key)" "(load i64 @fib.exc-key)"))
 (defun sys-for (platform: str text: str) -> str
   (if (= platform "Linux") text
     (if (= platform "Darwin")
       ;; _SC_NPROCESSORS_ONLN: 84 on glibc, 58 on Darwin (the pool's worker count);
       ;; the large-block cache (rt/alloc.lir): malloc_size for malloc_usable_size, CLOCK_MONOTONIC_RAW_APPROX (5) for
       ;; CLOCK_MONOTONIC_COARSE (6), and no mallopt (Darwin's malloc has none; its large blocks go back to the system on free)
-      (replace (replace (replace (replace (replace (replace (replace (replace text "__errno_location" "__error")
+      (darwin-keys (replace (replace (replace (replace (replace (replace (replace (replace text "__errno_location" "__error")
         "@openat (i32 -100)" "@openat (i32 -2)") "@fib.sys-clock (i32 1)" "@fib.sys-clock (i32 6)")
         "@sysconf (i32 84)" "@sysconf (i32 58)")
         "malloc_usable_size" "malloc_size") "@clock_gettime (i32 6)" "@clock_gettime (i32 5)")
-        "(declare mallopt i32 (i32 i32))\n" "") "(call @mallopt (i32 -3) (i32 131072))" "(add (i32 0) (i32 0))")
+        "(declare mallopt i32 (i32 i32))\n" "") "(call @mallopt (i32 -3) (i32 131072))" "(add (i32 0) (i32 0))"))
       (trap (str "fib.os: unsupported runtime platform " platform)))))
