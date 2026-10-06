@@ -1,0 +1,22 @@
+;; fib.autodiff.real: the scalar conversions the gradient formulas need, so one definition serves f32 and f64.
+;; `lit` makes a constant of the element type from an f64 literal; `wide` reads an element as f64 (the accumulation type);
+;; `total` is the sum of a whole tensor: ordered, and for f32 accumulated in f64 and rounded once (the numerics policy, autodiff.md 5).
+(ns fib.autodiff.real
+  (:use fib.core fib.seq fib.coll)
+  (:require [fib.tensor :as t]))
+
+(defprotocol Real
+  (lit (self x: f64) -> Self)
+  (wide (self x: Self) -> f64)
+  (total (self x: (t/Tensor Self)) -> Self))
+
+(impl Real f64
+  (lit (self x) x)
+  (wide (self x) x)
+  (total (self x) (t/sum x)))
+(impl Real f32
+  (lit (self x) (float x))
+  (wide (self x) (double x))
+  (total (self x) (float (t/fold (fn (acc: f64 v: f32) (+ acc (double v))) 0.0 x))))
+
+(defun scalar (like: (t/Tensor a) x: f64) :where ((Real a) (t/Element a)) -> (t/Tensor a) (t/full [] (lit (. like seed) x)))

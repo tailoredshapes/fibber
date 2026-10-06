@@ -1,0 +1,96 @@
+;; End-to-end training benchmark: an MLP classifier 784-256-10 (relu), softmax cross-entropy, batch 128, f32, generated data (no downloads).
+;;   F build scripts/bench/autodiff/mlp.fib -I lib -o mlp && ./mlp MODE OPT STEPS
+;;   MODE  tape (fib.autodiff: value-and-grad over a tape)   hand (the backward pass written out with fib.tensor, no tape)
+;;   OPT   sgd (lr 0.1)   adam (lr 0.001, 0.9, 0.999, 1e-8)
+;; Prints `loss STEP VALUE` for every step, `step_ms MEDIAN MEAN MIN` over the steps after 10 warm-up steps, and `checksum` (sum of |w1|, f64).
+;; The data and the initial weights are integer hashes (scripts/bench/autodiff/mlp.py computes the same numbers): hash(n j salt) =
+;; ((7919 n + 104729 j + 1299709 salt + 12345) 2654435761) mod 2^32, u = ((hash >> 7) mod 10^6) / 10^6, computed in f64 and rounded to f32.
+(ns main (:require [fib.tensor :as t] [fib.autodiff :as ad] [fib.math :as math]))
+
+(def batch: i64 128)
+(def samples: i64 4096)
+(def inputs: i64 784)
+(def hidden: i64 256)
+(def classes: i64 10)
+
+(defun hash (n: i64 j: i64 salt: i64) -> f64
+  (let [h (rem (* (+ (+ (* 7919 n) (* 104729 j)) (+ (* 1299709 salt) 12345)) 2654435761) 4294967296)]
+    (/ (double (rem (shr h 7) 1000000)) 1000000.0)))
+
+(defun signal (c: i64 j: i64) -> f64 (- (/ (double (rem (+ (* j (+ c 3)) (* c 17)) 11)) 10.0) 0.5))
+
+(defun make-x () -> (t/Tensor f32)
+  (let [buf (cell (array (* samples inputs) 0.0f32))]
+    (do (dotimes (n samples)
+          (dotimes (j inputs)
+            (array-set! &buf (+ (* n inputs) j) (float (+ (* 0.5 (- (hash n j 1) 0.5)) (* 0.8 (signal (rem n 10) j)))))))
+        (t/from-array [samples inputs] @buf 0.0f32))))
+
+(defun make-w (rows: i64 cols: i64 salt: i64) -> (t/Tensor f32)
+  (let [a (* 2.0 (math/sqrt (/ 6.0 (double rows)))) buf (cell (array (* rows cols) 0.0f32))]
+    (do (dotimes (i rows) (dotimes (j cols) (array-set! &buf (+ (* i cols) j) (float (* (- (hash i j salt) 0.5) a)))))
+        (t/from-array [rows cols] @buf 0.0f32))))
+
+(defun labels-of (b: i64) -> (Vec i64) (mapv (fn (k: i64) (rem (+ (* b batch) k) 10)) (range batch)))
+
+(defun mlp-loss (ps: (Vec (ad/Tracked f32)) xb: (t/Tensor f32) labels: (Vec i64)) -> (ad/Tracked f32)
+  (let [x (ad/const-like (nth ps 0) xb)
+        h (ad/dense x (nth ps 0) (nth ps 1) :relu)
+        o (ad/dense h (nth ps 2) (nth ps 3) :identity)]
+    (ad/softmax-cross-entropy o labels)))
+
+;; ---- the same step written out: forward, loss, backward with fib.tensor calls only (the same kernels as fib.autodiff's backward: the relu mask
+;; as relu(h/h), the bias gradient as a product with a row of ones), so the difference between the two modes is the tape
+(defun onehot (labels: (Vec i64)) -> (t/Tensor f32)
+  (let [buf (cell (array (* batch classes) 0.0f32))]
+    (do (dotimes (i batch) (array-set! &buf (+ (* i classes) (nth labels i)) 1.0f32))
+        (t/from-array [batch classes] @buf 0.0f32))))
+
+(defun hand-loss (p: (t/Tensor f32) labels: (Vec i64)) -> f32
+  (let [lp (t/to-array (t/log p))]
+    (float (/ (loop [i 0 acc 0.0] (if (< i batch) (recur (+ i 1) (- acc (double (array-get lp (+ (* i classes) (nth labels i)))))) acc)) (double batch)))))
+
+(defun hand-step (ps: (Vec (t/Tensor f32)) xb: (t/Tensor f32) labels: (Vec i64)) -> (ad/ValueGrad f32)
+  (let [w1 (nth ps 0) b1 (nth ps 1) w2 (nth ps 2) b2 (nth ps 3)
+        h (t/dense xb w1 b1 :relu) o (t/dense h w2 b2 :identity)
+        p (t/softmax o) loss (hand-loss p labels)
+        dz2 (t/scale (/ 1.0f32 128.0f32) (t/sub p (onehot labels)))
+        dh (t/mmul dz2 (t/transpose w2))
+        dz1 (t/mul dh (t/relu (t/div h h)))
+        ones (t/full [1 128] 1.0f32)]
+    (ad/ValueGrad (t/full [] loss)
+                  [(t/mmul (t/transpose xb) dz1) (t/reshape [256] (t/mmul ones dz1)) (t/mmul (t/transpose h) dz2) (t/reshape [10] (t/mmul ones dz2))])))
+
+(defun do-step (tape: bool ps: (Vec (t/Tensor f32)) xb: (t/Tensor f32) labels: (Vec i64)) -> (ad/ValueGrad f32)
+  (if tape
+      (ad/value-and-grad (fn (xs: (Vec (ad/Tracked f32))) (mlp-loss xs xb labels)) ps)
+      (hand-step ps xb labels)))
+
+(defun median (v: (Vec i64)) -> i64 (nth (sort v) (quot (count v) 2)))
+
+(defun train (tape: bool adam: bool steps: i64 x: (t/Tensor f32)) -> unit
+  (let [all-labels (mapv labels-of (range 32))] (train-loop tape adam steps x all-labels)))
+
+(defun train-loop (tape: bool adam: bool steps: i64 x: (t/Tensor f32) all-labels: (Vec (Vec i64))) -> unit
+  (loop [s 0 ps [(make-w inputs hidden 2) (t/zeros-f32 [hidden]) (make-w hidden classes 3) (t/zeros-f32 [classes])]
+         st (ad/adam-init ps) times []]
+    (if (< s steps)
+        (let [b (rem s 32) xb (t/slice 0 (* b batch) (* (+ b 1) batch) 1 x) labels (nth all-labels b)
+              t0 (sys-clock-now)
+              vg (do-step tape ps xb labels)
+              next (if adam
+                       (ad/adam-step 0.001 0.9 0.999 1.0e-8 st ps (. vg grads))
+                       (ad/Stepped (ad/sgd-step 0.1 ps (. vg grads)) st))
+              dt (- (sys-clock-now) t0)]
+          (do (println "loss" s (t/item (. vg value)))
+              (recur (+ s 1) (. next params) (. next state) (conj times dt))))
+        (let [warm (if (> steps 10) (vec (drop 10 times)) times) n (count warm)]
+          (if (> n 0)
+              (println "step_ms" (/ (double (median (vec warm))) 1000000.0) (/ (double (reduce + 0 warm)) (* 1000000.0 (double n)))
+                       (/ (double (reduce min 1000000000000 warm)) 1000000.0))
+              (println "step_ms 0 0 0"))
+          (println "checksum" (t/sum (t/map-as (fn (v: f32) (abs (double v))) 0.0 (nth ps 0))))))))
+
+(defun main () -> i64
+  (let [a (args) mode (nth a 0) opt (nth a 1) steps (unwrap (parse-long (nth a 2)))]
+    (do (train (= mode "tape") (= opt "adam") steps (make-x)) 0)))

@@ -1,0 +1,69 @@
+;; fib.autodiff.tape: the tape, tracked values and the recording points (docs/design/autodiff.md, section 3).
+;;
+;; A forward op computes its value eagerly and, when an input needs a gradient, pushes one TapeEntry: the id of its output, the ids of the
+;; inputs that need a gradient, and a closure from the output's gradient to those inputs' gradients. The closure owns (holds a count of) the
+;; tensors its formula saved. fib.autodiff.run pops entries from the end of the tape: an entry is moved out, run and dropped, so the
+;; saved tensors of op k are released before op k-1 runs.
+(ns fib.autodiff.tape
+  (:use fib.core fib.seq fib.coll)
+  (:require [fib.tensor :as t]))
+
+(defstruct (TapeEntry a) (out: i64 ins: (Vec i64) back: (fn ((t/Tensor a)) (Vec (t/Tensor a)))))
+;; entries: the recorded ops as a persistent chain, newest first (push and pop are O(1) and need no unique vector); next: the next id; live: 1 while ops record, 0 inside `no-grad`
+(defenum (Chain a) (Link entry: (TapeEntry a) prev: (Chain a)) (End))
+(defstruct (Tape a) (entries: (Cell (Chain a)) next: (Cell i64) live: (Cell i64)))
+;; a value on a tape; id < 0 means no gradient flows to it (a constant, or computed under no-grad)
+(defstruct (Tracked a) (val: (t/Tensor a) id: i64 tape: (Tape a)))
+(defstruct (ValueGrad a) (value: (t/Tensor a) grads: (Vec (t/Tensor a))))
+
+(defun new-tape () -> (Tape a) (Tape (cell End) (cell 0) (cell 1)))
+
+(defun fresh-id (tp: (Tape a)) -> i64
+  (let [n @(. tp next)] (do (set! (. tp next) (+ n 1)) n)))
+
+(defun leaf (tp: (Tape a) v: (t/Tensor a)) -> (Tracked a) (Tracked v (fresh-id tp) tp))
+(defun constant (tp: (Tape a) v: (t/Tensor a)) -> (Tracked a) (Tracked v -1 tp))
+(defun const-like (ref: (Tracked a) v: (t/Tensor a)) -> (Tracked a) (Tracked v -1 (. ref tape)))
+(defun value (x: (Tracked a)) -> (t/Tensor a) (. x val))
+(defun needs? (x: (Tracked a)) -> bool (and (>= (. x id) 0) (= @(. (. x tape) live) 1)))
+
+(defun push-entry (tp: (Tape a) e: (TapeEntry a)) -> unit
+  (set! (. tp entries) (Link e @(. tp entries))))
+
+;; The recording points. `need` says which inputs get a gradient; `back` receives the output gradient and returns the gradients of the
+;; needed inputs only, in input order.
+(defun record1 (a: (Tracked a) v: (t/Tensor a) back: (fn ((t/Tensor a)) (t/Tensor a))) -> (Tracked a)
+  (if (needs? a)
+      (let [tp (. a tape) id (fresh-id tp)]
+        (do (push-entry tp (TapeEntry id [(. a id)] (fn (g) [(back g)])))
+            (Tracked v id tp)))
+      (Tracked v -1 (. a tape))))
+
+(defun record2 (a: (Tracked a) b: (Tracked a) v: (t/Tensor a) back: (fn ((t/Tensor a) bool bool) (Vec (t/Tensor a)))) -> (Tracked a)
+  (let [na (needs? a) nb (needs? b)]
+    (if (or na nb)
+        (let [tp (. a tape) id (fresh-id tp)
+              ins (cond (and na nb) [(. a id) (. b id)] na [(. a id)] :else [(. b id)])]
+          (do (push-entry tp (TapeEntry id ins (fn (g) (back g na nb))))
+              (Tracked v id tp)))
+        (Tracked v -1 (. a tape)))))
+
+;; three inputs (dense: x, w, b)
+(defun record3 (a: (Tracked a) b: (Tracked a) c: (Tracked a) v: (t/Tensor a)
+                back: (fn ((t/Tensor a) bool bool bool) (Vec (t/Tensor a)))) -> (Tracked a)
+  (let [na (needs? a) nb (needs? b) nc (needs? c)]
+    (if (or na nb nc)
+        (let [tp (. a tape) id (fresh-id tp)
+              ins (into [] (concat (concat (if na [(. a id)] []) (if nb [(. b id)] [])) (if nc [(. c id)] [])))]
+          (do (push-entry tp (TapeEntry id ins (fn (g) (back g na nb nc))))
+              (Tracked v id tp)))
+        (Tracked v -1 (. a tape)))))
+
+;; no gradient flows through the result: the same value as a constant
+(defun stop-gradient (x: (Tracked a)) -> (Tracked a) (Tracked (. x val) -1 (. x tape)))
+
+;; `(no-grad ref f)` runs f with recording off: ops inside return constants and push nothing (inference, optimiser updates, evaluation)
+(defun no-grad (ref: (Tracked a) f: (fn () r) :borrow) -> r
+  (let [tp (. ref tape) before @(. tp live)]
+    (do (set! (. tp live) 0)
+        (let [r (f)] (do (set! (. tp live) before) r)))))

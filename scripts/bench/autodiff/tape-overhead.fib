@@ -1,0 +1,28 @@
+;; The cost of the tape itself: a chain of N elementwise ops on a tensor of ONE element, so the kernels cost almost nothing and what is left is the
+;; recording (a closure, an entry, an id), the backward walk and the library's per-call allocations. Best of 20, microseconds per op.
+;;   F build scripts/bench/autodiff/tape-overhead.fib -I lib -o to && taskset -c 3 ./to [N]
+;; The plain column runs the same chain of fib.tensor calls with no tape (the forward only), so forward-with-tape minus plain is the recording.
+(ns main (:require [fib.tensor :as t] [fib.autodiff :as ad]))
+
+(defun chain (ps: (Vec (ad/Tracked f64)) n: i64) -> (ad/Tracked f64)
+  (let [c (ad/const-like (nth ps 0) (t/full [1] 0.999))]
+    (ad/sum (loop [x (nth ps 0) i 0] (if (< i n) (recur (ad/mul x c) (+ i 1)) x)))))
+
+(defun plain (x: (t/Tensor f64) n: i64) -> f64
+  (let [c (t/full [1] 0.999)] (t/sum (loop [v x i 0] (if (< i n) (recur (t/mul v c) (+ i 1)) v)))))
+
+(defun forward-only (x: (t/Tensor f64) n: i64) -> i64
+  (let [tp (ad/new-tape)] (t/size (ad/value (chain [(ad/leaf tp x)] n)))))
+
+(defun best (name: str n: i64 runs: i64 f: (fn () i64)) -> unit
+  (loop [r 0 b 1000000000000000]
+    (if (< r runs)
+        (let [s (sys-clock-now) v (f) e (- (sys-clock-now) s)] (recur (+ r 1) (min b e)))
+        (println name "us_per_op" (/ (double b) (* 1000.0 (double n)))))))
+
+(defun main () -> i64
+  (let [n (unwrap (parse-long (nth (args) 0))) x (t/full [1] 1.0)]
+    (do (best "plain_forward" n 20 (fn () (if (> (plain x n) 0.0) 1 0)))
+        (best "tape_forward_only" n 20 (fn () (forward-only x n)))
+        (best "tape_forward_and_backward" n 20 (fn () (t/size (nth (ad/grad (fn (ps: (Vec (ad/Tracked f64))) (chain ps n)) [x]) 0))))
+        0)))

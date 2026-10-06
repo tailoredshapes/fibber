@@ -1,0 +1,32 @@
+;; Memory high-water mark of one training step of a deep MLP: 12 dense layers of width 1024 (relu), batch 256, f32, loss = mean(h*h).
+;;   F build scripts/bench/autodiff/deep.fib -I lib -o deep && ./deep STEPS      (STEPS 0 builds the parameters and the data only)
+;; scripts/bench/autodiff/deepmem.py runs it and its PyTorch twin and reports the peak RSS of 0 steps and of 1 step: the difference is what the step needs
+;; above the parameters and the data. Saved activations are 256 x 1024 x 4 B = 1 MiB per layer, a weight matrix is 4 MiB, the gradients of all 12 are 48 MiB.
+(ns main (:require [fib.tensor :as t] [fib.autodiff :as ad] [fib.math :as math]))
+
+(def layers: i64 12)
+(def width: i64 1024)
+(def rows: i64 256)
+
+(defun hash (n: i64 j: i64 salt: i64) -> f64
+  (let [h (rem (* (+ (+ (* 7919 n) (* 104729 j)) (+ (* 1299709 salt) 12345)) 2654435761) 4294967296)]
+    (/ (double (rem (shr h 7) 1000000)) 1000000.0)))
+
+(defun make (r: i64 c: i64 salt: i64 scale: f64) -> (t/Tensor f32)
+  (let [buf (cell (array (* r c) 0.0f32))]
+    (do (dotimes (i r) (dotimes (j c) (array-set! &buf (+ (* i c) j) (float (* scale (- (hash i j salt) 0.5))))))
+        (t/from-array [r c] @buf 0.0f32))))
+
+(defun net (ps: (Vec (ad/Tracked f32)) x: (t/Tensor f32)) -> (ad/Tracked f32)
+  (let [h (loop [h (ad/const-like (nth ps 0) x) l 0]
+            (if (< l layers) (recur (ad/dense h (nth ps (* 2 l)) (nth ps (+ (* 2 l) 1)) :relu) (+ l 1)) h))]
+    (ad/mean (ad/mul h h))))
+
+(defun main () -> i64
+  (let [steps (unwrap (parse-long (nth (args) 0)))
+        ps (vec (mapcat (fn (l: i64) [(make width width (+ l 2) (* 2.0 (math/sqrt (/ 6.0 1024.0)))) (t/zeros-f32 [width])]) (range layers)))
+        x (make rows width 1 2.0)]
+    (do (when (> steps 0)
+          (let [vg (ad/value-and-grad (fn (xs: (Vec (ad/Tracked f32))) (net xs x)) ps)]
+            (println "loss" (t/item (. vg value)) "grad0" (t/size (nth (. vg grads) 0)))))
+        0)))

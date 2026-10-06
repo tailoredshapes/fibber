@@ -1,0 +1,39 @@
+;; fib.autodiff.optim: optimiser steps over a vector of parameter tensors. Each step returns fresh tensors (values, not mutation):
+;; the old parameters are released when the caller rebinds them, and the gradients are consumed. In-place updates through a
+;; window (fib.view) are the stage-2 improvement named in docs/design/autodiff.md.
+(ns fib.autodiff.optim
+  (:use fib.core fib.seq fib.coll fib.autodiff.real)
+  (:require [fib.tensor :as t] [fib.math :as math]))
+
+;; p - lr g
+(defun sgd-step (lr: f64 params: (Vec (t/Tensor a)) grads: (Vec (t/Tensor a))) -> (Vec (t/Tensor a))
+  (vec (map-indexed (fn (i p) (let [k (lit (. p seed) (- 0.0 lr))] (t/axpby (one (. p seed)) p k (nth grads i)))) params)))
+
+(defstruct (AdamState a) (m: (Vec (t/Tensor a)) v: (Vec (t/Tensor a)) steps: i64))
+(defstruct (Stepped a) (params: (Vec (t/Tensor a)) state: (AdamState a)))
+
+(defun adam-init (params: (Vec (t/Tensor a))) -> (AdamState a)
+  (let [zs (fn (p: (t/Tensor a)) (t/full (t/shape p) (zero (. p seed))))]
+    (AdamState (mapv zs params) (mapv zs params) 0)))
+
+(defun ipow (x: f64 n: i64) -> f64 (loop [i 0 acc 1.0] (if (< i n) (recur (+ i 1) (* acc x)) acc)))
+
+;; sqrt of every element. fib.tensor has no vector sqrt; a scalar map with the libm-exact `math/sqrt` takes about a third of the time of the vector
+;; exp(log(v)/2) it replaced (the vector log and exp cost 2.3 ns an element each: docs/shootout/autodiff.md), and is exact. A vector `t/sqrt` over
+;; `simd/sqrt` is the right fix (docs/design/autodiff.md 9).
+(defun vsqrt (v: (t/Tensor a)) -> (t/Tensor a)
+  (let [sd (. v seed)] (t/map (fn (x: a) (lit sd (math/sqrt (wide sd x)))) v)))
+
+(defun adam-one (lr: f64 b1: f64 b2: f64 eps: f64 c1: f64 c2: f64 p: (t/Tensor a) g: (t/Tensor a) m: (t/Tensor a) v: (t/Tensor a))
+  -> (Vec (t/Tensor a))
+  (let [sd (. p seed) m2 (t/axpby (lit sd b1) m (lit sd (- 1.0 b1)) g)
+        v2 (t/axpby (lit sd b2) v (lit sd (- 1.0 b2)) (t/mul g g))
+        den (t/shift (lit sd eps) (t/scale (lit sd (/ 1.0 (math/sqrt c2))) (vsqrt v2)))
+        p2 (t/axpby (one sd) p (lit sd (- 0.0 (/ lr c1))) (t/div m2 den))]
+    [p2 m2 v2]))
+
+;; Adam (Kingma and Ba) with bias correction folded into the step size and the denominator
+(defun adam-step (lr: f64 b1: f64 b2: f64 eps: f64 st: (AdamState a) params: (Vec (t/Tensor a)) grads: (Vec (t/Tensor a))) -> (Stepped a)
+  (let [n (+ (. st steps) 1) c1 (- 1.0 (ipow b1 n)) c2 (- 1.0 (ipow b2 n))
+        rs (vec (map-indexed (fn (i p) (adam-one lr b1 b2 eps c1 c2 p (nth grads i) (nth (. st m) i) (nth (. st v) i))) params))]
+    (Stepped (mapv (fn (r) (nth r 0)) rs) (AdamState (mapv (fn (r) (nth r 1)) rs) (mapv (fn (r) (nth r 2)) rs) n))))

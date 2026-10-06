@@ -1,0 +1,25 @@
+;; fib.autodiff.parallel: data-parallel gradients (docs/design/autodiff.md 5.4). The batch is cut into `shards`; each shard runs the whole
+;; forward and backward on its own tape in a task (a tape holds Cells, which never cross a thread, so a tape cannot be shared: each task builds
+;; its own), and the shard gradients, which are plain tensors and so sendable, are added in a FIXED pairwise tree over the shard index. The
+;; sum therefore has the same bits for every worker count (the tree depends on the number of shards, not on the number of workers).
+(ns fib.autodiff.parallel
+  (:use fib.core fib.seq fib.coll fib.autodiff.tape fib.autodiff.run)
+  (:require [fib.tensor :as t] [fib.parallel :as par]))
+
+(defun tree-add (xs: (Vec (t/Tensor a))) -> (t/Tensor a)
+  (loop [level xs]
+    (if (= (count level) 1)
+        (nth level 0)
+        (recur (vec (map (fn (k: i64) (if (< (+ (* 2 k) 1) (count level)) (t/add (nth level (* 2 k)) (nth level (+ (* 2 k) 1))) (nth level (* 2 k))))
+                         (range (quot (+ (count level) 1) 2))))))))
+
+(defun mean-of (xs: (Vec (t/Tensor a)) k: a) -> (t/Tensor a) (t/scale k (tree-add xs)))
+
+;; f receives the shard index and the leaves and returns the shard's loss; the result is the mean over shards of the losses and the gradients
+;; (equal shards make that the gradient of the batch mean). `workers` tasks run at a time.
+(defn shard-value-and-grad
+  ([workers: i64 shards: i64 f: (fn :send (i64 (Vec (Tracked a))) (Tracked a)) params: (Vec (t/Tensor a)) k: a] -> (ValueGrad a)
+   (let [vgs (par/pmap-n (par/Par workers 1 false)
+                         (fn (i: i64) (run-grads (fn (xs: (Vec (Tracked a))) (f i xs)) params)) shards)]
+     (ValueGrad (mean-of (mapv (fn (v: (ValueGrad a)) (. v value)) vgs) k)
+                (mapv (fn (p: i64) (mean-of (mapv (fn (v: (ValueGrad a)) (nth (. v grads) p)) vgs) k)) (range (count params)))))))

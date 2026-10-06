@@ -1,0 +1,208 @@
+;; The tape and the backward pass of fib.autodiff: accumulation, graph shapes, stop-gradient, no-grad, the order and timing of releases,
+;; f32 against f64, determinism, the optimisers and a training loop that must converge (docs/design/autodiff.md 3, 5, 6).
+(ns main (:use fib.core fib.seq fib.coll fib.rng fib.test.core fib.test.gen fib.test.run adcheck)
+  (:require [fib.tensor :as t] [fib.autodiff :as ad] [fib.autodiff.parallel :as adp] [fib.autodiff.forward :as fwd] [fib.async :as as] [fib.math :as math]))
+
+(defun seeds () -> (Gen i64) (gen-i64-between 1 1000000000))
+(defun traps? (f: (fn :send () i64)) -> bool
+  (match (as/try-join (spawn f)) ((Err _) true) ((Ok _) false)))
+
+(defun vec1 (xs: (Vec f64)) -> (t/Tensor f64) (t/tensor xs))
+(defun close-all? (a: (Vec f64) b: (Vec f64) tol: f64) -> bool
+  (and (= (count a) (count b)) (every? (fn (i: i64) (<= (abs (- (nth a i) (nth b i))) tol)) (range (count a)))))
+
+;; ---- a tensor used twice, a diamond, a long chain
+(defun used-twice (ps: (Vec (ad/Tracked f64))) -> (ad/Tracked f64)
+  (let [x (nth ps 0)] (ad/sum (ad/add (ad/mul x x) x))))
+(defun diamond (ps: (Vec (ad/Tracked f64))) -> (ad/Tracked f64)
+  (let [y (ad/exp (nth ps 0))] (ad/sum (ad/add (ad/mul y y) (ad/tanh y)))))
+(defun chain (ps: (Vec (ad/Tracked f64))) -> (ad/Tracked f64)
+  (ad/sum (loop [x (nth ps 0) i 0] (if (< i 12) (recur (ad/tanh (ad/add x (nth ps 1))) (+ i 1)) x))))
+
+;; ---- the MLP, generic in the element type: relu hidden layer, softmax cross-entropy
+(defun mlp (ps: (Vec (ad/Tracked a)) x: (t/Tensor a) labels: (Vec i64)) -> (ad/Tracked a)
+  (let [xc (ad/const-like (nth ps 0) x)
+        h (ad/dense xc (nth ps 0) (nth ps 1) :relu)
+        o (ad/dense h (nth ps 2) (nth ps 3) :identity)]
+    (ad/softmax-cross-entropy o labels)))
+
+(defun mlp-problem (s: i64) -> (Vec (t/Tensor f64))
+  (let [r (rng-new s)]
+    [(rand-tensor r [6 5] 0.3 1.2 true) (rand-tensor r [5] 0.1 0.5 true) (rand-tensor r [5 3] 0.3 1.2 true) (rand-tensor r [3] 0.1 0.5 true)
+     (rand-tensor r [6 6] 0.3 1.5 true)]))
+
+(defun to-f32 (x: (t/Tensor f64)) -> (t/Tensor f32) (t/map-as (fn (v: f64) (float v)) 0.0f32 x))
+(defun labels-of (s: i64) -> (Vec i64) (let [r (rng-new (+ s 99))] (mapv (fn (i: i64) (rng-below r 3)) (range 6))))
+
+(defun mlp-grads64 (s: i64) -> (Vec (Vec f64))
+  (let [pr (mlp-problem s) x (nth pr 4) lb (labels-of s)]
+    (mapv t/to-vec (ad/grad (fn (ps: (Vec (ad/Tracked f64))) (mlp ps x lb)) (vec (take 4 pr))))))
+
+(defun mlp-grads32 (s: i64) -> (Vec (Vec f64))
+  (let [pr (mapv to-f32 (mlp-problem s)) x (nth pr 4) lb (labels-of s)]
+    (mapv (fn (g: (t/Tensor f32)) (mapv (fn (v: f32) (double v)) (t/to-vec g)))
+          (ad/grad (fn (ps: (Vec (ad/Tracked f32))) (mlp ps x lb)) (vec (take 4 pr))))))
+
+(defun f32-agrees? (s: i64) -> bool
+  (let [a (mlp-grads64 s) b (mlp-grads32 s)]
+    (every? (fn (i: i64) (close-all? (nth a i) (nth b i) (+ 1.0e-5 (* 1.0e-4 (reduce max 0.0 (map abs (nth a i))))))) (range 4))))
+
+;; ---- release timing: a probe op logs whether the tensor an earlier op saved is still alive when the probe's backward runs
+(defstruct Log (alive: (Cell (Vec bool)) target: (Cell (Option (Weak (t/Tensor f64))))))
+(defun new-log () -> Log (Log (cell []) (cell nil)))
+(defun target-alive? (lg: Log) -> bool
+  (match @(. lg target) ((some w) (match @w ((some _) true) (nil false))) (nil false)))
+(defun probe (a: (ad/Tracked f64) lg: Log) -> (ad/Tracked f64)
+  (ad/record1 a (t/scale 1.0 (ad/value a)) (fn (g: (t/Tensor f64)) (do (set! (. lg alive) (conj @(. lg alive) (target-alive? lg))) g))))
+
+;; x -> probe-before -> exp -> probe-after -> sum. Backward runs probe-after, exp, probe-before: exp's saved output is alive at the first
+;; probe and gone at the second.
+(defun build-probed (tp: (ad/Tape f64) x: (t/Tensor f64) lg: Log) -> (ad/Tracked f64)
+  (let [a (ad/leaf tp x)
+        b (probe a lg)
+        c (ad/exp b)
+        _ (set! (. lg target) (some (weak (ad/value c))))
+        d (probe c lg)]
+    (ad/sum d)))
+
+;; The forward values are locals of `build-probed`: when it returns, only the tape's closures hold exp's output.
+(defun release-log (x: (t/Tensor f64)) -> (Vec bool)
+  (let [lg (new-log) tp (ad/new-tape)
+        loss (build-probed tp x lg)
+        gs (ad/backward loss)]
+    @(. lg alive)))
+
+;; ---- optimisers
+(defun adam-ref (lr: f64 p: f64 g: f64 steps: i64) -> f64
+  (loop [i 1 p p m 0.0 v 0.0]
+    (if (<= i steps)
+        (let [m2 (+ (* 0.9 m) (* 0.1 g)) v2 (+ (* 0.999 v) (* 0.001 (* g g)))
+              mh (/ m2 (- 1.0 (ipow 0.9 i))) vh (/ v2 (- 1.0 (ipow 0.999 i)))]
+          (recur (+ i 1) (- p (/ (* lr mh) (+ (math/sqrt vh) 1.0e-8))) m2 v2))
+        p)))
+(defun ipow (x: f64 n: i64) -> f64 (loop [i 0 acc 1.0] (if (< i n) (recur (+ i 1) (* acc x)) acc)))
+
+(defun adam-n (n: i64 p: (t/Tensor f64) g: (t/Tensor f64)) -> (t/Tensor f64)
+  (loop [i 0 ps [p] st (ad/adam-init [p])]
+    (if (< i n)
+        (let [s2 (ad/adam-step 0.01 0.9 0.999 1.0e-8 st ps [g])] (recur (+ i 1) (. s2 params) (. s2 state)))
+        (nth ps 0))))
+
+;; training y = 2x + 1 by least squares with Adam: the loss must fall below 1e-6
+(defun lsq (ps: (Vec (ad/Tracked f64))) -> (ad/Tracked f64)
+  (let [x (ad/const-like (nth ps 0) (t/tensor [0.0 0.25 0.5 0.75 1.0 1.25 1.5]))
+        y (ad/const-like (nth ps 0) (t/tensor [1.0 1.5 2.0 2.5 3.0 3.5 4.0]))
+        pred (ad/add (ad/mul (nth ps 0) x) (nth ps 1))
+        d (ad/sub pred y)]
+    (ad/mean (ad/mul d d))))
+(defun train (steps: i64) -> f64
+  (loop [i 0 ps [(t/full [] 0.0) (t/full [] 0.0)] st (ad/adam-init [(t/full [] 0.0) (t/full [] 0.0)])]
+    (if (< i steps)
+        (let [vg (ad/value-and-grad lsq ps) s2 (ad/adam-step 0.1 0.9 0.999 1.0e-8 st ps (. vg grads))]
+          (recur (+ i 1) (. s2 params) (. s2 state)))
+        (t/item (. (ad/value-and-grad lsq ps) value)))))
+
+;; data-parallel: the batch of 6 rows is 6 shards of one row; the loss of a shard is the cross-entropy of its row
+(defun shard-loss (i: i64 xs: (Vec (ad/Tracked f64)) x: (t/Tensor f64) labels: (Vec i64)) -> (ad/Tracked f64)
+  (mlp xs (t/slice 0 i (+ i 1) 1 x) [(nth labels i)]))
+
+(defun sharded (workers: i64 s: i64) -> (ad/ValueGrad f64)
+  (let [pr (mlp-problem s) x (nth pr 4) lb (labels-of s)]
+    (adp/shard-value-and-grad workers 6 (fn (i: i64 xs: (Vec (ad/Tracked f64))) (shard-loss i xs x lb)) (vec (take 4 pr)) (/ 1.0 6.0))))
+
+;; forward mode: the JVP of a two-layer net along a random direction equals <reverse-mode gradient, direction>
+(defun net-dual (xs: (Vec (fwd/Dual f64)) x: (t/Tensor f64)) -> (fwd/Dual f64)
+  (let [h (fwd/ddense (fwd/constant-dual x) (nth xs 0) (nth xs 1) :tanh)
+        o (fwd/ddense h (nth xs 2) (nth xs 3) :tanh)]
+    (fwd/dmean (fwd/dmul o o))))
+(defun net-tracked (xs: (Vec (ad/Tracked f64)) x: (t/Tensor f64)) -> (ad/Tracked f64)
+  (let [h (ad/dense (ad/const-like (nth xs 0) x) (nth xs 0) (nth xs 1) :tanh)
+        o (ad/dense h (nth xs 2) (nth xs 3) :tanh)]
+    (ad/mean (ad/mul o o))))
+(defun jvp-agrees? (s: i64) -> bool
+  (let [r (rng-new s) pr (mlp-problem s) ps (vec (take 4 pr)) x (nth pr 4)
+        vs (mapv (fn (p: (t/Tensor f64)) (rand-tensor r (t/shape p) 0.3 1.0 true)) ps)
+        gs (ad/grad (fn (xs: (Vec (ad/Tracked f64))) (net-tracked xs x)) ps)
+        dot (reduce + 0.0 (map (fn (i: i64) (t/sum (t/mul (nth gs i) (nth vs i)))) (range 4)))
+        j (fwd/jvp (fn (xs: (Vec (fwd/Dual f64))) (net-dual xs x)) ps vs)]
+    (< (abs (- dot (t/item (. j d)))) (+ 1.0e-12 (* 1.0e-10 (abs dot))))))
+
+(defspecs specs
+  (feature "ad-graph"
+    (prop "ad-a-tensor-used-twice-accumulates-both-gradients" [s (seeds)]
+      (gradcheck used-twice [(rand-tensor (rng-new s) [(+ 1 (rem s 4)) 3] 0.3 1.5 true)]))
+    (scenario "ad-used-twice-has-the-known-gradient-2x+1"
+      (given [g (ad/grad used-twice [(vec1 [1.0 2.0 -3.0])])])
+      (then (expect = [3.0 5.0 -5.0] (t/to-vec (nth g 0)))))
+    (prop "ad-a-diamond-graph-accumulates-over-both-paths" [s (seeds)]
+      (gradcheck diamond [(rand-tensor (rng-new s) [2 (+ 1 (rem s 3))] 0.1 1.0 true)]))
+    (prop "ad-a-long-chain-with-a-shared-broadcast-bias" [s (seeds)]
+      (let [r (rng-new s)] (gradcheck chain [(rand-tensor r [3 4] 0.1 1.0 true) (rand-tensor r [4] 0.05 0.3 true)])))
+    (prop "ad-the-mlp-gradient-matches-finite-differences" [s (seeds)]
+      (let [pr (mlp-problem s) x (nth pr 4) lb (labels-of s)]
+        (gradcheck (fn (ps: (Vec (ad/Tracked f64))) (mlp ps x lb)) (vec (take 4 pr)))))
+    (scenario "ad-a-parameter-the-loss-does-not-read-has-a-zero-gradient"
+      (given [g (ad/grad (fn (ps: (Vec (ad/Tracked f64))) (ad/sum (nth ps 0))) [(vec1 [1.0 2.0]) (vec1 [5.0 6.0 7.0])])])
+      (then (expect = [1.0 1.0] (t/to-vec (nth g 0))) (expect = [0.0 0.0 0.0] (t/to-vec (nth g 1))) (expect = [3] (t/shape (nth g 1)))))
+    (scenario "ad-a-non-scalar-output-traps"
+      (then (expect = true (traps? (fn () (do (ad/grad (fn (ps: (Vec (ad/Tracked f64))) (ad/exp (nth ps 0))) [(vec1 [1.0 2.0])]) 0)))))))
+  ;; A gradient check differentiates whatever the forward computes, so a forward formula that is wrong and consistent with its backward
+  ;; passes it: the values need their own known answers.
+  (feature "ad-values"
+    (scenario "ad-mean-and-sum-have-the-right-value-and-gradient"
+      (given [vm (ad/value-and-grad (fn (ps: (Vec (ad/Tracked f64))) (ad/mean (nth ps 0))) [(vec1 [1.0 2.0 3.0 6.0])])
+              vs (ad/value-and-grad (fn (ps: (Vec (ad/Tracked f64))) (ad/sum (nth ps 0))) [(vec1 [1.0 2.0 3.0 6.0])])])
+      (then (expect = 3.0 (t/item (. vm value))) (expect = [0.25 0.25 0.25 0.25] (t/to-vec (nth (. vm grads) 0)))
+            (expect = 12.0 (t/item (. vs value)))))
+    (scenario "ad-cross-entropy-of-uniform-logits-is-ln-n-with-gradient-p-minus-onehot-over-m"
+      (given [vg (ad/value-and-grad (fn (ps: (Vec (ad/Tracked f64))) (ad/softmax-cross-entropy (nth ps 0) [0 3])) [(t/zeros [2 4])])])
+      (then (expect = true (< (abs (- (t/item (. vg value)) 1.3862943611198906)) 1.0e-12))
+            (expect = true (close-all? [-0.375 0.125 0.125 0.125 0.125 0.125 0.125 -0.375] (t/to-vec (nth (. vg grads) 0)) 1.0e-12))))
+    (scenario "ad-dense-value-is-the-fused-layer"
+      (given [x (t/reshape [2 2] (vec1 [1.0 -2.0 3.0 4.0])) w (t/reshape [2 2] (vec1 [1.0 0.0 0.0 -1.0])) b (vec1 [0.5 0.5])
+             vg (ad/value-and-grad (fn (ps: (Vec (ad/Tracked f64)))
+                                      (ad/sum (ad/dense (ad/const-like (nth ps 0) x) (nth ps 0) (nth ps 1) :relu))) [w b])])
+      (then (expect = 7.5 (t/item (. vg value))) (expect = [4.0 1.0 2.0 -2.0] (t/to-vec (nth (. vg grads) 0))) (expect = [2.0 1.0] (t/to-vec (nth (. vg grads) 1))))))
+  (feature "ad-scopes"
+    (scenario "ad-stop-gradient-blocks-the-path-and-keeps-the-value"
+      (given [g (ad/grad (fn (ps: (Vec (ad/Tracked f64))) (ad/sum (ad/mul (nth ps 0) (ad/stop-gradient (nth ps 0))))) [(vec1 [2.0 -3.0])])])
+      (then (expect = [2.0 -3.0] (t/to-vec (nth g 0)))))
+    (scenario "ad-no-grad-ops-record-nothing-and-pass-no-gradient"
+      (given [g (ad/grad (fn (ps: (Vec (ad/Tracked f64)))
+                           (let [x (nth ps 0) k (ad/no-grad x (fn () (ad/exp x)))]
+                             (ad/sum (ad/mul x k)))) [(vec1 [0.0 1.0])])])
+      (then (expect = true (close-all? [1.0 2.718281828459045] (t/to-vec (nth g 0)) 1.0e-12))))
+    (scenario "ad-recording-resumes-after-no-grad"
+      (given [g (ad/grad (fn (ps: (Vec (ad/Tracked f64)))
+                           (let [x (nth ps 0) _ (ad/no-grad x (fn () (ad/exp x)))] (ad/sum (ad/mul x x)))) [(vec1 [3.0])])])
+      (then (expect = [6.0] (t/to-vec (nth g 0))))))
+  (feature "ad-memory"
+    (scenario "ad-a-saved-tensor-is-alive-until-its-own-backward-runs-and-gone-before-the-next-op"
+      (given [log (release-log (vec1 [0.5 1.5]))])
+      (then (expect = [true false] log))))
+  (feature "ad-numerics"
+    (prop "ad-the-f32-gradients-agree-with-the-f64-gradients-through-the-fused-dense" [s (seeds)] (f32-agrees? s))
+    (prop "ad-the-gradient-is-bit-identical-from-run-to-run" [s (seeds)] (= (mlp-grads64 s) (mlp-grads64 s))))
+  (feature "ad-forward-mode"
+    (prop "ad-the-jvp-equals-the-reverse-gradient-dotted-with-the-direction" [s (seeds)] (jvp-agrees? s)))
+  (feature "ad-parallel"
+    (prop "ad-data-parallel-gradients-are-bit-identical-for-1-2-3-and-4-workers" [s (seeds)]
+      (let [a (sharded 1 s) b (sharded 2 s) c (sharded 3 s) d (sharded 4 s)]
+        (and (= (mapv t/to-vec (. a grads)) (mapv t/to-vec (. b grads))) (= (mapv t/to-vec (. a grads)) (mapv t/to-vec (. c grads)))
+             (= (mapv t/to-vec (. a grads)) (mapv t/to-vec (. d grads))) (= (t/to-vec (. a value)) (t/to-vec (. d value))))))
+    (prop "ad-data-parallel-gradients-equal-the-whole-batch-gradient-up-to-rounding" [s (seeds)]
+      (let [pr (mlp-problem s) whole (mlp-grads64 s) sh (. (sharded 3 s) grads)]
+        (every? (fn (i: i64) (close-all? (nth whole i) (t/to-vec (nth sh i)) 1.0e-12)) (range 4)))))
+  (feature "ad-optimisers"
+    (scenario "ad-sgd-step-is-p-minus-lr-g"
+      (given [p (vec1 [1.0 -2.0 3.5]) g (vec1 [0.5 4.0 -1.0])])
+      (then (expect = true (close-all? [0.95 -2.4 3.6] (t/to-vec (nth (ad/sgd-step 0.1 [p] [g]) 0)) 1.0e-12))))
+    (prop "ad-adam-matches-a-scalar-reference-for-five-steps" [s (seeds)]
+      (let [r (rng-new s) p (rand-tensor r [4] 0.2 2.0 true) g (rand-tensor r [4] 0.01 3.0 true) out (adam-n 5 p g)]
+        (every? (fn (i: i64) (< (abs (- (t/flat-at out i) (adam-ref 0.01 (t/flat-at p i) (t/flat-at g i) 5))) 1.0e-9)) (range 4))))
+    (scenario "ad-adam-trains-a-line-to-a-loss-below-1e-6"
+      (given [loss (train 400)])
+      (then (expect < loss 1.0e-6)))))
+
+
+(defun main () -> i64 (run-main (specs)))
