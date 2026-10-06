@@ -15,12 +15,13 @@
 #   copy-same       private-copy answers the closure itself, retained (no copy)                      7690-
 #   copy-no-retain  private-copy does not retain what the closure captured                           7690- 7692-
 #   copy-shared     private-copy marks its copy SHARED (atomic counts again)                         7690-
+#   chunk-no-copy   pmap's chunk calls the shared closure, not a private copy (the slow form)        7608- (the abandoned count)
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default
 #   ~/.cache/fibber-scratch/mutant-freeze-MODE), MUT_J (cases at once, default 1), MUT_TIMEOUT (seconds per case, default 300).
 #   The cases run under `ulimit -v 16000000`. That the cases pass UNmutated is shown by an ordinary `F cases cases/stdlib --only 7680- ..`.
 # exit: 0 when every case failed under the mutant, 1 when one survived, 2 for a setup error.
 set -uo pipefail
-MODE=${1:?usage: mutant-freeze.sh skip-children|keep-count|shared-mask|write-in-place|no-check|frozen-false|no-send|copy-same|copy-no-retain|copy-shared}
+MODE=${1:?usage: mutant-freeze.sh skip-children|keep-count|shared-mask|write-in-place|no-check|frozen-false|no-send|copy-same|copy-no-retain|copy-shared|chunk-no-copy}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-freeze-$MODE}
 FIBC=${FIBC:-}
@@ -34,6 +35,7 @@ case $MODE in
   no-send)        CASES=(7681-) ;;
   copy-same|copy-shared) CASES=(7690-) ;;
   copy-no-retain) CASES=(7690- 7692-) ;;
+  chunk-no-copy)  CASES=(7608-) ;;
   *) echo "mutant-freeze: unknown MODE $MODE" >&2; exit 2 ;;
 esac
 
@@ -65,6 +67,8 @@ case $MODE in
     mut $A 's/\(block entry \(ret \(icmp ne \(and \(call \@fib\.flags p\) \(i32 8\)\) \(i32 0\)\)\)\)\)/(block entry (ret (i1 0))))/' ;;
   no-send)
     mut compiler/types/builtins.fib 's/"\(\(Object a\) \(Send a\)\)"/"((Object a))"/' ;;
+  chunk-no-copy)
+    mut lib/fib/parallel/pmap.fib 's/\(let \[f \(private-copy f0\)\n        out \(cell \(array \(- hi lo\) \(f \(nth xs lo\)\)\)\)\]/(let [f f0\n        out (cell (array (- hi lo) (f (nth xs lo))))]/' ;;
   copy-same)
     mut $A 's/\(block kind \(br \(icmp ne k \(i8 0\)\) identity copy\)\)/(block kind (br (icmp eq (i8 0) (i8 0)) identity copy))/' ;;
   copy-no-retain)

@@ -72,3 +72,7 @@ help-while-waiting joins; `spawn`/`future` stay the OS-thread tier); structured 
 tensor kernels parallelise themselves above a size threshold; refcount contention is the main hazard (lock-free scalar atoms, `freeze`, no
 counts on peeked reads). Order: P-race (two real races TSAN found: the plain `fib.mt` global; `tile-window`'s element-0 seed), then P-struct
 and P-count-a in parallel, then P-tensor, P-sched, P-chan, P-det, P-count-b.
+
+## P-count-b (docs/design/parallelism.md 3.6.1), decided by the agent on 2026-10-06 within the lead's brief
+
+1 `freeze` goes through objects that are already SHARED and refuses a cell by type (`Send`), an atom, weak reference or task by a run-time trap; a refused freeze may leave the objects above the refusal frozen (safe). 2 The share-marking walk keeps its mode in its worklist, not in a global. 3 Borrowed element reads: not extended; the derived-read rule covers a builtin `array-get`, not a prelude call (measured). 4 The `:scoped` closure colour is not built: `private-copy` (a per-chunk shallow copy of a shared closure) gives the call cost without a new colour or a second closure ABI. 5 A pmap or pfor chunk that traps abandons its closure copy too (case 7608: 86 to 88).

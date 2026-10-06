@@ -1,0 +1,30 @@
+;; scripts/bench/parallel-closure.fib: the closure forms of fib.parallel against the macro forms (P-count-b; docs/shootout/parallel.md).
+;; usage: parallel-closure MODE W N      prints three rounds as `t MS` and the checksum as `v X`
+;; MODE: pmap       (pmap par f xs) with a closure made here, xs a Vec of N i64
+;;       pmap-each  (pmap-each [x xs par] (* x 2)): the body is made inside the chunk, no shared closure
+;;       preduce-n  (preduce-n par + 0 (fn (i) (* i 2)) N)
+;;       preduce-r  (preduce-range [i N par] + 0 (* i 2))
+;;       preduce    (preduce par + 0 f xs)
+;;       pfor       (pfor par N f) with f adding into one scalar atom per chunk's worth: skipped (an atom is its own contention)
+;; W workers (Par W 0 false). scripts/bench/parallel-closure.sh runs the table.
+(ns main (:use fib.core fib.parallel))
+
+(defun checksum (v: (Vec i64)) -> i64 (reduce + 0 v))
+
+(defun run (mode: str w: i64 n: i64 xs: (Vec i64)) -> i64
+  (let ((p (Par w 0 false)))
+    (cond (= mode "pmap") (checksum (pmap p (fn (x: i64) (* x 2)) xs))
+          (= mode "pmap-each") (checksum (pmap-each [x xs p] (* x 2)))
+          (= mode "preduce-n") (preduce-n p + 0 (fn (i: i64) (bit-xor (* i 3) 5)) n)
+          (= mode "preduce-r") (preduce-range [i n p] + 0 (bit-xor (* i 3) 5))
+          (= mode "preduce") (preduce p + 0 (fn (x: i64) (bit-xor (* x 3) 5)) xs)
+          :else (trap "unknown mode"))))
+
+(defun main () -> i64
+  (let ((mode (nth (args) 0)) (w (unwrap (parse-long (nth (args) 1)))) (n (unwrap (parse-long (nth (args) 2)))))
+    (let ((xs (vec (range n))))
+      (do (dotimes (r 3)
+            (let ((t0 (sys-clock-now)))
+              (let ((v (run mode w n xs)))
+                (do (println "t " (quot (- (sys-clock-now) t0) 1000000)) (println "v " v)))))
+          0))))

@@ -1,0 +1,31 @@
+;; spec:   docs/design/parallelism.md 3.2, 3.6.1 (P-count-b); lib/fib/parallel/pmap.fib, reduce.fib, scan.fib
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: pmap, pmap-n, pfor, preduce, preduce-n, pfold, pscan, private-copy
+;; The closure forms of fib.parallel give the sequential results for closures that capture heap values (a Vec, a string, a Map) at 1, 4 and 28
+;; workers and grains from 1 up. Each chunk calls a private copy of its closures; a copy that did not retain what the closure captured would free
+;; the Vec under another worker (wrong sums, a trap or a failed audit). The sums are integers so that the order of the combine does not matter.
+(ns main (:use fib.core fib.parallel tl.check))
+
+(defun prefix (v: (Vec i64)) -> (Vec i64)
+  (loop ((i 0) (acc 0) (out []))
+    (if (< i (count v)) (let ((a (+ acc (nth v i)))) (recur (+ i 1) a (conj out a))) out)))
+
+(defun main () -> i64
+  (let ((c (checks)) (table (mapv (fn (i: i64) (* i 7)) (range 100))) (tag (str "tag" 12)) (m (assoc {} 3 30)))
+    (let ((f (fn (x: i64) (+ (nth table (rem x 100)) (str-len tag) (unwrap (get (assoc m x x) 3))))))
+      (let ((xs (vec (range 5000))))
+        (let ((want (mapv f xs)) (wsum (reduce + 0 (mapv f xs))))
+          (do (doseq [w [1 4 28]]
+                (doseq [grain [0 1 7 100000]]
+                  (let ((p (Par w grain false)))
+                    (do (check c (= (pmap p f xs) want))
+                        (check c (= (pmap-n p (fn (i: i64) (f i)) 5000) want))
+                        (check c (= (preduce p + 0 f xs) wsum))
+                        (check c (= (preduce-n p + 0 (fn (i: i64) (f i)) 5000) wsum))
+                        (check c (= (pfold p + (fn (acc: i64 x: i64) (+ acc (f x))) 0 xs) wsum))
+                        (check c (= (pscan p + 0 want) (prefix want)))))))
+              (checks-result c)))))))

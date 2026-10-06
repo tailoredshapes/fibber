@@ -17,8 +17,9 @@
 ;; depends on the worker count (the bits of a floating point sum differ); use it when the combine is exact or the bits do not matter.
 ;;
 ;; The per-element closures of `pfold` and `preduce` are called from several threads: a shared closure's count is an atomic, and with 8
-;; threads each call costs about 60 ns instead of 1 (measured; docs/design/parallelism.md 3.2). For a body that is cheap per element
-;; write a chunk function that loops itself and use `pfold-chunks`; the closure is then called once per chunk.
+;; threads each call costs about 60 ns instead of 1 (measured; docs/design/parallelism.md 3.2). Each chunk therefore calls a `private-copy`
+;; of the closures it was given (P-count-b: a count of its own, 1 to 2 ns a call; the values a closure captured are retained once per chunk).
+;; A body that is cheap per element still does better as a chunk function that loops itself with `pfold-chunks`, or as the macros.
 (ns fib.parallel.reduce (:use fib.core fib.seq fib.coll fib.parallel.cpu fib.parallel.chunks))
 
 ;; One level of the tree: the results in pairs, the odd one carried.
@@ -48,11 +49,21 @@
       (let [parts (run-chunks (. p workers) n (fold-grain p n) chunk-fn)]
         (if (. p fast) (left-combine combine init parts) (tree-combine combine init parts)))))
 
-(defun fold-chunk (reducef: (fn (r a) r) init: r xs: (Vec a) lo: i64 hi: i64) -> r
-  (loop [i lo acc init] (if (< i hi) (recur (+ i 1) (reducef acc (nth xs i))) acc)))
+(defun fold-chunk (reducef0: (fn (r a) r) init: r xs: (Vec a) lo: i64 hi: i64) -> r
+  (let [reducef (private-copy reducef0)]
+    (loop [i lo acc init] (if (< i hi) (recur (+ i 1) (reducef acc (nth xs i))) acc))))
 
-(defun fold-index-chunk (step: (fn (r i64) r) init: r lo: i64 hi: i64) -> r
-  (loop [i lo acc init] (if (< i hi) (recur (+ i 1) (step acc i)) acc)))
+(defun fold-index-chunk (step0: (fn (r i64) r) init: r lo: i64 hi: i64) -> r
+  (let [step (private-copy step0)]
+    (loop [i lo acc init] (if (< i hi) (recur (+ i 1) (step acc i)) acc))))
+
+;; The step of a chunk of `preduce`: it calls `f` and `combine` for every element, so it holds private copies of both (the step itself is
+;; made inside the chunk, and is private already).
+(defun preduce-step (combine: (fn (r r) r) f: (fn (a) r)) -> (fn (r a) r)
+  (let [c (private-copy combine) g (private-copy f)] (fn (acc x) (c acc (g x)))))
+
+(defun preduce-index-step (combine: (fn (r r) r) f: (fn (i64) r)) -> (fn (r i64) r)
+  (let [c (private-copy combine) g (private-copy f)] (fn (acc i) (c acc (g i)))))
 
 (defn pfold
   ([combine: (fn (r r) r) reducef: (fn :send (r a) r) init: r xs: (Vec a)] -> r
@@ -62,12 +73,12 @@
 
 (defn preduce
   ([combine: (fn :send (r r) r) init: r f: (fn :send (a) r) xs: (Vec a)] -> r
-    (pfold-chunks (par) (vec-count xs) combine init (fn (lo hi) (fold-chunk (fn (acc x) (combine acc (f x))) init xs lo hi))))
+    (pfold-chunks (par) (vec-count xs) combine init (fn (lo hi) (fold-chunk (preduce-step combine f) init xs lo hi))))
   ([p: Par combine: (fn :send (r r) r) init: r f: (fn :send (a) r) xs: (Vec a)] -> r
-    (pfold-chunks p (vec-count xs) combine init (fn (lo hi) (fold-chunk (fn (acc x) (combine acc (f x))) init xs lo hi)))))
+    (pfold-chunks p (vec-count xs) combine init (fn (lo hi) (fold-chunk (preduce-step combine f) init xs lo hi)))))
 
 (defn preduce-n
   ([combine: (fn :send (r r) r) init: r f: (fn :send (i64) r) n: i64] -> r
-    (pfold-chunks (par) n combine init (fn (lo hi) (fold-index-chunk (fn (acc i) (combine acc (f i))) init lo hi))))
+    (pfold-chunks (par) n combine init (fn (lo hi) (fold-index-chunk (preduce-index-step combine f) init lo hi))))
   ([p: Par combine: (fn :send (r r) r) init: r f: (fn :send (i64) r) n: i64] -> r
-    (pfold-chunks p n combine init (fn (lo hi) (fold-index-chunk (fn (acc i) (combine acc (f i))) init lo hi)))))
+    (pfold-chunks p n combine init (fn (lo hi) (fold-index-chunk (preduce-index-step combine f) init lo hi)))))

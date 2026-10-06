@@ -443,3 +443,13 @@ fix is an interprocedural one (a function whose result is `Derived` from a param
 in the emitter); it was **not built**: no measured benchmark here needs it once the data can be frozen or the element is a scalar (a Vec of scalars
 touches no count), and the change is a checker feature of its own.
 
+**The closure forms** (built as `private-copy`, spec/types.md 2.10.2; not the `:scoped` colour). A closure call retains the closure it calls and the body of the
+closure releases it (lIR: `call @fib.retain p0` before the `indirect-call`, `call @fib.release env` in the body), so a closure shared by W tasks is an atomic count
+pair per call. The `:scoped` colour of 3.6 would remove that by passing the environment borrowed (a second calling convention for scoped closures) and by not
+share-marking what the scope lends. Measured first: share-marking a captured environment is 9.6 ns an object once per task; the call pair is 60 ns a call. `freeze` cannot
+help (it would make the caller's closure and what it captured immortal for good). A shallow copy per chunk with a count of its own turns the pair into a plain count
+(1 to 2 ns) and costs one allocation and one retain per captured value per chunk. With the library switched (`pmap`, `pmap-n`, `pfor`, `preduce`, `preduce-n`, `pfold`,
+`pscan`: docs/shootout/parallel.md): `pmap` with a caller closure 539 to 105 ms at 28 workers against `pmap-each`'s 98; `preduce-n` 361 to 5 ms; every checksum identical.
+Not done, and why the colour stays a possible later step: the share walk at hand-off (9.6 ns an object, once per task) and the retains of what a closure captured
+(once per chunk) remain; neither showed in a row. `fib.tensor` has no per-element closure of this kind (its parallel paths call a tile body once per tile through
+`fib.view.tiles`), so nothing there changed; its cases pass as before.

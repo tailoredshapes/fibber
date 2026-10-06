@@ -20,11 +20,32 @@ is `fibc run docs/shootout/parallel/NAME.fib -I lib` from the repository root.
 
 Results of all variants equal the sequential result (the last line of the program prints `equal true ...`).
 
-Why the closure form is slower: `f` of `(pmap f xs)` is one closure shared by W threads, and every call to it touches its atomic reference count. Measured
-directly (a chunk function that calls a shared closure per element, 1e6 elements, 8 workers): 60 to 65 ms with the closure, 3 ms with the same arithmetic written
-inline. A body made inside the chunk (`pmap-each`, `pmap-range`, `pfor-range`, `preduce-each`, `preduce-range`, or a chunk function of `pmap-chunks` and
-`pfold-chunks`) never shares a closure. This is the refcount-contention hazard of section 2.5 of the design (P-count-b: `freeze` and borrowed reads is the fix);
-nothing in `lib/` can remove it. For a body that costs a microsecond it is noise (the next table).
+Why the closure form was slower: `f` of `(pmap f xs)` is one closure shared by W threads, and a closure call retains the closure and the body releases it, so every
+call touched its atomic reference count. Measured directly (a chunk function that calls a shared closure per element, 1e6 elements, 8 workers): 60 to 65 ms with the
+closure, 3 ms with the same arithmetic written inline. This is the refcount-contention hazard of section 2.5 of the design. **P-count-b fixed it in the library**
+(next section): each chunk calls a `private-copy` of the closure. The table above is the v0.1.6 measurement and is kept as it was.
+
+## The closure forms after P-count-b (`scripts/bench/parallel-closure.sh`)
+
+Command: `FIBC=F scripts/bench/parallel-closure.sh "pmap pmap-each preduce preduce-n preduce-r" W 10000000` (ulimit -v 16000000, MALLOC_ARENA_MAX=2, under
+`flock /tmp/fibsuite.lock`; ms, median of three rounds; 1e7 elements; the machine is shared, so trust ratios of 2x and more). Before: the tree at 789aa92 (library
+without `private-copy`), after: this tree, the same compiler binary. The checksums of every row are the same before and after.
+
+| row | W=8 before | W=8 after | W=28 before | W=28 after |
+|---|---:|---:|---:|---:|
+| `(pmap p f xs)`, closure `(* x 2)` | 470 | 126 | 539 | 105 |
+| `pmap-each` (body made in the chunk) | 114 | 115 | 91 | 98 |
+| `(preduce p + 0 f xs)` | 385 | 25 | 452 | 12 |
+| `(preduce-n p + 0 f n)` | 367 | 7 | 361 | 5 |
+| `preduce-range` (macro) | 2 | 3 | 3 | 2 |
+
+The closure `pmap` was 5.9x and 5.3x slower than `pmap-each` (W=28, 8) and is 1.07x and 1.1x now; `preduce-n` was 180x slower than the macro at W=28 (361 against 2 ms)
+and is 2.5x now (5 against 2 ms, the per-element call that remains). The `*-each` forms did not change. The `:scoped` colour was not built: the closure rows are within
+the 2x criterion of the design without it (`pmap`) or are a per-element call of a closure (`preduce-n`, which has no macro-free form faster than a call).
+
+The files `pmap-trivial.fib`, `pmap-compute.fib` and `preduce-1e8.fib` of `docs/shootout/parallel/` were written for v0.1.6 and no longer compile (the tile
+combinators of `fib.view.tiles` have another signature; `fibc` says `cannot unify (fn (a i64 i64) unit) with (fn :send ((Array i64) i64 i64 i64) unit)`): the
+rows above come from the program that replaced them for the closure question, not from re-running those.
 
 Per-chunk Vec results concatenated with a `conj` loop cost 60 ms for 1e6 elements; a chunk result as an array (filled at 3 ns an element) concatenated
 into one array and turned into a Vec with `vec-from-array` (5 ns an element) costs 3 + 5 ms. That is what `pmap` does. Writing straight into one pre-sized array

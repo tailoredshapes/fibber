@@ -18,15 +18,21 @@
         (<= (. p workers) 1) n
         :else (max 1 (quot n (* 8 (. p workers))))))
 
+;; A closure that every worker calls is one object whose count each call touches (a call retains the closure and its body releases it): an atomic
+;; pair on a SHARED count, 60 ns at 8 threads (P-count-b, docs/shootout/parallel.md). Each chunk function below calls a `private-copy` of the closure
+;; it was given: a count of its own, 1 to 2 ns a call, and the values the closure captured are retained once per chunk, not once per call.
+;; A chunk is thousands of elements, so the copy (an allocation and a retain per captured value) is noise.
 ;; A chunk's results as an array: the first result sizes it (an array needs an element), the rest are stored in place.
 ;; Arrays, not Vecs: filling an array is 3 ns an element and `vec-from-array` 5, a `conj` loop 60 (measured, docs/design/parallelism.md 3.2).
-(defun map-chunk (f: (fn (a) b) xs: (Vec a) lo: i64 hi: i64) -> (Array b)
-  (let [out (cell (array (- hi lo) (f (nth xs lo))))]
+(defun map-chunk (f0: (fn (a) b) xs: (Vec a) lo: i64 hi: i64) -> (Array b)
+  (let [f (private-copy f0)
+        out (cell (array (- hi lo) (f (nth xs lo))))]
     (do (loop [i (+ lo 1)] (when (< i hi) (do (array-set! &out (- i lo) (f (nth xs i))) (recur (+ i 1)))))
         @out)))
 
-(defun index-chunk (f: (fn (i64) b) lo: i64 hi: i64) -> (Array b)
-  (let [out (cell (array (- hi lo) (f lo)))]
+(defun index-chunk (f0: (fn (i64) b) lo: i64 hi: i64) -> (Array b)
+  (let [f (private-copy f0)
+        out (cell (array (- hi lo) (f lo)))]
     (do (loop [i (+ lo 1)] (when (< i hi) (do (array-set! &out (- i lo) (f i)) (recur (+ i 1)))))
         @out)))
 
@@ -58,8 +64,9 @@
   ([f: (fn :send (i64) b) n: i64] -> (Vec b) (pmap-chunks (par) n (fn (lo hi) (index-chunk f lo hi))))
   ([p: Par f: (fn :send (i64) b) n: i64] -> (Vec b) (pmap-chunks p n (fn (lo hi) (index-chunk f lo hi)))))
 
-(defun each-chunk (f: (fn (i64) unit) lo: i64 hi: i64) -> unit
-  (loop [i lo] (when (< i hi) (do (f i) (recur (+ i 1))))))
+(defun each-chunk (f0: (fn (i64) unit) lo: i64 hi: i64) -> unit
+  (let [f (private-copy f0)]
+    (loop [i lo] (when (< i hi) (do (f i) (recur (+ i 1)))))))
 
 ;; The engine of every for-effect call: `(chunk-fn lo hi)` runs the indices [lo, hi).
 (defun pfor-chunks (p: Par n: i64 chunk-fn: (fn :send (i64 i64) unit)) -> unit
