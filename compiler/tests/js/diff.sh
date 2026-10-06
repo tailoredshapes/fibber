@@ -9,7 +9,8 @@
 #   --keep DIR         keep the translated .mjs and both runs' output there
 #   --reject           also the `;; expect: reject` cases of the directories: lir2js must refuse each with lairf's exit status and text
 # Environment: LAIRF, LIR2JS, FIBC (for --emit), NODE (default node), DIFF_TIMEOUT (seconds, default 30), RT (the runtime dir).
-# A row per program: `pass NAME`, `differ NAME: WHAT`, `unsupported NAME: WHAT` (the JS run stopped at `lir2js: unsupported`),
+# A row per program: `pass NAME`, `differ NAME: WHAT`, `unsupported NAME: WHAT` (the JS run stopped at `lir2js: unsupported`), `timeout NAME`
+# (the JS run alone exceeded the time limit),
 # `skip NAME: WHY` (the native run itself timed out, or fibc could not emit); then the counts. Exit 0 when every ending is pass or listed in
 # --expect, 1 otherwise, 2 for a usage error.
 set -u
@@ -62,6 +63,7 @@ one() {
   fi
   if ! "$LIR2JS" "$f" -o "$d/p.mjs" --rt "$RT" 2> "$d/t.err"; then echo "differ $name: lir2js failed: $(head -c 200 "$d/t.err")"; return; fi
   (timeout "$TMO" "$NODE" --stack-size=7000 "$d/p.mjs" > "$d/j.out" 2> "$d/j.err") 2> /dev/null; js=$?
+  if [ $js -eq 124 ] && [ $ns -ne 124 ]; then echo "timeout $name: the JS run took more than $TMO s"; return; fi
   if grep -q 'lir2js: unsupported' "$d/j.err"; then echo "unsupported $name: $(grep -m1 -o 'lir2js: unsupported.*' "$d/j.err" | head -c 160)"; return; fi
   what=""
   [ $ns -ne $js ] && what="exit $js, native $ns"
@@ -74,7 +76,7 @@ export -f one; export LAIRF LIR2JS NODE TMO RT root work keep FIBC
 xargs -P "$jobs" -I{} bash -c 'one "$@"' _ {} < "$list" > "$work/rows"
 [ -f "$work/skips" ] && cat "$work/skips" >> "$work/rows"
 sort -k2 "$work/rows" > "$work/sorted"; cat "$work/sorted"
-for v in pass differ unsupported skip; do printf '%s %s  ' "$v" "$(grep -c "^$v " "$work/sorted")"; done; echo
+for v in pass differ unsupported timeout skip; do printf '%s %s  ' "$v" "$(grep -c "^$v " "$work/sorted")"; done; echo
 if [ -n "$expect" ]; then
   grep -v '^pass ' "$work/sorted" | awk '{print $1, $2}' | sed 's/:$//' | sort > "$work/got"
   grep -v '^#' "$expect" | grep -v '^$' | sort > "$work/want"

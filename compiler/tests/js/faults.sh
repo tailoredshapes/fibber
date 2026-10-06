@@ -13,7 +13,7 @@ while [ $# -gt 0 ]; do case $1 in -j) jobs=$2; shift ;; *) names+=("$1") ;; esac
 faults=(
   "i64-add-wrap|scalar.fib|((BAdd) (big (str a \"+\" b)))|((BAdd) (p (str a \"+\" b)))"
   "overflow-trap|rt/int.js|return [w, w === r ? 0 : 1];|return [w, 0];"
-  "switch-branch|func.fib|\"default:{\" (goto fx phis from d)|\"default:{\" (goto fx phis from (. (nth cases 0) label))"
+  "switch-branch|func.fib|\"default:{\" (goto fx fl from d)|\"default:{\" (goto fx fl from (. (nth cases 0) label))"
   "tail-stack|func.fib|:else (str \"{const a=[\" (args-js fx args) \"];\" (restore-sp fx) \"\$tf=\" (fn-name n) \";\$ta=a;return \$TAIL;}\")))|:else (str \"return \" (fn-name n) \"(\" (args-js fx args) \");\")))"
   "f32-fround|scalar.fib|((TFloat) (str \"Math.fround\" (float-bin op a b)))|((TFloat) (float-bin op a b))"
 )
