@@ -3982,7 +3982,8 @@ to the OS (§6.8). The interpreter's `mark_shared`
 follows the same edges (`fibref` `heap/shared.rs`).
 
 `(Task T)`: `(i64 i32 i32  i32 state  i32 driver  i32 lock  ptr resume
-ptr result  ptr waiters  ..captures ..locals)`. `async` lowers to a
+ptr result  ptr waiters  ptr closure  ptr failure  ..captures ..locals)`
+(slots 6 to 10; captures start at slot 11, `compiler/emit/objects/kinds.fib`; amended 2026-10-06: the closure slot and the failure slot of exceptions stage 1 were missing here, so `unit-objects` had rotted against this text). `async` lowers to a
 state machine, not to LLVM coroutine intrinsics: `resume(task)`
 switches on `state`, runs to the next `await`, stores the live locals
 into the task object and returns; when the body's last step has
