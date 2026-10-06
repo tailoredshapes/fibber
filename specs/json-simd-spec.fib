@@ -3,24 +3,34 @@
 ;; documents, and on a long string that spans many blocks.
 (ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.json.types fib.json.write fib.json.gen fib.json.stage1))
 
+(defun structural? (c: i8) -> bool (or (= c 123i8) (or (= c 125i8) (or (= c 91i8) (or (= c 93i8) (or (= c 58i8) (= c 44i8)))))))
+(defun white? (c: i8) -> bool (or (= c 32i8) (or (= c 10i8) (or (= c 13i8) (= c 9i8)))))
+
+;; The scalar definition of the index: every unescaped quote, every structural character outside a string, the first byte of every other token outside a string.
 (defun reference (a: (Array i8)) -> (Vec i64)
-  (loop [i 0 instr false esc false out: (Vec i64) []]
+  (loop [i 0 instr false esc false tok false out: (Vec i64) []]
     (if (>= i (array-len a)) out
         (let [c (array-get a i)]
-          (cond esc (recur (+ i 1) instr false out)
-                (and instr (= c 92i8)) (recur (+ i 1) instr true out)
-                (= c 34i8) (recur (+ i 1) (not instr) false (conj out i))
-                (and (not instr) (or (= c 123i8) (or (= c 125i8) (or (= c 91i8) (or (= c 93i8) (or (= c 58i8) (= c 44i8))))))) (recur (+ i 1) instr false (conj out i))
-                :else (recur (+ i 1) instr false out))))))
+          (cond esc (recur (+ i 1) instr false tok out)
+                (and instr (= c 92i8)) (recur (+ i 1) instr true tok out)
+                (= c 34i8) (recur (+ i 1) (not instr) false false (conj out i))
+                instr (recur (+ i 1) instr false tok out)
+                (structural? c) (recur (+ i 1) instr false false (conj out i))
+                (white? c) (recur (+ i 1) instr false false out)
+                tok (recur (+ i 1) instr false true out)
+                :else (recur (+ i 1) instr false true (conj out i)))))))
 
 (defun index-of (s: str) -> (Vec i64)
-  (let [a (str-bytes s) r (structural-index a (array-len a))]
-    (vec (map (fn (i: i64) (array-get (. r fst) i)) (range (. r snd))))))
+  (let [x (structural-index s)
+        r (vec (map (fn (i: i64) (sidx-at x i)) (range (. x count))))]
+    (do (sidx-free x) r)))
+
+(defun flags-of (s: str) -> i64 (let [x (structural-index s)] (let [f (. x flags)] (do (sidx-free x) f))))
 
 (defun agrees (s: str) -> bool (= (index-of s) (reference (str-bytes s))))
 
 (defun snippets () -> (Vec str)
-  ["\"a\\\\\"" "\"\\\"\"" "\"x\\\\\\\"y\"" "[1,2]" "{\"k\":\"v\"}" "\"\\\\\\\\\\\\\"" "\"\\\\\\\\\\\"\"" ",:[]{}" "\"{[,:]}\""])
+  ["\"a\\\\\"" "\"\\\"\"" "\"x\\\\\\\"y\"" "[1,2]" "{\"k\":\"v\"}" "\"\\\\\\\\\\\\\"" "\"\\\\\\\\\\\"\"" ",:[]{}" "\"{[,:]}\"" "123,-4.5e+6" "true,false,null" "[12,34,\"ab\" , 5 ]" "  12  " "\"a\"1\"b\""])
 
 ;; Every snippet at every offset from 0 to 131 (so each lands across each boundary of the 64-byte blocks, and across 2 of them), after plain padding.
 (defun shifted-failures () -> (Vec str)
@@ -36,6 +46,10 @@
       (then (expect = true (agrees t))))
     (scenario "the tail block shorter than 64 bytes, every length from 0 to 130"
       (then (expect = [] (vec (filter (fn (n: i64) (not (agrees (str-join (vec (map (fn (i: i64) (if (= (rem i 3) 0) "[" (if (= (rem i 3) 1) "\"" ",")))  (range n))))))) (range 131))))))
+    (scenario "the flags: a control byte in a string, a string left open, nothing else"
+      (then (expect = [1 1 2 2 0 0 0] [(flags-of "\"a\x01b\"") (flags-of "[\"\x1f\"]") (flags-of "[\"abc") (flags-of "\"a\\\"") (flags-of "[1,\"abc\"]") (flags-of "\x01 [1]") (flags-of "\"é\"")])))
+    (scenario "a control byte in a string in the second block of 64 is flagged as well"
+      (then (expect = 1 (flags-of (str (str-join (vec (map (fn (i: i64) " ") (range 70))) ) "\"ab\x05\"")))))
     (prop "random documents (compact and pretty)" [x (gen-json)] (and (agrees (write x)) (agrees (write-pretty x))))))
 
 (defun main () -> i64 (run-main (specs)))

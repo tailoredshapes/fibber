@@ -1,0 +1,85 @@
+;; The index-driven tape builder (fib.json.tapefast, over fib.json.stage1) against the scalar one (fib.json.tapebuild/build-tape-scalar), which is the oracle: on every input
+;; the two must AGREE: if the fast builder accepts, the scalar builder accepts and the tapes are word for word equal; if the scalar builder accepts, the fast one does too
+;; (a valid document that falls back is a silent slowdown, so it is a failure here); if the scalar builder rejects, so does the fast one. The inputs: the JSONTestSuite subset
+;; files, random documents written compact, pretty and ASCII-only (blocks of 64 bytes cut them everywhere), a large document, and the same documents with one byte deleted,
+;; replaced, inserted, or the text cut off (the mutations of a valid document are where a grammar check that is missing shows).
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.json.types fib.json.write fib.json.gen fib.json.tape fib.json.tapebuild fib.json.tapefast fib.json.utf8) (:require [fib.os :as os]))
+
+(defun same-words (a: Doc b: Doc) -> bool
+  (and (= (. a len) (. b len))
+       (loop [i 0] (cond (>= i (. a len)) true (!= (array-get (. a words) i) (array-get (. b words) i)) false :else (recur (+ i 1))))))
+
+(defun agree (s: str) -> bool (agree-with s (default-options)))
+
+(defun agree-with (s: str o: JsonOptions) -> bool
+  (do
+    (match (fast-tape-always s o)
+      ((some d) (match (build-tape-scalar s o) ((Ok e) (same-words d e)) ((Err _) false)))
+      (nil (match (build-tape-scalar s o) ((Ok _) false) ((Err _) true))))))
+
+(defun suite-files () -> (Vec str)
+  (vec (concat (concat (suite-a) (suite-b)) (suite-c))))
+(defun suite-a () -> (Vec str)
+  ["y_array_empty.json" "y_array_with_several_null.json" "y_number_negative_zero.json" "y_number_real_capital_e_neg_exp.json" "y_number_double_close_to_zero.json"
+   "y_object_duplicated_key.json" "y_string_surrogates_U+1D11E_MUSICAL_SYMBOL_G_CLEF.json" "y_string_unicode_2.json" "y_string_nbsp_uescaped.json" "y_string_escaped_control_character.json"
+   "y_string_accepted_surrogate_pair.json" "y_structure_lonely_negative_real.json" "y_structure_trailing_newline.json" "y_string_null_escape.json" "y_string_in_array.json"
+   "y_object_extreme_numbers.json" "y_string_u+2028_line_sep.json" "y_number_simple_int.json" "y_string_last_surrogates_1_and_2.json" "y_object_with_newlines.json"])
+(defun suite-b () -> (Vec str)
+  [ "n_array_comma_after_close.json" "n_array_extra_comma.json" "n_array_unclosed.json" "n_number_minus_sign_with_trailing_garbage.json" "n_number_with_leading_zero.json"
+   "n_number_.2e-3.json" "n_number_infinity.json" "n_number_NaN.json" "n_object_trailing_comma.json" "n_object_single_quote.json" "n_string_1_surrogate_then_escape_u1.json"
+   "n_string_invalid_backslash_esc.json" "n_string_unescaped_ctrl_char.json" "n_string_single_quote.json" "n_structure_UTF8_BOM_no_data.json" "n_structure_null-byte-outside-string.json"
+   "n_structure_object_with_trailing_garbage.json" "n_string_invalid_utf8_after_escape.json" "n_structure_100000_opening_arrays.json" "n_incomplete_true.json" "n_object_missing_colon.json"
+   "n_structure_comma_instead_of_closing_brace.json"])
+(defun suite-c () -> (Vec str)
+  [ "n_string_escape_x.json" "i_number_huge_exp.json" "i_string_lone_second_surrogate.json" "i_structure_500_nested_arrays.json"
+   "i_number_too_big_pos_int.json" "i_string_UTF-8_invalid_sequence.json"])
+
+(defun suite-disagreements () -> (Vec str)
+  (vec (filter (fn (f: str)
+                 (match (os/read-file-bytes (str "specs/json-testsuite-subset/" f) 100000000)
+                   ((Err _) true)
+                   ((Ok b) (if (= (first-invalid b) -1) (not (agree (str-from-bytes b))) false))))
+               (suite-files))))
+
+(def substitutes: (Vec str) ["\"" "\\" "{" "}" "[" "]" "," ":" "0" "-" "e" "." " " "\n" "t" "n" "\x01" "u" "1" "+"])
+
+;; One edit of s chosen by k: at an ASCII byte (so the text stays valid UTF-8): delete it, replace it, insert before it, or cut the text there.
+(defun mutate (s: str k: i64) -> str
+  (let [n (str-len s)]
+    (if (= n 0) s
+        (let [pos (rem k n) op (rem (quot k n) 4) sub (nth substitutes (rem (quot k (* 4 n)) (count substitutes)))]
+          (if (< (str-byte-at s pos) 0i8) s
+              (cond (= op 0) (str (str-slice s 0 pos) (str-slice s (+ pos 1) n))
+                    (= op 1) (str (str-slice s 0 pos) sub (str-slice s (+ pos 1) n))
+                    (= op 2) (str (str-slice s 0 pos) sub (str-slice s pos n))
+                    :else (str-slice s 0 pos)))))))
+
+(defun big-document () -> str
+  (write (JArr (mapv (fn (i: i64) (JObj ["id" "name" "tags" "score" "nested"]
+                                        [(JInt i) (JStr (str "item \"" i "\" \\ é"))  (JArr [(JStr "a") (JBool true) JNull (JInt (* i 7919))])
+                                         (JFloat (/ (double i) 7.0)) (JObj ["x" "y"] [(JInt (- 0 i)) (JStr "")])]))
+                     (range 400)))))
+
+(defun shorts-a () -> (Vec str)
+  ["1" "-0" "1.5e3" "true" "false" "null" "\"\"" "\"a\"" "[]" "{}" "[ ]" "{ }" "[1]" "[1,2]" "{\"a\":1}" "{\"a\":[]}" " 1 " "\n[1]\n" "" " " "[" "]" "{" "}" "[1" "[1," "[1,]" "{\"a\"" "{\"a\":" "{\"a\":1"])
+(defun shorts-b () -> (Vec str)
+  ["{\"a\":1,}" "{1:2}" "[1 2]" "[1,,2]" "1 2" "tru" "truee" "nul" "-" "01" "1." "1e" "\"a" "\"a\\" "\"a\\\"" "\"\\u12\"" "\"\\ud800\"" "[\"a\" \"b\"]" "{\"a\" 1}" "{\"a\":1 \"b\":2}" "[1]]" "[[]" "][" "[1x]" "[12abc,3]" "[true1]" "[nullx]" "{\"a\":1x}" "[1}" "{\"a\":1]" "[}" "{]" "[1:2]" "{\"a\":1:2}" "[\"a\":1]"])
+
+(defspecs specs
+  (feature "the index-driven tape builder agrees with the scalar one"
+    (scenario "the JSONTestSuite subset: same verdict, same tape" (then (expect = [] (suite-disagreements))))
+    (scenario "a large document (hundreds of 64-byte blocks)" (then (expect = true (agree (big-document)))))
+    (scenario "the large document cut at every 37th byte (the cut may fall in a string, a number, a literal or between tokens)"
+      (then (expect = [] (vec (filter (fn (k: i64) (not (agree (mutate (big-document) (* k 37))))) (range 100))))))
+    (scenario "short texts: scalars, empty containers, the shapes around the end of the text"
+      (then (expect = [] (vec (filter (fn (t: str) (not (agree t))) (concat (shorts-a) (shorts-b)))))))
+    (scenario "the depth limit is the same: nesting of 3 at a limit of 3 is accepted, 4 is not (and at 1, 2)"
+      (then (expect = [] (vec (filter (fn (c: (Pair str i64)) (not (agree-with (. c fst) (JsonOptions (. c snd) 1073741824 0 0 false false))))
+                                      [(Pair "[[[1]]]" 3) (Pair "[[[[1]]]]" 3) (Pair "{\"a\":{\"b\":[1]}}" 3) (Pair "{\"a\":{\"b\":[[1]]}}" 3) (Pair "[1]" 1) (Pair "[[1]]" 1) (Pair "[]" 1) (Pair "[[]]" 1)])))))
+    (prop "random documents, compact" [x (gen-json)] (agree (write x)))
+    (prop "random documents, pretty" [x (gen-json)] (agree (write-pretty x)))
+    (prop "random documents, ASCII only (every non-ASCII character an escape)" [x (gen-json)] (agree (write-with x (WriteOptions 0 true))))
+    (prop "random documents with one edit" [p (gen-pair (gen-json) (gen-i64-between 0 1000000000))] (agree (mutate (write (. p fst)) (. p snd))))
+    (prop "random documents, pretty, with one edit" [p (gen-pair (gen-json) (gen-i64-between 0 1000000000))] (agree (mutate (write-pretty (. p fst)) (. p snd))))))
+
+(defun main () -> i64 (run-main (specs)))

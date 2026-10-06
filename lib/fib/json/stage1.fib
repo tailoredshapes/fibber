@@ -1,84 +1,117 @@
-;; fib.json.stage1: simdjson's stage 1 in fibber's lane vectors (docs/design/json.md 3, docs/shootout/json.md): the positions of every unescaped quote and of every
-;; structural character (`{ } [ ] : ,`) outside a string, found 64 bytes at a time. Per 16 bytes: compares against the byte classes (`simd/eq`, `simd/or` on masks);
-;; the masks become integers by `bits16`, which has to EMULATE a movemask (the language has none: a mask is converted to 0/1 lanes, widened to i32, multiplied by
-;; 2^lane and summed); the four 16-bit masks make one 64-bit word; escaped quotes are removed with simdjson's odd-backslash-run addition; the inside-a-string mask is the
-;; prefix XOR of the quote bits by a shift/xor ladder (no carry-less multiply); positions leave the word with a count-trailing-zeros loop, ctz written as
-;; popcount((x & -x) - 1) (there is no ctz builtin). The result is not yet what the tape builder consumes (it validates as it goes): this module is the measured
-;; experiment of phase 2, and its output equals a scalar reference (specs/json-simd-spec.fib).
-;;   (structural-index a n) -> (Pair (Array i64) i64)   the positions (ascending) in the first `count` words of the array; `a` holds n bytes of text
-(ns fib.json.stage1 (:use fib.core fib.seq fib.coll fib.simd))
+;; fib.json.stage1: simdjson's stage 1 in fibber's lane vectors (docs/design/json.md 3, docs/shootout/json.md): the positions of everything stage 2 has to look at, found
+;; 64 bytes at a time. Per block: byte-class compares on an `i8x64` (LLVM splits it to the target's width), each turned into a 64-bit mask by `simd/movemask`
+;; (one `pmovmskb` per 16 or 32 lanes, `kmov` on AVX-512, the NEON equivalent on aarch64); escaped quotes are removed with simdjson's odd-backslash-run addition; the
+;; inside-a-string mask is the prefix XOR of the quote bits by a shift/xor ladder (no carry-less multiply); positions leave the word with `ctz`, eight at a time
+;; written unconditionally (the branch is on the count, not on every bit).
+;; The index holds, in ascending order: every unescaped quote (an even count of them per string: the opening one, then the closing one), every structural character
+;; `{ } [ ] : ,` outside a string, and the first byte of every other token outside a string (a number or `true`, `false`, `null`: a run of bytes that are none of
+;; whitespace, structural or a quote). `flags` (an OR of f-control, f-unterminated) says what stage 1 saw that stage 2 must act on: a control byte inside a
+;; string, a string still open at the end. The index lives in malloc'ed memory (a malloc'ed buffer,
+;; not an array: no zero-fill, and `realloc` grows it): the caller frees it with `sidx-free`.
+;;   (structural-index s) -> Sidx
+(ns fib.json.stage1 (:use fib.core fib.seq fib.coll) (:require [fib.json.libc :as libc]))
 
-(def weights16: (Simd i32 16) <<1 2 4 8 16 32 64 128 256 512 1024 2048 4096 8192 16384 32768>>i32)
 (def even-bits: i64 6148914691236517205)
+(def f-control: i64 1)
+(def f-unterminated: i64 2)
 
-;; The 16 mask lanes as the low 16 bits of an integer (lane 0 is bit 0).
-(defun bits16 (m: (Simd bool 16)) -> i64
-  (let [ones: (Simd i8 16) (simd/blend m (splat (Simd i8 16) 1i8) (splat (Simd i8 16) 0i8))
-        wide: (Simd i32 16) (simd/convert ones)]
-    (sext i64 (hsum (* wide weights16)))))
+(defstruct Sidx (p: ptr count: i64 flags: i64 closing: i64))
 
-(defun cmp-eq (v: (Simd i8 16) c: i8) -> (Simd bool 16) (simd/eq v (splat (Simd i8 16) c)))
+(defun sidx-free (x: Sidx) -> unit (unsafe (free (. x p))))
+(defun sidx-at (x: Sidx k: i64) -> i64 (unsafe (load-i64 (ptr+ (. x p) (* 8 k)))))
 
-(defun structural16 (v: (Simd i8 16)) -> i64
-  (bits16 (simd/or (simd/or (simd/or (cmp-eq v 123i8) (cmp-eq v 125i8)) (simd/or (cmp-eq v 91i8) (cmp-eq v 93i8))) (simd/or (cmp-eq v 58i8) (cmp-eq v 44i8)))))
+(defun cmp-eq (v: (Simd i8 64) c: i8) -> (Simd bool 64) (simd/eq v (splat (Simd i8 64) c)))
+(defun mask-eq (v: (Simd i8 64) c: i8) -> i64 (simd/movemask (cmp-eq v c)))
 
-;; The masks of the 64 bytes at i: quote, backslash and structural bits.
-(defun classify64 (a: (Array i8) i: i64 &quote: i64 &bs: i64) -> i64
-  (let [v0: (Simd i8 16) (simd-load a i)
-        v1: (Simd i8 16) (simd-load a (+ i 16))
-        v2: (Simd i8 16) (simd-load a (+ i 32))
-        v3: (Simd i8 16) (simd-load a (+ i 48))]
-    (do (set! quote (bit-or (bit-or (bits16 (cmp-eq v0 34i8)) (shl (bits16 (cmp-eq v1 34i8)) 16))
-                            (bit-or (shl (bits16 (cmp-eq v2 34i8)) 32) (shl (bits16 (cmp-eq v3 34i8)) 48))))
-        (set! bs (bit-or (bit-or (bits16 (cmp-eq v0 92i8)) (shl (bits16 (cmp-eq v1 92i8)) 16))
-                         (bit-or (shl (bits16 (cmp-eq v2 92i8)) 32) (shl (bits16 (cmp-eq v3 92i8)) 48))))
-        (bit-or (bit-or (structural16 v0) (shl (structural16 v1) 16)) (bit-or (shl (structural16 v2) 32) (shl (structural16 v3) 48))))))
+;; `{ } [ ] : ,`: `[` and `]` are `{` and `}` with bit 5 set, so two compares do the four brackets.
+(defun op-mask (v: (Simd i8 64)) -> i64
+  (let [t (bit-or v (splat (Simd i8 64) 32i8))]
+    (simd/movemask (simd/or (simd/or (cmp-eq t 123i8) (cmp-eq t 125i8)) (simd/or (cmp-eq v 58i8) (cmp-eq v 44i8))))))
+
+(defun ws-mask (v: (Simd i8 64)) -> i64
+  (simd/movemask (simd/or (simd/or (cmp-eq v 32i8) (cmp-eq v 10i8)) (simd/or (cmp-eq v 13i8) (cmp-eq v 9i8)))))
+
+;; The bytes below 0x20 (a byte of 0x80 or more has bit 7 set and is not).
+(defun ctl-mask (v: (Simd i8 64)) -> i64
+  (simd/movemask (simd/eq (bit-and v (splat (Simd i8 64) -32i8)) (splat (Simd i8 64) 0i8))))
 
 (defun ult (x: i64 y: i64) -> bool (< (bit-xor x -9223372036854775808) (bit-xor y -9223372036854775808)))
 
-;; simdjson's find_escaped: the bits of the characters that follow an odd-length run of backslashes; `carry` is whether the previous block ended on one.
-(defun find-escaped (bs0: i64 &carry: i64) -> i64
-  (let [bs (bit-and bs0 (bit-not @carry))
-        follows (bit-or (shl bs 1) @carry)
-        odd-starts (bit-and (bit-and bs (bit-not even-bits)) (bit-not follows))
-        sum (unchecked-add odd-starts bs)]
-    (do (set! carry (if (ult sum odd-starts) 1 0))
-        (bit-and (bit-xor even-bits (shl sum 1)) follows))))
+;; simdjson's find_escaped, in two pure halves: the bits of the characters that follow an odd-length run of backslashes, and whether the block ends on one
+;; (`c`: whether the previous block did, 0 or 1).
+(defun esc-sum (bs0: i64 c: i64) -> i64
+  (let [bs (bit-and bs0 (bit-not c))
+        follows (bit-or (shl bs 1) c)]
+    (unchecked-add (bit-and (bit-and bs (bit-not even-bits)) (bit-not follows)) bs)))
+
+(defun esc-mask (bs0: i64 c: i64) -> i64
+  (let [bs (bit-and bs0 (bit-not c))
+        follows (bit-or (shl bs 1) c)]
+    (bit-and (bit-xor even-bits (shl (esc-sum bs0 c) 1)) follows)))
+
+(defun esc-carry (bs0: i64 c: i64) -> i64
+  (let [bs (bit-and bs0 (bit-not c))
+        follows (bit-or (shl bs 1) c)]
+    (if (ult (esc-sum bs0 c) (bit-and (bit-and bs (bit-not even-bits)) (bit-not follows))) 1 0)))
 
 ;; Bit i of the result is the XOR of bits 0..i of x (carry-less multiplication by all ones, as a ladder).
 (defun prefix-xor (x: i64) -> i64
   (let [a (bit-xor x (shl x 1)) b (bit-xor a (shl a 2)) c (bit-xor b (shl b 4)) d (bit-xor c (shl c 8)) e (bit-xor d (shl d 16))]
     (bit-xor e (shl e 32))))
 
-(defun ctz (x: i64) -> i64 (popcount (unchecked-subtract (bit-and x (unchecked-negate x)) 1)))
+;; ---- the index: eight positions written at a time
 
-;; Writes the positions of the set bits of `mask`, offset by `base`, into out from index k; answers the new k.
-(defun flatten-bits (&out: (Array i64) k: i64 mask: i64 base: i64) -> i64
-  (loop [m mask j k]
-    (if (= m 0) j
-        (do (array-set! &out j (+ base (ctz m))) (recur (bit-and m (unchecked-subtract m 1)) (+ j 1))))))
+(defun put-one (o: ptr k: i64 m: i64 base: i64) -> i64
+  (do (unsafe (store-i64 (ptr+ o (shl k 3)) (unchecked-add base (ctz m)))) (bit-and m (unchecked-subtract m 1))))
 
-(defun block-mask (q: i64 bs: i64 st: i64 &carry: i64 &instr: i64) -> i64
-  (let [escaped (find-escaped bs &carry)
-        quote (bit-and q (bit-not escaped))
-        in-string (bit-xor (prefix-xor quote) @instr)]
-    (do (set! instr (sar in-string 63))
-        (bit-or quote (bit-and st (bit-not in-string))))))
+;; Four positions at a time: small enough for the compiler to inline into the block loop (an eight-at-a-time function is not, and a call costs a `vzeroupper`).
+(defun put-four (o: ptr k: i64 m0: i64 base: i64) -> i64
+  (let [m1 (put-one o k m0 base) m2 (put-one o (unchecked-add k 1) m1 base) m3 (put-one o (unchecked-add k 2) m2 base)]
+    (put-one o (unchecked-add k 3) m3 base)))
 
-(defun structural-index (a: (Array i8) n: i64) -> (Pair (Array i64) i64)
-  (let [out (cell (array (+ n 64) 0))
-        carry (cell 0) instr (cell 0)
-        padded (cell (array 64 32i8))
-        full (* 64 (quot n 64))
-        q (cell 0) bs (cell 0)
-        k1 (loop [i 0 k 0]
-             (if (>= i full) k
-                 (let [st (classify64 a i &q &bs)
-                       m (block-mask @q @bs st &carry &instr)]
-                   (recur (+ i 64) (flatten-bits &out k m i)))))]
-    (if (= full n)
-        (Pair @out k1)
-        (do (dotimes (j (- n full)) (array-set! &padded j (array-get a (+ full j))))
-            (let [st (classify64 @padded 0 &q &bs)
-                  m (bit-and (block-mask @q @bs st &carry &instr) (unchecked-subtract (shl 1 (- n full)) 1))]
-              (let [k2 (flatten-bits &out k1 m full)] (Pair @out k2)))))))
+;; The positions of the set bits of m, offset by base, from slot k; the new count. Sixteen slots are written whatever the count (a block rarely has more, and a
+;; branch on the count mispredicts about as often as it costs); beyond 16 a loop. Up to `cnt + 15` slots are written.
+(defun flatten (o: ptr k: i64 m: i64 base: i64) -> i64
+  (let [cnt (popcount m)
+        m4 (put-four o k m base)
+        m8 (put-four o (unchecked-add k 4) m4 base)]
+    (if (<= cnt 8) (unchecked-add k cnt)
+        (loop [m m8 j (unchecked-add k 8)]
+          (if (= m 0) j (recur (put-one o j m base) (unchecked-add j 1)))))))
+
+;; ---- one block
+
+(defun load-block (p: ptr i: i64) -> (Simd i8 64) (unsafe (load-simd (ptr+ p i))))
+
+(defun grow (o: ptr cap: i64) -> ptr (unsafe (libc/realloc o (* 8 (* cap 2)))))
+
+;; The state carried from block to block: the escape carry (0/1), the in-string state (0 or -1), the last bit of the token-byte mask (0/1), the flags.
+(defun index-text (p: ptr n: i64 pad: ptr) -> Sidx
+  (let [cap0 (+ 256 (quot n 8))]
+    (loop [i 0 k 0 o (unsafe (alloc (* 8 cap0))) cap cap0 carry 0 instr 0 prevt 0 flags 0 nq 0]
+      (if (>= i n)
+          (Sidx o k (if (= instr 0) flags (bit-or flags f-unterminated)) nq)
+          (if (> (+ k 96) cap)
+              (recur i k (grow o cap) (* cap 2) carry instr prevt flags nq)
+              (let [v (if (<= (+ i 64) n) (load-block p i) (load-block pad 0))
+                    q (mask-eq v 34i8)
+                    bs (mask-eq v 92i8)
+                    esc (if (= (bit-or bs carry) 0) 0 (esc-mask bs carry))
+                    quote (bit-and q (bit-not esc))
+                    inq (bit-xor (prefix-xor quote) instr)
+                    ops (op-mask v)
+                    ws (ws-mask v)
+                    tok (bit-not (bit-or (bit-or ws ops) (bit-or quote inq)))
+                    starts (bit-and tok (bit-not (bit-or (shl tok 1) prevt)))
+                    m (bit-or (bit-or (bit-and ops (bit-not inq)) quote) starts)
+                    fl (bit-or flags (if (= (bit-and (ctl-mask v) inq) 0) 0 f-control))]
+                (recur (+ i 64) (flatten o k m i) o cap (esc-carry bs carry) (sar inq 63) (shr tok 63) fl (unchecked-add nq (popcount (bit-and quote (bit-not inq)))))))))))
+
+(defun structural-index (s: str) -> Sidx
+  (let [n (str-len s)
+        pad (unsafe (alloc 64))
+        full (* 64 (quot n 64))]
+    (do (unsafe (do (loop [j 0] (when (< j 64) (do (store-i8 (ptr+ pad j) 32i8) (recur (+ j 1)))))
+                    (loop [j full] (when (< j n) (do (store-i8 (ptr+ pad (- j full)) (load-i8 (ptr+ (raw s) (+ 24 j)))) (recur (+ j 1)))))))
+        (let [r (index-text (unsafe (ptr+ (raw s) 24)) n (if (= full n) pad pad))]
+          (do (unsafe (free pad)) r)))))

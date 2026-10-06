@@ -5,9 +5,18 @@
 # usage: scripts/mutant-json.sh [MUTANT..]        (default: all)
 #   escape-wrong      writer: the escape of a newline is `\m`                          (specs/json-spec.fib, json-prop-spec.fib)
 #   swar-control      writer: the eight-byte scan lets byte 0x1f through (< 31)          (specs/json-prop-spec.fib)
-#   simd-boundary     stage 1: the tail block keeps one byte too few (off by one)       (specs/json-simd-spec.fib)
+#   simd-boundary     stage 1: a block that ends exactly at the end of the text is read from the padding (off by one at the tail)  (specs/json-simd-spec.fib)
 #   simd-backslash    stage 1: the odd-backslash-run mask loses the even/odd parity      (specs/json-simd-spec.fib)
 #   simd-instring     stage 1: the in-string state is not carried into the next block   (specs/json-simd-spec.fib)
+#   simd-esc-carry    stage 1: an odd run of backslashes ending a block does not escape the first byte of the next  (specs/json-simd-spec.fib)
+#   simd-token-carry  stage 1: a token that crosses a block boundary starts again in the next block  (specs/json-simd-spec.fib)
+#   simd-control      stage 1: a control byte inside a string is not flagged             (specs/json-simd-spec.fib)
+#   fast-comma-state  fast tape: a comma is accepted where a value is expected          (specs/json-fast-spec.fib)
+#   fast-number-delim fast tape: the byte after a number is not checked (1x)           (specs/json-fast-spec.fib)
+#   fast-close-kind   fast tape: a ] may close an object and a } an array              (specs/json-fast-spec.fib)
+#   fast-escape-flag  fast tape: a string with a backslash is not told apart (no escape flag, no escape check)  (specs/json-fast-spec.fib)
+#   fast-depth        fast tape: the depth limit is `<=`                                (specs/json-fast-spec.fib)
+#   fast-string-end   fast tape: the end of a string is one past its closing quote      (specs/json-fast-spec.fib)
 #   float-tie         Eisel-Lemire: an exact halfway case rounds up, not to even         (specs/json-floats-spec.fib)
 #   float-print       Schubfach: the lower interval bound is exclusive for even mantissas (specs/json-floats-spec.fib)
 #   clinger           Clinger fast path accepts a mantissa above 2^53                    (specs/json-floats-spec.fib)
@@ -24,7 +33,7 @@ FIBC=${FIBC:-$HOME/.cache/fibber-scratch/gate-$(basename "$R")/F}
 [ -x "$FIBC" ] || { echo "mutant-json: no stage 2 fibc: set FIBC" >&2; exit 2; }
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-json}
 MUTANTS=("$@")
-[ ${#MUTANTS[@]} -gt 0 ] || MUTANTS=(escape-wrong swar-control simd-boundary simd-backslash simd-instring float-tie float-print clinger depth-off-by-one tape-depth leading-zero utf8-overlong lone-surrogate dup-last-wins)
+[ ${#MUTANTS[@]} -gt 0 ] || MUTANTS=(escape-wrong swar-control simd-boundary simd-backslash simd-instring simd-esc-carry simd-token-carry simd-control fast-comma-state fast-number-delim fast-close-kind fast-escape-flag fast-depth fast-string-end float-tie float-print clinger depth-off-by-one tape-depth leading-zero utf8-overlong lone-surrogate dup-last-wins)
 
 sub() { perl -0pi -e "$2" "$1"; cmp -s "$1" "$1.orig" && { echo "mutant-json: pattern not found in $1: $2" >&2; return 1; }; return 0; }
 mutate() { # mutate NAME TREE -> sets SPECS
@@ -32,9 +41,18 @@ mutate() { # mutate NAME TREE -> sets SPECS
   case $1 in
     escape-wrong)     f=$j/escape.fib; cp $f $f.orig; SPECS="json-spec json-prop-spec"; sub $f 's/\(= c 10\) 110/(= c 10) 109/' ;;
     swar-control)     f=$j/escape.fib; cp $f $f.orig; SPECS="json-prop-spec json-spec"; sub $f 's/\(unchecked-multiply ones 32\)/(unchecked-multiply ones 31)/' ;;
-    simd-boundary)    f=$j/stage1.fib; cp $f $f.orig; SPECS="json-simd-spec"; sub $f 's/\(shl 1 \(- n full\)\)/(shl 1 (- (- n full) 1))/' ;;
+    simd-boundary)    f=$j/stage1.fib; cp $f $f.orig; SPECS="json-simd-spec"; sub $f 's/\(<= \(\+ i 64\) n\)/(< (+ i 64) n)/' ;;
     simd-backslash)   f=$j/stage1.fib; cp $f $f.orig; SPECS="json-simd-spec"; sub $f 's/\(bit-not even-bits\)\) \(bit-not follows\)/even-bits) (bit-not follows)/' ;;
-    simd-instring)    f=$j/stage1.fib; cp $f $f.orig; SPECS="json-simd-spec"; sub $f 's/\(set! instr \(sar in-string 63\)\)/(set! instr 0)/' ;;
+    simd-instring)    f=$j/stage1.fib; cp $f $f.orig; SPECS="json-simd-spec"; sub $f 's/\(sar inq 63\)/0/' ;;
+    simd-esc-carry)   f=$j/stage1.fib; cp $f $f.orig; SPECS="json-simd-spec"; sub $f 's/\(esc-carry bs carry\) \(sar inq 63\)/0 (sar inq 63)/' ;;
+    simd-token-carry) f=$j/stage1.fib; cp $f $f.orig; SPECS="json-simd-spec"; sub $f 's/\(shr tok 63\)/0/' ;;
+    simd-control)     f=$j/stage1.fib; cp $f $f.orig; SPECS="json-simd-spec"; sub $f 's/\(bit-and \(ctl-mask v\) inq\)/0/' ;;
+    fast-comma-state) f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(and \(= st 1\) \(> dp 0\)\)/(and (or (= st 1) (= st 0)) (> dp 0))/' ;;
+    fast-number-delim) f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(and \(>= e 0\) \(or \(= e n\) \(or \(= e next\) \(ws\? \(byte-at p e\)\)\)\)\)/(>= e 0)/' ;;
+    fast-close-kind)  f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(= arr \(= c 93\)\)/true/' ;;
+    fast-escape-flag) f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(!= \(bit-and m \(- \(shl 1 w\) 1\)\) 0\)/false/; s/\(if \(= m 0\) \(recur \(\+ i 32\)\) true\)/(recur (+ i 32))/' ;;
+    fast-depth)       f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(< dp max-depth\)/(<= dp max-depth)/' ;;
+    fast-string-end)  f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(node k-str \(\+ a 1\)\) b\)/(node k-str (+ a 1)) (+ b 1))/' ;;
     float-tie)        f=$j/eisel.fib; cp $f $f.orig; SPECS="json-floats-spec"; sub $f 's/\(= \(bit-and mant 3\) 1\)/(= (bit-and mant 3) 7)/' ;;
     float-print)      f=$j/dtoa.fib; cp $f $f.orig; SPECS="json-floats-spec json-prop-spec"; sub $f 's/upin \(<= \(\+ vbl out\) \(shl sp10 2\)\)/upin (<= (+ vbl 1) (shl sp10 2))/' ;;
     clinger)          f=$j/number.fib; cp $f $f.orig; SPECS="json-floats-spec"; sub $f 's/\(<= nd 15\)/(<= nd 18)/; s/\(<= w 9007199254740992\)/(<= w 900719925474099200)/' ;;
