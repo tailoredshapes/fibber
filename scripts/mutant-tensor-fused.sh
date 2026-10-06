@@ -40,10 +40,10 @@ mutant relu-not-relu lib/fib/tensor/vmath.fib 's/(= op 6) (simd\/blend (simd\/gt
 mutant dense-drops-activation lib/fib/tensor/linalg.fib 's/(dense-multiply (. x seed) x w bias (vm\/activation-code act))/(dense-multiply (. x seed) x w bias 7)/'
 M=lib/fib/tensor/masks.fib
 mutant where-scalar-steps-like-dense $M 's/(= (reduce + 0 (map abs (strides x))) 0) 0/(= (reduce + 0 (map abs (strides x))) 0) 1/' 7084
-mutant where-ignores-slice-offset $M 's/(cb (array-get (. condition meta) 0))/(cb 0)/' 7084
-mutant where-ignores-value-offset $M 's/(lb (array-get (. left meta) 0))/(lb 0)/' 7084
+mutant where-ignores-slice-offset $M 's/(. condition buffer) (array-get (. condition meta) 0) cs/(. condition buffer) 0 cs/' 7084
+mutant where-ignores-value-offset $M 's/(. left buffer) (array-get (. left meta) 0) ls (. right buffer)/(. left buffer) 0 ls (. right buffer)/' 7084
 mutant where-treats-broadcast-as-linear $M 's/(cond (contiguous? x) 1/(cond (contiguous? x) 1 (> (count (strides x)) 1) 1/' 7084
-mutant where-swaps-branches $M 's/(if (array-get cx (+ cb (\* cs i))) (array-get lx (+ lb (\* ls i))) (array-get rx (+ rb (\* rs i))))/(if (array-get cx (+ cb (* cs i))) (array-get rx (+ rb (* rs i))) (array-get lx (+ lb (* ls i))))/' 7084
+mutant where-swaps-branches $M 's/(. left buffer) (array-get (. left meta) 0) ls (. right buffer) (array-get (. right meta) 0) rs)/(. right buffer) (array-get (. right meta) 0) rs (. left buffer) (array-get (. left meta) 0) ls)/' 7084
 V=lib/fib/tensor/vmath.fib
 mutant softmax-no-max-subtraction $V 's/(e: f64x4 (expv-f64 (- x m)))/(e: f64x4 (expv-f64 x))/' 7085
 mutant softmax-f32-no-max-subtraction $V 's/(e: f32x8 (expv-f32 (- x m)))/(e: f32x8 (expv-f32 x))/' 7085
