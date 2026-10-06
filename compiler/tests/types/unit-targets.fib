@@ -44,7 +44,7 @@
       (check cs "an x86-64 Apple triple is Darwin (as before the table)" (= (. (row "x86_64-apple-darwin") runtime-os) "Darwin"))
       (check cs "the cross Target of a row with no CPU named: the row's CPU, features, width and fma"
              (and (= (target-of-row (row "aarch64-apple-darwin") "apple-m1" false) (Target "apple-m1" "" 128 true))
-                  (= (target-of-row (row "x86_64-unknown-linux-gnu") "generic" false) (Target "generic" "" 128 false))
+                  (= (target-of-row (row "x86_64-unknown-linux-gnu") "x86-64-v3" false) (Target "x86-64-v3" "" 256 true))
                   (= (target-of-row (row "wasm32-wasip1") "generic" false) (Target "generic" "+simd128,+tail-call" 128 false))))
       (check cs "a named CPU: the CPU table decides when it knows the name, the row otherwise; no features"
              (and (= (target-of-row (row "x86_64-unknown-linux-gnu") "x86-64-v3" true) (Target "x86-64-v3" "" 256 true))
@@ -53,6 +53,20 @@
       (check cs "every libc-lacks name is a runtime C function"
              (every? (fn (r: TargetRow) (every? (fn (f: str) (some? (first (filter (fn (g: str) (= g f)) (runtime-c-functions))))) (. r libc-lacks)))
                      (target-rows)))
-      (check cs "a printed row has the header's 23 fields"
-             (every? (fn (r: TargetRow) (= (tabs (row-line r)) 22)) (target-rows)))
+      (check cs "a printed row has the header's 24 fields"
+             (and (= (tabs ROW-HEADER) 23) (every? (fn (r: TargetRow) (= (tabs (row-line r)) 23)) (target-rows))))
+      (check cs "ADR 0008: a row is supported exactly when it is marked so and has tailcc, musttail and fma"
+             (every? (fn (r: TargetRow) (= (row-supported? r) (and (= (. r support) "supported") (= (. r tail-cc) 18) (= (. r tail-kind) 2) (. r has-fma))))
+                     (target-rows)))
+      (check cs "ADR 0008: x86-64 and the aarch64 rows are supported; x86-64's CPU is x86-64-v3, 256 bits, fma"
+             (and (every? (fn (t: str) (row-supported? (row t))) ["x86_64-unknown-linux-gnu" "aarch64-apple-darwin" "aarch64-unknown-linux-gnu" "arm64-apple-ios"])
+                  (let ((r (row "x86_64-pc-linux-gnu"))) (and (= (. r default-cpu) "x86-64-v3") (= (. r vector-bits) 256) (. r has-fma)))))
+      (check cs "ADR 0008: riscv64 is parked (no tailcc) and not buildable; the wasm rows are portability targets, buildable, not supported"
+             (and (= (. (row "riscv64-unknown-linux-gnu") support) "parked: LLVM has no tailcc for RISC-V") (not (row-buildable? (row "riscv64-unknown-linux-gnu")))
+                  (every? (fn (t: str) (and (row-buildable? (row t)) (not (row-supported? (row t))) (starts-with? (. (row t) support) "portability target")))
+                          ["wasm32-wasip1" "wasm32-unknown-unknown"])))
+      (check cs "a row marked supported that breaks the rule is not supported, and says so"
+             (let ((bad (with (row "x86_64-unknown-linux-gnu") (has-fma false))))
+               (and (not (row-supported? bad)) (not (row-buildable? bad)) (starts-with? (support-text bad) "unsupported"))))
+      (check cs "an unlisted architecture is not buildable" (not (row-buildable? (row "mips64-unknown-linux-gnu"))))
       (finish cs))))

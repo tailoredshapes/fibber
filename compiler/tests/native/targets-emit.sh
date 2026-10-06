@@ -25,6 +25,14 @@ T=$(mktemp -d "${TMPDIR:-/tmp}/targets-emit.XXXXXX"); trap 'rm -rf "$T"' EXIT
 bad=0
 ok() { echo "ok   $*"; }
 no() { echo "FAIL $*"; bad=1; }
+# riscv64 is parked (docs/adr/0008: LLVM has no tailcc for RISC-V): `fibc build` refuses it without --allow-unsupported. This script keeps its
+# emit check working (to notice when tailcc lands), so it allows it once here, after showing the refusal.
+if "$F" build --target riscv64-unknown-linux-gnu cases/ownership/02-structural-sharing.fib -o "${TMPDIR:-/tmp}/te-refused.$$.o" --emit obj 2> "$T/refused"; then
+  no "fibc build --target riscv64 without --allow-unsupported was NOT refused"
+elif grep -q 'riscv64-unknown-linux-gnu is not a supported target (parked: LLVM has no tailcc for RISC-V' "$T/refused"; then
+  ok "fibc build --target riscv64 is refused without --allow-unsupported: $(head -c 90 "$T/refused")"
+else no "fibc build --target riscv64 failed without the refusal message: $(head -c 200 "$T/refused")"; fi
+export FIB_ALLOW_UNSUPPORTED=1
 triples="wasm32-wasip1 wasm32-unknown-unknown riscv64-unknown-linux-gnu"
 expected=compiler/tests/native/targets-emit.expected
 kernel=compiler/tests/native/targets/kernel.fib
