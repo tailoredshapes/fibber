@@ -3,7 +3,7 @@
 ;; the code and the position into a `JsonError` at the top. Strings are validated as UTF-8 while they are scanned (a `str` made of
 ;; arbitrary bytes is untrusted here), escapes decode into a byte buffer, a string with no escape is one slice.
 ;;   (parse s)  (parse-with s opts)  -> (Result Json JsonError)         (parse-bytes bytes) likewise
-(ns fib.json.parse (:use fib.core fib.seq fib.coll fib.json.types fib.json.number fib.json.buffer fib.json.utf8))
+(ns fib.json.parse (:use fib.core fib.seq fib.coll fib.json.types fib.json.number fib.json.buffer fib.json.utf8 fib.json.escape))
 
 (defun skip-ws (s: str n: i64 i: i64) -> i64
   (loop [k i] (let [b (at s n k)] (if (or (= b 32) (or (= b 10) (or (= b 13) (= b 9)))) (recur (+ k 1)) k))))
@@ -62,12 +62,13 @@
 (defun scan-string (s: str n: i64 &pos: i64 &fail: i64) -> str
   (let [start @pos]
     (loop [i start]
-      (let [b (at s n i)]
-        (cond (= b 34) (do (set! pos (+ i 1)) (str-slice s start i))
-              (= b 92) (string-slow s n start i &pos &fail)
-              (= b -1) (do (fail-at &pos &fail e-eof i) "")
-              (< b 32) (do (fail-at &pos &fail e-control i) "")
-              :else (recur (+ i 1)))))))
+      (let [w (loop [k i] (if (and (<= (+ k 8) n) (not (has-special (unsafe (load-i64 (ptr+ (raw s) (+ 24 k)))) false))) (recur (+ k 8)) k))
+            b (at s n w)]
+        (cond (= b 34) (do (set! pos (+ w 1)) (str-slice s start w))
+              (= b 92) (string-slow s n start w &pos &fail)
+              (= b -1) (do (fail-at &pos &fail e-eof w) "")
+              (< b 32) (do (fail-at &pos &fail e-control w) "")
+              :else (recur (+ w 1)))))))
 
 (defun literal (s: str n: i64 &pos: i64 &fail: i64 word: str v: Json) -> Json
   (let [a @pos m (str-len word)]

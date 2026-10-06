@@ -97,10 +97,30 @@
       (do (println "corpus" path ":" (. r snd) "cases," (. r fst) "differ") (. r fst)))
     (do (println "cannot read" path) 1)))
 
+;; print N: one line `HEXBITS TEXT` per double of several shapes (uniform bits, subnormals, powers of two, short decimals, integers), for scripts/json-floats-check.py.
+(defun hex16 (b: i64) -> str
+  (str-join (vec (map (fn (i: i64) (str-slice "0123456789abcdef" (bit-and (shr b (* 4 (- 15 i))) 15) (+ 1 (bit-and (shr b (* 4 (- 15 i))) 15)))) (range 16)))))
+
+(defun print-doubles (n: i64) -> i64
+  (let [st (cell 99991)]
+    (do (dotimes (i n)
+          (let [_ (set! st (next-rand @st))
+                r (rnd-out @st)
+                k (rem i 5)
+                bits (cond (= k 0) r
+                           (= k 1) (bit-and r 4503599627370495)
+                           (= k 2) (shl (+ 1 (rem (shr r 20) 2046)) 52)
+                           (= k 3) (f64->bits (/ (double (+ 1 (rem (shr r 20) 99999999))) (nth [1.0 10.0 100.0 1000.0 1.0e5 1.0e8 1.0e15 1.0e-5 1.0e-9] (rem (shr r 7) 9))))
+                           :else (f64->bits (double (shr r 11))))
+                x (bits->f64 bits)]
+            (when (= (- x x) 0.0) (println (hex16 bits) (write (JFloat x))))))
+        0)))
+
 (defun main () -> i64
   (let [a (args)
         arg (nth a 0)]
+    (if (= arg "print") (print-doubles (if-some [n (parse-long (nth a 1))] n 1000))
     (if-some [n (parse-long arg)]
       (if (= 0 (+ (check-texts n 88172645463325252) (check-doubles n 1234567)))
           0 1)
-      (if (= 0 (check-file arg)) 0 1))))
+      (if (= 0 (check-file arg)) 0 1)))))

@@ -47,21 +47,25 @@
 
 (def digit-pairs: str "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899")
 
-;; The decimal text of v.
+;; The digit count of the negative number x (x <= 0), 1 to 19.
+(defun neg-digits (x: i64) -> i64
+  (loop [n 1 p -10] (if (or (> x p) (>= n 19)) n (recur (+ n 1) (* p 10)))))
+
+;; The decimal text of v, two digits at a time, straight into the buffer: the digits are counted first and written from the last backwards.
 (defun put-i64 (&buf: (Array i8) &len: i64 v: i64) -> unit
-  (do (ensure &buf &len 20)
+  (do (ensure &buf &len 21)
       (when (< v 0) (put-raw &buf &len 45))
-      (let [tmp (cell (array 24 0i8))
-            ;; digits of |v| are produced backwards into tmp from index 23; v is kept negative so that i64's minimum works
-            w (if (< v 0) v (- 0 v))]
-        (let [first (loop [k 24 x w]
-                      (cond (<= x -100) (let [q (quot x 100) r (- (* q 100) x)]
-                                          (do (array-set! &tmp (- k 1) (str-byte-at digit-pairs (+ (* r 2) 1)))
-                                              (array-set! &tmp (- k 2) (str-byte-at digit-pairs (* r 2)))
-                                              (recur (- k 2) q)))
-                            (<= x -10) (do (array-set! &tmp (- k 1) (str-byte-at digit-pairs (+ (* (- 0 x) 2) 1)))
-                                           (array-set! &tmp (- k 2) (str-byte-at digit-pairs (* (- 0 x) 2)))
-                                           (- k 2))
-                            :else (do (array-set! &tmp (- k 1) (trunc i8 (+ 48 (- 0 x)))) (- k 1))))]
-          (loop [k first]
-            (when (< k 24) (do (put-raw &buf &len (zext i64 (array-get @tmp k))) (recur (+ k 1)))))))))
+      (let [w (if (< v 0) v (- 0 v))
+            n (neg-digits w)
+            base (+ 24 @len)]
+        (do (loop [k (+ base (- n 1)) x w]
+              (cond (<= x -100)
+                    (let [q (quot x 100) r (- (* q 100) x)]
+                      (do (unsafe (store-i8 (ptr+ (raw @buf) k) (str-byte-at digit-pairs (+ (* r 2) 1))))
+                          (unsafe (store-i8 (ptr+ (raw @buf) (- k 1)) (str-byte-at digit-pairs (* r 2))))
+                          (recur (- k 2) q)))
+                    (<= x -10)
+                    (do (unsafe (store-i8 (ptr+ (raw @buf) k) (str-byte-at digit-pairs (+ (* (- 0 x) 2) 1))))
+                        (unsafe (store-i8 (ptr+ (raw @buf) (- k 1)) (str-byte-at digit-pairs (* (- 0 x) 2)))))
+                    :else (unsafe (store-i8 (ptr+ (raw @buf) k) (trunc i8 (+ 48 (- 0 x)))))))
+            (set! len (+ @len n))))))
