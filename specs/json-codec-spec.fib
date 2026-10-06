@@ -7,6 +7,11 @@
 (defun code (s: str) -> i64 (match (decode-Person s) ((Ok _) 0) ((Err e) (. e code))))
 (def ann: str "{\"name\":\"Ann\",\"extra\":[1,{\"x\":2}],\"age\":41,\"tags\":[\"a\",\"b\"],\"score\":2,\"ok\":true,\"boss\":{\"name\":\"B\\u00f3\",\"age\":50,\"tags\":[],\"score\":1.5,\"ok\":false}}")
 
+(defun msg (s: str) -> str (match (decode-Person s) ((Ok _) "") ((Err e) (. e message))))
+(jc/defjson Team [lead: Person members: (Vec Person)])
+(defun tmsg (s: str) -> str (match (decode-Team s) ((Ok _) "") ((Err e) (. e message))))
+(def good: str "{\"name\":\"x\",\"age\":1,\"tags\":[],\"score\":0.5,\"ok\":true}")
+
 (defspecs specs
   (feature "defjson decode"
     (scenario "fields by key in any order, unknown keys ignored, nested record, an integer where a float is wanted"
@@ -18,6 +23,18 @@
             (expect = 16 (code "[]")) (expect = 2 (code "{\"name\":"))))
     (scenario "a number too big for i64 is a mismatch"
       (then (expect = 16 (code "{\"name\":\"x\",\"age\":9223372036854775808,\"tags\":[],\"score\":0.5,\"ok\":true}")))))
+  (feature "defjson mismatch names the path"
+    (scenario "a missing field, a mistyped field, a mistyped element, nested"
+      (then (expect = "the document does not match Person at $.ok: missing, expected bool" (msg "{\"name\":\"x\",\"age\":1,\"tags\":[],\"score\":0.5}"))
+            (expect = "the document does not match Person at $.age: expected i64, found string" (msg "{\"name\":\"x\",\"age\":\"1\",\"tags\":[],\"score\":0.5,\"ok\":true}"))
+            (expect = "the document does not match Person at $.tags[2]: expected str, found number" (msg "{\"name\":\"x\",\"age\":1,\"tags\":[\"a\",\"b\",7],\"score\":0.5,\"ok\":true}"))
+            (expect = "the document does not match Person at $.boss.age: expected i64, found number" (msg "{\"name\":\"x\",\"age\":1,\"tags\":[],\"boss\":{\"name\":\"b\",\"age\":1.5,\"tags\":[],\"score\":0.5,\"ok\":true},\"score\":0.5,\"ok\":true}"))
+            (expect = "the document does not match Person at $: expected object, found array" (msg "[]"))))
+    (scenario "the path runs through records and arrays of records, and names the first mismatch only"
+      (then (expect = (str "the document does not match Team at $.members[1].tags[0]: expected str, found boolean")
+                    (tmsg (str "{\"lead\":" good ",\"members\":[" good ",{\"name\":\"y\",\"age\":2,\"tags\":[true],\"score\":1,\"ok\":false}]}")))
+            (expect = "the document does not match Team at $.lead: missing, expected object" (tmsg "{\"members\":[]}"))
+            (expect = "" (tmsg (str "{\"lead\":" good ",\"members\":[" good "]}"))))))
   (feature "defjson encode"
     (scenario "a record is an object in field order; decode of encode is the record"
       (given [p (Person "Zed" -3 ["x" "y\"z"] (some (Person "Q" 0 [] nil -0.25 false)) 1.0e21 true)])

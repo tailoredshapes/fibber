@@ -12,6 +12,11 @@
 #   simd-token-carry  stage 1: a token that crosses a block boundary starts again in the next block  (specs/json-simd-spec.fib)
 #   simd-control      stage 1: a control byte inside a string is not flagged             (specs/json-simd-spec.fib)
 #   write-vec-control writer: the 32-byte vector scan misses bytes 0x10 to 0x1f in a string of 32 bytes or more (specs/json-prop-spec.fib)
+#   lines-col         lines: an error's column ignores the indentation of its line      (specs/json-lines-spec.fib)
+#   lines-number      lines: an error's line number is one too high                      (specs/json-lines-spec.fib)
+#   lines-newline     lines: the vector newline search lands one byte late               (specs/json-lines-spec.fib)
+#   codec-path-index  defjson: an element's index in the mismatch path is always 0       (specs/json-codec-spec.fib)
+#   codec-missing-rec defjson: a missing required record field is decoded (traps)       (specs/json-codec-spec.fib)
 #   fast-comma-state  fast tape: a comma is accepted where a value is expected          (specs/json-fast-spec.fib)
 #   fast-number-delim fast tape: the byte after a number is not checked (1x)           (specs/json-fast-spec.fib)
 #   fast-close-kind   fast tape: a ] may close an object and a } an array              (specs/json-fast-spec.fib)
@@ -34,7 +39,7 @@ FIBC=${FIBC:-$HOME/.cache/fibber-scratch/gate-$(basename "$R")/F}
 [ -x "$FIBC" ] || { echo "mutant-json: no stage 2 fibc: set FIBC" >&2; exit 2; }
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-json}
 MUTANTS=("$@")
-[ ${#MUTANTS[@]} -gt 0 ] || MUTANTS=(escape-wrong swar-control simd-boundary simd-backslash simd-instring simd-esc-carry simd-token-carry simd-control write-vec-control fast-comma-state fast-number-delim fast-close-kind fast-escape-flag fast-depth fast-string-end float-tie float-print clinger depth-off-by-one tape-depth leading-zero utf8-overlong lone-surrogate dup-last-wins)
+[ ${#MUTANTS[@]} -gt 0 ] || MUTANTS=(escape-wrong swar-control simd-boundary simd-backslash simd-instring simd-esc-carry simd-token-carry simd-control write-vec-control lines-col lines-number lines-newline codec-path-index codec-missing-rec fast-comma-state fast-number-delim fast-close-kind fast-escape-flag fast-depth fast-string-end float-tie float-print clinger depth-off-by-one tape-depth leading-zero utf8-overlong lone-surrogate dup-last-wins)
 
 sub() { perl -0pi -e "$2" "$1"; cmp -s "$1" "$1.orig" && { echo "mutant-json: pattern not found in $1: $2" >&2; return 1; }; return 0; }
 mutate() { # mutate NAME TREE -> sets SPECS
@@ -49,6 +54,11 @@ mutate() { # mutate NAME TREE -> sets SPECS
     simd-token-carry) f=$j/stage1.fib; cp $f $f.orig; SPECS="json-simd-spec"; sub $f 's/\(shr tok 63\)/0/' ;;
     simd-control)     f=$j/stage1.fib; cp $f $f.orig; SPECS="json-simd-spec"; sub $f 's/\(bit-and \(ctl-mask v\) inq\)/0/' ;;
     write-vec-control) f=$j/escape.fib; cp $f $f.orig; SPECS="json-prop-spec"; sub $f 's/-32i8\)\) \(splat \(Simd i8 32\) 0i8\)/-16i8)) (splat (Simd i8 32) 0i8)/' ;;
+    lines-col)        f=$j/lines.fib; cp $f $f.orig; SPECS="json-lines-spec"; sub $f 's/\(\+ \(. e column\) \(- start bol\)\)/(. e column)/' ;;
+    lines-number)     f=$j/lines.fib; cp $f $f.orig; SPECS="json-lines-spec"; sub $f 's/\(\+ no \(- \(. e line\) 1\)\)/(+ no (. e line))/' ;;
+    lines-newline)    f=$j/lines.fib; cp $f $f.orig; SPECS="json-lines-spec"; sub $f 's/\(if \(= m 0\) \(recur \(\+ i 32\)\) \(\+ i \(ctz m\)\)\)/(if (= m 0) (recur (+ i 32)) (+ i (ctz m) 1))/' ;;
+    codec-path-index) f=$j/codec.fib; cp $f $f.orig; SPECS="json-codec-spec"; sub $f 's/\(recur \(next-node d j\) \(\+ k 1\)\)/(recur (next-node d j) k)/' ;;
+    codec-missing-rec) f=$j/codec.fib; cp $f $f.orig; SPECS="json-codec-spec"; sub $f 's/\(if \(< i 0\) nil ~built\)/~built/' ;;
     fast-comma-state) f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(and \(= st 1\) \(> dp 0\)\)/(and (or (= st 1) (= st 0)) (> dp 0))/' ;;
     fast-number-delim) f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(and \(>= e 0\) \(or \(= e n\) \(or \(= e next\) \(ws\? \(byte-at p e\)\)\)\)\)/(>= e 0)/' ;;
     fast-close-kind)  f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(= arr \(= c 93\)\)/true/' ;;

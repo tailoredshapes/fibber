@@ -30,10 +30,31 @@
   (if (or (< n 0) (= (kind-of d n) k-null)) (some nil)
       (if-some [x (f n)] (some (some x)) nil)))
 
-(defun decode-with (s: str what: str f: (fn (Doc i64) (Option a))) -> (Result a JsonError)
+;; Where a node does not decode (the generated `diag-NAME` functions walk the same fields as the decoder): the leaf's message, with the path of the node from the root.
+(defun mismatch (d: Doc n: i64 p: str want: str) -> str
+  (if (< n 0) (str p ": missing, expected " want) (str p ": expected " want ", found " (node-kind d n))))
+
+(defun diag-vec (d: Doc n: i64 p: str f: (fn (i64 str) (Option str))) -> (Option str)
+  (cond (< n 0) (some (str p ": missing, expected array"))
+        (!= (kind-of d n) k-array) (some (str p ": expected array, found " (node-kind d n)))
+        :else (let [end (word1 d n)]
+                (loop [j (+ n 2) k 0]
+                  (if (>= j end) nil
+                      (match (f j (str p "[" k "]")) ((some m) (some m)) (nil (recur (next-node d j) (+ k 1)))))))))
+
+(defun diag-opt (d: Doc n: i64 p: str f: (fn (i64 str) (Option str))) -> (Option str)
+  (if (or (< n 0) (= (kind-of d n) k-null)) nil (f n p)))
+
+(defun diag-object (d: Doc i: i64 p: str) -> (Option str)
+  (cond (< i 0) (some (str p ": missing, expected object"))
+        (!= (kind-of d i) k-object) (some (str p ": expected object, found " (node-kind d i)))
+        :else nil))
+
+(defun decode-with (s: str what: str f: (fn (Doc i64) (Option a)) g: (fn (Doc i64 str) (Option str))) -> (Result a JsonError)
   (match (tape-of s)
     ((Err e) (Err e))
-    ((Ok d) (if-some [x (f d 0)] (Ok x) (Err (JsonError e-mismatch (str "the document does not match " what) 0 1 1))))))
+    ((Ok d) (if-some [x (f d 0)] (Ok x)
+              (Err (JsonError e-mismatch (str "the document does not match " what (match (g d 0 "$") ((some m) (str " at " m)) (nil ""))) 0 1 1))))))
 
 (defmacro defjson (head fields)
   (let ((tag (match head ((Sym _) head) (_ (trap "defjson: the name is a symbol"))))
@@ -45,6 +66,10 @@
         (let ((keys (loop ((i 0) (acc (vec-empty))) (if (< i n) (recur (+ i 1) (vec-conj acc (Str (f/sym-text (vec-nth names i))))) acc)))
               (encoded (loop ((i 0) (acc (vec-empty)))
                          (if (< i n) (recur (+ i 1) (vec-conj acc `(->json (. self ~(vec-nth names i))))) acc)))
+              (diags (loop ((i (- n 1)) (acc `nil))
+                       (if (>= i 0)
+                           (recur (- i 1) `(if-some [m ~(f/diagnoser (vec-nth types i) `(field d i ~(Str (f/sym-text (vec-nth names i)))) `(str p ~(Str (str-concat "." (f/sym-text (vec-nth names i))))))] (some m) ~acc))
+                           acc)))
               (built (loop ((i (- n 1)) (acc `(some (~tag ~@names))))
                        (if (>= i 0)
                            (recur (- i 1) `(if-some [~(vec-nth names i) ~(f/decoder (vec-nth types i) `(field d i ~(Str (f/sym-text (vec-nth names i)))))] ~acc nil))
@@ -53,6 +78,9 @@
                (derive Eq ~tag)
                (derive Debug ~tag)
                (impl fib.json.convert/ToJson ~tag (->json (self) (JObj [~@keys] [~@encoded])))
-               (defun ~(Sym (str-concat "json->" name)) (d: Doc i: i64) -> (Option ~tag) ~built)
+               (defun ~(Sym (str-concat "json->" name)) (d: Doc i: i64) -> (Option ~tag) (if (< i 0) nil ~built))
+               (defun ~(Sym (str-concat "diag-" name)) (d: Doc i: i64 p: str) -> (Option str)
+                 (if-some [m (fib.json.codec/diag-object d i p)] (some m) ~diags))
                (defun ~(Sym (str-concat "decode-" name)) (s: str) -> (Result ~tag JsonError)
-                 (decode-with s ~(Str name) (fn (d: Doc i: i64) (~(Sym (str-concat "json->" name)) d i))))))))))
+                 (decode-with s ~(Str name) (fn (d: Doc i: i64) (~(Sym (str-concat "json->" name)) d i))
+                              (fn (d: Doc i: i64 p: str) (~(Sym (str-concat "diag-" name)) d i p))))))))))

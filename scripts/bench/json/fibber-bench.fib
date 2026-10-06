@@ -1,8 +1,9 @@
 ;; scripts/bench/json/fibber-bench.fib MODE FILE REPS: the fib.json side of docs/shootout/json.md. Prints `NAME check N MB/s X` (X: MB/s of the input, of the output text for write).
 ;;   dom     parse into Json            tape   the structural pass only         three  tape + three fields of twitter.json by path (no DOM)
 ;;   typed   decode twitter.json into records (no DOM)                          write  serialise the parsed document, compact
+;;   linespar the same on all cores (reduce-lines-par)
 ;;   lines   NDJSON file: parse every line (bounded memory: fib.json.io/reduce-lines); the third argument is the file size in bytes
-(ns main (:use fib.core fib.seq fib.coll fib.json.types fib.json.parse fib.json.domfast fib.json.write fib.json.tapebuild fib.json.view fib.json.io) (:require [fib.json.codec :as jc]))
+(ns main (:use fib.core fib.seq fib.coll fib.json.types fib.json.parse fib.json.domfast fib.json.write fib.json.tapebuild fib.json.view fib.json.io fib.json.lines) (:require [fib.json.codec :as jc]))
 
 (jc/defjson User [screen_name: str followers_count: i64 verified: bool])
 (jc/defjson Status [id: i64 text: str retweet_count: i64 favorite_count: i64 user: User])
@@ -27,17 +28,26 @@
         t1 (sys-clock-now)]
     (println name "check" r "MB/s" (/ (* (double (* reps bytes)) 1000.0) (double (- t1 t0))))))
 
-(defun lines (path: str size: i64) -> unit
+(defun lines (path: str size: i64 par: bool) -> unit
   (let [t0 (sys-clock-now)
-        r (reduce-lines path (default-options) (fn (acc: i64 d: (Result Json JsonError)) (match d ((Ok _) (+ acc 1)) ((Err _) -1000000000))) 0)
+        step (fn (acc: i64 d: (Result Json JsonError)) (match d ((Ok _) (+ acc 1)) ((Err _) -1000000000)))
+        r (if par (reduce-lines-par path (default-options) step 0) (reduce-lines path (default-options) step 0))
         t1 (sys-clock-now)]
-    (println "ndjson lines" (match r ((Ok n) n) ((Err _) -1)) "MB/s" (/ (* (double size) 1000.0) (double (- t1 t0))))))
+    (println (if par "ndjson lines parallel" "ndjson lines") (match r ((Ok n) n) ((Err _) -1)) "MB/s" (/ (* (double size) 1000.0) (double (- t1 t0))))))
+
+(defun validate-par (path: str size: i64) -> unit
+  (match (read-file path)
+    ((some s) (let [t0 (sys-clock-now) r (count (filter (fn (b: bool) b) (validate-lines s (default-options)))) t1 (sys-clock-now)]
+                (println "ndjson validate parallel" r "MB/s" (/ (* (double size) 1000.0) (double (- t1 t0))))))
+    (nil (println "unreadable"))))
 
 (defun main () -> i64
   (let [a (args)
         mode (nth a 0)
         reps (if-some [v (parse-long (nth a 2))] v 1)]
-    (if (= mode "lines") (do (lines (nth a 1) reps) 0)
+    (if (= mode "lines") (do (lines (nth a 1) reps false) 0)
+        (if (= mode "linespar") (do (lines (nth a 1) reps true) 0)
+        (if (= mode "validatepar") (do (validate-par (nth a 1) reps) 0)
         (if-some [s (read-file (nth a 1))]
           (let [n (str-len s)]
             (cond (= mode "dom") (do (timed "dom parse" n reps (fn () (dom s))) 0)
@@ -46,4 +56,4 @@
                   (= mode "typed") (do (timed "typed decode" n reps (fn () (typed s))) 0)
                   (= mode "write") (match (parse-fast-default s) ((Ok j) (do (timed "write compact" (str-len (write j)) reps (fn () (str-len (write j)))) 0)) ((Err _) 1))
                   :else 1))
-          1))))
+          1))))))
