@@ -1,0 +1,102 @@
+;; fib.log.file: the file sink with size-based rotation (docs/design/observability-and-databases.md 2.6, package L2).
+;;
+;;   (file-sink path max-bytes keep json?)  -> (Result (dyn Sink :send) str)
+;;
+;; Lines are appended to `path` (O_APPEND). Before a line that would take the file past `max-bytes` (and the file is not empty: one line
+;; longer than the limit still goes in whole, into a file of its own), the file is rotated: `path.(keep-1)` is renamed over `path.keep`,
+;; ..., `path.1` over `path.2`, then `path` over `path.1` (each a `rename(2)`, atomic: a reader sees the old or the new file, never half),
+;; and a fresh `path` is opened. So a file never holds a partial line, `keep` archives are kept (`keep` 0: the file is removed, nothing is
+;; kept) and `max-bytes` 0 means no rotation. Writers take a spin lock (a scalar atom) around size check, rotation and write, so a line is
+;; one `write-all` and lines of different tasks do not interleave however long they are; the critical section is a few system calls. A
+;; failing write or rotation (disk full, a vanished directory) is an `Err` the logger counts and reports once, never a trap in the caller;
+;; the lock is released on every path, a trap in the section included (it is caught and returned as an `Err`).
+(ns fib.log.file (:use fib.core fib.seq fib.coll fib.log.core fib.log.sinks)
+  (:require [fib.os :as os] [fib.os.native :as n] [fib.os.errors :as oe] [fib.ex :as ex]))
+
+(extern rename :private (ptr ptr) -> i32)
+
+;; rename(2) of `from` over `to`.
+(defun rename-file :private (from: str to: str) -> (Result unit str)
+  (if (or (not (n/valid-text? from)) (not (n/valid-text? to)))
+      (Err "rename: NUL in a path")
+      (unsafe (let [a (n/c-text from) b (n/c-text to) r (rename a b) saved (n/errno)]
+                (do (free a) (free b)
+                    (if (< r 0i32) (Err (str "rename " from " to " to ": " (. (oe/error-from-code saved "rename") message))) (Ok ())))))))
+
+(defstruct FileState (fd: i64 size: i64))
+
+(defstruct FileSink (path: str max-bytes: i64 keep: i64 json: bool state: (Atom FileState) busy: (Atom bool) rotations: (Atom i64)))
+
+(defun open-append :private (path: str) -> (Result FileState str)
+  (match (os/open-file path (with (os/default-file-options) (access os/WriteOnly) (create true) (append true)))
+    ((Err e) (Err (str "open " path ": " (. e message))))
+    ((Ok fd) (Ok (FileState fd (match (os/seek-fd fd 0 os/End) ((Ok n) n) ((Err _) 0)))))))
+
+(defun file-sink-of (path: str max-bytes: i64 keep: i64 json: bool) -> (Result FileSink str)
+  (match (open-append path)
+    ((Err e) (Err e))
+    ((Ok st) (Ok (FileSink path max-bytes keep json (atom st) (atom false) (atom 0))))))
+
+;; A file sink as a `dyn Sink`: JSON lines when `json` is true, text lines otherwise.
+(defun file-sink (path: str max-bytes: i64 keep: i64 json: bool) -> (Result (dyn Sink :send) str)
+  (match (file-sink-of path max-bytes keep json)
+    ((Err e) (Err e))
+    ((Ok s) (Ok (dyn Sink :send s)))))
+
+(defun archive-name :private (path: str i: i64) -> str (str path "." i))
+
+;; The renames of one rotation (not the open): the first failure, if any; a missing archive is not a failure.
+(defun shift-archives :private (path: str keep: i64) -> (Result unit str)
+  (if (< keep 1)
+      (match (os/remove-file path) ((Ok _) (Ok ())) ((Err e) (Err (str "remove " path ": " (. e message)))))
+      (do (loop [i (- keep 1)]
+            (when (>= i 1)
+              (do (match (rename-file (archive-name path i) (archive-name path (+ i 1))) (_ ()))
+                  (recur (- i 1)))))
+          (rename-file path (archive-name path 1)))))
+
+;; Closes, shifts, reopens. On a failure to shift the old file is reopened and goes on growing (no line is lost for a rotation's sake).
+(defun rotate :private (s: FileSink st: FileState) -> (Pair FileState (Option str))
+  (do (os/close-fd (. st fd))
+      (let [shifted (shift-archives (. s path) (. s keep))]
+        (match (open-append (. s path))
+          ((Err e) (Pair (FileState -1 0) (some e)))
+          ((Ok fresh) (match shifted
+                        ((Ok _) (do (swap! (. s rotations) (fn (v: i64) (+ v 1))) (Pair fresh nil)))
+                        ((Err e) (Pair fresh (some e)))))))))
+
+(defun write-locked :private (s: FileSink line: (Array i8)) -> (Result unit str)
+  (let [st0 @(. s state)
+        due (and (> (. s max-bytes) 0) (> (. st0 size) 0) (> (+ (. st0 size) (array-len line)) (. s max-bytes)))
+        rot (if due (rotate s st0) (Pair st0 nil))
+        st (. rot fst)]
+    (do (reset! (. s state) st)
+        (if (< (. st fd) 0)
+            (Err (str "log file " (. s path) " is closed or could not be reopened"))
+            (match (os/write-all (. st fd) line)
+              ((Err e) (Err (str "write " (. s path) ": " (. e message))))
+              ((Ok _) (do (reset! (. s state) (FileState (. st fd) (+ (. st size) (array-len line))))
+                          (match (. rot snd) ((some m) (Err m)) (nil (Ok ()))))))))))
+
+(defun lock! :private (busy: (Atom bool)) -> unit
+  (loop [] (if (compare-and-set! busy false true) () (recur))))
+
+(defun with-lock :private (s: FileSink f: (fn (FileSink) (Result unit str))) -> (Result unit str)
+  (do (lock! (. s busy))
+      (let [r (ex/try (f s) (catch e (Err (str "log file sink: " (ex/ex-message e)))))]
+        (do (reset! (. s busy) false) r))))
+
+(impl Sink FileSink
+  (sink-write (self r)
+    (let [line (str-bytes (if (. self json) (render-json r) (render-text r)))]
+      (with-lock self (fn (s: FileSink) (write-locked s line)))))
+  (sink-flush (self) (Ok ()))
+  (sink-close (self)
+    (with-lock self (fn (s: FileSink)
+                      (let [st @(. s state)]
+                        (do (reset! (. s state) (FileState -1 0))
+                            (if (< (. st fd) 0) (Ok ())
+                                (match (os/close-fd (. st fd)) ((Ok _) (Ok ())) ((Err e) (Err (. e message)))))))))))
+
+;; How many times the file has been rotated (for tests and a status line).
+(defun rotation-count (s: FileSink) -> i64 @(. s rotations))

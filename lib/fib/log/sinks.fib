@@ -53,14 +53,23 @@
   (match (os/write-all fd (str-bytes line)) ((Ok _) (Ok ())) ((Err e) (Err (. e message)))))
 
 (defstruct TextSink (fd: i64))
-(impl Sink TextSink (sink-write (self r) (write-line (. self fd) (render-text r))))
+(impl Sink TextSink
+  (sink-write (self r) (write-line (. self fd) (render-text r)))
+  (sink-flush (self) (Ok ()))
+  (sink-close (self) (Ok ())))
 
 (defstruct JsonSink (fd: i64))
-(impl Sink JsonSink (sink-write (self r) (write-line (. self fd) (render-json r))))
+(impl Sink JsonSink
+  (sink-write (self r) (write-line (. self fd) (render-json r)))
+  (sink-flush (self) (Ok ()))
+  (sink-close (self) (Ok ())))
 
 ;; Keeps every record, for tests (the Appender contract runs against it as against the others).
 (defstruct MemorySink (records: (Atom (Vec LogRecord))))
-(impl Sink MemorySink (sink-write (self r) (do (swap! (. self records) (fn (v: (Vec LogRecord)) (conj v r))) (Ok ()))))
+(impl Sink MemorySink
+  (sink-write (self r) (do (swap! (. self records) (fn (v: (Vec LogRecord)) (conj v r))) (Ok ())))
+  (sink-flush (self) (Ok ()))
+  (sink-close (self) (Ok ())))
 
 (defun memory-sink () -> MemorySink (MemorySink (atom [])))
 (defun memory-records (m: MemorySink) -> (Vec LogRecord) @(. m records))
@@ -68,8 +77,3 @@
 ;; Text on standard error (the default, as log4j's console appender), JSON lines on a descriptor.
 (defun console-text () -> (dyn Sink :send) (dyn Sink :send (TextSink 2)))
 (defun json-lines (fd: i64) -> (dyn Sink :send) (dyn Sink :send (JsonSink fd)))
-
-;; The system a program gets with no code: FIB_LOG_FORMAT=json for JSON lines on standard error, text otherwise; levels from the
-;; environment (fib.log.core/levels-from-env).
-(defun system-from-env () -> LogSystem
-  (log-system (if (= (os/getenv "FIB_LOG_FORMAT") (some "json")) (json-lines 2) (console-text)) (levels-from-env)))

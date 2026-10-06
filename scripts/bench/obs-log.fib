@@ -1,0 +1,52 @@
+;; scripts/bench/obs-log.fib: what an enabled log call costs with each sink (package L2). usage: obs-log MODE N
+;; MODE: null    a sink that does nothing (the 82-107 ns of the design, 2.5)
+;;       file    JSON lines to a file sink (one write(2) per line)
+;;       async   the same behind an async sink (the caller only queues; the worker writes)
+;;       async-null   the async sink over the null sink, queue 8192, block: the queue cost alone, the worker keeps up
+;;       async-drop   the async sink over the file, queue 4096, drop-newest: the caller's cost when the file is slower than the producer
+;;       off     a disabled level (the loop alone, plus the compare)
+;; Prints three rounds as `ns/op X`, and for async the written count (a wrong count is a failure, not a speedup).
+;; Build: F build scripts/bench/obs-log.fib -I lib -o obs-log; run: ./obs-log async 200000
+(ns main (:require [fib.log :as log] [fib.os :as os]))
+
+(defstruct NullSink (n: i64))
+(impl log/Sink NullSink
+  (sink-write (self r) (Ok ()))
+  (sink-flush (self) (Ok ()))
+  (sink-close (self) (Ok ())))
+
+(defun rounds (lg: log/Logger n: i64 level-on: bool) -> unit
+  (dotimes (round 3)
+    (let [t0 (os/clock-now)]
+      (do (if level-on
+              (dotimes (i n) (log/info lg "request handled" :i i :ok true))
+              (dotimes (i n) (log/debug lg "request handled" :i i :ok true)))
+          (println (str "ns/op " (quot (* 10 (- (os/clock-now) t0)) (* 10 n))))))))
+
+(defun main () -> i64
+  (let [a (args) mode (nth a 0) n (unwrap-or (parse-long (nth a 1)) 100000)
+        path (str (os/temp-directory) "/obs-log-bench.log")
+        lv (log/LevelTable 2 [])]
+    (cond (or (= mode "null") (= mode "off")) (do (rounds (log/get-logger (log/log-system (dyn log/Sink :send (NullSink 0)) lv) "b") n (= mode "null")) 0)
+          (= mode "file")
+          (match (log/file-sink path 0 0 true)
+            ((Err e) (do (println e) 1))
+            ((Ok k) (do (rounds (log/get-logger (log/log-system k lv) "b") n true) (os/remove-file path) 0)))
+          (= mode "async-null")
+          (let [s (log/async-sink (dyn log/Sink :send (NullSink 0)) (unwrap-or (parse-long (nth a 2)) 8192) log/BlockProducer) lg (log/get-logger (log/log-system (dyn log/Sink :send s) lv) "b")]
+            (do (rounds lg n true) (log/sink-close (dyn log/Sink :send s))
+                (println (str "written " (log/async-written s) " of " (* 3 n) " dropped " (log/async-dropped s))) 0))
+          (= mode "async-drop")
+          (match (log/file-sink path 0 0 true)
+            ((Err e) (do (println e) 1))
+            ((Ok k) (let [s (log/async-sink k 4096 log/DropNewest) lg (log/get-logger (log/log-system (dyn log/Sink :send s) lv) "b")]
+                      (do (rounds lg n true) (log/sink-close (dyn log/Sink :send s))
+                          (println (str "written " (log/async-written s) " of " (* 3 n) " dropped " (log/async-dropped s)))
+                          (os/remove-file path) 0))))
+          :else
+          (match (log/file-sink path 0 0 true)
+            ((Err e) (do (println e) 1))
+            ((Ok k) (let [s (log/async-sink k 1000000 log/BlockProducer) lg (log/get-logger (log/log-system (dyn log/Sink :send s) lv) "b")]
+                      (do (rounds lg n true) (log/sink-close (dyn log/Sink :send s))
+                          (println (str "written " (log/async-written s) " of " (* 3 n) " dropped " (log/async-dropped s)))
+                          (os/remove-file path) 0)))))))
