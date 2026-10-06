@@ -1,12 +1,13 @@
 ;; The kernel of compiler/tests/native/targets-emit.sh: lanewise multiply and add, and fma, on f64x2 and f32x4 (128 bits: one SIMD128 register on
 ;; wasm32, one RVV register group at VLEN 128 on riscv64). The assembly of wasm32 must hold f64x2.mul, f64x2.add, f32x4.mul and f32x4.add; of
 ;; riscv64 RV64GC the scalar fmadd.d of `simd/fma`; of riscv64 with V the vector vfmul/vfadd and a vector fused multiply-add. The vectors depend
-;; on the argument count, so that the optimiser cannot fold the arithmetic away.
+;; on the argument count, so that the optimiser cannot fold the arithmetic away. `fused` asks (has-fma): on wasm32, which has no FMA, `simd/fma` is a
+;; trap (docs/adr/0008) that would make the rest of main dead code, so it is `simd/muladd` there.
 (ns main (:use fib.core))
 
 (defun mul-add (a: f64x2 x: f64x2 y: f64x2) -> f64x2 (+ (* a x) y))
 (defun mul-add32 (a: f32x4 x: f32x4 y: f32x4) -> f32x4 (+ (* a x) y))
-(defun fused (a: f64x2 x: f64x2 y: f64x2) -> f64x2 (simd/fma a x y))
+(defun fused (a: f64x2 x: f64x2 y: f64x2) -> f64x2 (if (has-fma) (simd/fma a x y) (simd/muladd a x y)))
 
 (defun main () -> i64
   (let ((n (count (args)))
