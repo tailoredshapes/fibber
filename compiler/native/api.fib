@@ -6,7 +6,7 @@
 
 (ns native.api
   (:use lir.ast native.error native.jit native.aot)
-  (:require [native.pipeline :as pipe]))
+  (:require [native.pipeline :as pipe] [native.link :as link]))
 
 
 (defstruct Jit (session: JitSession))
@@ -79,3 +79,19 @@
                 ((Ok l) (match (pipe/for-executable src)
                           ((Err e) (Err (lair-error-str e)))
                           ((Ok m) (unit-result (aot-build-executable m path path (AotOptions l libs dirs)))))))))
+
+;; The output of `--emit KIND` (obj, asm, llvm).
+(defun output-kind :private (kind: str) -> (Result AotOutput str)
+  (cond (= kind "obj") (Ok OutObject) (= kind "asm") (Ok OutAssembly) (= kind "llvm") (Ok OutLlvmIr)
+        :else (Err (str "unknown --emit " kind))))
+
+;; Compiles the module `src`, which must satisfy the `main` rule, to an object, assembly or LLVM IR (`kind`) written to `path`, for the target of
+;; FIB_TARGET_TRIPLE (else the host); links nothing. (`fibc build --emit`)
+(defun emit-file (src: str path: str opt: i64 kind: str) -> (Result unit str)
+  (try-let [l (level-check opt)
+            k (output-kind kind)
+            m (match (pipe/for-executable src) ((Err e) (Err (lair-error-str e))) ((Ok m) (Ok m)))
+            bytes (match (aot-emit m path k (AotOptions l [] [])) ((Err e) (Err (lair-error-str e))) ((Ok b) (Ok b)))]
+    (match (link/write-bytes path bytes)
+      ((Err e) (Err (str path ": " e)))
+      ((Ok _) (Ok ())))))
