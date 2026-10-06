@@ -1,0 +1,83 @@
+;; compiler/lir2js.fib: the JavaScript backend of lIR as a tool (docs/design/js-backend.md). It parses and checks a module as lair does
+;; (spec/lir.md section 10: the same reader and checker, compiler/lir), then writes one ES module that runs under node.
+;;   lir2js FILE.lir -o OUT.mjs [--rt DIR]      translate; DIR holds the runtime (default: $FIB_JS_RT, else compiler/js/rt)
+;;   lir2js emit FILE.lir [--rt DIR]            translate to standard output
+;;   lir2js run [--rt DIR] FILE.lir [ARGS..]    translate to a temporary file and run it: `node --stack-size=7000 FILE ARGS..` in place of
+;;                                              this process (execvp), so the exit status and a fatal signal are node's, which are the program's
+;; Build: fibc build compiler/lir2js.fib -I compiler -I lib -o lir2js
+(ns main
+  (:use lir.diag)
+  (:require [lir :as front] [lir.check :as check] [llvm.ffi :as ffi] [js.module :as jm]))
+
+(extern execvp :private (ptr ptr) -> i32)
+(extern setenv :private (ptr ptr i32) -> i32)
+(extern getpid :private () -> i32)
+
+(def usage: str "usage:
+  lir2js FILE.lir -o OUT.mjs [--rt DIR]
+  lir2js emit FILE.lir [--rt DIR]
+  lir2js run [--rt DIR] FILE.lir [ARGS..]")
+
+(defun runtime-text :private (dir: str) -> (Result str str)
+  (loop ((i 0) (out: (Vec str) []))
+    (if (>= i (count jm/runtime-files))
+        (Ok (str-join out))
+        (let ((path (str dir "/" (nth jm/runtime-files i))))
+          (match (read-file path)
+            ((some t) (recur (+ i 1) (conj (conj out t) "\n")))
+            (nil (Err (str "lir2js: cannot read the runtime file " path " (give --rt DIR or FIB_JS_RT)"))))))))
+
+(defun diags-text :private (ds: (Vec Diagnostic) file: str) -> str
+  (str-join (vec (map-indexed (fn (i: i64 d: Diagnostic) (str (if (= i 0) "" "\n") (diag-in-file d file))) ds))))
+
+;; The checked module of FILE, translated after the runtime in `dir`.
+(defun translate :private (file: str dir: str) -> (Result str str)
+  (match (read-file file)
+    (nil (Err (str file ": cannot read: No such file or directory (os error 2)")))
+    ((some src)
+     (match (front/parse-and-check src)
+       ((Err ds) (Err (diags-text ds file)))
+       ((Ok m) (match (check/check-main m)
+                 ((Err d) (Err (diag-in-file d file)))
+                 ((Ok _) (try-let [rt (runtime-text dir)] (Ok (jm/module-js m rt))))))))))
+
+;; `--rt DIR` taken out of the arguments: the directory and the rest.
+(defun rt-option :private (argv: (Vec str)) -> (Pair str (Vec str))
+  (loop ((i 0) (dir (unwrap-or (sys-getenv "FIB_JS_RT") "compiler/js/rt")) (rest: (Vec str) []))
+    (cond (>= i (count argv)) (Pair dir rest)
+          (and (= (nth argv i) "--rt") (< (+ i 1) (count argv))) (recur (+ i 2) (nth argv (+ i 1)) rest)
+          :else (recur (+ i 1) dir (conj rest (nth argv i))))))
+
+(defun set-env :private (k: str v: str) -> unit
+  (let ((a (ffi/bytes-new k)) (b (ffi/bytes-new v)))
+    (unsafe (do (setenv a b 1i32) ()))))
+
+;; Replaces this process with node running `js`; returns only when node cannot be started.
+(defun exec-node :private (js: str file: str args: (Vec str)) -> (Result i64 str)
+  (let ((words (into ["node" "--stack-size=7000" js] args))
+        (argv (ffi/words-new (conj (vec (map (fn (w: str) (ffi/ptr->addr (ffi/bytes-new w))) words)) 0))))
+    (do (set-env "FIB_JS_UNLINK" js)
+        (set-env "FIB_JS_ARGV0" file)
+        (unsafe (execvp (ffi/bytes-new "node") argv))
+        (Err "lir2js: cannot run node"))))
+
+(defun run-cmd :private (dir: str rest: (Vec str)) -> (Result i64 str)
+  (if (= (count rest) 0)
+      (Err usage)
+      (let ((file (nth rest 0))
+            (tmp (str (unwrap-or (sys-getenv "TMPDIR") "/tmp") "/lir2js-" (sext i64 (unsafe (getpid))) ".mjs")))
+        (try-let [text (translate file dir)]
+          (if (write-file tmp text) (exec-node tmp file (vec (drop 1 rest))) (Err (str "lir2js: cannot write " tmp)))))))
+
+(defun dispatch :private (argv: (Vec str)) -> (Result i64 str)
+  (let ((o (rt-option argv)) (dir (. o fst)) (a (. o snd)))
+    (cond (and (>= (count a) 1) (= (nth a 0) "run")) (run-cmd dir (vec (drop 1 a)))
+          (and (= (count a) 2) (= (nth a 0) "emit")) (try-let [t (translate (nth a 1) dir)] (do (print-raw t) (Ok 0)))
+          (and (= (count a) 3) (= (nth a 1) "-o"))
+          (try-let [t (translate (nth a 0) dir)] (if (write-file (nth a 2) t) (Ok 0) (Err (str "lir2js: cannot write " (nth a 2)))))
+          :else (Err usage))))
+
+(defun main () -> i64
+  (match (dispatch (vec (args)))
+    ((Ok code) code)
+    ((Err msg) (do (eprintln msg) 1))))

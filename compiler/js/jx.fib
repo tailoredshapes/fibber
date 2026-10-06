@@ -1,0 +1,153 @@
+;; compiler/js/jx.fib: the state of the lIR-to-JavaScript translator (docs/design/js-backend.md): the module context `Jx`, the function
+;; context `Fx`, names, and the layout of lIR types in memory (LLVM's x86-64 data layout), which the type descriptors carry to the runtime.
+;;
+;; The translator never fails on a checked module: what the JS runtime cannot do becomes a call that stops the program with
+;; `lir2js: unsupported: ..` when it is reached, so a module that only declares such a function still runs.
+(ns js.jx
+  (:use lir.types lir.lit lir.ast))
+
+;; The module context. The cells collect what the translation of the functions asks for: type descriptors and hoisted constants, written
+;; ahead of the functions in the output.
+(defstruct Jx
+  (structs: (Map str (Vec LType))
+   fns: (Map str LFnType)
+   defined: (Set str)
+   globals: (Set str)
+   may-tail: (Set str)
+   tds: (Cell (Map str str))
+   lines: (Cell (Vec str))
+   addrs: (Cell (Set str))
+   counter: (Cell i64)))
+
+;; The function context: the module, the function, its block numbers, every `let` binding by name (for its type), the types found so far,
+;; and the expression translator (set by js.expr; the instruction modules call it for their operands).
+(defstruct Fx
+  (jx: Jx
+   f: LFunction
+   labels: (Map str i64)
+   binds: (Map str LExpr)
+   types: (Cell (Map str LType))
+   allocas: bool
+   ex: (fn (Fx LExpr) str)))
+
+(defun fx-js (fx: Fx e: LExpr) -> str ((. fx ex) fx e))
+
+;; ---------------------------------------------------------------- names
+
+(defun has-prefix? (s: str pre: str) -> bool
+  (and (>= (str-len s) (str-len pre)) (= (str-slice s 0 (str-len pre)) pre)))
+
+(def hex-digits: str "0123456789abcdef")
+
+(defun hex-byte (b: i64) -> str
+  (str (str-slice hex-digits (shr b 4) (+ (shr b 4) 1)) (str-slice hex-digits (bit-and b 15) (+ (bit-and b 15) 1))))
+
+(defun ident-byte? :private (b: i64) -> bool
+  (or (and (>= b 97) (<= b 122)) (and (>= b 65) (<= b 90)) (and (>= b 48) (<= b 57)) (= b 95)))
+
+;; An lIR name as a JS identifier: letters, digits and `_` stay, any other byte is `$` and two hex digits.
+(defun mangle (prefix: str name: str) -> str
+  (let ((bs (str-bytes name)))
+    (str prefix
+         (str-join (loop ((i 0) (out []))
+                     (if (>= i (array-len bs))
+                         out
+                         (let ((b (bit-and (zext i64 (array-get bs i)) 255)))
+                           (recur (+ i 1) (conj out (if (ident-byte? b) (str-from-bytes (array 1 (trunc i8 b))) (str "$" (hex-byte b))))))))))))
+
+(defun local-name (n: str) -> str (mangle "v_" n))
+(defun fn-name (n: str) -> str (mangle "f_" n))
+(defun extern-name (n: str) -> str (mangle "x_" n))
+(defun global-name (n: str) -> str (mangle "g_" n))
+(defun phi-name (pos: i64) -> str (str "ph" pos))
+
+;; A JS name for a function as called: its definition, or the shim of a declared one.
+(defun callee-name (jx: Jx n: str) -> str
+  (if (contains? (. jx defined) n) (fn-name n) (extern-name n)))
+
+;; A fresh number for a hoisted constant.
+(defun fresh (jx: Jx) -> i64
+  (let ((c (. jx counter)) (n @c)) (do (set! c (+ n 1)) n)))
+
+;; Adds a line ahead of the functions and returns `name`.
+(defun hoist (jx: Jx name: str text: str) -> str
+  (do (update! (. jx lines) (fn (v) (conj v (str "const " name " = " text ";")))) name))
+
+;; The constant address of a function, made once (`$fnaddr` gives it a slot in the function table).
+(defun fn-addr (jx: Jx n: str) -> str
+  (let ((nm (mangle "A_" n)))
+    (if (contains? @(. jx addrs) n)
+        nm
+        (do (update! (. jx addrs) (fn (s) (conj s n)))
+            (hoist jx nm (str "$fnaddr(" (callee-name jx n) ")"))))))
+
+;; ---------------------------------------------------------------- types
+
+;; The lIR text of a type, the key of its descriptor.
+(defun ty-key (t: LType) -> str
+  (match t
+    ((TInt b) (str "i" b))
+    ((TFloat) "float")
+    ((TDouble) "double")
+    ((TPtr) "ptr")
+    ((TVector n e) (str "<" n " x " (ty-key e) ">"))
+    ((TNamed n) (str "%struct." n))
+    ((TAnon fs) (str "{" (str-join (vec (map (fn (f: LType) (str (ty-key f) ",")) fs))) "}"))
+    ((TArray n e) (str "[" n " x " (ty-key e) "]"))))
+
+(defun int-bits (t: LType) -> i64 (match t ((TInt b) b) (_ 0)))
+(defun is-vector? (t: LType) -> bool (match t ((TVector _ _) true) (_ false)))
+(defun elem-of (t: LType) -> LType (match t ((TVector _ e) e) (_ t)))
+(defun lanes-of (t: LType) -> i64 (match t ((TVector n _) n) (_ 1)))
+
+(defun struct-fields (jx: Jx t: LType) -> (Vec LType)
+  (match t
+    ((TNamed n) (unwrap-or (get (. jx structs) n) (vec-empty)))
+    ((TAnon fs) fs)
+    (_ (vec-empty))))
+
+(defun pow2-at-least (n: i64) -> i64
+  (loop ((p 1)) (if (>= p n) p (recur (* p 2)))))
+
+(defun round-up (n: i64 a: i64) -> i64 (* (quot (+ n (- a 1)) a) a))
+
+(defun scalar-size :private (t: LType) -> i64
+  (match t ((TInt b) (if (<= b 8) 1 (quot b 8))) ((TFloat) 4) ((TDouble) 8) (_ 8)))
+
+;; The bits of a vector element: i1 lanes are packed.
+(defun elem-bits :private (t: LType) -> i64
+  (match t ((TInt b) b) ((TFloat) 32) (_ 64)))
+
+;; ABI alignment and allocation size (LLVM's DataLayout for x86-64: a vector is aligned to its size rounded up to a power of two).
+(defun align-of (jx: Jx t: LType) -> i64
+  (match t
+    ((TVector n e) (pow2-at-least (quot (+ (* n (elem-bits e)) 7) 8)))
+    ((TArray _ e) (align-of jx e))
+    ((TNamed _) (fields-align jx (struct-fields jx t)))
+    ((TAnon fs) (fields-align jx fs))
+    (_ (scalar-size t))))
+
+(defun fields-align :private (jx: Jx fs: (Vec LType)) -> i64
+  (reduce (fn (a: i64 f: LType) (max a (align-of jx f))) 1 fs))
+
+(defun size-of (jx: Jx t: LType) -> i64
+  (match t
+    ((TVector n e) (round-up (quot (+ (* n (elem-bits e)) 7) 8) (align-of jx t)))
+    ((TArray n e) (* n (size-of jx e)))
+    ((TNamed _) (struct-size jx (struct-fields jx t)))
+    ((TAnon fs) (struct-size jx fs))
+    (_ (scalar-size t))))
+
+;; The offsets of a struct's fields.
+(defun field-offsets (jx: Jx fs: (Vec LType)) -> (Vec i64)
+  (loop ((i 0) (off 0) (out: (Vec i64) []))
+    (if (>= i (count fs))
+        out
+        (let ((f (nth fs i)) (o (round-up off (align-of jx f))))
+          (recur (+ i 1) (+ o (size-of jx f)) (conj out o))))))
+
+(defun struct-size :private (jx: Jx fs: (Vec LType)) -> i64
+  (if (= (count fs) 0)
+      0
+      (let ((offs (field-offsets jx fs)) (last (- (count fs) 1)))
+        (round-up (+ (nth offs last) (size-of jx (nth fs last))) (fields-align jx fs)))))

@@ -1,0 +1,149 @@
+;; compiler/js/func.fib: one lIR function as one JS function (docs/design/js-backend.md, decisions 3 and 4).
+;;
+;; Control flow is the loop-and-switch form: `let L = 0; for (;;) switch (L) { case 0: .. }`, one case per block, a branch being `L = k;
+;; continue;`. Every SSA name is a `let` of the function. A phi is a variable `ph<pos>` that each edge into its block assigns before it
+;; jumps; the block then reads it. Edges assign phi variables only from other names, so the copies of one edge are parallel by
+;; construction. A function of one block that does not call itself in tail position has no loop.
+;;
+;; Tail calls: a tail call of the function to itself sets the parameters and jumps to the entry block, which is a loop and costs nothing;
+;; any other tail call returns `$TAIL` with the callee and its arguments in `$tf` and `$ta`, and the caller's `$tl` runs it, so the JS
+;; stack does not grow. A function that allocas restores the stack pointer `$SP` on every return and before every tail call.
+(ns js.func
+  (:use lir.types lir.lit lir.ast js.jx js.ty js.scalar js.call js.expr)
+  (:require [lir.check.walk :as walk]))
+
+;; ---------------------------------------------------------------- what a function holds
+
+(defun walk-into :private (e: LExpr f: (fn (LExpr) unit)) -> unit
+  (do (f e)
+      (match (. e kind)
+        ((KLet binds body) (do (run! (fn (b: LBinding) (walk-into (. b value) f)) binds) (run! (fn (x: LExpr) (walk-into x f)) body)))
+        ((KPhi _ inc) (run! (fn (b: LBinding) (walk-into (. b value) f)) inc))
+        (_ (run! (fn (x: LExpr) (walk-into x f)) (walk/children e))))))
+
+(defun walk-fn (f: LFunction g: (fn (LExpr) unit)) -> unit
+  (run! (fn (b: LBlock) (run! (fn (e: LExpr) (walk-into e g)) (. b body))) (. f blocks)))
+
+;; Every `let` binding of the function, by name.
+(defun collect-binds :private (f: LFunction) -> (Map str LExpr)
+  (let ((m (cell {})))
+    (do (walk-fn f (fn (e: LExpr) (match (. e kind)
+                                     ((KLet binds _) (run! (fn (b: LBinding) (update! m (fn (x) (assoc x (. b name) (. b value))))) binds))
+                                     (_ ()))))
+        @m)))
+
+;; The phis of each block: label -> [(pos, incoming)].
+(defun block-phis :private (b: LBlock) -> (Vec (Pair i64 (Vec LBinding)))
+  (let ((acc (cell [])))
+    (do (run! (fn (e: LExpr) (walk-into e (fn (x: LExpr) (match (. x kind)
+                                                           ((KPhi _ inc) (update! acc (fn (v) (conj v (Pair (. x pos) inc)))))
+                                                           (_ ())))))
+              (. b body))
+        @acc)))
+
+(defun any-form? :private (f: LFunction p: (fn (LExpr) bool)) -> bool
+  (let ((hit (cell false)))
+    (do (walk-fn f (fn (e: LExpr) (if (p e) (set! hit true) ()))) @hit)))
+
+(defun self-tail? (fname: str e: LExpr) -> bool
+  (match (. e kind) ((KCall (CalDirect n) _ true) (= n fname)) (_ false)))
+
+;; A tail call that returns through the trampoline: not to itself and not to a declared C function.
+(defun trampolined-tail? (jx: Jx fname: str e: LExpr) -> bool
+  (match (. e kind)
+    ((KCall (CalDirect n) _ true) (and (not (= n fname)) (contains? (. jx defined) n)))
+    ((KCall (CalIndirect _ _) _ true) true)
+    (_ false)))
+
+;; ---------------------------------------------------------------- edges and terminators
+
+(defun restore-sp :private (fx: Fx) -> str (if (. fx allocas) "$SP=sp0;" ""))
+
+(defun goto :private (fx: Fx phis: (Map str (Vec (Pair i64 (Vec LBinding)))) from: str to: str) -> str
+  (str (str-join (vec (map (fn (ph: (Pair i64 (Vec LBinding)))
+                             (match (find-first (fn (b: LBinding) (= (. b name) from)) (. ph snd))
+                               ((some b) (str (phi-name (. ph fst)) "=" (fx-js fx (. b value)) ";"))
+                               (nil "")))
+                           (unwrap-or (get phis to) []))))
+       "L=" (unwrap-or (get (. fx labels) to) 0) ";continue;"))
+
+(defun ret-js :private (fx: Fx v: (Option LExpr)) -> str
+  (match v
+    ((some x) (if (. fx allocas) (str "{const r=" (fx-js fx x) ";$SP=sp0;return r;}") (str "return " (fx-js fx x) ";")))
+    (nil (str (restore-sp fx) "return;"))))
+
+(defun self-tail-js :private (fx: Fx args: (Vec LExpr)) -> str
+  (let ((ps (. (. fx f) params)))
+    (str "{"
+         (str-join (vec (map-indexed (fn (i: i64 a: LExpr) (str "const t" i "=" (fx-js fx a) ";")) args)))
+         (restore-sp fx)
+         (str-join (vec (map-indexed (fn (i: i64 p: LParam) (str (local-name (. p name)) "=t" i ";")) ps)))
+         "L=0;continue;}")))
+
+(defun tail-js :private (fx: Fx c: LCallee args: (Vec LExpr)) -> str
+  (let ((jx (. fx jx)) (fname (. (. fx f) name)))
+    (match c
+      ((CalDirect n)
+       (cond (= n fname) (self-tail-js fx args)
+             (not (contains? (. jx defined) n)) (str "{const r=" (call-js fx c args) ";" (restore-sp fx) "return r;}")
+             :else (str "{const a=[" (args-js fx args) "];" (restore-sp fx) "$tf=" (fn-name n) ";$ta=a;return $TAIL;}")))
+      ((CalIndirect p _)
+       (str "{const fp=$fn(" (fx-js fx p) "),a=[" (args-js fx args) "];" (restore-sp fx) "$tf=fp;$ta=a;return $TAIL;}")))))
+
+(defun case-label :private (fx: Fx v: LExpr) -> str (fx-js fx v))
+
+(defun switch-js :private (fx: Fx phis: (Map str (Vec (Pair i64 (Vec LBinding)))) from: str v: LExpr d: str cases: (Vec LCase)) -> str
+  (str "switch(" (fx-js fx v) "){"
+       (str-join (vec (map (fn (c: LCase) (str "case " (case-label fx (. c value)) ":{" (goto fx phis from (. c label)) "}")) cases)))
+       "default:{" (goto fx phis from d) "}}"))
+
+;; ---------------------------------------------------------------- statements
+
+(defun stmt-js :private (fx: Fx phis: (Map str (Vec (Pair i64 (Vec LBinding)))) from: str e: LExpr) -> str
+  (match (. e kind)
+    ((KLet binds body)
+     (str (str-join (vec (map (fn (b: LBinding) (str (local-name (. b name)) "=" (fx-js fx (. b value)) ";")) binds)))
+          (str-join (vec (map (fn (x: LExpr) (stmt-js fx phis from x)) body)))))
+    ((KRet v) (ret-js fx v))
+    ((KBr l) (goto fx phis from l))
+    ((KCondBr c a b) (str "if(" (fx-js fx c) "){" (goto fx phis from a) "}else{" (goto fx phis from b) "}"))
+    ((KSwitch v d cases) (switch-js fx phis from v d cases))
+    ((KUnreachable) "$trap();")
+    ((KCall c args true) (tail-js fx c args))
+    (_ (str (fx-js fx e) ";"))))
+
+(defun block-js :private (fx: Fx phis: (Map str (Vec (Pair i64 (Vec LBinding)))) b: LBlock) -> str
+  (str-join (vec (map (fn (e: LExpr) (str (stmt-js fx phis (. b label) e) "\n")) (. b body)))))
+
+;; ---------------------------------------------------------------- the function
+
+(defun fx-new :private (jx: Jx f: LFunction) -> Fx
+  (let ((ps (. f params)) (ts (. (. f ty) params)))
+    (Fx jx f
+        (into {} (map-indexed (fn (i: i64 b: LBlock) (Pair (. b label) i)) (. f blocks)))
+        (collect-binds f)
+        (cell (into {} (map-indexed (fn (i: i64 p: LParam) (Pair (. p name) (nth ts i))) ps)))
+        (any-form? f (fn (e: LExpr) (match (. e kind) ((KAlloca _ _ _) true) (_ false))))
+        expr-js)))
+
+(defun decls :private (fx: Fx phis: (Map str (Vec (Pair i64 (Vec LBinding))))) -> str
+  (let ((names (vec (map local-name (keys (. fx binds)))))
+        (pv (vec (mapcat (fn (v: (Vec (Pair i64 (Vec LBinding)))) (map (fn (p: (Pair i64 (Vec LBinding))) (phi-name (. p fst))) v)) (vals phis))))
+        (all (into names pv)))
+    (if (= (count all) 0) "" (str "let " (str-join (vec (map-indexed (fn (i: i64 n: str) (str (if (= i 0) "" ",") n)) all))) ";\n"))))
+
+;; The JS text of one function.
+(defun function-js (jx: Jx f: LFunction) -> str
+  (let ((fx (fx-new jx f))
+        (phis (into {} (map (fn (b: LBlock) (Pair (. b label) (block-phis b))) (. f blocks))))
+        (looped (or (> (count (. f blocks)) 1) (any-form? f (fn (e: LExpr) (self-tail? (. f name) e)))))
+        (params (str-join (vec (map-indexed (fn (i: i64 p: LParam) (str (if (= i 0) "" ",") (local-name (. p name)))) (. f params))))))
+    (str "function " (fn-name (. f name)) "(" params "){\n"
+         (if (. fx allocas) "const sp0=$SP;\n" "")
+         (decls fx phis)
+         (if looped
+             (str "let L=0;\nfor(;;)switch(L){\n"
+                  (str-join (vec (map-indexed (fn (i: i64 b: LBlock) (str "case " i ":{\n" (block-js fx phis b) "}\n")) (. f blocks))))
+                  "}\n")
+             (block-js fx phis (nth (. f blocks) 0)))
+         "}\n")))

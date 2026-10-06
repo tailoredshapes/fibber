@@ -1,0 +1,116 @@
+;; compiler/js/mem.fib: memory forms (spec/lir.md 6.5, 6.6) as JS. A scalar load or store is a DataView call on the one heap `$D` at the
+;; offset `address - 4096` (compiler/js/rt/core.js); an aggregate or vector goes through the runtime with its type descriptor. Alignment and
+;; `volatile` change nothing here: a DataView access may be unaligned, and nothing reorders it. Atomics are plain accesses: the first slice is
+;; single-threaded.
+(ns js.mem
+  (:use lir.types lir.lit lir.ast js.jx js.ty))
+
+(defun off :private (p: str) -> str (str p "-4096"))
+
+;; The load of a scalar of type t at address text p, or nil for a type the runtime reads.
+(defun scalar-load (t: LType p: str) -> (Option str)
+  (match t
+    ((TInt 1) (some (str "($D.getUint8(" (off p) ")&1)")))
+    ((TInt 8) (some (str "$D.getInt8(" (off p) ")")))
+    ((TInt 16) (some (str "$D.getInt16(" (off p) ",true)")))
+    ((TInt 32) (some (str "$D.getInt32(" (off p) ",true)")))
+    ((TInt 64) (some (str "$D.getBigInt64(" (off p) ",true)")))
+    ((TFloat) (some (str "$lf32(" (off p) ")")))
+    ((TDouble) (some (str "$D.getFloat64(" (off p) ",true)")))
+    ((TPtr) (some (str "$lp(" (off p) ")")))
+    (_ nil)))
+
+(defun scalar-store :private (t: LType p: str v: str) -> (Option str)
+  (match t
+    ((TInt 1) (some (str "$D.setUint8(" (off p) "," v ")")))
+    ((TInt 8) (some (str "$D.setInt8(" (off p) "," v ")")))
+    ((TInt 16) (some (str "$D.setInt16(" (off p) "," v ",true)")))
+    ((TInt 32) (some (str "$D.setInt32(" (off p) "," v ",true)")))
+    ((TInt 64) (some (str "$D.setBigInt64(" (off p) "," v ",true)")))
+    ((TFloat) (some (str "$sf32(" (off p) "," v ")")))
+    ((TDouble) (some (str "$D.setFloat64(" (off p) "," v ",true)")))
+    ((TPtr) (some (str "$sp(" (off p) "," v ")")))
+    (_ nil)))
+
+(defun load-js (fx: Fx t: LType p: str) -> str
+  (match (scalar-load t p)
+    ((some s) s)
+    (nil (str "$ld(" p "," (td (. fx jx) t) ")"))))
+
+;; A store evaluates the value, then the pointer. JS evaluates the receiver's arguments in their order, so when both may have an effect the
+;; store goes through `$stv(v, p, td)`, which takes them in lIR's order.
+(defun store-js (fx: Fx v: LExpr p: LExpr) -> str
+  (let ((t (type-of! fx v)) (vs (fx-js fx v)) (ps (fx-js fx p)))
+    (if (or (simple? v) (simple? p))
+        (match (scalar-store t ps vs)
+          ((some s) s)
+          (nil (str "$st(" ps "," (td (. fx jx) t) "," vs ")")))
+        (str "$stv(" vs "," ps "," (td (. fx jx) t) ")"))))
+
+(defun simple? :private (e: LExpr) -> bool
+  (match (. e kind)
+    ((KLocal _) true) ((KGlobal _) true) ((KInt _ _) true) ((KFloat _ _) true) ((KNull) true) ((KPhi _ _) true) (_ false)))
+
+(defun alloca-js :private (fx: Fx t: LType n: (Option LExpr) al: (Option i64)) -> str
+  (let ((jx (. fx jx)) (a (max (align-of jx t) (unwrap-or al 1))) (sz (size-of jx t)))
+    (match n
+      ((some c) (str "$alloca(" sz "*" (num-js fx c) "," a ")"))
+      (nil (str "$alloca(" sz "," a ")")))))
+
+;; An integer operand as a JS number (a GEP index, an alloca count): sign-extended, as LLVM does.
+(defun num-js (fx: Fx e: LExpr) -> str
+  (match (type-of! fx e)
+    ((TInt 64) (match (. e kind)
+                 ((KInt _ v) (str (lit-low v 64)))
+                 (_ (str "Number(" (fx-js fx e) ")"))))
+    ((TInt 1) (str "(-" (fx-js fx e) ")"))
+    (_ (fx-js fx e))))
+
+(defun const-index :private (e: LExpr) -> (Option i64)
+  (match (. e kind) ((KInt t v) (some (if (= t ty-i64) (lit-low v 64) (let ((b (int-bits t)) (w (lit-low v b)))
+                                                                          (if (>= w (shl 1 (- b 1))) (- w (shl 1 b)) w)))))
+                    (_ nil)))
+
+;; The step of one more index into type t: the constant offset added, the variable terms, and the type stepped into.
+(defun gep-steps :private (fx: Fx t: LType idx: (Vec LExpr)) -> (Pair i64 (Vec str))
+  (loop ((i 1) (t t) (k 0) (terms: (Vec str) []))
+    (if (>= i (count idx))
+        (Pair k terms)
+        (let ((e (nth idx i)))
+          (match t
+            ((TArray _ el) (let ((s (size-of (. fx jx) el)))
+                             (match (const-index e)
+                               ((some c) (recur (+ i 1) el (+ k (* c s)) terms))
+                               (nil (recur (+ i 1) el k (conj terms (str "+" (num-js fx e) "*" s)))))))
+            (_ (let ((fs (struct-fields (. fx jx) t)) (c (unwrap-or (const-index e) 0)))
+                 (recur (+ i 1) (nth fs c) (+ k (nth (field-offsets (. fx jx) fs) c)) terms))))))))
+
+(defun gep-js :private (fx: Fx t: LType p: LExpr idx: (Vec LExpr)) -> str
+  (let ((s0 (size-of (. fx jx) t)) (ps (fx-js fx p)))
+    (if (is-vector? (type-of! fx (nth idx 0)))
+        (str "$vgep(" ps "," (fx-js fx (nth idx 0)) "," s0 ")")
+        (let ((first (match (const-index (nth idx 0))
+                       ((some c) (Pair (* c s0) ""))
+                       (nil (Pair 0 (str "+" (num-js fx (nth idx 0)) "*" s0)))))
+              (rest (gep-steps fx t idx))
+              (k (+ (. first fst) (. rest fst))))
+          (str "(" ps (. first snd) (str-join (. rest snd)) (if (= k 0) "" (str "+" k)) ")")))))
+
+(defun rmw-word :private (op: LRmwOp) -> str
+  (match op
+    ((RXchg) "xchg") ((RAdd) "add") ((RSub) "sub") ((RAnd) "and") ((RNand) "nand") ((ROr) "or") ((RXor) "xor") ((RMax) "max")
+    ((RMin) "min") ((RUMax) "umax") ((RUMin) "umin") ((RFAdd) "fadd") ((RFSub) "fsub") ((RFMax) "fmax") ((RFMin) "fmin")))
+
+;; The memory forms.
+(defun mem-js (fx: Fx e: LExpr) -> str
+  (match (. e kind)
+    ((KAlloca t n al) (alloca-js fx t n al))
+    ((KLoad t p _ _) (load-js fx t (fx-js fx p)))
+    ((KStore v p _ _) (store-js fx v p))
+    ((KGep _ t p idx) (gep-js fx t p idx))
+    ((KAtomicLoad _ _ t p) (load-js fx t (fx-js fx p)))
+    ((KAtomicStore _ _ v p) (store-js fx v p))
+    ((KAtomicRmw op _ _ p v) (str "$rmw('" (rmw-word op) "'," (td (. fx jx) (type-of! fx v)) "," (fx-js fx p) "," (fx-js fx v) ")"))
+    ((KCmpXchg _ _ _ _ p x n) (str "$cmpxchg(" (td (. fx jx) (type-of! fx x)) "," (fx-js fx p) "," (fx-js fx x) "," (fx-js fx n) ")"))
+    ((KFence _ _) "undefined")
+    (_ "$unsupported('a form lir2js does not know')")))

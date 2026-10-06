@@ -1,0 +1,56 @@
+;; compiler/js/cast.fib: the JS text of lIR's conversions (spec/lir.md 6.3) on one scalar; js.expr maps them over the lanes of a vector,
+;; except bitcast, which works on the whole value through the runtime's scratch memory.
+(ns js.cast
+  (:use lir.types lir.lit lir.ast js.jx js.scalar))
+
+(defun trunc-js :private (from: i64 to: i64 v: str) -> str
+  (cond (= from 64) (if (= to 1) (str "Number(" v "&1n)") (str "Number(BigInt.asIntN(" to "," v "))"))
+        :else (wrap-small to v)))
+
+(defun zext-js :private (from: i64 to: i64 v: str) -> str
+  (let ((u (unsigned-small from v)))
+    (if (= to 64) (str "BigInt(" u ")") u)))
+
+(defun sext-js :private (from: i64 to: i64 v: str) -> str
+  (let ((s (if (= from 1) (str "(-" v ")") v)))
+    (if (= to 64) (str "BigInt(" s ")") s)))
+
+(defun float-of :private (single: bool x: str) -> str (if single (str "Math.fround(" x ")") x))
+
+(defun sitofp-js :private (from: i64 single: bool v: str) -> str
+  (cond (= from 64) (if single (str "$i2f32(" v ")") (str "Number(" v ")"))
+        (= from 1) (str "(-" v ")")
+        :else (float-of single v)))
+
+(defun uitofp-js :private (from: i64 single: bool v: str) -> str
+  (cond (= from 64) (if single (str "$u2f32(" v ")") (str "Number(BigInt.asUintN(64," v "))"))
+        :else (float-of single (unsigned-small from v))))
+
+(defun ptrtoint-js :private (to: i64 v: str) -> str
+  (cond (= to 64) (str "BigInt(" v ")")
+        (= to 1) (str "Number(BigInt(" v ")&1n)")
+        :else (str "Number(BigInt.asIntN(" to ",BigInt(" v ")))")))
+
+(defun inttoptr-js :private (from: i64 v: str) -> str
+  (if (= from 64) (str "Number(BigInt.asUintN(64," v "))") (unsigned-small from v)))
+
+(defun single? :private (t: LType) -> bool (= t ty-float))
+
+;; A conversion of one scalar from type `from` to type `to`.
+(defun cast-js (op: LCastOp from: LType to: LType v: str) -> str
+  (let ((fb (int-bits from)) (tb (int-bits to)))
+    (match op
+      ((CTrunc) (trunc-js fb tb v))
+      ((CZExt) (zext-js fb tb v))
+      ((CSExt) (sext-js fb tb v))
+      ((CFpTrunc) (str "Math.fround(" v ")"))
+      ((CFpExt) v)
+      ((CFpToSi) (str "$f2s(" tb "," v ")"))
+      ((CFpToUi) (str "$f2u(" tb "," v ")"))
+      ((CFpToSiSat) (str "$f2ssat(" tb "," v ")"))
+      ((CFpToUiSat) (str "$f2usat(" tb "," v ")"))
+      ((CSiToFp) (sitofp-js fb (single? to) v))
+      ((CUiToFp) (uitofp-js fb (single? to) v))
+      ((CPtrToInt) (ptrtoint-js tb v))
+      ((CIntToPtr) (inttoptr-js fb v))
+      ((CBitcast) v))))

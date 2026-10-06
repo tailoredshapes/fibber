@@ -1,0 +1,113 @@
+;; compiler/js/ty.fib: the lIR type of every expression of a checked module (the translator needs it: an `add` of i64 is BigInt arithmetic,
+;; one of i32 is `|0`), and the type descriptors the runtime reads for aggregate and vector memory (compiler/js/rt/mem.js).
+;;
+;; The checker has typed the module already but keeps no types; recomputing is short because every form's type follows from its operands.
+;; A name's type is its binding's, found through `binds` and remembered; a phi carries its type, so a loop never asks for itself.
+(ns js.ty
+  (:use lir.types lir.lit lir.ast js.jx))
+
+(defun ty-or-ptr :private (o: (Option LType)) -> LType (unwrap-or o ty-ptr))
+
+(defun first-arg-ty :private (fx: Fx args: (Vec LExpr)) -> (Option LType)
+  (if (= (count args) 0) nil (type-of fx (nth args 0))))
+
+(defun intrin-ty :private (fx: Fx name: str ty: (Option LType) args: (Vec LExpr)) -> (Option LType)
+  (cond (or (= name "masked-load") (= name "gather")) ty
+        (or (= name "masked-store") (= name "scatter")) nil
+        (and (has-prefix? name "reduce-") (not (= name "reduce-fadd")) (not (= name "reduce-fmul")))
+        (some (elem-of (ty-or-ptr (first-arg-ty fx args))))
+        :else (first-arg-ty fx args)))
+
+;; The type at the end of an extractvalue path.
+(defun path-ty :private (fx: Fx t: LType idx: (Vec LLit)) -> LType
+  (loop ((i 0) (t t))
+    (if (>= i (count idx))
+        t
+        (let ((k (unwrap-or (lit->i64 (nth idx i)) 0)))
+          (recur (+ i 1) (match t
+                           ((TArray _ e) e)
+                           (_ (nth (struct-fields (. fx jx) t) k))))))))
+
+(defun mask-ty :private (t: LType) -> LType
+  (match t ((TVector n _) (TVector n ty-i1)) (_ ty-i1)))
+
+(defun gep-ty :private (fx: Fx idx: (Vec LExpr)) -> LType
+  (if (and (= (count idx) 1) (is-vector? (ty-or-ptr (type-of fx (nth idx 0)))))
+      (TVector (lanes-of (ty-or-ptr (type-of fx (nth idx 0)))) ty-ptr)
+      ty-ptr))
+
+(defun call-ty :private (fx: Fx c: LCallee) -> (Option LType)
+  (match c
+    ((CalDirect n) (match (get (. (. fx jx) fns) n) ((some t) (. t ret)) (nil nil)))
+    ((CalIndirect _ t) (. t ret))))
+
+(defun local-ty :private (fx: Fx n: str) -> (Option LType)
+  (match (get @(. fx types) n)
+    ((some t) (some t))
+    (nil (match (get (. fx binds) n)
+           ((some b) (let ((t (type-of fx b)))
+                       (do (match t ((some x) (update! (. fx types) (fn (m) (assoc m n x)))) (nil ())) t)))
+           (nil nil)))))
+
+(defun lits-ty :private (fx: Fx name: (Option str) fields: (Vec LExpr)) -> LType
+  (match name
+    ((some n) (TNamed n))
+    (nil (TAnon (vec (map (fn (f: LExpr) (ty-or-ptr (type-of fx f))) fields))))))
+
+;; The type of an expression; nil for a void one.
+(defun type-of (fx: Fx e: LExpr) -> (Option LType)
+  (match (. e kind)
+    ((KLocal n) (local-ty fx n))
+    ((KInt t _) (some t)) ((KFloat t _) (some t)) ((KVector t _) (some t)) ((KArray t _) (some t)) ((KZero t) (some t))
+    ((KStruct n fs) (some (lits-ty fx n fs)))
+    ((KBin _ a _) (type-of fx a)) ((KUn _ a) (type-of fx a)) ((KSelect _ a _) (type-of fx a)) ((KInsertElement v _ _) (type-of fx v))
+    ((KOverflow _ a _) (let ((t (ty-or-ptr (type-of fx a)))) (some (TAnon [t (mask-ty t)]))))
+    ((KICmp _ a _) (some (mask-ty (ty-or-ptr (type-of fx a)))))
+    ((KFCmp _ a _) (some (mask-ty (ty-or-ptr (type-of fx a)))))
+    ((KCast _ t _) (some t))
+    ((KExtractElement v _) (some (elem-of (ty-or-ptr (type-of fx v)))))
+    ((KShuffle a _ m) (some (TVector (lanes-of (ty-or-ptr (type-of fx m))) (elem-of (ty-or-ptr (type-of fx a))))))
+    ((KExtractValue a idx) (some (path-ty fx (ty-or-ptr (type-of fx a)) idx)))
+    ((KInsertValue a _ _) (type-of fx a))
+    ((KLoad t _ _ _) (some t)) ((KAtomicLoad _ _ t _) (some t)) ((KAtomicRmw _ _ _ _ v) (type-of fx v))
+    ((KCmpXchg _ _ _ _ _ x _) (some (TAnon [(ty-or-ptr (type-of fx x)) ty-i1])))
+    ((KGep _ _ _ idx) (some (gep-ty fx idx)))
+    ((KIntrin name _ ty args _) (intrin-ty fx name ty args))
+    ((KCall c _ _) (call-ty fx c))
+    ((KPhi t _) (some t))
+    ((KLet _ body) (if (= (count body) 0) nil (type-of fx (nth body (- (count body) 1)))))
+    ((KStore _ _ _ _) nil) ((KAtomicStore _ _ _ _) nil) ((KFence _ _) nil) ((KTrap) nil)
+    ((KRet _) nil) ((KBr _) nil) ((KCondBr _ _ _) nil) ((KSwitch _ _ _) nil) ((KUnreachable) nil)
+    (_ (some ty-ptr))))
+
+(defun type-of! (fx: Fx e: LExpr) -> LType (ty-or-ptr (type-of fx e)))
+
+;; ---------------------------------------------------------------- type descriptors
+
+(defun scalar-td :private (t: LType) -> (Option str)
+  (match t
+    ((TInt b) (some (str "$i" b)))
+    ((TFloat) (some "$f32"))
+    ((TDouble) (some "$f64"))
+    ((TPtr) (some "$ptr"))
+    (_ nil)))
+
+(defun td-text :private (jx: Jx t: LType) -> str
+  (match t
+    ((TVector n e) (str "$vec(" n ", " (td jx e) ", " (size-of jx t) ")"))
+    ((TArray n e) (str "$arr(" n ", " (td jx e) ", " (size-of jx e) ", " (size-of jx t) ")"))
+    (_ (let ((fs (struct-fields jx t)) (offs (field-offsets jx fs)))
+         (str "$struct(" (size-of jx t) ", ["
+              (str-join (vec (map-indexed (fn (i: i64 f: LType) (str (if (= i 0) "" ", ") "[" (nth offs i) ", " (td jx f) "]")) fs)))
+              "])")))))
+
+;; The JS name of a type's descriptor: `$i32` for a scalar, a hoisted `T<n>` made once for any other type.
+(defun td (jx: Jx t: LType) -> str
+  (match (scalar-td t)
+    ((some s) s)
+    (nil (let ((k (ty-key t)))
+           (match (get @(. jx tds) k)
+             ((some n) n)
+             (nil (let ((text (td-text jx t)) (n (str "T" (fresh jx))))
+                    (do (update! (. jx tds) (fn (m) (assoc m k n)))
+                        (hoist jx n text)))))))))

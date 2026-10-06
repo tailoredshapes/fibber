@@ -1,0 +1,131 @@
+;; compiler/js/expr.fib: the JS expression of an lIR expression (the dispatcher). Every result is a primary JS expression (a name, a
+;; literal, a call or a parenthesised form), so a caller may put it anywhere. Memory forms are js.mem's, calls and intrinsics js.call's.
+(ns js.expr
+  (:use lir.types lir.lit lir.ast js.jx js.ty js.scalar js.cast js.mem js.call))
+
+;; A form whose JS text has no effect and costs nothing to repeat: names and literals.
+(defun pure? (e: LExpr) -> bool
+  (match (. e kind)
+    ((KLocal _) true) ((KGlobal _) true) ((KInt _ _) true) ((KFloat _ _) true) ((KNull) true) ((KPhi _ _) true) ((KZero _) true)
+    (_ false)))
+
+(defun float-text :private (v: f64) -> str
+  (cond (not (= v v)) "NaN"
+        (not (= (- v v) 0.0)) (if (> v 0.0) "Infinity" "(-Infinity)")
+        (< (f64->bits v) 0) (str "(" v ")")
+        :else (str v)))
+
+(defun float-literal :private (fx: Fx t: LType v: f64) -> str
+  (if (= t ty-float)
+      (hoist (. fx jx) (str "K" (fresh (. fx jx))) (str "Math.fround(" (float-text v) ")"))
+      (float-text v)))
+
+(defun bytes-text :private (bs: (Array i8)) -> str
+  (str "["
+       (str-join (loop ((i 0) (out []))
+                   (if (>= i (array-len bs)) out
+                       (recur (+ i 1) (conj out (str (if (= i 0) "" ",") (bit-and (zext i64 (array-get bs i)) 255)))))))
+       "]"))
+
+(defun list-js (fx: Fx es: (Vec LExpr)) -> str
+  (str "[" (str-join (vec (map-indexed (fn (i: i64 e: LExpr) (str (if (= i 0) "" ",") (fx-js fx e))) es))) "]"))
+
+(defun zero-js :private (fx: Fx t: LType) -> str
+  (match t
+    ((TInt 64) "0n") ((TInt _) "0") ((TFloat) "0") ((TDouble) "0") ((TPtr) "0")
+    (_ (str "$zero(" (td (. fx jx) t) ")"))))
+
+(defun global-js :private (fx: Fx n: str) -> str
+  (if (contains? (. (. fx jx) globals) n) (global-name n) (fn-addr (. fx jx) n)))
+
+;; ---------------------------------------------------------------- operations, on scalars or lane by lane
+
+(defun lanes1 (t: LType f: (fn (str) str) a: str) -> str
+  (if (is-vector? t) (str "$vm1((x)=>" (f "x") "," a ")") (f a)))
+
+(defun lanes2 (t: LType f: (fn (str str) str) a: str b: str) -> str
+  (if (is-vector? t) (str "$vm2((x,y)=>" (f "x" "y") "," a "," b ")") (f a b)))
+
+(defun bin-form :private (fx: Fx op: LBinOp a: LExpr b: LExpr) -> str
+  (let ((t (type-of! fx a)) (e (elem-of t)))
+    (lanes2 t (fn (x: str y: str) (bin-js op e x y)) (fx-js fx a) (fx-js fx b))))
+
+(defun un-form :private (fx: Fx op: LUnOp a: LExpr) -> str
+  (let ((t (type-of! fx a)) (e (elem-of t)))
+    (lanes1 t (fn (x: str) (match op
+                             ((UFNeg) (str "(-" x ")"))
+                             ((UCtpop) (str "$ctpop(" (int-bits e) "," x ")"))))
+            (fx-js fx a))))
+
+(defun ovf-code :private (op: LOvfOp) -> i64 (match op ((OvSAdd) 0) ((OvSSub) 1) ((OvSMul) 2)))
+
+(defun overflow-form :private (fx: Fx op: LOvfOp a: LExpr b: LExpr) -> str
+  (let ((t (type-of! fx a)) (f (if (is-vector? t) "$vsov(" "$sov(")))
+    (str f (ovf-code op) "," (int-bits (elem-of t)) "," (fx-js fx a) "," (fx-js fx b) ")")))
+
+(defun icmp-form :private (fx: Fx pr: LIPred a: LExpr b: LExpr) -> str
+  (let ((t (type-of! fx a)) (e (elem-of t)))
+    (lanes2 t (fn (x: str y: str) (icmp-js pr e x y)) (fx-js fx a) (fx-js fx b))))
+
+(defun fcmp-form :private (fx: Fx pr: LFPred a: LExpr b: LExpr) -> str
+  (lanes2 (type-of! fx a) (fn (x: str y: str) (fcmp-js pr x y)) (fx-js fx a) (fx-js fx b)))
+
+(defun cast-form :private (fx: Fx op: LCastOp to: LType v: LExpr) -> str
+  (let ((from (type-of! fx v)))
+    (cond (= op CBitcast)
+          (if (= from to) (fx-js fx v) (str "$bitcast(" (fx-js fx v) "," (td (. fx jx) from) "," (td (. fx jx) to) ")"))
+          :else (lanes1 from (fn (x: str) (cast-js op (elem-of from) (elem-of to) x)) (fx-js fx v)))))
+
+(defun select-form :private (fx: Fx c: LExpr a: LExpr b: LExpr) -> str
+  (cond (is-vector? (type-of! fx c)) (str "$vsel(" (fx-js fx c) "," (fx-js fx a) "," (fx-js fx b) ")")
+        (and (pure? a) (pure? b)) (str "(" (fx-js fx c) "?" (fx-js fx a) ":" (fx-js fx b) ")")
+        :else (str "$sel(" (fx-js fx c) "," (fx-js fx a) "," (fx-js fx b) ")")))
+
+;; An index operand as a JS number.
+(defun index-js (fx: Fx i: LExpr) -> str
+  (if (= (type-of! fx i) ty-i64) (str "Number(" (fx-js fx i) ")") (fx-js fx i)))
+
+(defun path-text :private (idx: (Vec LLit)) -> str
+  (str-join (vec (map (fn (k: LLit) (str "[" (lit-str k) "]")) idx))))
+
+(defun path-list :private (idx: (Vec LLit)) -> str
+  (str "[" (str-join (vec (map-indexed (fn (i: i64 k: LLit) (str (if (= i 0) "" ",") (lit-str k))) idx))) "]"))
+
+;; A `let` in operand position: a comma expression of its assignments and body.
+(defun let-js (fx: Fx binds: (Vec LBinding) body: (Vec LExpr)) -> str
+  (str "("
+       (str-join (vec (map (fn (b: LBinding) (str (local-name (. b name)) "=" (fx-js fx (. b value)) ",")) binds)))
+       (str-join (vec (map-indexed (fn (i: i64 e: LExpr) (str (if (= i 0) "" ",") (fx-js fx e))) body)))
+       ")"))
+
+;; The JS expression of `e`.
+(defun expr-js (fx: Fx e: LExpr) -> str
+  (match (. e kind)
+    ((KLocal n) (local-name n))
+    ((KGlobal n) (global-js fx n))
+    ((KInt t v) (int-literal (int-bits t) v))
+    ((KFloat t v) (float-literal fx t v))
+    ((KNull) "0")
+    ((KVector _ es) (list-js fx es))
+    ((KStr bs) (hoist (. fx jx) (str "S" (fresh (. fx jx))) (str "$cstr(" (bytes-text bs) ")")))
+    ((KStruct _ fs) (list-js fx fs))
+    ((KArray _ es) (list-js fx es))
+    ((KZero t) (zero-js fx t))
+    ((KBin op a b) (bin-form fx op a b))
+    ((KUn op a) (un-form fx op a))
+    ((KOverflow op a b) (overflow-form fx op a b))
+    ((KICmp pr a b) (icmp-form fx pr a b))
+    ((KFCmp pr a b) (fcmp-form fx pr a b))
+    ((KCast op t v) (cast-form fx op t v))
+    ((KSelect c a b) (select-form fx c a b))
+    ((KExtractElement v i) (str "(" (fx-js fx v) ")[" (index-js fx i) "]"))
+    ((KInsertElement v x i) (str "$vins(" (fx-js fx v) "," (fx-js fx x) "," (index-js fx i) ")"))
+    ((KShuffle a b m) (str "$shuffle(" (fx-js fx a) "," (fx-js fx b) "," (fx-js fx m) ")"))
+    ((KExtractValue a idx) (str "(" (fx-js fx a) ")" (path-text idx)))
+    ((KInsertValue a v idx) (str "$ins(" (fx-js fx a) "," (fx-js fx v) "," (path-list idx) ")"))
+    ((KPhi _ _) (phi-name (. e pos)))
+    ((KLet binds body) (let-js fx binds body))
+    ((KTrap) "$trap()")
+    ((KCall c args _) (call-js fx c args))
+    ((KIntrin name flags ty args al) (intrin-js fx name ty args))
+    (_ (mem-js fx e))))

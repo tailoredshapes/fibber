@@ -1,0 +1,77 @@
+;; compiler/js/module.fib: a checked lIR module as one ES module (docs/design/js-backend.md, decision 8). The output is, in order: the
+;; runtime (compiler/js/rt/*.js, concatenated: one scope, no imports between its parts), the shims of the declared functions, the
+;; addresses of the globals, the hoisted constants (type descriptors, strings, function addresses, float literals), the initialisers of
+;; the globals, the functions, and the call of `main`.
+(ns js.module
+  (:use lir.types lir.lit lir.ast js.jx js.ty js.mem js.expr js.func))
+
+;; The runtime's files, in the order they are concatenated.
+(def runtime-files: (Vec str) ["core.js" "int.js" "float.js" "mem.js" "fmt.js" "libc.js" "stdio.js"])
+
+(defun fn-types :private (m: LModule) -> (Map str LFnType)
+  (reduce (fn (acc: (Map str LFnType) it: LItem)
+            (match it
+              ((ItDefine f) (assoc acc (. f name) (. f ty)))
+              ((ItDeclare d) (assoc acc (. d name) (. d ty)))
+              (_ acc)))
+          {} (. m items)))
+
+(defun names-of :private (m: LModule p: (fn (LItem) (Option str))) -> (Set str)
+  (reduce (fn (acc: (Set str) it: LItem) (match (p it) ((some n) (conj acc n)) (nil acc))) #{} (. m items)))
+
+(defun defines :private (m: LModule) -> (Vec LFunction)
+  (vec (mapcat (fn (it: LItem) (match it ((ItDefine f) [f]) (_ []))) (. m items))))
+
+(defun jx-new :private (m: LModule) -> Jx
+  (let ((structs (reduce (fn (acc: (Map str (Vec LType)) it: LItem)
+                           (match it ((ItStruct s) (assoc acc (. s name) (. s fields))) (_ acc)))
+                         {} (. m items)))
+        (defined (names-of m (fn (it: LItem) (match it ((ItDefine f) (some (. f name))) (_ nil)))))
+        (globals (names-of m (fn (it: LItem) (match it ((ItGlobal g) (some (. g name))) ((ItDeclareGlobal g) (some (. g name))) (_ nil)))))
+        (jx0 (Jx structs (fn-types m) defined globals #{} (cell {}) (cell []) (cell #{}) (cell 0))))
+    (Jx structs (fn-types m) defined globals (may-tail-set jx0 m) (cell {}) (cell []) (cell #{}) (cell 0))))
+
+;; The functions that may return `$TAIL`: those with a tail call that is neither to themselves nor to a declared C function.
+(defun may-tail-set :private (jx: Jx m: LModule) -> (Set str)
+  (reduce (fn (acc: (Set str) f: LFunction)
+            (let ((hit (cell false)))
+              (do (walk-fn f (fn (e: LExpr) (if (trampolined-tail? jx (. f name) e) (set! hit true) ())))
+                  (if @hit (conj acc (. f name)) acc))))
+          #{} (defines m)))
+
+(defun extern-line :private (d: LDeclare) -> str
+  (str "const " (extern-name (. d name)) "=$X[\"" (. d name) "\"]??$stub(\"" (. d name) "\");\n"))
+
+(defun global-line :private (jx: Jx it: LItem) -> str
+  (match it
+    ((ItGlobal g) (str "const " (global-name (. g name)) "=$static(" (size-of jx (. g ty)) "," (align-of jx (. g ty)) ");\n"))
+    ((ItDeclareGlobal g) (str "const " (global-name (. g name)) "=$extGlobal(\"" (. g name) "\");\n"))
+    ((ItDeclare d) (extern-line d))
+    (_ "")))
+
+;; A context for expressions outside any function (the initialisers).
+(defun init-fx :private (jx: Jx) -> Fx
+  (Fx jx (LFunction "" (LFnType cc-c nil [] false) [] [] (LModifiers lk-external false) 0) {} {} (cell {}) false expr-js))
+
+(defun init-line :private (fx: Fx it: LItem) -> str
+  (match it
+    ((ItGlobal g) (str "$st(" (global-name (. g name)) "," (td (. fx jx) (. g ty)) "," (expr-js fx (. g init)) ");\n"))
+    (_ "")))
+
+(defun main-params :private (m: LModule) -> i64
+  (reduce (fn (acc: i64 f: LFunction) (if (= (. f name) "main") (count (. f params)) acc)) 0 (defines m)))
+
+;; The translated module after the runtime text `rt`.
+(defun module-js (m: LModule rt: str) -> str
+  (let ((jx (jx-new m))
+        (fns (str-join (vec (map (fn (f: LFunction) (function-js jx f)) (defines m)))))
+        (fx (init-fx jx))
+        (inits (str-join (vec (map (fn (it: LItem) (init-line fx it)) (. m items)))))
+        (heads (str-join (vec (map (fn (it: LItem) (global-line jx it)) (. m items))))))
+    (str rt
+         "\n// ---------------------------------------------------------------- the module (lir2js)\n"
+         heads
+         (str-join (vec (map (fn (l: str) (str l "\n")) @(. jx lines))))
+         inits
+         fns
+         "$start(f_main," (main-params m) ");\n")))

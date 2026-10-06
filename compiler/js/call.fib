@@ -1,0 +1,80 @@
+;; compiler/js/call.fib: calls (spec/lir.md 6.8) and the intrinsic forms (6.1, 6.4, 6.5) as JS. A call to a function that may tail call
+;; runs the trampoline `$tl` (compiler/js/rt/core.js), as does every indirect call; a call to a declared function calls its shim, whose
+;; result is brought to the declared type (a shim may answer a number where lIR says i64).
+(ns js.call
+  (:use lir.types lir.lit lir.ast lir.intrin js.jx js.ty js.scalar))
+
+(defun args-js (fx: Fx args: (Vec LExpr)) -> str
+  (str-join (vec (map-indexed (fn (i: i64 e: LExpr) (str (if (= i 0) "" ",") (fx-js fx e))) args))))
+
+(defun coerce-ret :private (r: (Option LType) call: str) -> str
+  (match r
+    ((some (TInt 64)) (str "$c64(" call ")"))
+    ((some (TInt k)) (wrap-small k call))
+    (_ call)))
+
+(defun call-js (fx: Fx c: LCallee args: (Vec LExpr)) -> str
+  (let ((jx (. fx jx)))
+    (match c
+      ((CalDirect n)
+       (cond (not (contains? (. jx defined) n))
+             (coerce-ret (match (get (. jx fns) n) ((some t) (. t ret)) (nil nil)) (str (extern-name n) "(" (args-js fx args) ")"))
+             (contains? (. jx may-tail) n) (str "$tl(" (fn-name n) "(" (args-js fx args) "))")
+             :else (str (fn-name n) "(" (args-js fx args) ")")))
+      ((CalIndirect p _) (str "$tl($fn(" (fx-js fx p) ")(" (args-js fx args) "))")))))
+
+;; ---------------------------------------------------------------- intrinsics
+
+(defun f1-js :private (name: str single: bool x: str) -> str
+  (cond (= name "fsqrt") (if single (str "Math.fround(Math.sqrt(" x "))") (str "Math.sqrt(" x ")"))
+        (= name "fabs") (str "Math.abs(" x ")")
+        (= name "ffloor") (str "Math.floor(" x ")")
+        (= name "fceil") (str "Math.ceil(" x ")")
+        (= name "ftrunc") (str "Math.trunc(" x ")")
+        (= name "fround") (str "$fround(" x ")")
+        :else (str "$froundeven(" x ")")))
+
+(defun f2-name :private (name: str) -> str
+  (cond (= name "fcopysign") "$fcopysign" (= name "fmin") "$fmin" (= name "fmax") "$fmax"
+        (= name "fminnum") "$fminnum" :else "$fmaxnum"))
+
+(defun fbin-op :private (name: str) -> LBinOp
+  (cond (= name "fadd") BFAdd (= name "fsub") BFSub (= name "fmul") BFMul (= name "fdiv") BFDiv :else BFRem))
+
+(defun red-i-fn :private (name: str e: LType) -> str
+  (let ((b (int-bits e)))
+    (cond (= name "reduce-add") (str "(x,y)=>" (bin-js BAdd e "x" "y"))
+          (= name "reduce-mul") (str "(x,y)=>" (bin-js BMul e "x" "y"))
+          (= name "reduce-and") (str "(x,y)=>" (bin-js BAnd e "x" "y"))
+          (= name "reduce-or") (str "(x,y)=>" (bin-js BOr e "x" "y"))
+          (= name "reduce-xor") (str "(x,y)=>" (bin-js BXor e "x" "y"))
+          :else (str "(x,y)=>$" (str-slice name 7 (str-len name)) "(" b ",x,y)"))))
+
+(defun red-m-fn :private (name: str) -> str
+  (cond (= name "reduce-fmin") "$fmin" (= name "reduce-fmax") "$fmax" (= name "reduce-fminnum") "$fminnum" :else "$fmaxnum"))
+
+(defun lane-call :private (t: LType body: str arity: i64 args: str) -> str
+  (if (is-vector? t)
+      (str "$vm" arity "(" (cond (= arity 1) "(x)=>" (= arity 2) "(x,y)=>" :else "(x,y,z)=>") body "," args ")")
+      (str "((" (cond (= arity 1) "x" (= arity 2) "x,y" :else "x,y,z") ")=>" body ")(" args ")")))
+
+(defun lanewise :private (name: str cls: str t: LType a: str) -> str
+  (let ((e (elem-of t)) (single (= e ty-float)) (b (int-bits e)))
+    (cond (= cls "f1") (lane-call t (f1-js name single "x") 1 a)
+          (= cls "f2") (lane-call t (str (f2-name name) "(x,y)") 2 a)
+          (= cls "f3") (lane-call t (if single "$fma32(x,y,z)" "$fma64(x,y,z)") 3 a)
+          (= cls "fbin") (lane-call t (bin-js (fbin-op name) e "x" "y") 2 a)
+          (= cls "i1") (lane-call t (str "$abs(" b ",x)") 1 a)
+          :else (lane-call t (str "$" name "(" b ",x,y)") 2 a))))
+
+;; An intrinsic form; `ty` is the leading type of masked-load and gather.
+(defun intrin-js (fx: Fx name: str ty: (Option LType) args: (Vec LExpr)) -> str
+  (let ((cls (intrin-class name)) (jx (. fx jx)) (t0 (type-of! fx (nth args 0))) (a (args-js fx args)))
+    (cond (= cls "red-i") (str "$fold(" (red-i-fn name (elem-of t0)) "," a ")")
+          (= cls "red-m") (str "$fold(" (red-m-fn name) "," a ")")
+          (= cls "red-f") (str "$foldFrom((x,y)=>" (bin-js (if (= name "reduce-fadd") BFAdd BFMul) t0 "x" "y") "," a ")")
+          (= cls "mload") (str "$mload(" (td jx (unwrap-or ty t0)) "," a ")")
+          (= cls "gather") (str "$gather(" (td jx (unwrap-or ty t0)) "," a ")")
+          (= cls "mstore") (str "$mstore(" (td jx t0) "," a ")")
+          (= cls "scatter") (str "$scatter(" (td jx t0) "," a ")")
+          :else (lanewise name cls t0 a))))
