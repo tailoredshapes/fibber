@@ -11,7 +11,7 @@
 #                      under $GATE_OUT/stamps, written when a stage passes), is not run again and says "skipped (unchanged since PASS at STAMP)". Not
 #                      for CI or a release: without the flag every stage runs, whatever passed before.
 #   -j N               cases run at a time inside each shard (default 4: a shard compiles one case at a time, the runs overlap)
-# The stages that need only F run side by side, one process group each, sharing a budget of GATE_BUDGET slots (default 16; the machine has
+# The stages that need only F run side by side, one process group each, sharing a budget of GATE_BUDGET slots (default the number of cores, at most 16; the machine has
 # 28 cores and 61 GB, and others use it): every heavy process (a compile, a shard of cases, a unit program) holds one slot while it runs
 # (scripts/lib/slots.sh). GATE_SHARDS (default GATE_BUDGET) is how many processes the stdlib cases are dealt out to. Each stage's log is
 # kept under $GATE_OUT and its output printed in a fixed order at the end, whichever finished first; the lines `[T s] stage X done` that
@@ -35,7 +35,8 @@ while [ $# -gt 0 ]; do
   shift
 done
 case $jobs in ''|*[!0-9]*|0) echo "gate: -j wants a whole number of at least 1" >&2; exit 2 ;; esac
-budget=${GATE_BUDGET:-16}; shards=${GATE_SHARDS:-$budget}
+cores=$(nproc 2> /dev/null || echo 16); [ "$cores" -gt 16 ] && cores=16
+budget=${GATE_BUDGET:-$cores}; shards=${GATE_SHARDS:-$budget}
 case $budget$shards in *[!0-9]*|'') echo "gate: GATE_BUDGET and GATE_SHARDS want whole numbers" >&2; exit 2 ;; esac
 [ "$budget" -ge 1 ] && [ "$shards" -ge 1 ] || { echo "gate: GATE_BUDGET and GATE_SHARDS want at least 1" >&2; exit 2; }
 # shellcheck source=lib/stage2.sh
