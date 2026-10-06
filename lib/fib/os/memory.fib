@@ -1,0 +1,43 @@
+;; fib.os.memory: the runtime's large-block cache (docs/design/allocator.md, rt/alloc.lir) and the process's resident memory.
+;; Not part of the `fib.os` facade: `fib_alloc_ctl` is a function of the runtime of this tree, which an older compiler's runtime does
+;; not have, so only a program that asks for this module names it.
+(ns fib.os.memory)
+;; Bound to the runtime's own definition (rt/alloc.lir marks it `;; extern:`; emit.rt), not to a C library.
+(extern fib_alloc_ctl :private (i64 i64 i64) -> i64)
+
+;; What the cache did since the program started. `held` and `peak` are bytes kept in the cache (by class size), `hits` the large
+;; allocations served from it, `misses` those that went to malloc, `returned` and `returned-blocks` what decay, `trim!` and
+;; `configure!` gave back, `refused` the blocks freed at once because the cap was reached; `decay-ms` (0: the cache is off) and `cap`
+;; are the settings in force.
+(defstruct AllocStats (held: i64 peak: i64 hits: i64 misses: i64 returned: i64 returned-blocks: i64 refused: i64 decay-ms: i64 cap: i64))
+
+(defun ctl :private (op: i64 a: i64 b: i64) -> i64 (unsafe (fib_alloc_ctl op a b)))
+
+(defun alloc-stats () -> AllocStats
+  (AllocStats (ctl 1 0 0) (ctl 7 0 0) (ctl 2 0 0) (ctl 3 0 0) (ctl 4 0 0) (ctl 5 0 0) (ctl 6 0 0) (ctl 8 0 0) (ctl 9 0 0)))
+
+;; Gives every cached block back to the system now (a program that knows a large phase has ended); the bytes given back.
+(defun trim! () -> i64 (ctl 0 0 0))
+
+;; Sets the decay time (ms) and the cap (bytes), as FIB_ALLOC_DECAY_MS and FIB_ALLOC_CACHE_MAX do at start-up. A decay of 0 turns the
+;; cache off and gives back what it holds.
+(defun configure! (decay-ms: i64 cap: i64) -> unit (do (ctl 10 decay-ms cap) ()))
+
+;; Reads FIB_ALLOC_DECAY_MS and FIB_ALLOC_CACHE_MAX again, as the runtime does at start-up (for a program that sets them itself).
+(defun configure-from-env! () -> unit (do (ctl 11 0 0) ()))
+
+;; The digits at the start of `text` from `i` on, skipping spaces and tabs first.
+(defun leading-number :private (text: str i: i64) -> i64
+  (loop [j i v 0 seen false]
+    (let [c (if (< j (str-len text)) (str-byte-at text j) 0i8)]
+      (cond (and (not seen) (or (= c 32i8) (= c 9i8))) (recur (+ j 1) v false)
+            (and (>= c 48i8) (<= c 57i8)) (recur (+ j 1) (+ (* v 10) (- (sext i64 c) 48)) true)
+            :else v))))
+
+;; The resident set size of this process in bytes: VmRSS of /proc/self/status (Linux); nil where there is no such file (Darwin).
+(defun rss-bytes () -> (Option i64)
+  (match (read-file "/proc/self/status")
+    (nil nil)
+    ((some text) (match (str-find text "VmRSS:" 0)
+                   (nil nil)
+                   ((some at) (some (* 1024 (leading-number text (+ at 6)))))))))

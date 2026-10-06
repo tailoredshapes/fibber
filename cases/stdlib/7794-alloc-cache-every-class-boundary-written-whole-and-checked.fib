@@ -1,0 +1,39 @@
+;; spec: docs/design/allocator.md section 2 (Size classes): a request is rounded up to its class and a freed block filed down by its usable size, so a block handed out is never smaller than the request
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib
+;; For every class from 128 KiB to 4 MiB (size (k+1) * 2^(e-2)), arrays of i64 whose blocks are just under, at and just over the
+;; class size (with or without the 16 bytes trace mode puts in front), first made and dropped largest first (the cache then holds a
+;; block of every class), then made smallest first and all kept alive at once, each written in every element with a pattern of its
+;; own and then all read back. A cache that hands out a block of the class below (too small by up to a fifth) has arrays write past
+;; their block into a neighbour (a wrong element: code 1) or past the mapping (SIGSEGV); either fails the case.
+(ns main (:require [fib.os.memory :as m]))
+
+(defun class-size (idx: i64) -> i64
+  (let [e (+ (quot idx 4) 16) k (+ (rem idx 4) 4)] (* (+ k 1) (shl 1 (- e 2)))))
+
+;; Element counts of i64 arrays around each boundary: the block is 24 bytes of header (and 16 of trace prefix) plus 8 per element.
+(def lengths: (Vec i64)
+  (vec (mapcat (fn (idx: i64) (let [c (class-size idx)] [(- (quot (- c 40) 8) 1) (quot (- c 40) 8) (quot (- c 24) 8) (+ (quot (- c 24) 8) 1)]))
+               (range 3 24))))
+
+(defun make (n: i64 tag: i64) -> (Array i64)
+  (let [buf (cell (array n 0))]
+    (do (dotimes (i n) (array-set! &buf i (+ (* tag 1000003) i))) @buf)))
+
+(defun intact? (a: (Array i64) tag: i64) -> bool
+  (loop [i 0] (cond (>= i (array-len a)) true (not (= (array-get a i) (+ (* tag 1000003) i))) false :else (recur (+ i 1)))))
+
+(defun main () -> i64
+  (let [warm (reduce (fn (acc: i64 k: i64) (let [n (nth lengths (- (count lengths) 1 k)) a (make n k)] (+ acc (array-len a))))
+                     0 (range (count lengths)))
+        h0 (. (m/alloc-stats) hits)
+        live (mapv (fn (k: i64) (make (nth lengths k) (+ k 100))) (range (count lengths)))
+        h1 (. (m/alloc-stats) hits)
+        ok (reduce (fn (acc: bool k: i64) (and acc (intact? (nth live k) (+ k 100)))) true (range (count live)))]
+    (cond (not ok) 1
+          (not (= warm (reduce + 0 lengths))) 2
+          (< (- h1 h0) 20) 3
+          :else 0)))

@@ -1,0 +1,32 @@
+;; spec: docs/design/allocator.md section 2 (Zeroing): the cache does not clear a block it hands out, so every element of (array n x) must be stored by the fill; a reused block that held 7.5 reads as 0.0 in (array n 0.0)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib
+;; An f64, an i64 and an f32 array of about 400 KB are filled with non-zero values and dropped; the next array of the same size
+;; filled with 0 is checked in every element, and the stats show that the blocks were reused (a fresh mapping reads zero anyway, so
+;; without hits the case would prove nothing: code 9). A fill that skips its stores (because fresh pages are zero) returns 1.
+(ns main (:require [fib.os.memory :as m]))
+
+(defun dirty-f64 () -> f64 (let [a (array 50000 7.5)] (array-get a 49999)))
+(defun dirty-i64 () -> i64 (let [a (array 50000 -1)] (array-get a 49999)))
+(defun dirty-f32 () -> f32 (let [a (array 100000 3.25f32)] (array-get a 99999)))
+
+(defun zero-f64? () -> bool
+  (let [a (array 50000 0.0)] (loop [i 0] (cond (>= i 50000) true (not (= (array-get a i) 0.0)) false :else (recur (+ i 1))))))
+(defun zero-i64? () -> bool
+  (let [a (array 50000 0)] (loop [i 0] (cond (>= i 50000) true (not (= (array-get a i) 0)) false :else (recur (+ i 1))))))
+(defun zero-f32? () -> bool
+  (let [a (array 100000 0.0f32)] (loop [i 0] (cond (>= i 100000) true (not (= (array-get a i) 0.0f32)) false :else (recur (+ i 1))))))
+
+(defun main () -> i64
+  (let [h0 (. (m/alloc-stats) hits)
+        d1 (dirty-f64) z1 (zero-f64?)
+        d2 (dirty-i64) z2 (zero-i64?)
+        d3 (dirty-f32) z3 (zero-f32?)
+        h1 (. (m/alloc-stats) hits)]
+    (cond (not (and z1 z2 z3)) 1
+          (not (and (= d1 7.5) (= d2 -1) (= d3 3.25f32))) 4
+          (< (- h1 h0) 3) 9
+          :else 0)))

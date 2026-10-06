@@ -4,10 +4,11 @@
 (ns emit.rt
   (:use emit.runtime) (:require [emit.os :as os] [expand.targetos :as tos]))
 
-;; The eleven parts in the order compile.rs:20 `include_str!`s them: core str array vec vecbuild atom thread task weak io sys.
+;; The eleven parts in the order compile.rs:20 `include_str!`s them: core str array vec vecbuild atom thread task weak io sys; then alloc,
+;; the large-block cache (rt/alloc.lir), which the Rust runtime does not have.
 (defun runtime-parts-for (os-name: str) -> (Vec str)
   [RT-CORE RT-STR RT-ARRAY RT-VEC RT-VECBUILD RT-ATOM RT-THREAD (os/sys-for os-name RT-TASK) RT-WEAK RT-IO
-   (os/sys-for os-name RT-SYS)])
+   (os/sys-for os-name RT-SYS) (os/sys-for os-name RT-ALLOC)])
 
 ;; The runtime of the program being generated: for the OS of FIB_TARGET_TRIPLE, else the host's (expand.targetos).
 (defun runtime-parts () -> (Vec str)
@@ -36,11 +37,17 @@
         ((some i) (some (line-from part (+ i 1)))))))
 
 ;; The runtime's own `declare` of the C function `name`, if any: a program's `extern` of the same name must agree with it and is then
-;; not declared again. Rust: compile.rs:36 runtime_declaration
+;; not declared again. Rust: compile.rs:36 runtime_declaration. Added: a runtime function marked by a line `;; extern: (declare ...)`
+;; (rt/alloc.lir's `fib_alloc_ctl`) answers with that declaration, so a library's `extern` of it binds to the runtime's definition.
 (defun runtime-declaration (name: str) -> (Option str)
-  (let ((head (str-join ["(declare " name " "])))
+  (let ((head (str-join ["(declare " name " "]))
+        (marked (str-join [";; extern: (declare " name " "])))
     (reduce (fn (found: (Option str) part: str)
               (match found
                 ((some _) found)
-                (nil (declaration-in part head))))
+                (nil (match (declaration-in part head)
+                       ((some d) (some d))
+                       (nil (match (declaration-in part marked)
+                              ((some m) (some (str-slice m 11 (str-len m))))
+                              (nil nil)))))))
             nil (runtime-parts))))

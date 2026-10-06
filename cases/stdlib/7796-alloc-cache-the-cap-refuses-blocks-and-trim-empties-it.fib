@@ -1,0 +1,33 @@
+;; spec: docs/design/allocator.md sections 3 and 4: a block that would take the cache above the cap (FIB_ALLOC_CACHE_MAX) is freed at once and counted as refused; trim! gives every cached block back and returns the bytes
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib
+;; With a cap of 1 MiB, four arrays of 600 KB (class 640 KiB) live together and dropped together: one is kept, three are refused,
+;; and the cache never holds more than the cap. With the cap at 1 GiB the same four are all kept; trim! returns their bytes (4 x
+;; 640 KiB) and the cache is empty. A runtime that ignores the cap returns 2; a trim! that keeps blocks returns 5 or 6.
+(ns main (:require [fib.os.memory :as m]))
+
+(defun four () -> i64
+  (let [xs (mapv (fn (i: i64) (array 75000 i)) (range 4))]
+    (reduce (fn (acc: i64 a: (Array i64)) (+ acc (array-get a 74999))) 0 xs)))
+
+(defun main () -> i64
+  (do (m/trim!)
+      (m/configure! 60000 1048576)
+      (let [s0 (m/alloc-stats)
+            sum1 (four)
+            s1 (m/alloc-stats)
+            refused (- (. s1 refused) (. s0 refused))
+            sum2 (do (m/configure! 60000 1073741824) (m/trim!) (four))
+            s2 (m/alloc-stats)
+            gone (m/trim!)
+            s3 (m/alloc-stats)]
+        (cond (not (and (= sum1 6) (= sum2 6))) 1
+              (> (. s1 held) 1048576) 2
+              (not (= refused 3)) 3
+              (not (= (. s2 held) 2621440)) 4
+              (not (= gone 2621440)) 5
+              (not (= (. s3 held) 0)) 6
+              :else 0))))

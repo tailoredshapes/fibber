@@ -60,6 +60,7 @@ creates an inheritable descriptor; use `set-inheritable` when needed.
 | `fib.os.system` | `system-info`, `page-size`, `available-cpus` |
 | `fib.os.random` | `random-bytes size` |
 | `fib.os.platform` | `current`, `name`, `from-name`; `Platform` variants `Linux`, `Darwin`, `Unsupported` |
+| `fib.os.memory` | the runtime's large-block cache (docs/design/allocator.md): `alloc-stats` (an `AllocStats`), `trim!`, `configure! decay-ms cap`, `configure-from-env!`; `rss-bytes` (VmRSS, nil without /proc). Not in the `fib.os` facade: required by name |
 
 Bytes remain `(Array i8)`, including embedded NULs. `read-fd` may return fewer
 bytes than requested; an empty array means EOF, while a nonblocking empty pipe

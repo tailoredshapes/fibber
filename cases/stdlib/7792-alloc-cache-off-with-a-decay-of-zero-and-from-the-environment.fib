@@ -1,0 +1,48 @@
+;; spec: docs/design/allocator.md sections 3 and 4: a decay of 0 (configure!, or FIB_ALLOC_DECAY_MS=0 read again by configure-from-env!) turns the cache off and empties it; FIB_ALLOC_CACHE_MAX sets the cap; a value that is not a decimal number is ignored
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib
+;; With the cache off, twenty same-size large arrays in a row are no hits and the cache holds nothing. The environment: FIB_ALLOC_DECAY_MS=0 turns
+;; it off, 250 and FIB_ALLOC_CACHE_MAX=12345678 set the decay and the cap, "x9" leaves the default 1000. On again, the loop hits.
+;; A runtime that still files blocks while the cache is off returns 2.
+(ns main (:require [fib.os.memory :as m] [fib.os.environment :as env]))
+
+(defun rounds (k: i64) -> f64
+  (reduce (fn (acc: f64 i: i64) (let [a (array 30000 (double i))] (+ acc (array-get a 29999)))) 0.0 (range k)))
+
+;; The hits of k rounds, or -1 when the arrays did not hold their values.
+(defun hits-of (k: i64) -> i64
+  (let [h0 (. (m/alloc-stats) hits) s (rounds k)]
+    (if (= s (double (quot (* k (- k 1)) 2))) (- (. (m/alloc-stats) hits) h0) -1)))
+
+(defun set-env (name: str value: str) -> bool
+  (match (env/setenv name value) ((Ok _) true) ((Err _) false)))
+
+(defun from-env (decay: str cap: str) -> m/AllocStats
+  (do (set-env "FIB_ALLOC_DECAY_MS" decay) (set-env "FIB_ALLOC_CACHE_MAX" cap) (m/configure-from-env!) (m/alloc-stats)))
+
+(defun main () -> i64
+  (do (m/configure! 0 1073741824)
+      (let [off-hits (hits-of 20)
+            off (m/alloc-stats)
+            on-hits (do (m/configure! 1000 1073741824) (hits-of 20))
+            e0 (from-env "0" "12345678")
+            e0-hits (hits-of 20)
+            e1 (from-env "250" "1073741824")
+            e1-hits (hits-of 20)
+            e2 (from-env "x9" "")]
+        (cond (not (= (. off decay-ms) 0)) 1
+              (not (= (. off held) 0)) 2
+              (not (= off-hits 0)) 3
+              (< on-hits 18) 4
+              (not (= (. e0 decay-ms) 0)) 6
+              (not (= (. e0 held) 0)) 7
+              (not (= e0-hits 0)) 8
+              (not (= (. e0 cap) 12345678)) 9
+              (not (= (. e1 decay-ms) 250)) 10
+              (< e1-hits 18) 11
+              (not (= (. e2 decay-ms) 1000)) 12
+              (not (= (. e2 cap) 1073741824)) 13
+              :else 0))))

@@ -1,0 +1,352 @@
+;; fib.rt, the large-block cache (docs/design/allocator.md): a freed block of 128 KiB or more is kept in a list of its size class and
+;; handed to the next request of that class; a block kept longer than the decay time (FIB_ALLOC_DECAY_MS, default 1000) goes back to
+;; `free`, and the cache never holds more than FIB_ALLOC_CACHE_MAX bytes (default 1 GiB). Blocks are plain malloc blocks: a request is
+;; rounded up to its class, a freed block is filed down by its usable size, so any runtime may `free` a block made here and any
+;; malloc block may be filed here. `fib.lc-get` and `fib.lc-put` serve objects (fib.alloc-slow, fib.free-block) and trace mode's
+;; blocks (fib.drop-one); a cached block is runtime memory, in no trace line.
+;;
+;; Classes: four per power of two, size (k+1) * 2^(e-2) for k in 4..7, index (e-16)*4 + k-4; index 3 is 128 KiB, 123 is 2^47.
+;; A cached block's first word is the next block of its class, its second the time it was filed (fib.lc-now, ns); newest first.
+;; Every list, the stats and the peak are under @fib.lc-lock (fib.lock, the atoms' spinlock); @fib.lc-bytes and @fib.lc-next
+;; are also read without it (fib.lc-tick), so every access of those two is atomic. The time is read only while the cache holds
+;; something: at a large or medium allocation or free, and at the end of `sys-sleep`; no thread runs in the background.
+(declare malloc_usable_size i64 (ptr))
+(declare mallopt i32 (i32 i32))
+
+;; 1 while the cache is on (FIB_ALLOC_DECAY_MS not 0); the decay in ns; the cap in bytes.
+(global internal fib.lc-on i32 (i32 1))
+(global internal fib.lc-decay i64 (i64 1000000000))
+(global internal fib.lc-cap i64 (i64 1073741824))
+(global internal fib.lc-lock i32 (i32 0))
+(global internal fib.lc-heads [124 x ptr] (zeroinitializer [124 x ptr]))
+;; The bytes held (by class size), and the time of the next sweep (the oldest block's filing time plus the decay).
+(global internal fib.lc-bytes i64 (i64 0))
+(global internal fib.lc-next i64 (i64 0))
+;; 0 hits, 1 misses, 2 bytes returned, 3 blocks returned, 4 blocks refused by the cap, 5 peak bytes held.
+(global internal fib.lc-stats [6 x i64] (zeroinitializer [6 x i64]))
+
+;; The coarse monotonic clock (CLOCK_MONOTONIC_COARSE, 6; Darwin's CLOCK_MONOTONIC_RAW_APPROX through emit.os): no system call.
+(define internal (fib.lc-now i64) ()
+  (block entry
+    (let ((t (alloca (align 8) i8 (i32 16))))
+      (call @clock_gettime (i32 6) t)
+      (ret (add (mul (load i64 t) (i64 1000000000)) (load i64 (getelementptr i8 t (i64 8))))))))
+
+;; malloc_usable_size (Darwin's malloc_size through emit.os).
+(define internal (fib.lc-usable i64) ((ptr p))
+  (block entry (ret (call @malloc_usable_size p))))
+
+;; glibc's mmap threshold pinned at 128 KiB (M_MMAP_THRESHOLD, -3), which also stops it sliding: every block the cache holds is then
+;; its own mapping, and the free of decay is an munmap. Darwin has no mallopt (emit.os drops the call).
+(define internal (fib.lc-os-init void) ()
+  (block entry
+    (let ((r (call @mallopt (i32 -3) (i32 131072))))
+      (ret))))
+
+;; floor(log2 x) for x >= 1.
+(define internal (fib.lc-log2 i64) ((i64 x))
+  (block entry (br loop))
+  (block loop
+    (let ((e (phi i64 (entry (i64 0)) (step e1)))
+          (v (phi i64 (entry x) (step v1))))
+      (br (icmp ugt v (i64 1)) step done)))
+  (block step
+    (let ((e1 (add e (i64 1)))
+          (v1 (lshr v (i64 1))))
+      (br loop)))
+  (block done (ret e)))
+
+;; The class of a request of n bytes (131072 <= n <= 2^47): the smallest class size not below n.
+(define internal (fib.lc-class-up i64) ((i64 n))
+  (block entry
+    (let ((m (sub n (i64 1)))
+          (e (call @fib.lc-log2 m))
+          (k (lshr m (sub e (i64 2)))))
+      (ret (add (mul (sub e (i64 16)) (i64 4)) (sub k (i64 4)))))))
+
+;; The class a block of u usable bytes (u >= 131072) is filed in: the largest class size not above u; above 123 it is not cached.
+(define internal (fib.lc-class-down i64) ((i64 u))
+  (block entry
+    (let ((e (call @fib.lc-log2 u))
+          (k (lshr u (sub e (i64 2)))))
+      (ret (add (mul (sub e (i64 16)) (i64 4)) (sub k (i64 5)))))))
+
+(define internal (fib.lc-class-size i64) ((i64 idx))
+  (block entry
+    (let ((e (add (udiv idx (i64 4)) (i64 16)))
+          (k (add (urem idx (i64 4)) (i64 4))))
+      (ret (shl (add k (i64 1)) (sub e (i64 2)))))))
+
+(define internal (fib.lc-stat-add void) ((i64 k) (i64 d))
+  (block entry
+    (let ((p (getelementptr i64 @fib.lc-stats k)))
+      (store (add (load i64 p) d) p)
+      (ret))))
+
+;; A block of at least n bytes, from the cache when n is a cached size and its class has one, else from malloc (null when malloc
+;; fails: the caller traps).
+(define internal (fib.lc-get ptr) ((i64 n))
+  (block entry
+    (let ((on (atomic-load monotonic i32 @fib.lc-on)))
+      (br (and (icmp ne on (i32 0)) (and (icmp uge n (i64 131072)) (icmp ule n (i64 140737488355328)))) cached plain)))
+  (block plain
+    (call @fib.lc-tick)
+    (ret (call @malloc n)))
+  (block cached
+    (let ((idx (call @fib.lc-class-up n))
+          (size (call @fib.lc-class-size idx))
+          (slot (getelementptr ptr @fib.lc-heads idx)))
+      (call @fib.lock @fib.lc-lock)
+      (let ((head (load ptr slot)))
+        (br (icmp ne head (ptr null)) hit miss))))
+  (block hit
+    (store (load ptr head) slot)
+    (atomic-store monotonic (sub (atomic-load monotonic i64 @fib.lc-bytes) size) @fib.lc-bytes)
+    (call @fib.lc-stat-add (i64 0) (i64 1))
+    (call @fib.unlock @fib.lc-lock)
+    (call @fib.lc-tick)
+    (ret head))
+  (block miss
+    (call @fib.lc-stat-add (i64 1) (i64 1))
+    (call @fib.unlock @fib.lc-lock)
+    (call @fib.lc-tick)
+    (ret (call @malloc size))))
+
+;; Takes back the malloc block p: filed in its class while the cache is on, the block is large enough and the cap allows, else freed.
+(define internal (fib.lc-put void) ((ptr p))
+  (block entry
+    (br (icmp ne (atomic-load monotonic i32 @fib.lc-on) (i32 0)) sized plain))
+  (block sized
+    (let ((u (call @fib.lc-usable p)))
+      (br (icmp uge u (i64 131072)) classed plain)))
+  (block classed
+    (let ((idx (call @fib.lc-class-down u)))
+      (br (icmp ule idx (i64 123)) file plain)))
+  (block file
+    (let ((size (call @fib.lc-class-size idx))
+          (now (call @fib.lc-now))
+          (slot (getelementptr ptr @fib.lc-heads idx)))
+      (call @fib.lock @fib.lc-lock)
+      (let ((b (atomic-load monotonic i64 @fib.lc-bytes))
+            (nb (add b size)))
+        (br (icmp ugt nb (atomic-load monotonic i64 @fib.lc-cap)) refuse keep))))
+  (block keep
+    (store (load ptr slot) p)
+    (store now (getelementptr i8 p (i64 8)))
+    (store p slot)
+    (atomic-store monotonic nb @fib.lc-bytes)
+    (let ((pk (getelementptr i64 @fib.lc-stats (i64 5))))
+      (store (select (icmp ugt nb (load i64 pk)) nb (load i64 pk)) pk)
+      (br (icmp eq b (i64 0)) first kept)))
+  (block first
+    (atomic-store monotonic (add now (atomic-load monotonic i64 @fib.lc-decay)) @fib.lc-next)
+    (br kept))
+  (block kept
+    (call @fib.unlock @fib.lc-lock)
+    (call @fib.lc-tick)
+    (ret))
+  (block refuse
+    (call @fib.lc-stat-add (i64 4) (i64 1))
+    (call @fib.unlock @fib.lc-lock)
+    (call @free p)
+    (call @fib.lc-tick)
+    (ret))
+  (block plain
+    (call @free p)
+    (call @fib.lc-tick)
+    (ret)))
+
+;; Every 256th small free while the program has one thread (fib.free-block's push, the only path that runs then): the decay check,
+;; so that a single-threaded server whose requests allocate only from the free lists still gives a spike's blocks back. A plain
+;; counter: the push path never runs once a second thread exists (fib.mt), and a thread's start orders it before that thread.
+(global internal fib.lc-count i32 (i32 256))
+(define internal (fib.lc-every void) ()
+  (block entry
+    (let ((c (sub (load i32 @fib.lc-count) (i32 1))))
+      (br (icmp eq c (i32 0)) check keep)))
+  (block keep (store c @fib.lc-count) (ret))
+  (block check
+    (store (i32 256) @fib.lc-count)
+    (call @fib.lc-tick)
+    (ret)))
+
+;; The decay check: while the cache holds something and the next deadline has passed, one sweep.
+(define internal (fib.lc-tick void) ()
+  (block entry
+    (br (icmp eq (atomic-load monotonic i64 @fib.lc-bytes) (i64 0)) done check))
+  (block check
+    (let ((now (call @fib.lc-now)))
+      (br (icmp sge now (atomic-load monotonic i64 @fib.lc-next)) sweep done)))
+  (block sweep
+    (call @fib.lc-sweep (sub now (atomic-load monotonic i64 @fib.lc-decay)))
+    (br done))
+  (block done (ret)))
+
+;; Under the lock: takes out of the list at `slot` every block filed at or before `cutoff` (a tail, the list being newest first)
+;; and returns its first block, or null.
+(define internal (fib.lc-cut ptr) ((ptr slot) (i64 cutoff))
+  (block entry (br walk))
+  (block walk
+    (let ((link (phi ptr (entry slot) (keep cur)))
+          (cur (load ptr link)))
+      (br (icmp eq cur (ptr null)) none test)))
+  (block test
+    (br (icmp sle (load i64 (getelementptr i8 cur (i64 8))) cutoff) cut keep))
+  (block keep (br walk))
+  (block cut
+    (store (ptr null) link)
+    (ret cur))
+  (block none (ret (ptr null))))
+
+;; Under the lock: counts the blocks of `chain` (class idx) as returned, and links the chain in front of `out`; the new head.
+(define internal (fib.lc-splice ptr) ((ptr chain) (ptr out) (i64 idx))
+  (block entry
+    (let ((size (call @fib.lc-class-size idx)))
+      (br (icmp eq chain (ptr null)) none walk)))
+  (block walk
+    (let ((n (phi ptr (entry chain) (step nx)))
+          (nx (load ptr n)))
+      (call @fib.lc-stat-add (i64 2) size)
+      (call @fib.lc-stat-add (i64 3) (i64 1))
+      (atomic-store monotonic (sub (atomic-load monotonic i64 @fib.lc-bytes) size) @fib.lc-bytes)
+      (br (icmp eq nx (ptr null)) tail step)))
+  (block step (br walk))
+  (block tail
+    (store out n)
+    (ret chain))
+  (block none (ret out)))
+
+;; Under the lock: the filing time of the oldest block at `slot`, or the largest i64 when there is none.
+(define internal (fib.lc-oldest i64) ((ptr slot))
+  (block entry
+    (let ((first (load ptr slot)))
+      (br (icmp eq first (ptr null)) none walk)))
+  (block walk
+    (let ((n (phi ptr (entry first) (step nx)))
+          (nx (load ptr n)))
+      (br (icmp eq nx (ptr null)) last step)))
+  (block step (br walk))
+  (block last (ret (load i64 (getelementptr i8 n (i64 8)))))
+  (block none (ret (i64 9223372036854775807))))
+
+(define internal (fib.lc-free-chain void) ((ptr chain))
+  (block entry (br test))
+  (block test
+    (let ((n (phi ptr (entry chain) (go nx))))
+      (br (icmp eq n (ptr null)) done go)))
+  (block go
+    (let ((nx (load ptr n)))
+      (call @free n)
+      (br test)))
+  (block done (ret)))
+
+;; Gives back every block filed at or before `cutoff` (the decay: now minus the decay time; trim: the largest i64) and sets the next
+;; deadline from the oldest block kept; the frees run after the lock is released. The bytes given back.
+(define internal (fib.lc-sweep i64) ((i64 cutoff))
+  (block entry
+    (call @fib.lock @fib.lc-lock)
+    (let ((before (load i64 (getelementptr i64 @fib.lc-stats (i64 2)))))
+      (br loop)))
+  (block loop
+    (let ((idx (phi i64 (entry (i64 0)) (loop idx1)))
+          (out (phi ptr (entry (ptr null)) (loop out1)))
+          (oldest (phi i64 (entry (i64 9223372036854775807)) (loop old1)))
+          (slot (getelementptr ptr @fib.lc-heads idx))
+          (out1 (call @fib.lc-splice (call @fib.lc-cut slot cutoff) out idx))
+          (t (call @fib.lc-oldest slot))
+          (old1 (select (icmp slt t oldest) t oldest))
+          (idx1 (add idx (i64 1))))
+      (br (icmp ult idx1 (i64 124)) loop done)))
+  (block done
+    (let ((left (atomic-load monotonic i64 @fib.lc-bytes))
+          (gone (sub (load i64 (getelementptr i64 @fib.lc-stats (i64 2))) before)))
+      (atomic-store monotonic (select (icmp eq left (i64 0)) (i64 0) (add old1 (atomic-load monotonic i64 @fib.lc-decay))) @fib.lc-next)
+      (call @fib.unlock @fib.lc-lock)
+      (call @fib.lc-free-chain out1)
+      (ret gone))))
+
+;; The decimal value of the environment variable `name`, or `dflt` when it is unset, empty, not all digits or too large.
+(define internal (fib.lc-env-int i64) ((ptr name) (i64 dflt))
+  (block entry
+    (let ((s (call @getenv name)))
+      (br (icmp eq s (ptr null)) no loop)))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (digit inext)))
+          (v (phi i64 (entry (i64 0)) (digit v1)))
+          (c (zext i64 (load i8 (getelementptr i8 s i)))))
+      (br (icmp eq c (i64 0)) end check)))
+  (block check
+    (br (and (icmp uge c (i64 48)) (and (icmp ule c (i64 57)) (icmp slt v (i64 92233720368547757)))) digit no))
+  (block digit
+    (let ((inext (add i (i64 1)))
+          (v1 (add (mul v (i64 10)) (sub c (i64 48)))))
+      (br loop)))
+  (block end (br (icmp eq i (i64 0)) no yes))
+  (block yes (ret v))
+  (block no (ret dflt)))
+
+;; Sets the decay (ms) and the cap (bytes). A decay of 0 or less turns the cache off and empties it.
+(define internal (fib.lc-configure void) ((i64 ms) (i64 cap))
+  (block entry
+    (atomic-store monotonic (select (icmp slt cap (i64 0)) (i64 0) cap) @fib.lc-cap)
+    (br (icmp sgt ms (i64 0)) on off))
+  (block on
+    (atomic-store monotonic (mul ms (i64 1000000)) @fib.lc-decay)
+    (call @fib.lc-os-init)
+    (atomic-store monotonic (i32 1) @fib.lc-on)
+    (ret))
+  (block off
+    (atomic-store monotonic (i32 0) @fib.lc-on)
+    (call @fib.lc-sweep (i64 9223372036854775807))
+    (ret)))
+
+;; From fib.init, and `configure-from-env!`: the two variables, as at start-up.
+(define internal (fib.lc-init void) ()
+  (block entry
+    (call @fib.lc-configure (call @fib.lc-env-int (string "FIB_ALLOC_DECAY_MS") (i64 1000))
+          (call @fib.lc-env-int (string "FIB_ALLOC_CACHE_MAX") (i64 1073741824)))
+    (ret)))
+
+(define internal (fib.lc-stat i64) ((i64 k))
+  (block entry
+    (call @fib.lock @fib.lc-lock)
+    (let ((v (load i64 (getelementptr i64 @fib.lc-stats k))))
+      (call @fib.unlock @fib.lc-lock)
+      (ret v))))
+
+;; extern: (declare fib_alloc_ctl i64 (i64 i64 i64))
+;; The library's door (fib.os.memory; emit.rt binds an `extern` of this name to this definition): op 0 trim (the bytes given back),
+;; 1 bytes held, 2 hits, 3 misses, 4 bytes returned, 5 blocks returned, 6 blocks refused by the cap, 7 peak bytes held, 8 the decay
+;; in ms (0: off), 9 the cap, 10 configure decay a ms and cap b bytes, 11 read the environment again; -1 for any other op.
+(define internal (fib_alloc_ctl i64) ((i64 op) (i64 a) (i64 b))
+  (block entry
+    (switch op other ((i64 0) trim) ((i64 1) held) ((i64 2) stat) ((i64 3) stat) ((i64 4) stat) ((i64 5) stat) ((i64 6) stat)
+            ((i64 7) stat) ((i64 8) decay) ((i64 9) cap) ((i64 10) conf) ((i64 11) env)))
+  (block trim (ret (call @fib.lc-sweep (i64 9223372036854775807))))
+  (block held (ret (atomic-load monotonic i64 @fib.lc-bytes)))
+  (block stat (ret (call @fib.lc-stat (sub op (i64 2)))))
+  (block decay
+    (br (icmp eq (atomic-load monotonic i32 @fib.lc-on) (i32 0)) zero ms))
+  (block zero (ret (i64 0)))
+  (block ms (ret (sdiv (atomic-load monotonic i64 @fib.lc-decay) (i64 1000000))))
+  (block cap (ret (atomic-load monotonic i64 @fib.lc-cap)))
+  (block conf (call @fib.lc-configure a b) (ret (i64 0)))
+  (block env (call @fib.lc-init) (ret (i64 0)))
+  (block other (ret (i64 -1))))
+
+;; At the end of `main` (fib.pool-quiesce) when FIB_ALLOC_STATS is set: one line of the cache's counts on standard error.
+(define internal (fib.lc-report void) ()
+  (block entry
+    (br (icmp eq (call @getenv (string "FIB_ALLOC_STATS")) (ptr null)) done say))
+  (block say
+    (let ((buf (alloca i8 (i32 400)))
+          (len (call @snprintf buf (i64 400)
+                     (string "fib.alloc: held %lld B (peak %lld), hits %lld, misses %lld, returned %lld B in %lld blocks, refused %lld; decay %lld ms, cap %lld B\n")
+                     (call @fib_alloc_ctl (i64 1) (i64 0) (i64 0)) (call @fib_alloc_ctl (i64 7) (i64 0) (i64 0))
+                     (call @fib_alloc_ctl (i64 2) (i64 0) (i64 0)) (call @fib_alloc_ctl (i64 3) (i64 0) (i64 0))
+                     (call @fib_alloc_ctl (i64 4) (i64 0) (i64 0)) (call @fib_alloc_ctl (i64 5) (i64 0) (i64 0))
+                     (call @fib_alloc_ctl (i64 6) (i64 0) (i64 0)) (call @fib_alloc_ctl (i64 8) (i64 0) (i64 0))
+                     (call @fib_alloc_ctl (i64 9) (i64 0) (i64 0)))))
+      (call @write (i32 2) buf (sext i64 len))
+      (br done)))
+  (block done (ret)))
