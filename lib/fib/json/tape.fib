@@ -1,0 +1,101 @@
+;; fib.json.tape: the structural pass of the on-demand front (docs/design/json.md 2b). One validating scan of the input builds a tape of two i64 words
+;; per value, in document order, and allocates nothing else: no strings, no numbers, no containers. A node is
+;;     word 0:  kind | (start << 8)          start = byte offset of the token (a string: of its first byte after the quote)
+;;     word 1:  string: end offset (the closing quote) | 1<<62 when the string has an escape;  number: end offset;  array and object: the tape index just past
+;;              its last node (so a sibling is one jump);  true, false, null: 0
+;; and an object's children alternate key (a string node), value. The whole grammar, the escapes (including surrogate pairing) and the depth limit are
+;; checked here, so a tape that exists is a valid document and the accessors (fib.json.view) cannot fail on it. The loop is a state machine over an
+;; explicit stack of open containers: no recursion, so depth costs a word, not a frame.
+(ns fib.json.tape (:use fib.core fib.seq fib.coll fib.json.types fib.json.number fib.json.buffer fib.json.escape) (:require [fib.json.libc :as libc]))
+
+(def k-null: i64 1)
+(def k-true: i64 2)
+(def k-false: i64 3)
+(def k-int: i64 4)
+(def k-float: i64 5)
+(def k-str: i64 6)
+(def k-array: i64 8)
+(def k-object: i64 9)
+(def esc-flag: i64 4611686018427387904)
+
+;; The tape holds `len` words of `words`; `src` is the text the offsets point into.
+(defstruct Doc (src: str words: (Array i64) len: i64))
+
+(defun tape-ensure (&t: (Array i64) &len: i64 extra: i64) -> unit
+  (let [need (+ @len extra) cap (array-len @t)]
+    (when (> need cap)
+      (let [nb (array (max need (* cap 2)) 0)]
+        (do (unsafe (libc/memcpy (ptr+ (raw nb) 24) (ptr+ (raw @t) 24) (* 8 @len)))
+            (set! t nb))))))
+
+(defun tape-put (&t: (Array i64) &len: i64 w0: i64 w1: i64) -> unit
+  (do (tape-ensure &t &len 2)
+      (unsafe (do (store-i64 (ptr+ (raw @t) (+ 24 (* 8 @len))) w0) (store-i64 (ptr+ (raw @t) (+ 32 (* 8 @len))) w1)))
+      (set! len (+ @len 2))))
+
+(defun tape-set (&t: (Array i64) idx: i64 v: i64) -> unit (unsafe (store-i64 (ptr+ (raw @t) (+ 24 (* 8 idx))) v)))
+
+(defun node (kind: i64 start: i64) -> i64 (bit-or kind (shl start 8)))
+
+;; ---- strings
+
+(defun is-hex (c: i64) -> bool (or (and (>= c 48) (<= c 57)) (or (and (>= c 97) (<= c 102)) (and (>= c 65) (<= c 70)))))
+
+(defun hex4-value (s: str n: i64 i: i64) -> i64
+  (loop [k 0 v 0]
+    (if (= k 4) v
+        (let [c (at s n (+ i k))
+              d (cond (and (>= c 48) (<= c 57)) (- c 48) (and (>= c 97) (<= c 102)) (- c 87) (and (>= c 65) (<= c 70)) (- c 55) :else -1)]
+          (if (< d 0) -1 (recur (+ k 1) (+ (* v 16) d)))))))
+
+;; The escape whose backslash is at i: the index after it, or -1 with the code in `fail`.
+(defun check-escape (s: str n: i64 i: i64 &fail: i64) -> i64
+  (let [c (at s n (+ i 1))]
+    (cond (or (= c 34) (or (= c 92) (or (= c 47) (or (= c 98) (or (= c 102) (or (= c 110) (or (= c 114) (= c 116)))))))) (+ i 2)
+          (= c 117)
+          (let [u (hex4-value s n (+ i 2))]
+            (cond (< u 0) (do (set! fail e-escape) -1)
+                  (and (>= u 55296) (< u 56320))
+                  (let [u2 (if (and (= (at s n (+ i 6)) 92) (= (at s n (+ i 7)) 117)) (hex4-value s n (+ i 8)) -1)]
+                    (if (and (>= u2 56320) (< u2 57344)) (+ i 12) (do (set! fail e-surrogate) -1)))
+                  (and (>= u 56320) (< u 57344)) (do (set! fail e-surrogate) -1)
+                  :else (+ i 6)))
+          (= c -1) (do (set! fail e-eof) -1)
+          :else (do (set! fail e-escape) -1))))
+
+;; A string starting after its opening quote: the index of the closing quote, or -1 with `fail` set (and the offending index in `bad`); `esc` says whether it has an escape.
+(defun scan-str (s: str n: i64 start: i64 &esc: i64 &fail: i64 &bad: i64) -> i64
+  (loop [i start]
+    (let [w (loop [k i] (if (and (<= (+ k 8) n) (not (has-special (unsafe (load-i64 (ptr+ (raw s) (+ 24 k)))) false))) (recur (+ k 8)) k))
+          b (at s n w)]
+      (cond (= b 34) w
+            (= b 92) (let [j (check-escape s n w &fail)] (do (set! esc 1) (if (< j 0) (do (set! bad w) -1) (recur j))))
+            (= b -1) (do (set! fail e-eof) (set! bad w) -1)
+            (< b 32) (do (set! fail e-control) (set! bad w) -1)
+            :else (recur (+ w 1))))))
+
+;; ---- numbers (grammar only; the value is made on demand)
+
+;; The end of the number at i, with `isf` 1 when it has a fraction or an exponent; -1 with fail/bad set when malformed.
+(defun scan-num (s: str n: i64 i: i64 &isf: i64 &fail: i64 &bad: i64) -> i64
+  (let [i0 (if (= (at s n i) 45) (+ i 1) i)
+        i1 (skip-digits s n i0)]
+    (cond (= i1 i0) (do (set! fail (if (>= i0 n) e-eof e-number)) (set! bad i0) -1)
+          (and (> (- i1 i0) 1) (= (at s n i0) 48)) (do (set! fail e-number) (set! bad (+ i0 1)) -1)
+          :else
+          (let [dot (= (at s n i1) 46)
+                i2 (if dot (skip-digits s n (+ i1 1)) i1)]
+            (if (and dot (= i2 (+ i1 1)))
+                (do (set! fail (if (>= i2 n) e-eof e-number)) (set! bad i2) -1)
+                (let [ec (at s n i2)
+                      has-e (or (= ec 101) (= ec 69))
+                      sg (at s n (+ i2 1))
+                      jx (if has-e (if (or (= sg 43) (= sg 45)) (+ i2 2) (+ i2 1)) i2)
+                      i3 (if has-e (skip-digits s n jx) i2)]
+                  (if (and has-e (= i3 jx))
+                      (do (set! fail (if (>= i3 n) e-eof e-number)) (set! bad i3) -1)
+                      (do (set! isf (if (or dot has-e) 1 0)) i3))))))))
+
+(defun word-at (s: str n: i64 i: i64 w: str) -> bool
+  (let [m (str-len w)]
+    (loop [k 0] (cond (= k m) true (= (at s n (+ i k)) (zext i64 (str-byte-at w k))) (recur (+ k 1)) :else false))))

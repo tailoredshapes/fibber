@@ -96,56 +96,59 @@
   (let [m (count keys)]
     (loop [i 0] (cond (>= i m) -1 (str-eq (nth keys i) k) i :else (recur (+ i 1))))))
 
-;; The object so far: keys and values in source order, and a key index (empty until the object has 16 keys).
-(defstruct ObjAcc (keys: (Vec str) vals: (Vec Json) idx: (Map str i64)))
-
+;; The index of keys once an object has more than 16 of them (before that a scan is cheaper than hashing).
 (defun get-or (m: (Map str i64) k: str d: i64) -> i64 (if-some [x (get m k)] x d))
 
 (defun index-keys (keys: (Vec str)) -> (Map str i64)
   (loop [i 0 m: (Map str i64) {}] (if (< i (count keys)) (recur (+ i 1) (assoc m (nth keys i) i)) m)))
 
-(defun key-index (acc: ObjAcc k: str dups: i64) -> i64
+;; Where key `k` already is (-1 when it is not there, or the policy keeps every pair).
+(defun key-index (keys: (Vec str) idx: (Map str i64) k: str dups: i64) -> i64
   (cond (= dups 1) -1
-        (> (count (. acc keys)) 16) (get-or (. acc idx) k -1)
-        :else (find-key (. acc keys) k)))
+        (> (count keys) 16) (get-or idx k -1)
+        :else (find-key keys k)))
 
-(defun add-pair (acc: ObjAcc at: i64 k: str v: Json) -> ObjAcc
-  (let [m (count (. acc keys))]
-    (cond (>= at 0) (ObjAcc (. acc keys) (assoc (. acc vals) at v) (. acc idx))
-          (> m 15) (ObjAcc (conj (. acc keys) k) (conj (. acc vals) v) (assoc (if (= m 16) (index-keys (. acc keys)) (. acc idx)) k m))
-          :else (ObjAcc (conj (. acc keys) k) (conj (. acc vals) v) (. acc idx)))))
+;; The key index after adding `k` as the key number m (the first 16 keys have none).
+(defun next-index (keys: (Vec str) idx: (Map str i64) k: str m: i64) -> (Map str i64)
+  (cond (< m 16) idx (= m 16) (assoc (index-keys keys) k m) :else (assoc idx k m)))
 
-;; At the opening quote of a key.
-(defun parse-member (s: str n: i64 &pos: i64 &fail: i64 depth: i64 o: JsonOptions acc: ObjAcc) -> ObjAcc
+;; At the opening quote of a key: reads `"key" : value` and answers the key; the value is left in `vcell`.
+(defun parse-member (s: str n: i64 &pos: i64 &fail: i64 depth: i64 o: JsonOptions &v: Json) -> str
   (do (set! pos (+ @pos 1))
       (let [k (scan-string s n &pos &fail)]
-        (if (!= @fail 0) acc
+        (if (!= @fail 0) k
             (let [j (skip-ws s n @pos)]
               (if (!= (at s n j) 58)
-                  (do (fail-at &pos &fail (if (>= j n) e-eof e-unexpected) j) acc)
-                  (let [kpos @pos
-                        _ (set! pos (skip-ws s n (+ j 1)))
-                        v (parse-value s n &pos &fail depth o)
-                        at (key-index acc k (. o duplicates))]
-                    (cond (!= @fail 0) acc
-                          (and (>= at 0) (= (. o duplicates) 2)) (do (fail-at &pos &fail e-duplicate kpos) acc)
-                          :else (add-pair acc at k v)))))))))
+                  (do (fail-at &pos &fail (if (>= j n) e-eof e-unexpected) j) k)
+                  (do (set! pos (skip-ws s n (+ j 1)))
+                      (set! v (parse-value s n &pos &fail depth o))
+                      k)))))))
 
 (defun parse-object (s: str n: i64 &pos: i64 &fail: i64 depth: i64 o: JsonOptions) -> Json
-  (let [i (skip-ws s n (+ @pos 1))
-        e (ObjAcc [] [] {})]
+  (let [i (skip-ws s n (+ @pos 1))]
     (if (= (at s n i) 125)
         (do (set! pos (+ i 1)) (JObj [] []))
         (do (set! pos i)
-            (loop [acc e]
+            (loop [keys: (Vec str) [] vals: (Vec Json) [] idx: (Map str i64) {}]
               (if (!= (at s n @pos) 34)
                   (do (fail-at &pos &fail (if (>= @pos n) e-eof e-unexpected) @pos) JNull)
-                  (let [acc2 (parse-member s n &pos &fail depth o acc)]
+                  (let [kpos @pos
+                        vc (cell JNull)
+                        k (parse-member s n &pos &fail depth o &vc)]
                     (if (!= @fail 0) JNull
-                        (let [j (skip-ws s n @pos) c (at s n j)]
-                          (cond (= c 44) (do (set! pos (skip-ws s n (+ j 1))) (recur acc2))
-                                (= c 125) (do (set! pos (+ j 1)) (JObj (. acc2 keys) (. acc2 vals)))
-                                :else (do (fail-at &pos &fail (if (= c -1) e-eof e-unexpected) j) JNull)))))))))))
+                        (let [dup (key-index keys idx k (. o duplicates))
+                              j (skip-ws s n @pos)
+                              c (at s n j)]
+                          (cond (and (>= dup 0) (= (. o duplicates) 2)) (do (fail-at &pos &fail e-duplicate kpos) JNull)
+                                (and (!= c 44) (!= c 125)) (do (fail-at &pos &fail (if (= c -1) e-eof e-unexpected) j) JNull)
+                                :else
+                                (let [m (count keys)
+                                      keys2 (if (>= dup 0) keys (conj keys k))
+                                      vals2 (if (>= dup 0) (assoc vals dup @vc) (conj vals @vc))
+                                      idx2 (if (>= dup 0) idx (next-index keys idx k m))]
+                                  (if (= c 44)
+                                      (do (set! pos (skip-ws s n (+ j 1))) (recur keys2 vals2 idx2))
+                                      (do (set! pos (+ j 1)) (JObj keys2 vals2))))))))))))))
 
 (defun parse-value (s: str n: i64 &pos: i64 &fail: i64 depth: i64 o: JsonOptions) -> Json
   (let [c (at s n @pos)]

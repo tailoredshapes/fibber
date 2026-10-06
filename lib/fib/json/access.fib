@@ -1,0 +1,73 @@
+;; fib.json.access: reading a `Json` (docs/design/json.md 5). Plain functions over the enum; every lookup answers an Option.
+;;   (json-get j "key")         the value of a key of an object (a scan of the keys: the first match, which is the only one under the default duplicate policy)
+;;   (json-nth j 3)             the element of an array
+;;   (get-in j ["a" "0" "b"])   a path of steps: a step is a key of an object or, on an array, the decimal index; (the vector is homogeneous, so an index is its text)
+;;   (pointer j "/a/0/b")       RFC 6901: "" is the whole document, `~1` is `/` and `~0` is `~` in a step, a step on an array is a decimal index without a leading zero
+;;   (as-i64 j) (as-f64 j) (as-str j) (as-bool j) (as-array j) (as-object j)    the payload when the kind matches (as-f64 also takes an integer), else nil
+;;   (json-type j)              "null" "boolean" "number" "string" "array" "object"
+(ns fib.json.access (:use fib.core fib.seq fib.coll fib.json.types))
+
+(defun json-get (j: Json k: str) -> (Option Json)
+  (match j
+    ((JObj keys vals)
+     (let [m (count keys)]
+       (loop [i 0] (cond (>= i m) nil (str-eq (nth keys i) k) (some (nth vals i)) :else (recur (+ i 1))))))
+    (_ nil)))
+
+(defun json-nth (j: Json i: i64) -> (Option Json)
+  (match j ((JArr xs) (if (and (>= i 0) (< i (count xs))) (some (nth xs i)) nil)) (_ nil)))
+
+;; The decimal index in `s` (no sign, no leading zero unless it is "0"), or -1.
+(defun index-text (s: str) -> i64
+  (let [n (str-len s)]
+    (if (or (= n 0) (and (> n 1) (= (str-byte-at s 0) 48i8)) (> n 15))
+        -1
+        (loop [i 0 v 0]
+          (if (= i n) v
+              (let [c (zext i64 (str-byte-at s i))] (if (and (>= c 48) (<= c 57)) (recur (+ i 1) (+ (* v 10) (- c 48))) -1)))))))
+
+(defun step (j: Json s: str) -> (Option Json)
+  (match j
+    ((JObj _ _) (json-get j s))
+    ((JArr _) (let [i (index-text s)] (if (>= i 0) (json-nth j i) nil)))
+    (_ nil)))
+
+(defun get-in (j: Json path: (Vec str)) -> (Option Json)
+  (loop [cur j i 0]
+    (if (= i (count path)) (some cur)
+        (if-some [nx (step cur (nth path i))] (recur nx (+ i 1)) nil))))
+
+;; One pointer step with the escapes undone: ~1 is /, ~0 is ~ (in that order, RFC 6901 4).
+(defun unescape-step (s: str) -> str
+  (if (nil? (str-find s "~" 0)) s
+      (let [out (cell "")]
+        (do (loop [i 0]
+              (when (< i (str-len s))
+                (let [c (str-byte-at s i) d (if (< (+ i 1) (str-len s)) (str-byte-at s (+ i 1)) 0i8)]
+                  (cond (and (= c 126i8) (= d 49i8)) (do (set! out (str @out "/")) (recur (+ i 2)))
+                        (and (= c 126i8) (= d 48i8)) (do (set! out (str @out "~")) (recur (+ i 2)))
+                        :else (do (set! out (str @out (str-slice s i (+ i 1)))) (recur (+ i 1)))))))
+            @out))))
+
+(defun split-pointer (p: str) -> (Vec str)
+  (let [n (str-len p)]
+    (loop [i 1 from 1 out: (Vec str) []]
+      (cond (> i n) out
+            (or (= i n) (= (str-byte-at p i) 47i8)) (recur (+ i 1) (+ i 1) (conj out (unescape-step (str-slice p from i))))
+            :else (recur (+ i 1) from out)))))
+
+(defun pointer (j: Json p: str) -> (Option Json)
+  (cond (= p "") (some j)
+        (!= (str-byte-at p 0) 47i8) nil
+        :else (get-in j (split-pointer p))))
+
+(defun as-i64 (j: Json) -> (Option i64) (match j ((JInt i) (some i)) (_ nil)))
+(defun as-f64 (j: Json) -> (Option f64) (match j ((JFloat f) (some f)) ((JInt i) (some (double i))) (_ nil)))
+(defun as-str (j: Json) -> (Option str) (match j ((JStr s) (some s)) (_ nil)))
+(defun as-bool (j: Json) -> (Option bool) (match j ((JBool b) (some b)) (_ nil)))
+(defun as-array (j: Json) -> (Option (Vec Json)) (match j ((JArr xs) (some xs)) (_ nil)))
+(defun as-object (j: Json) -> (Option (Pair (Vec str) (Vec Json))) (match j ((JObj ks vs) (some (Pair ks vs))) (_ nil)))
+
+(defun json-type (j: Json) -> str
+  (match j ((JNull) "null") ((JBool _) "boolean") ((JInt _) "number") ((JFloat _) "number") ((JBig _) "number")
+    ((JStr _) "string") ((JArr _) "array") ((JObj _ _) "object")))

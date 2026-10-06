@@ -25,9 +25,11 @@
   (let [_ (set! st (next-rand @st))
         r (shr (rnd-out @st) 33)
         nd (+ 1 (rem r 19))
-        digits (digit-text &st nd)
-        dot (rem (shr r 5) (+ nd 1))
-        mant (if (= (rem (shr r 9) 3) 0) digits (str (str-slice digits 0 dot) "." (if (= dot nd) "0" (str-slice digits dot nd))))
+        digits (str (+ 1 (rem (shr r 20) 9)) (digit-text &st (- nd 1)))
+        dot (+ 1 (rem (shr r 5) nd))
+        mant (cond (= (rem (shr r 9) 4) 0) digits
+                   (= (rem (shr r 9) 4) 1) (str "0." digits)
+                   :else (str (str-slice digits 0 dot) "." (if (= dot nd) "0" (str-slice digits dot nd))))
         ek (rem (shr r 11) 8)
         e (- (rem (shr r 15) 700) 350)
         ex (cond (= ek 0) "" (< ek 5) (str "e" (rem e 40)) :else (str "E" e))]
@@ -81,17 +83,18 @@
 
 (defun check-file (path: str) -> i64
   (if-some [txt (read-file path)]
-    (let [lines (filter (fn (l: str) (> (str-len l) 0)) (vec (string/split txt "\n")))
-          bad (loop [i 0 bad 0]
-                (if (= i (count lines)) bad
-                    (let [l (nth lines i)
-                          sp (if-some [k (str-find l " " 0)] k 0)
-                          t (str-slice l 0 sp)
-                          want (hex-bits (str-slice l (+ sp 1) (str-len l)))
-                          got (parse-bits t)]
-                      (if (= want got) (recur (+ i 1) bad)
-                          (do (when (< bad 10) (println "  MISMATCH" t "want" want "got" got)) (recur (+ i 1) (+ bad 1)))))))]
-      (do (println "corpus" path ":" (count lines) "cases," bad "differ") bad))
+    (let [n (str-len txt)
+          r (loop [from 0 bad 0 cnt 0]
+              (if (>= from n) (Pair bad cnt)
+                  (let [e (if-some [k (str-find txt "\n" from)] k n)
+                        l (str-slice txt from e)
+                        sp (if-some [k (str-find l " " 0)] k 0)
+                        t (str-slice l 0 sp)
+                        want (hex-bits (str-slice l (+ sp 1) (str-len l)))
+                        got (parse-bits t)]
+                    (if (= want got) (recur (+ e 1) bad (+ cnt 1))
+                        (do (when (< bad 10) (println "  MISMATCH" t "want" want "got" got)) (recur (+ e 1) (+ bad 1) (+ cnt 1)))))))]
+      (do (println "corpus" path ":" (. r snd) "cases," (. r fst) "differ") (. r fst)))
     (do (println "cannot read" path) 1)))
 
 (defun main () -> i64
