@@ -8,6 +8,8 @@ set -uo pipefail
 F=${1:?usage: run.sh STAGE2}
 here=$(cd "$(dirname "$0")" && pwd)
 export FIB_LIB=${FIB_LIB:-$PWD/lib}
+# The fixtures must not depend on the user's git configuration (a global config made the fixtures' commits fail on the Mac): no global or system config.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 ulimit -v 16000000
 mkdir -p "$HOME/.cache/fibber-scratch"
 T=$(mktemp -d "$HOME/.cache/fibber-scratch/deps-test.XXXXXX")

@@ -25,19 +25,19 @@ Releases are on the [GitHub releases page](https://github.com/tailoredshapes/fib
 (Apple Silicon), with `SHA256SUMS`. The 0.0.x releases are
 the Rust tools (tag `seed-1`, docs/rust-legacy.md); from 0.1.0 `fibc` is the compiler written in fibber, built by
 itself, and stays 0.x until the owner says 1.0.0. The current release is
-0.1.7 (the file `VERSION`). Download your platform's tarball and `SHA256SUMS`, then:
+0.1.8 (the file `VERSION`). Download your platform's tarball and `SHA256SUMS`, then:
 
 ```
-sha256sum -c --ignore-missing SHA256SUMS     # fibc-0.1.7-linux-x86_64.tar.gz: OK  (macOS: shasum -a 256 -c)
-tar xzf fibc-0.1.7-linux-x86_64.tar.gz       # or fibc-0.1.7-darwin-arm64.tar.gz
+sha256sum -c --ignore-missing SHA256SUMS     # fibc-0.1.8-linux-x86_64.tar.gz: OK  (macOS: shasum -a 256 -c)
+tar xzf fibc-0.1.8-linux-x86_64.tar.gz       # or fibc-0.1.8-darwin-arm64.tar.gz
 echo '(defun main () -> i64 (do (println "hello from fibber") 0))' > hello.fib
-fibc-0.1.7-linux-x86_64/bin/fibc --version   # fibc 0.1.7
-fibc-0.1.7-linux-x86_64/bin/fibc run hello.fib
-fibc-0.1.7-linux-x86_64/bin/fibc build hello.fib -o hello && ./hello
+fibc-0.1.8-linux-x86_64/bin/fibc --version   # fibc 0.1.8
+fibc-0.1.8-linux-x86_64/bin/fibc run hello.fib
+fibc-0.1.8-linux-x86_64/bin/fibc build hello.fib -o hello && ./hello
 ```
 
 The darwin-arm64 binary is ad-hoc signed, not notarised: if macOS blocks a downloaded copy, remove the quarantine
-attribute (`xattr -d com.apple.quarantine fibc-0.1.7-darwin-arm64/bin/fibc`). `fibc build` needs the system C compiler
+attribute (`xattr -d com.apple.quarantine fibc-0.1.8-darwin-arm64/bin/fibc`). `fibc build` needs the system C compiler
 (`cc`; Xcode's command line tools on a Mac) and a normal environment (it fails under a bare `env -i`: give it a `PATH`).
 The tarball holds one directory, `fibc-VERSION-PLATFORM/`:
 
