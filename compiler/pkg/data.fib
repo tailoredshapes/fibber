@@ -1,0 +1,114 @@
+;; compiler/pkg/data.fib: `deps.fib` and `deps.lock` as data (docs/design/packages.md §1, §2). Both files are fibber data forms read by
+;; the compiler's own reader (syntax.reader): one map, keywords for keys, strings, symbols, vectors and maps for values. Nothing in them is
+;; evaluated. Every error names FILE:LINE:COL of the form it is about.
+(ns pkg.data
+  (:require [syntax.reader :as rd] [syntax.error :as se])
+  (:use syntax.pos syntax.form))
+
+;; FILE:LINE:COL: MESSAGE.
+(defun at (p: Pos msg: str) -> str
+  (str-join [(. p file) ":" (show (. p line)) ":" (show (. p col)) ": " msg]))
+
+;; The one map a data file holds.
+(defun read-map (file: str) -> (Result Stx str)
+  (match (read-file file)
+    (nil (Err (str file ": cannot be read")))
+    ((some text)
+     (match (rd/read-all text file)
+       ((Err e) (Err (at (. e pos) (se/err-message (. e kind)))))
+       ((Ok forms)
+        (cond (not (= (count forms) 1)) (Err (str file ": wants exactly one map, has " (count forms) " forms"))
+              (map-form? (nth forms 0)) (Ok (nth forms 0))
+              :else (Err (at (. (nth forms 0) pos) "wants a map {..}"))))))))
+
+(defun map-form? (s: Stx) -> bool
+  (match (. s kind) ((SMap _) true) (_ false)))
+
+;; The items of a map form, keys and values alternating.
+(defun map-items (s: Stx) -> (Vec Stx)
+  (match (. s kind) ((SMap items) items) (_ [])))
+
+;; A key or value as its kind names it, for messages.
+(defun what (s: Stx) -> str
+  (match (. s kind)
+    ((SSym n) (str "symbol " n))
+    ((SKw n) (str ":" n))
+    ((SStr v) (str "string \"" v "\""))
+    ((SMap _) "a map")
+    ((SVec _) "a vector")
+    ((SList _) "a list")
+    (_ "a literal")))
+
+;; The name of a keyword key ("" for any other form).
+(defun kw-name (s: Stx) -> str
+  (match (. s kind) ((SKw n) n) (_ "")))
+
+;; The keys of a map form that are not among `known`, or that are not keywords, or that come twice: the first such, as an error.
+(defun check-keys (m: Stx known: (Vec str) where: str) -> (Result unit str)
+  (let ((items (map-items m)))
+    (loop ((i 0) (seen (vec-empty)))
+      (if (>= i (count items))
+          (Ok ())
+          (let ((k (nth items i)) (name (kw-name k)))
+            (cond (= name "") (Err (at (. k pos) (str "a key of " where " is a keyword, not " (what k))))
+                  (some? (first (filter (fn (s: str) (= s name)) seen))) (Err (at (. k pos) (str ":" name " comes twice in " where)))
+                  (nil? (first (filter (fn (s: str) (= s name)) known)))
+                    (Err (at (. k pos) (str "unknown key :" name " in " where " (known: :" (str-join-sep known " :") ")")))
+                  :else (recur (+ i 2) (conj seen name))))))))
+
+(defun str-join-sep (parts: (Vec str) sep: str) -> str
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (count parts))
+        (recur (+ i 1) (if (= i 0) (conj out (nth parts i)) (conj (conj out sep) (nth parts i))))
+        (str-join out))))
+
+;; The value of keyword `key` in a map form.
+(defun lookup (m: Stx key: str) -> (Option Stx)
+  (let ((items (map-items m)))
+    (loop ((i 0))
+      (cond (>= (+ i 1) (count items)) nil
+            (= (kw-name (nth items i)) key) (some (nth items (+ i 1)))
+            :else (recur (+ i 2))))))
+
+(defun want-str (s: Stx what-for: str) -> (Result str str)
+  (match (. s kind)
+    ((SStr v) (Ok v))
+    (_ (Err (at (. s pos) (str what-for " is a string, not " (what s)))))))
+
+(defun want-bool (s: Stx what-for: str) -> (Result bool str)
+  (match (. s kind)
+    ((SBool v) (Ok v))
+    (_ (Err (at (. s pos) (str what-for " is true or false, not " (what s)))))))
+
+;; A vector of strings.
+(defun want-strs (s: Stx what-for: str) -> (Result (Vec str) str)
+  (match (. s kind)
+    ((SVec items)
+     (loop ((i 0) (out (vec-empty)))
+       (if (>= i (count items))
+           (Ok out)
+           (match (want-str (nth items i) (str "each of " what-for))
+             ((Err m) (Err m))
+             ((Ok v) (recur (+ i 1) (conj out v)))))))
+    (_ (Err (at (. s pos) (str what-for " is a vector of strings [\"..\"], not " (what s)))))))
+
+;; The string at `key` of a map form, if there is one.
+(defun opt-str (m: Stx key: str) -> (Result (Option str) str)
+  (match (lookup m key)
+    (nil (Ok nil))
+    ((some v) (match (want-str v (str ":" key)) ((Err e) (Err e)) ((Ok s) (Ok (some s)))))))
+
+;; The strings at `key`, or `dflt` when the key is absent.
+(defun strs-or (m: Stx key: str dflt: (Vec str)) -> (Result (Vec str) str)
+  (match (lookup m key)
+    (nil (Ok dflt))
+    ((some v) (want-strs v (str ":" key)))))
+
+;; A string as a fibber string literal: `"` and `\` escaped, a newline as \n.
+(defun quote-str (s: str) -> str
+  (let ((cs (str-chars s)))
+    (loop ((i 0) (out ["\""]))
+      (if (< i (count cs))
+          (let ((c (nth cs i)))
+            (recur (+ i 1) (conj out (cond (= c \") "\\\"" (= c \\) "\\\\" (= c \newline) "\\n" :else (char->str c)))))
+          (str-join (conj out "\""))))))

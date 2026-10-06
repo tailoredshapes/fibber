@@ -1,0 +1,134 @@
+;; compiler/pkg/project.fib: the project file `deps.fib` as a value (docs/design/packages.md §1). Its shape is tools.deps' `deps.edn`:
+;;   {:name "acme/app" :version "0.1.0" :paths ["src"]
+;;    :deps {acme/util {:git/url "https://.." :git/tag "v1.2" :git/sha "<40 hex>"} acme/x {:local/root "../x"}}
+;;    :override {acme/util {:git/url ".." :git/sha ".."}}      ; the root project's choice where two requests disagree
+;;    :aliases {:test {:extra-paths ["specs"]}}                ; roots `fibc test` adds
+;;    :allow-urls ["http://intranet/x.git"]}                   ; URLs allowed although not https, ssh or file
+;; Every key is optional; :paths defaults to ["src"]. An unknown key is an error, so a misspelt one is not silently ignored.
+(ns pkg.project
+  (:require [pkg.data :as d])
+  (:use syntax.pos syntax.form))
+
+;; Where a library comes from: a commit of a git repository (sha and tag as written; resolution makes the sha), or a directory.
+(defenum PkgSource
+  (SrcGit url: str sha: (Option str) tag: (Option str))
+  (SrcLocal root: str))
+
+(defstruct PkgDep (name: str src: PkgSource pos: Pos))
+
+(defstruct PkgProject
+  (dir: str name: str version: str paths: (Vec str) deps: (Vec PkgDep) overrides: (Vec PkgDep) test-paths: (Vec str)
+   allow-urls: (Vec str)))
+
+(def project-keys: (Vec str) ["name" "version" "paths" "deps" "override" "aliases" "allow-urls"])
+(def dep-keys: (Vec str) ["git/url" "git/sha" "git/tag" "local/root"])
+
+;; Whether a text is a full commit id: 40 lower-case hex digits.
+(defun full-sha? (s: str) -> bool
+  (and (= (str-len s) 40)
+       (every? (fn (c: char) (or (and (>= c \0) (<= c \9)) (and (>= c \a) (<= c \f)))) (str-chars s))))
+
+;; A path of a library's :paths: relative, without a `..` part (a library's roots stay inside the library).
+(defun safe-path? (p: str) -> bool
+  (and (> (str-len p) 0) (not (starts-with? p "/")) (not (= p "..")) (not (starts-with? p "../"))
+       (nil? (str-find p "/../" 0)) (not (suffix? p "/.."))))
+
+(defun dep-name (k: Stx) -> (Result str str)
+  (match (. k kind)
+    ((SSym n) (Ok n))
+    ((SStr n) (if (> (str-len n) 0) (Ok n) (Err (d/at (. k pos) "a library's name is not empty"))))
+    (_ (Err (d/at (. k pos) (str "a library is named by a symbol (acme/util), not " (d/what k)))))))
+
+;; The git source of a dependency map: a URL and a full sha or a tag (or both).
+(defun git-source :private (m: Stx url: str) -> (Result PkgSource str)
+  (try-let [sha (d/opt-str m "git/sha")
+            tag (d/opt-str m "git/tag")]
+    (cond (and (nil? sha) (nil? tag)) (Err (d/at (. m pos) "a git dependency names :git/sha or :git/tag (or both)"))
+          (and (some? sha) (not (full-sha? (unwrap-or sha "")))) (Err (d/at (. m pos) (str ":git/sha is a full 40-digit commit id, not \"" (unwrap-or sha "") "\"")))
+          (and (some? tag) (= (unwrap-or tag "") "")) (Err (d/at (. m pos) ":git/tag is not empty"))
+          :else (Ok (SrcGit url sha tag)))))
+
+;; One dependency: the name and its coordinate map.
+(defun parse-dep (k: Stx v: Stx) -> (Result PkgDep str)
+  (try-let [name (dep-name k)
+            _ (if (d/map-form? v) (Ok ()) (Err (d/at (. v pos) (str "the coordinate of " name " is a map {..}, not " (d/what v)))))
+            _ (d/check-keys v dep-keys (str "the coordinate of " name))
+            url (d/opt-str v "git/url")
+            root (d/opt-str v "local/root")]
+    (cond (and (some? url) (some? root)) (Err (d/at (. v pos) (str name ": :git/url and :local/root exclude each other")))
+          (some? root) (if (or (some? (d/lookup v "git/sha")) (some? (d/lookup v "git/tag")))
+                           (Err (d/at (. v pos) (str name ": :local/root takes no :git/sha or :git/tag")))
+                           (Ok (PkgDep name (SrcLocal (unwrap-or root "")) (. k pos))))
+          (some? url) (match (git-source v (unwrap-or url "")) ((Err e) (Err e)) ((Ok s) (Ok (PkgDep name s (. k pos)))))
+          :else (Err (d/at (. v pos) (str name ": a coordinate has :git/url or :local/root"))))))
+
+;; The dependencies of a map `{name coord ..}` at `key`, in the order written; a name twice is an error.
+(defun parse-deps (m: Stx key: str) -> (Result (Vec PkgDep) str)
+  (match (d/lookup m key)
+    (nil (Ok []))
+    ((some dm)
+     (if (not (d/map-form? dm))
+         (Err (d/at (. dm pos) (str ":" key " is a map {name coordinate ..}, not " (d/what dm))))
+         (let ((items (d/map-items dm)))
+           (loop ((i 0) (out (vec-empty)))
+             (if (>= (+ i 1) (count items))
+                 (Ok out)
+                 (match (parse-dep (nth items i) (nth items (+ i 1)))
+                   ((Err e) (Err e))
+                   ((Ok dep) (if (some? (first (filter (fn (o: PkgDep) (= (. o name) (. dep name))) out)))
+                                 (Err (d/at (. dep pos) (str (. dep name) " comes twice in :" key)))
+                                 (recur (+ i 2) (conj out dep))))))))))))
+
+;; The :extra-paths of the alias :test, if there is one (the only alias the MVP reads: packages.md §5).
+(defun test-paths :private (m: Stx) -> (Result (Vec str) str)
+  (match (d/lookup m "aliases")
+    (nil (Ok []))
+    ((some am)
+     (if (not (d/map-form? am))
+         (Err (d/at (. am pos) (str ":aliases is a map {:alias {..}}, not " (d/what am))))
+         (match (d/lookup am "test")
+           (nil (Ok []))
+           ((some t) (if (d/map-form? t)
+                         (try-let [_ (d/check-keys t ["extra-paths"] "the alias :test")] (d/strs-or t "extra-paths" []))
+                         (Err (d/at (. t pos) (str "the alias :test is a map {..}, not " (d/what t)))))))))))
+
+(defun check-paths :private (paths: (Vec str) m: Stx) -> (Result (Vec str) str)
+  (match (first (filter (fn (p: str) (not (safe-path? p))) paths))
+    (nil (Ok paths))
+    ((some p) (Err (d/at (. m pos) (str "a path is relative and stays inside the library: \"" p "\""))))))
+
+;; The project of the map form `m` read from the directory `dir`.
+(defun parse-project (m: Stx dir: str) -> (Result PkgProject str)
+  (try-let [_ (d/check-keys m project-keys "deps.fib")
+            name (d/opt-str m "name")
+            version (d/opt-str m "version")
+            paths0 (d/strs-or m "paths" ["src"])
+            paths (check-paths paths0 m)
+            deps (parse-deps m "deps")
+            overrides (parse-deps m "override")
+            tests0 (test-paths m)
+            tests (check-paths tests0 m)
+            allow (d/strs-or m "allow-urls" [])]
+    (Ok (PkgProject dir (unwrap-or name "") (unwrap-or version "") paths deps overrides tests allow))))
+
+;; Whether `s` ends with `t`.
+(defun suffix? (s: str t: str) -> bool
+  (and (>= (str-len s) (str-len t)) (= (str-slice s (- (str-len s) (str-len t)) (str-len s)) t)))
+
+;; `DIR/deps.fib` read and parsed.
+(defun read-project (dir: str) -> (Result PkgProject str)
+  (try-let [m (d/read-map (str dir "/deps.fib"))] (parse-project m dir)))
+
+;; Whether a URL is one resolution fetches: https, ssh (`ssh://` or `user@host:path`) and file URLs, or one the root project allows.
+(defun url-allowed? (url: str allow: (Vec str)) -> bool
+  (or (starts-with? url "https://") (starts-with? url "ssh://") (starts-with? url "file://")
+      (scp-like? url) (some? (first (filter (fn (a: str) (= a url)) allow)))))
+
+;; `user@host:path`: an `@`, then a `:` before any `/`, and no `://`.
+(defun scp-like? :private (url: str) -> bool
+  (match (str-find url "@" 0)
+    (nil false)
+    ((some at) (match (str-find url ":" at)
+                 (nil false)
+                 ((some c) (and (nil? (str-find url "://" 0))
+                                (match (str-find url "/" 0) (nil true) ((some s) (> s c)))))))))

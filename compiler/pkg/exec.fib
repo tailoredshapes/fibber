@@ -1,0 +1,75 @@
+;; compiler/pkg/exec.fib: run another program (`git`, `chmod`, `rm`) and capture what it says (docs/design/packages.md §6). The program
+;; is found on PATH by execvp(3) and given its words as they are: no shell runs, so a URL or a path is never parsed by one. Standard input
+;; is /dev/null (nothing waits on a prompt), standard output and error go to two files of a fresh temporary directory, read back and removed.
+(ns pkg.exec
+  (:require [lair.ffi :as ffi] [fib.os :as os]))
+
+(extern fork :private () -> i32)
+(extern execvp :private (ptr ptr) -> i32)
+(extern dup2 :private (i32 i32) -> i32)
+(extern creat :private (ptr i32) -> i32)
+(extern open :private (ptr i32) -> i32)
+(extern close :private (i32) -> i32)
+(extern waitpid :private (i32 ptr i32) -> i32)
+(extern _exit :private (i32) -> unit)
+
+;; What a program did: its exit status (128 and the signal for one that was killed, 127 for one that could not be started, -1 for no
+;; process at all), and its standard output and error.
+(defstruct PkgRan (status: i64 out: str err: str))
+
+(defun decode-status :private (w: i64) -> i64
+  (if (= (bit-and w 127) 0) (bit-and (quot w 256) 255) (+ 128 (bit-and w 127))))
+
+;; In the child: /dev/null as standard input, the two files as output and error, then the program; 127 when it cannot be started.
+(defun become :private (file: ptr av: ptr fo: i32 fe: i32 null: ptr) -> i64
+  (unsafe
+    (let ((fi (open null 0i32)))
+      (do (dup2 fi 0i32) (dup2 fo 1i32) (dup2 fe 2i32) (execvp file av) (_exit 127i32) 0))))
+
+(defun wait-for :private (pid: i64) -> i64
+  (let ((st (ffi/slot-new))
+        (r (unsafe (waitpid (trunc i32 pid) st 0i32)))
+        (status (if (< r 0i32) -1 (decode-status (sext i64 (unsafe (load-i32 st)))))))
+    (do (ffi/free-addr (ffi/ptr->addr st)) status)))
+
+;; The process for `argv` (its first word is the program), output to `out` and errors to `err`; its exit status.
+(defun spawn-wait :private (argv: (Vec str) out: str err: str) -> i64
+  (let ((po (ffi/bytes-new out))
+        (pe (ffi/bytes-new err))
+        (pn (ffi/bytes-new "/dev/null"))
+        (cs (mapv (fn (w: str) (ffi/ptr->addr (ffi/bytes-new w))) argv))
+        (av (ffi/words-new (conj cs 0)))
+        (pid (unsafe
+               (let ((fo (creat po 384i32))
+                     (fe (creat pe 384i32))
+                     (pid (fork)))
+                 (cond (< pid 0i32) -1
+                       (= pid 0i32) (become (ffi/addr->ptr (nth cs 0)) av fo fe pn)
+                       :else (do (close fo) (close fe) (sext i64 pid)))))))
+    (do (doseq [p [(ffi/ptr->addr po) (ffi/ptr->addr pe) (ffi/ptr->addr pn) (ffi/ptr->addr av)]] (ffi/free-addr p))
+        (let ((status (if (< pid 0) -1 (wait-for pid))))
+          (do (doseq [c cs] (ffi/free-addr c)) status)))))
+
+;; Runs `argv` (not empty) and captures its output. A temporary directory that cannot be made is status -1 with the reason as `err`.
+(defun run (argv: (Vec str)) -> PkgRan
+  (match (os/create-temp-directory (str-concat (os/temp-directory) "/fibdeps-XXXXXX"))
+    ((Err e) (PkgRan -1 "" (str "cannot make a temporary directory: " (. e message))))
+    ((Ok dir)
+     (let ((out (str-concat dir "/out"))
+           (err (str-concat dir "/err"))
+           (status (spawn-wait argv out err))
+           (ran (PkgRan status (unwrap-or (read-file out) "") (unwrap-or (read-file err) ""))))
+       (do (os/remove-file out) (os/remove-file err) (os/remove-directory dir) ran)))))
+
+;; The first line of a text without its newline ("" for none).
+(defun first-line (text: str) -> str
+  (match (str-find text "\n" 0)
+    (nil text)
+    ((some i) (str-slice text 0 i))))
+
+;; What a failed run said, on one line: the first line of its error output, else of its output, else its status.
+(defun why (r: PkgRan) -> str
+  (cond (= (. r status) 127) "the program could not be started (is it on PATH?)"
+        (> (str-len (first-line (. r err))) 0) (first-line (. r err))
+        (> (str-len (first-line (. r out))) 0) (first-line (. r out))
+        :else (str "exit status " (. r status))))

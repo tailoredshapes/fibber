@@ -1,0 +1,57 @@
+;; compiler/pkg/paths.fib: text helpers of the package manager: splitting and joining, and paths made absolute and normal (`.` and `..`
+;; taken out by their text, as Cargo does for a path dependency: no symbolic link is followed).
+(ns pkg.paths (:require [fib.os :as os]))
+
+(defun split-on (s: str sep: str) -> (Vec str)
+  (loop ((from 0) (out (vec-empty)))
+    (match (str-find s sep from)
+      (nil (conj out (str-slice s from (str-len s))))
+      ((some i) (recur (+ i (str-len sep)) (conj out (str-slice s from i)))))))
+
+(defun join-sep (parts: (Vec str) sep: str) -> str
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (count parts))
+        (recur (+ i 1) (if (= i 0) (conj out (nth parts i)) (conj (conj out sep) (nth parts i))))
+        (str-join out))))
+
+(defun suffix? (s: str t: str) -> bool
+  (and (>= (str-len s) (str-len t)) (= (str-slice s (- (str-len s) (str-len t)) (str-len s)) t)))
+
+;; An absolute path with `.`, `..` and repeated `/` taken out.
+(defun normal (path: str) -> str
+  (let ((parts (split-on path "/")))
+    (loop ((i 0) (out (vec-empty)))
+      (if (< i (count parts))
+          (let ((p (nth parts i)))
+            (cond (or (= p "") (= p ".")) (recur (+ i 1) out)
+                  (= p "..") (recur (+ i 1) (if (empty? out) out (pop out)))
+                  :else (recur (+ i 1) (conj out p))))
+          (str "/" (join-sep out "/"))))))
+
+;; `rel` under `dir` (an absolute `rel` is itself), normal.
+(defun under (dir: str rel: str) -> str
+  (normal (if (starts-with? rel "/") rel (str dir "/" rel))))
+
+;; The working directory, absolute.
+(defun cwd () -> str
+  (match (os/current-directory) ((Ok d) d) ((Err _) ".")))
+
+;; `to` relative to the directory `from` (both absolute and normal): `../x` and the like; "." for the same directory.
+(defun relative (from: str to: str) -> str
+  (let ((a (filter (fn (p: str) (> (str-len p) 0)) (split-on from "/")))
+        (b (filter (fn (p: str) (> (str-len p) 0)) (split-on to "/")))
+        (k (loop ((i 0)) (if (and (< i (count a)) (< i (count b)) (= (nth a i) (nth b i))) (recur (+ i 1)) i)))
+        (ups (mapv (fn (_: str) "..") (drop k a)))
+        (parts (into ups (drop k b))))
+    (if (empty? parts) "." (join-sep parts "/"))))
+
+;; Whether a directory can be listed.
+(defun dir? (path: str) -> bool
+  (match (os/list-directory path) ((Ok _) true) ((Err _) false)))
+
+;; The directory that holds `deps.fib`, from `start` upwards: the project root, if there is one.
+(defun find-root (start: str) -> (Option str)
+  (loop ((dir (normal start)))
+    (cond (some? (read-file (str dir "/deps.fib"))) (some dir)
+          (= dir "/") nil
+          :else (recur (normal (str dir "/.."))))))
