@@ -507,6 +507,8 @@ Planted faults (each applied alone with `sed`, run, restored; scripts in `~/.cac
    syntax-quote qualifies symbols to the defining namespace, so `(:require [fib.log :as log])` + `(log/info ..)` would work. Change the
    expander so a template's `m/x` resolves to module `m` whether or not the user named it (a language change in `compiler/expand`), or
    keep `:use` for macro libraries?
+   **Answered (owner, 2026-10-06): change the expander** (MACRO-NS, docs/design/macro-names.md, spec/syntax.md 3.16 "Names in a
+   template"). fib.log, fib.db and fib.sql now name their own functions bare in their templates and work through `:require` alone.
 2. **`Datum` vs `Val`.** Ship `fib.datum` now as the scalar value of these libraries, and make `Val` (when designed) a superset that
    embeds it? Or design `Val` first?
 3. **C-library specs in the gate.** A gate stage that runs `scripts/test-db.sh` (needs libsqlite3.so.0 on CI runners), or keep it a

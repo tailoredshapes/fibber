@@ -1,0 +1,40 @@
+;; spec: syntax §3.16 (Names in a template); docs/design/macro-names.md; docs/design/observability-and-databases.md 4, 5
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; fib.sql and fib.db through `(:require [fib.sql :as sql] [fib.db :as db])` alone, as HoneySQL and next.jdbc are required: `sql/sql`
+;; expands to fib.sql.data's constructors and to `fib.sql/sql` for the nested data, the helpers `sql/select` .. to `fib.sql/helper-add`,
+;; `db/execute!` and `db/with-transaction` to fib.db.core's functions; none of them is named by the site. The site defines its own
+;; `format` (so the library's no longer shadows anything here) and a local named `transact`. A connection that records what it ran
+;; stands for a driver. Before the rule: `unbound name QMap` or `unbound name fib.sql/add-to-clause` at the site.
+(ns main (:use tl.check) (:require [fib.sql :as sql] [fib.db :as db] [fib.datum :as d]))
+
+(defun format (x: i64) -> str (str "#" x))
+
+(defstruct Recorder (ran: (Atom (Vec str))))
+(impl db/Connection Recorder
+  (conn-execute (self s params)
+    (do (swap! (. self ran) (fn (v: (Vec str)) (conj v (str s " " (count params)))))
+        (Ok [{"update-count" (d/DInt 1)}])))
+  (conn-close (self) (Ok ())))
+
+(defun main () -> i64
+  (let [c (checks)
+        id 7
+        q1 (sql/format (sql/sql {:select [:a [:b :bee]] :from [:t] :where [:and [:= :id id] [:> :n 3]] :limit 10}))
+        q2 (-> (sql/select :a :b) (sql/from :t) (sql/where [:= :id 1]) sql/format)
+        rec (Recorder (atom []))
+        transact 5
+        r1 (db/execute! rec ["insert into t values (?, ?)" 1 "x"])
+        r2 (db/with-transaction [tx rec] (db/execute! tx q2))]
+    (do (check c (= (. q1 sql) "SELECT a, b AS bee FROM t WHERE (id = ?) AND (n > ?) LIMIT ?"))
+        (check c (= (count (. q1 params)) 3))
+        (check c (= (. q2 sql) "SELECT a, b FROM t WHERE id = ?"))
+        (check c (= (format 3) "#3"))
+        (check c (match r1 ((Ok rows) (= (count rows) 1)) ((Err _) false)))
+        (check c (match r2 ((Ok _) true) ((Err _) false)))
+        (check c (= @(. rec ran) ["insert into t values (?, ?) 2" "BEGIN 0" "SELECT a, b FROM t WHERE id = ? 1" "COMMIT 0"]))
+        (check c (= transact 5))
+        (checks-result c))))

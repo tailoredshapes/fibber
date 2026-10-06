@@ -1,0 +1,26 @@
+;; spec: syntax §3.16 (Macro-time helpers); docs/design/autodiff.md 2.2 (b); docs/design/macro-names.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; The source-to-source experiment of the autodiff design, which failed with `macro ddx failed: .. unbound name df/diff-form`: a macro
+;; `ddx` that differentiates its argument form at expansion time by calling a recursive helper of a module its module requires
+;; (tl.symdiff/diff, through the alias `sd`). The site's own `diff` is not the helper. Without macro-time helpers this program is
+;; rejected (`macro ddx failed: .. unbound name sd/diff`).
+(ns main (:use tl.check) (:require [tl.symdiff :as sd]))
+
+(defmacro ddx (x e) (sd/diff x e))
+
+(defun diff (a: i64 b: i64) -> i64 (- a b))
+
+(defun main () -> i64
+  (let [c (checks)
+        x 3
+        y 5]
+    (do (check c (= (ddx x (* x (* x x))) 27))
+        (check c (= (ddx x (+ (* 2 x) 5)) 2))
+        (check c (= (ddx x (* y (+ x y))) 5))
+        (check c (= (ddx y (* x y)) 3))
+        (check c (= (diff 7 2) 5))
+        (checks-result c))))

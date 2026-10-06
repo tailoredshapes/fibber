@@ -1,0 +1,31 @@
+;; spec: syntax §3.16 (Names in a template); docs/design/macro-names.md; docs/design/observability-and-databases.md 2
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; fib.log through `(:require [fib.log :as log])` alone: `log/info` expands to `(fib.log/log-at 2 ..)`, a macro of fib.log the site
+;; never named, whose template names `enabled?`, `emit` and `->datum` bare; they resolve in fib.log, so the site needs no `:use`.
+;; Before the rule: `unbound name log-at` (and with the old library, `unbound name fib.log/enabled?`). A local named `emit` at the
+;; site does not capture the template's `emit`, and a disabled level evaluates neither the message nor the fields.
+(ns main (:use tl.check) (:require [fib.log :as log]))
+
+(defun main () -> i64
+  (let [c (checks)
+        m (log/memory-sink)
+        sys (log/log-system (dyn log/Sink :send m) (log/LevelTable log/INFO []))
+        lg (log/get-logger sys "app")
+        emit 99
+        hits (atom 0)]
+    (do (log/info lg "connected" :port 5432 :ok true)
+        (log/debug lg (do (swap! hits (fn (v: i64) (+ v 1))) "hidden") :n (do (swap! hits (fn (v: i64) (+ v 1))) 1))
+        (log/warn (log/with-context lg :rid "r1") "slow" :ms 12)
+        (let [rs (log/memory-records m)]
+          (do (check c (= (count rs) 2))
+              (check c (= (. (nth rs 0) message) "connected"))
+              (check c (= (count (. (nth rs 0) fields)) 2))
+              (check c (= (. (nth rs 1) level) log/WARN))
+              (check c (= (count (. (nth rs 1) fields)) 2))
+              (check c (= @hits 0))
+              (check c (= emit 99))
+              (checks-result c))))))

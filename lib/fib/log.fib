@@ -12,92 +12,38 @@
 ;; implicit fib.core has a `debug` of its own (the Debug protocol), which a `:use` of this module would shadow.
 (ns fib.log (:export-from fib.datum fib.log.core fib.log.sinks))
 
-;; The six level macros are one template each (a macro reaches only names the using module sees, or `var`: syntax §5, so they cannot share a
-;; macro of this module that the user did not name).
-(defmacro trace (lg message ... kvs)
+;; The level macros share one template, `log-at`, which their templates name bare: a template resolves in this module (syntax §3.16
+;; "Names in a template"), so `log-at`, `enabled?`, `emit` and `->datum` mean this library's wherever the macro is used, through an
+;; alias or a `:use`.
+
+;; (log-at L lg message :k v ..): the record at level L (0 trace .. 5 fatal) when that level is on for the logger; the message and the
+;; values are evaluated only then.
+(defmacro log-at (level lg message ... kvs)
   (if (= (rem (vec-count kvs) 2) 1)
       (trap "fib.log: the fields after the message come in keyword/value pairs")
       (let ((l (gensym "lg")))
         `(let ((~l ~lg))
-           (if (fib.log/enabled? ~l 0)
-               (fib.log/emit ~l 0 ~message
+           (if (enabled? ~l ~level)
+               (emit ~l ~level ~message
                  [~@(loop ((i 0) (out (vec-empty)))
                       (if (< i (vec-count kvs))
-                          (recur (+ i 2) (vec-conj out `(Pair ~(vec-nth kvs i) (fib.log/->datum ~(vec-nth kvs (+ i 1))))))
+                          (recur (+ i 2) (vec-conj out `(Pair ~(vec-nth kvs i) (->datum ~(vec-nth kvs (+ i 1))))))
                           out))])
                ())))))
 
-(defmacro debug (lg message ... kvs)
-  (if (= (rem (vec-count kvs) 2) 1)
-      (trap "fib.log: the fields after the message come in keyword/value pairs")
-      (let ((l (gensym "lg")))
-        `(let ((~l ~lg))
-           (if (fib.log/enabled? ~l 1)
-               (fib.log/emit ~l 1 ~message
-                 [~@(loop ((i 0) (out (vec-empty)))
-                      (if (< i (vec-count kvs))
-                          (recur (+ i 2) (vec-conj out `(Pair ~(vec-nth kvs i) (fib.log/->datum ~(vec-nth kvs (+ i 1))))))
-                          out))])
-               ())))))
-
-(defmacro info (lg message ... kvs)
-  (if (= (rem (vec-count kvs) 2) 1)
-      (trap "fib.log: the fields after the message come in keyword/value pairs")
-      (let ((l (gensym "lg")))
-        `(let ((~l ~lg))
-           (if (fib.log/enabled? ~l 2)
-               (fib.log/emit ~l 2 ~message
-                 [~@(loop ((i 0) (out (vec-empty)))
-                      (if (< i (vec-count kvs))
-                          (recur (+ i 2) (vec-conj out `(Pair ~(vec-nth kvs i) (fib.log/->datum ~(vec-nth kvs (+ i 1))))))
-                          out))])
-               ())))))
-
-(defmacro warn (lg message ... kvs)
-  (if (= (rem (vec-count kvs) 2) 1)
-      (trap "fib.log: the fields after the message come in keyword/value pairs")
-      (let ((l (gensym "lg")))
-        `(let ((~l ~lg))
-           (if (fib.log/enabled? ~l 3)
-               (fib.log/emit ~l 3 ~message
-                 [~@(loop ((i 0) (out (vec-empty)))
-                      (if (< i (vec-count kvs))
-                          (recur (+ i 2) (vec-conj out `(Pair ~(vec-nth kvs i) (fib.log/->datum ~(vec-nth kvs (+ i 1))))))
-                          out))])
-               ())))))
-
-(defmacro error (lg message ... kvs)
-  (if (= (rem (vec-count kvs) 2) 1)
-      (trap "fib.log: the fields after the message come in keyword/value pairs")
-      (let ((l (gensym "lg")))
-        `(let ((~l ~lg))
-           (if (fib.log/enabled? ~l 4)
-               (fib.log/emit ~l 4 ~message
-                 [~@(loop ((i 0) (out (vec-empty)))
-                      (if (< i (vec-count kvs))
-                          (recur (+ i 2) (vec-conj out `(Pair ~(vec-nth kvs i) (fib.log/->datum ~(vec-nth kvs (+ i 1))))))
-                          out))])
-               ())))))
-
-(defmacro fatal (lg message ... kvs)
-  (if (= (rem (vec-count kvs) 2) 1)
-      (trap "fib.log: the fields after the message come in keyword/value pairs")
-      (let ((l (gensym "lg")))
-        `(let ((~l ~lg))
-           (if (fib.log/enabled? ~l 5)
-               (fib.log/emit ~l 5 ~message
-                 [~@(loop ((i 0) (out (vec-empty)))
-                      (if (< i (vec-count kvs))
-                          (recur (+ i 2) (vec-conj out `(Pair ~(vec-nth kvs i) (fib.log/->datum ~(vec-nth kvs (+ i 1))))))
-                          out))])
-               ())))))
+(defmacro trace (lg message ... kvs) `(log-at 0 ~lg ~message ~@kvs))
+(defmacro debug (lg message ... kvs) `(log-at 1 ~lg ~message ~@kvs))
+(defmacro info (lg message ... kvs) `(log-at 2 ~lg ~message ~@kvs))
+(defmacro warn (lg message ... kvs) `(log-at 3 ~lg ~message ~@kvs))
+(defmacro error (lg message ... kvs) `(log-at 4 ~lg ~message ~@kvs))
+(defmacro fatal (lg message ... kvs) `(log-at 5 ~lg ~message ~@kvs))
 
 ;; (with-context lg :k v ..): the logger with these fields added to its context (a value; the old logger is unchanged).
 (defmacro with-context (lg ... kvs)
   (if (= (rem (vec-count kvs) 2) 1)
       (trap "fib.log: with-context takes keyword/value pairs")
-      `(fib.log/add-context ~lg
+      `(add-context ~lg
          [~@(loop ((i 0) (out (vec-empty)))
               (if (< i (vec-count kvs))
-                  (recur (+ i 2) (vec-conj out `(Pair ~(vec-nth kvs i) (fib.log/->datum ~(vec-nth kvs (+ i 1))))))
+                  (recur (+ i 2) (vec-conj out `(Pair ~(vec-nth kvs i) (->datum ~(vec-nth kvs (+ i 1))))))
                   out))])))

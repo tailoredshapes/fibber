@@ -1,0 +1,74 @@
+;; fib.test.form: what the `scenario` macro of fib.test.core builds from its steps, as functions it calls at expansion time (syntax §3.16
+;; "Macro-time helpers"). They run in the macro-time module, so they use the prelude's operations only; the code they build names
+;; fib.test.core's run-time functions by their full names (a template outside a `defmacro` body is not resolved in its module), and the
+;; site that expands `scenario` requires fib.test.core under that name (syntax §3.16 "Names in a template").
+(ns fib.test.form)
+
+;; The head of a step `(given ..)`, `(upon ..)`, `(then ..)`, `(covers ..)` or `(id ..)`: "" for anything else.
+(defun step-head (step: Form) -> str
+  (match step
+    ((List items) (if (> (vec-count items) 0) (match (vec-nth items 0) ((Sym h) h) (_ "")) ""))
+    (_ "")))
+
+(defun step-items :private (step: Form) -> (Vec Form)
+  (match step ((List items) items) (_ (vec-empty))))
+
+;; One item of a `then`, run with the log `log` before `acc`: an `(expect ..)` is a function of the log; any other item is a boolean form.
+(defun then-item :private (log: Form item: Form acc: Form) -> Form
+  (let ((expect (match item
+                  ((List xs) (if (> (vec-count xs) 0) (match (vec-nth xs 0) ((Sym r) (= r "expect")) (_ false)) false))
+                  (_ false))))
+    (if expect
+        `(do (~item ~log) ~acc)
+        `(do (fib.test.core/judge-true ~log (fib.test.core/then-line (quote ~item)) (call-pos) ~item) ~acc))))
+
+;; A `then` step's items, last first, wrapped around `acc`.
+(defun then-step :private (log: Form items: (Vec Form) acc: Form) -> Form
+  (loop ((j (- (vec-count items) 1)) (o acc))
+    (if (> j 0) (recur (- j 1) (then-item log (vec-nth items j) o)) o)))
+
+;; One step wrapped around the code of the steps after it.
+(defun step-code :private (log: Form step: Form acc: Form) -> Form
+  (let ((h (step-head step)) (items (step-items step)))
+    (cond (= h "given") `(do (fib.test.core/note ~log "Given" (fib.test.core/given-line (quote ~(vec-nth items 1)))) (let ~(vec-nth items 1) ~acc))
+          (= h "upon") `(do (fib.test.core/note ~log "When" (fib.test.core/upon-line (quote ~(vec-nth items 1)))) (let ~(vec-nth items 1) ~acc))
+          (= h "then") (then-step log items acc)
+          :else acc)))
+
+;; The body of a scenario's run: each step in order, the bindings of a Given or When holding for the steps after it, ending with the log.
+(defun scenario-body (log: Form steps: (Vec Form)) -> Form
+  (loop ((i (- (vec-count steps) 1)) (acc `(fib.test.core/rec-steps ~log)))
+    (if (< i 0) acc (recur (- i 1) (step-code log (vec-nth steps i) acc)))))
+
+;; The plan: the text of each Given, When and Then item, as code that makes it at run time.
+(defun scenario-plan (steps: (Vec Form)) -> (Vec Form)
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (vec-count steps))
+        (let ((h (step-head (vec-nth steps i))) (items (step-items (vec-nth steps i))))
+          (recur (+ i 1)
+                 (cond (= h "given") (vec-conj out `(fib.test.core/given-line (quote ~(vec-nth items 1))))
+                       (= h "upon") (vec-conj out `(fib.test.core/upon-line (quote ~(vec-nth items 1))))
+                       (= h "then") (loop ((j 1) (o out))
+                                      (if (< j (vec-count items))
+                                          (recur (+ j 1) (vec-conj o `(fib.test.core/then-line (quote ~(vec-nth items j)))))
+                                          o))
+                       :else out)))
+        out)))
+
+;; The rows of every `(covers "row" ..)` step, in order.
+(defun scenario-covers (steps: (Vec Form)) -> (Vec Form)
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (vec-count steps))
+        (recur (+ i 1)
+               (if (= (step-head (vec-nth steps i)) "covers")
+                   (let ((items (step-items (vec-nth steps i))))
+                     (loop ((j 1) (o out)) (if (< j (vec-count items)) (recur (+ j 1) (vec-conj o (vec-nth items j))) o)))
+                   out))
+        out)))
+
+;; The scenario's id before it is slugified: the last `(id "x")` step's, else its text.
+(defun scenario-ident (text: Form steps: (Vec Form)) -> Form
+  (loop ((i 0) (out text))
+    (if (< i (vec-count steps))
+        (recur (+ i 1) (if (= (step-head (vec-nth steps i)) "id") (vec-nth (step-items (vec-nth steps i)) 1) out))
+        out)))

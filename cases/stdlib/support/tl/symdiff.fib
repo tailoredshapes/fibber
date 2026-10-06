@@ -1,0 +1,25 @@
+;; tl.symdiff: the derivative of an expression of `+`, `*`, numbers and symbols with respect to one symbol, as a form: the helper of
+;; case 7933's `ddx` macro, which calls it at expansion time (syntax §3.16 "Macro-time helpers"). It recurses by name over the form,
+;; the walk that docs/design/autodiff.md 2.2 (b) found a macro could not do. Prelude operations only.
+(ns tl.symdiff)
+
+(defun same-sym? :private (x: Form e: Form) -> bool
+  (match x
+    ((Sym xn) (match e ((Sym en) (= xn en)) (_ false)))
+    (_ false)))
+
+;; d e / d x.
+(defun diff (x: Form e: Form) -> Form
+  (match e
+    ((Sym _) (if (same-sym? x e) '1 '0))
+    ((List items)
+     (if (= (vec-count items) 3)
+         (let ((a (vec-nth items 1)) (b (vec-nth items 2)))
+           (match (vec-nth items 0)
+             ((Sym op)
+              (cond (= op "+") `(+ ~(diff x a) ~(diff x b))
+                    (= op "*") `(+ (* ~(diff x a) ~b) (* ~a ~(diff x b)))
+                    :else (trap "diff: + and * only")))
+             (_ (trap "diff: + and * only"))))
+         (trap "diff: two operands")))
+    (_ '0)))

@@ -140,6 +140,13 @@ and no closures, `jit`-like. Experiments on this toolchain (`~/.cache/fibber-scr
 | a macro calling a helper `defun` in a module it `:require`s (`df/diff-form`) | `macro ddx failed: m2.fib:3:22: unbound name df/diff-form` | the macro-time module is the prelude and the macro; **no library function is visible at expansion time**, not even from a required module |
 | a helper that uses `count`, `map`, `conj` (the implicit library) | the same unbound-name error (spec/syntax.md 3.16: the implicit library is not in the macro-time module) | only the prelude's raw operations: `vec-count`, `vec-nth`, `vec-conj`, `match` on `Form`, `loop/recur` |
 
+**Since MACRO-NS (2026-10-06, docs/design/macro-names.md)** the first two rows are lifted: a macro may call functions of the modules its
+module requires or uses at expansion time (spec/syntax.md 3.16 "Macro-time helpers"), so the walker is a helper `defun` that recurses by name,
+and a macro's template resolves names in the macro's module. Case `cases/stdlib/7933` is the `ddx` experiment, now passing: a derivative
+macro over `+` and `*` that calls a recursive helper of a required module. The implicit library is still not in the macro-time module
+unless the macro's module (or a module it requires) `:use`s it by name. The verdict below on the source-to-source design is unchanged: the
+limits that remain are types, shapes and interprocedural differentiation, not names.
+
 What the expander does offer: macros receive and return `Form` (`Sym Kw Int Flt Str Chr Bool Nil List Vec Map`); quasiquote and `gensym`; expansion is
 outermost first and **before name resolution and typing**; `(call-pos)`. What that forbids, concretely:
 

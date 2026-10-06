@@ -4,11 +4,11 @@
 ;; values. A failed `expect` is a `Broke` value in that list, never a trap; a trap is the run's own and is isolated by fib.test.run.
 ;;
 ;; `given`, `upon` and `then` are not macros: `scenario` reads them as steps (`when` is the library's own macro, hence `upon`; the report
-;; prints it as `When`). `expect` is read by `then` the same way. The macros call fib.test.form at expansion time.
-(ns fib.test.core (:use fib.core fib.seq fib.coll fib.print))
+;; prints it as `When`). `expect` is read by `then` the same way. `scenario` calls fib.test.form at expansion time.
+(ns fib.test.core (:use fib.core fib.seq fib.coll fib.print) (:require [fib.test.form :as f]))
 
 ;; ---- printing the source of a step: the macros quote its forms and these print them at run time, so the text of `(expect = 3 (f x))` reaches
-;; the report as written (a macro of stage 2 sees the prelude only, never a library function: macros/runner.fib) ----
+;; the report as written ----
 
 (defun join-forms :private (xs: (Vec Form) from: i64) -> str
   (loop ((i from) (out ""))
@@ -122,83 +122,16 @@
 (defun contract-suite (head: str impl: str scs: (Vec Scenario)) -> Suite
   (Suite head impl (in-feature head scs)))
 
-;; ---- the macros: prelude names only (macros/runner.fib), no helper functions, so each step's code is built inline ------------------
+;; ---- the macros. Their templates name this module's functions bare: a template resolves in the module that defines the macro (syntax
+;; §3.16 "Names in a template"). `scenario` builds its steps with fib.test.form's functions, at expansion time ("Macro-time helpers").
 
 ;; (scenario "text" step ..): a Scenario. A step is (given [b e ..]) or (upon [b e ..]), whose bindings hold for the steps after it,
 ;; (then item ..) where an item is (expect rel expected actual) or a boolean form, (covers "row" ..) or (id "x").
 (defmacro scenario (text ... steps)
   (let ((log (gensym "log"))
         (seed (gensym "seed")))
-    (let ((body (loop ((i (- (vec-count steps) 1)) (acc `(fib.test.core/rec-steps ~log)))
-                  (if (< i 0)
-                      acc
-                      (match (vec-nth steps i)
-                        ((List items)
-                         (match (vec-nth items 0)
-                           ((Sym h)
-                            (cond (= h "given")
-                                    (recur (- i 1) `(do (fib.test.core/note ~log "Given" (fib.test.core/given-line (quote ~(vec-nth items 1))))
-                                                        (let ~(vec-nth items 1) ~acc)))
-                                  (= h "upon")
-                                    (recur (- i 1) `(do (fib.test.core/note ~log "When" (fib.test.core/upon-line (quote ~(vec-nth items 1))))
-                                                        (let ~(vec-nth items 1) ~acc)))
-                                  (= h "then")
-                                    (recur (- i 1)
-                                           (loop ((j (- (vec-count items) 1)) (o acc))
-                                             (if (> j 0)
-                                                 (recur (- j 1)
-                                                        (match (vec-nth items j)
-                                                          ((List xs)
-                                                           (match (vec-nth xs 0)
-                                                             ((Sym r)
-                                                              (if (= r "expect")
-                                                                  `(do (~(vec-nth items j) ~log) ~o)
-                                                                  `(do (fib.test.core/judge-true ~log (fib.test.core/then-line (quote ~(vec-nth items j))) (call-pos) ~(vec-nth items j)) ~o)))
-                                                             (_ `(do (fib.test.core/judge-true ~log (fib.test.core/then-line (quote ~(vec-nth items j))) (call-pos) ~(vec-nth items j)) ~o))))
-                                                          (x `(do (fib.test.core/judge-true ~log (fib.test.core/then-line (quote ~x)) (call-pos) ~x) ~o))))
-                                                 o)))
-                                  :else (recur (- i 1) acc)))
-                           (_ (recur (- i 1) acc))))
-                        (_ (recur (- i 1) acc))))))
-          (plan (loop ((i 0) (out (vec-empty)))
-                  (if (< i (vec-count steps))
-                      (recur (+ i 1)
-                             (match (vec-nth steps i)
-                               ((List items)
-                                (match (vec-nth items 0)
-                                  ((Sym h)
-                                   (cond (= h "given") (vec-conj out `(fib.test.core/given-line (quote ~(vec-nth items 1))))
-                                         (= h "upon") (vec-conj out `(fib.test.core/upon-line (quote ~(vec-nth items 1))))
-                                         (= h "then") (loop ((j 1) (o out))
-                                                        (if (< j (vec-count items))
-                                                            (recur (+ j 1) (vec-conj o `(fib.test.core/then-line (quote ~(vec-nth items j)))))
-                                                            o))
-                                         :else out))
-                                  (_ out)))
-                               (_ out)))
-                      out)))
-          (covers (loop ((i 0) (out (vec-empty)))
-                    (if (< i (vec-count steps))
-                        (recur (+ i 1)
-                               (match (vec-nth steps i)
-                                 ((List items)
-                                  (match (vec-nth items 0)
-                                    ((Sym h) (if (= h "covers")
-                                                 (loop ((j 1) (o out)) (if (< j (vec-count items)) (recur (+ j 1) (vec-conj o (vec-nth items j))) o))
-                                                 out))
-                                    (_ out)))
-                                 (_ out)))
-                        out)))
-          (ident (loop ((i 0) (out text))
-                   (if (< i (vec-count steps))
-                       (recur (+ i 1)
-                              (match (vec-nth steps i)
-                                ((List items)
-                                 (match (vec-nth items 0) ((Sym h) (if (= h "id") (vec-nth items 1) out)) (_ out)))
-                                (_ out)))
-                       out))))
-      `[(fib.test.core/Scenario (fib.test.core/slugify ~ident) ~text [~@covers] [~@plan]
-          (fn (~seed) (let ((~log (fib.test.core/new-rec))) ~body)) (call-pos))])))
+    `[(Scenario (slugify ~(f/scenario-ident text steps)) ~text [~@(f/scenario-covers steps)] [~@(f/scenario-plan steps)]
+        (fn (~seed) (let ((~log (new-rec))) ~(f/scenario-body log steps))) (call-pos))]))
 
 ;; (expect rel expected actual): what a `then` of a scenario holds, a function of the scenario's log, so that `(call-pos)` here is the position of the
 ;; `expect` as the author wrote it (a macro's template carries the position of the macro call, syntax §1.3) and a failure prints `file:line:col`. `scenario`
@@ -206,7 +139,7 @@
 (defmacro expect (rel expected actual)
   (let ((e (gensym "e")) (a (gensym "a")) (r (gensym "r")))
     `(fn (~r) (let ((~e ~expected) (~a ~actual))
-                (fib.test.core/judge ~r (fib.test.core/then-line (quote (expect ~rel ~expected ~actual))) (call-pos)
+                (judge ~r (then-line (quote (expect ~rel ~expected ~actual))) (call-pos)
                                      (~rel ~e ~a) (pr-str ~e) (pr-str ~a))))))
 
 ;; (outline "text" [a b] [[1 2] [3 4]] step ..): a scenario outline (Gherkin's Scenario Outline, a table of examples): one scenario for
@@ -216,14 +149,14 @@
     ((Vec ns)
      (match rows
        ((Vec rs)
-        `(fib.test.core/flat
+        `(flat
            [~@(loop ((i 0) (out (vec-empty)))
                 (if (< i (vec-count rs))
                     (recur (+ i 1)
                            (vec-conj out
                              (match (vec-nth rs i)
                                ((Vec vs)
-                                `(scenario (str ~text " #" ~(Int (+ i 1) :i64) " " (fib.test.core/form-text (quote ~(vec-nth rs i))))
+                                `(scenario (str ~text " #" ~(Int (+ i 1) :i64) " " (form-text (quote ~(vec-nth rs i))))
                                    (given ~(Vec (loop ((j 0) (b (vec-empty)))
                                                   (if (< j (vec-count ns)) (recur (+ j 1) (vec-conj (vec-conj b (vec-nth ns j)) (vec-nth vs j))) b))))
                                    ~@steps))
@@ -234,22 +167,22 @@
 
 ;; (feature "name" scenario ..): a Suite of scenarios with no implementation.
 (defmacro feature (name ... scenarios)
-  `(fib.test.core/feature-suite ~name (fib.test.core/flat [~@scenarios])))
+  `(feature-suite ~name (flat [~@scenarios])))
 
 ;; (defcontract Name [make ..] scenario ..): a function from the implementation's constructors to the contract's scenarios. Its
 ;; parameters are what the scenarios build the implementation from, usually one factory `make`; their types are inferred, so the
 ;; contract is generic over them and each use is monomorphised (design §2).
 (defmacro defcontract (name params ... scenarios)
   (match params
-    ((Vec ps) `(defun ~name ~(List ps) (fib.test.core/flat [~@scenarios])))
+    ((Vec ps) `(defun ~name ~(List ps) (flat [~@scenarios])))
     (_ (trap "defcontract: the parameters are a vector"))))
 
 ;; (implements Contract "impl-name" arg ..): the Suite of the contract's scenarios against one implementation.
 (defmacro implements (name impl ... args)
   (match name
-    ((Sym s) `(fib.test.core/contract-suite ~(Str s) ~impl (~name ~@args)))
+    ((Sym s) `(contract-suite ~(Str s) ~impl (~name ~@args)))
     (_ (trap "implements: the contract is a name"))))
 
 ;; (defspecs name suite ..): `(name)` is every suite of the file, the list `fibc test` runs.
 (defmacro defspecs (name ... suites)
-  `(defun ~name () -> (Vec fib.test.core/Suite) [~@suites]))
+  `(defun ~name () -> (Vec Suite) [~@suites]))

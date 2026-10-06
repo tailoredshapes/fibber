@@ -1,15 +1,17 @@
-;; fib.sql: SQL as data, HoneySQL 2's shape (docs/design/observability-and-databases.md 5). Explicit: `(:use fib.sql)` (the templates
-;; name `fib.sql/..`, design 5.3).
+;; fib.sql: SQL as data, HoneySQL 2's shape (docs/design/observability-and-databases.md 5). Explicit: `(:require [fib.sql :as sql])`,
+;; as HoneySQL is required (`[honey.sql :as sql]`); the macros' templates name this library's functions bare, and a template resolves in
+;; the module that defines the macro (syntax §3.16 "Names in a template"), so the alias is all a module needs.
 ;;
-;;   (format (sql {:select [:a [:b :bee]] :from [:t] :where [:and [:= :id id] [:> :n 3]] :order-by [[:n :desc]] :limit 10}))
+;;   (sql/format (sql/sql {:select [:a [:b :bee]] :from [:t] :where [:and [:= :id id] [:> :n 3]] :order-by [[:n :desc]] :limit 10}))
 ;;     => (Query "SELECT a, b AS bee FROM t WHERE (id = ?) AND (n > ?) ORDER BY n DESC LIMIT ?" [(DInt id) (DInt 3) (DInt 10)])
-;;   (execute! conn (format q))                                     ; fib.db
-;;   (-> (select :a :b) (from :t) (where [:= :id 1]) format)        ; the helpers build the same value
-;;   (format-with q :ansi)                                          ; quoted identifiers: :ansi (PostgreSQL, SQLite) or :mysql
+;;   (db/execute! conn (sql/format q))                                  ; fib.db
+;;   (-> (sql/select :a :b) (sql/from :t) (sql/where [:= :id 1]) sql/format)   ; the helpers build the same value
+;;   (sql/format-with q :ansi)                                          ; quoted identifiers: :ansi (PostgreSQL, SQLite) or :mysql
 ;;
 ;; `sql` turns literal data into a `SqlV` at compile time: keywords are identifiers and operators, numbers and strings are parameters, a
-;; symbol or a call is a run-time value (`->sqlv`: a `SqlV`, so queries compose, or any ToDatum value, as a parameter). `format` here
-;; shadows the implicit fib.print `format` in a module that `:use`s fib.sql (design 5.3); `fib.print/format` still names that one.
+;; symbol or a call is a run-time value (`->sqlv`: a `SqlV`, so queries compose, or any ToDatum value, as a parameter). Through the alias
+;; `sql/format` leaves the implicit fib.print `format` alone; a module that `:use`s fib.sql (which still works) gets this `format`
+;; instead, and `fib.print/format` still names that one.
 (ns fib.sql (:export-from fib.datum fib.sql.data fib.sql.format) (:use fib.core fib.seq fib.coll fib.datum fib.sql.data fib.sql.format)
   (:require [fib.db.core :as db]))
 
@@ -29,7 +31,7 @@
                                                              ((Kw k) `(Pair ~(Str k) (sql ~(vec-nth xs (+ i 1)))))
                                                              (_ (trap "sql: a clause name is a keyword")))))
                               out))]))
-    (_ `(fib.sql/->sqlv ~x))))
+    (_ `(->sqlv ~x))))
 
 (defun dialect-of (name: keyword) -> Dialect
   (cond (= name :mysql) (Dialect "`") (= name :none) (Dialect "") :else (Dialect "\"")))
@@ -48,14 +50,14 @@
 (defmacro select (... args) `(helper-add "select" ~@args))
 (defmacro from (... args) `(helper-add "from" ~@args))
 (defmacro order-by (... args) `(helper-add "order-by" ~@args))
-(defmacro where (q c) `(fib.sql/add-where ~q (sql ~c)))
-(defmacro limit (q n) `(fib.sql/with-clause ~q "limit" (sql ~n)))
+(defmacro where (q c) `(add-where ~q (sql ~c)))
+(defmacro limit (q n) `(with-clause ~q "limit" (sql ~n)))
 
 (defmacro helper-add (name ... args)
   (let ((fresh (if (> (vec-count args) 0)
                    (match (vec-nth args 0) ((Kw _) true) ((Vec _) true) (_ false))
                    true))
         (start (if fresh 0 1)))
-    `(fib.sql/add-to-clause ~(if fresh `fib.sql/QNil (vec-nth args 0)) ~name
+    `(add-to-clause ~(if fresh `QNil (vec-nth args 0)) ~name
        [~@(loop ((i start) (out (vec-empty)))
             (if (< i (vec-count args)) (recur (+ i 1) (vec-conj out `(sql ~(vec-nth args i)))) out))])))

@@ -1,5 +1,6 @@
 ;; fib.db: database access in next.jdbc's shape over JDBC-like protocols (docs/design/observability-and-databases.md 4). Explicit:
-;; `(:use fib.db)` (the macros' templates name `fib.db/..`, which resolves in a module that `:use`s this one; design 5.3).
+;; `(:require [fib.db :as db])` then `db/execute!` (a `:use` works too): the macros' templates name this library's functions bare, and
+;; a template resolves in the module that defines the macro (syntax §3.16 "Names in a template").
 ;;
 ;;   (match (open-sqlite ":memory:") ((Ok conn) ..) ((Err e) ..))           ; a driver's open: fib.db.sqlite
 ;;   (execute! conn ["select * from t where id = ?" id])                     ; (Result (Vec (Map str Datum)) DbError)
@@ -15,23 +16,23 @@
 (defmacro execute! (conn q)
   (match q
     ((Vec items)
-     `(fib.db/execute-query ~conn
-        (fib.db/Query ~(vec-nth items 0)
+     `(execute-query ~conn
+        (Query ~(vec-nth items 0)
           [~@(loop ((i 1) (out (vec-empty)))
-               (if (< i (vec-count items)) (recur (+ i 1) (vec-conj out `(fib.db/->datum ~(vec-nth items i)))) out))])))
-    (_ `(fib.db/execute-query ~conn ~q))))
+               (if (< i (vec-count items)) (recur (+ i 1) (vec-conj out `(->datum ~(vec-nth items i)))) out))])))
+    (_ `(execute-query ~conn ~q))))
 
 (defmacro execute-one! (conn q)
   (match q
     ((Vec items)
-     `(fib.db/execute-one-query ~conn
-        (fib.db/Query ~(vec-nth items 0)
+     `(execute-one-query ~conn
+        (Query ~(vec-nth items 0)
           [~@(loop ((i 1) (out (vec-empty)))
-               (if (< i (vec-count items)) (recur (+ i 1) (vec-conj out `(fib.db/->datum ~(vec-nth items i)))) out))])))
-    (_ `(fib.db/execute-one-query ~conn ~q))))
+               (if (< i (vec-count items)) (recur (+ i 1) (vec-conj out `(->datum ~(vec-nth items i)))) out))])))
+    (_ `(execute-one-query ~conn ~q))))
 
 ;; (with-transaction [tx conn] body ..): the body sees the connection as `tx` and returns a Result; Ok commits, Err rolls back.
 (defmacro with-transaction (spec ... body)
   (match spec
-    ((Vec items) `(fib.db/transact ~(vec-nth items 1) (fn (~(vec-nth items 0)) (do ~@body))))
+    ((Vec items) `(transact ~(vec-nth items 1) (fn (~(vec-nth items 0)) (do ~@body))))
     (_ (trap "with-transaction: the spec is [tx conn]"))))

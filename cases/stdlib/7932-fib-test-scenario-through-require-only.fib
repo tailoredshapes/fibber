@@ -1,0 +1,38 @@
+;; spec: syntax §3.16 (Names in a template, Macro-time helpers); docs/design/macro-names.md; docs/design/test-harness.md 1
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; fib.test's `scenario` through `(:require [fib.test.core :as t])` alone. The macro builds its steps with fib.test.form's functions at
+;; expansion time (before: `scenario` was one long function, as a macro could call no library function), and its template names
+;; `Scenario`, `slugify` and `new-rec` bare; the site defines its own `slugify` and binds a local `new-rec`, which capture nothing.
+;; The id, the plan, the covered rows and what each step came to, run with the scenario's own closure. Before the rule:
+;; `unbound name Scenario` at the site.
+(ns main (:use tl.check) (:require [fib.test.core :as t]))
+
+(defun slugify (s: str) -> str "wrong")
+
+(defun held? (r: t/StepRun) -> bool
+  (match (. r judged) ((t/Held) true) (_ false)))
+
+(defun main () -> i64
+  (let [c (checks)
+        new-rec 3
+        scs (t/scenario "adds two" (given [x 2]) (upon [y (+ x 3)]) (then (= y 5) (= x 2)) (covers "R1" "R2"))
+        named (t/scenario "named" (id "the-id") (then (= 1 2)))
+        sc (nth scs 0)
+        runs ((. sc run) 1)
+        bad ((. (nth named 0) run) 1)]
+    (do (check c (= (count scs) 1))
+        (check c (= (. sc id) "adds-two"))
+        (check c (= (. sc steps) ["Given x = 2" "When y = (+ x 3)" "Then (= y 5)" "Then (= x 2)"]))
+        (check c (= (. sc covers) ["R1" "R2"]))
+        (check c (= (count runs) 4))
+        (check c (held? (nth runs 2)))
+        (check c (held? (nth runs 3)))
+        (check c (= (. (nth named 0) id) "the-id"))
+        (check c (not (held? (nth bad 0))))
+        (check c (= new-rec 3))
+        (check c (= (slugify "x") "wrong"))
+        (checks-result c))))
