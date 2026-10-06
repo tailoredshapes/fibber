@@ -26,6 +26,13 @@
   (let ((r (g/fma-reference a b)))
     (and (same? (g/multiply-at a b (w8)) r) (same? (g/multiply-at a b (w16)) r))))
 
+;; the fused epilogue equals act(product + bias) computed outside the kernel, bit for bit, for identity (7) and relu (6): the bias and the activation
+;; are applied once per output, after the last inner block, whatever the width (the other activations are compared across widths only: their reference would be this library's own)
+(defun reference-fused? (a: (t/Tensor f32) b: (t/Tensor f32) bias: (t/Tensor f32) code: i64) -> bool
+  (let ((plain (t/add (g/multiply-at a b (w16)) bias)))
+    (let ((want (if (= code 7) plain (t/relu plain))))
+      (and (same? (g/multiply-with-at a b bias code (w8)) want) (same? (g/multiply-with-at a b bias code (w16)) want)))))
+
 ;; the fused epilogue with activation `code` at both widths
 (defun fused-agrees? (a: (t/Tensor f32) b: (t/Tensor f32) bias: (t/Tensor f32) code: i64) -> bool
   (same? (g/multiply-with-at a b bias code (w8)) (g/multiply-with-at a b bias code (w16))))
@@ -46,6 +53,11 @@
               (dotimes (ki (count ks))
                 (let ((m (nth ms mi)) (n (nth ns ni)) (k (nth ks ki)))
                   (check c (fused-agrees? (mat m k 4) (mat k n 5) (gen n 6) (v/activation-code :relu))))))))
+        ;; two inner blocks (513 and 700 steps of 512): the epilogue once, after the last
+        (let ((a (mat 13 700 1)) (b (mat 700 70 2)) (bias (gen 70 3)))
+          (do (check c (reference-fused? a b bias 7)) (check c (reference-fused? a b bias 6))))
+        (let ((a (mat 7 513 4)) (b (mat 513 65 5)) (bias (gen 65 6)))
+          (do (check c (reference-fused? a b bias 7)) (check c (reference-fused? a b bias 6))))
         ;; a second column block, strided operands and a stepped bias
         (let ((a (mat 5 9 3)) (b (mat 9 1100 4))) (check c (product-agrees? a b)) (check c (fused-agrees? a b (gen 1100 5) 5)))
         (let ((a (mat 19 23 5)) (b (mat 23 21 6)) (at (t/transpose (mat 23 19 5))) (bt (t/transpose (mat 21 23 6))) (bias (gen 21 8)))
@@ -58,5 +70,5 @@
         (let ((a (mat 40 300 1)) (b (mat 300 40 2)))
           (do (check c (not (same? (g/multiply-at a b (w16)) (t/mmul-scalar a b))))
               (check c (not (same? (g/multiply-with-at a b (gen 40 3) 7 (w16)) (g/multiply-at a b (w16)))))))
-        (check c (= (checks-made c) 1015))
+        (check c (= (checks-made c) 1019))
         (checks-result c))))

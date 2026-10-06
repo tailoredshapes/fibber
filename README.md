@@ -81,6 +81,12 @@ x86-64-v3 (`x86-64`, `x86-64-v2`) still builds, but it is outside the supported 
 `fibc targets` lists the code generation targets and which are supported; riscv64 is parked
 (LLVM has no `tailcc` for RISC-V) and `fibc build --target` refuses it without `--allow-unsupported`.
 
+**Vector width (AVX-512).** `f64xn`, `:native` and `(native-lanes T)` stand for the width the CPU table prefers: 256 bits for every AVX2 CPU, 512 for
+`x86-64-v4`, Sapphire Rapids, Granite Rapids and Zen 4/5 (`compiler/types/targets.fib`; Skylake-X and the client AVX-512 cores stay at 256). The numeric library
+(`fib.tensor`) is written over that width: on a host with AVX-512, a program built for the host gets 512-bit kernels (1.6 to 1.7 times the matmul and dense-layer speed on
+Sapphire Rapids, 10 percent on Zen 4: docs/shootout/avx512-2026-10-06.md); a release binary built for `x86-64-v3` keeps the 256-bit ones. `FIB_VECTOR_BITS=128|256|512`
+overrides the width for one run (a width the CPU lacks is split into the registers it has: correct, slower). Design: docs/design/avx512.md.
+
 ## Catching traps
 
 A trap (an index out of range, an integer overflow, `(trap msg)`, `unwrap` of `nil`) aborts the program unless a
