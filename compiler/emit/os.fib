@@ -1,5 +1,5 @@
 ;; Adapt the frozen seed runtime at its boundary without changing the Rust seed.
-(ns emit.os (:use fib.core fib.seq fib.coll))
+(ns emit.os (:use fib.core fib.seq fib.coll) (:require [types.targets :as tt]))
 (defun replace :private (text: str old: str new: str) -> str
   (loop [offset 0 parts: (Vec str) []]
     (match (str-find text old offset)
@@ -15,8 +15,17 @@
     "(declare pthread_getspecific ptr (i32))" "(declare pthread_getspecific ptr (i64))")
     "(load i32 @fib.task-key)" "(load i64 @fib.task-key)")
     "(load i32 @fib.exc-key)" "(load i64 @fib.exc-key)"))
+;; Whether the code is for a musl Linux (a row of types.targets whose libc is musl: `--static`, docs/design/static-linking.md). musl has no mallopt: its
+;; allocator already gives every block of 128 KiB or more its own mapping (the threshold the large-block cache pins glibc's to), so the call is dropped.
+(defun musl? :private () -> bool
+  (match (sys-getenv "FIB_TARGET_TRIPLE")
+    (nil false)
+    ((some t) (and (not (= t "")) (= (. (tt/target-row-of-triple t) libc) "musl")))))
 (defun sys-for (platform: str text: str) -> str
-  (if (= platform "Linux") text
+  (if (= platform "Linux")
+    (if (musl?)
+      (replace (replace text "(declare mallopt i32 (i32 i32))\n" "") "(call @mallopt (i32 -3) (i32 131072))" "(add (i32 0) (i32 0))")
+      text)
     (if (= platform "Darwin")
       ;; _SC_NPROCESSORS_ONLN: 84 on glibc, 58 on Darwin (the pool's worker count);
       ;; the large-block cache (rt/alloc.lir): malloc_size for malloc_usable_size, CLOCK_MONOTONIC_RAW_APPROX (5) for

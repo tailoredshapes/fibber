@@ -1,0 +1,20 @@
+;; compiler/driver/static.fib: `--static` (docs/design/static-linking.md): the build is for a fully static Linux executable. It is the musl row of the target the build
+;; is for: the host's architecture, or the one `--target` names (`aarch64-unknown-linux-gnu` and `aarch64-unknown-linux-musl` both give the aarch64 musl row).
+;; A target that is not Linux has none. Called once, after the other global flags, by fibc.fib.
+(ns driver.static
+  (:require [driver.native :as native] [llvm.target :as lt]))
+
+;; The architecture of a triple: the text before its first `-`.
+(defun arch-of :private (triple: str) -> str
+  (match (str-find triple "-" 0)
+    ((some i) (str-slice triple 0 i))
+    (nil triple)))
+
+;; Sets FIB_TARGET_TRIPLE to the musl triple when FIB_STATIC is 1 (the flag or the variable). Anything but a Linux target stays as given, and `build` says why it cannot be static.
+(defun apply-static () -> unit
+  (when (= (unwrap-or (native/getenv-opt "FIB_STATIC") "") "1")
+    (let ((given (match (native/getenv-opt "FIB_TARGET_TRIPLE")
+                   (nil (lt/host-triple))
+                   ((some t) (if (or (= t "") (= t "host")) (lt/host-triple) t)))))
+      (native/setenv-set "FIB_TARGET_TRIPLE"
+                         (if (some? (str-find given "linux" 0)) (str (arch-of given) "-unknown-linux-musl") given)))))

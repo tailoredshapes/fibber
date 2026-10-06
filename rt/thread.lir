@@ -10,7 +10,18 @@
 ;; released. Tasks, the run queue and the joins are in task.lir.
 (declare pthread_create i32 (ptr ptr ptr ptr))
 (declare pthread_detach i32 (i64))
+(declare pthread_attr_init i32 (ptr))
+(declare pthread_attr_setstacksize i32 (ptr i64))
+(declare pthread_attr_destroy i32 (ptr))
 (global internal fib.threads-live i32 (i32 0))
+
+;; A thread attribute with the stack size set explicitly (8 MiB: glibc's default from `ulimit -s`; musl's own default is 128 KiB and Darwin's 512 KiB,
+;; too small for the recursion a task may do). The attribute is 56 bytes on LP64 Linux and 64 on Darwin: 128 bytes, in the caller's frame, are enough.
+;; The caller makes room for it and destroys it after pthread_create.
+(define internal (fib.thread-attr i32) ((ptr a))
+  (block entry
+    (call @pthread_attr_init a)
+    (ret (call @pthread_attr_setstacksize a (i64 8388608)))))
 
 ;; Starts entry(task) on a new detached thread and counts it; in trace
 ;; mode writes the T line (compiler.md §4).
@@ -21,7 +32,10 @@
     (store (add (load i32 @fib.threads-live) (i32 1)) @fib.threads-live)
     (call @fib.rq-unlock)
     (let ((handle (alloca i64))
-          (rc (call @pthread_create handle (ptr null) entry task)))
+          (attr (alloca (align 8) i8 (i32 128)))
+          (_a (call @fib.thread-attr attr))
+          (rc (call @pthread_create handle attr entry task)))
+      (call @pthread_attr_destroy attr)
       (br (icmp ne rc (i32 0)) failed started)))
   (block failed
     (call @fib.fatal-c (string "spawn: cannot start a thread"))

@@ -260,6 +260,7 @@
       ((Pair (some name) (some ps))
        (cond (not (= (stx-nth-sym items 3) (some "->"))) (bad-extern form)
              (< (count items) 5) (bad-extern form)
+             (not (extern-lib-ok? form)) (resolve-err (. form pos) "extern option :lib takes a library name, a string: (extern f (T*) -> R :lib \"curl\")")
              :else
               (let ((varargs (some? (find-first (fn (o: Stx) (stx-kw? o "varargs")) (stx-from items 5)))))
                 (try-let ((params (try-collect ps (fn (p: Stx) (extern-scalar g m name p))))
@@ -273,6 +274,26 @@
     (loop ((i 0))
       (cond (>= (+ i 1) (count opts)) -1
             (stx-kw? (nth opts i) "fixed") (match (. (nth opts (+ i 1)) kind) ((SInt v _) v) (_ -1))
+            :else (recur (+ i 1))))))
+
+;; Whether every `:lib` among the options of an extern is followed by a non-empty string.
+(defun extern-lib-ok? (form: Stx) -> bool
+  (let ((opts (stx-from (stx-items form) 5)))
+    (loop ((i 0))
+      (cond (>= i (count opts)) true
+            (stx-kw? (nth opts i) "lib")
+              (if (and (< (+ i 1) (count opts))
+                       (match (. (nth opts (+ i 1)) kind) ((SStr v) (not (= v ""))) (_ false)))
+                  (recur (+ i 2))
+                  false)
+            :else (recur (+ i 1))))))
+
+;; The library of `:lib "NAME"` among the options of an extern (see `ExternDef`), "" when there is none.
+(defun extern-lib (form: Stx) -> str
+  (let ((opts (stx-from (stx-items form) 5)))
+    (loop ((i 0))
+      (cond (>= (+ i 1) (count opts)) ""
+            (stx-kw? (nth opts i) "lib") (match (. (nth opts (+ i 1)) kind) ((SStr v) v) (_ ""))
             :else (recur (+ i 1))))))
 
 ;; ---- impl methods

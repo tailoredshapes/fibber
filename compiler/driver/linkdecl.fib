@@ -1,0 +1,63 @@
+;; compiler/driver/linkdecl.fib: the native libraries a program's modules declare (`(extern f .. :lib "curl")`, spec/syntax.md 3.15) and how `build` links them.
+;; The emitter notes each library of an extern it reaches as a line `;; link-lib: LIB MODULE` of the lIR (emit.program); a module the program does not use, or a
+;; function of one that nothing calls, leaves no line, so no `-l` and no failure for a library the program does not need. The mode of the build decides how a library
+;; is linked: `dynamic` (`-lLIB`, resolved when the program starts), or `static` (`-l:libLIB.a`, the archive bundled into the executable). Per library: `--link LIB=MODE`
+;; (FIB_LINK, a comma-separated list); for all: `--link-mode MODE` (FIB_LINK_MODE); else static in a `--static` build (a static executable has no loader to resolve
+;; anything with) and dynamic in any other.
+(ns driver.linkdecl
+  (:require [driver.native :as native] [fib.string :as s]))
+
+(defstruct LinkLib (name: str module: str))
+
+(def marker: str ";; link-lib: ")
+
+;; The libraries the lIR text declares, each once, in the order first reached.
+(defun declared-libs (lir: str) -> (Vec LinkLib)
+  (loop ((at 0) (out []))
+    (match (str-find lir marker at)
+      (nil out)
+      ((some i) (let ((from (+ i (str-len marker)))
+                      (end (unwrap-or (str-find lir "\n" from) (str-len lir))))
+                  (let ((words (s/split (str-slice lir from end) " ")))
+                    (recur end (if (and (>= (count words) 2) (not-any? (fn (l: LinkLib) (= (. l name) (nth words 0))) out))
+                                   (conj out (LinkLib (nth words 0) (nth words 1)))
+                                   out))))))))
+
+;; The mode asked for `lib`: its own (`--link LIB=MODE`), else the build's, else nil.
+(defun mode-asked :private (lib: str) -> (Option str)
+  (let ((own (first (filter (fn (w: str) (starts-with? w (str lib "="))) (s/split (unwrap-or (native/getenv-opt "FIB_LINK") "") ",")))))
+    (match own
+      ((some w) (some (str-slice w (+ (str-len lib) 1) (str-len w))))
+      (nil (match (native/getenv-opt "FIB_LINK_MODE")
+             ((some m) (if (= m "") nil (some m)))
+             (nil nil))))))
+
+(defun static-build? () -> bool
+  (= (unwrap-or (native/getenv-opt "FIB_STATIC") "") "1"))
+
+;; The mode of `lib`: static or dynamic, or the reason it cannot be.
+(defun mode-of (l: LinkLib) -> (Result str str)
+  (let ((asked (mode-asked (. l name))))
+    (cond (and (some? asked) (not (some? (find-first (fn (y: str) (= y (unwrap-or asked ""))) ["static" "dynamic"]))))
+            (Err (str "fibc: --link: the mode of " (. l name) " is static or dynamic, not " (unwrap-or asked "")))
+          (and (static-build?) (= (unwrap-or asked "static") "dynamic"))
+            (Err (str "fibc: module " (. l module) " needs the native library " (. l name) ", asked dynamic, but a --static executable has no dynamic loader: link it static (--link "
+                      (. l name) "=static, with lib" (. l name) ".a on -L) or leave it out of the program"))
+          :else (Ok (unwrap-or asked (if (static-build?) "static" "dynamic"))))))
+
+;; The `-l` words for the libraries: `LIB` (dynamic) or `:libLIB.a` (static), the first failure otherwise.
+(defun lib-words (ls: (Vec LinkLib)) -> (Result (Vec str) str)
+  (loop ((i 0) (out []))
+    (if (>= i (count ls))
+        (Ok out)
+        (match (mode-of (nth ls i))
+          ((Err m) (Err m))
+          ((Ok mode) (recur (+ i 1) (conj out (if (= mode "static") (str ":lib" (. (nth ls i) name) ".a") (. (nth ls i) name)))))))))
+
+;; A failed link's text with what a declaration can add: for each declared library the linker could not find (`cannot find -lLIB`, `-l:libLIB.a`), the module that needs it.
+(defun explain-failure (m: str ls: (Vec LinkLib)) -> str
+  (let ((missing (filter (fn (l: LinkLib) (or (some? (str-find m (str "cannot find -l" (. l name)) 0)) (some? (str-find m (str "cannot find -l:lib" (. l name) ".a") 0)))) ls)))
+    (if (empty? missing)
+        m
+        (str m (str-join (mapv (fn (l: LinkLib) (str "\nfibc: module " (. l module) " needs the native library " (. l name) " (declared by `:lib \"" (. l name) "\"` on its externs): not found; "
+                                                   "install it (the development package: lib" (. l name) ".so for a dynamic link, lib" (. l name) ".a for --link " (. l name) "=static or --static) or give its directory with -L DIR")) missing))))))

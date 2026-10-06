@@ -1,0 +1,127 @@
+;; compiler/native/linkstatic.fib: the static link of `fibc build --static` (docs/design/static-linking.md). The object is linked with the system's `ld` (or an aarch64 `ld`
+;; for a cross build) against the musl pieces, not with `cc`: no libc of the build machine is read, so the result runs where nothing is installed.
+;;   LD -static -nostdlib -o OUT crt1.o crti.o OBJ [fibshim.o] [-LDIR..] [-lNAME..] --start-group libc.a libgcc.a --end-group crtn.o
+;; The pieces (`crt1.o crti.o crtn.o libc.a libgcc.a`, and `fibshim.o` on x86-64) are built by scripts/build-musl.sh from a pinned musl source, and found in
+;; $FIB_MUSL_DIR/ARCH (or $FIB_MUSL_DIR itself), else share/fibber/musl/ARCH beside the compiler (the release tarball's). The linker is $FIB_STATIC_LD, else `ld`
+;; for x86-64 and the first of `aarch64-linux-gnu-ld`, `ld.lld`, `ld.bfd`... for aarch64, found on PATH. Neither is a dependency of an ordinary build: each missing
+;; piece is an error that says what to do.
+
+(ns native.linkstatic
+  (:use native.error native.link)
+  (:require [llvm.ffi :as ffi] [types.targets :as tt]))
+
+(extern getenv :private (ptr) -> ptr)
+(extern access :private (ptr i32) -> i32)
+(extern readlink :private (ptr ptr i64) -> i64)
+
+(defun env-opt :private (name: str) -> (Option str)
+  (let ((k (ffi/bytes-new name))
+        (at (unsafe (ffi/ptr->addr (getenv k)))))
+    (do (ffi/free-addr (ffi/ptr->addr k))
+        (if (= at 0) nil (some (ffi/c-string-at at))))))
+
+;; Whether `path` can be read (access R_OK).
+(defun readable? :private (path: str) -> bool
+  (let ((p (ffi/bytes-new path)))
+    (let ((r (unsafe (access p 4i32))))
+      (do (ffi/free-addr (ffi/ptr->addr p)) (= r 0i32)))))
+
+;; Whether `path` can be executed (access X_OK).
+(defun executable? :private (path: str) -> bool
+  (let ((p (ffi/bytes-new path)))
+    (let ((r (unsafe (access p 1i32))))
+      (do (ffi/free-addr (ffi/ptr->addr p)) (= r 0i32)))))
+
+;; The directory of `path` without its last `/` ("" when there is none).
+(defun dirname :private (path: str) -> str
+  (loop ((i (- (str-len path) 1)))
+    (cond (< i 0) ""
+          (= (str-byte-at path i) 47i8) (str-slice path 0 i)
+          :else (recur (- i 1)))))
+
+;; The path of this executable (readlink /proc/self/exe), or nil.
+(defun self-path :private () -> (Option str)
+  (let ((p (ffi/bytes-new "/proc/self/exe"))
+        (buf (unsafe (alloc 4097))))
+    (let ((n (unsafe (readlink p buf 4096))))
+      (do (ffi/free-addr (ffi/ptr->addr p))
+          (if (> n 0)
+              (let ((s (unsafe (do (store-i8 (ptr+ buf n) 0i8) (ffi/c-string-at (ffi/ptr->addr buf))))))
+                (do (unsafe (free buf)) (some s)))
+              (do (unsafe (free buf)) nil))))))
+
+;; The words of a PATH-style text split at `:`.
+(defun split-path :private (text: str) -> (Vec str)
+  (loop ((i 0) (start 0) (out []))
+    (cond (>= i (str-len text)) (conj out (str-slice text start (str-len text)))
+          (= (str-byte-at text i) 58i8) (recur (+ i 1) (+ i 1) (conj out (str-slice text start i)))
+          :else (recur (+ i 1) start out))))
+
+;; The first executable `name` on PATH, as a path, or nil.
+(defun which :private (name: str) -> (Option str)
+  (first (filter executable? (mapv (fn (d: str) (str d "/" name)) (split-path (unwrap-or (env-opt "PATH") ""))))))
+
+;; The directories the musl pieces of `arch` are looked for in, in order.
+(defun musl-dirs :private (arch: str) -> (Vec str)
+  (let ((given (match (env-opt "FIB_MUSL_DIR") (nil []) ((some d) [(str d "/" arch) d])))
+        (shipped (match (self-path) (nil []) ((some p) [(str (dirname (dirname p)) "/share/fibber/musl/" arch)]))))
+    (into given shipped)))
+
+(defun joined :private (sep: str xs: (Vec str)) -> str
+  (reduce (fn (acc: str x: str) (if (= acc "") x (str acc sep x))) "" xs))
+
+(def pieces: (Vec str) ["crt1.o" "crti.o" "crtn.o" "libc.a" "libgcc.a"])
+
+(defun complete? :private (dir: str) -> bool
+  (every? (fn (f: str) (readable? (str dir "/" f))) pieces))
+
+;; The directory holding the musl pieces of `arch`, or the error that says how to get them.
+(defun musl-dir (arch: str) -> (Result str str)
+  (let ((dirs (musl-dirs arch)))
+    (match (first (filter complete? dirs))
+      ((some d) (Ok d))
+      (nil (Err (str "--static needs the musl pieces for " arch " (" (joined " " pieces) "), not found in "
+                     (if (empty? dirs) "FIB_MUSL_DIR (unset) or share/fibber/musl/" (joined ", " dirs))
+                     ": build them with scripts/build-musl.sh " arch " DIR and set FIB_MUSL_DIR=DIR, or use a fibc release that ships them (docs/design/static-linking.md)"))))))
+
+;; The linker for `arch`: $FIB_STATIC_LD, else the first found of the names for the architecture.
+(defun static-linker (arch: str) -> (Result str str)
+  (let ((names (if (= arch "aarch64") ["aarch64-linux-gnu-ld" "aarch64-linux-gnu-ld.bfd" "ld.lld" "ld.gold"] ["ld" "ld.lld" "ld.bfd"])))
+    (match (env-opt "FIB_STATIC_LD")
+      ((some l) (Ok l))
+      (nil (match (first (keep which names))
+             ((some l) (Ok l))
+             (nil (Err (str "--static for " arch " needs a linker for it on PATH (one of " (joined ", " names) "; for aarch64 from an x86-64 machine: binutils-aarch64-linux-gnu or lld) "
+                            "or FIB_STATIC_LD naming one"))))))))
+
+(defun keep :private (f: (fn (str) (Option str)) xs: (Vec str)) -> (Vec str)
+  (reduce (fn (acc: (Vec str) x: str) (match (f x) ((some y) (conj acc y)) (nil acc))) [] xs))
+
+;; The linker's arguments after its own name: see the top. `dirs` are the `-L` directories, `libs` the words after `-l`.
+(defun static-args (obj: str out: str dir: str arch: str dirs: (Vec str) libs: (Vec str)) -> (Vec str)
+  (let ((shim (if (readable? (str dir "/fibshim.o")) [(str dir "/fibshim.o")] []))
+        (ld-dirs (mapv (fn (d: str) (str "-L" d)) dirs))
+        (ld-libs (mapv (fn (l: str) (str "-l" l)) libs)))
+    (into (into (into (into (into ["-static" "-nostdlib" "-o" out (str dir "/crt1.o") (str dir "/crti.o") obj] shim) ld-dirs) ld-libs)
+                ["--start-group" (str dir "/libc.a") (str dir "/libgcc.a") "--end-group"])
+          [(str dir "/crtn.o")])))
+
+;; Writes the object beside `out` and runs the static linker. (link.fib `link`, for the musl pieces)
+(defun link-static (object: (Array i8) out: str dirs: (Vec str) libs: (Vec str) triple: str) -> (Result unit LairError)
+  (let ((arch (. (tt/target-row-of-triple triple) arch))
+        (obj (object-path out))
+        (errfile (str out ".lair.err")))
+    (match (musl-dir arch)
+      ((Err m) (Err (ErrBackend m)))
+      ((Ok dir)
+       (match (static-linker arch)
+         ((Err m) (Err (ErrBackend m)))
+         ((Ok ld)
+          (match (write-bytes obj object)
+            ((Err m) (Err (ErrBackend m)))
+            ((Ok _) (let ((r (run-cc (into [ld] (static-args obj out dir arch dirs libs)) errfile)))
+                      (do (remove-path obj)
+                          (remove-path errfile)
+                          (match r
+                            ((Err m) (Err (ErrBackend m)))
+                            ((Ok _) (Ok ())))))))))))))
