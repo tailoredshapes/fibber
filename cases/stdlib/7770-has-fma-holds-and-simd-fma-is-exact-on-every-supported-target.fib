@@ -1,0 +1,25 @@
+;; spec:   docs/adr/0008 (supported ISAs have guaranteed tail calls and FMA), types §1.9 (simd/fma, has-fma)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; A supported native target has a fused multiply-add (x86-64 from x86-64-v3, every aarch64), so `(has-fma)` is true wherever the cases run, and
+;; `simd/fma` is one exact rounding on a scalar and on every lane: with a = 1+e, b = 1-e, c = -1 the product 1-e^2 is not a double, so the fused
+;; answer -e^2 differs from the multiply-then-add answer 0. On a target without FMA this program would not run: each simd/fma below is a
+;; compile-time warning and a trap (compiler/tests/driver/no-fma.sh checks that on x86-64 and wasm32).
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (e (fdiv 1.0 1073741824.0)) (e32 (fdiv 1.0f32 8192.0f32)))
+    (do (check c (has-fma))
+        (check c (= (simd/fma (+ 1.0 e) (- 1.0 e) -1.0) (neg (* e e))))
+        (check c (= (simd/fma (+ 1.0f32 e32) (- 1.0f32 e32) -1.0f32) (neg (* e32 e32))))
+        (let ((f (simd/fma (splat f64x4 (+ 1.0 e)) (splat f64x4 (- 1.0 e)) (splat f64x4 -1.0))))
+          (check c (= f (splat f64x4 (neg (* e e))))))
+        (let ((f (simd/fma (splat f32x8 (+ 1.0f32 e32)) (splat f32x8 (- 1.0f32 e32)) (splat f32x8 -1.0f32))))
+          (check c (= f (splat f32x8 (neg (* e32 e32))))))
+        ;; teeth: the unfused answer is a different number, so a simd/fma that were a multiply and an add would fail the checks above
+        (let ((p (checks)))
+          (do (check p (= (+ (* (+ 1.0 e) (- 1.0 e)) -1.0) (neg (* e e)))) (check-detects c p)))
+        (checks-result c))))

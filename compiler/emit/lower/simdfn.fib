@@ -2,13 +2,15 @@
 ;; functions and integer min/max"), the conversions between lane types (6.3), the shuffles and the constants of a vector type:
 ;;   simd/fma simd/muladd simd/sqrt simd/floor simd/ceil simd/trunc simd/round simd/round-even simd/abs simd/min simd/max simd/min-num simd/max-num
 ;;   simd/convert simd/bitcast simd/reverse simd/shuffle simd/lanes simd/kind
-;; `simd/fma` is correctly rounded (one rounding, exactly IEEE `fma`): on a target without FMA hardware it is a libm call per lane. `simd/muladd` is `fmuladd`:
-;; one fused instruction where the target has FMA, a multiply and an add where it has not, so its result may differ in the last bit between targets.
+;; `simd/fma` is correctly rounded (one rounding, exactly IEEE `fma`). On a target without FMA hardware (docs/adr/0008: wasm, or an x86-64 CPU named below
+;; x86-64-v3) it is not emulated and not a libm call: the call site gets a compile-time warning (once, `FILE:LINE:COL: warning: simd/fma has no hardware
+;; support on T; ..`) and lowers to a trap with that message. `simd/muladd` is `fmuladd`: one fused instruction where the target has FMA, a multiply and
+;; an add where it has not, so its result may differ in the last bit between targets; it is the portable one.
 ;; `simd/min` and `simd/max` are the NaN-propagating pair (`fmin`, `fmax`: a NaN operand gives NaN, `-0.0` is below `+0.0`), as the library's `min` and `max`;
 ;; `simd/min-num` and `simd/max-num` are IEEE minNum and maxNum (a NaN operand loses). `simd/abs` of an integer traps on the minimum, as `neg` does.
 ;; `simd/round` is to nearest with ties away from zero, `simd/round-even` ties to even. Memory access to arrays is emit.lower.simdmem.
 (ns emit.lower.simdfn
-  (:use types.ty types.ast emit.value emit.ir emit.program emit.layout emit.lower.cx emit.lower.simd))
+  (:use types.ty types.ast types.decls emit.value emit.ir emit.program emit.layout emit.lower.cx emit.lower.simd))
 
 (defun ty-of :private (x: V) -> LirTy (unwrap-or (v-ty x) LirI64))
 
@@ -44,7 +46,32 @@
       (nil (Err (str-join ["unsupported: " name])))
       ((some op)
        (do (when (and (= name "simd/abs") (not (float-elem? t))) (abs-check cx t (v-text (nth a 0))))
-           (Ok (val cx (str-join ["(" op (str-join (mapv (fn (v: V) (str-concat " " (v-text v))) a)) ")"]) t)))))))
+           (when (and (= name "simd/fma") (not (. (g-target (program-g (. cx p))) has-fma))) (fma-trap cx))
+           (Ok (val cx (str-join ["(" (if (= name "simd/fma") (fma-op cx) op) (str-join (mapv (fn (v: V) (str-concat " " (v-text v))) a)) ")"]) t)))))))
+
+;; ---- simd/fma without FMA hardware (docs/adr/0008)
+
+;; The name of the target in the message: FIB_TARGET_TRIPLE's triple, else the CPU the program is built for.
+(defun fma-target-name :private (cx: LowerCx) -> str
+  (match (sys-getenv "FIB_TARGET_TRIPLE")
+    ((some t) (if (or (= t "") (= t "host")) (. (g-target (program-g (. cx p))) cpu) t))
+    (nil (. (g-target (program-g (. cx p))) cpu))))
+
+(defun fma-message :private (cx: LowerCx) -> str
+  (str-join ["simd/fma has no hardware support on " (fma-target-name cx) "; it traps at run time: use simd/muladd for portable code"]))
+
+;; The instruction of `simd/fma`: `fma` where the target fuses; where it does not, the trap before it has ended the block's live path and the
+;; value is never computed, so `fmuladd` (a multiply and an add, no libm call) stands in for the type's sake.
+(defun fma-op :private (cx: LowerCx) -> str
+  (if (. (g-target (program-g (. cx p))) has-fma) "fma" "fmuladd"))
+
+;; The call site's warning (once per site, in the program's warnings) and an unconditional trap with the same message.
+(defun fma-trap :private (cx: LowerCx) -> unit
+  (let ((m (fma-message cx)))
+    (do (match @(. cx at)
+          ((some e) (g-warn (program-g (. cx p)) (str-join [(pos-text (. e pos)) ": warning: " m])))
+          (nil (g-warn (program-g (. cx p)) (str-join ["warning: " m]))))
+        (lcx-trap-if cx (v-int LirI1 1) m))))
 
 ;; ---- conversions
 

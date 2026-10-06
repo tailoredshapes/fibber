@@ -376,7 +376,7 @@ literal lane index is checked at compile time, a dynamic one traps.
 
 | fibber | meaning | LLVM |
 |---|---|---|
-| `(simd/fma a b c)` | `a*b+c`, one rounding, **exactly** IEEE `fma` | `llvm.fma` (a libm `fma` call on a CPU without FMA: correct, slow) |
+| `(simd/fma a b c)` | `a*b+c`, one rounding, **exactly** IEEE `fma` | `llvm.fma`; on a CPU without FMA a compile-time warning and a trap (docs/adr/0008; it was a libm call, correct and slow) |
 | `(simd/muladd a b c)` | `a*b+c` fused where the target has FMA, multiply then add where not (not bit-identical across targets); `(has-fma)` is the compile-time constant of the target | `llvm.fmuladd` (SC1) |
 | `(simd/bitcast v)` | lanes reinterpreted as the same-width lane type of the context (`f64xN <-> i64xN`, `f32xN <-> i32xN`) | `bitcast` (SC1) |
 | `(simd/sqrt v)` | IEEE `sqrt`, correctly rounded (also the scalar `sqrt` builtin L11, `docs/shootout/gaps.md`) | `llvm.sqrt` |
