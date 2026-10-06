@@ -1,0 +1,182 @@
+;; fib.otel metrics (docs/design/observability-and-databases.md 3.1; package O2): counters, up-down counters, histograms and gauges, exact under 8
+;; concurrent tasks, bucket boundaries, attribute-set canonicalisation, the series limit, cumulative collection, the exporters and the
+;; periodic reader (fast: periods of 10 to 20 ms).
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.parallel)
+  (:require [fib.otel :as otel] [fib.os :as os] [fib.string :as string] [fib.ex :as ex]))
+
+(defun attrs (k: str v: i64) -> (Vec (Pair str otel/Datum)) [(Pair k (otel/->datum v))])
+
+(defun rig () -> otel/MeterProvider (otel/meter-provider (otel/make-resource "spec" [])))
+
+(defun metric-named (ms: (Vec otel/Metric) name: str) -> otel/Metric
+  (let [hit (filter (fn (m: otel/Metric) (= (. m name) name)) ms)] (if (> (count hit) 0) (nth hit 0) (trap (str "no metric " name)))))
+
+(defun sum-points (m: otel/Metric) -> (Vec otel/NumberPoint) (match (. m data) ((otel/SumData ps _) ps) (_ [])))
+(defun hist-points (m: otel/Metric) -> (Vec otel/HistogramPoint) (match (. m data) ((otel/HistogramData ps) ps) (_ [])))
+(defun gauge-points (m: otel/Metric) -> (Vec otel/GaugePoint) (match (. m data) ((otel/GaugeData ps) ps) (_ [])))
+
+(defun value-with (ps: (Vec otel/NumberPoint) k: str v: i64) -> i64
+  (let [hit (filter (fn (p: otel/NumberPoint) (and (= (count (. p attributes)) 1) (= (. (nth (. p attributes) 0) fst) k)
+                                                   (= (otel/as-int (. (nth (. p attributes) 0) snd)) (some v)))) ps)]
+    (if (> (count hit) 0) (. (nth hit 0) value) -1)))
+
+(defun total (ps: (Vec otel/NumberPoint)) -> i64 (reduce (fn (a: i64 p: otel/NumberPoint) (+ a (. p value))) 0 ps))
+
+(defun wait-until (f: (fn () bool) ms: i64) -> bool
+  (loop [i 0] (cond (f) true (>= i ms) false :else (do (os/sleep-ns 1000000) (recur (+ i 1))))))
+
+;; What 8 tasks record in the histogram scenario: task t records t + (i mod 200) for i in 0..999, under attribute t mod 2.
+(defun model-values (g: i64) -> (Vec f64)
+  (vec (mapcat (fn (t: i64) (vec (map (fn (i: i64) (double (+ t (rem i 200)))) (range 0 1000)))) (filter (fn (t: i64) (= (rem t 2) g)) (range 0 8)))))
+
+(defun model-counts (bounds: (Vec f64) vs: (Vec f64)) -> (Vec i64)
+  (vec (map (fn (b: i64) (count (filter (fn (v: f64) (= (otel/bucket-index bounds v) b)) vs))) (range 0 (+ (count bounds) 1)))))
+
+(defstruct BrokenMetricExporter (tries: (Atom i64)))
+(impl otel/MetricExporter BrokenMetricExporter
+  (export-metrics (self ms) (do (swap! (. self tries) (fn (v: i64) (+ v 1))) (trap "metric exporter blew up")))
+  (metric-exporter-flush (self) (Ok ()))
+  (metric-exporter-shutdown (self) (Ok ())))
+
+(defspecs specs
+  (feature "counters"
+    (scenario "8 tasks adding 1000 each give the exact total, per attribute set and overall"
+      (covers "fib.otel counter-add!")
+      (given [p (rig) c (otel/counter (otel/get-meter p "app") "reqs" "{r}" "requests")])
+      (upon [_ (with-tasks [s] (do (dotimes (t 8) (fork s (fn () (dotimes (i 1000) (otel/counter-add! c 1 (attrs "task" t)) (otel/counter-add! c 2 [])))))
+                                   ()))
+             ps (sum-points (metric-named (otel/collect-metrics p) "reqs"))])
+      (then (expect = 9 (count ps)) (expect = 24000 (total ps))
+            (expect = true (every? (fn (t: i64) (= 1000 (value-with ps "task" t))) (range 0 8)))
+            (expect = 16000 (. (nth (filter (fn (q: otel/NumberPoint) (= (count (. q attributes)) 0)) ps) 0) value))))
+    (scenario "a negative add to a monotonic counter is refused and counted; an up-down counter takes it"
+      (given [p (rig) c (otel/counter (otel/get-meter p "app") "c" "1" "") u (otel/up-down-counter (otel/get-meter p "app") "u" "1" "")])
+      (upon [_ (do (otel/counter-add! c 5 []) (otel/counter-add! c -3 []) (otel/updown-add! u 5 []) (otel/updown-add! u -8 []))
+             ms (otel/collect-metrics p)])
+      (then (expect = 5 (total (sum-points (metric-named ms "c")))) (expect = 1 (otel/counter-rejected c))
+            (expect = -3 (total (sum-points (metric-named ms "u"))))
+            (expect = true (match (. (metric-named ms "c") data) ((otel/SumData _ mono) mono) (_ false)))
+            (expect = false (match (. (metric-named ms "u") data) ((otel/SumData _ mono) mono) (_ true)))))
+    (scenario "bound instruments count into the same series as unbound ones"
+      (given [p (rig) c (otel/counter (otel/get-meter p "app") "c" "1" "") b (otel/bind-counter c (attrs "k" 1))])
+      (upon [_ (do (otel/bound-add! b 4) (otel/counter-add! c 6 (attrs "k" 1)) (otel/bound-add! b -1))
+             ps (sum-points (metric-named (otel/collect-metrics p) "c"))])
+      (then (expect = 1 (count ps)) (expect = 10 (total ps))))
+    (scenario "collection is cumulative: later totals include earlier ones, start time is fixed, time moves on"
+      (given [p (rig) c (otel/counter (otel/get-meter p "app") "c" "1" "")])
+      (upon [_ (otel/counter-add! c 3 []) a (nth (sum-points (metric-named (otel/collect-metrics p) "c")) 0)
+             _ (otel/counter-add! c 4 []) b (nth (sum-points (metric-named (otel/collect-metrics p) "c")) 0)])
+      (then (expect = 3 (. a value)) (expect = 7 (. b value)) (expect = (. a start-ns) (. b start-ns))
+            (expect = true (and (>= (. b time-ns) (. a time-ns)) (>= (. a time-ns) (. a start-ns)) (> (. a start-ns) 1700000000000000000)))))
+    (scenario "past the series limit new attribute sets share one overflow series, and nothing is lost"
+      (given [p (rig) c (otel/counter-with-limit (otel/get-meter p "app") "c" "1" "" 5)])
+      (upon [_ (dotimes (i 20) (otel/counter-add! c 1 (attrs "id" i)))
+             ps (sum-points (metric-named (otel/collect-metrics p) "c"))])
+      (then (expect = 6 (count ps)) (expect = 20 (total ps))
+            (expect = 15 (total (vec (filter (fn (q: otel/NumberPoint) (= (. (nth (. q attributes) 0) fst) "otel.metric.overflow")) ps)))))))
+  (feature "attribute sets"
+    (scenario "the order the attributes were written in does not matter, a repeated key keeps its last value"
+      (given [a [(Pair "b" (otel/->datum 1)) (Pair "a" (otel/->datum "x"))] b [(Pair "a" (otel/->datum "x")) (Pair "b" (otel/->datum 1))]
+              d [(Pair "a" (otel/->datum "old")) (Pair "b" (otel/->datum 1)) (Pair "a" (otel/->datum "x"))]])
+      (then (expect = ["a" "b"] (vec (map (fn (q: (Pair str otel/Datum)) (. q fst)) (otel/canonical-attributes a))))
+            (expect = (otel/attributes-key a) (otel/attributes-key b)) (expect = (otel/attributes-key a) (otel/attributes-key d))
+            (expect = 2 (count (otel/canonical-attributes d)))))
+    (scenario "different sets never share a key: kinds, lengths and separators are told apart"
+      (then (expect = 10 (count (set [(otel/attributes-key [(Pair "a=s1:q|b" (otel/->datum "x"))]) (otel/attributes-key [(Pair "a" (otel/->datum "q")) (Pair "b" (otel/->datum "x"))])
+                                     (otel/attributes-key [(Pair "k" (otel/->datum 1))]) (otel/attributes-key [(Pair "k" (otel/->datum "1"))])
+                                     (otel/attributes-key [(Pair "k" (otel/->datum 1.0))]) (otel/attributes-key [(Pair "k" (otel/->datum true))])
+                                     (otel/attributes-key [(Pair "a=s1:b" (otel/->datum "c"))]) (otel/attributes-key [(Pair "a" (otel/->datum "b=s1:c"))])
+                                     (otel/attributes-key [(Pair "a" (otel/->datum "b")) (Pair "c" (otel/->datum "d"))])
+                                     (otel/attributes-key [(Pair "a" (otel/->datum "b|1:c=s1:d"))])])))
+            (expect = "" (otel/attributes-key []))))
+    (scenario "attribute sets written in different orders are one series"
+      (given [p (rig) c (otel/counter (otel/get-meter p "app") "c" "1" "")])
+      (upon [_ (do (otel/counter-add! c 1 [(Pair "a" (otel/->datum 1)) (Pair "b" (otel/->datum 2))])
+                   (otel/counter-add! c 1 [(Pair "b" (otel/->datum 2)) (Pair "a" (otel/->datum 1))]))
+             ps (sum-points (metric-named (otel/collect-metrics p) "c"))])
+      (then (expect = 1 (count ps)) (expect = 2 (total ps)))))
+  (feature "histograms"
+    (scenario "a value equal to a boundary is in that boundary's bucket; below the first and above the last are the end buckets"
+      (covers "fib.otel histogram-record!")
+      (given [p (rig) h (otel/histogram (otel/get-meter p "app") "h" "ms" "" [20.0 10.0 10.0])])
+      (upon [_ (do (otel/histogram-record! h 5.0 []) (otel/histogram-record! h 10.0 []) (otel/histogram-record! h 10.0000001 [])
+                   (otel/histogram-record! h 20.0 []) (otel/histogram-record! h 20.5 []) (otel/histogram-record! h -1.0 []))
+             pt (nth (hist-points (metric-named (otel/collect-metrics p) "h")) 0)])
+      (then (expect = [10.0 20.0] (. pt bounds)) (expect = [3 2 1] (. pt counts)) (expect = 6 (. pt count))
+            (expect = 64.5000001 (. pt sum)) (expect = -1.0 (. pt min)) (expect = 20.5 (. pt max))))
+    (scenario "the bucket index at every edge"
+      (given [b [1.0 2.0 4.0]])
+      (then (expect = [0 0 1 1 2 2 3] (vec (map (fn (v: f64) (otel/bucket-index b v)) [0.5 1.0 1.5 2.0 3.0 4.0 4.5])))
+            (expect = 0 (otel/bucket-index [] 5.0)) (expect = 1 (otel/bucket-index [1.0] 1.5)) (expect = 0 (otel/bucket-index [1.0] 1.0))))
+    (scenario "8 tasks recording give exact counts per bucket, the exact sum, and the true min and max"
+      (given [p (rig) h (otel/histogram (otel/get-meter p "app") "h" "ms" "" [10.0 100.0])])
+      (upon [_ (with-tasks [s] (do (dotimes (t 8) (fork s (fn () (dotimes (i 1000) (otel/histogram-record! h (double (+ t (rem i 200))) (attrs "t" (rem t 2))))))) ()))
+             pts (hist-points (metric-named (otel/collect-metrics p) "h"))])
+      (then (expect = 2 (count pts)) (expect = 8000 (reduce (fn (a: i64 q: otel/HistogramPoint) (+ a (. q count))) 0 pts))
+            (expect = true (every? (fn (g: i64) (let [q (nth (filter (fn (x: otel/HistogramPoint) (= (otel/as-int (. (nth (. x attributes) 0) snd)) (some g))) pts) 0)
+                                                      vs (model-values g)]
+                                                  (and (= (. q counts) (model-counts [10.0 100.0] vs)) (= (. q count) (count vs))
+                                                       (= (. q sum) (reduce + 0.0 vs)) (= (. q min) (reduce min 1.0e308 vs)) (= (. q max) (reduce max 0.0 vs)))))
+                                   [0 1]))))
+    (scenario "the exact sum under concurrency (integers in f64 add exactly)"
+      (given [p (rig) h (otel/histogram (otel/get-meter p "app") "h" "ms" "" [])])
+      (upon [_ (with-tasks [s] (do (dotimes (t 8) (fork s (fn () (dotimes (i 1000) (otel/histogram-record! h 3.0 []))))) ()))
+             pt (nth (hist-points (metric-named (otel/collect-metrics p) "h")) 0)])
+      (then (expect = 24000.0 (. pt sum)) (expect = 8000 (. pt count)) (expect = [8000] (. pt counts)) (expect = 3.0 (. pt min)) (expect = 3.0 (. pt max))))
+    (scenario "a NaN is refused and counted; a histogram nobody recorded into has no points"
+      (given [p (rig) h (otel/histogram (otel/get-meter p "app") "h" "ms" "" [1.0])])
+      (upon [e (count (hist-points (metric-named (otel/collect-metrics p) "h"))) _ (otel/histogram-record! h (/ 0.0 0.0) [])
+             f (count (hist-points (metric-named (otel/collect-metrics p) "h")))])
+      (then (expect = 0 e) (expect = 0 f) (expect = 1 (otel/histogram-rejected h)))))
+  (feature "gauges"
+    (scenario "an observable gauge reports what the callback says at each collection"
+      (given [p (rig) v (atom 5)])
+      (upon [_ (otel/observable-gauge (otel/get-meter p "app") "temp" "C" "" (fn () [(Pair [(Pair "room" (otel/->datum "a"))] (double @v))]))
+             a (nth (gauge-points (metric-named (otel/collect-metrics p) "temp")) 0)
+             _ (reset! v 9) b (nth (gauge-points (metric-named (otel/collect-metrics p) "temp")) 0)])
+      (then (expect = 5.0 (. a value)) (expect = 9.0 (. b value)) (expect = "room" (. (nth (. a attributes) 0) fst))))
+    (scenario "a gauge callback that traps is left out and the other instruments are still collected"
+      (given [p (rig) c (otel/counter (otel/get-meter p "app") "c" "1" "")])
+      (upon [_ (do (otel/observable-gauge (otel/get-meter p "app") "bad" "1" "" (fn () (trap "callback blew up"))) (otel/counter-add! c 2 []))
+             ms (otel/collect-metrics p)])
+      (then (expect = 1 (count ms)) (expect = "c" (. (nth ms 0) name)))))
+  (feature "readers and exporters"
+    (scenario "the console renderings of a metric"
+      (given [p (rig) c (otel/counter (otel/get-meter p "app") "reqs" "{r}" "requests handled") h (otel/histogram (otel/get-meter p "app") "dur" "ms" "" [10.0])])
+      (upon [_ (do (otel/counter-add! c 7 (attrs "k" 1)) (otel/histogram-record! h 4.0 []) (otel/histogram-record! h 12.0 []))
+             ms (otel/collect-metrics p)])
+      (then (expect = "reqs{k=1} 7" (otel/metric-text (metric-named ms "reqs")))
+            (expect = "dur count=2 sum=16.0 min=4.0 max=12.0" (otel/metric-text (metric-named ms "dur")))
+            (expect = true (string/includes? (otel/metric-json (metric-named ms "reqs")) "\"type\":\"sum\",\"monotonic\":true,\"points\":[{\"attributes\":{\"k\":1},\"value\":7,"))
+            (expect = true (string/includes? (otel/metric-json (metric-named ms "dur")) "\"bounds\":[10.0],\"bucket_counts\":[1,1],"))
+            (expect = true (string/includes? (otel/metric-json (metric-named ms "dur")) "\"count\":2,\"sum\":16.0,\"min\":4.0,\"max\":12.0"))))
+    (scenario "the periodic reader exports on its period, cumulatively, and once more at shutdown with the final totals"
+      (covers "fib.otel periodic-reader")
+      (given [p (rig) c (otel/counter (otel/get-meter p "app") "c" "1" "") m (otel/memory-metric-exporter)
+              r (otel/periodic-reader p (dyn otel/MetricExporter :send m) 10000000)])
+      (upon [_ (otel/counter-add! c 5 [])
+             ok (wait-until (fn () (>= (count (otel/memory-metric-exports m)) 2)) 1500)
+             _ (otel/counter-add! c 5 [])
+             _ (otel/reader-shutdown r)
+             totals (vec (map (fn (b: (Vec otel/Metric)) (total (sum-points (nth b 0)))) (otel/memory-metric-exports m)))])
+      (then (expect = true ok) (expect = 10 (nth totals (- (count totals) 1)))
+            (expect = true (every? (fn (i: i64) (<= (nth totals i) (nth totals (+ i 1)))) (range 0 (- (count totals) 1))))
+            (expect = 5 (nth totals 0)) (expect = true @(. m shut))))
+    (scenario "reader-flush exports now, however long the period"
+      (given [p (rig) c (otel/counter (otel/get-meter p "app") "c" "1" "") m (otel/memory-metric-exporter)
+              r (otel/periodic-reader p (dyn otel/MetricExporter :send m) 60000000000)])
+      (upon [_ (otel/counter-add! c 3 []) f (otel/reader-flush r) n (count (otel/memory-metric-exports m))
+             _ (otel/reader-shutdown r) again (otel/reader-shutdown r)])
+      (then (expect = true (match f ((Ok _) true) ((Err _) false))) (expect = true (>= n 1)) (expect = 3 (total (sum-points (nth (nth (otel/memory-metric-exports m) 0) 0))))
+            (expect = true (match again ((Ok _) true) ((Err _) false)))))
+    (scenario "an exporter that traps is counted and the reader goes on"
+      (given [b (BrokenMetricExporter (atom 0)) p (rig) c (otel/counter (otel/get-meter p "app") "c" "1" "")
+              r (otel/periodic-reader p (dyn otel/MetricExporter :send b) 5000000)])
+      (upon [ok (wait-until (fn () (>= @(. b tries) 3)) 1500) _ (otel/reader-shutdown r)])
+      (then (expect = true ok) (expect = true (>= (otel/reader-failed r) 3))))
+    (scenario "with-periodic-reader shuts the reader down when the body traps"
+      (given [p (rig) m (otel/memory-metric-exporter)])
+      (upon [v (ex/try (otel/with-periodic-reader p (dyn otel/MetricExporter :send m) 60000000000 (fn (r: otel/PeriodicReader) (trap "boom"))) (catch e -1))])
+      (then (expect = -1 v) (expect = true @(. m shut))))))
+
+(defun main () -> i64 (run-main (specs)))

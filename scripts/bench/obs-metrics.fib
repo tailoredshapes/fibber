@@ -1,0 +1,47 @@
+;; scripts/bench/obs-metrics.fib: what recording a metric costs (package O2). usage: obs-metrics MODE T N
+;; T tasks each record N values (T 1 runs in the calling task); prints three rounds as `ns/op X` (wall time / (T*N): the cost to the program per
+;; record, so a contended mode that scales prints a LOWER number than one task) and the total read back (a wrong total is a failure).
+;; MODE: counter        Counter add with no attributes (the series is the instrument's own: one adder add)
+;;       counter-attrs  Counter add with two attributes (canonicalise, key, look up, add)
+;;       counter-bound  the same series bound once: bound-add!
+;;       histogram      Histogram record, no attributes, 15 bounds
+;;       histogram-attrs  Histogram record with one attribute
+;;       atom           one shared (atom 0) with swap! (the plain atomic the counter is compared with)
+;;       adder          a bare fib.adder inc! (the floor of the counter)
+;; Build: F build scripts/bench/obs-metrics.fib -I lib -o obs-metrics; run: ./obs-metrics counter 8 200000
+(ns main (:require [fib.otel :as otel] [fib.adder :as adder] [fib.os :as os] [fib.parallel :as par]))
+
+(defstruct Rig (mode: str counter: otel/Counter hist: otel/Histogram bound: otel/BoundSum shared: (Atom i64) adder: adder/Adder))
+
+(defun work (r: Rig n: i64) -> i64
+  (let [mode (. r mode)]
+    (do (cond (= mode "counter") (dotimes (i n) (otel/counter-add! (. r counter) 1 []))
+              (= mode "counter-attrs") (dotimes (i n) (otel/counter-add! (. r counter) 1 [(Pair "method" (otel/->datum "GET")) (Pair "code" (otel/->datum 200))]))
+              (= mode "counter-bound") (dotimes (i n) (otel/bound-add! (. r bound) 1))
+              (= mode "histogram") (dotimes (i n) (otel/histogram-record! (. r hist) (double (rem i 300)) []))
+              (= mode "histogram-attrs") (dotimes (i n) (otel/histogram-record! (. r hist) (double (rem i 300)) [(Pair "method" (otel/->datum "GET"))]))
+              (= mode "atom") (dotimes (i n) (swap! (. r shared) (fn (v: i64) (+ v 1))))
+              :else (dotimes (i n) (adder/inc! (. r adder))))
+        0)))
+
+(defun main () -> i64
+  (let [a (args) mode (nth a 0) tasks (unwrap-or (parse-long (nth a 1)) 1) n (unwrap-or (parse-long (nth a 2)) 100000)
+        p (otel/meter-provider (otel/make-resource "bench" [])) m (otel/get-meter p "bench")
+        c (otel/counter m "c" "1" "") h (otel/histogram m "h" "ms" "" (otel/default-bounds))
+        r (Rig mode c h (otel/bind-counter c [(Pair "method" (otel/->datum "GET")) (Pair "code" (otel/->datum 200))]) (atom 0) (adder/adder))]
+    (do (dotimes (round 3)
+          (let [t0 (os/clock-now)]
+            (do (if (= tasks 1)
+                    (work r n)
+                    (par/with-tasks [s] (do (dotimes (k tasks) (par/fork s (fn () (work r n)))) 0)))
+                (println (str "ns/op " (quot (* 100 (- (os/clock-now) t0)) (* 100 tasks n)))))))
+        (let [ms (otel/collect-metrics p)]
+          (println (str "read back " (cond (= mode "atom") @(. r shared) (= mode "adder") (adder/sum (. r adder))
+                                           :else (reduce (fn (acc: i64 mm: otel/Metric)
+                                                           (+ acc (match (. mm data)
+                                                                    ((otel/SumData ps _) (reduce (fn (x: i64 q: otel/NumberPoint) (+ x (. q value))) 0 ps))
+                                                                    ((otel/HistogramData ps) (reduce (fn (x: i64 q: otel/HistogramPoint) (+ x (. q count))) 0 ps))
+                                                                    (_ 0))))
+                                                         0 ms))
+                        " expected " (* 3 tasks n))))
+        0)))

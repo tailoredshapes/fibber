@@ -49,6 +49,17 @@ batch-flush-no-wait|otel-export-spec|otel/processor.fib|(processor-flush (self) 
 batch-unbounded|otel-export-spec|otel/queue.fib|full (>= n (. q capacity))|full false
 batch-drops-uncounted|otel-export-spec|otel/processor.fib|((QueueDropped) (do (bump! (. p dropped) 1) (when (= (. p overflow) DropOldest) ())))|((QueueDropped) ())
 batch-order-reversed|otel-export-spec|otel/queue.fib|(vec (reverse newest-first))|newest-first
+counter-accepts-negative|otel-metrics-spec|otel/metrics.fib|-> unit\n  (if (< n 0)\n      (do (swap! (. (. c core) rejected)|-> unit\n  (if false\n      (do (swap! (. (. c core) rejected)
+hist-bound-exclusive|otel-metrics-spec|otel/metrics.fib|(if (<= v (nth bounds mid)) (recur lo mid)|(if (< v (nth bounds mid)) (recur lo mid)
+attrs-not-canonical|otel-metrics-spec|otel/metrics.fib|(reduce insert-attr [] attrs)|attrs
+attrs-key-ambiguous|otel-metrics-spec|otel/metrics.fib|(str acc (str-len (. p fst)) ":" (. p fst) "="|(str acc (. p fst) "="
+series-limit-ignored|otel-metrics-spec|otel/metrics.fib|(< (count cur) (. c limit)) (assoc cur key (SumSeries canon (adder/adder)))|(>= (count cur) 0) (assoc cur key (SumSeries canon (adder/adder)))
+hist-sum-lost|otel-metrics-spec|otel/metrics.fib|(cas-add! (. s sum) v) (cas-min! (. s min) v)|(cas-min! (. s min) v)
+hist-min-is-max|otel-metrics-spec|otel/metrics.fib|(cas-min! (. s min) v) (cas-max! (. s max) v)|(cas-max! (. s min) v) (cas-max! (. s max) v)
+hist-count-lost|otel-metrics-spec|otel/metrics.fib|(adder/inc! (. s count))|()
+gauge-callback-uncaught|otel-metrics-spec|otel/metrics.fib|(into out (ex/try (collect-one c now (. p resource)) (catch e [])))|(into out (collect-one c now (. p resource)))
+reader-no-final-collect|otel-metrics-spec|otel/reader.fib|(cond @closed (collect-and-export p exporter collections failed)|(cond @closed ()
+reader-export-uncaught|otel-metrics-spec|otel/reader.fib|(match (ex/try (export-metrics exporter (collect-metrics p)) (catch e (Err (ex/ex-message e))))|(match (export-metrics exporter (collect-metrics p))
 EOF
 )
 if [ "$MODE" = list ]; then echo "$TABLE" | cut -d'|' -f1; exit 0; fi

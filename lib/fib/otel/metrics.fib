@@ -1,0 +1,258 @@
+;; fib.otel.metrics: MeterProvider, Meter and the instruments (docs/design/observability-and-databases.md 3.1; package O2).
+;;
+;;   (let [provider (meter-provider (make-resource "app" []))
+;;         meter    (get-meter provider "app.http")
+;;         requests (counter meter "http.requests" "{request}" "requests handled")
+;;         latency  (histogram meter "http.duration" "ms" "request time" (default-bounds))]
+;;     (counter-add! requests 1 [(Pair "method" (->datum "GET"))])
+;;     (histogram-record! latency 12.5 [(Pair "method" (->datum "GET"))])
+;;     (collect-metrics provider))                                   ; the cumulative data points, on demand
+;;
+;; Instruments: Counter (monotonic sum of i64: a negative add is refused and counted), UpDownCounter (sum that may fall), Histogram (explicit
+;; bucket bounds, count, sum, min, max of f64 values), observable Gauge (a callback run at each collection). Aggregation is cumulative since
+;; the provider was made. Nothing is global: the provider is a value that holds its instruments; the readers (fib.otel.reader) take it.
+;;
+;; Hot paths. Every series (one per attribute set) is made of `fib.adder` stripes, so tasks adding to one counter do not fight over a cache
+;; line: an add is one compare-and-swap on the task's own stripe. A histogram record is a bucket adder, a count adder, and compare-and-swap
+;; loops on the sum, the minimum and the maximum (only when the value improves them). The series of an instrument are looked up by the
+;; attribute set: `(canonical-attributes attrs)` sorts by key and keeps the last of a repeated key, so the order the caller wrote them in does
+;; not matter, and `(attributes-key attrs)` is an unambiguous text of that list (a map key). Recording with no attributes needs no lookup, and
+;; `bind-counter` / `bind-histogram` do the lookup once: a hot loop with fixed attributes pays only the adder. An instrument holds at most
+;; `series-limit` series (2000, OpenTelemetry's default); more land in one series with the attribute `otel.metric.overflow` = true.
+(ns fib.otel.metrics (:use fib.core fib.seq fib.coll fib.datum fib.otel.trace) (:require [fib.adder :as adder] [fib.os :as os] [fib.ex :as ex]))
+
+;; ---- the collected data
+
+(defstruct NumberPoint (attributes: (Vec (Pair str Datum)) value: i64 start-ns: i64 time-ns: i64))
+(defstruct GaugePoint (attributes: (Vec (Pair str Datum)) value: f64 time-ns: i64))
+;; `counts` has one more entry than `bounds`: bucket i holds the values v with bounds[i-1] < v <= bounds[i]; the last holds v > the last bound.
+(defstruct HistogramPoint (attributes: (Vec (Pair str Datum)) bounds: (Vec f64) counts: (Vec i64) count: i64 sum: f64 min: f64 max: f64
+                           start-ns: i64 time-ns: i64))
+
+(defenum MetricData (SumData points: (Vec NumberPoint) monotonic: bool) (HistogramData points: (Vec HistogramPoint)) (GaugeData points: (Vec GaugePoint)))
+
+(defstruct Metric (name: str unit: str description: str scope: str data: MetricData resource: Resource))
+
+(defprotocol Collectable
+  (collect-one (self now-ns: i64 resource: Resource) -> (Vec Metric)))
+
+;; ---- attribute sets
+
+(defun insert-attr :private (out: (Vec (Pair str Datum)) p: (Pair str Datum)) -> (Vec (Pair str Datum))
+  (let [n (count out)]
+    (loop [i 0]
+      (cond (>= i n) (conj out p)
+            (= (. (nth out i) fst) (. p fst)) (assoc out i p)
+            (> (. (nth out i) fst) (. p fst)) (into (conj (vec (take i out)) p) (drop i out))
+            :else (recur (+ i 1))))))
+
+;; The attributes sorted by key, a repeated key keeping its last value: two sets that mean the same are equal as lists.
+(defun canonical-attributes (attrs: (Vec (Pair str Datum))) -> (Vec (Pair str Datum))
+  (reduce insert-attr [] attrs))
+
+(defun datum-key :private (d: Datum) -> str
+  (match d
+    ((DNil) "n") ((DBool b) (if b "b1" "b0")) ((DInt i) (str "i" i ";")) ((DFloat f) (str "f" f ";"))
+    ((DStr s) (str "s" (str-len s) ":" s)) ((DBytes b) (str "x" (datum-text d) ";"))))
+
+;; An unambiguous text of the canonical attribute list: lengths before strings, a tag before each value, so no two different sets share a key
+;; (`("a=b" "c")` and `("a" "b=c")` differ, an int 1, a float 1.0, the string "1" and the bool true differ).
+(defun attributes-key (attrs: (Vec (Pair str Datum))) -> str
+  (reduce (fn (acc: str p: (Pair str Datum)) (str acc (str-len (. p fst)) ":" (. p fst) "=" (datum-key (. p snd)) "|")) "" (canonical-attributes attrs)))
+
+;; ---- the provider and the meter
+
+(defstruct MeterProvider (resource: Resource registry: (Atom (Vec (dyn Collectable :send))) wall0: i64 mono0: i64))
+(defstruct Meter (scope: str provider: MeterProvider))
+
+(defun meter-provider (resource: Resource) -> MeterProvider
+  (MeterProvider resource (atom []) (os/wall-now) (os/clock-now)))
+
+(defun get-meter (p: MeterProvider scope: str) -> Meter (Meter scope p))
+
+(defun register :private (m: Meter c: (dyn Collectable :send)) -> unit
+  (do (swap! (. (. m provider) registry) (fn (v: (Vec (dyn Collectable :send))) (conj v c))) ()))
+
+(defun provider-now :private (p: MeterProvider) -> i64 (+ (. p wall0) (- (os/clock-now) (. p mono0))))
+
+;; Every metric of every instrument: the cumulative data points as of now (what a reader collects). A gauge callback that traps is left out
+;; of that collection and the others are still collected.
+(defun collect-metrics (p: MeterProvider) -> (Vec Metric)
+  (let [now (provider-now p) reg @(. p registry)]
+    (reduce (fn (out: (Vec Metric) c: (dyn Collectable :send))
+              (into out (ex/try (collect-one c now (. p resource)) (catch e []))))
+            [] reg)))
+
+(defun overflow-attributes :private () -> (Vec (Pair str Datum)) [(Pair "otel.metric.overflow" (DBool true))])
+
+(defun series-limit () -> i64 2000)
+
+;; ---- sums: Counter and UpDownCounter
+
+(defstruct SumSeries (attributes: (Vec (Pair str Datum)) adder: adder/Adder))
+
+(defstruct SumCore (name: str unit: str description: str scope: str monotonic: bool limit: i64 start-ns: i64
+                    default: SumSeries series: (Atom (Map str SumSeries)) rejected: (Atom i64)))
+
+(defun make-sum :private (m: Meter name: str unit: str description: str monotonic: bool limit: i64) -> SumCore
+  (SumCore name unit description (. m scope) monotonic limit (. (. m provider) wall0) (SumSeries [] (adder/adder)) (atom (map-empty)) (atom 0)))
+
+(defun sum-points :private (c: SumCore now: i64) -> (Vec NumberPoint)
+  (let [d (. c default)
+        base (if (= (adder/sum (. d adder)) 0) [] [(NumberPoint [] (adder/sum (. d adder)) (. c start-ns) now)])
+        all (reduce (fn (out: (Vec NumberPoint) s: SumSeries) (conj out (NumberPoint (. s attributes) (adder/sum (. s adder)) (. c start-ns) now)))
+                    base (vec (vals @(. c series))))]
+    all))
+
+(impl Collectable SumCore
+  (collect-one (self now resource)
+    [(Metric (. self name) (. self unit) (. self description) (. self scope) (SumData (sum-points self now) (. self monotonic)) resource)]))
+
+;; The series of an attribute set, made when it is first seen (or the overflow series past the limit). The default (no attributes) series is
+;; made with the instrument and needs no lookup.
+(defun sum-series :private (c: SumCore attrs: (Vec (Pair str Datum))) -> SumSeries
+  (if (= (count attrs) 0)
+      (. c default)
+      (let [canon (canonical-attributes attrs) key (attributes-key canon) found (get @(. c series) key)]
+        (match found
+          ((some s) s)
+          (nil (let [m (swap! (. c series)
+                              (fn (cur: (Map str SumSeries))
+                                (cond (some? (get cur key)) cur
+                                      (< (count cur) (. c limit)) (assoc cur key (SumSeries canon (adder/adder)))
+                                      (some? (get cur "overflow")) cur
+                                      :else (assoc cur "overflow" (SumSeries (overflow-attributes) (adder/adder))))))]
+                 (match (get m key) ((some s) s) (nil (unwrap-or (get m "overflow") (. c default))))))))))
+
+(defstruct Counter (core: SumCore))
+(defstruct UpDownCounter (core: SumCore))
+
+(defun counter-with-limit (m: Meter name: str unit: str description: str limit: i64) -> Counter
+  (let [c (make-sum m name unit description true limit)] (do (register m (dyn Collectable :send c)) (Counter c))))
+
+(defun counter (m: Meter name: str unit: str description: str) -> Counter (counter-with-limit m name unit description (series-limit)))
+
+(defun up-down-counter (m: Meter name: str unit: str description: str) -> UpDownCounter
+  (let [c (make-sum m name unit description false (series-limit))] (do (register m (dyn Collectable :send c)) (UpDownCounter c))))
+
+;; Adds `n` (not negative: a negative add is refused and counted in `counter-rejected`).
+(defun counter-add! (c: Counter n: i64 attrs: (Vec (Pair str Datum))) -> unit
+  (if (< n 0)
+      (do (swap! (. (. c core) rejected) (fn (v: i64) (+ v 1))) ())
+      (if (= (count attrs) 0)
+          (adder/add! (. (. (. c core) default) adder) n)   ; borrowed all the way: no retain of a shared object, so tasks do not fight over a count
+          (adder/add! (. (sum-series (. c core) attrs) adder) n))))
+
+(defun counter-rejected (c: Counter) -> i64 @(. (. c core) rejected))
+
+(defun updown-add! (c: UpDownCounter n: i64 attrs: (Vec (Pair str Datum))) -> unit
+  (if (= (count attrs) 0)
+      (adder/add! (. (. (. c core) default) adder) n)
+      (adder/add! (. (sum-series (. c core) attrs) adder) n)))
+
+;; A series looked up once: `(bound-add! b n)` is then one adder add.
+(defstruct BoundSum (series: SumSeries monotonic: bool core: SumCore))
+(defun bind-counter (c: Counter attrs: (Vec (Pair str Datum))) -> BoundSum (BoundSum (sum-series (. c core) attrs) true (. c core)))
+(defun bind-updown (c: UpDownCounter attrs: (Vec (Pair str Datum))) -> BoundSum (BoundSum (sum-series (. c core) attrs) false (. c core)))
+(defun bound-add! (b: BoundSum n: i64) -> unit
+  (if (and (. b monotonic) (< n 0))
+      (do (swap! (. (. b core) rejected) (fn (v: i64) (+ v 1))) ())
+      (adder/add! (. (. b series) adder) n)))
+
+;; ---- histograms
+
+(defstruct HistSeries (attributes: (Vec (Pair str Datum)) buckets: (Vec adder/Adder) count: adder/Adder sum: (Atom f64) min: (Atom f64) max: (Atom f64)))
+
+(defstruct HistCore (name: str unit: str description: str scope: str bounds: (Vec f64) limit: i64 start-ns: i64
+                     default: HistSeries series: (Atom (Map str HistSeries)) rejected: (Atom i64)))
+
+;; OpenTelemetry's default bounds.
+(defun default-bounds () -> (Vec f64) [0.0 5.0 10.0 25.0 50.0 75.0 100.0 250.0 500.0 750.0 1000.0 2500.0 5000.0 7500.0 10000.0])
+
+(defun new-hist-series :private (attrs: (Vec (Pair str Datum)) n-bounds: i64) -> HistSeries
+  (HistSeries attrs (vec (map (fn (i: i64) (adder/adder)) (range 0 (+ n-bounds 1)))) (adder/adder) (atom 0.0) (atom 1.0e308) (atom -1.0e308)))
+
+(defun sorted-unique :private (bounds: (Vec f64)) -> (Vec f64)
+  (reduce (fn (out: (Vec f64) b: f64) (if (and (> (count out) 0) (= (nth out (- (count out) 1)) b)) out (conj out b))) [] (sort bounds)))
+
+(defun hist-points :private (c: HistCore now: i64) -> (Vec HistogramPoint)
+  (let [all (conj (vec (vals @(. c series))) (. c default))]
+    (vec (filter (fn (p: HistogramPoint) (> (. p count) 0)) (map (fn (s: HistSeries) (hist-point c s now)) all)))))
+
+(defun hist-point :private (c: HistCore s: HistSeries now: i64) -> HistogramPoint
+  (HistogramPoint (. s attributes) (. c bounds) (vec (map adder/sum (. s buckets))) (adder/sum (. s count)) @(. s sum) @(. s min) @(. s max)
+                  (. c start-ns) now))
+
+(impl Collectable HistCore
+  (collect-one (self now resource)
+    [(Metric (. self name) (. self unit) (. self description) (. self scope) (HistogramData (hist-points self now)) resource)]))
+
+(defstruct Histogram (core: HistCore))
+
+;; A histogram with these bucket bounds (sorted and de-duplicated here; none: one bucket for everything).
+(defun histogram (m: Meter name: str unit: str description: str bounds: (Vec f64)) -> Histogram
+  (let [bs (sorted-unique bounds)
+        c (HistCore name unit description (. m scope) bs (series-limit) (. (. m provider) wall0) (new-hist-series [] (count bs)) (atom (map-empty)) (atom 0))]
+    (do (register m (dyn Collectable :send c)) (Histogram c))))
+
+;; The index of the bucket of v: the first bound that is >= v (a value equal to a bound is in that bound's bucket), else the overflow bucket.
+(defun bucket-index (bounds: (Vec f64) v: f64) -> i64
+  (loop [lo 0 hi (count bounds)]
+    (if (>= lo hi) lo (let [mid (quot (+ lo hi) 2)] (if (<= v (nth bounds mid)) (recur lo mid) (recur (+ mid 1) hi))))))
+
+(defun hist-series :private (c: HistCore attrs: (Vec (Pair str Datum))) -> HistSeries
+  (if (= (count attrs) 0)
+      (. c default)
+      (let [canon (canonical-attributes attrs) key (attributes-key canon) found (get @(. c series) key)]
+        (match found
+          ((some s) s)
+          (nil (let [m (swap! (. c series)
+                              (fn (cur: (Map str HistSeries))
+                                (cond (some? (get cur key)) cur
+                                      (< (count cur) (. c limit)) (assoc cur key (new-hist-series canon (count (. c bounds))))
+                                      (some? (get cur "overflow")) cur
+                                      :else (assoc cur "overflow" (new-hist-series (overflow-attributes) (count (. c bounds)))))))]
+                 (match (get m key) ((some s) s) (nil (unwrap-or (get m "overflow") (. c default))))))))))
+
+(defun cas-min! :private (a: (Atom f64) v: f64) -> unit
+  (loop [] (let [cur @a] (if (< v cur) (if (compare-and-set! a cur v) () (recur)) ()))))
+
+(defun cas-max! :private (a: (Atom f64) v: f64) -> unit
+  (loop [] (let [cur @a] (if (> v cur) (if (compare-and-set! a cur v) () (recur)) ()))))
+
+(defun cas-add! :private (a: (Atom f64) v: f64) -> unit
+  (loop [] (let [cur @a] (if (compare-and-set! a cur (+ cur v)) () (recur)))))
+
+(defun record-in :private (c: HistCore s: HistSeries v: f64) -> unit
+  (if (!= v v)
+      (do (swap! (. c rejected) (fn (n: i64) (+ n 1))) ())
+      (do (adder/inc! (nth (. s buckets) (bucket-index (. c bounds) v)))
+          (adder/inc! (. s count))
+          (cas-add! (. s sum) v) (cas-min! (. s min) v) (cas-max! (. s max) v))))
+
+;; Records a value (a NaN is refused and counted in `histogram-rejected`).
+(defun histogram-record! (h: Histogram v: f64 attrs: (Vec (Pair str Datum))) -> unit
+  (if (= (count attrs) 0)
+      (record-in (. h core) (. (. h core) default) v)
+      (record-in (. h core) (hist-series (. h core) attrs) v)))
+
+(defun histogram-rejected (h: Histogram) -> i64 @(. (. h core) rejected))
+
+(defstruct BoundHistogram (series: HistSeries core: HistCore))
+(defun bind-histogram (h: Histogram attrs: (Vec (Pair str Datum))) -> BoundHistogram (BoundHistogram (hist-series (. h core) attrs) (. h core)))
+(defun bound-record! (b: BoundHistogram v: f64) -> unit (record-in (. b core) (. b series) v))
+
+;; ---- observable gauge
+
+;; The callback answers the current readings, each an attribute set and a value. It runs at every collection, in the collecting task.
+(defstruct GaugeCore (name: str unit: str description: str scope: str callback: (fn :send () (Vec (Pair (Vec (Pair str Datum)) f64)))))
+
+(impl Collectable GaugeCore
+  (collect-one (self now resource)
+    (let [readings ((. self callback))]
+      [(Metric (. self name) (. self unit) (. self description) (. self scope)
+               (GaugeData (vec (map (fn (r: (Pair (Vec (Pair str Datum)) f64)) (GaugePoint (canonical-attributes (. r fst)) (. r snd) now)) readings)))
+               resource)])))
+
+(defun observable-gauge (m: Meter name: str unit: str description: str callback: (fn :send () (Vec (Pair (Vec (Pair str Datum)) f64)))) -> unit
+  (register m (dyn Collectable :send (GaugeCore name unit description (. m scope) callback))))

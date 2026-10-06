@@ -1,0 +1,142 @@
+;; fib.otel.reader: getting metrics out (docs/design/observability-and-databases.md 3.4; package O2): the MetricExporter protocol, a console
+;; exporter (text and JSON), an in-memory exporter for tests, and the periodic reader.
+;;
+;;   (collect-metrics provider)                          the on-demand reader: a pull, in the caller (fib.otel.metrics)
+;;   (periodic-reader provider exporter period-ns)       a task that collects and exports every period
+;;   (reader-flush r)  (reader-shutdown r)               collect and export now / a last export, stop the task, shut the exporter down
+;;
+;; The periodic reader collects CUMULATIVE data points (the totals since the provider was made), so a lost export loses nothing: the next one
+;; carries the totals. The worker sleeps in steps of at most 1 ms and exports when `period-ns` has passed since the last export, on
+;; `reader-flush` and at shutdown. Each export runs under `try`: an `Err` or a trap of the exporter (or of a gauge callback) is counted
+;; (`reader-failed`), reported once on standard error, and the reader goes on. The worker is a task: call `reader-shutdown` (or use
+;; `with-periodic-reader`) before main returns, or the runtime waits for it.
+(ns fib.otel.reader (:use fib.core fib.seq fib.coll fib.datum fib.otel.trace fib.otel.metrics)
+  (:require [fib.os :as os] [fib.ex :as ex] [fib.log.sinks :as sinks]))
+
+(defprotocol MetricExporter
+  (export-metrics (self metrics: (Vec Metric)) -> (Result unit str))
+  (metric-exporter-flush (self) -> (Result unit str))
+  (metric-exporter-shutdown (self) -> (Result unit str)))
+
+;; ---- rendering
+
+(defun attrs-json :private (attrs: (Vec (Pair str Datum))) -> str
+  (str "{" (reduce (fn (acc: str p: (Pair str Datum)) (str acc (if (= acc "") "" ",") (json-quote (. p fst)) ":" (datum-json (. p snd)))) "" attrs) "}"))
+
+(defun join-json :private (items: (Vec str)) -> str
+  (str "[" (reduce (fn (acc: str s: str) (str acc (if (= acc "") "" ",") s)) "" items) "]"))
+
+(defun floats-json :private (v: (Vec f64)) -> str (join-json (vec (map (fn (f: f64) (datum-json (DFloat f))) v))))
+(defun ints-json :private (v: (Vec i64)) -> str (join-json (vec (map (fn (i: i64) (str i)) v))))
+
+(defun number-json :private (p: NumberPoint) -> str
+  (str "{\"attributes\":" (attrs-json (. p attributes)) ",\"value\":" (. p value) ",\"start_ns\":" (. p start-ns) ",\"time_ns\":" (. p time-ns) "}"))
+
+(defun gauge-json :private (p: GaugePoint) -> str
+  (str "{\"attributes\":" (attrs-json (. p attributes)) ",\"value\":" (datum-json (DFloat (. p value))) ",\"time_ns\":" (. p time-ns) "}"))
+
+(defun hist-json :private (p: HistogramPoint) -> str
+  (str "{\"attributes\":" (attrs-json (. p attributes)) ",\"count\":" (. p count) ",\"sum\":" (datum-json (DFloat (. p sum)))
+       ",\"min\":" (datum-json (DFloat (. p min))) ",\"max\":" (datum-json (DFloat (. p max)))
+       ",\"bounds\":" (floats-json (. p bounds)) ",\"bucket_counts\":" (ints-json (. p counts))
+       ",\"start_ns\":" (. p start-ns) ",\"time_ns\":" (. p time-ns) "}"))
+
+;; One metric as one JSON object (no newline): `type` is sum, histogram or gauge; a sum also says whether it is monotonic.
+(defun metric-json (m: Metric) -> str
+  (str "{\"name\":" (json-quote (. m name)) ",\"unit\":" (json-quote (. m unit)) ",\"description\":" (json-quote (. m description))
+       ",\"scope\":" (json-quote (. m scope)) ","
+       (match (. m data)
+         ((SumData ps mono) (str "\"type\":\"sum\",\"monotonic\":" mono ",\"points\":" (join-json (vec (map number-json ps)))))
+         ((HistogramData ps) (str "\"type\":\"histogram\",\"points\":" (join-json (vec (map hist-json ps)))))
+         ((GaugeData ps) (str "\"type\":\"gauge\",\"points\":" (join-json (vec (map gauge-json ps))))))
+       ",\"resource\":" (attrs-json (. (. m resource) attributes)) "}"))
+
+(defun labels-text :private (attrs: (Vec (Pair str Datum))) -> str
+  (if (= (count attrs) 0) ""
+      (str "{" (reduce (fn (acc: str p: (Pair str Datum)) (str acc (if (= acc "") "" ",") (. p fst) "=" (datum-text (. p snd)))) "" attrs) "}")))
+
+;; Human lines, one per data point: `http.requests{method=GET} 42`, `http.duration{} count=3 sum=30.5 min=1.0 max=20.0`.
+(defun metric-text (m: Metric) -> str
+  (str (join-lines (match (. m data)
+                     ((SumData ps _) (vec (map (fn (p: NumberPoint) (str (. m name) (labels-text (. p attributes)) " " (. p value))) ps)))
+                     ((HistogramData ps) (vec (map (fn (p: HistogramPoint) (str (. m name) (labels-text (. p attributes)) " count=" (. p count) " sum=" (. p sum)
+                                                                              " min=" (. p min) " max=" (. p max))) ps)))
+                     ((GaugeData ps) (vec (map (fn (p: GaugePoint) (str (. m name) (labels-text (. p attributes)) " " (. p value))) ps)))))))
+
+(defun join-lines :private (ls: (Vec str)) -> str
+  (reduce (fn (acc: str l: str) (str acc (if (= acc "") "" "\n") l)) "" ls))
+
+;; ---- exporters
+
+(defstruct ConsoleMetricExporter (fd: i64 json: bool))
+
+(impl MetricExporter ConsoleMetricExporter
+  (export-metrics (self metrics)
+    (let [lines (reduce (fn (acc: str m: Metric) (str acc (if (. self json) (metric-json m) (metric-text m)) "\n")) "" metrics)]
+      (match (os/write-all (. self fd) (str-bytes lines)) ((Ok _) (Ok ())) ((Err e) (Err (. e message))))))
+  (metric-exporter-flush (self) (Ok ()))
+  (metric-exporter-shutdown (self) (Ok ())))
+
+(defun console-metric-exporter () -> (dyn MetricExporter :send) (dyn MetricExporter :send (ConsoleMetricExporter 2 false)))
+(defun console-metric-json-exporter (fd: i64) -> (dyn MetricExporter :send) (dyn MetricExporter :send (ConsoleMetricExporter fd true)))
+
+;; Keeps every export (a vector of the batches), for tests.
+(defstruct MemoryMetricExporter (exports: (Atom (Vec (Vec Metric))) shut: (Atom bool)))
+
+(impl MetricExporter MemoryMetricExporter
+  (export-metrics (self metrics)
+    (if @(. self shut) (Err "the memory metric exporter is shut down")
+        (do (swap! (. self exports) (fn (v: (Vec (Vec Metric))) (conj v metrics))) (Ok ()))))
+  (metric-exporter-flush (self) (Ok ()))
+  (metric-exporter-shutdown (self) (do (reset! (. self shut) true) (Ok ()))))
+
+(defun memory-metric-exporter () -> MemoryMetricExporter (MemoryMetricExporter (atom []) (atom false)))
+(defun memory-metric-exports (m: MemoryMetricExporter) -> (Vec (Vec Metric)) @(. m exports))
+
+;; ---- the periodic reader
+
+(defstruct PeriodicReader (provider: MeterProvider exporter: (dyn MetricExporter :send) period-ns: i64 collections: (Atom i64) failed: (Atom i64)
+                           wanted: (Atom bool) closed: (Atom bool) worker: (Task unit)))
+
+(defun collect-and-export :private (p: MeterProvider exporter: (dyn MetricExporter :send) collections: (Atom i64) failed: (Atom i64)) -> unit
+  (do (match (ex/try (export-metrics exporter (collect-metrics p)) (catch e (Err (ex/ex-message e))))
+        ((Ok _) ())
+        ((Err m) (let [n (swap! failed (fn (v: i64) (+ v 1)))]
+                   (when (= n 1) (eprintln (str "fib.otel: a metric export failed (further failures are counted, not printed): " m))))))
+      (swap! collections (fn (v: i64) (+ v 1)))
+      ()))
+
+(defun reader-loop :private (p: MeterProvider exporter: (dyn MetricExporter :send) period-ns: i64 collections: (Atom i64) failed: (Atom i64)
+                             wanted: (Atom bool) closed: (Atom bool)) -> unit
+  (loop [last (os/clock-now)]
+    (let [now (os/clock-now)]
+      (cond @closed (collect-and-export p exporter collections failed)
+            (or @wanted (>= (- now last) period-ns)) (do (reset! wanted false) (collect-and-export p exporter collections failed) (recur (os/clock-now)))
+            :else (do (os/sleep-ns (min 1000000 (max 50000 (quot period-ns 4)))) (recur last))))))
+
+(defun periodic-reader (p: MeterProvider exporter: (dyn MetricExporter :send) period-ns: i64) -> PeriodicReader
+  (let [collections (atom 0) failed (atom 0) wanted (atom false) closed (atom false)
+        w (spawn (fn () (reader-loop p exporter period-ns collections failed wanted closed)))]
+    (PeriodicReader p exporter period-ns collections failed wanted closed w)))
+
+(defun reader-collections (r: PeriodicReader) -> i64 @(. r collections))
+(defun reader-failed (r: PeriodicReader) -> i64 @(. r failed))
+
+;; Collects and exports now, and returns when that export is done.
+(defun reader-flush (r: PeriodicReader) -> (Result unit str)
+  (let [before @(. r collections)]
+    (do (reset! (. r wanted) true)
+        (loop [] (when (and (<= @(. r collections) before) (not @(. r closed))) (do (os/sleep-ns 50000) (recur))))
+        (ex/try (metric-exporter-flush (. r exporter)) (catch e (Err (ex/ex-message e)))))))
+
+;; A last collection and export, then the worker stops and the exporter shuts down. A second call does nothing.
+(defun reader-shutdown (r: PeriodicReader) -> (Result unit str)
+  (if (compare-and-set! (. r closed) false true)
+      (do (join (. r worker)) (ex/try (metric-exporter-shutdown (. r exporter)) (catch e (Err (ex/ex-message e)))))
+      (Ok ())))
+
+;; Runs `f` with a periodic reader and shuts it down afterwards, whatever `f` does (a trap or a throw goes on after the shutdown).
+(defun with-periodic-reader (p: MeterProvider exporter: (dyn MetricExporter :send) period-ns: i64 f: (fn (PeriodicReader) a)) -> a
+  (let [r (periodic-reader p exporter period-ns)]
+    (ex/try (let [v (f r)] (do (reader-shutdown r) v))
+            (catch e (do (reader-shutdown r) (ex/throw e))))))
