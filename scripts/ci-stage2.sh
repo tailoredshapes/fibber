@@ -8,30 +8,104 @@
 # Limits (seconds), each the time a directory may take: LIMIT_OWNERSHIP, LIMIT_MODULES, LIMIT_STDLIB.
 # Also (scripts/gate.sh sets them; CI does not): CI_STAGE2_JOBS=N runs N cases at a time (`cases -j N`); CI_STAGE2_ONLY=FILE holds the
 # names (one per line, as `cases --only` takes them) of the stdlib cases to run, and the expected set is then the lines of the expected
-# file for the cases that were run.
+# file for the cases that were run. CI_STAGE2_SHARDS=K runs the stdlib cases in K processes, ownership in a quarter of that: one `cases`
+# compiles its cases one after the other (`-j` only runs what is compiled side by side), so shards are what make compiling parallel. The
+# directories then run side by side too, and with GATE_SLOTS (scripts/lib/slots.sh) each shard holds a slot while it runs. Unset: one
+# `cases` process for each directory, one after the other's results, as CI has always run it.
 set -u
 root=${GATE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 f=${1:?usage: ci-stage2.sh F}
 out=${CI_STAGE2_OUT:-$(mktemp -d)}
 mkdir -p "$out"
+here=$(cd "$(dirname "$0")" && pwd)
 cd "$root"
 bad=0
 : > "$out/actual"
-for pair in "ownership:${LIMIT_OWNERSHIP:-400}" "modules:${LIMIT_MODULES:-120}" "stdlib:${LIMIT_STDLIB:-1800}"; do
-  name=${pair%%:*}; limit=${pair##*:}; dir=cases/$name
-  echo "== $f cases $dir (limit ${limit}s)"
-  start=$(date +%s)
-  only=(); jflag=()
+
+# The cases of a directory as `cases --only` names them (the order of `ls`, bytes): a *.fib file, or a directory with a main.fib.
+case_names() {
+  local e
+  for e in $(cd "$1" && LC_ALL=C ls); do
+    if [ -f "$1/$e" ]; then case $e in *.fib) echo "$e" ;; esac; elif [ -f "$1/$e/main.fib" ]; then echo "$e"; fi
+  done
+}
+
+# launch NAME LIMIT SHARDS: starts the run of cases/NAME in the background. With one shard it is `cases DIR [--only ..] [-j N]` as ever; with
+# K the cases are dealt out in turn to K processes. A shard's time limit counts the wait for its slot.
+launch() {
+  local name=$1 limit=$2 k=$3 dir=cases/$1 i j
+  local -a names=() jflag=()
   [ -n "${CI_STAGE2_JOBS:-}" ] && jflag=(-j "$CI_STAGE2_JOBS")
-  if [ "$name" = stdlib ] && [ -n "${CI_STAGE2_ONLY:-}" ]; then only=(--only $(cat "$CI_STAGE2_ONLY")); fi
-  timeout "$limit" "$f" cases "$dir" "${only[@]}" "${jflag[@]}" > "$out/$name.txt" 2> "$out/$name.err"
-  code=$?
-  echo "exit $code after $(( $(date +%s) - start ))s"
+  if [ "$name" = stdlib ] && [ -n "${CI_STAGE2_ONLY:-}" ]; then mapfile -t names < "$CI_STAGE2_ONLY"
+  elif [ "$k" -gt 1 ]; then mapfile -t names < <(case_names "$dir"); fi
+  if [ "${#names[@]}" -gt 0 ] && [ "${#names[@]}" -lt "$k" ]; then k=${#names[@]}; fi
+  echo "$k" > "$out/$name.nshards"; echo "${#names[@]}" > "$out/$name.nnames"
+  for ((i = 0; i < k; i++)); do
+    local -a only=()
+    if [ "${#names[@]}" -gt 0 ]; then
+      for ((j = i; j < ${#names[@]}; j += k)); do only+=("${names[j]}"); done
+      only=(--only "${only[@]}")
+    fi
+    ( start=$(date +%s)
+      "$here/lib/slots.sh" timeout "$limit" "$f" cases "$dir" "${only[@]}" "${jflag[@]}" > "$out/$name.$i.txt" 2> "$out/$name.$i.err"
+      echo $? > "$out/$name.$i.code"; echo $(( $(date +%s) - start )) > "$out/$name.$i.secs" ) &
+  done
+}
+
+# collect NAME: puts the shards of NAME together: $out/NAME.txt (one table and one count line, as `cases` prints them), NAME.err, NAME.code
+# (124 if a shard timed out, else the largest exit status) and NAME.secs (the slowest shard).
+collect() {
+  local name=$1 k i code=0 secs=0 c s
+  k=$(cat "$out/$name.nshards")
+  if [ "$k" -eq 1 ]; then
+    for s in txt err code secs; do cp "$out/$name.0.$s" "$out/$name.$s"; done
+    return
+  fi
+  : > "$out/$name.err"
+  for ((i = 0; i < k; i++)); do
+    c=$(cat "$out/$name.$i.code"); cat "$out/$name.$i.err" >> "$out/$name.err"
+    if [ "$c" -eq 124 ]; then code=124; elif [ "$code" -ne 124 ] && [ "$c" -gt "$code" ]; then code=$c; fi
+    s=$(cat "$out/$name.$i.secs"); [ "$s" -gt "$secs" ] && secs=$s
+  done
+  echo "$code" > "$out/$name.code"; echo "$secs" > "$out/$name.secs"
+  { echo "case  status  detail"
+    for ((i = 0; i < k; i++)); do awk '$1 ~ /\.fib$/ && NF >= 2' "$out/$name.$i.txt"; done | LC_ALL=C sort -s -k1,1
+    for ((i = 0; i < k; i++)); do grep -E '^[0-9]+ cases: ' "$out/$name.$i.txt"; done | awk '
+      { all += $1
+        for (i = 3; i < NF; i++) { w = $(i+1); gsub(/,/, "", w)
+          if (w == "pass") p += $i; else if (w == "fail") f += $i; else if (w == "pending") q += $i
+          else if (w == "header") h += $i; else if (w == "open") o += $i } }
+      END { printf "\n%d cases: %d pass, %d fail, %d pending, %d header error", all, p, f, q, h
+            if (o > 0) printf ", %d open", o
+            printf "\n"
+            if (o > 0) printf "OPEN: %d of %d cases fail as their `open` label says; an open case is not a pass.\n", o, all
+            if (q > 0) printf "PENDING: %d of %d cases did not run; pending is not a pass.\n", q, all }'
+  } > "$out/$name.txt"
+}
+
+shards=${CI_STAGE2_SHARDS:-1}
+pairs=("ownership:${LIMIT_OWNERSHIP:-400}:$(( (shards + 3) / 4 ))" "modules:${LIMIT_MODULES:-120}:1" "stdlib:${LIMIT_STDLIB:-1800}:$shards")
+if [ "$shards" -le 1 ]; then   # one process at a time, as ever
+  for pair in "${pairs[@]}"; do IFS=: read -r name limit k <<< "$pair"; launch "$name" "$limit" "$k"; wait; done
+else
+  for pair in "${pairs[@]}"; do IFS=: read -r name limit k <<< "$pair"; launch "$name" "$limit" "$k"; done
+  wait
+fi
+for pair in "${pairs[@]}"; do
+  IFS=: read -r name limit k <<< "$pair"; dir=cases/$name
+  echo "== $f cases $dir (limit ${limit}s)"
+  collect "$name"
+  code=$(cat "$out/$name.code")
+  echo "exit $code after $(cat "$out/$name.secs")s"
   tail -n 6 "$out/$name.txt"
   awk '$1 ~ /\.fib$/ && NF >= 2 && $2 != "pass" && $2 != "OPEN"' "$out/$name.txt" | cut -c1-1500
   if [ "$code" -eq 124 ]; then echo "ci-stage2: $dir timed out"; bad=1; continue; fi
   total=$(sed -n 's/^\([0-9][0-9]*\) cases: .*/\1/p' "$out/$name.txt" | tail -n 1)
   if [ -z "$total" ] || [ "$total" -eq 0 ]; then echo "ci-stage2: $dir printed no case count (exit $code)"; tail -n 20 "$out/$name.err"; bad=1; continue; fi
+  named=$(cat "$out/$name.nnames")
+  if [ "$(cat "$out/$name.nshards")" -gt 1 ] && [ "$total" -ne "$named" ]; then
+    echo "ci-stage2: $dir ran $total cases in its shards, but $named were dealt out (a name that is the prefix of another?)"; bad=1; continue
+  fi
   awk -v d="$dir" '$1 ~ /\.fib$/ && NF >= 2 && $2 != "pass" && $2 != "OPEN" { print d "/" $1 " " $2 }' "$out/$name.txt" >> "$out/actual"
 done
 sort -o "$out/actual" "$out/actual"

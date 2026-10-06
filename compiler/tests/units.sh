@@ -30,7 +30,7 @@ judge() {
   n=$(echo "${f#compiler/tests/}" | tr / _); o=$out/$n; t0=$(date +%s)
   if ! "$fibc" build "$f" -I compiler -I lib -L "$llvm" -l LLVM-21 -o "$o" > "$o.log" 2>&1; then
     echo "FAIL $f $(( $(date +%s) - t0 )) s (does not build: $(tail -n 1 "$o.log" | cut -c1-160))"; return 1; fi
-  timeout 300 "$o" > "$o.out" 2>&1; rc=$?
+  "$here/../../scripts/lib/slots.sh" timeout 300 "$o" > "$o.out" 2>&1; rc=$?
   if [ $rc -ne 0 ]; then echo "FAIL $f $(( $(date +%s) - t0 )) s (exit $rc, $(grep -c '^FAIL' "$o.out") FAIL lines: $(grep -m1 '^FAIL' "$o.out" | cut -c1-120))"; return 1; fi
   if grep -q '^FAIL' "$o.out"; then echo "FAIL $f $(( $(date +%s) - t0 )) s ($(grep -m1 '^FAIL' "$o.out" | cut -c1-140))"; return 1; fi
   grep -q '^ok' "$o.out" || { echo "FAIL $f $(( $(date +%s) - t0 )) s (it printed no ok line)"; return 1; }
@@ -46,13 +46,25 @@ if [ ${#files[@]} -eq 0 ]; then
     *) mapfile -t files < <(names units.run | grep "^compiler/tests/$part/") ;;
   esac
 fi
-n=0
-for f in "${files[@]}"; do n=$((n+1)); judge "$f" || bad=1; done
-# a pending program that passes is a stale entry
-if [ $# -eq 0 ] && { [ "$part" = all ] || [ "$part" = pending ]; }; then
-  for f in $(names units.pending); do
-    if judge "$f" > "$out/pending.line"; then echo "FAIL $f passes now: move it from units.pending to units.run"; bad=1; fi
-  done
-fi
+# The programs are independent: up to UNITS_JOBS are built and run at a time (default 1, or 16 under the gate, whose slots limit the heavy
+# processes: scripts/lib/slots.sh), each verdict line going to a file and printed in the order of the list, so the output does not depend on
+# which finished first. A pending program that passes is a stale entry.
+jobs=${UNITS_JOBS:-$([ -n "${GATE_SLOTS:-}" ] && echo 16 || echo 1)}
+pend=()
+if [ $# -eq 0 ] && { [ "$part" = all ] || [ "$part" = pending ]; }; then mapfile -t pend < <(names units.pending); fi
+n=0; i=0
+for f in "${files[@]}"; do
+  n=$((n+1)); i=$((i+1))
+  ( judge "$f" > "$out/line.$i" 2>&1; echo $? > "$out/line.$i.rc" ) &
+  while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do wait -n; done
+done
+for f in "${pend[@]}"; do
+  i=$((i+1))
+  ( if judge "$f" > "$out/pending.line.$i" 2>&1; then echo "FAIL $f passes now: move it from units.pending to units.run" > "$out/line.$i"; echo 1 > "$out/line.$i.rc"
+    else : > "$out/line.$i"; echo 0 > "$out/line.$i.rc"; fi ) &
+  while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do wait -n; done
+done
+wait
+for k in $(seq 1 "$i"); do cat "$out/line.$k"; [ "$(cat "$out/line.$k.rc")" = 0 ] || bad=1; done
 echo "$n unit programs run"
 exit $bad

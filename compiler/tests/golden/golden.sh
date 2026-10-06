@@ -10,12 +10,13 @@
 #   --fibc F     (default: FIBC, else the gate's F) builds the tools it needs into $GOLDEN_OUT/tools first (about a minute)
 # --update keeps each suite's list of inputs (the ones the Rust agreed on); --rescan takes every file the suite's globs match now, and so
 # adds the inputs stage 2 alone has judged.
-# Environment: GOLDEN_JOBS suites (and tool builds) at a time, default 4; GOLDEN_OUT scratch (default ~/.cache/fibber-scratch/golden), FIB_LIB is set to lib/ of this tree.
+# Environment: GOLDEN_JOBS suites (and tool builds) at a time, default 4 (the gate's GATE_SLOTS limit the heavy ones); GOLDEN_OUT scratch (default ~/.cache/fibber-scratch/golden), FIB_LIB is set to lib/ of this tree.
 # Prints `ok SUITE (N inputs)` or `FAIL SUITE: first differing input` for each suite; exit 0 only if none failed; 2 for a usage error.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 . "$here/suites.sh"
+. "$here/../../../scripts/lib/slots.sh"   # under the gate (GATE_SLOTS) a tool build and a suite each hold a slot; alone nothing is limited
 jobs=${GOLDEN_JOBS:-4}; show=; showf=; update=0; rescan=0; only=(); tools=; fibc=${FIBC:-}
 while [ $# -gt 0 ]; do
   case $1 in
@@ -40,7 +41,7 @@ if [ -z "$tools" ]; then
   if [ "$(cat "$tools/.stamp" 2>/dev/null)" != "$stamp" ]; then
     pids=()
     for t in read expand types own explain emit lairf; do
-      "$fibc" build "compiler/$t.fib" -I compiler -I lib -L "${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" -l LLVM-21 -o "$tools/$t" &
+      "$root/scripts/lib/slots.sh" "$fibc" build "compiler/$t.fib" -I compiler -I lib -L "${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" -l LLVM-21 -o "$tools/$t" &
       pids+=($!)
       if [ ${#pids[@]} -ge "$jobs" ]; then wait "${pids[0]}" || { echo "golden: could not build a tool" >&2; exit 2; }; pids=("${pids[@]:1}"); fi
     done
@@ -81,7 +82,7 @@ while IFS='|' read -r name tool opts _rust globs; do
   [ -z "$name" ] && continue
   if [ ${#only[@]} -gt 0 ] && [[ " ${only[*]} " != *" $name "* ]]; then continue; fi
   names+=("$name")
-  ( run_suite "$name" "$tool" "$opts" "$globs" > "$out/res.$name"; echo $? > "$out/res.$name.status" ) &
+  ( slot_acquire; run_suite "$name" "$tool" "$opts" "$globs" > "$out/res.$name"; echo $? > "$out/res.$name.status"; slot_release ) &
   running=$((running + 1))
   if [ "$running" -ge "$jobs" ]; then wait -n; running=$((running - 1)); fi
 done < <(suite_table)
