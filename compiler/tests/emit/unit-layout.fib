@@ -34,7 +34,7 @@
     ((Err e) (str-join ["err " (str-slice e 0 6)]))))
 
 (defun rep (g: Globals t: Ty) -> str
-  (match (option-rep g t) ((Ok (OptNull)) "null") ((Ok (OptBoxed)) "boxed") ((Err _) "err")))
+  (match (option-rep g t) ((Ok (OptNull)) "null") ((Ok (OptBoxed)) "boxed") ((Ok (OptValue)) "value") ((Err _) "err")))
 
 (defun main () -> i64
   (let ((cs (checks-new)) (g (globals)))
@@ -63,9 +63,9 @@
       (check cs "a weak of a dyn is a dyn, any other weak a pointer"
              (= [(lt g (TCon KWeak [(TCon (KDyn 0 false) [])])) (lt g (TCon KWeak [(ty-str)]))] ["{ ptr ptr }" "ptr"]))
       (check cs "a dyn" (= (lt g (TCon (KDyn 0 true) [])) "{ ptr ptr }"))
-      (check cs "a fieldless enum is an i32, a struct and a data enum pointers"
+      (check cs "a fieldless enum is an i32, a struct and a data enum pointers, an Option of a scalar a pair held by value"
              (= [(lt g (nom 1 [])) (lt g (nom 2 [])) (lt g (nom 3 [(ty-i64)])) (lt g (nom 0 [(ty-i64)]))]
-                ["i32" "ptr" "ptr" "ptr"]))
+                ["i32" "ptr" "ptr" "{ i1 i64 }"]))
       (check cs "a type variable is refused"
              (= [(lt g (TVar 0)) (lt g (TGen 0)) (lt g (TRigid 0))] ["err a type" "err a type" "err a type"]))
       (check cs "a raw ptr is not an object pointer"
@@ -75,10 +75,10 @@
                  (is-object g (TFn CLocal [] (ty-unit))) (is-object g (ty-scalar SPtr))]
                 [false true false true true false]))
       (check cs "option-payload" (= [(option-payload g (nom 0 [(ty-i64)])) (option-payload g (nom 2 []))] [(some (ty-i64)) nil]))
-      (check cs "an option of an object is a null pointer, of a scalar a box"
+      (check cs "an option of an object is a null pointer, of a scalar a pair held by value, of an option or unit a box"
              (= [(rep g (ty-str)) (rep g (ty-i64)) (rep g (nom 0 [(ty-str)])) (rep g (ty-unit))
                  (rep g (ty-scalar SPtr)) (rep g (nom 1 [])) (rep g (nom 2 [])) (rep g (TFn CLocal [] (ty-unit)))]
-                ["null" "boxed" "boxed" "boxed" "boxed" "boxed" "null" "null"]))
+                ["null" "value" "boxed" "boxed" "value" "value" "null" "null"]))
       (check cs "an option is a pointer" (= (lt g (nom 0 [(ty-str)])) "ptr"))
       (check cs "an option of a type variable is refused" (= (rep g (TVar 3)) "err"))
       (check cs "field types are substituted"

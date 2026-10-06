@@ -6,6 +6,9 @@
 ;;   a program with one closure (`(let ((a 5) (s "xy") (f (fn (x: i64) (+ x (+ a (str-len s)))))) (f 1))`), the four
 ;;   objects of a fresh Program and the closure of two captures (an i64 and a pointer): all three walkers of every kind
 ;;   that matters, the type table and the class table, byte for byte;
+;;   The golden is a recorded output, no longer the Rust's (the Rust is frozen): it holds the task failure slot (slot 10,
+;;   exceptions stage 1: the captures start at 11) and the kind column `fib.kinds` of P-count-b (str and array 5, weak box 3,
+;;   task 4, closure 0: rt/atom.lir `fib.freeze-check`, `fib.private-copy`); change it only when a layout is meant to change;
 ;; - SOURCE: a task object with a frame (the Rust sets the frame once its body is lowered), read from `fields` and `size`.
 ;; The tool's `--layout` compares the same code over every ground type of 1,100 programs (compare.sh, E2's report).
 ;; Run from the repository root (the golden file is read by its path).
@@ -102,11 +105,11 @@
                                     (= (objects-render (. p objects)) golden))))))
       (let ((t (objects-new)))
         (let ((tid (objects-intern t "task.k" "task k" (ObTask [LirPtr] []))))
-          (do (check cs "a task without a frame: header, three i32, four pointers, a capture" (= (obj-size (objects-get t tid)) 72))
+          (do (check cs "a task without a frame: header, three i32, five pointers (resume, result, waiters, closure, failure), a capture" (= (obj-size (objects-get t tid)) 80))
               (objects-set-task-frame t tid [(FrVal LirI64) (FrBytes 12)])
               (check cs "the frame is known once the body is lowered: an i64, then 12 bytes at 8"
-                     (and (= (obj-size (objects-get t tid)) 96)
-                          (includes (objects-render t) "(defstruct task.k (i64 i32 i32 i32 i32 i32 ptr ptr ptr ptr ptr i64 [12 x i8]))\n")))
+                     (and (= (obj-size (objects-get t tid)) 104)
+                          (includes (objects-render t) "(defstruct task.k (i64 i32 i32 i32 i32 i32 ptr ptr ptr ptr ptr ptr i64 [12 x i8]))\n")))
               (let ((c (objects-intern t "o.P" "P" (ObStruct [(some LirI64)]))))
                 (do (objects-set-task-frame t c [(FrVal LirI64)])
                     (check cs "the frame of an object that is no task is left alone" (= (obj-size (objects-get t c)) 24)))))))
