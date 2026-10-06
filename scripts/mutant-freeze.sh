@@ -12,12 +12,15 @@
 #   no-check        freeze does not look for a cell, atom, weak reference or task                   7682- 7683- 7684-
 #   frozen-false    (frozen? x) always says false                                                   7680- 7685- 7686-
 #   no-send         freeze loses its (Send a) bound: a cell inside is no longer refused by type     7681-
+#   copy-same       private-copy answers the closure itself, retained (no copy)                      7690-
+#   copy-no-retain  private-copy does not retain what the closure captured                           7690- 7692-
+#   copy-shared     private-copy marks its copy SHARED (atomic counts again)                         7690-
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default
 #   ~/.cache/fibber-scratch/mutant-freeze-MODE), MUT_J (cases at once, default 1), MUT_TIMEOUT (seconds per case, default 300).
 #   The cases run under `ulimit -v 16000000`. That the cases pass UNmutated is shown by an ordinary `F cases cases/stdlib --only 7680- ..`.
 # exit: 0 when every case failed under the mutant, 1 when one survived, 2 for a setup error.
 set -uo pipefail
-MODE=${1:?usage: mutant-freeze.sh skip-children|keep-count|shared-mask|write-in-place|no-check|frozen-false|no-send}
+MODE=${1:?usage: mutant-freeze.sh skip-children|keep-count|shared-mask|write-in-place|no-check|frozen-false|no-send|copy-same|copy-no-retain|copy-shared}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-freeze-$MODE}
 FIBC=${FIBC:-}
@@ -29,6 +32,8 @@ case $MODE in
   write-in-place) CASES=(7680-) ;;
   no-check)       CASES=(7682- 7683- 7684-) ;;
   no-send)        CASES=(7681-) ;;
+  copy-same|copy-shared) CASES=(7690-) ;;
+  copy-no-retain) CASES=(7690- 7692-) ;;
   *) echo "mutant-freeze: unknown MODE $MODE" >&2; exit 2 ;;
 esac
 
@@ -60,6 +65,12 @@ case $MODE in
     mut $A 's/\(block entry \(ret \(icmp ne \(and \(call \@fib\.flags p\) \(i32 8\)\) \(i32 0\)\)\)\)\)/(block entry (ret (i1 0))))/' ;;
   no-send)
     mut compiler/types/builtins.fib 's/"\(\(Object a\) \(Send a\)\)"/"((Object a))"/' ;;
+  copy-same)
+    mut $A 's/\(block kind \(br \(icmp ne k \(i8 0\)\) identity copy\)\)/(block kind (br (icmp eq (i8 0) (i8 0)) identity copy))/' ;;
+  copy-no-retain)
+    mut $A 's/\(indirect-call \(load ptr rec\) \(fn void \(ptr ptr\)\) p \@fib\.retain\)\n      \(ret q\)/(ret q)/' ;;
+  copy-shared)
+    mut $A 's/\(ret q\)\)\)\)\n\n\(define internal \(fib\.frozen/(atomicrmw or monotonic (getelementptr %struct.fib.hdr q (i32 0) (i32 2)) (i32 1))\n      (ret q))))\n\n(define internal (fib.frozen/' ;;
 esac
 
 cd "$OUT/tree" || exit 2

@@ -715,6 +715,22 @@ whose objects are partly frozen already freezes the rest. `freeze` may run while
 worklist, the objects of a graph that other tasks hold are `SHARED` already, and a count that another task changes after the flag is set is
 never read again.
 
+#### 2.10.2 `private-copy` (P-count-b)
+
+```
+private-copy : ∀a. (Object a, Send a) ⇒ (fn :send (a) a)      ; escapes [EscBorrow]: the argument is borrowed, the result is owned
+```
+
+`(private-copy f)` is a shallow copy of the object `f` with a count of its own: count 1, flags 0 (not `SHARED`, so its retains and releases are
+plain), every child of `f` retained once. It is made for a **closure that tasks call**. A closure call retains the closure it calls and the
+closure's body releases it (§8.4), so each call of a closure that is `SHARED` is an atomic pair on one count: 60 ns at 8 threads, where a
+private copy costs 1 to 2 ns (docs/shootout/parallel.md). A task that is to call `f` many times makes `(private-copy f)` first; the captured
+values are retained once per copy, not once per call. The copy is not shared until it is handed to another thread. It replaces what a
+`:scoped` closure colour (borrowed captures, no share-marking) would give for calls, without a new colour: a copy is an ordinary owned
+closure, so the `Send` rules and the audit are untouched (**Decided**: the colour was measured against this and not built, 3.6 of the
+design). A copy of an `IMMORTAL` object is the object; of a cell, atom, weak reference or task (`fib.kinds`), or of a string or an array
+(whose size the type table does not give), the object itself, retained: nothing is copied that has an identity or no fixed layout.
+
 ### 2.11 `weak`, `spawn`, `join`, `trap`
 
 ```

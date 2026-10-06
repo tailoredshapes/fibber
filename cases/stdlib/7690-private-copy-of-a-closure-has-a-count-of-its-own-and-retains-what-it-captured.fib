@@ -1,0 +1,43 @@
+;; spec:   spec/types.md 2.10.2 (private-copy); docs/design/parallelism.md 3.6 (P-count-b)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: private-copy
+;; `(private-copy f)` is a shallow copy of the closure `f` with a count of its own (count 1, not SHARED), while `f` itself may be SHARED
+;; (here: captured by a task first). It calls as `f` does. What `f` captured (a Vec) is retained once for the copy and released when the
+;; copy dies: the count of the Vec is one higher while the copy lives and back where it was after. A copy that is not a copy (the same
+;; object returned) fails the count and flag checks; one that does not retain its captures fails the count checks and the audit. The
+;; closure of a named function is immortal and comes back as it is.
+(ns main (:use tl.check))
+
+(defun rc (x) -> i64 (unsafe (load-i64 (raw x))))
+(defun flags (x) -> i32 (unsafe (load-i32 (ptr+ (raw x) 12))))
+
+(defun add-n (n: i64) -> i64 (+ n 1))
+
+(defun main () -> i64
+  (let ((c (checks)) (v (mapv (fn (i: i64) (* i i)) (range 10))))
+    (let ((f (fn (i: i64) (nth v i))))
+      (do (check c (= (join (spawn (fn () (f 3)))) 9))
+          (check c (not (= (bit-and (flags f) 1i32) 0i32)))
+          (let ((before (rc v)))
+            (do (let ((g (private-copy f)))
+                  (do (check c (= (g 4) 16))
+                      (check c (= (f 5) 25))
+                      (check c (= (rc g) 1))
+                      (check c (= (bit-and (flags g) 1i32) 0i32))
+                      (check c (= (bit-and (flags g) 8i32) 0i32))
+                      (check c (= (rc v) (+ before 1)))
+                      (let ((h (private-copy g)))
+                        (do (check c (= (rc v) (+ before 2)))
+                            (check c (= (h 6) 36))))
+                      (check c (= (rc v) (+ before 1)))
+                      (check c (= (g 9) 81))))
+                (check c (= (rc v) before))
+                (check c (= (f 2) 4))))
+          (let ((n (private-copy add-n)))
+            (do (check c (frozen? n))
+                (check c (= (n 41) 42))))
+          (checks-result c)))))

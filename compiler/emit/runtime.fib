@@ -1643,7 +1643,8 @@
 (define internal (fib.freeze-check void) ((ptr p))
   (block entry
     (let ((k (load i8 (getelementptr i8 @fib.kinds (zext i64 (call @fib.tid p))))))
-      (br (icmp eq k (i8 0)) done refuse)))
+      (br (icmp eq k (i8 0)) done r0)))
+  (block r0 (br (icmp eq k (i8 5)) done refuse))
   (block refuse (br (icmp eq k (i8 1)) cell r2))
   (block r2 (br (icmp eq k (i8 2)) atom r3))
   (block r3 (br (icmp eq k (i8 3)) weak task))
@@ -1700,6 +1701,32 @@
   (block entry
     (call @fib.walk p (i64 3))
     (ret)))
+
+;; `(private-copy x)` (P-count-b): a shallow copy of the object x with a count of its own: count 1, not SHARED, the children retained once.
+;; A closure that many tasks call is one object whose count every call touches (the caller retains the closure it calls and the callee
+;; releases it: an atomic pair on a SHARED closure, 60 ns at 8 threads, docs/shootout/parallel.md); a task that calls a private copy of it
+;; pays a plain count (1 to 2 ns), and the captured values are retained once per copy, not once per call. The copy is not shared until
+;; it is handed to another thread (the hand-off marks it then). An IMMORTAL object has no count and is returned as it is; an object with
+;; an identity (a cell, atom, weak reference or task, fib.kinds) and a string or an array (whose size the type table does not give) are
+;; returned retained, not copied: they are immutable or have an identity, so one count more is all a user of the \"copy\" needs. A STACK object is copied to the heap.
+;; The size of an object is its record's (header included).
+(define internal (fib.private-copy ptr) ((ptr p))
+  (block entry (br (icmp eq p (ptr null)) same check))
+  (block check
+    (let ((f (call @fib.flags p))
+          (tid (call @fib.tid p))
+          (k (load i8 (getelementptr i8 @fib.kinds (zext i64 tid)))))
+      (br (icmp ne (and f (i32 8)) (i32 0)) same kind)))
+  (block kind (br (icmp ne k (i8 0)) identity copy))
+  (block identity (call @fib.retain p) (br same))
+  (block same (ret p))
+  (block copy
+    (let ((size (call @fib.size-of tid))
+          (q (call @fib.alloc size tid))
+          (rec (getelementptr %struct.fib.typerec @fib.types tid (i32 1))))
+      (call @memcpy (getelementptr i8 q (i64 16)) (getelementptr i8 p (i64 16)) (sub size (i64 16)))
+      (indirect-call (load ptr rec) (fn void (ptr ptr)) p @fib.retain)
+      (ret q))))
 
 (define internal (fib.frozen i1) ((ptr p))
   (block entry (ret (icmp ne (and (call @fib.flags p) (i32 8)) (i32 0)))))
