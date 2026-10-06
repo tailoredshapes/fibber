@@ -1,0 +1,54 @@
+;; fib.sql.data: SQL as data (docs/design/observability-and-databases.md 5). HoneySQL's queries are Clojure maps whose values mix keywords,
+;; numbers, strings, vectors and maps; fibber's collections are homogeneous, so the query is one sum type, `SqlV`, and the `sql` macro of
+;; the facade turns literal Clojure-shaped data into it at compile time (the text a user writes is HoneySQL's). A keyword is an identifier
+;; or an operator; every other scalar is a PARAMETER (HoneySQL's default): it is never spliced into the text.
+(ns fib.sql.data (:use fib.core fib.seq fib.coll fib.datum))
+
+(defenum SqlV
+  (QNil)                                ; NULL
+  (QKw name: str)                       ; :t.id, :count, :*  (identifier, operator or function name; `-` becomes `_` when formatted)
+  (QParam value: Datum)                 ; a bound value: always `?`
+  (QRaw text: str)                      ; [:raw "..."]: text the program vouches for (HoneySQL's :raw)
+  (QVec items: (Vec SqlV))              ; [:= :id 1], [:a [:b :alias]]
+  (QMap entries: (Vec (Pair str SqlV)))) ; {:select .. :from ..}: a clause name and its value, in any order
+
+;; What a run-time value inside a query becomes: a query value stays itself (composition, subqueries), anything ToDatum is a parameter.
+(defprotocol ToSql (->sqlv (self) -> SqlV))
+(impl ToSql SqlV (->sqlv (self) self))
+(impl ToSql Datum (->sqlv (self) (match self ((DNil) QNil) (_ (QParam self)))))
+(impl ToSql i64 (->sqlv (self) (QParam (DInt self))))
+(impl ToSql f64 (->sqlv (self) (QParam (DFloat self))))
+(impl ToSql bool (->sqlv (self) (QParam (DBool self))))
+(impl ToSql str (->sqlv (self) (QParam (DStr self))))
+(impl ToSql keyword (->sqlv (self) (QKw (keyword-text self))))
+
+;; The value of clause `name` in a query map.
+(defun clause (q: (Vec (Pair str SqlV)) name: str) -> (Option SqlV)
+  (map-opt (fn (p: (Pair str SqlV)) (. p snd)) (first (filter (fn (p: (Pair str SqlV)) (= (. p fst) name)) q))))
+
+;; A query with one clause set (replaced when present): what the helper functions build on.
+(defun with-clause (q: SqlV name: str v: SqlV) -> SqlV
+  (match q
+    ((QMap es) (QMap (conj (vec (filter (fn (p: (Pair str SqlV)) (!= (. p fst) name)) es)) (Pair name v))))
+    (_ (QMap [(Pair name v)]))))
+
+;; Appends to a vector-valued clause (where several `(join ..)` or `(select ..)` calls accumulate).
+(defun add-to-clause (q: SqlV name: str items: (Vec SqlV)) -> SqlV
+  (match q
+    ((QMap es) (match (clause es name)
+                 ((some (QVec old)) (with-clause q name (QVec (into old items))))
+                 (_ (with-clause q name (QVec items)))))
+    (_ (QMap [(Pair name (QVec items))]))))
+
+(defun and-form? :private (v: SqlV) -> bool
+  (match v ((QVec items) (match (first items) ((some (QKw "and")) true) (_ false))) (_ false)))
+
+;; HoneySQL's `where` helper: a second condition is ANDed with the first (an existing [:and ..] grows by one).
+(defun add-where (q: SqlV c: SqlV) -> SqlV
+  (match q
+    ((QMap es) (match (clause es "where")
+                 (nil (with-clause q "where" c))
+                 ((some old) (with-clause q "where" (if (and-form? old)
+                                                        (match old ((QVec items) (QVec (conj items c))) (_ old))
+                                                        (QVec [(QKw "and") old c]))))))
+    (_ (with-clause q "where" c))))

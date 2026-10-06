@@ -1,0 +1,209 @@
+;; fib.sql.format: `SqlV` to text and parameters, as HoneySQL 2's `format` writes them (docs/design/observability-and-databases.md 5.3;
+;; scripts/test-sql.sh compares the two on a corpus). Numbers and strings become `?` with the value in `params`; booleans and nil are
+;; written inline as TRUE, FALSE and NULL, as HoneySQL does. Identifiers: unquoted, `-` becomes `_`; quoted (`:ansi`, which PostgreSQL
+;; and SQLite use, or `:mysql`), each dotted part is quoted and kept as written.
+(ns fib.sql.format (:use fib.core fib.seq fib.coll fib.datum fib.sql.data) (:require [fib.string :as string]))
+
+;; The quote character: "" for none, "\"" for ANSI (PostgreSQL, SQLite), "`" for MySQL.
+(defstruct Dialect (quote: str))
+
+(defun ident (d: Dialect name: str) -> str
+  (cond (= name "*") "*"
+        (= (. d quote) "") (swap-byte name 45i8 95i8)
+        :else (string/join "." (map (fn (part: str) (if (= part "*") part (str (. d quote) part (. d quote)))) (string/split name ".")))))
+
+;; `s` with every byte `from` replaced by `to` (ASCII only: `-` to `_` or a space).
+(defun swap-byte :private (s: str from: i8 to: i8) -> str
+  (let [out (cell (str-bytes s))]
+    (do (dotimes (i (str-len s)) (when (= (str-byte-at s i) from) (array-set! &out i to)))
+        (str-from-bytes @out))))
+
+(defun upper-ascii :private (s: str) -> str
+  (let [out (cell (str-bytes s))]
+    (do (dotimes (i (str-len s))
+          (let [b (str-byte-at s i)] (when (and (>= b 97i8) (<= b 122i8)) (array-set! &out i (- b 32i8)))))
+        (str-from-bytes @out))))
+
+(def binary-ops: (Vec str) ["=" "<>" "!=" "<" ">" "<=" ">=" "like" "not-like" "ilike" "+" "-" "*" "/" "%" "||"])
+
+(defun binary? :private (op: str) -> bool (some? (first (filter (fn (o: str) (= o op)) binary-ops))))
+
+(defun op-text :private (op: str) -> str (upper-ascii (swap-byte op 45i8 32i8)))
+
+;; An operator expression: what gets parentheses when it is the operand of another operator.
+(defun compound? :private (e: SqlV) -> bool
+  (match e
+    ((QVec items) (match (first items)
+                    ((some (QKw op)) (or (binary? op) (or (= op "and") (or (= op "or") (= op "in")))))
+                    (_ false)))
+    (_ false)))
+
+(defun param :private (v: Datum &ps: (Vec Datum)) -> str
+  (match v
+    ((DBool b) (if b "TRUE" "FALSE"))
+    ((DNil) "NULL")
+    (_ (do (set! ps (conj @ps v)) "?"))))
+
+(defun operand :private (d: Dialect e: SqlV &ps: (Vec Datum)) -> str
+  (let [t (expr d e &ps)] (if (compound? e) (str "(" t ")") t)))
+
+(defun join-exprs :private (d: Dialect items: (Vec SqlV) sep: str &ps: (Vec Datum)) -> str
+  (loop [i 0 out ""]
+    (if (>= i (count items)) out (recur (+ i 1) (str out (if (> i 0) sep "") (expr d (nth items i) &ps))))))
+
+;; and/or: each operand in parentheses, nil operands dropped (HoneySQL lets a helper pass nil for "no condition").
+(defun logical :private (d: Dialect op: str args: (Vec SqlV) &ps: (Vec Datum)) -> str
+  (let [kept (vec (filter (fn (a: SqlV) (match a ((QNil) false) (_ true))) args))]
+    (loop [i 0 out ""]
+      (if (>= i (count kept)) out
+          (recur (+ i 1) (str out (if (> i 0) (str " " (op-text op) " ") "") "(" (expr d (nth kept i) &ps) ")"))))))
+
+(defun binary :private (d: Dialect op: str a: SqlV b: SqlV &ps: (Vec Datum)) -> str
+  (match b
+    ((QNil) (cond (= op "=") (str (operand d a &ps) " IS NULL")
+                  (or (= op "<>") (= op "!=")) (str (operand d a &ps) " IS NOT NULL")
+                  :else (let [l (operand d a &ps)] (str l " " (op-text op) " NULL"))))
+    (_ (let [l (operand d a &ps)] (str l " " (op-text op) " " (operand d b &ps))))))
+
+(defun in-list :private (d: Dialect a: SqlV b: SqlV &ps: (Vec Datum)) -> str
+  (let [l (operand d a &ps)]
+    (match b
+      ((QVec vs) (str l " IN (" (join-exprs d vs ", " &ps) ")"))
+      (_ (str l " IN " (expr d b &ps))))))
+
+(defun call :private (d: Dialect op: str args: (Vec SqlV) &ps: (Vec Datum)) -> str
+  (cond (or (= op "and") (= op "or")) (logical d op args &ps)
+        (and (binary? op) (= (count args) 2)) (binary d op (nth args 0) (nth args 1) &ps)
+        (and (= op "in") (= (count args) 2)) (in-list d (nth args 0) (nth args 1) &ps)
+        (= op "not") (str "NOT " (operand d (nth args 0) &ps))
+        (= op "raw") (match (nth args 0) ((QParam (DStr s)) s) (_ ""))
+        :else (str (upper-ascii (swap-byte op 45i8 95i8)) "(" (join-exprs d args ", " &ps) ")")))
+
+;; Any expression: an identifier, a parameter, an operator or function form, a subquery.
+(defun expr (d: Dialect e: SqlV &ps: (Vec Datum)) -> str
+  (match e
+    ((QNil) "NULL")
+    ((QKw n) (ident d n))
+    ((QParam v) (param v &ps))
+    ((QRaw t) t)
+    ((QVec items) (match (first items)
+                    ((some (QKw op)) (call d op (vec (rest items)) &ps))
+                    (_ (str "(" (join-exprs d items ", " &ps) ")"))))
+    ((QMap es) (str "(" (query-text d es &ps) ")"))))
+;; ---- clauses: a query map in HoneySQL's clause order ----
+
+(defun names :private (d: Dialect v: SqlV) -> str
+  (match v ((QVec items) (string/join ", " (map (fn (e: SqlV) (match e ((QKw n) (ident d n)) (_ ""))) items))) ((QKw n) (ident d n)) (_ "")))
+
+;; A select or from item: an expression, or [expr alias].
+(defun item :private (d: Dialect e: SqlV &ps: (Vec Datum)) -> str
+  (match e
+    ((QVec items) (match (first items)
+                    ((some (QKw _)) (if (= (count items) 2)
+                                        (match (nth items 1) ((QKw a) (str (expr d (nth items 0) &ps) " AS " (ident d a))) (_ (expr d e &ps)))
+                                        (expr d e &ps)))
+                    (_ (if (= (count items) 2)
+                           (match (nth items 1) ((QKw a) (str (expr d (nth items 0) &ps) " AS " (ident d a))) (_ (expr d e &ps)))
+                           (expr d (nth items 0) &ps)))))
+    (_ (expr d e &ps))))
+
+(defun items :private (d: Dialect v: SqlV &ps: (Vec Datum)) -> str
+  (match v
+    ((QVec xs) (loop [i 0 out ""] (if (>= i (count xs)) out (recur (+ i 1) (str out (if (> i 0) ", " "") (item d (nth xs i) &ps))))))
+    (_ (item d v &ps))))
+
+(defun order-items :private (d: Dialect v: SqlV &ps: (Vec Datum)) -> str
+  (match v
+    ((QVec xs) (string/join ", " (map (fn (x: SqlV)
+                                        (match x
+                                          ((QVec ys) (str (ident-or-expr d (nth ys 0)) " "
+                                                          (match (nth ys 1) ((QKw dir) (upper-ascii dir)) (_ "ASC"))))
+                                          (_ (str (ident-or-expr d x) " ASC"))))
+                                      xs)))
+    (_ "")))
+
+(defun ident-or-expr :private (d: Dialect e: SqlV) -> str (match e ((QKw n) (ident d n)) (_ "?")))
+
+(defun joins :private (d: Dialect kind: str v: SqlV &ps: (Vec Datum)) -> str
+  (match v
+    ((QVec xs) (loop [i 0 out ""]
+                 (if (>= (+ i 1) (count xs)) out
+                     (let [t (item d (nth xs i) &ps)] (recur (+ i 2) (str out " " kind " " t " ON " (expr d (nth xs (+ i 1)) &ps)))))))
+    (_ "")))
+
+(defun ctes :private (d: Dialect v: SqlV &ps: (Vec Datum)) -> str
+  (match v
+    ((QVec xs) (loop [i 0 out ""]
+                 (if (>= i (count xs)) out
+                     (match (nth xs i)
+                       ((QVec ys) (match (nth ys 0)
+                                    ((QKw n) (let [q (expr d (nth ys 1) &ps)] (recur (+ i 1) (str out (if (> i 0) ", " "") (ident d n) " AS " q))))
+                                    (_ (recur (+ i 1) out))))
+                       (_ (recur (+ i 1) out))))))
+    (_ "")))
+
+(defun set-pairs :private (d: Dialect v: SqlV &ps: (Vec Datum)) -> str
+  (match v
+    ((QMap es) (loop [i 0 out ""]
+                 (if (>= i (count es)) out
+                     (let [p (nth es i)] (recur (+ i 1) (str out (if (> i 0) ", " "") (ident d (. p fst)) " = " (expr d (. p snd) &ps)))))))
+    (_ "")))
+
+(defun row-text :private (d: Dialect vals: (Vec SqlV) &ps: (Vec Datum)) -> str (str "(" (join-exprs d vals ", " &ps) ")"))
+
+;; VALUES of maps (the columns are the first map's keys, in order) or of vectors (with :columns).
+(defun insert-values :private (d: Dialect cols: (Option SqlV) v: SqlV &ps: (Vec Datum)) -> str
+  (match v
+    ((QVec rows)
+     (match (first rows)
+       ((some (QMap first-es))
+        (let [ks (vec (map (fn (p: (Pair str SqlV)) (. p fst)) first-es))]
+          (str " (" (string/join ", " (map (fn (k: str) (ident d k)) ks)) ") VALUES "
+               (loop [i 0 out ""]
+                 (if (>= i (count rows)) out
+                     (recur (+ i 1) (str out (if (> i 0) ", " "")
+                                         (row-text d (vec (map (fn (k: str) (match (nth rows i) ((QMap es) (unwrap-or (clause es k) QNil)) (_ QNil))) ks)) &ps))))))))
+       (_ (str (match cols ((some c) (str " (" (names d c) ")")) (nil "")) " VALUES "
+               (loop [i 0 out ""]
+                 (if (>= i (count rows)) out
+                     (recur (+ i 1) (str out (if (> i 0) ", " "") (match (nth rows i) ((QVec vs) (row-text d vs &ps)) (_ ""))))))))))
+    (_ "")))
+
+(defun part :private (d: Dialect es: (Vec (Pair str SqlV)) name: str &ps: (Vec Datum)) -> str
+  (match (clause es name)
+    (nil "")
+    ((some v) (cond (= name "with") (str " WITH " (ctes d v &ps))
+                    (= name "select") (str " SELECT " (items d v &ps))
+                    (= name "select-distinct") (str " SELECT DISTINCT " (items d v &ps))
+                    (= name "insert-into") (str " INSERT INTO " (item d v &ps) (insert-values d (clause es "columns") (unwrap-or (clause es "values") QNil) &ps))
+                    (= name "update") (str " UPDATE " (item d v &ps))
+                    (= name "delete-from") (str " DELETE FROM " (item d v &ps))
+                    (= name "set") (str " SET " (set-pairs d v &ps))
+                    (= name "from") (str " FROM " (items d v &ps))
+                    (= name "join") (joins d "INNER JOIN" v &ps)
+                    (= name "left-join") (joins d "LEFT JOIN" v &ps)
+                    (= name "where") (str " WHERE " (expr d v &ps))
+                    (= name "group-by") (str " GROUP BY " (items d v &ps))
+                    (= name "having") (str " HAVING " (expr d v &ps))
+                    (= name "order-by") (str " ORDER BY " (order-items d v &ps))
+                    (= name "limit") (str " LIMIT " (expr d v &ps))
+                    (= name "offset") (str " OFFSET " (expr d v &ps))
+                    (= name "returning") (str " RETURNING " (items d v &ps))
+                    :else ""))))
+
+(def clause-order: (Vec str) ["with" "select" "select-distinct" "insert-into" "update" "delete-from" "set" "from" "join" "left-join"
+                               "where" "group-by" "having" "order-by" "limit" "offset" "returning"])
+
+(defun set-op :private (d: Dialect v: SqlV sep: str &ps: (Vec Datum)) -> str
+  (match v ((QVec qs) (join-exprs-bare d qs sep &ps)) (_ "")))
+
+(defun join-exprs-bare :private (d: Dialect qs: (Vec SqlV) sep: str &ps: (Vec Datum)) -> str
+  (loop [i 0 out ""]
+    (if (>= i (count qs)) out
+        (recur (+ i 1) (str out (if (> i 0) sep "") (match (nth qs i) ((QMap es) (query-text d es &ps)) (e (expr d e &ps))))))))
+
+(defun query-text (d: Dialect es: (Vec (Pair str SqlV)) &ps: (Vec Datum)) -> str
+  (cond (some? (clause es "union")) (set-op d (unwrap (clause es "union")) " UNION " &ps)
+        (some? (clause es "union-all")) (set-op d (unwrap (clause es "union-all")) " UNION ALL " &ps)
+        :else (let [t (loop [i 0 acc ""] (if (>= i (count clause-order)) acc (recur (+ i 1) (str acc (part d es (nth clause-order i) &ps)))))]
+                (subs t 1 (str-len t)))))

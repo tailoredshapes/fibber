@@ -1,0 +1,42 @@
+;; fib.sql (docs/design/observability-and-databases.md 5): what the HoneySQL corpus (scripts/test-sql.sh) cannot show because HoneySQL has
+;; no fibber values: run-time values become parameters, queries compose as values, the helper macros build what the literal builds, and
+;; a hostile string stays a parameter. The expected texts are HoneySQL 2.7.1479's for the same data.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.sql) (:require [fib.db.core :as db]))
+
+(defun text (q: db/Query) -> str (. q sql))
+(defun params (q: db/Query) -> str (string-of (map datum-text (. q params))))
+(defun string-of (xs: (LSeq str)) -> str (reduce (fn (acc: str s: str) (if (= acc "") s (str acc "," s))) "" xs))
+
+(defun by-name (name: str limit-n: i64) -> SqlV
+  (sql {:select [:id :name] :from [:people] :where [:= :name name] :limit limit-n}))
+
+(defspecs specs
+  (feature "fib.sql"
+    (scenario "run-time values are parameters, in order"
+      (given [q (format (by-name "ann" 5))])
+      (then (expect = "SELECT id, name FROM people WHERE name = ? LIMIT ?" (text q)) (expect = "ann,5" (params q))))
+    (scenario "a hostile string is a parameter, never text"
+      (given [q (format (by-name "x'); drop table people; --" 1))])
+      (then (expect = "SELECT id, name FROM people WHERE name = ? LIMIT ?" (text q))
+            (expect = "x'); drop table people; --,1" (params q))))
+    (scenario "a query value composes as a subquery"
+      (given [inner (sql {:select [:tid] :from [:u] :where [:> :score 10]})
+              q (format (sql {:select [:a] :from [:t] :where [:and [:in :id inner] [:= :kind "x"]]}))])
+      (then (expect = "SELECT a FROM t WHERE (id IN (SELECT tid FROM u WHERE score > ?)) AND (kind = ?)" (text q))
+            (expect = "10,x" (params q))))
+    (scenario "the helpers build what the literal builds"
+      (given [h (format (-> (select :a [:b :bee]) (from :t) (where [:= :id 7]) (order-by [:a :desc]) (limit 3)))
+              l (format (sql {:select [:a [:b :bee]] :from [:t] :where [:= :id 7] :order-by [[:a :desc]] :limit 3}))])
+      (then (expect = (text l) (text h)) (expect = (params l) (params h))
+            (expect = "SELECT a, b AS bee FROM t WHERE id = ? ORDER BY a DESC LIMIT ?" (text h))))
+    (scenario "select called twice adds columns; where called twice ANDs (honey.sql.helpers)"
+      (given [q (format (-> (select :a) (select :b) (from :t) (where [:= :x 1]) (where [:= :y 2])))])
+      (then (expect = "SELECT a, b FROM t WHERE (x = ?) AND (y = ?)" (text q)) (expect = "1,2" (params q))))
+    (scenario "dialects quote identifiers; parameters do not change"
+      (given [q (sql {:update :app-users :set {:full-name "Ann"} :where [:= :user-id 3]})])
+      (then (expect = "UPDATE app_users SET full_name = ? WHERE user_id = ?" (text (format q)))
+            (expect = "UPDATE \"app-users\" SET \"full-name\" = ? WHERE \"user-id\" = ?" (text (format-with q :ansi)))
+            (expect = "UPDATE `app-users` SET `full-name` = ? WHERE `user-id` = ?" (text (format-with q :mysql)))
+            (expect = "Ann,3" (params (format-with q :mysql)))))))
+
+(defun main () -> i64 (run-main (specs)))
