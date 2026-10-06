@@ -81,6 +81,25 @@ x86-64-v3 (`x86-64`, `x86-64-v2`) still builds, but it is outside the supported 
 `fibc targets` lists the code generation targets and which are supported; riscv64 is parked
 (LLVM has no `tailcc` for RISC-V) and `fibc build --target` refuses it without `--allow-unsupported`.
 
+## Catching traps
+
+A trap (an index out of range, an integer overflow, `(trap msg)`, `unwrap` of `nil`) aborts the program unless a
+`try` of `fib.ex` is active on the thread; then it unwinds to that `try`, and every object the unwound frames owned
+is freed (the audit stays clean):
+
+```clojure
+(ns main (:use fib.core fib.ex))
+
+(defun main () -> i64
+  (try (nth [1 2 3] 10)
+       (catch e :when (= (ex-kind e) (some "index")) -1)
+       (finally (println "done"))))
+```
+
+`throw` throws an `(ex-info ..)`-shaped exception; with no `try` active it is the trap of its message. Out of memory,
+a stack overflow, a thread that cannot start and a trap inside a `finally` that runs while unwinding stay fatal. Only
+a program that catches pays for it: the others compile exactly as before (docs/adr/0009, docs/design/exceptions.md).
+
 ## Projects and dependencies
 
 A project is a directory with a `deps.fib`; libraries come from git commits (or local directories). `fibc new`

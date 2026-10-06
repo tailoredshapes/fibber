@@ -85,3 +85,13 @@ its toolchain guarantees tail calls between functions of any signature (LLVM `ta
 multiply-add. Consequences: the x86-64 baseline is x86-64-v3 (AVX2 and FMA; releases move from x86-64-v2); AArch64 is unchanged; riscv64 is
 parked until LLVM implements `tailcc` for RISC-V (its emit check stays, to notice when it lands). wasm and JS: open question to the owner
 (proposal: portability targets with software FMA and return_call/trampolines, same results, slower).
+
+## Exceptions stage 2 (docs/design/exceptions.md 9, docs/adr/0009), decided by the agent on 2026-10-06 within the lead's brief
+
+1 The may-throw effect is decided per program: a program that calls `catch-run` compiles every function to return its failure next to its
+value, any other compiles as before (identical user code); a per-function inference inside a catching program is not built. 2 A result of
+two leaves or a SIMD vector takes a failure slot parameter instead of a third leaf, so that tail calls still jump. 3 `cell-update!`'s
+function and a function with an `array-take!` do not pass failures on (fatal there) in place of poisoning and of a trap-free-region
+checker: sound, and catchability there is what is lost. 4 `try` is a macro of fib.ex over the builtin `catch-run` and a closure, not a
+core form; one exception type, `(ExInfo (Map keyword Datum))`, and `(catch e :when cond ..)` for Clojure's `(catch T e ..)`. 5 A trap
+unwinds only while a catch is active on its thread; elsewhere it is the trap it was (abort, or the task's failure of stage 1).
