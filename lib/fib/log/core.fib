@@ -1,0 +1,117 @@
+;; fib.log.core: levels, records, the Sink protocol, loggers and their configuration (docs/design/observability-and-databases.md 2).
+;; The macros that make a disabled call cost one compare are in the facade `fib.log`; this module is the functions they call.
+;;
+;; No process-wide state: a `LogSystem` is a value (the sink, the level table, the failure count) built once at start-up and passed down,
+;; and a `Logger` is a value made from it (a name, its resolved level, its context fields). A task logs with the logger its closure
+;; captured, so the context fields of the logger travel into `spawn`, `fork` of `with-tasks` and `pmap` the way any captured value does
+;; (design 2.4: the measured alternative is a task-local slot).
+(ns fib.log.core (:use fib.core fib.seq fib.coll fib.datum) (:require [fib.os :as os] [fib.string :as string]))
+
+(def TRACE: i64 0)
+(def DEBUG: i64 1)
+(def INFO: i64 2)
+(def WARN: i64 3)
+(def ERROR: i64 4)
+(def FATAL: i64 5)
+(def OFF: i64 6)
+
+(defun level-name (level: i64) -> str
+  (cond (= level 0) "TRACE" (= level 1) "DEBUG" (= level 2) "INFO" (= level 3) "WARN" (= level 4) "ERROR" (= level 5) "FATAL" :else "OFF"))
+
+;; ASCII lower case (level names are ASCII; fib.string has no lower-case yet).
+(defun ascii-lower :private (s: str) -> str
+  (let [out (cell (str-bytes s))]
+    (do (dotimes (i (str-len s))
+          (let [b (str-byte-at s i)] (when (and (>= b 65i8) (<= b 90i8)) (array-set! &out i (+ b 32i8)))))
+        (str-from-bytes @out))))
+
+;; A level from its name, any case ("info", "WARN"); nil for anything else.
+(defun parse-level (text: str) -> (Option i64)
+  (let [t (ascii-lower (string/trim text))]
+    (cond (= t "trace") (some 0) (= t "debug") (some 1) (= t "info") (some 2) (= t "warn") (some 3)
+          (= t "error") (some 4) (= t "fatal") (some 5) (= t "off") (some 6) :else nil)))
+
+;; One event: the fields are the logger's context first, then the call's own, in order (a key may repeat; a sink shows every pair).
+(defstruct LogRecord (level: i64 logger: str message: str fields: (Vec (Pair keyword Datum)) time-ns: i64))
+
+;; Where records go. A sink must be safe to call from many tasks at once (each record is written whole or not at all) and must not trap:
+;; a failure is an `Err` that the logger counts and reports once (log4j's StatusLogger), never the program's end.
+(defprotocol Sink
+  (sink-write (self rec: LogRecord) -> (Result unit str)))
+
+;; The levels: `root` for every logger no rule names, and rules by name prefix ("app.db" covers "app.db" and "app.db.pool"); the longest
+;; matching prefix wins, as log4j's logger hierarchy does.
+(defstruct LevelTable (root: i64 rules: (Vec (Pair str i64))))
+
+(defstruct LogSystem (sink: (dyn Sink :send) levels: LevelTable failures: (Atom i64)))
+
+(defstruct Logger (name: str level: i64 context: (Vec (Pair keyword Datum)) system: LogSystem))
+
+(defun log-system (sink: (dyn Sink :send) levels: LevelTable) -> LogSystem
+  (LogSystem sink levels (atom 0)))
+
+(defun covers? :private (prefix: str name: str) -> bool
+  (or (= prefix name) (and (starts-with? name prefix) (= (str-byte-at name (str-len prefix)) 46i8))))
+
+(defun level-for (t: LevelTable name: str) -> i64
+  (let [rules (. t rules)]
+    (loop [i 0 best-len -1 best (. t root)]
+      (if (>= i (count rules))
+          best
+          (let [r (nth rules i) p (. r fst)]
+            (if (and (covers? p name) (> (str-len p) best-len))
+                (recur (+ i 1) (str-len p) (. r snd))
+                (recur (+ i 1) best-len best)))))))
+
+(defun get-logger (sys: LogSystem name: str) -> Logger
+  (Logger name (level-for (. sys levels) name) [] sys))
+
+;; The one compare a disabled call costs (the macros put it around the call; design 2.5).
+(defun enabled? (lg: Logger level: i64) -> bool (>= level (. lg level)))
+
+;; A logger with more context fields: what a request handler does once, then hands to everything it calls and every task it starts.
+(defun add-context (lg: Logger fields: (Vec (Pair keyword Datum))) -> Logger
+  (Logger (. lg name) (. lg level) (into (. lg context) fields) (. lg system)))
+
+(defun failures (sys: LogSystem) -> i64 @(. sys failures))
+
+(defun count-failure :private (sys: LogSystem message: str) -> unit
+  (let [n (swap! (. sys failures) (fn (v: i64) (+ v 1)))]
+    (when (= n 1) (eprintln (str "fib.log: a sink failed (further failures are counted, not printed): " message)))))
+
+;; Builds the record and hands it to the sink. Called only when `enabled?` said yes.
+(defun emit (lg: Logger level: i64 message: str fields: (Vec (Pair keyword Datum))) -> unit
+  (let [sys (. lg system)
+        rec (LogRecord level (. lg name) message (into (. lg context) fields) (os/wall-now))]
+    (match (sink-write (. sys sink) rec)
+      ((Ok _) ())
+      ((Err m) (count-failure sys m)))))
+
+;; ---- configuration: data, and the environment ----
+
+;; "app.db=debug,app.http=warn" as rules; a malformed or unknown entry is skipped (a log configuration must not stop a program).
+(defun parse-rules (text: str) -> (Vec (Pair str i64))
+  (reduce (fn (out: (Vec (Pair str i64)) entry: str)
+            (match (str-find entry "=" 0)
+              (nil out)
+              ((some i) (match (parse-level (subs entry (+ i 1) (str-len entry)))
+                          (nil out)
+                          ((some l) (conj out (Pair (string/trim (subs entry 0 i)) l)))))))
+          [] (string/split text ",")))
+
+;; FIB_LOG_LEVEL (the root, default info) and FIB_LOG_LEVELS (rules as above).
+(defun levels-from-env () -> LevelTable
+  (LevelTable (unwrap-or (and-then (os/getenv "FIB_LOG_LEVEL") parse-level) 2)
+              (match (os/getenv "FIB_LOG_LEVELS") (nil []) ((some t) (parse-rules t)))))
+
+;; The data form of a configuration: a root level name and a map of prefix to level name; Err names the first bad level.
+(defun levels-from-map (root: str rules: (Map str str)) -> (Result LevelTable str)
+  (match (parse-level root)
+    (nil (Err (str "unknown level " root)))
+    ((some r) (reduce (fn (acc: (Result LevelTable str) p: (Pair str str))
+                        (match acc
+                          ((Err e) (Err e))
+                          ((Ok t) (match (parse-level (. p snd))
+                                    (nil (Err (str "unknown level " (. p snd) " for " (. p fst))))
+                                    ((some l) (Ok (LevelTable (. t root) (conj (. t rules) (Pair (. p fst) l)))))))))
+                      (Ok (LevelTable r [])) rules))))

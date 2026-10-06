@@ -1,0 +1,84 @@
+;; fib.datum: the one value type that log fields, telemetry attributes and database columns share (docs/design/observability-and-databases.md
+;; 4.1). Clojure puts any value in a log call, a span attribute or a result row; fibber's collections are homogeneous, so the three libraries
+;; agree on a small closed enum instead: SQL's and OpenTelemetry's scalar kinds (null, boolean, integer, double, string, bytes). It is not
+;; the spec's `Val` (stdlib §4.13, fib.data): `Val` is the dynamic value of the whole language (nested maps and vectors), which nobody has
+;; designed yet; `Datum` is the scalar subset these libraries need now, and a `Val` would embed it.
+;;
+;;   (->datum x)        a Datum from an i64, f64, bool, str, keyword or Datum (the protocol `ToDatum`; a library type adds an impl)
+;;   (as-int d) ..      the payload when the kind matches: as-int as-float as-str as-bool, each an Option
+;;   (datum= a b)       equality (bytes compare by content; a NaN is not equal to itself, as `=` on f64)
+;;   (datum-text d)     the plain text: what a text log line shows (a string unquoted, nil as `nil`, bytes as hex)
+;;   (datum-json d)     the JSON text (a string quoted and escaped; NaN and the infinities as strings, JSON has no such numbers)
+(ns fib.datum (:use fib.core fib.seq fib.coll))
+
+(defenum Datum (DNil) (DBool b: bool) (DInt i: i64) (DFloat f: f64) (DStr s: str) (DBytes bytes: (Array i8)))
+
+(defprotocol ToDatum (->datum (self) -> Datum))
+(impl ToDatum Datum (->datum (self) self))
+(impl ToDatum i64 (->datum (self) (DInt self)))
+(impl ToDatum f64 (->datum (self) (DFloat self)))
+(impl ToDatum bool (->datum (self) (DBool self)))
+(impl ToDatum str (->datum (self) (DStr self)))
+(impl ToDatum keyword (->datum (self) (DStr (keyword-text self))))
+
+;; The name of a keyword without its colon: `:user-id` is "user-id" (Clojure's `name`, which the prelude lacks).
+(defun keyword-text (k: keyword) -> str
+  (let [s (str k)] (subs s 1 (str-len s))))
+
+(defun as-int (d: Datum) -> (Option i64) (match d ((DInt i) (some i)) (_ nil)))
+(defun as-float (d: Datum) -> (Option f64) (match d ((DFloat f) (some f)) ((DInt i) (some (double i))) (_ nil)))
+(defun as-str (d: Datum) -> (Option str) (match d ((DStr s) (some s)) (_ nil)))
+(defun as-bool (d: Datum) -> (Option bool) (match d ((DBool b) (some b)) (_ nil)))
+
+(defun bytes= :private (a: (Array i8) b: (Array i8)) -> bool
+  (and (= (array-len a) (array-len b))
+       (loop [i 0] (cond (>= i (array-len a)) true
+                         (!= (array-get a i) (array-get b i)) false
+                         :else (recur (+ i 1))))))
+
+(defun datum= (a: Datum b: Datum) -> bool
+  (match a
+    ((DNil) (match b ((DNil) true) (_ false)))
+    ((DBool x) (match b ((DBool y) (= x y)) (_ false)))
+    ((DInt x) (match b ((DInt y) (= x y)) (_ false)))
+    ((DFloat x) (match b ((DFloat y) (= x y)) (_ false)))
+    ((DStr x) (match b ((DStr y) (= x y)) (_ false)))
+    ((DBytes x) (match b ((DBytes y) (bytes= x y)) (_ false)))))
+
+(defun hex-digit :private (n: i64) -> str (subs "0123456789abcdef" n (+ n 1)))
+
+(defun hex :private (bytes: (Array i8)) -> str
+  (loop [i 0 out ""]
+    (if (>= i (array-len bytes))
+        out
+        (let [b (bit-and (sext i64 (array-get bytes i)) 255)]
+          (recur (+ i 1) (str out (hex-digit (bit-shift-right b 4)) (hex-digit (bit-and b 15))))))))
+
+(defun datum-text (d: Datum) -> str
+  (match d
+    ((DNil) "nil") ((DBool b) (str b)) ((DInt i) (str i)) ((DFloat f) (str f)) ((DStr s) s) ((DBytes b) (hex b))))
+
+;; The JSON escape of one byte, or "" when it stands for itself.
+(defun json-escape :private (c: i64) -> str
+  (cond (= c 34) "\\\"" (= c 92) "\\\\" (= c 10) "\\n" (= c 13) "\\r" (= c 9) "\\t"
+        (< c 32) (str "\\u00" (hex-digit (bit-shift-right c 4)) (hex-digit (bit-and c 15)))
+        :else ""))
+
+;; `s` as a JSON string, quotes included. UTF-8 above ASCII passes through (JSON text is UTF-8); a string with nothing to escape is
+;; copied once.
+(defun json-quote (s: str) -> str
+  (loop [i 0 start 0 out "\""]
+    (if (>= i (str-len s))
+        (str out (subs s start i) "\"")
+        (let [e (json-escape (bit-and (sext i64 (str-byte-at s i)) 255))]
+          (if (= e "")
+              (recur (+ i 1) start out)
+              (recur (+ i 1) (+ i 1) (str out (subs s start i) e)))))))
+
+(defun json-float :private (f: f64) -> str
+  (cond (!= f f) "\"NaN\"" (> f 1.0e308) "\"Infinity\"" (< f -1.0e308) "\"-Infinity\"" :else (str f)))
+
+(defun datum-json (d: Datum) -> str
+  (match d
+    ((DNil) "null") ((DBool b) (str b)) ((DInt i) (str i)) ((DFloat f) (json-float f))
+    ((DStr s) (json-quote s)) ((DBytes b) (json-quote (hex b)))))

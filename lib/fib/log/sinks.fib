@@ -1,0 +1,75 @@
+;; fib.log.sinks: rendering a record as a text line or a JSON line, and the sinks of the first slice (design 2.6): console text, JSON lines
+;; to a descriptor, and a memory sink for tests. A line is rendered whole and written with one `write-all`, so lines of different tasks do
+;; not interleave inside a line on a pipe or an O_APPEND file (a write of at most PIPE_BUF bytes to a pipe is atomic; a longer line, or a
+;; partial write that `write-all` resumes, can interleave: the async sink of package L2 serialises instead).
+(ns fib.log.sinks (:use fib.core fib.seq fib.coll fib.datum fib.log.core) (:require [fib.os :as os]))
+
+(defun pad2 :private (n: i64) -> str (if (< n 10) (str "0" n) (str n)))
+(defun pad3 :private (n: i64) -> str (cond (< n 10) (str "00" n) (< n 100) (str "0" n) :else (str n)))
+
+;; The UTC civil date of a count of days since 1970-01-01 (H. Hinnant's days_from_civil inverse), as "YYYY-MM-DD"; days >= 0.
+(defun civil-date :private (days: i64) -> str
+  (let [z (+ days 719468)
+        era (quot z 146097)
+        doe (- z (* era 146097))
+        yoe (quot (- (+ (- doe (quot doe 1460)) (quot doe 36524)) (quot doe 146096)) 365)
+        doy (- doe (- (+ (* 365 yoe) (quot yoe 4)) (quot yoe 100)))
+        mp (quot (+ (* 5 doy) 2) 153)
+        d (+ (- doy (quot (+ (* 153 mp) 2) 5)) 1)
+        m (if (< mp 10) (+ mp 3) (- mp 9))
+        y (+ (+ yoe (* era 400)) (if (<= m 2) 1 0))]
+    (str y "-" (pad2 m) "-" (pad2 d))))
+
+;; Nanoseconds since the epoch as ISO 8601 UTC with milliseconds: "2026-10-06T09:15:02.123Z".
+(defun iso-utc (ns: i64) -> str
+  (let [ms (quot ns 1000000)
+        secs (quot ms 1000)
+        day-secs (rem secs 86400)]
+    (str (civil-date (quot secs 86400)) "T" (pad2 (quot day-secs 3600)) ":" (pad2 (quot (rem day-secs 3600) 60)) ":"
+         (pad2 (rem day-secs 60)) "." (pad3 (rem ms 1000)) "Z")))
+
+(defun field-text :private (p: (Pair keyword Datum)) -> str
+  (let [v (. p snd)]
+    (str (keyword-text (. p fst)) "="
+         (match v ((DStr s) (if (or (some? (str-find s " " 0)) (= s "")) (json-quote s) s)) (_ (datum-text v))))))
+
+;; `2026-10-06T09:15:02.123Z INFO  app.db - connected host=db1 port=5432` and a newline.
+(defun render-text (r: LogRecord) -> str
+  (let [lname (level-name (. r level))
+        head (str (iso-utc (. r time-ns)) " " lname (if (= (str-len lname) 4) "  " " ") (. r logger) " - " (. r message))]
+    (str (reduce (fn (acc: str p: (Pair keyword Datum)) (str acc " " (field-text p))) head (. r fields)) "\n")))
+
+;; One JSON object and a newline: `ts`, `level`, `logger`, `msg`, then the fields in order (a field named like one of the four is still
+;; written: a JSON reader keeps the last, so a field cannot hide the header unless it repeats it; L2 decides whether to prefix them).
+(defun render-json (r: LogRecord) -> str
+  (let [head (str "{\"ts\":" (json-quote (iso-utc (. r time-ns))) ",\"level\":" (json-quote (level-name (. r level)))
+                  ",\"logger\":" (json-quote (. r logger)) ",\"msg\":" (json-quote (. r message)))]
+    (str (reduce (fn (acc: str p: (Pair keyword Datum))
+                   (str acc "," (json-quote (keyword-text (. p fst))) ":" (datum-json (. p snd))))
+                 head (. r fields))
+         "}\n")))
+
+(defun write-line :private (fd: i64 line: str) -> (Result unit str)
+  (match (os/write-all fd (str-bytes line)) ((Ok _) (Ok ())) ((Err e) (Err (. e message)))))
+
+(defstruct TextSink (fd: i64))
+(impl Sink TextSink (sink-write (self r) (write-line (. self fd) (render-text r))))
+
+(defstruct JsonSink (fd: i64))
+(impl Sink JsonSink (sink-write (self r) (write-line (. self fd) (render-json r))))
+
+;; Keeps every record, for tests (the Appender contract runs against it as against the others).
+(defstruct MemorySink (records: (Atom (Vec LogRecord))))
+(impl Sink MemorySink (sink-write (self r) (do (swap! (. self records) (fn (v: (Vec LogRecord)) (conj v r))) (Ok ()))))
+
+(defun memory-sink () -> MemorySink (MemorySink (atom [])))
+(defun memory-records (m: MemorySink) -> (Vec LogRecord) @(. m records))
+
+;; Text on standard error (the default, as log4j's console appender), JSON lines on a descriptor.
+(defun console-text () -> (dyn Sink :send) (dyn Sink :send (TextSink 2)))
+(defun json-lines (fd: i64) -> (dyn Sink :send) (dyn Sink :send (JsonSink fd)))
+
+;; The system a program gets with no code: FIB_LOG_FORMAT=json for JSON lines on standard error, text otherwise; levels from the
+;; environment (fib.log.core/levels-from-env).
+(defun system-from-env () -> LogSystem
+  (log-system (if (= (os/getenv "FIB_LOG_FORMAT") (some "json")) (json-lines 2) (console-text)) (levels-from-env)))

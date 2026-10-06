@@ -1,0 +1,34 @@
+;; The Appender contract of fib.log (docs/design/observability-and-databases.md 2.6, 6): what any sink must do, whoever implements it. A
+;; `make` builds a fresh `SinkProbe`: the sink, and a function that returns the lines the sink produced so far (for a sink that writes a
+;; descriptor, what came out of it; for the memory sink, its records rendered). Every scenario logs through the library's own logger.
+(ns log-appender-contract (:use fib.core fib.seq fib.coll fib.test.core fib.log fib.parallel) (:require [fib.string :as string]))
+
+(defstruct SinkProbe (sink: (dyn Sink :send) lines: (fn :send () (Vec str))))
+
+(defun probe-logger (p: SinkProbe) -> Logger
+  (get-logger (log-system (. p sink) (LevelTable 0 [])) "contract"))
+
+(defun whole-json? (line: str) -> bool
+  (and (string/starts-with? line "{\"ts\":\"") (string/ends-with? line "}")))
+
+(defcontract AppenderContract [make]
+  (scenario "every record arrives once, as one whole line"
+    (covers "fib.log sink-write")
+    (given [p (make) lg (probe-logger p)])
+    (upon [_ (do (info lg "one" :n 1) (warn lg "two" :n 2) (error lg "three" :n 3))])
+    (then (expect = 3 (count ((. p lines))))
+          (expect = true (every? whole-json? ((. p lines))))))
+  (scenario "records written by several tasks at once arrive whole"
+    (covers "fib.log sink-write")
+    (given [p (make) lg (probe-logger p)])
+    (upon [_ (with-tasks [s]
+               (do (dotimes (t 4) (fork s (fn () (dotimes (i 25) (info lg "from a task" :task t :i i))))) ()))])
+    (then (expect = 100 (count ((. p lines))))
+          (expect = true (every? whole-json? ((. p lines))))))
+  (scenario "the fields come out in order, after the header"
+    (covers "fib.log render-json")
+    (given [p (make) lg (with-context (probe-logger p) :req "r-9")])
+    (upon [_ (info lg "hello" :a 1 :b "x y" :c true)])
+    (then (expect = true (string/includes? (first-or ((. p lines)) "") "\"msg\":\"hello\",\"req\":\"r-9\",\"a\":1,\"b\":\"x y\",\"c\":true}")))))
+
+(defun first-or (v: (Vec str) d: str) -> str (if (> (count v) 0) (nth v 0) d))

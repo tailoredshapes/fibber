@@ -1,0 +1,97 @@
+;; fib.log (docs/design/observability-and-databases.md 2): levels, structured fields, lazy disabled levels, the level table, context carried
+;; into tasks, the text and JSON renderings, a failing sink, and the Appender contract against the memory sink and JSON lines on a pipe.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.log fib.parallel log-appender-contract)
+  (:require [fib.os :as os] [fib.string :as string]))
+
+(defun mem-logger (m: MemorySink root: i64 name: str) -> Logger
+  (get-logger (log-system (dyn Sink :send m) (LevelTable root [(Pair "app.db" DEBUG) (Pair "app.db.pool" WARN)])) name))
+
+(defun fixed (level: i64 fields: (Vec (Pair keyword Datum))) -> LogRecord
+  (LogRecord level "app.db" "connected" fields 1791277502123000000))
+
+;; A sink that always fails: the program must go on and count it.
+(defstruct BrokenSink (tries: (Atom i64)))
+(impl Sink BrokenSink (sink-write (self r) (do (swap! (. self tries) (fn (v: i64) (+ v 1))) (Err "disk full"))))
+
+;; ---- the two implementations the Appender contract runs against
+(defun memory-probe () -> SinkProbe
+  (let [m (memory-sink)]
+    (SinkProbe (dyn Sink :send m) (fn () (vec (map render-json-line (memory-records m)))))))
+
+(defun render-json-line (r: LogRecord) -> str (let [s (render-json r)] (subs s 0 (- (str-len s) 1))))
+
+(defun drain (fd: i64) -> str
+  (loop [out ""]
+    (match (os/read-fd fd 65536)
+      ((Ok b) (if (= (array-len b) 0) out (recur (str out (str-from-bytes b)))))
+      ((Err _) out))))
+
+(defun pipe-probe () -> SinkProbe
+  (let [p (match (os/make-pipe) ((Ok p) p) ((Err e) (trap (. e message)))) r (. p fst) w (. p snd) got (atom []) done (atom false)]
+    (SinkProbe (json-lines w)
+               (fn () (do (when (not @done)
+                            (let [text (do (os/close-fd w) (drain r))]
+                              (do (os/close-fd r) (swap! done (fn (_: bool) true))
+                                  (swap! got (fn (_: (Vec str)) (vec (filter (fn (l: str) (> (str-len l) 0)) (string/split text "\n"))))))))
+                          @got)))))
+
+(defspecs specs
+  (feature "fib.log levels and laziness"
+    (scenario "a disabled level evaluates neither its message nor its fields"
+      (covers "fib.log debug")
+      (given [m (memory-sink) lg (mem-logger m INFO "app") n (cell 0)])
+      (upon [_ (do (debug lg (do (set! n (+ @n 1)) "msg") :x (do (set! n (+ @n 10)) 1))
+                   (trace lg "msg" :x (do (set! n (+ @n 100)) 1)))])
+      (then (expect = 0 @n) (expect = 0 (count (memory-records m)))))
+    (scenario "an enabled level evaluates each argument once"
+      (given [m (memory-sink) lg (mem-logger m INFO "app") n (cell 0)])
+      (upon [_ (warn lg (do (set! n (+ @n 1)) "msg") :x (do (set! n (+ @n 10)) 1))])
+      (then (expect = 11 @n) (expect = 1 (count (memory-records m)))))
+    (scenario "the level itself is enabled, the one below is not"
+      (given [m (memory-sink) lg (mem-logger m WARN "app")])
+      (upon [_ (do (warn lg "w") (info lg "i") (error lg "e") (fatal lg "f"))])
+      (then (expect = [WARN ERROR FATAL] (vec (map (fn (r: LogRecord) (. r level)) (memory-records m))))))
+    (scenario "the longest matching prefix sets a logger's level"
+      (given [m (memory-sink)])
+      (then (expect = DEBUG (. (mem-logger m INFO "app.db") level))
+            (expect = DEBUG (. (mem-logger m INFO "app.db.query") level))
+            (expect = WARN (. (mem-logger m INFO "app.db.pool.idle") level))
+            (expect = INFO (. (mem-logger m INFO "app.dbx") level))
+            (expect = INFO (. (mem-logger m INFO "app") level))))
+    (scenario "levels parse in any case; rules skip what they cannot read"
+      (then (expect = (some WARN) (parse-level " Warn ")) (expect = nil (parse-level "verbose"))
+            (expect = [(Pair "a.b" ERROR) (Pair "c" TRACE)] (parse-rules "a.b=error,junk,x=loud, c =trace")))))
+  (feature "fib.log records"
+    (scenario "fields reach the sink as data, context first"
+      (given [m (memory-sink) lg (with-context (mem-logger m INFO "app") :req "r-1")])
+      (upon [_ (info lg "hello" :n 42 :ok true :ratio 0.5 :who :admin)])
+      (then (expect = "r-1 42 true 0.5 admin"
+                    (string/join " " (map (fn (p: (Pair keyword Datum)) (datum-text (. p snd))) (. (nth (memory-records m) 0) fields))))
+            (expect = "req n ok ratio who"
+                    (string/join " " (map (fn (p: (Pair keyword Datum)) (keyword-text (. p fst))) (. (nth (memory-records m) 0) fields))))))
+    (scenario "with-context leaves the logger it came from unchanged"
+      (given [m (memory-sink) lg (mem-logger m INFO "app")])
+      (upon [lg2 (with-context lg :req "r-2") _ (do (info lg "plain") (info lg2 "tagged"))])
+      (then (expect = [0 1] (vec (map (fn (r: LogRecord) (count (. r fields))) (memory-records m))))))
+    (scenario "a task forked in with-tasks logs with the context of the logger it captured"
+      (given [m (memory-sink) lg (with-context (mem-logger m INFO "app") :req "r-3")])
+      (upon [_ (with-tasks [s] (do (dotimes (t 3) (fork s (fn () (info lg "in a task" :task t)))) ()))])
+      (then (expect = 3 (count (memory-records m)))
+            (expect = true (every? (fn (r: LogRecord) (= "req=r-3" (str (keyword-text (. (nth (. r fields) 0) fst)) "=" (datum-text (. (nth (. r fields) 0) snd)))))
+                                   (memory-records m)))))
+    (scenario "the text line"
+      (then (expect = "2026-10-06T09:05:02.123Z INFO  app.db - connected host=db1 port=5432 note=\"two words\"\n"
+                    (render-text (fixed INFO [(Pair :host (DStr "db1")) (Pair :port (DInt 5432)) (Pair :note (DStr "two words"))])))
+            (expect = "1970-01-01T00:00:00.000Z WARN  x - m\n" (render-text (LogRecord WARN "x" "m" [] 0)))
+            (expect = "2000-02-29T23:59:59.999Z ERROR x - m\n" (render-text (LogRecord ERROR "x" "m" [] 951868799999000000)))))
+    (scenario "the JSON line escapes strings and keeps numbers as numbers"
+      (then (expect = "{\"ts\":\"2026-10-06T09:05:02.123Z\",\"level\":\"WARN\",\"logger\":\"app.db\",\"msg\":\"connected\",\"q\":\"say \\\"hi\\\"\\n\",\"n\":-7,\"x\":null,\"f\":\"NaN\"}\n"
+                    (render-json (fixed WARN [(Pair :q (DStr "say \"hi\"\n")) (Pair :n (DInt -7)) (Pair :x DNil) (Pair :f (DFloat (/ 0.0 0.0)))])))))
+    (scenario "a sink that fails is counted, reported once, and does not stop the program"
+      (given [b (BrokenSink (atom 0)) sys (log-system (dyn Sink :send b) (LevelTable INFO [])) lg (get-logger sys "app")])
+      (upon [_ (do (info lg "one") (info lg "two") (debug lg "off"))])
+      (then (expect = 2 (failures sys)) (expect = 2 @(. b tries)))))
+  (implements AppenderContract "memory" memory-probe)
+  (implements AppenderContract "json-lines on a pipe" pipe-probe))
+
+(defun main () -> i64 (run-main (specs)))
