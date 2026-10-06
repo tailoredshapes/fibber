@@ -79,5 +79,5 @@ $X.trunc = Math.trunc; $X.truncf = Math.trunc; $X.floor = Math.floor; $X.ceil = 
 $X.floorf = Math.floor; $X.ceilf = Math.ceil; $X.sqrtf = (x) => Math.fround(Math.sqrt(x)); $X.fabsf = Math.abs;
 $X.fmod = (a, b) => a % b; $X.round = $fround;
 for (const n of ['sin', 'cos', 'tan', 'exp', 'log', 'log2', 'log10', 'pow', 'atan', 'atan2', 'asin', 'acos', 'sinh', 'cosh', 'tanh',
-  'expm1', 'log1p', 'cbrt', 'hypot']) $X[n] = Math[n];
+  'expm1', 'log1p', 'cbrt', 'hypot']) { $X[n] = Math[n]; $X[n + 'f'] = (...a) => Math.fround(Math[n](...a)); }
 $X.exp2 = (x) => 2 ** x;

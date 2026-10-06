@@ -83,20 +83,33 @@ function $nanSign(x) { $fdv.setFloat64(0, x, true); return ($fdv.getUint32(4, tr
 // trunc/floor/ceil keep the sign of zero, as Math's do.
 function $ftrunc(x) { return Math.trunc(x); }
 
-// A float NaN keeps its payload and its quiet bit as a double whose payload is the float's shifted up 29 bits: DataView's getFloat32
-// widens through the hardware's conversion, which quiets a signalling NaN; V8 keeps a double's NaN bits as they are.
+// A float NaN keeps its 23 payload bits, its quiet bit among them, as a QUIET double NaN that carries them in its low word with the
+// marker bit 0x40000 of the high word: DataView's getFloat32 widens through the hardware's conversion, which quiets a signalling NaN, and
+// V8 quiets a signalling double NaN when it stores it in a double array (measured: compiler/tests/js/bench/nan.mjs), but keeps a quiet
+// one's payload.
 function $nan32(b) {
-  $fdv.setUint32(4, ((b >>> 31) << 31 | 0x7ff00000 | ((b & 0x7fffff) >>> 3)) >>> 0, true);
-  $fdv.setUint32(0, ((b & 7) << 29) >>> 0, true);
+  $fdv.setUint32(4, ((b >>> 31) << 31 | 0x7ff80000 | 0x40000) >>> 0, true);
+  $fdv.setUint32(0, b & 0x7fffff, true);
   return $fdv.getFloat64(0, true);
 }
 function $nan64to32(x) {
   $fdv.setFloat64(0, x, true);
   const hi = $fdv.getUint32(4, true), lo = $fdv.getUint32(0, true);
-  let p = ((hi & 0xfffff) << 3) | (lo >>> 29);
-  if (p === 0) p = 0x400000;                     // a payload only in the low bits: still a NaN, quiet
+  let p;
+  if ((hi & 0x7ffc0000) === 0x7ffc0000) p = lo & 0x7fffff;   // a float NaN, as $nan32 made it
+  else p = ((hi & 0x7ffff) << 3) | (lo >>> 29) | 0x400000;   // a double NaN narrowed as fptrunc does: the top bits, quiet
   return ((hi >>> 31) << 31 | 0x7f800000 | p) >>> 0;
 }
+// fpext and fptrunc of a NaN as x86-64 does them (cvtss2sd, cvtsd2ss): the payload moves to the other end of the wider mantissa and the
+// result is quiet.
+function $fpext(x) {
+  if (x === x) return x;
+  const b = $nan64to32(x);
+  $fdv.setUint32(4, ((b >>> 31) << 31 | 0x7ff80000 | ((b & 0x7fffff) >>> 3)) >>> 0, true);
+  $fdv.setUint32(0, ((b & 7) << 29) >>> 0, true);
+  return $fdv.getFloat64(0, true);
+}
+function $fptrunc(x) { return x === x ? Math.fround(x) : $nan32($nan64to32(x) | 0x400000); }
 function $lf32(o) { const x = $D.getFloat32(o, true); return x === x ? x : $nan32($D.getUint32(o, true)); }
 function $sf32(o, v) { if (v === v) $D.setFloat32(o, v, true); else $D.setUint32(o, $nan64to32(v), true); }
 

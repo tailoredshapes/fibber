@@ -69,6 +69,7 @@ $X.nanosleep = (req) => {
 };
 $X.sysconf = (n) => n === 84 ? 1n : $unsupported(`sysconf(${n})`);
 $X.sched_yield = () => 0;
+$X.getpid = () => process.pid;
 $X.madvise = () => 0;
 $X.exit = (c) => { throw new $Exit('exit', c); };
 $X.abort = () => $signal('SIGABRT');
@@ -123,8 +124,11 @@ $X.open = (path, flags, mode) => $X.openat(-100, path, flags, mode);
 $X.close = (fd) => { try { $fs.closeSync(fd); $fdpos.delete(fd); return 0; } catch (e) { return $osErr(e); } };
 $X.lseek = (fd, off, whence) => {
   if (!$fdpos.has(fd)) { $setErrno(29); return -1n; }
+  if (whence < 0 || whence > 2) { $setErrno(22); return -1n; }
   const base = whence === 0 ? 0 : whence === 1 ? $fdpos.get(fd) : $fs.fstatSync(fd).size;
-  const p = base + Number(off); $fdpos.set(fd, p); return BigInt(p);
+  const p = base + Number(off);
+  if (p < 0) { $setErrno(22); return -1n; }
+  $fdpos.set(fd, p); return BigInt(p);
 };
 $X.isatty = (fd) => $tty.isatty(fd) ? 1 : 0;
 $X.unlink = (p) => { try { $fs.unlinkSync($ctext(p)); return 0; } catch (e) { return $osErr(e); } };
