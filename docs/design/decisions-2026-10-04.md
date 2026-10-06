@@ -76,3 +76,12 @@ and P-count-a in parallel, then P-tensor, P-sched, P-chan, P-det, P-count-b.
 ## P-count-b (docs/design/parallelism.md 3.6.1), decided by the agent on 2026-10-06 within the lead's brief
 
 1 `freeze` goes through objects that are already SHARED and refuses a cell by type (`Send`), an atom, weak reference or task by a run-time trap; a refused freeze may leave the objects above the refusal frozen (safe). 2 The share-marking walk keeps its mode in its worklist, not in a global. 3 Borrowed element reads: not extended; the derived-read rule covers a builtin `array-get`, not a prelude call (measured). 4 The `:scoped` closure colour is not built: `private-copy` (a per-chunk shallow copy of a shared closure) gives the call cost without a new colour or a second closure ABI. 5 A pmap or pfor chunk that traps abandons its closure copy too (case 7608: 86 to 88).
+
+## Supported instruction sets (the owner, 2026-10-06)
+
+"I'm comfortable saying we only support isa that have tail call capabilities. I am also happy to say the same thing about FMA. Its 2026. This
+language is partly about making modern capabilities like simd and multiple cores easier to access." A native target is supported only when
+its toolchain guarantees tail calls between functions of any signature (LLVM `tailcc`/`musttail`) and the instruction set has fused
+multiply-add. Consequences: the x86-64 baseline is x86-64-v3 (AVX2 and FMA; releases move from x86-64-v2); AArch64 is unchanged; riscv64 is
+parked until LLVM implements `tailcc` for RISC-V (its emit check stays, to notice when it lands). wasm and JS: open question to the owner
+(proposal: portability targets with software FMA and return_call/trampolines, same results, slower).
