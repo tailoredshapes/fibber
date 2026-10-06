@@ -41,7 +41,7 @@ open(p, "w").write(s.replace(a, b))' "$t/compiler/js/$file" || { echo "FAULT NOT
   fi
   LIR2JS=$lir2js RT=$t/compiler/js/rt "$here/diff.sh" -j "$jobs" "$root/cases/lir" "$root/compiler/tests/js/cases" > "$t/rows" 2>&1
   n=$(grep -c '^differ ' "$t/rows")
-  if [ "$n" -gt 0 ]; then caught=$((caught + 1)); echo "caught $name: $n differ, e.g. $(grep -m1 '^differ ' "$t/rows" | cut -c1-150)"
+  if [ "$n" -gt 0 ]; then caught=$((caught + 1)); echo "caught $name: $n differ: $(grep "^differ " "$t/rows" | cut -d: -f1 | sed "s|^differ ||" | tr "\n" " ")"
   else missed=$((missed + 1)); echo "MISSED $name: $(tail -1 "$t/rows")"; fi
 done
 echo "faults: $caught caught, $missed missed"

@@ -59,19 +59,23 @@ hand-written carry for every operation; f64-when-small needs a range analysis lI
 after `+ - * <<`, `& | ^` and `>>` need none on canonical signed values, and every checked-overflow instruction compares the exact result
 with the wrapped one (`$sov`, rt/int.js). i32 is `(a+b|0)`, `Math.imul`, `>>>` for logical shifts; i8 and i16 are computed as i32 and cut
 back with `<<24>>24`. Unsigned operations and predicates convert at the operation (`>>>0`, `& 255`, `BigInt.asUintN(64, ..)`). Division by
-zero, and the minimum divided by -1, raise SIGFPE as x86-64's `idiv` does (lIR leaves both undefined; the native build of a checked fibber
-program never reaches them, since fibber checks first). Shift amounts are masked as x86-64 masks them (an amount at or above the width is
+zero, and the minimum divided by -1, raise SIGFPE as x86-64's `idiv` does (lIR leaves both undefined; fibber's own code tests the divisor
+first, types.md 8.12). Shift amounts are masked as x86-64 masks them (an amount at or above the width is
 poison in lIR).
 
 This is the main cost of the slice (see Speed): fibber's integers are i64, so its loops are BigInt loops. The way out, measured above at
-roughly 13 times, is a range analysis that proves an i64 small enough to live in a double, a later step.
+8 times (628 ms against 79 ms), is a range analysis that proves an i64 small enough to live in a double, a later step.
 
 **f32**: a float is a JS number that `Math.fround` has rounded after every operation. For `+ - * / sqrt` and `frem` this is exact IEEE
 single arithmetic (the double result of two floats, rounded once to float, is the correctly rounded float result, since 53 >= 2*24+2).
 Conversions that would round twice are done once: i64 to float folds the low bits into a sticky bit first (`$i2f32`), strtof rounds the
-decimal once through BigInt (`$decToF32`). A float NaN keeps its payload and quiet bit (a load widens it by hand, since DataView's
-`getFloat32` goes through the hardware conversion, which quiets a signalling NaN): `cases/ownership/194-float-bit-casts.fib` failed on
-its four f32 NaN probes until this was done.
+decimal once through BigInt (`$decToF32`). A float NaN keeps its 23 bits, quiet bit included, inside a *quiet* double NaN under a marker
+bit (`$nan32`, `$nan64to32`), and fpext and fptrunc move a NaN's payload as x86-64 does. Both halves were forced by measurement
+(`bench/nan.mjs`): DataView's `getFloat32` widens through the hardware conversion, which quiets a signalling NaN, and V8 quiets a signalling
+double NaN when it stores it in a double array (0 of 10^6 kept through an array literal) and now and then in optimised code (957 834 of
+10^6 kept as a scalar), while every quiet NaN keeps its payload. `cases/ownership/194-float-bit-casts.fib` failed on its f32 NaN probes,
+nondeterministically, until this was done. A signalling *double* NaN cannot be kept: its probes in case 194 fail in some runs (see
+Results); a JS number is not a 64-bit register.
 
 ### 2. Memory
 
@@ -102,12 +106,14 @@ other lIR. Function pointers are numbers from 2^44 up, 16 apart, indexing a tabl
 | structured `for` with `if` | 7.5 |
 | `for (;;) switch (L)`, one case per block | 66 |
 
-**Decision, for this slice: the loop-and-switch form** (every function of more than one block is `let L = 0; for (;;) switch (L) {..}`, a
-branch being `L = k; continue;`), because it is correct for every CFG lIR allows (irreducible ones included), and simple enough that its
-correctness is evident. It is 9 times slower than structured code on the measurement above; a stackifier or relooper is the first
-speed step after BigInt (the CFG of fibber's code is reducible). A phi is a variable `ph<pos>` that every edge into its block assigns before
-it jumps; edges read only the block's other names, never the phi variables, so the copies of one edge are parallel by construction (a swap
-of two phis is right with no temporaries). A function of one block without a self tail call has no loop.
+**Decision, for this slice: the loop-and-switch form, with every block that has one incoming edge written in place of that edge.**
+A function is `let L = 0; for (;;) switch (L) {..}` over the blocks that are the target of two or more edges (loop headers and join
+points) and the entry; a branch to one of them is `L = k; continue;`, and a branch to any other block is that block's code, so a diamond
+is an `if`/`else` and a function whose blocks all have one incoming edge has no loop. This is correct for every CFG lIR allows
+(irreducible ones included) and simple enough that its correctness is evident; a stackifier that also turns loop headers into JS loops is
+the next control-flow step. A phi is a variable `ph<pos>` that every edge into its block assigns before it jumps; edges read only the
+block's other names, never the phi variables, so the copies of one edge are parallel by construction (a swap of two phis is right with no
+temporaries, `compiler/tests/js/cases/branches.lir`). A comparison tested by a branch is written as the JS comparison, without its `?1:0`.
 
 ### 4. Calls and tail calls
 
@@ -180,7 +186,58 @@ output, standard error and the exit status. Inputs: every `;; expect: accept` ca
 looked into), `unsupported` (the JS run reached `lir2js: unsupported`) and `skip` (the native run timed out, or fibc could not emit).
 `--expect compiler/tests/js/expected.txt` makes the run fail when the set of non-passing programs is not exactly the listed one.
 
-Results (RESULTS)
+### Results (2026-10-06, the commits of this slice)
+
+| Corpus | pass | differ | unsupported | timeout | skip |
+|---|---|---|---|---|---|
+| `cases/lir` and `compiler/tests/js/cases`, accept and reject (`diff.sh --reject`): 83 accepted programs, 362 rejected | 441 | 1 (listed) | 3 | 0 | 0 |
+| `cases/ownership` through `fibc emit` (296 programs) | 257 | 0 | 39 | 0 | 0 |
+| `cases/stdlib` through `fibc emit` (1156 programs) | 1073 | 0 | 68 | 2 | 13 |
+
+Commands: `LAIRF=.. LIR2JS=.. compiler/tests/js/diff.sh --reject --expect compiler/tests/js/expected.txt` (the first row; "OK: every
+ending other than pass is listed"), and `FIBC=F diff.sh -j 2 --emit cases/ownership --emit cases/stdlib` (the others: 1330 pass, 0
+differ, 107 unsupported, 2 timeout, 13 skip, in 70 minutes). Every rejected case is refused by lir2js with lairf's own text. The listed
+difference is `cases/lir/simd/target-host-lacks.lir`, which `lairf run` refuses because this host lacks AVX-512 and which `lairf build`
+and lir2js accept. Unsupported: `pthread_create` 96 (every program that spawns a task or starts the pool), sockets 2, `mkdtemp` 2,
+`pipe`/`pipe2`/`dup` 3, `uname`, `readlink`, `getppid`, `fmemopen` one each, and the two guard-page cases of `cases/lir/simd` (`mprotect`).
+The timeouts are two tensor cases (`7080`, `7083`) whose JS run takes more than 30 s (BigInt index arithmetic). The skips are `open-`
+cases that stage 2 does not compile yet (`scripts/ci-stage2.expected`).
+
+The differences found and fixed on the way, each a bug of lir2js: `%g`/`%e` took the exponent from `Math.log10` before rounding
+(`cases/lir/simd/float-fns.lir`); a float NaN lost its signalling bit (`cases/ownership/194-float-bit-casts.fib`); `lseek` accepted a
+negative position and an unknown `whence` (`cases/stdlib/3602`). **No difference was a bug of lair or the native path.**
+
+One difference is not fixable in plain JS and is not in the counts' `differ` because it passed in the final run: case 194's probes of
+signalling *double* NaN payloads fail in some runs, since V8 quiets a signalling double NaN at times (see decision 1). It passed in the
+second corpus run and in 5 of 10 repeated runs of the first build.
+
+The harness is attacked by `compiler/tests/js/faults.sh`: five faults planted one at a time in a copy of the backend, each caught by at
+least one `differ` over `cases/lir` and `compiler/tests/js/cases` ("faults: 5 caught, 0 missed", 2 min 51 s):
+
+| Fault | Caught by (every `differ` row) |
+|---|---|
+| i64 `add` without the 64-bit wrap | `cases/lir/mapping/arith-checks.lir`, `cases/lir/mapping/trap.lir`, `compiler/tests/js/cases/i64-wrap.lir` |
+| the overflow flag of `sadd/ssub/smul-overflow` always 0 (a missed trap) | `cases/lir/instr/overflow.lir`, `cases/lir/mapping/arith-checks.lir`, `compiler/tests/js/cases/overflow-trap.lir` |
+| a `switch`'s default branch to its first case's block | `cases/lir/adversarial/switch-no-cases.lir`, `cases/lir/instr/control.lir`, `compiler/tests/js/cases/branches.lir` |
+| tail calls to other functions as JS calls (the stack grows) | `cases/lir/audit/t-cf.lir` (exit 139: the JS stack overflowed), `audit/t-tail-many-tailcc.lir`, `instr/tailcall.lir` |
+| f32 arithmetic without `Math.fround` | `cases/lir/audit/cmp-aot.lir`, `cases/lir/simd/reduce.lir`, `compiler/tests/js/cases/f32.lir` |
+
+`i64-wrap.lir` did not catch the first fault at first: its sums were printed with `%lld`, which cuts to 64 bits itself; its last line
+compares the wrapped sum with zero now. `compiler/tests/js/rt-test.mjs` (8121 checks, 0 failed) checks fma against independent references and printf and strtof against glibc;
+its own three planted faults (fma rounding ties up, printf rounding ties up, strtof rounding twice) fail 103, 7 and 1 checks.
+
+### Joining the gate
+
+`scripts/tools.sh` is not edited here. The one line that would add the check to its `--full` list, beside the other scripts of
+`compiler/tests`:
+
+```
+queue js-backend compiler/tests/js/check.sh "$out/js"
+```
+
+`check.sh` builds `lairf` (which links LLVM) and `lir2js` with the `FIBC` the stage provides, runs `rt-test.mjs` and `diff.sh --reject
+--expect expected.txt` with `-j 4`: about 2 minutes. `check.sh --faults` adds the planted faults (about 2.5 minutes more); the
+`--emit` corpus (70 minutes at `-j 2`) is for a nightly run, not the gate.
 
 ## Speed
 
@@ -188,4 +245,18 @@ Results (RESULTS)
 
 ## Not done in this slice
 
-(NOTDONE)
+- **Threads.** The first slice is single-threaded: `pthread_create` is unsupported, so is every fibber program that spawns a task
+  (96 of the corpus). Workers would be node `worker_threads` over a `SharedArrayBuffer`, with `Atomics` for lIR's atomics.
+- **Speed.** BigInt i64 and the dispatch loop for loop headers are the two costs; the next steps are a range analysis that keeps
+  provably small i64 values in doubles, and a stackifier for loops (decision 3).
+- **Signalling double NaNs** are not kept bit for bit (decision 1); NaNs produced by arithmetic have JS's canonical bits, where x86-64
+  produces the negative default NaN (printf prints `nan` where glibc prints `-nan`), which no case of the corpus prints.
+- **libm** functions other than the exact ones are JS's, which may differ from glibc's in the last place; no case of the corpus has met it.
+- **Not shimmed:** sockets, pipes, `dup`, `fork`, `mkdtemp`, `uname`, `readlink`, `getppid`, `fmemopen`, hexadecimal `strtod`, printf's
+  `%a`, guard pages (`mprotect(PROT_NONE)`), `declare-global` of anything but `stdin stdout stderr environ`.
+- **A browser.** The runtime uses node's `fs`, `tty` and `os` and a 4 GiB buffer; a browser build needs a smaller fixed heap and a console
+  stdout.
+- **Source maps**, from the positions every lIR node carries.
+- **A driver hook** (`fibc build --target js`): not added; `fibc emit` and `lir2js` compose.
+- **The fixed point** is unaffected: stage 2 does not import `js.*` (the translator is a separate tool), so `F emit compiler/fibc.fib` is
+  as before.
