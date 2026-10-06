@@ -1,0 +1,48 @@
+;; fib.json.gen: a generator of `Json` for fib.test properties (docs/design/json.md 6). Values of every kind and every awkward corner: i64 extremes, doubles of
+;; uniform bits and short decimals, strings with quotes, backslashes, control characters, non-ASCII and astral characters, objects with distinct keys,
+;; nesting limited by the size. Shrinks by dropping elements, by replacing a container with one of its children and by simplifying the leaves.
+(ns fib.json.gen (:use fib.core fib.seq fib.coll fib.rng fib.test.gen fib.json.types))
+
+(def pieces: (Vec str) ["a" "b" "key" " " "\"" "\\" "/" "\n" "\t" "\x01" "\x1f" "\x7f" "é" "€" "😀" "\u{2028}" "\u{FFFF}" "0" "u00e9" "{" "]"])
+
+(defun gen-text (r: Rng n: i64) -> str
+  (str-join (mapv (fn (i: i64) (nth pieces (rng-between r 0 (- (count pieces) 1)))) (range (rng-between r 0 n)))))
+
+(defun gen-number (r: Rng) -> Json
+  (let [k (rng-between r 0 9)]
+    (cond (= k 0) (JInt (rng-between r -100 100))
+          (= k 1) (JInt (rng-next r))
+          (= k 2) (JInt (if (= (rng-between r 0 1) 0) 9223372036854775807 -9223372036854775808))
+          (= k 3) (JFloat (/ (double (rng-between r -1000000 1000000)) 1000.0))
+          (< k 7) (let [x (bits->f64 (rng-next r))] (JFloat (if (= (- x x) 0.0) x 1.5)))
+          (= k 7) (JFloat (* (double (rng-between r 1 999999)) 1.0e-300))
+          (= k 8) (JFloat (* (double (rng-between r 1 999999)) 1.0e290))
+          :else (JFloat -0.0))))
+
+(defun gen-json-at (r: Rng size: i64) -> Json
+  (let [k (rng-between r 0 (if (> size 0) 8 5))]
+    (cond (= k 0) JNull
+          (= k 1) (JBool (= (rng-between r 0 1) 0))
+          (or (= k 2) (= k 3)) (gen-number r)
+          (or (= k 4) (= k 5)) (JStr (gen-text r 12))
+          (= k 6) (JArr (mapv (fn (i: i64) (gen-json-at r (quot size 2))) (range (rng-between r 0 (min size 6)))))
+          :else (let [m (rng-between r 0 (min size 6))]
+                  (JObj (mapv (fn (i: i64) (str (gen-text r 4) "#" i)) (range m))
+                        (mapv (fn (i: i64) (gen-json-at r (quot size 2))) (range m)))))))
+
+(defun drop-nth (v: (Vec a) i: i64) -> (Vec a) (vec (concat (take i v) (drop (+ i 1) v))))
+
+(defun shrink-json (j: Json) -> (Vec Json)
+  (match j
+    ((JInt i) (if (= i 0) [] [(JInt 0) (JInt (quot i 2))]))
+    ((JFloat f) (if (= f 0.0) [] [(JFloat 0.0) (JInt 1)]))
+    ((JStr s) (if (= (str-len s) 0) [] [(JStr "") (JStr (str-slice s 0 (quot (str-len s) 2)))]))
+    ((JArr xs) (vec (concat (concat xs [JNull])
+                             (concat (mapv (fn (i: i64) (JArr (drop-nth xs i))) (range (count xs)))
+                                     (mapcat (fn (i: i64) (mapv (fn (c: Json) (JArr (assoc xs i c))) (shrink-json (nth xs i)))) (range (count xs)))))))
+    ((JObj ks vs) (vec (concat (concat vs [JNull])
+                                (concat (mapv (fn (i: i64) (JObj (drop-nth ks i) (drop-nth vs i))) (range (count ks)))
+                                        (mapcat (fn (i: i64) (mapv (fn (c: Json) (JObj ks (assoc vs i c))) (shrink-json (nth vs i)))) (range (count vs)))))))
+    (_ (if (= j JNull) [] [JNull]))))
+
+(defun gen-json () -> (Gen Json) (Gen (fn (r: Rng size: i64) (gen-json-at r size)) (fn (j: Json) (shrink-json j))))

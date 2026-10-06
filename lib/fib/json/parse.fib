@@ -164,13 +164,15 @@
 
 ;; ---- entry points
 
+(defun bom? (s: str n: i64) -> bool (and (>= n 3) (and (= (at s n 0) 239) (and (= (at s n 1) 187) (= (at s n 2) 191)))))
+
 (defun parse-with (s: str o: JsonOptions) -> (Result Json JsonError)
   (let [n (str-len s)]
     (if (> n (. o max-size))
         (Err (make-error s e-size 0))
         (let [pos (cell 0)
               fail (cell 0)
-              bom (and (>= n 3) (and (= (at s n 0) 239) (and (= (at s n 1) 187) (= (at s n 2) 191))))
+              bom (bom? s n)
               _ (set! pos (if (and bom (. o bom)) 3 0))
               _ (set! pos (skip-ws s n @pos))
               v (if (and bom (not (. o bom))) (do (set! fail e-bom) JNull) (parse-value s n &pos &fail 0 o))]
@@ -178,6 +180,18 @@
               (Err (make-error s @fail @pos))
               (let [e (skip-ws s n @pos)]
                 (if (< e n) (Err (make-error s e-trailing e)) (Ok v))))))))
+
+;; One document of a text of several, starting at byte `start`: nil when only white space is left, else the result and the offset after the document
+;; (after a failure: after the next newline, so a line-delimited text goes on with its next line).
+(defun parse-at (s: str o: JsonOptions start: i64) -> (Option (Pair (Result Json JsonError) i64))
+  (let [n (str-len s)
+        i (skip-ws s n start)]
+    (if (>= i n) nil
+        (let [pos (cell i) fail (cell 0)
+              v (parse-value s n &pos &fail 0 o)]
+          (if (!= @fail 0)
+              (some (Pair (Err (make-error s @fail @pos)) (if-some [k (str-find s "\n" @pos)] (+ k 1) n)))
+              (some (Pair (Ok v) @pos)))))))
 
 (defun parse (s: str) -> (Result Json JsonError) (parse-with s (default-options)))
 

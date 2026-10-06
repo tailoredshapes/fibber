@@ -1,0 +1,72 @@
+;; fib.json: the API of docs/design/json.md 5 through its facade: lookups, JSON Pointer, the tape and its view, events, documents, files, Datum.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.datum) (:require [fib.json :as json] [fib.os :as os]))
+
+(defun ok (s: str) -> json/Json (match (json/parse s) ((Ok v) v) ((Err _) json/JNull)))
+(defun txt (o: (Option json/Json)) -> str (match o ((some j) (json/write j)) (nil "none")))
+(defun tape (s: str) -> json/Doc (match (json/tape s) ((Ok d) d) ((Err _) (trap "tape"))))
+(defun ev-name (e: json/JsonEvent) -> str
+  (match e ((json/EvNull) "null") ((json/EvBool b) (str b)) ((json/EvInt i) (str i)) ((json/EvFloat f) (str f)) ((json/EvBig t) t) ((json/EvStr s) (str "'" s "'")) ((json/EvKey k) (str k ":"))
+    ((json/EvStartArray) "[") ((json/EvEndArray) "]") ((json/EvStartObject) "{") ((json/EvEndObject) "}")))
+(defun events (s: str) -> str
+  (str-join ((fn (v: (Vec str)) v) (json/reduce-events (tape s) (fn (acc: (Vec str) e: json/JsonEvent) (conj acc (str (ev-name e) " "))) []))))
+(defun reverse (v: (Vec str)) -> (Vec str) (vec (map (fn (i: i64) (nth v (- (count v) (+ i 1)))) (range (count v)))))
+
+(defspecs specs
+  (feature "fib.json lookups"
+    (scenario "get-key, get-index, get-in"
+      (given [j (ok "{\"a\":[10,{\"b\":true}],\"c\":null,\"0\":\"zero\"}")])
+      (then (expect = "[10,{\"b\":true}]" (txt (json/get-key j "a"))) (expect = "none" (txt (json/get-key j "z")))
+            (expect = "true" (txt (json/get-in j ["a" "1" "b"]))) (expect = "none" (txt (json/get-in j ["a" "2"])))
+            (expect = "none" (txt (json/get-in j ["a" "01"]))) (expect = "\"zero\"" (txt (json/get-in j ["0"])))
+            (expect = "null" (txt (json/get-key j "c"))) (expect = "10" (txt (match (json/get-key j "a") ((some a) (json/get-index a 0)) (nil nil))))))
+    (scenario "JSON Pointer, RFC 6901: escapes, the empty pointer, array indices"
+      (given [j (ok "{\"a/b\":1,\"m~n\":2,\"\":3,\" \":4,\"arr\":[5,6]}")])
+      (then (expect = "1" (txt (json/pointer j "/a~1b"))) (expect = "2" (txt (json/pointer j "/m~0n"))) (expect = "3" (txt (json/pointer j "/")))
+            (expect = "4" (txt (json/pointer j "/ "))) (expect = "6" (txt (json/pointer j "/arr/1"))) (expect = "none" (txt (json/pointer j "/arr/-")))
+            (expect = "none" (txt (json/pointer j "arr"))) (expect = true (= (some j) (json/pointer j ""))))))
+  (feature "fib.json tape and view"
+    (scenario "navigation without a DOM"
+      (given [d (tape "{\"a\":[1,2.5,\"x\\ny\",true],\"k\\u00e9y\":{\"z\":-7}, \"big\":123456789012345678901}")])
+      (then (expect = (some 1) (json/node-i64 d (json/path d ["a" "0"]))) (expect = (some 2.5) (json/node-f64 d (json/path d ["a" "1"])))
+            (expect = (some "x\ny") (json/node-str d (json/path d ["a" "2"]))) (expect = (some true) (json/node-bool d (json/path d ["a" "3"])))
+            (expect = (some -7) (json/node-i64 d (json/path d ["kéy" "z"]))) (expect = -1 (json/path d ["a" "4"])) (expect = -1 (json/path d ["nope"]))
+            (expect = nil (json/node-i64 d (json/path d ["big"]))) (expect = nil (json/node-i64 d (json/path d ["a" "2"])))
+            (expect = (some 1.2345678901234568E20) (json/node-f64 d (json/path d ["big"])))))
+    (scenario "a subtree becomes a Json, with the DOM's rules"
+      (given [d (tape "{\"a\":{\"x\":1,\"x\":2},\"b\":[1,[2]]}")])
+      (then (expect = "{\"x\":2}" (json/write (json/node->json d (json/path d ["a"])))) (expect = "[1,[2]]" (json/write (json/node->json d (json/path d ["b"]))))))
+    (scenario "the tape rejects what the DOM rejects, with the same code and offset"
+      (then (expect = true (match (json/tape "[1,]") ((Err e) (and (= (. e code) 1) (= (. e offset) 3))) ((Ok _) false)))
+            (expect = true (match (json/tape "{\"a\":01}") ((Err e) (= (. e code) 3)) ((Ok _) false)))
+            (expect = true (match (json/tape "\"\\ud800\"") ((Err e) (= (. e code) 9)) ((Ok _) false)))
+            (expect = true (match (json/tape (str-join (vec (map (fn (i: i64) "[") (range 2000))))) ((Err e) (= (. e code) 7)) ((Ok _) false))))))
+  (feature "fib.json events and documents"
+    (scenario "events come in document order with keys marked"
+      (then (expect = "{ a: [ 1 2.5 'x' true null ] b: { } c: [ ] }" (trim-end (events "{\"a\":[1,2.5,\"x\",true,null],\"b\":{},\"c\":[]}")))
+            (expect = "[ [ ] [ [ 1 ] ] ]" (trim-end (events "[[],[[1]]]")))))
+    (scenario "documents: NDJSON and concatenated values; a bad line is an Err and the next line goes on"
+      (given [rs (json/documents "{\"a\":1}\n[2] 3\n{bad}\n\n4")])
+      (then (expect = 5 (count rs)) (expect = true (match (nth rs 3) ((Err e) (= (. e line) 3)) ((Ok _) false)))
+            (expect = "4" (match (nth rs 4) ((Ok j) (json/write j)) ((Err _) "err")))))
+    (scenario "reduce-lines over a file holds one chunk at a time and sees every line"
+      (given [path "/tmp/fib-json-lines.ndjson"
+              _ (os/write-file-bytes path (str-bytes (str-join (vec (map (fn (i: i64) (str "{\"n\":" i "}\n")) (range 1000))))))])
+      (then (expect = true (match (json/reduce-lines path (json/default-options)
+                                  (fn (acc: i64 r: (Result json/Json json/JsonError)) (match r ((Ok j) (+ acc (match (json/get-key j "n") ((some (json/JInt n)) n) (_ 0)))) ((Err _) -1000000)))
+                                  0)
+                              ((Ok n) (= n 499500)) ((Err _) false)))))
+    (scenario "read-file reads a file; a missing file and invalid UTF-8 are errors"
+      (given [p1 "/tmp/fib-json-doc.json" p2 "/tmp/fib-json-bad.json"
+              _ (os/write-file-bytes p1 (str-bytes " [1, 2.5, \"x\"] "))
+              _ (os/write-file-bytes p2 (str-bytes "\"ab"))])
+      (then (expect = "[1,2.5,\"x\"]" (match (json/read-file p1) ((Ok j) (json/write j)) ((Err _) "err")))
+            (expect = 15 (match (json/read-file "/tmp/does-not-exist-fib-json") ((Err e) (. e code)) ((Ok _) 0))))))
+  (feature "fib.json and fib.datum"
+    (scenario "Json to Datum and back"
+      (then (expect = true (datum= (DInt 5) (json/json->datum (json/JInt 5)))) (expect = true (datum= DNil (json/json->datum json/JNull)))
+            (expect = true (datum= (DStr "[1,2]") (json/json->datum (ok "[1,2]"))))
+            (expect = json/JNull (json/datum->json (DFloat (/ 0.0 0.0)))) (expect = (json/JStr "0a7f") (json/datum->json (DBytes (str-bytes "\n\x7f"))))))))
+
+(defun trim-end (t: str) -> str (str-slice t 0 (- (str-len t) 1)))
+
+(defun main () -> i64 (run-main (specs)))

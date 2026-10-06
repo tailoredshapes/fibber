@@ -1,0 +1,36 @@
+;; fib.json.events: a SAX-style event fold over a tape (docs/design/json.md 5). `(reduce-events d f init)` walks the document once in order and calls
+;; `(f acc event)` for each token; no value is built, a string is made (one slice) only when its event is. The tape of the whole document is held, 16 bytes
+;; per value: for inputs larger than memory use fib.json.io/reduce-lines, which holds one line at a time.
+(ns fib.json.events (:use fib.core fib.seq fib.coll fib.json.types fib.json.tape fib.json.view fib.json.number))
+
+(defun scalar-event (d: Doc i: i64 key: bool) -> JsonEvent
+  (let [k (kind-of d i)]
+    (cond (= k k-null) EvNull
+          (= k k-true) (EvBool true)
+          (= k k-false) (EvBool false)
+          (= k k-str) (let [x (node-key d i)] (if key (EvKey x) (EvStr x)))
+          (= k k-int) (if-some [v (node-i64 d i)] (EvInt v) (EvBig (str-slice (. d src) (start-of d i) (end-of-str d i))))
+          :else (if-some [v (node-f64 d i)] (EvFloat v) (EvBig (str-slice (. d src) (start-of d i) (end-of-str d i)))))))
+
+;; The open containers are `ends` (the tape index where each closes, times 2, plus 1 for an object) and `keys` (1 when the next node of an object is a key).
+(defun last-of (v: (Vec a)) -> a (nth v (- (count v) 1)))
+
+(defun close-ends (f: (fn (a JsonEvent) a) acc: a ends: (Vec i64) i: i64) -> (Pair a (Vec i64))
+  (loop [acc acc ends ends]
+    (if (and (> (count ends) 0) (= (quot (last-of ends) 2) i))
+        (recur (f acc (if (= (rem (last-of ends) 2) 1) EvEndObject EvEndArray)) (pop ends))
+        (Pair acc ends))))
+
+(defun reduce-events (d: Doc f: (fn (a JsonEvent) a) init: a) -> a
+  (loop [i 0 acc init ends: (Vec i64) [] keys: (Vec bool) []]
+    (let [r (close-ends f acc ends i)
+          acc2 (. r fst) ends2 (. r snd)
+          keys2 (if (< (count ends2) (count keys)) (vec (take (count ends2) keys)) keys)]
+      (if (>= i (. d len)) acc2
+          (let [k (kind-of d i)
+                inobj (and (> (count ends2) 0) (= (rem (last-of ends2) 2) 1))
+                iskey (and inobj (last-of keys2))
+                keys3 (if inobj (conj (pop keys2) (not (last-of keys2))) keys2)]
+            (cond (= k k-array) (recur (+ i 2) (f acc2 EvStartArray) (conj ends2 (* 2 (word1 d i))) (conj keys3 false))
+                  (= k k-object) (recur (+ i 2) (f acc2 EvStartObject) (conj ends2 (+ 1 (* 2 (word1 d i)))) (conj keys3 true))
+                  :else (recur (+ i 2) (f acc2 (scalar-event d i iskey)) ends2 keys3)))))))
