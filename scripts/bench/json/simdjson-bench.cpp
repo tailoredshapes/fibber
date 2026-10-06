@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <string>
 using namespace simdjson;
 using clk = std::chrono::steady_clock;
 
@@ -23,6 +24,15 @@ template <class F> double median_mbs(size_t bytes, int reps, F f) {
 }
 
 int main(int argc, char** argv) {
+  if (std::string(argv[1]).size() > 7 && std::string(argv[1]).substr(std::string(argv[1]).size() - 7) == ".ndjson") {
+    dom::parser p0;
+    auto t0 = clk::now(); size_t docs = 0, size = 0;
+    for (auto doc : p0.load_many(argv[1], 8000000)) { docs += doc.value().is_object(); }
+    double s = std::chrono::duration<double>(clk::now() - t0).count();
+    FILE* f = fopen(argv[1], "rb"); fseek(f, 0, SEEK_END); size = ftell(f); fclose(f);
+    printf("simdjson dom load_many     %8.1f MB/s (%zu docs)\n", size / s / 1e6, docs);
+    return 0;
+  }
   padded_string json = padded_string::load(argv[1]).value();
   int reps = atoi(argv[2]);
   dom::parser p;

@@ -2,6 +2,21 @@
 """Python's json (and orjson when installed): parse and serialise, MB/s, median of 5 batches. usage: bench.py FILE REPS"""
 import json, sys, time, statistics
 path, reps = sys.argv[1], int(sys.argv[2])
+if path.endswith('.ndjson'):
+    t0 = time.perf_counter(); n = 0; size = 0
+    with open(path, 'rb') as f:
+        for line in f:
+            json.loads(line); n += 1; size += len(line)
+    print('python json ndjson    %8.1f MB/s (%d lines)' % (size / (time.perf_counter() - t0) / 1e6, n))
+    try:
+        import orjson
+        t0 = time.perf_counter()
+        with open(path, 'rb') as f:
+            for line in f: orjson.loads(line)
+        print('orjson ndjson         %8.1f MB/s' % (size / (time.perf_counter() - t0) / 1e6))
+    except ImportError:
+        pass
+    sys.exit(0)
 raw = open(path, 'rb').read()
 text = raw.decode()
 def mbs(f, nbytes):
