@@ -241,7 +241,31 @@ queue js-backend compiler/tests/js/check.sh "$out/js"
 
 ## Speed
 
-(SPEED)
+`compiler/tests/js/speed.sh` emits each program with stage 2, builds it natively with `lairf build -O 2` and translates it with lir2js,
+then takes the median wall time of 3 runs of each (node v26.10.0, `--stack-size=7000`) and checks that the outputs are the same. Under
+`/tmp/fibsuite.lock`, nothing else of this session running:
+
+```
+FIBC=F LAIRF=lairf LIR2JS=lir2js compiler/tests/js/speed.sh "n-body=scripts/shootout/n-body/n-body.fib:200000" \
+  "binary-trees=scripts/bench/binary-trees.fib:" "vec-sort=scripts/bench/vec-sort.fib:" "strings=scripts/bench/strings.fib:" \
+  "num-f64=scripts/bench/num-f64.fib:"
+```
+
+| Program | native s | node s | node / native | output |
+|---|---|---|---|---|
+| n-body, 2 000 000 steps | 0.248 | 17.929 | 72 | same |
+| n-body, 200 000 steps | 0.029 | 1.765 | 60 | same |
+| binary-trees | 1.395 | 15.786 | 11 | same |
+| vec-sort | 0.456 | 12.687 | 28 | same |
+| strings | 0.694 | 12.506 | 18 | same |
+| num-f64 | 1.612 | 21.087 | 13 | same |
+| hello (start-up) | 0.003 | 0.037 | 11 | same |
+
+The JS build is 11 to 72 times slower than LLVM's `-O2`. A CPU profile of n-body (`node --cpu-prof`, 500 000 steps) says where:
+`pair-velocities` 19% of self time, the garbage collector 16%, `$sov` 15% (every checked `+` and `*` of fibber's i64 index arithmetic
+builds a BigInt and a two-element array), `$lp` 13% (pointer loads), `fib.alloc` 5%. The floating-point arithmetic itself is not the
+cost; the i64 representation is. So the next speed steps, in order: keep provably small i64 in doubles (no BigInt, and an overflow test
+that allocates nothing), then loops as JS loops.
 
 ## Not done in this slice
 
