@@ -217,7 +217,7 @@ so the tile follows the register file. At 256 bits (AVX2, sixteen ymm) it is a
 target's native width is 512 bits (`x86-64-v4`, Sapphire Rapids, Zen 4 and later: types.targets, docs/design/avx512.md; thirty-two zmm) it is a 6x32 (`f64`)
 or 6x64 (`f32`) tile of 24 accumulators, four vector loads of B and one broadcast: 29 of 32 registers, no spill. (A target without FMA, `(has-fma)` false, takes the multiply-then-add tiles of `gemm-f64`/`gemm-f32` instead; aarch64 would want its own tile.) An
 incomplete tile at the right or bottom edge goes through a scratch tile and the
-same kernel. Blocks are 256 (`f64`, narrow tile) or 128 (wide) and 512 (`f32` narrow) or 128 (wide) inner steps, 96 rows and
+same kernel. Blocks are 256 (`f64` narrow tile) or 512 (every other tile) inner steps, 96 rows and
 1024 columns. `multiply-at` (`gemm-fma-f64`, `gemm-fma-f32`) takes the width as a witness vector, `(splat f64x8 0.0)`, so a program can
 run either shape on any target (the eight lanes are split into the registers an AVX2 CPU has) and compare them: cases 7960 and 7961 do, bit for bit. Pointers into the packed buffers are unchecked; shapes and the
 reachable range of both inputs are validated once per call and every buffer is

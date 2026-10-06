@@ -7,7 +7,8 @@
 ;; fifteen of sixteen. With L >= 8 (AVX-512, thirty-two zmm) NR = 4L, a 6x32 tile: 24 accumulators, four B vectors and one broadcast
 ;; make 29 of 32 (BLIS's skx dgemm keeps 28 accumulators; this shape keeps A's panel at 6 rows, so the packing is the same at every
 ;; width, and it has the fewest loads per fma of the shapes that fit: (6+4)/24 against (8+3)/24 for 8x24 and (12+2)/24 for 12x16).
-;; The inner block shrinks with the tile so a B panel (kc x NR) stays in L1: 128 for the wide tile, 256 for the narrow one.
+;; The inner block of the wide tile is 512 (the narrow one 256): measured on Sapphire Rapids and Zen 4 (docs/shootout/avx512-2026-10-06.md, section kc),
+;; 64 loses 15 to 20 percent, 128 is 5 to 10 percent behind 512, and 512 is as fast as OpenBLAS on Zen 4. A B panel (kc x NR) is then larger than L1 and streams from L2.
 ;; `multiply` takes the native width of the target (8 lanes where `native-lanes` says 512 bits, else 4, which a 128-bit NEON
 ;; target legalises); `multiply-at` takes the witness, so a program can run any width on any target (the lanes are split into the
 ;; registers the CPU has) and compare.
@@ -24,7 +25,7 @@
 (defun nc :private () -> i64 1024) ; columns of B per block, a multiple of NR (8 or 32)
 (defun wide? :private (w: (Simd f64 n)) -> bool (>= (simd/lanes w) 8))
 (defun nr :private (w: (Simd f64 n)) -> i64 (* (simd/lanes w) (if (wide? w) 4 2)))  ; columns of a tile
-(defun kc :private (w: (Simd f64 n)) -> i64 (if (wide? w) 128 256))                 ; inner extent per block
+(defun kc :private (w: (Simd f64 n)) -> i64 (if (wide? w) 512 256))                 ; inner extent per block
 
 (defun ofs :private (p: ptr i: i64) -> ptr (unsafe (ptr+ p (unchecked-multiply 8 i))))
 (defun roundup :private (x: i64 q: i64) -> i64 (* q (quot (+ x (- q 1)) q)))
