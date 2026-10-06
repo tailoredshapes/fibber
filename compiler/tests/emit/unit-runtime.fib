@@ -5,7 +5,7 @@
 ;; Build: fibc build compiler/tests/emit/unit-runtime.fib -I compiler -I lib -o OUT
 (ns main (:use types.check emit.runtime emit.rt))
 
-(def stems: (Vec str) ["core" "str" "array" "vec" "vecbuild" "atom" "thread" "task" "weak" "io" "sys"])
+(def stems: (Vec str) ["core" "str" "array" "vec" "vecbuild" "atom" "thread" "task" "weak" "io" "sys" "alloc"])
 
 (defun file-text (stem: str) -> str
   (match (read-file (str-join ["rt/" stem ".lir"]))
@@ -16,7 +16,7 @@
   (let ((cs (checks-new))
         (parts (runtime-parts)))
     (do
-      (check cs "eleven parts" (= (count parts) 11))
+      (check cs "twelve parts" (= (count parts) 12))
       (doseq [i (range 10)]
         (check cs (str-join ["part " (nth stems i) " is its file"])
                (and (> (str-len (nth parts i)) 0) (= (nth parts i) (file-text (nth stems i))))))
@@ -36,5 +36,14 @@
       ;; which made the pool one worker).
       (let ((linux (str-join (runtime-parts-for "Linux"))) (darwin (str-join (runtime-parts-for "Darwin"))))
         (do (check cs "Linux asks sysconf(84)" (and (some? (str-find linux "@sysconf (i32 84)" 0)) (nil? (str-find linux "@sysconf (i32 58)" 0))))
-            (check cs "Darwin asks sysconf(58)" (and (some? (str-find darwin "@sysconf (i32 58)" 0)) (nil? (str-find darwin "@sysconf (i32 84)" 0))))))
+            (check cs "Darwin asks sysconf(58)" (and (some? (str-find darwin "@sysconf (i32 58)" 0)) (nil? (str-find darwin "@sysconf (i32 84)" 0))))
+            ;; ALLOC-1: the large-block cache's three platform calls.
+            (check cs "Linux pins glibc's mmap threshold, Darwin has no mallopt"
+                   (and (some? (str-find linux "(call @mallopt (i32 -3) (i32 131072))" 0)) (nil? (str-find darwin "@mallopt" 0)) (nil? (str-find darwin "(declare mallopt" 0))))
+            (check cs "Darwin asks malloc_size and its approximate raw clock"
+                   (and (some? (str-find darwin "(declare malloc_size i64 (ptr))" 0)) (nil? (str-find darwin "malloc_usable_size" 0))
+                        (some? (str-find darwin "@clock_gettime (i32 5)" 0)) (some? (str-find linux "@clock_gettime (i32 6)" 0))))))
+      (check cs "a function marked `;; extern:` answers with its declaration"
+             (= (runtime-declaration "fib_alloc_ctl") (some "(declare fib_alloc_ctl i64 (i64 i64 i64))")))
+      (check cs "part alloc is its file" (= (nth parts 11) (file-text "alloc")))
       (finish cs))))

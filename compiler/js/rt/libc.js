@@ -33,7 +33,11 @@ $X.realloc = (p, n) => {
   $freeBlock(p);
   return q;
 };
-$X.aligned_alloc = (a, n) => { a = Number(a); if (a <= 16) return $malloc(Number(n)); $unsupported('aligned_alloc above 16'); };
+// The runtime's large-block cache (rt/alloc.lir) files a freed block by its usable size, and pins glibc's mmap threshold: here there is no
+// threshold to pin, and a block's usable size is its class's.
+$X.malloc_usable_size = (p) => p === 0 ? 0n : BigInt($capacity(p));
+$X.mallopt = () => 1;
+$X.aligned_alloc =(a, n) => { a = Number(a); if (a <= 16) return $malloc(Number(n)); $unsupported('aligned_alloc above 16'); };
 $X.memcpy = (d, s, n) => { n = Number(n); if (n) $U8.copyWithin(d - $BIAS, s - $BIAS, s - $BIAS + n); return d; };
 $X.memmove = $X.memcpy;
 $X.memset = (d, v, n) => { n = Number(n); if (n) $U8.fill(v & 255, d - $BIAS, d - $BIAS + n); return d; };

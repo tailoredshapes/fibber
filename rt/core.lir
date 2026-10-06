@@ -47,6 +47,7 @@
   (block entry
     (call @fib.rq-init)
     (call @pthread_key_create @fib.task-key (ptr null))
+    (call @fib.lc-init)
     (let ((v (call @getenv (string "FIB_TRACE"))))
       (br (icmp eq v (ptr null)) done set)))
   (block set (store (i32 1) @fib.tracing) (br done))
@@ -145,6 +146,9 @@
     (store (load ptr head) slot)
     (br made))
   (block fresh
+    ;; A small block from malloc (more than one thread, or an empty list): the large-block cache's decay check (rt/alloc.lir), so
+    ;; that a threaded server whose requests are small still gives a spike's blocks back. An atomic load while the cache is empty.
+    (call @fib.lc-tick)
     (let ((q (call @malloc (shl cls (i64 4)))))
       (br (icmp eq q (ptr null)) oom made)))
   (block made
@@ -152,7 +156,7 @@
       (call @fib.init-hdr p tid (shl (trunc i32 cls) (i32 8)))
       (ret p)))
   (block big
-    (let ((p1 (call @malloc size)))
+    (let ((p1 (call @fib.lc-get size)))
       (br (icmp eq p1 (ptr null)) oom bigok)))
   (block bigok
     (call @fib.init-hdr p1 tid (i32 0))
@@ -162,7 +166,7 @@
     (br fin))
   (block fin (ret p1))
   (block traced
-    (let ((q2 (call @malloc (add size (i64 16)))))
+    (let ((q2 (call @fib.lc-get (add size (i64 16)))))
       (br (icmp eq q2 (ptr null)) oom tracedok)))
   (block tracedok
     (let ((n (call @fib.next-ordinal))
@@ -176,11 +180,13 @@
     (unreachable)))
 
 ;; Gives a dead object's block back: onto its class's list while there is
-;; one thread, else to free. `f` is the flags word read before the drop.
+;; one thread, else to free; a block of no class (above 512 bytes) to the
+;; large-block cache (rt/alloc.lir), which frees what it does not keep.
+;; `f` is the flags word read before the drop.
 (define internal (fib.free-block void) ((ptr p) (i32 f))
   (block entry
     (let ((cls (zext i64 (lshr f (i32 8)))))
-      (br (icmp ne cls (i64 0)) classed plain)))
+      (br (icmp ne cls (i64 0)) classed large)))
   (block classed
     (br (icmp eq (atomic-load monotonic i32 @fib.mt) (i32 0)) push plain))
   (block push
@@ -189,7 +195,8 @@
       (store (load ptr slot) p)
       (store p slot)
       (ret)))
-  (block plain (call @free p) (ret)))
+  (block plain (call @free p) (ret))
+  (block large (call @fib.lc-put p) (ret)))
 
 ;; The program's `(alloc n)` after its `calloc` (syntax §3.15): the block,
 ;; or the trap "out of memory" when there is none, as the interpreter
@@ -323,7 +330,7 @@
     (let ((q (getelementptr i8 p (i64 -16))))
       (call @fib.trace-line (i8 70) (load i64 q) (i8 0))
       (indirect-call (load ptr rec) (fn void (ptr ptr)) p wl)
-      (call @free q)
+      (call @fib.lc-put q)
       (ret))))
 
 ;; The worklist of a drop: the objects whose release is still to run,
