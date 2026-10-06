@@ -126,8 +126,8 @@ Names were grepped against `compiler/` and `lib/` (the self-hosting trap): `feat
 `prop`, `defcontract`, `implements`, `defspecs` are defined nowhere. Types that did collide were renamed (`Row`, `Ended`, `Job`, `Rec`
 of the compiler's own modules: the library's are `ScenarioRow`, `ChildEnded`, `ScenarioJob`, `StepLog`), because type and variant
 names are global across linked modules and a future `fibc test` links the runner into the driver. One name is shared on purpose:
-`lib/fib/lacinia/parse/cursor.fib` defines a function `expect`; module scope keeps it apart from the form `expect` (which is read by
-`then` and is never a binding), but a spec that `:use`s both modules should write `(:require [..lacinia.. :as g])`.
+`parse/cursor.fib` of the GraphQL engine (then `fib.lacinia`, now the separate lacewing repository) defined a function `expect`; module scope keeps it apart from the form `expect` (which is read by
+`then` and is never a binding), but a spec that `:use`s both modules should write `(:require [..module.. :as g])`.
 
 ### 2.3 Steps as data
 

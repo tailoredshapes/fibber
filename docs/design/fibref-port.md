@@ -49,7 +49,7 @@ decisions with recommendations.
 | `eval/pipeline.rs` | **Port** as `fibref.cmd` (322 lines becomes about 150) | |
 | `cases/` | **No port**; add the interpreter as a second outcome source to the existing harness (1.3) | |
 | `editor/` | **Port**, as `lsp.*`, on the same front-end tables, plus go-to-definition and document symbols (section 6) | the pack needs it; dev-loop DV8 |
-| `json.rs` | **Port** as `lsp.json` | fibber has no JSON module (`lib/fib/lacinia/json.fib` is a writer of GraphQL values only) |
+| `json.rs` | **Port** as `lsp.json` | fibber has no JSON module (the GraphQL engine's `json.fib`, now in the separate lacewing repository, is a writer of GraphQL values only) |
 | `dump.rs`, `expand_dump`, `types_dump`, `own_dump` | already ported (`fibc read|expand|types|own`) | |
 
 **Does the interpreter need LLVM?** Today macros run through the JIT, so yes unless package F6 (macros on the interpreter, fibber-interpreter.md P9) is
