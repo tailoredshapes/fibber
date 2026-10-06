@@ -1,0 +1,163 @@
+;; compiler/types/targets.fib: the table of code generation targets, one row per target (docs/design/targets.md 2).
+;;
+;; A target is a row of data, not a set of checks scattered over the compiler: the triple and LLVM's data layout for it, pointer width and
+;; byte order, the OS backend of the library and the runtime, the thread model, the vector width and features the checker's lane counts
+;; follow, whether `fma` is fused, the code-generation floor, unwinding, the object format, how an executable is linked and against what C
+;; library, and which of the runtime's C functions that library lacks. `types.target` (lanes, fma), `llvm.target` (CPU, -O 0 level),
+;; `native.target` (the cross target) and `expand.targetos` (the OS backend) read their answers from here. The module is pure data, so the
+;; checker and the tests need no LLVM. Adding a target is adding a row (and, for a new architecture, its LLVM initialisers in llvm.target).
+(ns types.targets)
+
+;; `triple` is the canonical triple of the row; `arch` and `os` are what a triple is matched on (`target-row-of-triple`). `runtime-os` is the
+;; OS adaptation of the runtime (emit.os) and the library's backend (expand.roots) that the row uses TODAY: "Linux" or "Darwin"; a row whose own
+;; `os` has no backend yet names "Linux" as a stand-in (its `status` says so). `data-layout` is LLVM 21's for the triple (checked by
+;; compiler/tests/native/targets-emit.sh against what the machine reports). `threads`: "pthreads", "wasm-threads" or "none". `vector-bits` and
+;; `features` are what the checker's `:native` lanes and the module's `(target ..)` form use when FIB_TARGET_CPU names no CPU. `min-level`
+;; is the lowest code-generation level the target is generated at (AArch64: 1, docs/design/aarch64.md 2.3). `tail-cc` is LLVM's calling
+;; convention number for lIR's `tailcc`: 18 (tailcc) where the backend has it, 0 (C) on WebAssembly, whose `musttail` is `return_call` of the
+;; tail-call feature (in the wasm rows' features), 8 (fastcc) on RISC-V, whose backend has no tailcc. `tail-kind` is how an lIR tail call is
+;; marked (LLVMTailCallKind): 2, `musttail`, the guarantee of spec/lir.md 7.3; 1, `tail`, a hint, on the rows without tailcc, because LLVM's
+;; verifier allows `musttail` between functions of different prototypes only under tailcc. On those rows a tail call is made where the
+;; backend can (wasm `return_call`, a RISC-V sibling call) and is an ordinary call otherwise: the 7.3 guarantee does NOT hold there
+;; (docs/design/targets.md 3.2: a blocker for running, not for emission). `reloc` is the relocation model of the
+;; machine (LLVMRelocMode): 2, position-independent, so that `cc` links a PIE; 1, static, on WebAssembly (PIC there imports `__memory_base`:
+;; the dynamic-linking convention, not what wasm-ld makes an executable from). `libc-lacks` lists the
+;; functions of `runtime-c-functions` that the row's C library does not provide.
+(defstruct TargetRow
+  (triple: str arch: str os: str runtime-os: str data-layout: str pointer-bits: i64 little-endian: bool threads: str
+   vector-bits: i64 default-cpu: str features: str has-fma: bool min-level: i64 tail-cc: i64 tail-kind: i64 reloc: i64 unwind: str object-format: str linker: str
+   sysroot: str libc: str libc-lacks: (Vec str) status: str))
+(derive Eq TargetRow)
+
+;; The C functions the runtime (rt/*.lir) declares: targets-emit.sh checks this list against the `declare`s of rt/.
+(defun runtime-c-functions () -> (Vec str)
+  ["__errno_location" "abort" "calloc" "clock_gettime" "close" "dup" "fclose" "ferror" "fopen" "fread" "free" "fwrite" "getenv" "isatty"
+   "lseek" "madvise" "malloc" "memcmp" "memcpy" "memset" "mkdir" "nanosleep" "openat" "pipe" "pthread_cond_broadcast" "pthread_cond_init"
+   "pthread_cond_wait" "pthread_create" "pthread_detach" "pthread_exit" "pthread_getspecific" "pthread_key_create" "pthread_mutex_init"
+   "pthread_mutex_lock" "pthread_mutex_unlock" "pthread_setspecific" "read" "realloc" "rmdir" "sched_yield" "snprintf" "strerror" "strlen"
+   "strtod" "strtof" "sysconf" "trunc" "truncf" "unlink" "write"])
+
+(def ELF64-LAYOUT-X86: str "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128")
+
+(defun row-x86-64-linux :private () -> TargetRow
+  (TargetRow "x86_64-unknown-linux-gnu" "x86_64" "linux" "Linux" ELF64-LAYOUT-X86 64 true "pthreads"
+             128 "generic" "" false 0 18 2 2 "dwarf-eh" "elf" "cc" "" "glibc" [] "runs"))
+
+(defun row-aarch64-darwin :private () -> TargetRow
+  (TargetRow "aarch64-apple-darwin" "aarch64" "darwin" "Darwin" "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32"
+             64 true "pthreads" 128 "apple-m1" "" true 1 18 2 2 "compact-unwind" "macho" "cc (ld64)" "" "libSystem" [] "runs"))
+
+(defun row-aarch64-linux :private () -> TargetRow
+  (TargetRow "aarch64-unknown-linux-gnu" "aarch64" "linux" "Linux"
+             "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32"
+             64 true "pthreads" 128 "generic" "" true 1 18 2 2 "dwarf-eh" "elf" "cc" "" "glibc" [] "emits"))
+
+(defun row-arm64-ios :private () -> TargetRow
+  (TargetRow "arm64-apple-ios" "aarch64" "ios" "Darwin" "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32"
+             64 true "pthreads" 128 "apple-m1" "" true 1 18 2 2 "compact-unwind" "macho" "xcrun clang (ld64), static library" "iPhoneOS SDK"
+             "libSystem" ["pipe"] "emits"))
+
+;; WASI preview 1, single-threaded: wasi-libc without threads (no pthread_create; the mutex and key functions are its single-thread stubs),
+;; no pipe, dup or madvise. 32-bit pointers. SIMD128 and tail calls are on (wasmtime, node and the browsers have both); no fused multiply-add.
+(defun row-wasm32-wasip1 :private () -> TargetRow
+  (TargetRow "wasm32-wasip1" "wasm32" "wasi" "Linux" "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"
+             32 true "none" 128 "generic" "+simd128,+tail-call" false 0 0 1 1 "none" "wasm" "wasm-ld" "WASI_SYSROOT" "wasi-libc"
+             ["dup" "madvise" "pipe" "pthread_create" "pthread_detach" "pthread_exit"] "emits; runtime-os Linux is a stand-in"))
+
+;; The browser or another JavaScript host: no C library at all, every runtime C function is an import the host must provide.
+(defun row-wasm32-unknown :private () -> TargetRow
+  (TargetRow "wasm32-unknown-unknown" "wasm32" "none" "Linux" "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"
+             32 true "none" 128 "generic" "+simd128,+tail-call" false 0 0 1 1 "none" "wasm" "wasm-ld --no-entry --export-dynamic" "" "none"
+             (runtime-c-functions) "emits; runtime-os Linux is a stand-in"))
+
+;; RV64GC Linux (the RVA20 profile: I M A F D C, Zicsr, Zifencei), the lp64d ABI. The V extension is not assumed (FIB_TARGET_CPU names a
+;; CPU that has it); the scalar D extension has a fused multiply-add (fmadd.d), so `has-fma` is true.
+(defun row-riscv64-linux :private () -> TargetRow
+  (TargetRow "riscv64-unknown-linux-gnu" "riscv64" "linux" "Linux" "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128"
+             64 true "pthreads" 128 "generic-rv64" "+m,+a,+f,+d,+c,+zicsr,+zifencei" true 0 8 1 2 "dwarf-eh" "elf" "cc (riscv64 cross)"
+             "RISCV_SYSROOT" "glibc" [] "emits"))
+
+;; Every row, in the order `fibc targets` prints them. The rest of LLVM's backends have no row yet (docs/design/targets.md 5).
+(defun target-rows () -> (Vec TargetRow)
+  [(row-x86-64-linux) (row-aarch64-darwin) (row-aarch64-linux) (row-arm64-ios) (row-wasm32-wasip1) (row-wasm32-unknown)
+   (row-riscv64-linux)])
+
+;; --- matching a triple
+
+(defun has :private (s: str t: str) -> bool (some? (str-find s t 0)))
+
+;; The architecture of a triple, the text before the first `-`, with Apple's `arm64` read as `aarch64`.
+(defun arch-of-triple (triple: str) -> str
+  (let ((a (match (str-find triple "-" 0) ((some i) (str-slice triple 0 i)) (nil triple))))
+    (if (= a "arm64") "aarch64" a)))
+
+;; Whether a triple is for an Apple OS (Mach-O).
+(defun apple-triple? (triple: str) -> bool
+  (or (has triple "-apple-") (has triple "-darwin") (has triple "-ios") (has triple "-macos")))
+
+;; The OS of a triple as the rows name it: ios, darwin, wasi, none (a wasm triple with no OS), linux, else other (freebsd, windows, ..: no row).
+(defun os-of-triple (triple: str) -> str
+  (cond (has triple "-ios") "ios"
+        (apple-triple? triple) "darwin"
+        (has triple "wasi") "wasi"
+        (starts-with? triple "wasm") "none"
+        (has triple "-linux") "linux"
+        :else "other"))
+
+;; The row for `triple`: the row of its architecture and OS; else the first row of its architecture, with the OS and runtime of the triple
+;; (an Apple triple is Darwin, anything else Linux) and status "unlisted"; else a generic row (128-bit vectors, no fma, Linux). The fallbacks
+;; are what the compiler did before the table: a triple it has no row for is generated as LLVM generates it.
+(defun target-row-of-triple (triple: str) -> TargetRow
+  (let ((arch (arch-of-triple triple))
+        (os (os-of-triple triple))
+        (rows (target-rows)))
+    (match (first (filter (fn (r: TargetRow) (and (= (. r arch) arch) (= (. r os) os))) rows))
+      ((some r) r)
+      (nil (let ((rt (if (apple-triple? triple) "Darwin" "Linux")))
+             (match (first (filter (fn (r: TargetRow) (= (. r arch) arch)) rows))
+               ((some r) (with r (triple triple) (os os) (runtime-os rt) (data-layout "") (libc-lacks []) (status "unlisted")))
+               (nil (TargetRow triple arch os rt "" 64 true "pthreads" 128 "generic" "" false 0 18 2 2 "unknown" "unknown" "cc" "" "unknown" []
+                               "unlisted"))))))))
+
+;; --- CPUs by name (FIB_TARGET_CPU, the host's): the vector width the compiler prefers and whether fma is fused
+
+;; `name` is a CPU name, or a prefix when `prefix?`; `family` is "x86" or "aarch64".
+(defstruct CpuRow (name: str prefix?: bool family: str vector-bits: i64 has-fma: bool))
+
+;; The x86 CPUs that have AVX2 and FMA (256-bit vectors). A name not in the table is taken to be a baseline x86-64 (128 bits, no fma): a
+;; wrong guess costs speed only.
+(defun cpu-rows-x86 :private () -> (Vec CpuRow)
+  (mapv (fn (n: str) (CpuRow n false "x86" 256 true))
+        ["x86-64-v3" "x86-64-v4" "haswell" "broadwell" "skylake" "skylake-avx512" "skx" "cascadelake" "cooperlake" "cannonlake"
+         "icelake-client" "icelake-server" "tigerlake" "rocketlake" "sapphirerapids" "alderlake" "raptorlake" "meteorlake" "graniterapids"
+         "znver1" "znver2" "znver3" "znver4" "znver5" "bdver4" "core-avx2"]))
+
+;; The aarch64 CPUs by LLVM's name or name prefix: every one has NEON's fused multiply-add and 128-bit vectors.
+(defun cpu-rows-aarch64 :private () -> (Vec CpuRow)
+  (into (mapv (fn (n: str) (CpuRow n true "aarch64" 128 true))
+              ["apple-" "cortex-a" "neoverse-" "ampere" "armv8" "armv9" "exynos-" "thunderx" "carmel" "falkor" "kryo" "saphira" "oryon" "a64fx"])
+        [(CpuRow "aarch64" false "aarch64" 128 true) (CpuRow "native-aarch64" false "aarch64" 128 true)]))
+
+(defun cpu-rows () -> (Vec CpuRow)
+  (into (cpu-rows-x86) (cpu-rows-aarch64)))
+
+;; The row of the CPU named `cpu`, if the table has it.
+(defun cpu-row (cpu: str) -> (Option CpuRow)
+  (first (filter (fn (r: CpuRow) (if (. r prefix?) (starts-with? cpu (. r name)) (= cpu (. r name)))) (cpu-rows))))
+
+;; --- printing (`fibc targets`)
+
+(defun commas :private (xs: (Vec str)) -> str
+  (reduce (fn (acc: str x: str) (if (= acc "") x (str-join [acc "," x]))) "" xs))
+
+(defun yes-no :private (b: bool) -> str (if b "yes" "no"))
+
+;; One row as tab-separated fields, in the order of the header.
+(defun row-line (r: TargetRow) -> str
+  (str-join [(. r triple) "\t" (. r arch) "\t" (. r os) "\t" (. r runtime-os) "\t" (str (. r pointer-bits)) "\t"
+             (if (. r little-endian) "little" "big") "\t" (. r threads) "\t" (str (. r vector-bits)) "\t" (. r default-cpu) "\t"
+             (if (= (. r features) "") "-" (. r features)) "\t" (yes-no (. r has-fma)) "\t" (str (. r min-level)) "\t" (str (. r tail-cc)) "\t" (if (= (. r tail-kind) 2) "musttail" "tail") "\t" (str (. r reloc)) "\t" (. r unwind) "\t"
+             (. r object-format) "\t" (. r linker) "\t" (if (= (. r sysroot) "") "-" (. r sysroot)) "\t" (. r libc) "\t"
+             (if (empty? (. r libc-lacks)) "-" (commas (. r libc-lacks))) "\t" (. r data-layout) "\t" (. r status)]))
+
+(def ROW-HEADER: str "triple\tarch\tos\truntime-os\tpointer-bits\tendian\tthreads\tvector-bits\tcpu\tfeatures\tfma\tmin-level\ttail-cc\ttail-call\treloc\tunwind\tobject\tlinker\tsysroot\tlibc\tlibc-lacks\tdata-layout\tstatus")

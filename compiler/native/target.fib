@@ -4,7 +4,7 @@
 ;; idempotent), because there is no global state to remember it in. The work is llvm.target's; this module is the lair-shaped face of it.
 
 (ns native.target
-  (:use lir.diag lir.ast native.error types.target)
+  (:use lir.diag lir.ast native.error types.target types.targets)
   (:require [llvm.target :as lt]))
 
 
@@ -19,13 +19,11 @@
                ((some cpu) (target-of-cpu cpu))
                (nil (target-of-features (lt/host-cpu-name) (lt/host-features))))))))
 
-;; The target of FIB_TARGET_TRIPLE `triple`: for AArch64 the CPU of `lt/cross-cpu`, 128-bit vectors (NEON; SVE is not assumed) and fast fma (every
-;; AArch64 CPU has FMLA/FMADD); anything else is the baseline, as `target-of-cpu` takes an unknown name. (design: docs/design/aarch64.md 2.3; the CPU rows
-;; belong in types/target.fib once that file is free of the SIMD work)
+;; The target of FIB_TARGET_TRIPLE `triple`: its row of types.targets (docs/design/targets.md) with the CPU of `lt/cross-cpu`: AArch64 128-bit
+;; vectors (NEON; SVE is not assumed) and fast fma, wasm32 SIMD128 and no fma, riscv64 RV64GC with fma; a CPU named by FIB_TARGET_CPU
+;; that the CPU table knows decides the width and fma instead.
 (defun cross-target-info :private (triple: str) -> Target
-  (if (lt/aarch64-triple? triple)
-      (Target (lt/cross-cpu triple) "" 128 true)
-      (target-of-cpu (lt/cross-cpu triple))))
+  (target-of-row (target-row-of-triple triple) (lt/cross-cpu triple) (some? (lt/requested-cpu))))
 
 ;; The machine for the code this run generates: the one `FIB_TARGET_TRIPLE` names, else the host's. Objects, assembly and IR come from it; the JIT
 ;; keeps `machine-host`, because it runs what it makes.
