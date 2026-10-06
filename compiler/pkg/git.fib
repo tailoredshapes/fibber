@@ -1,0 +1,123 @@
+;; compiler/pkg/git.fib: the git cache (docs/design/packages.md §4). A commit of a repository is checked out once, at
+;; CACHE/git/HOST/PATH/SHA (CACHE is $FIBBER_HOME, else $XDG_CACHE_HOME/fibber, else ~/.cache/fibber), fetched shallow (exactly that
+;; commit), made read-only, and never changed again. A fetch works in a directory of its own (SHA.tmp-PID) and renames it into place: a
+;; rename is atomic, so two builds that fetch the same commit at once both end with one whole checkout, and a fetch that dies leaves only
+;; a .tmp directory behind. Only `git`, `chmod` and `rm` are run, never code of the library.
+(ns pkg.git
+  (:require [pkg.exec :as x] [pkg.paths :as pp] [fib.os :as os] [lair.ffi :as ffi]))
+
+(extern rename :private (ptr ptr) -> i32)
+
+;; The root of the cache.
+(defun cache-home () -> str
+  (match (os/getenv "FIBBER_HOME")
+    ((some h) h)
+    (nil (match (os/getenv "XDG_CACHE_HOME")
+           ((some c) (str c "/fibber"))
+           (nil (str (unwrap-or (os/getenv "HOME") "/tmp") "/.cache/fibber"))))))
+
+;; A part of a path made safe: letters, digits, `.`, `_`, `-` kept, anything else `_`; `.` and `..` become `_`.
+(defun clean-part :private (p: str) -> str
+  (if (or (= p ".") (= p ".."))
+      "_"
+      (str-join (mapv (fn (c: char) (if (or (and (>= c \a) (<= c \z)) (and (>= c \A) (<= c \Z)) (and (>= c \0) (<= c \9))
+                                            (= c \.) (= c \_) (= c \-))
+                                        (char->str c) "_"))
+                      (str-chars p)))))
+
+;; `https://host/a/b.git`, `ssh://user@host/a/b`, `user@host:a/b.git` and `file:///a/b` as `host/a/b` (`file/a/b`): the
+;; directory of the repository under CACHE/git.
+(defun url-key (url: str) -> str
+  (let ((scheme (str-find url "://" 0))
+        (file? (starts-with? url "file://"))
+        (rest (match scheme (nil url) ((some i) (str-slice url (+ i 3) (str-len url)))))
+        (host-path (if file? rest (drop-user rest)))
+        (slashed (if (nil? scheme) (pp/join-sep (pp/split-on host-path ":") "/") host-path))
+        (parts (filter (fn (p: str) (> (str-len p) 0)) (pp/split-on slashed "/")))
+        (cleaned (mapv clean-part parts)))
+    (strip-git (pp/join-sep (if file? (into ["file"] cleaned) cleaned) "/"))))
+
+;; `user@host/..` as `host/..`: an `@` before the first `/` ends a user name.
+(defun drop-user :private (s: str) -> str
+  (match (str-find s "@" 0)
+    (nil s)
+    ((some a) (if (match (str-find s "/" 0) (nil true) ((some sl) (< a sl))) (str-slice s (+ a 1) (str-len s)) s))))
+
+(defun strip-git :private (k: str) -> str
+  (if (and (> (str-len k) 4) (= (str-slice k (- (str-len k) 4) (str-len k)) ".git")) (str-slice k 0 (- (str-len k) 4)) k))
+
+;; Where the commit `sha` of `url` is checked out.
+(defun checkout-dir (url: str sha: str) -> str
+  (str (cache-home) "/git/" (url-key url) "/" sha))
+
+;; `git` with these words; Err is what it said.
+(defun git (words: (Vec str)) -> (Result str str)
+  (let ((r (x/run (into ["git"] words))))
+    (if (= (. r status) 0) (Ok (. r out)) (Err (x/why r)))))
+
+;; The commit a tag of `url` names (an annotated tag peeled to its commit), asked of the remote: `git ls-remote`.
+(defun tag-sha (url: str tag: str) -> (Result str str)
+  (match (git ["ls-remote" "--" url (str "refs/tags/" tag) (str "refs/tags/" tag "^{}")])
+    ((Err m) (Err (str "git ls-remote " url ": " m)))
+    ((Ok out)
+     (let ((lines (filter (fn (l: str) (> (str-len l) 40)) (pp/split-on out "\n")))
+           (peeled (first (filter (fn (l: str) (> (count (pp/split-on l "^{}")) 1)) lines)))
+           (line (match peeled ((some p) (some p)) (nil (first lines)))))
+       (match line
+         (nil (Err (str "the tag " tag " is not in " url)))
+         ((some l) (Ok (str-slice l 0 40))))))))
+
+;; The commit and tree of a checkout, and whether its files are as committed: Ok the tree id, Err why not.
+(defun verify (dir: str sha: str) -> (Result str str)
+  (match (git ["-C" dir "rev-parse" "HEAD" "HEAD^{tree}"])
+    ((Err m) (Err (str dir ": not a checkout git can read: " m)))
+    ((Ok out)
+     (let ((ids (pp/split-on out "\n")))
+       (cond (< (count ids) 2) (Err (str dir ": git rev-parse said nothing"))
+             (not (= (nth ids 0) sha)) (Err (str dir ": the checkout is at " (nth ids 0) ", not the locked " sha))
+             :else (match (git ["-C" dir "status" "--porcelain" "--untracked-files=normal"])
+                     ((Err m) (Err (str dir ": git status: " m)))
+                     ((Ok "") (Ok (nth ids 1)))
+                     ((Ok changed) (Err (str dir ": the checkout's files were changed: " (x/first-line changed))))))))))
+
+;; Removes a checkout or a partial one (it is read-only).
+(defun remove-tree (dir: str) -> unit
+  (do (x/run ["chmod" "-R" "u+w" "--" dir]) (x/run ["rm" "-rf" "--" dir]) ()))
+
+;; Fetches exactly `sha` into the fresh repository `tmp` and checks it out: shallow first; a server that refuses a commit by id gets a
+;; full fetch of its branches and tags.
+(defun fetch-into :private (tmp: str url: str sha: str) -> (Result unit str)
+  (try-let [_ (git ["init" "-q" tmp])
+            _ (match (git ["-C" tmp "fetch" "-q" "--depth" "1" "--" url sha])
+                ((Ok o) (Ok o))
+                ((Err _) (git ["-C" tmp "fetch" "-q" "--" url "+refs/heads/*:refs/remotes/origin/*" "+refs/tags/*:refs/tags/*"])))
+            _ (git ["-C" tmp "-c" "advice.detachedHead=false" "checkout" "-q" "--detach" sha])]
+    (Ok ())))
+
+(defun rename-dir :private (from: str to: str) -> bool
+  (let ((a (ffi/bytes-new from)) (b (ffi/bytes-new to))
+        (r (unsafe (rename a b))))
+    (do (ffi/free-addr (ffi/ptr->addr a)) (ffi/free-addr (ffi/ptr->addr b)) (= r 0i32))))
+
+;; The checkout of `sha` of `url`, fetched when it is not in the cache; Ok its directory. With `offline`, a missing one is an error.
+(defun ensure (url: str sha: str offline: bool) -> (Result str str)
+  (let ((dir (checkout-dir url sha)))
+    (cond (pp/dir? dir) (Ok dir)
+          offline (Err (str sha " of " url " is not in the cache (" dir ") and --offline forbids fetching it"))
+          :else (fetch-new url sha dir))))
+
+(defun fetch-new :private (url: str sha: str dir: str) -> (Result str str)
+  (let ((tmp (str dir ".tmp-" (os/process-id)))
+        (_ (os/setenv "GIT_TERMINAL_PROMPT" "0"))
+        (_ (remove-tree tmp))
+        (_ (x/run ["mkdir" "-p" "--" tmp])))
+    (match (fetch-into tmp url sha)
+      ((Err m) (do (remove-tree tmp) (Err (str "cannot fetch " sha " of " url ": " m))))
+      ((Ok _)
+       (match (verify tmp sha)
+         ((Err m) (do (remove-tree tmp) (Err m)))
+         ((Ok _)
+          (do (x/run ["chmod" "-R" "a-w" "--" tmp])
+              (if (or (rename-dir tmp dir) (pp/dir? dir))
+                  (do (when (pp/dir? tmp) (remove-tree tmp)) (Ok dir))
+                  (do (remove-tree tmp) (Err (str "cannot move the checkout into " dir)))))))))))

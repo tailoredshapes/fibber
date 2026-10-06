@@ -1,0 +1,64 @@
+;; compiler/pkg/modules.fib: the module search path of a project and the check that no two libraries define one module (docs/design/
+;; packages.md §1.2). A module `a.b` is the file `a/b.fib` under a root (spec/syntax.md §5): the first root that has it wins, so two
+;; libraries with a file `util.fib` would make one of them silently unreachable. fibber does not impose a prefix per library (Clojure's
+;; reverse-domain names are a convention, and so is this); it lists every module of every library at resolution and refuses a name that
+;; two libraries (the project counts as one) define, or that the bundled library defines.
+(ns pkg.modules
+  (:require [pkg.resolve :as rs] [pkg.paths :as pp] [pkg.project :as pj] [fib.os :as os] [expand.libdir :as libdir]))
+
+;; A module and where it is: the library and the file.
+(defstruct PkgModule (name: str lib: str file: str))
+
+;; The modules below `dir`, named relative to `prefix` (`a.b` for `a/b.fib`); a directory whose name starts with `.` is not entered.
+(defun modules-below (dir: str prefix: str lib: str) -> (Vec PkgModule)
+  (match (os/list-directory dir)
+    ((Err _) [])
+    ((Ok entries)
+     (reduce (fn (acc: (Vec PkgModule) e: os/DirectoryEntry)
+               (let ((n (. e name)) (path (str dir "/" n)))
+                 (cond (starts-with? n ".") acc
+                       (or (= (. e kind) os/Directory) (= (. e kind) os/UnknownEntry))
+                         (if (pp/dir? path) (into acc (modules-below path (str prefix n ".") lib)) (with-file acc n prefix path lib))
+                       :else (with-file acc n prefix path lib))))
+             [] entries))))
+
+(defun with-file :private (acc: (Vec PkgModule) n: str prefix: str path: str lib: str) -> (Vec PkgModule)
+  (if (pp/suffix? n ".fib") (conj acc (PkgModule (str prefix (str-slice n 0 (- (str-len n) 4))) lib path)) acc))
+
+;; The roots of the project itself, absolute: its :paths, and with `test` the :extra-paths of its :test alias.
+(defun project-roots (p: pj/PkgProject test: bool) -> (Vec str)
+  (mapv (fn (r: str) (pp/under (. p dir) r)) (if test (into (. p paths) (. p test-paths)) (. p paths))))
+
+(defun lib-roots (l: rs/PkgLib) -> (Vec str)
+  (mapv (fn (r: str) (pp/under (. l dir) r)) (. l paths)))
+
+;; The module search path of a project: its roots, then each library's in resolution order (they come after `-I` and before
+;; FIB_LIB and the bundled library: expand.roots).
+(defun search-dirs (p: pj/PkgProject libs: (Vec rs/PkgLib) test: bool) -> (Vec str)
+  (reduce (fn (acc: (Vec str) l: rs/PkgLib) (into acc (lib-roots l))) (project-roots p test) libs))
+
+(defun owner-text :private (m: PkgModule) -> str (str (. m lib) " (" (. m file) ")"))
+
+;; Every module of the project and its libraries; Err for a module two of them define, or one the bundled library has.
+(defun check-collisions (p: pj/PkgProject libs: (Vec rs/PkgLib)) -> (Result unit str)
+  (let ((top (if (= (. p name) "") "the project" (. p name)))
+        (own (reduce (fn (acc: (Vec PkgModule) r: str) (into acc (modules-below r "" top))) [] (project-roots p false)))
+        (all (reduce (fn (acc: (Vec PkgModule) l: rs/PkgLib)
+                       (reduce (fn (a: (Vec PkgModule) r: str) (into a (modules-below r "" (. l name)))) acc (lib-roots l)))
+                     own libs))
+        (builtin (libdir/library-dir)))
+    (loop ((i 0) (seen: (Map str PkgModule) (map-empty)))
+      (if (>= i (count all))
+          (Ok ())
+          (let ((m (nth all i)))
+            (match (get seen (. m name))
+              ((some o) (if (= (. o lib) (. m lib))
+                            (recur (+ i 1) seen)
+                            (Err (str "the module " (. m name) " is defined twice: by " (owner-text o) " and by " (owner-text m)
+                                      "; a module name belongs to one library (name modules under a prefix of the library's own)"))))
+              (nil (if (and (not (= (. m name) "main")) (some? (read-file (str builtin "/" (module-file (. m name))))))
+                       (Err (str "the module " (. m name) " of " (owner-text m) " has the name of a module of the bundled library"))
+                       (recur (+ i 1) (assoc seen (. m name) m))))))))))
+
+(defun module-file :private (name: str) -> str
+  (str (pp/join-sep (pp/split-on name ".") "/") ".fib"))

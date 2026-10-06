@@ -1,0 +1,160 @@
+;; compiler/pkg/resolve.fib: resolution (docs/design/packages.md §3). From the root project's :deps, breadth first in the order written:
+;; each request becomes one library (a commit of a git repository, or a directory), whose own `deps.fib` (read as data: no code of a
+;; library runs here) adds its requests. The same library asked for twice is fine when both ask for the same commit (a diamond); two
+;; different commits are a CONFLICT naming both chains of who asked, and the root project's :override is the only way to choose (there is
+;; no newest-wins for commits). A tag is resolved to a commit once: a library the lock already has keeps the locked commit (a pin) unless
+;; `fibc deps update` names it, so a moved tag never changes a build silently; where a tagged commit has to be fetched, or `check-tags`
+;; asks (`fibc deps fetch`), the tag is asked of the remote again and a tag that moved is refused.
+(ns pkg.resolve
+  (:require [pkg.project :as pj] [pkg.git :as g] [pkg.paths :as pp] [pkg.data :as d]))
+
+;; A resolved library. `sha` and `tree` are "" for a directory; `dir` is where its files are (the checkout, or the directory); `paths`
+;; its source roots relative to `dir`; `deps` the names of the libraries it asked for; `via` the chain of names that first asked for it.
+(defstruct PkgLib (name: str src: pj/PkgSource sha: str tree: str dir: str paths: (Vec str) deps: (Vec str) via: (Vec str)))
+
+;; What resolution may do: `offline` fetches nothing; `pins` are the locked libraries; `unpinned` names the ones `deps update` takes
+;; afresh ("*" all); `check-tags` asks the remote for every tag.
+(defstruct PkgOpts (offline: bool pins: (Vec PkgLib) unpinned: (Vec str) check-tags: bool))
+
+;; One request: the dependency, the chain that asked for it, and the directory a :local/root is relative to.
+(defstruct PkgReq :private (dep: pj/PkgDep via: (Vec str) from: str from-git: bool))
+
+(defun lib-url (l: PkgLib) -> str
+  (match (. l src) ((pj/SrcGit url _ _) url) ((pj/SrcLocal _) "")))
+
+(defun lib-tag (l: PkgLib) -> (Option str)
+  (match (. l src) ((pj/SrcGit _ _ tag) tag) ((pj/SrcLocal _) nil)))
+
+;; How a library is shown in a message or a tree: `URL SHA (tag T)` or `DIR`.
+(defun lib-where (l: PkgLib) -> str
+  (match (. l src)
+    ((pj/SrcGit url _ tag) (str url " " (. l sha) (match tag (nil "") ((some t) (str " (tag " t ")")))))
+    ((pj/SrcLocal _) (. l dir))))
+
+(defun chain (via: (Vec str) name: str) -> str
+  (pp/join-sep (conj via name) " -> "))
+
+(defun find-lib (libs: (Vec PkgLib) name: str) -> (Option PkgLib)
+  (first (filter (fn (l: PkgLib) (= (. l name) name)) libs)))
+
+(defun find-dep :private (deps: (Vec pj/PkgDep) name: str) -> (Option pj/PkgDep)
+  (first (filter (fn (x: pj/PkgDep) (= (. x name) name)) deps)))
+
+(defun unpinned? :private (o: PkgOpts name: str) -> bool
+  (some? (first (filter (fn (u: str) (or (= u "*") (= u name))) (. o unpinned)))))
+
+;; The pinned commit for a tag request: the locked library of the same name, URL and tag, when it is not being updated.
+(defun pin :private (o: PkgOpts name: str url: str tag: str) -> (Option str)
+  (if (unpinned? o name)
+      nil
+      (match (find-lib (. o pins) name)
+        (nil nil)
+        ((some l) (if (and (= (lib-url l) url) (= (unwrap-or (lib-tag l) "") tag)) (some (. l sha)) nil)))))
+
+;; The commit a git request names: its sha, else its tag's pinned commit, else the tag asked of the remote.
+(defun request-sha :private (o: PkgOpts name: str url: str sha: (Option str) tag: (Option str)) -> (Result str str)
+  (match sha
+    ((some s) (Ok s))
+    (nil (let ((t (unwrap-or tag "")))
+           (match (pin o name url t)
+             ((some s) (Ok s))
+             (nil (if (. o offline)
+                      (Err (str name ": the tag " t " of " url " is not locked and --offline forbids asking the remote for it"))
+                      (match (g/tag-sha url t) ((Err m) (Err (str name ": " m))) ((Ok s) (Ok s))))))))))
+
+;; A tag that names another commit than the one resolved: refused.
+(defun check-tag :private (name: str url: str tag: str sha: str) -> (Result unit str)
+  (match (g/tag-sha url tag)
+    ((Err m) (Err (str name ": " m)))
+    ((Ok now) (if (= now sha)
+                  (Ok ())
+                  (Err (str name ": the tag " tag " of " url " has moved: it named " sha " when locked and names " now
+                            " now; `fibc deps update " name "` takes the new commit"))))))
+
+;; The project file of a library's directory: its own, or the default (paths ["src"], no deps) when it has none.
+(defun lib-project :private (dir: str) -> (Result pj/PkgProject str)
+  (if (some? (read-file (str dir "/deps.fib")))
+      (pj/read-project dir)
+      (Ok (pj/PkgProject dir "" "" ["src"] [] [] [] []))))
+
+;; The checkout of a git request: fetched if need be (a tagged commit about to be fetched has its tag checked first), then verified.
+(defun git-lib :private (o: PkgOpts r: PkgReq url: str sha: str tag: (Option str)) -> (Result PkgLib str)
+  (let ((name (. (. r dep) name))
+        (cached (pp/dir? (g/checkout-dir url sha)))
+        (must-check (and (some? tag) (not (. o offline)) (or (. o check-tags) (not cached)) (not (unpinned? o name)))))
+    (try-let [_ (if must-check (check-tag name url (unwrap-or tag "") sha) (Ok ()))
+              dir (g/ensure url sha (. o offline))
+              tree (match (g/verify dir sha)
+                     ((Err m) (Err (str name ": " m "; remove the directory (`fibc deps fetch` fetches it again)")))
+                     ((Ok t) (Ok t)))
+              p (lib-project dir)]
+      (Ok (PkgLib name (pj/SrcGit url (some sha) tag) sha tree dir (. p paths) (mapv (fn (x: pj/PkgDep) (. x name)) (. p deps))
+                  (. r via))))))
+
+(defun local-lib :private (r: PkgReq root: str) -> (Result PkgLib str)
+  (let ((name (. (. r dep) name))
+        (dir (pp/under (. r from) root)))
+    (cond (. r from-git) (Err (str (chain (. r via) name) ": a git library cannot depend on a :local/root"))
+          (not (pp/dir? dir)) (Err (str (chain (. r via) name) ": :local/root " dir " is not a directory"))
+          :else (try-let [p (lib-project dir)]
+                  (Ok (PkgLib name (pj/SrcLocal dir) "" "" dir (. p paths) (mapv (fn (x: pj/PkgDep) (. x name)) (. p deps)) (. r via)))))))
+
+;; The library a request names, resolved (not yet compared with one of the same name).
+(defun make-lib :private (o: PkgOpts allow: (Vec str) r: PkgReq) -> (Result PkgLib str)
+  (let ((dep (. r dep)) (name (. dep name)))
+    (match (. dep src)
+      ((pj/SrcLocal root) (local-lib r root))
+      ((pj/SrcGit url sha tag)
+       (if (not (pj/url-allowed? url allow))
+           (Err (str (chain (. r via) name) ": the URL " url " is not https, ssh or file; list it in :allow-urls of the root deps.fib to allow it"))
+           (try-let [s (request-sha o name url sha tag)] (git-lib o r url s tag)))))))
+
+;; Whether a request and a resolved library are the same commit (or directory); requests are compared after their tag is resolved.
+(defun same-source? :private (o: PkgOpts r: PkgReq l: PkgLib) -> (Result bool str)
+  (match (. (. r dep) src)
+    ((pj/SrcLocal root) (Ok (= (pp/under (. r from) root) (. l dir))))
+    ((pj/SrcGit url sha tag)
+     (try-let [s (request-sha o (. l name) url sha tag)] (Ok (and (= url (lib-url l)) (= s (. l sha))))))))
+
+(defun conflict :private (r: PkgReq l: PkgLib other: str) -> str
+  (let ((name (. l name)))
+    (str "CONFLICT: " name " is requested twice, at different commits:\n  " (chain (. l via) name) ": " (lib-where l)
+         "\n  " (chain (. r via) name) ": " other
+         "\nfibc does not choose between commits; choose one under :override in the root deps.fib, e.g.\n  :override {" name
+         " {:git/url \"..\" :git/sha \"..\"}}")))
+
+(defun request-where :private (o: PkgOpts r: PkgReq) -> str
+  (match (. (. r dep) src)
+    ((pj/SrcLocal root) (pp/under (. r from) root))
+    ((pj/SrcGit url sha tag) (str url " " (match (request-sha o (. (. r dep) name) url sha tag) ((Ok s) s) ((Err _) "?"))
+                                  (match tag (nil "") ((some t) (str " (tag " t ")")))))))
+
+;; The requests of a new library, after the ones already queued.
+(defun requests-of :private (l: PkgLib git?: bool) -> (Result (Vec PkgReq) str)
+  (try-let [p (lib-project (. l dir))]
+    (Ok (mapv (fn (x: pj/PkgDep) (PkgReq x (conj (. l via) (. l name)) (. l dir) git?)) (. p deps)))))
+
+;; One step: the request at `i` against what is resolved so far.
+(defun step :private (o: PkgOpts root: pj/PkgProject libs: (Vec PkgLib) r0: PkgReq) -> (Result (Option PkgReq) str)
+  (let ((name (. (. r0 dep) name))
+        (r (match (find-dep (. root overrides) name) (nil r0) ((some ov) (PkgReq ov (. r0 via) (. root dir) false)))))
+    (match (find-lib libs name)
+      ((some l) (try-let [same (same-source? o r l)] (if same (Ok nil) (Err (conflict r l (request-where o r))))))
+      (nil (Ok (some r))))))
+
+;; Every library the root project needs, in resolution order.
+(defun resolve (o: PkgOpts root: pj/PkgProject) -> (Result (Vec PkgLib) str)
+  (let ((top (if (= (. root name) "") "the project" (. root name)))
+        (queue0 (mapv (fn (x: pj/PkgDep) (PkgReq x [top] (. root dir) false)) (. root deps))))
+    (loop ((i 0) (queue queue0) (libs (vec-empty)))
+      (if (>= i (count queue))
+          (Ok libs)
+          (match (step o root libs (nth queue i))
+            ((Err m) (Err m))
+            ((Ok nil) (recur (+ i 1) queue libs))
+            ((Ok (some r)) (do
+                       (match (make-lib o (. root allow-urls) r)
+                         ((Err m) (Err m))
+                         ((Ok l) (match (requests-of l (match (. l src) ((pj/SrcGit _ _ _) true) (_ false)))
+                                   ((Err m) (Err m))
+                                   ((Ok more) (recur (+ i 1) (into queue more) (conj libs l)))))))))))))

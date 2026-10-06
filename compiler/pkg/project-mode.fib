@@ -1,0 +1,60 @@
+;; compiler/pkg/project-mode.fib: project mode (docs/design/packages.md §5). A command that reads a program, run where a `deps.fib` is
+;; (in the working directory or above it), resolves the project (pkg.resolve, pinned by deps.lock), writes the lock when resolution
+;; changed it, checks that no module is defined twice, and returns the module search path: the project's roots, then every library's in
+;; lock order. `--locked` refuses a missing or stale lock; `--offline` never fetches (a cold cache is an error); `--frozen` is both.
+(ns pkg.project-mode
+  (:require [pkg.project :as pj] [pkg.resolve :as rs] [pkg.lock :as lk] [pkg.modules :as md] [pkg.paths :as pp] [fib.os :as os]))
+
+(defstruct PkgFlags (locked: bool offline: bool))
+
+;; The words without `--locked`, `--offline` and `--frozen` (before the first `--`), and the flags they set.
+(defstruct PkgTaken (words: (Vec str) flags: PkgFlags))
+
+(defun take-flags (words: (Vec str)) -> PkgTaken
+  (loop ((i 0) (out (vec-empty)) (locked false) (offline false))
+    (if (>= i (count words))
+        (PkgTaken out (PkgFlags locked offline))
+        (let ((w (nth words i)))
+          (cond (= w "--") (PkgTaken (into out (drop i words)) (PkgFlags locked offline))
+                (= w "--locked") (recur (+ i 1) out true offline)
+                (= w "--offline") (recur (+ i 1) out locked true)
+                (= w "--frozen") (recur (+ i 1) out true true)
+                :else (recur (+ i 1) (conj out w) locked offline))))))
+
+;; A project and its resolved libraries.
+(defstruct PkgResolved (project: pj/PkgProject libs: (Vec rs/PkgLib)))
+
+(defun stale-lock-message :private () -> str
+  "deps.lock is missing or was not made from this deps.fib, and --locked forbids changing it (run `fibc deps fetch` and commit deps.lock)")
+
+;; Resolves the project at `root`, writing deps.lock when it changed (refused under --locked). `unpinned` and `check-tags` as rs/PkgOpts.
+(defun resolve-project (root: str f: PkgFlags unpinned: (Vec str) check-tags: bool) -> (Result PkgResolved str)
+  (try-let [p (pj/read-project root)
+            lock (lk/read-lock root)]
+    (let ((fresh (match lock (nil false) ((some l) (lk/fresh? l p))))
+          (pins (match lock (nil []) ((some l) (. l libs)))))
+      (if (and (. f locked) (not fresh))
+          (Err (stale-lock-message))
+          (try-let [libs (rs/resolve (rs/PkgOpts (. f offline) pins unpinned check-tags) p)
+                    _ (write-lock p libs lock fresh (. f locked))
+                    _ (md/check-collisions p libs)]
+            (Ok (PkgResolved p libs)))))))
+
+(defun write-lock :private (p: pj/PkgProject libs: (Vec rs/PkgLib) lock: (Option lk/PkgLock) fresh: bool locked: bool) -> (Result unit str)
+  (let ((same (and fresh (match lock (nil false) ((some l) (lk/same-libs? (. l libs) libs))))))
+    (cond same (Ok ())
+          locked (Err "resolution does not give what deps.lock records, and --locked forbids changing it (was deps.lock edited?)")
+          (write-file (str (. p dir) "/deps.lock") (lk/lock-text p libs)) (Ok ())
+          :else (Err (str "cannot write " (. p dir) "/deps.lock")))))
+
+;; The project root above the working directory, unless FIB_NO_PROJECT is set (the children `fibc test` starts: their parent resolved).
+(defun project-root () -> (Option str)
+  (match (os/getenv "FIB_NO_PROJECT")
+    ((some _) nil)
+    (nil (pp/find-root (pp/cwd)))))
+
+;; The extra module roots for a command: none outside a project; the project's search path inside one (with `test`, its :test paths).
+(defun project-dirs (f: PkgFlags test: bool) -> (Result (Vec str) str)
+  (match (project-root)
+    (nil (Ok []))
+    ((some root) (try-let [r (resolve-project root f [] false)] (Ok (md/search-dirs (. r project) (. r libs) test))))))

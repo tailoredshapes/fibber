@@ -1,0 +1,103 @@
+;; compiler/pkg/lock.fib: the lockfile `deps.lock` (docs/design/packages.md §2): the root project's requests it was made from (:deps
+;; and :override, as written), and every resolved library in resolution order with its commit, the commit's tree id (git's own object
+;; id of the files: what a checkout is verified against), its paths and the names it depends on. Fibber data, like deps.fib, written by
+;; fibc only; a directory library is recorded by its path relative to the project.
+(ns pkg.lock
+  (:require [pkg.project :as pj] [pkg.resolve :as rs] [pkg.data :as d] [pkg.paths :as pp] [pkg.git :as g])
+  (:use syntax.form))
+
+(defstruct PkgLock (requests: (Vec pj/PkgDep) overrides: (Vec pj/PkgDep) libs: (Vec rs/PkgLib)))
+
+(defun strs-text :private (v: (Vec str)) -> str
+  (str "[" (pp/join-sep (mapv d/quote-str v) " ") "]"))
+
+;; A request as deps.fib writes it, `relative` to the project for the text of a :local/root.
+(defun coord-text (src: pj/PkgSource) -> str
+  (match src
+    ((pj/SrcLocal root) (str "{:local/root " (d/quote-str root) "}"))
+    ((pj/SrcGit url sha tag)
+     (str "{:git/url " (d/quote-str url)
+          (match sha (nil "") ((some s) (str " :git/sha " (d/quote-str s))))
+          (match tag (nil "") ((some t) (str " :git/tag " (d/quote-str t)))) "}"))))
+
+(defun deps-text :private (deps: (Vec pj/PkgDep) indent: str) -> str
+  (str "{" (pp/join-sep (mapv (fn (x: pj/PkgDep) (str (. x name) " " (coord-text (. x src)))) deps) (str "\n" indent)) "}"))
+
+(defun lib-text :private (l: rs/PkgLib project: str) -> str
+  (str "{:name " (d/quote-str (. l name))
+       (match (. l src)
+         ((pj/SrcLocal dir) (str " :local/root " (d/quote-str (pp/relative project dir))))
+         ((pj/SrcGit url _ tag)
+          (str " :git/url " (d/quote-str url) " :git/sha " (d/quote-str (. l sha))
+               (match tag (nil "") ((some t) (str " :git/tag " (d/quote-str t))))
+               "\n   :tree " (d/quote-str (. l tree)))))
+       "\n   :paths " (strs-text (. l paths)) " :deps " (strs-text (. l deps)) " :via " (strs-text (. l via)) "}"))
+
+;; The text of the lockfile.
+(defun lock-text (p: pj/PkgProject libs: (Vec rs/PkgLib)) -> str
+  (str ";; deps.lock: written by fibc from deps.fib (docs/design/packages.md). Commit it; do not edit it.\n"
+       "{:lock 1\n :deps " (deps-text (. p deps) "        ")
+       "\n :override " (deps-text (. p overrides) "            ")
+       "\n :libs [" (pp/join-sep (mapv (fn (l: rs/PkgLib) (lib-text l (. p dir))) libs) "\n        ") "]}\n"))
+
+(defun want :private (m: Stx key: str) -> (Result Stx str)
+  (match (d/lookup m key)
+    (nil (Err (d/at (. m pos) (str "a locked library has :" key))))
+    ((some v) (Ok v))))
+
+;; One library of the lock, its directory found again (the cache, or the project's directory and the relative path).
+(defun read-lib :private (m: Stx project: str) -> (Result rs/PkgLib str)
+  (try-let [_ (d/check-keys m ["name" "git/url" "git/sha" "git/tag" "tree" "local/root" "paths" "deps" "via"] "a locked library")
+            nv (want m "name") name (d/want-str nv ":name")
+            pv (want m "paths") paths (d/want-strs pv ":paths")
+            dv (want m "deps") deps (d/want-strs dv ":deps")
+            vv (want m "via") via (d/want-strs vv ":via")
+            url (d/opt-str m "git/url") sha (d/opt-str m "git/sha") tag (d/opt-str m "git/tag")
+            tree (d/opt-str m "tree") root (d/opt-str m "local/root")]
+    (match url
+      ((some u) (let ((s (unwrap-or sha "")))
+                  (Ok (rs/PkgLib name (pj/SrcGit u (some s) tag) s (unwrap-or tree "") (rs-dir u s) paths deps via))))
+      (nil (let ((dir (pp/under project (unwrap-or root "."))))
+             (Ok (rs/PkgLib name (pj/SrcLocal dir) "" "" dir paths deps via)))))))
+
+(defun rs-dir :private (url: str sha: str) -> str (g/checkout-dir url sha))
+
+;; `DIR/deps.lock`, if there is one; Err for one that does not read.
+(defun read-lock (dir: str) -> (Result (Option PkgLock) str)
+  (let ((file (str dir "/deps.lock")))
+    (if (nil? (read-file file))
+        (Ok nil)
+        (try-let [m (d/read-map file)
+                  _ (d/check-keys m ["lock" "deps" "override" "libs"] "deps.lock")
+                  reqs (pj/parse-deps m "deps")
+                  ovs (pj/parse-deps m "override")
+                  lv (want m "libs")
+                  libs (read-libs lv dir)]
+          (Ok (some (PkgLock reqs ovs libs)))))))
+
+(defun read-libs :private (v: Stx dir: str) -> (Result (Vec rs/PkgLib) str)
+  (match (. v kind)
+    ((SVec items) (loop ((i 0) (out (vec-empty)))
+                    (if (>= i (count items))
+                        (Ok out)
+                        (match (read-lib (nth items i) dir) ((Err e) (Err e)) ((Ok l) (recur (+ i 1) (conj out l)))))))
+    (_ (Err (d/at (. v pos) ":libs is a vector")))))
+
+;; A request as one line of text, for comparing the lock's requests with deps.fib's (the order of a map does not matter).
+(defun request-key :private (x: pj/PkgDep) -> str
+  (str (. x name) " " (coord-text (. x src))))
+
+(defun same-requests? :private (a: (Vec pj/PkgDep) b: (Vec pj/PkgDep)) -> bool
+  (= (vec (sort (mapv request-key a))) (vec (sort (mapv request-key b)))))
+
+;; Whether the lock was made from these :deps and :override.
+(defun fresh? (l: PkgLock p: pj/PkgProject) -> bool
+  (and (same-requests? (. l requests) (. p deps)) (same-requests? (. l overrides) (. p overrides))))
+
+;; Whether two resolutions are the same libraries at the same commits, in the same order.
+(defun same-libs? (a: (Vec rs/PkgLib) b: (Vec rs/PkgLib)) -> bool
+  (and (= (count a) (count b))
+       (every? (fn (i: i64) (let ((x (nth a i)) (y (nth b i)))
+                               (and (= (. x name) (. y name)) (= (. x sha) (. y sha)) (= (. x dir) (. y dir)) (= (. x tree) (. y tree))
+                                    (= (. x paths) (. y paths)) (= (. x deps) (. y deps)))))
+               (range (count a)))))
