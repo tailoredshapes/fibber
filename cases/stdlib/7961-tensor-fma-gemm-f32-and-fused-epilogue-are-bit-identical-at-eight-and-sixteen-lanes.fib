@@ -1,0 +1,62 @@
+;; spec: lib/fib/tensor/README.md (Linear algebra and SIMD, AVX-512): the f32 GEMM and its fused bias-and-activation epilogue are one source over a witness vector; eight lanes (6x16 tile, inner block 512) and sixteen (6x64 tile, inner block 128) give the same bits
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; `multiply-with-at` runs the kernel and the epilogue at the width of the witness on any target. The plain product at both widths equals the checked scalar `fma-reference` bit for bit; with a bias and
+;; each activation the two widths equal each other bit for bit (the epilogue works eight lanes at a time at every width, so a tile edge that is wrong at 64 columns, a bias buffer padded to the wrong
+;; panel width, a bias read from the wrong tile, or an activation applied twice across inner blocks shows here), for shapes around the 16- and 64-column tiles, the 6-row tile, the inner blocks
+;; (128 and 512), the 1024-column block and strided operands.
+(ns main (:require [fib.tensor :as t] [fib.tensor.gemm-fma-f32 :as g] [fib.tensor.vmath :as v]) (:use tl.check))
+
+(defun gen (n: i64 seed: i64) -> (t/Tensor f32)
+  (let ((buf (cell (array n 0.0f32))))
+    (do (dotimes (i n) (array-set! &buf i (fdiv (float (- (rem (+ (* i 7919) (* seed 104729)) 1013) 500)) 37.0f32)))
+        (t/from-array [n] @buf 0.0f32))))
+(defun mat (m: i64 n: i64 seed: i64) -> (t/Tensor f32) (t/reshape [m n] (gen (* m n) seed)))
+
+(defun bits (x: (t/Tensor f32)) -> (Vec i32) (mapv (fn (e: f32) (f32->bits e)) (t/to-vec x)))
+(defun same? (x: (t/Tensor f32) y: (t/Tensor f32)) -> bool (and (= (t/shape x) (t/shape y)) (= (bits x) (bits y))))
+
+(defun w8 () -> f32x8 (splat f32x8 0.0f32))
+(defun w16 () -> f32x16 (splat f32x16 0.0f32))
+
+(defun product-agrees? (a: (t/Tensor f32) b: (t/Tensor f32)) -> bool
+  (let ((r (g/fma-reference a b)))
+    (and (same? (g/multiply-at a b (w8)) r) (same? (g/multiply-at a b (w16)) r))))
+
+;; the fused epilogue with activation `code` at both widths
+(defun fused-agrees? (a: (t/Tensor f32) b: (t/Tensor f32) bias: (t/Tensor f32) code: i64) -> bool
+  (same? (g/multiply-with-at a b bias code (w8)) (g/multiply-with-at a b bias code (w16))))
+
+(defun main () -> i64
+  (let ((c (checks)) (ms [1 5 6 7 13 97]) (ns [1 7 15 16 17 31 33 63 64 65 80 127 128 129]) (ks [1 3 127 128 129 300 511 512 513 700]))
+    (do (dotimes (mi (count ms))
+          (dotimes (ni (count ns))
+            (dotimes (ki (count ks))
+              (let ((m (nth ms mi)) (n (nth ns ni)) (k (nth ks ki)))
+                (check c (product-agrees? (mat m k 1) (mat k n 2)))))))
+        ;; the epilogue: every activation, tails in all three directions, two inner blocks at the narrow width (512) and five at the wide (128)
+        (let ((a (mat 13 700 1)) (b (mat 700 70 2)) (bias (gen 70 3)) (codes [2 3 4 5 6 7]))
+          (dotimes (i (count codes)) (check c (fused-agrees? a b bias (nth codes i)))))
+        (let ((ms [1 6 7 13]) (ns [1 15 16 17 63 64 65 129]) (ks [1 127 128 129 513]))
+          (dotimes (mi (count ms))
+            (dotimes (ni (count ns))
+              (dotimes (ki (count ks))
+                (let ((m (nth ms mi)) (n (nth ns ni)) (k (nth ks ki)))
+                  (check c (fused-agrees? (mat m k 4) (mat k n 5) (gen n 6) (v/activation-code :relu))))))))
+        ;; a second column block, strided operands and a stepped bias
+        (let ((a (mat 5 9 3)) (b (mat 9 1100 4))) (check c (product-agrees? a b)) (check c (fused-agrees? a b (gen 1100 5) 5)))
+        (let ((a (mat 19 23 5)) (b (mat 23 21 6)) (at (t/transpose (mat 23 19 5))) (bt (t/transpose (mat 21 23 6))) (bias (gen 21 8)))
+          (do (check c (product-agrees? at b))
+              (check c (product-agrees? a bt))
+              (check c (fused-agrees? at b bias 6))
+              (check c (fused-agrees? (t/flip 1 a) (t/flip 0 b) bias 3))
+              (let ((wide (gen 42 6)) (sl (t/slice 0 1 42 2 wide))) (check c (fused-agrees? a b sl 7)))))
+        ;; the data discriminate: an fma chain is not the multiply-then-add chain of mmul-scalar, and the epilogue changed the values
+        (let ((a (mat 40 300 1)) (b (mat 300 40 2)))
+          (do (check c (not (same? (g/multiply-at a b (w16)) (t/mmul-scalar a b))))
+              (check c (not (same? (g/multiply-with-at a b (gen 40 3) 7 (w16)) (g/multiply-at a b (w16)))))))
+        (check c (= (checks-made c) 1015))
+        (checks-result c))))

@@ -73,6 +73,18 @@ def setup(k, n):
         if k.startswith("sum"):
             return (lambda: a.sum(axis=axis)), cs
         return (lambda: a.max(axis=axis)), cs
+    if k == "expvec":
+        a = make([n], 0, f64)
+        return lambda: np.exp(a), cs
+    if k == "logvec":
+        a = make([n], 1, f64)
+        return lambda: np.log(np.abs(a) + 1.0), cs
+    if k == "tanhvec":
+        a = make([n], 0, f64)
+        return lambda: np.tanh(a), cs
+    if k == "expvec32":
+        a = make([n], 0, f32)
+        return lambda: np.exp(a), cs
     if k == "bcast":
         a, row = make([n, n], 1, f64), make([n], 2, f64)
         return lambda: a + row, cs
