@@ -1,8 +1,8 @@
 ;; fib.json.writefast: the serialiser's core, with the output position passed and returned instead of kept in cells (docs/design/json.md 4). The bytes go to a malloc'ed block of `cap`
 ;; bytes; every function takes the block, its capacity and the position, and answers the new position, or -1 when what it had to write does not fit. A -1 unwinds to `write-with`, which
-;; frees the block and writes again into one eight times bigger (so the work done before a full block is at most a seventh of the work done, and no byte is ever moved twice by a
-;; growth). No function here touches a cell on the path of a plain value: null, booleans, integers, strings with nothing to escape, separators and indentation are a bounds check and
-;; stores. What needs the cell-based buffer (a float through Schubfach, a string with an escape) is built in a small scratch buffer of its own and copied.
+;; frees the block and writes again: first into 4 KiB (a small document costs nothing more), then into 4 MiB (malloc'ed and so not touched beyond what is written: the pages
+;; are mapped when first stored to), then each time into one eight times bigger; the work lost to a full block is at most 4 KiB, then a seventh of the work done, and no byte is moved by a growth. No function here touches a cell on the path of a plain value: null, booleans, integers, strings with nothing to escape, separators and indentation are a bounds check and
+;; stores. What needs the cell-based buffer (a float through Schubfach, a string with an escape) is built in one scratch buffer shared by the whole write and copied.
 ;;   (write-with j opts) -> str     (write-bytes-with j opts) -> (Array i8)
 (ns fib.json.writefast (:use fib.core fib.seq fib.coll fib.json.types fib.json.buffer fib.json.dtoa fib.json.escape) (:require [fib.json.libc :as libc]))
 
@@ -38,12 +38,12 @@
             (+ start n)))))
 
 ;; Through the cell-based code in a scratch buffer of n0 bytes (grown there as needed), then copied.
-(defun wfloat (b: ptr cap: i64 pos: i64 x: f64) -> i64
-  (let [tb (cell (new-buffer 40)) tl (cell 0)]
-    (do (put-f64 &tb &tl x)
-        (wcopy b cap pos (unsafe (ptr+ (raw @tb) 24)) @tl))))
+(defun wfloat (b: ptr cap: i64 pos: i64 x: f64 &tb: (Array i8) &tl: i64) -> i64
+  (do (set! tl 0)
+      (put-f64 &tb &tl x)
+      (wcopy b cap pos (unsafe (ptr+ (raw @tb) 24)) @tl)))
 
-(defun wstring (b: ptr cap: i64 pos: i64 s: str ascii: bool) -> i64
+(defun wstring (b: ptr cap: i64 pos: i64 s: str ascii: bool &tb: (Array i8) &tl: i64) -> i64
   (let [n (str-len s)
         p (scan-plain s n (vec-plain-prefix s n ascii) ascii)]
     (if (>= p n)
@@ -52,9 +52,9 @@
                 (copy-bytes (unsafe (ptr+ b (+ pos 1))) (unsafe (ptr+ (raw s) 24)) n)
                 (wbyte b (+ pos (+ n 1)) 34)
                 (+ pos (+ n 2))))
-        (let [tb (cell (new-buffer (+ n 16))) tl (cell 0)]
-          (do (put-string-slow &tb &tl s ascii)
-              (wcopy b cap pos (unsafe (ptr+ (raw @tb) 24)) @tl))))))
+        (do (set! tl 0)
+            (put-string-slow &tb &tl s ascii)
+            (wcopy b cap pos (unsafe (ptr+ (raw @tb) 24)) @tl)))))
 
 (defun windent (b: ptr cap: i64 pos: i64 level: i64 w: WriteOptions) -> i64
   (if (= (. w indent) 0) pos
@@ -66,49 +66,53 @@
 
 (defun wchar (b: ptr cap: i64 pos: i64 c: i64) -> i64 (if (>= pos cap) -1 (do (wbyte b pos c) (+ pos 1))))
 
-(defun warray (b: ptr cap: i64 pos0: i64 items: (Vec Json) level: i64 w: WriteOptions) -> i64
+(defun warray (b: ptr cap: i64 pos0: i64 items: (Vec Json) level: i64 w: WriteOptions &tb: (Array i8) &tl: i64) -> i64
   (let [m (count items) p (wchar b cap pos0 91)]
     (if (or (< p 0) (= m 0)) (if (< p 0) -1 (wchar b cap p 93))
         (let [e (loop [i 0 q p]
                   (if (or (>= i m) (< q 0)) q
                       (let [q1 (if (> i 0) (wchar b cap q 44) q)
                             q2 (if (< q1 0) -1 (windent b cap q1 (+ level 1) w))]
-                        (recur (+ i 1) (if (< q2 0) -1 (wjson b cap q2 (nth items i) (+ level 1) w))))))
+                        (recur (+ i 1) (if (< q2 0) -1 (wjson b cap q2 (nth items i) (+ level 1) w &tb &tl))))))
               e2 (if (< e 0) -1 (windent b cap e level w))]
           (if (< e2 0) -1 (wchar b cap e2 93))))))
 
-(defun wobject (b: ptr cap: i64 pos0: i64 keys: (Vec str) vals: (Vec Json) level: i64 w: WriteOptions) -> i64
+(defun wobject (b: ptr cap: i64 pos0: i64 keys: (Vec str) vals: (Vec Json) level: i64 w: WriteOptions &tb: (Array i8) &tl: i64) -> i64
   (let [m (count keys) p (wchar b cap pos0 123)]
     (if (or (< p 0) (= m 0)) (if (< p 0) -1 (wchar b cap p 125))
         (let [e (loop [i 0 q p]
                   (if (or (>= i m) (< q 0)) q
                       (let [q1 (if (> i 0) (wchar b cap q 44) q)
                             q2 (if (< q1 0) -1 (windent b cap q1 (+ level 1) w))
-                            q3 (if (< q2 0) -1 (wstring b cap q2 (nth keys i) (. w ascii)))
+                            q3 (if (< q2 0) -1 (wstring b cap q2 (nth keys i) (. w ascii) &tb &tl))
                             q4 (if (< q3 0) -1 (wchar b cap q3 58))
                             q5 (if (or (< q4 0) (= (. w indent) 0)) q4 (wchar b cap q4 32))]
-                        (recur (+ i 1) (if (< q5 0) -1 (wjson b cap q5 (nth vals i) (+ level 1) w))))))
+                        (recur (+ i 1) (if (< q5 0) -1 (wjson b cap q5 (nth vals i) (+ level 1) w &tb &tl))))))
               e2 (if (< e 0) -1 (windent b cap e level w))]
           (if (< e2 0) -1 (wchar b cap e2 125))))))
 
-(defun wjson (b: ptr cap: i64 pos: i64 j: Json level: i64 w: WriteOptions) -> i64
+(defun wjson (b: ptr cap: i64 pos: i64 j: Json level: i64 w: WriteOptions &tb: (Array i8) &tl: i64) -> i64
   (match j
     ((JNull) (wlit b cap pos lit-null))
     ((JBool x) (wlit b cap pos (if x lit-true lit-false)))
     ((JInt i) (wint b cap pos i))
-    ((JFloat f) (wfloat b cap pos f))
+    ((JFloat f) (wfloat b cap pos f &tb &tl))
     ((JBig t) (wlit b cap pos t))
-    ((JStr s) (wstring b cap pos s (. w ascii)))
-    ((JArr items) (warray b cap pos items level w))
-    ((JObj keys vals) (wobject b cap pos keys vals level w))))
+    ((JStr s) (wstring b cap pos s (. w ascii) &tb &tl))
+    ((JArr items) (warray b cap pos items level w &tb &tl))
+    ((JObj keys vals) (wobject b cap pos keys vals level w &tb &tl))))
 
 (defun write-bytes-with (j: Json w: WriteOptions) -> (Array i8)
+  (let [tb (cell (new-buffer 64)) tl (cell 0)]
+    (write-loop j w &tb &tl)))
+
+(defun write-loop (j: Json w: WriteOptions &tb: (Array i8) &tl: i64) -> (Array i8)
   (loop [cap 4096]
     (let [b (unsafe (alloc cap))
-          r (wjson b cap 0 j 0 w)]
+          r (wjson b cap 0 j 0 w &tb &tl)]
       (if (>= r 0)
           (let [out (array r 0i8)]
             (do (unsafe (do (libc/memcpy (ptr+ (raw out) 24) b r) (free b))) out))
-          (do (unsafe (free b)) (recur (* cap 8)))))))
+          (do (unsafe (free b)) (recur (if (= cap 4096) 4194304 (* cap 8))))))))
 
 (defun write-with (j: Json w: WriteOptions) -> str (str-from-bytes (write-bytes-with j w)))
