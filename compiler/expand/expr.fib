@@ -42,7 +42,7 @@
 (ns expand.expr
   (:require [expand.prelude :as prelude] [expand.quasi :as quasi] [expand.params :as params]
             [expand.brackets :as brackets] [expand.overload :as overload]
-            [expand.scope :as scope])
+            [expand.scope :as scope] [expand.qualify :as qual] [expand.macrons :as macrons])
   (:use syntax.pos syntax.form expand.error expand.types expand.ctx expand.core
         expand.build expand.heads expand.collections expand.fuse))
 
@@ -131,7 +131,9 @@
       ((some def)
        (if (accepts? def (count args))
            (do (ctx-set-call-pos (. ex ctx) pos)
-               (runner-run (. ex runner) def args (. ex ctx)))
+               (match (runner-run (. ex runner) def args (. ex ctx))
+                 ((Ok f) (do (macrons/note-expansion (. ex ctx) def f) (Ok f)))
+                 ((Err e) (Err e))))
            (Err (ExpandError (MacroArity name (arity-text def) (count args)) pos)))))))
 
 ;; What one pass of `expand-head` made of a form.
@@ -209,7 +211,7 @@
         (match (ctx-step ctx pos)
           ((Err e) (Err e))
           ((Ok _)
-           (match (quasi/rewrite form)
+           (match (quasi/rewrite (qual/qualify-template ctx form))
              ((Err e) (Err e))
              ((Ok f) (Ok (Rewrote f))))))
         (match (ctx-macro-ambiguity ctx name)

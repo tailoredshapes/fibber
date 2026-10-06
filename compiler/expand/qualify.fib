@@ -1,0 +1,211 @@
+;; compiler/expand/qualify.fib: the names of a macro's template resolve in the macro's own module (package MACRO-NS, syntax §3.16 "Names
+;; in a template", docs/design/macro-names.md), as Clojure's syntax-quote qualifies a symbol with the namespace it is read in.
+;;
+;; When a `defmacro` body is walked (the context's `templating`), each quasiquote's template is rewritten here before expand.quasi turns
+;; it into code. At level 1 (not under an `unquote`, nor in a nested quasiquote), a symbol becomes:
+;; - `m/x`, where the macro's module defines `x` at top level (a function, a `def`, an `extern`, a protocol method, a struct, a variant,
+;;   a public macro) or sees it exported by a module it `:use`s or an implicit module, `m` being the module that defines it;
+;;   `(var m/x)` for a :private function, `def`, `extern` or method of the macro's module (the one reference that reaches a private
+;;   value, §3.20); a private struct, variant or macro and an enum or protocol name (a type) stay as written;
+;; - `ns/x` for `alias/x` where `alias` is a `:require` alias of the macro's module; any other qualified symbol stays as written;
+;; - itself, when it is a core form, `nil`, `&`, `...`, `_`, a name ending in `:`, a name the template binds anywhere (a `let`, `loop`
+;;   or other binding head's names, a `fn`, `defun` or `defmacro`'s name and parameters, a `match` clause's pattern variables, an
+;;   `impl` method's name and parameters, a `def`'s name, the field of `.` and `set-field!`: an over-approximation, so a local the
+;;   expansion binds is never qualified), or a name the module does not see from a definition (the prelude's names, the builtins,
+;;   names unknown here: resolved at the expansion site, as before).
+;; Nothing inside `quote`, `defstruct`, `defenum`, `defprotocol`, `extern` or `ns` is qualified.
+(ns expand.qualify
+  (:require [expand.scope :as scope] [fib.string :as fstr])
+  (:use syntax.pos syntax.form expand.types expand.ctx expand.build expand.heads expand.macrons))
+
+;; One template's question: the context, the macro's module and its scope, the names the template binds.
+(defstruct Tq :private (ctx: ExpandCtx ns: str tops: (Map str MacroTop) scope: ModuleScope bound: (Map str bool)))
+
+;; ---------------------------------------------------------------- what the template binds
+
+(def binding-heads: (Vec str) :private
+  ["let" "loop" "plet" "if-let" "when-let" "if-some" "when-some" "try-let" "doseq" "dotimes" "for" "with-open" "with-view"
+   "with-view-ro" "binding" "letfn"])
+
+(def fn-heads: (Vec str) :private ["fn" "defun" "defn" "defn-" "defmacro"])
+
+(defun member? :private (names: (Vec str) s: str) -> bool
+  (some? (first (filter (fn (n: str) (= n s)) names))))
+
+(defun items-of :private (f: Stx) -> (Vec Stx)
+  (match (. f kind) ((SList items) items) ((SVec items) items) (_ (vec-empty))))
+
+(defun list-or-vec? :private (f: Stx) -> bool
+  (match (. f kind) ((SList _) true) ((SVec _) true) (_ false)))
+
+(defun names-into :private (acc: (Map str bool) names: (Vec str)) -> (Map str bool)
+  (reduce (fn (m: (Map str bool) n: str) (assoc m n true)) acc names))
+
+;; The names of a binding list: `((a 1) (b 2))`, `(x expr)` or `[a 1 b 2]`.
+(defun binding-names :private (b: Stx) -> (Vec str)
+  (let ((items (items-of b)))
+    (match (. b kind)
+      ((SVec _) (reduce (fn (acc: (Vec str) i: i64) (into acc (scope/scope-binding-names (nth items i))))
+                        (vec-empty) (vec (filter (fn (i: i64) (= (rem i 2) 0)) (range (count items))))))
+      ((SList _)
+       (if (and (> (count items) 0) (list-or-vec? (nth items 0)))
+           (reduce (fn (acc: (Vec str) p: Stx)
+                     (if (list-or-vec? p) (if (empty? (items-of p)) acc (into acc (scope/scope-binding-names (nth (items-of p) 0)))) acc))
+                   (vec-empty) items)
+           (if (empty? items) (vec-empty) (scope/scope-binding-names (nth items 0)))))
+      (_ (vec-empty)))))
+
+;; The names of a parameter list: plain and typed names, and the variables of pattern parameters.
+(defun param-list-names :private (head: Stx params: Stx) -> (Vec str)
+  (reduce (fn (acc: (Vec str) p: Stx) (if (list-or-vec? p) (into acc (scope/scope-pattern-names p)) acc))
+          (scope/scope-param-names (Stx (SList [head params]) (. params pos)) 1)
+          (items-of params)))
+
+;; The names a `fn`-like form binds: the symbols before its parameter list (its name) and the parameters; for a `defn` of several
+;; clauses `([a b] body)` each clause's parameters.
+(defun fn-names :private (items: (Vec Stx)) -> (Vec str)
+  (loop ((i 1) (out (vec-empty)))
+    (if (>= i (count items))
+        out
+        (let ((f (nth items i)))
+          (match (. f kind)
+            ((SSym s) (recur (+ i 1) (conj out s)))
+            ((SVec _) (into out (param-list-names (nth items 0) f)))
+            ((SList inner)
+             (if (and (> (count inner) 0) (match (. (nth inner 0) kind) ((SVec _) true) (_ false)))
+                 (recur (+ i 1) (into out (param-list-names (nth items 0) (nth inner 0))))
+                 (if (= i (- (count items) 1)) out (into out (param-list-names (nth items 0) f)))))
+            (_ (recur (+ i 1) out)))))))
+
+;; The names an `impl`'s methods bind: each method's name and parameters.
+(defun impl-names :private (items: (Vec Stx)) -> (Vec str)
+  (reduce (fn (acc: (Vec str) m: Stx)
+            (match (. m kind)
+              ((SList ms) (into acc (fn-names (into [(sym "fn" (. m pos))] ms))))
+              (_ acc)))
+          (vec-empty) (vec (drop 3 items))))
+
+(defun sym-at :private (items: (Vec Stx) i: i64) -> (Vec str)
+  (if (< i (count items))
+      (match (. (nth items i) kind) ((SSym s) [s]) (_ (vec-empty)))
+      (vec-empty)))
+
+;; The names one list of the template binds (or that are not names: the field of `.`).
+(defun form-binds :private (h: str items: (Vec Stx)) -> (Vec str)
+  (cond (member? binding-heads h) (if (> (count items) 1) (binding-names (nth items 1)) (vec-empty))
+        (member? fn-heads h) (fn-names items)
+        (= h "match") (reduce (fn (acc: (Vec str) c: Stx)
+                                (if (and (list-or-vec? c) (not (empty? (items-of c))))
+                                    (into acc (scope/scope-pattern-names (nth (items-of c) 0)))
+                                    acc))
+                              (vec-empty) (vec (drop 2 items)))
+        (= h "impl") (impl-names items)
+        (= h "def") (vec (map (fn (s: str) (if (fstr/ends-with? s ":") (str-slice s 0 (- (str-len s) 1)) s)) (sym-at items 1)))
+        (or (= h ".") (= h "set-field!")) (sym-at items 2)
+        :else (vec-empty)))
+
+;; Every name the template binds, at any depth of level 1.
+(defun bound-names :private (t: Stx) -> (Map str bool)
+  (loop ((work [t]) (i 0) (out (map-empty)))
+    (if (>= i (count work))
+        out
+        (let ((f (nth work i)))
+          (match (. f kind)
+            ((SList items)
+             (match (head-name f)
+               ((some h) (if (stops? h)
+                             (recur work (+ i 1) out)
+                             (recur (into work items) (+ i 1) (names-into out (form-binds h items)))))
+               (nil (recur (into work items) (+ i 1) out))))
+            ((SVec items) (recur (into work items) (+ i 1) out))
+            ((SMap items) (recur (into work items) (+ i 1) out))
+            (_ (recur work (+ i 1) out)))))))
+
+;; The heads under which nothing is qualified (and nothing is looked at for bindings).
+(defun stops? :private (h: str) -> bool
+  (member? ["quote" "quasiquote" "unquote" "unquote-splicing" "defstruct" "defenum" "defprotocol" "extern" "ns"] h))
+
+;; ---------------------------------------------------------------- resolution
+
+;; The definition `x` that module `ns` exports: its own public one, else one a module it re-exports exports; with its module.
+(defun exported-top :private (ctx: ExpandCtx ns: str x: str depth: i64) -> (Option (Pair str MacroTop))
+  (if (> depth 64)
+      nil
+      (match (macro-ns-of ctx ns)
+        (nil nil)
+        ((some m)
+         (match (map-get (. m tops) x)
+           ((some t) (if (. t private) nil (some (Pair ns t))))
+           (nil (first (keep (fn (r: str) (exported-top ctx r x (+ depth 1))) (. (. m spec) exports)))))))))
+
+;; Where the macro's module finds the bare name `x`: its own definition, else the first of its `:use`s, then of its implicit modules,
+;; that exports it.
+(defun owner-of :private (q: Tq x: str) -> (Option (Pair str MacroTop))
+  (match (map-get (. q tops) x)
+    ((some t) (some (Pair (. q ns) t)))
+    (nil (first (keep (fn (u: str) (exported-top (. q ctx) u x 0))
+                      (into (. (. q scope) uses) (. (. q scope) implicit)))))))
+
+(defun skipped? :private (q: Tq s: str) -> bool
+  (or (is-core s) (is-quasi-form s) (member? ["nil" "&" "..." "_" "true" "false"] s) (fstr/ends-with? s ":") (fstr/starts-with? s "#")
+      (some? (map-get (. q bound) s))))
+
+;; The form the template symbol `s` becomes (see the header).
+(defun resolve :private (q: Tq s: str pos: Pos) -> Stx
+  (match (split-qualified s)
+    ((some (Pair a x))
+     (match (map-get (. (. q scope) aliases) a)
+       ((some ns) (sym (str-join [ns "/" x]) pos))
+       (nil (sym s pos))))
+    (nil
+     (if (skipped? q s)
+         (sym s pos)
+         (match (owner-of q s)
+           (nil (sym s pos))
+           ((some (Pair o t))
+            (let ((full (sym (str-join [o "/" s]) pos)))
+              (cond (= (. t kind) :type) (sym s pos)
+                    (not (. t private)) full
+                    (= (. t kind) :fun) (list-form [(sym "var" pos) full] pos)
+                    :else (sym s pos)))))))))
+
+;; The template with its level-1 names resolved.
+(defun walk :private (q: Tq t: Stx) -> Stx
+  (let ((pos (. t pos)))
+    (match (. t kind)
+      ((SSym s) (resolve q s pos))
+      ((SList items)
+       (match (head-name t)
+         ((some h)
+          (cond (stops? h) t
+                (and (= h "var") (= (count items) 2)) (list-form [(nth items 0) (var-operand q (nth items 1))] pos)
+                :else (Stx (SList (mapv (fn (f: Stx) (walk q f)) items)) pos)))
+         (nil (Stx (SList (mapv (fn (f: Stx) (walk q f)) items)) pos))))
+      ((SVec items) (Stx (SVec (mapv (fn (f: Stx) (walk q f)) items)) pos))
+      ((SMap items) (Stx (SMap (mapv (fn (f: Stx) (walk q f)) items)) pos))
+      (_ t))))
+
+;; The operand of `(var x)`: qualified as a symbol is, never wrapped in a second `var`.
+(defun var-operand :private (q: Tq f: Stx) -> Stx
+  (match (. f kind)
+    ((SSym s)
+     (let ((r (resolve q s (. f pos))))
+       (match (. r kind)
+         ((SList items) (nth items 1))
+         (_ r))))
+    (_ f)))
+
+;; The form `(quasiquote template)` with the template's names resolved in the module being expanded, when a `defmacro` body of a
+;; module other than the prelude is being walked; else the form as it is.
+(defun qualify-template (ctx: ExpandCtx form: Stx) -> Stx
+  (let ((s (ctx-scope ctx)))
+    (if (or (not @(. ctx templating)) (= (. s ns) prelude-ns))
+        form
+        (match (. form kind)
+          ((SList items)
+           (if (= (count items) 2)
+               (let ((m (current-ns ctx))
+                     (q (Tq ctx (. s ns) (. m tops) s (bound-names (nth items 1)))))
+                 (Stx (SList [(nth items 0) (walk q (nth items 1))]) (. form pos)))
+               form))
+          (_ form)))))

@@ -46,7 +46,7 @@
 ;; the `Runner`; `expand-all` returns the `Expanded`s in the dependency
 ;; order of `try-load`, or the first `ExpandError`, which ends it.
 (ns expand.modules
-  (:require [syntax.reader :as reader] [expand.program :as prog] [expand.regex :as regex])
+  (:require [syntax.reader :as reader] [expand.program :as prog] [expand.regex :as regex] [expand.macrons :as macrons])
   (:use syntax.pos syntax.form syntax.error expand.error expand.types expand.ctx
         expand.roots))
 
@@ -374,7 +374,18 @@
 ;; by step.
 (defun begin-spec (ctx: ExpandCtx spec: ModuleSpec) -> unit
   (do (ctx-begin-module ctx (. spec ns) (. spec uses) (. spec implicit) (alias-map (. spec requires)))
-      (ctx-reexport ctx (. spec ns) (. spec exports))))
+      (ctx-reexport ctx (. spec ns) (. spec exports))
+      (macrons/macro-begin ctx spec)))
+
+;; Ends the module `spec` describes, expanded into `forms`: what the next pass takes, the spec with the modules that macro expansions
+;; named by their full names required under those names (expand.macrons `note-expansion`, syntax §3.16 "Names in a template").
+(defun end-spec (ctx: ExpandCtx spec: ModuleSpec forms: (Vec Stx)) -> Expanded
+  (let ((gained @(. ctx gained)))
+    (do (ctx-end-module ctx)
+        (Expanded (if (empty? gained)
+                      spec
+                      (ModuleSpec (. spec ns) (into (. spec requires) gained) (. spec uses) (. spec exports) (. spec implicit)))
+                  forms))))
 
 ;; The `:require` aliases as a map, a later one of the same alias
 ;; replacing an earlier (`collect` into a `HashMap`).
@@ -397,6 +408,5 @@
                 (match (prog/expand-program (. l forms) ctx runner)
                   ((Err e) (Err e))
                   ((Ok forms)
-                   (do (ctx-end-module ctx)
-                       (recur (+ i 1) (conj out (Expanded (. l spec) forms))))))))
+                   (recur (+ i 1) (conj out (end-spec ctx (. l spec) forms)))))))
           (Ok out)))))

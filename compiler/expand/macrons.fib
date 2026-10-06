@@ -1,0 +1,185 @@
+;; compiler/expand/macrons.fib: what the names of a macro's template need to know about modules (package MACRO-NS, syntax §3.16 "Names
+;; in a template", docs/design/macro-names.md). expand.qualify resolves a template's names in the macro's own module when the `defmacro`
+;; is expanded; this module keeps what that needs and what the expansion site needs afterwards:
+;;
+;; - the record of every module begun (`MacroNs`: its spec, its top-level definitions with their kind and privacy, its expanded forms),
+;;   kept in the context by ns: `macro-begin` at `begin-spec`, `macro-tops` before the first form is expanded (the definitions read off
+;;   the unexpanded forms, so a helper defined below the macro is found), `macro-end` after the last (the definitions of the expanded
+;;   forms too, which macros made, and the forms themselves for the macro runner);
+;; - `note-expansion`: after a user macro ran, a module that its expansion names by its full name (`m/x`) and that the expansion site
+;;   cannot name yet is required under its own name (alias = ns), in the scope at once (so a macro the expansion calls as `m/mac` is
+;;   found) and in the spec the next pass reads (`gained`); only the macro's module and the modules it depends on, directly or not, are
+;;   required this way;
+;; - `own-plain`: in the macro's own module the qualification is taken off again at the end (`m/x` is `x`, `(var m/x)` is `(var x)`), so a
+;;   module that uses its own macros expands exactly as it did before the rule: the checker resolves `m/x` only through an alias.
+(ns expand.macrons
+  (:use syntax.pos syntax.form expand.types expand.ctx expand.build expand.private expand.fusescan))
+
+;; ---------------------------------------------------------------- definitions
+
+;; The names a top-level form defines, each with its kind (expand.types `MacroTop`).
+(defun top-kinds :private (form: Stx) -> (Vec (Pair str keyword))
+  (let ((h (unwrap-or (head-name form) "")))
+    (cond (or (= h "defun") (= h "extern") (= h "defn") (= h "defn-") (= h "def") (= h "defprotocol"))
+           (mapv (fn (n: str) (Pair n :fun)) (fuse-names-of form))
+          (= h "defstruct") (mapv (fn (n: str) (Pair n :ctor)) (fuse-names-of form))
+          (= h "defenum")
+           (let ((t (unwrap-or (type-name form) "")))
+             (mapv (fn (n: str) (Pair n (if (= n t) :type :ctor))) (fuse-names-of form)))
+          (= h "defmacro")
+           (match (fuse-item-sym (fuse-list-items form) 1) ((some n) [(Pair n :macro)]) (nil (vec-empty)))
+          :else (vec-empty))))
+
+(defun add-tops :private (out: (Map str MacroTop) form: Stx) -> (Map str MacroTop)
+  (let ((private (or (= (unwrap-or (head-name form) "") "defn-") (some? (marker-index form)))))
+    (reduce (fn (acc: (Map str MacroTop) p: (Pair str keyword)) (assoc acc (. p fst) (MacroTop private (. p snd))))
+            out (top-kinds form))))
+
+;; The top-level definitions of the forms, looking through a top-level `do`.
+(defun tops-of (forms: (Vec Stx)) -> (Map str MacroTop)
+  (loop ((work forms) (i 0) (out (map-empty)))
+    (if (< i (count work))
+        (let ((form (nth work i)))
+          (if (= (unwrap-or (head-name form) "") "do")
+              (recur (into work (vec (drop 1 (fuse-list-items form)))) (+ i 1) out)
+              (recur work (+ i 1) (add-tops out form))))
+        out)))
+
+;; ---------------------------------------------------------------- the records
+
+;; The spec of a module begun with no `begin-spec` (a single module expanded on its own), from its scope.
+(defun spec-of-scope :private (s: ModuleScope) -> ModuleSpec
+  (let ((acc (cell (vec-empty))))
+    (do (for-each (. s aliases) (fn (e: (Pair str str)) (set! acc (conj @acc (Require (. e fst) (. e snd))))))
+        (ModuleSpec (. s ns) @acc (. s uses) (vec-empty) (. s implicit)))))
+
+(defun macro-ns-of (ctx: ExpandCtx ns: str) -> (Option MacroNs)
+  (map-get @(. ctx macro-ns) ns))
+
+(defun put-ns :private (ctx: ExpandCtx m: MacroNs) -> unit
+  (set! (. ctx macro-ns) (assoc @(. ctx macro-ns) (. (. m spec) ns) m)))
+
+;; Records the module that `begin-spec` begins.
+(defun macro-begin (ctx: ExpandCtx spec: ModuleSpec) -> unit
+  (put-ns ctx (MacroNs spec (map-empty) (vec-empty))))
+
+;; The record of the module being expanded, made from its scope if it has none.
+(defun current-ns (ctx: ExpandCtx) -> MacroNs
+  (let ((s (ctx-scope ctx)))
+    (match (macro-ns-of ctx (. s ns))
+      ((some m) m)
+      (nil (MacroNs (spec-of-scope s) (map-empty) (vec-empty))))))
+
+;; Before the first form of the module being expanded: its definitions, read off its unexpanded forms.
+(defun macro-tops (ctx: ExpandCtx forms: (Vec Stx)) -> unit
+  (let ((m (current-ns ctx)))
+    (put-ns ctx (MacroNs (. m spec) (tops-of forms) (. m forms)))))
+
+;; After the last form: the qualification of the module's own names taken off (`own-plain`), the definitions of the expanded forms
+;; added to those of the unexpanded ones, and the forms kept. The forms the module ends with.
+(defun macro-end (ctx: ExpandCtx forms: (Vec Stx)) -> (Vec Stx)
+  (let ((m (current-ns ctx))
+        (plain (own-plain (. (. m spec) ns) forms)))
+    (do (put-ns ctx (MacroNs (. m spec) (merge (. m tops) (tops-of plain)) plain))
+        plain)))
+
+;; ---------------------------------------------------------------- the module's own names
+
+;; `ns/x` split at its first `/`: the qualifier and the name, when both are there.
+(defun split-qualified (s: str) -> (Option (Pair str str))
+  (match (str-find s "/" 0)
+    (nil nil)
+    ((some i) (if (and (> i 0) (< (+ i 1) (str-len s)))
+                  (some (Pair (str-slice s 0 i) (str-slice s (+ i 1) (str-len s))))
+                  nil))))
+
+(defun own-name :private (ns: str s: str) -> (Option str)
+  (match (split-qualified s)
+    ((some (Pair q x)) (if (= q ns) (some x) nil))
+    (nil nil)))
+
+;; Whether the form has a symbol `ns/x` anywhere (a walk with a queue, no native recursion).
+(defun has-own? :private (ns: str form: Stx) -> bool
+  (loop ((work [form]) (i 0))
+    (if (>= i (count work))
+        false
+        (match (. (nth work i) kind)
+          ((SSym s) (if (some? (own-name ns s)) true (recur work (+ i 1))))
+          ((SList items) (if (quoted? (nth work i)) (recur work (+ i 1)) (recur (into work items) (+ i 1))))
+          ((SVec items) (recur (into work items) (+ i 1)))
+          ((SMap items) (recur (into work items) (+ i 1)))
+          (_ (recur work (+ i 1)))))))
+
+;; Whether the form is `(quote ..)`: data, which keeps its symbols as written.
+(defun quoted? :private (form: Stx) -> bool
+  (= (unwrap-or (head-name form) "") "quote"))
+
+(defun plain-form :private (ns: str form: Stx) -> Stx
+  (let ((pos (. form pos)))
+    (match (. form kind)
+      ((SSym s) (match (own-name ns s) ((some x) (sym x pos)) (nil form)))
+      ((SList items) (if (quoted? form) form (Stx (SList (mapv (fn (f: Stx) (plain-form ns f)) items)) pos)))
+      ((SVec items) (Stx (SVec (mapv (fn (f: Stx) (plain-form ns f)) items)) pos))
+      ((SMap items) (Stx (SMap (mapv (fn (f: Stx) (plain-form ns f)) items)) pos))
+      (_ form))))
+
+;; The forms with every `ns/x` written `x` (and so `(var ns/x)` as `(var x)`), except in quoted data; a form with none is the same form.
+(defun own-plain (ns: str forms: (Vec Stx)) -> (Vec Stx)
+  (mapv (fn (f: Stx) (if (has-own? ns f) (plain-form ns f) f)) forms))
+
+;; ---------------------------------------------------------------- what an expansion names
+
+;; The modules `ns` depends on, directly or not (requires, uses, re-exports, implicit modules), and ns itself.
+(defun closure-of :private (ctx: ExpandCtx ns: str) -> (Map str bool)
+  (loop ((work [ns]) (i 0) (seen (map-empty)))
+    (if (>= i (count work))
+        seen
+        (let ((m (nth work i)))
+          (if (some? (map-get seen m))
+              (recur work (+ i 1) seen)
+              (recur (match (macro-ns-of ctx m)
+                       ((some info) (into (into (into (into work (mapv (fn (r: Require) (. r ns)) (. (. info spec) requires)))
+                                                      (. (. info spec) uses))
+                                                (. (. info spec) exports))
+                                          (. (. info spec) implicit)))
+                       (nil work))
+                     (+ i 1) (assoc seen m true)))))))
+
+;; Whether the module being expanded names module q by the qualifier q already: itself, an alias, an implicit module.
+(defun nameable? :private (s: ModuleScope q: str) -> bool
+  (or (= q (. s ns)) (some? (map-get (. s aliases) q)) (some? (first (filter (fn (m: str) (= m q)) (. s implicit))))))
+
+;; The qualifiers of the expansion that name a module begun so far that the site cannot name yet, each once.
+(defun wanted :private (ctx: ExpandCtx form: Stx) -> (Vec str)
+  (let ((s (ctx-scope ctx)))
+    (loop ((work [form]) (i 0) (out (vec-empty)))
+      (if (>= i (count work))
+          out
+          (match (. (nth work i) kind)
+            ((SSym name)
+             (match (split-qualified name)
+               ((some (Pair q _))
+                (if (or (nameable? s q) (not (some? (macro-ns-of ctx q))) (some? (first (filter (fn (o: str) (= o q)) out))))
+                    (recur work (+ i 1) out)
+                    (recur work (+ i 1) (conj out q))))
+               (nil (recur work (+ i 1) out))))
+            ((SList items) (recur (into work items) (+ i 1) out))
+            ((SVec items) (recur (into work items) (+ i 1) out))
+            ((SMap items) (recur (into work items) (+ i 1) out))
+            (_ (recur work (+ i 1) out)))))))
+
+;; Requires module q under its own name in the module being expanded: in the scope now, in its spec at the end (`gained`).
+(defun gain :private (ctx: ExpandCtx q: str) -> unit
+  (let ((s (ctx-scope ctx)))
+    (do (set! (. ctx scope) (ModuleScope (. s ns) (. s uses) (. s implicit) (assoc (. s aliases) q q)))
+        (set! (. ctx gained) (conj @(. ctx gained) (Require q q))))))
+
+;; After the macro `def` made `form`: every module the expansion names by its full name that the site cannot name yet, and that is the
+;; macro's module or one it depends on, is required under its own name.
+(defun note-expansion (ctx: ExpandCtx def: MacroDef form: Stx) -> unit
+  (let ((qs (wanted ctx form)))
+    (if (empty? qs)
+        ()
+        (let ((deps (closure-of ctx (. def ns))))
+          (doseq [q qs]
+            (when (some? (map-get deps q)) (gain ctx q)))))))

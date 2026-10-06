@@ -1230,9 +1230,46 @@ is built with (**Proposed**, stdlib design §7 B2; case 012 of
 `cases/modules`). `` `() `` is `(List (concat))`, the empty list, which
 both tools expand.
 
+**Names in a template** (**Decided**, owner, 2026-10-06, package MACRO-NS,
+docs/design/macro-names.md; stage 2 only, the Rust seed resolves every template
+name at the site). A template is resolved in the module that defines the
+macro, as Clojure's syntax-quote qualifies with the namespace it is read in.
+When a `defmacro` body is expanded, each symbol of a quasiquote template at
+level 1 (not under `~` or `~@`, not in a nested quasiquote, not inside `quote`,
+`defstruct`, `defenum`, `defprotocol`, `extern` or `ns`) is rewritten:
+
+| the symbol, in the macro's module `m` | becomes |
+|---|---|
+| a top-level function, `def`, `extern` or protocol method of `m`, a struct or variant of `m`, a public macro of `m` | `m/x` |
+| the same, exported to `m` by a module `o` it `:use`s or an implicit module `o` (through `:export-from`: the module that defines it) | `o/x` |
+| a `:private` function, `def`, `extern` or method of `m` | `(var m/x)` (§3.20) |
+| `a/x` where `a` is a `:require` alias of `m` for module `n` | `n/x` |
+| a core form, `nil`, `&`, `...`, `_`, `true`, `false`, a gensym, a name ending in `:` | itself |
+| a name the template binds anywhere: the names of a binding head (`let`, `loop`, `if-some`, `try-let`, `doseq` ..), of a `fn`, `defun`, `defn` or `defmacro` and their parameters, a `match` clause's pattern variables, an `impl` method's name and parameters, a `def`'s name, the field of `.` and `set-field!` | itself |
+| an enum or protocol name, a private struct, variant or macro, any other qualified name, a name `m` neither defines nor sees (the prelude's, the builtins', a name unknown in `m`) | itself: resolved at the expansion site, as before this rule |
+
+A template built by a function (not in a `defmacro` body) is not rewritten. When
+a user macro's expansion names a module by its full name (`o/x`) that the
+expansion site cannot name, and `o` is the macro's module or one it depends on
+(directly or not), the site requires `o` under its own name: the expander's
+scope at once, so that `o/mac` is a macro call, and the module spec the checker
+reads; `o` was loaded before the macro's module, so the dependency order holds.
+In the macro's own module the qualification is taken off when the module ends
+(`m/x` is `x`, `(var m/x)` is `(var x)`; quoted data is kept), so a module that
+uses its own macros expands as it did before this rule, and `m/x` written in
+module `m` itself names its definition. So a library's macro works where the
+library is only `:require`d, a local at the site cannot capture a name the
+template took from its module, and a site's own definition of the same name is
+not the one the template means (cases/modules 031 to 034). The binding names are
+an over-approximation, read off the one template: a pattern or binding list
+built in one template and spliced into another is not seen as binding, so a
+name in it that the macro's module defines is qualified; `gensym` is the answer
+there.
+
 `(gensym "prefix")` returns a fresh `Sym` that cannot collide with any
-source symbol. There is no automatic hygiene (**Decided**: renaming
-hygiene is a much larger expander, and `gensym` covers the cases).
+source symbol. There is no renaming hygiene (**Decided**: renaming
+hygiene is a much larger expander; `gensym` and the qualification above
+cover the cases).
 Expansion is outermost-first, repeated until no macro call remains,
 before name resolution and typing. A macro must be defined earlier in
 the module, or in a required module, than its first use. A macro call
@@ -1908,10 +1945,14 @@ private function a generic exported body calls), marked as not
 nameable.
 
 **Macros and private helpers.** A macro's expansion is resolved in the
-module that uses the macro, like every expansion (there is no automatic
-hygiene, §3.16), so a template that names a private helper of the
-macro's own module by a bare or qualified symbol would reach nothing,
-or the user's own name. It writes `(var m/helper)` instead (§3.20): the
+module that uses the macro, like every expansion, except for the names
+its templates took from the macro's own module (§3.16 "Names in a
+template", stage 2): a bare `helper` in a template of module `m` is
+written `(var m/helper)` for a private function and `m/helper` for a
+public one. Before that rule (and in the Rust seed), a template that names
+a private helper of the macro's own module by a bare or qualified symbol
+would reach nothing, or the user's own name, and it writes
+`(var m/helper)` by hand instead (§3.20): the
 one reference that sees a private definition, which is Clojure's
 answer as well (its syntax-quote qualifies `helper` to `m/helper`, which
 compiles only if `helper` is public, and `#'m/helper`, the var, is how a
