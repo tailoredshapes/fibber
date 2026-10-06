@@ -1,0 +1,34 @@
+;; plan over the memory fake: reduce, run!, early exit, an Err, the default conn-each.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.db fib.db.memory))
+
+(defun filled (n: i64) -> MemConn
+  (let [c (open-memory)
+        _ (execute! c ["create table t (id integer primary key, name text)"])]
+    (do (loop [i 0] (when (< i n) (do (execute! c ["insert into t (id, name) values (?, ?)" i "x"]) (recur (+ i 1))))) c)))
+
+(defun ids (r: (Result (Map str Datum) DbError)) -> i64 (match r ((Ok row) (unwrap-or (and-then as-int (col row :id)) -1)) ((Err _) -100)))
+
+(defspecs specs
+  (feature "plan"
+    (scenario "reduce over a plan sees every row once, in order"
+      (given [c (filled 5)])
+      (upon [s (reduce (fn (acc: i64 r: (Result (Map str Datum) DbError)) (+ (* acc 10) (ids r))) 0 (plan c ["select id from t order by id"]))])
+      (then (expect = 1234 s)))
+    (scenario "a plan with parameters binds them"
+      (given [c (filled 5)])
+      (upon [n (count (plan c ["select id from t where id >= ?" 3]))])
+      (then (expect = 2 n)))
+    (scenario "take stops the walk early"
+      (given [c (filled 5)])
+      (upon [v (vec (map ids (take 2 (plan c ["select id from t order by id"]))))])
+      (then (expect = [0 1] v)))
+    (scenario "a statement that fails is one Err element"
+      (given [c (filled 1)])
+      (upon [v (vec (map ids (plan c ["selec id from t"])))])
+      (then (expect = [-100] v)))
+    (scenario "a plan is run again at each walk"
+      (given [c (filled 3) p (plan c ["select id from t"])])
+      (upon [a (count p) _ (execute! c ["insert into t (id, name) values (?, ?)" 9 "y"]) b (count p)])
+      (then (expect = [3 4] [a b])))))
+
+(defun main () -> i64 (run-main (specs)))

@@ -1,10 +1,35 @@
 ;; fib.db against SQLite: the Driver contract on a fresh `:memory:` database per scenario, a fib.sql query executed, and what is SQLite's own (opening a file that
 ;; cannot be opened, SQLSTATE mapping). Needs libsqlite3 in the process: scripts/test-db.sh runs it (`LD_PRELOAD` under `fibc test`,
 ;; `-l:libsqlite3.so.0` for a build). Not under specs/: the gate's `fibc test specs` runs through the JIT with no C library but libc.
-(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.db fib.sql driver-contract))
+(ns main (:use fib.core fib.seq fib.coll fib.ex fib.test.core fib.test.run fib.db fib.sql fib.db.contract))
 
 (defun fresh () -> SqliteConn
   (match (open-sqlite ":memory:") ((Ok c) c) ((Err e) (trap (str "cannot open :memory: " (. e message))))))
+
+(defun proc-kb (key: str) -> i64
+  (match (try-slurp "/proc/self/status")
+    ((Err _) -1)
+    ((Ok text) (match (str-find text key 0)
+                 (nil -1)
+                 ((some at) (loop [i (+ at (str-len key)) n 0]
+                              (if (>= i (str-len text))
+                                  n
+                                  (let [b (bit-and (sext i64 (str-byte-at text i)) 255)]
+                                    (cond (and (>= b 48) (<= b 57)) (recur (+ i 1) (+ (* n 10) (- b 48)))
+                                          (> n 0) n
+                                          :else (recur (+ i 1) n))))))))))
+
+(defun big (rows: i64) -> SqliteConn
+  (let [c (fresh) _ (execute! c ["create table big (id integer primary key, v text)"])
+        _ (with-transaction [tx c]
+            (do (loop [i 0] (when (< i rows) (do (execute! tx ["insert into big (id, v) values (?, ?)" i "some text in each row"]) (recur (+ i 1)))))
+                (Ok ())))]
+    c))
+
+(defun id-of (r: (Result (Map str Datum) DbError)) -> i64 (match r ((Ok row) (unwrap-or (and-then as-int (col row :id)) -1)) ((Err _) -100)))
+
+;; the table can be dropped only when no statement on it is pending: SQLite answers SQLITE_LOCKED (6, "database table is locked") otherwise
+(defun droppable? (c: SqliteConn) -> bool (match (execute! c ["drop table big"]) ((Ok _) true) ((Err _) false)))
 
 (defspecs specs
   (implements DriverContract "sqlite" fresh)
@@ -15,6 +40,30 @@
               min-age 35])
       (upon [r (execute! c (format-with (sql {:select [:name] :from [:people] :where [:> :age min-age]}) :ansi))])
       (then (expect = ["bob"] (match r ((Ok rows) (vec (map (fn (row: (Map str Datum)) (datum-text (unwrap-or (col row :name) DNil))) rows))) ((Err e) [(. e message)])))))
+    (scenario "a plan over 100,000 rows streams them: the sum is right and the peak resident set does not grow; execute! of the same rows does"
+      (given [c (big 100000) h0 (proc-kb "VmHWM:")])
+      (upon [sum (reduce (fn (a: i64 r: (Result (Map str Datum) DbError)) (+ a (id-of r))) 0 (plan c ["select id, v from big"]))
+             h1 (proc-kb "VmHWM:")
+             n (match (execute! c ["select id, v from big"]) ((Ok rows) (count rows)) ((Err _) -1))
+             h2 (proc-kb "VmHWM:")])
+      (then (expect = 4999950000 sum) (expect = true (< (- h1 h0) 4096)) (expect = 100000 n) (expect = true (> (- h2 h1) 16384))))
+    (scenario "a plan stopped early finalizes its statement"
+      (given [c (big 50)])
+      (upon [ids (vec (map id-of (take 3 (plan c ["select id from big order by id"]))))])
+      (then (expect = [0 1 2] ids) (expect = true (droppable? c))))
+    (scenario "a plan whose consumer traps finalizes its statement and the trap goes on"
+      (given [c (big 50)])
+      (upon [r (try (do (reduce (fn (a: i64 r: (Result (Map str Datum) DbError)) (if (= (id-of r) 7) (nth [1] 5) (+ a 1))) 0 (plan c ["select id from big order by id"])) "no trap")
+                    (catch e (str "trap " (unwrap-or (ex-kind e) "?"))))])
+      (then (expect = "trap index" r) (expect = true (droppable? c))))
+    (scenario "a plan on a statement that fails midway ends with an Err and finalizes"
+      (given [c (big 20)])
+      (upon [ids (vec (map id-of (plan c ["select abs(case when id = 5 then -9223372036854775807 - 1 else id end) as id from big"])))])
+      (then (expect = [0 1 2 3 4 -100] ids) (expect = true (droppable? c))))
+    (scenario "a plan on a connection that is closed is an Err"
+      (given [c (big 3) _ (conn-close c)])
+      (upon [ids (vec (map id-of (plan c ["select id from big"])))])
+      (then (expect = [-100] ids)))
     (scenario "a database that cannot be opened is an Err with a connection SQLSTATE"
       (then (expect = "08001" (match (open-sqlite "/nonexistent-dir/x/y.db") ((Err e) (. e sqlstate)) ((Ok _) "opened")))))
     (scenario "result codes map onto SQLSTATE classes"

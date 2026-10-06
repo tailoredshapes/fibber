@@ -25,7 +25,15 @@
   ;; Runs one statement with `?` parameters. A statement that yields columns returns its rows; one that does not (INSERT, UPDATE, DDL)
   ;; returns one row `{"update-count" n}`, as next.jdbc does.
   (conn-execute (self sql: str params: (Vec Datum)) -> (Result (Vec (Map str Datum)) DbError))
-  (conn-close (self) -> (Result unit DbError)))
+  (conn-close (self) -> (Result unit DbError))
+  ;; Walks the rows of one statement, one at a time: `k` is called with each and answers false to stop (the walk then ends early). Ok is
+  ;; whether the walk ran to the end; an Err is the statement's, at the start or after some rows. A driver whose database has a cursor
+  ;; overrides it so that no row is kept after `k` has seen it and the statement is finished (finalized, closed) when the walk ends, however it
+  ;; ends, a trap in `k` included. The default is `conn-execute` and a walk over the vector: right, but it holds every row.
+  (conn-each (self sql: str params: (Vec Datum) k: (fn ((Map str Datum)) bool) :borrow) -> (Result bool DbError)
+    (match (conn-execute self sql params)
+      ((Err e) (Err e))
+      ((Ok rows) (Ok (each-while rows k))))))
 
 (defun col (row: (Map str Datum) k: keyword) -> (Option Datum) (get row (keyword-text k)))
 
@@ -68,3 +76,18 @@
        (match (conn-close conn)
          ((Err e) (match r ((Ok _) (Err e)) ((Err b) (Err b))))
          ((Ok _) r))))))
+
+;; (plan conn q): what next.jdbc's `plan` is, the rows of a statement as a reducible that is not built first. Nothing runs until it is
+;; walked, and each walk runs the statement again: `(reduce f init (plan c q))`, `(run! f (plan c q))`, `(take 10 ..)`, `(first ..)`.
+;; The elements are `(Result (Map str Datum) DbError)`: errors are values here as everywhere in fib.db; an Err ends the walk, and a statement
+;; that fails to start gives one Err. The statement is finished when the walk ends, on an early exit and on a trap in the consumer.
+;; `plan` the macro (fib.db) takes the literal vector form as `execute!` does; this is its function.
+(defstruct (Plan c) (conn: c query: Query))
+
+(defun plan-query (c: c q: Query) :where ((Connection c)) -> (Plan c) (Plan c q))
+
+(impl (Reducible (Result (Map str Datum) DbError)) (Plan c) :where ((Connection c))
+  (each-while (self k)
+    (match (conn-each (. self conn) (. (. self query) sql) (. (. self query) params) (fn (row: (Map str Datum)) (k (Ok row))))
+      ((Ok done) done)
+      ((Err e) (do (k (Err e)) false)))))

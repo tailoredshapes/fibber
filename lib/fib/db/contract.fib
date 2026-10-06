@@ -10,6 +10,8 @@
   (let [v (rows r)] (if (< i (count v)) (datum-text (unwrap-or (col (nth v i) k) DNil)) "<no row>")))
 (defun row-count (c: c table: str) :where ((Connection c)) -> i64
   (unwrap-or (and-then as-int (and-then (fn (r: (Map str Datum)) (get r "n")) (first (rows (conn-execute c (str "select count(*) as n from " table) []))))) -1))
+(defun plan-name (r: (Result (Map str Datum) DbError)) -> str
+  (match r ((Ok row) (datum-text (unwrap-or (col row :name) DNil))) ((Err e) (str "<err " (. e sqlstate) ">"))))
 (defun table! (c: c) :where ((Connection c)) -> unit
   (do (execute! c ["create table people (id integer primary key, name text not null unique, score real, active integer, photo bytea)"]) ()))
 
@@ -35,6 +37,16 @@
             _ (execute! c ["insert into people (id, name) values (?, ?)" 9 "zed"])])
     (then (expect = (some "eve") (match (execute-one! c ["select name from people where id >= ? order by id" 7]) ((Ok (some r)) (and-then as-str (col r :name))) (_ nil)))
           (expect = true (match (execute-one! c ["select name from people where id = ?" 8]) ((Ok nil) true) (_ false)))))
+  (scenario "plan walks the rows of a statement one by one, stops when the consumer does, and reports a failing statement as an Err"
+    (covers "fib.db plan")
+    (given [c (make) _ (table! c)
+            _ (execute! c ["insert into people (id, name) values (?, ?)" 1 "a"])
+            _ (execute! c ["insert into people (id, name) values (?, ?)" 2 "b"])
+            _ (execute! c ["insert into people (id, name) values (?, ?)" 3 "c"])])
+    (upon [all (vec (map plan-name (plan c ["select name from people where id >= ? order by id" 1])))
+           two (vec (map plan-name (take 2 (plan c ["select name from people order by id"]))))
+           bad (vec (map plan-name (plan c ["selec name from people"])))])
+    (then (expect = ["a" "b" "c"] all) (expect = ["a" "b"] two) (expect = ["<err 42601>"] bad)))
   (scenario "a statement without columns reports its update count"
     (covers "fib.db update-count")
     (given [c (make) _ (table! c)])

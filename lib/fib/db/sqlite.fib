@@ -6,7 +6,7 @@
 ;; Types: INTEGER is DInt, REAL DFloat, TEXT DStr, BLOB DBytes, NULL DNil; a DBool parameter binds as 0 or 1 (SQLite has no boolean).
 ;; A statement is prepared, bound, stepped to the end and finalized inside one `conn-execute`, so no statement handle outlives a call and
 ;; none can leak on an Err path. SQLite has no SQLSTATE; `sqlstate-of` maps its result codes onto the classes a program tests.
-(ns fib.db.sqlite (:use fib.core fib.seq fib.coll fib.datum fib.db.core fib.db.sqlite.ffi) (:require [fib.os.native :as n]))
+(ns fib.db.sqlite (:use fib.core fib.seq fib.coll fib.ex fib.datum fib.db.core fib.db.sqlite.ffi) (:require [fib.os.native :as n]))
 
 ;; `handle` is the sqlite3* (0 once closed: a closed connection refuses work instead of passing a freed pointer to C).
 (defstruct SqliteConn (handle: (Atom i64) path: str))
@@ -91,10 +91,38 @@
                           r (if (= b SQLITE_OK) (step-all db st) (Err (last-error db)))]
                       (do (unsafe (sqlite3_finalize st)) r))))))
 
+;; Steps a bound statement, handing each row to `k` as it is read; nothing is kept. Ok is whether the walk ran to the end.
+(defun stream-rows :private (db: i64 st: i64 names: (Vec str) k: (fn ((Map str Datum)) bool) :borrow) -> (Result bool DbError)
+  (loop []
+    (let [rc (unsafe (sqlite3_step st))]
+      (cond (= rc SQLITE_ROW) (if (k (read-row st names)) (recur) (Ok false))
+            (= rc SQLITE_DONE) (Ok true)
+            :else (Err (last-error db))))))
+
+;; The statement is finalized on every way out: the end, an early stop, an Err and a trap in `k` (which goes on after the finalize).
+(defun stream-statement :private (db: i64 st: i64 k: (fn ((Map str Datum)) bool) :borrow) -> (Result bool DbError)
+  (let [r (try (stream-rows db st (column-names st) k) (catch x (do (unsafe (sqlite3_finalize st)) (throw x))))]
+    (do (unsafe (sqlite3_finalize st)) r)))
+
+(defun run-stream :private (db: i64 sql: str params: (Vec Datum) k: (fn ((Map str Datum)) bool) :borrow) -> (Result bool DbError)
+  (let [text (n/c-text sql) slot (unsafe (alloc 8))
+        rc (unsafe (sqlite3_prepare_v2 db text -1i32 slot 0))
+        st (unsafe (load-i64 slot))]
+    (do (unsafe (do (free text) (free slot)))
+        (cond (!= rc SQLITE_OK) (Err (last-error db))
+              (= st 0) (Ok true)
+              :else (let [b (bind-all st params)]
+                      (if (= b SQLITE_OK)
+                          (stream-statement db st k)
+                          (let [e (last-error db)] (do (unsafe (sqlite3_finalize st)) (Err e)))))))))
+
 (impl Connection SqliteConn
   (conn-execute (self sql params)
     (let [db @(. self handle)]
       (if (= db 0) (Err (DbError "08003" 0 "sqlite: the connection is closed")) (run-statement db sql params))))
+  (conn-each (self sql params k)
+    (let [db @(. self handle)]
+      (if (= db 0) (Err (DbError "08003" 0 "sqlite: the connection is closed")) (run-stream db sql params k))))
   (conn-close (self)
     ;; Takes the handle out first (compare-and-set from the value read), so a second close, or a racing one, finds 0 and does nothing.
     (let [db @(. self handle)]
