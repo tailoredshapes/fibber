@@ -57,6 +57,17 @@
                           (let [v (- cp 65536)] (do (put-u &buf &len (+ 55296 (shr v 10))) (put-u &buf &len (+ 56320 (bit-and v 1023))))))
                       (+ i @w))))))
 
+;; Is every byte of s plain? From the 32-byte vector prefix on, eight bytes at a time; the last word is read overlapping the one before (its bytes were tested already), so a string of
+;; 8 to 31 bytes costs one or two words and no byte loop. Under eight bytes, the byte loop. JSON-3: the writer asks this first, and goes to the scan that finds the escape only when the answer is no.
+(defun all-plain? (s: str n: i64 ascii: bool) -> bool
+  (if (< n 8)
+      (loop [k 0] (cond (>= k n) true (plain-byte (byte-at s k) ascii) (recur (+ k 1)) :else false))
+      (let [v (vec-plain-prefix s n ascii)]
+        (loop [k v]
+          (cond (>= (+ k 8) n) (not (has-special (unsafe (load-i64 (ptr+ (raw s) (+ 24 (- n 8))))) ascii))
+                (has-special (unsafe (load-i64 (ptr+ (raw s) (+ 24 k)))) ascii) false
+                :else (recur (+ k 8)))))))
+
 ;; The first index at which a vector of 32 bytes holds a quote, a backslash, a byte below 0x20 (or, for `ascii`, of 0x80 or more); the last multiple of 32 when there is none:
 ;; the bytes after that are for `scan-plain`. One load, five compares and a movemask per 32 bytes.
 (defun vec-plain-prefix (s: str n: i64 ascii: bool) -> i64

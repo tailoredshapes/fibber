@@ -1,0 +1,32 @@
+;; fib.json.docwrite (JSON-3): a Doc written back without a Json. Strings and numbers are copied from the source as spelled, so the text of a Doc built from `write-pretty x` is exactly `write x`
+;; for every random document, and reading what it wrote gives the document back.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.json.types fib.json.parse fib.json.write fib.json.tapebuild fib.json.view fib.json.gen fib.json.docwrite))
+
+(defun dw (s: str) -> str (match (tape-of s) ((Ok d) (doc-write d)) ((Err e) (str "ERR " (. e message)))))
+(defun dw-pretty-of (x: Json) -> str (dw (write-pretty x)))
+(defun dw-spaced (x: Json) -> str (dw (str "  \n" (write-pretty x) "\n  ")))
+
+(defspecs specs
+  (feature "doc-write"
+    (scenario "white space goes, every token is copied as written, strings keep their escapes and numbers their spelling"
+      (then (expect = "{\"a\":[1,2.50,-0,1.0E2],\"b\":{},\"c\":[],\"d\":\"x\\n\\u00e9\\\"\"}" (dw " { \"a\" : [ 1 , 2.50 , -0 , 1.0E2 ] , \"b\" : { } , \"c\" : [ ] , \"d\" : \"x\\n\\u00e9\\\"\" } "))
+            (expect = "[[],[[]],{\"a\":{\"b\":{\"c\":[null,true,false]}}}]" (dw "[ [ ] , [ [ ] ] , { \"a\" : { \"b\" : { \"c\" : [ null , true , false ] } } } ]"))
+            (expect = "null" (dw " null ")) (expect = "\"\"" (dw "\"\"")) (expect = "-12345678901234567890123" (dw "-12345678901234567890123")) (expect = "[]" (dw "[]")) (expect = "{}" (dw "{}"))))
+    (scenario "a text of more than one 64-byte block, keys longer than 32 bytes, a node in the middle"
+      (given [s (str "{\"" (str-join (vec (map (fn (i: i64) "k") (range 70))) ) "\":[" (str-join (vec (map (fn (i: i64) "12345,") (range 40))) ) "{\"z\":\"" (str-join (vec (map (fn (i: i64) "w") (range 100))) ) "\"}]}")])
+      (then (expect = s (dw (str " " s " ")))))
+    (scenario "a subtree: doc-write-node of a node is the compact text of that node"
+      (given [d (match (tape-of "{\"a\": [1, {\"b\": [true, \"s\"]}, 3], \"c\": 4}") ((Ok d) d) ((Err _) (trap "tape")))])
+      (then (expect = "{\"b\":[true,\"s\"]}" (doc-write-node d (elem d (field d 0 "a") 1)))
+            (expect = "[1,{\"b\":[true,\"s\"]},3]" (doc-write-node d (field d 0 "a")))
+            (expect = "4" (doc-write-node d (field d 0 "c")))))
+    (scenario "pretty and ASCII-only texts of a Doc go through the Json writer"
+      (given [d (match (tape-of "{\"a\":[1,\"é\"]}") ((Ok d) d) ((Err _) (trap "tape")))])
+      (then (expect = "{\n  \"a\": [\n    1,\n    \"é\"\n  ]\n}" (doc-write-with d 0 (WriteOptions 2 false)))
+            (expect = "{\"a\":[1,\"\\u00e9\"]}" (doc-write-with d 0 (WriteOptions 0 true)))
+            (expect = "{\"a\":[1,\"é\"]}" (doc-write-with d 0 (WriteOptions 0 false)))))
+    (prop "the Doc of the pretty text writes the compact text of the value" [x (gen-json)] (= (dw-pretty-of x) (write x)))
+    (prop "the same with white space all around" [x (gen-json)] (= (dw-spaced x) (write x)))
+    (prop "what a Doc writes reads back as the document" [x (gen-json)] (match (parse (dw (write-pretty x))) ((Ok y) (= x y)) ((Err _) false)))))
+
+(defun main () -> i64 (run-main (specs)))

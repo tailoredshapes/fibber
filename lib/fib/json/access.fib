@@ -14,6 +14,16 @@
        (loop [i 0] (cond (>= i m) nil (str-eq (nth keys i) k) (some (nth vals i)) :else (recur (+ i 1))))))
     (_ nil)))
 
+;; A hash index of one object, for lookups in a big one (JSON-3). `JObj keys vals` stays two vectors (a field of the enum would change every pattern that matches it, and every parse would pay
+;; for an index nobody asks for): `(index-object j)` makes the index once, `(index-get x "k")` finds a key in O(1). Under the default duplicate policy a key occurs once; with `duplicates` 1 the
+;; index holds the last pair of a repeated key (the first one is what `json-get` finds).
+(defun index-object (j: Json) -> (Option ObjIndex)
+  (match j
+    ((JObj keys vals) (some (ObjIndex vals (loop [i 0 m: (Map str i64) {}] (if (< i (count keys)) (recur (+ i 1) (assoc m (nth keys i) i)) m)))))
+    (_ nil)))
+
+(defun index-get (x: ObjIndex k: str) -> (Option Json) (if-some [i (get (. x at) k)] (some (nth (. x vals) i)) nil))
+
 (defun json-nth (j: Json i: i64) -> (Option Json)
   (match j ((JArr xs) (if (and (>= i 0) (< i (count xs))) (some (nth xs i)) nil)) (_ nil)))
 
@@ -39,15 +49,13 @@
 
 ;; One pointer step with the escapes undone: ~1 is /, ~0 is ~ (in that order, RFC 6901 4).
 (defun unescape-step (s: str) -> str
-  (if (nil? (str-find s "~" 0)) s
-      (let [out (cell "")]
-        (do (loop [i 0]
-              (when (< i (str-len s))
-                (let [c (str-byte-at s i) d (if (< (+ i 1) (str-len s)) (str-byte-at s (+ i 1)) 0i8)]
-                  (cond (and (= c 126i8) (= d 49i8)) (do (set! out (str @out "/")) (recur (+ i 2)))
-                        (and (= c 126i8) (= d 48i8)) (do (set! out (str @out "~")) (recur (+ i 2)))
-                        :else (do (set! out (str @out (str-slice s i (+ i 1)))) (recur (+ i 1)))))))
-            @out))))
+  (let [n (str-len s)]
+    (if (nil? (str-find s "~" 0)) s
+        (str-join (loop [i 0 run 0 out: (Vec str) []]
+                    (cond (>= i n) (conj out (str-slice s run n))
+                          (and (= (str-byte-at s i) 126i8) (< (+ i 1) n) (= (str-byte-at s (+ i 1)) 49i8)) (recur (+ i 2) (+ i 2) (conj (conj out (str-slice s run i)) "/"))
+                          (and (= (str-byte-at s i) 126i8) (< (+ i 1) n) (= (str-byte-at s (+ i 1)) 48i8)) (recur (+ i 2) (+ i 2) (conj (conj out (str-slice s run i)) "~"))
+                          :else (recur (+ i 1) run out)))))))
 
 (defun split-pointer (p: str) -> (Vec str)
   (let [n (str-len p)]
