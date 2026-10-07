@@ -1,0 +1,47 @@
+;; spec: spec/stdlib.md rows `keyword`, `name`, `namespace`, `str->keyword` (Clojure's semantics for the flat keyword)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; Package LIBFIX-1: `keyword` made from a string at run time did not exist. Pinned: a name the program has as a literal is that keyword (`(= (keyword "a") :a)`), a
+;; new one equals what the same text makes and nothing else, shows, hashes and orders as a keyword of its name does (between the literals too), is a map key,
+;; `(keyword ns s)` is `ns/s`, `name` and `namespace` split at the first slash (a lone "/" is a name), a name of non-ASCII text round-trips, and 300 made keywords
+;; (the table grows from 64) stay distinct and stable. `audit: clean`: the names the table keeps are immortal, not leaks.
+(ns main (:use tl.check fib.coll fib.keyword))
+
+(defun many-ok? () -> bool
+  (let [ks (mapv (fn (i: i64) (keyword (str "gen-" i))) (range 300))]
+    (and (= (count (set ks)) 300)
+         (every? (fn (i: i64) (and (= (nth ks i) (keyword (str "gen-" i))) (= (name (nth ks i)) (str "gen-" i)))) (range 300)))))
+
+(defun main () -> i64
+  (let [c (checks) dyn (keyword "zz-made") dyn2 (keyword "zz-made") other (keyword "zz-other")]
+    (do (check c (= (keyword "a") :a))
+        (check c (= (keyword "lit-two") :lit-two))
+        (check c (= dyn dyn2))
+        (check c (not (= dyn other)))
+        (check c (not (= dyn :a)))
+        (check c (= (str dyn) ":zz-made"))
+        (check c (= (hash dyn) (hash dyn2)))
+        (check c (not (= (hash dyn) (hash other))))
+        (check c (= (get (assoc {:a 1} dyn 2) dyn2) (some 2)))
+        (check c (= (get (assoc {:a 1} dyn 2) :a) (some 1)))
+        (check c (< :a dyn))
+        (check c (< dyn :zzz-after))
+        (check c (< dyn other))
+        (check c (= (vec (sort [dyn :b other :a])) [:a :b dyn other]))
+        (check c (= (keyword "ns" "n") :ns/n))
+        (check c (= (name :a/b) "b"))
+        (check c (= (namespace :a/b) (some "a")))
+        (check c (= (name :a) "a"))
+        (check c (nil? (namespace :a)))
+        (check c (= (name (keyword "a/b/c")) "b/c"))
+        (check c (= (namespace (keyword "a/b/c")) (some "a")))
+        (check c (= (name (keyword "/")) "/"))
+        (check c (nil? (namespace (keyword "/"))))
+        (check c (= (name (keyword "caf\u{e9}\u{20ac}")) "caf\u{e9}\u{20ac}"))
+        (check c (= (namespace (keyword "\u{e9}/\u{20ac}")) (some "\u{e9}")))
+        (check c (= (str (keyword "caf\u{e9}")) ":caf\u{e9}"))
+        (check c (many-ok?))
+        (checks-result c))))
