@@ -7,7 +7,9 @@ exit status, a trap, a timeout), concurrent clients, a crashed worker (restarted
 (the worker never dies), and shutdown."""
 import json, os, random, shutil, socket, subprocess, sys, tempfile, threading, time
 
-fibc = os.path.abspath(sys.argv[1])
+# Under the gate argv[1] is the slot wrapper (scripts/lib/fibc-slot.sh): a long-lived server must not hold a gate slot for its whole life, nor wait for one
+# among sixty other scripts; the real fibc is named by GATE_REAL_FIBC (scripts/tools.sh).
+fibc = os.path.abspath(os.environ.get('GATE_REAL_FIBC') or sys.argv[1])
 root = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else os.getcwd()
 work = tempfile.mkdtemp(prefix='serve-test-')
 sock = os.path.join(work, 's.sock')
