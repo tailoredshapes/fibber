@@ -48,7 +48,7 @@ named by a case that checks it (the take, push, pop and update cases of `cases/s
   (allowing (live-uses repo ["lib/**.fib" "scripts/**.fib" "editors/**.fib"])
             ["lib/prelude.fib:array-take!" "lib/prelude.fib:array-push!" "lib/prelude.fib:array-pop!"
              "lib/fib/core/cells.fib:cell-update!" "lib/fib/bigint/mag.fib:array-pop!"
-             "lib/fib/http/server/reader.fib:array-push!" "lib/fib/os/files.fib:array-push!"])
+             "lib/fib/http/reader.fib:array-push!" "lib/fib/os/files.fib:array-push!"])
   (plant "lib/fib/json/buffer.fib" "\n(defun grow (&b: (Array i8) x: i8) -> unit (array-push! &b x))\n")
   (plant "lib/fib/tensor/storage.fib" "\n(defun last-of (&b: (Array i8)) -> i8 (array-pop! &b))\n"))
 

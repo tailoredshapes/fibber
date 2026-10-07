@@ -32,9 +32,10 @@
     ((Timeout _ _) 408)
     ((ProtocolError s) (cond (= s "unsupported HTTP expectation") 417 (= s "unsupported HTTP transfer encoding") 501 :else 400))
     (_ 400)))
-(defun fail :private (t: Transport error: Error) -> unit
+(defun fail :private (t: Transport error: Error o: Options) -> unit
   (match error ((Cancelled) ()) ((Closed) ()) ((TransportError _ _) ())
-    (_ (error-reply t (failure-status error) (error-message error)))))
+    (_ (do (t-deadline t (+ (time/clock-now) (ms (. o request-timeout-ms))))
+           (error-reply t (failure-status error) (error-message error))))))
 (defun keep? :private (head: RequestHead reply: Reply number: i64 o: Options stop: (Atom bool)) -> bool
   (and (keep-alive? head) (< number (. o max-requests-per-connection)) (not @stop)
        (match reply ((Whole r) (not (header-token? (. r headers) "connection" "close"))) (_ true))))
@@ -55,9 +56,9 @@
         ((Err _) ())
         ((Ok true)
           (match (head-of t r o)
-            ((Err error) (fail t error))
+            ((Err error) (fail t error o))
             ((Ok nil) ())
             ((Ok (some text))
               (match (handle-one t r text handler o (. t peer) stop number)
-                ((Err error) (fail t error))
+                ((Err error) (fail t error o))
                 ((Ok keep) (if keep (recur (+ number 1)) ()))))))))))

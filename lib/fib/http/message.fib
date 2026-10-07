@@ -3,19 +3,20 @@
 (ns fib.http.message (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes fib.http.wire)
   (:require [fib.string :as s]))
 (defstruct ResponseHead (status: i64 version: str reason: str headers: (Map str (Vec str))))
+(defun digits3? :private (rest: str) -> bool
+  (and (>= (str-len rest) 3)
+       (every? (fn (i: i64) (let [d (zext i64 (str-byte-at rest i))] (and (>= d 48) (<= d 57)))) [0 1 2])
+       (or (= (str-len rest) 3) (= (str-byte-at rest 3) 32i8))))
+;; Slices only at ASCII bytes the checks above established: header text is Latin-1 expanded to UTF-8, and a slice inside a character traps.
 (defun status-parts :private (line: str) -> (Result (Triple str i64 str) Error)
-  (let [first (str-find line " " 0)]
-    (match first
-      (nil (Err (ProtocolError "invalid HTTP status line")))
-      ((some at)
-        (let [version (str-slice line 0 at) rest (str-slice line (+ at 1) (str-len line))
-              code (str-slice rest 0 (min 3 (str-len rest)))
-              reason (if (> (str-len rest) 4) (str-slice rest 4 (str-len rest)) "")]
-          (cond (not (or (= version "HTTP/1.1") (= version "HTTP/1.0"))) (Err (ProtocolError "unsupported HTTP version in the status line"))
-                (or (!= (str-len code) 3) (and (> (str-len rest) 3) (!= (str-byte-at rest 3) 32i8)))
-                (Err (ProtocolError "invalid HTTP status code"))
-                :else (try-let [n (parse-size code 10 599)]
-                        (if (>= n 100) (Ok (Triple version n reason)) (Err (ProtocolError "invalid HTTP status code"))))))))))
+  (match (str-find line " " 0)
+    (nil (Err (ProtocolError "invalid HTTP status line")))
+    ((some at)
+      (let [version (str-slice line 0 at) rest (str-slice line (+ at 1) (str-len line))]
+        (cond (not (or (= version "HTTP/1.1") (= version "HTTP/1.0"))) (Err (ProtocolError "unsupported HTTP version in the status line"))
+              (not (digits3? rest)) (Err (ProtocolError "invalid HTTP status code"))
+              :else (try-let [n (parse-size (str-slice rest 0 3) 10 599)]
+                      (if (>= n 100) (Ok (Triple version n (if (> (str-len rest) 4) (str-slice rest 4 (str-len rest)) ""))) (Err (ProtocolError "invalid HTTP status code")))))))))
 (defn parse-response-head
   ([text: str] -> (Result ResponseHead Error) (parse-response-head text 100))
   ([text: str max-headers: i64] -> (Result ResponseHead Error)

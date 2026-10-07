@@ -1,0 +1,230 @@
+;; fib.http message layer against RFC 9112: heads, framing, chunked bodies (and trailers), the smuggling refusals, the limits (each at its edge and one
+;; past it) and fragmentation (the same message in one piece, one byte at a time and cut at random offsets must parse to the same result).
+;; Written from the RFC, not from an implementation's corpus. `fibc test specs/http-message-spec.fib`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.http.types fib.http.headers fib.http.bytes fib.http.testing
+               fib.http.transport fib.http.wire fib.http.message))
+
+(defun b (text: str) -> (Array i8) (str-bytes text))
+(defun whole (text: str) -> (Vec (Array i8)) [(b text)])
+(defun bytewise (text: str) -> (Vec (Array i8)) (byte-chunks (b text)))
+(defun req (text: str) -> (Result ParsedRequest Error) (request-of (whole text)))
+(defun req-bytewise (text: str) -> (Result ParsedRequest Error) (request-of (bytewise text)))
+(defun resp (method: str text: str) -> (Result Parsed Error) (response-of (whole text) method))
+(defun resp-bytewise (method: str text: str) -> (Result Parsed Error) (response-of (bytewise text) method))
+(defun rejected? (r: (Result ParsedRequest Error)) -> bool (match r ((Err _) true) (_ false)))
+(defun accepted? (r: (Result ParsedRequest Error)) -> bool (match r ((Ok _) true) (_ false)))
+(defun body-of (r: (Result ParsedRequest Error)) -> str (match r ((Ok p) (str-from-bytes (. p body))) ((Err e) (str "ERR " (error-message e)))))
+(defun rbody (r: (Result Parsed Error)) -> str (match r ((Ok p) (str-from-bytes (. p body))) ((Err e) (str "ERR " (error-message e)))))
+(defun limit-error? (r: (Result ParsedRequest Error)) -> bool (match r ((Err (LimitError _)) true) (_ false)))
+(defun same-request? (x: (Result ParsedRequest Error) y: (Result ParsedRequest Error)) -> bool
+  (match x
+    ((Ok p) (match y ((Ok q) (and (= (. p method) (. q method)) (= (. p target) (. q target)) (= (. p headers) (. q headers))
+                                  (= (str-from-bytes (. p body)) (str-from-bytes (. q body))) (= (. p trailers) (. q trailers)) (= (. p rest) (. q rest))))
+                    ((Err _) false)))
+    ((Err _) (match y ((Err _) true) ((Ok _) false)))))
+(defun same-response? (x: (Result Parsed Error) y: (Result Parsed Error)) -> bool
+  (match x
+    ((Ok p) (match y ((Ok q) (and (= (. p status) (. q status)) (= (. p headers) (. q headers)) (= (str-from-bytes (. p body)) (str-from-bytes (. q body)))
+                                  (= (. p trailers) (. q trailers)) (= (. p rest) (. q rest))))
+                    ((Err _) false)))
+    ((Err _) (match y ((Err _) true) ((Ok _) false)))))
+
+(defun host () -> str "Host: example.com\r\n")
+(defun post (headers: str body: str) -> str (str "POST /p HTTP/1.1\r\n" (host) headers "\r\n" body))
+
+;; Requests that must be refused: request smuggling (CL.TE, TE.CL, TE.TE), duplicate or malformed lengths, bare CR and LF, obsolete line folding,
+;; whitespace before the colon, a bad start line, a bad chunk.
+(defun refused () -> (Vec str)
+  [(post "Content-Length: 4\r\nTransfer-Encoding: chunked\r\n" "0\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\nContent-Length: 4\r\n" "0\r\n\r\n")
+   (post "Transfer-Encoding: xchunked\r\n" "0\r\n\r\n")
+   (post "Transfer-Encoding : chunked\r\n" "0\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n" "0\r\n\r\n")
+   (post "Transfer-Encoding:\r\n chunked\r\n" "0\r\n\r\n")
+   (post "Transfer-Encoding: chunked, identity\r\n" "0\r\n\r\n")
+   (post "Transfer-Encoding: identity, chunked\r\n" "0\r\n\r\n")
+   (post "Transfer-Encoding: \"chunked\"\r\n" "0\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\nContent-Length : 4\r\n" "0\r\n\r\n")
+   (post "Content-Length: 3\r\nContent-Length: 3\r\n" "abc")
+   (post "Content-Length: 3, 3\r\n" "abc")
+   (post "Content-Length: 3\r\nContent-Length: 4\r\n" "abc")
+   (post "Content-Length: -1\r\n" "")
+   (post "Content-Length: +3\r\n" "abc")
+   (post "Content-Length: 0x3\r\n" "abc")
+   (post "Content-Length: 1e1\r\n" "abc")
+   (post "Content-Length: \r\n" "")
+   (post "Content-Length: 3 4\r\n" "abc")
+   (post "Content-Length: 99999999999999999999\r\n" "abc")
+   (post "Content-Length: 18446744073709551616\r\n" "abc")
+   (post "Content-Length: 9223372036854775808\r\n" "abc")
+   "GET / HTTP/1.1\nHost: x\n\n"
+   "GET / HTTP/1.1\r\nHost: x\n\r\n"
+   "GET / HTTP/1.1\r\nHost: x\r\nX: a\nb\r\n\r\n"
+   "GET / HTTP/1.1\r\nHost: x\rX: a\r\n\r\n"
+   "GET / HTTP/1.1\r\nHost: x\r\nX: a\r b\r\n\r\n"
+   "GET / HTTP/1.1\r\nHost: x\r\nX: a\0b\r\n\r\n"
+   "GET / HTTP/1.1\r\nHost: x\r\nX: a\r\n b\r\n\r\n"
+   "GET / HTTP/1.1\r\nHost: x\r\nX: a\r\n\tb\r\n\r\n"
+   "GET / HTTP/1.1\r\nHost : x\r\n\r\n"
+   "GET / HTTP/1.1\r\nHost\t: x\r\n\r\n"
+   "GET / HTTP/1.1\r\n Host: x\r\n\r\n"
+   "GET / HTTP/1.1\r\nHost: x\r\nNo colon here\r\n\r\n"
+   "GET / HTTP/1.1\r\nHost: x\r\n: empty-name\r\n\r\n"
+   "GET / HTTP/1.1\r\nHost: x\r\nBad Name: v\r\n\r\n"
+   "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"
+   "GET / HTTP/1.1\r\n\r\n"
+   "\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n"
+   "GET  / HTTP/1.1\r\nHost: x\r\n\r\n"
+   "GET /\r\nHost: x\r\n\r\n"
+   "GET / HTTP/1.1 \r\nHost: x\r\n\r\n"
+   "GET / HTTP/2.0\r\nHost: x\r\n\r\n"
+   "GET / HTTP/1.2\r\nHost: x\r\n\r\n"
+   "GET / http/1.1\r\nHost: x\r\n\r\n"
+   "GET / HTTP/1\r\nHost: x\r\n\r\n"
+   "G@T / HTTP/1.1\r\nHost: x\r\n\r\n"
+   "GET /a b HTTP/1.1\r\nHost: x\r\n\r\n"
+   "GET / HTTP/1.1\r\nHost: x"
+   "GET / HTTP/1.1\r\nHost: x\r\n"
+   (post "Transfer-Encoding: chunked\r\n" "zz\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "ffffffffffffffffff\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "-1\r\n")
+   (post "Transfer-Encoding: chunked\r\n" " 3\r\nabc\r\n0\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "3 \r\nabc\r\n0\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "\r\n0\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "3\r\nabcd\r\n0\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "3\r\nabc\n0\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "3\nabc\r\n0\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "3\r\nabcXX0\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "3\r\nab")
+   (post "Transfer-Encoding: chunked\r\n" "3\r\nabc\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "0\r\nContent-Length: 5\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "0\r\nTransfer-Encoding: chunked\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "0\r\nbad trailer\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "0\r\n")
+   (post "Content-Length: 5\r\n" "abc")])
+(defun accepted () -> (Vec str)
+  ["GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+   "GET http://example.com/a?b=c HTTP/1.1\r\nHost: example.com\r\n\r\n"
+   "OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n"
+   "GET / HTTP/1.0\r\n\r\n"
+   "GET /a%20b?x=1&y=2 HTTP/1.1\r\nhOsT: x\r\nX-Empty:\r\nX-Tab:\tv \t\r\n\r\n"
+   (post "Transfer-Encoding: Chunked\r\n" "0\r\n\r\n")
+   (post "Transfer-Encoding:\tchunked \r\n" "3\r\nabc\r\n0\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "3;ext=1;other\r\nabc\r\n0;last\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "0000003\r\nabc\r\n0\r\nX-Sum: 1\r\n\r\n")
+   (post "Transfer-Encoding: chunked\r\n" "A\r\n0123456789\r\na\r\n0123456789\r\n0\r\n\r\n")
+   (post "Content-Length: 0\r\n" "")
+   (post "Content-Length: 007\r\n" "abcdefg")
+   (post "Content-Length: 3\r\n" "abc")])
+
+(def sample: str "POST /p HTTP/1.1\r\nHost: example.com\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: 5\r\n\r\nhelloGET /next HTTP/1.1\r\nHost: x\r\n\r\n")
+
+(defspecs specs
+  (feature "RFC 9112 requests"
+    (scenario "the example of section 3: start line, three fields, no body"
+      (given [r (req "GET /hello.txt HTTP/1.1\r\nUser-Agent: curl/7.64.1\r\nHost: www.example.com\r\nAccept-Language: en, mi\r\n\r\n")])
+      (then (expect = true (accepted? r))
+            (expect = "GET /hello.txt" (match r ((Ok p) (str (. p method) " " (. p target))) (_ "")))
+            (expect = (some "curl/7.64.1") (match r ((Ok p) (header (. p headers) "USER-AGENT")) (_ nil)))
+            (expect = (some "en, mi") (match r ((Ok p) (header (. p headers) "accept-language")) (_ nil)))))
+    (scenario "repeated fields stay separate and in order; field names are case-insensitive"
+      (given [r (req sample)])
+      (then (expect = ["a=1" "b=2"] (match r ((Ok p) (header-values (. p headers) "set-cookie")) (_ [])))))
+    (scenario "a message that follows on the stream is left unread (pipelining: the reader keeps it)"
+      (given [r (req sample)])
+      (then (expect = "hello" (body-of r))
+            (expect = true (match r ((Ok p) (> (. p rest) 0)) (_ false)))))
+    (scenario "the Mozilla chunked example of section 7.1: three chunks, no trailer"
+      (then (expect = "MozillaDeveloperNetwork" (body-of (req (post "Transfer-Encoding: chunked\r\n" "7\r\nMozilla\r\n9\r\nDeveloper\r\n7\r\nNetwork\r\n0\r\n\r\n"))))))
+    (scenario "chunk extensions are ignored, trailers are parsed and exposed"
+      (given [r (req (post "Transfer-Encoding: chunked\r\n" "3;name=value\r\nabc\r\n0\r\nExpires: never\r\nX-Sum: 7\r\n\r\n"))])
+      (then (expect = "abc" (body-of r))
+            (expect = ["never"] (match r ((Ok p) (header-values (. p trailers) "expires")) (_ [])))
+            (expect = ["7"] (match r ((Ok p) (header-values (. p trailers) "x-sum")) (_ [])))))
+    (scenario "borderline requests that are valid are accepted, whole and one byte at a time, with the same result"
+      (then (expect = [] (vec (filter (fn (i: i64) (not (and (accepted? (req (nth (accepted) i))) (same-request? (req (nth (accepted) i)) (req-bytewise (nth (accepted) i))))))
+                                      (range (count (accepted))))))))) 
+  (feature "request smuggling and malformed messages are refused"
+    (scenario "every row of the table is an error when the message arrives whole (the list is the rows that were not)"
+      (then (expect = [] (vec (filter (fn (i: i64) (not (rejected? (req (nth (refused) i))))) (range (count (refused))))))))
+    (scenario "every row of the table is an error when the message arrives one byte at a time"
+      (then (expect = [] (vec (filter (fn (i: i64) (not (rejected? (req-bytewise (nth (refused) i))))) (range (count (refused))))))))
+    (scenario "the table is not trivially short"
+      (then (expect = 67 (count (refused))))))
+  (feature "limits are exact: the limit is accepted, one past it is a LimitError"
+    (scenario "header count"
+      (given [three "GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\n\r\n"
+              four "GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n"])
+      (then (expect = true (accepted? (request-of (whole three) 100 65536 3)))
+            (expect = true (limit-error? (request-of (whole four) 100 65536 3)))
+            (expect = true (limit-error? (request-of (bytewise four) 100 65536 3)))))
+    (scenario "head bytes"
+      (given [head "GET / HTTP/1.1\r\nHost: x\r\n\r\n" n (str-len head)])
+      (then (expect = true (accepted? (request-of (whole head) 100 n 100)))
+            (expect = true (limit-error? (request-of (whole head) 100 (- n 1) 100)))))
+    (scenario "line length"
+      (given [long (str "GET /" (str-join (vec (map (fn (i: i64) "a") (range 8200)))) " HTTP/1.1\r\nHost: x\r\n\r\n")])
+      (then (expect = true (limit-error? (req long)))))
+    (scenario "content-length body"
+      (then (expect = "abc" (body-of (request-of (whole (post "Content-Length: 3\r\n" "abc")) 3 65536 100)))
+            (expect = true (limit-error? (request-of (whole (post "Content-Length: 4\r\n" "abcd")) 3 65536 100)))))
+    (scenario "chunked body: the total decoded size is bounded"
+      (then (expect = "abcdef" (body-of (request-of (whole (post "Transfer-Encoding: chunked\r\n" "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n")) 6 65536 100)))
+            (expect = true (limit-error? (request-of (whole (post "Transfer-Encoding: chunked\r\n" "3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n")) 6 65536 100))))))
+  (feature "responses (RFC 9112 section 6.3)"
+    (scenario "content-length, chunked with trailers, until close"
+      (then (expect = "Hello World!" (rbody (resp "GET" "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nHello World!")))
+            (expect = "abcde" (rbody (resp "GET" "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n3\r\ncde\r\n0\r\nX-T: 1\r\n\r\n")))
+            (expect = ["1"] (match (resp "GET" "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-T: 1\r\n\r\n") ((Ok p) (header-values (. p trailers) "x-t")) (_ [])))
+            (expect = "tail" (rbody (resp "GET" "HTTP/1.0 200 OK\r\n\r\ntail")))))
+    (scenario "HEAD, 204 and 304 have no body whatever the headers say"
+      (then (expect = "" (rbody (resp "HEAD" "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")))
+            (expect = "" (rbody (resp "GET" "HTTP/1.1 204 No Content\r\n\r\n")))
+            (expect = "" (rbody (resp "GET" "HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n")))))
+    (scenario "ambiguous or broken responses are errors"
+      (then (expect = true (match (resp "GET" "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n") ((Err _) true) (_ false)))
+            (expect = true (match (resp "GET" "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabc") ((Err _) true) (_ false)))
+            (expect = true (match (resp "GET" "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc") ((Err _) true) (_ false)))
+            (expect = true (match (resp "GET" "HTTP/2 200 OK\r\n\r\n") ((Err _) true) (_ false)))
+            (expect = true (match (resp "GET" "HTTP/1.1 20 OK\r\n\r\n") ((Err _) true) (_ false)))
+            (expect = true (match (resp "GET" "HTTP/1.1 2000 OK\r\n\r\n") ((Err _) true) (_ false)))
+            (expect = true (match (resp "GET" "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n") ((Err _) true) (_ false)))))
+    (scenario "a status line with no reason phrase is valid"
+      (then (expect = 200 (match (resp "GET" "HTTP/1.1 200 \r\nContent-Length: 0\r\n\r\n") ((Ok p) (. p status)) (_ 0)))))
+    (scenario "feeding a response one byte at a time gives the same result as in one piece"
+      (then (expect = true (same-response? (resp "GET" "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2;e\r\nab\r\n3\r\ncde\r\n0\r\nX-T: 1\r\n\r\n")
+                                           (resp-bytewise "GET" "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2;e\r\nab\r\n3\r\ncde\r\n0\r\nX-T: 1\r\n\r\n"))))))
+  (feature "serialising and parsing agree"
+    (prop "a chunked body cut at random offsets decodes to the body, with nothing left over" [x (gen-vec (gen-i64-between 0 255))]
+      (let [body (str-from-bytes-safe x) cuts (map (fn (v: i64) (* v 7)) x)
+            wire (concat-bytes [(b "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n") (chunked-of x) (last-chunk-bytes {})])]
+        (match (response-of (split-at wire (vec cuts)) "GET")
+          ((Ok p) (and (= (array-len (. p body)) (count x)) (= (. p rest) 0) (bytes-match? (. p body) x)))
+          ((Err _) false))))
+    (prop "a content-length body cut at random offsets decodes to the body" [x (gen-vec (gen-i64-between 0 255))]
+      (let [wire (concat-bytes [(b (str "HTTP/1.1 200 OK\r\nContent-Length: " (count x) "\r\n\r\n")) (bytes-of x)])]
+        (match (response-of (split-at wire (vec (map (fn (v: i64) (* v 13)) x))) "GET")
+          ((Ok p) (and (= (. p rest) 0) (bytes-match? (. p body) x))) ((Err _) false))))
+    (prop "response-bytes then parse gives the status, the header and the body" [x (gen-vec (gen-i64-between 0 255))]
+      (match (response-bytes (Response 200 {"x-n" [(str (count x))]} (bytes-of x)) "GET" true)
+        ((Ok wire) (match (response-of [wire] "GET")
+          ((Ok p) (and (= (. p status) 200) (= (header (. p headers) "x-n") (some (str (count x)))) (bytes-match? (. p body) x)))
+          ((Err _) false)))
+        ((Err _) false)))
+    (prop "a request head written by request-head-bytes parses back" [x (gen-i64-between 0 100000)]
+      (let [wire (concat-bytes [(request-head-bytes "PUT" (str "/p/" x "?q=" x) {"host" ["h"] "x-n" [(str x)]}) (b "")])]
+        (match (request-of [wire]) ((Ok p) (and (= (. p method) "PUT") (= (. p target) (str "/p/" x)) (= (header (. p headers) "x-n") (some (str x))))) ((Err _) false))))))
+
+(defun bytes-of (xs: (Vec i64)) -> (Array i8)
+  (let [out (cell (array (count xs) 0i8))] (do (dotimes (i (count xs)) (array-set! &out i (trunc i8 (nth xs i)))) @out)))
+(defun bytes-match? (a: (Array i8) xs: (Vec i64)) -> bool
+  (and (= (array-len a) (count xs)) (loop [i 0] (if (= i (count xs)) true (if (= (zext i64 (array-get a i)) (bit-and (nth xs i) 255)) (recur (+ i 1)) false)))))
+(defun str-from-bytes-safe (xs: (Vec i64)) -> str "")
+;; The body as chunks of 1 to 5 bytes (sizes taken from the data).
+(defun chunked-of (xs: (Vec i64)) -> (Array i8)
+  (loop [i 0 out: (Vec (Array i8)) []]
+    (if (>= i (count xs)) (concat-bytes out)
+      (let [n (min (+ 1 (rem (nth xs i) 5)) (- (count xs) i))]
+        (recur (+ i n) (conj out (chunk-bytes (bytes-of (vec (map (fn (j: i64) (nth xs (+ i j))) (range n)))))))))))
+
+(defun main () -> i64 (run-main (specs)))

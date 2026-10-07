@@ -1,0 +1,159 @@
+;; The native fib.http server, spoken to in raw bytes over a pipe (so the exact wire output is asserted) and over localhost sockets (graceful
+;; shutdown under load). Slowloris deadlines, size limits at their edges, pipelining, HEAD, Expect, chunked in both directions, the refusals.
+;; Every wait is bounded (about a second). `fibc test specs/http-server-spec.fib`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.http.types fib.http.headers fib.http.bytes fib.http.testing fib.http.transport)
+  (:require [fib.http.client :as c] [fib.http.server :as sv] [fib.http.server.types :as st] [fib.os.time :as time] [fib.os.net :as net]))
+
+(defun ok (text: str) -> st/Reply (st/Whole (text-response 200 text)))
+(defun pieces (n: i64) -> (fn () (Option (Array i8)))
+  (let [i (cell 0)] (fn () (if (>= @i n) nil (do (set! i (+ @i 1)) (some (str-bytes (str "p" @i ";"))))))))
+(defun handler (r: Request) -> st/Reply
+  (let [u (. r uri)]
+    (cond (= u "/stream") (st/Streamed 200 {} (pieces 3))
+          (= u "/trailer") (ok (str "sum=" (unwrap-or (header (. r trailers) "x-sum") "none") " body=" (str-from-bytes (. r body))))
+          (= u "/badheader") (st/Whole (Response 200 {"x" ["a\r\nInjected: 1"]} (str-bytes "x")))
+          (= u "/echo") (st/Whole (Response 200 {} (. r body)))
+          (= u "/close") (st/Whole (Response 200 {"connection" ["close"]} (str-bytes "bye")))
+          :else (ok (str "you asked for " u)))))
+(defun open-raw (o: st/Options) -> Transport
+  (match ((. (loopback-factory handler o) open) (Target "http" "x" 80 1000 nil)) ((Ok t) t) ((Err e) (trap (error-message e)))))
+(defun say (t: Transport text: str) -> unit (do (t-deadline t 0) (t-write t (str-bytes text)) ()))
+;; Reads until the peer closes or ms pass: the text and whether the peer closed.
+(defun slurp (t: Transport ms: i64) -> (Pair str bool)
+  (let [limit (+ (time/clock-now) (* ms 1000000))]
+    (loop [acc ""]
+      (do (t-deadline t limit)
+        (match (t-read t 4096)
+          ((Ok b) (if (= (array-len b) 0) (Pair acc true) (recur (str acc (str-from-bytes b)))))
+          ((Err (Timeout _ _)) (Pair acc false))
+          ((Err _) (Pair acc true)))))))
+(defun count-of (text: str needle: str) -> i64
+  (loop [from 0 n 0] (match (str-find text needle from) (nil n) ((some at) (recur (+ at (str-len needle)) (+ n 1))))))
+(defun has? (text: str needle: str) -> bool (some? (str-find text needle 0)))
+(defun status-line (text: str) -> str (let [e (unwrap-or (str-find text "\r\n" 0) (str-len text))] (str-slice text 0 e)))
+(defun opts () -> st/Options (st/default-options))
+(defun elapsed-ms (t0: i64) -> i64 (quot (- (time/clock-now) t0) 1000000))
+(defun one (o: st/Options request: str) -> (Pair str bool) (let [t (open-raw o)] (do (say t request) (let [r (slurp t 600)] (do (t-close t) r)))))
+
+(defspecs specs
+  (feature "framing of replies"
+    (scenario "two pipelined requests get two replies in order on one connection"
+      (given [r (one (opts) "GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")])
+      (then (expect = 2 (count-of (. r fst) "HTTP/1.1 200 OK")) (expect = true (< (unwrap-or (str-find (. r fst) "you asked for /one" 0) 99999) (unwrap-or (str-find (. r fst) "you asked for /two" 0) -1)))
+            (expect = true (. r snd))))
+    (scenario "a reply carries Date, the derived Content-Length and Connection"
+      (given [r (one (opts) "GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")])
+      (then (expect = "HTTP/1.1 200 OK" (status-line (. r fst))) (expect = true (has? (. r fst) "date: ")) (expect = true (has? (. r fst) "content-length: 16\r\n"))
+            (expect = true (has? (. r fst) "connection: close")) (expect = true (has? (. r fst) "\r\n\r\nyou asked for /x"))))
+    (scenario "HEAD gets the headers of the GET and no body"
+      (given [r (one (opts) "HEAD /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")])
+      (then (expect = true (has? (. r fst) "content-length: 16\r\n")) (expect = false (has? (. r fst) "you asked"))))
+    (scenario "a streamed reply is chunked on HTTP/1.1 and ends with the last chunk"
+      (given [r (one (opts) "GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")])
+      (then (expect = true (has? (. r fst) "transfer-encoding: chunked")) (expect = true (has? (. r fst) "\r\n\r\n3\r\np1;\r\n3\r\np2;\r\n3\r\np3;\r\n0\r\n\r\n"))))
+    (scenario "a streamed reply to HTTP/1.0 is delimited by the close, not chunked"
+      (given [r (one (opts) "GET /stream HTTP/1.0\r\n\r\n")])
+      (then (expect = false (has? (. r fst) "chunked")) (expect = true (has? (. r fst) "\r\n\r\np1;p2;p3;")) (expect = true (. r snd))))
+    (scenario "a handler that returns an injectable header gets a 500 and the connection closes"
+      (given [r (one (opts) "GET /badheader HTTP/1.1\r\nHost: x\r\n\r\n")])
+      (then (expect = "HTTP/1.1 500 Internal Server Error" (status-line (. r fst))) (expect = false (has? (. r fst) "Injected")) (expect = true (. r snd))))
+    (scenario "a request chunked with trailers reaches the handler with its trailers"
+      (given [r (one (opts) "POST /trailer HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\nX-Sum: 42\r\n\r\n")])
+      (then (expect = true (has? (. r fst) "sum=42 body=abcde")))))
+  (feature "Expect: 100-continue"
+    (scenario "the interim reply comes before the body is sent, the final reply after it"
+      (given [t (open-raw (opts))
+              _ (say t "POST /echo HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
+              first (slurp t 150)
+              _ (say t "hello")
+              second (slurp t 600)]
+        )
+      (then (expect = "HTTP/1.1 100 Continue\r\n\r\n" (. first fst)) (expect = true (has? (. second fst) "\r\n\r\nhello"))))
+    (scenario "an expectation the server does not know is a 417"
+      (then (expect = "HTTP/1.1 417 Expectation Failed" (status-line (. (one (opts) "POST /echo HTTP/1.1\r\nHost: x\r\nExpect: magic\r\nContent-Length: 1\r\n\r\nx") fst))))))
+  (feature "refusals answer with a status and close"
+    (scenario "garbage, CL.TE and a bare LF are 400 and the connection closes"
+      (then (expect = "HTTP/1.1 400 Bad Request" (status-line (. (one (opts) "GARBAGE\r\n\r\n") fst)))
+            (expect = "HTTP/1.1 400 Bad Request" (status-line (. (one (opts) "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n") fst)))
+            (expect = "HTTP/1.1 400 Bad Request" (status-line (. (one (opts) "GET / HTTP/1.1\nHost: x\n\n") fst)))
+            (expect = true (. (one (opts) "GARBAGE\r\n\r\n") snd))))
+    (scenario "the body limit is exact: 10 bytes pass, 11 are 413"
+      (given [o (with (opts) (max-body-bytes 10))])
+      (then (expect = "HTTP/1.1 200 OK" (status-line (. (one o "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\nConnection: close\r\n\r\n0123456789") fst)))
+            (expect = "HTTP/1.1 413 Content Too Large" (status-line (. (one o "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\nConnection: close\r\n\r\n01234567890") fst)))))
+    (scenario "header limits answer 431"
+      (then (expect = "HTTP/1.1 431 Request Header Fields Too Large"
+                    (status-line (. (one (with (opts) (max-headers 3)) "GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n") fst)))
+            (expect = "HTTP/1.1 200 OK" (status-line (. (one (with (opts) (max-headers 3)) "GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\nConnection: close\r\n\r\n") fst)))
+            (expect = "HTTP/1.1 431 Request Header Fields Too Large"
+                    (status-line (. (one (with (opts) (max-header-bytes 64)) "GET / HTTP/1.1\r\nHost: x\r\nA: 0123456789012345678901234567890123456789012345678901234567890123456789\r\n\r\n") fst))))))
+  (feature "connection lifetime"
+    (scenario "max-requests-per-connection closes after the last allowed request"
+      (given [r (one (with (opts) (max-requests-per-connection 2)) "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\nGET /c HTTP/1.1\r\nHost: x\r\n\r\n")])
+      (then (expect = 2 (count-of (. r fst) "HTTP/1.1 200 OK")) (expect = true (has? (. r fst) "connection: close")) (expect = true (. r snd))))
+    (scenario "Connection: close from the client, and HTTP/1.0 without keep-alive, close after the reply"
+      (then (expect = true (. (one (opts) "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n") snd))
+            (expect = true (. (one (opts) "GET / HTTP/1.0\r\n\r\n") snd))))
+    (scenario "a handler's Connection: close is honoured"
+      (then (expect = true (. (one (opts) "GET /close HTTP/1.1\r\nHost: x\r\n\r\n") snd))))
+    (scenario "slowloris: a head that stalls is a 408 and a close within the header deadline"
+      (given [t (open-raw (with (opts) (header-timeout-ms 200)))
+              t0 (time/clock-now)
+              _ (say t "GET / HTTP/1.1\r\nHost: x\r\nX-Slow: ")
+              r (slurp t 1000)
+              ms (elapsed-ms t0)]
+        )
+      (then (expect = "HTTP/1.1 408 Request Timeout" (status-line (. r fst))) (expect = true (. r snd)) (expect = true (< ms 700))))
+    (scenario "slowloris: a head dripped a byte at a time cannot outlive the deadline"
+      (given [t (open-raw (with (opts) (header-timeout-ms 250)))
+              t0 (time/clock-now)
+              _ (loop [i 0] (if (and (< i 20) (< (elapsed-ms t0) 450)) (do (say t "X") (time/sleep-ns 30000000) (recur (+ i 1))) ()))
+              r (slurp t 600)
+              ms (elapsed-ms t0)]
+        )
+      (then (expect = "HTTP/1.1 408 Request Timeout" (status-line (. r fst))) (expect = true (< ms 1100))))
+    (scenario "a body that stalls is a 408 within the request deadline"
+      (given [t (open-raw (with (opts) (request-timeout-ms 200)))
+              _ (say t "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nab")
+              r (slurp t 1000)]
+        )
+      (then (expect = "HTTP/1.1 408 Request Timeout" (status-line (. r fst))) (expect = true (. r snd))))
+    (scenario "an idle connection is closed silently after the idle timeout"
+      (given [t (open-raw (with (opts) (idle-timeout-ms 150)))
+              t0 (time/clock-now)
+              r (slurp t 1000)]
+        )
+      (then (expect = "" (. r fst)) (expect = true (. r snd)) (expect = true (< (elapsed-ms t0) 700)))))
+  (feature "graceful shutdown under load"
+    (scenario "stop drains: every response that began is complete, nothing is truncated, new connections are refused"
+      (given [srv (match (sv/run-server (fn (r: Request) (text-response 200 "ok")) (with (opts) (port 0) (workers 8))) ((Ok s) s) ((Err e) (trap (error-message e))))
+              base (str "http://127.0.0.1:" (sv/port srv))
+              tasks (vec (map (fn (i: i64) (spawn (fn () (client-load base 25)))) (range 6)))
+              _ (time/sleep-ns 120000000)
+              t0 (time/clock-now)
+              stopped (sv/stop-server srv)
+              stop-ms (elapsed-ms t0)
+              results (vec (map (fn (t: (Task i64)) (join t)) tasks))
+              again (sv/stop-server srv)
+              refused (match (net/connect-tcp "127.0.0.1" (sv/port srv) 300) ((Err _) true) ((Ok fd) false))]
+        )
+      (then (expect = true (match stopped ((Ok _) true) (_ false))) (expect = true (match again ((Ok _) true) (_ false)))
+            (expect = true (< stop-ms 3000))
+            (expect = 0 (reduce (fn (a: i64 x: i64) (+ a (rem x 1000))) 0 results))
+            (expect = true (> (reduce (fn (a: i64 x: i64) (+ a (quot x 1000))) 0 results) 0))
+            (expect = true refused)))))
+
+;; successes * 1000 + the number of failures that are NOT a clean stop (a protocol or limit error means a truncated or garbled reply).
+(defun client-load (base: str n: i64) -> i64
+  (match (c/build-http-client (c/default-options))
+    ((Err _) 999)
+    ((Ok cl) (let [r (loop [i 0 ok 0 bad 0]
+                       (if (= i n) (+ (* ok 1000) bad)
+                         (match (c/request-with cl (ClientRequest "GET" (str base "/") {} (array 0 0i8)))
+                           ((Ok x) (recur (+ i 1) (+ ok 1) bad))
+                           ((Err (ProtocolError _)) (recur (+ i 1) ok (+ bad 1)))
+                           ((Err (LimitError _)) (recur (+ i 1) ok (+ bad 1)))
+                           ((Err _) (+ (* ok 1000) bad)))))]
+               (do (c/close-http-client cl) r)))))
+
+(defun main () -> i64 (run-main (specs)))

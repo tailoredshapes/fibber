@@ -48,16 +48,20 @@
 ;; A connected socket the caller already holds (the server's accepted sockets). The Transport owns the descriptor from here.
 (defun socket-transport (fd: i64 peer: str stop: (Atom bool)) -> Transport (fd-transport fd fd true peer stop))
 
-(defun pipe-pair () -> (Result (Pair Transport Transport) Error)
+;; Two pipes make a duplex stream: [p1r p1w p2r p2w], p1 carrying A to B and p2 B to A. The descriptors are plain numbers so a task can be
+;; handed its end and build the Transport itself (a Transport never crosses a thread). Each end owns its two descriptors.
+(defun pipe-fds () -> (Result (Vec i64) Error)
   (match (io/make-pipe)
     ((Err e) (Err (n/os-error e)))
     ((Ok a) (match (io/make-pipe)
       ((Err e) (do (io/close-fd (. a fst)) (io/close-fd (. a snd)) (Err (n/os-error e))))
       ((Ok b) (do (io/set-nonblocking (. a fst) true) (io/set-nonblocking (. a snd) true)
                   (io/set-nonblocking (. b fst) true) (io/set-nonblocking (. b snd) true)
-        (let [stop (atom false)]
-          (Ok (Pair (fd-transport (. b fst) (. a snd) false "pipe-a" stop)
-                    (fd-transport (. a fst) (. b snd) false "pipe-b" stop))))))))))
+                  (Ok [(. a fst) (. a snd) (. b fst) (. b snd)])))))))
+(defun pipe-end-a (fds: (Vec i64)) -> Transport (fd-transport (nth fds 2) (nth fds 1) false "pipe-a" (atom false)))
+(defun pipe-end-b (fds: (Vec i64)) -> Transport (fd-transport (nth fds 0) (nth fds 3) false "pipe-b" (atom false)))
+(defun pipe-pair () -> (Result (Pair Transport Transport) Error)
+  (try-let [fds (pipe-fds)] (Ok (Pair (pipe-end-a fds) (pipe-end-b fds)))))
 
 (defun ip-literal? :private (host: str) -> bool
   (or (some? (str-find host ":" 0))
