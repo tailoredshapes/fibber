@@ -11,7 +11,7 @@
 ;; A file with no scenario matching `--only` is not an error while another file has one: its child says so with status 2 and
 ;; "no scenario matches" on standard error, which is what this module reads.
 (ns driver.test
-  (:require [fib.string :as s] [driver.proc :as p] [driver.native :as native])
+  (:require [fib.string :as s] [driver.proc :as p] [driver.native :as native] [pkg.project :as proj])
   (:use expand.roots))
 
 (def spec-suffix: str "-spec.fib")
@@ -84,6 +84,27 @@
 
 ;; ---- running them -------------------------------------------------------------------------------------------------------------------
 
+;; The directory part of a path ("" for a bare name).
+(defun dirname-of :private (path: str) -> str
+  (loop ((i (- (str-len path) 1)))
+    (cond (< i 0) ""
+          (= (str-byte-at path i) 47i8) (if (= i 0) "/" (str-slice path 0 i))
+          :else (recur (- i 1)))))
+
+;; The library roots of the project a spec file belongs to (package LIB-2): the nearest directory, from the file's own up to the working directory
+;; (or the file system's root for an absolute path), that holds a `deps.fib`; its `:paths` (default `src`) and its test paths (`:aliases :test
+;; :extra-paths`, default none), joined to it. So `fibc test` finds the modules of the spec's project wherever the command is run from, and not only
+;; those of the working directory. No `deps.fib` above the file: no roots (the spec's own directory is searched anyway, "beside the file").
+(defun project-roots (file: str) -> (Vec str)
+  (loop ((d (dirname-of file)) (n 0))
+    (let ((here (if (= d "") "." d)))
+      (cond (some? (read-file (path-join here "deps.fib")))
+              (match (proj/read-project here)
+                ((Ok pr) (mapv (fn (x: str) (path-join here x)) (into (. pr paths) (. pr test-paths))))
+                ((Err _) []))
+            (or (= d "") (or (= d "/") (> n 40))) []
+            :else (recur (dirname-of d) (+ n 1))))))
+
 ;; What a spec file's process came to.
 (defstruct FileRun (file: str status: i64 out: str err: str))
 
@@ -126,7 +147,7 @@
                 (cond (and (< next (count files)) (< (count running) jobs))
                         (let ((out (str tmp "/" next "-out"))
                               (err (str tmp "/" next "-err"))
-                              (pid (p/spawn-start (child-argv (nth files next) dirs args) out err file-limit-secs)))
+                              (pid (p/spawn-start (child-argv (nth files next) (into dirs (project-roots (nth files next))) args) out err file-limit-secs)))
                           (if (< pid 0)
                               (recur (+ next 1) running (assoc done next (FileRun (nth files next) -1 "" "cannot start a process")))
                               (recur (+ next 1) (assoc running pid (Pair next (Pair out err))) done)))
