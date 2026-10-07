@@ -2,7 +2,7 @@
 """scripts/bench/dev-loop-serve.py FIBC [BEFORE_FIBC]: the latency table of the development loop (docs/design/dev-loop.md section 8.5), in seconds.
 Run from the repository root, on a quiet machine, `ulimit -v 16000000`. FIBC is a stage 2 with `fibc serve`; BEFORE_FIBC (default FIBC) is used for the commands that
 do not use the server. Edits are made to a scratch copy of lib/ (the tree is not touched) and passed as the first module root. Prints one line for each row:
-`row | seconds (median of N, min-max)`. Holds /tmp/fibsuite.lock like the other benchmarks (skipped when `flock` is missing).
+`row | seconds (median of N, min-max)`. Takes /tmp/fibsuite.lock without waiting (a held lock is reported and the run goes on).
 Rows: cold `run hello`; `emit hello` (the front end alone; there is no `fibc check` in the tree); `test` of one scenario; `cases` of one case; after an edit of one function
 of a large module: `run` and `test` of a spec that uses it with no server, `check` of the module with no server (the client's fallback), and with a warm server: `check` of
 the module (lib/fib/json/codec.fib, lib/fib/tls/chain.fib), `check` of the spec, `run` of hello, `test` of one scenario, `eval` of a new definition and of an expression."""
@@ -14,8 +14,8 @@ scratch = os.path.expanduser('~/.cache/fibber-scratch/dv/bench-lib')
 sock = os.path.expanduser('~/.cache/fibber-scratch/dv/bench2.sock')
 env = dict(os.environ, FIB_LIB=os.path.join(root, 'lib'))
 limit = lambda: resource.setrlimit(resource.RLIMIT_AS, (16000000 * 1024, 16000000 * 1024))
-try: lock = open('/tmp/fibsuite.lock', 'w'); fcntl.flock(lock, fcntl.LOCK_EX)
-except Exception: pass
+try: lock = open('/tmp/fibsuite.lock', 'w'); fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except Exception: print('note: /tmp/fibsuite.lock is held; measuring anyway (expect noise)', flush=True)
 if os.path.exists(scratch): shutil.rmtree(scratch)
 shutil.copytree(os.path.join(root, 'lib'), scratch)
 
