@@ -30,7 +30,7 @@ trap 'kill $(cat "$W/pids") 2>/dev/null' EXIT
 observe() { # observe PORT CURL-ARGS..  (a path starting with / is the URL tail)
   local port=$1; shift; local args=() a
   for a in "$@"; do case $a in /*) args+=("http://127.0.0.1:$port$a") ;; *) args+=("$a") ;; esac; done
-  curl -s -m 5 -o "$W/body" -w "%{http_code} %{size_download} %{content_type} conns=%{num_connects} redirects=%{num_redirects}" "${args[@]}" 2>&1
+  command curl -s -m 5 -o "$W/body" -w "%{http_code} %{size_download} %{content_type} conns=%{num_connects} redirects=%{num_redirects}" "${args[@]}" 2>&1
   case " $* " in *" -I "*) echo " md5=(headers, not compared)" ;; *) echo " md5=$(md5sum < "$W/body" | cut -c1-12)" ;; esac
 }
 fail=0; n=0
