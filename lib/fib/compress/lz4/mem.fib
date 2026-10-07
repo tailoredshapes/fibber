@@ -1,0 +1,63 @@
+;; fib.compress.lz4.mem: raw byte access for the LZ4 modules (docs/design/compress.md 6). The block coder works on pointers into arrays that its caller holds
+;; for the whole call; every index it uses has been checked against the lengths it was given before it gets here (the decoder checks each offset and length, the
+;; encoder only reads what it has already seen), so nothing here checks. Explicit module: nothing in fib.core refers to it.
+(ns fib.compress.lz4.mem (:use fib.core fib.seq fib.coll))
+
+(defun data (a: (Array i8)) -> ptr (unsafe (ptr+ (raw a) 24)))
+
+(defun u+ (a: i64 b: i64) -> i64 (unchecked-add a b))
+(defun u- (a: i64 b: i64) -> i64 (unchecked-subtract a b))
+
+(defun rd8 (p: ptr i: i64) -> i64 (unsafe (zext i64 (load-i8 (ptr+ p i)))))
+(defun rd16 (p: ptr i: i64) -> i64 (unsafe (zext i64 (load-i16 (ptr+ p i)))))
+(defun rd32 (p: ptr i: i64) -> i64 (unsafe (zext i64 (load-i32 (ptr+ p i)))))
+(defun rd64 (p: ptr i: i64) -> i64 (unsafe (load-i64 (ptr+ p i))))
+
+(defun wr8 (p: ptr i: i64 v: i64) -> unit (unsafe (store-i8 (ptr+ p i) (trunc i8 v))))
+(defun wr16 (p: ptr i: i64 v: i64) -> unit (unsafe (store-i16 (ptr+ p i) (trunc i16 v))))
+(defun wr32 (p: ptr i: i64 v: i64) -> unit (unsafe (store-i32 (ptr+ p i) (trunc i32 v))))
+(defun wr64 (p: ptr i: i64 v: i64) -> unit (unsafe (store-i64 (ptr+ p i) v)))
+
+(defun cp16 (d: ptr di: i64 s: ptr si: i64) -> unit
+  (unsafe (let [v: (Simd i8 16) (load-simd (ptr+ s si))] (store-simd (ptr+ d di) v))))
+(defun cp32 (d: ptr di: i64 s: ptr si: i64) -> unit
+  (unsafe (let [v: (Simd i8 32) (load-simd (ptr+ s si))] (store-simd (ptr+ d di) v))))
+(defun cp8 (d: ptr di: i64 s: ptr si: i64) -> unit (wr64 d di (rd64 s si)))
+(defun cp4 (d: ptr di: i64 s: ptr si: i64) -> unit (wr32 d di (rd32 s si)))
+
+;; n bytes from s+si to d+di, exactly n written and exactly n read (a tail is covered by a chunk that overlaps the one before it), for ranges that do not overlap.
+(defun copy-exact (d: ptr di: i64 s: ptr si: i64 n: i64) -> unit
+  (cond (>= n 16)
+        (do (loop [i (if (>= n 64) (loop [k 0] (if (<= (u+ k 64) n) (do (cp32 d (u+ di k) s (u+ si k)) (cp32 d (u+ di (u+ k 32)) s (u+ si (u+ k 32))) (recur (u+ k 64))) k)) 0)]
+              (if (<= (u+ i 16) n) (do (cp16 d (u+ di i) s (u+ si i)) (recur (u+ i 16))) ()))
+            (cp16 d (u+ di (u- n 16)) s (u+ si (u- n 16))))
+        (>= n 8) (do (cp8 d di s si) (cp8 d (u+ di (u- n 8)) s (u+ si (u- n 8))))
+        (>= n 4) (do (cp4 d di s si) (cp4 d (u+ di (u- n 4)) s (u+ si (u- n 4))))
+        :else (loop [i 0] (if (< i n) (do (wr8 d (u+ di i) (rd8 s (u+ si i))) (recur (u+ i 1))) ()))))
+
+;; The same, for a range of one buffer the destination of which starts at least `dist` bytes after the source, `dist` at least `chunk` (8 or 16): chunks of `chunk`
+;; bytes read data written by the chunks before. `slack` says whether the buffer has `chunk` bytes of room after the n bytes (then the last chunk may run over).
+(defun copy-far (d: ptr di: i64 dist: i64 n: i64 chunk: i64 slack: bool) -> unit
+  (let [lim (if slack n (u- n (u- chunk 1)))
+        i32 (if (and (= chunk 16) (>= dist 32)) (loop [i 0] (if (<= (u+ i 32) lim) (do (cp32 d (u+ di i) d (u- (u+ di i) dist)) (recur (u+ i 32))) i)) 0)
+        i (if (= chunk 16)
+            (loop [i i32] (if (< i lim) (do (cp16 d (u+ di i) d (u- (u+ di i) dist)) (recur (u+ i 16))) i))
+            (loop [i 0] (if (< i lim) (do (cp8 d (u+ di i) d (u- (u+ di i) dist)) (recur (u+ i 8))) i)))]
+    (loop [j i] (if (< j n) (do (wr8 d (u+ di j) (rd8 d (u- (u+ di j) dist))) (recur (u+ j 1))) ()))))
+
+;; An overlapping match: n bytes at d+di from d+di-off, off below 8 or not: the pattern of `off` bytes repeats. The first `s` bytes (the least multiple of off that is
+;; at least 8) are copied one at a time, then the distance is `s`, a multiple of the period and at least a chunk.
+(defun copy-match (d: ptr di: i64 off: i64 n: i64 room: i64) -> unit
+  (cond (>= off 16) (copy-far d di off n 16 (>= room (u+ n 16)))
+        (>= off 8) (copy-far d di off n 8 (>= room (u+ n 8)))
+        :else
+        (let [s (* off (quot (u+ 7 off) off))]
+          (if (<= n s)
+            (loop [j 0] (if (< j n) (do (wr8 d (u+ di j) (rd8 d (u- (u+ di j) off))) (recur (u+ j 1))) ()))
+            (do (loop [j 0] (if (< j s) (do (wr8 d (u+ di j) (rd8 d (u- (u+ di j) off))) (recur (u+ j 1))) ()))
+                (copy-far d (u+ di s) s (u- n s) 8 (>= room (u+ n 8))))))))
+
+;; Byte-for-byte equality of two arrays (an (Array i8) has no Eq).
+(defun bytes-eq (a: (Array i8) b: (Array i8)) -> bool
+  (and (= (array-len a) (array-len b))
+       (loop [i 0] (cond (>= i (array-len a)) true (= (array-get a i) (array-get b i)) (recur (u+ i 1)) :else false))))

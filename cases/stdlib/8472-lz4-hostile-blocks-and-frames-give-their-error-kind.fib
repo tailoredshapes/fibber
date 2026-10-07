@@ -1,0 +1,19 @@
+;; spec: docs/design/compress.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; roots: ../../lib support
+;; Offset 0, an offset past the start, a literal past the end, a bad magic, an empty input, a version 2 frame and a negative limit each give their own error kind.
+(ns main (:use tl.check fib.compress.lz4.mem) (:require [fib.compress :as z] [fib.compress.lz4 :as lz4]))
+(defun bs (v: (Vec i64)) -> (Array i8) (let [c (cell (array (count v) 0i8))] (do (dotimes (i (count v)) (array-set! &c i (trunc i8 (nth v i)))) @c)))
+(defun kind (r: (Result (Array i8) z/CompressError)) -> keyword (match r ((Ok _) :ok) ((Err e) (. e kind))))
+(defun main () -> i64
+  (let [c (checks) k (lz4/lz4) o (z/default-options)]
+    (do (check c (= :corrupt (kind (lz4/block-decompress (bs [16 97 0 0 64 97 98 99 100]) 1000))))
+        (check c (= :corrupt (kind (lz4/block-decompress (bs [16 97 2 0 64 97 98 99 100]) 1000))))
+        (check c (= :truncated (kind (lz4/block-decompress (bs [80 97 98]) 1000))))
+        (check c (= :corrupt (kind (z/decompress k (bs [0 0 0 0 0 0 0 0]) o))))
+        (check c (= :truncated (kind (z/decompress k (array 0 0i8) o))))
+        (check c (= :unsupported (kind (z/decompress k (bs [4 34 77 24 160 64 0]) o))))
+        (check c (= :invalid-argument (kind (z/decompress k (bs [4 34 77 24 96 64 0]) (z/with-max-output o -1)))))
+        (checks-result c))))

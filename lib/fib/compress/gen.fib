@@ -1,0 +1,41 @@
+;; fib.compress.gen: random STRUCTURED inputs with shrinking, for property tests of a codec (fib.test.gen, docs/design/compress.md 8). An input is a vector of segments, each a
+;; kind (0 random bytes, 1 text, 2 a run of one byte, 3 a short repeating pattern, 4 records with one changing byte, 5 a copy of the segment before it), a length and a seed;
+;; `materialize` turns it into bytes. A failing input shrinks by dropping segments, halving lengths and moving kinds toward 0, so the report is a few segments.
+(ns fib.compress.gen (:use fib.core fib.seq fib.coll fib.rng fib.test.gen fib.compress.corpus))
+
+(defstruct Seg (kind: i64 len: i64 seed: i64))
+(derive Debug Seg)
+
+(defun seg-bytes (s: Seg prev: (Array i8)) -> (Array i8)
+  (let [k (. s kind) n (. s len) sd (. s seed)]
+    (cond (= k 0) (random-bytes sd n)
+          (= k 1) (text sd n)
+          (= k 2) (same-byte (rem (abs sd) 256) n)
+          (= k 3) (pattern sd (+ 1 (rem (abs sd) 12)) n)
+          (= k 4) (records sd n)
+          :else (if (= (array-len prev) 0) (random-bytes sd n) (pattern sd (array-len prev) n)))))
+
+;; The bytes of the segments in order (a kind 5 segment repeats the one before it: a match at that distance).
+(defun materialize (segs: (Vec Seg)) -> (Array i8)
+  (let [parts (loop [i 0 prev (array 0 0i8) out: (Vec (Array i8)) []]
+                (if (>= i (count segs)) out
+                  (let [b (seg-bytes (nth segs i) prev)] (recur (+ i 1) b (conj out b)))))
+        total (reduce (fn (a: i64 p: (Array i8)) (+ a (array-len p))) 0 parts)
+        c (cell (array total 0i8))]
+    (do (loop [i 0 at 0] (when (< i (count parts)) (let [p (nth parts i)] (do (array-blit! &c at p 0 (array-len p)) (recur (+ i 1) (+ at (array-len p)))))))
+        @c)))
+
+(defun shrink-len (n: i64) -> (Vec i64) (cond (= n 0) [] (= n 1) [0] :else [0 (quot n 2) (- n 1)]))
+
+(defun shrink-seg (s: Seg) -> (Vec Seg)
+  (vec (concat (map (fn (n: i64) (Seg (. s kind) n (. s seed))) (shrink-len (. s len)))
+               (if (> (. s kind) 0) [(Seg 0 (. s len) (. s seed))] []))))
+
+(defun gen-seg () -> (Gen Seg)
+  (Gen (fn (r: Rng size: i64)
+         (let [k (rng-between r 0 5) big (= (rng-between r 0 9) 0)]
+           (Seg k (if big (rng-between r 0 (* 3000 size)) (rng-between r 0 (* 40 size))) (rng-between r 1 1000000))))
+       shrink-seg))
+
+;; Up to `size` segments; the sizes grow with the case number, to a few hundred KB.
+(defun gen-input () -> (Gen (Vec Seg)) (gen-vec (gen-seg)))

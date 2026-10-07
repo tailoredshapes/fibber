@@ -1,0 +1,18 @@
+;; fib.compress.http: a codec as an HTTP `Decoder` (docs/design/http.md, Content-Encoding): `(decoder "gzip" codec)` is the value to register with `fib.http.client`'s `with-decoder`.
+;; The seam gives the whole body and the most output it may produce (`max-response-bytes`); the codec's `max-output` is that number, so a bomb is a `LimitError` and the client never holds
+;; more than the cap. Any other failure is a `ProtocolError` (a body that is not valid in its coding). `transport-reader` and `transport-writer` stream over a `Transport`.
+;;   (decoder name codec) -> Decoder        (transport-reader t) (transport-writer t)
+(ns fib.compress.http (:use fib.core fib.seq fib.coll fib.http.types fib.http.transport fib.http.client.types fib.compress.types fib.compress.ops))
+
+(defun http-error (e: CompressError) -> Error
+  (if (= (. e kind) :too-large) (LimitError (. e message)) (ProtocolError (str "content-encoding: " (. e message)))))
+
+(defun decoder (name: str c: (dyn Codec :send)) -> Decoder
+  (Decoder name (fn (body: (Array i8) max: i64)
+                  (match (decompress c body (with-max-output (fib.compress.types/default-options) max)) ((Ok b) (Ok b)) ((Err e) (Err (http-error e)))))))
+
+(defun transport-reader (t: Transport) -> (fn () (Result (Array i8) CompressError))
+  (fn () (match (t-read t 65536) ((Ok b) (Ok b)) ((Err e) (Err (io-error (error-message e)))))))
+
+(defun transport-writer (t: Transport) -> (fn ((Array i8)) (Result unit CompressError))
+  (fn (b: (Array i8)) (match (t-write t b) ((Ok _) (Ok ())) ((Err e) (Err (io-error (error-message e)))))))

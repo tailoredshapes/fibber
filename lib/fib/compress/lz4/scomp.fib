@@ -1,0 +1,103 @@
+;; fib.compress.lz4.scomp: the streaming LZ4 frame compressor (docs/design/compress.md 5, 6.4). Input is gathered in `win` after the history, a block at a time; a full block
+;; is coded, its bytes returned, and (linked blocks) the last 64 KiB slide to the front. Memory is bounded by the block size: win (64 KiB history + one block), the scratch the
+;; block is coded into, and the encoder's tables (16 to 32 KB fast; 128 KB + 128 KB for HC). The tables are reused between blocks without clearing: `gen` goes up by what
+;; slid out (linked) or by the block (independent, no dictionary), so an old position is below the window and never a candidate (fib.compress.lz4.blockenc).
+;; regs: 0 header written, 1 finished, 2 history length in win, 3 bytes pending in the block, 4 gen, 5 total bytes in, 6 block size, 7 flags (1 independent, 2 block
+;; checksums, 4 content checksum, 8 content size recorded), 8 content size, 9 dictionary length (independent: the history of every block, fixed)
+(ns fib.compress.lz4.scomp (:use fib.core fib.seq fib.coll fib.compress.types fib.compress.lz4.mem fib.compress.lz4.enc fib.compress.lz4.header fib.compress.lz4.xxh32
+                                 fib.compress.lz4.sbuf fib.compress.lz4.block fib.compress.lz4.frame))
+
+(defstruct LzComp (regs: (Array i64) enc: (Cell Encoder) win: (Cell (Array i8)) scratch: (Array i8) dict: (Array i8) xxh: Xxh))
+
+(defun rg (r: (Array i64) i: i64) -> i64 (unsafe (load-i64 (ptr+ (raw r) (+ 24 (shl i 3))))))
+(defun rs (r: (Array i64) i: i64 v: i64) -> unit (unsafe (store-i64 (ptr+ (raw r) (+ 24 (shl i 3))) v)))
+
+(defun make-compressor (o: Options) -> LzComp
+  (let [bs (block-size-of o) d (dict-tail (. o dictionary)) dl (array-len d)
+        indep (. o independent) hist-cap (if indep dl 65536)
+        r (array 10 0)
+        _ (do (rs r 4 1) (rs r 6 bs) (rs r 9 dl)
+              (rs r 7 (+ (if indep 1 0) (+ (if (. o block-checksum) 2 0) (+ (if (. o checksum) 4 0) (if (. o record-size) 8 0)))))
+              (rs r 8 (. o size-hint)))
+        win (array (+ hist-cap (+ bs win-slack)) 0i8)
+        e (enc-new (. o level) (. o acceleration) (if (< (. o size-hint) 0) 1000000 (. o size-hint)))
+        _ (when (> dl 0) (do (copy-exact (data win) 0 (data d) 0 dl) (rs r 2 dl) (enc-prime e (data win) dl 1)))]
+    (LzComp r (cell e) (cell win) (array (+ bs (+ (quot bs 255) 64)) 0i8) d (xxh-new 0))))
+
+(defun flag? (c: LzComp f: i64) -> bool (> (bit-and (rg (. c regs) 7) f) 0))
+
+(defun header-bytes (c: LzComp) -> (Array i8)
+  (build-head (flag? c 1) (flag? c 2) (flag? c 4) (if (flag? c 8) (rg (. c regs) 8) -1) -1 (block-id (rg (. c regs) 6))))
+
+;; The pending block (n bytes at win[hist, hist+n)) coded: size word, data, [checksum] as an array.
+(defun code-block (c: LzComp n: i64) -> (Array i8)
+  (let [r (. c regs) hist (rg r 2) w @(. c win) e @(. c enc) sc (. c scratch)
+        indep (flag? c 1) dl (rg r 9)
+        lo (if (and indep (= dl 0)) hist 0)
+        clen (enc-run e (data w) lo hist n (data sc) (rg r 4))
+        raw (>= clen n)
+        stored (if raw n clen)
+        out (array (+ 4 (+ stored (if (flag? c 2) 4 0))) 0i8)
+        _ (do (wr32 (data out) 0 (if raw (bit-or n 2147483648) clen))
+              (if raw (copy-exact (data out) 4 (data w) hist n) (copy-exact (data out) 4 (data sc) 0 clen))
+              (when (flag? c 2) (wr32 (data out) (+ 4 stored) (xxh32-ptr (unsafe (ptr+ (data out) 4)) stored 0))))]
+    out))
+
+;; After a block: slide the window (linked), or step gen (independent without a dictionary).
+(defun after-block (c: LzComp n: i64) -> unit
+  (let [r (. c regs) hist (rg r 2) indep (flag? c 1) dl (rg r 9)]
+    (cond (and indep (> dl 0)) ()
+          indep (rs r 4 (+ (rg r 4) (+ n 1)))
+          :else
+          (let [keep (min 65536 (+ hist n)) shift (- (+ hist n) keep) w @(. c win)]
+            (do (when (> shift 0) (move-down (data w) 0 shift keep))
+                (rs r 2 keep) (rs r 4 (+ (rg r 4) shift))
+                (when (> (rg r 4) gen-limit)
+                  (do (rs r 4 1) (set! (. c enc) (enc-reset @(. c enc))) (when (> keep 0) (enc-prime @(. c enc) (data w) keep 1)))))))))
+
+(defun flush-block (c: LzComp) -> (Array i8)
+  (let [r (. c regs) n (rg r 3) out (code-block c n)]
+    (do (rs r 3 0) (after-block c n) out)))
+
+;; The input chunk into the window; each full block coded. The parts of output, in order.
+(defun feed-loop (c: LzComp chunk: (Array i8)) -> (Vec (Array i8))
+  (let [r (. c regs) bs (rg r 6) n (array-len chunk)]
+    (loop [i 0 parts: (Vec (Array i8)) []]
+      (if (>= i n) parts
+        (let [fill (rg r 3) tk (min (- bs fill) (- n i)) w @(. c win)
+              _ (copy-exact (data w) (+ (rg r 2) fill) (data chunk) i tk)
+              _ (rs r 3 (+ fill tk))]
+          (recur (+ i tk) (if (= (rg r 3) bs) (conj parts (flush-block c)) parts)))))))
+
+(defun concat-parts (parts: (Vec (Array i8))) -> (Array i8)
+  (let [n (reduce (fn (a: i64 p: (Array i8)) (+ a (array-len p))) 0 parts) out (array n 0i8)]
+    (do (loop [i 0 at 0] (when (< i (count parts)) (let [p (nth parts i)] (do (copy-exact (data out) at (data p) 0 (array-len p)) (recur (+ i 1) (+ at (array-len p)))))))
+        out)))
+
+(defun comp-feed (c: LzComp chunk: (Array i8)) -> (Result (Array i8) CompressError)
+  (let [r (. c regs)]
+    (if (= (rg r 1) 1) (Err (invalid-argument "the compressor is finished"))
+      (do (when (flag? c 4) (xxh-update! (. c xxh) chunk 0 (array-len chunk)))
+          (rs r 5 (+ (rg r 5) (array-len chunk)))
+          (let [parts (feed-loop c chunk)
+                parts2 (if (= (rg r 0) 0) (do (rs r 0 1) (into [(header-bytes c)] parts)) parts)]
+            (Ok (concat-parts parts2)))))))
+
+(defun comp-finish (c: LzComp) -> (Result (Array i8) CompressError)
+  (let [r (. c regs)]
+    (cond (= (rg r 1) 1) (Err (invalid-argument "the compressor is finished"))
+          (and (flag? c 8) (not (= (rg r 5) (rg r 8)))) (do (rs r 1 1) (Err (invalid-argument "the stream's size is not the size-hint it announced")))
+          :else
+          (let [head (if (= (rg r 0) 0) (header-bytes c) (array 0 0i8))
+                last (if (> (rg r 3) 0) (flush-block c) (array 0 0i8))
+                tail (array (if (flag? c 4) 8 4) 0i8)
+                _ (when (flag? c 4) (wr32 (data tail) 4 (xxh-digest (. c xxh))))
+                _ (rs r 1 1)]
+            (Ok (concat-parts [head last tail]))))))
+
+(defun new-compressor (o: Options) -> (Result LzComp CompressError)
+  (match (check-options o)
+    ((Err e) (Err e))
+    ((Ok _)
+     (cond (and (. o record-size) (< (. o size-hint) 0)) (Err (invalid-argument "record-size on a stream needs size-hint (the total size)"))
+           :else (Ok (make-compressor o))))))

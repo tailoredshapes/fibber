@@ -1,0 +1,68 @@
+;; fib.compress.lz4.frame: the one-shot LZ4 frame compressor (lz4_Frame_format.md v1.6.x): header, blocks, end mark, content checksum.
+;; A block whose compressed form is not smaller than the data is stored (high bit of its size). Independent blocks (the default) do not refer to each other; with
+;; `independent` false the blocks are LINKED: a block may match the 64 KiB before it, and in this one-shot form that costs nothing, the whole input is the window.
+;; A dictionary (the last 64 KiB of it) is a prefix of the window of every block (independent) or of the first (linked).
+;;   (frame-compress src opts) -> (Result (Array i8) CompressError)      (frame-max-size n block-size) -> the most a frame of n content bytes can take
+(ns fib.compress.lz4.frame (:use fib.core fib.seq fib.coll fib.compress.types fib.compress.lz4.mem fib.compress.lz4.enc fib.compress.lz4.header fib.compress.lz4.xxh32))
+
+(def default-block-size: i64 65536)
+(def win-slack: i64 8)
+
+(defun block-size-of (o: Options) -> i64 (if (= (. o block-size) 0) default-block-size (. o block-size)))
+
+(defun check-options (o: Options) -> (Result unit CompressError)
+  (cond (< (block-id (block-size-of o)) 0) (Err (invalid-argument "block-size must be 65536, 262144, 1048576 or 4194304 (or 0 for the default)"))
+        (< (. o acceleration) 1) (Err (invalid-argument "acceleration must be at least 1"))
+        (< (. o max-output) 0) (Err (invalid-argument "max-output must not be negative"))
+        :else (Ok ())))
+
+(defun nblocks (n: i64 bs: i64) -> i64 (quot (+ n (- bs 1)) bs))
+(defun frame-max-size (n: i64 bs: i64) -> i64 (+ 19 (+ n (+ (* 8 (nblocks n bs)) 8))))
+
+(defun dict-tail (d: (Array i8)) -> (Array i8) (if (> (array-len d) 65536) (array-copy d (- (array-len d) 65536) (array-len d)) d))
+
+;; The window array: dict ++ src ++ slack (linked), or just src (its own window).
+(defun window (dict: (Array i8) src: (Array i8)) -> (Array i8)
+  (let [w (array (+ (array-len dict) (+ (array-len src) win-slack)) 0i8)]
+    (do (copy-exact (data w) 0 (data dict) 0 (array-len dict)) (copy-exact (data w) (array-len dict) (data src) 0 (array-len src)) w)))
+
+(defun end-block (dp: ptr op: i64 len: i64 bchk: bool) -> i64
+  (if bchk (do (wr32 dp (+ op (+ 4 len)) (xxh32-ptr (unsafe (ptr+ dp (+ op 4))) len 0)) (+ op (+ 8 len))) (+ op (+ 4 len))))
+
+;; One block of the window win[s0, s0+n) with history win[lo, s0): written at dst[op..): its size word, data and checksum. The new op.
+(defun put-block (e: Encoder win: (Array i8) lo: i64 s0: i64 n: i64 dst: (Array i8) op: i64 bchk: bool) -> i64
+  (let [dp (data dst) clen (enc-run e (data win) lo s0 n (unsafe (ptr+ dp (+ op 4))) 1)]
+    (if (< clen n)
+      (do (wr32 dp op clen) (end-block dp op clen bchk))
+      (do (wr32 dp op (bit-or n 2147483648)) (copy-exact dp (+ op 4) (data win) s0 n) (end-block dp op n bchk)))))
+
+;; Independent blocks with a dictionary: each block is copied after the dictionary into `win` (dl + block bytes) and coded there.
+(defun dict-block (e: Encoder win: (Array i8) dl: i64 src: (Array i8) pos: i64 n: i64 dst: (Array i8) op: i64 bchk: bool) -> i64
+  (do (copy-exact (data win) dl (data src) pos n) (put-block e win 0 dl n dst op bchk)))
+
+(defun blocks (e: Encoder src: (Array i8) win: (Array i8) dl: i64 bs: i64 indep: bool bchk: bool dst: (Array i8) op0: i64) -> i64
+  (let [n (array-len src)]
+    (loop [pos 0 op op0]
+      (if (>= pos n) op
+        (let [bn (min bs (- n pos))]
+          (recur (+ pos bn)
+                 (cond (and indep (> dl 0)) (dict-block e win dl src pos bn dst op bchk)
+                       indep (put-block e src pos pos bn dst op bchk)
+                       :else (put-block e win 0 (+ dl pos) bn dst op bchk))))))))
+
+(defun frame-compress (src: (Array i8) o: Options) -> (Result (Array i8) CompressError)
+  (match (check-options o)
+    ((Err e) (Err e))
+    ((Ok _)
+     (let [n (array-len src) bs (block-size-of o) dict (dict-tail (. o dictionary)) dl (array-len dict)
+           e (enc-new (. o level) (. o acceleration) n)
+           indep (. o independent)
+           win (cond (= dl 0) src indep (array (+ dl (+ bs win-slack)) 0i8) :else (window dict src))
+           _ (when (> dl 0) (do (when indep (copy-exact (data win) 0 (data dict) 0 dl)) (enc-prime e (data win) dl 1)))
+           head (build-head indep (. o block-checksum) (. o checksum) (if (. o record-size) n -1) -1 (block-id bs))
+           dst (array (+ (frame-max-size n bs) (+ (quot n 255) 256)) 0i8)
+           _ (copy-exact (data dst) 0 (data head) 0 (array-len head))
+           op (blocks e src win dl bs indep (. o block-checksum) dst (array-len head))
+           _ (wr32 (data dst) op 0)
+           end (if (. o checksum) (do (wr32 (data dst) (+ op 4) (xxh32 src 0)) (+ op 8)) (+ op 4))]
+       (Ok (array-copy dst 0 end))))))

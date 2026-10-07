@@ -1,0 +1,34 @@
+;; fib.compress.lz4.sbuf: a growable byte queue for the streaming LZ4 coders: bytes go in at the end (`sb-append`, one blit), come out at the front (`sb-skip`); `pos` and
+;; `end` mark the live bytes; when everything has been taken both return to 0; when the end of the array is reached the live bytes move to the front, and the array grows
+;; only when what is live and what comes do not fit. `sb-ptr` is the address of the first live byte, valid until the next `sb-append`.
+(ns fib.compress.lz4.sbuf (:use fib.core fib.seq fib.coll fib.compress.lz4.mem))
+
+(defstruct SBuf (arr: (Cell (Array i8)) pos: (Cell i64) end: (Cell i64)))
+
+(defun sb-new () -> SBuf (SBuf (cell (array 64 0i8)) (cell 0) (cell 0)))
+(defun sb-len (b: SBuf) -> i64 (- @(. b end) @(. b pos)))
+(defun sb-ptr (b: SBuf) -> ptr (unsafe (ptr+ (data @(. b arr)) @(. b pos))))
+
+(defun sb-room (b: SBuf n: i64) -> unit
+  (let [pos @(. b pos) end @(. b end) cap (array-len @(. b arr)) live (- end pos)]
+    (when (> (+ end n) cap)
+      (let [ncap (if (> (+ live n) (quot cap 2)) (max (+ live n) (* 2 cap)) cap) fresh (cell (array ncap 0i8))]
+        (do (array-blit! &fresh 0 @(. b arr) pos live)
+            (set! (. b arr) @fresh) (set! (. b pos) 0) (set! (. b end) live))))))
+
+(defun sb-append (b: SBuf src: (Array i8)) -> unit
+  (do (sb-room b (array-len src))
+      (let [c (. b arr)] (array-blit! &c @(. b end) src 0 (array-len src)))
+      (set! (. b end) (+ @(. b end) (array-len src)))))
+
+(defun sb-skip (b: SBuf n: i64) -> unit
+  (do (set! (. b pos) (+ @(. b pos) n))
+      (when (= @(. b pos) @(. b end)) (do (set! (. b pos) 0) (set! (. b end) 0)))))
+
+;; The first n live bytes as an array.
+(defun sb-take (b: SBuf n: i64) -> (Array i8) (array-copy @(. b arr) @(. b pos) (+ @(. b pos) n)))
+
+;; bytes [from, from + n) of the array, moved to the front: the ranges overlap (to < from), so it goes forwards a chunk at a time.
+(defun move-down (p: ptr to: i64 from: i64 n: i64) -> unit
+  (do (loop [i 0] (if (<= (+ i 16) n) (do (cp16 p (+ to i) p (+ from i)) (recur (+ i 16))) (loop [j i] (if (< j n) (do (wr8 p (+ to j) (rd8 p (+ from j))) (recur (+ j 1))) ()))))
+      ()))

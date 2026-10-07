@@ -1,0 +1,74 @@
+;; fib.compress.lz4.header: the LZ4 frame header (lz4_Frame_format.md, v1.6.x): building it and parsing it, with every reserved bit checked.
+;;   magic   04 22 4D 18 (LZ4 frame), 50..5F 2A 4D 18 (skippable: 4-byte size, then that many bytes, ignored), 02 21 4C 18 (legacy: blocks of a 4-byte size, each
+;;           decoding to at most 8 MiB, independent; decode only)
+;;   FLG     bits 7-6 version (01), 5 block independence, 4 block checksum, 3 content size present, 2 content checksum, 1 reserved (0), 0 dictionary id present
+;;   BD      bits 6-4 block maximum size (4: 64 KiB, 5: 256 KiB, 6: 1 MiB, 7: 4 MiB); the other bits reserved (0)
+;;   then the content size (8 bytes) and the dictionary id (4) when present, and the header checksum: the second byte of the xxHash32 (seed 0) of the descriptor.
+;; `(parse-head p n pos)` reads the head at p[pos, n): Ok with a FrameHead, Ok nil when more bytes are needed to decide, or the error.
+(ns fib.compress.lz4.header (:use fib.core fib.seq fib.coll fib.compress.types fib.compress.lz4.mem fib.compress.lz4.xxh32))
+
+(def magic-frame: i64 407708164)
+(def magic-legacy: i64 407642370)
+(def magic-skip-lo: i64 407710288)
+(def kind-frame: i64 0)
+(def kind-skip: i64 1)
+(def kind-legacy: i64 2)
+
+;; kind; hlen: the head's length in bytes (a frame's descriptor, a skippable frame's 8 bytes, legacy's 4); indep, bchk (block checksums), cchk (content checksum);
+;; csize: -1 when not recorded; dictid: -1 when none; bmax: the block maximum size; skip: a skippable frame's payload length.
+(defstruct FrameHead (kind: i64 hlen: i64 indep: bool bchk: bool cchk: bool csize: i64 dictid: i64 bmax: i64 skip: i64))
+
+(defun block-max (id: i64) -> i64 (cond (= id 4) 65536 (= id 5) 262144 (= id 6) 1048576 (= id 7) 4194304 :else -1))
+(defun block-id (size: i64) -> i64 (cond (= size 65536) 4 (= size 262144) 5 (= size 1048576) 6 (= size 4194304) 7 :else -1))
+
+(defun descriptor-len (flg: i64) -> i64 (+ 3 (+ (if (> (bit-and flg 8) 0) 8 0) (if (> (bit-and flg 1) 0) 4 0))))
+
+(defun rd64u (p: ptr i: i64) -> i64 (rd64 p i))
+
+(defun check-descriptor (p: ptr pos: i64 dl: i64) -> (Result unit CompressError)
+  (let [flg (rd8 p (+ pos 4)) bd (rd8 p (+ pos 5))]
+    (cond (not (= (shr flg 6) 1)) (Err (unsupported "the frame has a version other than 1"))
+          (> (bit-and flg 2) 0) (Err (corrupt "the frame's reserved FLG bit is set"))
+          (not (= (bit-and bd 143) 0)) (Err (corrupt "the frame's reserved BD bits are set"))
+          (< (block-max (bit-and (shr bd 4) 7)) 0) (Err (corrupt "the frame's block size id is not 4 to 7"))
+          (not (= (rd8 p (+ pos (+ 4 (- dl 1)))) (bit-and (shr (xxh32-ptr (ptr-add p (+ pos 4)) (- dl 1) 0) 8) 255)))
+            (Err (checksum-error "the frame header checksum does not match"))
+          :else (Ok ()))))
+
+(defun ptr-add (p: ptr i: i64) -> ptr (unsafe (ptr+ p i)))
+
+(defun make-head (p: ptr pos: i64 flg: i64 bd: i64 dl: i64) -> (Result (Option FrameHead) CompressError)
+  (let [has-cs (> (bit-and flg 8) 0)
+        csz (if has-cs (rd64 p (+ pos 6)) -1)
+        did (if (> (bit-and flg 1) 0) (rd32 p (+ pos (+ 6 (if has-cs 8 0)))) -1)]
+    (if (and has-cs (< csz 0)) (Err (corrupt "the frame's content size is not a size"))
+      (Ok (some (FrameHead kind-frame (+ 4 dl) (> (bit-and flg 32) 0) (> (bit-and flg 16) 0) (> (bit-and flg 4) 0) csz did
+                           (block-max (bit-and (shr bd 4) 7)) 0))))))
+
+(defun frame-head (p: ptr n: i64 pos: i64) -> (Result (Option FrameHead) CompressError)
+  (if (< n (+ pos 7)) (Ok nil)
+    (let [flg (rd8 p (+ pos 4)) dl (descriptor-len flg) bd (rd8 p (+ pos 5))]
+      (if (< n (+ pos (+ 4 dl))) (Ok nil)
+        (match (check-descriptor p pos dl)
+          ((Err e) (Err e))
+          ((Ok _) (make-head p pos flg bd dl)))))))
+
+(defun parse-head (p: ptr n: i64 pos: i64) -> (Result (Option FrameHead) CompressError)
+  (if (< n (+ pos 4)) (Ok nil)
+    (let [m (rd32 p pos)]
+      (cond (= m magic-frame) (frame-head p n pos)
+            (and (>= m magic-skip-lo) (<= m (+ magic-skip-lo 15)))
+              (if (< n (+ pos 8)) (Ok nil) (Ok (some (FrameHead kind-skip 8 false false false -1 -1 0 (rd32 p (+ pos 4))))))
+            (= m magic-legacy) (Ok (some (FrameHead kind-legacy 4 true false false -1 -1 8388608 0)))
+            :else (Err (corrupt "not an LZ4 frame: the magic number is unknown"))))))
+
+;; ---- building a head: magic, FLG, BD, [content size], [dictionary id], header checksum
+(defun build-head (indep: bool bchk: bool cchk: bool csize: i64 dictid: i64 bid: i64) -> (Array i8)
+  (let [flg (+ 64 (+ (if indep 32 0) (+ (if bchk 16 0) (+ (if (>= csize 0) 8 0) (+ (if cchk 4 0) (if (>= dictid 0) 1 0))))))
+        dl (descriptor-len flg)
+        h (array (+ 4 dl) 0i8) p (data h)
+        _ (do (wr32 p 0 magic-frame) (wr8 p 4 flg) (wr8 p 5 (shl bid 4))
+              (when (>= csize 0) (wr64 p 6 csize))
+              (when (>= dictid 0) (wr32 p (+ 6 (if (>= csize 0) 8 0)) dictid))
+              (wr8 p (+ 3 dl) (bit-and (shr (xxh32-ptr (ptr-add p 4) (- dl 1) 0) 8) 255)))]
+    h))

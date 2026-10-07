@@ -1,0 +1,128 @@
+;; fib.compress.lz4.framedec: the one-shot LZ4 frame decompressor, safe on hostile input (docs/design/compress.md 6.2). Decodes a sequence of frames: LZ4 frames,
+;; skippable frames (ignored) and legacy frames (decode only), straight into one growing output array. Every length is checked against the input, the block maximum and
+;; `max-output` BEFORE the output grows (a hostile size can allocate nothing beyond max-output), a declared content size is checked against `max-output` and against what
+;; the input could possibly expand to (255 to 1), reserved bits are errors, header, block and content checksums are verified when present. A dictionary is a prefix
+;; of the first frame's window (every block of it when the blocks are independent).
+;;   (frame-decompress src opts) -> (Result (Array i8) CompressError)
+(ns fib.compress.lz4.framedec (:use fib.core fib.seq fib.coll fib.compress.types fib.compress.lz4.mem fib.compress.lz4.header fib.compress.lz4.xxh32 fib.compress.lz4.blockdec fib.compress.lz4.block))
+
+(defstruct Pos (pos: i64 op: i64 end: bool))
+
+;; Room for `need` bytes in the output: the array is replaced by a larger one, exactly `need` when that is more than twice the old size, else doubled, but never
+;; past `lim` + 32 (the caller has checked `need` against max-output, so a hostile size allocates nothing beyond it).
+(defun ensure (&ob: (Array i8) op: i64 need: i64 lim: i64) -> unit
+  (when (> need (array-len @ob))
+    (let [nb (cell (array (if (> need (* 2 (array-len @ob))) need (max need (min (+ lim 32) (* 2 (array-len @ob))))) 0i8))]
+      (do (array-blit! &nb 0 @ob 0 op) (set! ob @nb)))))
+
+;; Blocks of one frame from i: each is a size word (0: the end mark), its data and, with block checksums, the checksum. `w` is the dictionary window of independent
+;; blocks (dl bytes of dictionary then room for a block), or an empty array.
+(defun dec-one (src: (Array i8) i: i64 &ob: (Array i8) op: i64 h: FrameHead lo: i64 cap: i64 w: (Array i8) dl: i64) -> (Result Pos CompressError)
+  (let [n (array-len src) p (data src)]
+    (if (> (+ i 4) n) (Err (truncated "the frame ends before its end mark"))
+      (let [wd (rd32 p i) sz (bit-and wd 2147483647) bsum (if (. h bchk) 4 0)]
+        (cond (= wd 0) (Ok (Pos (+ i 4) op true))
+              (> sz (. h bmax)) (Err (corrupt "a block is larger than the frame's block size"))
+              (> (+ i (+ 4 (+ sz bsum))) n) (Err (truncated "the frame ends inside a block"))
+              (and (. h bchk) (not (= (rd32 p (+ i (+ 4 sz))) (xxh32-ptr (unsafe (ptr+ p (+ i 4))) sz 0)))) (Err (checksum-error "a block's checksum does not match"))
+              (> (bit-and wd 2147483648) 0) (dec-raw src i sz &ob op cap bsum)
+              :else (dec-comp src i sz &ob op h lo cap w dl bsum))))))
+
+(defun dec-raw (src: (Array i8) i: i64 sz: i64 &ob: (Array i8) op: i64 cap: i64 bsum: i64) -> (Result Pos CompressError)
+  (if (> sz (- cap op)) (Err (too-large "the output exceeds max-output"))
+    (do (ensure &ob op (+ op sz) cap) (copy-exact (data @ob) op (data src) (+ i 4) sz) (Ok (Pos (+ i (+ 4 (+ sz bsum))) (+ op sz) false)))))
+
+(defun dec-comp (src: (Array i8) i: i64 sz: i64 &ob: (Array i8) op: i64 h: FrameHead lo: i64 cap: i64 w: (Array i8) dl: i64 bsum: i64) -> (Result Pos CompressError)
+  (let [lim (min cap (+ op (. h bmax)))
+        r (if (and (> dl 0) (. h indep)) (dec-with-dict src i sz &ob op lim w dl)
+            (do (ensure &ob op lim cap) (decode-block (unsafe (ptr+ (data src) (+ i 4))) sz (data @ob) (array-len @ob) op lo lim)))]
+    (cond (= r e-too-large) (Err (if (< lim cap) (corrupt "a block decodes to more than the frame's block size") (too-large "the output exceeds max-output")))
+          (< r 0) (Err (decode-error r))
+          :else (Ok (Pos (+ i (+ 4 (+ sz bsum))) r false)))))
+
+;; Independent blocks with a dictionary: decoded after the dictionary in `w`, then copied out. The new output end, or a negative code.
+(defun dec-with-dict (src: (Array i8) i: i64 sz: i64 &ob: (Array i8) op: i64 lim: i64 w: (Array i8) dl: i64) -> i64
+  (let [r (decode-block (unsafe (ptr+ (data src) (+ i 4))) sz (data w) (array-len w) dl 0 (+ dl (- lim op)))]
+    (if (< r 0) r
+      (do (ensure &ob op (+ op (- r dl)) lim) (copy-exact (data @ob) op (data w) dl (- r dl)) (+ op (- r dl))))))
+
+;; The blocks until the end mark, and the content checksum and size checks: the position after the frame and the output end.
+(defun dec-frame (src: (Array i8) i0: i64 &ob: (Array i8) op0: i64 h: FrameHead lo0: i64 cap: i64 w: (Array i8) dl: i64) -> (Result Pos CompressError)
+  (loop [i (+ i0 (. h hlen)) op op0]
+    (match (dec-one src i &ob op h (if (. h indep) op lo0) cap w dl)
+      ((Err e) (Err e))
+      ((Ok r) (if (not (. r end)) (recur (. r pos) (. r op)) (dec-trailer src r h op0))))))
+
+(defun dec-trailer (src: (Array i8) r: Pos h: FrameHead op0: i64) -> (Result Pos CompressError)
+  (let [i (. r pos) end (. r op)]
+    (cond (and (. h cchk) (> (+ i 4) (array-len src))) (Err (truncated "the frame ends before its content checksum"))
+          (and (>= (. h csize) 0) (not (= (. h csize) (- end op0)))) (Err (corrupt "the frame's content size does not match its content"))
+          :else (Ok (Pos (if (. h cchk) (+ i 4) i) end true)))))
+
+(defun check-content (src: (Array i8) r: Pos h: FrameHead &ob: (Array i8) op0: i64) -> (Result Pos CompressError)
+  (if (and (. h cchk) (not (= (rd32 (data src) (- (. r pos) 4)) (xxh32-ptr (unsafe (ptr+ (data @ob) op0)) (- (. r op) op0) 0))))
+    (Err (checksum-error "the content checksum does not match")) (Ok r)))
+
+(defun legacy-frame (src: (Array i8) i0: i64 &ob: (Array i8) op0: i64 cap: i64) -> (Result Pos CompressError)
+  (let [n (array-len src) p (data src)]
+    (loop [i (+ i0 4) op op0]
+      (if (>= i n) (Ok (Pos i op true))
+        (let [m (if (<= (+ i 4) n) (rd32 p i) -1)]
+          (cond (or (= m magic-frame) (= m magic-legacy) (and (>= m magic-skip-lo) (<= m (+ magic-skip-lo 15)))) (Ok (Pos i op true))
+                (< m 0) (Err (truncated "a legacy frame ends inside a block size"))
+                (> (+ i (+ 4 m)) n) (Err (truncated "a legacy frame ends inside a block"))
+                :else
+                (let [lim (min cap (+ op 8388608))
+                      _ (ensure &ob op lim cap)
+                      r (decode-block (unsafe (ptr+ p (+ i 4))) m (data @ob) (array-len @ob) op op lim)]
+                  (cond (= r e-too-large) (Err (if (< lim cap) (corrupt "a legacy block decodes to more than 8 MiB") (too-large "the output exceeds max-output")))
+                        (< r 0) (Err (decode-error r))
+                        :else (recur (+ i (+ 4 m)) r)))))))))
+
+(defun make-win (dict: (Array i8) bmax: i64) -> (Array i8)
+  (let [w (array (+ (array-len dict) (+ bmax 8)) 0i8)] (do (copy-exact (data w) 0 (data dict) 0 (array-len dict)) w)))
+
+(defun fix-kind (r: (Result Pos CompressError) small: bool) -> (Result Pos CompressError)
+  (match r ((Err e) (if (and small (= (. e kind) :too-large)) (Err (corrupt "the frame decodes to more than its content size")) (Err e))) ((Ok p) (Ok p))))
+
+(defun one-frame (src: (Array i8) i: i64 &ob: (Array i8) op: i64 h: FrameHead lo0: i64 cap: i64 dict: (Array i8)) -> (Result Pos CompressError)
+  (cond (= (. h kind) kind-skip) (if (> (+ i (+ 8 (. h skip))) (array-len src)) (Err (truncated "a skippable frame ends early")) (Ok (Pos (+ i (+ 8 (. h skip))) op true)))
+        (= (. h kind) kind-legacy) (legacy-frame src i &ob op cap)
+        (> (. h csize) (- cap op)) (Err (too-large "the frame's content size exceeds max-output"))
+        (> (. h csize) (+ 1024 (* 255 (array-len src)))) (Err (corrupt "the frame's content size is more than its data can expand to"))
+        :else
+        (let [fcap (if (>= (. h csize) 0) (+ op (. h csize)) cap)
+              w (if (and (> (array-len dict) 0) (. h indep)) (make-win dict (. h bmax)) (array 0 0i8))]
+          (do (when (>= (. h csize) 0) (ensure &ob op fcap fcap))
+              (match (fix-kind (dec-frame src i &ob op h lo0 fcap w (array-len dict)) (< fcap cap))
+                ((Err e) (Err e))
+                ((Ok r) (check-content src r h &ob op)))))))
+
+;; The frames of src one after the other, into ob from index `base` (a dictionary's length: it sits at the start); the output end.
+(defun frame-loop (src: (Array i8) &ob: (Array i8) base: i64 cap: i64 dict: (Array i8)) -> (Result i64 CompressError)
+  (let [n (array-len src) p (data src)]
+    (loop [i 0 op base first true]
+      (if (>= i n) (Ok op)
+        (match (parse-head p n i)
+          ((Err e) (Err e))
+          ((Ok nothing)
+           (match nothing
+             (nil (Err (truncated "the input ends inside a frame header")))
+             ((some h) (match (one-frame src i &ob op h (if first 0 op) cap (if first dict (array 0 0i8)))
+                         ((Err e) (Err e))
+                         ((Ok r) (recur (. r pos) (. r op) false)))))))))))
+
+(defun check-dec (o: Options) -> (Result unit CompressError)
+  (cond (< (. o max-output) 0) (Err (invalid-argument "max-output must not be negative")) :else (Ok ())))
+
+(defun frame-decompress (src: (Array i8) o: Options) -> (Result (Array i8) CompressError)
+  (match (check-dec o)
+    ((Err e) (Err e))
+    ((Ok _)
+     (let [d (let [t (. o dictionary)] (if (> (array-len t) 65536) (array-copy t (- (array-len t) 65536) (array-len t)) t))
+           dl (array-len d)
+           ob (cell (array dl 0i8))
+           _ (copy-exact (data @ob) 0 (data d) 0 dl)]
+       (match (frame-loop src &ob dl (+ dl (. o max-output)) d)
+         ((Err e) (Err e))
+         ((Ok end) (Ok (if (and (= dl 0) (= end (array-len @ob))) @ob (array-copy @ob dl end)))))))))

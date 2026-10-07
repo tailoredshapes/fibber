@@ -1,0 +1,16 @@
+;; spec: docs/design/compress.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; roots: ../../lib support
+;; An LZ4 block of 'hello' x 9 + 'world' is the exact bytes liblz4 1.10 gives (python lz4.block), and decodes back; the limit is exact; incompressible data is one literal run.
+(ns main (:use tl.check fib.compress.lz4.mem) (:require [fib.compress.lz4 :as lz4]))
+(defun main () -> i64
+  (let [c (checks) s (str-bytes "hello hello hello hello hello hello hello hello hello world")
+        z (lz4/block-compress s 1)
+        want [111 104 101 108 108 111 32 6 0 29 80 119 111 114 108 100]]
+    (do (check c (= (vec (map (fn (b: i8) (bit-and (sext i64 b) 255)) z)) want))
+        (check c (match (lz4/block-decompress z 1000) ((Ok b) (bytes-eq b s)) ((Err _) false)))
+        (check c (match (lz4/block-decompress z 58) ((Err e) (= (. e kind) :too-large)) ((Ok _) false)))
+        (check c (= (array-len (lz4/block-compress (str-bytes "abcdefghijklmnopq") 1)) 19))
+        (checks-result c))))

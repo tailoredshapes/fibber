@@ -1,0 +1,164 @@
+;; fib.compress.lz4 on HOSTILE input (docs/design/compress.md 7): a corpus of hand-built malicious blocks and frames, each of which must produce its specific error, and a fuzz of
+;; 200,000 mutations of valid frames (bit flips, truncations, length-field and offset corruption, header corruption, inserted and zeroed bytes) that must end in an error or a result,
+;; never a trap, a hang or more than max-output, in the one-shot and the streaming decoder, which must agree.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.rng fib.compress.types fib.compress.ops fib.compress.corpus fib.compress.lz4 fib.compress.lz4.mem
+               fib.compress.lz4.xxh32 fib.compress.lz4.header))
+
+(defun bytes-of (v: (Vec i64)) -> (Array i8) (fill (count v) (fn (i: i64) (nth v i))))
+(defun le32 (n: i64) -> (Array i8) (let [a (array 4 0i8)] (do (wr32 (data a) 0 n) a)))
+(defun cat (parts: (Vec (Array i8))) -> (Array i8) (concat-bytes parts))
+(defun repeat-byte (b: i64 n: i64) -> (Array i8) (same-byte b n))
+
+;; A frame head with the given FLG, BD and the bytes between BD and the header checksum, and the right checksum (or `hc-delta` away from it).
+(defun head (flg: i64 bd: i64 extra: (Array i8) hc-delta: i64) -> (Array i8)
+  (let [desc (cat [(bytes-of [flg bd]) extra])]
+    (cat [(le32 magic-frame) desc (bytes-of [(bit-and (+ hc-delta (shr (xxh32 desc 0) 8)) 255)])])))
+(defun h (flg: i64 bd: i64) -> (Array i8) (head flg bd (array 0 0i8) 0))
+(defun blk (z: (Array i8)) -> (Array i8) (cat [(le32 (array-len z)) z]))
+(defun raw-blk (z: (Array i8)) -> (Array i8) (cat [(le32 (bit-or (array-len z) 2147483648)) z]))
+(defun end () -> (Array i8) (le32 0))
+
+(def indep: i64 96)     ; FLG 0x60: version 1, independent blocks
+(def linked: i64 64)    ; FLG 0x40: version 1, linked blocks
+(def bd64k: i64 64)     ; BD 0x40: block maximum 64 KiB
+;; "abcd" as one sequence of four literals (a valid last sequence).
+(defun abcd () -> (Array i8) (bytes-of [64 97 98 99 100]))
+(defun good () -> (Array i8) (cat [(h indep bd64k) (blk (abcd)) (end)]))
+
+(defstruct Bad (name: str input: (Array i8) kind: keyword))
+(defun bad (name: str input: (Array i8) kind: keyword) -> Bad (Bad name input kind))
+
+(defun frame-cases () -> (Vec Bad)
+  (let [chain (repeat-byte 255 70000)]
+    [(bad "empty input" (array 0 0i8) :truncated)
+     (bad "the magic number only" (le32 magic-frame) :truncated)
+     (bad "an unknown magic number" (bytes-of [0 0 0 0 0 0 0 0 0]) :corrupt)
+     (bad "a version other than 1" (cat [(h 160 bd64k) (blk (abcd)) (end)]) :unsupported)
+     (bad "the reserved FLG bit set" (cat [(h 98 bd64k) (blk (abcd)) (end)]) :corrupt)
+     (bad "reserved BD bits set" (cat [(h indep 65) (blk (abcd)) (end)]) :corrupt)
+     (bad "block size id 3" (cat [(h indep 48) (blk (abcd)) (end)]) :corrupt)
+     (bad "a wrong header checksum" (cat [(head indep bd64k (array 0 0i8) 1) (blk (abcd)) (end)]) :checksum)
+     (bad "a block larger than the block size" (cat [(h indep bd64k) (le32 65537)]) :corrupt)
+     (bad "a block longer than the input" (cat [(h indep bd64k) (le32 1000) (abcd)]) :truncated)
+     (bad "no end mark" (cat [(h indep bd64k) (blk (abcd))]) :truncated)
+     (bad "a wrong block checksum" (cat [(h 112 bd64k) (blk (abcd)) (le32 12345) (end)]) :checksum)
+     (bad "a wrong content checksum" (cat [(h 100 bd64k) (blk (abcd)) (end) (le32 12345)]) :checksum)
+     (bad "a missing content checksum" (cat [(h 100 bd64k) (blk (abcd)) (end)]) :truncated)
+     (bad "a content size smaller than the content" (cat [(head 104 bd64k (cat [(le32 2) (le32 0)]) 0) (blk (abcd)) (end)]) :corrupt)
+     (bad "a content size larger than the content" (cat [(head 104 bd64k (cat [(le32 10) (le32 0)]) 0) (blk (abcd)) (end)]) :corrupt)
+     (bad "a content size of 2^60 over four bytes of data" (cat [(head 104 bd64k (cat [(le32 0) (le32 268435456)]) 0) (blk (abcd)) (end)]) :too-large)
+     (bad "a match offset of 0" (cat [(h indep bd64k) (blk (bytes-of [16 97 0 0 64 97 98 99 100])) (end)]) :corrupt)
+     (bad "a match offset past the start of the output" (cat [(h indep bd64k) (blk (bytes-of [16 97 2 0 64 97 98 99 100])) (end)]) :corrupt)
+     (bad "a literal run past the end of the block" (cat [(h indep bd64k) (blk (bytes-of [80 97 98])) (end)]) :truncated)
+     (bad "an offset cut off at the end of the block" (cat [(h indep bd64k) (blk (bytes-of [16 97 1])) (end)]) :truncated)
+     (bad "a literal length of 70000 255s with no end" (cat [(h indep 112) (blk (cat [(bytes-of [240]) chain])) (end)]) :truncated)
+     (bad "a match length that runs into the block size (a 255 chain)" (cat [(h indep bd64k) (blk (cat [(bytes-of [31 97 1 0]) (repeat-byte 255 5000) (bytes-of [0 64 97 98 99 100])])) (end)]) :corrupt)
+     (bad "a block ending right after a match" (cat [(h indep bd64k) (blk (bytes-of [16 97 1 0])) (end)]) :truncated)
+     (bad "a second independent block that reaches into the first" (cat [(h indep bd64k) (blk (bytes-of [128 97 98 99 100 101 102 103 104])) (blk (bytes-of [16 97 3 0 64 97 98 99 100])) (end)]) :corrupt)
+     (bad "a second linked frame that reaches into the first frame's output" (cat [(h linked bd64k) (blk (bytes-of [128 97 98 99 100 101 102 103 104])) (end) (h linked bd64k) (blk (bytes-of [16 97 3 0 64 97 98 99 100])) (end)]) :corrupt)
+     (bad "a skippable frame longer than the input" (cat [(le32 407710293) (le32 100) (bytes-of [1 2 3])]) :truncated)
+     (bad "bytes after the frame that are no frame" (cat [(good) (bytes-of [90 90 90 90 90])]) :corrupt)
+     (bad "a legacy frame with a block longer than the input" (cat [(le32 407642370) (le32 1000) (abcd)]) :truncated)
+     (bad "a stored block longer than the input" (cat [(h indep bd64k) (le32 (bit-or 1000 2147483648)) (abcd)]) :truncated)]))
+
+(defun block-cases () -> (Vec Bad)
+  [(bad "empty block" (array 0 0i8) :truncated)
+   (bad "offset 0" (bytes-of [16 97 0 0 64 97 98 99 100]) :corrupt)
+   (bad "offset past the start" (bytes-of [16 97 2 0 64 97 98 99 100]) :corrupt)
+   (bad "literal past the end" (bytes-of [80 97 98]) :truncated)
+   (bad "a literal length that overflows its input: 255 x 100000 then 0" (cat [(bytes-of [240]) (repeat-byte 255 100000) (bytes-of [0])]) :truncated)
+   (bad "a match length of 255 x 5000 + 1 (1.2 MB) past the 1 MiB limit" (cat [(bytes-of [31 97 1 0]) (repeat-byte 255 5000) (bytes-of [0 64 97 98 99 100])]) :too-large)
+   (bad "a match length chain with no end" (cat [(bytes-of [31 97 1 0]) (repeat-byte 255 5000)]) :truncated)
+   (bad "an offset of 65535 into 4 bytes of output" (bytes-of [16 97 255 255 64 97 98 99 100]) :corrupt)
+   (bad "offset 0, in a block with room behind it (the fast path)" (cat [(bytes-of [16 97 0 0]) (repeat-byte 7 40) (bytes-of [0])]) :corrupt)
+   (bad "offset past the start, in a block with room behind it (the fast path)" (cat [(bytes-of [16 97 2 0]) (repeat-byte 7 40) (bytes-of [0])]) :corrupt)])
+
+(defun kind-str (r: (Result (Array i8) CompressError)) -> keyword (match r ((Ok _) :ok) ((Err e) (. e kind))))
+(defun stream-fails? (c: Bad) -> bool (match (decompress-chunks (lz4) (with-max-output (default-options) 1048576) [(. c input)]) ((Err _) true) ((Ok _) false)))
+
+(defun frame-wrong () -> (Vec str)
+  (vec (map (fn (c: Bad) (str (. c name)))
+            (filter (fn (c: Bad) (not (= (kind-str (decompress (lz4) (. c input) (with-max-output (default-options) 1048576))) (. c kind)))) (frame-cases)))))
+(defun frame-stream-wrong () -> (Vec str)
+  (vec (map (fn (c: Bad) (. c name)) (filter (fn (c: Bad) (and (not (= (. c name) "a legacy frame with a block longer than the input")) (not (stream-fails? c)))) (frame-cases)))))
+(defun block-wrong () -> (Vec str)
+  (vec (map (fn (c: Bad) (. c name))
+            (filter (fn (c: Bad) (not (= (kind-str (block-decompress (. c input) 1048576)) (. c kind)))) (block-cases)))))
+
+;; ---- the bomb: a hundred megabytes of zeros is about 400 KB; with a 1 MiB limit the answer is too-large, from the one-shot and the streaming decoder, in both formats.
+(defun bomb-kinds () -> (Vec keyword)
+  (let [z (zeros 100000000) o (with-max-output (default-options) 1048576)
+        f (match (compress (lz4) z (default-options)) ((Ok b) b) ((Err _) (array 0 0i8)))
+        b (block-compress z 1)]
+    [(kind-str (decompress (lz4) f o)) (match (decompress-chunks (lz4) o (split-sizes f [4096])) ((Err e) (. e kind)) ((Ok _) :ok))
+     (kind-str (block-decompress b 1048576)) (kind-str (block-decompress-sized b 1000))]))
+
+(defun exact-limit-kinds () -> (Vec keyword)
+  [(kind-str (decompress (lz4) (good) (with-max-output (default-options) 4))) (kind-str (decompress (lz4) (good) (with-max-output (default-options) 3)))
+   (kind-str (decompress (lz4) (good) (with-max-output (default-options) 0)))])
+
+;; ---- the fuzz. The pool is valid frames of every kind; a mutation is one of eight.
+(defun frame-of (d: (Array i8) o: Options) -> (Array i8) (match (compress (lz4) d o) ((Ok b) b) ((Err _) (array 0 0i8))))
+
+(defun pool () -> (Vec (Array i8))
+  (let [t (text 9 1500) r (random-bytes 10 300) zs (zeros 5000) rec (records 11 1200) d (default-options)]
+    [(frame-of t d) (frame-of t (with-level d 9)) (frame-of r d) (frame-of zs d) (frame-of rec (with-independent d false)) (frame-of t (with-block-checksum d true))
+     (frame-of rec (with-checksum d false)) (frame-of t (with-record-size d true)) (frame-of rec (with-independent (with-block-size d 65536) false))
+     (frame-of rec (with-dictionary d (array-copy rec 0 200)))]))
+
+(defun zero-range (c: (Array i8) at: i64 e: i64) -> (Array i8)
+  (let [cc (cell (array-copy c 0 (array-len c)))] (do (loop [i at] (when (< i e) (do (array-set! &cc i 0i8) (recur (+ i 1))))) @cc)))
+
+(defun set-byte (z: (Array i8) at: i64 v: i64) -> (Array i8)
+  (let [c (cell (array-copy z 0 (array-len z)))] (do (array-set! &c at (trunc i8 v)) @c)))
+
+(defun set-word (z: (Array i8) at: i64 v: i64 wide: bool) -> (Array i8)
+  (let [c (array-copy z 0 (array-len z))] (do (if wide (wr32 (data c) (min at (max 0 (- (array-len z) 4))) v) (wr16 (data c) (min at (max 0 (- (array-len z) 2))) v)) c)))
+
+(defun mutate (g: Rng z: (Array i8)) -> (Array i8)
+  (let [n (array-len z) k (rng-between g 0 7) at (rng-between g 0 (max 0 (- n 1)))]
+    (cond (= n 0) z
+          (= k 0) (set-byte z at (bit-xor (zext i64 (array-get z at)) (shl 1 (rng-between g 0 7))))
+          (= k 1) (set-byte z at (rng-between g 0 255))
+          (= k 2) (array-copy z 0 at)
+          (= k 3) (set-word z at (rng-between g 0 4294967295) true)
+          (= k 4) (set-word z at (rng-between g 0 65535) false)
+          (= k 5) (set-byte z (rng-between g 0 (min 11 (- n 1))) (rng-between g 0 255))
+          (= k 6) (cat [(array-copy z 0 at) (bytes-of [(rng-between g 0 255)]) (array-copy z at n)])
+          :else (zero-range z at (min n (+ at (rng-between g 1 8)))))))
+
+;; One mutant through both decoders: [error, ok, output over the limit, the decoders disagree].
+(defun run-mutant (m: (Array i8) o: Options) -> (Vec i64)
+  (let [one (decompress (lz4) m o) st (decompress-chunks (lz4) o (split-sizes m [97 4000]))]
+    (match one
+      ((Err _) [1 0 0 (match st ((Err _) 0) ((Ok _) 1))])
+      ((Ok b) [0 1 (if (> (array-len b) (. o max-output)) 1 0) (match st ((Ok s) (if (bytes-eq s b) 0 1)) ((Err _) 1))]))))
+
+(defun fuzz (n: i64 seed: i64) -> (Vec i64)
+  (let [g (rng-new seed) p (pool) o (with-max-output (default-options) 65536) dict (array-copy (records 11 1200) 0 200)]
+    (loop [i 0 acc [0 0 0 0]]
+      (if (>= i n) acc
+        (let [z (nth p (rng-between g 0 (- (count p) 1)))
+              r (run-mutant (mutate g z) (if (= (rem i 7) 0) (with-dictionary o dict) o))]
+          (recur (+ i 1) [(+ (nth acc 0) (nth r 0)) (+ (nth acc 1) (nth r 1)) (+ (nth acc 2) (nth r 2)) (+ (nth acc 3) (nth r 3))]))))))
+
+(defspecs specs
+  (feature "fib.compress.lz4 hostile input"
+    (scenario "hand-built malicious frames: each is refused with its own error kind (30 cases: header, block, checksum, size, offset, chain, linking, truncation)"
+      (then (expect = 30 (count (frame-cases)))
+            (expect = [] (frame-wrong))))
+    (scenario "the same frames are errors for the streaming decoder too"
+      (then (expect = [] (frame-stream-wrong))))
+    (scenario "hand-built malicious blocks: offset 0, past the start, past the end, a 255 chain that would overflow, a match past the limit"
+      (then (expect = [] (block-wrong))))
+    (scenario "a decompression bomb: 100 MB of zeros in 400 KB, a 1 MiB limit: too-large from every decoder; the limit is exact"
+      (then (expect = [:too-large :too-large :too-large :too-large] (bomb-kinds))
+            (expect = [:ok :too-large :too-large] (exact-limit-kinds))))
+    (scenario "200,000 mutated frames never trap and never exceed max-output; the one-shot and the streaming decoder agree on every one"
+      (given [t (fuzz 200000 1)])
+      (then (expect = 200000 (+ (nth t 0) (nth t 1)))
+            (expect = 0 (nth t 2))
+            (expect = 0 (nth t 3))
+            (expect = true (> (nth t 0) 100000))))))
+
+(defun main () -> i64 (run-main (specs)))

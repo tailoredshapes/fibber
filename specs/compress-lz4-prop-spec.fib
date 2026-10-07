@@ -1,0 +1,51 @@
+;; Properties of fib.compress.lz4 on random structured inputs (fib.compress.gen: markov-ish text, runs, repeated patterns, records, random bytes, copies; fixed seed, shrinking
+;; to a few segments): the round trip through every encoder level and every frame option, one-shot and streamed with random chunkings, and what the encoder may not do.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.rng fib.compress.gen fib.compress.corpus fib.compress.lz4.inspect fib.compress.lz4.mem
+               fib.compress.types fib.compress.lz4 fib.compress.ops))
+
+(defun same-r (r: (Result (Array i8) CompressError) b: (Array i8)) -> bool (match r ((Ok x) (bytes-eq x b)) ((Err _) false)))
+(defun sizes-from (segs: (Vec Seg)) -> (Vec i64) (if (empty? segs) [1] (vec (map (fn (s: Seg) (+ 1 (rem (. s len) 9000))) segs))))
+(defun flags-of (segs: (Vec Seg)) -> i64 (if (empty? segs) 0 (rem (. (nth segs 0) seed) 16)))
+(defun opts-of (segs: (Vec Seg)) -> Options
+  (let [f (flags-of segs)]
+    (with (with (with (with (default-options) (checksum (> (bit-and f 1) 0))) (block-checksum (> (bit-and f 2) 0))) (independent (> (bit-and f 4) 0))) (record-size (> (bit-and f 8) 0)))))
+
+(defspecs specs
+  (feature "fib.compress.lz4 properties"
+    (prop "a fast block decodes to its input, at acceleration 1, 4 and 33" [x (gen-input)]
+          (let [b (materialize x)]
+            (and (same-r (block-decompress (block-compress b 1) 268435456) b) (same-r (block-decompress (block-compress b 4) 268435456) b)
+                 (same-r (block-decompress (block-compress b 33) 268435456) b))))
+    (prop "an HC block decodes to its input, at levels 3, 6, 9 and 12" [x (gen-input)]
+          (let [b (materialize x)]
+            (and (same-r (block-decompress (block-compress-hc b 3) 268435456) b) (same-r (block-decompress (block-compress-hc b 6) 268435456) b)
+                 (same-r (block-decompress (block-compress-hc b 9) 268435456) b) (same-r (block-decompress (block-compress-hc b 12) 268435456) b))))
+    (prop "a block is within compress-bound, and its decoding with the exact size is the input" [x (gen-input)]
+          (let [b (materialize x) z (block-compress b 1)]
+            (and (<= (array-len z) (compress-bound (array-len b))) (same-r (block-decompress-sized z (array-len b)) b))))
+    (prop "no match offset is above 65535, fast and HC" [x (gen-input)]
+          (let [b (materialize x)] (and (<= (max-offset (block-compress b 1)) 65535) (<= (max-offset (block-compress-hc b 9)) 65535))))
+    (prop "a block is a sequence of well-formed sequences: it walks, ends in literals, the last 5 bytes are literals" [x (gen-input)]
+          (let [b (materialize x) z (block-compress b 1)]
+            (match (block-sequences z)
+              (nil false)
+              ((some ss) (let [l (nth ss (- (count ss) 1))] (and (= (. l off) 0) (or (< (array-len b) 13) (>= (. l lit) 5))))))))
+    (prop "a frame round trips under random options (checksums, linked or independent blocks, content size), fast and HC" [x (gen-input)]
+          (let [b (materialize x) o (opts-of x)]
+            (and (same-r (match (compress (lz4) b o) ((Ok z) (decompress (lz4) z o)) ((Err e) (Err e))) b)
+                 (same-r (match (compress (lz4) b (with-level o 5)) ((Ok z) (decompress (lz4) z o)) ((Err e) (Err e))) b))))
+    (prop "a frame streamed in random chunks, compressed in random chunks, decodes to the input" [x (gen-input)]
+          (let [b (materialize x) o (with-size-hint (opts-of x) (array-len (materialize x))) sz (sizes-from x)]
+            (and (same-r (match (compress-chunks (lz4) o (split-sizes b sz)) ((Ok z) (decompress-chunks (lz4) o (split-sizes z (vec (reverse sz))))) ((Err e) (Err e))) b)
+                 (same-r (match (compress (lz4) b o) ((Ok z) (decompress-chunks (lz4) o (split-sizes z sz))) ((Err e) (Err e))) b))))
+    (prop "a frame made with the 64 KiB, 256 KiB, 1 MiB and 4 MiB block sizes decodes to the input" [x (gen-input)]
+          (let [b (materialize x)]
+            (every? (fn (bs: i64) (let [o (with-block-size (default-options) bs)]
+                                    (same-r (match (compress (lz4) b o) ((Ok z) (decompress (lz4) z o)) ((Err e) (Err e))) b)))
+                    [65536 262144 1048576 4194304])))
+    (prop "the same input gives the same output (determinism), fast, HC and frame" [x (gen-input)]
+          (let [b (materialize x)]
+            (and (bytes-eq (block-compress b 1) (block-compress b 1)) (bytes-eq (block-compress-hc b 9) (block-compress-hc b 9))
+                 (match (compress (lz4) b (default-options)) ((Ok p) (match (compress (lz4) b (default-options)) ((Ok q) (bytes-eq p q)) ((Err _) false))) ((Err _) false)))))))
+
+(defun main () -> i64 (run-main (specs)))

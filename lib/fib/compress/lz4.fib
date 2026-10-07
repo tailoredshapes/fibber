@@ -1,0 +1,46 @@
+;; fib.compress.lz4: LZ4 in pure fibber (no extern, no C library): the block format, the frame format (v1.6.x: block independence and linking, block and content checksums,
+;; content size, dictionary, skippable frames; legacy frames decode only), the fast encoder with acceleration, and LZ4 HC (levels 3 to 12). docs/design/compress.md, lib/fib/compress/README.md.
+;;   (lz4)                                              the `Codec` value: (compress (lz4) bytes opts), (decompress (lz4) bytes opts), streaming, ...
+;;   (block-compress bytes accel) (block-compress-hc bytes level) (block-decompress bytes max-output) (block-decompress-sized bytes size) (block-decompress-into ...)
+;;   (compress-bound n)                                 liblz4's LZ4_compressBound
+;;   (xxh32 bytes seed)                                 the checksum of the frame format
+;; Explicit: `(:require [fib.compress.lz4 :as lz4])`. Nothing in fib.core refers to it.
+(ns fib.compress.lz4 (:use fib.core fib.seq fib.coll fib.compress.types fib.compress.lz4.mem fib.compress.lz4.block fib.compress.lz4.frame fib.compress.lz4.framedec
+                           fib.compress.lz4.scomp fib.compress.lz4.sdec fib.compress.lz4.xxh32 fib.compress.lz4.header)
+  (:export-from fib.compress.lz4.block fib.compress.lz4.xxh32))
+
+(defstruct Lz4 (n: i64))
+(defun lz4 () -> Lz4 (Lz4 0))
+
+(defun magic-bytes () -> (Array i8) (let [a (array 4 0i8)] (do (wr32 (data a) 0 magic-frame) a)))
+
+(defstruct Lz4Compressor (c: LzComp))
+(defstruct Lz4Decompressor (d: LzDec))
+
+(impl Compressor Lz4Compressor
+  (compressor-feed (self chunk) (comp-feed (. self c) chunk))
+  (compressor-finish (self) (comp-finish (. self c))))
+
+(impl Decompressor Lz4Decompressor
+  (decompressor-feed (self chunk) (dec-feed (. self d) chunk))
+  (decompressor-finish (self) (dec-finish (. self d))))
+
+(defun check-level (o: Options) -> (Result unit CompressError)
+  (if (> (. o level) 12) (Err (unsupported "LZ4 has levels up to 12")) (Ok ())))
+
+(defun lz4-decompress (data: (Array i8) o: Options) -> (Result (Array i8) CompressError)
+  (if (= (array-len data) 0) (Err (truncated "empty input is not an LZ4 frame")) (frame-decompress data o)))
+
+(impl Codec Lz4
+  (codec-name (self) "lz4")
+  (codec-capabilities (self) [:frame :block :block-size :levels :streaming :dictionary :checksum :content-size :linked-blocks])
+  (codec-magics (self) [(magic-bytes)])
+  (codec-max-compressed-size (self n) (frame-max-size n default-block-size))
+  (codec-compress (self data opts) (match (check-level opts) ((Err e) (Err e)) ((Ok _) (frame-compress data opts))))
+  (codec-decompress (self data opts) (lz4-decompress data opts))
+  (codec-compressor (self opts)
+    (match (check-level opts)
+      ((Err e) (Err e))
+      ((Ok _) (match (new-compressor opts) ((Err e) (Err e)) ((Ok c) (Ok (dyn Compressor (Lz4Compressor c))))))))
+  (codec-decompressor (self opts)
+    (match (new-decompressor opts) ((Err e) (Err e)) ((Ok d) (Ok (dyn Decompressor (Lz4Decompressor d)))))))

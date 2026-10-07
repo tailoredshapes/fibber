@@ -1,0 +1,35 @@
+;; fib.compress.lz4.enc: the encoder state: the fast encoder's table, or the high-compression encoder's two, kept between blocks (and, for a streaming compressor, between
+;; calls) and reused WITHOUT being cleared: `gen` (the caller's) goes up past every position the old blocks held (fib.compress.lz4.blockenc).
+;;   (enc-new level acceleration size-hint) -> Encoder      level 3 to 12: high compression; otherwise the fast encoder (acceleration, or 1 - level for a negative level)
+;;   (enc-run e sp lo s0 n dp gen) -> compressed length     one block, sp[s0, s0+n), the history sp[lo, s0)
+(ns fib.compress.lz4.enc (:use fib.core fib.seq fib.coll fib.compress.lz4.mem fib.compress.lz4.blockenc fib.compress.lz4.hc))
+
+(defstruct Encoder (level: i64 accel: i64 hlog: i64 tbl: (Array i8) ct: (Array i8) st: (Array i64)))
+
+(defun hc-level? (level: i64) -> bool (>= level 3))
+
+(defun table-log (n: i64) -> i64 (cond (< n 0) 12 (<= n 4096) 9 (< n 65547) 13 :else 12))
+
+(defun enc-new (level: i64 accel: i64 size-hint: i64) -> Encoder
+  (let [lv (min level 12)]
+    (if (hc-level? lv)
+      (Encoder lv 1 hc-hash-log (array (shl 4 hc-hash-log) 0i8) (array 131072 0i8) (array 2 0))
+      (let [hl (table-log size-hint)]
+        (Encoder lv (if (< lv 0) (max accel (- 1 lv)) (max accel 1)) hl (array (shl 4 hl) 0i8) (array 0 0i8) (array 2 0))))))
+
+(defun enc-run (e: Encoder sp: ptr lo: i64 s0: i64 n: i64 dp: ptr gen: i64) -> i64
+  (if (hc-level? (. e level))
+    (hc-block sp lo s0 n dp (data (. e tbl)) (data (. e ct)) (unsafe (ptr+ (raw (. e st)) 24)) gen (. e level))
+    (enc-block sp lo s0 n dp (data (. e tbl)) gen (. e accel) (. e hlog))))
+
+;; Positions can reach `gen + window + block`: past 2^30 the tables are cleared (a real clear, once in a billion bytes) and gen starts again.
+(def gen-limit: i64 1073741824)
+(defun enc-reset (e: Encoder) -> Encoder
+  (Encoder (. e level) (. e accel) (. e hlog) (array (array-len (. e tbl)) 0i8) (array (array-len (. e ct)) 0i8) (array 2 0)))
+
+;; A dictionary (the bytes sp[0, dl), which the window starts with) goes into the tables, so that blocks that follow can match into it. The window must hold 3 bytes more.
+(defun enc-prime (e: Encoder sp: ptr dl: i64 gen: i64) -> unit
+  (if (hc-level? (. e level))
+    (hc-insert sp (data (. e tbl)) (data (. e ct)) (unsafe (ptr+ (raw (. e st)) 24)) gen 0 dl)
+    (let [tp (data (. e tbl)) shift (- 32 (. e hlog))]
+      (loop [i 0] (if (< i dl) (do (tput tp (hash4 (rd32 sp i) shift) (+ gen i)) (recur (+ i 1))) ())))))

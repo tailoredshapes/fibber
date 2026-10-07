@@ -1,0 +1,38 @@
+;; fib.compress.lz4.inspect: a walker over the sequences of an LZ4 block, for tests and tools (the specs check what the encoder CHOSE, not only that it round trips: the largest
+;; offset, the match lengths, the literal runs). `(block-sequences z)` -> a vector of Seq (literals, offset, match length; offset and match length 0 in the last sequence),
+;; or nil when the block is malformed. It is not the decoder: it reads lengths and moves on.
+(ns fib.compress.lz4.inspect (:use fib.core fib.seq fib.coll fib.compress.lz4.mem))
+
+(defstruct Seq (lit: i64 off: i64 ml: i64))
+
+;; The length at i whose nibble was 15: the sum and the next index, packed as (sum << 24 | index - no: two results through a pair.
+(defun ext (z: (Array i8) i: i64 base: i64) -> (Option (Pair i64 i64))
+  (loop [k i sum base]
+    (if (>= k (array-len z)) nil
+      (let [b (bit-and (zext i64 (array-get z k)) 255)]
+        (if (= b 255) (recur (+ k 1) (+ sum 255)) (some (Pair (+ sum b) (+ k 1))))))))
+
+(defun block-sequences (z: (Array i8)) -> (Option (Vec Seq))
+  (let [n (array-len z)]
+    (loop [i 0 out: (Vec Seq) []]
+      (if (>= i n) nil
+        (let [tok (bit-and (zext i64 (array-get z i)) 255) ln (shr tok 4) mn (bit-and tok 15)
+              l (if (= ln 15) (ext z (+ i 1) 15) (some (Pair ln (+ i 1))))]
+          (match l
+            (nil nil)
+            ((some lp)
+             (let [i2 (+ (. lp snd) (. lp fst))]
+               (cond (> i2 n) nil
+                     (= i2 n) (some (conj out (Seq (. lp fst) 0 0)))
+                     (> (+ i2 2) n) nil
+                     :else
+                     (let [off (+ (bit-and (zext i64 (array-get z i2)) 255) (* 256 (bit-and (zext i64 (array-get z (+ i2 1))) 255)))
+                           m (if (= mn 15) (ext z (+ i2 2) 15) (some (Pair mn (+ i2 2))))]
+                       (match m
+                         (nil nil)
+                         ((some mp) (recur (. mp snd) (conj out (Seq (. lp fst) off (+ 4 (. mp fst)))))))))))))))))
+
+(defun max-offset (z: (Array i8)) -> i64
+  (match (block-sequences z) (nil -1) ((some ss) (reduce (fn (a: i64 s: Seq) (max a (. s off))) 0 ss))))
+(defun offsets (z: (Array i8)) -> (Vec i64)
+  (match (block-sequences z) (nil []) ((some ss) (vec (map (fn (s: Seq) (. s off)) ss)))))

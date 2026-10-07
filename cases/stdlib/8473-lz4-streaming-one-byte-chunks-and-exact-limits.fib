@@ -1,0 +1,19 @@
+;; spec: docs/design/compress.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; roots: ../../lib support
+;; A frame fed one byte at a time decodes to the input; a stream compressed in 1-byte pieces decodes; max-output is exact; a cut stream is truncated.
+(ns main (:use tl.check fib.compress.lz4.mem) (:require [fib.compress :as z] [fib.compress.lz4 :as lz4]))
+(defun main () -> i64
+  (let [c (checks) k (lz4/lz4) o (z/default-options)
+        d (str-bytes "streaming streaming streaming, one byte at a time, streaming streaming")]
+    (match (z/compress k d o)
+      ((Err _) 1)
+      ((Ok f)
+       (do (check c (match (z/decompress-chunks k o (z/split-sizes f [1])) ((Ok b) (bytes-eq b d)) ((Err _) false)))
+           (check c (match (z/compress-chunks k o (z/split-sizes d [1])) ((Ok g) (match (z/decompress k g o) ((Ok b) (bytes-eq b d)) ((Err _) false))) ((Err _) false)))
+           (check c (match (z/decompress k f (z/with-max-output o (array-len d))) ((Ok _) true) ((Err _) false)))
+           (check c (match (z/decompress k f (z/with-max-output o (- (array-len d) 1))) ((Err e) (= (. e kind) :too-large)) ((Ok _) false)))
+           (check c (match (z/decompress-chunks k o (z/split-sizes (array-copy f 0 (- (array-len f) 1)) [1])) ((Err e) (= (. e kind) :truncated)) ((Ok _) false)))
+           (checks-result c))))))

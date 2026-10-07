@@ -1,0 +1,110 @@
+;; fib.compress.ops: what a program calls (docs/design/compress.md 3). Every function takes the codec as its first argument (a driver's value, or a `(dyn Codec :send ..)`),
+;; so a library that needs compression takes one codec parameter and stays independent of the format. The one-shot calls check the options against the codec's capabilities
+;; BEFORE the codec sees them (an option the codec has no capability for is an `unsupported` error, never silently dropped), then delegate.
+(ns fib.compress.ops (:use fib.core fib.seq fib.coll fib.compress.types))
+
+(defun supports? (c: c cap: keyword) -> bool :where ((Codec c)) (some? (first (filter (fn (k: keyword) (= k cap)) (codec-capabilities c)))))
+(defun name-of (c: c) -> str :where ((Codec c)) (codec-name c))
+(defun max-compressed-size (c: c n: i64) -> i64 :where ((Codec c)) (codec-max-compressed-size c n))
+
+(defun need (c: c cap: keyword what: str) -> (Result unit CompressError) :where ((Codec c))
+  (if (supports? c cap) (Ok ()) (Err (unsupported (str (codec-name c) " has no " what)))))
+
+;; The options a caller cannot have honoured: a dictionary without :dictionary, a level other than the default without :levels, a size hint, a block size, independence
+;; changes, block checksums or content size on a codec whose capabilities lack them.
+(defun check-options (c: c o: Options) -> (Result unit CompressError) :where ((Codec c))
+  (let [d (default-options)]
+    (cond (< (. o max-output) 0) (Err (invalid-argument "max-output must not be negative"))
+          (and (> (array-len (. o dictionary)) 0) (not (supports? c :dictionary))) (need c :dictionary "dictionary support")
+          (and (not (= (. o level) (. d level))) (not (supports? c :levels))) (need c :levels "levels")
+          (and (. o record-size) (not (supports? c :content-size))) (need c :content-size "content size")
+          (and (not (. o checksum)) (not (supports? c :checksum))) (Ok ())
+          :else (Ok ()))))
+
+(defun compress (c: c data: (Array i8) o: Options) -> (Result (Array i8) CompressError) :where ((Codec c))
+  (match (check-options c o) ((Err e) (Err e)) ((Ok _) (codec-compress c data o))))
+
+(defun decompress (c: c data: (Array i8) o: Options) -> (Result (Array i8) CompressError) :where ((Codec c))
+  (match (check-options c o) ((Err e) (Err e)) ((Ok _) (codec-decompress c data o))))
+
+(defun compress-default (c: c data: (Array i8)) -> (Result (Array i8) CompressError) :where ((Codec c)) (compress c data (default-options)))
+(defun decompress-default (c: c data: (Array i8)) -> (Result (Array i8) CompressError) :where ((Codec c)) (decompress c data (default-options)))
+
+;; ---- streaming over a reader and a writer (closures: an fd, a Transport, a socket, an array: see fib.compress.fd). `read` returns the next chunk, EMPTY at the end
+;; of the input; `write` takes output. Memory is bounded by the codec's block size and the chunk the reader gives, not by the stream.
+(defun write-nonempty (write: (fn ((Array i8)) (Result unit CompressError)) b: (Array i8)) -> (Result unit CompressError)
+  (if (= (array-len b) 0) (Ok ()) (write b)))
+
+;; Bytes written, or the error. The compressor is finished whatever happens to the writer.
+(defun compress-stream (c: c o: Options read: (fn () (Result (Array i8) CompressError)) write: (fn ((Array i8)) (Result unit CompressError))) -> (Result i64 CompressError) :where ((Codec c))
+  (try-let [_ (check-options c o) k (codec-compressor c o)]
+    (loop [total 0]
+      (try-let [chunk (read)]
+        (if (= (array-len chunk) 0)
+          (try-let [out (compressor-finish k) _ (write-nonempty write out)] (Ok (+ total (array-len out))))
+          (try-let [out (compressor-feed k chunk) _ (write-nonempty write out)] (recur (+ total (array-len out)))))))))
+
+;; Output of the decompressor for the input so far, until it asks for input.
+(defun drain (k: k first: DecStep write: (fn ((Array i8)) (Result unit CompressError)) total: i64) -> (Result i64 CompressError) :where ((Decompressor k))
+  (try-let [_ (write-nonempty write (. first output))]
+    (let [t (+ total (array-len (. first output)))]
+      (if (. first needs-input) (Ok t)
+        (try-let [more (decompressor-feed k (array 0 0i8))] (drain k more write t))))))
+
+;; The decompressed bytes written, or the error. The end of the input must be the end of a frame (else :truncated).
+(defun decompress-stream (c: c o: Options read: (fn () (Result (Array i8) CompressError)) write: (fn ((Array i8)) (Result unit CompressError))) -> (Result i64 CompressError) :where ((Codec c))
+  (try-let [_ (check-options c o) k (codec-decompressor c o)]
+    (loop [total 0]
+      (try-let [chunk (read)]
+        (if (= (array-len chunk) 0)
+          (try-let [_ (decompressor-finish k)] (Ok total))
+          (try-let [step (decompressor-feed k chunk) t (drain k step write total)] (recur t)))))))
+
+;; ---- arrays as the two ends: for tests and for small data that arrives in pieces.
+(defun chunks-reader (chunks: (Vec (Array i8))) -> (fn () (Result (Array i8) CompressError))
+  (let [at (cell 0)]
+    (fn () (let [i @at] (if (>= i (count chunks)) (Ok (array 0 0i8)) (do (set! at (+ i 1)) (Ok (nth chunks i))))))))
+
+(defun concat-bytes (parts: (Vec (Array i8))) -> (Array i8)
+  (let [n (reduce (fn (a: i64 p: (Array i8)) (+ a (array-len p))) 0 parts) out (cell (array n 0i8))]
+    (do (loop [i 0 at 0] (when (< i (count parts)) (let [p (nth parts i)] (do (array-blit! &out at p 0 (array-len p)) (recur (+ i 1) (+ at (array-len p)))))))
+        @out)))
+
+;; Splits `data` into chunks of the given sizes (the last size repeats): the way the contract feeds one array in pieces.
+(defun split-sizes (data: (Array i8) sizes: (Vec i64)) -> (Vec (Array i8))
+  (let [n (array-len data)]
+    (loop [at 0 i 0 out: (Vec (Array i8)) []]
+      (if (>= at n) out
+        (let [sz (max 1 (nth sizes (min i (- (count sizes) 1))))
+              e (min n (+ at sz))]
+          (recur e (+ i 1) (conj out (array-copy data at e))))))))
+
+(defun compress-chunks (c: c o: Options chunks: (Vec (Array i8))) -> (Result (Array i8) CompressError) :where ((Codec c))
+  (let [out (cell (vec-empty))]
+    (try-let [_ (compress-stream c o (chunks-reader chunks) (fn (b: (Array i8)) (do (set! out (conj @out b)) (Ok ()))))]
+      (Ok (concat-bytes @out)))))
+
+(defun decompress-chunks (c: c o: Options chunks: (Vec (Array i8))) -> (Result (Array i8) CompressError) :where ((Codec c))
+  (let [out (cell (vec-empty))]
+    (try-let [_ (decompress-stream c o (chunks-reader chunks) (fn (b: (Array i8)) (do (set! out (conj @out b)) (Ok ()))))]
+      (Ok (concat-bytes @out)))))
+
+;; ---- the registry: a VALUE (a Map the caller builds), names to codecs; no global table.
+(defun registry (codecs: (Vec (dyn Codec :send))) -> (Map str (dyn Codec :send))
+  (reduce (fn (m: (Map str (dyn Codec :send)) k: (dyn Codec :send)) (assoc m (codec-name k) k)) {} codecs))
+
+(defun lookup (r: (Map str (dyn Codec :send)) name: str) -> (Option (dyn Codec :send)) (get r name))
+
+(defun starts-with-bytes? (data: (Array i8) magic: (Array i8)) -> bool
+  (and (> (array-len magic) 0) (>= (array-len data) (array-len magic))
+       (loop [i 0] (cond (>= i (array-len magic)) true (= (array-get data i) (array-get magic i)) (recur (+ i 1)) :else false))))
+
+;; The codec of a registry whose frame magic number starts `data`; the first in name order when two claim it. nil when none does.
+(defun detect (r: (Map str (dyn Codec :send)) data: (Array i8)) -> (Option (dyn Codec :send))
+  (first (filter (fn (k: (dyn Codec :send)) (some? (first (filter (fn (m: (Array i8)) (starts-with-bytes? data m)) (codec-magics k))))) (map (fn (n: str) (unwrap-or (get r n) (nth (vals r) 0))) (sort (keys r))))))
+
+;; Detects the format and decompresses with its codec: :unsupported when no codec in the registry knows the magic number.
+(defun decompress-auto (r: (Map str (dyn Codec :send)) data: (Array i8) o: Options) -> (Result (Array i8) CompressError)
+  (match (detect r data)
+    (nil (Err (unsupported "no codec in the registry recognises this data")))
+    ((some k) (decompress k data o))))
