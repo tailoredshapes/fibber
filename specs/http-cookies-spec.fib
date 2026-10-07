@@ -1,0 +1,112 @@
+;; The opt-in cookie jar (fib.http.cookies, RFC 6265): the date parser against known epoch seconds, Set-Cookie parsing as a table with a fixed clock, domain-, path-, Secure and
+;; expiry matching as a table, the jar's limits, and the client against a real local server: no jar means nothing stored and nothing sent, a jar stores and sends, paths scope,
+;; Max-Age=0 deletes, a cookie set by a redirecting response goes with the next hop, a header the caller set is not overridden. `fibc test specs/http-cookies-spec.fib`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.http.types fib.http.headers fib.http.bytes fib.http.cookies fib.http.client.types)
+  (:require [fib.http.client :as c] [fib.http.server :as sv] [fib.http.server.types :as st] [fib.string :as s]))
+
+(defstruct DateRow (text: str epoch: i64))
+(defun date-rows () -> (Vec DateRow)
+  [(DateRow "Sun, 06 Nov 1994 08:49:37 GMT" 784111777) (DateRow "Sunday, 06-Nov-94 08:49:37 GMT" 784111777) (DateRow "Sun Nov  6 08:49:37 1994" 784111777)
+   (DateRow "Thu, 01 Jan 1970 00:00:00 GMT" 0) (DateRow "06 Nov 94 08:49:37" 784111777) (DateRow "Mon, 29 Feb 2016 12:00:00 GMT" 1456747200)
+   (DateRow "Sat, 01 Jan 2000 00:00:00 GMT" 946684800) (DateRow "1 Jan 69 00:00:00" 3124224000) (DateRow "1 Jan 70 00:00:00" 0)
+   (DateRow "Sun, 06 Nov 1994" -1) (DateRow "garbage" -1) (DateRow "" -1) (DateRow "32 Nov 1994 08:49:37" -1) (DateRow "06 Nov 1994 24:49:37" -1)
+   (DateRow "06 Nov 1994 08:60:37" -1) (DateRow "06 Foo 1994 08:49:37" -1) (DateRow "06 Nov 1600 08:49:37" -1)])
+(defun date-diffs () -> str (str-join (mapv (fn (r: DateRow) (if (= (parse-date (. r text)) (. r epoch)) "" (str (pr-str (. r text)) " -> " (parse-date (. r text)) " wanted " (. r epoch) "\n"))) (date-rows))))
+
+(def now: i64 1000)
+(defstruct SetRow (text: str host: str path: str secure: bool want: str))
+(defun show (c: (Option Cookie)) -> str
+  (match c (nil "-") ((some x) (str (. x name) "=" (. x value) "|" (. x domain) "|" (. x host-only) "|" (. x path) "|" (. x secure) "|" (. x http-only) "|" (. x same-site) "|" (. x expires)))))
+(defun set-rows () -> (Vec SetRow)
+  [(SetRow "a=b" "www.example.com" "/x/y" true "a=b|www.example.com|true|/x|false|false||0")
+   (SetRow "a=b" "www.example.com" "/" true "a=b|www.example.com|true|/|false|false||0")
+   (SetRow "a=b" "WWW.Example.COM" "/x" true "a=b|www.example.com|true|/|false|false||0")
+   (SetRow "a=b; Domain=example.com; Path=/; Secure; HttpOnly; SameSite=Lax" "www.example.com" "/x" true "a=b|example.com|false|/|true|true|lax|0")
+   (SetRow "a=b; Domain=.Example.COM" "www.example.com" "/" true "a=b|example.com|false|/|false|false||0")
+   (SetRow "a=b; Domain=other.com" "www.example.com" "/" true "-") (SetRow "a=b; Domain=com" "example.com" "/" true "-")
+   (SetRow "a=b; Domain=www.example.com" "example.com" "/" true "-") (SetRow "a=b; Domain=0.0.1" "10.0.0.1" "/" true "-")
+   (SetRow "a=b; Secure" "example.com" "/" false "-") (SetRow "=v" "example.com" "/" true "-") (SetRow "novalue" "example.com" "/" true "-")
+   (SetRow "a=" "example.com" "/" true "a=|example.com|true|/|false|false||0") (SetRow "  a  =  b  " "example.com" "/" true "a=b|example.com|true|/|false|false||0")
+   (SetRow "a=b=c" "example.com" "/" true "a=b=c|example.com|true|/|false|false||0")
+   (SetRow "a=b; Max-Age=60" "example.com" "/" true "a=b|example.com|true|/|false|false||1060") (SetRow "a=b; Max-Age=0" "example.com" "/" true "a=b|example.com|true|/|false|false||1")
+   (SetRow "a=b; Max-Age=-5" "example.com" "/" true "a=b|example.com|true|/|false|false||1") (SetRow "a=b; Max-Age=abc" "example.com" "/" true "a=b|example.com|true|/|false|false||0")
+   (SetRow "a=b; Expires=Thu, 01 Jan 1970 00:00:10 GMT; Max-Age=60" "example.com" "/" true "a=b|example.com|true|/|false|false||1060")
+   (SetRow "a=b; Expires=Sun, 06 Nov 1994 08:49:37 GMT" "example.com" "/" true "a=b|example.com|true|/|false|false||784111777")
+   (SetRow "a=b; Expires=nonsense" "example.com" "/" true "a=b|example.com|true|/|false|false||0")
+   (SetRow "a=b; Path=nopath" "example.com" "/d/e" true "a=b|example.com|true|/d|false|false||0") (SetRow "a=b; Path=/p" "example.com" "/d/e" true "a=b|example.com|true|/p|false|false||0")
+   (SetRow "__Secure-a=b" "example.com" "/" true "-") (SetRow "__Secure-a=b; Secure" "example.com" "/" true "__Secure-a=b|example.com|true|/|true|false||0")
+   (SetRow "__Host-a=b; Secure; Path=/" "example.com" "/" true "__Host-a=b|example.com|true|/|true|false||0")
+   (SetRow "__Host-a=b; Secure; Path=/; Domain=example.com" "example.com" "/" true "-") (SetRow "__Host-a=b; Secure" "example.com" "/x" true "-")
+   (SetRow "a=b; Unknown=1; Another" "example.com" "/" true "a=b|example.com|true|/|false|false||0")])
+(defun set-diffs () -> str
+  (str-join (mapv (fn (r: SetRow) (let [got (show (parse-set-cookie (. r text) (. r host) (. r path) (. r secure) now))]
+    (if (= got (. r want)) "" (str (pr-str (. r text)) " from " (. r host) (. r path) ": got " got " wanted " (. r want) "\n")))) (set-rows))))
+(defun big-cookie () -> str (str "a=" (str-join (mapv (fn (i: i64) "x") (range 5000)))))
+
+(defstruct MatchRow (set: str scheme: str host: str path: str hit: bool))
+(defun match-rows () -> (Vec MatchRow)
+  [(MatchRow "a=b" "https" "example.com" "/" true) (MatchRow "a=b" "https" "www.example.com" "/" false)
+   (MatchRow "a=b; Domain=example.com" "https" "www.example.com" "/" true) (MatchRow "a=b; Domain=example.com" "https" "example.com" "/" true)
+   (MatchRow "a=b; Domain=example.com" "https" "badexample.com" "/" false) (MatchRow "a=b; Domain=example.com" "https" "example.com.evil.com" "/" false)
+   (MatchRow "a=b; Path=/foo" "https" "example.com" "/foo" true) (MatchRow "a=b; Path=/foo" "https" "example.com" "/foo/" true)
+   (MatchRow "a=b; Path=/foo" "https" "example.com" "/foo/bar" true) (MatchRow "a=b; Path=/foo" "https" "example.com" "/foobar" false)
+   (MatchRow "a=b; Path=/foo" "https" "example.com" "/" false) (MatchRow "a=b; Path=/foo/" "https" "example.com" "/foo/bar" true)
+   (MatchRow "a=b; Path=/foo/" "https" "example.com" "/foo" false) (MatchRow "a=b; Secure" "https" "example.com" "/" true)
+   (MatchRow "a=b; Secure" "http" "example.com" "/" false) (MatchRow "a=b" "http" "example.com" "/" true)
+   (MatchRow "a=b; Max-Age=60" "https" "example.com" "/" true)])
+(defun match-diffs () -> str
+  (str-join (mapv (fn (r: MatchRow) (match (parse-set-cookie (. r set) "example.com" "/" true now)
+    (nil (str (. r set) ": not parsed\n"))
+    ((some c) (if (= (applies? c (. r scheme) (. r host) (. r path) now) (. r hit)) "" (str (. r set) " vs " (. r scheme) "://" (. r host) (. r path) " expected " (. r hit) "\n"))))) (match-rows))))
+
+(defun expired-line () -> str
+  (match (parse-set-cookie "a=b; Max-Age=0" "example.com" "/" true now)
+    (nil "-") ((some c) (str (applies? c "https" "example.com" "/" now) " " (applies? c "https" "example.com" "/" 1) " " (applies? (with c (expires 1060)) "https" "example.com" "/" 1059) " " (applies? (with c (expires 1060)) "https" "example.com" "/" 1060)))))
+
+;; ---- the client against a local server
+(defun seen (r: Request) -> str (unwrap-or (header (. r headers) "cookie") "none"))
+(defun handler (r: Request) -> st/Reply
+  (let [u (. r uri)]
+    (cond (= u "/login") (st/Whole (Response 200 {"set-cookie" ["sid=abc; Path=/" "pref=dark; Path=/app; Max-Age=3600" "sec=1; Secure" "sid=abc2; Path=/"]} (str-bytes "in")))
+          (= u "/clear") (st/Whole (Response 200 {"set-cookie" ["sid=; Max-Age=0; Path=/"]} (str-bytes "out")))
+          (= u "/r1") (st/Whole (Response 302 {"set-cookie" ["hop=1; Path=/"] "location" ["/whoami"]} (array 0 0i8)))
+          :else (st/Whole (text-response 200 (seen r))))))
+(defun with-server (f: (fn (str) str)) -> str
+  (match (sv/run-server-reply handler (with (st/default-options) (port 0)))
+    ((Err e) (error-message e))
+    ((Ok srv) (let [out (f (str "http://127.0.0.1:" (sv/port srv)))] (do (sv/stop-server srv) out)))))
+(defun body (o: Options url: str headers: (Map str (Vec str))) -> str
+  (match (c/request (ClientRequest "GET" url headers (array 0 0i8)) o) ((Ok r) (str-from-bytes (. r body))) ((Err e) (str "ERR " (error-message e)))))
+(defun session (with-jar: bool) -> str
+  (with-server (fn (base: str)
+    (let [j (new-jar) o (with (if with-jar (with-cookies (default-options) j) (default-options)) (follow-redirects true))
+          a (body o (str base "/login") {}) b (body o (str base "/whoami") {}) d (body o (str base "/app/x") {}) e (body o (str base "/clear") {}) f (body o (str base "/app/x") {})
+          g (body o (str base "/r1") {}) h (body o (str base "/whoami") {"cookie" ["mine=1"]})]
+      (str-join [b "|" d "|" f "|" g "|" h "|" (str (count (jar-cookies j)))])))))
+(defun flood () -> (Pair i64 i64)
+  (let [j (new-jar)]
+    (do (dotimes (i 60) (store j "https" "example.com" "/" [(str "n" i "=v")]))
+        (dotimes (i 60) (store j "https" (str "h" i ".example.org") "/" ["z=v"]))
+        (Pair (count (filter (fn (c: Cookie) (= (. c domain) "example.com")) (jar-cookies j))) (count (jar-cookies j))))))
+
+(defspecs specs
+  (feature "dates"
+    (scenario (str (count (date-rows)) " cookie dates against known epoch seconds") (then (expect = "" (date-diffs)))))
+  (feature "Set-Cookie"
+    (scenario (str (count (set-rows)) " Set-Cookie values") (then (expect = "" (set-diffs))))
+    (scenario "a cookie over 4096 bytes is refused" (then (expect = "-" (show (parse-set-cookie (big-cookie) "example.com" "/" true now))))))
+  (feature "matching"
+    (scenario (str (count (match-rows)) " cookies against requests") (then (expect = "" (match-diffs))))
+    (scenario "an expired cookie never applies; one applies until the second it expires"
+      (then (expect = "false false true false" (expired-line)))))
+  (feature "the client"
+    (scenario "without a jar nothing is sent: the cookie header never appears"
+      (then (expect = "none|none|none|none|mine=1|0" (session false))))
+    (scenario "with a jar: sid and pref are stored, sec (Secure over http) is refused, path scopes pref, Max-Age=0 deletes sid, a redirect hop carries its own cookie, a caller's cookie header wins"
+      (then (expect = "sid=abc2|pref=dark; sid=abc2|pref=dark|hop=1|mine=1|2" (session true)))))
+  (feature "limits"
+    (scenario "at most 50 cookies per domain and 3000 in all, the oldest dropped"
+      (given [r (flood)])
+      (then (expect = 50 (. r fst)) (expect = 110 (. r snd))))))
+
+(defun main () -> i64 (run-main (specs)))

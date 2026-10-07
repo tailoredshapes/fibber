@@ -1,7 +1,7 @@
 ;; Descriptor-backed Transports over fib.os: plain TCP (connect, and the server's accepted sockets) and a pair of pipes (the in-memory duplex of tests,
 ;; real kernel buffers and real deadlines, no sockets). No extern here: names resolve and sockets move through fib.os.net.
 (ns fib.http.tcp (:use fib.core fib.seq fib.coll fib.http.types fib.http.transport)
-  (:require [fib.os.net :as net] [fib.os.io :as io] [fib.os.errors :as os] [fib.os.time :as time] [fib.http.native :as n]))
+  (:require [fib.dns :as dns] [fib.os.net :as net] [fib.os.io :as io] [fib.os.errors :as os] [fib.os.time :as time] [fib.http.native :as n]))
 (def far: i64 3600000000000)
 (defstruct Fd :private (rfd: i64 wfd: i64 deadline: (Cell i64) closed: (Cell bool) socket: bool stop: (Atom bool)))
 (defun map-os :private (e: os/OSError) -> Error
@@ -10,10 +10,16 @@
         :else (n/os-error e)))
 (defun limit :private (d: Fd) -> i64 (let [x @(. d deadline)] (if (= x 0) (+ (time/clock-now) far) x)))
 (defun retry? :private (e: os/OSError) -> bool (includes? (. e kind) [os/Interrupted os/WouldBlock]))
+(defun readable :private (d: Fd) -> (Result unit os/OSError)
+  (if (> (limit d) (time/clock-now)) (net/wait-readable (. d rfd) (limit d) (. d stop))
+    (match (net/ready? (. d rfd) false 0)
+      ((Ok true) (Ok ()))
+      ((Ok false) (Err (os/timeout-error "read")))
+      ((Err e) (Err e)))))
 (defun fd-read :private (d: Fd n: i64) -> (Result (Array i8) Error)
   (if @(. d closed) (Err Closed)
     (loop []
-      (match (net/wait-readable (. d rfd) (limit d) (. d stop))
+      (match (readable d)
         ((Err e) (Err (map-os e)))
         ((Ok _) (match (io/read-fd (. d rfd) n)
           ((Ok bytes) (Ok bytes))
@@ -71,6 +77,16 @@
 (defun addresses (host: str) -> (Result (Vec str) Error)
   (if (ip-literal? host) (Ok [host])
     (match (net/resolve-host host) ((Ok xs) (Ok xs)) ((Err e) (Err (DnsError (str host ": " (. e message))))))))
+(defun native-resolve :private (r: dns/Resolver host: str) -> (Result (Vec str) Error)
+  (match (dns/resolve-host r host) ((Ok xs) (Ok xs)) ((Err e) (Err (DnsError (str host ": " (. e message)))))))
+;; How names become addresses: the native resolver of fib.dns (the default: no getaddrinfo, no NSS, works in a static binary in a scratch image),
+;; the platform's getaddrinfo (:resolver :system: for hosts whose names live in NSS only, mDNS or LDAP), or a function of the caller's.
+(defenum ResolverMode NativeDns SystemResolver (CustomResolver f: (fn :send (str) (Result (Vec str) Error))))
+(defun resolve-fn (mode: ResolverMode) -> (fn :send (str) (Result (Vec str) Error))
+  (match mode
+    ((NativeDns) (let [r (dns/system-resolver)] (fn (h: str) (native-resolve r h))))
+    ((SystemResolver) (fn (h: str) (addresses h)))
+    ((CustomResolver f) f)))
 (defun connect-error :private (e: os/OSError host: str port: i64) -> Error
   (if (= (. e kind) os/TimedOut) (Timeout "connect" (str host ":" port))
       (ConnectError (str host ":" port ": " (. e message)))))
@@ -82,9 +98,14 @@
           (match (net/connect-tcp (nth xs i) port (min ms 3600000))
             ((Ok fd) (Ok fd))
             ((Err e) (recur (+ i 1) (connect-error e host port)))))))))
-(defun connect (host: str port: i64 connect-timeout-ms: i64) -> (Result Transport Error)
+(defun connect-via (resolve: (fn :send (str) (Result (Vec str) Error)) host: str port: i64 connect-timeout-ms: i64) -> (Result Transport Error)
   (let [deadline (+ (time/clock-now) (* (max 1 (if (= connect-timeout-ms 0) 3600000 connect-timeout-ms)) 1000000))]
-    (try-let [xs (addresses host) fd (connect-any xs host port deadline)]
+    (try-let [xs (resolve host) fd (connect-any xs host port deadline)]
       (Ok (socket-transport fd (str host ":" port) (atom false))))))
+;; Connects with the native resolver and no cache (a resolver per call). The client's own dial (Target.dial) shares one resolver and its cache.
+(defun connect (host: str port: i64 connect-timeout-ms: i64) -> (Result Transport Error)
+  (connect-via (resolve-fn NativeDns) host port connect-timeout-ms))
+(defun dialer (resolve: (fn :send (str) (Result (Vec str) Error))) -> (fn :send (str i64 i64) (Result Transport Error))
+  (fn (h: str p: i64 ms: i64) (connect-via resolve h p ms)))
 (defun tcp-factory () -> Factory
-  (Factory "tcp" (fn (t: Target) (connect (. t host) (. t port) (. t connect-timeout-ms)))))
+  (Factory "tcp" (fn (t: Target) ((. t dial) (. t host) (. t port) (. t connect-timeout-ms)))))

@@ -53,55 +53,79 @@
                       (if (or (< cmp 0) (and (= cmp 0) (= (bit-and s 1) 0))) s t)))))))))
 
 (defun digit-count (f: i64) -> i64
-  (loop [n 1 p 10] (if (or (>= n 19) (< f p)) n (recur (+ n 1) (* p 10)))))
+  (cond (< f 100000000) (cond (< f 10000) (cond (< f 100) (if (< f 10) 1 2) (< f 1000) 3 :else 4)
+                              (< f 1000000) (if (< f 100000) 5 6)
+                              :else (if (< f 10000000) 7 8))
+        (< f 10000000000000000) (cond (< f 1000000000000) (cond (< f 10000000000) (if (< f 1000000000) 9 10) (< f 100000000000) 11 :else 12)
+                                      (< f 100000000000000) (if (< f 10000000000000) 13 14)
+                                      :else (if (< f 1000000000000000) 15 16))
+        :else (if (< f 100000000000000000) 17 18)))
 
-(defun pow10-int (n: i64) -> i64 (loop [i 0 p 1] (if (= i n) p (recur (+ i 1) (* p 10)))))
+(defun ten-pow (n: i64) -> i64
+  (loop [i 0 p 1] (if (= i n) p (recur (+ i 1) (* p 10)))))
 
-;; The digits of f (n of them) as bytes into the buffer.
-(defun put-digits (&buf: (Array i8) &len: i64 f: i64 n: i64) -> unit
-  (let [tmp (cell (array 20 0i8))]
-    (do (loop [i (- n 1) x f] (when (>= i 0) (do (array-set! &tmp i (trunc i8 (+ 48 (rem x 10)))) (recur (- i 1) (quot x 10)))))
-        (loop [i 0] (when (< i n) (do (put-raw &buf &len (zext i64 (array-get @tmp i))) (recur (+ i 1))))))))
+;; ---- the text, written straight to memory (JSON-3): a float is at most 25 bytes, so the caller has room for 32 and nothing here checks. Position in, position out.
 
-(defun put-zeros (&buf: (Array i8) &len: i64 n: i64) -> unit (loop [i 0] (when (< i n) (do (put-raw &buf &len 48) (recur (+ i 1))))))
+(defun dput (p: ptr at: i64 c: i64) -> unit (unsafe (store-i8 (ptr+ p at) (trunc i8 c))))
 
-;; The n digits of v, with leading zeros.
-(defun put-digits-padded (&buf: (Array i8) &len: i64 v: i64 n: i64) -> unit (put-digits &buf &len v n))
+;; The `width` digits of v >= 0 (leading zeros kept) at p+at, last digit last, two digits at a time from the table of the hundred pairs.
+(defun dig-write (p: ptr at: i64 width: i64 v: i64) -> unit
+  (loop [k (+ at (- width 1)) x v w width]
+    (cond (>= w 2) (let [q (quot x 100) r (- x (* q 100))]
+                     (do (dput p k (zext i64 (str-byte-at digit-pairs (+ (* r 2) 1))))
+                         (dput p (- k 1) (zext i64 (str-byte-at digit-pairs (* r 2))))
+                         (recur (- k 2) q (- w 2))))
+          (= w 1) (dput p k (+ 48 x))
+          :else ())))
 
-;; f (no trailing zeros, n digits) times 10^k, as JSON text.
-(defun put-decimal (&buf: (Array i8) &len: i64 f: i64 n: i64 k: i64) -> unit
+;; f (no trailing zeros, n digits) times 10^k as JSON text at p+at: plain notation for decimal exponents -5 to 16, else d.ddde[-]x.
+(defun dtoa-decimal (p: ptr at: i64 f: i64 n: i64 k: i64) -> i64
   (let [e (+ k (- n 1))]
-    (do (ensure &buf &len 40)
-        (cond (and (>= e 0) (< e 17))
-              (if (<= n (+ e 1))
-                  (do (put-digits &buf &len f n) (put-zeros &buf &len (- (+ e 1) n)) (put-raw &buf &len 46) (put-raw &buf &len 48))
-                  (let [ip (quot f (pow10-int (- n (+ e 1))))
-                        fp (- f (* ip (pow10-int (- n (+ e 1)))))]
-                    (do (put-digits &buf &len ip (+ e 1)) (put-raw &buf &len 46) (put-digits-padded &buf &len fp (- n (+ e 1))))))
-              (and (< e 0) (>= e -5))
-              (do (put-raw &buf &len 48) (put-raw &buf &len 46) (put-zeros &buf &len (- (- 0 e) 1)) (put-digits &buf &len f n))
-              :else
-              (let [lead (quot f (pow10-int (- n 1)))
-                    rest (- f (* lead (pow10-int (- n 1))))
-                    ae (if (< e 0) (- 0 e) e)]
-                (do (put-raw &buf &len (+ 48 lead))
-                    (when (> n 1) (do (put-raw &buf &len 46) (put-digits-padded &buf &len rest (- n 1))))
-                    (put-raw &buf &len 101)
-                    (when (< e 0) (put-raw &buf &len 45))
-                    (put-digits &buf &len ae (digit-count ae))))))))
+    (cond (and (>= e 0) (< e 17))
+          (if (<= n (+ e 1))
+              (do (dig-write p at n f)
+                  (loop [i (+ at n)] (if (< i (+ at (+ e 1))) (do (dput p i 48) (recur (+ i 1)))
+                                         (do (dput p i 46) (dput p (+ i 1) 48) (+ i 2)))))
+              (let [fl (- n (+ e 1))
+                    d (ten-pow fl)
+                    ip (quot f d)]
+                (do (dig-write p at (+ e 1) ip)
+                    (dput p (+ at (+ e 1)) 46)
+                    (dig-write p (+ at (+ e 2)) fl (- f (* ip d)))
+                    (+ at (+ n 1)))))
+          (and (< e 0) (>= e -5))
+          (do (dput p at 48) (dput p (+ at 1) 46)
+              (loop [i (+ at 2)] (if (< i (+ at (- 1 e))) (do (dput p i 48) (recur (+ i 1)))
+                                     (do (dig-write p i n f) (+ i n)))))
+          :else
+          (let [d (ten-pow (- n 1))
+                lead (quot f d)
+                ae (if (< e 0) (- 0 e) e)
+                a1 (if (> n 1) (do (dput p (+ at 1) 46) (dig-write p (+ at 2) (- n 1) (- f (* lead d))) (+ at (+ n 1))) (+ at 1))]
+            (do (dput p at (+ 48 lead))
+                (dput p a1 101)
+                (let [a2 (if (< e 0) (do (dput p (+ a1 1) 45) (+ a1 2)) (+ a1 1))
+                      nd (digit-count ae)]
+                  (do (dig-write p a2 nd ae) (+ a2 nd))))))))
 
-(defun put-f64 (&buf: (Array i8) &len: i64 x: f64) -> unit
+;; x as JSON text at p (32 bytes of room): the length. A NaN or an infinity is `null`.
+(defun dtoa-raw (p: ptr x: f64) -> i64
   (if (!= (- x x) 0.0)
-      (put-str &buf &len "null")
+      (do (unsafe (store-i32 p 1819047278i32)) 4)
       (let [bits (f64->bits x)
             neg (< bits 0)
             mag (bit-and bits mask63)
             bq (shr mag 52)
-            frac (bit-and mag 4503599627370495)]
-        (do (when neg (put-byte &buf &len 45))
-            (if (= mag 0)
-                (put-str &buf &len "0.0")
-                (let [kc (cell 0)
-                      f0 (if (= bq 0) (to-decimal frac -1074 &kc) (to-decimal (bit-or frac 4503599627370496) (- bq 1075) &kc))
-                      fk (loop [f f0 k @kc] (if (= (rem f 10) 0) (recur (quot f 10) (+ k 1)) (Pair f k)))]
-                  (put-decimal &buf &len (. fk fst) (digit-count (. fk fst)) (. fk snd))))))))
+            frac (bit-and mag 4503599627370495)
+            at (if neg (do (dput p 0 45) 1) 0)]
+        (if (= mag 0)
+            (do (dput p at 48) (dput p (+ at 1) 46) (dput p (+ at 2) 48) (+ at 3))
+            (let [kc (cell 0)
+                  f0 (if (= bq 0) (to-decimal frac -1074 &kc) (to-decimal (bit-or frac 4503599627370496) (- bq 1075) &kc))
+                  fc (cell f0)]
+              (do (loop [] (when (= (rem @fc 10) 0) (do (set! fc (quot @fc 10)) (set! kc (+ @kc 1)) (recur))))
+                  (dtoa-decimal p at @fc (digit-count @fc) @kc)))))))
+
+(defun put-f64 (&buf: (Array i8) &len: i64 x: f64) -> unit
+  (do (ensure &buf &len 32)
+      (set! len (+ @len (dtoa-raw (unsafe (ptr+ (raw @buf) (+ 24 @len))) x)))))

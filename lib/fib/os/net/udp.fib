@@ -1,0 +1,68 @@
+;; Connected UDP sockets for a native resolver (fib.dns): one socket per exchange, connect()ed to the server so the kernel itself drops datagrams from any other
+;; address or port, one datagram out, one datagram in under a deadline. The port of a fresh socket is the kernel's choice (Linux and Darwin randomise it per socket).
+(ns fib.os.net.udp (:use fib.core fib.os.errors)
+  (:require [fib.os.native :as n] [fib.os.abi :as a] [fib.os.backend :as b] [fib.os.io :as io] [fib.os.time :as time]
+            [fib.os.net.address :as addr] [fib.os.net.poll :as p]))
+(extern connect :private (i32 ptr i32) -> i32)
+(extern send :private (i32 ptr i64 i32) -> i64)
+(extern recv :private (i32 ptr i64 i32) -> i64)
+(defun connect-fd :private (fd: i64 host: str port: i64) -> (Result unit OSError)
+  (unsafe (let [address (alloc 128)]
+    (let [result (try-let [length (addr/encode host port address)]
+                   (let [r (connect (trunc i32 fd) address (trunc i32 length)) saved (n/errno)]
+                     (if (= r 0i32) (Ok ()) (Err (error-from-code saved "connect")))))]
+      (do (free address) result)))))
+;; A datagram socket connected to host:port (a numeric address). The caller closes it with fib.os.io/close-fd.
+(defun udp-open (host: str port: i64) -> (Result i64 OSError)
+  (if (or (not (n/valid-text? host)) (< port 1) (> port 65535)) (Err (invalid-input "connect" "invalid UDP peer"))
+    (try-let [fd (checked (b/socket-new-datagram (addr/family host)) "socket")]
+      (match (connect-fd fd host port) ((Ok _) (Ok fd)) ((Err e) (do (io/close-fd fd) (Err e)))))))
+(defun udp-send (fd: i64 bytes: (Array i8)) -> (Result unit OSError)
+  (if (or (= (array-len bytes) 0) (> (array-len bytes) 65507)) (Err (invalid-input "send" "invalid datagram size"))
+    (let [buffer (n/bytes-new bytes)
+          r (unsafe (send (trunc i32 fd) buffer (array-len bytes) (trunc i32 (. a/host no-signal)))) saved (n/errno)]
+      (unsafe (do (free buffer) (if (< r 0) (Err (error-from-code saved "send")) (Ok ())))))))
+;; The next datagram (at most max-bytes of it; a longer one is cut by the kernel) or a timeout error when the absolute deadline (fib.os.time/clock-now ns) passes.
+(defun udp-recv (fd: i64 max-bytes: i64 deadline: i64 stop: (Atom bool)) -> (Result (Array i8) OSError)
+  (if (or (< max-bytes 1) (> max-bytes 65535)) (Err (invalid-input "recv" "invalid datagram bound"))
+    (try-let [_ (p/wait-readable fd deadline stop)]
+      (unsafe (let [buffer (alloc max-bytes) r (recv (trunc i32 fd) buffer max-bytes 0i32) saved (n/errno)
+                    out (if (< r 0) (Err (error-from-code saved "recv")) (Ok (n/bytes-at buffer r)))]
+        (do (free buffer) out))))))
+
+;; The server side (a fake server in a spec, a stub resolver): an unconnected datagram socket bound to host:port (port 0 picks one), the datagram and its sender, a reply to a sender.
+(extern bind :private (i32 ptr i32) -> i32)
+(extern getsockname :private (i32 ptr ptr) -> i32)
+(extern sendto :private (i32 ptr i64 i32 ptr i32) -> i64)
+(extern recvfrom :private (i32 ptr i64 i32 ptr ptr) -> i64)
+(defstruct UdpBound (fd: i64 port: i64))
+(defstruct Datagram (bytes: (Array i8) peer: str port: i64))
+(defun bound-port :private (fd: i64) -> (Result i64 OSError)
+  (unsafe (let [address (alloc 128) size (alloc 4)]
+    (do (store-i32 size 128i32)
+      (let [r (getsockname (trunc i32 fd) address size) saved (n/errno) port (addr/port-at address)]
+        (do (free size) (free address) (if (< r 0i32) (Err (error-from-code saved "getsockname")) (Ok port))))))))
+(defun bind-fd :private (fd: i64 host: str port: i64) -> (Result unit OSError)
+  (unsafe (let [address (alloc 128)]
+    (let [result (try-let [length (addr/encode host port address)]
+                   (let [r (bind (trunc i32 fd) address (trunc i32 length)) saved (n/errno)] (if (= r 0i32) (Ok ()) (Err (error-from-code saved "bind")))))]
+      (do (free address) result)))))
+(defun udp-bind (host: str port: i64) -> (Result UdpBound OSError)
+  (if (or (not (n/valid-text? host)) (< port 0) (> port 65535)) (Err (invalid-input "bind" "invalid UDP address"))
+    (try-let [fd (checked (b/socket-new-datagram (addr/family host)) "socket")]
+      (match (bind-fd fd host port)
+        ((Err e) (do (io/close-fd fd) (Err e)))
+        ((Ok _) (match (bound-port fd) ((Err e) (do (io/close-fd fd) (Err e))) ((Ok actual) (Ok (UdpBound fd actual)))))))))
+(defun udp-recv-from (fd: i64 max-bytes: i64 deadline: i64 stop: (Atom bool)) -> (Result Datagram OSError)
+  (try-let [_ (p/wait-readable fd deadline stop)]
+    (unsafe (let [buffer (alloc max-bytes) address (alloc 128) size (alloc 4)]
+      (do (store-i32 size 128i32)
+        (let [r (recvfrom (trunc i32 fd) buffer max-bytes 0i32 address size) saved (n/errno)
+              out (if (< r 0) (Err (error-from-code saved "recvfrom")) (Ok (Datagram (n/bytes-at buffer r) (addr/peer-at address) (addr/port-at address))))]
+          (do (free size) (free address) (free buffer) out)))))))
+(defun udp-send-to (fd: i64 bytes: (Array i8) host: str port: i64) -> (Result unit OSError)
+  (unsafe (let [address (alloc 128) buffer (n/bytes-new bytes)]
+    (let [result (try-let [length (addr/encode host port address)]
+                   (let [r (sendto (trunc i32 fd) buffer (array-len bytes) (trunc i32 (. a/host no-signal)) address (trunc i32 length)) saved (n/errno)]
+                     (if (< r 0) (Err (error-from-code saved "sendto")) (Ok ()))))]
+      (do (free buffer) (free address) result)))))

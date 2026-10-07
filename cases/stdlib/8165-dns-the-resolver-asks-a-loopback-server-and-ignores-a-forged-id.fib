@@ -1,0 +1,33 @@
+;; spec: docs/design/dns.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll fib.dns)
+  (:require [fib.dns.decode :as dec] [fib.dns.encode :as enc] [fib.os.net :as net] [fib.os.io :as io] [fib.os.time :as time]))
+;; a one-purpose server: for each of its two queries (A and AAAA of x.test) it sends a FORGED answer (the wrong ID, with 6.6.6.6) and then the real one
+(defun answer (q: Message wrong-id: bool) -> Message
+  (let [qq (nth (. q questions) 0) a? (= (. qq qtype) 1)]
+    (Message (if wrong-id (bit-and (+ (. q id) 1) 65535) (. q id)) (make-flags true true false 0) (. q questions)
+             (if wrong-id [(Rr "x.test" 1 1 60 (RdA "6.6.6.6"))] (if a? [(Rr "x.test" 1 1 60 (RdA "9.9.9.9"))] [])) (if (or wrong-id a?) [] [(Rr "test" 6 1 60 (RdSoa 60))]) [])))
+(defun send (fd: i64 m: Message dg: net/Datagram) -> unit (match (enc/encode m) ((Ok b) (do (net/udp-send-to fd b (. dg peer) (. dg port)) ())) ((Err _) ())))
+(defun serve (fd: i64) -> i64
+  (loop [n 0]
+    (if (= n 2) 0
+      (match (net/udp-recv-from fd 4096 (+ (time/clock-now) 3000000000) (atom false))
+        ((Err _) 1)
+        ((Ok dg) (match (dec/decode (. dg bytes))
+          ((Err _) 2)
+          ((Ok q) (do (send fd (answer q true) dg) (send fd (answer q false) dg) (recur (+ n 1))))))))))
+(defun main () -> i64
+  (let [c (checks)]
+    (match (net/udp-bind "127.0.0.1" 0)
+      ((Err _) 1)
+      ((Ok u) (let [fd (. u fd) t (spawn (fn () (serve fd)))
+                    r (new-resolver (default-dns-config (ResolvConf [(Server "127.0.0.1" (. u port))] [] 1 1500 1) []))
+                    out (resolve-name r "x.test") served (join t)]
+                (do (io/close-fd fd)
+                    (check c (= served 0))
+                    (check c (match out ((Ok xs) (= xs ["9.9.9.9"])) (_ false)))
+                    (checks-result c)))))))

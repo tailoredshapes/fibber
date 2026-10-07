@@ -1,0 +1,20 @@
+;; spec: docs/design/dns.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll fib.dns.types) (:require [fib.dns.encode :as enc] [fib.dns.decode :as dec]))
+(defun main () -> i64
+  (let [c (checks)
+        m (Message 4660 33152 [(Question "www.example.com" 1 1)]
+            [(Rr "www.example.com" 5 1 300 (RdCname "web.example.com")) (Rr "web.example.com" 1 1 60 (RdA "93.184.216.34")) (Rr "web.example.com" 28 1 60 (RdAAAA "2606:2800:220:1::248"))]
+            [(Rr "example.com" 6 1 0 (RdSoa 900))] [(Rr "" 41 4096 0 (RdRaw []))])]
+    (do (match (enc/encode m)
+          ((Err _) (check c false))
+          ((Ok b) (do (check c (= (dec/decode b) (Ok m)))
+                      ;; compression: the second and third name are two-byte pointers, so the message is much shorter than the names written out
+                      (check c (= (array-len b) 140))
+                      (check c (= (array-get b 0) 18i8)) (check c (= (array-get b 1) 52i8)))))
+        (check c (match (enc/encode (Message 1 0 [(Question "a..b" 1 1)] [] [] [])) ((Err _) true) (_ false)))
+        (checks-result c))))

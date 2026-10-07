@@ -1,0 +1,21 @@
+;; scripts/bench/json/mt-mode.fib FILE: DOM parse and drop in a loop before and after one pmap-range: what the multi-thread mode of the runtime costs a program that is back to one thread (docs/design/allocator.md section 10).
+(ns main (:use fib.core fib.seq fib.coll fib.parallel fib.json.types fib.json.domfast))
+
+(defun dom (s: str) -> i64 (match (parse-fast-default s) ((Ok v) (match v ((JObj ks _) (count ks)) ((JArr xs) (count xs)) (_ 1))) ((Err _) -1)))
+
+(defun bench (name: str s: str reps: i64) -> unit
+  (let [t0 (sys-clock-now)
+        r (loop [k 0 a 0] (if (< k reps) (recur (+ k 1) (+ a (dom s))) a))
+        t1 (sys-clock-now)]
+    (println name "check" r "MB/s" (/ (* (double (* reps (str-len s))) 1000.0) (double (- t1 t0))))))
+
+(defun main () -> i64
+  (let [a (args)]
+    (if-some [s (read-file (nth a 0))]
+      (do (bench "single-thread mode" s 40)
+          (bench "single-thread mode" s 40)
+          (let [r (pmap-range [i 4] (* i i))] (println "pool started" (count r)))
+          (bench "after a pmap (multi-thread mode)" s 40)
+          (bench "after a pmap (multi-thread mode)" s 40)
+          0)
+      1)))

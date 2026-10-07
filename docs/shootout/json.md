@@ -5,6 +5,69 @@ every fibber figure the median of 5 runs, every competitor's figure the median o
 for serialise). **The box this was developed on is shared and noisy (load average 12 to 30 while I worked); the table is from the owner's Ryzen 7 5800X (WSL, 16 threads,
 quiet, freshly started: Jackson's JIT had little warm-up there, see the note).** The same run on the development box (i7-14700KF, quiet at the time) is in the last section.
 
+## JSON-3: the writer, the cache, the Doc, streams (AMD Ryzen 7 5800X, WSL2, 16 threads, quiet; 2026-10-07)
+
+Same harness and corpora as JSON-2 (`scripts/bench/json/run.sh`; `fibber-bench` modes added: `docwrite minify encode encodedom linesmap lineslazy`), fibber-bench built with `FIB_TARGET_CPU=x86-64-v3` by a stage 2 built from this tree,
+**default allocator, no environment**, median of 5 (NDJSON: median of 3), `ulimit -v 16000000`. The competitors were run again in the same session on the same box (Jackson 2.17.2 / Java 21, Python 3.14, simdjson 5.0.2 haswell);
+orjson is not installable there (no pip, no system installs) and is the dev box's venv, run noisily on the shared dev box (its quiet-run figures of JSON-2 are in brackets).
+
+| MB/s | twitter | citm_catalog | canada |
+|---|---:|---:|---:|
+| **tape** JSON-2 default / JSON-3 | 908 / **1 742** | 1 175 / **2 289** | 652 / **1 085** |
+| tape + 3 fields by path, JSON-2 / JSON-3 | 908 / 1 735 | | |
+| typed decode (3 records), JSON-2 / JSON-3 | 826 / **1 506** (86 percent of the tape) | | |
+| **DOM parse** JSON-2 / JSON-3 | 352 / **445** | 468 / **565** | 175 / **191** |
+| Jackson `readTree` | 549 | 836 | 98.5 |
+| Python `json.loads` | 287 | 321 | 102.5 |
+| orjson (dev box) | 752 (795) | 775 (868) | 361 (557) |
+| simdjson DOM | 3 788 | 4 422 | 1 420 |
+| **serialise from a `Json`** JSON-2 / JSON-3 | 330 / **861** | 271 / **547** | 98 / **229** |
+| Jackson `writeValueAsBytes` | 767 | 448 | 248 |
+| Python `json.dumps` | 447 | 208 | 58 |
+| orjson (dev box) | 2 973 (3 020) | 1 246 (1 500) | 1 123 (1 079) |
+| **a Doc written back (`doc-write`, tape built once)** | **2 123** | **1 578** | **2 746** |
+| **minify: tape + `doc-write` per document** | 1 033 | 1 543 | 728 |
+| typed encode of the 100-status Timeline, no DOM (`encode-Timeline`) / via `ToJson` and the DOM writer | 1 524 / 553 | | |
+
+| NDJSON, 100 MB (99 lines of about 1 MB, Ryzen, 16 threads), MB/s | JSON-2 | JSON-3 |
+|---|---:|---:|
+| `reduce-lines` (sequential) | 98.7 | 120.6 |
+| `reduce-lines-par` (a DOM per line on all cores, results kept) | 100.6 | 119 |
+| `reduce-lines-par-map` (the DOM is made and dropped in the task) | | **169** |
+| `lines-seq` (lazy `LSeq`, sequential) | | 70 |
+| `validate-lines` (tape per line, all cores) | 1 599 | 1 604 |
+| simdjson `load_many` / Python line loop / Jackson line loop | 658 | 377 / 90 / 66 |
+
+On the dev box with 21 433 lines of 5 KB (twitter's statuses, 100 MB, 28 threads, non-ASCII text, best of 5, noisy): `reduce-lines` 180, `reduce-lines-par` 179 (141 before), `reduce-lines-par-map` 409 (207 before the work moved into the task), `lines-seq` 126,
+`validate-lines` 2 480. The parallel parse itself runs at 1.3 to 1.5 GB/s of input there (a scratch program: parse and count in the task, not in the tree); the rest is the one thread that reads (1 GB/s through `os/read-fd`) and, with results kept, frees.
+
+**Against the targets** (set before JSON-3):
+
+- *DOM at least Jackson on twitter and citm*: **not met**: 445 and 565 against 549 and 836 (81 and 68 percent). Canada: ahead of Jackson (191 against 98.5). The DOM is one heap object per value and about 20 ns to make and drop each; `docs/design/json.md` section 7 says why a
+  `parse` that returns `Json` stops near here. The Doc (tape) path of the same document is 1.7 to 2.3 GB/s, 3 to 4 times Jackson's DOM.
+- *Writer at least 1 GB/s on string-heavy data and at least Jackson everywhere*: from a `Json`: 861 on twitter (not 1 GB/s), ahead of Jackson on twitter (767) and citm (448 against 547), **below it on canada (229 against 248)**; from a Doc: 1.6 to 2.7 GB/s on all three; typed: 1.5 GB/s. orjson is 2.5 to 4 times faster on twitter and 5 times on canada.
+- *Typed decode at least tape speed*: **not met**: 1 506 against 1 742 (86 percent; JSON-2: 91 percent). Both rose by the same allocator fix; the decoder finds each field by a scan of its object.
+- *Parallel NDJSON DOM scaling*: met when the work is done in the task (`reduce-lines-par-map`: 169 against 120 on 1 MB lines, 2.3 times on 5 KB lines on the dev box); **not met** when the results are kept for the caller (`reduce-lines-par`:
+  the one thread that folds also frees every DOM, and in multi-thread mode every allocation is a `malloc`; docs/design/allocator.md section 10).
+
+### What each lever gave (Ryzen, default allocator)
+
+| lever | before | after | note |
+|---|---|---|---|
+| 5 index and write buffer from the large-block cache (arrays, not malloc) | tape 900 / 1 164 / 652, write 330 / 271 / 98, DOM 352 / 468 / 175 | tape 1 770 / 2 268 / 1 090, write 704 / 558 / 119, DOM 437 / 546 / 193 | the "tuned allocator" column of JSON-2 without the environment; dev box: no change (glibc there does not fault so dearly) |
+| 1 float printing to memory, `all-plain?`, key and separator in one check | write 704 / 558 / 119 | 778 / 569 / 234 (861 / 547 / 229 in the final build) | canada is 111 000 floats: 135 to 265 MB/s on the dev box from printing alone |
+| 1 `doc-write` (tape to text, no `Json`) | | 2 123 / 1 578 / 2 746 | output bounded by the source, so the buffer is made once |
+| 1 `encode-NAME` (defjson, no DOM) | 553 via `ToJson` | 1 524 | position-passing writers; the first version over the cell-based buffer ran at 531 on the dev box, the position-passing one at 720 against 423 |
+| utf8 validator of the runtime: ASCII words, two- and three-byte sequences inline | `str-from-bytes` of 32 MB: 218 ms | 20 ms (ASCII) | `read-file` and every `str-from-bytes` get it; NDJSON `reduce-lines` 98.7 to 120.6 |
+| 5 NDJSON in parallel | 100.6 | 119 (results kept), 169 (work in the task) | 4 MB reads (32 MB reads stalled for 100 ms on fresh huge-page mappings), lines found in the bytes, each task copies, validates and parses its own |
+
+**What lost or did nothing**: replacing `wlit` by one 32-bit store for `null`, `true`, `false` (8.07 against 8.10 ns per null: kept, it is simpler); the DOM walk is not the writer's cost (`nth` and `match` over the whole twitter DOM run at 5.4 GB/s of input text, so
+the 8 ns per value of the writer are the stores and the room checks); `wsep` and `wkey` alone moved nothing outside the noise of the shared dev box (kept with the float printing, measured together on the Ryzen); a 32 MB read per NDJSON chunk
+(100 to 350 ms for one `read-fd`; 4 MB reads run at 1 GB/s); the multi-thread allocator was not changed.
+`perf` is still blocked: the decisions are from experiments that remove one piece at a time. Not measured: the Mac (the SIMD-free new code is the same on aarch64; no run), the dev-box and Ryzen figures of the lazy `lines-seq` beyond the two above (it validates each read twice, in the library to answer an `Err` and in `str-from-bytes`).
+
+Commands: `fibber-bench dom|tape|write|docwrite|minify|typed|three|encode|encodedom FILE REPS`, `fibber-bench lines|linespar|linesmap|lineslazy|validatepar big.ndjson SIZE`, `scripts/bench/json/mt-mode.fib FILE` (the multi-thread mode).
+
 ## JSON-2: making it fast (AMD Ryzen 7 5800X, WSL2, 16 threads, quiet; 2026-10-06)
 
 Same corpora, same harness (`scripts/bench/json/run.sh`, single thread, `ulimit -v 16000000`, median of 5), fibber-bench built with `FIB_TARGET_CPU=x86-64-v3` from this tree by a stage 2 built

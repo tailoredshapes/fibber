@@ -119,6 +119,8 @@ every other producer (`array-alloc`, `array-slice`, `fib.vec-drop`, the bulk bui
 tail array instead of `len*esize`; the tail array is already re-allocated on every `conj` today. The tail never grows past 32, so a
 fixed 32 is the whole rule; a general capacity (doubling) is not needed and not proposed.
 
+**Growth past 32 (LIBFIX-1).** The paragraph above is the design for the vector tail. Landed since: a unique `ROOMY` array of 32 or more elements grows in place too, its capacity being the power of two at or above its length (not stored: a function of `len`), and the copy that `array-push!` makes doubles the room. Before, an array of 32 or more got exactly one more slot per push and every push copied it (`fib.os/read-file-bytes` took 40 s for 1.6 MB). spec/types.md §2.13.1 has the exact rule, and says when a push still copies.
+
 **Tail layout is unchanged.** `tailoff = cnt - (array-len tail)` in `vec-nth`, `fib.vec-elem-ptr`, `fib.vec-drop` and
 `eval/vecs.rs` stays true: `len` of the tail is the fill. (A padded 32-slot tail with a count-derived fill would avoid the
 flag but changes all five readers; rejected.)

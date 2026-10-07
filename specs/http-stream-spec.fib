@@ -1,0 +1,113 @@
+;; HTTP-2's message-layer additions, over real loopback sockets: streaming request bodies on the client (`request-upload`: a producer, content-length or chunked, never held whole) and on the
+;; server (`run-server-stream`: the body is a Body the handler pulls; what it leaves unread is dropped so the connection is reused), the liveness probe of pooled connections (a connection
+;; the server closed while it was idle is not written to), and the connections queued but not yet accepted when the server stops (each gets a 503 and a clean end of stream, not a reset).
+;; `fibc test specs/http-stream-spec.fib`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.http.types fib.http.headers fib.http.bytes fib.http.body fib.http.client.types)
+  (:require [fib.http.client :as c] [fib.http.server :as sv] [fib.http.server.types :as st] [fib.os.time :as time] [fib.os.net :as net] [fib.os.io :as io]))
+
+(defun count-handler (r: Request body: Body) -> st/Reply
+  (let [u (. r uri)]
+    (cond (= u "/skip") (st/Whole (text-response 200 (str "skipped " (unwrap-or (header (. r headers) "content-length") "chunked"))))
+          (= u "/early") (st/Whole (text-response 413 "no thanks"))
+          :else (loop [n 0]
+                  (match (next-chunk body)
+                    ((Err e) (st/Whole (text-response 400 (str "body error: " (error-message e)))))
+                    ((Ok b) (if (= (array-len b) 0)
+                              (st/Whole (text-response 200 (str "bytes=" n " te=" (unwrap-or (header (. r headers) "transfer-encoding") "-") " cl=" (unwrap-or (header (. r headers) "content-length") "-"))))
+                              (recur (+ n (array-len b))))))))))
+(defun with-stream-server (o: st/Options f: (fn (i64) str)) -> str
+  (match (sv/run-server-stream count-handler (with o (port 0)))
+    ((Err e) (error-message e))
+    ((Ok srv) (let [out (f (sv/port srv))] (do (sv/stop-server srv) out)))))
+(defun producer (total: i64 piece: i64) -> (fn () (Option (Array i8)))
+  (let [sent (cell 0)]
+    (fn () (if (>= @sent total) nil (let [n (min piece (- total @sent)) out (cell (array n 1i8))] (do (set! sent (+ @sent n)) (some @out)))))))
+(defun up (cl: Client url: str length: (Option i64) next: (fn () (Option (Array i8)))) -> str
+  (match (c/request-upload cl (StreamingRequest "PUT" url {} next length))
+    ((Ok r) (str-from-bytes (. r body)))
+    ((Err e) (str "ERR " (match e ((ProtocolError m) (str "protocol " m)) (_ (error-message e)))))))
+(defun build (o: Options) -> Client (match (c/build-http-client o) ((Ok x) x) ((Err e) (trap (error-message e)))))
+
+(defun uploads () -> (Vec str)
+  (let [big (* 3 1048576)]
+    [(with-stream-server (st/default-options) (fn (port: i64) (up (build (default-options)) (str "http://127.0.0.1:" port "/x") (some big) (producer big 65536))))
+     (with-stream-server (st/default-options) (fn (port: i64) (up (build (default-options)) (str "http://127.0.0.1:" port "/x") nil (producer big 65536))))
+     (with-stream-server (st/default-options) (fn (port: i64) (up (build (default-options)) (str "http://127.0.0.1:" port "/x") (some 0) (producer 0 1))))
+     (with-stream-server (st/default-options) (fn (port: i64) (up (build (default-options)) (str "http://127.0.0.1:" port "/x") (some 100) (producer 99 10))))
+     (with-stream-server (st/default-options) (fn (port: i64) (up (build (default-options)) (str "http://127.0.0.1:" port "/x") (some 100) (producer 101 10))))]))
+;; three requests on one pooled connection: a handler that reads the whole body, one that reads none of it, and a plain one: the unread body is dropped, the connection reused
+(defun reuse-after-skip () -> str
+  (with-stream-server (st/default-options)
+    (fn (port: i64)
+      (let [cl (build (default-options)) base (str "http://127.0.0.1:" port)
+            a (up cl (str base "/x") (some 70000) (producer 70000 1000)) b (up cl (str base "/skip") (some 70000) (producer 70000 1000))
+            c1 (up cl (str base "/skip") nil (producer 70000 1000)) d (up cl (str base "/x") (some 5) (producer 5 5))]
+        (str-join [a "|" b "|" c1 "|" d "|" (str (. (c/pool-stats cl) opened) "/" (. (c/pool-stats cl) reused))])))))
+(defun body-over-limit () -> str
+  (with-stream-server (with (st/default-options) (max-body-bytes 100000))
+    (fn (port: i64) (let [cl (build (with (default-options) (throw-exceptions false)))] (str (up cl (str "http://127.0.0.1:" port "/x") nil (producer 300000 10000)) "|" (up cl (str "http://127.0.0.1:" port "/x") (some 10) (producer 10 10)))))))
+
+;; ---- liveness
+(defun idle-then-post (idle-ms: i64) -> (Pair str str)
+  (match (sv/run-server (fn (r: Request) (text-response 200 (. r request-method))) (with (st/default-options) (port 0) (idle-timeout-ms 150)))
+    ((Err e) (Pair (error-message e) ""))
+    ((Ok srv) (let [cl (build (default-options)) base (str "http://127.0.0.1:" (sv/port srv))
+                    a (match (c/request-with cl (ClientRequest "GET" (str base "/") {} (array 0 0i8))) ((Ok r) (str-from-bytes (. r body))) ((Err e) (error-message e)))
+                    _ (time/sleep-ns (* idle-ms 1000000))
+                    b (match (c/request-with cl (ClientRequest "POST" (str base "/") {} (str-bytes "x"))) ((Ok r) (str-from-bytes (. r body))) ((Err e) (str "ERR " (error-message e))))
+                    st (c/pool-stats cl) _ (sv/stop-server srv)]
+                (Pair (str a "," b) (str (. st opened) "/" (. st reused)))))))
+
+;; ---- queued connections at stop
+(defun read-text (fd: i64 ms: i64) -> str
+  (let [limit (+ (time/clock-now) (* ms 1000000))]
+    (loop [acc ""]
+      (match (net/wait-readable fd limit (atom false))
+        ((Err _) (str acc "<timeout>"))
+        ((Ok _) (match (io/read-fd fd 4096) ((Ok b) (if (= (array-len b) 0) (str acc "<eof>") (recur (str acc (str-from-bytes b))))) ((Err e) (str acc "<error " (. e message) ">"))))))))
+(defun queued-at-stop () -> (Pair str str)
+  (match (sv/run-server (fn (r: Request) (do (time/sleep-ns 400000000) (text-response 200 "slow"))) (with (st/default-options) (port 0) (workers 1)))
+    ((Err e) (Pair (error-message e) ""))
+    ((Ok srv) (let [req (str-bytes "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                    a (match (net/connect-tcp "127.0.0.1" (sv/port srv) 1000) ((Ok fd) fd) ((Err e) (trap (. e message))))
+                    _ (net/send-all a req 1000 (atom false)) _ (time/sleep-ns 100000000)
+                    b (match (net/connect-tcp "127.0.0.1" (sv/port srv) 1000) ((Ok fd) fd) ((Err e) (trap (. e message))))
+                    _ (net/send-all b req 1000 (atom false)) _ (time/sleep-ns 100000000)
+                    stopped (sv/stop-server srv)
+                    ta (read-text a 1000) tb (read-text b 1000) _ (io/close-fd a) _ (io/close-fd b)]
+                (Pair ta tb)))))
+
+(defspecs specs
+  (feature "streaming request bodies, client to server"
+    (scenario "3 MiB with a content-length, 3 MiB chunked, an empty one: the handler saw every byte, in pieces, never the whole"
+      (given [r (uploads)])
+      (then (expect = "bytes=3145728 te=- cl=3145728" (nth r 0))
+            (expect = true (starts-with? (nth r 1) "bytes=3145728 te=chunked"))
+            (expect = true (some? (str-find (nth r 1) "cl=-" 0)))
+            (expect = "bytes=0 te=- cl=0" (nth r 2))))
+    (scenario "a producer that delivers fewer or more bytes than its declared length is a ProtocolError"
+      (given [r (uploads)])
+      (then (expect = "ERR protocol the request body producer delivered fewer bytes than its declared length" (nth r 3))
+            (expect = "ERR protocol the request body producer delivered more bytes than its declared length" (nth r 4)))))
+  (feature "streaming request bodies on the server"
+    (scenario "a handler that reads none of the body: the rest is dropped and the connection serves the next request"
+      (given [r (reuse-after-skip)])
+      (then (expect = "bytes=70000 te=- cl=70000|skipped 70000|skipped chunked|bytes=5 te=- cl=5|1/3" r)))
+    (scenario "a streamed body over max-body-bytes fails the handler's read, and the connection is not reused"
+      (given [r (body-over-limit)])
+      (then (expect = true (starts-with? r "body error:")) (expect = true (s-ends r "bytes=10 te=- cl=10")))))
+  (feature "liveness of pooled connections"
+    (scenario "a connection the server closed while idle is not reused: a POST (never retried) succeeds on a fresh one"
+      (given [r (idle-then-post 500)])
+      (then (expect = "GET,POST" (. r fst)) (expect = "2/0" (. r snd))))
+    (scenario "a connection that is still alive is reused"
+      (given [r (idle-then-post 20)])
+      (then (expect = "GET,POST" (. r fst)) (expect = "1/1" (. r snd)))))
+  (feature "stop with connections queued"
+    (scenario "a connection the acceptor never took gets a 503 and an orderly end of stream; the one in service finishes"
+      (given [r (queued-at-stop)])
+      (then (expect = true (starts-with? (. r fst) "HTTP/1.1 200 OK")) (expect = true (starts-with? (. r snd) "HTTP/1.1 503 Service Unavailable"))
+            (expect = true (s-ends (. r snd) "<eof>"))))))
+
+(defun s-ends (t: str suffix: str) -> bool (and (>= (str-len t) (str-len suffix)) (= (str-slice t (- (str-len t) (str-len suffix)) (str-len t)) suffix)))
+(defun main () -> i64 (run-main (specs)))

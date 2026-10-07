@@ -1,0 +1,23 @@
+;; spec: docs/design/http.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll fib.http.types fib.http.client.types) (:require [fib.http.client :as c] [fib.http.server :as sv] [fib.http.server.types :as st] [fib.os.time :as time]))
+(defun main () -> i64
+  (let [ch (checks)]
+    (match (sv/run-server (fn (r: Request) (Response 200 {} (str-bytes (. r request-method)))) (with (st/default-options) (port 0) (idle-timeout-ms 150)))
+      ((Err _) 1)
+      ((Ok srv) (match (c/build-http-client (default-options))
+        ((Err _) 2)
+        ((Ok cl) (let [base (str "http://127.0.0.1:" (sv/port srv))
+                       a (c/request-with cl (ClientRequest "GET" (str base "/") {} (array 0 0i8)))
+                       _ (time/sleep-ns 500000000)
+                       b (c/request-with cl (ClientRequest "POST" (str base "/") {} (str-bytes "x")))
+                       stats (c/pool-stats cl)]
+                   (do (check ch (match a ((Ok r) (= (str-from-bytes (. r body)) "GET")) (_ false)))
+                       (check ch (match b ((Ok r) (= (str-from-bytes (. r body)) "POST")) (_ false)))
+                       (check ch (= (. stats opened) 2)) (check ch (= (. stats reused) 0))
+                       (c/close-http-client cl) (sv/stop-server srv)
+                       (checks-result ch)))))))))

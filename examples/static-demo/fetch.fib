@@ -1,0 +1,11 @@
+;; A static client for a FROM scratch image: resolves a name with the NATIVE resolver (fib.dns: /etc/resolv.conf, no getaddrinfo, no NSS, no /etc/nsswitch.conf) and fetches
+;; http://NAME/ with the native client. `fetch NAME`. Build: `fibc build --static examples/static-demo/fetch.fib -o fetch`. scripts/static-fetch-demo.sh runs it in a scratch image.
+(ns main (:use fib.core fib.seq fib.coll fib.http.types fib.dns) (:require [fib.http.client :as c] [fib.os.errors :as os]))
+(defun main () -> i64
+  (let [name (nth (args) 0) r (system-resolver)]
+    (do (match (resolve-host r name)
+          ((Ok xs) (println (str "resolved " name " -> " (str-join (mapv (fn (a: str) (str a " ")) xs)))))
+          ((Err e) (println (str "resolve failed: " (. e message)))))
+        (match (c/get (str "http://" name "/") (with (c/default-options) (timeout-ms 15000)))
+          ((Ok r) (do (println (str "GET http://" name "/ -> " (. r status) ", " (array-len (. r body)) " bytes")) 0))
+          ((Err e) (do (println (str "GET failed: " (error-message e))) 1))))))

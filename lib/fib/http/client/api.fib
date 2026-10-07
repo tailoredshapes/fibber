@@ -4,34 +4,53 @@
 (ns fib.http.client.api (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes fib.http.url fib.http.body
                               fib.http.client.types fib.http.client.pool fib.http.client.run)
   (:require [fib.string :as s]))
-(defun last-coding :private (headers: (Map str (Vec str))) -> str
-  (match (header headers "content-encoding")
-    (nil "") ((some v) (let [parts (s/split v "," -1)] (ascii-lower (trim-ows (nth parts (- (count parts) 1))))))))
-(defun decode :private (o: Options headers: (Map str (Vec str)) bytes: (Array i8)) -> (Result (Array i8) Error)
-  (let [coding (last-coding headers)
-        found (some-p (fn (d: Decoder) (if (= (. d name) coding) (some d) nil)) (. o decoders))]
-    (if (or (not (. o decompress)) (= coding "")) (Ok bytes)
-      (match found (nil (Ok bytes)) ((some d) ((. d decode) bytes))))))
+(def max-codings: i64 4)
+(defun codings :private (headers: (Map str (Vec str))) -> (Vec str)
+  (vec (filter (fn (c: str) (and (!= c "") (!= c "identity")))
+               (mapcat (fn (v: str) (map (fn (p: str) (ascii-lower (trim-ows p))) (s/split v "," -1))) (header-values headers "content-encoding")))))
+(defun decoder-for :private (o: Options name: str) -> (Option Decoder) (first (filter (fn (d: Decoder) (= (. d name) name)) (. o decoders))))
+(defun undo :private (o: Options names: (Vec str) bytes: (Array i8)) -> (Result (Array i8) Error)
+  (loop [i (- (count names) 1) cur bytes]
+    (if (< i 0) (Ok cur)
+      (match (decoder-for o (nth names i))
+        (nil (Err (ProtocolError "no decoder")))
+        ((some d) (match ((. d decode) cur (. o max-response-bytes))
+          ((Err e) (Err e))
+          ((Ok out) (if (> (array-len out) (. o max-response-bytes)) (Err (LimitError "decoded response exceeds the limit")) (recur (- i 1) out)))))))))
+;; (Ok (Pair headers body)): decoded with the codings removed, or as received when this client cannot undo them all.
+(defun decode :private (o: Options headers: (Map str (Vec str)) bytes: (Array i8)) -> (Result (Pair (Map str (Vec str)) (Array i8)) Error)
+  (let [names (codings headers)]
+    (cond (or (not (. o decompress)) (= (count names) 0)) (Ok (Pair headers bytes))
+          (> (count names) max-codings) (Err (ProtocolError "too many Content-Encoding codings"))
+          (not (every? (fn (n: str) (some? (decoder-for o n))) names)) (Ok (Pair headers bytes))
+          :else (match (undo o names bytes)
+                  ((Err e) (Err e))
+                  ((Ok plain) (Ok (Pair (dissoc (dissoc headers "content-encoding") "content-length") plain)))))))
 (defun finish :private (st: State sr: StreamResponse) -> (Result Response Error)
   (let [o (. st options)]
     (match (read-all (. sr body) (. o max-response-bytes))
       ((Err e) (do ((. sr abandon)) (Err e)))
       ((Ok bytes) (try-let [plain (decode o (. sr headers) bytes)]
-        (let [response (Response (. sr status) (. sr headers) plain)]
+        (let [response (Response (. sr status) (. plain fst) (. plain snd))]
           (if (and (. o throw-exceptions) (>= (. sr status) 400)) (Err (StatusError response)) (Ok response))))))))
 (defun execute :private (st: State request: ClientRequest) -> (Result Response Error)
   (try-let [sr (start st request)] (finish st sr)))
 (defun close-state :private (st: State) -> unit (do (set! (. st closed) true) (close-all (. st pool))))
 (defun build-http-client (o: Options) -> (Result Client Error)
   (if (not (valid-options? o)) (Err (InvalidRequest "invalid HTTP client options"))
-    (let [st (State o (new-pool) (cell false))]
+    (let [st (new-state o)]
       (Ok (Client (fn (r: ClientRequest) (execute st r)) (fn () (close-state st)) (fn () (stats (. st pool)))
-                  (fn (r: ClientRequest) (start st r)))))))
+                  (fn (r: ClientRequest) (start st r)) (fn (r: StreamingRequest) (start-upload st r))
+                  (fn (r: StreamingRequest) (try-let [sr (start-upload st r)] (finish st sr))))))))
 (defun close-http-client (client: Client) -> unit ((. client close)))
 (defun pool-stats (client: Client) -> PoolStats ((. client stats)))
 (defun request-with (client: Client request: ClientRequest) -> (Result Response Error) ((. client execute) request))
 ;; The response before its body is read: read it with fib.http.body/next-chunk or abandon it. Redirects are followed under the options.
 (defun request-stream (client: Client request: ClientRequest) -> (Result StreamResponse Error) ((. client stream) request))
+;; A request whose body is a producer pulled until it answers nil (a file, a pipe, generated data), never held whole: `(StreamingRequest "PUT" url {} next (some length))` sends a
+;; content-length (the producer must deliver exactly that many bytes), `nil` for the length sends chunked. See exchange-upload for what it does not do.
+(defun request-upload-stream (client: Client request: StreamingRequest) -> (Result StreamResponse Error) ((. client upload) request))
+(defun request-upload (client: Client request: StreamingRequest) -> (Result Response Error) ((. client upload-whole) request))
 (defun request (request: ClientRequest o: Options) -> (Result Response Error)
   (try-let [client (build-http-client o)]
     (let [result (request-with client request)] (do (close-http-client client) result))))

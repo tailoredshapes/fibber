@@ -1,0 +1,21 @@
+;; spec:   spec/types.md §6.3 "Field moves"
+;; expect: accept
+;; result: 1042
+;; audit:  clean
+;; `bump` steals `(. p buf)` at its last use of `p` only when the struct is unique at run time. `main` keeps `p` (it reads it after the first
+;; call), so that call is handed a second count of the struct: the field must be retained and the array copied, and `p` still holds the array
+;; with its 1. The second call is on `q`, the only holder: the field moves. A steal that did not test the struct would null the slot of `p`
+;; and `(array-get (. p buf) 0)` would read through a null (a trap or a wrong answer); one that tested only the field's count would write
+;; into the array `p` holds. 1000 + 42 = 1042: the first read sees 1 (`p` untouched), the second 42.
+(defstruct P (buf: (Array i64) n: i64))
+
+(defun bump (p: P) -> P
+  (let [n (. p n)
+        c (cell (. p buf))]
+    (do (array-set! &c 0 42) (P @c n))))
+
+(defun main () -> i64
+  (let [p (P (array 4 1) 4)
+        q (bump p)
+        r (bump (bump q))]
+    (+ (* 1000 (array-get (. p buf) 0)) (array-get (. r buf) 0))))

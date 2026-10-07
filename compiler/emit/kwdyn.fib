@@ -1,0 +1,36 @@
+;; compiler/emit/kwdyn.fib: the keyword helpers of a program that makes keywords at run time (`str->keyword`, LIBFIX-1). The ids 0 .. N-1 are the keywords the
+;; program mentions (emit.statics, sealed before the helpers are rendered); a keyword made from a string is looked up among them by name first, so `(keyword "a")` and
+;; `:a` are equal, and else takes the next id N+i of the table in rt/str.lir (`fib.kwd-intern`, under a lock, its strings immortal). The helpers then see the
+;; both ranges: `kw.name` the name, `kw.show` ":" and the name, `kw.hash` the FNV of the name (as the static helpers' `fib.str-hash` of it), `kw.rank` the number
+;; of keywords with a smaller name (the order of keywords is by name, types §3: it costs a walk over every keyword, which only a program that makes them pays).
+;; A program without `str->keyword` keeps emit.program's switches, unchanged.
+(ns emit.kwdyn
+  (:use emit.statics))
+
+(defun name-blocks :private (st: Statics names: (Vec str)) -> str
+  (str-join (mapv (fn (i: i64) (str-join ["  (block k" (str i) " (ret " (statics-string st (nth names i) 0) "))\n"])) (range (count names)))))
+
+(defun switch-cases :private (n: i64) -> str
+  (str-join (mapv (fn (i: i64) (str-join ["((i64 " (str i) ") k" (str i) ") "])) (range n))))
+
+;; The helpers: kw.name, kw.show, kw.hash, kw.rank and kw.intern over the keywords `names` (by id).
+(defun dyn-keyword-helpers (st: Statics names: (Vec str)) -> str
+  (let ((n (count names)) (ns (str (count names))) (colon (statics-string st ":" 0)))
+    (str-join
+      ["(define internal (kw.name ptr) ((i64 k))\n  (block entry (switch k dyn " (switch-cases n) "))\n" (name-blocks st names)
+       "  (block dyn (ret (call @fib.kwd-name (sub k (i64 " ns "))))))\n"
+       "(define internal (kw.show ptr) ((i64 k))\n  (block entry (ret (call @fib.str-concat " colon " (call @kw.name k)))))\n"
+       "(define internal (kw.hash i64) ((i64 k))\n  (block entry (ret (call @fib.str-hash (call @kw.name k)))))\n"
+       "(define internal (kw.rank i64) ((i64 k))\n"
+       "  (block entry (let ((me (call @kw.name k)) (total (add (i64 " ns ") (call @fib.kwd-count)))) (br loop)))\n"
+       "  (block loop (let ((j (phi i64 (entry (i64 0)) (step j2))) (r (phi i64 (entry (i64 0)) (step r2)))) (br (icmp slt j total) body done)))\n"
+       "  (block body (let ((less (icmp slt (call @fib.str-cmp (call @kw.name j) me) (i32 0)))) (br step)))\n"
+       "  (block step (let ((j2 (add j (i64 1))) (r2 (add r (select less (i64 1) (i64 0))))) (br loop)))\n"
+       "  (block done (ret r)))\n"
+       "(define internal (kw.intern i64) ((ptr s))\n"
+       "  (block entry (br loop))\n"
+       "  (block loop (let ((j (phi i64 (entry (i64 0)) (step j2)))) (br (icmp slt j (i64 " ns ")) body miss)))\n"
+       "  (block body (br (call @fib.str-eq (call @kw.name j) s) hit step))\n"
+       "  (block step (let ((j2 (add j (i64 1)))) (br loop)))\n"
+       "  (block hit (ret j))\n"
+       "  (block miss (ret (add (i64 " ns ") (call @fib.kwd-intern s)))))\n"])))
