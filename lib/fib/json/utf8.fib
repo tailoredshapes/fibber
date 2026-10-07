@@ -21,6 +21,15 @@
             (if (and (and (>= b1 lo) (< b1 hi)) (and (and (>= b2 128) (< b2 192)) (and (>= b3 128) (< b3 192)))) 4 0))
           :else 0)))
 
+;; The sequence at j when it is a two- or three-byte one with ordinary continuation bytes (what text in most languages is made of), else the general rule.
+(defun seq-len-fast (b: (Array i8) n: i64 j: i64) -> i64
+  (let [b0 (zext i64 (array-get b j))]
+    (cond (and (>= b0 194) (and (<= b0 223) (< (+ j 1) n)))
+          (if (= (bit-and (zext i64 (array-get b (+ j 1))) 192) 128) 2 (seq-len b n j))
+          (and (>= b0 225) (and (<= b0 239) (and (!= b0 237) (< (+ j 2) n))))
+          (if (and (= (bit-and (zext i64 (array-get b (+ j 1))) 192) 128) (= (bit-and (zext i64 (array-get b (+ j 2))) 192) 128)) 3 (seq-len b n j))
+          :else (seq-len b n j))))
+
 ;; The offset of the first byte that is not part of valid UTF-8, or -1.
 (defun first-invalid (b: (Array i8)) -> i64
   (let [n (array-len b)]
@@ -28,7 +37,7 @@
       (let [w (loop [k i] (if (and (<= (+ k 8) n) (= (bit-and (unsafe (load-i64 (ptr+ (raw b) (+ 24 k)))) high-bits) 0)) (recur (+ k 8)) k))
             j (loop [k w] (if (and (< k n) (>= (array-get b k) 0i8)) (recur (+ k 1)) k))]
         (if (>= j n) -1
-            (let [l (seq-len b n j)] (if (= l 0) j (recur (+ j l)))))))))
+            (let [l (seq-len-fast b n j)] (if (= l 0) j (recur (+ j l)))))))))
 
 (defun make-error-bytes (b: (Array i8) code: i64 offset: i64) -> JsonError
   (loop [i 0 line 1 col 1]

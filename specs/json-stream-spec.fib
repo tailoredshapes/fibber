@@ -1,0 +1,101 @@
+;; fib.json.stream and the rest of JSON-3: the lazy seq of documents over a file (any chunking, a document that spans lines, errors as values), the parallel fold with the work in the task,
+;; any sink for a write, the hash index of an object, and the tolerant reading options (comments, trailing commas, NaN and Infinity: off by default).
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.json.types fib.json.parse fib.json.write fib.json.stream fib.json.access fib.json.io) (:require [fib.os :as os]))
+
+(def path: str "/tmp/fib-json-stream-spec")
+
+(defun long-line (i: i64) -> str (str "{\"id\":" i ",\"pad\":\"" (str-join (vec (map (fn (k: i64) "0123456789") (range 70)))) "\"}"))
+(defun long-text (n: i64) -> str (str-join (vec (map (fn (i: i64) (str (long-line i) "\n")) (range n)))))
+(defun vec->array (v: (Vec i8)) -> (Array i8) (let [a (cell (array (count v) 0i8))] (do (dotimes (i (count v)) (array-set! &a i (nth v i))) @a)))
+(defun bad-utf8 (bs: (Vec i64)) -> bool
+  (do (os/write-file-bytes path (vec->array (vec (concat [34i8] (concat (map (fn (b: i64) (trunc i8 b)) bs) [34i8])))))
+      (match (lines-seq path (default-options)) ((Ok sq) (match (first sq) ((some (Err e)) (= (. e code) 6)) (_ false))) ((Err _) false))))
+
+(defun put-file (text: str) -> unit (do (os/write-file-bytes path (str-bytes text)) ()))
+
+(defun doc-line (i: i64) -> str (str "{\"id\":" i ",\"name\":\"n" i "\",\"tags\":[" i "," (+ i 1) "],\"é\":\"日本語" i "\"}"))
+(defun lines-text (n: i64) -> str (str-join (vec (map (fn (i: i64) (str (doc-line i) "\n")) (range n)))))
+
+(defun id-of (r: (Result Json JsonError)) -> i64
+  (match r ((Ok j) (match (json-get j "id") ((some (JInt i)) i) (_ -2))) ((Err _) -1)))
+(defun ids-of (sq: (LSeq (Result Json JsonError))) -> (Vec i64) (vec (map id-of sq)))
+(defun seq-ids (text: str) -> (Vec i64) (do (put-file text) (match (lines-seq path (default-options)) ((Ok sq) (ids-of sq)) ((Err _) [-9]))))
+(defun par-sum (text: str) -> i64
+  (do (put-file text) (match (reduce-lines-par-map path (default-options) (fn (r: (Result Json JsonError)) (id-of r)) (fn (a: i64 x: i64) (+ a x)) 0) ((Ok n) n) ((Err _) -99))))
+(defun par-ids (text: str) -> (Vec i64)
+  (do (put-file text) (match (reduce-lines-par-map path (default-options) (fn (r: (Result Json JsonError)) (id-of r)) (fn (a: (Vec i64) x: i64) (conj a x)) []) ((Ok v) v) ((Err _) [-99]))))
+
+(defun opt (c: bool t: bool n: bool) -> JsonOptions (tolerant-options c t n))
+(defun ok-of (s: str o: JsonOptions) -> (Option Json) (match (parse-with s o) ((Ok j) (some j)) ((Err _) nil)))
+(defun code-of (s: str o: JsonOptions) -> i64 (match (parse-with s o) ((Ok _) 0) ((Err e) (. e code))))
+(defun nan? (j: Json) -> bool (match j ((JFloat f) (!= f f)) (_ false)))
+
+(defspecs specs
+  (feature "lines-seq"
+    (scenario "the documents of a file in order, lazily, over several 4 MiB reads (7000 lines of about 70 bytes is under one; 70000 is over)"
+      (then (expect = (vec (range 100)) (seq-ids (lines-text 100)))
+            (expect = (vec (range 70000)) (seq-ids (lines-text 70000)))))
+    (scenario "a document that spans lines, blank lines, CRLF, no newline after the last document"
+      (then (expect = [1 2 3] (seq-ids "{\"id\":\n1}\n\n{\"id\":2}\r\n  {\"id\"\n:\n3}"))))
+    (scenario "a bad line is an Err in its place and the stream goes on; an empty file has no documents"
+      (then (expect = [1 -1 3] (seq-ids "{\"id\":1}\n{\"id\":x}\n{\"id\":3}\n")) (expect = [] (seq-ids ""))))
+    (scenario "a document longer than a chunk is read whole (a pretty-printed one of 780000 lines)"
+      (given [big (write-pretty (JArr (vec (map (fn (i: i64) (JObj ["id"] [(JInt i)])) (range 20000)))))])
+      (then (expect = true (do (put-file (str big "\n{\"id\":5}\n")) (match (lines-seq path (default-options)) ((Ok sq) (= 2 (count sq))) ((Err _) false))))))
+    (scenario "invalid UTF-8 is an Err (code 6), not a trap; a missing file is an Err"
+      (then (expect = true (do (os/write-file-bytes path (array 5 -1i8)) (match (lines-seq path (default-options)) ((Ok sq) (match (first sq) ((some (Err e)) (= (. e code) 6)) (_ false))) ((Err _) false))))
+            (expect = true (match (lines-seq "/tmp/fib-json-no-such-file" (default-options)) ((Err e) (= (. e code) 15)) ((Ok _) false))))))
+  (feature "lines of 512 bytes and more (the DOM builder, not the scalar reader)"
+    (scenario "in the lazy seq and in the parallel fold, over one chunk and over several"
+      (then (expect = (vec (range 3000)) (seq-ids (long-text 3000))) (expect = (vec (range 9000)) (seq-ids (long-text 9000)))
+            (expect = (vec (range 9000)) (par-ids (long-text 9000))))))
+  (feature "invalid UTF-8"
+    (scenario "overlong, surrogate, too high and cut sequences are an Err (code 6) in the stream, never a trap"
+      (then (expect = true (bad-utf8 [237 160 128])) (expect = true (bad-utf8 [224 128 128])) (expect = true (bad-utf8 [244 144 128 128]))
+            (expect = true (bad-utf8 [192 128])) (expect = true (bad-utf8 [226 130])) (expect = true (bad-utf8 [240 128 128 128])))))
+  (feature "reduce-lines-par-map"
+    (scenario "the work of g is done in the task; results are folded in file order across chunks"
+      (then (expect = 24496500 (par-sum (lines-text 7000)))
+            (expect = (vec (range 70000)) (par-ids (lines-text 70000)))
+            (expect = [1 -1 3] (par-ids "{\"id\":1}\n{\"id\":x}\n{\"id\":3}\n"))
+            (expect = 3 (par-sum "{\"id\":1}\n{\"id\":2}")))))
+  (feature "write-sink"
+    (scenario "the pieces are at most 64 KiB, in order, and concatenate to the compact text; an error stops the write and comes back"
+      (given [j (JArr (vec (map (fn (i: i64) (JStr (str "item " i))) (range 20000))))
+              got (cell [])])
+      (then (expect = true (match (write-sink j (fn (b: (Array i8)) (do (set! got (conj @got b)) (Ok ()))))
+                             ((Ok _) (and (> (count @got) 1) (every? (fn (b: (Array i8)) (<= (array-len b) 65536)) @got)
+                                          (= (write j) (str-join (vec (map (fn (b: (Array i8)) (str-from-bytes b)) @got))))))
+                             ((Err _) false)))
+            (expect = true (match (write-sink j (fn (b: (Array i8)) (Err (os/OSError os/Other 5 "sink" "full")))) ((Err e) (= (. e message) "full")) ((Ok _) false))))))
+  (feature "index-object"
+    (scenario "O(1) lookup in a big object, absent keys, other kinds"
+      (given [j (JObj (vec (map (fn (i: i64) (str "k" i)) (range 5000))) (vec (map (fn (i: i64) (JInt (* i 2))) (range 5000))))])
+      (then (expect = (some (JInt 9998)) (match (index-object j) ((some x) (index-get x "k4999")) (nil nil)))
+            (expect = (some (JInt 0)) (match (index-object j) ((some x) (index-get x "k0")) (nil nil)))
+            (expect = nil (match (index-object j) ((some x) (index-get x "nope")) (nil (some JNull))))
+            (expect = true (nil? (index-object (JArr []))))
+            (expect = (json-get j "k1234") (match (index-object j) ((some x) (index-get x "k1234")) (nil nil))))))
+  (feature "tolerant reading"
+    (scenario "off by default: comments, trailing commas, NaN and Infinity are errors"
+      (then (expect = 8 (code-of "[1,2] // c" (default-options))) (expect = 1 (code-of "/* c */ [1]" (default-options)))
+            (expect = 1 (code-of "[1,2,]" (default-options))) (expect = 1 (code-of "{\"a\":1,}" (default-options)))
+            (expect = 1 (code-of "[NaN]" (default-options))) (expect = 1 (code-of "[Infinity]" (default-options))) (expect = 3 (code-of "[-Infinity]" (default-options)))))
+    (scenario "comments only: // to the end of the line, /* */ anywhere white space may be, an unterminated one is an error"
+      (then (expect = (some (JArr [(JInt 1) (JInt 2)])) (ok-of "// head\n[1, /* two */ 2 // tail\n] /* end */" (opt true false false)))
+            (expect = (some (JObj ["a"] [(JInt 1)])) (ok-of "{ /* k */ \"a\" /* : */ : /* v */ 1 }" (opt true false false)))
+            (expect = (some (JStr "/* not a comment */")) (ok-of "\"/* not a comment */\"" (opt true false false)))
+            (expect = 1 (code-of "[1 /* open" (opt true false false))) (expect = 1 (code-of "[1,]" (opt true false false)))))
+    (scenario "trailing commas only: one before ] or }, never a leading or a double one"
+      (then (expect = (some (JArr [(JInt 1) (JInt 2)])) (ok-of "[1,2,]" (opt false true false)))
+            (expect = (some (JObj ["a" "b"] [(JInt 1) (JInt 2)])) (ok-of "{\"a\":1,\"b\":2, }" (opt false true false)))
+            (expect = 1 (code-of "[,]" (opt false true false))) (expect = 1 (code-of "[1,,]" (opt false true false))) (expect = 1 (code-of "{,}" (opt false true false)))
+            (expect = 1 (code-of "[1 // c\n]" (opt false true false)))))
+    (scenario "non-finite numbers only: NaN, Infinity, -Infinity are floats; other words stay errors"
+      (then (expect = true (match (ok-of "[NaN, Infinity, -Infinity, 1.5]" (opt false false true)) ((some (JArr [a b c d])) (and (nan? a) (= b (JFloat (/ 1.0 0.0))) (= c (JFloat (/ -1.0 0.0))) (= d (JFloat 1.5)))) (_ false)))
+            (expect = 1 (code-of "[Nan]" (opt false false true))) (expect = 1 (code-of "[Inf]" (opt false false true))) (expect = 1 (code-of "[infinity]" (opt false false true)))))
+    (scenario "all three together; a strict document reads the same under any options"
+      (then (expect = (some (JArr [(JInt 1) (JFloat (/ 1.0 0.0))])) (ok-of "[1, // one\n Infinity, /* two */ ]" (opt true true true)))
+            (expect = (ok-of "{\"a\":[1,2.5,\"x\"],\"b\":null}" (default-options)) (ok-of "{\"a\":[1,2.5,\"x\"],\"b\":null}" (opt true true true)))))))
+
+(defun main () -> i64 (run-main (specs)))

@@ -1,0 +1,41 @@
+;; scripts/bench/parallel-scale.fib: where the time of a parallel call goes, one phase per line, for the scaling curves of fib.parallel (docs/shootout/parallel.md).
+;; usage: parallel-scale MODE W N      prints, per round, `t PHASE MS` lines and `v X` (the checksum)
+;; MODE: pmap        (pmap-each [x xs p] (* x 2)) over a Vec of N i64: `call` is the pmap, `sum` the serial checksum of its result (what parallel-closure.fib adds to the call)
+;;       pmap-array  the same chunks put together as one `(Array i64)` (pmap-chunks-array): `call` is chunks + concat-chunks, `vec` the serial `vec-from-array` that makes the Vec of it
+;;       preduce     (preduce-range [i N p] + 0 (bit-xor (* i 3) 5)): `call` only
+;;       alloc       (pmap-range [i N p] (count (vec (range 6)))): every element builds a Vec of 6 (3 objects), so the workers allocate and free at once; `call`, `sum`
+;;       pfor-alloc  (pfor-range [i N p] ..): the same allocation for effect, nothing assembled: the allocator alone
+;; W workers (Par W 0 false). scripts/bench/parallel-scale.sh runs the curves (1, 2, 4, 8, 16 workers), medians of rounds.
+(ns main (:use fib.core fib.parallel))
+
+(defun small (i: i64) -> i64 (count (vec (range (+ 6 (rem i 2))))))
+
+(defun phase (name: str t0: i64) -> i64
+  (let ((t1 (sys-clock-now)))
+    (do (println "t" name (quot (- t1 t0) 1000)) t1)))
+
+(defun round (mode: str w: i64 n: i64 xs: (Vec i64)) -> i64
+  (let ((p (Par w 0 false)) (t0 (sys-clock-now)))
+    (cond (= mode "pmap")
+          (let ((r (pmap-each [x xs p] (* x 2))))
+            (let ((t1 (phase "call" t0)))
+              (let ((s (reduce + 0 r))) (do (phase "sum" t1) s))))
+          (= mode "pmap-array")
+          (let ((r (pmap-chunks-array p n (fn (lo hi) (map-chunk (fn (x: i64) (* x 2)) xs lo hi)))))
+            (let ((t1 (phase "call" t0)))
+              (let ((v (vec-from-array r))) (do (phase "vec" t1) (count v)))))
+          (= mode "preduce")
+          (let ((s (preduce-range [i n p] + 0 (bit-xor (* i 3) 5)))) (do (phase "call" t0) s))
+          (= mode "alloc")
+          (let ((r (pmap-range [i n p] (small i))))
+            (let ((t1 (phase "call" t0)))
+              (let ((s (reduce + 0 r))) (do (phase "sum" t1) s))))
+          (= mode "pfor-alloc")
+          (let ((a (atom 0)))
+            (do (pfor-range [i n p] (when (= (small i) 0) (swap! a inc))) (phase "call" t0) (deref a)))
+          :else (trap "unknown mode"))))
+
+(defun main () -> i64
+  (let ((mode (nth (args) 0)) (w (unwrap (parse-long (nth (args) 1)))) (n (unwrap (parse-long (nth (args) 2)))))
+    (let ((xs (if (or (= mode "pmap") (= mode "pmap-array")) (vec (range n)) [])))
+      (do (dotimes (r 3) (println "v" (round mode w n xs))) 0))))

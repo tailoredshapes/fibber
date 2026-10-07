@@ -25,11 +25,16 @@
 ;; max-depth: nesting limit (default 1024). max-size: refuse longer input (default 1 GiB).
 ;; duplicates: 0 the last value wins, at the key's first position (default); 1 keep every pair; 2 an error.
 ;; numbers: 0 i64 when integral and in range, else f64 (default); 1 as 0 but an integer outside i64 is `JBig` text; 2 every number that is not an i64 is `JBig` text.
+  ;; numbers is also a set of bits, all OFF by default and read only by the DOM parser (fib.json.parse): 16 comments, 32 trailing commas, 64 NaN and Infinity; `tolerant-options` sets them.
 ;; bom: skip a leading UTF-8 byte order mark (default false: it is an error, as RFC 8259 permits).
 ;; out-of-range: false (default) a number that overflows f64 (1e400) is an error; true it reads as an infinity.
 (defstruct JsonOptions (max-depth: i64 max-size: i64 duplicates: i64 numbers: i64 bom: bool out-of-range: bool))
 
 (defun default-options () -> JsonOptions (JsonOptions 1024 1073741824 0 0 false false))
+
+;; The options with comments (// and /* */), a trailing comma before ] or }, and NaN / Infinity / -Infinity as floats allowed (each only when asked: strict RFC 8259 is the default).
+(defun tolerant-options (comments: bool trailing-commas: bool non-finite: bool) -> JsonOptions
+  (JsonOptions 1024 1073741824 0 (+ (if comments 16 0) (+ (if trailing-commas 32 0) (if non-finite 64 0))) false false))
 
 (def e-unexpected: i64 1)
 (def e-eof: i64 2)
@@ -85,3 +90,6 @@
 (derive Eq JsonEvent)
 (derive Debug JsonEvent)
 
+
+;; A hash index of one object (fib.json.access: index-object, index-get).
+(defstruct ObjIndex (vals: (Vec Json) at: (Map str i64)))

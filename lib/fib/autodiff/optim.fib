@@ -18,14 +18,26 @@
 
 (defun ipow (x: f64 n: i64) -> f64 (loop [i 0 acc 1.0] (if (< i n) (recur (+ i 1) (* acc x)) acc)))
 
-;; One fused pass over a parameter, its gradient and its two moments (`t/adam-step`, fib.tensor.optim): the same operations in the same order as the nine tensor calls it replaced
-;; (axpby, mul, axpby, sqrt, scale, shift, div, axpby), so the results are bit-identical to them; PyTorch's placement of eps (after the square root and the bias correction).
-(defun adam-one (lr: f64 b1: f64 b2: f64 eps: f64 c1: f64 c2: f64 p: (t/Tensor a) g: (t/Tensor a) m: (t/Tensor a) v: (t/Tensor a))
-  -> (Vec (t/Tensor a))
-  (t/adam-step lr b1 b2 eps c1 c2 p g m v))
+;; One fused pass per parameter (`t/adam-step-owned`, fib.tensor.optim-owned): the same operations in the same order as the nine tensor calls it replaced (axpby, mul, axpby,
+;; sqrt, scale, shift, div, axpby), so the results are bit-identical to them; PyTorch's placement of eps (after the square root and the bias correction). The parameters and both
+;; moments are CONSUMED: each is taken out of its vector with `vec-take-at` (a unique vector hands over unique tensors), updated in its own buffer when nothing else holds it, and put
+;; back. A caller that keeps `params` or the state (it reads them again after the call) pays one copy of the buffers, as before.
+(defun adam-loop :private (lr: f64 b1: f64 b2: f64 eps: f64 c1: f64 c2: f64 grads: (Vec (t/Tensor a)) ps0: (Vec (t/Tensor a)) ms0: (Vec (t/Tensor a)) vs0: (Vec (t/Tensor a)))
+  -> (Triple (Vec (t/Tensor a)) (Vec (t/Tensor a)) (Vec (t/Tensor a)))
+  (let [n (count ps0)]
+    (loop [i 0 ps ps0 ms ms0 vs vs0]
+      (if (< i n)
+        (let [(Pair p ps2) (vec-take-at ps i)
+              (Pair m ms2) (vec-take-at ms i)
+              (Pair v vs2) (vec-take-at vs i)
+              r (t/adam-step-owned lr b1 b2 eps c1 c2 p (nth grads i) m v)]
+          (recur (+ i 1) (vec-assoc ps2 i (nth r 0)) (vec-assoc ms2 i (nth r 1)) (vec-assoc vs2 i (nth r 2))))
+        (Triple ps ms vs)))))
 
 ;; Adam (Kingma and Ba) with bias correction folded into the step size and the denominator
 (defun adam-step (lr: f64 b1: f64 b2: f64 eps: f64 st: (AdamState a) params: (Vec (t/Tensor a)) grads: (Vec (t/Tensor a))) -> (Stepped a)
-  (let [n (+ (. st steps) 1) c1 (- 1.0 (ipow b1 n)) c2 (- 1.0 (ipow b2 n))
-        rs (vec (map-indexed (fn (i p) (adam-one lr b1 b2 eps c1 c2 p (nth grads i) (nth (. st m) i) (nth (. st v) i))) params))]
-    (Stepped (mapv (fn (r) (nth r 0)) rs) (AdamState (mapv (fn (r) (nth r 1)) rs) (mapv (fn (r) (nth r 2)) rs) n))))
+  (let [n (+ (. st steps) 1) c1 (- 1.0 (ipow b1 n)) c2 (- 1.0 (ipow b2 n))]
+    (match st
+      ((AdamState m v _)
+       (match (adam-loop lr b1 b2 eps c1 c2 grads params m v)
+         ((Triple ps ms vs) (Stepped ps (AdamState ms vs n))))))))

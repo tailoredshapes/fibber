@@ -1,0 +1,33 @@
+;; spec: docs/design/json.md section 9 (the runtime's UTF-8 validation, JSON-3)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; `read-file` answers nil for text that is not UTF-8 (rt/io.lir, fib.utf8-valid). The validator skips eight ASCII bytes at a time and decides every other byte
+;; one sequence at a time. A file of 40 ASCII bytes with one sequence put at each offset from 0 to 33 (so that it starts at every position of an eight-byte word and
+;; crosses every word boundary) is valid for the sequences of Rust's from_utf8 and invalid for a stray continuation byte, an overlong lead, a surrogate,
+;; a lead cut short by the end or by the next byte, and the bytes 0xF5 to 0xFF. A word-skip that looks at the wrong bits or steps by the wrong amount accepts or refuses one of them.
+(ns main (:use tl.check fib.core fib.seq fib.coll) (:require [fib.os :as os]))
+
+(defun text-with (at: i64 seq: (Vec i64)) -> (Array i8)
+  (let [out (cell (array (+ 40 (count seq)) 97i8))]
+    (do (dotimes (i 40) (array-set! &out (if (< i at) i (+ i (count seq))) (trunc i8 97)))
+        (dotimes (k (count seq)) (array-set! &out (+ at k) (trunc i8 (nth seq k))))
+        @out)))
+
+(defun readable? (path: str b: (Array i8)) -> bool
+  (match (os/write-file-bytes path b) ((Ok _) (some? (read-file path))) ((Err _) false)))
+
+(def valid: (Vec (Vec i64)) [[195 169] [226 130 172] [240 159 152 128] [237 159 191] [244 143 191 191] [194 128]])
+(def invalid: (Vec (Vec i64)) [[128] [191] [192 128] [193 191] [224 128 128] [237 160 128] [240 128 128 128] [244 144 128 128] [245 128 128 128] [255] [254] [195] [226 130] [195 65] [240 159 152]])
+
+(defun main () -> i64
+  (let [c (checks) path (str "/tmp/fib-8070-" (os/process-id))]
+    (do (dotimes (at 34)
+          (do (doseq [s valid] (check c (readable? path (text-with at s))))
+              (doseq [s invalid] (check c (not (readable? path (text-with at s)))))))
+        (check c (readable? path (array 64 97i8)))
+        (check c (not (readable? path (let [a (cell (array 64 97i8))] (do (array-set! &a 63 -56i8) @a)))))
+        (os/remove-file path)
+        (checks-result c))))

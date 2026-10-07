@@ -36,3 +36,36 @@
              (= head "Option") `(fib.json.codec/diag-opt d ~n ~p (fn (j: i64 q: str) ~inner))
              :else (trap "defjson: a field type is i64 f64 str bool (Vec T) (Option T) or a defjson record"))))
     (_ (trap "defjson: a field type is i64 f64 str bool (Vec T) (Option T) or a defjson record"))))
+
+
+;; The direct encoder (JSON-3): the i64 expression that writes the value of the expression form `e`, of the type form t, at the position `pp` of the block `b` of `cap` bytes
+;; through fib.json.writefast's position-passing writers, and answers the new position, or -1 when the block is full (the caller restarts with a bigger one). Leaves are
+;; writefast's; a Vec is a loop, an Option is `if-some`; a record is its own `wenc-NAME`. `dp` numbers the nesting so that the names of a Vec of Vec of ... differ.
+(defun digits-text (i: i64) -> str
+  (let ((ds ["0" "1" "2" "3" "4" "5" "6" "7" "8" "9"]))
+    (if (< i 10) (vec-nth ds i) (str-concat (digits-text (quot i 10)) (vec-nth ds (rem i 10))))))
+
+(defun encoder (t: Form e: Form dp: i64) -> Form
+  (match t
+    ((Sym s)
+     (cond (= s "i64") `(fib.json.writefast/wint b cap pp ~e)
+           (= s "f64") `(fib.json.writefast/wfloat b cap pp ~e &tb &tl)
+           (= s "str") `(fib.json.writefast/wstring b cap pp ~e false &tb &tl)
+           (= s "bool") `(fib.json.writefast/wbool b cap pp ~e)
+           :else `(~(Sym (str-concat "wenc-" s)) b cap pp ~e &tb &tl)))
+    ((List parts)
+     (let ((head (sym-text (vec-nth parts 0)))
+           (x (Sym (str-concat "x" (digits-text dp)))) (v (Sym (str-concat "v" (digits-text dp)))) (m (Sym (str-concat "m" (digits-text dp)))) (i (Sym (str-concat "i" (digits-text dp)))))
+       (cond (= head "Vec")
+             `(let [~v ~e ~m (count ~v) pp (fib.json.writefast/wchar b cap pp 91)]
+                (if (< pp 0) -1
+                    (let [pp (loop [~i 0 pp pp]
+                               (if (or (>= ~i ~m) (< pp 0)) pp
+                                   (recur (+ ~i 1)
+                                          (let [pp (if (> ~i 0) (fib.json.writefast/wchar b cap pp 44) pp)]
+                                            (if (< pp 0) -1 ~(encoder (vec-nth parts 1) `(nth ~v ~i) (+ dp 1)))))))]
+                      (if (< pp 0) -1 (fib.json.writefast/wchar b cap pp 93)))))
+             (= head "Option")
+             `(if-some [~x ~e] ~(encoder (vec-nth parts 1) x (+ dp 1)) (fib.json.writefast/wnull b cap pp))
+             :else (trap "defjson: a field type is i64 f64 str bool (Vec T) (Option T) or a defjson record"))))
+    (_ (trap "defjson: a field type is i64 f64 str bool (Vec T) (Option T) or a defjson record"))))
