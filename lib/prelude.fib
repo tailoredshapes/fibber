@@ -22,13 +22,6 @@
 ;; built on, and the names of stdlib §6.5.
 ;;
 ;; Vec is the persistent vector of types §2.13: a 32-way trie of
-;; (Array a) nodes with a tail of up to 32 elements, as in Clojure. A
-;; conj copies the tail (at most 32 elements) and, every 32 elements,
-;; one path of the trie; nth walks one path. It has an empty variant
-;; because (array n x) needs an element to fill with, so no function can
-;; make an empty (Array a) for a generic a. The reference interpreter
-;; builds and reads this layout natively for Form items and concat
-;; (fibref eval/vecs.rs), so a change here must be made there too.
 
 ;; Box (syntax §4.5)
 (defstruct (Box a) (v: a))
@@ -155,8 +148,7 @@
        (let ((kid (array-take! &c sub)))
          (do (array-set! &c sub (vnode-assoc kid (- level 5) i x)) (VBranch @c)))))))
 
-;; node, a branch at level, with element i moved out: the element and the node with a null where it was. On a unique path the element's
-;; count travels to the caller (array-take! nulls the slot of a unique array); on a shared one the arrays are copied first and the element is retained.
+;; node with element i moved out: the element and the node with a null there (a unique path hands the count over; a shared one is copied, the element retained).
 (defun vnode-take :private (node: (VNode a) level: i64 i: i64) -> (Pair a (VNode a))
   (match node
     ((VLeaf items)
@@ -170,10 +162,8 @@
          (match (vnode-take kid (- level 5) i)
            ((Pair e k2) (do (array-set! &c sub k2) (Pair e (VBranch @c))))))))))
 
-;; (vec-take-at v i) is the element i and v with that slot emptied, for the caller that puts a value back with (vec-assoc v2 i x) before any other use of v2:
-;; when v is unique (the caller's last use of it, every holder on the path a count of one) the element is unique too, so a caller that updates it in place
-;; (an optimiser step on a tensor) copies nothing. A shared v is copied along the path and the element is retained, as `nth` would. The emptied slot
-;; reads as null: v2 must be written at i (vec-assoc) or dropped, never read or shown (spec/types.md 2.13.1, "Null slots").
+;; (vec-take-at v i): element i and v with that slot emptied; put a value back with (vec-assoc v2 i x) before any other use of v2 (types 2.13.1, "Null slots").
+;; A unique v hands out a unique element (an optimiser step updates it in place); a shared v is copied along the path and the element retained.
 (defun vec-take-at (v: (Vec a) i: i64) -> (Pair a (Vec a))
   (match v
     ((VecEmpty) (trap "nth: index out of range"))
@@ -281,28 +271,9 @@
                  (nil (trap "vec: a vector with no leaves and no tail"))
                  ((some r) (vec-pop-root (- cnt 1) shift r (vnode-leaf r shift (- cnt 2)))))))))))
 
-;; The bulk builder (stdlib design §2.5; tranche 1 plan L9). A Vec built by conj spends 2.09 heap
-;; objects an element (the tail is copied, and one path of the trie every 32); built here, 2 objects
-;; for every 32 elements (a leaf's array and its node, and the same one level up for every 32 nodes)
-;; and a few constants. The layout is the one above, unchanged, because rt/vec.lir and eval/vecs.rs
-;; read it: VecOf cnt shift root tail with the last 1..32 elements exactly in the tail, full leaves
-;; in the trie, shift 5 for a root of leaves, and an empty vector VecEmpty. The result is the vector
-;; a conj loop builds, as far as a program can tell (cases 480 and 481 read every element of a built
-;; vector and of the same grown by conj, which depends on the shift, the tail and the leaves being
-;; where a conj loop puts them); eval/vecs.rs build_vec stacks the branches the same way.
-;; Decided here:
-;;  - two entry points, both public: vec-from-array for an array whose length is known, and
-;;    vec-collect for a walk of unknown length (what the library's default to-vec is);
-;;  - the buffer of a collect has 32 slots, made from the first element (an (Array a) of a generic
-;;    a cannot be made without one) and written in place by array-set!; it becomes a leaf, itself
-;;    and not a copy, when the 33rd element of its run arrives, so a full buffer that ends the walk
-;;    is the tail without a copy;
-;;  - every mutable part of the state is a cell holding its array alone, because only then does
-;;    array-set! write in place (the count of a callee's owned parameter is two: §2.5);
-;;  - the leaves are an array that doubles from 4, made when the first leaf is full;
-;;  - the price is a constant: the state is a cell, a struct and three cells, so a collect of one element
-;;    allocates 6 more objects than the conj loop it replaced, of two 4 more, of three 2 more, of four the
-;;    same and of five or more fewer (cases 483 and 489 pin the counts).
+;; The bulk builder (stdlib design 2.5; tranche 1 plan L9): a Vec built by conj spends 2.09 heap objects an element, built here 2 for every 32 elements. The layout is the
+;; one above, unchanged (rt/vec.lir and eval/vecs.rs read it): VecOf cnt shift root tail, the last 1..32 elements exactly in the tail, full leaves in the trie, shift 5 for a root
+;; three 2 more, four the same, five or more fewer (cases 483 and 489 pin the counts).
 
 ;; The branches one level up: nodes[0..n) in groups of 32, an array of ceil(n/32) branches.
 (defun vnodes-up :private (nodes: (Array (VNode a)) n: i64) -> (Array (VNode a))
@@ -338,46 +309,6 @@
                             (recur (+ i 1)))
                         ()))
                   (vec-trie n 5 @leaves (shr split 5) (array-copy xs split n))))))))
-
-;; Leaves made where the elements are made (fib.parallel.pmap): a parallel call returns its results in chunks, and building the Vec from one array
-;; afterwards is two serial passes over every element. A chunk of a multiple of 32 results (any length for the last chunk) is cut into its leaves by
-;; the task that made it; the caller only joins the leaves and stacks the branches, one pointer per 32 elements.
-;; (vec-chunk-leaves xs last?): the full leaves of xs (nil when it has none) and the tail: xs itself when it is all tail, else the last 1..32 elements
-;; of the last chunk (an empty array for a chunk that is not the last). A chunk that is not the last and not a multiple of 32 elements is a trap.
-(defun vec-chunk-leaves (xs: (Array a) last: bool) -> (Pair (Option (Array (VNode a))) (Array a))
-  (let ((n (array-len xs)))
-    (if (and (not last) (!= (bit-and n 31) 0))
-        (trap "vec-chunk-leaves: a chunk that is not the last holds a multiple of 32 elements")
-        (let ((t (if last (+ (bit-and (- n 1) 31) 1) 0))
-              (m (- n (if last (+ (bit-and (- n 1) 31) 1) 0))))
-          (if (= m 0)
-              (Pair nil xs)
-              (let ((k (shr m 5))
-                    (c (cell (array (shr m 5) (VLeaf (array-copy xs 0 32))))))
-                (do (loop ((i 1))
-                      (if (< i k)
-                          (do (array-set! &c i (VLeaf (array-copy xs (shl i 5) (+ (shl i 5) 32)))) (recur (+ i 1)))
-                          ()))
-                    (Pair (some @c) (if (= t 0) (array-copy xs 0 0) (array-copy xs m n))))))))))
-
-;; The leaves of the chunks, in order, as a Vec: the parts are the answers of `vec-chunk-leaves` in chunk order, the last one holding the tail (at least 1 element).
-(defun vec-join-leaves (parts: (Vec (Pair (Option (Array (VNode a))) (Array a)))) -> (Vec a)
-  (let ((np (vec-count parts))
-        (leaves (loop ((i 0) (s 0))
-                  (if (< i (vec-count parts))
-                      (recur (+ i 1) (match (. (vec-nth parts i) fst) ((some l) (+ s (array-len l))) (nil s)))
-                      s)))
-        (tail (. (vec-nth parts (- (vec-count parts) 1)) snd)))
-    (if (= leaves 0)
-        (VecOf (array-len tail) 5 nil tail)
-        (let ((all (cell (array leaves (loop ((i 0)) (match (. (vec-nth parts i) fst) ((some l) (array-get l 0)) (nil (recur (+ i 1)))))))))
-          (do (loop ((i 0) (at 0))
-                (if (< i np)
-                    (match (. (vec-nth parts i) fst)
-                      ((some l) (do (dotimes (j (array-len l)) (array-set! &all (+ at j) (array-get l j))) (recur (+ i 1) (+ at (array-len l)))))
-                      (nil (recur (+ i 1) at)))
-                    ()))
-              (vec-trie (+ (shl leaves 5) (array-len tail)) 5 @all leaves tail))))))
 
 ;; The state of a build from a walk of unknown length: the buffer being filled (32 slots), the
 ;; count of elements taken, and the full leaves so far, an array that doubles (made when the first
@@ -438,9 +369,6 @@
 
 ;; Show of Option and List as Clojure prints them (stdlib design §2.7): a
 ;; present value is its payload's text (a nested Option is as ambiguous as
-;; Clojure's nested nil), nil is `nil`, and a List is its elements in
-;; parentheses, a space apart: `(1 2)`, `()`. The two are here, not
-;; derived, because a derived Show says `(some 3)` and `(Cons 1 (Cons 2
 ;; Empty))`.
 (impl Show (Option a) :where ((Show a))
   (show (self)
@@ -755,10 +683,6 @@
 
 ;; I/O (syntax §4.5): println and eprintln write s and a newline to fd 1
 ;; and fd 2 through the C write(2), copying the string's bytes to a raw
-;; buffer first. write may take fewer bytes than it is given, so each
-;; string is written in a loop until every byte has gone, and a call
-;; that fails (-1) or makes no progress (0 bytes of a non-empty rest,
-;; which would loop for ever) is the trap `NAME: write failed`, NAME
 ;; being the function the program called.
 (extern write :private (i32 ptr i64) -> i64)
 

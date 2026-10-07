@@ -53,19 +53,8 @@
 (defun pmap-chunks-array (p: Par n: i64 chunk-fn: (fn :send (i64 i64) (Array b))) -> (Array b)
   (concat-chunks (run-chunks (. p workers) n (auto-grain p n) chunk-fn) n))
 
-;; A Vec result of many elements is built from leaves cut by the tasks that made the elements (`vec-chunk-leaves`, prelude): the grain is a multiple of 32 so that every
-;; chunk but the last is whole leaves, and the serial part of the call is one pointer per 32 elements instead of two passes over every element (a copy into one array, and
-;; `vec-from-array`: at 1e8 elements those two passes were most of the call, which is why pmap did not scale: docs/shootout/parallel.md). Below LEAF-MIN results the old path
-;; is kept: the grain of a small call is its own (an 8-chunk call over 64 elements stays 8 chunks) and the serial part is nothing.
-(def LEAF-MIN: i64 8192)
-
-(defun leaf-grain (g: i64) -> i64 (shl (shr (+ g 31) 5) 5))
-
 (defun pmap-chunks (p: Par n: i64 chunk-fn: (fn :send (i64 i64) (Array b))) -> (Vec b)
-  (cond (<= n 0) []
-        (< n LEAF-MIN) (vec-from-array (pmap-chunks-array p n chunk-fn))
-        :else (vec-join-leaves (run-chunks (. p workers) n (leaf-grain (auto-grain p n))
-                                           (fn (lo hi) (vec-chunk-leaves (chunk-fn lo hi) (>= hi n)))))))
+  (if (<= n 0) [] (vec-from-array (pmap-chunks-array p n chunk-fn))))
 
 (defn pmap
   ([f: (fn :send (a) b) xs: (Vec a)] -> (Vec b) (pmap-chunks (par) (vec-count xs) (fn (lo hi) (map-chunk f xs lo hi))))

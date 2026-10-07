@@ -42,7 +42,7 @@ checksum, ms:
 | `MALLOC_ARENA_MAX=2` | old | 980 | 1388 | 830 | 1016 | 950 | 1.2x | 413 |
 | `MALLOC_ARENA_MAX=2` | new | 1072 | 1320 | 2081 | 1417 | 1153 | 0.93x | 440 to 810 |
 
-The change (`vec-chunk-leaves` and `vec-join-leaves` in the prelude, `pmap-chunks`): from 8192 results the grain is a multiple of 32, each worker cuts its chunk into the leaves of the result,
+**Not shipped; a measured prototype.** The prototype (`vec-chunk-leaves` and `vec-join-leaves` in the prelude, `pmap-chunks`; commit 2be99b2, reverted in the commit after it): from 8192 results the grain is a multiple of 32, each worker cuts its chunk into the leaves of the result,
 and the caller joins one pointer per 32 elements. It scales with the default glibc arenas (2.35x at 16 workers; the rest of the call is thread start, the join, and the 3M objects freed later).
 **With `MALLOC_ARENA_MAX=2`, which the AWS round used because a 32-core machine under `ulimit -v 16000000` cannot afford 8 arenas a core, it is worse than the old path from W=2**: 6 million small
 `malloc` calls from 4 to 16 threads contend on two arenas. That is the allocator finding: in multithreaded mode every small allocation is a `malloc` (rt/core.lir: `fib.mt` turns the free lists
@@ -51,8 +51,10 @@ change (the runtime fast path, the task entry and ADR 0018's decay would all cha
 parallel work that does not assemble a result scales with either setting (`pfor-alloc`, 1e7 elements, each a Vec of 6: 1036 ms at W=1, 247 at 16, default; 238 at 16 with 2 arenas), and
 `alloc` (the same per element, assembled by `pmap-range`) 1073 ms at W=1, 427 at 16 (old) and 301 (new). `preduce-range` 196, 101, 63 to 88, 45 to 50, 38 to 46 ms at W=1, 2, 4, 8, 16 (no result to assemble: unchanged).
 
-Below 8192 results the old path is kept (the grain of a small call is its own: case 7608 counts 8 chunks over 64 elements). Case 8205 pins the new path (every size around the switch and a leaf
-boundary, W 1 to 8, grains that are and are not multiples of 32).
+It was reverted for two reasons. The `MALLOC_ARENA_MAX=2` regression above is a regression for the configuration the benchmarks and `ulimit -v` users run in. And ADR 0006 holds `lib/prelude.fib` to 721
+lines (the allow-list only shrinks), and the two functions need the prelude's private `VNode` and `vec-trie`: they could not stay. Case 8205 (every size around the switch and a leaf boundary, W 1 to 8, grains
+that are and are not multiples of 32) passed with the prototype and was removed with it; commit 2be99b2 has both. The shipped part of this section is the diagnosis and `scripts/bench/parallel-scale.fib`.
+The order of work: the per-thread small-block cache first (it removes the arena effect for every parallel program), then the leaf assembly, which then needs no flag.
 
 ## 3. Shootout outliers
 
