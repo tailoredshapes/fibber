@@ -1,0 +1,46 @@
+;; spec:   syntax §3.9a (a constructor as a value), types §2.2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; A constructor is a function of its fields. Named where a value is wanted it is `(fn (c1 .. cn) (Ctor c1 .. cn))`: `(mapv some xs)` is `(Vec (Option T))`
+;; (it was `unsupported: a constructor as a value`), and so are `Ok` and `Err`, a struct's constructor, a variant with several fields, `partial`,
+;; `comp`, a `let` binding and a `def`. A variant without fields stays a value (`Dot` is not called). A constructor in call position is still the
+;; constructor, not a closure around it. Killed by: scripts/mutant-ctor-value.sh.
+(ns main (:use tl.check))
+
+(defstruct Tagged (tag: str n: i64))
+(defstruct Wrap (v: (Vec i64)))
+(defenum Shape (Circle r: i64) (Rect w: i64 h: i64) Dot)
+
+(def mk-tagged: (fn (str i64) Tagged) Tagged)
+(def wrap-it: (fn ((Vec i64)) Wrap) Wrap)
+
+(defun area (s: Shape) -> i64
+  (match s ((Circle r) (* r r)) ((Rect w h) (* w h)) (Dot 0)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (xs [1 2 3])
+        (opts (mapv some xs))
+        (oks (mapv Ok xs))
+        (errs (mapv (fn (s: str) (Err s)) ["a"]))
+        (circles (mapv Circle xs))
+        (wraps (mapv wrap-it [[1] [2 3] []]))
+        (rects (mapv (partial Rect 10) xs))
+        (some-inc (comp some inc))
+        (let-bound Tagged)
+        (dots (mapv (fn (x: i64) Dot) xs)))
+    (do (check c (= opts [(some 1) (some 2) (some 3)]))
+        (check c (= (count oks) 3))
+        (check c (match (nth oks 1) ((Ok v) (= v 2)) ((Err _) false)))
+        (check c (match (nth errs 0) ((Err m) (= m "a")) ((Ok _) false)))
+        (check c (= (mapv area circles) [1 4 9]))
+        (check c (= (mapv area rects) [10 20 30]))
+        (check c (= (mapv (fn (w: Wrap) (count (. w v))) wraps) [1 2 0]))
+        (check c (= (. (mk-tagged "t" 5) n) 5))
+        (check c (= (. (let-bound "u" 6) tag) "u"))
+        (check c (= (some-inc 1) (some 2)))
+        (check c (= (mapv area dots) [0 0 0]))
+        (check c (= (area (Rect 2 3)) 6))
+        (checks-result c))))
