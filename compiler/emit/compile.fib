@@ -7,7 +7,7 @@
 ;; set and holds what needs no body, the runtime and `main`.
 ;; `compile-macro` (E11) is the macro-time module of one `defmacro` (macros/abi.rs's text is emit.macros.abi's).
 (ns emit.compile
-  (:require [fib.string :as s] [emit.defs.astmod :as am] [emit.cpucheck :as cc] [emit.wasi :as wasi] [expand.targetos :as tos])
+  (:require [fib.string :as s] [emit.defs.astmod :as am] [emit.cpucheck :as cc] [emit.wasi :as wasi] [expand.targetos :as tos] [types.targets :as tt])
   (:use types.ty types.table types.decls types.init types.program own.program emit.value emit.names emit.objects emit.statics emit.program emit.inits
         emit.assemble emit.defs.mod emit.lower.cx emit.lower.mod emit.macros.abi types.target))
 
@@ -178,10 +178,22 @@
     ((Err m) (Err m))
     ((Ok m) (match (. m pending) ((some msg) (Err msg)) (nil (Ok (for-target (str-concat (target-form typed) (module-text m)))))))))
 
-;; The same for an executable, whose `main` returns the result as the process status and prints nothing (compiler.md §1).
+;; The kernels of the program as export specs, for a kernel target (docs/design/gpu.md 4): every function `defkernel` made (`gpu-kernel-NAME`, in any module
+;; of the program), exported as NAME. The emitter then lowers what the kernels reach, and native.kernel keeps that and drops the wrappers.
+(defun kernel-specs :private (typed: TypedProgram) -> (Vec (Pair str str))
+  (let ((g (. typed globals)) (pre tt/KERNEL-FUN-PREFIX))
+    (loop ((i 0) (out []))
+      (cond (>= i (table-count (. g funs))) out
+            (and (not (. (g-fun g i) is-macro)) (starts-with? (. (g-fun g i) name) pre))
+              (recur (+ i 1) (conj out (Pair (str-slice (. (g-fun g i) name) (str-len pre) (str-len (. (g-fun g i) name))) (. (g-fun g i) name))))
+            :else (recur (+ i 1) out)))))
+
+;; The same for an executable, whose `main` returns the result as the process status and prints nothing (compiler.md §1); on a kernel target the
+;; module is the kernels' (the exports are the kernels, `kernel-specs`).
 ;; Rust: compile.rs:53 compile_executable
 (defun compile-executable (typed: TypedProgram owned: OwnedProgram) -> (Result str str)
-  (match (let ((specs (export-specs))) (if (empty? specs) (compile-module typed owned true) (compile-library typed owned specs)))
+  (match (let ((specs (if (tt/kernel-triple? (sys-getenv "FIB_TARGET_TRIPLE")) (kernel-specs typed) (export-specs))))
+           (if (empty? specs) (compile-module typed owned true) (compile-library typed owned specs)))
     ((Err m) (Err m))
     ((Ok m) (match (. m pending) ((some msg) (Err msg)) (nil (Ok (for-target (str-concat (target-form typed) (module-text m)))))))))
 
