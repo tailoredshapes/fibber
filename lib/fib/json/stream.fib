@@ -1,0 +1,163 @@
+;; fib.json.stream: documents from a file descriptor in bounded memory (docs/design/json.md 7). The reader keeps one chunk of text (4 MiB, 4 MB for the parallel fold, under the 4 MiB at which the runtime asks for huge pages: a larger read is a fresh mapping each time, 100 ms stalls were seen) cut at its last
+;; newline, plus the bytes after that newline for the next chunk; UTF-8 is checked per chunk, so a character cannot be cut by a chunk (a cut is at a newline). A document that does not
+;; end inside the chunk (a pretty-printed one that spans lines, or any one longer than a chunk) is completed by reading on: the unparsed tail is put in front of the next read, and it
+;; is an error only when the file ends first. A stream with no newline at all is read whole. Errors carry the offset, line and column in their chunk.
+;;   (lines-seq path opts) -> (Result (LSeq (Result Json JsonError)) JsonError)    the documents, lazily, in order; the file is closed when the seq is read to its end
+;;                                                                          (an abandoned seq keeps its descriptor until the process ends: fold with `reduce-lines` to be sure)
+;;   (reduce-lines-par-map path opts g f init)   each document of each 32 MiB chunk goes through g on all cores (the DOM is made and dropped inside the task: its memory is
+;;                                               reused by the next line), the results of g are folded in file order by f; a document may not span lines here
+(ns fib.json.stream (:use fib.core fib.seq fib.coll fib.parallel fib.json.types) (:require [fib.os :as os] [fib.json.lines :as ln] [fib.json.parse :as p] [fib.json.domfast :as df] [fib.json.utf8 :as u] [fib.json.libc :as libc]))
+
+(defun io-error (what: str) -> JsonError (JsonError 15 (str "I/O error: " what) 0 1 1))
+
+(defstruct Chunk (bytes: (Array i8) rest: (Array i8) eof: bool))
+;; head: the line that straddles the cut; bytes[from, to): the whole lines of this read after it; rest: what follows the last newline
+(defstruct Split (head: (Array i8) bytes: (Array i8) from: i64 to: i64 rest: (Array i8) eof: bool))
+
+(defun last-newline (b: (Array i8)) -> i64
+  (loop [i (- (array-len b) 1)] (cond (< i 0) -1 (= (array-get b i) 10i8) i :else (recur (- i 1)))))
+
+(defun join-bytes (a: (Array i8) b: (Array i8)) -> (Array i8)
+  (let [out (array (+ (array-len a) (array-len b)) 0i8)]
+    (do (unsafe (do (libc/memcpy (ptr+ (raw out) 24) (ptr+ (raw a) 24) (array-len a))
+                    (libc/memcpy (ptr+ (raw out) (+ 24 (array-len a))) (ptr+ (raw b) 24) (array-len b))))
+        out)))
+
+(defun text-of (b: (Array i8)) -> (Result str JsonError)
+  (let [bad (u/first-invalid b)] (if (>= bad 0) (Err (u/make-error-bytes b e-utf8 bad)) (Ok (str-from-bytes b)))))
+
+;; Reads until `rest` and the new bytes hold a newline (the bytes are everything up to and with the last one, the rest is what follows) or the file ends (the bytes are all of it).
+(defun read-chunk (fd: i64 rest: (Array i8) size: i64) -> (Result Chunk JsonError)
+  (loop [buf rest]
+    (match (os/read-fd fd size)
+      ((Err e) (if (= (. e kind) os/Interrupted) (recur buf) (Err (io-error (. e message)))))
+      ((Ok c)
+       (if (= (array-len c) 0)
+           (Ok (Chunk buf (array 0 0i8) true))
+           (let [all (join-bytes buf c) cut (last-newline all)]
+             (if (< cut 0) (recur all)
+                 (Ok (Chunk (array-copy all 0 (+ cut 1)) (array-copy all (+ cut 1) (array-len all)) false)))))))))
+
+;; One read, split without copying it: the end of the previous read and the first line of this one are joined (a line), the lines up to the last newline stay where they are.
+(defun read-split (fd: i64 rest: (Array i8) size: i64) -> (Result Split JsonError)
+  (match (os/read-fd fd size)
+    ((Err e) (if (= (. e kind) os/Interrupted) (read-split fd rest size) (Err (io-error (. e message)))))
+    ((Ok c)
+     (let [n (array-len c)]
+       (if (= n 0) (Ok (Split rest c 0 0 (array 0 0i8) true))
+           (let [cut (last-newline c)]
+             (if (< cut 0)
+                 (read-split fd (join-bytes rest c) size)
+                 (let [first-nl (nl-from c n 0)]
+                   (Ok (Split (join-bytes rest (array-copy c 0 (+ first-nl 1))) c (+ first-nl 1) (+ cut 1) (array-copy c (+ cut 1) n) false))))))))))
+
+;; ---- the parallel fold: the lines are found in the bytes, and each task copies, validates and parses its own line
+
+(defun nl-from (b: (Array i8) n: i64 from: i64) -> i64
+  (loop [i from]
+    (if (<= (+ i 32) n)
+        (let [v: (Simd i8 32) (unsafe (load-simd (ptr+ (raw b) (+ 24 i))))
+              m (simd/movemask (simd/eq v (splat (Simd i8 32) 10i8)))]
+          (if (= m 0) (recur (+ i 32)) (+ i (ctz m))))
+        (loop [k i] (cond (>= k n) n (= (array-get b k) 10i8) k :else (recur (+ k 1)))))))
+
+(defun blank-bytes? (b: (Array i8) from: i64 to: i64) -> i64
+  (loop [k from] (cond (>= k to) to (let [c (array-get b k)] (or (= c 32i8) (or (= c 9i8) (= c 13i8)))) (recur (+ k 1)) :else k)))
+
+;; The non-blank lines of the bytes: where each starts (its first byte that is not white space), where it ends, its number in the chunk and where its line begins.
+(defstruct ByteLines (starts: (Array i64) ends: (Array i64) numbers: (Array i64) bols: (Array i64) count: i64))
+
+(defun count-newlines (b: (Array i8) n: i64) -> i64
+  (loop [i 0 c 0]
+    (if (<= (+ i 32) n)
+        (let [v: (Simd i8 32) (unsafe (load-simd (ptr+ (raw b) (+ 24 i))))]
+          (recur (+ i 32) (+ c (popcount (simd/movemask (simd/eq v (splat (Simd i8 32) 10i8)))))))
+        (loop [k i c2 c] (if (< k n) (recur (+ k 1) (if (= (array-get b k) 10i8) (+ c2 1) c2)) c2)))))
+
+(defun byte-lines (b: (Array i8) from: i64 n: i64) -> ByteLines
+  (let [cap (+ 1 (count-newlines b n))
+        st (cell (array cap 0)) en (cell (array cap 0)) no (cell (array cap 0)) bo (cell (array cap 0))]
+    (loop [ls from line 1 m 0]
+      (if (>= ls n) (ByteLines @st @en @no @bo m)
+          (let [e (nl-from b n ls) a (blank-bytes? b ls e)]
+            (if (>= a e) (recur (+ e 1) (+ line 1) m)
+                (do (array-set! &st m a) (array-set! &en m e) (array-set! &no m line) (array-set! &bo m ls)
+                    (recur (+ e 1) (+ line 1) (+ m 1)))))))))
+
+(defun parse-bytes-line (b: (Array i8) t: ByteLines i: i64 o: JsonOptions) -> (Result Json JsonError)
+  (let [a (array-get (. t starts) i) e (array-get (. t ends) i) no (array-get (. t numbers) i) bol (array-get (. t bols) i)
+        seg (array-copy b a e)
+        bad (u/first-invalid seg)]
+    (if (>= bad 0)
+        (Err (ln/place-error (u/make-error-bytes seg e-utf8 bad) a no bol))
+        (let [line (str-from-bytes seg)
+              fast (if (< (str-len line) 512) nil (df/parse-fast line o))]
+          (match fast
+            ((some v) (Ok v))
+            (nil (match (p/parse-with line o) ((Ok v) (Ok v)) ((Err er) (Err (ln/place-error er a no bol))))))))))
+
+(defun fold-lines-of (b: (Array i8) from: i64 n: i64 o: JsonOptions g: (fn ((Result Json JsonError)) r) f: (fn (a r) a) acc: a) -> a
+  (let [t (byte-lines b from n) m (. t count)
+        rs (pmap-range [i m] (g (parse-bytes-line b t i o)))]
+    (reduce f acc rs)))
+
+;; A chunk is the line that straddles the cut (`head`: the end of the previous read joined to the first line of this one) and the whole lines of the read itself, [from, to) of `body`: nothing big is copied.
+(defun fold-chunk (head: (Array i8) body: (Array i8) from: i64 to: i64 o: JsonOptions g: (fn ((Result Json JsonError)) r) f: (fn (a r) a) acc: a) -> a
+  (let [a1 (if (> (array-len head) 0) (fold-lines-of head 0 (array-len head) o g f acc) acc)]
+    (fold-lines-of body from to o g f a1)))
+
+(defun reduce-lines-par-map (path: str o: JsonOptions g: (fn ((Result Json JsonError)) r) f: (fn (a r) a) init: a) -> (Result a JsonError)
+  (match (os/open-file path (os/default-file-options))
+    ((Err e) (Err (io-error (. e message))))
+    ((Ok fd)
+     (let [res (loop [acc init rest: (Array i8) (array 0 0i8)]
+                 (match (read-split fd rest 4000000)
+                   ((Err e) (Err e))
+                   ((Ok c) (let [acc2 (fold-chunk (. c head) (. c bytes) (. c from) (. c to) o g f acc)]
+                             (if (. c eof) (Ok acc2) (recur acc2 (. c rest)))))))]
+       (do (os/close-fd fd) res)))))
+
+;; ---- the lazy seq of documents
+
+(defstruct LineSrc (fd: i64 text: str pos: i64 rest: (Array i8) eof: bool o: JsonOptions))
+
+(defun ended (st: LineSrc) -> LineSrc (LineSrc (. st fd) "" 0 (array 0 0i8) true (. st o)))
+
+;; The state with the cursor moved to `pos`.
+(defun at-pos (st: LineSrc pos: i64) -> LineSrc (LineSrc (. st fd) (. st text) pos (. st rest) (. st eof) (. st o)))
+
+;; The document that starts at `at` (a line of the text ends at e): the DOM builder on the line when it is long, else the scalar reader, which also knows where a document that spans lines ends.
+(defun doc-at (st: LineSrc at: i64 e: i64) -> (Option (Pair (Result Json JsonError) LineSrc))
+  (let [text (. st text) n (str-len text)
+        fast (if (< (- e at) 512) nil (df/parse-fast (str-slice text at e) (. st o)))]
+    (match fast
+      ((some v) (some (Pair (Ok v) (at-pos st e))))
+      (nil (match (p/parse-at text (. st o) at)
+             (nil nil)
+             ((some pr)
+              (if (and (not (. st eof)) (match (. pr fst) ((Err er) (= (. er code) e-eof)) ((Ok _) false)))
+                  (more st (str-bytes (str-slice text at n)))
+                  (some (Pair (. pr fst) (at-pos st (. pr snd)))))))))))
+
+;; The next document and the state after it; nil at the end of the stream.
+(defun next-doc (st: LineSrc) -> (Option (Pair (Result Json JsonError) LineSrc))
+  (let [text (. st text) n (str-len text) at (ln/skip-white text n (. st pos))]
+    (cond (< at n) (doc-at st at (ln/newline-from text n at))
+          (. st eof) (do (os/close-fd (. st fd)) nil)
+          :else (more st (array 0 0i8)))))
+
+;; Reads the next chunk behind `tail` (what of the text is still unparsed) and goes on.
+(defun more (st: LineSrc tail: (Array i8)) -> (Option (Pair (Result Json JsonError) LineSrc))
+  (match (read-chunk (. st fd) (join-bytes tail (. st rest)) 4194304)
+    ((Err e) (do (os/close-fd (. st fd)) (some (Pair (Err e) (ended st)))))
+    ((Ok c) (match (text-of (. c bytes))
+              ((Err e) (do (os/close-fd (. st fd)) (some (Pair (Err e) (ended st)))))
+              ((Ok t) (next-doc (LineSrc (. st fd) t 0 (. c rest) (. c eof) (. st o))))))))
+
+(defun doc-seq (st: LineSrc) -> (LSeq (Result Json JsonError))
+  (lazy-node (fn () (match (next-doc st) ((some pr) (LCons (. pr fst) (doc-seq (. pr snd)))) (nil LNil)))))
+
+(defun lines-seq (path: str o: JsonOptions) -> (Result (LSeq (Result Json JsonError)) JsonError)
+  (match (os/open-file path (os/default-file-options))
+    ((Err e) (Err (io-error (. e message))))
+    ((Ok fd) (Ok (doc-seq (LineSrc fd "" 0 (array 0 0i8) false o))))))

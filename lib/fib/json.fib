@@ -10,6 +10,7 @@
 ;;   (json/doc-write d) (json/doc-write-node d i) (json/doc-write-bytes d i)   a Doc written back compact without a Json: strings and numbers are copied as the source spelled them
 ;;   (json/reduce-events d f init)      SAX: f gets (acc, JsonEvent) per token         (json/documents text) a text of several documents (NDJSON or concatenated)
 ;;   (json/reduce-lines path opts f init)   a file of one document per line in chunks: bounded memory   (json/reduce-lines-par path opts f init) the same on all cores (lines only)
+;;   (json/lines-seq path opts)              a lazy seq of the documents of a file (one per line, or concatenated with newlines between), bounded memory   (json/reduce-lines-par-map path opts g f init) g runs in the task
 ;;   (json/parse-lines text opts)            the documents of a text of one per line, parsed in parallel, in order
 ;;   (->json x)  (json/json->datum j)  (json/datum->json d)                    plain data and fib.datum
 ;; Errors are values: a JsonError has a code, a message, the byte offset, the line and the column; nothing here traps on input.
@@ -17,7 +18,7 @@
   (:use fib.core fib.seq fib.coll fib.datum fib.json.types fib.json.convert)
   (:export-from fib.json.types)
   (:require [fib.os :as os] [fib.json.parse :as p] [fib.json.write :as w] [fib.json.access :as a] [fib.json.tapebuild :as tb] [fib.json.view :as v]
-            [fib.json.events :as ev] [fib.json.io :as io] [fib.json.domfast :as df] [fib.json.lines :as ln] [fib.json.convert :as cv] [fib.json.tape :as tp] [fib.json.docwrite :as dw]))
+            [fib.json.events :as ev] [fib.json.io :as io] [fib.json.domfast :as df] [fib.json.lines :as ln] [fib.json.convert :as cv] [fib.json.tape :as tp] [fib.json.docwrite :as dw] [fib.json.stream :as sm]))
 
 (defun parse (s: str) -> (Result Json JsonError) (df/parse-fast-default s))
 (defun parse-with (s: str o: JsonOptions) -> (Result Json JsonError) (df/parse-with-fast s o))
@@ -29,6 +30,8 @@
 (defun reduce-lines (path: str o: JsonOptions f: (fn (a (Result Json JsonError)) a) init: a) -> (Result a JsonError) (io/reduce-lines path o f init))
 
 (defun reduce-lines-par (path: str o: JsonOptions f: (fn (a (Result Json JsonError)) a) init: a) -> (Result a JsonError) (io/reduce-lines-par path o f init))
+(defun lines-seq (path: str o: JsonOptions) -> (Result (LSeq (Result Json JsonError)) JsonError) (sm/lines-seq path o))
+(defun reduce-lines-par-map (path: str o: JsonOptions g: (fn ((Result Json JsonError)) r) f: (fn (a r) a) init: a) -> (Result a JsonError) (sm/reduce-lines-par-map path o g f init))
 (defun parse-lines (s: str o: JsonOptions) -> (Vec (Result Json JsonError)) (ln/parse-lines s o))
 
 (defun write (j: Json) -> str (w/write j))

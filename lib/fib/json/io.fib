@@ -2,7 +2,7 @@
 ;; builtin `read-file` (one read; it answers nil for an unreadable file or for text that is not UTF-8) and, only when that fails, a chunked read through
 ;; file descriptors into a growable buffer, which tells an I/O error (code 15) from invalid UTF-8 (code 6, with the offset).
 ;; Lines and bounded memory: `reduce-lines` reads a file of one document per line (NDJSON) in chunks of 4 MiB and holds one chunk and one document at a time.
-(ns fib.json.io (:use fib.core fib.seq fib.coll fib.json.types fib.json.parse fib.json.write fib.json.buffer fib.json.utf8) (:require [fib.os :as os] [fib.json.domfast :as df] [fib.json.lines :as ln]))
+(ns fib.json.io (:use fib.core fib.seq fib.coll fib.json.types fib.json.parse fib.json.write fib.json.buffer fib.json.utf8) (:require [fib.os :as os] [fib.json.domfast :as df] [fib.json.lines :as ln] [fib.json.stream :as sm]))
 
 (defun io-error (what: str) -> JsonError (JsonError 15 (str "I/O error: " what) 0 1 1))
 
@@ -57,24 +57,9 @@
 (defun fold-lines (s: str o: JsonOptions f: (fn (a (Result Json JsonError)) a) init: a) -> a (ln/fold-lines-seq s o f init))
 
 ;; The same for a file of one document per line, each chunk of 32 MiB parsed on all cores (the results are folded in order, so f sees the file's order); memory: a chunk, its
-;; documents and the result vector. A document that spans lines is an error here (use reduce-lines).
+;; documents and the result vector. A document that spans lines is an error here (use reduce-lines). `fib.json.stream/reduce-lines-par-map` does the work of a function in the task too.
 (defun reduce-lines-par (path: str o: JsonOptions f: (fn (a (Result Json JsonError)) a) init: a) -> (Result a JsonError)
-  (match (os/open-file path (os/default-file-options))
-    ((Err e) (Err (io-error (. e message))))
-    ((Ok fd)
-     (let [r (loop [acc init rest: (Array i8) (array 0 0i8)]
-               (match (os/read-fd fd 33554432)
-                 ((Err e) (Err (io-error (. e message))))
-                 ((Ok chunk)
-                  (if (= (array-len chunk) 0)
-                      (Ok (if (> (array-len rest) 0) (fold-results (ln/parse-lines (str-from-bytes rest) o) f acc) acc))
-                      (let [all (let [b (cell (new-buffer (+ (array-len rest) (array-len chunk)))) l (cell 0)]
-                                  (do (put-bytes &b &l rest) (put-bytes &b &l chunk) (buffer-bytes @b @l)))
-                            cut (last-newline all)]
-                        (if (< cut 0)
-                            (recur acc all)
-                            (recur (fold-results (ln/parse-lines (str-from-bytes (array-copy all 0 cut)) o) f acc) (array-copy all (+ cut 1) (array-len all)))))))))]
-       (do (os/close-fd fd) r)))))
+  (sm/reduce-lines-par-map path o (fn (r: (Result Json JsonError)) r) f init))
 
 (defun fold-results (rs: (Vec (Result Json JsonError)) f: (fn (a (Result Json JsonError)) a) init: a) -> a
   (loop [i 0 acc init] (if (< i (count rs)) (recur (+ i 1) (f acc (nth rs i))) acc)))
