@@ -1,0 +1,28 @@
+;; spec: spec/stdlib.md section 4.7 (str/split, str/split-lines), docs/adr/0006 (no quadratic work in a library loop)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; Package LIBFIX-1: `str/split` on a multi-megabyte string. A split of 3.9 MB into 400,000 pieces (each piece holds a non-ASCII character, so a character
+;; offset and a byte offset differ at once) must give the right pieces and take under 5 s (it takes about 10 ms: a split that counted characters from the start of
+;; the string at every cut, as `subs` does, is quadratic and takes minutes). Both spellings of the pattern (a str and a char), `split-lines`, and the
+;; limit are checked on the pieces: first, last, a middle one, the count.
+(ns main (:use tl.check fib.coll) (:require [fib.string :as s] [fib.os :as os]))
+
+(defun main () -> i64
+  (let [c (checks) m 400000
+        big (s/join "," (mapv (fn (i: i64) (str "w\u{e9}" i)) (range m)))
+        lines (s/join "\n" (mapv (fn (i: i64) (str "\u{20ac}" i)) (range m)))
+        t0 (os/clock-now)
+        a (s/split big ",")
+        b (s/split big \,)
+        l (s/split-lines lines)
+        k (s/split big "," 3)
+        t1 (os/clock-now)]
+    (do (check c (and (= (count a) m) (= (nth a 0) "w\u{e9}0") (= (nth a 199999) "w\u{e9}199999") (= (nth a (- m 1)) "w\u{e9}399999")))
+        (check c (= a b))
+        (check c (and (= (count l) m) (= (nth l 0) "\u{20ac}0") (= (nth l (- m 1)) "\u{20ac}399999")))
+        (check c (and (= (count k) 3) (= (nth k 1) "w\u{e9}1") (= (str-len (nth k 2)) (- (str-len big) 10))))
+        (check c (< (- t1 t0) 5000000000))
+        (checks-result c))))
