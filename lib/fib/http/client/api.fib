@@ -40,12 +40,17 @@
   (if (not (valid-options? o)) (Err (InvalidRequest "invalid HTTP client options"))
     (let [st (new-state o)]
       (Ok (Client (fn (r: ClientRequest) (execute st r)) (fn () (close-state st)) (fn () (stats (. st pool)))
-                  (fn (r: ClientRequest) (start st r)))))))
+                  (fn (r: ClientRequest) (start st r)) (fn (r: StreamingRequest) (start-upload st r))
+                  (fn (r: StreamingRequest) (try-let [sr (start-upload st r)] (finish st sr))))))))
 (defun close-http-client (client: Client) -> unit ((. client close)))
 (defun pool-stats (client: Client) -> PoolStats ((. client stats)))
 (defun request-with (client: Client request: ClientRequest) -> (Result Response Error) ((. client execute) request))
 ;; The response before its body is read: read it with fib.http.body/next-chunk or abandon it. Redirects are followed under the options.
 (defun request-stream (client: Client request: ClientRequest) -> (Result StreamResponse Error) ((. client stream) request))
+;; A request whose body is a producer pulled until it answers nil (a file, a pipe, generated data), never held whole: `(StreamingRequest "PUT" url {} next (some length))` sends a
+;; content-length (the producer must deliver exactly that many bytes), `nil` for the length sends chunked. See exchange-upload for what it does not do.
+(defun request-upload-stream (client: Client request: StreamingRequest) -> (Result StreamResponse Error) ((. client upload) request))
+(defun request-upload (client: Client request: StreamingRequest) -> (Result Response Error) ((. client upload-whole) request))
 (defun request (request: ClientRequest o: Options) -> (Result Response Error)
   (try-let [client (build-http-client o)]
     (let [result (request-with client request)] (do (close-http-client client) result))))

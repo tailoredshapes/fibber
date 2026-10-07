@@ -13,6 +13,10 @@
                   (cond (> r 0) (recur (+ offset r))
                         (or (= kind Interrupted) (= kind WouldBlock)) (recur offset)
                         :else (Err (error-from-code (if (= r 0) 32 saved) "send"))))))))))
+(extern shutdown :private (i32 i32) -> i32)
+;; Ends the sending side of a connection (a FIN after what was sent), so a peer reads everything and then end of stream, not a reset.
+(defun shutdown-write (fd: i64) -> (Result unit OSError)
+  (let [r (unsafe (shutdown (trunc i32 fd) 1i32)) saved (n/errno)] (if (< r 0i32) (Err (error-from-code saved "shutdown")) (Ok ()))))
 (defun send-all (fd: i64 bytes: (Array i8) timeout-ms: i64 stop: (Atom bool)) -> (Result unit OSError)
   (if (or (< timeout-ms 1) (> timeout-ms 3600000)) (Err (invalid-input "send" "invalid send timeout"))
     (let [buffer (n/bytes-new bytes)

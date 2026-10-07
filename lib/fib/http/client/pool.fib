@@ -17,6 +17,11 @@
         kept (reduce (fn (out: (Vec Conn) c: Conn)
                        (if (or (expired? c o now) (> (buffered (. c r)) 0)) (do (close-conn c) out) (conj out c))) [] @(. p idle))]
     (set! (. p idle) kept)))
+;; The liveness probe: a deadline long past makes a read return what is already there and nothing else, so a connection the peer closed while it was idle (end of stream),
+;; or one with bytes nobody asked for, is found before a request is written to it, and a request of any method is never lost to a connection that died in the pool.
+(defun alive? :private (c: Conn) -> bool
+  (do (t-deadline (. c t) 1)
+      (let [r (fill (. c r))] (do (t-deadline (. c t) 0) (match r ((Err (Timeout _ _)) true) (_ false))))))
 (defun acquire (p: Pool key: str o: Options) -> (Option Conn)
   (do (sweep p o)
     (let [xs @(. p idle)
@@ -24,8 +29,9 @@
       (if (< at 0) nil
         (let [c (nth xs at)]
           (do (set! (. p idle) (remove-at xs at))
-              (set! (. p reused) (+ @(. p reused) 1))
-              (some (with c (fresh false)))))))))
+              (if (alive? c)
+                (do (set! (. p reused) (+ @(. p reused) 1)) (some (with c (fresh false))))
+                (do (close-conn c) (acquire p key o)))))))))
 (defun remove-at :private (xs: (Vec Conn) at: i64) -> (Vec Conn)
   (loop [i 0 out: (Vec Conn) []] (if (= i (count xs)) out (recur (+ i 1) (if (= i at) out (conj out (nth xs i)))))))
 (defun same-key-count :private (xs: (Vec Conn) key: str) -> i64 (count (filter (fn (c: Conn) (= (. c key) key)) xs)))

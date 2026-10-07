@@ -114,6 +114,27 @@
                 (if (includes? key seen) (do ((. sr abandon)) (Err (RedirectLoop (str "redirect loop at " (url-string next)))))
                   (do (drain sr)
                       (hop st m2 next (redirect-headers headers url next kept) (if kept body (array 0 0i8)) total (+ hops 1) (conj seen key))))))))))))
+;; An upload: the body is a producer (StreamingRequest). One attempt on a live connection (the pool probes liveness), no retry and no redirect following, because the producer cannot be
+;; rewound; the response is whatever came back (a 3xx is returned as it is).
+(defun upload-headers :private (o: Options url: Url req: StreamingRequest) -> (Map str (Vec str))
+  (let [base (jar-headers o url (hop-headers o url (. req method) (. req headers) (array 0 0i8))) plain (dissoc (dissoc base "content-length") "transfer-encoding")]
+    (match (. req length) ((some n) (assoc plain "content-length" [(str n)])) (nil (assoc plain "transfer-encoding" ["chunked"])))))
+(defun upload-once :private (st: State req: StreamingRequest url: Url headers: (Map str (Vec str)) total: i64) -> (Result StreamResponse Error)
+  (try-let [c (obtain st url total)]
+    (let [px (. c proxy) target (match px (nil (target url)) ((some _) (absolute-target url)))
+          h (match px (nil headers) ((some p) (match (. p auth) (nil headers) ((some a) (header-set headers "proxy-authorization" a)))))]
+      (match (exchange-upload (. st options) c (. req method) target h (. req next) (. req length) total)
+        ((Err e) (do (close-conn c) (Err (rename e total))))
+        ((Ok reply) (let [sr (managed st c reply total)] (do (jar-store (. st options) url (. sr headers)) (Ok sr))))))))
+(defun start-upload (st: State req: StreamingRequest) -> (Result StreamResponse Error)
+  (if @(. st closed) (Err Closed)
+    (try-let [url (validate-request (ClientRequest (. req method) (. req url) (. req headers) (array 0 0i8)))]
+      (match (. req length)
+        ((some n) (if (< n 0) (Err (InvalidRequest "negative upload length")) (upload-with st req url)))
+        (nil (upload-with st req url))))))
+(defun upload-with :private (st: State req: StreamingRequest url: Url) -> (Result StreamResponse Error)
+  (let [o (. st options) total (if (> (. o timeout-ms) 0) (+ (time/clock-now) (* (. o timeout-ms) 1000000)) 0)]
+    (upload-once st req url (upload-headers o url req) total)))
 (defun start (st: State request: ClientRequest) -> (Result StreamResponse Error)
   (if @(. st closed) (Err Closed)
     (try-let [url (validate-request request)]
