@@ -1,0 +1,42 @@
+;; spec: docs/design/stack.md, docs/adr/0009; fib.os.process fork-run
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; A forked child inherits the handler and the signal stack of the thread that forked it (the main stack's thread). A child that outruns its stack says
+;; `trap: stack overflow` on its standard error and ends with status 134, as a trap does. A child that reads a page it may not (here PROT_NONE: not a
+;; stack, and no guard page) must not be taken for a recursion: it says `fatal signal 11 at 0x` and the address, then dies of the signal itself
+;; (status 139, 128 plus SIGSEGV). Killed by: scripts/mutant-stack-guard.sh `any-fault` (the wild read would read as an overflow) and `no-handler`.
+(ns main (:use tl.check) (:require [fib.os :as os]))
+
+(defun scratch () -> str
+  (match (os/create-temp-directory (str (os/temp-directory) "/fibstack-XXXXXX")) ((Ok d) d) ((Err _) "/tmp")))
+
+(defun run (dir: str tag: str f: (fn () str)) -> os/Forked
+  (match (os/fork-run dir tag 60 f)
+    ((Ok r) r)
+    ((Err e) (os/Forked -9 false nil "" (. e message)))))
+
+(defun climb (n: i64) -> i64
+  (if (= n 0) 0 (- (* 2 n) (climb (- n 1)))))
+
+(extern mmap :private (i64 i64 i32 i32 i32 i64) -> ptr)
+
+;; A read of a page mapped PROT_NONE (MAP_PRIVATE | MAP_ANONYMOUS): a fault that is not on a stack.
+(defun wild () -> i64
+  (unsafe (load-i64 (mmap 0 4096 0i32 34i32 -1i32 0))))
+
+(defun main () -> i64
+  (let [c (checks) dir (scratch)
+        deep (run dir "deep" (fn () (str (climb 1000000000))))
+        stray (run dir "stray" (fn () (str (wild))))]
+    (do (check c (= (. deep status) 134))
+        (check c (= (. deep result) nil))
+        (check c (some? (str-find (. deep err) "trap: stack overflow" 0)))
+        (check c (= (. stray status) 139))
+        (check c (= (. stray result) nil))
+        (check c (some? (str-find (. stray err) "fatal signal 11 at 0x" 0)))
+        (check c (nil? (str-find (. stray err) "stack overflow" 0)))
+        (os/remove-directory dir)
+        (checks-result c))))

@@ -64,7 +64,7 @@ is emitted by the compiler (`lcx-trap-if`, `lcx-trap-c` in `compiler/emit/lower/
 | integer overflow, `/` and `rem` by zero, checked conversions, `str-from-bytes` | yes | the same |
 | a trap raised by the **joined task** | yes, as the value of `try-join` (stage 1) | S16, case 911 |
 | `out of memory` (`fib.alloc`, 3 sites in `rt/core.lir`, case ownership/195) | **no: fatal** | a handler and the unwinder allocate; the runtime may be half way through building an object; recovery cannot be argued |
-| stack overflow | **no: not a trap** | it is SIGSEGV on the guard page; there is no code to run. A `sigaltstack` handler could print a message and abort; it can never unwind |
+| stack overflow | **no: not a trap** | it is SIGSEGV on the guard page; there is no code to run, so it can never unwind. Since LANG-2 a `sigaltstack` handler prints `trap: stack overflow` and aborts (status 134, every thread, `try` or not; docs/design/stack.md, cases 8350-8354) |
 | `spawn: cannot start a thread`, `async: cannot start a worker thread` | no: fatal | resource failures of the runtime |
 | memory corruption, use after free, a negative count | no | none of them is detected as a trap; the audit stops the *interpreter* run (`HpErr`), compiled code does not detect them. A catch must never be able to hide an audit error |
 | hardware faults (SIGSEGV, SIGFPE, SIGILL from `(trap)`) | no | lIR `(trap)` stays `llvm.trap`: the path for faults without a message is fatal by definition |

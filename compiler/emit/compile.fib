@@ -22,9 +22,12 @@
   (let ((end (if (and executable (not (= (sys-getenv "FIB_RESULT_STDOUT") (some "1"))))
                  "(ret (trunc i32 r))"
                  "(call @printf (string \"%lld\\n\") r)\n      (ret (i32 0))")))
-    (str-join ["(declare printf i32 (ptr ...))\n(define (main i32) ((i32 argc) (ptr argv))\n  (block entry\n    " check "(call @fib.init)\n"
-               "    (call @fib.set-args argc argv)\n    " init "\n    (let ((r " (if uw (str-join ["(extractvalue (call @" entry ") 0)"]) (str-join ["(call @" entry ")"]))
-               "))\n      (call @fib.join-all)\n"
+    (str-join ["(declare printf i32 (ptr ...))\n(global internal fib.main-r i64 (i64 0))\n"
+               ;; The program runs from `fib.main-body` on the main stack that `fib.run-main` makes (docs/design/stack.md): the initialisers of the `def`s and the entry.
+               "(define internal (fib.main-body void) ()\n  (block entry\n    " init "\n    (let ((r " (if uw (str-join ["(extractvalue (call @" entry ") 0)"]) (str-join ["(call @" entry ")"]))
+               "))\n      (store r @fib.main-r)\n      (ret))))\n"
+               "(define (main i32) ((i32 argc) (ptr argv))\n  (block entry\n    " check "(call @fib.init)\n"
+               "    (call @fib.set-args argc argv)\n    (call @fib.run-main @fib.main-body)\n    (let ((r (load i64 @fib.main-r)))\n      (call @fib.join-all)\n"
                "      (call @fib.pool-quiesce)\n      " end ")))\n"])))
 
 ;; The constant `def`s are made by `emit-defs`, which runs each through the JIT; a program with none has no defs to make (the Rust

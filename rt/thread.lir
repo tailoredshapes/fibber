@@ -13,7 +13,11 @@
 (declare pthread_attr_init i32 (ptr))
 (declare pthread_attr_setstacksize i32 (ptr i64))
 (declare pthread_attr_destroy i32 (ptr))
+(declare pthread_attr_setguardsize i32 (ptr i64))
 (global internal fib.threads-live i32 (i32 0))
+;; The stack of a task's thread and of a pool worker, in bytes (docs/design/stack.md), and the guard below it.
+(global internal fib.thread-stack i64 (i64 8388608))
+(global internal fib.thread-guard i64 (i64 65536))
 
 ;; A thread attribute with the stack size set explicitly (8 MiB: glibc's default from `ulimit -s`; musl's own default is 128 KiB and Darwin's 512 KiB,
 ;; too small for the recursion a task may do). The attribute is 56 bytes on LP64 Linux and 64 on Darwin: 128 bytes, in the caller's frame, are enough.
@@ -21,7 +25,8 @@
 (define internal (fib.thread-attr i32) ((ptr a))
   (block entry
     (call @pthread_attr_init a)
-    (ret (call @pthread_attr_setstacksize a (i64 8388608)))))
+    (call @pthread_attr_setguardsize a (load i64 @fib.thread-guard))
+    (ret (call @pthread_attr_setstacksize a (load i64 @fib.thread-stack)))))
 
 ;; Starts entry(task) on a new detached thread and counts it; in trace
 ;; mode writes the T line (compiler.md §4).
@@ -50,12 +55,14 @@
 (define internal (fib.thread-enter void) ((ptr task))
   (block entry
     (call @pthread_setspecific (load i32 @fib.task-key) task)
+    (call @fib.guard-enter (load i64 @fib.thread-stack))
     (ret)))
 
 ;; The last runtime call of a thread entry: one thread fewer, and
 ;; whoever waits in fib.join-all is told.
 (define internal (fib.thread-done void) ()
   (block entry
+    (call @fib.guard-leave)
     (call @fib.rq-lock)
     (store (sub (load i32 @fib.threads-live) (i32 1)) @fib.threads-live)
     (call @fib.rq-broadcast)
@@ -72,3 +79,209 @@
     (call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))
     (br test))
   (block done (call @fib.rq-unlock) (ret)))
+
+;; ---- The stack guard (docs/design/stack.md). A stack that overflows ends in a SIGSEGV on its guard page: no code of the program runs, so it cannot be a
+;; trap that unwinds (docs/adr/0009: stack overflow is fatal, in a `try` too). What the runtime does is say so: every thread that runs the program keeps a
+;; signal stack of its own (`sigaltstack`: the handler cannot run on the stack that is gone) with a header of the bounds of the thread's stack, and one
+;; handler for SIGSEGV and SIGBUS reads it. A fault address within a megabyte of the end of the stack is `trap: stack overflow` and abort (the status of
+;; every trap, 134); any other fault is "fatal signal N at 0xADDR" and then the signal's own death, so a memory bug is never taken for a deep recursion.
+;; The handler uses write, sigaltstack, abort and sigaction only (all async-signal-safe). `main` runs on a stack the runtime makes (`fib.run-main`).
+;; Left out of a WASI runtime (emit.wasi), which has neither signals nor threads, and adapted for Darwin by emit.os.
+;; guard-begin
+(declare sigaction i32 (i32 ptr ptr))
+(declare sigaltstack i32 (ptr ptr))
+(declare pthread_join i32 (i64 ptr))
+(declare getrlimit i32 (i32 ptr))
+(declare prctl i32 (i32 ptr i64 i64 i64))
+(declare strtol i64 (ptr ptr i32))
+(global internal fib.guard-sigbus i32 (i32 7))
+(global internal fib.guard-ss-disable i32 (i32 2))
+(global internal fib.main-fn ptr (ptr null))
+(global internal fib.main-stack i64 (i64 0))
+;; The distance from the end of a stack within which a fault is its overflow (the guard of the main stack is a megabyte, of a task's thread 64 KiB).
+(global internal fib.guard-window i64 (i64 1048576))
+
+;; Fills the stack_t at ss. Linux: ss_sp, ss_flags (int, at 8), ss_size (at 16). Darwin: ss_sp, ss_size (at 8), ss_flags (int, at 16).
+(define internal (fib.guard-ss void) ((ptr ss) (ptr sp) (i64 size) (i32 flags))
+  (block entry
+    (store sp ss)
+    (store flags (getelementptr i8 ss (i64 8)))
+    (store size (getelementptr i8 ss (i64 16)))
+    (ret)))
+
+;; This thread is about to run program code on a stack of `size` bytes whose top is near here: gives it its signal stack, 64 KiB with the bounds
+;; of the stack in its first 16 bytes. Fails quietly (the thread then has no guard message, as before) when there is no memory for it.
+(define internal (fib.guard-enter void) ((i64 size))
+  (block entry
+    (let ((here (alloca i64))
+          (ss (alloca (align 8) i8 (i32 32)))
+          (blk (call @malloc (i64 65536))))
+      (br (icmp eq blk (ptr null)) out set)))
+  (block set
+    (let ((hi (ptrtoint i64 here)))
+      (store (sub hi size) blk)
+      (store hi (getelementptr i8 blk (i64 8)))
+      (call @fib.guard-ss ss (getelementptr i8 blk (i64 16)) (i64 65520) (i32 0))
+      (br (icmp ne (call @sigaltstack ss (ptr null)) (i32 0)) undo out)))
+  (block undo (call @free blk) (br out))
+  (block out (ret)))
+
+;; This thread ends: its signal stack is disabled and freed (a task's thread comes and goes; a program that spawns in a loop must not leak one each).
+(define internal (fib.guard-leave void) ()
+  (block entry
+    (let ((cur (alloca (align 8) i8 (i32 32)))
+          (off (alloca (align 8) i8 (i32 32)))
+          (_q (call @sigaltstack (ptr null) cur))
+          (sp (load ptr cur)))
+      (br (icmp eq sp (ptr null)) out drop)))
+  (block drop
+    (call @fib.guard-ss off (ptr null) (i64 0) (load i32 @fib.guard-ss-disable))
+    (call @sigaltstack off (ptr null))
+    (call @free (getelementptr i8 sp (i64 -16)))
+    (br out))
+  (block out (ret)))
+
+;; "fatal signal N at 0xADDR\n" in one write: N is a signal number of at most two digits.
+(define internal (fib.guard-unknown void) ((i32 sig) (i64 addr))
+  (block entry
+    (let ((buf (alloca (align 8) i8 (i32 64)))
+          (_h (call @memcpy buf (string "fatal signal ") (i64 13)))
+          (tens (udiv sig (i32 10)))
+          (ones (urem sig (i32 10))))
+      (br (icmp eq tens (i32 0)) units two)))
+  (block two
+    (store (trunc i8 (add tens (i32 48))) (getelementptr i8 buf (i64 13)))
+    (store (trunc i8 (add ones (i32 48))) (getelementptr i8 buf (i64 14)))
+    (call @memcpy (getelementptr i8 buf (i64 15)) (string " at 0x") (i64 6))
+    (br digits))
+  (block units
+    (store (trunc i8 (add ones (i32 48))) (getelementptr i8 buf (i64 13)))
+    (call @memcpy (getelementptr i8 buf (i64 14)) (string " at 0x") (i64 6))
+    (br digits))
+  (block digits
+    (let ((at (phi i64 (two (i64 21)) (units (i64 20)))))
+      (br loop)))
+  (block loop
+    (let ((i (phi i64 (digits (i64 0)) (loop2 i2)))
+          (nib (and (lshr addr (sub (i64 60) (shl i (i64 2)))) (i64 15)))
+          (ch (select (icmp ult nib (i64 10)) (add nib (i64 48)) (add nib (i64 87)))))
+      (store (trunc i8 ch) (getelementptr i8 buf (add at i)))
+      (br loop2)))
+  (block loop2
+    (let ((i2 (add i (i64 1))))
+      (br (icmp ult i2 (i64 16)) loop done)))
+  (block done
+    (store (i8 10) (getelementptr i8 buf (add at (i64 16))))
+    (call @write (i32 2) buf (add at (i64 17)))
+    (ret)))
+
+;; The handler of SIGSEGV and SIGBUS (sa_sigaction: signal, siginfo_t, ucontext). si_addr is at 16 on Linux and 24 on Darwin.
+(define internal (fib.guard-handler void) ((i32 sig) (ptr info) (ptr uc))
+  (block entry
+    (let ((addr (ptrtoint i64 (load ptr (getelementptr i8 info (i64 16)))))
+          (cur (alloca (align 8) i8 (i32 32)))
+          (_q (call @sigaltstack (ptr null) cur))
+          (sp (load ptr cur)))
+      (br (icmp eq sp (ptr null)) unknown check)))
+  (block check
+    (let ((lo (load i64 (getelementptr i8 sp (i64 -16))))
+          (w (load i64 @fib.guard-window)))
+      (br (icmp ult (sub addr (sub lo w)) (shl w (i64 1))) overflow unknown)))
+  (block overflow
+    (call @write (i32 2) (string "trap: stack overflow\n") (i64 21))
+    (call @abort)
+    (unreachable))
+  (block unknown
+    (call @fib.guard-unknown sig addr)
+    (let ((dfl (alloca (align 8) i8 (i32 160))))
+      (call @memset dfl (i32 0) (i64 160))
+      (call @sigaction sig dfl (ptr null))
+      (ret))))
+
+;; The handler for SIGSEGV and SIGBUS. `old` (two 160-byte slots) receives their previous actions, for fib.guard-restore.
+;; struct sigaction: the handler at 0 and the mask at 8 (128 bytes on Linux), sa_flags at 136 on Linux (SA_SIGINFO 4 | SA_ONSTACK 0x08000000);
+;; Darwin: the mask is 4 bytes, sa_flags at 12 (SA_SIGINFO 0x40 | SA_ONSTACK 1).
+(define internal (fib.guard-install void) ((ptr old))
+  (block entry
+    (let ((sa (alloca (align 8) i8 (i32 160))))
+      (call @memset sa (i32 0) (i64 160))
+      (store @fib.guard-handler sa)
+      (store (i32 134217732) (getelementptr i8 sa (i64 136)))
+      (call @sigaction (i32 11) sa old)
+      (call @sigaction (load i32 @fib.guard-sigbus) sa (getelementptr i8 old (i64 160)))
+      (ret))))
+
+(define internal (fib.guard-restore void) ((ptr old))
+  (block entry
+    (call @sigaction (i32 11) old (ptr null))
+    (call @sigaction (load i32 @fib.guard-sigbus) (getelementptr i8 old (i64 160)) (ptr null))
+    (ret)))
+
+;; The size of the main stack in MiB: FIB_STACK_MB when set (0: the process's own stack), else 256. Anything but a whole number is a fatal error that says so.
+(define internal (fib.main-stack-mb i64) ()
+  (block entry
+    (let ((v (call @getenv (string "FIB_STACK_MB"))))
+      (br (icmp eq v (ptr null)) default parse)))
+  (block default (ret (i64 256)))
+  (block parse
+    (let ((end (alloca ptr))
+          (n (call @strtol v end (i32 10)))
+          (good (and (icmp ne (load i8 v) (i8 0))
+                     (and (icmp eq (load i8 (load ptr end)) (i8 0))
+                          (and (icmp sge n (i64 0)) (icmp sle n (i64 1048576)))))))
+      (br good ok bad)))
+  (block ok (ret n))
+  (block bad
+    (call @fib.fatal-c (string "FIB_STACK_MB is not a whole number of MiB from 0 to 1048576"))
+    (unreachable)))
+
+;; What runs on the main stack: the guard of this thread, then the program (fib.main-fn).
+(define internal (fib.main-tramp ptr) ((ptr arg))
+  (block entry
+    (call @fib.guard-enter (load i64 @fib.main-stack))
+    (indirect-call (load ptr @fib.main-fn) (fn void ()))
+    (ret (ptr null))))
+
+;; Runs `body` (no arguments) on a stack of FIB_STACK_MB MiB (default 256) that the runtime makes: a thread whose stack is mapped, committed as it is
+;; touched, with a megabyte of guard below it, so that how deep a program may recurse is the same on every system and not what `ulimit -s` says.
+;; FIB_STACK_MB=0, and a system that will not make the thread, run `body` on the process's own stack, sized by RLIMIT_STACK (the guard bounds
+;; are then from that limit; unlimited is taken as 1 GiB). The signal handlers the process had are put back when `body` has returned. The first thread of
+;; the process, which only waits, is named `fib-parked` (Linux: prctl PR_SET_NAME, a comm of /proc) so that fib.os.process does not count it as another thread (a thread keeps the name its creator had when it was made: the name is set after the
+;; program's thread exists).
+(define internal (fib.run-main void) ((ptr body))
+  (block entry
+    (let ((old (alloca (align 8) i8 (i32 320)))
+          (mb (call @fib.main-stack-mb))
+          (attr (alloca (align 8) i8 (i32 128)))
+          (tid (alloca i64)))
+      (call @fib.guard-install old)
+      (store body @fib.main-fn)
+      (br (icmp eq mb (i64 0)) here spawn)))
+  (block spawn
+    (store (shl mb (i64 20)) @fib.main-stack)
+    (call @pthread_attr_init attr)
+    (call @pthread_attr_setguardsize attr (i64 1048576))
+    (let ((rs (call @pthread_attr_setstacksize attr (shl mb (i64 20)))))
+      (br (icmp eq rs (i32 0)) create refused)))
+  (block refused (call @pthread_attr_destroy attr) (br here))
+  (block create
+    (let ((rc (call @pthread_create tid attr @fib.main-tramp (ptr null))))
+      (call @pthread_attr_destroy attr)
+      (br (icmp eq rc (i32 0)) joined here)))
+  (block joined
+    (call @prctl (i32 15) (string "fib-parked") (i64 0) (i64 0) (i64 0))
+    (call @pthread_join (load i64 tid) (ptr null))
+    (call @prctl (i32 15) (string "fib-main") (i64 0) (i64 0) (i64 0))
+    (call @fib.guard-restore old)
+    (ret))
+  (block here
+    (let ((lim (alloca (align 8) i8 (i32 16)))
+          (_g (call @getrlimit (i32 3) lim))
+          (cur (load i64 lim)))
+      (store (select (icmp ult cur (i64 1073741824)) cur (i64 1073741824)) @fib.main-stack)
+      (call @fib.guard-enter (load i64 @fib.main-stack))
+      (indirect-call (load ptr @fib.main-fn) (fn void ()))
+      (call @fib.guard-leave)
+      (call @fib.guard-restore old)
+      (ret))))
+;; guard-end

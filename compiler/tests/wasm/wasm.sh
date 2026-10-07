@@ -7,6 +7,7 @@
 #   grow           a 768 MiB block is allocated and touched: the memory grows (memory.grow through wasi-libc's malloc) up to the limit the link gave
 #   oversize       a request of 2^33 + 4096 bytes is out of memory, not its low 32 bits (4096) made to look like success
 #   write          a 200000-byte write reaches standard output whole (the length of a 32-bit `write` is the whole length, not a part)
+#   stack          a non-tail recursion that outruns node's stack ends with `trap: stack overflow` and status 134 (run.mjs maps V8's RangeError; docs/design/stack.md)
 #   tail           ten million tail calls between functions of different signatures run in node's default stack with the tail-call extension, and overflow without it
 #   movemask       the lanes of a 32- and a 64-lane mask are in order on wasm (LLVM's WebAssembly backend gets `bitcast <32 x i1>` wrong)
 #   vec-of-objects a vector, an array and a map of objects are read at the element size of the 32-bit target
@@ -77,6 +78,15 @@ if buildx "$tmp/write.fib" "$tmp/write.wasm"; then
   got=$(run "$tmp/write.wasm" 2>/dev/null | wc -c)
   [ "$got" -eq 200000 ] && ok write || fail write "$got bytes of 200000"
 else fail write "build: $(head -1 "$tmp/build.err")"; fi
+
+cat > "$tmp/deep.fib" <<'EOF'
+(defun climb (n: i64) -> i64 (if (= n 0) 0 (- (* 2 n) (climb (- n 1)))))
+(defun main () -> i64 (climb 1000000000))
+EOF
+if buildx "$tmp/deep.fib" "$tmp/deep.wasm"; then
+  out=$(run "$tmp/deep.wasm" 2>&1); rc=$?
+  { [ "$rc" = 134 ] && echo "$out" | grep -q "^trap: stack overflow"; } && ok stack || fail stack "status $rc: $(echo "$out" | head -c 160)"
+else fail stack "build: $(head -1 "$tmp/build.err")"; fi
 
 [ "$quick" = --quick ] || {
 C=$root/cases/stdlib/8250-mutual-tail-calls-of-different-shapes-do-not-grow-the-stack.fib
