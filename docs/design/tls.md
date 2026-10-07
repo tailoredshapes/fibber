@@ -160,7 +160,8 @@ host-name and constraint cases (`tls-names-spec`), Wycheproof's signature and ke
 - No revocation; no certificate policies; no CT; no pinning.
 - **Secrets are not zeroised**: traffic secrets, keys and IVs live in ordinary `(Array i8)` values that the allocator frees without clearing. Only the provider's own buffers are cleansed
   (the driver does). Nothing in the language today can wipe an array in place and be sure the optimiser keeps the write; a `fib.crypto` primitive for it (a provider operation) is the way.
-- Every record seal/open crosses the provider with the key and nonce (the OpenSSL driver fetches the cipher per call: the known 25-40% at 16 KiB records found by the driver's benchmark, docs/design/crypto.md section 10).
+- Records are sealed and opened through an AEAD KEY HANDLE (`provider-aead-key`, docs/design/crypto.md 9.1) and into-buffer calls: the cipher is fetched and the key set once per direction and a
+  record writes into a caller-provided array. A driver that does not override `provider-aead-key` gets the default per-call handle (correct, slower); throughput in docs/shootout/tls.md.
 - Hostnames: a trailing dot on the reference is dropped; internationalised names must be given as A-labels; no Unicode processing.
 - The post-handshake deadline is the stream's `set-deadline`; there is no separate idle timer.
 
@@ -175,10 +176,64 @@ suffix list for wildcards, RSA-PSS certificate signatures (needs a provider sche
 
 ## 11. What the language lacked
 
-- **A byte-array blit and builder**: every concatenation is an element loop (`cat`); a `array-copy-into` or an append-with-capacity would make the record layer's copies memcpys.
+- **A byte-array blit** (added in CRYPTO-3: `array-blit!`, spec/types.md 2.13.3, one `memmove` into an array in place): the record layer's copies, `fib.tls.buf` and the write path use it. `cat` of the
+  protocol code (handshake messages, a few hundred bytes) is still an element loop; a builder with capacity would be a library function over `array-blit!`.
 - **Heterogeneous literals**: a table of `[name bytes expected]` has to be a struct; the specs have a dozen of them.
 - **No `try-let` over mixed error types**: every provider call is wrapped by `lift`; a Result-mapping form would remove noise.
 - **A way to wipe an array** (section 9) and **a way to say "this value must not be copied"** for keys.
 - Closure fields cannot be called as `(f x)` on a field access without the double parenthesis `((. s read) n)`; easy to get wrong.
 - The `cond`/`match` indentation depth: a handshake is straight-line code that wants `do`-notation.
 - A `fib.test` runner that finds a spec's `main` by itself (every spec file ends in `(defun main () (run-main (specs)))`), and `-I` flags for `fibc test` (an environment variable was needed).
+
+## 12. The server side (design only, not built)
+
+The record layer, the key schedule, the message codec and the AEAD are symmetric and already serve a server (the test server of `tls-specs/tls-server.fib` is built from them: it plays the server's half
+of every handshake the client specs run). What a real server needs on top is below, as a list of packages in the order that each leaves something that runs and is tested. The rules of section 1 hold:
+no primitive is ours (every signature, key agreement, MAC and AEAD is the provider's), errors are values, the provider and the policy are values the caller passes, no global state.
+
+**What it needs**
+
+1. **An identity**: a certificate chain and the private key that goes with its leaf. The chain is loaded from PEM (`CERTIFICATE` blocks, leaf first; `fib.tls.pem` already decodes blocks and
+   `fib.tls.x509` parses the certificates), and refused unless the leaf's SubjectPublicKeyInfo is the key's public half (`private-key-public` for an RSA key is the SPKI; for the curves it is the raw
+   point, wrapped with `fib.crypto.der/wrap-public` and compared). The key is imported from PKCS#8 PEM (`PRIVATE KEY`; `provider-import-private` takes `:ed25519 :p-256 :p-384` and, from CRYPTO-3,
+   `:rsa`; a SEC1 or PKCS#1 block is accepted where the library's DER decoder accepts it, and an encrypted key is refused: a passphrase is the caller's to remove). The chain is also run through the
+   client's own path validation against a store the operator names, so a server never starts with a chain its clients would refuse (an opt-out for private PKIs). The signature schemes it can answer
+   with are those the key supports and the provider lists: `rsa_pss_rsae_sha256/384` (`:sign-rsa-pss-sha256/384`), `ecdsa_secp256r1_sha256`, `ecdsa_secp384r1_sha384`, `ed25519`.
+2. **The ClientHello side**: parse a ClientHello (`supported_versions` must offer 1.3, `key_share`, `supported_groups`, `signature_algorithms`, `server_name`, `application_layer_protocol_negotiation`,
+   `psk_key_exchange_modes`, `pre_shared_key` last), pick a suite by the server's preference among the three the client supports, pick a group and agree (`private-key-agree` on a fresh key), answer a
+   **HelloRetryRequest** when the client offered groups but no share of one the server takes (the transcript rewrite of RFC 8446 4.4.1: the message_hash construction is the client's code reversed),
+   and refuse a downgrade, a legacy version other than 0x0303 and a session id that is not echoed.
+3. **The server flight**: ServerHello, EncryptedExtensions (ALPN, nothing else), Certificate (the chain, a `certificate_request_context` of length 0), CertificateVerify (`private-key-sign` over the
+   transcript content with the server context string; the PSS salt and the ECDSA nonce are the library's), Finished, then the client's Finished is checked with `ct=`, then application keys.
+4. **Policy values**: the suites and groups in preference order, an ALPN chooser (`(fn (offered) (Option str))`), an identity chooser keyed by the SNI name (`(fn (name) (Option Identity))`, so one
+   listener serves several names; a missing match is the default identity or `unrecognized_name`), handshake timeout, maximum handshake size (the client's limits), and a cap on `KeyUpdate`s.
+5. **Client certificates** (`CertificateRequest` and client authentication): the request carries `signature_algorithms` and optionally `certificate_authorities`; the client's `Certificate` and
+   `CertificateVerify` are parsed (the client code reversed) and the chain is validated with the same `fib.tls.chain` with the `clientAuth` extended key usage instead of `serverAuth` and no host-name
+   check; the verdict is a value the application sees (the leaf, or none when auth is optional). Required versus optional is policy. A client that sends an empty `Certificate` when it is
+   required gets `certificate_required` (alert 116).
+6. **Session tickets** (RFC 8446 4.6.1 and 2.2): after the handshake the server sends `NewSessionTicket`. Stateless tickets: the ticket is the resumption state (suite, `resumption_master_secret`
+   derived with `Derive-Secret(master, "res master", transcript-through-client-Finished)`, the ticket nonce and age add, the client's identity if authenticated, the lifetime, the ALPN) sealed with
+   an AEAD key the server holds as an **`AeadKey` handle** (section 9.1 of the crypto design: the cipher and key bound once; a rotation keeps the previous handle for the grace period), with a key
+   name in front so the right handle is tried first. On resumption: parse `pre_shared_key`, find the ticket, check lifetime (at most 7 days) and obfuscated age, verify the **binder** (HMAC over the
+   truncated ClientHello, constant-time `ct=`), derive the early secret from the PSK, run `psk_dhe_ke` ONLY (the certificate path is skipped, ECDHE is still done: never `psk_ke`). **0-RTT is never
+   accepted** (no `early_data` extension in the answer; the client's early data is skipped by trial-decryption failure counting up to the `max_early_data_size` the server advertises, which is 0).
+   A ticket is not single-use in this design (resumption with ECDHE does not need it); the replay story is 0-RTT's and stays off.
+7. **The connection API**: `accept` takes a transport (the `Io` of the client, any byte stream, so `fib.os.net`'s listener is HTTP-2's to wire), the provider, the `ServerConfig`, and returns the same
+   `Session` value the client returns (read, write, close, set-deadline, the ALPN, the suite), plus the client's identity when authenticated. `close_notify`, `KeyUpdate` (answered, and sent
+   before 2^24 records), and the fatal-alert path are the client's code.
+
+**What is NOT needed**: any new provider capability beyond RSA signing (done) and `provider-aead-key` (done); certificate parsing for a server's own chain beyond what `fib.tls.x509` already
+reads; a trust store unless client auth is on.
+
+**Packages** (each ends with tests that run, in the order of dependence):
+
+| Package | Content | Tests that make it done |
+|---|---|---|
+| TLS-S1 | ClientHello parse, suite/group/ALPN choice, ServerHello and HelloRetryRequest, the server half of the key schedule | RFC 8448 server-side trace byte for byte (the trace already in `tls-specs`); the client of this tree against it; every refusal of RFC 8446 4.1.3 and 4.2 |
+| TLS-S2 | `Identity`: PEM chain and PKCS#8 key loading, leaf-matches-key check, the chain validated against a store | the corpus of `specs/tls-fixtures` as server chains; a mismatched key, an expired leaf, an encrypted key |
+| TLS-S3 | The flight: EncryptedExtensions, Certificate, CertificateVerify for the four schemes, Finished; the `accept` call and `Session` | `openssl s_client`, `curl`, and this tree's client over a socket pair; each signature scheme once (RSA-PSS uses `:sign-rsa-pss-sha256`) |
+| TLS-S4 | Client certificates (CertificateRequest, client chain with `clientAuth`, optional and required) | the corpus with client roles; `s_client -cert`; a missing or wrong certificate is the right alert |
+| TLS-S5 | Session tickets and resumption (the client keeps tickets too: the client's half is its own package) | tickets across a rotation, an expired, a forged, a replayed binder, a ticket for another suite; `s_client -sess_out/-sess_in` |
+| TLS-S6 | Hardening: the mutation fuzz of the server's parsers, planted faults (`scripts/mutant-tls.sh` set for the server), throughput against `s_server` at the sizes of docs/shootout/tls.md | the faults all caught; the numbers recorded |
+
+**Not in these packages**: TLS 1.2 (never), 0-RTT, renegotiation, OCSP stapling by the server, the PSK-only mode, ALPN-based protocol routing (the application's), and an HTTP server (HTTP-2's).
