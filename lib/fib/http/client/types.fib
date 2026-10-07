@@ -1,8 +1,11 @@
 ;; Client options and values. Every limit and deadline is an option with a safe default; zero means "none" for the timeouts.
 (ns fib.http.client.types (:use fib.core fib.seq fib.coll fib.http.types fib.http.transport fib.http.tcp fib.http.body fib.http.proxy fib.http.cookies))
-;; An OPTIONAL Content-Encoding decoder (a driver supplies zlib: DEFLATE is not implemented here). name is the coding ("gzip", "deflate");
-;; decode inflates a whole body. With no decoder for a coding the body is returned as received and its content-encoding header is kept.
-(defstruct Decoder (name: str decode: (fn :send ((Array i8)) (Result (Array i8) Error))))
+;; An OPTIONAL Content-Encoding decoder (a driver supplies zlib: DEFLATE is not implemented here, ADR 0012 spirit: fib-zlib wraps libz). name is the coding ("gzip", "deflate");
+;; decode inflates a WHOLE body and gets the most output it may produce (Options.max-response-bytes): a decoder must fail with (LimitError ..) instead of exceeding it, and
+;; is where a ratio limit lives (the client also refuses any result longer than the cap). Codings listed in Content-Encoding are undone last first, at most 4; if one of them has
+;; no decoder the body is returned as received and content-encoding is kept; after a full decode content-encoding and content-length are removed. Accept-Encoding lists the
+;; registered names (not when the caller set one, not for `request-stream`, whose body is the wire body). See docs/design/http.md, Content-Encoding.
+(defstruct Decoder (name: str decode: (fn :send ((Array i8) i64) (Result (Array i8) Error))))
 (defstruct Options (connect-timeout-ms: i64 timeout-ms: i64 follow-redirects: bool
   max-redirects: i64 decompress: bool throw-exceptions: bool ca-file: (Option str)
   max-response-bytes: i64 max-header-bytes: i64
