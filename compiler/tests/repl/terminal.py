@@ -30,11 +30,16 @@ def run(keys, waits):
                 out += d
     read_until('fib> ')
     for k, w in zip(keys, waits):
-        before = out.count('fib> '.encode()) + out.count('...  '.encode())
+        pos = len(out)
         os.write(fd, k.encode())
-        if '\r' in k or w == 'prompt':    # an input line was sent: wait for the next prompt (the REPL is in cooked mode while a program runs)
-            end = time.time() + 300
-            while out.count('fib> '.encode()) + out.count('...  '.encode()) <= before and time.time() < end: read_until('\0', 0.3)
+        if '\r' in k or w == 'prompt':
+            # An input line was sent. The REPL is in cooked mode while its program runs, so a key sent early would be lost: wait until what it wrote since ends in a fresh
+            # prompt (the prompt written whole, not a redraw of a line being edited, which ends in an erase sequence) after the line's own newline, however long the machine takes.
+            end = time.time() + 600
+            while time.time() < end:
+                tail = out[pos:]
+                if b'\r\n' in tail and (tail.endswith(b'fib> ') or tail.endswith(b'...  ')): break
+                read_until('\0', 0.3)
         time.sleep(0.05)
     deadline = time.time() + 120; status = None
     while time.time() < deadline:
