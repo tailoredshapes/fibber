@@ -1,0 +1,20 @@
+;; examples/webgpu/gpu32.fib: the index space and the element accessors over i32, for kernels that run on every backend (docs/design/webgpu.md 3).
+;; WGSL has no i64, so a kernel for the WebGPU target indexes with i32; the same kernel runs through CUDA (PTX) unchanged. These are the i32
+;; forms of examples/gpu/gpu.fib's functions over the same externs (`gpu/gpu.sreg.*`), which native.kernel rewrites to lIR's `(sreg ..)`.
+;; `ptr+` takes an i64 offset: the `sext` of an i32 byte count is the one i64 the WGSL printer accepts, and only as an address.
+(ns gpu32 (:require [gpu :as gpu]))
+
+;; The thread's index in the whole grid along x or y, as i32: `group-id * group-size + local-id`, unchecked (the grid is sized by the host).
+(defun global-id-x () -> i32
+  (unsafe (unchecked-add (unchecked-multiply (gpu/gpu.sreg.ctaid.x) (gpu/gpu.sreg.ntid.x)) (gpu/gpu.sreg.tid.x))))
+(defun global-id-y () -> i32
+  (unsafe (unchecked-add (unchecked-multiply (gpu/gpu.sreg.ctaid.y) (gpu/gpu.sreg.ntid.y)) (gpu/gpu.sreg.tid.y))))
+(defun local-id-x () -> i32 (unsafe (gpu/gpu.sreg.tid.x)))
+(defun group-id-x () -> i32 (unsafe (gpu/gpu.sreg.ctaid.x)))
+(defun group-size-x () -> i32 (unsafe (gpu/gpu.sreg.ntid.x)))
+
+;; Element `i` of an f32 or i32 buffer at `p` (no bound check: the kernel checks its own, docs/design/gpu.md 3.2).
+(defun f32-at (p: ptr i: i32) -> f32 (unsafe (load-f32 (ptr+ p (sext i64 (unchecked-multiply 4i32 i))))))
+(defun f32-set! (p: ptr i: i32 v: f32) -> unit (unsafe (store-f32 (ptr+ p (sext i64 (unchecked-multiply 4i32 i))) v)))
+(defun i32-at (p: ptr i: i32) -> i32 (unsafe (load-i32 (ptr+ p (sext i64 (unchecked-multiply 4i32 i))))))
+(defun i32-set! (p: ptr i: i32 v: i32) -> unit (unsafe (store-i32 (ptr+ p (sext i64 (unchecked-multiply 4i32 i))) v)))

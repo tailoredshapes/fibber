@@ -1,0 +1,256 @@
+;; compiler/native/wgsl/expr.fib: the WGSL expression of an lIR expression (docs/design/webgpu.md 3: the mapping table). Every result is
+;; a primary WGSL expression (a name, a literal, a call or a parenthesised form). Memory: a `ptr` is `Ptr(buf, off)`, a storage buffer
+;; and a byte offset; `getelementptr` adds to the offset; a load or store goes through `fibw_ld_T`/`fibw_st_T` of the prelude
+;; (native.wgsl `prelude`), which switch on the buffer; an alloca'd scalar is a `var` of the function. The index space `(sreg ..)` reads
+;; the private copies the entry sets (`fibw_lid`, `fibw_wid`, `fibw_nwg`) and the override `wg_x`.. for the block size. A string constant (a
+;; trap's message, which only the runtime's trap entries take) is a null `Ptr`: the message is lost on the device, as on CUDA. OWNER: package WEBGPU-1.
+(ns native.wgsl.expr
+  (:use lir.types lir.lit lir.ast native.wgsl.wx))
+
+;; ---------------------------------------------------------------- literals
+
+(defun int-text :private (wf: Wf t: LType v: LLit) -> str
+  (match t
+    ((TInt 1) (if (= (lit-low v 1) 0) "false" "true"))
+    ((TInt 32) (let ((w (lit-low v 32)))
+                 (str "i32(" (if (>= w 2147483648) (- w 4294967296) w) ")")))
+    (_ (refuse wf (type-refusal t)))))
+
+;; An f32 literal: the shortest text of its value (exact: the double is the f32 value), or the bits of a NaN or an infinity.
+(defun float-text :private (wf: Wf t: LType v: f64) -> str
+  (cond (not (= t ty-float)) (refuse wf (type-refusal t))
+        (not (= v v)) "bitcast<f32>(0x7fc00000u)"
+        (not (= (- v v) 0.0)) (if (> v 0.0) "bitcast<f32>(0x7f800000u)" "bitcast<f32>(0xff800000u)")
+        :else (str "f32(" v ")")))
+
+;; A u32 constant of an i64 literal, as an address: the low 32 bits.
+(defun u32-text :private (v: LLit) -> str (str (lit-low v 32) "u"))
+
+;; ---------------------------------------------------------------- operands
+
+(defun u32-of :private (x: str) -> str (str "bitcast<u32>(" x ")"))
+(defun i32-of :private (x: str) -> str (str "bitcast<i32>(" x ")"))
+
+(defun local-wgsl :private (wf: Wf n: str) -> str
+  (cond (contains? (. wf allocas) n) (refuse wf (str "the address of the local " n " is used as a value (a kernel has no pointer to a local)"))
+        (addr-temp? wf n) (refuse wf (str "the i64 value " n " is used outside an address (i64 may only index a buffer)"))
+        :else (match (type-of wf (expr-new (KLocal n) 0))
+                ((some t) (if (some? (wgsl-type t)) (wname n) (refuse wf (str n ": " (type-refusal t)))))
+                (nil (wname n)))))
+
+;; ---------------------------------------------------------------- arithmetic
+
+(defun bin-i32 :private (wf: Wf op: LBinOp a: str b: str) -> str
+  (match op
+    ((BAdd) (str "(" a " + " b ")")) ((BSub) (str "(" a " - " b ")")) ((BMul) (str "(" a " * " b ")"))
+    ((BSDiv) (str "(" a " / " b ")")) ((BSRem) (str "(" a " % " b ")"))
+    ((BUDiv) (i32-of (str "(" (u32-of a) " / " (u32-of b) ")"))) ((BURem) (i32-of (str "(" (u32-of a) " % " (u32-of b) ")")))
+    ((BAnd) (str "(" a " & " b ")")) ((BOr) (str "(" a " | " b ")")) ((BXor) (str "(" a " ^ " b ")"))
+    ((BShl) (str "(" a " << " (u32-of b) ")")) ((BAShr) (str "(" a " >> " (u32-of b) ")"))
+    ((BLShr) (i32-of (str "(" (u32-of a) " >> " (u32-of b) ")")))
+    (_ (refuse wf "a float operation on an integer"))))
+
+(defun bin-bool :private (wf: Wf op: LBinOp a: str b: str) -> str
+  (match op
+    ((BAnd) (str "(" a " & " b ")")) ((BOr) (str "(" a " | " b ")")) ((BXor) (str "(" a " != " b ")"))
+    ((BAdd) (str "(" a " != " b ")")) ((BSub) (str "(" a " != " b ")")) ((BMul) (str "(" a " & " b ")"))
+    (_ (refuse wf "an operation on a bool that WGSL lacks"))))
+
+(defun bin-f32 :private (wf: Wf op: LBinOp a: str b: str) -> str
+  (match op
+    ((BFAdd) (str "(" a " + " b ")")) ((BFSub) (str "(" a " - " b ")")) ((BFMul) (str "(" a " * " b ")"))
+    ((BFDiv) (str "(" a " / " b ")")) ((BFRem) (str "(" a " % " b ")"))
+    (_ (refuse wf "an integer operation on a float"))))
+
+(defun bin-form :private (wf: Wf op: LBinOp a: LExpr b: LExpr) -> str
+  (let ((t (type-of! wf a)))
+    (match t
+      ((TInt 32) (bin-i32 wf op (wf-expr wf a) (wf-expr wf b)))
+      ((TInt 1) (bin-bool wf op (wf-expr wf a) (wf-expr wf b)))
+      ((TFloat) (bin-f32 wf op (wf-expr wf a) (wf-expr wf b)))
+      (_ (refuse wf (str "arithmetic on " (type-refusal t)))))))
+
+(defun un-form :private (wf: Wf op: LUnOp a: LExpr) -> str
+  (match op
+    ((UFNeg) (str "(-" (wf-expr wf a) ")"))
+    ((UCtpop) (str "countOneBits(" (wf-expr wf a) ")"))))
+
+;; Checked arithmetic: the prelude's helpers return `OvI32(value, overflowed)`; `extractvalue` reads `.v` and `.o`.
+(defun overflow-form :private (wf: Wf op: LOvfOp a: LExpr b: LExpr) -> str
+  (if (not (= (type-of! wf a) ty-i32))
+      (refuse wf (str "checked arithmetic on " (type-refusal (type-of! wf a))))
+      (str (match op ((OvSAdd) "fibw_sadd_ovf(") ((OvSSub) "fibw_ssub_ovf(") ((OvSMul) "fibw_smul_ovf("))
+           (wf-expr wf a) ", " (wf-expr wf b) ")")))
+
+(defun extract-form :private (wf: Wf a: LExpr idx: (Vec LLit)) -> str
+  (let ((k (if (= (count idx) 1) (unwrap-or (lit->i64 (nth idx 0)) 9) 9)))
+    (cond (not (= (wgsl-type (type-of! wf a)) (some "OvI32"))) (refuse wf "extractvalue of an aggregate that is not a checked result")
+          (= k 0) (str (wf-expr wf a) ".v")
+          (= k 1) (str (wf-expr wf a) ".o")
+          :else (refuse wf "extractvalue beyond the checked pair"))))
+
+;; ---------------------------------------------------------------- comparisons and casts
+
+(defun icmp-form :private (wf: Wf pr: LIPred a: LExpr b: LExpr) -> str
+  (let ((t (type-of! wf a)) (x (wf-expr wf a)) (y (wf-expr wf b)))
+    (if (not (or (= t ty-i32) (= t ty-i1) (= t ty-ptr)))
+        (refuse wf (str "a comparison of " (type-refusal t)))
+        (match pr
+          ((IEq) (if (= t ty-ptr) (str "((" x ".buf == " y ".buf) & (" x ".off == " y ".off))") (str "(" x " == " y ")")))
+          ((INe) (if (= t ty-ptr) (str "((" x ".buf != " y ".buf) | (" x ".off != " y ".off))") (str "(" x " != " y ")")))
+          ((ISlt) (str "(" x " < " y ")")) ((ISle) (str "(" x " <= " y ")")) ((ISgt) (str "(" x " > " y ")")) ((ISge) (str "(" x " >= " y ")"))
+          ((IUlt) (str "(" (u32-of x) " < " (u32-of y) ")")) ((IUle) (str "(" (u32-of x) " <= " (u32-of y) ")"))
+          ((IUgt) (str "(" (u32-of x) " > " (u32-of y) ")")) ((IUge) (str "(" (u32-of x) " >= " (u32-of y) ")"))))))
+
+(defun fcmp-form :private (wf: Wf pr: LFPred a: LExpr b: LExpr) -> str
+  (let ((x (wf-expr wf a)) (y (wf-expr wf b)) (ord (str "((" x " == " x ") & (" y " == " y "))")) (uno (str "((" x " != " x ") | (" y " != " y "))")))
+    (if (not (= (type-of! wf a) ty-float))
+        (refuse wf (str "a float comparison of " (type-refusal (type-of! wf a))))
+        (match pr
+          ((FOeq) (str "(" x " == " y ")")) ((FOne) (str "((" x " < " y ") | (" x " > " y "))"))
+          ((FOlt) (str "(" x " < " y ")")) ((FOle) (str "(" x " <= " y ")")) ((FOgt) (str "(" x " > " y ")")) ((FOge) (str "(" x " >= " y ")"))
+          ((FOrd) ord) ((FUno) uno)
+          ((FUeq) (str "((" x " == " y ") | " uno ")")) ((FUne) (str "(" x " != " y ")"))
+          ((FUlt) (str "(!(" x " >= " y "))")) ((FUle) (str "(!(" x " > " y "))")) ((FUgt) (str "(!(" x " <= " y "))")) ((FUge) (str "(!(" x " < " y "))"))))))
+
+(defun cast-form :private (wf: Wf op: LCastOp to: LType v: LExpr) -> str
+  (let ((from (type-of! wf v)))
+    (cond (not (some? (wgsl-type to))) (refuse wf (str "a conversion to " (type-refusal to)))
+          (not (some? (wgsl-type from))) (refuse wf (str "a conversion from " (type-refusal from)))
+          :else (let ((x (wf-expr wf v)))
+                  (match op
+                    ((CSExt) (if (= from ty-i1) (str "select(i32(0), i32(-1), " x ")") x))
+                    ((CZExt) (if (= from ty-i1) (str "select(i32(0), i32(1), " x ")") x))
+                    ((CTrunc) (if (= to ty-i1) (str "((" x " & i32(1)) != i32(0))") x))
+                    ((CFpToSi) (str "i32(" x ")")) ((CFpToSiSat) (str "i32(" x ")"))
+                    ((CFpToUi) (i32-of (str "u32(" x ")"))) ((CFpToUiSat) (i32-of (str "u32(" x ")")))
+                    ((CSiToFp) (str "f32(" x ")")) ((CUiToFp) (str "f32(" (u32-of x) ")"))
+                    ((CBitcast) (if (= from to) x (str "bitcast<" (wgsl-type! wf to) ">(" x ")")))
+                    (_ (refuse wf "pointer arithmetic beyond an index and an offset (ptrtoint/inttoptr)")))))))
+
+;; ---------------------------------------------------------------- addresses
+
+;; An i64 address operand as a u32 byte count: constants, `sext`/`zext` of an i32, and `add sub mul shl` of those (an i64 `let` is folded in).
+(defun addr-u32 (wf: Wf e: LExpr) -> str
+  (match (. e kind)
+    ((KInt _ v) (u32-text v))
+    ((KLocal n) (match (get (. wf binds) n)
+                  ((some b) (if (is-i64? (type-of! wf b)) (addr-u32 wf b) (u32-of (wf-expr wf e))))
+                  (nil (if (= (type-of! wf e) ty-i64)
+                           (refuse wf (str "the i64 parameter " n " (index with i32)"))
+                           (u32-of (wf-expr wf e))))))
+    ((KCast op _ x) (cond (not (= (type-of! wf x) ty-i32)) (refuse wf (str "an address from " (type-refusal (type-of! wf x))))
+                          (or (= op CSExt) (= op CZExt)) (u32-of (wf-expr wf x))
+                          :else (refuse wf "pointer arithmetic beyond an index and an offset")))
+    ((KBin op a b) (match op
+                     ((BAdd) (str "(" (addr-u32 wf a) " + " (addr-u32 wf b) ")"))
+                     ((BSub) (str "(" (addr-u32 wf a) " - " (addr-u32 wf b) ")"))
+                     ((BMul) (str "(" (addr-u32 wf a) " * " (addr-u32 wf b) ")"))
+                     ((BShl) (str "(" (addr-u32 wf a) " << " (addr-u32 wf b) ")"))
+                     (_ (refuse wf "pointer arithmetic beyond an index and an offset (i64 arithmetic that is not + - * <<)"))))
+    (_ (refuse wf "pointer arithmetic beyond an index and an offset (an i64 that is not an index)"))))
+
+(defun scale-of :private (t: LType) -> i64
+  (match t ((TInt 8) 1) ((TInt 32) 4) ((TFloat) 4) (_ 0)))
+
+;; `(getelementptr T p i)`: the same buffer, the offset moved by `i` elements of `T` (a kernel indexes elements of 4 bytes, or bytes).
+(defun gep-form :private (wf: Wf t: LType p: LExpr idx: (Vec LExpr)) -> str
+  (let ((s (scale-of t)))
+    (cond (not (= (count idx) 1)) (refuse wf "pointer arithmetic beyond an index and an offset (a getelementptr of several indices)")
+          (= s 0) (refuse wf (str "pointer arithmetic over " (type-str t) " elements (a kernel indexes i32, f32 or bytes)"))
+          :else (let ((base (wf-expr wf p)) (i (nth idx 0))
+                      (off (if (= (type-of! wf i) ty-i64) (addr-u32 wf i) (u32-of (wf-expr wf i)))))
+                  (str "Ptr(" base ".buf, " base ".off + " (if (= s 1) off (str "(" off " * " s "u)")) ")")))))
+
+(defun ld-name :private (wf: Wf t: LType) -> str
+  (match t ((TFloat) "fibw_ld_f32") ((TInt 32) "fibw_ld_i32")
+         (_ (refuse wf (str "a load of " (type-refusal t) " (a buffer holds i32 and f32 elements)")))))
+
+(defun st-name :private (wf: Wf t: LType) -> str
+  (match t ((TFloat) "fibw_st_f32") ((TInt 32) "fibw_st_i32")
+         (_ (refuse wf (str "a store of " (type-refusal t) " (a buffer holds i32 and f32 elements)")))))
+
+(defun alloca-name :private (wf: Wf p: LExpr) -> (Option str)
+  (match (. p kind) ((KLocal n) (if (contains? (. wf allocas) n) (some (wname n)) nil)) (_ nil)))
+
+(defun load-form (wf: Wf t: LType p: LExpr) -> str
+  (match (alloca-name wf p)
+    ((some n) n)
+    (nil (str (ld-name wf t) "(" (wf-expr wf p) ")"))))
+
+;; A store as a statement.
+(defun store-stmt (wf: Wf v: LExpr p: LExpr) -> str
+  (match (alloca-name wf p)
+    ((some n) (str n " = " (wf-expr wf v) ";"))
+    (nil (str (st-name wf (type-of! wf v)) "(" (wf-expr wf p) ", " (wf-expr wf v) ");"))))
+
+;; ---------------------------------------------------------------- the index space, calls, intrinsics
+
+(defun sreg-form :private (wf: Wf name: str) -> str
+  (cond (= name "tid.x") "i32(fibw_lid.x)" (= name "tid.y") "i32(fibw_lid.y)" (= name "tid.z") "i32(fibw_lid.z)"
+        (= name "ctaid.x") "i32(fibw_wid.x)" (= name "ctaid.y") "i32(fibw_wid.y)" (= name "ctaid.z") "i32(fibw_wid.z)"
+        (= name "ntid.x") "i32(wg_x)" (= name "ntid.y") "i32(wg_y)" (= name "ntid.z") "i32(wg_z)"
+        (= name "nctaid.x") "i32(fibw_nwg.x)" (= name "nctaid.y") "i32(fibw_nwg.y)" (= name "nctaid.z") "i32(fibw_nwg.z)"
+        :else (refuse wf (str "(sreg " name "): no WGSL builtin carries it"))))
+
+(defun args-wgsl (wf: Wf args: (Vec LExpr)) -> str
+  (str-join (vec (map-indexed (fn (i: i64 e: LExpr) (str (if (= i 0) "" ", ") (wf-expr wf e))) args))))
+
+(defun call-form (wf: Wf c: LCallee args: (Vec LExpr)) -> str
+  (match c
+    ((CalDirect n) (if (contains? (. (. wf wx) defined) n)
+                       (str (wname n) "(" (args-wgsl wf args) ")")
+                       (refuse wf (str "a call of the external function " n " (a kernel calls only functions of the program)"))))
+    ((CalIndirect _ _) (refuse wf "an indirect call (a kernel has no function pointers)"))))
+
+;; The float and integer intrinsic forms of spec/lir.md 6.4 with a WGSL builtin of the same meaning; the rest are refused by name.
+(defun intrin-form :private (wf: Wf name: str args: (Vec LExpr)) -> str
+  (let ((a (args-wgsl wf args)) (t (type-of! wf (nth args 0))))
+    (cond (not (or (= t ty-float) (= t ty-i32))) (refuse wf (str "(" name " ..) on " (type-refusal t)))
+          (or (= name "fma") (= name "fmuladd")) (str "fma(" a ")")
+          (= name "fsqrt") (str "sqrt(" a ")") (= name "fabs") (str "abs(" a ")") (= name "abs") (str "abs(" a ")")
+          (= name "ffloor") (str "floor(" a ")") (= name "fceil") (str "ceil(" a ")") (= name "ftrunc") (str "trunc(" a ")")
+          (= name "froundeven") (str "round(" a ")")
+          (or (= name "fminnum") (= name "smin")) (str "min(" a ")") (or (= name "fmaxnum") (= name "smax")) (str "max(" a ")")
+          (= name "umin") (i32-of (str "min(" (u32-of (wf-expr wf (nth args 0))) ", " (u32-of (wf-expr wf (nth args 1))) ")"))
+          (= name "umax") (i32-of (str "max(" (u32-of (wf-expr wf (nth args 0))) ", " (u32-of (wf-expr wf (nth args 1))) ")"))
+          (= name "cttz") (str "countTrailingZeros(" a ")") (= name "ctlz") (str "countLeadingZeros(" a ")")
+          (= name "fcopysign") (str "bitcast<f32>((" (u32-of (wf-expr wf (nth args 0))) " & 0x7fffffffu) | (" (u32-of (wf-expr wf (nth args 1))) " & 0x80000000u))")
+          (= name "fround") (refuse wf "(fround ..): WGSL rounds ties to even only (use froundeven)")
+          (or (= name "fmin") (= name "fmax")) (refuse wf (str "(" name " ..): WGSL's min/max do not promise to propagate NaN (use fminnum/fmaxnum)"))
+          :else (refuse wf (str "(" name " ..): no WGSL builtin (the SIMD and reduction forms are the CPU's)")))))
+
+;; ---------------------------------------------------------------- the dispatcher
+
+;; The WGSL expression of `e`.
+(defun expr-wgsl (wf: Wf e: LExpr) -> str
+  (match (. e kind)
+    ((KLocal n) (local-wgsl wf n))
+    ((KGlobal n) (if (contains? (. (. wf wx) strings) n) "Ptr(0u, 0u)" (refuse wf (str "the global " n " (a kernel has no globals: shared memory is not in this target yet)"))))
+    ((KInt t v) (int-text wf t v))
+    ((KFloat t v) (float-text wf t v))
+    ((KNull) "Ptr(0u, 0u)")
+    ((KZero t) (zero-of (some t)))
+    ((KBin op a b) (bin-form wf op a b))
+    ((KUn op a) (un-form wf op a))
+    ((KOverflow op a b) (overflow-form wf op a b))
+    ((KICmp pr a b) (icmp-form wf pr a b))
+    ((KFCmp pr a b) (fcmp-form wf pr a b))
+    ((KCast op t v) (cast-form wf op t v))
+    ((KSelect c a b) (str "select(" (wf-expr wf b) ", " (wf-expr wf a) ", " (wf-expr wf c) ")"))
+    ((KExtractValue a idx) (extract-form wf a idx))
+    ((KPhi _ _) (phi-name (. e pos)))
+    ((KTrap) "fibw_trap()")
+    ((KSreg name) (sreg-form wf name))
+    ((KBarrier) "workgroupBarrier()")
+    ((KCall c args _) (call-form wf c args))
+    ((KIntrin name _ _ args _) (intrin-form wf name args))
+    ((KLoad t p _ _) (load-form wf t p))
+    ((KGep _ t p idx) (gep-form wf t p idx))
+    ((KStr _) "Ptr(0u, 0u)")
+    ((KLet _ _) (refuse wf "a let in operand position"))
+    ((KAtomicLoad _ _ _ _) (refuse wf "an atomic (not in this target yet)"))
+    ((KAtomicStore _ _ _ _) (refuse wf "an atomic (not in this target yet)"))
+    ((KAtomicRmw _ _ _ _ _) (refuse wf "an atomic (not in this target yet)"))
+    ((KCmpXchg _ _ _ _ _ _ _) (refuse wf "an atomic (not in this target yet)"))
+    (_ (refuse wf "a SIMD or aggregate form"))))

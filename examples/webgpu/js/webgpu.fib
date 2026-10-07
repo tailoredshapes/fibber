@@ -1,0 +1,189 @@
+;; examples/webgpu/js/webgpu.fib: the `Device` protocol for the JavaScript host (docs/design/webgpu.md 5): a fibber program built for
+;; wasm32-wasi calls these externs, which the glue module examples/webgpu/js/fib-webgpu.mjs provides as the imports `env.fib_gpu_*`
+;; over the browser's (or Dawn's, under node) `navigator.gpu`. `:lib "js"` marks them as the host's (native.linkwasm: `--allow-undefined`).
+;; The same functions over wgpu-native are the native driver fib-gpu-webgpu (`src/webgpu.fib`, the same `ns webgpu`): a host program
+;; `(:require [webgpu :as g])` builds against either by its -I path. ADR 0011: the externs are in a driver, the core has none.
+;;
+;; Every call returns a Result; a `GpuError` names the call, a code (negative: the glue's; -1 usage) and the glue's text. The glue never
+;; throws into the module: without WebGPU (`navigator.gpu` undefined, no adapter) `open` is an Err. Ownership (gpu.md 3.3): a buffer
+;; passed to `launch` is lent to the stream until `sync`; `download`, `upload` and `release` of a lent buffer, `release` twice and any use
+;; after it are an Err. A device trap (a kernel's `trap`, a checked `+` that overflows) is the Err of the `sync` that follows (the flag of
+;; the WGSL's binding 1, read by the glue after the queue completes).
+(ns webgpu (:use fib.core fib.seq fib.coll) (:require [fib.os.native :as n]))
+
+(extern fib_gpu_open () -> i32 :lib "js")
+(extern fib_gpu_close () -> i32 :lib "js")
+(extern fib_gpu_name (ptr i32) -> i32 :lib "js")
+(extern fib_gpu_error (ptr i32) -> i32 :lib "js")
+(extern fib_gpu_load (ptr i32) -> i32 :lib "js")
+(extern fib_gpu_kernel (i32 ptr i32) -> i32 :lib "js")
+(extern fib_gpu_buffer (i32) -> i32 :lib "js")
+(extern fib_gpu_upload (i32 ptr i32) -> i32 :lib "js")
+(extern fib_gpu_download (i32 ptr i32) -> i32 :lib "js")
+(extern fib_gpu_launch (i32 i32 i32 i32 i32 i32 i32 ptr i32) -> i32 :lib "js")
+(extern fib_gpu_sync () -> i32 :lib "js")
+(extern fib_gpu_release (i32) -> i32 :lib "js")
+
+(defstruct GpuError (call: str code: i64 message: str))
+(derive Eq GpuError)
+
+(defstruct Device (name: str))
+(defstruct Module (id: i64))
+(defstruct Kernel (id: i64 name: str))
+;; `state`: 0 idle, 1 lent to a launched kernel until the stream syncs, 2 freed.
+(defstruct Buffer (id: i64 bytes: i64 state: (Cell i64)))
+(defstruct Stream (lent: (Cell (Vec Buffer))))
+
+;; A kernel argument: a buffer, or a scalar (i32 or f32: what WGSL has).
+(defenum Arg (ABuf b: Buffer) (AI32 n: i32) (AF32 x: f32))
+
+;; --- errors
+
+(defun text-of :private (f: (fn (ptr i32) i32) :borrow) -> str
+  (unsafe
+    (let [buf (alloc 1024)]
+      (let [len (f buf 1024i32)]
+        (let [s (if (> len 0i32) (n/c-string buf) "")]
+          (do (free buf) s))))))
+
+(defun fail :private (call: str code: i32) -> GpuError
+  (GpuError call (sext i64 code) (text-of (fn (p: ptr cap: i32) (unsafe (fib_gpu_error p cap))))))
+
+(defun check :private (call: str code: i32) -> (Result unit GpuError)
+  (if (>= code 0i32) (Ok ()) (Err (fail call code))))
+
+(defun id-result :private (call: str code: i32) -> (Result i64 GpuError)
+  (if (>= code 0i32) (Ok (sext i64 code)) (Err (fail call code))))
+
+(defun usage :private (call: str message: str) -> GpuError (GpuError call -1 message))
+
+;; --- the device
+
+;; The host's WebGPU device: an Err (never a trap) when the host has no `navigator.gpu`, no adapter or no device.
+(defun open () -> (Result Device GpuError)
+  (try-let [_ (check "open" (unsafe (fib_gpu_open)))]
+    (Ok (Device (text-of (fn (p: ptr cap: i32) (unsafe (fib_gpu_name p cap))))))))
+
+(defun close (d: Device) -> (Result unit GpuError)
+  (check "close" (unsafe (fib_gpu_close))))
+
+;; --- modules and kernels
+
+(defun with-text :private (text: str f: (fn (ptr i32) i32) :borrow) -> i32
+  (let [c (n/c-text text)]
+    (let [r (f c (trunc i32 (str-len text)))]
+      (do (unsafe (free c)) r))))
+
+;; The module of the WGSL text (what `fibc build --target wgsl-unknown-webgpu --emit wgsl` writes): the host compiles it (Tint under
+;; Dawn, naga under wgpu); a WGSL that does not compile is an Err with the compiler's message.
+(defun load-wgsl (d: Device wgsl: str) -> (Result Module GpuError)
+  (match (id-result "load-wgsl" (with-text wgsl (fn (p: ptr len: i32) (unsafe (fib_gpu_load p len)))))
+    ((Ok id) (Ok (Module id)))
+    ((Err e) (Err e))))
+
+;; The kernel `name` of the module (a `defkernel`'s name with `-` as `_`): an Err when the module has none.
+(defun kernel (m: Module name: str) -> (Result Kernel GpuError)
+  (match (id-result "kernel" (with-text name (fn (p: ptr len: i32) (unsafe (fib_gpu_kernel (trunc i32 (. m id)) p len)))))
+    ((Ok id) (Ok (Kernel id name)))
+    ((Err e) (Err e))))
+
+;; --- memory
+
+(defun array-data-f32 :private (xs: (Array f32)) -> ptr (unsafe (ptr+ (raw xs) 24)))
+(defun array-data-i32 :private (xs: (Array i32)) -> ptr (unsafe (ptr+ (raw xs) 24)))
+
+(defun buffer (d: Device bytes: i64) -> (Result Buffer GpuError)
+  (if (<= bytes 0)
+      (Err (usage "buffer" (str "a buffer of " bytes " bytes")))
+      (match (id-result "buffer" (unsafe (fib_gpu_buffer (trunc i32 bytes))))
+        ((Ok id) (Ok (Buffer id bytes (cell 0))))
+        ((Err e) (Err e)))))
+
+(defun usable :private (b: Buffer call: str) -> (Result unit GpuError)
+  (cond (= @(. b state) 2) (Err (usage call "the buffer was freed"))
+        (= @(. b state) 1) (Err (usage call "the buffer is lent to a running kernel: sync the stream first"))
+        :else (Ok ())))
+
+(defun bytes-check :private (b: Buffer n: i64 call: str) -> (Result unit GpuError)
+  (if (> n (. b bytes)) (Err (usage call (str n " bytes do not fit a buffer of " (. b bytes)))) (Ok ())))
+
+(defun release (b: Buffer) -> (Result unit GpuError)
+  (try-let [_ (usable b "release")
+            _ (check "release" (unsafe (fib_gpu_release (trunc i32 (. b id)))))]
+    (do (set! (. b state) 2) (Ok ()))))
+
+(defun upload-f32 (b: Buffer xs: (Array f32)) -> (Result unit GpuError)
+  (let [n (* 4 (array-len xs))]
+    (try-let [_ (usable b "upload") _ (bytes-check b n "upload")]
+      (check "upload" (unsafe (fib_gpu_upload (trunc i32 (. b id)) (array-data-f32 xs) (trunc i32 n)))))))
+
+(defun upload-i32 (b: Buffer xs: (Array i32)) -> (Result unit GpuError)
+  (let [n (* 4 (array-len xs))]
+    (try-let [_ (usable b "upload") _ (bytes-check b n "upload")]
+      (check "upload" (unsafe (fib_gpu_upload (trunc i32 (. b id)) (array-data-i32 xs) (trunc i32 n)))))))
+
+;; The first `count` f32s of `b` (the glue waits for the queue, then maps a staging copy).
+(defun download-f32 (b: Buffer count: i64) -> (Result (Array f32) GpuError)
+  (let [n (* 4 count) out (cell (array count 0.0f32))]
+    (try-let [_ (usable b "download") _ (bytes-check b n "download")
+              _ (check "download" (unsafe (fib_gpu_download (trunc i32 (. b id)) (array-data-f32 @out) (trunc i32 n))))]
+      (Ok @out))))
+
+(defun download-i32 (b: Buffer count: i64) -> (Result (Array i32) GpuError)
+  (let [n (* 4 count) out (cell (array count 0i32))]
+    (try-let [_ (usable b "download") _ (bytes-check b n "download")
+              _ (check "download" (unsafe (fib_gpu_download (trunc i32 (. b id)) (array-data-i32 @out) (trunc i32 n))))]
+      (Ok @out))))
+
+;; --- streams and launches
+
+;; The host's one queue, as a stream: what it is lent.
+(defun stream (d: Device) -> (Result Stream GpuError) (Ok (Stream (cell []))))
+
+(defun dim :private (v: (Vec i64) i: i64) -> i32 (trunc i32 (if (< i (count v)) (nth v i) 1)))
+
+(defun dims-ok? :private (v: (Vec i64)) -> bool
+  (and (>= (count v) 1) (<= (count v) 3) (every? (fn (x: i64) (and (>= x 1) (<= x 65535))) v)))
+
+(defun lend :private (s: Stream args: (Vec Arg)) -> (Result unit GpuError)
+  (loop [i 0]
+    (if (>= i (count args))
+        (Ok ())
+        (match (nth args i)
+          ((ABuf b) (match (usable b "launch")
+                      ((Err e) (Err e))
+                      ((Ok _) (do (set! (. b state) 1) (set! (. s lent) (conj @(. s lent) b)) (recur (+ i 1))))))
+          (_ (recur (+ i 1)))))))
+
+;; The argument table the glue reads: 8 bytes per argument, a kind (0 buffer, 1 i32, 2 f32) and the value's 32 bits.
+(defun arg-table :private (args: (Vec Arg)) -> ptr
+  (unsafe
+    (let [t (alloc (* 8 (max 1 (count args))))]
+      (do (dotimes (i (count args))
+            (let [s (ptr+ t (* 8 i))]
+              (match (nth args i)
+                ((ABuf b) (do (store-i32 s 0i32) (store-i32 (ptr+ s 4) (trunc i32 (. b id)))))
+                ((AI32 v) (do (store-i32 s 1i32) (store-i32 (ptr+ s 4) v)))
+                ((AF32 x) (do (store-i32 s 2i32) (store-f32 (ptr+ s 4) x))))))
+          t))))
+
+;; Launches `k` over `grid` workgroups of `block` invocations (one to three dimensions each) with `args`; the buffers among the arguments
+;; are lent to the stream until `sync`. The glue checks the arguments against the kernel's `// fib-kernel` line (count and kinds) and the
+;; pipeline's bind group layout: a mismatch is an Err naming the parameter.
+(defun launch (s: Stream k: Kernel grid: (Vec i64) block: (Vec i64) args: (Vec Arg)) -> (Result unit GpuError)
+  (cond (not (dims-ok? grid)) (Err (usage "launch" (str "a grid is 1 to 3 dimensions of 1 to 65535, not " grid)))
+        (not (dims-ok? block)) (Err (usage "launch" (str "a block is 1 to 3 dimensions of 1 to 65535, not " block)))
+        :else
+        (try-let [_ (lend s args)]
+          (let [t (arg-table args)]
+            (let [r (unsafe (fib_gpu_launch (trunc i32 (. k id)) (dim grid 0) (dim grid 1) (dim grid 2) (dim block 0) (dim block 1) (dim block 2)
+                                            t (trunc i32 (count args))))]
+              (do (unsafe (free t))
+                  (check (str "launch " (. k name)) r)))))))
+
+;; Waits for every launch on `s`; the lent buffers are the caller's again. A kernel that trapped is the Err here (the trap flag).
+(defun sync (s: Stream) -> (Result unit GpuError)
+  (let [r (check "sync" (unsafe (fib_gpu_sync)))]
+    (do (doseq [b @(. s lent)] (when (= @(. b state) 1) (set! (. b state) 0)))
+        (set! (. s lent) [])
+        r)))

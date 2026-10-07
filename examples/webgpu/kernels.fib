@@ -1,0 +1,111 @@
+;; examples/webgpu/kernels.fib: the kernels that run on every backend (docs/design/webgpu.md 6: one `defkernel`, three runs): the same
+;; vector add and register-tiled f32 GEMM as examples/gpu/kernels.fib, written over i32 indices (WGSL has no i64), with their CPU
+;; references beside them (the same fma chain, so the runs can be compared bit for bit, gpu.md 2.1). The kernels are PTX by
+;; `fibc build --target nvptx64-nvidia-cuda --emit ptx` and WGSL by `fibc build --target wgsl-unknown-webgpu --emit wgsl`; `main`
+;; is the host run: it prints the hash of each reference result, the line every backend's run must repeat (scripts/webgpu-agree.sh).
+(ns kernels (:require [gpu :as gpu] [gpu32 :as g]))
+
+;; c[i] = a[i] + b[i] for i below n: one thread per element, the grid sized by the host.
+(gpu/defkernel vadd (a: ptr b: ptr c: ptr n: i32)
+  (let ((i (g/global-id-x)))
+    (when (< i n)
+      (g/f32-set! c i (+ (g/f32-at a i) (g/f32-at b i))))))
+
+;; The same over i32 elements, with a checked `+`: an overflow is a device trap (the flag of the WGSL target, the trap of PTX).
+(gpu/defkernel vaddi (a: ptr b: ptr c: ptr n: i32)
+  (let ((i (g/global-id-x)))
+    (when (< i n)
+      (g/i32-set! c i (+ (g/i32-at a i) (g/i32-at b i))))))
+
+;; C = A*B, row major, square n: each thread computes a 4x4 tile of C in registers, one fma chain per element in increasing k (the order of
+;; `gemm-ref` and of fib.tensor's `fma-reference`). The grid is (n/4) x (n/4) threads; n is a multiple of 4.
+(gpu/defkernel gemm (a: ptr b: ptr c: ptr n: i32)
+  (let ((col (unchecked-multiply 4i32 (g/global-id-x)))
+        (row (unchecked-multiply 4i32 (g/global-id-y))))
+    (when (and (< row n) (< col n))
+      (let ((a0 (unchecked-multiply row n)) (a1 (unchecked-add a0 n)) (a2 (unchecked-add a1 n)) (a3 (unchecked-add a2 n)))
+        (loop ((k 0i32)
+               (c00 0.0f32) (c01 0.0f32) (c02 0.0f32) (c03 0.0f32)
+               (c10 0.0f32) (c11 0.0f32) (c12 0.0f32) (c13 0.0f32)
+               (c20 0.0f32) (c21 0.0f32) (c22 0.0f32) (c23 0.0f32)
+               (c30 0.0f32) (c31 0.0f32) (c32 0.0f32) (c33 0.0f32))
+          (if (< k n)
+              (let ((bk (unchecked-add (unchecked-multiply k n) col))
+                    (b0 (g/f32-at b bk)) (b1 (g/f32-at b (unchecked-add bk 1i32)))
+                    (b2 (g/f32-at b (unchecked-add bk 2i32))) (b3 (g/f32-at b (unchecked-add bk 3i32)))
+                    (x0 (g/f32-at a (unchecked-add a0 k))) (x1 (g/f32-at a (unchecked-add a1 k)))
+                    (x2 (g/f32-at a (unchecked-add a2 k))) (x3 (g/f32-at a (unchecked-add a3 k))))
+                (recur (unchecked-add k 1i32)
+                       (simd/fma x0 b0 c00) (simd/fma x0 b1 c01) (simd/fma x0 b2 c02) (simd/fma x0 b3 c03)
+                       (simd/fma x1 b0 c10) (simd/fma x1 b1 c11) (simd/fma x1 b2 c12) (simd/fma x1 b3 c13)
+                       (simd/fma x2 b0 c20) (simd/fma x2 b1 c21) (simd/fma x2 b2 c22) (simd/fma x2 b3 c23)
+                       (simd/fma x3 b0 c30) (simd/fma x3 b1 c31) (simd/fma x3 b2 c32) (simd/fma x3 b3 c33)))
+              (let ((r0 (unchecked-add (unchecked-multiply row n) col)) (r1 (unchecked-add r0 n)) (r2 (unchecked-add r1 n)) (r3 (unchecked-add r2 n)))
+                (do (g/f32-set! c r0 c00) (g/f32-set! c (unchecked-add r0 1i32) c01) (g/f32-set! c (unchecked-add r0 2i32) c02) (g/f32-set! c (unchecked-add r0 3i32) c03)
+                    (g/f32-set! c r1 c10) (g/f32-set! c (unchecked-add r1 1i32) c11) (g/f32-set! c (unchecked-add r1 2i32) c12) (g/f32-set! c (unchecked-add r1 3i32) c13)
+                    (g/f32-set! c r2 c20) (g/f32-set! c (unchecked-add r2 1i32) c21) (g/f32-set! c (unchecked-add r2 2i32) c22) (g/f32-set! c (unchecked-add r2 3i32) c23)
+                    (g/f32-set! c r3 c30) (g/f32-set! c (unchecked-add r3 1i32) c31) (g/f32-set! c (unchecked-add r3 2i32) c32) (g/f32-set! c (unchecked-add r3 3i32) c33)))))))))
+
+;; A device-side assert: every element of `a` must be positive, else the kernel traps; the host sees it after the sync (gpu.md 3.4).
+(gpu/defkernel assert-positive (a: ptr n: i32)
+  (let ((i (g/global-id-x)))
+    (when (< i n)
+      (when (<= (g/f32-at a i) 0.0f32) (trap "assert-positive: an element is not positive")))))
+
+;; --- the inputs and the CPU references, shared by every host (the hashes they print are the agreement test's)
+
+(defun fill-f32 (n: i64 seed: i64) -> (Array f32)
+  (let ((out (cell (array n 0.0f32))))
+    (do (dotimes (i n) (array-set! &out i (/ (sitofp f32 (rem (+ (* i 7919) seed) 10007)) 97.0f32)))
+        @out)))
+
+(defun fill-i32 (n: i64 seed: i64) -> (Array i32)
+  (let ((out (cell (array n 0i32))))
+    (do (dotimes (i n) (array-set! &out i (trunc i32 (- (rem (+ (* i 7919) seed) 100003) 50000))))
+        @out)))
+
+(defun vadd-ref (a: (Array f32) b: (Array f32)) -> (Array f32)
+  (let ((out (cell (array (array-len a) 0.0f32))))
+    (do (dotimes (i (array-len a)) (array-set! &out i (+ (array-get a i) (array-get b i))))
+        @out)))
+
+(defun vaddi-ref (a: (Array i32) b: (Array i32)) -> (Array i32)
+  (let ((out (cell (array (array-len a) 0i32))))
+    (do (dotimes (i (array-len a)) (array-set! &out i (+ (array-get a i) (array-get b i))))
+        @out)))
+
+;; C = A*B with one fma chain per element in increasing k: the kernel's order.
+(defun gemm-ref (a: (Array f32) b: (Array f32) n: i64) -> (Array f32)
+  (let ((out (cell (array (* n n) 0.0f32))))
+    (do (dotimes (i n)
+          (dotimes (j n)
+            (array-set! &out (+ (* i n) j)
+                        (loop ((k 0) (acc 0.0f32))
+                          (if (>= k n) acc (recur (+ k 1) (simd/fma (array-get a (+ (* i n) k)) (array-get b (+ (* k n) j)) acc)))))))
+        @out)))
+
+;; FNV-1a over the 32-bit words of a result: the hash every backend prints.
+(defun hash-f32 (xs: (Array f32)) -> i64
+  (loop ((i 0) (h 2166136261))
+    (if (>= i (array-len xs)) h (recur (+ i 1) (hash-word h (zext i64 (f32->bits (array-get xs i))))))))
+
+(defun hash-i32 (xs: (Array i32)) -> i64
+  (loop ((i 0) (h 2166136261))
+    (if (>= i (array-len xs)) h (recur (+ i 1) (hash-word h (bit-and (zext i64 (array-get xs i)) 4294967295))))))
+
+(defun hash-word (h: i64 w: i64) -> i64
+  (loop ((k 0) (h h))
+    (if (>= k 4) h (recur (+ k 1) (bit-and (unchecked-multiply (bit-xor h (bit-and (shr w (* 8 k)) 255)) 16777619) 4294967295)))))
+
+;; The sizes of the agreement test: vadd and vaddi over 2^20 elements, GEMM at 256.
+(def VADD-N: i64 1048576)
+(def GEMM-N: i64 256)
+
+;; The host run: the three reference hashes, as `NAME n HASH`.
+(defun main () -> i64
+  (let ((a (fill-f32 VADD-N 1)) (b (fill-f32 VADD-N 2)) (ai (fill-i32 VADD-N 3)) (bi (fill-i32 VADD-N 4))
+        (ga (fill-f32 (* GEMM-N GEMM-N) 5)) (gb (fill-f32 (* GEMM-N GEMM-N) 6)))
+    (do (println (str "vadd " VADD-N " " (hash-f32 (vadd-ref a b))))
+        (println (str "vaddi " VADD-N " " (hash-i32 (vaddi-ref ai bi))))
+        (println (str "gemm " GEMM-N " " (hash-f32 (gemm-ref ga gb GEMM-N))))
+        0)))

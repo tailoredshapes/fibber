@@ -1,0 +1,158 @@
+;; compiler/native/wgsl.fib: the WGSL of a kernel module (docs/design/webgpu.md), the second printer of what native.kernel extracts.
+;; `fibc build --target wgsl-unknown-webgpu --emit wgsl FILE -o K.wgsl` lowers the program as usual, keeps its kernels and what they
+;; reach (native.kernel: the lIR module), and prints that module as WGSL compute shaders instead of lowering it with LLVM: one
+;; `@compute @workgroup_size(wg_x, wg_y, wg_z)` entry per kernel over the binding model below, one WGSL function per device function.
+;; OWNER: package WEBGPU-1.
+;;
+;; The binding model (group 0), the same for every kernel of the module, so a driver needs no layout per kernel:
+;;   binding 0   uniform   fibw_params  the scalar parameters, 4 bytes each in parameter order (the bits of an i32 or f32; a bool is 0 or 1)
+;;   binding 1   storage   fibw_flag    the trap flag: 0 before the dispatch; 1 after a device trap (the driver reads it and reports Err)
+;;   binding 2.. storage   buf0..      the pointer parameters in parameter order, as arrays of 32-bit words
+;; The workgroup size is the override constants wg_x, wg_y, wg_z, set at pipeline creation (the launch's block). The line
+;; `// fib-kernel NAME T..` names each kernel's parameter types in order, for the driver to check a launch against.
+(ns native.wgsl
+  (:use lir.types lir.ast native.wgsl.wx)
+  (:require [native.wgsl.func :as func] [fib.string :as s]))
+
+;; At most this many pointer parameters: WebGPU's default limit is 8 storage buffers per stage, and the trap flag takes one.
+(def MAX-BUFFERS: i64 7)
+
+(defun kernel-fn? :private (f: LFunction) -> bool (= (. (. f ty) cc) cc-kernel))
+
+(defun defines :private (m: LModule) -> (Vec LFunction)
+  (vec (mapcat (fn (it: LItem) (match it ((ItDefine f) [f]) (_ []))) (. m items))))
+
+(defun fns-of :private (m: LModule) -> (Map str LFnType)
+  (reduce (fn (acc: (Map str LFnType) it: LItem)
+            (match it
+              ((ItDefine f) (assoc acc (. f name) (. f ty)))
+              ((ItDeclare d) (assoc acc (. d name) (. d ty)))
+              (_ acc)))
+          {} (. m items)))
+
+;; The functions that may trap: those with `(trap)` and, to a fixed point, those that call one.
+(defun trap-set :private (fs: (Vec LFunction)) -> (Set str)
+  (let ((calls (into {} (map (fn (f: LFunction) (Pair (. f name) (func/callees f))) fs))))
+    (loop ((seen (into #{} (map (fn (f: LFunction) (. f name)) (filter func/has-trap? fs)))))
+      (let ((grown (reduce (fn (acc: (Set str) f: LFunction)
+                             (if (some? (find-first (fn (c: str) (contains? seen c)) (unwrap-or (get calls (. f name)) [])))
+                                 (conj acc (. f name)) acc))
+                           seen fs)))
+        (if (= (count grown) (count seen)) seen (recur grown))))))
+
+;; The kernel that reaches each function (the first in the module's order), for the refusal; a kernel owns itself.
+(defun owners :private (fs: (Vec LFunction)) -> (Map str str)
+  (let ((calls (into {} (map (fn (f: LFunction) (Pair (. f name) (func/callees f))) fs))))
+    (reduce (fn (acc: (Map str str) k: LFunction)
+              (loop ((work [(. k name)]) (acc acc))
+                (if (empty? work)
+                    acc
+                    (let ((n (nth work 0)) (rest (vec (drop 1 work))))
+                      (if (contains? acc n)
+                          (recur rest acc)
+                          (recur (into rest (unwrap-or (get calls n) [])) (assoc acc n (. k name))))))))
+            {} (filter kernel-fn? fs))))
+
+;; The constant globals: the string constants a trap's message is (the only constants a kernel reaches; a mutable global is refused).
+(defun string-globals :private (m: LModule) -> (Set str)
+  (reduce (fn (acc: (Set str) it: LItem)
+            (match it
+              ((ItGlobal g) (if (. g constant) (conj acc (. g name)) acc))
+              (_ acc)))
+          #{} (. m items)))
+
+(defun ptr-count :private (f: LFunction) -> i64
+  (count (filter (fn (t: LType) (= t ty-ptr)) (. (. f ty) params))))
+
+;; ---------------------------------------------------------------- the prelude
+
+(defun buffer-decls :private (n: i64) -> str
+  (str-join (vec (map (fn (i: i64) (str "@group(0) @binding(" (+ i 2) ") var<storage, read_write> buf" i ": array<u32>;\n")) (range n)))))
+
+(defun ld-cases :private (n: i64) -> str
+  (str-join (vec (map (fn (i: i64) (str " case " i "u: { return buf" i "[p.off >> 2u]; }")) (range n)))))
+
+(defun st-cases :private (n: i64) -> str
+  (str-join (vec (map (fn (i: i64) (str " case " i "u: { buf" i "[p.off >> 2u] = v; }")) (range n)))))
+
+(defun prelude :private (n: i64) -> str
+  (str "struct Ptr { buf: u32, off: u32 }\n"
+       "struct OvI32 { v: i32, o: bool }\n"
+       "struct FibTrap { flag: atomic<u32> }\n"
+       "override wg_x: u32 = 64u;\noverride wg_y: u32 = 1u;\noverride wg_z: u32 = 1u;\n"
+       "@group(0) @binding(0) var<uniform> fibw_params: array<vec4<u32>, 4>;\n"
+       "@group(0) @binding(1) var<storage, read_write> fibw_flag: FibTrap;\n"
+       (buffer-decls n)
+       "var<private> fibw_lid: vec3<u32>;\nvar<private> fibw_wid: vec3<u32>;\nvar<private> fibw_nwg: vec3<u32>;\nvar<private> fibw_trapped: bool = false;\n"
+       "fn fibw_trap() { fibw_trapped = true; atomicStore(&fibw_flag.flag, 1u); }\n"
+       "fn fibw_ld_u32(p: Ptr) -> u32 { switch p.buf {" (ld-cases n) " default: { return 0u; } } }\n"
+       "fn fibw_st_u32(p: Ptr, v: u32) { switch p.buf {" (st-cases n) " default: { } } }\n"
+       "fn fibw_ld_f32(p: Ptr) -> f32 { return bitcast<f32>(fibw_ld_u32(p)); }\n"
+       "fn fibw_ld_i32(p: Ptr) -> i32 { return bitcast<i32>(fibw_ld_u32(p)); }\n"
+       "fn fibw_st_f32(p: Ptr, v: f32) { fibw_st_u32(p, bitcast<u32>(v)); }\n"
+       "fn fibw_st_i32(p: Ptr, v: i32) { fibw_st_u32(p, bitcast<u32>(v)); }\n"
+       "fn fibw_sadd_ovf(a: i32, b: i32) -> OvI32 { let r = bitcast<i32>(bitcast<u32>(a) + bitcast<u32>(b)); return OvI32(r, ((a ^ r) & (b ^ r)) < i32(0)); }\n"
+       "fn fibw_ssub_ovf(a: i32, b: i32) -> OvI32 { let r = bitcast<i32>(bitcast<u32>(a) - bitcast<u32>(b)); return OvI32(r, ((a ^ b) & (a ^ r)) < i32(0)); }\n"
+       "fn fibw_smul_ovf(a: i32, b: i32) -> OvI32 { let r = bitcast<i32>(bitcast<u32>(a) * bitcast<u32>(b)); "
+       "let o = (a != i32(0)) && ((r / a != b) || ((a == i32(-1)) && (b == i32(-2147483648)))); return OvI32(r, o); }\n"))
+
+;; ---------------------------------------------------------------- the entries
+
+(defun type-word :private (t: LType) -> str
+  (match t ((TPtr) "ptr") ((TInt 1) "bool") ((TInt 32) "i32") ((TFloat) "f32") (_ (type-str t))))
+
+;; `// fib-kernel NAME T..`: the launch ABI line a driver checks arguments against.
+(defun signature-line :private (f: LFunction) -> str
+  (str "// fib-kernel " (wname (. f name)) (str-join (vec (map (fn (t: LType) (str " " (type-word t))) (. (. f ty) params)))) "\n"))
+
+(defun param-component :private (k: i64) -> str
+  (str "fibw_params[" (quot k 4) "]." (nth ["x" "y" "z" "w"] (rem k 4))))
+
+;; The arguments the entry passes to the body: buffer i for the i-th pointer, uniform slot j for the j-th scalar.
+(defun entry-args :private (ts: (Vec LType)) -> str
+  (loop ((i 0) (nb 0) (ns 0) (out []))
+    (if (>= i (count ts))
+        (str-join out)
+        (let ((sep (if (= i 0) "" ", ")))
+          (match (nth ts i)
+            ((TPtr) (recur (+ i 1) (+ nb 1) ns (conj out (str sep "Ptr(" nb "u, 0u)"))))
+            ((TFloat) (recur (+ i 1) nb (+ ns 1) (conj out (str sep "bitcast<f32>(" (param-component ns) ")"))))
+            ((TInt 1) (recur (+ i 1) nb (+ ns 1) (conj out (str sep "(" (param-component ns) " != 0u)"))))
+            (_ (recur (+ i 1) nb (+ ns 1) (conj out (str sep "bitcast<i32>(" (param-component ns) ")")))))))))
+
+(defun entry-wgsl :private (f: LFunction) -> str
+  (str "@compute @workgroup_size(wg_x, wg_y, wg_z)\n"
+       "fn " (wname (. f name)) "(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n"
+       "  fibw_lid = lid; fibw_wid = wid; fibw_nwg = nwg;\n"
+       "  " (body-name (. f name)) "(" (entry-args (. (. f ty) params)) ");\n}\n"))
+
+(defun entry-refusal :private (f: LFunction) -> (Option str)
+  (let ((scalars (count (filter (fn (t: LType) (not (= t ty-ptr))) (. (. f ty) params)))))
+    (cond (> (ptr-count f) MAX-BUFFERS) (some (str "kernel " (. f name) " has " (ptr-count f) " pointer parameters; WebGPU binds at most " MAX-BUFFERS " (8 storage buffers, one is the trap flag)"))
+          (> scalars 16) (some (str "kernel " (. f name) " has " scalars " scalar parameters; the uniform holds 16"))
+          (some? (. (. f ty) ret)) (some (str "kernel " (. f name) " returns a value; a kernel is unit-valued"))
+          :else nil)))
+
+;; ---------------------------------------------------------------- the module
+
+(defun function-text :private (wx: Wx f: LFunction) -> str
+  (if (kernel-fn? f)
+      (str (func/function-wgsl wx f (body-name (. f name))) (entry-wgsl f))
+      (func/function-wgsl wx f (wname (. f name)))))
+
+;; The WGSL of the kernel module `m` (native.kernel `kernel-module`): the signature lines, the prelude, the device functions and the
+;; entries in the module's order; or the first refusal.
+(defun wgsl-module (m: LModule) -> (Result str str)
+  (let ((fs (defines m)) (kernels (vec (filter kernel-fn? fs))))
+    (match (first (filter some? (map entry-refusal kernels)))
+      ((some e) (Err (str "the webgpu target cannot take " (unwrap e) " (docs/design/webgpu.md 3)")))
+      (nil (let ((nbufs (max 1 (reduce (fn (a: i64 f: LFunction) (max a (ptr-count f))) 0 kernels)))
+                 (wx (Wx (fns-of m) (into #{} (map (fn (f: LFunction) (. f name)) fs)) (trap-set fs) (owners fs) (string-globals m) nbufs (cell nil)))
+                 (text (str "// WGSL of the kernels of a fibber program, written by fibc (docs/design/webgpu.md): group 0 is binding 0 the uniform of scalar\n"
+                            "// parameters (4 bytes each, in order), binding 1 the trap flag, bindings 2.. the pointer parameters in order; wg_x/wg_y/wg_z the workgroup size.\n"
+                            (str-join (vec (map signature-line kernels)))
+                            (prelude nbufs)
+                            (str-join (vec (map (fn (f: LFunction) (function-text wx f)) fs))))))
+             (match @(. wx err)
+               ((some e) (Err e))
+               (nil (Ok text))))))))

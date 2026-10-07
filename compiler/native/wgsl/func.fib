@@ -1,0 +1,198 @@
+;; compiler/native/wgsl/func.fib: one lIR function as one WGSL function (docs/design/webgpu.md 3.4), in the loop-and-switch form of the JS
+;; backend (compiler/js/func.fib): `var L: u32 = 0u; loop { switch L { case 0u: { .. } .. } }`, one case per block, a branch being
+;; `L = k;` (the case ends, the loop goes round). Every SSA name is a `var` of the function (a value defined in one block is read in
+;; another). A phi is a variable `ph<pos>` that each edge into its block assigns before it jumps. A block with one incoming edge is
+;; written where that edge is. A parameter is copied into a `var` of its name (a self tail call assigns them and jumps to the entry).
+;; A call of a function that may trap is followed by `if (fibw_trapped) { return ..; }`, so nothing runs after a device trap.
+(ns native.wgsl.func
+  (:use lir.types lir.lit lir.ast native.wgsl.wx native.wgsl.expr)
+  (:require [lir.check.walk :as walk]))
+
+;; ---------------------------------------------------------------- what a function holds
+
+(defun walk-into :private (e: LExpr f: (fn (LExpr) unit)) -> unit
+  (do (f e)
+      (match (. e kind)
+        ((KLet binds body) (do (run! (fn (b: LBinding) (walk-into (. b value) f)) binds) (run! (fn (x: LExpr) (walk-into x f)) body)))
+        ((KPhi _ inc) (run! (fn (b: LBinding) (walk-into (. b value) f)) inc))
+        (_ (run! (fn (x: LExpr) (walk-into x f)) (walk/children e))))))
+
+(defun walk-fn (f: LFunction g: (fn (LExpr) unit)) -> unit
+  (run! (fn (b: LBlock) (run! (fn (e: LExpr) (walk-into e g)) (. b body))) (. f blocks)))
+
+(defun collect-binds :private (f: LFunction) -> (Map str LExpr)
+  (let ((m (cell {})))
+    (do (walk-fn f (fn (e: LExpr) (match (. e kind)
+                                     ((KLet binds _) (run! (fn (b: LBinding) (update! m (fn (x) (assoc x (. b name) (. b value))))) binds))
+                                     (_ ()))))
+        @m)))
+
+(defun block-phis :private (b: LBlock) -> (Vec (Pair i64 (Vec LBinding)))
+  (let ((acc (cell [])))
+    (do (run! (fn (e: LExpr) (walk-into e (fn (x: LExpr) (match (. x kind)
+                                                           ((KPhi _ inc) (update! acc (fn (v) (conj v (Pair (. x pos) inc)))))
+                                                           (_ ())))))
+              (. b body))
+        @acc)))
+
+(defun any-form? :private (f: LFunction p: (fn (LExpr) bool)) -> bool
+  (let ((hit (cell false)))
+    (do (walk-fn f (fn (e: LExpr) (if (p e) (set! hit true) ()))) @hit)))
+
+(defun self-tail? :private (fname: str e: LExpr) -> bool
+  (match (. e kind) ((KCall (CalDirect n) _ true) (= n fname)) (_ false)))
+
+;; Whether the function contains `(trap)` itself.
+(defun has-trap? (f: LFunction) -> bool
+  (any-form? f (fn (e: LExpr) (match (. e kind) ((KTrap) true) (_ false)))))
+
+;; The functions `f` calls.
+(defun callees (f: LFunction) -> (Vec str)
+  (let ((acc (cell [])))
+    (do (walk-fn f (fn (e: LExpr) (match (. e kind) ((KCall (CalDirect n) _ _) (update! acc (fn (v) (conj v n)))) (_ ()))))
+        @acc)))
+
+;; ---------------------------------------------------------------- edges and terminators
+
+(defstruct Fl (phis: (Map str (Vec (Pair i64 (Vec LBinding)))) inline: (Set str) blocks: (Map str LBlock)))
+
+(defun ret-zero :private (wf: Wf) -> str
+  (let ((z (zero-of (. (. (. wf f) ty) ret)))) (if (= z "") "return;" (str "return " z ";"))))
+
+(defun goto :private (wf: Wf fl: Fl from: str to: str) -> str
+  (str (str-join (vec (map (fn (ph: (Pair i64 (Vec LBinding)))
+                             (match (find-first (fn (b: LBinding) (= (. b name) from)) (. ph snd))
+                               ((some b) (str (phi-name (. ph fst)) " = " (wf-expr wf (. b value)) "; "))
+                               (nil "")))
+                           (unwrap-or (get (. fl phis) to) []))))
+       (match (if (contains? (. fl inline) to) (get (. fl blocks) to) nil)
+         ((some b) (str "\n" (block-wgsl wf fl b)))
+         (nil (str "L = " (unwrap-or (get (. wf labels) to) 0) "u;")))))
+
+(defun ret-stmt :private (wf: Wf v: (Option LExpr)) -> str
+  (match v ((some x) (str "return " (wf-expr wf x) ";")) (nil "return;")))
+
+(defun self-tail-stmt :private (wf: Wf args: (Vec LExpr)) -> str
+  (let ((ps (. (. wf f) params)))
+    (str "{ "
+         (str-join (vec (map-indexed (fn (i: i64 a: LExpr) (str "let tc" i " = " (wf-expr wf a) "; ")) args)))
+         (str-join (vec (map-indexed (fn (i: i64 p: LParam) (str (wname (. p name)) " = tc" i "; ")) ps)))
+         "L = 0u; }")))
+
+(defun tail-stmt :private (wf: Wf c: LCallee args: (Vec LExpr)) -> str
+  (match c
+    ((CalDirect n) (if (= n (. (. wf f) name))
+                       (self-tail-stmt wf args)
+                       (let ((call (call-form wf c args)))
+                         (if (nil? (. (. (. wf f) ty) ret)) (str call "; return;") (str "return " call ";")))))
+    ((CalIndirect _ _) (refuse wf "an indirect call (a kernel has no function pointers)"))))
+
+(defun switch-stmt :private (wf: Wf fl: Fl from: str v: LExpr d: str cases: (Vec LCase)) -> str
+  (str "switch " (wf-expr wf v) " {"
+       (str-join (vec (map (fn (c: LCase) (str " case " (wf-expr wf (. c value)) ": { " (goto wf fl from (. c label)) " }")) cases)))
+       " default: { " (goto wf fl from d) " } }"))
+
+;; ---------------------------------------------------------------- statements
+
+;; The check after a call of a function that may trap: the caller returns too, so nothing runs after a device trap.
+(defun trap-check :private (wf: Wf e: LExpr) -> str
+  (match (. e kind)
+    ((KCall (CalDirect n) _ _) (if (contains? (. (. wf wx) traps) n) (str " if (fibw_trapped) { " (ret-zero wf) " }") ""))
+    (_ "")))
+
+(defun bind-stmt :private (wf: Wf b: LBinding) -> str
+  (let ((v (. b value)))
+    (match (. v kind)
+      ((KAlloca t c _) (cond (some? c) (refuse wf "an alloca of several elements (a kernel's locals are scalars)")
+                             (nil? (wgsl-type t)) (refuse wf (str "a local of " (type-refusal t)))
+                             :else ""))
+      (_ (if (addr-temp? wf (. b name))
+             ""
+             (str (wname (. b name)) " = " (wf-expr wf v) ";" (trap-check wf v)))))))
+
+(defun stmt-wgsl :private (wf: Wf fl: Fl from: str e: LExpr) -> str
+  (match (. e kind)
+    ((KLet binds body)
+     (str (str-join (vec (map (fn (b: LBinding) (str (bind-stmt wf b) " ")) binds)))
+          (str-join (vec (map (fn (x: LExpr) (stmt-wgsl wf fl from x)) body)))))
+    ((KRet v) (ret-stmt wf v))
+    ((KBr l) (goto wf fl from l))
+    ((KCondBr c a b) (str "if " (wf-expr wf c) " { " (goto wf fl from a) " } else { " (goto wf fl from b) " }"))
+    ((KSwitch v d cases) (switch-stmt wf fl from v d cases))
+    ((KUnreachable) (ret-zero wf))
+    ((KTrap) "fibw_trap();")
+    ((KStore v p _ _) (store-stmt wf v p))
+    ((KCall c args true) (tail-stmt wf c args))
+    ((KCall _ _ false) (str (wf-expr wf e) ";" (trap-check wf e)))
+    (_ (str (wf-expr wf e) ";"))))
+
+(defun block-wgsl :private (wf: Wf fl: Fl b: LBlock) -> str
+  (str-join (vec (map (fn (e: LExpr) (str "    " (stmt-wgsl wf fl (. b label) e) "\n")) (. b body)))))
+
+;; ---------------------------------------------------------------- the function
+
+(defun alloca-names :private (f: LFunction) -> (Set str)
+  (let ((acc (cell #{})))
+    (do (walk-fn f (fn (e: LExpr) (match (. e kind)
+                                     ((KLet binds _) (run! (fn (b: LBinding) (match (. (. b value) kind) ((KAlloca _ _ _) (update! acc (fn (s) (conj s (. b name))))) (_ ()))) binds))
+                                     (_ ()))))
+        @acc)))
+
+(defun wf-new :private (wx: Wx f: LFunction) -> Wf
+  (Wf wx f
+      (into {} (map-indexed (fn (i: i64 b: LBlock) (Pair (. b label) i)) (. f blocks)))
+      (collect-binds f)
+      (cell {})
+      (alloca-names f)
+      expr-wgsl))
+
+;; The `var` of every binding (an alloca's is the local itself), every phi and every parameter.
+(defun decls :private (wf: Wf fl: Fl) -> str
+  (let ((f (. wf f)) (ts (. (. f ty) params)))
+    (str (str-join (vec (map-indexed (fn (i: i64 p: LParam) (str "  var " (wname (. p name)) ": " (wgsl-type! wf (nth ts i)) " = a_" (wname (. p name)) ";\n")) (. f params))))
+         (str-join (vec (map (fn (n: str)
+                               (let ((v (unwrap-or (get (. wf binds) n) (expr-new kind-null 0))))
+                                 (match (. v kind)
+                                   ((KAlloca t _ _) (str "  var " (wname n) ": " (unwrap-or (wgsl-type t) "i32") ";\n"))
+                                   (_ (if (addr-temp? wf n) "" (str "  var " (wname n) ": " (wgsl-type! wf (type-of! wf v)) ";\n"))))))
+                             (keys (. wf binds)))))
+         (str-join (vec (mapcat (fn (v: (Vec (Pair i64 (Vec LBinding))))
+                                  (map (fn (p: (Pair i64 (Vec LBinding)))
+                                         (str "  var " (phi-name (. p fst)) ": " (phi-type wf (. p snd)) ";\n")) v))
+                                (vals (. fl phis))))))))
+
+(defun phi-type :private (wf: Wf inc: (Vec LBinding)) -> str
+  (if (= (count inc) 0) "i32" (wgsl-type! wf (type-of! wf (. (nth inc 0) value)))))
+
+(defun edge-counts :private (f: LFunction) -> (Map str i64)
+  (let ((m (cell {})) (add (fn (l: str) (update! m (fn (x) (assoc x l (+ 1 (unwrap-or (get x l) 0))))))))
+    (do (walk-fn f (fn (e: LExpr) (match (. e kind)
+                                     ((KBr l) (add l))
+                                     ((KCondBr _ a b) (do (add a) (add b)))
+                                     ((KSwitch _ d cases) (do (add d) (run! (fn (c: LCase) (add (. c label))) cases)))
+                                     (_ ()))))
+        @m)))
+
+(defun fl-new :private (f: LFunction) -> Fl
+  (let ((edges (edge-counts f)) (entry (. (nth (. f blocks) 0) label)))
+    (Fl (into {} (map (fn (b: LBlock) (Pair (. b label) (block-phis b))) (. f blocks)))
+        (into #{} (filter (fn (l: str) (and (not (= l entry)) (= (unwrap-or (get edges l) 0) 1))) (map (fn (b: LBlock) (. b label)) (. f blocks))))
+        (into {} (map (fn (b: LBlock) (Pair (. b label) b)) (. f blocks))))))
+
+;; The WGSL function of `f` under `name`: `fn NAME(a_p0: T, ..) -> R { .. }`.
+(defun function-wgsl (wx: Wx f: LFunction name: str) -> str
+  (let ((wf (wf-new wx f))
+        (fl (fl-new f))
+        (ts (. (. f ty) params))
+        (cased (vec (filter (fn (b: LBlock) (not (contains? (. fl inline) (. b label)))) (. f blocks))))
+        (looped (or (> (count cased) 1) (any-form? f (fn (e: LExpr) (self-tail? (. f name) e)))))
+        (params (str-join (vec (map-indexed (fn (i: i64 p: LParam) (str (if (= i 0) "" ", ") "a_" (wname (. p name)) ": " (wgsl-type! wf (nth ts i)))) (. f params)))))
+        (ret (match (. (. f ty) ret) ((some t) (str " -> " (wgsl-type! wf t))) (nil ""))))
+    (str "fn " name "(" params ")" ret " {\n"
+         (decls wf fl)
+         (if looped
+             (str "  var L: u32 = 0u;\n  loop { switch L {\n"
+                  (str-join (vec (map (fn (b: LBlock) (str "  case " (unwrap-or (get (. wf labels) (. b label)) 0) "u: {\n" (block-wgsl wf fl b) "  }\n")) cased)))
+                  "  default: { " (ret-zero wf) " }\n  } }\n")
+             (block-wgsl wf fl (nth (. f blocks) 0)))
+         "}\n")))

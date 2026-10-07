@@ -6,7 +6,7 @@
 
 (ns native.api
   (:use lir.ast native.error native.jit native.aot)
-  (:require [native.pipeline :as pipe] [native.link :as link] [native.kernel :as kernel] [native.target :as target] [types.targets :as tt]))
+  (:require [native.pipeline :as pipe] [native.link :as link] [native.kernel :as kernel] [native.wgsl :as wgsl] [native.target :as target] [types.targets :as tt]))
 
 
 (defstruct Jit (session: JitSession))
@@ -80,11 +80,28 @@
                           ((Err e) (Err (lair-error-str e)))
                           ((Ok m) (unit-result (aot-build-executable m path path (AotOptions l libs dirs)))))))))
 
-;; The output of `--emit KIND` (obj, asm, llvm; ptx is asm on a kernel target, whose assembly is PTX, and nothing elsewhere).
+;; The output of `--emit KIND` (obj, asm, llvm; ptx is asm on a kernel target, whose assembly is PTX, and nothing elsewhere; wgsl is the WebGPU
+;; kernel target's own printer, `emit-wgsl`, and never LLVM's).
 (defun output-kind :private (kind: str) -> (Result AotOutput str)
-  (cond (= kind "obj") (Ok OutObject) (= kind "asm") (Ok OutAssembly) (= kind "llvm") (Ok OutLlvmIr)
+  (cond (wgsl-target?) (Err (str "the webgpu kernel target emits WGSL, which LLVM does not make: --emit wgsl, not " kind " (docs/design/webgpu.md)"))
+        (= kind "obj") (Ok OutObject) (= kind "asm") (Ok OutAssembly) (= kind "llvm") (Ok OutLlvmIr)
         (= kind "ptx") (if (kernel-target?) (Ok OutAssembly) (Err "--emit ptx needs a kernel target: --target nvptx64-nvidia-cuda (docs/design/gpu.md)"))
         :else (Err (str "unknown --emit " kind))))
+
+;; Whether FIB_TARGET_TRIPLE names the WebGPU kernel target (types.targets `wgsl-row?`): its kernels are printed as WGSL.
+(defun wgsl-target? :private () -> bool
+  (match (target/requested-triple-row) ((some r) (tt/wgsl-row? r)) (nil false)))
+
+;; `--emit wgsl`: the kernel module of `src` printed as WGSL compute shaders (native.wgsl) and written to `path`; refused off the WebGPU target.
+(defun emit-wgsl :private (src: str path: str) -> (Result unit str)
+  (if (not (wgsl-target?))
+      (Err "--emit wgsl needs the WebGPU kernel target: --target wgsl-unknown-webgpu (docs/design/webgpu.md)")
+      (try-let [m0 (match (pipe/check-source src) ((Err e) (Err (lair-error-str e))) ((Ok m) (Ok m)))
+                km (kernel/kernel-module m0)
+                text (wgsl/wgsl-module km)]
+        (match (link/write-bytes path (str-bytes text))
+          ((Err e) (Err (str path ": " e)))
+          ((Ok _) (Ok ()))))))
 
 ;; Whether FIB_TARGET_TRIPLE names a kernel target (types.targets `kernel-row?`): its module is the program's kernels (native.kernel), its assembly PTX.
 (defun kernel-target? :private () -> bool
@@ -99,6 +116,9 @@
 ;; Compiles the module `src`, which must satisfy the `main` rule, to an object, assembly or LLVM IR (`kind`) written to `path`, for the target of
 ;; FIB_TARGET_TRIPLE (else the host); links nothing. On a kernel target the module is the program's kernels and the assembly is PTX. (`fibc build --emit`)
 (defun emit-file (src: str path: str opt: i64 kind: str) -> (Result unit str)
+  (if (= kind "wgsl") (emit-wgsl src path) (emit-llvm-file src path opt kind)))
+
+(defun emit-llvm-file :private (src: str path: str opt: i64 kind: str) -> (Result unit str)
   (try-let [l (level-check opt)
             k (output-kind kind)
             m0 (match (if (kernel-target?) (pipe/check-source src) (pipe/for-executable src)) ((Err e) (Err (lair-error-str e))) ((Ok m) (Ok m)))
