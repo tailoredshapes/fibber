@@ -1,0 +1,42 @@
+;; spec:   types §8.1, docs/design/targets.md 3 (the pointer size of the target)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: array-get array-set! nth assoc get
+;; A Vec, an Array and a Map whose elements are objects (a struct, a closure, a str, a Vec) are read and written at the size of a pointer of the target: 8 bytes on
+;; x86-64 and aarch64, 4 on wasm32. The runtime indexes them by the element size the compiler gives it and the compiler's own element access by the LLVM layout, so a wrong
+;; size on a 32-bit target is a vector whose elements are read at two strides (compiler/emit/layout.fib `size-align-pb`). 2000 elements make the vector trie three levels deep.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defstruct P (a: i64 b: str))
+
+(defun make-vec (n: i64) -> (Vec P)
+  (loop ((i 0) (v: (Vec P) []))
+    (if (< i n) (recur (+ i 1) (conj v (P i (str "p" i)))) v)))
+
+(defun sum-a (v: (Vec P)) -> i64 (reduce (fn (acc: i64 p: P) (+ acc (. p a))) 0 v))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (v (make-vec 2000)))
+    (do (check c (= (count v) 2000))
+        (check c (= (sum-a v) 1999000))
+        (check c (= (. (nth v 1999) b) "p1999"))
+        (check c (= (. (nth v 1024) b) "p1024"))
+        (check c (= (. (nth (assoc v 33 (P -1 "x")) 33) b) "x"))
+        (check c (= (. (nth v 33) b) "p33"))
+        ;; an array of objects
+        (let ((arr (cell (array 40 (P 0 "z")))))
+          (do (dotimes (i 40) (array-set! &arr i (P (* i 2) (str "q" i))))
+              (check c (= (. (array-get @arr 39) a) 78))
+              (check c (= (. (array-get @arr 7) b) "q7"))))
+        ;; a map of objects, and a vector of vectors and of closures
+        (let ((m (reduce (fn (acc: (Map str P) i: i64) (assoc acc (str "k" i) (P i (str "v" i)))) {} (range 300)))
+              (vv (mapv (fn (i: i64) (vec (range i))) (range 70)))
+              (fs (mapv (fn (i: i64) (fn (x: i64) (+ x i))) (range 100))))
+          (do (check c (= (. (unwrap-or (get m "k299") (P 0 "")) b) "v299"))
+              (check c (= (count (nth vv 69)) 69))
+              (check c (= ((nth fs 77) 1) 78))
+              (check c (= (count (concat v v)) 4000))))
+        (checks-result c))))

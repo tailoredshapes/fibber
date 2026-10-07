@@ -186,6 +186,26 @@ stage_static() {
   if [ -f "$sd/static.fail" ]; then tail -n 20 "$log" > "$sd/static.out"; else touch "$sd/static.ok"; fi
 }
 
+# The wasm stage (docs/design/wasm.md 7), full gate or GATE_WASM=1: `fibc build --target wasm32-wasi` linked with wasm-ld against wasi-libc and run under node. Only when node and
+# the toolchain are there (WASI_SDK, or WASM_LD and WASI_SYSROOT, or the wasi-sdk that scripts/fetch-wasm-tools.sh puts under ~/.cache/fibber-scratch/tools/wasm), and reported as
+# skipped, with the reason, when they are not: the toolchain is no dependency of the gate. It runs compiler/tests/wasm/wasm.sh (the checks of the 32-bit target) and cases/ownership
+# and cases/modules as wasm modules against compiler/tests/wasm/expected.txt (the cases that need threads, sockets or an FMA stay out, with their reasons).
+stage_wasm() {
+  skipped wasm compiler lib cases scripts && return
+  local t0 d log; t0=$(now); log=$GATE_OUT/wasm.log
+  if [ -z "${WASI_SDK:-}" ]; then for d in "$HOME"/.cache/fibber-scratch/tools/wasm/wasi-sdk-*; do [ -d "$d" ] && WASI_SDK=$d; done; export WASI_SDK; fi
+  if ! command -v node >/dev/null || { [ -z "${WASI_SDK:-}" ] && [ -z "${WASM_LD:-}" ] && ! command -v wasm-ld >/dev/null; }; then
+    echo "wasm SKIPPED: no node or no wasm toolchain (scripts/fetch-wasm-tools.sh, then WASI_SDK): the wasm32-wasi build was not tested" > "$sd/wasm.t"; touch "$sd/wasm.ok"; return
+  fi
+  : > "$log"
+  bash "$here/../compiler/tests/wasm/wasm.sh" "$F" >> "$log" 2>&1 || sfail wasm "wasm: compiler/tests/wasm/wasm.sh FAILED"
+  for d in ownership modules; do
+    python3 "$here/../compiler/tests/wasm/suite.py" --fibc "$F" "cases/$d" -j "$jobs" --expected "$here/../compiler/tests/wasm/expected.txt" >> "$log" 2>&1 || sfail wasm "wasm: cases/$d as wasm modules FAILED"
+  done
+  echo "wasm $(grep -E '^cases/[a-z]+: [0-9]+ cases' "$log" | awk '{p+=$4; f+=$6} END {print p " pass, " f " expected fail"}') (log: $log) $(elapsed "$t0" "$(now)") s" > "$sd/wasm.t"
+  if [ -f "$sd/wasm.fail" ]; then tail -n 20 "$log" > "$sd/wasm.out"; else touch "$sd/wasm.ok"; fi
+}
+
 sample=
 [ "$mode" = quick ] && make_sample
 # the order of the report
@@ -195,11 +215,12 @@ order+=(tools)
 [ "$mode" = full ] && order+=(adr)
 order+=(cases)
 if [ "$mode" = full ] || [ "${GATE_STATIC:-0}" = 1 ]; then order+=(static); fi
+if [ "$mode" = full ] || [ "${GATE_WASM:-0}" = 1 ]; then order+=(wasm); fi
 if { [ "$mode" = full ] || [ "${GATE_SPECS:-0}" = 1 ]; } && [ -d specs ]; then order+=(specs); fi
 # The stages with the longest chains first (the fixed point is one build after another, golden builds its tools and then runs its suites, the cases
 # are shards), a moment before the many small scripts of tools, so that the slots they ask for are theirs and the wall time is not a late
 # straggler's: the report below is the same whichever order they start in.
-for s in fixed golden cases static tools adr specs; do
+for s in fixed golden cases static wasm tools adr specs; do
   [[ " ${order[*]} " == *" $s "* ]] || continue
   ( stage_"$s"; stage_done "$s" ) &
   [ "$s" = cases ] && sleep 3

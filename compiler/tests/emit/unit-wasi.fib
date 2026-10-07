@@ -1,0 +1,62 @@
+;; compiler/tests/emit/unit-wasi.fib: the 32-bit target of docs/design/wasm.md 4: the layouts take the pointer width of the target, the libc functions whose `size_t` is 32 bits are named, and the
+;; WASI adaptation of the runtime (emit.wasi) applies to the runtime as it is: every text it rewrites is in rt/*.lir (a change of the runtime that moves one fails here, not on a machine with a wasm
+;; toolchain), what it rewrites is gone, and what it adds is there. Every check names a value a wrong table or a stale rewrite would change.
+;; Build: fibc build compiler/tests/emit/unit-wasi.fib -I compiler -I lib -o OUT
+(ns main (:use types.check types.targets emit.value emit.layout emit.runtime) (:require [emit.wasi :as w] [emit.os :as os]))
+
+(defun runtime () -> str
+  (str-join [RT-CORE RT-STR RT-ARRAY RT-VEC RT-VECBUILD RT-ATOM RT-THREAD RT-TASK RT-WEAK RT-IO RT-SYS RT-ALLOC]))
+
+(defun has (s: str t: str) -> bool (some? (str-find s t 0)))
+
+(defun adapted () -> str (str-join (mapv w/adapt [RT-CORE RT-STR RT-ARRAY RT-VEC RT-VECBUILD RT-ATOM RT-THREAD RT-TASK RT-WEAK RT-IO RT-SYS RT-ALLOC])))
+
+(defun main () -> i64
+  (let ((cs (checks-new)) (rt (runtime)) (out (adapted)))
+    (do
+      (check cs "a pointer is 8 bytes on the host and 4 on a 32-bit target; a dyn is two of them; an Option of one is a tag and a pointer"
+             (and (= (. (size-align LirPtr) fst) 8) (= (. (size-align-pb 4 LirPtr) fst) 4) (= (. (size-align-pb 4 LirPtr) snd) 4)
+                  (= (. (size-align-pb 4 LirRaw) fst) 4)
+                  (= (. (size-align-pb 4 LirDyn) fst) 8) (= (. (size-align-pb 8 LirDyn) fst) 16)
+                  (= (. (size-align-pb 4 (LirOpt LirPtr)) fst) 8) (= (. (size-align-pb 8 (LirOpt LirPtr)) fst) 16)))
+      (check cs "scalars do not depend on the pointer: i64 and double are 8 and 8-aligned even where a pointer is 4"
+             (and (= (size-align-pb 4 LirI64) (Pair 8 8)) (= (size-align-pb 4 LirDouble) (Pair 8 8)) (= (size-align-pb 4 LirI32) (Pair 4 4))
+                  (= (size-align-pb 4 (LirOpt LirI64)) (Pair 16 8))))
+      (check cs "the pointer width of the target is the row's: 4 for wasm32, 8 otherwise (the host's when no target is named)"
+             (and (= (quot (. (target-row-of-triple "wasm32-wasi") pointer-bits) 8) 4) (= (quot (. (target-row-of-triple "aarch64-apple-darwin") pointer-bits) 8) 8)))
+      (check cs "the libc functions of a 32-bit size_t are narrowed; lseek (off_t is 64 bits), the runtime's own functions and a made-up name are not"
+             (and (libc-narrow? "malloc") (libc-narrow? "write") (libc-narrow? "snprintf") (libc-narrow? "calloc") (libc-narrow? "memcpy")
+                  (not (libc-narrow? "lseek")) (not (libc-narrow? "fib_alloc_ctl")) (not (libc-narrow? "clock_gettime")) (not (libc-narrow? "no-such"))))
+      (check cs "every list of narrowed names is a name of the runtime's C functions or the library's externs: the runtime's size_t users are all in it"
+             (every? (fn (n: str) (libc-narrow? n)) ["malloc" "calloc" "realloc" "memcpy" "memcmp" "memset" "write" "read" "strlen" "snprintf" "sysconf" "pthread_detach" "malloc_usable_size"]))
+      (check cs "every text the WASI adaptation rewrites is in the runtime (a stale rewrite after a change of rt/*.lir fails here)"
+             (every? (fn (p: str) (has rt p)) (w/rewrite-patterns)))
+      (check cs "the adapted runtime calls no madvise, mallopt, pipe or dup, and declares none of them nor pthread_create, pthread_detach or pthread_exit (the shim defines the last three)"
+             (and (not (or (has out "@madvise") (has out "@mallopt") (has out "@pipe ") (has out "@dup ")))
+                  (not (or (has out "(declare madvise") (has out "(declare mallopt") (has out "(declare pipe ") (has out "(declare dup ")
+                           (has out "(declare pthread_create") (has out "(declare pthread_detach") (has out "(declare pthread_exit")))))
+      (check cs "no runtime text says a pointer is 8 bytes in the places that the target's 4 must reach (the trie's child arrays, the worklist)"
+             (and (has rt "(call @fib.array-alloc m tnarr (i64 8))") (not (has out "(call @fib.array-alloc m tnarr (i64 8))"))
+                  (not (has out "(call @fib.array-elem karr ki (i64 8))")) (has out "(call @fib.array-elem karr ki (i64 4))")
+                  (not (has out "(mul cap2 (i64 8))")) (has out "(mul cap2 (i64 4))")))
+      (check cs "the pool starts no worker, a spawn runs the task where it is asked, and the exit drains the queue instead of waiting for a worker"
+             (and (has out "(n (i64 0))") (has out "(call @fib.w.run-inline entry task)") (not (has out "(call @pthread_cond_wait"))
+                  (has out "(define internal (fib.pool-quiesce void) ()\n  (block entry (br test))")))
+      (check cs "the runtime's open uses WASI's AT_FDCWD (-2) and flags, and its errno is Linux's number of the WASI one"
+             (and (has out "(call @openat (i32 -2)") (has out "(call @fib.w.oflags flags)") (has out "(call @fib.w.errno-linux (load i32 (call @__errno_location)))")
+                  (has out "(call @strerror (call @fib.w.errno-wasi")))
+      (check cs "the shim defines what the adapted text calls: oflags, nosys, run-inline, the deadlock trap, both errno maps, pthread_create and pthread_exit"
+             (let ((shim (w/shim)))
+               (every? (fn (n: str) (has shim (str-join ["(define internal (" n " "])))
+                       ["fib.w.oflags" "fib.w.nosys" "fib.w.run-inline" "fib.w.deadlock" "fib.w.errno-linux" "fib.w.errno-wasi" "pthread_create" "pthread_exit" "pthread_detach"])))
+      (check cs "the errno maps are switches over the table: ENOENT 44 <-> 2, EEXIST 20 <-> 17, EINVAL 28 <-> 22"
+             (let ((shim (w/shim)))
+               (and (has shim "((i32 44) m44)") (has shim "(block m44 (ret (i32 2)))") (has shim "((i32 2) m2)") (has shim "(block m2 (ret (i32 44)))")
+                    (has shim "(block m17 (ret (i32 20)))") (has shim "(block m22 (ret (i32 28)))"))))
+      (check cs "the finishing pass renames clock_gettime everywhere and defines the wrapper that widens tv_nsec"
+             (let ((t (w/finish "(declare clock_gettime i32 (i32 ptr))\n (call @clock_gettime (i32 1) t) (call @clock_gettime id u)")))
+               (and (not (has t "(declare clock_gettime i32 (i32 ptr))")) (has t "(call @fib.w.clock-gettime (i32 1) t)") (has t "(call @fib.w.clock-gettime id u)")
+                    (has t "(define internal (fib.w.clock-gettime i32)") (has t "(store (sext i64 (load i32 at)) at)"))))
+      (check cs "a text with none of the patterns is left as it is by the part rewrite"
+             (= (w/adapt "(define internal (f void) () (block entry (ret)))") "(define internal (f void) () (block entry (ret)))"))
+      (finish cs))))
