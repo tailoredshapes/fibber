@@ -43,3 +43,33 @@ its context for a key (the largest), and `array-copy`-style builtins for the rec
 
 Memory use; CPU use of the client alone (the server shares the machine); larger records or other sizes of read; the P-256 and P-384 groups and the RSA and Ed25519 certificates; resumption (not built);
 other machines (the Mac and the Ryzen box of the memory notes were not used: the driver ran only here).
+
+## After CRYPTO-3 (2026-10-07): key handles, into-buffer calls, a read buffer, `array-blit!`
+
+**Measured** with `FIBC=<stage 2> DRIVER=<fib-crypto-openssl v0.3.0 src> MB=256 HS=100 scripts/tls-bench.sh` (same machine and the same `s_server`; the machine was shared with other agents' jobs, so the
+spread is wide: the three runs of each row are quoted). What changed in `fib.tls`: a key handle per direction (the cipher fetched and the key set once, section 9.1 of docs/design/crypto.md),
+`aead-key-open-into` straight out of a byte queue into one array per record, one array per `send` for all the records of a write (`aead-key-seal-into`, one reused inner-plaintext buffer), reads of at
+least 128 KiB, and `array-blit!` for every copy (`fib.tls.buf`).
+
+| suite | `fib.tls` before | `fib.tls` after | `openssl s_client` (same run) | curl (same run) |
+|---|---|---|---|---|
+| TLS_AES_128_GCM_SHA256 | 633, 607, 536 MB/s | 946, 1709, 1209 MB/s | 1596, 1725, 1198 MB/s | 1744, 1590, 1712 MB/s |
+| TLS_CHACHA20_POLY1305_SHA256 | 537, 533, 535 MB/s | 1033, 998, 962 MB/s | 1056, 1099, 1080 MB/s | 1192, 1120, 1130 MB/s |
+
+AES-128-GCM went from 2 to 4 times slower than `s_client`/curl to about 1.0 to 1.7 times slower (the median run 1209 against 1596: 1.32x); ChaCha20-Poly1305 is within 1.1x of `s_client`. The
+target of 1.5x is met on the median of both suites and missed on the slowest AES run (946 against 1596). What is left is not profiled: the read of the transport (a fresh array per `read`,
+copied once into the queue), one allocation of the plaintext per record, and the copy out to the 64 KiB array the caller asked for. Handshake latency in the same run: median 1.01 ms, p10 0.60 ms,
+p90 1.10 ms (n=100), against 0.45 ms before; the run shared the machine and a handshake now makes three key handles (six contexts), so the figure is not a conclusion: it should be measured again
+on a quiet machine before anything is said of it.
+
+The driver alone (`scripts/bench-pk.sh` of fib-crypto-openssl, 28 cores, MB/s of 10^6 bytes, wall time of the whole process):
+
+```
+aes-128-gcm           16384 bytes   per-call 4280   handle 6647   handle+into 7466   openssl speed 7629
+aes-128-gcm         1048576 bytes   per-call 6510   handle 6528   handle+into 7718   openssl speed 8014
+aes-256-gcm           16384 bytes   per-call 4046   handle 6301   handle+into 6598   openssl speed 6661
+aes-256-gcm         1048576 bytes   per-call 5395   handle 5748   handle+into 6472   openssl speed 6753
+chacha20-poly1305     16384 bytes   per-call 1956   handle 2343   handle+into 2437   openssl speed 2585
+chacha20-poly1305   1048576 bytes   per-call 2417   handle 2348   handle+into 2504   openssl speed 2532
+```
+A handle that seals into one buffer is within 1.02 to 1.07 times `openssl speed` at 16 KiB and 1 MiB for the three ciphers (target 1.15).

@@ -3,11 +3,11 @@
 ;; the peer's close_notify; a transport that ends without it is `Truncated`, an error (RFC 8446 6.1: otherwise an attacker can cut a message short). A fatal error closes
 ;; the connection after a best-effort alert, and every later call returns that error. The writer rekeys itself before 2^24 records under one key (the AES-GCM
 ;; limit of RFC 8446 5.5), and a connection stops at 2^40 records.
-(ns fib.tls.conn (:use fib.core fib.seq fib.coll fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.msg fib.tls.msg-parse fib.tls.keys fib.tls.record fib.tls.hs-flight))
+(ns fib.tls.conn (:use fib.core fib.seq fib.coll fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.buf fib.tls.msg fib.tls.msg-parse fib.tls.keys fib.tls.record fib.tls.hs-flight))
 
 (defstruct Session (read: (fn (i64) (Result (Array i8) TlsError)) write: (fn ((Array i8)) (Result unit TlsError)) close: (fn () unit) set-deadline: (fn (i64) unit)
                     alpn: (Option str) suite: str))
-(defstruct Conn (rec: Rec suite: Suite inbuf: (Cell (Array i8)) rtr: (Cell Traffic) wtr: (Cell Traffic) rclosed: (Cell bool) closed: (Cell bool)
+(defstruct Conn (rec: Rec suite: Suite abuf: Buf rtr: (Cell Traffic) wtr: (Cell Traffic) rclosed: (Cell bool) closed: (Cell bool)
                  failed: (Cell (Option TlsError)) updates: (Cell i64)))
 (def rekey-after: i64 16777216)
 (def max-updates: i64 1024)
@@ -16,6 +16,7 @@
   (do (if (and (not @(. c closed)) (match e ((TlsAlert _ _) false) ((Truncated) false) ((TransportFailed _) false) ((TlsTimeout _) false) (_ true)))
         (do (send p (. c rec) ct-alert (alert-body true (alert-for e))) ()) ())
       (set! (. c closed) true) (set! (. c failed) (some e))
+      (release-keys (. c rec))
       ((. (. (. c rec) io) close))
       e))
 (defun live :private (c: Conn) -> (Result unit TlsError)
@@ -24,13 +25,13 @@
 ;; ---- key updates
 (defun update-write :private (p: p c: Conn) :where ((CryptoProvider p)) -> (Result unit TlsError)
   (try-let [n (next-traffic p (. c suite) @(. c wtr))]
-    (do (set! (. c wtr) n) (set-write-keys (. c rec) (. (. c suite) aead) n) (Ok ()))))
+    (do (set! (. c wtr) n) (set-write-keys p (. c rec) (. (. c suite) aead) n))))
 ;; Tell the peer (under the old keys) and then switch: `request` asks the peer to update too.
 (defun send-key-update :private (p: p c: Conn request: bool) :where ((CryptoProvider p)) -> (Result unit TlsError)
   (try-let [_ (send p (. c rec) ct-handshake (key-update-message request))] (update-write p c)))
 (defun update-read :private (p: p c: Conn) :where ((CryptoProvider p)) -> (Result unit TlsError)
   (try-let [n (next-traffic p (. c suite) @(. c rtr))]
-    (do (set! (. c rtr) n) (set-read-keys (. c rec) (. (. c suite) aead) n) (Ok ()))))
+    (do (set! (. c rtr) n) (set-read-keys p (. c rec) (. (. c suite) aead) n))))
 
 (defun handle-message :private (p: p c: Conn m: HsMsg) :where ((CryptoProvider p)) -> (Result unit TlsError)
   (cond (= (. m type) ht-new-session-ticket) (parse-new-session-ticket (. m body))
@@ -49,25 +50,24 @@
     ((Ok (some m)) (match (handle-message p c m) ((Err e) (Err e)) ((Ok _) (drain-messages p c))))))
 
 ;; ---- reading application data
-(defun take-app :private (c: Conn n: i64) -> (Array i8)
-  (let [b @(. c inbuf) k (min n (array-len b))] (do (set! (. c inbuf) (drop-bytes b k)) (slice b 0 k))))
+(defun take-app :private (c: Conn n: i64) -> (Array i8) (buf-take (. c abuf) (min n (buf-len (. c abuf)))))
 (defun on-record :private (p: p c: Conn x: RecIn) :where ((CryptoProvider p)) -> (Result bool TlsError)
   (cond (= (. x type) ct-application-data)
           (if (not (message-boundary? (. c rec))) (Err (proto-alert 10 "application data inside a handshake message"))
-            (do (set! (. c inbuf) (cat [@(. c inbuf) (. x data)])) (Ok (> (array-len (. x data)) 0))))
+            (do (buf-append (. c abuf) (. x data) 0 (. x len)) (Ok (> (. x len) 0))))
         (= (. x type) ct-handshake)
-          (if (= (array-len (. x data)) 0) (Err (proto-err "an empty handshake record"))
-            (do (set! (. (. c rec) hsbuf) (cat [@(. (. c rec) hsbuf) (. x data)]))
+          (if (= (. x len) 0) (Err (proto-err "an empty handshake record"))
+            (do (set! (. (. c rec) hsbuf) (cat [@(. (. c rec) hsbuf) (. (exact x) data)]))
                 (match (drain-messages p c) ((Err e) (Err e)) ((Ok _) (Ok false)))))
         (not (message-boundary? (. c rec))) (Err (proto-alert 10 "an alert inside a handshake message"))
-        :else (match (alert-error (. x data))
+        :else (match (alert-error (. (exact x) data))
                 ((Truncated) (do (set! (. c rclosed) true) (Ok false)))
                 (e (Err e)))))
 ;; Reads records until there is application data, or the peer closed cleanly (then the result is the empty array), or something failed.
 (defun read-app :private (p: p c: Conn n: i64) :where ((CryptoProvider p)) -> (Result (Array i8) TlsError)
-  (cond (> (array-len @(. c inbuf)) 0) (Ok (take-app c n))
+  (cond (> (buf-len (. c abuf)) 0) (Ok (take-app c n))
         @(. c rclosed) (Ok (empty-bytes))
-        :else (match (read-record p (. c rec))
+        :else (match (read-raw-record (. c rec))
                 ((Err e) (Err e))
                 ((Ok x) (match (on-record p c x) ((Err e) (Err e)) ((Ok _) (read-app p c n)))))))
 (defun sess-read (p: p c: Conn n: i64) :where ((CryptoProvider p)) -> (Result (Array i8) TlsError)
@@ -76,13 +76,13 @@
     ((Ok _) (match (read-app p c n) ((Err e) (Err (fail p c e))) ((Ok b) (Ok b))))))
 
 ;; ---- writing
-(defun write-chunk :private (p: p c: Conn bytes: (Array i8)) :where ((CryptoProvider p)) -> (Result unit TlsError)
+(defun write-chunk :private (p: p c: Conn bytes: (Array i8) off: i64 len: i64) :where ((CryptoProvider p)) -> (Result unit TlsError)
   (try-let [_ (if (>= (write-seq (. c rec)) rekey-after) (send-key-update p c false) (Ok ()))]
-    (send p (. c rec) ct-application-data bytes)))
+    (send-range p (. c rec) ct-application-data bytes off len)))
 (defun write-all :private (p: p c: Conn bytes: (Array i8) off: i64) :where ((CryptoProvider p)) -> (Result unit TlsError)
   (if (>= off (array-len bytes)) (Ok ())
     (let [end (min (array-len bytes) (+ off 65536))]
-      (match (write-chunk p c (slice bytes off end)) ((Err e) (Err e)) ((Ok _) (write-all p c bytes end))))))
+      (match (write-chunk p c bytes off (- end off)) ((Err e) (Err e)) ((Ok _) (write-all p c bytes end))))))
 (defun sess-write (p: p c: Conn bytes: (Array i8)) :where ((CryptoProvider p)) -> (Result unit TlsError)
   (match (live c)
     ((Err e) (Err e))
@@ -93,9 +93,10 @@
   (if @(. c closed) ()
     (do (set! (. c closed) true)
         (match @(. c failed) ((some _) ()) (nil (do (send p (. c rec) ct-alert (alert-body false 0)) ())))
+        (release-keys (. c rec))
         ((. (. (. c rec) io) close)))))
 
 (defun make-session (p: p rec: Rec d: HsDone) :where ((CryptoProvider p)) -> Session
-  (let [c (Conn rec (. d suite) (cell (empty-bytes)) (cell (. d ap-read)) (cell (. d ap-write)) (cell false) (cell false) (cell nil) (cell 0))]
+  (let [c (Conn rec (. d suite) (buf-new 65536) (cell (. d ap-read)) (cell (. d ap-write)) (cell false) (cell false) (cell nil) (cell 0))]
     (Session (fn (n: i64) (sess-read p c n)) (fn (b: (Array i8)) (sess-write p c b)) (fn () (sess-close p c))
              (fn (at: i64) ((. (. rec io) set-deadline) at)) (. d alpn) (str (. (. d suite) aead) "/" (. (. d suite) hash)))))

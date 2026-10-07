@@ -5,92 +5,126 @@
 ;; the read keys are on (except the compatibility change_cipher_spec, only during the handshake), an inner plaintext of zeros only, an inner content over
 ;; 2^14, an unknown inner type, a major version other than 3, an empty handshake fragment, a partial handshake message cut by another record type,
 ;; and a sequence number at the bound. Closing the transport without close_notify is `Truncated`.
-(ns fib.tls.record (:use fib.core fib.seq fib.coll fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.msg fib.tls.keys) (:require [fib.crypto :as c]))
+;; THROUGHPUT (docs/shootout/tls.md): a direction's protection holds an AEAD KEY HANDLE (`c/aead-key`: the cipher and key bound once, fib.crypto.types `AeadKey`), so a record costs the
+;; nonce, the AAD and the data, not a cipher fetch and a context. Reads go into a `Buf` (as much as the transport yields at once) and a record is opened straight out of it into one new
+;; array (`aead-key-open-into`); a write builds all the records of a call in ONE array (`aead-key-seal-into`, headers and ciphertext at their offsets) from one reused inner-plaintext
+;; buffer. The copies are `array-blit!`, not element loops.
+(ns fib.tls.record (:use fib.core fib.seq fib.coll fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.buf fib.tls.msg fib.tls.keys) (:require [fib.crypto :as c]))
 
 (defstruct Io (read: (fn (i64) (Result (Array i8) TlsError)) write: (fn ((Array i8)) (Result unit TlsError)) close: (fn () unit) set-deadline: (fn (i64) unit)))
-;; One direction's protection: the AEAD, the key, the static IV and the next sequence number.
-(defstruct Prot (alg: keyword key: (Array i8) iv: (Array i8) seq: i64))
-(defstruct Rec (io: Io inbuf: (Cell (Array i8)) rd: (Cell (Option Prot)) wr: (Cell (Option Prot)) hsbuf: (Cell (Array i8)) ccs: (Cell i64) handshaking: (Cell bool)))
-(defstruct RecIn (type: i64 data: (Array i8)))
+;; One direction's protection: the AEAD key handle, the static IV and the next sequence number.
+(defstruct Prot (alg: keyword key: (dyn AeadKey) iv: (Array i8) seq: (Cell i64)))
+(defstruct Rec (io: Io inbuf: Buf rd: (Cell (Option Prot)) wr: (Cell (Option Prot)) hsbuf: (Cell (Array i8)) ccs: (Cell i64) handshaking: (Cell bool)))
+;; One record's content: `data[0, len)` (a handshake or alert record's `data` is exactly that; the connection's fast path leaves the inner type byte after it).
+(defstruct RecIn (type: i64 data: (Array i8) len: i64))
 (defstruct HsMsg (type: i64 body: (Array i8) raw: (Array i8)))
 
 (def max-plain: i64 16384)
 (def max-cipher: i64 16640)
 (def seq-bound: i64 1099511627776)
 (def max-hs-message: i64 262144)
+(def read-chunk: i64 131072)
 
-(defun new-rec (io: Io) -> Rec (Rec io (cell (empty-bytes)) (cell nil) (cell nil) (cell (empty-bytes)) (cell 0) (cell true)))
-(defun prot-of (alg: keyword t: Traffic) -> Prot (Prot alg (. t key) (. t iv) 0))
-(defun set-read-keys (r: Rec alg: keyword t: Traffic) -> unit (set! (. r rd) (some (prot-of alg t))))
-(defun set-write-keys (r: Rec alg: keyword t: Traffic) -> unit (set! (. r wr) (some (prot-of alg t))))
-(defun read-seq (r: Rec) -> i64 (match @(. r rd) (nil 0) ((some p) (. p seq))))
-(defun write-seq (r: Rec) -> i64 (match @(. r wr) (nil 0) ((some p) (. p seq))))
+(defun new-rec (io: Io) -> Rec (Rec io (buf-new 262144) (cell nil) (cell nil) (cell (empty-bytes)) (cell 0) (cell true)))
+;; The protection of one direction: a key handle made by the provider, so this is where an unsupported cipher shows.
+(defun prot-of (p: p alg: keyword t: Traffic) :where ((CryptoProvider p)) -> (Result Prot TlsError)
+  (match (c/aead-key p alg (. t key)) ((Err e) (Err (from-crypto e))) ((Ok k) (Ok (Prot alg k (. t iv) (cell 0))))))
+(defun close-prot :private (o: (Option Prot)) -> unit (match o (nil ()) ((some pr) (c/aead-key-close (. pr key)))))
+;; Installs new keys in one direction and closes the handle they replace.
+(defun set-read-keys (p: p r: Rec alg: keyword t: Traffic) :where ((CryptoProvider p)) -> (Result unit TlsError)
+  (try-let [pr (prot-of p alg t)] (do (close-prot @(. r rd)) (set! (. r rd) (some pr)) (Ok ()))))
+(defun set-write-keys (p: p r: Rec alg: keyword t: Traffic) :where ((CryptoProvider p)) -> (Result unit TlsError)
+  (try-let [pr (prot-of p alg t)] (do (close-prot @(. r wr)) (set! (. r wr) (some pr)) (Ok ()))))
+;; Releases both key handles (a connection that ends, cleanly or not).
+(defun release-keys (r: Rec) -> unit
+  (do (close-prot @(. r rd)) (close-prot @(. r wr)) (set! (. r rd) nil) (set! (. r wr) nil)))
+(defun read-seq (r: Rec) -> i64 (match @(. r rd) (nil 0) ((some p) @(. p seq))))
+(defun write-seq (r: Rec) -> i64 (match @(. r wr) (nil 0) ((some p) @(. p seq))))
 (defun encrypted-read? (r: Rec) -> bool (some? @(. r rd)))
 (defun encrypted-write? (r: Rec) -> bool (some? @(. r wr)))
 
-;; ---- reading bytes
+;; ---- reading bytes: until `n` are queued, asking the transport for what it has (at least `read-chunk`)
 (defun fill (r: Rec n: i64) -> (Result unit TlsError)
   (loop []
-    (let [have (array-len @(. r inbuf))]
+    (let [have (buf-len (. r inbuf))]
       (if (>= have n) (Ok ())
-        (match ((. (. r io) read) (max (- n have) 32768))
+        (match ((. (. r io) read) (max (- n have) read-chunk))
           ((Err e) (Err e))
-          ((Ok b) (if (= (array-len b) 0) (Err Truncated) (do (set! (. r inbuf) (cat [@(. r inbuf) b])) (recur)))))))))
-(defun consume (r: Rec n: i64) -> (Array i8)
-  (let [b @(. r inbuf)] (do (set! (. r inbuf) (drop-bytes b n)) (slice b 0 n))))
+          ((Ok b) (if (= (array-len b) 0) (Err Truncated) (do (buf-append (. r inbuf) b 0 (array-len b)) (recur)))))))))
 
 ;; ---- one record off the wire
-(defun open-record :private (p: p r: Rec pr: Prot header: (Array i8) frag: (Array i8)) :where ((CryptoProvider p)) -> (Result RecIn TlsError)
-  (match (c/aead-open p (. pr alg) (. pr key) (record-nonce (. pr iv) (. pr seq)) header frag)
-    ((Err e) (if (unsupported? e) (Err (from-crypto e)) (Err (proto-alert 20 "bad_record_mac: a record does not authenticate"))))
-    ((Ok pt) (do (set! (. r rd) (some (with pr (seq (+ (. pr seq) 1)))))
-                 (let [end (loop [i (- (array-len pt) 1)] (cond (< i 0) -1 (not (= (b-at pt i) 0)) i :else (recur (- i 1))))]
-                   (cond (= end -1) (Err (proto-alert 10 "an encrypted record of padding only"))
-                         (> end max-plain) (Err (proto-alert 22 "record_overflow: an inner plaintext over 2^14"))
-                         (not (includes? (b-at pt end) [21 22 23])) (Err (proto-alert 10 "an unknown inner content type"))
-                         :else (Ok (RecIn (b-at pt end) (slice pt 0 end)))))))))
+(defun inner-end :private (pt: (Array i8)) -> i64 (loop [i (- (array-len pt) 1)] (cond (< i 0) -1 (not (= (b-at pt i) 0)) i :else (recur (- i 1)))))
 
-(defun finish-record :private (p: p r: Rec enc: (Option Prot) ct: i64 header: (Array i8) frag: (Array i8)) :where ((CryptoProvider p)) -> (Result RecIn TlsError)
-  (match enc
-    (nil (Ok (RecIn ct frag)))
-    ((some pr) (if (>= (. pr seq) seq-bound) (Err (proto-alert 80 "the read sequence number is at its bound")) (open-record p r pr header frag)))))
+;; The record of `len` bytes after its header, opened out of the queue into one new array; the queue moves on whether or not it opened.
+(defun open-record :private (r: Rec pr: Prot len: i64) -> (Result RecIn TlsError)
+  (let [ib (. r inbuf) header (buf-slice ib 0 5) seqn @(. pr seq)
+        res (c/aead-key-open-into (. pr key) (record-nonce (. pr iv) seqn) header (buf-array ib) (+ (buf-start ib) 5) len (array (- len 16) 0i8) 0)
+        gone (buf-skip ib (+ 5 len))]
+    (match res
+      ((Err e) (if (unsupported? e) (Err (from-crypto e)) (Err (proto-alert 20 "bad_record_mac: a record does not authenticate"))))
+      ((Ok pt) (let [end (inner-end pt) bumped (set! (. pr seq) (+ seqn 1))]
+                 (cond (= end -1) (Err (proto-alert 10 "an encrypted record of padding only"))
+                       (> end max-plain) (Err (proto-alert 22 "record_overflow: an inner plaintext over 2^14"))
+                       (not (includes? (b-at pt end) [21 22 23])) (Err (proto-alert 10 "an unknown inner content type"))
+                       :else (Ok (RecIn (b-at pt end) pt end))))))))
 
-(defun read-record (p: p r: Rec) :where ((CryptoProvider p)) -> (Result RecIn TlsError)
+(defun check-header :private (ct: i64 ver: i64 len: i64 enc: (Option Prot)) -> (Option TlsError)
+  (cond (not (= (shr ver 8) 3)) (some (proto-alert 10 "a record with a major version other than 3"))
+        (and (some? enc) (not (= ct 23)) (not (= ct 20))) (some (proto-alert 10 "a plaintext record after the handshake keys are on"))
+        (> len (if (some? enc) max-cipher max-plain)) (some (proto-alert 22 "record_overflow: a record over the limit"))
+        (and (some? enc) (= ct 23) (< len 17)) (some (proto-err "an encrypted record too short for a tag and a type"))
+        (not (includes? ct [20 21 22 23])) (some (proto-alert 10 "an unknown record type"))
+        :else nil))
+
+(defun take-record :private (r: Rec ct: i64 len: i64 enc: (Option Prot)) -> (Result RecIn TlsError)
+  (let [ib (. r inbuf)]
+    (cond (= ct 20) (let [ok (and (= len 1) (= (buf-byte ib 5) 1) @(. r handshaking) (< @(. r ccs) 2)) gone (buf-skip ib (+ 5 len))]
+                      (if ok (do (set! (. r ccs) (+ @(. r ccs) 1)) (read-raw-record r)) (Err (proto-alert 10 "an unexpected change_cipher_spec"))))
+          :else (match enc
+                  (nil (let [pt (buf-slice ib 5 (+ 5 len)) gone (buf-skip ib (+ 5 len))] (Ok (RecIn ct pt len))))
+                  ((some pr) (if (>= @(. pr seq) seq-bound) (Err (proto-alert 80 "the read sequence number is at its bound")) (open-record r pr len)))))))
+
+;; The next record with its content in place: for an application-data record `data` may be longer than `len` (the inner type byte follows the content).
+(defun read-raw-record (r: Rec) -> (Result RecIn TlsError)
   (try-let [_ (fill r 5)]
-    (let [hb @(. r inbuf) ct (b-at hb 0) ver (be16 hb 1) len (be16 hb 3) enc @(. r rd)]
-      (cond (not (= (shr ver 8) 3)) (Err (proto-alert 10 "a record with a major version other than 3"))
-            (and (some? enc) (not (= ct 23)) (not (= ct 20))) (Err (proto-alert 10 "a plaintext record after the handshake keys are on"))
-            (> len (if (some? enc) max-cipher max-plain)) (Err (proto-alert 22 "record_overflow: a record over the limit"))
-            (and (some? enc) (= ct 23) (< len 17)) (Err (proto-err "an encrypted record too short for a tag and a type"))
-            (not (includes? ct [20 21 22 23])) (Err (proto-alert 10 "an unknown record type"))
-            :else (try-let [_ (fill r (+ 5 len))]
-                    (let [header (consume r 5) frag (consume r len)]
-                      (cond (and (= ct 20)) (if (and (= len 1) (= (b-at frag 0) 1) @(. r handshaking) (< @(. r ccs) 2))
-                                              (do (set! (. r ccs) (+ @(. r ccs) 1)) (read-record p r))
-                                              (Err (proto-alert 10 "an unexpected change_cipher_spec")))
-                            :else (finish-record p r enc ct header frag))))))))
+    (let [ib (. r inbuf) ct (buf-byte ib 0) ver (buf-be16 ib 1) len (buf-be16 ib 3) enc @(. r rd)]
+      (match (check-header ct ver len enc)
+        ((some e) (Err e))
+        (nil (try-let [_ (fill r (+ 5 len))] (take-record r ct len enc)))))))
+
+;; `data` of exactly `len` bytes.
+(defun exact (x: RecIn) -> RecIn (if (= (array-len (. x data)) (. x len)) x (RecIn (. x type) (array-copy (. x data) 0 (. x len)) (. x len))))
+(defun read-record (p: p r: Rec) :where ((CryptoProvider p)) -> (Result RecIn TlsError)
+  (match (read-raw-record r) ((Err e) (Err e)) ((Ok x) (Ok (exact x)))))
 
 ;; ---- writing
-(defun seal-record :private (p: p r: Rec ct: i64 data: (Array i8)) :where ((CryptoProvider p)) -> (Result (Array i8) TlsError)
-  (match @(. r wr)
-    (nil (Ok (cat [(w8 ct) (w16 771) (vec16 data)])))
-    ((some pr)
-      (if (>= (. pr seq) seq-bound) (Err (proto-alert 80 "the write sequence number is at its bound"))
-        (let [inner (cat [data (w8 ct)]) header (cat [(w8 23) (w16 771) (w16 (+ (array-len inner) 16))])]
-          (match (c/aead-seal p (. pr alg) (. pr key) (record-nonce (. pr iv) (. pr seq)) header inner)
-            ((Err e) (Err (from-crypto e)))
-            ((Ok sealed) (do (set! (. r wr) (some (with pr (seq (+ (. pr seq) 1))))) (Ok (cat [header sealed]))))))))))
+(defun put-header :private (a: (Array i8) at: i64 ct: i64 len: i64) -> (Array i8)
+  (array-with (array-with (array-with (array-with (array-with a at (trunc i8 ct)) (+ at 1) 3i8) (+ at 2) 3i8) (+ at 3) (trunc i8 (shr len 8))) (+ at 4) (trunc i8 (bit-and len 255))))
 
-;; The records of `data` (split at 2^14) of content type `ct`, in order, as one array: one write.
-(defun records-of (p: p r: Rec ct: i64 data: (Array i8)) :where ((CryptoProvider p)) -> (Result (Array i8) TlsError)
-  (loop [off 0 acc []]
-    (if (and (>= off (array-len data)) (> (count acc) 0)) (Ok (cat acc))
-      (let [end (min (array-len data) (+ off max-plain))]
-        (match (seal-record p r ct (slice data off end))
-          ((Err e) (Err e))
-          ((Ok rec) (recur end (conj acc rec))))))))
-(defun send (p: p r: Rec ct: i64 data: (Array i8)) :where ((CryptoProvider p)) -> (Result unit TlsError)
-  (try-let [bytes (records-of p r ct data)] ((. (. r io) write) bytes)))
+(defun record-count :private (len: i64) -> i64 (max 1 (quot (+ len (- max-plain 1)) max-plain)))
+
+;; The protected records of `data[off, off+len)` (split at 2^14) of content type `ct`: all in one array, built in place. `out` is threaded (handed over at each call), `inner`
+;; (the plaintext of a record and its type byte) and `hdr` (the 5 header bytes, the AAD) are reused by every record.
+(defun seal-records :private (r: Rec pr: Prot ct: i64 data: (Array i8) off: i64 len: i64) -> (Result (Array i8) TlsError)
+  (let [n (record-count len) inner (cell (array (+ (min len max-plain) 1) 0i8)) hdr (cell (array 5 0i8))]
+    (loop [i 0 o off out (array (+ len (* n 22)) 0i8)]
+      (if (= i n) (Ok out)
+        (let [chunk (min (- (+ off len) o) max-plain) pos (+ (- o off) (* i 22)) seqn @(. pr seq)
+              h (set! hdr (put-header @hdr 0 23 (+ chunk 17)))
+              filled (do (array-blit! &inner 0 data o chunk) (array-set! &inner chunk (trunc i8 ct)))
+              placed (put-header out pos 23 (+ chunk 17))]
+          (match (c/aead-key-seal-into (. pr key) (record-nonce (. pr iv) seqn) @hdr @inner 0 (+ chunk 1) placed (+ pos 5))
+            ((Err e) (Err (from-crypto e)))
+            ((Ok sealed) (do (set! (. pr seq) (+ seqn 1)) (recur (+ i 1) (+ o chunk) sealed)))))))))
+
+;; The records of `data[off, off+len)`, in order, as one array: one write.
+(defun records-of (p: p r: Rec ct: i64 data: (Array i8) off: i64 len: i64) :where ((CryptoProvider p)) -> (Result (Array i8) TlsError)
+  (match @(. r wr)
+    (nil (Ok (cat [(w8 ct) (w16 771) (w16 len) (array-copy data off (+ off len))])))
+    ((some pr) (if (>= @(. pr seq) seq-bound) (Err (proto-alert 80 "the write sequence number is at its bound")) (seal-records r pr ct data off len)))))
+(defun send-range (p: p r: Rec ct: i64 data: (Array i8) off: i64 len: i64) :where ((CryptoProvider p)) -> (Result unit TlsError)
+  (try-let [bytes (records-of p r ct data off len)] ((. (. r io) write) bytes)))
+(defun send (p: p r: Rec ct: i64 data: (Array i8)) :where ((CryptoProvider p)) -> (Result unit TlsError) (send-range p r ct data 0 (array-len data)))
 ;; The first ClientHello goes out with the record version 0x0301 (RFC 8446 5.1: for compatibility), as plaintext.
 (defun send-client-hello (r: Rec hello: (Array i8)) -> (Result unit TlsError)
   ((. (. r io) write) (cat [(w8 22) (w16 769) (vec16 hello)])))

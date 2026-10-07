@@ -22,6 +22,12 @@
 ;;   :accept-bad-sig    verify answers Ok for a signature that does not verify
 ;;   :reject-good-sig   verify answers an error for a good signature
 ;;   :sign-flip         a signature has a bit flipped
+;; Key handles (`AeadKey`, docs/design/crypto.md 9.1): each is a way a driver that keeps a context goes wrong, wrapped around the handle the real provider gave:
+;;   :key-sticky-nonce  the handle keeps the first nonce it was given and uses it for every later record (an IV that is not set again)
+;;   :key-skip-tag      the handle's open does not verify the tag
+;;   :key-flip-tag      the handle's seal flips a bit of the tag
+;;   :key-ignore-close  a closed handle still answers
+;;   :key-into-offset   `aead-key-seal-into` writes at offset 0 whatever offset was asked
 (ns fib.crypto.fault
   (:use fib.core fib.seq fib.coll fib.test.core fib.crypto.types fib.crypto.ops))
 
@@ -42,6 +48,36 @@
   (hasher-close (self) (hasher-close (. self inner))))
 
 (defstruct Faulty (inner: (dyn CryptoProvider :send) fault: keyword))
+
+;; ---- AEAD key handles
+(defstruct FaultyKey (inner: (dyn AeadKey) fault: keyword first-nonce: (Atom (Array i8)) closed: (Atom bool)))
+
+;; The nonce the handle really uses: the first one, for :key-sticky-nonce.
+(defun sticky-nonce :private (k: FaultyKey nonce: (Array i8)) -> (Array i8)
+  (if (not (= (. k fault) :key-sticky-nonce)) nonce
+    (do (when (= (array-len @(. k first-nonce)) 0) (reset! (. k first-nonce) nonce)) @(. k first-nonce))))
+(defun key-gone? :private (k: FaultyKey) -> bool (and @(. k closed) (not (= (. k fault) :key-ignore-close))))
+
+(impl AeadKey FaultyKey
+  (aead-key-alg (self) (aead-key-alg (. self inner)))
+  (aead-key-seal (self nonce aad pt)
+    (if (key-gone? self) (Err (key-closed))
+      (match (aead-key-seal (. self inner) (sticky-nonce self nonce) aad pt)
+        ((Ok b) (Ok (if (= (. self fault) :key-flip-tag) (tampered :flip-bit b) b)))
+        ((Err e) (Err e)))))
+  (aead-key-open (self nonce aad sealed)
+    (if (key-gone? self) (Err (key-closed))
+      (match (aead-key-open (. self inner) (sticky-nonce self nonce) aad sealed)
+        ((Ok b) (Ok b))
+        ((Err e) (if (= (. self fault) :key-skip-tag) (Ok (without-tag sealed)) (Err e))))))
+  (aead-key-seal-into (self nonce aad data off len out out-off)
+    (cond (key-gone? self) (Err (key-closed))
+      (or (< off 0) (< len 0) (> (+ off len) (array-len data)) (< out-off 0) (> (+ out-off (+ len 16)) (array-len out))) (Err (invalid-argument "the range is outside the data or the output"))
+      :else
+      (match (aead-key-seal self nonce aad (array-copy data off (+ off len)))
+        ((Err e) (Err e))
+        ((Ok s) (let ((c (cell out)) (at (if (= (. self fault) :key-into-offset) 0 out-off))) (do (array-blit! &c at s 0 (array-len s)) (Ok @c)))))))
+  (aead-key-close (self) (do (reset! (. self closed) true) (when (not (= (. self fault) :key-ignore-close)) (aead-key-close (. self inner))))))
 
 ;; ---- key handles: the wrapper of a private or public key does what the real one does, then breaks one thing.
 (defstruct FaultyPrivate (inner: (dyn PrivateKey :send) fault: keyword))
@@ -119,12 +155,19 @@
     (if (= (. self fault) :ct-true) (= (array-len a) (array-len b)) (provider-ct-equal (. self inner) a b)))
   (provider-aead-seal (self alg key nonce aad pt) (faulty-seal self alg key nonce aad pt))
   (provider-aead-open (self alg key nonce aad sealed) (faulty-open self alg key nonce aad sealed))
+  (provider-aead-key (self alg key)
+    (match (provider-aead-key (. self inner) alg key)
+      ((Err e) (Err e))
+      ((Ok k) (Ok (if (key-fault? (. self fault)) (dyn AeadKey (FaultyKey k (. self fault) (atom (array 0 0i8)) (atom false))) k)))))
   (provider-generate-key (self alg) (wrap-private self (provider-generate-key (. self inner) alg)))
   (provider-import-private (self alg pkcs8) (wrap-private self (provider-import-private (. self inner) alg pkcs8)))
   (provider-import-public (self spki)
     (match (provider-import-public (. self inner) spki)
       ((Err e) (Err e))
       ((Ok k) (Ok (dyn PublicKey :send (FaultyPublic k (. self fault))))))))
+
+(defun key-faults () -> (Vec keyword) [:key-sticky-nonce :key-skip-tag :key-flip-tag :key-ignore-close :key-into-offset])
+(defun key-fault? (f: keyword) -> bool (some? (first (filter (fn (x: keyword) (= x f)) (key-faults)))))
 
 (defun faults () -> (Vec keyword) [:truncate :flip-bit :wrong-alg :zero-random :ct-true :pbkdf2-plus :fallback :overclaim])
 
@@ -140,7 +183,12 @@
         (= fault :accept-bad-point) ["an-invalid-peer-is-an-error" "small-order-points"]
         (or (= fault :kex-flip) (= fault :public-flip)) ["key-agreement-reproduces"]
         (or (= fault :accept-bad-sig) (= fault :reject-good-sig)) ["verify-gives-the-verdict"]
-        (= fault :sign-flip) ["signing-with-a-generated-key"]
+        (= fault :sign-flip) ["signing-with-a-generated-key" "signs-RSASSA-PSS"]
+        (= fault :key-sticky-nonce) ["one-handle-over-twelve-records"]
+        (= fault :key-skip-tag) ["through-a-handle-every-invalid-vector"]
+        (= fault :key-flip-tag) ["a-key-handle-seals-and-opens-every-published-vector"]
+        (= fault :key-ignore-close) ["a-key-of-the-wrong-length"]
+        (= fault :key-into-offset) ["seal-into-and-open-into-write-where-asked"]
         :else []))
 
 ;; The ids of the scenarios that did not hold when run: a step that broke is a failure. A scenario that traps ends the run (a driver

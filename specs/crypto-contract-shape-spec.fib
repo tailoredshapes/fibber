@@ -11,7 +11,7 @@
 ;; The vector contract itself runs in a driver's repository, against a real library. `fibc test specs`.
 (ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.crypto.contract fib.crypto.fault fib.crypto.vectors
                fib.crypto.vectors-aead fib.crypto.vectors-pk fib.crypto.vectors-tls fib.crypto.contract-aead fib.crypto.contract-kex
-               fib.crypto.contract-sig fib.crypto.contract-tls)
+               fib.crypto.contract-sig fib.crypto.contract-tls fib.crypto.contract-aeadkey fib.crypto.contract-rsa fib.crypto.vectors-rsa)
   (:require [fib.crypto :as c]))
 
 (defstruct Nothing (n: i64))
@@ -52,7 +52,7 @@
 (impl c/CryptoProvider Refuses
   (provider-name (self) "refuses")
   (provider-capabilities (self) (into (c/aead-algs) [:x25519 :ecdh-p256 :ecdh-p384 :ed25519 :rsa-pss-sha256 :rsa-pss-sha384 :rsa-pkcs1-sha256 :rsa-pkcs1-sha384
-                                                      :ecdsa-p256-sha256 :ecdsa-p384-sha384 :sign-ed25519 :sign-ecdsa-p256-sha256 :sign-ecdsa-p384-sha384]))
+                                                      :ecdsa-p256-sha256 :ecdsa-p384-sha384 :sign-ed25519 :sign-ecdsa-p256-sha256 :sign-ecdsa-p384-sha384 :sign-rsa-pss-sha256 :sign-rsa-pss-sha384]))
   (provider-digest-start (self alg) (Err (c/unsupported (str alg))))
   (provider-hmac-start (self alg key) (Err (c/unsupported (str alg))))
   (provider-derive (self k) (Err (c/invalid-argument "refused")))
@@ -116,6 +116,10 @@
     (and (match kv ((some k) (der-private-ok? k)) (nil false))
          (match sv ((some s) (der-public-ok? (nth (sig-keys) (. s key)))) (nil false)))))
 
+(defun rsa-sound? () -> bool
+  (and (every? (fn (k: RsaKey) (and (hex-ok? (. k pkcs8)) (hex-ok? (. k spki)) (>= (. k bits) 1024) (> (hex-len (. k spki)) (quot (. k bits) 8)))) (rsa-keys))
+       (every? (fn (v: RsaSigned) (let [k (nth (rsa-keys) (. v key))] (and (hex-ok? (. v msg)) (hex-ok? (. v sig)) (>= (. k bits) 2048) (= (hex-len (. v sig)) (quot (. k bits) 8))))) (rsa-signed))))
+
 (defun scenario-ids (scs: (Vec Scenario)) -> (Vec str) (vec (map (fn (s: Scenario) (. s id)) scs)))
 (defun holds (scs: (Vec Scenario) id: str) -> bool
   (not (some? (first (filter (fn (f: str) (= f id)) (contract-failures scs 1))))))
@@ -127,8 +131,10 @@
   (some? (first (filter (fn (f: str) (mentions? f word)) (contract-failures scs 1)))))
 (defun has-word? (scs: (Vec Scenario) word: str) -> bool (some? (first (filter (fn (s: str) (mentions? s word)) (scenario-ids scs)))))
 
+(defun key-contract () -> (Vec Scenario) (vec (CryptoAeadKeyContract refuses)))
+
 (defun all-pk-scenarios () -> (Vec Scenario)
-  (into (into (into (vec (CryptoAeadContract refuses)) (vec (CryptoKexContract refuses))) (vec (CryptoSignatureContract refuses))) (vec (CryptoTlsKdfContract refuses))))
+  (into (into (into (into (into (vec (CryptoAeadContract refuses)) (vec (CryptoKexContract refuses))) (vec (CryptoSignatureContract refuses))) (vec (CryptoTlsKdfContract refuses))) (key-contract)) (vec (CryptoRsaSignContract refuses))))
 
 (def honest-id: str "capabilities-are-honest-a-listed-name-works-an-unlisted-one-is-an-unsupported-error-never-an-answer")
 
@@ -187,9 +193,29 @@
     (scenario "a verify that accepts a bad signature is caught by the one-change and cross-scheme scenarios"
       (given [scs (CryptoSignatureContract (fn () (refuses-with :accept-bad-sig)))])
       (then (expect = true (failing-word? scs "changed-in-one-place")) (expect = true (failing-word? scs "under-any-other-scheme"))))
+    (scenario "the key-handle contract has its six scenarios; against a provider that refuses everything (the default per-call handle over it) the positive ones fail and the negative ones hold"
+      (given [scs (key-contract)])
+      (then (expect = 6 (count scs))
+            (expect = true (failing-word? scs "a-key-handle-seals-and-opens-every-published-vector"))
+            (expect = true (failing-word? scs "one-handle-over-twelve-records"))
+            (expect = true (failing-word? scs "seal-into-and-open-into-write-where-asked"))
+            (expect = false (failing-word? scs "through-a-handle-every-invalid-vector"))))
+    (scenario "a handle that skips the tag check is caught by the invalid-vector scenario, and the other handle faults fail the scenario they name where the refusing provider lets them"
+      (given [scs (CryptoAeadKeyContract (fn () (refuses-with :key-skip-tag)))])
+      (then (expect = true (failing-word? scs "through-a-handle-every-invalid-vector"))))
+    (scenario "a handle that still answers after close fails the wrong-length-and-closed scenario against a provider that refuses everything only through its errors, so the fault is tied to its scenario by name"
+      (given [scs (key-contract)])
+      (then (expect = true (has-word? scs "a-key-of-the-wrong-length"))
+            (expect = [:key-sticky-nonce :key-skip-tag :key-flip-tag :key-ignore-close :key-into-offset] (key-faults))))
+    (scenario "the RSA signing vectors are sound (hex, key sizes, the signature as long as its modulus) and the contract has five scenarios that fail against a provider that signs nothing"
+      (given [scs (vec (CryptoRsaSignContract refuses))])
+      (then (expect = true (rsa-sound?)) (expect = [4 18] [(count (rsa-keys)) (count (rsa-signed))])
+            (expect = 5 (count scs))
+            (expect = true (failing-word? scs "signs-RSASSA-PSS")) (expect = true (failing-word? scs "made-by-python"))))
     (scenario "every fault of pk-faults names scenarios that exist in the contracts"
       (given [scs (all-pk-scenarios)])
       (then (expect = 11 (count (pk-faults)))
+            (expect = [] (vec (filter (fn (x: str) (not (= x ""))) (vec (mapcat (fn (f: keyword) (vec (map (fn (w: str) (if (has-word? scs w) "" (str f " " w))) (fault-scenarios f)))) (key-faults))))))
             (expect = [] (vec (filter (fn (x: str) (not (= x "")))
                                 (vec (mapcat (fn (f: keyword) (vec (map (fn (w: str) (if (has-word? scs w) "" (str f " " w))) (fault-scenarios f)))) (pk-faults))))))
             (expect = [] (vec (filter (fn (f: keyword) (empty? (fault-scenarios f))) (pk-faults))))))))

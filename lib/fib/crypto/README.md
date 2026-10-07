@@ -65,6 +65,17 @@ Capability names: `:aes-128-gcm :aes-256-gcm :chacha20-poly1305`, `:x25519 :ecdh
 answers `unsupported` (the protocol methods have defaults). Private keys never leave the driver as bytes; `provider-import-private` takes PKCS#8 DER for known-answer tests
 and stored keys. `fib.crypto.der` wraps a raw X25519 or Ed25519 key in the PKCS#8 or SPKI DER a driver imports.
 
+## Key handles and RSA signing (docs/design/crypto.md 9.1, 9.2)
+
+```clojure
+(match (c/aead-key p :aes-128-gcm key)                      ; cipher and key bound once: (Result (dyn AeadKey) CryptoError); close it
+  ((Ok k) (do (c/aead-key-seal k nonce aad pt)               ; per record: only nonce, AAD, data
+              (c/aead-key-seal-into k nonce aad data off len out out-off)   ; (Result (Array i8) ..): `out` is handed over, the array that comes back is the one to use
+              (c/aead-key-close k))))
+```
+A driver that does not override `provider-aead-key` gets a per-call handle by default. `private-key-sign` also takes `:rsa-pss-sha256` and `:rsa-pss-sha384` (capabilities `:sign-rsa-pss-sha256`
+`:sign-rsa-pss-sha384`) for a key imported from PKCS#8 as `:rsa`. Contracts: `CryptoAeadKeyContract` (fib.crypto.contract-aeadkey) and `CryptoRsaSignContract` (fib.crypto.contract-rsa).
+
 ## Encodings (ours, in fibber)
 
 `hex` `unhex` `base64` `unbase64` `base64-nopad` `unbase64-nopad` `base64url` `unbase64url` `base64url-nopad` `unbase64url-nopad`. The decoders

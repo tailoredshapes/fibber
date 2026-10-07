@@ -5,10 +5,7 @@
 ;; for records, `random-bytes`, `digest`, `hmac`, `hkdf-expand`, and nothing else of the provider.
 (ns fib.crypto.pk (:use fib.core fib.seq fib.coll fib.crypto.types fib.crypto.ops))
 
-(defun aead-algs () -> (Vec keyword) [:aes-128-gcm :aes-256-gcm :chacha20-poly1305])
-(defun aead-key-length (alg: keyword) -> i64 (cond (= alg :aes-128-gcm) 16 (= alg :aes-256-gcm) 32 (= alg :chacha20-poly1305) 32 :else -1))
-(defun aead-nonce-length (alg: keyword) -> i64 (if (= (aead-key-length alg) -1) -1 12))
-(defun aead-tag-length (alg: keyword) -> i64 (if (= (aead-key-length alg) -1) -1 16))
+;; The facts of the AEADs (`aead-algs`, `aead-key-length`, `aead-nonce-length`, `aead-tag-length`) are in fib.crypto.types, beside the key handle that checks them.
 
 ;; ciphertext || tag. The nonce must never repeat under one key: that is the caller's (TLS derives it from a counter), not the library's.
 (defun aead-seal (p: p alg: keyword key: (Array i8) nonce: (Array i8) aad: (Array i8) plaintext: (Array i8)) :where ((CryptoProvider p)) -> (Result (Array i8) CryptoError)
@@ -17,6 +14,11 @@
 ;; The plaintext of `sealed` (ciphertext || tag), or an error and nothing else: "authentication-failed" when the tag does not verify.
 (defun aead-open (p: p alg: keyword key: (Array i8) nonce: (Array i8) aad: (Array i8) sealed: (Array i8)) :where ((CryptoProvider p)) -> (Result (Array i8) CryptoError)
   (provider-aead-open p alg key nonce aad sealed))
+
+;; A KEY HANDLE (`AeadKey`, fib.crypto.types): the cipher and the key bound once, then `aead-key-seal` and `aead-key-open` per record with only the nonce, the AAD and the
+;; data; the `-into` forms write into a buffer the caller passes and gets back (no result array per record). The handle is the driver's: a driver that keeps a context
+;; for it does the key schedule once; one that does not still answers (the default is the per-call path). Close it: a handle that is not closed leaks what the driver keeps.
+(defun aead-key (p: p alg: keyword key: (Array i8)) :where ((CryptoProvider p)) -> (Result (dyn AeadKey) CryptoError) (provider-aead-key p alg key))
 
 (defun generate-key (p: p alg: keyword) :where ((CryptoProvider p)) -> (Result (dyn PrivateKey :send) CryptoError) (provider-generate-key p alg))
 (defun import-private-key (p: p alg: keyword pkcs8: (Array i8)) :where ((CryptoProvider p)) -> (Result (dyn PrivateKey :send) CryptoError) (provider-import-private p alg pkcs8))

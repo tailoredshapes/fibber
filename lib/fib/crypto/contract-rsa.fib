@@ -1,0 +1,121 @@
+;; fib.crypto.contract-rsa: what a provider that lists `:sign-rsa-pss-sha256` or `:sign-rsa-pss-sha384` must do (docs/design/crypto.md 9.2): sign with a private key imported
+;; from PKCS#8 (`provider-import-private :rsa`), for a TLS 1.3 SERVER later (CertificateVerify is rsa_pss_rsae_sha256 or _sha384: MGF1 with the same hash, salt length =
+;; digest length). The keys and the python-made signatures are fib.crypto.vectors-rsa (scripts/gen-crypto-vectors-rsa.sh). PSS is salted, so a signer has no known answer:
+;; the checks are that a signature VERIFIES, under the SPKI python wrote and under the one the key reports (`private-key-public`, DER of the SubjectPublicKeyInfo), that a
+;; changed message, signature or scheme does NOT, that two signatures of one message differ (a fresh salt), that python's own signatures verify here, and that a key under
+;; 2048 bits, a key of another type and garbage are refused. A provider that lists neither runs it vacuously. A driver runs
+;; `(implements CryptoRsaSignContract "openssl" (fn () <a provider>))`.
+(ns fib.crypto.contract-rsa
+  (:use fib.core fib.seq fib.coll fib.test.core fib.crypto.types fib.crypto.ops fib.crypto.pk fib.crypto.encoding
+        fib.crypto.contract fib.crypto.contract-aead fib.crypto.contract-sig fib.crypto.vectors-pk fib.crypto.vectors-rsa))
+
+(defun rsa-sign-schemes () -> (Vec keyword) [:rsa-pss-sha256 :rsa-pss-sha384])
+(defun sign-cap-of (s: keyword) -> keyword (if (= s :rsa-pss-sha256) :sign-rsa-pss-sha256 :sign-rsa-pss-sha384))
+(defun signing-keys () -> (Vec RsaKey) (vec (filter (fn (k: RsaKey) (>= (. k bits) 2048)) (rsa-keys))))
+(defun refused-sign? (r: (Result (Array i8) CryptoError)) -> bool (match r ((Ok _) false) ((Err e) (or (= (. e kind) "invalid-argument") (= (. e kind) "unsupported")))))
+(defun line (label: str ok: bool) -> str (if ok "" label))
+(defun lines (xs: (Vec str)) -> (Vec str) (vec (filter (fn (s: str) (not (= s ""))) xs)))
+(defun big-message () -> str (. (nth (rsa-signed) 2) msg))
+(defun messages () -> (Vec str) ["" "616263" (big-message)])
+
+(defun ec-private () -> str (. (nth (vec (filter (fn (v: KexVector) (= (. v alg) :p-256)) (kex-vectors))) 0) private))
+(defun flipped (b: (Array i8) i: i64) -> (Array i8) (if (and (>= i 0) (< i (array-len b))) (flip-at b i) b))
+(defun other-scheme (s: keyword) -> keyword (if (= s :rsa-pss-sha256) :rsa-pss-sha384 :rsa-pss-sha256))
+
+(defun sign-one (p: p k: (dyn PrivateKey :send) kv: RsaKey scheme: keyword spki-own: str m: str) :where ((CryptoProvider p)) -> (Vec str)
+  (let [msg (bytes-hex m) s1 (or-empty (private-key-sign k scheme msg)) s2 (or-empty (private-key-sign k scheme msg)) n (array-len s1)]
+    (lines
+      [(line (str "message " (quot (str-len m) 2) ": the signature is the modulus size") (= n (quot (. kv bits) 8)))
+       (line "verifies under the SPKI python wrote" (= "ok" (verdict p scheme (. kv spki) msg s1)))
+       (line "verifies under the SPKI the key reports" (= "ok" (verdict p scheme spki-own msg s1)))
+       (line "two signatures of one message differ (a fresh salt each time)" (not (= (hex s1) (hex s2))))
+       (line "the second verifies too" (= "ok" (verdict p scheme (. kv spki) msg s2)))
+       (line "a changed message does not verify" (refused-kind? (verdict p scheme (. kv spki) (bytes-hex (str m "00")) s1)))
+       (line "a changed first byte does not verify" (refused-kind? (verdict p scheme (. kv spki) msg (flipped s1 0))))
+       (line "a changed last byte does not verify" (refused-kind? (verdict p scheme (. kv spki) msg (flipped s1 (- n 1)))))
+       (line "does not verify under the other PSS scheme" (or (not (supports? p (other-scheme scheme))) (refused-kind? (verdict p (other-scheme scheme) (. kv spki) msg s1))))
+       (line "does not verify as PKCS#1 v1.5" (or (not (supports? p :rsa-pkcs1-sha256)) (refused-kind? (verdict p :rsa-pkcs1-sha256 (. kv spki) msg s1))))])))
+
+(defun sign-body (p: p k: (dyn PrivateKey :send) kv: RsaKey scheme: keyword) :where ((CryptoProvider p)) -> (Vec str)
+  (let [own (match (private-key-public k) ((Ok b) (hex b)) ((Err _) ""))]
+    (into (lines [(line "the kind is :rsa" (= (private-key-kind k) :rsa))
+                  (line "private-key-public is the SubjectPublicKeyInfo DER the vector has" (= own (. kv spki)))
+                  (line "a scheme of another key type is refused (ed25519)" (refused-sign? (private-key-sign k :ed25519 (str-bytes "m"))))
+                  (line "a scheme of another key type is refused (ecdsa-p256-sha256)" (refused-sign? (private-key-sign k :ecdsa-p256-sha256 (str-bytes "m"))))
+                  (line "PKCS#1 v1.5 is not a signing capability: refused" (refused-sign? (private-key-sign k :rsa-pkcs1-sha256 (str-bytes "m"))))])
+          (vec (mapcat (fn (m: str) (sign-one p k kv scheme own m)) (messages))))))
+
+(defun sign-key-failures (p: p kv: RsaKey scheme: keyword) :where ((CryptoProvider p)) -> (Vec str)
+  (match (import-private-key p :rsa (bytes-hex (. kv pkcs8)))
+    ((Err e) [(str "import: " (. e kind) " " (. e message))])
+    ((Ok k) (let [r (sign-body p k kv scheme)] (do (private-key-close k) r)))))
+
+(defun all-sign-failures (p: p) :where ((CryptoProvider p)) -> (Vec str)
+  (vec (mapcat (fn (scheme: keyword)
+                 (if (supports? p (sign-cap-of scheme))
+                   (vec (mapcat (fn (kv: RsaKey) (vec (map (fn (s: str) (str scheme " " (. kv name) ": " s)) (sign-key-failures p kv scheme)))) (signing-keys)))
+                   []))
+               (rsa-sign-schemes))))
+
+;; python's signatures verify here (and changed ones do not): the verifier is checked against an independent signer.
+(defun cross-failures (p: p v: RsaSigned) :where ((CryptoProvider p)) -> (Vec str)
+  (let [kv (nth (rsa-keys) (. v key)) msg (bytes-hex (. v msg)) sig (bytes-hex (. v sig))]
+    (lines [(line "python's signature verifies" (= "ok" (verdict p (. v scheme) (. kv spki) msg sig)))
+            (line "a changed message does not" (refused-kind? (verdict p (. v scheme) (. kv spki) (bytes-hex (str (. v msg) "00")) sig)))
+            (line "a changed signature does not" (refused-kind? (verdict p (. v scheme) (. kv spki) msg (flipped sig 5))))])))
+
+(defun import-kind (r: (Result (dyn PrivateKey :send) CryptoError)) -> str
+  (match r ((Err e) (. e kind)) ((Ok k) (do (private-key-close k) "ok"))))
+
+(defun import-failures (p: p) :where ((CryptoProvider p)) -> (Vec str)
+  (let [good (. (nth (signing-keys) 0) pkcs8) small (. (nth (rsa-keys) 3) pkcs8) ec (ec-private)]
+    (lines
+      [(line "a 1024-bit key is refused at import" (= "invalid-argument" (import-kind (import-private-key p :rsa (bytes-hex small)))))
+       (line "an EC key imported as :rsa is refused" (= "invalid-argument" (import-kind (import-private-key p :rsa (bytes-hex ec)))))
+       (line "an RSA key imported as :ed25519 is refused" (= "invalid-argument" (import-kind (import-private-key p :ed25519 (bytes-hex good)))))
+       (line "an empty PKCS#8 is refused" (= "invalid-argument" (import-kind (import-private-key p :rsa (array 0 0i8)))))
+       (line "a PKCS#8 with a byte added is refused" (= "invalid-argument" (import-kind (import-private-key p :rsa (bytes-hex (str good "00"))))))
+       (line "a PKCS#8 cut by a byte is refused" (= "invalid-argument" (import-kind (import-private-key p :rsa (bytes-hex (cut-hex good 1))))))
+       (line "a PKCS#8 with its first byte changed is refused" (= "invalid-argument" (import-kind (import-private-key p :rsa (bytes-hex (flip-hex good 0))))))
+       (line "garbage is refused" (= "invalid-argument" (import-kind (import-private-key p :rsa (bytes-hex "ffffffffffffffffffffffff")))))
+       (line "a public key (SPKI) is not a private key" (= "invalid-argument" (import-kind (import-private-key p :rsa (bytes-hex (. (nth (signing-keys) 0) spki))))))])))
+
+(defun closed-failures (p: p) :where ((CryptoProvider p)) -> (Vec str)
+  (match (import-private-key p :rsa (bytes-hex (. (nth (signing-keys) 0) pkcs8)))
+    ((Err e) [(str "import: " (. e kind))])
+    ((Ok k) (let [gone (do (private-key-close k) (private-key-close k) 0)]
+              (lines [(line "sign after close is a closed error" (= "closed" (kind-of (private-key-sign k (first-sign-scheme p) (str-bytes "m")))))
+                      (line "private-key-public after close is a closed error" (= "closed" (kind-of (private-key-public k))))
+                      (line "closing twice is not an error" (= gone 0))])))))
+
+(defun first-sign-scheme (p: p) :where ((CryptoProvider p)) -> keyword
+  (if (supports? p :sign-rsa-pss-sha256) :rsa-pss-sha256 :rsa-pss-sha384))
+
+(defun any-rsa-signing? (p: p) :where ((CryptoProvider p)) -> bool (or (supports? p :sign-rsa-pss-sha256) (supports? p :sign-rsa-pss-sha384)))
+
+(defcontract CryptoRsaSignContract [make]
+  (scenario "a key imported from PKCS#8 signs RSASSA-PSS (SHA-256 and SHA-384, salt = digest length): the signature verifies under the key's SPKI, two differ, a changed message, signature or scheme does not verify"
+    (covers "private-key-sign" "provider-import-private")
+    (given [p (make)])
+    (then (expect = [] (all-sign-failures p))))
+  (scenario "RSA-PSS signatures made by python's cryptography verify under the provider, and changed ones do not"
+    (given [p (make) vs (vec (filter (fn (v: RsaSigned) (supports? p (. v scheme))) (rsa-signed)))])
+    (then (expect = [] (vec (mapcat (fn (v: RsaSigned) (vec (map (fn (s: str) (str (. v scheme) " " (. v name) " key " (. v key) ": " s)) (cross-failures p v)))) vs)))))
+  (scenario "a key under 2048 bits, a key of another type, a public key, garbage and a changed or cut PKCS#8 are refused at import"
+    (given [p (make)])
+    (then (expect = [] (if (any-rsa-signing? p) (import-failures p) []))))
+  (scenario "a closed RSA key answers a closed error and closing twice is no error"
+    (given [p (make)])
+    (then (expect = [] (if (any-rsa-signing? p) (closed-failures p) []))))
+  (scenario "the RSA signing capabilities are honest: listed means a key imports and signs, unlisted means unsupported, never a signature"
+    (given [p (make)])
+    (then (expect = [] (vec (filter (fn (s: str) (not (= s "")))
+                              (vec (map (fn (scheme: keyword)
+                                          (match (import-private-key p :rsa (bytes-hex (. (nth (signing-keys) 0) pkcs8)))
+                                            ((Err e) (if (supports? p (sign-cap-of scheme)) (str scheme " listed but the import fails: " (. e kind)) ""))
+                                            ((Ok k) (let [r (private-key-sign k scheme (str-bytes "m"))]
+                                                      (do (private-key-close k)
+                                                          (match r
+                                                            ((Ok _) (if (supports? p (sign-cap-of scheme)) "" (str scheme " signs but is not listed")))
+                                                            ((Err e) (if (supports? p (sign-cap-of scheme)) (str scheme " listed but " (. e kind)) (if (= (. e kind) "unsupported") "" (str scheme " unlisted and not unsupported: " (. e kind)))))))))))
+                                        (rsa-sign-schemes)))))))))

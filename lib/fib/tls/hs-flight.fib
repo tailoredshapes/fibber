@@ -25,9 +25,9 @@
               c-secret (derive-secret p s hsec "c hs traffic" th) s-secret (derive-secret p s hsec "s hs traffic" th)
               c-hs (traffic-of p s c-secret) s-hs (traffic-of p s s-secret)
               _ (if (message-boundary? (. hs rec)) (Ok ()) (Err (proto-alert 10 "handshake data follows the ServerHello in its record")))
-              _ (send-ccs hs (. out st))]
-      (do (set-read-keys (. hs rec) (. s aead) s-hs) (set-write-keys (. hs rec) (. s aead) c-hs)
-          (Ok (KeyOut s shared hsec c-hs s-hs th))))))
+              _ (send-ccs hs (. out st))
+              _ (set-read-keys p (. hs rec) (. s aead) s-hs) _ (set-write-keys p (. hs rec) (. s aead) c-hs)]
+      (Ok (KeyOut s shared hsec c-hs s-hs th)))))
 
 ;; ---- the server's flight
 (defstruct Certs (request: (Option (Array i8)) chain: (Vec Cert)))
@@ -75,10 +75,11 @@
               c-secret (derive-secret p s master "c ap traffic" th-sf) s-secret (derive-secret p s master "s ap traffic" th-sf)
               c-ap (traffic-of p s c-secret) s-ap (traffic-of p s s-secret)
               _ (if (message-boundary? rec) (Ok ()) (Err (proto-alert 10 "handshake data follows the server's Finished")))
-              _ (do (set-read-keys rec (. s aead) s-ap) (send-request-answer p hs (. fl request)))
+              _ (set-read-keys p rec (. s aead) s-ap) _ (send-request-answer p hs (. fl request))
               th-cf (th-now p hs s) verify (finished-verify-data p s (. (. ko c-hs) secret) th-cf)
-              _ (send p rec ct-handshake (finished-message verify))]
-      (do (set-write-keys rec (. s aead) c-ap) (set! (. rec handshaking) false)
+              _ (send p rec ct-handshake (finished-message verify))
+              _ (set-write-keys p rec (. s aead) c-ap)]
+      (do (set! (. rec handshaking) false)
           (Ok (HsDone s (. fl alpn) (. fl leaf) s-ap c-ap
                       (Trace s (. ko shared) (. ko handshake) (. (. ko c-hs) secret) (. (. ko s-hs) secret) master c-secret s-secret (. ko th-hello) th-sf verify)))))))
 ;; A CertificateRequest is answered with an empty Certificate (RFC 8446 4.4.2): this client has no certificate.

@@ -2,8 +2,8 @@
 # The TLS tests that need a crypto driver (the gate has none): the RFC 8448 traces byte for byte, the end-to-end specs against the in-memory server, the certificate corpus
 # with real signature verification, and the mutation fuzz (FUZZ inputs of each kind, default 100000). The gate's own TLS specs (specs/tls-*-spec.fib: DER, names, chain
 # logic with stubbed signatures, messages) run in `scripts/gate.sh`; interop with real servers is scripts/tls-interop.sh; planted faults are scripts/mutant-tls.sh.
-#   FIBC=<stage-2 fibc of this tree> DRIVER=<src directory of fib-crypto-openssl, tag v0.2.0 (380515c)> [FUZZ=100000] scripts/tls-test.sh
-# The driver is its own repository (ssh://git@localhost:2222/tailoredshapes/fib-crypto-openssl.git): clone it at v0.2.0, it needs libcrypto.so.3 (OpenSSL 3).
+#   FIBC=<stage-2 fibc of this tree> DRIVER=<src directory of fib-crypto-openssl, v0.3.0 (the AEAD key handles and RSA signing: fibber CRYPTO-3)> [FUZZ=100000] scripts/tls-test.sh
+# The driver is its own repository (ssh://git@localhost:2222/tailoredshapes/fib-crypto-openssl.git): clone it at v0.3.0 (branch crypto-3 until the tag), it needs libcrypto.so.3 (OpenSSL 3).
 set -euo pipefail
 R=$(cd "$(dirname "$0")/.." && pwd)
 FIBC=${FIBC:?set FIBC to a stage-2 fibc of this tree}

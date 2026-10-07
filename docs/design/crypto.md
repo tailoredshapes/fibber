@@ -175,7 +175,7 @@ compiles: `provider-aead-seal` and `provider-aead-open` (alg, key, nonce, aad, p
 - **AEAD**: `:aes-128-gcm :aes-256-gcm :chacha20-poly1305`. Sealed = ciphertext || 16-byte tag. Nonce 12 bytes for all three (another length is `invalid-argument`: no
   variable-IV GCM, a TLS record never needs one). `aead-open` returns `authentication-failed` and no bytes for a bad tag, a short input, a changed AAD or nonce. The nonce is
   the caller's: reuse under one key is the caller's to avoid (TLS derives it from a counter), documented, not detectable here. Facts as functions: `aead-key-length`,
-  `aead-nonce-length`, `aead-tag-length`. Not built (not cheap): an incremental or in-place variant. A record layer seals whole records; the OpenSSL driver writes the
+  `aead-nonce-length`, `aead-tag-length`. The key-handle and into-buffer forms (an incremental variant is not built: a record layer seals whole records) are section 9.1. The per-call OpenSSL path writes the
   ciphertext into the result array directly (no copy) and decrypts into a buffer it cleanses.
 - **Key agreement**: `:x25519 :ecdh-p256 :ecdh-p384` (P-384 is cheap and TLS 1.3 offers it; P-521 is not offered). A private key is a **handle**, never bytes: `generate-key`
   `:x25519 :p-256 :p-384`, the raw public encoding from `private-key-public` (X25519: 32 bytes; P-256, P-384: the uncompressed point, 65 and 97 bytes: a TLS key_share), the
@@ -186,7 +186,7 @@ compiles: `provider-aead-seal` and `provider-aead-open` (alg, key, nonce, aad, p
   salt length 0 or MGF1/SHA-1 are INVALID here), `:rsa-pkcs1-sha256 :rsa-pkcs1-sha384` (certificates still use it), `:ecdsa-p256-sha256 :ecdsa-p384-sha384` (DER signatures),
   `:ed25519`. Keys come from `import-public-key` over X.509 SubjectPublicKeyInfo DER (the whole array is one SPKI; an RSA key below 2048 bits and a type that does not verify are
   refused); a scheme that does not fit the key type is `invalid-argument`; only a valid signature is `Ok`. ECDSA's high-S form is accepted (valid in TLS; Wycheproof calls it
-  acceptable) and no vector tests it either way. **Signing is a capability**: `:sign-ed25519 :sign-ecdsa-p256-sha256 :sign-ecdsa-p384-sha384`, by a `PrivateKey`; no RSA signing.
+  acceptable) and no vector tests it either way. **Signing is a capability**: `:sign-ed25519 :sign-ecdsa-p256-sha256 :sign-ecdsa-p384-sha384`, by a `PrivateKey`; RSA-PSS signing (`:sign-rsa-pss-sha256 :sign-rsa-pss-sha384`, from PKCS#8) is section 9.2.
 - **What TLS-1 needs and gets**: SPKI public-key import and verify (certificate chain, CertificateVerify), `generate-key` and `private-key-agree` (key share), `hmac` and
   `hkdf-extract` and `hkdf-expand` (HKDF-Expand-Label: the HkdfLabel bytes are TLS's own code), `aead-seal`/`aead-open` (records), `random-bytes`, `digest` (the transcript hash).
   What it must still do itself: **X.509 and ASN.1 parsing** (a certificate's SPKI, names, validity, extensions, the chain, path validation: protocol logic, written natively in
@@ -208,6 +208,48 @@ the faults that turn an error into a success (`:aead-skip-tag :accept-bad-point 
 that exists.
 
 TLS itself stays a library of its own (`fib.tls`), natively written (no libssl), over this interface.
+
+### 9.1 AEAD key handles and into-buffer calls (built: CRYPTO-3)
+
+CRYPTO-2 measured that a record through `provider-aead-seal` costs 25 to 42 percent more than `openssl speed` at TLS's 16 KiB (the cipher fetched, a context made and freed, the key
+schedule redone, a result array allocated per call), and that `fib.tls` read 2 to 4 times slower than `s_client` (docs/shootout/tls.md). The protocol gained what removes it, and **no
+primitive is ours**: a driver still wraps its library's contexts.
+
+- **`provider-aead-key (alg key) -> (Result (dyn AeadKey) CryptoError)`**, a method of `CryptoProvider` WITH A DEFAULT, so every v0.2.0 driver compiles and answers: the default checks the
+  key length and the capability list and returns `PerCallKey`, a handle whose seal and open are the provider's per-call `provider-aead-seal` and `-open` (correct, not faster). A driver that
+  keeps a context overrides it. The handle is a local `dyn` (not `:send`: a default over a provider that holds a cell, as the TLS test doubles do, must still compile; a connection is one task's).
+- **`AeadKey`** (`lib/fib/crypto/types.fib`): `aead-key-alg`, `aead-key-seal nonce aad plaintext` and `aead-key-open nonce aad sealed` (the same results as the per-call functions: ciphertext
+  || 16-byte tag; the plaintext or `authentication-failed` with nothing), `aead-key-close`, and the two INTO forms below. A handle is bound to (alg, key) once; a record costs the nonce, the
+  AAD and the data. Two handles never share state (the same key in two, or two keys in two); `aead-key-close` is idempotent and cleanses the driver's key schedule; every other call on a closed
+  handle is a `closed` error. **Nonce reuse is not detectable, by design**: the handle does not count records (a counter would have to be a second source of truth about what the caller sent),
+  so the contract tests that a nonce is not carried over from the record before (a handle that keeps its first nonce fails) but cannot test that a caller repeats one. TLS derives the nonce from
+  the record sequence number.
+- **`aead-key-seal-into nonce aad data off len out :owned out-off`** and **`aead-key-open-into`**: seal `data[off, off+len)` and write the `len + 16` bytes at `out[out-off, ..)`, or open
+  `data[off, off+len)` (ciphertext || tag) and write the `len - 16` plaintext bytes there. No result array is allocated per record. The language's ownership rule decides the shape: a protocol method
+  cannot take an `&` cell, so `out` is handed over (`:owned`) and the array that comes back is the one to use. When the caller passes it at its last use and nobody else holds it, it is written IN
+  PLACE (the driver makes it unique with the unique-write protocol before it writes through its address: a shared array is copied first and the caller's array is never changed); otherwise a copy
+  is written. A range outside `data` or `out` is `invalid-argument`. On an error the buffer is NOT returned, so a failed open leaves no unauthenticated plaintext in any array the caller can
+  see (the OpenSSL driver cleanses the part it wrote). Both methods have defaults over seal and open and `array-blit!` (spec/types.md 2.13.3).
+- **The contract** (`fib.crypto.contract-aeadkey`, `CryptoAeadKeyContract`, six scenarios): every vector of the per-call contract (the GCM spec, RFC 8439, Wycheproof, valid and invalid, and
+  the one-change variants) is run again through a handle; twelve records of different sizes and AADs through ONE handle equal the per-call output forward, in reverse and opened in a third
+  order (nothing carried from the record before), and do not open under the next record's nonce; handles with the same and with other keys interleave and each is closed alone;
+  the INTO forms write where asked and touch nothing else, never into an array the caller still holds, chain into one buffer, and refuse a bad range; wrong key and nonce lengths, an unlisted
+  algorithm, and use after close. **Faults** (`fib.crypto.fault`, `key-faults`): `:key-sticky-nonce :key-skip-tag :key-flip-tag :key-ignore-close :key-into-offset`; the gate shows against the
+  provider that refuses everything (the default handle over it) that the positive scenarios fail and the negative hold, and that each fault names a scenario that exists; the driver's repository
+  shows each caught by the real library.
+
+### 9.2 RSA signing (built: CRYPTO-3)
+
+For a TLS server later (CertificateVerify is `rsa_pss_rsae_sha256` or `_sha384`). `provider-import-private :rsa pkcs8` gives a `PrivateKey` of kind `:rsa`; `private-key-sign` takes
+`:rsa-pss-sha256` or `:rsa-pss-sha384` (MGF1 with the same hash, salt length = digest length, drawn fresh by the library, so two signatures of one message differ) under the capabilities
+`:sign-rsa-pss-sha256 :sign-rsa-pss-sha384`; `private-key-public` of an RSA key is its SubjectPublicKeyInfo DER (it has no raw form). A key under 2048 bits is refused at import, as
+`public-key-verify` refuses it; a scheme of another key type is `invalid-argument`; PKCS#1 v1.5 is not a signing capability (`unsupported`). There is no RSA key generation (it is slow and
+not what a server needs: it loads a key). **Vectors** (`fib.crypto.vectors-rsa`, `scripts/gen-crypto-vectors-rsa.sh`): Project Wycheproof's PSS files are verify-only and RFC 8017's
+own example key is 1024 bits, so the keys are made by python's `cryptography` (two of 2048 bits, one of 3072, one of 1024 that must be refused), with its PSS signatures over three messages
+for each of the two schemes, each checked by python before it is written. PSS is salted, so a signer has no known answer: the contract (`CryptoRsaSignContract`, five scenarios) checks that a
+signature VERIFIES under the SPKI python wrote and under the one the key reports, that two differ, that a changed message, signature or scheme (the other PSS scheme, PKCS#1) does not verify, that
+python's own signatures verify under the provider, and that a small key, an EC key, a public key, garbage and a changed or cut PKCS#8 are refused. The driver's repository adds the differential
+against python (python verifies every signature the driver makes) and the planted faults (wrong padding, zero salt, wrong MGF hash, any key size, any key kind).
 
 ## 10. Measurements
 
