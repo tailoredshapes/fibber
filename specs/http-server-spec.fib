@@ -124,6 +124,16 @@
               r (slurp t 1000)]
         )
       (then (expect = "" (. r fst)) (expect = true (. r snd)) (expect = true (< (elapsed-ms t0) 700)))))
+  (feature "graceful shutdown lets a request in flight finish"
+    (scenario "a handler that is still running when stop is called answers its client in full"
+      (given [srv (match (sv/run-server (fn (r: Request) (do (time/sleep-ns 300000000) (text-response 200 "done"))) (with (opts) (port 0))) ((Ok s) s) ((Err e) (trap (error-message e))))
+              url (str "http://127.0.0.1:" (sv/port srv) "/")
+              task (spawn (fn () (client-once url)))
+              _ (time/sleep-ns 100000000)
+              stopped (sv/stop-server srv)
+              answer (join task)]
+        )
+      (then (expect = true (match stopped ((Ok _) true) (_ false))) (expect = 200 answer))))
   (feature "graceful shutdown under load"
     (scenario "stop drains: every response that began is complete, nothing is truncated, new connections are refused"
       (given [srv (match (sv/run-server (fn (r: Request) (text-response 200 "ok")) (with (opts) (port 0) (workers 8))) ((Ok s) s) ((Err e) (trap (error-message e))))
@@ -155,5 +165,9 @@
                            ((Err (LimitError _)) (recur (+ i 1) ok (+ bad 1)))
                            ((Err _) (+ (* ok 1000) bad)))))]
                (do (c/close-http-client cl) r)))))
+
+(defun client-once (url: str) -> i64
+  (match (c/request (ClientRequest "GET" url {} (array 0 0i8)) (c/default-options))
+    ((Ok r) (if (= (str-from-bytes (. r body)) "done") (. r status) 1)) ((Err _) 0)))
 
 (defun main () -> i64 (run-main (specs)))

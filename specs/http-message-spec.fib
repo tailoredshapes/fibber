@@ -2,7 +2,7 @@
 ;; past it) and fragmentation (the same message in one piece, one byte at a time and cut at random offsets must parse to the same result).
 ;; Written from the RFC, not from an implementation's corpus. `fibc test specs/http-message-spec.fib`.
 (ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.http.types fib.http.headers fib.http.bytes fib.http.testing
-               fib.http.transport fib.http.wire fib.http.message))
+               fib.http.transport fib.http.reader fib.http.wire fib.http.message))
 
 (defun b (text: str) -> (Array i8) (str-bytes text))
 (defun whole (text: str) -> (Vec (Array i8)) [(b text)])
@@ -158,6 +158,14 @@
       (then (expect = true (accepted? (request-of (whole three) 100 65536 3)))
             (expect = true (limit-error? (request-of (whole four) 100 65536 3)))
             (expect = true (limit-error? (request-of (bytewise four) 100 65536 3)))))
+    (scenario "each layer enforces the header count on its own: the head parser, and the reader that bounds what is held"
+      (given [four "GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n" three "GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\n\r\n"
+              rd (fn (text: str max-lines: i64) (read-head (reader (. (scripted (whole text)) fst)) 65536 8192 max-lines))])
+      (then (expect = true (match (parse-request-head three 65536 3) ((Ok _) true) (_ false)))
+            (expect = true (match (parse-request-head four 65536 3) ((Err (LimitError _)) true) (_ false)))
+            (expect = true (match (rd three 4) ((Ok (some _)) true) (_ false)))
+            (expect = true (match (rd four 4) ((Err (LimitError _)) true) (_ false)))
+            (expect = true (match (rd four 5) ((Ok (some _)) true) (_ false)))))
     (scenario "head bytes"
       (given [head "GET / HTTP/1.1\r\nHost: x\r\n\r\n" n (str-len head)])
       (then (expect = true (accepted? (request-of (whole head) 100 n 100)))
