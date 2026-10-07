@@ -1,0 +1,104 @@
+;; fib.crypto.contract-aead: what a provider that lists `:aes-128-gcm`, `:aes-256-gcm` or `:chacha20-poly1305` must do (docs/design/crypto.md 9).
+;; A driver runs `(implements CryptoAeadContract "openssl" (fn () <a provider>))` beside `CryptoContract`. Vectors only: the RFC and NIST/McGrew-Viega
+;; known answers and Project Wycheproof's (fib.crypto.vectors-aead), and NEGATIVE cases derived from them here by changing one thing at a time. A
+;; provider that lists none of the three runs it vacuously; a driver's spec asserts it lists what it means to. Never a partial success: every
+;; invalid input is an error, and an error value has no plaintext in it.
+(ns fib.crypto.contract-aead
+  (:use fib.core fib.seq fib.coll fib.test.core fib.crypto.types fib.crypto.ops fib.crypto.pk fib.crypto.der fib.crypto.encoding
+        fib.crypto.contract fib.crypto.vectors-aead))
+
+(defun listed (p: p alg: keyword) :where ((CryptoProvider p)) -> bool (supports? p alg))
+
+(defun open-hex (p: p alg: keyword key: str nonce: str aad: str sealed: str) :where ((CryptoProvider p)) -> str
+  (result-hex (aead-open p alg (bytes-hex key) (bytes-hex nonce) (bytes-hex aad) (bytes-hex sealed))))
+
+;; The bytes with the low bit of byte i flipped.
+(defun flip-at (b: (Array i8) i: i64) -> (Array i8)
+  (let [c (cell (array-copy b 0 (array-len b)))] (do (array-set! &c i (bit-xor (array-get b i) 1i8)) @c)))
+(defun flip-hex (h: str i: i64) -> str (hex (flip-at (bytes-hex h) i)))
+(defun cut-hex (h: str n: i64) -> str (hex (array-copy (bytes-hex h) 0 (max 0 (- (quot (str-len h) 2) n)))))
+
+;; An empty or short `sealed`, wrong key and nonce lengths: refused with `invalid-argument` or `authentication-failed`, never a value.
+(defun refusal? (r: (Result (Array i8) CryptoError)) -> bool
+  (match r ((Ok _) false) ((Err e) (or (= (. e kind) "invalid-argument") (= (. e kind) "authentication-failed")))))
+(defun invalid? (r: (Result (Array i8) CryptoError)) -> bool (match r ((Ok _) false) ((Err e) (= (. e kind) "invalid-argument"))))
+
+;; The one-change variants of a valid vector: (label key nonce aad sealed); every one must fail to open.
+(defun tamper-variants (v: AeadVector) -> (Vec (Vec str))
+  (let [n (quot (str-len (. v sealed)) 2) ct (- n 16) k (. v key) no (. v nonce) a (. v aad) s (. v sealed)]
+    (into
+      (if (> ct 0)
+        [["first ciphertext byte flipped" k no a (flip-hex s 0)] ["last ciphertext byte flipped" k no a (flip-hex s (- ct 1))]]
+        [])
+      [["first tag byte flipped" k no a (flip-hex s ct)] ["last tag byte flipped" k no a (flip-hex s (- n 1))]
+       ["tag truncated by one byte" k no a (cut-hex s 1)] ["tag truncated to 8 bytes" k no a (cut-hex s 8)]
+       ["a byte appended" k no a (str s "00")] ["sealed shorter than a tag" k no a (cut-hex s (+ ct 1))] ["sealed empty" k no a ""]
+       ["nonce bit flipped" k (flip-hex no 0) a s] ["nonce last bit flipped" k (flip-hex no 11) a s]
+       ["aad changed" k no (if (= a "") "00" (flip-hex a 0)) s] ["key bit flipped" (flip-hex k 0) no a s]])))
+
+(defun tamper-failures (p: p vs: (Vec AeadVector)) :where ((CryptoProvider p)) -> (Vec str)
+  (vec (mapcat (fn (v: AeadVector)
+                 (vec (map (fn (x: (Vec str)) (str (. v alg) " " (. v name) ": " (nth x 0)))
+                           (filter (fn (x: (Vec str)) (not (refusal? (aead-open p (. v alg) (bytes-hex (nth x 1)) (bytes-hex (nth x 2)) (bytes-hex (nth x 3)) (bytes-hex (nth x 4))))))
+                                   (tamper-variants v)))))
+               vs)))
+
+(defun bad-length-failures (p: p alg: keyword) :where ((CryptoProvider p)) -> (Vec str)
+  (let [kl (aead-key-length alg) key (array kl 7i8) nonce (array 12 1i8) none (array 0 0i8) msg (str-bytes "hello")
+        sealed (match (aead-seal p alg key nonce none msg) ((Ok b) b) ((Err _) (array 21 0i8)))]
+    (vec (filter (fn (s: str) (not (= s "")))
+      [(if (invalid? (aead-seal p alg (array (- kl 1) 7i8) nonce none msg)) "" "seal: a key one byte short")
+       (if (invalid? (aead-seal p alg (array (+ kl 1) 7i8) nonce none msg)) "" "seal: a key one byte long")
+       (if (invalid? (aead-seal p alg (array 0 0i8) nonce none msg)) "" "seal: an empty key")
+       (if (invalid? (aead-seal p alg key (array 11 1i8) none msg)) "" "seal: an 11-byte nonce")
+       (if (invalid? (aead-seal p alg key (array 13 1i8) none msg)) "" "seal: a 13-byte nonce")
+       (if (invalid? (aead-seal p alg key (array 0 0i8) none msg)) "" "seal: an empty nonce")
+       (if (invalid? (aead-open p alg (array (- kl 1) 7i8) nonce none sealed)) "" "open: a key one byte short")
+       (if (invalid? (aead-open p alg key (array 11 1i8) none sealed)) "" "open: an 11-byte nonce")
+       (if (invalid? (aead-open p alg key (array 13 1i8) none sealed)) "" "open: a 13-byte nonce")
+       (if (invalid? (aead-open p alg key nonce none (array 0 0i8))) "" "open: nothing to open")
+       (if (refusal? (aead-open p alg key nonce none (array 15 0i8))) "" "open: fewer bytes than a tag")]))))
+
+;; seal then open over sizes around the block and the ChaCha block, and the facts of the algorithm.
+(defun roundtrip-failures (p: p alg: keyword) :where ((CryptoProvider p)) -> (Vec str)
+  (let [key (or-empty (random-bytes p (aead-key-length alg))) nonce (or-empty (random-bytes p 12)) aad (str-bytes "header")]
+    (vec (filter (fn (s: str) (not (= s "")))
+      (vec (map (fn (n: i64)
+                  (let [pt (or-empty (random-bytes p n)) sealed (aead-seal p alg key nonce aad pt)]
+                    (match sealed
+                      ((Err e) (str "seal " n ": " (. e message)))
+                      ((Ok s) (cond (not (= (array-len s) (+ n (aead-tag-length alg)))) (str "length of the sealed " n)
+                                    (not (= (result-hex (aead-open p alg key nonce aad s)) (hex pt))) (str "open " n)
+                                    (not (= (result-hex (aead-seal p alg key nonce aad pt)) (hex s))) (str "seal twice " n)
+                                    :else "")))))
+                [0 1 15 16 17 63 64 65 255 1000 5000]))))))
+
+(defcontract CryptoAeadContract [make]
+  (scenario "AEAD seal gives the published ciphertext and tag for every vector (GCM spec, RFC 8439, Wycheproof), and open gives the plaintext back"
+    (covers "aead-seal" "aead-open")
+    (given [p (make) vs (vec (filter (fn (v: AeadVector) (listed p (. v alg))) (aead-vectors)))])
+    (then (expect = [] (failing vs (fn (v: AeadVector) (str (. v alg) " " (. v name)))
+                         (fn (v: AeadVector) (= (. v sealed) (result-hex (aead-seal p (. v alg) (bytes-hex (. v key)) (bytes-hex (. v nonce)) (bytes-hex (. v aad)) (bytes-hex (. v pt))))))))
+          (expect = [] (failing vs (fn (v: AeadVector) (str (. v alg) " " (. v name)))
+                         (fn (v: AeadVector) (= (. v pt) (open-hex p (. v alg) (. v key) (. v nonce) (. v aad) (. v sealed))))))))
+  (scenario "every invalid vector (Wycheproof: modified tags and ciphertexts) is an authentication failure and returns nothing"
+    (given [p (make) vs (vec (filter (fn (v: AeadInvalid) (listed p (. v alg))) (aead-invalid-vectors)))])
+    (then (expect = [] (failing vs (fn (v: AeadInvalid) (str (. v alg) " " (. v name)))
+                         (fn (v: AeadInvalid) (= "authentication-failed" (kind-of (aead-open p (. v alg) (bytes-hex (. v key)) (bytes-hex (. v nonce)) (bytes-hex (. v aad)) (bytes-hex (. v sealed))))))))))
+  (scenario "each published vector, changed in one place (a ciphertext or tag byte, the tag cut short, a byte added, the nonce, the AAD, the key), fails to open"
+    (given [p (make) vs (vec (filter (fn (v: AeadVector) (listed p (. v alg))) (aead-vectors)))])
+    (then (expect = [] (tamper-failures p vs))))
+  (scenario "keys and nonces of the wrong length and sealed data shorter than a tag are refused"
+    (given [p (make)])
+    (then (expect = [] (vec (mapcat (fn (alg: keyword) (if (listed p alg) (vec (map (fn (s: str) (str alg " " s)) (bad-length-failures p alg))) [])) (aead-algs))))))
+  (scenario "seal then open returns the plaintext at every size, the sealed length is the plaintext plus 16, and sealing is deterministic"
+    (given [p (make)])
+    (then (expect = [] (vec (mapcat (fn (alg: keyword) (if (listed p alg) (vec (map (fn (s: str) (str alg " " s)) (roundtrip-failures p alg))) [])) (aead-algs))))))
+  (scenario "the facts: key 16 or 32 bytes, nonce 12, tag 16; an algorithm outside the list is `unsupported`, never an answer"
+    (given [p (make) k (array 16 1i8) n (array 12 1i8) e (array 0 0i8)])
+    (then (expect = [16 32 32] (vec (map aead-key-length (aead-algs))))
+          (expect = [12 12 12] (vec (map aead-nonce-length (aead-algs))))
+          (expect = [16 16 16] (vec (map aead-tag-length (aead-algs))))
+          (expect = "unsupported" (kind-of (aead-seal p :aes-192-gcm k n e e)))
+          (expect = "unsupported" (kind-of (aead-open p :rot13 k n e (array 16 0i8))))
+          (expect = [] (vec (filter (fn (a: keyword) (not (= (supports? p a) (not (= (kind-of (aead-seal p a (array (aead-key-length a) 1i8) n e e)) "unsupported"))))) (aead-algs)))))))

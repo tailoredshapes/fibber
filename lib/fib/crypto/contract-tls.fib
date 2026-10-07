@@ -1,0 +1,39 @@
+;; fib.crypto.contract-tls: the key-derivation part a TLS 1.3 client needs beyond what `CryptoContract` already pins (docs/design/crypto.md 9). HKDF-Extract
+;; is HMAC (salt as the key); HKDF-Expand is `hkdf-expand`; the HkdfLabel bytes of HKDF-Expand-Label are TLS's own code (the next package) and arrive here as
+;; `info`. The vectors are RFC 5869 appendix A and the whole key schedule of RFC 8448 (the 1-RTT handshake trace: early, handshake and master secrets, both
+;; sides' handshake and application traffic secrets, the keys and ivs, the finished keys, the resumption secrets).
+(ns fib.crypto.contract-tls
+  (:use fib.core fib.seq fib.coll fib.test.core fib.crypto.types fib.crypto.ops fib.crypto.encoding fib.crypto.contract fib.crypto.vectors fib.crypto.vectors-tls))
+
+(defun expand-ok? (p: p v: ExpandVector) :where ((CryptoProvider p)) -> bool
+  (= (. v expected) (result-hex (hkdf-expand p :sha-256 (bytes-hex (. v prk)) (bytes-hex (. v info)) (. v length)))))
+
+(defun extract-ok? (p: p v: ExtractVector) :where ((CryptoProvider p)) -> bool
+  (= (. v expected) (result-hex (hkdf-extract p :sha-256 (bytes-hex (. v salt)) (bytes-hex (. v ikm))))))
+
+;; HKDF = Extract then Expand: the one-call `hkdf` equals the two steps, on RFC 5869's vectors.
+(defun two-step-ok? (p: p v: HkdfVector) :where ((CryptoProvider p)) -> bool
+  (match (hkdf-extract p :sha-256 (bytes-hex (. v salt)) (bytes-hex (. v ikm)))
+    ((Err _) false)
+    ((Ok prk) (= (. v expected) (result-hex (hkdf-expand p :sha-256 prk (bytes-hex (. v info)) (. v length)))))))
+
+(defcontract CryptoTlsKdfContract [make]
+  (scenario "HKDF-Expand alone reproduces RFC 5869 A.1 and A.3 and every derive-secret, key and iv of RFC 8448"
+    (covers "hkdf-expand")
+    (given [p (make) vs (expand-vectors)])
+    (then (expect = [] (failing vs (fn (v: ExpandVector) (. v name)) (fn (v: ExpandVector) (expand-ok? p v))))
+          (expect = true (> (count vs) 20))))
+  (scenario "HKDF-Extract (HMAC with the salt as key) reproduces the early, handshake and master secrets of RFC 8448"
+    (covers "hkdf-extract")
+    (given [p (make) vs (extract-vectors)])
+    (then (expect = [] (failing vs (fn (v: ExtractVector) (. v name)) (fn (v: ExtractVector) (extract-ok? p v))))
+          (expect = true (> (count vs) 2))))
+  (scenario "the one-call HKDF equals Extract then Expand (RFC 5869 A.1 to A.3)"
+    (given [p (make) vs (hkdf-vectors)])
+    (then (expect = [] (failing vs (fn (v: HkdfVector) (. v name)) (fn (v: HkdfVector) (two-step-ok? p v))))))
+  (scenario "HKDF-Expand refuses a length with no answer"
+    (given [p (make) prk (array 32 1i8) info (str-bytes "info")])
+    (then (expect = "invalid-argument" (kind-of (hkdf-expand p :sha-256 prk info 0)))
+          (expect = "invalid-argument" (kind-of (hkdf-expand p :sha-256 prk info (+ (* 255 32) 1))))
+          (expect = "invalid-argument" (kind-of (hkdf-expand p :sha-256 prk info -1)))
+          (expect = "ok" (kind-of (hkdf-expand p :sha-256 prk info (* 255 32)))))))

@@ -4,8 +4,14 @@
 ;;  2. the contract against a provider that supports NOTHING (every operation is an `unsupported` error): it has the expected number of
 ;;     scenarios, the vector scenarios fail, and the honesty scenario holds: a contract that passed this provider could not fail;
 ;;  3. the same contract against a provider that overclaims (lists :rot13): the honesty scenario fails.
+;;  4. the AEAD, key agreement, signature and TLS-KDF contracts: scenario counts, the vector data, and against `Refuses` (lists every capability, does no
+;;     cryptography, answers an error to everything) the NEGATIVE scenarios hold and the positive ones fail; wrapped in the faults that turn an error into a
+;;     success (`:aead-skip-tag :accept-bad-point :accept-bad-sig`) the negative scenarios fail: they can fail. Faults that change a RIGHT answer need a real
+;;     library and are shown in the driver's repository; here each is tied to a scenario of the contracts that exists (`fault-scenarios`).
 ;; The vector contract itself runs in a driver's repository, against a real library. `fibc test specs`.
-(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.crypto.contract fib.crypto.fault fib.crypto.vectors)
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.crypto.contract fib.crypto.fault fib.crypto.vectors
+               fib.crypto.vectors-aead fib.crypto.vectors-pk fib.crypto.vectors-tls fib.crypto.contract-aead fib.crypto.contract-kex
+               fib.crypto.contract-sig fib.crypto.contract-tls)
   (:require [fib.crypto :as c]))
 
 (defstruct Nothing (n: i64))
@@ -28,7 +34,39 @@
   (provider-random (self n) (Err (c/unsupported "random")))
   (provider-ct-equal (self a b) false))
 
+(defstruct RefusePriv (n: i64))
+(impl c/PrivateKey RefusePriv
+  (private-key-kind (self) :x25519)
+  (private-key-public (self) (Err (c/invalid-argument "refused")))
+  (private-key-agree (self peer) (Err (c/invalid-argument "refused")))
+  (private-key-sign (self scheme msg) (Err (c/invalid-argument "refused")))
+  (private-key-close (self) ()))
+(defstruct RefusePub (n: i64))
+(impl c/PublicKey RefusePub
+  (public-key-kind (self) :rsa)
+  (public-key-verify (self scheme msg sig) (Err (c/invalid-signature)))
+  (public-key-close (self) ()))
+
+;; Lists every capability and refuses every operation (an authentication failure for open, an invalid argument for the rest). It does no cryptography.
+(defstruct Refuses (n: i64))
+(impl c/CryptoProvider Refuses
+  (provider-name (self) "refuses")
+  (provider-capabilities (self) (into (c/aead-algs) [:x25519 :ecdh-p256 :ecdh-p384 :ed25519 :rsa-pss-sha256 :rsa-pss-sha384 :rsa-pkcs1-sha256 :rsa-pkcs1-sha384
+                                                      :ecdsa-p256-sha256 :ecdsa-p384-sha384 :sign-ed25519 :sign-ecdsa-p256-sha256 :sign-ecdsa-p384-sha384]))
+  (provider-digest-start (self alg) (Err (c/unsupported (str alg))))
+  (provider-hmac-start (self alg key) (Err (c/unsupported (str alg))))
+  (provider-derive (self k) (Err (c/invalid-argument "refused")))
+  (provider-random (self n) (Err (c/unsupported "random")))
+  (provider-ct-equal (self a b) false)
+  (provider-aead-seal (self alg key nonce aad pt) (Err (c/invalid-argument "refused")))
+  (provider-aead-open (self alg key nonce aad sealed) (Err (c/authentication-failed)))
+  (provider-generate-key (self alg) (Ok (dyn c/PrivateKey :send (RefusePriv 0))))
+  (provider-import-private (self alg pkcs8) (Ok (dyn c/PrivateKey :send (RefusePriv 0))))
+  (provider-import-public (self spki) (Ok (dyn c/PublicKey :send (RefusePub 0)))))
+
 (defun nothing () -> Nothing (Nothing 0))
+(defun refuses () -> Refuses (Refuses 0))
+(defun refuses-with (fault: keyword) -> Faulty (Faulty (dyn c/CryptoProvider :send (Refuses 0)) fault))
 (defun overclaim () -> Overclaim (Overclaim 0))
 
 (defun hex-ok? (h: str) -> bool (match (c/unhex h) ((Ok _) true) ((Err _) false)))
@@ -47,10 +85,50 @@
        (every? (fn (v: HkdfVector) (and (hex-ok? (. v ikm)) (hex-ok? (. v salt)) (hex-ok? (. v info)) (hex-ok? (. v expected))
                                         (= (hex-len (. v expected)) (. v length)))) (hkdf-vectors))))
 
+(defun aead-sound? () -> bool
+  (and (every? (fn (v: AeadVector) (and (hex-ok? (. v key)) (hex-ok? (. v nonce)) (hex-ok? (. v aad)) (hex-ok? (. v pt)) (hex-ok? (. v sealed))
+                                        (= (hex-len (. v key)) (c/aead-key-length (. v alg))) (= (hex-len (. v nonce)) 12)
+                                        (= (hex-len (. v sealed)) (+ (hex-len (. v pt)) 16)))) (aead-vectors))
+       (every? (fn (v: AeadInvalid) (and (hex-ok? (. v key)) (hex-ok? (. v nonce)) (hex-ok? (. v aad)) (hex-ok? (. v sealed))
+                                         (= (hex-len (. v key)) (c/aead-key-length (. v alg))) (= (hex-len (. v nonce)) 12))) (aead-invalid-vectors))))
+
+(defun pk-sound? () -> bool
+  (and (every? (fn (v: KexVector) (and (hex-ok? (. v private)) (hex-ok? (. v public)) (hex-ok? (. v peer)) (hex-ok? (. v shared))
+                                       (= (hex-len (. v public)) (c/raw-public-length (. v alg))) (= (hex-len (. v peer)) (c/raw-public-length (. v alg)))
+                                       (> (hex-len (. v shared)) 31))) (kex-vectors))
+       (every? (fn (v: KexInvalid) (and (hex-ok? (. v private)) (hex-ok? (. v peer)))) (kex-invalid-vectors))
+       (every? (fn (v: SigVector) (and (hex-ok? (. v msg)) (hex-ok? (. v sig)) (>= (. v key) 0) (< (. v key) (count (sig-keys))))) (sig-vectors))
+       (every? hex-ok? (sig-keys))
+       (every? (fn (v: SignVector) (and (hex-ok? (. v private)) (hex-ok? (. v msg)) (= (hex-len (. v sig)) 64))) (sign-vectors))
+       (every? (fn (v: ExpandVector) (and (hex-ok? (. v prk)) (hex-ok? (. v info)) (hex-ok? (. v expected)) (= (hex-len (. v expected)) (. v length)))) (expand-vectors))
+       (every? (fn (v: ExtractVector) (and (hex-ok? (. v salt)) (hex-ok? (. v ikm)) (= (hex-len (. v expected)) 32))) (extract-vectors))))
+
+;; The fixed DER headers wrap the raw keys of the vectors into the PKCS#8 and SPKI the generator got from python's `cryptography`.
+(defun tail-hex (h: str n: i64) -> str (subs h (- (str-len h) (* 2 n)) (str-len h)))
+(defun raw-bytes (h: str) -> (Array i8) (match (c/unhex h) ((Ok b) b) ((Err _) (array 0 0i8))))
+(defun wrapped (r: (Result (Array i8) c/CryptoError)) -> str (match r ((Ok b) (c/hex b)) ((Err _) "ERR")))
+
+(defun der-private-ok? (kv: KexVector) -> bool (= (. kv private) (wrapped (c/wrap-private :x25519 (raw-bytes (tail-hex (. kv private) 32))))))
+(defun der-public-ok? (spki: str) -> bool (= spki (wrapped (c/wrap-public :ed25519 (raw-bytes (tail-hex spki 32))))))
+(defun der-matches? () -> bool
+  (let [kv (first (filter (fn (v: KexVector) (= (. v name) "rfc7748-6.1-alice")) (kex-vectors)))
+        sv (first (filter (fn (v: SigVector) (and (= (. v scheme) :ed25519) (= (. v name) "rfc8032-test1"))) (sig-vectors)))]
+    (and (match kv ((some k) (der-private-ok? k)) (nil false))
+         (match sv ((some s) (der-public-ok? (nth (sig-keys) (. s key)))) (nil false)))))
+
 (defun scenario-ids (scs: (Vec Scenario)) -> (Vec str) (vec (map (fn (s: Scenario) (. s id)) scs)))
 (defun holds (scs: (Vec Scenario) id: str) -> bool
   (not (some? (first (filter (fn (f: str) (= f id)) (contract-failures scs 1))))))
 (defun has-id? (scs: (Vec Scenario) id: str) -> bool (some? (first (filter (fn (s: str) (= s id)) (scenario-ids scs)))))
+
+(defun mentions? (id: str word: str) -> bool (some? (str-find id word 0)))
+;; Is there a failing scenario whose id has `word`? (`failing-word?`), a scenario of that name at all (`has-word?`).
+(defun failing-word? (scs: (Vec Scenario) word: str) -> bool
+  (some? (first (filter (fn (f: str) (mentions? f word)) (contract-failures scs 1)))))
+(defun has-word? (scs: (Vec Scenario) word: str) -> bool (some? (first (filter (fn (s: str) (mentions? s word)) (scenario-ids scs)))))
+
+(defun all-pk-scenarios () -> (Vec Scenario)
+  (into (into (into (vec (CryptoAeadContract refuses)) (vec (CryptoKexContract refuses))) (vec (CryptoSignatureContract refuses))) (vec (CryptoTlsKdfContract refuses))))
 
 (def honest-id: str "capabilities-are-honest-a-listed-name-works-an-unlisted-one-is-an-unsupported-error-never-an-answer")
 
@@ -77,6 +155,43 @@
       (given [w (Faulty (dyn c/CryptoProvider :send (Nothing 1)) :overclaim)])
       (then (expect = 8 (count (faults)))
             (expect = "faulty nothing" (c/provider-name w))
-            (expect = true (c/supports? w :rot13))))))
+            (expect = true (c/supports? w :rot13)))))
+  (feature "fib.crypto: AEAD, key agreement, signatures, the TLS key schedule"
+    (scenario "the vector data is well formed, its counts are fixed, and the DER headers wrap raw keys as the generator's python did"
+      (then (expect = true (aead-sound?)) (expect = true (pk-sound?)) (expect = true (der-matches?))
+            (expect = [23 9] [(count (aead-vectors)) (count (aead-invalid-vectors))])
+            (expect = [25 15 2 2] [(count (kex-vectors)) (count (kex-invalid-vectors)) (count (kex-iterated-vectors)) (count (sign-vectors))])
+            (expect = [111 74 11] [(count (sig-vectors)) (count (expand-vectors)) (count (extract-vectors))])))
+    (scenario "the four contracts have their scenarios"
+      (then (expect = [6 7 8 4] [(count (CryptoAeadContract refuses)) (count (CryptoKexContract refuses)) (count (CryptoSignatureContract refuses)) (count (CryptoTlsKdfContract refuses))])))
+    (scenario "against a provider that refuses everything the positive AEAD scenarios fail and the negative ones hold"
+      (given [scs (CryptoAeadContract refuses)])
+      (then (expect = true (failing-word? scs "AEAD-seal-gives-the-published")) (expect = true (failing-word? scs "seal-then-open"))
+            (expect = false (failing-word? scs "every-invalid-vector")) (expect = false (failing-word? scs "changed-in-one-place"))))
+    (scenario "an open that skips the tag check is caught by the invalid-vector and one-change scenarios"
+      (given [scs (CryptoAeadContract (fn () (refuses-with :aead-skip-tag)))])
+      (then (expect = true (failing-word? scs "every-invalid-vector")) (expect = true (failing-word? scs "changed-in-one-place"))))
+    (scenario "against a provider that refuses everything, bad peers are refused and the positive key agreement fails"
+      (given [scs (CryptoKexContract refuses)])
+      (then (expect = true (failing-word? scs "key-agreement-reproduces"))
+            (expect = false (failing-word? scs "an-invalid-peer-is-an-error")) (expect = false (failing-word? scs "each-valid-peer-changed"))
+            (expect = false (failing-word? scs "small-order-points"))))
+    (scenario "a key agreement that accepts a bad point is caught by all three negative scenarios"
+      (given [scs (CryptoKexContract (fn () (refuses-with :accept-bad-point)))])
+      (then (expect = true (failing-word? scs "an-invalid-peer-is-an-error")) (expect = true (failing-word? scs "each-valid-peer-changed"))
+            (expect = true (failing-word? scs "small-order-points"))))
+    (scenario "against a provider that refuses everything, no signature verifies and the changed signatures hold"
+      (given [scs (CryptoSignatureContract refuses)])
+      (then (expect = true (failing-word? scs "verify-gives-the-verdict"))
+            (expect = false (failing-word? scs "changed-in-one-place")) (expect = false (failing-word? scs "under-any-other-scheme"))))
+    (scenario "a verify that accepts a bad signature is caught by the one-change and cross-scheme scenarios"
+      (given [scs (CryptoSignatureContract (fn () (refuses-with :accept-bad-sig)))])
+      (then (expect = true (failing-word? scs "changed-in-one-place")) (expect = true (failing-word? scs "under-any-other-scheme"))))
+    (scenario "every fault of pk-faults names scenarios that exist in the contracts"
+      (given [scs (all-pk-scenarios)])
+      (then (expect = 11 (count (pk-faults)))
+            (expect = [] (vec (filter (fn (x: str) (not (= x "")))
+                                (vec (mapcat (fn (f: keyword) (vec (map (fn (w: str) (if (has-word? scs w) "" (str f " " w))) (fault-scenarios f)))) (pk-faults))))))
+            (expect = [] (vec (filter (fn (f: keyword) (empty? (fault-scenarios f))) (pk-faults))))))))
 
 (defun main () -> i64 (run-main (specs)))
