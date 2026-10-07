@@ -6,6 +6,7 @@ SMALL, BIG = b"x" * 100, b"y" * 1048576
 
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    wbufsize = 1 << 16  # one write per response: unbuffered headers then body would wait for a delayed ACK (40 ms) per request
 
     def log_message(self, *a):
         pass
