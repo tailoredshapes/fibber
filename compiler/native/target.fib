@@ -82,6 +82,28 @@
 (defun machine-dispose (m: Machine) -> unit
   (unsafe (lt/LLVMDisposeTargetMachine (. m tm))))
 
+;; `--static` is the musl row of a Linux target (driver.static); a build for any other target says so, instead of blaming FIB_TARGET_TRIPLE, which `--static`
+;; itself leaves set to the host's triple. `os-arch` names a triple as `OS-ARCH` (arm64-apple-darwin25.0 is darwin-arm64).
+(defun os-arch :private (triple: str) -> str
+  (let ((arch (match (str-find triple "-" 0) ((some i) (str-slice triple 0 i)) (nil triple)))
+        (os (if (or (some? (str-find triple "darwin" 0)) (some? (str-find triple "apple" 0)) (some? (str-find triple "macos" 0)))
+              "darwin"
+              (match (str-find triple "-" 0)
+                ((some i) (str-slice triple (+ i 1) (str-len triple)))
+                (nil "unknown")))))
+    (str os "-" arch)))
+
+(defun static-refusal (triple: str host: str) -> str
+  (str "--static builds are Linux-only (musl): " (if (= triple host) (str "this host is " (os-arch triple)) (str "the target is " triple))))
+
+;; Some message when the run is a `--static` one (FIB_STATIC=1) for a target that has no musl row, else nil.
+(defun static-refusal-now () -> (Option str)
+  (if (and (= (unwrap-or (sys-getenv "FIB_STATIC") "") "1") (not (some? (static-triple))))
+    (match (lt/requested-triple)
+      ((some t) (some (static-refusal t (lt/host-triple))))
+      (nil nil))
+    nil))
+
 ;; The CPU the environment asks for: nil for unset, empty or `host`. (target.rs `requested_cpu`)
 (defun requested-cpu (var: (Option str)) -> (Option str)
   (if-some [v var]
