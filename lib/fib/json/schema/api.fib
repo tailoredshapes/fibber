@@ -1,0 +1,56 @@
+;; fib.json.schema.api: compile a schema once, validate values with it.
+(ns fib.json.schema.api (:use fib.core fib.seq fib.coll fib.json.types fib.json.schema.types)
+  (:require [fib.json.parse :as p] [fib.json.access :as a] [fib.regex :as rx] [fib.json.schema.uri :as u] [fib.json.schema.index :as ix]
+            [fib.json.schema.meta :as meta] [fib.json.schema.scalar :as sc] [fib.json.schema.eval :as ev]))
+
+;; The base URI of a schema that names none: a hierarchical placeholder, so relative `$id`s and `$ref`s resolve against something.
+(def default-base: str "https://fib-json-schema.invalid/root.json")
+
+(defun schema-shaped? :private (j: Json) -> bool (match j ((JObj _ _) true) ((JBool _) true) (_ false)))
+
+(defun compile-patterns :private (patterns: (Vec str)) -> (Result (Map str rx/Regex) str)
+  (loop [i 0 out: (Map str rx/Regex) {}]
+    (if (>= i (count patterns)) (Ok out)
+      (let [p (nth patterns i)]
+        (if (contains? out p) (recur (+ i 1) out)
+          (match (rx/try-re-pattern p)
+            ((Err e) (Err (str "the pattern " p " does not compile: " e)))
+            ((Ok r) (recur (+ i 1) (assoc out p r)))))))))
+
+;; Indexed: the meta-schema, each resource under its URI, then the schema under the default base and its own `$id`.
+(defun indexed :private (root: Json resources: (Map str Json)) -> (Pair ix/Index str)
+  (let [with-meta (match (p/parse (meta/draft-07-text)) ((Ok m) (ix/walk (ix/Index {meta/draft-07-uri m} [] []) m meta/draft-07-uri 0)) ((Err _) (ix/empty-index)))
+        with-res (reduce (fn (idx: ix/Index uri: str)
+                           (let [doc (unwrap-or (get resources uri) JNull) key (u/without-fragment uri)]
+                             (ix/walk (with idx (resources (assoc (. idx resources) key doc))) doc key 0)))
+                         with-meta (vec (keys resources)))
+        seeded (with with-res (resources (assoc (. with-res resources) default-base root)) (patterns []) (refs []))
+        base (match root ((JObj _ _) (. (ix/enter seeded root default-base) snd)) (_ default-base))]
+    (Pair (ix/walk (with seeded (resources (assoc (. seeded resources) base root))) root default-base 0) base)))
+
+(defun unresolved :private (idx: ix/Index) -> (Option str)
+  (match (first (filter (fn (r: (Pair str str)) (not (some? (ix/lookup (. idx resources) (u/resolve (. r fst) (. r snd)))))) (. idx refs)))
+    ((some r) (some (. r snd)))
+    (nil nil)))
+
+;; A schema compiled with options: its `$id`s indexed, its regexes compiled, every `$ref` checked to resolve. Err names what is wrong.
+(defun compile-with (schema: Json opts: SchemaOptions) -> (Result JsonSchema str)
+  (if (not (schema-shaped? schema)) (Err "a schema is an object or a boolean")
+    (let [built (indexed schema (. opts resources)) idx (. built fst)]
+      (match (unresolved idx)
+        ((some ref) (Err (str "the $ref " ref " names no schema (a document a $ref names must be given to compile-with as a resource)")))
+        (nil (match (compile-patterns (. idx patterns))
+               ((Err m) (Err m))
+               ((Ok regexes) (Ok (JsonSchema schema (. built snd) (. idx resources) regexes (. opts formats))))))))))
+
+(defun compile-schema (schema: Json) -> (Result JsonSchema str) (compile-with schema (schema-options)))
+
+;; Every way `doc` fails the schema, in schema order; empty when it conforms.
+(defun validate (s: JsonSchema doc: Json) -> (Vec SchemaViolation)
+  (ev/check s (. s root) doc (sc/At "" "") (. s base) 0))
+
+(defun valid? (s: JsonSchema doc: Json) -> bool (empty? (validate s doc)))
+
+;; "/eggs: -1 is less than the minimum of 0" (the location, then the sentence; the sentence alone for the whole document).
+(defun violation-text (v: SchemaViolation) -> str
+  (if (= (. v instance-path) "") (. v message) (str (. v instance-path) ": " (. v message))))

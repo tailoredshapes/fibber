@@ -1,0 +1,60 @@
+;; fib.json.schema.index: what compiling a schema learns by walking it once. Every subschema an `$id` names, by absolute URI (draft 7: an
+;; `$id` beside a `$ref` is ignored, as every sibling of a `$ref` is; an `$id` of "#name" names its schema without changing the base); every
+;; regex a `pattern` or a `patternProperties` key holds; every `$ref`, with the base it is resolved against.
+(ns fib.json.schema.index (:use fib.core fib.seq fib.coll fib.json.types) (:require [fib.json.access :as a] [fib.json.schema.uri :as u]))
+
+;; Keywords whose value is a schema, an object of schemas, or an array of schemas (`items` is a schema or an array of them; a
+;; `dependencies` member is a schema or an array of names). Only these are walked: an `$id` inside `enum` or `const` is data.
+(def single-keys: (Vec str) ["additionalItems" "additionalProperties" "contains" "propertyNames" "if" "then" "else" "not" "items"])
+(def map-keys: (Vec str) ["properties" "patternProperties" "definitions" "dependencies"])
+(def list-keys: (Vec str) ["allOf" "anyOf" "oneOf" "items"])
+
+(defstruct Index (resources: (Map str Json) patterns: (Vec str) refs: (Vec (Pair str str))))
+
+(defun empty-index () -> Index (Index {} [] []))
+
+(defun str-member :private (j: Json k: str) -> (Option str) (match (a/json-get j k) ((some (JStr s)) (some s)) (_ nil)))
+
+;; The base a schema object's own keywords are read against, and the index with the names it defines.
+(defun enter (idx: Index j: Json base: str) -> (Pair Index str)
+  (match (str-member j "$id")
+    (nil (Pair idx base))
+    ((some id) (if (some? (a/json-get j "$ref")) (Pair idx base)
+                 (let [uri (u/resolve base id)]
+                   (if (starts-with? id "#")
+                       (Pair (with idx (resources (assoc (. idx resources) uri j))) base)
+                       (Pair (with idx (resources (assoc (. idx resources) (u/without-fragment uri) j))) (u/without-fragment uri))))))))
+
+(defun children :private (j: Json) -> (Vec Json)
+  (let [from-single (reduce (fn (o: (Vec Json) k: str) (match (a/json-get j k) ((some v) (match v ((JArr _) o) (_ (conj o v)))) (nil o))) [] single-keys)
+        from-maps (reduce (fn (o: (Vec Json) k: str) (match (a/json-get j k) ((some (JObj _ vs)) (vec (concat o vs))) (_ o))) from-single map-keys)]
+    (reduce (fn (o: (Vec Json) k: str) (match (a/json-get j k) ((some (JArr items)) (vec (concat o items))) (_ o))) from-maps list-keys)))
+
+(defun own-patterns :private (j: Json) -> (Vec str)
+  (let [p (match (str-member j "pattern") ((some s) [s]) (nil []))]
+    (match (a/json-get j "patternProperties") ((some (JObj ks _)) (vec (concat p ks))) (_ p))))
+
+(defun walk (idx: Index j: Json base: str depth: i64) -> Index
+  (match j
+    ((JObj _ _)
+     (if (> depth 512) idx
+       (let [entered (enter idx j base) b (. entered snd)
+             here (with (. entered fst) (patterns (vec (concat (. (. entered fst) patterns) (own-patterns j))))
+                    (refs (match (str-member j "$ref") ((some r) (conj (. (. entered fst) refs) (Pair b r))) (nil (. (. entered fst) refs)))))]
+         (reduce (fn (acc: Index c: Json) (walk acc c b (+ depth 1))) here (children j)))))
+    (_ idx)))
+
+;; The schema a URI names, and the base its keywords are read against: a document by its URI, then a JSON Pointer fragment walked
+;; through it (an `$id` passed on the way moves the base), or a "#name" an `$id` defined. Nil when nothing is there.
+(defun lookup (resources: (Map str Json) target: str) -> (Option (Pair Json str))
+  (let [doc-uri (u/without-fragment target) frag (u/fragment target)]
+    (if (and (!= frag "") (not (starts-with? frag "/")))
+        (match (get resources target) ((some j) (some (Pair j doc-uri))) (nil nil))
+        (match (get resources doc-uri)
+          (nil nil)
+          ((some doc) (match (and-then u/pointer-tokens (u/percent-decode frag))
+                        (nil nil)
+                        ((some toks) (loop [i 0 node doc base doc-uri]
+                                       (if (>= i (count toks)) (some (Pair node base))
+                                         (let [b (match node ((JObj _ _) (. (enter (empty-index) node base) snd)) (_ base))]
+                                           (match (u/step node (nth toks i)) (nil nil) ((some next) (recur (+ i 1) next b)))))))))))))

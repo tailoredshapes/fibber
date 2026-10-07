@@ -1,0 +1,64 @@
+;; fib.json.schema.value: JSON values as JSON Schema compares them. A number is a number whatever its spelling (1, 1.0 and 1e0 are equal,
+;; and 1.0 is an integer); objects are equal when they have the same members in any order.
+(ns fib.json.schema.value (:use fib.core fib.seq fib.coll fib.json.types) (:require [fib.json.access :as a] [fib.json.number :as num] [fib.json.write :as w]))
+
+(defun number? (j: Json) -> bool (match j ((JInt _) true) ((JFloat _) true) ((JBig _) true) (_ false)))
+
+;; A number as an f64 (a JBig by its text, correctly rounded; an overflow is an infinity).
+(defun as-f64 (j: Json) -> f64
+  (match j ((JInt i) (double i)) ((JFloat f) f) ((JBig t) (num/strtod-token t 0 (str-len t))) (_ 0.0)))
+
+(defun abs-f :private (f: f64) -> f64 (if (< f 0.0) (- 0.0 f) f))
+
+;; A float is an integer when it is finite and whole (every finite f64 at or above 2^63 is whole).
+(defun whole-float? :private (f: f64) -> bool
+  (and (= f f) (<= (abs-f f) 1.7976931348623157e308) (or (>= (abs-f f) 9.0e18) (= f (double (fptosi i64 f))))))
+
+(defun integer? (j: Json) -> bool
+  (match j ((JInt _) true) ((JFloat f) (whole-float? f)) ((JBig t) (whole-float? (as-f64 j))) (_ false)))
+
+;; JSON Schema's type of a value: "null" "boolean" "integer" (an integral number) "number" "string" "array" "object".
+(defun type-name (j: Json) -> str
+  (match j
+    ((JNull) "null") ((JBool _) "boolean") ((JStr _) "string") ((JArr _) "array") ((JObj _ _) "object")
+    (_ (if (integer? j) "integer" "number"))))
+
+;; Two numbers compared: exactly when both are i64, else as f64. -1, 0 or 1.
+(defun compare-numbers (x: Json y: Json) -> i64
+  (match x
+    ((JInt a) (match y ((JInt b) (cond (< a b) -1 (> a b) 1 :else 0)) (_ (let [f (as-f64 y) g (double a)] (cond (< g f) -1 (> g f) 1 :else 0)))))
+    (_ (let [f (as-f64 x) g (as-f64 y)] (cond (< f g) -1 (> f g) 1 :else 0)))))
+
+(defun equal? (x: Json y: Json) -> bool
+  (if (and (number? x) (number? y)) (= (compare-numbers x y) 0)
+    (match x
+      ((JNull) (match y ((JNull) true) (_ false)))
+      ((JBool a) (match y ((JBool b) (= a b)) (_ false)))
+      ((JStr a) (match y ((JStr b) (= a b)) (_ false)))
+      ((JArr xs) (match y ((JArr ys) (and (= (count xs) (count ys)) (every? (fn (i: i64) (equal? (nth xs i) (nth ys i))) (vec (range (count xs)))))) (_ false)))
+      ((JObj ks vs) (match y
+                      ((JObj ks2 _) (and (= (count ks) (count ks2))
+                                         (every? (fn (i: i64) (match (a/json-get y (nth ks i)) ((some v) (equal? (nth vs i) v)) (nil false))) (vec (range (count ks))))))
+                      (_ false)))
+      (_ false))))
+
+;; Whether `x` is a multiple of `m` (m > 0): exactly for two i64, else to within a relative 1e-9 of a whole quotient (0.3 is a multiple
+;; of 0.1 although 0.3 / 0.1 is 2.9999999999999996 in binary floating point); an infinite quotient is not.
+(defun multiple-of? (x: Json m: Json) -> bool
+  (match x
+    ((JInt a) (match m ((JInt b) (= (rem a b) 0)) (_ (whole? (/ (double a) (as-f64 m))))))
+    (_ (let [q (/ (as-f64 x) (as-f64 m))]
+         ;; An integer too large to divide (1e308 / 0.5 overflows) is still a multiple of any m whose reciprocal is whole.
+         (if (and (> (abs-f q) 1.0e300) (integer? x)) (whole? (/ 1.0 (as-f64 m))) (whole? q))))))
+
+(defun whole? :private (q: f64) -> bool
+  (let [aq (abs-f q)]
+    (cond (not (= q q)) false
+          (> aq 1.0e300) false
+          (>= aq 4.5e15) true
+          :else (let [r (double (fptosi i64 (+ q (if (< q 0.0) -0.5 0.5)))) d (- q r)]
+                  (<= (abs-f d) (* 1.0e-9 (if (< aq 1.0) 1.0 aq)))))))
+
+;; The text of a value for a message (short: a long one is cut).
+(defun brief (j: Json) -> str
+  (let [t (w/write j)] (if (> (str-len t) 60) (str (str-slice t 0 57) "...") t)))

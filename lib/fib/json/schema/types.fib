@@ -1,0 +1,22 @@
+;; fib.json.schema.types: a compiled JSON Schema and what validation reports (docs/design/json-schema.md).
+(ns fib.json.schema.types (:use fib.core fib.seq fib.coll fib.json.types) (:require [fib.regex :as rx]))
+
+;; A schema ready to validate with: the schema document, its base URI, every schema an `$id` (or a resource given to `compile-with`) names,
+;; by absolute URI, every `pattern` and `patternProperties` regex compiled once, and whether `format` is asserted.
+(defstruct JsonSchema (root: Json base: str resources: (Map str Json) regexes: (Map str rx/Regex) formats: bool))
+
+;; One way a document fails its schema: where in the document (a JSON Pointer, "" for the whole), where in the schema (the keyword's
+;; location as a JSON Pointer from the root schema, through the `$ref`s followed), the keyword, and a sentence.
+(defstruct SchemaViolation (instance-path: str schema-path: str keyword: str message: str))
+(derive Eq SchemaViolation)
+(derive Debug SchemaViolation)
+
+;; How to compile: schemas a `$ref` may name by absolute URI that the document does not contain (other documents; the draft-07 meta-schema
+;; is always available), and whether `format` is checked (true: a known format that does not match is a violation; unknown formats pass).
+(defstruct SchemaOptions (resources: (Map str Json) formats: bool))
+
+(defun schema-options () -> SchemaOptions (SchemaOptions {} true))
+
+;; A JSON Pointer token: `~` as `~0`, `/` as `~1`.
+(defun pointer-token (s: str) -> str
+  (str-join (mapv (fn (c: char) (cond (= c \~) "~0" (= c \/) "~1" :else (char->str c))) (str-chars s))))

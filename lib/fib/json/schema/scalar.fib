@@ -1,0 +1,78 @@
+;; fib.json.schema.scalar: the draft 7 keywords that look at one value and no subschema: type, enum, const, the numeric bounds and
+;; multipleOf, the string length bounds, pattern and format, the item and property counts, uniqueItems and required.
+(ns fib.json.schema.scalar (:use fib.core fib.seq fib.coll fib.json.types fib.json.schema.types fib.json.schema.value)
+  (:require [fib.json.access :as a] [fib.regex :as rx] [fib.json.schema.formats :as fmt]))
+
+(defstruct At (ipath: str spath: str))
+
+(defun violation (at: At kw: str message: str) -> SchemaViolation (SchemaViolation (. at ipath) (str (. at spath) "/" kw) kw message))
+
+(defun type-matches? :private (want: str j: Json) -> bool
+  (let [t (type-name j)] (or (= want t) (and (= want "number") (= t "integer")))))
+
+(defun check-type :private (at: At spec: Json j: Json) -> (Option SchemaViolation)
+  (let [wants (match spec ((JStr s) [s]) ((JArr items) (reduce (fn (o: (Vec str) i: Json) (match i ((JStr s) (conj o s)) (_ o))) [] items)) (_ []))]
+    (if (some? (first (filter (fn (w: str) (type-matches? w j)) wants))) nil
+      (some (violation at "type" (str (brief j) " is not of type " (str-join (vec (interpose " or " wants)))))))))
+
+(defun bound :private (at: At kw: str limit: Json j: Json ok: (fn (i64) bool) :borrow words: str) -> (Option SchemaViolation)
+  (if (or (not (number? limit)) (not (number? j)) (ok (compare-numbers j limit))) nil
+    (some (violation at kw (str (brief j) " is " words " " (brief limit))))))
+
+(defun numeric :private (at: At k: str v: Json j: Json) -> (Option SchemaViolation)
+  (cond (= k "minimum") (bound at k v j (fn (c: i64) (>= c 0)) "less than the minimum of")
+        (= k "maximum") (bound at k v j (fn (c: i64) (<= c 0)) "greater than the maximum of")
+        (= k "exclusiveMinimum") (bound at k v j (fn (c: i64) (> c 0)) "not greater than the exclusive minimum")
+        (= k "exclusiveMaximum") (bound at k v j (fn (c: i64) (< c 0)) "not less than the exclusive maximum")
+        (= k "multipleOf") (if (or (not (number? v)) (not (number? j)) (multiple-of? j v)) nil
+                             (some (violation at k (str (brief j) " is not a multiple of " (brief v)))))
+        :else nil))
+
+(defun limit :private (v: Json) -> i64 (match v ((JInt n) n) ((JFloat f) (fptosi i64 f)) (_ -1)))
+
+(defun counted :private (at: At k: str v: Json n: i64 noun: str) -> (Option SchemaViolation)
+  (let [lim (limit v) over (starts-with? k "max")]
+    (if (or (< lim 0) (if over (<= n lim) (>= n lim))) nil
+      (some (violation at k (str "has " n " " noun ", " (if over "more" "fewer") " than " lim))))))
+
+(defun string-checks :private (at: At k: str v: Json s: str regexes: (Map str rx/Regex) formats: bool) -> (Option SchemaViolation)
+  (cond (or (= k "minLength") (= k "maxLength")) (counted at k v (count (str-chars s)) "characters")
+        (= k "pattern") (match v
+                          ((JStr p) (match (get regexes p)
+                                      ((some r) (if (some? (rx/re-find r s)) nil (some (violation at k (str (brief (JStr s)) " does not match " (brief v))))))
+                                      (nil nil)))
+                          (_ nil))
+        (= k "format") (match v
+                         ((JStr f) (if (or (not formats) (fmt/conforms? f s)) nil (some (violation at k (str (brief (JStr s)) " is not a valid " f)))))
+                         (_ nil))
+        :else nil))
+
+(defun unique? :private (items: (Vec Json)) -> bool
+  (every? (fn (i: i64) (every? (fn (k: i64) (not (equal? (nth items i) (nth items k)))) (vec (range (+ i 1) (count items))))) (vec (range (count items)))))
+
+(defun array-checks :private (at: At k: str v: Json items: (Vec Json)) -> (Option SchemaViolation)
+  (cond (or (= k "minItems") (= k "maxItems")) (counted at k v (count items) "items")
+        (= k "uniqueItems") (if (and (= v (JBool true)) (not (unique? items))) (some (violation at k "has non-unique items")) nil)
+        :else nil))
+
+(defun object-checks :private (at: At k: str v: Json obj: Json) -> (Vec SchemaViolation)
+  (cond (or (= k "minProperties") (= k "maxProperties")) (match (counted at k v (count (match obj ((JObj ks _) ks) (_ []))) "properties") ((some x) [x]) (nil []))
+        (= k "required") (match v
+                           ((JArr names) (reduce (fn (o: (Vec SchemaViolation) n: Json)
+                                                   (match n ((JStr name) (if (some? (a/json-get obj name)) o (conj o (violation at k (str (brief n) " is a required property"))))) (_ o)))
+                                                 [] names))
+                           (_ []))
+        :else []))
+
+(defun one :private (o: (Option SchemaViolation)) -> (Vec SchemaViolation) (match o ((some x) [x]) (nil [])))
+
+;; The violations of one keyword `k` with value `v` that needs no subschema, for the value `j`.
+(defun keyword-checks (at: At k: str v: Json j: Json regexes: (Map str rx/Regex) formats: bool) -> (Vec SchemaViolation)
+  (cond (= k "type") (one (check-type at v j))
+        (= k "enum") (match v ((JArr items) (if (some? (first (filter (fn (e: Json) (equal? e j)) items))) [] [(violation at k (str (brief j) " is not one of " (brief v)))])) (_ []))
+        (= k "const") (if (equal? v j) [] [(violation at k (str (brief j) " is not " (brief v)))])
+        :else (match j
+                ((JStr s) (one (string-checks at k v s regexes formats)))
+                ((JArr items) (one (array-checks at k v items)))
+                ((JObj _ _) (object-checks at k v j))
+                (_ (if (number? j) (one (numeric at k v j)) [])))))
