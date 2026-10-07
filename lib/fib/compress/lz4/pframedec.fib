@@ -94,8 +94,8 @@
 (defun fallback (e: CompressError) -> (Result (Option (Array i8)) CompressError)
   (if (= (. e kind) :internal) (Err e) (Ok nil)))
 
-(defun make-shared (src: (Array i8) ix: Index h: FrameHead o: Options out: i64 total: i64) -> Shared
-  (let [gb (group-blocks (. h bmax)) jobs (quot (+ (. ix count) (- gb 1)) gb)]
+(defun make-shared (src: (Array i8) ix: Index h: FrameHead o: Options out: i64 total: i64 gb0: i64) -> Shared
+  (let [gb (if (> gb0 0) gb0 (group-blocks (. h bmax))) jobs (quot (+ (. ix count) (- gb 1)) gb)]
     (Shared src ix (. h bmax) gb jobs (. o verify) (. h bchk) (and (. o verify) (. h cchk)) (xxh-new 0) (atom 0) (atom false)
             (vec (map (fn (i: i64) (atom false)) (range jobs))) out total)))
 
@@ -106,8 +106,8 @@
         (loop [] (let [j @(. s next)] (when (< j (. s jobs)) (do (hash-job s j) (reset! (. s next) (+ j 1)) (recur)))))
         (if (= (xxh-digest (. s ck)) (rd32 (data (. s src)) end)) (Ok ()) (Err (checksum-error "the content checksum does not match"))))))
 
-(defun decode-par-direct (src: (Array i8) ix: Index h: FrameHead o: Options workers: i64) -> (Result (Option (Array i8)) CompressError)
-  (let [out (array (. h csize) 0i8) s (make-shared src ix h o (addr-of (data out)) (. h csize))]
+(defun decode-par-direct (src: (Array i8) ix: Index h: FrameHead o: Options workers: i64 gb: i64) -> (Result (Option (Array i8)) CompressError)
+  (let [out (array (. h csize) 0i8) s (make-shared src ix h o (addr-of (data out)) (. h csize) gb)]
     (match (run-jobs workers (. s jobs) (direct-job s))
       ((Err e) (fallback e))
       ((Ok _) (match (check-content s (. ix end)) ((Err e) (Err e)) ((Ok _) (Ok (some out))))))))
@@ -119,9 +119,9 @@
   (let [out (array (total-len parts) 0i8)]
     (match (place out 0 parts workers) ((Ok _) out) ((Err _) out))))
 
-(defun decode-par-place (src: (Array i8) ix: Index h: FrameHead o: Options workers: i64) -> (Result (Option (Array i8)) CompressError)
+(defun decode-par-place (src: (Array i8) ix: Index h: FrameHead o: Options workers: i64 gb: i64) -> (Result (Option (Array i8)) CompressError)
   (if (> (stored-bound ix (. h bmax)) (+ (. o max-output) (. h bmax))) (Ok nil)
-    (let [s (make-shared src ix h o 0 0)]
+    (let [s (make-shared src ix h o 0 0 gb)]
       (match (run-jobs workers (. s jobs) (place-job s))
         ((Err e) (fallback e))
         ((Ok parts)
@@ -130,18 +130,22 @@
              (if (and (. s cck) (not (= (xxh32 out 0) (rd32 (data src) (. ix end))))) (Err (checksum-error "the content checksum does not match"))
                (Ok (some out))))))))))
 
-(defun try-par (src: (Array i8) h: FrameHead o: Options workers: i64) -> (Result (Option (Array i8)) CompressError)
+(defun try-par (src: (Array i8) h: FrameHead o: Options workers: i64 gb: i64) -> (Result (Option (Array i8)) CompressError)
   (let [n (array-len src) ix (scan-blocks src h)]
     (cond (or (< (. ix end) 0) (not (= n (+ (. ix end) (if (. h cchk) 4 0)))) (< (. ix count) 2)) (Ok nil)
           (>= (. h csize) 0)
           (if (or (> (. h csize) (. o max-output)) (> (. h csize) (+ 1024 (* 255 n))) (not (= (. ix count) (quot (+ (. h csize) (- (. h bmax) 1)) (. h bmax))))) (Ok nil)
-            (decode-par-direct src ix h o workers))
-          :else (decode-par-place src ix h o workers))))
+            (decode-par-direct src ix h o workers gb))
+          :else (decode-par-place src ix h o workers gb))))
 
 (defun frame-decompress-par (src: (Array i8) o: Options workers: i64) -> (Result (Option (Array i8)) CompressError)
+  (frame-decompress-par-g src o workers 0))
+
+;; With the number of blocks of a job given (0: the default of about 1 MiB).
+(defun frame-decompress-par-g (src: (Array i8) o: Options workers: i64 gb: i64) -> (Result (Option (Array i8)) CompressError)
   (if (or (< (array-len src) 11) (> (array-len (. o dictionary)) 0)) (Ok nil)
     (match (parse-head (data src) (array-len src) 0)
       ((Ok head) (match head
-                   ((some h) (if (and (= (. h kind) kind-frame) (. h indep)) (try-par src h o workers) (Ok nil)))
+                   ((some h) (if (and (= (. h kind) kind-frame) (. h indep)) (try-par src h o workers gb) (Ok nil)))
                    (nil (Ok nil))))
       ((Err _) (Ok nil)))))

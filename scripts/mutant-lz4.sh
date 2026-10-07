@@ -12,6 +12,8 @@
 #   dict-base         frame: the dictionary sits one byte off in the window   stale-table  scomp: independent blocks keep the table and reach ahead
 #   hc-depth-zero     hc: the chain is not followed                    reserved-bit       header: the reserved FLG bit is accepted
 #   offset-check      blockdec: an offset one past the output is accepted   fast-offset-0  blockdec: the fast path does not check for offset 0
+#   slack-dlim / slack-ilim   blockdec: the fast path's output / input slack is too small (killed by the safety spec's canaries)   fast-small-pattern   blockdec: small offsets use a distance of 8
+#   xxh-vector-rot    xxh32: the vector round rotates by 14           par-order  par-race-window  par-lost-job  par-max-output  par-thread-dependent  par-error-swallowed  par-trap-kills  par-checksum-skipped (see docs/design/compress.md 9)
 #   linked-lo         framedec: a later frame may reach into the first   fast-copy-8      blockdec: the fast path copies 16 bytes at a distance of 8
 set -uo pipefail
 R=$(cd "$(dirname "$0")/.." && pwd)
@@ -19,7 +21,7 @@ FIBC=${FIBC:-$HOME/.cache/fibber-scratch/gate-$(basename "$R")/F}
 [ -x "$FIBC" ] || { echo "mutant-lz4: no stage 2 fibc: set FIBC" >&2; exit 2; }
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-lz4}
 MUTANTS=("$@")
-[ ${#MUTANTS[@]} -gt 0 ] || MUTANTS=(last-literals offset-65536 overlap-memmove nibble-overflow ext-255 no-verify match-past-end cap-off-by-one skip-content-crc skip-block-crc
+[ ${#MUTANTS[@]} -gt 0 ] || MUTANTS=(slack-dlim slack-ilim fast-small-pattern xxh-vector-rot par-order par-race-window par-lost-job par-max-output par-thread-dependent par-error-swallowed par-trap-kills par-checksum-skipped last-literals offset-65536 overlap-memmove nibble-overflow ext-255 no-verify match-past-end cap-off-by-one skip-content-crc skip-block-crc
                                      skip-header-crc block-crc-bytes dict-base stale-table hc-depth-zero reserved-bit offset-check fast-offset-0 linked-lo fast-copy-8)
 
 sub() { perl -0pi -e "$2" "$1"; cmp -s "$1" "$1.orig" && { echo "mutant-lz4: pattern not found in $1: $2" >&2; return 1; }; return 0; }
@@ -43,9 +45,21 @@ mutate() { # mutate NAME TREE
     hc-depth-zero)    f=$d/hc.fib; cp $f $f.orig; sub $f 's/\(cond \(<= level 3\) 4/(cond (<= level 99) 0 (<= level 3) 4/' ;;
     reserved-bit)     f=$d/header.fib; cp $f $f.orig; sub $f 's/\(> \(bit-and flg 2\) 0\) \(Err \(corrupt "the frame.s reserved FLG bit is set"\)\)/false (Err (corrupt "x"))/' ;;
     offset-check)     f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(> off \(u- op2 lo\)\)\) e-corrupt/(> off (u+ (u- op2 lo) 1))) e-corrupt/' ;;
-    fast-offset-0)    f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(and \(> off 0\) \(<= off \(u- op2 lo\)\)/(and (<= off (u- op2 lo))/' ;;
+    fast-offset-0)    f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(ult \(u- \(rd16 ip \(u\+ \(u\+ i 1\) lit\)\) 1\) \(u- \(u\+ op lit\) lo\)\)/(<= (rd16 ip (u+ (u+ i 1) lit)) (u- (u+ op lit) lo))/' ;;
     linked-lo)        f=$d/framedec.fib; cp $f $f.orig; sub $f 's/\(if first 0 op\) cap/0 cap/' ;;
-    fast-copy-8)      f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(if \(>= off 16\)(\s+)\(do \(cp16 dp op2 dp/(if (>= off 8)$1(do (cp16 dp op2 dp/' ;;
+    fast-copy-8)      f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(cond \(>= off 16\) \(do \(cp16 dp op2 dp/(cond (>= off 8) (do (cp16 dp op2 dp/' ;;
+    fast-small-pattern) f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(let \[s \(\* off \(quot \(u\+ 7 off\) off\)\) src/(let [s 8 src/' ;;
+    slack-dlim)       f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(u- dlen 46\)/(u- dlen 30)/' ;;
+    slack-ilim)       f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(u- ilen 17\)/(u- ilen 10)/' ;;
+    xxh-vector-rot)   f=$d/xxh32.fib; cp $f $f.orig; sub $f 's/\(shl a \(vs 13\)\) \(shr a \(vs 19\)\)/(shl a (vs 14)) (shr a (vs 18))/' ;;
+    par-order)        f=$d/pframe.fib; cp $f $f.orig; sub $f 's/blocks \(vec \(drop 1 parts\)\)/blocks (vec (reverse (drop 1 parts)))/' ;;
+    par-race-window)  f=$d/pframedec.fib; cp $f $f.orig; sub $f 's/ro \(\* k \(\. s bmax\)\)/ro (max 0 (- (* k (. s bmax)) 1))/' ;;
+    par-lost-job)     f=$d/../par.fib; cp $f $f.orig; sub $f 's/\(if \(>= i n\) out/(if (>= i (- n 1)) out/' ;;
+    par-max-output)   f=$d/pframedec.fib; cp $f $f.orig; sub $f 's/\(> \(\. h csize\) \(\. o max-output\)\) \(> \(\. h csize\)/false (> (. h csize)/' ;;
+    par-thread-dependent) f=$d/pframe.fib; cp $f $f.orig; sub $f 's/e \(enc-new \(\. o level\) \(\. o acceleration\) n\)/e (enc-new (. o level) (+ (. o acceleration) (if (= j 1) 1 0)) n)/' ;;
+    par-error-swallowed) f=$d/pframedec.fib; cp $f $f.orig; sub $f 's/\(Err e\) \(Ok nil\)\)\)/(Err e) (Ok (some (array 0 0i8))))))/' ;;
+    par-trap-kills)   f=$d/../par.fib; cp $f $f.orig; sub $f 's/\(Err \(internal \(str "a worker trapped: " \(\. e message\)\)\)\)/(trap "a worker trapped")/' ;;
+    par-checksum-skipped) f=$d/pframedec.fib; cp $f $f.orig; sub $f 's/\(and \(\. o verify\) \(\. h cchk\)\)/false/' ;;
     *) echo "mutant-lz4: unknown mutant $1" >&2; return 1 ;;
   esac
 }
@@ -55,7 +69,7 @@ for m in "${MUTANTS[@]}"; do
   t=$OUT/$m; rm -rf "$t"; mkdir -p "$t"; cp -r "$R/lib" "$t/lib"; mkdir -p "$t/specs"; cp "$R"/specs/compress-lz4-*.fib "$t/specs/"
   mutate "$m" "$t" || { echo "SETUP ERROR $m"; exit 2; }
   killed=""
-  for s in spec edge prop hostile; do
+  for s in spec edge prop safety xxh par hostile; do
     log=$t/$s.log
     (cd "$t" && FIB_LIB=$t/lib timeout 900 "$FIBC" test specs/compress-lz4-$s*.fib > "$log" 2>&1) && rc=0 || rc=$?
     if [ $rc -ne 0 ] || grep -qE '^  (FAIL|TRAP|ERROR)|scenarios: .* [1-9][0-9]* (fail|trap|timeout)' "$log"; then killed="$s: $(grep -m1 -E '^  (FAIL|TRAP|ERROR)|rejected|trap:' "$log" | cut -c1-110)"; break; fi
