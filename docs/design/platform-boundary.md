@@ -24,7 +24,7 @@ which 47 are plain system calls and 18 are pure functions that need no platform 
 | **processor count** | `sched_getaffinity` / `/sys` | `sysconf(_SC_NPROCESSORS_ONLN)` | pool size |
 | **fd I/O** | `read` `write` `close` `openat` `lseek` `dup` `dup2` `pipe2` `fcntl` `poll` `ioctl(TCGETS)` | the same names, `isatty` | `fib.os.io`, `println` (`write`), `rt/io.lir` (also `fopen` `fread` `fwrite` `fclose` `ferror` `ftell` `setbuf` `fmemopen`: the C stdio, which is a libc service, not a syscall) |
 | **files and directories** | `mkdir` `rmdir` `unlink` `rename` `readlink` `getcwd` `chdir` `getdents64` | the same, `opendir` `readdir` `closedir` `realpath` `mkdtemp` | `fib.os.files`, `fib.os.directories` |
-| **sockets** | `socket` `bind` `listen` `accept4` `connect` `send` `getsockopt` `setsockopt` `getsockname` | the same, `inet_pton` `inet_ntop` (pure) | `fib.os.net`; addresses are numeric (no resolver is called) |
+| **sockets** | `socket` `bind` `listen` `accept4` `connect` `send` `recv` `sendto` `recvfrom` `shutdown` `getsockopt` `setsockopt` `getsockname` | the same, `inet_pton` `inet_ntop` (pure) | `fib.os.net` (TCP, and UDP from HTTP-2); addresses are numeric: names are resolved by `fib.dns` above the platform layer, or by `getaddrinfo` only when asked (`:resolver :system`) |
 | **processes** | `clone` `execve` `wait4` `getpid` `getppid` `uname` `alarm` | `fork` `execvp` `waitpid` `getpid` `getppid` `uname` `alarm` `system` | `fib.os.process`, the compiler's link step |
 | **exit and trap** | `exit_group`, `tgkill`(SIGABRT) | `_exit`, `abort` | `trap` writes its message then `abort` (status 134) |
 | **environment, arguments** | the initial stack (`argv`, `envp`) | `getenv` `setenv` `unsetenv`, `main(argc, argv)` | `args`, `fib.os.environment` |

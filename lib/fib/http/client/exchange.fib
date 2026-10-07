@@ -27,6 +27,11 @@
         ((Err (Timeout _ _)) (if (and held (or (= total 0) (< (time/clock-now) total)))
                                (try-let [_ (t-write (. c t) body)] (recur false)) (Err (Timeout "io" "read timed out"))))
         ((Err e) (Err e))))))
+(defun reply-of :private (o: Options c: Conn method: str total: i64 got: (Pair ResponseHead bool)) -> (Result Reply Error)
+  (let [h (. got fst) unsent (. got snd)]
+    (try-let [mode (response-framing method (. h status) (. h headers))]
+      (Ok (Reply h (armed-body o c total (body-reader (. c r) mode (. o max-response-bytes) (. o max-header-bytes)))
+                 (and (not unsent) (response-reusable? (. h version) (. h headers) mode)))))))
 (defun exchange (o: Options c: Conn method: str target: str headers: (Map str (Vec str)) body: (Array i8) total: i64)
   -> (Result Reply Error)
   (let [head (request-head-bytes method target headers) hold (expects? headers body)]
@@ -34,7 +39,20 @@
       (try-let [_ (t-write (. c t) (if hold head (if (< (array-len body) 65536) (concat-bytes [head body]) head)))
                 _ (if (or hold (< (array-len body) 65536)) (Ok ()) (t-write (. c t) body))
                 got (final-head o c total body hold)]
-        (let [h (. got fst) unsent (. got snd)]
-          (try-let [mode (response-framing method (. h status) (. h headers))]
-            (Ok (Reply h (armed-body o c total (body-reader (. c r) mode (. o max-response-bytes) (. o max-header-bytes)))
-                       (and (not unsent) (response-reusable? (. h version) (. h headers) mode))))))))))
+        (reply-of o c method total got)))))
+;; A request body that is a producer, pulled until nil and never held whole: the head carries content-length when the length is known (the producer must deliver exactly that
+;; many bytes: a different count is a ProtocolError and the connection is closed by the caller) and transfer-encoding: chunked when it is not. The request deadline (not the read
+;; timeout) bounds the writes. There is no Expect: 100-continue, no replay on a stale connection and no redirect for such a request: the producer cannot be rewound.
+(defun send-pieces :private (c: Conn next: (fn () (Option (Array i8))) length: i64) -> (Result unit Error)
+  (loop [sent 0]
+    (match (next)
+      (nil (if (= sent length) (Ok ()) (Err (ProtocolError "the request body producer delivered fewer bytes than its declared length"))))
+      ((some piece) (if (> (+ sent (array-len piece)) length) (Err (ProtocolError "the request body producer delivered more bytes than its declared length"))
+                      (try-let [_ (if (= (array-len piece) 0) (Ok ()) (t-write (. c t) piece))] (recur (+ sent (array-len piece))))))))) 
+(defun exchange-upload (o: Options c: Conn method: str target: str headers: (Map str (Vec str)) next: (fn () (Option (Array i8))) length: (Option i64) total: i64)
+  -> (Result Reply Error)
+  (do (t-deadline (. c t) total)
+    (try-let [_ (t-write (. c t) (request-head-bytes method target headers))
+              _ (match length ((some n) (send-pieces c next n)) (nil (write-chunked (. c t) next {})))
+              got (final-head o c total (array 0 0i8) false)]
+      (reply-of o c method total got))))

@@ -1,0 +1,19 @@
+;; spec: docs/design/dns.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll fib.dns.config))
+(defun main () -> i64
+  (let [c (checks) empty (parse-resolv-conf "") full (parse-resolv-conf "nameserver 10.0.0.2 # x\nnameserver ::1\nsearch Corp.Example example.org\noptions ndots:2 timeout:3 attempts:4 rotate\n")
+        capped (parse-resolv-conf "options ndots:99 timeout:999 attempts:99\nnameserver 1.1.1.1\nnameserver 2.2.2.2\nnameserver 3.3.3.3\nnameserver 4.4.4.4\n")
+        hosts (parse-hosts "127.0.0.1 localhost\n10.1.2.3 Web.Example.COM web # c\nbad host1\n2001:db8::7 web\n")]
+    (do (check c (= (. empty servers) [(Server "127.0.0.1" 53)])) (check c (= (. empty ndots) 1)) (check c (= (. empty timeout-ms) 5000)) (check c (= (. empty attempts) 2))
+        (check c (= (. full servers) [(Server "10.0.0.2" 53) (Server "::1" 53)])) (check c (= (. full search) ["corp.example" "example.org"]))
+        (check c (= (. full ndots) 2)) (check c (= (. full timeout-ms) 3000)) (check c (= (. full attempts) 4))
+        (check c (= (count (. capped servers)) 3)) (check c (= (. capped ndots) 15)) (check c (= (. capped timeout-ms) 30000)) (check c (= (. capped attempts) 5))
+        (check c (= (hosts-lookup hosts "WEB.example.com." 0) ["10.1.2.3"])) (check c (= (hosts-lookup hosts "web" 0) ["10.1.2.3" "2001:db8::7"]))
+        (check c (= (hosts-lookup hosts "web" 6) ["2001:db8::7"])) (check c (= (hosts-lookup hosts "host1" 0) []))
+        (check c (= (. (load-resolv-conf "/nonexistent/resolv.conf") servers) [(Server "127.0.0.1" 53)])) (check c (= (count (load-hosts "/nonexistent/hosts")) 0))
+        (checks-result c))))

@@ -1,22 +1,22 @@
 ;; The listener and the accept loop: one acceptor task, one task per connection (at most workers at once), a graceful stop that stops accepting,
 ;; lets the requests in flight finish (up to drain-timeout-ms) and then cancels what is left. Tasks nobody joins end with the program (case 914).
-(ns fib.http.server.api (:use fib.core fib.seq fib.coll fib.http.types fib.http.transport fib.http.tcp fib.http.server.types fib.http.server.connection)
+(ns fib.http.server.api (:use fib.core fib.seq fib.coll fib.http.types fib.http.body fib.http.transport fib.http.tcp fib.http.server.types fib.http.server.connection)
   (:require [fib.os.net :as net] [fib.os.io :as io] [fib.os.errors :as os] [fib.os.time :as time] [fib.http.native :as n]))
 (defstruct Server (port: i64 stop: (fn () (Result unit Error)) wait: (fn () (Result unit Error))))
 (defstruct State :private (listener: (Cell i64) stopping: (Atom bool) abort: (Atom bool) active: (Atom i64) acceptor: (Task i64)
                            drain-ms: i64))
 (defun bump :private (a: (Atom i64) by: i64) -> unit (do (swap! a (fn (v: i64) (+ v by))) ()))
-(defun serve-task :private (fd: i64 peer: str handler: (fn :send (Request) Reply) o: Options stop: (Atom bool) abort: (Atom bool)
+(defun serve-task :private (fd: i64 peer: str handler: Handler o: Options stop: (Atom bool) abort: (Atom bool)
                             active: (Atom i64)) -> i64
   (let [t (socket-transport fd peer abort)]
-    (do (serve-connection t handler o stop) (t-close t) (bump active -1) 0)))
-(defun accept-one :private (fd: i64 handler: (fn :send (Request) Reply) o: Options stop: (Atom bool) abort: (Atom bool)
+    (do (serve-handler t handler o stop) (net/shutdown-write fd) (linger fd) (t-close t) (bump active -1) 0)))
+(defun accept-one :private (fd: i64 handler: Handler o: Options stop: (Atom bool) abort: (Atom bool)
                             active: (Atom i64)) -> bool
   (match (net/accept-tcp fd)
     ((Err e) (includes? (. e kind) [os/Interrupted os/WouldBlock os/ConnectionAborted]))
     ((Ok a) (do (bump active 1)
                 (spawn (fn () (serve-task (. a fd) (. a peer) handler o stop abort active))) true))))
-(defun acceptor :private (fd: i64 handler: (fn :send (Request) Reply) o: Options stop: (Atom bool) abort: (Atom bool) active: (Atom i64)) -> i64
+(defun acceptor :private (fd: i64 handler: Handler o: Options stop: (Atom bool) abort: (Atom bool) active: (Atom i64)) -> i64
   (loop []
     (cond @stop 0
           (>= @active (. o workers)) (do (time/sleep-ns 2000000) (recur))
@@ -24,7 +24,7 @@
             ((Err _) 1)
             ((Ok false) (recur))
             ((Ok true) (if (accept-one fd handler o stop abort active) (recur) 1))))))
-(defun run-server-reply (handler: (fn :send (Request) Reply) o: Options) -> (Result Server Error)
+(defun run-server-handler (handler: Handler o: Options) -> (Result Server Error)
   (if (not (valid-options? o)) (Err (InvalidRequest "invalid HTTP server options"))
     (match (net/listen-tcp (. o host) (. o port) (. o backlog))
       ((Err e) (Err (n/os-error e)))
@@ -32,6 +32,9 @@
                     task (spawn (fn () (acceptor fd handler actual stop abort active)))
                     st (State (cell fd) stop abort active task (. o drain-timeout-ms))]
         (Ok (Server (. l port) (fn () (stop-state st)) (fn () (join-acceptor st)))))))))
+(defun run-server-reply (handler: (fn :send (Request) Reply) o: Options) -> (Result Server Error) (run-server-handler (Buffered handler) o))
+;; A handler that takes the request body as a stream: see Handler in fib.http.server.types.
+(defun run-server-stream (handler: (fn :send (Request Body) Reply) o: Options) -> (Result Server Error) (run-server-handler (Streaming handler) o))
 (defun run-server (handler: (fn :send (Request) Response) o: Options) -> (Result Server Error)
   (run-server-reply (fn (r: Request) (Whole (handler r))) o))
 (defun port (server: Server) -> i64 (. server port))
@@ -42,11 +45,29 @@
     (do (loop [] (if (and (> @(. st active) 0) (< (time/clock-now) limit)) (do (time/sleep-ns 2000000) (recur)) ()))
         (reset! (. st abort) true)
         (loop [i 0] (if (and (> @(. st active) 0) (< i 500)) (do (time/sleep-ns 2000000) (recur (+ i 1))) ())))))
+(def refusal: str "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\nRetry-After: 1\r\n\r\n")
+;; read and drop what the peer sent, for up to 200 ms, so closing does not turn into a reset that destroys the answer in flight
+(defun linger :private (fd: i64) -> unit
+  (let [limit (+ (time/clock-now) 200000000)]
+    (loop []
+      (if (>= (time/clock-now) limit) ()
+        (match (net/ready? fd false 5)
+          ((Ok true) (match (io/read-fd fd 65536) ((Ok b) (if (= (array-len b) 0) () (recur))) ((Err _) ())))
+          (_ (recur)))))))
+(defun refuse-one :private (fd: i64) -> unit
+  (do (net/send-all fd (str-bytes refusal) 200 (atom false)) (net/shutdown-write fd) (linger fd) (io/close-fd fd) ()))
+;; Connections the kernel had queued and the acceptor never took, when the server stops: each gets a 503 with Connection: close and a clean end of stream (at most 256; the rest are reset).
+(defun refuse-queued :private (listener: i64) -> i64
+  (loop [n 0]
+    (if (>= n 256) n
+      (match (net/ready? listener false 0)
+        ((Ok true) (match (net/accept-tcp listener) ((Ok a) (do (refuse-one (. a fd)) (recur (+ n 1)))) ((Err _) n)))
+        (_ n)))))
 (defun stop-state :private (st: State) -> (Result unit Error)
   (let [fd @(. st listener)]
     (if (< fd 0) (Ok ())
       (do (reset! (. st stopping) true)
           (let [result (join-acceptor st)]
-            (do (drain st) (io/close-fd fd) (set! (. st listener) -1) result))))))
+            (do (drain st) (refuse-queued fd) (io/close-fd fd) (set! (. st listener) -1) result))))))
 (defun stop-server (server: Server) -> (Result unit Error) ((. server stop)))
 (defun wait-server (server: Server) -> (Result unit Error) ((. server wait)))

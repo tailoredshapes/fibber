@@ -1,0 +1,27 @@
+;; spec: docs/design/http.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll fib.http.types fib.http.testing fib.http.client.types)
+  (:require [fib.http.client :as c] [fib.http.server.types :as st]))
+(defun rev (b: (Array i8)) -> (Array i8) (let [n (array-len b) out (cell (array n 0i8))] (do (dotimes (i n) (array-set! &out i (array-get b (- (- n 1) i)))) @out)))
+(defun handler (r: Request) -> st/Reply
+  (st/Whole (cond (= (. r uri) "/two") (Response 200 {"content-encoding" ["x-rev, x-rev"] "content-length" ["5"]} (str-bytes "hello"))
+                  (= (. r uri) "/one") (Response 200 {"content-encoding" ["x-rev"]} (str-bytes "olleh"))
+                  (= (. r uri) "/mixed") (Response 200 {"content-encoding" ["x-rev, br"]} (str-bytes "olleh"))
+                  :else (Response 200 {} (str-bytes (. r uri))))))
+(defun fetch (o: Options url: str) -> (Result Response Error)
+  (match (c/build-http-client o) ((Err e) (Err e)) ((Ok cl) (let [r (c/request-with cl (ClientRequest "GET" url {} (array 0 0i8)))] (do (c/close-http-client cl) r)))))
+(defun body (r: (Result Response Error)) -> str (match r ((Ok x) (str-from-bytes (. x body))) ((Err _) "ERR")))
+(defun main () -> i64
+  (let [ch (checks) lf (loopback-factory handler (st/default-options))
+        o (with (with-factory (default-options) "http" lf) (decoders [(Decoder "x-rev" (fn (b: (Array i8) limit: i64) (if (> (array-len b) limit) (Err (LimitError "cap")) (Ok (rev b)))))]))]
+    (do (check ch (= (body (fetch o "http://h.test/one")) "hello"))
+        (check ch (= (body (fetch o "http://h.test/two")) "hello"))
+        (check ch (= (body (fetch o "http://h.test/mixed")) "olleh"))
+        (check ch (match (fetch o "http://h.test/two") ((Ok x) (and (not (some? (get-header x "content-encoding"))) (not (some? (get-header x "content-length"))))) (_ false)))
+        (check ch (match (fetch (with o (max-response-bytes 5)) "http://h.test/one") ((Ok x) (= (array-len (. x body)) 5)) (_ false)))
+        (checks-result ch))))
+(defun get-header (r: Response name: str) -> (Option (Vec str)) (get (. r headers) name))

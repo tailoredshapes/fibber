@@ -1,0 +1,39 @@
+;; Reading a response for the name that was asked: follow the CNAME chain from the question's name (at most 8 links, a name seen twice is a loop), keep only records that sit on that
+;; chain (records for other names in a response are ignored: they are never trusted into the answer), and take the smallest TTL used. No address of the type asked is NODATA; rcode 3 is
+;; NXDOMAIN. A negative answer's TTL is the smaller of the authority SOA's TTL and its minimum field (RFC 2308), 0 (not cacheable) when there is no SOA.
+(ns fib.dns.answer (:use fib.core fib.seq fib.coll fib.dns.types fib.dns.config fib.dns.exchange))
+(defstruct Answer (addrs: (Vec str) ttl: i64))
+(derive Eq Answer)
+(derive Debug Answer)
+(def max-chain: i64 8)
+(def max-addresses: i64 16)
+(defun negative-ttl (m: Message) -> i64
+  (reduce (fn (best: i64 r: Rr)
+            (match (. r data) ((RdSoa minimum) (if (= (. r rtype) type-soa) (max best (min (. r ttl) minimum)) best)) (_ best)))
+          0 (. m authority)))
+(defun owned-by :private (rrs: (Vec Rr) name: str) -> (Vec Rr) (vec (filter (fn (r: Rr) (= (lower (. r name)) name)) rrs)))
+(defun cname-of :private (rrs: (Vec Rr) name: str) -> (Option Rr)
+  (first (filter (fn (r: Rr) (and (= (. r rtype) type-cname) (match (. r data) ((RdCname _) true) (_ false)))) (owned-by rrs name))))
+(defun addr-of :private (r: Rr qtype: i64) -> (Option str)
+  (if (!= (. r rtype) qtype) nil
+    (match (. r data) ((RdA a) (some a)) ((RdAAAA a) (some a)) (_ nil))))
+(defun addresses-at :private (rrs: (Vec Rr) name: str qtype: i64) -> (Vec Rr)
+  (vec (filter (fn (r: Rr) (some? (addr-of r qtype))) (owned-by rrs name))))
+(defun target-of :private (r: Rr) -> str (match (. r data) ((RdCname t) (lower t)) (_ "")))
+(defun finish :private (rrs: (Vec Rr) qtype: i64 ttl: i64 m: Message) -> (Result Answer Fail)
+  (if (= (count rrs) 0) (Err (NoData (negative-ttl m)))
+    (Ok (Answer (vec (take max-addresses (map (fn (r: Rr) (unwrap-or (addr-of r qtype) "")) rrs)))
+                (reduce (fn (t: i64 r: Rr) (min t (. r ttl))) ttl rrs)))))
+(defun chain :private (m: Message qtype: i64) -> (Result Answer Fail)
+  (loop [cur (lower (. (nth (. m questions) 0) name)) hops 0 ttl 2147483647 seen: (Vec str) [cur]]
+    (match (cname-of (. m answers) cur)
+      (nil (finish (addresses-at (. m answers) cur qtype) qtype ttl m))
+      ((some r) (let [next (target-of r)]
+        (cond (>= hops max-chain) (Err (Temp "CNAME chain too long"))
+              (includes? next seen) (Err (Temp "CNAME loop"))
+              :else (recur next (+ hops 1) (min ttl (. r ttl)) (conj seen next))))))))
+;; m is a response that passed fib.dns.exchange/acceptable? for the question (name, qtype).
+(defun interpret (m: Message qtype: i64) -> (Result Answer Fail)
+  (cond (= (rcode m) rcode-nxdomain) (Err (NxDomain (negative-ttl m)))
+        (= (rcode m) rcode-ok) (chain m qtype)
+        :else (Err (Temp (str "server answered rcode " (rcode m))))))

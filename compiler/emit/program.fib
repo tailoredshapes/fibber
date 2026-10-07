@@ -10,7 +10,7 @@
 (ns emit.program
   (:require [fib.string :as s] [fib.unix :as unix] [emit.os :as os])
   (:use types.ty types.ast types.decls types.display types.init types.program own.program emit.value emit.layout emit.names
-        emit.mono emit.objects emit.statics emit.rt))
+        emit.mono emit.objects emit.statics emit.rt emit.kwdyn))
 
 ;; The work the queue hands out: a body, or a closure of an owner. Rust: program.rs:24 Work
 (defenum Work (WorkBody inst: Inst) (WorkClosure owner: Inst lit: i64 name: str))
@@ -206,8 +206,9 @@
 
 ;; Rust: program.rs:285 Program::render_keyword_helpers
 (defun program-render-keyword-helpers (p: Program) -> str
-  (if (not @(. p keyword-helpers))
-      ""
+  (cond (not @(. p keyword-helpers)) ""
+        (program-has-helper p "kw.dyn") (dyn-keyword-helpers (. p statics) (statics-keywords (. p statics)))
+        :else
       (let ((st (. p statics)) (names (statics-keywords (. p statics))) (n (count (statics-keywords (. p statics)))))
         ;; per keyword, in order, the `:k` text is interned and then the name: that numbers the `@str.N` of both
         (let ((pairs (mapv (fn (i: i64)

@@ -1,0 +1,38 @@
+;; A TTL-aware cache of resolved names with negative caching (RFC 2308), bounded in size. The clock is an argument (nanoseconds, fib.os.time/clock-now), so a spec drives time.
+;; An answer lives for the smallest TTL of the records it used, capped at max-ttl-s; a TTL of 0 is not cached. A negative answer (NXDOMAIN, NODATA) lives for the smaller of the SOA
+;; record's TTL and its minimum field, capped at max-negative-ttl-s, and is not cached when the response had no SOA. When the cache is full it drops what has expired, then the entry
+;; that expires first. The map is behind an Atom so a resolver value can be handed to a task; nothing is global (ADR 0013).
+(ns fib.dns.cache (:use fib.core fib.seq fib.coll))
+(def max-ttl-s: i64 86400)
+(def max-negative-ttl-s: i64 3600)
+(defstruct Entry (addrs: (Vec str) negative: str expires: i64))
+(derive Eq Entry)
+(derive Debug Entry)
+(defstruct Cache (entries: (Atom (Map str Entry)) max: i64))
+(defun new-cache (limit: i64) -> Cache (Cache (atom {}) (max 1 limit)))
+(defun cache-size (c: Cache) -> i64 (count @(. c entries)))
+(defun expired? :private (e: Entry now: i64) -> bool (<= (. e expires) now))
+(defun cache-get (c: Cache key: str now: i64) -> (Option Entry)
+  (match (get @(. c entries) key)
+    (nil nil)
+    ((some e) (if (expired? e now) (do (swap! (. c entries) (fn (m: (Map str Entry)) (dissoc m key))) nil) (some e)))))
+(defun live :private (m: (Map str Entry) now: i64) -> (Map str Entry)
+  (reduce (fn (out: (Map str Entry) k: str) (if (expired? (unwrap-or (get m k) (Entry [] "" 0)) now) (dissoc out k) out)) m (vec (keys m))))
+(defun soonest :private (m: (Map str Entry)) -> (Option str)
+  (reduce (fn (best: (Option str) k: str)
+            (match best (nil (some k)) ((some b) (if (< (. (unwrap-or (get m k) (Entry [] "" 0)) expires) (. (unwrap-or (get m b) (Entry [] "" 0)) expires)) (some k) best))))
+          nil (vec (keys m))))
+(defun make-room :private (m: (Map str Entry) max: i64 now: i64) -> (Map str Entry)
+  (if (< (count m) max) m
+    (let [fresh (live m now)]
+      (if (< (count fresh) max) fresh
+        (match (soonest fresh) (nil fresh) ((some k) (dissoc fresh k)))))))
+(defun clamp-ttl :private (ttl: i64 cap: i64) -> i64 (min ttl cap))
+(defun put-entry :private (c: Cache key: str addrs: (Vec str) negative: str ttl-s: i64 cap: i64 now: i64) -> bool
+  (let [ttl (clamp-ttl ttl-s cap)]
+    (if (<= ttl 0) false
+      (do (swap! (. c entries) (fn (m: (Map str Entry)) (assoc (make-room m (. c max) now) key (Entry addrs negative (+ now (* ttl 1000000000))))))
+          true))))
+(defun cache-put (c: Cache key: str addrs: (Vec str) ttl-s: i64 now: i64) -> bool (put-entry c key addrs "" ttl-s max-ttl-s now))
+;; kind is "nxdomain" or "nodata"
+(defun cache-put-negative (c: Cache key: str kind: str ttl-s: i64 now: i64) -> bool (put-entry c key [] kind ttl-s max-negative-ttl-s now))

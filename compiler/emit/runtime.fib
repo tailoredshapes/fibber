@@ -1336,9 +1336,38 @@
 (define internal (fib.utf8-valid i1) ((ptr p) (i64 n))
   (block entry (br loop))
   (block loop
-    (let ((i (phi i64 (entry (i64 0)) (adv inext))))
-      (br (icmp sge i n) ok head)))
+    (let ((i (phi i64 (entry (i64 0)) (adv inext) (wadv iw) (adv2 j2) (adv3 j3))))
+      (br (icmp sge i n) ok wide)))
+  ;; JSON-3: eight ASCII bytes at a time (a word with no byte of 0x80 or more is eight one-byte sequences); the common two- and three-byte sequences (C2..DF, E1..EC and EE..EF
+  ;; with their continuation bytes in 80..BF) inline; the step for everything else (E0, ED, F0..F4, and every error), which decides exactly as before.
+  (block wide
+    (br (icmp sle (add i (i64 8)) n) word head))
+  (block word
+    (let ((w (load i64 (getelementptr i8 p i)))
+          (iw (add i (i64 8))))
+      (br (icmp eq (and w (i64 -9187201950435737472)) (i64 0)) wadv head)))
+  (block wadv (br loop))
   (block head
+    (let ((b0 (zext i32 (load i8 (getelementptr i8 p i))))
+          (ia (add i (i64 1)))
+          (ib (add i (i64 2))))
+      (br (and (icmp uge b0 (i32 194)) (icmp ule b0 (i32 223))) two chk3)))
+  (block two
+    (br (icmp slt ia n) two2 slow))
+  (block two2
+    (let ((c1 (zext i32 (load i8 (getelementptr i8 p ia)))))
+      (br (icmp eq (and c1 (i32 192)) (i32 128)) adv2 slow)))
+  (block adv2 (let ((j2 (add i (i64 2)))) (br loop)))
+  (block chk3
+    (br (and (icmp uge b0 (i32 225)) (and (icmp ule b0 (i32 239)) (icmp ne b0 (i32 237)))) three slow))
+  (block three
+    (br (icmp slt ib n) three2 slow))
+  (block three2
+    (let ((d1 (zext i32 (load i8 (getelementptr i8 p ia))))
+          (d2 (zext i32 (load i8 (getelementptr i8 p ib)))))
+      (br (and (icmp eq (and d1 (i32 192)) (i32 128)) (icmp eq (and d2 (i32 192)) (i32 128))) adv3 slow)))
+  (block adv3 (let ((j3 (add i (i64 3)))) (br loop)))
+  (block slow
     (let ((k (call @fib.utf8-step p n i)))
       (br (icmp sgt k (i64 0)) adv bad)))
   (block adv (let ((inext (add i k))) (br loop)))
@@ -1422,6 +1451,67 @@
       (call @fib.trap-bytes buf (sext i64 len))
       (unreachable)))
   (block ok (ret n)))
+
+;; Keywords made at run time (`str->keyword`, LIBFIX-1, emit.kwdyn). The keywords of a program have ids 0 .. N-1 (its literals); one made from a string that is none
+;; of them takes the id N + i, i the index of its name in this table, which grows by doubling under a spinlock (fib.lock). The name is a copy, frozen (IMMORTAL and SHARED, never freed, and a trace-mode audit sees it freed, as it does a `freeze`), so
+;; the table owns it for good and a trace-mode audit counts no leak. Lookup is a walk: a program makes few keywords from strings, and the common
+;; one is a literal, found by emit.kwdyn's `kw.intern` before this is called.
+(global internal fib.kwd-lock i32 (i32 0))
+(global internal fib.kwd-names ptr (ptr null))
+(global internal fib.kwd-n i64 (i64 0))
+(global internal fib.kwd-cap i64 (i64 0))
+
+(define internal (fib.kwd-count i64) ()
+  (block entry (ret (atomic-load monotonic i64 @fib.kwd-n))))
+
+(define internal (fib.kwd-name ptr) ((i64 i))
+  (block entry
+    (call @fib.lock @fib.kwd-lock)
+    (let ((names (load ptr @fib.kwd-names))
+          (s (load ptr (getelementptr ptr names i))))
+      (call @fib.unlock @fib.kwd-lock)
+      (ret s))))
+
+(define internal (fib.kwd-intern i64) ((ptr s))
+  (block entry
+    (call @fib.lock @fib.kwd-lock)
+    (br scan))
+  (block scan
+    (let ((i (phi i64 (entry (i64 0)) (next i2)))
+          (n (load i64 @fib.kwd-n)))
+      (br (icmp slt i n) test add)))
+  (block test
+    (let ((names (load ptr @fib.kwd-names))
+          (t (load ptr (getelementptr ptr names i))))
+      (br (call @fib.str-eq t s) hit next)))
+  (block next
+    (let ((i2 (add i (i64 1))))
+      (br scan)))
+  (block hit
+    (call @fib.unlock @fib.kwd-lock)
+    (ret i))
+  (block add
+    (let ((cap (load i64 @fib.kwd-cap)))
+      (br (icmp sge n cap) grow put)))
+  (block grow
+    (let ((cap2 (select (icmp eq cap (i64 0)) (i64 64) (mul cap (i64 2))))
+          (nw (call @realloc (load ptr @fib.kwd-names) (mul cap2 (i64 8)))))
+      (br (icmp eq nw (ptr null)) oom grown)))
+  (block oom
+    (call @fib.fatal-c (string \"out of memory\"))
+    (unreachable))
+  (block grown
+    (store nw @fib.kwd-names)
+    (store cap2 @fib.kwd-cap)
+    (br put))
+  (block put
+    (let ((c (call @fib.str-copy s))
+          (names2 (load ptr @fib.kwd-names)))
+      (call @fib.freeze c)
+      (store c (getelementptr ptr names2 n))
+      (store (add n (i64 1)) @fib.kwd-n)
+      (call @fib.unlock @fib.kwd-lock)
+      (ret n))))
 ")
 
 ;; array.lir
@@ -1468,35 +1558,49 @@
       (call @memcpy dst src (mul m esize))
       (ret r))))
 
-;; `array-push!` (in-place-update.md §2): a copy of a with room for 32 elements
-;; (the vector tail's whole range), the elements not yet retained. ROOMY (flag
-;; bit 4, no reader of the flags tests it: they mask bits 0-3) says the block holds
-;; 32 elements, len of them used, so a unique ROOMY array grows in place. A length
-;; of 32 or more gets exactly one more element and no flag.
+;; `array-push!` (in-place-update.md §2): a copy of a with room to grow, the elements not yet retained. The capacity of a
+;; ROOMY block (flag bit 4, no reader of the flags tests it: they mask bits 0-3) is not stored; it is a function of the
+;; length: the smallest power of two that is at least max(len, 32) (`fib.array-cap`). So a unique ROOMY array grows in
+;; place while len is below 32, or is not a power of two; at a power of two the next push copies into a block of twice the
+;; room (amortised constant time per push, LIBFIX-1: an array of 32 or more elements used to get exactly one more element
+;; per copy, so a loop of pushes was quadratic). A pop only shortens len, so the block always has at least that capacity.
+(define internal (fib.array-cap i64) ((i64 n))
+  (block entry (br loop))
+  (block loop
+    (let ((c (phi i64 (entry (i64 32)) (step c1))))
+      (br (icmp ult c n) step done)))
+  (block step
+    (let ((c1 (shl c (i64 1))))
+      (br loop)))
+  (block done (ret c)))
+
 (define internal (fib.array-room ptr) ((ptr a) (i32 tid) (i64 esize))
   (block entry
     (let ((n (call @fib.array-len a))
-          (small (icmp slt n (i64 32)))
-          (cap (select small (i64 32) (add n (i64 1))))
+          (cap (call @fib.array-cap (add n (i64 1))))
           (r (call @fib.alloc (add (i64 24) (mul cap esize)) tid))
           (src (getelementptr %struct.fib.array.i8 a (i32 0) (i32 4) (i64 0)))
-          (dst (getelementptr %struct.fib.array.i8 r (i32 0) (i32 4) (i64 0))))
+          (dst (getelementptr %struct.fib.array.i8 r (i32 0) (i32 4) (i64 0)))
+          (fp (getelementptr %struct.fib.hdr r (i32 0) (i32 2))))
       (store n (getelementptr %struct.fib.array.i8 r (i32 0) (i32 3)))
       (call @memcpy dst src (mul n esize))
-      (br small roomy done)))
-  (block roomy
-    (let ((fp (getelementptr %struct.fib.hdr r (i32 0) (i32 2))))
       (store (or (load i32 fp) (i32 16)) fp)
-      (br done)))
-  (block done (ret r)))
+      (ret r))))
 
-;; True when a is unique and ROOMY with a free slot: array-push! writes it in place.
+;; True when a is unique and ROOMY with a free slot: array-push! writes it in place. Below 32 there is always room; from 32 on
+;; the capacity is the power of two at or above len, so there is room unless len is a power of two.
 (define internal (fib.array-roomy? i1) ((ptr a))
   (block entry
     (br (call @fib.unique? a) test no))
   (block test
     (br (icmp ne (and (call @fib.flags a) (i32 16)) (i32 0)) full no))
-  (block full (ret (icmp slt (call @fib.array-len a) (i64 32))))
+  (block full
+    (let ((n (call @fib.array-len a)))
+      (br (icmp slt n (i64 32)) yes big)))
+  (block big
+    (let ((m (and n (sub n (i64 1)))))
+      (ret (icmp ne m (i64 0)))))
+  (block yes (ret (i1 1)))
   (block no (ret (i1 0))))
 ")
 

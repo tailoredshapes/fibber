@@ -171,11 +171,14 @@
     (_ (Err (str-join [what " on a non-struct"])))))
 
 ;; `(. x f)`: a field load, no count operation (§6.2). Rust: lower/objects.rs:127 LowerCx::field_of
-(defun lcx-field-of (cx: LowerCx x: Expr name: str) -> (Result V str)
+(defun lcx-field-of (cx: LowerCx e: Expr x: Expr name: str) -> (Result V str)
   (try-let ((v (lcx-value cx x)) (t (lcx-ty cx x)) (at (field-at cx t "field access" name)) (obj (program-object (. cx p) t))
             (l (program-lir (. cx p) (nth (. at tys) (. at index)))))
     (Ok (match l
-          ((some lt) (lcx-load cx lt (lcx-gep cx (. obj snd) (v-text v) (. at slot))))
+          ((some lt)
+           (let [r (lcx-load cx lt (lcx-gep cx (. obj snd) (v-text v) (. at slot)))]
+             (do (set! (. cx origins) (assoc @(. cx origins) (field-origin-key e) (Origin v (. obj snd) (. at slot))))
+                 r)))
           (nil VUnit)))))
 
 ;; The lIR types of a closure's capture slots. Rust: lower/objects.rs:160 LowerCx::capture_tys

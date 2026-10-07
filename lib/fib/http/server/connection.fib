@@ -17,15 +17,15 @@
           (and (= (count values) 1) (= (ascii-lower (nth values 0)) "100-continue"))
           (match mode ((NoBody) (Ok ())) (_ (t-write t (str-bytes "HTTP/1.1 100 Continue\r\n\r\n"))))
           :else (Err (ProtocolError "unsupported HTTP expectation")))))
-(defun read-request :private (t: Transport r: Reader head: RequestHead o: Options peer: str) -> (Result Request Error)
+(defun read-request :private (t: Transport r: Reader head: RequestHead o: Options peer: str streaming: bool) -> (Result (Pair Request Body) Error)
   (try-let [_ (if (and (= (. head version) "HTTP/1.0") (some? (header (. head headers) "transfer-encoding")))
                   (Err (ProtocolError "HTTP/1.0 request cannot use Transfer-Encoding")) (Ok ()))
             mode (request-framing (. head headers) (. o max-body-bytes))
             _ (acknowledge t head mode)
             _ (Ok (t-deadline t (+ (time/clock-now) (ms (. o request-timeout-ms)))))
             bd (Ok (body-reader r mode (. o max-body-bytes) (. o max-header-bytes)))
-            b (read-all bd (. o max-body-bytes))]
-    (Ok (Request (. head request-method) (. head uri) (. head query-string) (. head headers) b (trailers bd) (. head version) peer (. o port)))))
+            b (if streaming (Ok (array 0 0i8)) (read-all bd (. o max-body-bytes)))]
+    (Ok (Pair (Request (. head request-method) (. head uri) (. head query-string) (. head headers) b (if streaming {} (trailers bd)) (. head version) peer (. o port)) bd))))
 (defun failure-status :private (error: Error) -> i64
   (match error
     ((LimitError s) (if (or (some? (str-find s "header" 0)) (some? (str-find s "line" 0))) 431 413))
@@ -39,16 +39,25 @@
 (defun keep? :private (head: RequestHead reply: Reply number: i64 o: Options stop: (Atom bool)) -> bool
   (and (keep-alive? head) (< number (. o max-requests-per-connection)) (not @stop)
        (match reply ((Whole r) (not (header-token? (. r headers) "connection" "close"))) (_ true))))
-(defun handle-one :private (t: Transport r: Reader text: str handler: (fn :send (Request) Reply) o: Options peer: str
+(defun run-handler :private (h: Handler req: (Pair Request Body)) -> Reply
+  (match h ((Buffered f) (f (. req fst))) ((Streaming f) (f (. req fst) (. req snd)))))
+;; what the handler left unread of a streamed body is read and dropped; false when that failed (the connection is then not reusable)
+(defun settle-body :private (h: Handler body: Body) -> bool
+  (match h
+    ((Buffered _) true)
+    ((Streaming _) (loop [] (if (finished? body) true (match (next-chunk body) ((Err _) false) ((Ok b) (if (= (array-len b) 0) true (recur)))))))))
+(defun handle-one :private (t: Transport r: Reader text: str handler: Handler o: Options peer: str
                             stop: (Atom bool) number: i64) -> (Result bool Error)
-  (try-let [head (parse-request-head text (. o max-header-bytes) (. o max-headers)) request (read-request t r head o peer)]
-    (let [reply (handler request) keep (keep? head reply number o stop)]
+  (try-let [head (parse-request-head text (. o max-header-bytes) (. o max-headers))
+            request (read-request t r head o peer (match handler ((Streaming _) true) (_ false)))]
+    (let [reply (run-handler handler request) settled (settle-body handler (. request snd)) keep (and settled (keep? head reply number o stop))]
       (do (t-deadline t (+ (time/clock-now) (ms (. o request-timeout-ms))))
           (try-let [_ (send-reply t reply (. head request-method) keep (. head version))] (Ok keep))))))
 (defun head-of :private (t: Transport r: Reader o: Options) -> (Result (Option str) Error)
   (do (t-deadline t (+ (time/clock-now) (ms (min (. o header-timeout-ms) (. o request-timeout-ms)))))
       (read-head r (. o max-header-bytes) (. o max-line-bytes) (+ (. o max-headers) 1))))
-(defun serve-connection (t: Transport handler: (fn :send (Request) Reply) o: Options stop: (Atom bool)) -> unit
+(defun serve-connection (t: Transport handler: (fn :send (Request) Reply) o: Options stop: (Atom bool)) -> unit (serve-handler t (Buffered handler) o stop))
+(defun serve-handler (t: Transport handler: Handler o: Options stop: (Atom bool)) -> unit
   (let [r (reader t)]
     (loop [number 1]
       (match (await-request t r o stop)

@@ -31,6 +31,9 @@ fibc build FILE.fib -o OUT [-O N] [-L DIR].. [-l LIB]..
                                ; an executable (lair's AOT), linked against the libraries
 fibc emit  FILE.fib            ; print the lIR module
 fibc explain FILE.fib          ; the plan, as `fibref explain` prints it (types §9)
+fibc check MODULE..           ; every definition of the modules (and of those they use) type- and ownership-checked, called or not; run, build and emit check
+                              ; a library definition only when the program reaches it. Exit 0, 3 a rejection (each failing module named), 2 a module not found.
+                              ; compiler/tests/driver/check-lib.sh checks all of lib/fib/** this way and plants the faults it must reject (LIBFIX-1)
 fibc cases [DIR]               ; the rule-6 harness (§5); default cases/ownership
 fibc test [PATH..] [options]   ; fib.test specs (compiler/driver/test.fib, docs/design/test-harness.md §6); exit 0 held, 1 failed, 2 usage/compile/nothing to run
 ```
@@ -98,11 +101,11 @@ once the library is moved, and the link failing without the flags) and by
 `crates/lair/tests/link.rs` (the same on `Options`).
 
 **Library roots** (**Proposed**, stdlib design §7 E7; the rule is syntax §5).
-Every command that reads a program (`run`, `build`, `emit`, `explain`,
+Every command that reads a program (`run`, `build`, `emit`, `explain`, `check`, `test`,
 `itrace`; `fibref run` and `fibref explain` likewise) takes `-I DIR` (or
 `-IDIR`), repeatable and anywhere before a `--`, and reads the environment
 variable `FIB_LIB` (directories separated as `PATH`'s are; an empty entry
-is skipped). A module `a.b` is looked for at `a/b.fib` in the main file's
+is skipped); a `-I DIR` that holds a `prelude.fib` is also the library directory when `FIB_LIB` is unset (`fibc test -I /path/to/lib specs` from any directory; LIBFIX-1). A module `a.b` is looked for at `a/b.fib` in the main file's
 directory, then in each `-I DIR` in the order given, then in each directory
 of `FIB_LIB` in order, then in the library the executable carries: the
 `.fib` files of the repository's `lib/` other than `lib/prelude.fib`,

@@ -1,0 +1,27 @@
+;; spec:   spec/types.md §6.3 "Field moves"; compiler/own/walk/state.fib `w-steal-field?`, `w-want-own-field`
+;; expect: accept
+;; result: 2001
+;; audit:  clean
+;; The field move takes the field out of a shell the frame OWNS. A parameter that stays borrowed (a method's: rule 4 makes only the `defun`s' owned; a `defun`'s declared `:borrow`) is the
+;; caller's: its last use in the callee is not the last use of the caller's count, so a field read there is retained as before and the caller's struct keeps its array. Here `main` keeps `p` and
+;; reads its array after each call; a callee that stole from the shell (the shell is unique: the caller holds the only count) would leave `p` with a null array, and `(array-get (. p buf) 0)` would
+;; read through it. 1000 + 1000 for the two copies the callees wrote, and 1 for the first element of `p`'s own array, untouched.
+(defstruct P (buf: (Array i64) n: i64))
+
+(defprotocol Bumper (bump (self) -> (Array i64)))
+(impl Bumper P
+  (bump (self)
+    (let [c (cell (. self buf))]
+      (do (array-set! &c 0 1000) @c))))
+
+(defun bump2 (p: P :borrow) -> (Array i64)
+  (let [c (cell (. p buf))]
+    (do (array-set! &c 0 1000) @c)))
+
+(defun mk () -> P (P (array 4 1) 4))   ; a call's result: a heap object (a struct built in `main` itself would be a stack object, which is never unique)
+
+(defun main () -> i64
+  (let [p (mk)
+        a (bump p)
+        b (bump2 p)]
+    (+ (array-get a 0) (+ (array-get b 0) (array-get (. p buf) 0)))))

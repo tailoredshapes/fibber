@@ -15,6 +15,13 @@
 (def MAG-MASK: i64 2147483647)
 (def MAG-BASE: i64 2147483648)
 
+;; Raw limb access for the hot loops (the same discipline as fib.tensor's kernels): the data of an `(Array i64)` starts 24 bytes after its header
+;; (spec/types.md 8.2); a read is of an array that is held, a write is of an array that the caller has just made and holds alone, so no check can fail and
+;; no unique-write test is needed. The sums and products are below 2^63 by the limb size (limbs < 2^31, carries < 2^32), so the unchecked forms agree with the checked ones.
+(defun limbs (a: (Array i64)) -> ptr (unsafe (ptr+ (raw a) 24)))
+(defun limb-at (p: ptr i: i64) -> i64 (unsafe (load-i64 (ptr+ p (unchecked-multiply 8 i)))))
+(defun limb-put! (p: ptr i: i64 x: i64) -> unit (unsafe (store-i64 (ptr+ p (unchecked-multiply 8 i)) x)))
+
 (defun mag-empty () -> (Array i64) (array 0 0))
 (defun mag-zero? (a: (Array i64)) -> bool (= (array-len a) 0))
 
@@ -58,41 +65,41 @@
       (mag-add b a)
       (let [la (array-len a) lb (array-len b)
             c (cell (array (+ la 1) 0))
-            carry (loop [i 0 carry 0]
-                    (if (< i la)
-                        (let [t (+ (+ (array-get a i) (if (< i lb) (array-get b i) 0)) carry)]
-                          (do (array-set! &c i (bit-and t MAG-MASK))
-                              (recur (+ i 1) (shr t 31))))
-                        carry))]
+            carry (let [ap (limbs a) bp (limbs b) cp (limbs @c)]
+                    (loop [i 0 carry 0]
+                      (if (< i la)
+                          (let [t (unchecked-add (unchecked-add (limb-at ap i) (if (< i lb) (limb-at bp i) 0)) carry)]
+                            (do (limb-put! cp i (bit-and t MAG-MASK))
+                                (recur (+ i 1) (shr t 31))))
+                          carry)))]
       (do (array-set! &c la carry) (do (mag-trim! &c) @c)))))
 
-;; a - b, for a >= b
 (defun mag-sub (a: (Array i64) b: (Array i64)) -> (Array i64)
   (let [la (array-len a) lb (array-len b)
         c (cell (array la 0))]
-    (do (loop [i 0 borrow 0]
-          (if (< i la)
-              (let [t (- (- (array-get a i) (if (< i lb) (array-get b i) 0)) borrow)]
-                (do (array-set! &c i (bit-and t MAG-MASK))
-                    (recur (+ i 1) (shr t 63))))
-              ()))
+    (do (let [ap (limbs a) bp (limbs b) cp (limbs @c)]
+          (loop [i 0 borrow 0]
+            (if (< i la)
+                (let [t (unchecked-subtract (unchecked-subtract (limb-at ap i) (if (< i lb) (limb-at bp i) 0)) borrow)]
+                  (do (limb-put! cp i (bit-and t MAG-MASK))
+                      (recur (+ i 1) (shr t 63))))
+                ())))
         (do (mag-trim! &c) @c))))
 
-;; a * m for 0 <= m < 2^31
 (defun mag-mul-small (a: (Array i64) m: i64) -> (Array i64)
   (if (= m 0)
       (mag-empty)
       (let [n (array-len a)
             c (cell (array (+ n 1) 0))
-            carry (loop [i 0 carry 0]
-                    (if (< i n)
-                        (let [t (+ (* (array-get a i) m) carry)]
-                          (do (array-set! &c i (bit-and t MAG-MASK))
-                              (recur (+ i 1) (shr t 31))))
-                        carry))]
+            carry (let [ap (limbs a) cp (limbs @c)]
+                    (loop [i 0 carry 0]
+                      (if (< i n)
+                          (let [t (unchecked-add (unchecked-multiply (limb-at ap i) m) carry)]
+                            (do (limb-put! cp i (bit-and t MAG-MASK))
+                                (recur (+ i 1) (shr t 31))))
+                          carry)))]
         (do (array-set! &c n carry) (do (mag-trim! &c) @c)))))
 
-;; a + m for 0 <= m < 2^31
 (defun mag-add-small (a: (Array i64) m: i64) -> (Array i64)
   (let [n (array-len a)
         c (cell (array (+ n 1) 0))
@@ -139,15 +146,15 @@
 (defun mag-shl-limbs (a: (Array i64) s: i64 len: i64) -> (Array i64)
   (let [n (array-len a)
         c (cell (array len 0))
-        carry (loop [i 0 carry 0]
-                (if (< i n)
-                    (let [x (array-get a i)]
-                      (do (array-set! &c i (bit-or (bit-and (shl x s) MAG-MASK) carry))
-                          (recur (+ i 1) (shr x (- 31 s)))))
-                    carry))]
+        carry (let [ap (limbs a) cp (limbs @c)]
+                (loop [i 0 carry 0]
+                  (if (< i n)
+                      (let [x (limb-at ap i)]
+                        (do (limb-put! cp i (bit-or (bit-and (shl x s) MAG-MASK) carry))
+                            (recur (+ i 1) (shr x (- 31 s)))))
+                      carry)))]
     (do (if (< n len) (array-set! &c n carry) ()) @c)))
 
-;; a * 2^k, k >= 0
 (defun mag-shl (a: (Array i64) k: i64) -> (Array i64)
   (if (mag-zero? a)
       a

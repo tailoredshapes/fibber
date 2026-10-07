@@ -28,6 +28,7 @@
     ((a/CmdEmit file) (c/cmd-emit file rts rm))
     ((a/CmdEmitDump opts files) (c/cmd-emit-dump files opts rts rm))
     ((a/CmdExplain file) (c/cmd-explain file rts rm))
+    ((a/CmdCheck mods) (c/cmd-check mods rts rm))
     ((a/CmdLsp) (lsp/lsp-main rts))
     ((a/CmdCases dir only jobs) (hn/cmd-cases dir only jobs))
     ((a/CmdTest words) (dt/cmd-test words dirs))
@@ -75,7 +76,16 @@
     ((a/CmdBuild _ _ _ _ _ _) (pm/project-dirs pf false))
     ((a/CmdEmit _) (pm/project-dirs pf false))
     ((a/CmdExplain _) (pm/project-dirs pf false))
+    ((a/CmdCheck _) (pm/project-dirs pf false))
     (_ (Ok []))))
+
+;; A `-I DIR` that holds a `prelude.fib` is the library too, as FIB_LIB names it (expand.libdir), unless FIB_LIB is set: `fibc test -I /path/to/lib specs` from any
+;; directory (the children of `test` inherit the variable). LIBFIX-1; compiler/tests/driver/test-cmd.sh.
+(defun adopt-library :private (dirs: (Vec str)) -> unit
+  (when (nil? (native/getenv-opt "FIB_LIB"))
+    (if-some [d (first (filter (fn (d: str) (some? (read-file (str-concat d "/prelude.fib")))) dirs))]
+      (native/setenv-set "FIB_LIB" d)
+      ())))
 
 (defun main () -> i64
   (let ((_ (native/ignore-sigpipe))
@@ -88,5 +98,5 @@
         (match (project-dirs cmd (. pt flags))
           ((Err m) (do (eprintln (str "fibc: " m)) 2))
           ((Ok extra)
-           (let ((dirs (into (. split dirs) extra)))
+           (let ((dirs (into (. split dirs) extra)) (_ (adopt-library (. split dirs))))
              (dispatch cmd (roots/roots-from-env dirs (native/getenv-opt "FIB_LIB")) (mr/maker-for (. nr no-runner)) dirs (. pt flags))))))))

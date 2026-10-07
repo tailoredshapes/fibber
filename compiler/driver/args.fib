@@ -11,7 +11,7 @@
 (def usage: str
   "usage: fibc <command>
 
-Every command that reads a program (run, build, emit, emit-dump, explain, lsp) takes
+Every command that reads a program (run, build, emit, emit-dump, explain, check, lsp) takes
 -I dir (or -Idir), any number of times, anywhere before --: a module is found
 beside the file, then under each -I dir in order, then under each directory of
 $FIB_LIB, then in the library directory `lib` (spec/syntax.md §5).
@@ -41,6 +41,10 @@ build defaults to 2, run to 0.
                          the layout of its types, or one macro module (spec/bootstrap.md
                          section 8); exit 0, 1 a record, 2 unreadable, 3 unsupported
   explain <file>         print the ownership checker's decisions (types §9)
+  check <module>..       load the modules and type-check and ownership-check EVERY definition of
+                         them and of the modules they use, called or not (run, build and emit check
+                         a library definition only when the program reaches it); exit 0 all
+                         checked, 3 one was rejected (each failing module named), 2 not loadable
   lsp                    serve the language server (LSP over standard input and
                          output: completion, hover, diagnostics, definition,
                          document symbols); takes -I; exit 0 after shutdown, 1 without
@@ -89,6 +93,7 @@ itrace and gen are commands of the Rust compiler (the test harness).")
   (CmdEmit file: str)
   (CmdEmitDump opts: EmitOptions files: (Vec str))
   (CmdExplain file: str)
+  (CmdCheck modules: (Vec str))
   (CmdHarness word: str)
   (CmdCases dir: str only: (Vec str) jobs: i64)
   (CmdTest words: (Vec str))
@@ -106,6 +111,7 @@ itrace and gen are commands of the Rust compiler (the test harness).")
     ((CmdEmit _) true)
     ((CmdEmitDump _ _) true)
     ((CmdExplain _) true)
+    ((CmdCheck _) true)
     ((CmdLsp) true)
     ((CmdTest _) true)
     ((CmdHarness w) (= w "itrace"))
@@ -238,6 +244,7 @@ itrace and gen are commands of the Rust compiler (the test harness).")
                                  (nil CmdInvalid)
                                  ((some p) (CmdEmitDump (. p opts) (. p files))))
           (and (= head "explain") (= n 2)) (CmdExplain (nth words 1))
+          (and (= head "check") (>= n 2)) (CmdCheck (vec (drop 1 words)))
           (and (= head "lsp") (= n 1)) CmdLsp
           (and (= head "targets") (= n 1)) CmdTargets
           (and (= head "itrace") (= n 2)) (CmdHarness head)

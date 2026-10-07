@@ -95,3 +95,27 @@
   (do (println tt/ROW-HEADER)
       (doseq [r (tt/target-rows)] (println (tt/row-line r)))
       0))
+
+;; `check MODULE..` (LIBFIX-1): `run`, `build` and `emit` check a library definition only when the program reaches it (types.infer.demand), so a type error in a
+;; function nobody calls waits for its first caller. This is the full check, as `explain`'s and `emit-dump`'s: a program of one `main` that requires each module
+;; (found beside the working directory, under -I, FIB_LIB and `lib`), every unit of every module it loads inferred and ownership-checked. All the modules go in one
+;; program; when it is rejected each is checked alone, so that every failing module is named (with its first error), not only the first the checker met.
+(defun check-source :private (mods: (Vec str)) -> str
+  (str-join ["(ns main (:require " (str-join (mapv (fn (i: i64) (str-join ["[" (nth mods i) " :as m" (str i) "]"])) (range (count mods)))) "))\n(defun main () -> i64 0)\n"]))
+
+(defun check-verdict :private (mods: (Vec str) roots: Roots rm: mk/RunnerMaker) -> (Result unit (Pair i64 str))
+  (match (front/front-check (check-source mods) "<check>" roots rm false)
+    ((front/FrontChecked _) (Ok ()))
+    ((front/FrontRejected m) (Err (Pair front/exit-rejected m)))
+    ((front/FrontFailed m) (Err (Pair front/exit-compile-failed m)))
+    ((front/FrontPending r) (Err (Pair front/exit-pending r)))))
+
+(defun cmd-check (mods: (Vec str) roots: Roots rm: mk/RunnerMaker) -> i64
+  (match (check-verdict mods roots rm)
+    ((Ok _) (do (println (str-join ["checked " (str (count mods)) " module(s) in full"])) 0))
+    ((Err e)
+     (if (= (count mods) 1)
+         (do (eprintln (str-concat "rejected:\n" (. e snd))) (. e fst))
+         (let ((bad (filter (fn (m: str) (match (check-verdict [m] roots rm) ((Ok _) false) ((Err _) true))) mods)))
+           (do (doseq [m bad] (eprintln (str-join ["FAIL " m ": " (match (check-verdict [m] roots rm) ((Err x) (. x snd)) ((Ok _) "")) ])))
+               (if (empty? bad) (do (eprintln (str-concat "rejected:\n" (. e snd))) (. e fst)) (. e fst))))))))

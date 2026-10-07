@@ -6,8 +6,9 @@
 ;; The index holds, in ascending order: every unescaped quote (an even count of them per string: the opening one, then the closing one), every structural character
 ;; `{ } [ ] : ,` outside a string, and the first byte of every other token outside a string (a number or `true`, `false`, `null`: a run of bytes that are none of
 ;; whitespace, structural or a quote). `flags` (an OR of f-control, f-unterminated) says what stage 1 saw that stage 2 must act on: a control byte inside a
-;; string, a string still open at the end. The index lives in malloc'ed memory (a malloc'ed buffer,
-;; not an array: no zero-fill, and `realloc` grows it): the caller frees it with `sidx-free`.
+;; string, a string still open at the end. The index lives in an `(Array f64)` made by `array-uninit-f64` (no zero fill; JSON-3: an
+;; array, so that its block comes from and goes back to the runtime's large-block cache, docs/design/allocator.md: a malloc'ed 2 MB index was a fresh mmap, page faults and
+;; an munmap on every document) used as 8-byte words; it is freed when the Sidx is dropped, `sidx-free` is kept for the callers and does nothing.
 ;;   (structural-index s) -> Sidx
 (ns fib.json.stage1 (:use fib.core fib.seq fib.coll) (:require [fib.json.libc :as libc]))
 
@@ -15,10 +16,12 @@
 (def f-control: i64 1)
 (def f-unterminated: i64 2)
 
-(defstruct Sidx (p: ptr count: i64 flags: i64 closing: i64))
+(defstruct Sidx (a: (Array f64) count: i64 flags: i64 closing: i64))
 
-(defun sidx-free (x: Sidx) -> unit (unsafe (free (. x p))))
-(defun sidx-at (x: Sidx k: i64) -> i64 (unsafe (load-i64 (ptr+ (. x p) (* 8 k)))))
+(defun sidx-free (x: Sidx) -> unit ())
+(defun sidx-at (x: Sidx k: i64) -> i64 (unsafe (load-i64 (ptr+ (raw (. x a)) (+ 24 (* 8 k))))))
+
+(defun words (a: (Array f64)) -> ptr (unsafe (ptr+ (raw a) 24)))
 
 (defun cmp-eq (v: (Simd i8 64) c: i8) -> (Simd bool 64) (simd/eq v (splat (Simd i8 64) c)))
 (defun mask-eq (v: (Simd i8 64) c: i8) -> i64 (simd/movemask (cmp-eq v c)))
@@ -83,16 +86,18 @@
 
 (defun load-block (p: ptr i: i64) -> (Simd i8 64) (unsafe (load-simd (ptr+ p i))))
 
-(defun grow (o: ptr cap: i64) -> ptr (unsafe (libc/realloc o (* 8 (* cap 2)))))
+(defun grow (o: (Array f64) k: i64 cap: i64) -> (Array f64)
+  (let [nb (unsafe (array-uninit-f64 (* cap 2)))]
+    (do (unsafe (libc/memcpy (ptr+ (raw nb) 24) (ptr+ (raw o) 24) (* 8 k))) nb)))
 
 ;; The state carried from block to block: the escape carry (0/1), the in-string state (0 or -1), the last bit of the token-byte mask (0/1), the flags.
 (defun index-text (p: ptr n: i64 pad: ptr) -> Sidx
   (let [cap0 (+ 256 (quot n 8))]
-    (loop [i 0 k 0 o (unsafe (alloc (* 8 cap0))) cap cap0 carry 0 instr 0 prevt 0 flags 0 nq 0]
+    (loop [i 0 k 0 o (unsafe (array-uninit-f64 cap0)) cap cap0 carry 0 instr 0 prevt 0 flags 0 nq 0]
       (if (>= i n)
           (Sidx o k (if (= instr 0) flags (bit-or flags f-unterminated)) nq)
           (if (> (+ k 96) cap)
-              (recur i k (grow o cap) (* cap 2) carry instr prevt flags nq)
+              (recur i k (grow o k cap) (* cap 2) carry instr prevt flags nq)
               (let [v (if (<= (+ i 64) n) (load-block p i) (load-block pad 0))
                     q (mask-eq v 34i8)
                     bs (mask-eq v 92i8)
@@ -105,7 +110,7 @@
                     starts (bit-and tok (bit-not (bit-or (shl tok 1) prevt)))
                     m (bit-or (bit-or (bit-and ops (bit-not inq)) quote) starts)
                     fl (bit-or flags (if (= (bit-and (ctl-mask v) inq) 0) 0 f-control))]
-                (recur (+ i 64) (flatten o k m i) o cap (esc-carry bs carry) (sar inq 63) (shr tok 63) fl (unchecked-add nq (popcount (bit-and quote (bit-not inq)))))))))))
+                (recur (+ i 64) (flatten (words o) k m i) o cap (esc-carry bs carry) (sar inq 63) (shr tok 63) fl (unchecked-add nq (popcount (bit-and quote (bit-not inq)))))))))))
 
 (defun structural-index (s: str) -> Sidx
   (let [n (str-len s)

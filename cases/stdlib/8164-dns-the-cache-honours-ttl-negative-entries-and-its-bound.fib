@@ -1,0 +1,19 @@
+;; spec: docs/design/dns.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll fib.dns.cache))
+(def sec: i64 1000000000)
+(defun has? (c: Cache key: str now: i64) -> bool (some? (cache-get c key now)))
+(defun main () -> i64
+  (let [ch (checks) c (new-cache 3)]
+    (do (check ch (cache-put c "a|1" ["1.1.1.1"] 10 (* 100 sec)))
+        (check ch (has? c "a|1" (+ (* 110 sec) -1))) (check ch (not (has? c "a|1" (* 110 sec))))
+        (check ch (not (cache-put c "z|1" ["1.1.1.1"] 0 0)))
+        (check ch (cache-put-negative c "n|1" "nxdomain" 30 0)) (check ch (match (cache-get c "n|1" (* 29 sec)) ((some e) (= (. e negative) "nxdomain")) (nil false)))
+        (check ch (not (has? c "n|1" (* 30 sec))))
+        (dotimes (i 50) (cache-put c (str "k" i "|1") ["1.1.1.1"] 60 (* i 1000)))
+        (check ch (<= (cache-size c) 3))
+        (checks-result ch))))
