@@ -1,0 +1,53 @@
+;; spec: spec/stdlib.md section 4.7 rows `clojure.string/replace` and `clojure.string/replace-first` (`str/replace`, `str/replace-first`); docs/adr/0006 (linear work)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; Package FOLLOWUP-1: the library had no public replace for strings. Pinned: a `str` and a `char` are matched literally and the replacement is literal text (`$1` and `\` mean nothing), a `Regex`
+;; reads its replacement as Java's template (`$1`, `\$`), `replace-first` changes the first match only, a text with no match comes back as it was, the empty match (`""`) is between every two
+;; characters and at both ends (`-a-b-c-`), overlapping matches do not overlap, and every one of them with non-ASCII text, where a byte offset and a character offset differ (a cut inside a
+;; character would trap or give mojibake). The last check is linear: 400,000 replacements in 3.9 MB of text take well under 5 s (a quadratic replace takes minutes).
+(ns main (:use tl.check fib.coll) (:require [fib.string :as s] [fib.regex :as re] [fib.os :as os]))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (s/replace "a,b,c" "," ";") "a;b;c"))
+        (check c (= (s/replace "a,b,c" \, ";") "a;b;c"))
+        (check c (= (s/replace "a,b,c" "," "") "abc"))
+        (check c (= (s/replace "aaaa" "aa" "b") "bb"))
+        (check c (= (s/replace "aaa" "aa" "b") "ba"))
+        (check c (= (s/replace "abc" "x" "y") "abc"))
+        (check c (= (s/replace "" "x" "y") ""))
+        (check c (= (s/replace "abc" "" "-") "-a-b-c-"))
+        (check c (= (s/replace "" "" "-") "-"))
+        (check c (= (s/replace "a.b" "." "$1\\") "a$1\\b"))
+        (check c (= (s/replace "abc" "abc" "xyz!") "xyz!"))
+        (check c (= (s/replace "xabcx" "abc" "") "xx"))
+        (check c (= (s/replace-first "a,b,c" "," ";") "a;b,c"))
+        (check c (= (s/replace-first "a,b,c" "x" ";") "a,b,c"))
+        (check c (= (s/replace-first "abc" "" "-") "-abc"))
+        (check c (= (s/replace "caf\u{e9} caf\u{e9}" "\u{e9}" "e") "cafe cafe"))
+        (check c (= (s/replace "caf\u{e9}" "f" "\u{20ac}") "ca\u{20ac}\u{e9}"))
+        (check c (= (s/replace "a\u{20ac}b\u{20ac}c" (char 8364) "-") "a-b-c"))
+        (check c (= (s/replace "a\u{20ac}b" "" "\u{e9}") "\u{e9}a\u{e9}\u{20ac}\u{e9}b\u{e9}"))
+        (check c (= (s/replace "\u{1f600}x\u{1f600}" "\u{1f600}" "") "x"))
+        (check c (= (s/replace-first "\u{e9}\u{e9}\u{e9}" "\u{e9}" "ee") "ee\u{e9}\u{e9}"))
+        (check c (= (s/replace "a1b22c" (re/re-pattern "[0-9]+") "#") "a#b#c"))
+        (check c (= (s/replace "a1b22c" (re/re-pattern "([0-9]+)") "<$1>") "a<1>b<22>c"))
+        (check c (= (s/replace-first "a1b22c" (re/re-pattern "([0-9]+)") "<$1>") "a<1>b22c"))
+        (check c (= (s/replace "a.b" (re/re-pattern "\\.") "\\$") "a$b"))
+        (check c (= (s/replace "caf\u{e9}s" (re/re-pattern "[\u{e9}\u{20ac}]") "e") "cafes"))
+        (check c (= (s/replace "\u{e9}1\u{e9}22" (re/re-pattern "(\\d+)") "[$1]") "\u{e9}[1]\u{e9}[22]"))
+        (check c (= (s/replace "a.b" (re/re-pattern "\\.") (re/re-quote-replacement "$1")) "a$1b"))
+        (let ((big (s/join "," (mapv (fn (i: i64) (str "w\u{e9}" i)) (range 400000))))
+              (t0 (os/clock-now))
+              (out (s/replace big "," "\u{20ac}"))
+              (out2 (s/replace big \, "\u{20ac}\u{20ac}"))
+              (t1 (os/clock-now)))
+          (do (check c (= (str-len out) (+ (- (str-len big) 399999) (* 399999 3))))
+              (check c (= (str-len out2) (+ (- (str-len big) 399999) (* 399999 6))))
+              (check c (s/starts-with? out "w\u{e9}0\u{20ac}w\u{e9}1\u{20ac}"))
+              (check c (s/ends-with? out "\u{20ac}w\u{e9}399999"))
+              (check c (< (- t1 t0) 5000000000))))
+        (checks-result c))))
