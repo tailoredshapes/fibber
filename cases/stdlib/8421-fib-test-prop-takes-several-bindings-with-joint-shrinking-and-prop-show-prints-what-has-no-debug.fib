@@ -1,0 +1,36 @@
+;; spec: docs/design/test-harness.md 3 (prop); package LIB-2 items 5b and 5c
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; covers: fib.test prop prop-show
+;; (prop "t" [a gen-a b gen-b ..] body): one case draws every name, the body sees each one, and a failing tuple is shrunk component by component (the report prints it as nested pairs [a [b c]]); with
+;; one binding the form is the old one. Before: `prop: the binding is [x generator]`. The failing property here is a*a + b*b < 50: the case that failed is drawn at random and shrunk to a smallest pair
+;; that still fails, whose sum of squares is at least 50 and for which no single-component step keeps failing (4 and 6 give 52; 3 and 6 give 45: so [4 6] or one of the other minima, never a pair
+;; with a component that could still be lowered). `prop-show` is for a generated type with no Debug instance: the author's function makes the text of the report.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen) (:require [fib.string :as str]))
+
+(defun show-n (n: i64) -> str (str "<" n ">"))
+(defun show-triple (p: (Pair i64 (Pair i64 i64))) -> str (str "<" (. p fst) "," (. (. p snd) fst) "," (. (. p snd) snd) ">"))
+
+(defun summed (a: i64 b: i64) -> bool (< (+ (* a a) (* b b)) 50))
+
+;; the steps one scenario of `suite` came to, as the broken text of its first failing step ("" when it held)
+(defun broken-text (sc: Scenario) -> str
+  (let ((steps ((. sc run) 1)))
+    (match (first (filter (fn (s: StepRun) (match (. s judged) ((Held) false) ((Broke _ _) true))) steps))
+      (nil "")
+      ((some s) (match (. s judged) ((Broke _ a) a) ((Held) ""))))))
+
+(defun main () -> i64
+  (let ((ok2 (nth (prop "two names hold" [a (gen-i64) b (gen-i64)] (= (+ a b) (+ b a))) 0))
+        (ok3 (nth (prop "three names hold" [a (gen-i64-between 0 10) b (gen-str) c (gen-bool)] (and (>= a 0) (>= (count b) 0))) 0))
+        (bad2 (nth (prop "two names fail" [a (gen-i64) b (gen-i64)] (summed a b)) 0))
+        (bad1 (nth (prop-show "one name, shown by a function" show-n [x (gen-i64-between 0 100)] (< x 3)) 0))
+        (bad3 (nth (prop-show "three names" show-triple [a (gen-i64-between 0 100) b (gen-i64-between 0 100) c (gen-i64-between 0 100)] (< (+ a (+ b c)) 5)) 0)))
+    (let ((t2 (broken-text bad2)) (t1 (broken-text bad1)) (t3 (broken-text bad3)))
+      (if (and (= (broken-text ok2) "") (and (= (broken-text ok3) "")
+          (and (str/includes? t2 "it fails for x = [") (and (str/includes? t1 "it fails for x = <3>") (str/includes? t3 "<")))))
+          0
+          1))))

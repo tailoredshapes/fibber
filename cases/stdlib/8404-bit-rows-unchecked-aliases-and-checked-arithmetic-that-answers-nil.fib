@@ -1,0 +1,73 @@
+;; spec: spec/stdlib.md section 4.3 rows bit-and-not bit-clear bit-set bit-flip bit-test pos-int? neg-int? nat-int? unchecked-inc unchecked-dec unchecked-*-int unchecked-byte unchecked-short unchecked-int unchecked-long; rows checked-add checked-sub checked-mul checked-neg checked-inc checked-dec (new)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; Package LIB-2. The bit rows are Clojure's ((bit-set 0 3) is 8, (bit-clear 15 0) 14, (bit-flip 5 1) 7, (bit-test 5 2) true, (bit-and-not 15 5) 10). The checked operators answer `nil` exactly when
+;; the ordinary one traps `integer overflow`: the overflow edge of i64 (9223372036854775807 + 1, -9223372036854775808 - 1, 3037000500 * 3037000500, -9223372036854775808 * -1) and of i8, with the
+;; neighbours that still fit; and 30000 seeded random i32 pairs (mixed small and full range) per operator, twice, against the exact answer computed one width up in i64: nil exactly when it does not fit.
+(ns main (:use tl.check))
+
+(defun fits32? (r: i64) -> bool (and (>= r -2147483648) (<= r 2147483647)))
+
+;; an i32 from the LCG state (the upper bits of a 64-bit LCG), the state advanced by the caller
+(defun lcg (s: i64) -> i64 (unchecked-add (unchecked-multiply s 6364136223846793005) 1442695040888963407))
+(defun draw (s: i64) -> i32 (trunc i32 (shr s 32)))
+
+;; the number of pairs (of 30000) on which an operator disagrees with the exact answer; the operands are mixed small and full-range so that both outcomes are common
+(defun disagreements (seed: i64) -> i64
+  (loop ((i 0) (s seed) (bad 0))
+    (if (= i 30000)
+        bad
+        (let ((s1 (lcg s)) (s2 (lcg s1)))
+          (let ((a (if (= (rem i 3) 0) (trunc i32 (shr (draw s1) 16i32)) (draw s1)))
+                (b (if (= (rem i 5) 0) (trunc i32 (shr (draw s2) 16i32)) (draw s2))))
+            (let ((ea (sext i64 a)) (eb (sext i64 b)))
+              (let ((add-ok (= (checked-add a b) (if (fits32? (+ ea eb)) (some (trunc i32 (+ ea eb))) nil)))
+                    (sub-ok (= (checked-sub a b) (if (fits32? (- ea eb)) (some (trunc i32 (- ea eb))) nil)))
+                    (mul-ok (= (checked-mul a b) (if (fits32? (* ea eb)) (some (trunc i32 (* ea eb))) nil))))
+                (recur (+ i 1) s2 (+ bad (+ (if add-ok 0 1) (+ (if sub-ok 0 1) (if mul-ok 0 1))))))))))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (bit-set 0 3) 8))
+        (check c (= (bit-clear 15 0) 14))
+        (check c (= (bit-flip 5 1) 7))
+        (check c (bit-test 5 2))
+        (check c (not (bit-test 5 1)))
+        (check c (= (bit-and-not 15 5) 10))
+        (check c (and (pos-int? 3) (and (not (neg-int? 3)) (nat-int? 0))))
+        (check c (and (neg-int? -1) (not (nat-int? -1))))
+        (check c (= (unchecked-inc 9223372036854775807) -9223372036854775808))
+        (check c (= (unchecked-dec -9223372036854775808) 9223372036854775807))
+        (check c (= (unchecked-add-int 2147483647i32 1i32) -2147483648i32))
+        (check c (= (unchecked-multiply-int 65536i32 65536i32) 0i32))
+        (check c (= (unchecked-byte 300) 44i8))
+        (check c (= (unchecked-short 70000) 4464i16))
+        (check c (= (unchecked-int 4294967297) 1i32))
+        (check c (nil? (checked-add 9223372036854775807 1)))
+        (check c (= (checked-add 9223372036854775806 1) (some 9223372036854775807)))
+        (check c (nil? (checked-add -9223372036854775808 -1)))
+        (check c (= (checked-add -5 5) (some 0)))
+        (check c (nil? (checked-sub -9223372036854775808 1)))
+        (check c (nil? (checked-sub 9223372036854775807 -1)))
+        (check c (= (checked-sub 5 7) (some -2)))
+        (check c (nil? (checked-mul 3037000500 3037000500)))
+        (check c (= (checked-mul 3037000499 3037000499) (some 9223372030926249001)))
+        (check c (nil? (checked-mul -9223372036854775808 -1)))
+        (check c (nil? (checked-mul -1 -9223372036854775808)))
+        (check c (= (checked-mul -1 5) (some -5)))
+        (check c (nil? (checked-mul 4611686018427387904 2)))
+        (check c (= (checked-mul -4611686018427387904 2) (some -9223372036854775808)))
+        (check c (= (checked-mul 0 -9223372036854775808) (some 0)))
+        (check c (nil? (checked-add 127i8 1i8)))
+        (check c (nil? (checked-mul 16i8 8i8)))
+        (check c (= (checked-mul -16i8 8i8) (some -128i8)))
+        (check c (nil? (checked-neg -128i8)))
+        (check c (= (checked-neg 5) (some -5)))
+        (check c (nil? (checked-inc 9223372036854775807)))
+        (check c (nil? (checked-dec -9223372036854775808)))
+        (check c (= (disagreements 12345) 0))
+        (check c (= (disagreements 987654321) 0))
+        (checks-result c))))

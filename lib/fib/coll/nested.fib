@@ -1,0 +1,71 @@
+;; fib.coll.nested: `subvec`, `update-keys`, `update-vals` and the macros `update-in` and `assoc-in` (stdlib §4.5 rows; package LIB-2).
+;; Decided here, where the page is silent:
+;;  - `subvec` answers a Vec made of a copy of the elements (O(b - a)), not Clojure's O(1) view: the row's `SubVec` view type is not
+;;    written, so `(subvec v a b)` is a `(Vec e)` that does not share v and keeps it alive no longer than the copy takes. It traps
+;;    `subvec: index out of range` unless 0 <= a <= b <= count, Clojure's check (its message is an IndexOutOfBounds there).
+;;  - `update-keys` is the last-wins one of the row: two keys that map to one keep the value of the entry the walk reached last, and the
+;;    walk is the map's (hash order), so which of two colliding entries wins is the walk's, not insertion order (Clojure's is the same
+;;    for a hash map).
+;;  - `update-in` and `assoc-in` are macros over a LITERAL vector path, `(update-in m [k1 k2] f)` is
+;;    `(update m k1 (fn (x) (update m' ..)))`: each level has its own key and value type, which a function over a computed path cannot
+;;    give. The empty path and a path that is not a literal vector are the macro's trap. A missing key at ANY level traps `update: no key`
+;;    (the row for update-in says so; for `assoc-in` it deviates from Clojure, which creates the missing levels: that needs a static
+;;    `(empty T)` of the level's type, §7 L4, which the language has not; the last level of `assoc-in` may be a new key, an intermediate
+;;    one may not).
+;;  - the macro bodies use prelude names only (stdlib §6.3).
+(ns fib.coll.nested (:use fib.core fib.seq fib.coll.protocols fib.coll.ops))
+
+;; the elements a to b-1 of v
+(defun vec-between :private (v: (Vec e) a: i64 b: i64) -> (Vec e)
+  (loop ((i a) (acc (vec-empty)))
+    (if (< i b) (recur (+ i 1) (vec-conj acc (vec-nth v i))) acc)))
+
+(defn subvec
+  ([v: (Vec e) a: i64 b: i64] -> (Vec e)
+  (if (and (<= 0 a) (and (<= a b) (<= b (vec-count v))))
+      (vec-between v a b)
+      (trap "subvec: index out of range")))
+  ([v: (Vec e) a: i64] -> (Vec e)
+  (if (and (<= 0 a) (<= a (vec-count v)))
+      (vec-between v a (vec-count v))
+      (trap "subvec: index out of range"))))
+
+;; m with f of each key
+(defun update-keys (m: (Map k v) f: (fn (k) k2) :borrow) :where ((Hash k) (Hash k2) (Eq k2)) -> (Map k2 v)
+  (let ((acc (cell (fib.prelude/map-empty))))
+    (do (fib.prelude/map-each m (fn (k x) (do (set! acc (fib.prelude/map-assoc @acc (f k) x)) true)))
+        @acc)))
+
+;; m with f of each value; the value type may change
+(defun update-vals (m: (Map k v) f: (fn (v) w) :borrow) :where ((Hash k) (Eq k)) -> (Map k w)
+  (let ((acc (cell (fib.prelude/map-empty))))
+    (do (fib.prelude/map-each m (fn (k x) (do (set! acc (fib.prelude/map-assoc @acc k (f x))) true)))
+        @acc)))
+
+;; (update-in m [k1 k2 ..] f): one `update` per level, the inner one inside a closure over the level's value
+(defmacro update-in (m path f)
+  (let ((ks (match path
+              ((Vec xs) xs)
+              (_ (trap "update-in: the path is a literal vector [k1 k2 ..]")))))
+    (if (= (vec-count ks) 0)
+        (trap "update-in: the path has at least one key")
+        (let ((tail (loop ((j 1) (out (vec-empty)))
+                      (if (< j (vec-count ks)) (recur (+ j 1) (vec-conj out (vec-nth ks j))) out))))
+          (if (= (vec-count tail) 0)
+              `(update ~m ~(vec-nth ks 0) ~f)
+              (let ((g (gensym "x")))
+                `(update ~m ~(vec-nth ks 0) (fn (~g) (update-in ~g ~(Vec tail) ~f)))))))))
+
+;; (assoc-in m [k1 k2 ..] v): the last level is an `assoc`, the levels above it an `update`
+(defmacro assoc-in (m path v)
+  (let ((ks (match path
+              ((Vec xs) xs)
+              (_ (trap "assoc-in: the path is a literal vector [k1 k2 ..]")))))
+    (if (= (vec-count ks) 0)
+        (trap "assoc-in: the path has at least one key")
+        (let ((tail (loop ((j 1) (out (vec-empty)))
+                      (if (< j (vec-count ks)) (recur (+ j 1) (vec-conj out (vec-nth ks j))) out))))
+          (if (= (vec-count tail) 0)
+              `(assoc ~m ~(vec-nth ks 0) ~v)
+              (let ((g (gensym "x")))
+                `(update ~m ~(vec-nth ks 0) (fn (~g) (assoc-in ~g ~(Vec tail) ~v)))))))))

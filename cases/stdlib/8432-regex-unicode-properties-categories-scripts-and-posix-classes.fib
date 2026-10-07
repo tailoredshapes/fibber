@@ -1,0 +1,38 @@
+;; spec: spec/stdlib.md section 4.21 (fib.regex.unicode); package LIB-2 item 6
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; covers: fib.regex.unicode
+;; `\p{L}`, `\P{L}`, `\p{Lu}`, `\p{Nd}`, `\p{IsGreek}`, `\p{script=Cyrillic}`, `\p{Alpha}`, `\pL`, and inside a class (`[\p{Nd}x]`, `[^\P{L}]`) work through the explicit module (the tables are not part of
+;; fib.regex): the answers are Java's (the differential compares thousands). Under `(?i)` the cased-letter properties widen to all cased letters (`(?i)\p{Lu}` matches a lowercase letter, as Java's). An unknown
+;; property is an `Err` that names it; plain `fib.regex` still refuses `\p` (a supplementary decision pinned here: the pattern needs the module).
+(ns main (:use tl.check) (:require [fib.regex :as re] [fib.regex.unicode :as ru]))
+
+(defun found (p: str s: str) -> str
+  (match (re/re-find (ru/re-pattern p) s) (nil "nil") ((some m) (. m whole))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (found "\\p{L}+" "123 héllo wörld") "héllo"))
+        (check c (= (found "\\p{Lu}\\p{Ll}+" "abc Éclair") "Éclair"))
+        (check c (= (found "[\\p{Nd}x]+" "ab٣٤x5") "٣٤x5"))
+        (check c (= (found "\\P{L}+" "ab12cd") "12"))
+        (check c (= (found "[^\\P{L}]+" "12ab") "ab"))
+        (check c (= (found "\\p{IsGreek}+" "abc αβγ def") "αβγ"))
+        (check c (= (found "\\p{script=Cyrillic}+" "abc привет") "привет"))
+        (check c (= (found "\\p{sc=Latin}+" "αβγ abc") "abc"))
+        (check c (= (found "\\p{Alpha}+" "12abc") "abc"))
+        (check c (= (found "\\pL+" "12abc") "abc"))
+        (check c (= (found "\\p{Zs}" "a b") " "))
+        (check c (= (found "\\p{Sc}" "cost: 5€") "€"))
+        (check c (= (found "\\p{general_category=Nd}+" "x٣٤") "٣٤"))
+        (check c (= (found "(?i)\\p{Lu}+" "abc") "abc"))
+        (check c (= (found "\\p{Lu}+" "abc") "nil"))
+        (check c (= (found "\\p{Cn}" "a") "nil"))
+        (check c (match (ru/try-re-pattern "\\p{Foo}") ((Err e) (= e "Unknown character property name {Foo}")) ((Ok _) false)))
+        (check c (match (ru/try-re-pattern "\\p{L") ((Err _) true) ((Ok _) false)))
+        (check c (match (re/try-re-pattern "\\p{L}") ((Err _) true) ((Ok _) false)))
+        (check c (= (re/re-count (ru/re-pattern "\\p{L}") "héllo wörld 123") 10))
+        (checks-result c))))

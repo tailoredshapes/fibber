@@ -1,0 +1,28 @@
+;; spec: spec/stdlib.md section 4.5 rows subvec update-in assoc-in update-keys update-vals
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; Package LIB-2. `subvec` is a copy (not Clojure's view) and is checked against Clojure's results: (subvec [1 2 3 4] 1 3) is [2 3], (subvec [1 2 3 4] 2) [3 4]. `update-in` and `assoc-in` are macros over a
+;; literal path, so each level has its own types: a (Map str (Map str i64)) and a (Map str (Vec i64)) both work. The last level of assoc-in may be a new key; an intermediate level that is missing
+;; traps (case 8402; Clojure creates it, which needs a static empty). update-keys: the last of two colliding keys wins.
+(ns main (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m: (Map str (Map str i64)) {"a" {"x" 1 "y" 2} "b" {"x" 5}})
+        (v: (Map str (Vec i64)) {"p" [1 2 3]}))
+    (do (check c (= (subvec [1 2 3 4] 1 3) [2 3]))
+        (check c (= (subvec [1 2 3 4] 2) [3 4]))
+        (check c (= (subvec [1 2 3 4] 0 0) []))
+        (check c (= (subvec [1 2 3 4] 4) []))
+        (check c (= (update-in m ["a" "x"] inc) {"a" {"x" 2 "y" 2} "b" {"x" 5}}))
+        (check c (= (assoc-in m ["a" "z"] 9) {"a" {"x" 1 "y" 2 "z" 9} "b" {"x" 5}}))
+        (check c (= (assoc-in {"k" 1} ["k"] 4) {"k" 4}))
+        (check c (= (assoc-in v ["p" 1] 20) {"p" [1 20 3]}))
+        (check c (= (update-in v ["p" 2] (fn (x: i64) (* x 100))) {"p" [1 2 300]}))
+        (check c (= (update-vals {"a" 1 "b" 2} (fn (x: i64) (str x "!"))) {"a" "1!" "b" "2!"}))
+        (check c (= (update-keys {"a" 1} (fn (k: str) (str k k))) {"aa" 1}))
+        (check c (= (count (update-keys {"a" 1 "b" 2} (fn (k: str) "same"))) 1))
+        (checks-result c))))

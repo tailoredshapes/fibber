@@ -1,0 +1,66 @@
+;; fib.string.extra: `str/last-index-of`, `str/reverse`, `str/escape`, `str/re-quote-replacement` and the byte-offset helpers `str/char-boundary?`,
+;; `str/next-boundary`, `str/prev-boundary` (stdlib §4.7, §2.9; package LIB-2). Decided here, where the page is silent:
+;;  - `last-index-of` answers a CHARACTER offset, as `index-of` does, so its result feeds `subs`. `(last-index-of s p)` is the last match; the
+;;    three-argument form looks for a match that STARTS at character `from` or before, as Java's `lastIndexOf(value, from)`: a `from` below 0
+;;    finds nothing, one past the end is the end. The pattern is a `Pattern`: a `str` or a `char` literally, or a `Regex` (the last start of
+;;    a match found by walking forward, which is the leftmost match at each start: for a regex that is the last start, not Java's: Clojure has none).
+;;  - `reverse` reverses by Unicode scalar value, not by grapheme (the row): a combining mark ends up before its base.
+;;  - `escape` replaces each character for which `f` answers `(some text)` and keeps the others; `f` is a function (a map as a function waits
+;;    for L21).
+;;  - `re-quote-replacement` puts a backslash before each `$` and `\`, so the text is literal in a regex replacement template.
+;;  - THE BYTE-OFFSET RULE (package LIB-2, item 7): the byte layer (`str-slice`, `str-find`, `str-byte-at`) takes byte offsets and TRAPS at an
+;;    offset that splits a character (`str-slice [0, 2) splits a character`, `str-find: from 2 splits a character`) or lies outside the string
+;;    (`str-slice: range ..`, `str-byte-at: index .. out of range`); it never answers a Result, so a program that computes offsets
+;;    itself pays a trap, not silent garbage. Everything counted in characters (`subs`, `count`, `nth`, `index-of`, `last-index-of`)
+;;    cannot split a character and so cannot trap on one. A program that mixes the two asks first: `(char-boundary? s i)` says whether byte i is
+;;    between two characters (0 and the length are), `(next-boundary s i)` is the first boundary at or after i and `(prev-boundary s i)` the last
+;;    at or before it; both clamp i into 0..length. Cases 8403 to 8405.
+(ns fib.string.extra (:use fib.core fib.seq fib.string.utf8 fib.string.pattern))
+
+(defun char-boundary? (s: str i: i64) -> bool
+  (let ((n (str-len s)))
+    (and (>= i 0) (and (<= i n) (or (= i n) (not (continuation? (byte-at s i))))))))
+
+(defun next-boundary (s: str i: i64) -> i64
+  (let ((n (str-len s)))
+    (loop ((j (if (< i 0) 0 i)))
+      (if (>= j n) n (if (continuation? (byte-at s j)) (recur (+ j 1)) j)))))
+
+(defun prev-boundary (s: str i: i64) -> i64
+  (let ((n (str-len s)))
+    (loop ((j (if (> i n) n i)))
+      (if (<= j 0) 0 (if (and (< j n) (continuation? (byte-at s j))) (recur (- j 1)) j)))))
+
+;; the byte offset of the last match start at or before the byte offset limit, or -1
+(defun last-start :private (p: p s: str limit: i64) :where ((Pattern p)) -> i64
+  (loop ((from 0) (best -1))
+    (if (or (< from 0) (> from (str-len s)))
+        best
+        (match (find-in p s from)
+          (nil best)
+          ((some m)
+           (let ((st (. m fst)))
+             (if (> st limit)
+                 best
+                 (recur (if (< st (str-len s)) (+ st (width-of (byte-at s st))) -1) st))))))))
+
+(defn last-index-of
+  ([s: str p: p from: i64] :where ((Pattern p)) -> (Option i64)
+  (if (< from 0)
+      nil
+      (let ((at (last-start p s (offset-after s from))))
+        (if (< at 0) nil (some (scalars-before s at))))))
+  ([s: str p: p] :where ((Pattern p)) -> (Option i64)
+  (let ((at (last-start p s (str-len s))))
+    (if (< at 0) nil (some (scalars-before s at))))))
+
+(defun reverse (s: str) -> str
+  (let ((cs (str-chars s)))
+    (str-join (loop ((i (- (vec-count cs) 1)) (out (vec-empty)))
+                (if (>= i 0) (recur (- i 1) (vec-conj out (char->str (vec-nth cs i)))) out)))))
+
+(defun escape (s: str f: (fn (char) (Option str))) -> str
+  (str-join (mapv (fn (c: char) (match (f c) ((some t) t) (nil (char->str c)))) (str-chars s))))
+
+(defun re-quote-replacement (s: str) -> str
+  (str-join (mapv (fn (c: char) (if (or (= c \$) (= c \\)) (str-concat "\\" (char->str c)) (char->str c))) (str-chars s))))

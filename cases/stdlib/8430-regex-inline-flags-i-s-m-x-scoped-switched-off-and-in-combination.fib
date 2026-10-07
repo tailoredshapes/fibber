@@ -1,0 +1,52 @@
+;; spec: spec/stdlib.md section 4.9 and 4.21 (fib.regex inline flags); package LIB-2 item 6
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; covers: fib.regex inline-flags
+;; The flags of java.util.regex: `(?i)` ASCII case-insensitive, `(?s)` dot matches line terminators, `(?m)` `^` and `$` at every line, `(?x)` white space and `#` comments ignored (also in a class); `(?i-s)` switches off;
+;; `(?i:..)` is scoped to the group; a flag set inside a group ends with it; `(?i)` in the middle holds to the end of the enclosing group and through later alternatives. Each expected value is what
+;; Java 25 answers (the differential, scripts/regex-diff, compares thousands of them). `(?m)^` never matches at the very end of the text, `(?m)$` does; `$` without `m` matches before a final line terminator;
+;; `\r\n` is one terminator (no `^` between the two). `(?i)*` is refused, as Java refuses it; `(?z)` and `(?i` are refused.
+(ns main (:use tl.check) (:require [fib.regex :as re]))
+
+(defun found (p: str s: str) -> str
+  (match (re/re-find (re/re-pattern p) s) (nil "nil") ((some m) (. m whole))))
+
+(defun refused? (p: str) -> bool (match (re/try-re-pattern p) ((Err _) true) ((Ok _) false)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (found "(?i)hello" "Say HeLLo") "HeLLo"))
+        (check c (= (found "hello" "Say HeLLo") "nil"))
+        (check c (= (found "(?i)[a-c]+" "xABCabc") "ABCabc"))
+        (check c (= (found "(?i)[^a]" "Ab") "b"))
+        (check c (= (found "(?s)a.c" "a\nc") "a\nc"))
+        (check c (= (found "a.c" "a\nc") "nil"))
+        (check c (= (found "(?m)^b$" "a\nb\nc") "b"))
+        (check c (= (found "^b$" "a\nb\nc") "nil"))
+        (check c (= (found "(?m)^" "") "nil"))
+        (check c (= (found "(?m)$" "") ""))
+        (check c (= (found "(?m)^\\w" "a\r\nb") "a"))
+        (check c (= (found "a$" "a\n") "a"))
+        (check c (= (found "(?x) a b # comment\n c" "abc") "abc"))
+        (check c (= (found "(?x)[a b]+" "a b") "a"))
+        (check c (= (found "a(?i:b)c" "aBc") "aBc"))
+        (check c (= (found "a(?i:b)c" "aBC") "nil"))
+        (check c (= (found "(a(?i)b)c" "aBc") "aBc"))
+        (check c (= (found "(a(?i)b)c" "aBC") "nil"))
+        (check c (= (found "a(?i)b|c" "aB") "aB"))
+        (check c (= (found "a(?i)b|c" "C") "C"))
+        (check c (= (found "(?i-s)a.c" "A\nC") "nil"))
+        (check c (= (found "(?is)a.c" "A\nC") "A\nC"))
+        (check c (= (found "(?ims)^a.c$" "x\nA\nC\ny") "A\nC"))
+        (check c (= (found "\\x{1F600}" "x😀") "😀"))
+        (check c (refused? "(?i)*"))
+        (check c (refused? "\\w(?i)?"))
+        (check c (refused? "(?z)a"))
+        (check c (refused? "(?i"))
+        (check c (refused? "(?i-"))
+        (check c (= (re/pattern-of (re/re-pattern-flags "a.c" "is")) "(?is)a.c"))
+        (check c (= (found "(?is)a.c" "A\nC") (match (re/re-find (re/re-pattern-flags "a.c" "is") "A\nC") (nil "nil") ((some m) (. m whole)))))
+        (checks-result c))))

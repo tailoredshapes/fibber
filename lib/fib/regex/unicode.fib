@@ -1,0 +1,197 @@
+;; fib.regex.unicode: `\p{..}` and `\P{..}` for fib.regex (package LIB-2), an EXPLICIT module: `(:require [fib.regex.unicode :as ru])`, then
+;; `(ru/re-pattern "\\p{L}+")`, `(ru/try-re-pattern ..)`, `(ru/re-pattern-flags ..)`. The Unicode tables (generated from Unicode 16.0.0 by
+;; scripts/gen-unicode.py, pinned by scripts/fetch-unicode.sh: fib.string.unicode.data and fib.regex.unicode.scripts) are string literals inside
+;; functions, and nothing else refers to this module: `fib.regex` itself, and every program that never requires this one, has none of them.
+;; HOW: the pattern text is rewritten before fib.regex's parser sees it. Each `\p{Name}` becomes the class of its code point ranges written as
+;; `[\x{lo}-\x{hi}..]` (outside a class) or as the bare ranges (inside one); `\P{Name}` is the complement, computed here over 0..0x10FFFF so that
+;; it also works inside a class (`[\P{L}x]`). The result is an ordinary pattern, parsed and run by the Pike VM like any other: the properties cost
+;; nothing at match time and `\p{L}` has the linear-time guarantee of the rest.
+;; WHICH NAMES (Java's spellings, case-sensitive for categories, the script names case-insensitive):
+;;  - a general category: `L Lu Ll Lt Lm Lo LC M Mn Mc Me N Nd Nl No P Pc Pd Ps Pe Pi Pf Po S Sm Sc Sk So Z Zs Zl Zp C Cc Cf Cs Co Cn`, bare or as
+;;    `IsL`, `general_category=L`, `gc=L`;  `\pL` (one letter, no braces) is `\p{L}`;
+;;  - a script (the long names of Scripts.txt, `Old_Italic`): `IsLatin`, `script=Latin`, `sc=Latin`;
+;;  - the POSIX classes of java.util.regex, ASCII only: `Lower Upper ASCII Alpha Digit Alnum Punct Graph Print Blank Cntrl XDigit Space`.
+;;  Not written (an error naming the property): blocks (`InGreek`), binary properties (`IsAlphabetic`, `IsEmoji` ..), the `java*` classes, scripts by
+;;  their four-letter codes (`sc=Latn`), and `\p{^..}`.
+;; A flag `(?i)` does not widen a property (`(?i)\p{Lu}` matches uppercase letters only); Java's `i` also matches the lowercase ones.
+(ns fib.regex.unicode
+  (:use fib.core fib.seq fib.coll)
+  (:require [fib.regex.api :as rx] [fib.regex.charset :as cs] [fib.string.unicode.data :as d] [fib.regex.unicode.scripts :as sc]))
+
+(defun hex-digit :private (b: i8) -> i64
+  (let [c (zext i64 b)] (if (< c 58) (- c 48) (- c 87))))
+
+(defun hex-at :private (t: str at: i64 n: i64) -> i64
+  (loop [k 0 v 0]
+    (if (= k n) v (recur (+ k 1) (bit-or (shl v 4) (hex-digit (str-byte-at t (+ at k))))))))
+
+;; the code point ranges (packed, normalised) of the runs of an 8-byte-record table whose value byte(s) `keep?` accepts; a run ends where the next starts
+(defun run-ranges :private (t: str keep?: (fn (i64) bool)) -> (Vec i64)
+  (let [n (quot (str-len t) 8)]
+    (cs/cs-norm (loop [i 0 out (vec-empty)]
+                  (if (< i n)
+                      (let [lo (hex-at t (* i 8) 6)
+                            hi (if (< (+ i 1) n) (- (hex-at t (* (+ i 1) 8) 6) 1) 1114111)]
+                        (recur (+ i 1) (if (keep? i) (conj out (cs/pack lo hi)) out)))
+                      out)))))
+
+(defun gc-ranges :private (pred: (fn (i64 i64) bool)) -> (Vec i64)
+  (let [t (d/gc-table)]
+    (run-ranges t (fn (i: i64) (pred (zext i64 (str-byte-at t (+ (* i 8) 6))) (zext i64 (str-byte-at t (+ (* i 8) 7))))))))
+
+(defun gc-names () -> (Vec str) ["L" "Lu" "Ll" "Lt" "Lm" "Lo" "LC" "M" "Mn" "Mc" "Me" "N" "Nd" "Nl" "No" "P" "Pc" "Pd" "Ps" "Pe" "Pi" "Pf" "Po"
+                          "S" "Sm" "Sc" "Sk" "So" "Z" "Zs" "Zl" "Zp" "C" "Cc" "Cf" "Cs" "Co" "Cn"])
+
+(defun byte0 :private (s: str i: i64) -> i64 (zext i64 (str-byte-at s i)))
+
+;; a general category by name: one letter is a major class, two a category, LC the cased letters
+(defun category-set :private (name: str) -> (Option (Vec i64))
+  (cond (not (some? (first (filter (fn (g: str) (= g name)) (gc-names))))) nil
+        (= name "LC") (some (gc-ranges (fn (a: i64 b: i64) (and (= a 76) (or (= b 117) (or (= b 108) (= b 116)))))))
+        (= (str-len name) 1) (some (gc-ranges (fn (a: i64 b: i64) (= a (byte0 name 0)))))
+        :else (some (gc-ranges (fn (a: i64 b: i64) (and (= a (byte0 name 0)) (= b (byte0 name 1))))))))
+
+(defun lower-ascii :private (s: str) -> str
+  (str-join (mapv (fn (c: char) (if (and (>= c \A) (<= c \Z)) (char->str (i32->char (+ (char->i32 c) 32i32))) (char->str c))) (str-chars s))))
+
+;; a script by its long name, case-insensitive; Unknown is the index 0
+(defun script-set :private (name: str) -> (Option (Vec i64))
+  (let [names (mapv lower-ascii (split-commas (sc/script-names)))
+        want (lower-ascii name)
+        idx (loop [i 0] (cond (>= i (count names)) -1 (= (nth names i) want) i :else (recur (+ i 1))))]
+    (if (< idx 0)
+        nil
+        (let [t (sc/script-table)]
+          (some (run-ranges t (fn (i: i64) (= (hex-at t (+ (* i 8) 6) 2) idx))))))))
+
+(defun split-commas :private (s: str) -> (Vec str)
+  (loop [i 0 start 0 out (vec-empty)]
+    (cond (>= i (str-len s)) (conj out (str-slice s start i))
+          (= (str-byte-at s i) 44i8) (recur (+ i 1) (+ i 1) (conj out (str-slice s start i)))
+          :else (recur (+ i 1) start out))))
+
+;; ASCII ranges of the POSIX classes of java.util.regex
+(defun posix-set :private (name: str) -> (Option (Vec i64))
+  (let [r (fn (lo: i64 hi: i64) (cs/pack lo hi))]
+    (cond (= name "Lower") (some [(r 97 122)])
+          (= name "Upper") (some [(r 65 90)])
+          (= name "ASCII") (some [(r 0 127)])
+          (= name "Alpha") (some [(r 65 90) (r 97 122)])
+          (= name "Digit") (some [(r 48 57)])
+          (= name "Alnum") (some [(r 48 57) (r 65 90) (r 97 122)])
+          (= name "Punct") (some [(r 33 47) (r 58 64) (r 91 96) (r 123 126)])
+          (= name "Graph") (some [(r 33 126)])
+          (= name "Print") (some [(r 32 126)])
+          (= name "Blank") (some [(r 9 9) (r 32 32)])
+          (= name "Cntrl") (some [(r 0 31) (r 127 127)])
+          (= name "XDigit") (some [(r 48 57) (r 65 70) (r 97 102)])
+          (= name "Space") (some [(r 9 13) (r 32 32)])
+          :else nil)))
+
+(defun after-prefix :private (name: str prefix: str) -> (Option str)
+  (if (starts-with? name prefix) (some (str-slice name (str-len prefix) (str-len name))) nil))
+
+;; the set of a property name, or the error naming it
+(defun property-set (name: str) -> (Result (Vec i64) str)
+  (let [found (cond (some? (posix-set name)) (posix-set name)
+                    (some? (category-set name)) (category-set name)
+                    (some? (after-prefix name "general_category=")) (category-set (unwrap (after-prefix name "general_category=")))
+                    (some? (after-prefix name "gc=")) (category-set (unwrap (after-prefix name "gc=")))
+                    (some? (after-prefix name "script=")) (script-set (unwrap (after-prefix name "script=")))
+                    (some? (after-prefix name "sc=")) (script-set (unwrap (after-prefix name "sc=")))
+                    (some? (after-prefix name "Is")) (let [rest (unwrap (after-prefix name "Is"))]
+                                                       (if (some? (category-set rest)) (category-set rest) (script-set rest)))
+                    :else nil)]
+    (match found
+      ((some s) (Ok s))
+      (nil (Err (str "Unknown character property name {" name "}"))))))
+
+(defun hex-text :private (n: i64) -> str
+  (loop [v n out ""]
+    (if (and (= v 0) (> (str-len out) 0))
+        out
+        (recur (shr v 4) (str-concat (str-slice "0123456789abcdef" (bit-and v 15) (+ (bit-and v 15) 1)) out)))))
+
+(defun ranges-text :private (s: (Vec i64)) -> str
+  (str-join (mapv (fn (r: i64)
+                    (let [lo (cs/range-lo r) hi (cs/range-hi r)]
+                      (if (= lo hi) (str "\\x{" (hex-text lo) "}") (str "\\x{" (hex-text lo) "}-\\x{" (hex-text hi) "}"))))
+                  s)))
+
+;; the text a `\p` stands for: the bare ranges inside a class, a class outside one; `negated` is `\P`
+(defun property-text :private (set: (Vec i64) negated: bool in-class: bool) -> str
+  (let [s (if negated (cs/cs-negate set) set)]
+    (if in-class (ranges-text s) (str "[" (ranges-text s) "]"))))
+
+;; the name after `\p`: `{Name}` or the one letter that follows; the name and the index after it, or an error
+(defun read-name :private (src: (Vec str) i: i64) -> (Result (Pair str i64) str)
+  (cond (>= i (count src)) (Err "Illegal character property: \\p at the end of the pattern")
+        (= (nth src i) "{") (loop [j (+ i 1) name ""]
+                              (cond (>= j (count src)) (Err "Unclosed character family")
+                                    (= (nth src j) "}") (if (= name "") (Err "Empty character family") (Ok (Pair name (+ j 1))))
+                                    :else (recur (+ j 1) (str-concat name (nth src j)))))
+        :else (Ok (Pair (nth src i) (+ i 1)))))
+
+;; whether the flag letters at i (after `(?`) switch `i` on: the new state of the case flag, and the index of the `)` or `:` that ends them; nil when the
+;; text there is not a flag group (a `(?:` or a form this module does not read: fib.regex's parser reports those)
+(defun case-flag-after :private (src: (Vec str) i: i64 ci: bool) -> (Option (Pair bool i64))
+  (loop [j i on true acc ci]
+    (let [c (if (< j (count src)) (nth src j) "")]
+      (cond (or (= c ")") (= c ":")) (some (Pair acc j))
+            (= c "-") (recur (+ j 1) false acc)
+            (= c "i") (recur (+ j 1) on on)
+            (or (= c "s") (or (= c "x") (= c "m"))) (recur (+ j 1) on acc)
+            :else nil))))
+
+;; Java's CASE_INSENSITIVE widens the cased-letter properties Lu, Ll and Lt to all cased letters (LC)
+(defun widen-name :private (name: str ci: bool) -> str
+  (let [base (cond (starts-with? name "general_category=") (str-slice name 17 (str-len name))
+                   (starts-with? name "gc=") (str-slice name 3 (str-len name))
+                   (starts-with? name "Is") (str-slice name 2 (str-len name))
+                   :else name)]
+    (if (and ci (or (= base "Lu") (or (= base "Ll") (= base "Lt")))) "LC" name)))
+
+;; the pattern with every `\p{..}` and `\P{..}` replaced; Err names a property it does not know. It follows the flag groups only as far as the
+;; case flag goes (a stack of the flag at each open group), because the case flag changes what `\p{Lu}` means
+(defun expand-properties (pattern: str) -> (Result str str)
+  (let [src (mapv char->str (str-chars pattern))]
+    (loop [i 0 depth 0 ci false saved (vec-empty) out (vec-empty)]
+      (if (>= i (count src))
+          (Ok (str-join out))
+          (let [c (nth src i)]
+            (cond (and (= c "\\") (< (+ i 1) (count src)) (or (= (nth src (+ i 1)) "p") (= (nth src (+ i 1)) "P")))
+                    (try-let [nm (read-name src (+ i 2))
+                              set (property-set (widen-name (. nm fst) ci))]
+                      (recur (. nm snd) depth ci saved (conj out (property-text set (= (nth src (+ i 1)) "P") (> depth 0)))))
+                  (= c "\\") (recur (+ i 2) depth ci saved (conj (conj out c) (if (< (+ i 1) (count src)) (nth src (+ i 1)) "")))
+                  (= c "[") (recur (+ i 1) (+ depth 1) ci saved (conj out c))
+                  (and (= c "]") (> depth 0)) (recur (+ i 1) (- depth 1) ci saved (conj out c))
+                  (and (= c "(") (= depth 0) (< (+ i 1) (count src)) (= (nth src (+ i 1)) "?"))
+                    (match (case-flag-after src (+ i 2) ci)
+                      (nil (recur (+ i 1) depth ci (conj saved ci) (conj out c)))
+                      ((some r) (let [j (. r snd)
+                                      chunk (vec (take (+ (- j i) 1) (drop i src)))]
+                                  (if (= (nth src j) ")")
+                                      (recur (+ j 1) depth (. r fst) saved (into out chunk))
+                                      (recur (+ j 1) depth (. r fst) (conj saved ci) (into out chunk))))))
+                  (and (= c "(") (= depth 0)) (recur (+ i 1) depth ci (conj saved ci) (conj out c))
+                  (and (= c ")") (= depth 0)) (recur (+ i 1) depth (if (> (count saved) 0) (nth saved (- (count saved) 1)) ci)
+                                                   (vec (take (max 0 (- (count saved) 1)) saved)) (conj out c))
+                  :else (recur (+ i 1) depth ci saved (conj out c))))))))
+
+(defun try-re-pattern (s: str) -> (Result rx/Regex str)
+  (try-let [t (expand-properties s)]
+    (rx/try-re-pattern t)))
+
+(defun re-pattern (s: str) -> rx/Regex
+  (match (try-re-pattern s)
+    ((Ok r) r)
+    ((Err e) (trap (str "PatternSyntaxException: " e " in " s)))))
+
+(defun try-re-pattern-flags (s: str flags: str) -> (Result rx/Regex str)
+  (try-re-pattern (str "(?" flags ")" s)))
+
+(defun re-pattern-flags (s: str flags: str) -> rx/Regex
+  (match (try-re-pattern-flags s flags)
+    ((Ok r) r)
+    ((Err e) (trap (str "PatternSyntaxException: " e " in " s)))))

@@ -1,0 +1,31 @@
+;; spec: spec/stdlib.md section 4.21 (fib.regex backtracking budget; the linear-time guarantee)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; covers: fib.regex try-re-find
+;; The guarantee is stated in two halves. (1) A pattern WITHOUT a backreference runs on the Pike VM, linear in the text: `(a+)+b` over 100000 letters a ends at once with no match (a backtracking matcher takes
+;; exponential time on it; this case would not finish). (2) A pattern WITH a backreference runs on the backtracking matcher, which has a budget of 5,000,000 steps per search; `(a*)*\1b` over a run of 52 a's and a
+;; c spends it, and `try-re-find` answers it as `(Err ..)` (and `re-find` traps, case 8433); a pattern that fits the budget answers `(Ok ..)` exactly as `re-find` does.
+(ns main (:use tl.check) (:require [fib.regex :as re] [fib.string :as str]))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (long (str/join (map (fn (i: i64) "a") (range 100000))))
+        (short "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"))
+    (do (check c (nil? (re/re-find (re/re-pattern "(a+)+b") long)))
+        (check c (not (re/backtracking? (re/re-pattern "(a+)+b"))))
+        (check c (match (re/try-re-find (re/re-pattern "(a*)*\\1b") short)
+                   ((Err e) (str/includes? e "backtracking budget exceeded"))
+                   ((Ok _) false)))
+        (check c (match (re/try-re-matches (re/re-pattern "(a*)*\\1b") short)
+                   ((Err e) (str/includes? e "backtracking budget exceeded"))
+                   ((Ok _) false)))
+        (check c (match (re/try-re-find (re/re-pattern "(a+)\\1") "xaaa")
+                   ((Ok m) (= (match m (nil "nil") ((some x) (. x whole))) "aa"))
+                   ((Err _) false)))
+        (check c (match (re/try-re-find (re/re-pattern "(a)b") "ab")
+                   ((Ok m) (some? m))
+                   ((Err _) false)))
+        (checks-result c))))

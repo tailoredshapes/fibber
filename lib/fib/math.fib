@@ -1,7 +1,101 @@
-;; fib.math (alias `math`, stdlib §4.10): so far `sqrt` only, which the n-body shootout program needs.
-;; sqrt is IEEE-exact (correctly rounded), so libm's `sqrt` gives the one answer in the interpreter and the
-;; compiled program. The spec makes it a builtin (§7 L11); until that lands this is the library function:
-;; the unsafe is here, in the library, never in a program that calls math/sqrt. Remove with the builtin.
-(ns fib.math (:require [fib.math.libm :as libm]))
+;; fib.math (alias `math`, stdlib §4.10): clojure.math over libm. Each function is the C99 one of the same name through the platform
+;; leaf fib.os.libm (ADR 0011), so the JIT and the compiled program give the one answer; `sqrt` is IEEE-exact.
+;; The unsafe is here, in the library, never in a program that calls `math/sin`. An explicit module: nothing is linked into a program that
+;; does not require it. Decided here, where the page is silent (package LIB-2):
+;;  - the functions take and answer f64. `round` is Java's `Math.round`: the exact floor of x + 1/2, as an i64 (NaN is 0, out of range
+;;    saturates, which `fptosi` does); `rint` is round-half-even and stays an f64.
+;;  - `signum` is 0.0 for 0.0 and -0.0 (the zero is returned as given), NaN for NaN.
+;;  - `get-exponent` is the unbiased exponent of a normal number, -1023 for zero and subnormals and 1024 for infinities and NaN (Java's).
+;;  - `floor-div` and `floor-mod` are over any signed integer type; the quotient rounds toward negative infinity. A zero divisor traps
+;;    as `quot` does, and the minimum divided by -1 traps `integer overflow` (Java's wraps).
+;;  - `add-exact` .. `decrement-exact` are the checked operators under Java's names: they trap with the integer overflow text where Java
+;;    throws ArithmeticException (`checked-add` and its kin are the Option-returning twins, fib.core).
+;;  - `random` is a double in [0, 1) from the platform's secure random bytes (fib.os.random): no global generator state (ADR 0013).
+;;    A failure of the random source traps.
+;;  - libm's results are the C library's, which differ from Java's fdlibm in the last place for some arguments of the transcendental functions
+;;    (`cbrt` is corrected for exact cubes, the one case a program notices); `sqrt`, `floor`, `ceil`, `rint`, `copy-sign` and `hypot` of exact
+;;    inputs are exact everywhere.
+;;  - `scalb` takes the scale as an i64 and clamps it into the range libm takes.
+(ns fib.math (:use fib.core) (:require [fib.os.libm :as libm] [fib.os.random :as rnd]))
 
 (defun sqrt (x: f64) -> f64 (unsafe (libm/sqrt x)))
+;; glibc's cbrt is not correctly rounded (27.0 gives 3.0000000000000004, Java's fdlibm gives 3.0): a result within a rounding of a whole
+;; number whose cube is exactly x is that whole number
+(defun cbrt (x: f64) -> f64
+  (let ((r (unsafe (libm/cbrt x))))
+    (let ((n (rint r)))
+      (if (= (* n (* n n)) x) n r))))
+(defun pow (a: f64 b: f64) -> f64 (unsafe (libm/pow a b)))
+(defun exp (x: f64) -> f64 (unsafe (libm/exp x)))
+(defun expm1 (x: f64) -> f64 (unsafe (libm/expm1 x)))
+(defun log (x: f64) -> f64 (unsafe (libm/log x)))
+(defun log10 (x: f64) -> f64 (unsafe (libm/log10 x)))
+(defun log1p (x: f64) -> f64 (unsafe (libm/log1p x)))
+(defun sin (x: f64) -> f64 (unsafe (libm/sin x)))
+(defun cos (x: f64) -> f64 (unsafe (libm/cos x)))
+(defun tan (x: f64) -> f64 (unsafe (libm/tan x)))
+(defun asin (x: f64) -> f64 (unsafe (libm/asin x)))
+(defun acos (x: f64) -> f64 (unsafe (libm/acos x)))
+(defun atan (x: f64) -> f64 (unsafe (libm/atan x)))
+(defun atan2 (y: f64 x: f64) -> f64 (unsafe (libm/atan2 y x)))
+(defun sinh (x: f64) -> f64 (unsafe (libm/sinh x)))
+(defun cosh (x: f64) -> f64 (unsafe (libm/cosh x)))
+(defun tanh (x: f64) -> f64 (unsafe (libm/tanh x)))
+(defun hypot (x: f64 y: f64) -> f64 (unsafe (libm/hypot x y)))
+(defun floor (x: f64) -> f64 (unsafe (libm/floor x)))
+(defun ceil (x: f64) -> f64 (unsafe (libm/ceil x)))
+(defun rint (x: f64) -> f64 (unsafe (libm/rint x)))
+(defun copy-sign (magnitude: f64 sign: f64) -> f64 (unsafe (libm/copysign magnitude sign)))
+(defun ieee-remainder (a: f64 b: f64) -> f64 (unsafe (libm/remainder a b)))
+(defun next-after (start: f64 direction: f64) -> f64 (unsafe (libm/nextafter start direction)))
+(defun next-up (x: f64) -> f64 (unsafe (libm/nextafter x (fdiv 1.0 0.0))))
+(defun next-down (x: f64) -> f64 (unsafe (libm/nextafter x (fdiv -1.0 0.0))))
+
+;; Java's Math.round: floor(x + 1/2) computed exactly (x - floor x >= 0.5 rounds up), an i64
+(defun round (x: f64) -> i64
+  (if (!= x x)
+      0
+      (let ((f (floor x)))
+        (if (>= (- x f) 0.5) (fptosi i64 (+ f 1.0)) (fptosi i64 f)))))
+
+(defun signum (x: f64) -> f64
+  (if (!= x x) x (if (> x 0.0) 1.0 (if (< x 0.0) -1.0 x))))
+
+(defun to-degrees (r: f64) -> f64 (* r 57.29577951308232))
+(defun to-radians (d: f64) -> f64 (* d 0.017453292519943295))
+
+;; the unbiased exponent of the double's bits
+(defun get-exponent (x: f64) -> i64
+  (- (bit-and (shr (f64->bits x) 52) 2047) 1023))
+
+;; the gap from |x| to the next double up
+(defun ulp (x: f64) -> f64
+  (let ((a (if (< x 0.0) (neg x) x)) (inf (fdiv 1.0 0.0)))
+    (cond (!= x x) x
+          (= a inf) inf
+          (= a 1.7976931348623157e308) 1.99584030953472e292
+          :else (- (next-up a) a))))
+
+(defun scalb (d: f64 scale: i64) -> f64
+  (unsafe (libm/scalbn d (trunc i32 (max -100000 (min 100000 scale))))))
+
+(defun floor-div (a: t b: t) :where ((Num t) (Ord t) (Unit t)) -> t
+  (let ((q (quot a b)) (r (rem a b)))
+    (if (and (!= r (zero a)) (!= (< r (zero a)) (< b (zero a)))) (dec q) q)))
+
+(defun floor-mod (a: t b: t) :where ((Num t) (Ord t) (Unit t)) -> t (mod a b))
+
+(defun add-exact (a: t b: t) :where ((Num t)) -> t (+ a b))
+(defun subtract-exact (a: t b: t) :where ((Num t)) -> t (- a b))
+(defun multiply-exact (a: t b: t) :where ((Num t)) -> t (* a b))
+(defun negate-exact (a: t) :where ((Num t)) -> t (neg a))
+(defun increment-exact (a: t) :where ((Num t) (Unit t)) -> t (inc a))
+(defun decrement-exact (a: t) :where ((Num t) (Unit t)) -> t (dec a))
+
+;; 53 random bits as a double in [0, 1)
+(defun random () -> f64
+  (match (rnd/random-bytes 8)
+    ((Err _) (trap "math/random: the platform's random source failed"))
+    ((Ok b) (let ((bits (loop ((i 0) (acc 0))
+                          (if (< i 8) (recur (+ i 1) (bit-or (shl acc 8) (bit-and (sext i64 (array-get b i)) 255))) acc))))
+              (* (sitofp f64 (shr bits 11)) 1.1102230246251565e-16)))))

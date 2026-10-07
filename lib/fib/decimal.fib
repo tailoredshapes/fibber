@@ -1,0 +1,348 @@
+;; fib.decimal: arbitrary-precision decimal numbers, java.math.BigDecimal's model (package LIB-2; proposed by the DMN agent's `Dec`, built on fib.bigint).
+;; An EXPLICIT module: `(:require [fib.decimal :as d])`; nothing in fib.core refers to it. A `Dec` is an unscaled BigInt and a scale: the value is
+;; unscaled x 10^-scale, so 1.50 and 1.5 are two Decs of one value, as BigDecimal's are (`dec-compare` says they are equal, `=` (Eq) that they differ,
+;; as BigDecimal's `compareTo` and `equals`). Everything below is checked against java.math.BigDecimal over 100000 seeded random operations
+;; (scripts/decimal-diff/run.sh; the report of package LIB-2 has the counts). Decided here, where the page is silent:
+;;  - the API is BigDecimal's under Clojure-shaped names: `dec-of-str` (new BigDecimal(String): sign, digits, a point, an exponent `e5` or `E-3`; nothing
+;;    else, no spaces), `dec-of-i64`, `dec-of-f64` (EXACT: `new BigDecimal(double)`, so 0.1 is 0.1000000000000000055511151231257827..., `dec-of-f64-text`
+;;    is `BigDecimal.valueOf(double)`: the shortest text that reads back, 0.1), `dec-to-f64` (correctly rounded), `dec-to-i64` (truncates; traps when it
+;;    does not fit), `dec-to-str` (BigDecimal.toString: plain notation while the scale is not negative and the adjusted exponent is at least -6, else
+;;    scientific `1.5E+3`), `dec-to-plain-str`.
+;;  - `dec-add dec-sub dec-mul` are exact (scale max, max, sum). `dec-round d mc` rounds to `mc`'s precision digits with its rounding mode (precision 0
+;;    is no rounding); `dec-set-scale d scale mode` is setScale (rounding when the scale shrinks; `Unnecessary` traps when it would have to round).
+;;    `dec-divide d e mc` is BigDecimal.divide(BigDecimal, MathContext): precision digits, and when the quotient is exact it is stripped of trailing zeros
+;;    down to the preferred scale (scale d - scale e); `dec-divide-scale d e scale mode` is divide(BigDecimal, int, RoundingMode); `dec-divide-exact` is
+;;    divide(BigDecimal): the quotient must have a finite expansion or it traps `Non-terminating decimal expansion; no exact representable decimal result.`
+;;    A zero divisor traps `/ by zero` (`Division by zero`, `Division undefined` for 0/0, as Java's messages).
+;;  - `MathContext` is a precision and a `RoundingMode`; `decimal128` is 34 digits half-even, `decimal64` 16, `decimal32` 7, `unlimited` precision 0.
+;;  - the rounding modes are Java's: Up (away from zero), Down (toward zero), Ceiling, Floor, HalfUp, HalfDown, HalfEven, Unnecessary.
+;;  - scales are held as i64 and traps `scale out of range` outside the int range Java has, so an absurd exponent is not an allocation of 10^(2^62).
+;;  - not offered: `remainder`, `divideToIntegralValue`, `sqrt`, `movePointLeft` (use `dec-set-scale` and `dec-mul`), `hashCode`.
+(ns fib.decimal
+  (:use fib.core fib.seq fib.coll fib.bigint)
+  (:require [fib.string :as s]))
+
+(defstruct Dec (unscaled: BigInt scale: i64))
+(derive Eq Dec)
+
+(defenum RoundingMode (Up) (Down) (Ceiling) (Floor) (HalfUp) (HalfDown) (HalfEven) (Unnecessary))
+(defstruct MathContext (precision: i64 mode: RoundingMode))
+
+(defun math-context (precision: i64 mode: RoundingMode) -> MathContext
+  (if (< precision 0) (trap "Digits < 0") (MathContext precision mode)))
+(defun decimal128 () -> MathContext (MathContext 34 HalfEven))
+(defun decimal64 () -> MathContext (MathContext 16 HalfEven))
+(defun decimal32 () -> MathContext (MathContext 7 HalfEven))
+(defun unlimited () -> MathContext (MathContext 0 HalfUp))
+
+(defun max-scale () -> i64 2147483647)
+
+(defun make-dec (u: BigInt sc: i64) -> Dec
+  (if (or (> sc (max-scale)) (< sc (neg (+ (max-scale) 1)))) (trap "scale out of range") (Dec u sc)))
+
+(defun dec-unscaled (d: Dec) -> BigInt (. d unscaled))
+(defun dec-scale (d: Dec) -> i64 (. d scale))
+(defun dec-signum (d: Dec) -> i64 (big-sign (. d unscaled)))
+
+(defun ten () -> BigInt (big-of-i64 10))
+(defun pow10 (n: i64) -> BigInt (expt (ten) n))
+
+;; the number of decimal digits of the unscaled value (1 for zero)
+(defun dec-precision (d: Dec) -> i64
+  (if (= (big-sign (. d unscaled)) 0) 1 (str-len (big-to-str (big-abs (. d unscaled))))))
+
+(defun digits-of (u: BigInt) -> i64 (if (= (big-sign u) 0) 1 (str-len (big-to-str (big-abs u)))))
+
+;; ---- construction and text ----
+
+(defun dec-of-i64 (n: i64) -> Dec (Dec (big-of-i64 n) 0))
+(defun dec-of-big (u: BigInt) -> Dec (Dec u 0))
+
+;; the digits and the position of the point of "d.ddd" (an unsigned mantissa): the digits without the point, and the number of digits after it; nil when malformed
+(defun mantissa (t: str) -> (Option (Pair str i64))
+  (match (str-find t "." 0)
+    (nil (if (and (> (str-len t) 0) (all-digits? t)) (some (Pair t 0)) nil))
+    ((some i) (let [a (str-slice t 0 i)
+                    b (str-slice t (+ i 1) (str-len t))]
+                (if (and (all-digits? a) (all-digits? b) (> (+ (str-len a) (str-len b)) 0))
+                    (some (Pair (str-concat a b) (str-len b)))
+                    nil)))))
+
+(defun all-digits? (t: str) -> bool
+  (loop [i 0] (if (< i (str-len t)) (if (and (>= (str-byte-at t i) 48i8) (<= (str-byte-at t i) 57i8)) (recur (+ i 1)) false) true)))
+
+;; the exponent after an `e` or `E`: an optional sign and digits, at most nine of them
+(defun exponent-of (t: str) -> (Option i64)
+  (let [neg? (and (> (str-len t) 0) (= (str-byte-at t 0) 45i8))
+        body (if (and (> (str-len t) 0) (or neg? (= (str-byte-at t 0) 43i8))) (str-slice t 1 (str-len t)) t)]
+    (if (and (> (str-len body) 0) (<= (str-len body) 10) (all-digits? body))
+        (let [v (unwrap-or (parse-long body) 0)] (some (if neg? (neg v) v)))
+        nil)))
+
+;; the index of the first `e` or `E`
+(defun exp-index (t: str) -> (Option i64)
+  (loop [i 0]
+    (cond (>= i (str-len t)) nil
+          (or (= (str-byte-at t i) 101i8) (= (str-byte-at t i) 69i8)) (some i)
+          :else (recur (+ i 1)))))
+
+;; BigDecimal(String)
+(defun dec-of-str (t: str) -> (Option Dec)
+  (let [neg? (and (> (str-len t) 0) (= (str-byte-at t 0) 45i8))
+        i (if (and (> (str-len t) 0) (or neg? (= (str-byte-at t 0) 43i8))) 1 0)
+        rest (str-slice t i (str-len t))
+        ei (exp-index rest)
+        mant (match ei (nil rest) ((some e) (str-slice rest 0 e)))
+        ex (match ei (nil (some 0)) ((some e) (exponent-of (str-slice rest (+ e 1) (str-len rest)))))]
+    (match (mantissa mant)
+      (nil nil)
+      ((some m) (match ex
+                  (nil nil)
+                  ((some e) (let [u (unwrap (parse-bigint (. m fst)))]
+                              (some (make-dec (if neg? (big-neg u) u) (- (. m snd) e))))))))))
+
+(defun dec-parse (t: str) -> Dec
+  (match (dec-of-str t) ((some d) d) (nil (trap (str "Character array is missing \"exponent\" mark 'e' or 'E'. " t)))))
+
+(defun zeros (n: i64) -> str
+  (loop [i 0 out ""] (if (< i n) (recur (+ i 1) (str-concat out "0")) out)))
+
+;; BigDecimal.toPlainString
+(defun dec-to-plain-str (d: Dec) -> str
+  (let [u (. d unscaled)
+        sc (. d scale)
+        sign (if (< (big-sign u) 0) "-" "")
+        digits (big-to-str (big-abs u))]
+    (cond (= (big-sign u) 0) (if (> sc 0) (str "0." (zeros sc)) "0")
+          (<= sc 0) (str sign digits (zeros (neg sc)))
+          (> (str-len digits) sc) (str sign (str-slice digits 0 (- (str-len digits) sc)) "." (str-slice digits (- (str-len digits) sc) (str-len digits)))
+          :else (str sign "0." (zeros (- sc (str-len digits))) digits))))
+
+;; BigDecimal.toString: plain while scale >= 0 and the adjusted exponent is >= -6, else scientific
+(defun dec-to-str (d: Dec) -> str
+  (let [u (. d unscaled)
+        sc (. d scale)
+        digits (big-to-str (big-abs u))
+        n (str-len digits)
+        adjusted (+ (neg sc) (- n 1))
+        sign (if (< (big-sign u) 0) "-" "")]
+    (cond (= sc 0) (str sign digits)
+          (and (> sc 0) (>= adjusted -6)) (dec-to-plain-str d)
+          :else (str sign (str-slice digits 0 1) (if (> n 1) (str "." (str-slice digits 1 n)) "")
+                    "E" (if (>= adjusted 0) "+" "") adjusted))))
+
+;; ---- comparison and the exact operations ----
+
+;; both unscaled values at the larger scale
+(defun aligned (a: Dec b: Dec) -> (Pair BigInt BigInt)
+  (let [sa (. a scale) sb (. b scale)]
+    (cond (= sa sb) (Pair (. a unscaled) (. b unscaled))
+          (> sa sb) (Pair (. a unscaled) (big-mul (. b unscaled) (pow10 (- sa sb))))
+          :else (Pair (big-mul (. a unscaled) (pow10 (- sb sa))) (. b unscaled)))))
+
+(defun dec-compare (a: Dec b: Dec) -> i64
+  (let [p (aligned a b)] (big-cmp (. p fst) (. p snd))))
+
+(defun dec-equals? (a: Dec b: Dec) -> bool (= a b))
+
+(defun dec-neg (a: Dec) -> Dec (Dec (big-neg (. a unscaled)) (. a scale)))
+(defun dec-abs (a: Dec) -> Dec (if (< (dec-signum a) 0) (dec-neg a) a))
+
+(defun dec-add (a: Dec b: Dec) -> Dec
+  (let [p (aligned a b)] (make-dec (big-add (. p fst) (. p snd)) (max (. a scale) (. b scale)))))
+(defun dec-sub (a: Dec b: Dec) -> Dec
+  (let [p (aligned a b)] (make-dec (big-sub (. p fst) (. p snd)) (max (. a scale) (. b scale)))))
+(defun dec-mul (a: Dec b: Dec) -> Dec (make-dec (big-mul (. a unscaled) (. b unscaled)) (+ (. a scale) (. b scale))))
+
+(defun dec-min (a: Dec b: Dec) -> Dec (if (<= (dec-compare a b) 0) a b))
+(defun dec-max (a: Dec b: Dec) -> Dec (if (>= (dec-compare a b) 0) a b))
+
+;; a^n for n >= 0
+(defun dec-pow (a: Dec n: i64) -> Dec
+  (if (or (< n 0) (> n 999999999)) (trap "Invalid operation") (make-dec (expt (. a unscaled) n) (* (. a scale) n))))
+
+;; the value with trailing zeros of the unscaled value removed (zero is 0, scale 0, as Java's)
+(defun dec-strip (a: Dec) -> Dec
+  (if (= (dec-signum a) 0)
+      (Dec (big-of-i64 0) 0)
+      (loop [u (. a unscaled) sc (. a scale)]
+        (let [qr (big-divmod u (ten))]
+          (if (= (big-sign (. qr snd)) 0) (recur (. qr fst) (- sc 1)) (Dec u sc))))))
+
+;; ---- rounding ----
+
+;; the quotient q of |n| by the positive d, adjusted by the rounding mode, for the sign of the whole value (neg?) and a nonzero-remainder flag
+;; `sticky` that stands for digits already dropped below the remainder r (its comparison with half of d is `cmp`: -1, 0 or 1)
+(defun round-up? (mode: RoundingMode neg?: bool q: BigInt inexact?: bool cmp: i64) -> bool
+  (match mode
+    ((Up) inexact?)
+    ((Down) false)
+    ((Ceiling) (and inexact? (not neg?)))
+    ((Floor) (and inexact? neg?))
+    ((HalfUp) (>= cmp 0))
+    ((HalfDown) (> cmp 0))
+    ((HalfEven) (or (> cmp 0) (and (= cmp 0) (big-odd? q))))
+    ((Unnecessary) (if inexact? (trap "Rounding necessary") false))))
+
+;; the quotient of a by the positive b, rounded: `extra` is true when digits below the division's remainder were dropped before it (they count as a remainder)
+(defun divide-and-round (a: BigInt b: BigInt mode: RoundingMode extra?: bool) -> BigInt
+  (let [neg? (< (big-sign a) 0)
+        qr (big-divmod (big-abs a) b)
+        q (. qr fst)
+        r (. qr snd)
+        inexact? (or extra? (!= (big-sign r) 0))
+        cmp (let [c (big-cmp (big-mul-small r 2) b)] (if (and (= c 0) extra?) 1 c))
+        up? (round-up? mode neg? q inexact? cmp)
+        q2 (if up? (big-add q (big-of-i64 1)) q)]
+    (if neg? (big-neg q2) q2)))
+
+;; the value rounded to `mc`'s precision; a carry that makes a digit too many is divided away
+(defun dec-round (d: Dec mc: MathContext) -> Dec
+  (let [p (. mc precision)
+        n (dec-precision d)]
+    (if (or (= p 0) (<= n p))
+        d
+        (let [drop (- n p)
+              q (divide-and-round (. d unscaled) (pow10 drop) (. mc mode) false)
+              sc (- (. d scale) drop)]
+          (if (> (digits-of q) p)
+              (make-dec (big-quot q (ten)) (- sc 1))
+              (make-dec q sc))))))
+
+(defun dec-set-scale (d: Dec sc: i64 mode: RoundingMode) -> Dec
+  (let [cur (. d scale)]
+    (cond (= sc cur) d
+          (> sc cur) (make-dec (big-mul (. d unscaled) (pow10 (- sc cur))) sc)
+          :else (make-dec (divide-and-round (. d unscaled) (pow10 (- cur sc)) mode false) sc))))
+
+;; ---- division ----
+
+(defun check-divisor (a: Dec b: Dec) -> unit
+  (if (= (dec-signum b) 0)
+      (trap (if (= (dec-signum a) 0) "Division undefined" "Division by zero"))
+      ()))
+
+;; divide(BigDecimal, int scale, RoundingMode): a / b with exactly `sc` digits after the point
+(defun dec-divide-scale (a: Dec b: Dec sc: i64 mode: RoundingMode) -> Dec
+  (do (check-divisor a b)
+      (let [k (- (+ sc (. b scale)) (. a scale))
+            num (if (>= k 0) (big-mul (. a unscaled) (pow10 k)) (. a unscaled))
+            den (if (>= k 0) (. b unscaled) (big-mul (. b unscaled) (pow10 (neg k))))
+            sgn (if (< (big-sign den) 0) -1 1)]
+        (make-dec (divide-and-round (if (< sgn 0) (big-neg num) num) (big-abs den) mode false) sc))))
+
+;; the trailing zeros stripped while the scale stays at or above `pref`
+(defun strip-to (u: BigInt sc: i64 pref: i64) -> Dec
+  (loop [u u sc sc]
+    (if (> sc pref)
+        (let [qr (big-divmod u (ten))]
+          (if (= (big-sign (. qr snd)) 0) (recur (. qr fst) (- sc 1)) (make-dec u sc)))
+        (make-dec u sc))))
+
+;; divide(BigDecimal, MathContext): `precision` digits, rounded by the mode; an exact quotient is stripped down to the preferred scale
+(defun dec-divide (a: Dec b: Dec mc: MathContext) -> Dec
+  (let [p (. mc precision)]
+    (if (= p 0)
+        (dec-divide-exact a b)
+        (do (check-divisor a b)
+            (let [pref (- (. a scale) (. b scale))]
+              (if (= (dec-signum a) 0)
+                  (make-dec (big-of-i64 0) (max (neg (+ (max-scale) 1)) (min (max-scale) pref)))
+                  (divide-p a b mc pref)))))))
+
+;; the quotient with p + 1 or p + 2 digits, then rounded to p; exact when nothing was left over
+(defun divide-p (a: Dec b: Dec mc: MathContext pref: i64) -> Dec
+  (let [p (. mc precision)
+        k (+ (- p (- (digits-of (. a unscaled)) (digits-of (. b unscaled)))) 1)
+        num (if (>= k 0) (big-mul (big-abs (. a unscaled)) (pow10 k)) (big-abs (. a unscaled)))
+        den (if (>= k 0) (big-abs (. b unscaled)) (big-mul (big-abs (. b unscaled)) (pow10 (neg k))))
+        neg? (!= (< (big-sign (. a unscaled)) 0) (< (big-sign (. b unscaled)) 0))
+        qr (big-divmod num den)
+        q (. qr fst)
+        exact? (= (big-sign (. qr snd)) 0)
+        sc (+ pref k)
+        signed (if neg? (big-neg q) q)
+        rem? (not exact?)]
+    (let [n (digits-of q)
+          drop (- n p)
+          pw (pow10 drop)
+          q2 (if (> drop 0) (divide-and-round-sticky signed pw (. mc mode) rem?) signed)
+          sc2 (- sc drop)
+          fin (if (> (digits-of q2) p) (Pair (big-quot q2 (ten)) (- sc2 1)) (Pair q2 sc2))
+          dropped-zero? (and exact? (= (big-sign (big-rem (big-abs q) pw)) 0))]
+      (if dropped-zero?
+          (strip-to (. fin fst) (. fin snd) pref)
+          (make-dec (. fin fst) (. fin snd))))))
+
+;; the quotient of a by the positive b where a remainder was already dropped below `a`'s last digit (`sticky`)
+(defun divide-and-round-sticky (a: BigInt b: BigInt mode: RoundingMode sticky: bool) -> BigInt
+  (divide-and-round a b mode sticky))
+
+;; divide(BigDecimal): the exact quotient, or a trap when its expansion does not end
+(defun dec-divide-exact (a: Dec b: Dec) -> Dec
+  (do (check-divisor a b)
+      (let [pref (- (. a scale) (. b scale))]
+        (if (= (dec-signum a) 0)
+            (make-dec (big-of-i64 0) pref)
+            (let [g (gcd (big-abs (. a unscaled)) (big-abs (. b unscaled)))
+                  den (big-quot (big-abs (. b unscaled)) g)
+                  twos-fives (count-2-5 den)]
+              (if (not (big-eq? (. twos-fives snd) (big-of-i64 1)))
+                  (trap "Non-terminating decimal expansion; no exact representable decimal result.")
+                  (let [k (max 0 (. twos-fives fst))
+                        num (big-mul (. a unscaled) (pow10 k))
+                        q (big-quot num (if (< (big-sign (. b unscaled)) 0) (big-neg (. b unscaled)) (. b unscaled)))
+                        q2 (if (< (big-sign (. b unscaled)) 0) (big-neg q) q)]
+                    (strip-to q2 (+ pref k) pref))))))))
+
+(defun big-eq? (a: BigInt b: BigInt) -> bool (= (big-cmp a b) 0))
+
+;; the number of decimal places an exact quotient by n needs (the larger of the exponents of 2 and 5 in n) and what is left of n when they are removed
+(defun count-2-5 (n: BigInt) -> (Pair i64 BigInt)
+  (loop [m n twos 0 fives 0]
+    (let [q2 (big-divmod m (big-of-i64 2))]
+      (if (= (big-sign (. q2 snd)) 0)
+          (recur (. q2 fst) (+ twos 1) fives)
+          (let [q5 (big-divmod m (big-of-i64 5))]
+            (if (= (big-sign (. q5 snd)) 0)
+                (recur (. q5 fst) twos (+ fives 1))
+                (Pair (max twos fives) m)))))))
+
+;; ---- conversions ----
+
+(defun dec-to-i64 (d: Dec) -> i64
+  (let [sc (. d scale)
+        u (. d unscaled)]
+    (big-to-i64 (if (<= sc 0) (big-mul u (pow10 (neg sc))) (big-quot u (pow10 sc))))))
+
+(defun dec-to-f64 (d: Dec) -> f64 (unwrap-or (parse-double (dec-to-str d)) 0.0))
+
+;; new BigDecimal(double): the exact value of the double
+(defun dec-of-f64 (x: f64) -> Dec
+  (if (or (!= x x) (= (- x x) (fdiv 1.0 0.0)) (!= (- x x) 0.0))
+      (trap "Infinite or NaN")
+      (let [bits (f64->bits x)
+            neg? (< bits 0)
+            e (bit-and (shr bits 52) 2047)
+            frac (bit-and bits 4503599627370495)
+            m0 (if (= e 0) frac (bit-or frac 4503599627370496))
+            e0 (if (= e 0) -1074 (- e 1075))]
+        (exact-double (big-of-i64 (if neg? (neg m0) m0)) e0))))
+
+;; m * 2^e as a Dec: for e < 0, m * 5^-e at scale -e after the trailing zero bits of m are removed
+(defun exact-double (m: BigInt e: i64) -> Dec
+  (cond (= (big-sign m) 0) (Dec m 0)
+        (>= e 0) (Dec (big-shift-left m e) 0)
+        :else (loop [m m e e]
+                (if (and (< e 0) (big-even? m)) (recur (big-quot m (big-of-i64 2)) (+ e 1))
+                    (if (< e 0) (Dec (big-mul m (expt (big-of-i64 5) (neg e))) (neg e)) (Dec m 0))))))
+
+;; BigDecimal.valueOf(double): the shortest text that reads back, as Double.toString writes it
+(defun dec-of-f64-text (x: f64) -> Dec (dec-parse (str x)))
+
+;; ---- instances ----
+
+(impl Ord Dec (< (self y) (< (dec-compare self y) 0)))
+(impl Show Dec (show (self) (dec-to-str self)))
+(impl ToStr Dec (to-str (self) (dec-to-str self)))
+(impl Debug Dec (debug (self) (str (dec-to-str self) "M")))

@@ -1,0 +1,137 @@
+;; fib.seq.tail: the sequence functions of stdlib §4.4 that need nothing but Reducible and a Vec (package LIB-2): take-last butlast drop-last
+;; take-nth nthrest nthnext nnext keep-indexed dedupe split-with splitv-at bounded-count partitionv partitionv-all tree-seq, and the
+;; vector forms rangev mapcatv sort-byv sortv. Decided here, where the page is silent:
+;;  - a function that must know the length (take-last, butlast, drop-last) reads the source once into a Vec and answers the part of it
+;;    as a seq over a Vec: Clojure's are lazy over a counted source, ours materialise, as `reverse` does. Nothing here is infinite
+;;    except `(take-nth 0 c)`, which repeats the first element for ever, as Clojure's does (the row, §9.1 Q33).
+;;  - the "empty where Clojure has nil" rule of §5 T1: butlast, drop-last and take-last of a short source are the empty seq; nthnext and
+;;    nnext answer an Option, nil when the source is exhausted, because their Clojure result is nil there.
+;;  - `nthrest` takes the source first, as the row says, and is `drop` otherwise.
+;;  - `tree-seq` walks depth first with an explicit Vec for a stack (no recursion, so a deep tree cannot overflow the stack) and is
+;;    eager: the whole walk is made when it is called, which differs from Clojure's lazy walk only for an infinite tree.
+;;  - rangev, mapcatv, sort-byv and sortv are the Vec-typed forms of range, mapcat, sort-by and sort, as mapv and filterv are
+;;    of map and filter: `(if c (range n) [])` does not type-check (a Range is not a Vec) and `(if c (rangev n) [])` does (§3 N13).
+(ns fib.seq.tail (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.vseq fib.seq.sources fib.seq.adaptors fib.seq.sort fib.seq.consumers fib.seq.streams))
+
+;; the elements a to b-1 of v (0 <= a <= b <= count v is the caller's)
+(defun vec-between :private (v: (Vec e) a: i64 b: i64) -> (Vec e)
+  (loop ((i a) (acc (vec-empty)))
+    (if (< i b) (recur (+ i 1) (vec-conj acc (vec-nth v i))) acc)))
+
+(defun take-last (n: i64 c: c) :where ((Reducible c e)) -> (VSeq e)
+  (let ((v (to-vec c)))
+    (let ((k (vec-count v)))
+      (vseq-of (vec-between v (if (> n k) 0 (if (< n 0) k (- k n))) k)))))
+
+(defun butlast (c: c) :where ((Reducible c e)) -> (LSeq e)
+  (let ((v (to-vec c)))
+    (to-lseq (vec-between v 0 (if (> (vec-count v) 0) (- (vec-count v) 1) 0)))))
+
+(defn drop-last
+  ([c: c] :where ((Reducible c e)) -> (LSeq e)
+  (butlast c))
+  ([n: i64 c: c] :where ((Reducible c e)) -> (LSeq e)
+  (let ((v (to-vec c)))
+    (let ((k (vec-count v)))
+      (to-lseq (vec-between v 0 (if (< n 0) k (if (> n k) 0 (- k n)))))))))
+
+;; every n-th element, the first included; n < 1 repeats the first element for ever (Clojure's), and an empty source stays empty
+(defun take-nth (n: i64 c: c) :where ((Reducible c e)) -> (LSeq e)
+  (if (< n 1)
+      (match (first c) (nil (to-lseq (vec-empty))) ((some x) (to-lseq (repeat x))))
+      (let ((v (to-vec c)))
+        (to-lseq (loop ((i 0) (acc (vec-empty)))
+                   (if (< i (vec-count v)) (recur (+ i n) (vec-conj acc (vec-nth v i))) acc))))))
+
+(defun nthrest (c: c n: i64) :where ((Reducible c e)) -> (LSeq e)
+  (drop n c))
+
+;; the source after its first n elements, nil when none is left
+(defun nthnext (n: i64 c: c) :where ((Reducible c e)) -> (Option (LSeq e))
+  (let ((v (to-vec c)))
+    (let ((k (vec-count v)) (m (if (< n 0) 0 n)))
+      (if (< m k) (some (to-lseq (vec-between v m k))) nil))))
+
+(defun nnext (c: c) :where ((Reducible c e)) -> (Option (LSeq e))
+  (nthnext 2 c))
+
+(defun bounded-count (n: i64 c: c) :where ((Reducible c e)) -> i64
+  (let ((k (cell 0)))
+    (do (each-while c (fn (x) (do (set! k (+ @k 1)) (< @k n)))) @k)))
+
+;; (keep-indexed f c): the payloads of the (some y) results of (f i x)
+(defun keep-indexed (f: (fn (i64 e) (Option b)) c: c) :where ((Reducible c e)) -> (LSeq b)
+  (let ((v (to-vec c)))
+    (to-lseq (loop ((i 0) (acc (vec-empty)))
+               (if (< i (vec-count v))
+                   (recur (+ i 1) (match (f i (vec-nth v i)) (nil acc) ((some y) (vec-conj acc y))))
+                   acc)))))
+
+;; the elements with each run of equal neighbours made one
+(defun dedupe (c: c) :where ((Reducible c e) (Eq e)) -> (LSeq e)
+  (let ((v (to-vec c)))
+    (to-lseq (loop ((i 0) (acc (vec-empty)))
+               (if (< i (vec-count v))
+                   (recur (+ i 1) (if (and (> i 0) (= (vec-nth v i) (vec-nth v (- i 1)))) acc (vec-conj acc (vec-nth v i))))
+                   acc)))))
+
+;; the first n elements and the rest, both Vecs, in one pass
+(defun splitv-at (n: i64 c: c) :where ((Reducible c e)) -> (Pair (Vec e) (Vec e))
+  (let ((v (to-vec c)))
+    (let ((k (vec-count v)) (m (if (< n 0) 0 n)))
+      (let ((at (if (> m k) k m)))
+        (Pair (vec-between v 0 at) (vec-between v at k))))))
+
+;; the longest prefix whose elements satisfy p, and the rest; p runs once per element up to and including the first failure
+(defun split-with (p: (fn (e) r) c: c) :where ((Reducible c e) (Truthy r)) -> (Pair (VSeq e) (VSeq e))
+  (let ((v (to-vec c)))
+    (let ((k (vec-count v))
+          (at (loop ((i 0)) (if (and (< i (vec-count v)) (truthy? (p (vec-nth v i)))) (recur (+ i 1)) i))))
+      (Pair (vseq-of (vec-between v 0 at)) (vseq-of (vec-between v at k))))))
+
+;; the groups of n elements as Vecs; the last short group is dropped by partitionv and kept by partitionv-all
+(defun chunks :private (n: i64 keep-short: bool c: c) :where ((Reducible c e)) -> (LSeq (Vec e))
+  (let ((v (to-vec c)))
+    (to-lseq (if (< n 1)
+                 (vec-empty)
+                 (loop ((i 0) (acc (vec-empty)))
+                   (let ((k (vec-count v)))
+                     (if (or (<= (+ i n) k) (and keep-short (< i k)))
+                         (recur (+ i n) (vec-conj acc (vec-between v i (if (< (+ i n) k) (+ i n) k))))
+                         acc)))))))
+
+(defun partitionv (n: i64 c: c) :where ((Reducible c e)) -> (LSeq (Vec e))
+  (chunks n false c))
+
+(defun partitionv-all (n: i64 c: c) :where ((Reducible c e)) -> (LSeq (Vec e))
+  (chunks n true c))
+
+;; (tree-seq branch? children root): the nodes depth first, a node before its children
+(defun tree-seq (branch?: (fn (n) bool) :borrow children: (fn (n) d) :borrow root: n) :where ((Reducible d n)) -> (LSeq n)
+  (loop ((stack (vec-conj (vec-empty) root)) (out (vec-empty)))
+    (if (= (vec-count stack) 0)
+        (to-lseq out)
+        (let ((top (vec-nth stack (- (vec-count stack) 1)))
+              (remaining (vec-between stack 0 (- (vec-count stack) 1))))
+          (let ((kids (if (branch? top) (to-vec (children top)) (vec-empty))))
+            (recur (loop ((j (- (vec-count kids) 1)) (s remaining))
+                     (if (>= j 0) (recur (- j 1) (vec-conj s (vec-nth kids j))) s))
+                   (vec-conj out top)))))))
+
+;; the Vec forms
+(defn rangev
+  ([n: t] :where ((Num t) (Ord t) (Unit t) (RangeLen t)) -> (Vec t)
+  (to-vec (range n)))
+  ([a: t b: t] :where ((Num t) (Ord t) (Unit t) (RangeLen t)) -> (Vec t)
+  (to-vec (range a b (one a))))
+  ([a: t b: t s: t] :where ((Num t) (Ord t) (Unit t) (RangeLen t)) -> (Vec t)
+  (to-vec (range a b s))))
+
+(defun mapcatv (f: (fn (e) d) c: c) :where ((Reducible c e) (Reducible d b)) -> (Vec b)
+  (to-vec (mapcat f c)))
+
+(defun sortv (c: c) :where ((Reducible c e) (Ord e)) -> (Vec e)
+  (to-vec (sort c)))
+
+(defun sort-byv (key: (fn (e) k) c: c) :where ((Reducible c e) (Ord k)) -> (Vec e)
+  (to-vec (sort-by key c)))

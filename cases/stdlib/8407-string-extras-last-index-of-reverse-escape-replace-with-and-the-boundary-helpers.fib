@@ -1,0 +1,46 @@
+;; spec: spec/stdlib.md section 4.7 rows str/last-index-of str/reverse str/escape str/replace-with str/re-quote-replacement; section 2.9 (the byte-offset rule: str/char-boundary? str/next-boundary str/prev-boundary)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; covers: str/last-index-of str/reverse str/escape str/replace-with str/re-quote-replacement
+;; Package LIB-2. last-index-of answers a CHARACTER offset (Java's lastIndexOf: "abcabc" "bc" is 4, with from 3 it is 1, "aéaé" "é" is 3, a miss and a negative from are nil); reverse is by scalar value
+;; ("aéb" is "béa"); escape keeps what f does not map; re-quote-replacement makes `$` and `\` literal; replace-with calls f on each match in order. The boundary helpers: in "aé" (bytes a, 0xC3, 0xA9) offsets 0, 1 and 3
+;; are boundaries, 2 is not; next-boundary 2 is 3, prev-boundary 2 is 1, and both clamp.
+(ns main (:use tl.check) (:require [fib.string :as str]))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (str/last-index-of "abcabc" "bc") (some 4)))
+        (check c (= (str/last-index-of "abcabc" "bc" 3) (some 1)))
+        (check c (= (str/last-index-of "aéaé" "é") (some 3)))
+        (check c (nil? (str/last-index-of "abc" "x")))
+        (check c (nil? (str/last-index-of "abc" "a" -1)))
+        (check c (= (str/last-index-of "abc" "") (some 3)))
+        (check c (= (str/last-index-of "abca" \a) (some 3)))
+        (check c (= (str/reverse "aéb") "béa"))
+        (check c (= (str/reverse "") ""))
+        (check c (= (str/escape "a<b>" (fn (ch: char) (if (= ch \<) (some "&lt;") (if (= ch \>) (some "&gt;") nil)))) "a&lt;b&gt;"))
+        (check c (= (str/re-quote-replacement "a$b\\c") "a\\$b\\\\c"))
+        (check c (= (str/replace-with "a1b22c" "2" (fn (m: str) (str "<" m ">"))) "a1b<2><2>c"))
+        (check c (= (str/replace-with "abc" "x" (fn (m: str) "?")) "abc"))
+        (check c (str/char-boundary? "aé" 0))
+        (check c (str/char-boundary? "aé" 1))
+        (check c (not (str/char-boundary? "aé" 2)))
+        (check c (str/char-boundary? "aé" 3))
+        (check c (not (str/char-boundary? "aé" 4)))
+        (check c (not (str/char-boundary? "aé" -1)))
+        (check c (= (str/next-boundary "aé" 2) 3))
+        (check c (= (str/prev-boundary "aé" 2) 1))
+        (check c (= (str/next-boundary "aé" 99) 3))
+        (check c (= (str/prev-boundary "aé" -4) 0))
+        (check c (= (str/next-boundary "aé" 1) 1))
+        (check c (= (str-slice "aé" 0 (str/prev-boundary "aé" 2)) "a"))
+        (check c (= (subs "aé" 1 2) "é"))
+        (check c (= (str/join ", " ["a" "b" "c"]) "a, b, c"))
+        (check c (= (str/join "-" [1 2 3]) "1-2-3"))
+        (check c (= (str/join ["a" "b" "c"]) "abc"))
+        (check c (= (str/join [1 2 3]) "123"))
+        (check c (= (str/join "-" (take 0 ["a"])) ""))
+        (checks-result c))))

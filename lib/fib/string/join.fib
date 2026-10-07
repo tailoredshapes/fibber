@@ -1,9 +1,10 @@
 ;; fib.string.join: `str/join` (owner L10b; stdlib §4.7, §3 N9; tranche 1 plan §6 L10b). Replaces the
 ;; prelude's `str-join`, which takes a `(Vec str)` only and which stays (M keeps it).
 ;; Decided here, where the page is silent:
-;;  - the one-argument arity `(str/join c)` is the page's `(str/join "" c)` until arity overloading
-;;    lands (L1): a name has one arity today, so `str/join` takes the separator and the source,
-;;    `(str/join sep c)`, over any `(Reducible c e)` whose element is a `(ToStr e)`.
+;;  - `(str/join c)` is `(str/join "" c)` (package LIB-2: arity overloading landed with L1) and `(str/join sep c)` takes the separator and the source over any
+;;    `(Reducible c e)` whose element is a `(ToStr e)`. The unqualified prelude `str-join` stays `(Vec str) -> str` with no separator: the compiler uses it
+;;    in 1791 places and a prelude function cannot have clauses (the expander reads `NAME$N` clauses per module, and a bare `str-join` call in another module
+;;    would be `unbound name`: tried, then reverted); the separator form is `str/join`.
 ;;  - the text is built in one pass over the source: each element is turned into its `to-str` text
 ;;    once and held, then the total length is known and one byte array is filled and made a `str`
 ;;    (the prelude's `str-join` idea): no `str-concat` per element, which would copy the text so far
@@ -32,7 +33,13 @@
 ;; The parts are collected by the bulk builder (vec-collect: two objects for every 32 parts), not by a conj onto a vector held
 ;; in a cell: the read of the cell makes the vector shared, so every conj copied the tail of up to 32 parts. The length of the
 ;; text is summed on the way, so there is no pass for it.
-(defun join (sep: str c: c) :where ((Reducible c e) (ToStr e)) -> str
+(defn join
+  ([c: c] :where ((Reducible c e) (ToStr e)) -> str
+  (join-with "" c))
+  ([sep: str c: c] :where ((Reducible c e) (ToStr e)) -> str
+  (join-with sep c)))
+
+(defun join-with :private (sep: str c: c) :where ((Reducible c e) (ToStr e)) -> str
   (let ((len (cell 0))
         (n (cell 0))
         (parts (fib.prelude/vec-collect

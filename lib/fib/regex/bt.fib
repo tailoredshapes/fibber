@@ -1,0 +1,113 @@
+;; fib.regex.bt: the backtracking matcher, used only for a pattern that has a backreference (`\1`), which the Pike VM cannot run (package LIB-2).
+;; It runs the same program as the Pike VM (fib.regex.prog, with the extra instruction BACKREF) depth first, in priority order, so it finds the
+;; match Java finds: the leftmost start, and of the matches there the first by greedy/lazy/alternative priority. A frame of the explicit stack
+;; is a SPLIT's other branch (the pc, the position, and how long the undo log was); a SAVE logs the slot's old value, so going back undoes the
+;; captures made since. The stack is a list and so costs no recursion depth: a long text cannot overflow the call stack.
+;; THE GUARANTEE IS DIFFERENT FROM THE PIKE VM'S, and is stated: the Pike VM is linear in (text x pattern) for every pattern and is the matcher
+;; of every pattern without a backreference; this one is exponential in the worst case (`(a*)*\1b` against a long run of a). It therefore runs
+;; with a BUDGET of steps (one per instruction executed, shared by all the start positions of one search): when the budget is spent the
+;; search is abandoned and the answer is the sentinel `(array 1 -2)`, which fib.regex.api turns into `(Err "regex backtracking budget
+;; exceeded ..")` for `try-re-find` and a trap for `re-find`. The default budget is 5,000,000 steps (about a second).
+(ns fib.regex.bt (:use fib.core fib.seq fib.coll fib.string.utf8 fib.regex.prog fib.regex.pike))
+
+(defstruct Frame (pc: i64 pos: i64 tlen: i64))
+(defstruct Undo (slot: i64 old: i64))
+
+(defstruct BtK (p: Prog s: str n: i64 endreq: bool budget: i64 used: (Cell i64) caps: (Cell (Array i64))))
+
+(defun default-budget () -> i64 5000000)
+
+(defun exceeded () -> (Array i64) (array 1 -2))
+(defun exceeded? (caps: (Array i64)) -> bool (and (= (array-len caps) 1) (= (array-get caps 0) -2)))
+
+;; ASCII letters equal when the case does not matter
+(defun fold-byte (b: i64) -> i64 (if (and (>= b 65) (<= b 90)) (+ b 32) b))
+
+;; whether the text of s from a to b is at pos
+(defun ref-at? (s: str a: i64 b: i64 pos: i64 ci: bool) -> bool
+  (let [len (- b a)]
+    (and (<= (+ pos len) (str-len s))
+         (loop [k 0]
+           (if (< k len)
+               (let [x (zext i64 (str-byte-at s (+ a k)))
+                     y (zext i64 (str-byte-at s (+ pos k)))]
+                 (if (or (= x y) (and ci (= (fold-byte x) (fold-byte y)))) (recur (+ k 1)) false))
+               true)))))
+
+;; the log undone down to length `tlen`
+(defun undo-to (k: BtK trail: (List Undo) tn: i64 tlen: i64) -> (List Undo)
+  (if (> tn tlen)
+      (match trail
+        ((Cons u rest) (do (caps-set! k (. u slot) (. u old)) (undo-to k rest (- tn 1) tlen)))
+        (Empty trail))
+      trail))
+
+(defun caps-set! (k: BtK slot: i64 v: i64) -> unit
+  (let [c (. k caps)] (array-set! &c slot v)))
+
+(defun bt-fail (k: BtK stack: (List Frame) trail: (List Undo) tn: i64) -> (Array i64)
+  (match stack
+    ((Empty) (no-caps))
+    ((Cons f rest) (let [t2 (undo-to k trail tn (. f tlen))]
+                     (bt-step k (. f pc) (. f pos) rest t2 (. f tlen))))))
+
+;; SAVE. A group's start is not visible until the group closes (Java's GroupHead keeps it in a local and GroupTail commits both ends): a backreference
+;; inside its own group, or in a later iteration of a loop around it, sees the PREVIOUS complete capture. So the start of group g (slot 2g) is written to a
+;; pending slot after the pattern's own (nslots + g), and the end (slot 2g+1) commits start and end together. The whole match (slots 0 and 1) and the loop
+;; slots are plain. Every write is logged for undo.
+(defun bt-save (k: BtK pc: i64 x: i64 pos: i64 stack: (List Frame) trail: (List Undo) tn: i64) -> (Array i64)
+  (let [p (. k p)
+        ng2 (* 2 (+ (. p groups) 1))
+        grp? (and (>= x 2) (< x ng2))
+        start? (and grp? (= (rem x 2) 0))
+        end? (and grp? (= (rem x 2) 1))
+        slot (if start? (+ (. p nslots) (quot x 2)) x)
+        old (array-get @(. k caps) slot)]
+    (do (caps-set! k slot pos)
+        (if end?
+            (let [sslot (- x 1)
+                  sold (array-get @(. k caps) sslot)]
+              (do (caps-set! k sslot (array-get @(. k caps) (+ (. p nslots) (quot x 2))))
+                  (bt-step k (+ pc 1) pos stack (Cons (Undo sslot sold) (Cons (Undo slot old) trail)) (+ tn 2))))
+            (bt-step k (+ pc 1) pos stack (Cons (Undo slot old) trail) (+ tn 1))))))
+
+(defun bt-step (k: BtK pc: i64 pos: i64 stack: (List Frame) trail: (List Undo) tn: i64) -> (Array i64)
+  (do (set! (. k used) (+ @(. k used) 1))
+      (if (> @(. k used) (. k budget))
+          (exceeded)
+          (let [p (. k p)
+                op (array-get (. p ops) pc)
+                x (array-get (. p xs) pc)
+                y (array-get (. p ys) pc)]
+            (cond (= op op-set)
+                  (if (and (< pos (. k n)) (member? p x (cls-of p (cp-at (. k s) pos))))
+                      (bt-step k (+ pc 1) (+ pos (width-of (byte-at (. k s) pos))) stack trail tn)
+                      (bt-fail k stack trail tn))
+                  (= op op-split) (bt-step k x pos (Cons (Frame y pos tn) stack) trail tn)
+                  (= op op-jmp) (bt-step k x pos stack trail tn)
+                  (= op op-save) (bt-save k pc x pos stack trail tn)
+                  (= op op-loopchk) (if (> pos (array-get @(. k caps) x))
+                                        (bt-step k (+ pc 1) pos stack trail tn)
+                                        (bt-step k y pos stack trail tn))
+                  (= op op-assert) (if (assert-ok? (. k s) x pos)
+                                       (bt-step k (+ pc 1) pos stack trail tn)
+                                       (bt-fail k stack trail tn))
+                  (= op op-backref) (let [a (array-get @(. k caps) (* 2 x))
+                                          b (array-get @(. k caps) (+ (* 2 x) 1))]
+                                      (if (and (>= a 0) (and (>= b 0) (ref-at? (. k s) a b pos (= y 1))))
+                                          (bt-step k (+ pc 1) (+ pos (- b a)) stack trail tn)
+                                          (bt-fail k stack trail tn)))
+                  :else (if (or (not (. k endreq)) (= pos (. k n)))
+                            (array-copy @(. k caps) 0 (array-len @(. k caps)))
+                            (bt-fail k stack trail tn)))))))
+
+;; the slots of the match of p in s that starts at `from` or later (at `from` only when `anchored`), or an empty array, or the sentinel
+;; of an exhausted budget. `endreq`: the match must end at the end of the text (Java's `matches`).
+(defun bt-run (p: Prog s: str from: i64 anchored: bool endreq: bool budget: i64) -> (Array i64)
+  (let [k (BtK p s (str-len s) endreq budget (cell 0) (cell (array (+ (. p nslots) (. p groups) 1) -1)))]
+    (loop [st from]
+      (do (set! (. k caps) (array (+ (. p nslots) (. p groups) 1) -1))
+          (let [r (bt-step k 0 st (list) (list) 0)]
+            (cond (> (array-len r) 0) r
+                  (or anchored (>= st (str-len s))) r
+                  :else (recur (+ st (width-of (byte-at s st))))))))))

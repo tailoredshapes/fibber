@@ -118,15 +118,16 @@
     ((Ok steps) (judged-row (. j sc) (. (. j suite) head) (. (. j suite) impl) steps))
     ((Err trap) (failed-row (. j sc) (. (. j suite) head) (. (. j suite) impl) "trap" (str "trap: " (. trap message))))))
 
-;; `jobs` scenarios at a time, each in a task; the rows in order.
-(defun run-tasks (js: (Vec ScenarioJob) jobs: i64) -> (Vec ScenarioRow)
+;; `jobs` scenarios at a time, each in a task; the rows in order. `stream` is called with each row as soon as it is made (package LIB-2: a
+;; long run's output appears row by row, not when the file ends).
+(defun run-tasks (js: (Vec ScenarioJob) jobs: i64 stream: (fn (ScenarioRow) unit)) -> (Vec ScenarioRow)
   (loop ((rest js) (rows []))
     (if (empty? rest)
         rows
         (let ((batch (vec (take jobs rest)))
               (tasks (mapv (fn (j: ScenarioJob) (let ((run (. (. j sc) run)) (seed (. j seed))) (spawn (fn () (run seed))))) batch)))
           (recur (vec (drop jobs rest))
-                 (into rows (mapv (fn (i: i64) (row-of-task (nth batch i) (as/try-join (nth tasks i)))) (range (count batch)))))))))
+                 (into rows (mapv (fn (i: i64) (let ((r (row-of-task (nth batch i) (as/try-join (nth tasks i))))) (do (stream r) r))) (range (count batch)))))))))
 
 ;; ---- fork isolation: a scenario in a child process (fib.os.process/fork-start) -----------------------------------------------------
 
@@ -135,9 +136,17 @@
   (encode ((. sc run) seed)))
 
 ;; Rows of all jobs in order, `jobs` children at a time. A child's files are `tmp/N.res|out|err`.
-(defun run-forked (js: (Vec ScenarioJob) tmp: str jobs: i64 secs: i64) -> (Vec ScenarioRow)
-  (let ((rows (loop ((next 0) (running {}) (done {}))
-                (cond (and (< next (count js)) (< (count running) jobs))
+(defun stream-ready (done: (Map i64 ScenarioRow) emitted: (Cell i64) stream: (fn (ScenarioRow) unit)) -> unit
+  (loop ()
+    (match (get done @emitted)
+      (nil ())
+      ((some r) (do (stream r) (set! emitted (+ @emitted 1)) (recur))))))
+
+(defun run-forked (js: (Vec ScenarioJob) tmp: str jobs: i64 secs: i64 stream: (fn (ScenarioRow) unit)) -> (Vec ScenarioRow)
+  (let ((emitted (cell 0))
+        (rows (loop ((next 0) (running {}) (done {}))
+                (cond (do (stream-ready done emitted stream) false) done
+                      (and (< next (count js)) (< (count running) jobs))
                         (let ((j (nth js next))
                               (sc (. j sc))
                               (seed (. j seed)))
@@ -154,7 +163,9 @@
                                           (assoc done (. p fst) (row-of-child (. j sc) (. (. j suite) head) (. (. j suite) impl)
                                                                               (os/fork-collect (. p snd) (. e status))))))))))))
         (lost (fn (i: i64) (failed-row (. (nth js i) sc) (. (. (nth js i) suite) head) (. (. (nth js i) suite) impl) "trap" "its process was lost"))))
-    (mapv (fn (i: i64) (unwrap-or (get rows i) (lost i))) (range (count js)))))
+    (let ((all (mapv (fn (i: i64) (unwrap-or (get rows i) (lost i))) (range (count js)))))
+      (do (loop ((i @emitted)) (if (< i (count all)) (do (stream (nth all i)) (recur (+ i 1))) ()))
+          all))))
 
 ;; ---- reporters --------------------------------------------------------------------------------------------------------------------
 
@@ -191,15 +202,30 @@
 (defun skip-count (rows: (Vec ScenarioRow) before: str after: str) -> str
   (let ((n (count-of rows "skip"))) (if (> n 0) (str before n after) "")))
 
-(defun plain (rows: (Vec ScenarioRow) seed: i64) -> str
+(defun plain-rows (rows: (Vec ScenarioRow)) -> str
   (let ((groups (vec (distinct (mapv (fn (r: ScenarioRow) (label r)) rows)))))
-    (str (str-join (mapv (fn (g: str)
-                           (str g "\n" (str-join (mapv (fn (r: ScenarioRow) (str "  " (row-plain r))) (filter (fn (r: ScenarioRow) (= (label r) g)) rows)))))
-                         groups))
-         "\n" (count rows) " scenarios: " (count-of rows "pass") " pass, " (count-of rows "fail") " fail, " (count-of rows "trap") " trap, "
+    (str-join (mapv (fn (g: str)
+                      (str g "\n" (str-join (mapv (fn (r: ScenarioRow) (str "  " (row-plain r))) (filter (fn (r: ScenarioRow) (= (label r) g)) rows)))))
+                    groups))))
+
+;; The row printed as it is made, the head of its group first when the group changes: the same text as `plain-rows` makes when the
+;; suites of one head are next to each other, which they are in a spec file.
+(defun streamer (o: SpecOpts) -> (fn (ScenarioRow) unit)
+  (let ((last (cell "#none#")))
+    (fn (r: ScenarioRow)
+      (if (= (. o format) "plain")
+          (do (if (= (label r) @last) () (do (print (str (label r) "\n")) (set! last (label r))))
+              (print (str "  " (row-plain r))))
+          ()))))
+
+(defun plain-summary (rows: (Vec ScenarioRow) seed: i64) -> str
+    (str "\n" (count rows) " scenarios: " (count-of rows "pass") " pass, " (count-of rows "fail") " fail, " (count-of rows "trap") " trap, "
          (count-of rows "timeout") " timeout" (skip-count rows ", " " skipped") " (seed " seed ")\n"
          (str-join (mapv (fn (r: ScenarioRow) (str "replay: --only '" (. r id) "' --seed " seed "\n"))
-                         (filter (fn (r: ScenarioRow) (not (or (= (. r status) "pass") (= (. r status) "skip")))) rows))))))
+                         (filter (fn (r: ScenarioRow) (not (or (= (. r status) "pass") (= (. r status) "skip")))) rows)))))
+
+(defun plain (rows: (Vec ScenarioRow) seed: i64) -> str
+  (str (plain-rows rows) (plain-summary rows seed)))
 
 (defun json-char :private (c: char) -> str
   (cond (= c \") "\\\""
@@ -295,19 +321,19 @@
 (defun report :private (rows: (Vec ScenarioRow) o: SpecOpts) -> i64
   (do (print (cond (= (. o format) "json") (json rows (. o seed))
                    (= (. o format) "tap") (tap rows (. o seed))
-                   :else (plain rows (. o seed))))
+                   :else (plain-summary rows (. o seed))))
       (if (= (count (filter (fn (r: ScenarioRow) (not (or (= (. r status) "pass") (= (. r status) "skip")))) rows)) 0) 0 1)))
 
 (defun run-forked-in :private (js: (Vec ScenarioJob) o: SpecOpts) -> i64
   (match (os/create-temp-directory (str (os/temp-directory) "/fibtest-XXXXXX"))
     ((Err _) (do (eprintln "fibc test: cannot make a scratch directory") 2))
-    ((Ok tmp) (let ((rows (run-forked js tmp (. o jobs) (. o secs))))
+    ((Ok tmp) (let ((rows (run-forked js tmp (. o jobs) (. o secs) (streamer o))))
                 (do (os/remove-directory tmp)
                     (report rows o))))))
 
 (defun run-jobs :private (js: (Vec ScenarioJob) o: SpecOpts) -> i64
-  (cond (= (. o isolate) "none") (report (mapv run-here js) o)
-        (= (. o isolate) "task") (report (run-tasks js (. o jobs)) o)
+  (cond (= (. o isolate) "none") (let ((st (streamer o))) (report (mapv (fn (j: ScenarioJob) (let ((r (run-here j))) (do (st r) r))) js) o))
+        (= (. o isolate) "task") (report (run-tasks js (. o jobs) (streamer o)) o)
         :else (run-forked-in js o)))
 
 ;; The whole run of a spec file: its suites and the command line (`(args)`).

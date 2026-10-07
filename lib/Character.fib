@@ -1,0 +1,47 @@
+;; Character (package LIB-2): the names of java.lang.Character that Clojure code writes (stdlib §4.8 rows Character/isDigit .. Character/forDigit). It is
+;; `:require`d with its own name, (:require [Character :as Character]), and used as (Character/isLetter c); like Math and Long, a Java name outside fib.*.
+;; The classes are Unicode 16.0.0's, from fib.string.unicode (an explicit module: only a program that requires Character carries the tables).
+;; Decided here, where the page is silent:
+;;  - isDigit is the category Nd (the digits of every script, `٣` included); the ASCII-only test the compiler uses is `fib.char/digit?`.
+;;  - isLetter is any category L*; isLetterOrDigit either; isUpperCase and isLowerCase include the Other_Uppercase and Other_Lowercase
+;;    characters (Ⓐ, ª), as Java's; isWhitespace is Java's (no no-break spaces, but U+001C to U+001F): see fib.string.unicode.
+;;  - toUpperCase and toLowerCase are the SIMPLE one-to-one mappings (a `char` stays a `char`: ß stays ß, where `str/upper-case` makes SS).
+;;  - `digit` is `(Option i64)` where Java answers -1: the value of c in the radix (2 to 36; the ASCII letters count above 9, and so do the fullwidth
+;;    Latin letters in Java, which are not read here), nil when c is not a digit of it or the radix is out of range. Digits of other scripts
+;;    (Nd) have their decimal value in radix 10 and up. `forDigit` is `(Option char)` where Java answers NUL: nil for a radix outside 2 to 36 or a
+;;    digit outside 0 to radix-1, else the lowercase character.
+(ns Character (:use fib.core) (:require [fib.string.unicode :as uc]))
+
+(defun cp :private (c: char) -> i64 (zext i64 (char->i32 c)))
+
+(defun isDigit (c: char) -> bool (uc/digit? (cp c)))
+(defun isLetter (c: char) -> bool (uc/letter? (cp c)))
+(defun isLetterOrDigit (c: char) -> bool (uc/letter-or-digit? (cp c)))
+(defun isWhitespace (c: char) -> bool (uc/white-space? (cp c)))
+(defun isUpperCase (c: char) -> bool (uc/upper? (cp c)))
+(defun isLowerCase (c: char) -> bool (uc/lower? (cp c)))
+(defun toUpperCase (c: char) -> char (uc/upper-char c))
+(defun toLowerCase (c: char) -> char (uc/lower-char c))
+
+(defn digit
+  ([c: char radix: i64] -> (Option i64)
+  (if (or (< radix 2) (> radix 36))
+      nil
+      (let ((n (cp c)))
+        (let ((v (cond (and (>= n 48) (<= n 57)) (- n 48)
+                       (and (>= n 97) (<= n 122)) (+ 10 (- n 97))
+                       (and (>= n 65) (<= n 90)) (+ 10 (- n 65))
+                       (uc/digit? n) (- n (zero-of-run n))
+                       :else -1)))
+          (if (and (>= v 0) (< v radix)) (some v) nil))))))
+
+;; the value of the Nd character n within its run of ten: the run starts at the first code point of the consecutive Nd characters
+;; whose count is a multiple of ten from there; a script's digits come in tens, so (n - first) mod 10 is the value
+(defun zero-of-run :private (n: i64) -> i64
+  (let ((lo (loop ((z n)) (if (uc/digit? (- z 1)) (recur (- z 1)) z))))
+    (- n (rem (- n lo) 10))))
+
+(defun forDigit (n: i64 radix: i64) -> (Option char)
+  (if (or (< radix 2) (or (> radix 36) (or (< n 0) (>= n radix))))
+      nil
+      (some (i32->char (trunc i32 (if (< n 10) (+ 48 n) (+ 87 n)))))))

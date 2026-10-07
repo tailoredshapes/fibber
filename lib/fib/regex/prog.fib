@@ -6,6 +6,7 @@
 ;;   3 SAVE x    record the position in slot x (group g has slots 2g and 2g+1; slots 0 and 1 are the whole match)
 ;;   4 ASSERT x  a zero-width test of kind x (fib.regex.ast)
 ;;   5 MATCH
+;;   7 BACKREF x y  the text of group x again, at the position (y 1: ASCII letters in either case); only the backtracking matcher (fib.regex.bt)
 ;;   6 LOOPCHK x y  at the end of an iteration of a loop whose body can match the empty string: if the
 ;;               position is past the one saved in slot x at the start of the iteration, go on, else go to y
 ;;               (Java's rule: an iteration that matches nothing is accepted and ends the loop)
@@ -24,6 +25,7 @@
 (def op-assert: i64 4)
 (def op-match: i64 5)
 (def op-loopchk: i64 6)
+(def op-backref: i64 7)
 
 (def max-prog: i64 60000)
 
@@ -65,7 +67,8 @@
         ((NAlt items) (comp-alt b items 0))
         ((NRep body mn mx g) (comp-rep b body mn mx g))
         ((NGroup idx body) (comp-group b idx body))
-        ((NAssert k) (do (set! (. b asserts) true) (emit b op-assert k 0) ())))))
+        ((NAssert k) (do (set! (. b asserts) true) (emit b op-assert k 0) ()))
+        ((NBackref idx ci) (do (set! (. b asserts) true) (emit b op-backref idx (if ci 1 0)) ())))))
 
 (defun comp-cat (b: Bld items: (Vec Node) i: i64) -> unit
   (let [n (count items)]
@@ -114,7 +117,8 @@
     ((NAlt items) (reduce (fn (a: bool x: Node) (or a (nullable? x))) false items))
     ((NRep body mn _ _) (or (= mn 0) (nullable? body)))
     ((NGroup _ body) (nullable? body))
-    ((NAssert _) true)))
+    ((NAssert _) true)
+    ((NBackref _ _) true)))
 
 (defun take-slot (b: Bld) -> i64
   (let [k @(. b slot)] (do (set! (. b slot) (+ k 1)) k)))
@@ -197,7 +201,8 @@
                     (reduce (fn (a: i64 x: Node) (if (= a (fixed-len x)) a -1)) l0 items)))
     ((NRep body mn mx _) (let [l (fixed-len body)] (if (and (>= l 0) (= mn mx)) (* mn l) -1)))
     ((NGroup _ body) (fixed-len body))
-    ((NAssert _) -1)))
+    ((NAssert _) -1)
+    ((NBackref _ _) -1)))
 
 ;; ---- classes ----
 
