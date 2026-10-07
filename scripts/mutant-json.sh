@@ -88,7 +88,7 @@ mutate() { # mutate NAME TREE -> sets SPECS
     write-indent)     f=$j/writefast.fib; cp $f $f.orig; SPECS="json-spec json-prop-spec"; sub $f 's/\(\* level \(\. w indent\)\)/(* level 1)/' ;;
     write-comma)      f=$j/writefast.fib; cp $f $f.orig; SPECS="json-spec json-prop-spec"; sub $f 's/\(if first pos \(wchar b cap pos 44\)\)/(if first pos (wchar b cap pos 59))/; s/\(wbyte b pos 44\)/(wbyte b pos 59)/' ;;
     fast-comma-state) f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(and \(= st 1\) \(> dp 0\)\)/(and (or (= st 1) (= st 0)) (> dp 0))/' ;;
-    fast-number-delim) f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(and \(>= e 0\) \(or \(= e n\) \(or \(= e next\) \(ws\? \(byte-at p e\)\)\)\)\)/(>= e 0)/' ;;
+    fast-number-delim) f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(and \(>= r 0\) \(or \(= e n\) \(or \(= e next\) \(ws\? \(byte-at p e\)\)\)\)\)/(>= r 0)/' ;;
     fast-close-kind)  f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(= arr \(= c 93\)\)/true/' ;;
     fast-escape-flag) f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(!= \(bit-and m \(- \(shl 1 w\) 1\)\) 0\)/false/; s/\(if \(= m 0\) \(recur \(\+ i 32\)\) true\)/(recur (+ i 32))/' ;;
     fast-depth)       f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(< dp max-depth\)/(<= dp max-depth)/' ;;

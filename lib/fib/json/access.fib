@@ -49,15 +49,13 @@
 
 ;; One pointer step with the escapes undone: ~1 is /, ~0 is ~ (in that order, RFC 6901 4).
 (defun unescape-step (s: str) -> str
-  (if (nil? (str-find s "~" 0)) s
-      (let [out (cell "")]
-        (do (loop [i 0]
-              (when (< i (str-len s))
-                (let [c (str-byte-at s i) d (if (< (+ i 1) (str-len s)) (str-byte-at s (+ i 1)) 0i8)]
-                  (cond (and (= c 126i8) (= d 49i8)) (do (set! out (str @out "/")) (recur (+ i 2)))
-                        (and (= c 126i8) (= d 48i8)) (do (set! out (str @out "~")) (recur (+ i 2)))
-                        :else (do (set! out (str @out (str-slice s i (+ i 1)))) (recur (+ i 1)))))))
-            @out))))
+  (let [n (str-len s)]
+    (if (nil? (str-find s "~" 0)) s
+        (str-join (loop [i 0 run 0 out: (Vec str) []]
+                    (cond (>= i n) (conj out (str-slice s run n))
+                          (and (= (str-byte-at s i) 126i8) (< (+ i 1) n) (= (str-byte-at s (+ i 1)) 49i8)) (recur (+ i 2) (+ i 2) (conj (conj out (str-slice s run i)) "/"))
+                          (and (= (str-byte-at s i) 126i8) (< (+ i 1) n) (= (str-byte-at s (+ i 1)) 48i8)) (recur (+ i 2) (+ i 2) (conj (conj out (str-slice s run i)) "~"))
+                          :else (recur (+ i 1) run out)))))))
 
 (defun split-pointer (p: str) -> (Vec str)
   (let [n (str-len p)]
