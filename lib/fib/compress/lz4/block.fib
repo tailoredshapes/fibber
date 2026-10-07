@@ -1,0 +1,53 @@
+;; fib.compress.lz4.block: the raw LZ4 block API (lz4_Block_format.md): no header, no size, no checksum: the caller keeps the compressed and the decompressed length.
+;;   (compress-bound n)                          the most a block of n input bytes can take (liblz4's LZ4_compressBound: n + n/255 + 16)
+;;   (block-compress src accel)                  -> (Array i8)   the fast encoder (acceleration 1 is the default; more skips faster over incompressible data)
+;;   (block-compress-hc src level)               -> (Array i8)   high compression, level 3 to 12 (fib.compress.lz4.hc)
+;;   (block-decompress src max-output)           -> (Result (Array i8) CompressError)   the size is not known: the answer grows until `max-output`, :too-large past it
+;;   (block-decompress-sized src size)           -> (Result (Array i8) CompressError)   the size is known exactly: one allocation, and the output must be exactly `size`
+;;   (block-decompress-into src dst off cap)     -> (Result i64 CompressError)   into a buffer the caller owns, at dst[off, off+cap): the length, no byte outside is written
+;; The decoder never trusts the data (fib.compress.lz4.blockdec): errors are :corrupt, :truncated and :too-large.
+(ns fib.compress.lz4.block (:use fib.core fib.seq fib.coll fib.compress.types fib.compress.lz4.mem fib.compress.lz4.enc fib.compress.lz4.blockdec))
+
+(def slack: i64 32)
+
+(defun compress-bound (n: i64) -> i64 (if (< n 0) -1 (+ n (+ (quot n 255) 16))))
+
+(defun run-enc (e: Encoder src: (Array i8)) -> (Array i8)
+  (let [n (array-len src) dst (array (+ (compress-bound n) slack) 0i8)
+        len (enc-run e (data src) 0 0 n (data dst) 1)]
+    (array-copy dst 0 len)))
+
+(defun block-compress (src: (Array i8) accel: i64) -> (Array i8) (run-enc (enc-new 1 accel (array-len src)) src))
+(defun block-compress-hc (src: (Array i8) level: i64) -> (Array i8) (run-enc (enc-new (max 3 level) 1 (array-len src)) src))
+
+(defun decode-error (code: i64) -> CompressError
+  (cond (= code e-too-large) (too-large "the block expands beyond the output limit")
+        (= code e-truncated) (truncated "the block ends inside a sequence")
+        :else (corrupt "the block is not valid LZ4 (an offset outside the data, or a zero offset)")))
+
+;; The decoder over src into dst[off, off+cap) of a buffer `dlen` bytes long (dlen = off + cap when the bytes after belong to the caller).
+(defun decode-to (src: (Array i8) dst: ptr dlen: i64 off: i64 cap: i64) -> i64
+  (decode-block (data src) (array-len src) dst dlen off off (+ off cap)))
+
+(defun block-decompress-into (src: (Array i8) dst: (Array i8) off: i64 cap: i64) -> (Result i64 CompressError)
+  (if (or (< off 0) (< cap 0) (> (+ off cap) (array-len dst))) (Err (invalid-argument "block-decompress-into: the range is outside the buffer"))
+    (let [r (decode-to src (data dst) (+ off cap) off cap)]
+      (if (< r 0) (Err (decode-error r)) (Ok (- r off))))))
+
+(defun block-decompress-sized (src: (Array i8) size: i64) -> (Result (Array i8) CompressError)
+  (if (< size 0) (Err (invalid-argument "block-decompress-sized: negative size"))
+    (let [dst (array (+ size slack) 0i8)
+          r (decode-to src (data dst) (+ size slack) 0 size)]
+      (cond (< r 0) (Err (decode-error r))
+            (not (= r size)) (Err (corrupt "the block decodes to fewer bytes than its size"))
+            :else (Ok (array-copy dst 0 size))))))
+
+;; Retries with a larger buffer while the answer is :too-large and the limit allows more: a block carries no size.
+(defun block-decompress (src: (Array i8) max-output: i64) -> (Result (Array i8) CompressError)
+  (if (< max-output 0) (Err (invalid-argument "block-decompress: negative max-output"))
+    (loop [cap (min max-output (max 1024 (* 4 (array-len src))))]
+      (let [dst (array (+ cap slack) 0i8)
+            r (decode-to src (data dst) (+ cap slack) 0 cap)]
+        (cond (>= r 0) (Ok (array-copy dst 0 r))
+              (and (= r e-too-large) (< cap max-output)) (recur (min max-output (* cap 4)))
+              :else (Err (decode-error r)))))))

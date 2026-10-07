@@ -1,0 +1,78 @@
+;; fib.compress.lz4.xxh32: xxHash32 (Yann Collet; BSD-2), the checksum of the LZ4 frame format. NOT a cryptographic hash and not for authentication.
+;; All arithmetic is on i64 with the result masked to 32 bits (a 32-bit product wraps in an i64 and the low 32 bits are right).
+;;   (xxh32 bytes seed) -> i64             (xxh32-range bytes off len seed) -> i64     (xxh32-ptr p len seed) -> i64
+;; Streaming: `(xxh-new seed)` -> Xxh, `(xxh-update! x bytes off len)`, `(xxh-digest x)`; the state is in two arrays written in place, so an Xxh is NOT a value
+;; to copy: use one per stream.
+(ns fib.compress.lz4.xxh32 (:use fib.core fib.seq fib.coll fib.compress.lz4.mem))
+
+(def p1: i64 2654435761)
+(def p2: i64 2246822519)
+(def p3: i64 3266489917)
+(def p4: i64 668265263)
+(def p5: i64 374761393)
+
+(defun m32 (x: i64) -> i64 (bit-and x 4294967295))
+(defun rotl (x: i64 n: i64) -> i64 (m32 (bit-or (shl x n) (shr x (- 32 n)))))
+(defun mul (a: i64 b: i64) -> i64 (m32 (unchecked-multiply a b)))
+(defun round (acc: i64 inp: i64) -> i64 (mul (rotl (m32 (+ acc (mul inp p2))) 13) p1))
+
+(defun avalanche (h: i64) -> i64
+  (let [a (mul (bit-xor h (shr h 15)) p2) b (mul (bit-xor a (shr a 13)) p3)] (bit-xor b (shr b 16))))
+
+(defun bytes-tail (p: ptr k: i64 end: i64 h0: i64) -> i64
+  (loop [j k h h0] (if (< j end) (recur (+ j 1) (mul (rotl (m32 (+ h (mul (rd8 p j) p5))) 11) p1)) h)))
+
+(defun tail (p: ptr i: i64 end: i64 h0: i64) -> i64
+  (let [k (loop [k i] (if (<= (+ k 4) end) (recur (+ k 4)) k))
+        h4 (loop [q i h h0] (if (<= (+ q 4) end) (recur (+ q 4) (mul (rotl (m32 (+ h (mul (rd32 p q) p3))) 17) p4)) h))]
+    (avalanche (bytes-tail p k end h4))))
+
+(defun xxh32-ptr (p: ptr len: i64 seed: i64) -> i64
+  (if (>= len 16)
+    (let [lim (- len 16)
+          r (loop [i 0 v1 (m32 (+ (+ seed p1) p2)) v2 (m32 (+ seed p2)) v3 seed v4 (m32 (- seed p1))]
+              (if (<= i lim)
+                (recur (+ i 16) (round v1 (rd32 p i)) (round v2 (rd32 p (+ i 4))) (round v3 (rd32 p (+ i 8))) (round v4 (rd32 p (+ i 12))))
+                (+ (+ (rotl v1 1) (rotl v2 7)) (+ (rotl v3 12) (rotl v4 18)))))
+          i16 (shl (shr len 4) 4)]
+      (tail p i16 len (m32 (+ r len))))
+    (tail p 0 len (m32 (+ (+ seed p5) len)))))
+
+(defun xxh32-range (a: (Array i8) off: i64 len: i64 seed: i64) -> i64 (xxh32-ptr (ptr-at a off) len seed))
+(defun ptr-at (a: (Array i8) off: i64) -> ptr (unsafe (ptr+ (raw a) (+ 24 off))))
+(defun xxh32 (a: (Array i8) seed: i64) -> i64 (xxh32-ptr (data a) (array-len a) seed))
+
+;; ---- streaming. st: v1 v2 v3 v4 total-bytes (as i64 words); tail: up to 15 bytes held back (the count is word 5).
+(defstruct Xxh (st: (Array i64) tail: (Array i8)))
+
+(defun xw (x: Xxh i: i64) -> i64 (unsafe (load-i64 (ptr+ (raw (. x st)) (+ 24 (shl i 3))))))
+(defun xset (x: Xxh i: i64 v: i64) -> unit (unsafe (store-i64 (ptr+ (raw (. x st)) (+ 24 (shl i 3))) v)))
+
+(defun xxh-new (seed: i64) -> Xxh
+  (let [x (Xxh (array 6 0) (array 16 0i8))]
+    (do (xset x 0 (m32 (+ (+ seed p1) p2))) (xset x 1 (m32 (+ seed p2))) (xset x 2 seed) (xset x 3 (m32 (- seed p1))) x)))
+
+(defun xxh-stripe (x: Xxh p: ptr i: i64) -> unit
+  (do (xset x 0 (round (xw x 0) (rd32 p i))) (xset x 1 (round (xw x 1) (rd32 p (+ i 4))))
+      (xset x 2 (round (xw x 2) (rd32 p (+ i 8)))) (xset x 3 (round (xw x 3) (rd32 p (+ i 12))))))
+
+;; Feed p[0, n): fills the held tail to 16 bytes first, then whole stripes from p, then holds what is left.
+(defun xxh-feed (x: Xxh p: ptr n: i64) -> unit
+  (let [tp (data (. x tail)) held (xw x 5)
+        _ (xset x 4 (+ (xw x 4) n))
+        tk (if (> held 0) (min n (- 16 held)) 0)]
+    (do (when (> tk 0) (copy-exact tp held p 0 tk))
+        (if (and (> held 0) (= (+ held tk) 16))
+          (do (xxh-stripe x tp 0) (xset x 5 0)) (xset x 5 (+ held tk)))
+        (let [i (loop [i tk] (if (<= (+ i 16) n) (do (xxh-stripe x p i) (recur (+ i 16))) i))
+              left (- n i)]
+          (when (> left 0) (do (copy-exact tp (xw x 5) p i left) (xset x 5 (+ (xw x 5) left))))))))
+
+(defun xxh-update! (x: Xxh a: (Array i8) off: i64 len: i64) -> unit (xxh-feed x (ptr-at a off) len))
+
+(defun xxh-digest (x: Xxh) -> i64
+  (let [total (xw x 4) held (xw x 5)
+        h (if (>= total 16)
+            (m32 (+ (+ (rotl (xw x 0) 1) (rotl (xw x 1) 7)) (+ (rotl (xw x 2) 12) (rotl (xw x 3) 18))))
+            (m32 (+ (xw x 2) p5)))]
+    (tail (data (. x tail)) 0 held (m32 (+ h (m32 total))))))

@@ -1,0 +1,52 @@
+;; scripts/lz4-diff.fib: the batch half of the differential test of fib.compress.lz4 against liblz4 (scripts/lz4-diff.py drives it).
+;; usage: lz4-diff IN OUT      IN: records, each seven little-endian i32 (mode level flags bsize accel dictlen datalen) then dict bytes then data bytes
+;;   mode 0 frame-compress, 1 frame-decompress, 2 block-compress, 3 block-decompress (max output 256 MiB), 4 block-compress-hc
+;;   flags bit 0 independent, 1 block checksums, 2 content checksum, 3 record content size
+;; OUT: per record an i32 status (0 ok, else 1 + the index of the error kind in [corrupt truncated too-large unsupported invalid-argument checksum]) and an i32 length, then
+;; the bytes. A trap ends the run (the driver counts that as a failure of the record before it).
+(ns main (:use fib.compress.types fib.compress.lz4.mem fib.compress.lz4.block fib.compress.lz4.frame fib.compress.lz4.framedec) (:require [fib.os.io :as io] [fib.os.files :as files]))
+
+(defun slurp (path: str) -> (Array i8)
+  (match (files/open-file path (files/default-file-options))
+    ((Err e) (trap (str "open " path)))
+    ((Ok fd)
+     (let [out (cell (array 0 0i8)) used (cell 0)]
+       (loop []
+         (match (io/read-fd fd 1048576)
+           ((Err e) (trap "read"))
+           ((Ok b) (if (= (array-len b) 0) (array-copy @out 0 @used)
+                     (do (when (> (+ @used (array-len b)) (array-len @out))
+                           (let [nb (cell (array (max (* 2 (array-len @out)) (+ @used (array-len b))) 0i8))] (do (array-blit! &nb 0 @out 0 @used) (set! out @nb))))
+                         (array-blit! &out @used b 0 (array-len b)) (set! used (+ @used (array-len b))) (recur))))))))))
+
+(defun i32at (a: (Array i8) i: i64) -> i64 (rd32 (data a) i))
+(defun kind-code (e: CompressError) -> i64
+  (let [k (. e kind)] (cond (= k :corrupt) 1 (= k :truncated) 2 (= k :too-large) 3 (= k :unsupported) 4 (= k :invalid-argument) 5 :else 6)))
+
+(defun run-one (mode: i64 level: i64 flags: i64 bsize: i64 accel: i64 dict: (Array i8) data: (Array i8)) -> (Result (Array i8) CompressError)
+  (let [o (Options level accel dict (> (bit-and flags 4) 0) (> (bit-and flags 2) 0) bsize (> (bit-and flags 1) 0) (> (bit-and flags 8) 0) -1 268435456)]
+    (cond (= mode 0) (frame-compress data o)
+          (= mode 1) (frame-decompress data o)
+          (= mode 2) (Ok (block-compress data (max 1 accel)))
+          (= mode 3) (block-decompress data 268435456)
+          :else (Ok (block-compress-hc data level)))))
+
+(defun put-record (out: (Array i8) r: (Result (Array i8) CompressError)) -> (Array i8)
+  (let [b (match r ((Ok b) b) ((Err e) (array 0 0i8))) st (match r ((Ok _) 0) ((Err e) (kind-code e)))
+        h (array 8 0i8)]
+    (do (wr32 (data h) 0 st) (wr32 (data h) 4 (array-len b)) (concat-bytes [out h b]))))
+
+(defun concat-bytes (parts: (Vec (Array i8))) -> (Array i8)
+  (let [n (reduce (fn (a: i64 p: (Array i8)) (+ a (array-len p))) 0 parts) out (array n 0i8)]
+    (do (loop [i 0 at 0] (when (< i (count parts)) (let [p (nth parts i)] (do (copy-exact (data out) at (data p) 0 (array-len p)) (recur (+ i 1) (+ at (array-len p)))))))
+        out)))
+
+(defun main () -> i64
+  (let [a (args) in (slurp (nth a 0)) n (array-len in)
+        outs (loop [i 0 outs: (Vec (Array i8)) []]
+               (if (>= i n) outs
+                 (let [mode (i32at in i) level (i32at in (+ i 4)) flags (i32at in (+ i 8)) bsize (i32at in (+ i 12)) accel (i32at in (+ i 16)) dl (i32at in (+ i 20)) len (i32at in (+ i 24))
+                       dict (array-copy in (+ i 28) (+ i (+ 28 dl))) data (array-copy in (+ i (+ 28 dl)) (+ i (+ 28 (+ dl len))))
+                       r (run-one mode (if (> level 2147483647) (- level 4294967296) level) flags bsize accel dict data)]
+                   (recur (+ i (+ 28 (+ dl len))) (conj outs (put-record (array 0 0i8) r))))))]
+    (match (files/write-file-bytes (nth a 1) (concat-bytes outs)) ((Ok _) 0) ((Err e) 1))))

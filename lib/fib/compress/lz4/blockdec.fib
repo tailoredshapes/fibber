@@ -1,0 +1,52 @@
+;; fib.compress.lz4.blockdec: the LZ4 block decoder, safe on hostile input (docs/design/compress.md 6.2). A block is a series of sequences: a token (literal
+;; length in the high nibble, match length minus 4 in the low), the literal length's extension bytes (while a byte is 255), the literals, a 2-byte little-endian
+;; offset, the match length's extension. The last sequence has literals only: the block ends when the input does, right after a literal run.
+;; EVERY index is checked before it is used: the literals are inside the input, the offset reaches no further back than `lo`, the output stays within `cap`; an
+;; overlapping match (offset below its length) repeats the pattern. A length sum cannot overflow (it is at most 255 times the input length). Nothing is read or
+;; written outside [0, ilen) of the input and [lo, dlen) of the output buffer, except that the wild copies (chunks of 8 or 16 bytes, only while the buffer has room
+;; for the chunk: `dlen` is the buffer's real end, or `cap` when the bytes after the output are the caller's) write up to 15 bytes after the output's end.
+;;   (decode-block ip ilen dp dlen op lo cap) -> output end, or a negative code: -1 corrupt, -2 truncated (the input ended inside a sequence), -3 over the cap
+(ns fib.compress.lz4.blockdec (:use fib.core fib.seq fib.coll fib.compress.lz4.mem))
+
+(def e-corrupt: i64 -1)
+(def e-truncated: i64 -2)
+(def e-too-large: i64 -3)
+
+;; The index of the first byte at or after i that is not 255 (a length extension ends there), or -1 when the input ends first.
+(defun ext-end (ip: ptr i: i64 ilen: i64) -> i64
+  (loop [k i] (cond (>= k ilen) -1 (= (rd8 ip k) 255) (recur (+ k 1)) :else k)))
+
+;; The packed result of a length: the extension is `e - i` bytes of 255 and the byte at e; the length is nib + 255 * (e - i) + byte.
+(defun ext-len (ip: ptr i: i64 e: i64 nib: i64) -> i64 (+ nib (+ (* 255 (- e i)) (rd8 ip e))))
+
+(defun copy-lits (ip: ptr i: i64 ilen: i64 dp: ptr op: i64 dlen: i64 n: i64) -> unit
+  (if (and (<= n 16) (<= (+ i 16) ilen) (<= (+ op 16) dlen)) (cp16 dp op ip i) (copy-exact dp op ip i n)))
+
+;; One sequence from ip (the token already read: `tok`, `i` just after it); the new input position and output position are returned through the caller's
+;; loop, so this function is the loop body of `decode-block`.
+(defun decode-block (ip: ptr ilen: i64 dp: ptr dlen: i64 op0: i64 lo: i64 cap: i64) -> i64
+  (loop [i 0 op op0]
+    (if (>= i ilen) e-truncated
+      (let [tok (rd8 ip i)
+            lnib (shr tok 4)
+            le (if (= lnib 15) (ext-end ip (+ i 1) ilen) (+ i 0))]
+        (if (< le 0) e-truncated
+          (let [i1 (if (= lnib 15) (+ le 1) (+ i 1))
+                lit (if (= lnib 15) (ext-len ip (+ i 1) le 15) lnib)]
+            (cond (> lit (- ilen i1)) e-truncated
+                  (> lit (- cap op)) e-too-large
+                  :else
+                  (let [i2 (+ i1 lit) op2 (+ op lit)]
+                    (do (copy-lits ip i1 ilen dp op dlen lit)
+                        (if (= i2 ilen) op2
+                          (if (> (+ i2 2) ilen) e-truncated
+                            (let [off (rd16 ip i2) i3 (+ i2 2)]
+                              (if (or (= off 0) (> off (- op2 lo))) e-corrupt
+                                (let [mnib (bit-and tok 15)
+                                      me (if (= mnib 15) (ext-end ip i3 ilen) i3)]
+                                  (if (< me 0) e-truncated
+                                    (let [i4 (if (= mnib 15) (+ me 1) i3)
+                                          ml (+ 4 (if (= mnib 15) (ext-len ip i3 me 15) mnib))]
+                                      (if (> ml (- cap op2)) e-too-large
+                                        (do (copy-match dp op2 off ml (- dlen op2))
+                                            (recur i4 (+ op2 ml))))))))))))))))))))

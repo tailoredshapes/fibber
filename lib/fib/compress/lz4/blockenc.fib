@@ -1,0 +1,82 @@
+;; fib.compress.lz4.blockenc: the fast LZ4 block encoder (docs/design/compress.md 6.1), the algorithm of liblz4's LZ4_compress_generic: a hash of the next four bytes
+;; indexes a table of positions; a candidate that is within 65535 bytes and whose four bytes equal is a match, extended backwards over the literals pending and forwards
+;; to the end of the data (less the last 5 bytes, which are always literals); a match may not start in the last 12 bytes. After a miss the step grows by one every 64
+;; attempts (`acceleration` raises the start: step = acceleration << 6 >> 6), so incompressible data is skipped quickly.
+;; THE TABLE keeps positions as `gen + index` (i32, little-endian, in an (Array i8)), so a table is reused for the next block, and the next frame, by raising `gen`
+;; past every position the old blocks can hold (not by zeroing 16 to 32 KB): an entry is a candidate only when `entry - gen` is at least `lo`, the first index of the
+;; window (the block's own start for an independent block; the dictionary's or the history's start otherwise).
+;;   (enc-block sp lo s0 n dp tp gen accel hlog) -> compressed length; the block is sp[s0, s0+n), history sp[lo, s0), output at dp, capacity `bound` of it (n + n/255 + 16)
+(ns fib.compress.lz4.blockenc (:use fib.core fib.seq fib.coll fib.compress.lz4.mem))
+
+(def last-lits: i64 5)
+(def mf-limit: i64 12)
+(def max-dist: i64 65535)
+
+(defun hash4 (v: i64 shift: i64) -> i64 (shr (bit-and (unchecked-multiply v 2654435761) 4294967295) shift))
+(defun tget (tp: ptr h: i64) -> i64 (rd32 tp (shl h 2)))
+(defun tput (tp: ptr h: i64 v: i64) -> unit (wr32 tp (shl h 2) v))
+
+;; Bytes equal from a and b (b before a) up to the limit (an index): the count, eight bytes at a time.
+(defun count-eq (sp: ptr a: i64 b: i64 lim: i64) -> i64
+  (let [e (loop [k a]
+            (if (<= (+ k 8) lim)
+              (let [x (bit-xor (rd64 sp k) (rd64 sp (- k (- a b))))]
+                (if (= x 0) (recur (+ k 8)) (+ k (shr (ctz x) 3))))
+              (loop [j k] (if (and (< j lim) (= (rd8 sp j) (rd8 sp (- j (- a b))))) (recur (+ j 1)) j))))]
+    (- e a)))
+
+;; How far a match at (ip, cand) extends backwards over pending literals (index anchor) without leaving the window (index lo).
+(defun back-eq (sp: ptr ip: i64 cand: i64 anchor: i64 lo: i64) -> i64
+  (loop [k 0] (if (and (> (- ip k) anchor) (> (- cand k) lo) (= (rd8 sp (- ip (+ k 1))) (rd8 sp (- cand (+ k 1))))) (recur (+ k 1)) k)))
+
+;; A length extension: n bytes of 255 would not do for a large n: floor((n)/255) 255s then the remainder.
+(defun put-ext (dp: ptr op: i64 n: i64) -> i64
+  (let [full (quot n 255)]
+    (do (loop [k 0] (if (< k full) (do (wr8 dp (+ op k) 255) (recur (+ k 1))) ()))
+        (wr8 dp (+ op full) (- n (* full 255)))
+        (+ op (+ full 1)))))
+
+;; The sequence: lit literals from sp[anchor, ..), then the match (offset off, length ml >= 4) -- or none when ml is 0 (the last sequence). The new output position.
+(defun put-seq (sp: ptr anchor: i64 lit: i64 dp: ptr op: i64 off: i64 ml: i64) -> i64
+  (let [tk (+ op 0)
+        mcode (if (= ml 0) 0 (- ml 4))
+        _ (wr8 dp tk (bit-or (shl (min lit 15) 4) (min mcode 15)))
+        o1 (if (>= lit 15) (put-ext dp (+ op 1) (- lit 15)) (+ op 1))
+        _ (copy-exact dp o1 sp anchor lit)
+        o2 (+ o1 lit)]
+    (if (= ml 0) o2
+      (do (wr16 dp o2 off)
+          (if (>= mcode 15) (put-ext dp (+ o2 2) (- mcode 15)) (+ o2 2))))))
+
+(defun valid? (sp: ptr cand: i64 ip: i64 lo: i64) -> bool
+  (and (>= cand lo) (< cand ip) (<= (- ip cand) max-dist) (= (rd32 sp cand) (rd32 sp ip))))
+
+;; The search. State: ip (the position tried), anchor (the start of the pending literals), op, step and nb (the skip counter), imm (the position right after a match:
+;; tried at once, with no step check).
+(defun search (sp: ptr lo: i64 iend: i64 dp: ptr tp: ptr gen: i64 shift: i64 accel: i64 ip0: i64 anchor0: i64) -> i64
+  (let [mf1 (+ (- iend mf-limit) 1) mlim (- iend last-lits) nb0 (shl accel 6)]
+    (loop [ip ip0 anchor anchor0 op 0 step 1 nb nb0 imm false]
+      (let [fwd (+ ip step)]
+        (if (and (not imm) (> fwd mf1))
+          (put-seq sp anchor (- iend anchor) dp op 0 0)
+          (let [h (hash4 (rd32 sp ip) shift) cand (- (tget tp h) gen)]
+            (do (tput tp h (+ gen ip))
+                (if (valid? sp cand ip lo)
+                  (let [b (back-eq sp ip cand anchor lo)
+                        mip (- ip b) mc (- cand b)
+                        ml (+ 4 (count-eq sp (+ ip 4) (+ cand 4) mlim) b)
+                        op2 (put-seq sp anchor (- mip anchor) dp op (- mip mc) ml)
+                        nip (+ mip ml)]
+                    (if (>= nip mf1)
+                      (put-seq sp nip (- iend nip) dp op2 0 0)
+                      (do (tput tp (hash4 (rd32 sp (- nip 2)) shift) (+ gen (- nip 2)))
+                          (recur nip nip op2 1 nb0 true))))
+                  (if imm (recur (+ ip 1) anchor op 1 nb0 false)
+                          (recur fwd anchor op (shr nb 6) (+ nb 1) false))))))))))
+
+(defun enc-block (sp: ptr lo: i64 s0: i64 n: i64 dp: ptr tp: ptr gen: i64 accel: i64 hlog: i64) -> i64
+  (let [iend (+ s0 n) shift (- 32 hlog)]
+    (if (< n 13)
+      (put-seq sp s0 n dp 0 0 0)
+      (do (tput tp (hash4 (rd32 sp s0) shift) (+ gen s0))
+          (search sp lo iend dp tp gen shift (max 1 accel) (+ s0 1) s0)))))
