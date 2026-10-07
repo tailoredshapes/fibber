@@ -1,0 +1,40 @@
+;; spec: spec/stdlib.md section 4.21 (fib.regex backreferences); package LIB-2 item 6
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; covers: fib.regex backreferences
+;; `\1` to `\9` refer to the text a group matched. A pattern that has one is run by the backtracking matcher (`backtracking?`), every other pattern by the Pike VM. The answers are Java's: the leftmost match
+;; and the first by priority (greedy `(a+)b\1` takes the longest run that the repeat allows), the group in a loop holds its LAST iteration, a reference to a group that did not take part fails the match, `(?i)`
+;; makes the reference case-insensitive, and inside a group or a loop the reference sees the previous complete capture (the group's start is committed when the group closes: `(a|\1b)+` over "ab" matches
+;; only "a", since the second iteration's `\1b` needs "ab" again; both checked against Java 25). A reference to a group that does not exist is refused. `replace-all` and `re-seq` work over the backtracking matcher: the doubled letters of "aabbcd" are `<a><b>cd`.
+(ns main (:use tl.check) (:require [fib.regex :as re]))
+
+(defun groups-of (p: str s: str) -> (Vec (Option str))
+  (match (re/re-find (re/re-pattern p) s) (nil []) ((some m) (re/re-groups m))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (re/backtracking? (re/re-pattern "(a)\\1")))
+        (check c (not (re/backtracking? (re/re-pattern "(a)b"))))
+        (check c (= (groups-of "(a+)b\\1" "xaabaa") [(some "aabaa") (some "aa")]))
+        (check c (= (groups-of "(a+)b\\1" "xaaba") [(some "aba") (some "a")]))
+        (check c (= (groups-of "(a)\\1" "ba") []))
+        (check c (= (groups-of "(\\w)\\1" "abccd") [(some "cc") (some "c")]))
+        (check c (= (groups-of "(?i)(a)\\1" "aA") [(some "aA") (some "a")]))
+        (check c (= (groups-of "(a)\\1" "aA") []))
+        (check c (= (groups-of "(a)|b\\1" "b") []))
+        (check c (= (groups-of "(a|\\1b)+" "ab") [(some "a") (some "a")]))
+        (check c (= (groups-of "(a|\\1b)+" "aab") [(some "aa") (some "a")]))
+        (check c (= (groups-of "(\\w+) \\1" "the the cat") [(some "the the") (some "the")]))
+        (check c (= (groups-of "<(\\w+)>.*</\\1>" "x<b>bold</b>y") [(some "<b>bold</b>") (some "b")]))
+        (check c (= (groups-of "(a*)\\1" "aaaa") [(some "aaaa") (some "aa")]))
+        (check c (= (groups-of "((a)|(b))+\\2" "ab") []))
+        (check c (match (re/try-re-pattern "(a)\\2") ((Err _) true) ((Ok _) false)))
+        (check c (match (re/try-re-pattern "\\1(a)") ((Err _) true) ((Ok _) false)))
+        (check c (= (re/replace-all (re/re-pattern "(\\w)\\1") "aabbcd" "<$1>") "<a><b>cd"))
+        (check c (= (count (re/re-seq (re/re-pattern "(\\d)\\1") "11 22 13 44")) 3))
+        (check c (= (match (re/re-matches (re/re-pattern "(a+)\\1") "aaaa") (nil "nil") ((some m) (. m whole))) "aaaa"))
+        (check c (= (match (re/re-matches (re/re-pattern "(a+)\\1") "aaa") (nil "nil") ((some m) (. m whole))) "nil"))
+        (checks-result c))))

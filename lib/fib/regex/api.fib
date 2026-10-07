@@ -17,27 +17,66 @@
 ;;  - `replace-all` and `replace-first` take Java's replacement text: `$n` is group n (more digits are
 ;;    taken while the group exists), `\x` is `x`; anything else after `$` or a lone `\` traps.
 ;;  - a string longer than 2^31 - 1 bytes traps in the searches that return spans packed in one number.
+;;  - package LIB-2: the inline flags `(?i) (?s) (?x) (?m)` are the parser's (fib.regex.parse); `(re-pattern-flags s "ims")` is `(re-pattern (str "(?ims)" s))`.
+;;    A pattern with a BACKREFERENCE (`\1`) is run by the backtracking matcher of fib.regex.bt (`backtracking?` says so), whose time is not linear:
+;;    it has a budget of steps per search, and a search that spends it is an error value in `try-re-find` and `try-re-matches`
+;;    (`(Err "regex backtracking budget exceeded ..")`) and a trap in `re-find`, `re-matches`, `re-seq` and the replacements. The Pike VM, linear in
+;;    the text for every pattern, stays the matcher of every pattern without a backreference.
 (ns fib.regex.api
   (:use fib.core fib.seq fib.coll fib.string.utf8 fib.string.pattern
-        fib.regex.ast fib.regex.parse fib.regex.prog fib.regex.pike fib.regex.dfa))
+        fib.regex.ast fib.regex.parse fib.regex.prog fib.regex.pike fib.regex.dfa fib.regex.bt))
 
 (defstruct Regex
-  (pattern: str groups: i64 fwd: Prog rev: Prog ftab: Tab rtab: Tab use-dfa: bool fixed: i64))
+  (pattern: str groups: i64 fwd: Prog rev: Prog ftab: Tab rtab: Tab use-dfa: bool fixed: i64 bt: bool))
 
 ;; the mutable state of searches over a `Regex` whose DFA did not fit a table: the lazy DFAs, forward and reverse
 (defstruct Matcher (f: (Option Dfa) r: (Option Dfa)))
 
 (defstruct Match (start: i64 end: i64 whole: str groups: (Vec (Option str)) spans: (Vec i64)))
 
+(defun has-backref? (n: Node) -> bool
+  (match n
+    ((NBackref _ _) true)
+    ((NCat items) (reduce (fn (b: bool x: Node) (or b (has-backref? x))) false items))
+    ((NAlt items) (reduce (fn (b: bool x: Node) (or b (has-backref? x))) false items))
+    ((NRep body _ _ _) (has-backref? body))
+    ((NGroup _ body) (has-backref? body))
+    (_ false)))
+
 (defun try-re-pattern (s: str) -> (Result Regex str)
   (try-let [a (parse-regex s)]
-    (let [f (compile-forward a)
-          r (compile-reverse a)]
-      (if (or (. f too-big) (. r too-big))
-          (Err "pattern is too large")
-          (let [dfa? (not (. f asserts))]
-            (Ok (Regex s (. a groups) f r (if dfa? (freeze-dfa f true false) (no-tab)) (if dfa? (freeze-dfa r false true) (no-tab))
-                       dfa? (fixed-len (. a node)))))))))
+    (if (has-backref? (. a node))
+        (let [f (compile-forward a)]
+          (if (. f too-big)
+              (Err "pattern is too large")
+              (Ok (Regex s (. a groups) f f (no-tab) (no-tab) false -1 true))))
+        (let [f (compile-forward a)
+              r (compile-reverse a)]
+          (if (or (. f too-big) (. r too-big))
+              (Err "pattern is too large")
+              (let [dfa? (not (. f asserts))]
+                (Ok (Regex s (. a groups) f r (if dfa? (freeze-dfa f true false) (no-tab)) (if dfa? (freeze-dfa r false true) (no-tab))
+                           dfa? (fixed-len (. a node)) false))))))))
+
+;; the pattern with the flags (letters of "imsx") switched on from its start: `(re-pattern-flags "a.c" "is")`
+(defun try-re-pattern-flags (s: str flags: str) -> (Result Regex str)
+  (try-re-pattern (str "(?" flags ")" s)))
+
+(defun re-pattern-flags (s: str flags: str) -> Regex
+  (match (try-re-pattern-flags s flags)
+    ((Ok r) r)
+    ((Err e) (trap (str "PatternSyntaxException: " e " in " s)))))
+
+;; whether the pattern has a backreference, so that its searches are the backtracking matcher's (budgeted, not linear)
+(defun backtracking? (rx: Regex) -> bool (. rx bt))
+
+(defun budget-message :private () -> str
+  (str "regex backtracking budget exceeded (" (default-budget) " steps): the pattern has a backreference and this text makes it exponential"))
+
+;; the slots of a search by the backtracking matcher; a spent budget is a trap here (try-re-find and try-re-matches return it as a value)
+(defun bt-caps :private (rx: Regex s: str from: i64 anchored: bool endreq: bool) -> (Array i64)
+  (let [r (bt-run (. rx fwd) s from anchored endreq (default-budget))]
+    (if (exceeded? r) (trap (budget-message)) r)))
 
 (defun re-pattern (s: str) -> Regex
   (match (try-re-pattern s)
@@ -101,6 +140,11 @@
 
 ;; the slots of the leftmost match at or after from; empty when none
 (defun find-caps :private (rx: Regex m: (Option Matcher) s: str from: i64) -> (Array i64)
+  (if (. rx bt)
+      (bt-caps rx s from false false)
+      (find-caps-fast rx m s from)))
+
+(defun find-caps-fast :private (rx: Regex m: (Option Matcher) s: str from: i64) -> (Array i64)
   (if (dfa-on? rx m)
       (let [e (fwd-end rx m s from)]
         (cond (= e -1) (no-caps)
@@ -113,6 +157,11 @@
 
 ;; the span of the leftmost match at or after from, packed; -1 when none
 (defun find-packed :private (rx: Regex m: (Option Matcher) s: str from: i64) -> i64
+  (if (. rx bt)
+      (caps-packed (bt-caps rx s from false false))
+      (find-packed-fast rx m s from)))
+
+(defun find-packed-fast :private (rx: Regex m: (Option Matcher) s: str from: i64) -> i64
   (if (dfa-on? rx m)
       (let [e (fwd-end rx m s from)]
         (cond (= e -1) -1
@@ -152,7 +201,23 @@
 
 ;; the whole of s must match
 (defun re-matches (rx: Regex s: str) -> (Option Match)
-  (caps-match s (pike-run (. rx fwd) s 0 true true) (. rx groups)))
+  (caps-match s (if (. rx bt) (bt-caps rx s 0 true true) (pike-run (. rx fwd) s 0 true true)) (. rx groups)))
+
+;; the same as `re-find` and `re-matches` with the spent budget of the backtracking matcher an `Err` (every other pattern is `Ok`)
+(defun try-re-find-from (rx: Regex s: str from: i64) -> (Result (Option Match) str)
+  (if (. rx bt)
+      (do (check-from s from)
+          (let [r (bt-run (. rx fwd) s from false false (default-budget))]
+            (if (exceeded? r) (Err (budget-message)) (Ok (caps-match s r (. rx groups))))))
+      (Ok (re-find-from rx s from))))
+
+(defun try-re-find (rx: Regex s: str) -> (Result (Option Match) str) (try-re-find-from rx s 0))
+
+(defun try-re-matches (rx: Regex s: str) -> (Result (Option Match) str)
+  (if (. rx bt)
+      (let [r (bt-run (. rx fwd) s 0 true true (default-budget))]
+        (if (exceeded? r) (Err (budget-message)) (Ok (caps-match s r (. rx groups)))))
+      (Ok (re-matches rx s))))
 
 ;; where the search goes on after the match [st, e)
 (defun next-from :private (s: str st: i64 e: i64) -> i64

@@ -1,0 +1,45 @@
+;; The fibber side of the fib.decimal differential test (scripts/decimal-diff/run.sh): the same lines as Ref.java reads, the same text printed per line.
+(ns main (:use fib.core fib.seq fib.coll fib.print) (:require [fib.decimal :as d] [fib.string :as s]))
+
+(defun mode-of (k: i64) -> d/RoundingMode
+  (cond (= k 0) d/Up (= k 1) d/Down (= k 2) d/Ceiling (= k 3) d/Floor (= k 4) d/HalfUp (= k 5) d/HalfDown :else d/HalfEven))
+
+(defun num (t: str) -> i64 (unwrap (parse-long t)))
+(defun dec (t: str) -> d/Dec (d/dec-parse t))
+
+(defun hex-val (b: i8) -> i64 (let [c (zext i64 b)] (if (< c 58) (- c 48) (- c 87))))
+(defun bits-of (h: str) -> f64
+  (bits->f64 (loop [i 0 v 0] (if (< i (str-len h)) (recur (+ i 1) (bit-or (shl v 4) (hex-val (str-byte-at h i)))) v))))
+
+(defun hex16 (n: i64) -> str
+  (str-join (mapv (fn (i: i64) (let [nib (bit-and (shr n (* 4 (- 15 i))) 15)] (str-slice "0123456789abcdef" nib (+ nib 1)))) (range 16))))
+
+(defun run-line (line: str) -> str
+  (let [f (s/split line " ")
+        op (nth f 0)
+        mc (fn (p: i64 m: i64) (d/math-context p (mode-of m)))]
+    (cond (= op "add") (d/dec-to-str (d/dec-add (dec (nth f 1)) (dec (nth f 2))))
+          (= op "sub") (d/dec-to-str (d/dec-sub (dec (nth f 1)) (dec (nth f 2))))
+          (= op "mul") (d/dec-to-str (d/dec-mul (dec (nth f 1)) (dec (nth f 2))))
+          (= op "cmp") (str (d/dec-compare (dec (nth f 1)) (dec (nth f 2))))
+          (= op "eq") (str (d/dec-equals? (dec (nth f 1)) (dec (nth f 2))))
+          (= op "div") (d/dec-to-str (d/dec-divide (dec (nth f 1)) (dec (nth f 2)) (mc (num (nth f 3)) (num (nth f 4)))))
+          (= op "divs") (d/dec-to-str (d/dec-divide-scale (dec (nth f 1)) (dec (nth f 2)) (num (nth f 3)) (mode-of (num (nth f 4)))))
+          (= op "divx") (d/dec-to-str (d/dec-divide-exact (dec (nth f 1)) (dec (nth f 2))))
+          (= op "setscale") (d/dec-to-str (d/dec-set-scale (dec (nth f 1)) (num (nth f 2)) (mode-of (num (nth f 3)))))
+          (= op "round") (d/dec-to-str (d/dec-round (dec (nth f 1)) (mc (num (nth f 2)) (num (nth f 3)))))
+          (= op "pow") (d/dec-to-str (d/dec-pow (dec (nth f 1)) (num (nth f 2))))
+          (= op "strip") (d/dec-to-str (d/dec-strip (dec (nth f 1))))
+          (= op "plain") (d/dec-to-plain-str (dec (nth f 1)))
+          (= op "prec") (str (d/dec-precision (dec (nth f 1))))
+          (= op "str") (d/dec-to-str (dec (nth f 1)))
+          (= op "f64") (d/dec-to-str (d/dec-of-f64 (bits-of (nth f 1))))
+          (= op "valof") (d/dec-to-str (d/dec-of-f64-text (bits-of (nth f 1))))
+          (= op "tof64") (hex16 (f64->bits (d/dec-to-f64 (dec (nth f 1)))))
+          (= op "toi64") (str (d/dec-to-i64 (dec (nth f 1))))
+          :else "?")))
+
+(defun main () -> i64
+  (do (doseq [line (s/split-lines (slurp (nth (vec (args)) 0)))]
+        (if (= line "") () (println (run-line line))))
+      0))

@@ -1,0 +1,59 @@
+;; The fuzz test of fib.regex (package LIB-2): `N` mutated patterns (fixed seed, argument 1 the seed, argument 2 the count) go to `try-re-pattern` of
+;; fib.regex.unicode and, when one compiles, to `try-re-find` over a few texts, one of them long. The property: no input traps. A pattern is either an `Err`
+;; or a regex; a search is an `Ok` or, for a pattern with a backreference, the `Err` of a spent budget. A trap (a failed index, an overflow, a stack
+;; overflow, an `unwrap` of nothing) ends the program with a nonzero status and no counts line. Prints the counts: how many patterns were refused, how many
+;; compiled, how many of those use the backtracking matcher, how many searches spent the budget.
+(ns main (:use fib.core fib.seq fib.coll fib.print fib.rng) (:require [fib.regex :as re] [fib.regex.unicode :as ru]))
+
+(defun corpus () -> (Vec str)
+  ["a+b" "(a|b)*c" "^\\w+@\\w+\\.com$" "(?i)hello" "(?s)a.c" "(?m)^b$" "(?x) a b # c\n d" "(a)\\1" "(\\w)\\1+" "(a+)+b" "(a*)*\\1b" "[a-c&&x]" "\\p{L}+" "\\P{Lu}"
+   "[\\p{Nd}x]+" "\\x{1F600}" "(?i-s)a(?s:.)c" "(?:a|b){2,3}?" "a{2}{3}" "((a)|b)\\2" "\\b\\w+\\b" "[^\\s]+" "(?<n>a)" "(?=a)b" "a++" "\\Qa.b\\E" "\\p{IsGreek}\\pL" "[\\x{e9}-\\x{ff}]"
+   "(((((((((a)))))))))\\9" "\\1(a)" "(?i)(?i)(?i)(a)" "\\u00e9" "\\0101" "[a-" "(" ")" "[]" "{" "a{1000}" "a{1001}" "\\" "\\p" "\\p{" "\\p{L" "\\pL" "x*+" "(?" "(?i" "(?i:" "(?-"])
+
+(defun metas () -> (Vec str) ["(" ")" "[" "]" "{" "}" "\\" "|" "*" "+" "?" "." "^" "$" "-" "&" "#" " " "p" "P" "1" "9" "x" "i" "s" "m" "<" ">" ":" "=" "!" "," "é" "😀"])
+
+(defun texts () -> (Vec str)
+  ["" "a" "ab" "aaaa" "aAbB 12 é😀" "line1\nline2\r\nline3" "foo@bar.com" (str-join (vec (map (fn (i: i64) "a") (range 400)))) "αβγ ABC ٣٤"])
+
+(defun pick (r: Rng xs: (Vec str)) -> str (nth xs (rem (shr (rng-next r) 1) (count xs))))
+(defun below (r: Rng n: i64) -> i64 (if (<= n 0) 0 (rem (shr (rng-next r) 1) n)))
+
+;; the characters of s as strings
+(defun chars-of (s: str) -> (Vec str) (mapv char->str (str-chars s)))
+
+;; one mutation of a pattern: delete, insert, replace, duplicate a stretch, swap two, truncate, or splice in another pattern
+(defun mutate (r: Rng p: str) -> str
+  (let [cs (chars-of p)
+        n (count cs)
+        i (below r (+ n 1))
+        k (below r 7)]
+    (cond (= k 0) (if (> n 0) (str-join (vec (concat (take (min i (- n 1)) cs) (drop (+ (min i (- n 1)) 1) cs)))) p)
+          (= k 1) (str-join (vec (concat (take i cs) (concat [(pick r (metas))] (drop i cs)))))
+          (= k 2) (if (> n 0) (str-join (vec (concat (take (min i (- n 1)) cs) (concat [(pick r (metas))] (drop (+ (min i (- n 1)) 1) cs))))) p)
+          (= k 3) (str-join (vec (concat (take i cs) (concat (take (below r 6) (drop i cs)) (drop i cs)))))
+          (= k 4) (if (> n 1) (let [a (min i (- n 1)) j (below r n)] (str-join (assoc (assoc cs a (nth cs j)) j (nth cs a)))) p)
+          (= k 5) (str-join (vec (take i cs)))
+          :else (str (str-join (vec (take i cs))) (pick r (corpus))))))
+
+(defun main () -> i64
+  (let [seed (unwrap-or (parse-long (nth (vec (args)) 0)) 1)
+        count (unwrap-or (parse-long (nth (vec (args)) 1)) 1000)
+        r (rng-new seed)
+        refused (cell 0)
+        compiled (cell 0)
+        bt (cell 0)
+        spent (cell 0)
+        searches (cell 0)]
+    (do (dotimes (n count)
+          (let [p (loop [p (pick r (corpus)) k (+ 1 (below r 3))] (if (> k 0) (recur (mutate r p) (- k 1)) p))]
+            (match (ru/try-re-pattern p)
+              ((Err _) (set! refused (+ @refused 1)))
+              ((Ok rx) (do (set! compiled (+ @compiled 1))
+                           (if (re/backtracking? rx) (set! bt (+ @bt 1)) ())
+                           (doseq [t (texts)]
+                             (do (set! searches (+ @searches 1))
+                                 (match (re/try-re-find rx t)
+                                   ((Err _) (set! spent (+ @spent 1)))
+                                   ((Ok _) ())))))))))
+        (println (str "patterns " count ": refused " @refused ", compiled " @compiled " (backtracking " @bt "), searches " @searches ", budget spent " @spent))
+        0)))

@@ -1,0 +1,47 @@
+;; The fibber side of the fib.regex differential test (scripts/regex-diff/run.sh): reads the file named by the first argument (the lines of gen.py,
+;; `MODE HEX(pattern) HEX(input)`) and prints, per line, what scripts/regex-diff/Ref.java prints for the same line: `ERR`, `NO`, or the code point index
+;; of the start of the match and the hex text of each group (`=` empty, `-` no part). A search that spends the backtracking budget prints `BUDGET`
+;; (the runner counts those apart; they are not disagreements). Every pattern goes through fib.regex.unicode, which is fib.regex plus `\p{..}`.
+(ns main (:use fib.core fib.seq fib.coll fib.print) (:require [fib.regex :as re] [fib.regex.unicode :as ru] [fib.string :as s]))
+
+(defun unhex (h: str) -> str
+  (if (= h "-")
+      ""
+      (let [n (quot (str-len h) 2)
+            c (cell (array (max n 1) 0i8))]
+        (do (dotimes (i n)
+              (let [hi (hexv (str-byte-at h (* 2 i)))
+                    lo (hexv (str-byte-at h (+ (* 2 i) 1)))]
+                (array-set! &c i (trunc i8 (+ (* hi 16) lo)))))
+            (str-from-bytes (array-copy @c 0 n))))))
+
+(defun hexv (b: i8) -> i64 (let [c (zext i64 b)] (if (< c 58) (- c 48) (- c 87))))
+
+(defun hex-of (t: str) -> str
+  (if (= (str-len t) 0)
+      "="
+      (str-join (mapv (fn (i: i64) (let [b (zext i64 (str-byte-at t i))] (str (str-slice "0123456789abcdef" (shr b 4) (+ (shr b 4) 1)) (str-slice "0123456789abcdef" (bit-and b 15) (+ (bit-and b 15) 1)))))
+                      (range (str-len t))))))
+
+(defun answer (m: (Option re/Match) text: str) -> str
+  (match m
+    (nil "NO")
+    ((some x) (str (count (str-chars (str-slice text 0 (. x start))))
+                   (str-join (mapv (fn (g: (Option str)) (match g (nil " -") ((some t) (str " " (hex-of t))))) (vec (concat [(some (. x whole))] (. x groups)))))))))
+
+(defun run-line (line: str) -> str
+  (let [f (s/split line " ")
+        pat (unhex (nth f 1))
+        text (unhex (nth f 2))]
+    (match (ru/try-re-pattern pat)
+      ((Err _) "ERR")
+      ((Ok rx)
+       (match (if (= (nth f 0) "f") (re/try-re-find rx text) (re/try-re-matches rx text))
+         ((Err _) "BUDGET")
+         ((Ok m) (answer m text)))))))
+
+(defun main () -> i64
+  (let [path (nth (vec (args)) 0)]
+    (do (doseq [line (s/split-lines (slurp path))]
+          (if (= line "") () (println (run-line line))))
+        0)))
