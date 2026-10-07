@@ -1,0 +1,144 @@
+;; fib.compress.contract: what any Codec must do, whoever implements it (docs/design/compress.md 8). A DRIVER repository runs it against itself:
+;; `(implements CompressContract "zlib" (fn () <a codec>))` in a spec file, and `fibc test` judges it. It names no driver. fib.compress.lz4 runs it in specs/compress-lz4-spec.fib,
+;; and fib.compress.fault wraps a real codec in the faults (a decoder that ignores max-output, that accepts a truncated frame, ...): each fault must make the scenario
+;; that names it FAIL (`fault-scenarios`), or the contract could not fail. Which scenarios apply follows the codec's capabilities (:frame, :streaming, :dictionary, :checksum,
+;; :levels, :content-size, :block-size, :linked-blocks): a scenario that needs one the codec lacks is a skip row, and the honesty scenario checks the other way: what is not
+;; listed must be an `unsupported` error, never a quiet change.
+;; CORRUPTION: the contract states exactly what it requires. A flipped byte under a content checksum must be an error or the original (`:checksum` codecs); under no checksum
+;; it may decode to something else, but never traps, and never exceeds `max-output`.
+(ns fib.compress.contract (:use fib.core fib.seq fib.coll fib.test.core fib.compress.types fib.compress.ops fib.compress.corpus fib.compress.checks))
+
+(defun known-capabilities () -> (Vec keyword) [:frame :block :block-size :levels :streaming :dictionary :checksum :content-size :linked-blocks])
+
+(defun unknown-caps (c: c) -> (Vec keyword) :where ((Codec c))
+  (vec (filter (fn (k: keyword) (not (some? (first (filter (fn (x: keyword) (= x k)) (known-capabilities)))))) (codec-capabilities c))))
+
+;; An option for each capability the codec lacks, and the answer it must give.
+(defun honesty-failures (c: c) -> (Vec str) :where ((Codec c))
+  (let [d (default-options) data (. (nth (small-corpus) 2) data)
+        want (fn (cap: keyword o: Options) (if (supports? c cap) true (is-kind? (compress c data o) :unsupported)))
+        no-stream (or (supports? c :streaming) (match (codec-compressor c d) ((Err e) (= (. e kind) :unsupported)) ((Ok _) false)))]
+    (cat [(if (want :dictionary (with-dictionary d data)) [] ["dictionary"])
+          (if (want :levels (with-level d 5)) [] ["level"])
+          (if (want :content-size (with-record-size d true)) [] ["content-size"])
+          (if no-stream [] ["streaming"])
+          (if (empty? (unknown-caps c)) [] ["unknown capability"])])))
+
+(defun smaller? (a: (Result (Array i8) CompressError) b: (Result (Array i8) CompressError)) -> bool
+  (match a ((Ok x) (match b ((Ok y) (< (array-len x) (array-len y))) ((Err _) false))) ((Err _) false)))
+
+(defun dictionary-failures (c: c) -> (Vec str) :where ((Codec c))
+  (let [d (default-options) s (find-sample "text 4096") dict (array-copy (. s data) 0 2000)
+        od (with-dictionary d dict)
+        plain (compress c (. s data) d) with (compress c (. s data) od)
+        back (match with ((Ok z) (decompress c z od)) ((Err e) (Err e)))
+        nodict (match with ((Ok z) (decompress c z d)) ((Err e) (Err e)))]
+    (cat [(if (is-bytes? back (. s data)) [] ["round trip with a dictionary"])
+          (if (smaller? with plain) [] ["a dictionary makes text smaller"])
+          (if (is-bytes? nodict (. s data)) ["decoding without the dictionary gave the original"] [])])))
+
+;; A decompressor given nothing asks for input, and finishing it is an error.
+(defun decoder-failures (c: c) -> (Vec str) :where ((Codec c))
+  (match (codec-decompressor c (default-options))
+    ((Err _) ["no decompressor"])
+    ((Ok dk)
+     (match (decompressor-feed dk (array 0 0i8))
+       ((Err _) ["empty feed failed"])
+       ((Ok st) (cat [(if (. st needs-input) [] ["an empty feed does not ask for input"])
+                      (match (decompressor-finish dk) ((Err _) []) ((Ok _) ["finish of an empty stream succeeded"]))]))))))
+
+;; A finished compressor refuses more, and a stream's output decodes.
+(defun finished-failures (c: c k: k s: Sample o1: (Array i8) o2: (Array i8)) -> (Vec str) :where ((Codec c) (Compressor k))
+  (cat [(if (is-bytes? (decompress c (concat-bytes [o1 o2]) (default-options)) (. s data)) [] ["stream output does not decode"])
+        (if (failed? (compressor-feed k (. s data))) [] ["feed after finish succeeded"])
+        (match (compressor-finish k) ((Err _) []) ((Ok _) ["second finish succeeded"]))]))
+
+(defun protocol-failures (c: c) -> (Vec str) :where ((Codec c))
+  (let [s (nth (small-corpus) 2)]
+    (match (codec-compressor c (default-options))
+      ((Err _) ["no compressor"])
+      ((Ok k)
+       (match (compressor-feed k (. s data))
+         ((Err _) ["feed failed"])
+         ((Ok o1)
+          (match (compressor-finish k)
+            ((Err _) ["finish failed"])
+            ((Ok o2) (into (finished-failures c k s o1 o2) (decoder-failures c))))))))))
+
+(defun stream-reuse-failures (c: c) -> (Vec str) :where ((Codec c))
+  (let [d (default-options) s (find-sample "text 4096") sizes [1000]
+        a (compress-chunks c d (split-sizes (. s data) sizes))
+        b (compress-chunks c d (split-sizes (. s data) sizes))]
+    (match a
+      ((Err _) ["a first stream failed"])
+      ((Ok x) (match b
+                ((Err _) ["a second stream failed"])
+                ((Ok y) (if (and (is-bytes? (decompress c x d) (. s data)) (is-bytes? (decompress c y d) (. s data))) [] ["the second stream is wrong"])))))))
+
+(defun magic-failures (c: c) -> (Vec str) :where ((Codec c))
+  (let [z (compressed c (nth (small-corpus) 2))
+        zzzz (array 8 90i8)]
+    (cat [(if (empty? (codec-magics c)) ["no magic numbers"] [])
+          (if (some? (first (filter (fn (m: (Array i8)) (starts-with-bytes? z m)) (codec-magics c)))) [] ["the output does not start with a magic number"])
+          (if (some? (first (filter (fn (m: (Array i8)) (starts-with-bytes? zzzz m)) (codec-magics c)))) ["a magic number matches ZZZZ"] [])])))
+
+(defcontract CompressContract [make]
+  (scenario "the codec has a name, lists only known capabilities, and refuses with `unsupported` what it does not list (honesty)"
+    (given [c (make)])
+    (then (expect = true (> (str-len (codec-name c)) 0))
+          (expect = [] (honesty-failures c))))
+  (scenario "a round trip gives the input back, on empty, 1-byte, incompressible, all-zero, long-run, text, pattern and random data at sizes around every block boundary"
+    (covers "compress" "decompress")
+    (given [c (make) samples (corpus)])
+    (then (expect = [] (round-trips c [(OptSet "default" (default-options))] samples))
+          (expect = true (> (count samples) 70))))
+  (scenario "a round trip holds under every option the codec lists: levels, checksums, block sizes, linked and independent blocks, content size"
+    (given [c (make) samples (small-corpus)])
+    (then (expect = [] (round-trips c (option-sets c) samples))
+          (expect = true (>= (count (option-sets c)) 1))))
+  (scenario "the same input compresses to the same bytes every time (determinism), and never to more than max-compressed-size"
+    (given [c (make) samples (corpus)])
+    (then (expect = [] (failing samples sname (fn (s: Sample) (deterministic? c s))))
+          (expect = [] (failing samples sname (fn (s: Sample) (within-bound? c s))))))
+  (scenario "streaming equals one-shot: output fed in pieces of 1, 7, 4096, 65537 bytes and in seeded random sizes decodes to the input, and a stream compressed in pieces decodes to it"
+    (skip-unless (supports? (make) :streaming) "the codec has no streaming")
+    (given [c (make) samples (corpus)])
+    (then (expect = [] (stream-failures c samples))))
+  (scenario "max-output is enforced exactly: the size succeeds, one byte under is too-large, one-shot and streamed"
+    (given [c (make) samples (corpus)])
+    (then (expect = [] (failing samples sname (fn (s: Sample) (max-exact? c s))))))
+  (scenario "truncated input at every prefix is an error, never a partial success presented as complete, one-shot and streamed"
+    (skip-unless (supports? (make) :frame) "a block-only codec cannot tell a truncated block")
+    (given [c (make) samples (small-corpus)])
+    (then (expect = [] (vec (mapcat (fn (s: Sample) (prefix-failures c s)) samples)))))
+  (scenario "corrupt bytes never trap: a flipped byte is an error or, under a checksum, the original; without one the output stays within max-output"
+    (given [c (make) samples (small-corpus)])
+    (then (expect = [] (vec (mapcat (fn (s: Sample) (corrupt-failures c s (supports? c :checksum))) samples)))))
+  (scenario "concatenated frames decompress to the concatenation, with empty frames among them"
+    (skip-unless (supports? (make) :frame) "the codec has no self-delimiting frames")
+    (given [c (make) a (nth (small-corpus) 2) b (nth (small-corpus) 4) e (nth (small-corpus) 0)])
+    (then (expect = true (concat-ok? c a b)) (expect = true (concat-ok? c e a)) (expect = true (concat-ok? c a e))))
+  (scenario "empty input to decompress is an error, and an empty input compresses and decompresses to empty"
+    (given [c (make) o (default-options)])
+    (then (expect = true (failed? (decompress c (array 0 0i8) o)))
+          (expect = true (is-bytes? (decompress c (compressed c (nth (small-corpus) 0)) o) (array 0 0i8)))))
+  (scenario "a dictionary makes text smaller, round trips, and is needed to decode"
+    (skip-unless (supports? (make) :dictionary) "the codec has no dictionary")
+    (given [c (make)])
+    (then (expect = [] (dictionary-failures c))))
+  (scenario "decompressor steps are bounded: one call returns at most 4 MiB however much input it holds, and says whether it needs more input"
+    (skip-unless (supports? (make) :streaming) "the codec has no streaming")
+    (given [c (make) zeros (find-sample "zeros 1000000")])
+    (then (expect = true (bounded-steps? c zeros))
+          (expect = [] (protocol-failures c))))
+  (scenario "two streams from one codec value are independent (no state is shared between streams)"
+    (skip-unless (supports? (make) :streaming) "the codec has no streaming")
+    (given [c (make)])
+    (then (expect = [] (stream-reuse-failures c))))
+  (scenario "a frame format has magic numbers: the output starts with one, and a registry finds the codec by it"
+    (skip-unless (supports? (make) :frame) "the codec has no frames")
+    (given [c (make)])
+    (then (expect = [] (magic-failures c))))
+  (scenario "an invalid argument is refused as such: a negative max-output"
+    (given [c (make) z (compressed c (nth (small-corpus) 2))])
+    (then (expect = true (is-kind? (decompress c z (with-max-output (default-options) -1)) :invalid-argument)))))

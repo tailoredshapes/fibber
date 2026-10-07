@@ -1,0 +1,125 @@
+;; fib.compress.lz4.sdec: the streaming LZ4 frame decompressor (docs/design/compress.md 5, 6.2). Input chunks of any size (one byte at a time included) are queued; a unit of
+;; the format is processed only when ALL of it has arrived (a frame head; a block: its size word, data and checksum; the content checksum), so memory is bounded by the
+;; block maximum (at most 4 MiB, from the frame head) plus the chunk the caller gave. One call returns at most one block's output (and `needs-input` false while the queue
+;; may hold more), so the output of a call is bounded whatever the input. Linked blocks keep a 64 KiB window; a dictionary is the start of the window (of every block
+;; when independent, of the first frame's first block otherwise). Legacy frames are not decoded here (:unsupported; the one-shot decoder has them).
+;; regs: 0 stage (0 frame head, 1 block, 2 content checksum, 3 skippable payload), 1 flags (1 independent, 2 block checksums, 4 content checksum), 2 block max, 3 content
+;; size (-1), 4 output of this frame, 5 total output, 6 window history length, 7 skip left, 8 frames finished, 9 max-output, 10 dictionary applies (first frame only)
+(ns fib.compress.lz4.sdec (:use fib.core fib.seq fib.coll fib.compress.types fib.compress.lz4.mem fib.compress.lz4.header fib.compress.lz4.xxh32 fib.compress.lz4.blockdec
+                                 fib.compress.lz4.block fib.compress.lz4.sbuf fib.compress.lz4.scomp))
+
+(defstruct LzDec (regs: (Array i64) ibuf: SBuf win: (Cell (Array i8)) xxh: (Cell Xxh) dict: (Array i8)))
+
+(defun new-decompressor (o: Options) -> (Result LzDec CompressError)
+  (if (< (. o max-output) 0) (Err (invalid-argument "max-output must not be negative"))
+    (let [r (array 12 0) t (. o dictionary) d (if (> (array-len t) 65536) (array-copy t (- (array-len t) 65536) (array-len t)) t)]
+      (do (rs r 9 (. o max-output)) (rs r 10 (if (> (array-len d) 0) 1 0))
+          (Ok (LzDec r (sb-new) (cell (array 0 0i8)) (cell (xxh-new 0)) d))))))
+
+(defun dflag? (d: LzDec f: i64) -> bool (> (bit-and (rg (. d regs) 1) f) 0))
+(defun empty-step (more: bool end: bool) -> (Result DecStep CompressError) (Ok (DecStep (array 0 0i8) more end)))
+
+;; A frame head is complete: its state is set up.
+(defun begin-frame (d: LzDec h: FrameHead) -> (Result unit CompressError)
+  (let [r (. d regs) dl (if (= (rg r 10) 1) (array-len (. d dict)) 0)]
+    (cond (> (. h csize) (- (rg r 9) (rg r 5))) (Err (too-large "the frame's content size exceeds max-output"))
+          :else
+          (let [hist-cap (if (. h indep) dl 65536) w (array (+ hist-cap (+ (. h bmax) 8)) 0i8)]
+            (do (copy-exact (data w) 0 (data (. d dict)) 0 dl)
+                (set! (. d win) w) (set! (. d xxh) (xxh-new 0))
+                (rs r 1 (+ (if (. h indep) 1 0) (+ (if (. h bchk) 2 0) (if (. h cchk) 4 0))))
+                (rs r 2 (. h bmax)) (rs r 3 (. h csize)) (rs r 4 0) (rs r 6 dl) (rs r 10 0) (rs r 0 1)
+                (Ok ()))))))
+
+(defun frame-done (d: LzDec) -> (Result DecStep CompressError)
+  (let [r (. d regs)]
+    (if (and (>= (rg r 3) 0) (not (= (rg r 3) (rg r 4)))) (Err (corrupt "the frame's content size does not match its content"))
+      (do (rs r 0 0) (rs r 8 (+ (rg r 8) 1)) (empty-step (= (sb-len (. d ibuf)) 0) true)))))
+
+(defun step-head (d: LzDec) -> (Result (Option DecStep) CompressError)
+  (let [b (. d ibuf) r (. d regs)]
+    (match (parse-head (sb-ptr b) (sb-len b) 0)
+      ((Err e) (Err e))
+      ((Ok nothing)
+       (match nothing
+         (nil (Ok (some (DecStep (array 0 0i8) true false))))
+         ((some h)
+          (cond (= (. h kind) kind-legacy) (Err (unsupported "legacy LZ4 frames are decoded by the one-shot decoder only"))
+                (= (. h kind) kind-skip) (do (sb-skip b 8) (rs r 7 (. h skip)) (rs r 0 (if (> (. h skip) 0) 3 0)) (rs r 8 (+ (rg r 8) (if (> (. h skip) 0) 0 1))) (Ok nil))
+                :else (match (begin-frame d h) ((Err e) (Err e)) ((Ok _) (do (sb-skip b (. h hlen)) (Ok nil)))))))))))
+
+;; Slides the window after `n` bytes were appended at hist (linked blocks): keeps the last 64 KiB.
+(defun slide (d: LzDec n: i64) -> unit
+  (let [r (. d regs) hist (rg r 6)]
+    (when (not (dflag? d 1))
+      (let [keep (min 65536 (+ hist n)) shift (- (+ hist n) keep)]
+        (do (when (> shift 0) (move-down (data @(. d win)) 0 shift keep)) (rs r 6 keep))))))
+
+(defun emit (d: LzDec out: (Array i8)) -> (Result DecStep CompressError)
+  (let [r (. d regs)]
+    (do (when (dflag? d 4) (xxh-update! @(. d xxh) out 0 (array-len out)))
+        (rs r 4 (+ (rg r 4) (array-len out))) (rs r 5 (+ (rg r 5) (array-len out)))
+        (Ok (DecStep out false false)))))
+
+(defun block-raw (d: LzDec sz: i64) -> (Result DecStep CompressError)
+  (let [b (. d ibuf) r (. d regs) data-at (unsafe (ptr+ (sb-ptr b) 4))]
+    (if (> sz (- (rg r 9) (rg r 5))) (Err (too-large "the output exceeds max-output"))
+      (let [out (array sz 0i8)]
+        (do (copy-exact (data out) 0 data-at 0 sz)
+            (when (not (dflag? d 1)) (do (copy-exact (data @(. d win)) (rg r 6) data-at 0 sz) (slide d sz)))
+            (sb-skip b (+ 4 (+ sz (if (dflag? d 2) 4 0))))
+            (emit d out))))))
+
+(defun block-comp (d: LzDec sz: i64) -> (Result DecStep CompressError)
+  (let [b (. d ibuf) r (. d regs) w @(. d win) hist (rg r 6)
+        room (- (rg r 9) (rg r 5)) n-lim (min (rg r 2) room)
+        res (decode-block (unsafe (ptr+ (sb-ptr b) 4)) sz (data w) (array-len w) hist 0 (+ hist n-lim))]
+    (cond (= res e-too-large) (Err (if (< n-lim (rg r 2)) (too-large "the output exceeds max-output") (corrupt "a block decodes to more than the frame's block size")))
+          (< res 0) (Err (decode-error res))
+          :else (let [n (- res hist) out (array-copy w hist res)]
+                  (do (slide d n) (sb-skip b (+ 4 (+ sz (if (dflag? d 2) 4 0)))) (emit d out))))))
+
+(defun step-block (d: LzDec) -> (Result (Option DecStep) CompressError)
+  (let [b (. d ibuf) r (. d regs) have (sb-len b)]
+    (if (< have 4) (Ok (some (DecStep (array 0 0i8) true false)))
+      (let [wd (rd32 (sb-ptr b) 0) sz (bit-and wd 2147483647) bsum (if (dflag? d 2) 4 0)]
+        (cond (= wd 0) (do (sb-skip b 4) (rs r 0 (if (dflag? d 4) 2 4)) (Ok nil))
+              (> sz (rg r 2)) (Err (corrupt "a block is larger than the frame's block size"))
+              (< have (+ 4 (+ sz bsum))) (Ok (some (DecStep (array 0 0i8) true false)))
+              (and (dflag? d 2) (not (= (rd32 (sb-ptr b) (+ 4 sz)) (xxh32-ptr (unsafe (ptr+ (sb-ptr b) 4)) sz 0)))) (Err (checksum-error "a block's checksum does not match"))
+              :else (match (if (> (bit-and wd 2147483648) 0) (block-raw d sz) (block-comp d sz))
+                      ((Err e) (Err e))
+                      ((Ok s) (Ok (some s)))))))))
+
+(defun step-trailer (d: LzDec) -> (Result (Option DecStep) CompressError)
+  (let [b (. d ibuf) r (. d regs)]
+    (cond (= (rg r 0) 4) (match (frame-done d) ((Err e) (Err e)) ((Ok s) (Ok (some s))))
+          (< (sb-len b) 4) (Ok (some (DecStep (array 0 0i8) true false)))
+          (not (= (rd32 (sb-ptr b) 0) (xxh-digest @(. d xxh)))) (Err (checksum-error "the content checksum does not match"))
+          :else (do (sb-skip b 4) (rs r 0 4) (Ok nil)))))
+
+(defun step-skip (d: LzDec) -> (Result (Option DecStep) CompressError)
+  (let [b (. d ibuf) r (. d regs) k (min (sb-len b) (rg r 7))]
+    (do (sb-skip b k) (rs r 7 (- (rg r 7) k))
+        (cond (= (rg r 7) 0) (do (rs r 0 0) (rs r 8 (+ (rg r 8) 1)) (Ok nil))
+              :else (Ok (some (DecStep (array 0 0i8) true false)))))))
+
+(defun dec-step (d: LzDec) -> (Result (Option DecStep) CompressError)
+  (let [st (rg (. d regs) 0)]
+    (cond (= st 0) (if (= (sb-len (. d ibuf)) 0) (Ok (some (DecStep (array 0 0i8) true false))) (step-head d))
+          (= st 1) (step-block d)
+          (= st 3) (step-skip d)
+          :else (step-trailer d))))
+
+(defun dec-feed (d: LzDec chunk: (Array i8)) -> (Result DecStep CompressError)
+  (do (sb-append (. d ibuf) chunk)
+      (loop []
+        (match (dec-step d)
+          ((Err e) (Err e))
+          ((Ok r) (match r (nil (recur)) ((some s) (Ok s))))))))
+
+(defun dec-finish (d: LzDec) -> (Result unit CompressError)
+  (let [r (. d regs)]
+    (cond (and (= (rg r 0) 0) (= (sb-len (. d ibuf)) 0) (> (rg r 8) 0)) (Ok ())
+          (and (= (rg r 0) 0) (> (sb-len (. d ibuf)) 0) (< (sb-len (. d ibuf)) 4)) (Err (truncated "the stream ends inside a frame header"))
+          :else (Err (truncated "the stream ends before the end of its frame")))))

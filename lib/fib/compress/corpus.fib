@@ -1,0 +1,66 @@
+;; fib.compress.corpus: the seeded inputs the codec contract runs (docs/design/compress.md 8): every kind of data a compressor treats differently, at every size where a format
+;; changes behaviour (the literal and match length extension edges 15/16/255/256, the 12 and 13 byte ends, 4 and 64 KiB, block sizes). The streams come from fib.rng's SplitMix64,
+;; so a failing sample is named by kind and size and replays exactly.
+(ns fib.compress.corpus (:use fib.core fib.seq fib.coll fib.rng))
+
+(defstruct Sample (name: str data: (Array i8)))
+
+(defun fill (n: i64 f: (fn (i64) i64)) -> (Array i8)
+  (let [c (cell (array n 0i8))]
+    (do (loop [i 0] (when (< i n) (do (array-set! &c i (trunc i8 (f i))) (recur (+ i 1))))) @c)))
+
+(defun random-bytes (seed: i64 n: i64) -> (Array i8) (let [r (rng-new seed)] (fill n (fn (i: i64) (rng-below r 256)))))
+(defun zeros (n: i64) -> (Array i8) (array n 0i8))
+(defun same-byte (b: i64 n: i64) -> (Array i8) (fill n (fn (i: i64) b)))
+
+;; A word list the text draws from: the same words again and again, as text does.
+(defun words () -> (Vec str) ["the" "of" "and" "compression" "block" "frame" "literal" "match" "offset" "token" "stream" "checksum" "window" "a" "to" "in" "hash" "chain"])
+
+(defun text (seed: i64 n: i64) -> (Array i8)
+  (let [r (rng-new seed) ws (words)
+        s (loop [acc "" k 0] (if (>= (str-len acc) n) acc (recur (str acc (nth ws (rng-below r (count ws))) (if (= (rng-below r 9) 0) ".\n" " ")) (+ k 1))))]
+    (array-copy (str-bytes s) 0 n)))
+
+;; A pattern of `period` bytes repeated: overlapping matches with offset = period.
+(defun pattern (seed: i64 period: i64 n: i64) -> (Array i8)
+  (let [p (random-bytes seed period)] (fill n (fn (i: i64) (zext i64 (array-get p (rem i period)))))))
+
+;; Records of one shape with a field that changes: repeated structure with noise.
+(defun records (seed: i64 n: i64) -> (Array i8)
+  (let [r (rng-new seed) base (random-bytes seed 24)]
+    (fill n (fn (i: i64) (if (= (rem i 24) 7) (rng-below r 256) (zext i64 (array-get base (rem i 24))))))))
+
+;; A long run, then noise, then the run's byte again: a match offset that is large and a literal run after it.
+(defun run-noise (seed: i64 n: i64) -> (Array i8)
+  (let [r (rng-new seed)] (fill n (fn (i: i64) (cond (< i (quot n 3)) 97 (< i (* 2 (quot n 3))) (rng-below r 256) :else 97)))))
+
+;; Runs of different lengths of different bytes.
+(defun runs (seed: i64 n: i64) -> (Array i8)
+  (let [r (rng-new seed) cur (cell 0) left (cell 0)]
+    (fill n (fn (i: i64) (do (when (= @left 0) (do (set! cur (rng-below r 256)) (set! left (+ 1 (rng-below r 400))))) (set! left (- @left 1)) @cur)))))
+
+(defun edge-sizes () -> (Vec i64)
+  [0 1 2 3 4 5 11 12 13 14 15 16 17 18 19 20 255 256 257 270 271 272 4095 4096 4097 65535 65536 65537 65547 131071 131072 131073 262144 262145])
+
+(defun sample (name: str n: i64 data: (Array i8)) -> Sample (Sample (str name " " n) data))
+
+;; The corpus: random (incompressible) at every edge size; text, zeros, patterns, records, runs at a spread of them; and the large inputs the block limits need.
+(defun corpus () -> (Vec Sample)
+  (let [es (edge-sizes)
+        spread [0 1 5 13 100 257 4096 65536 65537 262145]
+        groups [(vec (map (fn (n: i64) (sample "random" n (random-bytes (+ 1000 n) n))) es))
+                (vec (map (fn (n: i64) (sample "text" n (text (+ 2000 n) n))) spread))
+                (vec (map (fn (n: i64) (sample "zeros" n (zeros n))) [1 12 13 255 256 65536 65537 300000 1000000]))
+                (vec (map (fn (n: i64) (sample "pattern-3" n (pattern 3 3 n))) [13 100 70000]))
+                (vec (map (fn (n: i64) (sample "pattern-5" n (pattern 5 5 n))) [13 100 70000]))
+                (vec (map (fn (n: i64) (sample "pattern-65535" n (pattern 7 65535 n))) [200000]))
+                (vec (map (fn (n: i64) (sample "records" n (records (+ 3000 n) n))) [100 4096 100000]))
+                (vec (map (fn (n: i64) (sample "runs" n (runs (+ 4000 n) n))) [100 4096 100000]))
+                (vec (map (fn (n: i64) (sample "run-noise" n (run-noise (+ 5000 n) n))) [300 70000 200000]))
+                (vec (map (fn (n: i64) (sample "same-byte" n (same-byte 65 n))) [4 16 17 300]))]]
+    (reduce (fn (a: (Vec Sample) b: (Vec Sample)) (into a b)) [] groups)))
+
+;; Small samples for the scenarios that try every prefix or every byte.
+(defun small-corpus () -> (Vec Sample)
+  [(sample "empty" 0 (array 0 0i8)) (sample "one" 1 (same-byte 7 1)) (sample "text" 300 (text 11 300)) (sample "random" 40 (random-bytes 12 40))
+   (sample "zeros" 600 (zeros 600)) (sample "pattern-3" 200 (pattern 5 3 200)) (sample "records" 400 (records 13 400))])

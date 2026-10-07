@@ -1,0 +1,14 @@
+;; fib.compress: the interface for compression (docs/design/compress.md). A DRIVER implements `Codec` (fib.compress.lz4 is the first: pure fibber; zlib, gzip, zstd and snappy are
+;; drivers over C libraries in their own repositories) and a program passes the codec VALUE to the code that needs it. Explicit: `(:require [fib.compress :as z])`.
+;;
+;;   (z/compress codec bytes opts)            (z/decompress codec bytes opts)         ; (Result (Array i8) CompressError); opts: (z/default-options), (with-level ..)
+;;   (z/max-compressed-size codec n)          (z/supports? codec :dictionary)
+;;   (z/compress-stream codec opts read write)  (z/decompress-stream ..)  (z/compress-chunks codec opts chunks)   ; any chunking, bounded memory
+;;   (z/registry [(dyn Codec :send c) ..])    (z/detect reg bytes)      (z/decompress-auto reg bytes opts)         ; a Map the caller builds
+;;   (z/codec-compressor codec opts) -> (dyn Compressor): (z/compressor-feed k chunk) .. (z/compressor-finish k)       ; the streaming protocols
+;;   (z/codec-decompressor codec opts) -> (dyn Decompressor): (z/decompressor-feed k chunk) -> DecStep (output needs-input frame-end)
+;;
+;; Decompression takes a `max-output` (default 256 MiB: `default-max-output`): the result is never larger, and nothing beyond it is allocated (a decompression bomb is a
+;; `:too-large` error). Errors are values (`CompressError`: :corrupt :truncated :too-large :unsupported :invalid-argument :checksum :io); an unsupported option is an
+;; error, never a quiet change. The fd and HTTP adapters are in fib.compress.fd and fib.compress.http (they need fib.os and fib.http); the contract is fib.compress.contract.
+(ns fib.compress (:export-from fib.compress.types fib.compress.ops))

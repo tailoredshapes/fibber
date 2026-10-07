@@ -10,6 +10,7 @@
 ;;   :unsupported       the codec lacks what was asked (a level, a dictionary, streaming, a format feature): see `codec-capabilities`
 ;;   :invalid-argument  an option the codec refuses (a block size that is none, a negative limit, a dictionary on a codec that has none)
 ;;   :checksum          a checksum in the data does not match the bytes (header, block or content)
+;;   :io               a reader or writer the caller gave to a stream helper failed (the message says how)
 ;; `message` is for people; a program branches on `kind`.
 (defstruct CompressError (kind: keyword message: str))
 (derive Eq CompressError)
@@ -21,6 +22,7 @@
 (defun unsupported (m: str) -> CompressError (CompressError :unsupported m))
 (defun invalid-argument (m: str) -> CompressError (CompressError :invalid-argument m))
 (defun checksum-error (m: str) -> CompressError (CompressError :checksum m))
+(defun io-error (m: str) -> CompressError (CompressError :io m))
 (defun error-kind (e: CompressError) -> keyword (. e kind))
 
 ;; The default cap on a decompressed size: 256 MiB. A caller that expects more says so in `max-output`; one that expects less says so too. There is no "unlimited".
@@ -55,7 +57,7 @@
 
 ;; One step of a decompressor: output (at most the decompressor's per-call limit), whether it needs more input before it can produce any (`needs-input`: false while the
 ;; input it already holds can still give output, so the caller asks again with an empty chunk), and whether a frame has just ended (`frame-end`; more frames may follow).
-(defstruct Step (output: (Array i8) needs-input: bool frame-end: bool))
+(defstruct DecStep (output: (Array i8) needs-input: bool frame-end: bool))
 
 ;; A streaming compressor: `compressor-feed` takes any chunk (empty is fine, 1 byte is fine) and returns the output that is ready (maybe empty); `compressor-finish` returns the
 ;; rest, ends the stream and releases the state: a feed after finish is an `invalid-argument` error. Memory is bounded by the codec's block size, not by the stream.
@@ -63,11 +65,11 @@
   (compressor-feed (self chunk: (Array i8)) -> (Result (Array i8) CompressError))
   (compressor-finish (self) -> (Result (Array i8) CompressError)))
 
-;; A streaming decompressor. `decompressor-feed` appends the chunk to what it holds and returns a `Step`; the output of one call is bounded (the codec's block size and
+;; A streaming decompressor. `decompressor-feed` appends the chunk to what it holds and returns a `DecStep`; the output of one call is bounded (the codec's block size and
 ;; the remaining `max-output`), so a hostile input cannot make one call allocate more. The whole stream's output is bounded by `max-output` (:too-large past it).
 ;; `decompressor-finish` is true success only when every frame ended and no byte is left over: else :truncated (or :corrupt for bytes that are no frame).
 (defprotocol Decompressor
-  (decompressor-feed (self chunk: (Array i8)) -> (Result Step CompressError))
+  (decompressor-feed (self chunk: (Array i8)) -> (Result DecStep CompressError))
   (decompressor-finish (self) -> (Result unit CompressError)))
 
 ;; A codec. `codec-name` is the format's name ("lz4"). `codec-capabilities` lists keywords from: :frame (self-delimiting frames with a magic number), :block (raw blocks
@@ -81,5 +83,5 @@
   (codec-max-compressed-size (self n: i64) -> i64)
   (codec-compress (self data: (Array i8) opts: Options) -> (Result (Array i8) CompressError))
   (codec-decompress (self data: (Array i8) opts: Options) -> (Result (Array i8) CompressError))
-  (codec-compressor (self opts: Options) -> (Result (dyn Compressor :send) CompressError))
-  (codec-decompressor (self opts: Options) -> (Result (dyn Decompressor :send) CompressError)))
+  (codec-compressor (self opts: Options) -> (Result (dyn Compressor) CompressError))
+  (codec-decompressor (self opts: Options) -> (Result (dyn Decompressor) CompressError)))

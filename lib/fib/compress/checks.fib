@@ -1,0 +1,135 @@
+;; fib.compress.checks: the helpers of the codec contract (fib.compress.contract): each takes a codec and returns the NAMES of the inputs it failed on (an empty vector is a pass),
+;; so a failing scenario says which sample and which option set. Generic over the codec (`:where ((Codec c))`): a driver's value, or a `Faulty` over one.
+(ns fib.compress.checks (:use fib.core fib.seq fib.coll fib.rng fib.compress.types fib.compress.ops fib.compress.corpus))
+
+(defun same? (a: (Array i8) b: (Array i8)) -> bool
+  (and (= (array-len a) (array-len b))
+       (loop [i 0] (cond (>= i (array-len a)) true (= (array-get a i) (array-get b i)) (recur (+ i 1)) :else false))))
+
+(defun kind-of (r: (Result (Array i8) CompressError)) -> str (match r ((Ok _) "ok") ((Err e) (str (. e kind)))))
+(defun is-bytes? (r: (Result (Array i8) CompressError) want: (Array i8)) -> bool (match r ((Ok b) (same? b want)) ((Err _) false)))
+(defun is-kind? (r: (Result (Array i8) CompressError) k: keyword) -> bool (match r ((Ok _) false) ((Err e) (= (. e kind) k))))
+(defun failed? (r: (Result (Array i8) CompressError)) -> bool (match r ((Ok _) false) ((Err _) true)))
+
+(defun failing (xs: (Vec x) name: (fn (x) str) ok: (fn (x) bool)) -> (Vec str)
+  (vec (map name (filter (fn (x: x) (not (ok x))) xs))))
+
+(defun sname (s: Sample) -> str (. s name))
+
+;; ---- option sets a codec claims
+(defstruct OptSet (name: str opts: Options))
+
+(defun option-sets (c: c) -> (Vec OptSet) :where ((Codec c))
+  (let [d (default-options)
+        has (fn (k: keyword) (supports? c k))
+        parts [[(OptSet "default" d)]
+               (if (has :checksum) [(OptSet "checksum" (with-checksum d true)) (OptSet "no-checksum" (with-checksum d false))] [])
+               (if (has :levels) [(OptSet "level-1" (with-level d 1)) (OptSet "level-3" (with-level d 3)) (OptSet "level-9" (with-level d 9))] [])
+               (if (has :block-size) [(OptSet "block-65536" (with-block-size d 65536)) (OptSet "block-262144" (with-block-size d 262144))] [])
+               (if (has :linked-blocks) [(OptSet "linked" (with-independent d false)) (OptSet "independent" (with-independent d true))] [])
+               (if (has :content-size) [(OptSet "content-size" (with-record-size d true))] [])
+               (if (and (has :checksum) (has :frame)) [(OptSet "block-checksum" (with-block-checksum (with-checksum d true) true))] [])]]
+    (reduce (fn (a: (Vec OptSet) b: (Vec OptSet)) (into a b)) [] parts)))
+
+(defun round-trip? (c: c o: Options s: Sample) -> bool :where ((Codec c))
+  (match (compress c (. s data) o)
+    ((Err _) false)
+    ((Ok z) (is-bytes? (decompress c z o) (. s data)))))
+
+(defun round-trips (c: c os: (Vec OptSet) samples: (Vec Sample)) -> (Vec str) :where ((Codec c))
+  (vec (mapcat (fn (o: OptSet) (failing samples (fn (s: Sample) (str (. o name) " " (sname s))) (fn (s: Sample) (round-trip? c (. o opts) s)))) os)))
+
+(defun compressed (c: c s: Sample) -> (Array i8) :where ((Codec c))
+  (match (compress c (. s data) (default-options)) ((Ok z) z) ((Err _) (array 0 0i8))))
+
+;; ---- determinism, bound
+(defun deterministic? (c: c s: Sample) -> bool :where ((Codec c))
+  (match (compress c (. s data) (default-options))
+    ((Ok a) (match (compress c (. s data) (default-options)) ((Ok b) (same? a b)) ((Err _) false)))
+    ((Err _) false)))
+
+(defun within-bound? (c: c s: Sample) -> bool :where ((Codec c))
+  (let [z (compressed c s)] (and (> (array-len z) 0) (<= (array-len z) (max-compressed-size c (array-len (. s data)))))))
+
+;; ---- max-output: the limit exactly: the size succeeds, one under is :too-large (one-shot and streaming), a limit of 0 only for empty data
+(defun max-exact? (c: c s: Sample) -> bool :where ((Codec c))
+  (let [n (array-len (. s data)) z (compressed c s) o (default-options)
+        stream-limit (fn (m: i64) (decompress-chunks c (with-max-output o m) (split-sizes z [3000])))]
+    (and (is-bytes? (decompress c z (with-max-output o n)) (. s data))
+         (is-bytes? (stream-limit n) (. s data))
+         (or (= n 0) (and (is-kind? (decompress c z (with-max-output o (- n 1))) :too-large) (is-kind? (stream-limit (- n 1)) :too-large))))))
+
+;; ---- truncation: every proper prefix of a frame is an error, one-shot and streamed; an error, never a partial success
+(defun prefix-failures (c: c s: Sample) -> (Vec str) :where ((Codec c))
+  (let [z (compressed c s)]
+    (vec (filter (fn (x: str) (not (= x "")))
+                 (map (fn (k: i64) (let [p (array-copy z 0 k)]
+                                     (if (and (failed? (decompress c p (default-options))) (failed? (decompress-chunks c (default-options) [p]))) ""
+                                       (str (sname s) " prefix " k))))
+                      (range 0 (array-len z)))))))
+
+;; ---- corruption: no trap; with a checksum an Ok result is the original; without, an Ok result is within the limit
+(defun flip (z: (Array i8) i: i64 mask: i64) -> (Array i8)
+  (let [c (cell (array-copy z 0 (array-len z)))]
+    (do (array-set! &c i (bit-xor (array-get z i) (trunc i8 mask))) @c)))
+
+(defun corrupt-failures (c: c s: Sample checked: bool) -> (Vec str) :where ((Codec c))
+  (let [o (with-max-output (with-checksum (default-options) true) 1048576)
+        z (match (compress c (. s data) o) ((Ok b) b) ((Err _) (array 0 0i8)))]
+    (vec (filter (fn (x: str) (not (= x "")))
+                 (mapcat (fn (i: i64)
+                           (map (fn (mask: i64)
+                                  (let [r (decompress c (flip z i mask) o)]
+                                    (match r ((Err _) "")
+                                      ((Ok b) (if (or (and checked (not (same? b (. s data)))) (> (array-len b) 1048576)) (str (sname s) " byte " i " mask " mask) "")))))
+                                [1 128 255]))
+                         (range 0 (array-len z)))))))
+
+;; ---- concatenated frames: a then b decompresses to a ++ b
+(defun concat2 (a: (Array i8) b: (Array i8)) -> (Array i8) (concat-bytes [a b]))
+
+(defun concat-ok? (c: c a: Sample b: Sample) -> bool :where ((Codec c))
+  (let [z (concat2 (compressed c a) (compressed c b))
+        want (concat2 (. a data) (. b data))]
+    (and (is-bytes? (decompress c z (default-options)) want)
+         (is-bytes? (decompress-chunks c (default-options) (split-sizes z [5 1000])) want))))
+
+;; ---- streaming equals one-shot, for chunkings of 1, of 7, and a seeded run of mixed sizes
+(defun chunkings (seed: i64) -> (Vec (Vec i64))
+  (let [r (rng-new seed)] [[1] [7] [4096] [65537] (vec (map (fn (k: i64) (+ 1 (rng-below r 5000))) (range 0 40)))]))
+
+(defun stream-ok? (c: c s: Sample sizes: (Vec i64)) -> bool :where ((Codec c))
+  (let [z (compressed c s) o (default-options)
+        piece (split-sizes (. s data) sizes)]
+    (and (is-bytes? (decompress-chunks c o (split-sizes z sizes)) (. s data))
+         (match (compress-chunks c o piece) ((Ok zz) (is-bytes? (decompress c zz o) (. s data))) ((Err _) false)))))
+
+(defun stream-failures (c: c samples: (Vec Sample)) -> (Vec str) :where ((Codec c))
+  (vec (mapcat (fn (s: Sample)
+                 (vec (mapcat (fn (sizes: (Vec i64))
+                                (if (and (= (nth sizes 0) 1) (> (array-len (. s data)) 20000)) []
+                                  (if (stream-ok? c s sizes) [] [(str (sname s) " chunks " (nth sizes 0))])))
+                              (chunkings (array-len (. s data))))))
+               samples)))
+
+;; ---- the decompressor's per-call output stays within `step-bound`, whatever the input (a single chunk holding a whole stream)
+(def step-bound: i64 4194304)
+
+(defun pull-all (k: k step: DecStep sizes: (Vec i64) total: i64) -> i64 :where ((Decompressor k))
+  (let [big (if (> (array-len (. step output)) step-bound) 1 0) t (+ total (array-len (. step output)))]
+    (if (. step needs-input) (+ (* big 1000000000000) t)
+      (match (decompressor-feed k (array 0 0i8))
+        ((Err _) -1)
+        ((Ok more) (+ (pull-all k more sizes t) (* big 1000000000000)))))))
+
+(defun bounded-steps? (c: c s: Sample) -> bool :where ((Codec c))
+  (let [z (compressed c s)]
+    (match (codec-decompressor c (default-options))
+      ((Err _) false)
+      ((Ok k) (match (decompressor-feed k z) ((Err _) false) ((Ok st) (= (pull-all k st [] 0) (array-len (. s data)))))))))
+
+(defun cat (xs: (Vec (Vec str))) -> (Vec str) (reduce (fn (a: (Vec str) b: (Vec str)) (into a b)) [] xs))
+
+;; The corpus sample with this name ("text 4096", "zeros 1000000"); an empty sample when there is none (the scenario using it then fails).
+(defun find-sample (name: str) -> Sample
+  (match (first (filter (fn (s: Sample) (= (. s name) name)) (corpus))) ((some s) s) (nil (Sample name (array 0 0i8)))))
