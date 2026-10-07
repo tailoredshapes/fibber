@@ -1,0 +1,31 @@
+;; The JSON-Schema-Test-Suite runner of scripts/json-schema-suite.sh. Arguments: `--remote URI FILE` pairs (the suite's remotes, served as
+;; resources), then the test files. One line per test: FILE<TAB>GROUP<TAB>TEST<TAB>pass|FAIL<TAB>description. Exit 0.
+(ns main (:use fib.core fib.seq fib.coll fib.print) (:require [fib.json :as json] [fib.json.schema :as js]))
+
+(defun read-json (path: str) -> json/Json (match (json/read-file path) ((Ok j) j) ((Err e) (trap (str path ": " (. e message))))))
+
+(defun remotes (argv: (Vec str)) -> (Pair (Map str json/Json) i64)
+  (loop [i 0 out: (Map str json/Json) {}]
+    (if (and (< (+ i 2) (count argv)) (= (nth argv i) "--remote")) (recur (+ i 3) (assoc out (nth argv (+ i 1)) (read-json (nth argv (+ i 2)))))
+      (Pair out i))))
+
+(defun text (j: json/Json k: str) -> str (match (json/get-key j k) ((some (json/JStr s)) s) (_ "")))
+
+(defun run-group (file: str g: i64 group: json/Json res: (Map str json/Json)) -> unit
+  (let [tests (match (json/get-key group "tests") ((some (json/JArr ts)) ts) (_ []))
+        compiled (js/compile-with (unwrap-or (json/get-key group "schema") json/JNull) (with (js/schema-options) (resources res)))]
+    (doseq [t (range (count tests))]
+      (let [test (nth tests t)
+            want (= (json/get-key test "valid") (some (json/JBool true)))
+            got (match compiled ((Ok s) (some (js/valid? s (unwrap-or (json/get-key test "data") json/JNull)))) ((Err _) nil))
+            ok (= got (some want))]
+        (println (str file "\t" g "\t" t "\t" (if ok "pass" "FAIL") "\t" (text group "description") " / " (text test "description")
+                      (match compiled ((Err m) (str " [compile: " m "]")) ((Ok _) ""))))))))
+
+(defun main () -> i64
+  (let [rest (args) r (remotes rest) res (. r fst)]
+    (do (doseq [f (drop (. r snd) rest)]
+          (match (read-json f)
+            ((json/JArr groups) (doseq [g (range (count groups))] (run-group f g (nth groups g) res)))
+            (_ (println (str f "\t-\t-\tFAIL\tnot an array of groups")))))
+        0)))

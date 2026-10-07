@@ -1,0 +1,205 @@
+;; fib.json.schema.formats: the `format` values of draft 7 this module checks. date, time and date-time (RFC 3339, leap seconds only at
+;; 23:59:60 UTC), email (RFC 5321 dot-atoms), hostname (RFC 1123 labels), ipv4, ipv6 (RFC 4291, an IPv4 tail allowed), uri and
+;; uri-reference (RFC 3986 characters and shape), json-pointer, relative-json-pointer, regex (what fib.regex compiles) and uri-template
+;; (balanced braces). Any other format passes, as the specification asks of an unknown one.
+(ns fib.json.schema.formats (:use fib.core fib.seq fib.coll) (:require [fib.regex :as rx]))
+
+(defun b :private (s: str i: i64) -> i64 (if (and (>= i 0) (< i (str-len s))) (bit-and (zext i64 (str-byte-at s i)) 255) -1))
+(defun digit? :private (c: i64) -> bool (and (>= c 48) (<= c 57)))
+(defun alpha? :private (c: i64) -> bool (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))
+(defun hexd? :private (c: i64) -> bool (or (digit? c) (and (>= c 65) (<= c 70)) (and (>= c 97) (<= c 102))))
+(defun all-digits? :private (s: str from: i64 to: i64) -> bool (and (<= to (str-len s)) (every? (fn (i: i64) (digit? (b s i))) (vec (range from to)))))
+(defun num :private (s: str from: i64 to: i64) -> i64 (unwrap-or (parse-long (str-slice s from to)) -1))
+
+(defun leap? :private (y: i64) -> bool (and (= (rem y 4) 0) (or (!= (rem y 100) 0) (= (rem y 400) 0))))
+(defun days-in :private (y: i64 m: i64) -> i64
+  (cond (= m 2) (if (leap? y) 29 28) (or (= m 4) (= m 6) (= m 9) (= m 11)) 30 :else 31))
+
+(defun date? (s: str) -> bool
+  (and (= (str-len s) 10) (all-digits? s 0 4) (= (b s 4) 45) (all-digits? s 5 7) (= (b s 7) 45) (all-digits? s 8 10)
+       (let [y (num s 0 4) m (num s 5 7) d (num s 8 10)] (and (>= m 1) (<= m 12) (>= d 1) (<= d (days-in y m))))))
+
+;; HH:MM:SS[.frac](Z|±HH:MM), case-insensitive Z; a leap second only where the time is 23:59:60 in UTC.
+(defun time? (s: str) -> bool
+  (and (>= (str-len s) 9) (all-digits? s 0 2) (= (b s 2) 58) (all-digits? s 3 5) (= (b s 5) 58) (all-digits? s 6 8)
+       (let [h (num s 0 2) mi (num s 3 5) se (num s 6 8)
+             frac-end (if (= (b s 8) 46) (loop [i 9] (if (digit? (b s i)) (recur (+ i 1)) i)) 8)
+             zone (str-slice s frac-end (str-len s))]
+         (and (or (= frac-end 8) (> frac-end 9)) (<= h 23) (<= mi 59) (<= se 60)
+              (cond (or (= zone "Z") (= zone "z")) (or (< se 60) (and (= h 23) (= mi 59)))
+                    (and (= (str-len zone) 6) (or (= (b zone 0) 43) (= (b zone 0) 45)) (all-digits? zone 1 3) (= (b zone 3) 58) (all-digits? zone 4 6))
+                    (let [zh (num zone 1 3) zm (num zone 4 6) sign (if (= (b zone 0) 43) 1 -1)
+                          utc (rem (+ (- (+ (* h 60) mi) (* sign (+ (* zh 60) zm))) 2880) 1440)]
+                      (and (<= zh 23) (<= zm 59) (or (< se 60) (= utc 1439))))
+                    :else false)))))
+
+(defun date-time? (s: str) -> bool
+  (and (> (str-len s) 11) (or (= (b s 10) 84) (= (b s 10) 116)) (date? (str-slice s 0 10)) (time? (str-slice s 11 (str-len s)))))
+
+(defun atom-char? :private (c: i64) -> bool
+  (or (alpha? c) (digit? c) (some? (str-find "!#$%&'*+-/=?^_`{|}~" (char->str (char c)) 0))))
+
+;; local@domain: a dot-atom (no leading, trailing or doubled dot) or a quoted string, then a hostname or an address literal.
+(defun email? (s: str) -> bool
+  (match (str-find-last s "@")
+    (nil false)
+    ((some at) (let [local (str-slice s 0 at) domain (str-slice s (+ at 1) (str-len s))]
+                 (and (> (str-len local) 0) (<= (str-len local) 64)
+                      (if (and (starts-with? local "\"") (> (str-len local) 1) (= (b local (- (str-len local) 1)) 34))
+                          (every? (fn (i: i64) (< (b local i) 128)) (vec (range (str-len local))))
+                        (and (not (starts-with? local ".")) (not (= (b local (- (str-len local) 1)) 46)) (not (some? (str-find local ".." 0)))
+                             (every? (fn (i: i64) (or (= (b local i) 46) (atom-char? (b local i)))) (vec (range (str-len local))))))
+                      (cond (and (> (str-len domain) 7) (= (lower-ascii (str-slice domain 0 6)) "[ipv6:") (= (b domain (- (str-len domain) 1)) 93))
+                            (ipv6? (str-slice domain 6 (- (str-len domain) 1)))
+                            (and (starts-with? domain "[") (= (b domain (- (str-len domain) 1)) 93)) (ipv4? (str-slice domain 1 (- (str-len domain) 1)))
+                            :else (hostname? domain)))))))
+
+;; ASCII letters lowered.
+(defun lower-ascii :private (s: str) -> str
+  (str-join (mapv (fn (c: char) (if (and (>= c \A) (<= c \Z)) (char->str (char (+ (long c) 32))) (char->str c))) (str-chars s))))
+
+(defun str-find-last :private (s: str sub: str) -> (Option i64)
+  (loop [from 0 found: (Option i64) nil] (match (str-find s sub from) (nil found) ((some i) (recur (+ i 1) (some i))))))
+
+(defun split-on :private (s: str c: str) -> (Vec str)
+  (loop [from 0 out: (Vec str) []]
+    (let [i (match (str-find s c from) ((some i) i) (nil (str-len s))) next (conj out (str-slice s from i))]
+      (if (>= i (str-len s)) next (recur (+ i 1) next)))))
+
+;; RFC 1123: labels of 1 to 63 letters, digits and hyphens, not starting or ending with a hyphen; at most 253 characters. The IDNA rules of an
+;; "xn--" label (RFC 5891, 5892) are not checked: they need Unicode tables.
+(defun hostname? (s: str) -> bool
+  (let [h s]
+    (and (> (str-len h) 0) (<= (str-len h) 253)
+         (every? (fn (l: str) (and (> (str-len l) 0) (<= (str-len l) 63) (not (= (b l 0) 45)) (not (= (b l (- (str-len l) 1)) 45))
+                                   (not (and (= (b l 2) 45) (= (b l 3) 45) (not (starts-with? l "xn--"))))
+                                   (every? (fn (i: i64) (or (alpha? (b l i)) (digit? (b l i)) (= (b l i) 45))) (vec (range (str-len l))))))
+                 (split-on h ".")))))
+
+(defun ipv4? (s: str) -> bool
+  (let [parts (split-on s ".")]
+    (and (= (count parts) 4)
+         (every? (fn (p: str) (and (> (str-len p) 0) (<= (str-len p) 3) (all-digits? p 0 (str-len p))
+                                   (or (= (str-len p) 1) (not (= (b p 0) 48))) (<= (num p 0 (str-len p)) 255)))
+                 parts))))
+
+(defun hex-group? :private (g: str) -> bool (and (> (str-len g) 0) (<= (str-len g) 4) (every? (fn (i: i64) (hexd? (b g i))) (vec (range (str-len g))))))
+
+;; Up to 8 groups of 1 to 4 hex digits, one `::` standing for one or more zero groups, an IPv4 address as the last two groups.
+(defun ipv6? (s: str) -> bool
+  (let [gap (str-find s "::" 0)
+        halves (match gap ((some i) [(str-slice s 0 i) (str-slice s (+ i 2) (str-len s))]) (nil [s]))
+        groups (fn (h: str) (if (= h "") [] (split-on h ":")))
+        all (vec (concat (groups (nth halves 0)) (if (= (count halves) 2) (groups (nth halves 1)) [])))
+        v4 (and (> (count all) 0) (some? (str-find (peek-or all) "." 0)))
+        hexes (if v4 (vec (take (- (count all) 1) all)) all)
+        width (+ (count hexes) (if v4 2 0))]
+    (and (not (some? (str-find s ":::" 0))) (or (= (count halves) 1) (not (some? (str-find (nth halves 1) "::" 0))))
+         (every? hex-group? hexes) (or (not v4) (ipv4? (peek-or all)))
+         (if (= (count halves) 2) (< width 8) (= width 8))
+         (not (and (= (count halves) 1) (or (starts-with? s ":") (= (b s (- (str-len s) 1)) 58)))))))
+
+(defun peek-or :private (v: (Vec str)) -> str (unwrap-or (peek v) ""))
+
+;; Characters a URI reference may hold (RFC 3986 unreserved, reserved, and `%` before two hex digits).
+(defun uri-chars? :private (s: str) -> bool
+  (loop [i 0]
+    (let [c (b s i)]
+      (cond (< c 0) true
+            (= c 37) (if (and (hexd? (b s (+ i 1))) (hexd? (b s (+ i 2)))) (recur (+ i 3)) false)
+            (or (alpha? c) (digit? c) (some? (str-find "-._~:/?#[]@!$&'()*+,;=" (char->str (char c)) 0))) (recur (+ i 1))
+            :else false))))
+
+(defun scheme-len :private (s: str) -> i64
+  (if (not (alpha? (b s 0))) -1
+    (loop [i 1] (let [c (b s i)] (cond (= c 58) i (or (alpha? c) (digit? c) (= c 43) (= c 45) (= c 46)) (recur (+ i 1)) :else -1)))))
+
+(defun upto :private (s: str stops: str) -> i64
+  (loop [i 0] (let [c (b s i)] (if (or (< c 0) (some? (str-find stops (char->str (char c)) 0))) i (recur (+ i 1))))))
+
+(defun brackets? :private (s: str) -> bool (or (some? (str-find s "[" 0)) (some? (str-find s "]" 0))))
+
+;; userinfo@host:port, at most one `@`; the host an IP literal in brackets (IPv6 or IPvFuture) or a name without brackets; the port digits.
+(defun authority? :private (a: str) -> bool
+  (let [ats (- (count (split-on a "@")) 1)
+        hp (match (str-find-last a "@") ((some i) (str-slice a (+ i 1) (str-len a))) (nil a))
+        user (match (str-find-last a "@") ((some i) (str-slice a 0 i)) (nil ""))
+        port-ok (fn (p: str) (all-digits? p 0 (str-len p)))]
+    (and (<= ats 1) (not (brackets? user))
+         (if (starts-with? hp "[")
+             (match (str-find hp "]" 0)
+               (nil false)
+               ((some close) (let [lit (str-slice hp 1 close) after (str-slice hp (+ close 1) (str-len hp))]
+                               (and (or (ipv6? lit) (and (> (str-len lit) 1) (or (= (b lit 0) 118) (= (b lit 0) 86))))
+                                    (or (= after "") (and (starts-with? after ":") (port-ok (str-slice after 1 (str-len after)))))))))
+             (and (not (brackets? hp))
+                  (match (str-find-last hp ":") (nil true) ((some i) (port-ok (str-slice hp (+ i 1) (str-len hp))))))))))
+
+;; RFC 3986 4.1: a URI (`scheme:` required) or a URI reference (relative allowed: then a colon may not come before the first slash).
+(defun reference? :private (s: str need-scheme: bool) -> bool
+  (let [sl (scheme-len s) has-scheme (> sl 0)
+        rest (if has-scheme (str-slice s (+ sl 1) (str-len s)) s)
+        hier (str-slice rest 0 (upto rest "?#"))]
+    (and (uri-chars? s) (or has-scheme (not need-scheme))
+         (if (starts-with? hier "//")
+             (let [end (+ 2 (upto (str-slice hier 2 (str-len hier)) "/"))]
+               (and (authority? (str-slice hier 2 end)) (not (brackets? (str-slice hier end (str-len hier))))))
+             (and (not (brackets? hier))
+                  (or has-scheme (not (some? (str-find (str-slice hier 0 (upto hier "/")) ":" 0)))))))))
+
+(defun uri? (s: str) -> bool (reference? s true))
+(defun uri-reference? (s: str) -> bool (reference? s false))
+
+(defun json-pointer? (s: str) -> bool
+  (and (or (= s "") (starts-with? s "/"))
+       (loop [i 0] (let [c (b s i)] (cond (< c 0) true (= c 126) (if (or (= (b s (+ i 1)) 48) (= (b s (+ i 1)) 49)) (recur (+ i 2)) false) :else (recur (+ i 1)))))))
+
+(defun relative-json-pointer? (s: str) -> bool
+  (let [end (loop [i 0] (if (digit? (b s i)) (recur (+ i 1)) i))]
+    (and (> end 0) (or (= end 1) (not (= (b s 0) 48)))
+         (let [rest (str-slice s end (str-len s))] (or (= rest "#") (json-pointer? rest))))))
+
+;; RFC 6570: literals (no controls, space, " % < > \\ ^ ` { | } except a %XX; an apostrophe is allowed, as the suite and the errata have it) and expressions `{` [operator] varspec,.. `}`; a
+;; varspec is a name (letters, digits, `_`, %XX, single dots between) with `*` or `:` 1 to 9999 (no leading zero).
+(defun var-name? :private (v: str) -> bool
+  (and (> (str-len v) 0) (not (starts-with? v ".")) (not (= (b v (- (str-len v) 1)) 46)) (not (some? (str-find v ".." 0)))
+       (loop [i 0] (let [c (b v i)]
+                     (cond (< c 0) true
+                           (= c 37) (if (and (hexd? (b v (+ i 1))) (hexd? (b v (+ i 2)))) (recur (+ i 3)) false)
+                           (or (alpha? c) (digit? c) (= c 95) (= c 46)) (recur (+ i 1))
+                           :else false)))))
+
+(defun varspec? :private (v: str) -> bool
+  (cond (and (> (str-len v) 1) (= (b v (- (str-len v) 1)) 42)) (var-name? (str-slice v 0 (- (str-len v) 1)))
+        (some? (str-find v ":" 0)) (let [i (unwrap-or (str-find v ":" 0) 0) n (str-slice v (+ i 1) (str-len v))]
+                                     (and (var-name? (str-slice v 0 i)) (> (str-len n) 0) (<= (str-len n) 4) (all-digits? n 0 (str-len n))
+                                          (not (= (b n 0) 48))))
+        :else (var-name? v)))
+
+(defun expression? :private (e: str) -> bool
+  (let [body (if (and (> (str-len e) 0) (some? (str-find "+#./;?&=,!@|" (str-slice e 0 1) 0))) (str-slice e 1 (str-len e)) e)]
+    (and (> (str-len body) 0) (every? varspec? (split-on body ",")))))
+
+(defun uri-template? (s: str) -> bool
+  (loop [i 0]
+    (let [c (b s i)]
+      (cond (< c 0) true
+            (= c 123) (match (str-find s "}" i)
+                        (nil false)
+                        ((some close) (if (expression? (str-slice s (+ i 1) close)) (recur (+ close 1)) false)))
+            (= c 37) (if (and (hexd? (b s (+ i 1))) (hexd? (b s (+ i 2)))) (recur (+ i 3)) false)
+            (or (<= c 32) (= c 127) (some? (str-find "\"<>\\^`{|}" (char->str (char c)) 0))) false
+            :else (recur (+ i 1))))))
+
+(defun known? (format: str) -> bool
+  (some? (first (filter (fn (f: str) (= f format)) ["date" "time" "date-time" "email" "hostname" "ipv4" "ipv6" "uri" "uri-reference"
+                                                    "json-pointer" "relative-json-pointer" "regex" "uri-template"]))))
+
+;; Whether `s` is a `format`; an unknown format is true.
+(defun conforms? (format: str s: str) -> bool
+  (cond (= format "date") (date? s) (= format "time") (time? s) (= format "date-time") (date-time? s) (= format "email") (email? s)
+        (= format "hostname") (hostname? s) (= format "ipv4") (ipv4? s) (= format "ipv6") (ipv6? s) (= format "uri") (uri? s)
+        (= format "uri-reference") (uri-reference? s) (= format "json-pointer") (json-pointer? s)
+        (= format "relative-json-pointer") (relative-json-pointer? s) (= format "regex") (match (rx/try-re-pattern s) ((Ok _) true) ((Err _) false))
+        (= format "uri-template") (uri-template? s)
+        :else true))

@@ -1,0 +1,114 @@
+;; fib.json.schema (docs/design/json-schema.md): compiling, what a violation says and where, numbers as JSON Schema compares them, `$ref` in
+;; each of its forms, the combinators, formats, and the guards. Offline; the whole JSON-Schema-Test-Suite is scripts/json-schema-suite.sh.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run) (:require [fib.json :as json] [fib.json.schema :as js]))
+
+(defun j (text: str) -> json/Json (match (json/parse text) ((Ok v) v) ((Err e) (trap (str "bad JSON in the spec: " (. e message))))))
+(defun schema (text: str) -> js/JsonSchema (match (js/compile-schema (j text)) ((Ok s) s) ((Err m) (trap (str "does not compile: " m)))))
+(defun texts (s: js/JsonSchema doc: str) -> (Vec str) (mapv js/violation-text (js/validate s (j doc))))
+(defun valid (s: js/JsonSchema doc: str) -> bool (js/valid? s (j doc)))
+(defun compile-error (text: str) -> str (match (js/compile-schema (j text)) ((Ok _) "compiled") ((Err m) m)))
+
+(def hen: str "{\"type\": \"object\", \"required\": [\"name\"], \"additionalProperties\": false,
+  \"properties\": {\"name\": {\"type\": \"string\", \"minLength\": 1}, \"eggs\": {\"type\": \"integer\", \"minimum\": 0},
+                   \"laid\": {\"type\": \"array\", \"items\": {\"type\": \"string\", \"format\": \"date\"}}}}")
+
+(defspecs specs
+  (feature "compiling"
+    (scenario "a schema is an object or a boolean; a regex or a $ref that cannot work is refused when compiling"
+      (then (expect = "compiled" (compile-error "true"))
+            (expect = "a schema is an object or a boolean" (compile-error "[1]"))
+            (expect = true (starts-with? (compile-error "{\"pattern\": \"(\"}") "the pattern ( does not compile"))
+            (expect = true (starts-with? (compile-error "{\"$ref\": \"#/definitions/missing\"}") "the $ref #/definitions/missing names no schema"))
+            (expect = true (starts-with? (compile-error "{\"$ref\": \"http://example.com/other.json\"}") "the $ref http://example.com/other.json names no schema")))))
+  (feature "violations"
+    (scenario "every violation is reported, located in the document and in the schema"
+      (given [s (schema hen)
+              vs (js/validate s (j "{\"eggs\": -1, \"laid\": [\"2026-10-07\", \"yesterday\"], \"colour\": \"red\"}"))])
+      (then (expect = ["\"name\" is a required property" "/eggs: -1 is less than the minimum of 0" "/laid/1: \"yesterday\" is not a valid date"
+                       "/colour: no value is valid here"]
+                    (mapv js/violation-text vs))
+            (expect = ["/required" "/properties/eggs/minimum" "/properties/laid/items/format" "/additionalProperties"]
+                    (mapv (fn (v: js/SchemaViolation) (. v schema-path)) vs))
+            (expect = ["required" "minimum" "format" "false"] (mapv (fn (v: js/SchemaViolation) (. v keyword)) vs))))
+    (scenario "a conforming document has no violations"
+      (then (expect = [] (texts (schema hen) "{\"name\": \"chuck\", \"eggs\": 2, \"laid\": [\"2024-02-29\"]}"))
+            (expect = true (valid (schema "{}") "[1, {\"a\": null}]"))
+            (expect = false (valid (schema "false") "1")))))
+  (feature "numbers"
+    (scenario "1, 1.0 and 1e0 are one number; 1.0 is an integer; multipleOf survives binary fractions"
+      (then (expect = true (valid (schema "{\"type\": \"integer\"}") "1.0"))
+            (expect = false (valid (schema "{\"type\": \"integer\"}") "1.5"))
+            (expect = true (valid (schema "{\"const\": 1}") "1.0"))
+            (expect = true (valid (schema "{\"enum\": [1e0, \"a\"]}") "1"))
+            (expect = false (valid (schema "{\"uniqueItems\": true}") "[1, 1.0]"))
+            (expect = true (valid (schema "{\"multipleOf\": 0.1}") "0.3"))
+            (expect = true (valid (schema "{\"multipleOf\": 0.01}") "0.07"))
+            (expect = false (valid (schema "{\"multipleOf\": 2}") "7"))
+            (expect = true (valid (schema "{\"maximum\": 9007199254740993}") "9007199254740993"))
+            (expect = false (valid (schema "{\"exclusiveMaximum\": 3}") "3"))
+            (expect = true (valid (schema "{\"type\": \"integer\"}") "123456789012345678901234567890"))))
+    (scenario "objects are equal whatever the order of their members"
+      (then (expect = true (valid (schema "{\"const\": {\"a\": 1, \"b\": [2, {\"c\": 3}]}}") "{\"b\": [2, {\"c\": 3.0}], \"a\": 1}"))
+            (expect = false (valid (schema "{\"const\": {\"a\": 1}}") "{\"a\": 1, \"b\": 2}")))))
+  (feature "$ref"
+    (scenario "a JSON Pointer into the document, recursively"
+      (given [tree (schema "{\"definitions\": {\"node\": {\"type\": \"object\", \"properties\": {\"value\": {\"type\": \"number\"},
+                              \"children\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/definitions/node\"}}}}}, \"$ref\": \"#/definitions/node\"}")])
+      (then (expect = true (valid tree "{\"value\": 1, \"children\": [{\"value\": 2, \"children\": []}]}"))
+            (expect = ["/children/0/children/0/value: \"x\" is not of type number"]
+                    (texts tree "{\"value\": 1, \"children\": [{\"value\": 2, \"children\": [{\"value\": \"x\"}]}]}"))))
+    (scenario "by $id, by a plain-name $id, and against a base an $id sets"
+      (then (expect = false (valid (schema "{\"$id\": \"http://example.com/root.json\", \"definitions\": {\"a\": {\"$id\": \"a.json\", \"type\": \"integer\"}},
+                                             \"properties\": {\"x\": {\"$ref\": \"a.json\"}}}") "{\"x\": \"no\"}"))
+            (expect = false (valid (schema "{\"definitions\": {\"a\": {\"$id\": \"#thing\", \"minimum\": 5}}, \"$ref\": \"#thing\"}") "3"))
+            (expect = true (valid (schema "{\"$id\": \"http://example.com/dir/s.json\", \"definitions\": {\"b\": {\"$id\": \"b.json\", \"type\": \"string\"}},
+                                            \"items\": {\"$ref\": \"http://example.com/dir/b.json\"}}") "[\"ok\"]"))))
+    (scenario "a $ref replaces its sibling keywords (draft 7)"
+      (then (expect = true (valid (schema "{\"definitions\": {\"any\": {}}, \"properties\": {\"x\": {\"$ref\": \"#/definitions/any\", \"type\": \"string\"}}}") "{\"x\": 5}"))))
+    (scenario "the draft-07 meta-schema is built in"
+      (given [meta (schema "{\"$ref\": \"http://json-schema.org/draft-07/schema#\"}")])
+      (then (expect = true (valid meta hen))
+            (expect = false (valid meta "{\"type\": 5}"))
+            (expect = false (valid meta "{\"minLength\": -1}"))))
+    (scenario "another document is given as a resource"
+      (given [s (match (js/compile-with (j "{\"$ref\": \"http://example.com/name.json#/definitions/n\"}")
+                                        (with (js/schema-options) (resources {"http://example.com/name.json" (j "{\"definitions\": {\"n\": {\"type\": \"string\"}}}")})))
+                  ((Ok s) s) ((Err m) (trap m)))])
+      (then (expect = true (js/valid? s (j "\"a\""))) (expect = false (js/valid? s (j "1"))))))
+  (feature "combinators and conditionals"
+    (scenario "anyOf, oneOf, not, allOf, if/then/else"
+      (then (expect = [true false] [(valid (schema "{\"anyOf\": [{\"type\": \"string\"}, {\"minimum\": 2}]}") "3")
+                                    (valid (schema "{\"anyOf\": [{\"type\": \"string\"}, {\"minimum\": 2}]}") "1")])
+            (expect = [true false] [(valid (schema "{\"oneOf\": [{\"type\": \"integer\"}, {\"minimum\": 2}]}") "1")
+                                    (valid (schema "{\"oneOf\": [{\"type\": \"integer\"}, {\"minimum\": 2}]}") "3")])
+            (expect = false (valid (schema "{\"not\": {\"type\": \"null\"}}") "null"))
+            (expect = ["1 is less than the minimum of 2" "1 is not of type string"]
+                    (texts (schema "{\"allOf\": [{\"minimum\": 2}, {\"type\": \"string\"}]}") "1"))
+            (expect = [true false true]
+                    (let [c (schema "{\"if\": {\"required\": [\"kind\"], \"properties\": {\"kind\": {\"const\": \"hen\"}}}, \"then\": {\"required\": [\"eggs\"]}, \"else\": {\"required\": [\"name\"]}}")]
+                      [(valid c "{\"kind\": \"hen\", \"eggs\": 1}") (valid c "{\"kind\": \"hen\"}") (valid c "{\"name\": \"x\"}")]))))
+    (scenario "patternProperties, propertyNames, dependencies, contains, positional items"
+      (then (expect = false (valid (schema "{\"patternProperties\": {\"^x-\": {\"type\": \"integer\"}}}") "{\"x-a\": \"no\"}"))
+            (expect = [true false] (let [s (schema "{\"patternProperties\": {\"^x-\": {}}, \"additionalProperties\": false}")] [(valid s "{\"x-a\": 1}") (valid s "{\"y\": 1}")]))
+            (expect = false (valid (schema "{\"propertyNames\": {\"maxLength\": 3}}") "{\"long\": 1}"))
+            (expect = false (valid (schema "{\"dependencies\": {\"b\": [\"a\"]}}") "{\"b\": 1}"))
+            (expect = false (valid (schema "{\"contains\": {\"const\": 3}}") "[1, 2]"))
+            (expect = false (valid (schema "{\"items\": [{\"type\": \"string\"}], \"additionalItems\": false}") "[\"a\", 2]")))))
+  (feature "formats"
+    (scenario "formats are asserted by default, and can be turned off"
+      (given [loose (match (js/compile-with (j "{\"format\": \"email\"}") (with (js/schema-options) (formats false))) ((Ok s) s) ((Err m) (trap m)))])
+      (then (expect = [true false] [(valid (schema "{\"format\": \"email\"}") "\"a.b@example.com\"") (valid (schema "{\"format\": \"email\"}") "\"a..b@example.com\"")])
+            (expect = true (js/valid? loose (j "\"not an address\"")))
+            (expect = [true false] [(valid (schema "{\"format\": \"date-time\"}") "\"1998-12-31T23:59:60Z\"")
+                                    (valid (schema "{\"format\": \"date-time\"}") "\"1998-12-31T22:59:60Z\"")])
+            (expect = [true false true false] (mapv (fn (a: str) (valid (schema "{\"format\": \"ipv6\"}") a)) ["\"::1\"" "\"1:::2\"" "\"::ffff:1.2.3.4\"" "\"1:2:3:4:5:6:7:8:9\""]))
+            (expect = [true false] [(valid (schema "{\"format\": \"uri\"}") "\"https://example.com:8080/a?b#c\"") (valid (schema "{\"format\": \"uri\"}") "\"//no-scheme\"")])
+            (expect = true (valid (schema "{\"format\": \"something-new\"}") "\"anything\"")))))
+  (feature "guards"
+    (scenario "a schema that refers to itself without end is a violation, not a hang"
+      (then (expect = ["the schema refers to itself without end"] (texts (schema "{\"$ref\": \"#\"}") "1"))))
+    (scenario "string lengths count characters, not bytes"
+      (then (expect = true (valid (schema "{\"maxLength\": 2}") "\"\\ud83d\\udca9\\ud83d\\udca9\""))
+            (expect = false (valid (schema "{\"minLength\": 2}") "\"\\ud83d\\udca9\""))))))
+
+(defun main () -> i64 (run-main (specs)))

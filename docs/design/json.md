@@ -3,6 +3,8 @@
 Status: implemented (JSON-1, JSON-2, JSON-3: section 7). Library: `lib/fib/json.fib` (the facade, `(:require [fib.json :as json])`) over `lib/fib/json/*.fib`. Numbers
 and commands: `docs/shootout/json.md`. Tests: `specs/json-*.fib`, `scripts/json-*.sh`, `scripts/mutant-json.sh`.
 
+JSON Schema (draft 7) is the explicit module `fib.json.schema`: docs/design/json-schema.md.
+
 The language needed no new builtin. Everything below was measured on this tree's stage 2 with the released v0.1.8 seed's `fibc` building
 the compiler, so the library needs no release first. Measurements quoted here come from the shared 28-core box, which was at load 12 to 30
 while they ran: ratios between two variants of the same program are trustworthy, absolute MB/s are not (the final table is the Ryzen box).

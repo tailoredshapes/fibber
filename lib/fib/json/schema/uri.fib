@@ -1,0 +1,100 @@
+;; fib.json.schema.uri: what a `$ref` names. URI references resolved against a base (RFC 3986 5.2, without query semantics: enough for
+;; schema identifiers), and JSON Pointer fragments (RFC 6901, percent-decoded as a URI fragment is).
+(ns fib.json.schema.uri (:use fib.core fib.seq fib.coll fib.json.types) (:require [fib.json.access :as a]))
+
+(defun byte-at :private (s: str i: i64) -> i64 (if (< i (str-len s)) (bit-and (zext i64 (str-byte-at s i)) 255) -1))
+
+(defun scheme-end :private (s: str) -> i64
+  (let [alpha (fn (c: i64) (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))]
+    (if (not (alpha (byte-at s 0))) -1
+      (loop [i 1]
+        (let [c (byte-at s i)]
+          (cond (= c 58) i
+                (or (alpha c) (and (>= c 48) (<= c 57)) (= c 43) (= c 45) (= c 46)) (recur (+ i 1))
+                :else -1))))))
+
+(defun absolute? (s: str) -> bool (>= (scheme-end s) 0))
+
+(defun index-of :private (s: str sub: str) -> i64 (match (str-find s sub 0) ((some i) i) (nil -1)))
+
+;; `s` without its fragment, and the fragment (after the `#`, "" when none).
+(defun without-fragment (s: str) -> str (let [i (index-of s "#")] (if (< i 0) s (str-slice s 0 i))))
+(defun fragment (s: str) -> str (let [i (index-of s "#")] (if (< i 0) "" (str-slice s (+ i 1) (str-len s)))))
+
+;; The scheme and authority of an absolute hierarchical URI ("https://h:1"), or the scheme alone for one without an authority.
+(defun origin :private (base: str) -> str
+  (let [e (scheme-end base)]
+    (if (and (= (byte-at base (+ e 1)) 47) (= (byte-at base (+ e 2)) 47))
+        (let [rest (str-slice base (+ e 3) (str-len base)) slash (index-of rest "/")]
+          (if (< slash 0) base (str-slice base 0 (+ (+ e 3) slash))))
+        (str-slice base 0 (+ e 1)))))
+
+;; RFC 3986 5.2.4: `.` and `..` segments removed.
+(defun remove-dots :private (path: str) -> str
+  (let [parts (loop [from 0 out: (Vec str) []]
+                (let [i (match (str-find path "/" from) ((some i) i) (nil (str-len path)))]
+                  (let [next (conj out (str-slice path from i))] (if (>= i (str-len path)) next (recur (+ i 1) next)))))
+        kept (reduce (fn (acc: (Vec str) seg: str) (cond (= seg ".") acc (= seg "..") (if (> (count acc) 1) (pop acc) acc) :else (conj acc seg))) [] parts)
+        trailing (and (> (count parts) 0) (let [l (nth parts (- (count parts) 1))] (or (= l ".") (= l ".."))))]
+    (str (str-join (vec (interpose "/" kept))) (if (and trailing (> (count kept) 0)) "/" ""))))
+
+;; The directory of a base's path, with its trailing slash.
+(defun directory :private (base: str) -> str
+  (let [b (without-fragment base)
+        q (index-of b "?") path (if (< q 0) b (str-slice b 0 q))
+        o (origin path) rest (str-slice path (str-len o) (str-len path))]
+    (loop [i (- (str-len rest) 1)]
+      (cond (< i 0) (str o "/") (= (byte-at rest i) 47) (str o (str-slice rest 0 (+ i 1))) :else (recur (- i 1))))))
+
+(defun hierarchical? :private (base: str) -> bool
+  (let [e (scheme-end base)] (and (>= e 0) (= (byte-at base (+ e 1)) 47))))
+
+;; `ref` resolved against `base`; a trailing empty fragment ("x#") is dropped, so "x#" and "x" name one resource.
+(defun resolve (base: str ref: str) -> str
+  (let [r (cond (absolute? ref) ref
+                (starts-with? ref "#") (str (without-fragment base) ref)
+                (= ref "") (without-fragment base)
+                (not (hierarchical? base)) ref
+                (starts-with? ref "//") (str (str-slice base 0 (+ (scheme-end base) 1)) ref)
+                (starts-with? ref "/") (str (origin base) ref)
+                :else (str (directory base) ref))
+        o (if (absolute? r) (origin r) "")
+        frag-at (index-of r "#")
+        body (if (< frag-at 0) r (str-slice r 0 frag-at))
+        tail (if (< frag-at 0) "" (str-slice r frag-at (str-len r)))
+        cleaned (if (and (hierarchical? r) (> (str-len body) (str-len o))) (str o (remove-dots (str-slice body (str-len o) (str-len body)))) body)]
+    (if (= tail "#") cleaned (str cleaned tail))))
+
+(defun hex :private (c: i64) -> i64
+  (cond (and (>= c 48) (<= c 57)) (- c 48) (and (>= c 65) (<= c 70)) (- c 55) (and (>= c 97) (<= c 102)) (- c 87) :else -1))
+
+;; A fragment's percent-escapes decoded; nil when an escape is malformed.
+(defun percent-decode (s: str) -> (Option str)
+  (loop [i 0 out: (Vec i64) []]
+    (cond (>= i (str-len s)) (some (str-from-bytes (let [a (cell (array (count out) 0i8))] (do (dotimes (k (count out)) (array-set! &a k (trunc i8 (nth out k)))) @a))))
+          (= (byte-at s i) 37) (let [h (hex (byte-at s (+ i 1))) l (hex (byte-at s (+ i 2)))]
+                                 (if (or (< h 0) (< l 0)) nil (recur (+ i 3) (conj out (+ (* h 16) l)))))
+          :else (recur (+ i 1) (conj out (byte-at s i))))))
+
+;; A JSON Pointer's tokens (`~1` is `/`, `~0` is `~`); nil when it does not start with `/` and is not empty.
+(defun pointer-tokens (p: str) -> (Option (Vec str))
+  (if (= p "") (some [])
+    (if (not (starts-with? p "/")) nil
+      (some (loop [from 1 out: (Vec str) []]
+              (let [i (match (str-find p "/" from) ((some i) i) (nil (str-len p)))
+                    tok (str-join (loop [j from acc: (Vec str) []]
+                                    (cond (>= j i) acc
+                                          (and (= (byte-at p j) 126) (= (byte-at p (+ j 1)) 49)) (recur (+ j 2) (conj acc "/"))
+                                          (and (= (byte-at p j) 126) (= (byte-at p (+ j 1)) 48)) (recur (+ j 2) (conj acc "~"))
+                                          :else (recur (+ j 1) (conj acc (str-slice p j (+ j 1)))))))
+                    next (conj out tok)]
+                (if (>= i (str-len p)) next (recur (+ i 1) next))))))))
+
+;; One step of a pointer: an object's member, or an array's element (a decimal index without a leading zero).
+(defun step (j: Json tok: str) -> (Option Json)
+  (match j
+    ((JObj _ _) (a/json-get j tok))
+    ((JArr items) (match (parse-long tok)
+                    ((some n) (if (and (>= n 0) (< n (count items)) (or (= tok "0") (not (starts-with? tok "0")))) (some (nth items n)) nil))
+                    (nil nil)))
+    (_ nil)))

@@ -1,0 +1,118 @@
+;; fib.json.schema.eval: a value against a compiled schema, every violation collected. The keywords that hold subschemas are here (one
+;; module, since they recurse into each other); the others are fib.json.schema.scalar's. Draft 7: a `$ref` replaces every sibling keyword.
+(ns fib.json.schema.eval (:use fib.core fib.seq fib.coll fib.json.types fib.json.schema.types fib.json.schema.scalar)
+  (:require [fib.json.access :as a] [fib.regex :as rx] [fib.json.schema.uri :as u] [fib.json.schema.index :as ix]))
+
+;; Deeper than this, a schema is taken to recurse without end (`{"$ref": "#"}` against anything).
+(def max-depth: i64 256)
+
+(defun into-ipath :private (at: At token: str) -> At (with at (ipath (str (. at ipath) "/" (pointer-token token)))))
+(defun into-spath :private (at: At token: str) -> At (with at (spath (str (. at spath) "/" (pointer-token token)))))
+(defun ok? :private (vs: (Vec SchemaViolation)) -> bool (empty? vs))
+
+(defun matches? :private (s: JsonSchema pattern: str name: str) -> bool
+  (match (get (. s regexes) pattern) ((some r) (some? (rx/re-find r name))) (nil false)))
+
+(defun object-pairs :private (j: Json) -> (Vec (Pair str Json))
+  (match j ((JObj ks vs) (mapv (fn (i: i64) (Pair (nth ks i) (nth vs i))) (vec (range (count ks))))) (_ [])))
+
+(defun properties :private (s: JsonSchema node: Json j: Json at: At base: str depth: i64) -> (Vec SchemaViolation)
+  (let [props (object-pairs (unwrap-or (a/json-get node "properties") (JObj [] [])))
+        pats (object-pairs (unwrap-or (a/json-get node "patternProperties") (JObj [] [])))
+        members (object-pairs j)
+        named (reduce (fn (o: (Vec SchemaViolation) p: (Pair str Json))
+                        (match (a/json-get j (. p fst))
+                          ((some v) (vec (concat o (check s (. p snd) v (into-spath (into-spath (into-ipath at (. p fst)) "properties") (. p fst)) base depth))))
+                          (nil o)))
+                      [] props)
+        patterned (reduce (fn (o: (Vec SchemaViolation) m: (Pair str Json))
+                            (reduce (fn (o2: (Vec SchemaViolation) p: (Pair str Json))
+                                      (if (matches? s (. p fst) (. m fst))
+                                          (vec (concat o2 (check s (. p snd) (. m snd) (into-spath (into-spath (into-ipath at (. m fst)) "patternProperties") (. p fst)) base depth)))
+                                          o2))
+                                    o pats))
+                          named members)]
+    (match (a/json-get node "additionalProperties")
+      (nil patterned)
+      ((some extra) (reduce (fn (o: (Vec SchemaViolation) m: (Pair str Json))
+                              (if (or (some? (a/json-get (unwrap-or (a/json-get node "properties") (JObj [] [])) (. m fst)))
+                                      (some? (first (filter (fn (p: (Pair str Json)) (matches? s (. p fst) (. m fst))) pats))))
+                                  o
+                                  (vec (concat o (check s extra (. m snd) (into-spath (into-ipath at (. m fst)) "additionalProperties") base depth)))))
+                            patterned members)))))
+
+(defun object-keywords :private (s: JsonSchema node: Json j: Json at: At base: str depth: i64) -> (Vec SchemaViolation)
+  (let [names (match (a/json-get node "propertyNames")
+                (nil [])
+                ((some sub) (reduce (fn (o: (Vec SchemaViolation) m: (Pair str Json))
+                                      (vec (concat o (check s sub (JStr (. m fst)) (into-spath (into-ipath at (. m fst)) "propertyNames") base depth))))
+                                    [] (object-pairs j))))
+        deps (reduce (fn (o: (Vec SchemaViolation) d: (Pair str Json))
+                       (if (not (some? (a/json-get j (. d fst)))) o
+                         (match (. d snd)
+                           ((JArr needs) (vec (concat o (keyword-checks (into-spath (into-spath at "dependencies") (. d fst)) "required" (JArr needs) j {} false))))
+                           (sub (vec (concat o (check s sub j (into-spath (into-spath at "dependencies") (. d fst)) base depth)))))))
+                     [] (object-pairs (unwrap-or (a/json-get node "dependencies") (JObj [] []))))]
+    (vec (concat (properties s node j at base depth) (vec (concat names (mapv (fn (v: SchemaViolation) (with v (keyword "dependencies"))) deps)))))))
+
+(defun array-keywords :private (s: JsonSchema node: Json items: (Vec Json) at: At base: str depth: i64) -> (Vec SchemaViolation)
+  (let [each (fn (sub: Json from: i64 kw: str) (reduce (fn (o: (Vec SchemaViolation) i: i64)
+                                                         (vec (concat o (check s sub (nth items i) (into-spath (into-ipath at (str i)) kw) base depth))))
+                                                       [] (vec (range from (count items)))))
+        by-items (match (a/json-get node "items")
+                   (nil [])
+                   ((some (JArr subs)) (let [positional (reduce (fn (o: (Vec SchemaViolation) i: i64)
+                                                                  (vec (concat o (check s (nth subs i) (nth items i) (into-spath (into-spath (into-ipath at (str i)) "items") (str i)) base depth))))
+                                                                [] (vec (range (min (count subs) (count items)))))]
+                                         (match (a/json-get node "additionalItems") (nil positional) ((some extra) (vec (concat positional (each extra (count subs) "additionalItems")))))))
+                   ((some sub) (each sub 0 "items")))
+        contained (match (a/json-get node "contains")
+                    (nil [])
+                    ((some sub) (if (some? (first (filter (fn (x: Json) (ok? (check s sub x at base depth))) items))) []
+                                  [(violation at "contains" "has no item valid under the `contains` schema")])))]
+    (vec (concat by-items contained))))
+
+(defun combinators :private (s: JsonSchema node: Json j: Json at: At base: str depth: i64) -> (Vec SchemaViolation)
+  (let [subs (fn (k: str) (match (a/json-get node k) ((some (JArr xs)) xs) (_ [])))
+        valid-count (fn (k: str) (count (filter (fn (x: Json) (ok? (check s x j at base depth))) (subs k))))
+        all (reduce (fn (o: (Vec SchemaViolation) i: i64) (vec (concat o (check s (nth (subs "allOf") i) j (into-spath (into-spath at "allOf") (str i)) base depth))))
+                    [] (vec (range (count (subs "allOf")))))
+        any (if (and (some? (a/json-get node "anyOf")) (= (valid-count "anyOf") 0)) [(violation at "anyOf" "is not valid under any of the `anyOf` schemas")] [])
+        one (if (and (some? (a/json-get node "oneOf")) (!= (valid-count "oneOf") 1))
+                [(violation at "oneOf" (str "is valid under " (valid-count "oneOf") " of the `oneOf` schemas, not exactly one"))] [])
+        nope (match (a/json-get node "not") ((some x) (if (ok? (check s x j at base depth)) [(violation at "not" "is valid under the `not` schema")] [])) (nil []))
+        cond (match (a/json-get node "if")
+               (nil [])
+               ((some test) (let [branch (if (ok? (check s test j at base depth)) "then" "else")]
+                              (match (a/json-get node branch) ((some x) (check s x j (into-spath at branch) base depth)) (nil [])))))]
+    (vec (concat all (vec (concat any (vec (concat one (vec (concat nope cond))))))))))
+
+(def structural: (Vec str) ["properties" "patternProperties" "additionalProperties" "propertyNames" "dependencies" "items" "additionalItems"
+                            "contains" "allOf" "anyOf" "oneOf" "not" "if" "then" "else" "definitions" "$id" "$schema" "$comment"])
+
+(defun follow :private (s: JsonSchema ref: str j: Json at: At base: str depth: i64) -> (Vec SchemaViolation)
+  (match (ix/lookup (. s resources) (u/resolve base ref))
+    (nil [(violation at "$ref" (str "cannot resolve " ref))])
+    ((some target) (check s (. target fst) j (into-spath at "$ref") (. target snd) (+ depth 1)))))
+
+;; The violations of `j` under the schema `node`, read against `base`.
+(defun check (s: JsonSchema node: Json j: Json at: At base: str depth: i64) -> (Vec SchemaViolation)
+  (cond (> depth max-depth) [(violation at "$ref" "the schema refers to itself without end")]
+        :else
+        (match node
+          ((JBool b) (if b [] [(SchemaViolation (. at ipath) (. at spath) "false" "no value is valid here")]))
+          ((JObj ks vs)
+           (match (a/json-get node "$ref")
+             ((some (JStr ref)) (follow s ref j at base depth))
+             (_ (let [b (. (ix/enter (ix/empty-index) node base) snd)
+                      own (reduce (fn (o: (Vec SchemaViolation) i: i64)
+                                    (let [k (nth ks i)]
+                                      (if (some? (first (filter (fn (x: str) (= x k)) structural))) o
+                                        (vec (concat o (keyword-checks at k (nth vs i) j (. s regexes) (. s formats)))))))
+                                  [] (vec (range (count ks))))
+                      shaped (match j
+                               ((JObj _ _) (object-keywords s node j at b (+ depth 1)))
+                               ((JArr items) (array-keywords s node items at b (+ depth 1)))
+                               (_ []))]
+                  (vec (concat own (vec (concat shaped (combinators s node j at b (+ depth 1))))))))))
+          (_ []))))
