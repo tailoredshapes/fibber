@@ -266,3 +266,33 @@ input (a 1.6 MB file takes 40 s to read; `split` of a 5 MB string did not finish
 Planted faults. Encodings (`scripts/mutant-crypto-encoding.sh`, in this repository): ten mutants, all killed. Driver (`scripts/mutant-openssl.sh`):
 eleven mutants killed, one (`pkcs5-off`) equivalent on OpenSSL 3.2 and newer, where PBKDF2's minimum checks apply to FIPS only; it matters on 3.0
 and 3.1, so the parameter stays. The contract against `Faulty` wrappers: eight faults, each fails the scenario about the broken thing.
+
+### CRYPTO-2 (AEAD, key agreement, signatures), driver fib-crypto-openssl v0.2.0, OpenSSL 3.5.5, 2026-10-07
+
+Contracts through the driver (`scripts/test.sh`): `fibc test specs`: 65 scenarios, 65 pass (the base contract 15, AEAD 6, key agreement 7, signatures 8, TLS key schedule 4, the offered-capabilities
+check 1, the planted faults 12, the driver's own checks 6, SCRAM 6); the same contract spec built with `fibc build` and no `-l` flag (the `:lib "crypto"` declaration links `-lcrypto`) and with
+`--link crypto=static -L DIR` against an OpenSSL 3.5.5 `libcrypto.a` built from its tarball (`ldd` shows no libcrypto): 41/41 each. Fibber's gate: `GATE_FRESH=1 GATE_BUDGET=4 scripts/gate.sh --full`: PASS
+(specs 329 scenarios, 14 of them `crypto-contract-shape-spec`; 22 ADRs accepted).
+
+Planted faults in the driver (`scripts/mutant-openssl.sh`): 25 mutants, 25 killed (tag check skipped, a 12-byte tag, no cleanse, a P-256 key generated on P-384, a bad signature accepted, nonce
+and key length checks removed, AAD never fed, an RSA key of any size, a PKCS#8 key of any kind, HKDF-Expand running extract too, RSA-PSS letting the signature choose the salt length, ECDSA
+hashing with SHA-384, a scheme checked against any key type, and the 11 of v0.1.0). Not in the set, equivalent on 3.5.5: `zero-secret` (our all-zero X25519 check removed; OpenSSL refuses the secret
+itself: it survives) and `pkcs5-off`. The PSS mutant first SURVIVED: Wycheproof has no wrong-salt-length case, so vectors with salt length 0 and MGF1/SHA-1 (valid in Wycheproof, invalid under TLS 1.3's rsae)
+were added and it was then killed.
+
+Differential (`scripts/differential-pk.sh`, seed 20261007, against python `cryptography`): 2125 inputs, 0 mismatches: 312 seals (each also opened) over the three ciphers with sizes 0 to 3000 and the block
+boundaries, 624 tampered messages that must not open, 220 key agreements (X25519, P-256, P-384), 57 peers that must be refused (small-order, off-curve), 792 verifications (ed25519 240, ecdsa-p256 180, ecdsa-p384
+180, RSA-PSS and PKCS#1 v1.5 with SHA-256 and SHA-384 48 each) with python's verdict on tampered signatures, 120 signatures made by the driver, all of which python verified (Ed25519 byte for byte).
+
+Throughput (`scripts/bench-pk.sh`, 28 cores, AES-NI; wall time of the whole process, 10^6 bytes per second; the same buffer sealed again and again):
+```
+aes-128-gcm           16384 bytes   fib.crypto   5271 MB/s   openssl speed   9030 MB/s
+aes-128-gcm         1048576 bytes   fib.crypto   8127 MB/s   openssl speed   9845 MB/s
+aes-256-gcm           16384 bytes   fib.crypto   4547 MB/s   openssl speed   7483 MB/s
+aes-256-gcm         1048576 bytes   fib.crypto   7111 MB/s   openssl speed   8400 MB/s
+chacha20-poly1305     16384 bytes   fib.crypto   2422 MB/s   openssl speed   3101 MB/s
+chacha20-poly1305   1048576 bytes   fib.crypto   2839 MB/s   openssl speed   3091 MB/s
+X25519 generate + agree  20728 /s (openssl speed: 48896 agree/s)     Ed25519 sign + verify  11062 /s (openssl speed: sign 45059/s, verify 16116/s)
+```
+A 1 MiB seal is within 8 to 17 percent of `openssl speed`; at the 16 KiB of a TLS record the per-call work (fetching the cipher, a context, the result array) costs 25 to 42 percent more: the
+cipher fetch can be cached later. The first version (a zeroed C buffer and a copy out) did 3269 MB/s for 1 MiB AES-128-GCM; writing the ciphertext into the result array brought it to 8127.
