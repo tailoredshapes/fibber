@@ -216,15 +216,27 @@ Recent compiler and library changes include:
   `scripts/package.sh` builds a macOS tarball. No darwin-arm64 release has been
   published, and iOS and aarch64 Linux have not been run. See
   [the aarch64 design](docs/design/aarch64.md) and [the first numbers](docs/shootout/aarch64.md).
-- GraphQL lives in its own repository, lacewing: `ssh://git@localhost:2222/tailoredshapes/lacewing.git`, pulled in with `fibc deps add`
-  (see Projects and dependencies).
+- GraphQL lives in its own repository, lacewing: `ssh://git@localhost:2222/tailoredshapes/lacewing.git` (latest tag `v0.3.0`), pulled in with
+  `fibc deps add` (see Projects and dependencies). It is a GraphQL query engine in the shape of Clojure's Lacinia (compiled immutable schema, resolvers as plain
+  functions, ordered responses): typed schema construction, schema definition language (SDL) loading with resolvers attached by name, custom scalars, variables,
+  input objects, fragments, `@skip` and `@include`, whole-document validation before any resolver runs, and resolvers that see the selections beneath their field.
+  **Breaking since `v0.2.0`: `GqlField.resolver` is an `(Option GqlResolver)`** (SDL fields have none until one is attached). `v0.3.0` can resolve a query's fields in
+  parallel on native tasks (opt-in, `execute-with`), with the serial response. Not yet: mutations, subscriptions, introspection beyond `__typename`, enums,
+  interfaces, unions.
+- meshql in fibber: `meshql-fib` (`ssh://git@localhost:2222/tailoredshapes/meshql-fib.git`, `v0.2.0`) gives an entity a REST write surface and a GraphQL read surface
+  (on lacewing) from one declaration, with point-in-time reads and federation of graphlettes. It is the fourth implementation of the
+  [meshql](https://git.tildarc.com/tailoredshapes/meshql) contract and passes all five tiers (37 scenarios) against SQLite (`fib-db-sqlite`) and PostgreSQL
+  (`fib-db-postgres`); `meshql serve CONFIG` reads the HOCON configuration of the other implementations (`fib-hocon`).
 - HOCON configuration lives in its own repository, fib-hocon: `ssh://git@localhost:2222/tailoredshapes/fib-hocon.git` (tag `v0.1.0`), module
   `hocon`. It has the parser, substitutions, includes, merging, durations and sizes, a `config->record` macro, and a differential harness
   against Typesafe Config; its README has the features and the measurements.
 - Databases: `fib.db` (next.jdbc's shape: `execute!`, `with-transaction`, `with-connection`, `plan`), the driver contract
   `fib.db.contract` and an in-memory fake driver `fib.db.memory` are in the library; drivers are libraries in their own repositories. The
-  SQLite driver is `fib-db-sqlite`: `ssh://git@localhost:2222/tailoredshapes/fib-db-sqlite.git`, module `sqlite`. See
-  [the contract](docs/design/db-contract.md).
+  SQLite driver is `fib-db-sqlite`: `ssh://git@localhost:2222/tailoredshapes/fib-db-sqlite.git`, module `sqlite`. The PostgreSQL driver is
+  `fib-db-postgres`: `ssh://git@localhost:2222/tailoredshapes/fib-db-postgres.git` (tag `v0.1.0`), module `postgres`: the wire protocol (version 3.0) written in
+  fibber over `fib.os.net`, with no libpq and no C library of its own; it passes `fib.db.contract` against PostgreSQL 14, 16 and 17 and opens a connection from
+  a libpq-shaped URL (`pg/open-url`). It cannot yet connect over TLS (`sslmode=require` is refused: `fib.tls`'s `Session` is not `Send`, so it cannot live in a
+  connection that moves between tasks; see [the Send-able TLS session design](docs/design/tls-send.md)). See [the contract](docs/design/db-contract.md).
 - Gherkin: `fib-gherkin` (`ssh://git@localhost:2222/tailoredshapes/fib-gherkin.git`, module `gherkin`) reads `.feature` files (Cucumber's
   parser, all its languages, pickles, Cucumber Expressions) and runs them on `fib.test` with step definitions written in fibber, so
   `fibc test` prints the scenarios under their Gherkin names and the `.feature` line that did not hold. It is a front end to the system in

@@ -43,7 +43,8 @@ esac
 ulimit -v 16000000
 survived=0
 for c in "${CASES[@]}"; do
-  line=$("$FIBC" cases "$OUT/tree/cases/stdlib" --only "$c" 2>&1 | grep -E "^$c" | head -1)
+  all=$("$FIBC" cases "$OUT/tree/cases/stdlib" --only "$c" 2>&1) || true   # into a variable first: a pipe into `head -1` kills fibc with SIGPIPE, which pipefail reports
+  line=$(printf '%s\n' "$all" | grep -E "^$c" | head -1)
   case $line in
     *" pass"*) echo "SURVIVED  $MODE: $line"; survived=1 ;;
     *) echo "killed    $MODE: ${line:0:200}" ;;

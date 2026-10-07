@@ -13,7 +13,9 @@
 ;;    one piece, itself, even when it is empty (`(split "" ",")` is `[""]`, `(split "," ",")` is `[]`).
 ;;    A zero-width match is the empty string as a pattern (`(split "abc" "")` is `["a" "b" "c"]`):
 ;;    the search then goes on one character later, as Java's `Matcher.find` does.
-;;  - an instance only needs `find-in`; `split-by` has the default below. `replace-in` is tranche 3.
+;;  - an instance only needs `find-in`; `split-by` and `replace-by` have the defaults below. `replace-by` (package FOLLOWUP-1) is `clojure.string/replace`
+;;    for one pattern: a `str` or a `char` is matched literally and the replacement is the literal text (no `$1`), a `Regex` overrides it in fib.regex.api and reads
+;;    its replacement as a template (`$1`, `\$`), as Clojure's. `limit` is -1 for every match and 1 for the first; every offset here is a BYTE offset of the text.
 ;;  - the instances for `str` and `char` are here, with the protocol, and not in an implicit part
 ;;    (plan §4.3 rule 6): the protocol is reachable only through this module, so every program that
 ;;    can name `Pattern` has loaded them.
@@ -21,7 +23,8 @@
 
 (defprotocol Pattern
   (find-in (self s: str from: i64) -> (Option (Pair i64 i64)))
-  (split-by (self s: str limit: i64) -> (Vec str) (split-pieces self s limit)))
+  (split-by (self s: str limit: i64) -> (Vec str) (split-pieces self s limit))
+  (replace-by (self s: str to: str limit: i64) -> str (replace-spans s (match-spans self s limit) to)))
 
 ;; a `str` is itself, matched byte for byte; the empty `str` matches everywhere, also at the end
 (impl Pattern str
@@ -29,18 +32,19 @@
     (match (str-find s self from)
       (nil nil)
       ((some i) (some (Pair i (+ i (str-len self)))))))
-  (split-by (self s limit) (if (= (str-len self) 0) (split-pieces self s limit) (split-literal self s limit))))
+  (split-by (self s limit) (if (= (str-len self) 0) (split-pieces self s limit) (literal-pieces self s limit))))
 
 ;; a `char` is the string of its one character
 (impl Pattern char
   (find-in (self s from) (find-in (char->str self) s from))
-  (split-by (self s limit) (split-by (char->str self) s limit)))
+  (split-by (self s limit) (split-by (char->str self) s limit))
+  (replace-by (self s to limit) (replace-by (char->str self) s to limit)))
 
 ;; split-pieces for a pattern that is a non-empty `str`: no match is empty, so none starts a piece early and the next search
 ;; starts at the end of the last. The generic loop makes a Pair and an Option per match (find-in answers them to a caller it
 ;; cannot see) and, for a `char`, the one-character string per match; here the Option of str-find is matched where it is made,
 ;; so the one object a piece costs is its slice.
-(defun split-literal :private (pat: str s: str limit: i64) -> (Vec str)
+(defun literal-pieces :private (pat: str s: str limit: i64) -> (Vec str)
   (loop ((from 0) (pieces (vec-empty)))
     (if (if (> limit 0) (= (fib.prelude/vec-count pieces) (- limit 1)) false)
         (finish-pieces s from limit pieces)
@@ -87,3 +91,45 @@
              (if (if (= index 0) (if (= st 0) (= en 0) false) false)
                  (recur (next-from s st en) index pieces)
                  (recur (next-from s st en) en (fib.prelude/vec-conj pieces (str-slice s index st))))))))))
+
+;; the byte spans [start end start end ..] of the first `limit` matches of p in s (all of them when limit is negative); an empty match is followed one
+;; character on (next-from), so a non-ASCII text is never cut inside a character
+(defun match-spans :private (p: p s: str limit: i64) :where ((Pattern p)) -> (Vec i64)
+  (loop ((from 0) (k 0) (acc (vec-empty)))
+    (if (if (< from 0) true (= k limit))
+        acc
+        (match (find-in p s from)
+          (nil acc)
+          ((some m) (recur (next-from s (. m fst) (. m snd)) (+ k 1)
+                           (fib.prelude/vec-conj (fib.prelude/vec-conj acc (. m fst)) (. m snd))))))))
+
+(defun copy-bytes :private (buf: (Cell (Array i8)) pos: i64 src: (Array i8) lo: i64 hi: i64) -> i64
+  (do (dotimes (j (- hi lo)) (array-set! &buf (+ pos j) (array-get src (+ lo j))))
+      (+ pos (- hi lo))))
+
+;; s with each span replaced by `to`: the length is summed first and the result is written once into an array of that length, so the cost is linear in
+;; the text and the number of matches (no piece per match, no repeated concatenation). With no match the text itself comes back.
+(defun replace-spans :private (s: str spans: (Vec i64) to: str) -> str
+  (let ((n (fib.prelude/vec-count spans)))
+    (if (= n 0)
+        s
+        (let ((matched (loop ((i 0) (m 0))
+                         (if (< i n) (recur (+ i 2) (+ m (- (fib.prelude/vec-nth spans (+ i 1)) (fib.prelude/vec-nth spans i)))) m)))
+              (total (+ (- (str-len s) matched) (* (quot n 2) (str-len to))))
+              (src (str-bytes s))
+              (lb (str-bytes to))
+              (buf (cell (array (if (> total 1) total 1) 0i8))))
+          (loop ((i 0) (last 0) (pos 0))
+            (if (< i n)
+                (let ((p1 (copy-bytes buf pos src last (fib.prelude/vec-nth spans i)))
+                      (p2 (copy-bytes buf p1 lb 0 (array-len lb))))
+                  (recur (+ i 2) (fib.prelude/vec-nth spans (+ i 1)) p2))
+                (do (copy-bytes buf pos src last (array-len src))
+                    (str-from-bytes (array-copy @buf 0 total)))))))))
+
+;; (split-literal s sep) and (split-literal s sep limit) (stdlib §4.7, FOLLOWUP-1): `split` for a separator that is a `str`, taken literally and never as a regex, with Java's
+;; limit (0 drops the trailing empty strings, negative keeps them, positive caps the pieces); an empty separator cuts into characters. It is `(split s sep)` of fib.string
+;; without the `Pattern` generic, for a caller that has a `str` and wants no instance resolved. Linear, and byte offsets throughout: a non-ASCII text is cut at character boundaries.
+(defn split-literal
+  ([s: str sep: str] -> (Vec str) (split-by sep s 0))
+  ([s: str sep: str limit: i64] -> (Vec str) (split-by sep s limit)))

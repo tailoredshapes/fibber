@@ -1,0 +1,84 @@
+;; scripts/parse-double-floats.fib: verifies fib.core's parse-double against libc's strtod (stdlib §4.7 row `parse-double`; package FOLLOWUP-1). Run by scripts/parse-double-floats.sh.
+;;   parse-double-floats N      N random decimal texts of every shape (1 to 19 digits, a dot anywhere, exponents of every size): the bits of (parse-double t) and of strtod must be equal
+;;   parse-double-floats FILE   each line is `TEXT HEXBITS` (Python's float(TEXT) bits: halfway cases, subnormals, boundaries; scripts/json-floats.py writes it)
+;; The oracle declares its own strtod, in a script (ADR 0011 keeps `extern` out of the library). One line per check; exits 1 on any difference.
+(ns main)
+(extern strtod (ptr ptr) -> f64)
+
+(defun oracle (t: str) -> f64
+  (let ((n (str-len t)))
+    (unsafe
+      (let ((p (alloc (+ n 9))))
+        (do (dotimes (k n) (store-i8 (ptr+ p k) (str-byte-at t k)))
+            (store-i8 (ptr+ p n) 0i8)
+            (let ((r (strtod p (ptr+ p (+ n 1))))) (do (free p) r)))))))
+
+(defun next-rand (s: i64) -> i64
+  (let ((a (bit-xor s (shr s 12))) (b (bit-xor a (shl a 25))))
+    (bit-xor b (shr b 27))))
+
+(defun rnd-out (s: i64) -> i64 (unchecked-multiply s 2685821657736338717))
+
+(defun digit-text (st: i64 n: i64) -> str
+  (loop ((i 0) (out "") (s st))
+    (if (= i n) out
+        (let ((s2 (next-rand s)))
+          (recur (+ i 1) (str out (rem (shr (rnd-out s2) 40) 10)) s2)))))
+
+(defun rand-text (st: i64) -> str
+  (let ((r (shr (rnd-out st) 33))
+        (nd (+ 1 (rem r 19)))
+        (digits (str (+ 1 (rem (shr r 20) 9)) (digit-text st (- nd 1))))
+        (dot (+ 1 (rem (shr r 5) nd)))
+        (mant (if (= (rem (shr r 9) 4) 0) digits
+                  (if (= (rem (shr r 9) 4) 1) (str "0." digits)
+                      (str (str-slice digits 0 dot) "." (if (= dot nd) "0" (str-slice digits dot nd))))))
+        (ek (rem (shr r 11) 8))
+        (e (- (rem (shr r 15) 700) 350))
+        (ex (if (= ek 0) "" (if (< ek 5) (str "e" (rem e 40)) (str "E" e))))
+        (sign (if (= (rem (shr r 3) 4) 0) "-" "")))
+    (str sign mant ex)))
+
+(defun bits-of (t: str) -> i64
+  (match (parse-double t) ((some x) (f64->bits x)) (nil -1)))
+
+(defun check-random (n: i64) -> i64
+  (loop ((i 0) (bad 0) (st 88172645463325252))
+    (if (= i n)
+        (do (println "random decimal texts:" n "compared with strtod," bad "differ") bad)
+        (let ((s2 (next-rand st))
+              (t (rand-text s2))
+              (want (f64->bits (oracle t)))
+              (got (bits-of t)))
+          (if (= want got)
+              (recur (+ i 1) bad s2)
+              (do (when (< bad 10) (println "  MISMATCH" t "want" want "got" got))
+                  (recur (+ i 1) (+ bad 1) s2)))))))
+
+(defun hex-bits (h: str) -> i64
+  (loop ((k 0) (v 0))
+    (if (= k (str-len h)) v
+        (let ((c (zext i64 (str-byte-at h k)))) (recur (+ k 1) (bit-or (shl v 4) (if (< c 58) (- c 48) (- c 87))))))))
+
+(defun check-file (path: str) -> i64
+  (match (read-file path)
+    (nil (do (println "cannot read" path) 1))
+    ((some txt)
+     (let ((n (str-len txt)))
+       (loop ((from 0) (bad 0) (cnt 0))
+         (if (>= from n)
+             (do (println "corpus" path ":" cnt "cases," bad "differ") bad)
+             (let ((e (match (str-find txt "\n" from) ((some k) k) (nil n)))
+                   (l (str-slice txt from e))
+                   (sp (match (str-find l " " 0) ((some k) k) (nil 0)))
+                   (t (str-slice l 0 sp))
+                   (want (hex-bits (str-slice l (+ sp 1) (str-len l))))
+                   (got (bits-of t)))
+               (if (= want got) (recur (+ e 1) bad (+ cnt 1))
+                   (do (when (< bad 10) (println "  MISMATCH" t "want" want "got" got)) (recur (+ e 1) (+ bad 1) (+ cnt 1)))))))))))
+
+(defun main () -> i64
+  (let ((a (args)))
+    (if (= (count a) 1)
+        (match (parse-long (nth a 0)) ((some n) (check-random n)) (nil (check-file (nth a 0))))
+        (do (println "usage: parse-double-floats N | FILE") 2))))

@@ -1,0 +1,59 @@
+;; fib.core.parse: parse-boolean and the integer parsers of stdlib §4.3 (rows parse-boolean, try-parse-int, Integer/parseInt, Long/parseLong; package FOLLOWUP-1).
+;; Exports: parse-boolean try-parse-int parse-i32 try-parse-long. (parse-long is fib.core.text's, parse-double fib.core.decimal's.)
+;; Decided here, where the rows are silent:
+;;  - parse-boolean is Clojure's: exactly "true" or "false", lower case, no space; anything else is nil.
+;;  - try-parse-int is `[+-]? digit+` in the radix (2 to 36; the digits 0-9, a-z and A-Z, ASCII only, as parse-long's are), a value that fits an i32, else nil.
+;;    A radix outside 2 to 36 is nil here (Java's parseInt throws; the twin has no other way to say it). The empty string, a lone sign, a space and an underscore are nil.
+;;  - parse-i32 is the unqualified alias the row names. try-parse-long is the `Option` twin of Long/parseLong by §3 N13 (the row for parse-long is Clojure's own nil-returning
+;;    parser, radix 10 only; this one takes a radix).
+;;  - Integer/parseInt, Long/parseLong and Double/parseDouble (lib/Integer.fib, lib/Long.fib, lib/Double.fib) trap with Java's NumberFormatException texts.
+(ns fib.core.parse)
+
+(defun parse-boolean (s: str) -> (Option bool)
+  (if (= s "true") (some true) (if (= s "false") (some false) nil)))
+
+;; the value of the digit byte b in a radix, or -1
+(defun digit-in :private (b: i64 radix: i64) -> i64
+  (let ((d (if (and (>= b 48) (<= b 57)) (- b 48)
+               (if (and (>= b 97) (<= b 122)) (- b 87)
+                   (if (and (>= b 65) (<= b 90)) (- b 55) -1)))))
+    (if (< d radix) d -1)))
+
+;; the digits from byte i to n as the negative number -acc, which must stay at or above `least`; nil when a digit is wrong or the limit is passed
+(defun accumulate :private (s: str i: i64 radix: i64 least: i64) -> (Option i64)
+  (loop ((j i) (acc 0))
+    (if (= j (str-len s))
+        (some acc)
+        (let ((d (digit-in (zext i64 (str-byte-at s j)) radix)))
+          (if (< d 0)
+              nil
+              (if (< acc (quot least radix))
+                  nil
+                  (let ((next (- (* acc radix) d)))
+                    (if (< next least) nil (recur (+ j 1) next)))))))))
+
+;; the whole string as an integer of the range [least, most] in the radix
+(defun parse-range :private (s: str radix: i64 least: i64 most: i64) -> (Option i64)
+  (let ((n (str-len s)))
+    (if (or (= n 0) (or (< radix 2) (> radix 36)))
+        nil
+        (let ((b (str-byte-at s 0))
+              (neg (= b 45i8))
+              (start (if (or (= b 45i8) (= b 43i8)) 1 0)))
+          (if (= start n)
+              nil
+              (match (accumulate s start radix (if neg least (- 0 most)))
+                (nil nil)
+                ((some v) (some (if neg v (- 0 v))))))))))
+
+(defn try-parse-int
+  ([s: str] -> (Option i32)
+    (match (parse-range s 10 -2147483648 2147483647) (nil nil) ((some v) (some (trunc i32 v)))))
+  ([s: str radix: i64] -> (Option i32)
+    (match (parse-range s radix -2147483648 2147483647) (nil nil) ((some v) (some (trunc i32 v))))))
+
+(defun parse-i32 (s: str) -> (Option i32) (try-parse-int s))
+
+(defn try-parse-long
+  ([s: str] -> (Option i64) (parse-range s 10 -9223372036854775808 9223372036854775807))
+  ([s: str radix: i64] -> (Option i64) (parse-range s radix -9223372036854775808 9223372036854775807)))
