@@ -1,0 +1,28 @@
+;; fib.keyword: `keyword`, `name` and `namespace` (stdlib rows of the same names; LIBFIX-1; case 8104). Explicit, `(:use fib.keyword)` or `(:require [fib.keyword :as kw])`, and not in
+;; `fib.core`, because `keyword` is built on the builtin `str->keyword`, which the seed that builds stage 2 does not have: a library file that the compiler itself loads
+;; cannot use a builtin the seed lacks (the next SEED bump can move these three into fib.core.text).
+(ns fib.keyword (:use fib.core))
+;; A keyword is flat: `:a/b` is one name, "a/b", and `name` and `namespace` split it at the FIRST slash as Clojure's `Symbol.intern` does (a lone "/" is a
+;; name with no namespace). `(keyword s)` is the keyword of that name: the one a literal `:a` is when the program has one (`(= (keyword "a") :a)`), else a new
+;; one that equals only the keywords made from the same text, shows as `:` and the name, hashes as the name and orders by it, as every keyword does.
+;; The text counts bytes (`str-find`, `str-slice`), as the name of a keyword is any str: no offset of a character is taken.
+(defn keyword
+  ([s: str] -> keyword (str->keyword s))
+  ([ns: str s: str] -> keyword (str->keyword (str-concat ns (str-concat "/" s)))))
+
+;; the text of a keyword without its colon
+(defun keyword-body :private (k: keyword) -> str
+  (let ((t (str k))) (str-slice t 1 (str-len t))))
+
+;; the byte offset of the slash that ends the namespace, or -1
+(defun ns-slash :private (b: str) -> i64
+  (if (= b "/") -1 (match (str-find b "/" 0) (nil -1) ((some i) i))))
+
+(defun name (k: keyword) -> str
+  (let ((b (keyword-body k)) (i (ns-slash b)))
+    (if (< i 0) b (str-slice b (+ i 1) (str-len b)))))
+
+(defun namespace (k: keyword) -> (Option str)
+  (let ((b (keyword-body k)) (i (ns-slash b)))
+    (if (< i 0) nil (some (str-slice b 0 i)))))
+

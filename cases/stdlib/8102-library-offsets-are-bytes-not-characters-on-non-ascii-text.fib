@@ -1,0 +1,26 @@
+;; spec: spec/stdlib.md section 2.9 (subs counts characters; str-find, str-slice and str-len count bytes), docs/design/observability-and-databases.md 5
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; Package LIBFIX-1, the audit of `subs` next to byte offsets: the library called `subs` (characters) with offsets that were bytes (`str-len`, a loop index
+;; over `str-byte-at`, a `str-find` result), which trapped with "subs: index out of range" or cut the wrong text as soon as the input held a non-ASCII character.
+;; Each line below was one such place: keyword-text (the name of a keyword), json-quote, the kind of a caught trap by its message (fib.ex), the SQL
+;; tokenizer and `lower` of fib.db.memory, `sql/format` (its trailing `subs t 1 (str-len t)`), and the crypto contract's "rep:" message. Every
+;; expected value is spelled out: a wrong cut and a trap both fail.
+(ns main (:use tl.check fib.coll fib.ex) (:require [fib.datum :as d] [fib.db.memory.text :as mt] [fib.sql :as sql]))
+
+(defun main () -> i64
+  (let [c (checks)]
+    (do (check c (= (d/keyword-text :café) "caf\u{e9}"))
+        (check c (= (d/keyword-text :a) "a"))
+        (check c (= (d/json-quote "caf\u{e9} \"x\"\n\u{20ac}!") "\"caf\u{e9} \\\"x\\\"\\n\u{20ac}!\""))
+        (check c (= (d/json-quote "\u{e9}") "\"\u{e9}\""))
+        (check c (= (try (trap "caf\u{e9} \u{20ac} index out of range") (catch e (unwrap-or (ex-kind e) "?"))) "index"))
+        (check c (= (try (trap "\u{e9}\u{e9}\u{e9} nothing") (catch e (unwrap-or (ex-kind e) "?"))) "user"))
+        (check c (= (mt/lower "SELECT Caf\u{e9} FROM T\u{20ac}X") "select caf\u{e9} from t\u{20ac}x"))
+        (check c (= (mt/lower "ABC") "abc"))
+        (check c (= (mt/tokenize "SELECT caf\u{e9}, x FROM t WHERE n = '\u{20ac}'") ["select" "caf\u{e9}" "," "x" "from" "t" "where" "n" "=" "'\u{20ac}'"]))
+        (check c (= (. (sql/format (sql/sql {:select [:café] :from [:t€] :where [:= :id 1]})) sql) "SELECT caf\u{e9} FROM t\u{20ac} WHERE id = ?"))
+        (checks-result c))))

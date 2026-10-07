@@ -605,3 +605,64 @@
       (call @fib.trap-bytes buf (sext i64 len))
       (unreachable)))
   (block ok (ret n)))
+
+;; Keywords made at run time (`str->keyword`, LIBFIX-1, emit.kwdyn). The keywords of a program have ids 0 .. N-1 (its literals); one made from a string that is none
+;; of them takes the id N + i, i the index of its name in this table, which grows by doubling under a spinlock (fib.lock). The name is a copy, frozen (IMMORTAL and SHARED, never freed, and a trace-mode audit sees it freed, as it does a `freeze`), so
+;; the table owns it for good and a trace-mode audit counts no leak. Lookup is a walk: a program makes few keywords from strings, and the common
+;; one is a literal, found by emit.kwdyn's `kw.intern` before this is called.
+(global internal fib.kwd-lock i32 (i32 0))
+(global internal fib.kwd-names ptr (ptr null))
+(global internal fib.kwd-n i64 (i64 0))
+(global internal fib.kwd-cap i64 (i64 0))
+
+(define internal (fib.kwd-count i64) ()
+  (block entry (ret (atomic-load monotonic i64 @fib.kwd-n))))
+
+(define internal (fib.kwd-name ptr) ((i64 i))
+  (block entry
+    (call @fib.lock @fib.kwd-lock)
+    (let ((names (load ptr @fib.kwd-names))
+          (s (load ptr (getelementptr ptr names i))))
+      (call @fib.unlock @fib.kwd-lock)
+      (ret s))))
+
+(define internal (fib.kwd-intern i64) ((ptr s))
+  (block entry
+    (call @fib.lock @fib.kwd-lock)
+    (br scan))
+  (block scan
+    (let ((i (phi i64 (entry (i64 0)) (next i2)))
+          (n (load i64 @fib.kwd-n)))
+      (br (icmp slt i n) test add)))
+  (block test
+    (let ((names (load ptr @fib.kwd-names))
+          (t (load ptr (getelementptr ptr names i))))
+      (br (call @fib.str-eq t s) hit next)))
+  (block next
+    (let ((i2 (add i (i64 1))))
+      (br scan)))
+  (block hit
+    (call @fib.unlock @fib.kwd-lock)
+    (ret i))
+  (block add
+    (let ((cap (load i64 @fib.kwd-cap)))
+      (br (icmp sge n cap) grow put)))
+  (block grow
+    (let ((cap2 (select (icmp eq cap (i64 0)) (i64 64) (mul cap (i64 2))))
+          (nw (call @realloc (load ptr @fib.kwd-names) (mul cap2 (i64 8)))))
+      (br (icmp eq nw (ptr null)) oom grown)))
+  (block oom
+    (call @fib.fatal-c (string "out of memory"))
+    (unreachable))
+  (block grown
+    (store nw @fib.kwd-names)
+    (store cap2 @fib.kwd-cap)
+    (br put))
+  (block put
+    (let ((c (call @fib.str-copy s))
+          (names2 (load ptr @fib.kwd-names)))
+      (call @fib.freeze c)
+      (store c (getelementptr ptr names2 n))
+      (store (add n (i64 1)) @fib.kwd-n)
+      (call @fib.unlock @fib.kwd-lock)
+      (ret n))))

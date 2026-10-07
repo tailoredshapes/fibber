@@ -111,5 +111,21 @@ $s2 test --bogus > /dev/null 2>&1; ck "an unknown option: exit 2" $? 2
 $s2 test --format yaml specs > /dev/null 2>&1; ck "a bad format: exit 2" $? 2
 $s2 test empty > /dev/null 2>&1; ck "a directory without specs: exit 2" $? 2
 $s2 test nope-spec.fib > /dev/null 2>&1; ck "a path that is not there: exit 2" $? 2
+# -I (LIBFIX-1): `test` passes each -I DIR to its children as module roots, and a -I DIR that holds a prelude.fib is also the library (FIB_LIB's meaning, taken when
+# FIB_LIB is unset), so a spec runs from any directory with `-I /path/to/lib`; before, the prelude was read from `lib/` of the working directory and a spec outside
+# the repository failed with "cannot read lib/prelude.fib". The planted faults: the same run without -I (must fail, status 2), and a module root that is not given (the
+# spec requires a module that lives only under the second -I).
+mkdir -p "$t/extra/helper" "$t/away"
+printf '(ns helper.greet)\n(defun greeting () -> str "hello")\n' > "$t/extra/helper/greet.fib"
+cat > "$t/away/uses-spec.fib" <<'EOF'
+(ns main (:use fib.test.core fib.test.run) (:require [helper.greet :as g]))
+(defspecs specs
+  (feature "Roots"
+    (scenario "a module from the second -I" (then (expect = "hello" (g/greeting))))))
+(defun main () -> i64 (run-main (specs)))
+EOF
+(unset FIB_LIB; cd "$t/away" && $s2 test -I "$root/lib" -I "$t/extra" uses-spec.fib > "$t/away.out" 2>&1); ck "-I lib and -I DIR from another directory, FIB_LIB unset: exit 0" $? 0
+(unset FIB_LIB; cd "$t/away" && $s2 test uses-spec.fib > /dev/null 2>&1); ck "the same without -I: exit 2 (no library, no module root)" $? 2
+(unset FIB_LIB; cd "$t/away" && $s2 test -I "$root/lib" uses-spec.fib > /dev/null 2>&1); ck "with the library but without the module root: exit 2" $? 2
 echo "test-cmd: $([ $fail = 0 ] && echo ok || echo FAILED)"
 exit $fail

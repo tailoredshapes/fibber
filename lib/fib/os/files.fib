@@ -19,10 +19,12 @@
   (if (or (< mode 0) (> mode 4095)) (Err (invalid-input "mkdir" "invalid directory mode"))
       (checked-unit (sys-mkdir path mode) "mkdir")))
 (defun remove-directory (path: str) -> (Result unit OSError) (checked-unit (sys-rmdir path) "rmdir"))
+;; Chunks of 64 KiB appended to a growing array: `array-push!` doubles the room of an array of 32 or more elements, so the whole read is linear
+;; (it copied on every push, and a 1.6 MB file took 40 s: LIBFIX-1, cases/stdlib/8100).
 (defun read-open :private (fd: i64 limit: i64) -> (Result (Array i8) OSError)
   (let [out (cell (array 0 0i8))]
     (loop []
-      (match (io/read-fd fd (min 4096 (+ 1 (- limit (array-len @out)))))
+      (match (io/read-fd fd (min 65536 (+ 1 (- limit (array-len @out)))))
         ((Err error) (if (= (. error kind) Interrupted) (recur) (Err error)))
         ((Ok bytes)
           (cond (= (array-len bytes) 0) (Ok @out)

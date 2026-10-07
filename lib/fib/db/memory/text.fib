@@ -17,12 +17,16 @@
 (defun space? (c: i64) -> bool (or (= c 32) (= c 10) (= c 9) (= c 13)))
 (defun punct? (c: i64) -> bool (or (= c 40) (= c 41) (= c 44) (= c 63) (= c 61) (= c 60) (= c 62) (= c 33)))
 
+;; ASCII letters lower-cased; the runs between them are copied by byte range (an index here is a byte, so `subs`, which counts characters, was wrong
+;; for a non-ASCII word, and the one-byte slice of a lead byte is not a string).
 (defun lower (s: str) -> str
-  (loop [i 0 out ""]
+  (loop [i 0 start 0 out ""]
     (if (>= i (str-len s))
-        out
+        (str out (str-slice s start i))
         (let [c (byte-at s i)]
-          (recur (+ i 1) (str out (if (and (>= c 65) (<= c 90)) (subs "abcdefghijklmnopqrstuvwxyz" (- c 65) (- c 64)) (subs s i (+ i 1)))))))))
+          (if (and (>= c 65) (<= c 90))
+              (recur (+ i 1) (+ i 1) (str out (str-slice s start i) (str-slice "abcdefghijklmnopqrstuvwxyz" (- c 65) (- c 64))))
+              (recur (+ i 1) start out))))))
 
 (defun word-end (s: str i: i64) -> i64
   (loop [j i]
@@ -38,8 +42,8 @@
                   (= c 63) (recur (+ i 1) (conj out (str "?" q)) (+ q 1))
                   (punct? c) (let [two (and (< (+ i 1) n) (= (byte-at sql (+ i 1)) 61) (or (= c 62) (= c 60) (= c 33)))
                                    w (if two 2 1)]
-                               (recur (+ i w) (conj out (subs sql i (+ i w))) q))
-                  :else (let [e (word-end sql i)] (recur e (conj out (lower (subs sql i e))) q))))))))
+                               (recur (+ i w) (conj out (str-slice sql i (+ i w))) q))
+                  :else (let [e (word-end sql i)] (recur e (conj out (lower (str-slice sql i e))) q))))))))
 
 (defun tok-index (toks: (Vec str) w: str from: i64) -> i64
   (loop [i from] (cond (>= i (count toks)) -1 (= (nth toks i) w) i :else (recur (+ i 1)))))
@@ -56,7 +60,7 @@
 
 ;; ---- values
 (defun param-or-literal (t: str params: (Vec Datum)) -> (Result Datum DbError)
-  (cond (starts-with? t "?") (match (parse-long (subs t 1 (str-len t)))
+  (cond (starts-with? t "?") (match (parse-long (str-slice t 1 (str-len t)))
                                ((some k) (if (< k (count params)) (Ok (stored (nth params k))) (Err (DbError "07001" 0 "memory: too few parameters"))))
                                (nil (Err (syntax t))))
         (= t "null") (Ok DNil)
