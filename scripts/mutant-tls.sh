@@ -33,7 +33,7 @@ sub() { # sub FILE PERL-SUBSTITUTION: a pattern that is not found is a setup err
 apply() { # apply DIR MUTANT -> echoes the specs that must kill it
   local t=$1/fib/tls
   case $2 in
-    skip-hostname)    sub $t/chain.fib 's/\(cond \(host-matches\? host \(\. ex san-dns\) \(\. ex san-ip\)\) \(Ok \(\)\)/(cond true (Ok ())/'; echo specs/tls-chain-spec.fib ;;
+    skip-hostname)    sub $t/chain.fib 's/\(cond \(host-matches\? host \(\. ex san-dns\) \(\. ex san-ip\)\) \(Ok \(\)\)/(cond (or true (host-matches? host (. ex san-dns) (. ex san-ip))) (Ok ())/'; echo specs/tls-chain-spec.fib ;;
     skip-chain-sigs)  sub $t/chain.fib 's/\(c\/verify-signature p \(\. issuer spki\) s \(\. cert tbs\) \(\. cert signature\)\)/(Ok ())/'; echo tls-specs/tls-chain-real-spec.fib ;;
     accept-expired)   sub $t/chain.fib 's/\(> now \(\. x not-after\)\) \(Err/(> now (+ (. x not-after) 99999999999)) (Err/'; echo specs/tls-chain-spec.fib ;;
     ignore-pathlen)   sub $t/chain.fib 's/\(and \(>= \(\. ex path-len\) 0\) \(> below \(\. ex path-len\)\)\)/(and false (> below (. ex path-len)))/'; echo specs/tls-chain-spec.fib ;;

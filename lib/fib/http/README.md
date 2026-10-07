@@ -2,7 +2,7 @@
 
 `fib.http` supplies common values and helpers, `fib.http.server` a Ring-style HTTP/1.1 server and `fib.http.client` a Hato-style client. Both are
 native: one message layer (RFC 9112) over a `Transport` seam, plain TCP built on [fib.os](../os/README.md) (`fib.os.net`: sockets, poll, getaddrinfo).
-There is no libcurl and no native library to link; a program that uses them builds with `fibc build` (and `--static`). TLS is the next package:
+There is no libcurl and no native library to link; a program that uses them builds with `fibc build` (and `--static`). TLS is `fib.tls` (lib/fib/tls/README.md, UNAUDITED): `(tls/https-options options provider trust)` registers it;
 until a TLS `Transport` factory is registered an `https` URL is a typed error (`TlsUnsupported`), never a plain-text request. Native execution is
 tested on Linux LP64; the Darwin backend of `fib.os` is checked separately and not run. The architecture, limits and what is deferred are in
 [docs/design/http.md](../../../docs/design/http.md).

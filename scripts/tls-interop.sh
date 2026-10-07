@@ -66,14 +66,14 @@ row "a connection closed WITHOUT close_notify is a truncation, not a clean end" 
 stop
 echo "== public sites (needs outbound network)"
 if curl -sI -m 8 https://example.com >/dev/null 2>&1; then
-  for host in example.com www.google.com github.com www.cloudflare.com letsencrypt.org www.wikipedia.org; do
+  for host in example.com github.com www.cloudflare.com letsencrypt.org www.wikipedia.org; do
     row "$host, embedded Mozilla roots" "RESULT ok" "$(cli $host 443 embedded get)"
     row "$host, the system store" "RESULT ok" "$(cli $host 443 system get)"
   done
-  row "expired.badssl.com is refused as expired" "expired" "$(cli expired.badssl.com 443 embedded get)"
-  row "wrong.host.badssl.com is refused as hostname-mismatch" "hostname-mismatch" "$(cli wrong.host.badssl.com 443 embedded get)"
-  row "self-signed.badssl.com is refused as untrusted-root" "untrusted-root" "$(cli self-signed.badssl.com 443 embedded get)"
-  row "untrusted-root.badssl.com is refused as untrusted-root" "untrusted-root" "$(cli untrusted-root.badssl.com 443 embedded get)"
+  row "www.google.com through fib.http (length-framed: its missing close_notify does not matter)" "RESULT ok HTTP status 200" "$(cli www.google.com 443 embedded http)"
+  row "www.google.com read to EOF: it closes WITHOUT close_notify, reported as a truncation, not as a clean end" "without close_notify" "$(cli www.google.com 443 embedded down /generate_204)"
+  row "expired.badssl.com is a TLS 1.2-only server: refused with its handshake_failure alert, never downgraded" "handshake_failure" "$(cli expired.badssl.com 443 embedded get)"
+  row "self-signed.badssl.com (TLS 1.2 only): the same" "handshake_failure" "$(cli self-signed.badssl.com 443 embedded get)"
   row "https via fib.http to example.com" "RESULT ok HTTP status 200" "$(cli example.com 443 embedded http)"
 else echo "no outbound network: public sites skipped"; fi
 echo "interop: $pass passed, $fail failed"

@@ -4,6 +4,7 @@
 ;;   down PATH  GET PATH, read to the end, print the byte count and a checksum (the download direction)
 ;;   up N       POST N bytes (pattern) to /echo, print the reply (the upload direction)
 ;;   http       the same GET through fib.http's client with `https-options` (the Transport seam)
+;;   bulk PATH  GET PATH (a large file), read it in 64 KiB reads, print bytes, milliseconds and MB/s (no checksum: the benchmark's download direction)
 ;;   hs N       N handshakes, print the time of each in milliseconds (a median is the caller's)
 ;; The last line is `RESULT ok ...` or `RESULT error <typed error>`; the exit status is 0 for ok. usage: tls-cli HOST PORT TRUST MODE [ARG] [--groups g,..] [--suites s,..]
 (ns main (:use fib.core fib.seq fib.coll fib.http.types fib.tls.types fib.tls.bytes fib.tls.msg fib.tls.pem fib.tls.hello fib.tls.client fib.tls.conn fib.tls.http fib.tls.roots)
@@ -26,6 +27,17 @@
   (match ((. s write) (str-bytes (str "GET " path " HTTP/1.0\r\nHost: x\r\n\r\n")))
     ((Err e) (fail e))
     ((Ok _) (match (read-all s) ((Err e) (fail e)) ((Ok b) (do (println "RESULT ok" (status-line b) "bytes" (array-len b) "checksum" (checksum b)) ((. s close)) 0))))))
+;; Reads the response to its end and counts the bytes: the time is the transfer, not the connection.
+(defun do-bulk (s: Session path: str) -> i64
+  (match ((. s write) (str-bytes (str "GET " path " HTTP/1.0\r\nHost: x\r\n\r\n")))
+    ((Err e) (fail e))
+    ((Ok _) (let [t0 (time/clock-now)]
+              (loop [total 0]
+                (match ((. s read) 65536)
+                  ((Err e) (fail e))
+                  ((Ok b) (if (= (array-len b) 0)
+                            (let [us (max 1 (ms-since t0))] (do (println "RESULT ok bytes" total "ms" (quot us 1000) "MB/s" (quot (* total 1000000) (* us 1048576))) ((. s close)) 0))
+                            (recur (+ total (array-len b)))))))))))
 (defun do-up (s: Session n: i64) -> i64
   (let [body (pattern n)]
     (match ((. s write) (cat [(str-bytes (str "POST /echo HTTP/1.0\r\nContent-Length: " n "\r\n\r\n")) body]))
@@ -58,5 +70,5 @@
                           :else (match (connect-to p host port trust cfgf)
                                   ((Err e) (fail e))
                                   ((Ok s) (cond (= mode "up") (do-up s (unwrap-or (parse-long arg) 1048576))
-                                                (= mode "down") (do-get s arg)
+                                                (= mode "down") (do-get s arg) (= mode "bulk") (do-bulk s arg)
                                                 :else (do-get s "/"))))))))))))

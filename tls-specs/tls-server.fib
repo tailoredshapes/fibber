@@ -20,6 +20,9 @@
 (defun take-out (w: Wire n: i64) -> (Array i8) (let [b @(. w out) k (min n (array-len b))] (do (set! (. w out) (drop-bytes b k)) (slice b 0 k))))
 (defun take-sink (w: Wire n: i64) -> (Array i8) (let [b @(. w sink) k (min n (array-len b))] (do (set! (. w sink) (drop-bytes b k)) (slice b 0 k))))
 (defun flip-at (b: (Array i8) i: i64) -> (Array i8) (let [c (cell b)] (do (array-set! &c i (trunc i8 (bit-xor (b-at b i) 1))) @c)))
+;; The signed content of RFC 8446 4.4.3, written out here again (not the library's function) so that a fault in the library's context string is not mirrored by this server.
+(defun cv-content (server: bool th: (Array i8)) -> (Array i8)
+  (cat [(repeat-bytes 32 64) (ascii (if server "TLS 1.3, server CertificateVerify" "TLS 1.3, client CertificateVerify")) (w8 0) th]))
 (defun flip-last (b: (Array i8)) -> (Array i8) (flip-at b (- (array-len b) 1)))
 (defun orx (r: (Result x CryptoError)) -> (Result x TlsError) (lift r))
 
@@ -51,7 +54,7 @@
         cr? (= (. sc tamper) :cert-request) cert (cert-message (. sc chain))
         t1 (cat [tr ee (if cr? cr (empty-bytes)) cert])]
     (try-let [key (orx (c/import-private-key p :p-256 (. sc key))) th-cert (transcript-hash p suite (if (= (. sc tamper) :transcript) (cat [tr (if cr? cr (empty-bytes)) cert]) t1))
-              sig (orx (private-key-sign key :ecdsa-p256-sha256 (certificate-verify-content (not (= (. sc tamper) :cv-context)) th-cert)))]
+              sig (orx (private-key-sign key :ecdsa-p256-sha256 (cv-content (not (= (. sc tamper) :cv-context)) th-cert)))]
       (let [cv (hs-wrap ht-certificate-verify (cat [(w16 1027) (vec16 sig)])) t2 (cat [t1 cv])]
         (try-let [th-cv (transcript-hash p suite t2) fin-data (finished-verify-data p suite (. s-hs secret) th-cv)]
           (let [fin (hs-wrap ht-finished fin-data)
