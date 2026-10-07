@@ -66,7 +66,7 @@ try:
         try:
             if ask({'op': 'ping'}, timeout=5): up = True; break
         except Exception: time.sleep(0.2)
-    check('server starts and answers ping', up, 'no answer; log: ' + open(os.path.join(work, 'server.log')).read()[:300])
+    check('server starts and answers ping', up, 'no answer; server exit status %r (None: still running); socket exists %r; log: %s' % (srv.poll(), os.path.exists(sock), open(os.path.join(work, 'server.log')).read()[:300]))
     if not up: raise SystemExit(1)
 
     # ---- protocol
