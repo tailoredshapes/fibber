@@ -1,0 +1,103 @@
+;; fib.tls.x509-base: the small value types of a certificate: times (RFC 5280 4.1.2.5), distinguished names and their comparison (RFC 5280 7.1),
+;; and the algorithm identifiers (OIDs) of signatures and keys. Reading only; the checks that use them are in fib.tls.chain.
+(ns fib.tls.x509-base (:use fib.core fib.seq fib.coll fib.tls.types fib.tls.bytes fib.tls.asn1))
+
+;; ---- time. Seconds since 1970-01-01T00:00:00Z (no leap seconds, as POSIX).
+(defun days-from-civil :private (y0: i64 m: i64 d: i64) -> i64
+  (let [y (if (<= m 2) (- y0 1) y0)
+        era (quot (if (>= y 0) y (- y 399)) 400)
+        yoe (- y (* era 400))
+        doy (+ (quot (+ (* 153 (if (> m 2) (- m 3) (+ m 9))) 2) 5) (- d 1))
+        doe (+ (* yoe 365) (- (quot yoe 4) (quot yoe 100)) doy)]
+    (+ (* era 146097) doe -719468)))
+(defun leap? :private (y: i64) -> bool (and (= (rem y 4) 0) (or (not (= (rem y 100) 0)) (= (rem y 400) 0))))
+(defun month-days :private (y: i64 m: i64) -> i64
+  (cond (= m 2) (if (leap? y) 29 28) (includes? m [4 6 9 11]) 30 :else 31))
+(defun digits :private (b: (Array i8) from: i64 n: i64) -> i64
+  (loop [k 0 acc 0]
+    (if (= k n) acc
+      (let [c (b-at b (+ from k))] (if (and (>= c 48) (<= c 57)) (recur (+ k 1) (+ (* acc 10) (- c 48))) -1)))))
+(defun civil-seconds :private (y: i64 mo: i64 d: i64 h: i64 mi: i64 s: i64) -> (Result i64 TlsError)
+  (if (or (< y 0) (< mo 1) (> mo 12) (< d 1) (> d (month-days y mo)) (< h 0) (> h 23) (< mi 0) (> mi 59) (< s 0) (> s 59))
+    (Err (parse-err "time: a field is out of range"))
+    (Ok (+ (* 86400 (days-from-civil y mo d)) (+ (* 3600 h) (+ (* 60 mi) s))))))
+;; UTCTime is YYMMDDHHMMSSZ exactly (years 50-99 are 19xx, 00-49 are 20xx); GeneralizedTime is YYYYMMDDHHMMSSZ exactly. (RFC 5280 reserves GeneralizedTime for
+;; years from 2050; real roots break that, as OpenSSL and Go accept them, so do we: documented deviation.) Seconds are present, the zone is Z, there is no fraction.
+(defun der-time (t: Tlv) -> (Result i64 TlsError)
+  (let [b (. t src) o (. t off) n (tlv-len t)]
+    (cond (and (= (. t tag) tag-utctime) (= n 13) (= (b-at b (+ o 12)) 90))
+            (let [yy (digits b o 2) y (if (>= yy 50) (+ 1900 yy) (+ 2000 yy))]
+              (if (= yy -1) (Err (parse-err "time: not digits")) (civil-seconds-at b (+ o 2) y)))
+          (and (= (. t tag) tag-gentime) (= n 15) (= (b-at b (+ o 14)) 90))
+            (let [y (digits b o 4)]
+              (cond (= y -1) (Err (parse-err "time: not digits"))
+                    (< y 1950) (Err (parse-err "time: a GeneralizedTime before 1950"))
+                    :else (civil-seconds-at b (+ o 4) y)))
+          :else (Err (parse-err "time: not a UTCTime or GeneralizedTime in the DER form")))))
+(defun civil-seconds-at :private (b: (Array i8) o: i64 y: i64) -> (Result i64 TlsError)
+  (let [mo (digits b o 2) d (digits b (+ o 2) 2) h (digits b (+ o 4) 2) mi (digits b (+ o 6) 2) s (digits b (+ o 8) 2)]
+    (if (or (< mo 0) (< d 0) (< h 0) (< mi 0) (< s 0)) (Err (parse-err "time: not digits")) (civil-seconds y mo d h mi s))))
+
+;; ---- names
+;; `raw` is the DER of the Name; `canon` is its comparison form: per attribute, the type OID and the value with ASCII letters lower-cased, leading and
+;; trailing spaces removed and inner runs of spaces made one (RFC 5280 7.1 / RFC 4518's needs, for the string types UTF8String, PrintableString, IA5String,
+;; TeletexString); other string types compare as their bytes. The values of a multi-valued RDN are sorted. No Unicode case folding or normalisation is done: two
+;; names that differ only by it do not match, which refuses a chain, never accepts one.
+(defstruct Name (raw: (Array i8) canon: (Array i8) empty: bool))
+
+(defun fold-text :private (b: (Array i8)) -> (Array i8)
+  (let [out (cell (array (array-len b) 0i8))
+        n (loop [i 0 j 0 sp false]
+            (if (= i (array-len b)) j
+              (let [c (b-at b i) lc (if (and (>= c 65) (<= c 90)) (+ c 32) c)]
+                (cond (= c 32) (recur (+ i 1) j (> j 0))
+                      :else (let [j2 (if sp (do (array-set! &out j 32i8) (+ j 1)) j)]
+                              (do (array-set! &out j2 (trunc i8 lc)) (recur (+ i 1) (+ j2 1) false)))))))]
+    (slice @out 0 n)))
+(defun string-tag? :private (tag: i64) -> bool (includes? tag [12 19 22 20 18 26]))
+(defun ava-canon :private (t: Tlv) -> (Result (Array i8) TlsError)
+  (try-let [ks (der-seq-kids t "AttributeTypeAndValue")]
+    (if (not (= (count ks) 2)) (Err (parse-err "name: an attribute is a type and a value"))
+      (try-let [oid (der-oid (nth ks 0))]
+        (let [v (nth ks 1)]
+          (Ok (cat [(vec16 (ascii oid)) (vec16 (if (string-tag? (. v tag)) (fold-text (tlv-content v)) (cat [(w8 (. v tag)) (tlv-content v)])))])))))))
+(defun sort-bytes :private (xs: (Vec (Array i8))) -> (Vec (Array i8))
+  (vec (sort-by (fn (b: (Array i8)) (hex-of b)) xs)))
+(defun rdn-canon :private (t: Tlv) -> (Result (Array i8) TlsError)
+  (if (not (= (. t tag) tag-set)) (Err (parse-err "name: a relative name is a SET"))
+    (try-let [ks (der-kids t)]
+      (if (= (count ks) 0) (Err (parse-err "name: an empty relative name"))
+        (loop [i 0 acc []]
+          (if (= i (count ks)) (Ok (vec16 (cat (sort-bytes acc))))
+            (match (ava-canon (nth ks i)) ((Err e) (Err e)) ((Ok c) (recur (+ i 1) (conj acc c))))))))))
+(defun parse-name (t: Tlv) -> (Result Name TlsError)
+  (try-let [ks (der-seq-kids t "Name")]
+    (loop [i 0 acc []]
+      (if (= i (count ks)) (Ok (Name (tlv-raw t) (cat acc) (= (count ks) 0)))
+        (match (rdn-canon (nth ks i)) ((Err e) (Err e)) ((Ok c) (recur (+ i 1) (conj acc c))))))))
+(defun name-eq? (a: Name b: Name) -> bool
+  (or (bytes-eq? (. a raw) (. b raw)) (bytes-eq? (. a canon) (. b canon))))
+
+;; ---- algorithms. The OIDs are public identifiers (RFC 8017, 5480, 8410), the facts of a format.
+(defstruct AlgId (oid: str has-params: bool params-null: bool raw: (Array i8)))
+(defun parse-alg (t: Tlv) -> (Result AlgId TlsError)
+  (try-let [ks (der-seq-kids t "AlgorithmIdentifier")]
+    (cond (or (= (count ks) 0) (> (count ks) 2)) (Err (parse-err "AlgorithmIdentifier: one OID and optional parameters"))
+          :else (try-let [oid (der-oid (nth ks 0))]
+                  (Ok (AlgId oid (= (count ks) 2)
+                             (and (= (count ks) 2) (= (. (nth ks 1) tag) tag-null) (= (tlv-len (nth ks 1)) 0)) (tlv-raw t)))))))
+
+;; The signature scheme (a `fib.crypto` verify scheme keyword) of a certificate signature algorithm, or `:weak-NAME` for SHA-1, MD5 and MD2 (refused
+;; as weak), or `:unknown`. RSA PKCS#1 needs NULL parameters (RFC 4055 5); ECDSA and Ed25519 have none (RFC 5758 3.2, RFC 8410 3).
+(defun sig-scheme (a: AlgId) -> keyword
+  (let [o (. a oid) null? (and (. a has-params) (. a params-null)) none? (not (. a has-params))]
+    (cond (= o "1.2.840.113549.1.1.11") (if null? :rsa-pkcs1-sha256 :unknown)
+          (= o "1.2.840.113549.1.1.12") (if null? :rsa-pkcs1-sha384 :unknown)
+          (= o "1.2.840.113549.1.1.13") (if null? :rsa-pkcs1-sha512 :unknown)
+          (= o "1.2.840.10045.4.3.2") (if none? :ecdsa-p256-sha256 :unknown)
+          (= o "1.2.840.10045.4.3.3") (if none? :ecdsa-p384-sha384 :unknown)
+          (= o "1.3.101.112") (if none? :ed25519 :unknown)
+          (= o "1.2.840.113549.1.1.5") :weak-sha1-rsa (= o "1.2.840.10045.4.1") :weak-sha1-ecdsa (= o "1.2.840.113549.1.1.4") :weak-md5-rsa
+          (= o "1.2.840.113549.1.1.2") :weak-md2-rsa (= o "1.2.840.10040.4.3") :weak-sha1-dsa (= o "1.2.840.113549.1.1.14") :weak-sha224-rsa
+          :else :unknown)))
+(defun weak-scheme? (s: keyword) -> bool (includes? s [:weak-sha1-rsa :weak-sha1-ecdsa :weak-md5-rsa :weak-md2-rsa :weak-sha1-dsa :weak-sha224-rsa]))

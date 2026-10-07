@@ -1,0 +1,54 @@
+;; fib.tls.pem: PEM (RFC 7468) to DER, and a trust store as a VALUE. `pem-blocks` returns the decoded body of every block with a given label
+;; (CERTIFICATE) found in the bytes; text between blocks is ignored (the bundles carry titles); a block that does not end, or whose body is not base64 (no
+;; characters outside the alphabet except line breaks and spaces), is an error. A `TrustStore` is parsed certificates: where they come from (a file the
+;; client factory reads, a PEM text, the embedded fib.tls.roots) is the caller's choice. Nothing here reads the file system.
+(ns fib.tls.pem (:use fib.core fib.seq fib.coll fib.tls.types fib.tls.bytes fib.tls.x509) (:require [fib.crypto :as c]))
+
+(defun find-sub (hay: (Array i8) needle: (Array i8) from: i64) -> i64
+  (let [n (array-len needle) lim (- (array-len hay) n)]
+    (loop [i from]
+      (cond (> i lim) -1
+            (loop [k 0] (cond (= k n) true (= (array-get hay (+ i k)) (array-get needle k)) (recur (+ k 1)) :else false)) i
+            :else (recur (+ i 1))))))
+
+(defun squeeze :private (b: (Array i8)) -> (Array i8)
+  (let [out (cell (array (array-len b) 0i8))
+        n (loop [i 0 j 0]
+            (if (= i (array-len b)) j
+              (let [x (b-at b i)]
+                (if (or (= x 10) (= x 13) (= x 32) (= x 9)) (recur (+ i 1) j) (do (array-set! &out j (array-get b i)) (recur (+ i 1) (+ j 1)))))))]
+    (slice @out 0 n)))
+
+(defun decode-body :private (b: (Array i8)) -> (Result (Array i8) TlsError)
+  (match (c/unbase64 (str-from-bytes (squeeze b)))
+    ((Err _) (Err (parse-err "PEM: the body is not base64")))
+    ((Ok d) (Ok d))))
+
+(defun pem-blocks (text: (Array i8) label: str) -> (Result (Vec (Array i8)) TlsError)
+  (let [begin (ascii "-----BEGIN ") end (ascii "-----END ") dashes (ascii "-----")]
+    (loop [pos 0 acc []]
+      (let [i (find-sub text begin pos)]
+        (if (= i -1) (Ok acc)
+          (let [l0 (+ i (array-len begin)) l1 (find-sub text dashes l0)]
+            (if (= l1 -1) (Err (parse-err "PEM: an unterminated BEGIN line"))
+              (let [name (str-from-bytes (slice text l0 l1)) b0 (+ l1 5) e (find-sub text end b0)]
+                (if (= e -1) (Err (parse-err "PEM: a block without END"))
+                  (let [e1 (find-sub text dashes (+ e (array-len end)))]
+                    (if (= e1 -1) (Err (parse-err "PEM: an unterminated END line"))
+                      (if (= name label)
+                        (match (decode-body (slice text b0 e)) ((Err x) (Err x)) ((Ok d) (recur (+ e1 5) (conj acc d))))
+                        (recur (+ e1 5) acc)))))))))))))
+
+;; ---- trust store
+(defstruct TrustStore (anchors: (Vec Cert)))
+(defun empty-trust () -> TrustStore (TrustStore []))
+(defun trust-count (s: TrustStore) -> i64 (count (. s anchors)))
+(defun trust-add (s: TrustStore c: Cert) -> TrustStore (TrustStore (conj (. s anchors) c)))
+(defun trust-from-ders (ders: (Vec (Array i8))) -> (Result TrustStore TlsError)
+  (loop [i 0 acc []]
+    (if (= i (count ders)) (Ok (TrustStore acc))
+      (match (parse-certificate (nth ders i)) ((Err e) (Err e)) ((Ok c) (recur (+ i 1) (conj acc c)))))))
+;; Every CERTIFICATE block of a PEM text is a trust anchor; one that does not parse refuses the whole store (a store that silently lost a root
+;; would be a different store).
+(defun trust-from-pem (text: (Array i8)) -> (Result TrustStore TlsError)
+  (match (pem-blocks text "CERTIFICATE") ((Err e) (Err e)) ((Ok ders) (trust-from-ders ders))))

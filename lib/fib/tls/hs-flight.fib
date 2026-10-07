@@ -1,0 +1,97 @@
+;; fib.tls.hs-flight: the second half of the client handshake (fib.tls.hs is the first): the key schedule after the ServerHello, the server's encrypted flight
+;; (EncryptedExtensions, CertificateRequest, Certificate, CertificateVerify, Finished) and the client's answer. The transcript is the bytes of every handshake message
+;; in order (with the HelloRetryRequest replacement of RFC 8446 4.4.1); it is hashed whenever a secret or a signature needs it.
+(ns fib.tls.hs-flight (:use fib.core fib.seq fib.coll fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.msg fib.tls.msg-parse fib.tls.keys fib.tls.record fib.tls.hello
+                            fib.tls.hs fib.tls.x509)
+  (:require [fib.crypto :as c]))
+
+;; What a published trace pins: the secrets (RFC 8446 7.1) and the values the Finished messages cover.
+(defstruct Trace (suite: Suite shared: (Array i8) handshake: (Array i8) c-hs: (Array i8) s-hs: (Array i8) master: (Array i8) c-ap: (Array i8) s-ap: (Array i8)
+                  th-hello: (Array i8) th-server-finished: (Array i8) client-finished: (Array i8)))
+(defstruct HsDone (suite: Suite alpn: (Option str) leaf: Cert ap-read: Traffic ap-write: Traffic trace: Trace))
+(defstruct KeyOut (suite: Suite shared: (Array i8) handshake: (Array i8) c-hs: Traffic s-hs: Traffic th-hello: (Array i8)))
+
+;; ---- keys from the ServerHello: the shared secret (the private half is closed), then the handshake traffic keys of both directions
+(defun agree :private (hs: Hs st: Start sh: ServerHello) -> (Result (Array i8) TlsError)
+  (if (not (= (array-len (. sh share)) (raw-share-length (. st kind)))) (Err (proto-alert 47 "the server's key share has the wrong length for its group"))
+    (match @(. hs key)
+      (nil (Err (hs-fail 80 "no key share to agree with")))
+      ((some k) (let [r (private-key-agree k (. sh share))]
+                  (do (close-key hs)
+                      (match r ((Ok s) (Ok s)) ((Err e) (Err (if (unsupported? e) (from-crypto e) (proto-alert 47 (str "the server's key share is refused: " (. e message)))))))))))))
+(defun key-stage (p: p hs: Hs out: HelloOut) :where ((CryptoProvider p)) -> (Result KeyOut TlsError)
+  (let [s (. out suite)]
+    (try-let [shared (agree hs (. out st) (. out sh)) early (early-secret p s) hsec (handshake-secret p s early shared) th (th-now p hs s)
+              c-secret (derive-secret p s hsec "c hs traffic" th) s-secret (derive-secret p s hsec "s hs traffic" th)
+              c-hs (traffic-of p s c-secret) s-hs (traffic-of p s s-secret)
+              _ (if (message-boundary? (. hs rec)) (Ok ()) (Err (proto-alert 10 "handshake data follows the ServerHello in its record")))
+              _ (send-ccs hs (. out st))]
+      (do (set-read-keys (. hs rec) (. s aead) s-hs) (set-write-keys (. hs rec) (. s aead) c-hs)
+          (Ok (KeyOut s shared hsec c-hs s-hs th))))))
+
+;; ---- the server's flight
+(defstruct Certs (request: (Option (Array i8)) chain: (Vec Cert)))
+(defstruct Flight (alpn: (Option str) leaf: Cert request: (Option (Array i8))))
+
+(defun certs-of :private (m: HsMsg) -> (Result (Vec Cert) TlsError)
+  (try-let [ders (parse-certificate-msg (. m body))]
+    (if (= (count ders) 0) (Err (bad-cert CertBadChain "the server sent no certificate"))
+      (loop [i 0 acc []]
+        (if (= i (count ders)) (Ok acc)
+          (match (parse-der (nth ders i)) ((Err e) (Err e)) ((Ok c) (recur (+ i 1) (conj acc c)))))))))
+(defun parse-der :private (der: (Array i8)) -> (Result Cert TlsError) (parse-certificate der))
+(defun read-certs :private (p: p hs: Hs) :where ((CryptoProvider p)) -> (Result Certs TlsError)
+  (try-let [m (next-message p (. hs rec))]
+    (if (= (. m type) ht-certificate-request)
+      (try-let [ctx (parse-certificate-request (. m body)) _ (Ok (add-transcript hs (. m raw))) m2 (read-msg p hs ht-certificate "the Certificate") chain (certs-of m2)]
+        (do (add-transcript hs (. m2 raw)) (Ok (Certs (some ctx) chain))))
+      (try-let [m2 (expect-msg m ht-certificate "the Certificate") chain (certs-of m2)]
+        (do (add-transcript hs (. m2 raw)) (Ok (Certs nil chain)))))))
+
+(defun sig-alg-of :private (o: Offer wire: i64) -> (Option SigAlg) (first (filter (fn (a: SigAlg) (= (. a wire) wire)) (. o cv-sigs))))
+(defun check-verify :private (p: p hs: Hs leaf: Cert th-cert: (Array i8)) :where ((CryptoProvider p)) -> (Result unit TlsError)
+  (try-let [m (read-msg p hs ht-certificate-verify "the CertificateVerify") cv (parse-certificate-verify (. m body))]
+    (match (sig-alg-of (. @(. hs start) offer) (. cv fst))
+      (nil (Err (proto-alert 47 "CertificateVerify uses a signature scheme that was not offered")))
+      ((some alg)
+        (if (not (= (. leaf key-kind) (. alg key))) (Err (proto-alert 47 "the CertificateVerify scheme does not fit the certificate's key"))
+          (try-let [_ ((. (. hs hooks) verify-cv) (. leaf spki) (. alg scheme) (certificate-verify-content true th-cert) (. cv snd))]
+            (Ok (add-transcript hs (. m raw)))))))))
+(defun check-finished :private (p: p hs: Hs ko: KeyOut) :where ((CryptoProvider p)) -> (Result unit TlsError)
+  (try-let [m (read-msg p hs ht-finished "the server's Finished") th (th-now p hs (. ko suite))
+            expected (finished-verify-data p (. ko suite) (. (. ko s-hs) secret) th)]
+    (if (c/ct= p expected (. m body)) (Ok (add-transcript hs (. m raw))) (Err (hs-fail 51 "the server's Finished does not verify")))))
+
+(defun server-flight (p: p hs: Hs ko: KeyOut) :where ((CryptoProvider p)) -> (Result Flight TlsError)
+  (try-let [ee (read-msg p hs ht-encrypted-extensions "EncryptedExtensions") alpn (parse-encrypted-extensions (. ee body) (. (. hs cfg) alpn))
+            _ (Ok (add-transcript hs (. ee raw))) cs (read-certs p hs) leaf ((. (. hs hooks) validate) (. cs chain)) th-cert (th-now p hs (. ko suite))
+            _ (check-verify p hs leaf th-cert) _ (check-finished p hs ko)]
+    (Ok (Flight alpn leaf (. cs request)))))
+
+;; ---- the client's answer and the application keys
+(defun finish (p: p hs: Hs ko: KeyOut fl: Flight) :where ((CryptoProvider p)) -> (Result HsDone TlsError)
+  (let [s (. ko suite) rec (. hs rec)]
+    (try-let [th-sf (th-now p hs s) master (master-secret p s (. ko handshake))
+              c-secret (derive-secret p s master "c ap traffic" th-sf) s-secret (derive-secret p s master "s ap traffic" th-sf)
+              c-ap (traffic-of p s c-secret) s-ap (traffic-of p s s-secret)
+              _ (if (message-boundary? rec) (Ok ()) (Err (proto-alert 10 "handshake data follows the server's Finished")))
+              _ (do (set-read-keys rec (. s aead) s-ap) (send-request-answer p hs (. fl request)))
+              th-cf (th-now p hs s) verify (finished-verify-data p s (. (. ko c-hs) secret) th-cf)
+              _ (send p rec ct-handshake (finished-message verify))]
+      (do (set-write-keys rec (. s aead) c-ap) (set! (. rec handshaking) false)
+          (Ok (HsDone s (. fl alpn) (. fl leaf) s-ap c-ap
+                      (Trace s (. ko shared) (. ko handshake) (. (. ko c-hs) secret) (. (. ko s-hs) secret) master c-secret s-secret (. ko th-hello) th-sf verify)))))))
+;; A CertificateRequest is answered with an empty Certificate (RFC 8446 4.4.2): this client has no certificate.
+(defun send-request-answer :private (p: p hs: Hs request: (Option (Array i8))) :where ((CryptoProvider p)) -> (Result unit TlsError)
+  (match request
+    (nil (Ok ()))
+    ((some ctx) (let [m (empty-certificate-message ctx)] (do (add-transcript hs m) (send p (. hs rec) ct-handshake m))))))
+
+;; The whole run. Whatever the outcome, the private key share is closed.
+(defun run-handshake (p: p hs: Hs) :where ((CryptoProvider p)) -> (Result HsDone TlsError)
+  (let [r (run-inner p hs)] (do (close-key hs) r)))
+(defun run-inner :private (p: p hs: Hs) :where ((CryptoProvider p)) -> (Result HsDone TlsError)
+  (let [st @(. hs start)]
+    (try-let [_ (do (add-transcript hs (. st hello)) (send-client-hello (. hs rec) (. st hello)))
+              out (hello-stage p hs st false) ko (key-stage p hs out) fl (server-flight p hs ko)]
+      (finish p hs ko fl))))

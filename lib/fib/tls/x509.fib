@@ -1,0 +1,81 @@
+;; fib.tls.x509: parse an X.509 v1/v3 certificate (RFC 5280 4.1) from DER into a `Cert`. Strict: DER throughout (fib.tls.asn1), the two signature algorithm
+;; fields equal, extensions only in v3, no unique IDs, unknown critical extensions refused (fib.tls.x509-ext). Parsing decides nothing about trust:
+;; `fib.tls.chain` does. Every failure is `(BadCertificate CertParse ..)` or `CertUnknownCritical`; no input makes this trap.
+(ns fib.tls.x509 (:use fib.core fib.seq fib.coll fib.tls.types fib.tls.bytes fib.tls.asn1 fib.tls.x509-base fib.tls.x509-ext))
+
+;; `key-kind` is :rsa :p-256 :p-384 :ed25519 or :unknown (an algorithm this library does not verify with); `rsa-bits` is the modulus size, 0 for others.
+;; `sig-scheme` is a verify scheme of fib.crypto, :weak-.. or :unknown (see fib.tls.x509-base/sig-scheme).
+(defstruct Cert
+  (der: (Array i8) tbs: (Array i8) version: i64 serial: (Array i8) sig-scheme: keyword issuer: Name subject: Name
+   not-before: i64 not-after: i64 spki: (Array i8) key-kind: keyword rsa-bits: i64 exts: Exts signature: (Array i8)))
+
+(defun key-info :private (spki: Tlv) -> (Result (Pair keyword i64) TlsError)
+  (try-let [ks (der-seq-kids spki "SubjectPublicKeyInfo")]
+    (if (not (= (count ks) 2)) (Err (parse-err "SubjectPublicKeyInfo: an algorithm and a key"))
+      (try-let [alg (der-seq-kids (nth ks 0) "SubjectPublicKeyInfo algorithm") bits (der-bits (nth ks 1))
+                oid (if (= (count alg) 0) (Err (parse-err "empty AlgorithmIdentifier")) (der-oid (nth alg 0)))]
+        (cond (not (= (. bits snd) 0)) (Err (parse-err "SubjectPublicKeyInfo: the key has unused bits"))
+              (= oid "1.2.840.113549.1.1.1") (rsa-info (. bits fst))
+              (= oid "1.3.101.112") (Ok (Pair (if (and (= (count alg) 1) (= (array-len (. bits fst)) 32)) :ed25519 :unknown) 0))
+              (= oid "1.2.840.10045.2.1") (ec-info alg)
+              :else (Ok (Pair :unknown 0)))))))
+(defun ec-info :private (alg: (Vec Tlv)) -> (Result (Pair keyword i64) TlsError)
+  (if (not (= (count alg) 2)) (Ok (Pair :unknown 0))
+    (match (der-oid (nth alg 1))
+      ((Err _) (Ok (Pair :unknown 0)))
+      ((Ok c) (Ok (Pair (cond (= c "1.2.840.10045.3.1.7") :p-256 (= c "1.3.132.0.34") :p-384 :else :unknown) 0))))))
+(defun rsa-info :private (key: (Array i8)) -> (Result (Pair keyword i64) TlsError)
+  (try-let [root (der-root key) ks (der-seq-kids root "RSAPublicKey")]
+    (if (not (= (count ks) 2)) (Err (parse-err "RSAPublicKey: a modulus and an exponent"))
+      (try-let [n (der-int-bytes (nth ks 0)) e (der-int-bytes (nth ks 1))]
+        (if (>= (b-at n 0) 128) (Err (parse-err "RSAPublicKey: a negative modulus"))
+          (let [skip (if (= (b-at n 0) 0) 1 0)
+                top (if (> (array-len n) skip) (b-at n skip) 0)
+                topbits (loop [k 8] (cond (= k 0) 0 (not (= (bit-and top (shl 1 (- k 1))) 0)) k :else (recur (- k 1))))]
+            (Ok (Pair :rsa (if (= topbits 0) 0 (+ (* 8 (- (array-len n) skip 1)) topbits))))))))))
+
+(defun validity :private (t: Tlv) -> (Result (Pair i64 i64) TlsError)
+  (try-let [ks (der-seq-kids t "Validity")]
+    (if (not (= (count ks) 2)) (Err (parse-err "Validity: two times"))
+      (try-let [a (der-time (nth ks 0)) b (der-time (nth ks 1))]
+        (if (> a b) (Err (parse-err "Validity: notBefore is after notAfter")) (Ok (Pair a b)))))))
+
+(defun version-of :private (t: Tlv) -> (Result i64 TlsError)
+  (try-let [ks (der-kids t)]
+    (if (not (= (count ks) 1)) (Err (parse-err "version: one INTEGER"))
+      (try-let [v (der-small-int (nth ks 0))]
+        (cond (= v 0) (Err (parse-err "version: DER omits the default v1")) (> v 2) (Err (parse-err "version: unknown")) :else (Ok v))))))
+
+(defun tbs-fields :private (tbs: Tlv) -> (Result (Pair (Vec Tlv) i64) TlsError)
+  (try-let [ks (der-seq-kids tbs "tbsCertificate")]
+    (if (= (count ks) 0) (Err (parse-err "tbsCertificate: empty"))
+      (if (= (. (nth ks 0) tag) 160)
+        (try-let [v (version-of (nth ks 0))] (Ok (Pair (vec (drop 1 ks)) v)))
+        (Ok (Pair ks 0))))))
+
+(defun parse-tbs :private (der: (Array i8) tbs: Tlv outer: AlgId sig: (Array i8)) -> (Result Cert TlsError)
+  (try-let [fs (tbs-fields tbs)]
+    (let [ks (. fs fst) v (. fs snd) n (count ks)]
+      (cond (< n 6) (Err (parse-err "tbsCertificate: too few fields"))
+            (> n 7) (Err (parse-err (if (= (. (nth ks 6) tag) 161) "tbsCertificate: unique identifiers are not accepted" "tbsCertificate: too many fields")))
+            (and (= n 7) (not (= (. (nth ks 6) tag) 163))) (Err (parse-err "tbsCertificate: the seventh field is not extensions"))
+            (and (= n 7) (< v 2)) (Err (parse-err "tbsCertificate: extensions need version 3"))
+            :else
+            (try-let [serial (der-int-bytes (nth ks 0)) inner (parse-alg (nth ks 1)) issuer (parse-name (nth ks 2))
+                      vd (validity (nth ks 3)) subject (parse-name (nth ks 4)) ki (key-info (nth ks 5))
+                      exts (if (= n 7) (extensions-of (nth ks 6)) (Ok (no-exts)))]
+              (cond (not (bytes-eq? (. inner raw) (. outer raw))) (Err (parse-err "the signature algorithm differs inside and outside the tbsCertificate"))
+                    (> (array-len serial) 21) (Err (parse-err "serialNumber: longer than 20 bytes"))
+                    :else (Ok (Cert der (tlv-raw tbs) v serial (sig-scheme outer) issuer subject (. vd fst) (. vd snd) (tlv-raw (nth ks 5))
+                                    (. ki fst) (. ki snd) exts sig))))))))
+(defun extensions-of :private (t: Tlv) -> (Result Exts TlsError)
+  (try-let [ks (der-kids t)]
+    (if (not (= (count ks) 1)) (Err (parse-err "extensions: one SEQUENCE")) (parse-extensions (nth ks 0)))))
+
+;; A certificate from its DER (the whole array is one certificate).
+(defun parse-certificate (der: (Array i8)) -> (Result Cert TlsError)
+  (try-let [root (der-root der) _ (der-walk root 0) ks (der-seq-kids root "Certificate")]
+    (if (not (= (count ks) 3)) (Err (parse-err "Certificate: tbsCertificate, signatureAlgorithm, signatureValue"))
+      (try-let [outer (parse-alg (nth ks 1)) bits (der-bits (nth ks 2))]
+        (if (not (= (. bits snd) 0)) (Err (parse-err "signatureValue: unused bits"))
+          (parse-tbs der (nth ks 0) outer (. bits fst)))))))

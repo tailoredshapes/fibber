@@ -1,0 +1,117 @@
+;; fib.tls.msg-parse: the handshake messages a client RECEIVES, parsed with every length checked (no input traps: a short, long or malformed message is
+;; `(Err (TlsProtocol ..))`, which the connection reports as a decode_error alert). Bodies are the message without its 4-byte header. An extension that this
+;; client did not ask for is refused (RFC 8446 4.2: a client MUST abort on an unsolicited extension in ServerHello, EncryptedExtensions, Certificate).
+(ns fib.tls.msg-parse (:use fib.core fib.seq fib.coll fib.tls.types fib.tls.bytes fib.tls.msg))
+
+;; ---- a cursor over bytes: every read returns the value and the next position
+(defun get-n (b: (Array i8) pos: i64 n: i64) -> (Result (Pair (Array i8) i64) TlsError)
+  (if (or (< n 0) (> (+ pos n) (array-len b))) (Err (proto-err "a message is shorter than its length fields say")) (Ok (Pair (slice b pos (+ pos n)) (+ pos n)))))
+(defun get-u8 (b: (Array i8) pos: i64) -> (Result (Pair i64 i64) TlsError)
+  (if (>= pos (array-len b)) (Err (proto-err "a message ends early")) (Ok (Pair (b-at b pos) (+ pos 1)))))
+(defun get-u16 (b: (Array i8) pos: i64) -> (Result (Pair i64 i64) TlsError)
+  (if (> (+ pos 2) (array-len b)) (Err (proto-err "a message ends early")) (Ok (Pair (be16 b pos) (+ pos 2)))))
+(defun get-vec8 (b: (Array i8) pos: i64) -> (Result (Pair (Array i8) i64) TlsError)
+  (try-let [n (get-u8 b pos)] (get-n b (. n snd) (. n fst))))
+(defun get-vec16 (b: (Array i8) pos: i64) -> (Result (Pair (Array i8) i64) TlsError)
+  (try-let [n (get-u16 b pos)] (get-n b (. n snd) (. n fst))))
+(defun get-vec24 (b: (Array i8) pos: i64) -> (Result (Pair (Array i8) i64) TlsError)
+  (if (> (+ pos 3) (array-len b)) (Err (proto-err "a message ends early")) (get-n b (+ pos 3) (be24 b pos))))
+(defun at-end (b: (Array i8) pos: i64) -> (Result unit TlsError)
+  (if (= pos (array-len b)) (Ok ()) (Err (proto-err "bytes after the end of a message"))))
+
+;; ---- extension blocks: (type, data) in order; an extension type twice is refused (RFC 8446 4.2)
+(defun parse-exts (block: (Array i8)) -> (Result (Vec (Pair i64 (Array i8))) TlsError)
+  (loop [pos 0 acc []]
+    (if (= pos (array-len block)) (Ok acc)
+      (match (get-u16 block pos)
+        ((Err e) (Err e))
+        ((Ok t) (match (get-vec16 block (. t snd))
+                  ((Err e) (Err e))
+                  ((Ok d) (if (some? (first (filter (fn (x: (Pair i64 (Array i8))) (= (. x fst) (. t fst))) acc)))
+                            (Err (proto-err (str "extension " (. t fst) " appears twice")))
+                            (recur (. d snd) (conj acc (Pair (. t fst) (. d fst))))))))))))
+(defun find-ext (exts: (Vec (Pair i64 (Array i8))) typ: i64) -> (Option (Array i8))
+  (match (first (filter (fn (x: (Pair i64 (Array i8))) (= (. x fst) typ)) exts)) ((some x) (some (. x snd))) (nil nil)))
+
+;; ---- ServerHello and HelloRetryRequest (RFC 8446 4.1.3, 4.1.4)
+;; `selected-group` is the group of a HelloRetryRequest's key_share (0 in a ServerHello); `share-group` and `share` are a ServerHello's key_share.
+;; `version` is the supported_versions value (0 if absent); `cookie` is a HelloRetryRequest's.
+(defstruct ServerHello (random: (Array i8) session-id: (Array i8) suite: i64 version: i64 hrr: bool selected-group: i64 share-group: i64 share: (Array i8) cookie: (Option (Array i8))))
+
+(defun hrr-random () -> (Array i8) (hexb "cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c"))
+(def allowed-sh-exts: (Vec i64) [43 51 44])
+
+(defstruct ShareInfo (selected: i64 group: i64 key: (Array i8)))
+(defun server-share :private (d: (Array i8) hrr: bool) -> (Result ShareInfo TlsError)
+  (try-let [g (get-u16 d 0)]
+    (if hrr (if (= (. g snd) (array-len d)) (Ok (ShareInfo (. g fst) 0 (empty-bytes))) (Err (proto-err "a HelloRetryRequest key_share is the group only")))
+      (try-let [k (get-vec16 d (. g snd)) _ (at-end d (. k snd))] (Ok (ShareInfo 0 (. g fst) (. k fst)))))))
+
+(defun parse-server-hello (body: (Array i8)) -> (Result ServerHello TlsError)
+  (try-let [v (get-u16 body 0) r (get-n body 2 32) sid (get-vec8 body 34) s (get-u16 body (. sid snd)) comp (get-u8 body (. s snd))
+            eb (get-vec16 body (. comp snd)) _ (at-end body (. eb snd))]
+    (cond (not (= (. v fst) 771)) (Err (proto-err "ServerHello: legacy_version is not 0x0303"))
+          (> (array-len (. sid fst)) 32) (Err (proto-err "ServerHello: a session id over 32 bytes"))
+          (not (= (. comp fst) 0)) (Err (proto-err "ServerHello: a compression method"))
+          :else (try-let [exts (parse-exts (. eb fst))]
+                  (parse-sh-exts (ServerHello (. r fst) (. sid fst) (. s fst) 0 (bytes-eq? (. r fst) (hrr-random)) 0 0 (empty-bytes) nil) exts)))))
+(defun parse-sh-exts :private (sh: ServerHello exts: (Vec (Pair i64 (Array i8)))) -> (Result ServerHello TlsError)
+  (if (some? (first (filter (fn (x: (Pair i64 (Array i8))) (not (includes? (. x fst) allowed-sh-exts))) exts)))
+    (Err (proto-err "ServerHello: an extension this client did not offer"))
+    (try-let [sh1 (match (find-ext exts et-supported-versions)
+                    (nil (Ok sh))
+                    ((some d) (if (= (array-len d) 2) (Ok (with sh (version (be16 d 0)))) (Err (proto-err "ServerHello: supported_versions is two bytes")))))
+              sh2 (match (find-ext exts et-key-share)
+                    (nil (Ok sh1))
+                    ((some d) (try-let [t (server-share d (. sh1 hrr))] (Ok (with sh1 (selected-group (. t selected)) (share-group (. t group)) (share (. t key)))))))]
+      (match (find-ext exts et-cookie)
+        (nil (Ok sh2))
+        ((some d) (try-let [c (get-vec16 d 0) _ (at-end d (. c snd))] (Ok (with sh2 (cookie (some (. c fst)))))))))))
+
+;; ---- EncryptedExtensions (RFC 8446 4.3.1): the ALPN protocol the server chose, if any. server_name (an empty acknowledgement) and supported_groups
+;; are allowed; anything else was not asked for.
+(defun parse-encrypted-extensions (body: (Array i8) offered: (Vec str)) -> (Result (Option str) TlsError)
+  (try-let [eb (get-vec16 body 0) _ (at-end body (. eb snd)) exts (parse-exts (. eb fst))]
+    (if (some? (first (filter (fn (x: (Pair i64 (Array i8))) (not (includes? (. x fst) [0 10 16]))) exts)))
+      (Err (proto-err "EncryptedExtensions: an extension this client did not offer"))
+      (match (find-ext exts et-alpn)
+        (nil (Ok nil))
+        ((some d) (try-let [l (get-vec16 d 0) _ (at-end d (. l snd)) p (get-vec8 (. l fst) 0) _ (at-end (. l fst) (. p snd))]
+                    (let [name (str-from-bytes (. p fst))]
+                      (if (includes? name offered) (Ok (some name)) (Err (proto-err "EncryptedExtensions: ALPN names a protocol that was not offered"))))))))))
+
+;; ---- CertificateRequest: only its context matters (the answer is an empty Certificate); signature_algorithms is mandatory in it
+(defun parse-certificate-request (body: (Array i8)) -> (Result (Array i8) TlsError)
+  (try-let [c (get-vec8 body 0) eb (get-vec16 body (. c snd)) _ (at-end body (. eb snd)) exts (parse-exts (. eb fst))]
+    (match (find-ext exts et-signature-algorithms) (nil (Err (proto-err "CertificateRequest without signature_algorithms"))) ((some _) (Ok (. c fst))))))
+
+;; ---- Certificate (RFC 8446 4.4.2): the DER of each certificate, end-entity first. The per-certificate extensions (status_request, SCT) are length-checked and ignored.
+(def max-chain-certs: i64 16)
+(defun parse-certificate-msg (body: (Array i8)) -> (Result (Vec (Array i8)) TlsError)
+  (try-let [c (get-vec8 body 0) l (get-vec24 body (. c snd)) _ (at-end body (. l snd))]
+    (if (not (= (array-len (. c fst)) 0)) (Err (proto-err "Certificate: a non-empty request context in the server's chain"))
+      (loop [pos 0 acc []]
+        (if (= pos (array-len (. l fst))) (Ok acc)
+          (match (get-vec24 (. l fst) pos)
+            ((Err e) (Err e))
+            ((Ok der) (match (get-vec16 (. l fst) (. der snd))
+                        ((Err e) (Err e))
+                        ((Ok x) (cond (= (array-len (. der fst)) 0) (Err (proto-err "Certificate: an empty certificate"))
+                                      (>= (count acc) max-chain-certs) (Err (proto-err "Certificate: more certificates than this client accepts"))
+                                      :else (recur (. x snd) (conj acc (. der fst)))))))))))))
+
+;; ---- CertificateVerify: the scheme and the signature
+(defun parse-certificate-verify (body: (Array i8)) -> (Result (Pair i64 (Array i8)) TlsError)
+  (try-let [s (get-u16 body 0) sig (get-vec16 body (. s snd)) _ (at-end body (. sig snd))] (Ok (Pair (. s fst) (. sig fst)))))
+
+;; ---- NewSessionTicket (RFC 8446 4.6.1): checked for shape, then ignored (no resumption is built)
+(defun parse-new-session-ticket (body: (Array i8)) -> (Result unit TlsError)
+  (if (< (array-len body) 8) (Err (proto-err "NewSessionTicket: too short"))
+    (try-let [n (get-vec8 body 8) t (get-vec16 body (. n snd)) e (get-vec16 body (. t snd)) _ (at-end body (. e snd))]
+      (if (= (array-len (. t fst)) 0) (Err (proto-err "NewSessionTicket: an empty ticket")) (Ok ())))))
+
+;; ---- KeyUpdate (RFC 8446 4.6.3): update_not_requested (0) or update_requested (1), nothing else
+(defun parse-key-update (body: (Array i8)) -> (Result bool TlsError)
+  (cond (not (= (array-len body) 1)) (Err (proto-err "KeyUpdate: one byte"))
+        (= (b-at body 0) 0) (Ok false) (= (b-at body 0) 1) (Ok true)
+        :else (Err (proto-err "KeyUpdate: an unknown request_update"))))

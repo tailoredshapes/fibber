@@ -1,0 +1,119 @@
+;; fib.tls.names: what a certificate's names are compared with. IP literals (is this host an address?), hostname matching against subjectAltName
+;; (RFC 6125 6.4 as tightened by RFC 9525 6.3), and the dNSName and iPAddress rules of name constraints (RFC 5280 4.2.1.10). The subject's common name
+;; is NEVER used for a host (RFC 9525 1.2); a certificate without a matching SAN does not match.
+(ns fib.tls.names (:use fib.core fib.seq fib.coll fib.tls.bytes))
+
+;; ---- IP literals
+(defun digit-run :private (b: (Array i8) from: i64 to: i64) -> i64
+  (loop [i from acc 0]
+    (if (= i to) acc
+      (let [c (b-at b i)] (if (and (>= c 48) (<= c 57)) (recur (+ i 1) (+ (* acc 10) (- c 48))) -1)))))
+;; Four decimal octets, no leading zeros, nothing else: the bytes of an IPv4 address, or an empty array.
+(defun parse-ipv4 (s: str) -> (Array i8)
+  (let [b (str-bytes s)
+        dots (filter (fn (i: i64) (= (b-at b i) 46)) (range (array-len b)))]
+    (if (not (= (count dots) 3)) (empty-bytes)
+      (let [cuts (vec (concat (concat [-1] dots) [(array-len b)]))
+            parts (map (fn (k: i64) (let [a (+ (nth cuts k) 1) z (nth cuts (+ k 1))]
+                                      (if (or (= a z) (> (- z a) 3) (and (> (- z a) 1) (= (b-at b a) 48))) -1 (digit-run b a z)))) (range 4))]
+        (if (some? (first (filter (fn (v: i64) (or (< v 0) (> v 255))) parts)))
+          (empty-bytes) (cat (vec (map (fn (v: i64) (w8 v)) parts))))))))
+
+(defun hex-digit :private (c: i64) -> i64
+  (cond (and (>= c 48) (<= c 57)) (- c 48) (and (>= c 97) (<= c 102)) (- c 87) (and (>= c 65) (<= c 70)) (- c 55) :else -1))
+;; The 16-bit groups of one side of "::" (or of the whole address), 1-4 hex digits each; an IPv4 tail counts for two groups. Nil when malformed.
+(defun v6-groups :private (s: str) -> (Option (Vec i64))
+  (let [b (str-bytes s)]
+    (if (= (array-len b) 0) (some [])
+      (let [cuts (vec (concat (concat [-1] (filter (fn (i: i64) (= (b-at b i) 58)) (range (array-len b)))) [(array-len b)]))]
+        (loop [k 0 acc []]
+          (if (= k (- (count cuts) 1)) (some acc)
+            (let [a (+ (nth cuts k) 1) z (nth cuts (+ k 1)) last? (= k (- (count cuts) 2)) text (str-from-bytes (slice b a z))]
+              (cond (and last? (>= (index-of-byte b 46 a) 0))
+                      (let [v4 (parse-ipv4 text)]
+                        (if (= (array-len v4) 4) (recur (+ k 1) (conj (conj acc (be16 v4 0)) (be16 v4 2))) nil))
+                    (or (= a z) (> (- z a) 4)) nil
+                    :else (let [vs (map (fn (i: i64) (hex-digit (b-at b i))) (range a z))]
+                            (if (some? (first (filter (fn (v: i64) (< v 0)) vs))) nil
+                              (recur (+ k 1) (conj acc (reduce (fn (x: i64 d: i64) (+ (* x 16) d)) 0 vs)))))))))))))
+(defun groups-bytes :private (gs: (Vec i64)) -> (Array i8) (cat (vec (map (fn (g: i64) (w16 g)) gs))))
+;; Sixteen bytes of an IPv6 address (no brackets, no zone), or an empty array.
+(defun parse-ipv6 (s: str) -> (Array i8)
+  (let [b (str-bytes s) dc (find-double-colon b)]
+    (if (= dc -2) (empty-bytes)
+      (if (= dc -1)
+        (match (v6-groups s) (nil (empty-bytes)) ((some gs) (if (= (count gs) 8) (groups-bytes gs) (empty-bytes))))
+        (match (v6-groups (str-from-bytes (slice b 0 dc)))
+          (nil (empty-bytes))
+          ((some l) (match (v6-groups (str-from-bytes (slice b (+ dc 2) (array-len b))))
+                      (nil (empty-bytes))
+                      ((some r) (if (> (+ (count l) (count r)) 7) (empty-bytes)
+                                  (groups-bytes (vec (concat (concat l (map (fn (i: i64) 0) (range (- 8 (+ (count l) (count r)))))) r))))))))))))
+;; Index of the only "::", -1 when there is none, -2 when there is more than one or a ":::".
+(defun find-double-colon :private (b: (Array i8)) -> i64
+  (let [hits (filter (fn (i: i64) (and (< (+ i 1) (array-len b)) (= (b-at b i) 58) (= (b-at b (+ i 1)) 58))) (range (array-len b)))]
+    (cond (= (count hits) 0) -1
+          (> (count hits) 1) -2
+          (and (< (+ (first-of hits) 2) (array-len b)) (= (b-at b (+ (first-of hits) 2)) 58)) -2
+          :else (first-of hits))))
+(defun first-of :private (xs: (LSeq i64)) -> i64 (match (first xs) ((some v) v) (nil -1)))
+
+;; The raw address of an IP literal host (4 or 16 bytes), or an empty array when `host` is a name.
+(defun ip-literal (host: str) -> (Array i8)
+  (let [b (str-bytes host)]
+    (if (>= (index-of-byte b 58 0) 0) (parse-ipv6 host) (parse-ipv4 host))))
+(defun ip-literal? (host: str) -> bool (> (array-len (ip-literal host)) 0))
+
+;; ---- DNS names
+(defun lower-ascii (s: str) -> str
+  (let [b (str-bytes s)] (str-from-bytes (cat (vec (map (fn (i: i64) (let [c (b-at b i)] (w8 (if (and (>= c 65) (<= c 90)) (+ c 32) c)))) (range (array-len b))))))))
+(defun split-dots (s: str) -> (Vec str)
+  (let [b (str-bytes s)
+        cuts (vec (concat (concat [-1] (filter (fn (i: i64) (= (b-at b i) 46)) (range (array-len b)))) [(array-len b)]))]
+    (vec (map (fn (k: i64) (str-from-bytes (slice b (+ (nth cuts k) 1) (nth cuts (+ k 1))))) (range (- (count cuts) 1))))))
+(defun sub-str (s: str from: i64 to: i64) -> str (str-from-bytes (slice (str-bytes s) from to)))
+(defun join-dots (xs: (Vec str)) -> str (reduce (fn (a: str x: str) (if (= a "") x (str a "." x))) "" xs))
+(defun has-star? :private (s: str) -> bool (>= (index-of-byte (str-bytes s) 42 0) 0))
+(defun hostname-char? :private (c: i64) -> bool
+  (or (and (>= c 97) (<= c 122)) (and (>= c 48) (<= c 57)) (= c 45) (= c 95)))
+;; A label of a hostname or of a presented identifier: letters, digits, hyphen (and underscore, seen in the wild), 1 to 63 bytes.
+(defun good-label? :private (l: str) -> bool
+  (let [b (str-bytes l)] (and (>= (array-len b) 1) (<= (array-len b) 63) (every? (fn (i: i64) (hostname-char? (b-at b i))) (range (array-len b))))))
+(defun strip-trailing-dot :private (s: str) -> str
+  (let [b (str-bytes s)] (if (and (> (array-len b) 0) (= (b-at b (- (array-len b) 1)) 46)) (str-from-bytes (slice b 0 (- (array-len b) 1))) s)))
+
+;; Does the presented DNS identifier `pat` (a SAN dNSName) match the reference `host`? Both are compared case-insensitively. Rules: a wildcard is the
+;; WHOLE left-most label (`*.example.com`), at most one, and covers exactly one non-empty label of the host; at least two labels follow it (`*.com`
+;; matches nothing: the public suffix list is not consulted, so `*.co.uk` still matches); a wildcard in any other position (`a*.example.com`,
+;; `*.*.example.com`, `w*`) matches nothing; a host that is an IP literal matches no dNSName; an empty label, a trailing dot on the identifier, or a character
+;; outside letters, digits, hyphen and underscore matches nothing. The reference's own single trailing dot is dropped.
+(defun dns-name-matches? (pat: str host: str) -> bool
+  (let [h (lower-ascii (strip-trailing-dot host)) p (lower-ascii pat) hl (split-dots h) pl (split-dots p)]
+    (cond (or (= h "") (= p "") (ip-literal? h) (has-star? h)) false
+          (not (every? good-label? hl)) false
+          (not (has-star? p)) (and (every? good-label? pl) (= hl pl))
+          :else (and (= (first-of-str pl) "*") (>= (count pl) 3) (every? good-label? (vec (drop 1 pl)))
+                     (= (count hl) (count pl)) (= (vec (drop 1 hl)) (vec (drop 1 pl)))))))
+(defun first-of-str :private (xs: (Vec str)) -> str (if (= (count xs) 0) "" (nth xs 0)))
+
+;; The names a leaf presents: `dns` and `ips` from its subjectAltName. A host that is an IP literal matches only an iPAddress of the same bytes.
+(defun host-matches? (host: str dns: (Vec str) ips: (Vec (Array i8))) -> bool
+  (let [addr (ip-literal host)]
+    (if (> (array-len addr) 0)
+      (some? (first (filter (fn (ip: (Array i8)) (bytes-eq? ip addr)) ips)))
+      (some? (first (filter (fn (p: str) (dns-name-matches? p host)) dns))))))
+
+;; ---- name constraints
+;; A dNSName constraint "example.com" admits "example.com" and every name below it ("a.example.com"); ".example.com" admits only the names below it; ""
+;; admits every name. A wildcard name is judged as its parent with a placeholder label. Case-insensitive.
+(defun dns-in-subtree? (name: str base: str) -> bool
+  (let [n0 (lower-ascii (strip-trailing-dot name)) n (if (and (>= (str-len n0) 2) (= (sub-str n0 0 2) "*.")) (str "x" (sub-str n0 1 (str-len n0))) n0)
+        c (lower-ascii base)]
+    (cond (= c "") true
+          (= (sub-str c 0 1) ".") (and (> (str-len n) (str-len c)) (= (sub-str n (- (str-len n) (str-len c)) (str-len n)) c))
+          :else (or (= n c) (and (> (str-len n) (+ (str-len c) 1)) (= (sub-str n (- (str-len n) (str-len c) 1) (str-len n)) (str "." c)))))))
+;; An iPAddress constraint is an address and a mask (8 or 32 bytes): the address under the mask is the network.
+(defun ip-in-subtree? (ip: (Array i8) base: (Array i8)) -> bool
+  (let [n (array-len ip)]
+    (and (= (array-len base) (* 2 n))
+         (every? (fn (i: i64) (= (bit-and (b-at ip i) (b-at base (+ n i))) (bit-and (b-at base i) (b-at base (+ n i))))) (range n)))))

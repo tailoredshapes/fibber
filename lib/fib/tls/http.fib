@@ -1,0 +1,56 @@
+;; fib.tls.http: fib.tls as a `fib.http.transport` Transport and an "https" Factory. `tls-transport` runs the handshake over any Transport (a TCP socket, an in-memory pipe) and
+;; returns a Transport whose reads and writes are the connection's. A TLS error becomes the http Error that says the same: a timeout is `(Timeout "io" ..)` (the client renames it
+;; to its phase), a closed connection `Closed`, a handshake failure `ConnectError`, a record, alert or truncation failure `ProtocolError`, with the typed reason in the text. The
+;; caller supplies the crypto provider and the trust (embedded roots, a PEM file, a store of its own): fib.http does not depend on this module or on any driver.
+(ns fib.tls.http (:use fib.core fib.seq fib.coll fib.crypto.types fib.http.types fib.http.transport fib.http.client.types fib.tls.types fib.tls.bytes
+                       fib.tls.pem fib.tls.record fib.tls.hello fib.tls.client fib.tls.conn fib.tls.names)
+  (:require [fib.os.time :as time] [fib.os.files :as files] [fib.http.tcp :as tcp]))
+
+(defun from-http :private (e: Error) -> TlsError
+  (match e ((Timeout _ m) (TlsTimeout m)) ((Closed) TlsClosed) (_ (TransportFailed (error-message e)))))
+(defun io-of (t: Transport) -> Io
+  (Io (fn (n: i64) (match (t-read t n) ((Ok b) (Ok b)) ((Err e) (Err (from-http e)))))
+      (fn (b: (Array i8)) (match (t-write t b) ((Ok _) (Ok ())) ((Err e) (Err (from-http e)))))
+      (fn () (t-close t)) (fn (at: i64) (t-deadline t at))))
+
+(defun to-http (e: TlsError) -> Error
+  (match e ((TlsTimeout m) (Timeout "io" m)) ((TlsClosed) Closed) ((TransportFailed m) (TransportError 0 m))
+    ((TlsAlert _ _) (ProtocolError (tls-error-text e))) ((Truncated) (ProtocolError (tls-error-text e))) ((TlsProtocol _ _) (ProtocolError (tls-error-text e)))
+    (_ (ConnectError (str "tls: " (tls-error-text e))))))
+(defun transport-of (s: Session peer: str) -> Transport
+  (Transport (fn (n: i64) (match ((. s read) n) ((Ok b) (Ok b)) ((Err e) (Err (to-http e)))))
+             (fn (b: (Array i8)) (match ((. s write) b) ((Ok _) (Ok ())) ((Err e) (Err (to-http e)))))
+             (fn () ((. s close))) (fn (at: i64) ((. s set-deadline) at)) peer))
+
+;; A TLS client connection over `t`; `host` is the name verified and sent; `clock` gives seconds since the epoch.
+(defun tls-session (p: p cfg: ClientConfig t: Transport) :where ((CryptoProvider p)) -> (Result Session TlsError) (connect p cfg (io-of t)))
+(defun tls-transport (p: p cfg: ClientConfig t: Transport) :where ((CryptoProvider p)) -> (Result Transport Error)
+  (match (tls-session p cfg t) ((Err e) (Err (to-http e))) ((Ok s) (Ok (transport-of s (str "tls:" (. t peer)))))))
+
+;; ---- trust
+(def default-ca-paths: (Vec str) ["/etc/ssl/certs/ca-certificates.crt" "/etc/pki/tls/certs/ca-bundle.crt" "/etc/ssl/cert.pem" "/etc/ssl/ca-bundle.pem"])
+;; The trust store in a PEM file (an overridable option: a scratch image has none; see fib.tls.roots for a store that is data).
+(defun trust-from-file (path: str) -> (Result TrustStore TlsError)
+  (match (files/read-file-bytes path 33554432)
+    ((Err e) (Err (TransportFailed (str "reading " path ": " (. e message)))))
+    ((Ok b) (trust-from-pem b))))
+;; The first of the usual system locations that exists; fails closed (an error) when none does.
+(defun system-trust () -> (Result TrustStore TlsError) (system-trust-from default-ca-paths))
+(defun system-trust-from (paths: (Vec str)) -> (Result TrustStore TlsError)
+  (loop [i 0]
+    (if (= i (count paths)) (Err (TransportFailed "no system trust store found (set the path, or use the embedded roots)"))
+      (match (files/read-file-bytes (nth paths i) 33554432)
+        ((Ok b) (trust-from-pem b))
+        ((Err _) (recur (+ i 1)))))))
+
+(defun wall-seconds () -> i64 (quot (time/wall-now) 1000000000))
+
+;; The "https" Factory: connect TCP, then TLS. `trust` is the store, or a per-request `ca-file` of the client options replaces it. `clock` is sendable because a
+;; Factory's `open` is.
+(defun factory-with (p: p trust: TrustStore clock: (fn :send () i64) alpn: (Vec str) handshake-timeout-ms: i64) :where ((CryptoProvider p)) -> Factory
+  (Factory "tls"
+    (fn (t: Target)
+      (try-let [store (match (. t ca-file) (nil (Ok trust)) ((some path) (match (trust-from-file path) ((Ok s) (Ok s)) ((Err e) (Err (to-http e))))))
+                tcp (tcp/connect (. t host) (. t port) (. t connect-timeout-ms))]
+        (let [d (client-config (. t host) store (fn () (clock)))]
+          (tls-transport p (with d (alpn alpn) (handshake-timeout-ms handshake-timeout-ms)) tcp))))))

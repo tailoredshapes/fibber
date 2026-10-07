@@ -1,0 +1,143 @@
+;; fib.tls.chain: path validation for a TLS server certificate (RFC 5280 6, RFC 9525, the parts a client needs). `validate-chain` takes the certificates the
+;; server sent (the first is the end-entity), a trust store, the time and the host, and returns the verified end-entity or the typed reason. It builds a path
+;; leaf -> anchor by name (the issuer name equals the subject name, `fib.tls.x509-base/name-eq?`; the key identifiers must agree when both are present),
+;; verifies every signature through the crypto provider (`fib.crypto/verify-signature`: the signature primitives are the driver's), and then judges the path:
+;;   validity (inclusive, every certificate, the anchor too), SHA-1/MD5/MD2 signatures and RSA keys under 2048 bits refused, every issuer a CA (basicConstraints
+;;   cA, keyCertSign when keyUsage is present), pathLenConstraint over the non-self-issued intermediates below it, the end-entity's keyUsage (digitalSignature)
+;;   and extKeyUsage (serverAuth or anyExtendedKeyUsage; an issuer's EKU restricts too), nameConstraints (dNSName and iPAddress evaluated; any other
+;;   constrained name type that the certificates actually use fails closed), and the host against the subjectAltName (no common-name fallback).
+;; An anchor is trusted by being in the store: its own signature is not checked and it need not carry basicConstraints (v1 roots), but its validity,
+;; constraints and key size are. A leaf that IS an anchor (the same DER) is accepted without a signature. Revocation (CRL, OCSP, stapling) and
+;; certificate policies are NOT checked: a known gap (docs/design/tls.md). The first path whose signatures verify and whose checks pass is the answer; if none does,
+;; the error of the first candidate is reported.
+(ns fib.tls.chain (:use fib.core fib.seq fib.coll fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.names fib.tls.x509-base fib.tls.x509-ext fib.tls.x509 fib.tls.pem)
+  (:require [fib.crypto :as c]))
+
+(def max-path: i64 10)
+(def min-rsa-bits: i64 2048)
+(defstruct Ctx (store: TrustStore pool: (Vec Cert) now: i64 host: str))
+
+;; ---- signature of one certificate by its issuer
+(defun sig-error :private (e: CryptoError scheme: keyword) -> TlsError
+  (cond (= (. e kind) "unsupported") (UnsupportedCapability (str scheme))
+        (= (. e kind) "invalid-signature") (bad-cert CertBadSignature "the signature of a certificate does not verify")
+        :else (bad-cert CertBadSignature (str "a certificate signature was refused: " (. e message)))))
+(defun verify-cert-sig (p: p cert: Cert issuer: Cert) :where ((CryptoProvider p)) -> (Result unit TlsError)
+  (let [s (. cert sig-scheme)]
+    (cond (weak-scheme? s) (Err (bad-cert CertWeakAlgorithm (str "the certificate is signed with " s)))
+          (= s :unknown) (Err (bad-cert CertBadSignature "the certificate signature algorithm is not supported"))
+          (and (= (. issuer key-kind) :rsa) (< (. issuer rsa-bits) min-rsa-bits)) (Err (bad-cert CertWeakAlgorithm (str "an RSA key of " (. issuer rsa-bits) " bits")))
+          :else (match (c/verify-signature p (. issuer spki) s (. cert tbs) (. cert signature))
+                  ((Ok _) (Ok ())) ((Err e) (Err (sig-error e s)))))))
+
+;; ---- the checks of a complete path (leaf first, anchor last)
+(defun check-validity :private (path: (Vec Cert) now: i64) -> (Result unit TlsError)
+  (loop [i 0]
+    (if (= i (count path)) (Ok ())
+      (let [x (nth path i)]
+        (cond (< now (. x not-before)) (Err (bad-cert CertNotYetValid (str "certificate " i " is not valid before " (. x not-before))))
+              (> now (. x not-after)) (Err (bad-cert CertExpired (str "certificate " i " expired at " (. x not-after))))
+              :else (recur (+ i 1)))))))
+(defun check-keys :private (path: (Vec Cert)) -> (Result unit TlsError)
+  (match (first (filter (fn (x: Cert) (and (= (. x key-kind) :rsa) (< (. x rsa-bits) min-rsa-bits))) path))
+    ((some x) (Err (bad-cert CertWeakAlgorithm (str "an RSA key of " (. x rsa-bits) " bits"))))
+    (nil (Ok ()))))
+(defun self-issued? :private (x: Cert) -> bool (name-eq? (. x issuer) (. x subject)))
+(defun check-issuers :private (path: (Vec Cert)) -> (Result unit TlsError)
+  (let [n (count path)]
+    (loop [i 1 below 0]
+      (if (>= i n) (Ok ())
+        (let [x (nth path i) ex (. x exts) anchor? (= i (- n 1))]
+          (cond (and (not anchor?) (not (and (. ex has-bc) (. ex is-ca)))) (Err (bad-cert CertBadChain (str "certificate " i " is an issuer but not a CA")))
+                (and anchor? (. ex has-bc) (not (. ex is-ca))) (Err (bad-cert CertBadChain "the trust anchor is marked not a CA"))
+                (and (. ex has-ku) (not (ku-has? ex ku-key-cert-sign))) (Err (bad-cert CertKeyUsage (str "certificate " i " lacks keyCertSign")))
+                (and (>= (. ex path-len) 0) (> below (. ex path-len))) (Err (bad-cert CertPathLength (str "certificate " i " allows " (. ex path-len) " intermediates, the path has " below)))
+                :else (recur (+ i 1) (if (and (> i 0) (not (self-issued? x))) (+ below 1) below))))))))
+(defun eku-ok? :private (ex: Exts) -> bool (or (not (. ex has-eku)) (includes? oid-server-auth (. ex eku)) (includes? oid-any-eku (. ex eku))))
+(defun check-usage :private (path: (Vec Cert)) -> (Result unit TlsError)
+  (let [leaf (. (nth path 0) exts)]
+    (cond (and (. leaf has-ku) (not (ku-has? leaf ku-digital-signature))) (Err (bad-cert CertKeyUsage "the end-entity keyUsage lacks digitalSignature"))
+          (not (eku-ok? leaf)) (Err (bad-cert CertKeyUsage "the end-entity extKeyUsage does not allow serverAuth"))
+          :else (match (first (filter (fn (x: Cert) (not (eku-ok? (. x exts)))) (vec (drop 1 path))))
+                  ((some _) (Err (bad-cert CertKeyUsage "an issuer's extKeyUsage does not allow serverAuth")))
+                  (nil (Ok ()))))))
+
+;; ---- name constraints: the issuer at `i` constrains every certificate below it (index < i) except a self-issued intermediate
+(defun dns-allowed? :private (name: str perm: (Vec str) excl: (Vec str)) -> bool
+  (and (or (= (count perm) 0) (some? (first (filter (fn (b: str) (dns-in-subtree? name b)) perm))))
+       (not (some? (first (filter (fn (b: str) (dns-in-subtree? name b)) excl))))))
+(defun ip-allowed? :private (ip: (Array i8) perm: (Vec (Array i8)) excl: (Vec (Array i8))) -> bool
+  (let [same (filter (fn (b: (Array i8)) (= (array-len b) (* 2 (array-len ip)))) perm)]
+    (and (or (= (count perm) 0) (some? (first (filter (fn (b: (Array i8)) (ip-in-subtree? ip b)) same))))
+         (not (some? (first (filter (fn (b: (Array i8)) (ip-in-subtree? ip b)) excl)))))))
+(defun other-unjudged? :private (ca: Exts x: Cert) -> bool
+  (let [used (vec (concat (. (. x exts) san-other) (if (. (. x subject) empty) [] [4])))]
+    (some? (first (filter (fn (t: i64) (includes? t used)) (. ca nc-other))))))
+(defun nc-violation :private (ca: Exts x: Cert) -> (Option str)
+  (let [ex (. x exts)]
+    (cond (some? (first (filter (fn (n: str) (not (dns-allowed? n (. ca nc-perm-dns) (. ca nc-excl-dns)))) (. ex san-dns))))
+            (some "a dNSName outside the name constraints")
+          (some? (first (filter (fn (ip: (Array i8)) (not (ip-allowed? ip (. ca nc-perm-ip) (. ca nc-excl-ip)))) (. ex san-ip))))
+            (some "an iPAddress outside the name constraints")
+          (other-unjudged? ca x) (some "a name type the name constraints cover that this library cannot judge")
+          :else nil)))
+(defun check-constraints :private (path: (Vec Cert)) -> (Result unit TlsError)
+  (loop [i 1]
+    (if (>= i (count path)) (Ok ())
+      (let [ca (. (nth path i) exts)
+            bad (if (. ca has-nc)
+                  (first (filter (fn (j: i64) (and (or (= j 0) (not (self-issued? (nth path j)))) (some? (nc-violation ca (nth path j))))) (range i)))
+                  nil)]
+        (match bad
+          ((some j) (Err (bad-cert CertNameConstraint (str "certificate " j ": " (match (nc-violation ca (nth path j)) ((some m) m) (nil ""))))))
+          (nil (recur (+ i 1))))))))
+
+(defun check-host :private (leaf: Cert host: str) -> (Result unit TlsError)
+  (let [ex (. leaf exts)]
+    (cond (host-matches? host (. ex san-dns) (. ex san-ip)) (Ok ())
+          (not (. ex has-san)) (Err (bad-cert CertHostnameMismatch "the certificate has no subjectAltName (the common name is not used)"))
+          :else (Err (bad-cert CertHostnameMismatch (str "the certificate is not valid for " host))))))
+
+(defun check-path (path: (Vec Cert) now: i64 host: str) -> (Result unit TlsError)
+  (try-let [_ (check-validity path now) _ (check-keys path) _ (check-issuers path) _ (check-usage path) _ (check-constraints path)]
+    (check-host (nth path 0) host)))
+
+;; ---- building the path
+(defun key-ids-agree? :private (x: Cert issuer: Cert) -> bool
+  (match (. (. x exts) aki)
+    (nil true)
+    ((some a) (match (. (. issuer exts) ski) (nil true) ((some s) (bytes-eq? a s))))))
+(defun candidates :private (ctx: Ctx top: Cert path: (Vec Cert)) -> (Vec (Pair bool Cert))
+  (let [fit (fn (x: Cert) (and (name-eq? (. x subject) (. top issuer)) (key-ids-agree? top x)))
+        anchors (map (fn (x: Cert) (Pair true x)) (filter fit (. (. ctx store) anchors)))
+        pool (map (fn (x: Cert) (Pair false x))
+                  (filter (fn (x: Cert) (and (fit x) (not (some? (first (filter (fn (y: Cert) (bytes-eq? (. y der) (. x der))) path)))))) (. ctx pool)))]
+    (vec (concat anchors pool))))
+(defun in-store? :private (ctx: Ctx x: Cert) -> bool
+  (some? (first (filter (fn (a: Cert) (bytes-eq? (. a der) (. x der))) (. (. ctx store) anchors)))))
+
+(defun build (p: p ctx: Ctx path: (Vec Cert)) :where ((CryptoProvider p)) -> (Result (Vec Cert) TlsError)
+  (let [top (nth path (- (count path) 1))]
+    (cond (in-store? ctx top) (match (check-path path (. ctx now) (. ctx host)) ((Ok _) (Ok path)) ((Err e) (Err e)))
+          (>= (count path) max-path) (Err (bad-cert CertBadChain "the chain is too long"))
+          :else (let [cs (candidates ctx top path)]
+                  (if (= (count cs) 0)
+                    (Err (bad-cert CertUntrustedRoot (if (self-issued? top) "a self-signed certificate that is not in the trust store" "no issuer of the chain is in the trust store or in the chain")))
+                    (try-each p ctx path top cs))))))
+(defun try-each :private (p: p ctx: Ctx path: (Vec Cert) top: Cert cs: (Vec (Pair bool Cert))) :where ((CryptoProvider p)) -> (Result (Vec Cert) TlsError)
+  (loop [i 0 first-err nil]
+    (if (= i (count cs)) (match first-err ((some e) (Err e)) (nil (Err (bad-cert CertUntrustedRoot "no candidate issuer"))))
+      (let [cand (nth cs i) x (. cand snd)
+            r (match (verify-cert-sig p top x)
+                ((Err e) (Err e))
+                ((Ok _) (let [np (conj path x)]
+                          (if (. cand fst) (match (check-path np (. ctx now) (. ctx host)) ((Ok _) (Ok np)) ((Err e) (Err e)))
+                            (build p ctx np)))))]
+        (match r
+          ((Ok np) (Ok np))
+          ((Err e) (recur (+ i 1) (match first-err ((some f) (some f)) (nil (some e))))))))))
+
+;; The verified end-entity (and the path), or the reason. `presented` is the server's certificate list, end-entity first, already parsed.
+(defun validate-chain (p: p presented: (Vec Cert) store: TrustStore now: i64 host: str) :where ((CryptoProvider p)) -> (Result (Vec Cert) TlsError)
+  (if (= (count presented) 0) (Err (bad-cert CertBadChain "the server sent no certificate"))
+    (build p (Ctx store (vec (drop 1 presented)) now host) [(nth presented 0)])))
