@@ -1,0 +1,27 @@
+;; spec: docs/design/compress.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; roots: ../../lib support
+;; A corrupt block in the middle, a cut frame and a bad content checksum give one error kind for 1, 2, 3 and 7 threads; max-output is exact for every thread count.
+(ns main (:use tl.check fib.compress.lz4.mem) (:require [fib.compress :as z] [fib.compress.lz4 :as lz4]))
+(defun payload () -> (Array i8)
+  (let [c (cell (array 300000 0i8))] (do (dotimes (i 300000) (array-set! &c i (trunc i8 (+ (rem (* i 7) 41) (if (= (rem i 1000) 0) i 0))))) @c)))
+(defun poke (z: (Array i8) at: i64 v: i64) -> (Array i8) (let [c (array-copy z 0 (array-len z))] (do (wr8 (data c) at v) c)))
+(defun kind (r: (Result (Array i8) z/CompressError)) -> keyword (match r ((Ok _) :ok) ((Err e) (. e kind))))
+(defun all-same? (z: (Array i8) o: z/Options) -> bool
+  (let [ks (vec (map (fn (t: i64) (kind (z/decompress (lz4/lz4) z (z/with-threads o t)))) [1 2 3 7]))] (every? (fn (k: keyword) (= k (nth ks 0))) ks)))
+(defun main () -> i64
+  (let [c (checks) k (lz4/lz4) d (payload) o (z/with-max-output (z/with-block-checksum (z/with-block-size (z/default-options) 65536) true) 400000)
+        z (match (z/compress k d o) ((Ok b) b) ((Err _) (array 0 0i8))) n (array-len z)]
+    (do (check c (all-same? (poke z (quot n 2) 255) o))
+        (check c (not (= :ok (kind (z/decompress k (poke z (quot n 2) 255) o)))))
+        (check c (all-same? (array-copy z 0 (quot (* 3 n) 4)) o))
+        (check c (= :truncated (kind (z/decompress k (array-copy z 0 (quot (* 3 n) 4)) (z/with-threads o 7)))))
+        (check c (all-same? (poke z (- n 2) 9) o))
+        (check c (= :checksum (kind (z/decompress k (poke z (- n 2) 9) (z/with-threads o 3)))))
+        (dotimes (i 4)
+          (let [t (nth [1 2 3 7] i)]
+            (do (check c (= :ok (kind (z/decompress k z (z/with-max-output (z/with-threads o t) 300000)))))
+                (check c (= :too-large (kind (z/decompress k z (z/with-max-output (z/with-threads o t) 299999))))))))
+        (checks-result c))))

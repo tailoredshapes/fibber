@@ -78,7 +78,7 @@
 
 ;; ---- placement mode: a job's blocks decoded one after the other into a buffer of its own
 (defun place-group (s: Shared j: i64) -> (Result (Pair (Array i8) i64) CompressError)
-  (let [lo (* j (. s gb)) hi (min (. (. s ix) count) (* (+ j 1) (. s gb))) buf (array (* (- hi lo) (. s bmax)) 0i8) bp (data buf) p (data (. s src))]
+  (let [lo (* j (. s gb)) hi (min (. (. s ix) count) (* (+ j 1) (. s gb))) buf (fresh (* (- hi lo) (. s bmax))) bp (data buf) p (data (. s src))]
     (loop [k lo pos 0]
       (if (>= k hi) (Ok (Pair buf pos))
         (let [off (iw s k 0) sz (iw s k 1)]
@@ -107,7 +107,7 @@
         (if (= (xxh-digest (. s ck)) (rd32 (data (. s src)) end)) (Ok ()) (Err (checksum-error "the content checksum does not match"))))))
 
 (defun decode-par-direct (src: (Array i8) ix: Index h: FrameHead o: Options workers: i64 gb: i64) -> (Result (Option (Array i8)) CompressError)
-  (let [out (array (. h csize) 0i8) s (make-shared src ix h o (addr-of (data out)) (. h csize) gb)]
+  (let [out (fresh (. h csize)) s (make-shared src ix h o (addr-of (data out)) (. h csize) gb)]
     (match (run-jobs workers (. s jobs) (direct-job s))
       ((Err e) (fallback e))
       ((Ok _) (match (check-content s (. ix end)) ((Err e) (Err e)) ((Ok _) (Ok (some out))))))))
@@ -116,7 +116,7 @@
   (loop [k 0 sum 0] (if (>= k (. ix count)) sum (recur (+ k 1) (+ sum (if (= (nth (. ix words) (+ (* 3 k) 2)) 1) (nth (. ix words) (+ (* 3 k) 1)) bmax))))))
 
 (defun assemble (parts: (Vec (Pair (Array i8) i64)) workers: i64) -> (Array i8)
-  (let [out (array (total-len parts) 0i8)]
+  (let [out (fresh (total-len parts))]
     (match (place out 0 parts workers) ((Ok _) out) ((Err _) out))))
 
 (defun decode-par-place (src: (Array i8) ix: Index h: FrameHead o: Options workers: i64 gb: i64) -> (Result (Option (Array i8)) CompressError)

@@ -57,7 +57,7 @@ mutate() { # mutate NAME TREE
     par-lost-job)     f=$d/../par.fib; cp $f $f.orig; sub $f 's/\(if \(>= i n\) out/(if (>= i (- n 1)) out/' ;;
     par-max-output)   f=$d/pframedec.fib; cp $f $f.orig; sub $f 's/\(> \(\. h csize\) \(\. o max-output\)\) \(> \(\. h csize\)/false (> (. h csize)/' ;;
     par-thread-dependent) f=$d/pframe.fib; cp $f $f.orig; sub $f 's/e \(enc-new \(\. o level\) \(\. o acceleration\) n\)/e (enc-new (. o level) (+ (. o acceleration) (if (= j 1) 1 0)) n)/' ;;
-    par-error-swallowed) f=$d/pframedec.fib; cp $f $f.orig; sub $f 's/\(Err e\) \(Ok nil\)\)\)/(Err e) (Ok (some (array 0 0i8))))))/' ;;
+    par-error-swallowed) f=$d/pframedec.fib; cp $f $f.orig; sub $f 's/\(if \(= \(\. e kind\) :internal\) \(Err e\) \(Ok nil\)\)/(if (= (. e kind) :internal) (Err e) (Ok (some (array 0 0i8))))/' ;;
     par-trap-kills)   f=$d/../par.fib; cp $f $f.orig; sub $f 's/\(Err \(internal \(str "a worker trapped: " \(\. e message\)\)\)\)/(trap "a worker trapped")/' ;;
     par-checksum-skipped) f=$d/pframedec.fib; cp $f $f.orig; sub $f 's/\(and \(\. o verify\) \(\. h cchk\)\)/false/' ;;
     *) echo "mutant-lz4: unknown mutant $1" >&2; return 1 ;;
@@ -72,7 +72,7 @@ for m in "${MUTANTS[@]}"; do
   for s in spec edge prop safety xxh par hostile; do
     log=$t/$s.log
     (cd "$t" && FIB_LIB=$t/lib timeout 900 "$FIBC" test specs/compress-lz4-$s*.fib > "$log" 2>&1) && rc=0 || rc=$?
-    if [ $rc -ne 0 ] || grep -qE '^  (FAIL|TRAP|ERROR)|scenarios: .* [1-9][0-9]* (fail|trap|timeout)' "$log"; then killed="$s: $(grep -m1 -E '^  (FAIL|TRAP|ERROR)|rejected|trap:' "$log" | cut -c1-110)"; break; fi
+    if [ $rc -ne 0 ] || grep -qE '^  (FAIL|TRAP|ERROR)|scenarios: .* [1-9][0-9]* (fail|trap|timeout)' "$log"; then killed="$s: $(grep -m1 -E '^  (FAIL|TRAP|ERROR)|rejected|^  unsupported' "$log" | cut -c1-110)"; break; fi
   done
   if [ -n "$killed" ]; then echo "killed   $m   ($killed)"; else echo "SURVIVED $m"; survived=1; fi
   rm -rf "$t/lib" "$t/specs"

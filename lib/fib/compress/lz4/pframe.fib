@@ -20,7 +20,7 @@
 ;; The blocks [j * gb, min(nb, (j + 1) * gb)) of the input, coded: the buffer and the bytes of it used.
 (defun compress-group (src: (Array i8) o: Options bs: i64 gb: i64 j: i64) -> (Pair (Array i8) i64)
   (let [n (array-len src) from (* j gb bs) bytes (min (* gb bs) (- n from)) nbl (quot (+ bytes (- bs 1)) bs)
-        dst (array (+ (+ bytes (* nbl 8)) (+ (quot bytes 255) 128)) 0i8)
+        dst (fresh (+ (+ bytes (* nbl 8)) (+ (quot bytes 255) 128)))
         e (enc-new (. o level) (. o acceleration) n)]
     (loop [pos from op 0]
       (if (>= pos (+ from bytes)) (Pair dst op)
@@ -58,7 +58,7 @@
              blocks (vec (drop 1 parts))
              tail (array (if (. o checksum) 8 4) 0i8)
              _ (when (. o checksum) (wr32 (data tail) 4 (rd32 (data (. (nth parts 0) fst)) 0)))
-             out (array (+ (array-len head) (+ (total-len blocks) (array-len tail))) 0i8)
+             out (fresh (+ (array-len head) (+ (total-len blocks) (array-len tail))))
              _ (copy-exact (data out) 0 (data head) 0 (array-len head))]
          (match (place out (array-len head) (conj blocks (Pair tail (array-len tail))) workers)
            ((Err e) (Err e))
@@ -69,4 +69,4 @@
   (let [bs (block-size-of o) groups (quot (+ (nblocks (array-len data) bs) (- gb 1)) gb)]
     (match (run-jobs workers groups (fn (j: i64) (Ok (compress-group data o bs gb j))))
       ((Err e) (Err e))
-      ((Ok parts) (let [out (array (total-len parts) 0i8)] (match (place out 0 parts workers) ((Err e) (Err e)) ((Ok _) (Ok out))))))))
+      ((Ok parts) (let [out (fresh (total-len parts))] (match (place out 0 parts workers) ((Err e) (Err e)) ((Ok _) (Ok out))))))))

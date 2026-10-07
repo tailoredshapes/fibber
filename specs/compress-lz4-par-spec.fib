@@ -3,7 +3,7 @@
 ;; frames of many blocks (every kind of error in the middle of the frame: the same error kind whatever the worker count), and a fuzz of mutated many-block frames in which the
 ;; sequential and the parallel decoder must agree on every one.
 (ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.rng fib.compress.types fib.compress.ops fib.compress.corpus fib.compress.gen fib.compress.lz4
-               fib.compress.lz4.mem fib.compress.lz4.header fib.compress.lz4.xxh32 fib.compress.par fib.compress.lz4.pframe fib.compress.lz4.pframedec fib.compress.lz4.framedec fib.compress.lz4.frame))
+               fib.compress.lz4.mem fib.compress.lz4.header fib.compress.lz4.xxh32 fib.compress.par fib.compress.lz4.pframe fib.compress.lz4.pframedec fib.compress.lz4.framedec fib.compress.lz4.frame fib.compress.lz4.block))
 
 (defun bytes-of (v: (Vec i64)) -> (Array i8) (fill (count v) (fn (i: i64) (nth v i))))
 (defun ok-bytes (r: (Result (Array i8) CompressError)) -> (Array i8) (match r ((Ok b) b) ((Err _) (array 0 0i8))))
@@ -137,6 +137,21 @@
                                (if (and (= k1 kt) (not (= k1 :ok))) [] [(str "corrupt stream " t " " k1 " " kt)]))])))
                  [2 3 7]))))
 
+;; ---- results never contain a byte nobody wrote: the decoders make their arrays with array-uninit-i8, so the allocator is first made to hand back DIRTY memory (arrays of the result's size
+;; filled with 0xAA and dropped) and the answers must still be the data, block API, frame API, parallel direct, parallel placement and streamed.
+(defun dirty (n: i64) -> i64 (array-len (same-byte -86 n)))
+(defun poison-failures () -> (Vec str)
+  (let [d (text 77 2600000) o (o64) z (ok-bytes (compress (lz4) d o)) zn (ok-bytes (compress (lz4) d (with-record-size o false))) zb (block-compress d 1)
+        n (array-len d)]
+    (cat-v [(do (dirty (+ n 40)) (if (bytes-eq (ok-bytes (block-decompress zb n)) d) [] ["block-decompress"]))
+            (do (dirty n) (if (bytes-eq (ok-bytes (block-decompress-sized zb n)) d) [] ["block-decompress-sized"]))
+            (do (dirty n) (if (bytes-eq (ok-bytes (decompress (lz4) z (th o 1))) d) [] ["frame direct"]))
+            (do (dirty (* 3 n)) (if (bytes-eq (ok-bytes (decompress (lz4) zn (th o 1))) d) [] ["frame growing"]))
+            (do (dirty n) (if (bytes-eq (ok-bytes (decompress (lz4) z (th o 3))) d) [] ["parallel direct"]))
+            (do (dirty n) (if (bytes-eq (ok-bytes (decompress (lz4) zn (th o 3))) d) [] ["parallel placement"]))
+            (do (dirty n) (if (bytes-eq (ok-bytes (decompress-chunks (lz4) (th o 3) (split-sizes z [700000]))) d) [] ["parallel stream"]))
+            (do (dirty n) (if (bytes-eq (ok-bytes (compress (lz4) d (th o 3))) z) [] ["parallel compress"]))])))
+
 (defspecs specs
   (feature "fib.compress.par: the engine"
     (scenario "results come back in job order for every worker count"
@@ -171,6 +186,8 @@
       (then (expect = [] (jobs-failures))))
     (scenario "a 7 MiB stream in 100 KB chunks: compress is the sequential bytes and decompress the input with 2, 3 and 7 workers, over several batches, with verification off, and a corrupt block gives the sequential error"
       (then (expect = [] (stream-big-failures))))
+    (scenario "with the allocator handing back dirty memory (0xAA) the results are still the data: block, frame (direct and growing), parallel direct, placement and stream, parallel compress"
+      (then (expect = [] (poison-failures))))
     (scenario "the hostile frames again with jobs of 1, 2 and 5 blocks: the verdict is the sequential decoder's"
       (then (expect = [] (hostile-jobs-failures))))
     (scenario "10,000 mutated 3-block frames: the sequential and the 4-thread decoder agree on the verdict and the bytes of every one"

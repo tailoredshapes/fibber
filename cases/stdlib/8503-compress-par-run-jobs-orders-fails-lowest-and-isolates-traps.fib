@@ -1,0 +1,20 @@
+;; spec: docs/design/compress.md
+;; expect: accept
+;; result: 0
+;; audit: abandoned
+;; leaks: 32
+;; stage: 2
+;; roots: ../../lib support
+;; fib.compress.par/run-jobs: results in job order for every worker count; of several failing jobs the lowest index's error; a worker that traps is an :internal error and the process lives.
+(ns main (:use tl.check) (:require [fib.compress.types :as t] [fib.compress.par :as p]))
+(defun main () -> i64
+  (let [c (checks)]
+    (do (dotimes (i 4)
+          (let [w (nth [1 2 7 16] i)]
+            (do (check c (= (p/run-jobs w 25 (fn (j: i64) (t/Ok (* j j)))) (t/Ok (vec (map (fn (j: i64) (* j j)) (range 25))))))
+                (check c (match (p/run-jobs w 20 (fn (j: i64) (cond (= j 8) (Err (t/corrupt "job 8")) (= j 3) (Err (t/too-large "job 3")) :else (Ok j))))
+                           ((Err e) (and (= (. e kind) :too-large) (= (. e message) "job 3"))) ((Ok _) false))))))
+        (dotimes (i 2)
+          (let [w (nth [2 7] i)]
+            (check c (match (p/run-jobs w 12 (fn (j: i64) (if (= j 5) (trap "boom") (Ok j)))) ((Err e) (= (. e kind) :internal)) ((Ok _) false)))))
+        (checks-result c))))

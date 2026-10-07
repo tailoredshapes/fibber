@@ -1,0 +1,21 @@
+;; spec: spec/syntax.md 3.15 (array-uninit-i8)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; roots: ../../lib support
+;; `array-uninit-i8` makes a byte array of the given length without filling it: after the program writes every byte, the array reads back what was written, has the length asked, and copies, slices
+;; and releases like any array; a length of 0 is an empty array; the 4 MiB array of a decoder-sized write survives a copy.
+(ns main (:use tl.check))
+(defun filled (n: i64) -> (Array i8)
+  (let [a (unsafe (array-uninit-i8 n))]
+    (do (unsafe (dotimes (i n) (store-i8 (ptr+ (raw a) (+ 24 i)) (trunc i8 (rem (* i 31) 251))))) a)))
+(defun main () -> i64
+  (let [c (checks) a (filled 1000) big (filled 4194304) e (unsafe (array-uninit-i8 0))]
+    (do (check c (= (array-len a) 1000))
+        (check c (= (array-get a 0) 0i8))
+        (check c (= (array-get a 999) (trunc i8 (rem (* 999 31) 251))))
+        (check c (= (array-len e) 0))
+        (check c (= (array-len big) 4194304))
+        (check c (= (array-get (array-copy big 4194000 4194304) 303) (trunc i8 (rem (* 4194303 31) 251))))
+        (check c (= (array-get (array-copy a 10 20) 0) (trunc i8 (rem (* 10 31) 251))))
+        (checks-result c))))
