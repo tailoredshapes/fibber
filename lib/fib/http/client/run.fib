@@ -2,10 +2,11 @@
 ;; follow redirects under the policy of fib.http.client.redirect, and hand the response over as a stream whose connection returns to the pool
 ;; when (and only when) its body ran to the end under keep-alive. All of it on the caller's thread.
 (ns fib.http.client.run (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes fib.http.url fib.http.uri
-                              fib.http.transport fib.http.body fib.http.client.types fib.http.client.pool fib.http.client.exchange
+                              fib.http.transport fib.http.body fib.http.proxy fib.http.cookies fib.http.tunnel fib.http.client.types fib.http.client.pool fib.http.client.exchange
                               fib.http.client.redirect)
-  (:require [fib.os.time :as time] [fib.string :as s]))
-(defstruct State (options: Options pool: Pool closed: (Cell bool)))
+  (:require [fib.os.time :as time] [fib.string :as s] [fib.http.tcp :as tcp]))
+(defstruct State (options: Options pool: Pool closed: (Cell bool) resolve: (fn :send (str) (Result (Vec str) Error))))
+(defun new-state (o: Options) -> State (State o (new-pool) (cell false) (tcp/resolve-fn (. o resolver))))
 (defun validate-request (request: ClientRequest) -> (Result Url Error)
   (try-let [_ (validate-headers (. request headers))]
     (cond (not (token? (. request method))) (Err (InvalidRequest "invalid HTTP method"))
@@ -29,24 +30,38 @@
         (= total 0) (Ok (. o connect-timeout-ms))
         (= (. o connect-timeout-ms) 0) (Ok (remaining-ms total))
         :else (Ok (min (. o connect-timeout-ms) (remaining-ms total)))))
-(defun open-transport :private (o: Options url: Url total: i64) -> (Result Transport Error)
-  (let [scheme (. url scheme)]
+(defun proxy-of :private (st: State url: Url) -> (Option Proxy)
+  (proxy-for (. (. st options) proxy) (. url scheme) (. url host) (effective-port url)))
+;; An http request through a proxy goes to the proxy in absolute-form; an https one gets a CONNECT tunnel from its dial; both leave the Target's host and port
+;; to the factory as the ORIGIN's (the TLS name to verify), except that plain http dials the proxy's.
+(defun target-for :private (st: State url: Url ms: i64) -> Target
+  (let [o (. st options) scheme (. url scheme) port (effective-port url) direct (tcp/dialer (. st resolve))]
+    (match (proxy-of st url)
+      (nil (Target scheme (. url host) port ms (. o ca-file) direct))
+      ((some p) (if (= scheme "https") (Target scheme (. url host) port ms (. o ca-file) (tunnel-dial (. st resolve) p))
+                  (Target scheme (. p host) (. p port) ms (. o ca-file) direct))))))
+(defun conn-key :private (st: State url: Url) -> str
+  (match (proxy-of st url) (nil (origin url)) ((some p) (if (= (. url scheme) "http") (str (origin url) " via " (. p host) ":" (. p port)) (str (origin url) " tunnel " (. p host) ":" (. p port))))))
+(defun open-transport :private (st: State url: Url total: i64) -> (Result Transport Error)
+  (let [o (. st options) scheme (. url scheme)]
     (match (get (. o factories) scheme)
-      ((some f) (try-let [ms (connect-ms o total)]
-                  ((. f open) (Target scheme (. url host) (effective-port url) ms (. o ca-file)))))
+      ((some f) (try-let [ms (connect-ms o total)] ((. f open) (target-for st url ms))))
       (nil (if (= scheme "https")
              (Err (TlsUnsupported "unsupported scheme https: a TLS Transport factory (driver fib.tls) must be registered for \"https\" in the client options; none is, and the request is not downgraded"))
              (Err (InvalidRequest (str "unsupported scheme: " scheme))))))))
 (defun fresh-conn :private (st: State url: Url total: i64) -> (Result Conn Error)
-  (try-let [t (open-transport (. st options) url total)]
-    (do (count-opened (. st pool)) (Ok (conn-of (origin url) t)))))
+  (try-let [t (open-transport st url total)]
+    (do (count-opened (. st pool)) (Ok (conn-of (conn-key st url) t (if (= (. url scheme) "http") (proxy-of st url) nil))))))
 (defun obtain :private (st: State url: Url total: i64) -> (Result Conn Error)
-  (match (acquire (. st pool) (origin url) (. st options)) ((some c) (Ok c)) (nil (fresh-conn st url total))))
+  (match (acquire (. st pool) (conn-key st url) (. st options)) ((some c) (Ok c)) (nil (fresh-conn st url total))))
 (defun rename :private (e: Error total: i64) -> Error
   (match e ((Timeout "io" m) (if (and (> total 0) (>= (time/clock-now) total)) (Timeout "total" m) (Timeout "read" m))) (_ e)))
 (defun stale? :private (e: Error) -> bool (match e ((Closed) true) ((TransportError _ _) true) (_ false)))
 (defun attempt :private (st: State c: Conn method: str url: Url headers: (Map str (Vec str)) body: (Array i8) total: i64) -> (Result Reply Error)
-  (exchange (. st options) c method (target url) headers body total))
+  (match (. c proxy)
+    (nil (exchange (. st options) c method (target url) headers body total))
+    ((some p) (exchange (. st options) c method (absolute-target url)
+                (match (. p auth) (nil headers) ((some a) (header-set headers "proxy-authorization" a))) body total))))
 (defun retry :private (st: State method: str url: Url headers: (Map str (Vec str)) body: (Array i8) total: i64) -> (Result (Pair Reply Conn) Error)
   (try-let [c (fresh-conn st url total)]
     (match (attempt st c method url headers body total)
@@ -68,15 +83,22 @@
         out (Body next (fn () (trailers body)) (fn () (finished? body)))]
     (do (if (finished? body) (settle true) ())
         (StreamResponse (. (. reply head) status) (. (. reply head) headers) out (fn () (settle false))))))
+(defun jar-headers :private (o: Options url: Url h: (Map str (Vec str))) -> (Map str (Vec str))
+  (match (. o cookies)
+    (nil h)
+    ((some j) (if (some? (get h "cookie")) h
+                (match (header-for j (. url scheme) (. url host) (path-or-root url)) (nil h) ((some v) (assoc h "cookie" [v])))))))
+(defun jar-store :private (o: Options url: Url headers: (Map str (Vec str))) -> unit
+  (match (. o cookies) (nil ()) ((some j) (store j (. url scheme) (. url host) (path-or-root url) (unwrap-or (get headers "set-cookie") [])))))
 (defun loop-key :private (method: str url: Url) -> str (str method " " (url-string (with url (fragment nil)))))
 (defun drain :private (sr: StreamResponse) -> unit
   (match (read-all (. sr body) 65536) ((Ok _) ()) ((Err _) ((. sr abandon)))))
 (defun hop :private (st: State method: str url: Url headers: (Map str (Vec str)) body: (Array i8) total: i64 hops: i64 seen: (Vec str))
   -> (Result StreamResponse Error)
-  (let [o (. st options) h (hop-headers o url method headers body)]
+  (let [o (. st options) h (jar-headers o url (hop-headers o url method headers body))]
     (match (fetch st method url h body total)
       ((Err e) (Err (rename e total)))
-      ((Ok got) (let [sr (managed st (. got snd) (. got fst) total) status (. sr status)
+      ((Ok got) (let [sr (managed st (. got snd) (. got fst) total) status (. sr status) _ (jar-store o url (. sr headers))
                       loc (header (. sr headers) "location")]
         (if (not (and (. o follow-redirects) (redirect-status? status) (some? loc))) (Ok sr)
           (follow st method url headers body total hops seen sr (unwrap-or loc ""))))))))
@@ -92,6 +114,27 @@
                 (if (includes? key seen) (do ((. sr abandon)) (Err (RedirectLoop (str "redirect loop at " (url-string next)))))
                   (do (drain sr)
                       (hop st m2 next (redirect-headers headers url next kept) (if kept body (array 0 0i8)) total (+ hops 1) (conj seen key))))))))))))
+;; An upload: the body is a producer (StreamingRequest). One attempt on a live connection (the pool probes liveness), no retry and no redirect following, because the producer cannot be
+;; rewound; the response is whatever came back (a 3xx is returned as it is).
+(defun upload-headers :private (o: Options url: Url req: StreamingRequest) -> (Map str (Vec str))
+  (let [base (jar-headers o url (hop-headers o url (. req method) (. req headers) (array 0 0i8))) plain (dissoc (dissoc base "content-length") "transfer-encoding")]
+    (match (. req length) ((some n) (assoc plain "content-length" [(str n)])) (nil (assoc plain "transfer-encoding" ["chunked"])))))
+(defun upload-once :private (st: State req: StreamingRequest url: Url headers: (Map str (Vec str)) total: i64) -> (Result StreamResponse Error)
+  (try-let [c (obtain st url total)]
+    (let [px (. c proxy) target (match px (nil (target url)) ((some _) (absolute-target url)))
+          h (match px (nil headers) ((some p) (match (. p auth) (nil headers) ((some a) (header-set headers "proxy-authorization" a)))))]
+      (match (exchange-upload (. st options) c (. req method) target h (. req next) (. req length) total)
+        ((Err e) (do (close-conn c) (Err (rename e total))))
+        ((Ok reply) (let [sr (managed st c reply total)] (do (jar-store (. st options) url (. sr headers)) (Ok sr))))))))
+(defun start-upload (st: State req: StreamingRequest) -> (Result StreamResponse Error)
+  (if @(. st closed) (Err Closed)
+    (try-let [url (validate-request (ClientRequest (. req method) (. req url) (. req headers) (array 0 0i8)))]
+      (match (. req length)
+        ((some n) (if (< n 0) (Err (InvalidRequest "negative upload length")) (upload-with st req url)))
+        (nil (upload-with st req url))))))
+(defun upload-with :private (st: State req: StreamingRequest url: Url) -> (Result StreamResponse Error)
+  (let [o (. st options) total (if (> (. o timeout-ms) 0) (+ (time/clock-now) (* (. o timeout-ms) 1000000)) 0)]
+    (upload-once st req url (upload-headers o url req) total)))
 (defun start (st: State request: ClientRequest) -> (Result StreamResponse Error)
   (if @(. st closed) (Err Closed)
     (try-let [url (validate-request request)]

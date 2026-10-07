@@ -33,13 +33,21 @@
           (= u "/big") (st/Whole (Response 200 {} (pattern (parse-status (param r "n")))))
           (= u "/close") (st/Whole (Response 200 {"connection" ["close"]} (str-bytes "bye")))
           (= u "/rot") (st/Whole (Response 200 {"content-encoding" ["x-rev"]} (str-bytes "olleh")))
+          (= u "/rot2") (st/Whole (Response 200 {"content-encoding" ["x-rev, x-rev"] "content-length" ["5"]} (str-bytes "hello")))
+          (= u "/rot-br") (st/Whole (Response 200 {"content-encoding" ["x-rev, br"]} (str-bytes "olleh")))
+          (= u "/dup") (st/Whole (Response 200 {"content-encoding" ["x-dup"]} (str-bytes "abcde")))
+          (= u "/five") (st/Whole (Response 200 {"content-encoding" ["x-rev,x-rev,x-rev,x-rev,x-rev"]} (str-bytes "hello")))
           (= u "/target") (ok (str "target:" (. r request-method)))
           (starts-with? u "/status/") (st/Whole (text-response (parse-status (str-slice u 8 (str-len u))) "status"))
           :else (ok "root"))))
 (defun parse-status (t: str) -> i64 (loop [i 0 n 0] (if (= i (str-len t)) n (recur (+ i 1) (+ (* n 10) (- (zext i64 (str-byte-at t i)) 48))))))
 (defun reverse-decoder () -> Decoder
-  (Decoder "x-rev" (fn (b: (Array i8)) (Ok (let [n (array-len b) out (cell (array n 0i8))] (do (dotimes (i n) (array-set! &out i (array-get b (- (- n 1) i)))) @out))))))
+  (Decoder "x-rev" (fn (b: (Array i8) limit: i64) (if (> (array-len b) limit) (Err (LimitError "too large")) (Ok (let [n (array-len b) out (cell (array n 0i8))] (do (dotimes (i n) (array-set! &out i (array-get b (- (- n 1) i)))) @out)))))))
 
+;; doubles the body: a decoder that honours the limit says so, the greedy one does not (the client's own check must catch it)
+(defun dup (b: (Array i8)) -> (Array i8) (let [n (array-len b) out (cell (array (* 2 n) 0i8))] (do (dotimes (i n) (do (array-set! &out i (array-get b i)) (array-set! &out (+ n i) (array-get b i)))) @out)))
+(defun dup-decoder () -> Decoder (Decoder "x-dup" (fn (b: (Array i8) limit: i64) (if (> (* 2 (array-len b)) limit) (Err (LimitError "decoded body would exceed the limit")) (Ok (dup b))))))
+(defun greedy-decoder () -> Decoder (Decoder "x-dup" (fn (b: (Array i8) limit: i64) (Ok (dup b)))))
 (defun pipe-options () -> Options
   (let [lf (loopback-factory handler (st/default-options))]
     (with-factory (with-factory (default-options) "http" lf) "https" lf)))
@@ -159,6 +167,22 @@
             (expect = "x-rev" (body-or (get with-d "http://pipe.test/h/accept-encoding")))
             (expect = "none" (body-or (get without "http://pipe.test/h/accept-encoding")))
             (expect = (some "x-rev") (match (get without "http://pipe.test/rot") ((Ok x) (header (. x headers) "content-encoding")) (_ nil))))))
+  (feature "the decoder seam, finished"
+    (scenario "codings are undone last first, content-encoding and content-length are removed after a full decode"
+      (given [cl (build (with-decoder (pipe-options) (reverse-decoder))) r (get cl "http://pipe.test/rot2")])
+      (then (expect = "hello" (body-or r)) (expect = nil (match r ((Ok x) (header (. x headers) "content-encoding")) (_ nil))) (expect = nil (match r ((Ok x) (header (. x headers) "content-length")) (_ nil)))))
+    (scenario "one coding with no decoder leaves the body as received and the header in place (nothing is half decoded)"
+      (given [cl (build (with-decoder (pipe-options) (reverse-decoder))) r (get cl "http://pipe.test/rot-br")])
+      (then (expect = "olleh" (body-or r)) (expect = (some "x-rev, br") (match r ((Ok x) (header (. x headers) "content-encoding")) (_ nil)))))
+    (scenario "more than four codings are refused"
+      (then (expect = "protocol" (err-kind (get (build (with-decoder (pipe-options) (reverse-decoder))) "http://pipe.test/five")))))
+    (scenario "a decoder that honours the limit fails with LimitError; a greedy one is caught by the client's own cap; both within the cap succeed"
+      (then (expect = "too-large" (err-kind (get (build (with (with-decoder (pipe-options) (dup-decoder)) (max-response-bytes 8))) "http://pipe.test/dup")))
+            (expect = "too-large" (err-kind (get (build (with (with-decoder (pipe-options) (greedy-decoder)) (max-response-bytes 8))) "http://pipe.test/dup")))
+            (expect = "abcdeabcde" (body-or (get (build (with (with-decoder (pipe-options) (dup-decoder)) (max-response-bytes 10))) "http://pipe.test/dup")))))
+    (scenario "decompress false leaves everything as received and sends no Accept-Encoding"
+      (given [cl (build (with (with-decoder (pipe-options) (reverse-decoder)) (decompress false)))])
+      (then (expect = "olleh" (body-or (get cl "http://pipe.test/rot"))) (expect = "none" (body-or (get cl "http://pipe.test/h/accept-encoding"))))))
   (feature "client and server over localhost sockets"
     (scenario "basic requests, bodies, HEAD, errors, Host, Date" (then (expect = "" (run-on-sockets (fn (base: str) (basic (build (default-options)) base))))))
     (scenario "the redirect matrix over one real server"

@@ -171,3 +171,10 @@ writable path, 512 MB).
 
 A boot of the binary as PID 1 under qemu-system (no qemu-system on this machine: platform-boundary.md 4); `zig cc` as a toolchain; a `deps.fib` project setting for link modes; static builds of the compiler itself; macOS (no static executables there); riscv64 and wasm
 (the rows exist, `--static` refuses them); the AWS Lambda Runtime Interface Emulator; any use of AWS.
+
+## HTTP-2 note: name resolution without libc
+
+`fib.http` used `getaddrinfo`, which in a static musl binary needs `/etc/hosts` and `/etc/resolv.conf` in the image (and under glibc, NSS and shared libraries a static binary cannot load). HTTP-2 added a native
+resolver (`fib.dns`, docs/design/dns.md) that the client uses by default: it reads `/etc/resolv.conf` and `/etc/hosts` itself and speaks DNS over UDP and TCP, with documented fallbacks when the files are
+absent (no nameserver means `127.0.0.1`). A static binary alone in a `FROM scratch` image with only a bind-mounted `resolv.conf` resolves and fetches (`scripts/static-fetch-demo.sh`). `(with-system-resolver o)` keeps
+`getaddrinfo` for hosts whose names live in NSS only.

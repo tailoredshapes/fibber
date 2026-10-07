@@ -180,3 +180,29 @@ HTTP_FIBC=fibc scripts/test-http.sh            # the cases and the Python differ
 FIBC=fibc scripts/http-diff.sh                 # curl against python3 and the native server
 FIBC=fibc scripts/mutant-http.sh               # 18 planted faults, each must be killed
 ```
+
+## HTTP-2 additions
+
+```clojure
+;; names: the native resolver is the default (docs/design/dns.md); getaddrinfo is opt-in
+(with-system-resolver options)                       ; hosts whose names live in NSS only (mDNS, LDAP)
+(with-resolver options (CustomResolver (fn (host) (Ok ["127.0.0.1"]))))
+
+;; proxies: explicit; nothing reads the environment unless asked
+(with-proxy options (proxy-from-env))                ; http_proxy, https_proxy, no_proxy (then HTTPS_PROXY, NO_PROXY; HTTP_PROXY outside CGI)
+(with-proxy options (ProxySettings (some p) (some p) ["internal.example" ".corp.test"]))   ; p from (parse-proxy-url "http://user:pass@proxy:3128")
+;; plain http: absolute-form to the proxy; https: CONNECT host:port, then the TLS factory over the tunnel; Basic proxy credentials never appear in an error
+
+;; cookies: opt-in (fib.http.cookies; no public-suffix list: see docs/design/http.md)
+(with-cookies options (new-jar))
+
+;; decoders: the seam passes the output cap; fib-zlib (its own repo) is the gzip and deflate driver
+(with-decoder options (Decoder "gzip" (fn (bytes max-output) ...)))      ; or (zh/with-zlib options) from fib.zlib.http
+
+;; streaming bodies
+(request-upload client (StreamingRequest "PUT" url {} next (some length)))   ; next: (fn () (Option (Array i8))); length nil = chunked
+(run-server-stream (fn (request body) reply) options)                        ; body: fib.http.body/next-chunk until the empty array
+```
+
+`Target` gained `dial` (how a factory reaches the network with the client's resolver and proxy); a TLS factory calls `((. target dial) host port ms)` instead of `fib.http.tcp/connect`.
+A pooled connection is probed for liveness before reuse. At stop the server answers connections it never accepted with a 503.
