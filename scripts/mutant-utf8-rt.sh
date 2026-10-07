@@ -24,7 +24,8 @@ for m in "${MUTANTS[@]}"; do
   esac
   cmp -s "$f" "$R/compiler/emit/runtime.fib" && { echo "SETUP ERROR $m: pattern not found" >&2; exit 2; }
   (cd "$OUT" && FIB_LIB=$OUT/lib "$FIBC" build compiler/fibc.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o "$OUT/F9" > "$OUT/build.log" 2>&1) || { echo "SETUP ERROR $m: build failed"; exit 2; }
-  if (cd "$R" && FIB_LIB=$R/lib "$OUT/F9" cases cases/stdlib --only 8070- 2>&1 | grep -q "FAIL"); then echo "killed   $m"; else echo "SURVIVED $m"; survived=1; fi
+  out=$(cd "$R" && FIB_LIB=$R/lib "$OUT/F9" cases cases/stdlib --only 8070- 2>&1 || true)
+  if printf '%s' "$out" | grep -q "FAIL"; then echo "killed   $m"; else echo "SURVIVED $m"; survived=1; fi
 done
 rm -rf "$OUT"
 [ $survived = 0 ]
