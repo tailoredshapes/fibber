@@ -10,6 +10,11 @@
 (derive Eq CryptoError)
 (derive Debug CryptoError)
 
+;; `kind`s a caller branches on, beyond the four above: "authentication-failed" (an AEAD tag did not verify: no plaintext is returned) and
+;; "invalid-signature" (a well-formed signature that does not verify). A malformed key, point, signature or length is "invalid-argument".
+(defun authentication-failed () -> CryptoError (CryptoError "authentication-failed" "the authentication tag does not verify"))
+(defun invalid-signature () -> CryptoError (CryptoError "invalid-signature" "the signature does not verify"))
+
 (defun unsupported (what: str) -> CryptoError (CryptoError "unsupported" (str what " is not supported by this provider")))
 (defun invalid-argument (message: str) -> CryptoError (CryptoError "invalid-argument" message))
 (defun crypto-failed (message: str) -> CryptoError (CryptoError "failed" message))
@@ -21,12 +26,16 @@
 (defenum Kdf
   (KdfPbkdf2 alg: keyword password: (Array i8) salt: (Array i8) iterations: i64 length: i64)
   (KdfHkdf alg: keyword ikm: (Array i8) salt: (Array i8) info: (Array i8) length: i64)
+  (KdfHkdfExpand alg: keyword prk: (Array i8) info: (Array i8) length: i64)
   (KdfScrypt password: (Array i8) salt: (Array i8) n: i64 r: i64 p: i64 length: i64)
   (KdfArgon2id password: (Array i8) salt: (Array i8) iterations: i64 memory-kib: i64 lanes: i64 length: i64))
 
 ;; The capability name of a key derivation function.
 (defun kdf-name (k: Kdf) -> keyword
-  (match k ((KdfPbkdf2 _ _ _ _ _) :pbkdf2) ((KdfHkdf _ _ _ _ _) :hkdf) ((KdfScrypt _ _ _ _ _ _) :scrypt) ((KdfArgon2id _ _ _ _ _ _) :argon2id)))
+  (match k ((KdfPbkdf2 _ _ _ _ _) :pbkdf2) ((KdfHkdf _ _ _ _ _) :hkdf) ((KdfHkdfExpand _ _ _ _) :hkdf) ((KdfScrypt _ _ _ _ _ _) :scrypt) ((KdfArgon2id _ _ _ _ _ _) :argon2id)))
+
+;; `KdfHkdfExpand` is HKDF-Expand alone (RFC 5869 2.3) over a PRK the caller already has (TLS 1.3's HKDF-Expand-Label is it, with the
+;; HkdfLabel bytes as `info`); HKDF-Extract is `hmac` (salt as the key, the input keying material as the data). Both are under the `:hkdf` capability.
 
 ;; A running digest or HMAC. A hasher is a handle on state the driver owns: `hasher-update` feeds the bytes `data[off, off+len)` (so a large
 ;; input is never copied), `hasher-finish` returns the result and releases the state, `hasher-close` releases it without a result. Closing is
@@ -36,11 +45,45 @@
   (hasher-finish (self) -> (Result (Array i8) CryptoError))
   (hasher-close (self) -> unit))
 
+;; A private key a driver owns: a HANDLE, not bytes. The key never leaves the driver as bytes (there is no export). It does the operations itself,
+;; so a handle cannot be given to another driver's provider. `private-key-kind` is `:x25519 :ed25519 :p-256 :p-384`. `private-key-public` is the
+;; public key's raw encoding (X25519 and Ed25519: 32 bytes; P-256 and P-384: the uncompressed SEC1 point, 0x04 || X || Y), what a TLS key_share carries.
+;; `private-key-agree` is the shared secret with the peer's raw public encoding (X25519 and ECDH; never used raw: feed it to `hkdf`); it is an error
+;; for a wrong length, a point not on the curve, and a small-order point (an all-zero X25519 result). `private-key-sign` signs the message under a
+;; `scheme` of `public-key-verify`'s list that fits the key (Ed25519: `:ed25519`; P-256 and P-384: `:ecdsa-p256-sha256`, `:ecdsa-p384-sha384`; the
+;; signature is DER for ECDSA). `private-key-close` is idempotent and cleanses the key; use after close is a "closed" error.
+(defprotocol PrivateKey
+  (private-key-kind (self) -> keyword)
+  (private-key-public (self) -> (Result (Array i8) CryptoError))
+  (private-key-agree (self peer: (Array i8)) -> (Result (Array i8) CryptoError))
+  (private-key-sign (self scheme: keyword msg: (Array i8)) -> (Result (Array i8) CryptoError))
+  (private-key-close (self) -> unit))
+
+;; A public key a driver owns, imported from X.509 SubjectPublicKeyInfo DER. `public-key-kind` is `:rsa :p-256 :p-384 :ed25519`. `public-key-verify`
+;; is Ok only for a valid signature: a signature that does not verify is an "invalid-signature" error, a malformed one, a scheme the key does
+;; not fit, or a key too weak for the scheme is "invalid-argument". Schemes: `:rsa-pss-sha256 :rsa-pss-sha384` (MGF1 with the same hash, salt
+;; length = hash length: TLS 1.3's rsa_pss_rsae), `:rsa-pkcs1-sha256 :rsa-pkcs1-sha384` (RSASSA-PKCS1-v1_5, still the certificates'),
+;; `:ecdsa-p256-sha256 :ecdsa-p384-sha384` (DER signature), `:ed25519`. `public-key-close` is idempotent.
+(defprotocol PublicKey
+  (public-key-kind (self) -> keyword)
+  (public-key-verify (self scheme: keyword msg: (Array i8) sig: (Array i8)) -> (Result unit CryptoError))
+  (public-key-close (self) -> unit))
+
 ;; What a driver implements. Every operation returns a `Result`; an algorithm the provider does not list in `provider-capabilities` is an
 ;; "unsupported" error from the operation that asked for it. Capability names are keywords: digests `:sha-256` `:sha-384` `:sha-512` and
 ;; the legacy `:sha-1` `:md5` (not for security), the key derivation functions of `Kdf`, and `:hmac`, `:random`, `:ct-equal`. The
 ;; constant-time comparison is the library's (CRYPTO_memcmp, timingsafe_bcmp), never a loop of ours: `provider-ct-equal` is false for
 ;; bytes of different lengths (the length is not secret) and compares equal-length bytes in time that does not depend on where they differ.
+;;
+;; The public-key methods have DEFAULTS that answer "unsupported": a driver that has none of them implements the first seven methods only.
+;;   AEAD (docs/design/crypto.md 9): `:aes-128-gcm :aes-256-gcm :chacha20-poly1305`. `provider-aead-seal` returns ciphertext || tag (16 bytes);
+;;   `provider-aead-open` takes that and returns the plaintext, or "authentication-failed" with NOTHING of the plaintext. The nonce is 12 bytes for all
+;;   three, the key 16 or 32 (see `aead-key-length`); another length is "invalid-argument".
+;;   Key agreement: `:x25519 :ecdh-p256 :ecdh-p384`: `provider-generate-key` with `:x25519 :p-256 :p-384` (a handle, see `PrivateKey`).
+;;   Signatures: a verify scheme is a capability (`:rsa-pss-sha256 ... :ed25519`, see `PublicKey`); signing is `:sign-ed25519`
+;;   `:sign-ecdsa-p256-sha256` `:sign-ecdsa-p384-sha384`, with a key from `provider-generate-key` (`:ed25519 :p-256 :p-384`) or `provider-import-private`
+;;   (PKCS#8 DER: the only way raw private bytes enter, for known-answer tests and stored keys; the array is the caller's to cleanse).
+;;   `provider-import-public` takes the X.509 SubjectPublicKeyInfo DER of a certificate (the whole array is one SPKI: trailing bytes are an error).
 (defprotocol CryptoProvider
   (provider-name (self) -> str)
   (provider-capabilities (self) -> (Vec keyword))
@@ -48,4 +91,14 @@
   (provider-hmac-start (self alg: keyword key: (Array i8)) -> (Result (dyn Hasher :send) CryptoError))
   (provider-derive (self kdf: Kdf) -> (Result (Array i8) CryptoError))
   (provider-random (self n: i64) -> (Result (Array i8) CryptoError))
-  (provider-ct-equal (self a: (Array i8) b: (Array i8)) -> bool))
+  (provider-ct-equal (self a: (Array i8) b: (Array i8)) -> bool)
+  (provider-aead-seal (self alg: keyword key: (Array i8) nonce: (Array i8) aad: (Array i8) plaintext: (Array i8)) -> (Result (Array i8) CryptoError)
+    (Err (unsupported (str alg))))
+  (provider-aead-open (self alg: keyword key: (Array i8) nonce: (Array i8) aad: (Array i8) sealed: (Array i8)) -> (Result (Array i8) CryptoError)
+    (Err (unsupported (str alg))))
+  (provider-generate-key (self alg: keyword) -> (Result (dyn PrivateKey :send) CryptoError)
+    (Err (unsupported (str alg))))
+  (provider-import-private (self alg: keyword pkcs8: (Array i8)) -> (Result (dyn PrivateKey :send) CryptoError)
+    (Err (unsupported (str alg))))
+  (provider-import-public (self spki: (Array i8)) -> (Result (dyn PublicKey :send) CryptoError)
+    (Err (unsupported "public keys"))))

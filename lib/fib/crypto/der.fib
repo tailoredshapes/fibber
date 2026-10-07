@@ -1,0 +1,43 @@
+;; fib.crypto.der: the fixed DER headers that turn a RAW key into the standard container a driver imports (docs/design/crypto.md 9). An encoding of
+;; PUBLIC constants (the AlgorithmIdentifier OIDs of RFC 8410 and RFC 5480), not cryptography: nothing here reads a secret or branches on one. A TLS
+;; client gets a peer's key_share as raw bytes (X25519: 32; P-256: 65, 0x04 || X || Y; P-384: 97) and a driver wraps it in SubjectPublicKeyInfo to hand
+;; it to its library, which then checks the point; a known-answer test wraps a raw Ed25519 or X25519 private key in PKCS#8. Certificate parsing (reading
+;; DER) is NOT here: it is the next package's.
+(ns fib.crypto.der (:use fib.core fib.seq fib.coll fib.crypto.types fib.crypto.encoding))
+
+(defun spki-header :private (kind: keyword) -> (Option (Pair str i64))
+  (cond (= kind :x25519) (some (Pair "302a300506032b656e032100" 32))
+        (= kind :ed25519) (some (Pair "302a300506032b6570032100" 32))
+        (= kind :p-256) (some (Pair "3059301306072a8648ce3d020106082a8648ce3d030107034200" 65))
+        (= kind :p-384) (some (Pair "3076301006072a8648ce3d020106052b81040022036200" 97))
+        :else nil))
+
+;; The raw private key of X25519 and Ed25519 is 32 bytes: PKCS#8 wraps it as an OCTET STRING in an OCTET STRING (RFC 8410 7).
+(defun pkcs8-header :private (kind: keyword) -> (Option str)
+  (cond (= kind :x25519) (some "302e020100300506032b656e04220420")
+        (= kind :ed25519) (some "302e020100300506032b657004220420")
+        :else nil))
+
+(defun bytes-cat (a: (Array i8) b: (Array i8)) -> (Array i8)
+  (let [out (cell (array (+ (array-len a) (array-len b)) 0i8))]
+    (do (dotimes (i (array-len a)) (array-set! &out i (array-get a i)))
+        (dotimes (i (array-len b)) (array-set! &out (+ (array-len a) i) (array-get b i)))
+        @out)))
+
+(defun header-bytes :private (h: str) -> (Array i8) (match (unhex h) ((Ok b) b) ((Err e) (trap "fib.crypto.der: a bad header constant"))))
+
+;; SubjectPublicKeyInfo DER of a raw public key of `kind` (:x25519 :ed25519 :p-256 :p-384); the raw length is checked, the point is not (the library does).
+(defun wrap-public (kind: keyword raw: (Array i8)) -> (Result (Array i8) CryptoError)
+  (match (spki-header kind)
+    (nil (Err (unsupported (str kind))))
+    ((some h) (if (= (array-len raw) (. h snd)) (Ok (bytes-cat (header-bytes (. h fst)) raw))
+                (Err (invalid-argument (str kind " public key: the raw encoding is " (. h snd) " bytes")))))))
+
+;; PKCS#8 DER of a raw 32-byte private key of `kind` (:x25519 :ed25519). The result holds the key: cleanse it as you would the key.
+(defun wrap-private (kind: keyword raw: (Array i8)) -> (Result (Array i8) CryptoError)
+  (match (pkcs8-header kind)
+    (nil (Err (unsupported (str kind))))
+    ((some h) (if (= (array-len raw) 32) (Ok (bytes-cat (header-bytes h) raw)) (Err (invalid-argument (str kind " private key: the raw encoding is 32 bytes")))))))
+
+;; The raw public length of a key kind, -1 when unknown.
+(defun raw-public-length (kind: keyword) -> i64 (match (spki-header kind) (nil -1) ((some h) (. h snd))))

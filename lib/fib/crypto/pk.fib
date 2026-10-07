@@ -1,0 +1,29 @@
+;; fib.crypto.pk: AEAD, key agreement and signatures over a provider (docs/design/crypto.md 9). Thin, like fib.crypto.ops: the work is the
+;; driver's library's; this module has the FACTS about the algorithms (key, nonce and tag lengths: numbers from RFC 5116, 8439 and NIST SP 800-38D,
+;; not computation) and the sequencing that closes a key handle an error leaves open. A TLS 1.3 client needs exactly: `import-public-key` and
+;; `public-key-verify` for the certificate and CertificateVerify, `generate-key` and `private-key-agree` for the key share, `aead-seal`/`aead-open`
+;; for records, `random-bytes`, `digest`, `hmac`, `hkdf-expand`, and nothing else of the provider.
+(ns fib.crypto.pk (:use fib.core fib.seq fib.coll fib.crypto.types fib.crypto.ops))
+
+(defun aead-algs () -> (Vec keyword) [:aes-128-gcm :aes-256-gcm :chacha20-poly1305])
+(defun aead-key-length (alg: keyword) -> i64 (cond (= alg :aes-128-gcm) 16 (= alg :aes-256-gcm) 32 (= alg :chacha20-poly1305) 32 :else -1))
+(defun aead-nonce-length (alg: keyword) -> i64 (if (= (aead-key-length alg) -1) -1 12))
+(defun aead-tag-length (alg: keyword) -> i64 (if (= (aead-key-length alg) -1) -1 16))
+
+;; ciphertext || tag. The nonce must never repeat under one key: that is the caller's (TLS derives it from a counter), not the library's.
+(defun aead-seal (p: p alg: keyword key: (Array i8) nonce: (Array i8) aad: (Array i8) plaintext: (Array i8)) :where ((CryptoProvider p)) -> (Result (Array i8) CryptoError)
+  (provider-aead-seal p alg key nonce aad plaintext))
+
+;; The plaintext of `sealed` (ciphertext || tag), or an error and nothing else: "authentication-failed" when the tag does not verify.
+(defun aead-open (p: p alg: keyword key: (Array i8) nonce: (Array i8) aad: (Array i8) sealed: (Array i8)) :where ((CryptoProvider p)) -> (Result (Array i8) CryptoError)
+  (provider-aead-open p alg key nonce aad sealed))
+
+(defun generate-key (p: p alg: keyword) :where ((CryptoProvider p)) -> (Result (dyn PrivateKey :send) CryptoError) (provider-generate-key p alg))
+(defun import-private-key (p: p alg: keyword pkcs8: (Array i8)) :where ((CryptoProvider p)) -> (Result (dyn PrivateKey :send) CryptoError) (provider-import-private p alg pkcs8))
+(defun import-public-key (p: p spki: (Array i8)) :where ((CryptoProvider p)) -> (Result (dyn PublicKey :send) CryptoError) (provider-import-public p spki))
+
+;; Verifies one signature under the SPKI of a certificate and releases the key: Ok only when the signature is valid.
+(defun verify-signature (p: p spki: (Array i8) scheme: keyword msg: (Array i8) sig: (Array i8)) :where ((CryptoProvider p)) -> (Result unit CryptoError)
+  (match (provider-import-public p spki)
+    ((Err e) (Err e))
+    ((Ok k) (let [r (public-key-verify k scheme msg sig)] (do (public-key-close k) r)))))
