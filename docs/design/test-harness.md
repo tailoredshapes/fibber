@@ -325,7 +325,7 @@ Colourless, one row per scenario, failures expanded with the steps and the two s
                  "impl": str,             // "" for a feature
                  "id": str,               // stable, unique, includes [impl]
                  "text": str, "covers": [str..],
-                 "status": "pass"|"fail"|"trap"|"timeout",
+                 "status": "pass"|"fail"|"trap"|"timeout"|"skip",   // skip: a (skip-unless COND "reason") step whose COND was false; no pass, no failure, counted apart (summary.skip, only when above 0; TAP: ok .. # SKIP reason)
                  "message": str,          // trap text, timeout reason, or "no Then step.."
                  "steps": [ { "kind": "Given"|"When"|"Then", "text": str,
                               "status": "held"|"broke", "expected": str, "actual": str } ] } ] }

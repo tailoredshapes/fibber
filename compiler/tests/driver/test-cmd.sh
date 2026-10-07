@@ -46,6 +46,27 @@ cat > "$t/hang-spec.fib" <<'EOF'
 (defun main () -> i64 (run-main (specs)))
 EOF
 echo '(ns main (:use fib.test.core) (defspecs' > "$t/broken-spec.fib"
+# skip-unless: a scenario whose condition is false is reported as skipped (no pass, no failure) and none of its steps runs (its given would trap);
+# one whose condition holds runs, and fails when its claim is wrong.
+mkdir -p "$t/skips" "$t/skipfail"
+cat > "$t/skips/s-spec.fib" <<'EOF'
+(ns main (:use fib.test.core fib.test.run))
+(defspecs specs
+  (feature "Skips"
+    (scenario "needs a thing that is not here"
+      (skip-unless (= 1 2) "no such thing")
+      (given [v [1 2]])
+      (then (expect = 9 (nth v 7))))
+    (scenario "holds" (skip-unless (= 1 1) "never") (given [a 1]) (then (expect = 1 a)))))
+(defun main () -> i64 (run-main (specs)))
+EOF
+cat > "$t/skipfail/f-spec.fib" <<'EOF'
+(ns main (:use fib.test.core fib.test.run))
+(defspecs specs
+  (feature "NotSkipped"
+    (scenario "the condition holds, so the wrong claim is judged" (skip-unless (= 1 1) "never") (given [a 1]) (then (expect = 2 a)))))
+(defun main () -> i64 (run-main (specs)))
+EOF
 cd "$t" || exit 2
 
 $s2 test specs/good-spec.fib > "$t/o1" 2> "$t/e1"; ck "a holding spec: exit 0" $? 0
@@ -76,6 +97,15 @@ $s2 test specs --format tap > "$t/o11" 2> /dev/null; ck "tap: exit 1" $? 1
 ck "tap: one plan for both files, numbered in order" "$(grep -E '^(1\.\.|ok |not ok )' "$t/o11" | sed -E 's/ - .*//' | tr '\n' '|')" "1..4|ok 1|ok 2|not ok 3|ok 4|"
 $s2 test specs --list > "$t/o12" 2> /dev/null; ck "--list: exit 0" $? 0
 ck "--list: the ids, nothing run" "$(grep -c '^Good/' "$t/o12") $(grep -c '^Bad/' "$t/o12")" "2 2"
+
+$s2 test skips > "$t/o20" 2> /dev/null; ck "skip: a skipped scenario is no failure: exit 0" $? 0
+ck "skip: the total says skipped, and the skipped one is no pass" "$(grep '^total:' "$t/o20")" "total: 2 scenarios: 1 pass, 0 fail, 0 trap, 0 timeout, 1 skipped in 1 spec files (seed 1)"
+ck "skip: the row says skip and why" "$(grep -c 'skip  needs a thing' "$t/o20") $(grep -c 'skipped: no such thing' "$t/o20")" "1 1"
+$s2 test skips --format json > "$t/o21" 2> /dev/null; ck "skip: json exit 0" $? 0
+ck "skip: json summary" "$(grep -o '"summary":{[^}]*}' "$t/o21")" '"summary":{"total":2,"pass":1,"fail":0,"trap":0,"timeout":0,"skip":1}'
+$s2 test skips --format tap > "$t/o22" 2> /dev/null; ck "skip: tap exit 0" $? 0
+ck "skip: tap marks it SKIP with the reason" "$(grep -c '^ok 1 - .* # SKIP no such thing' "$t/o22")" 1
+$s2 test skipfail > /dev/null 2>&1; ck "skip: a condition that holds runs the scenario: its wrong claim fails, exit 1" $? 1
 
 $s2 test --bogus > /dev/null 2>&1; ck "an unknown option: exit 2" $? 2
 $s2 test --format yaml specs > /dev/null 2>&1; ck "a bad format: exit 2" $? 2
