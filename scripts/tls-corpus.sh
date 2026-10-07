@@ -144,6 +144,12 @@ with open(out, "w") as f:
     expr = "(fixtures-0)"
     for n in range(1, len(parts)): expr = "(concat %s (fixtures-%d))" % (expr, n)
     f.write("(defun fixtures () -> (Vec Fx) (vec %s))\n" % expr)
+key = subprocess.run(["openssl", "pkcs8", "-topk8", "-nocrypt", "-in", "%s/leaf.key" % w, "-outform", "DER"], capture_output=True, check=True).stdout.hex()
+with open(out, "a") as f:
+    f.write(";; The private key (PKCS#8, ECDSA P-256) of the fixture `leaf` and the chain [leaf, inter] below it: the in-memory test server of tls-specs/ signs its CertificateVerify with it.\n")
+    f.write("(defun server-key-pkcs8 () -> str \"%s\")\n" % key)
+    f.write("(defun server-chain () -> (Vec str) [\"%s\" \"%s\"])\n" % (der("leaf"), der("inter")))
+    f.write("(defun server-root () -> str \"%s\")\n" % der("root"))
 print("wrote %d fixtures" % len(rows))
 EOF
 (cd "$here/.." && sha256sum specs/tls-fixtures.fib > specs/tls-fixtures.sha256)

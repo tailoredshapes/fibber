@@ -1,0 +1,160 @@
+;; The TLS 1.3 client end to end against an in-memory server (tls-server) that uses the library's own record layer and key schedule and the OpenSSL driver for the primitives, so the
+;; flights carry REAL signatures and AEAD records: every suite, ALPN, a CertificateRequest, handshake messages in 1-byte records and in one record; every break the server can make
+;; of its flight (each must give the typed error, never success); post-handshake KeyUpdate in both directions, tickets, close_notify against truncation, alerts, a plaintext record
+;; after the keys are on, an oversized, replayed, reordered and corrupted record; 1 MiB each way; the server's flight cut at every byte and flipped at every byte. Run by
+;; scripts/tls-test.sh with the driver (this directory is not in the gate: the gate has no crypto driver).
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.msg fib.tls.pem fib.tls.hello fib.tls.record fib.tls.client fib.tls.conn
+               tls-server tls-fixtures)
+  (:require [fib.crypto :as c] [fib.crypto.openssl :as openssl]))
+
+(defun provider () -> openssl/OpenSsl (match (openssl/open-provider) ((Ok p) p) ((Err e) (trap (. e message)))))
+(defun chain () -> (Vec (Array i8)) (vec (map (fn (h: str) (hexb h)) (server-chain))))
+(defun trust () -> TrustStore (match (trust-from-ders [(hexb (server-root))]) ((Ok s) s) ((Err e) (trap (tls-error-text e)))))
+(defun cfg (host: str) -> ClientConfig (client-config host (trust) (fn () (fixture-now))))
+(defun sc (suite: i64 tamper: keyword sh: keyword alpn: (Option str) events: (Vec Ev)) -> Script (Script suite tamper sh (chain) (hexb (server-key-pkcs8)) alpn events))
+(defun plain (events: (Vec Ev)) -> Script (sc suite-aes-128-gcm-sha256 :none :none nil events))
+
+(defstruct Run (res: (Result Session TlsError) srv: Srv))
+(defun go (p: openssl/OpenSsl s: Script) -> Run (let [srv (new-srv s)] (Run (connect p (cfg "good.example") (client-io p srv)) srv)))
+(defun tag (e: TlsError) -> str
+  (match e ((HandshakeFailure _ m) (str "handshake:" m)) ((BadCertificate r _) (str "cert:" (reason-name r))) ((UnsupportedCapability _) "unsupported") ((TlsProtocol a _) (str "protocol:" a))
+    ((TlsAlert _ n) (str "alert:" n)) ((Truncated) "truncated") ((TlsTimeout _) "timeout") ((TlsClosed) "closed") ((TransportFailed _) "transport")))
+(defun outcome (r: Run) -> str (match (. r res) ((Ok _) "connected") ((Err e) (tag e))))
+(defun read-text (s: Session) -> str (match ((. s read) 65536) ((Ok b) (str "ok:" (str-from-bytes b))) ((Err e) (tag e))))
+(defun contains? (hay: str needle: str) -> bool
+  (let [h (str-bytes hay) n (str-bytes needle)]
+    (some? (first (filter (fn (i: i64) (bytes-eq? n (slice h i (+ i (array-len n))))) (range (+ 1 (- (array-len h) (array-len n)))))))))
+(defun session (r: Run) -> Session (match (. r res) ((Ok s) s) ((Err e) (trap (tag e)))))
+
+;; ---- full handshakes in every suite, data both ways
+(defun suite-text (p: openssl/OpenSsl suite: i64 want: str) -> str
+  (let [r (go p (sc suite :none :none nil [(EvData (ascii "hello from the server"))]))]
+    (match (. r res)
+      ((Err e) (str "suite " suite ": " (tag e)))
+      ((Ok s) (let [got (read-text s) _ ((. s write) (ascii "ping")) rcv (str-from-bytes (receive p (. r srv)))]
+                (str (if (= got "ok:hello from the server") "" (str "read " got "; ")) (if (= rcv "ping") "" (str "server received " rcv "; "))
+                     (if (= (. s suite) want) "" (str "suite " (. s suite) "; "))))))))
+
+(defstruct TC (name: str tamper: keyword sh: keyword want: str))
+(def tampers: (Vec TC)
+  [(TC "a flipped CertificateVerify signature byte" :cv-sig :none "CertificateVerify") (TC "a flipped Finished byte" :finished :none "Finished")
+   (TC "CertificateVerify signed under the client context string" :cv-context :none "CertificateVerify") (TC "signatures over a transcript without EncryptedExtensions" :transcript :none "CertificateVerify")
+   (TC "a downgrade sentinel in the ServerHello random" :none :sentinel "protocol:47") (TC "a ServerHello without supported_versions (TLS 1.2)" :none :tls12 "the server did not select TLS 1.3")
+   (TC "a cipher suite that was not offered" :none :bad-suite "protocol:47") (TC "a session id that is not echoed" :none :bad-sid "protocol:47")])
+(defun tamper-text (p: openssl/OpenSsl) -> str
+  (reduce (fn (a: str t: TC) (let [o (outcome (go p (sc suite-aes-128-gcm-sha256 (. t tamper) (. t sh) nil [])))]
+                              (if (contains? o (. t want)) a (str a (. t name) ": got " o "; ")))) "" tampers))
+(defun shapes-text (p: openssl/OpenSsl) -> str
+  (reduce (fn (a: str t: keyword) (let [r (go p (sc suite-aes-128-gcm-sha256 t :none nil [(EvData (ascii "ok"))]))]
+                                    (str a (match (. r res) ((Err e) (str (tag e) " under " t "; ")) ((Ok s) (if (= (read-text s) "ok:ok") "" (str "no data under " t "; ")))))))
+          "" [:fragment :coalesce :cert-request]))
+(defun cert-request-text (p: openssl/OpenSsl) -> str
+  (let [r (go p (sc suite-aes-128-gcm-sha256 :cert-request :none nil [(EvData (ascii "ok"))]))]
+    (match (. r res) ((Err e) (tag e)) ((Ok s) (let [t (read-text s)] (if (and (= t "ok:ok") (= @(. (. r srv) phase) 2) (= @(. (. r srv) failure) "")) "" (str "the server judged the client's answer: " @(. (. r srv) failure))))))))
+(defun alpn-text (p: openssl/OpenSsl) -> str
+  (let [r (go p (sc suite-aes-128-gcm-sha256 :none :none (some "http/1.1") [])) r2 (go p (sc suite-aes-128-gcm-sha256 :none :none (some "h2") []))]
+    (str (match (. r res) ((Ok s) (if (= (. s alpn) (some "http/1.1")) "" "alpn not selected; ")) ((Err e) (tag e))) (if (contains? (outcome r2) "protocol") "" (str "an unoffered ALPN gave " (outcome r2))))))
+
+;; ---- after the handshake
+(defstruct PH (name: str events: (Vec Ev) reads: (Vec str)))
+(defun hdr-plain () -> (Array i8) (hexb "160303000401000000"))
+(def post-cases-count: i64 15)
+(defun post-cases () -> (Vec PH)
+  [(PH "data then close_notify" [(EvData (ascii "abc")) EvClose] ["ok:abc" "ok:" "ok:"])
+   (PH "no close_notify is a truncation, not an end" [(EvData (ascii "abc"))] ["ok:abc" "truncated"])
+   (PH "nothing at all is a truncation" [] ["truncated"])
+   (PH "a fatal alert" [(EvAlert 40)] ["alert:handshake_failure" "alert:handshake_failure"])
+   (PH "a KeyUpdate (not requested) then data" [(EvKeyUpdate false) (EvData (ascii "x"))] ["ok:x"])
+   (PH "two KeyUpdates then data" [(EvKeyUpdate false) (EvKeyUpdate false) (EvData (ascii "y"))] ["ok:y"])
+   (PH "a ticket then data" [EvTicket (EvData (ascii "z"))] ["ok:z"])
+   (PH "an unexpected handshake message" [EvHandshakeJunk] ["protocol:10" "protocol:10"])
+   (PH "a plaintext record once the keys are on" [(EvRaw (hdr-plain))] ["protocol:10" "protocol:10"])
+   (PH "an oversized record" [EvOversize] ["protocol:22" "protocol:22"])
+   (PH "a replayed record" [(EvReplay (ascii "dup"))] ["ok:dup" "protocol:20"])
+   (PH "two records in the wrong order" [EvSwap] ["protocol:20" "protocol:20"])
+   (PH "a record with a flipped bit" [(EvFlip (ascii "bit"))] ["protocol:20" "protocol:20"])
+   (PH "an empty alert body is a decode error" [(EvRaw (hexb "150303000100"))] ["protocol:10"])
+   (PH "an unknown record type" [(EvRaw (hexb "190303000100"))] ["protocol:10"])])
+(defun post-text (p: openssl/OpenSsl) -> str
+  (reduce (fn (a: str c: PH)
+            (let [r (go p (plain (. c events)))]
+              (match (. r res)
+                ((Err e) (str a (. c name) ": handshake " (tag e) "; "))
+                ((Ok s) (let [got (vec (map (fn (i: i64) (read-text s)) (range (count (. c reads)))))]
+                          (if (= got (. c reads)) a (str a (. c name) ": expected " (pr-str (. c reads)) " got " (pr-str got) "; ")))))))
+          "" (post-cases)))
+(defun update-text (p: openssl/OpenSsl) -> str
+  (let [r (go p (plain [(EvKeyUpdate true) (EvData (ascii "x"))]))]
+    (match (. r res)
+      ((Err e) (tag e))
+      ((Ok s) (let [t (read-text s)] (do ((. s write) (ascii "after the update")) ((. s write) (ascii " and again"))
+                (let [rcv (str-from-bytes (receive p (. r srv)))] (str (if (= t "ok:x") "" (str "read " t "; ")) (if (= rcv "after the update and again") "" (str "server received [" rcv "]; "))))))))))
+
+;; ---- 1 MiB each way
+(defun pattern (n: i64) -> (Array i8) (let [c (cell (array n 0i8))] (do (dotimes (i n) (array-set! &c i (trunc i8 (+ 97 (rem (* i 7) 26))))) @c)))
+(defun checksum (b: (Array i8)) -> i64 (loop [i 0 acc 0] (if (= i (array-len b)) acc (recur (+ i 1) (rem (+ (* acc 31) (b-at b i)) 1000000007)))))
+(defun read-n (s: Session n: i64) -> (Array i8)
+  (loop [acc []] (if (>= (reduce (fn (t: i64 b: (Array i8)) (+ t (array-len b))) 0 acc) n) (cat acc)
+                   (match ((. s read) 65536) ((Ok b) (if (= (array-len b) 0) (cat acc) (recur (conj acc b)))) ((Err _) (cat acc))))))
+(defun big-text (p: openssl/OpenSsl) -> str
+  (let [data (pattern 1048576) r (go p (plain (vec (map (fn (i: i64) (EvData (slice data (* i 65536) (* (+ i 1) 65536)))) (range 16)))))]
+    (match (. r res)
+      ((Err e) (tag e))
+      ((Ok s) (let [got (read-n s 1048576)]
+                (do ((. s write) data)
+                  (let [rcv (receive p (. r srv))]
+                    (str (if (and (= (array-len got) 1048576) (= (checksum got) (checksum data))) "" (str "client received " (array-len got) " bytes; "))
+                         (if (and (= (array-len rcv) 1048576) (= (checksum rcv) (checksum data))) "" (str "server received " (array-len rcv) " bytes; "))))))))))
+
+;; ---- the server's bytes cut and flipped: a tap over the client's Io. `limit` cuts the stream after that many bytes (-1: never); `post` (set after the handshake) cuts that many
+;; bytes after the handshake's end; `flip` flips one byte.
+(defstruct Tap (served: (Cell i64) post: (Cell i64)))
+(defun tap-io (io: Io t: Tap limit: i64 flip: i64) -> Io
+  (Io (fn (n: i64)
+        (let [at @(. t served) lim (if (>= @(. t post) 0) @(. t post) limit) want (if (< lim 0) n (min n (- lim at)))]
+          (if (<= want 0) (Ok (empty-bytes))
+            (match ((. io read) want)
+              ((Err e) (Err e))
+              ((Ok b) (do (set! (. t served) (+ at (array-len b)))
+                          (if (and (>= flip at) (< flip (+ at (array-len b)))) (Ok (flip-at b (- flip at))) (Ok b))))))))
+      (. io write) (. io close) (. io set-deadline)))
+(defstruct Tapped (run: Run tap: Tap))
+(defun tapped (p: openssl/OpenSsl s: Script limit: i64 flip: i64 post: i64) -> Tapped
+  (let [srv (new-srv s) t (Tap (cell 0) (cell -1)) r (Run (connect p (cfg "good.example") (tap-io (client-io p srv) t limit flip)) srv)]
+    (do (if (>= post 0) (set! (. t post) (+ @(. t served) post)) ()) (Tapped r t))))
+(defun flight-length (p: openssl/OpenSsl) -> i64 (let [x (tapped p (plain []) -1 -1 -1)] @(. (. x tap) served)))
+(defun bitten? (x: Tapped) -> bool (> (array-len @(. (. (. (. x run) srv) wire) out)) 0))
+(defun cut-text (p: openssl/OpenSsl) -> str
+  (let [len (flight-length p)
+        bad (filter (fn (k: i64) (let [x (tapped p (plain []) k -1 -1)] (match (. (. x run) res) ((Ok _) (bitten? x)) ((Err _) false)))) (range len))]
+    (if (= (count bad) 0) "" (str "a handshake cut at byte " (nth (vec bad) 0) " of " len " succeeded; "))))
+(defun flip-text (p: openssl/OpenSsl) -> str
+  (let [len (flight-length p)
+        ok (filter (fn (i: i64) (let [x (tapped p (plain []) -1 i -1)] (match (. (. x run) res) ((Ok _) (< i @(. (. x tap) served))) ((Err _) false)))) (range len))]
+    (if (= (vec ok) [2]) "" (str "flipping a byte of the server's flight: successes at " (pr-str (vec ok)) " of " len " (only the plaintext record's minor version, byte 2, may be ignored); "))))
+(defun record-cut-text (p: openssl/OpenSsl) -> str
+  (let [data (pattern 1000) recsize (+ 5 1000 1 16) s (plain [(EvData data)])
+        outcomes (vec (map (fn (k: i64) (let [x (tapped p s -1 -1 k)] (match (. (. x run) res) ((Err e) (tag e)) ((Ok sess) (let [t (read-text sess)] (if (contains? t "ok:") "full" t)))))) (range (+ recsize 1))))]
+    (if (and (every? (fn (o: str) (= o "truncated")) (vec (take recsize outcomes))) (= (nth outcomes recsize) "full")) ""
+      (str "cutting a record: " (pr-str (vec (distinct outcomes)))))))
+
+(defspecs specs
+  (feature "a full handshake and data both ways, in each cipher suite"
+    (scenario "TLS_AES_128_GCM_SHA256" (given [p (provider)]) (then (expect = "" (suite-text p suite-aes-128-gcm-sha256 ":aes-128-gcm/:sha-256"))))
+    (scenario "TLS_AES_256_GCM_SHA384" (given [p (provider)]) (then (expect = "" (suite-text p suite-aes-256-gcm-sha384 ":aes-256-gcm/:sha-384"))))
+    (scenario "TLS_CHACHA20_POLY1305_SHA256" (given [p (provider)]) (then (expect = "" (suite-text p suite-chacha20-poly1305-sha256 ":chacha20-poly1305/:sha-256"))))
+    (scenario "ALPN: selected when offered, an error when the server picks another" (given [p (provider)]) (then (expect = "" (alpn-text p))))
+    (scenario "handshake messages in 1-byte records, all in one record, with a CertificateRequest" (given [p (provider)]) (then (expect = "" (shapes-text p))))
+    (scenario "a CertificateRequest is answered with an empty Certificate that the server accepts" (given [p (provider)]) (then (expect = "" (cert-request-text p)))))
+  (feature "a server that breaks its flight"
+    (scenario "each of 8 breaks is a typed error, never success" (given [p (provider)]) (then (expect = "" (tamper-text p)))))
+  (feature "after the handshake"
+    (scenario "15 events: close_notify, truncation, alerts, KeyUpdate, tickets, junk, plaintext, oversized, replayed, reordered, flipped, malformed" (given [p (provider)]) (then (expect = "" (post-text p))))
+    (scenario "a KeyUpdate that asks for one back: both directions rekey and data still flows" (given [p (provider)]) (then (expect = "" (update-text p))))
+    (scenario "1 MiB each way" (given [p (provider)]) (then (expect = "" (big-text p)))))
+  (feature "cut and corrupted streams"
+    (scenario "the server's flight cut at every byte never gives a connection" (given [p (provider)]) (then (expect = "" (cut-text p))))
+    (scenario "the server's flight flipped at every byte never gives a connection (but the ignored record version)" (given [p (provider)]) (then (expect = "" (flip-text p))))
+    (scenario "an application record cut at every byte is a truncation, whole it is data" (given [p (provider)]) (then (expect = "" (record-cut-text p))))))
+
+(defun main () -> i64 (run-main (specs)))

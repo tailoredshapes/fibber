@@ -1,0 +1,65 @@
+;; Mutation fuzz of the TLS client's inputs, run by scripts/tls-test.sh with the OpenSSL driver: `tls-fuzz N` makes N mutated certificates (bit flips, replaced bytes, truncations,
+;; insertions, deletions, zeroed runs) and N mutated server flights (the in-memory server's ServerHello and encrypted flight, mutated the same ways, 1 to 3 times) and checks that
+;; (a) nothing traps (a trap kills this program), and (b) a mutated flight gives a connection ONLY when the mutation left the bytes unchanged apart from the ignored minor version
+;; of the first record (byte 2). The exit status is 0 when both hold; the last line is the tally. Deterministic (a fixed LCG).
+(ns main (:use fib.core fib.seq fib.coll fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.msg fib.tls.pem fib.tls.x509 fib.tls.hello fib.tls.record fib.tls.client fib.tls.conn tls-server tls-fixtures)
+  (:require [fib.crypto :as c] [fib.crypto.openssl :as openssl]))
+
+(defun next (s: i64) -> i64 (rem (+ (* s 1103515245) 12345) 2147483648))
+(defun pick (s: i64 n: i64) -> i64 (rem (quot s 65536) n))
+(defun set-byte (b: (Array i8) i: i64 v: i64) -> (Array i8) (let [c (cell b)] (do (array-set! &c i (trunc i8 v)) @c)))
+(defun mutate (b: (Array i8) s0: i64) -> (Array i8)
+  (if (= (array-len b) 0) b (mutate-nonempty b s0)))
+(defun mutate-nonempty (b: (Array i8) s0: i64) -> (Array i8)
+  (let [n (array-len b) s1 (next s0) s2 (next s1) s3 (next s2) k (pick s0 6) i (pick s1 n) v (pick s2 256)]
+    (cond (= k 0) (set-byte b i (bit-xor (b-at b i) (shl 1 (pick s3 8))))
+          (= k 1) (set-byte b i v)
+          (= k 2) (slice b 0 i)
+          (= k 3) (cat [(slice b 0 i) (w8 v) (slice b i n)])
+          (= k 4) (cat [(slice b 0 i) (slice b (min n (+ i 1 (pick s3 4))) n)])
+          :else (cat [(slice b 0 i) (repeat-bytes 0 (min (- n i) (+ 1 (pick s3 8)))) (slice b (min n (+ i 1 (pick s3 8))) n)]))))
+(defun mutate-n (b: (Array i8) s: i64) -> (Array i8)
+  (let [k (+ 1 (pick s 3))] (loop [i 0 x b t s] (if (= i k) x (recur (+ i 1) (mutate x t) (next (next t)))))))
+
+(defun cert-fuzz (rounds: i64) -> i64
+  (let [certs (vec (map (fn (f: Fx) (hexb (nth (. f chain) 0))) (filter (fn (f: Fx) (not (. f real))) (fixtures))))]
+    (loop [i 0 s 777 ok 0]
+      (if (= i rounds) ok
+        (let [s2 (next s) c (nth certs (rem i (count certs)))]
+          (match (parse-certificate (mutate-n c s2)) ((Ok _) (recur (+ i 1) (next s2) (+ ok 1))) ((Err _) (recur (+ i 1) (next s2) ok))))))))
+
+(defstruct Seen (orig: (Cell (Array i8)) mut: (Cell (Array i8)) first: (Cell bool)))
+(defun mutating-io (io: Io sn: Seen seed: i64) -> Io
+  (let [buf (cell (empty-bytes))]
+    (Io (fn (n: i64)
+          (do (if @(. sn first)
+                (match ((. io read) 65536)
+                  ((Ok b) (do (set! (. sn first) false) (set! (. sn orig) b) (let [m (mutate-n b seed)] (do (set! (. sn mut) m) (set! buf m)))))
+                  ((Err _) ()))
+                ())
+              (let [b @buf k (min n (array-len b))] (do (set! buf (drop-bytes b k)) (Ok (slice b 0 k))))))
+        (. io write) (. io close) (. io set-deadline))))
+(defun same-but-minor? (a: (Array i8) b: (Array i8)) -> bool
+  (and (= (array-len a) (array-len b)) (every? (fn (i: i64) (or (= i 2) (= (array-get a i) (array-get b i)))) (range (array-len a)))))
+
+(defun flight-fuzz (p: openssl/OpenSsl rounds: i64) -> (Pair i64 i64)
+  (let [chain (vec (map (fn (h: str) (hexb h)) (server-chain))) key (hexb (server-key-pkcs8))
+        trust (match (trust-from-ders [(hexb (server-root))]) ((Ok s) s) ((Err e) (trap (tls-error-text e))))
+        cfg (client-config "good.example" trust (fn () (fixture-now)))]
+    (loop [i 0 s 4242 ok 0 bad 0]
+      (if (= i rounds) (Pair ok bad)
+        (let [suite (nth [suite-aes-128-gcm-sha256 suite-aes-256-gcm-sha384 suite-chacha20-poly1305-sha256] (rem i 3))
+              tamper (nth [:none :fragment :coalesce :cert-request] (rem (quot i 3) 4))
+              srv (new-srv (Script suite tamper :none chain key nil [])) sn (Seen (cell (empty-bytes)) (cell (empty-bytes)) (cell true))
+              r (connect p cfg (mutating-io (client-io p srv) sn (next s)))]
+          (match r
+            ((Err _) (recur (+ i 1) (next (next s)) ok bad))
+            ((Ok _) (recur (+ i 1) (next (next s)) (+ ok 1) (if (same-but-minor? @(. sn orig) @(. sn mut)) bad (+ bad 1))))))))))
+
+(defun main () -> i64
+  (let [n (unwrap-or (parse-long (nth (args) 0)) 1000)]
+    (match (openssl/open-provider)
+      ((Err e) (do (println "provider:" (. e message)) 2))
+      ((Ok p) (let [certs-ok (cert-fuzz n) f (flight-fuzz p n)]
+                (do (println "tls-fuzz:" n "mutated certificates," certs-ok "parsed;" n "mutated flights," (. f fst) "connected," (. f snd) "of those with changed bytes;" "no trap")
+                    (if (= (. f snd) 0) 0 1)))))))
