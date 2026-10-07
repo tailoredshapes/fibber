@@ -197,8 +197,25 @@
                      (not (contains? (. (. u cx) pinned) x))
                      (match s ((SiteBind b) (not (contains? (. (. u cx) pinned) b))) (_ true)))
             (let [d (. (. u cx) steal)] (set! d (conj @d (. e id))))))
+         ((EField base _ _) (record-field u e base s live))
          (_ ())))
       (_ ()))))
+
+;; Phase B: the field read e = `(. b f)` of mode `Derived(s)` is a last use of the field when `b` reads the site `s` itself (a binding that owns
+;; it or is an alias of it, not a field variable or a part of a part: the run-time test of `fib.unique?` is of the object `b` holds, so it must
+;; be the whole shell) and nothing reads `s`, as a whole or in part, after e. The consume of e then steals the field (spec/types.md 6.3, "Field
+;; moves"): from a unique shell it moves out, its slot nulled; else it is retained as before.
+(defun record-field :private (u: Lu e: Expr base: Expr s: Site live: (Set i64)) -> unit
+  (match (. base kind)
+    ((ELocal _)
+     (match (Pair (mode-of u base) s)
+       ((Pair (MBorrowed (SiteBind r)) (SiteBind r2))
+        (when (and (= r r2)
+                   (none-live? u live [(some (* r 8)) (some (+ (* r 8) 1))])
+                   (not (contains? (. (. u cx) pinned) r)))
+          (let [d (. (. u cx) steal)] (set! d (conj @d (. e id))))))
+       (_ ())))
+    (_ ())))
 
 ;; `u` inside the body of clause c of a match on s: when s reads a binding as a whole and the clause's pattern is a constructor
 ;; pattern (not an `Option`'s), that binding is a shell whose object a constructor call of the same variant may be built in.
