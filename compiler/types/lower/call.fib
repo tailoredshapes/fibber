@@ -107,9 +107,16 @@
   (match (match (stx-as-sym (nth items 0)) ((some name) (special lw name)) (nil nil))
     ((some s) (special-call lw s items form))
     (nil
-     (try-let ((head (lw-sub-expr lw (nth items 0) false))
+     (try-let ((head (lower-head lw (nth items 0)))
                (args (call-args lw items)))
        (Ok (lw-mk lw (. form pos) (ECall head args)))))))
+
+;; The head of a call. A constructor named here is the constructor itself, applied: it is not turned into its function (`name-form` does that where a
+;; value is wanted, so `(Some x)` is not `((fn (c) (Some c)) x)`).
+(defun lower-head :private (lw: Lowerer head: Stx) -> (Result Expr TypeError)
+  (match (if (and (some? (stx-as-sym head)) (not (lw-is-local lw (unwrap-or (stx-as-sym head) "")))) (g-value (. lw g) (. lw m) (unwrap-or (stx-as-sym head) "")) nil)
+    ((some (GCtor t v)) (Ok (lw-mk lw (. head pos) (EGlobal (GCtor t v)))))
+    (_ (lw-sub-expr lw head false))))
 
 (defun call-args :private (lw: Lowerer items: (Vec Stx)) -> (Result (Vec Arg) TypeError)
   (loop ((i 1) (args (vec-empty)))

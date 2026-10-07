@@ -1,0 +1,40 @@
+;; spec:   syntax §3.19 (def: evaluation order), types §2.16
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; A `def` that is not a constant expression is made before `main`, in source order, and may read the `def`s before it, which are constants (static data) or
+;; other made ones: directly (`(* base 2)`), through a function (`(scaled base)`), through a chain of three, and a table that a call reads. This
+;; used to be `unsupported: def base is read where it has no value`: the first constant def's JIT session lowered the bodies of the made ones, before the
+;; constant had a value (LANG-2 item 4). `fibc run` and `fibc build` are the same, so are a def that calls a function that reads a def. Killed by:
+;; scripts/mutant-defs-order.sh (the bodies are requested before the constants are made again).
+(ns main (:use tl.check))
+
+(defstruct Num (n: i64))
+(defun vnum (k: i64) -> Num (Num (+ k 41)))
+
+(def base: i64 7)
+(def table: (Vec i64) [10 20 30])
+(def twice: i64 (* base 2))
+(defun scaled (k: i64) -> i64 (* k (count table)))
+(def thrice: i64 (scaled base))
+(def chain1: i64 (+ twice thrice))
+(def chain2: i64 (+ chain1 base))
+(def chain3: i64 (* chain2 (nth table 1)))
+(def x: Num (vnum 1))
+(def later-const: i64 100)
+(def reads-later-fn: i64 (offset later-const))
+(defun offset (k: i64) -> i64 (+ k base))
+(def tagged: (Vec str) (mapv (fn (k: i64) (str "k" k)) table))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= twice 14))
+        (check c (= thrice 21))
+        (check c (= chain1 35))
+        (check c (= chain2 42))
+        (check c (= chain3 840))
+        (check c (= (. x n) 42))
+        (check c (= reads-later-fn 107))
+        (check c (= tagged ["k10" "k20" "k30"]))
+        (checks-result c))))

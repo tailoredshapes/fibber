@@ -56,9 +56,34 @@
     ((PVec subs rest) (check-vec-pattern cx p subs rest s))
     ((PCtor t v subs) (check-ctor-pattern cx p t v subs s))))
 
+;; The type an integer literal pattern without a suffix has when the scrutinee is already known to be an `i8`, `i16` or `i32`: that type, if the
+;; literal fits it (L26 a, the rule of a literal in a call argument: types §1.1), else the error that names the range. Any other literal has its own type.
+(defun pattern-lit-type :private (cx: Cx p: Pattern l: Lit s: Ty) -> (Result Ty TypeError)
+  (match l
+    ((LitInt n (I64)) (int-pattern-type cx p l n (store-resolve (. cx st) s)))
+    (_ (Ok (lit-type l)))))
+
+(defun int-pattern-type :private (cx: Cx p: Pattern l: Lit n: i64 s: Ty) -> (Result Ty TypeError)
+  (match s
+    ((TCon (KScalar sc) _)
+     (match (narrow-range sc)
+       (nil (Ok (lit-type l)))
+       ((some range)
+        (if (and (>= n (. range fst)) (<= n (. range snd)))
+            (Ok (ty-scalar sc))
+            (Err (type-error Unify (. p pos)
+                   (str-join ["the literal " (show n) " does not fit " (cx-show cx s) " (" (show (. range fst)) ".." (show (. range snd)) ")"])))))))
+    (_ (Ok (lit-type l)))))
+
+(defun narrow-range :private (sc: Scalar) -> (Option (Pair i64 i64))
+  (cond (= sc SI8) (some (Pair -128 127))
+        (= sc SI16) (some (Pair -32768 32767))
+        (= sc SI32) (some (Pair -2147483648 2147483647))
+        :else nil))
+
 ;; A literal has the scrutinee's type, which must have `Eq`.
 (defun check-lit-pattern :private (cx: Cx p: Pattern l: Lit s: Ty) -> (Result unit TypeError)
-  (let ((t (lit-type l)))
+  (try-let ((t (pattern-lit-type cx p l s)))
     (try-let ((_ (cx-unify cx s t (. p pos))))
       (if-some [eq (g-proto-name (. cx g) module-builtin "Eq")]
         (do (cx-defer cx (DkProto eq [t] nil) (. p pos) nil)

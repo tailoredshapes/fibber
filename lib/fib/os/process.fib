@@ -1,5 +1,5 @@
 (ns fib.os.process (:use fib.core fib.seq fib.coll fib.os.errors)
-  (:require [fib.os.native :as n] [fib.os.backend :as b] [fib.os.files :as files] [fib.os.time :as time] [fib.string :as s]))
+  (:require [fib.os.native :as n] [fib.os.backend :as b] [fib.os.files :as files] [fib.os.directories :as dirs] [fib.os.time :as time] [fib.string :as s]))
 (extern getpid :private () -> i32)
 (extern getppid :private () -> i32)
 (extern getcwd :private (ptr i64) -> ptr)
@@ -50,16 +50,14 @@
 (extern _exit :private (i32) -> unit)
 (extern alarm :private (i32) -> i32)
 
-;; The threads of this process, from /proc/self/status; nil where that cannot be read.
+;; The threads of this process, from /proc/self/task, without the first thread of a program whose `main` runs on a stack the runtime made (rt/thread.lir
+;; `fib.run-main`): that thread only waits for `main`'s and the runtime names it `fib-parked`. nil where /proc cannot be read.
 (defun thread-count () -> (Option i64)
-  (match (read-file "/proc/self/status")
-    (nil nil)
-    ((some text)
-     (match (str-find text "Threads:" 0)
-       (nil nil)
-       ((some i) (let [rest (str-slice text (+ i 8) (str-len text))
-                       line (str-slice rest 0 (unwrap-or (str-find rest "\n" 0) (str-len rest)))]
-                   (parse-long (s/trim line))))))))
+  (match (dirs/list-directory "/proc/self/task")
+    ((Err _) nil)
+    ((Ok entries)
+     (some (count (filter (fn (e: dirs/DirectoryEntry) (not (= (unwrap-or (read-file (str "/proc/self/task/" (. e name) "/comm")) "") "fib-parked\n")))
+                          entries))))))
 
 ;; A forked child: its process id and the files it writes (`dir/tag.res`, `.out`, `.err`).
 (defstruct ForkChild (pid: i64 base: str))

@@ -23,7 +23,7 @@ the path has not handed over, as a tail call's jump would), and returns the fail
 exactly as before: no function pays for the convention, and every trap aborts as it did.
 
 A trap unwinds only while a catch is active on its thread (a per-thread count, `fib.catching`); otherwise it is the trap it always was (the
-abort, or the task's failure of ADR 0001). Fatal and never caught: out of memory, stack overflow, a thread that cannot start, a trap
+abort, or the task's failure of ADR 0001). Fatal and never caught: out of memory, stack overflow (which says `trap: stack overflow` and ends with the status of a trap: docs/design/stack.md), a thread that cannot start, a trap
 inside a `finally` clause run while unwinding (`trap: in a finally clause run while unwinding: MSG`), a trap inside the runtime's own
 functions, and a failure that reaches code that cannot pass it on: a `def`'s initialiser, an async body, the function of a
 `cell-update!` (the cell is moved from while it runs; poisoning is not built), and any function that calls `array-take!` (a slot is moved

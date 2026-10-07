@@ -1,0 +1,33 @@
+;; spec:   syntax §5 (a definition shadows a prelude name)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; The rule: a type a module defines shadows the prelude's type of that name inside the module; nothing else changes. Here `Result` and `Pair` are the module's
+;; own structs (their constructors, fields and annotations are the module's), `Ok` and `Err` still build the prelude's result (the unannotated functions are
+;; inferred as before, `try-let` works), and the prelude's `Pair` is reached through the library functions that return it. A program that wants both
+;; renames its own (case 8365's error says so).
+(ns main (:use tl.check))
+
+(defstruct Pair (first: str second: i64))
+(defstruct Result (ok: bool msg: str))
+(defstruct Option (some: i64))
+
+(defun half (x: i64)
+  (if (= (rem x 2) 0) (Ok (quot x 2)) (Err "odd")))
+
+(defun quarter (x: i64)
+  (try-let ((h (half x)) (q (half h))) (Ok q)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (Pair "a" 2))
+        (r (Result true "fine"))
+        (o (Option 5)))
+    (do (check c (= (. p second) 2))
+        (check c (. r ok))
+        (check c (= (. r msg) "fine"))
+        (check c (= (. o some) 5))
+        (check c (match (quarter 8) ((Ok v) (= v 2)) ((Err _) false)))
+        (check c (match (quarter 6) ((Ok _) false) ((Err m) (= m "odd"))))
+        (checks-result c))))

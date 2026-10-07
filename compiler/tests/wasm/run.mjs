@@ -33,7 +33,9 @@ let status;
 try {
   status = wasi.start(instance);
 } catch (e) {
-  if (e instanceof WebAssembly.RuntimeError) { console.error("wasm trap: " + e.message); if (process.env.WASM_TRAP_STACK) console.error(e.stack); status = 134; }
+  // V8 reports an exhausted stack as a RangeError, not a trap of the module: the native runtime says `trap: stack overflow` and aborts (docs/design/stack.md).
+  if (e instanceof RangeError && /call stack/.test(e.message)) { console.error("trap: stack overflow (" + e.message + ")"); status = 134; }
+  else if (e instanceof WebAssembly.RuntimeError) { console.error("wasm trap: " + e.message); if (process.env.WASM_TRAP_STACK) console.error(e.stack); status = 134; }
   else throw e;
 }
 process.exit(status);

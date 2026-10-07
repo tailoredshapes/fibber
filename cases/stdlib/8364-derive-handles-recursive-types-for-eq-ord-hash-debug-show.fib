@@ -1,0 +1,58 @@
+;; spec:   syntax §4.4 (derive), types §2.12
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; `derive` of `Eq`, `Ord`, `Hash`, `Debug` and `Show` on a type that refers to itself through `Vec`, `Option`, `Map`, `List` and a `Pair`, on two types that
+;; refer to each other, and on a generic one. The instance of a recursive type is installed before the field instances are looked for, so the
+;; recursive field finds it. (LANG-2 reported `derive Debug` failing on recursive types and `distinct` needing `Hash`: neither was found to fail at the
+;; commit this case was written; `distinct` needs `Hash` and `Eq` of the element, and says `no implementation of Hash for P` when it lacks them. This case
+;; pins what works.) Killed by: a derive that does not install the instance before the fields' are asked.
+(ns main (:use tl.check))
+
+(defstruct Tree (label: i64 kids: (Vec Tree)))
+(derive Eq Tree) (derive Ord Tree) (derive Hash Tree) (derive Debug Tree) (derive Show Tree)
+
+(defstruct A (b: (Option B) n: i64))
+(defstruct B (as: (Vec A)))
+(derive Eq A) (derive Eq B)
+(derive Hash A) (derive Hash B)
+(derive Ord A) (derive Ord B)
+(derive Debug A) (derive Debug B)
+
+(defenum Json JNull (JNum n: i64) (JArr xs: (Vec Json)) (JObj m: (Map str Json)))
+(derive Eq Json) (derive Hash Json) (derive Debug Json) (derive Show Json)
+
+(defenum Rose (Leaf v: i64) (Node kids: (List Rose)) (Pr p: (Pair Rose Rose)))
+(derive Eq Rose) (derive Hash Rose) (derive Ord Rose) (derive Debug Rose)
+
+(defstruct (Node1 a) (v: a next: (Option (Node1 a))))
+(derive Eq Node1) (derive Hash Node1) (derive Ord Node1) (derive Debug Node1)
+
+(defun tree (n: i64) -> Tree (Tree n [(Tree (+ n 1) []) (Tree (+ n 2) [(Tree 9 [])])]))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (a (A (some (B [(A nil 1)])) 2))
+        (j (JArr [(JNum 1) (JObj {"k" JNull})]))
+        (n (Node1 1 (some (Node1 2 nil)))))
+    (do (check c (= (tree 1) (tree 1)))
+        (check c (not (= (tree 1) (tree 2))))
+        (check c (< (tree 1) (tree 2)))
+        (check c (= (hash (tree 1)) (hash (tree 1))))
+        (check c (not (= (hash (tree 1)) (hash (tree 2)))))
+        (check c (= (count (distinct [(tree 1) (tree 1) (tree 2)])) 2))
+        (check c (= (debug (Tree 7 [])) "#main.Tree{:label 7, :kids []}"))
+        (check c (= a a))
+        (check c (< (A nil 1) (A nil 2)))
+        (check c (= (count (distinct [a a (A nil 3)])) 2))
+        (check c (> (count (debug a)) 10))
+        (check c (= j j))
+        (check c (= (hash j) (hash j)))
+        (check c (> (count (show j)) 5))
+        (check c (= (Pr (Pair (Leaf 1) (Leaf 2))) (Pr (Pair (Leaf 1) (Leaf 2)))))
+        (check c (< (Leaf 1) (Leaf 2)))
+        (check c (= n n))
+        (check c (< (Node1 1 nil) (Node1 2 nil)))
+        (check c (> (count (debug n)) 5))
+        (checks-result c))))

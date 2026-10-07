@@ -79,11 +79,27 @@
   (reduce (fn (acc: (Vec (Pair str str)) r: (Pair str str)) (conj acc r)) (rewrites-sizes) (rewrites-rest)))
 
 ;; The texts `adapt` rewrites, for the unit that checks each is in the runtime (compiler/tests/emit/unit-wasi.fib).
-(defun rewrite-patterns () -> (Vec str) (mapv (fn (r: (Pair str str)) (. r fst)) (rewrites)))
+;; The rewrites that the stack guard of rt/thread.lir needs (the guard region itself is cut out by `without-guard`): a thread attribute has no guard size.
+(defun guard-rewrites :private () -> (Vec (Pair str str))
+  [(Pair "    (call @pthread_attr_setguardsize a (load i64 @fib.thread-guard))\n" "")
+   (Pair "(declare pthread_attr_setguardsize i32 (ptr i64))\n" "")])
+
+(defun all-rewrites :private () -> (Vec (Pair str str)) (into (rewrites) (guard-rewrites)))
+
+(defun rewrite-patterns () -> (Vec str) (mapv (fn (r: (Pair str str)) (. r fst)) (all-rewrites)))
 
 ;; One part of the runtime for WASI. Every rewrite is of text that is in exactly one part; a text that is not there leaves the part as it was.
 (defun adapt (text: str) -> str
-  (reduce (fn (t: str r: (Pair str str)) (replace t (. r fst) (. r snd))) text (rewrites)))
+  (reduce (fn (t: str r: (Pair str str)) (replace t (. r fst) (. r snd))) (without-guard text) (all-rewrites)))
+
+;; The stack guard of rt/thread.lir (between its `guard-begin` and `guard-end` marks) needs signals and threads: a WASI runtime has neither, and the host
+;; reports the exhaustion of the stack itself (docs/design/stack.md). The shim has the three calls the rest of the runtime makes.
+(defun without-guard :private (text: str) -> str
+  (match (str-find text ";; guard-begin\n" 0)
+    (nil text)
+    ((some a) (match (str-find text ";; guard-end\n" a)
+                (nil text)
+                ((some b) (str-concat (str-slice text 0 a) (str-slice text (+ b 13) (str-len text))))))))
 
 ;; The errno numbers of WASI and of Linux, for the errors the runtime and the library tell apart: (WASI Linux). The runtime's `sys-*` answer the negated Linux number
 ;; and `fib.os` reads the Linux numbers (lib/platform/wasi/fib/os/backend.fib maps the same table for the `errno` it reads itself); `strerror` takes WASI's.
@@ -111,6 +127,9 @@
      (errno-map "fib.w.errno-linux" (fn (r: (Pair i64 i64)) (. r fst)) (fn (r: (Pair i64 i64)) (. r snd)))
      (errno-map "fib.w.errno-wasi" (fn (r: (Pair i64 i64)) (. r snd)) (fn (r: (Pair i64 i64)) (. r fst)))
      "(define internal (fib.w.deadlock void) () (block entry (call @fib.fatal-c (string \"deadlock: this wait needs another thread, and a WASI program has one\")) (unreachable)))\n"
+     "(define internal (fib.guard-enter void) ((i64 size)) (block entry (ret)))\n"
+     "(define internal (fib.guard-leave void) () (block entry (ret)))\n"
+     "(define internal (fib.run-main void) ((ptr body)) (block entry (indirect-call body (fn void ())) (ret)))\n"
      "(define internal (pthread_detach i32) ((i64 t)) (block entry (ret (i32 0))))\n"
      "(define internal (pthread_exit void) ((ptr v)) (block entry (call @abort) (unreachable)))\n"
      "(define internal (fib.w.nosys i32) () (block entry (store (i32 52) (call @__errno_location)) (ret (i32 -1))))\n"

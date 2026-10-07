@@ -54,8 +54,27 @@
          (if (lw-is-primitive-form lw name)
              (Err (lw-primitive-value lw name form))
              (match (g-value (. lw g) (. lw m) name)
-               ((some r) (global-form lw r name form))
+               ((some r) (match (ctor-eta-arity (. lw g) r)
+                           (0 (global-form lw r name form))
+                           (n (ctor-as-function lw n form))))
                (nil (resolve-err (. form pos) (g-unknown (. lw g) (. lw m) SpValue name "unbound name")))))))))
+
+;; The number of fields a constructor takes when it is a function (a struct, or a variant with fields), else 0: a bare field-less variant is a value.
+(defun ctor-eta-arity (g: Globals r: GlobalRef) -> i64
+  (match r
+    ((GCtor t v)
+     (match (. (g-ty g t) shape)
+       ((TsStruct fields) (match v ((some _) 0) (nil (count fields))))
+       ((TsEnum vs) (match v ((some i) (match (get vs i) ((some x) (count (. x fields))) (nil 0))) (nil 0)))))
+    (_ 0)))
+
+;; A constructor named where a value is wanted (spec/syntax.md 3.9a): the function of its fields, `(fn (c1 .. cn) (Ctor c1 .. cn))`, which is what a
+;; constructor is. The parameters are moved into the constructor and their types are inferred from the use, so a generic constructor stays generic
+;; (`(mapv some xs)` is `(Vec (Option T))`). The name in call position is not rewritten (`lw-call-plain` reads its head without this).
+(defun ctor-as-function :private (lw: Lowerer n: i64 form: Stx) -> (Result Expr TypeError)
+  (let ((pos (. form pos))
+        (ps (mapv (fn (i: i64) (Stx (SSym (str-join ["ctor%" (str i)])) pos)) (range n))))
+    (lw-expr lw (Stx (SList [(Stx (SSym "fn") pos) (Stx (SList ps) pos) (Stx (SList (into [form] ps)) pos)]) pos) false)))
 
 (defun global-form :private (lw: Lowerer r: GlobalRef name: str form: Stx) -> (Result Expr TypeError)
   (try-let ((_ (lw-check-unsafe lw r name form)))

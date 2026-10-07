@@ -1,0 +1,71 @@
+;; spec:   syntax §3.6 (patterns: literals), types §2.8 (exhaustiveness)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; `match` takes literal patterns of integers (negative ones too), characters, strings, booleans and keywords, in the order written, with `_` as the
+;; default. (LANG-2: the rules agent wrote `cond` because `match` "does not accept integer literal patterns": it does, at `i64`; the narrower widths are
+;; case 8356.) A literal under a constructor (`(some 0)`), in a vector pattern and with `:as` is a literal pattern too.
+;; There is no or-pattern: two literals with one arm are two arms.
+(ns main (:use tl.check))
+
+(defun size (n: i64) -> str
+  (match n
+    (0 "zero")
+    (1 "one")
+    (-1 "minus one")
+    (9223372036854775807 "max")
+    (_ "many")))
+
+(defun vowel (c: char) -> bool
+  (match c
+    (\a true)
+    (\e true)
+    (\{ false)
+    (\' false)
+    (_ false)))
+
+(defun word (s: str) -> i64
+  (match s
+    ("one" 1)
+    ("two" 2)
+    ("" 0)
+    (_ -1)))
+
+(defun inner (o: (Option i64)) -> i64
+  (match o
+    ((some 0) 100)
+    ((some n) n)
+    (nil -1)))
+
+(defun pair (v: (Vec i64)) -> i64
+  (match v
+    ([0 0] 1)
+    ([1 x] x)
+    (_ 0)))
+
+(defun flag (b: bool) -> i64
+  (match b (true 1) (false 2)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (size 0) "zero"))
+        (check c (= (size 1) "one"))
+        (check c (= (size -1) "minus one"))
+        (check c (= (size 9223372036854775807) "max"))
+        (check c (= (size 77) "many"))
+        (check c (vowel \a))
+        (check c (not (vowel \{)))
+        (check c (not (vowel \')))
+        (check c (not (vowel \z)))
+        (check c (= (word "two") 2))
+        (check c (= (word "") 0))
+        (check c (= (word "three") -1))
+        (check c (= (inner (some 0)) 100))
+        (check c (= (inner (some 7)) 7))
+        (check c (= (inner nil) -1))
+        (check c (= (pair [0 0]) 1))
+        (check c (= (pair [1 9]) 9))
+        (check c (= (pair [2 9]) 0))
+        (check c (= (flag true) 1))
+        (checks-result c))))
