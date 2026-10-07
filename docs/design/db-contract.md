@@ -3,7 +3,7 @@
 A driver of `fib.db` is a type that implements the protocol `Connection` (`conn-execute`, `conn-close`).
 `fib.db.contract` is the executable statement of what that means: `DriverContract`, a contract in the sense of `fib.test`
 (docs/design/test-harness.md), a function from a factory `make` to scenarios. It lives in fibber's library so that a driver in its own
-repository (`fib-db-sqlite`, later PostgreSQL) runs the same scenarios against itself, and so that the core does not need a driver to be
+repository (`fib-db-sqlite`, and `fib-db-postgres`, v0.1.0: the PostgreSQL wire protocol in fibber, passing the contract on PostgreSQL 14, 16 and 17) runs the same scenarios against itself, and so that the core does not need a driver to be
 tested: `fib.db.memory`, an in-memory fake with no C library, runs the contract in fibber's gate.
 
 ## Running it against a driver
