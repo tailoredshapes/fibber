@@ -15,7 +15,7 @@ out=${TMPDIR:-/tmp}/repl-test-$$; mkdir -p "$out"; trap 'rm -rf "$out"' EXIT
 cd "$root" || exit 2
 names=(); for f in "$here"/*.in; do names+=("$(basename "$f" .in)"); done
 for n in "${names[@]}"; do
-  ( ulimit -v 16000000; HOME=$out timeout 120 "$fibc" repl --echo < "$here/$n.in" > "$out/$n.out" 2>&1; echo $? > "$out/$n.rc" ) &
+  ( ulimit -v 16000000; HOME=$out timeout 900 "$fibc" repl --echo < "$here/$n.in" > "$out/$n.out" 2>&1; echo $? > "$out/$n.rc" ) &
 done
 wait
 for n in "${names[@]}"; do sed -i -E 's/[0-9]+ ms/N ms/g' "$out/$n.out"; done   # the `:time` lines: the counts stay, the milliseconds do not

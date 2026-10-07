@@ -23,7 +23,7 @@ def limit():
 
 env = dict(os.environ, FIBC_SERVE_DEBUG='1', FIB_LIB=os.environ.get('FIB_LIB', os.path.join(root, 'lib')))
 
-def raw(data, path=None, timeout=60):
+def raw(data, path=None, timeout=300):
     s = socket.socket(socket.AF_UNIX); s.settimeout(timeout); s.connect(path or sock)
     s.sendall(data)
     buf = b''
@@ -62,10 +62,10 @@ ROOTS = [proj]
 srv = subprocess.Popen([fibc, 'serve', '--socket', sock, '-I', proj], cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=open(os.path.join(work, 'server.log'), 'w'), preexec_fn=limit)
 try:
     up = False
-    for _ in range(200):
+    for _ in range(1500):    # under the gate a fibc waits for a slot before it starts
         try:
             if ask({'op': 'ping'}, timeout=5): up = True; break
-        except Exception: time.sleep(0.05)
+        except Exception: time.sleep(0.2)
     check('server starts and answers ping', up, 'no answer; log: ' + open(os.path.join(work, 'server.log')).read()[:300])
     if not up: raise SystemExit(1)
 

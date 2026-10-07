@@ -18,7 +18,7 @@ def run(keys, waits):
         os.environ['FIB_LIB'] = os.environ.get('FIB_LIB', os.path.join(root, 'lib'))
         os.execv(fibc, [fibc, 'repl'])
     out = b''
-    def read_until(token, secs=60):
+    def read_until(token, secs=300):
         nonlocal out
         end = time.time() + secs
         while token.encode() not in out and time.time() < end:
@@ -33,10 +33,10 @@ def run(keys, waits):
         before = out.count('fib> '.encode()) + out.count('...  '.encode())
         os.write(fd, k.encode())
         if '\r' in k or w == 'prompt':    # an input line was sent: wait for the next prompt (the REPL is in cooked mode while a program runs)
-            end = time.time() + 60
+            end = time.time() + 300
             while out.count('fib> '.encode()) + out.count('...  '.encode()) <= before and time.time() < end: read_until('\0', 0.3)
         time.sleep(0.05)
-    deadline = time.time() + 20; status = None
+    deadline = time.time() + 120; status = None
     while time.time() < deadline:
         p, st = os.waitpid(pid, os.WNOHANG)
         if p:
