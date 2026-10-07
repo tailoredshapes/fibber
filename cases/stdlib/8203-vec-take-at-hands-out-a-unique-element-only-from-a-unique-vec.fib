@@ -1,0 +1,51 @@
+;; spec: lib/prelude.fib (vec-take-at, vnode-take); spec/types.md 2.13.1 "Null slots" (the slot left empty is written by vec-assoc before any other use)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; covers: vec-take-at
+;; `(vec-take-at v i)` answers the element and v with that slot emptied. Over every index of a Vec of 100 records (the tail and the trie: more than 32 elements) taking an element and putting it
+;; back with `vec-assoc` gives back an equal Vec. When v is unique (its only holder hands it over) the element comes out with a count of one, so an in-place update of it copies nothing; when another
+;; name holds v (or the element) the element's count is two and the other holder's Vec still reads as it did. A take that nulls the slot of a shared Vec would leave the other holder with a null element,
+;; and one that did not move the element out of a unique Vec would leave the count at two.
+(ns main (:use tl.check))
+
+(defstruct Rec (a: i64 b: str))
+(derive Eq Rec)
+
+(defun rc (x) -> i64 (unsafe (load-i64 (raw x))))
+
+(defun make (n: i64) -> (Vec Rec) (mapv (fn (i: i64) (Rec i (str "r" i))) (range n)))
+
+;; take and put back, from a vector that the call owns: equal to the original at every index
+(defun roundtrip (c: Checks) -> unit
+  (let ((orig (make 100)))
+    (dotimes (i 100)
+      (match (vec-take-at (make 100) i)
+        ((Pair e v2) (let ((back (vec-assoc v2 i e))) (check c (= back orig))))))))
+
+;; the count of the element of a unique vector, and of a vector another name also holds
+(defun unique-count (i: i64) -> i64
+  (match (vec-take-at (make 100) i) ((Pair e v2) (+ (rc e) (* 0 (count v2))))))
+
+(defun shared (c: Checks) -> unit
+  (let ((v (make 100)))
+    (dotimes (k 4)
+      (let ((i (nth [0 31 32 99] k)))
+        (match (vec-take-at v i)
+          ((Pair e v2)
+           (do (check c (= (rc e) 2))
+               ;; v is untouched: the element is still there, equal, and v2 is a different vector
+               (check c (= (nth v i) (Rec i (str "r" i))))
+               (check c (= v (make 100))))))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (q (checks)))
+    (do (roundtrip c)
+        (dotimes (k 4) (check c (= (unique-count (nth [0 31 32 99] k)) 1)))
+        (shared c)
+        ;; planted: a count of two for a unique take must be detected
+        (check q (= (unique-count 5) 2))
+        (check-detects c q)
+        (checks-result c))))

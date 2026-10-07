@@ -1,0 +1,86 @@
+;; spec: lib/fib/tensor/optim-owned.fib (header): adam-step-owned gives the bits of adam-step; a shared, strided or empty tensor takes the fresh-buffer path and the other holder sees no write
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; Five chained steps, every length 0..40 (around the lane widths), f32 and f64: the state of `adam-step-owned` (each output the next input, consumed at its last use, so the buffers
+;; are written in place) has the bits of the state of `adam-step`. Then the persistence cases: a parameter that is also held by a variable that is read after the call (count two) is not
+;; written (its values after the call are those before) and the result is right; a transposed view (not dense) goes the fresh way and equals the oracle. A kernel that wrote through a
+;; shared buffer, or that reordered an operation, changes a bit; the planted fault (the oracle given another learning rate) must be detected.
+(ns main (:require [fib.tensor :as t]) (:use tl.check))
+
+(defun ipow (x: f64 n: i64) -> f64 (loop ((i 0) (acc 1.0)) (if (< i n) (recur (+ i 1) (* acc x)) acc)))
+
+(defun gen-f32 (n: i64 seed: i64) -> (t/Tensor f32)
+  (let ((b (cell (array n 0.0f32))))
+    (do (dotimes (i n) (array-set! &b i (fptrunc f32 (fdiv (double (- (rem (+ (* i 7919) (* seed 104729)) 1013) 500)) 37.0))))
+        (t/from-array [n] @b 0.0f32))))
+(defun gen-f64 (n: i64 seed: i64) -> (t/Tensor f64)
+  (let ((b (cell (array n 0.0))))
+    (do (dotimes (i n) (array-set! &b i (fdiv (double (- (rem (+ (* i 7919) (* seed 104729)) 1013) 500)) 37.0)))
+        (t/from-array [n] @b 0.0))))
+
+(defun bits32 (x: (t/Tensor f32)) -> (Vec i64) (mapv (fn (v: f32) (zext i64 (f32->bits v))) (t/to-vec x)))
+(defun bits64 (x: (t/Tensor f64)) -> (Vec i64) (mapv (fn (v: f64) (f64->bits v)) (t/to-vec x)))
+
+;; the state after five steps by `adam-step` (fresh buffers) and by `adam-step-owned` (the state moved into each call), as one vector of bit vectors
+(defun oracle32 (n: i64 lr: f64) -> (Vec (Vec i64))
+  (loop ((s 1) (p (gen-f32 n 1)) (m (gen-f32 n 2)) (v (t/mul (gen-f32 n 3) (gen-f32 n 3))))
+    (if (<= s 5)
+        (let ((r (t/adam-step lr 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 s)) (- 1.0 (ipow 0.999 s)) p (gen-f32 n (+ 10 s)) m v)))
+          (recur (+ s 1) (nth r 0) (nth r 1) (nth r 2)))
+        [(bits32 p) (bits32 m) (bits32 v)])))
+(defun owned32 (n: i64 lr: f64) -> (Vec (Vec i64))
+  (loop ((s 1) (p (gen-f32 n 1)) (m (gen-f32 n 2)) (v (t/mul (gen-f32 n 3) (gen-f32 n 3))))
+    (if (<= s 5)
+        (let ((r (t/adam-step-owned lr 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 s)) (- 1.0 (ipow 0.999 s)) p (gen-f32 n (+ 10 s)) m v)))
+          (recur (+ s 1) (nth r 0) (nth r 1) (nth r 2)))
+        [(bits32 p) (bits32 m) (bits32 v)])))
+(defun oracle64 (n: i64 lr: f64) -> (Vec (Vec i64))
+  (loop ((s 1) (p (gen-f64 n 1)) (m (gen-f64 n 2)) (v (t/mul (gen-f64 n 3) (gen-f64 n 3))))
+    (if (<= s 5)
+        (let ((r (t/adam-step lr 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 s)) (- 1.0 (ipow 0.999 s)) p (gen-f64 n (+ 10 s)) m v)))
+          (recur (+ s 1) (nth r 0) (nth r 1) (nth r 2)))
+        [(bits64 p) (bits64 m) (bits64 v)])))
+(defun owned64 (n: i64 lr: f64) -> (Vec (Vec i64))
+  (loop ((s 1) (p (gen-f64 n 1)) (m (gen-f64 n 2)) (v (t/mul (gen-f64 n 3) (gen-f64 n 3))))
+    (if (<= s 5)
+        (let ((r (t/adam-step-owned lr 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 s)) (- 1.0 (ipow 0.999 s)) p (gen-f64 n (+ 10 s)) m v)))
+          (recur (+ s 1) (nth r 0) (nth r 1) (nth r 2)))
+        [(bits64 p) (bits64 m) (bits64 v)])))
+
+(defun all-lengths (c: Checks) -> unit
+  (dotimes (n 41)
+    (do (check c (= (oracle32 n 0.01) (owned32 n 0.01)))
+        (check c (= (oracle64 n 0.01) (owned64 n 0.01))))))
+
+;; p is read after the call: the call is handed a second count of p, takes the fresh path, and p keeps its values
+(defun shared-p (c: Checks) -> unit
+  (let ((p (gen-f64 37 1)) (m (gen-f64 37 2)) (v (t/mul (gen-f64 37 3) (gen-f64 37 3))) (g (gen-f64 37 4)))
+    (let ((before (bits64 p)) (want (t/adam-step 0.01 0.9 0.999 1.0e-8 0.1 0.001 p g m v)))
+      (let ((r (t/adam-step-owned 0.01 0.9 0.999 1.0e-8 0.1 0.001 p g m v)))
+        (do (check c (= (bits64 p) before))
+            (check c (= (bits64 (nth r 0)) (bits64 (nth want 0))))
+            (check c (= (bits64 (nth r 1)) (bits64 (nth want 1))))
+            (check c (= (bits64 (nth r 2)) (bits64 (nth want 2)))))))))
+
+;; a transposed (not dense) parameter and moments: the fresh path, the right values, the operands unchanged
+(defun strided (c: Checks) -> unit
+  (let ((p (t/transpose (t/reshape [5 8] (gen-f32 40 1)))) (m (t/transpose (t/reshape [5 8] (gen-f32 40 2))))
+        (v (t/transpose (t/reshape [5 8] (t/mul (gen-f32 40 3) (gen-f32 40 3))))) (g (t/transpose (t/reshape [5 8] (gen-f32 40 4)))))
+    (let ((want (t/adam-step 0.01 0.9 0.999 1.0e-8 0.1 0.001 p g m v)) (before (bits32 p)))
+      (let ((r (t/adam-step-owned 0.01 0.9 0.999 1.0e-8 0.1 0.001 p g m v)))
+        (do (check c (= (bits32 p) before))
+            (check c (= (t/shape (nth r 0)) [8 5]))
+            (check c (= (bits32 (nth r 0)) (bits32 (nth want 0))))
+            (check c (= (bits32 (nth r 1)) (bits32 (nth want 1))))
+            (check c (= (bits32 (nth r 2)) (bits32 (nth want 2)))))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (q (checks)))
+    (do (all-lengths c) (shared-p c) (strided c)
+        ;; planted: another learning rate in the oracle must be detected by the same comparison
+        (check q (= (oracle32 9 0.02) (owned32 9 0.01)))
+        (check-detects c q)
+        (checks-result c))))

@@ -1,0 +1,23 @@
+;; spec:   spec/types.md §6.3 "Field moves"; compiler/own/lastuse.fib `record-field`, compiler/emit/lower/ops.fib `lcx-steal-of`
+;; expect: accept
+;; result: 42
+;; audit:  clean
+;; allocs: <= 150
+;; `bump` reads the field `buf` of its parameter `p` with `(. p buf)` as the last use of `p` (the scalar field `n` is read first, in its own
+;; step) and hands it to `cell`. Since the field-move rule `p` is owned (rule 4), the read is a steal: `go` passes the only count of the
+;; struct, the field moves out of the unique struct (its slot is nulled) and the array is written in place by `array-set!`. Before the rule
+;; the read was retained, the array had count 2 and every `array-set!` copied it: 2 objects per call (the copy and the new struct), 202 in all
+;; (`fibc run --trace`). Now 1 per call (the new struct), 102 in all; the bound is 150, between the two.
+(defstruct P (buf: (Array i64) n: i64))
+
+(defun bump (p: P) -> P
+  (let [n (. p n)
+        c (cell (. p buf))]
+    (do (array-set! &c 0 42) (P @c n))))
+
+(defun go (p: P k: i64) -> P
+  (if (= k 0) p (go (bump p) (- k 1))))
+
+(defun main () -> i64
+  (let [q (go (P (array 4 1) 4) 100)]
+    (array-get (. q buf) 0)))

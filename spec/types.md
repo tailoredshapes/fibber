@@ -2037,6 +2037,36 @@ beyond the `match` clause row; what follows is why that is sound.
   tail position`; the body of the clause is in tail position when the
   `match` is (§6.10).
 
+**Field moves** (lever LANG-1; cases `cases/ownership/379` to `383`; mutants `scripts/mutant-fieldmove.sh`). A uniquely owned struct owns its fields: its
+count is one, so the only count of each object field is the one the struct holds. Taking a field out of such a struct therefore needs no count: the field *moves*, and
+the struct is left **partially moved**, a shell with a null in that slot (the null that a pattern steal, `array-take!` and `cell-update!` already leave; the release of a
+null is a no-op). The rule that decides when this is allowed is the one that decides the pattern steal above (§6.3 table, "steal"), extended from a pattern variable to a
+field read:
+
+- **F1, the read.** `(. b f)` where `b` is a variable whose mode is `Borrowed(s)` (it owns the site `s`, or aliases it: not a field variable, not a part of a part: the run-time
+  test is of the object `b` holds) and whose own mode is `Derived(s)`, at an *owned or stored position* of a call, constructor or `recur` (the positions at which `consume`
+  retains: the head of `(cell ..)`, a constructor argument, `(array-with a i ..)`, an owned parameter). Every other use of a field read is as before: a borrow.
+- **F2, last use.** Nothing reads `s` after the read, as a whole or in part, and no sibling operand of the same call reads it (own.lastuse `record-field`). So the struct is
+  never used again whole after the field is moved (it is not re-assembled either: a program that wants the struct again reads its other fields *before* the one that moves,
+  or builds a new one from them), and no other field of it is read after (a read of another field after the move is a read of a part, which F2 forbids: bind the other
+  fields first, `(let [n (. p n)] ..)`, as case 379 does).
+- **F3, ownership.** `s` is a binding of this frame that owns a count, not a stack object and not captured (`w-movable`, as for a pattern steal). A parameter of a `defun` that is
+  borrowed but would satisfy F1 and F2 is made **owned** (rule 4 of §6.4, `own.walk.state` `w-want-own-field`, as it is for a pattern variable): callers that use their argument
+  again afterwards pay one retain, and the callee's field is then moved. A method's parameter, and a `defun` parameter declared `:borrow`, stay borrowed and are never moved from
+  (case 383; a protocol method that wants its argument moved declares it `:owned`).
+- **Emission.** The read is lowered as before; the consume is `lcx-steal` (`emit/lower/ops.fib`): if `fib.unique?` holds of the struct (count one, none of `SHARED`, `IMMORTAL`,
+  `STACK`, `HAS-WEAK`) the slot is set to null and the count travels with the value; else the field is retained. A shared struct is therefore never changed (case 380).
+
+*Why it is sound.* After the move nothing can read the slot: F2 says no later step of the path reads the struct, F3 says the frame owns the only count it is accountable for, and
+the run-time test says that no other holder reaches the object. The struct's release, at its scope exit, skips the null. A closure or task that captured the binding is excluded
+(`pinned`). *What it does not do*: a read through a path, `(. (. o in) buf)` (the inner object is held by a struct that may be shared: case 382), a read at a `let` or `loop`
+initialiser or at a `set!` (they retain, §6.3 `store`), a field of an owned temporary (`(. (f x) buf)`: the temporary's step ends after the read), and `with` on a unique record whose
+new value reads the old one (`(with p (buf (array-with (. p buf) 0 x)))`: the expansion keeps `p` live in the cell while the value is built; write `match` or a pattern on `p`). The
+library's way to an in-place update through a unique struct is the constructor pattern, which steals at its last use as before, or this field read. There is no "use after partial
+move" error: the language has no moved state that a program can observe, so nothing is rejected; the plan simply does not move when F1 to F3 do not hold (cases 380 to 382 check
+that the answer is the same either way). Effect: `fib.tensor`'s `adam-step-owned` and `fib.autodiff`'s `adam-step` update the parameters and moments in place (`vec-take-at` hands a
+unique tensor out of a unique `Vec`; case 8201 bounds the allocations of a chain of steps).
+
 **Element reads** (performance batch 4, lever B; cases 270 to 278). `(array-get a i)` is the one
 primitive whose result is a part of an operand, as `(. e f)` is, and §6.2 gives it the same mode: `Derived(b)` when
 `a` is `Borrowed(b)` or `Derived(b)` and `b` is not a temporary of the call's own step, `Owned` otherwise. Source: `compiler/own/walk/call.fib`
