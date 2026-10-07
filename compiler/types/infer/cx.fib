@@ -146,6 +146,38 @@
 ;; `cannot unify a with b`: the two types zonked, printed by one printer
 ;; (so an unbound variable has the same name in both).
 (defun cx-mismatch (cx: Cx a: Ty b: Ty pos: Pos) -> TypeError
+  (match (literal-range-error cx a b)
+    ((some m) (type-error Unify pos m))
+    (nil (cx-mismatch-plain cx a b pos))))
+
+;; A literal that does not fit the integer width it meets (L26 a): `the literal 300 does not fit i8 (-128..127)`; nil for any other mismatch. `a` or `b` is an
+;; unbound literal variable (it holds the magnitude of the largest literal that shares it) and the other is `i8`, `i16` or `i32`.
+(defun literal-range-error :private (cx: Cx a: Ty b: Ty) -> (Option str)
+  (let ((ra (store-resolve (. cx st) a))
+        (rb (store-resolve (. cx st) b)))
+    (match (lit-width-pair cx ra rb)
+      ((some m) (some m))
+      (nil (lit-width-pair cx rb ra)))))
+
+(defun lit-width-pair :private (cx: Cx lit: Ty other: Ty) -> (Option str)
+  (match lit
+    ((TVar v)
+     (match (store-lit-of (. cx st) v)
+       ((some m)
+        (match other
+          ((TCon (KScalar s) _)
+           (cond (= s SI32) (if (> m 2147483647) (some (lit-range-text m "i32" "-2147483648..2147483647")) nil)
+                 (= s SI16) (if (> m 32767) (some (lit-range-text m "i16" "-32768..32767")) nil)
+                 (= s SI8) (if (> m 127) (some (lit-range-text m "i8" "-128..127")) nil)
+                 :else nil))
+          (_ nil)))
+       (nil nil)))
+    (_ nil)))
+
+(defun lit-range-text :private (m: i64 w: str range: str) -> str
+  (str-join ["the literal " (show m) " does not fit " w " (" range "): write it with a suffix of a width that holds it, or convert the other operand"]))
+
+(defun cx-mismatch-plain :private (cx: Cx a: Ty b: Ty pos: Pos) -> TypeError
   (let ((za (store-zonk-default (. cx st) a))
         (zb (store-zonk-default (. cx st) b))
         (p (printer-with-names (. cx g) [] @(. (. cx u) rigid-names))))

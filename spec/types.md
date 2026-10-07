@@ -66,6 +66,16 @@ else it is `i64`. A variable bound to an integer never adopts: `(let ((n 2)) (* 
 `cannot unify f64 with i64`. The interpreter and the compiler read the literal as a float
 of the type the checker recorded for it.
 
+**An integer literal at a narrower integer width** (**Decided**, owner, LANG-2, stdlib §7 L26 a: the literal adopts the width it meets, by range):
+the same literal variable of an argument position unifies with `i8`, `i16` or `i32` when the literal fits, by magnitude: at most 127, 32767,
+2147483647. So `(< x 5)`, `(= 100 x)`, `(+ x 1)`, `(bit-and x 255)` and `(bit-shift-left x 3)` have the width of `x` for an `i8`, `i16` or `i32` `x`, the literal on either
+side, and the literal is recorded at that width. A literal that does not fit is the error that names the range, `the literal 300 does not fit i8
+(-128..127)`, not the plain mismatch. The rule is by magnitude, so the minimum of a width, `-128` for `i8`, is written with its suffix (`-128i8`). A
+literal pattern of `match` takes the scrutinee's width the same way, by its value (`(-128 ..)` is an `i8` pattern), with the same error. Only a literal adopts:
+a variable bound to an integer is `i64` (`(let ((n 1)) (+ x n))` with an `i32` `x` is still `cannot unify i64 with i32`), a `let` binding of a literal
+is `i64`, and a literal that stands alone (a return value, a `let` initialiser) is `i64`: the rule is the one of an argument position, the place where the
+expected type is known.
+
 ### 1.2 Objects
 
 Everything that is not a scalar is an object: a counted value on the heap

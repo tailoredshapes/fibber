@@ -1,0 +1,48 @@
+;; spec:   types §1.1 (an integer literal in an argument position takes the integer width it meets, by range), stdlib §7 L26 (a)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; An `i8` was compared with `5` only through `(zext i64 x)`; the literal is now the width of the other operand, on either side, for comparisons and arithmetic
+;; at every integer width, and in a literal pattern of `match`. Every literal is at the edge of its range, so a literal read as `i64` and truncated, or
+;; one that took the wrong width, shows: 127 for i8, 32767 for i16, 2147483647 for i32 (the minimum of a width is written with its suffix, `-128i8`: the
+;; rule is by the magnitude of the literal, and 128 is not an i8; in a pattern, where the sign is known, `-128` is). Killed by: a checker that does not adopt (the case does
+;; not compile), and one that adopts without the range test (case 8357).
+(ns main (:use tl.check))
+
+(defun lt8 (x: i8) -> bool (< x 127))
+(defun eq8 (x: i8) -> bool (= x -128i8))
+(defun first8 (x: i8) -> bool (= 100 x))
+(defun add16 (x: i16) -> i16 (+ x 32767))
+(defun sub32 (x: i32) -> i32 (- x 2147483647))
+(defun mul8 (x: i8) -> i8 (* x 2))
+(defun band (x: i32) -> i32 (bit-and x 255))
+(defun pat8 (x: i8) -> i64
+  (match x
+    (0 10)
+    (-128 20)
+    (127 30)
+    (_ 0)))
+(defun pat32 (x: i32) -> i64
+  (match x
+    (2147483647 1)
+    (-1 2)
+    (_ 0)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (lt8 126i8))
+        (check c (not (lt8 127i8)))
+        (check c (eq8 -128i8))
+        (check c (first8 100i8))
+        (check c (= (add16 0i16) 32767i16))
+        (check c (= (sub32 2147483647i32) 0i32))
+        (check c (= (mul8 63i8) 126i8))
+        (check c (= (band 511i32) 255i32))
+        (check c (= (pat8 0i8) 10))
+        (check c (= (pat8 -128i8) 20))
+        (check c (= (pat8 127i8) 30))
+        (check c (= (pat8 5i8) 0))
+        (check c (= (pat32 2147483647i32) 1))
+        (check c (= (pat32 -1i32) 2))
+        (checks-result c))))
