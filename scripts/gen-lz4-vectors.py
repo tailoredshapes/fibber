@@ -50,14 +50,17 @@ fv.append(('concatenated text-3000 + zeros-100000', 'cat:text-3000+zeros-100000'
 skip = struct.pack('<II', 0x184D2A55, 5) + b'12345'
 fv.append(('skippable then frame', 'cat:text-3000', (skip + run([], a) + skip).hex(), ''))
 lines.append('(defun inputs () -> (Vec (Vec str))\n  [' + '\n   '.join('["%s" "%s"]' % (n, r) for n, r in INPUTS + [('dict', 'hex:' + dictdata.hex())]) + '])\n')
-lines.append('(defun frame-vectors () -> (Vec LzVector)\n  [')
-lines.append('\n   '.join('(LzVector "%s" "%s" "%s" "%s")' % v for v in fv) + '])')
+def chunked(name, ty, items, fmt):
+    parts = [items[i:i + 30] for i in range(0, len(items), 30)]
+    for k, part in enumerate(parts):
+        lines.append('(defun %s-%d () -> (Vec %s)\n  [' % (name, k, ty) + '\n   '.join(fmt(x) for x in part) + '])\n')
+    lines.append('(defun %s () -> (Vec %s)\n  (reduce (fn (a: (Vec %s) b: (Vec %s)) (into a b)) [] [%s]))\n' % (name, ty, ty, ty, ' '.join('(%s-%d)' % (name, k) for k in range(len(parts)))))
+chunked('frame-vectors', 'LzVector', fv, lambda v: '(LzVector "%s" "%s" "%s" "%s")' % v)
 bv = []
 for iname, rec in INPUTS:
     data = expand(rec)
     for mode, lv, ac in [('fast', 0, 1), ('fast', 0, 8), ('high_compression', 3, 1), ('high_compression', 9, 1), ('high_compression', 12, 1)]:
         bv.append(('%s %s %s' % (iname, mode, ac if mode == 'fast' else lv), iname, lb.compress(data, mode=mode, acceleration=ac, compression=lv or 9, store_size=False).hex()))
-lines.append('\n(defun block-vectors () -> (Vec (Vec str))\n  [')
-lines.append('\n   '.join('["%s" "%s" "%s"]' % v for v in bv) + '])')
+chunked('block-vectors', '(Vec str)', bv, lambda v: '["%s" "%s" "%s"]' % v)
 open(os.path.join(os.path.dirname(__file__), '..', 'lib/fib/compress/lz4/vectors.fib'), 'w').write('\n'.join(lines) + '\n')
 print(len(fv), 'frame vectors', len(bv), 'block vectors')

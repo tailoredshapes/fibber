@@ -19,7 +19,7 @@ Everything is an explicit module (the lesson of the prelude: a top-level definit
 | `fib.compress.lz4.*` | `mem` (raw byte access), `xxh32`, `blockenc` (fast), `hc`, `enc` (encoder state), `blockdec`, `block` (raw-block API), `header`, `frame` (one-shot compress), `framedec` (one-shot decompress), `scomp`, `sdec` (streaming), `sbuf`, `inspect`, `vectors` |
 
 No `extern` anywhere (ADR 0011), no builtins added (ADR 0014/0015: `array-blit!`, `load-simd`/`store-simd`, `ctz`, raw pointer loads and stores are the existing ones), no global mutable state, and no
-file over 500 lines. The 50-line function rule holds except for `decode-block` and the specs' tables.
+file over 500 lines. The 50-line function rule holds (ADR 0006 passes).
 
 ## 2. The protocol
 
