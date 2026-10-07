@@ -1,0 +1,51 @@
+;; The message layer's pure parts: the response head, the framing of a response, the bytes of a request head and of chunks. Parsing of the request
+;; head and of header lines is fib.http.wire (RFC 9112 section 6 framing, section 7 chunked, with the smuggling refusals).
+(ns fib.http.message (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes fib.http.wire)
+  (:require [fib.string :as s]))
+(defstruct ResponseHead (status: i64 version: str reason: str headers: (Map str (Vec str))))
+(defun status-parts :private (line: str) -> (Result (Triple str i64 str) Error)
+  (let [first (str-find line " " 0)]
+    (match first
+      (nil (Err (ProtocolError "invalid HTTP status line")))
+      ((some at)
+        (let [version (str-slice line 0 at) rest (str-slice line (+ at 1) (str-len line))
+              code (str-slice rest 0 (min 3 (str-len rest)))
+              reason (if (> (str-len rest) 4) (str-slice rest 4 (str-len rest)) "")]
+          (cond (not (or (= version "HTTP/1.1") (= version "HTTP/1.0"))) (Err (ProtocolError "unsupported HTTP version in the status line"))
+                (or (!= (str-len code) 3) (and (> (str-len rest) 3) (!= (str-byte-at rest 3) 32i8)))
+                (Err (ProtocolError "invalid HTTP status code"))
+                :else (try-let [n (parse-size code 10 599)]
+                        (if (>= n 100) (Ok (Triple version n reason)) (Err (ProtocolError "invalid HTTP status code"))))))))))
+(defn parse-response-head
+  ([text: str] -> (Result ResponseHead Error) (parse-response-head text 100))
+  ([text: str max-headers: i64] -> (Result ResponseHead Error)
+    (if (not (s/ends-with? text "\r\n\r\n")) (Err (ProtocolError "HTTP headers need CRLF framing"))
+      (let [lines (s/split text "\r\n" -1) end (- (count lines) 2)]
+        (try-let [line (status-parts (nth lines 0)) headers (parse-header-lines-max lines 1 end max-headers)]
+          (Ok (ResponseHead (. line snd) (. line fst) (. line thd) headers)))))))
+;; How the body of a response is delimited (RFC 9112 section 6.3). A response that carries both Content-Length and Transfer-Encoding is refused
+;; rather than resolved in favour of one: the two framings disagree and the connection could be desynchronised.
+(defun response-framing (method: str status: i64 headers: (Map str (Vec str))) -> (Result BodyMode Error)
+  (let [lengths (header-values headers "content-length") encodings (header-values headers "transfer-encoding")]
+    (cond (or (= method "HEAD") (< status 200) (= status 204) (= status 304)) (Ok NoBody)
+          (and (> (count lengths) 0) (> (count encodings) 0)) (Err (ProtocolError "ambiguous HTTP body framing"))
+          (> (count lengths) 1) (Err (ProtocolError "duplicate Content-Length"))
+          (> (count encodings) 0)
+          (if (and (= (count encodings) 1) (= (ascii-lower (trim-ows (nth encodings 0))) "chunked")) (Ok Chunked)
+              (Err (ProtocolError "unsupported HTTP transfer encoding")))
+          (= (count lengths) 1) (try-let [n (parse-size (trim-ows (nth lengths 0)) 10 9223372036854775807)] (Ok (Fixed n)))
+          :else (Ok UntilClose))))
+(defun response-reusable? (version: str headers: (Map str (Vec str)) mode: BodyMode) -> bool
+  (and (not (header-token? headers "connection" "close"))
+       (or (= version "HTTP/1.1") (header-token? headers "connection" "keep-alive"))
+       (match mode ((UntilClose) false) (_ true))))
+(defun request-head-bytes (method: str target: str headers: (Map str (Vec str))) -> (Array i8)
+  (str-bytes (str-join (into [(str method " " target " HTTP/1.1\r\n")] (conj (header-lines headers) "\r\n")))))
+(defun hex-size :private (n: i64) -> str
+  (let [digits "0123456789abcdef"]
+    (if (= n 0) "0"
+      (loop [m n out ""] (if (= m 0) out (recur (shr m 4) (str (str-slice digits (bit-and m 15) (+ (bit-and m 15) 1)) out)))))))
+(defun chunk-bytes (data: (Array i8)) -> (Array i8)
+  (concat-bytes [(str-bytes (str (hex-size (array-len data)) "\r\n")) data (str-bytes "\r\n")]))
+(defun last-chunk-bytes (trailers: (Map str (Vec str))) -> (Array i8)
+  (str-bytes (str-join (into ["0\r\n"] (conj (header-lines trailers) "\r\n")))))

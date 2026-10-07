@@ -1,0 +1,40 @@
+;; Writing a reply: a whole response (framing derived from the actual bytes by fib.http.wire/response-bytes) or a stream (chunked on HTTP/1.1).
+;; HEAD gets the head of the answer and no body; 1xx, 204 and 304 never carry one.
+(ns fib.http.server.reply (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes fib.http.wire fib.http.message
+                                fib.http.transport fib.http.body fib.http.server.types)
+  (:require [fib.http.server.date :as d]))
+(defun dated :private (headers: (Map str (Vec str))) -> (Map str (Vec str))
+  (if (some? (header headers "date")) headers (header-set headers "date" (d/http-date))))
+(defun stream-headers :private (headers: (Map str (Vec str)) chunked: bool keep: bool) -> (Map str (Vec str))
+  (let [h (dissoc (dissoc (dated (normalize-headers headers)) "content-length") "transfer-encoding")
+        k (header-set h "connection" (if keep "keep-alive" "close"))]
+    (if chunked (header-set k "transfer-encoding" "chunked") k)))
+(defun stream-head :private (status: i64 headers: (Map str (Vec str)) chunked: bool keep: bool) -> (Result (Array i8) Error)
+  (try-let [_ (validate-headers headers)]
+    (if (or (< status 200) (> status 599) (includes? status [204 205 304]))
+      (Err (InvalidRequest "a streamed HTTP response needs a status between 200 and 599 that carries a body"))
+      (Ok (str-bytes (str-join (into [(str "HTTP/1.1 " status " " (reason-phrase status) "\r\n")]
+                                     (conj (header-lines (stream-headers headers chunked keep)) "\r\n"))))))))
+(defun send-stream :private (t: Transport status: i64 headers: (Map str (Vec str)) next: (fn () (Option (Array i8)))
+                             method: str keep: bool version: str) -> (Result unit Error)
+  (let [chunked (= version "HTTP/1.1")]
+    (try-let [head (stream-head status headers chunked (and keep chunked))
+              _ (t-write t head)]
+      (cond (= method "HEAD") (Ok ())
+            chunked (write-chunked t next {})
+            :else (loop [] (match (next) (nil (Ok ())) ((some piece) (try-let [_ (t-write t piece)] (recur)))))))))
+(defun internal-error :private (t: Transport method: str) -> unit
+  (match (response-bytes (text-response 500 "Invalid handler response\n") method false)
+    ((Ok bytes) (do (t-write t bytes) ())) ((Err _) ())))
+(defun send-reply (t: Transport reply: Reply method: str keep: bool version: str) -> (Result unit Error)
+  (match reply
+    ((Whole r) (match (response-bytes (with r (headers (dated (. r headers)))) method keep)
+      ((Ok bytes) (t-write t bytes))
+      ((Err _) (do (internal-error t method) (Err (InvalidRequest "invalid handler response"))))))
+    ((Streamed status headers next)
+      (match (send-stream t status headers next method keep version)
+        ((Err (InvalidRequest m)) (do (internal-error t method) (Err (InvalidRequest m))))
+        (r r)))))
+(defun error-reply (t: Transport status: i64 message: str) -> unit
+  (match (response-bytes (with (text-response status (str message "\n")) (headers {"date" [(d/http-date)]})) "GET" false)
+    ((Ok bytes) (do (t-write t bytes) ())) ((Err _) ())))

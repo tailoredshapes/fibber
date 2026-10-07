@@ -8,9 +8,13 @@
       (loop [i 0]
         (if (= i (array-len (. self body))) true
           (if (= (array-get (. self body) i) (array-get (. other body) i)) (recur (+ i 1)) false))))))
+;; Typed failures. LimitError is "too large"; Timeout names its phase: "connect", "read" (no byte for the read timeout) or "total" (the request deadline).
+;; TlsUnsupported means the scheme needs a Transport factory nobody supplied (https before a TLS driver): never a silent downgrade.
 (defenum Error (InvalidRequest message: str) (ProtocolError message: str)
   (LimitError message: str) (TransportError code: i64 message: str)
-  (StatusError response: Response) (Closed) (Cancelled))
+  (StatusError response: Response) (Closed) (Cancelled)
+  (DnsError message: str) (ConnectError message: str) (Timeout phase: str message: str)
+  (TlsUnsupported message: str) (RedirectLoop message: str) (RedirectRefused message: str))
 (derive Eq Error)
 (defstruct Request (request-method: str uri: str query-string: (Option str)
   headers: (Map str (Vec str)) body: (Array i8) trailers: (Map str (Vec str))
@@ -19,4 +23,6 @@
 (defun error-message (error: Error) -> str
   (match error ((InvalidRequest s) s) ((ProtocolError s) s) ((LimitError s) s)
     ((TransportError _ s) s) ((StatusError r) (str "HTTP status " (. r status)))
-    ((Closed) "HTTP handle is closed") ((Cancelled) "HTTP operation cancelled")))
+    ((Closed) "HTTP handle is closed") ((Cancelled) "HTTP operation cancelled")
+    ((DnsError s) s) ((ConnectError s) s) ((Timeout phase s) (str phase " timeout: " s))
+    ((TlsUnsupported s) s) ((RedirectLoop s) s) ((RedirectRefused s) s)))

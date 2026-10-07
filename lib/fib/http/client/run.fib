@@ -1,0 +1,103 @@
+;; The client's engine: validate, derive headers, take a connection from the pool or open one through the scheme's Transport factory, exchange,
+;; follow redirects under the policy of fib.http.client.redirect, and hand the response over as a stream whose connection returns to the pool
+;; when (and only when) its body ran to the end under keep-alive. All of it on the caller's thread.
+(ns fib.http.client.run (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes fib.http.url fib.http.uri
+                              fib.http.transport fib.http.body fib.http.client.types fib.http.client.pool fib.http.client.exchange
+                              fib.http.client.redirect)
+  (:require [fib.os.time :as time] [fib.string :as s]))
+(defstruct State (options: Options pool: Pool closed: (Cell bool)))
+(defun validate-request (request: ClientRequest) -> (Result Url Error)
+  (try-let [_ (validate-headers (. request headers))]
+    (cond (not (token? (. request method))) (Err (InvalidRequest "invalid HTTP method"))
+          (or (some? (header (. request headers) "content-length")) (some? (header (. request headers) "transfer-encoding")))
+          (Err (InvalidRequest "HTTP client derives body framing from the body bytes"))
+          :else (match (parse-url (. request url))
+                  ((Err e) (Err (InvalidRequest (str "expected an absolute HTTP or HTTPS URL (" (error-message e) ")"))))
+                  ((Ok u) (if (includes? (. u scheme) ["http" "https"]) (Ok u) (Err (InvalidRequest (str "unsupported scheme: " (. u scheme))))))))))
+(defun idempotent? (method: str) -> bool (includes? method ["GET" "HEAD" "PUT" "DELETE" "OPTIONS" "TRACE"]))
+(defun hop-headers (o: Options url: Url method: str headers: (Map str (Vec str)) body: (Array i8)) -> (Map str (Vec str))
+  (let [h (normalize-headers headers)
+        h1 (if (some? (get h "host")) h (assoc h "host" [(authority url)]))
+        h2 (if (or (> (array-len body) 0) (includes? method ["POST" "PUT" "PATCH"])) (assoc h1 "content-length" [(str (array-len body))]) h1)
+        names (str-join (loop [i 0 out: (Vec str) []] (if (= i (count (. o decoders))) out
+                (recur (+ i 1) (conj (if (= i 0) out (conj out ", ")) (. (nth (. o decoders) i) name))))))
+        h3 (if (and (. o decompress) (> (count (. o decoders)) 0) (not (some? (get h2 "accept-encoding")))) (assoc h2 "accept-encoding" [names]) h2)]
+    (if (= (. o max-idle-per-host) 0) (assoc h3 "connection" ["close"]) h3)))
+(defun remaining-ms :private (total: i64) -> i64 (quot (- total (time/clock-now)) 1000000))
+(defun connect-ms :private (o: Options total: i64) -> (Result i64 Error)
+  (cond (and (> total 0) (<= (remaining-ms total) 0)) (Err (Timeout "total" "request deadline passed before connecting"))
+        (= total 0) (Ok (. o connect-timeout-ms))
+        (= (. o connect-timeout-ms) 0) (Ok (remaining-ms total))
+        :else (Ok (min (. o connect-timeout-ms) (remaining-ms total)))))
+(defun open-transport :private (o: Options url: Url total: i64) -> (Result Transport Error)
+  (let [scheme (. url scheme)]
+    (match (get (. o factories) scheme)
+      ((some f) (try-let [ms (connect-ms o total)]
+                  ((. f open) (Target scheme (. url host) (effective-port url) ms (. o ca-file)))))
+      (nil (if (= scheme "https")
+             (Err (TlsUnsupported "unsupported scheme https: a TLS Transport factory (driver fib.tls) must be registered for \"https\" in the client options; none is, and the request is not downgraded"))
+             (Err (InvalidRequest (str "unsupported scheme: " scheme))))))))
+(defun fresh-conn :private (st: State url: Url total: i64) -> (Result Conn Error)
+  (try-let [t (open-transport (. st options) url total)]
+    (do (count-opened (. st pool)) (Ok (conn-of (origin url) t)))))
+(defun obtain :private (st: State url: Url total: i64) -> (Result Conn Error)
+  (match (acquire (. st pool) (origin url) (. st options)) ((some c) (Ok c)) (nil (fresh-conn st url total))))
+(defun rename :private (e: Error total: i64) -> Error
+  (match e ((Timeout "io" m) (if (and (> total 0) (>= (time/clock-now) total)) (Timeout "total" m) (Timeout "read" m))) (_ e)))
+(defun stale? :private (e: Error) -> bool (match e ((Closed) true) ((TransportError _ _) true) (_ false)))
+(defun attempt :private (st: State c: Conn method: str url: Url headers: (Map str (Vec str)) body: (Array i8) total: i64) -> (Result Reply Error)
+  (exchange (. st options) c method (target url) headers body total))
+(defun retry :private (st: State method: str url: Url headers: (Map str (Vec str)) body: (Array i8) total: i64) -> (Result (Pair Reply Conn) Error)
+  (try-let [c (fresh-conn st url total)]
+    (match (attempt st c method url headers body total)
+      ((Ok r) (Ok (Pair r c))) ((Err e) (do (close-conn c) (Err e))))))
+(defun fetch (st: State method: str url: Url headers: (Map str (Vec str)) body: (Array i8) total: i64) -> (Result (Pair Reply Conn) Error)
+  (try-let [c (obtain st url total)]
+    (match (attempt st c method url headers body total)
+      ((Ok r) (Ok (Pair r c)))
+      ((Err e) (do (close-conn c)
+                   (if (and (not (. c fresh)) (stale? e) (idempotent? method)) (retry st method url headers body total) (Err e)))))))
+;; The response as a stream: the connection is settled once, when the body ends (pooled when reusable) or fails (closed).
+(defun managed (st: State c: Conn reply: Reply total: i64) -> StreamResponse
+  (let [done (cell false) body (. reply body)
+        settle (fn (ok: bool) (if @done () (do (set! done true)
+                 (if (and ok (. reply reusable)) (release (. st pool) c (. st options)) (close-conn c)))))
+        next (fn () (match (next-chunk body)
+                      ((Ok b) (do (if (= (array-len b) 0) (settle true) ()) (Ok b)))
+                      ((Err e) (do (settle false) (Err (rename e total))))))
+        out (Body next (fn () (trailers body)) (fn () (finished? body)))]
+    (do (if (finished? body) (settle true) ())
+        (StreamResponse (. (. reply head) status) (. (. reply head) headers) out (fn () (settle false))))))
+(defun loop-key :private (method: str url: Url) -> str (str method " " (url-string (with url (fragment nil)))))
+(defun drain :private (sr: StreamResponse) -> unit
+  (match (read-all (. sr body) 65536) ((Ok _) ()) ((Err _) ((. sr abandon)))))
+(defun hop :private (st: State method: str url: Url headers: (Map str (Vec str)) body: (Array i8) total: i64 hops: i64 seen: (Vec str))
+  -> (Result StreamResponse Error)
+  (let [o (. st options) h (hop-headers o url method headers body)]
+    (match (fetch st method url h body total)
+      ((Err e) (Err (rename e total)))
+      ((Ok got) (let [sr (managed st (. got snd) (. got fst) total) status (. sr status)
+                      loc (header (. sr headers) "location")]
+        (if (not (and (. o follow-redirects) (redirect-status? status) (some? loc))) (Ok sr)
+          (follow st method url headers body total hops seen sr (unwrap-or loc ""))))))))
+(defun follow :private (st: State method: str url: Url headers: (Map str (Vec str)) body: (Array i8) total: i64 hops: i64 seen: (Vec str)
+  sr: StreamResponse location: str) -> (Result StreamResponse Error)
+  (let [o (. st options) status (. sr status) m2 (next-method status method) kept (= m2 method)]
+    (cond (>= hops (. o max-redirects)) (do ((. sr abandon)) (Err (RedirectLoop (str "more than " (. o max-redirects) " redirects"))))
+          :else (match (resolve-reference url location)
+            ((Err e) (do ((. sr abandon)) (Err (ProtocolError (str "invalid redirect Location: " (error-message e))))))
+            ((Ok next) (match (check-scheme url next)
+              ((Err e) (do ((. sr abandon)) (Err e)))
+              ((Ok _) (let [key (loop-key m2 next)]
+                (if (includes? key seen) (do ((. sr abandon)) (Err (RedirectLoop (str "redirect loop at " (url-string next)))))
+                  (do (drain sr)
+                      (hop st m2 next (redirect-headers headers url next kept) (if kept body (array 0 0i8)) total (+ hops 1) (conj seen key))))))))))))
+(defun start (st: State request: ClientRequest) -> (Result StreamResponse Error)
+  (if @(. st closed) (Err Closed)
+    (try-let [url (validate-request request)]
+      (let [o (. st options) total (if (> (. o timeout-ms) 0) (+ (time/clock-now) (* (. o timeout-ms) 1000000)) 0)
+            headers (match (. url userinfo)
+                      (nil (. request headers))
+                      ((some info) (if (some? (header (. request headers) "authorization")) (. request headers)
+                                     (header-set (. request headers) "authorization" (str "Basic " (base64-encode (str-bytes info)))))))]
+        (hop st (. request method) url headers (. request body) total 0 [(loop-key (. request method) url)])))))

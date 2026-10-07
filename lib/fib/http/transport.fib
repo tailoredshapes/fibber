@@ -1,0 +1,41 @@
+;; The Transport seam: a byte stream the HTTP engine reads and writes and nothing else. Plain TCP (fib.http.tcp), a pair of pipes and a scripted
+;; in-memory stream (tests) implement it here; TLS (the next package) is one more implementation, handed to the client as a factory per scheme.
+;;
+;; A Transport is a value of closures over private state (the pattern of fib.os.memory-stream): it is used by one thread at a time and never shared.
+;;   read          at most n bytes; the empty array is end of stream; blocks until the deadline
+;;   write         all of the bytes or an error
+;;   close         releases the stream; idempotent
+;;   set-deadline  an absolute fib.os.time/clock-now instant (nanoseconds) that every later read and write observes; 0 means none.
+;;                 A read or write that passes it fails with (Timeout "io" ..), which the client renames to its phase.
+;;   peer          a text for logs and for the server's remote-addr
+(ns fib.http.transport (:use fib.core fib.seq fib.coll fib.http.types fib.http.bytes))
+(defstruct Transport (read: (fn (i64) (Result (Array i8) Error)) write: (fn ((Array i8)) (Result unit Error))
+  close: (fn () unit) set-deadline: (fn (i64) unit) peer: str))
+(defun t-read (t: Transport n: i64) -> (Result (Array i8) Error) ((. t read) n))
+(defun t-write (t: Transport bytes: (Array i8)) -> (Result unit Error) ((. t write) bytes))
+(defun t-close (t: Transport) -> unit ((. t close)))
+(defun t-deadline (t: Transport at: i64) -> unit ((. t set-deadline) at))
+;; What a factory makes a Transport from: scheme "http" -> TCP; the caller supplies others. host has no brackets; the last argument is the connect timeout in ms.
+(defstruct Target (scheme: str host: str port: i64 connect-timeout-ms: i64 ca-file: (Option str)))
+(defstruct Factory (name: str open: (fn :send (Target) (Result Transport Error))))
+
+;; A scripted stream: reads yield the given chunks one per call (a chunk longer than n is split), then end of stream; writes accumulate in the
+;; returned sink. Everything is in memory and on one thread, so protocol logic is tested without a kernel.
+(defstruct Script :private (chunks: (Vec (Array i8)) next: (Cell i64) offset: (Cell i64) sink: (Cell (Array i8)) closed: (Cell bool)))
+(defun script-read :private (s: Script n: i64) -> (Result (Array i8) Error)
+  (cond @(. s closed) (Err Closed)
+        (>= @(. s next) (count (. s chunks))) (Ok (array 0 0i8))
+        :else (let [chunk (nth (. s chunks) @(. s next)) off @(. s offset) take (min n (- (array-len chunk) off))]
+                (do (if (= (+ off take) (array-len chunk)) (do (set! (. s next) (+ @(. s next) 1)) (set! (. s offset) 0))
+                        (set! (. s offset) (+ off take)))
+                    (Ok (array-copy chunk off (+ off take)))))))
+(defun script-write :private (s: Script bytes: (Array i8)) -> (Result unit Error)
+  (if @(. s closed) (Err Closed)
+    (do (set! (. s sink) (concat-bytes [@(. s sink) bytes])) (Ok ()))))
+(defun scripted (chunks: (Vec (Array i8))) -> (Pair Transport (Cell (Array i8)))
+  (let [sink (cell (array 0 0i8)) s (Script chunks (cell 0) (cell 0) sink (cell false))]
+    (Pair (Transport (fn (n: i64) (script-read s n)) (fn (b: (Array i8)) (script-write s b))
+                     (fn () (set! (. s closed) true)) (fn (at: i64) ()) "scripted") sink)))
+;; One chunk per byte of the text: the worst fragmentation a peer can produce.
+(defun byte-chunks (text: (Array i8)) -> (Vec (Array i8))
+  (vec (map (fn (i: i64) (array-copy text i (+ i 1))) (range (array-len text)))))

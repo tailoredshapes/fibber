@@ -1,38 +1,52 @@
-;; Fixed native worker pool: no unbounded task per connection.
-(ns fib.http.server.api (:use fib.core fib.seq fib.coll fib.http.types fib.http.server.types)
-  (:require [fib.http.server.transport :as t] [fib.http.server.connection :as c] [fib.os.errors :as os]))
+;; The listener and the accept loop: one acceptor task, one task per connection (at most workers at once), a graceful stop that stops accepting,
+;; lets the requests in flight finish (up to drain-timeout-ms) and then cancels what is left. Tasks nobody joins end with the program (case 914).
+(ns fib.http.server.api (:use fib.core fib.seq fib.coll fib.http.types fib.http.transport fib.http.tcp fib.http.server.types fib.http.server.connection)
+  (:require [fib.os.net :as net] [fib.os.io :as io] [fib.os.errors :as os] [fib.os.time :as time] [fib.http.native :as n]))
 (defstruct Server (port: i64 stop: (fn () (Result unit Error)) wait: (fn () (Result unit Error))))
-(defstruct State :private (listener: (Cell i64) stopping: (Atom bool) tasks: (Vec (Task i64))))
-(defun worker :private (fd: i64 handler: (fn :send (Request) Response) o: Options stop: (Atom bool)) -> i64
+(defstruct State :private (listener: (Cell i64) stopping: (Atom bool) abort: (Atom bool) active: (Atom i64) acceptor: (Task i64)
+                           drain-ms: i64))
+(defun bump :private (a: (Atom i64) by: i64) -> unit (do (swap! a (fn (v: i64) (+ v by))) ()))
+(defun serve-task :private (fd: i64 peer: str handler: (fn :send (Request) Reply) o: Options stop: (Atom bool) abort: (Atom bool)
+                            active: (Atom i64)) -> i64
+  (let [t (socket-transport fd peer abort)]
+    (do (serve-connection t handler o stop) (t-close t) (bump active -1) 0)))
+(defun accept-one :private (fd: i64 handler: (fn :send (Request) Reply) o: Options stop: (Atom bool) abort: (Atom bool)
+                            active: (Atom i64)) -> bool
+  (match (net/accept-tcp fd)
+    ((Err e) (includes? (. e kind) [os/Interrupted os/WouldBlock os/ConnectionAborted]))
+    ((Ok a) (do (bump active 1)
+                (spawn (fn () (serve-task (. a fd) (. a peer) handler o stop abort active))) true))))
+(defun acceptor :private (fd: i64 handler: (fn :send (Request) Reply) o: Options stop: (Atom bool) abort: (Atom bool) active: (Atom i64)) -> i64
   (loop []
-    (if @stop 0
-      (match (t/ready? fd false 100)
-        ((Err _) (do (reset! stop true) 1))
-        ((Ok false) (recur))
-        ((Ok true) (match (t/accept-connection fd)
-          ((Err (TransportError e _)) (if (includes? (os/kind-for-code e) [os/Interrupted os/WouldBlock os/ConnectionAborted])
-            (recur) (do (reset! stop true) 1)))
-          ((Err _) (do (reset! stop true) 1))
-          ((Ok accepted) (do (c/serve-connection (. accepted fd) (. accepted peer) handler o stop)
-                            (t/close-fd (. accepted fd)) (recur)))))))))
-(defun run-server (handler: (fn :send (Request) Response) o: Options) -> (Result Server Error)
+    (cond @stop 0
+          (>= @active (. o workers)) (do (time/sleep-ns 2000000) (recur))
+          :else (match (net/ready? fd false 100)
+            ((Err _) 1)
+            ((Ok false) (recur))
+            ((Ok true) (if (accept-one fd handler o stop abort active) (recur) 1))))))
+(defun run-server-reply (handler: (fn :send (Request) Reply) o: Options) -> (Result Server Error)
   (if (not (valid-options? o)) (Err (InvalidRequest "invalid HTTP server options"))
-    (try-let [listener (t/open-listener (. o host) (. o port) (. o backlog))]
-      (let [fd (. listener fd) actual (with o (port (. listener port))) stop (atom false)
-            tasks (loop [i 0 out: (Vec (Task i64)) []]
-              (if (= i (. o workers)) out
-                (recur (+ i 1) (conj out (spawn (fn () (worker fd handler actual stop)))))))]
-        (let [state (State (cell fd) stop tasks)]
-          (Ok (Server (. listener port) (fn () (stop-state state)) (fn () (join-workers state)))))))))
+    (match (net/listen-tcp (. o host) (. o port) (. o backlog))
+      ((Err e) (Err (n/os-error e)))
+      ((Ok l) (let [fd (. l fd) actual (with o (port (. l port))) stop (atom false) abort (atom false) active (atom 0)
+                    task (spawn (fn () (acceptor fd handler actual stop abort active)))
+                    st (State (cell fd) stop abort active task (. o drain-timeout-ms))]
+        (Ok (Server (. l port) (fn () (stop-state st)) (fn () (join-acceptor st)))))))))
+(defun run-server (handler: (fn :send (Request) Response) o: Options) -> (Result Server Error)
+  (run-server-reply (fn (r: Request) (Whole (handler r))) o))
 (defun port (server: Server) -> i64 (. server port))
-(defun join-workers :private (server: State) -> (Result unit Error)
-  (let [failed (reduce (fn (n: i64 task: (Task i64)) (+ n (join task))) 0 (. server tasks))]
-    (if (= failed 0) (Ok ()) (Err (TransportError 5 "HTTP server worker failed")))))
-(defun stop-state :private (server: State) -> (Result unit Error)
-  (let [fd @(. server listener)]
+(defun join-acceptor :private (st: State) -> (Result unit Error)
+  (if (= (join (. st acceptor)) 0) (Ok ()) (Err (TransportError 5 "HTTP server accept loop failed"))))
+(defun drain :private (st: State) -> unit
+  (let [limit (+ (time/clock-now) (* (. st drain-ms) 1000000))]
+    (do (loop [] (if (and (> @(. st active) 0) (< (time/clock-now) limit)) (do (time/sleep-ns 2000000) (recur)) ()))
+        (reset! (. st abort) true)
+        (loop [i 0] (if (and (> @(. st active) 0) (< i 500)) (do (time/sleep-ns 2000000) (recur (+ i 1))) ())))))
+(defun stop-state :private (st: State) -> (Result unit Error)
+  (let [fd @(. st listener)]
     (if (< fd 0) (Ok ())
-      (do (reset! (. server stopping) true)
-          (let [result (join-workers server)]
-            (do (t/close-fd fd) (set! (. server listener) -1) result))))))
+      (do (reset! (. st stopping) true)
+          (let [result (join-acceptor st)]
+            (do (drain st) (io/close-fd fd) (set! (. st listener) -1) result))))))
 (defun stop-server (server: Server) -> (Result unit Error) ((. server stop)))
 (defun wait-server (server: Server) -> (Result unit Error) ((. server wait)))

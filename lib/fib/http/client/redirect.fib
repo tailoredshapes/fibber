@@ -1,0 +1,27 @@
+;; Redirect policy as pure functions (RFC 9110 15.4): which statuses redirect, how the method changes, which headers survive a change of origin,
+;; and the one scheme change that is refused. The hop limit and loop check are the run loop's.
+(ns fib.http.client.redirect (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.uri))
+(defun redirect-status? (status: i64) -> bool (includes? status [301 302 303 307 308]))
+;; 303 becomes GET (HEAD stays HEAD); 301 and 302 turn POST into GET as browsers do; 307 and 308 keep the method and the body.
+(defun next-method (status: i64 method: str) -> str
+  (cond (= status 303) (if (= method "HEAD") "HEAD" "GET")
+        (and (includes? status [301 302]) (= method "POST")) "GET"
+        :else method))
+(defun keeps-body? (status: i64 method: str) -> bool (and (includes? status [307 308]) true))
+(defun same-origin? (a: Url b: Url) -> bool
+  (and (= (. a scheme) (. b scheme)) (= (. a host) (. b host)) (= (effective-port a) (effective-port b))))
+(def credential-headers: (Vec str) ["authorization" "cookie" "proxy-authorization"])
+(def body-headers: (Vec str) ["content-type" "content-encoding" "content-language" "content-location" "content-length" "transfer-encoding"])
+(defun drop-headers :private (headers: (Map str (Vec str)) names: (Vec str)) -> (Map str (Vec str))
+  (reduce (fn (h: (Map str (Vec str)) n: str) (dissoc h n)) (normalize-headers headers) names))
+;; The headers of the next hop. Host is dropped (the next hop derives its own), credentials do not follow a change of origin, and a request
+;; that loses its body loses the headers that described it.
+(defun redirect-headers (headers: (Map str (Vec str)) from: Url to: Url body-kept: bool) -> (Map str (Vec str))
+  (let [a (drop-headers headers ["host"])
+        b (if (same-origin? from to) a (drop-headers a credential-headers))]
+    (if body-kept b (drop-headers b body-headers))))
+(defun check-scheme (from: Url to: Url) -> (Result unit Error)
+  (cond (and (= (. from scheme) "https") (= (. to scheme) "http"))
+        (Err (RedirectRefused (str "refusing to follow a redirect from https to http: " (url-string to))))
+        (not (includes? (. to scheme) ["http" "https"])) (Err (RedirectRefused (str "refusing a redirect to scheme " (. to scheme))))
+        :else (Ok ())))

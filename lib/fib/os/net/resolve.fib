@@ -1,0 +1,26 @@
+;; Name resolution through the platform's getaddrinfo (blocking, no timeout: a native resolver is later work, docs/design/http.md).
+;; Answers numeric addresses in the resolver's order, which connect-tcp accepts. Stream sockets only: one row per address.
+(ns fib.os.net.resolve (:use fib.core fib.seq fib.coll fib.os.errors)
+  (:require [fib.os.native :as n] [fib.os.abi :as a] [fib.os.net.address :as addr]))
+(extern getaddrinfo :private (ptr ptr ptr ptr) -> i32)
+(extern freeaddrinfo :private (ptr) -> unit)
+(extern gai_strerror :private (i32) -> ptr)
+;; Where ai_addr lives: after ai_addrlen and padding on Linux and musl (24), after ai_canonname on the BSDs (32).
+(defun addr-offset :private () -> i64 (if (. a/host sockaddr-length) 32 24))
+(defun walk :private (node: ptr) -> (Vec str)
+  (loop [p node out: (Vec str) []]
+    (if (= (n/address p) 0) out
+      (let [sa (unsafe (load-ptr (ptr+ p (addr-offset)))) text (addr/peer-at sa)]
+        (recur (unsafe (load-ptr (ptr+ p 40))) (if (= text "") out (conj out text)))))))
+(defun resolve-host (host: str) -> (Result (Vec str) OSError)
+  (if (or (not (n/valid-text? host)) (= host "")) (Err (invalid-input "getaddrinfo" "invalid host name"))
+    (unsafe (let [hints (alloc 64) out (alloc 8) name (n/c-text host)]
+      (do (dotimes (i 64) (store-i8 (ptr+ hints i) 0i8))
+          (store-i32 (ptr+ hints 8) 1i32)
+          (let [rc (getaddrinfo name (n/pointer 0) hints out) head (load-ptr out)
+                result (if (= rc 0i32)
+                         (let [xs (walk head)]
+                           (do (freeaddrinfo head)
+                               (if (= (count xs) 0) (Err (OSError NotFound 0 "getaddrinfo" "no address")) (Ok xs))))
+                         (Err (OSError NotFound (sext i64 rc) "getaddrinfo" (n/c-string (gai_strerror rc)))))]
+            (do (free name) (free out) (free hints) result)))))))
