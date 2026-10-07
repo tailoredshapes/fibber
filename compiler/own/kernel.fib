@@ -23,7 +23,11 @@
 (defun fail :private (cx: Cx pos: Pos what: str) -> unit
   (let [path @(. cx path)
         where (if (<= (count path) 1) "" (str " (reached through " (join-path path) ")"))]
-    (set! (. cx errs) (conj @(. cx errs) (own-error KernelRule pos (str "kernel " (. cx kernel) ": " what where))))))
+    (when (empty? @(. cx errs))
+      (set! (. cx errs) (conj @(. cx errs) (own-error KernelRule pos (str "kernel " (. cx kernel) ": " what where)))))))
+
+;; The first error of a kernel is the one reported (a Vec reached through the library's `nth` would otherwise name every line of the prelude).
+(defun failed? :private (cx: Cx) -> bool (not (empty? @(. cx errs))))
 
 (defun join-path :private (path: (Vec str)) -> str
   (reduce (fn (acc: str s: str) (if (= acc "") s (str acc " -> " s))) "" path))
@@ -84,9 +88,9 @@
 (defun walk-let :private (cx: Cx binds: (Vec LetBind) body: Expr) -> unit
   (do (dotimes (i (count binds))
         (let [b (nth binds i)]
-          (do (if (pat-ok? (. b pat)) (check-ty cx (. (. b pat) pos) (expr-ty cx (. b init)))
-                  (fail cx (. (. b pat) pos) "a pattern over data: a kernel binds names, scalars and pointers only"))
-              (walk cx (. b init)))))
+          (do (walk cx (. b init))
+              (if (pat-ok? (. b pat)) (check-ty cx (. (. b pat) pos) (expr-ty cx (. b init)))
+                  (fail cx (. (. b pat) pos) "a pattern over data: a kernel binds names, scalars and pointers only")))))
       (walk cx body)))
 
 (defun walk-match :private (cx: Cx e: Expr s: Expr clauses: (Vec Clause)) -> unit
@@ -98,6 +102,9 @@
               (walk cx (. c body)))))))
 
 (defun walk :private (cx: Cx e: Expr) -> unit
+  (if (failed? cx) () (walk-kind cx e)))
+
+(defun walk-kind :private (cx: Cx e: Expr) -> unit
   (match (. e kind)
     ((ELit (LitStr _)) (fail cx (. e pos) "a string literal: a kernel has no strings (a trap's message is the exception)"))
     ((ELit _) ())
@@ -142,8 +149,8 @@
 (defun walk-call :private (cx: Cx e: Expr head: Expr args: (Vec Arg)) -> unit
   (match (. head kind)
     ((EGlobal (GBuiltin b)) (walk-builtin cx e (builtin-name cx b) args))
-    ((EGlobal (GFun f)) (do (check-ty cx (. e pos) (expr-ty cx e)) (dotimes (i (count args)) (arg-expr cx (nth args i))) (reach-fun cx (. e pos) f)))
-    ((EGlobal (GMethod p i)) (do (check-ty cx (. e pos) (expr-ty cx e)) (dotimes (i (count args)) (arg-expr cx (nth args i))) (reach-method cx e head p i)))
+    ((EGlobal (GFun f)) (do (dotimes (i (count args)) (arg-expr cx (nth args i))) (check-ty cx (. e pos) (expr-ty cx e)) (reach-fun cx (. e pos) f)))
+    ((EGlobal (GMethod p i)) (do (dotimes (i (count args)) (arg-expr cx (nth args i))) (check-ty cx (. e pos) (expr-ty cx e)) (reach-method cx e head p i)))
     ((EGlobal (GCtor t _)) (fail cx (. e pos) (str "a constructor of " (. (g-ty (. (. cx p) globals) t) name) ": a kernel allocates nothing")))
     ((EGlobal (GExtern x)) (fail cx (. e pos) (str "a call of the extern " (. (g-ext (. (. cx p) globals) x) name) ": a kernel calls no C function")))
     ((EGlobal (GDef _)) (fail cx (. e pos) "a call through a def: a kernel has no function values"))
@@ -155,7 +162,7 @@
         (= name "cell") (do (check-ty cx (. e pos) (expr-ty cx e)) (dotimes (i (count args)) (arg-expr cx (nth args i))))
         (= name "set!") (do (check-ty cx (. e pos) (expr-ty cx e)) (dotimes (i (count args)) (arg-expr cx (nth args i))))
         (not (allowed-builtin? name)) (fail cx (. e pos) (str "the builtin " name ": a kernel allocates nothing, runs no task and catches nothing (docs/design/gpu.md 3)"))
-        :else (do (check-ty cx (. e pos) (expr-ty cx e)) (dotimes (i (count args)) (arg-expr cx (nth args i))))))
+        :else (do (dotimes (i (count args)) (arg-expr cx (nth args i))) (check-ty cx (. e pos) (expr-ty cx e)))))
 
 ;; A reached function: checked once under the kernel's rules, with the path; a function on the stack is a recursion.
 (defun reach-fun :private (cx: Cx pos: Pos f: i64) -> unit

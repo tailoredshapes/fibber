@@ -1,0 +1,17 @@
+;; spec:   types §2.17 (the kernel subset), syntax §3.22 (defkernel); docs/design/gpu.md 3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; The one-language guard (gpu.md 3.5): a defkernel is a function; `host-launch` runs it over a grid on the CPU with the index space set, and the result is the plain loop's (0 mismatches).
+(ns main (:require [fib.gpu :as gpu]))
+(defkernel vadd (a: ptr b: ptr c: ptr n: i64)
+  (let ((i (gpu/global-id 0)))
+    (when (< i n) (gpu/f32-set! c i (+ (gpu/f32-at a i) (gpu/f32-at b i))))))
+(defun fill (n: i64 seed: i64) -> (Array f32)
+  (let [out (cell (array n 0.0f32))]
+    (do (dotimes (i n) (array-set! &out i (sitofp f32 (rem (* (+ i 1) seed) 97)))) @out)))
+(defun main () -> i64
+  (let [n 1000 a (fill n 3) b (fill n 7) c (cell (array n 0.0f32))]
+    (do (gpu/host-launch [(quot (+ n 255) 256)] [256] (fn () (vadd (gpu/array-data a) (gpu/array-data b) (gpu/array-data @c) n)))
+        (loop [i 0 bad 0]
+          (if (>= i n) bad (recur (+ i 1) (if (= (f32->bits (+ (array-get a i) (array-get b i))) (f32->bits (array-get @c i))) bad (+ bad 1))))))))

@@ -47,26 +47,33 @@
   (buffer-fill (self v: i8) -> (Result unit GpuError))
   (buffer-release (self) -> (Result unit GpuError)))
 
-;; A kernel of a loaded module: its name and its signature (the kinds of its parameters; empty when the module carried none).
+;; A kernel of a loaded module: its name, its signature (the kinds of its parameters; empty when the module carried none) and the driver's
+;; handle of it (data: a driver reads its own, as `buffer-handle`).
 (defprotocol Kernel
   (kernel-name (self) -> str)
-  (kernel-signature (self) -> (Vec str)))
+  (kernel-signature (self) -> (Vec str))
+  (kernel-handle (self) -> i64))
 
 ;; A loaded module: its kernels by name (`:not-found`), and `unload`.
 (defprotocol Module
   (module-kernel (self name: str) -> (Result (dyn Kernel) GpuError))
   (module-unload (self) -> (Result unit GpuError)))
 
-;; An event on a stream: `event-elapsed-ms` is the milliseconds from this event to `later`, after waiting for the later one.
+;; An event on a stream: `event-elapsed-ms` is the milliseconds from this event to `later`, after waiting for the later one; `event-handle`
+;; the driver's handle (data).
 (defprotocol Event
-  (event-elapsed-ms (self later: (dyn Event)) -> (Result f64 GpuError)))
+  (event-elapsed-ms (self later: (dyn Event)) -> (Result f64 GpuError))
+  (event-handle (self) -> i64))
 
 ;; A stream: `stream-launch` runs `k` over `grid` blocks of `block` threads (one to three positive dimensions each) with `args`, checked
-;; against the kernel's signature, asynchronously, lending the buffers among `args` until `stream-sync`; `stream-record` marks an event.
+;; against the kernel's signature, asynchronously, lending the buffers among `args` until `stream-sync`; `stream-record` marks an event;
+;; `stream-lend` lends buffers as a launch does, for a library call on the stream (cuBLAS); `stream-handle` is the driver's handle (data).
 (defprotocol Stream
   (stream-launch (self k: (dyn Kernel) grid: (Vec i64) block: (Vec i64) args: (Vec Arg)) -> (Result unit GpuError))
   (stream-sync (self) -> (Result unit GpuError))
-  (stream-record (self e: (dyn Event)) -> (Result unit GpuError)))
+  (stream-record (self e: (dyn Event)) -> (Result unit GpuError))
+  (stream-lend (self bs: (Vec (dyn Buffer))) -> (Result unit GpuError))
+  (stream-handle (self) -> i64))
 
 ;; A device: its info, what it supports (`:ptx`, `:cubin`, `:pinned`, `:shared-memory`, `:events`, `:f64`), a module from source (PTX text as
 ;; bytes, or a binary image where `:cubin` is supported), memory (`:out-of-memory` beyond it, never a trap), streams, events, `close`.

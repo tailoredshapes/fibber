@@ -1,0 +1,142 @@
+;; fib.gpu.contract: what any `Device` driver must do, whoever implements it (docs/design/gpu.md 4.3; the pattern of fib.crypto's and
+;; fib.compress's contracts). A DRIVER repository runs it against itself: `(implements GpuContract "cuda" (fn () <a device>) <the PTX of
+;; fib.gpu.contract-kernels>)` in a spec built with `--kernel-target`, and `fibc test` judges it. It names no driver. fib.gpu.fault wraps a
+;; real device in the faults a driver can have (it skips the lent check, swallows the assert, ignores the signature): each fault must make the
+;; scenario that names it FAIL (`fault-scenarios`), or the contract could not fail. The device assert is a contract of its own
+;; (`GpuTrapContract`): after a device trap the context is unusable (CUDA), so a driver runs it in a process of its own, last.
+(ns fib.gpu.contract (:use fib.core fib.seq fib.coll fib.test.core fib.gpu.device) (:require [fib.string :as s]))
+
+(defun fill (n: i64 seed: i64) -> (Array f32)
+  (let [out (cell (array n 0.0f32))]
+    (do (dotimes (i n) (array-set! &out i (/ (sitofp f32 (rem (+ (* i 7919) seed) 10007)) 97.0f32))) @out)))
+
+(defun mismatches (want: (Array f32) got: (Array f32)) -> i64
+  (loop [i 0 bad 0]
+    (if (>= i (array-len want)) bad
+        (recur (+ i 1) (if (= (f32->bits (array-get want i)) (f32->bits (array-get got i))) bad (+ bad 1))))))
+
+;; The worst relative difference between two results.
+(defun worst-relative (want: (Array f32) got: (Array f32)) -> f64
+  (loop [i 0 worst 0.0]
+    (if (>= i (array-len want)) worst
+        (let [w (fpext f64 (array-get want i)) g (fpext f64 (array-get got i))
+              rel (/ (if (> (- w g) 0.0) (- w g) (- g w)) (+ (if (< w 0.0) (- 0.0 w) w) 1.0e-30))]
+          (recur (+ i 1) (if (> rel worst) rel worst))))))
+
+(defun mmul-ref (a: (Array f32) b: (Array f32) n: i64) -> (Array f32)
+  (let [c (cell (array (* n n) 0.0f32))]
+    (do (dotimes (i n) (dotimes (j n)
+          (array-set! &c (+ (* i n) j) (loop [k 0 acc 0.0f32] (if (>= k n) acc (recur (+ k 1) (simd/fma (array-get a (+ (* i n) k)) (array-get b (+ (* k n) j)) acc)))))))
+        @c)))
+
+(defun kind (r: (Result unit GpuError)) -> keyword (match r ((Ok _) :ok) ((Err e) (. e kind))))
+(defun kind-f32 (r: (Result (Array f32) GpuError)) -> keyword (match r ((Ok _) :ok) ((Err e) (. e kind))))
+(defun kind-buf (r: (Result (dyn Buffer) GpuError)) -> keyword (match r ((Ok _) :ok) ((Err e) (. e kind))))
+
+;; A run of vadd on `n` elements: the mismatches against the CPU, as a text ("" when none); an Err is its text.
+(defun vadd-run (d: (dyn Device) ptx: (Array i8) n: i64) -> str
+  (match (try-let [m (device-load d ptx) k (module-kernel m "contract_vadd") s (device-stream d)
+                   a (device-alloc d (* 4 n)) b (device-alloc d (* 4 n)) c (device-alloc d (* 4 n))
+                   ha (Ok (fill n 1)) hb (Ok (fill n 2))
+                   _ (buffer-upload a ha) _ (buffer-upload b hb)
+                   _ (stream-launch s k [(quot (+ n 255) 256)] [256] [(ABuf a) (ABuf b) (ABuf c) (AI64 n)])
+                   _ (stream-sync s)
+                   hc (buffer-download c n)
+                   _ (buffer-release a) _ (buffer-release b) _ (buffer-release c) _ (module-unload m)]
+            (let [want (cell (array n 0.0f32))]
+              (do (dotimes (i n) (array-set! &want i (+ (array-get ha i) (array-get hb i))))
+                  (Ok (mismatches @want hc)))))
+    ((Ok 0) "")
+    ((Ok bad) (str bad " mismatches"))
+    ((Err e) (str (. e kind) ": " (. e message)))))
+
+;; A run of gemm at `n`: the worst relative difference from the CPU reference (which sums in the same order: 0 is expected), -1 on an Err.
+(defun gemm-run (d: (dyn Device) ptx: (Array i8) n: i64) -> f64
+  (match (try-let [m (device-load d ptx) k (module-kernel m "contract_gemm") s (device-stream d)
+                   a (device-alloc d (* 4 (* n n))) b (device-alloc d (* 4 (* n n))) c (device-alloc d (* 4 (* n n)))
+                   ha (Ok (fill (* n n) 1)) hb (Ok (fill (* n n) 2))
+                   _ (buffer-upload a ha) _ (buffer-upload b hb)
+                   _ (stream-launch s k [(quot (+ n 15) 16) (quot (+ n 15) 16)] [16 16] [(ABuf a) (ABuf b) (ABuf c) (AI64 n)])
+                   _ (stream-sync s)
+                   hc (buffer-download c (* n n))
+                   _ (buffer-release a) _ (buffer-release b) _ (buffer-release c) _ (module-unload m)]
+            (Ok (worst-relative (mmul-ref ha hb n) hc)))
+    ((Ok w) w)
+    ((Err _) -1.0)))
+
+;; The lent rules: the kinds of (download while lent, release while lent, a second lend, download after sync, release twice, upload after release).
+(defun lent-kinds (d: (dyn Device) ptx: (Array i8)) -> (Vec keyword)
+  (let [n 1048576]
+    (match (try-let [m (device-load d ptx) k (module-kernel m "contract_vadd") s (device-stream d)
+                     a (device-alloc d (* 4 n)) b (device-alloc d (* 4 n)) c (device-alloc d (* 4 n))
+                     _ (buffer-upload a (fill n 1)) _ (buffer-upload b (fill n 2))
+                     _ (stream-launch s k [(quot n 256)] [256] [(ABuf a) (ABuf b) (ABuf c) (AI64 n)])
+                     k1 (Ok (kind-f32 (buffer-download c 16)))
+                     k2 (Ok (kind (buffer-release c)))
+                     k3 (Ok (kind (stream-launch s k [(quot n 256)] [256] [(ABuf a) (ABuf b) (ABuf c) (AI64 n)])))
+                     _ (stream-sync s)
+                     k4 (Ok (kind-f32 (buffer-download c 16)))
+                     _ (buffer-release c)
+                     k5 (Ok (kind (buffer-release c)))
+                     k6 (Ok (kind (buffer-upload c (fill 16 1))))
+                     _ (buffer-release a) _ (buffer-release b) _ (module-unload m)]
+              (Ok [k1 k2 k3 k4 k5 k6]))
+      ((Ok ks) ks)
+      ((Err e) [(. e kind)]))))
+
+(defun launch-kinds (d: (dyn Device) ptx: (Array i8)) -> (Vec keyword)
+  (match (try-let [m (device-load d ptx) k (module-kernel m "contract_vadd") s (device-stream d)
+                   a (device-alloc d 4096) b (device-alloc d 4096) c (device-alloc d 4096)
+                   few (Ok (kind (stream-launch s k [4] [256] [(ABuf a) (ABuf b) (AI64 1024)])))
+                   wrong (Ok (kind (stream-launch s k [4] [256] [(ABuf a) (ABuf b) (ABuf c) (AF32 1.0f32)])))
+                   empty (Ok (kind (stream-launch s k [0] [256] [(ABuf a) (ABuf b) (ABuf c) (AI64 1024)])))
+                   big (Ok (kind (stream-launch s k [4] [(+ (. (device-info d) max-block) 1)] [(ABuf a) (ABuf b) (ABuf c) (AI64 1024)])))
+                   good (Ok (kind (stream-launch s k [4] [256] [(ABuf a) (ABuf b) (ABuf c) (AI64 1024)])))
+                   _ (stream-sync s)
+                   sig (Ok (kernel-signature k))
+                   _ (buffer-release a) _ (buffer-release b) _ (buffer-release c) _ (module-unload m)]
+            (Ok [few wrong empty big good (if (= sig ["ptr" "ptr" "ptr" "i64"]) :ok :bad-signature)]))
+    ((Ok ks) ks)
+    ((Err e) [(. e kind)])))
+
+(defun alloc-beyond (d: (dyn Device)) -> keyword
+  (kind-buf (device-alloc d (* 4 (. (device-info d) memory)))))
+
+(defcontract GpuContract [make ptx]
+  (scenario "the device says what it is: a name, memory, a compute capability, a block limit, the capabilities it supports"
+    (given [d (make) i (device-info d)])
+    (then (expect = true (> (str-len (. i name)) 0)) (expect = true (> (. i memory) 0)) (expect = true (>= (. i max-block) 32))
+          (expect = true (device-supports? d :ptx))))
+  (scenario "vector add on 2^20 elements is bit for bit the CPU's"
+    (given [d (make)])
+    (then (expect = "" (vadd-run d ptx 1048576))))
+  (scenario "GEMM at 256 is within the stated bound of the CPU reference (the same fma order: bit exact, bound 0)"
+    (given [d (make)])
+    (then (expect = 0.0 (gemm-run d ptx 256))))
+  (scenario "lent-buffer misuse is an Err: download, release and a second lend while a kernel runs; use after release; and a download after sync is fine"
+    (given [d (make)])
+    (then (expect = [:lent :lent :lent :ok :released :released] (lent-kinds d ptx))))
+  (scenario "a launch is checked against the kernel's signature and the device: too few arguments, a wrong kind, an empty grid, a block over the limit; a good launch runs"
+    (given [d (make)])
+    (then (expect = [:arguments :arguments :launch :launch :ok :ok] (launch-kinds d ptx))))
+  (scenario "an allocation beyond the device's memory is an out-of-memory Err, not a trap"
+    (given [d (make)])
+    (then (expect = :out-of-memory (alloc-beyond d)))))
+
+;; The device assert: `contract_assert` traps on a non-positive element, and the trap is the `:device-trap` Err of the sync that follows; a
+;; positive input syncs Ok. Run last, in its own process: the context is unusable after the trap.
+(defun assert-run (d: (dyn Device) ptx: (Array i8) bad: bool) -> keyword
+  (let [n 1024]
+    (match (try-let [m (device-load d ptx) k (module-kernel m "contract_assert") s (device-stream d)
+                     a (device-alloc d (* 4 n))
+                     _ (buffer-upload a (let [xs (fill n 1)] (if bad (let [c (cell xs)] (do (array-set! &c 500 0.0f32) @c)) xs)))
+                     _ (stream-launch s k [(quot n 256)] [256] [(ABuf a) (AI64 n)])
+                     r (Ok (kind (stream-sync s)))]
+              (Ok r))
+      ((Ok k) k)
+      ((Err e) (. e kind)))))
+
+(defcontract GpuTrapContract [make ptx]
+  (scenario "a device assert (a kernel's trap) surfaces as the device-trap Err of the sync that follows; a positive input syncs Ok"
+    (given [d (make)])
+    (then (expect = :ok (assert-run d ptx false)) (expect = :device-trap (assert-run d ptx true)))))
