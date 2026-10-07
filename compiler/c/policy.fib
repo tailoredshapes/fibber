@@ -1,0 +1,188 @@
+;; compiler/c/policy.fib: the warning and error policy of the C printer (docs/design/lir2c.md section 2): what the chosen C compiler can
+;; do, and what the printer does with a tail call it cannot guarantee.
+;;
+;; The facts per compiler (the table; `fibc build --via c` confirms them with a probe, driver.viac):
+;;   gcc 15+    `__attribute__((musttail))` between any two prototypes whose stack-passed arguments fit the caller's (else an error);
+;;   clang 13+  `__attribute__((musttail))` only between identical prototypes;
+;;   any other  no musttail: every non-self tail call is a plain call.
+;; A tail call the compiler cannot guarantee is an ERROR (ADR 0008: a supported target guarantees tail calls), or with
+;; `--allow-plain-tail-calls` a WARNING at the call site and a plain call (the program keeps its meaning and risks its stack).
+;; The stack-slot estimate is the x86-64 SysV classification: 6 integer and 8 vector registers, aggregates over 16 bytes in memory.
+(ns c.policy
+  (:use lir.types lir.lit lir.ast c.cx)
+  (:require [lir.check.walk :as walk]))
+
+;; The facts of a compiler by name (the word of `--cc`, or the probe's answer).
+(defun opts-for (cc: str plain: bool lines: bool) -> COpts
+  (let ((base (cc-base cc)))
+    (cond (= base "gcc") (COpts cc true true plain lines)
+          (= base "clang") (COpts cc true false plain lines)
+          :else (COpts cc false false plain lines))))
+
+;; `gcc` of `/usr/bin/gcc-15`, `clang` of `clang-21`, `cc` otherwise.
+(defun cc-base (cc: str) -> str
+  (let ((name (match (str-rfind cc "/") ((some i) (str-slice cc (+ i 1) (str-len cc))) (nil cc))))
+    (cond (some? (str-find name "clang" 0)) "clang"
+          (some? (str-find name "gcc" 0)) "gcc"
+          :else "cc")))
+
+(defun str-rfind :private (s: str ch: str) -> (Option i64)
+  (loop ((i (- (str-len s) 1)))
+    (cond (< i 0) nil
+          (= (str-slice s i (+ i 1)) ch) (some i)
+          :else (recur (- i 1)))))
+
+;; ---------------------------------------------------------------- the SysV estimate
+
+(defun scalar-size :private (t: LType) -> i64
+  (match t ((TInt b) (if (<= b 8) 1 (quot b 8))) ((TFloat) 4) (_ 8)))
+
+(defun type-size :private (cx: Cx t: LType) -> i64
+  (match t
+    ((TVector n e) (* n (scalar-size e)))
+    ((TArray n e) (* n (type-size cx e)))
+    ((TNamed _) (reduce (fn (a: i64 f: LType) (+ a (type-size cx f))) 0 (agg-fields cx t)))
+    ((TAnon fs) (reduce (fn (a: i64 f: LType) (+ a (type-size cx f))) 0 fs))
+    (_ (scalar-size t))))
+
+;; The leaves of a type with their byte offsets (LLVM's x86-64 layout: natural alignment, a vector aligned to its size).
+(defun type-align :private (cx: Cx t: LType) -> i64
+  (match t
+    ((TVector n e) (let ((b (* n (scalar-size e)))) (loop ((p 1)) (if (>= p b) p (recur (* p 2))))))
+    ((TArray _ e) (type-align cx e))
+    ((TNamed _) (reduce (fn (a: i64 f: LType) (max a (type-align cx f))) 1 (agg-fields cx t)))
+    ((TAnon fs) (reduce (fn (a: i64 f: LType) (max a (type-align cx f))) 1 fs))
+    (_ (scalar-size t))))
+
+(defun round-up :private (n: i64 a: i64) -> i64 (* (quot (+ n (- a 1)) a) a))
+
+(defun layout-size :private (cx: Cx t: LType) -> i64
+  (match t
+    ((TArray n e) (* n (layout-size cx e)))
+    ((TNamed _) (fields-size cx (agg-fields cx t)))
+    ((TAnon fs) (fields-size cx fs))
+    (_ (type-size cx t))))
+
+(defun fields-size :private (cx: Cx fs: (Vec LType)) -> i64
+  (let ((end (reduce (fn (off: i64 f: LType) (+ (round-up off (type-align cx f)) (layout-size cx f))) 0 fs)))
+    (if (= (count fs) 0) 0 (round-up end (reduce (fn (a: i64 f: LType) (max a (type-align cx f))) 1 fs)))))
+
+;; (offset, leaf) pairs of a type's scalars and vectors, from `base`.
+(defun leaf-offsets :private (cx: Cx t: LType base: i64) -> (Vec (Pair i64 LType))
+  (match t
+    ((TArray n e) (vec (mapcat (fn (i: i64) (leaf-offsets cx e (+ base (* i (layout-size cx e))))) (range n))))
+    ((TNamed _) (fields-offsets cx (agg-fields cx t) base))
+    ((TAnon fs) (fields-offsets cx fs base))
+    (_ [(Pair base t)])))
+
+(defun fields-offsets :private (cx: Cx fs: (Vec LType) base: i64) -> (Vec (Pair i64 LType))
+  (loop ((i 0) (off 0) (out: (Vec (Pair i64 LType)) []))
+    (if (>= i (count fs))
+        out
+        (let ((f (nth fs i)) (o (round-up off (type-align cx f))))
+          (recur (+ i 1) (+ o (layout-size cx f)) (into out (leaf-offsets cx f (+ base o))))))))
+
+;; The SysV classification of one argument: the integer and vector registers it takes (an eightbyte is INTEGER when any of its leaves is
+;; an integer or a pointer, else SSE), or nil for one passed in memory (an aggregate over 16 bytes; a vector over 32 bytes).
+(defun arg-regs :private (cx: Cx t: LType) -> (Option (Pair i64 i64))
+  (let ((size (layout-size cx t)))
+    (cond (is-vector? t) (if (> size 32) nil (some (Pair 0 1)))
+          (not (type-aggregate? t)) (some (if (is-float? t) (Pair 0 1) (Pair 1 0)))
+          (> size 16) nil
+          :else (let ((ls (leaf-offsets cx t 0))
+                      (eb (fn (k: i64) (some? (find-first (fn (p: (Pair i64 LType)) (and (= (quot (. p fst) 8) k) (not (or (is-float? (. p snd)) (is-vector? (. p snd)))))) ls))))
+                      (n8 (quot (+ size 7) 8)))
+                  (some (reduce (fn (acc: (Pair i64 i64) k: i64) (if (eb k) (Pair (+ (. acc fst) 1) (. acc snd)) (Pair (. acc fst) (+ (. acc snd) 1))))
+                                (Pair 0 0) (range n8)))))))
+
+;; The bytes of stack a parameter list needs beyond the 6 integer and 8 vector registers (the SysV x86-64 rules, which gcc's "cannot
+;; tail-call: callee required more stack slots than the caller" is about): an argument that does not fit the registers left takes its size
+;; rounded up to 8 on the stack.
+(defun stack-bytes (cx: Cx params: (Vec LType)) -> i64
+  (loop ((i 0) (ints 6) (sses 8) (bytes 0))
+    (if (>= i (count params))
+        bytes
+        (let ((t (nth params i)) (rounded (* 8 (quot (+ (layout-size cx t) 7) 8))))
+          (match (arg-regs cx t)
+            (nil (recur (+ i 1) ints sses (+ bytes rounded)))
+            ((some r) (if (and (<= (. r fst) ints) (<= (. r snd) sses))
+                          (recur (+ i 1) (- ints (. r fst)) (- sses (. r snd)) bytes)
+                          (recur (+ i 1) ints sses (+ bytes rounded)))))))))
+
+;; ---------------------------------------------------------------- the tailcc stack area
+
+;; lIR's `tailcc` guarantees a tail call between any two prototypes; C's convention cannot jump to a callee that needs more stack-passed
+;; argument bytes than the caller received. So every `tailcc` prototype of the module (definitions, and the function types of indirect
+;; calls) is padded with i64 parameters, passed as 0, until its stack area is the largest one any tailcc prototype of the module needs
+;; (`tail-area`): then no tailcc callee needs more than its tailcc caller has, as LLVM's tailcc reserves the area. A module whose tailcc
+;; functions all fit the registers pays nothing.
+(defun tail-area (cx: Cx m: LModule) -> i64
+  (let ((best (cell 0))
+        (note (fn (t: LFnType) (when (= (. t cc) CcTail) (let ((n (stack-bytes cx (. t params)))) (update! best (fn (b) (max b n))))))))
+    (do (run! (fn (it: LItem)
+                (match it
+                  ((ItDefine f) (do (note (. f ty))
+                                    (run! (fn (b: LBlock) (run! (fn (e: LExpr) (walk-tail-types e note)) (. b body))) (. f blocks))))
+                  ((ItDeclare d) (note (. d ty)))
+                  (_ ())))
+              (. m items))
+        @best)))
+
+(defun walk-tail-types :private (e: LExpr f: (fn (LFnType) unit)) -> unit
+  (do (match (. e kind)
+        ((KCall (CalIndirect _ t) _ _) (when (= (. t cc) CcTail) (f t)))
+        (_ ()))
+      (match (. e kind)
+        ((KLet binds body) (do (run! (fn (b: LBinding) (walk-tail-types (. b value) f)) binds) (run! (fn (x: LExpr) (walk-tail-types x f)) body)))
+        ((KPhi _ _) ())
+        (_ (run! (fn (x: LExpr) (walk-tail-types x f)) (walk/children e))))))
+
+;; The parameter types with the padding.
+(defun padded-params (cx: Cx t: LFnType) -> (Vec LType)
+  (into (. t params) (vec (repeat (tail-pads cx t) ty-i64))))
+
+;; How many i64 parameters pad a tailcc prototype to the module's area (0 for a ccc one).
+(defun tail-pads (cx: Cx t: LFnType) -> i64
+  (if (not (= (. t cc) CcTail))
+      0
+      (loop ((n 0) (ps (. t params)))
+        (if (>= (stack-bytes cx ps) @(. cx tail-area)) n (recur (+ n 1) (conj ps ty-i64))))))
+
+;; ---------------------------------------------------------------- the verdict
+
+(defun same-prototype? :private (a: LFnType b: LFnType) -> bool
+  (and (= (. a ret) (. b ret)) (= (. a params) (. b params)) (= (. a varargs) (. b varargs))))
+
+;; Whether the tail call is written `musttail`; else it is a plain call, after a warning (`--allow-plain-tail-calls`) or an error.
+(defun tail-verdict (cx: Cx pos: i64 caller: str ct: LFnType callee: str tt: LFnType) -> bool
+  (let ((o (. cx opts)) (cc (cc-base (. o cc))))
+    (cond (not (. o musttail))
+          (refuse cx pos (str "tail call to " callee " in @" caller " cannot be guaranteed: " (. o cc) " has no __attribute__((musttail))"))
+          (result-in-memory? cx (. ct ret))
+          (refuse cx pos (str "tail call to " callee " in @" caller " cannot be guaranteed: a result of type " (ret-str (. ct ret))
+                              " is returned through a hidden pointer by the C convention (gcc: \"memory reference after call\")"))
+          (same-prototype? ct tt) true
+          (not (. o musttail-any))
+          (refuse cx pos (str "tail call to " callee " in @" caller " cannot be guaranteed: " cc " honours musttail only between identical prototypes, and "
+                              (fn-type-str tt) " differs from " (fn-type-str ct)))
+          (> (stack-bytes cx (padded-params cx tt)) (stack-bytes cx (padded-params cx ct)))
+          (refuse cx pos (str "tail call to " callee " in @" caller " cannot be guaranteed: the callee needs " (stack-bytes cx (padded-params cx tt))
+                              " bytes of stack-passed arguments and the caller has " (stack-bytes cx (padded-params cx ct)) " (lIR's tailcc has no C equivalent)"))
+          :else true)))
+
+;; Whether the C convention returns the type through a hidden pointer, which gcc cannot forward in a tail call: a vector over 32 bytes
+;; (512 bits is in a register only with AVX-512, which the printer does not assume) or an aggregate over 16 bytes. (lIR's rule 5, spec/lir.md
+;; 7.3, allows two leaves of up to 512 bits each, which LLVM forwards.)
+(defun result-in-memory? :private (cx: Cx r: (Option LType)) -> bool
+  (match r
+    (nil false)
+    ((some t) (cond (is-vector? t) (> (layout-size cx t) 32)
+                    (type-aggregate? t) (> (layout-size cx t) 16)
+                    :else false))))
+
+;; The plain-call path: a warning under `--allow-plain-tail-calls`, an error otherwise. Never musttail.
+(defun refuse :private (cx: Cx pos: i64 why: str) -> bool
+  (do (if (. (. cx opts) plain-tails)
+          (warn! cx pos (str why "; lowered to a plain call (--allow-plain-tail-calls): the stack may grow"))
+          (error! cx pos (str why "; --allow-plain-tail-calls lowers it to a plain call")))
+      false))

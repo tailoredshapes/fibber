@@ -1,0 +1,59 @@
+;; expect: accept
+;; out: wrap 9223372036854775807 -9223372036854775808 -2 0
+;; out: wrap8 -128 127 1 0
+;; out: shift -9223372036854775808 -9223372036854775808 1 -1 4611686018427387904
+;; out: shift32 -2147483648 1 -1
+;; out: udiv 18446744073709551615 3 1 3
+;; out: sdiv -3 1 -2 -1
+;; out: bits 64 64 0 1 -128 127 32 8
+;; out: ovf -9223372036854775808 1 9223372036854775807 1 -9223372036854775808 1
+;; out: sat 9223372036854775807 -9223372036854775808 0 255 0 127 -128
+;; out: fmin nan -0.0 0.0 1.0 nan 2.0
+;; out: fma 1.0000000000000002 -5.36616e+15 0
+;; out: bits2 4607182418800017408 1.0 1065353216
+;; out: mask 170 85 1
+;; out: cvt 1 -1 1 -1 -1.0 255.0
+;; The arithmetic edges the C printer must get right (docs/design/lir2c.md section 2): wrapping where lIR wraps (unsigned casts, never C's
+;; signed overflow), shift amounts masked to the width (x86-64's answer for what lIR calls poison), udiv/urem on the unsigned values, i8/i16
+;; computed without promotion surprises, cttz/ctlz of 0 and abs of the minimum (never poison), the overflow intrinsics at the edges, the
+;; saturating conversions (NaN to 0), the NaN-propagating fmin/fmax with -0.0 below +0.0, fma with one rounding, bitcasts, mask-to-integer
+;; bitcasts, and the conversions from i1.
+(declare printf i32 (ptr ...))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "wrap %lld %lld %lld %lld\n") (add (i64 9223372036854775807) (i64 0)) (add (i64 9223372036854775807) (i64 1))
+          (mul (i64 9223372036854775807) (i64 2)) (sub (i64 -9223372036854775808) (i64 -9223372036854775808)))
+    (call @printf (string "wrap8 %d %d %d %d\n") (sext i32 (add (i8 127) (i8 1))) (sext i32 (sub (i8 -128) (i8 1)))
+          (sext i32 (mul (i8 127) (i8 127))) (sext i32 (mul (i8 -128) (i8 2))))
+    (let ((amt (add (i64 62) (i64 1))) (one (add (i64 0) (i64 1))) (m (add (i64 0) (i64 -1))))
+      (call @printf (string "shift %lld %lld %lld %lld %lld\n") (shl one amt) (shl one (i64 63)) (lshr m amt) (ashr m (i64 63))
+            (lshr (i64 -9223372036854775808) (i64 1))))
+    (let ((a32 (add (i32 0) (i32 1))) (s32 (add (i32 0) (i32 31))))
+      (call @printf (string "shift32 %d %d %d\n") (shl a32 (i32 31)) (lshr (i32 -2147483648) s32) (ashr (i32 -2147483648) (i32 31))))
+    (let ((neg1 (add (i64 0) (i64 -1))) (three (add (i64 0) (i64 3))))
+      (call @printf (string "udiv %llu %llu %llu %llu\n") (udiv neg1 (i64 1)) (udiv (i64 11) three) (urem (i64 10) three) (urem neg1 (i64 4))))
+    (let ((m7 (add (i64 0) (i64 -7))) (two (add (i64 0) (i64 2))))
+      (call @printf (string "sdiv %lld %lld %lld %lld\n") (sdiv m7 two) (srem (i64 7) three) (sdiv (i64 7) (i64 -3)) (srem m7 (i64 -3))))
+    (let ((z (add (i64 0) (i64 0))) (mn (add (i64 0) (i64 -9223372036854775808))))
+      (call @printf (string "bits %lld %lld %lld %lld %d %d %d %d\n") (cttz z) (ctlz z) (ctpop z) (ctpop mn)
+            (sext i32 (abs (i8 -128))) (sext i32 (abs (i8 -127))) (ctlz (i32 0)) (sext i32 (cttz (i8 0)))))
+    (let ((r1 (sadd-overflow (i64 9223372036854775807) one)) (r2 (ssub-overflow mn one)) (r3 (smul-overflow mn m)))
+      (call @printf (string "ovf %lld %d %lld %d %lld %d\n") (extractvalue r1 0) (zext i32 (extractvalue r1 1))
+            (extractvalue r2 0) (zext i32 (extractvalue r2 1)) (extractvalue r3 0) (zext i32 (extractvalue r3 1))))
+    (let ((big (fadd (double 1e30) (double 0.0))) (nanv (bitcast double (i64 9221120237041090560))))
+      (call @printf (string "sat %lld %lld %lld %d %d %d %d\n") (fptosi-sat i64 big) (fptosi-sat i64 (fneg big)) (fptosi-sat i64 nanv)
+            (zext i32 (fptoui-sat i8 big)) (zext i32 (fptoui-sat i8 (fneg big))) (sext i32 (fptosi-sat i8 (double 127.9))) (sext i32 (fptosi-sat i8 (double -200.0)))))
+    (let ((nz (fneg (fadd (double 0.0) (double 0.0)))) (pz (fadd (double 0.0) (double 0.0))))
+      (call @printf (string "fmin %.1f %.1f %.1f %.1f %.1f %.1f\n") (fmin nanv (double 1.0)) (fmin nz pz) (fmax nz pz) (fminnum nanv (double 1.0))
+            (fmax nanv (double 2.0)) (fmaxnum nanv (double 2.0))))
+    (let ((x (fadd (double 1e16) (double 0.0))) (y (fadd (double 1e32) (double 0.0))))
+      (call @printf (string "fma %.17g %g %g\n") (fma (double 1.0) (double 1.0) (double 2.220446049250313e-16)) (fma x x (fneg y))
+            (fsub (fmul x x) y)))
+    (let ((d (fadd (double 1.0) (double 0.0))) (f (fadd (float 1.0) (float 0.0))))
+      (call @printf (string "bits2 %lld %.1f %d\n") (bitcast i64 d) (bitcast double (i64 4607182418800017408)) (bitcast i32 f)))
+    (let ((v (icmp slt (<8 x i32> 1 2 3 4 5 6 7 8) (<8 x i32> 0 3 0 5 0 7 0 9))) (w (icmp eq (<8 x i32> 1 2 3 4 5 6 7 8) (<8 x i32> 1 0 3 0 5 0 7 0))))
+      (call @printf (string "mask %d %d %d\n") (zext i32 (bitcast i8 v)) (zext i32 (bitcast i8 w)) (zext i32 (extractelement (bitcast <8 x i1> (i8 9)) (i32 0)))))
+    (let ((t (icmp eq (i64 1) (i64 1))))
+      (call @printf (string "cvt %d %d %d %lld %.1f %.1f\n") (zext i32 (zext i8 t)) (sext i32 (sext i8 t)) (zext i32 t) (sext i64 t)
+            (sitofp double t) (uitofp double (i8 -1))))
+    (ret (i32 0))))

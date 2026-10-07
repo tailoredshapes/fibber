@@ -1,0 +1,209 @@
+;; compiler/c/func.fib: one lIR function as one C function (docs/design/lir2c.md section 3). Every block is a label and every branch a
+;; `goto`, so the C control flow is the lIR one, block for block. A phi is a C variable `p_<pos>` that each edge into its block assigns
+;; before it jumps; when an edge assigns several, it copies every value into a temporary first (a parallel copy: the values may name the
+;; phis themselves, the lost-copy and swap problems). Every SSA name is a C local declared at the top of the function.
+;;
+;; Tail calls (spec/lir.md 7.3): a tail call of the function to itself assigns the parameters (in parallel) and jumps to the entry: a
+;; loop, on any compiler. Any other is `__attribute__((musttail)) return g(..)` where the compiler guarantees it (c.policy decides from
+;; the compiler's facts and the two prototypes); where it cannot, the call is an error, or with `--allow-plain-tail-calls` a plain call
+;; and a warning naming the call site: the program keeps its meaning and risks its stack.
+(ns c.func
+  (:use lir.types lir.lit lir.ast lir.diag c.cx c.ty c.expr c.call c.policy)
+  (:require [lir.check.walk :as walk]))
+
+;; ---------------------------------------------------------------- what a function holds
+
+(defun walk-into :private (e: LExpr f: (fn (LExpr) unit)) -> unit
+  (do (f e)
+      (match (. e kind)
+        ((KLet binds body) (do (run! (fn (b: LBinding) (walk-into (. b value) f)) binds) (run! (fn (x: LExpr) (walk-into x f)) body)))
+        ((KPhi _ inc) (run! (fn (b: LBinding) (walk-into (. b value) f)) inc))
+        (_ (run! (fn (x: LExpr) (walk-into x f)) (walk/children e))))))
+
+(defun walk-fn (f: LFunction g: (fn (LExpr) unit)) -> unit
+  (run! (fn (b: LBlock) (run! (fn (e: LExpr) (walk-into e g)) (. b body))) (. f blocks)))
+
+;; Every `let` binding of the function, by name.
+(defun collect-binds :private (f: LFunction) -> (Map str LExpr)
+  (let ((m (cell {})))
+    (do (walk-fn f (fn (e: LExpr) (match (. e kind)
+                                     ((KLet binds _) (run! (fn (b: LBinding) (update! m (fn (x) (assoc x (. b name) (. b value))))) binds))
+                                     (_ ()))))
+        @m)))
+
+(defun block-phis :private (b: LBlock) -> (Vec Phi)
+  (let ((acc (cell [])))
+    (do (run! (fn (e: LExpr) (walk-into e (fn (x: LExpr) (match (. x kind)
+                                                           ((KPhi t inc) (update! acc (fn (v) (conj v (Phi (. x pos) t inc)))))
+                                                           (_ ())))))
+              (. b body))
+        @acc)))
+
+(defun self-tail? :private (fname: str e: LExpr) -> bool
+  (match (. e kind) ((KCall (CalDirect n) _ true) (= n fname)) (_ false)))
+
+;; The labels a block's terminator names.
+(defun succs :private (b: LBlock) -> (Vec str)
+  (let ((acc (cell [])))
+    (do (run! (fn (e: LExpr) (walk-into e (fn (x: LExpr) (match (. x kind)
+                                                           ((KBr l) (update! acc (fn (v) (conj v l))))
+                                                           ((KCondBr _ a c) (update! acc (fn (v) (conj (conj v a) c))))
+                                                           ((KSwitch _ d cases) (update! acc (fn (v) (into (conj v d) (map (fn (c: LCase) (. c label)) cases)))))
+                                                           (_ ())))))
+              (. b body))
+        @acc)))
+
+;; Whether block `l` can reach itself (it is in a loop).
+(defun in-loop? :private (sm: (Map str (Vec str)) l: str) -> bool
+  (loop ((todo (unwrap-or (get sm l) [])) (seen: (Set str) #{}))
+    (cond (= (count todo) 0) false
+          (= (nth todo 0) l) true
+          (contains? seen (nth todo 0)) (recur (vec (drop 1 todo)) seen)
+          :else (recur (into (vec (drop 1 todo)) (unwrap-or (get sm (nth todo 0)) [])) (conj seen (nth todo 0))))))
+
+(defun has-alloca? :private (b: LBlock) -> bool
+  (let ((hit (cell false)))
+    (do (run! (fn (e: LExpr) (walk-into e (fn (x: LExpr) (match (. x kind) ((KAlloca _ _ _) (set! hit true)) (_ ()))))) (. b body))
+        @hit)))
+
+;; The blocks with an alloca that are in a loop: their allocas get a slot per execution.
+(defun looped-blocks :private (f: LFunction) -> (Set str)
+  (let ((sm (into {} (map (fn (b: LBlock) (Pair (. b label) (succs b))) (. f blocks)))))
+    (into #{} (map (fn (b: LBlock) (. b label)) (filter (fn (b: LBlock) (and (has-alloca? b) (in-loop? sm (. b label)))) (. f blocks))))))
+
+;; ---------------------------------------------------------------- edges and terminators
+
+;; The copies of an edge from `from` into the phis of `to`, then the jump.
+(defun goto! :private (cf: Cf from: str to: str) -> unit
+  (let ((phis (unwrap-or (get (. cf phis) to) []))
+        (vals (vec (keep (fn (ph: Phi) (match (find-first (fn (b: LBinding) (= (. b name) from)) (. ph inc))
+                                         ((some b) (some (Pair ph (expr-c cf (. b value)))))
+                                         (nil nil)))
+                         phis))))
+    (do (if (<= (count vals) 1)
+            (run! (fn (pv: (Pair Phi str)) (emit! cf (str (phi-name (. (. pv fst) pos)) " = " (. pv snd) ";"))) vals)
+            (let ((tmps (vec (map (fn (pv: (Pair Phi str)) (let ((t (new-temp cf (. (. pv fst) ty)))) (do (emit! cf (str t " = " (. pv snd) ";")) t))) vals))))
+              (run! (fn (i: i64) (emit! cf (str (phi-name (. (. (nth vals i) fst) pos)) " = " (nth tmps i) ";"))) (range (count vals)))))
+        (emit! cf (str "goto " (label-name to) ";")))))
+
+(defun ret! :private (cf: Cf v: (Option LExpr)) -> unit
+  (match v
+    ((some x) (emit! cf (str "return " (expr-c cf x) ";")))
+    (nil (emit! cf "return;"))))
+
+;; A tail call of the function to itself: the parameters assigned in parallel, then the entry block again.
+(defun self-tail! :private (cf: Cf args: (Vec LExpr)) -> unit
+  (let ((f (. cf f)) (ps (. f params)) (ts (. (. f ty) params))
+        (vals (vec (map (fn (a: LExpr) (expr-c cf a)) args)))
+        (tmps (vec (map-indexed (fn (i: i64 v: str) (let ((t (new-temp cf (nth ts i)))) (do (emit! cf (str t " = " v ";")) t))) vals))))
+    (do (run! (fn (i: i64) (emit! cf (str (local-name (. (nth ps i) name)) " = " (nth tmps i) ";"))) (range (count ps)))
+        (set! (. cf self-tail) true)
+        (emit! cf (str "goto " (label-name (. (nth (. f blocks) 0) label)) ";")))))
+
+(defun tail! :private (cf: Cf pos: i64 c: LCallee args: (Vec LExpr)) -> unit
+  (let ((cx (. cf cx)) (f (. cf f)))
+    (match c
+      ((CalDirect n)
+       (if (= n (. f name))
+           (self-tail! cf args)
+           (let ((text (call-text cf c args)))
+             (emit-tail! cf pos (tail-verdict cx pos (. f name) (. f ty) (str "@" n) (unwrap-or (get (. cx fns) n) (. f ty))) text (. (. f ty) ret)))))
+      ((CalIndirect _ t)
+       (let ((text (call-text cf c args)))
+         (emit-tail! cf pos (tail-verdict cx pos (. f name) (. f ty) "the callee" t) text (. (. f ty) ret)))))))
+
+(defun emit-tail! :private (cf: Cf pos: i64 must: bool text: str ret: (Option LType)) -> unit
+  (cond must (do (set! (. cf must-tail) true) (emit! cf (str "__attribute__((musttail)) return " text ";")))
+        (nil? ret) (do (emit! cf (str text ";")) (emit! cf "return;"))
+        :else (emit! cf (str "return " text ";"))))
+
+(defun switch! :private (cf: Cf from: str v: LExpr d: str cases: (Vec LCase)) -> unit
+  (do (emit! cf (str "switch (" (expr-c cf v) ") {"))
+      (run! (fn (c: LCase) (do (emit! cf (str "case " (expr-c cf (. c value)) ": {")) (goto! cf from (. c label)) (emit! cf "}"))) cases)
+      (emit! cf "default: {") (goto! cf from d) (emit! cf "}")
+      (emit! cf "}")))
+
+(defun terminator! :private (cf: Cf from: str e: LExpr) -> unit
+  (do (line! cf (. e pos))
+      (match (. e kind)
+        ((KRet v) (ret! cf v))
+        ((KBr l) (goto! cf from l))
+        ((KCondBr c a b) (do (emit! cf (str "if (" (expr-c cf c) ") {")) (goto! cf from a) (emit! cf "} else {") (goto! cf from b) (emit! cf "}")))
+        ((KSwitch v d cases) (switch! cf from v d cases))
+        ((KUnreachable) (emit! cf "__builtin_trap();"))
+        ((KCall c args true) (tail! cf (. e pos) c args))
+        (_ (stmt! cf e)))))
+
+;; A block's statements: a `let` whose last form is the terminator is opened here, so the terminator is written as one.
+(defun stmt-or-term! :private (cf: Cf from: str e: LExpr) -> unit
+  (match (. e kind)
+    ((KLet binds body)
+     (do (run! (fn (b: LBinding) (bind! cf b)) binds)
+         (run! (fn (x: LExpr) (stmt-or-term! cf from x)) body)))
+    (_ (if (kind-terminator? (. e kind)) (terminator! cf from e) (do (line! cf (. e pos)) (stmt! cf e))))))
+
+(defun block! :private (cf: Cf targets: (Set str) b: LBlock) -> unit
+  (do (set! (. cf label) (. b label))
+      (when (contains? targets (. b label)) (emit! cf (str (label-name (. b label)) ": ;")))
+      (run! (fn (e: LExpr) (stmt-or-term! cf (. b label) e)) (. b body))))
+
+;; ---------------------------------------------------------------- the function
+
+(defun cf-new :private (cx: Cx f: LFunction) -> Cf
+  (let ((ps (. f params)) (ts (. (. f ty) params)))
+    (Cf cx f (collect-binds f)
+        (cell (into {} (map-indexed (fn (i: i64 p: LParam) (Pair (. p name) (nth ts i))) ps)))
+        (cell []) (cell []) (cell 0)
+        (into {} (map (fn (b: LBlock) (Pair (. b label) (block-phis b))) (. f blocks)))
+        (looped-blocks f) (cell "") (cell false) (cell false) expr-c)))
+
+;; The labels some edge jumps to; the entry when the function tail-calls itself.
+(defun targets :private (f: LFunction) -> (Set str)
+  (let ((s (cell (into #{} (mapcat succs (. f blocks))))))
+    (do (walk-fn f (fn (e: LExpr) (if (self-tail? (. f name) e) (update! s (fn (x) (conj x (. (nth (. f blocks) 0) label)))) ())))
+        @s)))
+
+(defun phi-decls :private (cf: Cf) -> unit
+  (run! (fn (ps: (Vec Phi)) (run! (fn (ph: Phi) (declare! cf (str (ctype (. cf cx) (. ph ty)) " " (phi-name (. ph pos)) ";"))) ps))
+        (vals (. cf phis))))
+
+;; `static` for a private or internal function; an exported one carries its visibility.
+(defun linkage-text (m: LModifiers) -> str
+  (str (if (= (. m linkage) LkExternal) "" "static ") (if (. m hidden) "__attribute__((visibility(\"hidden\"))) " "")))
+
+;; The parameters, and for a tailcc function the padding `int64_t` ones of the module's stack area (c.policy `tail-pads`).
+(defun params-text (cx: Cx f: LFunction) -> str
+  (let ((ps (. f params)) (ts (. (. f ty) params)) (pads (tail-pads cx (. f ty))))
+    (if (and (= (count ps) 0) (= pads 0))
+        "(void)"
+        (str "(" (str-join (vec (map-indexed (fn (i: i64 p: LParam) (str (if (= i 0) "" ", ") (ctype cx (nth ts i)) " " (local-name (. p name)))) ps)))
+             (str-join (vec (map (fn (k: i64) (str (if (and (= k 0) (= (count ps) 0)) "" ", ") "int64_t pad" k)) (range pads)))) ")"))))
+
+;; The head of a definition. C's `main` is `int main(int, char **)`: the lIR one takes `(i32 argc) (ptr argv)` and gets its `argv` as a char *.
+;; A function with a musttail call is `noinline`: gcc 15 inlines such a function and then cannot honour the attribute in the inlined copy
+;; ("cannot tail-call: other reasons"); the call itself is a jump, so nothing is lost but the inlining of a body that ends in a jump.
+(defun head-text (cx: Cx f: LFunction) -> str (head-text-with cx f false))
+
+(defun head-text-with (cx: Cx f: LFunction noinline: bool) -> str
+  (if (= (. f name) "main")
+      (if (= (count (. f params)) 0) "int32_t main(void)" (str "int32_t main(int32_t " (local-name (. (nth (. f params) 0) name)) ", char **fib_argv)"))
+      (str (linkage-text (. f mods)) (if noinline "__attribute__((noinline)) " "") (ret-ctype cx (. (. f ty) ret)) " " (fn-name (. f name)) (params-text cx f))))
+
+;; The C text of one function. A `kernelcc` function (spec/lir.md 6.9a) is a GPU kernel's entry: an error, and no text.
+(defun function-c (cx: Cx f: LFunction) -> str
+  (if (= (. (. f ty) cc) CcKernel)
+      (do (error! cx (. f pos) (str "@" (. f name) " is kernelcc: kernel target forms have no C translation: use --kernel-target")) "")
+      (function-body-c cx f)))
+
+(defun function-body-c :private (cx: Cx f: LFunction) -> str
+  (let ((cf (cf-new cx f)) (tg (targets f)))
+    (do (run! (fn (t: LType) (type-ok! cx (. f pos) t)) (. (. f ty) params))
+        (match (. (. f ty) ret) ((some t) (type-ok! cx (. f pos) t)) (nil ()))
+        (phi-decls cf)
+        (when (and (= (. f name) "main") (= (count (. f params)) 2))
+          (do (declare! cf (str "char *" (local-name (. (nth (. f params) 1) name)) " = (char *)fib_argv;"))))
+        (run! (fn (b: LBlock) (block! cf tg b)) (. f blocks))
+        (str (head-text-with cx f @(. cf must-tail)) " {\n"
+             (str-join (vec (map (fn (l: str) (str "  " l "\n")) @(. cf decls))))
+             (str-join (vec (map (fn (l: str) (str "  " l "\n")) @(. cf out))))
+             "  __builtin_trap(); /* every block ends in a terminator: not reached */\n}\n"))))

@@ -1,0 +1,155 @@
+;; compiler/c/mem.fib: memory forms (spec/lir.md 6.5, 6.6) as C statements (docs/design/lir2c.md section 3).
+;; A scalar or vector load is `*(ma_T *)p`, through a typedef that carries `may_alias` (an lIR pointer is untyped: a block holds a string
+;; now and doubles after the allocator reuses it, so C's strict aliasing cannot be assumed) and, for an `(align N)` below the ABI's,
+;; `aligned(1)` (the access is then correct at any address). An aggregate is moved with `__builtin_memcpy`. A `<N x i1>` in memory is
+;; bit-packed as LLVM stores it. Pointer arithmetic is done in `uintptr_t`, which is never undefined (a `getelementptr` may step outside any
+;; object; `inbounds` is not used). Atomics are the `__atomic_*` builtins with lIR's ordering mapped one to one (unordered is relaxed, which
+;; is stronger); `singlethread` is a signal fence for `fence` and the same operation otherwise.
+(ns c.mem
+  (:use lir.types lir.lit lir.ast c.cx c.ty))
+
+(defun scalar-size :private (t: LType) -> i64
+  (match t ((TInt b) (if (<= b 8) 1 (quot b 8))) ((TFloat) 4) (_ 8)))
+
+;; The ABI alignment LLVM gives a scalar or vector (a vector: its size rounded up to a power of two).
+(defun abi-align :private (t: LType) -> i64
+  (match t
+    ((TVector n e) (loop ((p 1)) (if (>= p (* n (scalar-size e))) p (recur (* p 2)))))
+    (_ (scalar-size t))))
+
+(defun unaligned? :private (t: LType al: (Option i64)) -> bool
+  (match al ((some a) (< a (abi-align t))) (nil false)))
+
+(defun mask-vector? :private (t: LType) -> bool
+  (match t ((TVector _ (TInt 1)) true) (_ false)))
+
+;; `*(ma_T *)p`, or the volatile form.
+(defun access (cf: Cf t: LType p: str volatile: bool al: (Option i64)) -> str
+  (str "*(" (if volatile "volatile " "") (access-ctype (. cf cx) t (unaligned? t al)) " *)" p))
+
+;; A `<N x i1>` read from its packed bytes into `dst`, lane by lane.
+(defun unpack-mask! :private (cf: Cf n: i64 p: str dst: str) -> unit
+  (do (emit! cf (str "for (int i = 0; i < " n "; i++) " dst "[i] = (int8_t)((((fib_ma_u8 *)" p ")[i >> 3] >> (i & 7)) & 1);"))))
+
+(defun pack-mask! :private (cf: Cf n: i64 v: str p: str) -> unit
+  (do (emit! cf (str "for (int i = 0; i < " n "; i += 8) ((fib_ma_u8 *)" p ")[i >> 3] = 0;"))
+      (emit! cf (str "for (int i = 0; i < " n "; i++) ((fib_ma_u8 *)" p ")[i >> 3] |= (uint8_t)((" v "[i] & 1) << (i & 7));"))))
+
+;; `dst = load`.
+(defun lane-ptr :private (cf: Cf e: LType p: str) -> str
+  (str "((" (access-ctype (. cf cx) e true) " *)" p ")"))
+
+(defun load! (cf: Cf t: LType p: str volatile: bool al: (Option i64) dst: str) -> unit
+  (cond (mask-vector? t) (unpack-mask! cf (lanes-of t) p dst)
+        (padded? t) (emit! cf (str "for (int i = 0; i < " (lanes-of t) "; i++) " dst "[i] = " (lane-ptr cf (elem-of t) p) "[i];"))
+        (type-aggregate? t) (emit! cf (str "__builtin_memcpy(&" dst ", " p ", sizeof " dst ");"))
+        :else (emit! cf (str dst " = " (access cf t p volatile al) ";"))))
+
+(defun store! (cf: Cf t: LType v: str p: str volatile: bool al: (Option i64)) -> unit
+  (cond (mask-vector? t) (pack-mask! cf (lanes-of t) v p)
+        (padded? t) (emit! cf (str "for (int i = 0; i < " (lanes-of t) "; i++) " (lane-ptr cf (elem-of t) p) "[i] = " v "[i];"))
+        (type-aggregate? t) (emit! cf (str "__builtin_memcpy(" p ", &" v ", sizeof " v ");"))
+        :else (emit! cf (str (access cf t p volatile al) " = " v ";"))))
+
+;; ---------------------------------------------------------------- getelementptr
+
+;; An integer index as a uint64_t, sign-extended as LLVM extends indices (an i1 is 0 or -1).
+(defun index-u64 (cf: Cf e: LExpr) -> str
+  (let ((v (cf-ex cf e)))
+    (match (type-of! cf e)
+      ((TInt 1) (str "(uint64_t)(int64_t)(-(int)" v ")"))
+      ((TInt 64) (str "(uint64_t)" v))
+      (_ (str "(uint64_t)(int64_t)" v)))))
+
+;; The terms of the steps after the first index: a struct field is its offset, an array element its index times its size.
+(defun gep-steps :private (cf: Cf t: LType idx: (Vec LExpr)) -> str
+  (let ((cx (. cf cx)))
+    (loop ((i 1) (t t) (acc ""))
+      (if (>= i (count idx))
+          acc
+          (let ((e (nth idx i)))
+            (match t
+              ((TArray _ el) (recur (+ i 1) el (str acc " + " (index-u64 cf e) " * sizeof(" (ctype cx el) ")")))
+              (_ (let ((k (unwrap-or (lit->i64 (unwrap-or (expr-int-literal e) (LLit 0 0))) 0)) (fs (agg-fields cx t)))
+                   (recur (+ i 1) (nth fs k) (str acc " + __builtin_offsetof(" (ctype cx t) ", f" k ")"))))))))))
+
+(defun gep! (cf: Cf t: LType p: LExpr idx: (Vec LExpr) dst: str) -> unit
+  (let ((cx (. cf cx)) (ps (cf-ex cf p)) (i0 (nth idx 0)) (ti (type-of! cf i0)))
+    (if (is-vector? ti)
+        (let ((n (lanes-of ti)) (vi (cf-ex cf i0)) (vt (TVector n ty-i64)))
+          (emit! cf (str dst " = (" (ctype cx vt) ")((" (uvector-ctype cx vt) ")__builtin_convertvector(" vi ", " (ctype cx vt) ") * (uint64_t)sizeof(" (ctype cx t) ") + (uint64_t)(uintptr_t)" ps ");")))
+        (emit! cf (str dst " = (char *)((uintptr_t)" ps " + " (index-u64 cf i0) " * sizeof(" (ctype cx t) ")" (gep-steps cf t idx) ");")))))
+
+;; ---------------------------------------------------------------- alloca
+
+;; `(alloca T n)`: a C local (one slot per call) where the alloca runs once per call, `__builtin_alloca_with_align` (one slot per execution,
+;; as LLVM) in a block that is in a loop. The slot keeps `(align N)`; a C local has at least its type's alignment.
+(defun alloca! (cf: Cf t: LType n: (Option LExpr) al: (Option i64) label: str dst: str) -> unit
+  (let ((cx (. cf cx)) (ct (ctype cx t)) (slot (str "s" (fresh-temp cf)))
+        (attr (match al ((some a) (str " __attribute__((aligned(" a ")))")) (nil "")))
+        (fixed (match n (nil (some "")) ((some c) (match (expr-int-literal c) ((some v) (some (str "[" (lit-str v) "]"))) (nil nil))))))
+    (match (if (contains? (. cf looped) label) nil fixed)
+      ((some dims) (do (declare! cf (str ct " " slot dims attr ";"))
+                       (emit! cf (str dst " = (char *)&" slot ";"))))
+      (nil (let ((count (match n ((some c) (index-u64 cf c)) (nil "1"))))
+             (emit! cf (str dst " = (char *)__builtin_alloca_with_align(" count " * sizeof(" ct "), " (* 8 (unwrap-or al 16)) ");")))))))
+
+;; ---------------------------------------------------------------- atomics
+
+(defun order-c (o: LOrdering) -> str
+  (match o
+    ((OUnordered) "__ATOMIC_RELAXED") ((OMonotonic) "__ATOMIC_RELAXED") ((OAcquire) "__ATOMIC_ACQUIRE")
+    ((ORelease) "__ATOMIC_RELEASE") ((OAcqRel) "__ATOMIC_ACQ_REL") ((OSeqCst) "__ATOMIC_SEQ_CST")))
+
+(defun atomic-ptr :private (cf: Cf t: LType p: str) -> str
+  (str "(" (access-ctype (. cf cx) t false) " *)" p))
+
+(defun atomic-load! (cf: Cf o: LOrdering t: LType p: str dst: str) -> unit
+  (emit! cf (str "__atomic_load(" (atomic-ptr cf t p) ", &" dst ", " (order-c o) ");")))
+
+;; An lvalue holding `v`: a fresh temporary (the builtins take addresses).
+(defun lvalue! (cf: Cf t: LType v: str) -> str
+  (let ((tmp (fresh-temp cf)))
+    (do (declare! cf (str (ctype (. cf cx) t) " " tmp ";"))
+        (emit! cf (str tmp " = " v ";"))
+        tmp)))
+
+(defun atomic-store! (cf: Cf o: LOrdering t: LType v: str p: str) -> unit
+  (let ((tmp (lvalue! cf t v)))
+    (emit! cf (str "__atomic_store(" (atomic-ptr cf t p) ", &" tmp ", " (order-c o) ");"))))
+
+(defun fetch-word :private (op: LRmwOp) -> (Option str)
+  (match op
+    ((RAdd) (some "add")) ((RSub) (some "sub")) ((RAnd) (some "and")) ((RNand) (some "nand")) ((ROr) (some "or")) ((RXor) (some "xor"))
+    (_ nil)))
+
+;; The new value of a read-modify-write that the builtins lack, from the old value `o` and the operand `v`.
+(defun rmw-new :private (op: LRmwOp t: LType o: str v: str) -> str
+  (let ((u (unsigned-ctype t)) (s (if (= t ty-float) "32" "64")))
+    (match op
+      ((RMax) (str "(" o " > " v " ? " o " : " v ")")) ((RMin) (str "(" o " < " v " ? " o " : " v ")"))
+      ((RUMax) (str "((" u ")" o " > (" u ")" v " ? " o " : " v ")")) ((RUMin) (str "((" u ")" o " < (" u ")" v " ? " o " : " v ")"))
+      ((RFAdd) (str "(" o " + " v ")")) ((RFSub) (str "(" o " - " v ")"))
+      ((RFMax) (str "fib_fmaxnum" s "(" o ", " v ")")) ((RFMin) (str "fib_fminnum" s "(" o ", " v ")"))
+      (_ v))))
+
+(defun atomic-rmw! (cf: Cf op: LRmwOp o: LOrdering t: LType p: str v: str dst: str) -> unit
+  (match op
+    ((RXchg) (let ((tmp (lvalue! cf t v)))
+               (emit! cf (str "__atomic_exchange(" (atomic-ptr cf t p) ", &" tmp ", &" dst ", " (order-c o) ");"))))
+    (_ (match (fetch-word op)
+         ((some w) (emit! cf (str dst " = __atomic_fetch_" w "(" (atomic-ptr cf t p) ", " v ", " (order-c o) ");")))
+         (nil (let ((nw (lvalue! cf t v)))
+                (do (emit! cf (str "__atomic_load(" (atomic-ptr cf t p) ", &" dst ", __ATOMIC_RELAXED);"))
+                    (emit! cf (str "for (;;) { " nw " = " (rmw-new op t dst v) "; if (__atomic_compare_exchange(" (atomic-ptr cf t p)
+                                   ", &" dst ", &" nw ", 0, " (order-c o) ", __ATOMIC_RELAXED)) break; }")))))))))
+
+;; `{ T, i1 }`: the old value and whether the exchange happened.
+(defun cmpxchg! (cf: Cf weak: bool so: LOrdering fo: LOrdering t: LType p: str x: str n: str dst: str) -> unit
+  (let ((nw (lvalue! cf t n)))
+    (do (emit! cf (str dst ".f0 = " x ";"))
+        (emit! cf (str dst ".f1 = (uint8_t)__atomic_compare_exchange(" (atomic-ptr cf t p) ", &" dst ".f0, &" nw ", " (if weak "1" "0") ", "
+                       (order-c so) ", " (order-c fo) ");")))))
+
+(defun fence! (cf: Cf sc: LScope o: LOrdering) -> unit
+  (emit! cf (str (if (= sc ScSingleThread) "__atomic_signal_fence(" "__atomic_thread_fence(") (order-c o) ");")))

@@ -1,0 +1,86 @@
+;; compiler/c/ty.fib: the lIR type of every expression of a checked module (the printer declares a C local of that type for each result).
+;; The checker has typed the module already but keeps no types; recomputing is short because every form's type follows from its operands.
+;; A name's type is its binding's, found through `binds` and remembered; a phi carries its type, so a loop never asks for itself.
+;; (The same computation as compiler/js/ty.fib, over the C printer's function context.)
+(ns c.ty
+  (:use lir.types lir.lit lir.ast c.cx))
+
+(defun ty-or-ptr :private (o: (Option LType)) -> LType (unwrap-or o ty-ptr))
+
+(defun first-arg-ty :private (cf: Cf args: (Vec LExpr)) -> (Option LType)
+  (if (= (count args) 0) nil (type-of cf (nth args 0))))
+
+(defun has-prefix? (s: str pre: str) -> bool
+  (and (>= (str-len s) (str-len pre)) (= (str-slice s 0 (str-len pre)) pre)))
+
+(defun intrin-ty :private (cf: Cf name: str ty: (Option LType) args: (Vec LExpr)) -> (Option LType)
+  (cond (or (= name "masked-load") (= name "gather")) ty
+        (or (= name "masked-store") (= name "scatter")) nil
+        (and (has-prefix? name "reduce-") (not (= name "reduce-fadd")) (not (= name "reduce-fmul")))
+        (some (elem-of (ty-or-ptr (first-arg-ty cf args))))
+        :else (first-arg-ty cf args)))
+
+;; The type at the end of an extractvalue path.
+(defun path-ty (cf: Cf t: LType idx: (Vec LLit)) -> LType
+  (loop ((i 0) (t t))
+    (if (>= i (count idx))
+        t
+        (let ((k (unwrap-or (lit->i64 (nth idx i)) 0)))
+          (recur (+ i 1) (match t
+                           ((TArray _ e) e)
+                           (_ (nth (agg-fields (. cf cx) t) k))))))))
+
+(defun mask-ty (t: LType) -> LType
+  (match t ((TVector n _) (TVector n ty-i1)) (_ ty-i1)))
+
+(defun gep-ty :private (cf: Cf idx: (Vec LExpr)) -> LType
+  (if (and (= (count idx) 1) (is-vector? (ty-or-ptr (type-of cf (nth idx 0)))))
+      (TVector (lanes-of (ty-or-ptr (type-of cf (nth idx 0)))) ty-ptr)
+      ty-ptr))
+
+(defun call-ty :private (cf: Cf c: LCallee) -> (Option LType)
+  (match c
+    ((CalDirect n) (match (get (. (. cf cx) fns) n) ((some t) (. t ret)) (nil nil)))
+    ((CalIndirect _ t) (. t ret))))
+
+(defun local-ty :private (cf: Cf n: str) -> (Option LType)
+  (match (get @(. cf types) n)
+    ((some t) (some t))
+    (nil (match (get (. cf binds) n)
+           ((some b) (let ((t (type-of cf b)))
+                       (do (match t ((some x) (update! (. cf types) (fn (m) (assoc m n x)))) (nil ())) t)))
+           (nil nil)))))
+
+(defun lits-ty :private (cf: Cf name: (Option str) fields: (Vec LExpr)) -> LType
+  (match name
+    ((some n) (TNamed n))
+    (nil (TAnon (vec (map (fn (f: LExpr) (ty-or-ptr (type-of cf f))) fields))))))
+
+;; The type of an expression; nil for a void one.
+(defun type-of (cf: Cf e: LExpr) -> (Option LType)
+  (match (. e kind)
+    ((KLocal n) (local-ty cf n))
+    ((KInt t _) (some t)) ((KFloat t _) (some t)) ((KVector t _) (some t)) ((KArray t _) (some t)) ((KZero t) (some t))
+    ((KStruct n fs) (some (lits-ty cf n fs)))
+    ((KBin _ a _) (type-of cf a)) ((KUn _ a) (type-of cf a)) ((KSelect _ a _) (type-of cf a)) ((KInsertElement v _ _) (type-of cf v))
+    ((KOverflow _ a _) (let ((t (ty-or-ptr (type-of cf a)))) (some (TAnon [t (mask-ty t)]))))
+    ((KICmp _ a _) (some (mask-ty (ty-or-ptr (type-of cf a)))))
+    ((KFCmp _ a _) (some (mask-ty (ty-or-ptr (type-of cf a)))))
+    ((KCast _ t _) (some t))
+    ((KExtractElement v _) (some (elem-of (ty-or-ptr (type-of cf v)))))
+    ((KShuffle a _ m) (some (TVector (lanes-of (ty-or-ptr (type-of cf m))) (elem-of (ty-or-ptr (type-of cf a))))))
+    ((KExtractValue a idx) (some (path-ty cf (ty-or-ptr (type-of cf a)) idx)))
+    ((KInsertValue a _ _) (type-of cf a))
+    ((KLoad t _ _ _) (some t)) ((KAtomicLoad _ _ t _) (some t)) ((KAtomicRmw _ _ _ _ v) (type-of cf v))
+    ((KCmpXchg _ _ _ _ _ x _) (some (TAnon [(ty-or-ptr (type-of cf x)) ty-i1])))
+    ((KGep _ _ _ idx) (some (gep-ty cf idx)))
+    ((KIntrin name _ ty args _) (intrin-ty cf name ty args))
+    ((KCall c _ _) (call-ty cf c))
+    ((KPhi t _) (some t))
+    ((KLet _ body) (if (= (count body) 0) nil (type-of cf (nth body (- (count body) 1)))))
+    ((KSreg _) (some ty-i32))
+    ((KStore _ _ _ _) nil) ((KAtomicStore _ _ _ _) nil) ((KFence _ _) nil) ((KTrap) nil) ((KBarrier) nil)
+    ((KRet _) nil) ((KBr _) nil) ((KCondBr _ _ _) nil) ((KSwitch _ _ _) nil) ((KUnreachable) nil)
+    (_ (some ty-ptr))))
+
+(defun type-of! (cf: Cf e: LExpr) -> LType (ty-or-ptr (type-of cf e)))

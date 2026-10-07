@@ -1,0 +1,84 @@
+;; compiler/c/call.fib: calls (spec/lir.md 6.8) and the intrinsic forms (6.1, 6.4, 6.5) as C (docs/design/lir2c.md section 3). A direct
+;; call names the C function; an indirect call casts the pointer to the function type written at the call (interned as a typedef).
+;; The arguments are names or literals (c.expr hoists everything else first), so C's unspecified argument order changes nothing.
+;; A float intrinsic is the `__builtin_` of the same name (exact: `fma` one rounding, `sqrt` correctly rounded, `round` ties away,
+;; `rint` ties to even in the default rounding mode, which nothing changes); `fmin`/`fmax` and the integer forms are the helpers of
+;; c.prelude; on a vector each is a lane loop.
+(ns c.call
+  (:use lir.types lir.lit lir.ast lir.intrin c.cx c.ty c.scalar c.vec c.policy))
+
+(defun args-c (cf: Cf args: (Vec LExpr)) -> str
+  (str-join (vec (map-indexed (fn (i: i64 e: LExpr) (str (if (= i 0) "" ", ") (cf-ex cf e))) args))))
+
+;; The typedef of a pointer to a function type, made once per type.
+(defun fnptr-typedef (cx: Cx t: LFnType) -> str
+  (let ((key (str "fn:" (fn-type-str t))))
+    (match (get @(. cx types) key)
+      ((some s) s)
+      (nil (let ((nm (str "fp" (fresh cx)))
+                 (line (str "typedef " (ret-ctype cx (. t ret)) " (*" nm ")" (params-ctype-padded cx t (tail-pads cx t)) ";")))
+             (do (update! (. cx types) (fn (m) (assoc m key nm)))
+                 (update! (. cx typedefs) (fn (v) (conj v line)))
+                 nm))))))
+
+;; The call expression (no assignment): the arguments are evaluated first, in order.
+;; The argument texts, with a `0` per padding parameter of a tailcc callee (c.policy `tail-pads`), joined.
+(defun padded-args :private (cf: Cf args: (Vec LExpr) pads: i64) -> str
+  (str-join-with ", " (into (vec (map (fn (e: LExpr) (cf-ex cf e)) args)) (vec (repeat pads "0")))))
+
+(defun call-text (cf: Cf c: LCallee args: (Vec LExpr)) -> str
+  (let ((cx (. cf cx)))
+    (match c
+      ((CalDirect n) (let ((pads (match (get (. cx fns) n) ((some t) (tail-pads cx t)) (nil 0))))
+                       (str (callee-name cx n) "(" (padded-args cf args pads) ")")))
+      ((CalIndirect p t) (let ((ps (cf-ex cf p)) (as (padded-args cf args (tail-pads cx t))))
+                           (str "((" (fnptr-typedef cx t) ")" ps ")(" as ")"))))))
+
+;; ---------------------------------------------------------------- intrinsics
+
+(defun builtin1 :private (name: str single: bool x: str) -> str
+  (let ((s (if single "f" "")))
+    (cond (= name "fsqrt") (str "__builtin_sqrt" s "(" x ")")
+          (= name "fabs") (str "__builtin_fabs" s "(" x ")")
+          (= name "ffloor") (str "__builtin_floor" s "(" x ")")
+          (= name "fceil") (str "__builtin_ceil" s "(" x ")")
+          (= name "ftrunc") (str "__builtin_trunc" s "(" x ")")
+          (= name "fround") (str "__builtin_round" s "(" x ")")
+          :else (str "__builtin_rint" s "(" x ")"))))
+
+(defun f2-text :private (name: str single: bool x: str y: str) -> str
+  (let ((w (if single "32" "64")))
+    (cond (= name "fcopysign") (str "__builtin_copysign" (if single "f" "") "(" x ", " y ")")
+          :else (str "fib_" name w "(" x ", " y ")"))))
+
+(defun fbin-op :private (name: str) -> LBinOp
+  (cond (= name "fadd") BFAdd (= name "fsub") BFSub (= name "fmul") BFMul (= name "fdiv") BFDiv :else BFRem))
+
+;; One lane's text of a lane-wise intrinsic over scalar operand texts.
+(defun lane-text :private (name: str cls: str e: LType a: str b: str c: str) -> str
+  (let ((single (= e ty-float)) (w (if single "32" "64")) (b8 (int-bits e)))
+    (cond (= cls "f1") (builtin1 name single a)
+          (= cls "f2") (f2-text name single a b)
+          (= cls "f3") (if (= name "fma") (str "__builtin_fma" (if single "f" "") "(" a ", " b ", " c ")") (str "fib_fmuladd" w "(" a ", " b ", " c ")"))
+          (= cls "fbin") (bin-c (fbin-op name) e a b)
+          (= cls "i1") (if (= e ty-i1) a (str "fib_" name b8 "(" a ")"))
+          :else (if (= e ty-i1) (if (or (= name "smin") (= name "umin")) (str "(uint8_t)(" a " & " b ")") (str "(uint8_t)(" a " | " b ")")) (str "fib_" name b8 "(" a ", " b ")")))))
+
+(defun lanewise! :private (cf: Cf name: str cls: str t: LType as: (Vec str) dst: str) -> unit
+  (let ((e (elem-of t)) (a (nth as 0)) (b (if (> (count as) 1) (nth as 1) "")) (c (if (> (count as) 2) (nth as 2) "")))
+    (if (is-vector? t)
+        (lanes! cf (lanes-of t) (str dst "[i] = " (lane-text name cls e (str a "[i]") (str b "[i]") (str c "[i]")) ";"))
+        (emit! cf (str dst " = " (lane-text name cls e a b c) ";")))))
+
+;; An intrinsic form into `dst` (a void one, masked-store and scatter, has no dst); `ty` is the leading type of masked-load and gather.
+(defun intrin! (cf: Cf name: str ty: (Option LType) args: (Vec LExpr) dst: str) -> unit
+  (let ((cls (intrin-class name)) (t0 (type-of! cf (nth args 0))) (as (vec (map (fn (e: LExpr) (cf-ex cf e)) args))))
+    (cond (= cls "red-i") (reduce! cf name t0 nil (nth as 0) dst)
+          (= cls "red-m") (reduce! cf name t0 nil (nth as 0) dst)
+          (= cls "red-f") (reduce! cf name (type-of! cf (nth args 1)) (some (nth as 0)) (nth as 1) dst)
+          (= cls "mload") (masked-load! cf (unwrap-or ty t0) (nth as 0) (nth as 1) (nth as 2) dst)
+          (= cls "gather") (gather! cf (unwrap-or ty t0) (nth as 0) (nth as 1) (nth as 2) dst)
+          (= cls "mstore") (masked-store! cf t0 (nth as 0) (nth as 1) (nth as 2))
+          (= cls "scatter") (scatter! cf t0 (nth as 0) (nth as 1) (nth as 2))
+          (and (= cls "fbin") (is-vector? t0)) (vbin! cf (fbin-op name) t0 (nth as 0) (nth as 1) dst)
+          :else (lanewise! cf name cls t0 as dst))))
