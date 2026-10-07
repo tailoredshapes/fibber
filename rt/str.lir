@@ -519,8 +519,16 @@
 (define internal (fib.utf8-valid i1) ((ptr p) (i64 n))
   (block entry (br loop))
   (block loop
-    (let ((i (phi i64 (entry (i64 0)) (adv inext))))
-      (br (icmp sge i n) ok head)))
+    (let ((i (phi i64 (entry (i64 0)) (adv inext) (wadv iw))))
+      (br (icmp sge i n) ok wide)))
+  ;; JSON-3: eight ASCII bytes at a time (a word with no byte of 0x80 or more is eight one-byte sequences), the byte-wise step for anything else.
+  (block wide
+    (br (icmp sle (add i (i64 8)) n) word head))
+  (block word
+    (let ((w (load i64 (getelementptr i8 p i)))
+          (iw (add i (i64 8))))
+      (br (icmp eq (and w (i64 -9187201950435737472)) (i64 0)) wadv head)))
+  (block wadv (br loop))
   (block head
     (let ((k (call @fib.utf8-step p n i)))
       (br (icmp sgt k (i64 0)) adv bad)))
