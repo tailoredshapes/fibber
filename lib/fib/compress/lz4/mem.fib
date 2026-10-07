@@ -20,13 +20,16 @@
 
 (defun cp16 (d: ptr di: i64 s: ptr si: i64) -> unit
   (unsafe (let [v: (Simd i8 16) (load-simd (ptr+ s si))] (store-simd (ptr+ d di) v))))
+(defun cp32 (d: ptr di: i64 s: ptr si: i64) -> unit
+  (unsafe (let [v: (Simd i8 32) (load-simd (ptr+ s si))] (store-simd (ptr+ d di) v))))
 (defun cp8 (d: ptr di: i64 s: ptr si: i64) -> unit (wr64 d di (rd64 s si)))
 (defun cp4 (d: ptr di: i64 s: ptr si: i64) -> unit (wr32 d di (rd32 s si)))
 
 ;; n bytes from s+si to d+di, exactly n written and exactly n read (a tail is covered by a chunk that overlaps the one before it), for ranges that do not overlap.
 (defun copy-exact (d: ptr di: i64 s: ptr si: i64 n: i64) -> unit
   (cond (>= n 16)
-        (do (loop [i 0] (if (<= (u+ i 16) n) (do (cp16 d (u+ di i) s (u+ si i)) (recur (u+ i 16))) ()))
+        (do (loop [i (if (>= n 64) (loop [k 0] (if (<= (u+ k 64) n) (do (cp32 d (u+ di k) s (u+ si k)) (cp32 d (u+ di (u+ k 32)) s (u+ si (u+ k 32))) (recur (u+ k 64))) k)) 0)]
+              (if (<= (u+ i 16) n) (do (cp16 d (u+ di i) s (u+ si i)) (recur (u+ i 16))) ()))
             (cp16 d (u+ di (u- n 16)) s (u+ si (u- n 16))))
         (>= n 8) (do (cp8 d di s si) (cp8 d (u+ di (u- n 8)) s (u+ si (u- n 8))))
         (>= n 4) (do (cp4 d di s si) (cp4 d (u+ di (u- n 4)) s (u+ si (u- n 4))))
@@ -36,8 +39,9 @@
 ;; bytes read data written by the chunks before. `slack` says whether the buffer has `chunk` bytes of room after the n bytes (then the last chunk may run over).
 (defun copy-far (d: ptr di: i64 dist: i64 n: i64 chunk: i64 slack: bool) -> unit
   (let [lim (if slack n (u- n (u- chunk 1)))
+        i32 (if (and (= chunk 16) (>= dist 32)) (loop [i 0] (if (<= (u+ i 32) lim) (do (cp32 d (u+ di i) d (u- (u+ di i) dist)) (recur (u+ i 32))) i)) 0)
         i (if (= chunk 16)
-            (loop [i 0] (if (< i lim) (do (cp16 d (u+ di i) d (u- (u+ di i) dist)) (recur (u+ i 16))) i))
+            (loop [i i32] (if (< i lim) (do (cp16 d (u+ di i) d (u- (u+ di i) dist)) (recur (u+ i 16))) i))
             (loop [i 0] (if (< i lim) (do (cp8 d (u+ di i) d (u- (u+ di i) dist)) (recur (u+ i 8))) i)))]
     (loop [j i] (if (< j n) (do (wr8 d (u+ di j) (rd8 d (u- (u+ di j) dist))) (recur (u+ j 1))) ()))))
 

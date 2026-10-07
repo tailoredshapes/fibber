@@ -30,15 +30,16 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 int main(int argc, char **argv) {
   FILE *f = fopen(argv[2], "rb"); fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
   char *src = malloc(n), *dst = malloc(LZ4_compressBound(n)), *back = malloc(n); fread(src, 1, n, f); fclose(f);
-  int level = argc > 3 ? atoi(argv[3]) : 1; int csize = 0; double best = 1e9;
+  int level = argc > 3 ? atoi(argv[3]) : 1; int csize = 0; double ts[64]; int nt = 0;
   for (int r = 0; r < 5; r++) {
     double t0 = now();
     if (argv[1][0] == 'c') csize = LZ4_compress_fast(src, dst, n, LZ4_compressBound(n), level);
     else if (argv[1][0] == 'h') csize = LZ4_compress_HC(src, dst, n, LZ4_compressBound(n), level);
     else { if (r == 0) csize = LZ4_compress_default(src, dst, n, LZ4_compressBound(n)); t0 = now(); if (LZ4_decompress_safe(dst, back, csize, n) != n) return 1; }
-    double t = now() - t0; if (t < best) best = t;
+    ts[nt++] = now() - t0;
   }
-  printf("%s %s level %d: %ld -> %d (%.2f%%) best %.3f s = %.0f MB/s\n", argv[1], argv[2], level, n, csize, 100.0 * csize / n, best, n / best / 1e6);
+  for (int i = 0; i < nt; i++) for (int j = i + 1; j < nt; j++) if (ts[j] < ts[i]) { double x = ts[i]; ts[i] = ts[j]; ts[j] = x; }
+  double best = ts[nt / 2]; printf("%s %s level %d: %ld -> %d (%.2f%%) median %.3f s = %.0f MB/s\n", argv[1], argv[2], level, n, csize, 100.0 * csize / n, best, n / best / 1e6);
   return 0;
 }
 EOF
