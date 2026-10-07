@@ -61,4 +61,4 @@ linker's embedded output path, not in code. Nothing here is in `fib.core` or the
 
 ## Wasm
 
-Not run (see the report).
+Cases 8470 to 8475 (block bytes equal to liblz4's, frame options, hostile inputs, one-byte streaming, xxHash32, registry and dictionary) built with `fibc build --target wasm32-wasi` (wasi-sdk 34 from `scripts/fetch-wasm-tools.sh`) and run under node's WASI: all six return 0. The big specs were not run on wasm.
