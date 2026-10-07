@@ -1,0 +1,75 @@
+;; The shape of the fib.compress contract: that it CAN fail (method rule: a test that cannot fail is worse than none). Three kinds of check:
+;;  1. the contract run against fib.compress.lz4 holds every scenario (specs/compress-lz4-spec.fib reports each);
+;;  2. every fault of fib.compress.fault, wrapped around the real LZ4, makes the scenario that names it FAIL (`fault-scenarios`), and no other scenario change its verdict
+;;     in a way that hides it: the table in docs/design/compress.md 8;
+;;  3. a deliberately broken in-spec codec (it copies its input: no framing, no magic, no limit, accepts anything) fails the scenarios that need a real frame.
+;; `fibc test specs`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.compress.contract fib.compress.fault fib.compress.corpus fib.compress.lz4)
+  (:require [fib.compress :as z]))
+
+(defstruct Copier (n: i64))
+(impl z/Codec Copier
+  (codec-name (self) "copier")
+  (codec-capabilities (self) [:frame])
+  (codec-magics (self) [])
+  (codec-max-compressed-size (self n) n)
+  (codec-compress (self data opts) (Ok (array-copy data 0 (array-len data))))
+  (codec-decompress (self data opts) (Ok (array-copy data 0 (array-len data))))
+  (codec-compressor (self opts) (Err (z/unsupported "no streaming")))
+  (codec-decompressor (self opts) (Err (z/unsupported "no streaming"))))
+
+(defun copier () -> Copier (Copier 0))
+(defun real () -> (dyn z/Codec :send) (dyn z/Codec :send (lz4)))
+(defun with-fault (fault: keyword) -> Faulty (faulty (real) fault))
+
+(defun all-faults-caught? () -> bool
+  (every? (fn (f: keyword)
+            (let [scs (CompressContract (fn () (with-fault f)))]
+              (every? (fn (w: str) (and (has-word? scs w) (failing-word? scs w))) (fault-scenarios f))))
+          (faults)))
+
+(defspecs specs
+  (feature "fib.compress contract shape"
+    (scenario "the contract has its fifteen scenarios"
+      (given [scs (CompressContract (fn () (lz4)))])
+      (then (expect = 15 (count scs))))
+    (scenario "against real LZ4 every scenario holds"
+      (given [scs (CompressContract (fn () (lz4)))])
+      (then (expect = [] (contract-failures scs 1))))
+    (scenario "every fault has scenarios, and they exist"
+      (given [scs (CompressContract (fn () (lz4)))])
+      (then (expect = 8 (count (faults)))
+            (expect = [] (vec (filter (fn (f: keyword) (empty? (fault-scenarios f))) (faults))))
+            (expect = [] (vec (mapcat (fn (f: keyword) (vec (filter (fn (w: str) (not (has-word? scs w))) (fault-scenarios f)))) (faults))))))
+    (scenario "a decoder that ignores max-output fails the exact-limit scenario"
+      (given [scs (CompressContract (fn () (with-fault :ignore-max-output)))])
+      (then (expect = true (failing-word? scs "max-output-is-enforced-exactly"))))
+    (scenario "a decoder that accepts a truncated input fails the every-prefix scenario"
+      (given [scs (CompressContract (fn () (with-fault :accept-truncation)))])
+      (then (expect = true (failing-word? scs "truncated-input-at-every-prefix"))))
+    (scenario "a compressor that drops the checksum fails the corruption scenario: corrupt frames decode to wrong bytes"
+      (given [scs (CompressContract (fn () (with-fault :drop-checksum)))])
+      (then (expect = true (failing-word? scs "corrupt-bytes-never-trap"))))
+    (scenario "a bug at a block boundary fails the round-trip scenario"
+      (given [scs (CompressContract (fn () (with-fault :corrupt-boundary)))])
+      (then (expect = true (failing-word? scs "a-round-trip-gives-the-input-back"))))
+    (scenario "state reused between streams fails the independent-streams scenario"
+      (given [scs (CompressContract (fn () (with-fault :reuse-state)))])
+      (then (expect = true (failing-word? scs "two-streams-from-one-codec-value"))))
+    (scenario "a dictionary that is ignored fails the dictionary scenario"
+      (given [scs (CompressContract (fn () (with-fault :ignore-dictionary)))])
+      (then (expect = true (failing-word? scs "a-dictionary-makes-text-smaller"))))
+    (scenario "a bound that is half what it should be fails the determinism and bound scenario"
+      (given [scs (CompressContract (fn () (with-fault :small-bound)))])
+      (then (expect = true (failing-word? scs "the-same-input-compresses-to-the-same-bytes-every-time"))))
+    (scenario "a capability list that names something nothing implements fails the honesty scenario"
+      (given [scs (CompressContract (fn () (with-fault :overclaim)))])
+      (then (expect = true (failing-word? scs "the-codec-has-a-name"))))
+    (scenario "a codec that copies its input fails what needs a real frame: truncation, magic numbers, the empty input, the limit"
+      (given [scs (CompressContract copier)])
+      (then (expect = true (failing-word? scs "truncated-input-at-every-prefix"))
+            (expect = true (failing-word? scs "a-frame-format-has-magic-numbers"))
+            (expect = true (failing-word? scs "empty-input-to-decompress-is-an-error"))
+            (expect = true (failing-word? scs "max-output-is-enforced-exactly"))))))
+
+(defun main () -> i64 (run-main (specs)))

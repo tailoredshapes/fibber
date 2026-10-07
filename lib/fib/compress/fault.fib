@@ -1,0 +1,94 @@
+;; fib.compress.fault: how a driver shows its contract run can fail (docs/design/compress.md 8, method rule: a test that cannot fail is worse than none).
+;; `(Faulty real fault)` wraps a REAL codec and breaks one thing: a decorator, not a driver, it compresses nothing of its own. A driver repository runs the contract against
+;; each fault and expects the scenario `fault-scenarios` names to FAIL.
+;;   :ignore-max-output  decompress (one-shot and streamed) is given the default limit instead of the caller's: a bomb is not stopped
+;;   :accept-truncation  a truncated input is a success with nothing in it (one-shot), and finishing a cut stream succeeds
+;;   :drop-checksum      compress records no checksum whatever the options say, so a corrupted frame decodes to wrong bytes without an error
+;;   :corrupt-boundary   compress of an input of 64 KiB or more flips a bit in the middle of its output (a bug at a block boundary)
+;;   :reuse-state        the second compressor from one codec value is the first one again, finished (state kept between streams)
+;;   :ignore-dictionary  compress is given no dictionary, so the output is as large as without
+;;   :small-bound        max-compressed-size answers half of what it should (a preallocation that is too small)
+;;   :overclaim          the capability list names `:rot13`, which nothing implements
+(ns fib.compress.fault (:use fib.core fib.seq fib.coll fib.test.core fib.compress.types fib.compress.ops))
+
+(defstruct Lenient (inner: (dyn Decompressor)))
+(impl Decompressor Lenient
+  (decompressor-feed (self chunk) (decompressor-feed (. self inner) chunk))
+  (decompressor-finish (self) (match (decompressor-finish (. self inner)) ((Err _) (Ok ())) ((Ok u) (Ok u)))))
+
+(defstruct Faulty (inner: (dyn Codec :send) fault: keyword held: (Cell (Option (dyn Compressor)))))
+(defun faulty (inner: (dyn Codec :send) fault: keyword) -> Faulty (Faulty inner fault (cell nil)))
+
+(defun faults () -> (Vec keyword) [:ignore-max-output :accept-truncation :drop-checksum :corrupt-boundary :reuse-state :ignore-dictionary :small-bound :overclaim])
+
+(defun is? (f: Faulty k: keyword) -> bool (= (. f fault) k))
+
+;; The words of the ids of the contract scenarios that must fail for each fault (fib.compress.contract).
+(defun fault-scenarios (fault: keyword) -> (Vec str)
+  (cond (= fault :ignore-max-output) ["max-output-is-enforced-exactly"]
+        (= fault :accept-truncation) ["truncated-input-at-every-prefix"]
+        (= fault :drop-checksum) ["corrupt-bytes-never-trap"]
+        (= fault :corrupt-boundary) ["a-round-trip-gives-the-input-back"]
+        (= fault :reuse-state) ["two-streams-from-one-codec-value"]
+        (= fault :ignore-dictionary) ["a-dictionary-makes-text-smaller"]
+        (= fault :small-bound) ["the-same-input-compresses-to-the-same-bytes-every-time"]
+        (= fault :overclaim) ["the-codec-has-a-name"]
+        :else []))
+
+(defun flip-middle (b: (Array i8)) -> (Array i8)
+  (if (< (array-len b) 2) b
+    (let [c (cell (array-copy b 0 (array-len b))) i (quot (array-len b) 2)]
+      (do (array-set! &c i (bit-xor (array-get b i) 1i8)) @c))))
+
+(defun opts-for-compress (f: Faulty o: Options) -> Options
+  (cond (is? f :drop-checksum) (with (with o (checksum false)) (block-checksum false))
+        (is? f :ignore-dictionary) (with-dictionary o (array 0 0i8))
+        :else o))
+
+(defun opts-for-decompress (f: Faulty o: Options) -> Options (if (is? f :ignore-max-output) (with-max-output o default-max-output) o))
+
+(defun faulty-compress (f: Faulty data: (Array i8) o: Options) -> (Result (Array i8) CompressError)
+  (match (codec-compress (. f inner) data (opts-for-compress f o))
+    ((Ok b) (Ok (if (and (is? f :corrupt-boundary) (>= (array-len data) 65536)) (flip-middle b) b)))
+    ((Err e) (Err e))))
+
+(defun faulty-decompress (f: Faulty data: (Array i8) o: Options) -> (Result (Array i8) CompressError)
+  (match (codec-decompress (. f inner) data (opts-for-decompress f o))
+    ((Err e) (if (and (is? f :accept-truncation) (= (. e kind) :truncated)) (Ok (array 0 0i8)) (Err e)))
+    ((Ok b) (Ok b))))
+
+(defun faulty-compressor (f: Faulty o: Options) -> (Result (dyn Compressor) CompressError)
+  (match @(. f held)
+    ((some k) (if (is? f :reuse-state) (Ok k) (codec-compressor (. f inner) (opts-for-compress f o))))
+    (nil (match (codec-compressor (. f inner) (opts-for-compress f o))
+           ((Err e) (Err e))
+           ((Ok k) (do (when (is? f :reuse-state) (set! (. f held) (some k))) (Ok k)))))))
+
+(defun faulty-decompressor (f: Faulty o: Options) -> (Result (dyn Decompressor) CompressError)
+  (match (codec-decompressor (. f inner) (opts-for-decompress f o))
+    ((Err e) (Err e))
+    ((Ok k) (Ok (if (is? f :accept-truncation) (dyn Decompressor (Lenient k)) k)))))
+
+(impl Codec Faulty
+  (codec-name (self) (str "faulty " (codec-name (. self inner))))
+  (codec-capabilities (self) (if (is? self :overclaim) (conj (codec-capabilities (. self inner)) :rot13) (codec-capabilities (. self inner))))
+  (codec-magics (self) (codec-magics (. self inner)))
+  (codec-max-compressed-size (self n) (if (is? self :small-bound) (quot (codec-max-compressed-size (. self inner) n) 2) (codec-max-compressed-size (. self inner) n)))
+  (codec-compress (self data opts) (faulty-compress self data opts))
+  (codec-decompress (self data opts) (faulty-decompress self data opts))
+  (codec-compressor (self opts) (faulty-compressor self opts))
+  (codec-decompressor (self opts) (faulty-decompressor self opts)))
+
+;; The ids of the scenarios that did not hold when run: a step that broke is a failure. A scenario that traps ends the run (a driver that traps has failed too; `fibc test`
+;; shows it as a trap row). `seed` is the run's seed (the contract's inputs are fixed; it is for the test runner).
+(defun contract-failures (scs: (Vec Scenario) seed: i64) -> (Vec str)
+  (vec (map (fn (sc: Scenario) (. sc id))
+            (filter (fn (sc: Scenario)
+                      (some? (first (filter (fn (r: StepRun) (match (. r judged) ((Held) false) ((Broke _ _) true))) ((. sc run) seed)))))
+                    scs))))
+
+(defun scenario-ids (scs: (Vec Scenario)) -> (Vec str) (vec (map (fn (s: Scenario) (. s id)) scs)))
+(defun mentions? (id: str word: str) -> bool (some? (str-find id word 0)))
+;; Is there a failing scenario whose id has `word`? (`failing-word?`), a scenario of that name at all (`has-word?`).
+(defun failing-word? (scs: (Vec Scenario) word: str) -> bool (some? (first (filter (fn (f: str) (mentions? f word)) (contract-failures scs 1)))))
+(defun has-word? (scs: (Vec Scenario) word: str) -> bool (some? (first (filter (fn (s: str) (mentions? s word)) (scenario-ids scs)))))
