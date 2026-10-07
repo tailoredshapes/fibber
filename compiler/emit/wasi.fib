@@ -18,7 +18,7 @@
       (nil (str-join (conj parts (str-slice text offset (str-len text)))))
       ((some at) (recur (+ at (str-len old)) (conj (conj parts (str-slice text offset at)) new))))))
 
-(defun rewrites :private () -> (Vec (Pair str str))
+(defun rewrites-sizes :private () -> (Vec (Pair str str))
   [
    (Pair "(call @fib.array-elem arr (and (lshr i level) (i64 31)) (i64 8))"
          "(call @fib.array-elem arr (and (lshr i level) (i64 31)) (i64 4))")
@@ -32,6 +32,10 @@
          "(bigger (call @malloc (mul cap2 (i64 4))))")
    (Pair "(call @memcpy bigger base (mul len (i64 8)))"
          "(call @memcpy bigger base (mul len (i64 4)))")
+   ])
+
+(defun rewrites-rest :private () -> (Vec (Pair str str))
+  [
    (Pair "(define internal (fib.pool-quiesce void) ()\n  (block entry (call @fib.rq-lock) (br test))\n  (block test\n    (br (and (icmp eq (load ptr @fib.rq-head) (ptr null)) (icmp eq (load i32 @fib.pool-busy) (i32 0))) done sleep))\n  (block sleep\n    (call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))\n    (br test))\n  (block done (call @fib.rq-unlock) (call @fib.lc-report) (ret)))"
          "(define internal (fib.pool-quiesce void) ()\n  (block entry (br test))\n  (block test\n    (let ((t (call @fib.dequeue)))\n      (br (icmp eq t (ptr null)) done run)))\n  (block run (call @fib.run-one t) (br test))\n  (block done (call @fib.lc-report) (ret)))")
    (Pair "(call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))"
@@ -69,6 +73,10 @@
    (Pair "(n (select (icmp slt n0 (i64 1)) (i64 1) n0))"
          "(n (i64 0))")
    ])
+
+;; The pointer-size rewrites first, then the rest: the order the texts are rewritten in.
+(defun rewrites :private () -> (Vec (Pair str str))
+  (reduce (fn (acc: (Vec (Pair str str)) r: (Pair str str)) (conj acc r)) (rewrites-sizes) (rewrites-rest)))
 
 ;; The texts `adapt` rewrites, for the unit that checks each is in the runtime (compiler/tests/emit/unit-wasi.fib).
 ;; The rewrites that the stack guard of rt/thread.lir needs (the guard region itself is cut out by `without-guard`): a thread attribute has no guard size.
