@@ -25,7 +25,9 @@ mutant() { # mutant NAME FILE SED-EXPR
   rm -rf "$d"
 }
 mutant binding-off-by-one   compiler/native/wgsl.fib       's/(str "@group(0) @binding(" (+ i 2) ")/(str "@group(0) @binding(" (+ i 3) ")/'
-mutant i64-accepted         compiler/native/wgsl/wx.fib    's/((TInt 32) (some "i32"))/((TInt 32) (some "i32")) ((TInt 64) (some "i32"))/'
+# An "i64 accepted" mutant of the type table alone is equivalent: an i64 kernel is refused by three independent gates (the type table, the
+# literal printer, the arithmetic printer), so one edit leaves it refused and the tests rightly pass; the i64 refusal is tested by case 8571.
+mutant callers-run-after-trap compiler/native/wgsl/func.fib  's/(if (contains? (. (. wf wx) traps) n) (str " if (fibw_trapped) { " (ret-zero wf) " }") "")/""/'
 mutant overflow-unchecked   compiler/native/wgsl.fib       's/return OvI32(r, ((a ^ r) \& (b ^ r)) < i32(0));/return OvI32(r, false);/'
 mutant workgroup-size-fixed compiler/native/wgsl.fib       's/@compute @workgroup_size(wg_x, wg_y, wg_z)/@compute @workgroup_size(64, 1, 1)/'
 mutant trap-without-flag    compiler/native/wgsl.fib       's/fn fibw_trap() { fibw_trapped = true; atomicStore(&fibw_flag.flag, 1u); }/fn fibw_trap() { fibw_trapped = true; }/'
