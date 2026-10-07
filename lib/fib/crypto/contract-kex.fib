@@ -1,0 +1,134 @@
+;; fib.crypto.contract-kex: what a provider that lists `:x25519`, `:ecdh-p256` or `:ecdh-p384` must do (docs/design/crypto.md 9). RFC 7748 (6.1, 5.2 and the
+;; iterated vectors), Project Wycheproof's ECDH and X25519 cases (fib.crypto.vectors-pk), and the NEGATIVE cases: a peer that is not a point of the
+;; curve, a small-order point whose shared secret is all zero (RFC 7748 6.1, RFC 8446 7.4.2: it must be refused, not returned), a wrong length.
+;; Every one is an Err: never a partial success, never a secret computed from a bad point.
+(ns fib.crypto.contract-kex
+  (:use fib.core fib.seq fib.coll fib.test.core fib.crypto.types fib.crypto.ops fib.crypto.pk fib.crypto.der fib.crypto.encoding
+        fib.crypto.contract fib.crypto.contract-aead fib.crypto.vectors-pk))
+
+;; The capability that goes with a key kind (the kind names the curve, the capability the operation).
+(defun kex-cap (alg: keyword) -> keyword (cond (= alg :x25519) :x25519 (= alg :p-256) :ecdh-p256 (= alg :p-384) :ecdh-p384 :else :none))
+(defun kex-kinds () -> (Vec keyword) [:x25519 :p-256 :p-384])
+(defun raw-length (alg: keyword) -> i64 (raw-public-length alg))
+
+(defun import-key (p: p alg: keyword pkcs8: str) :where ((CryptoProvider p)) -> (Result (dyn PrivateKey :send) CryptoError) (import-private-key p alg (bytes-hex pkcs8)))
+
+;; Imports `private`, runs `f` on the key and closes it. A failed import is "ERR kind" so a comparison with a value fails.
+(defun with-key (p: p alg: keyword pkcs8: str f: (fn ((dyn PrivateKey :send)) str)) :where ((CryptoProvider p)) -> str
+  (match (import-key p alg pkcs8)
+    ((Err e) (str "ERR import " (. e kind)))
+    ((Ok k) (let [r (f k)] (do (private-key-close k) r)))))
+
+(defun agree-hex (k: (dyn PrivateKey :send) peer: str) -> str (result-hex (private-key-agree k (bytes-hex peer))))
+(defun public-hex (k: (dyn PrivateKey :send)) -> str (result-hex (private-key-public k)))
+
+(defun kex-ok? (p: p v: KexVector) :where ((CryptoProvider p)) -> bool
+  (= (str (. v public) "/" (. v shared))
+     (with-key p (. v alg) (. v private) (fn (k: (dyn PrivateKey :send)) (str (public-hex k) "/" (agree-hex k (. v peer)))))))
+
+;; An agreement with a bad peer must be an Err (any kind): `Ok` of anything is the failure.
+(defun refused? (r: (Result (Array i8) CryptoError)) -> bool (match r ((Ok _) false) ((Err _) true)))
+
+(defun invalid-refused? (p: p v: KexInvalid) :where ((CryptoProvider p)) -> bool
+  (= "refused" (with-key p (. v alg) (. v private) (fn (k: (dyn PrivateKey :send)) (if (refused? (private-key-agree k (bytes-hex (. v peer)))) "refused" "ACCEPTED")))))
+
+;; The peers made from a valid one by one change: every one is refused.
+;; `n` zero bytes, as hex.
+(defun zero-hex (n: i64) -> str (reduce (fn (acc: str i: i64) (str acc "00")) "" (range n)))
+
+(defun bad-peers (v: KexVector) -> (Vec (Pair str str))
+  (let [peer (. v peer) n (quot (str-len peer) 2) ec (> n 32)]
+    (into
+      [(Pair "empty" "") (Pair "one byte short" (cut-hex peer 1)) (Pair "one byte long" (str peer "00")) (Pair "half" (cut-hex peer (quot n 2)))]
+      (if ec
+        [(Pair "Y flipped (off the curve)" (flip-hex peer (- n 1))) (Pair "X flipped (off the curve)" (flip-hex peer 1))
+         (Pair "compressed form" (str "02" (subs peer 2 (+ 2 (* 2 (quot (- n 1) 2))))))
+         (Pair "the point at infinity" "00") (Pair "all zero" (str "04" (zero-hex (- n 1))))]
+        [(Pair "all zero" "0000000000000000000000000000000000000000000000000000000000000000")]))))
+
+(defun bad-peer-failures (p: p v: KexVector) :where ((CryptoProvider p)) -> (Vec str)
+  (vec (map (fn (x: (Pair str str)) (str (. v name) ": " (. x fst)))
+            (filter (fn (x: (Pair str str))
+                      (not (= "refused" (with-key p (. v alg) (. v private) (fn (k: (dyn PrivateKey :send)) (if (refused? (private-key-agree k (bytes-hex (. x snd)))) "refused" "ACCEPTED"))))))
+                    (bad-peers v)))))
+
+;; X25519's small-order points (Bernstein's list, and the non-canonical encodings of 0, 1 and -1 that RFC 7748 5 says are accepted as input): the
+;; shared secret with each is all zero, and RFC 7748 6.1 and RFC 8446 7.4.2 say to refuse it.
+(defun small-order-points () -> (Vec str)
+  ["0000000000000000000000000000000000000000000000000000000000000000" "0100000000000000000000000000000000000000000000000000000000000000"
+   "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800" "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"
+   "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f" "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+   "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"])
+
+;; One round of RFC 7748 5.2: X25519(k, u) with k imported from its raw bytes, as bytes or an error text.
+(defun x25519-round (p: p k: (Array i8) u: (Array i8)) :where ((CryptoProvider p)) -> (Result (Array i8) str)
+  (match (wrap-private :x25519 k)
+    ((Err e) (Err (str "wrap " (. e message))))
+    ((Ok pk) (match (import-private-key p :x25519 pk)
+               ((Err e) (Err (str "import " (. e kind))))
+               ((Ok key) (let [r (private-key-agree key u)]
+                           (do (private-key-close key) (match r ((Err e) (Err (str "agree " (. e kind)))) ((Ok out) (Ok out))))))))))
+
+;; RFC 7748 5.2: the loop of `n` rounds from k = u = 9, each key imported from its raw bytes.
+(defun iterate-x25519 (p: p n: i64) :where ((CryptoProvider p)) -> str
+  (let [nine (bytes-hex "0900000000000000000000000000000000000000000000000000000000000000")]
+    (loop [i 0 k nine u nine]
+      (if (= i n) (hex k)
+        (match (x25519-round p k u) ((Err t) (str "ERR " t)) ((Ok out) (recur (+ i 1) out k)))))))
+
+;; The checks of a generated pair, "" for each that holds.
+(defun pair-checks (alg: keyword a: (dyn PrivateKey :send) b: (dyn PrivateKey :send)) -> (Vec str)
+  (let [pa (or-empty (private-key-public a)) pb (or-empty (private-key-public b))
+        sab (result-hex (private-key-agree a pb)) sba (result-hex (private-key-agree b pa))]
+    [(if (= (private-key-kind a) alg) "" "kind") (if (= (array-len pa) (raw-length alg)) "" "public length")
+     (if (= (hex pa) (hex pb)) "two keys have one public key" "") (if (= sab sba) "" (str "the secrets differ " sab " " sba))
+     (if (> (str-len sab) 40) "" (str "secret " sab))
+     (if (and (not (= alg :x25519)) (> (array-len pa) 0) (not (= (array-get pa 0) 4i8))) "not an uncompressed point" "")]))
+
+;; After close a key refuses with `closed`, and closing again is harmless.
+(defun closed-check (a: (dyn PrivateKey :send) peer: (Array i8)) -> str
+  (do (private-key-close a) (private-key-close a)
+      (match (private-key-agree a peer) ((Err e) (if (= (. e kind) "closed") "" "a closed key: wrong kind")) ((Ok _) "a closed key agrees"))))
+
+;; Two generated keys of `alg` agree on the same secret, the raw public key has the right length, and a closed key refuses.
+(defun generated-failures (p: p alg: keyword) :where ((CryptoProvider p)) -> (Vec str)
+  (match (generate-key p alg)
+    ((Err e) [(str "generate " (. e kind) ": " (. e message))])
+    ((Ok a) (match (generate-key p alg)
+              ((Err e) (do (private-key-close a) [(str "generate again " (. e kind))]))
+              ((Ok b) (let [r (pair-checks alg a b) pb (or-empty (private-key-public b))
+                            c (closed-check a pb)]
+                        (do (private-key-close b) (vec (filter (fn (s: str) (not (= s ""))) (conj r c))))))))))
+
+(defcontract CryptoKexContract [make]
+  (scenario "key agreement reproduces the published public keys and shared secrets (RFC 7748 5.2 and 6.1, Wycheproof X25519 and ECDH P-256 and P-384)"
+    (covers "private-key-agree" "private-key-public")
+    (given [p (make) vs (vec (filter (fn (v: KexVector) (supports? p (kex-cap (. v alg)))) (kex-vectors)))])
+    (then (expect = [] (failing vs (fn (v: KexVector) (str (. v alg) " " (. v name))) (fn (v: KexVector) (kex-ok? p v))))))
+  (scenario "RFC 7748 5.2's iterated X25519: 1 and 1000 rounds"
+    (given [p (make) vs (if (supports? p :x25519) (kex-iterated-vectors) [])])
+    (then (expect = [] (failing vs (fn (v: KexIterated) (. v name)) (fn (v: KexIterated) (= (. v expected) (iterate-x25519 p (. v n))))))))
+  (scenario "an invalid peer is an error and no secret: off-curve points, wrong encodings, small-order points (Wycheproof)"
+    (given [p (make) vs (vec (filter (fn (v: KexInvalid) (supports? p (kex-cap (. v alg)))) (kex-invalid-vectors)))])
+    (then (expect = [] (failing vs (fn (v: KexInvalid) (str (. v alg) " " (. v name))) (fn (v: KexInvalid) (invalid-refused? p v))))))
+  (scenario "each valid peer changed in one place (shortened, lengthened, a flipped coordinate, compressed, infinity, zero) is an error"
+    (given [p (make) vs (vec (filter (fn (v: KexVector) (supports? p (kex-cap (. v alg)))) (kex-vectors)))])
+    (then (expect = [] (vec (mapcat (fn (v: KexVector) (bad-peer-failures p v)) vs)))))
+  (scenario "the small-order points of X25519 give an error, never the all-zero secret"
+    (given [p (make) k (str "302e020100300506032b656e04220420" "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")])
+    (then (expect = [] (if (supports? p :x25519)
+                         (vec (filter (fn (pt: str) (not (= "refused" (with-key p :x25519 k (fn (key: (dyn PrivateKey :send)) (if (refused? (private-key-agree key (bytes-hex pt))) "refused" "ACCEPTED"))))))
+                                      (small-order-points)))
+                         []))))
+  (scenario "generated keys: both sides compute one secret, the public encoding has the right length, two keys differ, a closed key refuses"
+    (given [p (make)])
+    (then (expect = [] (vec (mapcat (fn (alg: keyword) (if (supports? p (kex-cap alg)) (vec (map (fn (s: str) (str alg " " s)) (generated-failures p alg))) [])) (kex-kinds))))))
+  (scenario "key kinds are honest: a listed curve generates a key, an unlisted one is `unsupported`"
+    (given [p (make)])
+    (then (expect = [] (vec (filter (fn (alg: keyword)
+                                      (match (generate-key p alg)
+                                        ((Ok k) (do (private-key-close k) (not (supports? p (kex-cap alg)))))
+                                        ((Err e) (if (supports? p (kex-cap alg)) true (not (= (. e kind) "unsupported"))))))
+                                    (kex-kinds))))
+          (expect = "unsupported" (match (generate-key p :p-521) ((Err e) (. e kind)) ((Ok _) "ok")))
+          (expect = "unsupported" (match (import-private-key p :rot13 (array 3 0i8)) ((Err e) (. e kind)) ((Ok _) "ok"))))))
