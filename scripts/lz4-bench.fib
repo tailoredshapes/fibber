@@ -28,8 +28,20 @@
       ((Ok z) (match (decompress-chunks c o (split-sizes z [65536])) ((Ok b) (array-len z)) ((Err e) (trap "stream decompress"))))
       ((Err e) (trap "stream compress")))))
 
+;; The streaming decoder alone: the chunks fed, every step pulled, the output only counted.
+(defun pull (k: k st: DecStep total: i64) -> i64 :where ((Decompressor k))
+  (let [t (+ total (array-len (. st output)))]
+    (if (. st needs-input) t (match (decompressor-feed k (array 0 0i8)) ((Ok more) (pull k more t)) ((Err e) (trap "pull"))))))
+(defun stream-dec-count (z: (Array i8) o: Options chunk: i64) -> i64
+  (match (codec-decompressor (lz4/lz4) o)
+    ((Err e) (trap "dec"))
+    ((Ok k) (loop [i 0 total 0]
+              (if (>= i (array-len z)) total
+                (let [e (min (array-len z) (+ i chunk))]
+                  (match (decompressor-feed k (array-copy z i e)) ((Ok st) (recur e (pull k st total))) ((Err x) (trap "feed")))))))))
+
 (defun run (mode: str src: (Array i8) level: i64 z: (Array i8) buf: (Array i8) threads: i64 bsize: i64) -> i64
-  (let [o (with-verify (with-block-size (with-threads (with-level (default-options) level) threads) bsize) (not (= mode "fdn"))) n (array-len src)]
+  (let [chunks (if (= mode "sc") (split-sizes src [1048576]) []) o (with-verify (with-block-size (with-threads (with-level (default-options) level) threads) bsize) (not (= mode "fdn"))) n (array-len src)]
     (cond (= mode "c") (array-len (block-compress src level))
           (= mode "h") (array-len (block-compress-hc src level))
           (or (= mode "d") (= mode "dh")) (match (block-decompress-into z buf 0 n) ((Ok k) k) ((Err e) (trap (. e message))))
@@ -38,6 +50,10 @@
           (= mode "z") (array-len (array n 0i8))
           (= mode "f") (match (z/compress (lz4/lz4) src o) ((Ok b) (array-len b)) ((Err e) (trap (. e message))))
           (or (= mode "fd") (= mode "fdp") (= mode "fdn")) (match (z/decompress (lz4/lz4) z o) ((Ok b) (array-len b)) ((Err e) (trap (. e message))))
+          (= mode "sc") (match (compress-chunks (lz4/lz4) o chunks) ((Ok b) (array-len b)) ((Err e) (trap "sc")))
+          (= mode "sdn") (stream-dec-count z o 1048576)
+          (= mode "sdm") (stream-dec-count z o 65536)
+          (= mode "sd") (match (decompress-chunks (lz4/lz4) o (split-sizes z [1048576])) ((Ok b) (array-len b)) ((Err e) (trap "sd")))
           :else (stream-both src o))))
 
 (defun main () -> i64
@@ -45,6 +61,7 @@
         reps (if (> (count a) 3) (unwrap-or (parse-long (nth a 3)) 5) 5) threads (if (> (count a) 4) (unwrap-or (parse-long (nth a 4)) 1) 1) bsize (if (> (count a) 5) (unwrap-or (parse-long (nth a 5)) 65536) 65536) n (array-len src)
         buf (array (if (or (= mode "d") (= mode "dh")) n 0) 0i8)
         z (cond (or (= mode "dh") (= mode "dha")) (block-compress-hc src level) (or (= mode "d") (= mode "da")) (block-compress src 1)
+                (or (= mode "sd") (= mode "sdn") (= mode "sdm")) (match (frame-compress src (with-block-size (with-level (default-options) level) bsize)) ((Ok b) b) ((Err e) (trap "frame")))
                 (or (= mode "fd") (= mode "fdp") (= mode "fdn")) (match (frame-compress src (with-record-size (with-block-size (with-level (default-options) level) bsize) (not (= mode "fdp")))) ((Ok b) b) ((Err e) (trap "frame")))
                 :else (array 0 0i8))
         times (loop [r 0 ts: (Vec i64) []]
