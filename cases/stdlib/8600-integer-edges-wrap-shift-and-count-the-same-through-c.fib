@@ -1,0 +1,68 @@
+;; spec:   types §1.9, §2.12; docs/design/lir2c.md section 3 (the integer helpers of the C route)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; The integer edges a second code generator gets wrong first: wrapping at every width (unchecked-add and kin, lIR `add` with no flags),
+;; shifts by a count the width masks (`shl shr sar` mask the count, types §1.9), the logical shift of a negative value, quot and rem with
+;; negative operands (truncating, as C and LLVM), popcount, ctz and clz of 0 (the width, never poison), and the signed compare of the
+;; extremes. Each line is the same value natively and through C (`FIB_VIA=c fibc cases`, compiler/tests/c-backend/suite.sh);
+;; `planted` compares ctz of 0 with 63 and must see the check fail.
+(ns main (:use fib.core tl.check))
+
+(defun wrapping (c: Checks) -> unit
+  (do (check c (= (unchecked-add 9223372036854775807 1) -9223372036854775808))
+      (check c (= (unchecked-multiply 9223372036854775807 2) -2))
+      (check c (= (unchecked-subtract -9223372036854775808 1) 9223372036854775807))
+      (check c (= (unchecked-negate -9223372036854775808) -9223372036854775808))
+      (check c (= (unchecked-add 127i8 1i8) -128i8))
+      (check c (= (unchecked-multiply 127i8 127i8) 1i8))
+      (check c (= (unchecked-multiply -128i8 2i8) 0i8))
+      (check c (= (unchecked-add 32767i16 1i16) -32768i16))
+      (check c (= (unchecked-add 2147483647i32 1i32) -2147483648i32))))
+
+(defun shifts (c: Checks) -> unit
+  (let ((one (unchecked-add 0 1)) (m1 (unchecked-add 0 -1)) (minv (unchecked-add 0 -9223372036854775808)))
+    (do (check c (= (shl one 63) minv))
+        (check c (= (shl one 64) one))              ; the count is taken modulo the width
+        (check c (= (shl one 65) 2))
+        (check c (= (shr m1 63) 1))                 ; logical: the sign bit alone
+        (check c (= (shr minv 1) 4611686018427387904))
+        (check c (= (sar m1 63) -1))                ; arithmetic
+        (check c (= (sar minv 63) -1))
+        (check c (= (shl 1i32 31) -2147483648i32))
+        (check c (= (shr -2147483648i32 31) 1i32))
+        (check c (= (sar -128i8 7) -1i8))
+        (check c (= (shr -128i8 7) 1i8))
+        (check c (= (shl 1i8 8) 1i8)))))
+
+(defun division (c: Checks) -> unit
+  (let ((seven (unchecked-add 0 7)) (m7 (unchecked-add 0 -7)) (three (unchecked-add 0 3)))
+    (do (check c (= (quot m7 three) -2))
+        (check c (= (rem m7 three) -1))
+        (check c (= (quot seven -3) -2))
+        (check c (= (rem seven -3) 1))
+        (check c (= (quot -9223372036854775808 2) -4611686018427387904))
+        (check c (= (rem -9223372036854775808 3) -2)))))
+
+(defun counts (c: Checks) -> unit
+  (let ((z (unchecked-add 0 0)) (minv (unchecked-add 0 -9223372036854775808)))
+    (do (check c (= (ctz z) 64))
+        (check c (= (clz z) 64))
+        (check c (= (popcount z) 0))
+        (check c (= (popcount minv) 1))
+        (check c (= (ctz minv) 63))
+        (check c (= (clz 1) 63))
+        (check c (= (popcount -1) 64))
+        (check c (= (ctz 0i32) 32i32))
+        (check c (= (clz 0i8) 8i8))
+        (check c (= (popcount -1i16) 16i16))
+        (check c (< -9223372036854775808 9223372036854775807))
+        (check c (< -1 0))
+        (check c (= (bit-not 0) -1))
+        (check c (= (bit-xor minv -1) 9223372036854775807)))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (wrapping c) (shifts c) (division c) (counts c)
+        (checks-result c))))

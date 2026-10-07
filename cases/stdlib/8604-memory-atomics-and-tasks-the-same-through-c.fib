@@ -1,0 +1,46 @@
+;; spec:   types §2.11 (tasks, atoms), spec/lir.md 6.6 (atomics), docs/design/lir2c.md section 3 (the memory and atomic rows)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; What a C printer must get right about memory and threads: a block of bytes written as one type and read as another (the allocator
+;; reuses blocks, so C's strict aliasing cannot be assumed), arrays of every width read back at every index, eight tasks each adding to
+;; one atom ten thousand times under the atom's compare-and-swap (every increment counted, none lost), and a task's result joined.
+;; `planted` reads the sum with one task's increments missing and must see the check fail.
+(ns main (:use fib.core fib.async tl.check))
+
+(defun widths (c: Checks) -> unit
+  (let ((b (cell (array 16 0i8))) (h (cell (array 8 0i16))) (w (cell (array 4 0i32))) (d (cell (array 2 0.0))))
+    (do (array-set! &b 0 -1i8) (array-set! &b 15 127i8)
+        (array-set! &h 7 -32768i16)
+        (array-set! &w 1 2147483647i32) (array-set! &w 3 -1i32)
+        (array-set! &d 1 -0.0)
+        (check c (= (array-get @b 0) -1i8))
+        (check c (= (array-get @b 15) 127i8))
+        (check c (= (array-get @b 7) 0i8))
+        (check c (= (array-get @h 7) -32768i16))
+        (check c (= (array-get @w 1) 2147483647i32))
+        (check c (= (array-get @w 3) -1i32))
+        (check c (= (f64->bits (array-get @d 1)) -9223372036854775808))
+        (check c (= (array-len @b) 16)))))
+
+(defun punned (c: Checks) -> unit
+  (let ((xs (cell (array 4 1.5))) (ys (cell (array 4 0))))
+    (do (array-set! &ys 0 (f64->bits (array-get @xs 0)))
+        (array-set! &xs 1 (bits->f64 4611686018427387904))
+        (check c (= (array-get @ys 0) 4609434218613702656))
+        (check c (= (array-get @xs 1) 2.0))
+        (check c (= (bits->f64 (f64->bits (array-get @xs 2))) 1.5)))))
+
+(defun counted (c: Checks) -> unit
+  (let ((a (atom 0))
+        (ts (vec (map (fn (k: i64) (spawn (fn () (loop ((i 0)) (if (< i 10000) (do (swap! a (fn (v: i64) (+ v 1))) (recur (+ i 1))) k)))))
+                      (range 8)))))
+    (do (check c (= (reduce + 0 (map (fn (t: (Task i64)) (join t)) ts)) 28))
+        (check c (= @a 80000))
+        (check c (= (join (spawn (fn () (* 6 7)))) 42)))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (widths c) (punned c) (counted c)
+        (checks-result c))))
