@@ -1,0 +1,16 @@
+;; spec: docs/design/compress.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; roots: ../../lib support
+;; A registry the caller builds finds LZ4 by its magic number; a frame compressed with a dictionary round trips with it and is smaller than without.
+(ns main (:use tl.check fib.compress.lz4.mem) (:require [fib.compress :as z] [fib.compress.lz4 :as lz4]))
+(defun main () -> i64
+  (let [c (checks) k (lz4/lz4) o (z/default-options) reg (z/registry [(dyn z/Codec :send k)])
+        dict (str-bytes "the quick brown fox jumps over the lazy dog, the quick brown fox") d (str-bytes "the quick brown fox jumps over the lazy dog, the quick brown fox!")
+        od (z/with-dictionary o dict)]
+    (do (check c (match (z/compress k d o) ((Ok f) (some? (z/detect reg f))) ((Err _) false)))
+        (check c (not (some? (z/detect reg (str-bytes "ZZZZZZZZ")))))
+        (check c (match (z/compress k d od) ((Ok f) (match (z/decompress k f od) ((Ok b) (bytes-eq b d)) ((Err _) false))) ((Err _) false)))
+        (check c (match (z/compress k d od) ((Ok f) (match (z/compress k d o) ((Ok g) (< (array-len f) (array-len g))) ((Err _) false))) ((Err _) false)))
+        (checks-result c))))

@@ -1,0 +1,15 @@
+;; spec: docs/design/compress.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; roots: ../../lib support
+;; Frames under eight option sets (levels 1 to 8, independent or linked, block checksums) round trip, and every frame starts with the LZ4 magic 04 22 4D 18.
+(ns main (:use tl.check fib.compress.lz4.mem) (:require [fib.compress :as z] [fib.compress.lz4 :as lz4]))
+(defun main () -> i64
+  (let [c (checks) k (lz4/lz4) o (z/default-options)
+        d (str-bytes "abc abc abc abc abc abc abc abc abc abc abc abc abc abc abc!")]
+    (do (dotimes (i 8)
+          (let [o2 (z/with-block-checksum (z/with-independent (z/with-level o (+ 1 i)) (= (rem i 2) 0)) (> i 3))]
+            (check c (match (z/compress k d o2) ((Ok f) (match (z/decompress k f o2) ((Ok b) (bytes-eq b d)) ((Err _) false))) ((Err _) false)))))
+        (check c (match (z/compress k d o) ((Ok f) (and (= (array-get f 0) 4i8) (= (array-get f 1) 34i8) (= (array-get f 2) 77i8) (= (array-get f 3) 24i8))) ((Err _) false)))
+        (checks-result c))))

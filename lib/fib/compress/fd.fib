@@ -1,0 +1,22 @@
+;; fib.compress.fd: streaming compression over file descriptors (fib.os.io): `compress-fd` and `decompress-fd` read the input fd in chunks, feed the codec, write what comes out, and
+;; end the stream; memory is bounded by the codec's block size and `chunk` (64 KiB), not by the size of the stream. An fd is a file, a pipe, a socket (fib.os.net gives its fd), stdin.
+;; The results are bytes written, or a CompressError (`:io` when the fd failed). The fds are the caller's: they are not closed here.
+;;   (compress-fd codec opts in-fd out-fd)     (decompress-fd codec opts in-fd out-fd)     (fd-reader fd) (fd-writer fd)
+(ns fib.compress.fd (:use fib.core fib.seq fib.coll fib.compress.types fib.compress.ops fib.os.errors) (:require [fib.os.io :as io]))
+
+(def chunk: i64 65536)
+
+(defun io-failed (e: OSError) -> CompressError (io-error (str (. e operation) ": " (. e message))))
+
+;; The next chunk of the fd (empty at the end), retrying a read the system interrupted.
+(defun fd-reader (fd: i64) -> (fn () (Result (Array i8) CompressError))
+  (fn () (loop [] (match (io/read-fd fd chunk) ((Ok b) (Ok b)) ((Err e) (if (= (. e kind) Interrupted) (recur) (Err (io-failed e))))))))
+
+(defun fd-writer (fd: i64) -> (fn ((Array i8)) (Result unit CompressError))
+  (fn (b: (Array i8)) (match (io/write-all fd b) ((Ok _) (Ok ())) ((Err e) (Err (io-failed e))))))
+
+(defun compress-fd (c: c o: Options in-fd: i64 out-fd: i64) -> (Result i64 CompressError) :where ((Codec c))
+  (compress-stream c o (fd-reader in-fd) (fd-writer out-fd)))
+
+(defun decompress-fd (c: c o: Options in-fd: i64 out-fd: i64) -> (Result i64 CompressError) :where ((Codec c))
+  (decompress-stream c o (fd-reader in-fd) (fd-writer out-fd)))

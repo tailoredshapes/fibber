@@ -1,0 +1,52 @@
+;; examples/lz4.fib: compress and decompress files in the standard .lz4 frame format, interoperable with the `lz4` command line tool (scripts/lz4-interop.sh checks both ways).
+;;   fibc build examples/lz4.fib -o lz4f
+;;   lz4f [-d] [-1 .. -12] [-B4 .. -B7] [-BD | -BI] [-BX] [--no-frame-crc] [-D DICTFILE] [-m MAXBYTES] IN OUT
+;; Streams the input in 64 KiB chunks through `fib.compress` (memory is the block size, not the file). `-d` decompresses (default limit 256 MiB; `-m` changes it).
+;; -BD (default) links blocks, -BI makes them independent; -B4..-B7 are the block sizes 64 KiB, 256 KiB, 1 MiB, 4 MiB; -BX adds block checksums; --no-frame-crc drops the content checksum.
+(ns main (:use fib.core fib.seq fib.coll fib.compress.types fib.compress.ops fib.compress.fd) (:require [fib.compress.lz4 :as lz4] [fib.os.files :as files] [fib.os.io :as io]))
+
+(defstruct Cli (decompress: bool opts: Options in-path: str out-path: str))
+
+(defun block-size-of-flag (f: str) -> i64
+  (cond (= f "-B4") 65536 (= f "-B5") 262144 (= f "-B6") 1048576 (= f "-B7") 4194304 :else 0))
+
+(defun read-all (path: str) -> (Array i8)
+  (match (files/read-file-bytes path 1073741824) ((Ok b) b) ((Err e) (trap (str "cannot read " path)))))
+
+(defun apply-flag (o: Options f: str rest: (Vec str)) -> (Option (Pair Options i64))
+  (cond (and (>= (str-len f) 2) (some? (parse-long (subs f 1)))) (some (Pair (with-level o (unwrap-or (parse-long (subs f 1)) 0)) 1))
+        (some? (first (filter (fn (x: str) (= x f)) ["-B4" "-B5" "-B6" "-B7"]))) (some (Pair (with-block-size o (block-size-of-flag f)) 1))
+        (= f "-BD") (some (Pair (with-independent o false) 1))
+        (= f "-BI") (some (Pair (with-independent o true) 1))
+        (= f "-BX") (some (Pair (with-block-checksum o true) 1))
+        (= f "--no-frame-crc") (some (Pair (with-checksum o false) 1))
+        (= f "-D") (some (Pair (with-dictionary o (read-all (nth rest 0))) 2))
+        (= f "-m") (some (Pair (with-max-output o (unwrap-or (parse-long (nth rest 0)) 0)) 2))
+        :else nil))
+
+(defun parse-args (a: (Vec str)) -> (Result Cli str)
+  (loop [i 0 dec false o (with-independent (default-options) false) paths: (Vec str) []]
+    (if (>= i (count a))
+      (if (= (count paths) 2) (Ok (Cli dec o (nth paths 0) (nth paths 1))) (Err "usage: lz4f [-d] [-1..-12] [-B4..-B7] [-BD|-BI] [-BX] [--no-frame-crc] [-D dict] [-m max] IN OUT"))
+      (let [f (nth a i)]
+        (cond (= f "-d") (recur (+ i 1) true o paths)
+              (and (starts-with? f "-") (> (str-len f) 1))
+              (match (apply-flag o f (vec (drop (+ i 1) a)))
+                (nil (Err (str "unknown option " f)))
+                ((some r) (recur (+ i (. r snd)) dec (. r fst) paths)))
+              :else (recur (+ i 1) dec o (conj paths f)))))))
+
+(defun open-in (path: str) -> i64 (match (files/open-file path (files/default-file-options)) ((Ok fd) fd) ((Err e) (trap (str "cannot open " path)))))
+(defun open-out (path: str) -> i64
+  (match (files/open-file path (with (files/default-file-options) (access files/WriteOnly) (create true) (truncate true))) ((Ok fd) fd) ((Err e) (trap (str "cannot create " path)))))
+
+(defun main () -> i64
+  (match (parse-args (args))
+    ((Err m) (do (println m) 2))
+    ((Ok c)
+     (let [in (open-in (. c in-path)) out (open-out (. c out-path)) k (lz4/lz4)
+           r (if (. c decompress) (decompress-fd k (. c opts) in out) (compress-fd k (. c opts) in out))
+           _ (io/close-fd in) _ (io/close-fd out)]
+       (match r
+         ((Ok n) 0)
+         ((Err e) (do (println "lz4f:" (. e kind) (. e message)) 1)))))))

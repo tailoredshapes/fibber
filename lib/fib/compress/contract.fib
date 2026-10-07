@@ -27,6 +27,10 @@
 (defun smaller? (a: (Result (Array i8) CompressError) b: (Result (Array i8) CompressError)) -> bool
   (match a ((Ok x) (match b ((Ok y) (< (array-len x) (array-len y))) ((Err _) false))) ((Err _) false)))
 
+(defun cat-options (c: c od: Options) -> (Vec Options) :where ((Codec c))
+  (let [linked (if (supports? c :linked-blocks) [(with-independent od false)] [])]
+    (into (into linked (if (supports? c :levels) [(with-level od 9) (with-level (with-independent od false) 5)] [])) [(with-checksum od false)])))
+
 (defun dictionary-failures (c: c) -> (Vec str) :where ((Codec c))
   (let [d (default-options) s (find-sample "text 4096") dict (array-copy (. s data) 0 2000)
         od (with-dictionary d dict)
@@ -34,6 +38,9 @@
         back (match with ((Ok z) (decompress c z od)) ((Err e) (Err e)))
         nodict (match with ((Ok z) (decompress c z d)) ((Err e) (Err e)))]
     (cat [(if (is-bytes? back (. s data)) [] ["round trip with a dictionary"])
+          (if (every? (fn (o: Options) (match (compress c (. s data) o) ((Ok z) (is-bytes? (decompress c z o) (. s data))) ((Err _) false)))
+                      (cat-options c od))
+            [] ["round trip with a dictionary under other options (linked blocks, a level, no checksum)"])
           (if (smaller? with plain) [] ["a dictionary makes text smaller"])
           (if (is-bytes? nodict (. s data)) ["decoding without the dictionary gave the original"] [])])))
 

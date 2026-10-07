@@ -76,6 +76,15 @@
 (defun built-block-ok? (hex: str want: str) -> bool
   (match (block-decompress (hex-bytes hex) 1000) ((Ok b) (bytes-eq b (str-bytes want))) ((Err _) false)))
 
+;; 65536 random bytes then the same 65536 again: the second half is one long match at distance exactly 65536, which no encoder may use (the offset field holds 16 bits). The fast
+;; encoder finds the start of the repeat by luck of its table, so many seeds; whatever it finds, the block decodes and no offset is above 65535.
+(defun far-repeat (seed: i64) -> (Array i8) (let [r (random-bytes seed 65536)] (concat-bytes [r r (random-bytes (+ seed 1) 20)])))
+(defun far-failures (level: i64) -> (Vec str)
+  (vec (filter (fn (x: str) (not (= x "")))
+               (map (fn (seed: i64) (let [b (far-repeat seed) z (if (= level 1) (block-compress b 1) (block-compress-hc b level))]
+                                      (if (and (match (block-decompress z 1000000) ((Ok r) (bytes-eq r b)) ((Err _) false)) (<= (max-offset z) 65535)) "" (str "seed " seed))))
+                    (range 100 130)))))
+
 (defspecs specs
   (feature "fib.compress.lz4 published vectors"
     (scenario "122 frames of the lz4 v1.10.0 CLI (every flag combination, dictionary, legacy, concatenated, skippable) decode to their inputs, one-shot and streamed in 1000-byte chunks"
@@ -105,6 +114,8 @@
       (then (expect = [] (offset-failures 12 [65535] (fn (m: i64) (= m 65535))))
             (expect = [] (offset-failures 12 [65536 65537 100000] (fn (m: i64) (< m 65536))))
             (expect = [] (offset-failures 1 [65536 65537 100000] (fn (m: i64) (< m 65536))))))
+    (scenario "a repeat at exactly 65536 bytes (30 seeds): the block decodes, no offset is above 65535, fast and HC"
+      (then (expect = [] (far-failures 1)) (expect = [] (far-failures 4)) (expect = [] (far-failures 12))))
     (scenario "overlapping matches: a run of period 1 to 17 is coded with offset = period, fast and HC, and decodes (the pattern is repeated byte-wise)"
       (then (expect = [] (period-failures 1)) (expect = [] (period-failures 9))))
     (scenario "the longest matches: a million zeros are a few KB (the length extension runs through ~3900 bytes of 255) and decode, and the output limit is exact"
@@ -114,6 +125,11 @@
             (expect = true (match (block-decompress b 999999) ((Err e) (= (. e kind) :too-large)) ((Ok _) false)))))
     (scenario "hand-built blocks: a literal and an overlapping match of offset 1, then the last literals"
       (then (expect = true (built-block-ok? "11610100506162636465" "aaaaaaabcde"))))
+    (scenario "HC compresses better than the fast encoder, and a deeper search never does worse: text of 100 KB at fast, HC 3, 9, 12"
+      (given [t (text 77 100000) f (array-len (block-compress t 1)) h3 (array-len (block-compress-hc t 3)) h9 (array-len (block-compress-hc t 9)) h12 (array-len (block-compress-hc t 12))])
+      (then (expect = true (< (* 100 h3) (* 97 f)))
+            (expect = true (<= h9 h3))
+            (expect = true (<= h12 h9))))
     (scenario "the bound of liblz4: compress-bound n = n + n/255 + 16, and a block never exceeds it, for 0, 1, 12, 13, 255, 65536 and random 100000 bytes"
       (then (expect = [16 17 28 29 272 65809] (vec (map compress-bound [0 1 12 13 255 65536])))
             (expect = true (every? (fn (n: i64) (<= (array-len (block-compress (random-bytes n n) 1)) (compress-bound n))) [0 1 12 13 255 65536 100000]))))))
