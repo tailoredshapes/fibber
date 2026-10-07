@@ -15,13 +15,14 @@
 
 ;; un[j .. j+n] -= qhat * vn; the borrow out of the top limb, as 0 or 1 (a negative result)
 (defun mulsub! :private (&un: (Array i64) vn: (Array i64) n: i64 j: i64 qhat: i64) -> i64
-  (let [k (loop [i 0 k 0]
-            (if (< i n)
-                (let [p (* qhat (array-get vn i))
-                      t (- (- (array-get @un (+ i j)) k) (bit-and p MAG-MASK))]
-                  (do (array-set! &un (+ i j) (bit-and t MAG-MASK))
-                      (recur (+ i 1) (- (shr p 31) (sar t 31)))))
-                k))
+  (let [k (let [up (limbs @un) vp (limbs vn)]
+            (loop [i 0 k 0]
+              (if (< i n)
+                  (let [p (unchecked-multiply qhat (limb-at vp i))
+                        t (unchecked-subtract (unchecked-subtract (limb-at up (+ i j)) k) (bit-and p MAG-MASK))]
+                    (do (limb-put! up (+ i j) (bit-and t MAG-MASK))
+                        (recur (+ i 1) (unchecked-subtract (shr p 31) (sar t 31)))))
+                  k)))
         t (- (array-get @un (+ j n)) k)]
     (do (array-set! &un (+ j n) (bit-and t MAG-MASK))
         (if (< t 0) 1 0))))
