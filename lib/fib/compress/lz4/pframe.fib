@@ -63,3 +63,10 @@
          (match (place out (array-len head) (conj blocks (Pair tail (array-len tail))) workers)
            ((Err e) (Err e))
            ((Ok _) (Ok out))))))))
+
+;; The blocks of `data` (a multiple of the block size, except at the end of a stream) coded in parallel and put one after the other: what a streaming compressor returns for a batch.
+(defun par-blocks (data: (Array i8) o: Options workers: i64 gb: i64) -> (Result (Array i8) CompressError)
+  (let [bs (block-size-of o) groups (quot (+ (nblocks (array-len data) bs) (- gb 1)) gb)]
+    (match (run-jobs workers groups (fn (j: i64) (Ok (compress-group data o bs gb j))))
+      ((Err e) (Err e))
+      ((Ok parts) (let [out (array (total-len parts) 0i8)] (match (place out 0 parts workers) ((Err e) (Err e)) ((Ok _) (Ok out))))))))

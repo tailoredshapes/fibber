@@ -6,14 +6,14 @@
 ;; regs: 0 stage (0 frame head, 1 block, 2 content checksum, 3 skippable payload), 1 flags (1 independent, 2 block checksums, 4 content checksum), 2 block max, 3 content
 ;; size (-1), 4 output of this frame, 5 total output, 6 window history length, 7 skip left, 8 frames finished, 9 max-output, 10 dictionary applies (first frame only)
 (ns fib.compress.lz4.sdec (:use fib.core fib.seq fib.coll fib.compress.types fib.compress.lz4.mem fib.compress.lz4.header fib.compress.lz4.xxh32 fib.compress.lz4.blockdec
-                                 fib.compress.lz4.block fib.compress.lz4.sbuf fib.compress.lz4.scomp))
+                                 fib.compress.lz4.block fib.compress.lz4.sbuf fib.compress.lz4.scomp fib.compress.par fib.compress.lz4.pframe fib.compress.lz4.pframedec))
 
 (defstruct LzDec (regs: (Array i64) ibuf: SBuf win: (Cell (Array i8)) xxh: (Cell Xxh) dict: (Array i8)))
 
 (defun new-decompressor (o: Options) -> (Result LzDec CompressError)
   (if (< (. o max-output) 0) (Err (invalid-argument "max-output must not be negative"))
-    (let [r (array 12 0) t (. o dictionary) d (if (> (array-len t) 65536) (array-copy t (- (array-len t) 65536) (array-len t)) t)]
-      (do (rs r 9 (. o max-output)) (rs r 10 (if (> (array-len d) 0) 1 0))
+    (let [r (array 16 0) t (. o dictionary) d (if (> (array-len t) 65536) (array-copy t (- (array-len t) 65536) (array-len t)) t)]
+      (do (rs r 9 (. o max-output)) (rs r 10 (if (> (array-len d) 0) 1 0)) (rs r 13 (if (. o verify) 1 0)) (rs r 11 (if (>= (. o threads) 2) (worker-count (. o threads)) 0))
           (Ok (LzDec r (sb-new) (cell (array 0 0i8)) (cell (xxh-new 0)) d))))))
 
 (defun dflag? (d: LzDec f: i64) -> bool (> (bit-and (rg (. d regs) 1) f) 0))
@@ -79,14 +79,46 @@
           :else (let [n (- res hist) out (array-copy w hist res)]
                   (do (slide d n) (sb-skip b (+ 4 (+ sz (if (dflag? d 2) 4 0)))) (emit d out))))))
 
+;; ---- THREADS FOR A STREAM (docs/design/compress.md 9.3): with threads 2 or more, independent blocks and no dictionary, a call that finds at least 2 whole blocks queued decodes up to
+;; workers x about 1 MiB worth of them in parallel (jobs of fib.compress.lz4.pframedec's placement mode over a copy of the queued bytes) and returns the output of all of them in one
+;; step: the bound of a step is then that, not one block. It consumes nothing unless it succeeds: a corrupt or oversized block, a bad checksum or a limit that would be passed falls
+;; back to the sequential step, which says exactly what is wrong. Header, end mark and trailer are always the sequential code's.
+(defun scan-queued (d: LzDec limit: i64) -> Index
+  (let [b (. d ibuf) p (sb-ptr b) n (sb-len b) bsum (if (dflag? d 2) 4 0) bmax (rg (. d regs) 2)]
+    (loop [i 0 ws: (Vec i64) [] k 0]
+      (let [wd (if (<= (+ i 4) n) (rd32 p i) 0) sz (bit-and wd 2147483647)]
+        (if (or (>= k limit) (= wd 0) (> sz bmax) (> (+ i (+ 4 (+ sz bsum))) n)) (Index ws k i)
+          (recur (+ i (+ 4 (+ sz bsum))) (conj (conj (conj ws (+ i 4)) sz) (if (> (bit-and wd 2147483648) 0) 1 0)) (+ k 1)))))))
+
+(defun par-run (d: LzDec ix: Index) -> (Option DecStep)
+  (let [r (. d regs) b (. d ibuf) bmax (rg r 2) src (sb-take b (. ix end))
+        h (FrameHead kind-frame 0 true (dflag? d 2) false -1 -1 bmax 0)
+        s (make-shared src ix h (with-verify (default-options) (= (rg r 13) 1)) 0 0 0)]
+    (match (run-jobs (rg r 11) (. s jobs) (place-job s))
+      ((Err _) nil)
+      ((Ok parts)
+       (if (> (total-len parts) (- (rg r 9) (rg r 5))) nil
+         (let [out (array (total-len parts) 0i8)]
+           (match (place out 0 parts 1)
+             ((Err _) nil)
+             ((Ok _) (do (sb-skip b (. ix end)) (match (emit d out) ((Ok st) (some st)) ((Err _) nil)))))))))))
+
+(defun par-step (d: LzDec) -> (Option DecStep)
+  (if (or (< (rg (. d regs) 11) 2) (not (dflag? d 1)) (> (rg (. d regs) 6) 0)) nil
+    (let [ix (scan-queued d (* (rg (. d regs) 11) (group-blocks (rg (. d regs) 2))))]
+      (if (< (. ix count) 2) nil (par-run d ix)))))
+
 (defun step-block (d: LzDec) -> (Result (Option DecStep) CompressError)
+  (match (par-step d) ((some st) (Ok (some st))) (nil (step-block-seq d))))
+
+(defun step-block-seq (d: LzDec) -> (Result (Option DecStep) CompressError)
   (let [b (. d ibuf) r (. d regs) have (sb-len b)]
     (if (< have 4) (Ok (some (DecStep (array 0 0i8) true false)))
       (let [wd (rd32 (sb-ptr b) 0) sz (bit-and wd 2147483647) bsum (if (dflag? d 2) 4 0)]
         (cond (= wd 0) (do (sb-skip b 4) (rs r 0 (if (dflag? d 4) 2 4)) (Ok nil))
               (> sz (rg r 2)) (Err (corrupt "a block is larger than the frame's block size"))
               (< have (+ 4 (+ sz bsum))) (Ok (some (DecStep (array 0 0i8) true false)))
-              (and (dflag? d 2) (not (= (rd32 (sb-ptr b) (+ 4 sz)) (xxh32-ptr (unsafe (ptr+ (sb-ptr b) 4)) sz 0)))) (Err (checksum-error "a block's checksum does not match"))
+              (and (dflag? d 2) (= (rg r 13) 1) (not (= (rd32 (sb-ptr b) (+ 4 sz)) (xxh32-ptr (unsafe (ptr+ (sb-ptr b) 4)) sz 0)))) (Err (checksum-error "a block's checksum does not match"))
               :else (match (if (> (bit-and wd 2147483648) 0) (block-raw d sz) (block-comp d sz))
                       ((Err e) (Err e))
                       ((Ok s) (Ok (some s)))))))))
@@ -95,7 +127,7 @@
   (let [b (. d ibuf) r (. d regs)]
     (cond (= (rg r 0) 4) (match (frame-done d) ((Err e) (Err e)) ((Ok s) (Ok (some s))))
           (< (sb-len b) 4) (Ok (some (DecStep (array 0 0i8) true false)))
-          (not (= (rd32 (sb-ptr b) 0) (xxh-digest @(. d xxh)))) (Err (checksum-error "the content checksum does not match"))
+          (and (= (rg r 13) 1) (not (= (rd32 (sb-ptr b) 0) (xxh-digest @(. d xxh))))) (Err (checksum-error "the content checksum does not match"))
           :else (do (sb-skip b 4) (rs r 0 4) (Ok nil)))))
 
 (defun step-skip (d: LzDec) -> (Result (Option DecStep) CompressError)

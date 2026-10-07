@@ -123,6 +123,20 @@
                                      (not (every? (fn (w: i64) (every? (fn (gb: i64) (same-verdict? (gdecompress z o w gb) a)) [1 2 5])) [2 7]))))
                       (range (count (hostile))))))))
 
+;; ---- streams of several batches: 7 MiB, in chunks of 100000 bytes, with 2, 3 and 7 workers (a batch is workers x about 1 MiB, so there are 1 to 4 batches mid-stream)
+(defun stream-big-failures () -> (Vec str)
+  (let [d (text 51 7340032) o (o64) chunks (split-sizes d [100000]) zs (ok-bytes (compress-chunks (lz4) (th o 1) chunks))]
+    (vec (mapcat (fn (t: i64)
+                   (let [z (ok-bytes (compress-chunks (lz4) (th o t) chunks))]
+                     (cat-v [(if (bytes-eq z zs) [] [(str "compress " t)])
+                             (if (bytes-eq (ok-bytes (decompress-chunks (lz4) (th o t) (split-sizes zs [123457]))) d) [] [(str "decompress " t)])
+                             (if (bytes-eq (ok-bytes (decompress-chunks (lz4) (th (with-verify o false) t) (split-sizes zs [3000000]))) d) [] [(str "decompress, no verify " t)])
+                             ;; a corrupt block mid-stream: the same error kind as the sequential stream
+                             (let [bad (poke zs (quot (array-len zs) 2) 255) k1 (kind-of (decompress-chunks (lz4) (th o 1) (split-sizes bad [200000])))
+                                   kt (kind-of (decompress-chunks (lz4) (th o t) (split-sizes bad [200000])))]
+                               (if (and (= k1 kt) (not (= k1 :ok))) [] [(str "corrupt stream " t " " k1 " " kt)]))])))
+                 [2 3 7]))))
+
 (defspecs specs
   (feature "fib.compress.par: the engine"
     (scenario "results come back in job order for every worker count"
@@ -155,6 +169,8 @@
             (expect = [:checksum :checksum :corrupt :checksum :truncated :checksum :corrupt :truncated :checksum :truncated :checksum :corrupt :corrupt :too-large] (hostile-kinds))))
     (scenario "jobs of 1, 2 and 5 blocks over 2, 3, 7 and 16 workers (5 option sets): compress is the sequential bytes, decompress (direct and placement) the input"
       (then (expect = [] (jobs-failures))))
+    (scenario "a 7 MiB stream in 100 KB chunks: compress is the sequential bytes and decompress the input with 2, 3 and 7 workers, over several batches, with verification off, and a corrupt block gives the sequential error"
+      (then (expect = [] (stream-big-failures))))
     (scenario "the hostile frames again with jobs of 1, 2 and 5 blocks: the verdict is the sequential decoder's"
       (then (expect = [] (hostile-jobs-failures))))
     (scenario "10,000 mutated 3-block frames: the sequential and the 4-thread decoder agree on the verdict and the bytes of every one"

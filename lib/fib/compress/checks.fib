@@ -150,7 +150,20 @@
                          (if (is-bytes? (decompress c z1 (with-threads o t)) (. s data)) [] [(str (sname s) " decompress with " t " threads differs")])]))
                  (thread-counts)))))
 
-(defun thread-failures (c: c) -> (Vec str) :where ((Codec c)) (vec (mapcat (fn (s: Sample) (thread-sample-failures c s)) (par-samples))))
+;; Streams: the same bytes for every thread count (compressed in chunks of 50000 and 7 bytes), and the decoder in chunks of 30000 gives the input.
+(defun stream-thread-failures (c: c) -> (Vec str) :where ((Codec c))
+  (let [s (find-sample "text 262145") o (par-options c)
+        run (fn (t: i64 sizes: (Vec i64)) (compress-chunks c (with-threads o t) (split-sizes (. s data) sizes)))
+        base (fn (sizes: (Vec i64)) (ok-of (run 1 sizes)))]
+    (vec (mapcat (fn (t: i64)
+                   (cat [(if (same? (ok-of (run t [50000])) (base [50000])) [] [(str "stream compress (50000 chunks) differs with " t " threads")])
+                         (if (same? (ok-of (run t [7000 131 77777])) (base [7000 131 77777])) [] [(str "stream compress (mixed chunks) differs with " t " threads")])
+                         (if (is-bytes? (decompress-chunks c (with-threads o t) (split-sizes (base [50000]) [30000])) (. s data)) [] [(str "stream decompress differs with " t " threads")])]))
+                 (thread-counts)))))
+(defun ok-of (r: (Result (Array i8) CompressError)) -> (Array i8) (match r ((Ok b) b) ((Err _) (array 0 0i8))))
+
+(defun thread-failures (c: c) -> (Vec str) :where ((Codec c))
+  (into (vec (mapcat (fn (s: Sample) (thread-sample-failures c s)) (par-samples))) (if (supports? c :streaming) (stream-thread-failures c) [])))
 
 ;; The same error kind and the same exact limit for every thread count, on a frame cut, corrupted in the middle, and at its limit.
 (defun kinds-over-threads (c: c z: (Array i8) o: Options) -> (Vec str) :where ((Codec c))
