@@ -1,7 +1,7 @@
 ;; compiler/native/lower/calls.fib: calls and terminators (crates/lair/src/lower/calls.rs). OWNER: package L2.
 
 (ns native.lower.calls
-  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx native.lower.types native.lower.consts)
+  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx native.lower.types native.lower.consts native.lower.build)
   (:require [llvm.core :as core]))
 
 
@@ -29,7 +29,7 @@
        (Err (ErrInternal (str "unknown function @" g)))))
     ((CalIndirect p ty)
      (try-let ((f (fx-val fx p)))
-       (Ok (FuncEntry f ty))))))
+       (Ok (FuncEntry f ty nil))))))
 
 ;; A tail call is `musttail` followed by `ret` (spec/lir.md 7.3); `tail` on a target without tailcc (types.targets `tail-kind`).
 (defun finish-tail :private (fx: Fx c: i64 ty: LFnType) -> unit
@@ -40,6 +40,30 @@
           (nil (core/LLVMBuildRetVoid (. fx b))))
         ())))
 
+;; An `i64` as the `i32` a 32-bit libc takes for a `size_t`: a value that does not fit becomes the largest `i32` (all ones), not its low 32 bits, so that a request for
+;; more memory than there is fails (malloc answers null) instead of succeeding with the remainder.
+(defun saturating-trunc :private (fx: Fx v: i64) -> i64
+  (let ((i32t (lx-ty (. fx lx) (TInt 32)))
+        (i64t (lx-ty (. fx lx) (TInt 64))))
+    (let ((big (b-icmp (. fx b) 34i32 v (core/const-int i64t 4294967295 false)))
+          (low (b-cast (. fx b) (opcode-trunc) v i32t)))
+      (b-select (. fx b) big (core/const-int i32t 4294967295 false) low))))
+
+;; The arguments of a call to a function declared with `wire` where lIR says `ty`: an `i64` the wire says `i32` is truncated (the arguments past the
+;; parameters, a variadic call's, are as given).
+(defun narrow-args :private (fx: Fx ty: LFnType wire: LFnType vals: (Vec i64)) -> (Vec i64)
+  (vec (map-indexed (fn (i: i64 v: i64)
+                      (if (and (< i (count (. ty params))) (= (nth (. ty params) i) (TInt 64)) (= (nth (. wire params) i) (TInt 32)))
+                        (saturating-trunc fx v)
+                        v))
+                    vals)))
+
+;; The result of a call to a function declared with `wire`: an `i32` where lIR says `i64` is sign-extended (a `-1` stays `-1`).
+(defun widen-result :private (fx: Fx ty: LFnType wire: LFnType c: i64) -> i64
+  (if (and (= (. ty ret) (some (TInt 64))) (= (. wire ret) (some (TInt 32))))
+    (b-cast (. fx b) (opcode-sext) c (lx-ty (. fx lx) (TInt 64)))
+    c))
+
 ;; A call, tail or not; nil for a void result. (calls.rs `Fx::call`)
 (defun lower-call (fx: Fx e: LExpr) -> (Result (Option i64) LairError)
   (match (. e kind)
@@ -47,11 +71,12 @@
      (try-let ((fe (call-callee fx callee))
                (vals (fx-vals fx args)))
        (let ((ty (. fe ty))
-             (fty (lx-fn-ty (. fx lx) ty))
-             (c (core/build-call (. fx b) fty (. fe value) vals "")))
-         (do (unsafe (core/LLVMSetInstructionCallConv c (trunc i32 (cc-number (. fx lx) (. ty cc)))))
-             (cond (not tail) (Ok (match (. ty ret) ((some _) (some c)) (nil nil)))
-                   :else (do (finish-tail fx c ty) (Ok nil)))))))
+             (wire (unwrap-or (. fe wire) (. fe ty)))
+             (c0 (core/build-call (. fx b) (lx-fn-ty (. fx lx) wire) (. fe value) (narrow-args fx ty wire vals) "")))
+         (do (unsafe (core/LLVMSetInstructionCallConv c0 (trunc i32 (cc-number (. fx lx) (. ty cc)))))
+             (let ((c (widen-result fx ty wire c0)))
+               (cond (not tail) (Ok (match (. ty ret) ((some _) (some c)) (nil nil)))
+                     :else (do (finish-tail fx c ty) (Ok nil))))))))
     (_ (Err (ErrInternal "not a call")))))
 
 (defun lower-switch :private (fx: Fx v: LExpr d: str cases: (Vec LCase)) -> (Result unit LairError)

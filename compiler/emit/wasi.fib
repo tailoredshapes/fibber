@@ -1,0 +1,133 @@
+;; compiler/emit/wasi.fib: the runtime of a WASI program (docs/design/targets.md 5.1, docs/design/wasm.md): rt/*.lir adapted for wasm32-wasip1 and wasi-libc, in the
+;; way emit.os adapts it for Darwin and musl: the text of each part is rewritten at the places the platform differs, and a shim of lIR definitions is appended.
+;;
+;; What differs, and what is done about it:
+;;   * pointers are 4 bytes: the element size of an array of pointers (the vector trie's child arrays, the worklist) is 4 where the text says 8 (the sizes the compiler computes
+;;     come from `emit.layout/size-align-pb`);
+;;   * `size_t` and `long` are `i32`: native.lower narrows the calls of `types.targets/libc-narrow-names`, nothing here;
+;;   * no threads (docs/adr/0008, wasm has none without the threads proposal): the pool starts no worker (a joiner runs the queue itself, as it does when it waits), `pthread_create`
+;;     is a shim that fails with EAGAIN so that `spawn` of a thread says "cannot start" and a program that never spawns a thread never calls it, `pthread_exit` is `abort`;
+;;   * the clock takes a pointer to a clock object (`_CLOCK_MONOTONIC`, `_CLOCK_REALTIME`) where Linux takes a number, and a `timespec`'s `tv_nsec` is a 4-byte `long`;
+;;   * `AT_FDCWD` is -2 and the open flags are WASI's (`fib.w.oflags` maps the Linux words the library passes);
+;;   * no `madvise`, no `mallopt` (wasi-libc's malloc grows the linear memory with `memory.grow`: that is the page provider), no `pipe` or `dup`.
+(ns emit.wasi)
+
+(defun replace :private (text: str old: str new: str) -> str
+  (loop [offset 0 parts: (Vec str) []]
+    (match (str-find text old offset)
+      (nil (str-join (conj parts (str-slice text offset (str-len text)))))
+      ((some at) (recur (+ at (str-len old)) (conj (conj parts (str-slice text offset at)) new))))))
+
+(defun rewrites :private () -> (Vec (Pair str str))
+  [
+   (Pair "(call @fib.array-elem arr (and (lshr i level) (i64 31)) (i64 8))"
+         "(call @fib.array-elem arr (and (lshr i level) (i64 31)) (i64 4))")
+   (Pair "(call @fib.array-alloc m tnarr (i64 8))"
+         "(call @fib.array-alloc m tnarr (i64 4))")
+   (Pair "(call @fib.array-elem karr ki (i64 8))"
+         "(call @fib.array-elem karr ki (i64 4))")
+   (Pair "(bigger (call @malloc (mul cap2 (i64 8))))"
+         "(bigger (call @malloc (mul cap2 (i64 4))))")
+   (Pair "(call @memcpy bigger base (mul len (i64 8)))"
+         "(call @memcpy bigger base (mul len (i64 4)))")
+   (Pair "(define internal (fib.pool-quiesce void) ()\n  (block entry (call @fib.rq-lock) (br test))\n  (block test\n    (br (and (icmp eq (load ptr @fib.rq-head) (ptr null)) (icmp eq (load i32 @fib.pool-busy) (i32 0))) done sleep))\n  (block sleep\n    (call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))\n    (br test))\n  (block done (call @fib.rq-unlock) (call @fib.lc-report) (ret)))"
+         "(define internal (fib.pool-quiesce void) ()\n  (block entry (br test))\n  (block test\n    (let ((t (call @fib.dequeue)))\n      (br (icmp eq t (ptr null)) done run)))\n  (block run (call @fib.run-one t) (br test))\n  (block done (call @fib.lc-report) (ret)))")
+   (Pair "(call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))"
+         "(call @fib.w.deadlock)")
+   (Pair "(let ((e (load i32 (call @__errno_location))))"
+         "(let ((e (call @fib.w.errno-linux (load i32 (call @__errno_location)))))")
+   (Pair "(let ((p (call @strerror (trunc i32 e))))"
+         "(let ((p (call @strerror (call @fib.w.errno-wasi (trunc i32 e)))))")
+   (Pair "(declare madvise i32 (ptr i64 i32))\n"
+         "")
+   (Pair "(call @madvise (inttoptr ptr lo) (sub hi lo) (i32 14))"
+         "(add (i32 0) (i32 0))")
+   (Pair "(declare mallopt i32 (i32 i32))\n"
+         "")
+   (Pair "(call @mallopt (i32 -3) (i32 131072))"
+         "(add (i32 0) (i32 0))")
+   (Pair "(call @openat (i32 -100) (call @fib.str-bytes-ptr path) (trunc i32 flags) (trunc i32 mode))"
+         "(call @openat (i32 -2) (call @fib.str-bytes-ptr path) (call @fib.w.oflags flags) (trunc i32 mode))")
+   (Pair "(r (call @pipe fds))"
+         "(r (call @fib.w.nosys))")
+   (Pair "(call @dup (trunc i32 fd))"
+         "(call @fib.w.nosys)")
+   (Pair "(declare pipe i32 (ptr))\n"
+         "")
+   (Pair "(declare dup i32 (i32))\n"
+         "")
+   (Pair "(rc (call @pthread_create handle attr entry task))"
+         "(rc (call @fib.w.run-inline entry task))")
+   (Pair "(declare pthread_create i32 (ptr ptr ptr ptr))\n"
+         "")
+   (Pair "(declare pthread_detach i32 (i64))\n"
+         "")
+   (Pair "(declare pthread_exit void (ptr))\n"
+         "")
+   (Pair "(n (select (icmp slt n0 (i64 1)) (i64 1) n0))"
+         "(n (i64 0))")
+   ])
+
+;; The texts `adapt` rewrites, for the unit that checks each is in the runtime (compiler/tests/emit/unit-wasi.fib).
+(defun rewrite-patterns () -> (Vec str) (mapv (fn (r: (Pair str str)) (. r fst)) (rewrites)))
+
+;; One part of the runtime for WASI. Every rewrite is of text that is in exactly one part; a text that is not there leaves the part as it was.
+(defun adapt (text: str) -> str
+  (reduce (fn (t: str r: (Pair str str)) (replace t (. r fst) (. r snd))) text (rewrites)))
+
+;; The errno numbers of WASI and of Linux, for the errors the runtime and the library tell apart: (WASI Linux). The runtime's `sys-*` answer the negated Linux number
+;; and `fib.os` reads the Linux numbers (lib/platform/wasi/fib/os/backend.fib maps the same table for the `errno` it reads itself); `strerror` takes WASI's.
+(defun errnos :private () -> (Vec (Pair i64 i64))
+  [(Pair 44 2) (Pair 63 1) (Pair 2 13) (Pair 20 17) (Pair 28 22) (Pair 8 9) (Pair 27 4) (Pair 64 32) (Pair 54 20) (Pair 6 11) (Pair 73 110) (Pair 15 104)
+   (Pair 13 103) (Pair 14 111) (Pair 3 98) (Pair 52 38) (Pair 55 39) (Pair 31 21) (Pair 48 12) (Pair 58 95) (Pair 75 18) (Pair 51 28) (Pair 76 25)
+   (Pair 29 5) (Pair 70 34)])
+
+;; `(define internal (NAME i32) ((i32 e)) ..)` mapping `e` from the `from` side of `errnos` to the other, any other number unchanged.
+(defun errno-map :private (name: str from: (fn ((Pair i64 i64)) i64) to: (fn ((Pair i64 i64)) i64)) -> str
+  (let ((rows (errnos)))
+    (let ((head (str-join ["(define internal (" name " i32) ((i32 e))\n  (block entry (switch e other"]))
+          (cases (str-join (mapv (fn (r: (Pair i64 i64)) (str-join [" ((i32 " (str (from r)) ") m" (str (from r)) ")"])) rows)))
+          (blocks (str-join (mapv (fn (r: (Pair i64 i64)) (str-join ["  (block m" (str (from r)) " (ret (i32 " (str (to r)) ")))\n"])) rows))))
+      (str-join [head cases "))\n  (block other (ret e))\n" blocks ")\n"]))))
+
+;; The shim: what the text above calls and wasi-libc does not provide. The open flags are the Linux ones the library passes (O_CREAT 64, O_EXCL 128, O_TRUNC 512, O_APPEND 1024,
+;; O_NONBLOCK 2048, O_DIRECTORY 65536, the access mode in the low two bits), mapped to wasi-libc's (fcntl.h: O_RDONLY 0x04000000, O_WRONLY 0x10000000, O_CREAT 1<<12, O_DIRECTORY
+;; 2<<12, O_EXCL 4<<12, O_TRUNC 8<<12, O_APPEND 1, O_NONBLOCK 4); close-on-exec is dropped. `fib.w.nosys` is ENOSYS (WASI's 52) and -1.
+(defun shim () -> str
+  (str-join
+    [
+     "(define internal (pthread_create i32) ((ptr h) (ptr a) (ptr f) (ptr x)) (block entry (ret (i32 6))))\n"
+     "(define internal (fib.w.run-inline i32) ((ptr f) (ptr x)) (block entry (indirect-call f (fn ptr (ptr)) x) (ret (i32 0))))\n"
+     (errno-map "fib.w.errno-linux" (fn (r: (Pair i64 i64)) (. r fst)) (fn (r: (Pair i64 i64)) (. r snd)))
+     (errno-map "fib.w.errno-wasi" (fn (r: (Pair i64 i64)) (. r snd)) (fn (r: (Pair i64 i64)) (. r fst)))
+     "(define internal (fib.w.deadlock void) () (block entry (call @fib.fatal-c (string \"deadlock: this wait needs another thread, and a WASI program has one\")) (unreachable)))\n"
+     "(define internal (pthread_detach i32) ((i64 t)) (block entry (ret (i32 0))))\n"
+     "(define internal (pthread_exit void) ((ptr v)) (block entry (call @abort) (unreachable)))\n"
+     "(define internal (fib.w.nosys i32) () (block entry (store (i32 52) (call @__errno_location)) (ret (i32 -1))))\n"
+     "(define internal (fib.w.oflags i32) ((i64 f))\n"
+     "  (block entry\n"
+     "    (let ((m (and f (i64 3)))\n"
+     "          (acc (select (icmp eq m (i64 0)) (i64 67108864) (select (icmp eq m (i64 1)) (i64 268435456) (i64 335544320))))\n"
+     "          (a1 (or acc (select (icmp ne (and f (i64 64)) (i64 0)) (i64 4096) (i64 0))))\n"
+     "          (a2 (or a1 (select (icmp ne (and f (i64 128)) (i64 0)) (i64 16384) (i64 0))))\n"
+     "          (a3 (or a2 (select (icmp ne (and f (i64 512)) (i64 0)) (i64 32768) (i64 0))))\n"
+     "          (a4 (or a3 (select (icmp ne (and f (i64 1024)) (i64 0)) (i64 1) (i64 0))))\n"
+     "          (a5 (or a4 (select (icmp ne (and f (i64 2048)) (i64 0)) (i64 4) (i64 0))))\n"
+     "          (a6 (or a5 (select (icmp ne (and f (i64 65536)) (i64 0)) (i64 8192) (i64 0)))))\n"
+     "      (ret (trunc i32 a6)))))\n"]))
+
+;; The whole module of a WASI program, after the runtime and the library are in it: `clock_gettime` (the runtime's calls and `fib.os.time`'s extern) is the shim's, which takes the
+;; numeric clock id (0 realtime, anything else monotonic) where wasi-libc takes a pointer to a clock object, and leaves `tv_nsec` as the 8-byte word every reader of a
+;; `timespec` here expects (it is a 4-byte `long` in wasi-libc, and the 4 bytes after it are not written).
+(defun finish (text: str) -> str
+  (str-concat
+    (replace (replace text "(declare clock_gettime i32 (i32 ptr))\n" "") "@clock_gettime " "@fib.w.clock-gettime ")
+    (str-join ["(declare-global _CLOCK_MONOTONIC i32)\n"
+               "(declare-global _CLOCK_REALTIME i32)\n"
+               "(declare clock_gettime i32 (ptr ptr))\n"
+               "(define internal (fib.w.clock-gettime i32) ((i32 id) (ptr ts))\n"
+               "  (block entry\n"
+               "    (let ((r (call @clock_gettime (select (icmp eq id (i32 0)) @_CLOCK_REALTIME @_CLOCK_MONOTONIC) ts))\n"
+               "          (at (getelementptr i8 ts (i64 8))))\n"
+               "      (store (sext i64 (load i32 at)) at)\n"
+               "      (ret r))))\n"])))

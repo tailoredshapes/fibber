@@ -1,0 +1,25 @@
+;; examples/wasm/kernels.fib: functions for a JavaScript host (docs/design/wasm.md 5). Build and run:
+;;   fibc build examples/wasm/kernels.fib --target wasm32-wasi -o kernels.wasm --export add --export dot --export sum-squares=sumSquares --export fib-vec-length=vecLength
+;;   node examples/wasm/kernels.mjs kernels.wasm
+;; An export takes and returns integers, floats and raw `ptr`s (the host makes the memory a `ptr` points to with the module's `malloc`, and fills it through a typed array
+;; over `memory.buffer`); everything else a program can do (vectors, strings, closures, the library) it does inside.
+(ns main (:use fib.core fib.seq))
+
+(defun add (a: i64 b: i64) -> i64 (+ a b))
+
+;; The dot product of two arrays of `n` doubles, read through raw pointers (8 bytes an element).
+(defun dot (xs: ptr ys: ptr n: i64) -> f64
+  (unsafe
+    (loop ((i 0) (acc 0.0))
+      (if (< i n)
+        (recur (+ i 1) (+ acc (* (load-f64 (ptr+ xs (* 8 i))) (load-f64 (ptr+ ys (* 8 i))))))
+        acc))))
+
+;; The sum of the squares of 0 .. n-1 through a vector and `reduce`: allocation, the runtime, the library.
+(defun sum-squares (n: i64) -> i64
+  (reduce + 0 (map (fn (i: i64) (* i i)) (vec (range n)))))
+
+(defun fib-vec-length (n: i64) -> i64
+  (count (vec (range n))))
+
+;; A program with exports has no `main`.

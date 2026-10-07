@@ -115,6 +115,23 @@
 ;; or `kmov` on x86), the mask padded with false lanes up to 8, 16, 32 or 64 when it has other than those (the lIR has no `i3`), then `zext` to i64.
 (defun lcx-movemask (cx: LowerCx x: V) -> V
   (let ((n (lanes-of (ty-of x))))
+    (if (and (= (program-pb (. cx p)) 4) (> n 16) (= (rem n 16) 0))
+      (lcx-movemask-halves cx x n)
+      (lcx-movemask-whole cx x n))))
+
+;; On wasm32 a mask of more than 16 lanes is read 16 lanes at a time: LLVM 21's WebAssembly backend turns `bitcast <32 x i1>` to `i32` into the wrong bits
+;; (the lanes of the second half land in the wrong places), and `bitmask` is a 16-lane instruction anyway. Piece k of the mask is lanes 16k..16k+15 as an `i16`,
+;; shifted to bit 16k.
+(defun lcx-movemask-halves :private (cx: LowerCx x: V n: i64) -> V
+  (let ((pieces (mapv (fn (k: i64)
+                        (let ((half (val cx (str-join ["(shufflevector " (v-text x) " " (v-text x) " " (mask-text (vec (range (* 16 k) (* 16 (+ k 1))))) ")"]) (LirVec LirI1 16))))
+                          (let ((b (val cx (str-join ["(bitcast i16 " (v-text half) ")"]) LirI16)))
+                            (let ((z (val cx (str-join ["(zext i64 " (v-text b) ")"]) LirI64)))
+                              (if (= k 0) z (val cx (str-join ["(shl " (v-text z) " (i64 " (str (* 16 k)) "))"]) LirI64))))))
+                      (range (quot n 16)))))
+    (reduce (fn (acc: V v: V) (val cx (str-join ["(or " (v-text acc) " " (v-text v) ")"]) LirI64)) (nth pieces 0) (drop 1 pieces))))
+
+(defun lcx-movemask-whole :private (cx: LowerCx x: V n: i64) -> V
     (let ((w (cond (<= n 8) 8 (<= n 16) 16 (<= n 32) 32 :else 64)))
       (let ((wt (cond (= w 8) LirI8 (= w 16) LirI16 (= w 32) LirI32 :else LirI64))
             (m (if (= n w)
@@ -122,7 +139,7 @@
                    (val cx (str-join ["(shufflevector " (v-text x) " (zeroinitializer " (lir-ty-text (ty-of x)) ") "
                                       (mask-text (mapv (fn (i: i64) (if (< i n) i n)) (range w))) ")"]) (LirVec LirI1 w)))))
         (let ((b (val cx (str-join ["(bitcast " (lir-ty-text wt) " " (v-text m) ")"]) wt)))
-          (if (= w 64) b (val cx (str-join ["(zext i64 " (v-text b) ")"]) LirI64)))))))
+          (if (= w 64) b (val cx (str-join ["(zext i64 " (v-text b) ")"]) LirI64))))))
 
 ;; `ctz x` and `clz x` of an integer: the lIR `cttz` and `ctlz` (a zero has as many zeros as the type has bits, never poison).
 (defun lcx-count-zeros (cx: LowerCx name: str x: V) -> V

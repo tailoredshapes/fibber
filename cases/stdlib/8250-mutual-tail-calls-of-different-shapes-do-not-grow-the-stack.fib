@@ -1,0 +1,22 @@
+;; spec:   spec/lir.md 7.3, docs/adr/0008
+;; expect: accept
+;; result: 10000007
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: recur
+;; Ten million tail calls between functions that do not have the same signature (one or two integers, a float) must not grow the stack: x86-64 and aarch64 make them
+;; `musttail` under `tailcc`, WebAssembly makes them `return_call` (the tail-call extension, on in the row's features). Run under node with its default stack (about 1 MB),
+;; ten million frames would not fit, so the program holding the answer is the proof; compiler/tests/wasm/tail.sh builds it again without the extension and sees the overflow.
+(ns main (:use fib.core))
+
+(defun ping (n: i64 acc: i64) -> i64
+  (if (= n 0) acc (pong (- n 1) (+ acc 1) 2.5)))
+
+(defun pong (n: i64 acc: i64 x: f64) -> i64
+  (if (= n 0) acc (pang (- n 1) (+ acc (if (> x 2.0) 2 0)))))
+
+(defun pang (n: i64 acc: i64) -> i64
+  (if (= n 0) acc (ping (- n 1) acc)))
+
+(defun main () -> i64
+  (+ (ping 10000000 0) 7))

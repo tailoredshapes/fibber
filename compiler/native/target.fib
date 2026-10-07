@@ -36,7 +36,7 @@
 ;; vectors (NEON; SVE is not assumed) and fast fma, wasm32 SIMD128 and no fma, riscv64 RV64GC with fma; a CPU named by FIB_TARGET_CPU
 ;; that the CPU table knows decides the width and fma instead.
 (defun cross-target-info :private (triple: str) -> Target
-  (target-of-row (target-row-of-triple triple) (lt/cross-cpu triple) (some? (lt/requested-cpu))))
+  (target-of-row (with (target-row-of-triple triple) (features (lt/row-features (target-row-of-triple triple)))) (lt/cross-cpu triple) (some? (lt/requested-cpu))))
 
 ;; The machine for the code this run generates: the one `FIB_TARGET_TRIPLE` names, else the host's. Objects, assembly and IR come from it; the JIT
 ;; keeps `machine-host`, because it runs what it makes.
@@ -53,6 +53,16 @@
   (match (lt/requested-triple)
     (nil nil)
     ((some t) (if (= (. (target-row-of-triple t) libc) "musl") (some t) nil))))
+
+;; The triple of this run when it is for WebAssembly under WASI (a row whose OS is `wasi`): `fibc build --target wasm32-wasi` links it with wasm-ld (native.linkwasm); nil otherwise.
+(defun wasm-triple () -> (Option str)
+  (match (lt/requested-triple)
+    (nil nil)
+    ((some t) (if (= (. (target-row-of-triple t) os) "wasi") (some t) nil))))
+
+;; Whether the program is built as a library: `fibc build --export NAME` set FIB_EXPORTS, so there is no `main` to require (emit.compile).
+(defun exports-requested? () -> bool
+  (match (lt/env "FIB_EXPORTS") ((some e) (not (= e ""))) (nil false)))
 
 ;; Whether the run is for another target than the host: `FIB_TARGET_TRIPLE` is set. An executable cannot be linked for it here.
 (defun cross-target? () -> bool

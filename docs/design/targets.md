@@ -1,8 +1,9 @@
 # Targets as data: one row per LLVM target
 
-Status: design and first implementation, 2026-10-06. Code generation was checked on this x86-64 Linux machine for every triple below. Nothing
-was linked or run for wasm32 or riscv64. This machine has no wasm-ld, WASI sysroot, wasmtime or riscv64 sysroot, and fetching them was not
-permitted in this session (section 6). The aarch64 rows are unchanged from docs/design/aarch64.md and were run on the Mac there.
+Status: design and first implementation, 2026-10-06; **wasm32-wasip1 runs since WASM-2, 2026-10-07**: it is linked with wasm-ld against wasi-libc and run under node and wasmtime, and
+the three case directories run on it (section 5.1 as built, section 7, and docs/design/wasm.md, which is the design of the wasm32 target). Code generation was checked on this x86-64
+Linux machine for every other triple below; nothing was linked or run for wasm32-unknown-unknown or riscv64 (riscv64 is parked, ADR 0008). The aarch64 rows are unchanged from
+docs/design/aarch64.md and were run on the Mac there.
 
 The owner's goal is to target every LLVM backend. WebAssembly (WASI first, then the browser) and RISC-V come next. This package makes a target one row
 of data. It shows what each new row emits today and lists what stands between emitting and running.
@@ -47,7 +48,7 @@ of data. It shows what each new row emits today and lists what stands between em
 | aarch64-apple-darwin | 64 | pthreads | 128, apple-m1 | yes | 1 | 18 musttail | PIC | Mach-O, cc (ld64) | libSystem | Darwin | runs (Mac) | supported |
 | aarch64-unknown-linux-gnu | 64 | pthreads | 128, generic | yes | 1 | 18 musttail | PIC | ELF, cc | glibc | Linux | emits | supported |
 | arm64-apple-ios | 64 | pthreads | 128, apple-m1 | yes | 1 | 18 musttail | PIC | Mach-O, xcrun clang, static library | libSystem (pipe) | Darwin | emits | supported |
-| wasm32-wasip1 | 32 | none | 128, generic, `+simd128,+tail-call` | no | 0 | 0 (C) tail | static | wasm, wasm-ld, `$WASI_SYSROOT` | wasi-libc (dup madvise pipe pthread_create pthread_detach pthread_exit) | Linux (stand-in) | emits | portability target |
+| wasm32-wasip1 | 32 | none | 128, generic, `+simd128,+tail-call` | no | 1 | 0 (C) tail | static | wasm, wasm-ld, `$WASI_SYSROOT` | wasi-libc (madvise mallopt pthread_exit) | Wasi | runs (node, wasmtime) | portability target |
 | wasm32-unknown-unknown | 32 | none | 128, generic, `+simd128,+tail-call` | no | 0 | 0 (C) tail | static | wasm, `wasm-ld --no-entry --export-dynamic` | none (all 50) | Linux (stand-in) | emits | portability target |
 | riscv64-unknown-linux-gnu | 64 | pthreads | 128, generic-rv64, `+m,+a,+f,+d,+c,+zicsr,+zifencei` | yes (fmadd.d) | 0 | 8 (fastcc) tail | PIC | ELF lp64d, cc (riscv64 cross), `$RISCV_SYSROOT` | glibc | Linux | emits | parked: LLVM has no tailcc for RISC-V |
 
@@ -237,6 +238,10 @@ memory. It is not small: plan W2.
 
 ### 3.2 Tail calls are best-effort on WebAssembly and RISC-V
 
+**WASM-2 settled this for wasm** (docs/design/wasm.md 6): with `+tail-call` and the code generated at level 1 or more (the row's `min-level` is now 1: at level 0 LLVM's FastISel makes no `return_call`),
+ten million tail calls between functions of different signatures run in node's default stack (case 8250), and overflow without the feature (`FIB_TARGET_FEATURES=-tail-call`, the negative control of
+`compiler/tests/wasm/wasm.sh`). The text below is what was known before that run; RISC-V is as it was.
+
 spec/lir.md 7.3 promises that a tail call is a `musttail`. On the two new rows that promise does not hold today:
 
 * WebAssembly makes `return_call` where LLVM can. `02-structural-sharing` gets 6, checked by `targets-emit.sh`; with the row's
@@ -270,6 +275,20 @@ linked and run.
 Sizes: S is under a day, M one to three days, L about a week.
 
 ### 5.1 wasm32-wasip1, single-threaded first
+
+**As built (WASM-2).** W1 to W7 are done, with these decisions (docs/design/wasm.md has the detail and the numbers):
+
+| package | built as |
+|---|---|
+| **W1** | `scripts/fetch-wasm-tools.sh` (wasi-sdk 34 and wasmtime 49, sha256 pinned, ADR 0020); `fibc build --target wasm32-wasi` links with `wasm-ld`, wasi-libc and compiler-rt's builtins (`native/linkwasm.fib`: `WASI_SDK`, or `WASM_LD`, `WASI_SYSROOT`, `WASI_BUILTINS`); runs under node:wasi (`compiler/tests/wasm/run.mjs`) and wasmtime. `libc-lacks` checked against `libc.a`: it is `madvise mallopt pthread_exit` (the guess of the table was wrong: wasi-libc has stubs of `pipe`, `dup`, `pthread_create`, `pthread_detach`) |
+| **W2** | `size-align-pb`; the pointer width is `Program.pb` (the target's, 8 while the JIT makes constant `def`s and in macro modules); the constant `def`s of a 32-bit target are made on the host and the rest lowered afresh (`make-defs-at`, `program-rebuilt`); the runtime's pointer-sized literals are `emit.wasi/rewrites` |
+| **W3** | not as planned: the runtime keeps `i64`; the lowering declares the libc functions of `libc-narrow-names` with `i32` and narrows at each call (saturating), so the library's `extern`s need no change |
+| **W4** | `emit/wasi.fib` (the runtime) and `lib/platform/wasi/fib/os/backend.fib`; `AT_FDCWD` -2, WASI open flags, the clock, errno numbers mapped, no `pipe`/`dup` (ENOSYS) |
+| **W5** | decided: tasks run on the thread that joins them, `spawn` runs the task at the spawn (inline), the pool has no worker; a wait that needs another thread is the trap `deadlock` (wasm.md 3) |
+| **W6** | `compiler/tests/wasm/suite.py` runs a case directory as wasm modules against `compiler/tests/wasm/expected.txt`; the gate has a wasm stage (skipped, with the reason, without node or the toolchain) |
+| **W7** | decided in 3.2 above |
+
+The plan as it was written:
 
 | package | what | size |
 |---|---|---|
@@ -350,15 +369,27 @@ None of this is on this machine except qemu and node.
 This package does not edit scripts/gate.sh, scripts/tools.sh or compiler/tests/units.sh. `compiler/tests/types/unit-targets.fib` is listed in
 `compiler/tests/units.run`, so units.sh runs it.
 
-## 6. Tools that were not fetched
+## 6. Tools fetched, and not fetched
 
-The coordinator relayed that the owner allows fetching wasi-sdk, wasmtime, a static qemu-riscv64 and a riscv64 sysroot into
-`~/.cache/fibber-scratch/tools`. The session's permission system refused the network: a GitHub API query for the wasi-sdk releases was denied.
-Nothing was downloaded. No `scripts/fetch-target-tools.sh` was written, because a fetch script with unverified URLs and no published
-checksums to pin would be a script that cannot be shown to work. That script, the downloads and the differential runs of W1, W6, R1 and R2 are
-the next step once network access is granted.
+WASM-2 (2026-10-07) had network access: `scripts/fetch-wasm-tools.sh` fetches wasi-sdk 34.0 (x86-64 Linux: clang, `wasm-ld`, the wasi-libc sysroot, compiler-rt's builtins) and wasmtime 49.0.2 into
+`~/.cache/fibber-scratch/tools/wasm`, each checked against the sha256 that GitHub publishes for the release asset and that the script holds:
+
+* `wasi-sdk-34.0-x86_64-linux.tar.gz` b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4
+* `wasmtime-v49.0.2-x86_64-linux.tar.xz` a4d6e9e3a5a60f527cf7793d674c48930c80c2e8977995b8a275cad3254b9322
+
+Nothing is installed system-wide. node's `node:wasi` is the first runtime and was already here. A static qemu-riscv64 and a riscv64 sysroot were not fetched (riscv64 stays parked, ADR 0008);
+`wasm-opt` (binaryen) was not fetched and is not used.
 
 ## 7. Checks run
+
+* **WASM-2 (2026-10-07), wasm32-wasip1 run, not only emitted.** Linked with wasm-ld 23 (wasi-sdk 34) against wasi-libc, run under node v26.10.0 and wasmtime 49.0.2 (docs/design/wasm.md 9):
+  * `compiler/tests/wasm/suite.py`: cases/ownership 351 of 354 pass, cases/modules 32 of 32, cases/stdlib 1274 of 1337 (16 more are `open:` cases the header excuses); the 3 + 47 that do not
+    pass are in `compiler/tests/wasm/expected.txt` with their reasons (no second thread, no sockets, no FMA, libm differences, the unused `calloc`); the SIMD, tensor and movemask cases: 182 of 191 with simd128
+    and 182 with `FIB_TARGET_FEATURES=-simd128`, the nine that do not are FMA or libm;
+  * `compiler/tests/wasm/wasm.sh`: 12 of 12 (hello, memory.grow, oversize request, a 200 KB write, ten million tail calls and the negative control, movemask, vectors of objects, simd128 on and off, export), 6 s;
+  * `scripts/mutant-wasm.sh`: six planted faults (memory limit, `write` length, tail-call feature, lane order of a wide mask, pointer width, `size_t` saturation), each killed;
+  * `compiler/tests/emit/unit-wasi.fib` (every rewrite of the runtime is in rt/*.lir) and `compiler/tests/types/unit-targets.fib`; cases 8250-8252 pass natively and on wasm;
+  * the nine quick benchmarks print the same bytes on wasm and native, 1.2 to 3.6 times slower on node (wasm.md 8); a hello world is 43 KB.
 
 * `compiler/tests/native/targets-emit.sh` (full and `--quick`), `compiler/tests/types/unit-targets.fib` (17 checks) and
   `compiler/tests/driver/unit-args.fib` (22 checks). The output is in the commit messages and the report.

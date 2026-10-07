@@ -1,7 +1,7 @@
 ;; compiler/native/aot.fib: ahead-of-time compilation: an object, assembly or LLVM IR, and executables (crates/lair/src/aot.rs). OWNER: package A.
 
 (ns native.aot
-  (:use lir.diag lir.types lir.lit lir.ast native.error native.link native.linkstatic)
+  (:use lir.diag lir.types lir.lit lir.ast native.error native.link native.linkstatic native.linkwasm)
   (:require [lir.check :as check] [native.lower :as nl] [native.owned :as owned] [native.target :as target] [native.passes :as passes]
             [llvm.target :as lt] [llvm.core :as core] [llvm.ffi :as ffi]))
 
@@ -70,17 +70,20 @@
           ((Ok d) (recur (+ i 1) (conj acc d)))))))
 
 ;; Compiles a module that satisfies the `main` rule and links it into an executable at `path`. (aot.rs `build_executable`)
+(defun entry-check :private (m: LModule) -> (Result unit Diagnostic)
+  (if (target/exports-requested?) (Ok ()) (check/check-main m)))
+
 (defun aot-build-executable (m: LModule name: str path: str opts: AotOptions) -> (Result unit LairError)
-  (match (check/check-main m)
+  (match (entry-check m)
     ((Err d) (Err (lair-error-diag d)))
     ((Ok _) (match (target/static-refusal-now)
               ((some msg) (Err (ErrBackend msg)))
-              (nil (if (and (target/cross-target?) (not (some? (target/static-triple))))
-                     (Err (ErrBackend "FIB_TARGET_TRIPLE is set: an executable cannot be linked for another target here, except a static one (--static, or a -musl triple); use --emit obj or asm and link where the target runs"))
+              (nil (if (and (target/cross-target?) (not (some? (target/static-triple))) (not (some? (target/wasm-triple))))
+                     (Err (ErrBackend "FIB_TARGET_TRIPLE is set: an executable cannot be linked for another target here, except a static one (--static, or a -musl triple) or a WASI one (wasm32-wasi); use --emit obj or asm and link where the target runs"))
                      (aot-build-executable-host m name path opts)))))))
 
 (defun aot-build-executable-host :private (m: LModule name: str path: str opts: AotOptions) -> (Result unit LairError)
-  (match (check/check-main m)
+  (match (entry-check m)
     ((Err d) (Err (lair-error-diag d)))
     ((Ok _) (match (library-dirs (. opts lib-dirs))
               ((Err e) (Err e))
@@ -88,4 +91,6 @@
                            ((Err e) (Err e))
                            ((Ok obj) (match (target/static-triple)
                                         ((some t) (link-static obj path dirs (. opts libs) t))
-                                        (nil (link obj path dirs (. opts libs)))))))))))
+                                        (nil (if (some? (target/wasm-triple))
+                                               (link-wasm obj path dirs (. opts libs))
+                                               (link obj path dirs (. opts libs))))))))))))

@@ -1,0 +1,32 @@
+;; spec:   syntax §3.19, types §8.10
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: def
+;; Constant `def`s are values the compiler makes by running the program's own code in its JIT (which runs on the host) and writing what they hold as static data. For a target
+;; whose pointers are not the host's (wasm32) the JIT lays the objects out for the host and the data is written for the target: a struct with a str and a vector, a vector
+;; of structs, a pair, a vector of integers, and an Option of an object, must all read back as what the host made.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defstruct Row (id: i64 name: str tags: (Vec str)))
+
+(def ROWS: (Vec Row) [(Row 1 "one" ["a" "b"]) (Row 2 "two" []) (Row 3 "three" ["c"])])
+(def LABEL: str "label")
+(def PAIR: (Pair i64 str) (Pair 7 "seven"))
+(def NUMS: (Vec i64) [10 20 30 40])
+(def MAYBE: (Option Row) (some (Row 9 "nine" ["z"])))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (count ROWS) 3))
+        (check c (= (. (nth ROWS 2) name) "three"))
+        (check c (= (count (. (nth ROWS 0) tags)) 2))
+        (check c (= (nth (. (nth ROWS 0) tags) 1) "b"))
+        (check c (= (. (nth ROWS 0) id) 1))
+        (check c (= LABEL "label"))
+        (check c (= (. PAIR fst) 7))
+        (check c (= (. PAIR snd) "seven"))
+        (check c (= (reduce + 0 NUMS) 100))
+        (check c (match MAYBE ((some r) (= (nth (. r tags) 0) "z")) (nil false)))
+        (checks-result c))))

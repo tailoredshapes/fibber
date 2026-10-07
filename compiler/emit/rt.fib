@@ -2,11 +2,16 @@
 ;; section and the runtime's own `declare` of a C function. The text is the data of emit.runtime, generated from rt/*.lir.
 ;; Replaces compile.rs:20 RUNTIME and compile.rs:36 runtime_declaration.
 (ns emit.rt
-  (:use emit.runtime) (:require [emit.os :as os] [expand.targetos :as tos]))
+  (:use emit.runtime) (:require [emit.os :as os] [emit.wasi :as wasi] [expand.targetos :as tos]))
 
 ;; The eleven parts in the order compile.rs:20 `include_str!`s them: core str array vec vecbuild atom thread task weak io sys; then alloc,
 ;; the large-block cache (rt/alloc.lir), which the Rust runtime does not have.
 (defun runtime-parts-for (os-name: str) -> (Vec str)
+  (if (= os-name "Wasi")
+    (conj (mapv wasi/adapt [RT-CORE RT-STR RT-ARRAY RT-VEC RT-VECBUILD RT-ATOM RT-THREAD RT-TASK RT-WEAK RT-IO RT-SYS RT-ALLOC]) (wasi/shim))
+    (runtime-parts-posix os-name)))
+
+(defun runtime-parts-posix :private (os-name: str) -> (Vec str)
   [(os/sys-for os-name RT-CORE) RT-STR RT-ARRAY RT-VEC RT-VECBUILD RT-ATOM (os/sys-for os-name RT-THREAD) (os/sys-for os-name RT-TASK) RT-WEAK RT-IO
    (os/sys-for os-name RT-SYS) (os/sys-for os-name RT-ALLOC)])
 

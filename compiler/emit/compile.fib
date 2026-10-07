@@ -7,17 +7,19 @@
 ;; set and holds what needs no body, the runtime and `main`.
 ;; `compile-macro` (E11) is the macro-time module of one `defmacro` (macros/abi.rs's text is emit.macros.abi's).
 (ns emit.compile
-  (:require [emit.defs.astmod :as am] [emit.cpucheck :as cc])
-  (:use types.ty types.table types.decls types.program own.program emit.value emit.names emit.objects emit.statics emit.program emit.inits
+  (:require [fib.string :as s] [emit.defs.astmod :as am] [emit.cpucheck :as cc] [emit.wasi :as wasi] [expand.targetos :as tos])
+  (:use types.ty types.table types.decls types.init types.program own.program emit.value emit.names emit.objects emit.statics emit.program emit.inits
         emit.assemble emit.defs.mod emit.lower.cx emit.lower.mod emit.macros.abi types.target))
 
 ;; The text of a macro module. Rust: compile.rs:88 MacroModule
 (defstruct MacroModule (text: str))
 
+;; With FIB_RESULT_STDOUT=1 an executable prints its result as `fibc run` does and exits 0, instead of returning it as the status (a status keeps 8 bits): the harness of a target
+;; that cannot run the case under `fibc run` (compiler/tests/wasm/suite.py) reads the result from standard output.
 ;; The fixed end of a module: `main`, which §8.8 has join every thread still running before the result is printed (fibc run) or
 ;; returned (an executable), calling the program's entry function. Rust: compile.rs:296 main_text
 (defun main-text :private (entry: str executable: bool init: str check: str uw: bool) -> str
-  (let ((end (if executable
+  (let ((end (if (and executable (not (= (sys-getenv "FIB_RESULT_STDOUT") (some "1"))))
                  "(ret (trunc i32 r))"
                  "(call @printf (string \"%lld\\n\") r)\n      (ret (i32 0))")))
     (str-join ["(declare printf i32 (ptr ...))\n(define (main i32) ((i32 argc) (ptr argv))\n  (block entry\n    " check "(call @fib.init)\n"
@@ -31,6 +33,17 @@
   (if (empty? (filter (fn (d: i64) (. (g-def (program-g p) d) constant)) (all-def-ids p)))
       (Ok (defs-new))
       (emit-defs p)))
+
+;; The constant `def`s of a program for a target whose pointers are not the host's: they are evaluated by the JIT, which runs on the host, so the program is
+;; laid out and lowered for the host while it makes them, and the constants come back as text (struct constants: LLVM lays them out for the target). The program
+;; the rest is lowered for is a fresh one at the target's pointer width (`program-rebuilt`: the bodies, closures and vtables the JIT's pass made are lowered again).
+(defun make-defs-at :private (p: Program) -> (Result (Pair Program Defs) str)
+  (let ((pb (program-pb p)))
+    (if (or (= pb 8) (empty? (filter (fn (d: i64) (. (g-def (program-g p) d) constant)) (all-def-ids p))))
+        (try-let ((d (make-defs p))) (Ok (Pair p d)))
+        (do (set! (. p pb) 8)
+            (try-let ((d (emit-defs p)))
+              (Ok (Pair (program-rebuilt p pb) d)))))))
 
 ;; The `main` section: the init functions, then `main` calling the entry. Nothing in it depends on a body being emitted. An executable for x86-64
 ;; Linux first checks that the CPU has what it was built for (emit.cpucheck, docs/adr/0008).
@@ -64,14 +77,14 @@
     ((some main)
      (let ((p (emit.program/program-new typed owned)))
        (try-let ((_ (inits-plan p)))
-         (match (make-defs p)
+         (match (make-defs-at p)
            ((Err m) (pending-or-error p (body-name (program-g p) (BodyFun main) []) executable m))
-           ((Ok defs)
-            (do (set! (. p def-values) (merge @(. p def-values) @(. defs values)))
-                (let ((entry (program-request p (BodyFun main) [])))
-                  (match (emit-all p)
-                    ((Ok _) (verified p defs (Module (module-parts p @(. defs text)) (main-part p entry executable) nil)))
-                    ((Err m) (pending-or-error p entry executable m))))))))))))
+           ((Ok [q defs])
+            (do (set! (. q def-values) (merge @(. q def-values) @(. defs values)))
+                (let ((entry (program-request q (BodyFun main) [])))
+                  (match (emit-all q)
+                    ((Ok _) (verified q defs (Module (module-parts q @(. defs text)) (main-part q entry executable) nil)))
+                    ((Err m) (pending-or-error q entry executable m))))))))))))
 
 ;; The module's `(target (cpu ..) (features ..))` form (spec/lir.md 4.5) for the target the front end was told: the CPU the checker chose its lane
 ;; counts for, so that `lair` builds for the CPU the program was checked against. Nothing when the checker was told none (its unit tests).
@@ -80,19 +93,92 @@
     (nil "")
     ((some t) (str-join ["(target (cpu \"" (. t cpu) "\")" (if (= (. t features) "") "" (str-join [" (features \"" (. t features) "\")"])) ")\n"]))))
 
+;; --- exported functions (docs/design/wasm.md 5): `fibc build --export NAME[=SYMBOL]` makes the function NAME of the program a symbol of the object that the host can call,
+;; with the C convention and scalar or raw pointer arguments. There is no `main`: the module is a library, its runtime starts on the first call (`fib.export-ready`).
+(defun export-specs () -> (Vec (Pair str str))
+  (match (sys-getenv "FIB_EXPORTS")
+    (nil [])
+    ((some t)
+     (vec (mapv (fn (w: str) (match (str-find w "=" 0)
+                               ((some i) (Pair (str-slice w (+ i 1) (str-len w)) (str-slice w 0 i)))
+                               (nil (Pair w w))))
+                (filter (fn (w: str) (not (= w ""))) (s/split t ",")))))))
+
+;; The header of the lowered body `name`: its result type and the parameters `((T n) ..)`, from the text of the function. Only a function that is not generic, takes no
+;; hidden slot (a program that catches returns a failure next to the value) and has a scalar or raw pointer for each of them can be exported.
+(defun export-header :private (p: Program name: str) -> (Result (Pair str str) str)
+  (let ((prefix (str-join ["(define internal tailcc (" name " "])))
+    (match (first (filter (fn (f: str) (starts-with? f prefix)) @(. p funcs)))
+      (nil (Err (str-join ["export: no code for " name])))
+      ((some f)
+       (let ((line (match (str-find f "\n" 0) ((some i) (str-slice f 0 i)) (nil f)))
+             (from (str-len prefix)))
+         (match (str-find line ") (" from)
+           (nil (Err (str-join ["export: cannot read the signature of " name])))
+           ((some i) (Ok (Pair (str-slice line from i) (str-slice line (+ i 2) (- (str-len line) 0)))))))))))
+
+(defun scalar-word? :private (w: str) -> bool
+  (some? (first (filter (fn (x: str) (= x w)) ["i1" "i8" "i16" "i32" "i64" "float" "double" "ptr" "void"]))))
+
+;; The parameter names of `((T a) (U b))`, and whether every type is one an export takes.
+(defun export-params :private (ps: str) -> (Result (Vec str) str)
+  (let ((inner (str-slice ps 1 (- (str-len ps) 1))))
+    (let ((chunks (filter (fn (c: str) (not (= (s/trim c) ""))) (s/split inner ")"))))
+      (let ((words (mapv (fn (c: str) (s/split (s/trim (str-slice (s/trim c) 1 (str-len (s/trim c)))) " ")) chunks)))
+        (if (every? (fn (w: (Vec str)) (and (= (count w) 2) (scalar-word? (nth w 0)))) words)
+          (Ok (mapv (fn (w: (Vec str)) (nth w 1)) words))
+          (Err "export: every parameter must be an integer, a float or a raw ptr"))))))
+
+(defun export-wrapper :private (p: Program sym: str name: str) -> (Result str str)
+  (try-let ((h (export-header p name)))
+    (let ((ret (. h fst)) (ps (. h snd)))
+      (if (not (scalar-word? ret))
+        (Err (str-join ["export: " sym " must return an integer, a float, a raw ptr or nothing"]))
+        (try-let ((names (export-params ps)))
+          (let ((call (str-join ["(call @" name (str-join (mapv (fn (n: str) (str-join [" " n])) names)) ")"])))
+            (Ok (str-join ["(define (" sym " " ret ") " ps "\n  (block entry\n    (call @fib.export-ready)\n    "
+                           (if (= ret "void") (str-join [call "\n    (ret)"]) (str-join ["(let ((r " call "))\n      (ret r))"])) "))\n"]))))))))
+
+(defun export-ready :private (p: Program) -> str
+  (str-join ["(global internal fib.exported i32 (i32 0))\n"
+             "(define internal (fib.export-ready void) ()\n  (block entry (br (icmp eq (load i32 @fib.exported) (i32 0)) first done))\n"
+             "  (block first (store (i32 1) @fib.exported) (call @fib.init) (call @fib.set-args (i32 0) (ptr null))\n    "
+             (if (empty? @(. p inits)) "" "(call @fib.defs-init)") " (ret))\n  (block done (ret)))\n"]))
+
+;; The module of a library: the runtime, the program's functions reached from the exports, the wrappers and the init of the runtime on the first call.
+(defun compile-library :private (typed: TypedProgram owned: OwnedProgram specs: (Vec (Pair str str))) -> (Result Module str)
+  (let ((p (emit.program/program-new typed owned)))
+    (try-let ((_ (inits-plan p)))
+      (match (make-defs-at p)
+        ((Err m) (Err m))
+        ((Ok [q defs])
+         (do (set! (. q def-values) (merge @(. q def-values) @(. defs values)))
+             (try-let ((names (try-map (fn (s: (Pair str str))
+                                         (match (program-fun typed (. s snd))
+                                           (nil (Err (str-join ["export: the program has no function " (. s snd)])))
+                                           ((some f) (Ok (program-request q (BodyFun f) [])))))
+                                       specs))
+                       (_ (emit-all q))
+                       (wrappers (try-map (fn (i: i64) (export-wrapper q (. (nth specs i) fst) (nth names i))) (vec (range (count specs))))))
+               (Ok (Module (module-parts q @(. defs text)) (str-join [(inits-render q) (export-ready q) (str-join wrappers)]) nil)))))))))
+
+;; The module text as the target's runtime wants it: WASI's finishing pass (emit.wasi), nothing for the others.
+(defun for-target :private (text: str) -> str
+  (if (= (tos/target-platform-name) "Wasi") (wasi/finish text) text))
+
 ;; The lIR text of a whole program for `fibc run`: runtime, static data, bodies, and a `main` that prints the result.
 ;; Rust: compile.rs:47 compile
 (defun compile (typed: TypedProgram owned: OwnedProgram) -> (Result str str)
   (match (compile-module typed owned false)
     ((Err m) (Err m))
-    ((Ok m) (match (. m pending) ((some msg) (Err msg)) (nil (Ok (str-concat (target-form typed) (module-text m))))))))
+    ((Ok m) (match (. m pending) ((some msg) (Err msg)) (nil (Ok (for-target (str-concat (target-form typed) (module-text m)))))))))
 
 ;; The same for an executable, whose `main` returns the result as the process status and prints nothing (compiler.md §1).
 ;; Rust: compile.rs:53 compile_executable
 (defun compile-executable (typed: TypedProgram owned: OwnedProgram) -> (Result str str)
-  (match (compile-module typed owned true)
+  (match (let ((specs (export-specs))) (if (empty? specs) (compile-module typed owned true) (compile-library typed owned specs)))
     ((Err m) (Err m))
-    ((Ok m) (match (. m pending) ((some msg) (Err msg)) (nil (Ok (str-concat (target-form typed) (module-text m))))))))
+    ((Ok m) (match (. m pending) ((some msg) (Err msg)) (nil (Ok (for-target (str-concat (target-form typed) (module-text m)))))))))
 
 ;; The first `defmacro` of the program called `name`: its function id.
 (defun macro-index :private (g: Globals name: str) -> (Option i64)
@@ -150,6 +236,7 @@
       ((some f)
        (let ((p (emit.program/program-new typed owned)))
          (do (set! (. p macro-module) true)
+             (set! (. p pb) 8)
              (doseq [w (abi-widths)] (statics-keyword (. p statics) w))
              (match @(. g form)
                (nil (Err "the prelude defines no Form"))
