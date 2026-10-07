@@ -1,0 +1,121 @@
+;; fib.compress.lz4: the published vectors (the lz4 v1.10.0 CLI's frames, liblz4's blocks: lib/fib/compress/lz4/vectors.fib, made by scripts/gen-lz4-vectors.py), the xxHash32
+;; vectors, and the edge cases of the formats (docs/design/compress.md 8): every boundary where a length, an offset or a block changes how it is written.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.compress.types fib.compress.ops fib.compress.corpus fib.compress.lz4 fib.compress.lz4.mem
+               fib.compress.lz4.inspect fib.compress.lz4.vectors fib.compress.lz4.xxh32 fib.string)
+  (:require [fib.crypto :as c] [fib.string :as s]))
+
+(defn hex-bytes ([h: str] -> (Array i8) (match (c/unhex h) ((Ok b) b) ((Err _) (trap "bad hex in a vector")))))
+
+;; A recipe of the vector file: hex:H, zeros:N, rep:HEX:N, cat:a+b.
+(defun parts-of (s: str) -> (Vec str) (vec (s/split s ":")))
+(defun input-recipe (name: str) -> str (match (first (filter (fn (r: (Vec str)) (= (nth r 0) name)) (inputs))) ((some r) (nth r 1)) (nil "")))
+(defun expand (name: str) -> (Array i8)
+  (let [r (input-recipe name) ps (parts-of r) k (nth ps 0)]
+    (cond (= k "hex") (hex-bytes (if (> (count ps) 1) (nth ps 1) ""))
+          (= k "zeros") (zeros (unwrap-or (parse-long (nth ps 1)) 0))
+          (= k "rep") (let [p (hex-bytes (nth ps 1)) n (unwrap-or (parse-long (nth ps 2)) 0)] (fill n (fn (i: i64) (zext i64 (array-get p (rem i (array-len p)))))))
+          (= k "cat") (concat-bytes (vec (map expand (vec (s/split (nth ps 1) "+")))))
+          :else (trap (str "no input " name)))))
+(defn expand-any ([name: str] -> (Array i8) (if (starts-with? name "cat:") (concat-bytes (vec (map expand (vec (s/split (subs name 4) "+"))))) (expand name))))
+
+(defun dict-of (v: LzVector) -> (Array i8) (if (= (. v dict) "") (array 0 0i8) (expand (. v dict))))
+(defun opts-dict (v: LzVector) -> Options (with-dictionary (default-options) (dict-of v)))
+(defun legacy? (v: LzVector) -> bool (ends-with? (. v name) "legacy"))
+
+(defun frame-vector-ok? (v: LzVector chunk: i64) -> bool
+  (let [want (expand-any (. v input)) z (hex-bytes (. v compressed)) o (opts-dict v)]
+    (and (match (decompress (lz4) z o) ((Ok b) (bytes-eq b want)) ((Err _) false))
+         (or (legacy? v)
+             (match (decompress-chunks (lz4) o (split-sizes z [chunk])) ((Ok b) (bytes-eq b want)) ((Err _) false))))))
+
+(defun block-vector-ok? (v: (Vec str)) -> bool
+  (let [want (expand (nth v 1)) z (hex-bytes (nth v 2))]
+    (match (block-decompress z 268435456) ((Ok b) (bytes-eq b want)) ((Err _) false))))
+
+;; xxHash32 vectors from liblz4 itself: the content checksum of a frame of `data[i] = i mod 251`, the last four bytes after the end mark.
+(defun xxh-data (n: i64) -> (Array i8) (fill n (fn (i: i64) (rem i 251))))
+
+;; Streamed xxHash32 in three pieces equals the one-shot digest.
+(defun xxh-piece-ok? (n: i64) -> bool
+  (let [d (xxh-data n) x (xxh-new 0)]
+    (do (xxh-update! x d 0 (quot n 3)) (xxh-update! x d (quot n 3) (- n (quot n 3))) (= (xxh-digest x) (xxh32 d 0)))))
+(defun xxh-stream-failures () -> (Vec str)
+  (vec (map (fn (n: i64) (str "n=" n)) (filter (fn (n: i64) (not (xxh-piece-ok? n))) [0 1 15 16 17 31 32 33 100 4095 100000]))))
+
+;; Incompressible data of n bytes is stored as one literal run: 1 token byte, (n >= 15: 1 + (n - 15) / 255) length bytes, n literals. (A random array of up to a few hundred
+;; bytes has no repeated four bytes at the seeds used.)
+(defun literal-block-size (n: i64) -> i64 (if (>= n 15) (+ n (+ 2 (quot (- n 15) 255))) (+ n 1)))
+(defun literal-edge-failures () -> (Vec str)
+  (vec (filter (fn (x: str) (not (= x "")))
+               (map (fn (n: i64) (let [d (random-bytes (+ 77 n) n) z (block-compress d 1)]
+                                   (if (and (= (array-len z) (literal-block-size n)) (match (block-decompress z 100000) ((Ok b) (bytes-eq b d)) ((Err _) false))) "" (str "n=" n))))
+                    [0 1 2 3 4 5 11 12 13 14 15 16 17 18 269 270 271 272 524 525 526 780 781]))))
+
+;; A match at distance d: 8 bytes, d - 8 bytes that do not repeat, the 8 bytes again, 20 more.
+(defun at-distance (d: i64) -> (Array i8)
+  (let [x (random-bytes 5 8) mid (random-bytes 6 (- d 8)) tail (random-bytes 7 20)] (concat-bytes [x mid x tail])))
+
+(defun offset-failures (level: i64 ds: (Vec i64) want: (fn (i64) bool)) -> (Vec str)
+  (vec (filter (fn (x: str) (not (= x "")))
+               (map (fn (d: i64) (let [b (at-distance d) z (if (= level 1) (block-compress b 1) (block-compress-hc b level))
+                                       ok (and (match (block-decompress z 1000000) ((Ok r) (bytes-eq r b)) ((Err _) false)) (<= (max-offset z) 65535)
+                                               (want (max-offset z)))]
+                                   (if ok "" (str "d=" d " max offset " (max-offset z)))))
+                    ds))))
+
+;; A run of period p after 5 bytes: the encoder finds an overlapping match at offset p.
+(defun period-failures (level: i64) -> (Vec str)
+  (vec (filter (fn (x: str) (not (= x "")))
+               (map (fn (p: i64) (let [pat (random-bytes (+ 90 p) p) b (concat-bytes [(random-bytes 91 5) (pattern 90 p 200) (random-bytes 92 15)])
+                                       z (if (= level 1) (block-compress b 1) (block-compress-hc b level))
+                                       offs (offsets z)]
+                                   (if (and (match (block-decompress z 100000) ((Ok r) (bytes-eq r b)) ((Err _) false)) (some? (first (filter (fn (o: i64) (= o p)) offs)))) "" (str "p=" p))))
+                    [1 2 3 4 5 6 7 8 9 12 15 16 17]))))
+
+;; Hand-built blocks: a literal, an overlapping match of offset 1, a last sequence of literals.
+(defun built-block-ok? (hex: str want: str) -> bool
+  (match (block-decompress (hex-bytes hex) 1000) ((Ok b) (bytes-eq b (str-bytes want))) ((Err _) false)))
+
+(defspecs specs
+  (feature "fib.compress.lz4 published vectors"
+    (scenario "122 frames of the lz4 v1.10.0 CLI (every flag combination, dictionary, legacy, concatenated, skippable) decode to their inputs, one-shot and streamed in 1000-byte chunks"
+      (given [vs (frame-vectors)])
+      (then (expect = 122 (count vs))
+            (expect = [] (vec (map (fn (v: LzVector) (. v name)) (filter (fn (v: LzVector) (not (frame-vector-ok? v 1000))) vs))))))
+    (scenario "streamed in 1-byte chunks (the small ones)"
+      (given [vs (vec (filter (fn (v: LzVector) (< (str-len (. v compressed)) 3000)) (frame-vectors)))])
+      (then (expect = [] (vec (map (fn (v: LzVector) (. v name)) (filter (fn (v: LzVector) (not (frame-vector-ok? v 1))) vs))))
+            (expect = true (> (count vs) 40))))
+    (scenario "40 blocks of liblz4 (fast with acceleration 1 and 8, HC 3, 9, 12) decode to their inputs"
+      (given [vs (block-vectors)])
+      (then (expect = 40 (count vs))
+            (expect = [] (vec (map (fn (v: (Vec str)) (nth v 0)) (filter (fn (v: (Vec str)) (not (block-vector-ok? v))) vs))))))
+    (scenario "a legacy frame is refused by the streaming decoder as unsupported, not misread"
+      (given [v (first (filter (fn (v: LzVector) (legacy? v)) (frame-vectors)))])
+      (then (expect = :unsupported (match v ((some x) (match (decompress-chunks (lz4) (default-options) [(hex-bytes (. x compressed))]) ((Err e) (. e kind)) ((Ok _) :ok))) (nil :none)))))
+    (scenario "xxHash32: the published values of the empty and abc inputs, and a streamed digest in 3 pieces equals the one-shot one at every length around the 16-byte stripe"
+      (then (expect = [46947589 852579327] [(xxh32 (array 0 0i8) 0) (xxh32 (str-bytes "abc") 0)])
+            (expect = [] (xxh-stream-failures)))))
+  (feature "fib.compress.lz4 block and frame edges"
+    (scenario "incompressible data of n bytes is one literal run: 1 token byte, the length extension of 15, 270, 525 (255 steps), the literals"
+      (then (expect = [] (literal-edge-failures))))
+    (scenario "a match at distance 16 to 300 (255, 256) is found by the fast encoder (further away the skip acceleration steps over it, as liblz4 does), never above 65535"
+      (then (expect = [] (offset-failures 1 [16 17 24 100 255 256 300] (fn (m: i64) (> m 0))))))
+    (scenario "a match at distance 65535 is used (HC), one at 65536 is not and the data still round trips, and nothing exceeds 65535 at 65537 and 100000"
+      (then (expect = [] (offset-failures 12 [65535] (fn (m: i64) (= m 65535))))
+            (expect = [] (offset-failures 12 [65536 65537 100000] (fn (m: i64) (< m 65536))))
+            (expect = [] (offset-failures 1 [65536 65537 100000] (fn (m: i64) (< m 65536))))))
+    (scenario "overlapping matches: a run of period 1 to 17 is coded with offset = period, fast and HC, and decodes (the pattern is repeated byte-wise)"
+      (then (expect = [] (period-failures 1)) (expect = [] (period-failures 9))))
+    (scenario "the longest matches: a million zeros are a few KB (the length extension runs through ~3900 bytes of 255) and decode, and the output limit is exact"
+      (given [z (zeros 1000000) b (block-compress z 1)])
+      (then (expect = true (< (array-len b) 4100))
+            (expect = true (match (block-decompress b 1000000) ((Ok r) (bytes-eq r z)) ((Err _) false)))
+            (expect = true (match (block-decompress b 999999) ((Err e) (= (. e kind) :too-large)) ((Ok _) false)))))
+    (scenario "hand-built blocks: a literal and an overlapping match of offset 1, then the last literals"
+      (then (expect = true (built-block-ok? "11610100506162636465" "aaaaaaabcde"))))
+    (scenario "the bound of liblz4: compress-bound n = n + n/255 + 16, and a block never exceeds it, for 0, 1, 12, 13, 255, 65536 and random 100000 bytes"
+      (then (expect = [16 17 28 29 272 65809] (vec (map compress-bound [0 1 12 13 255 65536])))
+            (expect = true (every? (fn (n: i64) (<= (array-len (block-compress (random-bytes n n) 1)) (compress-bound n))) [0 1 12 13 255 65536 100000]))))))
+
+(defun main () -> i64 (run-main (specs)))
