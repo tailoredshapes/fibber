@@ -12,6 +12,10 @@
 (def mf-limit: i64 12)
 (def max-dist: i64 65535)
 
+;; liblz4's position hash on a 64-bit target (LZ4_hash5): the next FIVE bytes, (seq << 24) * 889523592379 >> 52, into a table of 4096 entries (hash log 12), whatever the size of the
+;; input: found against the reference by a simulation of LZ4_compress_generic that agrees with it on every one of 374 small inputs (scripts/lz4-sim.py).
+(defun hpos (sp: ptr i: i64 shift: i64) -> i64 (shr (unchecked-multiply (shl (rd64 sp i) 24) 889523592379) (u+ 32 shift)))
+
 (defun hash4 (v: i64 shift: i64) -> i64 (shr (bit-and (unchecked-multiply v 2654435761) 4294967295) shift))
 (defun tget (tp: ptr h: i64) -> i64 (rd32 tp (shl h 2)))
 (defun tput (tp: ptr h: i64 v: i64) -> unit (wr32 tp (shl h 2) v))
@@ -66,7 +70,7 @@
       (let [fwd (u+ ip step)]
         (if (and (not imm) (> fwd mf1))
           (put-seq sp anchor (u- iend anchor) dp op 0 0)
-          (let [h (hash4 (rd32 sp ip) shift) cand (u- (tget tp h) gen)]
+          (let [h (hpos sp ip shift) cand (u- (tget tp h) gen)]
             (do (tput tp h (u+ gen ip))
                 (if (valid? sp cand ip lo)
                   (let [b (back-eq sp ip cand anchor lo)
@@ -76,7 +80,7 @@
                         nip (u+ mip ml)]
                     (if (>= nip mf1)
                       (put-seq sp nip (u- iend nip) dp op2 0 0)
-                      (do (tput tp (hash4 (rd32 sp (u- nip 2)) shift) (u+ gen (u- nip 2)))
+                      (do (tput tp (hpos sp (u- nip 2) shift) (u+ gen (u- nip 2)))
                           (recur nip nip op2 1 nb0 true))))
                   (if imm (recur (u+ ip 1) anchor op 1 nb0 false)
                           (recur fwd anchor op (shr nb 6) (u+ nb 1) false))))))))))
@@ -85,5 +89,5 @@
   (let [iend (u+ s0 n) shift (u- 32 hlog)]
     (if (< n 13)
       (put-seq sp s0 n dp 0 0 0)
-      (do (tput tp (hash4 (rd32 sp s0) shift) (u+ gen s0))
+      (do (tput tp (hpos sp s0 shift) (u+ gen s0))
           (search sp lo iend dp tp gen shift (max 1 accel) (u+ s0 1) s0)))))
