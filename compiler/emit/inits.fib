@@ -7,14 +7,17 @@
 ;; `all-def-ids` is the Rust `defs::all_def_ids` (defs/mod.rs:50): emit.defs.mod's `def-ids` (the constants) is E10's.
 (ns emit.inits
   (:require [fib.string :as s])
-  (:use types.ty types.decls types.init types.program types.infer.mod own.program emit.value emit.program))
+  (:use types.ty types.decls types.init types.program types.infer.mod own.program emit.value emit.program emit.names))
 
 ;; Every `def` of the program, in the order the checker typed them, which is the order they are evaluated in (syntax §3.19).
 ;; Rust: defs/mod.rs:50 all_def_ids
 (defun all-def-ids (p: Program) -> (Vec i64)
   (vec (mapcat (fn (u: UnitRef) (match u ((UDef d) [d]) (_ []))) (. (. p typed) units))))
 
-;; Plans one `def`: nothing for a constant, else its slot, its body requested and its place among the inits.
+;; Plans one `def`: nothing for a constant, else its slot, its place among the inits and the name its body will have. The body is NOT requested here:
+;; `inits-request` does that once the constants are made. A requested body is lowered by the first `emit-all` (the one `emit-def` runs for the first
+;; constant), and a body that reads a constant `def` (`(def twice (* base 2))`) is lowered there before `base` has a value: "def base is read where it
+;; has no value" (LANG-2 item 4; a `def` that calls a function that reads one fails the same way).
 (defun plan-one :private (p: Program d: i64) -> (Result unit str)
   (let ((dd (g-def (program-g p) d)))
     (if (. dd constant)
@@ -25,17 +28,22 @@
            (try-let ((lt (program-lir p t)))
              (match lt
                ((some (LirDyn)) (Err (str-join ["def " (. dd name) ": a def made at run time holds a dyn value"])))
-               (_ (let ((body (program-request p (BodyDef d) []))
+               (_ (let ((body (body-name (program-g p) (BodyDef d) []))
                         (object (match lt ((some (LirPtr)) true) (_ false))))
                     (do (set! (. p def-slots) (assoc @(. p def-slots) d (DefValue (str-join ["def.slot." (str d)]) lt)))
                         (set! (. p inits) (conj @(. p inits) (Init d (. dd module) body object)))
                         (Ok ())))))))))))
 
-;; Chooses the `def`s made at run time, gives each its slot and requests its body. Runs before the constants are made, because a
-;; function a constant names may read one of these `def`s. Rust: inits.rs:57 plan
+;; Chooses the `def`s made at run time and gives each its slot. Runs before the constants are made, because a function a constant names may
+;; read one of these `def`s (it loads the slot). Rust: inits.rs:57 plan
 (defun inits-plan (p: Program) -> (Result unit str)
   (try-let ((_ (try-map (fn (d: i64) (plan-one p d)) (all-def-ids p))))
     (Ok ())))
+
+;; Requests the bodies of the planned inits: after the constants are made, so that what a body reads of them has its value (see `plan-one`).
+(defun inits-request (p: Program) -> unit
+  (do (doseq [i @(. p inits)] (program-request p (BodyDef (. i def-id)) []))
+      ()))
 
 ;; The zero a global of the type starts as. Rust: inits.rs:104 zero
 (defun slot-zero :private (l: LirTy) -> str
