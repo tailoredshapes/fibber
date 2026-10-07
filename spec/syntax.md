@@ -213,8 +213,10 @@ which the rules above leave open:
 - `\xNN` is at most `7F` (a string is UTF-8); `\u{..}` takes one to six
   hex digits naming a Unicode scalar value; after `\` in a character
   literal a character that cannot continue a symbol is the character
-  itself, otherwise the whole run must be one character or one of
-  `newline`, `space`, `tab`, `return`.
+  itself (`\(`, `\)`, `\[`, `\]`, `\{`, `\}`, `\"`, `\;`, `\'`, `\,`, `\@`, `\`` , `\~`, `\\`), otherwise the whole run must be one character or one of
+  `newline`, `space`, `tab`, `return` (so `\*` and `\a` are characters, and `\ab` is `BadCharLiteral`). LANG-2 re-checked the rule against
+  a report that `\*`, `\{` and `\'` read as `unclosed (`: the compiler's reader and the seed's (0.1.11) read them all, in 35 contexts
+  (case 8355).
 - Forms nest at most 1000 deep, counting every open delimiter, every
   pending prefix and every pending `#_`; deeper is a read error.
 
@@ -554,6 +556,14 @@ matched as `(Variant)` (**Decided**; §3.9). `match` is the only
 eliminator of enums and `Option` in the core; `nil?`,
 `some?`, `if-let`, `when-let` are prelude definitions over it.
 
+**Literal patterns** (case 8360): an integer (negative ones too), float, character, string, `bool` and keyword literal matches the value that is `=`
+to it, at the type of the scrutinee; a literal under a constructor, in a vector pattern and with `:as` is a literal pattern too. The values of these types
+are not enumerable, so a `match` whose clauses are literals is exhaustive only with a final `_` or symbol clause (`non-exhaustive match: missing _`, case
+8361). An unsuffixed integer literal pattern takes the scrutinee's width when that is `i8`, `i16` or `i32` and the literal fits it, and is the error
+`the literal 200 does not fit i8 (-128..127)` when it does not (types §1.1; cases 8356, 8359). There is **no or-pattern**: `(| 1 2)` is not a pattern, two
+literals sharing an arm are two clauses (LANG-2 did not add it: the pattern compiler, `emit.lower.pattern`, turns each clause into one test-and-bind sequence for one body, and alternatives
+would need the same bindings in each and a join of the sequences, which it has no form for; the cost is not "cheap").
+
 Evaluation: evaluate the scrutinee once; take the first clause whose
 pattern matches and whose guard, if it has one, is true; bind its
 variables; evaluate its body. A clause is tried in three stages: its
@@ -712,6 +722,25 @@ a macro emit `nil` through a quasiquote without a special case). There
 is no implicit lifting of `T` to `(Option T)` and no null of any other
 type (**Decided**, D3: every coercion the inference draft proposed
 made acceptance order-dependent, and `if-let` covers the idiom).
+
+### 3.9a A constructor as a value
+
+A constructor is a function of its fields, and a constructor named where a value is wanted, that is anywhere but the head of a call, is that
+function (**Decided**, owner, LANG-2: "they're just functions"). The checker's lowering to the typed tree (`types.lower.expr` `name-form`) writes it
+out as the `fn` it is: for a struct or a variant with `n > 0` fields, the symbol `C` is `(fn (c%1 .. c%n) (C c%1 .. c%n))`, the parameters being fresh names
+no program can write. Everything follows from that expansion and nothing is special-cased:
+
+- the types are inferred from the use, so a generic constructor stays generic: `(mapv some xs)` is `(Vec (Option T))` for `xs : (Vec T)`, `(mapv Ok xs)` is
+  `(Vec (Result T e))` with `e` fixed by the context, `(mapv Tagged xs)` is `(Vec Tagged)`;
+- the arguments are moved in, as in a call (types §6): the closure captures nothing, owns its parameters for the length of the call and gives them to
+  the object;
+- `partial`, `comp`, `apply`, `reduce`, `map`, `mapv`, `filter` and the like take it where they take a function, a `let` binds it, and a `def` may hold it
+  (`(def mk: (fn (str i64) Tagged) Tagged)`: not a constant expression, §3.19, since it is a `fn`, so it is made before `main`);
+- a variant without fields stays a value (`Dot`, `nil`, §3.9): there is no function to make;
+- a constructor in call position, `(C a b)`, is the constructor itself: the head of a call is not rewritten, so a call allocates no closure;
+- the arity is the number of fields: `(mapv Rect xs)` with `Rect` of two fields is `cannot unify (fn (i64 i64) Shape) with (fn (a) b)`, as for any
+  function of two parameters;
+- the name is resolved as any name is (§5): a constructor `:use`d from another module, or a local definition that shadows it, is the one named.
 
 ### 3.10 `defprotocol`, `impl`
 
@@ -1593,7 +1622,9 @@ fix the instantiation with its annotation, since its type is closed:
 annotation means `send` (types §1.4).
 
 Evaluation: before `main` runs, the `def`s of each module are evaluated
-in source order, modules in dependency order (§5); the value and every
+in source order, modules in dependency order (§5), and a `def` made at run time may read any `def` before it, constant or made, directly or
+through the functions it calls (**Decided**, LANG-2 item 4; cases 8367, 8368: the compiler used to lower the body of a made `def` before the constants
+before it had values, `def base is read where it has no value`); the value and every
 object reachable from it become **immortal** (types §8.2), exactly like
 a literal: no count, never freed, never written in place (§3.13). A
 named function as a value is its immortal constant closure (types
@@ -1909,7 +1940,11 @@ exported top-level names in unqualified. A name defined locally shadows a
 `:use`d one; two `:use`d modules exporting the same name make that name
 an error when referenced unqualified. The prelude is not counted as a
 second `:use`: a `:use`d module's name shadows the prelude's, as a local
-definition does.
+definition does. This holds for types as for functions: a module that defines a `Result` or a `Pair` of its own has its own in
+that module, and the prelude's is not reachable by that name there (**Decided**, LANG-2 item 7; there is no "reserved prelude name" error: a
+program that happens to use a name the prelude has is not wrong). When that makes an annotation fail the error says so: `type Result takes 0
+argument(s), not 2; the type Result of this module shadows the prelude's Result, which takes 2 (a definition shadows a prelude name, spec/syntax.md
+section 5): rename yours to use both` (cases 8365, 8366). The constructors of the prelude's type (`Ok`, `Err`) remain what they are.
 
 **Roots and re-exports** (**Proposed**, stdlib design §6.2, §7 E7). A
 *root* is a directory under which a module `a.b` is the file `a/b.fib`.

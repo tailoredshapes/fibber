@@ -1,0 +1,24 @@
+;; spec: syntax §1.1 (the character literal), §1.6 (the reader's rules)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; roots: ../../lib support
+;; Every single character after the backslash is itself, whatever it is: the brackets and braces, the quotes, the prefix characters, `;` and `,`. LANG-2
+;; reported `\*`, `\{` and `\'` as an `unclosed (`. The compiler's reader and the seed's (0.1.11) read them all, alone and in lists, vectors, maps, sets,
+;; quotes, syntax quotes, `#_`, patterns and macro arguments (a probe over thirty-one characters in thirty-five contexts found no failure, and the case below
+;; passes before and after the package), so this case pins the rule and is not a fix: it fails if any of them stops closing its list or reads as
+;; another character (they are compared with their code points, written as numbers).
+(ns main (:use tl.check))
+
+(defun code (c: char) -> i64 (sext i64 (char->i32 c)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (cs [\* \{ \} \' \( \) \[ \] \" \; \, \@ \` \~ \^ \# \% \& \\ \a])
+        (want [42 123 125 39 40 41 91 93 34 59 44 64 96 126 94 35 37 38 92 97]))
+    (do (check c (= (count cs) 20))
+        (check c (= (mapv code cs) want))
+        (check c (= (code \*) 42))
+        (check c (match [\' \'] ([a b] (= a b)) (_ false)))
+        (check c (= (count (str-chars (str \{ \* \'))) 3))
+        (checks-result c))))

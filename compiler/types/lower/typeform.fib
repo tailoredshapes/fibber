@@ -233,6 +233,15 @@
          (_ (try-let ((anns (arg-anns g m head args allow-self)))
               (applied-type g m head anns (. form pos)))))))))
 
+;; When the type `head` resolved to is a module's own and the prelude has a type of the same name: the sentence that says the definition shadows it (LANG-2 item 7;
+;; a `defstruct Result` of a program is not the prelude's `(Result a e)`, so `(Result i64 str)` is then an arity error that would otherwise be puzzling).
+(defun shadow-note :private (g: Globals m: i64 head: str id: i64) -> str
+  (match (if (= (. (g-ty g id) module) module-prelude) nil (g-type-name g module-prelude head))
+    (nil "")
+    ((some pid)
+     (str-join ["; the type " head " of this module shadows the prelude's " head ", which takes " (show (count (. (g-ty g pid) params)))
+                " (a definition shadows a prelude name, spec/syntax.md section 5): rename yours to use both"]))))
+
 ;; `(K A..)` once the arguments are resolved: a built-in constructor or a nominal type.
 (defun applied-type :private (g: Globals m: i64 head: str anns: (Vec TypeAnn) pos: Pos)
     -> (Result TypeAnn TypeError)
@@ -245,7 +254,7 @@
         (if (= arity (count anns))
             (Ok (ANominal id anns))
             (resolve-err pos (str-join ["type " head " takes " (show arity)
-                                        " argument(s), not " (show (count anns))]))))
+                                        " argument(s), not " (show (count anns)) (shadow-note g m head id)]))))
       (resolve-err pos (g-unknown g m SpType head "unknown type")))))
 
 ;; The arguments of the type constructor `head`: types, or colours at its colour
