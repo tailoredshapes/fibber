@@ -1,0 +1,24 @@
+;; spec: docs/design/dns.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll fib.dns.types) (:require [fib.dns.decode :as dec] [fib.dns.ip :as ip]))
+(defun unhex (t: str) -> (Array i8)
+  (let [clean (vec (filter (fn (c: i64) (>= (ip/hex-value c) 0)) (map (fn (i: i64) (zext i64 (str-byte-at t i))) (range (str-len t)))))
+        n (quot (count clean) 2) out (cell (array n 0i8))]
+    (do (dotimes (i n) (array-set! &out i (trunc i8 (+ (* 16 (ip/hex-value (nth clean (* 2 i)))) (ip/hex-value (nth clean (+ (* 2 i) 1))))))) @out)))
+(defun bad? (hex: str) -> bool (match (dec/decode (unhex hex)) ((Err _) true) ((Ok _) false)))
+(defun main () -> i64
+  (let [c (checks) good "1234 8180 0001 0001 0000 0000 03777777 076578616d706c65 03636f6d 00 0001 0001 c00c 0001 0001 0000003c 0004 5db8d822"]
+    (do (check c (not (bad? good)))
+        (check c (bad? ""))
+        (check c (bad? "1234 8180 ffff ffff ffff ffff"))
+        (check c (bad? "1234 0100 0001 0000 0000 0000 c00c 0001 0001"))
+        (check c (bad? "1234 0100 0001 0000 0000 0000 c010 0001 0001 03616263 00"))
+        (check c (bad? (str good " 00")))
+        (check c (bad? "1234 0100 0001 0000 0000 0000 40 61 00 0001 0001"))
+        (check c (bad? "1234 8180 0001 0001 0000 0000 03777777 076578616d706c65 03636f6d 00 0001 0001 c00c 0001 0001 0000003c 0003 5db8d8"))
+        (check c (every? (fn (cut: i64) (match (dec/decode (array-copy (unhex good) 0 cut)) ((Err _) true) ((Ok _) false))) (range (array-len (unhex good)))))
+        (checks-result c))))

@@ -1,0 +1,33 @@
+;; spec: docs/design/http.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll fib.http.types fib.http.body fib.http.client.types)
+  (:require [fib.http.client :as c] [fib.http.server :as sv] [fib.http.server.types :as st]))
+(defun handler (r: Request body: Body) -> st/Reply
+  (if (= (. r uri) "/skip") (st/Whole (text-of 200 "skipped"))
+    (loop [n 0 largest 0]
+      (match (next-chunk body)
+        ((Err _) (st/Whole (text-of 400 "error")))
+        ((Ok b) (if (= (array-len b) 0) (st/Whole (text-of 200 (str n ":" (> largest 0) ":" (array-len (. r body)))))
+                  (recur (+ n (array-len b)) (max largest (array-len b)))))))))
+(defun text-of (status: i64 t: str) -> Response (Response status {} (str-bytes t)))
+(defun producer (total: i64 piece: i64) -> (fn () (Option (Array i8)))
+  (let [sent (cell 0)] (fn () (if (>= @sent total) nil (let [n (min piece (- total @sent))] (do (set! sent (+ @sent n)) (some (array n 1i8))))))))
+(defun up (cl: Client url: str len: (Option i64) total: i64) -> str
+  (match (c/request-upload cl (StreamingRequest "PUT" url {} (producer total 50000) len)) ((Ok r) (str-from-bytes (. r body))) ((Err e) (str "ERR " (error-message e)))))
+(defun main () -> i64
+  (let [ch (checks)]
+    (match (sv/run-server-stream handler (with (st/default-options) (port 0)))
+      ((Err _) 1)
+      ((Ok srv) (match (c/build-http-client (default-options))
+        ((Err _) 2)
+        ((Ok cl) (let [base (str "http://127.0.0.1:" (sv/port srv))
+                       a (up cl (str base "/x") (some 1000000) 1000000) b (up cl (str base "/x") nil 1000000) s (up cl (str base "/skip") (some 300000) 300000) d (up cl (str base "/x") (some 3) 3)
+                       short (up cl (str base "/x") (some 10) 5)]
+                   (do (check ch (= a "1000000:true:0")) (check ch (= b "1000000:true:0")) (check ch (= s "skipped")) (check ch (= d "3:true:0"))
+                       (check ch (= short "ERR the request body producer delivered fewer bytes than its declared length"))
+                       (c/close-http-client cl) (sv/stop-server srv)
+                       (checks-result ch)))))))))

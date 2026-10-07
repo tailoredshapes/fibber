@@ -7,10 +7,12 @@
 (defun transport (r: Reader) -> Transport (. r t))
 ;; Bytes read from the stream and not yet consumed (a pooled connection with any is not reusable).
 (defun buffered (r: Reader) -> i64 (- (array-len @(. r buf)) @(. r pos)))
-(defun fill (r: Reader) -> (Result bool Error)
+(defun fill (r: Reader) -> (Result bool Error) (fill-with r 16384))
+;; heads and small bodies read 16 KiB (a bigger buffer per request costs more than it saves); a body read asks for 64 KiB
+(defun fill-with (r: Reader size: i64) -> (Result bool Error)
   (cond (> (buffered r) 0) (Ok true)
         @(. r eof) (Ok false)
-        :else (try-let [bytes (t-read (. r t) 65536)]
+        :else (try-let [bytes (t-read (. r t) size)]
                 (if (= (array-len bytes) 0) (do (set! (. r eof) true) (Ok false))
                     (do (set! (. r buf) bytes) (set! (. r pos) 0) (Ok true))))))
 (defun next-byte :private (r: Reader) -> (Result (Option i8) Error)
@@ -19,7 +21,7 @@
       (let [i @(. r pos)] (do (set! (. r pos) (+ i 1)) (Ok (some (array-get @(. r buf) i))))))))
 ;; Up to n bytes: what is buffered, else one read. The empty array is end of stream.
 (defun read-some (r: Reader n: i64) -> (Result (Array i8) Error)
-  (try-let [more (fill r)]
+  (try-let [more (fill-with r (if (> n 16384) 65536 16384))]
     (if (not more) (Ok (array 0 0i8))
       (let [start @(. r pos) take (min n (buffered r))]
         (do (set! (. r pos) (+ start take)) (Ok (array-copy @(. r buf) start (+ start take))))))))
