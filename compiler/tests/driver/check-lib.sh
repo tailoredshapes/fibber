@@ -26,6 +26,7 @@ mkdir -p "$S/tree"; cp -r lib "$S/tree/lib"
 } >> "$S/tree/lib/fib/char.fib"
 printf '(ns main (:require [fib.char :as c]))\n(defun main () -> i64 0)\n' > "$S/tree/main.fib"
 cd "$S/tree" || exit 2
+export FIB_LIB="$S/tree/lib"   # the gate exports FIB_LIB=<repository>/lib, which would win over the planted copy
 r=$("$FIBC" run main.fib 2>&1); rr=$?
 echo "run on the planted tree (nothing calls the faults): exit $rr: $(echo "$r" | head -1)"
 [ $rr -eq 0 ] || { echo "FAIL: run rejected an uncalled function (the demand check changed: update this script)"; exit 1; }
