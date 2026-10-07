@@ -1,0 +1,30 @@
+;; The CONNECT tunnel of an https request through an HTTP proxy (RFC 9110 9.3.6): open TCP to the PROXY (its name resolved by the client's resolver), send CONNECT host:port with the
+;; proxy credentials when there are some, read the proxy's answer, and hand back the same Transport, now a byte pipe to the origin, for the TLS factory to run its handshake over
+;; (the proxy sees the CONNECT line and the sizes, never the plaintext). A non-2xx answer is a ConnectError naming the proxy and the status, never the credentials; bytes the proxy
+;; sends before the client has spoken are refused (they would be taken for the start of the server's handshake).
+(ns fib.http.tunnel (:use fib.core fib.seq fib.coll fib.http.types fib.http.transport fib.http.reader fib.http.message fib.http.proxy) (:require [fib.http.tcp :as tcp] [fib.os.time :as time]))
+(defun where :private (p: Proxy) -> str (str (. p host) ":" (. p port)))
+(defun refused :private (p: Proxy status: i64) -> Error
+  (ConnectError (if (= status 407) (str "proxy " (where p) " requires (valid) proxy authentication (407)") (str "proxy " (where p) " refused CONNECT with status " status))))
+(defun answer :private (r: Reader p: Proxy) -> (Result unit Error)
+  (match (read-head r 16384 8192 101)
+    ((Err (Timeout _ _)) (Err (Timeout "connect" (where p))))
+    ((Err e) (Err (ConnectError (str "proxy " (where p) ": " (error-message e)))))
+    ((Ok nil) (Err (ConnectError (str "proxy " (where p) " closed the connection before answering CONNECT"))))
+    ((Ok (some text)) (match (parse-response-head text 100)
+      ((Err _) (Err (ConnectError (str "proxy " (where p) " sent an invalid answer to CONNECT"))))
+      ((Ok h) (cond (or (< (. h status) 200) (>= (. h status) 300)) (Err (refused p (. h status)))
+                    (> (buffered r) 0) (Err (ConnectError (str "proxy " (where p) " sent data before the tunnel was used")))
+                    :else (Ok ())))))))
+(defun establish :private (t: Transport host: str port: i64 p: Proxy ms: i64) -> (Result unit Error)
+  (do (t-deadline t (+ (time/clock-now) (* (max 1 ms) 1000000)))
+      (match (t-write t (connect-request host port p))
+        ((Err (Timeout _ _)) (Err (Timeout "connect" (where p))))
+        ((Err e) (Err (ConnectError (str "proxy " (where p) ": " (error-message e)))))
+        ((Ok _) (let [res (answer (reader t) p)] (do (t-deadline t 0) res))))))
+;; The dial of a client with a proxy for https: (dial host port ms) is a tunnel to host:port.
+(defun tunnel-dial (resolve: (fn :send (str) (Result (Vec str) Error)) p: Proxy) -> (fn :send (str i64 i64) (Result Transport Error))
+  (fn (host: str port: i64 ms: i64)
+    (match (tcp/connect-via resolve (. p host) (. p port) ms)
+      ((Err e) (Err e))
+      ((Ok t) (match (establish t host port p ms) ((Ok _) (Ok t)) ((Err e) (do (t-close t) (Err e))))))))

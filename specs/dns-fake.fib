@@ -2,7 +2,7 @@
 ;; (lower case). A Behaviour says what to answer (rcode, answers, authority) and what to do wrong: truncate the UDP answer (so the client must use TCP), ignore the first
 ;; `drop` UDP queries, delay the answer, and forge: `spoof` 1 sends a copy with the wrong ID first, 2 one with the wrong question, 3 one with the right ID and question
 ;; from ANOTHER socket (another source port: a connected client socket must not see it), each carrying the address 6.6.6.6, before the real answer. A query for a name with
-;; no row is NXDOMAIN with an SOA. The log (an Atom) gets "name|type|udp" or "...|tcp" for every query that was answered or dropped.
+;; no row is NXDOMAIN with an SOA. The log (an Atom) gets "name|type|udp|ID|source-port" or "name|type|tcp" for every query that was answered or dropped.
 (ns dns-fake (:use fib.core fib.seq fib.coll fib.dns.types)
   (:require [fib.dns.decode :as dec] [fib.dns.encode :as enc] [fib.os.net :as net] [fib.os.io :as io] [fib.os.time :as time] [fib.os.errors :as os]))
 (defstruct Behaviour (rcode: i64 answers: (Vec Rr) authority: (Vec Rr) truncate: bool drop: i64 spoof: i64 delay-ms: i64))
@@ -40,7 +40,7 @@
     ((Err _) counts)
     ((Ok q) (if (!= (count (. q questions)) 1) counts
       (let [qq (nth (. q questions) 0) key (key-of (. qq name) (. qq qtype)) b (unwrap-or (get bs key) (nx-behaviour)) seen (unwrap-or (get counts key) 0)]
-        (do (log-it log (str key "|udp"))
+        (do (log-it log (str key "|udp|" (. q id) "|" (. dg port)))
             (if (>= seen (. b drop)) (reply-udp fd other q b dg) ())
             (assoc counts key (+ seen 1))))))))
 (defun read-n :private (fd: i64 n: i64 deadline: i64 stop: (Atom bool)) -> (Option (Array i8))

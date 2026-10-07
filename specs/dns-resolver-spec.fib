@@ -3,7 +3,7 @@
 ;; the cache (hits, TTL expiry, negative entries), the search rules as the queries the server saw, IP literals, /etc/hosts, localhost. Every query the server saw is in its
 ;; log, so "asked once" and "asked again" are counts, not guesses. `fibc test specs/dns-resolver-spec.fib`.
 (ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.dns.types fib.dns.config fib.dns.resolve dns-fake)
-  (:require [fib.os.time :as time] [fib.os.errors :as os] [fib.os.net :as net] [fib.os.io :as io]))
+  (:require [fib.os.time :as time] [fib.os.errors :as os] [fib.os.net :as net] [fib.os.io :as io] [fib.dns.ip :as ip]))
 
 (defun conf (servers: (Vec Server) search: (Vec str) timeout-ms: i64 attempts: i64) -> ResolvConf (ResolvConf servers search 1 timeout-ms attempts))
 (defun resolver-of (port: i64 timeout-ms: i64 attempts: i64) -> Resolver
@@ -44,6 +44,13 @@
         r (new-resolver (default-dns-config (conf [(Server "127.0.0.1" (. dead port)) (Server "127.0.0.1" (. f port))] [] 400 1) []))
         out (show (resolve-host r host)) _ (stop f)]
     (Pair out (log-of f))))
+
+(defun field (entry: str i: i64) -> str (nth (ip/split-on entry 124) i))
+(defun distinct-of (log: (Vec str) i: i64) -> i64 (count (into #{} (mapv (fn (e: str) (field e i)) (filter (fn (e: str) (>= (count (ip/split-on e 124)) 5)) log)))))
+(defun many-lookups (n: i64) -> (Vec str)
+  (let [f (start (basic-table)) r (resolver-of (. f port) 400 1)
+        _ (dotimes (i n) (resolve-host r (str "n" i ".test"))) _ (stop f)]
+    (log-of f)))
 
 (defspecs specs
   (feature "answers"
@@ -96,6 +103,10 @@
     (scenario "forged answers alone, with no real one, end in a timeout, never in the forged address"
       (given [t {(key-of "s4.test" 1) (Behaviour 0 [(a-rr "s4.test" 60 "1.1.1.1")] [] false 100 1 0) (key-of "s4.test" 28) (Behaviour 0 [] [] false 100 1 0)} p (timed t "s4.test" 200 1)])
       (then (expect = "err:timeout" (. p fst)))))
+  (feature "query IDs and source ports"
+    (scenario "forty-eight queries use at least 40 distinct IDs and at least 40 distinct source ports (the IDs come from the platform's entropy, the ports from the kernel)"
+      (given [log (many-lookups 24)])
+      (then (expect = 48 (count log)) (expect = true (>= (distinct-of log 3) 40)) (expect = true (>= (distinct-of log 4) 40)))))
   (feature "the cache"
     (scenario "the second lookup is answered from the cache: the server saw each type once"
       (given [p (twice (basic-table) "a.test" 0)])
@@ -113,7 +124,7 @@
     (scenario "a short name is tried with each search domain first, then as it is"
       (given [t (merge (basic-table) {(key-of "svc.corp.test" 1) (answering [(a-rr "svc.corp.test" 60 "8.8.8.8")]) (key-of "svc.corp.test" 28) (nodata "test")})
               p (searched ["other.test" "corp.test"] 1 "svc" t)])
-      (then (expect = "ok:8.8.8.8," (. p fst)) (expect = true (starts-with? (first-of (. p snd)) "svc.other.test|")) (expect = true (some? (first (filter (fn (e: str) (= e "svc.corp.test|1|udp")) (. p snd)))))
+      (then (expect = "ok:8.8.8.8," (. p fst)) (expect = true (starts-with? (first-of (. p snd)) "svc.other.test|")) (expect = true (some? (first (filter (fn (e: str) (starts-with? e "svc.corp.test|1|udp")) (. p snd)))))
             (expect = 0 (count-prefix (. p snd) "svc|"))))
     (scenario "a name with ndots dots is tried as it is first"
       (given [p (searched ["corp.test"] 1 "a.test" (basic-table))])

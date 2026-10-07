@@ -2,14 +2,14 @@
 ;; after its response body was read to the end under keep-alive; it leaves the pool when it is taken, when it has been idle longer than the
 ;; idle timeout, when the origin already holds max-idle-per-host (the oldest goes) and when the client closes. The pool is local to its client
 ;; and thread, like the client: no global state (ADR 0013).
-(ns fib.http.client.pool (:use fib.core fib.seq fib.coll fib.http.types fib.http.transport fib.http.reader fib.http.client.types)
+(ns fib.http.client.pool (:use fib.core fib.seq fib.coll fib.http.types fib.http.transport fib.http.reader fib.http.proxy fib.http.client.types)
   (:require [fib.os.time :as time]))
-(defstruct Conn (key: str t: Transport r: Reader since: i64 fresh: bool))
+(defstruct Conn (key: str t: Transport r: Reader since: i64 fresh: bool proxy: (Option Proxy)))
 (defstruct Pool (idle: (Cell (Vec Conn)) opened: (Cell i64) reused: (Cell i64)))
 (defun new-pool () -> Pool (Pool (cell []) (cell 0) (cell 0)))
 (defun close-conn (c: Conn) -> unit (t-close (. c t)))
 (defun count-opened (p: Pool) -> unit (set! (. p opened) (+ @(. p opened) 1)))
-(defun conn-of (key: str t: Transport) -> Conn (Conn key t (reader t) 0 true))
+(defun conn-of (key: str t: Transport proxy: (Option Proxy)) -> Conn (Conn key t (reader t) 0 true proxy))
 (defun expired? :private (c: Conn o: Options now: i64) -> bool
   (and (> (. o idle-timeout-ms) 0) (> (- now (. c since)) (* (. o idle-timeout-ms) 1000000))))
 (defun sweep :private (p: Pool o: Options) -> unit

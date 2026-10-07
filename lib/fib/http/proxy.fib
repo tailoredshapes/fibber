@@ -1,0 +1,66 @@
+;; HTTP proxy settings for the client (docs/design/http.md, Proxies). Nothing here reads the environment unless the caller asks: `(proxy-from-env)` is an explicit
+;; option (libcurl honoured http_proxy implicitly; this client does not). A proxy is an http:// proxy (https proxies and SOCKS are refused, not guessed). Credentials from the
+;; proxy URL's userinfo become a Basic Proxy-Authorization VALUE held in the Proxy; `Proxy` derives no Debug and no error message of this package carries the URL or the
+;; value, so a log of an error or a value cannot leak them. Environment rules (curl's): the lower case http_proxy, https_proxy, no_proxy first, then HTTPS_PROXY and
+;; NO_PROXY; HTTP_PROXY only when REQUEST_METHOD is not set (httpoxy: a CGI request header Proxy: becomes HTTP_PROXY). no_proxy is a comma list: "*" is everything, a name
+;; matches itself and its subdomains (a leading "." or "*." is allowed), name:port restricts the port; CIDR ranges are not understood (a name or address must be listed).
+(ns fib.http.proxy (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.uri fib.http.url fib.http.wire) (:require [fib.os.environment :as env] [fib.string :as s]))
+(defstruct Proxy (host: str port: i64 auth: (Option str)))
+(defstruct ProxySettings (http: (Option Proxy) https: (Option Proxy) no-proxy: (Vec str)))
+(defun no-proxy () -> ProxySettings (ProxySettings nil nil []))
+(defun with-scheme :private (text: str) -> str (if (some? (str-find text "://" 0)) text (str "http://" text)))
+(defun credentials :private (info: (Option str)) -> (Result (Option str) Error)
+  (match info
+    (nil (Ok nil))
+    ((some i) (match (percent-decode i)
+      ((Err _) (Err (InvalidRequest "proxy credentials are not valid percent-encoding")))
+      ((Ok b) (Ok (some (str "Basic " (base64-encode b)))))))))
+;; "http://user:pass@host:3128", "host:3128" (taken as http) or "host" (port 1080, as curl). Errors never repeat the text.
+(defun parse-proxy-url (text: str) -> (Result Proxy Error)
+  (match (parse-url (with-scheme (trim-ows text)))
+    ((Err _) (Err (InvalidRequest "a proxy URL could not be parsed")))
+    ((Ok u) (cond (!= (. u scheme) "http") (Err (InvalidRequest (str "proxy scheme " (. u scheme) " is not supported: only http proxies")))
+                  (= (. u host) "") (Err (InvalidRequest "a proxy URL has no host"))
+                  :else (match (credentials (. u userinfo))
+                          ((Err e) (Err e))
+                          ((Ok auth) (Ok (Proxy (. u host) (match (. u port) ((some p) p) (nil 1080)) auth))))))))
+(defun lower (t: str) -> str (ascii-lower t))
+(defun entry-port :private (entry: str) -> (Pair str i64)
+  (let [at (str-rfind-colon entry)]
+    (if (< at 0) (Pair entry 0)
+      (let [digits (str-slice entry (+ at 1) (str-len entry))]
+        (if (and (> (str-len digits) 0) (not (some? (str-find entry "]" 0))) (every? (fn (i: i64) (let [c (zext i64 (str-byte-at digits i))] (and (>= c 48) (<= c 57)))) (range (str-len digits))))
+          (Pair (str-slice entry 0 at) (loop [i 0 n 0] (if (= i (str-len digits)) n (recur (+ i 1) (+ (* n 10) (- (zext i64 (str-byte-at digits i)) 48))))))
+          (Pair entry 0))))))
+(defun str-rfind-colon :private (t: str) -> i64 (loop [i (- (str-len t) 1)] (cond (< i 0) -1 (= (str-byte-at t i) 58i8) i :else (recur (- i 1)))))
+(defun strip-dots :private (e: str) -> str
+  (let [a (if (s/starts-with? e "*.") (str-slice e 2 (str-len e)) e)] (if (s/starts-with? a ".") (str-slice a 1 (str-len a)) a)))
+(defun entry-matches? :private (entry: str host: str port: i64) -> bool
+  (let [p (entry-port entry) name (strip-dots (lower (. p fst))) h (lower host)]
+    (and (> (str-len name) 0) (or (= (. p snd) 0) (= (. p snd) port)) (or (= h name) (s/ends-with? h (str "." name))))))
+(defun bypass? (patterns: (Vec str) host: str port: i64) -> bool
+  (some? (first (filter (fn (e: str) (or (= e "*") (entry-matches? e host port))) patterns))))
+;; The proxy for a request to scheme://host:port, or nil: no_proxy first, then the proxy of the scheme.
+(defun proxy-for (settings: ProxySettings scheme: str host: str port: i64) -> (Option Proxy)
+  (if (bypass? (. settings no-proxy) host port) nil
+    (if (= scheme "https") (. settings https) (if (= scheme "http") (. settings http) nil))))
+(defun patterns-of :private (text: str) -> (Vec str) (vec (filter (fn (e: str) (> (str-len e) 0)) (map trim-ows (s/split text "," -1)))))
+(defun first-set :private (get: (fn (str) (Option str)) names: (Vec str)) -> (Option str)
+  (loop [i 0] (if (= i (count names)) nil (match (get (nth names i)) ((some v) (if (= (str-len (trim-ows v)) 0) (recur (+ i 1)) (some v))) (nil (recur (+ i 1)))))))
+(defun parsed :private (v: (Option str)) -> (Option Proxy)
+  (match v (nil nil) ((some t) (match (parse-proxy-url t) ((Ok p) (some p)) ((Err _) nil)))))
+;; The settings of an environment given as a lookup function (a spec feeds a table; `proxy-from-env` feeds the process's). An unparsable value is ignored.
+(defun proxy-from-env-with (get: (fn (str) (Option str))) -> ProxySettings
+  (let [cgi (some? (get "REQUEST_METHOD"))]
+    (ProxySettings (parsed (first-set get (if cgi ["http_proxy"] ["http_proxy" "HTTP_PROXY"])))
+                   (parsed (first-set get ["https_proxy" "HTTPS_PROXY"]))
+                   (patterns-of (unwrap-or (first-set get ["no_proxy" "NO_PROXY"]) "")))))
+(defun proxy-from-env () -> ProxySettings (proxy-from-env-with (fn (n: str) (env/getenv n))))
+;; The request target of a proxied http request: the absolute URI without credentials and fragment (RFC 9112 3.2.2).
+(defun absolute-target (u: Url) -> str (url-string (with u (userinfo nil) (fragment nil))))
+;; The CONNECT request for a tunnel to host:port (RFC 9110 9.3.6): authority-form target, Host, the proxy credentials when there are some.
+(defun connect-request (host: str port: i64 proxy: Proxy) -> (Array i8)
+  (let [authority (if (some? (str-find host ":" 0)) (str "[" host "]:" port) (str host ":" port))
+        base {"host" [authority]}
+        headers (match (. proxy auth) (nil base) ((some a) (assoc base "proxy-authorization" [a])))]
+    (str-bytes (str "CONNECT " authority " HTTP/1.1\r\n" (str-join (header-lines headers)) "\r\n"))))

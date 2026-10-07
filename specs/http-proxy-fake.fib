@@ -1,0 +1,63 @@
+;; An in-process HTTP proxy for the proxy specs: one acceptor task and one task per connection over real loopback sockets. It logs "request-line|Proxy-Authorization value or -"
+;; for every request head it reads. With `want-auth` set it answers 407 to a request without exactly that Proxy-Authorization value. CONNECT host:port opens a TCP connection to
+;; that address, answers 200 and relays bytes both ways until either side closes. Anything else (absolute-form) is answered by the proxy itself with a 200 whose body is the
+;; request line, so a spec sees what the client sent without an origin.
+(ns http-proxy-fake (:use fib.core fib.seq fib.coll fib.dns.ip)
+  (:require [fib.os.net :as net] [fib.os.io :as io] [fib.os.time :as time] [fib.string :as s]))
+(defstruct ProxyFake (port: i64 log: (Atom (Vec str)) stop: (Atom bool) task: (Task i64) kids: (Atom (Vec (Task i64)))))
+(defun read-head :private (fd: i64 deadline: i64 stop: (Atom bool)) -> (Option str)
+  (loop [acc ""]
+    (if (some? (str-find acc "\r\n\r\n" 0)) (some acc)
+      (match (net/wait-readable fd deadline stop)
+        ((Err _) nil)
+        ((Ok _) (match (io/read-fd fd 1)
+          ((Err _) nil)
+          ((Ok b) (if (= (array-len b) 0) nil (recur (str acc (str-from-bytes b)))))))))))
+(defun header-of :private (head: str name: str) -> str
+  (let [lines (s/split head "\r\n" -1)]
+    (unwrap-or (first (filter (fn (v: str) (not (= v ""))) (map (fn (l: str) (if (starts-with? (hb-lower l) (str name ":")) (s/trim (str-slice l (+ (str-len name) 1) (str-len l))) "")) lines))) "-")))
+(defun hb-lower :private (t: str) -> str (let [out (cell (array (str-len t) 0i8))] (do (dotimes (i (str-len t)) (let [c (zext i64 (str-byte-at t i))] (array-set! &out i (trunc i8 (if (and (>= c 65) (<= c 90)) (+ c 32) c))))) (str-from-bytes @out))))
+(defun send-text :private (fd: i64 text: str stop: (Atom bool)) -> unit (do (net/send-all fd (str-bytes text) 3000 stop) ()))
+(defun pump :private (a: i64 b: i64 stop: (Atom bool)) -> unit
+  (loop [idle 0]
+    (if (or @stop (> idle 150)) ()
+      (let [ra (net/ready? a false 10) rb (net/ready? b false 10)]
+        (cond (match ra ((Ok true) true) (_ false))
+                (match (io/read-fd a 4096) ((Ok x) (if (= (array-len x) 0) () (do (net/send-all b x 3000 stop) (recur 0)))) ((Err _) ()))
+              (match rb ((Ok true) true) (_ false))
+                (match (io/read-fd b 4096) ((Ok x) (if (= (array-len x) 0) () (do (net/send-all a x 3000 stop) (recur 0)))) ((Err _) ()))
+              :else (recur (+ idle 1)))))))
+(defun authority-parts :private (t: str) -> (Pair str i64)
+  (let [k (loop [i (- (str-len t) 1)] (cond (< i 0) -1 (= (str-byte-at t i) 58i8) i :else (recur (- i 1))))]
+    (Pair (str-slice t 0 k) (number-of (str-slice t (+ k 1) (str-len t)) 10 5))))
+(defun relay :private (fd: i64 target: str stop: (Atom bool)) -> unit
+  (let [hp (authority-parts target)]
+    (match (net/connect-tcp (. hp fst) (. hp snd) 2000)
+      ((Err _) (send-text fd "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" stop))
+      ((Ok up) (do (send-text fd "HTTP/1.1 200 Connection established\r\n\r\n" stop) (pump fd up stop) (io/close-fd up) ())))))
+(defun answer :private (fd: i64 head: str want-auth: str log: (Atom (Vec str)) stop: (Atom bool)) -> unit
+  (let [line (nth (s/split head "\r\n" -1) 0) parts (s/split line " " -1) auth (header-of head "proxy-authorization")]
+    (do (swap! log (fn (v: (Vec str)) (conj v (str line "|" auth))))
+        (cond (and (!= want-auth "") (!= auth want-auth))
+                (send-text fd "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"t\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" stop)
+              (= (nth parts 0) "CONNECT") (relay fd (nth parts 1) stop)
+              :else (send-text fd (str "HTTP/1.1 200 OK\r\nContent-Length: " (str-len line) "\r\nConnection: close\r\n\r\n" line) stop)))))
+(defun connection :private (fd: i64 want-auth: str log: (Atom (Vec str)) stop: (Atom bool)) -> i64
+  (do (match (read-head fd (+ (time/clock-now) 3000000000) stop) (nil ()) ((some head) (answer fd head want-auth log stop))) (io/close-fd fd) 0))
+(defun accept-loop :private (listener: i64 want-auth: str log: (Atom (Vec str)) stop: (Atom bool) kids: (Atom (Vec (Task i64)))) -> i64
+  (loop []
+    (if @stop 0
+      (match (net/ready? listener false 20)
+        ((Ok true) (match (net/accept-tcp listener)
+          ((Ok a) (let [fd (. a fd) t (spawn (fn () (connection fd want-auth log stop)))] (do (swap! kids (fn (v: (Vec (Task i64))) (conj v t))) (recur))))
+          ((Err _) (recur))))
+        (_ (recur))))))
+(defun start (want-auth: str) -> ProxyFake
+  (match (net/listen-tcp "127.0.0.1" 0 16)
+    ((Err e) (trap (. e message)))
+    ((Ok l) (let [log (atom []) stop (atom false) kids (atom []) fd (. l fd)]
+              (ProxyFake (. l port) log stop (spawn (fn () (let [r (accept-loop fd want-auth log stop kids)] (do (io/close-fd fd) r)))) kids)))))
+(defun stop (p: ProxyFake) -> i64
+  (do (reset! (. p stop) true) (join (. p task))
+      (dotimes (i (count @(. p kids))) (join (nth @(. p kids) i))) 0))
+(defun log-of (p: ProxyFake) -> (Vec str) @(. p log))
