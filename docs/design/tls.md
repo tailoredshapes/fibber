@@ -160,7 +160,7 @@ host-name and constraint cases (`tls-names-spec`), Wycheproof's signature and ke
 - No revocation; no certificate policies; no CT; no pinning.
 - **Secrets are not zeroised**: traffic secrets, keys and IVs live in ordinary `(Array i8)` values that the allocator frees without clearing. Only the provider's own buffers are cleansed
   (the driver does). Nothing in the language today can wipe an array in place and be sure the optimiser keeps the write; a `fib.crypto` primitive for it (a provider operation) is the way.
-- Every record seal/open crosses the provider with the key and nonce (the OpenSSL driver fetches the cipher per call: the known 25-40% at 16 KiB records of docs/shootout/crypto.md).
+- Every record seal/open crosses the provider with the key and nonce (the OpenSSL driver fetches the cipher per call: the known 25-40% at 16 KiB records found by the driver's benchmark, docs/design/crypto.md section 10).
 - Hostnames: a trailing dot on the reference is dropped; internationalised names must be given as A-labels; no Unicode processing.
 - The post-handshake deadline is the stream's `set-deadline`; there is no separate idle timer.
 

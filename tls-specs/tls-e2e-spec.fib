@@ -138,6 +138,18 @@
     (if (and (every? (fn (o: str) (= o "truncated")) (vec (take recsize outcomes))) (= (nth outcomes recsize) "full")) ""
       (str "cutting a record: " (pr-str (vec (distinct outcomes)))))))
 
+;; ---- deadlines: the handshake runs under one set on the stream and clears it; a stream that times out is a timeout
+(defstruct Seen2 (xs: (Cell (Vec i64))))
+(defun deadline-text (p: openssl/OpenSsl) -> str
+  (let [srv (new-srv (plain [])) sn (Seen2 (cell [])) base (client-io p srv)
+        io (Io (. base read) (. base write) (. base close) (fn (at: i64) (set! (. sn xs) (conj @(. sn xs) at))))]
+    (match (connect p (cfg "good.example") io)
+      ((Err e) (tag e))
+      ((Ok _) (let [xs @(. sn xs)] (if (and (= (count xs) 2) (> (nth xs 0) 0) (= (nth xs 1) 0)) "" (str "deadlines " (pr-str xs))))))))
+(defun timeout-text (p: openssl/OpenSsl) -> str
+  (match (connect p (cfg "good.example") (Io (fn (n: i64) (Err (TlsTimeout "no data"))) (fn (b: (Array i8)) (Ok ())) (fn () ()) (fn (at: i64) ())))
+    ((Err e) (tag e)) ((Ok _) "connected")))
+
 (defspecs specs
   (feature "a full handshake and data both ways, in each cipher suite"
     (scenario "TLS_AES_128_GCM_SHA256" (given [p (provider)]) (then (expect = "" (suite-text p suite-aes-128-gcm-sha256 ":aes-128-gcm/:sha-256"))))
@@ -146,6 +158,9 @@
     (scenario "ALPN: selected when offered, an error when the server picks another" (given [p (provider)]) (then (expect = "" (alpn-text p))))
     (scenario "handshake messages in 1-byte records, all in one record, with a CertificateRequest" (given [p (provider)]) (then (expect = "" (shapes-text p))))
     (scenario "a CertificateRequest is answered with an empty Certificate that the server accepts" (given [p (provider)]) (then (expect = "" (cert-request-text p)))))
+  (feature "deadlines"
+    (scenario "the handshake sets a deadline on the stream and clears it afterwards" (given [p (provider)]) (then (expect = "" (deadline-text p))))
+    (scenario "a stream that times out during the handshake is a timeout" (given [p (provider)]) (then (expect = "timeout" (timeout-text p)))))
   (feature "a server that breaks its flight"
     (scenario "each of 8 breaks is a typed error, never success" (given [p (provider)]) (then (expect = "" (tamper-text p)))))
   (feature "after the handshake"

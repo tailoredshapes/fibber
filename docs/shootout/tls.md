@@ -27,11 +27,11 @@ The handshake costs the client one X25519 key generation and agreement, one ECDS
 | TLS_AES_128_GCM_SHA256 | 633, 607, 536 MB/s | 1268, 2028, 1738 MB/s | 2244, 2123, 2240 MB/s |
 | TLS_CHACHA20_POLY1305_SHA256 | 537, 533, 535 MB/s | 1394, 1440, 1242 MB/s | 1478, 1440, 1250 MB/s |
 
-(Three runs each, in the order run.) `fib.tls` reads at about **2.5-4x less than OpenSSL's own client for AES-GCM** and 2.5-2.9x less for ChaCha20-Poly1305. The gap is expected and is not
+(Three runs each, in the order run.) `fib.tls` reads at about **2-4x less than OpenSSL's own client or curl for AES-GCM** and 2.3-2.8x less for ChaCha20-Poly1305. The gap is expected and is not
 the AEAD: the AEAD itself is the same libcrypto code. Where it goes, in the order the code makes it likely (not profiled: not yet measured, so do not trust this order):
 
 1. **A provider call per 16 KiB record** that fetches the cipher, creates and frees a context and copies the record into and out of driver buffers: the known per-call cipher-fetch overhead
-   of the OpenSSL driver, 25-40 % at 16 KiB records in `docs/shootout/crypto.md`'s own measurement (an incremental or context-reusing AEAD in the provider protocol would remove it).
+   of the OpenSSL driver, 25-40 % at 16 KiB records, as the driver's own benchmark (`scripts/bench-pk.sh` in fib-crypto-openssl; docs/design/crypto.md section 10) found (an incremental or context-reusing AEAD in the provider protocol would remove it).
 2. **Byte-at-a-time copies in fibber**: there is no array blit (section 11 of docs/design/tls.md); `record.fib` copies the record out of the input buffer, the plaintext out of the
    decrypted array, and the input buffer's remainder after every record, each as an element loop. A 64 KiB read is four records and about a dozen such copies.
 3. The nonce XOR and the inner-type scan are per record and small.
