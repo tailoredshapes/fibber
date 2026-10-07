@@ -53,6 +53,6 @@ echo "mutant-serve: building the $MODE mutant ..."
 cd "$R" || exit 2
 if [ "$TEST" = serve ]; then FIB_LIB="$R/lib" "$R/compiler/tests/serve/run.sh" "$OUT/F" > "$OUT/test.log" 2>&1; else "$R/compiler/tests/repl/run.sh" "$OUT/F" > "$OUT/test.log" 2>&1; fi
 rc=$?
-grep -E '^FAIL' "$OUT/test.log" | head -5
+grep -E '^FAIL' "$OUT/test.log" | head -5 || true  # pipe-ok: a short failure listing
 if [ $rc -ne 0 ]; then echo "mutant-serve: $MODE KILLED by the $TEST test (exit $rc)"; exit 0; fi
 echo "mutant-serve: $MODE SURVIVED: the $TEST test passed under the mutant"; exit 1

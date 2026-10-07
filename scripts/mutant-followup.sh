@@ -4,7 +4,7 @@
 # by the timeout and counts as failed). A case that still passes survived. The library is read from source, so no stage 2 is built.
 # usage: scripts/mutant-followup.sh [MODE..]        (default: all)
 #   MODE            what is broken                                                                                       cases that must fail
-#   pd-tie          Eisel-Lemire: an exact halfway case rounds up, not to even                                           8280-
+#   pd-clinger          Clinger fast path accepts a mantissa past 2^53 and 18 digits (double rounding)                         8280-
 #   pd-junk         parse-double: trailing text after a number is accepted ("12abc")                                      8280-
 #   pd-hex          parse-double: the digits scan accepts the letters a to f (hex digits)                                 8280-
 #   int-range       try-parse-int: a value past the i32 range is not refused                                              8281-
@@ -22,7 +22,7 @@ FIBC=${FIBC:-}
 [ -x "$FIBC" ] || { echo "mutant-followup: no fibc: set FIBC to an executable" >&2; exit 2; }
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-followup}
 MODES=("$@")
-[ ${#MODES[@]} -gt 0 ] || MODES=(pd-tie pd-junk pd-hex int-range or-else-eager or-trap-msg replace-first replace-split split-limit trim-cr)
+[ ${#MODES[@]} -gt 0 ] || MODES=(pd-clinger pd-junk pd-hex int-range or-else-eager or-trap-msg replace-first replace-split split-limit trim-cr)
 survived=0
 ulimit -v 16000000
 
@@ -37,7 +37,7 @@ for MODE in "${MODES[@]}"; do
   rm -rf "$OUT/tree"; mkdir -p "$OUT/tree/cases" "$OUT/tmp"; export TMPDIR=$OUT/tmp
   cp -r "$R/lib" "$OUT/tree/"; cp -r "$R/cases/stdlib" "$OUT/tree/cases/"
   case $MODE in
-    pd-tie)        CASE=8280-; mut lib/fib/core/eisel.fib 's/\(= \(bit-and mant 3\) 1\)/(= (bit-and mant 3) 7)/' ;;
+    pd-clinger)        CASE=8280-; mut lib/fib/core/decimal.fib 's/\(<= nd 15\)/(<= nd 18)/; s/\(<= w 9007199254740992\)/(>= w 0)/' ;;
     pd-junk)       CASE=8280-; mut lib/fib/core/decimal.fib 's/\(or \(and has-e \(= i3 jx\)\) \(< i3 n\)\)/(and has-e (= i3 jx))/' ;;
     pd-hex)        CASE=8280-; mut lib/fib/core/decimal.fib 's/\(if \(and \(>= b 48\) \(<= b 57\)\) \(recur/(if (and (>= b 48) (<= b 102)) (recur/' ;;
     int-range)     CASE=8281-; mut lib/fib/core/parse.fib 's/\(if \(< next least\) nil \(recur \(\+ j 1\) next\)\)/(recur (+ j 1) next)/' ;;

@@ -3,16 +3,19 @@
 ;;  - the grammar is the page's: `[+-]? (digits ['.' digits*] | '.' digits) ([eE] [+-]? digits)?`, or exactly one of `NaN`, `Infinity`, `-Infinity`.
 ;;    Everything else is nil, never a trap: hex (`0x1p3`), a leading or trailing space, `inf`, `+Infinity` (the page names three), a trailing `d` or `f`
 ;;    (Java's Double.parseDouble takes it; the page does not), `.`, `e5`, `1e`, `` and `-`. The page decides where Java and the page differ.
-;;  - the value is correctly rounded (to nearest, ties to even): Clinger's exact fast path (at most 15 significant digits and a power of ten up to 22),
-;;    else Eisel-Lemire (fib.core.eisel, shared with fib.json), else libc's strtod on a NUL-terminated copy of the token (fib.os.decimal, the platform
-;;    layer; ADR 0011 keeps `extern` out of fib.core). A result past the largest double is `Infinity` and a result below the least subnormal is a zero
-;;    that keeps its sign (`-1e-400` is `-0.0`), as Java and strtod give. `-0` and `-0.0` are `-0.0`.
-;;  - Dependency direction (resolved here): fib.json already depends on fib.core, so the shared parser could not stay under fib.json: eisel.fib and pow5.fib
-;;    moved to fib.core.eisel and fib.core.pow5 and fib.json.number requires them from there; the core never requires the explicit library.
-;;  - a mantissa of more than 18 significant digits goes to strtod (Eisel-Lemire takes a mantissa below 2^63), as fib.json's does.
-(ns fib.core.decimal (:require [fib.core.eisel :as el] [fib.os.decimal :as os]))
+;;  - the value is correctly rounded: Clinger's exact fast path (at most 15 significant digits, a mantissa up to 2^53 and a power of ten up to 22: one correctly rounded
+;;    multiplication or division of two exact doubles), else libc's strtod on a NUL-terminated copy of the token (fib.os.decimal, the platform layer; ADR 0011 keeps `extern`
+;;    out of fib.core). glibc's and musl's strtod are correctly rounded, so every text gets the nearest double, ties to even. A result past the largest double is `Infinity`
+;;    and one below the least subnormal a zero that keeps its sign (`-1e-400` is `-0.0`). `-0` and `-0.0` are `-0.0`.
+;;  - COST: this module has no top-level `def` and no table. The emitter always emits and initialises the `def`s of fib.core, so a table here (the 128-bit powers of five of
+;;    Eisel-Lemire, 1,300 words as hex text) would be in every program's lIR (hello world: 147 KB to 413 KB, 28 KB to 67 KB native). The powers of ten are a function. Eisel-Lemire
+;;    stays in fib.json (explicit, so it costs a program nothing unless required), where the JSON parser uses it; parse-double is for text that is not a hot loop.
+(ns fib.core.decimal (:require [fib.os.decimal :as os]))
 
-(def pow10-table: (Vec f64) [1.0 1.0e1 1.0e2 1.0e3 1.0e4 1.0e5 1.0e6 1.0e7 1.0e8 1.0e9 1.0e10 1.0e11 1.0e12 1.0e13 1.0e14 1.0e15 1.0e16 1.0e17 1.0e18 1.0e19 1.0e20 1.0e21 1.0e22])
+;; 10^k for k from 0 to 22, exact in a double: each product of two exact values below 2^53 times 10 stays exact up to 10^22
+(defun pow10 :private (k: i64) -> f64
+  (loop ((i 0) (p 1.0))
+    (if (= i k) p (recur (+ i 1) (* p 10.0)))))
 
 ;; the byte at i as 0 to 255, or -1 past the end
 (defun byte-or-eof :private (s: str n: i64 i: i64) -> i64
@@ -57,9 +60,8 @@
   (if (= w 0)
       0.0
       (if (and (<= nd 15) (and (>= e10 -22) (and (<= e10 22) (<= w 9007199254740992))))
-          (if (< e10 0) (fdiv (sitofp f64 w) (vec-nth pow10-table (- 0 e10))) (* (sitofp f64 w) (vec-nth pow10-table e10)))
-          (let ((r (if (<= nd 18) (el/eisel-lemire w e10) 0.0)))
-            (if (> r 0.0) r (strtod-token s a b))))))
+          (if (< e10 0) (fdiv (sitofp f64 w) (pow10 (- 0 e10))) (* (sitofp f64 w) (pow10 e10)))
+          (strtod-token s a b))))
 
 ;; the number with its sign, from a text whose grammar is checked: the digits start at i0, the integer part ends at i1, the fraction (when dot) at i2, the exponent at i3
 (defun number-value :private (s: str i0: i64 i1: i64 i2: i64 i3: i64 neg: bool dot: bool has-e: bool eneg: bool jx: i64) -> f64

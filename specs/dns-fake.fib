@@ -77,15 +77,17 @@
         (match (net/udp-recv-from udp 4096 (+ (time/clock-now) 20000000) (atom false))
           ((Err _) (recur counts))
           ((Ok dg) (recur (handle-udp udp other bs log counts dg))))))))
-(defun start (bs: (Map str Behaviour)) -> Fake
+;; The TCP listener takes the UDP port's number; under load another process may hold that TCP port already, so a refused listen closes the UDP socket and tries a new port.
+(defun start-n (bs: (Map str Behaviour) tries: i64) -> Fake
   (match (net/udp-bind "127.0.0.1" 0)
     ((Err e) (trap (. e message)))
     ((Ok u) (match (net/listen-tcp "127.0.0.1" (. u port) 8)
-      ((Err e) (trap (. e message)))
+      ((Err e) (if (> tries 0) (do (io/close-fd (. u fd)) (start-n bs (- tries 1))) (trap (. e message))))
       ((Ok l) (match (net/udp-bind "127.0.0.1" 0)
         ((Err e) (trap (. e message)))
         ((Ok o) (let [log (atom []) stop (atom false) ufd (. u fd) lfd (. l fd) ofd (. o fd)]
           (Fake (. u port) log stop (spawn (fn () (let [r (serve ufd ofd lfd bs log stop)] (do (io/close-fd ufd) (io/close-fd lfd) (io/close-fd ofd) r)))))))))))))
+(defun start (bs: (Map str Behaviour)) -> Fake (start-n bs 25))
 (defun stop (f: Fake) -> i64 (do (swap! (. f stop) (fn (x: bool) true)) (join (. f task))))
 (defun log-of (f: Fake) -> (Vec str) @(. f log))
 (defun count-of (f: Fake key: str) -> i64 (count (filter (fn (e: str) (starts-with? e key)) @(. f log))))
