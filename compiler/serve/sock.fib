@@ -1,0 +1,216 @@
+;; compiler/serve/sock.fib: the platform wrappers of `fibc serve` (docs/design/dev-loop.md section 8): a unix-domain stream socket (listen, accept, connect), a
+;; connection that reads one line at a time, and the process calls the server needs (fork, waitpid, dup2, _exit, alarm, kill). The compiler is a host tool
+;; and outside ADR 0011; the library has no unix-domain sockets (fib.os.net is TCP), so the externs are here. The sockaddr_un layout follows `fib.os.abi`
+;; (a length byte first on the BSDs and macOS, a 16-bit family on Linux). Reads and writes go through fib.unix (read(2) and write(2) of any descriptor).
+;; Every function answers a `Result` whose error is text; none traps on input.
+(ns serve.sock
+  (:require [lair.ffi :as ffi] [fib.unix :as unix] [fib.os.abi :as a]))
+
+(extern socket :private (i32 i32 i32) -> i32)
+(extern bind :private (i32 ptr i32) -> i32)
+(extern listen :private (i32 i32) -> i32)
+(extern accept :private (i32 ptr ptr) -> i32)
+(extern connect :private (i32 ptr i32) -> i32)
+(extern fork :private () -> i32)
+(extern waitpid :private (i32 ptr i32) -> i32)
+(extern dup2 :private (i32 i32) -> i32)
+(extern _exit :private (i32) -> unit)
+(extern alarm :private (i32) -> i32)
+(extern kill :private (i32 i32) -> i32)
+(extern getpid :private () -> i32)
+(extern poll :private (ptr i64 i32) -> i32)
+(extern chmod :private (ptr i32) -> i32)
+(extern signal :private (i32 i64) -> i64)
+(extern setrlimit :private (i32 ptr) -> i32)
+(extern exit :private (i32) -> unit)
+
+(def path-max: i64 100)
+(def line-max: i64 8388608)
+
+;; The sockaddr_un of `path`, 110 bytes zeroed and filled; the caller frees it.
+(defun sockaddr :private (path: str) -> (Result ptr str)
+  (if (or (> (str-len path) path-max) (some? (str-find path "\0" 0)))
+      (Err (str "socket path longer than " path-max " bytes, or holding a NUL"))
+      (unsafe
+        (let ((p (alloc 110))
+              (bs (str-bytes path)))
+          (do (dotimes (i 110) (store-i8 (ptr+ p i) 0i8))
+              (if (. a/host sockaddr-length)
+                  (do (store-i8 p 110i8) (store-i8 (ptr+ p 1) 1i8))
+                  (store-i16 p (trunc i16 1)))
+              (dotimes (i (array-len bs)) (store-i8 (ptr+ p (+ 2 i)) (array-get bs i)))
+              (Ok p))))))
+
+(defun new-socket :private () -> (Result i64 str)
+  (let ((fd (sext i64 (unsafe (socket 1i32 1i32 0i32)))))
+    (if (< fd 0) (Err "cannot make a unix socket") (Ok fd))))
+
+;; Whether something accepts connections at `path`.
+(defun alive? (path: str) -> bool
+  (match (connect-unix path)
+    ((Ok fd) (do (unix/fd-close fd) true))
+    ((Err _) false)))
+
+;; A connection to the socket at `path`.
+(defun connect-unix (path: str) -> (Result i64 str)
+  (match (sockaddr path)
+    ((Err m) (Err m))
+    ((Ok sa)
+     (match (new-socket)
+       ((Err m) (do (unsafe (free sa)) (Err m)))
+       ((Ok fd)
+        (let ((r (sext i64 (unsafe (connect (trunc i32 fd) sa 110i32)))))
+          (do (unsafe (free sa))
+              (if (< r 0) (do (unix/fd-close fd) (Err (str "cannot connect to " path))) (Ok fd)))))))))
+
+;; A listening socket at `path`; a stale socket file (nothing accepts at it) is removed first, a live one is an error.
+(defun listen-unix (path: str backlog: i64) -> (Result i64 str)
+  (if (alive? path)
+      (Err (str "a server is already listening at " path))
+      (do (unix/fd-unlink path)
+          (match (sockaddr path)
+            ((Err m) (Err m))
+            ((Ok sa)
+             (match (new-socket)
+               ((Err m) (do (unsafe (free sa)) (Err m)))
+               ((Ok fd)
+                (let ((b (sext i64 (unsafe (bind (trunc i32 fd) sa 110i32))))
+                      (l (if (< b 0) -1 (sext i64 (unsafe (listen (trunc i32 fd) (trunc i32 backlog)))))))
+                  (do (unsafe (free sa))
+                      (if (< l 0) (do (unix/fd-close fd) (Err (str "cannot listen at " path))) (Ok fd)))))))))))
+
+;; The next connection of the listening socket (an interrupted accept is made again).
+(defun accept-unix (fd: i64) -> (Result i64 str)
+  (let ((nul (ffi/addr->ptr 0)))
+    (loop ((tries 0))
+      (let ((c (sext i64 (unsafe (accept (trunc i32 fd) nul nul)))))
+        (cond (>= c 0) (Ok c)
+              (< tries 100) (recur (+ tries 1))
+              :else (Err "accept failed"))))))
+
+;; ---- lines
+
+;; A connection: its descriptor and the bytes read past the last line.
+(defstruct Conn (fd: i64 pending: (Cell (Array i8))))
+
+(defun conn-new (fd: i64) -> Conn (Conn fd (cell (array 0 0i8))))
+
+(defun bytes-concat :private (x: (Array i8) y: (Array i8)) -> (Array i8)
+  (let ((n (array-len x)) (m (array-len y)) (out (cell (array (+ (array-len x) (array-len y)) 0i8))))
+    (do (dotimes (i n) (array-set! &out i (array-get x i)))
+        (dotimes (j m) (array-set! &out (+ n j) (array-get y j)))
+        @out)))
+
+(defun find-newline :private (a: (Array i8) from: i64) -> i64
+  (let ((n (array-len a)))
+    (loop ((i from))
+      (cond (>= i n) -1
+              (= (array-get a i) 10i8) i
+              :else (recur (+ i 1))))))
+
+(defun utf8-ok? (bs: (Array i8)) -> bool
+  (let ((n (array-len bs))
+        (b (fn (i: i64) (zext i64 (array-get bs i))))
+        (cont? (fn (i: i64 lo: i64 hi: i64) (and (< i (array-len bs)) (and (>= (zext i64 (array-get bs i)) lo) (<= (zext i64 (array-get bs i)) hi))))))
+    (loop ((i 0))
+      (if (>= i n)
+          true
+          (let ((c (b i)))
+            (cond (< c 128) (recur (+ i 1))
+                  (and (>= c 194) (<= c 223)) (if (cont? (+ i 1) 128 191) (recur (+ i 2)) false)
+                  (= c 224) (if (and (cont? (+ i 1) 160 191) (cont? (+ i 2) 128 191)) (recur (+ i 3)) false)
+                  (and (>= c 225) (<= c 236)) (if (and (cont? (+ i 1) 128 191) (cont? (+ i 2) 128 191)) (recur (+ i 3)) false)
+                  (= c 237) (if (and (cont? (+ i 1) 128 159) (cont? (+ i 2) 128 191)) (recur (+ i 3)) false)
+                  (and (>= c 238) (<= c 239)) (if (and (cont? (+ i 1) 128 191) (cont? (+ i 2) 128 191)) (recur (+ i 3)) false)
+                  (= c 240) (if (and (cont? (+ i 1) 144 191) (and (cont? (+ i 2) 128 191) (cont? (+ i 3) 128 191))) (recur (+ i 4)) false)
+                  (and (>= c 241) (<= c 243)) (if (and (cont? (+ i 1) 128 191) (and (cont? (+ i 2) 128 191) (cont? (+ i 3) 128 191))) (recur (+ i 4)) false)
+                  (= c 244) (if (and (cont? (+ i 1) 128 143) (and (cont? (+ i 2) 128 191) (cont? (+ i 3) 128 191))) (recur (+ i 4)) false)
+                  :else false))))))
+
+;; One line as text. `Ok nil` at the end of the input before any byte; an error for a line over `line-max` bytes, a read error, an input that
+;; ends inside a line, or a line that is not UTF-8 (the line is consumed, so the next call goes on after it).
+(defun conn-read-line (c: Conn) -> (Result (Option str) str)
+  (loop ((scan 0))
+    (let ((pend @(. c pending))
+          (nl (find-newline pend scan)))
+      (cond (>= nl 0)
+              (let ((line (array-copy pend 0 nl)))
+                (do (set! (. c pending) (array-copy pend (+ nl 1) (array-len pend)))
+                    (if (utf8-ok? line) (Ok (some (str-from-bytes line))) (Err "the line is not UTF-8"))))
+            (> (array-len pend) line-max) (do (set! (. c pending) (array 0 0i8)) (Err "the line is too long"))
+            :else
+              (match (unix/fd-read (. c fd) 65536)
+                ((Err e) (Err (str "read failed: " (unix/errno-text e))))
+                ((Ok bs)
+                 (if (= (array-len bs) 0)
+                     (if (= (array-len pend) 0) (Ok nil) (Err "the input ended inside a line"))
+                     (do (set! (. c pending) (bytes-concat pend bs))
+                         (recur (array-len pend))))))))))
+
+;; `text` and a newline written to `fd`, all of it; an error when the peer has gone.
+(defun write-line (fd: i64 text: str) -> (Result unit str)
+  (let ((bs (str-bytes (str text "\n"))) (n (+ (str-len text) 1)))
+    (loop ((off 0))
+      (if (>= off n)
+          (Ok ())
+          (match (unix/fd-write-range fd bs off (- n off))
+            ((Err e) (Err (str "write failed: " (unix/errno-text e))))
+            ((Ok k) (if (<= k 0) (Err "write failed") (recur (+ off k)))))))))
+
+;; ---- processes
+
+;; A new process (0 in the child, the child's id in the parent, -1 when there is none).
+(defun fork-process () -> i64 (sext i64 (unsafe (fork))))
+(defun redirect (from: i64 to: i64) -> unit (do (unsafe (dup2 (trunc i32 from) (trunc i32 to))) ()))
+(defun exit-now (code: i64) -> unit (unsafe (_exit (trunc i32 code))))
+(defun alarm-in (secs: i64) -> unit (do (unsafe (alarm (trunc i32 secs))) ()))
+(defun kill-process (pid: i64 sig: i64) -> unit (do (unsafe (kill (trunc i32 pid) (trunc i32 sig))) ()))
+(defun process-id () -> i64 (sext i64 (unsafe (getpid))))
+
+;; The status of a process that ended (the code, or 128 and the signal), as waitpid words it.
+(defun decode-status :private (w: i64) -> i64
+  (if (= (bit-and w 127) 0) (bit-and (quot w 256) 255) (+ 128 (bit-and w 127))))
+
+;; Waits for `pid`; its status, or -1.
+(defun wait-process (pid: i64) -> i64
+  (unsafe
+    (let ((st (alloc 8)))
+      (do (store-i64 st 0)
+          (let ((r (waitpid (trunc i32 pid) st 0i32))
+                (status (if (< r 0i32) -1 (decode-status (sext i64 (load-i32 st))))))
+            (do (free st) status))))))
+
+;; Collects every child that has ended, without waiting; how many.
+(defun reap-children () -> i64
+  (unsafe
+    (let ((st (alloc 8)))
+      (do (store-i64 st 0)
+          (let ((n (loop ((n 0))
+                     (if (> (waitpid -1i32 st 1i32) 0i32) (recur (+ n 1)) n))))
+            (do (free st) n))))))
+
+;; Whether `fd` can be read (or has ended) within `ms` milliseconds. A descriptor poll cannot watch counts as readable (the read then fails with its error).
+(defun wait-readable (fd: i64 ms: i64) -> bool
+  (unsafe
+    (let ((pf (alloc 8)))
+      (do (store-i32 pf (trunc i32 fd)) (store-i16 (ptr+ pf 4) (trunc i16 1)) (store-i16 (ptr+ pf 6) (trunc i16 0))
+          (let ((r (poll pf 1 (trunc i32 ms))))
+            (do (free pf) (not (= r 0i32))))))))
+
+;; The socket file readable and writable by its owner only.
+(defun chmod-private (path: str) -> unit
+  (let ((p (ffi/bytes-new path)))
+    (do (unsafe (chmod p 384i32)) (ffi/free-addr (ffi/ptr->addr p)))))
+
+;; SIGINT ignored (the REPL's own) or back to its default (in the process that runs a program).
+(defun ignore-interrupt () -> unit (do (unsafe (signal 2i32 1)) ()))
+(defun default-interrupt () -> unit (do (unsafe (signal 2i32 0)) ()))
+
+;; A trap ends a program by abort, and a core file of a process this size takes a second to write: no core files in this process and its children.
+(defun no-core () -> unit
+  (unsafe
+    (let ((lim (alloc 16)))
+      (do (store-i64 lim 0) (store-i64 (ptr+ lim 8) 0) (setrlimit 4i32 lim) (free lim) ()))))
+
+;; The process ends the way `fibc run` does: through the C library's exit, which writes what the program buffered.
+(defun exit-flush (code: i64) -> unit (unsafe (exit (trunc i32 code))))

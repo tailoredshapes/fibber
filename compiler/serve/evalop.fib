@@ -1,0 +1,65 @@
+;; compiler/serve/evalop.fib: the server's `eval` request (docs/design/dev-loop.md section 8.2): `{"op":"eval","session":NAME,"text":INPUT}`. The server keeps a REPL session (serve.replcore) for each
+;; name (default "default"). The input is what `fibc repl` takes: definitions are added to the session (answered at once: `defined`), one expression is made into a program and run in a process
+;; of its own, answered with its printed `value`; `:type EXPR` and `:reset` are the two commands. A refusal carries `diagnostics` and the lines the REPL would print as `shown`.
+(ns serve.evalop
+  (:require [serve.proto :as p] [serve.incr :as inc] [serve.diag :as dg] [serve.exec :as ex] [serve.replcore :as rc] [lsp.json :as j] [expand.roots :as roots]
+            [driver.native :as native] [fib.string :as s]))
+
+(defstruct Sessions (m: (Cell (Map str rc/Session))))
+
+(defun sessions-new () -> Sessions (Sessions (cell (map-empty))))
+
+(defun session-named :private (ss: Sessions name: str) -> rc/Session
+  (match (get @(. ss m) name)
+    ((some x) x)
+    (nil (let ((x (rc/session-new))) (do (set! (. ss m) (assoc @(. ss m) name x)) x)))))
+
+(defun refusal :private (r: p/Req shown: (Vec str) ds: (Vec dg/Diag)) -> str
+  (p/response r false [(Pair "shown" (j/JArr (mapv j/json-str shown))) (Pair "diagnostics" (p/diags-json ds (map-empty)))]))
+
+(defun run-answer :private (r: p/Req st: inc/Stats) -> (fn (i64 str str) str)
+  (fn (status: i64 out: str err: str)
+    (p/response r (= status 0)
+                [(Pair "value" (j/json-str (s/trim out))) (Pair "stdout" (j/json-str out)) (Pair "stderr" (j/json-str err)) (Pair "exit" (j/json-int status))
+                 (Pair "trapped" (j/JBool (= status 134))) (Pair "stats" (p/stats-json st))])))
+
+(defun do-expression :private (sess: rc/Session e: inc/Engine rts: roots/Roots listener: i64 scratch: str conn: i64 r: p/Req expr: str) -> (Pair bool str)
+  (match (rc/expression-input sess e rts expr)
+    ((rc/Refused shown ds) (Pair false (refusal r shown ds)))
+    ((rc/ToRun lir st)
+     (if (ex/spawn-run conn listener scratch rc/repl-file lir 0 (vec-empty) (unwrap-or (p/field-int r "timeout") 60) (run-answer r st))
+         (Pair true "")
+         (Pair false (p/error-response r "fork-failed" "cannot start a process"))))
+    (_ (Pair false (p/response r true [])))))
+
+(defun do-parts :private (sess: rc/Session e: inc/Engine rts: roots/Roots listener: i64 scratch: str conn: i64 r: p/Req defs: (Vec rc/Def) cs: (Vec str) exprs: (Vec str)) -> (Pair bool str)
+  (cond (> (count exprs) 1) (Pair false (p/error-response r "bad-request" "one expression for each eval request"))
+        (and (empty? defs) (empty? cs)) (do-expression sess e rts listener scratch conn r (nth exprs 0))
+        :else
+          (match (rc/define-input sess e rts defs cs)
+            ((rc/Refused shown ds) (Pair false (refusal r shown ds)))
+            ((rc/Defined names st)
+             (if (empty? exprs)
+                 (Pair false (p/response r true [(Pair "defined" (j/JArr (mapv j/json-str (into names cs)))) (Pair "stats" (p/stats-json st))]))
+                 (do-expression sess e rts listener scratch conn r (nth exprs 0))))
+            (_ (Pair false (p/response r true []))))))
+
+(defun do-type :private (sess: rc/Session e: inc/Engine rts: roots/Roots r: p/Req expr: str) -> (Pair bool str)
+  (match (rc/type-of-expr sess e rts expr)
+    ((Ok t) (Pair false (p/response r true [(Pair "type" (j/json-str t))])))
+    ((Err lines) (Pair false (refusal r lines (vec-empty))))))
+
+;; The answer to an `eval` request and whether the connection is a run's now.
+(defun op-eval (ss: Sessions e: inc/Engine dirs: (Vec str) listener: i64 scratch: str conn: i64 r: p/Req) -> (Pair bool str)
+  (match (p/field-str r "text")
+    (nil (Pair false (p/error-response r "bad-request" "eval needs a string `text`")))
+    ((some text)
+     (let ((sess (session-named ss (unwrap-or (p/field-str r "session") "default")))
+           (rts (roots/roots-from-env (into dirs (unwrap-or (p/field-strs r "roots") (vec-empty))) (native/getenv-opt "FIB_LIB")))
+           (t (s/trim text)))
+       (cond (= t ":reset") (do (set! (. sess clauses) (vec-empty)) (set! (. sess defs) (vec-empty)) (Pair false (p/response r true [])))
+             (s/starts-with? t ":type ") (do-type sess e rts r (s/trim (str-slice t 6 (str-len t))))
+             :else (match (rc/classify text)
+                     ((rc/Blank) (Pair false (p/response r true [])))
+                     ((rc/Unreadable m) (Pair false (refusal r [(str "<input>:" m)] (vec-empty))))
+                     ((rc/Parts defs cs exprs) (do-parts sess e rts listener scratch conn r defs cs exprs))))))))

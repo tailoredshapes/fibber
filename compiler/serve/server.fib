@@ -1,0 +1,191 @@
+;; compiler/serve/server.fib: `fibc serve` (docs/design/dev-loop.md section 8). A supervisor holds the listening socket and runs the worker in a child
+;; process: a worker that traps (a bug in a pass, or the `crash` request of a debug run) is restarted, with a cold cache, and the supervisor never
+;; reads a request. The worker serves one connection at a time: it reads one request line (waiting at most `read-wait-ms`), answers it, closes. `check`,
+;; `emit`, `stats`, `ping`, `reset` and `shutdown` are answered in the worker, whose engine (serve.incr) keeps the front end's state between requests; `run`, `test` and
+;; `eval` make the program in the worker and run it in a process of their own (serve.exec) that answers the client itself, so runs overlap.
+(ns serve.server
+  (:require [serve.sock :as sk] [serve.proto :as p] [serve.incr :as inc] [serve.diag :as dg] [serve.exec :as ex] [serve.evalop :as ev] [lsp.json :as j]
+            [expand.roots :as roots] [emit.compile :as ec] [driver.native :as native] [fib.unix :as unix])
+  (:use own.driver own.program types.program))
+
+(def read-wait-ms: i64 3000)
+(def default-timeout: i64 60)
+
+(defstruct Server (engine: inc/Engine dirs: (Vec str) path: str listener: i64 stop: (Cell bool) served: (Cell i64) scratch: str sessions: ev/Sessions))
+
+(defun roots-of (s: Server r: p/Req) -> roots/Roots
+  (roots/roots-from-env (into (. s dirs) (unwrap-or (p/field-strs r "roots") (vec-empty))) (native/getenv-opt "FIB_LIB")))
+
+;; The text the request is about: its own `text`, else the file's.
+(defun source-of (r: p/Req file: str) -> (Option str)
+  (match (p/field-str r "text") ((some t) (some t)) (nil (read-file file))))
+
+(defun texts-for (ds: (Vec dg/Diag) file: str source: str) -> (Map str str)
+  (reduce (fn (acc: (Map str str) d: dg/Diag)
+            (if (some? (get acc (. d file)))
+                acc
+                (if (= (. d file) file)
+                    (assoc acc file source)
+                    (match (read-file (. d file)) ((some t) (assoc acc (. d file) t)) (nil acc)))))
+          (map-empty) ds))
+
+(defun failure-fields :private (ds: (Vec dg/Diag) file: str source: str st: inc/Stats) -> (Vec (Pair str j/JVal))
+  [(Pair "exit" (j/json-int (if (empty? ds) 0 3))) (Pair "diagnostics" (p/diags-json ds (texts-for ds file source))) (Pair "stats" (p/stats-json st))])
+
+;; ---- check, emit
+
+(defun op-check :private (s: Server r: p/Req) -> str
+  (match (p/field-str r "file")
+    (nil (p/error-response r "bad-request" "check needs a string `file`"))
+    ((some file)
+     (match (source-of r file)
+       (nil (p/error-response r "cannot-read" (str "cannot read " file)))
+       ((some source)
+        (let ((f (inc/engine-front (. s engine) file source (roots-of s r) (unwrap-or (p/field-str r "main") "auto") false)))
+          (match (. f checked)
+            ((Ok _) (p/response r true (failure-fields [] file source (. f stats))))
+            ((Err ds) (p/response r (empty? ds) (failure-fields ds file source (. f stats)))))))))))
+
+(defun op-emit :private (s: Server r: p/Req) -> str
+  (match (p/field-str r "file")
+    (nil (p/error-response r "bad-request" "emit needs a string `file`"))
+    ((some file)
+     (match (source-of r file)
+       (nil (p/error-response r "cannot-read" (str "cannot read " file)))
+       ((some source)
+        (let ((f (inc/engine-front (. s engine) file source (roots-of s r) "yes" true)))
+          (match (. f checked)
+            ((Err ds) (p/response r false (failure-fields ds file source (. f stats))))
+            ((Ok c) (match (ec/compile (. c typed) (. c owned))
+                      ((Err m) (p/error-response r "unsupported" m))
+                      ((Ok lir) (p/response r true [(Pair "lir" (j/json-str lir)) (Pair "stats" (p/stats-json (. f stats)))])))))))))))
+
+;; ---- run, test
+
+(defun run-finish :private (r: p/Req st: inc/Stats) -> (fn (i64 str str) str)
+  (fn (status: i64 out: str err: str)
+    (p/response r (= status 0)
+                [(Pair "exit" (j/json-int status)) (Pair "stdout" (j/json-str out)) (Pair "stderr" (j/json-str err))
+                 (Pair "trapped" (j/JBool (= status 134))) (Pair "timed_out" (j/JBool (= status 142))) (Pair "stats" (p/stats-json st))])))
+
+;; Runs `lir` in its own process; the response is the reporter's. True when it was started.
+(defun start-run :private (s: Server conn: i64 r: p/Req file: str lir: str args: (Vec str) st: inc/Stats) -> bool
+  (ex/spawn-run conn (. s listener) (. s scratch) file lir (unwrap-or (p/field-int r "opt") 0) args
+                (unwrap-or (p/field-int r "timeout") default-timeout) (run-finish r st)))
+
+;; The words after `--` for `test`: the scenario selection of fib.test.
+(defun test-args :private (r: p/Req) -> (Vec str)
+  (let ((only (unwrap-or (p/field-str r "only") "")) (seed (p/field-int r "seed")))
+    (into (into (if (= only "") (vec-empty) ["--only" only]) (match seed (nil (vec-empty)) ((some n) ["--seed" (show n)])))
+          (unwrap-or (p/field-strs r "args") (vec-empty)))))
+
+;; The run of a program: answered here when it does not check or cannot start, else by the process that runs it. True when `conn` is the run's now.
+(defun op-run :private (s: Server conn: i64 r: p/Req) -> (Pair bool str)
+  (match (p/field-str r "file")
+    (nil (Pair false (p/error-response r "bad-request" (str (. r op) " needs a string `file`"))))
+    ((some file)
+     (match (source-of r file)
+       (nil (Pair false (p/error-response r "cannot-read" (str "cannot read " file))))
+       ((some source)
+        (let ((f (inc/engine-front (. s engine) file source (roots-of s r) (unwrap-or (p/field-str r "main") "yes") true)))
+          (match (. f checked)
+            ((Err ds) (Pair false (p/response r false (failure-fields ds file source (. f stats)))))
+            ((Ok c) (run-checked s conn r file c f)))))))))
+
+(defun run-checked :private (s: Server conn: i64 r: p/Req file: str c: Checked f: inc/Front) -> (Pair bool str)
+  (match (ec/compile (. c typed) (. c owned))
+    ((Err m) (Pair false (p/error-response r "unsupported" m)))
+    ((Ok lir)
+     (let ((args (if (= (. r op) "test") (test-args r) (unwrap-or (p/field-strs r "args") (vec-empty)))))
+       (if (start-run s conn r file lir args (. f stats))
+           (Pair true "")
+           (Pair false (p/error-response r "fork-failed" "cannot start a process")))))))
+
+;; ---- the rest
+
+(defun op-stats :private (s: Server r: p/Req) -> str
+  (let ((e (. s engine)))
+    (p/response r true [(Pair "requests" (j/json-int @(. s served))) (Pair "entries" (j/json-int (count @(. e entries))))
+                        (Pair "verdicts" (j/json-int (count @(. e verdicts)))) (Pair "pid" (j/json-int (sk/process-id)))])))
+
+(defun op-reset :private (s: Server r: p/Req) -> str
+  (let ((e (. s engine)))
+    (do (set! (. e entries) (map-empty)) (set! (. e verdicts) (map-empty)) (set! (. e session) nil) (set! (. e base) nil)
+        (p/response r true []))))
+
+;; The debug request: a trap in the worker, for the supervisor's test. Only with FIBC_SERVE_DEBUG=1.
+(defun op-crash :private (r: p/Req) -> str
+  (if (= (unwrap-or (native/getenv-opt "FIBC_SERVE_DEBUG") "") "1")
+      (let ((v: (Vec i64) (vec-empty))) (show (nth v (+ 1 (count (. r op))))))
+      (p/error-response r "unknown-op" "unknown op `crash`")))
+
+;; The answer to a request, and whether the connection now belongs to a run.
+(defun dispatch :private (s: Server conn: i64 r: p/Req) -> (Pair bool str)
+  (let ((op (. r op)))
+    (cond (= op "check") (Pair false (op-check s r))
+          (= op "emit") (Pair false (op-emit s r))
+          (or (= op "run") (= op "test")) (op-run s conn r)
+          (= op "eval") (ev/op-eval (. s sessions) (. s engine) (. s dirs) (. s listener) (. s scratch) conn r)
+          (= op "ping") (Pair false (p/response r true [(Pair "pong" (j/JBool true))]))
+          (= op "stats") (Pair false (op-stats s r))
+          (= op "reset") (Pair false (op-reset s r))
+          (= op "crash") (Pair false (op-crash r))
+          (= op "shutdown") (do (set! (. s stop) true) (Pair false (p/response r true [])))
+          :else (Pair false (p/error-response r "unknown-op" (str "unknown op `" op "`"))))))
+
+;; ---- the loop
+
+(defun handle-line :private (s: Server conn: i64 line: str) -> (Pair bool str)
+  (match (p/parse-request line)
+    ((Err m) (Pair false (p/bad-request m)))
+    ((Ok r) (dispatch s conn r))))
+
+;; One connection: its request read, answered, closed (unless a run took it).
+(defun serve-connection :private (s: Server conn: i64) -> unit
+  (let ((c (sk/conn-new conn))
+        (reply (if (sk/wait-readable conn read-wait-ms)
+                   (match (sk/conn-read-line c)
+                     ((Err m) (Pair false (p/bad-request m)))
+                     ((Ok nil) (Pair false ""))
+                     ((Ok (some line)) (handle-line s conn line)))
+                   (Pair false (p/bad-request "no request within the time allowed")))))
+    (do (set! (. s served) (+ @(. s served) 1))
+        (if (. reply fst)
+            (do (unix/fd-close conn) ())
+            (do (when (not (= (. reply snd) "")) (sk/write-line conn (. reply snd)))
+                (unix/fd-close conn)
+                ())))))
+
+(defun worker-loop :private (s: Server) -> i64
+  (loop ()
+    (sk/reap-children)
+    (if @(. s stop)
+        0
+        (match (sk/accept-unix (. s listener))
+          ((Err _) 1)
+          ((Ok conn) (do (serve-connection s conn) (recur)))))))
+
+;; The supervisor: the worker is forked, waited for and, when it did not stop cleanly, started again; at most `restarts-max` times.
+(def restarts-max: i64 50)
+
+(defun supervise :private (s: Server) -> i64
+  (loop ((n 0))
+    (let ((pid (sk/fork-process)))
+      (cond (< pid 0) 1
+            (= pid 0) (do (sk/exit-now (worker-loop s)) 0)
+            :else (let ((st (sk/wait-process pid)))
+                    (cond (= st 0) 0
+                          (>= n restarts-max) 1
+                          :else (do (eprintln (str "fibc serve: the worker ended with status " st "; started again with an empty cache"))
+                                    (recur (+ n 1)))))))))
+
+;; `fibc serve`: listens at `path`, answers until a `shutdown` request. 0 after a shutdown.
+(defun serve-main (path: str dirs: (Vec str)) -> i64
+  (match (sk/listen-unix path 64)
+    ((Err m) (do (eprintln (str "fibc serve: " m)) 2))
+    ((Ok fd)
+     (do (native/ignore-sigpipe)
+         (sk/chmod-private path)
+         (let ((s (Server (inc/engine-new) dirs path fd (cell false) (cell 0) (ex/make-scratch) (ev/sessions-new)))
+               (code (supervise s)))
+           (do (unix/fd-close fd) (unix/fd-unlink path) code))))))

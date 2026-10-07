@@ -1,6 +1,6 @@
 # The development loop: from edit to result
 
-Status: design, 2026-10-04. Docs only; no `.rs` or `.fib` source changed. It replaces `docs/design/fibber-interpreter.md` (written for the
+Status: design 2026-10-04; **sections 8 to 11 (2026-10-07) record what was built: the compile server `fibc serve`, its client, the REPL `fibc repl`, with measurements, the protocol and what remains.** Sections 0 to 7 are the design as written, unchanged except where section 8 says it differs. Docs only up to section 7; no `.rs` or `.fib` source changed by it. It replaces `docs/design/fibber-interpreter.md` (written for the
 rule 6 oracle goal) now that the owner has decided the interpreter is a development tool ("Rule 6 can suck it. We're past that. The
 interpreter is a development tool. It helps agents and meat developers as quickly as possible", `decisions-2026-10-04.md`, amendment).
 The old document's independence, divergence table, `compare` and audit-fidelity machinery are dropped; its speed measurements (section
@@ -8,10 +8,10 @@ The old document's independence, divergence table, `compare` and audit-fidelity 
 
 The question: what gets an agent or a human from an edit to a result fastest? This document measures first, then compares four
 options with the numbers, then recommends. **Measured** means a command was run in this session and its output is quoted. **Estimate**
-means derived from measured numbers by the stated arithmetic. Nothing here is implemented.
+means derived from measured numbers by the stated arithmetic. Sections 0 to 7: nothing there is implemented (DV1 was, see `git log`); sections 8 to 11: built.
 
 Contents: 0 the short answer; 1 method; 2 measurements; 3 the four options; 4 errors, tests, editor, notebooks; 5 recommendation and
-package plan; 6 decisions for the owner; 7 what was not measured.
+package plan; 6 decisions for the owner; 7 what was not measured; 8 the compile server; 9 the REPL; 10 tests and planted faults; 11 what remains.
 
 ## 0. The short answer
 
@@ -390,3 +390,233 @@ under a second for a leaf change). For a human in an editor: DV2, DV8. For scien
   turn them into measurements.
 - Only one machine, shared with other jobs, 7 runs per number, 10% noise. The `p200` figures between batches (447, 501) show it.
 - The Rust interpreter could not run the library-heavy programs (older library), so its compute comparison is on `pold` only.
+
+
+## 8. The compile server, as built (DV2 with the engine of DV3; 2026-10-07)
+
+`fibc serve [--socket PATH] [-I dir]..` keeps the front end's state in a process and answers requests over a unix-domain socket. `fibc --server VERB ..` is its client. `fibc repl` (section 9) is
+the same engine in a terminal. Code: `compiler/serve/` (13 files, 1,700 lines of fibber, none over 237 lines); two edits outside it: the command words in `compiler/driver/args.fib` and
+`compiler/fibc.fib`, and the macro runner's cache key (`compiler/macros/runner.fib`, 23 lines). No new dependency: sockets, `fork`, `waitpid`, `poll`, `termios` through externs in
+`compiler/serve/sock.fib` and `line.fib` (the compiler is a host tool, ADR 0011 does not apply; the library has no unix-domain sockets, `fib.os.net` is TCP).
+
+### 8.1 What is kept, and what is not
+
+- **The expansion of each module, under a key of its content and of everything before it.** A module's key is the hash of its text and name combined with the key of the module before it in the
+  load order (the order is the dependency order, main last, the implicit library first). The engine stores, under that key, the module's expanded forms and a *snapshot of the expander's context*
+  after it (`serve.snap`: every part of an `ExpandCtx` is a `Cell` of persistent values, so a copy of the cells continues exactly where the first stopped; the constructor is positional, a
+  new field makes the file fail to compile). A request loads the program (the modules are read and parsed again: 17 to 40 ms for 60 to 110 modules), computes the keys, restores the snapshot
+  after the longest prefix it already has and expands the rest. A change to a module changes its key and every later key: **the modules after the changed one are expanded again even when
+  they do not use it** (the context after a module is a function of everything before it). Expanding from scratch and from a snapshot give the same lIR: the tests compare `emit` through the
+  server, after an edit, with `fibc emit` byte for byte.
+- **The macros.** `macros.runner` builds each user macro's module once and keeps it in its session. The server keeps one session across requests; the key of a built macro is now
+  `ns/name@KEY`, the key of the module that defines it, so an edit rebuilds the macros of the modules from the edit on and no others (before: `ns/name`, which is only right inside one run).
+- **The verdict of a check, by key** (the key of the last module, the file name, whether `main` is required): a check of text already seen costs the load (9 to 40 ms).
+- **The prelude** (`lib/prelude.fib`, expanded once, re-read when its content changes: the key is its hash) and the context after it.
+- **Not kept: the type checker's and the ownership pass's state.** Lowering, inference and ownership run on the whole expanded program at every request. This is the floor of the loop
+  (section 8.5): for a one-function edit of `fib.json.codec` the check is about 70% of the time. A second version (`serve.units`, since removed) checked only the functions an edit can have
+  affected and left the module's other functions unchecked; the measurement was a gain of about 10 ms, because the units that dominate are the library's reached units, and leaving
+  those out is not possible: a function has no scheme until its unit is inferred (`internal: NAME has no scheme`, tried). What would cut it is a persistent checker: a snapshot of
+  `Globals` and the checker's environment after the unchanged prefix, as the expander's context is kept. That is DV6 proper and is not built.
+- **Not kept: generated code.** `run` and `test` make the lIR in the worker and JIT it in a new process; the JIT of the program and the part of the library it reaches is the other half of
+  the time of a spec run (section 8.5).
+
+### 8.2 The protocol
+
+One JSON object on one line in, one on one line out, **one request for each connection** (the client connects, writes the line, reads one line, closes). UTF-8; a line over 8 MiB, a line that is
+not UTF-8 and a connection that says nothing for 3 s are answered with a `bad-request` and closed. The server never traps on a request: it is the property that the protocol fuzz of the tests
+checks (10,000 malformed requests, same worker afterwards). The socket is `$FIBC_SOCKET`, else `$XDG_RUNTIME_DIR/fibc-serve.sock`, else `/tmp/fibc-serve-$USER.sock`, mode 0600; `serve` refuses
+a socket that something accepts at and replaces a stale file. Paths in requests are absolute (the client makes them so): the server has its own working directory.
+
+Request: `{"op": OP, "id": ID?, ...}`; `id` (a string or a whole number) is echoed in the answer. Every answer has `id` and `ok`; an error is
+`{"id":..,"ok":false,"error":{"code":"bad-request"|"unknown-op"|"cannot-read"|"unsupported"|"fork-failed","message":..}}`.
+
+| op | request fields | answer fields |
+|---|---|---|
+| `ping` | | `pong` |
+| `check` | `file`; `text` (the buffer instead of the file); `roots` (module roots, after the server's `-I`); `main` ("auto" default: required when the file defines it, "yes", "no") | `exit` (0, or 3 when rejected), `diagnostics`, `stats` |
+| `emit` | as `check` | `lir` (the lIR text, as `fibc emit`), or `diagnostics` |
+| `run` | `file`, `args` (strings), `opt` (0..3), `timeout` (seconds, default 60), `roots` | `exit` (the status of the process), `stdout`, `stderr`, `trapped` (status 134), `timed_out` (status 142), `stats`; or `diagnostics` and `exit` 3 when the program does not check |
+| `test` | as `run`, and `only` (a substring of a scenario id, fib.test's `--only`), `seed` | as `run`: a scenario selection that matches nothing is exit 2 |
+| `eval` | `session` (default "default"), `text` (what `fibc repl` takes), `timeout`, `roots` | `defined` (names), or `value` (the printed value, `stdout`, `stderr`, `exit`, `trapped`), or `type` (for `:type EXPR`); a refusal: `shown` (the lines the REPL prints) and `diagnostics` |
+| `stats` | | `requests`, `entries`, `verdicts`, `pid` of the worker |
+| `reset` | | forget the cache |
+| `shutdown` | | the server answers, exits 0 and removes its socket |
+
+`stats` of a check: `{"modules":67,"reused":65,"expanded":2,"verdict":false,"load_ms":18,"expand_ms":8,"lower_ms":80,"check_ms":290,"total_ms":400}`: the modules of the program, how many were
+restored and how many expanded, whether the answer came from the verdict kept, and the milliseconds of loading, expanding, lowering and type and ownership checking.
+
+Example (a program that does not check, then the same text edited):
+
+```
+> {"op":"check","file":"/p/bad.fib","id":3}
+< {"id":3,"ok":false,"exit":3,"diagnostics":[{"severity":"error","code":"type/Unify","file":"/p/bad.fib","line":2,"col":26,"endLine":2,"endCol":27,"start":35,"end":36,"message":"cannot unify i64 with str"}],"stats":{...}}
+```
+
+### 8.3 Diagnostics
+
+One object for each error: `severity` (always "error"), `code`, `file`, `line` and `col` (1-based, of the start), `endLine` and `endCol` (of the end, when the file can be read), `start` and `end`
+(byte offsets), `message` (the text the compiler prints). The **code** is `STAGE/KIND`, KIND the variant name the passes' dumps already print (`fibc emit-dump`, the types and own tools):
+`type/Unify`, `type/Resolve`, `type/NoField`, `type/NoInstance`, `own/BorrowEscapes`, `own/AmpTwice`, `read/UnterminatedString`, `expand/MacroFailed`, `load/Missing`, `load/Cycle`,
+`internal/Checker`. (`fibc explain` prints the ownership checker's decisions and has no codes: these are the codes the checker itself uses.) The checker stops at its first error in a unit,
+so a program has as many diagnostics as units that failed.
+
+### 8.4 Runs, tests, concurrency, crashes
+
+- `run`, `test` and `eval` make the program in the worker (so the cache is warm) and **fork a reporter, which forks the program**: the program's output and error go to files, its input is
+  /dev/null, an alarm ends it after `timeout` seconds, and a trap (status 134), a signal or a timeout ends only that process. The reporter writes the answer on the client's connection and
+  exits; the worker does not wait for it, so runs overlap. Neither child keeps the listening socket. No core files (`RLIMIT_CORE` 0: a core of this process takes a second to write).
+  The exit goes through the C library's `exit`, as `fibc run`'s does: a program's buffered output is written.
+- **Supervision.** The process you start holds the socket and runs the worker in a child; a worker that dies (a trap in a pass: a bug, or the debug request `crash` with
+  `FIBC_SERVE_DEBUG=1`) is started again with an empty cache and the supervisor says so on its standard error. The request that was in flight gets no answer (the connection closes): the client
+  takes that as "no server" and runs the ordinary command in its own process. At most 50 restarts.
+- **Clients.** The worker serves one connection at a time; a check holds the others for its duration (they wait in the listen queue, 64 deep). 24 concurrent clients, mixed checks and runs,
+  all get their own answer (tests). A client that connects and says nothing holds the worker for the read timeout (3 s) and no longer.
+- **The client** `fibc --server check|emit|run|test|eval|ping|stats|reset|shutdown ARGS [--socket PATH] [--json] [-q] [--timeout N]` prints what the ordinary command prints (`check`:
+  `rejected:` and one `file:line:col: message [code]` line for each diagnostic, on standard error, exit 3; `run`: the program's output, its exit status) and with `--json` the answer line.
+  When no server answers it prints `fibc: no server (why); running here` on standard error (not with `-q`) and runs the ordinary path in this process: `run` and `emit` are `fibc run` and
+  `fibc emit`, `test` is `fibc test`, `check` is the same engine with nothing cached. The tests compare the warm server's diagnostics with those of the cold process for the same edit.
+  `check` has no ordinary command in the tree to fall back on (another package is adding `fibc check`; when it lands, `--server check` should call it for the fallback and this one stays the
+  server's).
+
+### 8.5 Measurements (what the loop costs now)
+
+Command: `python3 scripts/bench/dev-loop-serve.py F9 F0` (edits are made to a scratch copy of `lib/` and passed as the first module root; `F0` is stage 2 of main 68e4cf6, `F9` this tree). The 28-core
+host was **shared and loaded** (load average 11 to 13 from other agents): every number is high by an unknown amount, the min-max column shows the spread, and the numbers quoted in the text as "a
+quiet moment" (first two runs of the same script, load 5) are lower. Seconds, median of 3 to 6 runs.
+
+| row | before (no server) | with the server | notes |
+|---|---|---|---|
+| cold `run hello` | 0.21 (0.18-0.22) | 0.22 (0.20-0.27) through `serve` | the JIT and the process dominate; the front end saved is about 60 ms and a fork costs it back |
+| `emit hello` (the front end alone; the nearest to a check there is) | 0.15 | `check`: 0.03 when the text was seen; first time 0.14 | |
+| `test` one scenario of `specs/json-api-spec.fib` | 3.7 (3.4-3.7) | 3.8 (front end 2.0 of it, after an edit) | the code generation of the spec, not the front end, is what remains |
+| `cases` one case | 0.20 | not changed | each case is a `fibc run` child |
+| after an edit of one function of `fib.json.codec`: **check** | none; the client's fallback (a cold engine) 0.69 | **0.47-0.68** (expanded 2 of 67 modules; lower 135 ms, type and ownership check 431 ms); first time 0.73 | quiet moment (load 5): 0.35-0.42; the target of 0.30 s **was not reached** |
+| after an edit of one function of `fib.tls.chain`: check | | **0.40-0.53** (expanded 2 of 60; lower 85, check 250); first time 0.75 | |
+| the same text checked again | | **0.03-0.04** (the verdict) | |
+| after an edit of `fib.json.access`: `run specs/json-api-spec.fib` | 3.4 | | |
+| the same edit: **check** of the spec | 1.8 (`emit`-like) | **1.9** (expanded 27 of 107 modules: everything after the edit in the load order; check 719 ms) | the engine does not help here: the modules after the edit are all expanded again |
+| `eval` of an expression in a session (server) | | 0.27 | check of the session's program + JIT + fork |
+| `eval` of a definition or redefinition (server) | | **0.08** | the check only |
+| REPL input that runs (`:time`) | | front end 60-120 ms, run 40-60 ms | |
+| worker resident set after the run above (375 cached modules) | | 255 MB | |
+
+What this says. (1) The server removes the cost of the library and of unchanged modules **where the edit is in the last modules of the load order**: a check of a library module drops from 2.3 s (the
+spec that uses it, before) to 0.35-0.6 s, and to 0.03 s for text seen. (2) It does not remove the type and ownership checking of the whole program, which is 55 to 70% of what is left (lower 20%,
+load and expansion 10%); that is the floor until the checker's state is kept (section 11). (3) An edit early in the load order (a module the spec reaches through ten others) expands everything
+after it again: 27 modules, 1.9 s. (4) `run` and `test` are limited by code generation, which nothing here caches: no gain over the 3.4-3.7 s of today for a json spec, a gain of the front end only
+(about 0.1 s for hello). **So the loop for a developer editing a library module is: `check` in 0.4-0.6 s instead of a 3.5 s run; for a spec run it is unchanged.**
+
+### 8.6 The editor
+
+Not done. The language server (`compiler/lsp`) checks the whole library, with no macro runner, for every analysis (it needs the scheme of every library name for completion and hover, which
+the engine's on-demand check does not make), and keeps its own memo of whole runs. Using the server for the diagnostics only is cheap (the `check` answer has the byte offsets `LsDiag`
+needs and `text` takes the buffer): send `check` with the buffer when a socket answers, and keep the language server's own analysis for completion and hover. That is about 40 lines in
+`lsp.analysis` and a test against the recorded transcripts of `compiler/tests/lsp`; it was left because the lsp files are another package's golden-checked surface and the gain, for a file the
+engine has seen, is a check of the buffer in 100 to 400 ms against the language server's whole-library analysis.
+
+## 9. The REPL, as built (DV7; 2026-10-07)
+
+`fibc repl [--echo] [-I dir]..`: read, evaluate, print. It is a development tool, not a specification oracle (ADR 0005). It uses the server's engine in its own process (`serve.incr`: the
+library's expansion is done once per session; it does not talk to a running `fibc serve`; the server's `eval` request (section 8.2) is the same session code behind a socket, with the sessions in
+the worker).
+
+**An input** is definitions, `require` and `use`, or one expression; several forms in one input run in order (definitions first, then the expressions). Definitions: `def defun defn defrecord
+defstruct defenum defprotocol defmacro extern impl derive`. `(require [a.b :as x])` and `(use a.b)` become clauses of the session's `ns`; `(ns ..)` in a loaded file contributes its clauses.
+**An expression** is the body of a `main` that prints its value with `prn` (the Debug text: strings quoted, as Clojure's `pr`); an expression of type unit is run for its effect (a program that
+does not print has no `Debug` for unit, the check says so, and the program is made again without the print: one more check, 60 to 100 ms).
+
+**State is source.** A session is the text of its definitions. Every input is a whole program: the session's text, then the input, checked by the engine (the library and the unchanged modules
+cost the load, not the check) and, for an expression, JIT-compiled and run in a child process with the terminal as its streams. Consequences, which are the answers to the questions the brief asked:
+
+- *Redefinition.* A new definition of a name replaces the earlier one (it moves to the end of the session's text; order does not matter to the checker). Types and protocols are replaced the same
+  way (`defrecord Pt` again). It is **accepted only when the program of all the definitions still checks**: otherwise nothing changes and the output says which definition broke
+  (`<session>:6:26: Pt has no field x [type/NoField] (in the definition of px)`, then `; refused; the session is unchanged`). So dependents are always re-checked, against the new definition.
+- *Previously compiled dependents.* There are none: nothing is compiled between inputs, so no dependent keeps the old code. Each run is a fresh program built from the current text.
+  The price is that **values do not persist**: a `def` is evaluated again by every input that runs (its side effects too), an `atom` or a cell does not keep its value from one input to the next.
+  A REPL with resident values needs a JIT session that keeps modules and replaces them by resource tracker, and the per-definition checker of DV6; this is not that (section 11).
+- *Cost.* An input that runs costs the check of the program (60 to 120 ms with a few definitions, more as the session grows) and the JIT of the program and the part of the library it
+  reaches (about 60 ms): 170 to 250 ms measured in a quiet moment. A definition alone costs the check only (77 ms in the server's `eval`).
+- *Traps.* The evaluated program runs in its own process (`fork`): a trap, an exit, a signal ends that process, the REPL says `; the program trapped (status 134); the session is unchanged` and
+  goes on. SIGINT is ignored by the REPL and default in the child, so ctrl-c stops a running program and not the session. Out of memory is the child's too. **Not covered:** a `def` whose
+  initialiser traps makes every later run trap (it is evaluated by each); `:reset` clears it.
+- *Ownership across inputs.* There is nothing to decide, because a value of one input is not visible in the next: a name defined by `def` is a global of the program, as in any program.
+
+**Commands** (`:help`): `:type EXPR` (the checker's type of the expression: a function made of it is checked and its type read from the tables: `(map inc [1 2 3]) : (LSeq i64)`), `:doc NAME`
+(a definition of the session: its text; any other name: its type), `(doc NAME)` the same, `:time EXPR` (the front end's milliseconds with how many modules were expanded and reused, and the
+run's), `:load FILE` (the definitions of the file added, its expressions run; the file is remembered), `:reload`, `:defs`, `:reset`, `:quit` (also `(quit)`, `(exit)`, ctrl-d).
+
+**Reading input.** On a terminal (`isatty`) the descriptor is put in raw mode with `termios` (`tcgetattr`, `cfmakeraw`, `tcsetattr`: what the platform gives, no readline) and a line is edited:
+left, right, home, end, ctrl-a/e/b/f, backspace, delete, ctrl-k/u/w, ctrl-l, up and down (ctrl-p, ctrl-n) through the history, ctrl-c drops the line, ctrl-d on an empty line ends. The history is
+`~/.fibc_history`. While a program runs the terminal is in its normal mode. An input whose brackets or string are open continues on a line with the prompt `...  `. Off a terminal a line is read
+as it is; with `--echo` the prompt and each line are printed, so the output of a session is its own transcript.
+
+Transcript (`compiler/tests/repl/redefine.transcript`, exact):
+
+```
+fib> (defun sq (x: i64) -> i64 (* x x))
+; defined sq
+fib> (defun cube (x: i64) -> i64 (* x (sq x)))
+; defined cube
+fib> (cube 3)
+27
+fib> (defun sq (x: i64) -> i64 (+ x 1))
+; redefined sq
+fib> (cube 3)
+12
+fib> (defun sq (x: i64) -> str "no")
+<session>:2:34: cannot unify str with i64 [type/Unify] (in the definition of cube)
+; refused; the session is unchanged
+fib> (cube 3)
+12
+```
+
+and of errors and a trap (`errors.transcript`, `trap.transcript`):
+
+```
+fib> (defun leak (x: (Box i64) :borrow) -> (Box i64) x)
+<input>:1:1: parameter x of leak is declared :borrow but escapes [own/BorrowEscapes]
+; refused; the session is unchanged
+fib> (first-of [])
+trap: nth: index out of range
+; the program trapped (status 134); the session is unchanged
+fib> (first-of [4])
+4
+```
+
+## 10. Tests and planted faults
+
+`compiler/tests/serve/run.sh FIBC` (13 s, offline; python3 and a real socket): the protocol (ids, errors, one request for each connection), diagnostics (file, line, column, end, code),
+the cache against changed files (a touched file with the same content is a verdict hit; an edited dependency makes the dependent fail and is not served stale; only the modules from the edit on
+are expanded; reverting works), `emit` equal to `fibc emit` (before and after an edit), the warm server's diagnostics equal to a cold process's, runs (arguments, status, a trap, a timeout, a
+program that does not check), eval sessions (definition, redefinition, a trap), the client's output and its fallback, 24 concurrent clients, a silent client, a worker crashed with the debug
+request and restarted, **10,000 malformed requests** (random bytes, truncated and deeply nested JSON, wrong types, invalid UTF-8, a 3 KB path) with the same worker afterwards, a second
+server at a live socket refused, shutdown.
+`compiler/tests/repl/run.sh FIBC` (about 15 s): five scripted sessions (`*.in`, the transcripts `*.transcript` are the exact output of `fibc repl --echo`: session, errors, redefinition,
+trap, load and reload) and `terminal.py`, the REPL on a pseudo-terminal (typing, editing, history, continuation, ctrl-c, ctrl-d, a trap). Both are in the gate's `tools` stage (`scripts/tools.sh`,
+full gate).
+`scripts/mutant-serve.sh MODE` plants one fault in a copy of `compiler/`, builds it and runs the test that pins the rule; the test must fail:
+
+| mode | fault | killed by |
+|---|---|---|
+| `stale-cache` | a module's key ignores its text (an edited file is not seen) | serve: 5 checks fail (the edit is not seen, the stale verdict is served, the dependent still checks) |
+| `no-dependents` | a module's key ignores the modules before it (a dependent is not expanded or checked again) | serve: the dependent of an edited module still checks, only-from-the-edit-on expansion, warm vs cold diagnostics |
+| `no-supervisor` | the worker is not run under the supervisor | serve: the crash request ends the server, no new worker (new pid is None) |
+| `repl-trap-kills` | the REPL runs an expression in its own process, not in a child | repl: the first expression ends the session; 5 transcripts and the terminal test differ |
+| `redefine-keeps-old` | a redefinition does not replace the earlier definition | repl: the load and redefine transcripts differ |
+| `redefine-unchecked` | a definition is accepted without checking the program of them all | repl: the errors and redefine transcripts differ (refusals are accepted) |
+
+Run on 2026-10-07, each built from a copy with the seed v0.1.11: all six KILLED (the lines of `$MUT_OUT/test.log` quote the failing checks).
+
+## 11. What remains
+
+1. **The checker's state across requests** (DV6 proper). Lowering and the type and ownership checks of the whole program are 70% of the loop for a large module (section 8.5). Keep a snapshot of
+   `Globals` and the checker's environment after the unchanged prefix, as `serve.snap` does for the expander, and check only the modules after the change; then the library's units are checked once.
+   Needs the audit that every part of `Globals` and `Checker` is a `Cell` of persistent values, as `ExpandCtx` is.
+2. **Generated code.** `run` and `test` JIT the program each time. Per-function modules, or a module for each source module with the ORC resource trackers
+   (`LLVMOrcResourceTrackerRemove`), would let a changed function be replaced. Section 3 estimated at most 55 ms of 330 for lazy compilation; the spec runs here are 1.5 to 2 s of code generation.
+3. **A REPL with resident values** (needs 2).
+4. **`fibc check`** is another package's: the client's fallback for `check` should call it.
+5. **The editor** (section 8.6), `cases --watch` and the fork-per-case harness (section 4.2): not built.
+6. The type checker is whole-program, so a check of a library module needs the program that requires it: a library module (`fib.*`) is checked as the module a one-line program requires, which
+   sees the implicit modules; its text is the file on disk (`text` is for programs).
+7. Linux and macOS have `sockaddr_un` handled; only Linux was run.

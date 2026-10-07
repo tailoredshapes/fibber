@@ -1,0 +1,65 @@
+;; compiler/serve/proto.fib: the wire protocol of `fibc serve` (docs/design/dev-loop.md section 8.2): one JSON object on one line in, one JSON object on one line
+;; out, one request for each connection. `parse-request` never traps: a line that is not JSON, not an object, or has no `op` is a `BadRequest` that
+;; the server answers with an error response, and the fields are read with accessors that answer `nil` for a field of the wrong type.
+(ns serve.proto
+  (:require [lsp.json :as j] [serve.diag :as dg] [serve.incr :as inc]))
+
+;; A request: its `id` (echoed back: a string or a whole number, else null), its `op` and the whole object.
+(defstruct Req (id: j/JVal op: str obj: j/JVal))
+
+(defun parse-request (line: str) -> (Result Req str)
+  (match (j/json-parse line)
+    ((Err m) (Err (str "not JSON: " m)))
+    ((Ok v)
+     (match v
+       ((j/JObj _ _)
+        (match (match (j/json-get v "op") ((some o) (j/json-as-str o)) (nil nil))
+          (nil (Err "the request has no string `op`"))
+          ((some op) (Ok (Req (id-of v) op v)))))
+       (_ (Err "the request is not an object"))))))
+
+(defun id-of :private (v: j/JVal) -> j/JVal
+  (match (j/json-get v "id")
+    ((some (j/JStr s)) (j/JStr s))
+    ((some (j/JInt n)) (j/JInt n))
+    (_ j/JNull)))
+
+;; ---- fields
+
+(defun field-str (r: Req key: str) -> (Option str)
+  (match (j/json-get (. r obj) key) ((some x) (j/json-as-str x)) (nil nil)))
+
+(defun field-int (r: Req key: str) -> (Option i64)
+  (match (j/json-get (. r obj) key) ((some x) (j/json-as-int x)) (nil nil)))
+
+(defun field-bool (r: Req key: str) -> bool
+  (match (j/json-get (. r obj) key) ((some (j/JBool b)) b) (_ false)))
+
+;; An array of strings; a field that is not one, or holds another type, is nil.
+(defun field-strs (r: Req key: str) -> (Option (Vec str))
+  (match (j/json-get (. r obj) key)
+    ((some (j/JArr items))
+     (let ((ss (mapv j/json-as-str items)))
+       (if (= (count (filterv some? ss)) (count ss)) (some (mapv (fn (o: (Option str)) (unwrap-or o "")) ss)) nil)))
+    (_ nil)))
+
+;; ---- responses
+
+(defun stats-json (s: inc/Stats) -> j/JVal
+  (j/json-obj [(Pair "modules" (j/json-int (. s modules))) (Pair "reused" (j/json-int (. s reused))) (Pair "expanded" (j/json-int (. s expanded)))
+               (Pair "verdict" (j/JBool (. s verdict))) (Pair "load_ms" (j/json-int (. s load-ms))) (Pair "expand_ms" (j/json-int (. s expand-ms)))
+               (Pair "lower_ms" (j/json-int (. s lower-ms))) (Pair "check_ms" (j/json-int (. s check-ms))) (Pair "total_ms" (j/json-int (. s total-ms)))]))
+
+(defun response (r: Req ok: bool fields: (Vec (Pair str j/JVal))) -> str
+  (j/json-text (j/json-obj (into [(Pair "id" (. r id)) (Pair "ok" (j/JBool ok))] fields))))
+
+;; The response to a line that is no request (the id is unknown).
+(defun bad-request (message: str) -> str
+  (j/json-text (j/json-obj [(Pair "id" j/JNull) (Pair "ok" (j/JBool false))
+                            (Pair "error" (j/json-obj [(Pair "code" (j/json-str "bad-request")) (Pair "message" (j/json-str message))]))])))
+
+(defun error-response (r: Req code: str message: str) -> str
+  (response r false [(Pair "error" (j/json-obj [(Pair "code" (j/json-str code)) (Pair "message" (j/json-str message))]))]))
+
+(defun diags-json (ds: (Vec dg/Diag) texts: (Map str str)) -> j/JVal
+  (j/JArr (mapv (fn (d: dg/Diag) (dg/diag-json d texts)) ds)))
