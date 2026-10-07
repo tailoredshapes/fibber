@@ -33,7 +33,10 @@
    ;; the target has 32-bit pointers: the libc functions of `types.targets/libc-narrow-names` are declared with `i32` for what lIR says `i64`
    ptr32: bool
    ;; the target is WASI: lIR's `main` is wasi-libc's `__main_argc_argv`
-   wasi: bool))
+   wasi: bool
+   ;; the target is a kernel target (types.targets `kernel-row?`): a scalar `load` or `store` marked `(align 1)` is given its natural alignment, because the
+   ;; kernel subset indexes elements, never bytes (docs/design/gpu.md 3.3), and a byte-aligned access on a GPU is four accesses of a byte
+   kernel: bool))
 
 ;; A phi to fix up after every block is lowered: the LLVM phi and its incoming bindings (func.rs `Fx::phis`).
 (defstruct PhiFix (phi: i64 incoming: (Vec LBinding)))
@@ -55,9 +58,10 @@
   18)
 
 ;; LLVM's calling convention number: 0 for ccc; for tailcc the target's (`Lx` `tail-cc`: 18, LLVM's tailcc, where the backend has it; the C
-;; convention on WebAssembly, whose `musttail` is the tail-call feature's `return_call`; fastcc on RISC-V). (mod.rs `cc_number`)
+;; convention on WebAssembly, whose `musttail` is the tail-call feature's `return_call`; fastcc on RISC-V); 71 (ptx_kernel) for `kernelcc`, the
+;; entry of a GPU kernel, which only a kernel target's backend accepts (docs/design/gpu.md). (mod.rs `cc_number`)
 (defun cc-number (lx: Lx cc: LCc) -> i64
-  (match cc ((CcC) 0) ((CcTail) (. lx tail-cc))))
+  (match cc ((CcC) 0) ((CcTail) (. lx tail-cc)) ((CcKernel) 71)))
 
 ;; Lowers `e` through the dispatcher field. (expr.rs `Fx::expr`)
 (defun fx-expr (fx: Fx e: LExpr) -> (Result (Option i64) LairError)

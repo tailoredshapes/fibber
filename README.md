@@ -258,6 +258,11 @@ Recent compiler and library changes include:
   `fibc test` prints the scenarios under their Gherkin names and the `.feature` line that did not hold. It is a front end to the system in
   [the test harness design](docs/design/test-harness.md); the design's "plain-text front end: rejected for now" (section 2.4) is this
   library, built because a project asked for feature files.
+- GPU kernels (a prototype, GPU-1): `fibc build --target nvptx64-nvidia-cuda --emit ptx` writes the PTX of a program's `defkernel`s
+  (`examples/gpu/`; the kernel subset, the index space and the memory model are [the GPU design](docs/design/gpu.md)); the CUDA driver
+  that loads and launches them is `fib-gpu-cuda`: `ssh://git@localhost:2222/tailoredshapes/fib-gpu-cuda.git` (tag `v0.0.1`), modules
+  `cuda` and `cublas`, over `libcuda`'s driver API. Measured there: a GEMM written in fibber at 30% of cuBLAS and within 5% of the same
+  kernel in CUDA C; vector add bit for bit the CPU's.
 
 The standard library in `lib/` follows Clojure's names and argument shapes,
 within fibber's static types and ownership model. Its specification and

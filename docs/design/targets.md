@@ -51,6 +51,7 @@ of data. It shows what each new row emits today and lists what stands between em
 | wasm32-wasip1 | 32 | none | 128, generic, `+simd128,+tail-call` | no | 1 | 0 (C) tail | static | wasm, wasm-ld, `$WASI_SYSROOT` | wasi-libc (madvise mallopt pthread_exit) | Wasi | runs (node, wasmtime) | portability target |
 | wasm32-unknown-unknown | 32 | none | 128, generic, `+simd128,+tail-call` | no | 0 | 0 (C) tail | static | wasm, `wasm-ld --no-entry --export-dynamic` | none (all 50) | Linux (stand-in) | emits | portability target |
 | riscv64-unknown-linux-gnu | 64 | pthreads | 128, generic-rv64, `+m,+a,+f,+d,+c,+zicsr,+zifencei` | yes (fmadd.d) | 0 | 8 (fastcc) tail | PIC | ELF lp64d, cc (riscv64 cross), `$RISCV_SYSROOT` | glibc | Linux | emits | parked: LLVM has no tailcc for RISC-V |
+| nvptx64-nvidia-cuda | 64 | none | 128, sm_89 | yes | 1 | 0 (C) tail | static | ptx, none (a driver loads it) | none (all 50) | Linux (stand-in; no runtime is emitted) | emits PTX, run by fib-gpu-cuda (docs/design/gpu.md) | kernel target |
 
 Data layouts (LLVM 21's, from the machine; checked by `targets-emit.sh` and `a64-emit.sh`):
 
@@ -335,8 +336,8 @@ Size: L. The libc-free runtime is most of it.
 * **32-bit hosted** (armv7 linux-gnueabihf, i686, riscv32): W2 and W3 (pointer and `size_t` width) first, then as above. M.
 * **Embedded and no OS** (AVR, MSP430, ARM Cortex-M, RISC-V bare metal, Xtensa, which is not in LLVM 21 here): the libc-free runtime of 5.3,
   no threads, a 16-bit `int` on AVR and MSP430. L or more. AVR's 16-bit pointers break the 24-byte header.
-* **Accelerators and VMs** (NVPTX, AMDGPU, BPF, SPIR-V, Lanai, VE, Hexagon): no general host runtime. A kernel-only subset of the language would be
-  a separate design.
+* **Accelerators and VMs** (NVPTX, AMDGPU, BPF, SPIR-V, Lanai, VE, Hexagon): no general host runtime. A kernel-only subset of the language is
+  docs/design/gpu.md (GPU-1, 2026-10-07): NVPTX is a **kernel target** row that emits the PTX of a program's kernels; SPIR-V and AMDGPU are the same class.
 
 ### 5.6 What running needs installed
 
