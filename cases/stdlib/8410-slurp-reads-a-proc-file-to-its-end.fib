@@ -1,0 +1,20 @@
+;; spec: spec/stdlib.md section 4.15 row slurp (LIB-2: a /proc file has st_size 0, so a reader that trusts fstat answers empty)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; covers: slurp try-slurp
+;; The rules agent reported `slurp` of a /proc file as empty. The runtime reads with `fread` until it falls short, not by the size of the file (rt/io.lir fib.read-file), so /proc/self/status and /proc/cpuinfo (st_size 0, tens of KB)
+;; come back whole; this case pins it. A missing file is the `Err` of try-slurp. (On a platform with no /proc the case is not run: the cases of the gate run on Linux.)
+(ns main (:use tl.check) (:require [fib.string :as str]))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (status (slurp "/proc/self/status"))
+        (cpu (slurp "/proc/cpuinfo")))
+    (do (check c (> (count status) 500))
+        (check c (str/includes? status "Name:"))
+        (check c (> (count cpu) 1000))
+        (check c (match (try-slurp "/proc/self/no-such-file") ((Ok _) false) ((Err e) (= e "cannot read /proc/self/no-such-file"))))
+        (checks-result c))))

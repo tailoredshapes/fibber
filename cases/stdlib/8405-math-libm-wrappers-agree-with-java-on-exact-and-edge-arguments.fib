@@ -1,0 +1,74 @@
+;; spec: spec/stdlib.md section 4.10 rows math/pow exp expm1 log log10 log1p sin cos tan asin acos atan atan2 sinh cosh tanh hypot cbrt floor ceil rint round signum to-degrees to-radians floor-div copy-sign get-exponent ulp next-after next-up next-down scalb ieee-remainder random add-exact subtract-exact multiply-exact negate-exact increment-exact decrement-exact; Math/sqrt Math/pow Math/floor Math/ceil Math/round Math/random Math/log
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; covers: math/pow math/exp math/log math/sin math/cos math/atan2 math/floor math/ceil math/round math/rint math/signum math/hypot math/cbrt math/floor-div math/get-exponent math/ulp math/next-up math/scalb Math/sqrt Math/round
+;; Package LIB-2. fib.math wraps libm through fib.os.libm. The arguments here are the ones where libm and Java (fdlibm) agree on every platform because the answer is exact or the IEEE-defined
+;; one: powers of two and integers, perfect squares and cubes, the edges of `round` (Java's floor(x + 0.5): 0.49999999999999994 is 0, -2.5 is -2, 2.5 is 3, NaN is 0, saturation), signum of the
+;; zeros and NaN, and the exponent and ulp of powers of two. The values that depend on libm's last digit are checked to 1e-15 relative, not for equality;
+;; Java's fdlibm differ in the last place for some arguments; see fib.math.
+(ns main (:use tl.check) (:require [fib.math :as math] [Math :as Math]))
+
+(defun close? (a: f64 b: f64) -> bool (<= (abs (- a b)) (* 1e-15 (max 1.0 (abs b)))))
+
+(defun main () -> i64
+  (let ((c (checks)) (nan (/ 0.0 0.0)) (inf (/ 1.0 0.0)))
+    (do (check c (= (math/pow 2.0 10.0) 1024.0))
+        (check c (= (math/pow 2.0 -1.0) 0.5))
+        (check c (= (math/exp 0.0) 1.0))
+        (check c (close? (math/exp 1.0) 2.718281828459045))
+        (check c (= (math/log 1.0) 0.0))
+        (check c (close? (math/log 10.0) 2.302585092994046))
+        (check c (= (math/log10 1000.0) 3.0))
+        (check c (= (math/sin 0.0) 0.0))
+        (check c (= (math/cos 0.0) 1.0))
+        (check c (close? (math/sin 1.0) 0.8414709848078965))
+        (check c (close? (math/atan2 1.0 1.0) 0.7853981633974483))
+        (check c (= (math/hypot 3.0 4.0) 5.0))
+        (check c (= (math/cbrt 27.0) 3.0))
+        (check c (= (math/cbrt -8.0) -2.0))
+        (check c (= (math/floor -1.5) -2.0))
+        (check c (= (math/ceil -1.5) -1.0))
+        (check c (= (math/rint 2.5) 2.0))
+        (check c (= (math/rint 3.5) 4.0))
+        (check c (= (math/round 2.5) 3))
+        (check c (= (math/round -2.5) -2))
+        (check c (= (math/round 0.49999999999999994) 0))
+        (check c (= (math/round nan) 0))
+        (check c (= (math/round 1e30) 9223372036854775807))
+        (check c (= (math/round -1e30) -9223372036854775808))
+        (check c (= (math/signum -3.0) -1.0))
+        (check c (= (math/signum 7.5) 1.0))
+        (check c (= (math/signum 0.0) 0.0))
+        (check c (not (= (math/signum nan) (math/signum nan))))
+        (check c (= (math/to-degrees 3.141592653589793) 180.0))
+        (check c (= (math/to-radians 180.0) 3.141592653589793))
+        (check c (= (math/floor-div -7 2) -4))
+        (check c (= (math/floor-div 7 2) 3))
+        (check c (= (math/floor-div 7 -2) -4))
+        (check c (= (math/floor-mod -7 2) 1))
+        (check c (= (math/copy-sign 3.0 -1.0) -3.0))
+        (check c (= (math/get-exponent 8.0) 3))
+        (check c (= (math/get-exponent 0.5) -1))
+        (check c (= (math/get-exponent 0.0) -1023))
+        (check c (= (math/get-exponent inf) 1024))
+        (check c (= (math/ulp 1.0) 2.220446049250313e-16))
+        (check c (= (math/ulp -1.0) 2.220446049250313e-16))
+        (check c (= (math/next-up 1.0) 1.0000000000000002))
+        (check c (= (math/next-down 1.0) 0.9999999999999999))
+        (check c (= (math/next-after 1.0 2.0) 1.0000000000000002))
+        (check c (= (math/scalb 1.0 4) 16.0))
+        (check c (= (math/ieee-remainder 5.0 3.0) -1.0))
+        (check c (= (math/add-exact 1 2) 3))
+        (check c (= (math/multiply-exact 100000 100000) 10000000000))
+        (check c (let ((r (math/random))) (and (>= r 0.0) (< r 1.0))))
+        (check c (not (= (math/random) (math/random))))
+        (check c (= (Math/sqrt 144.0) 12.0))
+        (check c (= (Math/pow 2.0 8.0) 256.0))
+        (check c (= (Math/floor 1.5) 1.0))
+        (check c (= (Math/ceil 1.5) 2.0))
+        (check c (= (Math/round 1.5) 2))
+        (check c (= (Math/log 1.0) 0.0))
+        (checks-result c))))

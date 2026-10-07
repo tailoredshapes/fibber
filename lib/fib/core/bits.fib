@@ -1,0 +1,66 @@
+;; fib.core.bits: the bit rows of stdlib §4.3 (bit-and-not bit-clear bit-set bit-flip bit-test), the integer predicates (pos-int? neg-int?
+;; nat-int?), the unchecked family that Clojure spells as aliases (unchecked-inc, unchecked-dec, the -int forms, unchecked-byte
+;; unchecked-short unchecked-int unchecked-long) and the checked arithmetic of package LIB-2 (checked-add checked-sub checked-mul
+;; checked-neg checked-inc checked-dec). Decided here, where the page is silent:
+;;  - the bit index is taken modulo the width, as `shl` is (types §2.12): (bit-set 0 64) is 1, Java's (1 << 64) is 1 too.
+;;  - the `-int` forms are at i32 (Clojure's int is 32 bits) and wrap; unchecked-inc and unchecked-dec wrap at the operand's width.
+;;  - unchecked-byte, unchecked-short, unchecked-int and unchecked-long take an i64 and truncate it to the narrower width, as Clojure's do
+;;    (they do not trap on a value that does not fit); the float and char forms are not written (no float-to-int rule is settled).
+;;  - checked-add, checked-sub and checked-mul answer `nil` when the exact result does not fit the width and `(some r)` when it does. The
+;;    ordinary + - * trap on overflow (`integer overflow in + at i64`); these are the non-trapping twins for code that must decide
+;;    (the rules agent's report: "arithmetic traps on overflow with no checked variant"). Overflow is read from the signs of the
+;;    wrapped result for + and -, and for * by dividing the wrapped product by one factor; the minimum and -1 are handled first, because
+;;    `quot` of the minimum by -1 traps. The auto-promoting `+'` family is not offered (it needs BigInt promotion, tranche 4).
+(ns fib.core.bits (:use fib.core.base fib.core.protocols fib.core.num))
+
+(defun bit-and-not (a: t b: t) :where ((Bits t)) -> t (bit-and a (bit-not b)))
+(defun bit-clear (a: t n: t) :where ((Bits t) (Unit t)) -> t (bit-and a (bit-not (shl (one a) n))))
+(defun bit-set (a: t n: t) :where ((Bits t) (Unit t)) -> t (bit-or a (shl (one a) n)))
+(defun bit-flip (a: t n: t) :where ((Bits t) (Unit t)) -> t (bit-xor a (shl (one a) n)))
+(defun bit-test (a: t n: t) :where ((Bits t) (Eq t) (Unit t)) -> bool (!= (bit-and a (shl (one a) n)) (zero a)))
+
+(defun pos-int? (n: t) :where ((Bits t) (Ord t) (Unit t)) -> bool (> n (zero n)))
+(defun neg-int? (n: t) :where ((Bits t) (Ord t) (Unit t)) -> bool (< n (zero n)))
+(defun nat-int? (n: t) :where ((Bits t) (Ord t) (Unit t)) -> bool (not (< n (zero n))))
+
+(defun unchecked-inc (x: t) :where ((Bits t) (Unit t)) -> t (unchecked-add x (one x)))
+(defun unchecked-dec (x: t) :where ((Bits t) (Unit t)) -> t (unchecked-subtract x (one x)))
+(defun unchecked-add-int (a: i32 b: i32) -> i32 (unchecked-add a b))
+(defun unchecked-subtract-int (a: i32 b: i32) -> i32 (unchecked-subtract a b))
+(defun unchecked-multiply-int (a: i32 b: i32) -> i32 (unchecked-multiply a b))
+(defun unchecked-negate-int (a: i32) -> i32 (unchecked-negate a))
+(defun unchecked-inc-int (a: i32) -> i32 (unchecked-add a 1i32))
+(defun unchecked-dec-int (a: i32) -> i32 (unchecked-subtract a 1i32))
+(defun unchecked-divide-int (a: i32 b: i32) -> i32 (quot a b))
+(defun unchecked-remainder-int (a: i32 b: i32) -> i32 (rem a b))
+(defun unchecked-byte (x: i64) -> i8 (trunc i8 x))
+(defun unchecked-short (x: i64) -> i16 (trunc i16 x))
+(defun unchecked-int (x: i64) -> i32 (trunc i32 x))
+(defun unchecked-long (x: i64) -> i64 x)
+
+;; true when the signed integers a and b have the signs that make the wrapped sum r wrong
+(defun checked-add (a: t b: t) :where ((Bits t) (Ord t) (Unit t)) -> (Option t)
+  (let ((r (unchecked-add a b)))
+    (if (< (bit-and (bit-xor a r) (bit-xor b r)) (zero a)) nil (some r))))
+
+(defun checked-sub (a: t b: t) :where ((Bits t) (Ord t) (Unit t)) -> (Option t)
+  (let ((r (unchecked-subtract a b)))
+    (if (< (bit-and (bit-xor a b) (bit-xor a r)) (zero a)) nil (some r))))
+
+;; the minimum of the width is the one value whose wrapped negation is itself
+(defun at-min? :private (x: t) :where ((Bits t) (Ord t) (Unit t)) -> bool
+  (and (< x (zero x)) (= (unchecked-negate x) x)))
+
+(defun checked-neg (a: t) :where ((Bits t) (Ord t) (Unit t)) -> (Option t)
+  (if (at-min? a) nil (some (unchecked-negate a))))
+
+(defun checked-mul (a: t b: t) :where ((Bits t) (Ord t) (Unit t)) -> (Option t)
+  (let ((z (zero a)) (m1 (unchecked-negate (one a))))
+    (cond (or (= a z) (= b z)) (some z)
+          (= a m1) (checked-neg b)
+          (= b m1) (checked-neg a)
+          :else (let ((r (unchecked-multiply a b)))
+                  (if (= (quot r b) a) (some r) nil)))))
+
+(defun checked-inc (a: t) :where ((Bits t) (Ord t) (Unit t)) -> (Option t) (checked-add a (one a)))
+(defun checked-dec (a: t) :where ((Bits t) (Ord t) (Unit t)) -> (Option t) (checked-sub a (one a)))

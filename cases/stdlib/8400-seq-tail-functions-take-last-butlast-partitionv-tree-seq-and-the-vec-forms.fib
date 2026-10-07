@@ -1,0 +1,51 @@
+;; spec: spec/stdlib.md section 4.4 rows take-last butlast drop-last take-nth nthrest nthnext nnext bounded-count keep-indexed dedupe splitv-at split-with partitionv partitionv-all tree-seq; rows rangev mapcatv sortv sort-byv (N14)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; Package LIB-2: the cheap sequence rows of the ADR 0023 list, written over `Reducible` and one `Vec`. Each answer is compared with Clojure's (checked against Clojure 1.12:
+;; (take-last 2 [1 2 3 4]) is (3 4), (butlast [1 2 3]) (1 2), (drop-last 2 [1 2 3]) (1), (take-nth 2 [1 2 3 4 5]) (1 3 5), (dedupe [1 1 2 2 2 1]) (1 2 1),
+;; (partition-all 2 [1 2 3 4 5]) ((1 2) (3 4) (5)), (tree-seq ..) in preorder) where the row follows Clojure, and the rows that differ are pinned: butlast and drop-last of a short source are
+;; empty, not nil (§5 T1), nthnext answers an Option. `(if c (rangev n) [])` type-checks where `(if c (range n) [])` does not: the Vec forms are the idiom (§3 N14).
+(ns main (:use tl.check))
+
+(defun tree-children (n: i64) -> (Vec i64) [(* n 2) (+ (* n 2) 1)])
+
+(defun pick (c: bool) -> (Vec i64) (if c (rangev 3) []))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (vec (take-last 2 [1 2 3 4])) [3 4]))
+        (check c (= (vec (take-last 9 [1 2])) [1 2]))
+        (check c (= (vec (take-last 0 [1 2])) []))
+        (check c (= (vec (butlast [1 2 3])) [1 2]))
+        (check c (= (vec (butlast [1])) []))
+        (check c (= (vec (butlast (take 0 [1]))) []))
+        (check c (= (vec (drop-last 2 [1 2 3])) [1]))
+        (check c (= (vec (drop-last [1 2 3])) [1 2]))
+        (check c (= (vec (drop-last 9 [1 2 3])) []))
+        (check c (= (vec (take-nth 2 [1 2 3 4 5])) [1 3 5]))
+        (check c (= (vec (take 3 (take-nth 0 [7 8]))) [7 7 7]))
+        (check c (= (vec (nthrest [1 2 3 4] 2)) [3 4]))
+        (check c (nil? (nthnext 3 [1 2 3])))
+        (check c (= (match (nthnext 1 [1 2 3]) ((some s) (vec s)) (nil [])) [2 3]))
+        (check c (= (match (nnext [1 2]) ((some s) (vec s)) (nil [99])) [99]))
+        (check c (= (bounded-count 2 [1 2 3 4]) 2))
+        (check c (= (bounded-count 10 [1 2 3 4]) 4))
+        (check c (= (vec (keep-indexed (fn (i: i64 x: i64) (if (even? i) (some (* x 10)) nil)) [1 2 3 4])) [10 30]))
+        (check c (= (vec (dedupe [1 1 2 2 2 1])) [1 2 1]))
+        (check c (= (splitv-at 2 [1 2 3 4]) (Pair [1 2] [3 4])))
+        (check c (= (splitv-at 9 [1 2]) (Pair [1 2] [])))
+        (check c (match (split-with even? [2 4 5 6]) ((Pair a b) (and (= (vec a) [2 4]) (= (vec b) [5 6])))))
+        (check c (= (vec (partitionv 2 [1 2 3 4 5])) [[1 2] [3 4]]))
+        (check c (= (vec (partitionv-all 2 [1 2 3 4 5])) [[1 2] [3 4] [5]]))
+        (check c (= (vec (tree-seq (fn (n: i64) (< n 4)) tree-children 1)) [1 2 4 5 3 6 7]))
+        (check c (= (pick true) [0 1 2]))
+        (check c (= (pick false) []))
+        (check c (= (rangev 1 4) [1 2 3]))
+        (check c (= (rangev 0 10 5) [0 5]))
+        (check c (= (mapcatv (fn (x: i64) [x x]) [1 2]) [1 1 2 2]))
+        (check c (= (sortv [3 1 2]) [1 2 3]))
+        (check c (= (sort-byv neg [3 1 2]) [3 2 1]))
+        (checks-result c))))
