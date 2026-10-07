@@ -1,0 +1,44 @@
+;; fib.json.codec's direct encoder (JSON-3): `encode-NAME` writes a defjson record straight into a byte buffer, no `Json`. It must give the bytes the DOM writer gives for `(to-json x)`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run) (:require [fib.json :as json] [fib.json.codec :as jc]))
+
+(jc/defjson Leaf [id: i64 label: str weight: f64 on: bool])
+(jc/defjson Node [name: str leaves: (Vec Leaf) grid: (Vec (Vec i64)) next: (Option Node) note: (Option str) ratio: (Option f64)])
+
+(defun via-dom (x: Node) -> str (json/write (json/to-json x)))
+
+(defun strs () -> (Vec str) ["" "a" "plain text of some length, more than thirty-two bytes to take the vector path" "q\"uote\\back" "line\nfeed\ttab\u{1}ctl" "é日本語😀" "\u{7f}"])
+(defun floats () -> (Vec f64) [0.0 -0.0 1.0 -2.5 1.0e21 1.0e-7 123456789.125 5.0e-324 1.7976931348623157e308 0.1 100.0])
+(defun ints () -> (Vec i64) [0 1 -1 9 10 99 100 -100 9223372036854775807 -9223372036854775808 123456789])
+
+(defun leaf (k: i64) -> Leaf (Leaf (nth (ints) (rem k 11)) (nth (strs) (rem k 7)) (nth (floats) (rem k 11)) (= (rem k 2) 0)))
+(defun node (k: i64 depth: i64) -> Node
+  (Node (nth (strs) (rem k 7))
+        (vec (map (fn (j: i64) (leaf (+ k j))) (range 0 (rem k 5))))
+        (vec (map (fn (j: i64) (vec (map (fn (m: i64) (nth (ints) (rem (+ j m) 11))) (range 0 (rem (+ k j) 4))))) (range 0 (rem k 3))))
+        (if (> depth 0) (some (node (+ k 7) (- depth 1))) nil)
+        (if (= (rem k 2) 0) (some (nth (strs) (rem k 7))) nil)
+        (if (= (rem k 3) 0) (some (nth (floats) (rem k 11))) nil)))
+
+(defun agree? (k: i64) -> bool (let [x (node k 2)] (= (via-dom x) (encode-Node x))))
+(defun all-agree? (n: i64) -> bool (every? (fn (k: i64) (agree? k)) (range 0 n)))
+
+(defspecs specs
+  (feature "encode-NAME"
+    (scenario "a record is an object in field order, the exact text"
+      (then (expect = "{\"id\":7,\"label\":\"x\",\"weight\":1.5,\"on\":true}" (encode-Leaf (Leaf 7 "x" 1.5 true)))
+            (expect = "{\"name\":\"n\",\"leaves\":[],\"grid\":[],\"next\":null,\"note\":null,\"ratio\":null}" (encode-Node (Node "n" [] [] nil nil nil)))
+            (expect = "{\"name\":\"n\",\"leaves\":[{\"id\":1,\"label\":\"\",\"weight\":0.0,\"on\":false}],\"grid\":[[1,2],[],[3]],\"next\":null,\"note\":\"s\",\"ratio\":0.5}"
+                    (encode-Node (Node "n" [(Leaf 1 "" 0.0 false)] [[1 2] [] [3]] nil (some "s") (some 0.5))))))
+    (scenario "the same bytes as the DOM writer on 400 records of every shape of string, float and integer, two levels of records deep"
+      (then (expect = true (all-agree? 400))))
+    (scenario "the bytes decode to the record that was encoded"
+      (given [x (node 5 2)])
+      (then (expect = (some x) (match (decode-Node (encode-Node x)) ((Ok y) (some y)) ((Err _) nil)))))
+    (scenario "encode-bytes- is the same text as bytes"
+      (given [x (node 9 1)])
+      (then (expect = (encode-Node x) (str-from-bytes (encode-bytes-Node x)))))
+    (scenario "a NaN and an infinity are null, as the DOM writer has them"
+      (then (expect = "{\"id\":1,\"label\":\"\",\"weight\":null,\"on\":true}" (encode-Leaf (Leaf 1 "" (/ 0.0 0.0) true)))
+            (expect = "{\"id\":1,\"label\":\"\",\"weight\":null,\"on\":true}" (encode-Leaf (Leaf 1 "" (/ 1.0 0.0) true)))))))
+
+(defun main () -> i64 (run-main (specs)))
