@@ -1,0 +1,24 @@
+;; spec:   types §6.3
+;; expect: accept
+;; result: 114
+;; audit:  clean
+;; The join of a borrowed parameter and a fresh array (spec §6.3) in every position: bound then used, returned, tail, passed, stored in a struct, used twice, dropped.
+;; Killed by: a join that does not retain the borrowed arm (a double free) or retains twice (a leak).
+(defun fresh (b: (Array i64) n: i64) -> (Array i64)
+  (let [r (cell (array n 0))] (do (array-set! &r 0 (array-get b 0)) @r)))
+(defun sink (v: (Array i64)) -> i64 (+ (array-get v 0) (array-len v)))
+(defstruct Box (arr: (Array i64)))
+(defun t1 (b: (Array i64) c: bool) -> i64 (let [v (if c b (fresh b 3))] (sink v)))
+(defun t2 (b: (Array i64) c: bool) -> (Array i64) (let [v (if c b (fresh b 3))] v))
+(defun t3 (b: (Array i64) c: bool) -> (Array i64) (if c b (fresh b 3)))
+(defun t4 (b: (Array i64) c: bool) -> i64 (sink (if c b (fresh b 3))))
+(defun t5 (b: (Array i64) c: bool) -> i64 (let [bx (Box (if c b (fresh b 3)))] (sink (:arr bx))))
+(defun t6 (b: (Array i64) c: bool) -> i64 (let [v (if c b (fresh b 3))] (+ (sink v) (sink v))))
+(defun t7 (b: (Array i64) c: bool) -> i64 (let [v (if c b (fresh b 3))] 5))
+(defun t8 (b: (Array i64) c: bool) -> i64 (let [v (if c (fresh b 3) b)] (sink v)))
+(defun main () -> i64
+  (let [a (array 4 3)
+        s1 (+ (+ (t1 a true) (t1 a false)) (+ (sink (t2 a true)) (sink (t2 a false))))
+        s2 (+ (+ (sink (t3 a true)) (sink (t3 a false))) (+ (t4 a true) (t4 a false)))
+        s3 (+ (+ (t5 a true) (t5 a false)) (+ (t6 a true) (t6 a false)))]
+    (+ (+ s1 s2) (+ s3 (+ (+ (t7 a true) (t7 a false)) (+ (t8 a true) (t8 a false)))))))
