@@ -3,13 +3,20 @@
 (ns lir.parse.control
   (:use lir.diag lir.types lir.ast lir.sexp lir.parse.names lir.parse.ty))
 
-;; The form for `ret br switch phi let call tailcall indirect-call indirect-tailcall unreachable trap`, nil for another head. (control.rs `parse`)
+;; The special registers of a kernel target `(sreg NAME)` reads (spec/lir.md 6.9): the thread's index in its block, the block's in the grid, their sizes, in x, y and z.
+(defun sreg-name? (r: str) -> bool
+  (some? (first (filter (fn (n: str) (= n r)) ["tid.x" "tid.y" "tid.z" "ctaid.x" "ctaid.y" "ctaid.z" "ntid.x" "ntid.y" "ntid.z" "nctaid.x" "nctaid.y" "nctaid.z"]))))
+
+;; The form for `ret br switch phi let call tailcall indirect-call indirect-tailcall unreachable trap sreg barrier`, nil for another head. (control.rs `parse`)
 (defun parse-control (name: str args: (Vec Sexp) pos: i64 sub: ExprParser) -> (Option (Result LExpr Diagnostic))
   (cond (= name "ret") (some (ret sub args pos))
         (= name "br") (some (br sub args pos))
         (= name "switch") (some (switch sub args pos))
         (= name "unreachable") (some (try-let ((_ (arity name args 0 pos))) (Ok (expr-new kind-unreachable pos))))
         (= name "trap") (some (try-let ((_ (arity name args 0 pos))) (Ok (expr-new kind-trap pos))))
+        (= name "barrier") (some (try-let ((_ (arity name args 0 pos))) (Ok (expr-new KBarrier pos))))
+        (= name "sreg") (some (try-let ((_ (arity name args 1 pos)) (r (atom-text (nth args 0) "a special register name")))
+                                (if (sreg-name? r) (Ok (expr-new (KSreg r) pos)) (Err (Diagnostic pos (str "sreg: no special register " r))))))
         (= name "phi") (some (phi sub args pos))
         (= name "let") (some (let-form sub args pos))
         (or (= name "call") (= name "tailcall")) (some (direct-call sub name args pos))

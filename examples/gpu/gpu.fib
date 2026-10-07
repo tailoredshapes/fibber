@@ -1,0 +1,43 @@
+;; examples/gpu/gpu.fib: the kernel side of fibber on a GPU, as the GPU-1 prototype has it (docs/design/gpu.md 3): `defkernel` and the
+;; index space. A kernel is an ordinary fibber function over raw pointers and scalars; `fibc build --target nvptx64-nvidia-cuda --emit ptx`
+;; keeps the kernels of the program and what they reach (native.kernel) and writes PTX. The index-space functions are externs that
+;; native.kernel rewrites to lIR's `(sreg NAME)` and `(barrier)` forms, so the ordinary emitter needs nothing new for them. In the design `fib.gpu` is a
+;; platform-layer module (ADR 0011) and `defkernel` a core form with the `:kernel` marker; here the macro makes a `defun` named
+;; `gpu-kernel-NAME`, the name native.kernel looks for. The same module compiles for the host, where nothing calls the kernels.
+(ns gpu)
+
+;; The index space, as externs native.kernel rewrites to lIR's `(sreg NAME)` and `(barrier)` (spec/lir.md 6.9): nothing of the host defines them,
+;; and nothing of the host calls them (a kernel is launched by a driver).
+(extern gpu.sreg.tid.x () -> i32)
+(extern gpu.sreg.tid.y () -> i32)
+(extern gpu.sreg.ctaid.x () -> i32)
+(extern gpu.sreg.ctaid.y () -> i32)
+(extern gpu.sreg.ntid.x () -> i32)
+(extern gpu.sreg.ntid.y () -> i32)
+(extern gpu.sreg.nctaid.x () -> i32)
+(extern gpu.sreg.nctaid.y () -> i32)
+(extern gpu.barrier () -> unit)
+
+;; `(defkernel name (params) body..)`: a kernel entry, `unit`-valued, its body in `unsafe` (a kernel reads and writes raw device pointers).
+(defmacro defkernel (name params ... body)
+  (let ((kname (match name ((Sym s) (Sym (str-concat "gpu-kernel-" s))) (_ name))))
+    `(defun ~kname ~params -> unit (unsafe (do ~@body)))))
+
+;; The thread's index in the block, the block's index in the grid, the block's size and the grid's size, along dimension 0 (x) or 1 (y).
+(defun local-id (d: i64) -> i64
+  (unsafe (sext i64 (if (= d 0) (gpu.sreg.tid.x) (gpu.sreg.tid.y)))))
+(defun group-id (d: i64) -> i64
+  (unsafe (sext i64 (if (= d 0) (gpu.sreg.ctaid.x) (gpu.sreg.ctaid.y)))))
+(defun group-size (d: i64) -> i64
+  (unsafe (sext i64 (if (= d 0) (gpu.sreg.ntid.x) (gpu.sreg.ntid.y)))))
+(defun grid-size (d: i64) -> i64
+  (unsafe (sext i64 (if (= d 0) (gpu.sreg.nctaid.x) (gpu.sreg.nctaid.y)))))
+;; The thread's index in the whole grid along `d`: one invocation of the kernel per index.
+(defun global-id (d: i64) -> i64
+  (unchecked-add (unchecked-multiply (group-id d) (group-size d)) (local-id d)))
+;; Every thread of the block waits here until all have arrived.
+(defun barrier () -> unit (unsafe (gpu.barrier)))
+
+;; Element `i` of an f32 buffer at `p` (no check: the kernel's grid is sized by the host, docs/design/gpu.md 3.2).
+(defun f32-at (p: ptr i: i64) -> f32 (unsafe (load-f32 (ptr+ p (unchecked-multiply 4 i)))))
+(defun f32-set! (p: ptr i: i64 v: f32) -> unit (unsafe (store-f32 (ptr+ p (unchecked-multiply 4 i)) v)))

@@ -20,11 +20,13 @@ commands:
   run [--trace] [-O N] <file> [-- arg..]
                          compile file through the JIT and run its main; the
                          args after -- are (args)
-  build <file> -o <out> [-O N] [-L dir].. [-l lib].. [--emit obj|asm|llvm]
+  build <file> -o <out> [-O N] [-L dir].. [-l lib].. [--emit obj|asm|llvm|ptx]
                          compile file to an executable; each -l lib links
                          -llib, each -L dir is searched for libraries (-Ldir and
                          -llib are also taken); --emit writes the object, the
-                         assembly or the LLVM IR instead and links nothing
+                         assembly or the LLVM IR instead and links nothing;
+                         --emit ptx (a kernel target, --target nvptx64-nvidia-cuda)
+                         writes the PTX of the program's kernels (docs/design/gpu.md)
   targets                print the table of code generation targets (one row per
                          target, tab-separated; docs/design/targets.md)
 
@@ -174,7 +176,7 @@ itrace and gen are commands of the Rust compiler (the test harness).")
           (nil nil)
           ((some v) (if (= v "") nil (some (FlagVal flag v 2))))))))
 
-;; `build FILE -o OUT` and any number of `-L DIR` and `-l LIB`, and at most one `-O N` and one `--emit obj|asm|llvm`, in any order after the
+;; `build FILE -o OUT` and any number of `-L DIR` and `-l LIB`, and at most one `-O N` and one `--emit obj|asm|llvm|ptx`, in any order after the
 ;; file; `-o` exactly once.
 ;; Rust: command.rs:218 `parse_build`
 (defun parse-build :private (file: str rest: (Vec str)) -> Command
@@ -190,7 +192,7 @@ itrace and gen are commands of the Rust compiler (the test harness).")
              (cond (and (= name "-o") (nil? out)) (recur next (some value) dirs libs opt emit)
                    (= name "-L") (recur next out (conj dirs value) libs opt emit)
                    (= name "-l") (recur next out dirs (conj libs value) opt emit)
-                   (and (= name "--emit") (nil? emit) (in? value ["obj" "asm" "llvm"])) (recur next out dirs libs opt (some value))
+                   (and (= name "--emit") (nil? emit) (in? value ["obj" "asm" "llvm" "ptx"])) (recur next out dirs libs opt (some value))
                    (and (= name "-O") (nil? opt))
                      (match (opt-level value)
                        (nil CmdInvalid)

@@ -85,16 +85,28 @@
     (_ (Err (ErrInternal (str "unexpected form at " (pos-str (. e pos))))))))
 
 ;; `alloca load store getelementptr` and the atomics. (memory.rs `Fx::memory`)
+;; The alignment of a scalar access on a kernel target (Lx `kernel`): `(align 1)` on a scalar of `size` bytes is read as `size` (docs/design/gpu.md 3.3), any
+;; other alignment stands.
+(defun kernel-align :private (fx: Fx align: (Option i64) scalar-size: i64) -> (Option i64)
+  (if (and (. (. fx lx) kernel) (= align (some 1)) (> scalar-size 0)) (some scalar-size) align))
+
+;; The size in bytes of a scalar type, 0 for anything else.
+(defun scalar-size :private (t: i64) -> i64
+  (unsafe
+    (let ((k (core/LLVMGetTypeKind t)))
+      (cond (= k 8i32) (quot (sext i64 (core/LLVMGetIntTypeWidth t)) 8) (= k 2i32) 4 (= k 3i32) 8 :else 0))))
+
 (defun lower-memory (fx: Fx e: LExpr) -> (Result (Option i64) LairError)
   (match (. e kind)
     ((KAlloca ty count align) (lower-alloca fx ty count align))
     ((KLoad ty ptr volatile align)
      (try-let ((p (fx-val fx ptr)))
-       (let ((l (b-load (. fx b) (lx-ty (. fx lx) ty) p)))
-         (do (access-options l volatile align) (Ok (some l))))))
+       (let ((lt (lx-ty (. fx lx) ty)))
+         (let ((l (b-load (. fx b) lt p)))
+           (do (access-options l volatile (kernel-align fx align (scalar-size lt))) (Ok (some l)))))))
     ((KStore value ptr volatile align)
      (try-let ((v (fx-val fx value)) (p (fx-val fx ptr)))
        (let ((st (b-store (. fx b) v p)))
-         (do (access-options st volatile align) (Ok nil)))))
+         (do (access-options st volatile (kernel-align fx align (scalar-size (unsafe (core/LLVMTypeOf v))))) (Ok nil)))))
     ((KGep inbounds ty ptr indices) (lower-gep fx inbounds ty ptr indices))
     (_ (lower-atomic fx e))))
