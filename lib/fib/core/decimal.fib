@@ -1,0 +1,94 @@
+;; fib.core.decimal: parse-double (stdlib §2.9 grammar, §4.7 row `parse-double`; package FOLLOWUP-1).
+;; Exports: parse-double.
+;;  - the grammar is the page's: `[+-]? (digits ['.' digits*] | '.' digits) ([eE] [+-]? digits)?`, or exactly one of `NaN`, `Infinity`, `-Infinity`.
+;;    Everything else is nil, never a trap: hex (`0x1p3`), a leading or trailing space, `inf`, `+Infinity` (the page names three), a trailing `d` or `f`
+;;    (Java's Double.parseDouble takes it; the page does not), `.`, `e5`, `1e`, `` and `-`. The page decides where Java and the page differ.
+;;  - the value is correctly rounded (to nearest, ties to even): Clinger's exact fast path (at most 15 significant digits and a power of ten up to 22),
+;;    else Eisel-Lemire (fib.core.eisel, shared with fib.json), else libc's strtod on a NUL-terminated copy of the token (fib.os.decimal, the platform
+;;    layer; ADR 0011 keeps `extern` out of fib.core). A result past the largest double is `Infinity` and a result below the least subnormal is a zero
+;;    that keeps its sign (`-1e-400` is `-0.0`), as Java and strtod give. `-0` and `-0.0` are `-0.0`.
+;;  - Dependency direction (resolved here): fib.json already depends on fib.core, so the shared parser could not stay under fib.json: eisel.fib and pow5.fib
+;;    moved to fib.core.eisel and fib.core.pow5 and fib.json.number requires them from there; the core never requires the explicit library.
+;;  - a mantissa of more than 18 significant digits goes to strtod (Eisel-Lemire takes a mantissa below 2^63), as fib.json's does.
+(ns fib.core.decimal (:require [fib.core.eisel :as el] [fib.os.decimal :as os]))
+
+(def pow10-table: (Vec f64) [1.0 1.0e1 1.0e2 1.0e3 1.0e4 1.0e5 1.0e6 1.0e7 1.0e8 1.0e9 1.0e10 1.0e11 1.0e12 1.0e13 1.0e14 1.0e15 1.0e16 1.0e17 1.0e18 1.0e19 1.0e20 1.0e21 1.0e22])
+
+;; the byte at i as 0 to 255, or -1 past the end
+(defun byte-or-eof :private (s: str n: i64 i: i64) -> i64
+  (if (< i n) (zext i64 (str-byte-at s i)) -1))
+
+;; the first index at or after i that is not an ASCII digit
+(defun digits-end :private (s: str n: i64 i: i64) -> i64
+  (loop ((k i))
+    (let ((b (byte-or-eof s n k)))
+      (if (and (>= b 48) (<= b 57)) (recur (+ k 1)) k))))
+
+;; the token s[a, b) by libc's strtod, on a NUL-terminated copy
+(defun strtod-token :private (s: str a: i64 b: i64) -> f64
+  (unsafe
+    (let ((p (alloc (+ (- b a) 9))))
+      (do (loop ((k a)) (when (< k b) (do (store-i8 (ptr+ p (- k a)) (str-byte-at s k)) (recur (+ k 1)))))
+          (store-i8 (ptr+ p (- b a)) 0i8)
+          (let ((r (os/strtod p (ptr+ p (+ (- b a) 1))))) (do (free p) r))))))
+
+;; the exponent digits s[a, b) as a number, capped so that a hostile exponent cannot overflow
+(defun exponent-value :private (s: str a: i64 b: i64) -> i64
+  (loop ((k a) (v 0))
+    (if (>= k b) v (recur (+ k 1) (if (> v 100000) v (+ (* v 10) (- (zext i64 (str-byte-at s k)) 48)))))))
+
+;; the significant digits of s[a, b), the dot skipped, leading zeros skipped, as a mantissa of the first 18 of them; their count (all of them, however
+;; many) goes to `nd`. Used only when at most 18 remain.
+(defun mantissa-of :private (s: str a: i64 b: i64 &nd: i64) -> i64
+  (loop ((k a) (w 0) (nsig 0))
+    (if (>= k b)
+        (do (set! nd nsig) w)
+        (let ((c (zext i64 (str-byte-at s k))))
+          (if (= c 46)
+              (recur (+ k 1) w nsig)
+              (if (and (= w 0) (= c 48))
+                  (recur (+ k 1) w nsig)
+                  (if (>= nsig 18)
+                      (recur (+ k 1) w (+ nsig 1))
+                      (recur (+ k 1) (+ (* w 10) (- c 48)) (+ nsig 1)))))))))
+
+;; the magnitude of w * 10^e10 (w from the first 18 digits, nd the count of significant digits), a double at least 0.0
+(defun magnitude :private (s: str a: i64 b: i64 w: i64 nd: i64 e10: i64) -> f64
+  (if (= w 0)
+      0.0
+      (if (and (<= nd 15) (and (>= e10 -22) (and (<= e10 22) (<= w 9007199254740992))))
+          (if (< e10 0) (fdiv (sitofp f64 w) (vec-nth pow10-table (- 0 e10))) (* (sitofp f64 w) (vec-nth pow10-table e10)))
+          (let ((r (if (<= nd 18) (el/eisel-lemire w e10) 0.0)))
+            (if (> r 0.0) r (strtod-token s a b))))))
+
+;; the number with its sign, from a text whose grammar is checked: the digits start at i0, the integer part ends at i1, the fraction (when dot) at i2, the exponent at i3
+(defun number-value :private (s: str i0: i64 i1: i64 i2: i64 i3: i64 neg: bool dot: bool has-e: bool eneg: bool jx: i64) -> f64
+  (let ((nd (cell 0))
+        (w (mantissa-of s i0 i2 &nd))
+        (ev (if has-e (exponent-value s jx i3) 0))
+        (e10 (- (if eneg (- 0 ev) ev) (if dot (- i2 (+ i1 1)) 0)))
+        (x (magnitude s i0 i3 w @nd e10)))
+    (if neg (* x -1.0) x)))
+
+(defun parse-double (s: str) -> (Option f64)
+  (let ((n (str-len s)))
+    (if (= s "NaN")
+        (some (fdiv 0.0 0.0))
+        (if (= s "Infinity")
+            (some (fdiv 1.0 0.0))
+            (if (= s "-Infinity")
+                (some (fdiv -1.0 0.0))
+                (let ((neg (= (byte-or-eof s n 0) 45))
+                      (i0 (if (or (= (byte-or-eof s n 0) 45) (= (byte-or-eof s n 0) 43)) 1 0))
+                      (i1 (digits-end s n i0))
+                      (dot (= (byte-or-eof s n i1) 46))
+                      (i2 (if dot (digits-end s n (+ i1 1)) i1))
+                      (ec (byte-or-eof s n i2))
+                      (has-e (or (= ec 101) (= ec 69)))
+                      (sg (byte-or-eof s n (+ i2 1)))
+                      (jx (if has-e (if (or (= sg 43) (= sg 45)) (+ i2 2) (+ i2 1)) i2))
+                      (i3 (if has-e (digits-end s n jx) i2)))
+                  (if (or (and (= i1 i0) (or (not dot) (= i2 (+ i1 1))))
+                          (or (and has-e (= i3 jx)) (< i3 n)))
+                      nil
+                      (some (number-value s i0 i1 i2 i3 neg dot has-e (= sg 45) jx)))))))))

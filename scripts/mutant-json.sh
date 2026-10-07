@@ -69,7 +69,7 @@ mutate() { # mutate NAME TREE -> sets SPECS
     fast-escape-flag) f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(!= \(bit-and m \(- \(shl 1 w\) 1\)\) 0\)/false/; s/\(if \(= m 0\) \(recur \(\+ i 32\)\) true\)/(recur (+ i 32))/' ;;
     fast-depth)       f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(< dp max-depth\)/(<= dp max-depth)/' ;;
     fast-string-end)  f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(node k-str \(\+ a 1\)\) b\)/(node k-str (+ a 1)) (+ b 1))/' ;;
-    float-tie)        f=$j/eisel.fib; cp $f $f.orig; SPECS="json-floats-spec"; sub $f 's/\(= \(bit-and mant 3\) 1\)/(= (bit-and mant 3) 7)/' ;;
+    float-tie)        f=$t/lib/fib/core/eisel.fib; cp $f $f.orig; SPECS="json-floats-spec"; sub $f 's/\(= \(bit-and mant 3\) 1\)/(= (bit-and mant 3) 7)/' ;;
     float-print)      f=$j/dtoa.fib; cp $f $f.orig; SPECS="json-floats-spec json-prop-spec"; sub $f 's/upin \(<= \(\+ vbl out\) \(shl sp10 2\)\)/upin (<= (+ vbl 1) (shl sp10 2))/' ;;
     clinger)          f=$j/number.fib; cp $f $f.orig; SPECS="json-floats-spec"; sub $f 's/\(<= nd 15\)/(<= nd 18)/; s/\(<= w 9007199254740992\)/(<= w 900719925474099200)/' ;;
     depth-off-by-one) f=$j/parse.fib; cp $f $f.orig; SPECS="json-spec"; sub $f 's/\(>= depth \(\. o max-depth\)\)/(> depth (. o max-depth))/g' ;;
