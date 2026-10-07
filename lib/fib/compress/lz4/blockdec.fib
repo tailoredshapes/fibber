@@ -14,39 +14,65 @@
 
 ;; The index of the first byte at or after i that is not 255 (a length extension ends there), or -1 when the input ends first.
 (defun ext-end (ip: ptr i: i64 ilen: i64) -> i64
-  (loop [k i] (cond (>= k ilen) -1 (= (rd8 ip k) 255) (recur (+ k 1)) :else k)))
+  (loop [k i] (cond (>= k ilen) -1 (= (rd8 ip k) 255) (recur (u+ k 1)) :else k)))
 
 ;; The packed result of a length: the extension is `e - i` bytes of 255 and the byte at e; the length is nib + 255 * (e - i) + byte.
-(defun ext-len (ip: ptr i: i64 e: i64 nib: i64) -> i64 (+ nib (+ (* 255 (- e i)) (rd8 ip e))))
+(defun ext-len (ip: ptr i: i64 e: i64 nib: i64) -> i64 (u+ nib (u+ (* 255 (u- e i)) (rd8 ip e))))
+
+;; The common match, a short one at a distance of at least 16 bytes with room to spare: two 16-byte chunks (the second writes nothing that is not later overwritten or beyond the end).
+(defun do-match (dp: ptr op: i64 off: i64 ml: i64 dlen: i64) -> unit
+  (if (and (>= off 16) (<= ml 32) (<= (u+ op 32) dlen))
+    (do (cp16 dp op dp (u- op off)) (cp16 dp (u+ op 16) dp (u- (u+ op 16) off)))
+    (copy-match dp op off ml (u- dlen op))))
 
 (defun copy-lits (ip: ptr i: i64 ilen: i64 dp: ptr op: i64 dlen: i64 n: i64) -> unit
-  (if (and (<= n 16) (<= (+ i 16) ilen) (<= (+ op 16) dlen)) (cp16 dp op ip i) (copy-exact dp op ip i n)))
+  (if (and (<= n 16) (<= (u+ i 16) ilen) (<= (u+ op 16) dlen)) (cp16 dp op ip i) (copy-exact dp op ip i n)))
 
 ;; One sequence from ip (the token already read: `tok`, `i` just after it); the new input position and output position are returned through the caller's
 ;; loop, so this function is the loop body of `decode-block`.
+;; The common sequence: a literal run of at most 14, a match of at most 18, room in the input for a 16-byte literal chunk and the offset, and in the output for the chunks
+;; (ilim and dlim are the limits of `i` and `op` for that); `fast-ok?` also checks the offset and the cap, so a sequence that fails any check goes the slow way, which says why.
+(defun fast-ok? (ip: ptr i: i64 op: i64 ilim: i64 dlim: i64 lo: i64 cap: i64) -> bool
+  (and (<= i ilim) (<= op dlim)
+       (let [tok (rd8 ip i)]
+         (and (< tok 240) (< (bit-and tok 15) 15)
+              (let [lit (shr tok 4) off (rd16 ip (u+ (u+ i 1) lit)) op2 (u+ op lit)]
+                (and (> off 0) (<= off (u- op2 lo)) (<= (u+ (u+ op2 (bit-and tok 15)) 4) cap)))))))
+
+;; The sequence at i, op, as above: the new i and op packed (i shifted left 32; `decode-block` keeps the fast path to inputs below 2 GiB and outputs below 4 GiB).
+(defun fast-seq (ip: ptr i: i64 op: i64 dp: ptr dlen: i64) -> i64
+  (let [tok (rd8 ip i) lit (shr tok 4) i1 (u+ i 1) i2 (u+ i1 lit) op2 (u+ op lit) off (rd16 ip i2) ml (u+ (bit-and tok 15) 4)]
+    (do (cp16 dp op ip i1)
+        (if (>= off 16)
+          (do (cp16 dp op2 dp (u- op2 off)) (cp16 dp (u+ op2 16) dp (u- (u+ op2 16) off)))
+          (copy-match dp op2 off ml (u- dlen op2)))
+        (bit-or (shl (u+ i2 2) 32) (u+ op2 ml)))))
+
 (defun decode-block (ip: ptr ilen: i64 dp: ptr dlen: i64 op0: i64 lo: i64 cap: i64) -> i64
-  (loop [i 0 op op0]
+  (let [ilim (min (u- ilen 17) 2147483000) dlim (min (u- dlen 46) 4294967000)]
+   (loop [i 0 op op0]
+    (if (fast-ok? ip i op ilim dlim lo cap) (let [r (fast-seq ip i op dp dlen)] (recur (shr r 32) (bit-and r 4294967295)))
     (if (>= i ilen) e-truncated
       (let [tok (rd8 ip i)
             lnib (shr tok 4)
-            le (if (= lnib 15) (ext-end ip (+ i 1) ilen) (+ i 0))]
+            le (if (= lnib 15) (ext-end ip (u+ i 1) ilen) (u+ i 0))]
         (if (< le 0) e-truncated
-          (let [i1 (if (= lnib 15) (+ le 1) (+ i 1))
-                lit (if (= lnib 15) (ext-len ip (+ i 1) le 15) lnib)]
-            (cond (> lit (- ilen i1)) e-truncated
-                  (> lit (- cap op)) e-too-large
+          (let [i1 (if (= lnib 15) (u+ le 1) (u+ i 1))
+                lit (if (= lnib 15) (ext-len ip (u+ i 1) le 15) lnib)]
+            (cond (> lit (u- ilen i1)) e-truncated
+                  (> lit (u- cap op)) e-too-large
                   :else
-                  (let [i2 (+ i1 lit) op2 (+ op lit)]
+                  (let [i2 (u+ i1 lit) op2 (u+ op lit)]
                     (do (copy-lits ip i1 ilen dp op dlen lit)
                         (if (= i2 ilen) op2
-                          (if (> (+ i2 2) ilen) e-truncated
-                            (let [off (rd16 ip i2) i3 (+ i2 2)]
-                              (if (or (= off 0) (> off (- op2 lo))) e-corrupt
+                          (if (> (u+ i2 2) ilen) e-truncated
+                            (let [off (rd16 ip i2) i3 (u+ i2 2)]
+                              (if (or (= off 0) (> off (u- op2 lo))) e-corrupt
                                 (let [mnib (bit-and tok 15)
                                       me (if (= mnib 15) (ext-end ip i3 ilen) i3)]
                                   (if (< me 0) e-truncated
-                                    (let [i4 (if (= mnib 15) (+ me 1) i3)
-                                          ml (+ 4 (if (= mnib 15) (ext-len ip i3 me 15) mnib))]
-                                      (if (> ml (- cap op2)) e-too-large
-                                        (do (copy-match dp op2 off ml (- dlen op2))
-                                            (recur i4 (+ op2 ml))))))))))))))))))))
+                                    (let [i4 (if (= mnib 15) (u+ me 1) i3)
+                                          ml (u+ 4 (if (= mnib 15) (ext-len ip i3 me 15) mnib))]
+                                      (if (> ml (u- cap op2)) e-too-large
+                                        (do (do-match dp op2 off ml dlen)
+                                            (recur i4 (u+ op2 ml))))))))))))))))))))))
