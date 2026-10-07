@@ -148,25 +148,33 @@
                                      (~rel ~e ~a) (pr-str ~e) (pr-str ~a))))))
 
 ;; (outline "text" [a b] [[1 2] [3 4]] step ..): a scenario outline (Gherkin's Scenario Outline, a table of examples): one scenario for
-;; each row, its text the outline's text and the row, a (given [a 1 b 2]) of the row's values before the steps.
+;; each row, its text the outline's text and the row.
+;; The steps are written ONCE, as the body of one function of the row's values (`(fn (i row-text a b) (scenario ..))`), and each row is one
+;; call of it: the table is data and the steps are type-checked and compiled once, not once per row. (The first version expanded the steps
+;; once per row and a 400-row table took 120 seconds to compile: the cost grew with the square of the rows, package LIB-2 item 5a; the
+;; per-row `scenario` forms were N distinct closures in one vector expression.) The consequence: the `given` of a row is the binding of each
+;; name to itself, so the plan prints `Given a = a, b = b`; the row's values are in the scenario's text (`double #2 [3 6]`) and the report's
+;; expected and actual sides.
 (defmacro outline (text names rows ... steps)
   (match names
     ((Vec ns)
      (match rows
        ((Vec rs)
-        `(flat
-           [~@(loop ((i 0) (out (vec-empty)))
-                (if (< i (vec-count rs))
-                    (recur (+ i 1)
-                           (vec-conj out
-                             (match (vec-nth rs i)
-                               ((Vec vs)
-                                `(scenario (str ~text " #" ~(Int (+ i 1) :i64) " " (form-text (quote ~(vec-nth rs i))))
-                                   (given ~(Vec (loop ((j 0) (b (vec-empty)))
-                                                  (if (< j (vec-count ns)) (recur (+ j 1) (vec-conj (vec-conj b (vec-nth ns j)) (vec-nth vs j))) b))))
-                                   ~@steps))
-                               (_ (trap "outline: a row is a vector")))))
-                    out))]))
+        (let ((mk (gensym "mk")) (idx (gensym "i")) (rt (gensym "rt")))
+          `(let ((~mk (fn (~idx ~rt ~@ns)
+                        (scenario (str ~text " #" ~idx " " ~rt)
+                          (given ~(Vec (loop ((j 0) (b (vec-empty)))
+                                         (if (< j (vec-count ns)) (recur (+ j 1) (vec-conj (vec-conj b (vec-nth ns j)) (vec-nth ns j))) b))))
+                          ~@steps))))
+             (flat
+               [~@(loop ((i 0) (out (vec-empty)))
+                    (if (< i (vec-count rs))
+                        (recur (+ i 1)
+                               (vec-conj out
+                                 (match (vec-nth rs i)
+                                   ((Vec vs) `(~mk ~(Int (+ i 1) :i64) (form-text (quote ~(vec-nth rs i))) ~@vs))
+                                   (_ (trap "outline: a row is a vector")))))
+                        out))]))))
        (_ (trap "outline: the rows are a vector"))))
     (_ (trap "outline: the names are a vector"))))
 
@@ -191,3 +199,9 @@
 ;; (defspecs name suite ..): `(name)` is every suite of the file, the list `fibc test` runs.
 (defmacro defspecs (name ... suites)
   `(defun ~name () -> (Vec Suite) [~@suites]))
+
+;; (defspecs-main name suite ..): `defspecs` and the `main` of a spec file in one form, `(defun main () -> i64 (run-main (name)))`, so a spec file
+;; needs no `main` of its own (package LIB-2 item 5f). The file still needs `(:use fib.test.run)` or the require that makes `fib.test.run` loaded.
+(defmacro defspecs-main (name ... suites)
+  `(do (defspecs ~name ~@suites)
+       (defun main () -> i64 (fib.test.run/run-main (~name)))))
