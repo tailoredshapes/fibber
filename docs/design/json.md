@@ -51,8 +51,8 @@ struct because macros see syntax, not types (`defrecord` is built the same way).
 Findings that shaped it (each measured, commands in `docs/shootout/json.md`):
 
 - `subs` is O(n) per call (it counts characters): a parser built on it took 26 s for twitter.json. `str-slice` takes byte offsets and is O(length).
-- `array-push!` copies once the array has 32 elements or more (spec/types.md 2.13.1): 580 ns per push at 1 M pushes, quadratic beyond. So the serialiser's
-  buffer is an `(Array i8)` with a length cell and a `memcpy` doubling (`fib.json.buffer`); `os/read-file-bytes`, which appends with `array-push!`, is avoided
+- `array-push!` copied once the array had 32 elements or more (580 ns per push at 1 M pushes, quadratic beyond) when JSON-1 was written; LIBFIX-1 made it linear, but it is still a checked call per byte. So the serialiser's
+  buffer is an `(Array i8)` with a length cell and a `memcpy` doubling (`fib.json.buffer`); `os/read-file-bytes`, which appends with `array-push!` (quadratic then, linear now, still a push per byte), is avoided
   (`json/read-file` is the builtin `read-file`, with a chunked fd read only for its failure path).
 - `/` on integers is a Ratio; `quot` and `rem` are the integer operations.
 - A bounds-checked `str-byte-at` per byte against an unchecked raw load: DOM parse of citm_catalog 156 to 412 MB/s, canada 67 to 176 (with Eisel-Lemire), twitter 98 to 130.

@@ -2,7 +2,7 @@
 # The tool tests of the gate: the fast scripts of the language server, the fibref port and the fibgen port, each under a time bound, one
 # line each (`ok NAME N s` or `FAIL NAME N s`), exit 0 when every one passed. Called by scripts/gate.sh (the `tools` stage); also runnable alone.
 #   scripts/tools.sh [--quick|--full] FIBC [OUTDIR]
-#   --quick   the skeletons only (every module of the ports builds and links): fibref/skeleton.sh, gen/skeleton.sh
+#   --quick   the skeletons only (every module of the ports builds and links): fibref/skeleton.sh, gen/skeleton.sh, and driver/check-lib.sh (the full check of the library)
 #   --full    the skeletons, and: units.sh in five parts (the unit programs of the passes; each unit-*.fib is run, or is listed as pending or run
 #             elsewhere in compiler/tests/units.*), shootout-compile.sh (the programs of docs/shootout/parallel compile), lsp/run.sh (the unit programs), lsp/server.sh (the replay of the recorded transcripts), lsp/hardening.js (the cases
 #             of the fuzz findings), lsp/fuzz.js --selftest, fibref/heap.sh, gen/rng-check.sh, gen/compare.sh pipelines 1 300, gen/planted.sh
@@ -43,6 +43,8 @@ queue() { if [ -n "${TOOLS_ONLY:-}" ] && [[ " $TOOLS_ONLY " != *" $1 "* ]]; then
 
 queue fibref-skeleton "$t/fibref/skeleton.sh" "$out/fibref-skeleton"
 queue gen-skeleton "$t/gen/skeleton.sh" "$out/gen-skeleton"
+# every module of lib/fib/** type-checked and ownership-checked in full, called or not (`fibc check`, LIBFIX-1), and the planted faults a check must reject: nine seconds
+queue sh-driver-check-lib "$t/driver/check-lib.sh" "$FIBC"
 if [ "$mode" = full ]; then
   # the unit programs of the passes: every compiler/tests/*/unit-*.fib is run, or listed as pending (failing, with the reason) or run elsewhere
   for part in emit own types rest pending; do queue "units-$part" env UNITS_DIR=$part "$t/units.sh" "$out/units-$part"; done
