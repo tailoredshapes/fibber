@@ -1,35 +1,24 @@
-;; compiler/native/kernel.fib: the kernel module of a program, for a kernel target (docs/design/gpu.md 4). OWNER: package GPU-1.
+;; compiler/native/kernel.fib: the kernel module of a program, for a kernel target (docs/design/gpu.md 4). OWNER: packages GPU-1, GPU-2.
 ;;
-;; `fibc build --target nvptx64-nvidia-cuda --emit ptx` lowers a program as usual to lIR (every pass, every check) and then keeps only
-;; its kernels: the functions `defkernel` made (examples/gpu/gpu.fib: a `defun` named `gpu-kernel-NAME`; the `:kernel` marker of the
-;; design, docs/design/gpu.md 9, replaces the name convention) and what they reach. The entry of each kernel is renamed to NAME (what the
+;; `fibc build --target nvptx64-nvidia-cuda --emit ptx` lowers a program as usual to lIR (every pass, every check: the kernel checker
+;; own.kernel among them) and then keeps only its kernels: the functions `defkernel` made, named by the kernel table the emitter writes
+;; (`(constant internal fib.kernel.NAME ptr @F)`, emit.compile), and what they reach. The entry of each kernel is renamed to NAME (what the
 ;; driver asks the module for), made external and given the `kernelcc` convention (LLVM's ptx_kernel). What a kernel may reach:
-;; functions of the program and the library (device functions), `llvm.*` intrinsics (the index-space and barrier externs of gpu.fib),
-;; string constants, and the runtime's trap entries, which become a device trap (`llvm.trap`: the driver sees it as an error after the
-;; stream syncs). Anything else of the runtime (`fib.*`: allocation, counts, tasks) or of libc is refused with the path that reaches it:
-;; that refusal is the kernel subset, enforced at the lIR level until the checker has it (gpu.md 6).
+;; functions of the program and the library (device functions), `(sreg ..)`, `(barrier)` and `(global shared ..)` (the `gpu/*` builtins,
+;; emit.lower.gpu), string constants, and the runtime's trap entries, which become a device trap (`llvm.trap`: the driver sees it as an
+;; error after the stream syncs). Anything else of the runtime (`fib.*`: allocation, counts, tasks) or of libc is refused with the path that
+;; reaches it: the backstop below the source-level checker (own.kernel), which names the position.
+;; `kernel-signatures` is the launch ABI (gpu.md 4.5): the header `// fib.kernel-sig NAME: kind..` the PTX carries, one line per kernel.
 (ns native.kernel
   (:use lir.ast lir.types)
   (:require [lir.parse :as parse] [lir.print :as print] [lir.check :as check] [fib.string :as s]))
 
-;; The mark of a kernel's function name, after its module: `f.main.gpu-kernel-vadd` and `f.gpu-kernel-vadd` are the kernel `vadd`.
-(def KERNEL-MARK: str "gpu-kernel-")
+;; The kernel table's entries: `fib.kernel.NAME`.
+(def KERNEL-TABLE: str "fib.kernel.")
 
-;; The kernel name of a define, if it is one: the text after the mark, which follows a `.`.
-(defun kernel-name (fname: str) -> (Option str)
-  (match (str-find fname KERNEL-MARK 0)
-    ((some i) (if (and (> i 0) (= (str-byte-at fname (- i 1)) 46i8))
-                  (some (str-slice fname (+ i (str-len KERNEL-MARK)) (str-len fname)))
-                  nil))
-    (nil nil)))
-
-;; The index-space externs of examples/gpu/gpu.fib, `gpu.sreg.NAME` and `gpu.barrier`, are the lIR forms `(sreg NAME)` and `(barrier)` (spec/lir.md 6.9):
-;; a call of one is rewritten to the form and its declare dropped (the design's builtins emit the forms directly, gpu.md 9).
-(defun index-space-extern? (name: str) -> bool
-  (or (starts-with? name "gpu.sreg.") (= name "gpu.barrier")))
-
-(defun index-space-forms (text: str) -> str
-  (s/replace (s/replace (s/replace text "(call @gpu.barrier )" "(barrier)") "(call @gpu.sreg." "(sreg ") ".sreg.tid" "tid"))
+;; The kernel an entry of the table names: the text after the prefix.
+(defun kernel-name (gname: str) -> (Option str)
+  (if (starts-with? gname KERNEL-TABLE) (some (str-slice gname (str-len KERNEL-TABLE) (str-len gname))) nil))
 
 ;; PTX symbols are letters, digits, `_` and `$`: every other byte of an lIR name (`.` between module parts, `-`, `?`, `!`, `/`, `<`) becomes `_`, in
 ;; definitions and in `@` references alike (`f.main.gpu-kernel-vadd` reaches the driver as `vadd`, `assert-positive` as `assert_positive`).
@@ -58,17 +47,27 @@
 (defun ptx-item (it: LItem) -> LItem
   (match it
     ((ItDefine f) (ItDefine (LFunction (ptx-name (. f name)) (. f ty) (. f params) (. f blocks) (. f mods) (. f pos))))
-    ((ItGlobal g) (ItGlobal (LGlobalDef (ptx-name (. g name)) (. g ty) (. g init) (. g constant) (. g mods) (. g pos))))
+    ((ItGlobal g) (ItGlobal (LGlobalDef (ptx-name (. g name)) (. g ty) (. g init) (. g constant) (. g mods) (. g pos) (. g shared))))
     ((ItDeclare d) (ItDeclare (LDeclare (ptx-name (. d name)) (. d ty) (. d hidden) (. d pos))))
     (_ it)))
 
-;; The text of an item as the kernel module has it: PTX names, the index-space forms.
+;; The text of an item as the kernel module has it: PTX names.
 (defun device-text (it: LItem) -> str
-  (ptx-refs (index-space-forms (item-text (ptx-item it)))))
+  (ptx-refs (item-text (ptx-item it))))
 
 ;; The runtime's trap entries a kernel may reach (checked arithmetic, `trap`, an index check): each becomes `llvm.trap`.
 (defun trap-entry? (name: str) -> bool
   (or (= name "fib.trap-c") (= name "fib.trap") (= name "fib.trap-index") (= name "fib.trap-overflow")))
+
+;; The runtime's stack-object entries a kernel may reach (a scalar cell of a kernel is a stack slot, spec/types.md 6.11): on the device the header
+;; is written (`fib.init-hdr`, three stores) and the trace branch (a global of the host runtime) is dropped.
+(defun stack-entry? (name: str) -> bool
+  (or (= name "fib.stack-init") (= name "fib.stack-end")))
+
+(defun device-stack-text :private (name: str) -> str
+  (if (= name "fib.stack-init")
+      "(define internal (fib_stack_init void) ((ptr p) (i32 tid))\n  (block entry (call @fib_init_hdr p tid (i32 4)) (ret)))\n"
+      "(define internal (fib_stack_end void) ((ptr p))\n  (block entry (ret)))\n"))
 
 ;; The `@name` references in the text of one item.
 (defun refs-in (text: str) -> (Vec str)
@@ -99,18 +98,20 @@
 (defun by-name (m: LModule) -> (Map str LItem)
   (reduce (fn (acc: (Map str LItem) it: LItem) (if (= (item-name it) "") acc (assoc acc (item-name it) it))) {} (. m items)))
 
-;; The kernel defines of `m`: pairs of kernel name and function name; an error when two defines name the same kernel.
+;; The kernels of `m` from its kernel table: pairs of kernel name and function name; an error when two entries name the same kernel (two
+;; kernels of one name in two modules: the driver asks by name) or two PTX names collide (`a-b` and `a_b`).
 (defun kernels-of (m: LModule) -> (Result (Vec (Pair str str)) str)
   (loop ((items (. m items)) (i 0) (seen: (Map str str) {}) (out []))
     (if (>= i (count items))
-        (if (empty? out) (Err "no kernel: a kernel is a (defkernel NAME ..) of examples/gpu/gpu.fib (docs/design/gpu.md 3)") (Ok out))
+        (if (empty? out) (Err "no kernel: a kernel is a (defkernel NAME (param..) body..) (spec/syntax.md 3.22, docs/design/gpu.md 3)") (Ok out))
         (match (nth items i)
-          ((ItDefine f)
-           (match (kernel-name (. f name))
-             ((some k) (match (get seen k)
-                         ((some other) (Err (str "two kernels named " k ": " other " and " (. f name))))
-                         (nil (recur items (+ i 1) (assoc seen k (. f name)) (conj out (Pair k (. f name)))))))
-             (nil (recur items (+ i 1) seen out))))
+          ((ItGlobal g)
+           (match (Pair (kernel-name (. g name)) (. (. g init) kind))
+             ((Pair (some k) (KGlobal f))
+              (match (get seen (ptx-name k))
+                ((some other) (Err (str "two kernels named " k " in PTX: " other " and " f " (a kernel's PTX name is its name with - as _)")))
+                (nil (recur items (+ i 1) (assoc seen (ptx-name k) f) (conj out (Pair k f))))))
+             (_ (recur items (+ i 1) seen out))))
           (_ (recur items (+ i 1) seen out))))))
 
 ;; Everything reachable from `roots` through `@` references, with the path (the referrer) of each name: a map from name to the name that reached it.
@@ -123,9 +124,9 @@
               (recur rest seen)
               (let ((seen2 (assoc seen (. p fst) (. p snd))))
                 (match (get names (. p fst))
-                  ((some it) (if (trap-entry? (. p fst))
-                                 (recur rest seen2)
-                                 (recur (into rest (mapv (fn (r: str) (Pair r (. p fst))) (refs-in (item-text it)))) seen2)))
+                  ((some it) (cond (trap-entry? (. p fst)) (recur rest seen2)
+                                   (stack-entry? (. p fst)) (recur (if (= (. p fst) "fib.stack-init") (conj rest (Pair "fib.init-hdr" (. p fst))) rest) seen2)
+                                   :else (recur (into rest (mapv (fn (r: str) (Pair r (. p fst))) (refs-in (item-text it)))) seen2)))
                   (nil (recur rest seen2)))))))))
 
 (defun path-text :private (seen: (Map str str) name: str) -> str
@@ -138,10 +139,9 @@
 (defun refusal (seen: (Map str str) it: LItem) -> (Option str)
   (let ((name (item-name it)) (where (path-text seen (item-name it))))
     (match it
-      ((ItDefine f) (if (and (starts-with? name "fib.") (not (trap-entry? name)))
+      ((ItDefine f) (if (and (starts-with? name "fib.") (not (trap-entry? name)) (not (stack-entry? name)) (not (= name "fib.init-hdr")))
                         (some (str "the kernel reaches the runtime function " where ": a kernel allocates nothing and runs no task (docs/design/gpu.md 3)")) nil))
-      ((ItDeclare d) (if (index-space-extern? name) nil
-                         (some (str "the kernel reaches the C function " where ": a kernel calls no libc (docs/design/gpu.md 3)"))))
+      ((ItDeclare d) (some (str "the kernel reaches the C function " where ": a kernel calls no libc (docs/design/gpu.md 3)")))
       ((ItDeclareGlobal _) (some (str "the kernel reaches the external global " where)))
       (_ nil))))
 
@@ -194,9 +194,9 @@
                      ((some why) (Err why))
                      (nil (match it
                             ((ItDefine f) (cond (trap-entry? name) (recur items (+ i 1) (conj out (device-trap-text f)) true)
+                                                (stack-entry? name) (recur items (+ i 1) (conj out (device-stack-text name)) trap)
                                                 (some? (kernel-of kernels name)) (recur items (+ i 1) (conj out (entry-text f (unwrap (kernel-of kernels name)))) trap)
                                                 :else (recur items (+ i 1) (conj out (device-text it)) trap)))
-                            ((ItDeclare _) (if (index-space-extern? name) (recur items (+ i 1) out trap) (recur items (+ i 1) (conj out (device-text it)) trap)))
                             (_ (recur items (+ i 1) (conj out (device-text it)) trap))))))))))))
 
 ;; The kernel module of the program `m`: parsed and checked again, so lair sees a module like any other.
@@ -213,3 +213,16 @@
                         ((Ok km) (match (check/check km)
                                    ((Err ds) (Err (str "the kernel module is not valid lIR: " (. (nth ds 0) message))))
                                    ((Ok _) (Ok km))))))))))))
+
+;; The launch ABI (docs/design/gpu.md 4.5): the signature of every kernel entry of the kernel module, as the header the PTX carries,
+;; `// fib.kernel-sig NAME: KIND..` (one line per kernel, the kinds lIR's words: ptr i64 i32 i16 i8 i1 float double). A driver reads the
+;; header when it loads the PTX and checks a launch's arguments against it (count and kind) before the kernel runs. PTX itself carries no
+;; signature; a line comment is what every PTX assembler ignores.
+(defun kernel-signatures (km: LModule) -> str
+  (s/join "" (mapv (fn (it: LItem)
+                     (match it
+                       ((ItDefine f) (match (. (. f ty) cc)
+                                       ((CcKernel) (str "// fib.kernel-sig " (. f name) ":" (s/join "" (mapv (fn (t: LType) (str " " (type-str t))) (. (. f ty) params))) "\n"))
+                                       (_ "")))
+                       (_ "")))
+                   (. km items))))

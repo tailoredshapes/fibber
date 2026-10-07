@@ -1,0 +1,126 @@
+;; fib.gpu.device: the host API of a GPU as protocols (docs/design/gpu.md 4.3). This module is the PROTOCOL: a DRIVER (fib-gpu-cuda; later
+;; Vulkan/OpenCL, Metal) implements the seven and a program takes a `(dyn Platform)` or a `(dyn Device)` from it and never names CUDA. Every
+;; call that can fail returns a `Result` with a `GpuError`; a device-side trap (a kernel's `trap`, a checked `+`) is the `Err` of the `sync`
+;; that follows it; nothing here traps on the host for a device's fault.
+;;
+;; Ownership of a device buffer (gpu.md 3.3): a buffer passed to `stream-launch` is lent to the stream until `stream-sync` returns; while
+;; lent, `buffer-upload`, `buffer-download`, `buffer-release` and a second lend are `:lent` errors; `buffer-release` is final (`:released`
+;; after). The driver keeps that state (the dynamic backstop); `with-launch` (fib.gpu.host) is the static lend.
+;;
+;; The launch ABI (gpu.md 4.5): a kernel's PTX carries `// fib.kernel-sig NAME: KIND..` per kernel (native.kernel); `parse-signatures`
+;; reads the header, `kernel-signature` is what a module's kernel reports, and `check-args` is the check a driver makes before it launches:
+;; an argument of the wrong kind or a wrong count is an `:arguments` error naming the kernel and the position. A cubin (no header) has no
+;; signature, and a launch to it is unchecked (the signature is empty).
+(ns fib.gpu.device (:use fib.core fib.seq fib.coll) (:require [fib.string :as s]))
+
+;; `kind`: :no-device (no driver or no GPU), :driver (the driver API refused: the call, its code and text are in `message`), :invalid-ptx,
+;; :not-found (no such kernel), :out-of-memory, :lent (the buffer is lent to a running kernel), :released (use after release), :arguments
+;; (a launch's arguments do not fit the kernel's signature), :launch (the launch itself was refused: an empty grid, a block over the device's
+;; limit), :device-trap (a kernel trapped: the Err of `stream-sync`), :unsupported (the driver lacks what was asked), :invalid-argument.
+(defstruct GpuError (kind: keyword message: str))
+(derive Eq GpuError)
+(derive Debug GpuError)
+
+(defun gpu-error (kind: keyword message: str) -> GpuError (GpuError kind message))
+(defun error-kind (e: GpuError) -> keyword (. e kind))
+
+;; What a device says of itself, as data: its name, memory in bytes, compute capability (CUDA's major.minor; a Vulkan driver gives its
+;; version), the number of multiprocessors, the most threads a block may have, and the bytes of shared memory a block may use.
+(defstruct DeviceInfo (name: str memory: i64 cc-major: i64 cc-minor: i64 units: i64 max-block: i64 shared-bytes: i64))
+(derive Debug DeviceInfo)
+
+;; A kernel argument: a device buffer, or a scalar of the kinds a kernel parameter may have.
+(defenum Arg (ABuf b: (dyn Buffer)) (AI64 n: i64) (AI32 n: i32) (AF32 x: f32) (AF64 x: f64) (ABool b: bool))
+
+;; The kind of an argument, as the signature names it (lIR's words: ptr i64 i32 float double i1).
+(defun arg-kind (a: Arg) -> str
+  (match a ((ABuf _) "ptr") ((AI64 _) "i64") ((AI32 _) "i32") ((AF32 _) "float") ((AF64 _) "double") ((ABool _) "i1")))
+
+;; A device buffer: `bytes` its size, `handle` the driver's address of it (data: a driver reads its own), the transfers, and `release`.
+(defprotocol Buffer
+  (buffer-bytes (self) -> i64)
+  (buffer-handle (self) -> i64)
+  (buffer-upload (self xs: (Array f32)) -> (Result unit GpuError))
+  (buffer-download (self count: i64) -> (Result (Array f32) GpuError))
+  (buffer-upload-bytes (self xs: (Array i8)) -> (Result unit GpuError))
+  (buffer-download-bytes (self count: i64) -> (Result (Array i8) GpuError))
+  (buffer-fill (self v: i8) -> (Result unit GpuError))
+  (buffer-release (self) -> (Result unit GpuError)))
+
+;; A kernel of a loaded module: its name and its signature (the kinds of its parameters; empty when the module carried none).
+(defprotocol Kernel
+  (kernel-name (self) -> str)
+  (kernel-signature (self) -> (Vec str)))
+
+;; A loaded module: its kernels by name (`:not-found`), and `unload`.
+(defprotocol Module
+  (module-kernel (self name: str) -> (Result (dyn Kernel) GpuError))
+  (module-unload (self) -> (Result unit GpuError)))
+
+;; An event on a stream: `event-elapsed-ms` is the milliseconds from this event to `later`, after waiting for the later one.
+(defprotocol Event
+  (event-elapsed-ms (self later: (dyn Event)) -> (Result f64 GpuError)))
+
+;; A stream: `stream-launch` runs `k` over `grid` blocks of `block` threads (one to three positive dimensions each) with `args`, checked
+;; against the kernel's signature, asynchronously, lending the buffers among `args` until `stream-sync`; `stream-record` marks an event.
+(defprotocol Stream
+  (stream-launch (self k: (dyn Kernel) grid: (Vec i64) block: (Vec i64) args: (Vec Arg)) -> (Result unit GpuError))
+  (stream-sync (self) -> (Result unit GpuError))
+  (stream-record (self e: (dyn Event)) -> (Result unit GpuError)))
+
+;; A device: its info, what it supports (`:ptx`, `:cubin`, `:pinned`, `:shared-memory`, `:events`, `:f64`), a module from source (PTX text as
+;; bytes, or a binary image where `:cubin` is supported), memory (`:out-of-memory` beyond it, never a trap), streams, events, `close`.
+(defprotocol Device
+  (device-info (self) -> DeviceInfo)
+  (device-supports? (self cap: keyword) -> bool)
+  (device-load (self source: (Array i8)) -> (Result (dyn Module) GpuError))
+  (device-alloc (self bytes: i64) -> (Result (dyn Buffer) GpuError))
+  (device-stream (self) -> (Result (dyn Stream) GpuError))
+  (device-event (self) -> (Result (dyn Event) GpuError))
+  (device-close (self) -> (Result unit GpuError)))
+
+;; A platform: the devices a driver can open (`platform-device-count` is 0 with a driver and no GPU; `:no-device` from `open` says which).
+(defprotocol Platform
+  (platform-name (self) -> str)
+  (platform-device-count (self) -> (Result i64 GpuError))
+  (platform-open (self ordinal: i64) -> (Result (dyn Device) GpuError)))
+
+;; ---- the launch ABI
+
+;; The signatures a PTX text carries in its header: kernel name to the kinds of its parameters (`// fib.kernel-sig NAME: KIND..` lines).
+(defun parse-signatures (ptx: str) -> (Map str (Vec str))
+  (reduce (fn (acc: (Map str (Vec str)) line: str)
+            (if (s/starts-with? line "// fib.kernel-sig ")
+                (let [rest (str-slice line 18 (str-len line))]
+                  (match (str-find rest ":" 0)
+                    ((some i) (assoc acc (str-slice rest 0 i) (vec (filter (fn (w: str) (> (str-len w) 0)) (s/split (str-slice rest (+ i 1) (str-len rest)) " ")))))
+                    (nil acc)))
+                acc))
+          {} (s/split ptx "\n")))
+
+;; The signatures of the kernels in a source (text): what a driver reads at `device-load`; a binary image has none.
+(defun signatures-of (source: (Array i8)) -> (Map str (Vec str))
+  (if (and (> (array-len source) 2) (= (array-get source 0) 47i8) (= (array-get source 1) 47i8))
+      (parse-signatures (str-from-bytes source))
+      {}))
+
+;; The launch check: `args` against `sig` for the kernel `name`; an empty signature (a binary image) checks nothing.
+(defun check-args (name: str sig: (Vec str) args: (Vec Arg)) -> (Result unit GpuError)
+  (cond (empty? sig) (Ok ())
+        (not (= (count sig) (count args)))
+        (Err (gpu-error :arguments (str "launch of " name ": " (count args) " argument" (if (= (count args) 1) "" "s") " for " (count sig) " parameter" (if (= (count sig) 1) "" "s") " (" (s/join " " sig) ")")))
+        :else
+        (loop [i 0]
+          (cond (>= i (count args)) (Ok ())
+                (not (= (arg-kind (nth args i)) (nth sig i)))
+                (Err (gpu-error :arguments (str "launch of " name ": argument " (+ i 1) " is " (arg-kind (nth args i)) ", the parameter is " (nth sig i))))
+                :else (recur (+ i 1))))))
+
+;; The grid and block check every driver makes: one to three positive dimensions, the block within `max-block` threads.
+(defun check-dims (name: str grid: (Vec i64) block: (Vec i64) max-block: i64) -> (Result unit GpuError)
+  (let [ok? (fn (v: (Vec i64)) (and (>= (count v) 1) (<= (count v) 3) (every? (fn (x: i64) (and (>= x 1) (<= x 2147483647))) v)))
+        threads (reduce (fn (acc: i64 x: i64) (* acc x)) 1 block)]
+    (cond (not (ok? grid)) (Err (gpu-error :launch (str "launch of " name ": a grid is 1 to 3 positive dimensions, not " grid)))
+          (not (ok? block)) (Err (gpu-error :launch (str "launch of " name ": a block is 1 to 3 positive dimensions, not " block)))
+          (> threads max-block) (Err (gpu-error :launch (str "launch of " name ": a block of " threads " threads; the device allows " max-block)))
+          :else (Ok ()))))

@@ -1,0 +1,211 @@
+;; compiler/own/kernel.fib: the kernel-subset checker (docs/design/gpu.md 3, spec/types.md 2.17; package GPU-2). A `defkernel` (syntax §3.22)
+;; is checked after inference, at the source: its body, and the body of every function it reaches (`:kernel-pure` is inferred: a function
+;; reached from a kernel is checked under the same rules, and the error names the path), may hold what the GPU can run and nothing that
+;; reaches the runtime. Refused, each at its position, with `kernel K:` first and the path when the position is in a reached function:
+;;   a parameter that is not a scalar or a `ptr`; a constructor (any heap data: a struct, an enum, `some`, a Vec, a Map), a cell of an object, `atom`,
+;;   `array`, `str`, `spawn`, `join`, `catch-run`, `throw-object` and every other builtin outside the list below (the message names it);
+;;   a string literal (except the message of `trap`); a `Simd` value (`simd`, `splat`, `load-f32x4`: the lane model is the CPU's, gpu.md 5.3);
+;;   a closure (`fn`), `async`, `await`, `quote`, `dyn`, `@`, `set!`, `set-field!`, `&`, a field read, a `match` on data (patterns other than a
+;;   literal, a wildcard or a name), an extern, a `def`; protocol dispatch through `dyn` or a bound (an instance that is not a built-in scalar
+;;   one is a function: checked like one); recursion, direct or mutual (the call graph of a kernel is acyclic); and a binding or a result
+;;   whose type is a string, a lane vector or an object.
+;;   Allowed: arithmetic and comparison on scalars (checked `+ - *` trap on the device), the conversions, the bit functions, `simd/fma`,
+;;   `simd/sqrt` and the float family on scalars, `ptr+`, the scalar `load-*`/`store-*`, `trap`, `unchecked-*`, `f32->bits` and kin,
+;;   `gpu/*`, `if`, `do`, `let`, `loop`/`recur` (unbounded loops are the GPU's problem), `unsafe`, `and`, `or`; a `cell` of a scalar with `@` and
+;;   `set!` (an accumulator: the emitter's stack slot, LLVM's registers; a cell that escapes would reach the allocator, which the lIR
+;;   backstop refuses).
+;; The lIR-level refusal of native.kernel stays as the backstop.
+(ns own.kernel
+  (:use syntax.pos types.ty types.ast types.decls types.table types.program types.builtins types.infer.cx types.display own.error))
+
+(defstruct Cx :private (p: TypedProgram kernel: str errs: (Cell (Vec OwnError)) done: (Cell (Set i64)) stack: (Cell (Vec i64)) path: (Cell (Vec str))))
+
+(defun fail :private (cx: Cx pos: Pos what: str) -> unit
+  (let [path @(. cx path)
+        where (if (<= (count path) 1) "" (str " (reached through " (join-path path) ")"))]
+    (set! (. cx errs) (conj @(. cx errs) (own-error KernelRule pos (str "kernel " (. cx kernel) ": " what where))))))
+
+(defun join-path :private (path: (Vec str)) -> str
+  (reduce (fn (acc: str s: str) (if (= acc "") s (str acc " -> " s))) "" path))
+
+;; ---- types
+
+(defun scalar-ty? :private (t: Ty) -> bool
+  (match t ((TCon (KScalar _) _) true) (_ false)))
+
+;; A local whose type is `(Cell scalar)`: a kernel's accumulator (a stack slot the emitter makes, registers after LLVM; D6 of types.md 6.11), allowed.
+(defun scalar-cell? :private (cx: Cx x: Expr) -> bool
+  (match (. x kind)
+    ((ELocal b) (match (binding-ty cx b)
+                  ((some (TCon (KCell) args)) (and (= (count args) 1) (scalar-ty? (nth args 0))))
+                  (_ false)))
+    (_ false)))
+
+;; Why a type is not a kernel's, nil when it is: a scalar, a `ptr`, or a cell of a scalar.
+(defun type-objection :private (cx: Cx t: Ty) -> (Option str)
+  (match t
+    ((TCon (KScalar _) _) nil)
+    ((TCon (KCell) args) (if (and (= (count args) 1) (scalar-ty? (nth args 0))) nil (some "a cell of an object: a kernel has cells of scalars only")))
+    ((TCon (KStr) _) (some "a string: a kernel has no strings"))
+    ((TCon (KSimd) _) (some "a Simd value: a kernel is scalar code, the GPU supplies the lanes (docs/design/gpu.md 5.3)"))
+    ((TVar _) nil) ((TGen _) nil) ((TRigid _) nil)
+    (_ (some (str "heap data of type " (printer-ty (printer-with-names (. (. cx p) globals) [] []) t) ": a kernel allocates nothing")))))
+
+(defun check-ty :private (cx: Cx pos: Pos t: (Option Ty)) -> unit
+  (match t
+    ((some ty) (match (type-objection cx ty) ((some why) (fail cx pos why)) (nil ())))
+    (nil ())))
+
+(defun binding-ty :private (cx: Cx b: i64) -> (Option Ty) (get (. (. cx p) binding-types) b))
+(defun expr-ty :private (cx: Cx e: Expr) -> (Option Ty) (get (. (. cx p) expr-types) (. e id)))
+
+;; ---- builtins
+
+(def allowed-builtins: (Vec str) :private
+  ["not" "trunc" "zext" "sext" "fptrunc" "fpext" "fptosi" "fptoui" "sitofp" "uitofp" "f64->bits" "bits->f64" "f32->bits" "bits->f32"
+   "trap" "ptr+" "load-i8" "load-i16" "load-i32" "load-i64" "load-ptr" "store-i8" "store-i16" "store-i32" "store-i64" "store-ptr"
+   "load-f32" "load-f64" "store-f32" "store-f64" "unchecked-add" "unchecked-subtract" "unchecked-multiply" "unchecked-negate"
+   "simd/fma" "simd/muladd" "simd/sqrt" "simd/floor" "simd/ceil" "simd/trunc" "simd/abs" "simd/min" "simd/max" "ctz" "clz"
+   "gpu/local-id" "gpu/group-id" "gpu/group-size" "gpu/num-groups" "gpu/global-id" "gpu/barrier" "gpu/shared"])
+
+(defun allowed-builtin? :private (name: str) -> bool
+  (reduce (fn (acc: bool x: str) (or acc (= x name))) false allowed-builtins))
+
+(defun builtin-name :private (cx: Cx b: i64) -> str (. (nth (. (. cx p) builtins) b) name))
+
+;; ---- the walk
+
+(defun walk-all :private (cx: Cx es: (Vec Expr)) -> unit
+  (dotimes (i (count es)) (walk cx (nth es i))))
+
+(defun pat-ok? :private (pat: Pattern) -> bool
+  (match (. pat kind) ((PWild) true) ((PBind _) true) ((PLit _) true) (_ false)))
+
+(defun walk-let :private (cx: Cx binds: (Vec LetBind) body: Expr) -> unit
+  (do (dotimes (i (count binds))
+        (let [b (nth binds i)]
+          (do (if (pat-ok? (. b pat)) (check-ty cx (. (. b pat) pos) (expr-ty cx (. b init)))
+                  (fail cx (. (. b pat) pos) "a pattern over data: a kernel binds names, scalars and pointers only"))
+              (walk cx (. b init)))))
+      (walk cx body)))
+
+(defun walk-match :private (cx: Cx e: Expr s: Expr clauses: (Vec Clause)) -> unit
+  (do (walk cx s)
+      (dotimes (i (count clauses))
+        (let [c (nth clauses i)]
+          (do (when (not (pat-ok? (. c pat))) (fail cx (. (. c pat) pos) "a match on data: a kernel matches literals only (no enum, no Option, no struct)"))
+              (match (. c guard) ((some g) (walk cx g)) (nil ()))
+              (walk cx (. c body)))))))
+
+(defun walk :private (cx: Cx e: Expr) -> unit
+  (match (. e kind)
+    ((ELit (LitStr _)) (fail cx (. e pos) "a string literal: a kernel has no strings (a trap's message is the exception)"))
+    ((ELit _) ())
+    ((ELocal _) ())
+    ((EGlobal r) (global-value cx e r))
+    ((ECall head args) (walk-call cx e head args))
+    ((EFn _) (fail cx (. e pos) "a closure: a kernel has no function values (call a named function; it is checked too)"))
+    ((ELet binds body) (walk-let cx binds body))
+    ((EMatch s clauses) (walk-match cx e s clauses))
+    ((ELoop binds body) (do (dotimes (i (count binds)) (let [b (nth binds i)] (do (check-ty cx (. (. b init) pos) (expr-ty cx (. b init))) (walk cx (. b init))))) (walk cx body)))
+    ((EField _ _ _) (fail cx (. e pos) "a field read: a kernel has no objects"))
+    ((EDeref (PlExpr x) _) (if (scalar-cell? cx x) () (fail cx (. e pos) "a cell read: a kernel has no cells but scalar ones (a pointer is read with load-f32 and kin)")))
+    ((EDeref _ _) (fail cx (. e pos) "a cell read: a kernel has no cells but scalar ones (a pointer is read with load-f32 and kin)"))
+    ((ESet (PlExpr x) v) (if (scalar-cell? cx x) (walk cx v) (fail cx (. e pos) "set!: a kernel has no cells but scalar ones")))
+    ((ESet _ _) (fail cx (. e pos) "set!: a kernel has no cells but scalar ones"))
+    ((ESetField _ _ _) (fail cx (. e pos) "set-field!: a kernel has no objects"))
+    ((EAsync _ _) (fail cx (. e pos) "async: a kernel runs no task"))
+    ((EAwait _) (fail cx (. e pos) "await: a kernel runs no task"))
+    ((EQuote _) (fail cx (. e pos) "quote: a kernel has no forms"))
+    ((EDyn _ _ _ _) (fail cx (. e pos) "dyn: a kernel has no dynamic dispatch"))
+    ((ESimd _ _) (fail cx (. e pos) "a Simd value: a kernel is scalar code, the GPU supplies the lanes (docs/design/gpu.md 5.3)"))
+    ((ESplat _ _) (fail cx (. e pos) "a Simd value: a kernel is scalar code, the GPU supplies the lanes (docs/design/gpu.md 5.3)"))
+    ((EConcat _) (fail cx (. e pos) "a string: a kernel has no strings"))
+    (_ (walk-all cx (expr-children e)))))
+
+;; A global used as a value (not the head of a call).
+(defun global-value :private (cx: Cx e: Expr r: GlobalRef) -> unit
+  (match r
+    ((GFun _) (fail cx (. e pos) "a function as a value: a kernel has no function values"))
+    ((GCtor _ _) (fail cx (. e pos) "a constructor as a value: a kernel allocates nothing"))
+    ((GMethod _ _) (fail cx (. e pos) "a method as a value: a kernel has no function values"))
+    ((GBuiltin _) (fail cx (. e pos) "a builtin as a value: a kernel has no function values"))
+    ((GDef _) (fail cx (. e pos) "a def: a kernel reads no global"))
+    ((GExtern _) (fail cx (. e pos) "an extern: a kernel calls no C function"))))
+
+(defun arg-expr :private (cx: Cx a: Arg) -> unit
+  (match a
+    ((ArgExpr x) (walk cx x))
+    ((ArgAmp _ pos) (fail cx pos "an & argument: a kernel has no cells"))))
+
+;; A call: by what its head is.
+(defun walk-call :private (cx: Cx e: Expr head: Expr args: (Vec Arg)) -> unit
+  (match (. head kind)
+    ((EGlobal (GBuiltin b)) (walk-builtin cx e (builtin-name cx b) args))
+    ((EGlobal (GFun f)) (do (check-ty cx (. e pos) (expr-ty cx e)) (dotimes (i (count args)) (arg-expr cx (nth args i))) (reach-fun cx (. e pos) f)))
+    ((EGlobal (GMethod p i)) (do (check-ty cx (. e pos) (expr-ty cx e)) (dotimes (i (count args)) (arg-expr cx (nth args i))) (reach-method cx e head p i)))
+    ((EGlobal (GCtor t _)) (fail cx (. e pos) (str "a constructor of " (. (g-ty (. (. cx p) globals) t) name) ": a kernel allocates nothing")))
+    ((EGlobal (GExtern x)) (fail cx (. e pos) (str "a call of the extern " (. (g-ext (. (. cx p) globals) x) name) ": a kernel calls no C function")))
+    ((EGlobal (GDef _)) (fail cx (. e pos) "a call through a def: a kernel has no function values"))
+    (_ (do (fail cx (. e pos) "a call of a value: a kernel has no function values") (walk cx head)))))
+
+(defun walk-builtin :private (cx: Cx e: Expr name: str args: (Vec Arg)) -> unit
+  (cond (= name "trap") ()
+        (= name "gpu/shared") ()
+        (= name "cell") (do (check-ty cx (. e pos) (expr-ty cx e)) (dotimes (i (count args)) (arg-expr cx (nth args i))))
+        (= name "set!") (do (check-ty cx (. e pos) (expr-ty cx e)) (dotimes (i (count args)) (arg-expr cx (nth args i))))
+        (not (allowed-builtin? name)) (fail cx (. e pos) (str "the builtin " name ": a kernel allocates nothing, runs no task and catches nothing (docs/design/gpu.md 3)"))
+        :else (do (check-ty cx (. e pos) (expr-ty cx e)) (dotimes (i (count args)) (arg-expr cx (nth args i))))))
+
+;; A reached function: checked once under the kernel's rules, with the path; a function on the stack is a recursion.
+(defun reach-fun :private (cx: Cx pos: Pos f: i64) -> unit
+  (let [d (g-fun (. (. cx p) globals) f)]
+    (cond (some? (find-first (fn (x: i64) (= x f)) @(. cx stack)))
+          (fail cx pos (str "recursion: " (. d name) " is on the path " (join-path (conj @(. cx path) (. d name))) " (a kernel's call graph is acyclic)"))
+          (contains? @(. cx done) f) ()
+          :else (check-body cx f (. d name) (. d params) (. d body)))))
+
+;; A method call: a built-in scalar instance is arithmetic; another instance's method is a function; a bound or `dyn` is dispatch.
+(defun reach-method :private (cx: Cx e: Expr head: Expr p: i64 i: i64) -> unit
+  (let [g (. (. cx p) globals) m (nth (. (g-proto g p) methods) i)]
+    (match (get (. (. cx p) resolutions) (. head id))
+      ((some (ResInstance index _))
+       (let [inst (table-get (. g instances) index)]
+         (if (= (. inst module) module-builtin)
+             ()
+             (match (find-first (fn (im: ImplMethod) (= (. im index) i)) (. inst methods))
+               ((some im) (check-method cx (. m name) index im))
+               (nil (fail cx (. e pos) (str "the method " (. m name) " has no body in the instance: a kernel cannot call a default")))))))
+      ((some (ResBound _)) (fail cx (. e pos) (str "the method " (. m name) " dispatches on a bound: a kernel calls no polymorphic function")))
+      ((some (ResDyn)) (fail cx (. e pos) (str "the method " (. m name) " dispatches through dyn: a kernel has no dynamic dispatch")))
+      (nil (fail cx (. e pos) (str "the method " (. m name) ": no resolution"))))))
+
+(defun check-method :private (cx: Cx name: str index: i64 im: ImplMethod) -> unit
+  (let [key (+ 1000000000 (* 1000 index) (. im index))]
+    (if (or (contains? @(. cx done) key) (some? (find-first (fn (x: i64) (= x key)) @(. cx stack))))
+        ()
+        (do (set! (. cx stack) (conj @(. cx stack) key)) (set! (. cx path) (conj @(. cx path) name))
+            (dotimes (i (count (. im params))) (check-ty cx (. im pos) (binding-ty cx (nth (. im params) i))))
+            (walk cx (. im body))
+            (set! (. cx stack) (pop @(. cx stack))) (set! (. cx path) (pop @(. cx path)))
+            (set! (. cx done) (conj @(. cx done) key))))))
+
+;; The body of a function `f` (a kernel or a reached one): its parameters, then its body, on the stack while it is walked.
+(defun check-body :private (cx: Cx f: i64 name: str params: (Vec ParamDecl) body: Expr) -> unit
+  (do (set! (. cx stack) (conj @(. cx stack) f)) (set! (. cx path) (conj @(. cx path) name))
+      (dotimes (i (count params))
+        (let [p (nth params i) pos (. (table-get (. (. (. cx p) globals) bindings) (. p binding)) pos)]
+          (if (. p amp) (fail cx pos (str "the parameter &" (. p name) ": a kernel has no cells"))
+              (check-ty cx pos (binding-ty cx (. p binding))))))
+      (walk cx body)
+      (set! (. cx stack) (pop @(. cx stack))) (set! (. cx path) (pop @(. cx path)))
+      (set! (. cx done) (conj @(. cx done) f))))
+
+;; The errors of every kernel of the program, in declaration order; none when the program has no kernel.
+(defun kernel-check (p: TypedProgram) -> (Vec OwnError)
+  (let [g (. p globals) ks @(. g kernels)]
+    (reduce (fn (acc: (Vec OwnError) f: i64)
+              (let [d (g-fun g f) cx (Cx p (. d name) (cell []) (cell (set-empty)) (cell []) (cell []))]
+                (do (check-body cx f (. d name) (. d params) (. d body))
+                    (into acc @(. cx errs)))))
+            [] ks)))
