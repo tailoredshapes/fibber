@@ -87,6 +87,22 @@ x86-64-v3 (`x86-64`, `x86-64-v2`) still builds, but it is outside the supported 
 Sapphire Rapids, 10 percent on Zen 4: docs/shootout/avx512-2026-10-06.md); a release binary built for `x86-64-v3` keeps the 256-bit ones. `FIB_VECTOR_BITS=128|256|512`
 overrides the width for one run (a width the CPU lacks is split into the registers it has: correct, slower). Design: docs/design/avx512.md.
 
+## Names that look alike
+
+A few names mean one thing unqualified and another under a module alias, and the rule is to **qualify, never rename** (spec/stdlib.md section 3, N15):
+
+| you want | write | not |
+|----------|-------|-----|
+| wait for a task | `(join t)` or `@t` | `(str/join ..)` |
+| join strings with a separator | `(str/join ", " xs)`, `(str/join xs)` | `(join ", " xs)`; the prelude's `str-join` takes a `(Vec str)` and no separator |
+| is x in this collection | `(includes? x coll)` (the element first, so `->>` threads the collection) | `(str/includes? ..)` |
+| does this string hold that text | `(str/includes? s sub)` (the string first, as Clojure's) | `(includes? ..)` |
+| where is it in a string | `(str/index-of s value)`, `(str/last-index-of s value)` (character offsets) | `(index-of ..)` |
+
+`(:require [fib.string :as str])` always; `(:use fib.string)` shadows the implicit `join` and `includes?` with the string ones. A `Range`, a `VSeq` or a `LSeq` is not a `Vec`, so `(if c (range n) [])` does not type-check: write `(if c (rangev n) [])` (also `mapcatv`, `sortv`, `sort-byv`), or `(vec (range n))`.
+
+A byte offset that splits a character traps (`str-slice [0, 2) splits a character`); ask first with `(str/char-boundary? s i)`, `(str/next-boundary s i)`, `(str/prev-boundary s i)`, or count in characters (`subs`, `str/index-of`).
+
 ## Catching traps
 
 A trap (an index out of range, an integer overflow, `(trap msg)`, `unwrap` of `nil`) aborts the program unless a
