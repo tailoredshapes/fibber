@@ -212,13 +212,20 @@ def wy_sigs(scheme, file, nvalid, per_bad, cap_bad, groups=3):
         ts = grp["tests"]
         for t in stratified([t for t in ts if t["result"] == "valid"], 2, nvalid): add_sig(scheme, f"wycheproof-{file}-{t['tcId']}", spki, H(t["msg"]), H(t["sig"]), True)
         for t in stratified([t for t in ts if t["result"] == "invalid"], per_bad, cap_bad): add_sig(scheme, f"wycheproof-{file}-{t['tcId']}", spki, H(t["msg"]), H(t["sig"]), False)
-wy_sigs("ed25519", "ed25519", 5, 1, 24)
-wy_sigs("ecdsa-p256-sha256", "ecdsa_secp256r1_sha256", 6, 1, 40)
-wy_sigs("ecdsa-p384-sha384", "ecdsa_secp384r1_sha384", 4, 1, 24)
+wy_sigs("ed25519", "ed25519", 5, 4, 30)
+wy_sigs("ecdsa-p256-sha256", "ecdsa_secp256r1_sha256", 6, 2, 60)
+wy_sigs("ecdsa-p384-sha384", "ecdsa_secp384r1_sha384", 4, 2, 40)
 wy_sigs("rsa-pss-sha256", "rsa_pss_2048_sha256_mgf1_32", 4, 1, 14)
 wy_sigs("rsa-pss-sha384", "rsa_pss_2048_sha384_mgf1_48", 3, 1, 10)
 wy_sigs("rsa-pkcs1-sha256", "rsa_signature_2048_sha256", 4, 1, 16)
 wy_sigs("rsa-pkcs1-sha384", "rsa_signature_2048_sha384", 3, 1, 10)
+
+# Policy: TLS 1.3's rsa_pss_rsae_* needs MGF1 with the signature's hash and a salt as long as the hash. Wycheproof's VALID signatures of other parameters (salt length 0,
+# or MGF1 with SHA-1) are therefore INVALID here, and python (salt_length = hash length, MGF1 of the same hash) must refuse them too.
+for file in ("rsa_pss_2048_sha256_mgf1_0", "rsa_pss_2048_sha256_mgf1sha1_20"):
+    for grp in wy(file)["testGroups"]:
+        for t in [t for t in grp["tests"] if t["result"] == "valid"][:2]:
+            add_sig("rsa-pss-sha256", f"policy-{file}-{t['tcId']}", grp["publicKeyDer"], H(t["msg"]), H(t["sig"]), False)
 
 # RFC 8032 7.1 tests 1 and 2: public key, message and signature from the RFC; signing known-answer vectors too (Ed25519 is deterministic)
 sign_rows = []

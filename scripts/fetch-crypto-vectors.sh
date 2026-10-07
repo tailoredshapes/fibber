@@ -10,7 +10,7 @@ dest=${1:-$HOME/.cache/fibber-scratch/tools/crypto-vectors}
 record=no; [ "${2:-}" = "--record" ] && record=yes
 mkdir -p "$dest"
 RFCS="5869 7748 8032 8439 8448 8446"
-WYCHE="aes_gcm chacha20_poly1305 x25519 ed25519 ecdsa_secp256r1_sha256 ecdsa_secp384r1_sha384 rsa_pss_2048_sha256_mgf1_32 rsa_pss_2048_sha384_mgf1_48 rsa_signature_2048_sha256 rsa_signature_2048_sha384 ecdh_secp256r1 ecdh_secp384r1 ecdh_secp256r1_ecpoint"
+WYCHE="aes_gcm chacha20_poly1305 x25519 ed25519 ecdsa_secp256r1_sha256 ecdsa_secp384r1_sha384 rsa_pss_2048_sha256_mgf1_32 rsa_pss_2048_sha384_mgf1_48 rsa_pss_2048_sha256_mgf1sha1_20 rsa_pss_2048_sha256_mgf1_0 rsa_signature_2048_sha256 rsa_signature_2048_sha384 ecdh_secp256r1 ecdh_secp384r1 ecdh_secp256r1_ecpoint"
 for r in $RFCS; do
   [ -s "$dest/rfc$r.txt" ] || curl -sSfL -m 120 -o "$dest/rfc$r.txt" "https://www.rfc-editor.org/rfc/rfc$r.txt"
 done

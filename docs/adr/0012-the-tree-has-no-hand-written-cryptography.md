@@ -1,7 +1,7 @@
 # 0012. The tree has no hand-written cryptography
 
 Status: accepted
-Date: 2026-10-06
+Date: 2026-10-06 (extended 2026-10-07: AEAD, key agreement, signatures)
 Source: the owner's standing rule (memory: "No hand-written crypto"); docs/design/crypto.md sections 1, 3 and 6; lib/fib/crypto/README.md.
 
 ## Context
@@ -19,6 +19,12 @@ was prose (a memory note and a design paragraph); nothing stopped a module from 
 3. No module of `lib/` requires a driver namespace (`fib.crypto.openssl`, `fib.crypto.commoncrypto`): drivers live in their own repositories.
 4. The contract that every provider must pass, and the proofs that the contract can fail, stay in the tree: `fib.crypto.contract`, the
    fault decorator `fib.crypto.fault`, and the two gate specs of `specs/`.
+5. (2026-10-07) The same holds for what the protocol grew: AEAD (AES-GCM, ChaCha20-Poly1305), key agreement (X25519, ECDH), signatures (RSA, ECDSA, Ed25519)
+   and HKDF-Expand are a protocol, four contracts (`contract-aead`, `-kex`, `-sig`, `-tls`) over published vectors (`vectors-aead`, `-pk`, `-tls`, generated from
+   RFC texts and Project Wycheproof by `scripts/gen-crypto-vectors-pk.sh`), and the faults of `fib.crypto.fault`; the primitives are a driver's. The only
+   byte-level code of ours is `fib.crypto.der` (the fixed AlgorithmIdentifier headers of RFC 5480 and RFC 8410 that wrap a raw key) and `fib.crypto.encoding`:
+   encodings of public data. The heuristic list below gains the ChaCha20 constants, Curve25519's `a24` and the P-256 prime. No fake provider is in `lib/`: the
+   shape spec's `Refuses` provider is in `specs/`, lists capabilities, does no cryptography and answers an error to everything.
 
 ## Consequences
 
@@ -34,7 +40,8 @@ was prose (a memory note and a design paragraph); nothing stopped a module from 
 (defun hash-constants () -> (Vec str)
   ["0x428a2f98" "0x428A2F98" "0x6a09e667" "0x6A09E667" "0xbb67ae85" "0x67452301" "0xefcdab89" "0xEFCDAB89" "0x5be0cd19" "0xd76aa478"
    "0xc1059ed8" "0xcbbb9d5d" "0x6a09e667f3bcc908" "0xcbbb9d5dc1059ed8" "0x428a2f98d728ae22"
-   "1116352408" "1779033703" "1732584193" "3614090360" "0x63 0x7c 0x77 0x7b" "99 124 119 123"])
+   "1116352408" "1779033703" "1732584193" "3614090360" "0x63 0x7c 0x77 0x7b" "99 124 119 123"
+   "0x61707865" "0x3320646e" "0x79622d32" "0x6b206574" "1634760805" "121665" "0x0ffffffc0ffffffc" "0xffffffff00000001" "0xFFFFFFFF00000001"])
 
 (defun constants-in (repo: Repo) -> (Vec Finding)
   (reduce (fn (acc: (Vec Finding) c: str) (into acc (grep-live repo ["lib/**.fib" "compiler/**.fib" "!compiler/tests/**"] c))) [] (hash-constants)))
@@ -42,7 +49,9 @@ was prose (a memory note and a design paragraph); nothing stopped a module from 
 (rule "no live line of lib/ or compiler/ carries a SHA, MD5 or AES constant"
   (constants-in repo)
   (plant "lib/fib/crypto/ops.fib" "\n(def k0: i64 0x428a2f98)\n")
-  (plant "lib/fib/otel/ids.fib" "\n(def sbox: (Array i64) [0x63 0x7c 0x77 0x7b 0xf2])\n"))
+  (plant "lib/fib/otel/ids.fib" "\n(def sbox: (Array i64) [0x63 0x7c 0x77 0x7b 0xf2])\n")
+  (plant "lib/fib/crypto/pk.fib" "\n(def sigma0: i64 0x61707865)\n")
+  (plant "lib/fib/crypto/der.fib" "\n(def a24: i64 121665)\n"))
 
 (rule "no definition named default-provider (a provider is a value the program passes)"
   (grep-live repo ["lib/**.fib" "compiler/**.fib" "!compiler/tests/**"] "default-provider")
@@ -55,9 +64,16 @@ was prose (a memory note and a design paragraph); nothing stopped a module from 
   (plant-file "lib/fib/zz-plant.fib" "(ns fib.zz-plant (:require [fib.crypto.openssl :as o]))\n"))
 
 (rule "the contract, the fault decorator and the gate's two specs are in the tree"
-  (missing repo ["lib/fib/crypto/contract.fib" "lib/fib/crypto/fault.fib" "specs/crypto-contract-shape-spec.fib" "specs/crypto-encoding-spec.fib"])
+  (missing repo ["lib/fib/crypto/contract.fib" "lib/fib/crypto/fault.fib" "specs/crypto-contract-shape-spec.fib" "specs/crypto-encoding-spec.fib"
+                "lib/fib/crypto/contract-aead.fib" "lib/fib/crypto/contract-kex.fib" "lib/fib/crypto/contract-sig.fib" "lib/fib/crypto/contract-tls.fib"])
   (plant-remove "lib/fib/crypto/contract.fib")
-  (plant-remove "specs/crypto-contract-shape-spec.fib"))
+  (plant-remove "specs/crypto-contract-shape-spec.fib")
+  (plant-remove "lib/fib/crypto/contract-kex.fib"))
+
+(rule "the AEAD and key-agreement contracts keep their negative cases (a tag that does not verify, a small-order point)"
+  (into (must-contain repo "lib/fib/crypto/contract-aead.fib" "authentication-failed")
+        (must-contain repo "lib/fib/crypto/contract-kex.fib" "small-order-points"))
+  (plant-file "lib/fib/crypto/contract-aead.fib" "(ns fib.crypto.contract-aead)\n"))
 
 (rule "the contract requires the capabilities a protocol consumer needs, and the decorator can fake a fallback"
   (into (must-contain repo "lib/fib/crypto/contract.fib" "(defun required-capabilities () -> (Vec keyword) [:sha-256 :sha-384 :sha-512 :hmac :pbkdf2 :hkdf :random :ct-equal])")
