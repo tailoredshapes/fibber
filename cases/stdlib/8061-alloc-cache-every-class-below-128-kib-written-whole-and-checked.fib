@@ -1,0 +1,39 @@
+;; spec: docs/design/allocator.md section 9 (Size classes, with the musl floor): a request is rounded up to its class and a freed block filed down by its usable size, in the classes below 128 KiB too
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib
+;; For every class from 5 KiB to 128 KiB (size (k+1) * 2^(e-2)), arrays of i64 whose blocks are just under, at and just over the
+;; class size (with or without the 16 bytes trace mode puts in front), first made and dropped largest first (the cache then holds a
+;; block of every class), then made smallest first and all kept alive at once, each written in every element with a pattern of its
+;; own and then all read back (classes the runtime does not cache, a glibc executable's below 128 KiB, are plain blocks and the case checks the same writes; where the floor is 4 KiB, a musl executable, the second round must be hits: code 3). A cache that hands out a block of the class below (too small by up to a fifth) has arrays write past
+;; their block into a neighbour (a wrong element: code 1) or past the mapping (SIGSEGV); either fails the case.
+(ns main (:require [fib.os.memory :as m]))
+
+(defun class-size (idx: i64) -> i64
+  (let [e (+ (quot idx 4) 12) k (+ (rem idx 4) 4)] (* (+ k 1) (shl 1 (- e 2)))))
+
+;; Element counts of i64 arrays around each boundary: the block is 24 bytes of header (and 16 of trace prefix) plus 8 per element.
+(def lengths: (Vec i64)
+  (vec (mapcat (fn (idx: i64) (let [c (class-size idx)] [(- (quot (- c 40) 8) 1) (quot (- c 40) 8) (quot (- c 24) 8) (+ (quot (- c 24) 8) 1)]))
+               (range 0 20))))
+
+(defun make (n: i64 tag: i64) -> (Array i64)
+  (let [buf (cell (array n 0))]
+    (do (dotimes (i n) (array-set! &buf i (+ (* tag 1000003) i))) @buf)))
+
+(defun intact? (a: (Array i64) tag: i64) -> bool
+  (loop [i 0] (cond (>= i (array-len a)) true (not (= (array-get a i) (+ (* tag 1000003) i))) false :else (recur (+ i 1)))))
+
+(defun main () -> i64
+  (let [warm (reduce (fn (acc: i64 k: i64) (let [n (nth lengths (- (count lengths) 1 k)) a (make n k)] (+ acc (array-len a))))
+                     0 (range (count lengths)))
+        h0 (. (m/alloc-stats) hits)
+        live (mapv (fn (k: i64) (make (nth lengths k) (+ k 100))) (range (count lengths)))
+        h1 (. (m/alloc-stats) hits)
+        ok (reduce (fn (acc: bool k: i64) (and acc (intact? (nth live k) (+ k 100)))) true (range (count live)))]
+    (cond (not ok) 1
+          (not (= warm (reduce + 0 lengths))) 2
+          (and (<= (m/cache-floor) 4096) (< (- h1 h0) 15)) 3
+          :else 0)))

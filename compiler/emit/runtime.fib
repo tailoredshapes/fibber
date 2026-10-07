@@ -2781,7 +2781,7 @@
 ;; malloc block may be filed here. `fib.lc-get` and `fib.lc-put` serve objects (fib.alloc-slow, fib.free-block) and trace mode's
 ;; blocks (fib.drop-one); a cached block is runtime memory, in no trace line.
 ;;
-;; Classes: four per power of two, size (k+1) * 2^(e-2) for k in 4..7, index (e-16)*4 + k-4; index 3 is 128 KiB, 123 is 2^47.
+;; Classes: four per power of two, size (k+1) * 2^(e-2) for k in 4..7, index (e-10)*4 + k-4; index 27 is 128 KiB, 147 is 2^47.
 ;; A cached block's first word is the next block of its class, its second the time it was filed (fib.lc-now, ns); newest first.
 ;; Every list, the stats and the peak are under @fib.lc-lock (fib.lock, the atoms' spinlock); @fib.lc-bytes and @fib.lc-next
 ;; are also read without it (fib.lc-tick), so every access of those two is atomic. The time is read only while the cache holds
@@ -2794,7 +2794,10 @@
 (global internal fib.lc-decay i64 (i64 1000000000))
 (global internal fib.lc-cap i64 (i64 1073741824))
 (global internal fib.lc-lock i32 (i32 0))
-(global internal fib.lc-heads [124 x ptr] (zeroinitializer [124 x ptr]))
+(global internal fib.lc-heads [148 x ptr] (zeroinitializer [148 x ptr]))
+;; The smallest block the cache keeps (and the smallest request it serves): 128 KiB; emit.os sets 4 KiB for a musl target, whose malloc maps and unmaps
+;; a group of every block from 2 KiB up each time (24,339 mmap calls for the strings benchmark, docs/design/allocator.md, section 9). At least 1025.
+(global internal fib.lc-floor i64 (i64 131072))
 ;; The bytes held (by class size), and the time of the next sweep (the oldest block's filing time plus the decay).
 (global internal fib.lc-bytes i64 (i64 0))
 (global internal fib.lc-next i64 (i64 0))
@@ -2832,24 +2835,24 @@
       (br loop)))
   (block done (ret e)))
 
-;; The class of a request of n bytes (131072 <= n <= 2^47): the smallest class size not below n.
+;; The class of a request of n bytes (fib.lc-floor <= n <= 2^47): the smallest class size not below n.
 (define internal (fib.lc-class-up i64) ((i64 n))
   (block entry
     (let ((m (sub n (i64 1)))
           (e (call @fib.lc-log2 m))
           (k (lshr m (sub e (i64 2)))))
-      (ret (add (mul (sub e (i64 16)) (i64 4)) (sub k (i64 4)))))))
+      (ret (add (mul (sub e (i64 10)) (i64 4)) (sub k (i64 4)))))))
 
-;; The class a block of u usable bytes (u >= 131072) is filed in: the largest class size not above u; above 123 it is not cached.
+;; The class a block of u usable bytes (u >= fib.lc-floor) is filed in: the largest class size not above u; above 147 it is not cached.
 (define internal (fib.lc-class-down i64) ((i64 u))
   (block entry
     (let ((e (call @fib.lc-log2 u))
           (k (lshr u (sub e (i64 2)))))
-      (ret (add (mul (sub e (i64 16)) (i64 4)) (sub k (i64 5)))))))
+      (ret (add (mul (sub e (i64 10)) (i64 4)) (sub k (i64 5)))))))
 
 (define internal (fib.lc-class-size i64) ((i64 idx))
   (block entry
-    (let ((e (add (udiv idx (i64 4)) (i64 16)))
+    (let ((e (add (udiv idx (i64 4)) (i64 10)))
           (k (add (urem idx (i64 4)) (i64 4))))
       (ret (shl (add k (i64 1)) (sub e (i64 2)))))))
 
@@ -2864,7 +2867,7 @@
 (define internal (fib.lc-get ptr) ((i64 n))
   (block entry
     (let ((on (atomic-load monotonic i32 @fib.lc-on)))
-      (br (and (icmp ne on (i32 0)) (and (icmp uge n (i64 131072)) (icmp ule n (i64 140737488355328)))) cached plain)))
+      (br (and (icmp ne on (i32 0)) (and (icmp uge n (load i64 @fib.lc-floor)) (icmp ule n (i64 140737488355328)))) cached plain)))
   (block plain
     (call @fib.lc-tick)
     (ret (call @malloc n)))
@@ -2894,10 +2897,10 @@
     (br (icmp ne (atomic-load monotonic i32 @fib.lc-on) (i32 0)) sized plain))
   (block sized
     (let ((u (call @fib.lc-usable p)))
-      (br (icmp uge u (i64 131072)) classed plain)))
+      (br (icmp uge u (load i64 @fib.lc-floor)) classed plain)))
   (block classed
     (let ((idx (call @fib.lc-class-down u)))
-      (br (icmp ule idx (i64 123)) file plain)))
+      (br (icmp ule idx (i64 147)) file plain)))
   (block file
     (let ((size (call @fib.lc-class-size idx))
           (now (call @fib.lc-now))
@@ -3032,7 +3035,7 @@
           (t (call @fib.lc-oldest slot))
           (old1 (select (icmp slt t oldest) t oldest))
           (idx1 (add idx (i64 1))))
-      (br (icmp ult idx1 (i64 124)) loop done)))
+      (br (icmp ult idx1 (i64 148)) loop done)))
   (block done
     (let ((left (atomic-load monotonic i64 @fib.lc-bytes))
           (gone (sub (load i64 (getelementptr i64 @fib.lc-stats (i64 2))) before)))
@@ -3093,11 +3096,11 @@
 ;; extern: (declare fib_alloc_ctl i64 (i64 i64 i64))
 ;; The library's door (fib.os.memory; emit.rt binds an `extern` of this name to this definition): op 0 trim (the bytes given back),
 ;; 1 bytes held, 2 hits, 3 misses, 4 bytes returned, 5 blocks returned, 6 blocks refused by the cap, 7 peak bytes held, 8 the decay
-;; in ms (0: off), 9 the cap, 10 configure decay a ms and cap b bytes, 11 read the environment again; -1 for any other op.
+;; in ms (0: off), 9 the cap, 10 configure decay a ms and cap b bytes, 11 read the environment again, 12 the smallest block the cache keeps (bytes); -1 for any other op.
 (define internal (fib_alloc_ctl i64) ((i64 op) (i64 a) (i64 b))
   (block entry
     (switch op other ((i64 0) trim) ((i64 1) held) ((i64 2) stat) ((i64 3) stat) ((i64 4) stat) ((i64 5) stat) ((i64 6) stat)
-            ((i64 7) stat) ((i64 8) decay) ((i64 9) cap) ((i64 10) conf) ((i64 11) env)))
+            ((i64 7) stat) ((i64 8) decay) ((i64 9) cap) ((i64 10) conf) ((i64 11) env) ((i64 12) floor)))
   (block trim (ret (call @fib.lc-sweep (i64 9223372036854775807))))
   (block held (ret (atomic-load monotonic i64 @fib.lc-bytes)))
   (block stat (ret (call @fib.lc-stat (sub op (i64 2)))))
@@ -3108,6 +3111,7 @@
   (block cap (ret (atomic-load monotonic i64 @fib.lc-cap)))
   (block conf (call @fib.lc-configure a b) (ret (i64 0)))
   (block env (call @fib.lc-init) (ret (i64 0)))
+  (block floor (ret (load i64 @fib.lc-floor)))
   (block other (ret (i64 -1))))
 
 ;; At the end of `main` (fib.pool-quiesce) when FIB_ALLOC_STATS is set: one line of the cache's counts on standard error.

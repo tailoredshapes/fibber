@@ -59,7 +59,7 @@ Everything else of the 102 C names the runtime and `fib.os` use exists in musl (
 | What | Symptom | Fix |
 |---|---|---|
 | `__x86_get_cpuid_feature_leaf` (glibc 2.33+: the start-up CPU check of ADR 0008 calls it) | undefined at link | `rt/static/cpuid.c`: the same function over `cpuid`/`xgetbv`, compiled by `build-musl.sh` into `fibshim.o`, linked on x86-64 only; aarch64 has no check |
-| `mallopt(M_MMAP_THRESHOLD)` (`rt/alloc.lir`, the large-block cache) | undefined at link | `emit.os` drops the call for a musl target, as it does for Darwin; musl's malloc maps blocks of 128 KiB and more on their own already |
+| `mallopt(M_MMAP_THRESHOLD)` (`rt/alloc.lir`, the large-block cache) | undefined at link | `emit.os` drops the call for a musl target, as it does for Darwin; musl's malloc maps blocks of 128 KiB and more on their own already; and it maps and unmaps a group for every block from about 2 KiB, so `emit.os` also sets the cache's floor to 4 KiB there (allocator.md 9: the `strings` benchmark's 24,339 mmap calls) |
 | thread stack: musl's default for a thread is **128 KiB** (glibc's: 8 MiB from `ulimit -s`) | a task recursing 40,000 deep dies of SIGSEGV | `rt/thread.lir` `fib.thread-attr`: every thread (task and pool worker) is created with an explicit 8 MiB stack. Case 8003 recurses in a task; with the stack set to 64 KiB it fails with status 139 (the planted fault), with 8 MiB it passes |
 | soft-float on aarch64 (`strtod` wants `__trunctfdf2`) | undefined at link | `libgcc.a` of the cross gcc ships with the pieces |
 | `-lm -lpthread` | not needed (musl has them in libc.a) | the static link line has none |
