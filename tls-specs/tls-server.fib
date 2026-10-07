@@ -68,12 +68,12 @@
               early (early-secret p suite) hsec (handshake-secret p suite early shared) th (transcript-hash p suite (cat [(. ch raw) sh]))
               cs-secret (derive-secret p suite hsec "c hs traffic" th) ss-secret (derive-secret p suite hsec "s hs traffic" th)
               c-hs (traffic-of p suite cs-secret) s-hs (traffic-of p suite ss-secret)
-              _ (Ok (do (set-write-keys r (. suite aead) s-hs) (set-read-keys r (. suite aead) c-hs)))
+              _ (set-write-keys p r (. suite aead) s-hs) _ (set-read-keys p r (. suite aead) c-hs)
               fl (flight-msgs p sc suite s-hs (cat [(. ch raw) sh])) _ (send-msgs p r (. sc tamper) (. fl fst))
               th-sf (transcript-hash p suite (. fl snd)) master (master-secret p suite hsec)
               c-ap-s (derive-secret p suite master "c ap traffic" th-sf) s-ap-s (derive-secret p suite master "s ap traffic" th-sf)
               c-ap (traffic-of p suite c-ap-s) s-ap (traffic-of p suite s-ap-s)]
-      (do (set-write-keys r (. suite aead) s-ap) (set! (. srv wtr) (some s-ap)) (set! (. srv pend) (some (Pend suite c-hs c-ap s-ap (. fl snd) (= (. sc tamper) :cert-request))))
+      (do (set-write-keys p r (. suite aead) s-ap) (set! (. srv wtr) (some s-ap)) (set! (. srv pend) (some (Pend suite c-hs c-ap s-ap (. fl snd) (= (. sc tamper) :cert-request))))
           (set! (. srv phase) 1) (Ok ())))))
 
 ;; ---- step 1: the client's Finished in (checked), then the scripted events out
@@ -91,14 +91,14 @@
 (defun update-wtr (p: p srv: Srv) :where ((CryptoProvider p)) -> (Result unit TlsError)
   (match @(. srv pend)
     (nil (Ok ()))
-    ((some pd) (match @(. srv wtr) (nil (Ok ())) ((some t) (try-let [n (next-traffic p (. pd suite) t)] (Ok (do (set! (. srv wtr) (some n)) (set-write-keys (. srv rec) (. (. pd suite) aead) n)))))))))
+    ((some pd) (match @(. srv wtr) (nil (Ok ())) ((some t) (try-let [n (next-traffic p (. pd suite) t)] (do (set! (. srv wtr) (some n)) (set-write-keys p (. srv rec) (. (. pd suite) aead) n))))))))
 (defun oversize :private (p: p srv: Srv) :where ((CryptoProvider p)) -> (Result unit TlsError)
   (match @(. (. srv rec) wr)
     (nil (Err (proto-err "no keys")))
     ((some pr) (let [inner (cat [(repeat-bytes 1 16385) (w8 23)]) header (cat [(w8 23) (w16 771) (w16 (+ (array-len inner) 16))])]
-                 (match (c/aead-seal p (. pr alg) (. pr key) (record-nonce (. pr iv) (. pr seq)) header inner)
+                 (match (c/aead-key-seal (. pr key) (record-nonce (. pr iv) @(. pr seq)) header inner)
                    ((Err e) (Err (from-crypto e)))
-                   ((Ok sealed) (do (set! (. (. srv rec) wr) (some (with pr (seq (+ (. pr seq) 1))))) (push-out srv (cat [header sealed])) (Ok ()))))))))
+                   ((Ok sealed) (do (set! (. pr seq) (+ @(. pr seq) 1)) (push-out srv (cat [header sealed])) (Ok ()))))))))
 (defun play-one :private (p: p srv: Srv e: Ev) :where ((CryptoProvider p)) -> (Result unit TlsError)
   (let [r (. srv rec)]
     (match e
@@ -120,7 +120,7 @@
   (match @(. srv pend)
     (nil (Err (proto-err "no flight sent")))
     ((some pd) (try-let [_ (check-client-finish p srv pd)]
-                 (do (set-read-keys (. srv rec) (. (. pd suite) aead) (. pd c-ap)) (set! (. srv rtr) (some (. pd c-ap))) (set! (. srv phase) 2) (play p srv 0))))))
+                 (try-let [_ (set-read-keys p (. srv rec) (. (. pd suite) aead) (. pd c-ap))] (do (set! (. srv rtr) (some (. pd c-ap))) (set! (. srv phase) 2) (play p srv 0)))))))
 
 (defun advance (p: p srv: Srv) :where ((CryptoProvider p)) -> unit
   (let [r (cond (= @(. srv phase) 0) (step0 p srv) (= @(. srv phase) 1) (step1 p srv) :else (Ok ()))]
@@ -135,7 +135,7 @@
             ((Ok x) (do (cond (= (. x type) ct-application-data) (set! (. srv received) (cat [@(. srv received) (. x data)]))
                               (and (= (. x type) ct-handshake) (= (b-at (. x data) 0) ht-key-update))
                                 (match @(. srv pend) (nil ()) ((some pd) (match @(. srv rtr) (nil ())
-                                  ((some t) (match (next-traffic p (. pd suite) t) ((Err _) ()) ((Ok n) (do (set! (. srv rtr) (some n)) (set-read-keys (. srv rec) (. (. pd suite) aead) n))))))))
+                                  ((some t) (match (next-traffic p (. pd suite) t) ((Err _) ()) ((Ok n) (do (set! (. srv rtr) (some n)) (set-read-keys p (. srv rec) (. (. pd suite) aead) n) ())))))))
                               :else ())
                         (recur))))))
       @(. srv received)))

@@ -1,0 +1,43 @@
+;; fib.tls.buf: a growable byte queue, the buffer under the record layer's reads and the connection's application data. Bytes go in at the end (`buf-append`, ONE blit of the
+;; range) and come out at the front (`buf-take`, one slice; `buf-skip`, none). `pos` and `end` mark the live bytes of `arr`; when everything has been taken both return to 0, so
+;; the common case (a read that ends on a record boundary) never moves a byte. When the end of the array is reached with a partial record left, the live bytes move to the front
+;; of a new array (a copy of what is LIVE, not of the capacity), and the array grows when what is live and what comes does not fit. Everything is a copy of a range: the
+;; element loop of `fib.tls.bytes/cat` is not used for data (the array blit `array-blit!`, spec/types.md 2.13.3, does it with one memmove). Nothing here is secret-dependent.
+(ns fib.tls.buf (:use fib.core fib.seq fib.coll fib.tls.bytes))
+
+(defstruct Buf (arr: (Cell (Array i8)) pos: (Cell i64) end: (Cell i64)))
+
+(defun buf-new (capacity: i64) -> Buf (Buf (cell (array capacity 0i8)) (cell 0) (cell 0)))
+(defun buf-len (b: Buf) -> i64 (- @(. b end) @(. b pos)))
+(defun buf-byte (b: Buf i: i64) -> i64 (b-at @(. b arr) (+ @(. b pos) i)))
+(defun buf-be16 (b: Buf i: i64) -> i64 (be16 @(. b arr) (+ @(. b pos) i)))
+;; The array and the offset of the first live byte, for a caller that reads the range in place (the AEAD opens a record straight out of the buffer).
+(defun buf-array (b: Buf) -> (Array i8) @(. b arr))
+(defun buf-start (b: Buf) -> i64 @(. b pos))
+
+;; Makes room for `n` more bytes at the end.
+(defun buf-room :private (b: Buf n: i64) -> unit
+  (let [pos @(. b pos) end @(. b end) cap (array-len @(. b arr)) live (- end pos)]
+    (when (> (+ end n) cap)
+      (let [ncap (if (> (+ live n) cap) (max (+ live n) (* 2 cap)) cap) fresh (cell (array ncap 0i8))]
+        (do (array-blit! &fresh 0 @(. b arr) pos live)
+            (set! (. b arr) @fresh) (set! (. b pos) 0) (set! (. b end) live))))))
+
+;; `src[off, off+n)` at the end.
+(defun buf-append (b: Buf src: (Array i8) off: i64 n: i64) -> unit
+  (do (buf-room b n)
+      (let [c (. b arr)] (array-blit! &c @(. b end) src off n))
+      (set! (. b end) (+ @(. b end) n))))
+
+;; Forgets the first `n` live bytes; an empty queue starts again at 0.
+(defun buf-skip (b: Buf n: i64) -> unit
+  (do (set! (. b pos) (+ @(. b pos) n))
+      (when (= @(. b pos) @(. b end)) (do (set! (. b pos) 0) (set! (. b end) 0)))))
+
+;; The first `n` live bytes as a new array, forgotten.
+(defun buf-take (b: Buf n: i64) -> (Array i8)
+  (let [pos @(. b pos) out (array-copy @(. b arr) pos (+ pos n))] (do (buf-skip b n) out)))
+
+;; The live bytes `[from, to)` (relative to the first), not forgotten.
+(defun buf-slice (b: Buf from: i64 to: i64) -> (Array i8)
+  (let [pos @(. b pos)] (array-copy @(. b arr) (+ pos from) (+ pos to))))

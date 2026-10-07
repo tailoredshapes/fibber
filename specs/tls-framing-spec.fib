@@ -1,0 +1,133 @@
+;; The record layer's framing of PROTECTED records, in the gate, where there is no real cipher: `Framing` is a test double that does NO cryptography (its "seal" appends a 16-byte
+;; marker made of the nonce and the last four bytes of the AAD, its "open" checks the marker), so what is judged here is everything around the AEAD: that a write builds all the
+;; records of a call in one array with the right headers and offsets (`seal-records`), that every record gets its own nonce from the sequence number and the header as AAD, that
+;; reads out of the buffer at every chunking give the records back (`fib.tls.buf`: growth, the move of a partial record to the front), that inner padding and the inner type are read
+;; right, and that a record opened under the wrong sequence number or with a changed marker is `bad_record_mac`. The real ciphers are judged with the driver (tls-specs/tls-e2e-spec.fib).
+;; Framing does not implement `provider-aead-key`: the DEFAULT handle over its per-call seal and open, and the default `-into` methods over those, are what runs. `fibc test specs`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.buf fib.tls.msg fib.tls.keys fib.tls.record))
+
+(defstruct Framing (n: i64))
+(defun marker (nonce: (Array i8) aad: (Array i8)) -> (Array i8) (cat [nonce (slice aad 1 5)]))
+(impl CryptoProvider Framing
+  (provider-name (self) "framing (no cryptography)")
+  (provider-capabilities (self) [:aes-128-gcm :aes-256-gcm :chacha20-poly1305])
+  (provider-digest-start (self alg) (Err (unsupported "digest")))
+  (provider-hmac-start (self alg key) (Err (unsupported "hmac")))
+  (provider-derive (self kdf) (Err (unsupported "derive")))
+  (provider-random (self n) (Err (unsupported "random")))
+  (provider-ct-equal (self a b) false)
+  (provider-aead-seal (self alg key nonce aad pt) (Ok (cat [pt (marker nonce aad)])))
+  (provider-aead-open (self alg key nonce aad sealed)
+    (let [n (- (array-len sealed) 16)]
+      (cond (< n 0) (Err (authentication-failed))
+            (bytes-eq? (slice sealed n (array-len sealed)) (marker nonce aad)) (Ok (slice sealed 0 n))
+            :else (Err (authentication-failed))))))
+
+(defun traffic () -> Traffic (Traffic (repeat-bytes 1 32) (repeat-bytes 2 16) (hexb "000102030405060708090a0b")))
+(defun framing () -> Framing (Framing 0))
+(defun keyed-rec (io: Io) -> Rec
+  (let [r (fib.tls.record/new-rec io)]
+    (match (set-read-keys (framing) r :aes-128-gcm (traffic))
+      ((Err _) (trap "no read keys"))
+      ((Ok _) (match (set-write-keys (framing) r :aes-128-gcm (traffic)) ((Err _) (trap "no write keys")) ((Ok _) r))))))
+
+;; An Io that appends what is written to `out` and reads `data` in pieces of at most `chunk`.
+(defun io-of (data: (Array i8) chunk: i64 out: (Cell (Array i8))) -> Io
+  (let [pos (cell 0)]
+    (Io (fn (n: i64) (let [p @pos k (min (min n chunk) (- (array-len data) p))] (do (set! pos (+ p k)) (Ok (slice data p (+ p k))))))
+        (fn (b: (Array i8)) (do (set! out (cat [@out b])) (Ok ()))) (fn () ()) (fn (at: i64) ()))))
+
+(defun payload (n: i64) -> (Array i8) (let [c (cell (array n 0i8))] (do (dotimes (i n) (array-set! &c i (trunc i8 (+ 3 (* i 7))))) @c)))
+
+;; What `send` writes for `data` of content type `ct` through a keyed record layer.
+(defun written (ct: i64 data: (Array i8)) -> (Array i8)
+  (let [out (cell (empty-bytes)) r (keyed-rec (io-of (empty-bytes) 1 out))]
+    (match (send (framing) r ct data) ((Err _) (trap "send failed")) ((Ok _) @out))))
+
+;; The records of a stream, read back: (content type, bytes) of each, or the error as text.
+(defun read-all (stream: (Array i8) chunk: i64 n: i64) -> (Vec (Pair i64 (Array i8)))
+  (let [r (keyed-rec (io-of stream chunk (cell (empty-bytes))))]
+    (loop [i 0 acc []]
+      (if (= i n) acc
+        (match (read-record (framing) r) ((Err _) acc) ((Ok x) (recur (+ i 1) (conj acc (Pair (. x type) (. x data))))))))))
+(defun joined (rs: (Vec (Pair i64 (Array i8)))) -> (Array i8) (cat (vec (map (fn (x: (Pair i64 (Array i8))) (. x snd)) rs))))
+(defun first-err (stream: (Array i8) n: i64) -> str
+  (let [r (keyed-rec (io-of stream 4096 (cell (empty-bytes))))]
+    (loop [i 0]
+      (if (= i n) "none"
+        (match (read-record (framing) r) ((Err e) (tls-error-text e)) ((Ok _) (recur (+ i 1))))))))
+
+;; ---- the checks
+(defun layout-text () -> str
+  (let [w (written 23 (payload 40000))]
+    (str (if (= (array-len w) (+ 40000 (* 3 22))) "" (str "length " (array-len w) "; "))
+         (if (= (slice-hex w 0 5) "1703034011") "" (str "first header " (slice-hex w 0 5) "; "))
+         (if (= (slice-hex w (+ 5 16384 17) (+ 5 16384 17 5)) "1703034011") "" "second header; ")
+         (if (= (slice-hex w (* 2 (+ 5 16384 17)) (+ (* 2 (+ 5 16384 17)) 5)) (hex-of (cat [(hexb "170303") (w16 (+ (- 40000 32768) 17))]))) "" "third header; "))))
+(defun slice-hex (b: (Array i8) from: i64 to: i64) -> str (hex-of (slice b from to)))
+
+(defun roundtrip-text (n: i64 chunk: i64) -> str
+  (let [data (payload n) rs (read-all (written 23 data) chunk (max 1 (quot (+ n 16383) 16384)))]
+    (str (if (every? (fn (x: (Pair i64 (Array i8))) (= (. x fst) 23)) rs) "" "a record type changed; ")
+         (if (bytes-eq? (joined rs) data) "" (str "content differs (" n " bytes, chunks of " chunk ", " (array-len (joined rs)) " back); ")))))
+(defun roundtrips-text () -> str
+  (reduce (fn (a: str c: (Pair i64 i64)) (str a (roundtrip-text (. c fst) (. c snd)))) ""
+          [(Pair 1 1) (Pair 16384 1) (Pair 16385 7) (Pair 40000 1000) (Pair 40000 100000) (Pair 100000 4093) (Pair 700000 65536) (Pair 700000 3)]))
+
+(defun empty-and-handshake-text () -> str
+  (let [e (written 23 (empty-bytes)) hs (written 22 (payload 100)) back (read-all hs 4096 1) eb (read-all e 4096 1)]
+    (str (if (= (array-len e) 22) "" "an empty write is not one record; ")
+         (if (and (= (count eb) 1) (= (array-len (. (nth eb 0) snd)) 0) (= (. (nth eb 0) fst) 23)) "" "an empty record was not read back; ")
+         (if (and (= (count back) 1) (= (. (nth back 0) fst) 22) (bytes-eq? (. (nth back 0) snd) (payload 100))) "" "a handshake record did not round trip; "))))
+
+;; A record built by hand with `pad` zero bytes after the inner type, as a peer that pads would send it.
+(defun padded (data: (Array i8) ct: i64 pad: i64) -> (Array i8)
+  (let [inner (cat [data (w8 ct) (repeat-bytes 0 pad)]) header (cat [(w8 23) (w16 771) (w16 (+ (array-len inner) 16))])
+        nonce (record-nonce (. (traffic) iv) 0)]
+    (match (provider-aead-seal (framing) :aes-128-gcm (repeat-bytes 0 16) nonce header inner) ((Ok s) (cat [header s])) ((Err _) (trap "seal")))))
+(defun padding-text () -> str
+  (let [a (read-all (padded (payload 50) 23 0) 4096 1) b (read-all (padded (payload 50) 22 9) 4096 1) c (read-all (padded (empty-bytes) 21 300) 4096 1)]
+    (str (if (and (= (count a) 1) (= (. (nth a 0) fst) 23) (= (array-len (. (nth a 0) snd)) 50)) "" "no padding; ")
+         (if (and (= (count b) 1) (= (. (nth b 0) fst) 22) (= (array-len (. (nth b 0) snd)) 50)) "" "nine bytes of padding; ")
+         (if (and (= (count c) 1) (= (. (nth c 0) fst) 21) (= (array-len (. (nth c 0) snd)) 0)) "" "an empty content with 300 bytes of padding; "))))
+
+(defun flip-at (b: (Array i8) i: i64) -> (Array i8) (let [c (cell (slice b 0 (array-len b)))] (do (array-set! &c i (bit-xor (array-get b i) 1i8)) @c)))
+(defun swap-text () -> str
+  (let [w (written 23 (payload 40000)) rl (+ 5 16384 17)
+        swapped (cat [(slice w rl (* 2 rl)) (slice w 0 rl) (slice w (* 2 rl) (array-len w))])]
+    (str (if (= (first-err (flip-at w (- rl 1)) 3) "protocol error: bad_record_mac: a record does not authenticate") "" (str "a changed tag: " (first-err (flip-at w (- rl 1)) 3) "; "))
+         (if (= (first-err swapped 3) "protocol error: bad_record_mac: a record does not authenticate") "" (str "two records swapped: " (first-err swapped 3) "; "))
+         (if (= (first-err w 3) "none") "" (str "the unchanged stream: " (first-err w 3) "; ")))))
+
+(defun seq-text () -> str
+  (let [out (cell (empty-bytes)) r (keyed-rec (io-of (empty-bytes) 1 out))
+        sent (send (framing) r 23 (payload 40000)) after (write-seq r)]
+    (if (= after 3) "" (str "the write sequence after 3 records is " after "; "))))
+
+;; ---- the buffer
+(defun buf-text () -> str
+  (let [b (buf-new 8)]
+    (do (buf-append b (payload 5) 0 5)
+        (buf-append b (payload 20) 2 10)                       ; grows past 8
+        (let [first-ok (= (hex-of (buf-take b 3)) (hex-of (slice (payload 5) 0 3)))
+              two-left (= (buf-len b) 12)
+              _ (buf-skip b 9)
+              rest-ok (= (hex-of (buf-slice b 0 3)) (hex-of (slice (payload 20) 9 12)))
+              _ (buf-append b (payload 4) 0 4)                  ; the live 3 bytes move to a new array's front when the end is reached
+              all (buf-take b (buf-len b))]
+          (str (if first-ok "" "take; ") (if two-left "" "length; ") (if rest-ok "" "skip; ")
+               (if (= (hex-of all) (hex-of (cat [(slice (payload 20) 9 12) (payload 4)]))) "" (str "append after skip: " (hex-of all) "; "))
+               (if (= (buf-len b) 0) "" "not empty; "))))))
+
+(defspecs specs
+  (feature "protected records without a cipher"
+    (scenario "a write of 40000 bytes is three records in one array with the headers and lengths they should have" (then (expect = "" (layout-text))))
+    (scenario "the content comes back at every size and every chunking of the transport, across buffer growth" (then (expect = "" (roundtrips-text))))
+    (scenario "an empty write is one record, a handshake record round trips" (then (expect = "" (empty-and-handshake-text))))
+    (scenario "the inner type is the last non-zero byte: no padding, nine bytes, an empty content with 300" (then (expect = "" (padding-text))))
+    (scenario "a changed marker and two records swapped are bad_record_mac, the stream as written is not" (then (expect = "" (swap-text))))
+    (scenario "the write sequence number counts records" (then (expect = "" (seq-text)))))
+  (feature "the byte queue"
+    (scenario "append grows, take and skip move the front, an emptied queue starts again" (then (expect = "" (buf-text))))))
+
+(defun main () -> i64 (run-main (specs)))
