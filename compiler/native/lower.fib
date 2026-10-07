@@ -26,7 +26,20 @@
                       ((Err msg) (do (owned-dispose owned) (Err (ErrInternal msg))))
                       ((Ok _) (Ok owned)))))))))
 
+;; A `kernelcc` function on a target that is not a kernel target: refused here, before LLVM sees a convention its backend has no code for.
+(defun kernel-refusal :private (lx: Lx items: (Vec LItem)) -> (Option str)
+  (if (. lx kernel)
+      nil
+      (match (first (filter (fn (it: LItem) (match it ((ItDefine f) (match (. (. f ty) cc) ((CcKernel) true) (_ false))) (_ false))) items))
+        ((some (ItDefine f)) (some (str "@" (. f name) " is kernelcc: only a kernel target (nvptx64-nvidia-cuda) lowers a kernel; docs/design/gpu.md")))
+        (_ nil))))
+
 (defun module-items :private (lx: Lx m: LModule) -> (Result unit LairError)
+  (match (kernel-refusal lx (. m items))
+    ((some why) (Err (ErrBackend why)))
+    (nil (module-items-of lx m))))
+
+(defun module-items-of :private (lx: Lx m: LModule) -> (Result unit LairError)
   (let ((items (. m items))
         (tgt (module-target m)))
     (do (declare-structs lx items)

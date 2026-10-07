@@ -160,8 +160,27 @@
 (defun kernel-of :private (kernels: (Vec (Pair str str)) fname: str) -> (Option str)
   (match (first (filter (fn (p: (Pair str str)) (= (. p snd) fname)) kernels)) ((some p) (some (. p fst)) ) (nil nil)))
 
+;; The first refusal among the reached items, the one nearest the kernel (the shortest path): a kernel that allocates is refused at the runtime's
+;; allocator, not at the `malloc` below it.
+(defun first-refusal :private (m: LModule seen: (Map str str)) -> (Option str)
+  (loop ((items (. m items)) (i 0) (best: (Option str) nil) (depth 1000000))
+    (if (>= i (count items))
+        best
+        (let ((it (nth items i)))
+          (if (not (contains? seen (item-name it)))
+              (recur items (+ i 1) best depth)
+              (match (refusal seen it)
+                (nil (recur items (+ i 1) best depth))
+                ((some why) (let ((d (count (s/split why "<-"))))
+                              (if (< d depth) (recur items (+ i 1) (some why) d) (recur items (+ i 1) best depth))))))))))
+
 ;; The kernel module's text: the structs, then every reached item in the program's order, rewritten as above.
 (defun kernel-text :private (m: LModule names: (Map str LItem) seen: (Map str str) kernels: (Vec (Pair str str))) -> (Result str str)
+  (match (first-refusal m seen)
+    ((some why) (Err why))
+    (nil (kernel-items m seen kernels))))
+
+(defun kernel-items :private (m: LModule seen: (Map str str) kernels: (Vec (Pair str str))) -> (Result str str)
   (loop ((items (. m items)) (i 0) (out []) (trap false))
     (if (>= i (count items))
         (Ok (s/join "" out))
