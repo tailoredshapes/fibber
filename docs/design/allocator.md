@@ -208,3 +208,23 @@ musl's malloc and `memcpy` themselves, which no cache in the runtime changes; no
 Tests: case 8060 (blocks of 104 KB are hits where the floor says they are cached, and under `FIB_STATIC_CASES=1`, which the gate's
 static stage sets, the floor must be at most 100 KiB), case 8061 (every class from 5 KiB to 128 KiB written whole and read back), and
 `scripts/mutant-alloc-floor.sh` (the floor back at 128 KiB; a freed block filed in the class above its size; a `cache-floor` that lies).
+
+## 10. What the JSON work found (JSON-3)
+
+**Blocks that bypassed the cache.** fib.json's structural index and its write buffer were `malloc`/`calloc` blocks of 100 KiB to a few MiB made by the library itself, not objects, so the cache of section 2 never
+saw them, and since the cache pins glibc's `M_MMAP_THRESHOLD` at 128 KiB (section 3) each one was an `mmap`, a page fault per 4 KiB written and an `munmap`. JSON-2 called this "the allocator tuning that made tape 2x faster on WSL2" and left it to
+the environment (`MALLOC_MMAP_THRESHOLD_=1000000000 MALLOC_TRIM_THRESHOLD_=1000000000 MALLOC_TOP_PAD_=268435456`). The fix is at the source, in the library, and the runtime needed no change: a scratch block of known
+size is an `(Array f64)` made by `array-uninit-f64` (no zero fill) and used through `(raw a)`, so it comes from `fib.lc-get` and goes back by `fib.lc-put` when the array is dropped. Ryzen, WSL2, default allocator, MB/s: tape twitter/citm/canada 900/1164/652
+to 1770/2268/1090 (the tuned column of JSON-2 was 1803/2342/1051); write 330/271/98 to 704/558/119. The environment variables are not needed by this library any more; they still help a program that mallocs
+large blocks itself.
+
+**The multi-thread mode costs a single-threaded program 40 percent once any task has run.** `fib.mt` is set by the first `spawn` or pool start and never cleared (rt/core.lir): from then on `fib.alloc` takes `fib.alloc-slow`
+(a call, `fib.lc-tick`, `malloc`) and `fib.free-block` takes `free`, and every retain and release of a counted object is an atomic read-modify-write. Measured (dev box, i7-14700KF, `taskset` to four cores,
+twitter.json DOM parse and drop in a loop, MB/s): 490 and 506 before a `pmap-range [i 4] ...`, 296 and 296 after it, the same process, the same code (`scripts/bench/json/mt-mode.fib`).
+The cause is the free lists and the plain reference counts being off, not a lock: glibc's per-thread arenas serve malloc and free without contention, and the parallel parse of 21 000 NDJSON lines scales (1.3 to 1.5 GB/s on 28 threads,
+against 233 MB/s on one) when the DOMs are made and dropped inside the tasks. Which of the two (malloc against the list, atomic against plain counts) is the larger part was not measured: `perf` is not allowed on these machines.
+
+**Not fixed, and what a fix needs.** Thread-local free lists need a thread-local variable the runtime does not have in lIR (a `pthread_getspecific` call per allocation costs what it saves), and a block made on one thread is freed on another
+(a pool worker makes a chunk, the joiner drops it), so a list per thread needs a bounded hand-back to a shared list. Biased reference counts (the owner thread counts without an atomic, others use a second counter) change the object
+header (rt/core.lir `fib.hdr`) and every inlined retain and release, and belong to the parallel-runtime work, not to a library. fib.json avoids the cost where it can: `reduce-lines-par-map` makes and drops each DOM inside its task,
+and `validate-lines` allocates one array per line.

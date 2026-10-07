@@ -1,0 +1,20 @@
+;; spec:   spec/types.md §6.3 "Field moves"; compiler/own/lastuse.fib `record-field`
+;; expect: accept
+;; result: 1005
+;; audit:  clean
+;; The field move is for `(. b f)` where `b` is the binding that owns the struct (or an alias of it): the run-time test is of the object that
+;; `b` holds. `inner` reads `(. (. o in) buf)`: the object read first, `(. o in)`, is a part of `o`, not `o`; its count is 1 because `o` holds it,
+;; while `o` itself is shared (the caller keeps it). Testing the count of the part, as the pattern steal tests its shell, would take the
+;; array out of an object that two holders reach. `main` keeps `o` and reads its array after the call: 1000 for the untouched array of
+;; `o` and 5 for the sum of the two lengths.
+(defstruct In (buf: (Array i64)))
+(defstruct Out (in: In k: i64))
+
+(defun inner (o: Out) -> (Array i64)
+  (let [c (cell (. (. o in) buf))]
+    (do (array-set! &c 0 99) @c)))
+
+(defun main () -> i64
+  (let [o (Out (In (array 2 1)) 0)
+        a (inner o)]
+    (+ (* 1000 (array-get (. (. o in) buf) 0)) (+ (array-len a) (array-len (. (. o in) buf)) 1))))

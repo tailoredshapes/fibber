@@ -357,6 +357,17 @@
             (_ false)))
          (_ false))))
 
+;; Whether `x`, a field read `(. b f)` of mode `Derived(s)`, is the field's last use (own.lastuse `record-field`) and the shell may be stolen
+;; from: the site is this frame's own (an owner of a count that is not on the stack), nothing else reads it after.
+(defun w-steal-field? (w: Walker x: Expr m: Mode) -> bool
+  (and (contains? (. (. w cx) steal) (. x id))
+       (match (Pair (. x kind) m)
+         ((Pair (EField _ _ _) (MDerived s))
+          (and (w-movable w s)
+               (not (contains? (. (. w cx) scope-local) s))
+               (not (w-env-moved? w s))))
+         (_ false))))
+
 ;; Whether `x` is the last use of a field variable (and nothing reads the shell afterwards) of the match on a *borrowed parameter* of
 ;; a `defun`: the steal would fire if the parameter were owned. The parameter is then recorded in `wants` (own.unit `decide` makes it
 ;; owned and walks again), and `x` is retained as before in this walk.
@@ -372,6 +383,20 @@
               (do (set! (. w wants) (conj @(. w wants) p)) true)
               false)))
          (_ false))
+       false))
+    (_ false)))
+
+;; Rule 4 for a field read: `x` is `(. b f)` of mode `Derived(Bind p)`, the field's last use (`w-steal-field?` would hold if `p` were owned), and `p` is a
+;; borrowed parameter of a `defun` (not declared `:borrow`): `p` is recorded in `wants`, as `w-want-own` does for a pattern variable.
+(defun w-want-own-field (w: Walker x: Expr m: Mode) -> bool
+  (match (Pair (. x kind) m)
+    ((Pair (EField _ _ _) (MDerived (SiteBind p)))
+     (if (contains? (. (. w cx) steal) (. x id))
+       (let [bound (get (. @(. w out) bindings) p)]
+         (if (and (= (. (w-frame w) kind) FkDefun)
+                  (match bound ((some k) (= (. k kind) BnBorrowedParam)) (_ false)))
+           (do (set! (. w wants) (conj @(. w wants) p)) true)
+           false))
        false))
     (_ false)))
 

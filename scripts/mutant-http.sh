@@ -58,7 +58,7 @@ apply() {
     head-after-limit)  sub "$h/wire.fib" 's/\(if \(> \(- end start\) max\) \(Err \(LimitError "too many HTTP headers"\)\)/(if (> (- end start) (+ max 1)) (Err (LimitError "too many HTTP headers"))/' ;;
     head-sends-body)   sub "$h/wire.fib" 's/\(if \(or \(= method "HEAD"\) \(= status 204\)/(if (or (= status 204)/' ;;
     keepalive-ignores-close) sub "$h/wire.fib" 's/\(and \(not \(header-token\? \(\. head headers\) "connection" "close"\)\)/(and true/' ;;
-    slowloris)         sub "$h/server/connection.fib" 's/\(ms \(\. o header-timeout-ms\)\)/(ms (* 100 (. o header-timeout-ms)))/' ;;
+    slowloris)         sub "$h/server/connection.fib" 's/\(ms \(min \(\. o header-timeout-ms\) \(\. o request-timeout-ms\)\)\)/(ms (* 100 (. o header-timeout-ms)))/' ;;
     no-drain)          sub "$h/server/api.fib" 's/\(loop \[\] \(if \(and \(> \@\(\. st active\) 0\) \(< \(time\/clock-now\) limit\)\)/(loop [] (if false/' ;;
     redirect-301)      sub "$h/client/redirect.fib" 's/\(and \(includes\? status \[301 302\]\) \(= method "POST"\)\)/(and (includes? status [302]) (= method "POST"))/' ;;
     redirect-307)      sub "$h/client/redirect.fib" 's/\(cond \(= status 303\)/(cond (includes? status [303 307])/' ;;

@@ -1,0 +1,108 @@
+;; HTTP proxies for the client, with an in-process proxy (specs/http-proxy-fake.fib) over real loopback sockets: plain http in absolute-form, https by CONNECT tunnel to a real
+;; origin (the https factory here is plain TCP over the dial, which is what TLS wraps), Basic proxy authentication (sent, refused with 407, never in an error text), no_proxy
+;; bypass, the environment rules as tables (explicit: nothing reads the environment unless `proxy-from-env` is asked), and proxy URL parsing. `fibc test specs/http-proxy-spec.fib`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.http.types fib.http.headers fib.http.bytes fib.http.proxy fib.http.client.types http-proxy-fake)
+  (:require [fib.http.client :as c] [fib.http.server :as sv] [fib.http.server.types :as st] [fib.http.tcp :as tcp] [fib.string :as s]))
+
+(defun origin-handler (r: Request) -> st/Reply
+  (st/Whole (text-response 200 (str (. r request-method) " " (. r uri) " pa=" (unwrap-or (header (. r headers) "proxy-authorization") "none") " au=" (unwrap-or (header (. r headers) "authorization") "none")))))
+(defun with-origin (f: (fn (i64) str)) -> str
+  (match (sv/run-server-reply origin-handler (with (st/default-options) (port 0)))
+    ((Err e) (error-message e))
+    ((Ok srv) (let [out (f (sv/port srv))] (do (sv/stop-server srv) out)))))
+(defun settings (http: str https: str no: (Vec str)) -> ProxySettings
+  (ProxySettings (if (= http "") nil (match (parse-proxy-url http) ((Ok p) (some p)) ((Err _) nil)))
+                 (if (= https "") nil (match (parse-proxy-url https) ((Ok p) (some p)) ((Err _) nil))) no))
+(defun options (s: ProxySettings) -> Options (with (with-proxy (default-options) s) (timeout-ms 5000)))
+(defun get-text (o: Options url: str) -> str
+  (match (c/get url o) ((Ok r) (str-from-bytes (. r body))) ((Err e) (match e ((StatusError r) (str "status " (. r status))) ((ConnectError m) (str "connect: " m)) ((DnsError m) (str "dns: " m)) (_ (str "error: " (error-message e)))))))
+(defun entries (p: ProxyFake) -> (Vec str) (log-of p))
+
+;; the plain http request through a proxy: the request line the proxy saw, and the credentials
+(defun via-http (user: str) -> (Pair str (Vec str))
+  (let [p (start "") o (options (settings (str "http://" user "127.0.0.1:" (. p port)) "" []))
+        out (get-text o "http://example.invalid/a/b?x=1#frag") _ (stop p)]
+    (Pair out (entries p))))
+(defun tunnel (proxy-user: str want: str) -> (Pair str (Vec str))
+  (let [p (start want)]
+    (let [out (with-origin (fn (port: i64)
+                (get-text (with-factory (options (settings "" (str "http://" proxy-user "127.0.0.1:" (. p port)) [])) "https" (tcp/tcp-factory)) (str "https://127.0.0.1:" port "/t/1"))))
+          _ (stop p)]
+      (Pair out (entries p)))))
+(defun bypassed () -> (Pair str (Vec str))
+  (let [p (start "")]
+    (let [out (with-origin (fn (port: i64) (get-text (options (settings (str "http://127.0.0.1:" (. p port)) "" ["127.0.0.1"])) (str "http://127.0.0.1:" port "/direct")))) _ (stop p)]
+      (Pair out (entries p)))))
+(defun first-entry (v: (Vec str)) -> str (if (= (count v) 0) "" (nth v 0)))
+(defun lines (v: (Vec str)) -> str (str-join (mapv (fn (e: str) (str e ";")) v)))
+
+;; ---- environment tables
+(defstruct EnvRow (label: str env: (Map str str) http: str https: str no: str))
+(defun view :private (p: (Option Proxy)) -> str (match p (nil "-") ((some x) (str (. x host) ":" (. x port) (match (. x auth) (nil "") ((some _) "+auth"))))))
+(defun env-line (env: (Map str str)) -> str
+  (let [s (proxy-from-env-with (fn (n: str) (get env n)))] (str (view (. s http)) " " (view (. s https)) " " (str-join (mapv (fn (e: str) (str e ",")) (. s no-proxy))))))
+(defun env-rows () -> (Vec EnvRow)
+  [(EnvRow "nothing set" {} "-" "-" "")
+   (EnvRow "lower case" {"http_proxy" "http://p1:3128" "https_proxy" "http://p2:3129" "no_proxy" "a.example, b.example"} "p1:3128" "p2:3129" "a.example,b.example,")
+   (EnvRow "upper case HTTPS_PROXY and NO_PROXY" {"HTTPS_PROXY" "http://p2:3129" "NO_PROXY" "x.example"} "-" "p2:3129" "x.example,")
+   (EnvRow "upper case HTTP_PROXY is taken outside CGI" {"HTTP_PROXY" "http://p3:1"} "p3:1" "-" "")
+   (EnvRow "upper case HTTP_PROXY is ignored in CGI (httpoxy)" {"HTTP_PROXY" "http://evil:1" "REQUEST_METHOD" "GET"} "-" "-" "")
+   (EnvRow "lower case wins over upper case" {"http_proxy" "http://low:1" "HTTP_PROXY" "http://up:1"} "low:1" "-" "")
+   (EnvRow "credentials make an auth value" {"https_proxy" "http://u:p%40ss@h:8080"} "-" "h:8080+auth" "")
+   (EnvRow "no scheme means http, no port means 1080" {"http_proxy" "proxy.corp" "https_proxy" "proxy.corp:8080"} "proxy.corp:1080" "proxy.corp:8080" "")
+   (EnvRow "an https:// or socks5:// proxy is refused" {"http_proxy" "https://p:1" "https_proxy" "socks5://p:1"} "-" "-" "")
+   (EnvRow "an empty value is unset" {"http_proxy" "" "HTTP_PROXY" "http://up:1"} "up:1" "-" "")
+   (EnvRow "junk is ignored" {"http_proxy" "http://" "https_proxy" "::::"} "-" "-" "")])
+(defun env-diffs () -> str
+  (str-join (mapv (fn (r: EnvRow) (let [got (env-line (. r env)) want (str (. r http) " " (. r https) " " (. r no))]
+    (if (= got want) "" (str (. r label) ": got " (pr-str got) " wanted " (pr-str want) "\n")))) (env-rows))))
+(defstruct NoRow (patterns: (Vec str) host: str port: i64 bypass: bool))
+(defun no-rows () -> (Vec NoRow)
+  [(NoRow ["*"] "anything" 80 true) (NoRow [] "a.example" 80 false) (NoRow ["a.example"] "a.example" 80 true) (NoRow ["a.example"] "www.a.example" 80 true)
+   (NoRow ["a.example"] "xa.example" 80 false) (NoRow [".a.example"] "www.a.example" 80 true) (NoRow [".a.example"] "a.example" 80 true) (NoRow ["*.a.example"] "x.a.example" 80 true)
+   (NoRow ["A.Example"] "a.EXAMPLE" 80 true) (NoRow ["a.example:8080"] "a.example" 8080 true) (NoRow ["a.example:8080"] "a.example" 80 false)
+   (NoRow ["10.0.0.1"] "10.0.0.1" 80 true) (NoRow ["10.0.0.1"] "10.0.0.11" 80 false) (NoRow ["x" "y.example"] "y.example" 80 true) (NoRow ["a.example"] "example" 80 false)
+   (NoRow ["a.example"] "a.example.org" 80 false) (NoRow [""] "a.example" 80 false)])
+(defun no-diffs () -> str
+  (str-join (mapv (fn (r: NoRow) (if (= (bypass? (. r patterns) (. r host) (. r port)) (. r bypass)) "" (str (pr-str (. r patterns)) " " (. r host) ":" (. r port) " expected bypass " (. r bypass) "\n"))) (no-rows))))
+(defun err-text (r: (Result Proxy Error)) -> str (match r ((Ok _) "ok") ((Err e) (error-message e))))
+
+(defspecs specs
+  (feature "plain http through a proxy"
+    (scenario "the request goes to the proxy in absolute-form, without the fragment, and the proxy's answer is the response"
+      (given [r (via-http "")])
+      (then (expect = "GET http://example.invalid/a/b?x=1 HTTP/1.1" (. r fst)) (expect = "GET http://example.invalid/a/b?x=1 HTTP/1.1|-" (first-entry (. r snd)))))
+    (scenario "proxy credentials from the proxy URL are sent as Basic Proxy-Authorization"
+      (given [r (via-http "user:s3cret@")])
+      (then (expect = "GET http://example.invalid/a/b?x=1 HTTP/1.1|Basic dXNlcjpzM2NyZXQ=" (first-entry (. r snd))))))
+  (feature "https by CONNECT"
+    (scenario "the proxy sees CONNECT host:port, the origin sees an ordinary request with no proxy credentials, the answer arrives through the tunnel"
+      (given [r (tunnel "user:s3cret@" "Basic dXNlcjpzM2NyZXQ=")])
+      (then (expect = true (starts-with? (first-entry (. r snd)) "CONNECT 127.0.0.1:")) (expect = true (s/ends-with? (first-entry (. r snd)) " HTTP/1.1|Basic dXNlcjpzM2NyZXQ="))
+            (expect = "GET /t/1 pa=none au=none" (. r fst)) (expect = 1 (count (. r snd)))))
+    (scenario "a proxy that wants credentials the client does not have answers 407: a ConnectError that names the proxy and never the password"
+      (given [r (tunnel "user:wrong-pass-123@" "Basic dXNlcjpzM2NyZXQ=")])
+      (then (expect = true (starts-with? (. r fst) "connect: proxy 127.0.0.1:")) (expect = true (some? (str-find (. r fst) "(407)" 0)))
+            (expect = false (some? (str-find (. r fst) "wrong-pass-123" 0))) (expect = false (some? (str-find (. r fst) "d3JvbmctcGFzcy0xMjM" 0)))))
+    (scenario "a proxy nobody listens on is a ConnectError"
+      (then (expect = true (starts-with? (get-text (with-factory (options (settings "" "http://127.0.0.1:1" [])) "https" (tcp/tcp-factory)) "https://127.0.0.1:2/") "connect:")))))
+  (feature "no_proxy"
+    (scenario "a host on the no_proxy list goes direct: the origin answers and the proxy saw nothing"
+      (given [r (bypassed)])
+      (then (expect = "GET /direct pa=none au=none" (. r fst)) (expect = 0 (count (. r snd)))))
+    (scenario (str (count (no-rows)) " no_proxy patterns against hosts") (then (expect = "" (no-diffs)))))
+  (feature "the environment is read only when asked"
+    (scenario (str (count (env-rows)) " environments") (then (expect = "" (env-diffs))))
+    (scenario "the default options have no proxy, whatever the environment says"
+      (then (expect = true (match (. (. (default-options) proxy) http) (nil true) (_ false))))))
+  (feature "proxy URLs"
+    (scenario "errors never repeat the URL or its credentials"
+      (then (expect = "proxy scheme https is not supported: only http proxies" (err-text (parse-proxy-url "https://user:hunter2@p:1")))
+            (expect = "a proxy URL could not be parsed" (err-text (parse-proxy-url "http://user:hunter2@")))
+            (expect = false (some? (str-find (err-text (parse-proxy-url "socks5://user:hunter2@p:1")) "hunter2" 0)))
+            (expect = false (some? (str-find (err-text (parse-proxy-url "http://user:%zz@p:1")) "zz" 0)))))
+    (scenario "the CONNECT request for an IPv6 target is bracketed and carries Host"
+      (then (expect = "CONNECT [2001:db8::1]:443 HTTP/1.1\r\nhost: [2001:db8::1]:443\r\n\r\n"
+                    (str-from-bytes (connect-request "2001:db8::1" 443 (Proxy "p" 1 nil))))))))
+
+(defun main () -> i64 (run-main (specs)))

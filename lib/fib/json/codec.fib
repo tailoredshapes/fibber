@@ -7,9 +7,17 @@
 ;; A field is i64, f64 (an integer is accepted), str, bool, (Vec T), (Option T) (a missing key or null is nil), or another defjson record. A missing
 ;; key, a value of another kind or a number that does not fit is a mismatch: the result is an Err with code 16 (the key's offset is not tracked; the message names the type).
 ;; Duplicate keys: the first one is read. Unknown keys are ignored.
-(ns fib.json.codec (:use fib.core fib.seq fib.coll fib.json.types fib.json.tape fib.json.tapebuild fib.json.view fib.json.convert) (:require [fib.json.codecform :as f]))
+(ns fib.json.codec (:use fib.core fib.seq fib.coll fib.json.types fib.json.tape fib.json.tapebuild fib.json.view fib.json.convert) (:require [fib.json.codecform :as f] [fib.json.buffer :as b] [fib.json.libc :as libc]))
 
 (def e-mismatch: i64 16)
+
+;; The direct encoder's block handling (the writers are fib.json.writefast's): a block of `cap` bytes from the large-block cache, its pointer, the finished bytes, the next size.
+(defun enc-block (cap: i64) -> (Array f64) (unsafe (array-uninit-f64 (quot cap 8))))
+(defun enc-ptr (ba: (Array f64)) -> ptr (unsafe (ptr+ (raw ba) 24)))
+(defun enc-finish (ba: (Array f64) n: i64) -> (Array i8)
+  (let [out (array n 0i8)] (do (unsafe (libc/memcpy (ptr+ (raw out) 24) (ptr+ (raw ba) 24) n)) out)))
+(defun enc-grow (cap: i64) -> i64 (cond (= cap 4096) 65536 (= cap 65536) 4194304 :else (* cap 8)))
+(defun enc-scratch () -> (Array i8) (b/new-buffer 64))
 
 (defun dec-i64 (d: Doc n: i64) -> (Option i64) (if (>= n 0) (node-i64 d n) nil))
 (defun dec-f64 (d: Doc n: i64) -> (Option f64) (if (>= n 0) (node-f64 d n) nil))
@@ -66,6 +74,13 @@
         (let ((keys (loop ((i 0) (acc (vec-empty))) (if (< i n) (recur (+ i 1) (vec-conj acc (Str (f/sym-text (vec-nth names i))))) acc)))
               (encoded (loop ((i 0) (acc (vec-empty)))
                          (if (< i n) (recur (+ i 1) (vec-conj acc `(->json (. self ~(vec-nth names i))))) acc)))
+              (enc-fields (loop ((i (- n 1)) (acc `(fib.json.writefast/wchar b cap pp 125)))
+                       (if (>= i 0)
+                           (recur (- i 1) `(let [pp (fib.json.writefast/wlit b cap pp ~(Str (str-concat (if (= i 0) "\"" ",\"") (str-concat (f/sym-text (vec-nth names i)) "\":"))))]
+                                             (if (< pp 0) -1
+                                                 (let [pp ~(f/encoder (vec-nth types i) `(. self ~(vec-nth names i)) 0)]
+                                                   (if (< pp 0) -1 ~acc)))))
+                           acc)))
               (diags (loop ((i (- n 1)) (acc `nil))
                        (if (>= i 0)
                            (recur (- i 1) `(if-some [m ~(f/diagnoser (vec-nth types i) `(field d i ~(Str (f/sym-text (vec-nth names i)))) `(str p ~(Str (str-concat "." (f/sym-text (vec-nth names i))))))] (some m) ~acc))
@@ -78,6 +93,14 @@
                (derive Eq ~tag)
                (derive Debug ~tag)
                (impl fib.json.convert/ToJson ~tag (->json (self) (JObj [~@keys] [~@encoded])))
+               (defun ~(Sym (str-concat "wenc-" name)) (b: ptr cap: i64 pp: i64 self: ~tag &tb: (Array i8) &tl: i64) -> i64
+                 (let [pp (fib.json.writefast/wchar b cap pp 123)] (if (< pp 0) -1 ~enc-fields)))
+               (defun ~(Sym (str-concat "encode-bytes-" name)) (x: ~tag) -> (Array i8)
+                 (let [tb (cell (fib.json.codec/enc-scratch)) tl (cell 0)]
+                   (loop [cap 4096]
+                     (let [ba (fib.json.codec/enc-block cap) r (~(Sym (str-concat "wenc-" name)) (fib.json.codec/enc-ptr ba) cap 0 x &tb &tl)]
+                       (if (>= r 0) (fib.json.codec/enc-finish ba r) (recur (fib.json.codec/enc-grow cap)))))))
+               (defun ~(Sym (str-concat "encode-" name)) (x: ~tag) -> str (str-from-bytes (~(Sym (str-concat "encode-bytes-" name)) x)))
                (defun ~(Sym (str-concat "json->" name)) (d: Doc i: i64) -> (Option ~tag) (if (< i 0) nil ~built))
                (defun ~(Sym (str-concat "diag-" name)) (d: Doc i: i64 p: str) -> (Option str)
                  (if-some [m (fib.json.codec/diag-object d i p)] (some m) ~diags))

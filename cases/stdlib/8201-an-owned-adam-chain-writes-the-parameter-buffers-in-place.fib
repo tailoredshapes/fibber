@@ -1,0 +1,24 @@
+;; spec: lib/fib/tensor/optim-owned.fib (header), spec/types.md §6.3 "Field moves"; the parameter and both moments are consumed and written in place
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; allocs: <= 2500
+;; stage: 2
+;; roots: ../../lib support
+;; One hundred chained steps of `adam-step-owned` on a tensor of 64 elements, each state the next call's input at its last use: with the buffers written in place the run allocates 1955
+;; objects (`fibc run --trace`: the Vec and the shells of each result and a few descriptors per step). With a fresh buffer for each of p, m and v (`adam-step`: 7058 objects) or a copy of a
+;; buffer that reached the kernel shared (the protocol method borrowing its tensors, so each shell had a count of two: 2258 and more) the count is above the bound. The value after the 100
+;; steps is the one `adam-step` gives (case 8200 proves the bits; the literal here is its result).
+(ns main (:require [fib.tensor :as t]))
+
+(def g (t/from-array [64] (array 64 0.25) 0.0))
+
+(defun run-owned (k: i64) -> f64
+  (loop ((s 1) (p (t/from-array [64] (array 64 1.0) 0.0)) (m (t/from-array [64] (array 64 0.0) 0.0)) (v (t/from-array [64] (array 64 0.0) 0.0)))
+    (if (<= s k)
+        (let ((r (t/adam-step-owned 0.01 0.9 0.999 1.0e-8 0.1 0.001 p g m v)))
+          (recur (+ s 1) (nth r 0) (nth r 1) (nth r 2)))
+        (t/at p [3]))))
+
+(defun main () -> i64
+  (if (= (run-owned 100) -0.4725923558321452) 0 1))

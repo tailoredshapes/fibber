@@ -1,0 +1,125 @@
+;; A small cookie jar after RFC 6265 (and the prefix and Secure rules of 6265bis), an OPT-IN client option: `(with-cookies options (new-jar))` and nothing is stored or sent otherwise.
+;; Set-Cookie: name=value with Expires (the lenient date of 5.1.1), Max-Age (wins), Domain, Path, Secure, HttpOnly, SameSite (parsed and kept; the client has no "site" to
+;; apply it to). Matching: domain-match (host-only cookies match their host only), path-match (5.1.4), Secure only on https, expiry; the Cookie header lists longer paths
+;; first, then older cookies. Limits: a cookie is at most 4096 bytes, 50 cookies per domain, 3000 in all (the oldest go first).
+;; NOT here: a public-suffix list. A Domain attribute is accepted when it domain-matches the host and has a dot, so `Domain=com` is refused and `Domain=co.uk` is NOT: a site on
+;; example.co.uk can set a cookie every .co.uk site receives. Do not use this jar across sites you do not trust, or add the list. Also not here: cookie persistence to disk,
+;; third-party policy, SameSite enforcement. The jar is a value over an Atom (sendable; share it between clients on purpose).
+(ns fib.http.cookies (:use fib.core fib.seq fib.coll fib.http.headers) (:require [fib.os.time :as time] [fib.string :as s]))
+(defstruct Cookie (name: str value: str domain: str host-only: bool path: str secure: bool http-only: bool same-site: str expires: i64 created: i64))
+(defstruct Jar (cookies: (Atom (Vec Cookie))))
+(def max-cookie-bytes: i64 4096)
+(def max-per-domain: i64 50)
+(def max-total: i64 3000)
+(defun new-jar () -> Jar (Jar (atom [])))
+(defun jar-cookies (j: Jar) -> (Vec Cookie) @(. j cookies))
+(defun now-seconds () -> i64 (quot (time/wall-now) 1000000000))
+(defun lower (t: str) -> str (ascii-lower t))
+(defun digits? :private (t: str) -> bool (and (> (str-len t) 0) (every? (fn (i: i64) (let [c (zext i64 (str-byte-at t i))] (and (>= c 48) (<= c 57)))) (range (str-len t)))))
+(defun to-int :private (t: str) -> i64 (loop [i 0 n 0] (if (or (= i (str-len t)) (> n 100000000000)) n (recur (+ i 1) (+ (* n 10) (- (zext i64 (str-byte-at t i)) 48))))))
+;; ---- dates (RFC 6265 5.1.1)
+(def months: (Vec str) ["jan" "feb" "mar" "apr" "may" "jun" "jul" "aug" "sep" "oct" "nov" "dec"])
+(defun delimiter? :private (c: i64) -> bool
+  (or (= c 9) (and (>= c 32) (<= c 47)) (and (>= c 59) (<= c 64)) (and (>= c 91) (<= c 96)) (and (>= c 123) (<= c 126))))
+(defun tokens (t: str) -> (Vec str)
+  (loop [i 0 from -1 out: (Vec str) []]
+    (cond (= i (str-len t)) (if (>= from 0) (conj out (str-slice t from i)) out)
+          (delimiter? (zext i64 (str-byte-at t i))) (recur (+ i 1) -1 (if (>= from 0) (conj out (str-slice t from i)) out))
+          :else (recur (+ i 1) (if (< from 0) i from) out))))
+(defun hms :private (tok: str) -> (Option (Vec i64))
+  (let [parts (s/split tok ":" -1)]
+    (if (and (= (count parts) 3) (every? (fn (p: str) (and (digits? p) (<= (str-len p) 2))) parts)) (some (vec (map to-int parts))) nil)))
+(defun month-of :private (tok: str) -> i64
+  (if (< (str-len tok) 3) -1 (let [m (lower (str-slice tok 0 3))] (loop [i 0] (cond (= i 12) -1 (= (nth months i) m) (+ i 1) :else (recur (+ i 1)))))))
+(defstruct Parts :private (time: (Option (Vec i64)) day: i64 month: i64 year: i64))
+(defun scan :private (toks: (Vec str)) -> Parts
+  (reduce (fn (p: Parts tok: str)
+            (cond (and (not (some? (. p time))) (some? (hms tok))) (with p (time (hms tok)))
+                  (and (< (. p day) 0) (digits? tok) (<= (str-len tok) 2)) (with p (day (to-int tok)))
+                  (and (< (. p month) 0) (>= (month-of tok) 0)) (with p (month (month-of tok)))
+                  (and (< (. p year) 0) (digits? tok) (>= (str-len tok) 2) (<= (str-len tok) 4)) (with p (year (to-int tok)))
+                  :else p))
+          (Parts nil -1 -1 -1) toks))
+(defun days-from-civil (y: i64 m: i64 d: i64) -> i64
+  (let [y1 (if (<= m 2) (- y 1) y) era (quot y1 400) yoe (- y1 (* era 400)) doy (+ (quot (+ (* 153 (+ m (if (> m 2) -3 9))) 2) 5) (- d 1))
+        doe (+ (* yoe 365) (quot yoe 4) (- 0 (quot yoe 100)) doy)]
+    (+ (* era 146097) doe -719468)))
+;; epoch seconds, or -1 when the text is not a cookie date
+(defun parse-date (t: str) -> i64
+  (let [p (scan (tokens t)) y (cond (and (>= (. p year) 70) (<= (. p year) 99)) (+ (. p year) 1900) (and (>= (. p year) 0) (<= (. p year) 69)) (+ (. p year) 2000) :else (. p year))]
+    (match (. p time)
+      (nil -1)
+      ((some tm) (if (or (< (. p day) 1) (> (. p day) 31) (< (. p month) 1) (< y 1601) (> (nth tm 0) 23) (> (nth tm 1) 59) (> (nth tm 2) 59)) -1
+                   (+ (* 86400 (days-from-civil y (. p month) (. p day))) (* 3600 (nth tm 0)) (* 60 (nth tm 1)) (nth tm 2)))))))
+;; ---- matching
+(defun ip-like? :private (h: str) -> bool (or (some? (str-find h ":" 0)) (and (> (str-len h) 0) (every? (fn (i: i64) (let [c (zext i64 (str-byte-at h i))] (or (= c 46) (and (>= c 48) (<= c 57))))) (range (str-len h))))))
+(defun domain-match? (host: str domain: str) -> bool
+  (or (= host domain) (and (not (ip-like? host)) (s/ends-with? host (str "." domain)))))
+(defun path-match? (request: str cookie: str) -> bool
+  (and (starts-with? request cookie) (or (= request cookie) (s/ends-with? cookie "/") (= (str-byte-at request (str-len cookie)) 47i8))))
+(defun default-path (p: str) -> str
+  (if (or (= (str-len p) 0) (!= (str-byte-at p 0) 47i8)) "/"
+    (let [k (loop [i (- (str-len p) 1)] (cond (< i 0) 0 (= (str-byte-at p i) 47i8) i :else (recur (- i 1))))] (if (= k 0) "/" (str-slice p 0 k)))))
+;; ---- Set-Cookie
+(defstruct Attrs :private (domain: str path: str secure: bool http-only: bool same-site: str expires: i64 max-age: (Option i64)))
+(defun attr :private (a: Attrs name: str value: str) -> Attrs
+  (cond (= name "domain") (with a (domain (lower (if (starts-with? value ".") (str-slice value 1 (str-len value)) value))))
+        (= name "path") (with a (path value))
+        (= name "secure") (with a (secure true))
+        (= name "httponly") (with a (http-only true))
+        (= name "samesite") (with a (same-site (lower value)))
+        (= name "expires") (let [d (parse-date value)] (if (< d 0) a (with a (expires d))))
+        (= name "max-age") (let [v (if (starts-with? value "-") (str-slice value 1 (str-len value)) value)]
+                             (if (digits? v) (with a (max-age (some (if (starts-with? value "-") 0 (to-int v))))) a))
+        :else a))
+(defun attributes :private (parts: (Vec str)) -> Attrs
+  (reduce (fn (a: Attrs raw: str)
+            (let [p (trim-ows raw) k (str-find p "=" 0)]
+              (if (= (str-len p) 0) a
+                (match k (nil (attr a (lower p) "")) ((some i) (attr a (lower (trim-ows (str-slice p 0 i))) (trim-ows (str-slice p (+ i 1) (str-len p)))))))))
+          (Attrs "" "" false false "" 0 nil) parts))
+(defun prefix-ok? :private (name: str a: Attrs) -> bool
+  (and (or (not (starts-with? name "__Secure-")) (. a secure))
+       (or (not (starts-with? name "__Host-")) (and (. a secure) (= (. a domain) "") (= (. a path) "/")))))
+;; The cookie a Set-Cookie value makes for a response from `host` to a request for `path`, or nil when it must be refused.
+(defun parse-set-cookie (text: str host: str path: str secure-conn: bool now: i64) -> (Option Cookie)
+  (let [parts (s/split text ";" -1) nv (trim-ows (nth parts 0)) eq (str-find nv "=" 0)]
+    (if (or (> (str-len text) max-cookie-bytes) (not (some? eq))) nil
+      (let [i (unwrap-or eq 0) name (trim-ows (str-slice nv 0 i)) value (trim-ows (str-slice nv (+ i 1) (str-len nv))) a (attributes (vec (rest parts)))
+            exp (match (. a max-age) ((some n) (if (<= n 0) 1 (+ now n))) (nil (. a expires)))
+            has-domain (> (str-len (. a domain)) 0)]
+        (cond (= name "") nil
+              (and (. a secure) (not secure-conn)) nil
+              (not (prefix-ok? name a)) nil
+              (and has-domain (not (and (domain-match? (lower host) (. a domain)) (some? (str-find (. a domain) "." 0))))) nil
+              :else (some (Cookie name value (if has-domain (. a domain) (lower host)) (not has-domain)
+                                  (if (starts-with? (. a path) "/") (. a path) (default-path path)) (. a secure) (. a http-only) (. a same-site) exp now)))))))
+(defun same-key? :private (a: Cookie b: Cookie) -> bool (and (= (. a name) (. b name)) (= (. a domain) (. b domain)) (= (. a path) (. b path))))
+(defun expired? (c: Cookie now: i64) -> bool (and (> (. c expires) 0) (<= (. c expires) now)))
+(defun evict :private (cs: (Vec Cookie) domain: str) -> (Vec Cookie)
+  (let [mine (vec (filter (fn (c: Cookie) (= (. c domain) domain)) cs))]
+    (if (<= (count mine) max-per-domain) cs
+      (let [oldest (reduce (fn (o: Cookie c: Cookie) (if (< (. c created) (. o created)) c o)) (first-of mine) mine)] (vec (remove (fn (c: Cookie) (same-key? c oldest)) cs))))))
+(defun first-of :private (xs: (Vec Cookie)) -> Cookie (nth xs 0))
+(defun insert :private (cs: (Vec Cookie) c: Cookie now: i64) -> (Vec Cookie)
+  (let [old (first (filter (fn (x: Cookie) (same-key? x c)) cs)) rest (vec (remove (fn (x: Cookie) (same-key? x c)) cs))]
+    (if (expired? c now) rest
+      (let [c2 (match old ((some o) (with c (created (. o created)))) (nil c)) all (conj rest c2)]
+        (if (> (count all) max-total) (vec (drop 1 (sort-by (fn (x: Cookie) (. x created)) all))) (evict all (. c domain)))))))
+;; Stores the Set-Cookie header values of a response from scheme://host/path.
+(defun store (j: Jar scheme: str host: str path: str values: (Vec str)) -> unit
+  (let [now (now-seconds)]
+    (do (dotimes (i (count values))
+          (match (parse-set-cookie (nth values i) host path (= scheme "https") now)
+            (nil ())
+            ((some c) (do (swap! (. j cookies) (fn (cs: (Vec Cookie)) (insert cs c now))) ()))))
+        ())))
+(defun applies? (c: Cookie scheme: str host: str path: str now: i64) -> bool
+  (and (not (expired? c now)) (or (not (. c secure)) (= scheme "https"))
+       (if (. c host-only) (= host (. c domain)) (domain-match? host (. c domain))) (path-match? path (. c path))))
+;; The Cookie request header value for scheme://host/path, or nil when no cookie applies. host is lower case; path has no query.
+(defun header-for (j: Jar scheme: str host: str path: str) -> (Option str)
+  (let [now (now-seconds) hit (filter (fn (c: Cookie) (applies? c scheme (lower host) (if (= path "") "/" path) now)) @(. j cookies))
+        ordered (sort-by (fn (c: Cookie) (+ (* (- 0 (str-len (. c path))) 10000000000) (. c created))) (vec hit))]
+    (if (= (count ordered) 0) nil (some (s/join "; " (mapv (fn (c: Cookie) (str (. c name) "=" (. c value))) ordered))))))
+(defun clear (j: Jar) -> unit (do (reset! (. j cookies) []) ()))

@@ -1,24 +1,36 @@
 ;; Client options and values. Every limit and deadline is an option with a safe default; zero means "none" for the timeouts.
-(ns fib.http.client.types (:use fib.core fib.seq fib.coll fib.http.types fib.http.transport fib.http.tcp fib.http.body))
-;; An OPTIONAL Content-Encoding decoder (a driver supplies zlib: DEFLATE is not implemented here). name is the coding ("gzip", "deflate");
-;; decode inflates a whole body. With no decoder for a coding the body is returned as received and its content-encoding header is kept.
-(defstruct Decoder (name: str decode: (fn :send ((Array i8)) (Result (Array i8) Error))))
+(ns fib.http.client.types (:use fib.core fib.seq fib.coll fib.http.types fib.http.transport fib.http.tcp fib.http.body fib.http.proxy fib.http.cookies))
+;; An OPTIONAL Content-Encoding decoder (a driver supplies zlib: DEFLATE is not implemented here, ADR 0012 spirit: fib-zlib wraps libz). name is the coding ("gzip", "deflate");
+;; decode inflates a WHOLE body and gets the most output it may produce (Options.max-response-bytes): a decoder must fail with (LimitError ..) instead of exceeding it, and
+;; is where a ratio limit lives (the client also refuses any result longer than the cap). Codings listed in Content-Encoding are undone last first, at most 4; if one of them has
+;; no decoder the body is returned as received and content-encoding is kept; after a full decode content-encoding and content-length are removed. Accept-Encoding lists the
+;; registered names (not when the caller set one, not for `request-stream`, whose body is the wire body). See docs/design/http.md, Content-Encoding.
+(defstruct Decoder (name: str decode: (fn :send ((Array i8) i64) (Result (Array i8) Error))))
 (defstruct Options (connect-timeout-ms: i64 timeout-ms: i64 follow-redirects: bool
   max-redirects: i64 decompress: bool throw-exceptions: bool ca-file: (Option str)
   max-response-bytes: i64 max-header-bytes: i64
   read-timeout-ms: i64 max-headers: i64 max-line-bytes: i64 max-idle-per-host: i64 idle-timeout-ms: i64
-  factories: (Map str Factory) decoders: (Vec Decoder)))
+  factories: (Map str Factory) decoders: (Vec Decoder) resolver: ResolverMode proxy: ProxySettings cookies: (Option Jar)))
 ;; timeout-ms is the whole request including redirects; read-timeout-ms the wait for any one piece of the response; connect-timeout-ms one connect.
 (defun default-options () -> Options
-  (Options 10000 30000 false 5 true true nil 8388608 65536 0 100 8192 4 30000 {"http" (tcp-factory)} []))
+  (Options 10000 30000 false 5 true true nil 8388608 65536 0 100 8192 4 30000 {"http" (tcp-factory)} [] NativeDns (no-proxy) nil))
 ;; The Transport factory for a scheme (for https: the TLS driver). Replaces any earlier one.
 (defun with-factory (o: Options scheme: str f: Factory) -> Options (with o (factories (assoc (. o factories) scheme f))))
 (defun with-decoder (o: Options d: Decoder) -> Options (with o (decoders (conj (. o decoders) d))))
+;; How names are resolved: the native resolver (the default), the platform's getaddrinfo (`:resolver :system`, for hosts whose names live in NSS only: mDNS, LDAP), or a function.
+(defun with-resolver (o: Options mode: ResolverMode) -> Options (with o (resolver mode)))
+(defun with-system-resolver (o: Options) -> Options (with o (resolver SystemResolver)))
+;; Proxies are explicit: `(with-proxy o (proxy-from-env))` reads http_proxy, https_proxy and no_proxy from the environment; nothing reads them implicitly.
+(defun with-proxy (o: Options settings: ProxySettings) -> Options (with o (proxy settings)))
+;; Cookies are opt-in: `(with-cookies o (new-jar))` stores the Set-Cookie headers of every response (each redirect hop too) in the jar and sends the matching cookies; fib.http.cookies.
+(defun with-cookies (o: Options j: Jar) -> Options (with o (cookies (some j))))
 (defstruct PoolStats (opened: i64 reused: i64 idle: i64))
 ;; A response whose body has not been read: the Body streams it; abandon closes the connection (the pool keeps it only when the body ran to its end).
 (defstruct StreamResponse (status: i64 headers: (Map str (Vec str)) body: Body abandon: (fn () unit)))
+(defstruct StreamingRequest (method: str url: str headers: (Map str (Vec str)) next: (fn () (Option (Array i8))) length: (Option i64)))
 (defstruct Client (execute: (fn (ClientRequest) (Result Response Error)) close: (fn () unit) stats: (fn () PoolStats)
-  stream: (fn (ClientRequest) (Result StreamResponse Error))))
+  stream: (fn (ClientRequest) (Result StreamResponse Error)) upload: (fn (StreamingRequest) (Result StreamResponse Error))
+  upload-whole: (fn (StreamingRequest) (Result Response Error))))
 (defun valid-options? (o: Options) -> bool
   (and (match (. o ca-file) (nil true) ((some path) (not (some? (str-find path "\0" 0)))))
        (>= (. o connect-timeout-ms) 0) (<= (. o connect-timeout-ms) 3600000)

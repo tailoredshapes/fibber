@@ -8,6 +8,26 @@
 (defun skip-ws (s: str n: i64 i: i64) -> i64
   (loop [k i] (let [b (at s n k)] (if (or (= b 32) (or (= b 10) (or (= b 13) (= b 9)))) (recur (+ k 1)) k))))
 
+;; Tolerant reading (JSON-3), all OFF by default: bits of `numbers` above the two that choose the number mode (types.fib): 16 comments (`// ...` and `/* ... */` count as white space),
+;; 32 a comma before a closing `]` or `}`, 64 `NaN`, `Infinity` and `-Infinity` as floats. Only this reader knows them: the fast tape refuses such text and this one is run instead; the tape
+;; (`json/tape`) stays strict.
+(defun tol-comments? (o: JsonOptions) -> bool (!= (bit-and (. o numbers) 16) 0))
+(defun tol-commas? (o: JsonOptions) -> bool (!= (bit-and (. o numbers) 32) 0))
+(defun tol-nonfinite? (o: JsonOptions) -> bool (!= (bit-and (. o numbers) 64) 0))
+
+;; White space and comments: a `//` comment runs to the end of the line, a `/*` one to the next `*/`; an unterminated one is left where it starts (the caller then reports the `/`).
+(defun skip-ws-c (s: str n: i64 i: i64) -> i64
+  (loop [k i]
+    (let [b (at s n k)]
+      (cond (or (= b 32) (or (= b 10) (or (= b 13) (= b 9)))) (recur (+ k 1))
+            (and (= b 47) (= (at s n (+ k 1)) 47)) (recur (loop [m (+ k 2)] (if (or (>= m n) (= (at s n m) 10)) m (recur (+ m 1)))))
+            (and (= b 47) (= (at s n (+ k 1)) 42))
+            (let [e (loop [m (+ k 2)] (cond (>= (+ m 1) n) -1 (and (= (at s n m) 42) (= (at s n (+ m 1)) 47)) (+ m 2) :else (recur (+ m 1))))]
+              (if (< e 0) k (recur e)))
+            :else k))))
+
+(defun ws (s: str n: i64 i: i64 o: JsonOptions) -> i64 (if (tol-comments? o) (skip-ws-c s n i) (skip-ws s n i)))
+
 (defun push-cp (&buf: (Array i8) &len: i64 c: i64) -> unit
   (cond (< c 128) (put-byte &buf &len c)
         (< c 2048) (do (put-byte &buf &len (+ 192 (shr c 6))) (put-byte &buf &len (+ 128 (bit-and c 63))))
@@ -80,15 +100,18 @@
 ;; ---- arrays and objects
 
 (defun parse-array (s: str n: i64 &pos: i64 &fail: i64 depth: i64 o: JsonOptions) -> Json
-  (let [i (skip-ws s n (+ @pos 1))]
+  (let [i (ws s n (+ @pos 1) o)]
     (if (= (at s n i) 93)
         (do (set! pos (+ i 1)) (JArr []))
         (do (set! pos i)
             (loop [items: (Vec Json) []]
               (let [v (parse-value s n &pos &fail depth o)]
                 (if (!= @fail 0) JNull
-                    (let [j (skip-ws s n @pos) c (at s n j)]
-                      (cond (= c 44) (do (set! pos (skip-ws s n (+ j 1))) (recur (conj items v)))
+                    (let [j (ws s n @pos o) c (at s n j)]
+                      (cond (= c 44) (let [p2 (ws s n (+ j 1) o)]
+                                       (if (and (tol-commas? o) (= (at s n p2) 93))
+                                           (do (set! pos (+ p2 1)) (JArr (conj items v)))
+                                           (do (set! pos p2) (recur (conj items v)))))
                             (= c 93) (do (set! pos (+ j 1)) (JArr (conj items v)))
                             :else (do (fail-at &pos &fail (if (= c -1) e-eof e-unexpected) j) JNull))))))))))
 
@@ -118,15 +141,15 @@
   (do (set! pos (+ @pos 1))
       (let [k (scan-string s n &pos &fail)]
         (if (!= @fail 0) k
-            (let [j (skip-ws s n @pos)]
+            (let [j (ws s n @pos o)]
               (if (!= (at s n j) 58)
                   (do (fail-at &pos &fail (if (>= j n) e-eof e-unexpected) j) k)
-                  (do (set! pos (skip-ws s n (+ j 1)))
+                  (do (set! pos (ws s n (+ j 1) o))
                       (set! v (parse-value s n &pos &fail depth o))
                       k)))))))
 
 (defun parse-object (s: str n: i64 &pos: i64 &fail: i64 depth: i64 o: JsonOptions) -> Json
-  (let [i (skip-ws s n (+ @pos 1))]
+  (let [i (ws s n (+ @pos 1) o)]
     (if (= (at s n i) 125)
         (do (set! pos (+ i 1)) (JObj [] []))
         (do (set! pos i)
@@ -138,7 +161,7 @@
                         k (parse-member s n &pos &fail depth o &vc)]
                     (if (!= @fail 0) JNull
                         (let [dup (key-index keys idx k (. o duplicates))
-                              j (skip-ws s n @pos)
+                              j (ws s n @pos o)
                               c (at s n j)]
                           (cond (and (>= dup 0) (= (. o duplicates) 2)) (do (fail-at &pos &fail e-duplicate kpos) JNull)
                                 (and (!= c 44) (!= c 125)) (do (fail-at &pos &fail (if (= c -1) e-eof e-unexpected) j) JNull)
@@ -148,19 +171,26 @@
                                       vals2 (if (>= dup 0) (assoc vals dup @vc) (conj vals @vc))
                                       idx2 (if (>= dup 0) idx (next-index keys idx k m))]
                                   (if (= c 44)
-                                      (do (set! pos (skip-ws s n (+ j 1))) (recur keys2 vals2 idx2))
+                                      (let [p2 (ws s n (+ j 1) o)]
+                                        (if (and (tol-commas? o) (= (at s n p2) 125))
+                                            (do (set! pos (+ p2 1)) (JObj keys2 vals2))
+                                            (do (set! pos p2) (recur keys2 vals2 idx2))))
                                       (do (set! pos (+ j 1)) (JObj keys2 vals2))))))))))))))
 
 (defun parse-value (s: str n: i64 &pos: i64 &fail: i64 depth: i64 o: JsonOptions) -> Json
   (let [c (at s n @pos)]
     (cond (= c 34) (do (set! pos (+ @pos 1)) (let [x (scan-string s n &pos &fail)] (if (!= @fail 0) JNull (JStr x))))
-          (or (= c 45) (and (>= c 48) (<= c 57))) (scan-number s n &pos &fail (. o numbers) (. o out-of-range))
+          (and (= c 45) (and (tol-nonfinite? o) (= (at s n (+ @pos 1)) 73)))
+          (do (set! pos (+ @pos 1)) (literal s n &pos &fail "Infinity" (JFloat (/ -1.0 0.0))))
+          (or (= c 45) (and (>= c 48) (<= c 57))) (scan-number s n &pos &fail (bit-and (. o numbers) 3) (. o out-of-range))
           (= c 123) (if (>= depth (. o max-depth)) (do (fail-at &pos &fail e-depth @pos) JNull) (parse-object s n &pos &fail (+ depth 1) o))
           (= c 91) (if (>= depth (. o max-depth)) (do (fail-at &pos &fail e-depth @pos) JNull) (parse-array s n &pos &fail (+ depth 1) o))
           (= c 116) (literal s n &pos &fail "true" (JBool true))
           (= c 102) (literal s n &pos &fail "false" (JBool false))
           (= c 110) (literal s n &pos &fail "null" JNull)
           (= c -1) (do (fail-at &pos &fail e-eof @pos) JNull)
+          (and (= c 78) (tol-nonfinite? o)) (literal s n &pos &fail "NaN" (JFloat (/ 0.0 0.0)))
+          (and (= c 73) (tol-nonfinite? o)) (literal s n &pos &fail "Infinity" (JFloat (/ 1.0 0.0)))
           :else (do (fail-at &pos &fail e-unexpected @pos) JNull))))
 
 ;; ---- entry points
@@ -175,18 +205,18 @@
               fail (cell 0)
               bom (bom? s n)
               _ (set! pos (if (and bom (. o bom)) 3 0))
-              _ (set! pos (skip-ws s n @pos))
+              _ (set! pos (ws s n @pos o))
               v (if (and bom (not (. o bom))) (do (set! fail e-bom) JNull) (parse-value s n &pos &fail 0 o))]
           (if (!= @fail 0)
               (Err (make-error s @fail @pos))
-              (let [e (skip-ws s n @pos)]
+              (let [e (ws s n @pos o)]
                 (if (< e n) (Err (make-error s e-trailing e)) (Ok v))))))))
 
 ;; One document of a text of several, starting at byte `start`: nil when only white space is left, else the result and the offset after the document
 ;; (after a failure: after the next newline, so a line-delimited text goes on with its next line).
 (defun parse-at (s: str o: JsonOptions start: i64) -> (Option (Pair (Result Json JsonError) i64))
   (let [n (str-len s)
-        i (skip-ws s n start)]
+        i (ws s n start o)]
     (if (>= i n) nil
         (let [pos (cell i) fail (cell 0)
               v (parse-value s n &pos &fail 0 o)]

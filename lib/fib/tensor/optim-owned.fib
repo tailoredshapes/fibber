@@ -1,0 +1,141 @@
+;; The Adam step on tensors the caller hands over: the parameter and its two moments are updated in their own buffers, no fresh buffer (spec/types.md 6.3 "Field moves").
+;;
+;; adam-step-owned lr b1 b2 eps bc1 bc2 p g m v  ->  [p' m' v']      the arithmetic, the order of operations and so the results of `adam-step` (fib.tensor.optim), bit for bit
+;;
+;; p, m and v are CONSUMED: write the call with each at its last use. When a tensor's descriptor and its buffer are both unique (count one: the caller held no other reference, so no Vec,
+;; tape or variable can see the change) and the tensor is dense, its buffer is the result's buffer, written in place; any tensor that is shared, or not dense, makes the whole call
+;; the fresh-buffer `adam-step` (nothing is half in place, and a shared holder never sees a write). `g` is only read. Each element is read and then written at the same index, so one
+;; pass in place equals the pass into fresh buffers.
+;;
+;; How a unique tensor's buffer gets to the kernel without a copy: the pattern `(Tensor buf meta seed)` on an owned tensor steals `buf` at its last use (the shell is unique, so the slot
+;; is nulled and the count travels), `(cell buf)` holds it, the kernel writes through `&` and peeks the cell for its reads (spec/types.md 6.3 "Cell peeks"), and the result is the shell
+;; of the same variant built over `@cell` (shell reuse). A field read `(. p buffer)` of an owned `p` at its last use does the same since the field-move rule.
+(ns fib.tensor.optim-owned
+  (:use fib.core fib.simd fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.views fib.tensor.memory fib.tensor.optim))
+
+;; A dense tensor of n elements at offset o fits its buffer (Tensor is a forgeable descriptor: the raw kernel checks before it writes).
+(defun fits :private (o: i64 n: i64 len: i64) -> unit
+  (when (or (< o 0) (> (+ o n) len)) (trap "tensor: optimiser step: the descriptor does not fit its buffer")))
+
+;; element f32 i of the buffer at `p` (no count, no check: the caller has checked the range and holds the buffer)
+(defun at-f32 :private (p: ptr i: i64) -> ptr (unsafe (ptr+ p (unchecked-multiply 4 i))))
+
+(defun adam-ip-f32 :private (n: i64 b1: f32 omb1: f32 b2: f32 omb2: f32 rs: f32 eps: f32 nlr: f32 pp: ptr gp: ptr mp: ptr vp: ptr) -> unit
+  (unsafe
+    (let ((end (- n (rem n (native-lanes f32)))) (b1v (splat f32xn b1)) (omb1v (splat f32xn omb1)) (b2v (splat f32xn b2)) (omb2v (splat f32xn omb2))
+          (rsv (splat f32xn rs)) (epsv (splat f32xn eps)) (nlrv (splat f32xn nlr)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((gv: f32xn (load-simd (at-f32 gp i))) (mv: f32xn (load-simd (at-f32 mp i))) (vv: f32xn (load-simd (at-f32 vp i))) (pv: f32xn (load-simd (at-f32 pp i)))
+                    (m2: f32xn (+ (* b1v mv) (* omb1v gv)))
+                    (v2: f32xn (+ (* b2v vv) (* omb2v (* gv gv))))
+                    (den: f32xn (+ (* (simd/sqrt v2) rsv) epsv))
+                    (p2: f32xn (+ pv (* nlrv (fdiv m2 den)))))
+                (do (store-simd (at-f32 mp i) m2) (store-simd (at-f32 vp i) v2) (store-simd (at-f32 pp i) p2) (recur (+ i (native-lanes f32)))))))
+          (loop ((i end))
+            (when (< i n)
+              (let ((gx (load-f32 (at-f32 gp i))) (mx (load-f32 (at-f32 mp i))) (vx (load-f32 (at-f32 vp i))) (px (load-f32 (at-f32 pp i)))
+                    (m2 (+ (* b1 mx) (* omb1 gx)))
+                    (v2 (+ (* b2 vx) (* omb2 (* gx gx))))
+                    (den (+ (* (simd/sqrt v2) rs) eps)))
+                (do (store-f32 (at-f32 mp i) m2) (store-f32 (at-f32 vp i) v2) (store-f32 (at-f32 pp i) (+ px (* nlr (fdiv m2 den))))
+                    (recur (+ i 1))))))))))
+
+;; The unique-write protocol once, so that the buffer in the cell is written by raw pointer after it: a shared buffer is copied here, a unique one is left as it is.
+(defun own-f32! :private (&c: (Array f32) o: i64) -> unit
+  (let ((x (array-get @c o))) (array-set! &c o x)))
+
+;; The pointer to element `o` of the array, valid while the array is held.
+(defun ptr-f32 :private (a: (Array f32) o: i64) -> ptr (unsafe (ptr+ (raw a) (+ (array-header-size) (* 4 o)))))
+
+(defun ip-f32 :private (n: i64 b1: f32 omb1: f32 b2: f32 omb2: f32 rs: f32 eps: f32 nlr: f32 g: (Array f32) go: i64
+                        p: (Tensor f32) m: (Tensor f32) v: (Tensor f32)) -> (Vec (Tensor f32))
+  (match p
+    ((Tensor pb pm ps)
+     (match m
+       ((Tensor mb mm ms)
+        (match v
+          ((Tensor vb vm vs)
+           (let ((po (array-get pm 0)) (mo (array-get mm 0)) (vo (array-get vm 0)))
+             (do (fits po n (array-len pb)) (fits mo n (array-len mb)) (fits vo n (array-len vb)) (fits go n (array-len g))
+                 (let ((pc (cell pb)) (mc (cell mb)) (vc (cell vb)))
+                   (do (own-f32! &pc po) (own-f32! &mc mo) (own-f32! &vc vo)
+                       (adam-ip-f32 n b1 omb1 b2 omb2 rs eps nlr (ptr-f32 @pc po) (ptr-f32 g go) (ptr-f32 @mc mo) (ptr-f32 @vc vo))
+                       [(Tensor @pc pm ps) (Tensor @mc mm ms) (Tensor @vc vm vs)])))))))))))
+
+;; element f64 i of the buffer at `p` (no count, no check: the caller has checked the range and holds the buffer)
+(defun at-f64 :private (p: ptr i: i64) -> ptr (unsafe (ptr+ p (unchecked-multiply 8 i))))
+
+(defun adam-ip-f64 :private (n: i64 b1: f64 omb1: f64 b2: f64 omb2: f64 rs: f64 eps: f64 nlr: f64 pp: ptr gp: ptr mp: ptr vp: ptr) -> unit
+  (unsafe
+    (let ((end (- n (rem n (native-lanes f64)))) (b1v (splat f64xn b1)) (omb1v (splat f64xn omb1)) (b2v (splat f64xn b2)) (omb2v (splat f64xn omb2))
+          (rsv (splat f64xn rs)) (epsv (splat f64xn eps)) (nlrv (splat f64xn nlr)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((gv: f64xn (load-simd (at-f64 gp i))) (mv: f64xn (load-simd (at-f64 mp i))) (vv: f64xn (load-simd (at-f64 vp i))) (pv: f64xn (load-simd (at-f64 pp i)))
+                    (m2: f64xn (+ (* b1v mv) (* omb1v gv)))
+                    (v2: f64xn (+ (* b2v vv) (* omb2v (* gv gv))))
+                    (den: f64xn (+ (* (simd/sqrt v2) rsv) epsv))
+                    (p2: f64xn (+ pv (* nlrv (fdiv m2 den)))))
+                (do (store-simd (at-f64 mp i) m2) (store-simd (at-f64 vp i) v2) (store-simd (at-f64 pp i) p2) (recur (+ i (native-lanes f64)))))))
+          (loop ((i end))
+            (when (< i n)
+              (let ((gx (load-f64 (at-f64 gp i))) (mx (load-f64 (at-f64 mp i))) (vx (load-f64 (at-f64 vp i))) (px (load-f64 (at-f64 pp i)))
+                    (m2 (+ (* b1 mx) (* omb1 gx)))
+                    (v2 (+ (* b2 vx) (* omb2 (* gx gx))))
+                    (den (+ (* (simd/sqrt v2) rs) eps)))
+                (do (store-f64 (at-f64 mp i) m2) (store-f64 (at-f64 vp i) v2) (store-f64 (at-f64 pp i) (+ px (* nlr (fdiv m2 den))))
+                    (recur (+ i 1))))))))))
+
+;; The unique-write protocol once, so that the buffer in the cell is written by raw pointer after it: a shared buffer is copied here, a unique one is left as it is.
+(defun own-f64! :private (&c: (Array f64) o: i64) -> unit
+  (let ((x (array-get @c o))) (array-set! &c o x)))
+
+;; The pointer to element `o` of the array, valid while the array is held.
+(defun ptr-f64 :private (a: (Array f64) o: i64) -> ptr (unsafe (ptr+ (raw a) (+ (array-header-size) (* 8 o)))))
+
+(defun ip-f64 :private (n: i64 b1: f64 omb1: f64 b2: f64 omb2: f64 rs: f64 eps: f64 nlr: f64 g: (Array f64) go: i64
+                        p: (Tensor f64) m: (Tensor f64) v: (Tensor f64)) -> (Vec (Tensor f64))
+  (match p
+    ((Tensor pb pm ps)
+     (match m
+       ((Tensor mb mm ms)
+        (match v
+          ((Tensor vb vm vs)
+           (let ((po (array-get pm 0)) (mo (array-get mm 0)) (vo (array-get vm 0)))
+             (do (fits po n (array-len pb)) (fits mo n (array-len mb)) (fits vo n (array-len vb)) (fits go n (array-len g))
+                 (let ((pc (cell pb)) (mc (cell mb)) (vc (cell vb)))
+                   (do (own-f64! &pc po) (own-f64! &mc mo) (own-f64! &vc vo)
+                       (adam-ip-f64 n b1 omb1 b2 omb2 rs eps nlr (ptr-f64 @pc po) (ptr-f64 g go) (ptr-f64 @mc mo) (ptr-f64 @vc vo))
+                       [(Tensor @pc pm ps) (Tensor @mc mm ms) (Tensor @vc vm vs)])))))))))))
+
+;; The extents of two descriptors agree (no `shape` vectors built: this runs once per parameter per step).
+(defun same-dims? :private (a: (Array i64) b: (Array i64)) -> bool
+  (let ((r (meta-rank a)))
+    (and (= r (meta-rank b))
+         (loop ((i 0)) (if (< i r) (if (= (array-get a (+ 2 i)) (array-get b (+ 2 i))) (recur (+ i 1)) false) true)))))
+
+(defun dense-all? :private (p: (Tensor t) m: (Tensor t) v: (Tensor t)) -> bool
+  (and (contiguous? p) (contiguous? m) (contiguous? v)))
+
+(defprotocol OptimiserOwned
+  (adam-owned-impl (self lr: f64 b1: f64 b2: f64 eps: f64 bc1: f64 bc2: f64 p: (Tensor Self) :owned g: (Tensor Self) m: (Tensor Self) :owned v: (Tensor Self) :owned) -> (Vec (Tensor Self))))
+(impl OptimiserOwned f32
+  (adam-owned-impl (self lr b1 b2 eps bc1 bc2 p g m v)
+    (if (and (dense-all? p m v) (same-dims? (. p meta) (. g meta)) (same-dims? (. p meta) (. m meta)) (same-dims? (. p meta) (. v meta)) (> (meta-size (. p meta)) 0))
+        (let ((gd (contiguous g)))
+          (ip-f32 (meta-size (. p meta)) (fptrunc f32 b1) (fptrunc f32 (- 1.0 b1)) (fptrunc f32 b2) (fptrunc f32 (- 1.0 b2)) (fptrunc f32 (/ 1.0 (simd/sqrt bc2))) (fptrunc f32 eps)
+                  (fptrunc f32 (- 0.0 (/ lr bc1))) (. gd buffer) (array-get (. gd meta) 0) p m v))
+        (adam-step lr b1 b2 eps bc1 bc2 p g m v))))
+(impl OptimiserOwned f64
+  (adam-owned-impl (self lr b1 b2 eps bc1 bc2 p g m v)
+    (if (and (dense-all? p m v) (same-dims? (. p meta) (. g meta)) (same-dims? (. p meta) (. m meta)) (same-dims? (. p meta) (. v meta)) (> (meta-size (. p meta)) 0))
+        (let ((gd (contiguous g)))
+          (ip-f64 (meta-size (. p meta)) (double b1) (double (- 1.0 b1)) (double b2) (double (- 1.0 b2)) (double (/ 1.0 (simd/sqrt bc2))) (double eps)
+                  (double (- 0.0 (/ lr bc1))) (. gd buffer) (array-get (. gd meta) 0) p m v))
+        (adam-step lr b1 b2 eps bc1 bc2 p g m v))))
+
+(defun adam-step-owned (lr: f64 b1: f64 b2: f64 eps: f64 bc1: f64 bc2: f64 p: (Tensor t) g: (Tensor t) m: (Tensor t) v: (Tensor t))
+  :where ((Element t) (Optimiser t) (OptimiserOwned t)) -> (Vec (Tensor t))
+  (let ((seed (. p seed)))   ; read first: an operand that reads `p` beside the call's own would keep it from being at its last use
+    (adam-owned-impl seed lr b1 b2 eps bc1 bc2 p g m v)))

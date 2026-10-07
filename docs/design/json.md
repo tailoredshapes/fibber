@@ -1,6 +1,6 @@
 # fib.json
 
-Status: implemented (JSON-1). Library: `lib/fib/json.fib` (the facade, `(:require [fib.json :as json])`) over `lib/fib/json/*.fib`. Numbers
+Status: implemented (JSON-1, JSON-2, JSON-3: section 7). Library: `lib/fib/json.fib` (the facade, `(:require [fib.json :as json])`) over `lib/fib/json/*.fib`. Numbers
 and commands: `docs/shootout/json.md`. Tests: `specs/json-*.fib`, `scripts/json-*.sh`, `scripts/mutant-json.sh`.
 
 The language needed no new builtin. Everything below was measured on this tree's stage 2 with the released v0.1.8 seed's `fibc` building
@@ -51,8 +51,8 @@ struct because macros see syntax, not types (`defrecord` is built the same way).
 Findings that shaped it (each measured, commands in `docs/shootout/json.md`):
 
 - `subs` is O(n) per call (it counts characters): a parser built on it took 26 s for twitter.json. `str-slice` takes byte offsets and is O(length).
-- `array-push!` copies once the array has 32 elements or more (spec/types.md 2.13.1): 580 ns per push at 1 M pushes, quadratic beyond. So the serialiser's
-  buffer is an `(Array i8)` with a length cell and a `memcpy` doubling (`fib.json.buffer`); `os/read-file-bytes`, which appends with `array-push!`, is avoided
+- `array-push!` copied once the array had 32 elements or more (580 ns per push at 1 M pushes, quadratic beyond) when JSON-1 was written; LIBFIX-1 made it linear, but it is still a checked call per byte. So the serialiser's
+  buffer is an `(Array i8)` with a length cell and a `memcpy` doubling (`fib.json.buffer`); `os/read-file-bytes`, which appends with `array-push!` (quadratic then, linear now, still a push per byte), is avoided
   (`json/read-file` is the builtin `read-file`, with a chunked fd read only for its failure path).
 - `/` on integers is a Ratio; `quot` and `rem` are the integer operations.
 - A bounds-checked `str-byte-at` per byte against an unchecked raw load: DOM parse of citm_catalog 156 to 412 MB/s, canada 67 to 176 (with Eisel-Lemire), twitter 98 to 130.
@@ -87,8 +87,32 @@ array in this language, there is no slice type, so `str-slice` copies; a documen
 
 | parse vs Python's json and Jackson on the corpus | `scripts/bench/json/` (same documents, outputs compared by the shootout's check column) | see the shootout |
 
-## 7. Not done (after JSON-2)
+## 7. JSON-3: the writer, the Doc, streams, options
 
-Streaming SAX over input larger than memory with a tape-free scanner; a lazy seq of documents over a reader (`reduce-lines` and `reduce-lines-par` fold; neither is a seq); a hash-indexed `JObj`
-(an index would have to live in the type: `JObj keys vals` is two vectors, lookups scan); zero-copy strings (no slice type); a `defjson` encoder that writes straight to the buffer without a DOM;
-`has-simd` gating for wasm and JS targets; `JBig` arithmetic; `json/write-to` takes a file descriptor only (not an arbitrary sink); fib.log / fib.otel / fib.db / fib.http do not use fib.json yet (those directories were not touched).
+Measured on the Ryzen 7 5800X (WSL2) in `docs/shootout/json.md`; every piece has a spec and planted faults (`scripts/mutant-json.sh`).
+
+- **The large-block cache reaches the library.** `fib.json.stage1` malloc'ed its structural index (a word per eight input bytes) and the writer a 4 MiB block per document. The runtime
+  pins glibc's mmap threshold at 128 KiB when its large-block cache is on (docs/design/allocator.md), so a `malloc` of that size is a fresh `mmap`, first-touch page faults and an `munmap`: on WSL2 that
+  was the whole difference between "default" and "tuned" (`MALLOC_MMAP_THRESHOLD_=1000000000`) in JSON-2. Both buffers are now arrays made by `array-uninit-f64` (no zero fill), so their blocks
+  come from, and go back to, the cache. Default allocator, no environment: tape 900 to 1 770 MB/s on twitter, the numbers that were the "tuned" column. Nothing in the process allocator is changed.
+- **The Doc is the tape.** `Doc (src words len)` already is a struct of arrays: tags and offsets in one `(Array i64)`, strings and numbers as (start, end) into the one source `str`
+  that the Doc holds a counted reference to (nothing is copied, nothing is freed early). Accessors answer node indices (`field`, `elem`, `path`), or owned copies (`node-str`, `node->json`); no accessor
+  returns a view into the buffer (the language has no slice type). `parse` still returns `Json`: the DOM is one heap object per value (a `JInt`, a `JStr` and its `str`, a `Vec` and its arrays),
+  about 20 ns each to make and drop, which is what 440 to 560 MB/s is; a lighter `Json` would be a different type. `fib.json.docwrite` writes a Doc back without building one:
+  1.6 to 2.7 GB/s (strings and numbers are copied as the source spelled them).
+- **Writer.** Float printing writes digits straight to memory (no `Pair`, no scratch array per call): canada 98 to 229 MB/s. Strings of 8 to 31 bytes are tested with one or two words (`all-plain?`),
+  a key and its colon and the separators take one room check each. `defjson` also writes `encode-NAME` / `encode-bytes-NAME` over the same position-passing writers, with no `Json`:
+  1.5 GB/s of output against 0.55 GB/s through `ToJson` and the DOM writer. What a DOM walk costs is not the `nth` and the `match` (a walk alone runs at 5 GB/s of input text) but the
+  stores per value; the DOM writer is at 550 to 860 MB/s, not at 1 GB/s.
+- **Streams.** `fib.json.stream`: `lines-seq` (a lazy `LSeq` of `Result`s over a file, 4 MiB reads cut at a newline; a document that spans lines or reads is completed by reading on; the file is closed when the
+  seq ends) and `reduce-lines-par-map` (each line is copied, validated and parsed inside its task, `g` runs there, the DOM is dropped there; results are folded in order). UTF-8 is checked per read and answers an
+  `Err` (code 6), not a trap. The runtime's validator (`fib.utf8-valid`, rt/str.lir) skips eight ASCII bytes at a time and decides two- and three-byte sequences inline: `str-from-bytes` of 32 MB of ASCII 218 to 20 ms.
+- **Options.** `tolerant-options comments trailing-commas non-finite`: off by default, read by the DOM parser only (the fast tape refuses such text and the scalar parser, which knows them, runs; the tape stays strict).
+  They are bits of `JsonOptions.numbers` above the two that choose the number mode, so `(JsonOptions ...)` written positionally by existing code means what it meant.
+- **Lookup and sinks.** `index-object` / `index-get` give O(1) lookup in one big object; `JObj keys vals` itself is unchanged (a third field would break every pattern that matches it and every
+  parse would pay for an index nobody reads). `write-sink j sink` writes the compact text to any `(fn ((Array i8)) (Result unit OSError))` in pieces of at most 64 KiB; `write-to fd` is the same with `os/write-all`.
+
+**Not done.** A `Json` that is cheaper than one object per value (so DOM parse at Jackson's speed); `JObj` carrying its index; `defjson` for sum types and for fields of other kinds than the listed ones; typed decode faster than the
+tape it reads (it is 86 percent of it: the decoder finds fields by key in a scan of each object); the writer from a `Json` at 1 GB/s on string-heavy data (it is 0.86 GB/s on twitter); a general fix of the multi-thread allocator
+(docs/design/allocator.md section 10 says what it needs); parallel DOM NDJSON that scales when the results are kept (the DOMs are freed by the thread that folds them); `has-simd` gating for wasm and JS targets; `JBig` arithmetic;
+streaming SAX with a tape-free scanner; aarch64 speeds (the new code was not run on the Mac).

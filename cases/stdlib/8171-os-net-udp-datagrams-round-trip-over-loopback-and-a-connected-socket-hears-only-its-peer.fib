@@ -1,0 +1,27 @@
+;; spec: docs/design/dns.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll) (:require [fib.os.net :as net] [fib.os.io :as io] [fib.os.time :as time]))
+(defun main () -> i64
+  (let [c (checks) stop (atom false)]
+    (match (net/udp-bind "127.0.0.1" 0)
+      ((Err _) 1)
+      ((Ok server) (match (net/udp-bind "127.0.0.1" 0)
+        ((Err _) 2)
+        ((Ok stranger) (match (net/udp-open "127.0.0.1" (. server port))
+          ((Err _) 3)
+          ((Ok client)
+            (do (check c (match (net/udp-send client (str-bytes "ping")) ((Ok _) true) (_ false)))
+                (match (net/udp-recv-from (. server fd) 100 (+ (time/clock-now) 1000000000) stop)
+                  ((Err _) (check c false))
+                  ((Ok dg) (do (check c (= (str-from-bytes (. dg bytes)) "ping"))
+                               ;; a datagram from another socket to the client's address never reaches the connected client; the peer's own answer does
+                               (net/udp-send-to (. stranger fd) (str-bytes "forged") "127.0.0.1" (. dg port))
+                               (net/udp-send-to (. server fd) (str-bytes "pong") (. dg peer) (. dg port))
+                               (check c (match (net/udp-recv client 100 (+ (time/clock-now) 1000000000) stop) ((Ok b) (= (str-from-bytes b) "pong")) (_ false)))
+                               (check c (match (net/udp-recv client 100 (+ (time/clock-now) 100000000) stop) ((Err e) true) ((Ok _) false))))))
+                (io/close-fd client) (io/close-fd (. server fd)) (io/close-fd (. stranger fd))
+                (checks-result c))))))))))

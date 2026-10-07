@@ -1,0 +1,50 @@
+;; spec: lib/fib/autodiff/optim.fib (header): the Adam step of fib.autodiff consumes the parameters and the state it is given and writes their buffers in place when they are unique; a caller that keeps them sees no write
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; Thirty chained steps of `ad/adam-step` over a Vec of two parameters (64 and 4 elements) give the values of `adam-step` on each parameter by itself. Then the persistence case: the caller keeps
+;; `ps` and the state after the call (it reads them again), so the step is handed shared tensors and must copy: the old parameters and moments read as before the step, the new ones differ.
+;; A step that wrote through a shared buffer would change the old parameter and fail the first checks.
+(ns main (:require [fib.tensor :as t] [fib.autodiff :as ad]) (:use tl.check))
+
+(defun ipow (x: f64 n: i64) -> f64 (loop ((i 0) (acc 1.0)) (if (< i n) (recur (+ i 1) (* acc x)) acc)))
+
+;; the oracle: `adam-step` (fresh buffers) with the bias corrections of step s, for a tensor of n elements at `init` and the constant gradient `gv`
+(defun run-fresh (n: i64 init: f64 gv: f64 k: i64 at: i64) -> f64
+  (let ((gt (t/from-array [n] (array n gv) 0.0)))
+    (loop ((s 1) (p (t/from-array [n] (array n init) 0.0)) (m (t/from-array [n] (array n 0.0) 0.0)) (v (t/from-array [n] (array n 0.0) 0.0)))
+      (if (<= s k)
+          (let ((r (t/adam-step 0.01 0.9 0.999 1.0e-8 (- 1.0 (ipow 0.9 s)) (- 1.0 (ipow 0.999 s)) p gt m v)))
+            (recur (+ s 1) (nth r 0) (nth r 1) (nth r 2)))
+          (t/at p [at])))))
+
+(defun ad-chain (k: i64) -> (Vec f64)
+  (let ((g2 [(t/from-array [64] (array 64 0.25) 0.0) (t/from-array [4] (array 4 0.5) 0.0)]))
+    (loop ((s 0) (ps [(t/from-array [64] (array 64 1.0) 0.0) (t/from-array [4] (array 4 2.0) 0.0)]) (st (ad/adam-init ps)))
+      (if (< s k)
+          (let ((next (ad/adam-step 0.01 0.9 0.999 1.0e-8 st ps g2)))
+            (recur (+ s 1) (. next params) (. next state)))
+          [(t/at (nth ps 0) [3]) (t/at (nth ps 1) [1])]))))
+
+(defun persistence (c: Checks) -> unit
+  (let ((ps [(t/from-array [64] (array 64 1.0) 0.0) (t/from-array [4] (array 4 2.0) 0.0)])
+        (g2 [(t/from-array [64] (array 64 0.25) 0.0) (t/from-array [4] (array 4 0.5) 0.0)]))
+    (let ((st (ad/adam-init ps)))
+      (let ((next (ad/adam-step 0.01 0.9 0.999 1.0e-8 st ps g2)))
+        (do (check c (= (t/at (nth ps 0) [3]) 1.0))
+            (check c (= (t/at (nth ps 1) [1]) 2.0))
+            (check c (= (t/at (nth (. st m) 0) [3]) 0.0))
+            (check c (= (t/at (nth (. st v) 1) [1]) 0.0))
+            (check c (!= (t/at (nth (. next params) 0) [3]) 1.0))
+            (check c (!= (t/at (nth (. (. next state) m) 0) [3]) 0.0))
+            (check c (= (. (. next state) steps) 1)))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (q (checks)))
+    (do (check c (= (ad-chain 30) [(run-fresh 64 1.0 0.25 30 3) (run-fresh 4 2.0 0.5 30 1)]))
+        (persistence c)
+        (check q (= (ad-chain 30) [(run-fresh 64 1.0 0.25 29 3) (run-fresh 4 2.0 0.5 30 1)]))
+        (check-detects c q)
+        (checks-result c))))

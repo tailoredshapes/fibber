@@ -1,0 +1,27 @@
+;; spec: docs/design/http.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll fib.http.types fib.http.client.types) (:require [fib.http.server :as sv] [fib.http.server.types :as st] [fib.os.net :as net] [fib.os.io :as io] [fib.os.time :as time]))
+(defun read-text (fd: i64) -> str
+  (let [limit (+ (time/clock-now) 2000000000)]
+    (loop [acc ""]
+      (match (net/wait-readable fd limit (atom false))
+        ((Err _) (str acc "<timeout>"))
+        ((Ok _) (match (io/read-fd fd 4096) ((Ok b) (if (= (array-len b) 0) (str acc "<eof>") (recur (str acc (str-from-bytes b))))) ((Err _) (str acc "<error>"))))))))
+(defun main () -> i64
+  (let [ch (checks) req (str-bytes "GET / HTTP/1.1\r\nHost: x\r\n\r\n")]
+    (match (sv/run-server (fn (r: Request) (do (time/sleep-ns 400000000) (Response 200 {} (str-bytes "slow")))) (with (st/default-options) (port 0) (workers 1)))
+      ((Err _) 1)
+      ((Ok srv) (match (net/connect-tcp "127.0.0.1" (sv/port srv) 1000)
+        ((Err _) 2)
+        ((Ok a) (do (net/send-all a req 1000 (atom false)) (time/sleep-ns 100000000)
+          (match (net/connect-tcp "127.0.0.1" (sv/port srv) 1000)
+            ((Err _) 3)
+            ((Ok b) (do (net/send-all b req 1000 (atom false)) (time/sleep-ns 100000000)
+                        (sv/stop-server srv)
+                        (let [ta (read-text a) tb (read-text b)]
+                          (do (check ch (starts-with? ta "HTTP/1.1 200 OK")) (check ch (starts-with? tb "HTTP/1.1 503 Service Unavailable")) (check ch (not (some? (str-find tb "<error>" 0))))
+                              (io/close-fd a) (io/close-fd b) (checks-result ch)))))))))))))

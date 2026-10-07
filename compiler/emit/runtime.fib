@@ -1336,9 +1336,38 @@
 (define internal (fib.utf8-valid i1) ((ptr p) (i64 n))
   (block entry (br loop))
   (block loop
-    (let ((i (phi i64 (entry (i64 0)) (adv inext))))
-      (br (icmp sge i n) ok head)))
+    (let ((i (phi i64 (entry (i64 0)) (adv inext) (wadv iw) (adv2 j2) (adv3 j3))))
+      (br (icmp sge i n) ok wide)))
+  ;; JSON-3: eight ASCII bytes at a time (a word with no byte of 0x80 or more is eight one-byte sequences); the common two- and three-byte sequences (C2..DF, E1..EC and EE..EF
+  ;; with their continuation bytes in 80..BF) inline; the step for everything else (E0, ED, F0..F4, and every error), which decides exactly as before.
+  (block wide
+    (br (icmp sle (add i (i64 8)) n) word head))
+  (block word
+    (let ((w (load i64 (getelementptr i8 p i)))
+          (iw (add i (i64 8))))
+      (br (icmp eq (and w (i64 -9187201950435737472)) (i64 0)) wadv head)))
+  (block wadv (br loop))
   (block head
+    (let ((b0 (zext i32 (load i8 (getelementptr i8 p i))))
+          (ia (add i (i64 1)))
+          (ib (add i (i64 2))))
+      (br (and (icmp uge b0 (i32 194)) (icmp ule b0 (i32 223))) two chk3)))
+  (block two
+    (br (icmp slt ia n) two2 slow))
+  (block two2
+    (let ((c1 (zext i32 (load i8 (getelementptr i8 p ia)))))
+      (br (icmp eq (and c1 (i32 192)) (i32 128)) adv2 slow)))
+  (block adv2 (let ((j2 (add i (i64 2)))) (br loop)))
+  (block chk3
+    (br (and (icmp uge b0 (i32 225)) (and (icmp ule b0 (i32 239)) (icmp ne b0 (i32 237)))) three slow))
+  (block three
+    (br (icmp slt ib n) three2 slow))
+  (block three2
+    (let ((d1 (zext i32 (load i8 (getelementptr i8 p ia))))
+          (d2 (zext i32 (load i8 (getelementptr i8 p ib)))))
+      (br (and (icmp eq (and d1 (i32 192)) (i32 128)) (icmp eq (and d2 (i32 192)) (i32 128))) adv3 slow)))
+  (block adv3 (let ((j3 (add i (i64 3)))) (br loop)))
+  (block slow
     (let ((k (call @fib.utf8-step p n i)))
       (br (icmp sgt k (i64 0)) adv bad)))
   (block adv (let ((inext (add i k))) (br loop)))

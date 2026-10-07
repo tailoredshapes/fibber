@@ -1,0 +1,76 @@
+;; fib.json.docwrite: a Doc (the tape of a parsed document) written back as compact JSON without building a `Json` (docs/design/json.md 7). A linear walk over the tape's
+;; words with a small stack of open containers; each string and each number is copied from the source text exactly as it was written (a string keeps its escapes, a number its
+;; spelling: `1.0E2` stays `1.0E2`, where the `Json` writer would print `100.0`), so the work per value is a few compares and one copy of its bytes. The text of the source
+;; bounds the output (every output byte is a non-blank byte of the source), so the buffer is made once, at that size, and never restarts.
+;; A pretty or an ASCII-only text of a Doc goes through `node->json` and the `Json` writer (`doc-write-with`).
+;;   (doc-write d) (doc-write-node d i) -> str          (doc-write-bytes d i) -> (Array i8)          (doc-write-with d i opts) -> str
+(ns fib.json.docwrite (:use fib.core fib.seq fib.coll fib.json.types fib.json.tape) (:require [fib.json.tapefast :as tf] [fib.json.escape :as es] [fib.json.write :as w] [fib.json.view :as v] [fib.json.libc :as libc]))
+
+(defun dw-put (o: ptr pos: i64 c: i64) -> unit (unsafe (store-i8 (ptr+ o pos) (trunc i8 c))))
+
+;; The stack of open containers, three words a level: the tape index where it ends, 1 for an object (0 an array), the children written so far (a key counts one, its value one).
+(defun sk-get (sk: ptr d: i64 f: i64) -> i64 (unsafe (load-i64 (ptr+ sk (shl (+ (* d 3) f) 3)))))
+(defun sk-set (sk: ptr d: i64 f: i64 v: i64) -> unit (unsafe (store-i64 (ptr+ sk (shl (+ (* d 3) f) 3)) v)))
+
+;; The separator that goes before the next child of the container on top: a comma between children, a colon between a key and its value.
+(defun dw-sep (o: ptr q: i64 sk: ptr dp: i64) -> i64
+  (if (= dp 0) q
+      (let [c (sk-get sk (- dp 1) 2)]
+        (if (= (sk-get sk (- dp 1) 1) 1)
+            (if (= (bit-and c 1) 1) (do (dw-put o q 58) (+ q 1)) (if (> c 0) (do (dw-put o q 44) (+ q 1)) q))
+            (if (> c 0) (do (dw-put o q 44) (+ q 1)) q)))))
+
+(defun dw-count (sk: ptr dp: i64) -> unit (when (> dp 0) (sk-set sk (- dp 1) 2 (+ 1 (sk-get sk (- dp 1) 2)))))
+
+(defun dw-lit (o: ptr q: i64 k: i64) -> i64
+  (cond (= k k-null) (do (unsafe (store-i32 (ptr+ o q) 1819047278i32)) (+ q 4))
+        (= k k-true) (do (unsafe (store-i32 (ptr+ o q) 1702195828i32)) (+ q 4))
+        :else (do (unsafe (do (store-i32 (ptr+ o q) 1936482662i32) (store-i8 (ptr+ o (+ q 4)) 101i8))) (+ q 5))))
+
+;; The subtree at tape node i written to o; its length.
+(defun dw-run (src: ptr tp: ptr i: i64 o: ptr sk: ptr capd: i64) -> i64
+  (let [w00 (tf/tget tp i)
+        root-end (if (>= (bit-and w00 255) k-array) (tf/tget tp (+ i 1)) (+ i 2))]
+    (loop [j i q 0 dp 0]
+      (if (and (> dp 0) (>= j (sk-get sk (- dp 1) 0)))
+          (do (dw-put o q (if (= (sk-get sk (- dp 1) 1) 1) 125 93))
+              (dw-count sk (- dp 1))
+              (recur j (+ q 1) (- dp 1)))
+          (if (>= j root-end) q
+              (let [w0 (tf/tget tp j) k (bit-and w0 255) a (shr w0 8) q1 (dw-sep o q sk dp)]
+                (cond (= k k-str)
+                      (let [b (bit-and (tf/tget tp (+ j 1)) 4611686018427387903)]
+                        (do (dw-put o q1 34)
+                            (es/copy-bytes (unsafe (ptr+ o (+ q1 1))) (unsafe (ptr+ src a)) (- b a))
+                            (dw-put o (+ q1 (+ (- b a) 1)) 34)
+                            (dw-count sk dp)
+                            (recur (+ j 2) (+ q1 (+ (- b a) 2)) dp)))
+                      (or (= k k-int) (= k k-float))
+                      (let [b (tf/tget tp (+ j 1))]
+                        (do (es/copy-bytes (unsafe (ptr+ o q1)) (unsafe (ptr+ src a)) (- b a))
+                            (dw-count sk dp)
+                            (recur (+ j 2) (+ q1 (- b a)) dp)))
+                      (>= k k-array)
+                      (if (>= dp capd) -1
+                          (do (dw-put o q1 (if (= k k-object) 123 91))
+                              (sk-set sk dp 0 (tf/tget tp (+ j 1)))
+                              (sk-set sk dp 1 (if (= k k-object) 1 0))
+                              (sk-set sk dp 2 0)
+                              (recur (+ j 2) (+ q1 1) (+ dp 1))))
+                      :else
+                      (let [q2 (dw-lit o q1 k)] (do (dw-count sk dp) (recur (+ j 2) q2 dp))))))))))
+
+(defun doc-write-bytes (d: Doc i: i64) -> (Array i8)
+  (let [src (. d src) n (str-len src)
+        ba (unsafe (array-uninit-f64 (quot (+ n 47) 8)))
+        capd (min (+ 1 (quot (. d len) 2)) 100000)
+        sk (array (+ 6 (* 3 capd)) 0)
+        r (dw-run (unsafe (ptr+ (raw src) 24)) (unsafe (raw (. d words))) i (unsafe (ptr+ (raw ba) 24)) (unsafe (ptr+ (raw sk) 24)) capd)]
+    (if (< r 0) (w/write-bytes (v/node->json d i))
+        (let [out (array r 0i8)] (do (unsafe (libc/memcpy (ptr+ (raw out) 24) (ptr+ (raw ba) 24) r)) out)))))
+
+(defun doc-write-node (d: Doc i: i64) -> str (str-from-bytes (doc-write-bytes d i)))
+(defun doc-write (d: Doc) -> str (doc-write-node d 0))
+
+(defun doc-write-with (d: Doc i: i64 o: WriteOptions) -> str
+  (if (and (= (. o indent) 0) (not (. o ascii))) (doc-write-node d i) (w/write-with (v/node->json d i) o)))

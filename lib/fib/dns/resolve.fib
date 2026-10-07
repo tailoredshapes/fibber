@@ -1,0 +1,89 @@
+;; The resolver: /etc/hosts first, then DNS (the nsswitch default "files dns"), candidates by the search rules, A and AAAA asked concurrently (one task each), servers and attempts
+;; walked on timeouts and server failures, results cached by TTL. The addresses come back IPv4 first, then IPv6 (a connect that fails moves on to the next; a host without IPv6 pays
+;; one immediate error). A bare IPv4 or IPv6 literal (also in brackets) is returned as is without a query. "localhost" and "*.localhost" are the loopback addresses (RFC 6761 6.3) even
+;; with no /etc/hosts. A resolver is a value (configuration and cache); build it once and share it, nothing is global.
+(ns fib.dns.resolve (:use fib.core fib.seq fib.coll fib.dns.types fib.dns.config fib.dns.exchange fib.dns.answer fib.dns.cache)
+  (:require [fib.string :as s] [fib.dns.ip :as ip] [fib.dns.encode :as enc] [fib.os.time :as time] [fib.os.errors :as os]))
+(defstruct DnsConfig (conf: ResolvConf hosts: (Vec HostEntry) edns-size: i64 total-ms: i64 cache-size: i64))
+(defstruct Resolver (config: DnsConfig cache: Cache))
+(defenum DnsError (NameNotFound message: str) (NameTimeout message: str) (NameFailed message: str))
+(derive Eq DnsError)
+(derive Debug DnsError)
+(defun default-dns-config (conf: ResolvConf hosts: (Vec HostEntry)) -> DnsConfig (DnsConfig conf hosts 1232 15000 512))
+(defun new-resolver (c: DnsConfig) -> Resolver (Resolver c (new-cache (. c cache-size))))
+;; The host's own files: /etc/resolv.conf and /etc/hosts, or the documented fallbacks.
+(defun system-resolver () -> Resolver (new-resolver (default-dns-config (load-resolv-conf "/etc/resolv.conf") (load-hosts "/etc/hosts"))))
+(defun dots :private (name: str) -> i64 (- (count (ip/split-on name 46)) 1))
+;; The names to try, in order (resolv.conf search and ndots rules): a trailing dot is absolute; a name with at least ndots dots is tried as is first, otherwise last.
+(defun candidates (c: ResolvConf name: str) -> (Vec str)
+  (if (s/ends-with? name ".") [(str-slice name 0 (- (str-len name) 1))]
+    (let [suffixed (vec (map (fn (d: str) (str name "." d)) (. c search)))]
+      (vec (filter enc/valid-name? (if (>= (dots name) (. c ndots)) (into [name] suffixed) (into suffixed [name])))))))
+(defun key-of :private (name: str qtype: i64) -> str (str name "|" qtype))
+(defun from-entry :private (e: Entry) -> (Result Answer Fail)
+  (cond (= (. e negative) "nxdomain") (Err (NxDomain 0)) (= (. e negative) "nodata") (Err (NoData 0)) :else (Ok (Answer (. e addrs) 0))))
+(defun lookup-type (c: DnsConfig name: str qtype: i64 deadline: i64) -> (Result Answer Fail)
+  (let [servers (. (. c conf) servers) per-try (* (. (. c conf) timeout-ms) 1000000)]
+    (loop [attempt 0 si 0 last: Fail (Temp "no nameservers")]
+      (cond (>= (time/clock-now) deadline) (Err (Temp "timeout"))
+            (= attempt (. (. c conf) attempts)) (Err last)
+            (>= si (count servers)) (recur (+ attempt 1) 0 last)
+            :else (match (ask (nth servers si) (Question name qtype class-in) (. c edns-size) (min deadline (+ (time/clock-now) per-try)))
+              ((Err f) (recur attempt (+ si 1) f))
+              ((Ok m) (match (interpret m qtype)
+                ((Err (Temp r)) (recur attempt (+ si 1) (Temp r)))
+                (result result))))))))
+(defun store :private (r: Resolver name: str qtype: i64 res: (Result Answer Fail)) -> unit
+  (let [key (key-of name qtype) now (time/clock-now)]
+    (match res
+      ((Ok a) (do (cache-put (. r cache) key (. a addrs) (. a ttl) now) ()))
+      ((Err (NxDomain t)) (do (cache-put-negative (. r cache) key "nxdomain" t now) ()))
+      ((Err (NoData t)) (do (cache-put-negative (. r cache) key "nodata" t now) ()))
+      (_ ()))))
+(defun cached :private (r: Resolver name: str qtype: i64) -> (Option (Result Answer Fail))
+  (match (cache-get (. r cache) (key-of name qtype) (time/clock-now)) (nil nil) ((some e) (some (from-entry e)))))
+(defun temp? :private (f: Fail) -> bool (match f ((Temp _) true) (_ false)))
+(defun nx? :private (f: Fail) -> bool (match f ((NxDomain _) true) (_ false)))
+;; neither type answered: a temporary failure wins (nothing is known), NXDOMAIN only when both said it, else NODATA
+(defun neither :private (fa: Fail fb: Fail) -> Fail
+  (cond (temp? fa) fa (temp? fb) fb (and (nx? fa) (nx? fb)) fa (nx? fa) fb :else fa))
+(defun both :private (a: (Result Answer Fail) b: (Result Answer Fail)) -> (Result (Vec str) Fail)
+  (match a
+    ((Ok x) (match b ((Ok y) (Ok (into (. x addrs) (. y addrs)))) (_ (Ok (. x addrs)))))
+    ((Err fa) (match b ((Ok y) (Ok (. y addrs))) ((Err fb) (Err (neither fa fb)))))))
+;; Fetches what is not cached: the two types in two tasks at once. The cache is touched only on this thread.
+(defun fetch :private (r: Resolver name: str deadline: i64) -> (Result (Vec str) Fail)
+  (let [c (. r config) c4 (cached r name type-a) c6 (cached r name type-aaaa)
+        t4 (match c4 (nil (some (spawn (fn () (lookup-type c name type-a deadline))))) (_ nil))
+        t6 (match c6 (nil (some (spawn (fn () (lookup-type c name type-aaaa deadline))))) (_ nil))
+        r4 (match t4 ((some t) (join t)) (nil (unwrap-or c4 (Err (Temp "unreachable")))))
+        r6 (match t6 ((some t) (join t)) (nil (unwrap-or c6 (Err (Temp "unreachable")))))]
+    (do (if (some? t4) (store r name type-a r4) ()) (if (some? t6) (store r name type-aaaa r6) ()) (both r4 r6))))
+(defun clean-host :private (host: str) -> str
+  (if (and (starts-with? host "[") (s/ends-with? host "]")) (str-slice host 1 (- (str-len host) 1)) host))
+(defun localhost? :private (name: str) -> bool (let [n (lower name)] (or (= n "localhost") (s/ends-with? n ".localhost"))))
+(defun via-dns :private (r: Resolver name: str) -> (Result (Vec str) DnsError)
+  (let [deadline (+ (time/clock-now) (* (. (. r config) total-ms) 1000000))]
+    (loop [cs (candidates (. (. r config) conf) name) temp: (Option str) nil]
+      (if (= (count cs) 0)
+        (match temp ((some why) (Err (if (= why "timeout") (NameTimeout (str name ": DNS timeout")) (NameFailed (str name ": " why)))))
+                    (nil (Err (NameNotFound (str name ": no such host")))))
+        (match (fetch r (nth cs 0) deadline)
+          ((Ok addrs) (Ok addrs))
+          ((Err (Temp why)) (recur (vec (rest cs)) (some why)))
+          ((Err _) (recur (vec (rest cs)) temp)))))))
+(defun resolve-name (r: Resolver host: str) -> (Result (Vec str) DnsError)
+  (let [h (clean-host host)]
+    (cond (= h "") (Err (NameFailed "empty host name"))
+          (some? (ip/literal h)) (Ok [h])
+          (not (enc/valid-name? (if (s/ends-with? h ".") (str-slice h 0 (- (str-len h) 1)) h))) (Err (NameFailed (str host ": invalid host name")))
+          (localhost? (if (s/ends-with? h ".") (str-slice h 0 (- (str-len h) 1)) h)) (Ok ["127.0.0.1" "::1"])
+          :else (let [local (hosts-lookup (. (. r config) hosts) h 0)]
+                  (if (> (count local) 0) (Ok local) (via-dns r h))))))
+;; The shape of fib.os.net/resolve-host: numeric addresses, or an OSError (NotFound, TimedOut, Other).
+(defun resolve-host (r: Resolver host: str) -> (Result (Vec str) os/OSError)
+  (match (resolve-name r host)
+    ((Ok xs) (Ok xs))
+    ((Err (NameNotFound m)) (Err (os/OSError os/NotFound 0 "dns" m)))
+    ((Err (NameTimeout m)) (Err (os/timeout-error "dns")))
+    ((Err (NameFailed m)) (Err (os/OSError os/Other 0 "dns" m)))))

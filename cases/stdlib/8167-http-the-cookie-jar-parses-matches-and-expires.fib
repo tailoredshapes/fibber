@@ -1,0 +1,23 @@
+;; spec: docs/design/http.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll fib.http.cookies))
+(defun ok (text: str host: str path: str secure: bool) -> (Option Cookie) (parse-set-cookie text host path secure 1000))
+(defun main () -> i64
+  (let [c (checks)]
+    (do (check c (= (parse-date "Sun, 06 Nov 1994 08:49:37 GMT") 784111777)) (check c (= (parse-date "Sunday, 06-Nov-94 08:49:37 GMT") 784111777)) (check c (= (parse-date "nonsense") -1))
+        (check c (match (ok "a=b; Domain=.Example.COM; Path=/; Secure; HttpOnly" "www.example.com" "/x" true) ((some k) (and (= (. k domain) "example.com") (not (. k host-only)) (. k secure) (. k http-only))) (nil false)))
+        (check c (not (some? (ok "a=b; Domain=other.com" "www.example.com" "/" true))))
+        (check c (not (some? (ok "a=b; Domain=com" "example.com" "/" true))))
+        (check c (not (some? (ok "a=b; Secure" "example.com" "/" false))))
+        (check c (not (some? (ok "__Host-a=b; Secure; Domain=example.com; Path=/" "example.com" "/" true))))
+        (check c (match (ok "a=b; Max-Age=60; Expires=Thu, 01 Jan 1970 00:00:10 GMT" "example.com" "/" true) ((some k) (= (. k expires) 1060)) (nil false)))
+        (check c (match (ok "a=b" "example.com" "/d/e" true) ((some k) (= (. k path) "/d")) (nil false)))
+        (check c (match (ok "a=b; Domain=example.com; Path=/foo" "example.com" "/" true)
+                   ((some k) (and (applies? k "https" "www.example.com" "/foo/bar" 1000) (not (applies? k "https" "www.example.com" "/foobar" 1000)) (not (applies? k "https" "badexample.com" "/foo" 1000))))
+                   (nil false)))
+        (check c (match (ok "a=b; Max-Age=0" "example.com" "/" true) ((some k) (not (applies? k "https" "example.com" "/" 1000))) (nil false)))
+        (checks-result c))))

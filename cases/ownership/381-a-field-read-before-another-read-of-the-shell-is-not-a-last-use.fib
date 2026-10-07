@@ -1,0 +1,28 @@
+;; spec:   spec/types.md §6.3 "Field moves"; compiler/own/lastuse.fib `record-field`
+;; expect: accept
+;; result: 8
+;; audit:  clean
+;; The steal of `(. p buf)` needs that nothing reads the shell afterwards. Here the field is read twice in one call (`twice`: the siblings of
+;; a constructor keep the shell live for each other), once more after (`later`: the same field read again after the first), and through a derived binding
+;; that is read after the field (`held`). In each the struct is unique when the function runs (the caller's last use), and a steal at any
+;; of the reads that are not the last would null the slot and the later read would see null: a trap or a wrong sum. The sum is 4 + 2 + 2.
+(defstruct P (buf: (Array i64) n: i64))
+
+(defstruct Two (a: (Array i64) b: (Array i64)))
+
+;; the arguments of a constructor are stores: owned positions, where a field read at the shell's last use is a steal
+(defun twice (p: P) -> i64
+  (let [t (Two (. p buf) (. p buf))]
+    (+ (array-len (. t a)) (array-len (. t b)))))
+
+(defun later (p: P) -> i64
+  (let [c (cell (. p buf))]
+    (+ (array-len @c) (array-len (. p buf)))))
+
+(defun held (p: P) -> i64
+  (let [h (. p buf)
+        c (cell (. p buf))]
+    (+ (array-len @c) (array-len h))))
+
+(defun main () -> i64
+  (+ (twice (P (array 2 0) 0)) (+ (later (P (array 1 7) 0)) (held (P (array 1 7) 0)))))

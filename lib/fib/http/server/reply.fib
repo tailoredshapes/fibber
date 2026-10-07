@@ -28,8 +28,9 @@
     ((Ok bytes) (do (t-write t bytes) ())) ((Err _) ())))
 (defun send-reply (t: Transport reply: Reply method: str keep: bool version: str) -> (Result unit Error)
   (match reply
-    ((Whole r) (match (response-bytes (with r (headers (dated (. r headers)))) method keep)
-      ((Ok bytes) (t-write t bytes))
+    ((Whole r) (match (response-parts (with r (headers (dated (. r headers)))) method keep)
+      ((Ok parts) (if (< (array-len (. parts snd)) 16384) (t-write t (concat-bytes [(. parts fst) (. parts snd)]))
+                    (try-let [_ (t-write t (. parts fst))] (t-write t (. parts snd)))))
       ((Err _) (do (internal-error t method) (Err (InvalidRequest "invalid handler response"))))))
     ((Streamed status headers next)
       (match (send-stream t status headers next method keep version)
