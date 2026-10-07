@@ -29,7 +29,8 @@ cmp -s "$f" "$R/compiler/expand/overload.fib" && { echo "mutant-call-pos: the mu
 (cd "$OUT/tree" && "$FIBC" build compiler/fibc.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o "$OUT/F") > "$OUT/build.log" 2>&1 \
   || { tail -5 "$OUT/build.log"; echo "mutant-call-pos: the mutant did not build" >&2; exit 2; }
 export FIB_LIB=$OUT/tree/lib
-line=$(cd "$OUT/tree" && "$OUT/F" cases cases/stdlib --only 7533- 2>&1 | grep -E '^7533-' | head -1)
+all=$(cd "$OUT/tree" && "$OUT/F" cases cases/stdlib --only 7533- 2>&1) || true   # into a variable first: a pipe into `head -1` kills F with SIGPIPE, which pipefail reports
+line=$(printf '%s\n' "$all" | grep -E '^7533-' | head -1)
 case $line in
   *" pass"*) echo "SURVIVED  $MODE: $line"; exit 1 ;;
   *) echo "killed    $MODE: ${line:0:160}"; exit 0 ;;

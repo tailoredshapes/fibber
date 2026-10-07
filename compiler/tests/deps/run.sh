@@ -21,7 +21,7 @@ unset FIB_NO_PROJECT
 make_fixtures
 fail=0
 ck() { if [ "$2" = "$3" ]; then echo "ok    $1"; else echo "FAIL  $1: got [$2] want [$3]"; fail=1; fi; }
-has() { if grep -q -- "$3" "$2"; then echo "ok    $1"; else echo "FAIL  $1: no [$3] in:"; sed 's/^/        /' "$2" | head -8; fail=1; fi; }
+has() { if grep -q -- "$3" "$2"; then echo "ok    $1"; else echo "FAIL  $1: no [$3] in:"; sed 's/^/        /' "$2" | head -8; fail=1; fi; }   # pipe-ok: the failure-path print of a small file, its status is not used
 o=$T/out; e=$T/err
 run() { "$F" "$@" > "$o" 2> "$e"; echo $?; }
 last() { tail -n 1 "$o"; }

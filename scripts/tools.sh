@@ -43,6 +43,8 @@ queue() { if [ -n "${TOOLS_ONLY:-}" ] && [[ " $TOOLS_ONLY " != *" $1 "* ]]; then
 
 queue fibref-skeleton "$t/fibref/skeleton.sh" "$out/fibref-skeleton"
 queue gen-skeleton "$t/gen/skeleton.sh" "$out/gen-skeleton"
+# no `set -o pipefail` script pipes into a consumer that exits early (head, grep -q, awk exit): SIGPIPE fails the pipeline silently; a plant proves the rule (FOLLOWUP-1)
+queue lint-pipefail "$here/lint-pipefail.sh"
 # every module of lib/fib/** type-checked and ownership-checked in full, called or not (`fibc check`, LIBFIX-1), and the planted faults a check must reject: nine seconds
 queue sh-driver-check-lib "$t/driver/check-lib.sh" "$FIBC"
 if [ "$mode" = full ]; then

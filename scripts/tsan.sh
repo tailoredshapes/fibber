@@ -52,7 +52,7 @@ case ${1:-} in
       # shellcheck disable=SC2086
       "$0" $flag --check "$prog" $args > "$OUT/suite-last.out" 2>&1; rc=$?
       echo "$([ $rc = 0 ] && echo ok || echo FAIL) $(basename "$prog") $args :: $(tail -1 "$OUT/suite-last.out")"
-      [ $rc = 0 ] || { bad=$((bad+1)); sed 's/^/    /' "$OUT/suite-last.out" | grep -E 'NEW|build|exit' | head -5; }
+      [ $rc = 0 ] || { bad=$((bad+1)); sed 's/^/    /' "$OUT/suite-last.out" | grep -E 'NEW|build|exit' | head -5 || true; }
     done < "$suite"
     echo "tsan suite: $n programs, $bad with a NEW report or a failure (baseline $BASE)"
     [ $bad = 0 ]; exit $? ;;
@@ -73,7 +73,7 @@ fi
 name=$(basename "$prog" .fib | cut -c1-40)
 w=$OUT/work/$name; mkdir -p "$w"; rm -f "$w"/run.*
 # the case's `;; roots:` header names its support directories, relative to the file
-incs=(); for r in $(sed -n 's/^;; roots:[ \t]*//p' "$prog" | head -1); do incs+=(-I "$(cd "$(dirname "$prog")" && cd "$r" 2>/dev/null && pwd)"); done
+incs=(); for r in $(head -1 < <(sed -n 's/^;; roots:[ \t]*//p' "$prog")); do incs+=(-I "$(cd "$(dirname "$prog")" && cd "$r" 2>/dev/null && pwd)"); done
 (ulimit -v 16000000; "$F" emit "${incs[@]}" "$prog" > "$w/p.lir") 2> "$w/emit.err" || { echo "tsan: emit failed: $(head -3 "$w/emit.err")" >&2; exit 2; }
 (ulimit -v 16000000; "$lairf" emit-llvm "$w/p.lir" > "$w/p.ll") 2> "$w/llvm.err" || { echo "tsan: emit-llvm failed: $(head -3 "$w/llvm.err")" >&2; exit 2; }
 [ -n "${TSAN_SED:-}" ] && { cp "$w/p.ll" "$w/p.pre.ll"; sed -i -E "$TSAN_SED" "$w/p.ll"; cmp -s "$w/p.ll" "$w/p.pre.ll" && { echo "tsan: TSAN_SED changed nothing" >&2; exit 2; }; }
@@ -117,7 +117,7 @@ while IFS=$'\t' read -r cnt s; do
 done < "$w/signatures.txt"
 # A run is a failure too when it timed out, or printed a result other than the header's `;; result:` (else 0: the kernels' answer), or
 # (a case that expects a trap) did not exit nonzero. TSAN's own exit code is 66.
-want=$(sed -n 's/^;; result:[ \t]*\(-\{0,1\}[0-9]*\).*/\1/p' "$prog" | head -1); want=${want:-0}
+want=$(head -1 < <(sed -n 's/^;; result:[ \t]*\(-\{0,1\}[0-9]*\).*/\1/p' "$prog")); want=${want:-0}
 trapcase=0; grep -q '^;; expect:[ \t]*trap' "$prog" && trapcase=1
 i=0
 for c in $codes; do
