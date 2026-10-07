@@ -48,6 +48,13 @@
       (do (wr16 dp o2 off)
           (if (>= mcode 15) (put-ext dp (u+ o2 2) (u- mcode 15)) (u+ o2 2))))))
 
+;; The common sequence, inline: at most 14 literals, a match of 4 to 18, 16 readable bytes at the literals (a 16-byte chunk copy, whose wild bytes land in the slack every output
+;; buffer of the encoder has: 32 bytes after the bound); anything else is `put-seq`.
+(defun put-fast (sp: ptr anchor: i64 lit: i64 dp: ptr op: i64 off: i64 ml: i64 iend: i64) -> i64
+  (if (and (< lit 15) (< ml 19) (<= (u+ anchor 16) iend))
+    (do (wr8 dp op (bit-or (shl lit 4) (u- ml 4))) (cp16 dp (u+ op 1) sp anchor) (wr16 dp (u+ (u+ op 1) lit) off) (u+ (u+ op 3) lit))
+    (put-seq sp anchor lit dp op off ml)))
+
 (defun valid? (sp: ptr cand: i64 ip: i64 lo: i64) -> bool
   (and (>= cand lo) (< cand ip) (<= (u- ip cand) max-dist) (= (rd32 sp cand) (rd32 sp ip))))
 
@@ -65,7 +72,7 @@
                   (let [b (back-eq sp ip cand anchor lo)
                         mip (u- ip b) mc (u- cand b)
                         ml (u+ (u+ 4 (count-eq sp (u+ ip 4) (u+ cand 4) mlim)) b)
-                        op2 (put-seq sp anchor (u- mip anchor) dp op (u- mip mc) ml)
+                        op2 (put-fast sp anchor (u- mip anchor) dp op (u- mip mc) ml iend)
                         nip (u+ mip ml)]
                     (if (>= nip mf1)
                       (put-seq sp nip (u- iend nip) dp op2 0 0)

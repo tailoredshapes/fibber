@@ -1,0 +1,130 @@
+;; The parallel mode of fib.compress.lz4 (docs/design/compress.md 9): the engine (fib.compress.par: order, the lowest failing job, a trap in a worker), the property that THE RESULT DOES NOT
+;; DEPEND ON THE THREAD COUNT (compress: the same bytes for 1, 2, 3, 7, 16 workers; decompress: the same output, in direct, placement and sequential-fallback modes), hand-built hostile
+;; frames of many blocks (every kind of error in the middle of the frame: the same error kind whatever the worker count), and a fuzz of mutated many-block frames in which the
+;; sequential and the parallel decoder must agree on every one.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.rng fib.compress.types fib.compress.ops fib.compress.corpus fib.compress.gen fib.compress.lz4
+               fib.compress.lz4.mem fib.compress.lz4.header fib.compress.lz4.xxh32 fib.compress.par))
+
+(defun bytes-of (v: (Vec i64)) -> (Array i8) (fill (count v) (fn (i: i64) (nth v i))))
+(defun ok-bytes (r: (Result (Array i8) CompressError)) -> (Array i8) (match r ((Ok b) b) ((Err _) (array 0 0i8))))
+(defun kind-of (r: (Result (Array i8) CompressError)) -> keyword (match r ((Ok _) :ok) ((Err e) (. e kind))))
+(defun o64 () -> Options (with-block-size (default-options) 65536))
+(defun th (o: Options t: i64) -> Options (with-threads o t))
+(defun cat (parts: (Vec (Array i8))) -> (Array i8) (concat-bytes parts))
+(defun le32 (n: i64) -> (Array i8) (let [a (array 4 0i8)] (do (wr32 (data a) 0 n) a)))
+
+;; ---- the engine
+(defun failing-jobs (workers: i64) -> (Result (Vec i64) CompressError)
+  (run-jobs workers 20 (fn (i: i64) (cond (= i 8) (Err (corrupt "job 8")) (= i 3) (Err (too-large "job 3")) :else (Ok i)))))
+(defun trapping-jobs (workers: i64) -> (Result (Vec i64) CompressError)
+  (run-jobs workers 12 (fn (i: i64) (if (= i 5) (trap "boom") (Ok i)))))
+(defun err-kind (r: (Result (Vec i64) CompressError)) -> keyword (match r ((Ok _) :ok) ((Err e) (. e kind))))
+(defun err-message (r: (Result (Vec i64) CompressError)) -> str (match r ((Ok _) "") ((Err e) (. e message))))
+(defun values-ok? (workers: i64 n: i64) -> bool
+  (match (run-jobs workers n (fn (i: i64) (Ok (* i i)))) ((Ok v) (= v (vec (map (fn (i: i64) (* i i)) (range n))))) ((Err _) false)))
+
+;; ---- the property: the same bytes for every thread count
+(defun comp-ok? (b: (Array i8) o: Options) -> bool
+  (let [z1 (ok-bytes (compress (lz4) b (th o 1)))]
+    (every? (fn (t: i64) (let [zt (ok-bytes (compress (lz4) b (th o t)))]
+                           (and (bytes-eq zt z1) (bytes-eq (ok-bytes (decompress (lz4) z1 (th o t))) b)
+                                (bytes-eq (ok-bytes (decompress (lz4) zt (th (with-verify o false) t))) b))))
+            [2 3 7 16])))
+
+(defun opts-from (segs: (Vec Seg)) -> Options
+  (let [f (if (empty? segs) 0 (. (nth segs 0) seed))]
+    (with (with (with-level (with-block-size (default-options) (nth [65536 262144 1048576] (rem f 3))) (nth [1 1 3 9] (rem (quot f 3) 4)))
+                (block-checksum (= (rem (quot f 12) 2) 0))) (checksum (= (rem (quot f 24) 3) 0)))))
+
+;; A frame whose blocks are NOT all full (a legal producer may cut a block short): the parallel decoder's guess about the layout is wrong and it must hand over to the sequential one.
+(defun frame-blocks-of (f: (Array i8)) -> (Array i8)
+  (match (parse-head (data f) (array-len f) 0)
+    ((Ok h) (match h ((some hd) (array-copy f (. hd hlen) (- (array-len f) (if (. hd cchk) 8 4)))) (nil (array 0 0i8))))
+    ((Err _) (array 0 0i8))))
+(defun spliced () -> (Array i8)
+  (let [a (text 21 100000) b (text 22 90000) o (with-checksum (o64) true)
+        fa (ok-bytes (compress (lz4) a (with-record-size o false))) fb (ok-bytes (compress (lz4) b (with-record-size o false)))
+        whole (cat [a b])]
+    (cat [(build-head true false true (array-len whole) -1 4) (frame-blocks-of fa) (frame-blocks-of fb) (le32 0) (le32 (xxh32 whole 0))])))
+(defun spliced-whole () -> (Array i8) (cat [(text 21 100000) (text 22 90000)]))
+
+;; ---- hostile frames of 12 blocks
+(defun big () -> (Array i8) (text 31 (* 12 65536)))
+(defun frame-with (o: Options) -> (Array i8) (ok-bytes (compress (lz4) (big) o)))
+(defun block-start (z: (Array i8) k: i64) -> i64
+  (loop [i (+ 4 3 (if (> (bit-and (rd8 (data z) 4) 8) 0) 8 0)) j 0]
+    (if (= j k) i (recur (+ i (+ 4 (+ (bit-and (rd32 (data z) i) 2147483647) (if (> (bit-and (rd8 (data z) 4) 16) 0) 4 0)))) (+ j 1)))))
+(defun poke (z: (Array i8) at: i64 v: i64) -> (Array i8) (let [c (array-copy z 0 (array-len z))] (do (wr8 (data c) at v) c)))
+(defun poke32 (z: (Array i8) at: i64 v: i64) -> (Array i8) (let [c (array-copy z 0 (array-len z))] (do (wr32 (data c) at v) c)))
+
+(defun hostile () -> (Vec (Array i8))
+  (let [o (with-block-checksum (o64) true) z (frame-with o) zn (frame-with (with-record-size o false)) b7 (block-start z 7) n (array-len z)]
+    [(poke z (+ b7 14) 255) (poke z (+ b7 40) 7)
+     (poke32 z b7 100000)
+     (poke32 z (+ b7 4 (bit-and (rd32 (data z) b7) 2147483647)) 12345)
+     (array-copy z 0 (quot (* 6 n) 10)) (poke z (- n 2) 1) (cat [z (bytes-of [90 90 90 90])]) (array-copy z 0 (- n 8))
+     (poke zn (+ (block-start zn 5) 20) 200) (array-copy zn 0 (quot (* 9 (array-len zn)) 10)) (poke zn (- (array-len zn) 1) 3)
+     (cat [(build-head true true true (+ (array-len (big)) 1000) -1 4) (array-copy z (+ 4 3 8) n)])
+     (cat [(build-head true true true 100 -1 4) (array-copy z (+ 4 3 8) n)])
+     (cat [(build-head true true true 1099511627776 -1 4) (array-copy z (+ 4 3 8) n)])]))
+
+(defun kinds (z: (Array i8) o: Options) -> (Vec keyword) (vec (map (fn (t: i64) (kind-of (decompress (lz4) z (th o t)))) [1 2 3 7 16])))
+(defun hostile-failures () -> (Vec str)
+  (let [o (with-max-output (o64) 10000000)]
+    (vec (map (fn (i: i64) (str "case " i))
+              (filter (fn (i: i64) (let [ks (kinds (nth (hostile) i) o)] (not (and (not (= (nth ks 0) :ok)) (every? (fn (k: keyword) (= k (nth ks 0))) ks)))))
+                      (range (count (hostile))))))))
+(defun hostile-kinds () -> (Vec keyword) (vec (map (fn (z: (Array i8)) (nth (kinds z (with-max-output (o64) 10000000)) 4)) (hostile))))
+
+;; ---- the fuzz: mutants of frames of 3 blocks, the sequential and the 4-thread decoder must give the same verdict and the same bytes
+(defun pool () -> (Vec (Array i8))
+  (let [d (text 41 (* 3 65536)) o (with-block-checksum (o64) true)]
+    [(ok-bytes (compress (lz4) d o)) (ok-bytes (compress (lz4) d (with-record-size o false))) (ok-bytes (compress (lz4) d (with-checksum (o64) false)))]))
+(defun mutate (g: Rng z: (Array i8)) -> (Array i8)
+  (let [n (array-len z) k (rng-between g 0 4) at (rng-between g 0 (- n 1)) c (array-copy z 0 n)]
+    (cond (= k 0) (do (wr8 (data c) at (bit-xor (rd8 (data c) at) (shl 1 (rng-between g 0 7)))) c)
+          (= k 1) (do (wr8 (data c) at (rng-between g 0 255)) c)
+          (= k 2) (array-copy z 0 at)
+          (= k 3) (do (wr32 (data c) (min at (- n 4)) (rng-between g 0 4294967295)) c)
+          :else (do (wr8 (data c) (rng-between g 0 (min 20 (- n 1))) (rng-between g 0 255)) c))))
+(defun disagreements (n: i64 seed: i64) -> i64
+  (let [g (rng-new seed) p (pool) o (with-max-output (o64) 1000000)]
+    (loop [i 0 bad 0]
+      (if (>= i n) bad
+        (let [m (mutate g (nth p (rng-between g 0 2))) a (decompress (lz4) m (th o 1)) b (decompress (lz4) m (th o 4))]
+          (recur (+ i 1) (if (and (= (kind-of a) (kind-of b)) (bytes-eq (ok-bytes a) (ok-bytes b))) bad (+ bad 1))))))))
+
+(defspecs specs
+  (feature "fib.compress.par: the engine"
+    (scenario "results come back in job order for every worker count"
+      (then (expect = true (every? (fn (w: i64) (values-ok? w 37)) [1 2 3 7 16 64]))))
+    (scenario "of several failing jobs the LOWEST index's error is the answer, whatever the worker count (the one a sequential run meets first)"
+      (then (expect = [:too-large :too-large :too-large :too-large] (vec (map (fn (w: i64) (err-kind (failing-jobs w))) [1 2 7 16])))
+            (expect = "job 3" (err-message (failing-jobs 16)))))
+    (scenario "a worker that traps is an :internal error, not a dead process, and every worker is joined"
+      (then (expect = [:internal :internal :internal] (vec (map (fn (w: i64) (err-kind (trapping-jobs w))) [2 7 16])))
+            (expect = true (every? (fn (w: i64) (str-find (err-message (trapping-jobs w)) "boom" 0)) [2 7]))))
+    (scenario "after a failure the pool is reusable: the next call works"
+      (then (expect = true (values-ok? 7 50)))))
+  (feature "fib.compress.lz4: threads"
+    (prop "compress is the same bytes for 1, 2, 3, 7 and 16 threads, and decompress gives the input, for random inputs, block sizes, levels and checksums" [x (gen-input)]
+          (comp-ok? (materialize x) (opts-from x)))
+    (scenario "a frame with blocks that are not full decodes the same in parallel (the layout guess fails and the sequential decoder answers)"
+      (given [z (spliced) want (spliced-whole)])
+      (then (expect = true (every? (fn (t: i64) (bytes-eq (ok-bytes (decompress (lz4) z (th (o64) t))) want)) [1 2 3 7 16]))))
+    (scenario "the same output with the content size recorded (direct) and not (placement), with block checksums, and with verification off"
+      (given [d (big)])
+      (then (expect = true (every? (fn (o: Options) (every? (fn (t: i64) (let [z (ok-bytes (compress (lz4) d o))] (bytes-eq (ok-bytes (decompress (lz4) z (th o t))) d))) [2 3 7 16]))
+                                   [(o64) (with-record-size (o64) false) (with-block-checksum (o64) true) (with-checksum (o64) false) (with-verify (o64) false)
+                                    (with-block-size (default-options) 1048576) (with-level (o64) 9)]))))
+    (scenario "a dictionary and linked blocks are not parallel and are right for every thread count"
+      (given [d (big)])
+      (then (expect = true (every? (fn (t: i64) (let [o (th (with-independent (o64) false) t) z (ok-bytes (compress (lz4) d o))] (bytes-eq (ok-bytes (decompress (lz4) z o)) d))) [2 7]))
+            (expect = true (every? (fn (t: i64) (let [o (th (with-dictionary (o64) (array-copy d 0 5000)) t) z (ok-bytes (compress (lz4) d o))] (bytes-eq (ok-bytes (decompress (lz4) z o)) d))) [2 7]))))
+    (scenario "12-block hostile frames (a bad offset, a block over the maximum, a bad block checksum, truncation, a bad content checksum, trailing bytes, no end mark, a short content size, a huge one): one error kind for every thread count"
+      (then (expect = [] (hostile-failures))
+            (expect = [:checksum :checksum :corrupt :checksum :truncated :checksum :corrupt :truncated :checksum :truncated :checksum :corrupt :corrupt :too-large] (hostile-kinds))))
+    (scenario "10,000 mutated 3-block frames: the sequential and the 4-thread decoder agree on the verdict and the bytes of every one"
+      (then (expect = 0 (disagreements 10000 3))))))
+
+(defun main () -> i64 (run-main (specs)))

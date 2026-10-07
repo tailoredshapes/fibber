@@ -1,10 +1,10 @@
-;; scripts/lz4-bench.fib: the measuring half of docs/shootout/lz4.md. usage: lz4-bench MODE FILE [LEVEL] [REPS]
+;; scripts/lz4-bench.fib: the measuring half of docs/shootout/lz4.md. usage: lz4-bench MODE FILE [LEVEL] [REPS] [THREADS] [BSIZE]
 ;;   c  fast block, acceleration LEVEL        h  HC block, level LEVEL      d  block decompress (of the fast block) into a buffer made once      dh  the same for an HC block
 ;;   da and dha: the same into a fresh array each time (allocation, zero fill and page faults included)
-;;   f  frame compress, level LEVEL (64 KiB independent blocks, content checksum)      fd  frame decompress      s  streaming compress + decompress in 64 KiB chunks
+;;   f  frame compress, level LEVEL (independent blocks of BSIZE, content checksum), THREADS workers      fd  frame decompress (content size recorded: direct mode)  fdp  the same without the size  fdn  the same with verification off      s  streaming compress + decompress in 64 KiB chunks
 ;; Prints the input and output sizes and the MEDIAN of REPS (default 5) runs, in MB/s of input: the same line as scripts/fetch-lz4-tools.sh's lz4bench.
-(ns main (:use fib.compress.types fib.compress.lz4.mem fib.compress.lz4.block fib.compress.lz4.frame fib.compress.lz4.framedec fib.compress.ops)
-  (:require [fib.os.io :as io] [fib.os.files :as files] [fib.os.time :as time] [fib.compress.lz4 :as lz4]))
+(ns main (:use fib.compress.types fib.compress.lz4.mem fib.compress.lz4.block fib.compress.lz4.frame fib.compress.lz4.framedec fib.compress.lz4.xxh32 fib.compress.ops)
+  (:require [fib.compress :as z] [fib.os.io :as io] [fib.os.files :as files] [fib.os.time :as time] [fib.compress.lz4 :as lz4]))
 
 (defun slurp (path: str) -> (Array i8)
   (match (files/open-file path (files/default-file-options))
@@ -28,27 +28,29 @@
       ((Ok z) (match (decompress-chunks c o (split-sizes z [65536])) ((Ok b) (array-len z)) ((Err e) (trap "stream decompress"))))
       ((Err e) (trap "stream compress")))))
 
-(defun run (mode: str src: (Array i8) level: i64 z: (Array i8) buf: (Array i8)) -> i64
-  (let [o (with-level (default-options) level) n (array-len src)]
+(defun run (mode: str src: (Array i8) level: i64 z: (Array i8) buf: (Array i8) threads: i64 bsize: i64) -> i64
+  (let [o (with-verify (with-block-size (with-threads (with-level (default-options) level) threads) bsize) (not (= mode "fdn"))) n (array-len src)]
     (cond (= mode "c") (array-len (block-compress src level))
           (= mode "h") (array-len (block-compress-hc src level))
           (or (= mode "d") (= mode "dh")) (match (block-decompress-into z buf 0 n) ((Ok k) k) ((Err e) (trap (. e message))))
           (or (= mode "da") (= mode "dha")) (match (block-decompress-sized z n) ((Ok b) (array-len b)) ((Err e) (trap (. e message))))
-          (= mode "f") (match (frame-compress src o) ((Ok b) (array-len b)) ((Err e) (trap (. e message))))
-          (= mode "fd") (match (frame-decompress z o) ((Ok b) (array-len b)) ((Err e) (trap (. e message))))
+          (= mode "x") (xxh32 src 0)
+          (= mode "z") (array-len (array n 0i8))
+          (= mode "f") (match (z/compress (lz4/lz4) src o) ((Ok b) (array-len b)) ((Err e) (trap (. e message))))
+          (or (= mode "fd") (= mode "fdp") (= mode "fdn")) (match (z/decompress (lz4/lz4) z o) ((Ok b) (array-len b)) ((Err e) (trap (. e message))))
           :else (stream-both src o))))
 
 (defun main () -> i64
   (let [a (args) mode (nth a 0) src (slurp (nth a 1)) level (if (> (count a) 2) (unwrap-or (parse-long (nth a 2)) 1) 1)
-        reps (if (> (count a) 3) (unwrap-or (parse-long (nth a 3)) 5) 5) n (array-len src)
+        reps (if (> (count a) 3) (unwrap-or (parse-long (nth a 3)) 5) 5) threads (if (> (count a) 4) (unwrap-or (parse-long (nth a 4)) 1) 1) bsize (if (> (count a) 5) (unwrap-or (parse-long (nth a 5)) 65536) 65536) n (array-len src)
         buf (array (if (or (= mode "d") (= mode "dh")) n 0) 0i8)
         z (cond (or (= mode "dh") (= mode "dha")) (block-compress-hc src level) (or (= mode "d") (= mode "da")) (block-compress src 1)
-                (= mode "fd") (match (frame-compress src (with-level (default-options) level)) ((Ok b) b) ((Err e) (trap "frame")))
+                (or (= mode "fd") (= mode "fdp") (= mode "fdn")) (match (frame-compress src (with-record-size (with-block-size (with-level (default-options) level) bsize) (not (= mode "fdp")))) ((Ok b) b) ((Err e) (trap "frame")))
                 :else (array 0 0i8))
         times (loop [r 0 ts: (Vec i64) []]
                 (if (>= r reps) ts
-                  (let [t0 (now) _ (run mode src level z buf) t (- (now) t0)] (recur (+ r 1) (conj ts t)))))
+                  (let [t0 (now) _ (run mode src level z buf threads bsize) t (- (now) t0)] (recur (+ r 1) (conj ts t)))))
         best (nth (vec (sort times)) (quot (count times) 2))
-        size (run mode src level z buf)]
-    (do (println mode (nth a 1) "level" level ":" n "->" (if (or (= mode "d") (= mode "dh") (= mode "da") (= mode "dha") (= mode "fd")) (array-len z) size) (str (quot (* 10000 size) n) "/100 %") "median" (quot best 1000000) "ms =" (quot (* n 1000) (max 1 best)) "MB/s")
+        size (run mode src level z buf threads bsize)]
+    (do (println mode (nth a 1) "level" level ":" n "->" (if (or (= mode "d") (= mode "dh") (= mode "da") (= mode "dha") (= mode "fd") (= mode "fdp") (= mode "fdn")) (array-len z) size) (str (quot (* 10000 size) n) "/100 %") "median" (quot best 1000000) "ms =" (quot (* n 1000) (max 1 best)) "MB/s")
         0)))

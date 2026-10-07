@@ -133,3 +133,39 @@
 ;; The corpus sample with this name ("text 4096", "zeros 1000000"); an empty sample when there is none (the scenario using it then fails).
 (defun find-sample (name: str) -> Sample
   (match (first (filter (fn (s: Sample) (= (. s name) name)) (corpus))) ((some s) s) (nil (Sample name (array 0 0i8)))))
+
+;; ---- THREADS: the result does not depend on the thread count (docs/design/compress.md 9)
+(defun thread-counts () -> (Vec i64) [2 3 7 16])
+
+;; Block sizes of 64 KiB (when the codec has them) make a 100 to 300 KB sample a few blocks, so a parallel codec has jobs to share.
+(defun par-options (c: c) -> Options :where ((Codec c))
+  (let [d (default-options)] (if (supports? c :block-size) (with-block-size d 65536) d)))
+
+(defun par-samples () -> (Vec Sample) [(find-sample "text 262145") (find-sample "records 100000") (find-sample "run-noise 200000") (find-sample "zeros 300000") (find-sample "random 65537")])
+
+(defun thread-sample-failures (c: c s: Sample) -> (Vec str) :where ((Codec c))
+  (let [o (par-options c) z1 (match (compress c (. s data) (with-threads o 1)) ((Ok b) b) ((Err _) (array 0 0i8)))]
+    (vec (mapcat (fn (t: i64)
+                   (cat [(match (compress c (. s data) (with-threads o t)) ((Ok zt) (if (same? zt z1) [] [(str (sname s) " compress with " t " threads differs")])) ((Err _) [(str (sname s) " compress failed with " t)]))
+                         (if (is-bytes? (decompress c z1 (with-threads o t)) (. s data)) [] [(str (sname s) " decompress with " t " threads differs")])]))
+                 (thread-counts)))))
+
+(defun thread-failures (c: c) -> (Vec str) :where ((Codec c)) (vec (mapcat (fn (s: Sample) (thread-sample-failures c s)) (par-samples))))
+
+;; The same error kind and the same exact limit for every thread count, on a frame cut, corrupted in the middle, and at its limit.
+(defun kinds-over-threads (c: c z: (Array i8) o: Options) -> (Vec str) :where ((Codec c))
+  (vec (map (fn (t: i64) (kind-of (decompress c z (with-threads o t)))) (into [1] (thread-counts)))))
+
+(defun error-thread-failures (c: c) -> (Vec str) :where ((Codec c))
+  (let [s (find-sample "text 262145") o (with-max-output (with-checksum (par-options c) true) 10000000)
+        z (match (compress c (. s data) (with-threads o 1)) ((Ok b) b) ((Err _) (array 0 0i8)))
+        mid (flip z (quot (array-len z) 2) 255) late (flip z (- (array-len z) 9) 1) cut (array-copy z 0 (quot (* 3 (array-len z)) 4))
+        n (array-len (. s data))
+        same-all? (fn (zz: (Array i8)) (let [ks (kinds-over-threads c zz o)] (every? (fn (k: str) (= k (nth ks 0))) ks)))
+        lim (fn (m: i64) (kinds-over-threads c z (with-max-output o m)))]
+    (cat [(if (same-all? mid) [] ["a corrupt block in the middle: the error kind depends on the threads"])
+          (if (= (nth (kinds-over-threads c mid o) 0) "ok") ["the corrupt frame was accepted"] [])
+          (if (same-all? late) [] ["a corrupt tail: the error kind depends on the threads"])
+          (if (same-all? cut) [] ["a cut frame: the error kind depends on the threads"])
+          (if (every? (fn (k: str) (= k "ok")) (lim n)) [] ["max-output at the exact size fails under some thread count"])
+          (if (every? (fn (k: str) (= k ":too-large")) (lim (- n 1))) [] ["max-output one under is not too-large under every thread count"])])))

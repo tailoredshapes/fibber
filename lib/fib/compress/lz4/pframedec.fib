@@ -1,0 +1,147 @@
+;; fib.compress.lz4.pframedec: PARALLEL one-shot decompression of a one-frame LZ4 stream with INDEPENDENT blocks (docs/design/compress.md 9). The head is parsed and the block headers are scanned
+;; sequentially (4-byte size words: O(blocks), no data touched) into an INDEX of (data offset, stored size, stored-uncompressed flag) per block; the blocks are cut into jobs of about 1 MiB
+;; of output and the jobs are self-scheduled over the workers of fib.compress.par. Two modes:
+;;   DIRECT (the frame records its content size, as frames from this library do by default): the output array is allocated once, exactly, and block k decodes straight into its window
+;;     [k * bmax, (k + 1) * bmax): disjoint windows, and `decode-block` is given the window's end as `dlen`, so not even its wild copies leave the window (the proof of
+;;     fib.compress.lz4.blockdec with dlen = the window). The layout is a guess that every block decodes to exactly `bmax` bytes (the last to what is left): a block that does not (legal:
+;;     a producer may cut a block short) makes the attempt give way to the sequential decoder.
+;;   PLACEMENT (no content size): each job decodes its blocks into a buffer of its own, and the buffers are copied into the one result array at their offsets (a second pass, parallel
+;;     above 8 MiB); the transient memory is the result plus the buffers. BOUND: the work and the buffers are limited to the sum over blocks of (stored ? size : bmax), which is checked
+;;     against max-output + one block BEFORE any buffer is made; the exact limit is enforced when the results are placed.
+;; EVERY failure of the attempt (a corrupt block, a bad block checksum, a size that is not the guess, a limit that would be exceeded) is handed to the sequential decoder (`Ok nil`): that is
+;; what makes the error kinds identical to the sequential decoder's, whatever the worker count and whichever worker met the error. A worker that traps is an `:internal` error.
+;; BLOCK CHECKSUMS are verified in the jobs. The CONTENT CHECKSUM is xxHash32 of the whole output: sequential by its nature, but PIPELINED: a worker that finishes a job takes the
+;; checksum's lock if it is free and hashes every finished job in order from where the last holder stopped, while the others decode (no thread waits for it; a trap cannot hang it).
+;; It bounds the speed at one core of xxHash32; `verify` false (Options.verify) skips the checks.
+;;   (frame-decompress-par src opts workers) -> (Result (Option (Array i8)) CompressError)    nil: use the sequential decoder
+(ns fib.compress.lz4.pframedec (:use fib.core fib.seq fib.coll fib.compress.types fib.compress.par fib.compress.lz4.mem fib.compress.lz4.header fib.compress.lz4.xxh32
+                                      fib.compress.lz4.blockdec fib.compress.lz4.pframe))
+
+;; The index: three numbers per block in one vector (data offset, stored size, 1 when stored uncompressed); `end` is the position after the end mark, -1 when the stream is not
+;; a plain run of blocks.
+(defstruct Index (words: (Vec i64) count: i64 end: i64))
+(defun no-index () -> Index (Index [] 0 -1))
+
+(defun scan-blocks (src: (Array i8) h: FrameHead) -> Index
+  (let [n (array-len src) p (data src) bsum (if (. h bchk) 4 0)]
+    (loop [i (. h hlen) ws: (Vec i64) []]
+      (if (> (+ i 4) n) (no-index)
+        (let [wd (rd32 p i) sz (bit-and wd 2147483647)]
+          (cond (= wd 0) (Index ws (quot (count ws) 3) (+ i 4))
+                (or (> sz (. h bmax)) (> (+ i (+ 4 (+ sz bsum))) n)) (no-index)
+                :else (recur (+ i (+ 4 (+ sz bsum))) (conj (conj (conj ws (+ i 4)) sz) (if (> (bit-and wd 2147483648) 0) 1 0)))))))))
+
+;; What the jobs share: read-only, except the checksum state (under `lock`) and the `ready` flags.
+(defstruct Shared (src: (Array i8) ix: Index bmax: i64 gb: i64 jobs: i64 verify: bool bsum: bool cck: bool
+                   ck: Xxh next: (Atom i64) lock: (Atom bool) ready: (Vec (Atom bool)) out: i64 total: i64))
+
+(defun iw (s: Shared k: i64 f: i64) -> i64 (nth (. (. s ix) words) (+ (* 3 k) f)))
+(defun mismatch () -> CompressError (corrupt "the layout is not the guess"))
+
+;; The stored block's checksum, when there is one and the caller wants it checked.
+(defun block-sum-ok? (s: Shared k: i64) -> bool
+  (or (not (. s bsum)) (not (. s verify))
+      (= (rd32 (data (. s src)) (+ (iw s k 0) (iw s k 1))) (xxh32-ptr (unsafe (ptr+ (data (. s src)) (iw s k 0))) (iw s k 1) 0))))
+
+;; Block k into its window of the output: its length, or the error that sends the frame to the sequential decoder.
+(defun decode-direct (s: Shared k: i64 outp: ptr) -> (Result i64 CompressError)
+  (let [off (iw s k 0) sz (iw s k 1) ro (* k (. s bmax)) rlen (min (. s bmax) (- (. s total) ro)) p (data (. s src))]
+    (cond (not (block-sum-ok? s k)) (Err (checksum-error "a block's checksum does not match"))
+          (= (iw s k 2) 1) (if (= sz rlen) (do (copy-exact (unsafe (ptr+ outp ro)) 0 p off sz) (Ok sz)) (Err (mismatch)))
+          :else (let [r (decode-block (unsafe (ptr+ p off)) sz (unsafe (ptr+ outp ro)) rlen 0 0 rlen)]
+                  (cond (< r 0) (Err (corrupt "a block does not decode")) (not (= r rlen)) (Err (mismatch)) :else (Ok r))))))
+
+;; ---- the pipelined content checksum
+(defun hash-job (s: Shared j: i64) -> unit
+  (let [from (* j (* (. s gb) (. s bmax))) to (min (. s total) (+ from (* (. s gb) (. s bmax))))]
+    (xxh-feed (. s ck) (unsafe (ptr+ (ptr-at-addr (. s out)) from)) (- to from))))
+
+(defun hash-ready (s: Shared) -> unit
+  (loop []
+    (let [j @(. s next)]
+      (when (and (< j (. s jobs)) @(nth (. s ready) j)) (do (hash-job s j) (reset! (. s next) (+ j 1)) (recur))))))
+
+(defun advance-ck (s: Shared) -> unit
+  (when (. s cck)
+    (loop []
+      (when (compare-and-set! (. s lock) false true)
+        (do (hash-ready s) (reset! (. s lock) false)
+            (let [j @(. s next)] (when (and (< j (. s jobs)) @(nth (. s ready) j)) (recur))))))))
+
+(defun direct-job (s: Shared) -> (fn :send (i64) (Result i64 CompressError))
+  (fn (j: i64)
+    (let [outp (ptr-at-addr (. s out)) hi (min (. (. s ix) count) (* (+ j 1) (. s gb)))]
+      (loop [k (* j (. s gb))]
+        (if (>= k hi) (do (reset! (nth (. s ready) j) true) (advance-ck s) (Ok j))
+          (match (decode-direct s k outp) ((Err e) (Err e)) ((Ok _) (recur (+ k 1)))))))))
+
+
+;; ---- placement mode: a job's blocks decoded one after the other into a buffer of its own
+(defun place-group (s: Shared j: i64) -> (Result (Pair (Array i8) i64) CompressError)
+  (let [lo (* j (. s gb)) hi (min (. (. s ix) count) (* (+ j 1) (. s gb))) buf (array (* (- hi lo) (. s bmax)) 0i8) bp (data buf) p (data (. s src))]
+    (loop [k lo pos 0]
+      (if (>= k hi) (Ok (Pair buf pos))
+        (let [off (iw s k 0) sz (iw s k 1)]
+          (cond (not (block-sum-ok? s k)) (Err (checksum-error "a block's checksum does not match"))
+                (= (iw s k 2) 1) (do (copy-exact bp pos p off sz) (recur (+ k 1) (+ pos sz)))
+                :else (let [r (decode-block (unsafe (ptr+ p off)) sz bp (array-len buf) pos pos (min (array-len buf) (+ pos (. s bmax))))]
+                        (if (< r 0) (Err (corrupt "a block does not decode")) (recur (+ k 1) r)))))))))
+
+(defun place-job (s: Shared) -> (fn :send (i64) (Result (Pair (Array i8) i64) CompressError))
+  (fn (j: i64) (place-group s j)))
+
+;; ---- the entry
+(defun fallback (e: CompressError) -> (Result (Option (Array i8)) CompressError)
+  (if (= (. e kind) :internal) (Err e) (Ok nil)))
+
+(defun make-shared (src: (Array i8) ix: Index h: FrameHead o: Options out: i64 total: i64) -> Shared
+  (let [gb (group-blocks (. h bmax)) jobs (quot (+ (. ix count) (- gb 1)) gb)]
+    (Shared src ix (. h bmax) gb jobs (. o verify) (. h bchk) (and (. o verify) (. h cchk)) (xxh-new 0) (atom 0) (atom false)
+            (vec (map (fn (i: i64) (atom false)) (range jobs))) out total)))
+
+;; The content checksum after the jobs: whatever is not hashed yet, then the comparison with the stored one.
+(defun check-content (s: Shared end: i64) -> (Result unit CompressError)
+  (if (not (. s cck)) (Ok ())
+    (do (hash-ready s)
+        (loop [] (let [j @(. s next)] (when (< j (. s jobs)) (do (hash-job s j) (reset! (. s next) (+ j 1)) (recur)))))
+        (if (= (xxh-digest (. s ck)) (rd32 (data (. s src)) end)) (Ok ()) (Err (checksum-error "the content checksum does not match"))))))
+
+(defun decode-par-direct (src: (Array i8) ix: Index h: FrameHead o: Options workers: i64) -> (Result (Option (Array i8)) CompressError)
+  (let [out (array (. h csize) 0i8) s (make-shared src ix h o (addr-of (data out)) (. h csize))]
+    (match (run-jobs workers (. s jobs) (direct-job s))
+      ((Err e) (fallback e))
+      ((Ok _) (match (check-content s (. ix end)) ((Err e) (Err e)) ((Ok _) (Ok (some out))))))))
+
+(defun stored-bound (ix: Index bmax: i64) -> i64
+  (loop [k 0 sum 0] (if (>= k (. ix count)) sum (recur (+ k 1) (+ sum (if (= (nth (. ix words) (+ (* 3 k) 2)) 1) (nth (. ix words) (+ (* 3 k) 1)) bmax))))))
+
+(defun assemble (parts: (Vec (Pair (Array i8) i64)) workers: i64) -> (Array i8)
+  (let [out (array (total-len parts) 0i8)]
+    (match (place out 0 parts workers) ((Ok _) out) ((Err _) out))))
+
+(defun decode-par-place (src: (Array i8) ix: Index h: FrameHead o: Options workers: i64) -> (Result (Option (Array i8)) CompressError)
+  (if (> (stored-bound ix (. h bmax)) (+ (. o max-output) (. h bmax))) (Ok nil)
+    (let [s (make-shared src ix h o 0 0)]
+      (match (run-jobs workers (. s jobs) (place-job s))
+        ((Err e) (fallback e))
+        ((Ok parts)
+         (if (> (total-len parts) (. o max-output)) (Ok nil)
+           (let [out (assemble parts workers)]
+             (if (and (. s cck) (not (= (xxh32 out 0) (rd32 (data src) (. ix end))))) (Err (checksum-error "the content checksum does not match"))
+               (Ok (some out))))))))))
+
+(defun try-par (src: (Array i8) h: FrameHead o: Options workers: i64) -> (Result (Option (Array i8)) CompressError)
+  (let [n (array-len src) ix (scan-blocks src h)]
+    (cond (or (< (. ix end) 0) (not (= n (+ (. ix end) (if (. h cchk) 4 0)))) (< (. ix count) 2)) (Ok nil)
+          (>= (. h csize) 0)
+          (if (or (> (. h csize) (. o max-output)) (> (. h csize) (+ 1024 (* 255 n))) (not (= (. ix count) (quot (+ (. h csize) (- (. h bmax) 1)) (. h bmax))))) (Ok nil)
+            (decode-par-direct src ix h o workers))
+          :else (decode-par-place src ix h o workers))))
+
+(defun frame-decompress-par (src: (Array i8) o: Options workers: i64) -> (Result (Option (Array i8)) CompressError)
+  (if (or (< (array-len src) 11) (> (array-len (. o dictionary)) 0)) (Ok nil)
+    (match (parse-head (data src) (array-len src) 0)
+      ((Ok head) (match head
+                   ((some h) (if (and (= (. h kind) kind-frame) (. h indep)) (try-par src h o workers) (Ok nil)))
+                   (nil (Ok nil))))
+      ((Err _) (Ok nil)))))
