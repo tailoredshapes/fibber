@@ -397,10 +397,12 @@
         (recur (+ i 1) (conj passes pass))))))
 
 ;; A binding of a scope the jump exits is moved once and retained after; anything else is
-;; consumed.
+;; consumed. A binding that an operand walked before (the arguments are all walked first) has already handed
+;; over, as the last read of the path, is retained here: the operand that read it earlier in the evaluation order
+;; reaches the slot after that hand-over has consumed the count (BUG-1: `(recur y (f x y))`).
 (defun recur-pass :private (w: Walker scope: i64 x: Expr m: Mode moved: (Cell (Set Site))) -> Pass
   (match m
-    ((MBorrowed s) :when (and (exited? w scope s) (not (contains? @moved s)))
+    ((MBorrowed s) :when (and (exited? w scope s) (not (contains? @moved s)) (not (w-env-moved? w s)))
      (do (set! moved (conj @moved s)) PsMove))
     ((MBorrowed s) :when (exited? w scope s) PsRetain)
     (_ (consume w x m moved false))))

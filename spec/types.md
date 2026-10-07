@@ -1924,7 +1924,7 @@ relies on exactly this distinction.
 | `(dyn P e)` | the mode of `e` |
 | `(let ..)` | the mode of its body, adjusted by the scope-exit rule (§6.3) |
 | `(loop ..)` | the mode of its body, adjusted by the scope-exit rule with the loop variables as its owning bindings (§6.10) |
-| `(recur ..)` | no value: a tail call to the loop; its arguments are consumed into the loop variables (§6.10) |
+| `(recur ..)` | no value: a tail call to the loop; its arguments are consumed into the loop variables (§6.10); an argument that reads a binding of the loop moves it only when no other argument reads it after: a count that a later argument hands over (a last use inside it) is never also moved into a slot, the earlier read is retained (cases 384 to 390) |
 | `(do .. e)` | the mode of `e` |
 | `(if c a b)`, `(match ..)` | the **join** (§6.3) of the branch modes |
 | `(unsafe b)` | the mode of `b` |
