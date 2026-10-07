@@ -1,29 +1,24 @@
 # HTTP
 
-`fib.http` supplies common values and helpers, `fib.http.server` supplies a
-Ring-style HTTP/1.1 server, and `fib.http.client` supplies a Hato-style client.
-Native execution is tested on Linux LP64. Platform sockets, errors, clocks, and
-memory streams use [fib.os](../os/README.md), which includes a Darwin backend
-whose macOS execution and toolchain validation remain pending. The server
-uses POSIX sockets; the client uses libcurl 7.85 or newer for HTTP, HTTPS, TLS
-verification, compression, and connection reuse.
+`fib.http` supplies common values and helpers, `fib.http.server` a Ring-style HTTP/1.1 server and `fib.http.client` a Hato-style client. Both are
+native: one message layer (RFC 9112) over a `Transport` seam, plain TCP built on [fib.os](../os/README.md) (`fib.os.net`: sockets, poll, getaddrinfo).
+There is no libcurl and no native library to link; a program that uses them builds with `fibc build` (and `--static`). TLS is the next package:
+until a TLS `Transport` factory is registered an `https` URL is a typed error (`TlsUnsupported`), never a plain-text request. Native execution is
+tested on Linux LP64; the Darwin backend of `fib.os` is checked separately and not run. The architecture, limits and what is deferred are in
+[docs/design/http.md](../../../docs/design/http.md).
 
 ## Running the examples
 
 ```sh
-./F build examples/http-server.fib -I lib -o /tmp/http-server
+fibc build examples/http-server.fib -I lib -o /tmp/http-server
 /tmp/http-server
 
 # In another terminal:
-./F build examples/http-client.fib -I lib -l curl -o /tmp/http-client
+fibc build examples/http-client.fib -I lib -o /tmp/http-client
 /tmp/http-client
-FIB_HTTP_URL=https://example.com /tmp/http-client
 ```
 
-Install libcurl's development package for client linking, for example
-`sudo apt-get install libcurl4-openssl-dev`. A server application needs only
-Fibber and the system C library. `FIB_HTTP_PORT` selects the example server's
-port; `FIB_HTTP_URL` selects the client example's destination.
+`FIB_HTTP_PORT` selects the example server's port; `FIB_HTTP_URL` the client's destination (http only).
 
 ## Values and headers
 
@@ -91,13 +86,17 @@ Fibber's normal process-abort semantics.
 |---|---:|
 | `host` | `"127.0.0.1"` (numeric IPv4 or IPv6 address) |
 | `port` | 8080 |
-| `workers` | 4 |
+| `workers` (most connections at once, one task each) | 64 |
 | `backlog` | 128 |
 | `request-timeout-ms` | 10,000 |
 | `max-body-bytes` | 8,388,608 |
 | `max-header-bytes` | 65,536 |
 | `max-line-bytes` | 8,192 |
 | `max-requests-per-connection` | 100 |
+| `max-headers` | 100 |
+| `header-timeout-ms` (whole head, from its first byte) | 10,000 |
+| `idle-timeout-ms` (wait for the next request) | 10,000 |
+| `drain-timeout-ms` (graceful stop waits for requests in flight) | 5,000 |
 
 Options are immutable structures, updated with `with`. Request and response I/O
 have deadlines; the request deadline covers the complete head and body, including
@@ -116,9 +115,8 @@ a 500 and close the connection. Chunked transfer encoding is refused on HTTP/1.0
 ## Client
 
 ```clojure
-(client/get "https://example.com")
-(client/get "https://example.com"
-  (with (client/default-options) (timeout-ms 5000)))
+(client/get "http://example.com")
+(client/get "http://example.com" (with (client/default-options) (timeout-ms 5000)))
 (client/post "http://localhost:8080/echo" "hello")
 
 (client/request
@@ -127,73 +125,58 @@ a 500 and close the connection. Chunked transfer encoding is refused on HTTP/1.0
   (client/default-options))
 ```
 
-`request` and the convenience functions return `(Result h/Response h/Error)`.
-`get` and `post` have an optional Options argument; `head`, `put`, `patch`, and
-`delete` take Options explicitly. `ClientRequest` supports additional methods
-and binary bodies. The client derives Content-Length and transport framing;
-passing Content-Length or Transfer-Encoding yourself is an InvalidRequest.
+`request` and the convenience functions return `(Result h/Response h/Error)`; `get` and `post` have an optional Options argument, `head`, `put`,
+`patch` and `delete` take Options explicitly. The client derives Host, Content-Length and the body framing; passing Content-Length or
+Transfer-Encoding yourself is an `InvalidRequest`. Userinfo in the URL becomes a Basic Authorization header.
 
-For connection reuse, call `client/build-http-client options`, use
-`client/request-with client request`, then `client/close-http-client client`.
-Every ordinary Result path in the one-shot `request` closes its native handle.
-Reusable clients use local closures over their private state, so they cannot
-cross threads. Native handles and state cells are never exposed by the public
-client or server values. Closing twice is harmless; requests after close return
-`h/Closed`.
-
-`client/request-async request options` returns `(Task (Result h/Response h/Error))`.
-Use `join` or `@` to obtain the result. Each async request owns a separate client
-and executes on a native thread. Applications should bound the tasks they start.
-
-`client/form-request` builds a form-encoded request. `client/basic-auth` and
-`client/bearer-auth` add authorization to a request; Basic credentials are encoded
-from UTF-8. `client/wrap-header` composes a sendable request function with an
-additional header.
+`client/build-http-client options` makes a reusable client (a connection pool); `client/request-with client request` sends on it;
+`client/request-stream client request` returns a `client/StreamResponse` (status, headers, a `fib.http.body/Body` to pull chunks from, `abandon`);
+`client/pool-stats` gives connections opened, reused and idle; `client/close-http-client` closes the pool (twice is harmless; requests after close
+return `h/Closed`). A client is local to its thread; `client/request-async request options` returns a `(Task (Result h/Response h/Error))` and owns
+its client. `client/form-request`, `client/basic-auth`, `client/bearer-auth` and `client/wrap-header` are as before.
 
 | Client option | Default |
 |---|---:|
-| `connect-timeout-ms` | 10,000 |
-| `timeout-ms` | 30,000 |
+| `connect-timeout-ms` (one connect) | 10,000 |
+| `timeout-ms` (whole request, redirects included) | 30,000 |
+| `read-timeout-ms` (the wait for any one piece of the response) | 0 (none) |
 | `follow-redirects` | false |
 | `max-redirects` | 5 |
-| `decompress` | true |
-| `throw-exceptions` | true |
-| `ca-file` | nil (system trust store) |
+| `decompress` (use the registered decoders) | true |
+| `throw-exceptions` (status 400 and above is `h/StatusError`) | true |
+| `ca-file` (passed to the TLS factory; unused by TCP) | nil |
 | `max-response-bytes` | 8,388,608 |
 | `max-header-bytes` | 65,536 |
+| `max-headers` | 100 |
+| `max-line-bytes` | 8,192 |
+| `max-idle-per-host` (0: no reuse) | 4 |
+| `idle-timeout-ms` (pooled connections) | 30,000 |
+| `factories` (scheme to Transport factory) | `{"http" (tcp-factory)}` |
+| `decoders` (Content-Encoding) | none |
 
-Timeout zero means no timeout. Redirect following is explicit and restricted to
-HTTP and HTTPS schemes; enabling it permits HTTPS-to-HTTP redirects, like Hato's
-`:always` policy. Hato's separate `:normal` redirect policy is not provided.
-TLS certificate chains and hostnames remain verified; `ca-file` adds an explicit
-CA bundle through libcurl. Proxy environment variables follow libcurl's policy.
+Timeout zero means none (for `connect-timeout-ms`, the rest of `timeout-ms`). `(client/with-factory options "https" factory)` registers the TLS
+driver's factory; `(client/with-decoder options (client/Decoder "gzip" inflate))` registers a decoder (DEFLATE is a driver, not here).
 
-HTTP statuses 400 and above return `h/StatusError response` by default, retaining
-the body and headers. Set `throw-exceptions` false to receive them as Ok values.
-Transport errors, malformed messages, size limits, closed handles, and invalid
-requests also return Error variants. These are Result values, rather than language
-exceptions. Decompressed bodies retain the original response headers.
+Errors are `h/Error` values: `InvalidRequest`, `ProtocolError`, `LimitError` (too large), `TransportError`, `StatusError response`, `Closed`, `Cancelled`,
+`DnsError`, `ConnectError`, `Timeout phase` (`"connect"`, `"read"`, `"total"`), `TlsUnsupported`, `RedirectLoop`, `RedirectRefused`.
 
-Responses are buffered in bounded memory streams. `max-response-bytes` bounds the
-decoded body; `max-header-bytes` bounds aggregate headers, including redirects and
-interim responses. No response body or header is written to a temporary file.
+Redirects (off by default): 301/302/303/307/308; 303 becomes GET, 301 and 302 turn POST into GET, 307 and 308 keep method and body;
+credentials are dropped on a change of origin; https to http is refused; loops and `max-redirects` are `RedirectLoop`.
+
+## Transport
+
+`fib.http.transport/Transport` is the seam: `read`, `write`, `close`, `set-deadline`, `peer`; `Factory` makes one from a `Target`. `fib.http.tcp` has
+TCP, pipes and `connect`; `fib.http.transport/scripted` an in-memory stream; `fib.http.testing/loopback-factory` a client connection served by the
+native server over pipes. See the design record for how a TLS driver plugs in.
 
 ## Scope and checks
 
-This first API supplies buffered HTTP messages. Server TLS, HTTP/2 serving,
-WebSockets, streaming/SSE, multipart builders, cookie jars, and automatic JSON or
-Transit coercion are not provided. Client protocol negotiation follows the linked
-libcurl build. Middleware and serialization can be added around these typed
-messages without changing the transport contract.
-
-Run the protocol cases and independent offline HTTP/TLS tests with:
+Not provided: HTTP/2, TLS (next package), cookie jars, proxies, a native DNS resolver, WebSockets, multipart builders, streaming request bodies, and
+automatic JSON or Transit coercion.
 
 ```sh
-HTTP_FIBC=./F scripts/test-http.sh
+fibc test specs/http-message-spec.fib specs/http-uri-spec.fib specs/http-client-spec.fib specs/http-server-spec.fib specs/http-fuzz-spec.fib -I lib
+HTTP_FIBC=fibc scripts/test-http.sh            # the cases and the Python differential suite
+FIBC=fibc scripts/http-diff.sh                 # curl against python3 and the native server
+FIBC=fibc scripts/mutant-http.sh               # 18 planted faults, each must be killed
 ```
-
-The checks include binary and chunked exchange, repeated headers, fragmentation,
-HEAD, pipelining, malformed framing, limits, timeouts, cleanup, concurrency,
-connection reuse, redirect behavior, gzip, verified local TLS, untrusted
-certificates, and hostname mismatches. See [the design record](../../../docs/design/http.md)
-for implementation details and provenance.

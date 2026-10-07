@@ -237,7 +237,7 @@ creating ids (a 16-byte random from a per-task `fib.rng` state seeded from `fib.
 - **Processors:** `simple` (export at end, for tests) and `batch` (the default): a bounded queue (2048 spans), a background task that
   exports when 512 are waiting or every 5 s, drop-newest when full with a dropped counter (exported as a metric), `force-flush!` and
   `shutdown!` (which the program calls at exit; there is no finalizer to do it).
-- **OTLP/HTTP with JSON** (`/v1/traces`, `/v1/metrics`, `/v1/logs`) through `fib.http.client` (libcurl: HTTPS for free). JSON first
+- **OTLP/HTTP with JSON** (`/v1/traces`, `/v1/metrics`, `/v1/logs`) through `fib.http.client` (native; plain http until the TLS package, then https). JSON first
   because it needs no protobuf encoder and the collector accepts it; protobuf later as `fib.proto` (a hand-written encoder for the
   three OTLP messages is ~300 lines). Retry with backoff on 429/503 honouring `Retry-After`; never block the application.
 - **Console exporter:** one JSON line per span, for development.

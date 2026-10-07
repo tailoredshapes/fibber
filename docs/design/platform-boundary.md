@@ -59,7 +59,7 @@ implementation. The runtime needed three changes for it (thread stack size, no `
    detached-thread exit that frees its own stack). A single-threaded B2 would drop tasks to run inline; the language's concurrency story depends on threads, so that is a tier decision;
 3. **C stdio** (`fopen` `fread` `fwrite` `fclose` `ferror` `ftell` `setbuf` `fmemopen`, used by `rt/io.lir` and `fib.os.memory-stream`): replace by `read`/`write` over fds and a memory buffer in fibber (small);
 4. **`opendir`/`readdir`** (`getdents64` plus a parse), `realpath`, `mkdtemp`, `getenv`/`setenv` (the environment is the initial stack), `execvp` (PATH search), `system`, `errno` (a TLS slot).
-What is lost: `getaddrinfo` and NSS (fibber calls neither today: sockets take numeric addresses, and libcurl, the only resolver, is a driver B2 cannot link), `dlopen` (nothing calls it; a
+What is lost: `getaddrinfo` and NSS (fibber calls `getaddrinfo` since HTTP-1, in `fib.os.net/resolve-host`; NSS is not used by it directly but glibc does; the libcurl driver, once the only resolver, is gone), `dlopen` (nothing calls it; a
 driver for a shared library cannot exist at B2, only a static one), locale (nothing uses it; `fib.fmt` formats numbers itself or through `snprintf`, which B2 replaces), `iconv`, the
 vDSO if the port does not parse the auxiliary vector (`clock_gettime` then costs a system call: `fib.lc-now` was written to avoid exactly that). Verdict: B2 is feasible and buys little
 over B1 on Linux (musl is already small and static: a hello world is 77 KB, the demo of docs/design/static-linking.md 469 KB), and it is the stepping stone to C: every

@@ -121,7 +121,7 @@ rejects sending them to another thread. Limits range from zero to 64 MiB.
 
 `native-handle` is an unsafe-interoperability escape hatch: its pointer is valid
 only while the stream is open. Foreign code must respect that lifetime. HTTP
-uses these streams as libcurl write destinations. Buffers include one extra
+was written for libcurl write destinations (the HTTP client is native now and no longer uses them). Buffers include one extra
 byte for stdio's terminator and use the actual written length to preserve NULs.
 
 ## Validation and extension

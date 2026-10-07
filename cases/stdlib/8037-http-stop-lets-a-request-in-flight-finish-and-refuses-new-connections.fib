@@ -1,0 +1,20 @@
+;; spec: docs/design/http.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll fib.http.types fib.http.bytes) (:require [fib.http.client :as cl] [fib.http.server :as sv] [fib.os.time :as time] [fib.os.net :as net]))
+(defun fetch (url: str) -> str
+  (match (cl/request (ClientRequest "GET" url {} (array 0 0i8)) (cl/default-options)) ((Ok r) (str-from-bytes (. r body))) ((Err _) "error")))
+(defun main () -> i64
+  (let [c (checks)]
+    (match (sv/run-server (fn (r: Request) (do (time/sleep-ns 200000000) (text-response 200 "done"))) (with (sv/default-options) (port 0)))
+      ((Err _) 1)
+      ((Ok server)
+        (let [port (sv/port server) task (spawn (fn () (fetch (str "http://127.0.0.1:" port "/"))))]
+          (do (time/sleep-ns 60000000)
+              (check c (match (sv/stop-server server) ((Ok _) true) (_ false)))
+              (check c (= (join task) "done"))
+              (check c (match (net/connect-tcp "127.0.0.1" port 300) ((Err _) true) (_ false)))
+              (checks-result c)))))))

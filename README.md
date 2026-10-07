@@ -153,7 +153,7 @@ printf 'FROM scratch\nCOPY demo /demo\nENTRYPOINT ["/demo"]\n' > Dockerfile && d
 
 `--static` needs the musl pieces for the architecture (`libc.a`, `crt1.o`, ...): `scripts/build-musl.sh x86_64 DIR` builds them from a pinned musl source (needs gcc and make) and `FIB_MUSL_DIR=DIR` finds them; a release built with
 `WITH_MUSL=1 scripts/package.sh` ships them in `share/fibber/musl/`. An ordinary `fibc build` needs none of this. For aarch64 from an x86-64 machine you also need an aarch64 `ld` (`binutils-aarch64-linux-gnu`) or `ld.lld`.
-A module that needs a native library declares it (`(extern f ... :lib "curl")`); `fibc build` links it only when the program reaches it, dynamically by default and bundled with `--static`, `--link curl=static` or `--link-mode static`,
+A module that needs a native library declares it (`(extern f ... :lib "NAME")`); `fibc build` links it only when the program reaches it, dynamically by default and bundled with `--static`, `--link curl=static` or `--link-mode static`,
 and a missing library is an error that names the module and the library. A scratch image has no CA certificates, no NSS and no time-zone data: see docs/design/static-linking.md (the measurements, what musl needed, the notes for TLS and DNS)
 and docs/design/platform-boundary.md (what the runtime assumes of the platform, and the tiers beyond: no libc, no operating system). `scripts/static-demo.sh` builds the demo into scratch images for both architectures and runs a Lambda
 `bootstrap` against a local fake of the Runtime API.
@@ -277,13 +277,17 @@ natively; the Darwin backend ran on Apple Silicon during the aarch64 work (see
 gate. See the [OS design record](docs/design/os.md).
 
 The explicit [`fib.http` library](lib/fib/http/README.md) provides shared HTTP
-messages, a Ring-style HTTP/1.1 server with a fixed native worker pool, and a
-Hato-style client backed by libcurl. It includes binary bodies, repeated headers,
-query and form encoding, keep-alive, chunked requests, verified HTTPS on the
-client, timeouts, and asynchronous requests. Build the
-[server example](examples/http-server.fib) with `./F build examples/http-server.fib -I lib`;
-the [client example](examples/http-client.fib) also needs `-l curl`.
-See the library README for API contracts and the current scope.
+messages, a Ring-style HTTP/1.1 server (a task per connection, graceful stop,
+slowloris deadlines) and a Hato-style client (connection pool, redirects, typed
+errors, deadlines), both native over a `Transport` seam: no libcurl, no library
+to link, and they build `--static`. They include binary bodies, repeated
+headers, streaming bodies, chunked transfer in both directions, keep-alive and
+asynchronous requests. HTTPS is the next package: until a TLS transport is
+registered an `https` URL is a typed error, never a downgrade. Build the
+[server example](examples/http-server.fib) with `./F build examples/http-server.fib -I lib`
+and the [client example](examples/http-client.fib) the same way. See the library
+README for API contracts and [the design record](docs/design/http.md) for the architecture,
+limits and what is deferred.
 
 ### Build and validate
 
