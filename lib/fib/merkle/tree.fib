@@ -1,0 +1,89 @@
+;; fib.merkle.tree: an incremental merkle tree over items appended at increasing offsets. The tree keeps only its pending roots, one per set
+;; bit of the count (a binary carry: appending merges equal heights into a branch); the root folds them right to left. Every node an append
+;; makes is handed back, for the caller to keep where it likes (`MerkleLog` keeps them in a map; merkql-fib in a pack file): a proof walks
+;; down through them. A proof carries each sibling's digest, side and offsets, so checking it needs the hasher and nothing else.
+(ns fib.merkle.tree (:use fib.core fib.seq fib.coll fib.merkle.node) (:require [fib.crypto.encoding :as enc]))
+
+(defstruct Pending (height: i64 digest: str first: i64 last: i64))
+(defstruct MerkleTree (pending: (Vec Pending) count: i64))
+(defstruct Appended (tree: MerkleTree digest: str written: (Vec (Pair str MerkleNode))))
+(defenum SiblingSide (OnLeft) (OnRight))
+(derive Eq SiblingSide)
+(defstruct Sibling (digest: str side: SiblingSide first: i64 last: i64))
+(derive Eq Sibling)
+(defstruct MerkleProof (item: str offset: i64 siblings: (Vec Sibling) root: str))
+(derive Eq MerkleProof)
+
+(defun empty-tree () -> MerkleTree (MerkleTree [] 0))
+(defun tree-count (t: MerkleTree) -> i64 (. t count))
+
+(defun carry? :private (pending: (Vec Pending) height: i64) -> bool
+  (match (peek pending) ((some top) (= (. top height) height)) (nil false)))
+
+;; Appends the item whose digest is `item` (raw bytes) at `offset`, which must be after every offset already in the tree (a trap if not).
+;; The result's `digest` is the root of the subtree the item completed; `written` is every node made, with its digest.
+(defun append (t: MerkleTree hasher: (fn ((Array i8)) (Array i8)) :borrow item: (Array i8) offset: i64) -> Appended
+  (do (match (peek (. t pending))
+        ((some top) (if (<= offset (. top last)) (trap (str "fib.merkle/append: offset " offset " is not after " (. top last))) ()))
+        (nil (if (< offset 0) (trap (str "fib.merkle/append: offset " offset " is negative")) ())))
+      (let [leaf (MerkleLeaf (enc/hex item) offset) leaf-d (node-hash hasher leaf)]
+        (loop [pending (. t pending) d leaf-d h 0 first offset written: (Vec (Pair str MerkleNode)) [(Pair leaf-d leaf)]]
+          (if (carry? pending h)
+              (let [top (unwrap (peek pending)) b (MerkleBranch (. top digest) d (. top first) offset) bd (node-hash hasher b)]
+                (recur (pop pending) bd (+ h 1) (. top first) (conj written (Pair bd b))))
+              (Appended (MerkleTree (conj pending (Pending h d first offset)) (+ (. t count) 1)) d written))))))
+
+;; The pending roots from index `from` on, folded right to left into one: its digest and offsets.
+(defun fold-from :private (ps: (Vec Pending) hasher: (fn ((Array i8)) (Array i8)) :borrow from: i64) -> Pending
+  (loop [i (- (count ps) 2) acc (nth ps (- (count ps) 1))]
+    (if (< i from) acc
+      (let [p (nth ps i) b (MerkleBranch (. p digest) (. acc digest) (. p first) (. acc last))]
+        (recur (- i 1) (Pending (+ (. p height) 1) (node-hash hasher b) (. p first) (. acc last)))))))
+
+;; The root's digest; nil for an empty tree.
+(defun root (t: MerkleTree hasher: (fn ((Array i8)) (Array i8)) :borrow) -> (Option str)
+  (if (= (count (. t pending)) 0) nil (some (. (fold-from (. t pending) hasher 0) digest))))
+
+(defun sibling-of :private (n: MerkleNode digest: str side: SiblingSide) -> Sibling (Sibling digest side (node-first n) (node-last n)))
+
+;; Down from `digest` to the leaf at `offset`: the leaf's item and the siblings, nearest the leaf first. nil when a node is missing.
+(defun descend :private (lookup: (fn (str) (Option MerkleNode)) :borrow digest: str offset: i64) -> (Option (Pair str (Vec Sibling)))
+  (loop [d digest path: (Vec Sibling) []]
+    (match (lookup d)
+      (nil nil)
+      ((some (MerkleLeaf item o)) (if (= o offset) (some (Pair item (vec (reverse path)))) nil))
+      ((some (MerkleBranch l r _ _))
+       (match (lookup l)
+         (nil nil)
+         ((some ln) (match (lookup r)
+                      (nil nil)
+                      ((some rn) (if (<= offset (node-last ln))
+                                     (recur l (conj path (sibling-of rn r OnRight)))
+                                     (recur r (conj path (sibling-of ln l OnLeft))))))))))))
+
+;; The inclusion proof of the item at `offset`, reading nodes through `lookup`; nil when no item is at `offset` or a node is missing.
+(defun proof (t: MerkleTree hasher: (fn ((Array i8)) (Array i8)) :borrow lookup: (fn (str) (Option MerkleNode)) :borrow offset: i64)
+  -> (Option MerkleProof)
+  (let [ps (. t pending) n (count ps)
+        j (loop [i 0] (cond (= i n) -1 (and (>= offset (. (nth ps i) first)) (<= offset (. (nth ps i) last))) i :else (recur (+ i 1))))]
+    (if (< j 0) nil
+      (match (descend lookup (. (nth ps j) digest) offset)
+        (nil nil)
+        ((some found)
+         (let [right (if (< j (- n 1))
+                         (let [f (fold-from ps hasher (+ j 1))] [(Sibling (. f digest) OnRight (. f first) (. f last))])
+                         [])
+               lefts (mapv (fn (i: i64) (let [p (nth ps i)] (Sibling (. p digest) OnLeft (. p first) (. p last)))) (vec (reverse (range j))))]
+           (some (MerkleProof (. found fst) offset (vec (concat (. found snd) (vec (concat right lefts))))
+                              (. (fold-from ps hasher 0) digest)))))))))
+
+;; Whether the proof's item at its offset hashes up to its root. Compare the root and the item with the ones you trust.
+(defun verify (hasher: (fn ((Array i8)) (Array i8)) :borrow p: MerkleProof) -> bool
+  (let [end (reduce (fn (acc: Pending s: Sibling)
+                      (let [b (if (= (. s side) OnRight)
+                                  (MerkleBranch (. acc digest) (. s digest) (. acc first) (. s last))
+                                  (MerkleBranch (. s digest) (. acc digest) (. s first) (. acc last)))]
+                        (Pending 0 (node-hash hasher b) (node-first b) (node-last b))))
+                    (Pending 0 (node-hash hasher (MerkleLeaf (. p item) (. p offset))) (. p offset) (. p offset))
+                    (. p siblings))]
+    (= (. end digest) (. p root))))

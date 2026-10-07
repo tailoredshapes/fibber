@@ -1,0 +1,53 @@
+;; fib.merkle.node: the nodes of a merkle tree and their bytes. A digest is lowercase hex: fibber's `(Array i8)` has neither Eq nor Hash, and
+;; a digest is compared and used as a map key. The bytes are merkql's (bincode 1, fixed-width little-endian): a leaf is u32 0, the item's
+;; digest, the offset as u64; a branch is u32 1, the left and right digests, the first and last offsets beneath it as u64. A node's digest is
+;; the hasher's digest of those bytes, so a tree built here with SHA-256 has the root merkql computes for the same items.
+(ns fib.merkle.node (:use fib.core fib.seq fib.coll) (:require [fib.crypto.encoding :as enc]))
+
+(defenum MerkleNode (MerkleLeaf item: str offset: i64) (MerkleBranch left: str right: str first: i64 last: i64))
+(derive Eq MerkleNode)
+
+(defun le :private (n: i64 width: i64) -> (Array i8)
+  (let [out (cell (array width 0i8))]
+    (do (dotimes (i width) (array-set! &out i (trunc i8 (bit-and (bit-shift-right n (* 8 i)) 255)))) @out)))
+
+(defun read-le :private (b: (Array i8) at: i64 width: i64) -> i64
+  (loop [i 0 acc 0]
+    (if (= i width) acc
+      (recur (+ i 1) (bit-or acc (bit-shift-left (bit-and (sext i64 (array-get b (+ at i))) 255) (* 8 i)))))))
+
+(defun concat-bytes :private (parts: (Vec (Array i8))) -> (Array i8)
+  (let [out (cell (array (reduce (fn (n: i64 p: (Array i8)) (+ n (array-len p))) 0 parts) 0i8))]
+    (do (reduce (fn (at: i64 p: (Array i8)) (do (dotimes (i (array-len p)) (array-set! &out (+ at i) (array-get p i))) (+ at (array-len p))))
+                0 parts)
+        @out)))
+
+(defun slice-bytes :private (b: (Array i8) from: i64 n: i64) -> (Array i8)
+  (let [out (cell (array n 0i8))] (do (dotimes (i n) (array-set! &out i (array-get b (+ from i)))) @out)))
+
+(defun raw :private (digest: str) -> (Array i8)
+  (match (enc/unhex digest) ((Ok b) b) ((Err _) (trap (str "fib.merkle: the digest " digest " is not hex")))))
+
+;; The node's bytes. Traps when a digest in it is not hex (the library makes only hex digests).
+(defun node-bytes (node: MerkleNode) -> (Array i8)
+  (match node
+    ((MerkleLeaf item offset) (concat-bytes [(le 0 4) (raw item) (le offset 8)]))
+    ((MerkleBranch l r first last) (concat-bytes [(le 1 4) (raw l) (raw r) (le first 8) (le last 8)]))))
+
+;; The node in `bytes`, or nil when they are not one: the digest width is what the length leaves.
+(defun node-from-bytes (b: (Array i8)) -> (Option MerkleNode)
+  (let [n (array-len b) tag (if (>= n 4) (read-le b 0 4) -1)]
+    (cond (and (= tag 0) (> n 12))
+          (let [w (- n 12) off (read-le b (+ 4 w) 8)]
+            (if (< off 0) nil (some (MerkleLeaf (enc/hex (slice-bytes b 4 w)) off))))
+          (and (= tag 1) (> n 20) (= 0 (rem (- n 20) 2)))
+          (let [w (quot (- n 20) 2) first (read-le b (+ 4 (* 2 w)) 8) last (read-le b (+ 12 (* 2 w)) 8)]
+            (if (or (< first 0) (< last first)) nil
+              (some (MerkleBranch (enc/hex (slice-bytes b 4 w)) (enc/hex (slice-bytes b (+ 4 w) w)) first last))))
+          :else nil)))
+
+(defun node-hash (hasher: (fn ((Array i8)) (Array i8)) :borrow node: MerkleNode) -> str (enc/hex (hasher (node-bytes node))))
+
+;; The first and last offsets beneath a node.
+(defun node-first (node: MerkleNode) -> i64 (match node ((MerkleLeaf _ o) o) ((MerkleBranch _ _ f _) f)))
+(defun node-last (node: MerkleNode) -> i64 (match node ((MerkleLeaf _ o) o) ((MerkleBranch _ _ _ l) l)))

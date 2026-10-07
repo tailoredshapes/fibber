@@ -30,7 +30,7 @@ and, once the emitter pruned unused code, did not reach it either.
 - Porting the platform (musl, direct system calls, freestanding) means reading `fib.os`, `lib/platform/`, the runtime and the drivers, a list that is checked, not
   remembered.
 - The violators below are the known set to migrate: each moves to a platform-layer function (`fmt/libc` and `json/libc`: number formatting and parsing and `memcpy` belong
-  in `fib.os.memory` or a primitive; `math/libm`: `sqrt` is an LLVM intrinsic; `log/file`: `rename` belongs in `fib.os.files`; `http/server/date` migrated by HTTP-1: the date is computed in fibber; `test/arch/rules`: `system` belongs in `fib.os.process`). The allow-list shrinks as they move and can only shrink: an entry that no
+  in `fib.os.memory` or a primitive; `math/libm`: `sqrt` is an LLVM intrinsic; `log/file` migrated by MERKLE-1: `rename` is `fib.os.files`' `rename-file`; `http/server/date` migrated by HTTP-1: the date is computed in fibber; `test/arch/rules`: `system` belongs in `fib.os.process`). The allow-list shrinks as they move and can only shrink: an entry that no
   longer matches is itself a finding.
 - A new module cannot add an `extern` without either being a platform module, being named a driver here (a change to this ADR) or failing the gate.
 
@@ -39,7 +39,7 @@ and, once the emitter pruned unused code, did not reach it either.
 ```fibber fitness
 (rule "no module outside the platform layer and the drivers contains an extern (the known violators are allowed, and only those)"
   (allowing (grep-live repo ["lib/**.fib" "!lib/fib/os/**" "!lib/platform/**" "!lib/prelude.fib"] "(extern ")
-            ["lib/fib/fmt/libc.fib:(extern" "lib/fib/math/libm.fib:(extern" "lib/fib/log/file.fib:(extern"
+            ["lib/fib/fmt/libc.fib:(extern" "lib/fib/math/libm.fib:(extern"
              "lib/fib/json/libc.fib:(extern" "lib/fib/test/arch/rules.fib:(extern"])
   (plant "lib/fib/zz-plant.fib" "\n(extern puts (ptr) -> i32)\n"))
 

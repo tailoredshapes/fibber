@@ -11,17 +11,13 @@
 ;; failing write or rotation (disk full, a vanished directory) is an `Err` the logger counts and reports once, never a trap in the caller;
 ;; the lock is released on every path, a trap in the section included (it is caught and returned as an `Err`).
 (ns fib.log.file (:use fib.core fib.seq fib.coll fib.log.core fib.log.sinks)
-  (:require [fib.os :as os] [fib.os.native :as n] [fib.os.errors :as oe] [fib.ex :as ex]))
+  (:require [fib.os :as os] [fib.os.errors :as oe] [fib.ex :as ex]))
 
-(extern rename :private (ptr ptr) -> i32)
-
-;; rename(2) of `from` over `to`.
+;; rename(2) of `from` over `to` (fib.os.files).
 (defun rename-file :private (from: str to: str) -> (Result unit str)
-  (if (or (not (n/valid-text? from)) (not (n/valid-text? to)))
-      (Err "rename: NUL in a path")
-      (unsafe (let [a (n/c-text from) b (n/c-text to) r (rename a b) saved (n/errno)]
-                (do (free a) (free b)
-                    (if (< r 0i32) (Err (str "rename " from " to " to ": " (. (oe/error-from-code saved "rename") message))) (Ok ())))))))
+  (match (os/rename-file from to)
+    ((Ok _) (Ok ()))
+    ((Err e) (Err (if (= (. e kind) oe/InvalidInput) "rename: NUL in a path" (str "rename " from " to " to ": " (. e message)))))))
 
 (defstruct FileState (fd: i64 size: i64))
 

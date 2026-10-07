@@ -1,0 +1,61 @@
+;; spec: docs/design/merkle.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; roots: ../../lib support
+;; fib.merkle against a reference written separately (Python: the tree as a fold of perfect subtrees, largest first, not a binary carry),
+;; over FNV-1a 64 as the hasher (any `(fn ((Array i8)) (Array i8))` will do; the library has no hash of its own). The node bytes are merkql's.
+(ns main (:use tl.check) (:require [fib.merkle :as mk] [fib.crypto :as c]))
+
+(defun fnv (b: (Array i8)) -> (Array i8)
+  (let [h (loop [i 0 h -3750763034362895579]
+            (if (= i (array-len b)) h
+              (recur (+ i 1) (unchecked-multiply (bit-xor h (bit-and (sext i64 (array-get b i)) 255)) 1099511628211))))
+        out (cell (array 8 0i8))]
+    (do (dotimes (i 8) (array-set! &out i (trunc i8 (bit-and (bit-shift-right h (* 8 i)) 255)))) @out)))
+
+(defun item (i: i64) -> (Array i8) (fnv (str-bytes (str "item-" i))))
+(defun log-of (n: i64) -> mk/MerkleLog (reduce (fn (l: mk/MerkleLog i: i64) (mk/log-append l fnv (item i))) (mk/merkle-log) (vec (range n))))
+(defun root-of (n: i64) -> str (unwrap-or (mk/log-root (log-of n) fnv) "none"))
+(defun proof-at (l: mk/MerkleLog i: i64) -> mk/MerkleProof (match (mk/log-proof l fnv i) ((some p) p) (nil (trap (str "no proof at " i)))))
+
+(defun main () -> i64
+  (let [c (checks) l13 (log-of 13) p5 (proof-at l13 5) s0 (nth (. p5 siblings) 0)
+        sparse (reduce (fn (t: mk/MerkleTree o: i64) (. (mk/append t fnv (item o) o) tree)) (mk/empty-tree) [0 5 9])]
+    (do (check c (= (c/hex (mk/node-bytes (mk/MerkleLeaf (c/hex (item 0)) 7))) "000000003385e8aa1354fa660700000000000000"))
+        (check c (= (c/hex (mk/node-bytes (mk/MerkleBranch (c/hex (item 0)) (c/hex (item 1)) 3 9)))
+                    "010000003385e8aa1354fa668083e8aa1353fa6603000000000000000900000000000000"))
+        (check c (= (mapv root-of [1 2 3 5 7 8 13 64])
+                    ["102ead39ba2da843" "27c7c3ecf16c710e" "5f8f4be52b2cf8ee" "66af8d82418d8648" "314033b3cfd0ec04" "b6492ef664acd558"
+                     "06b380a2785de130" "7e20cac3fbbb7c62"]))
+        (check c (= (mk/log-root (mk/merkle-log) fnv) nil))
+        ;; every offset proves, against the root, with the item it holds; past either end there is no proof
+        (check c (every? (fn (i: i64) (let [p (proof-at l13 i)] (and (mk/verify fnv p) (= (. p root) (root-of 13)) (= (. p item) (c/hex (item i))))))
+                         (vec (range 13))))
+        (check c (and (= (mk/log-proof l13 fnv 13) nil) (= (mk/log-proof l13 fnv -1) nil)))
+        ;; a proof that lies about anything fails: the item, the offset, a sibling's digest, side or offsets, the root
+        (check c (not (mk/verify fnv (with p5 (item (c/hex (item 6)))))))
+        (check c (not (mk/verify fnv (with p5 (offset 6)))))
+        (check c (not (mk/verify fnv (with p5 (siblings (assoc (. p5 siblings) 0 (with s0 (digest (c/hex (item 9))))))))))
+        (check c (not (mk/verify fnv (with p5 (siblings (assoc (. p5 siblings) 0 (with s0 (side (if (= (. s0 side) mk/OnLeft) mk/OnRight mk/OnLeft)))))))))
+        (check c (not (mk/verify fnv (with p5 (siblings (assoc (. p5 siblings) 0 (with s0 (first (+ (. s0 first) 1)) (last (+ (. s0 last) 1)))))))))
+        (check c (not (mk/verify fnv (with p5 (root (root-of 12))))))
+        ;; node bytes read back; what is not a node is nil
+        (check c (= (mk/node-from-bytes (mk/node-bytes (mk/MerkleBranch (c/hex (item 0)) (c/hex (item 1)) 3 9)))
+                    (some (mk/MerkleBranch (c/hex (item 0)) (c/hex (item 1)) 3 9))))
+        (check c (= (mk/node-from-bytes (mk/node-bytes (mk/MerkleLeaf (c/hex (item 2)) 4))) (some (mk/MerkleLeaf (c/hex (item 2)) 4))))
+        (check c (and (= (mk/node-from-bytes (array 3 0i8)) nil) (= (mk/node-from-bytes (array 20 2i8)) nil) (= (mk/node-from-bytes (array 21 1i8)) nil)))
+        ;; offsets need only increase: a sparse tree proves what it holds and nothing between
+        (let [nodes (reduce (fn (m: (Map str mk/MerkleNode) o: i64)
+                              (reduce (fn (m2: (Map str mk/MerkleNode) w: (Pair str mk/MerkleNode)) (assoc m2 (. w fst) (. w snd))) m
+                                      (. (mk/append (mk/empty-tree) fnv (item o) o) written)))
+                            {} [0 5 9])
+              full (reduce (fn (acc: (Pair mk/MerkleTree (Map str mk/MerkleNode)) o: i64)
+                             (let [a (mk/append (. acc fst) fnv (item o) o)]
+                               (Pair (. a tree) (reduce (fn (m2: (Map str mk/MerkleNode) w: (Pair str mk/MerkleNode)) (assoc m2 (. w fst) (. w snd))) (. acc snd) (. a written)))))
+                           (Pair (mk/empty-tree) nodes) [0 5 9])
+              look (fn (d: str) (get (. full snd) d))]
+          (do (check c (= (mk/tree-count sparse) 3))
+              (check c (match (mk/proof (. full fst) fnv look 5) ((some p) (mk/verify fnv p)) (nil false)))
+              (check c (= (mk/proof (. full fst) fnv look 4) nil))))
+        (checks-result c))))
