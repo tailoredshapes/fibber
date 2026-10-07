@@ -1,0 +1,139 @@
+;; The handshake messages of fib.tls: what the client SENDS (the ClientHello: its extensions, SNI only for names, TLS 1.3 only, filtered by what the provider can do) and what it RECEIVES
+;; (ServerHello and HelloRetryRequest with the downgrade sentinel, a TLS 1.2 hello, an unoffered suite, a wrong session id echo, unsolicited and duplicate extensions;
+;; EncryptedExtensions and ALPN; Certificate; CertificateVerify; NewSessionTicket; KeyUpdate), every one cut at EVERY byte (a short message is an error, never a trap). Bytes are built here
+;; from the RFC 8446 layouts, independently of the parser. The gate has no crypto driver (tls-stub). `fibc test specs`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.msg fib.tls.msg-parse fib.tls.keys fib.tls.hello
+               fib.tls.hs fib.tls.pem tls-stub))
+
+(defun sid () -> (Array i8) (repeat-bytes 65 32))
+(defun rnd () -> (Array i8) (repeat-bytes 7 32))
+(defun kshare (group: i64 n: i64) -> (Array i8) (ext et-key-share (cat [(w16 group) (vec16 (repeat-bytes 9 n))])))
+(defun sh-body (random: (Array i8) session: (Array i8) suite: i64 exts: (Vec (Array i8))) -> (Array i8) (cat [(w16 771) random (vec8 session) (w16 suite) (w8 0) (vec16 (cat exts))]))
+(defun versions () -> (Array i8) (ext et-supported-versions (w16 772)))
+(defun good-sh () -> (Array i8) (sh-body (rnd) (sid) suite-aes-128-gcm-sha256 [(versions) (kshare 29 32)]))
+(defun start () -> Start
+  (Start (empty-bytes) (sid) 29 :x25519 (Offer [suite-aes-128-gcm-sha256 suite-chacha20-poly1305-sha256] [:x25519] (cv-algs) (cert-algs)) false []
+         (fn (g: i64 pb: (Array i8) ck: (Option (Array i8))) (empty-bytes))))
+(defun sh-verdict (b: (Array i8)) -> str
+  (match (parse-server-hello b)
+    ((Err e) (str "parse: " (tls-error-text e)))
+    ((Ok sh) (match (check-server-hello (start) sh) ((Ok _) (if (. sh hrr) "ok hrr" "ok")) ((Err (HandshakeFailure a _)) (str "hs " a)) ((Err (TlsProtocol a _)) (str "proto " a)) ((Err e) (tls-error-text e))))))
+(defun parse-ok? (r: (Result x TlsError)) -> bool (match r ((Ok _) true) ((Err _) false)))
+(defun every-cut (b: (Array i8) f: (fn ((Array i8)) bool)) -> str
+  (let [bad (filter (fn (k: i64) (f (slice b 0 k))) (range (array-len b)))] (if (= (count bad) 0) "" (str "a cut at " (nth (vec bad) 0) " parsed; "))))
+
+(defstruct SC (name: str bytes: (Array i8) expect: str))
+(defun sh-diffs () -> str
+  (let [hrr-exts [(versions) (ext et-key-share (w16 23)) (ext et-cookie (vec16 (ascii "cookie")))]
+        cases [(SC "a TLS 1.3 ServerHello" (good-sh) "ok")
+               (SC "a HelloRetryRequest" (sh-body (hrr-random) (sid) suite-aes-128-gcm-sha256 hrr-exts) "ok hrr")
+               (SC "the TLS 1.2 downgrade sentinel" (sh-body (cat [(repeat-bytes 7 24) (hexb "444f574e47524401")]) (sid) suite-aes-128-gcm-sha256 [(versions) (kshare 29 32)]) "proto 47")
+               (SC "the TLS 1.1 downgrade sentinel" (sh-body (cat [(repeat-bytes 7 24) (hexb "444f574e47524400")]) (sid) suite-aes-128-gcm-sha256 [(versions) (kshare 29 32)]) "proto 47")
+               (SC "no supported_versions: a TLS 1.2 server" (sh-body (rnd) (sid) suite-aes-128-gcm-sha256 [(kshare 29 32)]) "hs 70")
+               (SC "supported_versions names 1.2" (sh-body (rnd) (sid) suite-aes-128-gcm-sha256 [(ext et-supported-versions (w16 771)) (kshare 29 32)]) "hs 70")
+               (SC "a suite that was not offered" (sh-body (rnd) (sid) suite-aes-256-gcm-sha384 [(versions) (kshare 29 32)]) "proto 47")
+               (SC "a TLS 1.2 suite (0xc02f)" (sh-body (rnd) (sid) 49199 [(versions) (kshare 29 32)]) "proto 47")
+               (SC "a session id that is not echoed" (sh-body (rnd) (repeat-bytes 66 32) suite-aes-128-gcm-sha256 [(versions) (kshare 29 32)]) "proto 47")
+               (SC "an empty session id when one was sent" (sh-body (rnd) (empty-bytes) suite-aes-128-gcm-sha256 [(versions) (kshare 29 32)]) "proto 47")
+               (SC "an unsolicited extension (supported_groups)" (sh-body (rnd) (sid) suite-aes-128-gcm-sha256 [(versions) (kshare 29 32) (ext et-supported-groups (w16 29))]) "parse: protocol error: ServerHello: an extension this client did not offer")
+               (SC "a pre_shared_key extension (none was offered)" (sh-body (rnd) (sid) suite-aes-128-gcm-sha256 [(versions) (ext et-pre-shared-key (w16 0))]) "parse: protocol error: ServerHello: an extension this client did not offer")
+               (SC "the same extension twice" (sh-body (rnd) (sid) suite-aes-128-gcm-sha256 [(versions) (versions) (kshare 29 32)]) "parse: protocol error: extension 43 appears twice")
+               (SC "a compression method" (cat [(w16 771) (rnd) (vec8 (sid)) (w16 4865) (w8 1) (vec16 (cat [(versions) (kshare 29 32)]))]) "parse: protocol error: ServerHello: a compression method")
+               (SC "legacy_version 1.2 is required in the body" (cat [(w16 772) (rnd) (vec8 (sid)) (w16 4865) (w8 0) (vec16 (cat [(versions) (kshare 29 32)]))]) "parse: protocol error: ServerHello: legacy_version is not 0x0303")
+               (SC "a share for another group than the one sent" (sh-body (rnd) (sid) suite-aes-128-gcm-sha256 [(versions) (kshare 23 65)]) "ok")]]
+    (reduce (fn (a: str i: i64) (let [c (nth cases i) got (sh-verdict (. c bytes))] (if (= got (. c expect)) a (str a (. c name) ": expected " (. c expect) " got " got "; ")))) "" (range (count cases)))))
+
+(defun cut-diffs () -> str
+  (str (every-cut (good-sh) (fn (b: (Array i8)) (parse-ok? (parse-server-hello b))))
+       (every-cut (sh-body (hrr-random) (sid) suite-aes-128-gcm-sha256 [(versions) (ext et-key-share (w16 23))]) (fn (b: (Array i8)) (parse-ok? (parse-server-hello b))))
+       (if (parse-ok? (parse-server-hello (cat [(good-sh) (w8 0)]))) "trailing byte after a ServerHello; " "")))
+
+;; ---- EncryptedExtensions
+(defun ee (exts: (Vec (Array i8))) -> (Array i8) (vec16 (cat exts)))
+(defun ee-text (b: (Array i8) offered: (Vec str) extra: (Vec i64)) -> str
+  (match (parse-encrypted-extensions b offered extra) ((Err e) (tls-error-text e)) ((Ok nil) "none") ((Ok (some p)) p)))
+(defun ee-diffs () -> str
+  (str (if (= (ee-text (ee [(ext-alpn ["http/1.1"])]) ["http/1.1" "h2"] []) "http/1.1") "" "alpn selected; ")
+       (if (= (ee-text (ee []) ["http/1.1"] []) "none") "" "no alpn; ")
+       (if (= (ee-text (ee [(ext-alpn ["h2"])]) ["http/1.1"] []) "protocol error: EncryptedExtensions: ALPN names a protocol that was not offered") "" "unoffered alpn accepted; ")
+       (if (= (ee-text (ee [(ext et-supported-versions (w16 772))]) [] []) "protocol error: EncryptedExtensions: an extension this client did not offer") "" "an unsolicited extension accepted; ")
+       (if (= (ee-text (ee [(ext 28 (w16 16384))]) [] []) "protocol error: EncryptedExtensions: an extension this client did not offer") "" "record_size_limit accepted unasked; ")
+       (if (= (ee-text (ee [(ext 28 (w16 16384))]) [] [28]) "none") "" "an extra allowed type refused; ")
+       (if (= (ee-text (ee [(ext 0 (empty-bytes)) (ext et-supported-groups (vec16 (w16 29)))]) [] []) "none") "" "server_name and supported_groups refused; ")
+       (if (parse-ok? (parse-encrypted-extensions (cat [(ee []) (w8 0)]) [] [])) "trailing bytes accepted; " "")
+       (if (parse-ok? (parse-encrypted-extensions (ee [(ext-alpn ["http/1.1"]) (ext-alpn ["http/1.1"])]) ["http/1.1"] [])) "a duplicate extension accepted; " "")
+       (every-cut (ee [(ext-alpn ["http/1.1"])]) (fn (b: (Array i8)) (parse-ok? (parse-encrypted-extensions b ["http/1.1"] []))))))
+
+;; ---- Certificate, CertificateVerify, CertificateRequest, NewSessionTicket, KeyUpdate
+(defun cert-entry (der: (Array i8)) -> (Array i8) (cat [(vec24 der) (vec16 (empty-bytes))]))
+(defun cert-msg (ctx: (Array i8) ders: (Vec (Array i8))) -> (Array i8) (cat [(vec8 ctx) (vec24 (cat (vec (map (fn (d: (Array i8)) (cert-entry d)) ders))))]))
+(defun cert-count (b: (Array i8)) -> i64 (match (parse-certificate-msg b) ((Ok xs) (count xs)) ((Err _) -1)))
+(defun ticket () -> (Array i8) (cat [(w32 3600) (w32 7) (vec8 (w8 1)) (vec16 (repeat-bytes 5 20)) (vec16 (empty-bytes))]))
+(defun cv-body () -> (Array i8) (cat [(w16 2052) (vec16 (repeat-bytes 1 5))]))
+(defun misc-diffs () -> str
+  (let [d (repeat-bytes 3 10)]
+    (str (if (= (cert-count (cert-msg (empty-bytes) [d d])) 2) "" "two certificates; ") (if (= (cert-count (cert-msg (empty-bytes) [])) 0) "" "an empty list; ")
+         (if (= (cert-count (cert-msg (w8 1) [d])) -1) "" "a non-empty request context in a server chain; ")
+         (if (= (cert-count (cert-msg (empty-bytes) [(empty-bytes)])) -1) "" "an empty certificate; ")
+         (if (= (cert-count (cert-msg (empty-bytes) (vec (map (fn (i: i64) d) (range 17))))) -1) "" "17 certificates; ")
+         (if (= (cert-count (cert-msg (empty-bytes) (vec (map (fn (i: i64) d) (range 16))))) 16) "" "16 certificates refused; ")
+         (every-cut (cert-msg (empty-bytes) [d d]) (fn (b: (Array i8)) (= (cert-count b) 2)))
+         (if (match (parse-certificate-verify (cv-body)) ((Ok p) (and (= (. p fst) 2052) (= (array-len (. p snd)) 5))) ((Err _) false)) "" "CertificateVerify; ")
+         (every-cut (cv-body) (fn (b: (Array i8)) (parse-ok? (parse-certificate-verify b))))
+         (if (parse-ok? (parse-certificate-request (cat [(vec8 (empty-bytes)) (vec16 (ext et-signature-algorithms (vec16 (w16 2052))))]))) "" "CertificateRequest; ")
+         (if (parse-ok? (parse-certificate-request (cat [(vec8 (empty-bytes)) (vec16 (empty-bytes))]))) "a CertificateRequest without signature_algorithms; " "")
+         (if (parse-ok? (parse-new-session-ticket (ticket))) "" "NewSessionTicket; ")
+         (if (parse-ok? (parse-new-session-ticket (cat [(w32 3600) (w32 7) (vec8 (w8 1)) (vec16 (empty-bytes)) (vec16 (empty-bytes))]))) "an empty ticket; " "")
+         (every-cut (ticket) (fn (b: (Array i8)) (parse-ok? (parse-new-session-ticket b))))
+         (if (and (= (parse-key-update (w8 0)) (Ok false)) (= (parse-key-update (w8 1)) (Ok true))) "" "KeyUpdate values; ")
+         (if (or (parse-ok? (parse-key-update (w8 2))) (parse-ok? (parse-key-update (empty-bytes))) (parse-ok? (parse-key-update (cat [(w8 0) (w8 0)])))) "a bad KeyUpdate accepted; " ""))))
+
+;; ---- the ClientHello the client builds
+(defun cfg-for (host: str) -> ClientConfig (client-config host (empty-trust) (fn () 0)))
+(defun offer-all () -> Offer (Offer [suite-aes-128-gcm-sha256] [:x25519] (cv-algs) (cert-algs)))
+(defun hello (host: str cookie: (Option (Array i8))) -> (Array i8) (build-hello (cfg-for host) (offer-all) (rnd) (sid) 29 (repeat-bytes 5 32) cookie))
+(defun has (hay: (Array i8) needle: (Array i8)) -> bool
+  (some? (first (filter (fn (i: i64) (bytes-eq? needle (slice hay i (+ i (array-len needle))))) (range (+ 1 (- (array-len hay) (array-len needle))))))))
+(defun hello-diffs () -> str
+  (let [h (hello "example.com" nil) ip (hello "127.0.0.1" nil) v6 (hello "::1" nil) ck (hello "example.com" (some (ascii "ck")))]
+    (str (if (and (= (b-at h 0) 1) (= (be24 h 1) (- (array-len h) 4))) "" "the header length; ")
+         (if (= (be16 h 4) 771) "" "legacy_version; ") (if (bytes-eq? (slice h 6 38) (rnd)) "" "the random; ")
+         (if (has h (ascii "example.com")) "" "no SNI for a name; ") (if (has ip (ascii "127.0.0.1")) "SNI for an IPv4 literal; " "") (if (has v6 (ascii "::1")) "SNI for an IPv6 literal; " "")
+         (if (has h (hexb "002b0003020304")) "" "supported_versions is not exactly [TLS 1.3]; ")
+         (if (has h (cat [(hexb "0010000b000908") (ascii "http/1.1")])) "" "no ALPN http/1.1; ")
+         (if (has h (cat [(hexb "003300260024001d0020") (repeat-bytes 5 32)])) "" "no key_share for x25519; ")
+         (if (has ck (ascii "ck")) "" "no cookie; ") (if (has h (ascii "ck")) "a cookie without a retry; " "")
+         (if (has h (hexb "002d0002")) "psk_key_exchange_modes without resumption; " ""))))
+(defun offer-text (caps: (Vec keyword)) -> str
+  (match (make-offer (StubCaps caps) (cfg-for "x"))
+    ((Err (UnsupportedCapability w)) (str "lacks " w)) ((Err e) (tls-error-text e))
+    ((Ok o) (str (count (. o suites)) " suites " (count (. o groups)) " groups " (count (. o cv-sigs)) " sigs " (count (. o cert-sigs)) " cert-sigs"))))
+(def base-caps: (Vec keyword) [:hmac :hkdf :random :ct-equal :sha-256 :sha-384 :aes-128-gcm :aes-256-gcm :chacha20-poly1305 :x25519 :ecdh-p256 :ecdh-p384
+                               :rsa-pss-sha256 :rsa-pss-sha384 :rsa-pkcs1-sha256 :rsa-pkcs1-sha384 :ecdsa-p256-sha256 :ecdsa-p384-sha384 :ed25519])
+(defun without (caps: (Vec keyword) xs: (Vec keyword)) -> (Vec keyword) (vec (filter (fn (c: keyword) (not (includes? c xs))) caps)))
+(defstruct OC (name: str caps: (Vec keyword) expect: str))
+(defun offer-diffs () -> str
+  (let [rows [(OC "everything" base-caps "3 suites 3 groups 5 sigs 7 cert-sigs")
+              (OC "no sha-384: aes-256-gcm is not offered" (without base-caps [:sha-384]) "2 suites 3 groups 5 sigs 7 cert-sigs")
+              (OC "no chacha20" (without base-caps [:chacha20-poly1305]) "2 suites 3 groups 5 sigs 7 cert-sigs")
+              (OC "only x25519" (without base-caps [:ecdh-p256 :ecdh-p384]) "3 suites 1 groups 5 sigs 7 cert-sigs")
+              (OC "no ed25519, no rsa-pss" (without base-caps [:ed25519 :rsa-pss-sha256 :rsa-pss-sha384]) "3 suites 3 groups 2 sigs 4 cert-sigs")
+              (OC "no AEAD at all" (without base-caps [:aes-128-gcm :aes-256-gcm :chacha20-poly1305]) "lacks an AEAD and hash for a TLS 1.3 cipher suite (aes-128-gcm, aes-256-gcm or chacha20-poly1305, with sha-256 or sha-384)")
+              (OC "no key agreement" (without base-caps [:x25519 :ecdh-p256 :ecdh-p384]) "lacks key agreement (x25519, ecdh-p256 or ecdh-p384)")
+              (OC "no signature verification" (without base-caps [:ed25519 :rsa-pss-sha256 :rsa-pss-sha384 :ecdsa-p256-sha256 :ecdsa-p384-sha384]) "lacks signature verification (rsa-pss, ecdsa or ed25519)")
+              (OC "no hmac" (without base-caps [:hmac]) "lacks :hmac") (OC "no hkdf" (without base-caps [:hkdf]) "lacks :hkdf") (OC "no random" (without base-caps [:random]) "lacks :random")
+              (OC "no constant-time compare" (without base-caps [:ct-equal]) "lacks :ct-equal")]]
+    (reduce (fn (a: str i: i64) (let [r (nth rows i) got (offer-text (. r caps))] (if (= got (. r expect)) a (str a (. r name) ": expected [" (. r expect) "] got [" got "]; ")))) "" (range (count rows)))))
+
+(defspecs specs
+  (feature "ServerHello and HelloRetryRequest (RFC 8446 4.1.3, 4.1.4)"
+    (scenario "16 hellos: accepted, retried, downgraded, unoffered, unsolicited, duplicated, malformed" (then (expect = "" (sh-diffs))))
+    (scenario "a hello cut at every byte, or with a byte too many, is an error" (then (expect = "" (cut-diffs)))))
+  (feature "EncryptedExtensions, Certificate, CertificateVerify, CertificateRequest, NewSessionTicket, KeyUpdate"
+    (scenario "EncryptedExtensions: ALPN, unsolicited extensions, cuts" (then (expect = "" (ee-diffs))))
+    (scenario "the other messages and every cut of them" (then (expect = "" (misc-diffs)))))
+  (feature "the ClientHello"
+    (scenario "framing, SNI for names only, TLS 1.3 only, ALPN, one key share, a cookie only after a retry, no resumption" (then (expect = "" (hello-diffs))))
+    (scenario "what is offered follows the provider's capabilities; a missing kind names itself" (then (expect = "" (offer-diffs))))))
+
+(defun main () -> i64 (run-main (specs)))

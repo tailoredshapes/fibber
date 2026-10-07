@@ -19,8 +19,9 @@
              ((Err e) (Err (if (unsupported? e) (from-crypto e) (hs-fail 51 "CertificateVerify: the signature does not verify"))))))))
 
 ;; The first ClientHello and what the machine needs to answer a HelloRetryRequest: `rebuild` makes the second one from (group, public key, cookie). `compat` sends
-;; the middlebox-compatibility change_cipher_spec (RFC 8446 D.4) once.
-(defstruct Start (hello: (Array i8) sid: (Array i8) group: i64 kind: keyword offer: Offer compat: bool
+;; the middlebox-compatibility change_cipher_spec (RFC 8446 D.4) once; `extra` lists extension types the hello offers beyond the standard ones (a trace's layout), which
+;; EncryptedExtensions may then answer.
+(defstruct Start (hello: (Array i8) sid: (Array i8) group: i64 kind: keyword offer: Offer compat: bool extra: (Vec i64)
                   rebuild: (fn (i64 (Array i8) (Option (Array i8))) (Array i8))))
 ;; `key` is the private half of the current key share: it is closed when the shared secret is made, when a HelloRetryRequest replaces it and when the run fails.
 (defstruct Hs (cfg: ClientConfig rec: Rec tr: (Cell (Array i8)) hooks: Hooks start: (Cell Start) key: (Cell (Option (dyn PrivateKey :send)))))
@@ -44,7 +45,7 @@
 (defun fresh-hello (p: p cfg: ClientConfig o: Offer) :where ((CryptoProvider p)) -> (Result (Pair Start (dyn PrivateKey :send)) TlsError)
   (try-let [random (lift (c/random-bytes p 32)) sid (lift (c/random-bytes p 32)) kp (make-key p (nth (. o groups) 0))]
     (let [kind (nth (. o groups) 0) gid (group-id kind)]
-      (Ok (Pair (Start (build-hello cfg o random sid gid (. kp snd) nil) sid gid kind o true
+      (Ok (Pair (Start (build-hello cfg o random sid gid (. kp snd) nil) sid gid kind o true []
                        (fn (g: i64 pb: (Array i8) ck: (Option (Array i8))) (build-hello cfg o random sid g pb ck)))
                 (. kp fst))))))
 (defun new-hs (cfg: ClientConfig io: Io hooks: Hooks st: Start key: (dyn PrivateKey :send)) -> Hs
@@ -53,7 +54,7 @@
 ;; ---- ServerHello checks (RFC 8446 4.1.3)
 (def downgrade-12: (Array i8) (hexb "444f574e47524401"))
 (def downgrade-11: (Array i8) (hexb "444f574e47524400"))
-(defun check-server-hello :private (st: Start sh: ServerHello) -> (Result Suite TlsError)
+(defun check-server-hello (st: Start sh: ServerHello) -> (Result Suite TlsError)
   (let [tail (slice (. sh random) 24 32)]
     (cond (or (bytes-eq? tail downgrade-12) (bytes-eq? tail downgrade-11)) (Err (proto-alert 47 "the ServerHello random carries a TLS downgrade sentinel"))
           (not (= (. sh version) 772)) (Err (hs-fail 70 "the server did not select TLS 1.3 (no fallback to an older version)"))

@@ -1,0 +1,30 @@
+;; A deterministic decorator over a real crypto provider, for replaying published TLS traces (RFC 8448): `provider-random` and `provider-generate-key` answer from queues
+;; the test fills (the values the RFC lists); everything else is the inner provider's. It does no cryptography of its own and lives in the tests, never in lib/.
+(ns tls-det (:use fib.core fib.seq fib.coll fib.crypto.types))
+
+(defstruct Det (inner: (dyn CryptoProvider :send) randoms: (Cell (Vec (Array i8))) keys: (Cell (Vec (Pair keyword (Array i8))))))
+(defun det (inner: (dyn CryptoProvider :send)) -> Det (Det inner (cell []) (cell [])))
+(defun queue-random (d: Det b: (Array i8)) -> unit (set! (. d randoms) (conj @(. d randoms) b)))
+(defun queue-key (d: Det kind: keyword pkcs8: (Array i8)) -> unit (set! (. d keys) (conj @(. d keys) (Pair kind pkcs8))))
+
+(impl CryptoProvider Det
+  (provider-name (self) (str "det " (provider-name (. self inner))))
+  (provider-capabilities (self) (provider-capabilities (. self inner)))
+  (provider-digest-start (self alg) (provider-digest-start (. self inner) alg))
+  (provider-hmac-start (self alg key) (provider-hmac-start (. self inner) alg key))
+  (provider-derive (self kdf) (provider-derive (. self inner) kdf))
+  (provider-random (self n)
+    (let [q @(. self randoms)]
+      (if (and (> (count q) 0) (= (array-len (nth q 0)) n))
+        (do (set! (. self randoms) (vec (drop 1 q))) (Ok (nth q 0)))
+        (provider-random (. self inner) n))))
+  (provider-ct-equal (self a b) (provider-ct-equal (. self inner) a b))
+  (provider-aead-seal (self alg key nonce aad pt) (provider-aead-seal (. self inner) alg key nonce aad pt))
+  (provider-aead-open (self alg key nonce aad sealed) (provider-aead-open (. self inner) alg key nonce aad sealed))
+  (provider-generate-key (self alg)
+    (let [q @(. self keys)]
+      (if (and (> (count q) 0) (= (. (nth q 0) fst) alg))
+        (do (set! (. self keys) (vec (drop 1 q))) (provider-import-private (. self inner) alg (. (nth q 0) snd)))
+        (provider-generate-key (. self inner) alg))))
+  (provider-import-private (self alg pkcs8) (provider-import-private (. self inner) alg pkcs8))
+  (provider-import-public (self spki) (provider-import-public (. self inner) spki)))

@@ -1,0 +1,36 @@
+;; Test doubles for the TLS specs of the gate, which has no crypto driver. `Stub` lists the capabilities TLS needs, does NO cryptography (every digest, MAC, key
+;; derivation, random and AEAD answers `unsupported`) and imports a public key whose `verify` answers what the stub was made to answer: `StubAccepts` (every
+;; signature is valid) or `StubRejects` (none is). So the gate's chain specs judge everything of the path logic that is not the signature (names, dates, constraints,
+;; usages, algorithms, issuers) and can show that a signature failure is reported as one. Signatures are judged for real in tls-specs/, with the OpenSSL driver.
+(ns tls-stub (:use fib.core fib.seq fib.coll fib.crypto.types))
+
+(defstruct Stub (accepts: bool))
+(defstruct StubKey (accepts: bool))
+(impl PublicKey StubKey
+  (public-key-kind (self) :rsa)
+  (public-key-verify (self scheme msg sig) (if (. self accepts) (Ok ()) (Err (invalid-signature))))
+  (public-key-close (self) ()))
+(defun stub-accepts () -> Stub (Stub true))
+(defun stub-rejects () -> Stub (Stub false))
+
+(impl CryptoProvider Stub
+  (provider-name (self) "stub (no cryptography)")
+  (provider-capabilities (self) [:hmac :hkdf :random :ct-equal :sha-256 :sha-384 :aes-128-gcm :aes-256-gcm :chacha20-poly1305 :x25519 :ecdh-p256 :ecdh-p384
+                                 :rsa-pss-sha256 :rsa-pss-sha384 :rsa-pkcs1-sha256 :rsa-pkcs1-sha384 :ecdsa-p256-sha256 :ecdsa-p384-sha384 :ed25519])
+  (provider-digest-start (self alg) (Err (unsupported "digest")))
+  (provider-hmac-start (self alg key) (Err (unsupported "hmac")))
+  (provider-derive (self kdf) (Err (unsupported "derive")))
+  (provider-random (self n) (Err (unsupported "random")))
+  (provider-ct-equal (self a b) false)
+  (provider-import-public (self spki) (Ok (dyn PublicKey :send (StubKey (. self accepts))))))
+
+;; A stub that lists exactly the capabilities it is given (what a provider with fewer algorithms looks like to `fib.tls.hello/make-offer`).
+(defstruct StubCaps (caps: (Vec keyword)))
+(impl CryptoProvider StubCaps
+  (provider-name (self) "stub with a capability list")
+  (provider-capabilities (self) (. self caps))
+  (provider-digest-start (self alg) (Err (unsupported "digest")))
+  (provider-hmac-start (self alg key) (Err (unsupported "hmac")))
+  (provider-derive (self kdf) (Err (unsupported "derive")))
+  (provider-random (self n) (Err (unsupported "random")))
+  (provider-ct-equal (self a b) false))
