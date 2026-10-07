@@ -1,0 +1,79 @@
+;; Message bodies as streams. A Body yields chunks of the decoded payload (the empty array ends it) and keeps the framing honest: a fixed body that
+;; ends early, a chunk without its CRLF, a size beyond the limit and a malformed trailer are errors, never a silently shorter message. Writing is the
+;; mirror: fixed (the length is known) and chunked (producer pulled until it answers nil), over a Transport.
+(ns fib.http.body (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes fib.http.wire fib.http.message
+                        fib.http.transport fib.http.reader))
+(defstruct Body (next: (fn () (Result (Array i8) Error)) trailers: (fn () (Map str (Vec str))) finished: (fn () bool)))
+(defun next-chunk (b: Body) -> (Result (Array i8) Error) ((. b next)))
+(defun trailers (b: Body) -> (Map str (Vec str)) ((. b trailers)))
+;; True once the framing has been read to its end: the connection is positioned at the next message.
+(defun finished? (b: Body) -> bool ((. b finished)))
+(def piece: i64 65536)
+(defun empty-body () -> Body (Body (fn () (Ok (array 0 0i8))) (fn () {}) (fn () true)))
+(defun bytes-body (bytes: (Array i8)) -> Body
+  (let [sent (cell false)]
+    (Body (fn () (if @sent (Ok (array 0 0i8)) (do (set! sent true) (Ok bytes)))) (fn () {}) (fn () @sent))))
+(defun fixed-body :private (r: Reader n: i64) -> Body
+  (let [left (cell n)]
+    (Body (fn () (if (= @left 0) (Ok (array 0 0i8))
+                   (try-let [bytes (read-some r (min piece @left))]
+                     (if (= (array-len bytes) 0) (Err (ProtocolError "truncated HTTP body"))
+                         (do (set! left (- @left (array-len bytes))) (Ok bytes))))))
+          (fn () {}) (fn () (= @left 0)))))
+(defun close-body :private (r: Reader limit: i64) -> Body
+  (let [total (cell 0) done (cell false)]
+    (Body (fn () (if @done (Ok (array 0 0i8))
+                   (try-let [bytes (read-some r piece)]
+                     (cond (= (array-len bytes) 0) (do (set! done true) (Ok bytes))
+                           (> (+ @total (array-len bytes)) limit) (Err (LimitError "HTTP body exceeds its size limit"))
+                           :else (do (set! total (+ @total (array-len bytes))) (Ok bytes))))))
+          (fn () {}) (fn () @done))))
+(def forbidden-trailers: (Vec str) ["content-length" "transfer-encoding" "host" "connection" "trailer" "expect"])
+(defun read-trailers :private (r: Reader limit: i64) -> (Result (Map str (Vec str)) Error)
+  (loop [out: (Map str (Vec str)) {} n 0 size 0]
+    (try-let [line (required-line r 8192)]
+      (cond (= line "") (Ok out)
+            (> (+ size (str-len line)) limit) (Err (LimitError "HTTP trailers are too large"))
+            (>= n 100) (Err (LimitError "too many HTTP trailers"))
+            :else (try-let [entry (parse-header-line line)]
+              (if (includes? (. entry fst) forbidden-trailers) (Err (ProtocolError "forbidden HTTP trailer field"))
+                  (recur (header-add out (. entry fst) (. entry snd)) (+ n 1) (+ size (+ (str-len line) 2)))))))))
+(defstruct ChunkState :private (left: (Cell i64) total: (Cell i64) done: (Cell bool) trailers: (Cell (Map str (Vec str)))))
+(defun chunk-header :private (r: Reader st: ChunkState limit: i64 header-limit: i64) -> (Result (Array i8) Error)
+  (try-let [line (required-line r 1024) n (parse-chunk-size line (- limit @(. st total)))]
+    (if (= n 0)
+      (try-let [t (read-trailers r header-limit)] (do (set! (. st trailers) t) (set! (. st done) true) (Ok (array 0 0i8))))
+      (do (set! (. st left) n) (set! (. st total) (+ @(. st total) n)) (Ok (array 0 0i8))))))
+(defun chunk-data :private (r: Reader st: ChunkState) -> (Result (Array i8) Error)
+  (try-let [bytes (read-some r (min piece @(. st left)))]
+    (if (= (array-len bytes) 0) (Err (ProtocolError "truncated HTTP chunk"))
+      (do (set! (. st left) (- @(. st left) (array-len bytes)))
+          (if (> @(. st left) 0) (Ok bytes)
+            (try-let [ending (read-exact r 2)]
+              (if (and (= (array-get ending 0) 13i8) (= (array-get ending 1) 10i8)) (Ok bytes)
+                  (Err (ProtocolError "HTTP chunk needs CRLF")))))))))
+(defun chunked-next :private (r: Reader st: ChunkState limit: i64 header-limit: i64) -> (Result (Array i8) Error)
+  (loop []
+    (cond @(. st done) (Ok (array 0 0i8))
+          (> @(. st left) 0) (chunk-data r st)
+          :else (try-let [_ (chunk-header r st limit header-limit)] (recur)))))
+(defun chunked-body :private (r: Reader limit: i64 header-limit: i64) -> Body
+  (let [st (ChunkState (cell 0) (cell 0) (cell false) (cell {}))]
+    (Body (fn () (chunked-next r st limit header-limit)) (fn () @(. st trailers)) (fn () @(. st done)))))
+;; limit bounds the payload bytes of a chunked or until-close body (a fixed one was bounded by its length when it was framed).
+(defun body-reader (r: Reader mode: BodyMode limit: i64 header-limit: i64) -> Body
+  (match mode ((NoBody) (empty-body)) ((Fixed n) (fixed-body r n)) ((Chunked) (chunked-body r limit header-limit))
+    ((UntilClose) (close-body r limit))))
+(defun read-all (b: Body limit: i64) -> (Result (Array i8) Error)
+  (loop [parts: (Vec (Array i8)) [] size 0]
+    (try-let [bytes (next-chunk b)]
+      (cond (= (array-len bytes) 0) (Ok (concat-bytes parts))
+            (> (+ size (array-len bytes)) limit) (Err (LimitError "HTTP body exceeds its size limit"))
+            :else (recur (conj parts bytes) (+ size (array-len bytes)))))))
+(defun write-fixed (t: Transport bytes: (Array i8)) -> (Result unit Error) (t-write t bytes))
+;; Chunked output: each non-empty piece of next is one chunk; nil ends the body, then the trailers.
+(defun write-chunked (t: Transport next: (fn () (Option (Array i8))) trailers: (Map str (Vec str))) -> (Result unit Error)
+  (loop []
+    (match (next)
+      (nil (t-write t (last-chunk-bytes trailers)))
+      ((some piece) (if (= (array-len piece) 0) (recur) (try-let [_ (t-write t (chunk-bytes piece))] (recur)))))))

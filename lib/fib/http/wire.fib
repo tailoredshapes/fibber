@@ -3,7 +3,7 @@
   (:require [fib.string :as s]))
 (defstruct RequestHead (request-method: str uri: str query-string: (Option str)
   version: str headers: (Map str (Vec str))))
-(defenum BodyMode (NoBody) (Fixed length: i64) (Chunked))
+(defenum BodyMode (NoBody) (Fixed length: i64) (Chunked) (UntilClose))
 (defun parse-header-line (line: str) -> (Result (Pair str str) Error)
   (match (str-find line ":" 0)
     (nil (Err (ProtocolError "HTTP header has no colon")))
@@ -11,15 +11,17 @@
       (let [name (str-slice line 0 at) value (trim-ows (str-slice line (+ at 1) (str-len line)))]
         (if (and (token? name) (header-value? value)) (Ok (Pair (ascii-lower name) value))
             (Err (ProtocolError "invalid HTTP header field")))))))
-(defun parse-header-lines (lines: (Vec str) start: i64 end: i64) -> (Result (Map str (Vec str)) Error)
-  (if (> (- end start) 100) (Err (LimitError "too many HTTP headers"))
+(defun parse-header-lines-max (lines: (Vec str) start: i64 end: i64 max: i64) -> (Result (Map str (Vec str)) Error)
+  (if (> (- end start) max) (Err (LimitError "too many HTTP headers"))
     (loop [i start out: (Map str (Vec str)) {}]
       (if (= i end) (Ok out)
         (if (> (str-len (nth lines i)) 8192) (Err (LimitError "HTTP header line is too long"))
           (try-let [entry (parse-header-line (nth lines i))]
             (recur (+ i 1) (header-add out (. entry fst) (. entry snd)))))))))
+(defun parse-header-lines (lines: (Vec str) start: i64 end: i64) -> (Result (Map str (Vec str)) Error)
+  (parse-header-lines-max lines start end 100))
 (defun valid-target? :private (target: str) -> bool
-  (and (> (str-len target) 0) (or (starts-with? target "/") (= target "*"))
+  (and (> (str-len target) 0) (or (starts-with? target "/") (= target "*") (starts-with? target "http://") (starts-with? target "https://"))
     (loop [i 0]
       (if (= i (str-len target)) true
         (let [b (zext i64 (str-byte-at target i))]
@@ -28,7 +30,7 @@
   (let [parts (s/split line " " -1)]
     (cond (!= (count parts) 3) (Err (ProtocolError "invalid HTTP request line"))
           (not (token? (nth parts 0))) (Err (ProtocolError "invalid HTTP method"))
-          (not (valid-target? (nth parts 1))) (Err (ProtocolError "expected an origin-form HTTP target"))
+          (not (valid-target? (nth parts 1))) (Err (ProtocolError "expected an origin-form or absolute-form HTTP target"))
           (not (or (= (nth parts 2) "HTTP/1.1") (= (nth parts 2) "HTTP/1.0")))
           (Err (ProtocolError "unsupported HTTP version"))
           :else (Ok (Triple (nth parts 0) (nth parts 1) (nth parts 2))))))
@@ -43,24 +45,26 @@
     (if (or (> (count hosts) 1) (and (= version "HTTP/1.1") (!= (count hosts) 1))
             (and (= (count hosts) 1) (not (valid-host? (nth hosts 0)))))
         (Err (ProtocolError "HTTP request needs one valid Host header")) (Ok ()))))
-(defun parse-request-head (text: str) -> (Result RequestHead Error)
-  (cond (> (str-len text) 65536) (Err (LimitError "HTTP headers are too large"))
-        (not (s/ends-with? text "\r\n\r\n")) (Err (ProtocolError "HTTP headers need CRLF framing"))
-        :else
-        (let [lines (s/split text "\r\n" -1) end (- (count lines) 2)]
-          (try-let [line (request-line (nth lines 0))
-                    headers (parse-header-lines lines 1 end)
-                    _ (checked-host headers (. line thd))]
-            (let [target (. line snd) question (str-find target "?" 0)
-                  uri (match question (nil target) ((some at) (str-slice target 0 at)))
-                  query (match question (nil nil) ((some at) (some (str-slice target (+ at 1) (str-len target)))))]
-              (Ok (RequestHead (. line fst) uri query (. line thd) headers)))))))
+(defn parse-request-head
+  ([text: str] -> (Result RequestHead Error) (parse-request-head text 65536 100))
+  ([text: str max-bytes: i64 max-headers: i64] -> (Result RequestHead Error)
+    (cond (> (str-len text) max-bytes) (Err (LimitError "HTTP headers are too large"))
+          (not (s/ends-with? text "\r\n\r\n")) (Err (ProtocolError "HTTP headers need CRLF framing"))
+          :else
+          (let [lines (s/split text "\r\n" -1) end (- (count lines) 2)]
+            (try-let [line (request-line (nth lines 0))
+                      headers (parse-header-lines-max lines 1 end max-headers)
+                      _ (checked-host headers (. line thd))]
+              (let [target (. line snd) question (str-find target "?" 0)
+                    uri (match question (nil target) ((some at) (str-slice target 0 at)))
+                    query (match question (nil nil) ((some at) (some (str-slice target (+ at 1) (str-len target)))))]
+                (Ok (RequestHead (. line fst) uri query (. line thd) headers))))))))
 (defun digit :private (b: i64 base: i64) -> i64
   (let [n (cond (and (>= b 48) (<= b 57)) (- b 48)
                (and (>= b 65) (<= b 70)) (+ 10 (- b 65))
                (and (>= b 97) (<= b 102)) (+ 10 (- b 97)) :else -1)]
     (if (< n base) n -1)))
-(defun parse-size :private (text: str base: i64 limit: i64) -> (Result i64 Error)
+(defun parse-size (text: str base: i64 limit: i64) -> (Result i64 Error)
   (if (= (str-len text) 0) (Err (ProtocolError "empty HTTP body length"))
     (loop [i 0 n 0]
       (if (= i (str-len text)) (Ok n)

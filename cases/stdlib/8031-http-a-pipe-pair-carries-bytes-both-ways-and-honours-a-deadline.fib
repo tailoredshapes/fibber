@@ -1,0 +1,24 @@
+;; spec: docs/design/http.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll fib.http.types fib.http.transport fib.http.tcp) (:require [fib.os.time :as time]))
+(defun main () -> i64
+  (let [c (checks)]
+    (match (pipe-pair)
+      ((Err _) 1)
+      ((Ok p) (let [a (. p fst) b (. p snd)]
+        (do (check c (match (t-write a (str-bytes "ping")) ((Ok _) true) (_ false)))
+            (check c (match (t-read b 100) ((Ok x) (= (str-from-bytes x) "ping")) (_ false)))
+            (check c (match (t-write b (str-bytes "pong")) ((Ok _) true) (_ false)))
+            (check c (match (t-read a 100) ((Ok x) (= (str-from-bytes x) "pong")) (_ false)))
+            (t-deadline a (+ (time/clock-now) 50000000))
+            (check c (match (t-read a 100) ((Err (Timeout _ _)) true) (_ false)))
+            (t-close b)
+            (t-deadline a 0)
+            (check c (match (t-read a 100) ((Ok x) (= (array-len x) 0)) (_ false)))
+            (t-close a) (t-close a)
+            (check c (match (t-read a 1) ((Err (Closed)) true) (_ false)))
+            (checks-result c)))))))

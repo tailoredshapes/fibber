@@ -1,14 +1,28 @@
+;; Server options and the handler's reply. workers is the most connections served at once (one task each); beyond it the listener stops
+;; accepting and connections wait in the kernel's backlog.
+;; Deadlines (all in ms): idle-timeout-ms waits for the first byte of a request on a kept-alive connection; header-timeout-ms bounds the whole
+;; head from its first byte (the slowloris defence); request-timeout-ms bounds the body and each write; drain-timeout-ms how long a graceful
+;; stop waits for requests in flight.
 (ns fib.http.server.types (:use fib.core fib.http.types))
 (defstruct Options (host: str port: i64 workers: i64 backlog: i64
   request-timeout-ms: i64 max-body-bytes: i64 max-header-bytes: i64
-  max-line-bytes: i64 max-requests-per-connection: i64))
-(defun default-options () -> Options (Options "127.0.0.1" 8080 4 128 10000 8388608 65536 8192 100))
+  max-line-bytes: i64 max-requests-per-connection: i64
+  max-headers: i64 header-timeout-ms: i64 idle-timeout-ms: i64 drain-timeout-ms: i64))
+(defun default-options () -> Options (Options "127.0.0.1" 8080 64 128 10000 8388608 65536 8192 100 100 10000 10000 5000))
+;; A handler answers with a whole Response or a stream: status and headers now, the body as pieces pulled until nil (sent chunked on HTTP/1.1,
+;; delimited by the close on HTTP/1.0). The producer runs on the connection's task.
+(defenum Reply (Whole response: Response)
+  (Streamed status: i64 headers: (Map str (Vec str)) next: (fn () (Option (Array i8)))))
 (defun valid-options? (o: Options) -> bool
   (and (not (some? (str-find (. o host) "\0" 0)))
-       (>= (. o port) 0) (<= (. o port) 65535) (>= (. o workers) 1) (<= (. o workers) 256)
+       (>= (. o port) 0) (<= (. o port) 65535) (>= (. o workers) 1) (<= (. o workers) 4096)
        (>= (. o backlog) 1) (<= (. o backlog) 65535)
        (>= (. o request-timeout-ms) 1) (<= (. o request-timeout-ms) 3600000)
+       (>= (. o header-timeout-ms) 1) (<= (. o header-timeout-ms) 3600000)
+       (>= (. o idle-timeout-ms) 1) (<= (. o idle-timeout-ms) 3600000)
+       (>= (. o drain-timeout-ms) 0) (<= (. o drain-timeout-ms) 3600000)
+       (>= (. o max-headers) 1) (<= (. o max-headers) 1000)
        (>= (. o max-body-bytes) 0) (<= (. o max-body-bytes) 1073741824)
-       (>= (. o max-header-bytes) 64) (<= (. o max-header-bytes) 65536)
-       (>= (. o max-line-bytes) 16) (<= (. o max-line-bytes) 8192)
+       (>= (. o max-header-bytes) 64) (<= (. o max-header-bytes) 1048576)
+       (>= (. o max-line-bytes) 16) (<= (. o max-line-bytes) 65536)
        (>= (. o max-requests-per-connection) 1) (<= (. o max-requests-per-connection) 100000)))

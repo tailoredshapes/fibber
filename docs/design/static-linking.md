@@ -66,7 +66,7 @@ Everything else of the 102 C names the runtime and `fib.os` use exists in musl (
 | `FIB_ALLOC_DECAY_MS`, the cache's `madvise`, `clock_gettime(CLOCK_MONOTONIC_COARSE)` | work unchanged (musl uses the vDSO in static binaries) | none |
 | signal alternate stack | the runtime installs no signal handler and no alternate stack | none (platform-boundary.md 1) |
 | `getentropy`, `pipe2`, `accept4`, `poll`, `fmemopen`, `mkdtemp`, `strftime` | exist in musl | none |
-| `getaddrinfo` without NSS | fibber never calls it: `fib.os.net` takes numeric addresses; DNS was libcurl's | later stage: musl's resolver reads `/etc/resolv.conf` and `/etc/hosts` itself, no NSS, so a client can use `getaddrinfo` from the scratch image provided those files are mounted |
+| `getaddrinfo` without NSS | HTTP-1 calls it (`fib.os.net/resolve-host`, the platform layer, blocking); `fib.os.net/connect-tcp` itself still takes numeric addresses; DNS was libcurl's before | later stage: musl's resolver reads `/etc/resolv.conf` and `/etc/hosts` itself, no NSS, so a client can use `getaddrinfo` from the scratch image provided those files are mounted |
 
 Note: **libc `malloc` is still the allocator under every fibber program.** The runtime's free lists and large-block cache sit on top of it (`malloc`, `calloc`, `free`, `malloc_usable_size` are in the census of a hello world).
 musl's malloc is the slower of the two; section 6 measures what that costs.

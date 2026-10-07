@@ -1,0 +1,65 @@
+;; fib.http.uri against RFC 3986: the reference-resolution tables of section 5.4 (normal and abnormal examples, base http://a/b/c/d;p?q), the
+;; generic syntax (scheme, userinfo, host, IPv6 literals, port), refusals, and percent-encoding. `fibc test specs/http-uri-spec.fib`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.http.types fib.http.uri))
+
+(defun base () -> Url (match (parse-url "http://a/b/c/d;p?q") ((Ok u) u) ((Err _) (trap "base"))))
+(defun shown (r: (Result Url Error)) -> str (match r ((Ok u) (url-string u)) ((Err e) "ERR")))
+(defun ok-bytes (r: (Result (Array i8) Error)) -> str (match r ((Ok b) (str-from-bytes b)) ((Err _) "ERR")))
+;; section 5.4.1 and 5.4.2: (reference, target)
+(defun table () -> (Vec (Pair str str))
+  [(Pair "g" "http://a/b/c/g") (Pair "./g" "http://a/b/c/g") (Pair "g/" "http://a/b/c/g/") (Pair "/g" "http://a/g") (Pair "//g" "http://g/")
+   (Pair "?y" "http://a/b/c/d;p?y") (Pair "g?y" "http://a/b/c/g?y") (Pair "#s" "http://a/b/c/d;p?q#s") (Pair "g#s" "http://a/b/c/g#s")
+   (Pair "g?y#s" "http://a/b/c/g?y#s") (Pair ";x" "http://a/b/c/;x") (Pair "g;x" "http://a/b/c/g;x") (Pair "g;x?y#s" "http://a/b/c/g;x?y#s")
+   (Pair "" "http://a/b/c/d;p?q") (Pair "." "http://a/b/c/") (Pair "./" "http://a/b/c/") (Pair ".." "http://a/b/") (Pair "../" "http://a/b/")
+   (Pair "../g" "http://a/b/g") (Pair "../.." "http://a/") (Pair "../../" "http://a/") (Pair "../../g" "http://a/g")
+   (Pair "../../../g" "http://a/g") (Pair "../../../../g" "http://a/g") (Pair "/./g" "http://a/g") (Pair "/../g" "http://a/g")
+   (Pair "g." "http://a/b/c/g.") (Pair ".g" "http://a/b/c/.g") (Pair "g.." "http://a/b/c/g..") (Pair "..g" "http://a/b/c/..g")
+   (Pair "./../g" "http://a/b/g") (Pair "./g/." "http://a/b/c/g/") (Pair "g/./h" "http://a/b/c/g/h") (Pair "g/../h" "http://a/b/c/h")
+   (Pair "g;x=1/./y" "http://a/b/c/g;x=1/y") (Pair "g;x=1/../y" "http://a/b/c/y")
+   (Pair "g?y/./x" "http://a/b/c/g?y/./x") (Pair "g?y/../x" "http://a/b/c/g?y/../x") (Pair "g#s/./x" "http://a/b/c/g#s/./x") (Pair "g#s/../x" "http://a/b/c/g#s/../x")
+   (Pair "https://other/x/../y" "https://other/y")])
+(defun bad-urls () -> (Vec str)
+  ["http://h:99999/" "http://h:abc/" "http://[::1/" "http://[zz]/" "http://[::1]x/" "http:///path" "http://ho st/" "http://h/\r\n" "//h/" "h/" "/p" ""
+   "http://h/a b" "http://h/\"" "http://h/<>" "http://h/\\p" "ftp:rel" "http://h:65536/" "http://h:-1/" "1http://h/" "http://h\u{e9}/"])
+
+(defspecs specs
+  (feature "RFC 3986 section 5.4: resolving references against http://a/b/c/d;p?q"
+    (scenario "every row of the normal and abnormal examples (the list is the rows that differ)"
+      (then (expect = [] (vec (filter (fn (row: (Pair str str)) (!= (shown (resolve-reference (base) (. row fst))) (. row snd))) (table)))))))
+  (feature "generic syntax"
+    (scenario "scheme and host are lower-cased, userinfo, port and fragment are kept"
+      (then (expect = "http://user:pw@example.com:8080/a/b?x=1#frag" (shown (parse-url "HTTP://user:pw@Example.COM:8080/a/b?x=1#frag")))))
+    (scenario "an IPv6 literal loses its brackets in the host and gets them back in the Host header"
+      (given [u (parse-url "http://[2001:db8::1]:8080/x")])
+      (then (expect = "2001:db8::1" (match u ((Ok x) (. x host)) (_ "")))
+            (expect = "[2001:db8::1]:8080" (match u ((Ok x) (authority x)) (_ "")))
+            (expect = 8080 (match u ((Ok x) (effective-port x)) (_ 0)))))
+    (scenario "the default port is not written into Host; an empty port is the default"
+      (then (expect = "h" (match (parse-url "http://h:80/") ((Ok x) (authority x)) (_ "")))
+            (expect = "h" (match (parse-url "http://h:/") ((Ok x) (authority x)) (_ "")))
+            (expect = 443 (match (parse-url "https://h") ((Ok x) (effective-port x)) (_ 0)))
+            (expect = "h:8443" (match (parse-url "https://h:8443/") ((Ok x) (authority x)) (_ "")))))
+    (scenario "an empty path is the root in the request target; the query is kept, the fragment is not sent"
+      (then (expect = "/" (match (parse-url "http://h") ((Ok x) (target x)) (_ "")))
+            (expect = "/?q=1" (match (parse-url "http://h?q=1#f") ((Ok x) (target x)) (_ "")))
+            (expect = "/a/b?x" (match (parse-url "http://h/a/b?x#f") ((Ok x) (target x)) (_ "")))))
+    (scenario "malformed URLs are refused (the list is the ones that were accepted)"
+      (then (expect = [] (vec (filter (fn (t: str) (!= (shown (parse-url t)) "ERR")) (bad-urls)))))))
+  (feature "percent-encoding"
+    (scenario "everything but the unreserved characters is encoded, and decoding undoes it"
+      (then (expect = "a%20b%2Fc%3Fd%3De~-._" (percent-encode (str-bytes "a b/c?d=e~-._")))
+            (expect = "a b/c?d=e" (ok-bytes (percent-decode "a%20b%2Fc%3Fd%3De")))
+            (expect = "+" (ok-bytes (percent-decode "+")))
+            (expect = "é" (ok-bytes (percent-decode "%C3%A9")))))
+    (scenario "bad escapes are errors"
+      (then (expect = "ERR" (ok-bytes (percent-decode "%"))) (expect = "ERR" (ok-bytes (percent-decode "%4")))
+            (expect = "ERR" (ok-bytes (percent-decode "%zz"))) (expect = "ERR" (ok-bytes (percent-decode "ab%2")))))
+    (prop "decode of encode is the identity over all bytes" [x (gen-vec (gen-i64-between 0 255))]
+      (let [bytes (let [out (cell (array (count x) 0i8))] (do (dotimes (i (count x)) (array-set! &out i (trunc i8 (nth x i)))) @out))]
+        (match (percent-decode (percent-encode bytes))
+          ((Ok back) (and (= (array-len back) (array-len bytes)) (loop [i 0] (if (= i (array-len bytes)) true (if (= (array-get back i) (array-get bytes i)) (recur (+ i 1)) false)))))
+          ((Err _) false))))
+    (prop "resolving any text against a base never traps and an Ok result is an http(s) URL with a host" [s (gen-str)]
+      (match (resolve-reference (base) s) ((Ok u) (> (str-len (. u host)) 0)) ((Err _) true)))))
+
+(defun main () -> i64 (run-main (specs)))

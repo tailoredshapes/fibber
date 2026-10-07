@@ -1,0 +1,25 @@
+;; The native server of the differential harness (scripts/http-diff.sh): the same routes as scripts/tests/http/diff-server.py, answered by fib.http.
+;; stdout reports the bound port; closing stdin stops it.
+(ns main (:use fib.core fib.seq fib.coll fib.print)
+  (:require [fib.http :as h] [fib.http.server :as s] [fib.os.time :as time] [fib.unix :as u]))
+(defun pieces () -> (fn () (Option (Array i8)))
+  (let [i (cell 0)] (fn () (if (>= @i 4) nil (do (set! i (+ @i 1)) (some (str-bytes (str "chunk-" @i "\n"))))))))
+(defun pattern (n: i64) -> (Array i8)
+  (let [out (cell (array n 0i8))] (do (dotimes (i n) (array-set! &out i (trunc i8 (+ 33 (rem i 90))))) @out)))
+(defun status-of (u: str) -> i64 (loop [i 8 n 0] (if (= i (str-len u)) n (recur (+ i 1) (+ (* n 10) (- (zext i64 (str-byte-at u i)) 48))))))
+(defun handler (r: h/Request) -> s/Reply
+  (let [u (. r uri)]
+    (cond (= u "/hello") (s/Whole (h/with-header (h/text-response 200 "hello\n") "x-route" "hello"))
+          (= u "/echo") (s/Whole (h/Response 200 {"content-type" ["application/octet-stream"]} (. r body)))
+          (= u "/chunked") (s/Streamed 200 {"content-type" ["text/plain"]} (pieces))
+          (= u "/redirect") (s/Whole (h/Response 302 {"location" ["/hello"]} (array 0 0i8)))
+          (= u "/redirect301") (s/Whole (h/Response 301 {"location" ["/hello"]} (array 0 0i8)))
+          (= u "/big") (s/Whole (h/Response 200 {"content-type" ["application/octet-stream"]} (pattern 1048576)))
+          (= u "/probe") (s/Whole (h/text-response 200 (unwrap-or (h/header (. r headers) "x-probe") "none")))
+          (= u "/slow") (do (time/sleep-ns 300000000) (s/Whole (h/text-response 200 "slow\n")))
+          (starts-with? u "/status/") (s/Whole (h/text-response (status-of u) "status\n"))
+          :else (s/Whole (h/text-response 404 "not found\n")))))
+(defun main () -> i64
+  (match (s/run-server-reply handler (with (s/default-options) (port 0) (workers 16)))
+    ((Err e) (do (eprintln (h/error-message e)) 1))
+    ((Ok server) (do (println (s/port server)) (u/fd-read 0 1) (match (s/stop-server server) ((Ok _) 0) ((Err _) 1))))))

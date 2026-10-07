@@ -1,0 +1,96 @@
+;; Fuzzing the message layer: 100,000 mutated messages (byte flips, deletions, insertions of the bytes that matter to HTTP, duplicated slices, swaps,
+;; truncations) go through the request and the response parser. Three things are asserted, none of them "it returned something":
+;;   no trap (a trap fails the spec: the harness reports it), the result does not depend on how the bytes were fragmented (whole, one at a time,
+;;   random cuts: the same Ok value or an Err on all of them), and the known-bad families are always errors: every truncation of a valid request and
+;;   every request whose CRLF was turned into a bare LF. Fixed seed; `fibc test specs/http-fuzz-spec.fib`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.http.types fib.http.headers fib.http.bytes fib.http.testing fib.http.transport fib.http.message))
+
+(defun b (text: str) -> (Array i8) (str-bytes text))
+(defun seeds () -> (Vec str)
+  ["GET /hello.txt HTTP/1.1\r\nHost: www.example.com\r\nAccept: */*\r\n\r\n"
+   "POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 11\r\n\r\nhello world"
+   "POST /p HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\nX-T: 1\r\n\r\n"
+   "PUT /a%20b?x=1 HTTP/1.1\r\nHost: h:8080\r\nCookie: a=b\r\nCookie: c=d\r\nContent-Length: 0\r\n\r\n"
+   "OPTIONS * HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\n\r\n"
+   "GET http://example.com/a?b=c HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"])
+(defun response-seeds () -> (Vec str)
+  ["HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello"
+   "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3;e=1\r\nabc\r\n0\r\nX-Sum: 3\r\n\r\n"
+   "HTTP/1.0 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nuntil close"
+   "HTTP/1.1 301 Moved Permanently\r\nLocation: /x\r\nContent-Length: 0\r\n\r\n"
+   "HTTP/1.1 204 No Content\r\n\r\n"])
+(def alphabet: (Vec i64) [13 10 0 32 58 44 59 48 57 102 70 45 43 9 255 128 47 63 37 92 34 61 13 10])
+
+;; xorshift: a fixed, portable stream of numbers.
+(defun next (x: i64) -> i64
+  (let [a (bit-xor x (shl x 13)) c (bit-xor a (shr a 7)) d (bit-xor c (shl c 17))] (if (= d 0) 88172645463325252 d)))
+(defun pick (x: i64 n: i64) -> i64 (let [m (bit-and (shr x 8) 1073741823)] (rem m n)))
+(defun bytes-of (xs: (Vec i64)) -> (Array i8)
+  (let [out (cell (array (count xs) 0i8))] (do (dotimes (i (count xs)) (array-set! &out i (trunc i8 (nth xs i)))) @out)))
+(defun ints-of (a: (Array i8)) -> (Vec i64) (vec (map (fn (i: i64) (bit-and (zext i64 (array-get a i)) 255)) (range (array-len a)))))
+;; One mutation of a message (as ints) from the random word x.
+(defun mutate (xs: (Vec i64) x: i64) -> (Vec i64)
+  (let [n (count xs) kind (pick x 6) y (next x) at (pick y (max 1 n)) z (next y) v (nth alphabet (pick z (count alphabet)))]
+    (if (= n 0) [v]
+      (cond (= kind 0) (assoc xs at v)
+            (= kind 1) (vec (concat (take at xs) (drop (+ at 1) xs)))
+            (= kind 2) (vec (concat (concat (take at xs) [v]) (drop at xs)))
+            (= kind 3) (let [len (+ 1 (pick z 8))] (vec (concat (concat (take at xs) (take len (drop at xs))) (drop at xs))))
+            (= kind 4) (vec (take at xs))
+            :else (let [o (pick z n)] (assoc (assoc xs at (nth xs o)) o (nth xs at)))))))
+(defun fuzz-once (msg: (Vec i64) x: i64 as-request: bool) -> bool
+  (let [a (bytes-of msg) cuts (vec (map (fn (i: i64) (pick (next (+ x i)) (max 1 (array-len a)))) (range 5)))]
+    (if as-request
+      (and (same-req? (request-of [a]) (request-of (byte-chunks a))) (same-req? (request-of [a]) (request-of (split-at a cuts))))
+      (and (same-resp? (response-of [a] "GET") (response-of (byte-chunks a) "GET")) (same-resp? (response-of [a] "GET") (response-of (split-at a cuts) "GET"))))))
+(defun same-req? (x: (Result ParsedRequest Error) y: (Result ParsedRequest Error)) -> bool
+  (match x
+    ((Ok p) (match y ((Ok q) (and (= (. p method) (. q method)) (= (. p target) (. q target)) (= (. p headers) (. q headers))
+                                  (= (ints-of (. p body)) (ints-of (. q body))))) ((Err _) false)))
+    ((Err _) (match y ((Err _) true) ((Ok _) false)))))
+(defun same-resp? (x: (Result Parsed Error) y: (Result Parsed Error)) -> bool
+  (match x
+    ((Ok p) (match y ((Ok q) (and (= (. p status) (. q status)) (= (. p headers) (. q headers)) (= (ints-of (. p body)) (ints-of (. q body)))))
+                    ((Err _) false)))
+    ((Err _) (match y ((Err _) true) ((Ok _) false)))))
+;; Runs n iterations from the seed list; the result is the indices of the iterations whose fragmentations disagreed (empty is the goal), first 5.
+(defun run (seeds: (Vec str) n: i64 as-request: bool) -> (Vec i64)
+  (loop [i 0 x 2463534242 bad: (Vec i64) []]
+    (if (or (= i n) (>= (count bad) 5)) bad
+      (let [x1 (next x) seed (ints-of (b (nth seeds (pick x1 (count seeds))))) x2 (next x1) m1 (mutate seed x2) x3 (next x2)
+            m2 (if (= (pick x3 3) 0) m1 (mutate m1 x3))]
+        (recur (+ i 1) (next x3) (if (fuzz-once m2 x3 as-request) bad (conj bad i)))))))
+;; How many of n mutants of the request seeds still parse and how many are refused: the fuzzer must exercise both sides.
+(defun mix (n: i64) -> (Pair i64 i64)
+  (loop [i 0 x 2463534242 ok 0 bad 0]
+    (if (= i n) (Pair ok bad)
+      (let [x1 (next x) seed (ints-of (b (nth (seeds) (pick x1 (count (seeds)))))) x2 (next x1) m (mutate seed x2)]
+        (match (request-of [(bytes-of m)]) ((Ok _) (recur (+ i 1) (next x2) (+ ok 1) bad)) ((Err _) (recur (+ i 1) (next x2) ok (+ bad 1))))))))
+(defun truncations-error? (text: str) -> bool
+  (let [a (b text)]
+    (every? (fn (cut: i64) (match (request-of [(array-copy a 0 cut)]) ((Err _) true) ((Ok _) false))) (range (array-len a)))))
+(defun bare-lf-error? (text: str) -> bool
+  (let [head-end (unwrap-or (str-find text "\r\n\r\n" 0) 0)]
+    (every? (fn (at: i64) (if (and (= (str-byte-at text at) 13i8) (= (str-byte-at text (+ at 1)) 10i8))
+                            (match (request-of [(b (str (str-slice text 0 at) "\n" (str-slice text (+ at 2) (str-len text))))]) ((Err _) true) ((Ok _) false))
+                            true))
+            (range (+ head-end 2)))))
+
+(defspecs specs
+  (feature "fuzzing the request parser"
+    (scenario "50,000 mutated requests: whole, byte at a time and cut at random offsets agree (the list is the iterations that did not)"
+      (then (expect = [] (run (seeds) 50000 true)))))
+  (feature "the fuzzer is not vacuous"
+    (scenario "of 20,000 single mutants both a good share still parse and a good share are refused"
+      (given [m (mix 20000)])
+      (then (expect = true (> (. m fst) 1000)) (expect = true (> (. m snd) 1000)))))
+  (feature "fuzzing the response parser"
+    (scenario "50,000 mutated responses: the same"
+      (then (expect = [] (run (response-seeds) 50000 false)))))
+  (feature "families that are always errors"
+    (scenario "every truncation of every valid request with a body or a head is an error"
+      (then (expect = true (every? (fn (i: i64) (truncations-error? (nth (seeds) i))) [0 1 2 3 5]))))
+    (scenario "every CRLF of a request head turned into a bare LF is an error"
+      (then (expect = true (every? (fn (t: str) (bare-lf-error? t)) (seeds)))))))
+
+(defun main () -> i64 (run-main (specs)))

@@ -1,0 +1,25 @@
+;; spec: docs/design/http.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll fib.http.types fib.http.bytes fib.http.testing fib.http.client.types) (:require [fib.http.client :as cl] [fib.http.server.types :as st]))
+(defun handler (r: Request) -> st/Reply
+  (let [u (. r uri)]
+    (cond (= u "/301") (st/Whole (Response 301 {"location" ["/m"]} (array 0 0i8)))
+          (= u "/307") (st/Whole (Response 307 {"location" ["/m"]} (array 0 0i8)))
+          (= u "/down") (st/Whole (Response 302 {"location" ["http://x/m"]} (array 0 0i8)))
+          :else (st/Whole (text-response 200 (str (. r request-method) ":" (str-from-bytes (. r body))))))))
+(defun go (client: Client method: str url: str) -> str
+  (match (cl/request-with client (ClientRequest method url {} (str-bytes "d")))
+    ((Ok r) (str-from-bytes (. r body))) ((Err (RedirectRefused _)) "refused") ((Err _) "error")))
+(defun main () -> i64
+  (let [c (checks) lf (loopback-factory handler (st/default-options))
+        o (with (with-factory (with-factory (default-options) "http" lf) "https" lf) (follow-redirects true))]
+    (match (cl/build-http-client o)
+      ((Err _) 1)
+      ((Ok client)
+        (do (check c (= (go client "POST" "http://x/301") "GET:")) (check c (= (go client "POST" "http://x/307") "POST:d"))
+            (check c (= (go client "GET" "https://x/down") "refused"))
+            (cl/close-http-client client) (checks-result c))))))

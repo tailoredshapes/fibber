@@ -1,0 +1,16 @@
+;; spec: docs/design/http.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use tl.check fib.coll fib.http.types fib.http.testing fib.http.transport))
+(defun wire () -> (Array i8) (str-bytes "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3;e=1\r\nabc\r\n2\r\nde\r\n0\r\nX-T: 1\r\n\r\n"))
+(defun main () -> i64
+  (let [c (checks)]
+    (do (check c (match (response-of [(wire)] "GET")
+          ((Ok p) (and (= (str-from-bytes (. p body)) "abcde") (= (. p status) 200) (= (. p rest) 0))) (_ false)))
+        (check c (match (response-of (byte-chunks (wire)) "GET")
+          ((Ok p) (and (= (str-from-bytes (. p body)) "abcde") (= (. p trailers) {"x-t" ["1"]}))) (_ false)))
+        (check c (match (response-of (split-at (wire) [3 17 40]) "GET") ((Ok p) (= (str-from-bytes (. p body)) "abcde")) (_ false)))
+        (checks-result c))))

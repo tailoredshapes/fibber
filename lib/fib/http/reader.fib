@@ -1,0 +1,66 @@
+;; A buffered reader over a Transport: the one place that turns a byte stream into lines and counted reads. Strict by construction: a line ends
+;; at CRLF and nowhere else (a bare LF, a bare CR and a NUL are errors), and every line and head has a byte bound that is checked before the
+;; byte is stored, so a hostile peer cannot make the reader hold more than the bound. A Reader is used by one thread, with its Transport.
+(ns fib.http.reader (:use fib.core fib.seq fib.coll fib.http.types fib.http.bytes fib.http.transport))
+(defstruct Reader (t: Transport buf: (Cell (Array i8)) pos: (Cell i64) eof: (Cell bool)))
+(defun reader (t: Transport) -> Reader (Reader t (cell (array 0 0i8)) (cell 0) (cell false)))
+(defun transport (r: Reader) -> Transport (. r t))
+;; Bytes read from the stream and not yet consumed (a pooled connection with any is not reusable).
+(defun buffered (r: Reader) -> i64 (- (array-len @(. r buf)) @(. r pos)))
+(defun fill (r: Reader) -> (Result bool Error)
+  (cond (> (buffered r) 0) (Ok true)
+        @(. r eof) (Ok false)
+        :else (try-let [bytes (t-read (. r t) 16384)]
+                (if (= (array-len bytes) 0) (do (set! (. r eof) true) (Ok false))
+                    (do (set! (. r buf) bytes) (set! (. r pos) 0) (Ok true))))))
+(defun next-byte :private (r: Reader) -> (Result (Option i8) Error)
+  (try-let [more (fill r)]
+    (if (not more) (Ok nil)
+      (let [i @(. r pos)] (do (set! (. r pos) (+ i 1)) (Ok (some (array-get @(. r buf) i))))))))
+;; Up to n bytes: what is buffered, else one read. The empty array is end of stream.
+(defun read-some (r: Reader n: i64) -> (Result (Array i8) Error)
+  (try-let [more (fill r)]
+    (if (not more) (Ok (array 0 0i8))
+      (let [start @(. r pos) take (min n (buffered r))]
+        (do (set! (. r pos) (+ start take)) (Ok (array-copy @(. r buf) start (+ start take))))))))
+(defun read-exact (r: Reader n: i64) -> (Result (Array i8) Error)
+  (let [out (cell (array n 0i8))]
+    (loop [offset 0]
+      (if (= offset n) (Ok @out)
+        (try-let [bytes (read-some r (- n offset))]
+          (if (= (array-len bytes) 0) (Err (ProtocolError "truncated HTTP body"))
+            (do (dotimes (i (array-len bytes)) (array-set! &out (+ offset i) (array-get bytes i)))
+                (recur (+ offset (array-len bytes))))))))))
+;; One line without its CRLF; nil at end of stream before any byte of it. max bounds the line's bytes (CRLF excluded).
+(defun read-line (r: Reader max: i64) -> (Result (Option (Array i8)) Error)
+  (let [out (cell (array 0 0i8))]
+    (loop [prev 0]
+      (try-let [b (next-byte r)]
+        (match b
+          (nil (if (and (= prev 0) (= (array-len @out) 0)) (Ok nil) (Err (ProtocolError "truncated HTTP line"))))
+          ((some x)
+            (let [c (zext i64 x)]
+              (cond (and (= prev 13) (!= c 10)) (Err (ProtocolError "bare CR in an HTTP line"))
+                    (= c 10) (if (= prev 13) (Ok (some @out)) (Err (ProtocolError "bare LF in an HTTP line")))
+                    (= c 0) (Err (ProtocolError "NUL in an HTTP line"))
+                    (= c 13) (recur 13)
+                    (>= (array-len @out) max) (Err (LimitError "HTTP line is too long"))
+                    :else (do (array-push! &out x) (recur c))))))))))
+(defun required-line (r: Reader max: i64) -> (Result str Error)
+  (try-let [line (read-line r max)]
+    (match line (nil (Err (ProtocolError "truncated HTTP message"))) ((some bytes) (Ok (latin1-text bytes))))))
+;; A message head as text ending in a blank line, or nil at a clean end of stream before it. max-bytes bounds the whole head, max-line each
+;; line, max-lines the lines before the blank one (the start line and the header fields).
+(defun read-head (r: Reader max-bytes: i64 max-line: i64 max-lines: i64) -> (Result (Option str) Error)
+  (loop [parts: (Vec str) [] size 0]
+    (try-let [line (read-line r max-line)]
+      (match line
+        (nil (if (= (count parts) 0) (Ok nil) (Err (ProtocolError "truncated HTTP headers"))))
+        ((some bytes)
+          (let [next (+ size (+ (array-len bytes) 2))]
+            (cond (> next max-bytes) (Err (LimitError "HTTP headers are too large"))
+                  (= (array-len bytes) 0)
+                  (if (= (count parts) 0) (Err (ProtocolError "empty line before the HTTP start line"))
+                      (Ok (some (str-join (conj parts "\r\n")))))
+                  (>= (count parts) max-lines) (Err (LimitError "too many HTTP headers"))
+                  :else (recur (conj parts (str (latin1-text bytes) "\r\n")) next))))))))

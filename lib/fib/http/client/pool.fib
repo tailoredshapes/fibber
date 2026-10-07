@@ -1,0 +1,42 @@
+;; The connection pool of one Client: idle connections by origin ("scheme://host:port"), reused most recent first. A connection is idle only
+;; after its response body was read to the end under keep-alive; it leaves the pool when it is taken, when it has been idle longer than the
+;; idle timeout, when the origin already holds max-idle-per-host (the oldest goes) and when the client closes. The pool is local to its client
+;; and thread, like the client: no global state (ADR 0013).
+(ns fib.http.client.pool (:use fib.core fib.seq fib.coll fib.http.types fib.http.transport fib.http.reader fib.http.client.types)
+  (:require [fib.os.time :as time]))
+(defstruct Conn (key: str t: Transport r: Reader since: i64 fresh: bool))
+(defstruct Pool (idle: (Cell (Vec Conn)) opened: (Cell i64) reused: (Cell i64)))
+(defun new-pool () -> Pool (Pool (cell []) (cell 0) (cell 0)))
+(defun close-conn (c: Conn) -> unit (t-close (. c t)))
+(defun count-opened (p: Pool) -> unit (set! (. p opened) (+ @(. p opened) 1)))
+(defun conn-of (key: str t: Transport) -> Conn (Conn key t (reader t) 0 true))
+(defun expired? :private (c: Conn o: Options now: i64) -> bool
+  (and (> (. o idle-timeout-ms) 0) (> (- now (. c since)) (* (. o idle-timeout-ms) 1000000))))
+(defun sweep :private (p: Pool o: Options) -> unit
+  (let [now (time/clock-now)
+        kept (reduce (fn (out: (Vec Conn) c: Conn)
+                       (if (or (expired? c o now) (> (buffered (. c r)) 0)) (do (close-conn c) out) (conj out c))) [] @(. p idle))]
+    (set! (. p idle) kept)))
+(defun acquire (p: Pool key: str o: Options) -> (Option Conn)
+  (do (sweep p o)
+    (let [xs @(. p idle)
+          at (loop [i (- (count xs) 1)] (cond (< i 0) -1 (= (. (nth xs i) key) key) i :else (recur (- i 1))))]
+      (if (< at 0) nil
+        (let [c (nth xs at)]
+          (do (set! (. p idle) (remove-at xs at))
+              (set! (. p reused) (+ @(. p reused) 1))
+              (some (with c (fresh false)))))))))
+(defun remove-at :private (xs: (Vec Conn) at: i64) -> (Vec Conn)
+  (loop [i 0 out: (Vec Conn) []] (if (= i (count xs)) out (recur (+ i 1) (if (= i at) out (conj out (nth xs i)))))))
+(defun same-key-count :private (xs: (Vec Conn) key: str) -> i64 (count (filter (fn (c: Conn) (= (. c key) key)) xs)))
+(defun evict-oldest :private (p: Pool key: str) -> unit
+  (let [xs @(. p idle) at (loop [i 0] (cond (= i (count xs)) -1 (= (. (nth xs i) key) key) i :else (recur (+ i 1))))]
+    (if (< at 0) ()
+      (do (close-conn (nth xs at)) (set! (. p idle) (remove-at xs at))))))
+(defun release (p: Pool c: Conn o: Options) -> unit
+  (if (= (. o max-idle-per-host) 0) (close-conn c)
+    (do (loop [] (if (>= (same-key-count @(. p idle) (. c key)) (. o max-idle-per-host)) (do (evict-oldest p (. c key)) (recur)) ()))
+        (set! (. p idle) (conj @(. p idle) (with c (since (time/clock-now))))))))
+(defun close-all (p: Pool) -> unit
+  (do (dotimes (i (count @(. p idle))) (close-conn (nth @(. p idle) i))) (set! (. p idle) [])))
+(defun stats (p: Pool) -> PoolStats (PoolStats @(. p opened) @(. p reused) (count @(. p idle))))

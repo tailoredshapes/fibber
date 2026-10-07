@@ -1,12 +1,17 @@
-;; A reentrant UTC conversion supplies HTTP's Date header on native servers.
-(ns fib.http.server.date (:require [fib.http.native :as n] [fib.os.time :as u]))
-(extern gmtime_r :private (ptr ptr) -> ptr)
-(extern strftime :private (ptr i64 ptr ptr) -> i64)
-(defun http-date () -> str
-  (unsafe (let [seconds (alloc 8) tm (alloc 128) out (alloc 64)
-                format (n/c-text "%a, %d %b %Y %H:%M:%S GMT")]
-    (do (store-i64 seconds (quot (u/wall-now) 1000000000))
-      (let [converted (n/address (gmtime_r seconds tm))
-            size (if (= converted 0) 0 (strftime out 64 format tm))
-            text (str-from-bytes (n/bytes-at out size))]
-        (do (free format) (free out) (free tm) (free seconds) text))))))
+;; The Date header (RFC 9110 5.6.7: IMF-fixdate) computed from the wall clock in fibber: no extern here (ADR 0011), the civil-from-days
+;; arithmetic is H. Hinnant's. fib.os.time supplies the clock.
+(ns fib.http.server.date (:use fib.core fib.seq fib.coll) (:require [fib.os.time :as u]))
+(def days: (Vec str) ["Sun" "Mon" "Tue" "Wed" "Thu" "Fri" "Sat"])
+(def months: (Vec str) ["Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"])
+(defun two :private (n: i64) -> str (if (< n 10) (str "0" n) (str n)))
+;; IMF-fixdate of a count of seconds since the Unix epoch (non-negative).
+(defun format-date (seconds: i64) -> str
+  (let [days-since (quot seconds 86400) rest (rem seconds 86400)
+        z (+ days-since 719468) era (quot z 146097) doe (- z (* era 146097))
+        yoe (quot (- (+ (- doe (quot doe 1460)) (quot doe 36524)) (quot doe 146096)) 365)
+        doy (- doe (- (+ (* 365 yoe) (quot yoe 4)) (quot yoe 100)))
+        mp (quot (+ (* 5 doy) 2) 153) d (+ (- doy (quot (+ (* 153 mp) 2) 5)) 1)
+        m (if (< mp 10) (+ mp 3) (- mp 9)) y (+ (+ yoe (* era 400)) (if (<= m 2) 1 0))]
+    (str (nth days (rem (+ days-since 4) 7)) ", " (two d) " " (nth months (- m 1)) " " y " "
+         (two (quot rest 3600)) ":" (two (quot (rem rest 3600) 60)) ":" (two (rem rest 60)) " GMT")))
+(defun http-date () -> str (format-date (quot (u/wall-now) 1000000000)))

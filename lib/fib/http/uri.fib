@@ -1,0 +1,134 @@
+;; URIs per RFC 3986: the generic syntax (scheme, userinfo, host with IPv6 literals, port, path, query, fragment), percent-encoding, reference
+;; resolution (5.2, what a redirect needs) and dot-segment removal. Punycode and IDNA are out of scope: a host with a byte above 127 is refused.
+(ns fib.http.uri (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes))
+(defstruct Url (scheme: str userinfo: (Option str) host: str port: (Option i64) path: str query: (Option str) fragment: (Option str)))
+(defstruct Ref :private (scheme: (Option str) authority: (Option str) path: str query: (Option str) fragment: (Option str)))
+(defun bad :private (m: str) -> Error (InvalidRequest (str "invalid URL: " m)))
+(defun alpha? :private (b: i64) -> bool (or (and (>= b 65) (<= b 90)) (and (>= b 97) (<= b 122))))
+(defun digit? :private (b: i64) -> bool (and (>= b 48) (<= b 57)))
+(defun unreserved? :private (b: i64) -> bool (or (alpha? b) (digit? b) (includes? b [45 46 95 126])))
+(defun uri-char? :private (b: i64) -> bool
+  (and (> b 32) (< b 127) (not (includes? b [34 60 62 92 94 96 123 124 125]))))
+(defun all-chars? :private (s: str) -> bool
+  (loop [i 0] (if (= i (str-len s)) true (if (uri-char? (zext i64 (str-byte-at s i))) (recur (+ i 1)) false))))
+(defun hex-digit :private (b: i64) -> i64
+  (cond (digit? b) (- b 48) (and (>= b 65) (<= b 70)) (+ 10 (- b 65)) (and (>= b 97) (<= b 102)) (+ 10 (- b 97)) :else -1))
+;; Percent-encodes every byte that is not unreserved (so "/" and "?" are encoded too: for a path segment or a query value).
+(defun percent-encode (bytes: (Array i8)) -> str
+  (let [hex "0123456789ABCDEF"]
+    (str-join (loop [i 0 out: (Vec str) []]
+      (if (= i (array-len bytes)) out
+        (let [b (zext i64 (array-get bytes i))]
+          (recur (+ i 1) (conj out (if (unreserved? b) (str-from-bytes (array-copy bytes i (+ i 1)))
+            (str "%" (str-slice hex (shr b 4) (+ (shr b 4) 1)) (str-slice hex (bit-and b 15) (+ (bit-and b 15) 1))))))))))))
+(defun percent-decode (text: str) -> (Result (Array i8) Error)
+  (let [out (cell (array (str-len text) 0i8))]
+    (loop [i 0 j 0]
+      (if (= i (str-len text)) (Ok (array-copy @out 0 j))
+        (let [b (zext i64 (str-byte-at text i))]
+          (if (= b 37)
+            (if (> (+ i 3) (str-len text)) (Err (bad "truncated percent escape"))
+              (let [hi (hex-digit (zext i64 (str-byte-at text (+ i 1)))) lo (hex-digit (zext i64 (str-byte-at text (+ i 2))))]
+                (if (or (< hi 0) (< lo 0)) (Err (bad "invalid percent escape"))
+                  (do (array-set! &out j (trunc i8 (+ (* hi 16) lo))) (recur (+ i 3) (+ j 1))))))
+            (do (array-set! &out j (trunc i8 b)) (recur (+ i 1) (+ j 1)))))))))
+(defun cut :private (s: str ch: str) -> (Pair str (Option str))
+  (match (str-find s ch 0) (nil (Pair s nil)) ((some at) (Pair (str-slice s 0 at) (some (str-slice s (+ at 1) (str-len s)))))))
+(defun scheme-end :private (s: str) -> i64
+  (if (or (= (str-len s) 0) (not (alpha? (zext i64 (str-byte-at s 0))))) -1
+    (loop [i 1] (if (= i (str-len s)) -1
+      (let [b (zext i64 (str-byte-at s i))]
+        (cond (= b 58) i (or (alpha? b) (digit? b) (includes? b [43 45 46])) (recur (+ i 1)) :else -1))))))
+(defun parse-ref :private (text: str) -> (Result Ref Error)
+  (if (not (all-chars? text)) (Err (bad "a space, control, non-ASCII or forbidden character"))
+    (let [f (cut text "#") q (cut (. f fst) "?") body (. q fst) e (scheme-end body)
+          scheme (if (< e 0) nil (some (ascii-lower (str-slice body 0 e)))) rest (if (< e 0) body (str-slice body (+ e 1) (str-len body)))]
+      (if (starts-with? rest "//")
+        (let [after (str-slice rest 2 (str-len rest))
+              slash (loop [i 0] (cond (= i (str-len after)) i (= (str-byte-at after i) 47i8) i :else (recur (+ i 1))))]
+          (Ok (Ref scheme (some (str-slice after 0 slash)) (str-slice after slash (str-len after)) (. q snd) (. f snd))))
+        (Ok (Ref scheme nil rest (. q snd) (. f snd)))))))
+(defun parse-port :private (s: str) -> (Result (Option i64) Error)
+  (if (= s "") (Ok nil)
+    (loop [i 0 n 0]
+      (if (= i (str-len s)) (Ok (some n))
+        (let [b (zext i64 (str-byte-at s i))]
+          (cond (not (digit? b)) (Err (bad "invalid port")) (> n 6553) (Err (bad "port out of range"))
+                :else (let [m (+ (* n 10) (- b 48))] (if (> m 65535) (Err (bad "port out of range")) (recur (+ i 1) m)))))))))
+(defun host-ok? :private (h: str v6: bool) -> bool
+  (and (> (str-len h) 0)
+    (loop [i 0] (if (= i (str-len h)) true
+      (let [b (zext i64 (str-byte-at h i))]
+        (if (if v6 (or (= b 58) (= b 46) (>= (hex-digit b) 0)) (or (unreserved? b) (= b 37) (includes? b [33 36 38 39 40 41 42 43 44 59 61]))) (recur (+ i 1)) false))))))
+(defun parse-hostport :private (s: str) -> (Result (Triple str (Option i64) bool) Error)
+  (if (starts-with? s "[")
+    (match (str-find s "]" 0)
+      (nil (Err (bad "unterminated IPv6 literal")))
+      ((some at) (let [h (str-slice s 1 at) rest (str-slice s (+ at 1) (str-len s))]
+        (cond (not (host-ok? h true)) (Err (bad "invalid IPv6 literal"))
+              (= rest "") (Ok (Triple h nil true))
+              (starts-with? rest ":") (try-let [p (parse-port (str-slice rest 1 (str-len rest)))] (Ok (Triple h p true)))
+              :else (Err (bad "text after an IPv6 literal"))))))
+    (let [c (cut s ":")] ; a reg-name has at most one colon
+      (try-let [p (parse-port (match (. c snd) (nil "") ((some x) x)))]
+        (if (host-ok? (. c fst) false) (Ok (Triple (ascii-lower (. c fst)) p false)) (Err (bad "invalid host")))))))
+(defun default-port (scheme: str) -> i64 (cond (= scheme "http") 80 (= scheme "https") 443 :else 0))
+(defun parse-url (text: str) -> (Result Url Error)
+  (try-let [r (parse-ref text)]
+    (match (. r scheme)
+      (nil (Err (bad "no scheme")))
+      ((some scheme) (match (. r authority)
+        (nil (Err (bad "no authority")))
+        ((some auth)
+          (let [at (loop [i (- (str-len auth) 1)] (cond (< i 0) -1 (= (str-byte-at auth i) 64i8) i :else (recur (- i 1))))
+                info (if (< at 0) nil (some (str-slice auth 0 at))) hp (if (< at 0) auth (str-slice auth (+ at 1) (str-len auth)))]
+            (try-let [h (parse-hostport hp)]
+              (Ok (Url scheme info (. h fst) (. h snd) (. r path) (. r query) (. r fragment)))))))))))
+(defun effective-port (u: Url) -> i64 (match (. u port) ((some p) p) (nil (default-port (. u scheme)))))
+(defun path-or-root (u: Url) -> str (if (= (. u path) "") "/" (. u path)))
+;; The request target in origin-form (RFC 9112 3.2.1): path and query, never the fragment.
+(defun target (u: Url) -> str
+  (str (path-or-root u) (match (. u query) (nil "") ((some q) (str "?" q)))))
+(defun host-text :private (u: Url) -> str (if (some? (str-find (. u host) ":" 0)) (str "[" (. u host) "]") (. u host)))
+;; The Host header value: the port only when it is not the scheme's default.
+(defun authority (u: Url) -> str
+  (match (. u port) (nil (host-text u))
+    ((some p) (if (= p (default-port (. u scheme))) (host-text u) (str (host-text u) ":" p)))))
+(defun url-string (u: Url) -> str
+  (str (. u scheme) "://" (match (. u userinfo) (nil "") ((some i) (str i "@"))) (authority u) (path-or-root u)
+       (match (. u query) (nil "") ((some q) (str "?" q))) (match (. u fragment) (nil "") ((some f) (str "#" f)))))
+(defun origin (u: Url) -> str (str (. u scheme) "://" (. u host) ":" (effective-port u)))
+;; RFC 3986 5.2.4.
+(defun join-slash :private (segs: (Vec str)) -> str
+  (loop [i 0 out ""] (if (= i (count segs)) out (recur (+ i 1) (if (= i 0) (nth segs 0) (str out "/" (nth segs i)))))))
+(defun remove-dots (path: str) -> str
+  (let [parts (str-split-slash path) n (count parts)
+        segs (loop [i 0 out: (Vec str) []]
+               (if (= i n) out
+                 (let [s (nth parts i)]
+                   (cond (= s ".") (recur (+ i 1) out)
+                         (= s "..") (recur (+ i 1) (if (> (count out) 1) (pop out) out))
+                         :else (recur (+ i 1) (conj out s))))))
+        l (nth parts (- n 1)) trail (or (= l ".") (= l ".."))]
+    (if trail (str (join-slash segs) "/") (join-slash segs))))
+(defun str-split-slash :private (s: str) -> (Vec str)
+  (loop [i 0 start 0 out: (Vec str) []]
+    (cond (= i (str-len s)) (conj out (str-slice s start i))
+          (= (str-byte-at s i) 47i8) (recur (+ i 1) (+ i 1) (conj out (str-slice s start i)))
+          :else (recur (+ i 1) start out))))
+(defun merge-paths :private (base: Url ref-path: str) -> str
+  (if (= (. base path) "") (str "/" ref-path)
+    (match (last-slash (. base path)) (nil ref-path) ((some at) (str (str-slice (. base path) 0 (+ at 1)) ref-path)))))
+(defun last-slash :private (s: str) -> (Option i64)
+  (loop [i (- (str-len s) 1)] (cond (< i 0) nil (= (str-byte-at s i) 47i8) (some i) :else (recur (- i 1)))))
+;; Resolves a Location (or any reference) against the URL of the response that carried it.
+(defun resolve-reference (base: Url reference: str) -> (Result Url Error)
+  (try-let [r (parse-ref reference)]
+    (cond (some? (. r scheme)) (try-let [u (parse-url reference)] (Ok (with u (path (remove-dots (. u path))))))
+          (some? (. r authority)) (parse-url (str (. base scheme) ":" reference))
+          :else
+          (let [path (cond (= (. r path) "") (. base path)
+                           (starts-with? (. r path) "/") (remove-dots (. r path))
+                           :else (remove-dots (merge-paths base (. r path))))
+                query (if (= (. r path) "") (match (. r query) (nil (. base query)) ((some q) (some q))) (. r query))]
+            (Ok (Url (. base scheme) (. base userinfo) (. base host) (. base port) path query (. r fragment)))))))

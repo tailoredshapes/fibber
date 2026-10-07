@@ -1,0 +1,35 @@
+;; scripts/bench/http-load.fib: a keep-alive load generator written with the native client (HTTP-1). One task and one client per connection, each
+;; sending `requests` sequential GETs; every latency is kept. Prints one line: requests/s and the latency percentiles in microseconds.
+;;   http-load URL CONNECTIONS REQUESTS-PER-CONNECTION       e.g. http-load http://127.0.0.1:8080/small 64 2000
+;; Also `http-load --serve PORT SMALL-BYTES BIG-BYTES`: the native server under test (routes /small and /big), stops when stdin closes.
+(ns main (:use fib.core fib.seq fib.coll fib.print fib.http.types fib.http.bytes)
+  (:require [fib.http.client :as c] [fib.http.server :as s] [fib.os.time :as time] [fib.os.environment :as env] [fib.unix :as u]))
+(defun one-connection (url: str n: i64) -> (Vec i64)
+  (match (c/build-http-client (with (c/default-options) (timeout-ms 20000)))
+    ((Err _) [])
+    ((Ok cl) (let [out (loop [i 0 acc: (Vec i64) []]
+                (if (= i n) acc
+                  (let [t0 (time/clock-now)
+                        r (c/request-with cl (ClientRequest "GET" url {} (array 0 0i8)))]
+                    (recur (+ i 1) (match r ((Ok _) (conj acc (quot (- (time/clock-now) t0) 1000))) ((Err _) acc))))))]
+               (do (c/close-http-client cl) out)))))
+(defun pct (xs: (Vec i64) p: i64) -> i64 (nth xs (min (- (count xs) 1) (quot (* p (count xs)) 100))))
+(defun load (url: str conns: i64 n: i64) -> i64
+  (let [t0 (time/clock-now)
+        tasks (vec (map (fn (i: i64) (spawn (fn () (one-connection url n)))) (range conns)))
+        all (reduce (fn (acc: (Vec i64) t: (Task (Vec i64))) (into acc (join t))) [] tasks)
+        wall (- (time/clock-now) t0) sorted (vec (sort all))]
+    (do (println (str "requests=" (count sorted) " wall_ms=" (quot wall 1000000) " rps=" (quot (* (count sorted) 1000000000) (max 1 wall))
+                      " p50_us=" (pct sorted 50) " p90_us=" (pct sorted 90) " p99_us=" (pct sorted 99) " max_us=" (nth sorted (- (count sorted) 1))))
+        0)))
+(defun serve (port: i64 small: i64 big: i64) -> i64
+  (let [sb (array small 120i8) bb (array big 121i8)]
+    (match (s/run-server (fn (r: Request) (if (= (. r uri) "/big") (Response 200 {} bb) (Response 200 {} sb)))
+                         (with (s/default-options) (port port) (workers 128) (max-requests-per-connection 100000)))
+      ((Err e) (do (eprintln (error-message e)) 1))
+      ((Ok srv) (do (println (s/port srv)) (u/fd-read 0 1) (do (s/stop-server srv) 0))))))
+(defun main () -> i64
+  (let [a (args)]
+    (cond (and (= (count a) 4) (= (nth a 0) "--serve")) (serve (unwrap-or (parse-long (nth a 1)) 8080) (unwrap-or (parse-long (nth a 2)) 100) (unwrap-or (parse-long (nth a 3)) 1048576))
+          (= (count a) 3) (load (nth a 0) (unwrap-or (parse-long (nth a 1)) 1) (unwrap-or (parse-long (nth a 2)) 1000))
+          :else (do (eprintln "usage: http-load URL CONNECTIONS REQUESTS | --serve PORT SMALL BIG") 2))))

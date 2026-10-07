@@ -1,0 +1,206 @@
+;; The native fib.http client against the native server: in process over pipes (the loopback Factory: real deadlines, no sockets) and over real
+;; localhost sockets (port 0). Keep-alive reuse is asserted by count, the pool by its limits, the redirect rules as a matrix, deadlines against a
+;; slow handler (each test bounded at about a second), streaming both ways, Expect: 100-continue, the decoder seam, and the https refusal.
+;; `fibc test specs/http-client-spec.fib`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.http.types fib.http.headers fib.http.bytes fib.http.testing fib.http.transport fib.http.body
+               fib.http.client.types)
+  (:require [fib.http.client :as c] [fib.http.server :as sv] [fib.http.server.types :as st] [fib.os.time :as time] [fib.string :as s]
+            [fib.os.net :as net] [fib.os.io :as io]))
+
+(defun text-of (r: Response) -> str (str-from-bytes (. r body)))
+(defun ok (text: str) -> st/Reply (st/Whole (text-response 200 text)))
+(defun query-of (r: Request) -> str (match (. r query-string) (nil "") ((some q) q)))
+(defun param (r: Request name: str) -> str
+  (let [q (query-of r) key (str name "=")]
+    (match (str-find q key 0) (nil "") ((some at) (let [rest (str-slice q (+ at (str-len key)) (str-len q))] (str-slice rest 0 (unwrap-or (str-find rest "&" 0) (str-len rest))))))))
+(defun redirect (status: i64 to: str) -> st/Reply (st/Whole (Response status {"location" [to]} (array 0 0i8))))
+(defun pieces (n: i64 pause-ms: i64) -> (fn () (Option (Array i8)))
+  (let [i (cell 0)]
+    (fn () (if (>= @i n) nil (do (set! i (+ @i 1)) (time/sleep-ns (* pause-ms 1000000)) (some (str-bytes (str "piece-" @i ";"))))))))
+(defun pattern (n: i64) -> (Array i8)
+  (let [out (cell (array n 0i8))] (do (dotimes (i n) (array-set! &out i (trunc i8 (rem (* i 7) 251)))) @out)))
+(defun handler (r: Request) -> st/Reply
+  (let [u (. r uri)]
+    (cond (= u "/echo") (st/Whole (Response 200 {"x-method" [(. r request-method)]} (. r body)))
+          (= u "/m") (ok (str (. r request-method) ":" (str-from-bytes (. r body))))
+          (starts-with? u "/h/") (ok (unwrap-or (header (. r headers) (str-slice u 3 (str-len u))) "none"))
+          (starts-with? u "/redir/") (redirect (parse-status (str-slice u 7 (str-len u))) (param r "to"))
+          (= u "/loop/a") (redirect 302 "/loop/b")
+          (= u "/loop/b") (redirect 302 "/loop/a")
+          (= u "/slow") (do (time/sleep-ns 600000000) (ok "late"))
+          (= u "/trickle") (st/Streamed 200 {} (pieces 8 100))
+          (= u "/stream") (st/Streamed 200 {"x-s" ["1"]} (pieces 5 0))
+          (= u "/big") (st/Whole (Response 200 {} (pattern (parse-status (param r "n")))))
+          (= u "/close") (st/Whole (Response 200 {"connection" ["close"]} (str-bytes "bye")))
+          (= u "/rot") (st/Whole (Response 200 {"content-encoding" ["x-rev"]} (str-bytes "olleh")))
+          (= u "/target") (ok (str "target:" (. r request-method)))
+          (starts-with? u "/status/") (st/Whole (text-response (parse-status (str-slice u 8 (str-len u))) "status"))
+          :else (ok "root"))))
+(defun parse-status (t: str) -> i64 (loop [i 0 n 0] (if (= i (str-len t)) n (recur (+ i 1) (+ (* n 10) (- (zext i64 (str-byte-at t i)) 48))))))
+(defun reverse-decoder () -> Decoder
+  (Decoder "x-rev" (fn (b: (Array i8)) (Ok (let [n (array-len b) out (cell (array n 0i8))] (do (dotimes (i n) (array-set! &out i (array-get b (- (- n 1) i)))) @out))))))
+
+(defun pipe-options () -> Options
+  (let [lf (loopback-factory handler (st/default-options))]
+    (with-factory (with-factory (default-options) "http" lf) "https" lf)))
+(defun build (o: Options) -> Client (match (c/build-http-client o) ((Ok x) x) ((Err e) (trap (error-message e)))))
+(defun get (cl: Client url: str) -> (Result Response Error) (c/request-with cl (ClientRequest "GET" url {} (array 0 0i8))))
+(defun send (cl: Client method: str url: str headers: (Map str (Vec str)) body: str) -> (Result Response Error)
+  (c/request-with cl (ClientRequest method url headers (str-bytes body))))
+(defun body-or (r: (Result Response Error)) -> str (match r ((Ok x) (text-of x)) ((Err e) (str "ERR " (error-message e)))))
+(defun status-or (r: (Result Response Error)) -> i64 (match r ((Ok x) (. x status)) ((Err _) -1)))
+(defun err-kind (r: (Result Response Error)) -> str
+  (match r ((Ok _) "ok") ((Err e) (match e ((Timeout p _) (str "timeout-" p)) ((DnsError _) "dns") ((ConnectError _) "connect") ((TlsUnsupported _) "tls-unsupported")
+    ((RedirectLoop _) "redirect-loop") ((RedirectRefused _) "redirect-refused") ((LimitError _) "too-large") ((ProtocolError _) "protocol") ((StatusError _) "status")
+    ((InvalidRequest _) "invalid") (_ "other")))))
+;; "" when held, else the message: a check's failure travels as text so the scenario shows what differed.
+(defun want (label: str expected: str actual: str) -> str (if (= expected actual) "" (str label ": expected " (pr-str expected) " got " (pr-str actual) "\n")))
+(defun wanti (label: str expected: i64 actual: i64) -> str (want label (str expected) (str actual)))
+
+;; ---- one body of checks, run over both transports ----
+(defun basic (cl: Client base: str) -> str
+  (str-join [(want "get" "root" (body-or (get cl (str base "/"))))
+             (want "post echo" "ping" (body-or (send cl "POST" (str base "/echo") {} "ping")))
+             (want "put method" "PUT:x" (body-or (send cl "PUT" (str base "/m") {} "x")))
+             (want "empty post" "POST:" (body-or (send cl "POST" (str base "/m") {} "")))
+             (want "head" "" (body-or (send cl "HEAD" (str base "/") {} "")))
+             (wanti "head status" 200 (status-or (send cl "HEAD" (str base "/") {} "")))
+             (want "delete" "DELETE:" (body-or (send cl "DELETE" (str base "/m") {} "")))
+             (want "404 is a StatusError" "status" (err-kind (get cl (str base "/status/404"))))
+             (want "204 has no body" "" (body-or (get cl (str base "/status/204"))))
+             (want "host header" (str-slice base 7 (str-len base)) (body-or (get cl (str base "/h/host"))))
+             (wanti "1 MiB body" 1048576 (match (get cl (str base "/big?n=1048576")) ((Ok x) (array-len (. x body))) (_ -1)))
+             (wanti "70000 byte upload echoed" 70000 (match (c/request-with cl (ClientRequest "POST" (str base "/echo") {} (pattern 70000))) ((Ok x) (array-len (. x body))) (_ -1)))
+             (want "date header" "29" (match (get cl (str base "/")) ((Ok x) (str (str-len (unwrap-or (header (. x headers) "date") "")))) (_ "-")))
+             (want "content-length derived" "4" (body-or (send cl "POST" (str base "/h/content-length") {} "abcd")))]))
+(defun redirects (cl: Client base: str) -> str
+  (let [follow (build (with (pipe-options) (follow-redirects true)))
+        to (fn (status: i64 t: str) (str base "/redir/" status "?to=" t))]
+    (str-join [(want "not followed by default" "302" (str (status-or (get cl (to 302 "/target")))))
+               (want "301 GET" "target:GET" (body-or (get follow (to 301 "/target"))))
+               (want "301 POST becomes GET" "target:GET" (body-or (send follow "POST" (to 301 "/target") {} "data")))
+               (want "302 POST becomes GET" "target:GET" (body-or (send follow "POST" (to 302 "/target") {} "data")))
+               (want "303 POST becomes GET" "target:GET" (body-or (send follow "POST" (to 303 "/target") {} "data")))
+               (want "303 PUT becomes GET" "target:GET" (body-or (send follow "PUT" (to 303 "/target") {} "data")))
+               (want "303 HEAD stays HEAD" "200" (str (status-or (send follow "HEAD" (to 303 "/target") {} ""))))
+               (want "307 POST keeps method and body" "POST:data" (body-or (send follow "POST" (to 307 "/m") {} "data")))
+               (want "308 PUT keeps method and body" "PUT:data" (body-or (send follow "PUT" (to 308 "/m") {} "data")))
+               (want "301 PUT keeps method and body" "PUT:data" (body-or (send follow "PUT" (to 301 "/m") {} "data")))
+               (want "relative Location" "target:GET" (body-or (get follow (to 302 "../target"))))
+               (want "loop" "redirect-loop" (err-kind (get follow (str base "/loop/a"))))
+               (want "limit" "redirect-loop" (err-kind (get (build (with (pipe-options) (follow-redirects true) (max-redirects 2)))
+                                                            (to 302 "/redir/302?to=/redir/302?to=/target"))))
+               (want "exactly at the limit" "target:GET" (body-or (get (build (with (pipe-options) (follow-redirects true) (max-redirects 2)))
+                                                                       (to 302 "/redir/302?to=/target"))))
+               (want "authorization kept on the same origin" "Bearer t" (body-or (send follow "GET" (to 302 "/h/authorization") {"authorization" ["Bearer t"]} "")))
+               (want "https to http is refused" "redirect-refused" (err-kind (get follow "https://pipe.test/redir/302?to=http://pipe.test/target")))
+               (want "http to https is followed" "target:GET" (body-or (get follow "http://pipe.test/redir/302?to=https://pipe.test/target")))])))
+(defun streaming (cl: Client base: str) -> str
+  (match (c/request-stream cl (ClientRequest "GET" (str base "/stream") {} (array 0 0i8)))
+    ((Err e) (str "stream: " (error-message e)))
+    ((Ok sr) (let [chunks (loop [n 0 out ""] (match (next-chunk (. sr body))
+                              ((Ok b) (if (= (array-len b) 0) (str n "|" out) (recur (+ n 1) (str out (str-from-bytes b)))))
+                              ((Err e) (str "ERR " (error-message e)))))]
+      (want "streamed chunks" "5|piece-1;piece-2;piece-3;piece-4;piece-5;" chunks)))))
+
+(defun run-on-sockets (f: (fn (str) str)) -> str
+  (match (sv/run-server-reply handler (with (st/default-options) (port 0)))
+    ((Err e) (str "no server: " (error-message e)))
+    ((Ok srv) (let [out (f (str "http://127.0.0.1:" (sv/port srv)))] (do (sv/stop-server srv) out)))))
+
+(defun reuse (o: Options base: str) -> str
+  (let [cl (build o)]
+    (do (dotimes (i 5) (get cl (str base "/")))
+        (let [s (c/pool-stats cl)
+              a (str "opened " (. s opened) " reused " (. s reused) " idle " (. s idle))
+              _ (get cl (str base "/close"))
+              _ (get cl (str base "/"))
+              s2 (c/pool-stats cl)]
+          (do (c/close-http-client cl)
+              (str-join [(want "five requests share one connection" "opened 1 reused 4 idle 1" a)
+                         (want "Connection: close ends reuse (a new connection follows)" "2" (str (. s2 opened)))]))))))
+(defun no-reuse (o: Options base: str) -> str
+  (let [cl (build (with o (max-idle-per-host 0)))]
+    (do (dotimes (i 3) (get cl (str base "/")))
+        (let [s (c/pool-stats cl)] (do (c/close-http-client cl) (want "max-idle 0 opens one per request" "3 0 0" (str (. s opened) " " (. s reused) " " (. s idle))))))))
+(defun pool-limit (o: Options base: str) -> str
+  (let [cl (build (with o (max-idle-per-host 2)))
+        open (fn (n: i64) (vec (map (fn (i: i64) (c/request-stream cl (ClientRequest "GET" (str base "/stream") {} (array 0 0i8)))) (range n))))
+        rs (open 4)]
+    (do (dotimes (i 4) (match (nth rs i) ((Ok sr) (loop [] (match (next-chunk (. sr body)) ((Ok b) (if (= (array-len b) 0) () (recur))) (_ ())))) (_ ())))
+        (let [s (c/pool-stats cl)] (do (c/close-http-client cl)
+          (want "four live connections, two kept" "4 2" (str (. s opened) " " (. s idle))))))))
+(defun after-close (o: Options base: str) -> str
+  (let [cl (build o)]
+    (do (c/close-http-client cl)
+        (want "a closed client refuses" "other" (err-kind (get cl (str base "/")))))))
+
+(defspecs specs
+  (feature "client and server over the in-memory pipe transport"
+    (scenario "basic requests, bodies, HEAD, errors, Host, Date" (then (expect = "" (basic (build (pipe-options)) "http://pipe.test"))))
+    (scenario "the redirect matrix" (then (expect = "" (redirects (build (pipe-options)) "http://pipe.test"))))
+    (scenario "a response is streamed chunk by chunk" (then (expect = "" (streaming (build (pipe-options)) "http://pipe.test"))))
+    (scenario "keep-alive reuse counts" (then (expect = "" (reuse (pipe-options) "http://pipe.test"))))
+    (scenario "max-idle-per-host 0 reuses nothing" (then (expect = "" (no-reuse (pipe-options) "http://pipe.test"))))
+    (scenario "the pool keeps at most max-idle-per-host connections" (then (expect = "" (pool-limit (pipe-options) "http://pipe.test"))))
+    (scenario "a closed client" (then (expect = "" (after-close (pipe-options) "http://pipe.test"))))
+    (scenario "an IPv6 literal is bracketed in Host" (then (expect = "[::1]:8081" (body-or (get (build (pipe-options)) "http://[::1]:8081/h/host")))))
+    (scenario "Expect: 100-continue: the body follows the interim response"
+      (then (expect = "POST:payload" (body-or (send (build (pipe-options)) "POST" "http://pipe.test/m" {"expect" ["100-continue"]} "payload")))))
+    (scenario "Cross-origin redirects drop credentials (a different port is another origin)"
+      (given [cl (build (with (pipe-options) (follow-redirects true)))])
+      (then (expect = "none" (body-or (send cl "GET" "http://pipe.test/redir/302?to=http://pipe.test:81/h/authorization" {"authorization" ["Bearer t"] "cookie" ["a=b"]} "")))
+            (expect = "none" (body-or (send cl "GET" "http://pipe.test/redir/302?to=http://other.test/h/cookie" {"authorization" ["Bearer t"] "cookie" ["a=b"]} "")))))
+    (scenario "the decoder seam: a registered decoder decodes, none leaves the body and the header"
+      (given [with-d (build (with-decoder (pipe-options) (reverse-decoder))) without (build (pipe-options))]
+        )
+      (then (expect = "hello" (body-or (get with-d "http://pipe.test/rot")))
+            (expect = "olleh" (body-or (get without "http://pipe.test/rot")))
+            (expect = "x-rev" (body-or (get with-d "http://pipe.test/h/accept-encoding")))
+            (expect = "none" (body-or (get without "http://pipe.test/h/accept-encoding")))
+            (expect = (some "x-rev") (match (get without "http://pipe.test/rot") ((Ok x) (header (. x headers) "content-encoding")) (_ nil))))))
+  (feature "client and server over localhost sockets"
+    (scenario "basic requests, bodies, HEAD, errors, Host, Date" (then (expect = "" (run-on-sockets (fn (base: str) (basic (build (default-options)) base))))))
+    (scenario "the redirect matrix over one real server"
+      (then (expect = "" (run-on-sockets (fn (base: str) (str-join [(want "301 POST" "target:GET" (body-or (send (build (with (default-options) (follow-redirects true))) "POST" (str base "/redir/301?to=/target") {} "d")))
+                                                                   (want "307 POST" "POST:d" (body-or (send (build (with (default-options) (follow-redirects true))) "POST" (str base "/redir/307?to=/m") {} "d")))]))))))
+    (scenario "keep-alive reuse counts" (then (expect = "" (run-on-sockets (fn (base: str) (reuse (default-options) base))))))
+    (scenario "max-idle-per-host 0 reuses nothing" (then (expect = "" (run-on-sockets (fn (base: str) (no-reuse (default-options) base))))))
+    (scenario "the pool keeps at most max-idle-per-host connections" (then (expect = "" (run-on-sockets (fn (base: str) (pool-limit (default-options) base))))))
+    (scenario "chunked streaming"  (then (expect = "" (run-on-sockets (fn (base: str) (streaming (build (default-options)) base))))))
+    (scenario "four asynchronous requests each own a client"
+      (then (expect = "root root root root"
+              (run-on-sockets (fn (base: str) (let [ts (vec (map (fn (i: i64) (c/request-async (ClientRequest "GET" (str base "/") {} (array 0 0i8)) (default-options))) (range 4)))]
+                                                (str-join (vec (interpose " " (vec (map (fn (t: (Task (Result Response Error))) (body-or (join t))) ts)))))))))))
+    (scenario "a connection refused, an unknown host, an unsupported scheme"
+      (then (expect = "connect" (err-kind (get (build (default-options)) "http://127.0.0.1:1/")))
+            (expect = "dns" (err-kind (get (build (default-options)) "http://no-such-host.invalid/")))
+            (expect = "invalid" (err-kind (get (build (default-options)) "ftp://127.0.0.1/"))))))
+  (feature "https without a TLS driver is refused, never downgraded"
+    (scenario "the default options have no https factory: a typed error and no connection is attempted"
+      (given [cl (build (default-options))])
+      (then (expect = "tls-unsupported" (err-kind (get cl "https://127.0.0.1:1/")))
+            (expect = 0 (. (c/pool-stats cl) opened))))
+    (scenario "a factory registered for https is the one used (the seam TLS plugs into)"
+      (then (expect = "root" (body-or (get (build (pipe-options)) "https://pipe.test/"))))))
+  (feature "deadlines are real and bounded"
+    (scenario "a slow handler against a read timeout is Timeout read, in about a tenth of a second"
+      (given [cl (build (with (pipe-options) (read-timeout-ms 100)))
+              t0 (time/clock-now)
+              r (get cl "http://pipe.test/slow")
+              elapsed (quot (- (time/clock-now) t0) 1000000)]
+        )
+      (then (expect = "timeout-read" (err-kind r)) (expect = true (< elapsed 500))))
+    (scenario "a trickling stream stays under the read timeout but exceeds the total deadline"
+      (given [cl (build (with (pipe-options) (read-timeout-ms 400) (timeout-ms 300)))
+              t0 (time/clock-now)
+              r (get cl "http://pipe.test/trickle")
+              elapsed (quot (- (time/clock-now) t0) 1000000)]
+        )
+      (then (expect = "timeout-total" (err-kind r)) (expect = true (< elapsed 700))))
+    (scenario "the same trickle with no deadlines completes"
+      (then (expect = "piece-1;piece-2;piece-3;piece-4;piece-5;piece-6;piece-7;piece-8;" (body-or (get (build (pipe-options)) "http://pipe.test/trickle")))))
+    (scenario "a response larger than max-response-bytes is too-large"
+      (then (expect = "too-large" (err-kind (get (build (with (pipe-options) (max-response-bytes 1000))) "http://pipe.test/big?n=2000")))))))
+
+(defun main () -> i64 (run-main (specs)))

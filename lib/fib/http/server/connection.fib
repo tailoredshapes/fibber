@@ -1,52 +1,64 @@
-;; A worker owns each accepted connection until this function returns.
-(ns fib.http.server.connection (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes fib.http.server.types)
-  (:require [fib.http.server.reader :as r] [fib.http.server.body :as b]
-            [fib.http.server.transport :as t] [fib.http.server.date :as d] [fib.http.wire :as w] [fib.os.errors :as os]))
-(defun acknowledge :private (fd: i64 head: w/RequestHead o: Options stop: (Atom bool)) -> (Result unit Error)
+;; One connection: a loop of requests over a Transport, on the task that owns it. Between requests the connection waits in slices of 100 ms so a
+;; graceful stop (stop is set) closes it promptly; a request in flight is always finished. Deadlines are armed before every wait: idle, then the
+;; head (absolute from its first byte), then the body.
+(ns fib.http.server.connection (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes fib.http.wire
+                                     fib.http.transport fib.http.reader fib.http.body fib.http.server.types fib.http.server.reply)
+  (:require [fib.os.time :as time]))
+(defun ms (n: i64) -> i64 (* n 1000000))
+(defun await-request :private (t: Transport r: Reader o: Options stop: (Atom bool)) -> (Result bool Error)
+  (let [limit (+ (time/clock-now) (ms (. o idle-timeout-ms)))]
+    (loop []
+      (cond (or @stop (>= (time/clock-now) limit)) (Ok false)
+            :else (do (t-deadline t (min limit (+ (time/clock-now) (ms 100))))
+                      (match (fill r) ((Ok b) (Ok b)) ((Err (Timeout _ _)) (recur)) ((Err e) (Err e))))))))
+(defun acknowledge :private (t: Transport head: RequestHead mode: BodyMode) -> (Result unit Error)
   (let [values (header-values (. head headers) "expect")]
     (cond (= (count values) 0) (Ok ())
           (and (= (count values) 1) (= (ascii-lower (nth values 0)) "100-continue"))
-          (t/send-all fd (str-bytes "HTTP/1.1 100 Continue\r\n\r\n") (. o request-timeout-ms) stop)
+          (match mode ((NoBody) (Ok ())) (_ (t-write t (str-bytes "HTTP/1.1 100 Continue\r\n\r\n"))))
           :else (Err (ProtocolError "unsupported HTTP expectation")))))
-(defun read-request :private (in: r/Input fd: i64 head: w/RequestHead o: Options peer: str stop: (Atom bool))
-  -> (Result Request Error)
+(defun read-request :private (t: Transport r: Reader head: RequestHead o: Options peer: str) -> (Result Request Error)
   (try-let [_ (if (and (= (. head version) "HTTP/1.0") (some? (header (. head headers) "transfer-encoding")))
                   (Err (ProtocolError "HTTP/1.0 request cannot use Transfer-Encoding")) (Ok ()))
-            mode (w/request-framing (. head headers) (. o max-body-bytes))
-            _ (acknowledge fd head o stop)
-            body (b/read-body in mode (. o max-body-bytes) (. o max-header-bytes))]
-    (Ok (Request (. head request-method) (. head uri) (. head query-string) (. head headers)
-      (. body fst) (. body snd) (. head version) peer (. o port)))))
-(defun reply :private (fd: i64 response: Response method: str keep: bool o: Options stop: (Atom bool)) -> (Result unit Error)
-  (let [dated (if (some? (header (. response headers) "date")) response (with-header response "date" (d/http-date)))
-        encoded (w/response-bytes dated method keep)]
-    (match encoded
-      ((Ok bytes) (t/send-all fd bytes (. o request-timeout-ms) stop))
-      ((Err _) (try-let [bytes (w/response-bytes (text-response 500 "Invalid handler response\n") method false)]
-        (do (t/send-all fd bytes (. o request-timeout-ms) stop) (Err (InvalidRequest "invalid handler response"))))))))
+            mode (request-framing (. head headers) (. o max-body-bytes))
+            _ (acknowledge t head mode)
+            _ (Ok (t-deadline t (+ (time/clock-now) (ms (. o request-timeout-ms)))))
+            bd (Ok (body-reader r mode (. o max-body-bytes) (. o max-header-bytes)))
+            b (read-all bd (. o max-body-bytes))]
+    (Ok (Request (. head request-method) (. head uri) (. head query-string) (. head headers) b (trailers bd) (. head version) peer (. o port)))))
 (defun failure-status :private (error: Error) -> i64
-  (match error ((LimitError s) (if (or (some? (str-find s "header" 0)) (some? (str-find s "line" 0))) 431 413))
-    ((TransportError n _) (if (= (os/kind-for-code n) os/TimedOut) 408 400))
-    ((ProtocolError s) (cond (= s "unsupported HTTP expectation") 417
-                            (= s "unsupported HTTP transfer encoding") 501 :else 400)) (_ 400)))
-(defun fail :private (fd: i64 error: Error o: Options stop: (Atom bool)) -> unit
-  (match error ((Cancelled) ())
-    (_ (do (reply fd (text-response (failure-status error) (str (error-message error) "\n")) "GET" false o stop) ()))))
-(defun handle-one :private (fd: i64 in: r/Input text: str handler: (fn :send (Request) Response)
-  o: Options peer: str stop: (Atom bool) number: i64) -> (Result bool Error)
-  (try-let [head (w/parse-request-head text) request (read-request in fd head o peer stop)]
-    (let [response (handler request)
-          keep (and (w/keep-alive? head) (< number (. o max-requests-per-connection))
-                    (not (header-token? (. response headers) "connection" "close")) (not @stop))]
-      (try-let [_ (reply fd response (. head request-method) keep o stop)] (Ok keep)))))
-(defun serve-connection (fd: i64 peer: str handler: (fn :send (Request) Response) o: Options stop: (Atom bool)) -> unit
-  (let [in (r/input fd stop (. o max-line-bytes))]
+  (match error
+    ((LimitError s) (if (or (some? (str-find s "header" 0)) (some? (str-find s "line" 0))) 431 413))
+    ((Timeout _ _) 408)
+    ((ProtocolError s) (cond (= s "unsupported HTTP expectation") 417 (= s "unsupported HTTP transfer encoding") 501 :else 400))
+    (_ 400)))
+(defun fail :private (t: Transport error: Error o: Options) -> unit
+  (match error ((Cancelled) ()) ((Closed) ()) ((TransportError _ _) ())
+    (_ (do (t-deadline t (+ (time/clock-now) (ms (. o request-timeout-ms))))
+           (error-reply t (failure-status error) (error-message error))))))
+(defun keep? :private (head: RequestHead reply: Reply number: i64 o: Options stop: (Atom bool)) -> bool
+  (and (keep-alive? head) (< number (. o max-requests-per-connection)) (not @stop)
+       (match reply ((Whole r) (not (header-token? (. r headers) "connection" "close"))) (_ true))))
+(defun handle-one :private (t: Transport r: Reader text: str handler: (fn :send (Request) Reply) o: Options peer: str
+                            stop: (Atom bool) number: i64) -> (Result bool Error)
+  (try-let [head (parse-request-head text (. o max-header-bytes) (. o max-headers)) request (read-request t r head o peer)]
+    (let [reply (handler request) keep (keep? head reply number o stop)]
+      (do (t-deadline t (+ (time/clock-now) (ms (. o request-timeout-ms))))
+          (try-let [_ (send-reply t reply (. head request-method) keep (. head version))] (Ok keep))))))
+(defun head-of :private (t: Transport r: Reader o: Options) -> (Result (Option str) Error)
+  (do (t-deadline t (+ (time/clock-now) (ms (min (. o header-timeout-ms) (. o request-timeout-ms)))))
+      (read-head r (. o max-header-bytes) (. o max-line-bytes) (+ (. o max-headers) 1))))
+(defun serve-connection (t: Transport handler: (fn :send (Request) Reply) o: Options stop: (Atom bool)) -> unit
+  (let [r (reader t)]
     (loop [number 1]
-      (do (r/begin-request in (. o request-timeout-ms))
-        (match (r/read-head in (. o max-header-bytes))
-          ((Err error) (fail fd error o stop))
-          ((Ok nil) ())
-          ((Ok (some text))
-            (match (handle-one fd in text handler o peer stop number)
-              ((Err error) (fail fd error o stop))
-              ((Ok keep) (if keep (recur (+ number 1)) ())))))))))
+      (match (await-request t r o stop)
+        ((Ok false) ())
+        ((Err _) ())
+        ((Ok true)
+          (match (head-of t r o)
+            ((Err error) (fail t error o))
+            ((Ok nil) ())
+            ((Ok (some text))
+              (match (handle-one t r text handler o (. t peer) stop number)
+                ((Err error) (fail t error o))
+                ((Ok keep) (if keep (recur (+ number 1)) ()))))))))))

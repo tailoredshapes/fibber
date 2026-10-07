@@ -1,0 +1,40 @@
+;; One request/response exchange on a connection: write the request, read the final response head (skipping interim 1xx, honouring
+;; Expect: 100-continue), frame the body. The connection is neither closed nor pooled here: the caller decides, from Reply.reusable and from
+;; whether the body ran to its end. Deadlines are armed before every wait: the request's total deadline, or the read timeout, the nearer.
+(ns fib.http.client.exchange (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes fib.http.wire fib.http.message
+                                   fib.http.transport fib.http.reader fib.http.body fib.http.client.types fib.http.client.pool)
+  (:require [fib.os.time :as time]))
+(defstruct Reply (head: ResponseHead body: Body reusable: bool))
+(defun soonest :private (a: i64 b: i64) -> i64 (cond (= a 0) b (= b 0) a :else (min a b)))
+(defun arm (o: Options c: Conn total: i64) -> unit
+  (t-deadline (. c t) (soonest total (if (> (. o read-timeout-ms) 0) (+ (time/clock-now) (* (. o read-timeout-ms) 1000000)) 0))))
+(defun armed-body (o: Options c: Conn total: i64 b: Body) -> Body
+  (Body (fn () (do (arm o c total) (next-chunk b))) (fn () (trailers b)) (fn () (finished? b))))
+(defun read-response-head :private (o: Options c: Conn) -> (Result ResponseHead Error)
+  (try-let [text (read-head (. c r) (. o max-header-bytes) (. o max-line-bytes) (+ (. o max-headers) 1))]
+    (match text (nil (Err Closed)) ((some t) (parse-response-head t (. o max-headers))))))
+(defun expects? :private (headers: (Map str (Vec str)) body: (Array i8)) -> bool
+  (and (> (array-len body) 0) (header-token? headers "expect" "100-continue")))
+;; Reads heads until a final one. sent? says the body is already on the wire; an interim 100 releases a body held back, and 1s without
+;; any answer sends it anyway (a server that ignores Expect).
+(defun final-head :private (o: Options c: Conn total: i64 body: (Array i8) hold: bool) -> (Result (Pair ResponseHead bool) Error)
+  (loop [held hold]
+    (do (arm o c (if held (soonest total (+ (time/clock-now) 1000000000)) total))
+      (match (read-response-head o c)
+        ((Ok h) (cond (and (= (. h status) 100) held) (try-let [_ (t-write (. c t) body)] (recur false))
+                      (< (. h status) 200) (recur held)
+                      :else (Ok (Pair h held))))
+        ((Err (Timeout _ _)) (if (and held (or (= total 0) (< (time/clock-now) total)))
+                               (try-let [_ (t-write (. c t) body)] (recur false)) (Err (Timeout "io" "read timed out"))))
+        ((Err e) (Err e))))))
+(defun exchange (o: Options c: Conn method: str target: str headers: (Map str (Vec str)) body: (Array i8) total: i64)
+  -> (Result Reply Error)
+  (let [head (request-head-bytes method target headers) hold (expects? headers body)]
+    (do (arm o c total)
+      (try-let [_ (t-write (. c t) (if hold head (if (< (array-len body) 65536) (concat-bytes [head body]) head)))
+                _ (if (or hold (< (array-len body) 65536)) (Ok ()) (t-write (. c t) body))
+                got (final-head o c total body hold)]
+        (let [h (. got fst) unsent (. got snd)]
+          (try-let [mode (response-framing method (. h status) (. h headers))]
+            (Ok (Reply h (armed-body o c total (body-reader (. c r) mode (. o max-response-bytes) (. o max-header-bytes)))
+                       (and (not unsent) (response-reusable? (. h version) (. h headers) mode))))))))))

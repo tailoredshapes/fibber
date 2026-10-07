@@ -1,0 +1,45 @@
+;; Helpers for testing HTTP code without sockets: parse a message that arrives in any fragmentation (over the scripted Transport), cut a message at
+;; chosen offsets, and a loopback Factory whose connections are served by a native server over a pair of pipes. Used by the specs of fib.http and
+;; usable by any program that tests a client or a handler.
+(ns fib.http.testing (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes fib.http.wire fib.http.message
+                           fib.http.transport fib.http.reader fib.http.body fib.http.tcp fib.http.server.types fib.http.server.connection))
+(defstruct Parsed (status: i64 headers: (Map str (Vec str)) body: (Array i8) trailers: (Map str (Vec str)) rest: i64))
+(defstruct ParsedRequest (method: str target: str version: str headers: (Map str (Vec str)) body: (Array i8) trailers: (Map str (Vec str)) rest: i64))
+;; Cuts bytes at the given offsets (taken modulo the length, sorted, deduplicated): the chunks a peer's writes could arrive as.
+(defun split-at (bytes: (Array i8) cuts: (Vec i64)) -> (Vec (Array i8))
+  (let [n (array-len bytes)
+        points (if (= n 0) [] (vec (sort (vec (distinct (map (fn (c: i64) (rem (if (< c 0) (- 0 c) c) n)) cuts))))))]
+    (loop [i 0 start 0 out: (Vec (Array i8)) []]
+      (if (= i (count points)) (conj out (array-copy bytes start n))
+        (let [p (nth points i)] (recur (+ i 1) p (if (= p start) out (conj out (array-copy bytes start p)))))))))
+(defn response-of
+  ([chunks: (Vec (Array i8)) method: str] -> (Result Parsed Error) (response-of chunks method 1048576))
+  ([chunks: (Vec (Array i8)) method: str limit: i64] -> (Result Parsed Error)
+    (let [r (reader (. (scripted chunks) fst))]
+      (try-let [text (read-head r 65536 8192 101)]
+        (match text (nil (Err Closed))
+          ((some t) (try-let [h (parse-response-head t) mode (response-framing method (. h status) (. h headers))]
+            (let [b (body-reader r mode limit 65536)]
+              (try-let [bytes (read-all b limit)]
+                (Ok (Parsed (. h status) (. h headers) bytes (trailers b) (buffered r))))))))))))
+(defn request-of
+  ([chunks: (Vec (Array i8))] -> (Result ParsedRequest Error) (request-of chunks 1048576 65536 100))
+  ([chunks: (Vec (Array i8)) limit: i64 max-bytes: i64 max-headers: i64] -> (Result ParsedRequest Error)
+    (let [r (reader (. (scripted chunks) fst))]
+      (try-let [text (read-head r max-bytes 8192 (+ max-headers 1))]
+        (match text (nil (Err Closed))
+          ((some t) (try-let [h (parse-request-head t max-bytes max-headers) mode (request-framing (. h headers) limit)]
+            (let [b (body-reader r mode limit 65536)]
+              (try-let [bytes (read-all b limit)]
+                (Ok (ParsedRequest (. h request-method) (. h uri) (. h version) (. h headers) bytes (trailers b) (buffered r))))))))))))
+;; A Factory whose connections are pipes served by a native server task: no sockets, real deadlines. The task gets only descriptors and builds
+;; its own Transport.
+(defun serve-pipe-task :private (a: i64 b: i64 c: i64 d: i64 handler: (fn :send (Request) Reply) o: Options) -> i64
+  (let [t (pipe-end-b [a b c d])] (do (serve-connection t handler o (atom false)) (t-close t) 0)))
+(defun loopback-factory (handler: (fn :send (Request) Reply) o: Options) -> Factory
+  (Factory "loopback"
+    (fn (target: Target)
+      (match (pipe-fds)
+        ((Err e) (Err e))
+        ((Ok fds) (do (spawn (fn () (serve-pipe-task (nth fds 0) (nth fds 1) (nth fds 2) (nth fds 3) handler o)))
+                      (Ok (pipe-end-a fds))))))))

@@ -1,180 +1,145 @@
-# HTTP client and server
+# HTTP client and server (HTTP-1)
 
-The library has a Ring-style HTTP/1.1 server and a Hato-style client. Hato is a
-client around Java's HTTP stack; Fibber's client uses libcurl as its native
-transport. Protocol handling, data structures, options, and server scheduling
-live in Fibber. The server uses POSIX sockets through the shared `fib.os` transport boundary.
+`fib.http` is a native HTTP/1.1 implementation: one message layer, a `Transport` seam under it, a client and a server on top. There is no libcurl and no
+`extern` in `lib/fib/http` (ADR 0011): sockets, polling and name resolution are `fib.os.net`, the clock is `fib.os.time`. The libcurl client and its
+`:lib "curl"` driver were removed by this package; the ADR's allow-list lost `http/server/date` (the date is computed in fibber) and the driver row.
 
-Requests and responses hold immutable headers and binary byte arrays. Header
-names are case-insensitive; repeated values, especially Set-Cookie, remain
-separate. UTF-8 conversion is explicit and returns an error for invalid bytes.
-Handlers are functions from a request to a response; middleware composes those
-functions. Model options are typed structures with defaults and `with` updates.
+The public API is the [library README](../../lib/fib/http/README.md). This file is the architecture, the limits, the security notes and what is deferred.
 
-Server framing accepts HTTP/1.0 and HTTP/1.1, fixed and chunked request bodies,
-100-continue, HEAD, keep-alive, and pipelined requests. It rejects ambiguous
-framing, duplicate Host and Content-Length fields, obsolete line folding, and
-header injection. Headers, lines, bodies, chunk counts, request times, worker
-counts, and requests per connection have bounds. Shutdown stops acceptance and
-joins workers; raw descriptors are closed on every ordinary error path.
+## Layers
 
-The client supports synchronous and native-task requests, reusable connections,
-binary request and response bodies, repeated headers, encoded query and form
-parameters, redirects, timeouts, decompression, and verified HTTPS. A reusable
-client is local to its thread; asynchronous requests own separate clients.
-Failures return Result values; HTTP status errors retain their response.
+```
+fib.http.client            fib.http.server           the two facades (Hato- and Ring-shaped, as before)
+  client/run   pool          server/connection reply   the engines: redirects, pool, deadlines | the request loop, replies
+fib.http.body   fib.http.message   fib.http.wire        framing: streaming bodies, chunked, response head | request head, header lines
+fib.http.reader                                          bytes -> lines and counted reads, with byte bounds checked before storing
+fib.http.transport   fib.http.tcp                        the seam | descriptors: TCP, pipes; connect (with getaddrinfo) in fib.os.net
+fib.os.net  fib.os.io  fib.os.time                       the platform layer (extern lives only here)
+```
 
-Protocol cases are written before implementation. Integration checks use a
-Python HTTP implementation and raw sockets, including fragmented requests,
-chunked bodies, connection reuse, rejection paths, concurrency, and local TLS.
+`fib.http.uri` (RFC 3986), `fib.http.url` (query and form encoding, Base64), `fib.http.headers`, `fib.http.types` and `fib.http.bytes` are pure.
+`fib.http.testing` has the helpers the specs use and any program may: a message parsed from arbitrary fragmentation, and a loopback `Factory` served by
+the native server over pipes.
 
-## API and ownership
+## The Transport seam (what TLS-1 plugs into)
 
-The [library README](../../lib/fib/http/README.md) is the public API reference.
-`fib.http` is transport-independent; requiring it does not introduce libcurl.
-`fib.http.server` and `fib.http.client` are separate facades. Both use Response,
-binary byte arrays, and maps of header names to vectors of values. The server
-Request separates the encoded URI and query, body, and trailers. ClientRequest
-contains an absolute URL. Options are immutable records updated with `with`.
+```clojure
+(defstruct Transport (read: (fn (i64) (Result (Array i8) Error))   ; at most n bytes; the empty array is end of stream
+                      write: (fn ((Array i8)) (Result unit Error)) ; all of the bytes or an error
+                      close: (fn () unit)                          ; idempotent
+                      set-deadline: (fn (i64) unit)                ; absolute fib.os.time/clock-now ns, 0 = none; read and write observe it
+                      peer: str))
+(defstruct Target (scheme host port connect-timeout-ms ca-file))   ; what a factory opens
+(defstruct Factory (name: str open: (fn :send (Target) (Result Transport Error))))
+```
 
-A Server provides local stop and wait closures over a private state containing
-the listening descriptor, stop atom, and fixed vector of native tasks. Neither
-the descriptor nor its cell is exposed in the public value. Workers
-receive only the descriptor, immutable options, a sendable handler, and the stop
-atom. Each worker owns its accepted descriptor until connection processing
-returns, then closes it. Readers use private cells for the current buffer,
-position, and deadline; a reader never crosses threads.
+A Transport is a value of closures over private state (the pattern of `fib.os.memory-stream`), used by one thread; `spawn` rejects capturing one
+(case 8038). A deadline that passes makes a read or write fail with `(Timeout "io" ..)`; the client renames it `read` or `total`, the server answers 408.
+`Error` is the engine's, so a transport reports its own failures in HTTP's terms (`ConnectError`, `Timeout "connect"`, `DnsError`, `TransportError`).
 
-A reusable Client provides local request and close closures over a private
-libcurl handle cell and immutable options. Requiring Send rejects sharing it,
-as case 7305 demonstrates. Cases 7307 and 7308 reject direct access to native
-handle fields; they originally compiled before this encapsulation. One-shot and
-asynchronous requests
-allocate and close their own clients. libcurl global initialization and cleanup
-are balanced with each client's lifetime. The supported libcurl versions have
-thread-safe global initialization; no Fibber global or hidden mutable pool is
-introduced. Resetting an easy handle between calls clears request options while
-retaining its connection cache. The interoperability check observes one peer
-port across three successive requests from the same client.
+Implementations in this package: `fib.http.tcp` (a connected socket, `connect` through `fib.os.net/resolve-host` and `connect-tcp`), a pair of pipes
+(`pipe-pair`, or the descriptors `pipe-fds` so a task builds its own end), and `fib.http.transport/scripted` (reads from a list of chunks, writes into
+a sink; memory only).
 
-Explicit close operations are idempotent. Ordinary Result errors take the same
-cleanup paths as success: streams, header lists, temporary C strings, and native
-handles are released. Native allocation failure and a handler's `trap` follow
-the language's existing process-abort behavior. Stop cancels socket I/O and
-joins executing handlers; it cannot interrupt an arbitrary user handler.
+The client takes a **Factory per scheme** in `Options.factories` (a `(Map str Factory)`, default `{"http" (tcp-factory)}`; `with-factory` adds one).
+`https` has none by default: the request fails with `(TlsUnsupported "unsupported scheme https: a TLS Transport factory (driver fib.tls) must be
+registered ...")` before any connection is attempted (case 8035 asserts zero connections opened). It is never sent in the clear and never downgraded.
 
-## Protocol engine
+**TLS-1 must:** provide a `Factory` whose `open` makes the TCP connection (`fib.http.tcp/connect host port connect-timeout-ms`, or the Transport it
+returns wrapped), runs the handshake over it with `fib.crypto`, and returns a `Transport` whose `read` and `write` carry application data and whose
+`set-deadline` also bounds the handshake and record reads; `Target.host` is the name to verify, `Target.ca-file` the explicit trust anchor option the old
+client had. Then `(with-factory options "https" (tls/factory ...))` is the whole integration; a server side needs `fib.http.server.connection/serve-connection`
+over a Transport from an accepted socket, which is already how the server works. Nothing in the engine knows the scheme beyond the pool key.
 
-The server keeps unread bytes in one connection buffer, including bytes from
-subsequent pipelined requests. Line reading requires CRLF. Framing is chosen
-before Expect handling or body allocation: no body, an exact Content-Length,
-or chunked. Duplicate lengths and a length combined with Transfer-Encoding
-fail and close the connection. The chunk decoder enforces its decoded size
-and chunk-count limits, checks each chunk's CRLF, and reads bounded trailers.
-Fields that could alter framing or routing are refused in trailers.
+## Message layer (RFC 9112)
 
-The head and body share an absolute request deadline. Reads poll in intervals
-of at most 100 ms so shutdown can wake idle workers. Writes have a separate
-deadline, handle short writes, retry EINTR/EAGAIN, and use MSG_NOSIGNAL. A
-disconnected peer therefore cannot terminate the process through SIGPIPE.
-Accepted sockets are nonblocking, so a writable poll result cannot turn into an
-unbounded blocking send. Two regression tests originally reproduced an 8 MiB
-response exceeding its deadline and shutdown hanging when the peer stopped
-reading. Both pass with nonblocking accepted sockets. The worker pool bounds
-simultaneous handlers and connections; idle keep-alive
-connections retain their worker until the next request deadline. This provides
-a simple synchronous reference architecture rather than an event-loop server.
+- **Reading** (`fib.http.reader`): a line ends at CRLF and nowhere else; a bare LF, a bare CR and a NUL are errors. Each line has a byte bound
+  (`max-line-bytes`), each head a total bound and a line count, all checked before the byte is stored.
+- **Head** (`fib.http.wire`, `fib.http.message`): header names are case-insensitive tokens and are lower-cased; values keep their order and repeats
+  (`Set-Cookie` is never merged); whitespace before the colon, obsolete line folding, a leading space on the first line, a missing colon, an empty
+  name, an invalid method, version or target are `ProtocolError`s. Targets: origin-form, absolute-form (the URL is kept in `uri`), `*`.
+  HTTP/1.0 and 1.1 only. Received header bytes above 127 are kept as Latin-1 characters (as before); every slice of header text is at an ASCII byte
+  (the fuzzer found a slice inside a character that trapped; case 8041).
+- **Framing**: `request-framing` and `response-framing` give `NoBody`, `Fixed n`, `Chunked` or `UntilClose`. Content-Length together with
+  Transfer-Encoding, a repeated Content-Length (including `3, 3`), a non-digit length (`-1`, `+3`, `0x3`, empty, `3 4`), a length beyond i64 or beyond
+  the limit, a Transfer-Encoding other than exactly `chunked` (`xchunked`, `chunked, identity`, a second field) are errors, never resolved in favour
+  of one reading. A response with both is refused too. HEAD, 1xx, 204 and 304 have no body whatever the headers say.
+- **Chunked**: size in hex with overflow checked per digit, extensions after `;` ignored but must be header-value bytes, the CRLF after every chunk
+  checked, trailers parsed into `Body.trailers` (a trailer that could change framing or routing is refused: Content-Length, Transfer-Encoding, Host,
+  Connection, Trailer, Expect), at most 100 trailers.
+- **Bodies are streams** (`fib.http.body`): `Body` yields chunks of the decoded payload, the empty array ends it; `read-all` buffers under a limit.
+  A truncated fixed body or chunk is an error, not a short message. Writing: `write-fixed`, `write-chunked` (a producer pulled until it answers nil).
+- **Content-Encoding** is an optional `Decoder` seam (`Options.decoders`, `with-decoder`): `(Decoder "gzip" (fn :send ((Array i8)) (Result (Array i8) Error)))`
+  inflates a whole body, and `Accept-Encoding` lists the registered names. DEFLATE is not implemented here (zlib is a driver, to be written in its own
+  repo like the crypto ones). With no decoder the body arrives as sent and `content-encoding` is kept (the old client decoded gzip through libcurl).
+- **Limits** are options with safe defaults: header bytes 65536, line 8192, header count 100, body 8 MiB (server) / response 8 MiB (client).
 
-Response framing is derived from actual byte counts. A supplied Content-Length
-or Transfer-Encoding does not override it. HEAD advertises the corresponding
-body size but sends no body. Statuses 204 and 304 omit Content-Length and send
-no body; 205 sends Content-Length zero. Handlers choose whether to close a
-connection through Connection, subject to server limits and shutdown. Invalid
-handler headers become a 500 with a closed connection.
+## Client
 
-HTTP method and header-name tokens are checked as ASCII bytes before slicing.
-This matters for malformed input: case 7300 originally reproduced a runtime
-trap on a non-ASCII name, and now verifies a Result error. UTF-8 body decoding
-checks continuation bytes, shortest encoding, surrogate exclusion, and the
-Unicode maximum. Raw body bytes never undergo this conversion implicitly.
+`request`, `get`, `post`, ... and `build-http-client` with `request-with`, `request-stream`, `pool-stats`, `close-http-client`: the shapes of the libcurl
+client, plus the stream. A client is local to its thread; `request-async` gives each request its own.
 
-## Native client boundary
+- **Errors** (`fib.http.types/Error`, extended): `InvalidRequest`, `ProtocolError`, `LimitError` (too large), `TransportError`, `StatusError response`,
+  `Closed`, `Cancelled` (existing), and new `DnsError`, `ConnectError`, `Timeout phase` (`connect`, `read`, `total`), `TlsUnsupported`, `RedirectLoop`,
+  `RedirectRefused`. Code that matched the old set with a catch-all keeps working (the one thing that does not: `TransportError 28` was libcurl's
+  timeout, now `Timeout`; the fib-hocon change is listed in the package report).
+- **Deadlines**: `connect-timeout-ms` (one connect, clamped to what is left of the total), `read-timeout-ms` (the wait for any one piece of the
+  response; default none), `timeout-ms` (the whole request including redirects; default 30 s). Armed before every wait; the nearer wins.
+- **Redirects** (`client/redirect.fib`, pure): off by default; 301/302/303/307/308 with a Location; 303 becomes GET (HEAD stays), 301 and 302 turn POST into
+  GET, 307 and 308 keep method and body; a method change drops the body and the headers that described it; `authorization`, `cookie` and
+  `proxy-authorization` do not follow a change of origin (scheme, host or port); https to http is refused (`RedirectRefused`); a repeated
+  (method, URL) is `RedirectLoop`, as is exceeding `max-redirects` (default 5). Location is resolved by RFC 3986 section 5.2.
+- **Pool**: per origin (`scheme://host:port`), most recently idle first, `max-idle-per-host` (default 4; 0 disables reuse and sends `Connection: close`),
+  `idle-timeout-ms` (default 30 s, swept on each use), the oldest evicted over the limit. A connection returns to the pool only when its body ran to the
+  end under keep-alive; an unread body closes it (`abandon`). There is no liveness probe: a pooled connection the peer closed fails on first use and,
+  for an idempotent method, is retried once on a fresh connection. `pool-stats` reports connections opened, reuses and idle.
+- **DNS** is `getaddrinfo` (`fib.os.net/resolve-host`, the platform layer; blocking, no timeout; stream sockets; addresses tried in the resolver's
+  order). A native resolver is later work (docs/design/static-linking.md: musl's resolver needs `/etc/hosts` and `/etc/resolv.conf` in the image).
+- `Expect: 100-continue` on a request with a body holds the body until the interim 100 (or one second, or a final status, in which case the body is
+  not sent and the connection is closed). Userinfo in the URL becomes a Basic `Authorization` header.
 
-The implementation uses libcurl's easy API and `fib.os.memory-stream`. A bounded
-FILE stream captures headers and another captures the decoded body. Both
-disable stdio buffering so excess writes become errors during transfer. Each
-buffer has one extra byte for stdio's terminating NUL; `ftell` supplies the
-actual length, including embedded NUL bytes in the payload. Successful captures
-copy only their written prefix into immutable Fibber arrays. The extra-byte
-boundary is tested with bodies exactly at, one byte above, and above a zero
-size limit. No C write callback or temporary file is needed.
+## Server
 
-The bindings assume LP64 and are tested natively on Linux. The OS layer owns
-libc differences; its Darwin source backend is checked separately and still
-requires native macOS/toolchain validation. Opaque C handles use the same integer-address
-convention as the compiler's existing native bindings. Stage 2 currently types
-only the explicitly declared prefix of a `:varargs` extern, so the bindings
-declare libcurl's third argument word explicitly. Pointer values use the LP64
-integer/pointer register representation. Existing runtime declarations such as
-`fclose(ptr)` retain their pointer signature. A general variadic-call inference
-extension remains compiler work, independent of this HTTP implementation.
+`run-server` (Ring-shaped, a handler `Request -> Response`) and `run-server-reply` (a handler returning `Reply`: `(Whole response)` or
+`(Streamed status headers next)`, the body pulled from `next` and sent chunked on HTTP/1.1, close-delimited on 1.0). One acceptor task; one task per
+connection, at most `workers` at once (default 64; beyond it the listener stops accepting and the kernel's backlog queues). A request loop per
+connection: pipelined requests are answered in order, `max-requests-per-connection`, `Connection: close`, HTTP/1.0 semantics, HEAD (the head of the GET,
+no body), 100-continue (sent only after the framing was accepted), `Date` (IMF-fixdate computed in fibber), 408/413/417/431/501/400 answers that close.
 
-Only HTTP and HTTPS URLs and redirects are enabled. TLS chain and hostname
-verification use libcurl's defaults and are never disabled by these options.
-An explicit CA bundle is supported. Redirect following defaults off; enabling
-it has Hato's `:always` behavior and a finite redirect limit. The `:normal`
-policy, cookie jars, streaming, multipart construction, WebSockets, and data
-coercion are outside this initial API, as documented in the public README.
+- **Slowloris**: `idle-timeout-ms` (first byte of the next request, closed silently), `header-timeout-ms` (the whole head from its first byte; never
+  longer than `request-timeout-ms`; a drip of one byte at a time cannot outlive it: 408), `request-timeout-ms` (body, and each write).
+- **Graceful stop**: `stop-server` stops accepting, lets requests in flight finish for up to `drain-timeout-ms` (idle connections close within
+  100 ms), then cancels what is left and closes the listener. Connections queued in the kernel and not yet accepted are reset.
+- Routing is out of scope; the server has `wrap-header` only. Request bodies are buffered (up to `max-body-bytes`) with their trailers; streaming
+  request bodies are not offered (the message layer has them; the server API does not yet).
 
-## Validation
+## Security notes
 
-The nine native cases 7300–7308 pass, covering headers and injection, request
-framing, size overflow, query/form encoding, invalid UTF-8, Base64, response
-framing, server startup/shutdown, client options, and the rejected cross-thread
-client capture and access to native handle fields. Cases are run with the native
-memory audit.
+Request smuggling defences are the framing rules above, tested as a table (specs/http-message-spec.fib: 67 refused shapes whole and one byte at a time,
+13 valid borderline shapes accepted) and by fuzzing (100,000 mutants: no trap, the same result for every fragmentation, every truncation and every
+CRLF-to-LF of a valid request refused). The HTTP/1.0 request with Transfer-Encoding is refused. Responses with ambiguous framing are refused, not guessed.
+Credentials do not cross origins on redirect. `https` never degrades. A hostile peer is bounded in memory by the line, head, body and trailer limits
+and in time by the deadlines; the client's body limit applies to chunked and close-delimited bodies as they stream.
 
-The offline Python suite passes all 27 tests. It exercises each implementation
-against an independent counterpart and also tests Fibber-to-Fibber exchange.
-It verifies four concurrent server handlers and four async client requests,
-descriptor reclamation after repeated requests, repeated response headers,
-gzip, redirects including POST-to-GET on 302, closed handles, size limits,
-fragmentation, pipelining, 100-continue, trailers, timeouts, stalled readers, and disconnected
-peers. A generated local certificate proves that trusted HTTPS succeeds while
-an untrusted certificate and a hostname mismatch both fail. CI runs this suite
-after the stage-2 cases with libcurl and openssl installed.
+## Not done (deferred)
 
-Two integration tests enable Fibber's runtime ownership trace while transferring
-actual messages. They require allocations to be recorded and reject duplicate
-frees, unknown frees, and live owned objects after client or server shutdown.
-Client success, status errors, size errors, connection reuse, and async requests
-are covered. Server binary echo, invalid handler output, and shutdown are covered.
-This audits Fibber-owned values; it does not instrument libcurl or raw C buffers.
+HTTP/2; cookies (not in this package); compression (the Decoder seam only); proxies (`http_proxy`, `no_proxy`, CONNECT: the old client honoured
+libcurl's environment; the design is a Factory that connects to the proxy and, for `https`, issues CONNECT before the TLS factory runs, so it belongs
+with TLS-1); a native DNS resolver and happy eyeballs; a liveness probe for pooled connections; streaming request bodies on the client and the server;
+HTTP pipelining by the client (off by design); a lingering close on the server (a reset instead of a FIN when a peer's bytes are unread at stop).
+Windows is not built or tested; macOS uses the platform layer's Darwin ABI table (`getaddrinfo`'s `ai_addr` offset differs and is chosen by it) and
+was not run.
 
-The full native gate also passes after the OS migration: stage 2 and stage 3
-emit identical lIR; ownership and module cases pass; the standard-library suite
-has its existing 21 open cases and the existing expected 1707 atom-lifetime
-audit failure. There are no new unexpected failures. The OS suite additionally
-checks native ABI conformance against C headers and Darwin backend emission.
-See [the OS design record](os.md) for platform status and compiler integration.
-Both README examples have been built and run together, including binary echo
-and encoded query routes.
+## Tests
 
-Reproduce with `HTTP_FIBC=./F scripts/test-http.sh`. Set HTTP_TEST_OUT to keep
-the built fixtures in a chosen scratch directory; otherwise the script removes
-its temporary directory. It holds `/tmp/fibsuite.lock` to avoid overlap with
-the performance harness.
+`specs/http-message-spec.fib`, `http-uri-spec.fib`, `http-client-spec.fib`, `http-server-spec.fib`, `http-fuzz-spec.fib` (`fibc test specs/http-*-spec.fib`);
+cases 7300-7308 and 8030-8041; `scripts/mutant-http.sh` (18 planted faults, each killed by the spec named in the script);
+`scripts/test-http.sh` (the Python differential suite: 27 tests, the native client against python3 servers and python clients against the native server);
+`scripts/http-diff.sh` (the curl CLI against python's http.server and the native server over 22 requests: identical outcomes); `scripts/bench/http-bench.py`
+and [docs/shootout/http.md](../shootout/http.md) for the measurements.
 
 ## Provenance
 
-[Hato](https://github.com/gnarroway/hato) supplies the API inspiration for a
-small client, reusable native transport, options, and middleware.
-[Ring](https://github.com/ring-clojure/ring/blob/master/SPEC) supplies the request
-and response model. The Fibber implementation is original code; it does not
-copy either project's implementation.
-
-Protocol framing follows [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html).
-The native boundary uses the documented
-[libcurl option API](https://curl.se/libcurl/c/curl_easy_setopt.html),
-[default FILE write transport](https://curl.se/libcurl/c/CURLOPT_WRITEDATA.html),
-and [bounded memory streams](https://man7.org/linux/man-pages/man3/fmemopen.3.html).
+[Ring](https://github.com/ring-clojure/ring/blob/master/SPEC) and [Hato](https://github.com/gnarroway/hato) supplied the API shapes. The code is original.
+Protocol rules follow [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html), [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html) and
+[RFC 3986](https://www.rfc-editor.org/rfc/rfc3986.html).
