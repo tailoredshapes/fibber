@@ -1,0 +1,78 @@
+;; Encoding DNS messages (RFC 1035 4.1, name compression 4.1.4, EDNS0 OPT record RFC 6891). Names are validated first (labels 1..63 printable ASCII bytes, name at most 255 bytes
+;; on the wire), so an encoder failure is a text, never a trap. Compression points at the first earlier occurrence of a whole suffix (offsets below 16384).
+(ns fib.dns.encode (:use fib.core fib.seq fib.coll fib.dns.types) (:require [fib.dns.ip :as ip]))
+(defstruct W :private (buf: (Cell (Vec i64)) names: (Cell (Map str i64))))
+(defun put8 :private (w: W x: i64) -> unit (set! (. w buf) (conj @(. w buf) (bit-and x 255))))
+(defun put16 :private (w: W x: i64) -> unit (do (put8 w (shr x 8)) (put8 w x)))
+(defun put32 :private (w: W x: i64) -> unit (do (put16 w (shr x 16)) (put16 w x)))
+(defun put-text :private (w: W text: str) -> unit (dotimes (i (str-len text)) (put8 w (zext i64 (str-byte-at text i)))))
+(defun valid-name? (name: str) -> bool
+  (or (= name "")
+      (and (<= (+ (str-len name) 2) 255)
+           (loop [parts (ip/split-on name 46)]
+             (cond (= (count parts) 0) true
+                   (or (< (str-len (first-of parts)) 1) (> (str-len (first-of parts)) 63)) false
+                   (not (printable? (first-of parts))) false
+                   :else (recur (vec (rest parts))))))))
+(defun first-of :private (xs: (Vec str)) -> str (nth xs 0))
+(defun printable? :private (t: str) -> bool
+  (loop [i 0] (if (= i (str-len t)) true (let [c (zext i64 (str-byte-at t i))] (if (and (>= c 33) (<= c 126) (!= c 46)) (recur (+ i 1)) false)))))
+(defun suffix :private (labels: (Vec str) from: i64) -> str
+  (loop [i (+ from 1) out (nth labels from)] (if (= i (count labels)) out (recur (+ i 1) (str out "." (nth labels i))))))
+(defun write-name :private (w: W name: str) -> unit
+  (if (= name "") (put8 w 0)
+    (let [labels (ip/split-on name 46)]
+      (loop [i 0]
+        (if (= i (count labels)) (put8 w 0)
+          (let [key (suffix labels i) known (get @(. w names) key)]
+            (match known
+              ((some off) (put16 w (+ 49152 off)))
+              (nil (let [at (count @(. w buf))]
+                     (do (if (< at 16384) (set! (. w names) (assoc @(. w names) key at)) ())
+                         (put8 w (str-len (nth labels i))) (put-text w (nth labels i)) (recur (+ i 1))))))))))))
+(defun put-ip :private (w: W bytes: (Option (Array i8)) n: i64) -> bool
+  (match bytes (nil false) ((some b) (if (= (array-len b) n) (do (dotimes (i n) (put8 w (zext i64 (array-get b i)))) true) false))))
+(defun patch16 :private (w: W at: i64 x: i64) -> unit
+  (set! (. w buf) (assoc (assoc @(. w buf) at (bit-and (shr x 8) 255)) (+ at 1) (bit-and x 255))))
+(defun write-data :private (w: W d: Rdata) -> bool
+  (match d
+    ((RdA a) (put-ip w (ip/parse-ipv4 a) 4))
+    ((RdAAAA a) (put-ip w (ip/parse-ipv6 a) 16))
+    ((RdCname n) (do (write-name w n) true))
+    ((RdSoa m) (do (put8 w 0) (put8 w 0) (put32 w 1) (put32 w 3600) (put32 w 600) (put32 w 86400) (put32 w m) true))
+    ((RdRaw xs) (do (dotimes (i (count xs)) (put8 w (nth xs i))) true))))
+(defun write-rr :private (w: W r: Rr) -> bool
+  (do (write-name w (. r name)) (put16 w (. r rtype)) (put16 w (. r rclass)) (put32 w (. r ttl))
+      (let [at (count @(. w buf))]
+        (do (put16 w 0)
+            (let [ok (write-data w (. r data))]
+              (do (patch16 w at (- (count @(. w buf)) at 2)) ok))))))
+(defun names-ok? :private (m: Message) -> bool
+  (and (every? (fn (q: Question) (valid-name? (. q name))) (. m questions))
+       (every? (fn (r: Rr) (valid-name? (. r name))) (. m answers))
+       (every? (fn (r: Rr) (valid-name? (. r name))) (. m authority))
+       (every? (fn (r: Rr) (valid-name? (. r name))) (. m additional))))
+(defun write-all :private (w: W m: Message) -> bool
+  (do (put16 w (. m id)) (put16 w (. m flags)) (put16 w (count (. m questions))) (put16 w (count (. m answers)))
+      (put16 w (count (. m authority))) (put16 w (count (. m additional)))
+      (dotimes (i (count (. m questions)))
+        (let [q (nth (. m questions) i)] (do (write-name w (. q name)) (put16 w (. q qtype)) (put16 w (. q qclass)))))
+      (and (every? (fn (r: Rr) (write-rr w r)) (. m answers)) (every? (fn (r: Rr) (write-rr w r)) (. m authority))
+           (every? (fn (r: Rr) (write-rr w r)) (. m additional)))))
+(defun to-array :private (xs: (Vec i64)) -> (Array i8)
+  (let [out (cell (array (count xs) 0i8))] (do (dotimes (i (count xs)) (array-set! &out i (trunc i8 (nth xs i)))) @out)))
+(defun encode (m: Message) -> (Result (Array i8) str)
+  (if (not (names-ok? m)) (Err "invalid name")
+    (let [w (W (cell []) (cell {}))]
+      (if (write-all w m)
+        (if (> (count @(. w buf)) 65535) (Err "message longer than 65535 bytes") (Ok (to-array @(. w buf))))
+        (Err "invalid record data")))))
+;; A recursive query for one name and type, with an EDNS0 OPT record advertising `udp-size` when it is above 512.
+(defun query (id: i64 name: str qtype: i64 udp-size: i64) -> (Result (Array i8) str)
+  (encode (Message id 256 [(Question name qtype class-in)] [] []
+                   (if (> udp-size 512) [(Rr "" type-opt udp-size 0 (RdRaw []))] []))))
+;; The bytes of a message that is not a valid message: a TCP frame of it (two bytes of length first, RFC 1035 4.2.2).
+(defun frame (payload: (Array i8)) -> (Array i8)
+  (let [n (array-len payload) out (cell (array (+ n 2) 0i8))]
+    (do (array-set! &out 0 (trunc i8 (shr n 8))) (array-set! &out 1 (trunc i8 n))
+        (dotimes (i n) (array-set! &out (+ i 2) (array-get payload i))) @out)))

@@ -1,0 +1,73 @@
+;; The resolver's configuration: /etc/resolv.conf (nameserver, search, domain, options ndots timeout attempts) and /etc/hosts, parsed from text so a spec feeds it tables.
+;; Fallbacks when a file is absent or empty (a scratch image has none; AWS Lambda writes a resolv.conf, so it is read, not assumed): no nameserver line gives 127.0.0.1 (what musl
+;; and glibc do), no search list gives none (the host's own domain is NOT guessed from the hostname), ndots 1, timeout 5 s, attempts 2. Limits: three nameservers (as glibc and musl), six
+;; search domains, ndots at most 15, timeout at most 30 s, attempts at most 5, hosts and resolv.conf files at most 256 KiB. An unreadable or hostile line is skipped, never an error.
+(ns fib.dns.config (:use fib.core fib.seq fib.coll) (:require [fib.dns.ip :as ip] [fib.os.files :as files] [fib.string :as s]))
+(defstruct Server (addr: str port: i64))
+(defstruct ResolvConf (servers: (Vec Server) search: (Vec str) ndots: i64 timeout-ms: i64 attempts: i64))
+(defstruct HostEntry (addr: str names: (Vec str)))
+(derive Eq Server)
+(derive Eq ResolvConf)
+(derive Eq HostEntry)
+(derive Debug Server)
+(derive Debug ResolvConf)
+(derive Debug HostEntry)
+(def default-servers: (Vec Server) [(Server "127.0.0.1" 53)])
+(defun default-conf () -> ResolvConf (ResolvConf default-servers [] 1 5000 2))
+(defun lower (s: str) -> str
+  (let [out (cell (array (str-len s) 0i8))]
+    (do (dotimes (i (str-len s)) (let [c (zext i64 (str-byte-at s i))] (array-set! &out i (trunc i8 (if (and (>= c 65) (<= c 90)) (+ c 32) c)))))
+        (str-from-bytes @out))))
+(defun blank? :private (c: i64) -> bool (or (= c 32) (= c 9) (= c 13) (= c 11) (= c 12)))
+(defun fields (line: str) -> (Vec str)
+  (loop [i 0 from -1 out: (Vec str) []]
+    (cond (= i (str-len line)) (if (>= from 0) (conj out (str-slice line from i)) out)
+          (blank? (zext i64 (str-byte-at line i))) (recur (+ i 1) -1 (if (>= from 0) (conj out (str-slice line from i)) out))
+          :else (recur (+ i 1) (if (< from 0) i from) out))))
+(defun strip-comment :private (line: str) -> str
+  (let [h (str-find line "#" 0) s (str-find line ";" 0)
+        cut (cond (and (some? h) (some? s)) (min (unwrap-or h 0) (unwrap-or s 0)) (some? h) (unwrap-or h 0) (some? s) (unwrap-or s 0) :else (str-len line))]
+    (str-slice line 0 cut)))
+(defun lines-of :private (text: str) -> (Vec (Vec str)) (vec (map (fn (l: str) (fields (strip-comment l))) (ip/split-on text 10))))
+(defun number :private (t: str) -> i64 (ip/number-of t 10 9))
+(defun clamp :private (n: i64 lo: i64 hi: i64) -> i64 (max lo (min hi n)))
+(defun apply-option :private (c: ResolvConf opt: str) -> ResolvConf
+  (cond (starts-with? opt "ndots:") (let [n (number (str-slice opt 6 (str-len opt)))] (if (< n 0) c (with c (ndots (clamp n 0 15)))))
+        (starts-with? opt "timeout:") (let [n (number (str-slice opt 8 (str-len opt)))] (if (< n 1) c (with c (timeout-ms (* 1000 (clamp n 1 30))))))
+        (starts-with? opt "attempts:") (let [n (number (str-slice opt 9 (str-len opt)))] (if (< n 1) c (with c (attempts (clamp n 1 5)))))
+        :else c))
+(defun add-server :private (c: ResolvConf addr: str) -> ResolvConf
+  (if (and (some? (ip/literal addr)) (< (count (. c servers)) 3)) (with c (servers (conj (. c servers) (Server addr 53)))) c))
+(defun valid-domain? :private (d: str) -> bool (and (> (str-len d) 0) (<= (str-len d) 253)))
+(defun apply-line :private (c: ResolvConf fs: (Vec str)) -> ResolvConf
+  (cond (< (count fs) 2) c
+        (= (nth fs 0) "nameserver") (add-server c (nth fs 1))
+        (= (nth fs 0) "domain") (if (valid-domain? (nth fs 1)) (with c (search [(lower (nth fs 1))])) c)
+        (= (nth fs 0) "search") (with c (search (vec (take 6 (filter valid-domain? (map lower (rest fs)))))))
+        (= (nth fs 0) "options") (reduce apply-option c (rest fs))
+        :else c))
+;; /etc/resolv.conf text to a configuration. The text of a file with no nameserver line still answers 127.0.0.1.
+(defun parse-resolv-conf (text: str) -> ResolvConf
+  (let [c (reduce apply-line (ResolvConf [] [] 1 5000 2) (lines-of text))]
+    (if (= (count (. c servers)) 0) (with c (servers default-servers)) c)))
+(defun host-entry :private (fs: (Vec str)) -> (Option HostEntry)
+  (if (and (>= (count fs) 2) (some? (ip/literal (nth fs 0)))) (some (HostEntry (nth fs 0) (vec (map lower (rest fs))))) nil))
+(defun parse-hosts (text: str) -> (Vec HostEntry) (vec (keep host-entry (lines-of text))))
+(defun absolute :private (name: str) -> str (if (s/ends-with? name ".") (str-slice name 0 (- (str-len name) 1)) name))
+;; The addresses /etc/hosts gives a name (case-insensitive, a trailing dot ignored), in file order. family: 4, 6 or 0 for both.
+(defun hosts-lookup (entries: (Vec HostEntry) name: str family: i64) -> (Vec str)
+  (let [want (lower (absolute name))]
+    (vec (filter (fn (a: str) (or (= family 0) (= family (if (some? (str-find a ":" 0)) 6 4))))
+                 (map (fn (e: HostEntry) (. e addr)) (filter (fn (e: HostEntry) (includes? want (. e names))) entries))))))
+(def file-limit: i64 262144)
+;; bytes above 127 become "?" so a file in another encoding cannot make an invalid str
+(defun ascii-text :private (b: (Array i8)) -> str
+  (let [out (cell (array (array-len b) 0i8))]
+    (do (dotimes (i (array-len b)) (let [c (zext i64 (array-get b i))] (array-set! &out i (if (< c 128) (array-get b i) 63i8)))) (str-from-bytes @out))))
+(defun read-text :private (path: str) -> (Option str)
+  (match (files/read-file-bytes path file-limit)
+    ((Err _) nil)
+    ((Ok b) (some (ascii-text b)))))
+;; The file, or the fallbacks when it is missing, unreadable or too large.
+(defun load-resolv-conf (path: str) -> ResolvConf (match (read-text path) (nil (default-conf)) ((some t) (parse-resolv-conf t))))
+(defun load-hosts (path: str) -> (Vec HostEntry) (match (read-text path) (nil []) ((some t) (parse-hosts t))))

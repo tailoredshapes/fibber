@@ -1,0 +1,91 @@
+;; A fake DNS server for the resolver specs: one task, a UDP socket and a TCP listener on the same loopback port, answers from a table of Behaviours keyed "name|type"
+;; (lower case). A Behaviour says what to answer (rcode, answers, authority) and what to do wrong: truncate the UDP answer (so the client must use TCP), ignore the first
+;; `drop` UDP queries, delay the answer, and forge: `spoof` 1 sends a copy with the wrong ID first, 2 one with the wrong question, 3 one with the right ID and question
+;; from ANOTHER socket (another source port: a connected client socket must not see it), each carrying the address 6.6.6.6, before the real answer. A query for a name with
+;; no row is NXDOMAIN with an SOA. The log (an Atom) gets "name|type|udp" or "...|tcp" for every query that was answered or dropped.
+(ns dns-fake (:use fib.core fib.seq fib.coll fib.dns.types)
+  (:require [fib.dns.decode :as dec] [fib.dns.encode :as enc] [fib.os.net :as net] [fib.os.io :as io] [fib.os.time :as time] [fib.os.errors :as os]))
+(defstruct Behaviour (rcode: i64 answers: (Vec Rr) authority: (Vec Rr) truncate: bool drop: i64 spoof: i64 delay-ms: i64))
+(defstruct Fake (port: i64 log: (Atom (Vec str)) stop: (Atom bool) task: (Task i64)))
+(defun answering (answers: (Vec Rr)) -> Behaviour (Behaviour 0 answers [] false 0 0 0))
+(defun a-rr (name: str ttl: i64 addr: str) -> Rr (Rr name type-a class-in ttl (RdA addr)))
+(defun aaaa-rr (name: str ttl: i64 addr: str) -> Rr (Rr name type-aaaa class-in ttl (RdAAAA addr)))
+(defun cname-rr (name: str ttl: i64 target: str) -> Rr (Rr name type-cname class-in ttl (RdCname target)))
+(defun soa-rr (zone: str ttl: i64 minimum: i64) -> Rr (Rr zone type-soa class-in ttl (RdSoa minimum)))
+(defun low (s: str) -> str (let [out (cell (array (str-len s) 0i8))] (do (dotimes (i (str-len s)) (let [c (zext i64 (str-byte-at s i))] (array-set! &out i (trunc i8 (if (and (>= c 65) (<= c 90)) (+ c 32) c))))) (str-from-bytes @out))))
+(defun key-of (name: str qtype: i64) -> str (str (low name) "|" qtype))
+(defun response-for :private (q: Message b: Behaviour truncate: bool) -> Message
+  (Message (. q id) (make-flags true true truncate (. b rcode)) (. q questions) (if truncate [] (. b answers)) (if truncate [] (. b authority)) []))
+(defun nx-behaviour :private () -> Behaviour (Behaviour 3 [] [(soa-rr "test" 30 30)] false 0 0 0))
+(defun send-msg :private (fd: i64 m: Message dg: net/Datagram) -> unit
+  (match (enc/encode m)
+    ((Ok bytes) (do (net/udp-send-to fd bytes (. dg peer) (. dg port)) ()))
+    ((Err _) ())))
+(defun forged :private (q: Message kind: i64) -> Message
+  (let [qs (. q questions) bad (Rr (. (nth qs 0) name) type-a class-in 300 (RdA "6.6.6.6"))]
+    (cond (= kind 1) (Message (bit-and (+ (. q id) 1) 65535) (make-flags true true false 0) qs [bad] [] [])
+          (= kind 2) (Message (. q id) (make-flags true true false 0) [(Question "evil.test" type-a class-in)] [(Rr "evil.test" type-a class-in 300 (RdA "6.6.6.6"))] [] [])
+          :else (Message (. q id) (make-flags true true false 0) qs [bad] [] []))))
+(defun spoof :private (fd: i64 other: i64 q: Message b: Behaviour dg: net/Datagram) -> unit
+  (cond (= (. b spoof) 0) ()
+        (= (. b spoof) 3) (send-msg other (forged q 3) dg)
+        :else (send-msg fd (forged q (. b spoof)) dg)))
+(defun log-it :private (log: (Atom (Vec str)) entry: str) -> unit (do (swap! log (fn (v: (Vec str)) (conj v entry))) ()))
+(defun reply-udp :private (fd: i64 other: i64 q: Message b: Behaviour dg: net/Datagram) -> unit
+  (do (spoof fd other q b dg)
+      (if (> (. b delay-ms) 0) (do (time/sleep-ns (* (. b delay-ms) 1000000)) ()) ())
+      (send-msg fd (response-for q b (. b truncate)) dg)))
+(defun handle-udp :private (fd: i64 other: i64 bs: (Map str Behaviour) log: (Atom (Vec str)) counts: (Map str i64) dg: net/Datagram) -> (Map str i64)
+  (match (dec/decode (. dg bytes))
+    ((Err _) counts)
+    ((Ok q) (if (!= (count (. q questions)) 1) counts
+      (let [qq (nth (. q questions) 0) key (key-of (. qq name) (. qq qtype)) b (unwrap-or (get bs key) (nx-behaviour)) seen (unwrap-or (get counts key) 0)]
+        (do (log-it log (str key "|udp"))
+            (if (>= seen (. b drop)) (reply-udp fd other q b dg) ())
+            (assoc counts key (+ seen 1))))))))
+(defun read-n :private (fd: i64 n: i64 deadline: i64 stop: (Atom bool)) -> (Option (Array i8))
+  (let [out (cell (array n 0i8))]
+    (loop [got 0]
+      (if (= got n) (some @out)
+        (match (net/wait-readable fd deadline stop)
+          ((Err _) nil)
+          ((Ok _) (match (io/read-fd fd (- n got))
+            ((Err _) nil)
+            ((Ok b) (if (= (array-len b) 0) nil
+                      (do (dotimes (i (array-len b)) (array-set! &out (+ got i) (array-get b i))) (recur (+ got (array-len b)))))))))))))
+(defun answer-tcp :private (fd: i64 q: Message bs: (Map str Behaviour) log: (Atom (Vec str)) stop: (Atom bool)) -> unit
+  (let [qq (nth (. q questions) 0) key (key-of (. qq name) (. qq qtype)) b (unwrap-or (get bs key) (nx-behaviour))]
+    (do (log-it log (str key "|tcp"))
+        (match (enc/encode (response-for q b false))
+          ((Ok bytes) (do (net/send-all fd (enc/frame bytes) 2000 stop) ()))
+          ((Err _) ())))))
+(defun serve-tcp :private (fd: i64 bs: (Map str Behaviour) log: (Atom (Vec str)) stop: (Atom bool)) -> unit
+  (let [deadline (+ (time/clock-now) 2000000000)]
+    (match (read-n fd 2 deadline stop)
+      (nil ())
+      ((some h) (match (read-n fd (+ (* 256 (zext i64 (array-get h 0))) (zext i64 (array-get h 1))) deadline stop)
+        (nil ())
+        ((some body) (match (dec/decode body) ((Err _) ()) ((Ok q) (answer-tcp fd q bs log stop)))))))))
+(defun maybe-tcp :private (listener: i64 bs: (Map str Behaviour) log: (Atom (Vec str)) stop: (Atom bool)) -> unit
+  (match (net/ready? listener false 0)
+    ((Ok true) (match (net/accept-tcp listener) ((Ok a) (do (serve-tcp (. a fd) bs log stop) (io/close-fd (. a fd)) ())) ((Err _) ())))
+    (_ ())))
+(defun serve :private (udp: i64 other: i64 tcp: i64 bs: (Map str Behaviour) log: (Atom (Vec str)) stop: (Atom bool)) -> i64
+  (loop [counts: (Map str i64) {}]
+    (if @stop 0
+      (do (maybe-tcp tcp bs log stop)
+        (match (net/udp-recv-from udp 4096 (+ (time/clock-now) 20000000) (atom false))
+          ((Err _) (recur counts))
+          ((Ok dg) (recur (handle-udp udp other bs log counts dg))))))))
+(defun start (bs: (Map str Behaviour)) -> Fake
+  (match (net/udp-bind "127.0.0.1" 0)
+    ((Err e) (trap (. e message)))
+    ((Ok u) (match (net/listen-tcp "127.0.0.1" (. u port) 8)
+      ((Err e) (trap (. e message)))
+      ((Ok l) (match (net/udp-bind "127.0.0.1" 0)
+        ((Err e) (trap (. e message)))
+        ((Ok o) (let [log (atom []) stop (atom false) ufd (. u fd) lfd (. l fd) ofd (. o fd)]
+          (Fake (. u port) log stop (spawn (fn () (let [r (serve ufd ofd lfd bs log stop)] (do (io/close-fd ufd) (io/close-fd lfd) (io/close-fd ofd) r)))))))))))))
+(defun stop (f: Fake) -> i64 (do (swap! (. f stop) (fn (x: bool) true)) (join (. f task))))
+(defun log-of (f: Fake) -> (Vec str) @(. f log))
+(defun count-of (f: Fake key: str) -> i64 (count (filter (fn (e: str) (starts-with? e key)) @(. f log))))

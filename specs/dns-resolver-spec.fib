@@ -1,0 +1,138 @@
+;; The native resolver end to end against a fake DNS server in the same process over loopback UDP and TCP (specs/dns-fake.fib): answers, CNAME chains, NXDOMAIN, NODATA,
+;; SERVFAIL, truncation then TCP, lost and slow answers with retries and a second nameserver, forged answers (wrong ID, wrong question, another source port) that must be ignored,
+;; the cache (hits, TTL expiry, negative entries), the search rules as the queries the server saw, IP literals, /etc/hosts, localhost. Every query the server saw is in its
+;; log, so "asked once" and "asked again" are counts, not guesses. `fibc test specs/dns-resolver-spec.fib`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.dns.types fib.dns.config fib.dns.resolve dns-fake)
+  (:require [fib.os.time :as time] [fib.os.errors :as os] [fib.os.net :as net] [fib.os.io :as io]))
+
+(defun conf (servers: (Vec Server) search: (Vec str) timeout-ms: i64 attempts: i64) -> ResolvConf (ResolvConf servers search 1 timeout-ms attempts))
+(defun resolver-of (port: i64 timeout-ms: i64 attempts: i64) -> Resolver
+  (new-resolver (default-dns-config (conf [(Server "127.0.0.1" port)] [] timeout-ms attempts) [])))
+(defun show (r: (Result (Vec str) os/OSError)) -> str
+  (match r
+    ((Ok xs) (str "ok:" (str-join (mapv (fn (s: str) (str s ",")) xs))))
+    ((Err e) (str "err:" (cond (= (. e kind) os/NotFound) "notfound" (= (. e kind) os/TimedOut) "timeout" :else (str "other " (. e message)))))))
+(defun both-types (name: str a4: (Vec Rr) a6: (Vec Rr)) -> (Map str Behaviour)
+  {(key-of name 1) (answering a4) (key-of name 28) (answering a6)})
+(defun nodata (zone: str) -> Behaviour (Behaviour 0 [] [(soa-rr zone 60 60)] false 0 0 0))
+(defun basic-table () -> (Map str Behaviour)
+  (merge (both-types "a.test" [(a-rr "a.test" 60 "1.2.3.4")] [(aaaa-rr "a.test" 60 "2001:db8::1")])
+         {(key-of "v4only.test" 1) (answering [(a-rr "v4only.test" 60 "5.6.7.8")]) (key-of "v4only.test" 28) (nodata "test")
+          (key-of "www.test" 1) (answering [(cname-rr "www.test" 60 "mid.test") (cname-rr "mid.test" 60 "end.test") (a-rr "end.test" 60 "9.9.9.9")])
+          (key-of "www.test" 28) (nodata "test")
+          (key-of "nodata.test" 1) (nodata "test") (key-of "nodata.test" 28) (nodata "test")
+          (key-of "fail.test" 1) (Behaviour 2 [] [] false 0 0 0) (key-of "fail.test" 28) (Behaviour 2 [] [] false 0 0 0)
+          (key-of "loop.test" 1) (answering [(cname-rr "loop.test" 60 "loop2.test") (cname-rr "loop2.test" 60 "loop.test")]) (key-of "loop.test" 28) (nodata "test")
+          (key-of "big.test" 1) (Behaviour 0 [(a-rr "big.test" 60 "7.7.7.7")] [] true 0 0 0) (key-of "big.test" 28) (Behaviour 0 [(aaaa-rr "big.test" 60 "2001:db8::7")] [] true 0 0 0)}))
+(defun lookup (table: (Map str Behaviour) host: str) -> (Pair str (Vec str))
+  (let [f (start table) r (resolver-of (. f port) 400 2) out (show (resolve-host r host)) _ (stop f)] (Pair out (log-of f))))
+(defun answer-of (table: (Map str Behaviour) host: str) -> str (. (lookup table host) fst))
+
+(defun count-prefix (log: (Vec str) p: str) -> i64 (count (filter (fn (e: str) (starts-with? e p)) log)))
+(defun timed (table: (Map str Behaviour) host: str timeout-ms: i64 attempts: i64) -> (Pair str i64)
+  (let [f (start table) r (resolver-of (. f port) timeout-ms attempts) t0 (time/clock-now) out (show (resolve-host r host)) ms (quot (- (time/clock-now) t0) 1000000) _ (stop f)]
+    (Pair out ms)))
+(defun twice (table: (Map str Behaviour) host: str gap-ms: i64) -> (Pair str (Vec str))
+  (let [f (start table) r (resolver-of (. f port) 400 2) o1 (show (resolve-host r host)) _ (time/sleep-ns (* gap-ms 1000000)) o2 (show (resolve-host r host)) _ (stop f)]
+    (Pair (str o1 " " o2) (log-of f))))
+(defun searched (search: (Vec str) ndots: i64 host: str table: (Map str Behaviour)) -> (Pair str (Vec str))
+  (let [f (start table) r (new-resolver (default-dns-config (ResolvConf [(Server "127.0.0.1" (. f port))] search ndots 400 1) [])) out (show (resolve-host r host)) _ (stop f)]
+    (Pair out (log-of f))))
+;; the first server is a closed UDP port (the kernel answers with ICMP port unreachable at once), the second the fake
+(defun with-dead-first (table: (Map str Behaviour) host: str) -> (Pair str (Vec str))
+  (let [dead (match (net/udp-bind "127.0.0.1" 0) ((Ok u) u) ((Err e) (trap (. e message)))) _ (io/close-fd (. dead fd)) f (start table)
+        r (new-resolver (default-dns-config (conf [(Server "127.0.0.1" (. dead port)) (Server "127.0.0.1" (. f port))] [] 400 1) []))
+        out (show (resolve-host r host)) _ (stop f)]
+    (Pair out (log-of f))))
+
+(defspecs specs
+  (feature "answers"
+    (scenario "A and AAAA come back together, IPv4 first"
+      (then (expect = "ok:1.2.3.4,2001:db8::1," (answer-of (basic-table) "a.test"))))
+    (scenario "a name with only an A record answers it; the AAAA NODATA is not an error"
+      (then (expect = "ok:5.6.7.8," (answer-of (basic-table) "v4only.test"))))
+    (scenario "a CNAME chain from the question to an address"
+      (then (expect = "ok:9.9.9.9," (answer-of (basic-table) "www.test"))))
+    (scenario "the name is matched without regard to case, and a trailing dot is the same name"
+      (then (expect = "ok:1.2.3.4,2001:db8::1," (answer-of (basic-table) "A.TEST."))))
+    (scenario "NXDOMAIN is not found; so is NODATA for both types"
+      (then (expect = "err:notfound" (answer-of (basic-table) "nothere.test")) (expect = "err:notfound" (answer-of (basic-table) "nodata.test"))))
+    (scenario "SERVFAIL on both types is an error that is not 'not found'"
+      (then (expect = true (starts-with? (answer-of (basic-table) "fail.test") "err:other"))))
+    (scenario "a CNAME loop is an error"
+      (then (expect = true (starts-with? (answer-of (basic-table) "loop.test") "err:other"))))
+    (scenario "a name that cannot be a DNS name is refused without a query"
+      (given [p (lookup (basic-table) "a..test")])
+      (then (expect = true (starts-with? (. p fst) "err:other")) (expect = 0 (count (. p snd))))))
+  (feature "truncation"
+    (scenario "a truncated UDP answer is asked again over TCP and the TCP answer is used"
+      (given [p (lookup (basic-table) "big.test")])
+      (then (expect = "ok:7.7.7.7,2001:db8::7," (. p fst)) (expect = 1 (count-prefix (. p snd) "big.test|1|udp")) (expect = 1 (count-prefix (. p snd) "big.test|1|tcp"))
+            (expect = 1 (count-prefix (. p snd) "big.test|28|tcp")))))
+  (feature "lost and slow answers"
+    (scenario "the first query is lost: the retry after the timeout gets the answer"
+      (given [t (merge (basic-table) {(key-of "lossy.test" 1) (Behaviour 0 [(a-rr "lossy.test" 60 "4.4.4.4")] [] false 1 0 0) (key-of "lossy.test" 28) (nodata "test")}) p (lookup t "lossy.test")])
+      (then (expect = "ok:4.4.4.4," (. p fst)) (expect = 2 (count-prefix (. p snd) "lossy.test|1|udp"))))
+    (scenario "a server that never answers is a timeout after attempts times the timeout, not forever"
+      (given [t {(key-of "mute.test" 1) (Behaviour 0 [] [] false 100 0 0) (key-of "mute.test" 28) (Behaviour 0 [] [] false 100 0 0)} p (timed t "mute.test" 150 2)])
+      (then (expect = "err:timeout" (. p fst)) (expect = true (>= (. p snd) 290)) (expect = true (< (. p snd) 1500))))
+    (scenario "an answer that comes after a delay shorter than the timeout is accepted"
+      (given [t {(key-of "slow.test" 1) (Behaviour 0 [(a-rr "slow.test" 60 "3.3.3.3")] [] false 0 0 120) (key-of "slow.test" 28) (nodata "test")} p (timed t "slow.test" 600 1)])
+      (then (expect = "ok:3.3.3.3," (. p fst)) (expect = true (>= (. p snd) 100))))
+    (scenario "a refused port on the first nameserver moves on to the second at once"
+      (given [p (with-dead-first (basic-table) "a.test")])
+      (then (expect = "ok:1.2.3.4,2001:db8::1," (. p fst)))))
+  (feature "forged answers"
+    (scenario "an answer with the wrong ID before the real one is ignored"
+      (given [t (both-types "s1.test" [(a-rr "s1.test" 60 "1.1.1.1")] [])
+              t1 (assoc t (key-of "s1.test" 1) (Behaviour 0 [(a-rr "s1.test" 60 "1.1.1.1")] [] false 0 1 0))])
+      (then (expect = "ok:1.1.1.1," (answer-of t1 "s1.test"))))
+    (scenario "an answer to another question (right ID) before the real one is ignored"
+      (given [t {(key-of "s2.test" 1) (Behaviour 0 [(a-rr "s2.test" 60 "1.1.1.1")] [] false 0 2 0) (key-of "s2.test" 28) (nodata "test")}])
+      (then (expect = "ok:1.1.1.1," (answer-of t "s2.test"))))
+    (scenario "an answer with the right ID and question from another source port never reaches the socket"
+      (given [t {(key-of "s3.test" 1) (Behaviour 0 [(a-rr "s3.test" 60 "1.1.1.1")] [] false 0 3 0) (key-of "s3.test" 28) (nodata "test")}])
+      (then (expect = "ok:1.1.1.1," (answer-of t "s3.test"))))
+    (scenario "forged answers alone, with no real one, end in a timeout, never in the forged address"
+      (given [t {(key-of "s4.test" 1) (Behaviour 0 [(a-rr "s4.test" 60 "1.1.1.1")] [] false 100 1 0) (key-of "s4.test" 28) (Behaviour 0 [] [] false 100 1 0)} p (timed t "s4.test" 200 1)])
+      (then (expect = "err:timeout" (. p fst)))))
+  (feature "the cache"
+    (scenario "the second lookup is answered from the cache: the server saw each type once"
+      (given [p (twice (basic-table) "a.test" 0)])
+      (then (expect = "ok:1.2.3.4,2001:db8::1, ok:1.2.3.4,2001:db8::1," (. p fst)) (expect = 1 (count-prefix (. p snd) "a.test|1|")) (expect = 1 (count-prefix (. p snd) "a.test|28|"))))
+    (scenario "an entry is asked for again after its TTL"
+      (given [t {(key-of "short.test" 1) (answering [(a-rr "short.test" 1 "2.2.2.2")]) (key-of "short.test" 28) (Behaviour 0 [] [(soa-rr "test" 1 1)] false 0 0 0)} p (twice t "short.test" 1300)])
+      (then (expect = 2 (count-prefix (. p snd) "short.test|1|")) (expect = 2 (count-prefix (. p snd) "short.test|28|"))))
+    (scenario "NXDOMAIN is cached for the SOA's time: the second lookup sends nothing"
+      (given [p (twice (basic-table) "nothere.test" 0)])
+      (then (expect = "err:notfound err:notfound" (. p fst)) (expect = 1 (count-prefix (. p snd) "nothere.test|1|")) (expect = 1 (count-prefix (. p snd) "nothere.test|28|"))))
+    (scenario "a failure (SERVFAIL) is not cached"
+      (given [p (twice (basic-table) "fail.test" 0)])
+      (then (expect = true (> (count-prefix (. p snd) "fail.test|1|") 2)))))
+  (feature "search and ndots"
+    (scenario "a short name is tried with each search domain first, then as it is"
+      (given [t (merge (basic-table) {(key-of "svc.corp.test" 1) (answering [(a-rr "svc.corp.test" 60 "8.8.8.8")]) (key-of "svc.corp.test" 28) (nodata "test")})
+              p (searched ["other.test" "corp.test"] 1 "svc" t)])
+      (then (expect = "ok:8.8.8.8," (. p fst)) (expect = true (starts-with? (first-of (. p snd)) "svc.other.test|")) (expect = true (some? (first (filter (fn (e: str) (= e "svc.corp.test|1|udp")) (. p snd)))))
+            (expect = 0 (count-prefix (. p snd) "svc|"))))
+    (scenario "a name with ndots dots is tried as it is first"
+      (given [p (searched ["corp.test"] 1 "a.test" (basic-table))])
+      (then (expect = "ok:1.2.3.4,2001:db8::1," (. p fst)) (expect = 0 (count-prefix (. p snd) "a.test.corp.test|"))))
+    (scenario "an absolute name (trailing dot) is never searched"
+      (given [p (searched ["corp.test"] 1 "nothere." (basic-table))])
+      (then (expect = "err:notfound" (. p fst)) (expect = 0 (count-prefix (. p snd) "nothere.corp.test|")))))
+  (feature "literals, hosts and localhost"
+    (scenario "IP literals are returned as they are, bracketed or not, and no query is sent"
+      (given [p (lookup (basic-table) "10.1.2.3") q (lookup (basic-table) "[2001:db8::5]") r (lookup (basic-table) "::1")])
+      (then (expect = "ok:10.1.2.3," (. p fst)) (expect = "ok:2001:db8::5," (. q fst)) (expect = "ok:::1," (. r fst)) (expect = 0 (+ (count (. p snd)) (count (. q snd)) (count (. r snd))))))
+    (scenario "localhost and names under .localhost are the loopback addresses, with no files and no query"
+      (given [p (lookup (basic-table) "localhost") q (lookup (basic-table) "App.Localhost")])
+      (then (expect = "ok:127.0.0.1,::1," (. p fst)) (expect = "ok:127.0.0.1,::1," (. q fst)) (expect = 0 (+ (count (. p snd)) (count (. q snd))))))
+    (scenario "/etc/hosts wins over DNS"
+      (given [f (start (basic-table))
+              r (new-resolver (default-dns-config (conf [(Server "127.0.0.1" (. f port))] [] 400 1) (parse-hosts "10.0.0.9 a.test\n")))
+              out (show (resolve-host r "a.test")) _ (stop f)])
+      (then (expect = "ok:10.0.0.9," out) (expect = 0 (count (log-of f)))))))
+
+(defun first-of (xs: (Vec str)) -> str (if (= (count xs) 0) "" (nth xs 0)))
+(defun main () -> i64 (run-main (specs)))

@@ -1,0 +1,258 @@
+;; The DNS wire format, configuration, cache and answer logic of fib.dns, with no network: message tables written as hex (RFC 1035 layouts, built by hand, not by the encoder),
+;; malformed packets (pointer loops and forward pointers, truncation at every offset, trailing bytes, reserved label types, bad counts, oversize names and messages, bad rdata
+;; lengths), round trips of 3,000 generated messages, 100,000 mutated responses that must never trap (and whose successes must round-trip), the IP text tables, resolv.conf and
+;; hosts tables, the cache's TTL, negative and size rules with a driven clock, the candidates of the search rules, and CNAME chain reading. `fibc test specs/dns-wire-spec.fib`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.dns.types fib.dns.config fib.dns.cache fib.dns.exchange fib.dns.answer)
+  (:require [fib.dns.decode :as dec] [fib.dns.encode :as enc] [fib.dns.ip :as ip] [fib.dns.resolve :as rs]))
+
+(defun hexval (c: i64) -> i64 (ip/hex-value c))
+(defun unhex (t: str) -> (Array i8)
+  (let [clean (vec (filter (fn (c: i64) (>= (hexval c) 0)) (map (fn (i: i64) (zext i64 (str-byte-at t i))) (range (str-len t)))))
+        n (quot (count clean) 2) out (cell (array n 0i8))]
+    (do (dotimes (i n) (array-set! &out i (trunc i8 (+ (* 16 (hexval (nth clean (* 2 i)))) (hexval (nth clean (+ (* 2 i) 1))))))) @out)))
+(defun msg-or-blank (r: (Result Message str)) -> Message (match r ((Ok m) m) ((Err _) (Message 0 0 [] [] [] []))))
+(defun ok? (r: (Result Message str)) -> bool (match r ((Ok _) true) ((Err _) false)))
+(defun err-has? (r: (Result Message str) frag: str) -> bool (match r ((Err e) (some? (str-find e frag 0))) ((Ok _) false)))
+
+;; header: id 1234, flags 8180, qd 1, an 1, ns 0, ar 0; question www.example.com A IN (offset 12..33); answer c00c A IN ttl 60 rdlength 4 93.184.216.34
+(def head: str "1234 8180 0001 0001 0000 0000")
+(def question: str "03777777 076578616d706c65 03636f6d 00 0001 0001")
+(def answer: str "c00c 0001 0001 0000003c 0004 5db8d822")
+(defun good () -> str (str head " " question " " answer))
+(defstruct Row (label: str hex: str frag: str))
+(defun bad-rows () -> (Vec Row)
+  [(Row "empty" "" "shorter than a header") (Row "eleven bytes" "1234 8180 0001 0001 0000 00" "shorter than a header")
+   (Row "header only, counts promise a question" "1234 8180 0001 0000 0000 0000" "exceed")
+   (Row "counts far beyond the bytes" "1234 8180 ffff ffff ffff ffff" "exceed")
+   (Row "answer count beyond the bytes" (str "1234 8180 0001 0002 0000 0000 " question " " answer) "past the end")
+   (Row "a name that points at itself" "1234 0100 0001 0000 0000 0000 c00c 0001 0001" "backwards")
+   (Row "a name that points forward" "1234 0100 0001 0000 0000 0000 c010 0001 0001 03616263 00" "backwards")
+   (Row "a pointer to a pointer that points back to it" (str "1234 8180 0001 0001 0000 0000 03777777 00 0001 0001 c01a 0001 0001 0000003c 0004 01020304 c00c") "")
+   (Row "a label of the reserved type 0x40" "1234 0100 0001 0000 0000 0000 40 61 00 0001 0001" "reserved")
+   (Row "a label of the reserved type 0x80" "1234 0100 0001 0000 0000 0000 80 61 00 0001 0001" "reserved")
+   (Row "a label that runs past the end" "1234 0100 0001 0000 0000 0000 3f 6162 0001 0001" "past the end")
+   (Row "a name with no root label" "1234 0100 0001 0000 0000 0000 01 61" "exceed")
+   (Row "a pointer cut in half" "1234 0100 0001 0000 0000 0000 c0" "exceed")
+   (Row "a question cut short" "1234 0100 0001 0000 0000 0000 01 61 00 0001" "question")
+   (Row "a label with a dot byte" "1234 0100 0001 0000 0000 0000 03 61 2e 62 00 0001 0001" "outside printable")
+   (Row "a label with a NUL byte" "1234 0100 0001 0000 0000 0000 03 61 00 62 00 0001 0001" "")
+   (Row "an A record of three bytes" (str head " " question " c00c 0001 0001 0000003c 0003 5db8d8") "not 4 bytes")
+   (Row "an AAAA record of four bytes" (str head " " question " c00c 001c 0001 0000003c 0004 5db8d822") "not 16 bytes")
+   (Row "rdata longer than the message" (str head " " question " c00c 0001 0001 0000003c 0100 5db8d822") "past the end")
+   (Row "a CNAME whose name is shorter than its data" (str head " " question " c00c 0005 0001 0000003c 0005 01610000 00") "wrong length")
+   (Row "a record header cut short" (str head " " question " c00c 0001 0001 0000") "record header")
+   (Row "trailing byte" (str (good) " 00") "trailing")
+   (Row "trailing record bytes" (str (good) " c00c 0001") "trailing")])
+(defun row-diffs () -> str
+  (str-join (mapv (fn (r: Row) (let [res (dec/decode (unhex (. r hex)))]
+    (if (and (not (ok? res)) (or (= (. r frag) "") (err-has? res (. r frag)))) "" (str (. r label) ": " (match res ((Ok _) "decoded") ((Err e) e)) "\n")))) (bad-rows))))
+;; every proper prefix of a valid message is an error, whatever the cut
+(defun prefixes-error? (b: (Array i8)) -> bool
+  (every? (fn (cut: i64) (not (ok? (dec/decode (array-copy b 0 cut))))) (range (array-len b))))
+(defun label-hex (n: i64) -> str (str (hex2 n) " " (str-join (mapv (fn (j: i64) "61") (range n))) " "))
+(defun hex2 (n: i64) -> str (str (str-slice "0123456789abcdef" (shr n 4) (+ 1 (shr n 4))) (str-slice "0123456789abcdef" (bit-and n 15) (+ 1 (bit-and n 15)))))
+(defun name-bytes (last: i64) -> (Array i8)
+  (unhex (str "1234 0100 0001 0000 0000 0000 " (label-hex 63) (label-hex 63) (label-hex 63) (label-hex last) " 00 0001 0001")))
+(defun too-long-name () -> (Array i8) (name-bytes 62))
+(defun ok-long-name () -> (Array i8) (name-bytes 61))
+
+(defun good-message () -> Message
+  (Message 4660 33152 [(Question "www.example.com" 1 1)] [(Rr "www.example.com" 1 1 60 (RdA "93.184.216.34"))] [] []))
+
+;; ---- generated messages (xorshift: a fixed stream)
+(defun next (x: i64) -> i64 (let [a (bit-xor x (shl x 13)) c (bit-xor a (shr a 7)) d (bit-xor c (shl c 17))] (if (= d 0) 88172645463325252 d)))
+(defun pick (x: i64 n: i64) -> i64 (rem (bit-and (shr x 8) 1073741823) n))
+(def labels: (Vec str) ["a" "www" "example" "com" "net" "x-y" "mail" "_srv" "Co" "d0main" "node1" "k"])
+(defun gen-name (x: i64) -> str
+  (let [n (pick x 4)] (str-join (mapv (fn (i: i64) (str (if (= i 0) "" ".") (nth labels (pick (next (+ x (* 31 i))) (count labels))))) (range (+ n 1))))))
+(defun gen-addr4 (x: i64) -> str (str (pick x 256) "." (pick (next x) 256) "." (pick (next (next x)) 256) "." (pick (next (next (next x))) 256)))
+(defun gen-addr6 (x: i64) -> str
+  (ip/format-ipv6 (let [out (cell (array 16 0i8))] (do (dotimes (i 16) (array-set! &out i (trunc i8 (if (= (pick (next (+ x i)) 3) 0) 0 (pick (next (+ x (* 7 i))) 256))))) @out))))
+(defun gen-rr (x: i64) -> Rr
+  (let [k (pick x 5) name (gen-name (next x)) ttl (pick (next (next x)) 100000) y (next (next (next x)))]
+    (cond (= k 0) (Rr name 1 1 ttl (RdA (gen-addr4 y)))
+          (= k 1) (Rr name 28 1 ttl (RdAAAA (gen-addr6 y)))
+          (= k 2) (Rr name 5 1 ttl (RdCname (gen-name y)))
+          (= k 3) (Rr name 6 1 ttl (RdSoa (pick y 100000)))
+          :else (Rr name 16 1 ttl (RdRaw (vec (map (fn (i: i64) (pick (next (+ y i)) 256)) (range (pick y 20)))))))))
+(defun gen-message (x: i64) -> Message
+  (let [na (pick x 5) ns (pick (next x) 3) nr (pick (next (next x)) 3) y (next (next (next x)))]
+    (Message (pick x 65536) (pick (next y) 65536) [(Question (gen-name y) (nth [1 28 5 255] (pick y 4)) 1)]
+             (vec (map (fn (i: i64) (gen-rr (next (+ y i)))) (range na))) (vec (map (fn (i: i64) (gen-rr (next (+ y 100 i)))) (range ns)))
+             (vec (map (fn (i: i64) (gen-rr (next (+ y 200 i)))) (range nr))))))
+(defun round-trips? (m: Message) -> bool
+  (match (enc/encode m) ((Err _) false) ((Ok b) (match (dec/decode b) ((Ok d) (= d m)) ((Err _) false)))))
+(defun round-trip-failures (n: i64) -> (Vec i64)
+  (vec (take 5 (filter (fn (i: i64) (not (round-trips? (gen-message (next (+ 12345 (* 7919 i))))))) (range n)))))
+
+;; ---- fuzz: mutants of valid responses
+(defun ints-of (a: (Array i8)) -> (Vec i64) (vec (map (fn (i: i64) (bit-and (zext i64 (array-get a i)) 255)) (range (array-len a)))))
+(defun bytes-of (xs: (Vec i64)) -> (Array i8) (let [out (cell (array (count xs) 0i8))] (do (dotimes (i (count xs)) (array-set! &out i (trunc i8 (nth xs i)))) @out)))
+(def alphabet: (Vec i64) [0 192 255 63 64 128 12 1 28 5 41 4 16 2 192 12 0 0 1 255 200])
+(defun mutate (xs: (Vec i64) x: i64) -> (Vec i64)
+  (let [n (count xs) kind (pick x 6) y (next x) at (pick y (max 1 n)) z (next y) v (nth alphabet (pick z (count alphabet)))]
+    (if (= n 0) [v]
+      (cond (= kind 0) (assoc xs at v)
+            (= kind 1) (vec (concat (take at xs) (drop (+ at 1) xs)))
+            (= kind 2) (vec (concat (concat (take at xs) [v]) (drop at xs)))
+            (= kind 3) (let [len (+ 1 (pick z 8))] (vec (concat (concat (take at xs) (take len (drop at xs))) (drop at xs))))
+            (= kind 4) (vec (take at xs))
+            :else (let [o (pick z n)] (assoc (assoc xs at (nth xs o)) o (nth xs at)))))))
+(defun seed-messages () -> (Vec (Array i8))
+  (vec (map (fn (i: i64) (match (enc/encode (gen-message (next (+ 999 (* 31 i))))) ((Ok b) b) ((Err _) (array 0 0i8)))) (range 24))))
+;; returns [ok-count err-count roundtrip-failures] over n mutants
+(defun fuzz (n: i64) -> (Vec i64)
+  (let [seeds (seed-messages)]
+    (loop [i 0 x 2463534242 ok 0 bad 0 rt 0]
+      (if (= i n) [ok bad rt]
+        (let [x1 (next x) seed (ints-of (nth seeds (pick x1 (count seeds)))) x2 (next x1) m1 (mutate seed x2) x3 (next x2)
+              m2 (if (= (pick x3 3) 0) m1 (mutate m1 x3)) b (bytes-of m2)]
+          (match (dec/decode b)
+            ((Err _) (recur (+ i 1) (next x3) ok (+ bad 1) rt))
+            ((Ok m) (recur (+ i 1) (next x3) (+ ok 1) bad (if (round-trips? m) rt (+ rt 1))))))))))
+
+;; ---- ip text
+(defstruct IpRow (text: str canon: str))
+(def ip-rows: (Vec IpRow)
+  [(IpRow "1.2.3.4" "1.2.3.4") (IpRow "0.0.0.0" "0.0.0.0") (IpRow "255.255.255.255" "255.255.255.255") (IpRow "256.1.1.1" "") (IpRow "1.2.3" "") (IpRow "1.2.3.4.5" "")
+   (IpRow "01.2.3.4" "") (IpRow "1.2.3.04" "") (IpRow "1..3.4" "") (IpRow "1.2.3.4 " "") (IpRow "a.b.c.d" "") (IpRow "-1.2.3.4" "") (IpRow "" "") (IpRow "example.com" "")
+   (IpRow "::1" "::1") (IpRow "::" "::") (IpRow "2001:db8::1" "2001:db8::1") (IpRow "2001:0DB8:0000:0000:0000:0000:0000:0001" "2001:db8::1")
+   (IpRow "1:2:3:4:5:6:7:8" "1:2:3:4:5:6:7:8") (IpRow "1:0:0:2:0:0:0:3" "1:0:0:2::3") (IpRow "1:0:2:0:3:0:4:0" "1:0:2:0:3:0:4:0") (IpRow "::ffff:1.2.3.4" "::ffff:102:304")
+   (IpRow "fe80::1" "fe80::1") (IpRow "1::" "1::") (IpRow "1:2:3:4:5:6:7::" "1:2:3:4:5:6:7:0") (IpRow ":::" "") (IpRow "1::2::3" "") (IpRow "1:2:3:4:5:6:7:8:9" "")
+   (IpRow "1:2:3:4:5:6:7" "") (IpRow "12345::1" "") (IpRow "g::1" "") (IpRow "::1.2.3" "") (IpRow ":1" "") (IpRow "1:" "") (IpRow "fe80::1%eth0" "") (IpRow "::1.2.3.4:5" "")])
+(defun canon (t: str) -> str (match (ip/literal t) (nil "") ((some b) (if (= (array-len b) 4) (ip/format-ipv4 b 0) (ip/format-ipv6 b)))))
+(defun ip-diffs () -> str (str-join (mapv (fn (r: IpRow) (if (= (canon (. r text)) (. r canon)) "" (str (pr-str (. r text)) " -> " (pr-str (canon (. r text))) ", wanted " (pr-str (. r canon)) "\n"))) ip-rows)))
+
+;; ---- resolv.conf and hosts
+(defun conf-line (c: ResolvConf) -> str
+  (str (str-join (mapv (fn (s: Server) (str (. s addr) ":" (. s port) ",")) (. c servers))) "|" (str-join (mapv (fn (s: str) (str s ",")) (. c search))) "|" (. c ndots) "|" (. c timeout-ms) "|" (. c attempts)))
+(defstruct ConfRow (text: str want: str))
+(def conf-rows: (Vec ConfRow)
+  [(ConfRow "" "127.0.0.1:53,||1|5000|2") (ConfRow "# only a comment\n; and another\n" "127.0.0.1:53,||1|5000|2")
+   (ConfRow "nameserver 10.0.0.2\nnameserver 10.0.0.3\n" "10.0.0.2:53,10.0.0.3:53,||1|5000|2")
+   (ConfRow "nameserver 10.0.0.2 # comment\nsearch Corp.Example example.org\noptions ndots:2 timeout:3 attempts:4\n" "10.0.0.2:53,|corp.example,example.org,|2|3000|4")
+   (ConfRow "nameserver 1.1.1.1\nnameserver 2.2.2.2\nnameserver 3.3.3.3\nnameserver 4.4.4.4\n" "1.1.1.1:53,2.2.2.2:53,3.3.3.3:53,||1|5000|2")
+   (ConfRow "nameserver not-an-address\nnameserver ::1\n" "::1:53,||1|5000|2")
+   (ConfRow "domain a.example\nsearch b.example\n" "127.0.0.1:53,|b.example,|1|5000|2")
+   (ConfRow "search b.example\ndomain a.example\n" "127.0.0.1:53,|a.example,|1|5000|2")
+   (ConfRow "options ndots:99 timeout:999 attempts:99\n" "127.0.0.1:53,||15|30000|5")
+   (ConfRow "options ndots:x timeout:0 attempts:0 rotate edns0 ndots:3\n" "127.0.0.1:53,||3|5000|2")
+   (ConfRow "nameserver\nsearch\noptions\n  \t nameserver  192.168.0.1\t\r\n" "192.168.0.1:53,||1|5000|2")
+   (ConfRow "search a b c d e f g h\n" "127.0.0.1:53,|a,b,c,d,e,f,|1|5000|2")])
+(defun conf-diffs () -> str
+  (str-join (mapv (fn (r: ConfRow) (let [got (conf-line (parse-resolv-conf (. r text)))] (if (= got (. r want)) "" (str (pr-str (. r text)) " -> " got ", wanted " (. r want) "\n")))) conf-rows)))
+(defun hosts-text () -> str "127.0.0.1 localhost\n::1 localhost ip6-localhost # loop\n10.1.2.3 Web.Example.COM web\nbad-address host1\n  10.9.9.9\n2001:db8::7 web v6only\n")
+(defun hosts-line (name: str family: i64) -> str (str-join (mapv (fn (a: str) (str a " ")) (hosts-lookup (parse-hosts (hosts-text)) name family))))
+
+;; ---- cache with a driven clock
+(def sec: i64 1000000000)
+(defun entry-line (c: Cache key: str now: i64) -> str
+  (match (cache-get c key now) (nil "-") ((some e) (str (if (= (. e negative) "") "pos" (. e negative)) ":" (count (. e addrs))))))
+
+;; ---- candidates
+(defun cand-line (search: (Vec str) ndots: i64 name: str) -> str (str-join (mapv (fn (s: str) (str s " ")) (rs/candidates (ResolvConf [] search ndots 5000 2) name))))
+
+;; ---- answers
+(defun msg (answers: (Vec Rr) authority: (Vec Rr) rcode: i64) -> Message
+  (Message 1 (make-flags true true false rcode) [(Question "www.test" 1 1)] answers authority []))
+(defun show (r: (Result Answer Fail)) -> str
+  (match r ((Ok a) (str (str-join (mapv (fn (s: str) (str s ",")) (. a addrs))) "@" (. a ttl))) ((Err (NxDomain t)) (str "nx@" t)) ((Err (NoData t)) (str "nodata@" t)) ((Err (Temp w)) (str "temp:" w))))
+(defun a (name: str ttl: i64 addr: str) -> Rr (Rr name 1 1 ttl (RdA addr)))
+(defun cn (name: str ttl: i64 target: str) -> Rr (Rr name 5 1 ttl (RdCname target)))
+(defun soa (ttl: i64 min: i64) -> Rr (Rr "test" 6 1 ttl (RdSoa min)))
+
+(defspecs specs
+  (feature "decoding"
+    (scenario "a valid response decodes to the expected message"
+      (then (expect = (good-message) (msg-or-blank (dec/decode (unhex (good)))))))
+    (scenario (str (count (bad-rows)) " malformed packets are errors with the stated reason") (then (expect = "" (row-diffs))))
+    (scenario "every proper prefix of a valid message is an error"
+      (then (expect = true (prefixes-error? (unhex (good)))) (expect = true (prefixes-error? (unhex "1234 8180 0001 0002 0000 0000 03777777 00 0001 0001 c00c 0001 0001 0000003c 0004 01020304 c00c 0001 0001 0000003c 0004 05060708")))))
+    (scenario "a name of 255 wire bytes is the longest accepted; one byte more is refused"
+      (then (expect = true (ok? (dec/decode (ok-long-name)))) (expect = true (err-has? (dec/decode (too-long-name)) "longer than 255"))))
+    (scenario "a message over 65535 bytes is refused before it is read"
+      (then (expect = true (err-has? (dec/decode (array 70000 0i8)) "longer than 65535"))))
+    (scenario "a TTL with the top bit set reads as zero (RFC 2181 8)"
+      (then (expect = "0" (match (dec/decode (unhex (str head " " question " c00c 0001 0001 80000001 0004 5db8d822"))) ((Ok m) (str (. (nth (. m answers) 0) ttl))) ((Err e) e)))))
+    (scenario "a compression pointer to an earlier name is followed"
+      (then (expect = "www.example.com" (match (dec/read-name (unhex (good)) 33) ((Ok p) (. p fst)) ((Err e) e)))
+            (expect = "35" (match (dec/read-name (unhex (good)) 33) ((Ok p) (str (. p snd))) ((Err e) e))))))
+  (feature "encoding"
+    (scenario "the query for a name is a header, one question and the EDNS0 OPT record"
+      (then (expect = (str "abcd" "0100" "0001" "0000" "0000" "0001" "03777777" "076578616d706c65" "03636f6d" "00" "0001" "0001" "00" "0029" "04d0" "00000000" "0000")
+                    (match (enc/query 43981 "www.example.com" 1 1232) ((Ok b) (hex-of b)) ((Err e) e)))))
+    (scenario "a name with an empty label, a label over 63 bytes or a space is refused"
+      (then (expect = false (enc/valid-name? "a..b")) (expect = false (enc/valid-name? (str-join (mapv (fn (i: i64) "a") (range 64)))))
+            (expect = false (enc/valid-name? "a b.c")) (expect = true (enc/valid-name? "a.b.c")) (expect = true (enc/valid-name? "_dmarc.example.com"))))
+    (scenario "compression points at an earlier suffix: the second name costs two bytes"
+      (then (expect = 2 (match (enc/encode (Message 1 0 [(Question "a.example.com" 1 1)] [(Rr "a.example.com" 1 1 1 (RdA "1.1.1.1"))] [] []))
+                              ((Ok b) (- (array-len b) (+ 12 (+ 15 4) (+ 10 4)))) ((Err _) -1))))))
+  (feature "round trips"
+    (scenario "3,000 generated messages encode and decode to themselves (the list is the first failures)"
+      (then (expect = [] (round-trip-failures 3000)))))
+  (feature "fuzzing the decoder"
+    (scenario "100,000 mutated responses decode or fail without a trap; every success re-encodes to a message that decodes to it"
+      (given [r (fuzz 100000)])
+      (then (expect = 0 (nth r 2)) (expect = true (> (nth r 0) 2000)) (expect = true (> (nth r 1) 2000)))))
+  (feature "IP literals"
+    (scenario (str (count ip-rows) " IPv4 and IPv6 texts") (then (expect = "" (ip-diffs)))))
+  (feature "configuration"
+    (scenario (str (count conf-rows) " resolv.conf texts") (then (expect = "" (conf-diffs))))
+    (scenario "/etc/hosts: names are case-insensitive, comments and bad lines skipped, family filters"
+      (then (expect = "10.1.2.3 2001:db8::7 " (hosts-line "web" 0)) (expect = "10.1.2.3 " (hosts-line "WEB.example.com." 4)) (expect = "2001:db8::7 " (hosts-line "web" 6))
+            (expect = "127.0.0.1 ::1 " (hosts-line "localhost" 0)) (expect = "" (hosts-line "host1" 0)) (expect = "" (hosts-line "nobody" 0))))
+    (scenario "absent files give the fallbacks"
+      (then (expect = "127.0.0.1:53,||1|5000|2" (conf-line (load-resolv-conf "/nonexistent/resolv.conf"))) (expect = 0 (count (load-hosts "/nonexistent/hosts"))))))
+  (feature "the cache"
+    (scenario "a positive entry lives for its TTL and not a nanosecond longer"
+      (given [c (new-cache 8) _ (cache-put c "a|1" ["1.1.1.1"] 10 (* 100 sec))])
+      (then (expect = "pos:1" (entry-line c "a|1" (+ (* 100 sec) (* 10 sec) -1))) (expect = "-" (entry-line c "a|1" (+ (* 100 sec) (* 10 sec))))))
+    (scenario "a TTL of 0 is not cached; a huge TTL is capped at a day"
+      (given [c (new-cache 8) z (cache-put c "z|1" ["1.1.1.1"] 0 0) _ (cache-put c "big|1" ["1.1.1.1"] 99999999 0)])
+      (then (expect = false z) (expect = "-" (entry-line c "z|1" 1)) (expect = "pos:1" (entry-line c "big|1" (- (* 86400 sec) 1))) (expect = "-" (entry-line c "big|1" (* 86400 sec)))))
+    (scenario "a negative entry says which, expires, and is capped at an hour"
+      (given [c (new-cache 8) _ (cache-put-negative c "n|1" "nxdomain" 30 0) _ (cache-put-negative c "d|1" "nodata" 99999 0)])
+      (then (expect = "nxdomain:0" (entry-line c "n|1" (- (* 30 sec) 1))) (expect = "-" (entry-line c "n|1" (* 30 sec)))
+            (expect = "nodata:0" (entry-line c "d|1" (- (* 3600 sec) 1))) (expect = "-" (entry-line c "d|1" (* 3600 sec)))))
+    (scenario "the cache never holds more than its limit: expired entries go first, then the one that expires soonest"
+      (given [c (new-cache 3) _ (cache-put c "a|1" ["1.1.1.1"] 50 0) _ (cache-put c "b|1" ["1.1.1.1"] 10 0) _ (cache-put c "c|1" ["1.1.1.1"] 90 0)
+              _ (cache-put c "d|1" ["1.1.1.1"] 70 (* 20 sec)) s1 (cache-size c) _ (cache-put c "e|1" ["1.1.1.1"] 70 (* 21 sec))])
+      (then (expect = 3 s1) (expect = 3 (cache-size c)) (expect = "-" (entry-line c "b|1" (* 21 sec))) (expect = "-" (entry-line c "a|1" (* 22 sec)))
+            (expect = "pos:1" (entry-line c "c|1" (* 22 sec))) (expect = "pos:1" (entry-line c "d|1" (* 22 sec))) (expect = "pos:1" (entry-line c "e|1" (* 22 sec)))))
+    (scenario "ten thousand distinct names leave at most the limit"
+      (given [c (new-cache 100) _ (map (fn (i: i64) (cache-put c (str "n" i "|1") ["1.1.1.1"] 60 (* i 1000))) (range 10000))])
+      (then (expect = true (<= (cache-size c) 100)))))
+  (feature "the search rules"
+    (scenario "ndots and search decide the order of the names tried"
+      (then (expect = "svc.corp.test svc " (cand-line ["corp.test"] 1 "svc")) (expect = "a.b a.b.corp.test " (cand-line ["corp.test"] 1 "a.b"))
+            (expect = "a.b.corp.test a.b " (cand-line ["corp.test"] 2 "a.b")) (expect = "a.b " (cand-line ["corp.test"] 2 "a.b.")) (expect = "x " (cand-line [] 1 "x"))
+            (expect = "a.one a.two a " (cand-line ["one" "two"] 1 "a")))))
+  (feature "reading an answer"
+    (scenario "addresses at the question's name"
+      (then (expect = "1.1.1.1,2.2.2.2,@60" (show (interpret (msg [(a "www.test" 60 "1.1.1.1") (a "WWW.test" 300 "2.2.2.2")] [] 0) 1)))))
+    (scenario "a CNAME chain is followed and the smallest TTL wins"
+      (then (expect = "9.9.9.9,@5" (show (interpret (msg [(cn "www.test" 100 "mid.test") (cn "mid.test" 5 "end.test") (a "end.test" 60 "9.9.9.9")] [] 0) 1)))))
+    (scenario "records for names off the chain are ignored (not trusted into the answer)"
+      (then (expect = "nodata@0" (show (interpret (msg [(a "other.test" 60 "6.6.6.6")] [] 0) 1)))
+            (expect = "9.9.9.9,@60" (show (interpret (msg [(a "evil.test" 60 "6.6.6.6") (a "www.test" 60 "9.9.9.9")] [] 0) 1)))))
+    (scenario "a CNAME loop and a chain of nine links are errors, a chain of eight is not"
+      (then (expect = "temp:CNAME loop" (show (interpret (msg [(cn "www.test" 60 "a.test") (cn "a.test" 60 "www.test")] [] 0) 1)))
+            (expect = "temp:CNAME loop" (show (interpret (msg [(cn "www.test" 60 "www.test")] [] 0) 1)))
+            (expect = "temp:CNAME chain too long" (show (interpret (msg (vec (map (fn (i: i64) (cn (if (= i 0) "www.test" (str "c" i ".test")) 60 (str "c" (+ i 1) ".test"))) (range 10))) [] 0) 1)))
+            (expect = "1.1.1.1,@60" (show (interpret (msg (conj (vec (map (fn (i: i64) (cn (if (= i 0) "www.test" (str "c" i ".test")) 60 (str "c" (+ i 1) ".test"))) (range 8))) (a "c8.test" 60 "1.1.1.1")) [] 0) 1)))))
+    (scenario "NXDOMAIN and NODATA carry the negative TTL from the SOA: the smaller of its TTL and its minimum; none without an SOA"
+      (then (expect = "nx@30" (show (interpret (msg [] [(soa 100 30)] 3) 1))) (expect = "nx@20" (show (interpret (msg [] [(soa 20 300)] 3) 1)))
+            (expect = "nodata@30" (show (interpret (msg [] [(soa 100 30)] 0) 1))) (expect = "nx@0" (show (interpret (msg [] [] 3) 1)))))
+    (scenario "SERVFAIL and REFUSED are temporary"
+      (then (expect = "temp:server answered rcode 2" (show (interpret (msg [] [] 2) 1))) (expect = "temp:server answered rcode 5" (show (interpret (msg [] [] 5) 1)))))
+    (scenario "a response is acceptable only with the ID, the response bit, opcode 0 and the same question"
+      (given [q (Question "www.test" 1 1)])
+      (then (expect = true (acceptable? q 1 (msg [] [] 0))) (expect = false (acceptable? q 2 (msg [] [] 0)))
+            (expect = false (acceptable? q 1 (with (msg [] [] 0) (flags 256)))) (expect = false (acceptable? q 1 (with (msg [] [] 0) (flags (+ 32768 2048)))))
+            (expect = false (acceptable? q 1 (with (msg [] [] 0) (questions [(Question "www.test" 28 1)]))))
+            (expect = false (acceptable? q 1 (with (msg [] [] 0) (questions [(Question "evil.test" 1 1)]))))
+            (expect = false (acceptable? q 1 (with (msg [] [] 0) (questions []))))))))
+
+(defun hex-of (b: (Array i8)) -> str (str-join (mapv (fn (i: i64) (hex2 (zext i64 (array-get b i)))) (range (array-len b)))))
+
+(defun main () -> i64 (run-main (specs)))

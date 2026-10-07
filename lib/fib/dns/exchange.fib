@@ -1,0 +1,80 @@
+;; One question to one server: UDP first (a connected socket, so the kernel drops datagrams from any other address or port), a fresh random 16-bit ID from the platform's entropy
+;; for every try (no entropy is a failure, never a predictable ID), the answer accepted only when it is a response with that ID, opcode 0 and exactly the question asked (a datagram
+;; that is not is ignored and the wait goes on until the deadline: a spoofer cannot end the exchange early, only a real answer can), a truncated answer (TC) repeated over TCP to the
+;; same server (RFC 7766, two-byte length frame, bounded), EDNS0 dropped for one retry when the server answers FORMERR or NOTIMP (RFC 6891 7). The source port of a UDP socket
+;; is the kernel's random ephemeral port; the library does not bind one itself.
+(ns fib.dns.exchange (:use fib.core fib.seq fib.coll fib.dns.types fib.dns.config)
+  (:require [fib.dns.decode :as dec] [fib.dns.encode :as enc] [fib.os.net :as net] [fib.os.io :as io] [fib.os.errors :as os]
+            [fib.os.random :as rnd] [fib.os.time :as time]))
+(defenum Fail (NxDomain ttl: i64) (NoData ttl: i64) (Temp reason: str))
+(derive Eq Fail)
+(derive Debug Fail)
+(def udp-receive: i64 4096)
+(def tcp-limit: i64 65535)
+(defun same-question? :private (a: Question b: Question) -> bool
+  (and (= (lower (. a name)) (lower (. b name))) (= (. a qtype) (. b qtype)) (= (. a qclass) (. b qclass))))
+(defun acceptable? (q: Question id: i64 m: Message) -> bool
+  (and (response? m) (= (. m id) id) (= (opcode m) 0) (= (count (. m questions)) 1) (same-question? q (nth (. m questions) 0))))
+(defun failure :private (e: os/OSError) -> Fail
+  (Temp (if (= (. e kind) os/TimedOut) "timeout" (. e message))))
+(defun listen-loop :private (fd: i64 q: Question id: i64 deadline: i64 stop: (Atom bool)) -> (Result Message Fail)
+  (loop []
+    (match (net/udp-recv fd udp-receive deadline stop)
+      ((Err e) (Err (failure e)))
+      ((Ok bytes) (match (dec/decode bytes)
+        ((Err _) (recur))
+        ((Ok m) (if (acceptable? q id m) (Ok m) (recur))))))))
+(defun udp-once (server: Server q: Question id: i64 query: (Array i8) deadline: i64) -> (Result Message Fail)
+  (match (net/udp-open (. server addr) (. server port))
+    ((Err e) (Err (failure e)))
+    ((Ok fd) (let [r (match (net/udp-send fd query) ((Err e) (Err (failure e))) ((Ok _) (listen-loop fd q id deadline (atom false))))]
+               (do (io/close-fd fd) r)))))
+(defun ms-left :private (deadline: i64) -> i64 (max 1 (min 3600000 (quot (- deadline (time/clock-now)) 1000000))))
+(defun read-exact :private (fd: i64 n: i64 deadline: i64 stop: (Atom bool)) -> (Result (Array i8) os/OSError)
+  (let [out (cell (array n 0i8))]
+    (loop [got 0]
+      (if (= got n) (Ok @out)
+        (match (net/wait-readable fd deadline stop)
+          ((Err e) (Err e))
+          ((Ok _) (match (io/read-fd fd (- n got))
+            ((Err e) (if (= (. e kind) os/Interrupted) (recur got) (Err e)))
+            ((Ok b) (if (= (array-len b) 0) (Err (os/OSError os/ConnectionReset 0 "read" "server closed the connection"))
+                      (do (dotimes (i (array-len b)) (array-set! &out (+ got i) (array-get b i))) (recur (+ got (array-len b)))))))))))))
+(defun tcp-read :private (fd: i64 deadline: i64) -> (Result (Array i8) os/OSError)
+  (match (read-exact fd 2 deadline (atom false))
+    ((Err e) (Err e))
+    ((Ok h) (let [n (+ (* 256 (zext i64 (array-get h 0))) (zext i64 (array-get h 1)))]
+              (if (or (= n 0) (> n tcp-limit)) (Err (os/invalid-input "read" "bad TCP frame length")) (read-exact fd n deadline (atom false)))))))
+(defun tcp-talk :private (fd: i64 query: (Array i8) deadline: i64) -> (Result (Array i8) os/OSError)
+  (match (net/send-all fd (enc/frame query) (ms-left deadline) (atom false))
+    ((Err e) (Err e))
+    ((Ok _) (tcp-read fd deadline))))
+(defun tcp-once (server: Server q: Question id: i64 query: (Array i8) deadline: i64) -> (Result Message Fail)
+  (match (net/connect-tcp (. server addr) (. server port) (ms-left deadline))
+    ((Err e) (Err (failure e)))
+    ((Ok fd) (let [r (tcp-talk fd query deadline)]
+      (do (io/close-fd fd)
+        (match r
+          ((Err e) (Err (failure e)))
+          ((Ok bytes) (match (dec/decode bytes)
+            ((Err why) (Err (Temp (str "bad TCP answer: " why))))
+            ((Ok m) (if (acceptable? q id m) (Ok m) (Err (Temp "TCP answer does not match the question"))))))))))))
+(defun fresh-id :private () -> (Result i64 Fail)
+  (match (rnd/random-bytes 2)
+    ((Err _) (Err (Temp "no entropy for the query ID")))
+    ((Ok b) (Ok (+ (* 256 (zext i64 (array-get b 0))) (zext i64 (array-get b 1)))))))
+(defun over-tcp :private (m: Message server: Server q: Question id: i64 query: (Array i8) deadline: i64) -> (Result Message Fail)
+  (if (truncated? m) (tcp-once server q id query deadline) (Ok m)))
+(defun try-once :private (server: Server q: Question edns: i64 deadline: i64) -> (Result Message Fail)
+  (match (fresh-id)
+    ((Err f) (Err f))
+    ((Ok id) (match (enc/query id (. q name) (. q qtype) edns)
+      ((Err why) (Err (Temp (str "cannot encode the query: " why))))
+      ((Ok query) (match (udp-once server q id query deadline)
+        ((Err f) (Err f))
+        ((Ok m) (over-tcp m server q id query deadline))))))))
+;; The server's answer for q, or why not. edns is the advertised UDP size (0 for no EDNS0).
+(defun ask (server: Server q: Question edns: i64 deadline: i64) -> (Result Message Fail)
+  (match (try-once server q edns deadline)
+    ((Err f) (Err f))
+    ((Ok m) (if (and (> edns 0) (includes? (rcode m) [rcode-formerr 4])) (ask server q 0 deadline) (Ok m)))))
