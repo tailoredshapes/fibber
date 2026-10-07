@@ -1,5 +1,9 @@
 (ns fib.os.files (:use fib.core fib.seq fib.coll fib.os.errors)
-  (:require [fib.os.io :as io] [fib.os.abi :as a]))
+  (:require [fib.os.io :as io] [fib.os.abi :as a] [fib.os.native :as n]))
+(extern fsync :private (i32) -> i32)
+(extern ftruncate :private (i32 i64) -> i32)
+(extern flock :private (i32 i32) -> i32)
+(extern rename :private (ptr ptr) -> i32)
 (defenum FileAccess (ReadOnly) (WriteOnly) (ReadWrite))
 (defstruct FileOptions (access: FileAccess create: bool create-new: bool truncate: bool append: bool mode: i64))
 (defun default-file-options () -> FileOptions (FileOptions ReadOnly false false false false 420))
@@ -39,3 +43,19 @@
   (try-let [fd (open-file path (with (default-file-options) (access WriteOnly) (create true) (truncate true)))]
     (let [result (io/write-all fd bytes) closed (io/close-fd fd)]
       (try-let [_ result _ closed] (Ok ())))))
+;; Durability (docs/design/platform-boundary.md, files): what a store needs to survive a crash. `sync-fd` is fsync(2): the file's data and
+;; metadata are on the device when it answers. `rename-file` is rename(2), atomic: a reader of `to` sees the old file or the new one, never half
+;; (with `sync-fd` of the new file first and of the directory after, the temp+fsync+rename idiom). `truncate-fd` is ftruncate(2). `lock-fd`
+;; takes flock(2)'s exclusive lock without waiting: Err WouldBlock while another open file description holds it; the lock goes when the
+;; descriptor is closed or the process ends (LOCK_EX 2, LOCK_NB 4 on Linux and Darwin; WASI preview 1 has no flock, so it does not link there).
+(defun sync-fd (fd: i64) -> (Result unit OSError) (c-unit (unsafe (sext i64 (fsync (trunc i32 fd)))) "fsync"))
+(defun truncate-fd (fd: i64 size: i64) -> (Result unit OSError)
+  (if (< size 0) (Err (invalid-input "ftruncate" "negative size")) (c-unit (unsafe (sext i64 (ftruncate (trunc i32 fd) size))) "ftruncate")))
+(defun lock-fd (fd: i64) -> (Result unit OSError) (c-unit (unsafe (sext i64 (flock (trunc i32 fd) 6i32))) "flock"))
+(defun sync-path (path: str) -> (Result unit OSError)
+  (try-let [fd (open-file path (default-file-options))]
+    (let [synced (sync-fd fd) closed (io/close-fd fd)] (try-let [_ synced _ closed] (Ok ())))))
+(defun rename-file (from: str to: str) -> (Result unit OSError)
+  (if (not (and (n/valid-text? from) (n/valid-text? to))) (Err (invalid-input "rename" "NUL in path"))
+    (let [a (n/c-text from) b (n/c-text to) r (unsafe (rename a b)) saved (n/errno)]
+      (unsafe (do (free a) (free b) (if (< r 0i32) (Err (error-from-code saved "rename")) (Ok ())))))))

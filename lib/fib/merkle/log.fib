@@ -1,0 +1,17 @@
+;; fib.merkle.log: a merkle tree that keeps its own nodes, in memory: items are appended at offsets 0, 1, 2, ...
+(ns fib.merkle.log (:use fib.core fib.seq fib.coll fib.merkle.node fib.merkle.tree))
+
+(defstruct MerkleLog (tree: MerkleTree nodes: (Map str MerkleNode)))
+
+(defun merkle-log () -> MerkleLog (MerkleLog (empty-tree) {}))
+(defun log-count (l: MerkleLog) -> i64 (tree-count (. l tree)))
+
+;; Appends the item whose digest is `item` at the next offset.
+(defun log-append (l: MerkleLog hasher: (fn ((Array i8)) (Array i8)) :borrow item: (Array i8)) -> MerkleLog
+  (let [a (append (. l tree) hasher item (tree-count (. l tree)))]
+    (MerkleLog (. a tree) (reduce (fn (m: (Map str MerkleNode) w: (Pair str MerkleNode)) (assoc m (. w fst) (. w snd))) (. l nodes) (. a written)))))
+
+(defun log-root (l: MerkleLog hasher: (fn ((Array i8)) (Array i8)) :borrow) -> (Option str) (root (. l tree) hasher))
+
+(defun log-proof (l: MerkleLog hasher: (fn ((Array i8)) (Array i8)) :borrow offset: i64) -> (Option MerkleProof)
+  (let [nodes (. l nodes)] (proof (. l tree) hasher (fn (d: str) (get nodes d)) offset)))

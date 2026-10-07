@@ -1,0 +1,37 @@
+;; spec: docs/design/platform-boundary.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; The durability calls of fib.os.files: fsync, ftruncate, rename over an existing file, and flock's exclusive lock (a second open file
+;; description of the same file is refused, WouldBlock, until the first is closed).
+(ns main (:use tl.check) (:require [fib.os :as os]))
+(defun text (path: str) -> str (match (os/read-file-bytes path 1024) ((Ok b) (str-from-bytes b)) ((Err e) (. e message))))
+(defun open-rw (path: str) -> i64
+  (match (os/open-file path (with (os/default-file-options) (access os/ReadWrite) (create true))) ((Ok fd) fd) ((Err e) (trap (. e message)))))
+(defun main () -> i64
+  (let [c (checks)
+        dir (match (os/create-temp-directory "/tmp/fib-os-8322-XXXXXX") ((Ok d) d) ((Err e) (trap (. e message))))
+        a (str dir "/a") b (str dir "/b")]
+    (do (check c (= (os/write-file-bytes a (str-bytes "new")) (Ok ())))
+        (check c (= (os/write-file-bytes b (str-bytes "old")) (Ok ())))
+        (check c (= (os/sync-path a) (Ok ())))
+        (check c (= (os/rename-file a b) (Ok ())))
+        (check c (= (text b) "new"))
+        (check c (match (os/rename-file a b) ((Err e) (= (. e kind) os/NotFound)) ((Ok _) false)))
+        (check c (match (os/rename-file "a\0b" b) ((Err e) (= (. e kind) os/InvalidInput)) ((Ok _) false)))
+        (check c (= (os/sync-path dir) (Ok ())))
+        (let [fd (open-rw b) other (open-rw b)]
+          (do (check c (= (os/truncate-fd fd 2) (Ok ())))
+              (check c (= (os/sync-fd fd) (Ok ())))
+              (check c (= (text b) "ne"))
+              (check c (match (os/truncate-fd fd -1) ((Err e) (= (. e kind) os/InvalidInput)) ((Ok _) false)))
+              (check c (= (os/lock-fd fd) (Ok ())))
+              (check c (match (os/lock-fd other) ((Err e) (= (. e kind) os/WouldBlock)) ((Ok _) false)))
+              (check c (= (os/close-fd fd) (Ok ())))
+              (check c (= (os/lock-fd other) (Ok ())))
+              (check c (= (os/close-fd other) (Ok ())))))
+        (check c (match (os/sync-fd 987654) ((Err e) (= (. e kind) os/BadDescriptor)) ((Ok _) false)))
+        (os/remove-file b) (os/remove-directory dir)
+        (checks-result c))))
