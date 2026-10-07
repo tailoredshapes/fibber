@@ -14,6 +14,16 @@
        (loop [i 0] (cond (>= i m) nil (str-eq (nth keys i) k) (some (nth vals i)) :else (recur (+ i 1))))))
     (_ nil)))
 
+;; A hash index of one object, for lookups in a big one (JSON-3). `JObj keys vals` stays two vectors (a field of the enum would change every pattern that matches it, and every parse would pay
+;; for an index nobody asks for): `(index-object j)` makes the index once, `(index-get x "k")` finds a key in O(1). Under the default duplicate policy a key occurs once; with `duplicates` 1 the
+;; index holds the last pair of a repeated key (the first one is what `json-get` finds).
+(defun index-object (j: Json) -> (Option ObjIndex)
+  (match j
+    ((JObj keys vals) (some (ObjIndex vals (loop [i 0 m: (Map str i64) {}] (if (< i (count keys)) (recur (+ i 1) (assoc m (nth keys i) i)) m)))))
+    (_ nil)))
+
+(defun index-get (x: ObjIndex k: str) -> (Option Json) (if-some [i (get (. x at) k)] (some (nth (. x vals) i)) nil))
+
 (defun json-nth (j: Json i: i64) -> (Option Json)
   (match j ((JArr xs) (if (and (>= i 0) (< i (count xs))) (some (nth xs i)) nil)) (_ nil)))
 

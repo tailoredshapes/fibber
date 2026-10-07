@@ -3,6 +3,7 @@
 ;;   (json/parse text)                  -> (Result Json JsonError)      the DOM: JNull JBool JInt JFloat JBig JStr JArr JObj, objects in source order
 ;;   (json/parse-bytes bytes)  (json/read-file path)  (json/parse-with text opts)         the same from bytes (UTF-8 checked), a file, with options
 ;;   (json/write j) (json/write-pretty j) (json/write-with j (WriteOptions indent ascii)) (json/write-bytes j) (json/write-to fd j) (json/write-file path j)
+  ;; (json/index-object j) (json/index-get ix "k")  a hash index of one object for big objects     (json/write-sink j sink)  any sink: (fn ((Array i8)) (Result unit OSError))
 ;;   (json/get-key j "k") (json/get-index j 2) (json/get-in j ["a" "0" "b"]) (json/pointer j "/a/0/b")           lookups: Options
 ;;   (json/tape text)                   -> (Result Doc JsonError)       the zero-copy front: one validating pass, no allocation per value
 ;;   (json/field d i "k") (json/elem d i 2) (json/path d ["a" "b"])    node indices (-1 when absent); (json/node-str d i) (json/node-i64 d i) (json/node-f64 d i) (json/node-bool d i) -> Option
@@ -10,6 +11,7 @@
 ;;   (json/doc-write d) (json/doc-write-node d i) (json/doc-write-bytes d i)   a Doc written back compact without a Json: strings and numbers are copied as the source spelled them
 ;;   (json/reduce-events d f init)      SAX: f gets (acc, JsonEvent) per token         (json/documents text) a text of several documents (NDJSON or concatenated)
 ;;   (json/reduce-lines path opts f init)   a file of one document per line in chunks: bounded memory   (json/reduce-lines-par path opts f init) the same on all cores (lines only)
+;;   tolerant reading, OFF by default: (json/parse-with text (json/tolerant-options comments trailing-commas non-finite))
 ;;   (json/lines-seq path opts)              a lazy seq of the documents of a file (one per line, or concatenated with newlines between), bounded memory   (json/reduce-lines-par-map path opts g f init) g runs in the task
 ;;   (json/parse-lines text opts)            the documents of a text of one per line, parsed in parallel, in order
 ;;   (->json x)  (json/json->datum j)  (json/datum->json d)                    plain data and fib.datum
@@ -39,12 +41,15 @@
 (defun write-with (j: Json o: WriteOptions) -> str (w/write-with j o))
 (defun write-bytes (j: Json) -> (Array i8) (w/write-bytes j))
 (defun write-to (fd: i64 j: Json) -> (Result unit os/OSError) (io/write-to fd j))
+(defun write-sink (j: Json sink: (fn ((Array i8)) (Result unit os/OSError))) -> (Result unit os/OSError) (io/write-sink j sink))
 (defun write-file (path: str j: Json) -> (Result unit os/OSError) (io/write-file-json path j))
 
 (defun get-key (j: Json k: str) -> (Option Json) (a/json-get j k))
 (defun get-index (j: Json i: i64) -> (Option Json) (a/json-nth j i))
 (defun get-in (j: Json path: (Vec str)) -> (Option Json) (a/get-in j path))
 (defun pointer (j: Json p: str) -> (Option Json) (a/pointer j p))
+(defun index-object (j: Json) -> (Option ObjIndex) (a/index-object j))
+(defun index-get (x: ObjIndex k: str) -> (Option Json) (a/index-get x k))
 (defun type-name (j: Json) -> str (a/json-type j))
 
 (defun tape (s: str) -> (Result Doc JsonError) (tb/tape-of s))

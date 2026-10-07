@@ -29,6 +29,16 @@
 ;; Writes the compact text of j to the descriptor.
 (defun write-to (fd: i64 j: Json) -> (Result unit os/OSError) (os/write-all fd (write-bytes j)))
 
+
+;; Writes the compact text of j to any sink: a function that takes the next piece (an array of at most 64 KiB) and answers Ok, or an error that stops the write and is returned.
+;; `(write-to fd j)` is this with `(os/write-all fd piece)`; a socket, a buffer, a compressor or a test double is another sink. The text is built whole first (the DOM is in memory anyway).
+(defun write-sink (j: Json sink: (fn ((Array i8)) (Result unit os/OSError))) -> (Result unit os/OSError)
+  (let [b (write-bytes j) n (array-len b)]
+    (loop [i 0]
+      (if (>= i n) (Ok ())
+          (let [e (min n (+ i 65536))]
+            (match (sink (array-copy b i e)) ((Ok _) (recur e)) ((Err x) (Err x))))))))
+
 (defun write-file-json (path: str j: Json) -> (Result unit os/OSError) (os/write-file-bytes path (write-bytes j)))
 
 ;; Folds f over the documents of a file with one per line, each as a result; a blank line is skipped. Memory: one chunk (4 MiB) plus the document.

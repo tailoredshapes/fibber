@@ -34,6 +34,30 @@
 #   utf8-overlong     UTF-8 check: C0 and C1 lead bytes are accepted                     (specs/json-spec.fib)
 #   lone-surrogate    a lone low surrogate escape is accepted                            (specs/json-spec.fib)
 #   dup-last-wins     duplicate keys: the first value wins                               (specs/json-spec.fib)
+#   JSON-3 (each one planted in the piece that was added; the spec that guards it is named):
+#   doc-comma         docwrite: no comma before the second element of an array                (specs/json-doc-spec.fib)
+#   doc-colon         docwrite: the colon after a key is a comma                              (specs/json-doc-spec.fib)
+#   doc-string-end    docwrite: the closing quote of a string is written one byte late        (specs/json-doc-spec.fib)
+#   doc-close-kind    docwrite: an object is closed with ] and an array with }                (specs/json-doc-spec.fib)
+#   doc-count         docwrite: a container that closes does not count as a child of its parent (specs/json-doc-spec.fib)
+#   enc-vec-comma     defjson encoder: no comma between the elements of a Vec after the second (specs/json-encode-spec.fib)
+#   enc-key-comma     defjson encoder: no comma before the second field                       (specs/json-encode-spec.fib)
+#   enc-option-null   defjson encoder: a missing Option is `false`, not `null`                (specs/json-encode-spec.fib)
+#   enc-finish        defjson encoder: the last byte of the result is lost                    (specs/json-encode-spec.fib)
+#   stream-eof-merge  lines-seq: a document that does not end in its chunk is an error, not completed by reading on (specs/json-stream-spec.fib)
+#   stream-skip       lines-seq: the cursor after a long line is one byte too early                        (specs/json-stream-spec.fib)
+#   stream-order      reduce-lines-par-map: the results of a chunk are folded in reverse order (specs/json-stream-spec.fib)
+#   stream-head       reduce-lines-par-map: the line that straddles two reads is dropped      (specs/json-stream-spec.fib)
+#   utf8-fast-surrogate  UTF-8 fast path: ED is taken as an ordinary three-byte lead          (specs/json-stream-spec.fib)
+#   tol-line-comment  tolerant: a // comment ends at a carriage return, not a newline          (specs/json-stream-spec.fib)
+#   tol-array-comma   tolerant: a trailing comma before ] is not accepted                     (specs/json-stream-spec.fib)
+#   tol-default-on    tolerant: comments are accepted by the default options                    (specs/json-stream-spec.fib)
+#   tol-nan           tolerant: NaN is spelled NaX                                             (specs/json-stream-spec.fib)
+#   index-first       ObjIndex: every lookup answers the first value                           (specs/json-stream-spec.fib)
+#   sink-chunk        write-sink: a piece is 65537 bytes                                       (specs/json-stream-spec.fib)
+#   dtoa-pairs        float printing: the two digits of a pair are swapped                     (specs/json-floats-spec.fib json-prop-spec.fib)
+#   dtoa-zeros        float printing: one zero too few after `0.` for a small number           (specs/json-floats-spec.fib json-prop-spec.fib)
+#   plain-tail        writer: the overlapping last word of a string is read one byte early (the last byte is never tested)       (specs/json-prop-spec.fib)
 # environment: FIBC, MUT_OUT (scratch). exit: 0 when every mutant was killed, 1 when one survived, 2 for a setup error.
 set -uo pipefail
 R=$(cd "$(dirname "$0")/.." && pwd)
@@ -41,7 +65,7 @@ FIBC=${FIBC:-$HOME/.cache/fibber-scratch/gate-$(basename "$R")/F}
 [ -x "$FIBC" ] || { echo "mutant-json: no stage 2 fibc: set FIBC" >&2; exit 2; }
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-json}
 MUTANTS=("$@")
-[ ${#MUTANTS[@]} -gt 0 ] || MUTANTS=(escape-wrong swar-control simd-boundary simd-backslash simd-instring simd-esc-carry simd-token-carry simd-control write-vec-control lines-col lines-number lines-newline codec-path-index codec-missing-rec write-indent write-comma fast-comma-state fast-number-delim fast-close-kind fast-escape-flag fast-depth fast-string-end float-tie float-print clinger depth-off-by-one tape-depth leading-zero utf8-overlong lone-surrogate dup-last-wins)
+[ ${#MUTANTS[@]} -gt 0 ] || MUTANTS=(escape-wrong swar-control simd-boundary simd-backslash simd-instring simd-esc-carry simd-token-carry simd-control write-vec-control lines-col lines-number lines-newline codec-path-index codec-missing-rec write-indent write-comma fast-comma-state fast-number-delim fast-close-kind fast-escape-flag fast-depth fast-string-end float-tie float-print clinger depth-off-by-one tape-depth leading-zero utf8-overlong lone-surrogate dup-last-wins doc-comma doc-colon doc-string-end doc-close-kind doc-count enc-vec-comma enc-key-comma enc-option-null enc-finish stream-eof-merge stream-skip stream-order stream-head utf8-fast-surrogate tol-line-comment tol-array-comma tol-default-on tol-nan index-first sink-chunk dtoa-pairs dtoa-zeros plain-tail)
 
 sub() { perl -0pi -e "$2" "$1"; cmp -s "$1" "$1.orig" && { echo "mutant-json: pattern not found in $1: $2" >&2; return 1; }; return 0; }
 mutate() { # mutate NAME TREE -> sets SPECS
@@ -62,7 +86,7 @@ mutate() { # mutate NAME TREE -> sets SPECS
     codec-path-index) f=$j/codec.fib; cp $f $f.orig; SPECS="json-codec-spec"; sub $f 's/\(recur \(next-node d j\) \(\+ k 1\)\)/(recur (next-node d j) k)/' ;;
     codec-missing-rec) f=$j/codec.fib; cp $f $f.orig; SPECS="json-codec-spec"; sub $f 's/\(if \(< i 0\) nil ~built\)/~built/' ;;
     write-indent)     f=$j/writefast.fib; cp $f $f.orig; SPECS="json-spec json-prop-spec"; sub $f 's/\(\* level \(\. w indent\)\)/(* level 1)/' ;;
-    write-comma)      f=$j/writefast.fib; cp $f $f.orig; SPECS="json-spec json-prop-spec"; sub $f 's/\(if \(> i 0\) \(wchar b cap q 44\) q\)/(if (> i 1) (wchar b cap q 44) q)/g' ;;
+    write-comma)      f=$j/writefast.fib; cp $f $f.orig; SPECS="json-spec json-prop-spec"; sub $f 's/\(if first pos \(wchar b cap pos 44\)\)/(if first pos (wchar b cap pos 59))/; s/\(wbyte b pos 44\)/(wbyte b pos 59)/' ;;
     fast-comma-state) f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(and \(= st 1\) \(> dp 0\)\)/(and (or (= st 1) (= st 0)) (> dp 0))/' ;;
     fast-number-delim) f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(and \(>= e 0\) \(or \(= e n\) \(or \(= e next\) \(ws\? \(byte-at p e\)\)\)\)\)/(>= e 0)/' ;;
     fast-close-kind)  f=$j/tapefast.fib; cp $f $f.orig; SPECS="json-fast-spec"; sub $f 's/\(= arr \(= c 93\)\)/true/' ;;
@@ -78,6 +102,29 @@ mutate() { # mutate NAME TREE -> sets SPECS
     utf8-overlong)    f=$j/utf8.fib; cp $f $f.orig; SPECS="json-spec"; sub $f 's/\(< b0 194\) 0/(< b0 192) 0/' ;;
     lone-surrogate)   f=$j/parse.fib; cp $f $f.orig; SPECS="json-spec"; sub $f 's/\(and \(>= u 56320\) \(< u 57344\)\) \(do \(fail-at/(and false (< u 57344)) (do (fail-at/' ;;
     dup-last-wins)    f=$j/parse.fib; cp $f $f.orig; SPECS="json-spec"; sub $f 's/\(assoc vals dup \@vc\)/vals/' ;;
+    doc-comma)        f=$j/docwrite.fib; cp $f $f.orig; SPECS="json-doc-spec"; sub $f 's/\(if \(> c 0\) \(do \(dw-put o q 44\) \(\+ q 1\)\) q\)\)\)\)\)/(if (> c 1) (do (dw-put o q 44) (+ q 1)) q)))))/' ;;
+    doc-colon)        f=$j/docwrite.fib; cp $f $f.orig; SPECS="json-doc-spec"; sub $f 's/\(do \(dw-put o q 58\) \(\+ q 1\)\)/(do (dw-put o q 44) (+ q 1))/' ;;
+    doc-string-end)   f=$j/docwrite.fib; cp $f $f.orig; SPECS="json-doc-spec"; sub $f 's/\(dw-put o \(\+ q1 \(\+ \(- b a\) 1\)\) 34\)/(dw-put o (+ q1 (+ (- b a) 2)) 34)/' ;;
+    doc-close-kind)   f=$j/docwrite.fib; cp $f $f.orig; SPECS="json-doc-spec"; sub $f 's/\(if \(= \(sk-get sk \(- dp 1\) 1\) 1\) 125 93\)/(if (= (sk-get sk (- dp 1) 1) 1) 93 125)/' ;;
+    doc-count)        f=$j/docwrite.fib; cp $f $f.orig; SPECS="json-doc-spec"; sub $f 's/\(dw-count sk \(- dp 1\)\)\n/(do)\n/' ;;
+    enc-vec-comma)    f=$j/codecform.fib; cp $f $f.orig; SPECS="json-encode-spec"; sub $f 's/\(if \(> ~i 0\) \(fib.json.writefast\/wchar b cap pp 44\) pp\)/(if (> ~i 1) (fib.json.writefast\/wchar b cap pp 44) pp)/' ;;
+    enc-key-comma)    f=$j/codec.fib; cp $f $f.orig; SPECS="json-encode-spec"; sub $f 's/\(if \(= i 0\) "\\"" ",\\""\)/(if (< i 2) "\\"" ",\\"")/' ;;
+    enc-option-null)  f=$j/codecform.fib; cp $f $f.orig; SPECS="json-encode-spec"; sub $f 's/\(fib.json.writefast\/wnull b cap pp\)/(fib.json.writefast\/wbool b cap pp false)/' ;;
+    enc-finish)       f=$j/codec.fib; cp $f $f.orig; SPECS="json-encode-spec"; sub $f 's/\(ptr\+ \(raw ba\) 24\) n\)\) out\)\)/(ptr+ (raw ba) 24) (- n 1))) out))/' ;;
+    stream-eof-merge) f=$j/stream.fib; cp $f $f.orig; SPECS="json-stream-spec"; sub $f 's/\(= \(\. er code\) e-eof\)/false/' ;;
+    stream-skip)      f=$j/stream.fib; cp $f $f.orig; SPECS="json-stream-spec"; sub $f 's/\(some v\) \(some \(Pair \(Ok v\) \(at-pos st e\)\)\)/(some v) (some (Pair (Ok v) (at-pos st (- e 1))))/' ;;
+    stream-order)     f=$j/stream.fib; cp $f $f.orig; SPECS="json-stream-spec"; sub $f 's/\(reduce f acc rs\)/(reduce f acc (reverse rs))/' ;;
+    stream-head)      f=$j/stream.fib; cp $f $f.orig; SPECS="json-stream-spec"; sub $f 's/\(fold-lines-of head 0 \(array-len head\) o g f acc\) acc\)/acc acc)/' ;;
+    utf8-fast-surrogate) f=$j/utf8.fib; cp $f $f.orig; SPECS="json-stream-spec"; sub $f 's/\(and \(!= b0 237\) \(< \(\+ j 2\) n\)\)/(< (+ j 2) n)/' ;;
+    tol-line-comment) f=$j/parse.fib; cp $f $f.orig; SPECS="json-stream-spec"; sub $f 's/\(= \(at s n m\) 10\)\) m \(recur/(= (at s n m) 13)) m (recur/' ;;
+    tol-array-comma)  f=$j/parse.fib; cp $f $f.orig; SPECS="json-stream-spec"; sub $f 's/\(and \(tol-commas\? o\) \(= \(at s n p2\) 93\)\)/(and false (= (at s n p2) 93))/' ;;
+    tol-default-on)   f=$j/parse.fib; cp $f $f.orig; SPECS="json-stream-spec"; sub $f 's/\(!= \(bit-and \(\. o numbers\) 16\) 0\)/(!= (bit-and (. o numbers) 16) 1)/' ;;
+    tol-nan)          f=$j/parse.fib; cp $f $f.orig; SPECS="json-stream-spec"; sub $f 's/"NaN" \(JFloat/"NaX" (JFloat/' ;;
+    index-first)      f=$j/access.fib; cp $f $f.orig; SPECS="json-stream-spec"; sub $f 's/\(some \(nth \(\. x vals\) i\)\)/(some (nth (. x vals) 0))/' ;;
+    sink-chunk)       f=$j/io.fib; cp $f $f.orig; SPECS="json-stream-spec"; sub $f 's/\(min n \(\+ i 65536\)\)/(min n (+ i 65537))/' ;;
+    dtoa-pairs)       f=$j/dtoa.fib; cp $f $f.orig; SPECS="json-floats-spec json-prop-spec"; sub $f 's/\(dput p k \(zext i64 \(str-byte-at digit-pairs \(\+ \(\* r 2\) 1\)\)\)\)/(dput p k (zext i64 (str-byte-at digit-pairs (* r 2))))/' ;;
+    dtoa-zeros)       f=$j/dtoa.fib; cp $f $f.orig; SPECS="json-floats-spec json-prop-spec"; sub $f 's/\(< i \(\+ at \(- 1 e\)\)\)/(< i (+ at (- 0 e)))/' ;;
+    plain-tail)       f=$j/escape.fib; cp $f $f.orig; SPECS="json-prop-spec"; sub $f 's/\(\+ 24 \(- n 8\)\)/(+ 24 (- n 9))/' ;;
     *) echo "mutant-json: unknown mutant $1" >&2; return 1 ;;
   esac
 }
