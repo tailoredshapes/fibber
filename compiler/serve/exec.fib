@@ -1,0 +1,65 @@
+;; compiler/serve/exec.fib: running a compiled program on behalf of a request, in a process of its own (docs/design/dev-loop.md section 8.4). The server has
+;; already made the lIR (its front end is the engine's, so its cache is warm); `spawn-run` forks a reporter, which forks the program: the program's
+;; standard output and error go to two files, its standard input is /dev/null, an alarm ends it after `secs` seconds, and a trap, a signal or a
+;; timeout ends only that process. The reporter waits for it, reads the files, has `finish` make the response line from the status and the two texts,
+;; writes it to the client's connection and exits. The server never waits: it goes back to its next connection, so runs are concurrent. Neither child
+;; keeps the listening socket, so a server that dies leaves nothing holding its address.
+(ns serve.exec
+  (:require [serve.sock :as sk] [fib.unix :as unix] [driver.native :as native]))
+
+(def output-max: i64 4194304)
+
+(defun scratch-dir () -> str
+  (let ((tmp (unwrap-or (native/getenv-opt "TMPDIR") "/tmp")))
+    (str (if (= tmp "") "/tmp" tmp) "/fibc-serve-" (show (sk/process-id)))))
+
+(defun make-scratch () -> str
+  (let ((d (scratch-dir))) (do (unix/fd-mkdir d 448) d)))
+
+;; The text a program wrote, cut at `output-max` bytes (on a byte that begins a character) with a note.
+(defun output-text (path: str) -> str
+  (match (read-file path)
+    (nil "")
+    ((some t) (if (> (str-len t) output-max)
+                  (str (str-slice t 0 (loop ((k output-max)) (if (and (> k 0) (= (bit-and (zext i64 (str-byte-at t k)) 192) 128)) (recur (- k 1)) k))) "\n[output cut]\n")
+                  t))))
+
+(defun open-onto :private (path: str flags: i64 fd: i64) -> unit
+  (match (unix/fd-open path flags 420)
+    ((Ok f) (do (sk/redirect f fd) (if (= f fd) () (do (unix/fd-close f) ()))))
+    ((Err _) ())))
+
+;; In the program's own process: streams, alarm, the run; the process never returns.
+(defun program-process :private (outp: str errp: str file: str lir: str opt: i64 args: (Vec str) secs: i64) -> unit
+  (do (sk/no-core)
+      (open-onto "/dev/null" unix/O_RDONLY 0)
+      (open-onto outp (+ unix/O_WRONLY (+ unix/O_CREAT unix/O_TRUNC)) 1)
+      (open-onto errp (+ unix/O_WRONLY (+ unix/O_CREAT unix/O_TRUNC)) 2)
+      (when (> secs 0) (sk/alarm-in secs))
+      (match (native/run-lir file lir opt args)
+        ((Ok code) (sk/exit-flush code))
+        ((Err m) (do (eprintln (str "compile failed: " m)) (sk/exit-flush 5))))))
+
+;; In the reporter: the program forked, waited for, its streams read, the response written, everything closed; the process never returns.
+(defun reporter :private (conn: i64 listener: i64 dir: str file: str lir: str opt: i64 args: (Vec str) secs: i64 finish: (fn (i64 str str) str)) -> unit
+  (let ((tag (str dir "/" (show (sk/process-id))))
+        (outp (str dir "/" (show (sk/process-id)) ".out"))
+        (errp (str dir "/" (show (sk/process-id)) ".err"))
+        (pid (sk/fork-process)))
+    (do (unix/fd-close listener)
+        (when (= pid 0)
+          (do (unix/fd-close conn) (program-process outp errp file lir opt args secs)))
+        (let ((status (if (< pid 0) 5 (sk/wait-process pid)))
+              (out (output-text outp))
+              (err (output-text errp)))
+          (do (unix/fd-unlink outp) (unix/fd-unlink errp)
+              (sk/write-line conn (finish status out err))
+              (unix/fd-close conn)
+              (sk/exit-now 0))))))
+
+;; Starts the run; true in the server when the reporter was forked (the server must then close its copy of `conn`), false when no process could be made.
+(defun spawn-run (conn: i64 listener: i64 dir: str file: str lir: str opt: i64 args: (Vec str) secs: i64 finish: (fn (i64 str str) str)) -> bool
+  (let ((pid (sk/fork-process)))
+    (cond (< pid 0) false
+          (= pid 0) (do (reporter conn listener dir file lir opt args secs finish) true)
+          :else true)))

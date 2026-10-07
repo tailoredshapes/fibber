@@ -33,7 +33,9 @@
 ;; modules made so far by macro key (a failed build is kept: the Rust keeps it too), and how many were added to the session.
 (defstruct Session
   (prelude: (Vec Stx) names: (Map str bool) jit: (Cell (Option jit/Jit)) mods: (Cell (Map str (Result fibm/Fibm ExpandErrKind)))
-   built: (Cell i64)))
+   built: (Cell i64)
+   ;; the key of each module's content, by ns, set by a server that keeps a session between requests (serve.incr); empty for a tool that makes one
+   chains: (Cell (Map str str))))
 
 ;; The names the program's modules define at top level: `defun` and `def`, also inside a `do`, a trailing `:` of a `def` taken off.
 ;; Rust: eval/macros.rs collect_names
@@ -52,7 +54,20 @@
     (_ names)))
 
 (defun session-new (prelude: (Vec Stx) program: (Vec Stx)) -> Session
-  (Session prelude (reduce (fn (acc: (Map str bool) f: Stx) (collect-names f acc)) (map-empty) program) (cell nil) (cell (map-empty)) (cell 0)))
+  (Session prelude (reduce (fn (acc: (Map str bool) f: Stx) (collect-names f acc)) (map-empty) program) (cell nil) (cell (map-empty)) (cell 0) (cell (map-empty))))
+
+;; A server keeps one session between requests: the same session with the names of this request's program, its JIT and the macros built so far
+;; shared (the cells are the same cells). A macro is built once for the content of its module (`session-key`), so an edit rebuilds the macros
+;; of the modules from the edit on and no others.
+(defun session-reuse (s: Session program: (Vec Stx)) -> Session
+  (Session (. s prelude) (reduce (fn (acc: (Map str bool) f: Stx) (collect-names f acc)) (map-empty) program) (. s jit) (. s mods) (. s built) (. s chains)))
+
+;; Says that the module `ns` has the content key `chain` from now on.
+(defun session-note-chain (s: Session ns: str chain: str) -> unit
+  (set! (. s chains) (assoc @(. s chains) ns chain)))
+
+(defun session-key :private (s: Session def: MacroDef) -> str
+  (str-join [(. def key) "@" (unwrap-or (get @(. s chains) (. def ns)) "")]))
 
 ;; ---------------------------------------------------------------- the module of a macro
 
@@ -189,11 +204,11 @@
 
 ;; The module of the macro, built on its first use. Rust: JitRunner::module
 (defun session-module :private (s: Session def: MacroDef ctx: ExpandCtx) -> (Result fibm/Fibm ExpandErrKind)
-  (match (get @(. s mods) (. def key))
+  (match (get @(. s mods) (session-key s def))
     ((some r) r)
     (nil
      (let ((r (build-module s def ctx)))
-       (do (set! (. s mods) (assoc @(. s mods) (. def key) r))
+       (do (set! (. s mods) (assoc @(. s mods) (session-key s def) r))
            r)))))
 
 ;; ---------------------------------------------------------------- one call
@@ -324,6 +339,10 @@
 (defun runner-new (prelude: (Vec Stx) program: (Vec Stx)) -> Runner
   (let ((s (session-new prelude program)))
     (Runner (fn (def: MacroDef args: (Vec Stx) ctx: ExpandCtx) (run-macro s def args ctx)))))
+
+;; The runner over an existing session (a server's).
+(defun runner-of (s: Session) -> Runner
+  (Runner (fn (def: MacroDef args: (Vec Stx) ctx: ExpandCtx) (run-macro s def args ctx))))
 
 ;; What a tool hands the passes: the runner of this module.
 (defun runner-maker () -> RunnerMaker

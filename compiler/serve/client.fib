@@ -1,0 +1,173 @@
+;; compiler/serve/client.fib: the client of `fibc serve`: `fibc --server VERB ..` (docs/design/dev-loop.md section 8.2). It sends one request, prints the answer the way the
+;; ordinary command prints it and exits with the same status. When no server answers (the socket is not there, nothing accepts at it, the connection
+;; drops before an answer: a crashed worker), it runs the ordinary path in this process instead, so the command always works; a note on standard error
+;; says so unless -q is given. Paths are sent absolute (the server has its own working directory).
+(ns serve.client
+  (:require [serve.sock :as sk] [serve.diag :as dg] [serve.incr :as inc] [lsp.json :as j] [fib.unix :as unix] [fib.os.process :as proc]
+            [driver.native :as native] [driver.commands :as c] [driver.test :as dt] [expand.roots :as roots] [expand.maker :as mk]))
+
+(defun default-path () -> str
+  (match (native/getenv-opt "FIBC_SOCKET")
+    ((some p) p)
+    (nil (match (native/getenv-opt "XDG_RUNTIME_DIR")
+           ((some d) (str d "/fibc-serve.sock"))
+           (nil (str "/tmp/fibc-serve-" (unwrap-or (native/getenv-opt "USER") "user") ".sock"))))))
+
+(defun absolute (p: str) -> str
+  (if (starts-with? p "/")
+      p
+      (match (proc/current-directory) ((Ok d) (str d "/" p)) ((Err _) p))))
+
+;; One request and its answer: the line sent, the line read. An error when the server cannot be reached or does not answer.
+(defun exchange (path: str line: str) -> (Result str str)
+  (match (sk/connect-unix path)
+    ((Err m) (Err m))
+    ((Ok fd)
+     (let ((r (match (sk/write-line fd line)
+                ((Err m) (Err m))
+                ((Ok _) (match (sk/conn-read-line (sk/conn-new fd))
+                          ((Err m) (Err m))
+                          ((Ok nil) (Err "the server closed the connection without an answer"))
+                          ((Ok (some l)) (Ok l)))))))
+       (do (unix/fd-close fd) r)))))
+
+(defstruct Opts (path: str json: bool quiet: bool words: (Vec str) timeout: i64))
+
+(defun parse-opts (words: (Vec str)) -> Opts
+  (loop ((i 0) (o (Opts (default-path) false false (vec-empty) 0)))
+    (if (>= i (count words))
+        o
+        (let ((w (nth words i)))
+          (cond (and (= w "--socket") (< (+ i 1) (count words))) (recur (+ i 2) (Opts (nth words (+ i 1)) (. o json) (. o quiet) (. o words) (. o timeout)))
+                (= w "--json") (recur (+ i 1) (Opts (. o path) true (. o quiet) (. o words) (. o timeout)))
+                (= w "-q") (recur (+ i 1) (Opts (. o path) (. o json) true (. o words) (. o timeout)))
+                (and (= w "--timeout") (< (+ i 1) (count words)))
+                  (recur (+ i 2) (Opts (. o path) (. o json) (. o quiet) (. o words) (unwrap-or (parse-long (nth words (+ i 1))) 0)))
+                :else (recur (+ i 1) (Opts (. o path) (. o json) (. o quiet) (conj (. o words) w) (. o timeout))))))))
+
+(defun req (op: str fields: (Vec (Pair str j/JVal))) -> str
+  (j/json-text (j/json-obj (into [(Pair "op" (j/json-str op))] fields))))
+
+(defun strs (xs: (Vec str)) -> j/JVal (j/JArr (mapv j/json-str xs)))
+
+;; ---- printing an answer
+
+(defun field :private (v: j/JVal key: str) -> (Option j/JVal) (j/json-get v key))
+(defun str-of :private (v: j/JVal key: str) -> str (match (field v key) ((some x) (unwrap-or (j/json-as-str x) "")) (nil "")))
+(defun int-of :private (v: j/JVal key: str) -> i64 (match (field v key) ((some (j/JInt n)) n) (_ 0)))
+
+(defun diag-line :private (d: j/JVal) -> str
+  (str-join [(str-of d "file") ":" (show (int-of d "line")) ":" (show (int-of d "col")) ": " (str-of d "message") " [" (str-of d "code") "]"]))
+
+;; Prints the diagnostics of an answer on standard error as the compiler prints a rejection; the exit status.
+(defun print-diagnostics (v: j/JVal) -> i64
+  (match (field v "diagnostics")
+    ((some (j/JArr ds))
+     (do (when (not (empty? ds)) (eprintln "rejected:"))
+         (doseq [d ds] (eprintln (diag-line d)))
+         (int-of v "exit")))
+    (_ (int-of v "exit"))))
+
+(defun print-error :private (v: j/JVal) -> i64
+  (match (field v "error")
+    ((some e) (do (eprintln (str "fibc: " (str-of e "message"))) 2))
+    (nil 2)))
+
+(defun print-answer :private (verb: str line: str json: bool) -> i64
+  (match (j/json-parse line)
+    ((Err m) (do (eprintln (str "fibc: the server's answer is not JSON: " m)) 2))
+    ((Ok v)
+     (cond json (do (println line) (if (= (int-of v "exit") 0) 0 (int-of v "exit")))
+           (not (some? (field v "error"))) (print-ok verb v)
+           :else (print-error v)))))
+
+(defun print-ok :private (verb: str v: j/JVal) -> i64
+  (cond (= verb "emit") (if (some? (field v "lir")) (native/write-stdout (str-of v "lir")) (print-diagnostics v))
+        (or (= verb "run") (= verb "test"))
+          (if (some? (field v "stdout"))
+              (do (native/write-stdout (str-of v "stdout")) (write-err (str-of v "stderr")) (int-of v "exit"))
+              (print-diagnostics v))
+        (= verb "check") (print-diagnostics v)
+        (= verb "eval") (print-eval v)
+        :else (do (println (j/json-text v)) 0)))
+
+(defun print-eval :private (v: j/JVal) -> i64
+  (cond (some? (field v "value")) (do (println (str-of v "value")) (write-err (str-of v "stderr")) (int-of v "exit"))
+        (some? (field v "type")) (do (println (str-of v "type")) 0)
+        (some? (field v "defined")) (do (println (j/json-text (unwrap-or (field v "defined") j/JNull))) 0)
+        (some? (field v "shown")) (do (match (field v "shown") ((some (j/JArr ls)) (doseq [l ls] (println (unwrap-or (j/json-as-str l) "")))) (_ ())) 3)
+        :else 0))
+
+(defun write-err :private (s: str) -> unit (when (not (= s "")) (do (unix/fd-write 2 (str-bytes s)) ())))
+
+;; ---- the verbs and their fallbacks
+
+(defun request-for :private (verb: str words: (Vec str) dirs: (Vec str) timeout: i64) -> (Option str)
+  (let ((roots (Pair "roots" (strs (mapv absolute dirs)))) (file (if (> (count words) 0) (absolute (nth words 0)) "")))
+    (cond (or (= verb "check") (= verb "emit")) (if (= (count words) 1) (some (req verb [(Pair "file" (j/json-str file)) roots])) nil)
+          (= verb "run") (with-timeout (run-request words file roots) timeout)
+          (= verb "test") (with-timeout (test-request words file roots) timeout)
+          (= verb "eval") (if (empty? words) nil (some (req "eval" [(Pair "text" (j/json-str (str-join (vec (interpose " " words)))))])))
+          (in-list? verb ["ping" "stats" "reset" "shutdown"]) (some (req verb []))
+          :else nil)))
+
+;; The request with a `timeout` field (seconds) when one was asked for; it is put in front of the closing brace.
+(defun with-timeout :private (r: (Option str) secs: i64) -> (Option str)
+  (match r
+    (nil nil)
+    ((some line) (if (> secs 0) (some (str (str-slice line 0 (- (str-len line) 1)) ",\"timeout\":" secs "}")) r))))
+
+(defun in-list? :private (w: str ws: (Vec str)) -> bool (some? (first (filter (fn (x: str) (= x w)) ws))))
+
+(defun run-request :private (words: (Vec str) file: str roots: (Pair str j/JVal)) -> (Option str)
+  (cond (= (count words) 0) nil
+        (= (count words) 1) (some (req "run" [(Pair "file" (j/json-str file)) roots]))
+        (= (nth words 1) "--") (some (req "run" [(Pair "file" (j/json-str file)) roots (Pair "args" (strs (vec (drop 2 words))))]))
+        :else nil))
+
+(defun test-request :private (words: (Vec str) file: str roots: (Pair str j/JVal)) -> (Option str)
+  (if (= (count words) 0)
+      nil
+      (let ((rest (vec (drop 1 words)))
+            (only (match (index-of rest "--only") (nil nil) ((some i) (if (< (+ i 1) (count rest)) (some (nth rest (+ i 1))) nil))))
+            (seed (match (index-of rest "--seed") (nil nil) ((some i) (if (< (+ i 1) (count rest)) (parse-long (nth rest (+ i 1))) nil)))))
+        (some (req "test" (into [(Pair "file" (j/json-str file)) roots]
+                                (into (match only (nil (vec-empty)) ((some o) [(Pair "only" (j/json-str o))]))
+                                      (match seed (nil (vec-empty)) ((some n) [(Pair "seed" (j/json-int n))])))))))))
+
+(defun index-of :private (xs: (Vec str) w: str) -> (Option i64)
+  (first (filter (fn (i: i64) (= (nth xs i) w)) (range (count xs)))))
+
+;; The ordinary command, in this process, when no server answered.
+(defun fallback :private (verb: str words: (Vec str) rts: roots/Roots rm: mk/RunnerMaker dirs: (Vec str)) -> i64
+  (cond (= verb "check") (check-here (nth words 0) rts)
+        (= verb "run") (c/cmd-run (nth words 0) false (if (> (count words) 2) (vec (drop 2 words)) (vec-empty)) 0 rts rm)
+        (= verb "emit") (c/cmd-emit (nth words 0) rts rm)
+        (= verb "test") (dt/cmd-test words dirs)
+        :else (do (eprintln (str "fibc: no server is running, and `" verb "` has nothing to do without one")) 2)))
+
+;; `check` in this process: a new engine (so nothing is cached), the same diagnostics.
+(defun check-here (file: str rts: roots/Roots) -> i64
+  (match (read-file file)
+    (nil (do (eprintln (str "fibc: cannot read " file)) 2))
+    ((some source)
+     (let ((f (inc/engine-front (inc/engine-new) file source rts "auto" false)))
+       (match (. f checked)
+         ((Ok _) 0)
+         ((Err ds) (do (when (not (empty? ds)) (eprintln "rejected:"))
+                       (doseq [d ds] (eprintln (dg/diag-text d)))
+                       (if (empty? ds) 0 3))))))))
+
+;; `fibc --server VERB WORDS..`: the exit status.
+(defun cmd-client (words: (Vec str) rts: roots/Roots rm: mk/RunnerMaker dirs: (Vec str)) -> i64
+  (let ((o (parse-opts words)) (ws (. (parse-opts words) words)))
+    (if (empty? ws)
+        (do (eprintln "usage: fibc --server check|emit|run|test|ping|stats|reset|shutdown FILE.. [--socket PATH] [--json] [-q]") 2)
+        (let ((verb (nth ws 0)) (rest (vec (drop 1 ws))))
+          (match (request-for verb rest dirs (. o timeout))
+            (nil (do (eprintln (str "fibc: `" verb "` does not take those arguments")) 2))
+            ((some line)
+             (match (exchange (. o path) line)
+               ((Ok answer) (print-answer verb answer (. o json)))
+               ((Err why) (do (when (not (. o quiet)) (eprintln (str "fibc: no server (" why "); running here")))
+                              (fallback verb rest rts rm dirs))))))))))

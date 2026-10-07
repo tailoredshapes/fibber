@@ -1,0 +1,216 @@
+;; compiler/serve/replcore.fib: the session of `fibc repl` and of the server's `eval` (docs/design/dev-loop.md section 9). A session is the text of its definitions: the `ns`
+;; clauses `require` and `use` added, and the top-level forms `def`, `defun`, `defrecord`, `defstruct`, `defenum`, `defprotocol`, `defmacro`, `extern`, `impl`,
+;; `derive` entered, a later definition of the same name replacing the earlier. Every input is a whole program: the session's text, then the input. A
+;; definition is accepted when the program of all the definitions checks (so a redefinition that breaks a dependent is refused, and says which one);
+;; an expression is the body of a `main` that prints its value with `prn`, and the program is made by the engine (serve.incr), so the library and the
+;; unchanged definitions cost the load, not the check of the library. Nothing is compiled between inputs: each run is a fresh program, so a definition is
+;; never stale and a `def` is evaluated again by every run. The core makes the program and says what to do; running it is the caller's.
+(ns serve.replcore
+  (:require [serve.incr :as inc] [serve.diag :as dg] [syntax.reader :as reader] [expand.roots :as roots] [fib.string :as s] [syntax.error :as se] [own.driver :as od] [emit.compile :as ec] [lsp.catalog :as cat])
+  (:use syntax.pos syntax.form))
+
+(defstruct Def (key: str name: str text: str))
+
+(defstruct Session (clauses: (Cell (Vec str)) defs: (Cell (Vec Def)) files: (Cell (Vec str)) runs: (Cell i64)))
+
+(defun session-new () -> Session (Session (cell (vec-empty)) (cell (vec-empty)) (cell (vec-empty)) (cell 0)))
+
+(def repl-file: str "<repl>")
+
+;; What an input is: definitions and clauses, then expressions, each run in turn.
+(defenum Action
+  (Parts defs: (Vec Def) clauses: (Vec str) exprs: (Vec str))
+  (Blank)
+  (Unreadable message: str))
+
+;; What making the program of an input came to.
+(defenum Evaled
+  (Defined names: (Vec str) stats: inc/Stats)
+  (Refused shown: (Vec str) diags: (Vec dg/Diag))
+  (ToRun lir: str stats: inc/Stats)
+  (Note text: str))
+
+;; ---- reading an input
+
+(defun head-of :private (f: Stx) -> str
+  (match (. f kind)
+    ((SList items) (if (empty? items) "" (match (. (nth items 0) kind) ((SSym h) h) (_ ""))))
+    (_ "")))
+
+(defun second-sym :private (f: Stx) -> str
+  (match (. f kind)
+    ((SList items) (if (< (count items) 2) "" (match (. (nth items 1) kind) ((SSym n) n) (_ ""))))
+    (_ "")))
+
+(defun type-head? :private (h: str) -> bool
+  (or (= h "defstruct") (or (= h "defrecord") (or (= h "defenum") (= h "defprotocol")))))
+
+(defun defining? :private (h: str) -> bool
+  (or (s/starts-with? h "def") (or (= h "extern") (or (= h "impl") (= h "derive")))))
+
+(defun strip-colon :private (n: str) -> str (if (s/ends-with? n ":") (str-slice n 0 (- (str-len n) 1)) n))
+
+(defun def-of :private (text: str f: Stx) -> Def
+  (let ((h (head-of f)) (n (strip-colon (second-sym f))) (src (str-slice text (. (. f pos) start) (. (. f pos) end))))
+    (cond (or (= h "impl") (= h "derive") (= n "")) (Def (str "text:" src) n src)
+          (type-head? h) (Def (str "type:" n) n src)
+          :else (Def (str "val:" n) n src))))
+
+(defun clause-of :private (text: str f: Stx) -> str
+  (let ((items (match (. f kind) ((SList is) is) (_ (vec-empty)))))
+    (str "(:" (head-of f) " " (str-join (vec (interpose " " (mapv (fn (x: Stx) (str-slice text (. (. x pos) start) (. (. x pos) end))) (vec (drop 1 items)))))) ")")))
+
+(defun clause-head? :private (h: str) -> bool (or (= h "require") (= h "use")))
+
+;; The text of a read error.
+(defun reader-message :private (e: se/ReadError) -> str (se/err-message (. e kind)))
+
+;; The clauses a form gives: `(require ..)` and `(use ..)` are one each, `(ns name clause..)` its clauses.
+(defun clauses-of :private (text: str f: Stx) -> (Vec str)
+  (let ((h (head-of f)) (items (match (. f kind) ((SList is) is) (_ (vec-empty)))))
+    (cond (clause-head? h) [(clause-of text f)]
+          (= h "ns") (mapv (fn (x: Stx) (str-slice text (. (. x pos) start) (. (. x pos) end))) (vec (drop 2 items)))
+          :else (vec-empty))))
+
+(defun other? :private (f: Stx) -> bool
+  (let ((h (head-of f))) (and (not (defining? h)) (and (not (clause-head? h)) (not (= h "ns"))))))
+
+;; The meaning of the text of one input.
+(defun classify (text: str) -> Action
+  (match (reader/read-all text repl-file)
+    ((Err e) (Unreadable (str (. (. e pos) line) ":" (. (. e pos) col) ": " (reader-message e))))
+    ((Ok forms)
+     (if (empty? forms)
+         Blank
+         (Parts (mapv (fn (f: Stx) (def-of text f)) (filterv (fn (f: Stx) (defining? (head-of f))) forms))
+                (vec (mapcat (fn (f: Stx) (clauses-of text f)) forms))
+                (mapv (fn (f: Stx) (str-slice text (. (. f pos) start) (. (. f pos) end))) (filterv other? forms)))))))
+
+;; Whether the text has an open bracket or string left: the line editor asks for more.
+(defun incomplete? (text: str) -> bool
+  (let ((n (str-len text)))
+    (loop ((i 0) (depth 0) (in-str false))
+      (if (>= i n)
+          (or in-str (> depth 0))
+          (let ((c (str-byte-at text i)))
+            (cond in-str (cond (= c 92i8) (recur (+ i 2) depth true) (= c 34i8) (recur (+ i 1) depth false) :else (recur (+ i 1) depth true))
+                  (= c 34i8) (recur (+ i 1) depth true)
+                  (= c 59i8) (recur (skip-line text i) depth false)
+                  (= c 92i8) (recur (+ i 2) depth false)
+                  (or (= c 40i8) (or (= c 91i8) (= c 123i8))) (recur (+ i 1) (+ depth 1) false)
+                  (or (= c 41i8) (or (= c 93i8) (= c 125i8))) (recur (+ i 1) (max 0 (- depth 1)) false)
+                  :else (recur (+ i 1) depth false)))))))
+
+(defun skip-line :private (text: str i: i64) -> i64
+  (match (str-find text "\n" i) ((some k) k) (nil (str-len text))))
+
+;; ---- the program of a session
+
+(defun clauses-text :private (cs: (Vec str)) -> str (str-join (mapv (fn (c: str) (str " " c)) cs)))
+
+(defun header (cs: (Vec str)) -> str (str "(ns main" (clauses-text cs) ")\n"))
+
+(defun lines-in (t: str) -> i64
+  (loop ((i 0) (n 0)) (if (>= i (str-len t)) n (recur (+ i 1) (if (= (str-byte-at t i) 10i8) (+ n 1) n)))))
+
+(defun defs-text (ds: (Vec Def)) -> str (str-join (mapv (fn (d: Def) (str (. d text) "\n")) ds)))
+
+;; The definitions with those of `news` in place of the ones they replace, the new ones last.
+(defun merge-defs (olds: (Vec Def) news: (Vec Def)) -> (Vec Def)
+  (into (filterv (fn (d: Def) (not (some? (first (filterv (fn (n: Def) (= (. n key) (. d key))) news))))) olds) news))
+
+(defun merge-clauses (olds: (Vec str) news: (Vec str)) -> (Vec str)
+  (into (filterv (fn (c: str) (not (some? (first (filterv (fn (n: str) (= n c)) news))))) olds) news))
+
+;; ---- diagnostics shown
+
+;; The name of the definition that holds line `line` of the session's text after the header, or "".
+(defun def-at-line (ds: (Vec Def) line: i64) -> str
+  (. (reduce (fn (acc: (Pair i64 str) d: Def)
+               (let ((end (+ (. acc fst) (lines-in (str (. d text) "\n")))))
+                 (Pair end (if (and (= (. acc snd) "") (<= line end)) (. d name) (. acc snd)))))
+             (Pair 0 "") ds)
+     snd))
+
+;; `<input>:L:C: message [code]` for a diagnostic at or after line `first` (the input's first line), else `<session>:L:C:` and the definition it is in.
+(defun show-diag (d: dg/Diag at: i64 ds: (Vec Def)) -> str
+  (if (and (= (. d file) repl-file) (>= (. d line) at))
+      (str "<input>:" (+ 1 (- (. d line) at)) ":" (. d col) ": " (. d message) " [" (. d code) "]")
+      (str (if (= (. d file) repl-file) "<session>" (. d file)) ":" (. d line) ":" (. d col) ": " (. d message) " [" (. d code) "]"
+           (if (= (. d file) repl-file) (str " (in the definition of " (def-at-line ds (- (. d line) 1)) ")") ""))))
+
+(defun refused (r: Evaled) -> bool (match r ((Refused _ _) true) (_ false)))
+
+;; ---- making the program
+
+(defun source-of (clauses: (Vec str) defs: (Vec Def) tail: str) -> str
+  (str (header clauses) (defs-text defs) tail))
+
+(defun front (e: inc/Engine rts: roots/Roots src: str mode: str want: bool) -> inc/Front
+  (inc/engine-front e repl-file src rts mode want))
+
+;; A definition input: accepted when the program of all the definitions checks; the session is changed only then.
+(defun define-input (s: Session e: inc/Engine rts: roots/Roots news: (Vec Def) cs: (Vec str)) -> Evaled
+  (if (some? (first (filterv (fn (d: Def) (= (. d name) "main")) news)))
+      (Refused ["`main` is reserved by the REPL (it holds the expression being run)"] (vec-empty))
+      (define-checked s e rts news cs)))
+
+(defun define-checked :private (s: Session e: inc/Engine rts: roots/Roots news: (Vec Def) cs: (Vec str)) -> Evaled
+  (let ((clauses (merge-clauses @(. s clauses) cs))
+        (defs (merge-defs @(. s defs) news))
+        (kept (- (count defs) (count news)))
+        (src (source-of clauses defs ""))
+        (at (+ 2 (lines-in (str (defs-text (vec (take kept defs))))))))
+    (let ((f (front e rts src "no" false)))
+      (match (. f checked)
+        ((Ok _) (accept s clauses defs news (. f stats)))
+        ((Err ds) (if (empty? ds)
+                      (accept s clauses defs news (. f stats))
+                      (Refused (mapv (fn (d: dg/Diag) (show-diag d at defs)) ds) ds)))))))
+
+(defun accept :private (s: Session clauses: (Vec str) defs: (Vec Def) news: (Vec Def) st: inc/Stats) -> Evaled
+  (do (set! (. s clauses) clauses) (set! (. s defs) defs)
+      (Defined (mapv (fn (d: Def) (. d name)) news) st)))
+
+;; An expression input: the program that prints its value (`prn`; an expression of type unit is run for its effect: a program that does not print has no instance of
+;; Debug for unit, and is made again without the print).
+(defun expression-input (s: Session e: inc/Engine rts: roots/Roots expr: str) -> Evaled
+  (let ((r (expression-with s e rts expr true)))
+    (match r
+      ((Refused _ ds)
+       (if (some? (first (filterv (fn (d: dg/Diag) (s/includes? (. d message) "Debug for unit")) ds)))
+           (expression-with s e rts expr false)
+           r))
+      (_ r))))
+
+(defun expression-with :private (s: Session e: inc/Engine rts: roots/Roots expr: str print: bool) -> Evaled
+  (let ((defs @(. s defs)) (clauses @(. s clauses)))
+    (let ((tail (if print (str "(defun main () -> i64\n  (do (prn\n" expr "\n) 0))\n") (str "(defun main () -> i64\n  (do (do\n" expr "\n) 0))\n")))
+          (at (+ 4 (lines-in (str (defs-text defs))))))
+      (let ((f (front e rts (source-of clauses defs tail) "yes" true)))
+        (match (. f checked)
+          ((Err ds) (Refused (mapv (fn (d: dg/Diag) (show-diag d at defs)) ds) ds))
+          ((Ok c) (to-run c (. f stats))))))))
+
+(defun to-run :private (c: od/Checked st: inc/Stats) -> Evaled
+  (match (ec/compile-executable (. c typed) (. c owned))
+    ((Err m) (Refused [(str "unsupported: " m)] (vec-empty)))
+    ((Ok lir) (ToRun lir st))))
+
+;; `:type`: the type of an expression, from the checker's table for a function made of it.
+(defun type-of-expr (s: Session e: inc/Engine rts: roots/Roots expr: str) -> (Result str (Vec str))
+  (let ((defs @(. s defs)) (clauses @(. s clauses)))
+    (let ((tail (str "(defun repl-type-of ()\n" expr "\n)\n"))
+          (at (+ 3 (lines-in (str (defs-text defs))))))
+      (let ((f (front e rts (source-of clauses defs tail) "no" true)))
+        (match (. f checked)
+          ((Err ds) (Err (mapv (fn (d: dg/Diag) (show-diag d at defs)) ds)))
+          ((Ok c) (match (cat/catalog-value (. c typed) "" "repl-type-of")
+                    (nil (Err ["no type for the expression"]))
+                    ((some it) (Ok (strip-wrapper (. it detail)))))))))))
+
+;; The catalog shows the function made for `:type` as `(fn :send () T)`: T is the type.
+(defun strip-wrapper :private (t: str) -> str
+  (if (and (s/starts-with? t "(fn :send () ") (s/ends-with? t ")"))
+      (str-slice t 13 (- (str-len t) 1))
+      t))

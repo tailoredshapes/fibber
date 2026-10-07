@@ -1,0 +1,171 @@
+;; compiler/serve/repl.fib: `fibc repl` (docs/design/dev-loop.md section 9). Read an input (serve.line: raw terminal editing, or plain lines from a pipe), continue it
+;; while its brackets are open, and act: definitions go into the session (serve.replcore), an expression is made into a program and run in a process of its own with the
+;; terminal as its streams, so a trap, an exit or an interrupt ends that process and the session goes on. The REPL keeps its own engine (serve.incr), the same code as the
+;; server's: the library's expansion is done once per session. It is a development tool, not a specification oracle (ADR 0005).
+(ns serve.repl
+  (:require [serve.replcore :as rc] [serve.incr :as inc] [serve.line :as ln] [serve.sock :as sk] [serve.diag :as dg] [driver.native :as native]
+            [expand.roots :as roots] [fib.string :as s]))
+
+(defstruct Repl (sess: rc/Session eng: inc/Engine rts: roots/Roots ed: ln/Editor echo: bool))
+
+(def prompt: str "fib> ")
+(def more: str "...  ")
+
+(def help-text: str
+  "inputs: definitions (def defun defrecord defstruct defenum defprotocol defmacro extern impl derive), (require ..) and (use ..), or one expression, whose value is printed with prn
+a redefinition replaces the earlier definition and is refused, with the dependent that breaks, when the program of all the definitions no longer checks
+:type EXPR   the type of EXPR            :doc NAME  what NAME is (also (doc NAME))     :time EXPR  run EXPR and say what it cost
+:load FILE   add the definitions of FILE and run its expressions                         :reload    load the files again
+:defs        the definitions             :reset     forget them                      :help  :quit (ctrl-d)")
+
+;; ---- running
+
+;; Runs `lir` in a process of its own, standard streams the terminal's; its status.
+(defun run-here (file: str lir: str) -> i64
+  (let ((pid (sk/fork-process)))
+    (cond (< pid 0) -1
+          (= pid 0) (do (sk/default-interrupt) (sk/no-core)
+                        (match (native/run-lir file lir 0 (vec-empty))
+                          ((Ok code) (sk/exit-flush code))
+                          ((Err m) (do (eprintln (str "compile failed: " m)) (sk/exit-flush 5))))
+                        0)
+          :else (sk/wait-process pid))))
+
+(defun say-status :private (status: i64) -> unit
+  (cond (= status 0) ()
+        (= status 134) (println "; the program trapped (status 134); the session is unchanged")
+        (= status 130) (println "; interrupted")
+        (< status 0) (println "; the program could not be started")
+        :else (println (str "; the program ended with status " status))))
+
+;; ---- one evaluated piece
+
+(defun show-all :private (lines: (Vec str)) -> unit (doseq [l lines] (println l)))
+
+(defun stats-note :private (st: inc/Stats) -> str
+  (str "; front end " (. st total-ms) " ms (" (. st modules) " modules, " (. st expanded) " expanded, " (. st reused) " reused)"))
+
+;; Evaluates an expression; the run's milliseconds when `timed`.
+(defun eval-expr (r: Repl expr: str timed: bool) -> unit
+  (match (rc/expression-input (. r sess) (. r eng) (. r rts) expr)
+    ((rc/Refused shown _) (do (show-all shown) (println "; refused")))
+    ((rc/ToRun lir st)
+     (let ((t0 (sys-clock-now)) (status (run-here rc/repl-file lir)))
+       (do (say-status status)
+           (when timed (println (str (stats-note st) ", run " (quot (- (sys-clock-now) t0) 1000000) " ms")))
+           ())))
+    (_ ())))
+
+(defun define-parts :private (r: Repl defs: (Vec rc/Def) clauses: (Vec str)) -> bool
+  (let ((had (filterv (fn (d: rc/Def) (some? (first (filterv (fn (o: rc/Def) (= (. o key) (. d key))) @(. (. r sess) defs))))) defs)))
+    (match (rc/define-input (. r sess) (. r eng) (. r rts) defs clauses)
+      ((rc/Refused shown _) (do (show-all shown) (println "; refused; the session is unchanged") false))
+      ((rc/Defined names _)
+       (do (println (str "; " (if (and (not (empty? had)) (= (count had) (count defs))) "redefined " "defined ")
+                         (str-join (vec (interpose ", " (into names clauses))))))
+           true))
+      (_ true))))
+
+(defun run-parts :private (r: Repl text: str) -> unit
+  (match (rc/classify text)
+    ((rc/Blank) ())
+    ((rc/Unreadable m) (println (str "<input>:" m)))
+    ((rc/Parts defs clauses exprs)
+     (let ((ok (if (and (empty? defs) (empty? clauses)) true (define-parts r defs clauses))))
+       (do (when ok (doseq [e exprs] (eval-expr r e false))) ())))))
+
+;; ---- commands
+
+(defun cmd-type :private (r: Repl expr: str) -> unit
+  (match (rc/type-of-expr (. r sess) (. r eng) (. r rts) expr)
+    ((Ok t) (println (str expr " : " t)))
+    ((Err lines) (show-all lines))))
+
+(defun cmd-doc :private (r: Repl name: str) -> unit
+  (match (first (filterv (fn (d: rc/Def) (= (. d name) name)) @(. (. r sess) defs)))
+    ((some d) (println (. d text)))
+    (nil (match (rc/type-of-expr (. r sess) (. r eng) (. r rts) name)
+           ((Ok t) (println (str name " : " t)))
+           ((Err lines) (show-all lines))))))
+
+(defun cmd-load :private (r: Repl path: str) -> unit
+  (match (read-file path)
+    (nil (println (str "; cannot read " path)))
+    ((some text) (do (when (not (some? (first (filterv (fn (p: str) (= p path)) @(. (. r sess) files)))))
+                       (set! (. (. r sess) files) (conj @(. (. r sess) files) path)))
+                     (run-parts r text)))))
+
+(defun cmd-reload :private (r: Repl) -> unit
+  (let ((fs @(. (. r sess) files)))
+    (if (empty? fs) (println "; nothing has been loaded") (doseq [f fs] (cmd-load r f)))))
+
+(defun cmd-defs :private (r: Repl) -> unit
+  (do (doseq [c @(. (. r sess) clauses)] (println c))
+      (doseq [d @(. (. r sess) defs)] (println (. d text)))))
+
+(defun cmd-reset :private (r: Repl) -> unit
+  (do (set! (. (. r sess) clauses) (vec-empty)) (set! (. (. r sess) defs) (vec-empty)) (println "; the session is empty")))
+
+(defun split-word :private (text: str) -> (Pair str str)
+  (match (str-find text " " 0)
+    (nil (Pair text ""))
+    ((some i) (Pair (str-slice text 0 i) (s/trim (str-slice text (+ i 1) (str-len text)))))))
+
+;; A command; false to end the session.
+(defun command :private (r: Repl text: str) -> bool
+  (let ((w (split-word text)) (c (. w fst)) (arg (. w snd)))
+    (cond (or (= c ":quit") (= c ":q")) false
+          (= c ":help") (do (println help-text) true)
+          (= c ":type") (do (cmd-type r arg) true)
+          (= c ":doc") (do (cmd-doc r arg) true)
+          (= c ":time") (do (eval-expr r arg true) true)
+          (= c ":load") (do (cmd-load r arg) true)
+          (= c ":reload") (do (cmd-reload r) true)
+          (= c ":defs") (do (cmd-defs r) true)
+          (= c ":reset") (do (cmd-reset r) true)
+          :else (do (println (str "; unknown command " c "; :help lists them")) true))))
+
+;; `(doc NAME)`, `(quit)` and `(exit)` as the REPL's own forms.
+(defun own-form :private (r: Repl text: str) -> (Option bool)
+  (let ((t (s/trim text)))
+    (cond (or (= t "(quit)") (= t "(exit)")) (some false)
+          (s/starts-with? t "(doc ") (do (cmd-doc r (s/trim (str-slice t 5 (- (str-len t) 1)))) (some true))
+          :else nil)))
+
+;; ---- the loop
+
+;; The text of one input: its first line and, while brackets are open, more.
+(defun read-input :private (r: Repl) -> (Result (Option str) str)
+  (match (ln/read-line (. r ed) prompt (. r echo))
+    ((Err m) (Err m))
+    ((Ok nil) (Ok nil))
+    ((Ok (some l)) (continue-input r l))))
+
+(defun continue-input :private (r: Repl text: str) -> (Result (Option str) str)
+  (if (and (rc/incomplete? text) (not (s/starts-with? (s/trim text) ":")))
+      (match (ln/read-line (. r ed) more (. r echo))
+        ((Err m) (Err m))
+        ((Ok nil) (Ok (some text)))
+        ((Ok (some l)) (continue-input r (str text "\n" l))))
+      (Ok (some text))))
+
+(defun step :private (r: Repl text: str) -> bool
+  (let ((t (s/trim text)))
+    (do (when (not (= t "")) (ln/remember (. r ed) (str-join (vec (interpose " " (ln/str-split-lines t))))))
+        (cond (= t "") true
+              (s/starts-with? t ":") (command r t)
+              :else (match (own-form r t) ((some k) k) (nil (do (run-parts r t) true)))))))
+
+(defun repl-loop :private (r: Repl) -> i64
+  (loop ((n 0))
+    (match (read-input r)
+      ((Err m) (do (eprintln (str "fibc repl: " m)) 2))
+      ((Ok nil) 0)
+      ((Ok (some text)) (if (step r text) (recur (+ n 1)) 0)))))
+
+;; `fibc repl [--echo]`: 0 at the end of the session.
+(defun repl-main (echo: bool dirs: (Vec str)) -> i64
+  (let ((ed (ln/editor-new 0))
+        (rts (roots/roots-from-env dirs (native/getenv-opt "FIB_LIB"))))
+    (do (native/ignore-sigpipe) (sk/ignore-interrupt)
+        (repl-loop (Repl (rc/session-new) (inc/engine-new) rts ed echo)))))

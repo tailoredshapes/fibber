@@ -1,0 +1,63 @@
+;; compiler/serve/diag.fib: machine-readable diagnostics (docs/design/dev-loop.md section 8.3). One `Diag` for each error the front end reports, with the place
+;; (file, line, column of the start; the byte offsets of start and end; the end as line and column when the file can be read), a `code` and the message.
+;; The code is `STAGE/KIND` where KIND is the variant name the pass dumps already print (`fibc emit-dump` and the types and own tools: `Unify`, `Resolve`,
+;; `BorrowEscapes`, `UnterminatedString`, `MacroFailed`, ...), so a diagnostic of the server and the dump of the same program name the same rule.
+;; STAGE is read, load, expand, type, own, or internal.
+(ns serve.diag
+  (:require [lsp.json :as j] [expand.error :as ee] [syntax.error :as se] [types.error :as te] [own.error :as oe] [expand.modules :as mods])
+  (:use syntax.pos expand.types expand.error))
+
+(defstruct Diag (code: str file: str line: i64 col: i64 start: i64 end: i64 message: str))
+
+(defun diag-at (code: str pos: Pos message: str) -> Diag
+  (Diag code (. pos file) (. pos line) (. pos col) (. pos start) (. pos end) message))
+
+(defun diag-nowhere (code: str file: str message: str) -> Diag (Diag code file 1 0 0 0 message))
+
+(defun line-col-at :private (text: str off: i64) -> (Pair i64 i64)
+  (let ((n (min off (str-len text))))
+    (loop ((i 0) (line 1) (from 0))
+      (cond (>= i n) (Pair line (+ 1 (- n from)))
+            (= (str-byte-at text i) 10i8) (recur (+ i 1) (+ line 1) (+ i 1))
+            :else (recur (+ i 1) line from)))))
+
+(defun diag-json (d: Diag texts: (Map str str)) -> j/JVal
+  (let ((text (get texts (. d file)))
+        (end (match text
+               ((some t) (line-col-at t (. d end)))
+               (nil (Pair (. d line) (. d col))))))
+    (j/json-obj [(Pair "severity" (j/json-str "error")) (Pair "code" (j/json-str (. d code)))
+                 (Pair "file" (j/json-str (. d file))) (Pair "line" (j/json-int (. d line))) (Pair "col" (j/json-int (. d col)))
+                 (Pair "endLine" (j/json-int (. end fst))) (Pair "endCol" (j/json-int (. end snd)))
+                 (Pair "start" (j/json-int (. d start))) (Pair "end" (j/json-int (. d end)))
+                 (Pair "message" (j/json-str (. d message)))])))
+
+;; The text of a diagnostic: the compiler's `FILE:LINE:COL: MESSAGE` and the code in brackets.
+(defun diag-text (d: Diag) -> str (str-join [(. d file) ":" (show (. d line)) ":" (show (. d col)) ": " (. d message) " [" (. d code) "]"]))
+
+(defun load-diag (e: LoadErr) -> Diag
+  (match e
+    ((LoadRead r) (diag-at (str "read/" (se/err-name (. r kind))) (. r pos) (se/err-message (. r kind))))
+    ((LoadSpec pos what) (diag-at "load/Spec" pos what))
+    ((LoadMissing ns file) (diag-nowhere "load/Missing" file (mods/load-err-message e)))
+    ((LoadCycle _ _) (diag-nowhere "load/Cycle" "" (mods/load-err-message e)))
+    ((LoadMismatch file _ _) (diag-nowhere "load/Mismatch" file (mods/load-err-message e)))))
+
+(defun expand-diag (e: ExpandError) -> Diag
+  (diag-at (str "expand/" (ee/expand-err-name (. e kind))) (. e pos) (ee/expand-err-message (. e kind))))
+
+(defun type-diags (es: (Vec te/TypeError)) -> (Vec Diag)
+  (mapv (fn (x: te/TypeError) (diag-at (str "type/" (te/error-kind-name (. x kind))) (. x pos) (. x message))) es))
+
+(defun own-diags (es: (Vec oe/OwnError)) -> (Vec Diag)
+  (mapv (fn (x: oe/OwnError) (diag-at (str "own/" (oe/own-error-kind-name (. x kind))) (. x pos) (. x message))) es))
+
+;; The diagnostics of a check failure.
+(defun check-diags (file: str e: oe/CheckError) -> (Vec Diag)
+  (match e
+    ((oe/CeType es) (type-diags es))
+    ((oe/CeOwn es) (own-diags es))
+    ((oe/CeRead m) [(diag-nowhere "read/Error" file m)])
+    ((oe/CeExpand m) [(diag-nowhere "expand/Error" file m)])
+    ((oe/CePrelude m) [(diag-nowhere "internal/Prelude" file m)])
+    ((oe/CeInternal m) [(diag-nowhere "internal/Checker" file m)])))

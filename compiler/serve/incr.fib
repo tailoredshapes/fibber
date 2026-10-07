@@ -1,0 +1,236 @@
+;; compiler/serve/incr.fib: the incremental front end of `fibc serve` and `fibc repl` (docs/design/dev-loop.md section 8.1). The engine holds, for the
+;; modules of every program it has seen, the expanded form of the module and the expander's context after it (serve.snap), each under a key that is the
+;; content of the module and of every module before it in the load order (so a module's key changes when it or anything it can depend on changes, and
+;; never otherwise). A request loads the program (the modules are read and parsed again: that is cheap), computes the keys, restores the context of the
+;; longest prefix of modules it already has and expands the rest. Modules after a changed one are expanded again even when they do not use it: the
+;; order is the dependency order, and the context after a module is a function of everything before it. Macros: one runner session is kept, and a macro
+;; is built once for the key of the module that defines it (macros.runner `session-key`), so an edit rebuilds the macros of the modules from it on.
+;; Typing and the ownership pass run on the whole expanded program every time, with the library's units not reached by the main module left unchecked
+;; (types.infer.demand): they are not cached, which is the floor of the loop (section 8.5). A verdict (the diagnostics of `check`) is kept by key, so
+;; a check of text already seen costs the load.
+(ns serve.incr
+  (:require [expand.modules :as mods] [expand.maker :as mk] [expand.roots :as roots] [expand.program :as prog] [expand.libdir :as libdir]
+            [macros.runner :as mr] [fib.string :as s] [syntax.reader :as reader] [types.driver :as td] [native.target :as nt] [serve.snap :as snap] [serve.diag :as dg])
+  (:use syntax.form expand.types expand.ctx expand.error types.error types.program types.driver own.error own.driver))
+
+(defstruct Entry (ctx: ExpandCtx exp: Expanded))
+
+;; What a request cost and what it reused. Times are milliseconds.
+(defstruct Stats (modules: i64 reused: i64 expanded: i64 verdict: bool load-ms: i64 expand-ms: i64 lower-ms: i64 check-ms: i64 total-ms: i64))
+
+(defstruct Engine
+  (entries: (Cell (Map str Entry))
+   prelude-key: (Cell i64)
+   prelude: (Cell (Vec Stx))
+   base: (Cell (Option ExpandCtx))
+   session: (Cell (Option mr/Session))
+   verdicts: (Cell (Map str (Vec dg/Diag)))))
+
+(def entries-max: i64 4000)
+
+(defun engine-new () -> Engine
+  (Engine (cell (map-empty)) (cell 0) (cell (vec-empty)) (cell nil) (cell nil) (cell (map-empty))))
+
+(defun empty-stats () -> Stats (Stats 0 0 0 false 0 0 0 0 0))
+
+(defun ms-since (t0: i64) -> i64 (quot (- (sys-clock-now) t0) 1000000))
+
+;; ---- the prelude and the keys
+
+;; The prelude's expanded forms and the context after them, from the cache while `lib/prelude.fib` has the content it had.
+(defun prelude-of (e: Engine) -> (Result (Pair (Vec Stx) ExpandCtx) (Vec dg/Diag))
+  (let ((text (unwrap-or (read-file (str-concat (libdir/library-dir) "/prelude.fib")) ""))
+        (key (hash-combine (hash text) (str-len text))))
+    (match @(. e base)
+      ((some b) (if (= @(. e prelude-key) key)
+                    (Ok (Pair @(. e prelude) (snap/ctx-snapshot b)))
+                    (prelude-fresh e key)))
+      (nil (prelude-fresh e key)))))
+
+(defun prelude-fresh :private (e: Engine key: i64) -> (Result (Pair (Vec Stx) ExpandCtx) (Vec dg/Diag))
+  (let ((ctx (ctx-new)))
+    (match (td/prelude-forms ctx)
+      ((Err m) (Err [(dg/diag-nowhere "internal/Prelude" "lib/prelude.fib" m)]))
+      ((Ok forms)
+       (do (set! (. e entries) (map-empty)) (set! (. e verdicts) (map-empty)) (set! (. e session) nil)
+           (set! (. e prelude-key) key) (set! (. e prelude) forms) (set! (. e base) (some (snap/ctx-snapshot ctx)))
+           (Ok (Pair forms ctx)))))))
+
+;; The key of a module: its content (text, name) after the key of the module before it.
+(defun module-key (prev: i64 text: str ns: str) -> i64
+  (hash-combine (hash-combine (hash-combine prev (hash text)) (str-len text)) (hash ns)))
+
+;; The text of a loaded module: the request's own text for the main file, else the file.
+(defun text-of (l: Loaded file: str source: str) -> str
+  (if (= (. l file) file) source (unwrap-or (read-file (. l file)) "")))
+
+;; The keys of the loaded modules, in order, from the key of the prelude.
+(defun keys-of (base: i64 loaded: (Vec Loaded) file: str source: str) -> (Vec i64)
+  (. (reduce (fn (acc: (Pair i64 (Vec i64)) l: Loaded)
+               (let ((k (module-key (. acc fst) (text-of l file source) (. (. l spec) ns))))
+                 (Pair k (conj (. acc snd) k))))
+             (Pair base (vec-empty)) loaded)
+     snd))
+
+;; ---- expansion
+
+;; How many modules from the first have an entry, and the context and expanded modules they give.
+(defun reusable :private (e: Engine keys: (Vec i64)) -> i64
+  (let ((es @(. e entries)))
+    (loop ((i 0))
+      (if (and (< i (count keys)) (some? (get es (show (nth keys i))))) (recur (+ i 1)) i))))
+
+(defun reused-modules :private (e: Engine keys: (Vec i64) j: i64) -> (Vec Expanded)
+  (mapv (fn (i: i64) (. (unwrap-or (get @(. e entries) (show (nth keys i))) (Entry (ctx-new) (Expanded (module-spec-main) (vec-empty)))) exp))
+        (range j)))
+
+(defun store-entry :private (e: Engine key: i64 ctx: ExpandCtx ex: Expanded) -> unit
+  (let ((es @(. e entries)))
+    (set! (. e entries) (assoc (if (> (count es) entries-max) (map-empty) es) (show key) (Entry (snap/ctx-snapshot ctx) ex)))))
+
+(defun session-of :private (e: Engine prelude: (Vec Stx) loaded: (Vec Loaded)) -> mr/Session
+  (let ((program (reduce (fn (acc: (Vec Stx) l: Loaded) (into acc (. l forms))) (vec-empty) loaded)))
+    (match @(. e session)
+      ((some s) (mr/session-reuse s program))
+      (nil (let ((s (mr/session-new prelude program))) (do (set! (. e session) (some s)) s))))))
+
+;; Expands modules j.. of `loaded` in `ctx`, each stored once expanded; all the modules, or the first error.
+(defun expand-rest :private (e: Engine loaded: (Vec Loaded) keys: (Vec i64) j: i64 ctx: ExpandCtx runner: Runner sess: mr/Session
+                             out0: (Vec Expanded)) -> (Result (Vec Expanded) (Vec dg/Diag))
+  (loop ((i j) (out out0))
+    (if (>= i (count loaded))
+        (Ok out)
+        (let ((l (nth loaded i)))
+          (do (mr/session-note-chain sess (. (. l spec) ns) (show (nth keys i)))
+              (mods/begin-spec ctx (. l spec))
+              (match (prog/expand-program (. l forms) ctx runner)
+                ((Err x) (Err [(dg/expand-diag x)]))
+                ((Ok forms)
+                 (let ((ex (mods/end-spec ctx (. l spec) forms)))
+                   (do (store-entry e (nth keys i) ctx ex)
+                       (recur (+ i 1) (conj out ex)))))))))))
+
+;; The expanded program: what is reusable, then the rest expanded.
+(defun expand-program :private (e: Engine prelude: (Vec Stx) base-ctx: ExpandCtx loaded: (Vec Loaded) keys: (Vec i64) rm: mr/Session)
+    -> (Pair i64 (Result (Vec Expanded) (Vec dg/Diag)))
+  (let ((j (reusable e keys))
+        (ctx (if (= j 0) base-ctx (snap/ctx-snapshot (. (unwrap-or (get @(. e entries) (show (nth keys (- j 1)))) (Entry base-ctx (Expanded (module-spec-main) (vec-empty)))) ctx)))))
+    (Pair j (expand-rest e loaded keys j ctx (mr/runner-of rm) rm (reused-modules e keys j)))))
+
+;; ---- the check
+
+(defun library-flags :private (modules: (Vec Expanded) target: str) -> (Vec bool)
+  (mapv (fn (i: i64) (and (< i (- (count modules) 1)) (and (empty? (. (. (nth modules i) spec) implicit)) (not (= (. (. (nth modules i) spec) ns) target)))))
+        (range (count modules))))
+
+;; Whether the forms define `main` at top level.
+(defun defines-main? (forms: (Vec Stx)) -> bool
+  (some? (first (filter (fn (f: Stx)
+                          (match (. f kind)
+                            ((SList items)
+                             (and (> (count items) 1)
+                                  (match [(. (nth items 0) kind) (. (nth items 1) kind)]
+                                    ([(SSym h) (SSym n)] (and (or (= h "defun") (= h "defn")) (= n "main")))
+                                    (_ false))))
+                            (_ false)))
+                        forms))))
+
+(defstruct Front (checked: (Result Checked (Vec dg/Diag)) stats: Stats key: str))
+
+(defun typecheck :private (modules: (Vec Expanded) prelude: (Vec Stx) main: bool file: str target: str) -> (Pair (Result Checked (Vec dg/Diag)) i64)
+  (let ((t0 (sys-clock-now)))
+    (match (lower-modules-for modules prelude (some (nt/target-info)))
+      ((Err es) (Pair (Err (dg/type-diags es)) (ms-since t0)))
+      ((Ok l)
+       (let ((lowered (ms-since t0)))
+         (match (own-check-lowered-with l main (some (library-flags modules target)))
+           ((Ok c) (Pair (Ok c) lowered))
+           ((Err x) (Pair (Err (dg/check-diags file x)) lowered))))))))
+
+;; What a request asks of the front end: the file (as the diagnostics name it), the file the loader starts from (`start`: the file itself, or for a library module a
+;; one-line program that requires it), that text, the module roots, whether `main` is required ("yes", "no", "auto": when the file defines it), whether
+;; the program itself is wanted (a run) or only the verdict (a check), and the module whose every unit is checked ("" for the program's own).
+(defstruct Job (file: str start: str source: str rts: roots/Roots mainmode: str want: bool target: str))
+
+;; A library module (`fib.*`) is not a program: it sees no implicit module and may define no `main`. It is checked as the module a one-line program requires, which
+;; sees the implicit modules the library's own instances come from; its own units are all checked, the others' only when reached. The text is the file's on disk.
+(defun library-job (file: str source: str rts: roots/Roots want: bool) -> (Option Job)
+  (match (reader/read-all source file)
+    ((Err _) nil)
+    ((Ok forms)
+     (match (mods/spec-of forms "main")
+       ((Err _) nil)
+       ((Ok spec)
+        (let ((ns (. spec ns)) (rel (str (str-replace-all ns "." "/") ".fib")))
+          (if (mods/sees-implicit ns (mods/implicit-lib))
+              nil
+              (some (Job file "<check>" (str "(ns main (:require [" ns " :as target]))\n") (root-for rts file rel) "no" want ns)))))))))
+
+(defun str-replace-all :private (s: str from: str to: str) -> str
+  (str-join (vec (interpose to (split-on s from)))))
+
+(defun split-on :private (s: str sep: str) -> (Vec str)
+  (loop ((i 0) (out []))
+    (match (str-find s sep i)
+      (nil (conj out (str-slice s i (str-len s))))
+      ((some k) (recur (+ k (str-len sep)) (conj out (str-slice s i k)))))))
+
+;; The roots with the one `file` is under first, when `file` ends with the module's path.
+(defun root-for :private (rts: roots/Roots file: str rel: str) -> roots/Roots
+  (let ((tail (str "/" rel)))
+    (cond (s/ends-with? file tail) (roots/Roots (into [(str-slice file 0 (- (str-len file) (str-len tail)))] (. rts dirs)) (. rts builtin))
+          (= file rel) (roots/Roots (into ["."] (. rts dirs)) (. rts builtin))
+          :else rts)))
+
+(defun job-of (file: str source: str rts: roots/Roots mainmode: str want: bool) -> Job
+  (match (library-job file source rts want)
+    ((some j) j)
+    (nil (Job file file source rts mainmode want ""))))
+
+;; The front end of a job through typing and ownership. Without `want` (a check), text seen before is answered from its verdict with no `Checked`: `Err []` is a
+;; program that held, and `stats.verdict` says it came from the cache. With `want` (a run) the program is always made.
+(defun engine-front (e: Engine file: str source: str rts: roots/Roots mainmode: str want: bool) -> Front
+  (engine-job e (job-of file source rts mainmode want)))
+
+(defun engine-job (e: Engine j: Job) -> Front
+  (let ((t0 (sys-clock-now)))
+    (match (prelude-of e)
+      ((Err ds) (Front (Err ds) (empty-stats) ""))
+      ((Ok [prelude base-ctx])
+       (match (mods/try-load-in (. j source) (. j start) (. j rts))
+         ((Err x) (Front (Err [(dg/load-diag x)]) (empty-stats) ""))
+         ((Ok loaded) (front-loaded e j loaded prelude base-ctx t0)))))))
+
+(defun front-loaded :private (e: Engine j: Job loaded: (Vec Loaded) prelude: (Vec Stx) base-ctx: ExpandCtx t0: i64) -> Front
+  (let ((t1 (ms-since t0))
+        (keys (keys-of @(. e prelude-key) loaded (. j start) (. j source)))
+        (mm (. j mainmode))
+        (main (cond (= mm "yes") true (= mm "no") false :else (defines-main? (. (nth loaded (- (count loaded) 1)) forms))))
+        (vkey (str (show (nth keys (- (count keys) 1))) "/" (show (hash (. j file))) "/" (if main "m" "l")))
+        (n (count loaded)))
+    (match (if (. j want) nil (get @(. e verdicts) vkey))
+      ((some ds) (Front (Err ds) (Stats n n 0 true t1 0 0 0 (ms-since t0)) vkey))
+      (nil (front-expand e j loaded prelude base-ctx keys main vkey t1 t0)))))
+
+(defun store-verdict :private (e: Engine key: str ds: (Vec dg/Diag)) -> unit
+  (let ((v @(. e verdicts)))
+    (set! (. e verdicts) (assoc (if (> (count v) entries-max) (map-empty) v) key ds))))
+
+(defun front-expand :private (e: Engine j: Job loaded: (Vec Loaded) prelude: (Vec Stx) base-ctx: ExpandCtx keys: (Vec i64) main: bool vkey: str t1: i64 t0: i64) -> Front
+  (let ((sess (session-of e prelude loaded))
+        (t2 (sys-clock-now))
+        (ex (expand-program e prelude base-ctx loaded keys sess))
+        (n (count loaded)))
+    (match (. ex snd)
+      ((Err ds) (do (store-verdict e vkey ds)
+                    (Front (Err ds) (Stats n (. ex fst) (- n (. ex fst)) false t1 (ms-since t2) 0 0 (ms-since t0)) vkey)))
+      ((Ok modules) (front-typed e j modules prelude main vkey (Stats n (. ex fst) (- n (. ex fst)) false t1 (ms-since t2) 0 0 0) t0)))))
+
+(defun front-typed :private (e: Engine j: Job modules: (Vec Expanded) prelude: (Vec Stx) main: bool vkey: str st0: Stats t0: i64) -> Front
+  (let ((t3 (sys-clock-now))
+        (tc (typecheck modules prelude main (. j file) (. j target)))
+        (r (. tc fst))
+        (t4 (sys-clock-now))
+        (st (Stats (. st0 modules) (. st0 reused) (. st0 expanded) false (. st0 load-ms) (. st0 expand-ms) (. tc snd) (- (quot (- t4 t3) 1000000) (. tc snd)) (ms-since t0))))
+    (do (store-verdict e vkey (match r ((Ok _) (vec-empty)) ((Err ds) ds)))
+        (Front r st vkey))))

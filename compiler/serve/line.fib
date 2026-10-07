@@ -1,0 +1,165 @@
+;; compiler/serve/line.fib: the line editor of `fibc repl` (docs/design/dev-loop.md section 9.3). On a terminal the descriptor is put in raw mode with the C library's termios (tcgetattr,
+;; cfmakeraw, tcsetattr: the platform gives that and nothing else is used; no readline) and a line is edited with: left and right, home and end, ctrl-a ctrl-e ctrl-b ctrl-f,
+;; backspace, delete, ctrl-d (end of input on an empty line, else delete), ctrl-k, ctrl-u, ctrl-w, ctrl-l, up and down (and ctrl-p, ctrl-n) through the history, ctrl-c (the line
+;; is dropped). Anywhere else (a pipe, a file) a line is read as it is, with no prompt echo. The history is the inputs of this run and of `~/.fibc_history`.
+(ns serve.line
+  (:require [serve.sock :as sk] [lair.ffi :as ffi] [fib.unix :as unix] [driver.native :as native]))
+
+(extern tcgetattr :private (i32 ptr) -> i32)
+(extern tcsetattr :private (i32 i32 ptr) -> i32)
+(extern cfmakeraw :private (ptr) -> unit)
+
+(def history-max: i64 1000)
+
+(defstruct Editor (tty: bool conn: sk/Conn history: (Cell (Vec str)) saved: ptr))
+
+(defun editor-new (fd: i64) -> Editor
+  (Editor (unix/fd-isatty fd) (sk/conn-new fd) (cell (load-history)) (unsafe (alloc 256))))
+
+(defun history-path :private () -> str (str (unwrap-or (native/getenv-opt "HOME") ".") "/.fibc_history"))
+
+(defun load-history :private () -> (Vec str)
+  (match (read-file (history-path))
+    (nil (vec-empty))
+    ((some t) (vec (take-last history-max (filterv (fn (l: str) (not (= l ""))) (vec (str-split-lines t))))))))
+
+(defun str-split-lines (t: str) -> (Vec str)
+  (loop ((i 0) (out []))
+    (match (str-find t "\n" i)
+      (nil (conj out (str-slice t i (str-len t))))
+      ((some k) (recur (+ k 1) (conj out (str-slice t i k)))))))
+
+(defun take-last :private (n: i64 xs: (Vec str)) -> (Vec str) (vec (drop (max 0 (- (count xs) n)) xs)))
+
+;; Remembers an input (in the run, and in the file unless the file cannot be written).
+(defun remember (ed: Editor line: str) -> unit
+  (let ((h @(. ed history)))
+    (when (and (not (= line "")) (not (and (not (empty? h)) (= (nth h (- (count h) 1)) line))))
+      (do (set! (. ed history) (conj h line))
+          (let ((fd (unix/fd-open (history-path) (+ unix/O_WRONLY (+ unix/O_CREAT unix/O_APPEND)) 384)))
+            (match fd ((Ok f) (do (unix/fd-write f (str-bytes (str line "\n"))) (unix/fd-close f) ())) ((Err _) ())))))))
+
+;; ---- raw mode
+
+(defun raw-on :private (ed: Editor) -> bool
+  (unsafe
+    (if (= (tcgetattr 0i32 (. ed saved)) 0i32)
+        (let ((raw (alloc 256)))
+          (do (dotimes (i 256) (store-i8 (ptr+ raw i) (load-i8 (ptr+ (. ed saved) i))))
+              (cfmakeraw raw)
+              (let ((r (tcsetattr 0i32 1i32 raw))) (do (free raw) (= r 0i32)))))
+        false)))
+
+(defun raw-off :private (ed: Editor) -> unit (do (unsafe (tcsetattr 0i32 1i32 (. ed saved))) ()))
+
+;; ---- keys
+
+(defenum Key (Char c: char) (Enter) (Eof) (Interrupt) (Left) (Right) (Up) (Down) (Home) (End) (Delete) (Backspace) (KillEnd) (KillLine) (KillWord) (Clear) (Other))
+
+(defun next-byte :private (ed: Editor) -> i64
+  (match (unix/fd-read 0 1) ((Ok bs) (if (= (array-len bs) 0) -1 (zext i64 (array-get bs 0)))) ((Err _) -1)))
+
+(defun utf8-char :private (ed: Editor lead: i64) -> Key
+  (let ((n (cond (>= lead 240) 3 (>= lead 224) 2 :else 1))
+        (bs (cell (array (+ n 1) 0i8))))
+    (do (array-set! &bs 0 (trunc i8 lead))
+        (dotimes (i n) (array-set! &bs (+ i 1) (trunc i8 (max 0 (next-byte ed)))))
+        (if (sk/utf8-ok? @bs) (match (first (str-chars (str-from-bytes @bs))) ((some c) (Char c)) (nil Other)) Other))))
+
+(defun escape-key :private (ed: Editor) -> Key
+  (let ((a (next-byte ed)))
+    (if (= a 91)
+        (let ((b (next-byte ed)))
+          (cond (= b 65) Up (= b 66) Down (= b 67) Right (= b 68) Left (= b 72) Home (= b 70) End
+                (= b 51) (do (next-byte ed) Delete)
+                (and (>= b 48) (<= b 57)) (do (loop ((c (next-byte ed))) (if (or (= c 126) (< c 0) (and (>= c 64) (<= c 126))) c (recur (next-byte ed)))) Other)
+                :else Other))
+        Other)))
+
+(defun read-key :private (ed: Editor) -> Key
+  (let ((b (next-byte ed)))
+    (cond (< b 0) Eof
+          (or (= b 13) (= b 10)) Enter
+          (= b 4) Eof (= b 3) Interrupt (= b 2) Left (= b 6) Right (= b 1) Home (= b 5) End (= b 16) Up (= b 14) Down
+          (= b 11) KillEnd (= b 21) KillLine (= b 23) KillWord (= b 12) Clear (or (= b 127) (= b 8)) Backspace
+          (= b 27) (escape-key ed)
+          (>= b 192) (utf8-char ed b)
+          (>= b 32) (Char (i32->char (trunc i32 b)))
+          :else Other)))
+
+;; ---- editing
+
+(defstruct Buf (chars: (Vec char) at: i64))
+
+(defun text-of :private (b: Buf) -> str (str-join (mapv (fn (c: char) (str c)) (. b chars))))
+
+(defun render :private (prompt: str b: Buf) -> unit
+  (let ((back (- (count (. b chars)) (. b at))))
+    (do (native/write-stdout (str "\r" prompt (text-of b) "\x1b[K" (if (> back 0) (str "\x1b[" back "D") "")))
+        ())))
+
+(defun word-start :private (cs: (Vec char) at: i64) -> i64
+  (let ((j (loop ((k at)) (if (and (> k 0) (= (nth cs (- k 1)) \space)) (recur (- k 1)) k))))
+    (loop ((k j)) (if (and (> k 0) (not (= (nth cs (- k 1)) \space))) (recur (- k 1)) k))))
+
+(defun with-chars :private (b: Buf cs: (Vec char) at: i64) -> Buf (Buf cs at))
+
+;; The effect of an editing key on the buffer; nil for a key that is not one.
+(defun edit :private (b: Buf k: Key) -> (Option Buf)
+  (let ((cs (. b chars)) (at (. b at)) (n (count (. b chars))))
+    (match k
+      ((Char c) (some (Buf (into (conj (vec (take at cs)) c) (vec (drop at cs))) (+ at 1))))
+      ((Left) (some (Buf cs (max 0 (- at 1)))))
+      ((Right) (some (Buf cs (min n (+ at 1)))))
+      ((Home) (some (Buf cs 0)))
+      ((End) (some (Buf cs n)))
+      ((Backspace) (if (> at 0) (some (Buf (into (vec (take (- at 1) cs)) (vec (drop at cs))) (- at 1))) (some b)))
+      ((Delete) (if (< at n) (some (Buf (into (vec (take at cs)) (vec (drop (+ at 1) cs))) at)) (some b)))
+      ((KillEnd) (some (Buf (vec (take at cs)) at)))
+      ((KillLine) (some (Buf (vec (drop at cs)) 0)))
+      ((KillWord) (let ((w (word-start cs at))) (some (Buf (into (vec (take w cs)) (vec (drop at cs))) w))))
+      (_ nil))))
+
+(defun buf-of :private (line: str) -> Buf (let ((cs (vec (str-chars line)))) (Buf cs (count cs))))
+
+;; One line edited on the terminal; `Ok nil` at the end of input.
+(defun edit-line :private (ed: Editor prompt: str) -> (Result (Option str) str)
+  (do (native/write-stdout prompt)
+      (edit-resume ed prompt (Buf (vec-empty) 0) (count @(. ed history)) "")))
+
+(defun or-b :private (o: (Option Buf) b: Buf) -> Buf (match o ((some x) x) (nil b)))
+
+(defun history-step :private (ed: Editor prompt: str b: Buf hist: i64 draft: str dir: i64) -> (Result (Option str) str)
+  (let ((h @(. ed history)) (to (+ hist dir)))
+    (if (or (< to 0) (> to (count h)))
+        (edit-resume ed prompt b hist draft)
+        (let ((d (if (= hist (count h)) (text-of b) draft))
+              (nb (buf-of (if (= to (count h)) d (nth h to)))))
+          (do (render prompt nb) (edit-resume ed prompt nb to d))))))
+
+;; Goes on editing from a buffer: the loop of `edit-line` entered again with the state.
+(defun edit-resume :private (ed: Editor prompt: str b: Buf hist: i64 draft: str) -> (Result (Option str) str)
+  (loop ((b b) (hist hist) (draft draft))
+    (let ((k (read-key ed)))
+      (match k
+        ((Enter) (do (native/write-stdout "\r\n") (Ok (some (text-of b)))))
+        ((Eof) (if (empty? (. b chars)) (do (native/write-stdout "\r\n") (Ok nil)) (recur (or-b (edit b Delete) b) hist draft)))
+        ((Interrupt) (do (native/write-stdout "^C\r\n") (Ok (some ""))))
+        ((Clear) (do (native/write-stdout "\x1b[H\x1b[2J") (render prompt b) (recur b hist draft)))
+        ((Up) (history-step ed prompt b hist draft -1))
+        ((Down) (history-step ed prompt b hist draft 1))
+        (_ (let ((nb (or-b (edit b k) b))) (do (render prompt nb) (recur nb hist draft))))))))
+
+;; The next line of input. `echo` (a transcript run) prints the prompt and the line it read, so that the output is the whole session.
+(defun read-line (ed: Editor prompt: str echo: bool) -> (Result (Option str) str)
+  (if (. ed tty)
+      (if (raw-on ed)
+          (let ((r (edit-line ed prompt))) (do (raw-off ed) r))
+          (plain-line ed prompt echo))
+      (plain-line ed prompt echo)))
+
+(defun plain-line :private (ed: Editor prompt: str echo: bool) -> (Result (Option str) str)
+  (do (when (. ed tty) (native/write-stdout prompt))
+      (match (sk/conn-read-line (. ed conn))
+        ((Ok (some l)) (do (when echo (native/write-stdout (str prompt l "\n"))) (Ok (some l))))
+        (r r))))
