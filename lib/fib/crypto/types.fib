@@ -45,13 +45,61 @@
   (hasher-finish (self) -> (Result (Array i8) CryptoError))
   (hasher-close (self) -> unit))
 
+;; The facts of the three AEADs (RFC 5116, 8439, NIST SP 800-38D: numbers, not computation): key, nonce and tag lengths; -1 for an algorithm that is not one.
+(defun aead-algs () -> (Vec keyword) [:aes-128-gcm :aes-256-gcm :chacha20-poly1305])
+(defun aead-key-length (alg: keyword) -> i64 (cond (= alg :aes-128-gcm) 16 (= alg :aes-256-gcm) 32 (= alg :chacha20-poly1305) 32 :else -1))
+(defun aead-nonce-length (alg: keyword) -> i64 (if (= (aead-key-length alg) -1) -1 12))
+(defun aead-tag-length (alg: keyword) -> i64 (if (= (aead-key-length alg) -1) -1 16))
+
+;; An AEAD KEY HANDLE (docs/design/crypto.md 9.1): the algorithm and the key bound once by `provider-aead-key`, so a driver sets the key schedule up once and a record costs only
+;; its nonce, AAD and data. `aead-key-seal` returns ciphertext || tag, `aead-key-open` the plaintext or "authentication-failed" with NOTHING of it, as the per-call functions do.
+;; The `-into` forms write into a buffer: `aead-key-seal-into` seals `data[off, off+len)` and writes the `len + 16` bytes at `out[out-off, ..)`; `aead-key-open-into` opens
+;; `data[off, off+len)` (ciphertext || tag) and writes the `len - 16` plaintext bytes at `out[out-off, ..)`. `out` is handed over (`:owned`) and the array that comes back is
+;; the one to use: the same array, written in place, when the caller passed it at its last use and nobody else holds it; a copy otherwise (a shared array is never written).
+;; A range outside `data` or `out` is "invalid-argument". On an error the buffer is NOT returned, so a failed open leaves no unauthenticated plaintext in any array the caller
+;; can see. NONCE REUSE under one key is the caller's to avoid (TLS derives the nonce from a counter) and is NOT detectable here, by design: the handle does not count.
+;; Handles are independent: the same key in two handles, or two keys in two, never interact. `aead-key-close` is idempotent and cleanses the driver's key schedule;
+;; every other call on a closed handle is a "closed" error. A handle is used by one task at a time. The two `-into` methods have DEFAULTS over seal and open.
+(defprotocol AeadKey
+  (aead-key-alg (self) -> keyword)
+  (aead-key-seal (self nonce: (Array i8) aad: (Array i8) plaintext: (Array i8)) -> (Result (Array i8) CryptoError))
+  (aead-key-open (self nonce: (Array i8) aad: (Array i8) sealed: (Array i8)) -> (Result (Array i8) CryptoError))
+  (aead-key-seal-into (self nonce: (Array i8) aad: (Array i8) data: (Array i8) off: i64 len: i64 out: (Array i8) :owned out-off: i64) -> (Result (Array i8) CryptoError)
+    (cond (or (< off 0) (< len 0) (> (+ off len) (array-len data))) (Err (invalid-argument "aead-key-seal-into: the range is outside the data"))
+          (or (< out-off 0) (> (+ out-off (+ len 16)) (array-len out))) (Err (invalid-argument "aead-key-seal-into: the output does not have room for the data and the tag"))
+          :else (match (aead-key-seal self nonce aad (array-copy data off (+ off len)))
+                  ((Err e) (Err e))
+                  ((Ok s) (let ((c (cell out))) (do (array-blit! &c out-off s 0 (array-len s)) (Ok @c)))))))
+  (aead-key-open-into (self nonce: (Array i8) aad: (Array i8) data: (Array i8) off: i64 len: i64 out: (Array i8) :owned out-off: i64) -> (Result (Array i8) CryptoError)
+    (cond (or (< off 0) (< len 16) (> (+ off len) (array-len data))) (Err (invalid-argument "aead-key-open-into: the range is outside the data, or shorter than a tag"))
+          (or (< out-off 0) (> (+ out-off (- len 16)) (array-len out))) (Err (invalid-argument "aead-key-open-into: the output does not have room for the plaintext"))
+          :else (match (aead-key-open self nonce aad (array-copy data off (+ off len)))
+                  ((Err e) (Err e))
+                  ((Ok pt) (let ((c (cell out))) (do (array-blit! &c out-off pt 0 (array-len pt)) (Ok @c)))))))
+  (aead-key-close (self) -> unit))
+
+;; The handle of a provider that does not keep a context: the key and the algorithm, and the per-call `provider-aead-seal` and `-open` for each record. It is what the default
+;; of `provider-aead-key` returns, so a driver of v0.2.0 compiles unchanged and `fib.tls` runs over it (slower, correct).
+(defstruct PerCallKey (provider: (dyn CryptoProvider) alg: keyword key: (Array i8) live: (Atom bool)))
+
+(defun key-closed () -> CryptoError (CryptoError "closed" "the AEAD key was closed"))
+
+(impl AeadKey PerCallKey
+  (aead-key-alg (self) (. self alg))
+  (aead-key-seal (self nonce aad pt)
+    (if @(. self live) (provider-aead-seal (. self provider) (. self alg) (. self key) nonce aad pt) (Err (key-closed))))
+  (aead-key-open (self nonce aad sealed)
+    (if @(. self live) (provider-aead-open (. self provider) (. self alg) (. self key) nonce aad sealed) (Err (key-closed))))
+  (aead-key-close (self) (reset! (. self live) false)))
+
 ;; A private key a driver owns: a HANDLE, not bytes. The key never leaves the driver as bytes (there is no export). It does the operations itself,
 ;; so a handle cannot be given to another driver's provider. `private-key-kind` is `:x25519 :ed25519 :p-256 :p-384`. `private-key-public` is the
 ;; public key's raw encoding (X25519 and Ed25519: 32 bytes; P-256 and P-384: the uncompressed SEC1 point, 0x04 || X || Y), what a TLS key_share carries.
 ;; `private-key-agree` is the shared secret with the peer's raw public encoding (X25519 and ECDH; never used raw: feed it to `hkdf`); it is an error
 ;; for a wrong length, a point not on the curve, and a small-order point (an all-zero X25519 result). `private-key-sign` signs the message under a
 ;; `scheme` of `public-key-verify`'s list that fits the key (Ed25519: `:ed25519`; P-256 and P-384: `:ecdsa-p256-sha256`, `:ecdsa-p384-sha384`; the
-;; signature is DER for ECDSA). `private-key-close` is idempotent and cleanses the key; use after close is a "closed" error.
+;; signature is DER for ECDSA; RSA, from PKCS#8 only: `:rsa-pss-sha256` and `:rsa-pss-sha384`, a new random salt of the digest's length each time, so two signatures of one message differ,
+;; and `private-key-public` of an RSA key is its SubjectPublicKeyInfo DER; a key under 2048 bits is refused at import, as `public-key-verify` refuses it). `private-key-close` is idempotent and cleanses the key; use after close is a "closed" error.
 (defprotocol PrivateKey
   (private-key-kind (self) -> keyword)
   (private-key-public (self) -> (Result (Array i8) CryptoError))
@@ -79,9 +127,10 @@
 ;;   AEAD (docs/design/crypto.md 9): `:aes-128-gcm :aes-256-gcm :chacha20-poly1305`. `provider-aead-seal` returns ciphertext || tag (16 bytes);
 ;;   `provider-aead-open` takes that and returns the plaintext, or "authentication-failed" with NOTHING of the plaintext. The nonce is 12 bytes for all
 ;;   three, the key 16 or 32 (see `aead-key-length`); another length is "invalid-argument".
+;;   `provider-aead-key` (alg, key) binds the cipher and key in a handle, `AeadKey`, that seals and opens records without the per-call setup; the default is the per-call path.
 ;;   Key agreement: `:x25519 :ecdh-p256 :ecdh-p384`: `provider-generate-key` with `:x25519 :p-256 :p-384` (a handle, see `PrivateKey`).
 ;;   Signatures: a verify scheme is a capability (`:rsa-pss-sha256 ... :ed25519`, see `PublicKey`); signing is `:sign-ed25519`
-;;   `:sign-ecdsa-p256-sha256` `:sign-ecdsa-p384-sha384`, with a key from `provider-generate-key` (`:ed25519 :p-256 :p-384`) or `provider-import-private`
+;;   `:sign-ecdsa-p256-sha256` `:sign-ecdsa-p384-sha384` `:sign-rsa-pss-sha256` `:sign-rsa-pss-sha384`, with a key from `provider-generate-key` (`:ed25519 :p-256 :p-384`) or `provider-import-private`
 ;;   (PKCS#8 DER: the only way raw private bytes enter, for known-answer tests and stored keys; the array is the caller's to cleanse).
 ;;   `provider-import-public` takes the X.509 SubjectPublicKeyInfo DER of a certificate (the whole array is one SPKI: trailing bytes are an error).
 (defprotocol CryptoProvider
@@ -96,6 +145,10 @@
     (Err (unsupported (str alg))))
   (provider-aead-open (self alg: keyword key: (Array i8) nonce: (Array i8) aad: (Array i8) sealed: (Array i8)) -> (Result (Array i8) CryptoError)
     (Err (unsupported (str alg))))
+  (provider-aead-key (self alg: keyword key: (Array i8)) -> (Result (dyn AeadKey) CryptoError)
+    (cond (not (= (array-len key) (aead-key-length alg))) (Err (if (= (aead-key-length alg) -1) (unsupported (str alg)) (invalid-argument (str alg ": the key is " (aead-key-length alg) " bytes"))))
+          (not (some? (first (filter (fn (c: keyword) (= c alg)) (provider-capabilities self))))) (Err (unsupported (str alg)))
+          :else (Ok (dyn AeadKey (PerCallKey (dyn CryptoProvider self) alg key (atom true))))))
   (provider-generate-key (self alg: keyword) -> (Result (dyn PrivateKey :send) CryptoError)
     (Err (unsupported (str alg))))
   (provider-import-private (self alg: keyword pkcs8: (Array i8)) -> (Result (dyn PrivateKey :send) CryptoError)

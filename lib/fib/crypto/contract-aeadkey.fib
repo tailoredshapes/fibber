@@ -1,0 +1,190 @@
+;; fib.crypto.contract-aeadkey: what an AEAD KEY HANDLE (`provider-aead-key`, `AeadKey` of fib.crypto.types, docs/design/crypto.md 9.1) must do beyond what the per-call
+;; contract (fib.crypto.contract-aead) already pins. The VECTORS are the same ones, reused through the handle; what is new is what only a handle can get wrong: a key
+;; schedule or IV that survives from one record to the next, two handles that share state, a closed handle that still answers, an `-into` that writes at the wrong
+;; offset or into an array somebody else holds. A driver runs `(implements CryptoAeadKeyContract "openssl" (fn () <a provider>))` beside `CryptoAeadContract`.
+;; A provider that lists no AEAD runs it vacuously. Nonce REUSE is not tested for refusal: it is the caller's to avoid and a handle does not count (types.fib).
+(ns fib.crypto.contract-aeadkey
+  (:use fib.core fib.seq fib.coll fib.test.core fib.crypto.types fib.crypto.ops fib.crypto.pk fib.crypto.encoding
+        fib.crypto.contract fib.crypto.contract-aead fib.crypto.vectors-aead))
+
+(defun key-kind (r: (Result (dyn AeadKey) CryptoError)) -> str (match r ((Ok _) "ok") ((Err e) (. e kind))))
+(defun fail-line (label: str ok: bool) -> str (if ok "" label))
+(defun drop-empty (xs: (Vec str)) -> (Vec str) (vec (filter (fn (s: str) (not (= s ""))) xs)))
+
+;; Runs `f` on a handle for (alg, key) and closes it; an error creating the handle is the one failure.
+(defun with-handle (p: p alg: keyword key: (Array i8) f: (fn ((dyn AeadKey)) (Vec str))) :where ((CryptoProvider p)) -> (Vec str)
+  (match (aead-key p alg key)
+    ((Err e) [(str "aead-key: " (. e kind) " " (. e message))])
+    ((Ok k) (let [r (f k)] (do (aead-key-close k) r)))))
+
+;; ---- the published vectors, through a handle
+(defun vector-failures (p: p v: AeadVector) :where ((CryptoProvider p)) -> (Vec str)
+  (with-handle p (. v alg) (bytes-hex (. v key))
+    (fn (k: (dyn AeadKey))
+      (drop-empty
+        [(fail-line "seal" (= (. v sealed) (result-hex (aead-key-seal k (bytes-hex (. v nonce)) (bytes-hex (. v aad)) (bytes-hex (. v pt))))))
+         (fail-line "open" (= (. v pt) (result-hex (aead-key-open k (bytes-hex (. v nonce)) (bytes-hex (. v aad)) (bytes-hex (. v sealed))))))
+         (fail-line "alg" (= (aead-key-alg k) (. v alg)))]))))
+
+(defun invalid-failures (p: p v: AeadInvalid) :where ((CryptoProvider p)) -> (Vec str)
+  (with-handle p (. v alg) (bytes-hex (. v key))
+    (fn (k: (dyn AeadKey))
+      (drop-empty [(fail-line "open of an invalid vector is authentication-failed"
+                              (= "authentication-failed" (kind-of (aead-key-open k (bytes-hex (. v nonce)) (bytes-hex (. v aad)) (bytes-hex (. v sealed))))))]))))
+
+;; The one-change variants of a valid vector (the per-call contract's), each through a handle of ITS key: every one fails to open.
+(defun variant-failures (p: p v: AeadVector) :where ((CryptoProvider p)) -> (Vec str)
+  (vec (map (fn (x: (Vec str)) (str (. v alg) " " (. v name) ": " (nth x 0)))
+            (filter (fn (x: (Vec str))
+                      (match (aead-key p (. v alg) (bytes-hex (nth x 1)))
+                        ((Err _) false)
+                        ((Ok k) (let [r (aead-key-open k (bytes-hex (nth x 2)) (bytes-hex (nth x 3)) (bytes-hex (nth x 4)))] (do (aead-key-close k) (not (refusal? r)))))))
+                    (tamper-variants v)))))
+
+;; ---- reuse: one handle, many records
+(defun counter-nonce (i: i64) -> (Array i8)
+  (let [n (cell (array 12 0i8))] (do (array-set! &n 11 (trunc i8 i)) (array-set! &n 10 (trunc i8 (shr i 8))) @n)))
+(defun aad-of (i: i64) -> (Array i8) (if (= (rem i 3) 0) (array 0 0i8) (array (+ 1 (* 7 (rem i 3))) (trunc i8 i))))
+(defun record-of (p: p n: i64) :where ((CryptoProvider p)) -> (Array i8) (match (random-bytes p n) ((Ok b) b) ((Err _) (array n 3i8))))
+
+;; Twelve records of different sizes and AADs through ONE handle, compared with the per-call functions; then the same records again in reverse order (a nonce or an AAD
+;; or a length left over from the record before shows), then every one opened, in a third order, and opened under the wrong nonce.
+(def reuse-sizes: (Vec i64) [0 1 16 100 17 5000 15 64 0 333 16384 2])
+
+(defun reuse-body :private (p: p alg: keyword key: (Array i8) pts: (Vec (Array i8)) k: (dyn AeadKey)) :where ((CryptoProvider p)) -> (Vec str)
+  (let [idx (range (count pts))
+        want (fn (i: i64) (result-hex (aead-seal p alg key (counter-nonce i) (aad-of i) (nth pts i))))
+        got (fn (i: i64) (result-hex (aead-key-seal k (counter-nonce i) (aad-of i) (nth pts i))))
+        sealed (fn (i: i64) (or-empty (aead-key-seal k (counter-nonce i) (aad-of i) (nth pts i))))
+        opened (fn (i: i64) (= (hex (nth pts i)) (result-hex (aead-key-open k (counter-nonce i) (aad-of i) (sealed i)))))
+        other (fn (i: i64) (refusal? (aead-key-open k (counter-nonce (+ i 1)) (aad-of i) (sealed i))))
+        forward (map (fn (i: i64) (fail-line (str "record " i " forward") (= (want i) (got i)))) idx)
+        backward (map (fn (i: i64) (fail-line (str "record " i " in reverse") (= (want i) (got i)))) (reverse idx))
+        opens (map (fn (i: i64) (fail-line (str "record " i " opened") (opened i))) (concat (filter even? idx) (filter odd? idx)))
+        wrong (map (fn (i: i64) (fail-line (str "record " i " opens under another record's nonce") (other i))) idx)]
+    (drop-empty (vec (concat (concat forward backward) (concat opens wrong))))))
+
+;; Twelve records of different sizes and AADs through ONE handle, compared with the per-call functions; then the same records again in reverse order (a nonce or an AAD
+;; or a length left over from the record before shows), then every one opened, in a third order, and opened under the wrong nonce.
+(defun reuse-failures (p: p alg: keyword) :where ((CryptoProvider p)) -> (Vec str)
+  (let [key (record-of p (aead-key-length alg)) pts (vec (map (fn (n: i64) (record-of p n)) reuse-sizes))]
+    (with-handle p alg key (fn (k: (dyn AeadKey)) (reuse-body p alg key pts k)))))
+
+;; Handles do not share state: keys A, B and A again in three handles used in turn; closing one leaves the others working and the closed one closed.
+(defun independence-body :private (alg: keyword ka: (Array i8) kb: (Array i8) p: p x: (dyn AeadKey) y: (dyn AeadKey) z: (dyn AeadKey)) :where ((CryptoProvider p)) -> (Vec str)
+  (let [pt (str-bytes "the same record for every handle") aad (str-bytes "aad") n (counter-nonce 7)
+        want-a (result-hex (aead-seal p alg ka n aad pt)) want-b (result-hex (aead-seal p alg kb n aad pt))
+        r1 [(fail-line "A first" (= want-a (result-hex (aead-key-seal x n aad pt)))) (fail-line "B after A" (= want-b (result-hex (aead-key-seal y n aad pt))))
+            (fail-line "A again after B" (= want-a (result-hex (aead-key-seal x n aad pt)))) (fail-line "C (A's key) after B" (= want-a (result-hex (aead-key-seal z n aad pt))))
+            (fail-line "B opens what A sealed" (refusal? (aead-key-open y n aad (or-empty (aead-key-seal x n aad pt)))))]
+        closed (do (aead-key-close x) (aead-key-close x) 0)
+        r2 [(fail-line "A is closed" (= "closed" (kind-of (aead-key-seal x n aad pt)))) (fail-line "B still works after A closed" (= want-b (result-hex (aead-key-seal y n aad pt))))
+            (fail-line "C still works after A closed" (= want-a (result-hex (aead-key-seal z n aad pt))))]]
+    (do (aead-key-close y) (aead-key-close z) (drop-empty (into (into r1 r2) [(if (= closed 0) "" "x")])))))
+
+(defun independence-failures (p: p alg: keyword) :where ((CryptoProvider p)) -> (Vec str)
+  (let [ka (record-of p (aead-key-length alg)) kb (record-of p (aead-key-length alg))]
+    (match (aead-key p alg ka)
+      ((Err e) [(str "A: " (. e kind))])
+      ((Ok x) (match (aead-key p alg kb)
+                ((Err e) (do (aead-key-close x) [(str "B: " (. e kind))]))
+                ((Ok y) (match (aead-key p alg ka)
+                          ((Err e) (do (aead-key-close x) (aead-key-close y) [(str "C: " (. e kind))]))
+                          ((Ok z) (independence-body alg ka kb p x y z)))))))))
+
+;; ---- the `-into` forms: bytes land where they are asked, nothing else changes, an array somebody else holds is never written, a bad range is an error.
+(defun filled (n: i64 v: i64) -> (Array i8) (array n (trunc i8 v)))
+(defun slice-hex (b: (Array i8) from: i64 to: i64) -> str (if (> to (array-len b)) "short" (hex (array-copy b from to))))
+(defun with-bytes (base: (Array i8) at: i64 b: (Array i8)) -> (Array i8) (let [c (cell base)] (do (array-blit! &c at b 0 (array-len b)) @c)))
+
+(defun seal-into-failures :private (k: (dyn AeadKey) src: (Array i8) want: (Array i8) nonce: (Array i8) aad: (Array i8)) -> (Vec str)
+  (let [off 7 len 33 at 13 orig (filled 100 85) out (or-empty (aead-key-seal-into k nonce aad src off len orig at)) tail (+ at (+ len 16))
+        n4 (counter-nonce 4)
+        one (or-empty (aead-key-seal-into k nonce aad src 0 10 (filled 80 0) 0))
+        two (or-empty (aead-key-seal-into k n4 aad src 10 20 one 26))]
+    (drop-empty
+      [(fail-line "seal-into: the bytes before the offset are untouched" (= (slice-hex out 0 at) (slice-hex orig 0 at)))
+       (fail-line "seal-into: the ciphertext and tag are where asked" (= (hex want) (slice-hex out at tail)))
+       (fail-line "seal-into: the bytes after are untouched" (= (slice-hex out tail 100) (slice-hex orig tail 100)))
+       (fail-line "seal-into: an array another variable holds is not written" (= (hex orig) (hex (filled 100 85))))
+       (fail-line "seal-into twice into one buffer is the two records one after the other, and the rest stays"
+                  (= (str (result-hex (aead-key-seal k nonce aad (array-copy src 0 10))) (result-hex (aead-key-seal k n4 aad (array-copy src 10 30))) (hex (filled 18 0))) (hex two)))
+       (fail-line "seal-into: the output too small is invalid-argument" (= "invalid-argument" (kind-of (aead-key-seal-into k nonce aad src off len (filled 48 0) 0))))
+       (fail-line "seal-into: a negative output offset is invalid-argument" (= "invalid-argument" (kind-of (aead-key-seal-into k nonce aad src off len (filled 100 0) -1))))
+       (fail-line "seal-into: data past the end is invalid-argument" (= "invalid-argument" (kind-of (aead-key-seal-into k nonce aad src 90 20 (filled 100 0) 0))))])))
+
+(defun open-into-failures :private (k: (dyn AeadKey) src: (Array i8) want: (Array i8) nonce: (Array i8) aad: (Array i8)) -> (Vec str)
+  (let [n (array-len want) in-buf (with-bytes (filled 90 17) 5 want) base (filled 60 102) out (or-empty (aead-key-open-into k nonce aad in-buf 5 n base 9))
+        bad-tag (let [c (cell in-buf)] (do (array-set! &c 20 (bit-xor (array-get in-buf 20) 1i8)) @c))]
+    (drop-empty
+      [(fail-line "open-into: the plaintext is where asked" (= (slice-hex src 7 40) (slice-hex out 9 42)))
+       (fail-line "open-into: the bytes around it are untouched" (and (= (slice-hex out 0 9) (slice-hex base 0 9)) (= (slice-hex out 42 60) (slice-hex base 42 60))))
+       (fail-line "open-into: an array another variable holds is not written" (= (hex base) (hex (filled 60 102))))
+       (fail-line "open-into: shorter than a tag is invalid-argument" (= "invalid-argument" (kind-of (aead-key-open-into k nonce aad in-buf 5 15 (filled 60 0) 0))))
+       (fail-line "open-into: an output too small is invalid-argument" (= "invalid-argument" (kind-of (aead-key-open-into k nonce aad in-buf 5 n (filled 20 0) 0))))
+       (fail-line "open-into: a changed tag is authentication-failed" (= "authentication-failed" (kind-of (aead-key-open-into k nonce aad bad-tag 5 n (filled 60 0) 0))))
+       (fail-line "open-into: a changed AAD is authentication-failed" (= "authentication-failed" (kind-of (aead-key-open-into k nonce (str-bytes "other") in-buf 5 n (filled 60 0) 0))))])))
+
+(defun into-failures (p: p alg: keyword) :where ((CryptoProvider p)) -> (Vec str)
+  (let [key (record-of p (aead-key-length alg)) src (record-of p 100) nonce (counter-nonce 3) aad (str-bytes "header")
+        want (or-empty (aead-seal p alg key nonce aad (array-copy src 7 40)))]
+    (with-handle p alg key
+      (fn (k: (dyn AeadKey)) (into (seal-into-failures k src want nonce aad) (open-into-failures k src want nonce aad))))))
+
+;; The handle's own facts and its failures: the algorithm, a key of the wrong length, a nonce of the wrong length, use after close.
+(defun handle-facts :private (k: (dyn AeadKey) alg: keyword) -> (Vec str)
+  (let [nonce (array 12 1i8) none (array 0 0i8) msg (str-bytes "hello") sealed (or-empty (aead-key-seal k nonce none msg))]
+    (drop-empty
+      [(fail-line "the algorithm" (= (aead-key-alg k) alg))
+       (fail-line "seal: an 11-byte nonce is invalid-argument" (= "invalid-argument" (kind-of (aead-key-seal k (array 11 1i8) none msg))))
+       (fail-line "seal: a 13-byte nonce is invalid-argument" (= "invalid-argument" (kind-of (aead-key-seal k (array 13 1i8) none msg))))
+       (fail-line "open: an 11-byte nonce is invalid-argument" (= "invalid-argument" (kind-of (aead-key-open k (array 11 1i8) none sealed))))
+       (fail-line "open: nothing to open" (= "invalid-argument" (kind-of (aead-key-open k nonce none (array 0 0i8)))))
+       (fail-line "open: fewer bytes than a tag" (refusal? (aead-key-open k nonce none (array 15 0i8))))
+       (fail-line "a refused call does not break the handle" (= (hex sealed) (result-hex (aead-key-seal k nonce none msg))))])))
+
+(defun closed-facts :private (k: (dyn AeadKey)) -> (Vec str)
+  (let [nonce (array 12 1i8) none (array 0 0i8) msg (str-bytes "hello") sealed (or-empty (aead-key-seal k nonce none msg)) gone (do (aead-key-close k) (aead-key-close k) 0)]
+    (drop-empty
+      [(fail-line "seal after close is a closed error" (= "closed" (kind-of (aead-key-seal k nonce none msg))))
+       (fail-line "open after close is a closed error" (= "closed" (kind-of (aead-key-open k nonce none sealed))))
+       (fail-line "seal-into after close is a closed error" (= "closed" (kind-of (aead-key-seal-into k nonce none msg 0 5 (array 40 0i8) 0))))
+       (fail-line "open-into after close is a closed error" (= "closed" (kind-of (aead-key-open-into k nonce none sealed 0 (array-len sealed) (array 40 0i8) 0))))
+       (fail-line "closing twice is not an error" (= gone 0))])))
+
+(defun facts-failures (p: p alg: keyword) :where ((CryptoProvider p)) -> (Vec str)
+  (let [kl (aead-key-length alg) key (array kl 9i8)]
+    (into (drop-empty
+            [(fail-line "a key one byte short is invalid-argument" (= "invalid-argument" (key-kind (aead-key p alg (array (- kl 1) 9i8)))))
+             (fail-line "a key one byte long is invalid-argument" (= "invalid-argument" (key-kind (aead-key p alg (array (+ kl 1) 9i8)))))
+             (fail-line "an empty key is invalid-argument" (= "invalid-argument" (key-kind (aead-key p alg (array 0 0i8)))))])
+          (with-handle p alg key (fn (k: (dyn AeadKey)) (into (handle-facts k alg) (closed-facts k)))))))
+
+(defun each-alg (p: p f: (fn (keyword) (Vec str))) :where ((CryptoProvider p)) -> (Vec str)
+  (vec (mapcat (fn (alg: keyword) (if (supports? p alg) (vec (map (fn (s: str) (str alg " " s)) (f alg))) [])) (aead-algs))))
+
+(defcontract CryptoAeadKeyContract [make]
+  (scenario "a key handle seals and opens every published vector (GCM spec, RFC 8439, Wycheproof) as the per-call functions do, and says its algorithm"
+    (covers "provider-aead-key" "aead-key-seal" "aead-key-open")
+    (given [p (make) vs (vec (filter (fn (v: AeadVector) (supports? p (. v alg))) (aead-vectors)))])
+    (then (expect = [] (vec (mapcat (fn (v: AeadVector) (vec (map (fn (s: str) (str (. v alg) " " (. v name) ": " s)) (vector-failures p v)))) vs)))))
+  (scenario "through a handle every invalid vector is an authentication failure, and each published vector changed in one place (a byte, the tag, the nonce, the AAD, the key) fails to open"
+    (given [p (make) iv (vec (filter (fn (v: AeadInvalid) (supports? p (. v alg))) (aead-invalid-vectors)))
+            vs (vec (filter (fn (v: AeadVector) (supports? p (. v alg))) (aead-vectors)))])
+    (then (expect = [] (vec (mapcat (fn (v: AeadInvalid) (vec (map (fn (s: str) (str (. v alg) " " (. v name) ": " s)) (invalid-failures p v)))) iv)))
+          (expect = [] (vec (mapcat (fn (v: AeadVector) (variant-failures p v)) vs)))))
+  (scenario "one handle over twelve records of different sizes and AADs gives what the per-call functions give, in any order, and keeps no nonce, AAD or length from the record before"
+    (given [p (make)])
+    (then (expect = [] (each-alg p (fn (alg: keyword) (reuse-failures p alg))))))
+  (scenario "handles are independent: the same key in two handles, another key in a third, and closing one leaves the others working"
+    (given [p (make)])
+    (then (expect = [] (each-alg p (fn (alg: keyword) (independence-failures p alg))))))
+  (scenario "seal-into and open-into write where asked and nowhere else, never into an array another variable holds, chain into one buffer, and refuse a bad range"
+    (given [p (make)])
+    (then (expect = [] (each-alg p (fn (alg: keyword) (into-failures p alg))))))
+  (scenario "a key of the wrong length, a nonce of the wrong length and use after close are errors, and an algorithm outside the list has no handle"
+    (given [p (make) k (array 16 1i8)])
+    (then (expect = [] (each-alg p (fn (alg: keyword) (facts-failures p alg))))
+          (expect = "unsupported" (key-kind (aead-key p :aes-192-gcm k)))
+          (expect = "unsupported" (key-kind (aead-key p :rot13 k)))
+          (expect = [] (vec (filter (fn (a: keyword) (not (= (supports? p a) (= (key-kind (aead-key p a (array (aead-key-length a) 1i8))) "ok")))) (aead-algs)))))))
