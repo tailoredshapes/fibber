@@ -16,7 +16,8 @@
     "(load i32 @fib.task-key)" "(load i64 @fib.task-key)")
     "(load i32 @fib.exc-key)" "(load i64 @fib.exc-key)"))
 ;; Whether the code is for a musl Linux (a row of types.targets whose libc is musl: `--static`, docs/design/static-linking.md). musl has no mallopt: its
-;; allocator already gives every block of 128 KiB or more its own mapping (the threshold the large-block cache pins glibc's to), so the call is dropped.
+;; allocator already gives every block of 128 KiB or more its own mapping (the threshold the large-block cache pins glibc's to), so the call is dropped. Its malloc
+;; also maps a group of 32 KiB or more for every block from 2 KiB up and unmaps it at the free, so the cache's floor is 4 KiB there (docs/design/allocator.md, section 9).
 (defun musl? :private () -> bool
   (match (sys-getenv "FIB_TARGET_TRIPLE")
     (nil false)
@@ -24,7 +25,8 @@
 (defun sys-for (platform: str text: str) -> str
   (if (= platform "Linux")
     (if (musl?)
-      (replace (replace text "(declare mallopt i32 (i32 i32))\n" "") "(call @mallopt (i32 -3) (i32 131072))" "(add (i32 0) (i32 0))")
+      (replace (replace (replace text "(declare mallopt i32 (i32 i32))\n" "") "(call @mallopt (i32 -3) (i32 131072))" "(add (i32 0) (i32 0))")
+               "(global internal fib.lc-floor i64 (i64 131072))" "(global internal fib.lc-floor i64 (i64 4096))")
       text)
     (if (= platform "Darwin")
       ;; _SC_NPROCESSORS_ONLN: 84 on glibc, 58 on Darwin (the pool's worker count);

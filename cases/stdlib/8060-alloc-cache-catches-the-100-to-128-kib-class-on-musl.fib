@@ -1,0 +1,30 @@
+;; spec: docs/design/allocator.md section 9 (rt/alloc.lir fib.lc-floor, compiler/emit/os.fib): in a static (musl) executable the cache keeps blocks from 4 KiB, so the 100-128 KiB class is cached and musl's malloc does not map and unmap it at every free
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib
+;; Fifty arrays of 13000 f64 (104 KB: under the 128 KiB floor of a glibc executable, over the 4 KiB floor of a musl one), one after the other, each dropped
+;; before the next is made. `cache-floor` says what the runtime keeps: when it is at most the block, the first is a miss and the rest are hits (held bytes at
+;; the end); when it is above, none is. Under `FIB_STATIC_CASES=1` (the gate's static stage: this case is one of those it runs) the floor must be the
+;; musl one, at most 100 KiB: a runtime whose musl floor went back to 128 KiB has 24,339 mmap calls in the `strings` benchmark again and fails here (code 5).
+;; A dynamic run holds the cache to its own floor, whatever it is. Each array is read back at both ends.
+(ns main (:use fib.core) (:require [fib.os.memory :as m] [fib.os.environment :as env]))
+
+(defun one-round (i: i64) -> f64
+  (let [a (array 13000 (double i))] (+ (array-get a 0) (array-get a 12999))))
+
+(defun main () -> i64
+  (let [floor (m/cache-floor)
+        static? (= (unwrap-or (env/getenv "FIB_STATIC_CASES") "") "1")
+        s0 (m/alloc-stats)
+        total (reduce (fn (acc: f64 i: i64) (+ acc (one-round i))) 0.0 (range 50))
+        s1 (m/alloc-stats)
+        hits (- (. s1 hits) (. s0 hits))
+        cached? (<= floor 104024)]
+    (cond (and static? (> floor 102400)) 5
+          (and cached? (< hits 48)) 1
+          (and cached? (= (. s1 held) 0)) 3
+          (and (not cached?) (> hits 0)) 2
+          (not (= total 2450.0)) 4
+          :else 0)))

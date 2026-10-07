@@ -141,12 +141,12 @@
 
 ;; ---- reading a report ----------------------------------------------------------------------------------------------------------------
 
-(defstruct Tally (total: i64 pass: i64 fail: i64 trap: i64 timeout: i64))
+(defstruct Tally (total: i64 pass: i64 fail: i64 trap: i64 timeout: i64 skip: i64))
 
-(def no-tally: Tally (Tally 0 0 0 0 0))
+(def no-tally: Tally (Tally 0 0 0 0 0 0))
 
 (defun add-tally :private (a: Tally b: Tally) -> Tally
-  (Tally (+ (. a total) (. b total)) (+ (. a pass) (. b pass)) (+ (. a fail) (. b fail)) (+ (. a trap) (. b trap)) (+ (. a timeout) (. b timeout))))
+  (Tally (+ (. a total) (. b total)) (+ (. a pass) (. b pass)) (+ (. a fail) (. b fail)) (+ (. a trap) (. b trap)) (+ (. a timeout) (. b timeout)) (+ (. a skip) (. b skip))))
 
 ;; The whole number after `key` in `text`, 0 when there is none.
 (defun number-after :private (text: str key: str) -> i64
@@ -157,25 +157,27 @@
                 (unwrap-or (parse-long (str-slice text from to)) 0)))))
 
 (defun tally-json :private (out: str) -> Tally
-  (Tally (number-after out "\"total\":") (number-after out "\"pass\":") (number-after out "\"fail\":") (number-after out "\"trap\":") (number-after out "\"timeout\":")))
+  (Tally (number-after out "\"total\":") (number-after out "\"pass\":") (number-after out "\"fail\":") (number-after out "\"trap\":") (number-after out "\"timeout\":")
+         (number-after out "\"skip\":")))
 
 (defun count-lines :private (out: str prefix: str) -> i64
   (count (filter (fn (l: str) (starts-with? l prefix)) (s/split-lines out))))
 
 (defun tally-tap :private (out: str) -> Tally
   (let ((ok (count-lines out "ok "))
-        (bad (count-lines out "not ok ")))
-    (Tally (+ ok bad) ok (- bad (+ (count-lines-with out " # trap") (count-lines-with out " # timeout")))
-           (count-lines-with out " # trap") (count-lines-with out " # timeout"))))
+        (bad (count-lines out "not ok "))
+        (skipped (count (filter (fn (l: str) (and (starts-with? l "ok ") (some? (s/index-of l " # SKIP")))) (s/split-lines out)))))
+    (Tally (+ ok bad) (- ok skipped) (- bad (+ (count-lines-with out " # trap") (count-lines-with out " # timeout")))
+           (count-lines-with out " # trap") (count-lines-with out " # timeout") skipped)))
 
 (defun count-lines-with :private (out: str needle: str) -> i64
   (count (filter (fn (l: str) (and (starts-with? l "not ok ") (some? (s/index-of l needle)))) (s/split-lines out))))
 
-;; The summary line of a plain report: `N scenarios: A pass, B fail, C trap, D timeout (seed S)`.
+;; The summary line of a plain report: `N scenarios: A pass, B fail, C trap, D timeout (seed S)`, or `D timeout, E skipped (seed S)` when a scenario was skipped.
 (defun tally-plain :private (out: str) -> Tally
-  (match (first (filter (fn (l: str) (and (some? (s/index-of l " scenarios: ")) (some? (s/index-of l " timeout (seed")))) (s/split-lines out)))
+  (match (first (filter (fn (l: str) (and (some? (s/index-of l " scenarios: ")) (some? (s/index-of l " (seed ")))) (s/split-lines out)))
     (nil no-tally)
-    ((some l) (Tally (number-after l "") (number-after l ": ") (number-after l " pass, ") (number-after l " fail, ") (number-after l " trap, ")))))
+    ((some l) (Tally (number-after l "") (number-after l ": ") (number-after l " pass, ") (number-after l " fail, ") (number-after l " trap, ") (number-after l " timeout, ")))))
 
 (defun tally-of :private (format: str out: str) -> Tally
   (cond (= format "json") (tally-json out)
@@ -234,7 +236,7 @@
     ((Died) (str "== " (. r file) "\n  DIED: the spec process ended with status " (. r status) "\n" (tail-lines (. r err) 12)))))
 
 (defun total-line :private (t: Tally rs: (Vec FileRun) seed: i64) -> str
-  (str "\ntotal: " (. t total) " scenarios: " (. t pass) " pass, " (. t fail) " fail, " (. t trap) " trap, " (. t timeout) " timeout in "
+  (str "\ntotal: " (. t total) " scenarios: " (. t pass) " pass, " (. t fail) " fail, " (. t trap) " trap, " (. t timeout) " timeout" (if (> (. t skip) 0) (str ", " (. t skip) " skipped") "") " in "
        (count-outcome rs "ran") " spec files (seed " seed ")\n"))
 
 (defun plain-report :private (rs: (Vec FileRun) o: TestOpts) -> str
@@ -254,7 +256,7 @@
 (defun json-report :private (rs: (Vec FileRun) o: TestOpts) -> str
   (let ((t (total-of rs "json" false)))
     (str "{\"schema\":1,\"seed\":" (. o seed) ",\"summary\":{\"total\":" (. t total) ",\"pass\":" (. t pass) ",\"fail\":" (. t fail)
-         ",\"trap\":" (. t trap) ",\"timeout\":" (. t timeout) "},\"files\":["
+         ",\"trap\":" (. t trap) ",\"timeout\":" (. t timeout) (if (> (. t skip) 0) (str ",\"skip\":" (. t skip)) "") "},\"files\":["
          (str-join (vec (interpose "," (mapv (fn (r: FileRun) (str "{\"file\":" (jstr (. r file)) ",\"status\":" (. r status) ",\"outcome\":\"" (outcome-name (outcome-of r)) "\"}")) rs))))
          "],\"results\":["
          (str-join (vec (interpose "," (filter (fn (x: str) (not (= x "")))

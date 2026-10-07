@@ -14,10 +14,11 @@ section 8.3: with glibc's thresholds raised by environment the Adam step went fr
 
 ## 2. The cache
 
-- **Which blocks.** A request of `LC-MIN` = 128 KiB or more (header included), up to 2^47 bytes. Below 128 KiB glibc's own
-  bins already reuse blocks without a system call, so a second cache there would only duplicate them.
+- **Which blocks.** A request of `fib.lc-floor` bytes or more (header included), up to 2^47 bytes. The floor is 128 KiB: below it glibc's
+  own bins already reuse blocks without a system call, so a second cache there would only duplicate them. In a static (musl) executable
+  the floor is 4 KiB, because musl's malloc does not (section 9).
 - **Size classes.** Four per power of two: a class size is `(k+1) * 2^(e-2)` for k in 4..7 (128 KiB, 160, 192, 224, 256 KiB, ...),
-  124 classes in all. A request is rounded **up** to its class and that many bytes are asked of `malloc`, so every block of a class
+  148 classes in all (from 1.25 KiB: the table reaches below the 4 KiB floor). A request is rounded **up** to its class and that many bytes are asked of `malloc`, so every block of a class
   can serve every request of it. The waste is under 25% of the request, and for a mapped block the pages past the end that are never
   written are never faulted in. A freed block is filed **down**: its class is the largest class size not above
   `malloc_usable_size` (Darwin: `malloc_size`), so a block that came from anywhere (an older runtime, a JIT module, a block made
@@ -154,3 +155,56 @@ set-conj 0.24/0.22, lazy-fused 0.84/0.77, strings 0.63/0.66 s); lazy-fused is fl
 **macOS** (the Mac Studio, arm64, macOS 27): cases 7790-7796 cross-built by F1 (`--target arm64-apple-macosx13.0.0 --emit obj`),
 linked with `cc` on the Mac and run natively: all exit 0; 7791 checks the cache's own counts there (no /proc), and its stats line shows
 the 32 blocks returned after the sleep.
+
+## 9. The musl floor (SMALL-1)
+
+STATIC-1 measured the `strings` benchmark 94% slower in a static musl executable (0.73 s against 1.42 s). `strace -c` of the two
+builds (the same code, x86-64-v3):
+
+| | glibc | musl |
+|-|-:|-:|
+| mmap | 17 | 24,339 |
+| munmap | 5 | 14,304 |
+| brk | 2,070 | 2,417 |
+
+The cause: musl's malloc (mallocng) serves a block of about 2 KiB and more from a group it maps for it (the sizes mapped: 4, 8, 32 and
+64 KiB for the blocks from 2 KiB to 128 KiB), and unmaps the group when its last block is freed. A string built by repeated
+concatenation (`grow`: 20,000 pieces, a new block of a larger size each time, each dropped at once) maps and unmaps at every step.
+glibc serves the same blocks from its heap (`brk`). The cache's floor of 128 KiB did not reach them: with the cache's counts on
+(`FIB_ALLOC_STATS=1`) the musl run had 3 hits and 5 misses in all, and mmap sizes under 128 KiB were 24,333 of the 24,339 calls.
+
+The fix: the floor is a global (`fib.lc-floor`, 128 KiB), which `emit.os` sets to 4 KiB when the target is musl (the same place that drops
+`mallopt`); `fib.os.memory/cache-floor` reads it. The classes start at 1.25 KiB (index 0), so the table is 148 entries.
+Measured with a floor knob (a temporary environment variable, removed), mmap/munmap of the musl `strings` run by floor:
+
+| floor | mmap | munmap |
+|-:|-:|-:|
+| 128 KiB (before) | 24,339 | 14,304 |
+| 64 KiB | 24,338 | 14,302 |
+| 32 KiB | 15,258 | 5,220 |
+| 16 KiB | 12,769 | 2,730 |
+| 8 KiB | 11,572 | 1,533 |
+| 4 KiB | 10,650 | 610 |
+| 2 KiB | 10,168 | 128 |
+
+The mmaps that remain are growth of live data (a million small strings: groups that stay), which glibc serves with `brk`. 4 KiB is
+the floor taken: 2 KiB saves 480 more munmap calls and caches smaller blocks, a lock and a rounding for each. glibc keeps 128 KiB:
+a floor of 8 KiB or 16 KiB there changed no system call count (brk 2,067 to 2,070) and no time (median of 5, `strings`: 0.657 s at 128 KiB,
+0.664 at 16 KiB, 0.666 at 8 KiB, 0.656 at 4 KiB).
+
+Time, `scripts/bench/static-compare.sh` (medians of 3 or 7, x86-64-v3, the same machine, before and after; the dynamic column is glibc):
+
+| benchmark | glibc before | glibc after | musl before | musl after |
+|-|-:|-:|-:|-:|
+| strings | 0.652 to 0.685 | 0.657 to 0.672 | 1.200 to 1.237 | 1.091 to 1.120 |
+| set-conj | 0.225 to 0.249 | 0.222 to 0.244 | 0.228 to 0.249 | 0.230 to 0.273 |
+| binary-trees | 1.315 to 1.318 | 1.332 to 1.382 | 1.385 to 1.430 | 1.390 to 1.472 |
+| vec-conj-pop | 0.838 to 0.847 | 0.842 to 0.854 | 0.946 to 0.975 | 0.951 to 0.960 |
+
+(ranges over the runs of the script; the order of the rows of one benchmark between runs is noise, 5% to 10%.) The musl `strings` run
+is 8 to 9% faster, `sys` time 0.195 s to 0.086 s; the gap to glibc went from +80% to +65%. The rest is user time (1.00 s against 0.57 s):
+musl's malloc and `memcpy` themselves, which no cache in the runtime changes; not profiled (`perf` is not allowed on this machine).
+
+Tests: case 8060 (blocks of 104 KB are hits where the floor says they are cached, and under `FIB_STATIC_CASES=1`, which the gate's
+static stage sets, the floor must be at most 100 KiB), case 8061 (every class from 5 KiB to 128 KiB written whole and read back), and
+`scripts/mutant-alloc-floor.sh` (the floor back at 128 KiB; a freed block filed in the class above its size; a `cache-floor` that lies).

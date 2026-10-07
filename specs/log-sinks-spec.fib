@@ -8,6 +8,12 @@
 (defun fresh-dir () -> str
   (match (os/create-temp-directory (str (os/temp-directory) "/fiblogXXXXXX")) ((Ok d) d) ((Err e) (trap (. e message)))))
 
+;; Whether `path` can be opened for reading: /dev/full exists on Linux and not on macOS, where the scenario that needs it is skipped (reported as skipped, not passed).
+(defun openable? (path: str) -> bool
+  (match (os/open-file path (os/default-file-options))
+    ((Ok fd) (do (os/close-fd fd) true))
+    ((Err _) false)))
+
 (defun slurp (path: str) -> str
   (match (os/read-file-bytes path 10000000) ((Ok b) (str-from-bytes b)) ((Err _) "")))
 
@@ -119,6 +125,7 @@
              _ (rm-all dir names)])
       (then (expect = 800 (count all)) (expect = true (every? (fn (l: str) (whole-json? l)) all))))
     (scenario "a failing disk write does not trap the caller: it is counted and the program goes on"
+      (skip-unless (openable? "/dev/full") "no /dev/full")
       (given [k (must-file "/dev/full" 0 0) sys (log/log-system k (log/LevelTable 0 [])) lg (log/get-logger sys "t")])
       (upon [_ (do (log/info lg "one") (log/info lg "two") (log/info lg "three"))])
       (then (expect = 3 (log/failures sys))))

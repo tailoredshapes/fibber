@@ -58,12 +58,17 @@
 (defun broken? :private (steps: (Vec StepRun)) -> bool
   (some? (first (filter (fn (s: StepRun) (match (. s judged) ((Held) false) ((Broke _ _) true))) steps))))
 
+;; A scenario that stopped at a `skip-unless` whose condition was false.
+(defun skipped? :private (steps: (Vec StepRun)) -> bool
+  (some? (first (filter (fn (s: StepRun) (= (. s kind) "Skip")) steps))))
+
 (defun thens? :private (steps: (Vec StepRun)) -> bool
   (some? (first (filter (fn (s: StepRun) (= (. s kind) "Then")) steps))))
 
 ;; The status of a row from the steps it ran. A scenario with no Then cannot fail, and is refused as a failure.
 (defun judged-row :private (sc: Scenario head: str impl: str steps: (Vec StepRun)) -> ScenarioRow
-  (cond (not (thens? steps)) (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) "fail" steps "no Then step: a scenario that cannot fail" (. sc at))
+  (cond (skipped? steps) (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) "skip" steps "" (. sc at))
+        (not (thens? steps)) (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) "fail" steps "no Then step: a scenario that cannot fail" (. sc at))
         (broken? steps) (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) "fail" steps "" (. sc at))
         :else (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) "pass" steps "" (. sc at))))
 
@@ -160,6 +165,7 @@
   (cond (= status "pass") "pass"
         (= status "fail") "FAIL"
         (= status "trap") "TRAP"
+        (= status "skip") "skip"
         :else "TIME"))
 
 (defun label (r: ScenarioRow) -> str
@@ -181,15 +187,19 @@
 (defun count-of (rows: (Vec ScenarioRow) status: str) -> i64
   (count (filter (fn (r: ScenarioRow) (= (. r status) status)) rows)))
 
+;; `before` N `after` when some row was skipped, else nothing: the summaries keep their old shape for a run that skipped none.
+(defun skip-count (rows: (Vec ScenarioRow) before: str after: str) -> str
+  (let ((n (count-of rows "skip"))) (if (> n 0) (str before n after) "")))
+
 (defun plain (rows: (Vec ScenarioRow) seed: i64) -> str
   (let ((groups (vec (distinct (mapv (fn (r: ScenarioRow) (label r)) rows)))))
     (str (str-join (mapv (fn (g: str)
                            (str g "\n" (str-join (mapv (fn (r: ScenarioRow) (str "  " (row-plain r))) (filter (fn (r: ScenarioRow) (= (label r) g)) rows)))))
                          groups))
          "\n" (count rows) " scenarios: " (count-of rows "pass") " pass, " (count-of rows "fail") " fail, " (count-of rows "trap") " trap, "
-         (count-of rows "timeout") " timeout (seed " seed ")\n"
+         (count-of rows "timeout") " timeout" (skip-count rows ", " " skipped") " (seed " seed ")\n"
          (str-join (mapv (fn (r: ScenarioRow) (str "replay: --only '" (. r id) "' --seed " seed "\n"))
-                         (filter (fn (r: ScenarioRow) (not (= (. r status) "pass"))) rows))))))
+                         (filter (fn (r: ScenarioRow) (not (or (= (. r status) "pass") (= (. r status) "skip")))) rows))))))
 
 (defun json-char :private (c: char) -> str
   (cond (= c \") "\\\""
@@ -218,7 +228,7 @@
 ;; The run as one JSON document; the schema is in the design, §5.
 (defun json (rows: (Vec ScenarioRow) seed: i64) -> str
   (str "{\"schema\":1,\"seed\":" seed ",\"summary\":{\"total\":" (count rows) ",\"pass\":" (count-of rows "pass") ",\"fail\":" (count-of rows "fail")
-       ",\"trap\":" (count-of rows "trap") ",\"timeout\":" (count-of rows "timeout") "},\"results\":["
+       ",\"trap\":" (count-of rows "trap") ",\"timeout\":" (count-of rows "timeout") (skip-count rows ",\"skip\":" "") "},\"results\":["
        (str-join (vec (interpose "," (mapv row-json rows)))) "]}\n"))
 
 (defun list-plain :private (js: (Vec ScenarioJob)) -> str
@@ -233,9 +243,14 @@
                       ((Broke e a) (str "# " (. s text) ": expected " e ", actual " a "\n"))))
                   (. r steps))))
 
+;; The reason a row was skipped: the text of its Skip step after "skipped: ".
+(defun skip-reason :private (r: ScenarioRow) -> str
+  (str-join (mapv (fn (s: StepRun) (if (= (. s kind) "Skip") (str-slice (. s text) 9 (str-len (. s text))) "")) (. r steps))))
+
 (defun tap-row :private (r: ScenarioRow n: i64) -> str
-  (str (if (= (. r status) "pass") "ok " "not ok ") n " - " (. r id)
-       (if (= (. r status) "pass") "" (str " # " (. r status) (if (= (. r message) "") "" (str ": " (. r message)))))
+  (str (if (or (= (. r status) "pass") (= (. r status) "skip")) "ok " "not ok ") n " - " (. r id)
+       (if (= (. r status) "skip") (str " # SKIP " (skip-reason r))
+       (if (= (. r status) "pass") "" (str " # " (. r status) (if (= (. r message) "") "" (str ": " (. r message))))))
        "\n" (tap-diag r)))
 
 ;; TAP version 13: the plan first, a `# seed` line so a failure is replayable from the log.
@@ -281,7 +296,7 @@
   (do (print (cond (= (. o format) "json") (json rows (. o seed))
                    (= (. o format) "tap") (tap rows (. o seed))
                    :else (plain rows (. o seed))))
-      (if (= (count (filter (fn (r: ScenarioRow) (not (= (. r status) "pass"))) rows)) 0) 0 1)))
+      (if (= (count (filter (fn (r: ScenarioRow) (not (or (= (. r status) "pass") (= (. r status) "skip")))) rows)) 0) 0 1)))
 
 (defun run-forked-in :private (js: (Vec ScenarioJob) o: SpecOpts) -> i64
   (match (os/create-temp-directory (str (os/temp-directory) "/fibtest-XXXXXX"))

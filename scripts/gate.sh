@@ -180,7 +180,7 @@ stage_static() {
   for d in ownership modules; do
     FIB_STATIC=1 FIB_STATIC_CASES=1 "$SLOTS_SH" "$F" cases cases/$d -j "$jobs" >> "$log" 2>&1 || sfail static "static: cases/$d as static executables FAILED"
   done
-  FIB_STATIC=1 FIB_STATIC_CASES=1 "$SLOTS_SH" "$F" cases cases/stdlib --only 655- 665- 1709- 2228- 2650- 4005- 6106- 6222- 7304- 8000- 8001- 8002- 8003- -j "$jobs" >> "$log" 2>&1 \
+  FIB_STATIC=1 FIB_STATIC_CASES=1 "$SLOTS_SH" "$F" cases cases/stdlib --only 655- 665- 1709- 2228- 2650- 4005- 6106- 6222- 7304- 8000- 8001- 8002- 8003- 8060- 8061- -j "$jobs" >> "$log" 2>&1 \
     || sfail static "static: stdlib cases as static executables FAILED"
   echo "static $(grep -E '^[0-9]+ cases:' "$log" | awk '{p+=$3; f+=$5} END {print p " pass, " f " fail"}') (log: $log) $(elapsed "$t0" "$(now)") s" > "$sd/static.t"
   if [ -f "$sd/static.fail" ]; then tail -n 20 "$log" > "$sd/static.out"; else touch "$sd/static.ok"; fi
