@@ -2,7 +2,7 @@
 ;; follow redirects under the policy of fib.http.client.redirect, and hand the response over as a stream whose connection returns to the pool
 ;; when (and only when) its body ran to the end under keep-alive. All of it on the caller's thread.
 (ns fib.http.client.run (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes fib.http.url fib.http.uri
-                              fib.http.transport fib.http.body fib.http.proxy fib.http.tunnel fib.http.client.types fib.http.client.pool fib.http.client.exchange
+                              fib.http.transport fib.http.body fib.http.proxy fib.http.cookies fib.http.tunnel fib.http.client.types fib.http.client.pool fib.http.client.exchange
                               fib.http.client.redirect)
   (:require [fib.os.time :as time] [fib.string :as s] [fib.http.tcp :as tcp]))
 (defstruct State (options: Options pool: Pool closed: (Cell bool) resolve: (fn :send (str) (Result (Vec str) Error))))
@@ -83,15 +83,22 @@
         out (Body next (fn () (trailers body)) (fn () (finished? body)))]
     (do (if (finished? body) (settle true) ())
         (StreamResponse (. (. reply head) status) (. (. reply head) headers) out (fn () (settle false))))))
+(defun jar-headers :private (o: Options url: Url h: (Map str (Vec str))) -> (Map str (Vec str))
+  (match (. o cookies)
+    (nil h)
+    ((some j) (if (some? (get h "cookie")) h
+                (match (header-for j (. url scheme) (. url host) (path-or-root url)) (nil h) ((some v) (assoc h "cookie" [v])))))))
+(defun jar-store :private (o: Options url: Url headers: (Map str (Vec str))) -> unit
+  (match (. o cookies) (nil ()) ((some j) (store j (. url scheme) (. url host) (path-or-root url) (unwrap-or (get headers "set-cookie") [])))))
 (defun loop-key :private (method: str url: Url) -> str (str method " " (url-string (with url (fragment nil)))))
 (defun drain :private (sr: StreamResponse) -> unit
   (match (read-all (. sr body) 65536) ((Ok _) ()) ((Err _) ((. sr abandon)))))
 (defun hop :private (st: State method: str url: Url headers: (Map str (Vec str)) body: (Array i8) total: i64 hops: i64 seen: (Vec str))
   -> (Result StreamResponse Error)
-  (let [o (. st options) h (hop-headers o url method headers body)]
+  (let [o (. st options) h (jar-headers o url (hop-headers o url method headers body))]
     (match (fetch st method url h body total)
       ((Err e) (Err (rename e total)))
-      ((Ok got) (let [sr (managed st (. got snd) (. got fst) total) status (. sr status)
+      ((Ok got) (let [sr (managed st (. got snd) (. got fst) total) status (. sr status) _ (jar-store o url (. sr headers))
                       loc (header (. sr headers) "location")]
         (if (not (and (. o follow-redirects) (redirect-status? status) (some? loc))) (Ok sr)
           (follow st method url headers body total hops seen sr (unwrap-or loc ""))))))))

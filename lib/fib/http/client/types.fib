@@ -1,5 +1,5 @@
 ;; Client options and values. Every limit and deadline is an option with a safe default; zero means "none" for the timeouts.
-(ns fib.http.client.types (:use fib.core fib.seq fib.coll fib.http.types fib.http.transport fib.http.tcp fib.http.body fib.http.proxy))
+(ns fib.http.client.types (:use fib.core fib.seq fib.coll fib.http.types fib.http.transport fib.http.tcp fib.http.body fib.http.proxy fib.http.cookies))
 ;; An OPTIONAL Content-Encoding decoder (a driver supplies zlib: DEFLATE is not implemented here). name is the coding ("gzip", "deflate");
 ;; decode inflates a whole body. With no decoder for a coding the body is returned as received and its content-encoding header is kept.
 (defstruct Decoder (name: str decode: (fn :send ((Array i8)) (Result (Array i8) Error))))
@@ -7,10 +7,10 @@
   max-redirects: i64 decompress: bool throw-exceptions: bool ca-file: (Option str)
   max-response-bytes: i64 max-header-bytes: i64
   read-timeout-ms: i64 max-headers: i64 max-line-bytes: i64 max-idle-per-host: i64 idle-timeout-ms: i64
-  factories: (Map str Factory) decoders: (Vec Decoder) resolver: ResolverMode proxy: ProxySettings))
+  factories: (Map str Factory) decoders: (Vec Decoder) resolver: ResolverMode proxy: ProxySettings cookies: (Option Jar)))
 ;; timeout-ms is the whole request including redirects; read-timeout-ms the wait for any one piece of the response; connect-timeout-ms one connect.
 (defun default-options () -> Options
-  (Options 10000 30000 false 5 true true nil 8388608 65536 0 100 8192 4 30000 {"http" (tcp-factory)} [] NativeDns (no-proxy)))
+  (Options 10000 30000 false 5 true true nil 8388608 65536 0 100 8192 4 30000 {"http" (tcp-factory)} [] NativeDns (no-proxy) nil))
 ;; The Transport factory for a scheme (for https: the TLS driver). Replaces any earlier one.
 (defun with-factory (o: Options scheme: str f: Factory) -> Options (with o (factories (assoc (. o factories) scheme f))))
 (defun with-decoder (o: Options d: Decoder) -> Options (with o (decoders (conj (. o decoders) d))))
@@ -19,6 +19,8 @@
 (defun with-system-resolver (o: Options) -> Options (with o (resolver SystemResolver)))
 ;; Proxies are explicit: `(with-proxy o (proxy-from-env))` reads http_proxy, https_proxy and no_proxy from the environment; nothing reads them implicitly.
 (defun with-proxy (o: Options settings: ProxySettings) -> Options (with o (proxy settings)))
+;; Cookies are opt-in: `(with-cookies o (new-jar))` stores the Set-Cookie headers of every response (each redirect hop too) in the jar and sends the matching cookies; fib.http.cookies.
+(defun with-cookies (o: Options j: Jar) -> Options (with o (cookies (some j))))
 (defstruct PoolStats (opened: i64 reused: i64 idle: i64))
 ;; A response whose body has not been read: the Body streams it; abandon closes the connection (the pool keeps it only when the body ran to its end).
 (defstruct StreamResponse (status: i64 headers: (Map str (Vec str)) body: Body abandon: (fn () unit)))
