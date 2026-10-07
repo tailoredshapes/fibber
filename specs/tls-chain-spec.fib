@@ -1,0 +1,49 @@
+;; Path validation of fib.tls (fib.tls.chain) over the committed corpus of specs/tls-fixtures.fib (made by scripts/tls-corpus.sh with the openssl CLI): every fixture is judged
+;; and must give the typed reason its name says, never success for a refused one and never a refusal for an accepted one. The gate has no crypto driver, so the signatures are
+;; answered by a stub (tls-stub): everything but the signature is judged here; a stub that rejects every signature shows that a signature failure is reported as one; the
+;; fixtures whose signature is wrong on purpose (`real`) are judged with the OpenSSL driver by scripts/tls-test.sh. `fibc test specs`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.pem fib.tls.x509 fib.tls.chain tls-stub tls-fixtures))
+
+(defun ders (xs: (Vec str)) -> (Vec (Array i8)) (vec (map (fn (h: str) (hexb h)) xs)))
+(defun parse-all (xs: (Vec str)) -> (Result (Vec Cert) TlsError)
+  (loop [i 0 acc []]
+    (if (= i (count xs)) (Ok acc)
+      (match (parse-certificate (hexb (nth xs i))) ((Err e) (Err e)) ((Ok c) (recur (+ i 1) (conj acc c)))))))
+(defun reason-text (e: TlsError) -> str (match e ((BadCertificate r _) (reason-name r)) (_ (tls-error-text e))))
+(defun verdict (p: p f: Fx) :where ((CryptoProvider p)) -> str
+  (match (parse-all (. f chain))
+    ((Err e) (reason-text e))
+    ((Ok chain)
+      (match (parse-all (. f anchors))
+        ((Err e) (str "anchors: " (reason-text e)))
+        ((Ok anchors) (match (validate-chain p chain (TrustStore anchors) (fixture-now) (. f host)) ((Ok _) "ok") ((Err e) (reason-text e))))))))
+(defun fixture (i: i64) -> Fx (nth (fixtures) i))
+(defun judged (i: i64) -> str
+  (let [f (fixture i)] (if (. f real) (. f expect) (verdict (stub-accepts) f))))
+(defun all-judged () -> str
+  (str-join (vec (filter (fn (s: str) (not (= s ""))) (map (fn (i: i64) (let [f (fixture i)] (if (= (judged i) (. f expect)) "" (str (. f name) ": expected " (. f expect) " got " (judged i) "; ")))) (range (count (fixtures))))))))
+(defun str-join (xs: (Vec str)) -> str (reduce (fn (a: str x: str) (str a x)) "" xs))
+(defun real-count () -> i64 (count (filter (fn (f: Fx) (. f real)) (fixtures))))
+;; With a provider that rejects every signature the accepted chains fail with bad-signature (the stub is not vacuous), and a leaf that IS an anchor needs no signature.
+(defun rejecting-text () -> str
+  (str-join (vec (filter (fn (s: str) (not (= s "")))
+    (map (fn (f: Fx) (let [v (verdict (stub-rejects) f)]
+                       (cond (not (= (. f expect) "ok")) ""
+                             (= (. f chain) (. f anchors)) (if (= v "ok") "" (str (. f name) " (a leaf that is the anchor) gave " v "; "))
+                             :else (if (= v "bad-signature") "" (str (. f name) " gave " v " with a rejecting verifier; ")))))
+         (fixtures))))))
+
+(defspecs specs
+  (feature "path validation over the committed corpus (signatures stubbed)"
+    (scenario "the corpus has the cases the task names" (then (expect = true (>= (count (fixtures)) 38)) (expect = 3 (real-count))))
+    (scenario "every fixture gives its typed reason" (then (expect = "" (all-judged))))
+    (scenario "a verifier that rejects every signature turns every accepted chain into bad-signature (except a leaf that is the anchor)" (then (expect = "" (rejecting-text)))))
+  (feature "the typed reasons"
+    (scenario "reason names"
+      (then (expect = "hostname-mismatch" (reason-name CertHostnameMismatch)) (expect = "unknown-critical-extension" (reason-name CertUnknownCritical))
+            (expect = "path-length" (reason-name CertPathLength)) (expect = "name-constraint" (reason-name CertNameConstraint))))
+    (scenario "alerts name the certificate problem"
+      (then (expect = 45 (alert-for (bad-cert CertExpired "x"))) (expect = 48 (alert-for (bad-cert CertUntrustedRoot "x"))) (expect = 42 (alert-for (bad-cert CertHostnameMismatch "x")))
+            (expect = 71 (alert-for (bad-cert CertWeakAlgorithm "x"))) (expect = 50 (alert-for (proto-err "x"))) (expect = 10 (alert-for (proto-alert 10 "x")))))))
+
+(defun main () -> i64 (run-main (specs)))

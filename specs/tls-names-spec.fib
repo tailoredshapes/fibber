@@ -1,0 +1,71 @@
+;; Host name matching of fib.tls (RFC 6125 6.4, tightened by RFC 9525 6.3), IP literals, and the dNSName and iPAddress name constraints of RFC 5280 4.2.1.10, as TABLES: each row is
+;; (presented identifier or constraint, reference, expected). The rows follow the cases the Go crypto/x509 and BoringSSL hostname tests and RFC 9525's examples make, written out
+;; here, not copied. A table that cannot fail is worse than none: the last scenario checks that the table's expected values are not all the same. `fibc test specs`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.tls.bytes fib.tls.names))
+
+(defstruct Row (pat: str host: str ok: bool))
+(def host-rows: (Vec Row)
+  [(Row "example.com" "example.com" true) (Row "EXAMPLE.com" "example.COM" true) (Row "example.com" "example.com." true) (Row "example.com" "www.example.com" false)
+   (Row "example.com" "xexample.com" false) (Row "www.example.com" "example.com" false) (Row "example.com." "example.com" false)
+   (Row "*.example.com" "www.example.com" true) (Row "*.example.com" "WWW.Example.COM" true) (Row "*.example.com" "example.com" false)
+   (Row "*.example.com" "a.b.example.com" false) (Row "*.example.com" ".example.com" false) (Row "*.example.com" "-.example.com" true)
+   (Row "*.com" "example.com" false) (Row "*" "example" false) (Row "*." "a." false) (Row "*.example.com" "*.example.com" false)
+   (Row "a*.example.com" "ab.example.com" false) (Row "*a.example.com" "ba.example.com" false) (Row "w*w.example.com" "www.example.com" false)
+   (Row "*.*.example.com" "a.b.example.com" false) (Row "www.*.com" "www.example.com" false) (Row "www.example.*" "www.example.com" false)
+   (Row "xn--*.example.com" "xn--a.example.com" false) (Row "*.xn--bcher-kva.example" "a.xn--bcher-kva.example" true)
+   (Row "" "" false) (Row "example.com" "" false) (Row "" "example.com" false) (Row "a..b" "a..b" false) (Row ".example.com" ".example.com" false)
+   (Row "127.0.0.1" "127.0.0.1" false) (Row "*.0.0.1" "127.0.0.1" false) (Row "::1" "::1" false) (Row "ex ample.com" "ex ample.com" false)
+   (Row "exa_mple.com" "exa_mple.com" true) (Row "a.example.com" "a.example.com" true) (Row "very-long-label.example.com" "very-long-label.example.com" true)])
+
+(defstruct IpRow (text: str hex: str))
+(def ip-rows: (Vec IpRow)
+  [(IpRow "1.2.3.4" "01020304") (IpRow "0.0.0.0" "00000000") (IpRow "255.255.255.255" "ffffffff") (IpRow "127.0.0.1" "7f000001")
+   (IpRow "256.1.1.1" "") (IpRow "1.2.3" "") (IpRow "1.2.3.4.5" "") (IpRow "01.2.3.4" "") (IpRow "1.2.3.04" "") (IpRow "1..3.4" "") (IpRow "a.b.c.d" "") (IpRow "1.2.3.4 " "")
+   (IpRow "example.com" "") (IpRow "" "") (IpRow "-1.2.3.4" "") (IpRow "1.2.3.-4" "")
+   (IpRow "::1" "00000000000000000000000000000001") (IpRow "::" "00000000000000000000000000000000") (IpRow "2001:db8::1" "20010db8000000000000000000000001")
+   (IpRow "2001:0db8:0000:0000:0000:0000:0000:0001" "20010db8000000000000000000000001") (IpRow "1:2:3:4:5:6:7:8" "00010002000300040005000600070008")
+   (IpRow "::ffff:1.2.3.4" "00000000000000000000ffff01020304") (IpRow "fe80::1" "fe800000000000000000000000000001") (IpRow "1::" "00010000000000000000000000000000")
+   (IpRow "1:2:3:4:5:6:7::" "00010002000300040005000600070000") (IpRow "::2:3:4:5:6:7:8" "00000002000300040005000600070008")
+   (IpRow ":::" "") (IpRow "1::2::3" "") (IpRow "1:2:3:4:5:6:7:8:9" "") (IpRow "1:2:3:4:5:6:7" "") (IpRow "12345::1" "") (IpRow "g::1" "") (IpRow "::1.2.3" "")
+   (IpRow "1:2:3:4:5:6:7:8::" "") (IpRow ":1" "") (IpRow "1:" "") (IpRow "::1.2.3.4:5" "")])
+
+(defstruct DnsRow (name: str base: str ok: bool))
+(def dns-constraints: (Vec DnsRow)
+  [(DnsRow "example.com" "example.com" true) (DnsRow "a.example.com" "example.com" true) (DnsRow "a.b.example.com" "example.com" true) (DnsRow "badexample.com" "example.com" false)
+   (DnsRow "example.org" "example.com" false) (DnsRow "example.com" ".example.com" false) (DnsRow "a.example.com" ".example.com" true) (DnsRow "EXAMPLE.COM" "example.com" true)
+   (DnsRow "a.example.com" "EXAMPLE.com" true) (DnsRow "anything" "" true) (DnsRow "*.example.com" "example.com" true) (DnsRow "*.example.com" "other.com" false)
+   (DnsRow "example.com." "example.com" true) (DnsRow "com" "example.com" false)])
+
+(defstruct IpCon (ip: str base: str ok: bool))
+(def ip-constraints: (Vec IpCon)
+  [(IpCon "10.1.2.3" "0a000000ff000000" true) (IpCon "11.1.2.3" "0a000000ff000000" false) (IpCon "10.1.2.3" "0a010200ffffff00" true) (IpCon "10.1.3.3" "0a010200ffffff00" false)
+   (IpCon "192.168.1.1" "00000000" false) (IpCon "10.1.2.3" "00000000ffffffffffffffffffffffff" false) (IpCon "::1" "00000000000000000000000000000001ffffffffffffffffffffffffffffffff" true)
+   (IpCon "::2" "00000000000000000000000000000001ffffffffffffffffffffffffffffffff" false) (IpCon "10.1.2.3" "0000000000000000" true)])
+
+(defun host-diffs () -> str
+  (reduce (fn (a: str r: Row) (if (= (dns-name-matches? (. r pat) (. r host)) (. r ok)) a (str a "[" (. r pat) " vs " (. r host) " expected " (. r ok) "] "))) "" host-rows))
+(defun ip-diffs () -> str
+  (reduce (fn (a: str r: IpRow) (if (= (hex-of (ip-literal (. r text))) (. r hex)) a (str a "[" (. r text) " gave " (hex-of (ip-literal (. r text))) " expected " (. r hex) "] "))) "" ip-rows))
+(defun dns-diffs () -> str
+  (reduce (fn (a: str r: DnsRow) (if (= (dns-in-subtree? (. r name) (. r base)) (. r ok)) a (str a "[" (. r name) " in " (. r base) " expected " (. r ok) "] "))) "" dns-constraints))
+(defun ipc-diffs () -> str
+  (reduce (fn (a: str r: IpCon) (if (= (ip-in-subtree? (ip-literal (. r ip)) (hexb (. r base))) (. r ok)) a (str a "[" (. r ip) " in " (. r base) " expected " (. r ok) "] "))) "" ip-constraints))
+(defun san-diffs () -> str
+  (let [dns ["a.example.com" "*.wild.example"] ips [(ip-literal "10.0.0.1") (ip-literal "2001:db8::1")]]
+    (str (if (host-matches? "a.example.com" dns ips) "" "dns san; ") (if (host-matches? "x.wild.example" dns ips) "" "wildcard san; ")
+         (if (host-matches? "10.0.0.1" dns ips) "" "ip san; ") (if (host-matches? "2001:db8::1" dns ips) "" "ipv6 san; ")
+         (if (host-matches? "10.0.0.2" dns ips) "ip mismatch; " "") (if (host-matches? "b.example.com" dns ips) "dns mismatch; " "")
+         (if (host-matches? "10.0.0.1" ["10.0.0.1"] []) "an IP host matched a dNSName; " "") (if (host-matches? "a.example.com" [] ips) "no dNSName but matched; " ""))))
+
+(defspecs specs
+  (feature "host name matching"
+    (scenario (str (count host-rows) " presented identifiers against reference names") (then (expect = "" (host-diffs))))
+    (scenario "a host against a whole subjectAltName (DNS and IP entries)" (then (expect = "" (san-diffs))))
+    (scenario "the table has both outcomes" (then (expect = true (some? (first (filter (fn (r: Row) (. r ok)) host-rows)))) (expect = true (some? (first (filter (fn (r: Row) (not (. r ok))) host-rows)))))))
+  (feature "IP literals"
+    (scenario (str (count ip-rows) " IPv4 and IPv6 texts") (then (expect = "" (ip-diffs)))))
+  (feature "name constraints"
+    (scenario (str (count dns-constraints) " dNSName subtree checks") (then (expect = "" (dns-diffs))))
+    (scenario (str (count ip-constraints) " iPAddress subtree checks") (then (expect = "" (ipc-diffs))))))
+
+(defun main () -> i64 (run-main (specs)))

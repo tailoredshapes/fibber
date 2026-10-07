@@ -1,0 +1,31 @@
+;; The whole certificate corpus (specs/tls-fixtures.fib) judged with REAL signature verification (the OpenSSL driver): every fixture must give its typed reason, including the three whose
+;; signature is wrong on purpose (a flipped byte in the leaf's signature, in the intermediate's, in the leaf's contents), which the gate's stubbed verifier cannot tell. Also: a
+;; valid RSA, ECDSA and Ed25519 chain verify through the provider. Run by scripts/tls-test.sh.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.pem fib.tls.x509 fib.tls.chain tls-fixtures)
+  (:require [fib.crypto :as c] [fib.crypto.openssl :as openssl]))
+
+(defun provider () -> openssl/OpenSsl (match (openssl/open-provider) ((Ok p) p) ((Err e) (trap (. e message)))))
+(defun parse-all (xs: (Vec str)) -> (Result (Vec Cert) TlsError)
+  (loop [i 0 acc []]
+    (if (= i (count xs)) (Ok acc)
+      (match (parse-certificate (hexb (nth xs i))) ((Err e) (Err e)) ((Ok c) (recur (+ i 1) (conj acc c)))))))
+(defun reason-text (e: TlsError) -> str (match e ((BadCertificate r _) (reason-name r)) (_ (tls-error-text e))))
+(defun verdict (p: openssl/OpenSsl f: Fx) -> str
+  (match (parse-all (. f chain))
+    ((Err e) (reason-text e))
+    ((Ok chain) (match (parse-all (. f anchors))
+                  ((Err e) (str "anchors: " (reason-text e)))
+                  ((Ok anchors) (match (validate-chain p chain (TrustStore anchors) (fixture-now) (. f host)) ((Ok _) "ok") ((Err e) (reason-text e))))))))
+(defun all-text (p: openssl/OpenSsl) -> str
+  (reduce (fn (a: str f: Fx) (let [v (verdict p f)] (if (= v (. f expect)) a (str a (. f name) ": expected " (. f expect) " got " v "; ")))) "" (fixtures)))
+(defun real-text (p: openssl/OpenSsl) -> str
+  (reduce (fn (a: str f: Fx) (if (. f real) (let [v (verdict p f)] (if (= v "bad-signature") a (str a (. f name) " gave " v "; "))) a)) "" (fixtures)))
+(defun ok-count (p: openssl/OpenSsl) -> i64 (count (filter (fn (f: Fx) (= (verdict p f) "ok")) (fixtures))))
+
+(defspecs specs
+  (feature "path validation over the corpus with real signature verification"
+    (scenario "every fixture gives its typed reason" (given [p (provider)]) (then (expect = "" (all-text p))))
+    (scenario "a wrong signature is bad-signature (leaf, intermediate, tampered contents)" (given [p (provider)]) (then (expect = "" (real-text p))))
+    (scenario "the accepted chains verified through the provider (ECDSA, RSA PKCS#1, Ed25519 leaves)" (given [p (provider)]) (then (expect = 11 (ok-count p))))))
+
+(defun main () -> i64 (run-main (specs)))

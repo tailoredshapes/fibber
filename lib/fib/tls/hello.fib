@@ -1,0 +1,57 @@
+;; fib.tls.hello: the configuration of a client and the ClientHello it makes. What is OFFERED is what the crypto provider can do (its capability list): a
+;; suite, a group or a signature scheme the provider lacks is not offered, and a provider that lacks all of one kind is `UnsupportedCapability`, naming it.
+;; Only TLS 1.3 is offered (supported_versions = [0x0304], legacy_version 0x0303): there is no fallback.
+(ns fib.tls.hello (:use fib.core fib.seq fib.coll fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.msg fib.tls.names fib.tls.pem fib.tls.keys)
+  (:require [fib.crypto :as c]))
+
+;; `host` is the name verified against the certificate and sent as server_name (not when it is an IP literal). `now` is the clock, in seconds since the
+;; epoch (the caller's: no global clock). `alpn` the protocols offered ([] sends no ALPN). `groups` and `suites` are the preference orders to offer, filtered by
+;; the provider's capabilities; `handshake-timeout-ms` bounds the whole handshake.
+(defstruct ClientConfig (host: str trust: TrustStore now: (fn () i64) alpn: (Vec str) groups: (Vec keyword) suites: (Vec i64) handshake-timeout-ms: i64))
+(defun client-config (host: str trust: TrustStore now: (fn () i64)) -> ClientConfig
+  (ClientConfig host trust now ["http/1.1"] [:x25519 :p-256 :p-384] [suite-aes-128-gcm-sha256 suite-chacha20-poly1305-sha256 suite-aes-256-gcm-sha384] 10000))
+
+;; (wire id, key kind of generate-key, capability of key agreement) of each group
+(defun group-id (kind: keyword) -> i64 (cond (= kind :x25519) group-x25519 (= kind :p-256) group-secp256r1 (= kind :p-384) group-secp384r1 :else -1))
+(defun group-kind (id: i64) -> (Option keyword) (cond (= id group-x25519) (some :x25519) (= id group-secp256r1) (some :p-256) (= id group-secp384r1) (some :p-384) :else nil))
+(defun group-cap (kind: keyword) -> keyword (cond (= kind :x25519) :x25519 (= kind :p-256) :ecdh-p256 :else :ecdh-p384))
+(defun raw-share-length (kind: keyword) -> i64 (cond (= kind :x25519) 32 (= kind :p-256) 65 :else 97))
+
+;; (wire scheme, verify scheme keyword of fib.crypto, the key kind the certificate must hold)
+(defstruct SigAlg (wire: i64 scheme: keyword key: keyword))
+(defun cv-algs () -> (Vec SigAlg)
+  [(SigAlg sig-ecdsa-p256-sha256 :ecdsa-p256-sha256 :p-256) (SigAlg sig-ecdsa-p384-sha384 :ecdsa-p384-sha384 :p-384)
+   (SigAlg sig-rsa-pss-rsae-sha256 :rsa-pss-sha256 :rsa) (SigAlg sig-rsa-pss-rsae-sha384 :rsa-pss-sha384 :rsa) (SigAlg sig-ed25519 :ed25519 :ed25519)])
+(defun cert-algs () -> (Vec SigAlg) (vec (concat (cv-algs) [(SigAlg sig-rsa-pkcs1-sha256 :rsa-pkcs1-sha256 :rsa) (SigAlg sig-rsa-pkcs1-sha384 :rsa-pkcs1-sha384 :rsa)])))
+
+(defstruct Offer (suites: (Vec i64) groups: (Vec keyword) cv-sigs: (Vec SigAlg) cert-sigs: (Vec SigAlg)))
+
+(defun suite-usable? :private (p: p id: i64) :where ((CryptoProvider p)) -> bool
+  (match (suite-of id) (nil false) ((some s) (and (c/supports? p (. s aead)) (c/supports? p (. s hash))))))
+(defun alg-usable? :private (p: p a: SigAlg) :where ((CryptoProvider p)) -> bool (c/supports? p (. a scheme)))
+
+;; What the provider makes it possible to offer; an empty kind, or a missing basic, is an error naming it.
+(defun make-offer (p: p cfg: ClientConfig) :where ((CryptoProvider p)) -> (Result Offer TlsError)
+  (let [suites (vec (filter (fn (id: i64) (suite-usable? p id)) (. cfg suites)))
+        groups (vec (filter (fn (g: keyword) (c/supports? p (group-cap g))) (. cfg groups)))
+        cvs (vec (filter (fn (a: SigAlg) (alg-usable? p a)) (cv-algs)))
+        certs (vec (filter (fn (a: SigAlg) (alg-usable? p a)) (cert-algs)))
+        missing (first (filter (fn (w: keyword) (not (c/supports? p w))) [:hmac :hkdf :random :ct-equal]))]
+    (cond (some? missing) (Err (UnsupportedCapability (str (match missing ((some m) m) (nil :none)))))
+          (= (count suites) 0) (Err (UnsupportedCapability "an AEAD and hash for a TLS 1.3 cipher suite (aes-128-gcm, aes-256-gcm or chacha20-poly1305, with sha-256 or sha-384)"))
+          (= (count groups) 0) (Err (UnsupportedCapability "key agreement (x25519, ecdh-p256 or ecdh-p384)"))
+          (= (count cvs) 0) (Err (UnsupportedCapability "signature verification (rsa-pss, ecdsa or ed25519)"))
+          :else (Ok (Offer suites groups cvs certs)))))
+
+;; The ClientHello, in the order: server_name, supported_groups, signature_algorithms, signature_algorithms_cert, supported_versions, key_share, alpn, cookie.
+;; `share` is the (group, public) pair for the one key share; `cookie` is echoed from a HelloRetryRequest.
+(defun build-hello (cfg: ClientConfig o: Offer random: (Array i8) sid: (Array i8) group: i64 pub: (Array i8) cookie: (Option (Array i8))) -> (Array i8)
+  (client-hello random sid (. o suites)
+    (vec (concat (concat (concat (if (ip-literal? (. cfg host)) [] [(ext-server-name (. cfg host))])
+      [(ext-supported-groups (vec (map (fn (k: keyword) (group-id k)) (. o groups))))
+       (ext-signature-algorithms (vec (map (fn (a: SigAlg) (. a wire)) (. o cv-sigs))))
+       (ext-signature-algorithms-cert (vec (map (fn (a: SigAlg) (. a wire)) (. o cert-sigs))))
+       (ext-supported-versions-client [772])
+       (ext-key-share-client [(Pair group pub)])])
+      (if (= (count (. cfg alpn)) 0) [] [(ext-alpn (. cfg alpn))]))
+      (match cookie (nil []) ((some ck) [(ext-cookie ck)]))))))

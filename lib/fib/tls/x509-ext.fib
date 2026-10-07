@@ -1,0 +1,135 @@
+;; fib.tls.x509-ext: the extensions of a certificate (RFC 5280 4.2). Understood and enforced by fib.tls.chain: basicConstraints, keyUsage, extKeyUsage,
+;; subjectAltName (dNSName and iPAddress), nameConstraints (dNSName and iPAddress; the other name types are recorded in `nc-other` so that the chain can
+;; refuse a name it cannot judge), and informational: subjectKeyIdentifier, authorityKeyIdentifier. Recognised and not processed (policies, CRL
+;; distribution points, authority information access, SCTs: no revocation, no policy checking, see docs/design/tls.md): certificatePolicies,
+;; cRLDistributionPoints, authorityInfoAccess, subjectInfoAccess, issuerAltName, freshestCRL, and the Certificate Transparency list. Any other
+;; extension that is critical, and policyMappings, policyConstraints and inhibitAnyPolicy when critical (their processing is not built), is refused.
+(ns fib.tls.x509-ext (:use fib.core fib.seq fib.coll fib.tls.types fib.tls.bytes fib.tls.asn1))
+
+(defstruct Exts
+  (has-bc: bool is-ca: bool path-len: i64 has-ku: bool ku: i64 has-eku: bool eku: (Vec str)
+   has-san: bool san-dns: (Vec str) san-ip: (Vec (Array i8)) san-other: (Vec i64)
+   has-nc: bool nc-perm-dns: (Vec str) nc-excl-dns: (Vec str) nc-perm-ip: (Vec (Array i8)) nc-excl-ip: (Vec (Array i8)) nc-other: (Vec i64)
+   ski: (Option (Array i8)) aki: (Option (Array i8))))
+(defun no-exts () -> Exts
+  (Exts false false -1 false 0 false [] false [] [] [] false [] [] [] [] [] nil nil))
+
+;; keyUsage bit numbers (RFC 5280 4.2.1.3)
+(def ku-digital-signature: i64 0) (def ku-key-cert-sign: i64 5)
+(defun ku-has? (e: Exts bit: i64) -> bool (not (= (bit-and (. e ku) (shl 1 bit)) 0)))
+
+(def oid-server-auth: str "1.3.6.1.5.5.7.3.1")
+(def oid-any-eku: str "2.5.29.37.0")
+
+(defun ext-body (t: Tlv) -> (Result Tlv TlsError) (der-root (tlv-content t)))
+
+(defun parse-basic (e: Exts body: Tlv) -> (Result Exts TlsError)
+  (try-let [ks (der-seq-kids body "basicConstraints")]
+    (cond (= (count ks) 0) (Ok (with e (has-bc true)))
+          (= (. (nth ks 0) tag) tag-bool)
+            (try-let [ca (der-bool (nth ks 0))]
+              (cond (not ca) (Err (parse-err "basicConstraints: DER omits cA FALSE"))
+                    (= (count ks) 1) (Ok (with e (has-bc true) (is-ca true)))
+                    (= (count ks) 2) (try-let [pl (der-small-int (nth ks 1))] (Ok (with e (has-bc true) (is-ca true) (path-len pl))))
+                    :else (Err (parse-err "basicConstraints: too many fields"))))
+          (= (count ks) 1) (try-let [pl (der-small-int (nth ks 0))] (Ok (with e (has-bc true) (path-len pl))))
+          :else (Err (parse-err "basicConstraints: unexpected fields")))))
+
+(defun parse-key-usage (e: Exts body: Tlv) -> (Result Exts TlsError)
+  (try-let [bs (der-bits body)]
+    (let [bytes (. bs fst) nbits (- (* 8 (array-len bytes)) (. bs snd))]
+      (if (= nbits 0) (Err (parse-err "keyUsage: no bits"))
+        (Ok (with e (has-ku true)
+              (ku (loop [i 0 m 0]
+                    (if (= i nbits) m
+                      (recur (+ i 1) (if (= (bit-and (shr (b-at bytes (quot i 8)) (- 7 (rem i 8))) 1) 1) (bit-or m (shl 1 i)) m)))))))))))
+
+(defun parse-eku (e: Exts body: Tlv) -> (Result Exts TlsError)
+  (try-let [ks (der-seq-kids body "extKeyUsage")]
+    (if (= (count ks) 0) (Err (parse-err "extKeyUsage: empty"))
+      (loop [i 0 acc []]
+        (if (= i (count ks)) (Ok (with e (has-eku true) (eku acc)))
+          (match (der-oid (nth ks i)) ((Err x) (Err x)) ((Ok o) (recur (+ i 1) (conj acc o)))))))))
+
+;; ---- general names. [2] dNSName (IA5), [7] iPAddress, others by tag number.
+(defun ia5? :private (b: (Array i8)) -> bool (loop [i 0] (cond (= i (array-len b)) true (>= (b-at b i) 128) false :else (recur (+ i 1)))))
+(defstruct Names (dns: (Vec str) ip: (Vec (Array i8)) other: (Vec i64)))
+(defun add-general-name :private (ns: Names g: Tlv ip-lens: (Vec i64)) -> (Result Names TlsError)
+  (let [tag (. g tag) body (tlv-content g)]
+    (cond (= tag 130) (if (ia5? body) (Ok (with ns (dns (conj (. ns dns) (str-from-bytes body))))) (Err (parse-err "general name: dNSName is not IA5")))
+          (= tag 135) (if (includes? (array-len body) ip-lens) (Ok (with ns (ip (conj (. ns ip) body)))) (Err (parse-err "general name: an iPAddress of the wrong length")))
+          :else (Ok (with ns (other (conj (. ns other) (- tag (if (constructed? g) 160 128)))))))))
+(defun general-names :private (body: Tlv what: str) -> (Result Names TlsError)
+  (try-let [ks (der-seq-kids body what)]
+    (if (= (count ks) 0) (Err (parse-err (str what ": empty")))
+      (loop [i 0 acc (Names [] [] [])]
+        (if (= i (count ks)) (Ok acc)
+          (match (add-general-name acc (nth ks i) [4 16]) ((Err x) (Err x)) ((Ok a) (recur (+ i 1) a))))))))
+(defun parse-san (e: Exts body: Tlv) -> (Result Exts TlsError)
+  (try-let [ns (general-names body "subjectAltName")]
+    (Ok (with e (has-san true) (san-dns (. ns dns)) (san-ip (. ns ip)) (san-other (. ns other))))))
+
+;; ---- name constraints. Each subtree is a base name; minimum is 0 and maximum absent (RFC 5280 4.2.1.10).
+(defun subtrees :private (t: Tlv) -> (Result Names TlsError)
+  (try-let [ks (der-kids t)]
+    (loop [i 0 acc (Names [] [] [])]
+      (if (= i (count ks)) (Ok acc)
+        (match (subtree acc (nth ks i)) ((Err x) (Err x)) ((Ok a) (recur (+ i 1) a)))))))
+(defun subtree :private (acc: Names t: Tlv) -> (Result Names TlsError)
+  (try-let [ks (der-seq-kids t "GeneralSubtree")]
+    (if (not (= (count ks) 1)) (Err (parse-err "nameConstraints: a subtree has a base only (minimum 0, no maximum)"))
+      (add-general-name acc (nth ks 0) [8 32]))))
+(defun parse-nc (e: Exts body: Tlv) -> (Result Exts TlsError)
+  (try-let [ks (der-seq-kids body "nameConstraints")]
+    (let [perm (first (filter (fn (k: Tlv) (= (. k tag) 160)) ks)) excl (first (filter (fn (k: Tlv) (= (. k tag) 161)) ks))]
+      (if (or (= (count ks) 0) (> (count ks) 2) (and (= (count ks) 2) (or (nil? perm) (nil? excl))))
+        (Err (parse-err "nameConstraints: permitted and excluded subtrees only"))
+        (try-let [p (nc-names perm) x (nc-names excl)]
+          (Ok (with e (has-nc true) (nc-perm-dns (. p dns)) (nc-excl-dns (. x dns)) (nc-perm-ip (. p ip)) (nc-excl-ip (. x ip))
+                (nc-other (vec (concat (. p other) (. x other)))))))))))
+(defun nc-names :private (t: (Option Tlv)) -> (Result Names TlsError)
+  (match t (nil (Ok (Names [] [] []))) ((some k) (subtrees k))))
+
+(defun parse-ski (e: Exts body: Tlv) -> (Result Exts TlsError)
+  (try-let [v (der-octets body)] (Ok (with e (ski (some v))))))
+(defun parse-aki (e: Exts body: Tlv) -> (Result Exts TlsError)
+  (try-let [ks (der-seq-kids body "authorityKeyIdentifier")]
+    (match (first (filter (fn (k: Tlv) (= (. k tag) 128)) ks))
+      (nil (Ok e)) ((some k) (Ok (with e (aki (some (tlv-content k)))))))))
+
+;; ---- the extension list
+(def ignored-oids: (Vec str)
+  ["2.5.29.32" "2.5.29.31" "1.3.6.1.5.5.7.1.1" "1.3.6.1.5.5.7.1.11" "2.5.29.18" "2.5.29.46" "1.3.6.1.4.1.11129.2.4.2" "1.3.6.1.4.1.11129.2.4.3"])
+(def refused-critical-oids: (Vec str) ["2.5.29.33" "2.5.29.36" "2.5.29.54"])
+
+(defun apply-ext :private (e: Exts oid: str critical: bool body: Tlv) -> (Result Exts TlsError)
+  (cond (= oid "2.5.29.19") (parse-basic e body)
+        (= oid "2.5.29.15") (parse-key-usage e body)
+        (= oid "2.5.29.37") (parse-eku e body)
+        (= oid "2.5.29.17") (parse-san e body)
+        (= oid "2.5.29.30") (parse-nc e body)
+        (= oid "2.5.29.14") (parse-ski e body)
+        (= oid "2.5.29.35") (parse-aki e body)
+        (and critical (includes? oid refused-critical-oids)) (Err (bad-cert CertUnknownCritical (str "critical extension " oid " is not processed here")))
+        (includes? oid ignored-oids) (Ok e)
+        critical (Err (bad-cert CertUnknownCritical (str "unknown critical extension " oid)))
+        :else (Ok e)))
+
+(defun one-ext :private (e: Exts seen: (Vec str) x: Tlv) -> (Result (Pair Exts (Vec str)) TlsError)
+  (try-let [ks (der-seq-kids x "Extension")]
+    (if (or (< (count ks) 2) (> (count ks) 3)) (Err (parse-err "Extension: OID, optional critical, value"))
+      (try-let [oid (der-oid (nth ks 0))
+                critical (if (= (count ks) 3) (der-bool (nth ks 1)) (Ok false))
+                octets (der-octets (nth ks (- (count ks) 1)))]
+        (cond (includes? oid seen) (Err (parse-err (str "extension " oid " appears twice")))
+              (and (= (count ks) 3) (not critical)) (Err (parse-err "Extension: DER omits critical FALSE"))
+              :else (try-let [body (der-root octets) e2 (apply-ext e oid critical body)] (Ok (Pair e2 (conj seen oid)))))))))
+
+(defun empty-strs :private () -> (Vec str) [])
+;; The `Extensions` element ([3] EXPLICIT in the tbsCertificate); `t` is the SEQUENCE inside it.
+(defun parse-extensions (t: Tlv) -> (Result Exts TlsError)
+  (try-let [ks (der-seq-kids t "Extensions")]
+    (if (= (count ks) 0) (Err (parse-err "Extensions: empty (omit it)"))
+      (loop [i 0 e (no-exts) seen (empty-strs)]
+        (if (= i (count ks)) (Ok e)
+          (match (one-ext e seen (nth ks i)) ((Err x) (Err x)) ((Ok p) (recur (+ i 1) (. p fst) (. p snd)))))))))

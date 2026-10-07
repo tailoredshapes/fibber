@@ -1,0 +1,104 @@
+;; The record layer of fib.tls (RFC 8446 5) where no cryptography is needed, so in the gate: framing, limits and refusals of PLAINTEXT records and of what the layer refuses BEFORE it
+;; decrypts (a plaintext record once the read keys are on, a ciphertext over 2^14+256 or under 17 bytes, an unknown type, a major version other than 3); handshake messages split
+;; across records at EVERY split point and coalesced, delivered a byte at a time; the stream cut at every byte; an empty handshake record; an alert or application data inside a
+;; handshake message; the compatibility change_cipher_spec (at most two, body 0x01, only during the handshake); and the nonce construction. The encrypted records themselves
+;; (round trip, a flipped bit, replay, reorder) are judged with the real driver in tls-specs/tls-e2e-spec.fib. `fibc test specs`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.msg fib.tls.keys fib.tls.record tls-stub))
+
+(defun feed-io (data: (Array i8) chunk: i64) -> Io
+  (let [pos (cell 0)]
+    (Io (fn (n: i64) (let [p @pos k (min (min n chunk) (- (array-len data) p))] (do (set! pos (+ p k)) (Ok (slice data p (+ p k))))))
+        (fn (b: (Array i8)) (Ok ())) (fn () ()) (fn (at: i64) ()))))
+(defun rec-of (data: (Array i8) chunk: i64) -> Rec (fib.tls.record/new-rec (feed-io data chunk)))
+(defun hs-rec (body: (Array i8)) -> (Array i8) (cat [(w8 22) (w16 771) (vec16 body)]))
+(defun msg (typ: i64 n: i64) -> (Array i8) (hs-wrap typ (repeat-bytes 5 n)))
+(defun tag (e: TlsError) -> str
+  (match e ((TlsProtocol a _) (str "protocol:" a)) ((TlsAlert _ n) (str "alert:" n)) ((Truncated) "truncated") ((UnsupportedCapability _) "unsupported") (_ (tls-error-text e))))
+(defun next-text (r: Rec) -> str (match (next-message (stub-accepts) r) ((Ok m) (str "msg " (. m type) " " (array-len (. m body)))) ((Err e) (tag e))))
+(defun read-text (r: Rec) -> str (match (read-record (stub-accepts) r) ((Ok x) (str "rec " (. x type) " " (array-len (. x data)))) ((Err e) (tag e))))
+(defun texts (r: Rec n: i64) -> (Vec str) (vec (map (fn (i: i64) (next-text r)) (range n))))
+
+(defun split-text () -> str
+  (let [m (msg 8 300) n (array-len m)
+        bad (filter (fn (k: i64) (not (= (next-text (rec-of (cat [(hs-rec (slice m 0 k)) (hs-rec (slice m k n))]) 1000000)) "msg 8 300"))) (range 1 n))]
+    (if (= (count bad) 0) "" (str "a message split at byte " (nth (vec bad) 0) " was not reassembled; "))))
+(defun split3-text () -> str
+  (let [m (msg 11 50) n (array-len m)
+        bad (filter (fn (k: i64) (let [j (+ k 1)] (not (= (next-text (rec-of (cat [(hs-rec (slice m 0 k)) (hs-rec (slice m k j)) (hs-rec (slice m j n))]) 1000000)) "msg 11 50")))) (range 1 (- n 1)))]
+    (if (= (count bad) 0) "" (str "a message split in three at " (nth (vec bad) 0) "; "))))
+(defun bytewise-text () -> str
+  (let [stream (cat [(hs-rec (msg 8 20)) (hs-rec (cat [(msg 11 400) (msg 15 70)]))])]
+    (if (= (texts (rec-of stream 1) 4) ["msg 8 20" "msg 11 400" "msg 15 70" "truncated"]) "" (str "bytewise: " (pr-str (texts (rec-of stream 1) 4))))))
+(defun cut-text () -> str
+  (let [stream (cat [(hs-rec (msg 8 20)) (hs-rec (cat [(msg 11 400) (msg 15 70)]))])
+        bad (filter (fn (k: i64) (let [r (rec-of (slice stream 0 k) 7)] (= (last-of (texts r 3)) "msg 15 70"))) (range (array-len stream)))]
+    (if (= (count bad) 0) "" (str "a stream cut at byte " (nth (vec bad) 0) " still gave the last message; "))))
+(defun last-of (xs: (Vec str)) -> str (nth xs (- (count xs) 1)))
+(defun cut-all-text () -> str
+  (let [stream (hs-rec (msg 8 100)) bad (filter (fn (k: i64) (not (= (next-text (rec-of (slice stream 0 k) 3)) "truncated"))) (range (array-len stream)))]
+    (if (= (count bad) 0) "" (str "a record cut at byte " (nth (vec bad) 0) " did not give truncated; "))))
+
+(defstruct RC (name: str bytes: (Array i8) want: str))
+(defun rec-cases () -> (Vec RC)
+  [(RC "a record of exactly 2^14 bytes" (cat [(w8 22) (w16 771) (w16 16384) (repeat-bytes 0 16384)]) "rec 22 16384")
+   (RC "a plaintext record over 2^14 bytes" (cat [(w8 22) (w16 771) (w16 16385) (repeat-bytes 0 16385)]) "protocol:22")
+   (RC "an unknown record type" (hexb "630303000100") "protocol:10") (RC "a major version other than 3" (hexb "160203000100") "protocol:10")
+   (RC "an old minor version is not looked at (0x0301)" (hexb "160301000100") "rec 22 1") (RC "an empty application record" (hexb "170303000000") "rec 23 0")
+   (RC "alert, close_notify" (hexb "15030300020100") "rec 21 2")])
+(defun rec-diffs () -> str
+  (reduce (fn (a: str c: RC) (let [got (read-text (rec-of (. c bytes) 4096))] (if (= got (. c want)) a (str a (. c name) ": " got "; ")))) "" (rec-cases)))
+
+(defstruct HC (name: str bytes: (Array i8) want: (Vec str)))
+(defun hs-cases () -> (Vec HC)
+  [(HC "two messages in one record" (hs-rec (cat [(msg 8 5) (msg 11 6)])) ["msg 8 5" "msg 11 6" "truncated"])
+   (HC "an empty handshake record" (hs-rec (empty-bytes)) ["protocol:50"])
+   (HC "an alert inside a half-received message" (cat [(hs-rec (slice (msg 8 20) 0 6)) (hexb "15030300020028")]) ["protocol:10"])
+   (HC "application data inside a half-received message" (cat [(hs-rec (slice (msg 8 20) 0 6)) (hexb "170303000161")]) ["protocol:10"])
+   (HC "application data during the handshake" (hexb "170303000161") ["protocol:10"])
+   (HC "close_notify during the handshake" (hexb "15030300020100") ["alert:close_notify (during the handshake)"])
+   (HC "a fatal alert" (hexb "15030300020228") ["alert:handshake_failure"])
+   (HC "an alert of three bytes" (hexb "1503030003012800") ["protocol:50"])
+   (HC "a handshake message larger than 2^18" (hs-rec (hexb "08050000")) ["protocol:22"])
+   (HC "one change_cipher_spec is ignored" (cat [(hexb "140303000101") (hs-rec (msg 8 3))]) ["msg 8 3"])
+   (HC "two change_cipher_spec are ignored" (cat [(hexb "140303000101") (hexb "140303000101") (hs-rec (msg 8 3))]) ["msg 8 3"])
+   (HC "a third change_cipher_spec is refused" (cat [(hexb "140303000101") (hexb "140303000101") (hexb "140303000101") (hs-rec (msg 8 3))]) ["protocol:10"])
+   (HC "a change_cipher_spec with another body" (cat [(hexb "140303000102") (hs-rec (msg 8 3))]) ["protocol:10"])
+   (HC "a two-byte change_cipher_spec" (cat [(hexb "14030300020101") (hs-rec (msg 8 3))]) ["protocol:10"])])
+(defun hs-diffs () -> str
+  (reduce (fn (a: str c: HC) (let [got (texts (rec-of (. c bytes) 4096) (count (. c want)))] (if (= got (. c want)) a (str a (. c name) ": " (pr-str got) "; ")))) "" (hs-cases)))
+(defun ccs-after-handshake () -> str
+  (let [r (rec-of (cat [(hexb "140303000101") (hs-rec (msg 8 3))]) 4096)] (do (set! (. r handshaking) false) (next-text r))))
+
+;; ---- once the read keys are on (the stub has no AEAD: what is judged here is what is refused BEFORE decrypting)
+(defun keyed (data: (Array i8)) -> Rec
+  (let [r (rec-of data 4096)] (do (set-read-keys r :aes-128-gcm (Traffic (repeat-bytes 1 32) (repeat-bytes 2 16) (repeat-bytes 3 12))) r)))
+(defun keyed-cases () -> (Vec RC)
+  [(RC "a plaintext handshake record" (hs-rec (msg 8 3)) "protocol:10") (RC "a plaintext alert" (hexb "15030300020100") "protocol:10")
+   (RC "a ciphertext over 2^14+256" (cat [(w8 23) (w16 771) (w16 16641) (repeat-bytes 0 16641)]) "protocol:22")
+   (RC "a ciphertext shorter than a tag and a type" (cat [(w8 23) (w16 771) (w16 16) (repeat-bytes 0 16)]) "protocol:50")
+   (RC "a ciphertext of 2^14+256 is read (and cannot be opened without an AEAD)" (cat [(w8 23) (w16 771) (w16 16640) (repeat-bytes 0 16640)]) "unsupported")
+   (RC "an unknown type" (hexb "630303000100") "protocol:10")])
+(defun keyed-diffs () -> str
+  (reduce (fn (a: str c: RC) (let [got (read-text (keyed (. c bytes)))] (if (= got (. c want)) a (str a (. c name) ": " got "; ")))) "" (keyed-cases)))
+(defun nonce-diffs () -> str
+  (let [iv (hexb "000102030405060708090a0b")]
+    (str (if (= (hex-of (record-nonce iv 0)) "000102030405060708090a0b") "" "seq 0; ") (if (= (hex-of (record-nonce iv 1)) "000102030405060708090a0a") "" "seq 1; ")
+         (if (= (hex-of (record-nonce iv 256)) "000102030405060708090b0b") "" "seq 256; ") (if (= (hex-of (record-nonce iv 72623859790382856)) "000102030405060708090a0b") "seq as a number ignored; " "")
+         (if (= (hex-of (record-nonce (repeat-bytes 0 12) 72623859790382856)) "000000000102030405060708") "" "a 64-bit sequence is not left-padded to 12 bytes; "))))
+
+(defspecs specs
+  (feature "handshake messages across records"
+    (scenario "a message split in two records at every byte is reassembled" (then (expect = "" (split-text))))
+    (scenario "a message split in three records is reassembled" (then (expect = "" (split3-text))))
+    (scenario "records delivered a byte at a time, two messages in one record" (then (expect = "" (bytewise-text))))
+    (scenario "a stream cut at every byte never gives the last message" (then (expect = "" (cut-text))))
+    (scenario "a record cut at every byte is a truncation" (then (expect = "" (cut-all-text)))))
+  (feature "plaintext records and the handshake rules"
+    (scenario "limits, versions, types" (then (expect = "" (rec-diffs))))
+    (scenario "14 handshake-stream cases: empty, interleaved, alerts, oversized, change_cipher_spec" (then (expect = "" (hs-diffs))))
+    (scenario "a change_cipher_spec after the handshake is refused" (then (expect = "protocol:10" (ccs-after-handshake)))))
+  (feature "once the read keys are on"
+    (scenario "what is refused before decrypting" (then (expect = "" (keyed-diffs))))
+    (scenario "the nonce is the IV XOR the left-padded 64-bit sequence number" (then (expect = "" (nonce-diffs))))))
+
+(defun main () -> i64 (run-main (specs)))

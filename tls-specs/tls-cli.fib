@@ -1,0 +1,74 @@
+;; A small TLS client program for the interop script (scripts/tls-interop.sh) and the benchmark (scripts/tls-bench.sh): it connects to HOST:PORT with the OpenSSL driver, verifies the
+;; name HOST against a trust store ("embedded" roots, "system" files, or a PEM path) and does one of
+;;   get        GET / over HTTP/1.0; prints the status line and the byte count
+;;   down PATH  GET PATH, read to the end, print the byte count and a checksum (the download direction)
+;;   up N       POST N bytes (pattern) to /echo, print the reply (the upload direction)
+;;   http       the same GET through fib.http's client with `https-options` (the Transport seam)
+;;   bulk PATH  GET PATH (a large file), read it in 64 KiB reads, print bytes, milliseconds and MB/s (no checksum: the benchmark's download direction)
+;;   hs N       N handshakes, print the time of each in milliseconds (a median is the caller's)
+;; The last line is `RESULT ok ...` or `RESULT error <typed error>`; the exit status is 0 for ok. usage: tls-cli HOST PORT TRUST MODE [ARG] [--groups g,..] [--suites s,..]
+(ns main (:use fib.core fib.seq fib.coll fib.http.types fib.tls.types fib.tls.bytes fib.tls.msg fib.tls.pem fib.tls.hello fib.tls.client fib.tls.conn fib.tls.http fib.tls.roots)
+  (:require [fib.crypto :as c] [fib.crypto.openssl :as openssl] [fib.http.tcp :as tcp] [fib.http.client :as hc] [fib.http.client.types :as ht] [fib.os.time :as time]))
+
+(defun trust-of (name: str) -> (Result TrustStore TlsError)
+  (cond (= name "embedded") (embedded-roots) (= name "system") (system-trust) :else (trust-from-file name)))
+(defun pattern (n: i64) -> (Array i8) (let [c (cell (array n 0i8))] (do (dotimes (i n) (array-set! &c i (trunc i8 (+ 97 (rem (* i 7) 26))))) @c)))
+(defun checksum (b: (Array i8)) -> i64 (loop [i 0 acc 0] (if (= i (array-len b)) acc (recur (+ i 1) (rem (+ (* acc 31) (b-at b i)) 1000000007)))))
+(defun read-all (s: Session) -> (Result (Array i8) TlsError)
+  (loop [acc []] (match ((. s read) 65536) ((Err e) (Err e)) ((Ok b) (if (= (array-len b) 0) (Ok (cat acc)) (recur (conj acc b)))))))
+(defun ms-since (t0: i64) -> i64 (quot (- (time/clock-now) t0) 1000))
+(defun connect-to (p: openssl/OpenSsl host: str port: i64 trust: TrustStore cfgf: (fn (ClientConfig) ClientConfig)) -> (Result Session TlsError)
+  (match (tcp/connect host port 5000)
+    ((Err e) (Err (TransportFailed (error-message e))))
+    ((Ok t) (tls-session p (cfgf (client-config host trust (fn () (wall-seconds)))) t))))
+(defun status-line (b: (Array i8)) -> str (let [i (index-of-byte b 13 0)] (str-from-bytes (slice b 0 (if (< i 0) (min 40 (array-len b)) i)))))
+(defun fail (e: TlsError) -> i64 (do (println "RESULT error" (tls-error-text e)) 1))
+(defun do-get (s: Session path: str) -> i64
+  (match ((. s write) (str-bytes (str "GET " path " HTTP/1.0\r\nHost: x\r\n\r\n")))
+    ((Err e) (fail e))
+    ((Ok _) (match (read-all s) ((Err e) (fail e)) ((Ok b) (do (println "RESULT ok" (status-line b) "bytes" (array-len b) "checksum" (checksum b)) ((. s close)) 0))))))
+;; Reads the response to its end and counts the bytes: the time is the transfer, not the connection.
+(defun do-bulk (s: Session path: str) -> i64
+  (match ((. s write) (str-bytes (str "GET " path " HTTP/1.0\r\nHost: x\r\n\r\n")))
+    ((Err e) (fail e))
+    ((Ok _) (let [t0 (time/clock-now)]
+              (loop [total 0]
+                (match ((. s read) 65536)
+                  ((Err e) (fail e))
+                  ((Ok b) (if (= (array-len b) 0)
+                            (let [us (max 1 (ms-since t0))] (do (println "RESULT ok bytes" total "ms" (quot us 1000) "MB/s" (quot (* total 1000000) (* us 1048576))) ((. s close)) 0))
+                            (recur (+ total (array-len b)))))))))))
+(defun do-up (s: Session n: i64) -> i64
+  (let [body (pattern n)]
+    (match ((. s write) (cat [(str-bytes (str "POST /echo HTTP/1.0\r\nContent-Length: " n "\r\n\r\n")) body]))
+      ((Err e) (fail e))
+      ((Ok _) (match (read-all s) ((Err e) (fail e)) ((Ok b) (do (println "RESULT ok" (status-line b) "sent" n "reply bytes" (array-len b)) ((. s close)) 0)))))))
+(defun do-hs (p: openssl/OpenSsl host: str port: i64 trust: TrustStore n: i64 cfgf: (fn (ClientConfig) ClientConfig)) -> i64
+  (let [times (vec (map (fn (i: i64) (let [t0 (time/clock-now)] (match (connect-to p host port trust cfgf) ((Err _) -1) ((Ok s) (do ((. s close)) (ms-since t0)))))) (range n)))]
+    (do (println "RESULT ok handshake-us" (pr-str times)) 0)))
+(defun do-http (p: openssl/OpenSsl host: str port: i64 trust: TrustStore) -> i64
+  (let [o (https-options (ht/default-options) p trust)]
+    (match (hc/request (ClientRequest "GET" (str "https://" host ":" port "/") {} (array 0 0i8)) o)
+      ((Err e) (do (println "RESULT error" (error-message e)) 1))
+      ((Ok r) (do (println "RESULT ok HTTP status" (. r status) "bytes" (array-len (. r body))) 0)))))
+(defun split-commas (s: str) -> (Vec str) (vec (map (fn (x: str) x) [s])))
+
+(defun main () -> i64
+  (let [a (args) host (nth a 0) port (unwrap-or (parse-long (nth a 1)) 0) tn (nth a 2) mode (nth a 3) arg (if (> (count a) 4) (nth a 4) "")]
+    (match (openssl/open-provider)
+      ((Err e) (do (println "RESULT error provider:" (. e message)) 2))
+      ((Ok p) (match (trust-of tn)
+                ((Err e) (fail e))
+                ((Ok trust)
+                  (let [cfgf (fn (c: ClientConfig) (cond (includes? "--aes128" a) (with c (suites [suite-aes-128-gcm-sha256]))
+                                                         (includes? "--chacha" a) (with c (suites [suite-chacha20-poly1305-sha256]))
+                                                         (includes? "--aes256" a) (with c (suites [suite-aes-256-gcm-sha384]))
+                                                         (includes? "--p256" a) (with c (groups [:p-256]))
+                                                         :else c))]
+                    (cond (= mode "hs") (do-hs p host port trust (unwrap-or (parse-long arg) 10) cfgf)
+                          (= mode "http") (do-http p host port trust)
+                          :else (match (connect-to p host port trust cfgf)
+                                  ((Err e) (fail e))
+                                  ((Ok s) (cond (= mode "up") (do-up s (unwrap-or (parse-long arg) 1048576))
+                                                (= mode "down") (do-get s arg) (= mode "bulk") (do-bulk s arg)
+                                                :else (do-get s "/"))))))))))))

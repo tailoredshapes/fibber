@@ -1,0 +1,58 @@
+;; fib.tls.types: the typed failures of fib.tls (docs/design/tls.md). Every failure is a value; nothing is retried at a weaker protocol, suite or
+;; check, and a failure that could be an attack is never reported as a clean end of stream. The variant names are prefixed because variant names are
+;; global across linked modules (fib.http.types has `Closed` and `ProtocolError`, which a program that links both would otherwise collide with).
+(ns fib.tls.types (:use fib.core fib.seq fib.coll))
+
+;; Why a certificate was refused.
+(defenum CertReason
+  (CertExpired) (CertNotYetValid) (CertUntrustedRoot) (CertHostnameMismatch) (CertBadSignature) (CertPathLength) (CertNameConstraint)
+  (CertKeyUsage) (CertWeakAlgorithm) (CertUnknownCritical) (CertParse) (CertBadChain))
+(derive Eq CertReason)
+(derive Debug CertReason)
+
+(defun reason-name (r: CertReason) -> str
+  (match r ((CertExpired) "expired") ((CertNotYetValid) "not-yet-valid") ((CertUntrustedRoot) "untrusted-root") ((CertHostnameMismatch) "hostname-mismatch")
+    ((CertBadSignature) "bad-signature") ((CertPathLength) "path-length") ((CertNameConstraint) "name-constraint") ((CertKeyUsage) "key-usage")
+    ((CertWeakAlgorithm) "weak-algorithm") ((CertUnknownCritical) "unknown-critical-extension") ((CertParse) "parse") ((CertBadChain) "bad-chain")))
+
+;; HandshakeFailure: the peer or the negotiation failed (no common suite, a Finished that does not verify, a bad CertificateVerify).
+;; BadCertificate: the chain was refused, with the reason. UnsupportedCapability: the provider lacks a primitive this connection needs (`what` names it).
+;; TlsProtocol: an unexpected or malformed message, an illegal parameter. TlsAlert: a fatal alert the peer sent. Truncated: the transport ended
+;; without close_notify (an attacker can do that; a clean end is `Ok` of the empty array). TlsTimeout: a deadline passed. TlsClosed: used after close.
+;; TransportFailed: the byte stream under TLS failed.
+(defenum TlsError
+  (HandshakeFailure alert: i64 message: str) (BadCertificate reason: CertReason message: str) (UnsupportedCapability what: str)
+  (TlsProtocol alert: i64 message: str) (TlsAlert description: i64 name: str) (Truncated) (TlsTimeout message: str) (TlsClosed)
+  (TransportFailed message: str))
+(derive Eq TlsError)
+(derive Debug TlsError)
+
+(defun alert-name (d: i64) -> str
+  (cond (= d 0) "close_notify" (= d 10) "unexpected_message" (= d 20) "bad_record_mac" (= d 22) "record_overflow" (= d 40) "handshake_failure"
+        (= d 42) "bad_certificate" (= d 43) "unsupported_certificate" (= d 44) "certificate_revoked" (= d 45) "certificate_expired"
+        (= d 46) "certificate_unknown" (= d 47) "illegal_parameter" (= d 48) "unknown_ca" (= d 49) "access_denied" (= d 50) "decode_error"
+        (= d 51) "decrypt_error" (= d 70) "protocol_version" (= d 71) "insufficient_security" (= d 80) "internal_error"
+        (= d 86) "inappropriate_fallback" (= d 90) "user_canceled" (= d 109) "missing_extension" (= d 110) "unsupported_extension"
+        (= d 112) "unrecognized_name" (= d 113) "bad_certificate_status_response" (= d 115) "unknown_psk_identity"
+        (= d 116) "certificate_required" (= d 120) "no_application_protocol" :else (str "alert " d)))
+
+(defun tls-error-text (e: TlsError) -> str
+  (match e ((HandshakeFailure _ m) (str "handshake failure: " m))
+    ((BadCertificate r m) (str "bad certificate (" (reason-name r) "): " m))
+    ((UnsupportedCapability w) (str "the crypto provider lacks " w))
+    ((TlsProtocol _ m) (str "protocol error: " m)) ((TlsAlert _ n) (str "peer alert: " n))
+    ((Truncated) "connection ended without close_notify (truncation)") ((TlsTimeout m) (str "timeout: " m))
+    ((TlsClosed) "connection closed") ((TransportFailed m) (str "transport: " m))))
+
+(defun bad-cert (r: CertReason message: str) -> TlsError (BadCertificate r message))
+(defun parse-err (message: str) -> TlsError (BadCertificate CertParse message))
+;; A malformed message (alert 50, decode_error); `proto-alert` names another alert: 10 unexpected_message, 20 bad_record_mac, 22 record_overflow, 47 illegal_parameter.
+(defun proto-err (message: str) -> TlsError (TlsProtocol 50 message))
+(defun proto-alert (alert: i64 message: str) -> TlsError (TlsProtocol alert message))
+(defun hs-fail (alert: i64 message: str) -> TlsError (HandshakeFailure alert message))
+
+;; The alert a connection sends before it closes on `e` (RFC 8446 6): a certificate problem says which, a protocol problem says what it was.
+(defun alert-for (e: TlsError) -> i64
+  (match e ((HandshakeFailure a _) a) ((TlsProtocol a _) a) ((UnsupportedCapability _) 40)
+    ((BadCertificate r _) (match r ((CertExpired) 45) ((CertUntrustedRoot) 48) ((CertWeakAlgorithm) 71) ((CertNotYetValid) 45) (_ 42)))
+    (_ 80)))

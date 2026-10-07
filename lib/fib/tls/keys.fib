@@ -1,0 +1,64 @@
+;; fib.tls.keys: the TLS 1.3 key schedule (RFC 8446 7). The primitives are the provider's (HMAC for HKDF-Extract, HKDF-Expand through `KdfHkdfExpand`,
+;; the digest); what is ours is the PROTOCOL: the HkdfLabel encoding, the label strings, which secret feeds which, and what the traffic keys and the Finished
+;; key are made of. Checked against every secret of RFC 8448 (specs/tls-keys-spec.fib and the handshake trace spec).
+(ns fib.tls.keys (:use fib.core fib.seq fib.coll fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.msg) (:require [fib.crypto :as c]))
+
+;; A cipher suite of RFC 8446 B.4: the AEAD, the hash of the key schedule and the transcript, the AEAD key length, the hash length.
+(defstruct Suite (id: i64 aead: keyword hash: keyword key-len: i64 hash-len: i64))
+(defun suite-of (id: i64) -> (Option Suite)
+  (cond (= id suite-aes-128-gcm-sha256) (some (Suite id :aes-128-gcm :sha-256 16 32))
+        (= id suite-aes-256-gcm-sha384) (some (Suite id :aes-256-gcm :sha-384 32 48))
+        (= id suite-chacha20-poly1305-sha256) (some (Suite id :chacha20-poly1305 :sha-256 32 32))
+        :else nil))
+
+;; A provider failure as the connection reports it: a missing algorithm names itself; anything else is a failed handshake.
+(defun from-crypto (e: CryptoError) -> TlsError
+  (if (unsupported? e) (UnsupportedCapability (. e message)) (HandshakeFailure 80 (str "crypto: " (. e kind) ": " (. e message)))))
+(defun lift (r: (Result x CryptoError)) -> (Result x TlsError) (match r ((Ok v) (Ok v)) ((Err e) (Err (from-crypto e)))))
+
+;; HkdfLabel (RFC 8446 7.1): uint16 length, opaque label<7..255> = "tls13 " + Label, opaque context<0..255>.
+(defun hkdf-label (label: str context: (Array i8) length: i64) -> (Array i8)
+  (cat [(w16 length) (vec8 (ascii (str "tls13 " label))) (vec8 context)]))
+(defun expand-label (p: p hash: keyword secret: (Array i8) label: str context: (Array i8) length: i64) :where ((CryptoProvider p)) -> (Result (Array i8) TlsError)
+  (lift (c/hkdf-expand p hash secret (hkdf-label label context length) length)))
+;; Derive-Secret(Secret, Label, Messages) = HKDF-Expand-Label(Secret, Label, Transcript-Hash(Messages), Hash.length); `transcript-hash` is already the hash.
+(defun derive-secret (p: p s: Suite secret: (Array i8) label: str transcript-hash: (Array i8)) :where ((CryptoProvider p)) -> (Result (Array i8) TlsError)
+  (expand-label p (. s hash) secret label transcript-hash (. s hash-len)))
+(defun transcript-hash (p: p s: Suite transcript: (Array i8)) :where ((CryptoProvider p)) -> (Result (Array i8) TlsError)
+  (lift (c/digest p (. s hash) transcript)))
+(defun zeros (n: i64) -> (Array i8) (repeat-bytes 0 n))
+
+;; ---- the three secrets, each extracted from the one before and the new input
+(defun early-secret (p: p s: Suite) :where ((CryptoProvider p)) -> (Result (Array i8) TlsError)
+  (lift (c/hkdf-extract p (. s hash) (zeros (. s hash-len)) (zeros (. s hash-len)))))
+(defun extract-next (p: p s: Suite prev: (Array i8) input: (Array i8)) :where ((CryptoProvider p)) -> (Result (Array i8) TlsError)
+  (try-let [empty-hash (transcript-hash p s (empty-bytes)) salt (derive-secret p s prev "derived" empty-hash)]
+    (lift (c/hkdf-extract p (. s hash) salt input))))
+(defun handshake-secret (p: p s: Suite early: (Array i8) shared: (Array i8)) :where ((CryptoProvider p)) -> (Result (Array i8) TlsError)
+  (extract-next p s early shared))
+(defun master-secret (p: p s: Suite handshake: (Array i8)) :where ((CryptoProvider p)) -> (Result (Array i8) TlsError)
+  (extract-next p s handshake (zeros (. s hash-len))))
+
+;; ---- traffic keys (RFC 8446 7.3): key = Expand-Label(secret, "key", "", key_length), iv = Expand-Label(secret, "iv", "", 12)
+(defstruct Traffic (secret: (Array i8) key: (Array i8) iv: (Array i8)))
+(defun traffic-of (p: p s: Suite secret: (Array i8)) :where ((CryptoProvider p)) -> (Result Traffic TlsError)
+  (try-let [k (expand-label p (. s hash) secret "key" (empty-bytes) (. s key-len)) iv (expand-label p (. s hash) secret "iv" (empty-bytes) 12)]
+    (Ok (Traffic secret k iv))))
+;; KeyUpdate (RFC 8446 7.2): application_traffic_secret_N+1 = Expand-Label(secret_N, "traffic upd", "", Hash.length)
+(defun next-traffic (p: p s: Suite t: Traffic) :where ((CryptoProvider p)) -> (Result Traffic TlsError)
+  (try-let [n (expand-label p (. s hash) (. t secret) "traffic upd" (empty-bytes) (. s hash-len))] (traffic-of p s n)))
+
+;; ---- Finished (RFC 8446 4.4.4): HMAC(finished_key, Transcript-Hash(..)), finished_key = Expand-Label(base_key, "finished", "", Hash.length)
+(defun finished-verify-data (p: p s: Suite base: (Array i8) transcript-hash: (Array i8)) :where ((CryptoProvider p)) -> (Result (Array i8) TlsError)
+  (try-let [fk (expand-label p (. s hash) base "finished" (empty-bytes) (. s hash-len))] (lift (c/hmac p (. s hash) fk transcript-hash))))
+
+;; ---- CertificateVerify content (RFC 8446 4.4.3): 64 spaces, the context string, a zero byte, the transcript hash
+(defun certificate-verify-content (server: bool transcript-hash: (Array i8)) -> (Array i8)
+  (cat [(repeat-bytes 32 64) (ascii (if server "TLS 1.3, server CertificateVerify" "TLS 1.3, client CertificateVerify")) (w8 0) transcript-hash]))
+
+;; ---- the record nonce (RFC 8446 5.3): the 64-bit sequence number, left-padded with zeros to the IV length, XOR the IV
+(defun record-nonce (iv: (Array i8) seq: i64) -> (Array i8)
+  (let [out (cell (array 12 0i8))]
+    (do (dotimes (i 12)
+          (array-set! &out i (trunc i8 (bit-xor (b-at iv i) (if (< i 4) 0 (bit-and (shr seq (* 8 (- 11 i))) 255))))))
+        @out)))

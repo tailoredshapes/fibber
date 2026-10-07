@@ -1,0 +1,151 @@
+;; An in-memory TLS 1.3 SERVER for the specs (never in lib/: fib.tls is a client): it answers a ClientHello with a flight built from the library's own key schedule and record layer
+;; and a real crypto provider, and it can be told to BREAK the flight in exactly one way (a CertificateVerify signature byte, the Finished, the signed context string, the
+;; transcript the signatures cover, the ServerHello's random or version or suite or session id) or to send post-handshake events (application data, KeyUpdate, close_notify, an
+;; alert, a plaintext record, an oversized or replayed or reordered or corrupted record, nothing at all). The client's Io is driven synchronously: when the client reads and
+;; nothing is waiting, the server takes the step its state calls for. Deterministic given the provider's random.
+(ns tls-server (:use fib.core fib.seq fib.coll fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.msg fib.tls.msg-parse fib.tls.keys fib.tls.record fib.tls.hello)
+  (:require [fib.crypto :as c]))
+
+(defenum Ev (EvData bytes: (Array i8)) (EvKeyUpdate request: bool) (EvClose) (EvAlert desc: i64) (EvRaw bytes: (Array i8)) (EvOversize) (EvReplay bytes: (Array i8)) (EvSwap)
+  (EvFlip bytes: (Array i8)) (EvTicket) (EvHandshakeJunk))
+;; tamper: :none :cv-sig :finished :cv-context :transcript :fragment (one record per byte) :coalesce (the flight in one record) :cert-request
+;; sh: :none :sentinel :tls12 :bad-suite :bad-sid
+(defstruct Script (suite: i64 tamper: keyword sh: keyword chain: (Vec (Array i8)) key: (Array i8) alpn: (Option str) events: (Vec Ev)))
+(defstruct Wire (sink: (Cell (Array i8)) out: (Cell (Array i8))))
+(defstruct Pend (suite: Suite c-hs: Traffic c-ap: Traffic s-ap: Traffic tr: (Array i8) cert-request: bool))
+(defstruct Srv (rec: Rec wire: Wire phase: (Cell i64) received: (Cell (Array i8)) failure: (Cell str) script: Script pend: (Cell (Option Pend)) wtr: (Cell (Option Traffic))
+                rtr: (Cell (Option Traffic)) closed: (Cell bool)))
+
+(defun script (suite: i64 chain: (Vec (Array i8)) key: (Array i8) events: (Vec Ev)) -> Script (Script suite :none :none chain key nil events))
+(defun take-out (w: Wire n: i64) -> (Array i8) (let [b @(. w out) k (min n (array-len b))] (do (set! (. w out) (drop-bytes b k)) (slice b 0 k))))
+(defun take-sink (w: Wire n: i64) -> (Array i8) (let [b @(. w sink) k (min n (array-len b))] (do (set! (. w sink) (drop-bytes b k)) (slice b 0 k))))
+(defun flip-at (b: (Array i8) i: i64) -> (Array i8) (let [c (cell b)] (do (array-set! &c i (trunc i8 (bit-xor (b-at b i) 1))) @c)))
+;; The signed content of RFC 8446 4.4.3, written out here again (not the library's function) so that a fault in the library's context string is not mirrored by this server.
+(defun cv-content (server: bool th: (Array i8)) -> (Array i8)
+  (cat [(repeat-bytes 32 64) (ascii (if server "TLS 1.3, server CertificateVerify" "TLS 1.3, client CertificateVerify")) (w8 0) th]))
+(defun flip-last (b: (Array i8)) -> (Array i8) (flip-at b (- (array-len b) 1)))
+(defun orx (r: (Result x CryptoError)) -> (Result x TlsError) (lift r))
+
+(defun ch-share :private (body: (Array i8)) -> (Result (Pair (Array i8) (Array i8)) TlsError)
+  (try-let [sid (get-vec8 body 34) suites (get-vec16 body (. sid snd)) comp (get-vec8 body (. suites snd)) eb (get-vec16 body (. comp snd)) exts (parse-exts (. eb fst))]
+    (match (find-ext exts et-key-share)
+      (nil (Err (proto-err "no key_share")))
+      ((some d) (try-let [l (get-vec16 d 0) g (get-u16 (. l fst) 0) k (get-vec16 (. l fst) (. g snd))] (Ok (Pair (. sid fst) (. k fst))))))))
+
+(defun server-hello :private (sc: Script random: (Array i8) sid: (Array i8) pub: (Array i8)) -> (Array i8)
+  (let [r (if (= (. sc sh) :sentinel) (cat [(slice random 0 24) (hexb "444f574e47524401")]) random)
+        share (ext et-key-share (cat [(w16 29) (vec16 pub)]))
+        exts (if (= (. sc sh) :tls12) [share] [(ext et-supported-versions (w16 (if (= (. sc sh) :tls12) 771 772))) share])]
+    (hs-wrap ht-server-hello (cat [(w16 771) r (vec8 (if (= (. sc sh) :bad-sid) (repeat-bytes 66 32) sid)) (w16 (if (= (. sc sh) :bad-suite) 4868 (. sc suite))) (w8 0) (vec16 (cat exts))]))))
+
+(defun send-msgs :private (p: p r: Rec tamper: keyword msgs: (Vec (Array i8))) :where ((CryptoProvider p)) -> (Result unit TlsError)
+  (cond (= tamper :coalesce) (send p r ct-handshake (cat msgs))
+        (= tamper :fragment) (let [all (cat msgs)] (loop [i 0] (if (= i (array-len all)) (Ok ()) (match (send p r ct-handshake (slice all i (+ i 1))) ((Err e) (Err e)) ((Ok _) (recur (+ i 1)))))))
+        :else (loop [i 0] (if (= i (count msgs)) (Ok ()) (match (send p r ct-handshake (nth msgs i)) ((Err e) (Err e)) ((Ok _) (recur (+ i 1))))))))
+
+(defun cert-message :private (ders: (Vec (Array i8))) -> (Array i8)
+  (hs-wrap ht-certificate (cat [(vec8 (empty-bytes)) (vec24 (cat (vec (map (fn (d: (Array i8)) (cat [(vec24 d) (vec16 (empty-bytes))])) ders))))])))
+(defun ee-message :private (alpn: (Option str)) -> (Array i8)
+  (hs-wrap ht-encrypted-extensions (vec16 (match alpn (nil (empty-bytes)) ((some a) (ext-alpn [a]))))))
+
+;; ---- step 0: ClientHello in; ServerHello and the encrypted flight out
+(defun flight-msgs :private (p: p sc: Script suite: Suite s-hs: Traffic tr: (Array i8)) :where ((CryptoProvider p)) -> (Result (Pair (Vec (Array i8)) (Array i8)) TlsError)
+  (let [ee (ee-message (. sc alpn)) cr (hs-wrap ht-certificate-request (cat [(vec8 (w8 1)) (vec16 (ext et-signature-algorithms (vec16 (w16 1027))))]))
+        cr? (= (. sc tamper) :cert-request) cert (cert-message (. sc chain))
+        t1 (cat [tr ee (if cr? cr (empty-bytes)) cert])]
+    (try-let [key (orx (c/import-private-key p :p-256 (. sc key))) th-cert (transcript-hash p suite (if (= (. sc tamper) :transcript) (cat [tr (if cr? cr (empty-bytes)) cert]) t1))
+              sig (orx (private-key-sign key :ecdsa-p256-sha256 (cv-content (not (= (. sc tamper) :cv-context)) th-cert)))]
+      (let [cv (hs-wrap ht-certificate-verify (cat [(w16 1027) (vec16 sig)])) t2 (cat [t1 cv])]
+        (try-let [th-cv (transcript-hash p suite t2) fin-data (finished-verify-data p suite (. s-hs secret) th-cv)]
+          (let [fin (hs-wrap ht-finished fin-data)
+                sent [ee (if cr? cr (empty-bytes)) cert (if (= (. sc tamper) :cv-sig) (flip-last cv) cv) (if (= (. sc tamper) :finished) (flip-last fin) fin)]]
+            (Ok (Pair (vec (filter (fn (m: (Array i8)) (> (array-len m) 0)) sent)) (cat [t2 fin])))))))))
+(defun step0 (p: p srv: Srv) :where ((CryptoProvider p)) -> (Result unit TlsError)
+  (let [sc (. srv script) r (. srv rec)]
+    (try-let [ch (next-message p r) cs (ch-share (. ch body)) suite (match (suite-of (. sc suite)) ((some s) (Ok s)) (nil (Err (proto-err "suite"))))
+              key (orx (c/generate-key p :x25519)) pub (orx (private-key-public key)) shared (orx (private-key-agree key (. cs snd))) random (orx (c/random-bytes p 32))
+              sh (Ok (server-hello sc random (. cs fst) pub)) _ (send p r ct-handshake sh)
+              early (early-secret p suite) hsec (handshake-secret p suite early shared) th (transcript-hash p suite (cat [(. ch raw) sh]))
+              cs-secret (derive-secret p suite hsec "c hs traffic" th) ss-secret (derive-secret p suite hsec "s hs traffic" th)
+              c-hs (traffic-of p suite cs-secret) s-hs (traffic-of p suite ss-secret)
+              _ (Ok (do (set-write-keys r (. suite aead) s-hs) (set-read-keys r (. suite aead) c-hs)))
+              fl (flight-msgs p sc suite s-hs (cat [(. ch raw) sh])) _ (send-msgs p r (. sc tamper) (. fl fst))
+              th-sf (transcript-hash p suite (. fl snd)) master (master-secret p suite hsec)
+              c-ap-s (derive-secret p suite master "c ap traffic" th-sf) s-ap-s (derive-secret p suite master "s ap traffic" th-sf)
+              c-ap (traffic-of p suite c-ap-s) s-ap (traffic-of p suite s-ap-s)]
+      (do (set-write-keys r (. suite aead) s-ap) (set! (. srv wtr) (some s-ap)) (set! (. srv pend) (some (Pend suite c-hs c-ap s-ap (. fl snd) (= (. sc tamper) :cert-request))))
+          (set! (. srv phase) 1) (Ok ())))))
+
+;; ---- step 1: the client's Finished in (checked), then the scripted events out
+(defun check-client-finish :private (p: p srv: Srv pd: Pend) :where ((CryptoProvider p)) -> (Result unit TlsError)
+  (let [r (. srv rec) s (. pd suite)]
+    (try-let [tr (if (. pd cert-request) (try-let [m (read-expect p r ht-certificate)] (Ok (cat [(. pd tr) (. m raw)]))) (Ok (. pd tr)))
+              m (read-expect p r ht-finished) th (transcript-hash p s tr) expect (finished-verify-data p s (. (. pd c-hs) secret) th)]
+      (if (bytes-eq? expect (. m body)) (Ok ()) (Err (proto-err "the client's Finished does not verify"))))))
+(defun read-expect :private (p: p r: Rec typ: i64) :where ((CryptoProvider p)) -> (Result HsMsg TlsError)
+  (try-let [m (next-message p r)] (if (= (. m type) typ) (Ok m) (Err (proto-err (str "server expected message " typ " got " (. m type)))))))
+
+(defun sealed-record :private (p: p srv: Srv ct: i64 data: (Array i8)) :where ((CryptoProvider p)) -> (Array i8)
+  (do (send p (. srv rec) ct data) (take-out (. srv wire) 100000000)))
+(defun push-out (srv: Srv b: (Array i8)) -> unit (set! (. (. srv wire) out) (cat [@(. (. srv wire) out) b])))
+(defun update-wtr (p: p srv: Srv) :where ((CryptoProvider p)) -> (Result unit TlsError)
+  (match @(. srv pend)
+    (nil (Ok ()))
+    ((some pd) (match @(. srv wtr) (nil (Ok ())) ((some t) (try-let [n (next-traffic p (. pd suite) t)] (Ok (do (set! (. srv wtr) (some n)) (set-write-keys (. srv rec) (. (. pd suite) aead) n)))))))))
+(defun oversize :private (p: p srv: Srv) :where ((CryptoProvider p)) -> (Result unit TlsError)
+  (match @(. (. srv rec) wr)
+    (nil (Err (proto-err "no keys")))
+    ((some pr) (let [inner (cat [(repeat-bytes 1 16385) (w8 23)]) header (cat [(w8 23) (w16 771) (w16 (+ (array-len inner) 16))])]
+                 (match (c/aead-seal p (. pr alg) (. pr key) (record-nonce (. pr iv) (. pr seq)) header inner)
+                   ((Err e) (Err (from-crypto e)))
+                   ((Ok sealed) (do (set! (. (. srv rec) wr) (some (with pr (seq (+ (. pr seq) 1))))) (push-out srv (cat [header sealed])) (Ok ()))))))))
+(defun play-one :private (p: p srv: Srv e: Ev) :where ((CryptoProvider p)) -> (Result unit TlsError)
+  (let [r (. srv rec)]
+    (match e
+      ((EvData b) (send p r ct-application-data b))
+      ((EvKeyUpdate req) (try-let [_ (send p r ct-handshake (key-update-message req))] (update-wtr p srv)))
+      ((EvClose) (send p r ct-alert (alert-body false 0)))
+      ((EvAlert d) (send p r ct-alert (alert-body true d)))
+      ((EvRaw b) (Ok (push-out srv b)))
+      ((EvOversize) (oversize p srv))
+      ((EvReplay b) (let [rec (sealed-record p srv ct-application-data b)] (Ok (do (push-out srv rec) (push-out srv rec)))))
+      ((EvSwap) (let [a (sealed-record p srv ct-application-data (ascii "first")) b (sealed-record p srv ct-application-data (ascii "second"))] (Ok (do (push-out srv b) (push-out srv a)))))
+      ((EvFlip b) (let [rec (sealed-record p srv ct-application-data b)] (Ok (push-out srv (flip-at rec (- (array-len rec) 3))))))
+      ((EvTicket) (send p r ct-handshake (hs-wrap ht-new-session-ticket (cat [(w32 3600) (w32 7) (vec8 (w8 1)) (vec16 (repeat-bytes 5 20)) (vec16 (empty-bytes))]))))
+      ((EvHandshakeJunk) (send p r ct-handshake (hs-wrap ht-certificate (empty-bytes)))))))
+(defun play :private (p: p srv: Srv i: i64) :where ((CryptoProvider p)) -> (Result unit TlsError)
+  (if (>= i (count (. (. srv script) events))) (Ok ())
+    (match (play-one p srv (nth (. (. srv script) events) i)) ((Err e) (Err e)) ((Ok _) (play p srv (+ i 1))))))
+(defun step1 (p: p srv: Srv) :where ((CryptoProvider p)) -> (Result unit TlsError)
+  (match @(. srv pend)
+    (nil (Err (proto-err "no flight sent")))
+    ((some pd) (try-let [_ (check-client-finish p srv pd)]
+                 (do (set-read-keys (. srv rec) (. (. pd suite) aead) (. pd c-ap)) (set! (. srv rtr) (some (. pd c-ap))) (set! (. srv phase) 2) (play p srv 0))))))
+
+(defun advance (p: p srv: Srv) :where ((CryptoProvider p)) -> unit
+  (let [r (cond (= @(. srv phase) 0) (step0 p srv) (= @(. srv phase) 1) (step1 p srv) :else (Ok ()))]
+    (match r ((Err e) (do (set! (. srv failure) (tls-error-text e)) (set! (. srv phase) 3))) ((Ok _) ()))))
+
+;; ---- what the client wrote after the handshake: its application data (KeyUpdates are followed)
+(defun receive (p: p srv: Srv) :where ((CryptoProvider p)) -> (Array i8)
+  (do (loop []
+        (if false ()
+          (match (read-record p (. srv rec))
+            ((Err _) ())
+            ((Ok x) (do (cond (= (. x type) ct-application-data) (set! (. srv received) (cat [@(. srv received) (. x data)]))
+                              (and (= (. x type) ct-handshake) (= (b-at (. x data) 0) ht-key-update))
+                                (match @(. srv pend) (nil ()) ((some pd) (match @(. srv rtr) (nil ())
+                                  ((some t) (match (next-traffic p (. pd suite) t) ((Err _) ()) ((Ok n) (do (set! (. srv rtr) (some n)) (set-read-keys (. srv rec) (. (. pd suite) aead) n))))))))
+                              :else ())
+                        (recur))))))
+      @(. srv received)))
+
+(defun client-io (p: p srv: Srv) :where ((CryptoProvider p)) -> Io
+  (Io (fn (n: i64) (do (if (= (array-len @(. (. srv wire) out)) 0) (advance p srv) ()) (Ok (take-out (. srv wire) n))))
+      (fn (b: (Array i8)) (do (set! (. (. srv wire) sink) (cat [@(. (. srv wire) sink) b])) (Ok ())))
+      (fn () (set! (. srv closed) true)) (fn (at: i64) ())))
+
+(defun new-srv (sc: Script) -> Srv
+  (let [w (Wire (cell (empty-bytes)) (cell (empty-bytes)))
+        io (Io (fn (n: i64) (Ok (take-sink w n))) (fn (b: (Array i8)) (do (set! (. w out) (cat [@(. w out) b])) (Ok ()))) (fn () ()) (fn (at: i64) ()))]
+    (Srv (new-rec io) w (cell 0) (cell (empty-bytes)) (cell "") sc (cell nil) (cell nil) (cell nil) (cell false))))

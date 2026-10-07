@@ -45,10 +45,10 @@ The client takes a **Factory per scheme** in `Options.factories` (a `(Map str Fa
 `https` has none by default: the request fails with `(TlsUnsupported "unsupported scheme https: a TLS Transport factory (driver fib.tls) must be
 registered ...")` before any connection is attempted (case 8035 asserts zero connections opened). It is never sent in the clear and never downgraded.
 
-**TLS-1 must:** provide a `Factory` whose `open` makes the TCP connection (`fib.http.tcp/connect host port connect-timeout-ms`, or the Transport it
+**TLS-1 (built: `fib.tls`, docs/design/tls.md) provides, as this section asked:** a a `Factory` whose `open` makes the TCP connection (`fib.http.tcp/connect host port connect-timeout-ms`, or the Transport it
 returns wrapped), runs the handshake over it with `fib.crypto`, and returns a `Transport` whose `read` and `write` carry application data and whose
 `set-deadline` also bounds the handshake and record reads; `Target.host` is the name to verify, `Target.ca-file` the explicit trust anchor option the old
-client had. Then `(with-factory options "https" (tls/factory ...))` is the whole integration; a server side needs `fib.http.server.connection/serve-connection`
+client had. Then `(tls/https-options options provider trust)` (which is `(with-factory options "https" (tls/factory provider trust))`) is the whole integration: `fib.http` does not require `fib.tls` or any crypto driver, the caller passes the provider and the trust as values; a server side needs `fib.http.server.connection/serve-connection`
 over a Transport from an accepted socket, which is already how the server works. Nothing in the engine knows the scheme beyond the pool key.
 
 ## Message layer (RFC 9112)

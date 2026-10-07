@@ -1,0 +1,129 @@
+;; fib.tls.asn1: a strict DER reader (ITU-T X.690 section 10; RFC 5280 requires DER). Definite lengths only, the minimal length encoding, no
+;; high-tag-number form, every length checked against the bytes that are there, a depth limit on nesting. No input makes it trap: a refusal is
+;; an `(Err (BadCertificate CertParse ..))`. A `Tlv` is a window on the source array (the tag, where the header starts, where the contents start and
+;; end); nothing is copied until `tlv-content` or `tlv-raw` asks.
+(ns fib.tls.asn1 (:use fib.core fib.seq fib.coll fib.tls.types fib.tls.bytes))
+
+(defstruct Tlv (src: (Array i8) tag: i64 start: i64 off: i64 end: i64))
+(def max-depth: i64 24)
+(def tag-bool: i64 1) (def tag-int: i64 2) (def tag-bits: i64 3) (def tag-octets: i64 4) (def tag-null: i64 5) (def tag-oid: i64 6)
+(def tag-utf8: i64 12) (def tag-printable: i64 19) (def tag-ia5: i64 22) (def tag-utctime: i64 23) (def tag-gentime: i64 24)
+(def tag-seq: i64 48) (def tag-set: i64 49)
+
+(defun long-length :private (b: (Array i8) pos: i64 n: i64) -> i64
+  (loop [k 0 acc 0] (if (= k n) acc (recur (+ k 1) (+ (shl acc 8) (b-at b (+ pos k)))))))
+
+;; The one TLV that starts at `pos` and ends by `limit`.
+(defun der-parse (b: (Array i8) pos: i64 limit: i64) -> (Result Tlv TlsError)
+  (if (or (< pos 0) (> (+ pos 2) limit) (> limit (array-len b))) (Err (parse-err "DER: truncated header"))
+    (let [tag (b-at b pos) l0 (b-at b (+ pos 1))]
+      (cond (= (bit-and tag 31) 31) (Err (parse-err "DER: high tag numbers are not used here"))
+            (< l0 128) (if (> (+ pos 2 l0) limit) (Err (parse-err "DER: the length passes the end"))
+                         (Ok (Tlv b tag pos (+ pos 2) (+ pos 2 l0))))
+            (= l0 128) (Err (parse-err "DER: indefinite length (BER) is not DER"))
+            (> (- l0 128) 4) (Err (parse-err "DER: a length of more than four bytes"))
+            (> (+ pos 2 (- l0 128)) limit) (Err (parse-err "DER: truncated length"))
+            (= (b-at b (+ pos 2)) 0) (Err (parse-err "DER: a length with a leading zero byte is not minimal"))
+            :else (let [n (- l0 128) len (long-length b (+ pos 2) n) off (+ pos 2 n)]
+                    (cond (< len 128) (Err (parse-err "DER: a long length for a short value is not minimal"))
+                          (> len (- limit off)) (Err (parse-err "DER: the length passes the end"))
+                          :else (Ok (Tlv b tag pos off (+ off len)))))))))
+
+;; The whole array is exactly one TLV.
+(defun der-root (b: (Array i8)) -> (Result Tlv TlsError)
+  (match (der-parse b 0 (array-len b))
+    ((Err e) (Err e))
+    ((Ok t) (if (= (. t end) (array-len b)) (Ok t) (Err (parse-err "DER: bytes after the value"))))))
+
+(defun constructed? (t: Tlv) -> bool (not (= (bit-and (. t tag) 32) 0)))
+(defun tlv-len (t: Tlv) -> i64 (- (. t end) (. t off)))
+(defun tlv-content (t: Tlv) -> (Array i8) (slice (. t src) (. t off) (. t end)))
+(defun tlv-raw (t: Tlv) -> (Array i8) (slice (. t src) (. t start) (. t end)))
+(defun tlv-tag? (t: Tlv tag: i64) -> bool (= (. t tag) tag))
+
+;; The elements inside a constructed value; they must fill it exactly.
+(defun der-kids (t: Tlv) -> (Result (Vec Tlv) TlsError)
+  (if (not (constructed? t)) (Err (parse-err "DER: a primitive value where a constructed one is expected"))
+    (loop [pos (. t off) acc []]
+      (if (= pos (. t end)) (Ok acc)
+        (match (der-parse (. t src) pos (. t end))
+          ((Err e) (Err e))
+          ((Ok k) (recur (. k end) (conj acc k))))))))
+
+(defun expect-tag (t: Tlv tag: i64 what: str) -> (Result Tlv TlsError)
+  (if (= (. t tag) tag) (Ok t) (Err (parse-err (str "DER: " what ": expected tag " tag ", found " (. t tag))))))
+
+;; The elements of a SEQUENCE (tag 0x30) or SET (0x31).
+(defun der-seq-kids (t: Tlv what: str) -> (Result (Vec Tlv) TlsError)
+  (match (expect-tag t tag-seq what) ((Err e) (Err e)) ((Ok _) (der-kids t))))
+
+;; Every constructed value inside `t`, to the depth limit, is well formed; used once on a whole certificate so that nothing below is a surprise.
+(defun der-walk (t: Tlv depth: i64) -> (Result unit TlsError)
+  (cond (> depth max-depth) (Err (parse-err "DER: nesting is too deep"))
+        (not (constructed? t)) (Ok ())
+        :else (match (der-kids t)
+                ((Err e) (Err e))
+                ((Ok ks) (loop [i 0] (if (= i (count ks)) (Ok ())
+                           (match (der-walk (nth ks i) (+ depth 1)) ((Err e) (Err e)) ((Ok _) (recur (+ i 1))))))))))
+
+;; ---- typed contents
+(defun der-bool (t: Tlv) -> (Result bool TlsError)
+  (cond (not (= (. t tag) tag-bool)) (Err (parse-err "DER: expected BOOLEAN"))
+        (not (= (tlv-len t) 1)) (Err (parse-err "DER: BOOLEAN is one byte"))
+        (= (b-at (. t src) (. t off)) 0) (Ok false)
+        (= (b-at (. t src) (. t off)) 255) (Ok true)
+        :else (Err (parse-err "DER: BOOLEAN true is 0xFF"))))
+
+;; The two's-complement content bytes of an INTEGER, minimal.
+(defun der-int-bytes (t: Tlv) -> (Result (Array i8) TlsError)
+  (let [b (. t src) o (. t off) n (tlv-len t)]
+    (cond (not (= (. t tag) tag-int)) (Err (parse-err "DER: expected INTEGER"))
+          (= n 0) (Err (parse-err "DER: an empty INTEGER"))
+          (and (> n 1) (or (and (= (b-at b o) 0) (< (b-at b (+ o 1)) 128)) (and (= (b-at b o) 255) (>= (b-at b (+ o 1)) 128))))
+            (Err (parse-err "DER: an INTEGER with redundant leading bytes"))
+          :else (Ok (tlv-content t)))))
+
+;; A small non-negative INTEGER (a version, a path length, a count).
+(defun der-small-int (t: Tlv) -> (Result i64 TlsError)
+  (match (der-int-bytes t)
+    ((Err e) (Err e))
+    ((Ok v) (cond (>= (b-at v 0) 128) (Err (parse-err "DER: a negative INTEGER where a count is expected"))
+                  (> (array-len v) 4) (Err (parse-err "DER: an INTEGER too large for a count"))
+                  :else (Ok (long-length v 0 (array-len v)))))))
+
+(defun der-octets (t: Tlv) -> (Result (Array i8) TlsError)
+  (if (= (. t tag) tag-octets) (Ok (tlv-content t)) (Err (parse-err "DER: expected OCTET STRING"))))
+
+;; A BIT STRING: the bytes and the count of unused bits of the last one; the unused bits must be zero (DER).
+(defun der-bits (t: Tlv) -> (Result (Pair (Array i8) i64) TlsError)
+  (let [n (tlv-len t) b (. t src) o (. t off)]
+    (cond (not (= (. t tag) tag-bits)) (Err (parse-err "DER: expected BIT STRING"))
+          (= n 0) (Err (parse-err "DER: an empty BIT STRING"))
+          (> (b-at b o) 7) (Err (parse-err "DER: a BIT STRING with more than 7 unused bits"))
+          (and (= n 1) (not (= (b-at b o) 0))) (Err (parse-err "DER: unused bits in an empty BIT STRING"))
+          (and (> n 1) (not (= (bit-and (b-at b (- (. t end) 1)) (- (shl 1 (b-at b o)) 1)) 0))) (Err (parse-err "DER: unused BIT STRING bits are not zero"))
+          :else (Ok (Pair (slice b (+ o 1) (. t end)) (b-at b o))))))
+
+(defun oid-arc :private (b: (Array i8) from: i64 to: i64) -> i64
+  (loop [i from acc 0] (if (= i to) acc (recur (+ i 1) (+ (shl acc 7) (bit-and (b-at b i) 127))))))
+;; The dotted text of an OBJECT IDENTIFIER ("2.5.29.19"). A sub-identifier of more than eight bytes or with a leading 0x80 is refused.
+(defun der-oid (t: Tlv) -> (Result str TlsError)
+  (let [b (. t src) n (tlv-len t) o (. t off)]
+    (cond (not (= (. t tag) tag-oid)) (Err (parse-err "DER: expected OBJECT IDENTIFIER"))
+          (= n 0) (Err (parse-err "DER: an empty OBJECT IDENTIFIER"))
+          (not (< (b-at b (- (. t end) 1)) 128)) (Err (parse-err "DER: an OBJECT IDENTIFIER ends inside a sub-identifier"))
+          :else
+          (loop [i o start o parts []]
+            (cond (= i (. t end))
+                    (let [v0 (oid-arc b o (+ o (first-arc-len b o (. t end))))
+                          tail parts
+                          head (cond (< v0 40) (str "0." v0) (< v0 80) (str "1." (- v0 40)) :else (str "2." (- v0 80)))]
+                      (Ok (reduce (fn (acc: str p: str) (str acc "." p)) head tail)))
+                  (and (= i start) (= (b-at b i) 128)) (Err (parse-err "DER: a sub-identifier with a leading 0x80"))
+                  (> (- i start) 7) (Err (parse-err "DER: a sub-identifier too large"))
+                  (< (b-at b i) 128)
+                    (if (= start o) (recur (+ i 1) (+ i 1) parts)
+                      (recur (+ i 1) (+ i 1) (conj parts (str (oid-arc b start (+ i 1))))))
+                  :else (recur (+ i 1) start parts))))))
+(defun first-arc-len :private (b: (Array i8) o: i64 end: i64) -> i64
+  (loop [i o] (cond (>= i end) (- end o) (< (b-at b i) 128) (+ (- i o) 1) :else (recur (+ i 1)))))

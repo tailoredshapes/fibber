@@ -1,0 +1,51 @@
+;; fib.tls.bytes: big-endian integers and byte-array building for the protocol code of fib.tls (TLS and DER are both byte formats). Bytes are
+;; `(Array i8)`; an i8 is signed, so every read goes through `b-at`, which gives 0..255. Nothing here is cryptography and nothing is secret-dependent.
+(ns fib.tls.bytes (:use fib.core fib.seq fib.coll) (:require [fib.crypto :as c]))
+
+(defun b-at (b: (Array i8) i: i64) -> i64 (bit-and (zext i64 (array-get b i)) 255))
+(defun be16 (b: (Array i8) i: i64) -> i64 (+ (shl (b-at b i) 8) (b-at b (+ i 1))))
+(defun be24 (b: (Array i8) i: i64) -> i64 (+ (shl (b-at b i) 16) (+ (shl (b-at b (+ i 1)) 8) (b-at b (+ i 2)))))
+(defun be32 (b: (Array i8) i: i64) -> i64 (+ (shl (be16 b i) 16) (be16 b (+ i 2))))
+
+(defun put-be :private (v: i64 n: i64) -> (Array i8)
+  (let [o (cell (array n 0i8))]
+    (do (dotimes (k n) (array-set! &o k (trunc i8 (bit-and (shr v (* 8 (- (- n 1) k))) 255)))) @o)))
+(defun w8 (v: i64) -> (Array i8) (put-be v 1))
+(defun w16 (v: i64) -> (Array i8) (put-be v 2))
+(defun w24 (v: i64) -> (Array i8) (put-be v 3))
+(defun w32 (v: i64) -> (Array i8) (put-be v 4))
+(defun w64 (v: i64) -> (Array i8) (put-be v 8))
+
+(defun cat (parts: (Vec (Array i8))) -> (Array i8)
+  (let [size (reduce (fn (n: i64 p: (Array i8)) (+ n (array-len p))) 0 parts)
+        out (cell (array size 0i8))]
+    (do (loop [i 0 off 0]
+          (if (= i (count parts)) ()
+            (let [p (nth parts i)]
+              (do (dotimes (j (array-len p)) (array-set! &out (+ off j) (array-get p j)))
+                  (recur (+ i 1) (+ off (array-len p)))))))
+        @out)))
+
+(defun slice (b: (Array i8) from: i64 to: i64) -> (Array i8) (array-copy b from to))
+(defun drop-bytes (b: (Array i8) n: i64) -> (Array i8) (array-copy b n (array-len b)))
+(defun empty-bytes () -> (Array i8) (array 0 0i8))
+(defun ascii (s: str) -> (Array i8) (str-bytes s))
+
+;; Length-prefixed vectors (RFC 8446 3.4): a 1, 2 or 3 byte length, then the bytes.
+(defun vec8 (b: (Array i8)) -> (Array i8) (cat [(w8 (array-len b)) b]))
+(defun vec16 (b: (Array i8)) -> (Array i8) (cat [(w16 (array-len b)) b]))
+(defun vec24 (b: (Array i8)) -> (Array i8) (cat [(w24 (array-len b)) b]))
+
+;; Equality of PUBLIC bytes (a name, a type, a label). Secrets are compared by the provider's `ct=`, never here.
+(defun bytes-eq? (a: (Array i8) b: (Array i8)) -> bool
+  (and (= (array-len a) (array-len b)) (loop [i 0] (cond (= i (array-len a)) true (= (array-get a i) (array-get b i)) (recur (+ i 1)) :else false))))
+
+;; Bytes from hex text: for constants and tests; a bad digit is a trap (a program error, not an input error).
+(defun hexb (h: str) -> (Array i8) (match (c/unhex h) ((Ok b) b) ((Err _) (trap "fib.tls.bytes/hexb: not hex"))))
+(defun hex-of (b: (Array i8)) -> str (c/hex b))
+
+;; `n` copies of the byte `v`.
+(defun repeat-bytes (v: i64 n: i64) -> (Array i8) (array n (trunc i8 v)))
+;; The first index at or after `from` holding byte `v`, or -1.
+(defun index-of-byte (b: (Array i8) v: i64 from: i64) -> i64
+  (loop [i from] (cond (>= i (array-len b)) -1 (= (b-at b i) v) i :else (recur (+ i 1)))))

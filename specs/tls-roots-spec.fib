@@ -1,0 +1,41 @@
+;; The trust stores of fib.tls as values: the embedded Mozilla roots (121 certificates as data: every one parses; their shape), PEM parsing (blocks among other text, other labels
+;; ignored, bad base64, a block without END, a certificate that does not parse refusing the store), and the facade `fib.tls` that exports them. `fibc test specs`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.tls.types fib.tls.bytes fib.tls.asn1 fib.tls.x509 fib.tls.x509-ext fib.tls.pem fib.tls.roots tls-fixtures)
+  (:require [fib.crypto :as c] [fib.tls :as tls]))
+
+(defun roots () -> (Vec Cert) (match (embedded-roots) ((Ok s) (. s anchors)) ((Err e) (trap (tls-error-text e)))))
+(defun pem-of (der: (Array i8)) -> str (str "-----BEGIN CERTIFICATE-----\n" (c/base64 der) "\n-----END CERTIFICATE-----\n"))
+(defun first-der () -> (Array i8) (hexb (server-root)))
+(defun count-text (r: (Result (Vec (Array i8)) TlsError)) -> str (match r ((Ok xs) (str (count xs))) ((Err _) "parse")))
+(defun trust-text (r: (Result TrustStore TlsError)) -> str (match r ((Ok s) (str (trust-count s))) ((Err e) (tls-error-text e))))
+(defstruct PC (name: str text: str want: str))
+(defun pem-cases () -> (Vec PC)
+  (let [one (pem-of (first-der)) bad "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"]
+    [(PC "empty text" "" "0") (PC "one block" one "1") (PC "two blocks with a comment between" (str one "\n# a comment between\n" one) "2")
+     (PC "text around a block" (str "title\n\n" one "trailing words\n") "1")
+     (PC "another label is ignored" (str one "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n") "1")
+     (PC "bad base64 in a block" bad "parse") (PC "a block without END" "-----BEGIN CERTIFICATE-----\nAAAA\n" "parse")
+     (PC "an unterminated BEGIN line" "-----BEGIN CERTIFICATE\nAAAA\n" "parse")]))
+(defun pem-diffs () -> str
+  (str (reduce (fn (a: str c: PC) (let [got (count-text (pem-blocks (ascii (. c text)) "CERTIFICATE"))] (if (= got (. c want)) a (str a (. c name) ": " got "; ")))) "" (pem-cases))
+       (if (= (trust-text (trust-from-pem (ascii (str (pem-of (first-der)) (pem-of (first-der)))))) "2") "" "a store from PEM; ")
+       (match (trust-from-pem (ascii "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")) ((Ok _) "a certificate that does not parse was accepted into a store; ") ((Err _) ""))))
+
+(defun shape-text () -> str
+  (let [rs (roots)]
+    (str (if (= (count rs) 121) "" (str "expected 121 roots, found " (count rs) "; "))
+         (if (= (count rs) (roots-count)) "" "roots-count; ")
+         (let [bad (filter (fn (r: Cert) (or (. (. r subject) empty) (not (name-self? r)))) rs)] (if (= (count bad) 0) "" (str (count bad) " roots that are not self-issued; ")))
+         (let [unk (filter (fn (r: Cert) (= (. r key-kind) :unknown)) rs)] (if (<= (count unk) 2) "" (str (count unk) " roots with a key of an unknown kind; ")))
+         (let [weak (filter (fn (r: Cert) (and (= (. r key-kind) :rsa) (< (. r rsa-bits) 2048))) rs)] (if (= (count weak) 0) "" (str (count weak) " RSA roots under 2048 bits; ")))
+         (let [badbc (filter (fn (r: Cert) (and (. (. r exts) has-bc) (not (. (. r exts) is-ca)))) rs)] (if (= (count badbc) 0) "" (str (count badbc) " roots that say they are not CAs; "))))))
+(defun name-self? (r: Cert) -> bool (bytes-eq? (. (. r issuer) raw) (. (. r subject) raw)))
+
+(defspecs specs
+  (feature "the embedded Mozilla roots"
+    (scenario "121 roots parse, are self-issued, and have usable keys" (then (expect = "" (shape-text))))
+    (scenario "the facade fib.tls exports the stores" (then (expect = 0 (tls/trust-count (tls/empty-trust))) (expect = 121 (match (tls/embedded-roots) ((Ok s) (tls/trust-count s)) ((Err _) -1))))))
+  (feature "PEM and trust stores"
+    (scenario "blocks among other text, other labels, bad bodies, a store from PEM" (then (expect = "" (pem-diffs))))))
+
+(defun main () -> i64 (run-main (specs)))

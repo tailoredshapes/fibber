@@ -1,0 +1,49 @@
+;; fib.tls.msg: the numbers of TLS 1.3 (RFC 8446 section 4 and appendix B: handshake types, extension types, cipher suites, groups, signature schemes) and the
+;; ENCODERS of the handshake messages a client sends. Each encoder is a small function of bytes to bytes; a ClientHello is its random, session id, suites and an
+;; ORDERED list of already-encoded extensions, so a test can lay out the extensions of any published trace (RFC 8448's) with the same encoders the client uses.
+(ns fib.tls.msg (:use fib.core fib.seq fib.coll fib.tls.bytes))
+
+;; ---- handshake message types (RFC 8446 4)
+(def ht-client-hello: i64 1) (def ht-server-hello: i64 2) (def ht-new-session-ticket: i64 4) (def ht-end-of-early-data: i64 5)
+(def ht-encrypted-extensions: i64 8) (def ht-certificate: i64 11) (def ht-certificate-request: i64 13) (def ht-certificate-verify: i64 15)
+(def ht-finished: i64 20) (def ht-key-update: i64 24) (def ht-message-hash: i64 254)
+;; ---- record content types (RFC 8446 5.1)
+(def ct-change-cipher-spec: i64 20) (def ct-alert: i64 21) (def ct-handshake: i64 22) (def ct-application-data: i64 23)
+;; ---- extension types (RFC 8446 4.2, IANA)
+(def et-server-name: i64 0) (def et-supported-groups: i64 10) (def et-signature-algorithms: i64 13) (def et-alpn: i64 16)
+(def et-pre-shared-key: i64 41) (def et-supported-versions: i64 43) (def et-cookie: i64 44) (def et-psk-modes: i64 45)
+(def et-signature-algorithms-cert: i64 50) (def et-key-share: i64 51)
+;; ---- cipher suites, groups, signature schemes
+(def suite-aes-128-gcm-sha256: i64 4865) (def suite-aes-256-gcm-sha384: i64 4866) (def suite-chacha20-poly1305-sha256: i64 4867)
+(def group-x25519: i64 29) (def group-secp256r1: i64 23) (def group-secp384r1: i64 24)
+(def sig-ecdsa-p256-sha256: i64 1027) (def sig-ecdsa-p384-sha384: i64 1283) (def sig-rsa-pss-rsae-sha256: i64 2052) (def sig-rsa-pss-rsae-sha384: i64 2053)
+(def sig-ed25519: i64 2055) (def sig-rsa-pkcs1-sha256: i64 1025) (def sig-rsa-pkcs1-sha384: i64 1281)
+
+(defun hs-wrap (typ: i64 body: (Array i8)) -> (Array i8) (cat [(w8 typ) (w24 (array-len body)) body]))
+
+;; ---- extensions
+(defun ext (typ: i64 body: (Array i8)) -> (Array i8) (cat [(w16 typ) (vec16 body)]))
+(defun w16s (xs: (Vec i64)) -> (Array i8) (cat (vec (map (fn (x: i64) (w16 x)) xs))))
+(defun ext-server-name (host: str) -> (Array i8) (ext et-server-name (vec16 (cat [(w8 0) (vec16 (ascii host))]))))
+(defun ext-supported-groups (gs: (Vec i64)) -> (Array i8) (ext et-supported-groups (vec16 (w16s gs))))
+(defun ext-signature-algorithms (ss: (Vec i64)) -> (Array i8) (ext et-signature-algorithms (vec16 (w16s ss))))
+(defun ext-signature-algorithms-cert (ss: (Vec i64)) -> (Array i8) (ext et-signature-algorithms-cert (vec16 (w16s ss))))
+(defun ext-supported-versions-client (vs: (Vec i64)) -> (Array i8) (ext et-supported-versions (vec8 (w16s vs))))
+;; The shares are (group, key_exchange) pairs; one share, for the group the client expects to be chosen, is normal.
+(defun ext-key-share-client (shares: (Vec (Pair i64 (Array i8)))) -> (Array i8)
+  (ext et-key-share (vec16 (cat (vec (map (fn (s: (Pair i64 (Array i8))) (cat [(w16 (. s fst)) (vec16 (. s snd))])) shares))))))
+(defun ext-alpn (protocols: (Vec str)) -> (Array i8)
+  (ext et-alpn (vec16 (cat (vec (map (fn (s: str) (vec8 (ascii s))) protocols))))))
+(defun ext-cookie (cookie: (Array i8)) -> (Array i8) (ext et-cookie (vec16 cookie)))
+
+;; ---- ClientHello (RFC 8446 4.1.2): legacy_version 0x0303, random, legacy_session_id, cipher_suites, compression_methods = [null], extensions.
+(defun client-hello (random: (Array i8) session-id: (Array i8) suites: (Vec i64) exts: (Vec (Array i8))) -> (Array i8)
+  (hs-wrap ht-client-hello (cat [(w16 771) random (vec8 session-id) (vec16 (w16s suites)) (vec8 (w8 0)) (vec16 (cat exts))])))
+
+;; ---- the other messages a client sends
+(defun finished-message (verify-data: (Array i8)) -> (Array i8) (hs-wrap ht-finished verify-data))
+(defun key-update-message (request: bool) -> (Array i8) (hs-wrap ht-key-update (w8 (if request 1 0))))
+;; A Certificate with no certificates, the answer to a CertificateRequest from a client that has none (RFC 8446 4.4.2): the context echoed, an empty list.
+(defun empty-certificate-message (context: (Array i8)) -> (Array i8) (hs-wrap ht-certificate (cat [(vec8 context) (w24 0)])))
+;; An alert record's body: level (2 fatal, 1 warning) and description.
+(defun alert-body (fatal: bool description: i64) -> (Array i8) (cat [(w8 (if fatal 2 1)) (w8 description)]))

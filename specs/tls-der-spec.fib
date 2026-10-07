@@ -1,0 +1,102 @@
+;; The ASN.1 DER reader and the certificate parser of fib.tls: tables of valid and refused encodings (X.690 section 10, RFC 5280), the time rules, and a MUTATION FUZZ over the committed
+;; certificates: 20000 mutated inputs (bit flips, byte replacements, truncations, insertions, deletions, zeroed runs) must each give a certificate or a typed error and never trap
+;; (a trap would end the scenario as TRAP). scripts/tls-test.sh runs the same fuzz for 100000 inputs. The generator is a fixed LCG: the corpus is deterministic. `fibc test specs`.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.tls.types fib.tls.bytes fib.tls.asn1 fib.tls.x509-base fib.tls.x509 tls-fixtures))
+
+(defstruct Case (hex: str ok: bool))
+(def der-cases: (Vec Case)
+  [(Case "3000" true) (Case "3003020101" true) (Case "0500" true) (Case "0201ff" true) (Case "04020102" true) (Case "3082000a0401000401000401000401000401000401000401000401000401" false)
+   (Case "30800000" false) (Case "3081050101" false) (Case "308200050201010000" false) (Case "3005020101" false) (Case "300602010100" false)
+   (Case "30" false) (Case "" false) (Case "3003020101ff" false) (Case "1f0100" false) (Case "3084ffffffff" false) (Case "3085000000000a" false) (Case "308100" false)
+  ])
+
+(defstruct Typed (hex: str what: str ok: bool))
+(def typed-cases: (Vec Typed)
+  [(Typed "010100" "bool" true) (Typed "0101ff" "bool" true) (Typed "010101" "bool" false) (Typed "0102ffff" "bool" false) (Typed "0100" "bool" false)
+   (Typed "020100" "int" true) (Typed "02020100" "int" true) (Typed "02020001" "int" false) (Typed "0202ff80" "int" false) (Typed "020200ff" "int" true) (Typed "0200" "int" false) (Typed "0202ff7f" "int" true)
+   (Typed "03020001" "bits" true) (Typed "030100" "bits" true) (Typed "03020801" "bits" false) (Typed "03020701" "bits" false) (Typed "030207f0" "bits" false) (Typed "03020780" "bits" true) (Typed "0300" "bits" false) (Typed "03010100" "bits" false)
+   (Typed "06032b6570" "oid" true) (Typed "0603551d13" "oid" true) (Typed "06092a864886f70d01010b" "oid" true) (Typed "06028001" "oid" false) (Typed "060255ff" "oid" false) (Typed "0600" "oid" false)
+   (Typed "060a2b0601040182371402ffff" "oid" false) (Typed "06020000" "oid" true) (Typed "0603888103" "oid" true)
+   (Typed "0402abcd" "octets" true) (Typed "0500" "octets" false)])
+
+(defun kind-ok? (what: str t: Tlv) -> bool
+  (cond (= what "bool") (match (der-bool t) ((Ok _) true) ((Err _) false))
+        (= what "int") (match (der-int-bytes t) ((Ok _) true) ((Err _) false))
+        (= what "bits") (match (der-bits t) ((Ok _) true) ((Err _) false))
+        (= what "oid") (match (der-oid t) ((Ok _) true) ((Err _) false))
+        :else (match (der-octets t) ((Ok _) true) ((Err _) false))))
+(defun walk-ok? (b: (Array i8)) -> bool
+  (match (der-root b) ((Err _) false) ((Ok t) (match (der-walk t 0) ((Ok _) true) ((Err _) false)))))
+(defun der-diffs () -> str
+  (reduce (fn (a: str c: Case) (if (= (walk-ok? (hexb (. c hex))) (. c ok)) a (str a "[" (. c hex) " expected " (. c ok) "] "))) "" der-cases))
+(defun typed-diffs () -> str
+  (reduce (fn (a: str c: Typed)
+            (let [r (match (der-root (hexb (. c hex))) ((Err _) false) ((Ok t) (kind-ok? (. c what) t)))]
+              (if (= r (. c ok)) a (str a "[" (. c what) " " (. c hex) " expected " (. c ok) "] "))))
+          "" typed-cases))
+(defun oid-text (h: str) -> str (match (der-root (hexb h)) ((Err _) "ERR") ((Ok t) (match (der-oid t) ((Ok s) s) ((Err _) "ERR")))))
+(defun nested (n: i64) -> (Array i8) (if (= n 0) (hexb "0500") (let [inner (nested (- n 1))] (cat [(w8 48) (w8 (array-len inner)) inner]))))
+
+;; ---- times
+(defstruct Tm (hex: str secs: i64))
+(def time-cases: (Vec Tm)
+  [(Tm "170d3730303130313030303030305a" -1) (Tm "170d3730303130313030303030305a" -1)])
+(defun time-of (tag: i64 text: str) -> i64
+  (match (der-time (match (der-root (cat [(w8 tag) (w8 (str-len text)) (ascii text)])) ((Ok t) t) ((Err _) (trap "bad tlv")))) ((Ok s) s) ((Err _) -1)))
+(defun time-diffs () -> str
+  (str (if (= (time-of 23 "700101000000Z") 0) "" "epoch; ") (if (= (time-of 23 "700101000001Z") 1) "" "one second; ") (if (= (time-of 23 "491231235959Z") 2524607999) "" "2049; ")
+       (if (= (time-of 23 "500101000000Z") -631152000) "" "1950; ") (if (= (time-of 24 "20500101000000Z") 2524608000) "" "2050 generalized; ")
+       (if (= (time-of 24 "20240229120000Z") 1709208000) "" "leap day; ") (if (= (time-of 23 "000229000000Z") 951782400) "" "2000 leap; ")
+       (if (= (time-of 23 "990101000000Z") 915148800) "" "1999; ") (if (= (time-of 24 "99991231235959Z") 253402300799) "" "year 9999; ")
+       (if (= (time-of 23 "230229000000Z") -1) "" "2023-02-29 accepted; ") (if (= (time-of 23 "000230000000Z") -1) "" "Feb 30; ") (if (= (time-of 23 "991301000000Z") -1) "" "month 13; ")
+       (if (= (time-of 23 "990100000000Z") -1) "" "day 0; ") (if (= (time-of 23 "990101240000Z") -1) "" "hour 24; ") (if (= (time-of 23 "990101006000Z") -1) "" "minute 60; ")
+       (if (= (time-of 23 "990101000060Z") -1) "" "second 60; ") (if (= (time-of 23 "9901010000Z") -1) "" "no seconds; ") (if (= (time-of 23 "990101000000+0100") -1) "" "an offset; ")
+       (if (= (time-of 23 "990101000000") -1) "" "no Z; ") (if (= (time-of 24 "19990101000000.5Z") -1) "" "a fraction; ") (if (= (time-of 24 "19490101000000Z") -1) "" "1949 generalized; ")
+       (if (= (time-of 23 "99010100000aZ") -1) "" "a letter; ") (if (= (time-of 19 "990101000000Z") -1) "" "a PrintableString time; ")))
+
+;; ---- the fuzz: mutations of the committed certificates
+(defun next (s: i64) -> i64 (rem (+ (* s 1103515245) 12345) 2147483648))
+(defun pick (s: i64 n: i64) -> i64 (rem (quot s 65536) n))
+(defun set-byte (b: (Array i8) i: i64 v: i64) -> (Array i8) (let [c (cell b)] (do (array-set! &c i (trunc i8 v)) @c)))
+(defun mutate (b: (Array i8) s0: i64) -> (Array i8)
+  (let [n (array-len b) s1 (next s0) s2 (next s1) s3 (next s2) k (pick s0 6) i (pick s1 n) v (pick s2 256)]
+    (cond (= k 0) (set-byte b i (bit-xor (b-at b i) (shl 1 (pick s3 8))))
+          (= k 1) (set-byte b i v)
+          (= k 2) (slice b 0 i)
+          (= k 3) (cat [(slice b 0 i) (w8 v) (slice b i n)])
+          (= k 4) (cat [(slice b 0 i) (slice b (min n (+ i 1 (pick s3 4))) n)])
+          :else (cat [(slice b 0 i) (repeat-bytes 0 (min (- n i) (+ 1 (pick s3 8)))) (slice b (min n (+ i 1 (pick s3 8))) n)]))))
+(defstruct Tally (ok: i64 err: i64))
+(defun fuzz (rounds: i64) -> Tally
+  (let [certs (vec (map (fn (f: Fx) (hexb (nth (. f chain) 0))) (filter (fn (f: Fx) (not (. f real))) (fixtures))))]
+    (loop [i 0 s 12345 ok 0 err 0]
+      (if (= i rounds) (Tally ok err)
+        (let [s2 (next s) c (nth certs (rem i (count certs))) m (if (= (rem i 11) 0) c (mutate c s2))]
+          (match (parse-certificate m) ((Ok _) (recur (+ i 1) (next s2) (+ ok 1) err)) ((Err _) (recur (+ i 1) (next s2) ok (+ err 1)))))))))
+(defun fuzz-text (n: i64) -> str
+  (let [t (fuzz n)] (if (and (= (+ (. t ok) (. t err)) n) (> (. t ok) (quot n 12)) (> (. t err) (quot n 2))) "" (str "ok " (. t ok) " err " (. t err)))))
+(defun whole-certs-ok () -> str
+  (reduce (fn (a: str f: Fx) (if (or (. f real) (= (. f name) "unknown-critical-extension")) a (reduce (fn (b: str h: str) (match (parse-certificate (hexb h)) ((Ok _) b) ((Err e) (str b (. f name) ": " (tls-error-text e) "; ")))) a (. f chain))))
+          "" (fixtures)))
+(defun truncations () -> str
+  (let [b (hexb (nth (. (nth (fixtures) 0) chain) 0))]
+    (if (some? (first (filter (fn (k: i64) (match (parse-certificate (slice b 0 k)) ((Ok _) true) ((Err _) false))) (range (array-len b))))) "a truncated certificate parsed" "")))
+
+(defspecs specs
+  (feature "the DER reader"
+    (scenario (str (count der-cases) " structures: well formed or refused (indefinite, non-minimal, truncated, overlong, trailing bytes, high tags)") (then (expect = "" (der-diffs))))
+    (scenario (str (count typed-cases) " typed contents: BOOLEAN, INTEGER, BIT STRING, OID, OCTET STRING") (then (expect = "" (typed-diffs))))
+    (scenario "OBJECT IDENTIFIERS read as dotted text"
+      (then (expect = "2.5.29.19" (oid-text "0603551d13")) (expect = "1.2.840.113549.1.1.11" (oid-text "06092a864886f70d01010b")) (expect = "1.3.101.112" (oid-text "06032b6570"))
+            (expect = "2.131123" (oid-text "0603888103"))))
+    (scenario "a 128-byte value needs the long length form, minimally" (then (expect = true (walk-ok? (cat [(hexb "048180") (repeat-bytes 0 128)]))) (expect = false (walk-ok? (cat [(hexb "04820080") (repeat-bytes 0 128)])))))
+    (scenario "nesting deeper than the limit is refused, shallow nesting is not"
+      (then (expect = true (walk-ok? (nested 10))) (expect = false (walk-ok? (nested 40))))))
+  (feature "certificate times"
+    (scenario "UTCTime and GeneralizedTime: values, leap days, ranges, forms" (then (expect = "" (time-diffs)))))
+  (feature "the certificate parser"
+    (scenario "every committed certificate parses" (then (expect = "" (whole-certs-ok))))
+    (scenario "no truncation of a certificate parses" (then (expect = "" (truncations))))
+    (scenario "20000 mutated certificates give a certificate or a typed error, never a trap" (then (expect = "" (fuzz-text 20000))))))
+
+(defun main () -> i64 (run-main (specs)))

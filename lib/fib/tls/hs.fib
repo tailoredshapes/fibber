@@ -1,0 +1,101 @@
+;; fib.tls.hs: the client side of the TLS 1.3 handshake (RFC 8446 4), as one straight run through the messages the RFC fixes: ClientHello, [HelloRetryRequest and a
+;; second ClientHello], ServerHello, EncryptedExtensions, [CertificateRequest], Certificate, CertificateVerify, Finished, then the client's [empty Certificate] and
+;; Finished. A message out of that order, a second HelloRetryRequest, a ServerHello that is not TLS 1.3 or carries the downgrade sentinel, an unsolicited extension, a
+;; Finished that does not verify: each ends the handshake with a typed error (and the alert that names it); nothing is retried at a weaker setting. The certificate
+;; checks and the CertificateVerify signature are `Hooks`, built from the provider and the trust store by `default-hooks`; a spec replaces them to run a published trace
+;; whose certificate this library would refuse (RFC 8448's RSA-1024), and nothing else does. The second half of the run is fib.tls.hs-flight.
+(ns fib.tls.hs (:use fib.core fib.seq fib.coll fib.crypto.types fib.tls.types fib.tls.bytes fib.tls.msg fib.tls.msg-parse fib.tls.keys fib.tls.record fib.tls.hello
+                     fib.tls.names fib.tls.pem fib.tls.x509 fib.tls.chain)
+  (:require [fib.crypto :as c]))
+
+(defstruct Hooks (validate: (fn ((Vec Cert)) (Result Cert TlsError)) verify-cv: (fn ((Array i8) keyword (Array i8) (Array i8)) (Result unit TlsError))))
+
+(defun default-hooks (p: p cfg: ClientConfig) :where ((CryptoProvider p)) -> Hooks
+  (Hooks (fn (certs: (Vec Cert))
+           (match (validate-chain p certs (. cfg trust) ((. cfg now)) (. cfg host)) ((Ok path) (Ok (nth path 0))) ((Err e) (Err e))))
+         (fn (spki: (Array i8) scheme: keyword content: (Array i8) sig: (Array i8))
+           (match (c/verify-signature p spki scheme content sig)
+             ((Ok _) (Ok ()))
+             ((Err e) (Err (if (unsupported? e) (from-crypto e) (hs-fail 51 "CertificateVerify: the signature does not verify"))))))))
+
+;; The first ClientHello and what the machine needs to answer a HelloRetryRequest: `rebuild` makes the second one from (group, public key, cookie). `compat` sends
+;; the middlebox-compatibility change_cipher_spec (RFC 8446 D.4) once; `extra` lists extension types the hello offers beyond the standard ones (a trace's layout), which
+;; EncryptedExtensions may then answer.
+(defstruct Start (hello: (Array i8) sid: (Array i8) group: i64 kind: keyword offer: Offer compat: bool extra: (Vec i64)
+                  rebuild: (fn (i64 (Array i8) (Option (Array i8))) (Array i8))))
+;; `key` is the private half of the current key share: it is closed when the shared secret is made, when a HelloRetryRequest replaces it and when the run fails.
+(defstruct Hs (cfg: ClientConfig rec: Rec tr: (Cell (Array i8)) hooks: Hooks start: (Cell Start) key: (Cell (Option (dyn PrivateKey :send)))))
+
+(defun add-transcript (hs: Hs bytes: (Array i8)) -> unit (set! (. hs tr) (cat [@(. hs tr) bytes])))
+(defun th-now (p: p hs: Hs s: Suite) :where ((CryptoProvider p)) -> (Result (Array i8) TlsError) (transcript-hash p s @(. hs tr)))
+(defun expect-msg (m: HsMsg typ: i64 what: str) -> (Result HsMsg TlsError)
+  (if (= (. m type) typ) (Ok m) (Err (proto-alert 10 (str "unexpected handshake message " (. m type) " where " what " belongs")))))
+(defun read-msg (p: p hs: Hs typ: i64 what: str) :where ((CryptoProvider p)) -> (Result HsMsg TlsError)
+  (try-let [m (next-message p (. hs rec))] (expect-msg m typ what)))
+(defun close-key (hs: Hs) -> unit
+  (match @(. hs key) ((some k) (do (private-key-close k) (set! (. hs key) nil))) (nil ())))
+
+;; ---- the first ClientHello: a fresh key for the preferred group
+(defun make-key :private (p: p kind: keyword) :where ((CryptoProvider p)) -> (Result (Pair (dyn PrivateKey :send) (Array i8)) TlsError)
+  (match (c/generate-key p kind)
+    ((Err e) (Err (from-crypto e)))
+    ((Ok key) (match (private-key-public key)
+                ((Err e) (do (private-key-close key) (Err (from-crypto e))))
+                ((Ok pub) (Ok (Pair key pub)))))))
+(defun fresh-hello (p: p cfg: ClientConfig o: Offer) :where ((CryptoProvider p)) -> (Result (Pair Start (dyn PrivateKey :send)) TlsError)
+  (try-let [random (lift (c/random-bytes p 32)) sid (lift (c/random-bytes p 32)) kp (make-key p (nth (. o groups) 0))]
+    (let [kind (nth (. o groups) 0) gid (group-id kind)]
+      (Ok (Pair (Start (build-hello cfg o random sid gid (. kp snd) nil) sid gid kind o true []
+                       (fn (g: i64 pb: (Array i8) ck: (Option (Array i8))) (build-hello cfg o random sid g pb ck)))
+                (. kp fst))))))
+(defun new-hs (cfg: ClientConfig io: Io hooks: Hooks st: Start key: (dyn PrivateKey :send)) -> Hs
+  (Hs cfg (new-rec io) (cell (empty-bytes)) hooks (cell st) (cell (some key))))
+
+;; ---- ServerHello checks (RFC 8446 4.1.3)
+(def downgrade-12: (Array i8) (hexb "444f574e47524401"))
+(def downgrade-11: (Array i8) (hexb "444f574e47524400"))
+(defun check-server-hello (st: Start sh: ServerHello) -> (Result Suite TlsError)
+  (let [tail (slice (. sh random) 24 32)]
+    (cond (or (bytes-eq? tail downgrade-12) (bytes-eq? tail downgrade-11)) (Err (proto-alert 47 "the ServerHello random carries a TLS downgrade sentinel"))
+          (not (= (. sh version) 772)) (Err (hs-fail 70 "the server did not select TLS 1.3 (no fallback to an older version)"))
+          (not (bytes-eq? (. sh session-id) (. st sid))) (Err (proto-alert 47 "the ServerHello does not echo the legacy_session_id"))
+          (not (includes? (. sh suite) (. (. st offer) suites))) (Err (proto-alert 47 "the server chose a cipher suite that was not offered"))
+          :else (match (suite-of (. sh suite)) (nil (Err (proto-alert 47 "an unknown cipher suite"))) ((some s) (Ok s))))))
+
+;; ---- HelloRetryRequest (RFC 8446 4.1.4): one allowed. The transcript restarts as message_hash(Hash(ClientHello1)), the HelloRetryRequest, ClientHello2.
+(defun hrr-group :private (st: Start sh: ServerHello) -> (Result keyword TlsError)
+  (match (group-kind (. sh selected-group))
+    (nil (Err (proto-alert 47 "a HelloRetryRequest selects an unknown group")))
+    ((some kind)
+      (cond (not (includes? kind (. (. st offer) groups))) (Err (proto-alert 47 "a HelloRetryRequest selects a group that was not offered"))
+            (and (= (. sh selected-group) (. st group)) (nil? (. sh cookie))) (Err (proto-alert 47 "a HelloRetryRequest that changes nothing"))
+            :else (Ok kind)))))
+(defun retry-hello :private (p: p hs: Hs st: Start sh: ServerHello suite: Suite raw: (Array i8)) :where ((CryptoProvider p)) -> (Result Start TlsError)
+  (try-let [kind (hrr-group st sh) h1 (transcript-hash p suite (. st hello)) kp (make-key p kind)]
+    (do (close-key hs) (set! (. hs key) (some (. kp fst)))
+        (let [st2 (with st (group (. sh selected-group)) (kind kind) (hello ((. st rebuild) (. sh selected-group) (. kp snd) (. sh cookie))))]
+          (do (set! (. hs tr) (cat [(w8 ht-message-hash) (w24 (array-len h1)) h1 raw (. st2 hello)]))
+              (set! (. hs start) st2)
+              (Ok st2))))))
+
+(defstruct HelloOut (st: Start sh: ServerHello suite: Suite))
+(defun send-ccs (hs: Hs st: Start) -> (Result unit TlsError)
+  (if (. st compat) ((. (. (. hs rec) io) write) (hexb "140303000101")) (Ok ())))
+
+;; The ServerHello, after at most one HelloRetryRequest. A second ServerHello must keep the suite the HelloRetryRequest named and answer the new group.
+(defun hello-stage (p: p hs: Hs st: Start retried: bool) :where ((CryptoProvider p)) -> (Result HelloOut TlsError)
+  (try-let [m (read-msg p hs ht-server-hello "the ServerHello") sh (parse-server-hello (. m body))]
+    (cond (. sh hrr) (if retried (Err (proto-alert 10 "a second HelloRetryRequest")) (retry-stage p hs st sh (. m raw)))
+          (not (= (. sh share-group) (. st group))) (Err (proto-alert 47 "the key_share answers a group that was not offered as a share"))
+          :else (try-let [suite (check-server-hello st sh)]
+                  (do (add-transcript hs (. m raw)) (Ok (HelloOut st sh suite)))))))
+(defun retry-stage :private (p: p hs: Hs st: Start sh: ServerHello raw: (Array i8)) :where ((CryptoProvider p)) -> (Result HelloOut TlsError)
+  (try-let [suite (check-server-hello st (with sh (share-group (. st group)) (session-id (. st sid))))
+            _ (if (= (. sh version) 772) (Ok ()) (Err (hs-fail 70 "a HelloRetryRequest that is not TLS 1.3")))
+            st2 (retry-hello p hs st sh suite raw) _ (send-ccs hs st)]
+    (try-let [_ ((. (. (. hs rec) io) write) (cat [(w8 22) (w16 771) (vec16 (. st2 hello))]))
+              out (hello-stage-2 p hs st2 (. sh suite))]
+      (Ok out))))
+(defun hello-stage-2 :private (p: p hs: Hs st: Start suite-id: i64) :where ((CryptoProvider p)) -> (Result HelloOut TlsError)
+  (try-let [out (hello-stage p hs st true)]
+    (if (= (. (. out sh) suite) suite-id) (Ok out) (Err (proto-alert 47 "the second ServerHello changes the cipher suite")))))
