@@ -1,0 +1,53 @@
+<!doctype html>
+<!-- examples/webgpu/js/browser.html: the wasm host of the WebGPU kernels in a browser (docs/design/webgpu.md 6). Served from a directory holding
+     host.wasm and kernels.wgsl beside this file (examples/webgpu/js/browser.sh does that and runs Chromium headless); the page loads the module with
+     a WASI shim of the eight functions the fibber runtime needs, the imports of fib-webgpu.mjs over navigator.gpu, and prints what the module
+     prints into <pre id="out">; the last line is `exit N`. Needs JSPI (Chrome 137+). -->
+<html lang="en">
+<meta charset="utf-8">
+<title>fibber kernels on WebGPU</title>
+<pre id="out"></pre>
+<script type="module">
+import { FibGpu, wasmImports } from "./fib-webgpu.mjs";
+const out = document.getElementById("out");
+const say = (s) => { out.textContent += s; console.log(s.replace(/\n$/, "")); };
+function wasiShim(getMemory) {
+  const dec = new TextDecoder();
+  let pending = "";
+  return {
+    environ_get: () => 0,
+    environ_sizes_get: (c, b) => { const m = new DataView(getMemory().buffer); m.setUint32(c, 0, true); m.setUint32(b, 0, true); return 0; },
+    clock_time_get: (id, prec, p) => { new DataView(getMemory().buffer).setBigUint64(p, BigInt(Math.round(performance.now() * 1e6)), true); return 0; },
+    fd_close: () => 0,
+    fd_seek: () => 8,   // ESPIPE
+    fd_write: (fd, iovs, n, written) => {
+      const mem = getMemory().buffer, v = new DataView(mem); let total = 0;
+      for (let i = 0; i < n; i++) { const p = v.getUint32(iovs + 8 * i, true), len = v.getUint32(iovs + 8 * i + 4, true); pending += dec.decode(new Uint8Array(mem, p, len)); total += len; }
+      v.setUint32(written, total, true);
+      const lines = pending.split("\n"); pending = lines.pop(); for (const l of lines) say(l + "\n");
+      return 0;
+    },
+    proc_exit: (code) => { throw new Error("proc_exit " + code); },
+    sched_yield: () => 0,
+  };
+}
+try {
+  if (typeof WebAssembly.Suspending !== "function") throw new Error("no JSPI in this browser");
+  const fib = new FibGpu(navigator.gpu);
+  const wgsl = await (await fetch("./kernels.wgsl")).text();
+  const module = await WebAssembly.compileStreaming(fetch("./host.wasm"));
+  let memory;
+  const imports = { wasi_snapshot_preview1: wasiShim(() => memory), env: wasmImports(fib, () => memory) };
+  const instance = await WebAssembly.instantiate(module, imports);
+  memory = instance.exports.memory;
+  instance.exports._initialize();
+  const text = new TextEncoder().encode(wgsl);
+  const p = instance.exports.malloc(text.length + 1);
+  new Uint8Array(memory.buffer, p, text.length).set(text);
+  const status = Number(await WebAssembly.promising(instance.exports.run)(p, BigInt(text.length)));
+  say("exit " + status + "\n");
+} catch (e) {
+  say("error: " + (e.message ?? e) + "\nexit 2\n");
+}
+</script>
+</html>
