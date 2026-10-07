@@ -40,6 +40,26 @@
       (call @memcpy dst src (mul m esize))
       (ret r))))
 
+;; `array-blit!` (spec/types.md 2.13.3): n elements of src from si into dst from di, in place (dst is the unique array the compiler
+;; made of the cell). Any index or count outside either array traps, nothing is written. memmove: src may be dst.
+(define internal (fib.array-blit void) ((ptr dst) (i64 di) (ptr src) (i64 si) (i64 n) (i64 esize))
+  (block entry
+    (let ((dn (call @fib.array-len dst)) (sn (call @fib.array-len src))
+          (bad (or (or (icmp slt di (i64 0)) (icmp slt si (i64 0)))
+                   (or (icmp slt n (i64 0)) (or (icmp sgt n (sub dn di)) (icmp sgt n (sub sn si)))))))
+      (br bad range ok)))
+  (block range
+    (let ((buf (alloca i8 (i32 128)))
+          (len (call @snprintf buf (i64 128) (string "array-blit! of %lld elements at dst %lld (of %lld) from src %lld (of %lld) is out of range")
+                     n di (call @fib.array-len dst) si (call @fib.array-len src))))
+      (call @fib.trap-bytes buf (sext i64 len))
+      (unreachable)))
+  (block ok
+    (let ((d (getelementptr i8 (getelementptr %struct.fib.array.i8 dst (i32 0) (i32 4) (i64 0)) (mul di esize)))
+          (s (getelementptr i8 (getelementptr %struct.fib.array.i8 src (i32 0) (i32 4) (i64 0)) (mul si esize))))
+      (call @memmove d s (mul n esize))
+      (ret))))
+
 ;; `array-push!` (in-place-update.md §2): a copy of a with room for 32 elements
 ;; (the vector tail's whole range), the elements not yet retained. ROOMY (flag
 ;; bit 4, no reader of the flags tests it: they mask bits 0-3) says the block holds

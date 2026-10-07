@@ -1,0 +1,50 @@
+;; spec:   types §2.13.3 (array-blit!)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: array-blit!
+;; `(array-blit! &d di s si n)` copies n scalar elements of s from si into d from di. (1) Into an array a cell holds alone the bytes land in
+;; place and the rest is untouched. (2) Into an array another variable also holds the other array is whole afterwards (the write goes to a
+;; copy). (3) The source may be the destination array itself, overlapping either way (memmove). (4) Zero elements at the end of both arrays is
+;; allowed and changes nothing. (5) An i64 array too: the element size is the array's.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun ramp (n: i64) -> (Array i8) (let ((a (cell (array n 0i8)))) (do (dotimes (i n) (array-set! &a i (trunc i8 i))) @a)))
+(defun same? (a: (Array i8) xs: (Vec i64)) -> bool
+  (and (= (array-len a) (count xs)) (loop ((i 0)) (cond (= i (array-len a)) true (= (zext i64 (array-get a i)) (nth xs i)) (recur (+ i 1)) :else false))))
+
+(defun in-place (c: Checks) -> unit
+  (let ((d (cell (array 6 0i8))))
+    (do (array-blit! &d 1 (ramp 10) 4 3)
+        (check c (same? @d [0 4 5 6 0 0])))))
+
+(defun shared-whole (c: Checks) -> unit
+  (let ((orig (array 4 7i8)) (d (cell orig)))
+    (do (array-blit! &d 0 (ramp 4) 0 2)
+        (check c (same? @d [0 1 7 7]))
+        (check c (same? orig [7 7 7 7])))))
+
+(defun overlap (c: Checks) -> unit
+  (let ((d (cell (ramp 8))))
+    (do (array-blit! &d 2 @d 0 5)
+        (check c (same? @d [0 1 0 1 2 3 4 7]))
+        (array-blit! &d 0 @d 3 5)
+        (check c (same? @d [1 2 3 4 7 3 4 7])))))
+
+(defun empty-at-end (c: Checks) -> unit
+  (let ((d (cell (ramp 3))))
+    (do (array-blit! &d 3 (ramp 2) 2 0)
+        (check c (same? @d [0 1 2])))))
+
+(defun wide (c: Checks) -> unit
+  (let ((d (cell (array 5 0))))
+    (do (array-blit! &d 2 (array 3 -9) 0 3)
+        (check c (= (array-get @d 1) 0))
+        (check c (= (array-get @d 2) -9))
+        (check c (= (array-get @d 4) -9)))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (in-place c) (shared-whole c) (overlap c) (empty-at-end c) (wide c)
+        (checks-result c))))

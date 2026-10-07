@@ -1048,6 +1048,7 @@ array-set! : ∀a. (fn ((& (Array a)) i64 a) unit)                   ; a signatu
 array-take!: ∀a. (fn ((& (Array a)) i64) a)                        ; a signature; the element moved out (§2.13.1)
 array-push!: ∀a. (fn ((& (Array a)) a) unit)                       ; a signature; append, in place iff unique and ROOMY (§2.13.1)
 array-pop! : ∀a. (fn ((& (Array a))) a)                            ; a signature; the last element moved out, a trap when empty (§2.13.1)
+array-blit!: ∀a. (fn ((& (Array a)) i64 (Array a) i64 i64) unit)    ; a signature; n scalar elements copied, in place iff unique (§2.13.3)
 cell-update!: ∀a. (fn ((Cell a) (fn :send (a) a)) unit)            ; the content moved out of the cell for the call of f (§2.13.1)
 (set-field! &x f e)    x : (Cell S);  f a field name, not an expression;  HasField(S, f, F);  e : F   ⇒ unit
                                                                     ; in place iff unique, else copy (§6.6)
@@ -1153,6 +1154,17 @@ and `vnode-pop` calls it only on a branch of `n >= 1` kids (`lib/prelude.fib`).
 `len >= 32` it copies exactly `len + 1` elements on every call, so a caller
 that wants amortised in-place growth beyond 32 does not get it from this
 primitive.
+
+#### 2.13.3 `array-blit!`: a range copied into an array in place
+
+`(array-blit! &d di s si n)` copies the `n` elements `s[si, si+n)` into `d[di, di+n)` and returns `unit`. Source: `compiler/emit/lower/builtins.fib` (`array-blit`,
+which takes the array out of the cell as `array-own` does), `rt/array.lir` (`fib.array-blit`). Type `(fn ((& (Array a)) i64 (Array a) i64 i64) unit)`, escape kinds
+`[EscInOut EscScalar EscBorrow EscScalar EscScalar]`. `d` is taken through an `&` position and written in place iff it is unique (§6.6), else a copy takes the cell
+first, so a shared array is never written. The copy is a `memmove` of `n * size` bytes, so `s` may be the array in `d`'s cell and the ranges may overlap. A negative
+index or count, or a range beyond either length (`di + n > len d`, `si + n > len s`), traps with `array-blit! of N elements at dst D (of LD) from src S (of LS) is out
+of range` and writes nothing; `n = 0` at an index equal to the length is allowed. The element type must be a scalar (no object pointer and no `dyn`): a bytewise
+copy of counted elements would skip their counts, so the lowering refuses it (`array-blit! needs an array of scalars`). It is the blit that `array-copy` (a fresh
+slice) and the element loop lacked: a record layer, an HTTP body and a JSON buffer build their bytes with it. Cases 8140 to 8142, mutant `scripts/mutant-blit.sh`.
 
 ### 2.14 `&` parameters and places
 

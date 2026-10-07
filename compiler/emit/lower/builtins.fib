@@ -1,13 +1,8 @@
-;; compiler/emit/lower/builtins.fib: the builtins of syntax §4.3 (types §2.9 to §2.13, §8.3): cells, arrays, strings, traps and the unsafe
-;; primitives, lowered by name. Replaces crates/fibc/src/lower/builtins.rs (478 lines of Rust); `lcx-rt-call` of that file is in
-;; emit.lower.cx (emit.lower.strfind calls it and this module calls strfind), and the cell load is the hub's `cell-load` (call.rs
-;; is above this module). The Rust `match name` is a chain of `match`es, each ending in the next (`builtin-core`, `builtin-text`,
-;; `builtin-mem`), because a fibber `match` takes no or-pattern; an argument is fetched where the Rust arm fetches it, so a missing
-;; one is the Rust's error. The `trap` arm of a macro module (`fib.trap-at`, Rust `p.macro_module`) is E11's.
+;; compiler/emit/lower/builtins.fib: the builtins of syntax §4.3 (types §2.9 to §2.13, §8.3): cells, arrays, strings, traps and the unsafe primitives, lowered
+;; by name, a chain of `match`es (`builtin-core`, `builtin-text`, `builtin-mem`) since a fibber `match` takes no or-pattern. The cell load is the hub's `cell-load`.
 (ns emit.lower.builtins
   (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.layout emit.ir emit.program emit.objects.kinds
         emit.lower.cx emit.lower.ops emit.lower.cells emit.lower.arith emit.lower.pattern emit.lower.strfind emit.lower.threads emit.lower.freeze emit.lower.simd emit.lower.simdmem emit.lower.catch))
-
 ;; Argument `i` of the builtin `name`. Rust: the closure `arg` of lower/builtins.rs:16
 (defun arg :private (name: str a: (Vec V) i: i64) -> (Result V str)
   (match (get a i)
@@ -148,12 +143,12 @@
 (defstruct Arr (tid: i64 sname: str elem: Ty unit: bool el: LirTy esize: i64 counted: bool))
 
 (defun array-name? :private (name: str) -> bool
-  (one-of? name ["array-uninit-f32" "array-uninit-f64" "array" "array-len" "array-get" "array-with" "array-copy" "array-set!" "array-take!" "array-push!" "array-pop!"]))
+  (one-of? name ["array-uninit-f32" "array-uninit-f64" "array" "array-len" "array-get" "array-with" "array-copy" "array-set!" "array-take!" "array-push!" "array-pop!" "array-blit!"]))
 
 ;; The array type the builtin works on: the result's for the makers, the cell's content for `array-set!`, else the argument's.
 (defun array-ty-of :private (cx: LowerCx name: str e: Expr tys: (Vec Ty)) -> (Result Ty str)
   (cond (one-of? name ["array-uninit-f32" "array-uninit-f64" "array" "array-copy" "array-with"]) (lcx-ty cx e)
-        (one-of? name ["array-set!" "array-take!" "array-push!" "array-pop!"])
+        (one-of? name ["array-set!" "array-take!" "array-push!" "array-pop!" "array-blit!"])
         (match (nth tys 0)
           ((TCon (KCell) args) (Ok (nth args 0)))
           (_ (Err (str-join [name " on a non-cell"]))))
@@ -183,7 +178,6 @@
   (str-join ["(getelementptr %struct." (. r sname) " " arr " (i32 0) (i32 " (str slot-elems) ") " i ")"]))
 
 ;; Stores `x` into every element of a fresh array of `n`, taking `n - 1` further counts on it (the consume brought the first).
-;; Rust: lower/builtins.rs:349 array_fill
 (defun array-fill :private (cx: LowerCx r: Arr p: V n: V x: V) -> unit
   (let ((b (. cx b)) (lh (fb-label b "fill")) (lb (fb-label b "fillb")) (ld (fb-label b "filled")) (entry (fb-current b)))
     (do (fb-term b (str-join ["(br " lh ")"]))
@@ -210,7 +204,6 @@
         (fb-open b ln))))
 
 ;; The address of element `i`, after the bounds check (a trap with the interpreter's message, `eval/arrays.rs`).
-;; Rust: lower/builtins.rs:396 array_index
 (defun array-index :private (cx: LowerCx r: Arr arr: str i: V) -> str
   (array-index-n cx r arr i (array-length cx r arr)))
 
@@ -329,6 +322,13 @@
                   (do (fb-stmt b (str-join ["(store " (v-text n1) " " lp ")"]))
                       (Ok v))))))))))
 
+;; `(array-blit! &d di s si n)`: n scalar elements of s into d, in place when d is unique, else into a copy that takes its place.
+(defun array-blit :private (cx: LowerCx r: Arr cell-ty: Ty a: (Vec V)) -> (Result V str)
+  (if (. r counted) (Err "array-blit! needs an array of scalars: a counted element cannot be copied bytewise")
+    (try-let ((arr (array-own cx r cell-ty a false)))
+      (do (fb-stmt (. cx b) (str-join ["(call @fib.array-blit " (v-text arr) " " (v-text (nth a 1)) " " (v-text (nth a 2)) " " (v-text (nth a 3)) " " (v-text (nth a 4)) " (i64 " (str (. r esize)) "))"]))
+          (Ok VUnit)))))
+
 ;; `(array-take! &a i)`: element `i` moved out (a null left in its slot), from a unique array or else from a copy.
 (defun array-take :private (cx: LowerCx r: Arr cell-ty: Ty a: (Vec V)) -> (Result V str)
   (try-let ((arr (array-own cx r cell-ty a false)))
@@ -395,6 +395,7 @@
       ("array-take!" (array-take cx r (nth tys 0) a))
       ("array-push!" (array-push cx r (nth tys 0) a))
       ("array-pop!" (array-pop cx r (nth tys 0) a))
+      ("array-blit!" (array-blit cx r (nth tys 0) a))
       (_ (array-set cx r (nth tys 0) a)))))
 
 ;; ---- strings, the command line, floats
