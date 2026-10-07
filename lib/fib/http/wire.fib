@@ -101,6 +101,9 @@
     (reduce (fn (lines: (Vec str) value: str) (conj lines (str (. entry fst) ": " value "\r\n")))
       out (. entry snd))) [] (normalize-headers headers)))
 (defun response-bytes (response: Response method: str keep: bool) -> (Result (Array i8) Error)
+  (try-let [parts (response-parts response method keep)] (Ok (concat-bytes [(. parts fst) (. parts snd)]))))
+;; The head and the body of a whole response, apart: a big body is written after its head without being copied next to it.
+(defun response-parts (response: Response method: str keep: bool) -> (Result (Pair (Array i8) (Array i8)) Error)
   (try-let [_ (validate-headers (. response headers))]
     (let [status (. response status) body (. response body)
           headers (dissoc (dissoc (normalize-headers (. response headers)) "transfer-encoding") "content-length")
@@ -111,7 +114,7 @@
       (if (or (< status 200) (> status 599)) (Err (InvalidRequest "HTTP response status must be between 200 and 599"))
         (let [head (str-join (into [(str "HTTP/1.1 " status " " (reason-phrase status) "\r\n")]
                                   (conj (header-lines final) "\r\n")))]
-          (Ok (concat-bytes [(str-bytes head) (if (or (= method "HEAD") (= status 204) (= status 205) (= status 304)) (array 0 0i8) body)])))))))
+          (Ok (Pair (str-bytes head) (if (or (= method "HEAD") (= status 204) (= status 205) (= status 304)) (array 0 0i8) body))))))))
 (defun response-status :private (line: str) -> (Result i64 Error)
   (let [parts (s/split line " " -1)]
     (if (and (>= (count parts) 2) (starts-with? (nth parts 0) "HTTP/") (= (str-len (nth parts 1)) 3))

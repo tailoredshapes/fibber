@@ -19,6 +19,7 @@
   (let [r (unsafe (shutdown (trunc i32 fd) 1i32)) saved (n/errno)] (if (< r 0i32) (Err (error-from-code saved "shutdown")) (Ok ()))))
 (defun send-all (fd: i64 bytes: (Array i8) timeout-ms: i64 stop: (Atom bool)) -> (Result unit OSError)
   (if (or (< timeout-ms 1) (> timeout-ms 3600000)) (Err (invalid-input "send" "invalid send timeout"))
-    (let [buffer (n/bytes-new bytes)
-          result (send-loop fd buffer (array-len bytes) (+ (time/clock-now) (* timeout-ms 1000000)) stop)]
-      (unsafe (do (free buffer) result)))))
+    ;; the array's own data is handed to send (no copy: the old byte-at-a-time copy into a malloc buffer cost a millisecond a MiB); the bytes start after the 24-byte array header
+    ;; (spec/types.md section 8, the same constant fib.view and the drivers use), and the array is borrowed for the whole call
+    (let [buffer (unsafe (ptr+ (raw bytes) 24))]
+      (send-loop fd buffer (array-len bytes) (+ (time/clock-now) (* timeout-ms 1000000)) stop))))
