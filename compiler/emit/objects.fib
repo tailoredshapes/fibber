@@ -40,9 +40,9 @@
     ((FrVal t) (lir-mem-text t))
     ((FrBytes n) (str-join ["[" (str n) " x i8]"]))))
 
-(defun frame-size-align :private (f: FrameSlot) -> (Pair i64 i64)
+(defun frame-size-align :private (pb: i64 f: FrameSlot) -> (Pair i64 i64)
   (match f
-    ((FrVal t) (size-align t))
+    ((FrVal t) (size-align-pb pb t))
     ((FrBytes n) (Pair n 8))))
 
 (defun frame-vals :private (ts: (Vec LirTy)) -> (Vec FrameSlot)
@@ -83,16 +83,22 @@
 ;; A struct's fields already hold its slots; an enum's hold the tag prefix, and the variant's slots follow.
 ;; Rust: objects.rs:135 ObjInfo::offsets
 (defun obj-offsets (o: ObjInfo tag: (Option i64)) -> (Vec i64)
+  (obj-offsets-pb o tag 8))
+
+(defun obj-offsets-pb (o: ObjInfo tag: (Option i64) pb: i64) -> (Vec i64)
   (let ((fixed (match (. o kind) ((ObStruct _) (count (layout-header))) (_ (count (obj-fields o)))))
         (all (match (. o kind)
                ((ObEnum _) (variant-fields o tag))
                (_ (obj-fields o)))))
-    (vec (drop fixed (field-offsets (mapv frame-size-align all))))))
+    (vec (drop fixed (field-offsets (mapv (fn (f: FrameSlot) (frame-size-align pb f)) all))))))
 
 ;; The size of a fixed-size object; an enum's is its largest variant's. Strings and arrays add their elements at run time.
 ;; Rust: objects.rs:152 ObjInfo::size
 (defun obj-size (o: ObjInfo) -> i64
-  (let ((of (fn (f: (Vec FrameSlot)) (struct-size-of (mapv frame-size-align f)))))
+  (obj-size-pb o 8))
+
+(defun obj-size-pb (o: ObjInfo pb: i64) -> i64
+  (let ((of (fn (f: (Vec FrameSlot)) (struct-size-of (mapv (fn (s: FrameSlot) (frame-size-align pb s)) f)))))
     (match (. o kind)
       ((ObEnum vs) (reduce (fn (m: i64 i: i64) (max m (of (variant-fields o (some i))))) 0 (range (count vs))))
       (_ (of (obj-fields o))))))
@@ -147,11 +153,11 @@
               (_ []))))))
 
 ;; The type table and the class table. Rust: objects.rs:317 render_tables
-(defun render-tables :private (list: (Vec ObjInfo)) -> str
+(defun render-tables :private (list: (Vec ObjInfo) pb: i64) -> str
   (let ((n (str (count list)))
         (rec (fn (o: ObjInfo)
                (str-join ["(%struct.fib.typerec @drop." (str (. o tid)) " @trace." (str (. o tid))
-                          " (string " (lir-quote (. o name)) ") (i64 " (str (obj-size o)) ") @share." (str (. o tid)) ")"])))
+                          " (string " (lir-quote (. o name)) ") (i64 " (str (obj-size-pb o pb)) ") @share." (str (. o tid)) ")"])))
         (class (fn (o: ObjInfo) (str-join ["(i8 " (str (obj-class o)) ")"])))
         (kind (fn (o: ObjInfo) (str-join ["(i8 " (str (obj-kind o)) ")"]))))
     (str-join ["(constant internal fib.types [" n " x %struct.fib.typerec] ([" n " x %struct.fib.typerec] "
@@ -178,10 +184,16 @@
 ;; of an object are the same text every time (`struct-text`, `walker-text`), which the in-memory hand-over parses once (emit.defs.astmod).
 ;; Rust: objects.rs:238 Objects::render
 (defun objects-render-pieces (os: Objects) -> (Vec str)
+  (objects-render-pieces-pb os 8))
+
+(defun objects-render-pieces-pb (os: Objects pb: i64) -> (Vec str)
   (let ((list @(. os list)))
     (into (into (mapv (fn (o: ObjInfo) (struct-text os o)) list)
                 (mapv (fn (o: ObjInfo) (walker-text os o)) list))
-          [(render-tables list)])))
+          [(render-tables list pb)])))
 
 (defun objects-render (os: Objects) -> str
   (str-join (objects-render-pieces os)))
+
+(defun objects-render-pb (os: Objects pb: i64) -> str
+  (str-join (objects-render-pieces-pb os pb)))

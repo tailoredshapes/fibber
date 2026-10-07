@@ -33,6 +33,15 @@
    sysroot: str libc: str libc-lacks: (Vec str) status: str support: str))
 (derive Eq TargetRow)
 
+;; The libc functions whose `size_t`, `long`, `ssize_t` and pointer-sized words the runtime and the library write as `i64` (`i64` is right on a 64-bit target) and that a
+;; 32-bit target's libc takes as `i32`: native.lower declares them with `i32` there and narrows and widens at each call. A function that takes a real 64-bit value
+;; (`lseek`'s `off_t`) is not in it, and neither are the functions the runtime itself defines (`fib_alloc_ctl`).
+(defun libc-narrow-names () -> (Vec str)
+  ["malloc" "calloc" "realloc" "memcpy" "memcmp" "memset" "write" "read" "strlen" "snprintf" "sysconf" "pthread_detach" "pthread_attr_setstacksize"
+   "malloc_usable_size" "madvise" "fread" "fwrite" "readlink" "getcwd" "getentropy" "poll" "send" "fmemopen" "ftell" "setbuf" "fcntl"])
+
+(defun libc-narrow? (name: str) -> bool (some? (first (filter (fn (n: str) (= n name)) (libc-narrow-names)))))
+
 ;; The C functions the runtime (rt/*.lir) declares: targets-emit.sh checks this list against the `declare`s of rt/.
 (defun runtime-c-functions () -> (Vec str)
   ["__errno_location" "abort" "calloc" "clock_gettime" "close" "dup" "fclose" "ferror" "fopen" "fread" "free" "fwrite" "getenv" "isatty"
@@ -67,17 +76,19 @@
 ;; as a portability target: built, its results the same, `simd/fma` a trap (warned at compile time) and `simd/muladd` a multiply and an add.
 (def PORTABILITY: str "portability target: no guaranteed FMA, tail calls by the wasm tail-call extension")
 
-;; WASI preview 1, single-threaded: wasi-libc without threads (no pthread_create; the mutex and key functions are its single-thread stubs),
-;; no pipe, dup or madvise. 32-bit pointers. SIMD128 and tail calls are on (wasmtime, node and the browsers have both); no fused multiply-add.
+;; WASI preview 1, single-threaded: wasi-libc without threads (`pthread_create`, `pipe` and `dup` are stubs that fail, the mutex and key functions its single-thread ones; it has no
+;; `madvise`, `mallopt` or `pthread_exit`: `libc-lacks` is checked against its `libc.a`, docs/design/wasm.md 2). 32-bit pointers. SIMD128 and tail calls are on (node, wasmtime and the
+;; browsers have both); no fused multiply-add. `min-level` is 1: at code-generation level 0 LLVM's FastISel makes no `return_call` (docs/design/wasm.md 6). `runtime-os` "Wasi" is emit.wasi
+;; and lib/platform/wasi.
 (defun row-wasm32-wasip1 :private () -> TargetRow
-  (TargetRow "wasm32-wasip1" "wasm32" "wasi" "Linux" "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"
-             32 true "none" 128 "generic" "+simd128,+tail-call" false 0 0 1 1 "none" "wasm" "wasm-ld" "WASI_SYSROOT" "wasi-libc"
-             ["dup" "madvise" "pipe" "pthread_create" "pthread_detach" "pthread_exit"] "emits; runtime-os Linux is a stand-in" PORTABILITY))
+  (TargetRow "wasm32-wasip1" "wasm32" "wasi" "Wasi" "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"
+             32 true "none" 128 "generic" "+simd128,+tail-call" false 1 0 1 1 "none" "wasm" "wasm-ld" "WASI_SYSROOT" "wasi-libc"
+             ["madvise" "mallopt" "pthread_exit"] "runs (node:wasi, wasmtime): docs/design/wasm.md" PORTABILITY))
 
 ;; The browser or another JavaScript host: no C library at all, every runtime C function is an import the host must provide.
 (defun row-wasm32-unknown :private () -> TargetRow
   (TargetRow "wasm32-unknown-unknown" "wasm32" "none" "Linux" "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"
-             32 true "none" 128 "generic" "+simd128,+tail-call" false 0 0 1 1 "none" "wasm" "wasm-ld --no-entry --export-dynamic" "" "none"
+             32 true "none" 128 "generic" "+simd128,+tail-call" false 1 0 1 1 "none" "wasm" "wasm-ld --no-entry --export-dynamic" "" "none"
              (runtime-c-functions) "emits; runtime-os Linux is a stand-in" PORTABILITY))
 
 ;; RV64GC Linux (the RVA20 profile: I M A F D C, Zicsr, Zifencei), the lp64d ABI. The V extension is not assumed (FIB_TARGET_CPU names a

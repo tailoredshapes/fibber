@@ -1,0 +1,121 @@
+;; compiler/native/linkwasm.fib: the link of `fibc build --target wasm32-wasi` (docs/design/wasm.md): the object is linked with `wasm-ld` against wasi-libc, no `cc`.
+;;   WASM-LD crt1.o OBJ [-LDIR..] [-lNAME..] -Lsysroot/lib/wasm32-wasip1 -lc [libclang_rt.builtins.a] -o OUT -z stack-size=N --stack-first --max-memory=M
+;; The pieces come from a wasi-sdk (https://github.com/WebAssembly/wasi-sdk: `bin/wasm-ld`, `share/wasi-sysroot`, `lib/clang/N/lib/wasm32-unknown-wasip1/libclang_rt.builtins.a`)
+;; or are named one by one: $WASI_SDK is its directory, $WASM_LD the linker (else `wasm-ld` on PATH, else the SDK's), $WASI_SYSROOT the sysroot (else the SDK's),
+;; $WASI_BUILTINS the compiler-rt builtins (else the SDK's). Nothing of this is a dependency of an ordinary build: a missing piece is an error that says what to do.
+;; The linear memory of the program: $FIB_WASM_STACK bytes of stack (default 8 MiB, the thread stack of the native runtime), grown by wasi-libc's malloc with
+;; `memory.grow` up to $FIB_WASM_MAX_MEMORY bytes (default 4 GiB less one page).
+(ns native.linkwasm
+  (:use native.error native.link)
+  (:require [llvm.ffi :as ffi] [types.targets :as tt]))
+
+(extern getenv :private (ptr) -> ptr)
+(extern access :private (ptr i32) -> i32)
+
+(defun env-of :private (name: str) -> (Option str)
+  (let ((k (ffi/bytes-new name))
+        (at (unsafe (ffi/ptr->addr (getenv k)))))
+    (do (ffi/free-addr (ffi/ptr->addr k))
+        (if (= at 0) nil (some (ffi/c-string-at at))))))
+
+(defun file-ok? :private (path: str mode: i32) -> bool
+  (let ((p (ffi/bytes-new path)))
+    (let ((r (unsafe (access p mode))))
+      (do (ffi/free-addr (ffi/ptr->addr p)) (= r 0i32)))))
+
+(defun split-on-colon :private (text: str) -> (Vec str)
+  (loop ((i 0) (start 0) (out []))
+    (cond (>= i (str-len text)) (conj out (str-slice text start (str-len text)))
+          (= (str-byte-at text i) 58i8) (recur (+ i 1) (+ i 1) (conj out (str-slice text start i)))
+          :else (recur (+ i 1) start out))))
+
+(defun first-file :private (paths: (Vec str) mode: i32) -> (Option str)
+  (first (filter (fn (p: str) (file-ok? p mode)) paths)))
+
+(defun sdk-path :private (rel: str) -> (Vec str)
+  (match (env-of "WASI_SDK") (nil []) ((some d) [(str d "/" rel)])))
+
+;; `wasm-ld`: $WASM_LD, else on PATH (`wasm-ld`, `wasm-ld-21`), else the SDK's.
+(defun wasm-ld :private () -> (Result str str)
+  (let ((named (match (env-of "WASM_LD") (nil []) ((some l) [l])))
+        (on-path (reduce (fn (acc: (Vec str) d: str) (into acc [(str d "/wasm-ld") (str d "/wasm-ld-21")])) [] (split-on-colon (unwrap-or (env-of "PATH") "")))))
+    (match (first-file (into (into named on-path) (sdk-path "bin/wasm-ld")) 1i32)
+      ((some l) (Ok l))
+      (nil (Err "a WebAssembly build needs wasm-ld (LLVM's lld): put it on PATH, or set WASM_LD, or set WASI_SDK to a wasi-sdk (docs/design/wasm.md 3)")))))
+
+;; The directory of the sysroot's libraries for wasm32-wasip1 (crt1.o, libc.a).
+(defun sysroot-lib :private () -> (Result str str)
+  (let ((roots (into (match (env-of "WASI_SYSROOT") (nil []) ((some d) [d])) (sdk-path "share/wasi-sysroot"))))
+    (match (first (filter (fn (d: str) (file-ok? (str d "/lib/wasm32-wasip1/libc.a") 4i32)) roots))
+      ((some d) (Ok (str d "/lib/wasm32-wasip1")))
+      (nil (Err "a WebAssembly build needs wasi-libc (lib/wasm32-wasip1/libc.a): set WASI_SYSROOT to a WASI sysroot, or WASI_SDK to a wasi-sdk (docs/design/wasm.md 3)")))))
+
+;; compiler-rt's builtins for wasm32: $WASI_BUILTINS, else the SDK's clang resource directory (any version 17 to 40), else none (the link then says what it lacks).
+(defun builtins :private () -> (Option str)
+  (let ((given (match (env-of "WASI_BUILTINS") (nil []) ((some b) [b])))
+        (sdk (match (env-of "WASI_SDK")
+               (nil [])
+               ((some d) (mapv (fn (v: i64) (str d "/lib/clang/" (show v) "/lib/wasm32-unknown-wasip1/libclang_rt.builtins.a")) (range 17 41))))))
+    (first-file (into given sdk) 4i32)))
+
+(defun number-env :private (name: str default: i64) -> i64
+  (match (env-of name)
+    (nil default)
+    ((some t) (unwrap-or (parse-long t) default))))
+
+;; The linker's arguments after its own name. `dirs` are the `-L` directories, `libs` the words after `-l`.
+(defun wasm-args (obj: str out: str lib: str rt: (Option str) dirs: (Vec str) libs: (Vec str)) -> (Vec str)
+  (let ((head (into (into (into [(str lib (if (library?) "/crt1-reactor.o" "/crt1.o")) obj]
+                                (mapv (fn (d: str) (str "-L" d)) dirs))
+                          (mapv (fn (l: str) (str "-l" l)) libs))
+                    [(str "-L" lib) "-lc" "-lwasi-emulated-getpid"]))
+        (tail ["-o" out (str "-zstack-size=" (show (number-env "FIB_WASM_STACK" 8388608))) "--stack-first"
+               (str "--max-memory=" (show (number-env "FIB_WASM_MAX_MEMORY" 4294901760)))]))
+    (into (into (into (into head (match rt (nil []) ((some b) [b]))) tail) (library-flags)) (strip-flags))))
+
+;; The name section (the function names a trap's stack shows) is dropped: the hello world is 43 KB without it and 231 KB with it. FIB_WASM_NAMES=1 keeps it.
+(defun strip-flags :private () -> (Vec str)
+  (if (= (env-of "FIB_WASM_NAMES") (some "1")) [] ["--strip-all"]))
+
+;; A library (`--export`): wasi-libc's reactor start (`_initialize`, no `_start`), no entry point, each export a symbol the module exports, and `malloc` and `free` so that
+;; the host can make the memory its arguments point to.
+(defun library? :private () -> bool
+  (match (env-of "FIB_EXPORTS") ((some e) (not (= e ""))) (nil false)))
+
+(defun library-flags :private () -> (Vec str)
+  (if (library?)
+    (into ["--no-entry" "--export=malloc" "--export=free"]
+          (mapv (fn (w: str) (str "--export=" (match (str-find w "=" 0) ((some i) (str-slice w (+ i 1) (str-len w))) (nil w))))
+                (split-on-colon-or-comma (unwrap-or (env-of "FIB_EXPORTS") ""))))
+    []))
+
+(defun split-on-colon-or-comma :private (text: str) -> (Vec str)
+  (loop ((i 0) (start 0) (out []))
+    (cond (>= i (str-len text)) (conj out (str-slice text start (str-len text)))
+          (= (str-byte-at text i) 44i8) (recur (+ i 1) (+ i 1) (conj out (str-slice text start i)))
+          :else (recur (+ i 1) start out))))
+
+;; What a failed link says when WASI lacks a function the program uses: the library's sockets, processes, host names and temporary directories are not in preview 1.
+(defun hint :private (m: str) -> str
+  (if (some? (str-find m "undefined symbol" 0))
+    (str m "\nthis program uses a function that WASI preview 1 does not have (sockets, processes, host names, temporary directories: docs/design/wasm.md 2); it cannot be built for wasm32-wasi")
+    m))
+
+;; Writes the object beside `out` and runs wasm-ld. (link.fib `link`, for wasi-libc)
+(defun link-wasm (object: (Array i8) out: str dirs: (Vec str) libs: (Vec str)) -> (Result unit LairError)
+  (let ((obj (object-path out))
+        (errfile (str out ".lair.err")))
+    (match (wasm-ld)
+      ((Err m) (Err (ErrBackend m)))
+      ((Ok ld)
+       (match (sysroot-lib)
+         ((Err m) (Err (ErrBackend m)))
+         ((Ok lib)
+          (match (write-bytes obj object)
+            ((Err m) (Err (ErrBackend m)))
+            ((Ok _) (let ((r (run-cc (into [ld] (wasm-args obj out lib (builtins) dirs libs)) errfile)))
+                      (do (remove-path obj)
+                          (remove-path errfile)
+                          (match r
+                            ((Err m) (Err (ErrBackend (hint m))))
+                            ((Ok _) (Ok ())))))))))))))

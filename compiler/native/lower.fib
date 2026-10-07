@@ -15,7 +15,8 @@
         (funcs: (Cell (Map str FuncEntry)) (cell {}))
         (globals: (Cell (Map str i64)) (cell {})))
     (let ((lx (Lx (. owned ctx) (. owned module) td structs fields funcs globals (. (tt/target-row-of-triple triple) tail-cc)
-                  (. (tt/target-row-of-triple triple) tail-kind)))
+                  (. (tt/target-row-of-triple triple) tail-kind)
+                  (= (. (tt/target-row-of-triple triple) pointer-bits) 32) (= (. (tt/target-row-of-triple triple) os) "wasi")))
           (r (module-items lx m)))
       (do (unsafe (do (lt/LLVMDisposeTargetData td) (free dl)))
           (match r
@@ -30,7 +31,7 @@
     (do (declare-structs lx items)
         (dotimes (i (count items))
           (match (nth items i)
-            ((ItDeclare d) (add-function lx (. d name) (. d ty) (hidden-mods (. d hidden)) nil))
+            ((ItDeclare d) (add-declare lx (. d name) (. d ty) (hidden-mods (. d hidden))))
             ((ItDefine f) (add-function lx (. f name) (. f ty) (. f mods) tgt))
             ((ItGlobal g) (add-global lx (. g name) (. g ty) (. g mods)))
             ((ItDeclareGlobal g) (add-global lx (. g name) (. g ty) (hidden-mods (. g hidden))))
@@ -90,13 +91,30 @@
     ((some v) v)
     (nil (trap (str "unknown struct " name)))))
 
+;; A libc function of a 32-bit target is declared with the target's own types: `i32` for `size_t`, `long` and the pointer-sized words the runtime and the library write
+;; as `i64`. Calls narrow their arguments and widen the result (native.lower.calls). The names are types.targets' `libc-narrow-names`.
+(defun narrow-ty :private (t: LType) -> LType
+  (match t ((TInt n) (if (= n 64) (TInt 32) t)) (_ t)))
+
+(defun narrowed :private (ty: LFnType) -> LFnType
+  (LFnType (. ty cc) (match (. ty ret) ((some r) (some (narrow-ty r))) (nil nil)) (mapv narrow-ty (. ty params)) (. ty varargs)))
+
+(defun add-declare :private (lx: Lx name: str ty: LFnType mods: LModifiers) -> unit
+  (if (and (. lx ptr32) (tt/libc-narrow? name))
+    (let ((w (narrowed ty)))
+      (let ((f (core/add-function (. lx module) name (lx-fn-ty lx w))))
+        (do (unsafe (core/LLVMSetFunctionCallConv f (trunc i32 (cc-number lx (. ty cc)))))
+            (set-modifiers f mods)
+            (let ((fns (. lx funcs))) (update! fns (fn (m) (assoc m name (FuncEntry f ty (some w)))))))))
+    (add-function lx name ty mods nil)))
+
 (defun add-function :private (lx: Lx name: str ty: LFnType mods: LModifiers tgt: (Option LTarget)) -> unit
-  (let ((f (core/add-function (. lx module) name (lx-fn-ty lx ty))))
+  (let ((f (core/add-function (. lx module) (if (and (. lx wasi) (= name "main")) "__main_argc_argv" name) (lx-fn-ty lx ty))))
     (do (unsafe (core/LLVMSetFunctionCallConv f (trunc i32 (cc-number lx (. ty cc)))))
         (set-modifiers f mods)
         (if-some [t tgt] (target-attributes lx f t) ())
         (if (slow-path? name) (add-noinline lx f) ())
-        (let ((fns (. lx funcs))) (update! fns (fn (m) (assoc m name (FuncEntry f ty))))))))
+        (let ((fns (. lx funcs))) (update! fns (fn (m) (assoc m name (FuncEntry f ty nil))))))))
 
 ;; The string attribute `key` = `value` on the definition `f`.
 (defun add-string-attribute :private (lx: Lx f: i64 key: str value: str) -> unit

@@ -8,7 +8,7 @@
 ;; The runtime's own `declare` (`runtime-declaration`) is emit.rt's.
 ;; E11 added the last field, `macro-module` (Rust `macro_module: bool`, set by `compile-macro`): a trap of a macro module fails the expansion.
 (ns emit.program
-  (:require [fib.string :as s] [fib.unix :as unix])
+  (:require [fib.string :as s] [fib.unix :as unix] [emit.os :as os])
   (:use types.ty types.ast types.decls types.display types.init types.program own.program emit.value emit.layout emit.names
         emit.mono emit.objects emit.statics emit.rt))
 
@@ -30,7 +30,9 @@
    helpers: (Cell (Map str bool)) def-values: (Cell (Map i64 DefValue)) quotes: (Cell (Map i64 str))
    quote-text: (Cell str) quote-counter: (Cell i64) keyword-helpers: (Cell bool)
    def-slots: (Cell (Map i64 DefValue)) inits: (Cell (Vec Init))
-   macro-module: (Cell bool) unwinding: bool))
+   macro-module: (Cell bool) unwinding: bool
+   ;; the bytes of a pointer in the target's memory (4 on wasm32): the layouts of the objects are computed from it. 8 while the JIT runs, which is the host's.
+   pb: (Cell i64)))
 
 ;; Whether the program catches (stage 2 of docs/design/exceptions.md, ADR 0009): some body calls `catch-run`. Only then do its functions
 ;; return a failure next to their value (emit.lower.call); a program that never catches has no observer of a failure, so a trap aborts
@@ -51,12 +53,26 @@
 (defun program-new (typed: TypedProgram owned: OwnedProgram) -> Program
   (let ((p (Program typed owned (objects-new) (statics-new) (queue-new) (cell []) (cell 0) (cell []) (cell [])
                     (cell (map-empty)) (cell (map-empty)) (cell (map-empty)) (cell "") (cell 0) (cell false)
-                    (cell (map-empty)) (cell []) (cell false) (program-unwinds? typed owned))))
+                    (cell (map-empty)) (cell []) (cell false) (program-unwinds? typed owned) (cell (os/target-pointer-bytes)))))
     (do (objects-intern (. p objects) "fib.str" "str" ObStr)
         (objects-intern (. p objects) "fib.array.i8" "(Array i8)" (ObArray LirI8))
         (objects-intern (. p objects) "fib.weakbox" "weak box" ObWeak)
         (objects-intern (. p objects) "fib.task" "task" (ObTask [] []))
         p)))
+
+;; The program the rest of the module is lowered for after the JIT made the constants at the host's pointer width: the same types, objects (their layouts are computed on
+;; demand), static data and definitions of the `def`s and their values, and the same work to do: every body and closure the first pass asked for is lowered again, at `pb`
+;; (the queue is copied with its head at the start; the closures are asked for again by the bodies that make them, so each name is the one the statics and the constants already hold), into text that is made afresh.
+(defun program-rebuilt (p: Program pb: i64) -> Program
+  (let ((q (. p queue)))
+    (Program (. p typed) (. p owned) (. p objects) (. p statics)
+             (Queue (cell @(. q pending)) (cell 0) (cell @(. q names)) (cell nil))
+             (cell []) (cell 0) (cell []) (cell [])
+             (cell (map-empty)) (cell @(. p def-values)) (cell (map-empty)) (cell "") (cell 0) (cell false)
+             (cell @(. p def-slots)) (cell @(. p inits)) (cell false) (. p unwinding) (cell pb))))
+
+;; The bytes of a pointer of the program's layouts.
+(defun program-pb (p: Program) -> i64 @(. p pb))
 
 ;; Rust: program.rs:93 Program::g
 (defun program-g (p: Program) -> Globals

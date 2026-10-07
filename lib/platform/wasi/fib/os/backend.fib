@@ -1,0 +1,27 @@
+;; WASI implementation of the internal backend interface (docs/design/wasm.md): wasm32-wasip1 over wasi-libc. The platform layer (ADR 0011): the externs are here.
+;; What WASI lacks is an error, never a crash: sockets, pipes and the path of the executable answer ENOSYS, as the library's own callers expect of a refusal.
+;; wasi-libc's errno numbers are WASI's (ENOENT is 44, not 2); `errno` answers the Linux number of the same error, so the library's kinds and texts stay one table.
+(ns fib.os.backend (:require [fib.os.abi-data :as a]))
+(extern __errno_location :private () -> ptr)
+(extern readdir :private (ptr) -> ptr)
+(defun wasi-abi () -> a/Abi
+  (a/Abi 64 128 512 1024 2048 524288 -2 1
+         11 110 103 104 111 95 98
+         1 2 16384 10 false 65 8 9 1
+         115 4 39 21))
+(def abi: a/Abi (wasi-abi))
+(def platform-name: str "Wasi")
+;; The Linux number of a WASI errno; a number with no counterpart is passed on.
+(defun linux-errno :private (wasi: i64) -> i64
+  (cond (= wasi 44) 2 (= wasi 63) 1 (= wasi 2) 13 (= wasi 20) 17 (= wasi 28) 22 (= wasi 8) 9 (= wasi 27) 4 (= wasi 64) 32
+        (= wasi 54) 20 (= wasi 6) 11 (= wasi 73) 110 (= wasi 15) 104 (= wasi 13) 103 (= wasi 14) 111 (= wasi 3) 98
+        (= wasi 52) 38 (= wasi 55) 39 (= wasi 31) 21 (= wasi 48) 12 (= wasi 58) 95 (= wasi 75) 18 (= wasi 51) 28
+        (= wasi 76) 25 (= wasi 29) 5 (= wasi 70) 34
+        :else wasi))
+(defun errno () -> i64 (linux-errno (unsafe (sext i64 (load-i32 (__errno_location))))))
+(defun clear-errno () -> unit (unsafe (store-i32 (__errno_location) 0i32)))
+(defun directory-next (directory: ptr) -> ptr (unsafe (readdir directory)))
+(defun executable-path (buffer: ptr size: i64) -> i64 -38)
+(defun socket-new (family: i64) -> i64 -38)
+(defun socket-accept (fd: i64 address: ptr size: ptr) -> i64 -38)
+(defun pipe-cloexec (fds: ptr) -> i32 -38i32)

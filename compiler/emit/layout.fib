@@ -102,17 +102,22 @@
                  (Ok (conj rows (Variant (some (. v name)) tys)))))
              (Ok []) vs))))
 
-;; The size and alignment of an lIR type on the targets lIR supports.
-;; Rust: layout.rs:108 size_align
-(defun size-align (t: LirTy) -> (Pair i64 i64)
+;; The size and alignment of an lIR type on a target whose pointers are `pb` bytes (8: every target but wasm32's 4, docs/design/targets.md 3). `pb` is the
+;; program's (`emit.program/program-pb`); the host's is 8, which `emit.defs.jit` reads the JIT's memory by.
+(defun size-align-pb (pb: i64 t: LirTy) -> (Pair i64 i64)
   (match t
     ((LirI1) (Pair 1 1)) ((LirI8) (Pair 1 1)) ((LirI16) (Pair 2 2))
     ((LirI32) (Pair 4 4)) ((LirFloat) (Pair 4 4))
-    ((LirI64) (Pair 8 8)) ((LirDouble) (Pair 8 8)) ((LirPtr) (Pair 8 8)) ((LirRaw) (Pair 8 8))
-    ((LirDyn) (Pair 16 8))
+    ((LirI64) (Pair 8 8)) ((LirDouble) (Pair 8 8)) ((LirPtr) (Pair pb pb)) ((LirRaw) (Pair pb pb))
+    ((LirDyn) (Pair (* 2 pb) pb))
     ((LirVec _ _) (Pair (vec-mem-bytes t) 8))
-    ((LirOpt t) (let ((s (size-align t)))
+    ((LirOpt t) (let ((s (size-align-pb pb t)))
                   (Pair (round-up (+ (round-up 1 (. s snd)) (. s fst)) (. s snd)) (. s snd))))))
+
+;; The size and alignment of an lIR type on the host (8-byte pointers).
+;; Rust: layout.rs:108 size_align
+(defun size-align (t: LirTy) -> (Pair i64 i64)
+  (size-align-pb 8 t))
 
 ;; `off` rounded up to a multiple of `a` (Rust's `div_ceil(a) * a`).
 (defun round-up :private (off: i64 a: i64) -> i64
