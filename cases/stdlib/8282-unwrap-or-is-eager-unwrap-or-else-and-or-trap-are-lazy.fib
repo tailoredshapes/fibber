@@ -1,0 +1,33 @@
+;; spec: spec/stdlib.md section 4.3 rows `unwrap-or` (eager: a function), `unwrap-or-else` (new, lazy) and `or-trap` (new, a macro); section 4.2 row `or` (lazy, Clojure's text)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; Package FOLLOWUP-1: `(unwrap-or o (trap "msg"))` always traps, because unwrap-or is a function and its default is evaluated before the call. Pinned: that eagerness (the counter
+;; `n` goes up for a `some` too, which is the reason the lazy forms exist), `unwrap-or-else` runs its thunk only for nil, `or-trap` evaluates o once and its message only for nil and
+;; traps with that message, and `or` of an Option and a trap stays lazy.
+(ns main (:use tl.check fib.ex))
+
+(defun trap-message (f: (fn () i64)) -> str (try (do (f) "no trap") (catch e (ex-message e))))
+
+(defun main () -> i64
+  (let ((c (checks)) (n (cell 0)) (m (cell 0)) (k (cell 0)) (o (cell 0)))
+    (do (check c (= (unwrap-or (some 5) (do (set! n (+ @n 1)) 9)) 5))
+        (check c (= @n 1))
+        (check c (= (unwrap-or-else (some 5) (fn () (do (set! m (+ @m 1)) 9))) 5))
+        (check c (= @m 0))
+        (check c (= (unwrap-or-else (parse-long "x") (fn () (do (set! m (+ @m 1)) 9))) 9))
+        (check c (= @m 1))
+        (check c (= (unwrap-or-else (parse-long "12") (fn () (trap "never"))) 12))
+        (check c (= (trap-message (fn () (unwrap-or-else (parse-long "x") (fn () (trap "no number"))))) "no number"))
+        (check c (= (or-trap (some 3) (do (set! k (+ @k 1)) "never")) 3))
+        (check c (= @k 0))
+        (check c (= (or-trap (parse-long "41") "never") 41))
+        (check c (= (trap-message (fn () (or-trap (parse-long "x") (do (set! k (+ @k 1)) "expected a number")))) "expected a number"))
+        (check c (= @k 1))
+        (check c (= (trap-message (fn () (or-trap (parse-long "x") (str "bad " "input")))) "bad input"))
+        (check c (= (or (parse-long "7") (do (set! o (+ @o 1)) 0)) 7))
+        (check c (= @o 0))
+        (check c (= (trap-message (fn () (or (parse-long "x") (trap "or traps")))) "or traps"))
+        (checks-result c))))
