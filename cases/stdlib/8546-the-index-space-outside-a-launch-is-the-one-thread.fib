@@ -2,9 +2,14 @@
 ;; expect: accept
 ;; result: 7
 ;; audit:  clean
-;; Outside `host-launch` a kernel is its thread (0,0,0) of a 1x1x1 grid: the ids are 0, the sizes 1, `global-id` 0 (gpu.md 3.5); 1 + 0+0+0 + 1+1+1 + 1+1+1 + 0+0+0 = 7, after a barrier that returns.
+;; Outside `host-launch` a kernel is its thread (0,0,0) of a 1x1x1 grid: the ids are 0, the sizes 1, `global-id` 0 (gpu.md 3.5); 1 + 0+0+0 + 1+1+1 + 1+1+1 + 0+0+0 = 7, after a barrier that returns,
+;; a `gpu/host-index-set!` of the local id 1 to 5 and back to 0 (what `host-launch` does), and `gpu/program-ptx`, which is "" under `fibc run` (no kernel target).
 (ns main (:require [fib.gpu :as gpu]))
 (defun main () -> i64
   (do (gpu/barrier)
+      (gpu/host-index-set! 0 1 5)
+      (when (not (= (gpu/local-id 1) 5)) (trap "host-index-set! did not set the local id"))
+      (gpu/host-index-set! 0 1 0)
+      (when (not (= (str-len (gpu/program-ptx)) 0)) (trap "program-ptx is not empty without a kernel target"))
       (+ 1 (gpu/local-id 0) (gpu/local-id 2) (gpu/group-id 1) (gpu/group-size 0) (gpu/group-size 1) (gpu/group-size 2)
          (gpu/num-groups 0) (gpu/num-groups 1) (gpu/num-groups 2) (gpu/global-id 0) (gpu/global-id 1) (gpu/global-id 2))))
