@@ -12,8 +12,10 @@ if [ -z "$chrome" ]; then for c in chromium google-chrome chromium-browser /snap
 [ -n "$chrome" ] || { echo "browser.sh: no chromium (set CHROMIUM)" >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "browser.sh: no python3 for the http server" >&2; exit 2; }
 command -v node >/dev/null 2>&1 || { echo "browser.sh: no node for the devtools client" >&2; exit 2; }
-xvfb=; command -v xvfb-run >/dev/null 2>&1 && xvfb="xvfb-run -a"
-T=$(mktemp -d "${TMPDIR:-/tmp}/fib-webgpu-browser.XXXXXX"); trap 'kill $pid $srv 2>/dev/null; sleep 0.5; rm -rf "$T"' EXIT
+xvfb=; command -v xvfb-run >/dev/null 2>&1 && xvfb="env TMPDIR=/tmp xvfb-run -a"   # its auth file must be where the snap can read it
+# The temporary directory is under /tmp whatever TMPDIR says: a snap-confined Chromium cannot read a dot-directory of $HOME (its profile would fall
+# back to the default one and its singleton lock). Chromium is killed by its devtools port (xvfb-run is a wrapper: killing it leaves the browser).
+T=$(mktemp -d "/tmp/fib-webgpu-browser.XXXXXX"); trap 'pkill -f "remote-debugging-port=$dev" 2>/dev/null; kill $srv 2>/dev/null; sleep 0.5; rm -rf "$T"' EXIT
 cp "$here/browser.html" "$here/fib-webgpu.mjs" "$T/"; cp "$wasm" "$T/host.wasm"; cp "$wgsl" "$T/kernels.wgsl"
 port=$((20000 + RANDOM % 20000)); dev=$((port + 1))
 (cd "$T" && python3 -m http.server "$port" --bind 127.0.0.1 > "$T/server.log" 2>&1) & srv=$!
