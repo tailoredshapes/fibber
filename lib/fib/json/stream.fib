@@ -110,11 +110,12 @@
   (match (os/open-file path (os/default-file-options))
     ((Err e) (Err (io-error (. e message))))
     ((Ok fd)
-     (let [res (loop [acc init rest: (Array i8) (array 0 0i8)]
-                 (match (read-split fd rest 4000000)
+     (let [res (loop [acc init rest: (Array i8) (array 0 0i8) size 4000000]
+                 (match (read-split fd rest size)
                    ((Err e) (Err e))
-                   ((Ok c) (let [acc2 (fold-chunk (. c head) (. c bytes) (. c from) (. c to) o g f acc)]
-                             (if (. c eof) (Ok acc2) (recur acc2 (. c rest)))))))]
+                   ((Ok c) (let [acc2 (fold-chunk (. c head) (. c bytes) (. c from) (. c to) o g f acc)
+                                 avg (quot (. c to) (max 1 (count-newlines (. c bytes) (. c to))))]
+                             (if (. c eof) (Ok acc2) (recur acc2 (. c rest) (min 268435456 (max 4000000 (* 32 avg)))))))))]
        (do (os/close-fd fd) res)))))
 
 ;; ---- the lazy seq of documents
