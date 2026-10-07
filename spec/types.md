@@ -1121,7 +1121,7 @@ work on the copy. A shared array is therefore never written.
 | Primitive | Result | On the array in the cell |
 |---|---|---|
 | `(array-take! &c i)` | element `i`, owned | `i` is range-checked (`fib.trap-index` outside `0 .. len`). For an element that is an object pointer the slot is set to null and the count moves to the result, with no retain. For a scalar element the value is read and the slot is unchanged. For a `dyn` element the value is retained and the slot is unchanged |
-| `(array-push! &c x)` | `unit` | appends `x` (a store, E2) and adds one to `len`. In place iff the array is unique and `ROOMY` (§8.2) with `len < 32` (`fib.array-roomy?`). Otherwise a copy takes the cell, made by `fib.array-room`: for `len < 32` a block with room for 32 elements, flagged `ROOMY`; for `len >= 32` a block of exactly `len + 1` elements, not flagged. Elements of the copy are retained |
+| `(array-push! &c x)` | `unit` | appends `x` (a store, E2) and adds one to `len`. In place iff the array is unique and `ROOMY` (§8.2) and has a free slot (`fib.array-roomy?`: `len < 32`, or `len` is not a power of two). Otherwise a copy takes the cell, made by `fib.array-room`: a block flagged `ROOMY` whose capacity is the smallest power of two at or above `max(len + 1, 32)`, so a loop of pushes copies at 32, 64, 128, .. and is linear (before LIBFIX-1 a block of `len >= 32` got exactly `len + 1` elements, no flag, and every push copied: quadratic). Elements of the copy are retained. **When a push copies:** the array is shared (`SHARED`, count above 1, `HAS-WEAK`, `STACK`, `IMMORTAL`), or it did not come from `array-push!` (a fresh `array`, `array-with`, `array-copy`, a slice: one copy at the first push, then in place), or `len` is a power of two at or above 32. The capacity is not stored: it is a function of `len` and `ROOMY`, and `array-pop!` only shortens `len`, so the block is never smaller than the function says |
 | `(array-pop! &c)` | the last element, owned | traps with `array-pop! on an empty array` when `len` is 0. Otherwise `len` is reduced by one and the last element is returned, moved out of the array that was in the cell (a unique one, or the copy made when it was not; the copy retained every element, so the old array keeps its own count) |
 | `(cell-update! c f)` | `unit` | `c` is a `Cell`, not an `&` position, and `f : (fn :send (a) a)`. The content is moved out of the cell, `f` is called on it as an owned argument and its result is stored into the cell without a retain. For an object-pointer content the cell holds null while `f` runs, so a value only the cell held reaches `f` with count 1. For a `dyn` content the value is retained for the call and the old reference released after it. A cell of `unit` content is refused at lowering (`cell-update! on a cell of unit`) |
 
@@ -1134,7 +1134,7 @@ taken slot would read null; no library function does it, and it is the
 caller's obligation, not checked.
 
 **The `ROOMY` flag.** Bit 4 of the header flags word (value 16, §8.2). It says
-"this block was allocated with room for 32 elements, `len` of them in use".
+"this block was allocated with room for `max(32, 2^ceil(log2 len))` elements, `len` of them in use".
 Only `fib.array-room` sets it, so only the growth path of `array-push!` does;
 `array`, `array-with`, `array-copy` and the copy of `array-set!`, `array-take!` and
 `array-pop!` leave it clear. `fib.unique?` masks bits 0 to 3 and so ignores
@@ -3512,8 +3512,8 @@ flags: bit 0 SHARED    counts are atomic from now on (§7)
        bit 2 STACK     a scope-local object: retain/release are no-ops (§6.11)
        bit 3 IMMORTAL  static data: literals and everything reachable from them,
                        def values (syntax §3.19), named-function closures, vtables
-       bit 4 ROOMY     an array block with room for 32 elements, len of them in use
-                       (§2.13.1); set only by fib.array-room, the growth path of
+       bit 4 ROOMY     an array block with room for max(32, the power of two at or above
+                       len) elements, len of them in use (§2.13.1); set only by fib.array-room, the growth path of
                        array-push!; no test of the other bits reads it (fib.unique?
                        masks bits 0 to 3)
 ```
@@ -4220,7 +4220,7 @@ quantum.
 | `&` copy-in | at call entry, after every argument, in parameter order: `fib.retain` the variable's content and store it into the private cell (§6.6), or, for a taken `&b` (§6.6), store it without the retain; nothing for a forwarded `&v` (§6.10 rule (b)), nor for the `&` operand of `array-set!` or `set-field!`, which update the variable's own cell (§2.13) |
 | `&` write-back | store the private cell's content into the variable; `fib.release` the variable's old content, unless the copy-in took it (§6.6) |
 | `array-set!`, `set-field!` | `fib.unique?` test (flags first, `HAS-WEAK` among them, then the count, §8.2); in-place write, or copy + store + `fib.release` old |
-| `array-take!`, `array-push!`, `array-pop!` | the same test on the array in the `&` cell (`array-push!` tests `fib.array-roomy?`: unique, `ROOMY`, `len < 32`); on failure a copy is stored and the old array released; then the element moved out (null left in the slot of an object element), or appended with `len` increased, or `len` decreased and the last element returned (§2.13.1) |
+| `array-take!`, `array-push!`, `array-pop!` | the same test on the array in the `&` cell (`array-push!` tests `fib.array-roomy?`: unique, `ROOMY`, and a free slot: `len < 32` or `len` not a power of two); on failure a copy is stored and the old array released; then the element moved out (null left in the slot of an object element), or appended with `len` increased, or `len` decreased and the last element returned (§2.13.1) |
 | `cell-update!` | load the content of the cell, store null there (object content) or retain it (`dyn`), call `f` with it owned, store the result without a retain (§2.13.1) |
 | static objects: the type table, literals, named-function closures, vtables | lIR `constant`s with `count` 0 and `IMMORTAL` in their headers, referring to each other by address (§8.2, §8.3, §8.4, §8.5); no module initialiser, nothing runs before `main` |
 | `def` initialisation | the constant expression is evaluated at compile time — its literal parts folded, the prelude calls of the collection-literal rewrite (`conj`, `assoc`, syntax §1.4) run through the JIT that runs macros (ROADMAP, M4) — and the resulting graph, `def`s in source order, is emitted as static objects as above (syntax §3.19); `fib.immortalise` is then the interpreter's only (**Decided**, owner, 2026-09-28, lir.md §14 item 3) |
