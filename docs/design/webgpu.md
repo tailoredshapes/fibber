@@ -15,51 +15,57 @@ A kernel target (gpu.md 4.1) whose output is WGSL, the shading language of WebGP
 --emit wgsl FILE -o K.wgsl` lowers the program as usual, keeps its kernels and what they reach (the same kernel module `native.kernel`
 extracts for PTX) and prints that module as WGSL compute shaders. LLVM has no WGSL backend, so this row is the first whose code generator
 is a printer of lIR (as `lir2js` is for JavaScript, compiler/js/) and not an LLVM machine: `--emit llvm/asm/obj/ptx` are refused on it.
-The WGSL is run by a driver of the `Device` protocol: `fib-gpu-webgpu` over wgpu-native on the native host (Vulkan here; Metal, D3D12, GL
+The WGSL is run by a driver of GPU-2's `fib.gpu.device` protocols (lib/fib/gpu/device.fib): `fib-gpu-webgpu` over wgpu-native on the native host (Vulkan here; Metal, D3D12, GL
 elsewhere), or the JavaScript glue `fib-webgpu.mjs` over `navigator.gpu` for a fibber program built for wasm32 (Dawn under node, a
 browser). The point: the same `defkernel`, three machines (the CPU, CUDA, WebGPU), one result.
 
 ## 2. What was measured
 
 `scripts/webgpu-agree.sh --browser`, the one-language guard: examples/webgpu/kernels.fib (vector add in f32 and i32, the register-tiled
-f32 GEMM of gpu.md with i32 indices, a device assert) run on every backend, each run printing the FNV-1a hash of its result:
+f32 GEMM of gpu.md with i32 indices, the same GEMM through block-shared memory, a device assert) run on every backend, each run printing the FNV-1a hash of its result:
 
 ```
-cpu: gemm 256 2053739098;vadd 1048576 4050346011;vaddi 1048576 925329787;
-ok   cuda (PTX, fib-gpu-cuda): vadd, vaddi, gemm hash as the CPU's (device: NVIDIA GeForce RTX 4080 SUPER sm_89)
+cpu: gemm 256 2053739098;gemm-smem 256 2053739098;vadd 1048576 4050346011;vaddi 1048576 925329787;
+ok   cuda (PTX, fib-gpu-cuda): vadd, vaddi, gemm hash as the CPU's (device: NVIDIA GeForce RTX 4080 SUPER)
 ok   webgpu native (WGSL, fib-gpu-webgpu over wgpu-native): vadd, vaddi, gemm hash as the CPU's (device: NVIDIA GeForce RTX 4080 SUPER (610.57.04, Vulkan))
 ok   webgpu node (WGSL, the wasm host, Dawn): vadd, vaddi, gemm hash as the CPU's (device: nvidia lovelace nvidia-geforce-rtx-4080-super ..)
 note webgpu chromium (WGSL, the wasm host in the browser): vadd and vaddi hash as the CPU's; the GEMM differs (an unfused fma on this host: device: google swiftshader): gemm 256 906634477
 webgpu-agree: every run made agrees with the CPU
 ```
 
-The GEMM is bit for bit the CPU's `fma` chain through CUDA, through wgpu-native and through Dawn on the NVIDIA GPU; on SwiftShader (the
-CPU Vulkan Chromium fell back to, section 6.3) it differs because WGSL's `fma` is "inherited from `x * y + z`" in the specification's
+(The ok lines compare the whole set, `gemm-smem` included.) The GEMMs are bit for bit the CPU's `fma` chain through CUDA, through wgpu-native and through Dawn on the NVIDIA GPU; on SwiftShader (the
+CPU Vulkan Chromium fell back to, section 6.2) it differs because WGSL's `fma` is "inherited from `x * y + z`" in the specification's
 accuracy table: a host may or may not fuse it. The agreement test therefore demands bit equality of vadd and vaddi and reports the GEMM's
 state per host; a kernel that needs a fused multiply-add on every WebGPU host must compute it another way (section 3.5).
 
-The device assert: `assert-positive` on an input with a zero makes `sync` return `Err -20 a kernel trapped` on wgpu-native, under Dawn and in
-Chromium; on a positive input `Ok` (examples/webgpu/host.fib prints both).
+The device assert: `assert-positive` on an input with a zero makes `stream-sync` return the `:device-trap` Err on wgpu-native, under Dawn and in
+Chromium; on a positive input `Ok` (examples/webgpu/hostrun.fib prints both).
 
-`fib-gpu-webgpu/examples/bench.fib` on wgpu-native over Vulkan, the wall clock around launch and sync (the driver has no timestamp queries
-yet; the submit is in the number), median of 5 (3 at 4096), every result bit exact against the CPU:
+`fib-gpu-webgpu/examples/bench.fib` on wgpu-native over Vulkan, through the protocols, the wall clock around launch and sync (the driver has no
+timestamp queries yet; the submit is in the number), median of 5 (3 at 4096), every result bit exact against the CPU. The box is shared (a streaming
+server and other agents use the GPU), so each number is the best of the runs with the GPU idle (`nvidia-smi` 0%); the spread of those runs is in brackets:
 
 | | WebGPU (WGSL, wgpu-native/Vulkan) | CUDA (PTX, fib-gpu-cuda, GPU events; gpu.md 2) | WebGPU / CUDA |
 |---|---:|---:|---:|
-| vector add, 2^24 f32 | 0.52 ms, 384 GB/s | 0.32 ms, 626 GB/s | 61% |
-| gemm 1024 | 0.366 ms, 5.9 TFLOPS | 0.264 ms, 8.1 | 72% |
-| gemm 2048 | 1.96 ms, 8.8 TFLOPS | 1.61 ms, 10.6 | 83% |
-| gemm 4096 | 14.3 ms, 9.6 TFLOPS | 12.6 ms, 10.9 | 88% |
-| upload (queue.writeBuffer) | 5.3 GB/s | 13.6 to 15.7 GB/s | |
-| download (a mapped staging copy) | 0.28 GB/s | 0.4 to 2.4 GB/s | |
+| vector add, 2^24 f32 | 0.41 ms, 488 GB/s [384 to 488] | 0.32 ms, 626 GB/s | 78% |
+| gemm 1024 | 0.37 ms, 5.9 TFLOPS [5.0 to 5.9] | 0.264 ms, 8.1 | 72% |
+| gemm 2048 | 1.96 ms, 8.8 TFLOPS [8.6 to 8.8] | 1.61 ms, 10.6 | 83% |
+| gemm 4096 | 14.3 ms, 9.6 TFLOPS [9.1 to 9.6] | 12.6 ms, 10.9 | 88% |
+| gemm_smem 1024 (shared memory) | 2.8 ms, 0.77 TFLOPS | 12.6 (CUDA C and fibber, GPU-2) | 6% |
+| upload (queue.writeBuffer) | 5.3 to 6.2 GB/s | 13.6 to 15.7 GB/s | |
+| download (a mapped staging copy) | 0.25 to 0.6 GB/s | 0.4 to 2.4 GB/s | |
 
 Why the gap, honestly: (a) the clock: CUDA's numbers are GPU events around the launch, WebGPU's are the wall clock around submit, poll and
-the flag read, which is most of the 0.2 ms difference at 1024 and all of vadd's; (b) the code: WGSL goes through naga to SPIR-V and the
-NVIDIA Vulkan compiler, PTX through LLVM's NVPTX backend and the NVIDIA assembler; the GEMM's inner loop is the same 16 fused multiply-adds
-and 8 loads per k, and the per-load `switch` on the buffer number (section 3.3) folds away after inlining (the 9.6 TFLOPS say so: a real
-switch per load would halve it); (c) the transfers: `queue.writeBuffer` copies through a staging ring, and the download maps a fresh staging
-buffer each time (a persistent one is the fix, as pinned memory is CUDA's). The shared-memory version of the GEMM (gpu.md 6.3) would move
-both backends; WGSL has `var<workgroup>` ready for it (section 3.6).
+the flag read, which is most of the 0.1 ms difference at 1024 and a good part of vadd's; (b) the code: WGSL goes through naga to SPIR-V and the
+NVIDIA Vulkan compiler, PTX through LLVM's NVPTX backend and the NVIDIA assembler; the register-tiled GEMM's inner loop is the same 16 fused
+multiply-adds and 8 loads per k, and the per-load `switch` on the buffer number (section 3.3) folds away after inlining (the 9.6 TFLOPS say so: a real
+switch per load would halve it); (c) the transfers: `queue.writeBuffer` copies through a staging ring, and the download maps a fresh staging buffer each
+time (a persistent one is the fix, as pinned memory is CUDA's). **The shared-memory GEMM is the one that does not follow:** 0.77 TFLOPS through WGSL where
+the same fibber kernel is 17 TFLOPS on CUDA, 20 times slower than the register-tiled kernel in the same module. The cause is not measured; the
+hypotheses, in the order of cost to test: the loop-and-switch form of the kernel (a state machine over `L` that the driver's compiler cannot unroll, where LLVM's
+PTX gets plain loops), the `Ptr` switch in the shared accesses (the pointers reach `load-slices` and `f32-at` as parameters; if the driver does not inline
+them the switch is real), and the cells (16 `var`s the driver must promote to registers across the state machine). Structured printing of loops (the
+relooper, section 9) is the fix that tests the first and the likeliest.
 
 ## 3. The mapping: the kernel subset to WGSL
 
@@ -154,7 +160,7 @@ Err naming the parameter" holds; the PTX path still lacks it.
 WGSL has no trap. A fibber `trap` (and the checked `+`/`*` that overflow, the index check) reaches the kernel module as a call of the
 runtime's trap entry, which the extractor rewrites to `(trap)`. The printer makes it `fibw_trap()`: the private `fibw_trapped` is set, the
 flag buffer's word is `atomicStore`d to 1, the function returns its type's zero, and every caller returns after a call that may trap. The
-driver zeroes the flag before every dispatch and reads it after the queue completes (`sync`): a set flag is `Err -20`, the same contract as
+driver zeroes the flag before every dispatch and reads it after the queue completes (`stream-sync`): a set flag is the `:device-trap` Err, the same contract as
 CUDA's `trap;` (gpu.md 3.4), with one difference that is better: the device and its buffers are intact afterwards (CUDA loses the context).
 Checked arithmetic: WGSL's i32 `+` wraps; the printer's `fibw_sadd_ovf` computes the wrapped sum and the overflow bit from the signs, as LLVM's
 intrinsic would, so an overflow is a trap here as on the CPU and on CUDA (`vaddi` carries one; the planted fault "wrap-on-overflow not
@@ -168,22 +174,36 @@ fibber's `simd/fma` promises one rounding (ADR 0008; a CPU without FMA traps). T
 `fma(..)`; whether it is fused is the host's; a kernel that must be bit-exact across WebGPU hosts uses `simd/muladd` in its meaning (either
 rounding) and compares with a tolerance, as gpu.md 2.1 derives one for sums in another order. The agreement test encodes this.
 
-### 3.6 Not in this target yet, with the mapping ready
+### 3.6 Block-shared memory, scalar cells, and the uniformity rules (built after GPU-2's lIR forms)
 
-* **Shared memory** (gpu.md 6.3, `(gpu/shared T N)`): a `var<workgroup> name: array<T, N>` at module scope, one per kernel and declaration,
-  and a `Ptr` whose `buf` names it (a third kind of buffer number in the load/store switch, with no bounds concern: a fixed array). When the
-  lIR form lands (`(global shared ..)` in address space 3 for NVPTX), the printer maps the global's name to the `var<workgroup>` and
-  `addrspacecast` to a `Ptr` of that kind: about 40 lines.
-* **The barrier under divergence**: WGSL's uniformity analysis (Tint enforces it; naga is laxer) refuses `workgroupBarrier()` under control
-  flow it cannot prove uniform. The loop-and-switch form hides the structure from the analysis: a kernel with a barrier inside a loop may be
-  refused by Tint although it is uniform. The fix is structured printing of single-entry regions (the relooper's job); gpu.md 6.2's checker
-  rule ("a barrier is not under an index-dependent condition") is the source-level half.
+* **Shared memory** (`gpu/shared :f32 N`, GPU-2's `(global shared NAME [N x T] ..)`): a `var<workgroup> fibw_shK: array<u32, N>` at module scope for each
+  shared global (WGSL zero-initialises workgroup memory, as the lIR global's `zeroinitializer` says), and a `Ptr` whose `buf` is `16 + K` (`SHARED-BASE`):
+  the load/store switch gets a case for each, so a pointer passed to a device function (`load-slices as bs ..`) loads and stores like a storage buffer.
+  Only 32-bit words (f32 or i32) are taken; another element type is refused by name. `examples/webgpu/kernels.fib` has GPU-2's shared-memory GEMM over
+  i32 (`gemm_smem`, 64x64 tiles, 256 threads, two barriers per slice): it is `gemm`'s result bit for bit on the CPU, CUDA, wgpu-native, Dawn.
+* **Scalar cells.** A kernel may hold `(cell 0.0f32)` (a stack slot, spec/types.md 6.11): the emitter writes `alloca %struct.fib.cell.float`, the
+  `fib.stack-init`/`fib.stack-end` calls and a `getelementptr` to the value. The printer makes the alloca a `var` of the element type, drops the header and the two calls
+  (the functions are not printed), and a `getelementptr` of a cell struct over a cell alloca is the variable itself.
+* **The barrier and WGSL's uniformity analysis.** Dawn's Tint refuses a `workgroupBarrier()` that it cannot prove is in uniform control flow (naga does not).
+  Three things in the printer exist for it, each found by Tint's own diagnostic on `gemm_smem`: (1) a function has one exit: a looped function breaks out of
+  its `loop` to a single `return fibw_r;` (`L = 0xffffffffu; continue;` replaces a `return` inside the loop), because a `return` under control flow Tint
+  cannot prove uniform makes everything after the call non-uniform; (2) a function that reaches a barrier makes no early exit after a call that may trap
+  (the check reads `fibw_trapped`, a private variable, which Tint takes as non-uniform): the callee's trap exits the callee, the flag is set, the caller goes on
+  and the results are void; (3) a branch whose condition is a constant is not printed: the runtime guards a checked division by a constant with
+  `(icmp eq (i32 16) (i32 -1))`, a variable to Tint, and `and`-ed with a test of `local_invocation_id`, which is non-uniform. The rule that remains: a barrier
+  in a function whose control flow before it depends on thread-varying data (a data-dependent `trap` path, an early `return`) is refused by Tint
+  (the error is Dawn's, `the WGSL does not compile`, with the line); gpu.md 6.2's checker rule, "a barrier is not under an index-dependent condition", is its
+  source-level half.
 * **Atomics**: `atomicAdd`, `atomicMax` .. on `atomic<i32>`/`atomic<u32>` in storage and workgroup memory; lIR's `atomicrmw` maps one to one
   once a buffer can be declared `array<atomic<u32>>` (the printer would need the element type per buffer: a kernel attribute, or the
-  signature's `atomic ptr`).
+  signature's `atomic ptr`). Not built.
 * **f16**: behind WebGPU's `shader-f16` feature (`enable f16;` in the WGSL, `requiredFeatures` at device creation); lIR has no half type
-  (gpu.md 6.5); when it has, `half` is `f16` here, with the feature requested by the driver when the WGSL enables it.
-* **64-bit**: never; an i64 kernel is refused by name, and the design accepts it: GPU index arithmetic is 32-bit anyway (CUDA's `int` too).
+  (gpu.md 6.5); when it has, `half` is `f16` here, with the feature requested by the driver when the WGSL enables it. Design only.
+* **64-bit**: never; an i64 kernel is refused by name. Index arithmetic is the one place i64 shows (GPU-2's `gpu/global-id` and the `ptr+` offset are i64): the
+  printer takes a `trunc i32` of an i64 `+ - * <<` expression in 32-bit arithmetic (the low 32 bits of those depend only on the low 32 bits: exact), a
+  `sext` of an i32 as a `ptr+` offset as a u32 byte count, and an `icmp` of two i64 literals (the dimension select of the builtins) as a constant. A kernel
+  that keeps an i64 in a variable, compares it, passes it or takes it as a parameter is refused. So kernels for every backend index with i32
+  (`(trunc i32 (gpu/global-id 0))`: examples/webgpu/gpu32.fib), and fib.gpu.contract's own kernels (`n: i64`) are not WGSL kernels.
 
 ## 4. The compiler changes
 
@@ -203,31 +223,38 @@ Nothing above the lIR changed; the kernel module is byte for byte the one PTX ta
 
 ## 5. The hosts and their drivers
 
+Both drivers implement GPU-2's `fib.gpu.device` protocols (`Platform Device Module Kernel Buffer Stream Event`, lib/fib/gpu/device.fib) under the same
+`ns webgpu` and the same `(platform)`, so one host program (examples/webgpu/hostrun.fib, over `(dyn Platform)`) drives the CUDA driver, the wgpu-native driver
+and the JavaScript driver. The launch ABI is GPU-2's: the WGSL carries `// fib.kernel-sig NAME: KIND..` lines, which `signatures-of`, `check-args` and
+`check-dims` of fib.gpu.device read and apply; the error kinds are the protocol's (`:no-device :invalid-ptx :not-found :out-of-memory :lent :released
+:arguments :launch :device-trap :driver :invalid-argument`; `:invalid-ptx` is the protocol's name for "the kernel source is invalid", WGSL here).
+
 ### 5.1 The wasm/JS host: `examples/webgpu/js/`
 
-A fibber program built for wasm32-wasi (`--export run`: a reactor) requires the module `webgpu` of examples/webgpu/js/webgpu.fib: the
-`Device` protocol as fibber over twelve externs `fib_gpu_*` declared `:lib "js"`, which the module imports from `env`. The glue
-`fib-webgpu.mjs` provides them (`wasmImports(fibGpu, memory)`) over a `FibGpu` class that is the driver in JavaScript (open, loadWgsl with an
+A fibber program built for wasm32-wasi (`--export run`: a reactor) requires the module `webgpu` of examples/webgpu/js/webgpu.fib: the protocols as
+fibber over twelve externs `fib_gpu_*` declared `:lib "js"` (native.linkwasm: `--allow-undefined`), which the module imports from `env`. The glue
+`fib-webgpu.mjs` provides them (`wasmImports(fibGpu, memory)`) over a `FibGpu` class that is the driver's JavaScript half (open, loadWgsl with an
 explicit bind group layout, kernel, buffer, upload with `queue.writeBuffer`, download through a staging copy and `mapAsync`, launch with the
-uniform written, the flag zeroed, the bind group, the dispatch, sync with `onSubmittedWorkDone` and the flag read). WebGPU is asynchronous
+uniform written, the flag zeroed, the bind group, the dispatch, sync with `onSubmittedWorkDone` and the flag read). The ownership state (lent,
+released) and the signature check are on the fibber side, as in the other drivers. WebGPU is asynchronous
 and a wasm import is a call: the asynchronous imports (`open`, `load`, `download`, `sync`) are `WebAssembly.Suspending` and the export is
 called through `WebAssembly.promising`: JavaScript Promise Integration, in node 24+ and Chrome 137+ (checked: node v26.10.0, Chromium 153).
 Without it the program would need a worker and `Atomics.wait`. Errors never cross into the module as exceptions: every import answers a
-status and keeps its text for `fib_gpu_error`; a host without `navigator.gpu`, without an adapter or without a device makes `open` an `Err`
-(`-2`, `-3`, `-4`) and the fibber program decides. `run.mjs` runs the host under node, taking `navigator.gpu` from the `webgpu` npm package
-(Dawn, with Tint's validation at pipeline creation: the second validator); `browser.html` + `browser.sh`/`browser.mjs` run it in Chromium
-headless with a 40-line WASI shim (the eight calls the runtime makes) and the DevTools protocol relaying the console.
+status and keeps its text for `fib_gpu_error`; a host without `navigator.gpu`, without an adapter or without a device makes `platform-open` the `:no-device`
+Err (status `-2`, `-3`, `-4`) and the fibber program decides. `run.mjs` runs the host under node, taking `navigator.gpu` from the `webgpu` npm package
+(Dawn); `browser.html` + `browser.sh`/`browser.mjs` run it in Chromium headless with a 40-line WASI shim (the eight calls the runtime makes) and the
+DevTools protocol relaying the console; `validate.mjs` compiles a WGSL file with Tint and prints its messages in full.
 
 The ABI of the imports (all i32, so no BigInt crosses): `fib_gpu_open() fib_gpu_close() fib_gpu_name(buf cap) fib_gpu_error(buf cap)
 fib_gpu_load(wgsl len) -> module fib_gpu_kernel(module name len) -> kernel fib_gpu_buffer(bytes) -> buffer fib_gpu_upload(buffer ptr bytes)
 fib_gpu_download(buffer ptr bytes) fib_gpu_launch(kernel gx gy gz bx by bz args n) fib_gpu_sync() fib_gpu_release(buffer)`; a launch's
-arguments are a table of 8 bytes each, a kind (0 buffer, 1 i32, 2 f32) and the value's 32 bits.
+arguments are a table of 8 bytes each, a kind (0 buffer, 1 i32 or bool, 2 f32) and the value's 32 bits.
 
 ### 5.2 The native host: `fib-gpu-webgpu` over wgpu-native
 
-The same `ns webgpu` with the same functions, over wgpu-native v29.0.1.1 (`libwgpu_native.so`, `webgpu.h`): a host program `(:require
-[webgpu :as g])` builds against either driver by its `-I` path (examples/webgpu/host.fib is built both ways). The driver is 300 lines of
-fibber (the protocol, the ownership rules, the signature check, the trap flag, Results) over a C shim of 200 lines (`shim/fibwgpu.c`,
+The same `ns webgpu` and `(platform)`, over wgpu-native v29.0.1.1 (`libwgpu_native.so`, `webgpu.h`), v0.1.0 in its own repository: a host program
+`(:require [webgpu :as g])` builds against either driver by its `-I` path (examples/webgpu/host.fib is built both ways). The driver is 330 lines of
+fibber (the protocol instances, the ownership rules, the trap flag, Results) over a C shim of 220 lines (`shim/fibwgpu.c`,
 `libfibwgpu.so`, `:lib "fibwgpu"`), and the shim is the honest delta of this package:
 
 * **Callbacks.** webgpu.h's asynchronous calls (`wgpuAdapterRequestDevice`, `wgpuBufferMapAsync`, `wgpuDevicePopErrorScope`) deliver to a C
@@ -240,24 +267,29 @@ fibber (the protocol, the ownership rules, the signature check, the trap flag, R
   with `WGPUStringView` pairs and `nextInChain` extensions) whose layouts move between releases: writing them from fibber by byte offsets is
   possible and brittle; the shim fills them from the header. This is `fibgen`'s job (a header to externs and layouts) once it is ported.
 * **Synchronous waits.** wgpu-native v29 has no `wgpuInstanceWaitAny` (it panics "not implemented"): the shim uses the fact that wgpu-core is
-  synchronous (a device request and an error-scope pop deliver inside the call) and `wgpuDevicePoll(wait)` for a map and for `sync`.
-  `WGPU_BACKEND=vulkan|gl|metal|dx12` limits the backends (`WGPUInstanceExtras`): a backend the host lacks is "no adapter", `Err -2`.
+  synchronous (a device request and an error-scope pop deliver inside the call) and `wgpuDevicePoll(wait)` for a map and for `stream-sync`.
+  `WGPU_BACKEND=vulkan|gl|metal|dx12` limits the backends (`WGPUInstanceExtras`): a backend the host lacks is no adapter, `:no-device`.
+  A workgroup over the device's 256 invocations is refused by the driver first: wgpu-native v29 reports an invalid pipeline override late and the dispatch then never completes.
 
-The contract (`scripts/test.sh --plant`, on this machine): vadd, vaddi and the GEMM bit exact, the assert's two paths; 16 checks of
-`specs/ownership-spec.fib` (lent-buffer misuse, release twice, use after release, the three signature mismatches naming the parameter, a
-block over WebGPU's 256 invocations, an empty grid, a kernel the module lacks, an oversize download, a zero-byte buffer, a WGSL that does
-not compile: each an `Err`); `WGPU_BACKEND=metal` on Linux is `Err -2` from `open`, exit 2, no trap; three planted faults caught (the lent
-check removed: the spec fails; the flag never read: the assert check fails; the block size ignored: a hash differs). The loader caveat of
-gpu.md 7 applies: a missing `libwgpu_native.so` fails before `main` (the dynamic loader's message), not as an `Err`.
+The contract: `fib.gpu.contract` cannot run on a WGSL driver as it is: its kernels take `n: i64` and WGSL has no 64-bit integer. The driver's
+`specs/ownership-spec.fib` is its i32 flavour: the contract's scenarios (the device says what it is, vector add bit for bit, the lent rules, the
+launch checks, an allocation beyond memory is `:out-of-memory`) over the kernels of examples/webgpu/kernels.fib, written through the protocols
+only (it runs against any driver), plus the WebGPU limits (a grid over 65535 workgroups, a WGSL that does not compile, an i64 argument for an i32 parameter):
+19 checks hold on this machine. `scripts/test.sh --plant` also runs examples/webgpu/host.fib (vadd, vaddi, the GEMM bit exact, the assert's two paths);
+`WGPU_BACKEND=metal` on Linux is `:no-device` from `platform-open`, exit 2, no trap; three planted faults are caught (the lent check removed: the spec
+fails; the flag never read: the assert check fails; the block size ignored: a hash differs). The loader caveat of gpu.md 7 applies: a missing
+`libwgpu_native.so` fails before `main` (the dynamic loader's message), not as an `Err`. A planted "download before queue completion" cannot exist here:
+WebGPU orders a copy after the work submitted before it on the queue, so the protocol's lent check is the only guard a program needs (plant 1).
 
 ## 6. The one-language guard: one `defkernel`, five runs
 
-examples/webgpu/kernels.fib holds the kernels and, beside them, their CPU references in the same fma order and `main`, which prints the three
-reference hashes. examples/webgpu/host.fib is the host program over the `webgpu` driver (either one): it launches the kernels, prints the
-same lines and checks them (the wasm build prints the GEMM's hash only: `simd/fma` traps on wasm32, ADR 0008, so the CPU reference is the
-native run's). examples/webgpu/host-cuda.fib is the same host over the `cuda` driver. `scripts/webgpu-agree.sh` builds all of it and
-compares the lines (section 2). The guard against the two-languages trap (gpu.md 7) holds: the kernels are fibber, built for the host, for
-nvptx64 and for wgsl from one file; what differs per backend is the host program's driver module.
+examples/webgpu/kernels.fib holds the kernels (vadd, vaddi, gemm, gemm_smem, assert_positive); examples/webgpu/refs.fib their CPU references in the same fma order
+and the hash every run prints (a separate module: GPU-2's rule is that a program with a kernel built for a platform with no kernel target is refused, and the host
+programs need the references without the kernels); examples/webgpu/cpu.fib prints the reference hashes. examples/webgpu/hostrun.fib is the one host,
+over `(dyn Platform)`: it launches the kernels, prints the same lines and checks them (the wasm build prints the GEMM's hash only: `simd/fma` traps on
+wasm32, ADR 0008, so the CPU reference is the native run's). host.fib is its main over `webgpu/platform` (either driver), host-cuda.fib its main over
+`cuda/platform` (fib-gpu-cuda v0.1.0). `scripts/webgpu-agree.sh` builds all of it and compares the lines (section 2). The guard against the
+two-languages trap (gpu.md 7) holds: the kernels are fibber, built for the host, for nvptx64 and for wgsl from one file; what differs per backend is one `require`.
 
 ### 6.1 node with Dawn
 
@@ -286,13 +318,16 @@ the MSL must be fibber's own. Not run: the Mac was not used in this package (`sc
 
 ## 8. Tests and tools
 
-* `compiler/tests/native/wgsl-emit.sh` (no GPU): the row; the WGSL's content (the four entries and signatures, the binding model, the
-  overrides, `fma(`, `fibw_sadd_ovf(`, the flag store, the index space; no `i64`/`f64`/`ptr<`/runtime/libc) and its equality with the golden
-  compiler/tests/native/wgsl/kernels.wgsl (`--update` after an intended change); naga's validation (the tool of fetch-webgpu-tools.sh;
-  skipped with a note when absent); the host run of the kernels file; the eight 857x cases on the target; the refusals (`--emit ptx/llvm/obj`
-  on the row, `--emit wgsl` on nvptx64 and for the host, an executable); four planted faults in the WGSL caught (a binding off by one, a fixed
-  workgroup size, a trap without the flag, a checked `+` as a plain `+`). Output on this box: "wgsl-emit: every check holds".
-* `scripts/mutant-webgpu.sh` (no GPU, a stage-2 build per mutant): six mutants of the emitter's source, each caught by wgsl-emit.sh.
+* `compiler/tests/native/wgsl-emit.sh` (no GPU): the row; the WGSL's content (the five entries and signatures, the binding model, the
+  overrides, `fma(`, `fibw_sadd_ovf(`, the flag store, the index space, `var<workgroup>` and `workgroupBarrier()`; no `i64`/`f64`/`ptr<`/runtime/libc) and
+  its equality with the golden compiler/tests/native/wgsl/kernels.wgsl (`--update` after an intended change); naga's validation (the tool of
+  fetch-webgpu-tools.sh) and Tint's, through Dawn under node (examples/webgpu/js/validate.mjs), each skipped with a note when absent; the host run
+  of the kernels file and cpu.fib; the eight 857x cases on the target; the refusals (`--emit ptx/llvm/obj` on the row, `--emit wgsl` on nvptx64 and
+  for the host, an executable); four planted faults in the WGSL caught (a binding off by one, a fixed workgroup size, a trap without the flag, a checked
+  `+` as a plain `+`). Output on this box: "wgsl-emit: every check holds".
+* `scripts/mutant-webgpu.sh` (no GPU, a stage-2 build per mutant): six mutants of the emitter's source (the binding index, the checked `+`, the workgroup
+  size, the trap flag, the index space, callers running on after a trap), each caught by wgsl-emit.sh. An "i64 accepted" mutant of the type table alone is equivalent
+  (three gates refuse i64: the type table, the literal printer, the arithmetic printer), and the i64 refusal is case 8571's.
 * `scripts/webgpu-agree.sh [--browser]` (a GPU, the drivers, node, Chromium): section 2.
 * `fib-gpu-webgpu/scripts/test.sh --plant` (a GPU): section 5.2.
 * `scripts/fetch-webgpu-tools.sh` (ADR 0020): wgpu-native v29.0.1.1 (sha256 recorded), naga-cli 30.0.1 built from its crates.io tarball
@@ -304,7 +339,8 @@ the MSL must be fibber's own. Not run: the Mac was not used in this package (`sc
 1. The C-callback form (5.2): the one language addition this backend asks for; then the shim shrinks to the descriptor fills, which
    `fibgen` removes in turn.
 2. Timestamp queries in the drivers (the bench is wall clock), a persistent staging buffer for downloads, a uniform ring for launches.
-3. Structured printing for the barrier's uniformity (3.6), shared memory, atomics, f16 as they land in lIR.
+3. Structured printing of loops (the relooper): the shared-memory GEMM's 20x gap to the register-tiled one (section 2) is the test of whether the loop-and-switch
+   form is the cause; it would also lift the uniformity rule of 3.6 for barriers after thread-varying control flow. Atomics and f16 as they land in lIR.
 4. The hardware Chromium run (6.2) on a machine whose Chromium is not sandboxed from the GPU; the Mac (section 7).
-5. The `kernels` module name is used by both examples/gpu and examples/webgpu: a program that includes both directories must put
-   examples/webgpu first (the drivers' scripts do); renaming one is a one-line change for the lead.
+5. `fib.gpu.contract` for 32-bit kernels: its kernels take `n: i64`; a WGSL driver cannot pass it. An i32 flavour of the contract in fib.gpu (parameterised by the
+   index type) would let every driver run the same scenarios; today the driver's spec is a copy of its questions (section 5.2).

@@ -191,8 +191,7 @@
   (match t ((TFloat) "fibw_st_f32") ((TInt 32) "fibw_st_i32")
          (_ (refuse wf (str "a store of " (type-refusal t) " (a buffer holds i32 and f32 elements)")))))
 
-(defun alloca-name :private (wf: Wf p: LExpr) -> (Option str)
-  (match (. p kind) ((KLocal n) (if (contains? (. wf allocas) n) (some (wname n)) nil)) (_ nil)))
+(defun alloca-name :private (wf: Wf p: LExpr) -> (Option str) (local-var wf p))
 
 (defun load-form (wf: Wf t: LType p: LExpr) -> str
   (match (alloca-name wf p)
@@ -241,13 +240,43 @@
           (or (= name "fmin") (= name "fmax")) (refuse wf (str "(" name " ..): WGSL's min/max do not promise to propagate NaN (use fminnum/fmaxnum)"))
           :else (refuse wf (str "(" name " ..): no WGSL builtin (the SIMD and reduction forms are the CPU's)")))))
 
+;; ---------------------------------------------------------------- constants
+
+;; The integer a literal, or a let bound to one, is.
+(defun const-int (wf: Wf e: LExpr) -> (Option i64)
+  (match (. e kind)
+    ((KInt _ v) (lit->i64 v))
+    ((KLocal n) (match (get (. wf binds) n) ((some b) (const-int wf b)) (nil nil)))
+    (_ nil)))
+
+;; The truth a condition has whatever the thread: `(icmp eq (i32 16) (i32 -1))` is false, `(and x false)` is false. The checked arithmetic of the runtime guards its
+;; trap with such conditions (a division by a constant), and WGSL's uniformity analysis (Tint) cannot see through a variable that holds them: a branch on one that
+;; also depends on `local_invocation_id` makes the code after it non-uniform, and a `workgroupBarrier` may not be there. A branch on a constant is not printed.
+(defun const-bool (wf: Wf e: LExpr) -> (Option bool)
+  (match (. e kind)
+    ((KInt (TInt 1) v) (match (lit->i64 v) ((some x) (some (not (= x 0)))) (nil nil)))
+    ((KLocal n) (match (get (. wf binds) n) ((some b) (const-bool wf b)) (nil nil)))
+    ((KICmp pr a b) (match (Pair (const-int wf a) (const-int wf b))
+                      ((Pair (some p) (some q)) (match pr
+                                                  ((IEq) (some (= p q))) ((INe) (some (not (= p q)))) ((ISlt) (some (< p q))) ((ISle) (some (<= p q)))
+                                                  ((ISgt) (some (> p q))) ((ISge) (some (>= p q))) (_ nil)))
+                      (_ nil)))
+    ((KBin op a b) (let ((x (const-bool wf a)) (y (const-bool wf b)))
+                     (match op
+                       ((BAnd) (cond (= x (some false)) (some false) (= y (some false)) (some false) (and (some? x) (some? y)) (some (and (unwrap x) (unwrap y))) :else nil))
+                       ((BOr) (cond (= x (some true)) (some true) (= y (some true)) (some true) (and (some? x) (some? y)) (some (or (unwrap x) (unwrap y))) :else nil))
+                       (_ nil))))
+    (_ nil)))
+
 ;; ---------------------------------------------------------------- the dispatcher
 
 ;; The WGSL expression of `e`.
 (defun expr-wgsl (wf: Wf e: LExpr) -> str
   (match (. e kind)
     ((KLocal n) (local-wgsl wf n))
-    ((KGlobal n) (if (contains? (. (. wf wx) strings) n) "Ptr(0u, 0u)" (refuse wf (str "the global " n " (a kernel has no globals: shared memory is not in this target yet)"))))
+    ((KGlobal n) (cond (contains? (. (. wf wx) strings) n) "Ptr(0u, 0u)"
+                       (contains? (. (. wf wx) shared) n) (str "Ptr(" (unwrap-or (get (. (. wf wx) shared) n) 0) "u, 0u)")
+                       :else (refuse wf (str "the global " n " (a kernel has only block-shared globals and string constants)"))))
     ((KInt t v) (int-text wf t v))
     ((KFloat t v) (float-text wf t v))
     ((KNull) "Ptr(0u, 0u)")

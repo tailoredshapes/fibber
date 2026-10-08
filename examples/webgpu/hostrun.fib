@@ -66,6 +66,20 @@
                   (do (println (str "gemm " n " worst relative difference against the CPU: " worst (if (= h (k/hash-f32 ref)) " (bit exact)" "")))
                       (Ok (if (<= worst 2.0e-5) 0 1))))))))))
 
+;; The same GEMM staged through block-shared memory (`gpu/shared`: `var<workgroup>` in WGSL): blocks of 256 threads over 64x64 tiles; its hash is gemm's.
+(defun run-gemm-smem (d: (dyn gpu/Device) s: (dyn gpu/Stream) m: (dyn gpu/Module)) -> (Result i64 gpu/GpuError)
+  (let [n k/GEMM-N ha (k/fill-f32 (* n n) 5) hb (k/fill-f32 (* n n) 6)]
+    (try-let [kn (gpu/module-kernel m "gemm_smem")
+              a (gpu/device-alloc d (* 4 n n)) b (gpu/device-alloc d (* 4 n n)) c (gpu/device-alloc d (* 4 n n))
+              _ (gpu/buffer-upload a ha) _ (gpu/buffer-upload b hb)
+              _ (gpu/stream-launch s kn [(quot n 64) (quot n 64)] [256] [(gpu/ABuf a) (gpu/ABuf b) (gpu/ABuf c) (gpu/AI32 (trunc i32 n))])
+              _ (gpu/stream-sync s)
+              hc (gpu/buffer-download c (* n n))
+              _ (gpu/buffer-release a) _ (gpu/buffer-release b) _ (gpu/buffer-release c)]
+      (let [h (k/hash-f32 hc)]
+        (do (println (str "gemm-smem " n " " h))
+            (Ok 0))))))
+
 ;; The assert kernel: `stream-sync` is Ok on a positive input and the `:device-trap` Err on one with a zero.
 (defun run-assert (d: (dyn gpu/Device) s: (dyn gpu/Stream) m: (dyn gpu/Module) positive: bool) -> (Result i64 gpu/GpuError)
   (let [n 4096 xs (cell (array n 1.5f32))]
@@ -83,10 +97,10 @@
   (try-let [d (gpu/platform-open p 0)
             s (gpu/device-stream d)
             m (gpu/device-load d source)
-            r1 (run-vadd d s m) r2 (run-vaddi d s m) r3 (run-gemm d s m with-ref)
+            r1 (run-vadd d s m) r2 (run-vaddi d s m) r3 (run-gemm d s m with-ref) r6 (run-gemm-smem d s m)
             r4 (run-assert d s m true) r5 (run-assert d s m false)]
     (do (println (str "device: " (. (gpu/device-info d) name)))
-        (Ok (max r1 (max r2 (max r3 (max r4 r5))))))))
+        (Ok (max r1 (max r2 (max r3 (max r4 (max r5 r6)))))))))
 
 (defun report (r: (Result i64 gpu/GpuError)) -> i64
   (match r

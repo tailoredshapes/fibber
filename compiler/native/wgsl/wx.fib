@@ -9,15 +9,21 @@
 (ns native.wgsl.wx
   (:use lir.types lir.lit lir.ast))
 
-;; The module context: the signatures of every function, the defined ones, the ones that may trap (reach `(trap)`), the kernel that
-;; reaches each function (for the refusal), the string constants (a trap's message: a null `Ptr` on the device), the count of storage
+;; The module context: the signatures of every function, the defined ones, the ones that may trap (reach `(trap)`), the ones that reach a `(barrier)`, the kernel that
+;; reaches each function (for the refusal), the string constants (a trap's message: a null `Ptr` on the device), the block-shared globals (name to the
+;; buffer number of its `var<workgroup>`: SHARED-BASE and up), the scalar cells (`%struct.fib.cell.T`: a stack slot of a kernel, spec/types.md 6.11, to its element T), the count of storage
 ;; buffers (the most pointer parameters of a kernel), and the refusal.
+(def SHARED-BASE: i64 16)
+
 (defstruct Wx
   (fns: (Map str LFnType)
    defined: (Set str)
    traps: (Set str)
+   barriers: (Set str)
    owner: (Map str str)
    strings: (Set str)
+   shared: (Map str i64)
+   cells: (Map str LType)
    nbufs: i64
    err: (Cell (Option str))))
 
@@ -30,6 +36,7 @@
    binds: (Map str LExpr)
    types: (Cell (Map str LType))
    allocas: (Set str)
+   looped: bool
    ex: (fn (Wf LExpr) str)))
 
 (defun wf-expr (wf: Wf e: LExpr) -> str ((. wf ex) wf e))
@@ -170,3 +177,29 @@
 
 ;; The private body of a kernel entry, called by the `@compute` entry of the same name.
 (defun body-name (k: str) -> str (str "fibw_k_" (wname k)))
+
+;; ---------------------------------------------------------------- scalar cells
+
+;; A scalar cell of a kernel (`(cell 0.0f32)`) is a stack object `%struct.fib.cell.T` = {header, T}: the printer makes it a `var` of T (the header is dropped, the
+;; `fib.stack-init`/`fib.stack-end` calls are no-ops) and a `getelementptr` into its value is the variable itself.
+(defun cell-elem (wx: Wx t: LType) -> (Option LType)
+  (match t ((TNamed n) (get (. wx cells) n)) (_ nil)))
+
+(defun stack-call? (n: str) -> bool (or (= n "fib_stack_init") (= n "fib_stack_end")))
+(defun stack-fn? (n: str) -> bool (or (stack-call? n) (= n "fib_init_hdr")))
+
+;; Whether the let `name` is the address of a cell's value: a `getelementptr` of a cell struct over a cell alloca.
+(defun cell-gep? (wf: Wf name: str) -> bool
+  (match (get (. wf binds) name)
+    ((some b) (match (. b kind)
+                ((KGep _ t p _) (and (some? (cell-elem (. wf wx) t)) (match (. p kind) ((KLocal n) (contains? (. wf allocas) n)) (_ false))))
+                (_ false)))
+    (nil false)))
+
+;; The variable a pointer operand names, if it is a scalar local: an alloca, or the address of a cell's value.
+(defun local-var (wf: Wf p: LExpr) -> (Option str)
+  (match (. p kind)
+    ((KLocal n) (cond (contains? (. wf allocas) n) (some (wname n))
+                      (cell-gep? wf n) (match (get (. wf binds) n) ((some b) (match (. b kind) ((KGep _ _ bp _) (match (. bp kind) ((KLocal base) (some (wname base))) (_ nil))) (_ nil))) (nil nil))
+                      :else nil))
+    (_ nil)))

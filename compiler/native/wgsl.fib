@@ -20,7 +20,15 @@
 (defun kernel-fn? :private (f: LFunction) -> bool (= (. (. f ty) cc) cc-kernel))
 
 (defun defines :private (m: LModule) -> (Vec LFunction)
-  (vec (mapcat (fn (it: LItem) (match it ((ItDefine f) [f]) (_ []))) (. m items))))
+  (vec (mapcat (fn (it: LItem) (match it ((ItDefine f) (if (stack-fn? (. f name)) [] [f])) (_ []))) (. m items))))
+
+;; The scalar cells of the module: `%struct.fib.cell.T` = {header, T}, to T (wx.fib `cell-elem`).
+(defun cell-map :private (m: LModule) -> (Map str LType)
+  (into {} (mapcat (fn (it: LItem)
+                     (match it
+                       ((ItStruct d) (if (and (starts-with? (. d name) "fib.cell.") (= (count (. d fields)) 4)) [(Pair (. d name) (nth (. d fields) 3))] []))
+                       (_ [])))
+                   (. m items))))
 
 (defun fns-of :private (m: LModule) -> (Map str LFnType)
   (reduce (fn (acc: (Map str LFnType) it: LItem)
@@ -30,10 +38,10 @@
               (_ acc)))
           {} (. m items)))
 
-;; The functions that may trap: those with `(trap)` and, to a fixed point, those that call one.
-(defun trap-set :private (fs: (Vec LFunction)) -> (Set str)
+;; The functions that satisfy `base?` (contain `(trap)`, contain `(barrier)`) and, to a fixed point, those that call one.
+(defun reach-set :private (fs: (Vec LFunction) base?: (fn (LFunction) bool)) -> (Set str)
   (let ((calls (into {} (map (fn (f: LFunction) (Pair (. f name) (func/callees f))) fs))))
-    (loop ((seen (into #{} (map (fn (f: LFunction) (. f name)) (filter func/has-trap? fs)))))
+    (loop ((seen (into #{} (map (fn (f: LFunction) (. f name)) (filter base? fs)))))
       (let ((grown (reduce (fn (acc: (Set str) f: LFunction)
                              (if (some? (find-first (fn (c: str) (contains? seen c)) (unwrap-or (get calls (. f name)) [])))
                                  (conj acc (. f name)) acc))
@@ -61,6 +69,19 @@
               (_ acc)))
           #{} (. m items)))
 
+;; The block-shared globals of the module (`(global shared NAME [N x T] ..)`, gpu/shared): name to the number of its words (a 32-bit element: float or i32), in order.
+(defun shared-globals :private (m: LModule) -> (Vec (Pair str i64))
+  (vec (mapcat (fn (it: LItem)
+                 (match it
+                   ((ItGlobal g) (if (. g shared)
+                                     (match (. g ty) ((TArray n e) (if (or (= e ty-float) (= e ty-i32)) [(Pair (. g name) n)] [(Pair (. g name) -1)])) (_ [(Pair (. g name) -1)]))
+                                     []))
+                   (_ [])))
+               (. m items))))
+
+(defun shared-map :private (shs: (Vec (Pair str i64))) -> (Map str i64)
+  (into {} (map-indexed (fn (i: i64 p: (Pair str i64)) (Pair (. p fst) (+ SHARED-BASE i))) shs)))
+
 (defun ptr-count :private (f: LFunction) -> i64
   (count (filter (fn (t: LType) (= t ty-ptr)) (. (. f ty) params))))
 
@@ -69,13 +90,18 @@
 (defun buffer-decls :private (n: i64) -> str
   (str-join (vec (map (fn (i: i64) (str "@group(0) @binding(" (+ i 2) ") var<storage, read_write> buf" i ": array<u32>;\n")) (range n)))))
 
-(defun ld-cases :private (n: i64) -> str
-  (str-join (vec (map (fn (i: i64) (str " case " i "u: { return buf" i "[p.off >> 2u]; }")) (range n)))))
+(defun ld-cases :private (n: i64 sh: i64) -> str
+  (str (str-join (vec (map (fn (i: i64) (str " case " i "u: { return buf" i "[p.off >> 2u]; }")) (range n))))
+       (str-join (vec (map (fn (i: i64) (str " case " (+ SHARED-BASE i) "u: { return fibw_sh" i "[p.off >> 2u]; }")) (range sh))))))
 
-(defun st-cases :private (n: i64) -> str
-  (str-join (vec (map (fn (i: i64) (str " case " i "u: { buf" i "[p.off >> 2u] = v; }")) (range n)))))
+(defun st-cases :private (n: i64 sh: i64) -> str
+  (str (str-join (vec (map (fn (i: i64) (str " case " i "u: { buf" i "[p.off >> 2u] = v; }")) (range n))))
+       (str-join (vec (map (fn (i: i64) (str " case " (+ SHARED-BASE i) "u: { fibw_sh" i "[p.off >> 2u] = v; }")) (range sh))))))
 
-(defun prelude :private (n: i64) -> str
+(defun shared-decls :private (sh: (Vec (Pair str i64))) -> str
+  (str-join (vec (map-indexed (fn (i: i64 p: (Pair str i64)) (str "var<workgroup> fibw_sh" i ": array<u32, " (. p snd) ">;\n")) sh))))
+
+(defun prelude :private (n: i64 sh: (Vec (Pair str i64))) -> str
   (str "struct Ptr { buf: u32, off: u32 }\n"
        "struct OvI32 { v: i32, o: bool }\n"
        "struct FibTrap { flag: atomic<u32> }\n"
@@ -85,8 +111,9 @@
        (buffer-decls n)
        "var<private> fibw_lid: vec3<u32>;\nvar<private> fibw_wid: vec3<u32>;\nvar<private> fibw_nwg: vec3<u32>;\nvar<private> fibw_trapped: bool = false;\n"
        "fn fibw_trap() { fibw_trapped = true; atomicStore(&fibw_flag.flag, 1u); }\n"
-       "fn fibw_ld_u32(p: Ptr) -> u32 { switch p.buf {" (ld-cases n) " default: { return 0u; } } }\n"
-       "fn fibw_st_u32(p: Ptr, v: u32) { switch p.buf {" (st-cases n) " default: { } } }\n"
+       (shared-decls sh)
+       "fn fibw_ld_u32(p: Ptr) -> u32 { switch p.buf {" (ld-cases n (count sh)) " default: { return 0u; } } }\n"
+       "fn fibw_st_u32(p: Ptr, v: u32) { switch p.buf {" (st-cases n (count sh)) " default: { } } }\n"
        "fn fibw_ld_f32(p: Ptr) -> f32 { return bitcast<f32>(fibw_ld_u32(p)); }\n"
        "fn fibw_ld_i32(p: Ptr) -> i32 { return bitcast<i32>(fibw_ld_u32(p)); }\n"
        "fn fibw_st_f32(p: Ptr, v: f32) { fibw_st_u32(p, bitcast<u32>(v)); }\n"
@@ -126,6 +153,11 @@
        "  fibw_lid = lid; fibw_wid = wid; fibw_nwg = nwg;\n"
        "  " (body-name (. f name)) "(" (entry-args (. (. f ty) params)) ");\n}\n"))
 
+(defun shared-refusal :private (shs: (Vec (Pair str i64))) -> (Option str)
+  (match (first (filter (fn (p: (Pair str i64)) (< (. p snd) 0)) shs))
+    ((some p) (some (str "the block-shared " (. p fst) " is not an array of 32-bit words (f32 or i32): WGSL workgroup memory here is words"))) 
+    (nil nil)))
+
 (defun entry-refusal :private (f: LFunction) -> (Option str)
   (let ((scalars (count (filter (fn (t: LType) (not (= t ty-ptr))) (. (. f ty) params)))))
     (cond (> (ptr-count f) MAX-BUFFERS) (some (str "kernel " (. f name) " has " (ptr-count f) " pointer parameters; WebGPU binds at most " MAX-BUFFERS " (8 storage buffers, one is the trap flag)"))
@@ -144,14 +176,15 @@
 ;; entries in the module's order; or the first refusal.
 (defun wgsl-module (m: LModule) -> (Result str str)
   (let ((fs (defines m)) (kernels (vec (filter kernel-fn? fs))))
-    (match (first (filter some? (map entry-refusal kernels)))
+    (match (first (filter some? (conj (vec (map entry-refusal kernels)) (shared-refusal (shared-globals m)))))
       ((some e) (Err (str "the webgpu target cannot take " (unwrap e) " (docs/design/webgpu.md 3)")))
       (nil (let ((nbufs (max 1 (reduce (fn (a: i64 f: LFunction) (max a (ptr-count f))) 0 kernels)))
-                 (wx (Wx (fns-of m) (into #{} (map (fn (f: LFunction) (. f name)) fs)) (trap-set fs) (owners fs) (string-globals m) nbufs (cell nil)))
+                 (shs (shared-globals m))
+                 (wx (Wx (fns-of m) (into #{} (map (fn (f: LFunction) (. f name)) fs)) (reach-set fs func/has-trap?) (reach-set fs func/has-barrier?) (owners fs) (string-globals m) (shared-map shs) (cell-map m) nbufs (cell nil)))
                  (text (str "// WGSL of the kernels of a fibber program, written by fibc (docs/design/webgpu.md): group 0 is binding 0 the uniform of scalar\n"
                             "// parameters (4 bytes each, in order), binding 1 the trap flag, bindings 2.. the pointer parameters in order; wg_x/wg_y/wg_z the workgroup size.\n"
                             (str-join (vec (map signature-line kernels)))
-                            (prelude nbufs)
+                            (prelude nbufs shs)
                             (str-join (vec (map (fn (f: LFunction) (function-text wx f)) fs))))))
              (match @(. wx err)
                ((some e) (Err e))

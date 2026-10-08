@@ -18,7 +18,7 @@ do_cuda=1; do_native=1; do_node=1; do_browser=0
 for a in "$@"; do case $a in --no-cuda) do_cuda=0 ;; --no-native) do_native=0 ;; --no-node) do_node=0 ;; --browser) do_browser=1 ;; esac; done
 T=$(mktemp -d "${TMPDIR:-/tmp}/webgpu-agree.XXXXXX"); trap 'rm -rf "$T"' EXIT
 bad=0; INC=(-I examples/webgpu)
-hashes() { grep -E "^(vadd|vaddi|gemm) [0-9]+ [0-9]+$" "$1" | sort; }
+hashes() { grep -E "^(vadd|vaddi|gemm|gemm-smem) [0-9]+ [0-9]+$" "$1" | sort; }
 compare() { # compare NAME LOG: the hash lines against the CPU's
   if diff <(hashes "$T/cpu.log") <(hashes "$2") > "$T/d"; then echo "ok   $1: vadd, vaddi, gemm hash as the CPU's ($(grep -m1 device: "$2" | cut -c1-80))"
   elif diff <(hashes "$T/cpu.log" | grep -v '^gemm') <(hashes "$2" | grep -v '^gemm') > /dev/null && grep -q '^gemm' "$2"; then

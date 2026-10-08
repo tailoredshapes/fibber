@@ -46,6 +46,55 @@
                     (g/f32-set! c r2 c20) (g/f32-set! c (unchecked-add r2 1i32) c21) (g/f32-set! c (unchecked-add r2 2i32) c22) (g/f32-set! c (unchecked-add r2 3i32) c23)
                     (g/f32-set! c r3 c30) (g/f32-set! c (unchecked-add r3 1i32) c31) (g/f32-set! c (unchecked-add r3 2i32) c32) (g/f32-set! c (unchecked-add r3 3i32) c33)))))))))
 
+;; The same GEMM staged through block-shared memory (gpu.md 6.3; GPU-2's `gemm-smem` over i32): a block of 256 threads computes a 64x64 tile of C; for each
+;; slice of 16 k's the block loads a 64x16 slice of A and a 16x64 slice of B into `gpu/shared` memory, waits at the barrier, takes its 4x4 micro-tile's 16
+;; fmas per k from shared memory, then a barrier before the next slice. The sum per element is in increasing k: the result is `gemm`'s bit for bit. The grid is
+;; (n/64) x (n/64) blocks of 256 (one dimension); n a multiple of 64. In WGSL the two shared arrays are `var<workgroup>` (webgpu.md 3.6).
+(defkernel gemm-smem (a: ptr b: ptr c: ptr n: i32)
+  (let ((as (gpu/shared :f32 1024)) (bs (gpu/shared :f32 1024))
+        (tid (g/local-id-x)) (xa (unchecked-multiply 4i32 (quot (g/local-id-x) 16i32))) (xb (unchecked-multiply 4i32 (rem (g/local-id-x) 16i32)))
+        (row0 (unchecked-multiply 64i32 (trunc i32 (gpu/group-id 1)))) (col0 (unchecked-multiply 64i32 (g/group-id-x)))
+        (c00 (cell 0.0f32)) (c01 (cell 0.0f32)) (c02 (cell 0.0f32)) (c03 (cell 0.0f32))
+        (c10 (cell 0.0f32)) (c11 (cell 0.0f32)) (c12 (cell 0.0f32)) (c13 (cell 0.0f32))
+        (c20 (cell 0.0f32)) (c21 (cell 0.0f32)) (c22 (cell 0.0f32)) (c23 (cell 0.0f32))
+        (c30 (cell 0.0f32)) (c31 (cell 0.0f32)) (c32 (cell 0.0f32)) (c33 (cell 0.0f32)))
+    (do (loop ((k0 0i32))
+          (when (< k0 n)
+            (do (load-slices as bs a b n tid row0 col0 k0)
+                (gpu/barrier)
+                (loop ((k 0i32))
+                  (when (< k 16i32)
+                    (let ((ka (unchecked-add (unchecked-multiply k 64i32) xa)) (kb (unchecked-add (unchecked-multiply k 64i32) xb))
+                          (x0 (g/f32-at as ka)) (x1 (g/f32-at as (unchecked-add ka 1i32))) (x2 (g/f32-at as (unchecked-add ka 2i32))) (x3 (g/f32-at as (unchecked-add ka 3i32)))
+                          (b0 (g/f32-at bs kb)) (b1 (g/f32-at bs (unchecked-add kb 1i32))) (b2 (g/f32-at bs (unchecked-add kb 2i32))) (b3 (g/f32-at bs (unchecked-add kb 3i32))))
+                      (do (set! c00 (simd/fma x0 b0 @c00)) (set! c01 (simd/fma x0 b1 @c01)) (set! c02 (simd/fma x0 b2 @c02)) (set! c03 (simd/fma x0 b3 @c03))
+                          (set! c10 (simd/fma x1 b0 @c10)) (set! c11 (simd/fma x1 b1 @c11)) (set! c12 (simd/fma x1 b2 @c12)) (set! c13 (simd/fma x1 b3 @c13))
+                          (set! c20 (simd/fma x2 b0 @c20)) (set! c21 (simd/fma x2 b1 @c21)) (set! c22 (simd/fma x2 b2 @c22)) (set! c23 (simd/fma x2 b3 @c23))
+                          (set! c30 (simd/fma x3 b0 @c30)) (set! c31 (simd/fma x3 b1 @c31)) (set! c32 (simd/fma x3 b2 @c32)) (set! c33 (simd/fma x3 b3 @c33))
+                          (recur (unchecked-add k 1i32))))))
+                (gpu/barrier)
+                (recur (unchecked-add k0 16i32)))))
+        (store-tile c n (unchecked-add row0 xa) (unchecked-add col0 xb)
+                    @c00 @c01 @c02 @c03 @c10 @c11 @c12 @c13 @c20 @c21 @c22 @c23 @c30 @c31 @c32 @c33))))
+
+;; The block's 256 threads load a 64x16 slice of A (as[k*64 + r]) and a 16x64 slice of B (bs[k*64 + c]) for the k's from k0: 4 elements of each per thread.
+(defun load-slices (as: ptr bs: ptr a: ptr b: ptr n: i32 tid: i32 row0: i32 col0: i32 k0: i32) -> unit
+  (loop ((e tid))
+    (when (< e 1024i32)
+      (let ((r (quot e 16i32)) (k (rem e 16i32)) (kb (quot e 64i32)) (cb (rem e 64i32)))
+        (do (g/f32-set! as (unchecked-add (unchecked-multiply k 64i32) r) (g/f32-at a (unchecked-add (unchecked-multiply (unchecked-add row0 r) n) (unchecked-add k0 k))))
+            (g/f32-set! bs (unchecked-add (unchecked-multiply kb 64i32) cb) (g/f32-at b (unchecked-add (unchecked-multiply (unchecked-add k0 kb) n) (unchecked-add col0 cb))))
+            (recur (unchecked-add e 256i32)))))))
+
+(defun store-tile (c: ptr n: i32 row: i32 col: i32
+                   c00: f32 c01: f32 c02: f32 c03: f32 c10: f32 c11: f32 c12: f32 c13: f32
+                   c20: f32 c21: f32 c22: f32 c23: f32 c30: f32 c31: f32 c32: f32 c33: f32) -> unit
+  (let ((r0 (unchecked-add (unchecked-multiply row n) col)) (r1 (unchecked-add r0 n)) (r2 (unchecked-add r1 n)) (r3 (unchecked-add r2 n)))
+    (do (g/f32-set! c r0 c00) (g/f32-set! c (unchecked-add r0 1i32) c01) (g/f32-set! c (unchecked-add r0 2i32) c02) (g/f32-set! c (unchecked-add r0 3i32) c03)
+        (g/f32-set! c r1 c10) (g/f32-set! c (unchecked-add r1 1i32) c11) (g/f32-set! c (unchecked-add r1 2i32) c12) (g/f32-set! c (unchecked-add r1 3i32) c13)
+        (g/f32-set! c r2 c20) (g/f32-set! c (unchecked-add r2 1i32) c21) (g/f32-set! c (unchecked-add r2 2i32) c22) (g/f32-set! c (unchecked-add r2 3i32) c23)
+        (g/f32-set! c r3 c30) (g/f32-set! c (unchecked-add r3 1i32) c31) (g/f32-set! c (unchecked-add r3 2i32) c32) (g/f32-set! c (unchecked-add r3 3i32) c33))))
+
 ;; A device-side assert: every element of `a` must be positive, else the kernel traps; the host sees it after the sync (gpu.md 3.4).
 (defkernel assert-positive (a: ptr n: i32)
   (let ((i (g/global-id-x)))
