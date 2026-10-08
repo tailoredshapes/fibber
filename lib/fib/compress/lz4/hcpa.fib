@@ -1,0 +1,61 @@
+;; fib.compress.lz4.hcpa: the PATTERN ANALYSIS of liblz4's LZ4HC_InsertAndGetWiderMatch (the "PA optimization", on for the levels whose search depth is above 128: level 9 and the optimal
+;; parser's finder), for a single window (no external dictionary). When the chain step from a candidate is 1 (the byte before it hashes alike: a run of a pattern of 1, 2 or 4 bytes) and the
+;; bytes at ip are such a pattern, the search does not walk the run byte by byte: it jumps to the start or to the best aligned place of the run in the chain and stops looking at the rest
+;; of it (docs/shootout/lz4.md 4: without this, level 9 was byte-identical with liblz4 on 93.6% of 30,000 inputs).
+;; The loop of `wider` (fib.compress.lz4.hc3) keeps the candidate `mi`, the attempts left, the longest length and this analysis's two words (`rep`: 0 untested, 1 not a pattern, 2 a pattern;
+;; `srcl`: the length of the pattern run at ip). `pa-step` answers with an ACTION in register 16 and the new values in registers 17 (the candidate), 18 (longest), 19 (rep), 20 (srcl):
+;; action 0: not applicable, follow the chain; 1: continue with the candidate in 17 (the attempt is spent); 2: stop. A match it finds is written in registers 2 and 3 like `wider`'s own.
+(ns fib.compress.lz4.hcpa (:use fib.core fib.seq fib.coll fib.compress.lz4.mem fib.compress.lz4.blockenc))
+
+;; Bytes from i on that equal the pattern (4 bytes of a period 1, 2 or 4) repeated, up to end (an index).
+(defun count-pat (sp: ptr i: i64 end: i64 pat: i64) -> i64
+  (let [p8 (bit-or pat (shl pat 32))]
+    (loop [k i]
+      (if (<= (u+ k 8) end)
+        (let [x (bit-xor (rd64 sp k) p8)] (if (= x 0) (recur (u+ k 8)) (u- (u+ k (shr (ctz x) 3)) i)))
+        (loop [j k b p8] (if (and (< j end) (= (rd8 sp j) (bit-and b 255))) (recur (u+ j 1) (shr b 8)) (u- j i)))))))
+
+;; Bytes before i (down to low) that equal the pattern repeated backwards: whole words first, then the bytes from the last one of the pattern down.
+(defun back-pat (sp: ptr i: i64 low: i64 pat: i64) -> i64
+  (let [k (loop [k i] (if (and (>= k (u+ low 4)) (= (rd32 sp (u- k 4)) pat)) (recur (u- k 4)) k))]
+    (u- i (loop [j k s 24] (if (and (> j low) (>= s 0) (= (rd8 sp (u- j 1)) (bit-and (shr pat s) 255))) (recur (u- j 1) (u- s 8)) j)))))
+
+(defun pat? (pat: i64) -> bool (and (= (bit-and pat 65535) (shr pat 16)) (= (bit-and pat 255) (shr pat 24))))
+
+(defun act (st: ptr a: i64 mi: i64 best: i64 rep: i64 srcl: i64) -> unit
+  (do (wr64 st 128 a) (wr64 st 136 mi) (wr64 st 144 best) (wr64 st 152 rep) (wr64 st 160 srcl)))
+
+;; The candidate mi-1 (a run of the pattern), its run forwards and backwards, and where to go on.
+(defun pa-run (sp: ptr st: ptr ip: i64 cand: i64 look: i64 lowest: i64 mlim: i64 pat: i64 best: i64 rep: i64 srcl: i64 ct: ptr gen: i64) -> unit
+  (if (not (= (rd32 sp cand) pat)) (act st 1 (u+ cand 1) best rep srcl)
+    (let [fwd (u+ 4 (count-pat sp (u+ cand 4) mlim pat))
+          back0 (back-pat sp cand lowest pat) back (u- cand (max (u- cand back0) lowest)) cur (u+ back fwd)]
+      (if (and (>= cur srcl) (<= fwd srcl))
+        (act st 1 (u- (u+ cand fwd) srcl) best rep srcl)
+        (let [nm (u- cand back)]
+          (if (> look 0) (act st 1 nm best rep srcl)
+            (let [maxml (min cur srcl)]
+              (if (and (< best maxml) (> (u- ip nm) 65535)) (act st 2 nm best rep srcl)
+                (do (when (< best maxml) (do (wr64 st 16 ip) (wr64 st 24 nm)))
+                    (act st 1 (u- nm (rd16 ct (shl (bit-and (u+ gen nm) 65535) 1))) (max best maxml) rep srcl))))))))))
+
+;; One chain step of `wider` at candidate mi whose chain delta is 1.
+(defun pa-step (sp: ptr st: ptr ct: ptr gen: i64 ip: i64 mi: i64 look: i64 lowest: i64 mlim: i64 best: i64 rep: i64 srcl: i64) -> unit
+  (let [pat (rd32 sp ip)
+        rep2 (if (= rep 0) (if (pat? pat) 2 1) rep)
+        srcl2 (if (and (= rep 0) (= rep2 2)) (u+ 4 (count-pat sp (u+ ip 4) mlim pat)) srcl)
+        cand (u- mi 1)]
+    (if (and (= rep2 2) (>= cand lowest))
+      (pa-run sp st ip cand look lowest mlim pat best rep2 srcl2 ct gen)
+      (act st 0 mi best rep2 srcl2))))
+
+;; CHAIN SWAP (liblz4's `chainSwap`): the candidate mi matched as long as the longest (`longest`): look along its first `longest - 3` positions for the largest chain step (probing every
+;; position at first, then every second, third .. as the accelerator rises) and leave through THAT position's chain. Writes the step in register 26 (1: no better chain, stay) and the
+;; position of the probe in register 27; true.
+(defun swap-chain (sp: ptr ct: ptr gen: i64 mi: i64 longest: i64 st: ptr) -> bool
+  (let [end (u+ (u- longest 4) 1)]
+    (loop [pos 0 step 1 accel 16 dist 1 at 0]
+      (if (< pos end)
+        (let [cd (rd16 ct (shl (bit-and (u+ gen (u+ mi pos)) 65535) 1)) st2 (shr accel 4)]
+          (if (> cd dist) (recur (u+ pos st2) st2 16 cd pos) (recur (u+ pos st2) st2 (u+ accel 1) dist at)))
+        (do (wr64 st 208 dist) (wr64 st 216 at) true)))))
