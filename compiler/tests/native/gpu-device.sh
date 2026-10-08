@@ -54,6 +54,7 @@ wgsl_checks() { # wgsl_checks REDUCE.wgsl ATOMICS.wgsl
 if wgsl_checks "$T/reduce.wgsl" "$T/atomics.wgsl"; then ok "WGSL: atomic buffers and workgroup words, the helpers, compare-and-exchange, the barrier"; else no "WGSL content"; fi
 if wgsl examples/webgpu/kernels.fib "$T/plain.wgsl" 2> "$T/err" && grep -q 'array<u32>;' "$T/plain.wgsl" && ! grep -q 'atomic<u32>>' "$T/plain.wgsl"; then ok "WGSL: a module with no atomic keeps the plain array<u32> buffers"; else no "plain module: $(cat "$T/err")"; fi
 if wgsl $D/reduce-all.fib "$T/x.wgsl" 2> "$T/err"; then no "the f32 atomic sum was accepted for WGSL"; else grep -q "an f32 atomic" "$T/err" && ok "WGSL: the f32 atomic is refused by name: $(head -c 120 "$T/err")" || no "f32 atomic refusal text: $(cat "$T/err")"; fi
+grep -q '^warning: wgsl: function .*state machine' "$T/err" && ok "WGSL: a function the relooper cannot structure warns and falls back to the state machine: $(grep -m1 '^warning: wgsl' "$T/err" | cut -c1-110)" || no "no fallback warning for the loop with several exits: $(head -c 200 "$T/err")"
 if [ -x "$NAGA" ]; then
   for w in reduce atomics; do
     if "$NAGA" "$T/$w.wgsl" > "$T/naga" 2>&1; then ok "naga: $w.wgsl validation successful"; else no "naga rejects $w.wgsl: $(head -n 5 "$T/naga")"; fi
@@ -65,6 +66,25 @@ if command -v node > /dev/null 2>&1; then
     if [ $code -eq 0 ]; then ok "Tint (Dawn): $w.wgsl has no errors"; elif [ $code -eq 3 ]; then echo "note the webgpu npm package or an adapter is missing: Tint validation skipped"; break
     else no "Tint rejects $w.wgsl: $(grep -v 'Warning: max' "$T/tint" | head -n 6)"; fi
   done
+fi
+
+# 1b. GPU-4: kernels that branch around a barrier in one function (compiler/tests/native/gpu/branch.fib). The WGSL printer structures the control flow
+# (if/else, loop, break, continue: native.wgsl.reloop) so Tint sees the barrier in uniform control flow; the old loop-and-switch form of such a function is rejected.
+if ptx $D/branch.fib "$T/branch.ptx" 2> "$T/err" && wgsl $D/branch.fib "$T/branch.wgsl" 2>> "$T/err"; then ok "branch.fib built for PTX and WGSL"; else no "branch.fib build: $(cat "$T/err")"; fi
+[ -s "$T/err" ] && no "branch.fib printed a warning (a fallback to the state machine): $(head -c 200 "$T/err")" || ok "branch.fib: no fallback warning (every function structured)"
+branch_text() { # branch_text BRANCH.wgsl: the branchy kernels hold their barriers and no state machine
+  local r=0
+  grep -qF 'workgroupBarrier()' "$1" || { echo "     no workgroupBarrier() in branch.wgsl"; r=1; }
+  grep -q 'switch L {' "$1" && { echo "     branch.wgsl has a loop-and-switch state machine"; r=1; }
+  [ "$(grep -c 'fn \(rev\|tree_sum\|parity\|early\)(' "$1")" -eq 4 ] || { echo "     a kernel of branch.fib is missing"; r=1; }
+  return $r
+}
+if branch_text "$T/branch.wgsl"; then ok "WGSL: branch.fib has its four kernels, the barriers and no loop-and-switch state machine"; else no "branch.wgsl content"; fi
+if [ -x "$NAGA" ]; then "$NAGA" "$T/branch.wgsl" > "$T/naga" 2>&1 && ok "naga: branch.wgsl validation successful" || no "naga rejects branch.wgsl: $(head -n 5 "$T/naga")"; fi
+if command -v node > /dev/null 2>&1; then
+  node examples/webgpu/js/validate.mjs "$T/branch.wgsl" > "$T/tint" 2>&1; code=$?
+  if [ $code -eq 0 ]; then ok "Tint (Dawn): branch.wgsl has no errors (a barrier after thread-dependent branches)"; elif [ $code -eq 3 ]; then echo "note no WebGPU adapter: Tint check of branch.wgsl skipped"
+  else no "Tint rejects branch.wgsl: $(grep -v 'Warning: max' "$T/tint" | head -n 6)"; fi
 fi
 
 # 2. the host
@@ -82,6 +102,8 @@ else
   if [ $code -eq 0 ]; then ok "device (CUDA): $(grep -c '^ok' "$T/cuda.out") reduction checks equal fibber's CPU reference: $(grep partials "$T/cuda.out" | head -n 1 | cut -c1-90)"; else no "device (CUDA) reductions: $(grep -v '^ok' "$T/cuda.out" | head -n 5)"; fi
   cuda atomics "$T/atomics.ptx" > "$T/cuda.out" 2>&1; code=$?
   if [ $code -eq 0 ]; then ok "device (CUDA): $(grep -c '^ok' "$T/cuda.out") atomics checks equal the CPU's"; else no "device (CUDA) atomics: $(grep -v '^ok' "$T/cuda.out" | head -n 5)"; fi
+  cuda branch "$T/branch.ptx" > "$T/cuda.out" 2>&1; code=$?
+  if [ $code -eq 0 ] && [ "$(grep -c '^ok' "$T/cuda.out")" -eq 4 ]; then ok "device (CUDA): 4 branch-around-barrier checks equal the CPU's"; else no "device (CUDA) branch: $(grep -v '^ok' "$T/cuda.out" | head -n 5)"; fi
 fi
 wg() { node $D/wgsl_run.mjs "$@" 2>&1 | grep -v '^Warning'; }
 wg badgrid "$T/reduce.wgsl" > "$T/wg.out"; code=${PIPESTATUS[0]}
@@ -91,6 +113,8 @@ else
   grep -q "^ok" "$T/wg.out" && ok "device (WebGPU): $(head -c 160 "$T/wg.out")" || no "device (WebGPU) badgrid: $(cat "$T/wg.out")"
   wg reduce "$T/reduce.wgsl" "$T/ref.txt" > "$T/wg.out"
   if [ "$(grep -c '^FAIL' "$T/wg.out")" -eq 0 ] && [ "$(grep -c '^ok' "$T/wg.out")" -ge 25 ]; then ok "device (WebGPU): $(grep -c '^ok' "$T/wg.out") reduction checks equal fibber's CPU reference"; else no "device (WebGPU) reductions: $(grep -v '^ok' "$T/wg.out" | head -n 5)"; fi
+  wg branch "$T/branch.wgsl" > "$T/wg.out"
+  if [ "$(grep -c '^FAIL' "$T/wg.out")" -eq 0 ] && [ "$(grep -c '^ok' "$T/wg.out")" -eq 4 ]; then ok "device (WebGPU): 4 branch-around-barrier checks equal the CPU's"; else no "device (WebGPU) branch: $(grep -v '^ok' "$T/wg.out" | head -n 5)"; fi
   wg atomics "$T/atomics.wgsl" > "$T/wg.out"
   if [ "$(grep -c '^FAIL' "$T/wg.out")" -eq 0 ] && [ "$(grep -c '^ok' "$T/wg.out")" -ge 5 ]; then ok "device (WebGPU): $(grep -c '^ok' "$T/wg.out") atomics checks equal the CPU's"; else no "device (WebGPU) atomics: $(grep -v '^ok' "$T/wg.out" | head -n 5)"; fi
 fi
@@ -100,13 +124,24 @@ sed 's/atom.shared.max.s32/atom.shared.xxx.s32/' "$T/atomics.ptx" > "$T/p.ptx"
 if ptx_checks "$T/reduce.ptx" "$T/p.ptx" > /dev/null; then no "planted: a PTX without atom.shared passed the text checks"; else ok "planted: a PTX without atom.shared fails the text checks"; fi
 sed 's/atomicCompareExchangeWeak/atomicXxx/g' "$T/atomics.wgsl" > "$T/p.wgsl"
 if wgsl_checks "$T/reduce.wgsl" "$T/p.wgsl" > /dev/null; then no "planted: a WGSL without compare-and-exchange passed the text checks"; else ok "planted: a WGSL without compare-and-exchange fails the text checks"; fi
+sed '0,/workgroupBarrier();/s//workgroupBarrier(); switch L {/' "$T/branch.wgsl" > "$T/p.wgsl"
+if branch_text "$T/p.wgsl" > /dev/null; then no "planted: a branch.wgsl with a state machine passed the text checks"; else ok "planted: a state machine in branch.wgsl fails the text checks"; fi
+sed '0,/workgroupBarrier();/s//if (fibw_lid.x < 3u) { workgroupBarrier(); }/' "$T/branch.wgsl" > "$T/p.wgsl"
+if command -v node > /dev/null 2>&1 && node examples/webgpu/js/validate.mjs "$T/branch.wgsl" > /dev/null 2>&1; then
+  if node examples/webgpu/js/validate.mjs "$T/p.wgsl" > "$T/tint" 2>&1; then no "planted: a barrier under a thread-dependent if was accepted by Tint"; else grep -q "uniform control flow" "$T/tint" && ok "planted: a barrier under a thread-dependent if is rejected by Tint (uniform control flow)" || no "planted Tint: $(head -n 3 "$T/tint")"; fi
+fi
 if [ $cuda_on -eq 1 ]; then
+  sed -E 's/bar\.sync[[:space:]]+0;//' "$T/branch.ptx" > "$T/p.ptx"
+  if cuda branch "$T/p.ptx" > "$T/cuda.out" 2>&1; then no "planted: branch kernels without bar.sync passed the device comparison"; else grep -q "^FAIL rev" "$T/cuda.out" && ok "planted: branch kernels without bar.sync fail the device comparison (CUDA)" || no "planted branch PTX: $(head -n 3 "$T/cuda.out")"; fi
   sed 's/^ref sum-i32 1000003 7 32 .*/ref sum-i32 1000003 7 32 1/' "$T/ref.txt" > "$T/ref-bad.txt"
   if cuda reduce "$T/reduce.ptx" "$T/ref-bad.txt" > "$T/cuda.out" 2>&1; then no "planted: a wrong reference sum was accepted by the device comparison"; else grep -q "^FAIL sum-i32 n=1000003 grid=7" "$T/cuda.out" && ok "planted: a wrong reference value fails the device comparison (CUDA)" || no "planted reference: $(grep -v '^ok' "$T/cuda.out" | head -n 3)"; fi
   sed 's/atom.global.add.u32/atom.global.or.b32/' "$T/atomics.ptx" > "$T/p.ptx"
   if cuda atomics "$T/p.ptx" > "$T/cuda.out" 2>&1; then no "planted: an atomic or in place of the atomic add passed the histogram"; else grep -q "^FAIL hist" "$T/cuda.out" && ok "planted: an atomic or in place of the atomic add fails the histogram on the device (CUDA)" || no "planted histogram: $(grep -v '^ok' "$T/cuda.out" | head -n 3)"; fi
 fi
 if [ $wg_on -eq 1 ]; then
+  sed 's/workgroupBarrier();//' "$T/branch.wgsl" > "$T/p.wgsl"
+  wg branch "$T/p.wgsl" > "$T/wg.out"
+  if grep -q "^FAIL rev" "$T/wg.out"; then ok "planted: branch kernels without workgroupBarrier fail the device comparison (WebGPU)"; else no "planted branch WGSL: $(head -n 3 "$T/wg.out")"; fi
   sed 's/atomicAdd(/atomicOr(/g' "$T/atomics.wgsl" > "$T/p.wgsl"
   wg atomics "$T/p.wgsl" > "$T/wg.out"
   if grep -q "^FAIL hist" "$T/wg.out"; then ok "planted: atomicOr in place of atomicAdd fails the histogram on the device (WebGPU)"; else no "planted WGSL histogram: $(head -n 3 "$T/wg.out")"; fi
