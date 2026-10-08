@@ -89,6 +89,7 @@ warp_wgsl_checks() { # warp_wgsl_checks WARP.wgsl
 }
 if warp_wgsl_checks "$T/warp.wgsl"; then ok "WGSL: enable subgroups, the header line, the shuffles, the ballot, the entry builtins"; else no "warp WGSL content"; fi
 if grep -qi 'subgroup' "$T/plain.wgsl" "$T/atomics.wgsl"; then no "a module with no warp form prints subgroups"; else ok "WGSL: a module with no warp form prints nothing of subgroups"; fi
+wgsl $D/reduce-all.fib "$T/x.wgsl" 2> "$T/err" || no "reduce-all.fib no longer builds for WGSL: $(head -c 200 "$T/err")"
 grep -q '^warning: wgsl: function .*state machine' "$T/err" && ok "WGSL: a function the relooper cannot structure warns and falls back to the state machine: $(grep -m1 '^warning: wgsl' "$T/err" | cut -c1-110)" || no "no fallback warning for the loop with several exits: $(head -c 200 "$T/err")"
 if [ -x "$NAGA" ]; then
   for w in reduce atomics f32; do
