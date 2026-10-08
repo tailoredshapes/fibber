@@ -17,7 +17,8 @@ SEED_DIR := $(BUILD)/seed/$(SEED_SHA)
 SEED_FIBC := $(SEED_DIR)/bin/fibc
 export FIB_SEED_CACHE ?= $(HOME)/.cache/fibber-scratch/seeds
 
-$(SEED_FIBC): SEED scripts/fetch-seed.sh
+# the directory is named by the sha256 in SEED, so SEED itself is no prerequisite: a touched SEED with the same sha256 changes nothing
+$(SEED_FIBC): | scripts/fetch-seed.sh
 	rm -rf $(SEED_DIR); mkdir -p $(SEED_DIR)/unpack
 	FIB_PLATFORM=$(FIB_PLATFORM) scripts/fetch-seed.sh $(SEED_DIR)/unpack > /dev/null
 	mv $(SEED_DIR)/unpack/fibc-*/* $(SEED_DIR)/ && rm -rf $(SEED_DIR)/unpack

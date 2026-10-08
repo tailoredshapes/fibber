@@ -51,7 +51,7 @@ endef
 $(RELEASE_DIR)/shim/cc: mk/release.mk | $(RELEASE_DIR)/shim/
 	$(file >$@,$(SHIM_CC))chmod +x $@
 $(RELEASE_TREE)/bin/fibc: $(RELEASE_DIR)/F3 $(RELEASE_DIR)/stage.ok $(RELEASE_DIR)/shim/cc $(RELEASE_LLVM_DEP)
-	mkdir -p $(@D) && REAL_CC=$$(command -v cc) PATH="$(abspath $(RELEASE_DIR)/shim):$$PATH" $(call release_build,$(RELEASE_DIR)/F3,$@.new) && mv $@.new $@
+	rm -rf $(@D).new && mkdir -p $(@D).new $(@D) && REAL_CC=$$(command -v cc) PATH="$(abspath $(RELEASE_DIR)/shim):$$PATH" $(call release_build,$(RELEASE_DIR)/F3,$(@D).new/fibc) && mv $(@D).new/fibc $@ && rmdir $(@D).new   # built under its own name: fibc embeds it
 # The checks of the shipped binary (scripts/lib/check-shipped.sh: no rpath, no libLLVM, only the system libraries, no AVX-512 outside BLAKE3, the
 # start-up CPU check in it, and it emits what F emits).
 $(RELEASE_DIR)/binary.ok: $(RELEASE_TREE)/bin/fibc $(RELEASE_DIR)/emit.F scripts/lib/check-shipped.sh
@@ -96,7 +96,7 @@ endif
 $(RELEASE_DIR)/tree.ok: $(RELEASE_DIR)/binary.ok $(RELEASE_TREE)/README.txt $(RELEASE_TREE)/LICENSE $(RELEASE_DIR)/lib.ok $(RELEASE_DIR)/musl.ok
 	$(call stamp,env -i PATH=/usr/bin:/bin $(abspath $(RELEASE_TREE))/bin/fibc --version \
 	  && echo '(defun main () -> i64 (do (println "hello from fibber") 0))' > $(RELEASE_DIR)/hello.fib \
-	  && cd $(RELEASE_DIR) && env -i PATH=/usr/bin:/bin $(abspath $(RELEASE_TREE))/bin/fibc build hello.fib -o hello && [ "$$(env -i ./hello)" = "hello from fibber" ] \
+	  && (cd $(RELEASE_DIR) && env -i PATH=/usr/bin:/bin $(abspath $(RELEASE_TREE))/bin/fibc build hello.fib -o hello && [ "$$(env -i ./hello)" = "hello from fibber" ]) \
 	  && echo "the shipped fibc builds hello and it runs")
 $(DIST)/$(RELEASE_NAME).tar.gz: $(RELEASE_DIR)/tree.ok | $(DIST)/
 	rm -f $@; v=$$(tar --version 2> /dev/null || true); if grep -q 'GNU tar' <<< "$$v"; then tar -C $(RELEASE_DIR) --owner=0 --group=0 --sort=name -czf $@ $(RELEASE_NAME); \
