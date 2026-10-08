@@ -10,6 +10,8 @@
 ;;   nested N       a pmap whose body pmaps (forks inside forks)
 ;;   trap N         N pool tasks that trap, each asked with try-join (the chain, the worker replacement)
 ;;   blocking N     N tasks each under `blocking` (a spare worker started)
+;;   gap N          N rounds from main: a pause (workers park), a fork of a task of 0 to 25 us of work, the join (the windows of a lost wakeup and of a
+;;                  joiner that registers as the task completes; the planted faults of scripts/mutant-sched.sh lost-wakeup and complete-no-fence)
 (ns main (:use fib.core fib.async fib.parallel fib.os))
 
 (defun tree (d: i64) -> i64
@@ -23,6 +25,15 @@
 (defun wide (n: i64) -> i64
   (let ((ts (loop ((i 0) (out [])) (if (< i n) (recur (+ i 1) (conj out (fork-task (fn () (* i 2))))) out))))
     (reduce (fn (acc: i64 t: (Task i64)) (+ acc (join t))) 0 ts)))
+
+(defun burn (k: i64) -> i64 (loop ((i 0) (a 1)) (if (< i k) (recur (+ i 1) (rem (+ (* a 7) i) 1000003)) a)))
+
+(defun gap (n: i64) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i n)
+        (do (sleep-ns (* (rem i 5) 30000))
+            (recur (+ i 1) (+ acc (if (>= (join (fork-task (fn () (burn (* (rem i 13) 2000))))) 0) 1 0))))
+        acc)))
 
 (defun run (kind: str n: i64) -> i64
   (cond (= kind "tree") (if (= (join (fork-task (fn () (tree n)))) (shl 1 n)) 0 1)
@@ -38,6 +49,7 @@
         (= kind "trap") (let ((ts (vec (map (fn (i) (fork-task (fn () (if (= (rem i 3) 0) (trap "planted") i)))) (range n)))))
                           (let ((bad (count (filter (fn (t: (Task i64)) (match (try-join t) ((Err e) (= (. e message) "planted")) ((Ok _) false))) ts))))
                             (if (= bad (quot (+ n 2) 3)) 0 1)))
+        (= kind "gap") (if (= (gap n) n) 0 1)
         (= kind "blocking") (let ((ts (vec (map (fn (i) (fork-task (fn () (blocking (do (sleep-ns 1000000) i))))) (range n)))))
                               (if (= (reduce (fn (acc: i64 t: (Task i64)) (+ acc (join t))) 0 ts) (quot (* n (- n 1)) 2)) 0 1))
         :else 2))

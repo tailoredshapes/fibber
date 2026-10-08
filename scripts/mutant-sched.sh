@@ -99,8 +99,8 @@ stress() {
 case $MODE in
   steal-no-cas|pop-last-no-race|run-unclaimed) cases 8640- 8645-; stress tree 18 120; stress wide 20000 120 ;;
   pop-fence-release) cases 8640- 8645-; stress tree 18 120 ;;
-  lost-wakeup)       stress storm 200000 60 FIB_THREADS=2; stress storm 200000 60 FIB_THREADS=1 ;;
-  complete-no-fence) stress storm 300000 60 FIB_THREADS=2; stress storm 300000 60 FIB_THREADS=4 ;;
+  lost-wakeup)       stress gap 20000 60 FIB_THREADS=2; stress gap 20000 60 FIB_THREADS=4; stress storm 200000 60 FIB_THREADS=1 ;;
+  complete-no-fence) stress gap 20000 60 FIB_THREADS=2; stress gap 20000 60 FIB_THREADS=4; stress storm 300000 60 FIB_THREADS=4 ;;
   park-not-help)     cases 8640-; stress tree 16 60 FIB_THREADS=4 ;;
   complete-first)    cases 8647- 8640- ;;
   check)
