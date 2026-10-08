@@ -24,7 +24,7 @@ mutants=(
   'no-object-cell|s/(some "a cell of an object: a kernel has cells of scalars only")/nil/'
   'atomic-add-is-sub@compiler/emit/lower/gpu.fib|s/(starts-with? rest "add-") (some "add")/(starts-with? rest "add-") (some "sub")/'
   'select-swapped@compiler/emit/lower/gpu.fib|s/(str-join \["(select " (v-text c) " " (v-text x) " " (v-text y) ")"\])/(str-join ["(select " (v-text c) " " (v-text y) " " (v-text x) ")"])/'
-  'cas-swaps-expected-and-new@compiler/emit/lower/gpu.fib|s/" " (v-text p) " " (v-text x) " " (v-text n) ") 0)"/" " (v-text p) " " (v-text n) " " (v-text x) ") 0)"/'
+  'cas-swaps-expected-and-new@compiler/emit/lower/gpu.fib|s/(v-text p) " " (v-text x) " " (v-text n) ") 0)"/(v-text p) " " (v-text n) " " (v-text x) ") 0)"/'
 )
 bad=0; n=0
 for m in "${mutants[@]}"; do
