@@ -22,7 +22,6 @@ ifeq ($(UNAME_S),Darwin)
   export PATH := $(CURDIR)/scripts/portable/bin:$(PATH):/opt/homebrew/bin
   export BASH_ENV := $(CURDIR)/scripts/portable/bash-env.sh
   export MAKE
-  export LLVM_LIBDIR LLVM_LIB LLVMLIB
 endif
 PLATFORM := $(shell echo "$(UNAME_S)-$(UNAME_M)" | tr 'A-Z' 'a-z' | sed 's/linux-amd64/linux-x86_64/; s/darwin-aarch64/darwin-arm64/')
 FIB_PLATFORM ?= $(PLATFORM)
@@ -33,6 +32,8 @@ ifeq ($(UNAME_S),Darwin)
   LLVM_LIBDIR ?= /opt/homebrew/opt/llvm@21/lib
   LLVM_LIB := $(LLVM_LIBDIR)
   LLVMLIB := $(LLVM_LIBDIR)
+  # (after the assignments: `export X` before `X ?= ..` defines X empty and the default is then never taken)
+  export LLVM_LIBDIR LLVM_LIB LLVMLIB
 else
   LLVM_LIBDIR ?= /usr/lib/llvm-21/lib
 endif
