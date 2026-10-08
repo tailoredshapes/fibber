@@ -3422,6 +3422,19 @@
   (block withdraw2 (atomicrmw sub seq_cst @fib.sched-sleepers (i32 1)) (br out))
   (block out (ret)))
 
+;; A joiner about to park looks at the task's state a few thousand times first: a task a thief took a moment ago is mostly done within
+;; a microsecond, and a park (a futex wait and the completion's wake-up) costs more than that. 1 when the task is done.
+(define internal (fib.sched-spin-done i1) ((ptr task))
+  (block entry (br loop))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (next i2))))
+      (br (icmp slt i (i64 3000)) look no)))
+  (block look
+    (br (icmp eq (atomic-load acquire i32 (getelementptr %struct.fib.task task (i32 0) (i32 3))) (i32 2)) yes next))
+  (block next (let ((i2 (add i (i64 1)))) (br loop)))
+  (block yes (ret (i1 1)))
+  (block no (ret (i1 0))))
+
 ;; `join` of a pool task (from fib.drive). A worker runs the task itself when it can claim it, else helps with any work there is,
 ;; and parks when there is none or it is too deep in helps. Another thread runs the task itself when it can claim it and the program
 ;; catches (the runner isolates a trap then), else parks: a trap in a task run on a thread without a worker's chain could not be
@@ -3441,14 +3454,17 @@
   (block catching?
     (br (icmp ne (atomic-load monotonic i32 @fib.sched-catching) (i32 0)) try park))
   (block try (br (call @fib.sched-claim-run task) loop park))
-  (block park (call @fib.sched-wait task (i1 0)) (br loop))
+  (block park (br (call @fib.sched-spin-done task) loop park2))
+  (block park2 (call @fib.sched-wait task (i1 0)) (br loop))
   (block worker
     (br (call @fib.sched-claim-run task) loop help))
   (block help
     (br (icmp sge (load i64 (getelementptr i8 w (i64 200))) (load i64 @fib.sched-max-depth)) deep find))
   (block find
     (let ((t (call @fib.sched-find w)))
-      (br (icmp eq t (ptr null)) deep run)))
+      (br (icmp eq t (ptr null)) deep? run)))
+  (block deep? (br (call @fib.sched-spin-done task) loop idle))
+  (block idle (call @fib.sched-wait task (i1 1)) (br loop))
   (block run (call @fib.sched-run t) (br loop))
   (block deep (call @fib.sched-wait task (i1 0)) (br loop))
   (block done (ret)))
