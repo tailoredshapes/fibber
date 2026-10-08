@@ -258,6 +258,17 @@ Recent compiler and library changes include:
   `fibc test` prints the scenarios under their Gherkin names and the `.feature` line that did not hold. It is a front end to the system in
   [the test harness design](docs/design/test-harness.md); the design's "plain-text front end: rejected for now" (section 2.4) is this
   library, built because a project asked for feature files.
+- GPU kernels (core, GPU-2): `(defkernel name (params) body)` is a core form (spec/syntax.md 3.22); its body is the kernel subset
+  (spec/types.md 2.17: scalars, pointers, scalar cells, arithmetic, loops, the `gpu/*` builtins: `gpu/global-id`, `gpu/barrier`,
+  `gpu/shared` block-shared memory), checked at the source (a string, an allocation, a closure, a Simd value, a task, recursion, dyn dispatch
+  are refused at their positions) and compiled for the host too (`fib.gpu/host-launch` runs a kernel over a grid on the CPU: `fibc run
+  examples/gpu/gpu.fib -I examples/gpu`). `fibc build --kernel-target nvptx64-nvidia-cuda` builds the executable with the kernels' PTX
+  embedded (`gpu/program-ptx`) and beside it as `OUT.ptx`, with the launch ABI (each kernel's signature in the PTX header); a program with a
+  kernel built for a platform with no kernel target is refused (no CPU fallback). The host side is the `fib.gpu.device` protocols
+  (`Platform Device Module Kernel Buffer Stream Event`), which a driver implements and a program uses without naming CUDA: `fib-gpu-cuda`
+  (`ssh://git@localhost:2222/tailoredshapes/fib-gpu-cuda.git`, tag `v0.1.0`) passes the device contract `fib.gpu.contract` (7 of 7
+  scenarios, 3 faults caught). Measured there: fibber's shared-memory GEMM at 17.1 TFLOPS at n = 4096 (47% of cuBLAS, the CUDA C kernel's
+  speed), bit for bit the CPU's; [the GPU design](docs/design/gpu.md) has the table and what phase 2 and 3 still owe.
 
 The standard library in `lib/` follows Clojure's names and argument shapes,
 within fibber's static types and ownership model. Its specification and

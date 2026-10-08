@@ -95,3 +95,12 @@ function and a function with an `array-take!` do not pass failures on (fatal the
 checker: sound, and catchability there is what is lost. 4 `try` is a macro of fib.ex over the builtin `catch-run` and a closure, not a
 core form; one exception type, `(ExInfo (Map keyword Datum))`, and `(catch e :when cond ..)` for Clojure's `(catch T e ..)`. 5 A trap
 unwinds only while a catch is active on its thread; elsewhere it is the trap it was (abort, or the task's failure of stage 1).
+
+## GPU (docs/design/gpu.md), the owner, 2026-10-07
+
+The kernel target and `fib.gpu` are CORE, not a driver: "I think its core, we just have to be careful to reject on platforms that don't have
+a gpu... 'Defkernel' is a smart way of making it a deliberate dev choice." So: `defkernel` is the deliberate opt-in; a program with a
+kernel built for a platform that has no kernel target is rejected with a clear message naming the kernel and the platform (never a silent
+CPU fallback); the drivers (fib-gpu-cuda, later Metal/Vulkan) stay in their own repositories per ADR 0011; the lIR forms of spec/lir.md
+§6.9a (`kernelcc`, `(sreg R)`, `(barrier)`, the align-1 rule) are accepted. Phase 1 (the `:kernel` core form, the source-level kernel
+checker, the launch ABI, the `fib.gpu` builtins and the `Device` protocol) is the next package.

@@ -1,78 +1,84 @@
-;; fib.compress.lz4.blockdec: the LZ4 block decoder, safe on hostile input (docs/design/compress.md 6.2). A block is a series of sequences: a token (literal
-;; length in the high nibble, match length minus 4 in the low), the literal length's extension bytes (while a byte is 255), the literals, a 2-byte little-endian
-;; offset, the match length's extension. The last sequence has literals only: the block ends when the input does, right after a literal run.
-;; EVERY index is checked before it is used: the literals are inside the input, the offset reaches no further back than `lo`, the output stays within `cap`; an
-;; overlapping match (offset below its length) repeats the pattern. A length sum cannot overflow (it is at most 255 times the input length). Nothing is read or
-;; written outside [0, ilen) of the input and [lo, dlen) of the output buffer, except that the wild copies (chunks of 8 or 16 bytes, only while the buffer has room
-;; for the chunk: `dlen` is the buffer's real end, or `cap` when the bytes after the output are the caller's) write up to 15 bytes after the output's end.
+;; fib.compress.lz4.blockdec: the LZ4 block decoder, safe on hostile input (docs/design/compress.md 5.3, 6). A block is a series of sequences: a token (literal length in the high
+;; nibble, match length minus 4 in the low), the literal length's extension bytes (while a byte is 255), the literals, a 2-byte little-endian offset, the match length's extension.
+;; The last sequence has literals only: the block ends when the input does, right after a literal run.
 ;;   (decode-block ip ilen dp dlen op lo cap) -> output end, or a negative code: -1 corrupt, -2 truncated (the input ended inside a sequence), -3 over the cap
+;; ip/ilen: the input; dp/dlen: the output buffer and its real length; the output is written from index op, a match may reach back to index lo, no output byte at or past cap is
+;; ever part of the result.
+;;
+;; TWO PATHS. The FAST path takes a sequence whose literal run is at most 14 and whose match is at most 18, when the input and output have room for the fixed-size vector copies it does
+;; without looking at lengths again. Its SAFETY PROOF is the slack condition, written as `i <= ilim and op <= dlim`:
+;;   ilim = min(ilen - 17, 2^31 - 1000): the token is at i, the 16-byte literal chunk reads [i+1, i+17) and the offset (at i+1+lit <= i+15) reads up to i+17: all inside the input;
+;;   dlim = min(dlen - 46, cap - 32, 2^32 - 1000): the literal chunk writes [op, op+16); the match starts at op2 = op+lit <= op+14 and its chunks write at most [op2, op2+32) <= op+46 <= dlen,
+;;     and its 18 bytes end at op2 + 18 <= op + 32 <= cap: inside the buffer and below the cap. (The wild bytes written past the sequence's end are inside the buffer, after the output's end,
+;;     so they are overwritten by the next sequence or are beyond the result; a caller whose buffer continues past the cap passes dlen = cap, which this proof then respects.)
+;;   the offset is checked by one unsigned compare: 1 <= off <= op2 - lo (zero wraps to a huge number), so a match reads only bytes in [lo, op2) and written bytes.
+;; Anything the fast path does not take, or any check it fails, goes to `slow-seq`, which checks EVERY length and index and says which check failed. A length sum cannot overflow
+;; (at most 255 times the input length). The packed result of the fast and slow paths is (i << 32) | op: inputs below 2 GiB and outputs below 4 GiB take the fast path; others only the slow.
 (ns fib.compress.lz4.blockdec (:use fib.core fib.seq fib.coll fib.compress.lz4.mem))
 
 (def e-corrupt: i64 -1)
 (def e-truncated: i64 -2)
 (def e-too-large: i64 -3)
+(def done-flag: i64 4611686018427387904)
 
 ;; The index of the first byte at or after i that is not 255 (a length extension ends there), or -1 when the input ends first.
 (defun ext-end (ip: ptr i: i64 ilen: i64) -> i64
   (loop [k i] (cond (>= k ilen) -1 (= (rd8 ip k) 255) (recur (u+ k 1)) :else k)))
 
-;; The packed result of a length: the extension is `e - i` bytes of 255 and the byte at e; the length is nib + 255 * (e - i) + byte.
+;; The length of an extension: nib + 255 * (e - i) + the byte at e.
 (defun ext-len (ip: ptr i: i64 e: i64 nib: i64) -> i64 (u+ nib (u+ (* 255 (u- e i)) (rd8 ip e))))
-
-;; The common match, a short one at a distance of at least 16 bytes with room to spare: two 16-byte chunks (the second writes nothing that is not later overwritten or beyond the end).
-(defun do-match (dp: ptr op: i64 off: i64 ml: i64 dlen: i64) -> unit
-  (if (and (>= off 16) (<= ml 32) (<= (u+ op 32) dlen))
-    (do (cp16 dp op dp (u- op off)) (cp16 dp (u+ op 16) dp (u- (u+ op 16) off)))
-    (copy-match dp op off ml (u- dlen op))))
 
 (defun copy-lits (ip: ptr i: i64 ilen: i64 dp: ptr op: i64 dlen: i64 n: i64) -> unit
   (if (and (<= n 16) (<= (u+ i 16) ilen) (<= (u+ op 16) dlen)) (cp16 dp op ip i) (copy-exact dp op ip i n)))
 
-;; One sequence from ip (the token already read: `tok`, `i` just after it); the new input position and output position are returned through the caller's
-;; loop, so this function is the loop body of `decode-block`.
-;; The common sequence: a literal run of at most 14, a match of at most 18, room in the input for a 16-byte literal chunk and the offset, and in the output for the chunks
-;; (ilim and dlim are the limits of `i` and `op` for that); `fast-ok?` also checks the offset and the cap, so a sequence that fails any check goes the slow way, which says why.
-(defun fast-ok? (ip: ptr i: i64 op: i64 ilim: i64 dlim: i64 lo: i64 cap: i64) -> bool
-  (and (<= i ilim) (<= op dlim)
-       (let [tok (rd8 ip i)]
-         (and (< tok 240) (< (bit-and tok 15) 15)
-              (let [lit (shr tok 4) off (rd16 ip (u+ (u+ i 1) lit)) op2 (u+ op lit)]
-                (and (> off 0) (<= off (u- op2 lo)) (<= (u+ (u+ op2 (bit-and tok 15)) 4) cap)))))))
+;; The sequence at i, op, checking everything: (i << 32 | op) of the next, or done-flag + output end when the block ends, or a negative code.
+(defun slow-seq (ip: ptr ilen: i64 dp: ptr dlen: i64 lo: i64 cap: i64 i: i64 op: i64) -> i64
+  (if (>= i ilen) e-truncated
+    (let [tok (rd8 ip i) lnib (shr tok 4)
+          le (if (= lnib 15) (ext-end ip (u+ i 1) ilen) (u+ i 0))]
+      (if (< le 0) e-truncated
+        (let [i1 (if (= lnib 15) (u+ le 1) (u+ i 1))
+              lit (if (= lnib 15) (ext-len ip (u+ i 1) le 15) lnib)]
+          (cond (> lit (u- ilen i1)) e-truncated
+                (> lit (u- cap op)) e-too-large
+                :else (slow-match ip ilen dp dlen lo cap tok (u+ i1 lit) op (u+ op lit) (copy-lits ip i1 ilen dp op dlen lit))))))))
 
-;; The sequence at i, op, as above: the new i and op packed (i shifted left 32; `decode-block` keeps the fast path to inputs below 2 GiB and outputs below 4 GiB).
-(defun fast-seq (ip: ptr i: i64 op: i64 dp: ptr dlen: i64) -> i64
-  (let [tok (rd8 ip i) lit (shr tok 4) i1 (u+ i 1) i2 (u+ i1 lit) op2 (u+ op lit) off (rd16 ip i2) ml (u+ (bit-and tok 15) 4)]
-    (do (cp16 dp op ip i1)
-        (if (>= off 16)
-          (do (cp16 dp op2 dp (u- op2 off)) (cp16 dp (u+ op2 16) dp (u- (u+ op2 16) off)))
-          (copy-match dp op2 off ml (u- dlen op2)))
-        (bit-or (shl (u+ i2 2) 32) (u+ op2 ml)))))
+;; After the literals (copied): the end of the block, or the offset and the match.
+(defun slow-match (ip: ptr ilen: i64 dp: ptr dlen: i64 lo: i64 cap: i64 tok: i64 i2: i64 op: i64 op2: i64 u: unit) -> i64
+  (cond (= i2 ilen) (u+ done-flag op2)
+        (> (u+ i2 2) ilen) e-truncated
+        :else
+        (let [off (rd16 ip i2) i3 (u+ i2 2) mnib (bit-and tok 15)]
+          (if (or (= off 0) (> off (u- op2 lo))) e-corrupt
+            (let [me (if (= mnib 15) (ext-end ip i3 ilen) i3)]
+              (if (< me 0) e-truncated
+                (let [i4 (if (= mnib 15) (u+ me 1) i3) ml (u+ 4 (if (= mnib 15) (ext-len ip i3 me 15) mnib))]
+                  (if (> ml (u- cap op2)) e-too-large
+                    (do (copy-match dp op2 off ml (u- dlen op2)) (bit-or (shl i4 32) (u+ op2 ml)))))))))))
+
+;; The match of the fast path (off >= 1, ml <= 18, room for 32 bytes): 16 or more apart, two 16-byte chunks; 8 to 15 apart, three 8-byte chunks; below 8 the pattern's first
+;; eight bytes are written one at a time and the rest by 8-byte chunks from the distance of the first multiple of the period that is at least 8.
+(defun fast-match (dp: ptr op2: i64 off: i64) -> unit
+  (cond (>= off 16) (do (cp16 dp op2 dp (u- op2 off)) (cp16 dp (u+ op2 16) dp (u- (u+ op2 16) off)))
+        (>= off 8) (do (cp8 dp op2 dp (u- op2 off)) (cp8 dp (u+ op2 8) dp (u- (u+ op2 8) off)) (cp8 dp (u+ op2 16) dp (u- (u+ op2 16) off)))
+        :else
+        (let [s (* off (quot (u+ 7 off) off)) src (u- op2 off)]
+          (do (wr8 dp op2 (rd8 dp src)) (wr8 dp (u+ op2 1) (rd8 dp (u+ src 1))) (wr8 dp (u+ op2 2) (rd8 dp (u+ src 2))) (wr8 dp (u+ op2 3) (rd8 dp (u+ src 3)))
+              (wr8 dp (u+ op2 4) (rd8 dp (u+ src 4))) (wr8 dp (u+ op2 5) (rd8 dp (u+ src 5))) (wr8 dp (u+ op2 6) (rd8 dp (u+ src 6))) (wr8 dp (u+ op2 7) (rd8 dp (u+ src 7)))
+              (cp8 dp (u+ op2 8) dp (u- (u+ op2 8) s)) (cp8 dp (u+ op2 16) dp (u- (u+ op2 16) s))))))
+
+(defun fast? (ip: ptr i: i64 op: i64 ilim: i64 dlim: i64 lo: i64) -> bool
+  (and (<= i ilim) (<= op dlim)
+       (let [tok (rd8 ip i) lit (shr tok 4)]
+         (and (< lit 15) (< (bit-and tok 15) 15) (ult (u- (rd16 ip (u+ (u+ i 1) lit)) 1) (u- (u+ op lit) lo))))))
 
 (defun decode-block (ip: ptr ilen: i64 dp: ptr dlen: i64 op0: i64 lo: i64 cap: i64) -> i64
-  (let [ilim (min (u- ilen 17) 2147483000) dlim (min (u- dlen 46) 4294967000)]
-   (loop [i 0 op op0]
-    (if (fast-ok? ip i op ilim dlim lo cap) (let [r (fast-seq ip i op dp dlen)] (recur (shr r 32) (bit-and r 4294967295)))
-    (if (>= i ilen) e-truncated
-      (let [tok (rd8 ip i)
-            lnib (shr tok 4)
-            le (if (= lnib 15) (ext-end ip (u+ i 1) ilen) (u+ i 0))]
-        (if (< le 0) e-truncated
-          (let [i1 (if (= lnib 15) (u+ le 1) (u+ i 1))
-                lit (if (= lnib 15) (ext-len ip (u+ i 1) le 15) lnib)]
-            (cond (> lit (u- ilen i1)) e-truncated
-                  (> lit (u- cap op)) e-too-large
-                  :else
-                  (let [i2 (u+ i1 lit) op2 (u+ op lit)]
-                    (do (copy-lits ip i1 ilen dp op dlen lit)
-                        (if (= i2 ilen) op2
-                          (if (> (u+ i2 2) ilen) e-truncated
-                            (let [off (rd16 ip i2) i3 (u+ i2 2)]
-                              (if (or (= off 0) (> off (u- op2 lo))) e-corrupt
-                                (let [mnib (bit-and tok 15)
-                                      me (if (= mnib 15) (ext-end ip i3 ilen) i3)]
-                                  (if (< me 0) e-truncated
-                                    (let [i4 (if (= mnib 15) (u+ me 1) i3)
-                                          ml (u+ 4 (if (= mnib 15) (ext-len ip i3 me 15) mnib))]
-                                      (if (> ml (u- cap op2)) e-too-large
-                                        (do (do-match dp op2 off ml dlen)
-                                            (recur i4 (u+ op2 ml))))))))))))))))))))))
+  (let [ilim (min (u- ilen 17) 2147483000) dlim (min (min (u- dlen 46) (u- cap 32)) 4294967000)]
+    (loop [i 0 op op0]
+      (if (fast? ip i op ilim dlim lo)
+        (let [tok (rd8 ip i) lit (shr tok 4) i2 (u+ (u+ i 1) lit) op2 (u+ op lit)]
+          (do (cp16 dp op ip (u+ i 1)) (fast-match dp op2 (rd16 ip i2)) (recur (u+ i2 2) (u+ op2 (u+ (bit-and tok 15) 4)))))
+        (let [r (slow-seq ip ilen dp dlen lo cap i op)]
+          (cond (< r 0) r
+                (>= r done-flag) (u- r done-flag)
+                :else (recur (shr r 32) (bit-and r 4294967295))))))))

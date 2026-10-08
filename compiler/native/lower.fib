@@ -16,7 +16,8 @@
         (globals: (Cell (Map str i64)) (cell {})))
     (let ((lx (Lx (. owned ctx) (. owned module) td structs fields funcs globals (. (tt/target-row-of-triple triple) tail-cc)
                   (. (tt/target-row-of-triple triple) tail-kind)
-                  (= (. (tt/target-row-of-triple triple) pointer-bits) 32) (= (. (tt/target-row-of-triple triple) os) "wasi")))
+                  (= (. (tt/target-row-of-triple triple) pointer-bits) 32) (= (. (tt/target-row-of-triple triple) os) "wasi")
+                  (tt/kernel-row? (tt/target-row-of-triple triple))))
           (r (module-items lx m)))
       (do (unsafe (do (lt/LLVMDisposeTargetData td) (free dl)))
           (match r
@@ -25,7 +26,22 @@
                       ((Err msg) (do (owned-dispose owned) (Err (ErrInternal msg))))
                       ((Ok _) (Ok owned)))))))))
 
+;; A `kernelcc` function or a `shared` global on a target that is not a kernel target: refused here, before LLVM sees a convention its
+;; backend has no code for, or an address space the target has no memory for.
+(defun kernel-refusal :private (lx: Lx items: (Vec LItem)) -> (Option str)
+  (if (. lx kernel)
+      nil
+      (match (first (filter (fn (it: LItem) (match it ((ItDefine f) (match (. (. f ty) cc) ((CcKernel) true) (_ false))) ((ItGlobal g) (. g shared)) (_ false))) items))
+        ((some (ItDefine f)) (some (str "@" (. f name) " is kernelcc: only a kernel target (nvptx64-nvidia-cuda) lowers a kernel; docs/design/gpu.md")))
+        ((some (ItGlobal g)) (some (str "@" (. g name) " is shared: only a kernel target (nvptx64-nvidia-cuda) has block-shared memory; docs/design/gpu.md")))
+        (_ nil))))
+
 (defun module-items :private (lx: Lx m: LModule) -> (Result unit LairError)
+  (match (kernel-refusal lx (. m items))
+    ((some why) (Err (ErrBackend why)))
+    (nil (module-items-of lx m))))
+
+(defun module-items-of :private (lx: Lx m: LModule) -> (Result unit LairError)
   (let ((items (. m items))
         (tgt (module-target m)))
     (do (declare-structs lx items)
@@ -33,7 +49,7 @@
           (match (nth items i)
             ((ItDeclare d) (add-declare lx (. d name) (. d ty) (hidden-mods (. d hidden))))
             ((ItDefine f) (add-function lx (. f name) (. f ty) (. f mods) tgt))
-            ((ItGlobal g) (add-global lx (. g name) (. g ty) (. g mods)))
+            ((ItGlobal g) (if (. g shared) (add-shared-global lx (. g name) (. g ty)) (add-global lx (. g name) (. g ty) (. g mods))))
             ((ItDeclareGlobal g) (add-global lx (. g name) (. g ty) (hidden-mods (. g hidden))))
             ((ItStruct _) ())
             ((ItTarget _) ())))
@@ -46,12 +62,12 @@
     (if (>= i (count items))
         (Ok ())
         (match (nth items i)
-          ((ItGlobal g) (match (lx-constant lx (. g init))
+          ((ItGlobal g) (if (. g shared) (recur (+ i 1)) (match (lx-constant lx (. g init))
                           ((Err x) (Err x))
                           ((Ok init) (let ((gv (global-of lx (. g name))))
                                        (do (unsafe (do (core/LLVMSetInitializer gv init)
                                                        (core/LLVMSetGlobalConstant gv (if (. g constant) 1i32 0i32))))
-                                           (recur (+ i 1)))))))
+                                           (recur (+ i 1))))))))
           (_ (recur (+ i 1)))))))
 
 (defun global-of :private (lx: Lx name: str) -> i64
@@ -146,6 +162,19 @@
       (do (unsafe (free n))
           (set-modifiers gv mods)
           (let ((gs (. lx globals))) (update! gs (fn (m) (assoc m name gv))))))))
+
+;; A `shared` global (spec/lir.md 6.9a): block-shared memory of a kernel, LLVM address space 3 (NVPTX `.shared`), content undefined at block start
+;; (`undef`: NVPTX refuses an initialiser there), internal to the module. What `@NAME` denotes is the generic address of it (an `addrspacecast`
+;; constant), so every `load` and `store` through it is an ordinary access that LLVM's InferAddressSpaces turns into `ld.shared`/`st.shared`.
+(defun add-shared-global :private (lx: Lx name: str ty: LType) -> unit
+  (let ((t (lx-ty lx ty))
+        (n (ffi/bytes-new name)))
+    (let ((gv (unsafe (core/LLVMAddGlobalInAddressSpace (. lx module) t n 3i32))))
+      (do (unsafe (do (free n)
+                      (core/LLVMSetInitializer gv (core/LLVMGetUndef t))
+                      (core/LLVMSetLinkage gv 8i32)))
+          (let ((generic (unsafe (core/LLVMConstAddrSpaceCast gv (core/LLVMPointerTypeInContext (. lx ctx) 0i32)))))
+            (let ((gs (. lx globals))) (update! gs (fn (m) (assoc m name generic)))))))))
 
 ;; Applies linkage and visibility words (spec/lir.md 4.3): internal is 8, private 9, hidden visibility 1.
 (defun set-modifiers :private (v: i64 mods: LModifiers) -> unit

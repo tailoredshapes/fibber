@@ -17,9 +17,13 @@
 (defun words () -> (Vec str) ["the" "of" "and" "compression" "block" "frame" "literal" "match" "offset" "token" "stream" "checksum" "window" "a" "to" "in" "hash" "chain"])
 
 (defun text (seed: i64 n: i64) -> (Array i8)
-  (let [r (rng-new seed) ws (words)
-        s (loop [acc "" k 0] (if (>= (str-len acc) n) acc (recur (str acc (nth ws (rng-below r (count ws))) (if (= (rng-below r 9) 0) ".\n" " ")) (+ k 1))))]
-    (array-copy (str-bytes s) 0 n)))
+  (let [r (rng-new seed) ws (vec (map (fn (w: str) (str-bytes w)) (words))) nw (count ws) c (cell (array n 0i8))]
+    (do (loop [pos 0]
+          (when (< pos n)
+            (let [w (nth ws (rng-below r nw)) k (min (array-len w) (- n pos)) sep (if (= (rng-below r 9) 0) 10i8 32i8)]
+              (do (array-blit! &c pos w 0 k)
+                  (let [p2 (+ pos k)] (do (when (< p2 n) (array-set! &c p2 sep)) (recur (+ p2 1)))))))) 
+        @c)))
 
 ;; A pattern of `period` bytes repeated: overlapping matches with offset = period.
 (defun pattern (seed: i64 period: i64 n: i64) -> (Array i8)

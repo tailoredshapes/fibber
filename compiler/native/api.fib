@@ -6,7 +6,7 @@
 
 (ns native.api
   (:use lir.ast native.error native.jit native.aot)
-  (:require [native.pipeline :as pipe] [native.link :as link]))
+  (:require [native.pipeline :as pipe] [native.link :as link] [native.kernel :as kernel] [native.target :as target] [types.targets :as tt]))
 
 
 (defstruct Jit (session: JitSession))
@@ -71,6 +71,14 @@
     ((Err e) (Err (lair-error-str e)))
     ((Ok _) (Ok ()))))
 
+;; `header` (the kernel signatures, native.kernel) before the PTX `body`.
+(defun with-header :private (header: str body: (Array i8)) -> (Array i8)
+  (let ((h (str-bytes header)) (n (array-len body)))
+    (let ((out (cell (array (+ (array-len h) n) 0i8))))
+      (do (dotimes (i (array-len h)) (array-set! &out i (array-get h i)))
+          (dotimes (i n) (array-set! &out (+ (array-len h) i) (array-get body i)))
+          @out))))
+
 ;; Compiles the module `src`, which must satisfy the `main` rule, and links it into the executable `path`. (jit.fib `build-executable`)
 (defun build-executable (src: str path: str opt: i64 libs: (Vec str) dirs: (Vec str)) -> (Result unit str)
   (cond (= path "") (Err "path is empty")
@@ -80,18 +88,31 @@
                           ((Err e) (Err (lair-error-str e)))
                           ((Ok m) (unit-result (aot-build-executable m path path (AotOptions l libs dirs)))))))))
 
-;; The output of `--emit KIND` (obj, asm, llvm).
+;; The output of `--emit KIND` (obj, asm, llvm; ptx is asm on a kernel target, whose assembly is PTX, and nothing elsewhere).
 (defun output-kind :private (kind: str) -> (Result AotOutput str)
   (cond (= kind "obj") (Ok OutObject) (= kind "asm") (Ok OutAssembly) (= kind "llvm") (Ok OutLlvmIr)
+        (= kind "ptx") (if (kernel-target?) (Ok OutAssembly) (Err "--emit ptx needs a kernel target: --target nvptx64-nvidia-cuda (docs/design/gpu.md)"))
         :else (Err (str "unknown --emit " kind))))
 
+;; Whether FIB_TARGET_TRIPLE names a kernel target (types.targets `kernel-row?`): its module is the program's kernels (native.kernel), its assembly PTX.
+(defun kernel-target? :private () -> bool
+  (match (target/requested-triple-row) ((some r) (tt/kernel-row? r)) (nil false)))
+
+;; The module to generate code for: the program, or on a kernel target its kernel module (`--emit obj` has no meaning there: PTX is text).
+(defun module-for-target :private (m: LModule k: AotOutput) -> (Result LModule str)
+  (cond (not (kernel-target?)) (Ok m)
+        (match k ((OutObject) true) (_ false)) (Err "a kernel target emits PTX, which is text: --emit ptx (or asm, llvm), not obj")
+        :else (kernel/kernel-module m)))
+
 ;; Compiles the module `src`, which must satisfy the `main` rule, to an object, assembly or LLVM IR (`kind`) written to `path`, for the target of
-;; FIB_TARGET_TRIPLE (else the host); links nothing. (`fibc build --emit`)
+;; FIB_TARGET_TRIPLE (else the host); links nothing. On a kernel target the module is the program's kernels and the assembly is PTX. (`fibc build --emit`)
 (defun emit-file (src: str path: str opt: i64 kind: str) -> (Result unit str)
   (try-let [l (level-check opt)
             k (output-kind kind)
-            m (match (pipe/for-executable src) ((Err e) (Err (lair-error-str e))) ((Ok m) (Ok m)))
-            bytes (match (aot-emit m path k (AotOptions l [] [])) ((Err e) (Err (lair-error-str e))) ((Ok b) (Ok b)))]
+            m0 (match (if (kernel-target?) (pipe/check-source src) (pipe/for-executable src)) ((Err e) (Err (lair-error-str e))) ((Ok m) (Ok m)))
+            m (module-for-target m0 k)
+            bytes0 (match (aot-emit m path k (AotOptions l [] [])) ((Err e) (Err (lair-error-str e))) ((Ok b) (Ok b)))
+            bytes (Ok (if (and (kernel-target?) (match k ((OutAssembly) true) (_ false))) (with-header (kernel/kernel-signatures m) bytes0) bytes0))]
     (match (link/write-bytes path bytes)
       ((Err e) (Err (str path ": " e)))
       ((Ok _) (Ok ())))))

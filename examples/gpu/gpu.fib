@@ -1,0 +1,48 @@
+;; examples/gpu/gpu.fib: the kernels of examples/gpu/kernels.fib run on the HOST (docs/design/gpu.md 3.5, the one-language guard): a `defkernel`
+;; is an ordinary function, and `fib.gpu/host-launch` runs it over a grid on the CPU with the index space set for each thread, so `vadd` and
+;; the register-tiled `gemm` give, element for element, what a CPU loop gives (and what the device gives: fib-gpu-cuda's examples check
+;; the same kernels on the GPU against the same CPU reference). The shared-memory GEMM is not run here: it needs the block's other threads
+;; before its barrier (gpu.md 3.5). Result: 0 when every element matches, else the count of mismatches.
+;;   fibc run examples/gpu/gpu.fib -I examples/gpu
+;; Built with `fibc build --kernel-target nvptx64-nvidia-cuda`, `(gpu/program-ptx)` is the PTX of the kernels, which a driver loads.
+(ns main (:require [kernels :as k] [fib.gpu :as gpu]))
+
+(defun fill (n: i64 seed: i64) -> (Array f32)
+  (let [out (cell (array n 0.0f32))]
+    (do (dotimes (i n) (array-set! &out i (/ (sitofp f32 (rem (+ (* i 7919) seed) 10007)) 97.0f32)))
+        @out)))
+
+;; How many elements of `got` differ bit for bit from `want`.
+(defun mismatches (want: (Array f32) got: (Array f32)) -> i64
+  (loop [i 0 bad 0]
+    (if (>= i (array-len want)) bad
+        (recur (+ i 1) (if (= (f32->bits (array-get want i)) (f32->bits (array-get got i))) bad (+ bad 1))))))
+
+;; vadd on the host over a grid of 256-thread blocks, against a plain loop.
+(defun check-vadd (n: i64) -> i64
+  (let [a (fill n 1) b (fill n 2) c (cell (array n 0.0f32)) want (cell (array n 0.0f32))]
+    (do (dotimes (i n) (array-set! &want i (+ (array-get a i) (array-get b i))))
+        (gpu/host-launch [(quot (+ n 255) 256)] [256] (fn () (k/vadd (gpu/array-data a) (gpu/array-data b) (gpu/array-data @c) n)))
+        (mismatches @want @c))))
+
+;; The CPU reference of C = A*B: one chain of fused multiply-adds per element in increasing k (what both GEMM kernels compute).
+(defun mmul-ref (a: (Array f32) b: (Array f32) n: i64) -> (Array f32)
+  (let [c (cell (array (* n n) 0.0f32))]
+    (do (dotimes (i n)
+          (dotimes (j n)
+            (array-set! &c (+ (* i n) j)
+                        (loop [k 0 acc 0.0f32]
+                          (if (>= k n) acc (recur (+ k 1) (simd/fma (array-get a (+ (* i n) k)) (array-get b (+ (* k n) j)) acc)))))))
+        @c)))
+
+;; The register-tiled gemm on the host: (n/4)/16 x (n/4)/16 blocks of 16x16 threads, as the device launch has it; n a multiple of 64.
+(defun check-gemm (n: i64) -> i64
+  (let [a (fill (* n n) 1) b (fill (* n n) 2) c (cell (array (* n n) 0.0f32)) want (mmul-ref a b n) tiles (quot n 4)]
+    (do (gpu/host-launch [(quot tiles 16) (quot tiles 16)] [16 16] (fn () (k/gemm (gpu/array-data a) (gpu/array-data b) (gpu/array-data @c) n)))
+        (mismatches want @c))))
+
+(defun main () -> i64
+  (let [v (check-vadd 100000) g (check-gemm 128)]
+    (do (println (str "host vadd 100000: " v " mismatches; host gemm 128: " g " mismatches; index outside a launch: "
+                      (gpu/global-id 0) " of " (gpu/group-size 0) "x" (gpu/num-groups 0) "; program-ptx: " (str-len (gpu/program-ptx)) " bytes"))
+        (+ v g))))

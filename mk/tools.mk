@@ -50,13 +50,14 @@ tool_gen-compare := bash -c "$(F_ABS) build compiler/fibgen.fib -I compiler -I l
 tool_gen-planted := $(T)/gen/planted.sh | $(wildcard $(T)/gen/*)
 tool_js-backend := $(T)/js/check.sh $(TOOLS_OUT)/js | $(wildcard $(T)/js/*) $(wildcard $(T)/js/cases/*) $(wildcard compiler/js/*.fib)
 tool_deps := $(T)/deps/run.sh $(F_ABS) | $(wildcard $(T)/deps/*)
+tool_sh-native-gpu-emit := $(T)/native/gpu-emit.sh | $(T)/native/gpu-emit.sh $(wildcard examples/gpu/*) $(wildcard compiler/native/*.fib)
 tool_sh-make-graph := $(T)/make/graph.sh | $(wildcard $(T)/make/*) Makefile $(wildcard mk/*.mk)
 
 TOOLS_QUICK := fibref-skeleton gen-skeleton lint-pipefail sh-driver-check-lib sh-make-graph
 TOOLS_FULL := $(TOOLS_QUICK) units-emit units-own units-types units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-emit-runtime sh-emit-defs-order sh-stack-stack \
   sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
-  sh-native-l1-unit sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
+  sh-native-l1-unit sh-native-gpu-emit sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
 # The command is every word up to the `|`, the inputs every word after it.
 upto_bar = $(if $(filter |,$(firstword $(1))),,$(if $(1),$(firstword $(1)) $(call upto_bar,$(wordlist 2,999999,$(1))),))
 after_bar = $(if $(1),$(if $(filter |,$(firstword $(1))),$(wordlist 2,999999,$(1)),$(call after_bar,$(wordlist 2,999999,$(1)))),)

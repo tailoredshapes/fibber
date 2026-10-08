@@ -1,0 +1,19 @@
+;; spec: docs/design/compress.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; roots: ../../lib support
+;; A 300000-byte input in 64 KiB blocks: compress with 1, 2, 3 and 7 threads gives the same bytes, and decompress with every thread count gives the input; with verification off too.
+(ns main (:use tl.check fib.compress.lz4.mem) (:require [fib.compress :as z] [fib.compress.lz4 :as lz4]))
+(defun data () -> (Array i8)
+  (let [c (cell (array 300000 0i8))] (do (dotimes (i 300000) (array-set! &c i (trunc i8 (+ (rem (* i 7) 41) (if (= (rem i 1000) 0) i 0))))) @c)))
+(defun main () -> i64
+  (let [c (checks) k (lz4/lz4) d (data) o (z/with-block-size (z/default-options) 65536)
+        z1 (match (z/compress k d (z/with-threads o 1)) ((Ok b) b) ((Err _) (array 0 0i8)))]
+    (do (check c (> (array-len z1) 100))
+        (dotimes (i 3)
+          (let [t (nth [2 3 7] i)]
+            (do (check c (match (z/compress k d (z/with-threads o t)) ((Ok b) (bytes-eq b z1)) ((Err _) false)))
+                (check c (match (z/decompress k z1 (z/with-threads o t)) ((Ok b) (bytes-eq b d)) ((Err _) false)))
+                (check c (match (z/decompress k z1 (z/with-verify (z/with-threads o t) false)) ((Ok b) (bytes-eq b d)) ((Err _) false))))))
+        (checks-result c))))

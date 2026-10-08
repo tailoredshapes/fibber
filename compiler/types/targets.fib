@@ -106,6 +106,19 @@
 ;; `mallopt` (emit.os drops the call), its default thread stack is 128 KiB (the runtime sets 8 MiB itself: rt/thread.lir) and glibc's start-up CPU query comes
 ;; from the shim `fibshim.o` of the musl pieces (rt/static/cpuid.c). The linker is the system `ld` (x86-64) or an aarch64 `ld` (`aarch64-linux-gnu-ld`, `ld.lld`)
 ;; and `sysroot` names the variable that finds the pieces (`crt1.o libc.a libgcc.a`): FIB_MUSL_DIR, else share/fibber/musl/ARCH beside the executable.
+(def KERNEL: str "kernel target: emits PTX for a driver to launch (--emit ptx); no host runtime, no tail calls, FMA yes (docs/design/gpu.md)")
+
+;; NVIDIA GPUs through PTX (docs/design/gpu.md): a KERNEL target, not a general one. `fibc build --target nvptx64-nvidia-cuda --emit ptx` lowers the
+;; kernels of a program (native.kernel: the `defkernel` functions and what they reach, nothing of the runtime) and writes PTX text that a driver
+;; (fib-gpu-cuda, over libcuda) loads and launches; no executable is ever linked for it. `tail-cc` 0 with the `tail` hint: NVPTX has no tailcc and a
+;; kernel's loops are branches; FMA is fused on every GPU; the `fib.trap*` calls of checked arithmetic become a device trap (`llvm.trap`) that the
+;; driver reports as an error after the stream syncs. `sm_89` (Ada) is the default CPU; FIB_TARGET_CPU names another (sm_70 .. sm_120).
+;; Data layout: LLVM 21's for nvptx64 (checked by compiler/tests/native/gpu-emit.sh).
+(defun row-nvptx64-cuda :private () -> TargetRow
+  (TargetRow "nvptx64-nvidia-cuda" "nvptx64" "cuda" "Linux" "e-p6:32:32-i64:64-i128:128-v16:16-v32:32-n16:32:64"
+             64 true "none" 128 "sm_89" "" true 1 0 1 1 "none" "ptx" "none (a driver loads the PTX)" "" "none" (runtime-c-functions)
+             "emits PTX (examples/gpu); runtime-os Linux is a stand-in, no runtime is emitted" KERNEL))
+
 (defun row-x86-64-musl :private () -> TargetRow
   (with (row-x86-64-linux) (triple "x86_64-unknown-linux-musl") (linker "ld (static)") (sysroot "FIB_MUSL_DIR") (libc "musl") (libc-lacks ["mallopt"])
         (status "runs; fully static")))
@@ -117,7 +130,7 @@
 ;; Every row, in the order `fibc targets` prints them. The rest of LLVM's backends have no row yet (docs/design/targets.md 5).
 (defun target-rows () -> (Vec TargetRow)
   [(row-x86-64-linux) (row-aarch64-darwin) (row-aarch64-linux) (row-arm64-ios) (row-wasm32-wasip1) (row-wasm32-unknown)
-   (row-riscv64-linux) (row-x86-64-musl) (row-aarch64-musl)])
+   (row-riscv64-linux) (row-x86-64-musl) (row-aarch64-musl) (row-nvptx64-cuda)])
 
 ;; --- matching a triple
 
@@ -135,9 +148,10 @@
 ;; Whether a triple is for musl (`-musl`, `-linux-musl`): its own row, with the Linux code and the musl C library.
 (defun musl-triple? (triple: str) -> bool (has triple "-musl"))
 
-;; The OS of a triple as the rows name it: ios, darwin, wasi, none (a wasm triple with no OS), linux, else other (freebsd, windows, ..: no row).
+;; The OS of a triple as the rows name it: ios, darwin, wasi, none (a wasm triple with no OS), cuda (nvptx), linux, else other (freebsd, windows, ..: no row).
 (defun os-of-triple (triple: str) -> str
   (cond (has triple "-ios") "ios"
+        (has triple "-cuda") "cuda"
         (apple-triple? triple) "darwin"
         (has triple "wasi") "wasi"
         (starts-with? triple "wasm") "none"
@@ -169,9 +183,20 @@
 (defun row-supported? (r: TargetRow) -> bool
   (and (= (. r support) "supported") (meets-rule? r)))
 
-;; Whether `fibc build` makes code for the row without --allow-unsupported: a supported row or a portability target.
+;; Whether `fibc build` makes code for the row without --allow-unsupported: a supported row, a portability target or a kernel target (PTX only).
 (defun row-buildable? (r: TargetRow) -> bool
-  (or (row-supported? r) (starts-with? (. r support) "portability target")))
+  (or (row-supported? r) (starts-with? (. r support) "portability target") (kernel-row? r)))
+
+;; A kernel target (docs/design/gpu.md): its code is kernels for a driver to launch, never an executable; `fibc build` emits PTX for it and nothing else.
+(defun kernel-row? (r: TargetRow) -> bool
+  (starts-with? (. r support) "kernel target"))
+
+;; Whether the value of FIB_TARGET_TRIPLE (nil when unset) names a kernel target: the checker needs no `main` then and the emitter's roots are the kernels.
+(defun kernel-triple? (triple: (Option str)) -> bool
+  (match triple ((some t) (and (not (= t "")) (not (= t "host")) (kernel-row? (target-row-of-triple t)))) (nil false)))
+
+;; The name of a kernel's function as `defkernel` makes it (examples/gpu/gpu.fib): `gpu-kernel-` and the kernel's name (native.kernel reads it back).
+(def KERNEL-FUN-PREFIX: str "gpu-kernel-")
 
 ;; The support column as printed: what the row says, or why a row marked supported is not.
 (defun support-text (r: TargetRow) -> str

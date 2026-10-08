@@ -72,16 +72,16 @@ not claim `:streaming`: the contract's step-bound scenario fails it.
 
 ## 3. The contract
 
-`fib.compress.contract/CompressContract` is a `defcontract` of **15 scenarios**: honesty of the capability list; round trip on 73 corpus inputs (empty, 1 byte, incompressible, all-zero, long runs, text, repeating
+`fib.compress.contract/CompressContract` is a `defcontract` of **17 scenarios**: honesty of the capability list; round trip on 73 corpus inputs (empty, 1 byte, incompressible, all-zero, long runs, text, repeating
 patterns, records, at every edge size around 12/13, 15/16, 255/256, 4096, 64 KiB, block sizes); round trip under every option the codec lists; determinism and the size bound; streaming equals one-shot for
 chunkings of 1, 7, 4096, 65537 bytes and seeded random sizes; `max-output` exact (the size succeeds, one under is `:too-large`, one-shot and streamed); truncation at **every prefix** is an error, one-shot and
 streamed; corruption (a flipped byte under a checksum is an error or the original, without one it never traps and stays within the limit); concatenated frames; empty input; a dictionary (smaller, round trips, needed);
-decompressor steps bounded and `needs-input` honest; independent streams; magic numbers and detection; invalid arguments. A scenario that needs a capability the codec lacks is a skip row.
+decompressor steps bounded and `needs-input` honest; independent streams; magic numbers and detection; invalid arguments; and, for a codec with `:parallel`, **the result does not depend on the thread count** (compress: the same bytes for 1, 2, 3, 7 and 16 threads, one-shot and streamed; decompress: the same output) and **errors and limits do not depend on it** (a corrupt block, a corrupt tail and a cut frame give one error kind, and `max-output` is exact, for every thread count). A scenario that needs a capability the codec lacks is a skip row.
 
 **What corruption is required to do.** LZ4 frames written with a content checksum (the default here) detect any change of the content, so a flipped byte is an error or decodes to the original (a flip in a
 don't-care field). A frame without checksums may decode to different bytes: the contract then requires only that nothing traps and the output stays within `max-output`.
 
-**Faults** (`fib.compress.fault/Faulty`, a decorator over a real codec). Each must make the scenario that names it fail, shown in `specs/compress-contract-shape-spec.fib`:
+**Faults** (`fib.compress.fault/Faulty`, a decorator over a real codec; **11**). Each must make the scenario that names it fail, shown in `specs/compress-contract-shape-spec.fib`:
 
 | fault | what it does | scenario that fails |
 |---|---|---|
@@ -93,6 +93,9 @@ don't-care field). A frame without checksums may decode to different bytes: the 
 | `:ignore-dictionary` | compress is given no dictionary | a dictionary makes text smaller |
 | `:small-bound` | `max-compressed-size` answers half | the bound |
 | `:overclaim` | lists `:rot13` | honesty |
+| `:thread-dependent` | compress with more than one thread uses another acceleration | the result does not depend on the thread count |
+| `:par-error-kind` | decompress with more than one thread answers `:internal` where the sequential decoder says `:corrupt` | errors and limits do not depend on the thread count |
+| `:par-ignore-limit` | decompress with more than one thread gets the default limit instead of the caller's | errors and limits do not depend on the thread count |
 
 The shape spec also runs the contract against a codec that copies its input (no frame, no magic, no limit): it fails truncation, magic numbers, the empty input and the limit.
 
@@ -116,29 +119,50 @@ The shape spec also runs the contract against a codec that copies its input (no 
 
 ### 5.1 The fast encoder (`blockenc`)
 
-liblz4's `LZ4_compress_generic`: a multiplicative hash of the next four bytes indexes a table of positions (4096 entries from 64 KiB of input, 8192 below, 512 below 4 KiB; 4 bytes each); a candidate within 65535 bytes whose four bytes
-equal is a match, extended backwards over the pending literals and forwards (eight bytes at a time with `ctz`) to the end less 5; the last 5 bytes are literals and no match starts in the last 12; the step grows by one every 64 failed
-attempts (`acceleration` raises the start), and the position right after a match is tried at once. **The table is not cleared between blocks or frames**: positions are stored as `gen + index`, and a candidate is valid only
-when `entry - gen` is at least the window start, so the next block (or frame) raises `gen` past every old position (a bump of the base offset, as liblz4's `currentOffset`), and a 16 to 32 KB table is never re-zeroed
-(a real clear happens once in a billion bytes). A candidate must also be before the position (stale entries of a reused window), and its bytes are verified, so a bug here costs ratio, not correctness.
+liblz4's `LZ4_compress_generic`, and BYTE-IDENTICAL to it (`docs/shootout/lz4.md` 4): a hash of the next FIVE bytes (`(seq << 24) * 889523592379 >> 52`) indexes a table of 4096 positions (16 KB, at every
+input size); a candidate within 65535 bytes whose four bytes equal is a match, extended backwards over the pending literals and forwards (eight bytes at a time with `ctz`) to the end less 5; the last 5 bytes
+are literals and no match starts in the last 12; the step grows by one every 64 failed attempts (`acceleration` raises the start), and the position right after a match is tried at once. The block API starts from a
+table of zeros whose index 0 is the first byte, as `LZ4_compress_default` does (the one place the reference reads an empty slot as a candidate), so the bytes agree. **The table is not cleared between blocks or
+frames**: positions are stored as `gen + index`, and a candidate is valid only when `entry - gen` is at least the window start, so the next block (or frame) raises `gen` past every old position (a bump of the base
+offset, as liblz4's `currentOffset`), and a 16 KB table is never re-zeroed. A candidate must also be before the position, and its bytes are verified, so a bug here costs ratio, not correctness. The common sequence
+(at most 14 literals, a match of 4 to 18) is emitted inline by `put-fast`.
 
-### 5.2 LZ4 HC (`hc`)
+### 5.2 LZ4 HC (`hc`, `hc3`)
 
-Levels 3 to 12: a hash chain over every position (32768 head entries and a 65536-entry table of 16-bit distances to the previous position of the same hash) searched to a depth of 4, 8, 16, 32, 64, 128, 256 (levels 3 to 9, liblz4's
-table) and 512, 2048, 16384 (levels 10 to 12), with **one-step lazy matching**. This is not liblz4's parser: liblz4 looks three matches ahead at 3 to 9 and runs an optimal parser at 10 to 12, so its output is a
-little smaller; the measured difference is in `docs/shootout/lz4.md`. Every match is verified against the bytes.
+Levels 3 to 12: a hash chain over every position (32768 head entries and a 65536-entry table of 16-bit distances to the previous position of the same hash) searched to a depth of 4, 8, 16, 32, 64, 128, 256 (levels 3
+to 9, liblz4's table) and 512, 2048, 16384 (levels 10 to 12). The parser is a port of `LZ4HC_compress_hashChain`: three matches are found one after the other (`wider`: a chain search that may extend a match
+backwards), and arranged as liblz4 arranges them (a short first match is dropped, a first match that a longer second one would squeeze is trimmed to 18, three ascending matches write the first and carry on with the
+other two). It is written as a machine over a small register file (`st`, 16 words) so that no function passes the 50-line limit; its output is byte-identical to liblz4's at levels 3 to 8, 94% at level 9 (the pattern
+analysis for more than 128 attempts is not ported) and its ratio is within 0.3% at 10 to 12, where liblz4 runs an optimal parser that is not ported.
 
-### 5.3 The decoder (`blockdec`)
+### 5.3 The decoder (`blockdec`) and its safety proof
 
-One loop. A common-case path takes a sequence with a literal run of at most 14, a match of at most 18 and room in both buffers in a handful of compares (16-byte vector copies for the literals and for a match at distance 16
-or more); everything else, and every sequence that fails one of those checks, goes the careful way and says why it failed. Matches at distance 8 to 15 copy 8 bytes at a time; below 8 the pattern is written out for the
-first multiple of the period that is at least 8 and the rest copies from that distance. Arithmetic in the coders is `unchecked-add`/`unchecked-subtract` (checked i64 arithmetic cost about a third of the decode speed;
-every index is bounded by array lengths well below 2^40, and the bounds checks themselves are comparisons, not arithmetic).
+Two paths. The FAST path takes a sequence whose literal run is at most 14 and whose match is at most 18, when the input and output have room for the fixed-size vector copies; its safety proof is the **slack
+condition**, `i <= ilim and op <= dlim`, written out in the file and checked by `specs/compress-lz4-safety-spec.fib` (canaries around the output range, bytes after the input that would be taken for an offset) and by
+two planted faults (`slack-dlim`, `slack-ilim`):
 
-### 5.4 The frame format
+* `ilim = min(ilen - 17, 2^31 - 1000)`: the token is at `i`, the 16-byte literal chunk reads `[i+1, i+17)` and the offset (at `i+1+lit <= i+15`) reads up to `i+17`: all inside the input;
+* `dlim = min(dlen - 46, cap - 32, 2^32 - 1000)`: the literal chunk writes `[op, op+16)`; the match starts at `op2 = op+lit <= op+14` and its chunks write at most `[op2, op2+32) <= op+46 <= dlen`, and its 18 bytes
+  end at `op2 + 18 <= op + 32 <= cap`: inside the buffer and below the cap. The wild bytes written past a sequence's end are inside the buffer after the output's end (overwritten by the next sequence or beyond the
+  result); a caller whose buffer continues past the cap passes `dlen = cap`, which the proof then respects (this is what the parallel decoder does: `dlen` is the end of the block's window);
+* the offset is checked by ONE unsigned compare: `1 <= off <= op2 - lo` (zero wraps to a huge number), so a match reads only bytes in `[lo, op2)` that were written.
 
-`header` builds and parses the descriptor; `frame` and `framedec` are the one-shot coder (a one-shot compress of linked blocks costs nothing extra: the input is the window); `scomp` and `sdec` are the streaming ones, with
-a window of 64 KiB of history ahead of the block, slid with `move-down`. Conformance is the table in `lib/fib/compress/README.md`.
+Everything else, and every sequence that fails one of those checks, goes to `slow-seq`, which checks EVERY length and index and says which check failed (`-1` corrupt, `-2` truncated, `-3` over the cap). A length
+sum cannot overflow (at most 255 times the input length). Arithmetic in the coders is `unchecked-add/subtract` (checked i64 arithmetic cost about a third of the decode speed; every index is bounded by array lengths
+well below 2^40, and the bounds checks themselves are comparisons). Matches at a distance of 8 to 15 copy 8 bytes at a time; below 8 the pattern's first eight bytes are written one at a time and the rest copies
+from the distance of the least multiple of the period that is at least 8.
+
+### 5.4 xxHash32
+
+The four accumulators of a stripe are one `(Simd i32 4)`: a stripe of 16 bytes is one vector load, a multiply, an add, a rotate (shift, shift, or) and a multiply with the lane arithmetic wrapping
+(`unchecked-multiply` on vectors); about 10 GB/s, four times the scalar loop. `specs/compress-lz4-xxh-spec.fib` checks it against an independent scalar version and the streamed form on 1,000,000 random lengths and
+contents, and against liblz4's checksums through the reference vectors; a planted fault (a different rotation) is killed.
+
+### 5.5 The frame format, one-shot and streaming
+
+`header` builds and parses the descriptor; `frame` and `framedec` are the one-shot coder (a one-shot compress of linked blocks costs nothing extra: the input is the window); `scomp` and `sdec` are the streaming
+ones, with a window of 64 KiB of history ahead of the block, slid with `move-down`. **The content size is recorded by default** (`record-size` true: a one-shot compress knows it) so that a decoder allocates the
+result once and exactly; a streaming compressor records it only when it is given `size-hint`. Conformance is the table in `lib/fib/compress/README.md`.
 
 ## 6. Differential testing
 
@@ -149,7 +173,65 @@ a window of 64 KiB of history ahead of the block, slid with `move-down`. Conform
 * `scripts/lz4-interop.sh` runs `examples/lz4.fib` against the CLI both ways. `scripts/fetch-lz4-tools.sh` fetches and builds the CLI and the Silesia corpus with recorded checksums (ADR 0020).
 * `scripts/mutant-lz4.sh`: 20 planted faults, each killed by a spec.
 
-## 7. What is not here
+## 7. Results
 
-Optimal parsing at HC 10 to 12, `LZ4_compress_destSize`, partial decompression, writing legacy or skippable frames, a streaming decoder for legacy frames, a dictionary for raw blocks (the frame API has it), multithreaded compression,
+`docs/shootout/lz4.md` has the measurements: single-thread speed against liblz4 (fast 1.19x slower and byte-identical, HC 3 to 9 byte-identical, decode 1.58x), the scaling curves to 16 threads, the cutoffs,
+the 2 GB streams and what bounds each (memory bandwidth; one core of xxHash32), and the assembly findings that drove the single-thread work.
+
+## 8. Tools
+
+`scripts/fetch-lz4-tools.sh` (the reference, the corpus, with checksums), `scripts/lz4-diff.{fib,py}` (both directions against liblz4), `scripts/lz4-sim.py` (a simulation of `LZ4_compress_generic` that agrees with it),
+`scripts/gen-lz4-vectors.py`, `scripts/lz4-interop.sh`, `scripts/lz4-bench.fib`, `scripts/mutant-lz4.sh` (32 faults), `scripts/mutant-uninit-i8.sh`.
+
+## 9. Threads (`Options.threads`, the `:parallel` capability)
+
+`Options.threads`: 0 (the default) is automatic (the machine's cores, but only for an input large enough to pay: LZ4 compresses in parallel from 2 MiB and decompresses from 512 KiB of compressed input, measured in
+`docs/shootout/lz4.md` 3), 1 is sequential, n is n workers whatever the size (never more than the 64 of `fib.parallel.cpu`). **The result does not depend on it**: the same bytes, the same output, the same error kind
+and the same exact `max-output` limit (contract scenarios 16 and 17, the property tests of `specs/compress-lz4-par-spec.fib`, planted faults). A codec without `:parallel` ignores the field. `Options.verify` (default
+true) says whether a decoder checks the checksums that are in the data.
+
+### 9.1 The engine (`fib.compress.par`)
+
+The runtime has no work-stealing pool yet (`docs/design/parallelism.md` 3.1 is a design and a prototype): a task is an OS thread. The engine starts `workers` tasks and the JOBS `0 .. n-1` are SELF-SCHEDULED: every
+worker takes the next unclaimed index from one atom (a fetch-and-add), runs it, and comes back, so a slow job delays one worker and the others take what is left (the balance of a stealing deque for one level of
+jobs, with one shared counter instead of deques). A job is `(fn (i) (Result r CompressError))`. A worker that gets an error says so and stops taking jobs; the others finish the job they are in and stop; EVERY task
+is joined whatever happens (no task outlives the call). The error returned is that of the LOWEST failing index: jobs are claimed in increasing order and a claimed job always finishes, so every index below the first
+failing one has been run, and the error is the one a sequential run would meet first, whatever the worker count. A worker that TRAPS is joined with `try-join` (ADR 0001) and becomes an `:internal` error, not a dead
+process. Results come back in index order. A job's output goes into an array its caller owns through an ADDRESS (`addr-of` / `ptr-at-addr`: a `ptr` is not `Send`; the array outlives the call and the ranges
+written are disjoint: the caller's contract, stated where it is used).
+
+### 9.2 Compression of independent blocks (`pframe`)
+
+The input is cut into blocks as usual and the blocks into jobs of about 1 MiB; each job codes its blocks into a buffer of its own with an encoder of its own and returns the buffer; the content checksum (sequential by
+nature) is job 0 and runs beside the others; the frame is then put together in order (the copy of the buffers into the one result is parallel above 8 MiB). The bytes do not depend on the worker count, or on how jobs
+are cut: a block is coded from its own bytes alone (independent: its history is itself, `lo` is its start), so whichever worker codes it, and whether the table carried entries from an earlier block or not, the bytes
+are the same; the sequential `frame-compress` is the same function over the same blocks. Linked blocks, a dictionary and the streaming compressor without threads stay sequential (a linked block cannot start before
+the one before it ends; priming each job with a dictionary would keep the output independent of the workers but is not done).
+
+### 9.3 Decompression of independent blocks (`pframedec`) and streams
+
+The head is parsed and the block headers scanned sequentially (4-byte size words: O(blocks)) into an index; the jobs decode blocks in parallel. DIRECT mode (the frame records its content size): the result array is
+allocated once, exactly, with `array-uninit-i8`, and block k decodes straight into its window `[k * bmax, (k+1) * bmax)`, with `decode-block` given the window's end as `dlen` (the slack proof then keeps even its wild
+copies inside the window: disjoint windows). The layout is a guess that every block decodes to exactly `bmax` bytes; a block that does not makes the attempt give way to the sequential decoder. PLACEMENT mode (no
+recorded size): each job decodes into a buffer of its own and the buffers are copied into the result (a second pass). EVERY failure of the attempt hands the frame to the sequential decoder, which is what makes the
+error kinds identical to the sequential decoder's. `max-output`: direct mode checks the declared size before anything is allocated; placement mode bounds the work by the sum of the stored/maximum block sizes (at most
+`max-output` plus one block) before any buffer is made and enforces the exact limit when placing: **a parallel decode never allocates more than `max-output` plus one block**. Block checksums are verified in the jobs;
+the content checksum is pipelined (a worker that finishes a job takes the checksum's lock if free and hashes every finished job in order), so it is bounded by one core of xxHash32 and not by the whole decode; it
+cannot be parallelised (xxHash32 of a concatenation is not a combination of the hashes of its parts) and `verify` false skips it. Concatenated frames, linked blocks, dictionaries and legacy frames decode
+sequentially.
+
+**Streams.** With `threads` of 2 or more (not automatic: the length of a stream is not known), independent blocks and no dictionary: the compressor holds input until it has a BATCH (workers x about 1 MiB), codes the
+batch in parallel, and returns its blocks in order; the decompressor, finding at least two whole blocks queued, decodes up to that many in parallel and returns their output in one step (a step is then bounded by
+workers x about 1 MiB of output instead of one block), consuming nothing unless it succeeds. Memory is a few MiB per worker, never the length of the stream. `fib.compress.fd` overlaps the I/O when threads are asked
+for: a reader task reads ahead and a writer task writes behind through bounded queues (the producer sleeps while the queue is full; both tasks are always joined).
+
+## 10. A builtin: `array-uninit-i8`
+
+`(unsafe (array-uninit-i8 n))` is an `(Array i8)` of n bytes whose contents are not defined, the byte twin of `array-uninit-f32/f64` (spec row `spec/syntax.md` 3.15, cases 8506 to 8508, mutant
+`scripts/mutant-uninit-i8.sh`, ADR 0014). It removes the zero fill of a result: `memset` of 211 MB is 12 ms, a third of a parallel decode. Every use writes each byte it will return before it returns it (the decoders
+return an array in which they wrote every byte, or a copy of the part they wrote), and `specs/compress-lz4-par-spec.fib` runs the decoders after filling the heap with 0xAA to prove it.
+
+## 11. What is not here
+
+Optimal parsing at HC 10 to 12 (the lazy parser is within 0.3% of its size), `LZ4_compress_destSize`, partial decompression, writing legacy or skippable frames, a streaming decoder for legacy frames, a dictionary for raw blocks (the frame API has it), parallel linked blocks, parallel concatenated frames (one frame at a time is parallel), parallel decode without a recorded size at full speed (placement is 1.2 to 1.4x), the pattern analysis of HC 9,
 and a `ratio` limit option (a bomb is bounded by `max-output`, which a caller sets from what it expects). Dictionaries larger than 64 KiB use their last 64 KiB, as the format does.
