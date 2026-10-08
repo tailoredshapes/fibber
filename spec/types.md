@@ -4066,6 +4066,40 @@ return joins every thread still running before the result is returned
 to the OS (§6.8). The interpreter's `mark_shared`
 follows the same edges (`fibref` `heap/shared.rs`).
 
+**Amended 2026-10-07, P-sched (docs/design/parallelism.md 3.1 as built,
+`rt/sched.lir`, `rt/deque.lir`).** `(fork-task f)` : `∀a. (fn ((fn :send ()
+a)) (Task a))` with `Send a`, the builtin of the third tier: a **pool task**.
+It share-marks `f` as `spawn` does, makes the same `(Task a)` (count 1, the
+handle; the pool takes a count of its own) with the pool runner of the
+result type as its resume function and the closure in its slot, and gives it
+to the runtime's work-stealing pool: this worker's deque, or the injector
+queue from a thread that is not a worker. A task with both a closure and a
+resume function is a pool task; that is how `join`, `@t`, `try-join` and
+`task-failure` tell the tiers apart, and their types do not change. The pool
+starts on the first fork: `FIB_THREADS` workers, else the CPUs of the
+process's affinity mask capped by the cgroup v2 quota (1 to 256), each an OS
+thread with the stack and guard of §8.8's threads. `join` of a pool task by
+a worker runs the task itself when it can claim it, else helps (its own
+deque, the injector, other deques) and parks on the task when there is
+nothing; by a thread that is not a worker, it runs the task itself only in a
+program that catches (below) and parks otherwise. A pool task must not
+spin-wait for another pool task (`spawn` is the tier for that: cases 166 to
+168); a call that blocks in the OS on a worker goes under
+`fib.parallel/blocking`, which starts one more worker for the duration. A
+trap in a pool task is the task's failure, exactly as a spawned task's: in a
+program that catches (stage 2 above) the runner calls `f` under a catch of
+its own and records the failure on any thread; otherwise the trap on a worker
+fails every task the worker was inside (the one that trapped and the ones
+whose joins it was helping, which would trap on it in their turn, there being
+no `try` in such a program), the worker is replaced and its thread ends;
+`trap in task: MESSAGE` is written once. Out of memory, a worker that cannot
+start and a stack overflow stay fatal. A target without threads (wasm) has a
+pool of no workers: `fork-task` runs `f` at the fork. The exit of `main`
+drains the pool before the spawned threads are joined and the result is
+returned. Cases 8640 to 8652; `lib/fib/parallel` runs on this tier
+(`fork`, `pmap`, `pfor`, `preduce`, `pscan`), `spawn` and `future` stay
+threads, `async` stays the stackless tier.
+
 `(Task T)`: `(i64 i32 i32  i32 state  i32 driver  i32 lock  ptr resume
 ptr result  ptr waiters  ptr closure  ptr failure  ..captures ..locals)`
 (slots 6 to 10; captures start at slot 11, `compiler/emit/objects/kinds.fib`; amended 2026-10-06: the closure slot and the failure slot of exceptions stage 1 were missing here, so `unit-objects` had rotted against this text). `async` lowers to a

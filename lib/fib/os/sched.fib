@@ -1,0 +1,22 @@
+;; fib.os.sched: the runtime's work-stealing pool (docs/design/parallelism.md 3.1, rt/sched.lir): what the library asks it and tells it.
+;; Not part of the `fib.os` facade, as fib.os.memory is not: `fib_sched_ctl` is a function of the runtime of this tree.
+;; The pool itself is reached through the builtin `fork-task` and `join`; this module is its control surface:
+;;   (pool-workers)           the worker count W: FIB_THREADS, else the CPUs of the affinity mask capped by the cgroup quota (1 to 256)
+;;   (blocking-enter) (blocking-leave)   around a call that blocks in the OS on a worker (a read, a sleep, a lock): one more worker for the duration
+;;   (pool-worker?)           whether this thread is a worker of the pool
+;;   (pool-started?) (pool-live-workers) (pool-tasks-run) (pool-steals) (pool-inline-forks)   the pool's counters, for tests and measurements
+(ns fib.os.sched)
+;; Bound to the runtime's own definition (rt/sched.lir marks it `;; extern:`; emit.rt), not to a C library.
+(extern fib_sched_ctl :private (i64 i64) -> i64)
+
+(defun ctl :private (op: i64 a: i64) -> i64 (unsafe (fib_sched_ctl op a)))
+
+(defun pool-workers () -> i64 (ctl 0 0))
+(defun blocking-enter () -> unit (do (ctl 1 0) ()))
+(defun blocking-leave () -> unit (do (ctl 2 0) ()))
+(defun pool-worker? () -> bool (= (ctl 3 0) 1))
+(defun pool-tasks-run () -> i64 (ctl 4 0))
+(defun pool-steals () -> i64 (ctl 5 0))
+(defun pool-live-workers () -> i64 (ctl 6 0))
+(defun pool-inline-forks () -> i64 (ctl 7 0))
+(defun pool-started? () -> bool (= (ctl 8 0) 1))

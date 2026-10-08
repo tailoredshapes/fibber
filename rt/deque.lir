@@ -1,0 +1,189 @@
+;; fib.rt, the deques of the work-stealing pool (docs/design/parallelism.md 2.3 and 3.1; the pool itself is sched.lir): a Chase-Lev
+;; deque per worker (Le, Pop, Cohen, Nardelli 2013, in the lIR of docs/design/parallelism/proto/cl.lir, whose orderings are kept as
+;; they are: the stress test of that experiment finds a missing compare-and-swap and a missing race for the last item, and not a
+;; weakened fence, which a model checker would), the injector list for threads that are not workers, and the worker count.
+;; A worker record (256 bytes, sched.lir): 0 top, 64 bottom (lines of their own), 128 ring of 4096 task pointers, 136 index, 144 rng,
+;; 160 tasks run, 168 steals, 176 forks, 184 forks run inline (ring full), 192 chain, 200 depth, 208 the count flag of the next run.
+(declare sched_getaffinity i32 (i32 i64 ptr))
+(global internal fib.sched-recs ptr (ptr null))
+(global internal fib.sched-live i64 (i64 0))
+(global internal fib.sched-n i64 (i64 0))
+(global internal fib.sched-inj-head ptr (ptr null))
+(global internal fib.sched-inj-tail ptr (ptr null))
+(global internal fib.sched-inj-lock i32 (i32 0))
+;; The ring of a deque has 4096 slots.
+(global internal fib.sched-mask i64 (i64 4095))
+
+;; The record of worker `i`.
+(define internal (fib.sched-rec ptr) ((i64 i))
+  (block entry (ret (load ptr (getelementptr ptr (load ptr @fib.sched-recs) i)))))
+
+;; ---- the deque (cl.lir: push and pop by the owner, steal by anyone)
+
+;; The owner pushes; 0 when the ring is full.
+(define internal (fib.sched-push i1) ((ptr w) (ptr t))
+  (block entry
+    (let ((b (atomic-load monotonic i64 (getelementptr i8 w (i64 64))))
+          (top (atomic-load acquire i64 w)))
+      (br (icmp sge (sub b top) (i64 4096)) full room)))
+  (block full (ret (i1 0)))
+  (block room
+    (atomic-store monotonic t (getelementptr ptr (load ptr (getelementptr i8 w (i64 128))) (and b (load i64 @fib.sched-mask))))
+    (fence release)
+    (atomic-store monotonic (add b (i64 1)) (getelementptr i8 w (i64 64)))
+    (ret (i1 1))))
+
+;; The owner pops its newest task, or null.
+(define internal (fib.sched-pop ptr) ((ptr w))
+  (block entry
+    (let ((bp (getelementptr i8 w (i64 64)))
+          (b (sub (atomic-load monotonic i64 bp) (i64 1))))
+      (atomic-store monotonic b bp)
+      (fence seq_cst)
+      (let ((t (atomic-load monotonic i64 w)))
+        (br (icmp sle t b) nonempty empty))))
+  (block empty (atomic-store monotonic (add b (i64 1)) bp) (ret (ptr null)))
+  (block nonempty
+    (let ((x (atomic-load monotonic ptr (getelementptr ptr (load ptr (getelementptr i8 w (i64 128))) (and b (load i64 @fib.sched-mask))))))
+      (br (icmp eq t b) last more)))
+  (block more (ret x))
+  (block last
+    (let ((r (cmpxchg seq_cst monotonic w t (add t (i64 1)))))
+      (atomic-store monotonic (add b (i64 1)) bp)
+      (ret (select (extractvalue r 1) x (ptr null))))))
+
+;; A thief takes the oldest task of `w`, or null.
+(define internal (fib.sched-steal ptr) ((ptr w))
+  (block entry
+    (let ((t (atomic-load acquire i64 w)))
+      (fence seq_cst)
+      (let ((b (atomic-load acquire i64 (getelementptr i8 w (i64 64)))))
+        (br (icmp slt t b) some none))))
+  (block none (ret (ptr null)))
+  (block some
+    (let ((x (atomic-load monotonic ptr (getelementptr ptr (load ptr (getelementptr i8 w (i64 128))) (and t (load i64 @fib.sched-mask)))))
+          (r (cmpxchg seq_cst monotonic w t (add t (i64 1)))))
+      (ret (select (extractvalue r 1) x (ptr null))))))
+
+;; Whether any deque or the injector holds a task (the re-check before a sleep; a plain sweep).
+(define internal (fib.sched-any-work i1) ()
+  (block entry (br (icmp ne (atomic-load acquire ptr @fib.sched-inj-head) (ptr null)) yes sweep))
+  (block sweep
+    (let ((n (atomic-load acquire i64 @fib.sched-live))) (br loop)))
+  (block loop
+    (let ((i (phi i64 (sweep (i64 0)) (next i2))))
+      (br (icmp slt i n) look no)))
+  (block look
+    (let ((w (call @fib.sched-rec i))
+          (t (atomic-load acquire i64 w))
+          (b (atomic-load acquire i64 (getelementptr i8 w (i64 64)))))
+      (br (icmp slt t b) yes next)))
+  (block next (let ((i2 (add i (i64 1)))) (br loop)))
+  (block yes (ret (i1 1)))
+  (block no (ret (i1 0))))
+
+;; ---- the injector: a list of (task, next) nodes under a spinlock, for forks from threads that are not workers
+
+(define internal (fib.sched-inject void) ((ptr t))
+  (block entry
+    (let ((node (call @malloc (i64 16))))
+      (store t node)
+      (store (ptr null) (getelementptr i8 node (i64 8)))
+      (call @fib.lock @fib.sched-inj-lock)
+      (br (icmp eq (load ptr @fib.sched-inj-tail) (ptr null)) first append)))
+  (block first (atomic-store release node @fib.sched-inj-head) (store node @fib.sched-inj-tail) (br out))
+  (block append (store node (getelementptr i8 (load ptr @fib.sched-inj-tail) (i64 8))) (store node @fib.sched-inj-tail) (br out))
+  (block out (call @fib.unlock @fib.sched-inj-lock) (ret)))
+
+(define internal (fib.sched-take-injected ptr) ()
+  (block entry
+    (br (icmp eq (atomic-load acquire ptr @fib.sched-inj-head) (ptr null)) empty locked))
+  (block empty (ret (ptr null)))
+  (block locked
+    (call @fib.lock @fib.sched-inj-lock)
+    (let ((node (atomic-load acquire ptr @fib.sched-inj-head)))
+      (br (icmp eq node (ptr null)) none take)))
+  (block none (call @fib.unlock @fib.sched-inj-lock) (ret (ptr null)))
+  (block take
+    (let ((next (load ptr (getelementptr i8 node (i64 8))))
+          (t (load ptr node)))
+      (atomic-store release next @fib.sched-inj-head)
+      (br (icmp eq next (ptr null)) last more)))
+  (block last (store (ptr null) @fib.sched-inj-tail) (br out))
+  (block more (br out))
+  (block out (call @fib.unlock @fib.sched-inj-lock) (call @free node) (ret t)))
+
+;; ---- the worker count: FIB_THREADS, else the affinity mask capped by the cgroup quota (1 to 256)
+
+;; FIB_THREADS as a number, or 0 when unset or not a number from 1 to 256.
+(define internal (fib.sched-env-threads i64) ()
+  (block entry
+    (let ((v (call @getenv (string "FIB_THREADS"))))
+      (br (icmp eq v (ptr null)) none parse)))
+  (block none (ret (i64 0)))
+  (block parse
+    (let ((end (alloca ptr))
+          (n (call @strtol v end (i32 10)))
+          (good (and (icmp ne (load i8 v) (i8 0))
+                     (and (icmp eq (load i8 (load ptr end)) (i8 0)) (and (icmp sge n (i64 1)) (icmp sle n (i64 256)))))))
+      (ret (select good n (i64 0))))))
+
+;; The CPUs of this process's affinity mask (0 where the call is not available: Darwin, emit.os).
+(define internal (fib.sched-affinity i64) ()
+  (block entry
+    (let ((mask (alloca (align 8) i64 (i32 16)))
+          (rc (call @sched_getaffinity (i32 0) (i64 128) mask)))
+      (br (icmp ne rc (i32 0)) none count)))
+  (block none (ret (i64 0)))
+  (block count (br loop))
+  (block loop
+    (let ((i (phi i64 (count (i64 0)) (next i2)))
+          (acc (phi i64 (count (i64 0)) (next acc2))))
+      (br (icmp slt i (i64 16)) word done)))
+  (block word
+    (let ((acc2 (add acc (ctpop (load i64 (getelementptr i64 mask i)))))
+          (i2 (add i (i64 1))))
+      (br next)))
+  (block next (br loop))
+  (block done (ret acc)))
+
+;; The cgroup v2 quota of /sys/fs/cgroup/cpu.max ("max PERIOD" or "QUOTA PERIOD"), rounded up to whole CPUs; 0 when there is none.
+(define internal (fib.sched-cgroup i64) ()
+  (block entry
+    (let ((fd (call @openat (i32 -100) (string "/sys/fs/cgroup/cpu.max") (i32 0))))
+      (br (icmp slt fd (i32 0)) none read)))
+  (block none (ret (i64 0)))
+  (block read
+    (let ((buf (alloca i8 (i32 64)))
+          (n (call @read fd buf (i64 63))))
+      (call @close fd)
+      (br (icmp sle n (i64 0)) none parse)))
+  (block parse
+    (store (i8 0) (getelementptr i8 buf n))
+    (br (icmp eq (load i8 buf) (i8 109)) none numbers))
+  (block numbers
+    (let ((end (alloca ptr))
+          (quota (call @strtol buf end (i32 10)))
+          (period (call @strtol (load ptr end) (ptr null) (i32 10))))
+      (br (and (icmp sgt quota (i64 0)) (icmp sgt period (i64 0))) ratio none)))
+  (block ratio (ret (udiv (add quota (sub period (i64 1))) period))))
+
+;; The number of workers: computed once.
+(define internal (fib.sched-count i64) ()
+  (block entry
+    (let ((cached (load i64 @fib.sched-n)))
+      (br (icmp ne cached (i64 0)) have compute)))
+  (block have (ret cached))
+  (block compute
+    (let ((env (call @fib.sched-env-threads)))
+      (br (icmp ne env (i64 0)) forced detect)))
+  (block forced (store env @fib.sched-n) (ret env))
+  (block detect
+    (let ((aff (call @fib.sched-affinity))
+          (onl (call @sysconf (i32 84)))
+          (cpus (select (icmp sgt aff (i64 0)) aff onl))
+          (quota (call @fib.sched-cgroup))
+          (capped (select (and (icmp sgt quota (i64 0)) (icmp slt quota cpus)) quota cpus))
+          (n (select (icmp slt capped (i64 1)) (i64 1) (select (icmp sgt capped (i64 256)) (i64 256) capped))))
+      (store n @fib.sched-n)
+      (ret n))))

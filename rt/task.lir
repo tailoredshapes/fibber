@@ -117,9 +117,10 @@
 ;; At the program's exit, after its spawned threads are joined: waits
 ;; until the queue is empty and no worker is inside a task, so every
 ;; release a worker owes has been done (compiler.md §4: the trace must
-;; hold every free before the process ends).
+;; hold every free before the process ends); the work-stealing pool
+;; (sched.lir) drains first.
 (define internal (fib.pool-quiesce void) ()
-  (block entry (call @fib.rq-lock) (br test))
+  (block entry (call @fib.sched-quiesce) (call @fib.rq-lock) (br test))
   (block test
     (br (and (icmp eq (load ptr @fib.rq-head) (ptr null)) (icmp eq (load i32 @fib.pool-busy) (i32 0))) done sleep))
   (block sleep
@@ -202,12 +203,14 @@
 
 ;; join/block-on (§8.8): drives the executor until the task is done,
 ;; resuming the task itself when it can claim it, running other queued
-;; tasks meanwhile, sleeping when there is nothing to run.
+;; tasks meanwhile, sleeping when there is nothing to run. A pool task
+;; (sched.lir) is joined by the pool's own join, which helps instead.
 (define internal (fib.drive void) ((ptr task))
   (block entry
     (let ((sp (getelementptr %struct.fib.task task (i32 0) (i32 3)))
           (dp (getelementptr %struct.fib.task task (i32 0) (i32 4))))
-      (br loop)))
+      (br (call @fib.sched-pool-task task) pool loop)))
+  (block pool (call @fib.sched-join task) (ret))
   (block loop
     (br (icmp eq (atomic-load acquire i32 sp) (i32 2)) done claim))
   (block claim
