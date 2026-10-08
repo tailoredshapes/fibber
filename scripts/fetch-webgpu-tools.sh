@@ -35,7 +35,7 @@ for what in $WANT; do
       [ -d naga-cli-$NAGA_VER ] || tar xzf naga-cli-$NAGA_VER.crate
       [ -x "$DIR/naga/bin/naga" ] || CARGO_TARGET_DIR="$DIR/naga/target" nice "$HOME/.cargo/bin/cargo" install --path naga-cli-$NAGA_VER --root "$DIR/naga" --locked -j 4 >/dev/null 2>&1 \
         || CARGO_TARGET_DIR="$DIR/naga/target" nice "$HOME/.cargo/bin/cargo" install --path naga-cli-$NAGA_VER --root "$DIR/naga" -j 4 2>&1 | tail -3
-      echo "naga-cli $NAGA_VER: $("$DIR/naga/bin/naga" --version 2>&1 | head -1) at $DIR/naga/bin/naga" ;;
+      echo "naga-cli $NAGA_VER: $("$DIR/naga/bin/naga" --version 2>&1) at $DIR/naga/bin/naga" ;;
     node)
       mkdir -p "$DIR/webgpu-node"; cd "$DIR/webgpu-node"
       [ -f webgpu-$NODE_VER.tgz ] || curl -sfL -m 600 -o webgpu-$NODE_VER.tgz "$NODE_URL"
