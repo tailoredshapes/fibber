@@ -1,0 +1,20 @@
+;; spec:   types §2.17 (the gpu builtins: gpu/atomic-add-f32, gpu/atomic-max-f32, gpu/atomic-min-f32), lir §6.6; docs/design/gpu.md 13
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib
+;; Each f32 atomic answers the value that was in memory before. add leaves the sum; max keeps the larger and ignores a NaN operand; min keeps the smaller. The library's
+;; `fetch-` forms and the discarding `f32-min!` are the same instructions. On a buffer of the host (outside a kernel: unsafe, a raw ptr), one thread. Result: the number
+;; of wrong answers (bit 1 the old values, bit 2 the final words).
+(ns main (:require [fib.gpu :as gpu]))
+(defun main () -> i64
+  (let [buf (cell (array 4 0.0f32)) p (gpu/array-data @buf)]
+    (unsafe
+      (do (array-set! &buf 0 1.5f32) (array-set! &buf 1 1.5f32) (array-set! &buf 2 1.5f32) (array-set! &buf 3 1.5f32)
+          (let [a (gpu/atomic-add-f32 p 2.25f32)                                             ; old 1.5, new 3.75
+                b (gpu/atomic-max-f32 (ptr+ p 4) 4.0f32)                                     ; old 1.5, new 4.0
+                c (gpu/atomic-min-f32 (ptr+ p 8) -2.0f32)                                    ; old 1.5, new -2.0
+                d (gpu/atomic-max-f32 (ptr+ p 12) 0.0f32)                                    ; 0.0 < 1.5: old 1.5, stays
+                e (gpu/atomic-max-f32 (ptr+ p 12) (/ 0.0f32 0.0f32))]                        ; a NaN operand is ignored: old 1.5, stays
+            (+ (if (and (= a 1.5f32) (= b 1.5f32) (= c 1.5f32) (= d 1.5f32) (= e 1.5f32)) 0 1)
+               (if (and (= (array-get @buf 0) 3.75f32) (= (array-get @buf 1) 4.0f32) (= (array-get @buf 2) -2.0f32) (= (array-get @buf 3) 1.5f32)) 0 2)))))))

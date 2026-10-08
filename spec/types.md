@@ -1312,7 +1312,10 @@ compiler/types/builtins.fib), each with a case (cases/stdlib 8545-8548) and a mu
 | `(gpu/program-ptx)` | `(fn () str)` | `""` | the PTX of the program's kernels when built with `--kernel-target` (embedded), else `""` |
 | `(gpu/atomic-add-i32 p v)` `gpu/atomic-min-i32` `gpu/atomic-max-i32` (signed) `gpu/atomic-umin-i32` `gpu/atomic-umax-i32` `gpu/atomic-xchg-i32` | `(fn (ptr i32) i32)`, unsafe | `(atomicrmw OP monotonic p v)`: PTX `atom.global.add.u32` / `atom.shared.max.s32` .. (global or block-shared memory by the pointer's origin); WGSL: `atomicAdd` .. on `array<atomic<u32>>` (webgpu.md 3.7) | the same instruction (the host runs one thread at a time); answers the OLD value |
 | `(gpu/atomic-cas-i32 p expected new)` | `(fn (ptr i32 i32) i32)`, unsafe | `(extractvalue (cmpxchg monotonic monotonic p expected new) 0)`: the old value; `new` was stored when it equals `expected` | the same |
-| `(gpu/atomic-add-i64 p v)` `(gpu/atomic-add-f32 p v)` | `(fn (ptr i64) i64)`, `(fn (ptr f32) f32)`, unsafe | `atom.global.add.u64`, `atom.global.add.f32` | the same; WGSL refuses both by name |
+| `(gpu/atomic-add-i64 p v)` | `(fn (ptr i64) i64)`, unsafe | `atom.global.add.u64` | the same; WGSL refuses it by name (WGSL atomics are 32-bit) |
+| `(gpu/atomic-add-f32 p v)` `(gpu/atomic-max-f32 p v)` `(gpu/atomic-min-f32 p v)` (GPU-5) | `(fn (ptr f32) f32)`, unsafe | `(atomicrmw fadd monotonic p v)` / `fmax` / `fmin`: PTX `atom.global.add.f32` (max and min are loops LLVM expands, `atom.cas`); the OLD value | the same instruction; WGSL: a compare-and-exchange loop over the u32 bits (`fibw_atomic_fadd` .., webgpu.md 3.7); add is not deterministic (within n * 2^-24 * sum \|x\| of the left-to-right sum), max and min are exact and ignore a NaN operand |
+| `(gpu/shfl-down-i32 v d)` `gpu/shfl-down-f32` `gpu/shfl-up-i32` `gpu/shfl-up-f32` `gpu/shfl-xor-i32` `gpu/shfl-xor-f32` `gpu/shfl-idx-i32` `gpu/shfl-idx-f32` (GPU-5) | `(fn (i32 i32) i32)`, `(fn (f32 i32) f32)` | `(shfl-down v d)` etc. (lir.md 6.9a): PTX `shfl.sync.down.b32 .. -1` (mask: the whole warp; `up` clamps at lane 0, `xor` is `bfly`); WGSL `subgroupShuffleDown(v, d)`, `subgroupShuffleUp`, `subgroupShuffleXor`, `subgroupShuffle` (needs `enable subgroups;`: webgpu.md 3.8) | the lane's own `v` (a thread is a warp of one) |
+| `(gpu/subgroup-size)` `(gpu/lane-id)` `(gpu/ballot c)` (GPU-5) | `(fn () i32)`, `(fn () i32)`, `(fn (bool) i32)` | `(sreg warpsize)`, `(sreg laneid)`, `(ballot c)`: PTX `%warpsize` (32), `%laneid`, `vote.sync.ballot.b32`; WGSL `subgroup_size`, `subgroup_invocation_id`, `subgroupBallot(c).x` (lanes 0 to 31) | 1, 0, and 1 or 0 by `c` |
 | `(gpu/select c a b)` | `(fn (bool t t) t)` with `Num t` | lIR `(select c a b)`: both operands are computed, no branch | the same |
 
 **The kernel subset.** A `defkernel` (syntax §3.22) and every function it reaches (`:kernel-pure` is inferred: a function reached from a
@@ -1329,8 +1332,8 @@ closure, `async`, `await`, `quote`, `dyn`, `&`, a field read, `set-field!`, a `m
 `dyn` or a bound (a built-in scalar instance is arithmetic; another instance's method is a function, checked like one); recursion, direct or
 mutual (the call graph of a kernel is acyclic: `recursion: fact is on the path k -> fact -> fact`); a parameter, binding or result whose type
 is a string, a lane vector or an object. The lIR-level refusal of native.kernel (anything that reaches the runtime or libc) stays as the
-backstop. Not checked: a `gpu/barrier` under a condition that differs between the threads of a block (undefined in PTX: the program's
-obligation, gpu.md 3.2). Cases: cases/stdlib 8530-8542 (one per refusal); mutants: scripts/mutant-gpu.sh.
+backstop. Not checked: a `gpu/barrier` under a condition that differs between the threads of a block, or a shuffle or `gpu/ballot` under one that differs
+between the lanes of a warp (undefined in PTX: the program's obligation, gpu.md 3.2 and 12). Cases: cases/stdlib 8530-8542 (one per refusal); mutants: scripts/mutant-gpu.sh.
 
 ## 3. The inference algorithm
 

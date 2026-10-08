@@ -1,0 +1,136 @@
+;; fib.gpu.sim: a device that is host memory, for the contract to run where there is no GPU (docs/design/gpu.md 6.8). It is a REAL implementation of the
+;; protocols, with the asynchrony made deterministic: a copy is QUEUED on its stream and happens when something forces it (`transfer-wait` runs the
+;; queue through that copy; `stream-sync` runs all of it; `transfer-done?` runs it at the third ask), so a driver that skips the wait leaves the
+;; destination as it was and a test sees it. It loads no kernel (`device-load` is `:unsupported`): fib.gpu.contract's `GpuTransferContract` is the part
+;; of the contract it passes. Buffers and pinned buffers are malloc memory; the lend rules are `lend-launch`, `lend-copy` and `pinned-use` of fib.gpu.device.
+(ns fib.gpu.sim (:use fib.core fib.seq fib.coll fib.gpu.device) (:require [fib.os.native :as n]))
+
+;; Shared by one device: buffer states and pinned states by address, the next stream id.
+(defstruct SimShared (bst: (Cell (Map i64 i64)) pst: (Cell (Map i64 i64)) streams: (Cell i64)))
+(defstruct SimDevice (info: DeviceInfo sh: SimShared))
+(defstruct SimBuffer (addr: i64 bytes: i64 sh: SimShared))
+(defstruct SimPinned (addr: i64 bytes: i64 sh: SimShared))
+;; `queue`: the copies not yet done, each [seq src dst bytes]; `lent`: the buffers lent since the last sync.
+(defstruct SimStream (id: i64 sh: SimShared queue: (Cell (Vec (Vec i64))) seqs: (Cell i64) lent: (Cell (Vec i64))))
+(defstruct SimTransfer (queue: (Cell (Vec (Vec i64))) seq: i64 pinned: (dyn Pinned) sh: SimShared polls: (Cell i64) waited: (Cell bool)))
+
+(defun sim-device (memory: i64) -> SimDevice
+  (SimDevice (DeviceInfo "fib.gpu.sim" memory 0 0 1 1024 0) (SimShared (cell {}) (cell {}) (cell 0))))
+
+(defun state-of :private (m: (Cell (Map i64 i64)) a: i64) -> i64 (unwrap-or (get @m a) 0))
+(defun put! :private (m: (Cell (Map i64 i64)) a: i64 s: i64) -> unit (set! m (assoc @m a s)))
+
+;; Copies `bytes` from address `src` to `dst`, a word at a time and then a byte at a time.
+(defun copy-mem! :private (src: i64 dst: i64 bytes: i64) -> unit
+  (unsafe
+    (let [s (n/pointer src) d (n/pointer dst) words (quot bytes 8)]
+      (do (dotimes (i words) (store-i64 (ptr+ d (* 8 i)) (load-i64 (ptr+ s (* 8 i)))))
+          (loop [i (* 8 words)] (when (< i bytes) (do (store-i8 (ptr+ d i) (load-i8 (ptr+ s i))) (recur (+ i 1)))))))))
+
+(defun f32-ptr :private (xs: (Array f32)) -> ptr (unsafe (ptr+ (raw xs) 24)))
+(defun i8-ptr :private (xs: (Array i8)) -> ptr (unsafe (ptr+ (raw xs) 24)))
+
+;; Runs the queued copies up to and including `seq`, in order.
+(defun run-through! :private (q: (Cell (Vec (Vec i64))) seq: i64) -> unit
+  (do (doseq [c @q] (when (<= (nth c 0) seq) (copy-mem! (nth c 1) (nth c 2) (nth c 3))))
+      (set! q (vec (filter (fn (c: (Vec i64)) (> (nth c 0) seq)) @q)))))
+
+(defun buffer-ok :private (b: SimBuffer what: str n: i64) -> (Result unit GpuError)
+  (let [st (state-of (. (. b sh) bst) (. b addr))]
+    (cond (= st 2) (Err (gpu-error :released (str what ": the buffer was released")))
+          (lent? st) (Err (gpu-error :lent (str what ": the buffer is lent to a running kernel: sync the stream first")))
+          (> n (. b bytes)) (Err (gpu-error :invalid-argument (str what ": " n " bytes do not fit a buffer of " (. b bytes))))
+          :else (Ok ()))))
+
+(impl Buffer SimBuffer
+  (buffer-bytes (self) (. self bytes))
+  (buffer-handle (self) (. self addr))
+  (buffer-upload (self xs) (try-let [_ (buffer-ok self "upload" (* 4 (array-len xs)))] (do (copy-mem! (n/address (f32-ptr xs)) (. self addr) (* 4 (array-len xs))) (Ok ()))))
+  (buffer-download (self count)
+    (let [out (cell (array count 0.0f32))]
+      (try-let [_ (buffer-ok self "download" (* 4 count))] (do (copy-mem! (. self addr) (n/address (f32-ptr @out)) (* 4 count)) (Ok @out)))))
+  (buffer-upload-bytes (self xs) (try-let [_ (buffer-ok self "upload" (array-len xs))] (do (copy-mem! (n/address (i8-ptr xs)) (. self addr) (array-len xs)) (Ok ()))))
+  (buffer-download-bytes (self count)
+    (let [out (cell (array count 0i8))]
+      (try-let [_ (buffer-ok self "download" count)] (do (copy-mem! (. self addr) (n/address (i8-ptr @out)) count) (Ok @out)))))
+  (buffer-fill (self v) (try-let [_ (buffer-ok self "fill" 0)] (do (unsafe (dotimes (i (. self bytes)) (store-i8 (ptr+ (n/pointer (. self addr)) i) v))) (Ok ()))))
+  (buffer-release (self)
+    (try-let [_ (buffer-ok self "release" 0)] (do (unsafe (free (n/pointer (. self addr)))) (put! (. (. self sh) bst) (. self addr) 2) (Ok ())))))
+
+(defun pinned-ok :private (p: SimPinned what: str) -> (Result unit GpuError) (pinned-use (state-of (. (. p sh) pst) (. p addr)) what))
+
+(impl Pinned SimPinned
+  (pinned-bytes (self) (. self bytes))
+  (pinned-handle (self) (. self addr))
+  (pinned-locked? (self) false)
+  (pinned-write (self xs)
+    (try-let [_ (pinned-ok self "pinned-write")
+              _ (if (> (* 4 (array-len xs)) (. self bytes)) (Err (gpu-error :invalid-argument "pinned-write: more than the buffer holds")) (Ok ()))]
+      (do (copy-mem! (n/address (f32-ptr xs)) (. self addr) (* 4 (array-len xs))) (Ok ()))))
+  (pinned-read (self count)
+    (let [out (cell (array count 0.0f32))]
+      (try-let [_ (pinned-ok self "pinned-read")
+                _ (if (> (* 4 count) (. self bytes)) (Err (gpu-error :invalid-argument "pinned-read: more than the buffer holds")) (Ok ()))]
+        (do (copy-mem! (. self addr) (n/address (f32-ptr @out)) (* 4 count)) (Ok @out)))))
+  (pinned-release (self)
+    (try-let [_ (pinned-ok self "pinned-release")]
+      (do (unsafe (free (n/pointer (. self addr)))) (put! (. (. self sh) pst) (. self addr) 2) (Ok ())))))
+
+(impl Transfer SimTransfer
+  (transfer-done? (self)
+    (do (set! (. self polls) (+ @(. self polls) 1))
+        (when (>= @(. self polls) 3) (run-through! (. self queue) (. self seq)))
+        (Ok (not (some? (first (filter (fn (c: (Vec i64)) (= (nth c 0) (. self seq))) @(. self queue))))))))
+  (transfer-wait (self)
+    (if @(. self waited)
+        (Err (gpu-error :invalid-argument "transfer-wait: the transfer was already waited for"))
+        (do (run-through! (. self queue) (. self seq))
+            (set! (. self waited) true)
+            (put! (. (. self sh) pst) (pinned-handle (. self pinned)) 0)
+            (Ok (. self pinned))))))
+
+;; Lends the device buffer to this stream for a copy and the pinned buffer to the transfer; the copy is queued.
+(defun queue-copy :private (s: SimStream dev: (dyn Buffer) host: (dyn Pinned) bytes: i64 in?: bool) -> (Result (dyn Transfer) GpuError)
+  (let [sh (. s sh) h (buffer-handle dev) ph (pinned-handle host)]
+    (try-let [_ (copy-bytes-check (if in? "stream-copy-in" "stream-copy-out") bytes (buffer-bytes dev) (pinned-bytes host))
+              _ (pinned-use (state-of (. sh pst) ph) (if in? "stream-copy-in" "stream-copy-out"))
+              st (lend-copy (state-of (. sh bst) h) (. s id))]
+      (let [seq (+ @(. s seqs) 1)]
+        (do (set! (. s seqs) seq)
+            (when (= (state-of (. sh bst) h) 0) (set! (. s lent) (conj @(. s lent) h)))
+            (put! (. sh bst) h st) (put! (. sh pst) ph 1)
+            (set! (. s queue) (conj @(. s queue) (if in? [seq ph h bytes] [seq h ph bytes])))
+            (Ok (dyn Transfer (SimTransfer (. s queue) seq host sh (cell 0) (cell false)))))))))
+
+(impl Stream SimStream
+  (stream-launch (self k grid block args) (Err (gpu-error :unsupported "the simulated device runs no kernel")))
+  (stream-sync (self)
+    (do (run-through! (. self queue) @(. self seqs))
+        (doseq [h @(. self lent)] (when (lent? (state-of (. (. self sh) bst) h)) (put! (. (. self sh) bst) h 0)))
+        (set! (. self lent) [])
+        (Ok ())))
+  (stream-record (self e) (Ok ()))
+  (stream-lend (self bs) (Ok ()))
+  (stream-copy-in (self dst src bytes) (queue-copy self dst src bytes true))
+  (stream-copy-out (self src dst bytes) (queue-copy self src dst bytes false))
+  (stream-handle (self) (. self id)))
+
+(defun alloc-mem :private (bytes: i64) -> i64 (unsafe (n/address (alloc bytes))))
+
+(impl Device SimDevice
+  (device-info (self) (. self info))
+  (device-supports? (self cap) false)
+  (device-load (self source) (Err (gpu-error :unsupported "the simulated device loads no kernel")))
+  (device-alloc (self bytes)
+    (cond (<= bytes 0) (Err (gpu-error :invalid-argument (str "a buffer of " bytes " bytes")))
+          (> bytes (. (. self info) memory)) (Err (gpu-error :out-of-memory (str "a buffer of " bytes " bytes")))
+          :else (let [a (alloc-mem bytes)] (do (put! (. (. self sh) bst) a 0) (Ok (dyn Buffer (SimBuffer a bytes (. self sh))))))))
+  (device-pinned (self bytes)
+    (cond (<= bytes 0) (Err (gpu-error :invalid-argument (str "a pinned buffer of " bytes " bytes")))
+          (> bytes (. (. self info) memory)) (Err (gpu-error :out-of-memory (str "a pinned buffer of " bytes " bytes")))
+          :else (let [a (alloc-mem bytes)] (do (put! (. (. self sh) pst) a 0) (Ok (dyn Pinned (SimPinned a bytes (. self sh))))))))
+  (device-stream (self)
+    (do (set! (. (. self sh) streams) (+ @(. (. self sh) streams) 1))
+        (Ok (dyn Stream (SimStream @(. (. self sh) streams) (. self sh) (cell []) (cell 0) (cell []))))))
+  (device-event (self) (Err (gpu-error :unsupported "the simulated device has no events")))
+  (device-close (self) (Ok ())))

@@ -1,0 +1,25 @@
+;; fib.gpu.warp: warp (subgroup) shuffles for kernels (docs/design/gpu.md 12, spec/types.md 2.17). Thin names over the builtins `gpu/shfl-{down,up,xor,idx}-{i32,f32}`, `gpu/subgroup-size`,
+;; `gpu/lane-id` and `gpu/ballot`: PTX `shfl.sync` and `vote.sync.ballot`, WGSL `subgroupShuffle*` and `subgroupBallot` (the module then says `enable subgroups;` and carries the header line
+;; `// fib.requires: subgroups`: a device without the feature rejects it BY NAME before compiling, it is never run wrong).
+;;   (shfl-down-i32 v d)   the `v` of the lane `lane + d` of the warp          (shfl-up-i32 v d)  of the lane `lane - d`
+;;   (shfl-xor-i32 v m)    the `v` of the lane `lane ^ m` (a butterfly)        (shfl-idx-i32 v l) of the lane `l`
+;;   (subgroup-size)       the width of the warp (32 on NVIDIA; 4 to 128 in WGSL, a power of two)        (lane-id)  this thread's lane, 0 .. subgroup-size - 1
+;;   (ballot c)            bit k (k < 32) is set when lane k's `c` is true, the same in every lane
+;; Every lane of the warp must call a shuffle or a ballot TOGETHER (it is a barrier of the warp, the full-warp mask of `shfl.sync`): not under a branch the lanes disagree on, and the block holds
+;; whole warps. A source lane out of range answers the lane's own value on PTX and an UNSPECIFIED value in WGSL: a caller must not depend on it. The warp of a thread is
+;; `local-id / subgroup-size` and its lane `lane-id` for the one-dimensional blocks of fib.gpu.reduce-warp (true on NVIDIA and checked on the device by compiler/tests/native/gpu-device.sh; WGSL does
+;; not promise the mapping). On the host a thread is a warp of one: `subgroup-size` is 1, `lane-id` 0, a shuffle answers its own `v`, `ballot` is 1 or 0.
+(ns fib.gpu.warp (:use fib.core))
+
+(defun shfl-down-i32 (v: i32 d: i32) -> i32 (gpu/shfl-down-i32 v d))
+(defun shfl-down-f32 (v: f32 d: i32) -> f32 (gpu/shfl-down-f32 v d))
+(defun shfl-up-i32 (v: i32 d: i32) -> i32 (gpu/shfl-up-i32 v d))
+(defun shfl-up-f32 (v: f32 d: i32) -> f32 (gpu/shfl-up-f32 v d))
+(defun shfl-xor-i32 (v: i32 m: i32) -> i32 (gpu/shfl-xor-i32 v m))
+(defun shfl-xor-f32 (v: f32 m: i32) -> f32 (gpu/shfl-xor-f32 v m))
+(defun shfl-idx-i32 (v: i32 l: i32) -> i32 (gpu/shfl-idx-i32 v l))
+(defun shfl-idx-f32 (v: f32 l: i32) -> f32 (gpu/shfl-idx-f32 v l))
+
+(defun subgroup-size () -> i32 (gpu/subgroup-size))
+(defun lane-id () -> i32 (gpu/lane-id))
+(defun ballot (c: bool) -> i32 (gpu/ballot c))

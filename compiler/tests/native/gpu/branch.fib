@@ -1,0 +1,38 @@
+;; compiler/tests/native/gpu/branch.fib: kernels that branch around a barrier in ONE function, for compiler/tests/native/gpu-device.sh (GPU-4). Before the relooper in
+;; native.wgsl.func every function with a branch was printed as a loop-and-switch state machine and Dawn rejected a barrier in it. Block size 128 (a launch's block).
+;;   rev        out[i] = data[block base + 127 - t]: the load is under `when (< i n)` (a thread-dependent branch), then the barrier, then the read of another thread's slot
+;;   tree-sum   the textbook reduction: `when (< t stride)` adds the slot of thread t+stride, a barrier each step, thread 0 writes the block's sum; the loop is uniform
+;;   parity     an if/else whose arms write different values (even and odd threads), a barrier after the join, then each thread reads its neighbour's slot
+;;   early      a `when` after the last barrier that skips the tail threads (the barrier itself is reached by every thread)
+(ns branch (:require [fib.gpu :as gpu] [gpu32 :as g]))
+
+(defkernel rev (data: ptr out: ptr n: i32)
+  (let ((i (g/global-id-x)) (t (g/local-id-x)) (s (gpu/shared :i32 128)))
+    (do (when (< i n) (g/i32-set! s t (g/i32-at data i)))
+        (gpu/barrier)
+        (when (< i n) (g/i32-set! out i (g/i32-at s (unchecked-subtract 127i32 t)))))))
+
+(defkernel tree-sum (data: ptr out: ptr n: i32)
+  (let ((i (g/global-id-x)) (t (g/local-id-x)) (s (gpu/shared :i32 128)))
+    (do (if (< i n) (g/i32-set! s t (g/i32-at data i)) (g/i32-set! s t 0i32))
+        (gpu/barrier)
+        (loop ((stride 64i32))
+          (when (> stride 0i32)
+            (do (when (< t stride) (g/i32-set! s t (unchecked-add (g/i32-at s t) (g/i32-at s (unchecked-add t stride)))))
+                (gpu/barrier)
+                (recur (quot stride 2i32)))))
+        (when (= t 0i32) (g/i32-set! out (g/group-id-x) (g/i32-at s 0i32))))))
+
+(defkernel parity (data: ptr out: ptr n: i32)
+  (let ((i (g/global-id-x)) (t (g/local-id-x)) (s (gpu/shared :i32 128)))
+    (do (if (= (bit-and t 1i32) 0i32)
+            (g/i32-set! s t (unchecked-add (g/i32-at data i) 1000i32))
+            (g/i32-set! s t (unchecked-multiply (g/i32-at data i) 2i32)))
+        (gpu/barrier)
+        (g/i32-set! out i (g/i32-at s (bit-xor t 1i32))))))
+
+(defkernel early (data: ptr out: ptr n: i32)
+  (let ((i (g/global-id-x)) (t (g/local-id-x)) (s (gpu/shared :i32 128)))
+    (do (g/i32-set! s t (g/i32-at data i))
+        (gpu/barrier)
+        (when (< i n) (g/i32-set! out i (unchecked-add (g/i32-at s (unchecked-subtract 127i32 t)) 1i32))))))

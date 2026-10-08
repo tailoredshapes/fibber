@@ -1,0 +1,157 @@
+;; compiler/native/wgsl/reloop.fib: the analysis behind structured WGSL (docs/design/webgpu.md 3.6, 9.3): from the control-flow graph of one lIR function (the
+;; successors of each block) to what native.wgsl.func needs to print `if`/`else`/`loop` with `break` and `continue` in place of the loop-and-switch state machine:
+;;   * the reachable blocks, the dominators, and whether the graph is reducible (every edge either goes forward in reverse postorder or is a back edge to a
+;;     dominator); an irreducible graph is `ok = false` and the printer falls back to the state machine (with a warning);
+;;   * the natural loops (by header: the body and the one block the loop exits to, if any: a loop with two exit targets is refused, as is an exit that
+;;     leaves two loops at once, since WGSL has no labelled break);
+;;   * the join of each branch: its immediate post-dominator in the graph of its own loop level (a back edge, a break and a return go to the exit; a nested
+;;     loop is one node that goes to its exit block);
+;;   * the number of forward edges into each block (a block with one is printed where that edge is).
+(ns native.wgsl.reloop)
+
+(def EXIT: str "%exit")
+
+(defstruct Lp (body: (Set str) exit: (Option str)))
+(defstruct Rl (ok: bool why: str ipdom: (Map str str) loops: (Map str Lp) fwd: (Map str i64) nodes: i64))
+
+;; ---------------------------------------------------------------- sets and a dataflow
+
+(defun inter :private (a: (Set str) b: (Set str)) -> (Set str)
+  (into #{} (filter (fn (x: str) (contains? b x)) a)))
+
+(defun succs-of :private (g: (Map str (Vec str)) n: str) -> (Vec str) (unwrap-or (get g n) []))
+
+(defun dfs :private (g: (Map str (Vec str)) n: str seen: (Cell (Set str)) post: (Cell (Vec str))) -> unit
+  (if (contains? @seen n)
+      ()
+      (do (update! seen (fn (s) (conj s n)))
+          (run! (fn (m: str) (dfs g m seen post)) (succs-of g n))
+          (update! post (fn (v) (conj v n))))))
+
+;; The sets `d(n) = {n} + the intersection of d(m) over the inputs m of n`, to a fixed point; the root has {root}. (dominators: inputs are the
+;; predecessors; post-dominators: the successors.)
+(defun solve :private (nodes: (Vec str) root: str inputs: (fn (str) (Vec str))) -> (Map str (Set str))
+  (let ((all (into #{} nodes)))
+    (loop ((d (into {} (map (fn (n: str) (Pair n (if (= n root) #{root} all))) nodes))))
+      (let ((d2 (reduce (fn (acc: (Map str (Set str)) n: str)
+                          (if (= n root)
+                              acc
+                              (let ((ins (inputs n))
+                                    (meet (reduce (fn (s: (Set str) m: str) (inter s (unwrap-or (get acc m) #{}))) all ins)))
+                                (assoc acc n (conj meet n)))))
+                        d nodes)))
+        (if (= (total d2) (total d)) d (recur d2))))))
+
+(defun total :private (d: (Map str (Set str))) -> i64 (reduce (fn (a: i64 s: (Set str)) (+ a (count s))) 0 (vals d)))
+
+;; The immediate one: the member of d(n) other than n whose own set is one smaller than d(n)'s.
+(defun idom-of :private (d: (Map str (Set str)) n: str) -> (Option str)
+  (let ((mine (unwrap-or (get d n) #{})))
+    (find-first (fn (m: str) (and (not (= m n)) (= (count (unwrap-or (get d m) #{})) (- (count mine) 1)))) mine)))
+
+;; ---------------------------------------------------------------- loops
+
+(defun closure :private (preds: (Map str (Vec str)) h: str seeds: (Vec str)) -> (Set str)
+  (loop ((work seeds) (body #{h}))
+    (if (empty? work)
+        body
+        (let ((n (nth work 0)) (rest (vec (drop 1 work))))
+          (if (contains? body n)
+              (recur rest body)
+              (recur (into rest (succs-of preds n)) (conj body n)))))))
+
+(defun innermost :private (loops: (Map str Lp) n: str) -> str
+   (reduce (fn (best: str h: str)
+             (if (and (contains? (. (unwrap (get loops h)) body) n)
+                      (or (= best "") (< (count (. (unwrap (get loops h)) body)) (count (. (unwrap (get loops best)) body)))))
+                 h best))
+           "" (keys loops)))
+
+;; The loop that holds loop `h` (the innermost of the others whose body has `h`), "" for none.
+(defun parent-of :private (loops: (Map str Lp) h: str) -> str
+  (reduce (fn (best: str o: str)
+            (if (and (not (= o h)) (contains? (. (unwrap (get loops o)) body) h)
+                     (or (= best "") (< (count (. (unwrap (get loops o)) body)) (count (. (unwrap (get loops best)) body)))))
+                o best))
+          "" (keys loops)))
+
+(defun exits-of :private (g: (Map str (Vec str)) body: (Set str)) -> (Set str)
+  (into #{} (mapcat (fn (u: str) (filter (fn (v: str) (not (contains? body v))) (succs-of g u))) body)))
+
+;; ---------------------------------------------------------------- the analysis
+
+(defun bad :private (why: str) -> Rl (Rl false why {} {} {} 0))
+
+(defun preds-of :private (nodes: (Vec str) g: (Map str (Vec str))) -> (Map str (Vec str))
+  (reduce (fn (acc: (Map str (Vec str)) u: str)
+            (reduce (fn (a: (Map str (Vec str)) v: str) (assoc a v (conj (succs-of a v) u))) acc (succs-of g u)))
+          {} nodes))
+
+;; The nodes of region `r` ("" the function, else a loop header) with their successors in the region's graph.
+(defun region-succ :private (loops: (Map str Lp) g: (Map str (Vec str)) dead: (Set str) r: str n: str) -> (Vec str)
+  (let ((inner (innermost loops n)))
+    (if (and (contains? dead n) (= inner r))
+        []
+    (if (and (not (= inner r)) (contains? loops n))
+        (match (. (unwrap (get loops n)) exit) ((some e) [e]) (nil [EXIT]))
+        (let ((ts (map (fn (t: str) (if (and (not (= t r)) (or (= (innermost loops t) r) (and (contains? loops t) (= (parent-of loops t) r)))) t EXIT))
+                       (succs-of g n))))
+          (if (empty? ts) [EXIT] (vec ts)))))))
+
+(defun region-ipdoms :private (loops: (Map str Lp) g: (Map str (Vec str)) dead: (Set str) nodes: (Vec str) r: str) -> (Map str str)
+  (let ((mine (vec (filter (fn (n: str) (or (= (innermost loops n) r) (and (contains? loops n) (= (parent-of loops n) r)))) nodes)))
+        (sc (fn (n: str) (region-succ loops g dead r n)))
+        (d (solve (conj (vec mine) EXIT) EXIT sc)))
+    (into {} (mapcat (fn (n: str)
+                       (if (= (innermost loops n) r)
+                           (if (>= (count (unwrap (get d n))) (+ 1 (count mine))) [] (match (idom-of d n) ((some m) (if (= m EXIT) [] [(Pair n m)])) (nil [])))
+                           []))
+                     mine))))
+
+(defun fwd-counts :private (nodes: (Vec str) g: (Map str (Vec str)) dom: (Map str (Set str))) -> (Map str i64)
+  (reduce (fn (acc: (Map str i64) u: str)
+            (reduce (fn (a: (Map str i64) v: str)
+                      (if (contains? (unwrap (get dom u)) v) a (assoc a v (+ 1 (unwrap-or (get a v) 0)))))
+                    acc (succs-of g u)))
+          {} nodes))
+
+;; The analysis of the graph `g` (block to successors, one entry per edge) from `entry`. `dead` are the blocks that end in a trap or `unreachable`: they
+;; never reach a join, so they do not stop a branch from having one (`if (bad) trap` then the rest).
+(defun analyze (entry: str g: (Map str (Vec str)) dead: (Set str)) -> Rl
+  (let ((seen (cell #{})) (post (cell [])))
+    (do (dfs g entry seen post)
+        (let ((nodes (vec (reverse @post))) (rpo (into {} (map-indexed (fn (i: i64 n: str) (Pair n i)) nodes)))
+              (preds (preds-of nodes g))
+              (dom (solve nodes entry (fn (n: str) (succs-of preds n))))
+              (edges (vec (mapcat (fn (u: str) (map (fn (v: str) (Pair u v)) (succs-of g u))) nodes)))
+              (backs (vec (filter (fn (e: (Pair str str)) (contains? (unwrap (get dom (. e fst))) (. e snd))) edges))))
+          (if (some? (find-first (fn (e: (Pair str str))
+                                   (and (not (contains? (unwrap (get dom (. e fst))) (. e snd)))
+                                        (>= (unwrap (get rpo (. e fst))) (unwrap (get rpo (. e snd))))))
+                                 edges))
+              (bad "irreducible control flow")
+              (shape entry g dead nodes preds dom backs))))))
+
+(defun shape :private (entry: str g: (Map str (Vec str)) dead: (Set str) nodes: (Vec str) preds: (Map str (Vec str)) dom: (Map str (Set str)) backs: (Vec (Pair str str))) -> Rl
+  (let ((hdrs (vec (distinct (map (fn (e: (Pair str str)) (. e snd)) backs))))
+        (bodies (into {} (map (fn (h: str)
+                                (Pair h (closure preds h (vec (map (fn (e: (Pair str str)) (. e fst)) (filter (fn (e: (Pair str str)) (= (. e snd) h)) backs))))))
+                              hdrs)))
+        (loops (into {} (map (fn (h: str)
+                               (let ((xs (vec (exits-of g (unwrap (get bodies h))))))
+                                 (Pair h (Lp (unwrap (get bodies h)) (if (empty? xs) nil (some (nth xs 0)))))))
+                             hdrs)))
+        (multi (find-first (fn (h: str) (> (count (exits-of g (unwrap (get bodies h)))) 1)) hdrs))
+        (deep (find-first (fn (h: str)
+                            (let ((p (parent-of loops h)))
+                              (match (. (unwrap (get loops h)) exit)
+                                ((some e) (and (not (= p "")) (not (contains? (. (unwrap (get loops p)) body) e))))
+                                (nil false))))
+                          hdrs)))
+    (cond (some? multi) (bad (str "a loop with several exits (at " (unwrap multi) ")"))
+          (some? deep) (bad (str "a loop that exits several loops at once (at " (unwrap deep) ")"))
+          :else (Rl true ""
+                    (reduce (fn (acc: (Map str str) r: str) (into acc (region-ipdoms loops g dead nodes r))) {} (conj (vec hdrs) ""))
+                    loops
+                    (fwd-counts nodes g dom)
+                    (count nodes)))))

@@ -32,5 +32,10 @@ mutant overflow-unchecked   compiler/native/wgsl.fib       's/return OvI32(r, ((
 mutant workgroup-size-fixed compiler/native/wgsl.fib       's/@compute @workgroup_size(wg_x, wg_y, wg_z)/@compute @workgroup_size(64, 1, 1)/'
 mutant trap-without-flag    compiler/native/wgsl.fib       's/fn fibw_trap() { fibw_trapped = true; atomicStore(&fibw_flag.flag, 1u); }/fn fibw_trap() { fibw_trapped = true; }/'
 mutant index-space-swapped  compiler/native/wgsl/expr.fib  's/(= name "tid.x") "i32(fibw_lid.x)"/(= name "tid.x") "i32(fibw_wid.x)"/'
+# GPU-5: the f32 atomic loop and the subgroup forms (cases 8578 and 8580 are accept cases; the golden kernels.wgsl must not gain a subgroup line)
+mutant f32-atomic-refused   compiler/native/wgsl/atomic.fib 's/((RFAdd) (some "fibw_atomic_fadd"))/((RFAdd) nil)/'
+mutant shuffle-down-is-up   compiler/native/wgsl/subgroup.fib 's/"shfl-down" "subgroupShuffleDown"/"shfl-down" "subgroupShuffleUp"/'
+mutant subgroups-always-on  compiler/native/wgsl/subgroup.fib 's/(if on (str "enable subgroups;/(if true (str "enable subgroups;/'
+mutant header-line-dropped  compiler/native/wgsl/subgroup.fib 's/(if on "\/\/ fib.requires: subgroups/(if false "\/\/ fib.requires: subgroups/'
 [ $bad = 0 ] && echo "mutant-webgpu: every mutant is caught" || echo "mutant-webgpu: FAILED"
 exit $bad

@@ -1,0 +1,46 @@
+;; fib.gpu.lend: the STATIC form of the pinned-buffer loan (docs/design/gpu.md 6.8; the sibling of `with-view`, spec/types.md 6.15). The protocols check
+;; at run time that a pinned buffer in flight is not touched (`:lent`); this file makes the checker refuse it before the program runs:
+;;
+;;   (let [p (cell (unwrap-pinned (device-pinned d (* 4 n))))]          ; the pinned buffer is a private cell
+;;     (with-copy-in (p s dst (* 4 n))                                  ; p is lent to the copy for the body
+;;       (stream-launch s k grid block args)                            ; device work in stream order, host work: anything but p
+;;       ..))                                                           ; the copy is waited for at the end: (Ok body-value), or the Err
+;;
+;; `with-copy-in` and `with-copy-out` are `with-view` over a lender: the place `p` is FROZEN for the body (rule L2: "p is lent to t and cannot be used
+;; here", a second copy of the same buffer inside the body is the same error), the loan is the scoped value `t`, never returned, stored or captured
+;; (S1, VC1, VC2), and the scope's exit is `transfer-wait`: the loan cannot outlive the copy, and the copy cannot outlive the buffer's cell. A
+;; transfer the driver refuses is the Err of the whole form (the body has run). Nothing here is a driver: `stream-copy-in` and `-out` are the protocol's.
+;; Explicit: `(:require [fib.gpu.lend :as lend])`; a program using the forms writes `(:use fib.view)` for the lender protocol's sake.
+(ns fib.gpu.lend (:use fib.core fib.seq fib.coll fib.view fib.gpu.device))
+
+;; The loan: the transfer the driver started, or the Err it refused with. Scoped: borrowed, never consumed (types 1.10).
+(defstruct InFlight (started: (Result (dyn Transfer) GpuError)))
+(impl Scoped InFlight (scoped-tag (self) 4))
+
+;; The lenders: `with-view` calls these (L3) with `&p`, the cell of the pinned buffer.
+(defun copy-in-lend (&p: (dyn Pinned) s: (dyn Stream) dst: (dyn Buffer) bytes: i64) -> InFlight
+  (unsafe (InFlight (stream-copy-in s dst @p bytes))))
+(defun copy-out-lend (&p: (dyn Pinned) s: (dyn Stream) src: (dyn Buffer) bytes: i64) -> InFlight
+  (unsafe (InFlight (stream-copy-out s src @p bytes))))
+
+;; The scope's exit: waits for the copy (which hands the pinned buffer back) and answers the body's value, or the Err.
+(defun inflight-finish (t: InFlight v: a) -> (Result a GpuError)
+  (match (. t started)
+    ((Ok tr) (match (transfer-wait tr) ((Ok _) (Ok v)) ((Err e) (Err e))))
+    ((Err e) (Err e))))
+
+;; (with-copy-in (p stream device-buffer bytes) body..): the pinned buffer in the cell `p` is copied to the device buffer, asynchronously, while the body runs.
+(defmacro with-copy-in (spec ... body)
+  (let ((items (match spec ((List xs) xs) (_ (trap "with-copy-in: (p stream device-buffer bytes)"))))
+        (t (gensym "loan")) (v (gensym "body")))
+    (do (when (!= (vec-count items) 4) (trap "with-copy-in: (p stream device-buffer bytes)"))
+        `(fib.view/with-view [~t (fib.gpu.lend/copy-in-lend (& ~(vec-nth items 0)) ~(vec-nth items 1) ~(vec-nth items 2) ~(vec-nth items 3))]
+           (let ((~v (do ~@body))) (fib.gpu.lend/inflight-finish @~t ~v))))))
+
+;; (with-copy-out (p stream device-buffer bytes) body..): the device buffer is copied into the pinned buffer in the cell `p`; the body may not read `p`.
+(defmacro with-copy-out (spec ... body)
+  (let ((items (match spec ((List xs) xs) (_ (trap "with-copy-out: (p stream device-buffer bytes)"))))
+        (t (gensym "loan")) (v (gensym "body")))
+    (do (when (!= (vec-count items) 4) (trap "with-copy-out: (p stream device-buffer bytes)"))
+        `(fib.view/with-view [~t (fib.gpu.lend/copy-out-lend (& ~(vec-nth items 0)) ~(vec-nth items 1) ~(vec-nth items 2) ~(vec-nth items 3))]
+           (let ((~v (do ~@body))) (fib.gpu.lend/inflight-finish @~t ~v))))))

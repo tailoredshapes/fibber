@@ -69,9 +69,10 @@ relooper, section 9) is the fix that tests the first and the likeliest.
 
 ## 3. The mapping: the kernel subset to WGSL
 
-The printer (compiler/native/wgsl/) takes the kernel module: SSA lIR with blocks, phis, `let`s. Each lIR function is one WGSL function in
-the loop-and-switch form of the JS backend (compiler/js/func.fib): `var L: u32 = 0u; loop { switch L { case 0u: { .. } .. } }`, one case per
-block, a branch `L = k;` (the case ends, the loop goes round), a phi a `var ph<pos>` assigned on the edge, a block with one incoming edge
+The printer (compiler/native/wgsl/) takes the kernel module: SSA lIR with blocks, phis, `let`s. Each lIR function is one WGSL function, in
+structured form where its control-flow graph allows (3.7: `if`/`else`, `loop` with `break` and `continue`), else in the loop-and-switch form of the JS backend
+(compiler/js/func.fib): `var L: u32 = 0u; loop { switch L { case 0u: { .. } .. } }`, one case per
+block, a branch `L = k;` (the case ends, the loop goes round); in both a phi a `var ph<pos>` assigned on the edge, a block with one incoming edge
 written where that edge is. Every SSA name is a `var` of the function (a value defined in one block is read in another; WGSL `let`s are
 block-scoped). Parameters are copied into `var`s of their names (a self tail call assigns them and jumps to the entry; any other tail call
 is `return f(..)`). The entry of a kernel is a `@compute @workgroup_size(wg_x, wg_y, wg_z) fn NAME(@builtin ..)` that stores the builtins
@@ -190,8 +191,9 @@ rounding) and compares with a tolerance, as gpu.md 2.1 derives one for sums in a
   cannot prove uniform makes everything after the call non-uniform; (2) a function that reaches a barrier makes no early exit after a call that may trap
   (the check reads `fibw_trapped`, a private variable, which Tint takes as non-uniform): the callee's trap exits the callee, the flag is set, the caller goes on
   and the results are void; (3) a branch whose condition is a constant is not printed: the runtime guards a checked division by a constant with
-  `(icmp eq (i32 16) (i32 -1))`, a variable to Tint, and `and`-ed with a test of `local_invocation_id`, which is non-uniform. The rule that remains: a barrier
-  in a function whose control flow before it depends on thread-varying data (a data-dependent `trap` path, an early `return`) is refused by Tint
+  `(icmp eq (i32 16) (i32 -1))`, a variable to Tint, and `and`-ed with a test of `local_invocation_id`, which is non-uniform. (1) holds for the
+  state-machine form only: since GPU-4 a function is printed structured (3.7) and returns where it returns. The rule that remains: a barrier
+  in a function whose control flow before it depends on thread-varying data through a `return` or a `trap` path (a thread that leaves before the barrier) is refused by Tint
   (the error is Dawn's, `the WGSL does not compile`, with the line); gpu.md 6.2's checker rule, "a barrier is not under an index-dependent condition", is its
   source-level half.
 * **Atomics** (GPU-3, native/wgsl/atomic.fib): `atomicAdd`, `atomicMax` .. work on `atomic<i32>`/`atomic<u32>` in storage and workgroup memory only, and the
@@ -199,8 +201,21 @@ rounding) and compares with a tolerance, as gpu.md 2.1 derives one for sums in a
   or `cmpxchg` in any function prints every storage buffer as `array<atomic<u32>>`, every workgroup array as `array<atomic<u32>, N>`, and every plain access as
   `atomicLoad`/`atomicStore` (`Wx.atomics`); a module with none prints the plain `array<u32>` (the golden kernels.wgsl is unchanged). `atomicrmw add/umin/umax/xchg`
   on an i32 are the helpers `fibw_atomic_add` .. (a switch on the `Ptr`'s buffer, as `fibw_ld_u32`); signed `min`/`max` are a loop of `atomicCompareExchangeWeak`
-  (the buffer holds u32); `cmpxchg` answers the old value and retries a spurious failure of the weak exchange. Refused by name: an f32 atomic (`fadd`), a 64-bit
+  (the buffer holds u32); `cmpxchg` answers the old value and retries a spurious failure of the weak exchange. An f32 `fadd`/`fsub`/`fmax`/`fmin` (GPU-5) is a loop of
+  `atomicCompareExchangeWeak` over the u32 bits (`fibw_atomic_fadd` .., load, `bitcast<f32>`, combine, `bitcast<u32>`, exchange when the bits differ, retry with the value another
+  thread left; the old value is the answer): add and sub round once per attempt, so a sum over threads is not deterministic (within n * 2^-24 * sum |x| of the left-to-right
+  sum), max and min are exact and ignore a NaN. Refused by name: a 64-bit
   one, an atomic load or store, a cmpxchg whose success flag is used. Verified by naga, Tint and a run on an adapter (gpu-device.sh).
+* **Subgroups** (GPU-5, native/wgsl/subgroup.fib, the forms of spec/lir.md 6.9a): lIR's `(shfl-down v lane)` `shfl-up` `shfl-xor` `shfl-idx` are `subgroupShuffleDown`,
+  `subgroupShuffleUp`, `subgroupShuffleXor` and `subgroupShuffle`, `(ballot c)` is `bitcast<i32>(subgroupBallot(c).x)` (lanes 0 to 31), `(sreg laneid)` and `(sreg warpsize)` are the
+  entry builtins `subgroup_invocation_id` and `subgroup_size`, copied by the entry into two private variables (`fibw_lane`, `fibw_sgs`). A module that uses any prints `enable subgroups;`,
+  `diagnostic(off, subgroup_uniformity);` (Tint takes the builtins read through a private variable as non-uniform and refuses every shuffle in a loop on `subgroup_size`; the contract
+  that all lanes of the warp call together is the library's, as `shfl.sync`'s full mask is on PTX) and the header line `// fib.requires: subgroups`; a module that uses none prints none of
+  it (the golden kernels.wgsl is unchanged). **Unsupported targets are rejected by name**: a driver reads the header line before compiling and, when the adapter lacks the `subgroups`
+  feature, refuses the module (`rejected: the module requires the WebGPU subgroups feature ..`); it requests `requiredFeatures: ["subgroups"]` otherwise (examples/webgpu/js/validate.mjs
+  and compiler/tests/native/gpu/wgsl_run.mjs do; exit 4; `FIB_WEBGPU_NO_SUBGROUPS=1` plays an adapter without it). The adapter here (Dawn over the RTX 4080 SUPER, vendor nvidia,
+  architecture lovelace) has the feature, subgroup size 32 (min = max = 32). A source lane out of range is unspecified in WGSL (PTX answers the lane's own value). WGSL does not promise that
+  the subgroup is the run of local ids `[k * size, (k + 1) * size)`; `warp-probe` checks the mapping on the device (it holds on this one).
 * **f16**: behind WebGPU's `shader-f16` feature (`enable f16;` in the WGSL, `requiredFeatures` at device creation); lIR has no half type
   (gpu.md 6.5); when it has, `half` is `f16` here, with the feature requested by the driver when the WGSL enables it. Design only.
 * **64-bit**: never; an i64 kernel is refused by name. Index arithmetic is the one place i64 shows (GPU-2's `gpu/global-id` and the `ptr+` offset are i64): the
@@ -208,6 +223,24 @@ rounding) and compares with a tolerance, as gpu.md 2.1 derives one for sums in a
   `sext` of an i32 as a `ptr+` offset as a u32 byte count, and an `icmp` of two i64 literals (the dimension select of the builtins) as a constant. A kernel
   that keeps an i64 in a variable, compares it, passes it or takes it as a parameter is refused. So kernels for every backend index with i32
   (`(trunc i32 (gpu/global-id 0))`: examples/webgpu/gpu32.fib), and fib.gpu.contract's own kernels (`n: i64`) are not WGSL kernels.
+
+### 3.7 Structured control flow (the relooper, GPU-4)
+
+A function with a branch or a loop is printed as `if`/`else` and `loop` with `break` and `continue` (compiler/native/wgsl/reloop.fib is the analysis,
+func.fib the printer), because Tint takes a barrier inside the loop-and-switch state machine as non-uniform as soon as anything in the function branches on the thread
+(before GPU-4: `'workgroupBarrier' must only be called from uniform control flow` for `compiler/tests/native/gpu/branch.fib`; after, none). The method:
+dominators by dataflow; a graph is reducible when every edge either goes forward in reverse postorder or is a back edge to a dominator; a natural loop
+is a header with its body; the join of a branch is its immediate post-dominator computed in the graph of its own loop level (a back edge, a break and a return
+go to the exit, a nested loop is one node that goes to its exit block; a block that ends in `trap` or `unreachable` never rejoins, so `if (bad) trap` followed by
+the rest has a join). The printer emits a branch's arms with the join as `stop`, then the join; an edge to the join prints nothing, to the loop header
+`continue;`, to the loop's exit block `break;`, otherwise the block is printed where the edge is (only if it has one forward edge). A `switch` terminator is an
+`if`/`else if` chain (a WGSL `break` inside a `switch` would leave the switch). A phi is assigned on the edge, as before. A `ret` is a `return` where it is.
+It falls back to the state machine, with `warning: wgsl: function F: why; printed as a loop-and-switch state machine ..` on standard error, for: an irreducible
+graph, a loop with several exit blocks, a loop whose exit leaves two loops at once (WGSL has no labelled break), a join reached from outside its branch (a
+block with two forward edges that is no branch's join: it would need code duplication), and silently for a function with a self tail call. The functions
+without a branch print as before (the golden compiler/tests/native/wgsl/kernels.wgsl changed only in the functions that branch). A barrier after
+a thread-dependent branch or inside a loop that has one is now accepted by Tint (compiler/tests/native/gpu-device.sh, section 1b, with the kernels run on
+CUDA and WebGPU and planted faults); the rule that stays is the source-level one, a barrier is reached by every thread of the block or by none.
 
 ## 4. The compiler changes
 
@@ -343,8 +376,8 @@ the MSL must be fibber's own. Not run: the Mac was not used in this package (`sc
 1. The C-callback form (5.2): the one language addition this backend asks for; then the shim shrinks to the descriptor fills, which
    `fibgen` removes in turn.
 2. Timestamp queries in the drivers (the bench is wall clock), a persistent staging buffer for downloads, a uniform ring for launches.
-3. Structured printing of loops (the relooper): the shared-memory GEMM's 20x gap to the register-tiled one (section 2) is the test of whether the loop-and-switch
-   form is the cause; it would also lift the uniformity rule of 3.6 for barriers after thread-varying control flow (gpu.md 12: even a branch AFTER the barrier in the same function trips Tint, today). f16 as it lands in lIR.
+3. DONE in GPU-4 (3.7): structured printing (the relooper). Still open: the shared-memory GEMM's 20x gap to the register-tiled one (section 2) is the test of
+   whether the loop-and-switch form was the cause, and it has not been re-measured with the structured form; it also lifted the uniformity rule of 3.6 for barriers after thread-varying control flow (gpu.md 12: even a branch AFTER the barrier in the same function trips Tint, today). f16 as it lands in lIR.
 4. The hardware Chromium run (6.2) on a machine whose Chromium is not sandboxed from the GPU; the Mac (section 7).
 5. `fib.gpu.contract` for 32-bit kernels: its kernels take `n: i64`; a WGSL driver cannot pass it. An i32 flavour of the contract in fib.gpu (parameterised by the
    index type) would let every driver run the same scenarios; today the driver's spec is a copy of its questions (section 5.2).

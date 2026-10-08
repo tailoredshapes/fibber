@@ -1,0 +1,16 @@
+;; spec:   docs/design/webgpu.md 3.7 (atomics: an f32 atomic is a compare-and-exchange loop over the u32 bits), types §2.17
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib ../../examples/webgpu
+;; webgpu-target = accept | bitcast<f32>(fibw_atomic_fadd(
+;; WGSL has atomic<i32> and atomic<u32> only; `gpu/f32-add!` (lIR `atomicrmw fadd`) used to be refused by name (GPU-3). Since GPU-5 the printer lowers it to
+;; `fibw_atomic_fadd`, a loop of `atomicCompareExchangeWeak` on the bits, and the call site is in the WGSL. compiler/tests/native/wgsl-emit.sh builds it for
+;; wgsl-unknown-webgpu and checks the text; compiler/tests/native/gpu-device.sh runs the loop on a device against the CPU (within n * 2^-24 * sum |x|).
+;; The host builds and runs this program (nothing calls the kernel).
+(ns main (:require [fib.gpu :as gpu] [gpu32 :as g]))
+(defkernel k (a: ptr n: i32)
+  (let ((i (g/global-id-x)))
+    (when (< i n) (gpu/f32-add! a 0i32 (g/f32-at a i)))))
+(defun main () -> i64 0)

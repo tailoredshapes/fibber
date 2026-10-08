@@ -443,7 +443,7 @@ executable form and skips the device part, with a note, where there is none. Pin
 
 **WebGPU.** WGSL has atomics on `atomic<i32>` and `atomic<u32>` only, so a module that contains an atomic prints every storage buffer and workgroup array as
 `array<atomic<u32>>` and every plain access as `atomicLoad`/`atomicStore` (webgpu.md 3.7); a module with none prints what it always printed (the golden
-kernels.wgsl is unchanged). Signed min and max and `cas` are loops of `atomicCompareExchangeWeak`; an f32 or 64-bit atomic is refused by name. Dawn's
+kernels.wgsl is unchanged). Signed min and max and `cas` are loops of `atomicCompareExchangeWeak`; a 64-bit atomic is refused by name (an f32 one was too until GPU-5, section 13). Dawn's
 uniformity analysis shaped the reductions: the printer makes any function with a branch a `loop { switch }` state machine, and Tint then takes a barrier in it
 as non-uniform when anything after the barrier branches on the thread. So the reductions have no thread-dependent branch in a function that holds a barrier
 (masks through `gpu/select`, folds in functions of their own, every thread doing the final atomic with the identity for those that must not add), and the
@@ -451,5 +451,79 @@ number of blocks is a kernel argument checked against `gpu/num-groups` (a read o
 in the WGSL target returns zeros and goes on (webgpu.md 3.4), so a loop that steps by a trapped call's answer must not: the folds step past n if the total is 0.
 
 **Not done:** pinned host memory and async launch (item 8: `cuMemHostAlloc`, `cuMemcpyHtoDAsync` belong to the driver repository fib-gpu-cuda, which the
+core does not contain; the download at 0.4 GB/s is still the cost of not having it); (a warp shuffle reduction and f32 atomics through WGSL: section 13, GPU-5); a relooper in the WGSL printer (webgpu.md 9.3), which would lift the branch rules above.
+
+## 13. Warp shuffles and f32 atomics on WebGPU (GPU-5)
+
+The two kernel-side gaps of section 12. Verified on this machine's RTX 4080 SUPER through libcuda (PTX) and Dawn (WGSL, subgroups feature present, subgroup size 32);
+`compiler/tests/native/gpu-device.sh` is the executable form and skips the device part, with a note, where there is none.
+
+| what | where | verdict |
+|---|---|---|
+| warp shuffles as builtins | `gpu/shfl-{down,up,xor,idx}-{i32,f32}`, `gpu/subgroup-size`, `gpu/lane-id`, `gpu/ballot` (compiler/types/builtins.fib, emit.lower.gpu; spec/types.md 2.17): lIR `(shfl-MODE v lane)`, `(sreg warpsize)`, `(sreg laneid)`, `(ballot c)` (spec/lir.md 6.9a, the intrinsic table of lir.intrin, class `warp`) | PTX `shfl.sync.{down,up,bfly,idx}.b32 .., 31 (0 for up), -1`, `%warpsize`, `%laneid`, `vote.sync.ballot.b32`; WGSL `subgroupShuffle*`, `subgroupBallot(c).x`, the entry builtins (webgpu.md 3.6). On the host a thread is a warp of one |
+| rejected where unsupported | a WGSL module that uses a warp form says `// fib.requires: subgroups`; a device without the feature rejects it by name before compiling; the C and JS backends refuse the forms like `sreg` | `rejected: the module requires the WebGPU subgroups feature ..` (exit 4 of the harnesses) |
+| the library | `fib.gpu.warp` (exported by `fib.gpu`: `shfl-down-i32` .., `subgroup-size`, `lane-id`, `ballot`), `fib.gpu.reduce-warp` (`block-sum-i32 -max-i32 -min-i32 block-sum-f32 -max-f32`), `fib.gpu.reduce-warp-kernels` (`reduce-warp-sum-i32 -max-i32 -min-i32 -max-f32 -partials-f32`, `warp-probe`) | the butterfly `shfl-xor` reduces a warp so every lane holds its value; one shared word per thread, one barrier, a second butterfly over the warp values: one barrier where the tree has 2 log2(block). Integer and f32-max results equal the CPU's exactly; the f32 sum is deterministic for a warp width but not the tree's order, within n * 2^-24 * sum \|x\| of the left-to-right sum |
+| f32 atomics in WGSL | `gpu/atomic-add-f32` (and, new, `gpu/atomic-max-f32`, `gpu/atomic-min-f32`; lIR `atomicrmw fadd fsub fmax fmin`) lowered in native/wgsl/atomic.fib to a compare-and-exchange loop over the u32 bits; PTX keeps `atom.global.add.f32` | accepted by the WGSL printer (cases 8578, 8580); add within the documented bound, max and min exact |
+| library additions | `fib.gpu.atomic`: `f32-fetch-max`, `f32-fetch-min`, `f32-min!` (and the existing `f32-fetch-add`, `f32-add!`, `f32-max!`) | `reduce-sum-f32` (fib.gpu.reduce-atomic-f32) now builds for WGSL too |
+
+**Uniformity.** Tint's `subgroup_uniformity` analysis cannot prove the shuffles uniform when the loop bound is `subgroup_size` read through a private variable, so a module that uses
+warp forms is printed with `diagnostic(off, subgroup_uniformity);` (webgpu.md 3.6); the contract (every lane of the warp calls together) is the library's, as on PTX. The workgroup
+uniformity of the barrier stays an error and the reductions keep the rules of section 12 (no thread-dependent branch before a barrier). The ballot answers the lanes 0 to 31 only.
+Mapping: the library takes the warp of a thread as the run of local ids `[k * size, (k + 1) * size)` (the partial of warp k is the word k * size of the window); WGSL does not promise it,
+`warp-probe` checks it on the device. **Not done:** `subgroup_id` and `num_subgroups` (a WGSL feature of its own), shuffles of 64-bit or vector values, `shfl.sync` with a partial mask (a
+divergent warp), `match.sync`, warp-level `redux.sync` (sm_80), cooperative groups.
+kernels.wgsl is unchanged). Signed min and max and `cas` are loops of `atomicCompareExchangeWeak`; an f32 or 64-bit atomic is refused by name. Dawn's
+uniformity analysis shaped the reductions until GPU-4: the printer made any function with a branch a `loop { switch }` state machine, and Tint then took a barrier in it
+as non-uniform when anything after the barrier branched on the thread. Since GPU-4 the printer structures control flow (webgpu.md 3.7), the block trees are
+branches (`when (< t stride)`) around their barriers, and the final atomics are `when (= tid 0)`; the results are the same (the CPU reference is unchanged, cases
+8550-8555 and the 30 device checks). The number of blocks is still a kernel argument checked against `gpu/num-groups` (a read of a builtin through a private
+variable is non-uniform to Tint), and a thread must not leave (`return`, `trap`) before a barrier. A device trap
+in the WGSL target returns zeros and goes on (webgpu.md 3.4), so a loop that steps by a trapped call's answer must not: the folds step past n if the total is 0.
+
+**Not done:** pinned host memory and async launch (item 8: `cuMemHostAlloc`, `cuMemcpyHtoDAsync` belong to the driver repository fib-gpu-cuda, which the
 core does not contain; the download at 0.4 GB/s is still the cost of not having it); a warp shuffle reduction (an intrinsic family); f32 atomic add and
-min/max through WGSL (no form); a relooper in the WGSL printer (webgpu.md 9.3), which would lift the branch rules above.
+min/max through WGSL (no form); 
+
+## 14. Pinned host memory and asynchronous copies as built (GPU-6)
+
+Item 8 of section 9. The protocol is in fibber (`lib/fib/gpu/device.fib`), the two drivers implement it in their repositories (fib-gpu-cuda, fib-gpu-webgpu, branch `async`), and one
+contract both pass (`lib/fib/gpu/contract-async.fib`). Verified on this machine's RTX 4080 SUPER (driver 610.57.04): libcuda for PTX, wgpu-native over Vulkan for WGSL.
+
+**The API.** `device-pinned d bytes` gives a `(dyn Pinned)`: `bytes` of host memory (`pinned-write`, `pinned-read` of f32, `pinned-bytes`, `pinned-handle` = its address,
+`pinned-locked?`, `pinned-release`). `stream-copy-in s dst src bytes` and `stream-copy-out s src dst bytes` copy between a device buffer and a pinned buffer asynchronously, in stream
+order with the launches, and answer a `(dyn Transfer)`: `transfer-done?` asks without blocking, `transfer-wait` blocks until the copy is complete and GIVES THE PINNED BUFFER BACK (the
+one it was given). A pinned buffer is owned by one holder at a time: the copy lends it to the transfer, and in flight `pinned-write`, `pinned-read`, `pinned-release` and a second
+copy are `:lent` Errs; a second wait is `:invalid-argument`; release is final (`:released`). A device buffer is lent to the stream by a copy as by a launch, until `stream-sync`, with the
+stream's order respected (`lend-copy`, `lend-launch` in device.fib): a copy may follow a copy or a launch of its stream, a launch may follow a copy, a launch after a launch of one
+buffer is still `:lent`, and any use from another stream or from the host is `:lent`. So `copy-in a; copy-in b; launch(a, b, c); copy-out c` needs no sync between its steps.
+
+**The static form.** The Errs are the dynamic backstop (3.3's rule 1, extended). `fib.gpu.lend` (explicit, with `fib.view`) is the compile-time form, a `with-view` over a lender:
+`(with-copy-in (p stream device-buffer bytes) body..)` and `with-copy-out` lend the pinned buffer in the cell `p` to the copy for the body and wait at the scope's exit; the value is `(Ok body-value)`
+or the Err of the copy. The checker already refuses what the dynamic rules refuse: the body touching `p` (`p is lent to #loan and cannot be used here`, case 441), a second copy of `p` inside
+(case 442), the loan escaping (S1/VC1/VC2, the machinery of ADR 0022); case 440 is the accepted twin and runs the form on the simulated device. `with-launch` (3.3), the same for a device
+buffer and a launch, is still not built.
+
+**The simulated device.** `fib.gpu.sim` is a real implementation of the protocols on host memory with deterministic asynchrony (a copy is queued and happens when a wait, a sync or the third
+`transfer-done?` forces it; it loads no kernel). It makes the transfer contract and its faults testable without a GPU, in the gate: case 8670.
+
+**The contract** (`fib.gpu.contract-async`). `GpuTransferContract [make]`: 6 scenarios (the pinned buffer's life, 4 MB through the device and back, the loan in flight, polling and the second wait, the
+copy checks, two streams); `GpuAsyncContract [make source]`: 2 scenarios over `fib.gpu.contract-async-kernels` (i32 only, so one source is PTX and WGSL): copy-in, launch, copy-out with no sync between
+them bit for bit the CPU's, and a copy queued behind a 20 ms kernel (`async-spin`, 20 million steps of a multiply-xor chain) that must not be `done?` at once and must hold the bytes after the wait.
+`fib.gpu.fault` gains `async-faults`: `:early-wait` (the wait returns at once, the program sees the bytes then, `done?` is true: caught by "a wait returns after the copy is complete") and
+`:skip-pinned-check` (the copy is waited for before it returns, nothing is ever in flight: caught by "a pinned buffer in flight is lent to its transfer"); `fault-caught?` checks that the scenarios a
+fault names exist and fail. Drivers also plant the faults in their own source (`scripts/test.sh --plant`): a wait that does not wait, a pinned buffer never in flight, a `done?` that is always true.
+The one honest limit: on a real device the transfer contract's round trip can pass under `:early-wait` (the DMA finishes before the host's stale read does); the long-kernel scenario is what
+catches it, deterministically. WebGPU's copy-in (`queue.writeBuffer`) copies the bytes when it returns, so a copy-in wait that does not wait is not observable and is not planted.
+
+**WebGPU.** Pinned memory there is plain host memory (`pinned-locked?` false, `device-supports? :pinned` false): WebGPU has no page-locked memory. The copy-in is `queue.writeBuffer`, a submit and
+`queue.onSubmittedWorkDone` (a fence); the copy-out a staging copy and `mapAsync`. Both deliver to C callbacks in the driver's shim (`fibwgpu_read_begin/_poll/_finish`, `fibwgpu_fence/_poll/_finish`):
+the existing mechanism; the fibber side only starts, polls and ends a request. The language still has no C-callback form (webgpu.md 5.2); with it the shim's six functions would shrink to the
+descriptor fills. The JavaScript driver answers `:unsupported` to the new calls.
+
+**Measured** (fib-gpu-cuda `examples/overlap.fib`, 32 MiB chunks of f32, a kernel of 5000 dependent fma steps per element so that copy and kernel take about the same time; every result checked
+bit for bit on a sample against the CPU): one copy-in 1.85 ms (17.8 GB/s), the kernel 1.96 ms, one copy-out 1.94 ms (17.3 GB/s). 96 chunks: pageable `buffer-upload`/`buffer-download` 894 ms (7.2 GB/s
+of host transfer; it varies from 1.5 to 8 GB/s run to run with the page faults of the fresh result array), pinned serial 533 ms (12.1 GB/s), pinned over 3 streams 306 ms (21.0 GB/s): copy and compute
+overlap, 1.74 times faster than the same pinned chunks one after the other and 2.9 times faster than pageable. The overlap is partial (the ideal for three equal stages is near 3x): the two copy
+directions share the bus, 21 GB/s aggregate against 17.8 alone each way. WebGPU (fib-gpu-webgpu `examples/overlap.fib`, the same program over WGSL): 1.11 times (48 chunks, serial 366 ms, piped 329 ms,
+kernel 6.4 ms against copy-in 5.4 ms and copy-out 3.3 ms): one queue, a `writeBuffer` that copies through a staging ring on the CPU, and a kernel that is the WGSL printer's state machine (30 ms for the
+work CUDA does in 0.8 ms at 2000 steps): the hardware has no second path to overlap on in this driver.

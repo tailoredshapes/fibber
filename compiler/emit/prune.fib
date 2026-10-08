@@ -6,20 +6,20 @@
 ;;
 ;; Roots: every item that is not `internal` or `private` (`main`, the exports of a library), every piece of text that is not an item (the
 ;; `declare`s, `defstruct`s, `target`), the kernel table `fib.kernel.*` (driver.commands reads it from the text), what the text of `main` names
-;; (`root-text`), and the initialisers that may do something. A `def` made at run time is dropped only when it is pure and nobody reads its slot:
-;; its body calls, through the program's own functions, only the runtime of core, str, array, vec, vecbuild, weak and alloc (which allocate and
-;; count, nothing a program can see) and makes no indirect call (a closure may be anything). A call of anything else (an `extern`, I/O, an atom,
-;; a thread, a task) keeps it. A trap or an out-of-memory in the initialiser of an unread, pure `def` is not preserved: that is the one change of
-;; behaviour, and it is the point (a `def` is evaluated for its value).
+;; (`root-text`), and the initialisers that may do something. A `def` made at run time must run before `main` and may trap, loop or act (syntax
+;; §3.19, case 1706: an unread `def broken (trap ..)` stops the program), so it is dropped only when nobody reads its slot AND its body provably
+;; cannot: it is one block (no branch, so no loop and no checked path), mentions no division, remainder, checked operation, trap, raise, abort, unreachable,
+;; integer-made pointer, atomic or indirect call, and names nothing but data (constants, globals) and the count operations `fib.retain`
+;; and `fib.release`. A call of a function of the program (it might trap: not proved total), an allocation (it might run out of memory)
+;; or anything else keeps the `def`. Literals, a read of another `def`, a named string or constant: dropped when unread.
 ;; The text is cut where a line starts with `(` at the left margin, which the emitter does for every item and never inside one (strings escape
 ;; their line breaks).
 (ns emit.prune
-  (:require [emit.runtime :as rt])
   (:use emit.assemble emit.program))
 
 ;; The search: the items by name (the program's, the runtime's), the names found live, the names to scan, and, for a pure `def`, its slot's
 ;; name and the name of its body (reaching the slot reaches the body).
-(defstruct Search (prog: (Map str str) rts: (Map str str) pure-rt: (Map str bool) live: (Cell (Map str bool)) work: (Cell (Vec str))
+(defstruct Search (prog: (Map str str) rts: (Map str str) live: (Cell (Map str bool)) work: (Cell (Vec str))
                    lazy: (Map str str)))
 
 ;; --- the text in pieces
@@ -98,34 +98,31 @@
               (match (get (. st lazy) n) ((some b) (reach st b)) (nil ()))
               (recur)))))))
 
-;; Whether the body `name` does nothing a program can see: see the header. A depth-first walk over the program's own items.
-(defun pure-body? (st: Search name: str) -> bool
-  (let ((seen (cell {})) (work (cell [name])) (ok (cell true)))
-    (do (loop ()
-          (let ((w @work))
-            (when (and @ok (> (count w) 0))
-              (let ((n (nth w (- (count w) 1))))
-                (do (set! work (vec-pop w))
-                    (when (not (contains? @seen n))
-                      (do (set! seen (assoc @seen n true))
-                          (cond (contains? (. st pure-rt) n) ()
-                                (contains? (. st rts) n) (set! ok false)
-                                :else (match (get (. st prog) n)
-                                        (nil (set! ok false))
-                                        ((some t) (if (some? (str-find t "(indirect-" 0))
-                                                      (set! ok false)
-                                                      (doseq [r (refs-of t)] (set! work (conj @work r)))))))))
-                    (recur))))))
-        @ok)))
+;; The tokens of a body that can trap or do something: a division or remainder, a checked operation, an unreachable, a pointer made from an integer, an
+;; atomic access, an indirect call.
+(defun risky-text? :private (t: str) -> bool
+  (some? (find-first (fn (w: str) (some? (str-find t w 0)))
+                     ["div" "rem" "overflow" "unreachable" "inttoptr" "atomic" "cmpxchg" "indirect" "trap" "raise" "abort"])))
 
-;; --- the runtime's pure part
-;; The names of the items of the parts of the runtime that allocate, count and build values, and do nothing else.
-(defun pure-runtime-names () -> (Map str bool)
-  (reduce (fn (acc: (Map str bool) part: str)
-            (reduce (fn (a: (Map str bool) p: str)
-                      (let ((it (piece-item p))) (if (= (. it fst) "") a (assoc a (. it fst) true))))
-                    acc (split-pieces part)))
-          {} [rt/RT-CORE rt/RT-STR rt/RT-ARRAY rt/RT-VEC rt/RT-VECBUILD rt/RT-WEAK rt/RT-ALLOC]))
+;; How many times `w` is in `t`.
+(defun occurrences :private (t: str w: str) -> i64
+  (loop ((from 0) (n 0))
+    (match (str-find t w from) (nil n) ((some i) (recur (+ i 1) (+ n 1))))))
+
+;; A name a pure body may mention: the count operations (they cannot trap), or a global or constant (data: its address or its value).
+(defun ref-ok? :private (st: Search r: str) -> bool
+  (or (= r "fib.retain") (= r "fib.release")
+      (match (get (. st prog) r)
+        ((some t) (or (starts-with? t "(constant ") (starts-with? t "(global ")))
+        (nil false))))
+
+;; Whether the initialiser body `name` provably does nothing and cannot trap, loop, run out of memory or call anything (see the header): one block (no
+;; branch, so no loop and no checked path), no risky operation, and no name but data and the count operations. When in doubt: no.
+(defun pure-body? (st: Search name: str) -> bool
+  (match (get (. st prog) name)
+    (nil false)
+    ((some t) (and (= (occurrences t "(block ") 1) (not (risky-text? t)) (every? (fn (r: str) (ref-ok? st r)) (refs-of t))))))
+
 
 ;; --- the whole
 (defstruct Field (pieces: (Vec str) items: (Vec (Pair str bool))))
@@ -172,11 +169,10 @@
   (let ((fs (mapv field-of [(. parts runtime) (. parts externs) (. parts types) (. parts statics) (. parts keywords) (. parts defs) (. parts quotes)]))
         (fns (mapv field-of (. parts fns)))
         (roots (cell [])))
-    (let ((rts (index-field (nth fs 0) {} roots))
-          (pure-rt (pure-runtime-names)))
+    (let ((rts (index-field (nth fs 0) {} roots)))
       (let ((prog (reduce (fn (m: (Map str str) f: Field) (index-field f m roots)) {} (into (mapv (fn (k: i64) (nth fs k)) [1 2 3 4 5 6]) fns))))
-        (let ((lazy (lazy-inits (Search prog rts pure-rt (cell {}) (cell []) {}) inits)))
-          (let ((st (Search prog rts pure-rt (cell {}) (cell []) lazy)))
+        (let ((lazy (lazy-inits (Search prog rts (cell {}) (cell []) {}) inits)))
+          (let ((st (Search prog rts (cell {}) (cell []) lazy)))
             (do (seed st @roots root-text inits)
                 (let ((live @(. st live)))
                   (Pair (Parts (live-text (nth fs 0) live) (live-text (nth fs 1) live) (live-text (nth fs 2) live) (live-text (nth fs 3) live)

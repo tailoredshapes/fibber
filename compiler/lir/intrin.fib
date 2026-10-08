@@ -8,6 +8,8 @@
 ;;   red-i        a vector of integers folded to its element type
 ;;   red-f        `reduce-fadd` and `reduce-fmul`: the start value and a vector of floats
 ;;   red-m        a vector of floats folded by min or max
+;;   warp         the kernel target's warp forms (spec/lir.md 6.9a): `shfl-down shfl-up shfl-xor shfl-idx` (a value, i32 or float, and an i32 lane operand, same type out),
+;;                `ballot` (an i1, answering the i32 of the warp's votes); `llvm` is the prefix of the NVPTX intrinsic (the type is appended for a shuffle)
 ;;   mload gather a leading type, then 3 operands; mstore scatter: 3 operands (the vector first)
 (ns lir.intrin)
 
@@ -35,7 +37,10 @@
    "reduce-fmin" (IntrinInfo "red-m" "llvm.vector.reduce.fminimum") "reduce-fmax" (IntrinInfo "red-m" "llvm.vector.reduce.fmaximum")
    "reduce-fminnum" (IntrinInfo "red-m" "llvm.vector.reduce.fmin") "reduce-fmaxnum" (IntrinInfo "red-m" "llvm.vector.reduce.fmax")
    "masked-load" (IntrinInfo "mload" "llvm.masked.load") "masked-store" (IntrinInfo "mstore" "llvm.masked.store")
-   "gather" (IntrinInfo "gather" "llvm.masked.gather") "scatter" (IntrinInfo "scatter" "llvm.masked.scatter")})
+   "gather" (IntrinInfo "gather" "llvm.masked.gather") "scatter" (IntrinInfo "scatter" "llvm.masked.scatter")
+   "shfl-down" (IntrinInfo "warp" "llvm.nvvm.shfl.sync.down") "shfl-up" (IntrinInfo "warp" "llvm.nvvm.shfl.sync.up")
+   "shfl-xor" (IntrinInfo "warp" "llvm.nvvm.shfl.sync.bfly") "shfl-idx" (IntrinInfo "warp" "llvm.nvvm.shfl.sync.idx")
+   "ballot" (IntrinInfo "warp" "llvm.nvvm.vote.ballot.sync")})
 
 (defun intrin-info (name: str) -> (Option IntrinInfo) (get intrin-table name))
 
@@ -48,7 +53,9 @@
 ;; How many value operands the form takes (not counting its leading type, flags or alignment).
 (defun intrin-arity (name: str) -> i64
   (let ((c (intrin-class name)))
-    (cond (or (= c "f1") (= c "i1") (= c "red-i") (= c "red-m")) 1
+    (cond (= name "ballot") 1
+          (= c "warp") 2
+          (or (= c "f1") (= c "i1") (= c "red-i") (= c "red-m")) 1
           (or (= c "f2") (= c "i2") (= c "fbin") (= c "red-f")) 2
           :else 3)))
 

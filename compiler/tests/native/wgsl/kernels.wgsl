@@ -52,24 +52,16 @@ fn fibw_k_vadd(a_p0: Ptr, a_p1: Ptr, a_p2: Ptr, a_p3: i32) {
   var t10: f32;
   var t4: bool;
   var t1: i32;
-  var L: u32 = 0u;
-  loop { if L == 4294967295u { break; }
-  switch L {
-  case 0u: {
     t1 = f_gpu32_global_id_x(); 
     t4 = (t1 < p3); if t4 { 
     t8 = f_gpu32_f32_at(p0, t1); t9 = f_gpu32_f32_at(p1, t1); t10 = (t8 + t9); f_gpu32_f32_set_(p2, t1, t10);
-    L = 4u;
+    
  } else { 
-    L = 4u;
+    
  }
+    return;
 
-  }
-  case 4u: {
-    L = 4294967295u; continue;
-  }
-  default: { L = 4294967295u; continue; }
-  } }
+
 }
 @compute @workgroup_size(wg_x, wg_y, wg_z)
 fn vadd(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
@@ -88,29 +80,21 @@ fn fibw_k_vaddi(a_p0: Ptr, a_p1: Ptr, a_p2: Ptr, a_p3: i32) {
   var t10: OvI32;
   var t4: bool;
   var t1: i32;
-  var L: u32 = 0u;
-  loop { if L == 4294967295u { break; }
-  switch L {
-  case 0u: {
     t1 = f_gpu32_global_id_x(); 
     t4 = (t1 < p3); if t4 { 
     t8 = f_gpu32_i32_at(p0, t1); t9 = f_gpu32_i32_at(p1, t1); t10 = fibw_sadd_ovf(t8, t9); t11 = t10.o; if t11 { 
-    fib_trap_c(Ptr(0u, 0u)); if (fibw_trapped) { L = 4294967295u; continue; }
-    L = 4294967295u; continue;
- } else { 
+    fib_trap_c(Ptr(0u, 0u)); if (fibw_trapped) { return; }
+    return;
+ } else {  }
     t14 = t10.v; f_gpu32_i32_set_(p2, t1, t14);
-    L = 6u;
- }
- } else { 
-    L = 6u;
- }
+    
 
-  }
-  case 6u: {
-    L = 4294967295u; continue;
-  }
-  default: { L = 4294967295u; continue; }
-  } }
+ } else { 
+    
+ }
+    return;
+
+
 }
 @compute @workgroup_size(wg_x, wg_y, wg_z)
 fn vaddi(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
@@ -242,21 +226,13 @@ fn fibw_k_gemm(a_p0: Ptr, a_p1: Ptr, a_p2: Ptr, a_p3: i32) {
   var t40: f32;
   var t35: f32;
   var ph115964117771: bool;
-  var L: u32 = 0u;
-  loop { if L == 4294967295u { break; }
-  switch L {
-  case 0u: {
                      t1 = f_gpu32_global_id_x(); t2 = (i32(4) * t1); 
     t5 = f_gpu32_global_id_y(); t6 = (i32(4) * t5); 
     t9 = (t6 < p3); if t9 { 
-    t13 = (t2 < p3); ph115964117771 = t13; L = 5u;
+    t13 = (t2 < p3); ph115964117771 = t13; 
  } else { 
-    ph115964117771 = false; L = 5u;
+    ph115964117771 = false; 
  }
-
-
-  }
-  case 5u: {
     t14 = ph115964117771; if t14 { 
     t18 = (t6 * p3); 
     t21 = (t18 + p3); 
@@ -279,16 +255,7 @@ fn fibw_k_gemm(a_p0: Ptr, a_p1: Ptr, a_p2: Ptr, a_p3: i32) {
     t44 = f32(0.0);
     t45 = f32(0.0);
     t46 = f32(0.0);
-    L = 11u;
-
-
-
-
- } else { 
-    L = 29u;
- }
-  }
-  case 11u: {
+    loop {
     t48 = t30; t49 = (t48 < p3); if t49 { 
     t53 = t30; t54 = (t53 * p3); t55 = (t54 + t2); 
     t58 = f_gpu32_f32_at(p1, t55); 
@@ -316,7 +283,7 @@ fn fibw_k_gemm(a_p0: Ptr, a_p1: Ptr, a_p2: Ptr, a_p3: i32) {
     t44 = t122;
     t45 = t124;
     t46 = t126;
-    L = 11u;
+    continue;
 
 
 
@@ -326,7 +293,9 @@ fn fibw_k_gemm(a_p0: Ptr, a_p1: Ptr, a_p2: Ptr, a_p3: i32) {
 
 
 
- } else { 
+ } else { break; }
+}
+
     t127 = (t6 * p3); t128 = (t127 + t2); 
     t131 = (t128 + p3); 
     t134 = (t131 + p3); 
@@ -348,19 +317,25 @@ fn fibw_k_gemm(a_p0: Ptr, a_p1: Ptr, a_p2: Ptr, a_p3: i32) {
     t164 = (t137 + i32(2)); t165 = t45; f_gpu32_f32_set_(p2, t164, t165);
     t166 = (t137 + i32(3)); t167 = t46; f_gpu32_f32_set_(p2, t166, t167);
     
-    L = 29u;
+    
 
 
 
 
 
+
+
+
+
+
+ } else { 
+    
  }
-  }
-  case 29u: {
-    L = 4294967295u; continue;
-  }
-  default: { L = 4294967295u; continue; }
-  } }
+    return;
+
+
+
+
 }
 @compute @workgroup_size(wg_x, wg_y, wg_z)
 fn gemm(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
@@ -511,10 +486,6 @@ fn fibw_k_gemm_smem(a_p0: Ptr, a_p1: Ptr, a_p2: Ptr, a_p3: i32) {
   var t13: bool;
   var t40: i32;
   var t35: i32;
-  var L: u32 = 0u;
-  loop { if L == 4294967295u { break; }
-  switch L {
-  case 0u: {
                       
     
     t5 = f_gpu32_local_id_x(); 
@@ -575,65 +546,12 @@ fn fibw_k_gemm_smem(a_p0: Ptr, a_p1: Ptr, a_p2: Ptr, a_p3: i32) {
      t110 = f32(0.0);
     
     t114 = i32(0);
-    L = 32u;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-  }
-  case 32u: {
+    loop {
     t116 = t114; t117 = (t116 < p3); if t117 { 
     t121 = t114; f_load_slices(Ptr(16u, 0u), Ptr(17u, 0u), p0, p1, p3, t5, t43, t47, t121);
     workgroupBarrier();
     t122 = i32(0);
-    L = 34u;
- } else { 
-    
-    t269 = (t43 + t18); t270 = (t47 + t31);  t272 = t50;  t274 = t54;  t276 = t58;  t278 = t62;  t280 = t66;  t282 = t70;  t284 = t74;  t286 = t78;  t288 = t82;  t290 = t86;  t292 = t90;  t294 = t94;  t296 = t98;  t298 = t102;  t300 = t106;  t302 = t110; f_store_tile(p2, p3, t269, t270, t272, t274, t276, t278, t280, t282, t284, t286, t288, t290, t292, t294, t296, t298, t300, t302);
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    L = 4294967295u; continue;
-
- }
-  }
-  case 34u: {
+    loop {
     t124 = t122; t125 = (t124 < i32(16)); if t125 { 
     t129 = t122; t130 = (t129 * i32(64)); t131 = (t130 + t18); 
     t134 = t122; t135 = (t134 * i32(64)); t136 = (t135 + t31); 
@@ -662,7 +580,7 @@ fn fibw_k_gemm_smem(a_p0: Ptr, a_p1: Ptr, a_p2: Ptr, a_p3: i32) {
      t254 = t106; t255 = fma(t151, t162, t254);  t257 = t106;  t106 = t255;
      t260 = t110; t261 = fma(t151, t166, t260);  t263 = t110;  t110 = t261;
     t265 = t122; t266 = (t265 + i32(1)); t122 = t266;
-    L = 34u;
+    continue;
 
 
 
@@ -673,16 +591,66 @@ fn fibw_k_gemm_smem(a_p0: Ptr, a_p1: Ptr, a_p2: Ptr, a_p3: i32) {
 
 
 
- } else { 
+ } else { break; }
+}
+
     
     workgroupBarrier();
     t267 = t114; t268 = (t267 + i32(16)); t114 = t268;
-    L = 32u;
+    continue;
 
- }
-  }
-  default: { L = 4294967295u; continue; }
-  } }
+
+ } else { break; }
+}
+
+    
+    t269 = (t43 + t18); t270 = (t47 + t31);  t272 = t50;  t274 = t54;  t276 = t58;  t278 = t62;  t280 = t66;  t282 = t70;  t284 = t74;  t286 = t78;  t288 = t82;  t290 = t86;  t292 = t90;  t294 = t94;  t296 = t98;  t298 = t102;  t300 = t106;  t302 = t110; f_store_tile(p2, p3, t269, t270, t272, t274, t276, t278, t280, t282, t284, t286, t288, t290, t292, t294, t296, t298, t300, t302);
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    return;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 }
 @compute @workgroup_size(wg_x, wg_y, wg_z)
 fn gemm_smem(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
@@ -696,30 +664,22 @@ fn fibw_k_assert_positive(a_p0: Ptr, a_p1: i32) {
   var t9: bool;
   var t4: bool;
   var t1: i32;
-  var L: u32 = 0u;
-  loop { if L == 4294967295u { break; }
-  switch L {
-  case 0u: {
     t1 = f_gpu32_global_id_x(); 
     t4 = (t1 < p1); if t4 { 
     t8 = f_gpu32_f32_at(p0, t1); t9 = (t8 <= f32(0.0)); if t9 { 
-    fib_trap(Ptr(0u, 0u)); if (fibw_trapped) { L = 4294967295u; continue; }
-    L = 4294967295u; continue;
+    fib_trap(Ptr(0u, 0u)); if (fibw_trapped) { return; }
+    return;
+ } else {  }
+    
+    
+
+
  } else { 
     
-    L = 7u;
-
  }
- } else { 
-    L = 7u;
- }
+    return;
 
-  }
-  case 7u: {
-    L = 4294967295u; continue;
-  }
-  default: { L = 4294967295u; continue; }
-  } }
+
 }
 @compute @workgroup_size(wg_x, wg_y, wg_z)
 fn assert_positive(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
@@ -885,14 +845,8 @@ fn f_load_slices(a_p0: Ptr, a_p1: Ptr, a_p2: Ptr, a_p3: Ptr, a_p4: i32, a_p5: i3
   var t66: i32;
   var t56: i32;
   var t13: bool;
-  var L: u32 = 0u;
-  loop { if L == 4294967295u { break; }
-  switch L {
-  case 0u: {
      t1 = p5;
-    L = 1u;
-  }
-  case 1u: {
+    loop {
     t3 = t1; t4 = (t3 < i32(1024)); if t4 { 
     t8 = t1; t9 = (i32(16) == i32(0)); 
     t12 = (t8 == i32(-2147483648)); t13 = (i32(16) == i32(-1)); t14 = (t12 & t13); 
@@ -909,7 +863,7 @@ fn f_load_slices(a_p0: Ptr, a_p1: Ptr, a_p2: Ptr, a_p3: Ptr, a_p4: i32, a_p5: i3
     t56 = (t29 * i32(64)); t57 = (t56 + t17); t58 = (p6 + t17); t59 = (t58 * p4); t60 = (p8 + t29); t61 = (t59 + t60); t62 = f_gpu32_f32_at(p2, t61); f_gpu32_f32_set_(p0, t57, t62);
     t63 = (t41 * i32(64)); t64 = (t63 + t53); t65 = (p8 + t41); t66 = (t65 * p4); t67 = (p7 + t53); t68 = (t66 + t67); t69 = f_gpu32_f32_at(p3, t68); f_gpu32_f32_set_(p1, t64, t69);
     t70 = t1; t71 = (t70 + i32(256)); t1 = t71;
-    L = 1u;
+    continue;
 
 
 
@@ -922,14 +876,13 @@ fn f_load_slices(a_p0: Ptr, a_p1: Ptr, a_p2: Ptr, a_p3: Ptr, a_p4: i32, a_p5: i3
 
 
 
- } else { 
+ } else { break; }
+}
+
     
-    L = 4294967295u; continue;
+    return;
 
- }
-  }
-  default: { L = 4294967295u; continue; }
-  } }
+
 }
 fn f_store_tile(a_p0: Ptr, a_p1: i32, a_p2: i32, a_p3: i32, a_p4: f32, a_p5: f32, a_p6: f32, a_p7: f32, a_p8: f32, a_p9: f32, a_p10: f32, a_p11: f32, a_p12: f32, a_p13: f32, a_p14: f32, a_p15: f32, a_p16: f32, a_p17: f32, a_p18: f32, a_p19: f32) {
   var p0: Ptr = a_p0;

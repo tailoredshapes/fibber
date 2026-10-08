@@ -15,8 +15,19 @@
        (cond (or (= c "f1") (= c "f2") (= c "f3") (= c "fbin")) (some-t (check-float-fn fcx name args p))
              (or (= c "i1") (= c "i2")) (some-t (check-int-fn fcx name args p))
              (or (= c "red-i") (= c "red-m") (= c "red-f")) (some-t (check-reduce fcx name c args p))
+             (= c "warp") (some-t (check-warp fcx name args p))
              :else (check-masked fcx name c ty args p))))
     (_ (err (. e pos) "internal error: not an intrinsic form"))))
+
+;; The warp forms (spec/lir.md 6.9a): `(shfl-MODE v lane)` is `v`'s type (i32 or float) with an i32 lane operand; `(ballot c)` takes an i1 and is an i32.
+(defun check-warp :private (fcx: Fcx name: str args: (Vec LExpr) pos: i64) -> (Result LType Diagnostic)
+  (if (= name "ballot")
+      (try-let ((tc (fcx-val fcx (nth args 0))))
+        (if (= tc ty-i1) (Ok ty-i32) (err pos (str "ballot needs an i1 operand, found " (type-str tc)))))
+      (try-let ((tv (fcx-val fcx (nth args 0))) (tl (fcx-val fcx (nth args 1))))
+        (cond (not (or (= tv ty-i32) (= tv ty-float))) (err pos (str name " needs an i32 or float value, found " (type-str tv)))
+              (not (= tl ty-i32)) (err pos (str name " needs an i32 lane, found " (type-str tl)))
+              :else (Ok tv)))))
 
 (defun some-t :private (r: (Result LType Diagnostic)) -> (Result (Option LType) Diagnostic)
   (match r ((Ok t) (Ok (some t))) ((Err d) (Err d))))

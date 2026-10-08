@@ -1,0 +1,30 @@
+;; spec:   types §6.15, §1.10; docs/design/gpu.md 6.8
+;; expect: accept
+;; result: 3
+;; audit:  clean
+;; stage:  2
+;; `with-copy-in` and `with-copy-out` (fib.gpu.lend) are `with-view` over a lender: the pinned buffer's cell is lent to the copy for the body and the copy is waited for
+;; at the scope's exit, which hands the buffer back (the form is `(Ok body-value)`). The owner is used again after the form. Run on the simulated device (fib.gpu.sim).
+(ns main (:use fib.view fib.gpu.lend) (:require [fib.gpu :as gpu] [fib.gpu.sim :as sim]))
+
+(defun pinned (d: (dyn gpu/Device) n: i64) -> (dyn gpu/Pinned)
+  (match (gpu/device-pinned d n) ((Ok p) p) ((Err e) (trap (. e message)))))
+
+(defun four () -> (Array f32)
+  (let [c (cell (array 4 1.0f32))] (do (array-set! &c 2 3.0f32) (array-set! &c 3 4.0f32) @c)))
+
+(defun landed (r: (Result (Array f32) gpu/GpuError)) -> i64
+  (match r ((Ok xs) (if (and (= (array-get xs 2) 3.0f32) (= (array-get xs 3) 4.0f32)) 3 -1)) ((Err _) -3)))
+
+(defun main () -> i64
+  (let [d (dyn gpu/Device (sim/sim-device 1048576))
+        s (match (gpu/device-stream d) ((Ok s) s) ((Err e) (trap (. e message))))
+        dv (match (gpu/device-alloc d 16) ((Ok b) b) ((Err e) (trap (. e message))))
+        src (cell (pinned d 16))
+        dst (cell (pinned d 16))
+        w (gpu/pinned-write @src (four))
+        a (with-copy-in (src s dv 16) 1)
+        b (with-copy-out (dst s dv 16) 2)]
+    (match a
+      ((Ok 1) (match b ((Ok 2) (landed (gpu/pinned-read @dst 4))) (_ -2)))
+      (_ -1))))
