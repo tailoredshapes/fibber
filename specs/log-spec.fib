@@ -1,6 +1,6 @@
 ;; fib.log (docs/design/observability-and-databases.md 2): levels, structured fields, lazy disabled levels, the level table, context carried
 ;; into tasks, the text and JSON renderings, a failing sink, and the Appender contract against the memory sink and JSON lines on a pipe.
-(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.log fib.parallel log-appender-contract)
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.log fib.parallel fib.async log-appender-contract)
   (:require [fib.os :as os] [fib.string :as string]))
 
 (defun mem-logger (m: MemorySink root: i64 name: str) -> Logger
@@ -29,12 +29,18 @@
       ((Ok b) (if (= (array-len b) 0) out (recur (str out (str-from-bytes b)))))
       ((Err _) out))))
 
+;; The pipe's reader is a thread that drains it WHILE the records are written: a pipe holds 64 KiB, or as little as one page when the user is over
+;; `fs.pipe-user-pages-soft` (16384 pages over all of a user's pipes: a gate with hundreds of `fibc` children open), and the contract's hundred records
+;; are about 11 KB, so a probe that read only after `with-tasks` returned deadlocked with its own writers (the lead's regression of 2026-10-07, which was
+;; the machine's pipe quota, not the runtime: case 8680). `lines` closes the write end, joins the drainer and splits what it read.
 (defun pipe-probe () -> SinkProbe
-  (let [p (match (os/make-pipe) ((Ok p) p) ((Err e) (trap (. e message)))) r (. p fst) w (. p snd) got (atom []) done (atom false)]
+  (let [p (match (os/make-pipe) ((Ok p) p) ((Err e) (trap (. e message)))) r (. p fst) w (. p snd)
+        drainer (spawn (fn () (let [text (drain r)] (do (os/close-fd r) text))))
+        got (atom []) done (atom false)]
     (SinkProbe (json-lines w)
                (fn () (do (when (not @done)
-                            (let [text (do (os/close-fd w) (drain r))]
-                              (do (os/close-fd r) (swap! done (fn (_: bool) true))
+                            (let [text (do (os/close-fd w) (join drainer))]
+                              (do (swap! done (fn (_: bool) true))
                                   (swap! got (fn (_: (Vec str)) (vec (filter (fn (l: str) (> (str-len l) 0)) (string/split text "\n"))))))))
                           @got)))))
 
