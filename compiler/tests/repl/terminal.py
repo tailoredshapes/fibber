@@ -13,7 +13,9 @@ def run(keys, waits):
     pid, fd = pty.fork()
     if pid == 0:
         os.chdir(root)
-        resource.setrlimit(resource.RLIMIT_AS, (16000000 * 1024, 16000000 * 1024))
+        if sys.platform == 'linux':   # macOS refuses RLIMIT_AS (errno 5 / EINVAL); the limit guards a Linux runaway only
+            try: resource.setrlimit(resource.RLIMIT_AS, (16000000 * 1024, 16000000 * 1024))
+            except (ValueError, OSError): pass
         os.environ['HOME'] = home
         os.environ['FIB_LIB'] = os.environ.get('FIB_LIB', os.path.join(root, 'lib'))
         os.execv(fibc, [fibc, 'repl'])

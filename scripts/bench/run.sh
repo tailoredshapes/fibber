@@ -48,7 +48,7 @@ median() { sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}'; }
 timed() {
   local ts=() mem=0 i
   for i in $(seq "$runs"); do
-    /usr/bin/time -f "%e %M" -o "$work/t" "$@" > "$work/stdout" 2>/dev/null
+    /usr/bin/time -f "%e %M" -o "$work/t" "$@" > "$work/stdout" 2>/dev/null   # linux-only: GNU time -f/-o for wall seconds and peak memory (BSD time has -l)
     read -r e m < "$work/t"
     ts+=("$e"); [ "$m" -gt "$mem" ] && mem=$m
   done

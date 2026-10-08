@@ -1,4 +1,5 @@
 #!/bin/bash
+# linux-only-file: needs the Linux libcrypto.so.3 through ldconfig and LD_PRELOAD; not part of the Mac gate
 # The TLS tests that need a crypto driver (the gate has none): the RFC 8448 traces byte for byte, the end-to-end specs against the in-memory server, the certificate corpus
 # with real signature verification, and the mutation fuzz (FUZZ inputs of each kind, default 100000). The gate's own TLS specs (specs/tls-*-spec.fib: DER, names, chain
 # logic with stubbed signatures, messages) run in `scripts/gate.sh`; interop with real servers is scripts/tls-interop.sh; planted faults are scripts/mutant-tls.sh.

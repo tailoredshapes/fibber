@@ -40,10 +40,10 @@ part=${UNITS_DIR:-all}
 files=("$@")
 if [ ${#files[@]} -eq 0 ]; then
   case $part in
-    all) mapfile -t files < <(names units.run) ;;
+    all) files=(); while IFS= read -r l; do files+=("$l"); done < <(names units.run) ;;
     pending) files=() ;;
-    rest) mapfile -t files < <(names units.run | grep -v -e '^compiler/tests/emit/' -e '^compiler/tests/own/' -e '^compiler/tests/types/') ;;
-    *) mapfile -t files < <(names units.run | grep "^compiler/tests/$part/") ;;
+    rest) files=(); while IFS= read -r l; do files+=("$l"); done < <(names units.run | grep -v -e '^compiler/tests/emit/' -e '^compiler/tests/own/' -e '^compiler/tests/types/') ;;
+    *) files=(); while IFS= read -r l; do files+=("$l"); done < <(names units.run | grep "^compiler/tests/$part/") ;;
   esac
 fi
 # The programs are independent: up to UNITS_JOBS are built and run at a time (default 1, or 16 under the gate, whose slots limit the heavy
@@ -51,18 +51,18 @@ fi
 # which finished first. A pending program that passes is a stale entry.
 jobs=${UNITS_JOBS:-$([ -n "${GATE_SLOTS:-}" ] && echo 16 || echo 1)}
 pend=()
-if [ $# -eq 0 ] && { [ "$part" = all ] || [ "$part" = pending ]; }; then mapfile -t pend < <(names units.pending); fi
+if [ $# -eq 0 ] && { [ "$part" = all ] || [ "$part" = pending ]; }; then while IFS= read -r l; do pend+=("$l"); done < <(names units.pending); fi
 n=0; i=0
 for f in "${files[@]}"; do
   n=$((n+1)); i=$((i+1))
   ( judge "$f" > "$out/line.$i" 2>&1; echo $? > "$out/line.$i.rc" ) &
-  while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do wait -n; done
+  while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do sleep 0.1; done
 done
 for f in "${pend[@]}"; do
   i=$((i+1))
   ( if judge "$f" > "$out/pending.line.$i" 2>&1; then echo "FAIL $f passes now: move it from units.pending to units.run" > "$out/line.$i"; echo 1 > "$out/line.$i.rc"
     else : > "$out/line.$i"; echo 0 > "$out/line.$i.rc"; fi ) &
-  while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do wait -n; done
+  while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do sleep 0.1; done
 done
 wait
 for k in $(seq 1 "$i"); do cat "$out/line.$k"; [ "$(cat "$out/line.$k.rc")" = 0 ] || bad=1; done

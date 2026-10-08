@@ -45,7 +45,7 @@ EOM
 }
 names=""
 run() { # NAME FILE FROM TO [target]: in the background, at most $jobs_max at once
-  while [ "$(jobs -rp | wc -l)" -ge "$jobs_max" ]; do wait -n; done
+  while [ "$(jobs -rp | wc -l)" -ge "$jobs_max" ]; do sleep 0.1; done
   names="$names $1"
   fault "$@" &
 }

@@ -1,4 +1,5 @@
 #!/bin/bash
+# linux-only-file: the JSON benchmark of the Linux bench box (jackson, simdjson, /proc/cpuinfo, stat -c); not part of any gate
 # scripts/bench/json/run.sh: the JSON shootout of docs/shootout/json.md on one machine. Single thread, `ulimit -v 16000000`, every fib.json number the median of 5 runs
 # (the competitors' programs take the median of 5 batches themselves), the whole run under `flock /tmp/fibsuite.lock`.
 # Environment (all with defaults for the layout of the shootout directory):

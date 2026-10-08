@@ -20,8 +20,10 @@ def check(name, cond, why=''):
     else: print('FAIL %s: %s' % (name, why)); failed.append(name)
 
 def limit():
+    if sys.platform != 'linux': return   # macOS refuses RLIMIT_AS (the preexec_fn fails and the server never starts)
     import resource
-    resource.setrlimit(resource.RLIMIT_AS, (16000000 * 1024, 16000000 * 1024))
+    try: resource.setrlimit(resource.RLIMIT_AS, (16000000 * 1024, 16000000 * 1024))
+    except (ValueError, OSError): pass
 
 env = dict(os.environ, FIBC_SERVE_DEBUG='1', FIB_LIB=os.environ.get('FIB_LIB', os.path.join(root, 'lib')))
 

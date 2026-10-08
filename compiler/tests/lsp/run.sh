@@ -11,7 +11,7 @@ fibc=${FIBC:-fibc}
 command -v "$fibc" >/dev/null 2>&1 || [ -x "$fibc" ] || { echo "lsp tests: no fibc: set FIBC" >&2; exit 2; }
 export FIB_LIB=${FIB_LIB:-$root/lib}
 cd "$root" || exit 2
-declare -A want=([json]=69 [text]=61 [scope]=62 [analysis]=46)
+want_of() { case $1 in json) echo 69 ;; text) echo 61 ;; scope) echo 62 ;; analysis) echo 46 ;; esac; }
 names=("$@"); [ ${#names[@]} -gt 0 ] || names=(json text scope analysis)
 rc=0
 for n in "${names[@]}"; do
@@ -20,7 +20,7 @@ for n in "${names[@]}"; do
   out=$("$fibc" run "$f" -I compiler -I lib 2>&1); st=$?
   last=$(printf '%s\n' "$out" | grep '^checks ' | tail -1)
   printf '%s\n' "$out" | grep '^FAIL' >&2
-  if [ "$last" = "checks ${want[$n]} failed 0" ]; then echo "$n: ok ($last)"
-  else echo "$n: FAILED (exit $st; expected 'checks ${want[$n]} failed 0', got '$last')" >&2; printf '%s\n' "$out" | tail -5 >&2; rc=1; fi
+  if [ "$last" = "checks $(want_of "$n") failed 0" ]; then echo "$n: ok ($last)"
+  else echo "$n: FAILED (exit $st; expected 'checks $(want_of "$n") failed 0', got '$last')" >&2; printf '%s\n' "$out" | tail -5 >&2; rc=1; fi
 done
 exit $rc

@@ -25,7 +25,7 @@ time_of() { # time_of EXE ARGS: median elapsed seconds of RUNS runs, the output'
   local exe=$1 args=$2 ts=() i s; sum=""
   for i in $(seq "$runs"); do
     # shellcheck disable=SC2086
-    /usr/bin/time -f "%e" -o "$work/t" bash -c "ulimit -v 16000000; exec \"$exe\" $args" > "$work/out" 2> "$work/err"
+    /usr/bin/time -f "%e" -o "$work/t" bash -c "ulimit -v 16000000; exec \"$exe\" $args" > "$work/out" 2> "$work/err"   # linux-only: GNU time -f/-o for wall seconds and peak memory (BSD time has -l)
     ts+=("$(tail -n 1 "$work/t")"); s=$(sha1sum < "$work/out" | cut -c1-12)
     if [ -n "$sum" ] && [ "$s" != "$sum" ]; then sum=UNSTABLE; else sum=$s; fi
   done

@@ -15,7 +15,7 @@ if [ -n "${TOOLS_ONLY:-}" ]; then targets=(); for n in $TOOLS_ONLY; do targets+=
 elif [ "$mode" = quick ]; then targets=(tools-quick); else targets=(tools); fi
 make -k -j"${TOOLS_JOBS:-3}" "${targets[@]}" TOOLS_TIMEOUT="${TOOLS_TIMEOUT:-900}" "${builder[@]}" > build/tools.log 2>&1
 bad=0
-if [ -n "${TOOLS_ONLY:-}" ]; then stamps=("${targets[@]}"); else mapfile -t stamps < <(make -s tools-list TOOLS_MODE="$mode"); fi
+if [ -n "${TOOLS_ONLY:-}" ]; then stamps=("${targets[@]}"); else stamps=(); while IFS= read -r line; do stamps+=("$line"); done < <(make -s tools-list TOOLS_MODE="$mode"); fi
 for s in "${stamps[@]}"; do
   n=${s#build/tools/}; n=${n%.ok}
   if make -q "$s" "${builder[@]}" 2> /dev/null; then echo "ok $n $(cat "$s") s"; else echo "FAIL $n (log: ${s%.ok}.log)"; bad=1; tail -n 12 "${s%.ok}.log" 2> /dev/null | sed 's/^/    /'; fi

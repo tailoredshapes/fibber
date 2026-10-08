@@ -1,4 +1,5 @@
 #!/bin/bash
+# linux-only-file: compares the resolver with getent, which macOS does not have (dscacheutil -q host would be the form); not part of the Mac gate
 # The differential of the native resolver against the box's own tools, on live names: for each name, the addresses fib.dns returns must be the set `dig +short A` and
 # `dig +short AAAA` return (dig follows CNAMEs and prints the addresses after them) when both ask the same server, and for names in /etc/hosts and localhost the set `getent ahosts`
 # returns. Needs dig, getent and a network; names that vary per query (round robin, geo DNS) are compared as sets of what both saw over several tries, so a name from a CDN can

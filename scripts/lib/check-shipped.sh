@@ -16,16 +16,16 @@ if [ "$link" = static ] && [ "$plat" = darwin-arm64 ]; then
   codesign -v "$bin" || { echo "check-shipped: the shipped fibc has no valid signature" >&2; exit 1; }
   echo "shipped fibc: no LC_RPATH, loads: $(otool -L "$bin" | tail -n +2 | awk '{print $1}' | tr '\n' ' ')"
 elif [ "$link" = static ]; then
-  if readelf -d "$bin" | grep -q -E 'RUNPATH|RPATH'; then
+  if readelf -d "$bin" | grep -q -E 'RUNPATH|RPATH'; then   # linux-only: the ELF branch of a Linux release; the darwin branch above uses otool
     echo "check-shipped: the shipped fibc has an RUNPATH/RPATH (the cc shim did not take, or a library is still found by one):" >&2
-    readelf -d "$bin" | grep -E 'RUNPATH|RPATH' >&2; exit 1
+    readelf -d "$bin" | grep -E 'RUNPATH|RPATH' >&2; exit 1   # linux-only: the ELF branch of a Linux release; the darwin branch above uses otool
   fi
-  if readelf -d "$bin" | grep NEEDED | grep -q -E 'liblair|libLLVM'; then
-    echo "check-shipped: the shipped fibc needs liblair or libLLVM:" >&2; readelf -d "$bin" | grep NEEDED >&2; exit 1
+  if readelf -d "$bin" | grep NEEDED | grep -q -E 'liblair|libLLVM'; then   # linux-only: the ELF branch of a Linux release; the darwin branch above uses otool
+    echo "check-shipped: the shipped fibc needs liblair or libLLVM:" >&2; readelf -d "$bin" | grep NEEDED >&2; exit 1   # linux-only: the ELF branch of a Linux release; the darwin branch above uses otool
   fi
-  extra=$(ldd "$bin" | awk '{print $1}' | sed 's|.*/||' | grep -v -E '^(linux-vdso|ld-linux)|^(libc|libm|libstdc\+\+|libgcc_s|libz|libzstd)\.' || true)
-  if [ -n "$extra" ]; then echo "check-shipped: ldd shows libraries beyond libc, libm, libstdc++, libgcc_s, libz, libzstd: $extra" >&2; exit 1; fi
-  echo "shipped fibc: no RUNPATH, NEEDED: $(readelf -d "$bin" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | tr '\n' ' ')"
+  extra=$(ldd "$bin" | awk '{print $1}' | sed 's|.*/||' | grep -v -E '^(linux-vdso|ld-linux)|^(libc|libm|libstdc\+\+|libgcc_s|libz|libzstd)\.' || true)   # linux-only: the ELF branch of a Linux release; the darwin branch above uses otool
+  if [ -n "$extra" ]; then echo "check-shipped: ldd shows libraries beyond libc, libm, libstdc++, libgcc_s, libz, libzstd: $extra" >&2; exit 1; fi   # linux-only: the ELF branch of a Linux release; the darwin branch above uses otool
+  echo "shipped fibc: no RUNPATH, NEEDED: $(readelf -d "$bin" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | tr '\n' ' ')"   # linux-only: the ELF branch of a Linux release; the darwin branch above uses otool
 else
   echo "note: LLVM_LINK=shared: this binary needs the LLVM shared library; it is not a release"
 fi

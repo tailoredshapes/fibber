@@ -1,4 +1,5 @@
 #!/bin/bash
+# linux-only-file: needs the Linux libcrypto.so.3 through ldconfig and LD_PRELOAD; mutation reviews are not part of the Mac gate
 # scripts/mutant-tls.sh: the mutation review of fib.tls. Copies lib/fib/tls to a scratch directory, applies ONE planted fault to the copy, and runs the specs that must notice it
 # (the scratch copy is first on the module path): at least one scenario must FAIL (or the spec must not compile or must trap). A fault under which every scenario passes means the specs
 # have a hole. Nothing in the tree changes. The faults that need real cryptography (signatures, AEAD, key schedule) are judged by the driver specs (tls-specs/, with the OpenSSL

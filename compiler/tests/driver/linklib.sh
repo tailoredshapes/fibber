@@ -33,11 +33,11 @@ fails_with "4b dynamic in a --static build" "no dynamic loader" -- "$F" build --
 if command -v gcc > /dev/null 2>&1; then
   mkdir -p "$T/lib"; printf 'int fibtest_answer(void) { return 42; }\n' > "$T/lib/a.c"
   gcc -O1 -fPIC -c "$T/lib/a.c" -o "$T/lib/a.o" && ar rcs "$T/lib/libfibtest.a" "$T/lib/a.o" && gcc -shared -o "$T/lib/libfibtest.so" "$T/lib/a.o" || { echo "linklib: gcc failed"; exit 1; }
-  check "3a a real library, dynamic: -lfibtest by the declaration" bash -c "'$F' build $D/uses-answer.fib -I $D -L $T/lib -o $T/d && $T/d && ldd $T/d | grep -q libfibtest"
-  check "3b a real library bundled: --link fibtest=static has no dependency on it" bash -c "'$F' build --link fibtest=static $D/uses-answer.fib -I $D -L $T/lib -o $T/s && $T/s && ! ldd $T/s | grep -q libfibtest"
+  check "3a a real library, dynamic: -lfibtest by the declaration" bash -c "'$F' build $D/uses-answer.fib -I $D -L $T/lib -o $T/d && $T/d && { ldd $T/d 2>/dev/null || otool -L $T/d; } | grep -q libfibtest"
+  check "3b a real library bundled: --link fibtest=static has no dependency on it" bash -c "'$F' build --link fibtest=static $D/uses-answer.fib -I $D -L $T/lib -o $T/s && $T/s && ! { ldd $T/s 2>/dev/null || otool -L $T/s; } | grep -q libfibtest"
   check "3c --link-mode static does the same" bash -c "'$F' build --link-mode static $D/uses-answer.fib -I $D -L $T/lib -o $T/s2 && $T/s2"
   if "$F" build --static $D/requires-missing.fib -I $D -o "$T/probe" > "$T/out" 2>&1; then
-    check "3d a real library in a fully static musl executable" bash -c "'$F' build --static $D/uses-answer.fib -I $D -L $T/lib -o $T/ss && $T/ss && ! ldd $T/ss 2>/dev/null | grep -q 'libc'"
+    check "3d a real library in a fully static musl executable" bash -c "'$F' build --static $D/uses-answer.fib -I $D -L $T/lib -o $T/ss && $T/ss && ! ldd $T/ss 2>/dev/null | grep -q 'libc'" # linux-only: a fully static musl executable (3d is skipped where there are no musl pieces)
   else echo "skip 3d (no musl pieces: $(head -1 "$T/out" | cut -c1-100))"; fi
 else echo "skip 3 (no gcc to build the test library)"; fi
 [ $bad -eq 0 ] && echo "linklib: all checks hold" || echo "linklib: FAILED"; exit $bad

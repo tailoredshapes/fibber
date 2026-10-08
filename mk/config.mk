@@ -1,6 +1,6 @@
 # mk/config.mk: the settings every section shares (docs/design/build.md 3). Nothing here is a target but the directories.
 ifeq ($(filter 4.% 5.%,$(MAKE_VERSION)),)
-  $(error GNU Make 4 or later is needed (this is $(MAKE_VERSION)); on macOS: brew install make, then gmake)
+  $(error fibber needs GNU Make 4 or later (this is $(MAKE_VERSION)). macOS ships 3.81 as /usr/bin/make: `brew install make` and run `gmake` (README.md, Install))
 endif
 .DEFAULT_GOAL := help
 SHELL := bash
@@ -17,6 +17,11 @@ ABS_BUILD := $(abspath $(BUILD))
 VERSION := $(strip $(shell tr -d '[:space:]' < VERSION))
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
+# macOS: what the scripts expect from GNU coreutils comes from scripts/portable (timeout, flock, nproc, sha256sum, sed -i, date %N, a ulimit -v that succeeds)
+ifeq ($(UNAME_S),Darwin)
+  export PATH := $(CURDIR)/scripts/portable/bin:$(PATH)
+  export BASH_ENV := $(CURDIR)/scripts/portable/bash-env.sh
+endif
 PLATFORM := $(shell echo "$(UNAME_S)-$(UNAME_M)" | tr 'A-Z' 'a-z' | sed 's/linux-amd64/linux-x86_64/; s/darwin-aarch64/darwin-arm64/')
 FIB_PLATFORM ?= $(PLATFORM)
 
@@ -54,7 +59,7 @@ LIMIT_STDLIB ?= 1800
 export FIB_LIB := $(ROOT)/lib
 # TMPDIR is outside the tree on purpose: with TMPDIR inside the worktree, cases/stdlib/8283 fails in a shard (expected 0, got 4294967296) and passes
 # with TMPDIR elsewhere (found in MAKE-1; reported, not explained). SCRATCH holds it, and the tool scripts' scratch.
-SCRATCH ?= $(HOME)/.cache/fibber-scratch/mk-$(shell echo $(ROOT) | md5sum | cut -c1-8)
+SCRATCH ?= $(HOME)/.cache/fibber-scratch/mk-$(shell echo $(ROOT) | { md5sum 2> /dev/null || md5 -r; } | cut -c1-8)
 export TMPDIR := $(SCRATCH)/tmp
 $(shell mkdir -p $(TMPDIR))
 unexport LD_LIBRARY_PATH

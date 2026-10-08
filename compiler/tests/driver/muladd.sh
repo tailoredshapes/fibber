@@ -1,4 +1,5 @@
 #!/bin/bash
+# linux-only-file: x86-64-v2/v3 runs, /proc/cpuinfo and nm -D; the Mac is arm64 (skipped: compiler/tests/expected-macos.txt)
 # SC1: `simd/muladd` and `(has-fma)` follow the target, and no build for a CPU without FMA calls libm's `fma`. Programs are built with FIB_TARGET_CPU pinned:
 #   x86-64-v2 (no FMA): (has-fma) is false, muladd equals the multiply-then-add (simd/fma is not called: it traps there, docs/adr/0008, no-fma.sh)
 #   x86-64-v3 (FMA):    (has-fma) is true,  muladd equals simd/fma (run only when the host has avx2 and fma)

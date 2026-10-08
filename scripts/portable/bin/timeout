@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+# timeout shim for macOS (no GNU coreutils): `timeout [-k KILL_AFTER] [-s SIGNAL] [--foreground] [--preserve-status] DURATION COMMAND [ARG]...`.
+# Runs COMMAND with this process's stdin, stdout and stderr; after DURATION (a number with an optional s, m, h or d) sends SIGNAL (default TERM) to it,
+# and KILL_AFTER later SIGKILL; exits 124 on a timeout, else COMMAND's status (128+N when a signal killed it), 125 for a bad call, 127 when it is not found.
+import signal, subprocess, sys
+
+def dur(s):
+    mult = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}
+    return float(s[:-1]) * mult[s[-1]] if s and s[-1] in mult else float(s)
+
+def sig_of(name):
+    name = name.upper()
+    return signal.Signals[name if name.startswith('SIG') else 'SIG' + name]
+
+a, sig, ka = sys.argv[1:], signal.SIGTERM, None
+try:
+    while a and a[0].startswith('-') and a[0] != '--':
+        o = a.pop(0)
+        if o in ('-k', '--kill-after'): ka = dur(a.pop(0))
+        elif o.startswith('--kill-after='): ka = dur(o.split('=', 1)[1])
+        elif o in ('-s', '--signal'): sig = sig_of(a.pop(0))
+        elif o.startswith('--signal='): sig = sig_of(o.split('=', 1)[1])
+        elif o in ('--foreground', '--preserve-status', '-v', '--verbose'): pass
+        else: raise ValueError(o)
+    if a and a[0] == '--': a.pop(0)
+    d = dur(a.pop(0)); assert a
+except (ValueError, KeyError, IndexError, AssertionError):
+    sys.stderr.write('timeout: usage: timeout [-k D] [-s SIG] DURATION COMMAND [ARG]...\n'); sys.exit(125)
+try:
+    p = subprocess.Popen(a)
+except FileNotFoundError:
+    sys.stderr.write('timeout: failed to run command %s: No such file or directory\n' % a[0]); sys.exit(127)
+except PermissionError:
+    sys.stderr.write('timeout: failed to run command %s: Permission denied\n' % a[0]); sys.exit(126)
+for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):   # a signal to the shim goes on to the command, as timeout(1) does
+    signal.signal(s, lambda n, f: p.send_signal(n))
+timed_out = False
+try:
+    rc = p.wait(timeout=d if d > 0 else None)
+except subprocess.TimeoutExpired:
+    timed_out = True
+    p.send_signal(sig)
+    try: rc = p.wait(timeout=ka) if ka else p.wait()
+    except subprocess.TimeoutExpired: p.kill(); rc = p.wait()
+sys.exit(124 if timed_out else (128 - rc if rc < 0 else rc))

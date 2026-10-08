@@ -2,7 +2,7 @@
 #   make -j8 gate        the full gate, incremental (the stamps under build/ say what passed on which inputs)
 #   make -j8 quick       the quick gate
 #   make release         dist/fibc-VERSION-PLATFORM.tar.gz and SHA256SUMS
-# macOS: BSD make cannot read this; `brew install make` and run `gmake`.
+# macOS: /usr/bin/make is GNU Make 3.81 and stops at once with a message; `brew install make` and run `gmake` (`gmake mac-check`: mk/mac.mk).
 # MK is the directory of this Makefile's sections, so that a copy of the Makefile and mk/ elsewhere (compiler/tests/make/graph.sh plants
 # faults in one) runs against this tree with `make -f COPY/Makefile`.
 MK := $(dir $(lastword $(MAKEFILE_LIST)))mk
@@ -15,6 +15,7 @@ include $(MK)/tools.mk
 include $(MK)/checks.mk
 include $(MK)/gate.mk
 include $(MK)/release.mk
+include $(MK)/mac.mk
 include $(MK)/mutants.mk
 include $(MK)/bench.mk
 include $(MK)/fetch.mk

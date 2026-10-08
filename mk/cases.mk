@@ -45,7 +45,7 @@ STDLIB_TABLES := $(foreach k,$(call SHARD_IDX,$(SHARDS)),$(CASES_DIR)/stdlib.$(k
 OWNERSHIP_TABLES := $(foreach k,$(call SHARD_IDX,$(OWN_SHARDS)),$(CASES_DIR)/ownership.$(k).txt)
 MODULES_TABLES := $(CASES_DIR)/modules.0.txt
 SAMPLE_TABLES := $(foreach k,$(call SHARD_IDX,$(QUICK_SHARDS)),$(CASES_DIR)/sample.$(k).txt)
-CASES_DATA := scripts/ci-stage2.expected scripts/case-floor.expected scripts/ci-stage2.sh
+CASES_DATA := scripts/ci-stage2.expected scripts/case-floor.expected scripts/ci-stage2.sh $(wildcard scripts/ci-stage2.expected-darwin)
 
 $(CASES_DIR)/full.ok: $(OWNERSHIP_TABLES) $(MODULES_TABLES) $(STDLIB_TABLES) $(CASES_DATA)
 	$(call stamp,scripts/ci-stage2.sh --from $(CASES_DIR) ownership:ownership:$(OWN_SHARDS) modules:modules:1 stdlib:stdlib:$(SHARDS))
