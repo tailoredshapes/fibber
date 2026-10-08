@@ -38,6 +38,8 @@ linux-tool	@C@(numactl|lscpu|setarch|chrt|ionice|unshare|nsenter|setcap|chattr|f
 getopt	@C@getopt[[:space:]]	BSD getopt has no long options: a while/case loop
 grep-P	grep[[:space:]]+(-[a-zA-Z]*P|--perl-regexp)	BSD grep has no -P: grep -E, or awk, or perl -ne
 stat-c	@C@stat[[:space:]]+(-c|--format|--printf)	BSD stat has -f: wc -c < file for a size, or python3
+realpath	@C@realpath[[:space:]]+(-m|-s|-e|--)	macOS realpath has no options (13+): python3 -c 'import os,sys; print(os.path.relpath(...))' or cd+pwd
+sed-brace	@C@sed[[:space:]]+[^|]*[{][^;}]*[dpqPDgGhHxnNlz=]}	BSD sed needs a ; or newline before the closing brace: '1{/x/d;}'
 touch-d	@C@touch[[:space:]]+(-[a-zA-Z]*d|--date)	BSD touch -d takes an ISO time, not '-1 day': touch -t 200001010000 (a fixed old time), or touch -r REFERENCE
 date-d	@C@date[[:space:]]+(-d|--date)	BSD date has -j -f and -v: compute with python3 or awk
 readlink	@C@readlink[[:space:]]+(-[a-eg-z]*f|--canonicalize)	readlink -f needs macOS 12.3: (cd "$(dirname f)" && pwd)
@@ -98,6 +100,8 @@ pipe-stderr|run |& tee log.txt
 test-v|if [[ -v HOME ]]; then :; fi
 coproc|coproc SERVER { server; }
 negative-index|last=${a[-1]}
+realpath|realpath --relative-to=a b
+sed-brace|sed '1{/^(target /d}' f
 proc|grep -q avx2 /proc/cpuinfo
 sysfs|cat /sys/devices/system/cpu/online
 ldconfig|lib=$(ldconfig -p | head -1)

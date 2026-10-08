@@ -7,6 +7,9 @@ if [ "$(uname -s)" = Darwin ]; then
   _portable=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
   case ":$PATH:" in *":$_portable/bin:"*) ;; *) PATH=$_portable/bin:$PATH ;; esac
   BASH_ENV=$_portable/bash-env.sh
+  # the LLVM 21 libraries of Homebrew's keg-only llvm@21 (the scripts default to Debian's /usr/lib/llvm-21/lib); the PATH of an ssh session lacks /opt/homebrew/bin
+  : "${LLVM_LIBDIR:=/opt/homebrew/opt/llvm@21/lib}"; LLVM_LIB=$LLVM_LIBDIR; LLVMLIB=$LLVM_LIBDIR; export LLVM_LIBDIR LLVM_LIB LLVMLIB
+  case ":$PATH:" in *":/opt/homebrew/bin:"*) ;; *) [ -d /opt/homebrew/bin ] && PATH=$PATH:/opt/homebrew/bin ;; esac
   export PATH BASH_ENV
   [ -n "${BASH_VERSION:-}" ] && . "$_portable/bash-env.sh"   # this shell too, not only the bash scripts it starts
   unset _portable

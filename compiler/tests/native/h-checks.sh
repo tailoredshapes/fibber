@@ -12,8 +12,8 @@ export FIB_LIB=${FIB_LIB:-$root/lib}
 cd "$root" || exit 2
 rc=0
 for t in h-header h-exec; do
-  "$fibc" build compiler/tests/native/$t.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o "$out/$t" || { echo "h-checks: $t FAILED to build"; rc=1; continue; }
-  LD_LIBRARY_PATH=/usr/lib/llvm-21/lib "$out/$t" > "$out/$t.out"; s=$?
+  "$fibc" build compiler/tests/native/$t.fib -I compiler -I lib -L "${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" -l LLVM-21 -o "$out/$t" || { echo "h-checks: $t FAILED to build"; rc=1; continue; }
+  LD_LIBRARY_PATH="${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" "$out/$t" > "$out/$t.out"; s=$?
   echo "$t: $(grep -c '^ok' "$out/$t.out") ok, $(grep -c '^FAIL' "$out/$t.out") FAIL (status $s)"
   [ "$s" -eq 0 ] || { grep '^FAIL' "$out/$t.out"; rc=1; }
 done

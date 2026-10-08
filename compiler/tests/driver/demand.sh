@@ -18,7 +18,7 @@ bad=0; n=0
 for f in "$@"; do
   r=$(roots_of "$f"); n=$((n + 1))
   # stage 2's emit starts with the module's (target ..) form (SIMD P3); emit-dump prints the sections only
-  a=$( "$fibc" emit $r "$f" 2>&1 | sed '1{/^(target /d}'; echo "status ${PIPESTATUS[0]}" )
+  a=$( "$fibc" emit $r "$f" 2>&1 | sed '1{/^(target /d;}'; echo "status ${PIPESTATUS[0]}" )
   b=$( "$fibc" emit-dump $r "$f" 2>&1 | grep -v '^== \|^;; == section '; echo "status ${PIPESTATUS[0]}" )
   if [ "$a" = "$b" ]; then echo "same $f"; else echo "DIFF $f"; bad=1; fi
 done

@@ -60,7 +60,7 @@ $s2 build "$t/lair.fib" -o "$t/lair-rpath" -L "$t/rp" -l hooktest > /dev/null 2>
 ck "build -L DIR writes an rpath: the executable runs from /, with no LD_LIBRARY_PATH" "$(cd /; env -u LD_LIBRARY_PATH "$t/lair-rpath" 2>&1; echo $?)" 0
 mv "$t/rp" "$t/rp-moved"
 ck "build -L DIR: the rpath is what finds the library (moved away, it does not start)" "$(cd /; env -u LD_LIBRARY_PATH "$t/lair-rpath" 2>&1 | grep -c 'libhooktest.so: cannot open')" 1
-ck "build -L DIR: a relative directory is an absolute rpath" "$($s2 build "$t/lair.fib" -o "$t/lair-rel" -L "$(realpath --relative-to="$root" "$t/rp-moved")" -l hooktest > /dev/null 2>&1; cd /; env -u LD_LIBRARY_PATH "$t/lair-rel" 2>&1; echo $?)" 0
+ck "build -L DIR: a relative directory is an absolute rpath" "$($s2 build "$t/lair.fib" -o "$t/lair-rel" -L "$(python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$t/rp-moved" "$root")" -l hooktest > /dev/null 2>&1; cd /; env -u LD_LIBRARY_PATH "$t/lair-rel" 2>&1; echo $?)" 0
 mkdir -p "$t/jc"; cp cases/ownership/01-return-part-of-argument.fib "$t/jc/"
 ck "cases DIR -j 2 runs and counts as without it, exit 0" "$($s2 cases "$t/jc" -j 2 | tail -1; echo $?)" "$(printf '1 cases: 1 pass, 0 fail, 0 pending, 0 header error\n0')"
 ck "cases -j 0: usage on standard error, exit 2" "$($s2 cases "$t/jc" -j 0 2>&1 >/dev/null | head -1; $s2 cases "$t/jc" -j 0 >/dev/null 2>&1; echo $?)" "$(printf 'usage: fibc <command>\n2')"

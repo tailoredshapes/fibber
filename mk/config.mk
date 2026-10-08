@@ -19,9 +19,10 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 # macOS: what the scripts expect from GNU coreutils comes from scripts/portable (timeout, flock, nproc, sha256sum, sed -i, date %N, `make` = this gmake, a ulimit -v that succeeds)
 ifeq ($(UNAME_S),Darwin)
-  export PATH := $(CURDIR)/scripts/portable/bin:$(PATH)
+  export PATH := $(CURDIR)/scripts/portable/bin:$(PATH):/opt/homebrew/bin
   export BASH_ENV := $(CURDIR)/scripts/portable/bash-env.sh
   export MAKE
+  export LLVM_LIBDIR LLVM_LIB LLVMLIB
 endif
 PLATFORM := $(shell echo "$(UNAME_S)-$(UNAME_M)" | tr 'A-Z' 'a-z' | sed 's/linux-amd64/linux-x86_64/; s/darwin-aarch64/darwin-arm64/')
 FIB_PLATFORM ?= $(PLATFORM)
@@ -30,6 +31,8 @@ FIB_PLATFORM ?= $(PLATFORM)
 LLVM_LINK ?= shared
 ifeq ($(UNAME_S),Darwin)
   LLVM_LIBDIR ?= /opt/homebrew/opt/llvm@21/lib
+  LLVM_LIB := $(LLVM_LIBDIR)
+  LLVMLIB := $(LLVM_LIBDIR)
 else
   LLVM_LIBDIR ?= /usr/lib/llvm-21/lib
 endif

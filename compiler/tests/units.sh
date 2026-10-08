@@ -53,12 +53,12 @@ jobs=${UNITS_JOBS:-$([ -n "${GATE_SLOTS:-}" ] && echo 16 || echo 1)}
 pend=()
 if [ $# -eq 0 ] && { [ "$part" = all ] || [ "$part" = pending ]; }; then while IFS= read -r l; do pend+=("$l"); done < <(names units.pending); fi
 n=0; i=0
-for f in "${files[@]}"; do
+for f in ${files[@]+"${files[@]}"}; do
   n=$((n+1)); i=$((i+1))
   ( judge "$f" > "$out/line.$i" 2>&1; echo $? > "$out/line.$i.rc" ) &
   while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do sleep 0.1; done
 done
-for f in "${pend[@]}"; do
+for f in ${pend[@]+"${pend[@]}"}; do
   i=$((i+1))
   ( if judge "$f" > "$out/pending.line.$i" 2>&1; then echo "FAIL $f passes now: move it from units.pending to units.run" > "$out/line.$i"; echo 1 > "$out/line.$i.rc"
     else : > "$out/line.$i"; echo 0 > "$out/line.$i.rc"; fi ) &
