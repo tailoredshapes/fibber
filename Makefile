@@ -18,5 +18,6 @@ include $(MK)/release.mk
 include $(MK)/mac.mk
 include $(MK)/mutants.mk
 include $(MK)/bench.mk
+include $(MK)/k8s.mk
 include $(MK)/fetch.mk
 include $(MK)/help.mk
