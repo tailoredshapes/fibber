@@ -19,7 +19,7 @@ K8S_TTL ?= 3600
 K8S_DEADLINE ?= 14400
 K8S_RUN := $(shell date +%s)
 K8S_KUBECTL := kubectl -n $(K8S_NS)
-K8S_LOADER := loader-$(K8S_POOL)
+K8S_LOADER = loader-$(K8S_POOL)
 K8S_SEED_HOST ?= $(FIB_SEED_CACHE)/$(SEED_SHA)/seed.tar.gz
 K8S_GATE_CMD = $(K8S_PREP) || true; make -k -j$(K8S_J) CASE_JOBS=$(CASE_JOBS) $(K8S_EXTRA) gate-stamps || true; make gate-report $(K8S_EXTRA)
 K8S_QUICK_CMD = make -k -j$(K8S_J) CASE_JOBS=$(CASE_JOBS) $(K8S_EXTRA) quick-stamps || true; make gate-report GATE_MODE=quick $(K8S_EXTRA)
@@ -87,15 +87,11 @@ k8s-apply-bench:   ## the benchmark node's work volume and loader pod (k8s/bench
 	kubectl apply -f k8s/bench.yaml
 # On the Ryzen's WSL2 node (quiet x86): builds F, then runs the quick benchmarks (scripts/bench/quick.sh) against the baseline there.
 k8s-bench: K8S_POOL := bench
-k8s-bench: k8s-image k8s-src k8s-seed   ## the quick benchmarks on the bench node (BENCH="name.." for some); K8S_CPU=8 K8S_MEM=8Gi by default there
-	@echo "(WSL2 stops its VM when no wsl.exe session is open, which drops the node: an ssh session holding 'sleep' keeps it up for the run)"
+k8s-bench: k8s-image   ## the quick benchmarks on the bench node (BENCH="name.." for some); BENCH_CPU=8 BENCH_MEM=8Gi by default
+	@echo "(WSL2 stops its VM when no wsl.exe session is open, which drops the node: an ssh session holding 'sleep' keeps it up for the whole run)"
 	ssh -o BatchMode=yes $(BENCH_HOST) 'wsl -u root -e sleep 14400' > /dev/null 2>&1 & kp=$$!; trap "kill $$kp" EXIT; sleep 30; \
+	$(MAKE) --no-print-directory K8S_POOL=bench k8s-src k8s-seed && \
 	$(call k8s_run,bench,make -j4 CASE_JOBS=4 $(K8S_EXTRA) bench BENCH='$(BENCH)',$(or $(BENCH_CPU),8),$(or $(BENCH_MEM),8Gi))
-# The stdlib shards as an Indexed Job (one pod per shard, SHARDS of them, K8S_PAR at a time): F is built first by a plain job on the same volume.
-K8S_PAR ?= 8
-k8s-shards: k8s-image k8s-src k8s-seed   ## the stdlib case shards as an Indexed Job (SHARDS pods, K8S_PAR at once, K8S_SHARD_CPU each), after a job that builds F
-	$(call k8s_run,prep,make -j$(K8S_J) build/F)
-	$(call k8s_run,shards,make CASE_JOBS=1 build/cases/stdlib.$$JOB_COMPLETION_INDEX.txt,$(or $(K8S_SHARD_CPU),1),$(or $(K8S_SHARD_MEM),3Gi),$(SHARDS),$(K8S_PAR))
 k8s-run: k8s-image k8s-src k8s-seed   ## any shell command in a pod, in the tree: make k8s-run CMD="build/F cases cases/stdlib --only 8283-str-replace-literal-char-and-regex-on-ascii-and-non-ascii.fib"
 	test -n "$(CMD)" || { echo "k8s-run: CMD='shell command' (run in /work/tree)" >&2; exit 2; }
 	$(call k8s_run,run,$(CMD))
