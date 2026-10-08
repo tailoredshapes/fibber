@@ -66,5 +66,5 @@ repro-aarch64-sibcall:   ## the LLVM sibling-call fault by llc alone (docs/desig
 	@$(LLC) --version | grep 'LLVM version'
 	@for f in min.ll min-tail.ll; do printf '%-13s %s\n' $$f "$$($(LLC) -mtriple=aarch64-linux-gnu -O2 $(REPRO_SIBCALL)/$$f -o - | grep -E '^[[:space:]]+bl?[[:space:]]+callee' | tr -s '\t ' ' ')"; done
 	@$(LLC) -mtriple=aarch64-linux-gnu -O2 $(REPRO_SIBCALL)/min-frame.ll -o - | grep -E '(sub|add)[[:space:]]+sp, sp|\[sp\], #|^[[:space:]]+bl?[[:space:]]+callee' | tr -s '\t ' ' '
-	@asm="$$($(LLC) -mtriple=aarch64-linux-gnu -O2 $(REPRO_SIBCALL)/min.ll -o -)"; printf '%s\n' "$$asm" | grep -qE '^[[:space:]]+bl[[:space:]]+callee' || { echo 'the unmarked call is not a bl: the control failed' >&2; exit 1; }
+	@out=$$($(LLC) -mtriple=aarch64-linux-gnu -O2 $(REPRO_SIBCALL)/min.ll -o -); printf '%s\n' "$$out" | grep -qE '^[[:space:]]+bl[[:space:]]+callee' || { echo 'the unmarked call is not a bl: the control failed' >&2; exit 1; }
 .PHONY: repro-aarch64-sibcall
