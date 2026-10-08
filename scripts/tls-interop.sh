@@ -1,4 +1,5 @@
 #!/bin/bash
+# linux-only-file: needs the Linux libcrypto.so.3 through ldconfig and LD_PRELOAD; not part of the Mac gate
 # Interop of the native TLS 1.3 client (fib.tls) against real servers: `openssl s_server` (OpenSSL 3.x CLI) and python's ssl module, with a throwaway CA generated into scratch,
 # and, when this machine has outbound network, a few public sites with the embedded roots and with the system store. Prints one row per case: `PASS` or `FAIL` and the client's
 # own RESULT line. Not part of the gate (it needs openssl, python3, the OpenSSL driver and a network port).

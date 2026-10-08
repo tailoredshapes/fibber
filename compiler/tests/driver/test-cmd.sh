@@ -91,7 +91,7 @@ ck "--only matching nothing: said" "$(grep -c 'nothing to run is not a pass' "$t
 
 $s2 test specs --format json > "$t/o10" 2> /dev/null; ck "json: exit 1" $? 1
 ck "json: summary" "$(grep -o '"summary":{[^}]*}' "$t/o10")" '"summary":{"total":4,"pass":3,"fail":1,"trap":0,"timeout":0}'
-ck "json: two files, four results" "$(grep -o '"file":' "$t/o10" | wc -l) $(grep -o '"suite":' "$t/o10" | wc -l)" "2 4"
+ck "json: two files, four results" "$(grep -o '"file":' "$t/o10" | wc -l | tr -d ' ') $(grep -o '"suite":' "$t/o10" | wc -l | tr -d ' ')" "2 4"
 ck "json: the broken step has its position" "$(grep -c '"status":"broke","expected":"2","actual":"1","at":"[^"]*bad-spec.fib:4:' "$t/o10")" 1
 $s2 test specs --format tap > "$t/o11" 2> /dev/null; ck "tap: exit 1" $? 1
 ck "tap: one plan for both files, numbered in order" "$(grep -E '^(1\.\.|ok |not ok )' "$t/o11" | sed -E 's/ - .*//' | tr '\n' '|')" "1..4|ok 1|ok 2|not ok 3|ok 4|"

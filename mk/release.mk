@@ -99,6 +99,7 @@ $(RELEASE_DIR)/tree.ok: $(RELEASE_DIR)/binary.ok $(RELEASE_TREE)/README.txt $(RE
 	  && (cd $(RELEASE_DIR) && env -i PATH=/usr/bin:/bin $(abspath $(RELEASE_TREE))/bin/fibc build hello.fib -o hello && [ "$$(env -i ./hello)" = "hello from fibber" ]) \
 	  && echo "the shipped fibc builds hello and it runs")
 $(DIST)/$(RELEASE_NAME).tar.gz: $(RELEASE_DIR)/tree.ok | $(DIST)/
+# linux-only: GNU tar's --owner/--sort (reproducible archive); bsdtar, which macOS has, takes the else branch
 	rm -f $@; v=$$(tar --version 2> /dev/null || true); if grep -q 'GNU tar' <<< "$$v"; then tar -C $(RELEASE_DIR) --owner=0 --group=0 --sort=name -czf $@ $(RELEASE_NAME); \
 	else tar -C $(RELEASE_DIR) --uid 0 --gid 0 -czf $@ $(RELEASE_NAME); fi
 $(DIST)/SHA256SUMS: $(DIST)/$(RELEASE_NAME).tar.gz

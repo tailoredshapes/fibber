@@ -73,7 +73,7 @@ echo "$TABLE" | while IFS='|' read -r label dir args md5; do
   cflags=; grep -q -e '-ffp-contract=off' "$d/README.md" 2>/dev/null && cflags=-ffp-contract=off
   gcc -O3 -march=native $cflags -o "$b/c" "$cs" -lm || continue
   rm -rf "$b/java"; mkdir -p "$b/java"; javac -d "$b/java" "$javas" || continue
-  jclass=$(sed -n 's/^\(public \)\{0,1\}\(final \)\{0,1\}class[[:space:]]\+\([A-Za-z0-9_$]*\).*/\3/p' "$javas" | head -1)
+  jclass=$(sed -n -E 's/^(public )?(final )?class[[:space:]]+([A-Za-z0-9_$]*).*/\3/p' "$javas" | head -1)
   for c in $(echo "$cpus" | tr ',' ' '); do
     tc=$(cpu_env "$c")
     for kind in scalar simd; do

@@ -1,4 +1,5 @@
 #!/bin/bash
+# linux-only-file: needs the Linux libcrypto.so.3 through ldconfig and LD_PRELOAD; not part of the Mac gate
 # Benchmark of the native TLS 1.3 client (fib.tls over the OpenSSL driver) against `openssl s_client`, `openssl s_time` and curl, all to the same `openssl s_server` on localhost:
 # handshake latency (new connections, no resumption) and bulk download throughput (64 KiB reads) for AES-128-GCM and ChaCha20-Poly1305. Prints the commands it runs and the
 # numbers it measured; docs/shootout/tls.md records one run. Not tuned: this is the first measurement, correctness came first.

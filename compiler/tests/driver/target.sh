@@ -16,6 +16,7 @@ ck "x86-64-v3: the target form is the first line" "$(FIB_TARGET_CPU=x86-64-v3 "$
 host=$(env -u FIB_TARGET_CPU "$s2" emit "$T/plain.fib" | head -1)
 case $host in
   '(target (cpu "'*'") (features "'*'"))') echo "ok   unset: the host's CPU and its features: ${host:0:60}..." ;;
+  '(target (cpu "apple-'*'"))') [ "$(uname -s)" = Darwin ] && echo "ok   unset: the host's CPU (Apple Silicon: a named CPU, no feature list): $host" || { echo "FAIL unset: apple CPU on $(uname -s): [$host]"; bad=1; } ;;
   *) echo "FAIL unset: wanted the host's target form, got [$host]"; bad=1 ;;
 esac
 lanes() { # CPU TYPE LANES: a function that takes TYPE and returns the explicit vector of LANES; the program is checked (emit is rejected or not)

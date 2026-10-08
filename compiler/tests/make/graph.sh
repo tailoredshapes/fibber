@@ -11,6 +11,8 @@
 #      stamp, the real one does (the check can fail: it fails on the planted copy)
 #   7  a stamp is not written when its command fails, and a target a failed recipe changed is removed (.DELETE_ON_ERROR)
 #   8  `make -n gate` runs no download when the seed is in place (no curl, wget, gh release download in the dry run)
+#  10  `make mac-check`'s stamps are the full gate's less the tools and stages of compiler/tests/expected-macos.txt (a listed tool is not run, an unlisted one is; the check
+#      fails on a planted extra line and on a listed name that is no tool)
 # usage: compiler/tests/make/graph.sh [SCRATCH]     (run anywhere; make 4 is needed)
 set -u
 # The test runs as a tool of the gate, inside make's environment (-j, GATE_FRESH, FIBC=F): none of it belongs to the graph under test.
@@ -44,25 +46,25 @@ stamps=$(M -n -p 2> /dev/null | sed -n 's/^FULL_STAMPS := //p' | head -n 1)
 [ -n "$stamps" ] || { echo "graph.sh: could not read FULL_STAMPS"; exit 2; }
 
 # 1 help names every public target
-phony=$(grep -h '^\.PHONY:' Makefile mk/*.mk | sed 's/^\.PHONY://' | tr ' ' '\n' | grep -v '^$' | grep -v -E '^(FORCE|gate-stamps|quick-stamps|gate-report|tools-list|mutants-list)$' | LC_ALL=C sort -u)
+phony=$(grep -h '^\.PHONY:' Makefile mk/*.mk | sed 's/^\.PHONY://' | tr ' ' '\n' | grep -v '^$' | grep -v -E '^(FORCE|gate-stamps|quick-stamps|gate-report|mac-stamps|mac-report|tools-list|mutants-list)$' | LC_ALL=C sort -u)
 listed=$(M help | awk 'NR > 2 { print $1 }' | LC_ALL=C sort -u)
 missing=$(comm -23 <(echo "$phony") <(echo "$listed"))
 if [ -z "$missing" ]; then ok "1 make help lists every public target ($(echo "$phony" | wc -l))"; else fail "1 make help misses: $(echo "$missing" | tr '\n' ' ')"; fi
 
 # 2 nothing changed: up to date, no recipe
 if M -q gate-stamps; then ok "2a make -q gate-stamps: up to date"; else fail "2a make -q gate-stamps says something is out of date on fake products newer than the tree"; fi
-out=$(M -n gate-stamps 2>&1); rc=$?; n=$(echo "$out" | grep -c -v '^make\|^$' || true)
+out=$(M -n gate-stamps 2>&1); rc=$?; n=$(echo "$out" | grep -c -v -E '^(g?make|$)' || true)
 if [ "$rc" -eq 0 ] && [ "$n" -eq 0 ]; then ok "2b make -n gate-stamps runs no recipe"; else fail "2b make -n gate-stamps (exit $rc) would run $n lines: $(echo "$out" | head -3)"; fi
 
 # 3 one tool stamp older than its script: only that recipe runs
-touch -d '-1 day' "$B/tools/gen-skeleton.ok"
-run=$(M -n gate-stamps | grep -v '^make')
+touch -t 200001010000 "$B/tools/gen-skeleton.ok"
+run=$(M -n gate-stamps | grep -v -E '^g?make')
 if echo "$run" | grep -q 'tests/gen/skeleton.sh' && [ "$(echo "$run" | grep -c 'rm -f ')" -eq 1 ]; then ok "3 an old tool stamp reruns alone (1 recipe: gen-skeleton)"; else fail "3 expected exactly the gen-skeleton recipe, got: $(echo "$run" | grep -c 'rm -f ') recipes"; fi
 touch "$B/tools/gen-skeleton.ok"
 
 # 4 F older than a compiler source: F rebuilds and everything downstream reruns
-touch -d '-1 day' "$B/F"
-run=$(M -n gate-stamps | grep -v '^make')
+touch -t 200001010000 "$B/F"
+run=$(M -n gate-stamps | grep -v -E '^g?make')
 for want in 'build compiler/fibc.fib' 'cases cases/stdlib' 'golden.sh' 'tests/gen/skeleton.sh' 'adr --strict'; do
   echo "$run" | grep -q -- "$want" || { fail "4 with F out of date, nothing runs for: $want"; want=; }
   [ -n "$want" ] && ok "4 with F out of date the dry run has: $want"
@@ -71,8 +73,8 @@ touch "$B/F"; sleep 0.05; touch "$B"/*.ok "$B"/golden/*.ok "$B"/tools/*.ok "$B"/
 
 # 5 one stdlib case newer than its shard's table: that shard reruns, no other
 first=$(M -n -p 2> /dev/null | sed -n 's/^NAMES_stdlib.3 := //p' | head -n 1 | awk '{print $1}')
-touch -d '-1 day' "$B/cases/stdlib.3.txt"
-run=$(M -n gate-stamps | grep -v '^make' | grep -c 'cases cases/stdlib' || true)
+touch -t 200001010000 "$B/cases/stdlib.3.txt"
+run=$(M -n gate-stamps | grep -v -E '^g?make' | grep -c 'cases cases/stdlib' || true)
 if [ "$run" -eq 1 ]; then ok "5 an old shard table reruns alone (shard 3 of stdlib, first case $first)"; else fail "5 expected 1 stdlib shard to rerun, got $run"; fi
 touch "$B/cases/stdlib.3.txt"; sleep 0.05; touch "$B/cases/full.ok"
 
@@ -80,7 +82,7 @@ touch "$B/cases/stdlib.3.txt"; sleep 0.05; touch "$B/cases/full.ok"
 cp Makefile "$S/Makefile"; cp mk/*.mk "$S/mk/"
 sed -i 's|^$(TOOLS_DIR)/$(1).ok: $(F) $(call after_bar|$(TOOLS_DIR)/$(1).ok: $(call after_bar|' "$S/mk/tools.mk"
 grep -q '^$(TOOLS_DIR)/$(1).ok: $(call after_bar' "$S/mk/tools.mk" || { fail "6 the plant did not take (the tool rule changed shape?)"; }
-touch -d '-1 day' "$B/F"
+touch -t 200001010000 "$B/F"
 real=$(M -n "$B/tools/gen-skeleton.ok" | grep -c 'tests/gen/skeleton.sh' || true)
 planted=$(make --no-print-directory -f "$S/Makefile" BUILD="$B" -n "$B/tools/gen-skeleton.ok" | grep -c 'tests/gen/skeleton.sh' || true)
 if [ "$real" -eq 1 ] && [ "$planted" -eq 0 ]; then ok "6 a tool stamp without its F prerequisite is caught: the real graph reruns it after F, the planted copy does not"
@@ -110,7 +112,7 @@ cat > "$T/fakeF" <<'FAKE'
 #!/bin/bash
 # fake `F cases DIR [--only NAME..] [-j N]`: one row per case asked for (all of DIR without --only), then the count line
 dir=$2; shift 2; names=()
-if [ "${1:-}" = --only ]; then shift; while [ $# -gt 0 ] && [ "$1" != -j ]; do names+=("$1"); shift; done; else mapfile -t names < <(ls "$dir"); fi
+if [ "${1:-}" = --only ]; then shift; while [ $# -gt 0 ] && [ "$1" != -j ]; do names+=("$1"); shift; done; else while IFS= read -r n; do names+=("$n"); done < <(ls "$dir"); fi
 echo "case  status  detail"; for n in "${names[@]}"; do echo "$n pass"; done
 echo; echo "${#names[@]} cases: ${#names[@]} pass, 0 fail, 0 pending, 0 header error"
 FAKE
@@ -131,6 +133,17 @@ if [ "$n" -eq 0 ]; then ok "9 nothing changed: no shard reruns"; else fail "9 no
 echo "; new" > "$T/cases/stdlib/115-new.fib"; shards; check_deal "a case added in the middle"
 mv "$T/cases/stdlib/140-e.fib" "$T/cases/stdlib/141-e.fib"; shards; check_deal "a case renamed"
 rm "$T/cases/stdlib/100-a.fib"; shards; check_deal "a case deleted"
+
+# 10: the Mac gate is the gate less the expected-macos.txt list (compare the stamp lists make prints; nothing is built)
+mac=$(M -n -p 2> /dev/null | sed -n 's/^MAC_STAMPS := //p' | head -n 1); full=$(M -n -p 2> /dev/null | sed -n 's/^TOOLS_FULL_STAMPS := //p' | head -n 1)
+skip=$(awk '$1 == "tool" { print $2 }' compiler/tests/expected-macos.txt)
+for t in $skip; do
+  case " $full " in *" $B/tools/$t.ok "*) ;; *) fail "10 expected-macos.txt names $t, which is no tool of the gate"; continue ;; esac
+  case " $mac " in *" $B/tools/$t.ok "*) fail "10 $t is listed in expected-macos.txt, yet mac-check would run it" ;; *) ok "10 mac-check skips $t (expected-macos.txt)" ;; esac
+done
+for t in lint-portable gen-skeleton sh-driver-cli; do case " $mac " in *" $B/tools/$t.ok "*) ok "10 mac-check runs $t" ;; *) fail "10 mac-check does not run $t (a tool nobody listed)" ;; esac; done
+# the plant: a listed name that is no tool must be caught by the same test
+case " $full " in *" $B/tools/no-such-tool.ok "*) fail "10 the plant no-such-tool is a tool?" ;; *) ok "10 plant: a listed name that is no tool is not in the gate (the loop above would fail on it)" ;; esac
 
 [ -n "${KEEP:-}" ] || rm -rf "$S"
 echo "graph: $bad failed"

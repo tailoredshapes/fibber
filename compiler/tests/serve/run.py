@@ -12,7 +12,9 @@ import json, os, random, shutil, socket, subprocess, sys, tempfile, threading, t
 fibc = os.path.abspath(os.environ.get('GATE_REAL_FIBC') or sys.argv[1])
 root = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else os.getcwd()
 work = tempfile.mkdtemp(prefix='serve-test-')
-sock = os.path.join(work, 's.sock')
+# a Unix socket path is at most 103 bytes on macOS (107 on Linux): the sockets live in a short directory, whatever TMPDIR is
+sockdir = work if len(work) < 70 else tempfile.mkdtemp(prefix='fs-', dir='/tmp')   # /tmp only when TMPDIR is deep
+sock = os.path.join(sockdir, 's.sock')
 failed = []
 
 def check(name, cond, why=''):
@@ -20,8 +22,10 @@ def check(name, cond, why=''):
     else: print('FAIL %s: %s' % (name, why)); failed.append(name)
 
 def limit():
+    if sys.platform != 'linux': return   # macOS refuses RLIMIT_AS (the preexec_fn fails and the server never starts)
     import resource
-    resource.setrlimit(resource.RLIMIT_AS, (16000000 * 1024, 16000000 * 1024))
+    try: resource.setrlimit(resource.RLIMIT_AS, (16000000 * 1024, 16000000 * 1024))
+    except (ValueError, OSError): pass
 
 env = dict(os.environ, FIBC_SERVE_DEBUG='1', FIB_LIB=os.environ.get('FIB_LIB', os.path.join(root, 'lib')))
 
@@ -97,7 +101,7 @@ try:
     r2 = ask({'op': 'check', 'file': P('main.fib'), 'roots': ROOTS})
     check('an edited dependency is seen: the dependent no longer checks (stale cache is not served)', r2['ok'] is False and r2['stats']['verdict'] is False and len(r2['diagnostics']) > 0, r2)
     check('only the modules from the edit on are expanded again', 0 < r2['stats']['expanded'] < r2['stats']['modules'] and r2['stats']['reused'] > 0, r2['stats'])
-    cold = subprocess.run([fibc, '--server', 'check', P('main.fib'), '-I', proj, '--socket', os.path.join(work, 'nobody.sock'), '-q'], capture_output=True, text=True, cwd=root, env=env, preexec_fn=limit)
+    cold = subprocess.run([fibc, '--server', 'check', P('main.fib'), '-I', proj, '--socket', os.path.join(sockdir, 'nobody.sock'), '-q'], capture_output=True, text=True, cwd=root, env=env, preexec_fn=limit)
     warm = client('check', P('main.fib'), '-I', proj, '-q')
     check('the warm server and a cold process give the same diagnostics for the edited program', cold.returncode == 3 and cold.stderr == warm.stderr and cold.stderr != '', (cold.stderr, warm.stderr))
     r3 = ask({'op': 'check', 'file': P('lib/b.fib'), 'roots': ROOTS}); check('the dependent module itself is rejected too', r3['ok'] is False, r3)
@@ -127,7 +131,7 @@ try:
     c = client('check', P('bad.fib')); check('client check prints rejected: and the diagnostic, exit 3', c.returncode == 3 and 'rejected:' in c.stderr and P('bad.fib') + ':2:26' in c.stderr, (c.returncode, c.stderr))
     c = client('run', P('args.fib'), '--', 'q'); check('client run prints stdout and exits with the status', c.returncode == 0 and c.stdout == 'args 1 q\n3\n', (c.returncode, c.stdout, c.stderr))
     c = client('eval', '(+ 1 2)'); check('client eval prints the value', c.returncode == 0 and c.stdout.strip() == '3', (c.returncode, c.stdout, c.stderr))
-    c = subprocess.run([fibc, '--server', 'check', P('bad.fib'), '--socket', os.path.join(work, 'nobody.sock')], capture_output=True, text=True, cwd=root, env=env, preexec_fn=limit)
+    c = subprocess.run([fibc, '--server', 'check', P('bad.fib'), '--socket', os.path.join(sockdir, 'nobody.sock')], capture_output=True, text=True, cwd=root, env=env, preexec_fn=limit)
     check('with no server the client runs the ordinary check here (same diagnostic, same status)', c.returncode == 3 and P('bad.fib') + ':2:26' in c.stderr and 'running here' in c.stderr, (c.returncode, c.stderr))
 
     # ---- eval sessions
@@ -204,6 +208,6 @@ try:
     check('the server exits 0 after shutdown and removes its socket', code == 0 and not os.path.exists(sock), (code, os.path.exists(sock)))
 finally:
     if srv.poll() is None: srv.kill()
-    shutil.rmtree(work, ignore_errors=True)
+    shutil.rmtree(work, ignore_errors=True); shutil.rmtree(sockdir, ignore_errors=True)
 print('serve tests: %s' % ('FAILED (%d)' % len(failed) if failed else 'ok'))
 sys.exit(1 if failed else 0)

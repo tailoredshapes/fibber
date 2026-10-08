@@ -1,4 +1,5 @@
 #!/bin/bash
+# linux-only-file: tests the x86-64 start-up CPU check against /proc/cpuinfo; the Mac is arm64 (skipped: compiler/tests/expected-macos.txt)
 # docs/adr/0008: an x86-64 Linux executable checks at start that the CPU has the features it was built for (emit.cpucheck) and otherwise ends with
 #   trap: this program needs CPU (AVX2, FMA); this CPU lacks: ..
 # (status 134) instead of SIGILL somewhere later. Checked here:

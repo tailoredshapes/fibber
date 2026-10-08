@@ -55,7 +55,7 @@ for n in $names; do
   if ! build_bench "$n"; then printf '%-14s build FAILED (%s)\n' "$n" "$work/$n.build.log"; bad=1; continue; fi
   ts=(); sum=
   for i in $(seq "$runs"); do
-    /usr/bin/time -f "%e" -o "$work/t" bash -c "ulimit -v 16000000; exec \"$work/$n\"" > "$work/stdout" 2> "$work/stderr"
+    /usr/bin/time -f "%e" -o "$work/t" bash -c "ulimit -v 16000000; exec \"$work/$n\"" > "$work/stdout" 2> "$work/stderr"   # linux-only: GNU time -f/-o for wall seconds and peak memory (BSD time has -l)
     ts+=("$(tail -n 1 "$work/t")"); s=$(sha1sum < "$work/stdout" | cut -c1-12)
     if [ -n "$sum" ] && [ "$s" != "$sum" ]; then sum=UNSTABLE; else sum=$s; fi
   done

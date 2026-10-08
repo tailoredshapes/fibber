@@ -17,7 +17,18 @@ set -u
 root=$(cd "$(dirname "$0")/.." && pwd); cd "$root"
 llvm=${MAC_LLVM:-/opt/homebrew/opt/llvm@21}; scratch=${MAC_SCRATCH:-$HOME/fibber-a64-scratch/check}; mkdir -p "$scratch/tmp"
 export FIB_LIB=$root/lib TMPDIR=$scratch/tmp
-jobs=${JOBS:-8}; quick=; [ "${1:-}" = --quick ] && quick=1
+jobs=${JOBS:-8}; quick=; withf=
+FB=$scratch/F
+while [ $# -gt 0 ]; do
+  case $1 in
+    --quick) quick=1 ;;
+    --with-f) withf=1; FB=${2:?--with-f needs the path of a stage 2 fibc}; shift ;;
+    *) echo "usage: scripts/mac-check.sh [--quick] [--with-f F]" >&2; exit 2 ;;
+  esac
+  shift
+done
+# the shims macOS needs (timeout, flock, sed -i, ..): scripts/portable
+. "$root/scripts/portable/env.sh"
 bad=0
 step() { local n=$1; shift; if "$@"; then echo "ok   step $n"; else echo "FAIL step $n"; bad=$((bad+1)); fi; }
 # KNOWN: cases that fail on the Mac for a named reason (docs/design/aarch64.md 6.3); anything else that fails is new.
@@ -28,23 +39,23 @@ s1() {
   [ "$(uname -m)" = arm64 ] || { echo "  not arm64: $(uname -m)"; return 1; }
   command -v cc >/dev/null || { echo "  no cc: xcode-select --install"; return 1; }
   [ -e "$llvm/lib/libLLVM-21.dylib" ] || { echo "  no $llvm/lib/libLLVM-21.dylib: brew install llvm@21 (not llvm: that is 22)"; return 1; }
-  SEED=$(seed); [ -n "$SEED" ] || { echo "  no seed fibc: set FIBC (see the header of this script)"; return 1; }
+  if [ -n "$withf" ]; then SEED=$FB; else SEED=$(seed); fi; [ -n "$SEED" ] || { echo "  no seed fibc: set FIBC (see the header of this script)"; return 1; }
   "$SEED" --version || { echo "  the seed does not run"; return 1; }
 }
 build_with() { "$1" build compiler/fibc.fib -I compiler -I lib -L "$llvm/lib" -l LLVM-21 -o "$2"; }
-s2() { build_with "$SEED" "$scratch/F" 2> "$scratch/build.err" || { tail -5 "$scratch/build.err"; return 1; }; "$scratch/F" --version; }
+s2() { build_with "$SEED" "$FB" 2> "$scratch/build.err" || { tail -5 "$scratch/build.err"; return 1; }; "$FB" --version; }
 s3() {
-  build_with "$scratch/F" "$scratch/F3" 2> "$scratch/build3.err" || { tail -5 "$scratch/build3.err"; return 1; }
-  "$scratch/F" emit --exe -I compiler -I lib compiler/fibc.fib > "$scratch/e2.lir" && "$scratch/F3" emit --exe -I compiler -I lib compiler/fibc.fib > "$scratch/e3.lir" || return 1
+  build_with "$FB" "$scratch/F3" 2> "$scratch/build3.err" || { tail -5 "$scratch/build3.err"; return 1; }
+  "$FB" emit --exe -I compiler -I lib compiler/fibc.fib > "$scratch/e2.lir" && "$scratch/F3" emit --exe -I compiler -I lib compiler/fibc.fib > "$scratch/e3.lir" || return 1
   cmp "$scratch/e2.lir" "$scratch/e3.lir" || { echo "  F and F3 emit different lIR"; return 1; }
 }
 s4() {
-  F=$scratch/F; echo '(defun main () -> i64 (do (println "hello from fibber on aarch64") 0))' > "$scratch/hello.fib"
+  F=$FB; echo '(defun main () -> i64 (do (println "hello from fibber on aarch64") 0))' > "$scratch/hello.fib"
   "$F" build "$scratch/hello.fib" -o "$scratch/hello" 2>&1 && [ "$("$scratch/hello")" = "hello from fibber on aarch64" ] || { echo "  AOT hello failed"; return 1; }
   [ "$("$F" run "$scratch/hello.fib" | head -1)" = "hello from fibber on aarch64" ] || { echo "  JIT hello failed"; return 1; }
 }
 cases() { # DIR [--only ..]: the `fibc cases` table; the lines that are not pass/open are printed; fails on a FAIL line not in KNOWN
-  "$scratch/F" cases "$@" -j "$jobs" > "$scratch/cases.out" 2>&1
+  "$FB" cases "$@" -j "$jobs" > "$scratch/cases.out" 2>&1
   local fails new= f n
   fails=$(grep -E ' FAIL ' "$scratch/cases.out" | awk '{print $1}')
   for f in $fails; do n=${f%%-*}; case " $KNOWN " in *" $n "*) ;; *) new="$new $f" ;; esac; done
@@ -55,15 +66,21 @@ s5() { cases cases/ownership; }
 s6() { if [ -n "$quick" ]; then cases cases/stdlib --only 62 70 74 42 36; else cases cases/stdlib; fi; }
 s7() {
   local c=cases/stdlib/6223-vectors-cross-calls-and-loops-at-odd-widths.fib o st r=0
-  for o in 0 1 2; do "$scratch/F" run -O $o -I cases/stdlib/support "$c" > /dev/null 2>&1; st=$?; echo "  JIT -O $o: exit $st"; [ $st -eq 0 ] || r=1; done
+  for o in 0 1 2; do "$FB" run -O $o -I cases/stdlib/support "$c" > /dev/null 2>&1; st=$?; echo "  JIT -O $o: exit $st"; [ $st -eq 0 ] || r=1; done
   for o in 0 2; do
-    "$scratch/F" build -I cases/stdlib/support "$c" -o "$scratch/v6223" -O $o > /dev/null 2>&1 && "$scratch/v6223" > /dev/null 2>&1; st=$?; echo "  AOT -O $o: exit $st"; [ $st -eq 0 ] || r=1
+    "$FB" build -I cases/stdlib/support "$c" -o "$scratch/v6223" -O $o > /dev/null 2>&1 && "$scratch/v6223" > /dev/null 2>&1; st=$?; echo "  AOT -O $o: exit $st"; [ $st -eq 0 ] || r=1
   done
-  F="$scratch/F" compiler/tests/native/a64-o0.sh || r=1
+  F="$FB" compiler/tests/native/a64-o0.sh || r=1
   return $r
 }
-step 1 s1 || exit 1
-step 2 s2; [ -x "$scratch/F" ] || exit 1
-step 3 s3; step 4 s4; step 5 s5; step 6 s6; step 7 s7
+if [ -n "$withf" ]; then   # `make mac-check` built F, ran the fixed point and the case directories: what is left is this machine's own checks (steps 1, 4, 7)
+  [ -x "$FB" ] || { echo "no F at $FB"; exit 2; }
+  step 1 s1 || exit 1
+  step 4 s4; step 7 s7
+else
+  step 1 s1 || exit 1
+  step 2 s2; [ -x "$FB" ] || exit 1
+  step 3 s3; step 4 s4; step 5 s5; step 6 s6; step 7 s7
+fi
 echo "mac-check: $bad step(s) failed"
 exit $bad

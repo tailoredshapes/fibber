@@ -4,11 +4,12 @@
 ;; audit: clean
 ;; stage: 2
 ;; roots: ../../lib support
+;; On macOS the first half (a child that outruns its stack) is expected to fail, scripts/ci-stage2.expected-darwin: the child has no signal stack there and dies of SIGILL.
 ;; A forked child inherits the handler and the signal stack of the thread that forked it (the main stack's thread). A child that outruns its stack says
 ;; `trap: stack overflow` on its standard error and ends with status 134, as a trap does. A child that reads a page it may not (here PROT_NONE: not a
 ;; stack, and no guard page) must not be taken for a recursion: it says `fatal signal 11 at 0x` and the address, then dies of the signal itself
-;; (status 139, 128 plus SIGSEGV). Killed by: scripts/mutant-stack-guard.sh `any-fault` (the wild read would read as an overflow) and `no-handler`.
-(ns main (:use tl.check) (:require [fib.os :as os]))
+;; (status 139, 128 plus SIGSEGV; on Darwin the read of a PROT_NONE page is SIGBUS, 10, status 138). Killed by: scripts/mutant-stack-guard.sh `any-fault` (the wild read would read as an overflow) and `no-handler`.
+(ns main (:use tl.check) (:require [fib.os :as os] [fib.os.platform.detect :as pd]))
 
 (defun scratch () -> str
   (match (os/create-temp-directory (str (os/temp-directory) "/fibstack-XXXXXX")) ((Ok d) d) ((Err _) "/tmp")))
@@ -21,22 +22,27 @@
 (defun climb (n: i64) -> i64
   (if (= n 0) 0 (- (* 2 n) (climb (- n 1)))))
 
+(defun darwin? () -> bool (= (pd/name (pd/current)) "Darwin"))
+
 (extern mmap :private (i64 i64 i32 i32 i32 i64) -> ptr)
 
-;; A read of a page mapped PROT_NONE (MAP_PRIVATE | MAP_ANONYMOUS): a fault that is not on a stack.
+;; A read of a page mapped PROT_NONE (MAP_PRIVATE | MAP_ANONYMOUS: 0x22 on Linux, 0x1002 on Darwin, where 0x22 is no valid flag set and mmap
+;; fails with -1): a fault that is not on a stack.
 (defun wild () -> i64
-  (unsafe (load-i64 (mmap 0 4096 0i32 34i32 -1i32 0))))
+  (unsafe (load-i64 (mmap 0 4096 0i32 (if (= (pd/name (pd/current)) "Darwin") 4098i32 34i32) -1i32 0))))
 
 (defun main () -> i64
   (let [c (checks) dir (scratch)
+        stray-status (if (darwin?) 138 139)
+        stray-msg (if (darwin?) "fatal signal 10 at 0x" "fatal signal 11 at 0x")
         deep (run dir "deep" (fn () (str (climb 1000000000))))
         stray (run dir "stray" (fn () (str (wild))))]
     (do (check c (= (. deep status) 134))
         (check c (= (. deep result) nil))
         (check c (some? (str-find (. deep err) "trap: stack overflow" 0)))
-        (check c (= (. stray status) 139))
+        (check c (= (. stray status) stray-status))
         (check c (= (. stray result) nil))
-        (check c (some? (str-find (. stray err) "fatal signal 11 at 0x" 0)))
+        (check c (some? (str-find (. stray err) stray-msg 0)))
         (check c (nil? (str-find (. stray err) "stack overflow" 0)))
         (os/remove-directory dir)
         (checks-result c))))

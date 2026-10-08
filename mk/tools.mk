@@ -12,6 +12,7 @@ tool_env := env FIBC=$(F_ABS) FUZZ_SELFTEST_DEADLINE=$(FUZZ_SELFTEST_DEADLINE) R
 tool_fibref-skeleton := $(T)/fibref/skeleton.sh $(TOOLS_OUT)/fibref-skeleton | $(wildcard $(T)/fibref/*) $(wildcard compiler/fibref/*.fib compiler/fibref/*/*.fib)
 tool_gen-skeleton := $(T)/gen/skeleton.sh $(TOOLS_OUT)/gen-skeleton | $(wildcard $(T)/gen/*) $(wildcard compiler/gen/*.fib compiler/gen/*/*.fib)
 tool_lint-pipefail := scripts/lint-pipefail.sh | $(shell find scripts $(T) .github -type f \( -name '*.sh' -o -name '*.yml' \)) Makefile $(wildcard mk/*.mk)
+tool_lint-portable := scripts/lint-portable.sh | $(shell find scripts $(T) -type f \( -name '*.sh' -o -name '*.mk' \)) Makefile $(wildcard mk/*.mk)
 tool_sh-driver-check-lib := $(T)/driver/check-lib.sh $(F_ABS) | $(T)/driver/check-lib.sh $(wildcard $(T)/driver/linklib/*)
 tool_units-emit := env UNITS_DIR=emit $(T)/units.sh $(TOOLS_OUT)/units-emit | $(T)/units.sh $(T)/units.run $(T)/units.pending $(T)/units.elsewhere $(wildcard $(T)/emit/unit-*.fib)
 tool_units-own := env UNITS_DIR=own $(T)/units.sh $(TOOLS_OUT)/units-own | $(T)/units.sh $(T)/units.run $(T)/units.pending $(T)/units.elsewhere $(wildcard $(T)/own/unit-*.fib)
@@ -53,7 +54,7 @@ tool_deps := $(T)/deps/run.sh $(F_ABS) | $(wildcard $(T)/deps/*)
 tool_sh-native-gpu-emit := $(T)/native/gpu-emit.sh | $(T)/native/gpu-emit.sh $(wildcard examples/gpu/*) $(wildcard compiler/native/*.fib)
 tool_sh-make-graph := $(T)/make/graph.sh | $(wildcard $(T)/make/*) Makefile $(wildcard mk/*.mk)
 
-TOOLS_QUICK := fibref-skeleton gen-skeleton lint-pipefail sh-driver-check-lib sh-make-graph
+TOOLS_QUICK := fibref-skeleton gen-skeleton lint-pipefail lint-portable sh-driver-check-lib sh-make-graph
 TOOLS_FULL := $(TOOLS_QUICK) units-emit units-own units-types units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-emit-runtime sh-emit-defs-order sh-stack-stack \
   sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \

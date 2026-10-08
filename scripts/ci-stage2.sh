@@ -51,11 +51,11 @@ case_names() {
 # launch NAME LIMIT SHARDS: starts the run of cases/NAME in the background. With one shard it is `cases DIR [--only ..] [-j N]` as ever; with
 # K the cases are dealt out in turn to K processes. A shard's time limit counts the wait for its slot.
 launch() {
-  local name=$1 limit=$2 k=$3 dir=cases/$1 i j
+  local name=$1 limit=$2 k=$3 dir=cases/$1 i j line
   local -a names=() jflag=()
   [ -n "${CI_STAGE2_JOBS:-}" ] && jflag=(-j "$CI_STAGE2_JOBS")
-  if [ "$name" = stdlib ] && [ -n "${CI_STAGE2_ONLY:-}" ]; then mapfile -t names < "$CI_STAGE2_ONLY"
-  elif [ "$k" -gt 1 ]; then mapfile -t names < <(case_names "$dir"); fi
+  if [ "$name" = stdlib ] && [ -n "${CI_STAGE2_ONLY:-}" ]; then while IFS= read -r line; do names+=("$line"); done < "$CI_STAGE2_ONLY"
+  elif [ "$k" -gt 1 ]; then while IFS= read -r line; do names+=("$line"); done < <(case_names "$dir"); fi
   if [ "${#names[@]}" -gt 0 ] && [ "${#names[@]}" -lt "$k" ]; then k=${#names[@]}; fi
   echo "$k" > "$out/$name.nshards"; echo "${#names[@]}" > "$out/$name.nnames"
   for ((i = 0; i < k; i++)); do
@@ -144,7 +144,10 @@ for pair in "${pairs[@]}"; do
   fi
 done
 sort -o "$out/actual" "$out/actual"
-grep -v -e '^#' -e '^[[:space:]]*$' scripts/ci-stage2.expected | sort > "$out/expected"
+{ grep -v -e '^#' -e '^[[:space:]]*$' scripts/ci-stage2.expected
+  # macOS: cases that fail there for a named reason in the header of the case or in the file (scripts/ci-stage2.expected-darwin); same format
+  if [ "$(uname -s)" = Darwin ] && [ -f scripts/ci-stage2.expected-darwin ]; then grep -v -e '^#' -e '^[[:space:]]*$' scripts/ci-stage2.expected-darwin; fi
+} | sort > "$out/expected"
 if [ -n "$sample" ]; then   # a sample: only the expected lines of the stdlib cases that ran, all of the other directories'
   awk '$1 ~ /\.fib$/ { print "cases/stdlib/" $1 }' "$out/$sample.txt" | sort > "$out/ran"
   awk 'NR==FNR { ran[$1]=1; next } $1 !~ /^cases\/stdlib\// || ($1 in ran)' "$out/ran" "$out/expected" > "$out/expected.sel"

@@ -56,6 +56,14 @@ libm, libstdc++, libgcc_s, libz and libzstd (`ldd bin/fibc` shows those
 and nothing else), and a C compiler (`cc`) for `fibc build`. To make a release
 yourself, see `scripts/package.sh`.
 
+**Building and testing on macOS (Apple Silicon).** The build is GNU Make 4 or later: macOS ships GNU Make 3.81 as `/usr/bin/make`, which the
+Makefile refuses with a message, so `brew install make` and run `gmake`. Also `brew install llvm@21` (keg-only; `llvm` alone is 22) and the
+Xcode command line tools. `gmake -j8 mac-check` is the gate for the Mac (mk/mac.mk): the full gate less the tools and stages that need Linux, each
+named with its reason in `compiler/tests/expected-macos.txt`, plus the machine checks of `scripts/mac-check.sh`; `MAC_QUICK=1` is the short set.
+The scripts assume GNU coreutils and bash 4; on a Mac `scripts/portable/` stands in (a `timeout`, `flock`, `nproc`, `sha256sum`, `sed -i` and `date +%N`
+that work there, and a `ulimit -v` that succeeds), which the Makefile puts on `PATH` itself and `. scripts/portable/env.sh` does for a script run by hand.
+`scripts/lint-portable.sh` fails the gate on any other Linux-only tool or bash 4 feature that is not marked `# linux-only: reason`.
+
 **Which CPU it needs.** `fibc` needs a 2013+ x86-64 CPU with AVX2 and FMA (x86-64-v3), or Apple
 Silicon/ARMv8, and on Linux glibc 2.33 or later. fibber supports only instruction sets with guaranteed tail calls and
 fused multiply-add (docs/adr/0008). On an older x86-64 CPU `fibc`, and every x86-64 program it

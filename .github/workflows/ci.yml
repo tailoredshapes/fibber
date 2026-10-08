@@ -57,3 +57,37 @@ jobs:
       - name: Native HTTP interoperability and TLS
         timeout-minutes: 10
         run: HTTP_FIBC="$PWD/build/F" HTTP_TEST_OUT="$RUNNER_TEMP/http" bash scripts/test-http.sh
+
+  # macOS (Apple Silicon, the macos-14 runner): `gmake mac-check` (mk/mac.mk): the gate less what macOS cannot run (compiler/tests/expected-macos.txt, each
+  # skip with its reason), plus the machine checks of scripts/mac-check.sh. The seed is SEED's darwin-arm64 row. UNTESTED ON THE RUNNER: the job was
+  # written from a run on an M1 Ultra (macOS 27, Homebrew llvm@21), not run on GitHub; a first run here may need the paths or the timeout adjusted.
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 5
+
+      # llvm@21 is keg-only (/opt/homebrew/opt/llvm@21; `llvm` alone is 22); make gives gmake (macOS has GNU Make 3.81, which the Makefile refuses)
+      - name: Install LLVM 21 and GNU Make
+        timeout-minutes: 15
+        run: brew install llvm@21 make
+
+      - name: The Mac gate (gmake mac-check)
+        timeout-minutes: 120
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gmake -k -j4 mac-stamps CASE_JOBS=4 LIMIT_STDLIB=3600 LIMIT_OWNERSHIP=1200 || true
+          gmake mac-report
+
+      - name: Keep the logs of a failed Mac gate
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-gate-logs
+          path: |
+            build/*.log
+            build/*/*.log
+            build/cases/*.txt
+            build/cases/*.err

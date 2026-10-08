@@ -121,9 +121,9 @@ timed_median() {
   RES_NOTE=""; RES_MD5="-"; RES_P=""
   for i in $(seq "$n"); do
     if [ "$lang" = fib ]; then
-      "${pre[@]}" /usr/bin/time -f '%e %U %M' -o "$tmp/t" timeout "$timeout_s" bash -c 'ulimit -v 16000000; exec "$@"' _ "$@" < "$input" > "$tmp/stdout" 2> "$tmp/stderr"
+      "${pre[@]}" /usr/bin/time -f '%e %U %M' -o "$tmp/t" timeout "$timeout_s" bash -c 'ulimit -v 16000000; exec "$@"' _ "$@" < "$input" > "$tmp/stdout" 2> "$tmp/stderr"   # linux-only: GNU time -f/-o for wall seconds and peak memory (BSD time has -l)
     else
-      "${pre[@]}" /usr/bin/time -f '%e %U %M' -o "$tmp/t" timeout "$timeout_s" "$@" < "$input" > "$tmp/stdout" 2> "$tmp/stderr"
+      "${pre[@]}" /usr/bin/time -f '%e %U %M' -o "$tmp/t" timeout "$timeout_s" "$@" < "$input" > "$tmp/stdout" 2> "$tmp/stderr"   # linux-only: GNU time -f/-o for wall seconds and peak memory (BSD time has -l)
     fi
     local rc=$?
     if [ $rc -ne 0 ]; then bad="exit status $rc: $(head -c 200 "$tmp/stderr" | tr '\n\t' '  ')"; break; fi
@@ -215,7 +215,7 @@ build_all() {  # NAME: builds the languages in $langs into $scratch; sets HAVE_<
     if [ -z "$s" ]; then BUILD_NOTE_java="no $name.java"
     else
       # the class to run: the first top-level `class NAME` of the file (binary-trees.java declares binarytrees)
-      JAVA_CLASS=$(sed -n 's/^\(public \)\{0,1\}\(final \)\{0,1\}\(abstract \)\{0,1\}class[[:space:]]\+\([A-Za-z0-9_$]*\).*/\4/p' "$s" | head -1)
+      JAVA_CLASS=$(sed -n -E 's/^(public )?(final )?(abstract )?class[[:space:]]+([A-Za-z0-9_$]*).*/\4/p' "$s" | head -1)
       [ -z "$JAVA_CLASS" ] && JAVA_CLASS=${name//-/}
       rm -rf "$scratch/java/$name"; mkdir -p "$scratch/java/$name"
       if javac -d "$scratch/java/$name" "$s" > "$tmp/build-java.log" 2>&1; then HAVE_java=1
@@ -232,7 +232,7 @@ build_all() {  # NAME: builds the languages in $langs into $scratch; sets HAVE_<
       CLJ_MODE=ns; CLJ_FILE=$s
       if grep -q -E '^\((when|if|apply|-main)[^;]*-main|^\(-main' "$s"; then CLJ_MODE=script
       else
-        CLJ_NS=$(sed -n 's/^(ns[[:space:]]\+\([^][[:space:]()]*\).*/\1/p' "$s" | head -1)
+        CLJ_NS=$(sed -n -E 's/^\(ns[[:space:]]+([^][[:space:]()]*).*/\1/p' "$s" | head -1)
       fi
       if [ "$CLJ_MODE" = ns ] && [ -z "$CLJ_NS" ]; then BUILD_NOTE_clj="$s: no top-level -main call and no (ns NAME ..) form"
       else

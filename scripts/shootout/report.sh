@@ -1,4 +1,5 @@
 #!/bin/bash
+# linux-only-file: the shootout report reads /proc/cpuinfo; the shootout is the Linux bench box's
 # Regenerates the results section of docs/shootout.md: runs scripts/shootout/run.sh (arguments are passed on:
 # names, --size, --langs, -n) and replaces what lies between the markers
 #   <!-- shootout:results:begin -->  and  <!-- shootout:results:end -->

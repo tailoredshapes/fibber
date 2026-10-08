@@ -1,4 +1,5 @@
 #!/bin/bash
+# linux-only-file: x86-64-v2/v3 runs and /proc/cpuinfo; the Mac is arm64 (skipped: compiler/tests/expected-macos.txt)
 # docs/adr/0008: `simd/fma` (exact, one rounding) on a target without FMA hardware is a compile-time warning at each call site, once, and a trap
 # with the same text at run time; never a libm call or an emulation. `simd/muladd` stays legal everywhere, and a `(has-fma)` dispatch on such a
 # target does not lower its fused branch (no warning for it). Checked here:

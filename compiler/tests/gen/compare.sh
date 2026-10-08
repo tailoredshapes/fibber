@@ -23,7 +23,7 @@ while IFS=$'\t' read -r seed size bytes hash model; do
   if [ $rc -ne 0 ]; then echo "seed $seed: exit $rc"; bad=$((bad + 1)); [ $bad -ge 10 ] && break; continue; fi
   got_model=$(tail -n 1 "$tmp/one" | sed 's/^;; model: //')
   sed '$d' "$tmp/one" > "$tmp/prog"
-  got_hash=$(sha256sum < "$tmp/prog" | cut -c1-16); got_bytes=$(wc -c < "$tmp/prog")
+  got_hash=$(sha256sum < "$tmp/prog" | cut -c1-16); got_bytes=$(wc -c < "$tmp/prog" | tr -d " ")
   if [ "$got_hash" != "$hash" ] || [ "$got_bytes" != "$bytes" ] || [ "$got_model" != "$model" ]; then
     echo "seed $seed size $size: want $bytes $hash $model; got $got_bytes $got_hash $got_model"
     bad=$((bad + 1)); [ $bad -ge 10 ] && break

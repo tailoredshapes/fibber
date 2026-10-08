@@ -74,11 +74,11 @@ if "$F" build "$H" -I examples/gpu --emit ptx -o "$T/x.ptx" 2> "$T/err"; then no
 if "$F" build --target nvptx64-nvidia-cuda "$K" -o "$T/x" 2> "$T/err"; then no "an executable for the kernel target was linked"; else ok "an executable for the kernel target: refused"; fi
 # a kernel built for a platform with no kernel target: refused (docs/design/decisions-2026-10-04.md, GPU); with the target: the executable, OUT.ptx, the PTX embedded
 cp "$K" "$T/p/"; cp "$H" "$T/p/host.fib"
-if "$F" build "$T/p/host.fib" -I "$T/p" -o "$T/host" 2> "$T/err"; then no "a program with kernels was built for the host without a kernel target"; else grep -q "fibc: the program has the kernels vadd, gemm, gemm-smem, assert-positive (defkernel) and x86_64-.*linux-gnu has no kernel target: build with --kernel-target nvptx64-nvidia-cuda" "$T/err" && ok "no kernel target: refused naming the kernels and the platform" || no "no-kernel-target text: $(cat "$T/err")"; fi
+if "$F" build "$T/p/host.fib" -I "$T/p" -o "$T/host" 2> "$T/err"; then no "a program with kernels was built for the host without a kernel target"; else grep -q -E "fibc: the program has the kernels vadd, gemm, gemm-smem, assert-positive \(defkernel\) and [a-z0-9_]+-[a-z]+-[a-z0-9.-]+ has no kernel target: build with --kernel-target nvptx64-nvidia-cuda" "$T/err" && ok "no kernel target: refused naming the kernels and the platform" || no "no-kernel-target text: $(cat "$T/err")"; fi
 if "$F" build "$T/p/host.fib" -I "$T/p" -o "$T/host" --kernel-target none 2> "$T/err"; then no "--kernel-target none built a program with kernels"; else grep -q "has no kernel target" "$T/err" && ok "--kernel-target none: refused" || no "kernel-target none text: $(cat "$T/err")"; fi
 if "$F" build "$T/p/host.fib" -I "$T/p" -o "$T/host" --kernel-target bogus 2> "$T/err"; then no "--kernel-target bogus was accepted"; else grep -q "not a kernel target" "$T/err" && ok "--kernel-target bogus: refused" || no "bogus text: $(cat "$T/err")"; fi
 if "$F" build "$T/p/host.fib" -I "$T/p" -o "$T/host" --kernel-target nvptx64-nvidia-cuda 2> "$T/err" && [ -s "$T/host.ptx" ] && grep -q "fib.kernel-sig gemm_smem" "$T/host.ptx"; then
-  "$T/host" > "$T/hostrun" 2>&1; n=$(wc -c < "$T/host.ptx")
+  "$T/host" > "$T/hostrun" 2>&1; n=$(wc -c < "$T/host.ptx" | tr -d " ")
   grep -q "program-ptx: $n bytes" "$T/hostrun" && ok "--kernel-target nvptx64-nvidia-cuda: the executable, host.ptx beside it ($n bytes) and the same PTX embedded (gpu/program-ptx)" || no "embedded PTX: $(cat "$T/hostrun")"
 else no "--kernel-target build: $(cat "$T/err")"; fi
 

@@ -84,7 +84,7 @@ while IFS='|' read -r name tool opts _rust globs; do
   names+=("$name")
   ( slot_acquire; run_suite "$name" "$tool" "$opts" "$globs" > "$out/res.$name"; echo $? > "$out/res.$name.status"; slot_release ) &
   running=$((running + 1))
-  if [ "$running" -ge "$jobs" ]; then wait -n; running=$((running - 1)); fi
+  while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do sleep 0.1; done
 done < <(suite_table)
 wait
 for name in "${names[@]}"; do cat "$out/res.$name"; [ "$(cat "$out/res.$name.status")" = 0 ] || bad=1; done

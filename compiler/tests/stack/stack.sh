@@ -55,6 +55,8 @@ build "$S/depthn.fib" "$S/depthn" && {
   expect "FIB_STACK_MB=2, 200000 frames" "$S/depthn" 134 "trap: stack overflow" FIB_STACK_MB=2 N=200000
   expect "FIB_STACK_MB=64, 200000 frames" "$S/depthn" 0 "" FIB_STACK_MB=64 N=200000
   for v in abc -1 9999999999 ""; do expect "FIB_STACK_MB='$v'" "$S/depthn" 134 "FIB_STACK_MB is not a whole number" FIB_STACK_MB="$v" N=10; done; }
+# O_RDWR|O_CREAT is 66 on Linux and 514 on Darwin; SIGBUS is 7 on Linux and 10 on Darwin (status 135 and 138)
+if [ "$(uname -s)" = Darwin ]; then oflags=514; bussig=10; busst=138; else oflags=66; bussig=7; busst=135; fi
 cat > "$S/bus.fib" <<'EOF'
 (ns main)
 (extern mmap :private (i64 i64 i32 i32 i32 i64) -> ptr)
@@ -71,8 +73,9 @@ cat > "$S/bus.fib" <<'EOF'
                 (let ((m (mmap 0 8192 3i32 1i32 fd 0)))
                   (do (ftruncate fd 0) (unlink path) (load-i64 m)))))))))
 EOF
+sed -i "s/66i32/${oflags}i32/" "$S/bus.fib"
 if build "$S/bus.fib" "$S/bus"; then
-  expect "SIGBUS is not a stack overflow" "$S/bus" 135 "fatal signal 7 at 0x" X=1
+  expect "SIGBUS is not a stack overflow" "$S/bus" $busst "fatal signal $bussig at 0x" X=1
 fi
 # a system that will not make the 256 MiB thread (an address-space limit) runs the program on the process's own stack, and still says so on overflow
 ( ulimit -v 200000
