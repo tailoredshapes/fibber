@@ -29,7 +29,10 @@ endef
 # a directory run in one shard (K = 1) is run without --only, as CI always ran it.
 define shard_rule
 NAMES_$(1).$(4) := $(call shard_of,$(6),$(3),$(4))
-$(CASES_DIR)/$(1).$(4).txt: $(F) $$(call case_files,$(2),$$(NAMES_$(1).$(4))) $(SUPPORT_FILES) | $(CASES_DIR)/
+# The shard's membership is a file (changed only when its content changes): the deal shifts when a case is added, renamed or removed, and a
+# table made for the old deal must not be taken for the new one.
+$$(call cfg_write,$(CASES_DIR)/$(1).$(4).list,$$(NAMES_$(1).$(4)))
+$(CASES_DIR)/$(1).$(4).txt: $(F) $(CASES_DIR)/$(1).$(4).list $$(call case_files,$(2),$$(NAMES_$(1).$(4))) $(SUPPORT_FILES) | $(CASES_DIR)/
 	$$(call run_shard,$(2),$(5),$(if $(or $(7),$(filter-out 1,$(3))),--only $$(NAMES_$(1).$(4)),))
 endef
 $(foreach k,$(call SHARD_IDX,$(SHARDS)),$(eval $(call shard_rule,stdlib,stdlib,$(SHARDS),$(k),$(LIMIT_STDLIB),$(STDLIB_NAMES))))

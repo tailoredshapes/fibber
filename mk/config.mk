@@ -74,6 +74,9 @@ BUILDER ?= $(SEED_FIBC)
 define stamp
 rm -f $@; t0=$$(date +%s); if { $(1); } > $(@:%.ok=%.log) 2>&1; then echo "$$(( $$(date +%s) - t0 ))" > $@; else echo "FAIL $@ (log: $(@:%.ok=%.log))"; tail -n 20 $(@:%.ok=%.log); exit 1; fi
 endef
+# $(call cfg_write,FILE,TEXT): at parse time, FILE holds TEXT; its mtime moves only when the content changes. A stamp or a table that depends on
+# FILE therefore reruns when the configuration (or a shard's membership) changes, and not otherwise; under -n and -q the file is the same.
+cfg_write = $(shell mkdir -p $(dir $(1)); echo '$(2)' | cmp -s - $(1) || echo '$(2)' > $(1))
 # $(call skip,REASON): the stamp says the stage was skipped, with the reason (a toolchain that is not there is no failure of the tree).
 define skip
 rm -f $@; echo "SKIPPED: $(1)" > $@; echo "$@: SKIPPED: $(1)"
