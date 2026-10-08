@@ -1,7 +1,7 @@
 // compiler/tests/native/gpu/wgsl_run.mjs: runs the WGSL of fib.gpu's atomics and reductions on a WebGPU device (Dawn through the `webgpu` npm package of
 // scripts/fetch-webgpu-tools.sh) and compares with the CPU, as cuda_run.py does for PTX. The launch follows the binding model of native.wgsl: group 0, binding 0 the
 // uniform of scalar parameters (4 bytes each), binding 1 the trap flag, bindings 2.. the pointer parameters; the workgroup size is the override constant wg_x.
-//   node wgsl_run.mjs reduce REDUCE.wgsl REF.txt | atomics ATOMICS.wgsl | badgrid REDUCE.wgsl | warp WARP.wgsl REF.txt | probe WARP.wgsl | f32atomics F32.wgsl
+//   node wgsl_run.mjs reduce REDUCE.wgsl REF.txt | atomics ATOMICS.wgsl | branch BRANCH.wgsl | badgrid REDUCE.wgsl | warp WARP.wgsl REF.txt | probe WARP.wgsl | f32atomics F32.wgsl
 // One line per check, `ok ...` or `FAIL ...`. Exit 0 when every check holds, 1 on a failure, 3 when there is no adapter or no package (the caller skips), 4 when the module says
 // `// fib.requires: subgroups` and the adapter lacks the feature (GPU-5: rejected by name; FIB_WEBGPU_NO_SUBGROUPS=1 plays an adapter without it).
 import { createRequire } from "node:module";
@@ -241,6 +241,31 @@ async function f32AtomicsMode(path) {
   check(!trapped && mm[0] === Math.max(...xf) && mm[1] === Math.min(...xf), `f32 atomic max/min n=${n}: device [${mm}] equal the CPU's [${Math.max(...xf)},${Math.min(...xf)}] exactly`);
 }
 
-if (mode === "reduce") await reduceMode(a, b); else if (mode === "atomics") await atomicsMode(a); else if (mode === "warp") await warpMode(a, b);
+// The kernels of branch.fib: a thread-dependent branch around a barrier in one function (the relooper, native.wgsl.func), against the CPU's answers.
+async function branchMode(path) {
+  const m = new Module(path);
+  for (const n of [99968, 100000]) {
+    const grid = Math.ceil(n / 128), len = grid * 128;
+    const data = Int32Array.from(lcg(len, 9), (v, i) => (i < n ? (v >>> 12) & 0xffff : 0));
+    const pd = m.buffer(data);
+    const run = async (name, outLen) => {
+      const out = m.buffer(new Int32Array(outLen));
+      const trapped = await m.launch(name, grid, 128, P(pd), P(out), I(n));
+      return trapped ? null : Array.from(await m.read(out, outLen, Int32Array));
+    };
+    const same = (got, want, what) => check(got !== null && got.length >= want.length && want.every((v, i) => got[i] === v), `${what} n=${n}: equals the CPU's (${got && got.slice(0, 3)}..)`);
+    const base = (i) => i - (i % 128);
+    if (n % 128 === 0) {
+      same(await run("rev", len), Array.from({ length: n }, (_, i) => data[base(i) + 127 - (i % 128)]), "rev (a thread-dependent load, a barrier, a read of another thread's slot)");
+      const par = Array.from(data, (v, i) => (i % 2 === 0 ? v + 1000 : v * 2));
+      same(await run("parity", len), Array.from({ length: len }, (_, i) => par[i ^ 1]), "parity (an if/else, a barrier after the join)");
+    } else {
+      same(await run("tree_sum", grid), Array.from({ length: grid }, (_, b) => data.slice(b * 128, (b + 1) * 128).reduce((x, y) => x + y, 0)), `tree-sum (${grid} block sums of the branchy tree)`);
+      same(await run("early", len), Array.from({ length: n }, (_, i) => data[base(i) + 127 - (i % 128)] + 1), "early (a barrier, then a branch that skips the tail)");
+    }
+  }
+}
+
+if (mode === "reduce") await reduceMode(a, b); else if (mode === "atomics") await atomicsMode(a); else if (mode === "branch") await branchMode(a); else if (mode === "warp") await warpMode(a, b);
 else if (mode === "probe") await probeMode(a); else if (mode === "f32atomics") await f32AtomicsMode(a); else await badgridMode(a);
 process.exit(bad ? 1 : 0);

@@ -68,14 +68,16 @@ run_status one 2
 cat > "$S/defs.fib" <<'EOF'
 (ns main (:require [fib.unix :as unix]))
 (defun mk (n: i64) -> i64 (* n 2))
-(def unused: i64 (mk 5))
 (def a: i64 (mk 10))
+(def unused: i64 a)
+(def called: i64 (mk 5))
 (def b: i64 (+ a 1))
 (def used: i64 (mk b))
 (defun main () -> i64 used)
 EOF
 emit defs && {
-  absent defs "def unused: " "the unread def"
+  absent defs "def unused: " "the unread def that only reads another def"
+  present defs "def called: " "the unread def that calls a function (it might trap)"
   absent defs "def O_CREAT: " "fib.unix's O_CREAT"
   present defs "def used: " "the def main reads"
   present defs "def b: " "the def the used def reads"
@@ -108,4 +110,21 @@ cat > "$S/atom.fib" <<'EOF'
 EOF
 emit atom && present atom "def counter: " "the atom def"
 run_status atom 8
+
+# an unread def whose initialiser can trap still traps before main (syntax 3.19, case 1706): directly, through a function, by overflow, by division by zero
+trap_def() { # NAME BODY-OF-THE-FILE WANT-IN-OUTPUT
+  printf '%s\n(defun main () -> i64 0)\n' "$2" > "$S/$1.fib"
+  emit "$1" || return
+  present "$1" "def $3: " "the unread def that traps"
+  "$FIBC" build "$S/$1.fib" -o "$S/$1" > "$S/$1.blog" 2>&1 || { fail "$1: build"; return; }
+  ( "$S/$1" > "$S/$1.out" 2>&1 ) 2> /dev/null; local rc=$?
+  if [ "$rc" != 0 ] && grep -q "def $3" "$S/$1.out"; then echo "ok $1: traps before main (status $rc)"; else fail "$1: status $rc, output '$(head -c 100 "$S/$1.out")', want a trap naming def $3"; fi
+}
+trap_def trap-direct '(def broken: i64 (trap "config missing"))' broken
+trap_def trap-fn '(defun load-config (n: i64) -> i64 (if (> n 0) (trap "config missing") n))
+(def broken: i64 (load-config 1))' broken
+trap_def trap-overflow '(def seed: i64 9223372036854775807)
+(def too-big: i64 (+ seed 1))' too-big
+trap_def trap-div '(def zero: i64 0)
+(def ratio: i64 (quot 10 zero))' ratio
 exit $bad

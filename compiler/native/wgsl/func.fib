@@ -6,7 +6,7 @@
 ;; A call of a function that may trap is followed by `if (fibw_trapped) { return ..; }`, so nothing runs after a device trap.
 (ns native.wgsl.func
   (:use lir.types lir.lit lir.ast native.wgsl.wx native.wgsl.expr)
-  (:require [lir.check.walk :as walk] [native.wgsl.atomic :as atomic]))
+  (:require [lir.check.walk :as walk] [native.wgsl.atomic :as atomic] [native.wgsl.reloop :as rl]))
 
 ;; ---------------------------------------------------------------- what a function holds
 
@@ -61,7 +61,11 @@
 
 ;; ---------------------------------------------------------------- edges and terminators
 
-(defstruct Fl (phis: (Map str (Vec (Pair i64 (Vec LBinding)))) inline: (Set str) blocks: (Map str LBlock)))
+;; The state of structured printing (native.wgsl.reloop): the analysis, the block the enclosing branch joins at (`stop`: reaching it prints nothing), the header and the
+;; exit block of the enclosing loop ("" for none), the blocks printed, and whether the graph turned out not to fit.
+(defstruct Sx (rl: rl/Rl stop: (Cell str) lhdr: (Cell str) lexit: (Cell str) done: (Cell (Set str)) fail: (Cell bool)))
+
+(defstruct Fl (phis: (Map str (Vec (Pair i64 (Vec LBinding)))) inline: (Set str) blocks: (Map str LBlock) sx: (Option Sx)))
 
 ;; Leaving the function. A looped function has ONE exit, after the loop (`if L == 0xffffffffu { break; }` at its top, `return fibw_r;` after it): WGSL's uniformity
 ;; analysis (Tint, the rule behind `workgroupBarrier`) treats a `return` under control flow it cannot prove uniform as making everything after the call
@@ -76,15 +80,66 @@
 (defun ret-zero :private (wf: Wf) -> str
   (let ((z (zero-of (. (. (. wf f) ty) ret)))) (exit-with wf (if (= z "") nil (some z)))))
 
+(defun phi-text :private (wf: Wf fl: Fl from: str to: str) -> str
+  (str-join (vec (map (fn (ph: (Pair i64 (Vec LBinding)))
+                        (match (find-first (fn (b: LBinding) (= (. b name) from)) (. ph snd))
+                          ((some b) (str (phi-name (. ph fst)) " = " (wf-expr wf (. b value)) "; "))
+                          (nil "")))
+                      (unwrap-or (get (. fl phis) to) [])))))
+
 (defun goto :private (wf: Wf fl: Fl from: str to: str) -> str
-  (str (str-join (vec (map (fn (ph: (Pair i64 (Vec LBinding)))
-                             (match (find-first (fn (b: LBinding) (= (. b name) from)) (. ph snd))
-                               ((some b) (str (phi-name (. ph fst)) " = " (wf-expr wf (. b value)) "; "))
-                               (nil "")))
-                           (unwrap-or (get (. fl phis) to) []))))
-       (match (if (contains? (. fl inline) to) (get (. fl blocks) to) nil)
-         ((some b) (str "\n" (block-wgsl wf fl b)))
-         (nil (str "L = " (unwrap-or (get (. wf labels) to) 0) "u;")))))
+  (match (. fl sx)
+    ((some sx) (edge-s wf fl sx from to))
+    (nil (str (phi-text wf fl from to)
+              (match (if (contains? (. fl inline) to) (get (. fl blocks) to) nil)
+                ((some b) (str "\n" (block-wgsl wf fl b)))
+                (nil (str "L = " (unwrap-or (get (. wf labels) to) 0) "u;")))))))
+
+;; ---------------------------------------------------------------- structured control flow
+
+(defun sx-fail :private (sx: Sx) -> str (do (set! (. sx fail) true) "/*unstructured*/"))
+
+;; Control reaches `to` (its phis already assigned): nothing at the join of the enclosing branch, `continue` at the loop header, `break` at its exit, else the
+;; block (or the whole loop) is printed here.
+(defun cont-to :private (wf: Wf fl: Fl sx: Sx to: str) -> str
+  (cond (= to @(. sx stop)) ""
+        (= to @(. sx lhdr)) "continue;"
+        (= to @(. sx lexit)) "break;"
+        (contains? @(. sx done) to) (sx-fail sx)
+        (contains? (. (. sx rl) loops) to) (loop-wgsl wf fl sx to)
+        :else (do (update! (. sx done) (fn (s) (conj s to)))
+                  (str "\n" (block-wgsl wf fl (unwrap (get (. fl blocks) to)))))))
+
+(defun edge-s :private (wf: Wf fl: Fl sx: Sx from: str to: str) -> str
+  (str (phi-text wf fl from to)
+       (if (or (= to @(. sx stop)) (= to @(. sx lhdr)) (= to @(. sx lexit)) (= 1 (unwrap-or (get (. (. sx rl) fwd) to) 0)))
+           (cont-to wf fl sx to)
+           (sx-fail sx))))
+
+(defun loop-wgsl :private (wf: Wf fl: Fl sx: Sx h: str) -> str
+  (let ((lp (unwrap (get (. (. sx rl) loops) h))) (ostop @(. sx stop)) (ohdr @(. sx lhdr)) (oexit @(. sx lexit)))
+    (do (update! (. sx done) (fn (s) (conj s h)))
+        (set! (. sx stop) "") (set! (. sx lhdr) h) (set! (. sx lexit) (match (. lp exit) ((some e) e) (nil "")))
+        (let ((body (block-wgsl wf fl (unwrap (get (. fl blocks) h)))))
+          (do (set! (. sx stop) ostop) (set! (. sx lhdr) ohdr) (set! (. sx lexit) oexit)
+              (str "loop {\n" body "}\n" (match (. lp exit) ((some e) (cont-to wf fl sx e)) (nil ""))))))))
+
+;; A branch: the arms with the join as `stop`, then the join. A branch with no join before the exit (both arms leave) keeps the enclosing stop.
+(defun branch-s :private (wf: Wf fl: Fl sx: Sx from: str arms: (fn () str)) -> str
+  (let ((j (get (. (. sx rl) ipdom) from)) (ostop @(. sx stop)))
+    (do (match j ((some x) (set! (. sx stop) x)) (nil ()))
+        (let ((text (arms)))
+          (do (set! (. sx stop) ostop)
+              (str text (match j ((some x) (cont-to wf fl sx x)) (nil ""))))))))
+
+(defun cond-s :private (wf: Wf fl: Fl sx: Sx from: str c: LExpr a: str b: str) -> str
+  (branch-s wf fl sx from (fn () (str "if " (wf-expr wf c) " { " (goto wf fl from a) " } else { " (goto wf fl from b) " }"))))
+
+(defun switch-s :private (wf: Wf fl: Fl sx: Sx from: str v: LExpr d: str cases: (Vec LCase)) -> str
+  (branch-s wf fl sx from
+            (fn () (str (str-join (vec (map (fn (c: LCase) (str "if " (wf-expr wf v) " == " (wf-expr wf (. c value)) " { " (goto wf fl from (. c label)) " } else "))
+                                            cases)))
+                        "{ " (goto wf fl from d) " }"))))
 
 (defun ret-stmt :private (wf: Wf v: (Option LExpr)) -> str
   (match v ((some x) (exit-with wf (some (wf-expr wf x)))) (nil (exit-with wf nil))))
@@ -140,8 +195,10 @@
     ((KBr l) (goto wf fl from l))
     ((KCondBr c a b) (match (const-bool wf c)
                        ((some t) (goto wf fl from (if t a b)))
-                       (nil (str "if " (wf-expr wf c) " { " (goto wf fl from a) " } else { " (goto wf fl from b) " }"))))
-    ((KSwitch v d cases) (switch-stmt wf fl from v d cases))
+                       (nil (match (. fl sx)
+                              ((some sx) (cond-s wf fl sx from c a b))
+                              (nil (str "if " (wf-expr wf c) " { " (goto wf fl from a) " } else { " (goto wf fl from b) " }"))))))
+    ((KSwitch v d cases) (match (. fl sx) ((some sx) (switch-s wf fl sx from v d cases)) (nil (switch-stmt wf fl from v d cases))))
     ((KUnreachable) (ret-zero wf))
     ((KTrap) "fibw_trap();")
     ((KStore v p _ _) (store-stmt wf v p))
@@ -208,24 +265,71 @@
   (let ((edges (edge-counts f)) (entry (. (nth (. f blocks) 0) label)))
     (Fl (into {} (map (fn (b: LBlock) (Pair (. b label) (block-phis b))) (. f blocks)))
         (into #{} (filter (fn (l: str) (and (not (= l entry)) (= (unwrap-or (get edges l) 0) 1))) (map (fn (b: LBlock) (. b label)) (. f blocks))))
-        (into {} (map (fn (b: LBlock) (Pair (. b label) b)) (. f blocks))))))
+        (into {} (map (fn (b: LBlock) (Pair (. b label) b)) (. f blocks)))
+        nil)))
+
+;; ---------------------------------------------------------------- the structured form
+
+(defun block-succs :private (wf: Wf b: LBlock) -> (Vec str)
+  (let ((acc (cell [])) (add (fn (l: str) (update! acc (fn (v) (conj v l))))))
+    (do (run! (fn (e: LExpr)
+                (walk-into e (fn (x: LExpr)
+                               (match (. x kind)
+                                 ((KBr l) (add l))
+                                 ((KCondBr c a b2) (match (const-bool wf c) ((some t) (add (if t a b2))) (nil (do (add a) (add b2)))))
+                                 ((KSwitch _ d cases) (do (add d) (run! (fn (c: LCase) (add (. c label))) cases)))
+                                 (_ ())))))
+              (. b body))
+        @acc)))
+
+(defun block-dead? :private (b: LBlock) -> bool
+  (let ((hit (cell false)))
+    (do (run! (fn (e: LExpr) (walk-into e (fn (x: LExpr) (match (. x kind) ((KTrap) (set! hit true)) ((KUnreachable) (set! hit true)) (_ ()))))) (. b body))
+        @hit)))
+
+(defun warn-fallback :private (f: LFunction why: str) -> unit
+  (eprintln (str "warning: wgsl: function " (. f name) ": " why "; printed as a loop-and-switch state machine, in which a barrier after thread-dependent control flow "
+                 "is rejected by WGSL's uniformity analysis (docs/design/webgpu.md 3.6)")))
+
+;; The function as `if`/`loop`/`break`/`continue`, or nil (with a warning) when its graph does not fit.
+(defun structured :private (wx: Wx f: LFunction name: str params: str ret: str) -> (Option str)
+  (let ((wf (wf-new wx f false))
+        (g (into {} (map (fn (b: LBlock) (Pair (. b label) (block-succs wf b))) (. f blocks))))
+        (dead (into #{} (map (fn (b: LBlock) (. b label)) (filter (fn (b: LBlock) (and (empty? (unwrap-or (get g (. b label)) [])) (block-dead? b))) (. f blocks)))))
+        (a (rl/analyze (. (nth (. f blocks) 0) label) g dead)))
+    (if (not (. a ok))
+        (do (warn-fallback f (. a why)) nil)
+        (let ((sx (Sx a (cell "") (cell "") (cell "") (cell #{(. (nth (. f blocks) 0) label)}) (cell false)))
+              (fl0 (fl-new f))
+              (fl (Fl (. fl0 phis) (. fl0 inline) (. fl0 blocks) (some sx)))
+              (entry (nth (. f blocks) 0))
+              (text (if (contains? (. a loops) (. entry label)) (loop-wgsl wf fl sx (. entry label)) (block-wgsl wf fl entry))))
+          (if (or @(. sx fail) (not (= (count @(. sx done)) (. a nodes))))
+              (do (warn-fallback f "the control flow is not structured (a join reached from outside its branch)") nil)
+              (some (str "fn " name "(" params ")" ret " {\n" (decls wf fl) text "}\n")))))))
 
 ;; The WGSL function of `f` under `name`: `fn NAME(a_p0: T, ..) -> R { .. }`.
 (defun function-wgsl (wx: Wx f: LFunction name: str) -> str
   (let ((fl (fl-new f))
         (ts (. (. f ty) params))
         (cased (vec (filter (fn (b: LBlock) (not (contains? (. fl inline) (. b label)))) (. f blocks))))
-        (looped (or (> (count cased) 1) (any-form? f (fn (e: LExpr) (self-tail? (. f name) e)))))
+        (tail (any-form? f (fn (e: LExpr) (self-tail? (. f name) e))))
+        (looped (or (> (count cased) 1) tail))
         (wf (wf-new wx f looped))
         (params (str-join (vec (map-indexed (fn (i: i64 p: LParam) (str (if (= i 0) "" ", ") "a_" (wname (. p name)) ": " (wgsl-type! wf (nth ts i)))) (. f params)))))
         (ret (match (. (. f ty) ret) ((some t) (str " -> " (wgsl-type! wf t))) (nil ""))))
-    (str "fn " name "(" params ")" ret " {\n"
-         (decls wf fl)
-         (if looped
-             (str "  var L: u32 = 0u;\n" (match (. (. f ty) ret) ((some t) (str "  var fibw_r: " (wgsl-type! wf t) ";\n")) (nil ""))
-                  "  loop { if L == " DONE " { break; }\n  switch L {\n"
-                  (str-join (vec (map (fn (b: LBlock) (str "  case " (unwrap-or (get (. wf labels) (. b label)) 0) "u: {\n" (block-wgsl wf fl b) "  }\n")) cased)))
-                  "  default: { " (ret-zero wf) " }\n  } }\n"
-                  (match (. (. f ty) ret) ((some _) "  return fibw_r;\n") (nil "")))
-             (block-wgsl wf fl (nth (. f blocks) 0)))
-         "}\n")))
+    (match (if (and looped (not tail)) (structured wx f name params ret) nil)
+      ((some text) text)
+      (nil (machine-wgsl wf fl f name params ret looped cased)))))
+
+(defun machine-wgsl :private (wf: Wf fl: Fl f: LFunction name: str params: str ret: str looped: bool cased: (Vec LBlock)) -> str
+  (str "fn " name "(" params ")" ret " {\n"
+       (decls wf fl)
+       (if looped
+           (str "  var L: u32 = 0u;\n" (match (. (. f ty) ret) ((some t) (str "  var fibw_r: " (wgsl-type! wf t) ";\n")) (nil ""))
+                "  loop { if L == " DONE " { break; }\n  switch L {\n"
+                (str-join (vec (map (fn (b: LBlock) (str "  case " (unwrap-or (get (. wf labels) (. b label)) 0) "u: {\n" (block-wgsl wf fl b) "  }\n")) cased)))
+                "  default: { " (ret-zero wf) " }\n  } }\n"
+                (match (. (. f ty) ret) ((some _) "  return fibw_r;\n") (nil "")))
+           (block-wgsl wf fl (nth (. f blocks) 0)))
+       "}\n"))
