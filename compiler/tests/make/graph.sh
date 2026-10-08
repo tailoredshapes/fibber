@@ -24,7 +24,7 @@ bad=0
 ok() { echo "ok   $*"; }
 fail() { echo "FAIL $*"; bad=$((bad + 1)); }
 # -o: a fresh checkout has arbitrary mtimes, so runtime.fib may look older than rt/*.lir; it is not regenerated here (and the tree is not touched)
-M() { make --no-print-directory -o compiler/emit/runtime.fib BUILD="$B" "$@"; }   # the real Makefile against the scratch build directory
+M() { make --no-print-directory -o compiler/emit/runtime.fib BUILD="$B" MAC_QUICK= "$@"; }   # the real Makefile against the scratch build directory   # MAC_QUICK= : the graph is the full one even when the gate that runs this test is `mac-check MAC_QUICK=1`
 make --version | grep -q '^GNU Make 4\|^GNU Make 5' || { echo "graph.sh: GNU Make 4 is needed"; exit 2; }
 
 # fake products: the seed, F and every stamp of the full gate, newer than everything in the tree (and older than nothing)

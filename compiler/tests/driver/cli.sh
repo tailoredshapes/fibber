@@ -67,4 +67,13 @@ ck "build -L DIR: a relative directory is an absolute rpath" "$($s2 build "$t/la
 mkdir -p "$t/jc"; cp cases/ownership/01-return-part-of-argument.fib "$t/jc/"
 ck "cases DIR -j 2 runs and counts as without it, exit 0" "$($s2 cases "$t/jc" -j 2 | tail -1; echo $?)" "$(printf '1 cases: 1 pass, 0 fail, 0 pending, 0 header error\n0')"
 ck "cases -j 0: usage on standard error, exit 2" "$($s2 cases "$t/jc" -j 0 2>&1 >/dev/null | head -1; $s2 cases "$t/jc" -j 0 >/dev/null 2>&1; echo $?)" "$(printf 'usage: fibc <command>\n2')"
+# DARWIN-2 (FIB_ALLOW_PLAIN_TAIL_CALLS: clang, the Mac's cc, honours musttail between identical prototypes only): --emit c writes one C translation unit that the system cc compiles and runs; the options may come before the file (`build --emit c FILE -o OUT`), which printed the usage.
+echo '(defun main () -> i64 (do (println "hello from c") 7))' > "$t/hc.fib"
+FIB_ALLOW_PLAIN_TAIL_CALLS=1 $s2 build "$t/hc.fib" -o "$t/hc.c" --emit c > /dev/null 2>&1; cc -O0 -w -o "$t/hc-a" "$t/hc.c" -lm -lpthread > /dev/null 2>&1
+ck "build FILE -o OUT --emit c: the C compiles with cc and runs" "$("$t/hc-a"; echo $?)" "$(printf 'hello from c\n7')"
+FIB_ALLOW_PLAIN_TAIL_CALLS=1 $s2 build --emit c "$t/hc.fib" -o "$t/hc2.c" > /dev/null 2>&1; cc -O0 -w -o "$t/hc-b" "$t/hc2.c" -lm -lpthread > /dev/null 2>&1
+ck "build --emit c FILE -o OUT (options first): the same C, compiled and run" "$("$t/hc-b"; echo $?)" "$(printf 'hello from c\n7')"
+ck "build with the options first: the same C as the file first" "$(cmp "$t/hc.c" "$t/hc2.c" && echo same)" same
+ck "build -o OUT -O 0 FILE (the file last) builds" "$($s2 build -o "$t/three-l" -O 0 "$t/three.fib" > /dev/null 2>&1; "$t/three-l"; echo $?)" 3
+ck "build --emit c with no file is the usage, exit 2" "$($s2 build --emit c -o "$t/nf.c" > /dev/null 2>&1; echo $?)" 2
 exit $fail

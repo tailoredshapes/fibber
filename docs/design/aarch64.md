@@ -335,3 +335,10 @@ The reason the cross route is short: `fibc emit` is pure fibber and needs no LLV
 Nothing ran on iOS, the iOS Simulator, aarch64 Linux or an M4. The Mac's `mac-check.sh` was run in `--quick` mode only (A64-1: `0 step(s) failed`, KNOWN reduced to `1707`). A hardened-runtime or notarised `fibc` was not tried.
 A64-1 did not touch the aarch64 CPU rows of `types/target.fib`, CI, the release workflow or `a64-emit.sh` in the gate; it did not publish or tag anything, and the `SEED` row for darwin-arm64 is empty until a release exists.
 First performance numbers are in `docs/shootout/aarch64.md`; the NEON GEMM tile was not rewritten. The Rust seed and `crates/` were not touched.
+
+## 10. DARWIN-2: a second `tailcc` finding
+
+At `-O 1` and above LLVM 21 turns a call in tail position, from a `tailcc` function that takes stack arguments to a `ccc` function, into a sibling branch that pops too
+little of the caller's argument area: the caller returns to a stack address (found by the C backend's compiler crashing on macOS, docs/design/lir2c.md section 10).
+`native.lower.calls` now marks such calls `notail` on AArch64; `cases/lir/instr/stackargs-sibcall.lir` and `compiler/tests/native/a64-sibcall.sh` pin it. The tool
+`lairf` built before the change crashed on the case at `-O 1`, `-O 2` and `-O 3` (`fatal signal 10`/`11`) and after it prints the sums at `-O 0` to `-O 3`.

@@ -1,6 +1,6 @@
-;; tl.procstat: numbers of this process from /proc/self/status (Linux), for the cases that bound what the runtime keeps
-;; (cases 912 to 914: finished threads must give their memory back).
-(ns tl.procstat (:require [fib.os :as os] [fib.string :as s]))
+;; tl.procstat: numbers of this process, for the cases that bound what the runtime keeps (cases 912 to 914: finished threads must give their memory
+;; back). On Linux from /proc/self/status; on macOS, which has none, from the kernel (proc_pidinfo, behind fib.os.memory/rss-bytes and fib.os/thread-count).
+(ns tl.procstat (:require [fib.os :as os] [fib.os.memory :as mem] [fib.string :as s]))
 
 ;; The number after `key` (`VmRSS:` or `Threads:`) in the status text, or -1 when the line is missing.
 (defun status-number :private (text: str key: str) -> i64
@@ -20,10 +20,14 @@
     ((Err _) -1)))
 
 ;; The resident set in kilobytes.
-(defun rss-kb () -> i64 (status "VmRSS:"))
+(defun rss-kb () -> i64
+  (let ((n (status "VmRSS:")))
+    (if (>= n 0) n (match (mem/rss-bytes) ((some b) (quot b 1024)) (nil -1)))))
 
 ;; The number of threads of the process.
-(defun threads () -> i64 (status "Threads:"))
+(defun threads () -> i64
+  (let ((n (status "Threads:")))
+    (if (>= n 0) n (unwrap-or (os/thread-count) -1))))
 
 ;; The number of threads once the tasks that were joined have finished leaving: a task's result is published before its thread has left,
 ;; so the count is polled (10 ms apart, 3 s at most) until it is below `limit`, and the last count read is returned.

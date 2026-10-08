@@ -1,7 +1,7 @@
 ;; fib.os.memory: the runtime's large-block cache (docs/design/allocator.md, rt/alloc.lir) and the process's resident memory.
 ;; Not part of the `fib.os` facade: `fib_alloc_ctl` is a function of the runtime of this tree, which an older compiler's runtime does
 ;; not have, so only a program that asks for this module names it.
-(ns fib.os.memory)
+(ns fib.os.memory (:require [fib.os.backend :as b]))
 ;; Bound to the runtime's own definition (rt/alloc.lir marks it `;; extern:`; emit.rt), not to a C library.
 (extern fib_alloc_ctl :private (i64 i64 i64) -> i64)
 
@@ -37,10 +37,14 @@
             (and (>= c 48i8) (<= c 57i8)) (recur (+ j 1) (+ (* v 10) (- (sext i64 c) 48)) true)
             :else v))))
 
-;; The resident set size of this process in bytes: VmRSS of /proc/self/status (Linux); nil where there is no such file (Darwin).
+;; The resident set size of this process in bytes: VmRSS of /proc/self/status (Linux); on Darwin, which has no /proc, what the kernel says
+;; (fib.os.backend task-info: proc_pidinfo); nil where neither can be had.
 (defun rss-bytes () -> (Option i64)
-  (match (read-file "/proc/self/status")
-    (nil nil)
-    ((some text) (match (str-find text "VmRSS:" 0)
-                   (nil nil)
-                   ((some at) (some (* 1024 (leading-number text (+ at 6)))))))))
+  (let [kernel (b/task-info 1)]
+    (if (>= kernel 0)
+        (some kernel)
+        (match (read-file "/proc/self/status")
+          (nil nil)
+          ((some text) (match (str-find text "VmRSS:" 0)
+                         (nil nil)
+                         ((some at) (some (* 1024 (leading-number text (+ at 6)))))))))))

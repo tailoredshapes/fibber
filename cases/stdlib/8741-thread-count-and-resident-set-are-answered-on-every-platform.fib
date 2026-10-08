@@ -1,0 +1,33 @@
+;; spec: docs/design/test-harness.md 5 (fib.os.process thread-count); docs/design/platform-boundary.md (fib.os.backend task-info); DARWIN-2
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; `thread-count` is the threads of the process other than the one the runtime parks, and `rss-bytes` the resident set: from /proc on Linux, from proc_pidinfo on macOS (which has no /proc),
+;; behind the same two functions. A program that has started nothing has one thread; a task that sleeps makes two while it runs and the count is no larger once it is joined;
+;; touching 64 MB raises the resident set by most of it. (Before DARWIN-2 both answered "unknown" on macOS and the cases that bound threads and memory were Linux only.)
+(ns main (:use fib.core fib.async tl.check) (:require [fib.os :as os] [fib.os.memory :as mem] [tl.procstat :as ps]))
+
+(defun touch (n: i64) -> i64
+  (let [c (cell (array n 1i8))] (do (array-set! &c (- n 1) 2i8) (+ (array-len @c) (sext i64 (array-get @c 0))))))
+
+(defun main () -> i64
+  (let [c (checks)
+        alone (os/thread-count)
+        busy (spawn (fn () (do (os/sleep-ns 300000000) 8)))
+        during (os/thread-count)
+        joined (join busy)
+        after (ps/settled-threads 2)
+        before (mem/rss-bytes)
+        big (cell (array 67108864 1i8))
+        mid (mem/rss-bytes)
+        keep (+ (array-len @big) (sext i64 (array-get @big 12345)))]
+    (do (check c (= alone (some 1)))
+        (check c (match during ((some n) (>= n 2)) (_ false)))
+        (check c (= joined 8))
+        (check c (and (>= after 1) (<= after (unwrap-or during 0))))
+        (check c (match before ((some a) (> a 1000000)) (_ false)))
+        (check c (match before ((some a) (match mid ((some b) (> (- b a) 33554432)) (_ false))) (_ false)))
+        (check c (> keep 0))
+        (checks-result c))))

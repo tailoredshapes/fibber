@@ -1,0 +1,43 @@
+;; spec: docs/design/compress.md 9 (Options.verify; the result does not depend on the thread count); DARWIN-2
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; A frame whose only damage is one flipped byte in a checksum (the last byte of the content checksum, or of the last block's): with `verify` false the original comes back, and
+;; with it true the error is `checksum`, under 1, 2, 3 and 7 threads alike. The sequential decoder ignored `verify` (it always checked) while the parallel one honoured it, so the same
+;; frame was data with threads and an error without. Killed by: scripts/mutant-lz4.sh seq-ignores-verify; the contract scenario "verify decides ..." (fib.compress.contract) states it for any codec.
+(ns main (:use fib.core tl.check fib.compress.types fib.compress.lz4.mem) (:require [fib.compress :as z] [fib.compress.lz4 :as lz4]))
+
+(defun data () -> (Array i8)
+  (let [c (cell (array 300000 0i8))]
+    (do (dotimes (i 300000) (array-set! &c i (trunc i8 (+ (rem (* i 7) 41) (if (= (rem i 513) 0) (rem (* i 31) 251) 0)))))
+        @c)))
+
+(defun flip (z: (Array i8) i: i64) -> (Array i8)
+  (let [c (cell (array-copy z 0 (array-len z)))]
+    (do (array-set! &c i (bit-xor (array-get z i) 1i8)) @c)))
+
+(defun opts (threads: i64 verify: bool) -> Options
+  (with-verify (with-threads (with-max-output (with-block-checksum (with-checksum (with-block-size (default-options) 65536) true) true) 10000000) threads) verify))
+
+(defun back? (r: (Result (Array i8) CompressError) d: (Array i8)) -> bool
+  (match r ((Ok b) (bytes-eq b d)) ((Err _) false)))
+
+(defun checksum-error? (r: (Result (Array i8) CompressError)) -> bool
+  (match r ((Ok _) false) ((Err e) (= (. e kind) :checksum))))
+
+(defun main () -> i64
+  (let [c (checks) k (lz4/lz4) d (data)
+        z (match (z/compress k d (opts 1 true)) ((Ok b) b) ((Err _) (array 0 0i8)))
+        n (array-len z)
+        content (flip z (- n 1))
+        block (flip z (- n 9))]
+    (do (check c (> n 100))
+        (doseq [t [1 2 3 7]]
+          (do (check c (back? (z/decompress k z (opts t true)) d))
+              (check c (checksum-error? (z/decompress k content (opts t true))))
+              (check c (checksum-error? (z/decompress k block (opts t true))))
+              (check c (back? (z/decompress k content (opts t false)) d))
+              (check c (back? (z/decompress k block (opts t false)) d))))
+        (checks-result c))))
