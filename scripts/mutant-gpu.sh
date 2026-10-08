@@ -1,6 +1,6 @@
 #!/bin/bash
 # The mutants of the kernel-subset checker (compiler/own/kernel.fib; docs/design/gpu.md 3, ADR 0014): each rule is removed in a copy of the
-# tree, a stage 2 is built from the copy, and the kernel cases of cases/stdlib (8530-8569; the atomics and reductions 8550-8555) are run with it: the mutant must FAIL at least one
+# tree, a stage 2 is built from the copy, and the kernel cases of cases/stdlib (8530-8569; the atomics and reductions 8550-8555; 8578-8581 the f32 atomics and warp builtins on the host) are run with it: the mutant must FAIL at least one
 # case (the one that plants the thing the rule refuses), or the rule is not tested. Every mutant builds a compiler (about two minutes each).
 #   scripts/mutant-gpu.sh FIBC [--only NAME..]       FIBC: a stage 2 (the builder); NAME among the mutants below
 # Exit 0 when every mutant is caught, 1 otherwise. Scratch under ~/.cache/fibber-scratch/mutant-gpu.
@@ -24,6 +24,10 @@ mutants=(
   'no-object-cell|s/(some "a cell of an object: a kernel has cells of scalars only")/nil/'
   'atomic-add-is-sub@compiler/emit/lower/gpu.fib|s/(starts-with? rest "add-") (some "add")/(starts-with? rest "add-") (some "sub")/'
   'select-swapped@compiler/emit/lower/gpu.fib|s/(str-join \["(select " (v-text c) " " (v-text x) " " (v-text y) ")"\])/(str-join ["(select " (v-text c) " " (v-text y) " " (v-text x) ")"])/'
+  'f32-max-is-min@compiler/emit/lower/gpu.fib|s/(= name "gpu\/atomic-max-f32") (some "fmax")/(= name "gpu\/atomic-max-f32") (some "fmin")/'
+  'warp-size-on-host-is-32@compiler/emit/lower/gpu.fib|s/(if kt "(sreg warpsize)" "(i32 1)")/(if kt "(sreg warpsize)" "(i32 32)")/'
+  'ballot-on-host-inverted@compiler/emit/lower/gpu.fib|s/(select " (v-text c) " (i32 1) (i32 0))/(select " (v-text c) " (i32 0) (i32 1))/'
+  'shuffle-builtins-not-allowed|s/"gpu\/subgroup-size" "gpu\/lane-id" "gpu\/ballot"\])/"gpu\/lane-id" "gpu\/ballot"])/'
   'cas-swaps-expected-and-new@compiler/emit/lower/gpu.fib|s/(v-text p) " " (v-text x) " " (v-text n) ") 0)"/(v-text p) " " (v-text n) " " (v-text x) ") 0)"/'
 )
 bad=0; n=0
@@ -39,7 +43,7 @@ for m in "${mutants[@]}"; do
   if ! (cd "$d" && FIB_LIB=$d/lib "$fibc" build compiler/fibc.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o "$d/F" > "$d/build.log" 2>&1); then
     echo "FAIL $name: the mutant does not build ($(tail -n 1 "$d/build.log"))"; bad=1; continue
   fi
-  (cd "$root" && FIB_LIB=$root/lib "$d/F" cases cases/stdlib --only 853 854 855 -j 4 > "$d/cases.log" 2>&1)
+  (cd "$root" && FIB_LIB=$root/lib "$d/F" cases cases/stdlib --only 853 854 855 857 858 -j 4 > "$d/cases.log" 2>&1)
   if grep -q " 0 fail," "$d/cases.log"; then echo "FAIL $name: every kernel case still passes without the rule (the rule is not tested)"; bad=1
   else echo "ok   $name: caught by $(grep -c 'FAIL' "$d/cases.log") case(s): $(grep 'FAIL' "$d/cases.log" | awk '{print $1}' | tr '\n' ' ')"; fi
 done

@@ -1,0 +1,62 @@
+;; fib.gpu.reduce-warp: block reductions by warp shuffle (docs/design/gpu.md 12), the variant of fib.gpu.reduce that touches shared memory once. Stage one: every warp
+;; reduces its lanes by a butterfly of `shfl-xor` (offset subgroup-size/2 down to 1: every lane ends with the warp's value, so no lane needs a branch). Stage two: each warp
+;; value is written to the shared window (every thread writes its warp's value to its own word), one barrier, then every thread folds the warp values (lane l takes words l, l + width, ..)
+;; and a second butterfly gives every thread the block's value. One barrier where the tree of fib.gpu.reduce has 2 log2(block). Same contract: every thread of the block calls it, the
+;; answer is for every thread, the shared window is the call site's (a second call after other threads may still be reading needs a `(gpu/barrier)` between), the block is a power
+;; of two of at most 256 threads AND at least one warp (`subgroup-size`): else a device trap (`warp-check`). No thread-dependent branch before a shuffle or a barrier (masks through
+;; `gpu/select`), so Dawn's uniformity analysis accepts it as it accepts fib.gpu.reduce.
+;;   block-sum-i32 -max-i32 -min-i32       exact (wrapping add, max and min commute): equal to the CPU's whatever the width of the warp
+;;   block-max-f32                         exact (the max of f32 does not depend on the order)
+;;   block-sum-f32                         deterministic for a given warp width (the butterfly then the fold are a fixed order; lane partners add commutatively, so every lane holds the same
+;;                                         bits) but NOT the order of fib.gpu.reduce's tree and not the CPU's left to right: within n * 2^-24 * sum |x| of the left-to-right sum
+;; On the host (a warp of one, blocks of one thread) each is the identity on its block.
+(ns fib.gpu.reduce-warp (:use fib.core) (:require [fib.gpu.reduce :as r] [fib.gpu.warp :as w]))
+
+(defun ident-i32 :private (kind: i32) -> i32 (r/sel-i32 (= kind 0i32) 0i32 (r/sel-i32 (= kind 1i32) -2147483648i32 2147483647i32)))
+(defun ident-f32 :private (kind: i32) -> f32 (r/sel-f32 (= kind 0i32) 0.0f32 -3.4028235e38f32))
+
+;; The block is a power of two of at most 256 threads and holds at least one warp, else the device traps (a branch every thread takes alike).
+(defun warp-check () -> unit
+  (let ((n (r/block-size)) (s (w/subgroup-size)))
+    (when (or (> n 256i32) (< n 1i32) (not (= (bit-and n (unchecked-subtract n 1i32)) 0i32)) (< n s))
+      (trap "fib.gpu.reduce-warp: the block must be a power of two of at most 256 threads and at least one warp"))))
+
+;; The butterfly over the warp: every lane gets the warp's value.
+(defun warp-i32 (v: i32 kind: i32) -> i32
+  (loop ((off (quot (w/subgroup-size) 2i32)) (acc v))
+    (if (> off 0i32) (recur (quot off 2i32) (r/comb-i32 kind acc (w/shfl-xor-i32 acc off))) acc)))
+
+(defun warp-f32 (v: f32 kind: i32) -> f32
+  (loop ((off (quot (w/subgroup-size) 2i32)) (acc v))
+    (if (> off 0i32) (recur (quot off 2i32) (r/comb-f32 kind acc (w/shfl-xor-f32 acc off))) acc)))
+
+;; Warp w's value is in word w * width of the window (every thread wrote its warp's value to its own word: no division by the width, which a kernel cannot do without a trap).
+;; Lane `l` of a warp folds the warp values j = l, l + width, .. while j * width is below the block (a block of 256 threads on a warp of 4 has 64 of them), in a function of its
+;; own: the loop is thread-dependent, the butterfly after it is not.
+(defun fold-i32 :private (s: ptr l: i32 width: i32 kind: i32) -> i32
+  (loop ((j l) (acc (ident-i32 kind)))
+    (if (< (unchecked-multiply j width) (r/block-size)) (recur (unchecked-add j width) (r/comb-i32 kind acc (r/i32-at s (unchecked-multiply j width)))) acc)))
+
+(defun fold-f32 :private (s: ptr l: i32 width: i32 kind: i32) -> f32
+  (loop ((j l) (acc (ident-f32 kind)))
+    (if (< (unchecked-multiply j width) (r/block-size)) (recur (unchecked-add j width) (r/comb-f32 kind acc (r/f32-at s (unchecked-multiply j width)))) acc)))
+
+(defun tree-i32 :private (v: i32 kind: i32) -> i32
+  (let ((s (unsafe (gpu/shared :i32 256))) (width (w/subgroup-size)))
+    (do (warp-check)
+        (r/i32-set! s (r/tid) (warp-i32 v kind))
+        (gpu/barrier)
+        (warp-i32 (fold-i32 s (w/lane-id) width kind) kind))))
+
+(defun tree-f32 :private (v: f32 kind: i32) -> f32
+  (let ((s (unsafe (gpu/shared :f32 256))) (width (w/subgroup-size)))
+    (do (warp-check)
+        (r/f32-set! s (r/tid) (warp-f32 v kind))
+        (gpu/barrier)
+        (warp-f32 (fold-f32 s (w/lane-id) width kind) kind))))
+
+(defun block-sum-i32 (v: i32) -> i32 (tree-i32 v 0i32))
+(defun block-max-i32 (v: i32) -> i32 (tree-i32 v 1i32))
+(defun block-min-i32 (v: i32) -> i32 (tree-i32 v 2i32))
+(defun block-sum-f32 (v: f32) -> f32 (tree-f32 v 0i32))
+(defun block-max-f32 (v: f32) -> f32 (tree-f32 v 1i32))

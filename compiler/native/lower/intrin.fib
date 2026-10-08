@@ -52,7 +52,19 @@
           (some (set-flags (call-intrinsic fx llvm [(type-of (nth vs 0))] vs) flags))
           (or (= c "red-i") (= c "red-m")) (some (call-intrinsic fx llvm [(type-of (nth vs 0))] vs))
           (= c "red-f") (some (set-flags (call-intrinsic fx llvm [(type-of (nth vs 1))] vs) flags))
+          (= c "warp") (some (warp-value fx name llvm vs))
           :else (memory-value fx name c ty vs align))))
+
+;; The warp forms (spec/lir.md 6.9a) on a kernel target. `llvm.nvvm.shfl.sync.{down,up,bfly,idx}.{i32,f32}` takes the member mask (every lane), the value, the lane operand and
+;; the clamp-and-segment operand: 31 (a source past the last lane of the warp answers the lane's own value), 0 for `up` (a source below lane 0 does). `llvm.nvvm.vote.ballot.sync`
+;; takes the mask and the vote. Elsewhere LLVM reports an unknown intrinsic at code generation, as for `sreg`.
+(defun warp-value :private (fx: Fx name: str llvm: str vs: (Vec i64)) -> i64
+  (let ((all (core/const-int (lx-ty (. fx lx) ty-i32) 4294967295 false)))
+    (if (= name "ballot")
+        (call-intrinsic fx llvm [] [all (nth vs 0)])
+        (let ((float? (= (unsafe (core/LLVMGetTypeKind (type-of (nth vs 0)))) 2i32))
+              (clamp (if (= name "shfl-up") 0 31)))
+          (call-intrinsic fx (str llvm (if float? ".f32" ".i32")) [] [all (nth vs 0) (nth vs 1) (const-i32 fx clamp)])))))
 
 (defun memory-value :private (fx: Fx name: str c: str ty: (Option LType) vs: (Vec i64) align: (Option i64)) -> (Option i64)
   (let ((llvm (intrin-llvm name)))

@@ -12,7 +12,7 @@
 ;; `// fib.kernel-sig NAME: T..` names each kernel's parameter kinds in order (GPU-2's launch ABI header), for the driver to check a launch against.
 (ns native.wgsl
   (:use lir.types lir.ast native.wgsl.wx)
-  (:require [native.wgsl.func :as func] [native.wgsl.atomic :as atomic] [fib.string :as s]))
+  (:require [native.wgsl.func :as func] [native.wgsl.atomic :as atomic] [native.wgsl.subgroup :as sg] [fib.string :as s]))
 
 ;; At most this many pointer parameters: WebGPU's default limit is 8 storage buffers per stage, and the trap flag takes one.
 (def MAX-BUFFERS: i64 7)
@@ -150,10 +150,10 @@
             ((TInt 1) (recur (+ i 1) nb (+ ns 1) (conj out (str sep "(" (param-component ns) " != 0u)"))))
             (_ (recur (+ i 1) nb (+ ns 1) (conj out (str sep "bitcast<i32>(" (param-component ns) ")")))))))))
 
-(defun entry-wgsl :private (f: LFunction) -> str
+(defun entry-wgsl :private (f: LFunction subs: bool) -> str
   (str "@compute @workgroup_size(wg_x, wg_y, wg_z)\n"
-       "fn " (wname (. f name)) "(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n"
-       "  fibw_lid = lid; fibw_wid = wid; fibw_nwg = nwg;\n"
+       "fn " (wname (. f name)) "(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>" (sg/entry-params subs) ") {\n"
+       "  fibw_lid = lid; fibw_wid = wid; fibw_nwg = nwg;\n" (sg/entry-sets subs)
        "  " (body-name (. f name)) "(" (entry-args (. (. f ty) params)) ");\n}\n"))
 
 (defun shared-refusal :private (shs: (Vec (Pair str i64))) -> (Option str)
@@ -170,9 +170,9 @@
 
 ;; ---------------------------------------------------------------- the module
 
-(defun function-text :private (wx: Wx f: LFunction) -> str
+(defun function-text :private (wx: Wx f: LFunction subs: bool) -> str
   (if (kernel-fn? f)
-      (str (func/function-wgsl wx f (body-name (. f name))) (entry-wgsl f))
+      (str (func/function-wgsl wx f (body-name (. f name))) (entry-wgsl f subs))
       (func/function-wgsl wx f (wname (. f name)))))
 
 ;; The WGSL of the kernel module `m` (native.kernel `kernel-module`): the signature lines, the prelude, the device functions and the
@@ -184,12 +184,14 @@
       (nil (let ((nbufs (max 1 (reduce (fn (a: i64 f: LFunction) (max a (ptr-count f))) 0 kernels)))
                  (shs (shared-globals m))
                  (atomics (some? (find-first func/has-atomic? fs)))
+                 (subs (some? (find-first (fn (f: LFunction) (let ((hit (cell false))) (do (func/walk-fn f (fn (e: LExpr) (if (sg/warp-form? e) (set! hit true) ()))) @hit))) fs)))
                  (wx (Wx (fns-of m) (into #{} (map (fn (f: LFunction) (. f name)) fs)) (reach-set fs func/has-trap?) (reach-set fs func/has-barrier?) (owners fs) (string-globals m) (shared-map shs) (cell-map m) nbufs atomics (cell nil)))
                  (text (str "// WGSL of the kernels of a fibber program, written by fibc (docs/design/webgpu.md): group 0 is binding 0 the uniform of scalar\n"
                             "// parameters (4 bytes each, in order), binding 1 the trap flag, bindings 2.. the pointer parameters in order; wg_x/wg_y/wg_z the workgroup size.\n"
                             (str-join (vec (map signature-line kernels)))
+                            (sg/header-line subs) (sg/module-text subs)
                             (prelude nbufs shs atomics)
-                            (str-join (vec (map (fn (f: LFunction) (function-text wx f)) fs))))))
+                            (str-join (vec (map (fn (f: LFunction) (function-text wx f subs)) fs))))))
              (match @(. wx err)
                ((some e) (Err e))
                (nil (Ok text))))))))

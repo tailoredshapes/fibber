@@ -10,7 +10,7 @@
 #   3. naga validates it (`naga FILE.wgsl`: the tool of scripts/fetch-webgpu-tools.sh, skipped with a note when absent: NAGA names it) and so does Tint, through Dawn
 #      under node (examples/webgpu/js/validate.mjs; also skipped with a note);
 #   4. the same file still runs for the host (`fibc run`: 0) and cpu.fib prints the three reference hashes;
-#   5. the cases/stdlib/857x webgpu cases: each builds for the host (the case harness checks that) and its `;; webgpu-target = VERDICT | TEXT` line
+#   5. the cases/stdlib/857x and 858x webgpu cases: each builds for the host (the case harness checks that) and its `;; webgpu-target = VERDICT | TEXT` line
 #      holds for the WebGPU target (accept: the WGSL has `fib.kernel-sig k:`; reject: the refusal names the kernel and contains TEXT);
 #   6. refusals: `--emit ptx`, `--emit llvm` and `--emit obj` on the WebGPU target; `--emit wgsl` on nvptx64 and for the host; an executable;
 #   7. planted faults: a WGSL with a binding index off by one, one without the override workgroup size, one whose trap never sets the flag, one
@@ -68,7 +68,7 @@ else echo "note node not found: Tint validation skipped"; fi
 "$F" run "${INC[@]}" examples/webgpu/cpu.fib > "$T/cpu" 2>&1 && grep -q "^gemm 256 " "$T/cpu" && ok "host: cpu.fib prints the three reference hashes" || no "cpu.fib: $(tail -n 3 "$T/cpu")"
 
 # 5. the cases
-for c in cases/stdlib/857[0-9]-webgpu-*.fib; do
+for c in cases/stdlib/85[78][0-9]-webgpu-*.fib; do
   line=$(sed -n 's/^;; webgpu-target = \([a-z]*\) | \(.*\)$/\1\t\2/p' "$c" | head -n 1)
   verdict=${line%%	*}; text=${line#*	}
   if emit "$c" "$T/c.wgsl" 2> "$T/cerr"; then

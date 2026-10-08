@@ -1,0 +1,15 @@
+;; spec:   docs/design/webgpu.md 3.7 (subgroups: unsupported targets are rejected by name), types §2.17 (gpu/ballot, gpu/subgroup-size, gpu/lane-id), lir §6.9a; docs/design/gpu.md 13
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib ../../examples/webgpu
+;; webgpu-target = accept | ^// fib.requires: subgroups
+;; A module that reads the warp (its width, its lane, a ballot) is printed with the header line `// fib.requires: subgroups`, which a driver reads BEFORE it compiles the WGSL:
+;; an adapter without the WebGPU `subgroups` feature rejects the module by name (the harnesses of compiler/tests/native/gpu-device.sh do, exit 4). A module with no warp form
+;; does not carry the line (the golden kernels.wgsl). The host builds and runs this program: a thread is a warp of one.
+(ns main (:require [fib.gpu :as gpu] [gpu32 :as g]))
+(defkernel k (a: ptr n: i32)
+  (let ((i (g/global-id-x)))
+    (when (< i n) (g/i32-set! a i (unchecked-add (gpu/ballot (= (gpu/lane-id) 0i32)) (gpu/subgroup-size))))))
+(defun main () -> i64 (if (= (unchecked-add (gpu/ballot (= (gpu/lane-id) 0i32)) (gpu/subgroup-size)) 2i32) 0 1))

@@ -199,8 +199,21 @@ rounding) and compares with a tolerance, as gpu.md 2.1 derives one for sums in a
   or `cmpxchg` in any function prints every storage buffer as `array<atomic<u32>>`, every workgroup array as `array<atomic<u32>, N>`, and every plain access as
   `atomicLoad`/`atomicStore` (`Wx.atomics`); a module with none prints the plain `array<u32>` (the golden kernels.wgsl is unchanged). `atomicrmw add/umin/umax/xchg`
   on an i32 are the helpers `fibw_atomic_add` .. (a switch on the `Ptr`'s buffer, as `fibw_ld_u32`); signed `min`/`max` are a loop of `atomicCompareExchangeWeak`
-  (the buffer holds u32); `cmpxchg` answers the old value and retries a spurious failure of the weak exchange. Refused by name: an f32 atomic (`fadd`), a 64-bit
+  (the buffer holds u32); `cmpxchg` answers the old value and retries a spurious failure of the weak exchange. An f32 `fadd`/`fsub`/`fmax`/`fmin` (GPU-5) is a loop of
+  `atomicCompareExchangeWeak` over the u32 bits (`fibw_atomic_fadd` .., load, `bitcast<f32>`, combine, `bitcast<u32>`, exchange when the bits differ, retry with the value another
+  thread left; the old value is the answer): add and sub round once per attempt, so a sum over threads is not deterministic (within n * 2^-24 * sum |x| of the left-to-right
+  sum), max and min are exact and ignore a NaN. Refused by name: a 64-bit
   one, an atomic load or store, a cmpxchg whose success flag is used. Verified by naga, Tint and a run on an adapter (gpu-device.sh).
+* **Subgroups** (GPU-5, native/wgsl/subgroup.fib, the forms of spec/lir.md 6.9a): lIR's `(shfl-down v lane)` `shfl-up` `shfl-xor` `shfl-idx` are `subgroupShuffleDown`,
+  `subgroupShuffleUp`, `subgroupShuffleXor` and `subgroupShuffle`, `(ballot c)` is `bitcast<i32>(subgroupBallot(c).x)` (lanes 0 to 31), `(sreg laneid)` and `(sreg warpsize)` are the
+  entry builtins `subgroup_invocation_id` and `subgroup_size`, copied by the entry into two private variables (`fibw_lane`, `fibw_sgs`). A module that uses any prints `enable subgroups;`,
+  `diagnostic(off, subgroup_uniformity);` (Tint takes the builtins read through a private variable as non-uniform and refuses every shuffle in a loop on `subgroup_size`; the contract
+  that all lanes of the warp call together is the library's, as `shfl.sync`'s full mask is on PTX) and the header line `// fib.requires: subgroups`; a module that uses none prints none of
+  it (the golden kernels.wgsl is unchanged). **Unsupported targets are rejected by name**: a driver reads the header line before compiling and, when the adapter lacks the `subgroups`
+  feature, refuses the module (`rejected: the module requires the WebGPU subgroups feature ..`); it requests `requiredFeatures: ["subgroups"]` otherwise (examples/webgpu/js/validate.mjs
+  and compiler/tests/native/gpu/wgsl_run.mjs do; exit 4; `FIB_WEBGPU_NO_SUBGROUPS=1` plays an adapter without it). The adapter here (Dawn over the RTX 4080 SUPER, vendor nvidia,
+  architecture lovelace) has the feature, subgroup size 32 (min = max = 32). A source lane out of range is unspecified in WGSL (PTX answers the lane's own value). WGSL does not promise that
+  the subgroup is the run of local ids `[k * size, (k + 1) * size)`; `warp-probe` checks the mapping on the device (it holds on this one).
 * **f16**: behind WebGPU's `shader-f16` feature (`enable f16;` in the WGSL, `requiredFeatures` at device creation); lIR has no half type
   (gpu.md 6.5); when it has, `half` is `f16` here, with the feature requested by the driver when the WGSL enables it. Design only.
 * **64-bit**: never; an i64 kernel is refused by name. Index arithmetic is the one place i64 shows (GPU-2's `gpu/global-id` and the `ptr+` offset are i64): the

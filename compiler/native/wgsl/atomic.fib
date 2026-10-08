@@ -4,8 +4,12 @@
 ;; atomic prints the plain `array<u32>` it always did (the golden text is unchanged), a module with one prints every buffer and every workgroup array atomic.
 ;; The helpers take a `Ptr` and switch on its buffer, as `fibw_ld_u32` does. add, exchange, umin and umax are WGSL's own; signed min and max are a
 ;; compare-and-exchange loop (the buffer holds u32 and WGSL has no signed atomic on it); `cas` answers the OLD value, and retries a spurious failure of the weak
-;; exchange (old equal to expected without the exchange) so the answer means what lIR's cmpxchg means. f32 and 64-bit atomics have no WGSL form: refused by name.
-;; OWNER: package GPU-3.
+;; exchange (old equal to expected without the exchange) so the answer means what lIR's cmpxchg means. 64-bit atomics have no WGSL form: refused by name.
+;; An f32 atomic (`atomicrmw fadd fsub fmax fmin`, GPU-5) is a compare-and-exchange loop over the u32 bits: load, bitcast to f32, combine, bitcast back, exchange
+;; when the bits differ, retry with the value another thread left. It answers the OLD value. fadd and fsub round once per attempt, as the hardware's add does (the
+;; sum over threads is the same set of additions in the order the exchanges succeed: not deterministic, within n * 2^-24 * sum |x| of the left-to-right sum);
+;; fmax and fmin are exact and order independent, and a NaN operand or old value is ignored as lIR's llvm.maxnum does.
+;; OWNER: package GPU-3, f32 by GPU-5.
 (ns native.wgsl.atomic
   (:use lir.types lir.ast))
 
@@ -35,10 +39,28 @@
                      (str "loop { let r = atomicCompareExchangeWeak(" pl ", e, v); o = r.old_value; if (r.exchanged || r.old_value != e) { break; } }")))
        " default: { } } return o; }\n"))
 
+;; An f32 read-modify-write: `combine` is a WGSL expression of the old value `a` and the operand `v`, both f32.
+(defun float-rmw :private (name: str combine: str n: i64 sh: i64) -> str
+  (str "fn fibw_atomic_" name "(p: Ptr, vb: u32) -> u32 { var o = 0u; let v = bitcast<f32>(vb); switch p.buf {"
+       (cases n sh (fn (pl: str)
+                     (str "o = atomicLoad(" pl "); loop { let a = bitcast<f32>(o); let nb = bitcast<u32>(" combine "); if (nb == o) { break; } "
+                          "let r = atomicCompareExchangeWeak(" pl ", o, nb); if (r.exchanged) { break; } o = r.old_value; }")))
+       " default: { } } return o; }\n"))
+
+(defun float-helpers :private (n: i64 sh: i64) -> str
+  (str (float-rmw "fadd" "a + v" n sh) (float-rmw "fsub" "a - v" n sh)
+       (float-rmw "fmax" "select(select(a, v, v > a), v, a != a)" n sh) (float-rmw "fmin" "select(select(a, v, v < a), v, a != a)" n sh)))
+
 ;; The helpers of a module with atomics, for `n` storage buffers and `sh` workgroup arrays.
 (defun helpers (n: i64 sh: i64) -> str
   (str (simple "add" "atomicAdd" n sh) (simple "umin" "atomicMin" n sh) (simple "umax" "atomicMax" n sh) (simple "xchg" "atomicExchange" n sh)
-       (signed "smin" "<" n sh) (signed "smax" ">" n sh) (cas n sh)))
+       (signed "smin" "<" n sh) (signed "smax" ">" n sh) (cas n sh) (float-helpers n sh)))
+
+;; The helper a float `atomicrmw` operation maps to; nil for one with no WGSL form.
+(defun frmw-helper (op: LRmwOp) -> (Option str)
+  (match op
+    ((RFAdd) (some "fibw_atomic_fadd")) ((RFSub) (some "fibw_atomic_fsub")) ((RFMax) (some "fibw_atomic_fmax")) ((RFMin) (some "fibw_atomic_fmin"))
+    (_ nil)))
 
 ;; Whether the expression is an atomic form.
 (defun atomic-form? (e: LExpr) -> bool

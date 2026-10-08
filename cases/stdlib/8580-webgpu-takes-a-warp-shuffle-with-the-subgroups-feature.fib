@@ -1,0 +1,22 @@
+;; spec:   docs/design/webgpu.md 3.7 (subgroups), types §2.17 (gpu/shfl-*, gpu/subgroup-size, gpu/ballot), lir §6.9a; docs/design/gpu.md 13
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib ../../examples/webgpu
+;; webgpu-target = accept | subgroupShuffleDown(
+;; A kernel that shuffles down by one lane: the WGSL has `enable subgroups;`, `subgroupShuffleDown(` and the header line `// fib.requires: subgroups` a driver reads
+;; before compiling (compiler/tests/native/gpu-device.sh checks the other forms and runs them on a device). On the host a thread is a warp of one: a shuffle answers the
+;; lane's own value, the warp is 1 wide, the lane 0, and the ballot is 1 or 0 by the vote; this program checks that, and its result is the number of wrong answers.
+(ns main (:require [fib.gpu :as gpu] [gpu32 :as g]))
+(defkernel k (a: ptr n: i32)
+  (let ((i (g/global-id-x)))
+    (when (< i n) (g/i32-set! a i (gpu/shfl-down-i32 (g/i32-at a i) 1i32)))))
+(defun main () -> i64
+  (+ (if (= (gpu/shfl-down-i32 7i32 1i32) 7i32) 0 1)
+     (if (= (gpu/shfl-up-i32 7i32 1i32) 7i32) 0 2)
+     (if (= (gpu/shfl-xor-i32 7i32 5i32) 7i32) 0 4)
+     (if (= (gpu/shfl-idx-i32 7i32 3i32) 7i32) 0 8)
+     (if (and (= (gpu/shfl-down-f32 2.5f32 2i32) 2.5f32) (= (gpu/shfl-up-f32 2.5f32 2i32) 2.5f32) (= (gpu/shfl-xor-f32 2.5f32 1i32) 2.5f32) (= (gpu/shfl-idx-f32 2.5f32 0i32) 2.5f32)) 0 16)
+     (if (and (= (gpu/subgroup-size) 1i32) (= (gpu/lane-id) 0i32)) 0 32)
+     (if (and (= (gpu/ballot true) 1i32) (= (gpu/ballot false) 0i32)) 0 64)))

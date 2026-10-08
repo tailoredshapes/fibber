@@ -1,0 +1,46 @@
+;; compiler/native/wgsl/subgroup.fib: warp forms in WGSL (GPU-5; docs/design/webgpu.md 3.8, docs/design/gpu.md 12; spec/lir.md 6.9a). lIR's `(shfl-down v lane)`, `shfl-up`, `shfl-xor`,
+;; `shfl-idx`, `(ballot c)`, `(sreg laneid)` and `(sreg warpsize)` are WGSL's subgroup operations: `subgroupShuffleDown/Up/Xor/subgroupShuffle`, `subgroupBallot(c).x`, the builtins
+;; `subgroup_invocation_id` and `subgroup_size`. WGSL needs `enable subgroups;` and a device created with the `subgroups` feature; a module that uses none prints neither (the golden
+;; kernels.wgsl is unchanged). A module that does says so in its header, `// fib.requires: subgroups`, which a driver reads BEFORE compiling: an adapter without the feature
+;; rejects the module by name (the harness of compiler/tests/native/gpu/wgsl_run.mjs does). The builtins reach the shuffles through two private variables the entries set, as `fibw_lid`.
+;; The answers differ from PTX's only where the source lane is out of range: PTX answers the lane's own value, WGSL leaves it unspecified; `ballot` answers the votes of lanes 0 to 31.
+;; OWNER: package GPU-5.
+(ns native.wgsl.subgroup
+  (:use lir.types lir.ast native.wgsl.wx))
+
+(def MODES: (Map str str) :private
+  {"shfl-down" "subgroupShuffleDown" "shfl-up" "subgroupShuffleUp" "shfl-xor" "subgroupShuffleXor" "shfl-idx" "subgroupShuffle"})
+
+;; Whether the name is a warp intrinsic.
+(defun intrin? (name: str) -> bool (or (contains? MODES name) (= name "ballot")))
+
+;; Whether the expression is a warp form.
+(defun warp-form? (e: LExpr) -> bool
+  (match (. e kind)
+    ((KIntrin name _ _ _ _) (intrin? name))
+    ((KSreg r) (or (= r "laneid") (= r "warpsize")))
+    (_ false)))
+
+;; The WGSL of a warp intrinsic with its operands.
+(defun form (wf: Wf name: str args: (Vec LExpr)) -> str
+  (if (= name "ballot")
+      (str "bitcast<i32>(subgroupBallot(" (wf-expr wf (nth args 0)) ").x)")
+      (str (unwrap-or (get MODES name) "") "(" (wf-expr wf (nth args 0)) ", bitcast<u32>(" (wf-expr wf (nth args 1)) "))")))
+
+;; The special registers.
+(defun sreg-text (name: str) -> (Option str)
+  (cond (= name "laneid") (some "i32(fibw_lane)") (= name "warpsize") (some "i32(fibw_sgs)") :else nil))
+
+;; The module-level text of a module that uses them: the directive, the diagnostic filter, the private copies. Tint's uniformity analysis takes `subgroup_size` read
+;; through a private variable (the entry copies the builtin) as non-uniform and refuses every shuffle that a loop on it encloses; the contract of fib.gpu.warp (every lane of
+;; the warp calls together, as `shfl.sync`'s full mask means on PTX) is the author's, so the check is turned off for the module (the barrier's workgroup uniformity stays an error).
+(defun module-text (on: bool) -> str
+  (if on (str "enable subgroups;\ndiagnostic(off, subgroup_uniformity);\nvar<private> fibw_sgs: u32;\nvar<private> fibw_lane: u32;\n") ""))
+
+;; The header line a driver checks.
+(defun header-line (on: bool) -> str (if on "// fib.requires: subgroups (the device needs the WebGPU `subgroups` feature)\n" ""))
+
+;; What the entry of a kernel takes and does.
+(defun entry-params (on: bool) -> str
+  (if on ", @builtin(subgroup_size) sgs: u32, @builtin(subgroup_invocation_id) sil: u32" ""))
+(defun entry-sets (on: bool) -> str (if on "  fibw_sgs = sgs; fibw_lane = sil;\n" ""))

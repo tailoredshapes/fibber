@@ -3,7 +3,7 @@
 ;; operands having been assigned before it, in lIR's order (spec/lir.md 5.2). So an operand text is always a name or a literal, C's
 ;; unspecified evaluation order never matters, and `select` evaluates both arms as lIR does. The C compiler undoes the temporaries.
 (ns c.expr
-  (:use lir.types lir.lit lir.ast lir.diag c.cx c.ty c.scalar c.vec c.mem c.call))
+  (:use lir.types lir.lit lir.ast lir.diag lir.intrin c.cx c.ty c.scalar c.vec c.mem c.call))
 
 ;; A form whose C text has no effect and costs nothing to repeat: names and literals.
 (defun leaf-text :private (cf: Cf e: LExpr) -> (Option str)
@@ -154,7 +154,7 @@
       ((KTrap) (emit! cf "__builtin_trap();"))
       ((KSreg _) (kernel-form! cf (. e pos) "sreg"))
       ((KBarrier) (kernel-form! cf (. e pos) "barrier"))
-      ((KIntrin name _ ty args _) (intrin! cf name ty args dst))
+      ((KIntrin name _ ty args _) (if (= (intrin-class name) "warp") (kernel-form! cf (. e pos) name) (intrin! cf name ty args dst)))
       ((KCall c args _) (let ((t (call-text cf c args))) (emit! cf (if (= dst "") (str t ";") (str dst " = " t ";")))))
       ((KLet binds body) (do (run! (fn (b: LBinding) (bind! cf b)) binds)
                              (run! (fn (x: LExpr) (stmt! cf x)) (vec (take (- (count body) 1) body)))

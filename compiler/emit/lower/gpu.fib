@@ -11,8 +11,8 @@
   (:use types.ty types.ast emit.value emit.ir emit.program emit.statics emit.lower.cx))
 
 (defun gpu-name? (name: str) -> bool
-  (or (one-of name ["gpu/local-id" "gpu/group-id" "gpu/group-size" "gpu/num-groups" "gpu/global-id" "gpu/barrier" "gpu/shared" "gpu/select" "gpu/host-index-set!" "gpu/program-ptx"])
-      (some? (atomic-op name))))
+  (or (one-of name ["gpu/local-id" "gpu/group-id" "gpu/group-size" "gpu/num-groups" "gpu/global-id" "gpu/barrier" "gpu/shared" "gpu/select" "gpu/host-index-set!" "gpu/program-ptx" "gpu/subgroup-size" "gpu/lane-id" "gpu/ballot"])
+      (some? (atomic-op name)) (some? (shfl-mode name))))
 
 (defun one-of :private (x: str xs: (Vec str)) -> bool
   (reduce (fn (acc: bool y: str) (or acc (= x y))) false xs))
@@ -99,6 +99,8 @@
 (defun atomic-op :private (name: str) -> (Option str)
   (cond (not (starts-with? name "gpu/atomic-")) nil
         (= name "gpu/atomic-add-f32") (some "fadd")
+        (= name "gpu/atomic-max-f32") (some "fmax")
+        (= name "gpu/atomic-min-f32") (some "fmin")
         (= name "gpu/atomic-cas-i32") (some "cas")
         :else (let ((rest (str-slice name 11 (str-len name))))
                 (cond (starts-with? rest "add-") (some "add") (starts-with? rest "min-") (some "min") (starts-with? rest "max-") (some "max")
@@ -114,6 +116,26 @@
           (Ok (fb-val b (str-join ["(atomicrmw " op " monotonic " (v-text p) " " (v-text x) ")"])
                       (let ((el (str-slice name (- (str-len name) 3) (str-len name)))) (cond (= el "f32") LirFloat (= el "i64") LirI64 :else LirI32))))))))
 
+;; ---- warp shuffles (GPU-5): `gpu/shfl-{down,up,xor,idx}-{i32,f32} v lane` is lIR `(shfl-MODE v lane)`, `gpu/subgroup-size` `(sreg warpsize)`, `gpu/lane-id`
+;; `(sreg laneid)`, `gpu/ballot c` `(ballot c)`. On the host every thread is a subgroup of one (the threads run one after another): a shuffle answers its own value,
+;; the size is 1, the lane 0, the ballot 1 or 0.
+(defun shfl-mode (name: str) -> (Option str)
+  (cond (not (starts-with? name "gpu/shfl-")) nil
+        :else (let ((m (str-slice name 4 (- (str-len name) 4))) (el (str-slice name (- (str-len name) 3) (str-len name))))
+                (if (and (one-of el ["i32" "f32"]) (one-of m ["shfl-down" "shfl-up" "shfl-xor" "shfl-idx"])) (some m) nil))))
+
+(defun lcx-warp :private (cx: LowerCx name: str a: (Vec V)) -> (Result V str)
+  (let ((b (. cx b)) (kt (kernel-target?)))
+    (cond (= name "gpu/subgroup-size") (Ok (fb-val b (if kt "(sreg warpsize)" "(i32 1)") LirI32))
+          (= name "gpu/lane-id") (Ok (fb-val b (if kt "(sreg laneid)" "(i32 0)") LirI32))
+          (= name "gpu/ballot")
+          (try-let ((c (arg name a 0)))
+            (Ok (fb-val b (if kt (str-join ["(ballot " (v-text c) ")"]) (str-join ["(select " (v-text c) " (i32 1) (i32 0))"])) LirI32)))
+          :else (try-let ((x (arg name a 0)) (l (arg name a 1)))
+                  (if kt
+                      (Ok (fb-val b (str-join ["(" (unwrap-or (shfl-mode name) "shfl-down") " " (v-text x) " " (v-text l) ")"]) (unwrap-or (v-ty x) LirI32)))
+                      (Ok x))))))
+
 (defun program-ptx :private (cx: LowerCx) -> V
   (let ((text (if (kernel-target?) "" (match (sys-getenv "FIB_KERNEL_PTX") ((some path) (unwrap-or (read-file path) "")) (nil "")))))
     (VVal (statics-string (. (. cx p) statics) text 0) LirPtr)))
@@ -121,6 +143,7 @@
 ;; A `gpu/*` builtin call. `gpu/barrier` and `gpu/host-index-set!` are statements (unit).
 (defun lcx-gpu (cx: LowerCx name: str e: Expr a: (Vec V)) -> (Result V str)
   (cond (some? (atomic-op name)) (lcx-atomic cx name a)
+        (or (some? (shfl-mode name)) (one-of name ["gpu/subgroup-size" "gpu/lane-id" "gpu/ballot"])) (lcx-warp cx name a)
         (= name "gpu/barrier") (do (when (kernel-target?) (fb-stmt (. cx b) "(barrier)")) (Ok VUnit))
         (= name "gpu/global-id") (try-let ((d (arg name a 0))) (Ok (global-id cx d)))
         (= name "gpu/shared") (shared-window cx e)

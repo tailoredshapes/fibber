@@ -443,7 +443,7 @@ executable form and skips the device part, with a note, where there is none. Pin
 
 **WebGPU.** WGSL has atomics on `atomic<i32>` and `atomic<u32>` only, so a module that contains an atomic prints every storage buffer and workgroup array as
 `array<atomic<u32>>` and every plain access as `atomicLoad`/`atomicStore` (webgpu.md 3.7); a module with none prints what it always printed (the golden
-kernels.wgsl is unchanged). Signed min and max and `cas` are loops of `atomicCompareExchangeWeak`; an f32 or 64-bit atomic is refused by name. Dawn's
+kernels.wgsl is unchanged). Signed min and max and `cas` are loops of `atomicCompareExchangeWeak`; a 64-bit atomic is refused by name (an f32 one was too until GPU-5, section 13). Dawn's
 uniformity analysis shaped the reductions: the printer makes any function with a branch a `loop { switch }` state machine, and Tint then takes a barrier in it
 as non-uniform when anything after the barrier branches on the thread. So the reductions have no thread-dependent branch in a function that holds a barrier
 (masks through `gpu/select`, folds in functions of their own, every thread doing the final atomic with the identity for those that must not add), and the
@@ -451,5 +451,24 @@ number of blocks is a kernel argument checked against `gpu/num-groups` (a read o
 in the WGSL target returns zeros and goes on (webgpu.md 3.4), so a loop that steps by a trapped call's answer must not: the folds step past n if the total is 0.
 
 **Not done:** pinned host memory and async launch (item 8: `cuMemHostAlloc`, `cuMemcpyHtoDAsync` belong to the driver repository fib-gpu-cuda, which the
-core does not contain; the download at 0.4 GB/s is still the cost of not having it); a warp shuffle reduction (an intrinsic family); f32 atomic add and
-min/max through WGSL (no form); a relooper in the WGSL printer (webgpu.md 9.3), which would lift the branch rules above.
+core does not contain; the download at 0.4 GB/s is still the cost of not having it); (a warp shuffle reduction and f32 atomics through WGSL: section 13, GPU-5); a relooper in the WGSL printer (webgpu.md 9.3), which would lift the branch rules above.
+
+## 13. Warp shuffles and f32 atomics on WebGPU (GPU-5)
+
+The two kernel-side gaps of section 12. Verified on this machine's RTX 4080 SUPER through libcuda (PTX) and Dawn (WGSL, subgroups feature present, subgroup size 32);
+`compiler/tests/native/gpu-device.sh` is the executable form and skips the device part, with a note, where there is none.
+
+| what | where | verdict |
+|---|---|---|
+| warp shuffles as builtins | `gpu/shfl-{down,up,xor,idx}-{i32,f32}`, `gpu/subgroup-size`, `gpu/lane-id`, `gpu/ballot` (compiler/types/builtins.fib, emit.lower.gpu; spec/types.md 2.17): lIR `(shfl-MODE v lane)`, `(sreg warpsize)`, `(sreg laneid)`, `(ballot c)` (spec/lir.md 6.9a, the intrinsic table of lir.intrin, class `warp`) | PTX `shfl.sync.{down,up,bfly,idx}.b32 .., 31 (0 for up), -1`, `%warpsize`, `%laneid`, `vote.sync.ballot.b32`; WGSL `subgroupShuffle*`, `subgroupBallot(c).x`, the entry builtins (webgpu.md 3.6). On the host a thread is a warp of one |
+| rejected where unsupported | a WGSL module that uses a warp form says `// fib.requires: subgroups`; a device without the feature rejects it by name before compiling; the C and JS backends refuse the forms like `sreg` | `rejected: the module requires the WebGPU subgroups feature ..` (exit 4 of the harnesses) |
+| the library | `fib.gpu.warp` (exported by `fib.gpu`: `shfl-down-i32` .., `subgroup-size`, `lane-id`, `ballot`), `fib.gpu.reduce-warp` (`block-sum-i32 -max-i32 -min-i32 block-sum-f32 -max-f32`), `fib.gpu.reduce-warp-kernels` (`reduce-warp-sum-i32 -max-i32 -min-i32 -max-f32 -partials-f32`, `warp-probe`) | the butterfly `shfl-xor` reduces a warp so every lane holds its value; one shared word per thread, one barrier, a second butterfly over the warp values: one barrier where the tree has 2 log2(block). Integer and f32-max results equal the CPU's exactly; the f32 sum is deterministic for a warp width but not the tree's order, within n * 2^-24 * sum \|x\| of the left-to-right sum |
+| f32 atomics in WGSL | `gpu/atomic-add-f32` (and, new, `gpu/atomic-max-f32`, `gpu/atomic-min-f32`; lIR `atomicrmw fadd fsub fmax fmin`) lowered in native/wgsl/atomic.fib to a compare-and-exchange loop over the u32 bits; PTX keeps `atom.global.add.f32` | accepted by the WGSL printer (cases 8578, 8580); add within the documented bound, max and min exact |
+| library additions | `fib.gpu.atomic`: `f32-fetch-max`, `f32-fetch-min`, `f32-min!` (and the existing `f32-fetch-add`, `f32-add!`, `f32-max!`) | `reduce-sum-f32` (fib.gpu.reduce-atomic-f32) now builds for WGSL too |
+
+**Uniformity.** Tint's `subgroup_uniformity` analysis cannot prove the shuffles uniform when the loop bound is `subgroup_size` read through a private variable, so a module that uses
+warp forms is printed with `diagnostic(off, subgroup_uniformity);` (webgpu.md 3.6); the contract (every lane of the warp calls together) is the library's, as on PTX. The workgroup
+uniformity of the barrier stays an error and the reductions keep the rules of section 12 (no thread-dependent branch before a barrier). The ballot answers the lanes 0 to 31 only.
+Mapping: the library takes the warp of a thread as the run of local ids `[k * size, (k + 1) * size)` (the partial of warp k is the word k * size of the window); WGSL does not promise it,
+`warp-probe` checks it on the device. **Not done:** `subgroup_id` and `num_subgroups` (a WGSL feature of its own), shuffles of 64-bit or vector values, `shfl.sync` with a partial mask (a
+divergent warp), `match.sync`, warp-level `redux.sync` (sm_80), cooperative groups.

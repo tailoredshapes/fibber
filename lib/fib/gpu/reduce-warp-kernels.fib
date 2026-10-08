@@ -1,0 +1,41 @@
+;; fib.gpu.reduce-warp-kernels: grid reductions by warp shuffle, as fib.gpu.reduce-kernels (docs/design/gpu.md 12) with the block step of fib.gpu.reduce-warp. Same arguments
+;; `(data out n blocks)`, same folds, same identities for `out[0]`, and the same results: the integer and f32-max kernels equal the CPU's exactly; `reduce-warp-partials-f32`
+;; writes block b's value to partials[b] (deterministic for a given warp width, the host adds the partials) and is within n * 2^-24 * sum |x| of the left-to-right sum.
+;;   reduce-warp-sum-i32  reduce-warp-max-i32  reduce-warp-min-i32  reduce-warp-max-f32  reduce-warp-partials-f32
+;; The block must be a power of two of 32 .. 256 on PTX (the warp is 32) and of at least subgroup-size in WGSL, else a device trap.
+;; `warp-probe (out n)` is the test of the primitives (compiler/tests/native/gpu-device.sh): thread t (global id) writes eight words at out[8t]: its lane, the warp width, the
+;; shuffles of v = 7t + 3 (down 1, up 2, xor 5, idx 3), the ballot of "lane mod 3 = 0", and the bits of the f32 shuffle-down by 2 of v as a float. The harness compares them with a model of the warp.
+(ns fib.gpu.reduce-warp-kernels (:use fib.core) (:require [fib.gpu :as gpu] [fib.gpu.reduce :as r] [fib.gpu.reduce-warp :as rw] [fib.gpu.reduce-kernels :as k] [fib.gpu.warp :as w]))
+
+(defkernel reduce-warp-sum-i32 (data: ptr out: ptr n: i32 blocks: i32)
+  (let ((blk (rw/block-sum-i32 (k/fold-sum-i32 data n (k/threads blocks)))))
+    (gpu/i32-add! out 0i32 (r/sel-i32 (= (r/tid) 0i32) blk 0i32))))
+
+(defkernel reduce-warp-max-i32 (data: ptr out: ptr n: i32 blocks: i32)
+  (let ((blk (rw/block-max-i32 (k/fold-max-i32 data n (k/threads blocks)))))
+    (gpu/i32-max! out 0i32 blk)))
+
+(defkernel reduce-warp-min-i32 (data: ptr out: ptr n: i32 blocks: i32)
+  (let ((blk (rw/block-min-i32 (k/fold-min-i32 data n (k/threads blocks)))))
+    (gpu/i32-min! out 0i32 blk)))
+
+(defkernel reduce-warp-partials-f32 (data: ptr partials: ptr n: i32 blocks: i32)
+  (let ((blk (rw/block-sum-f32 (k/thread-sum data n (k/threads blocks)))))
+    (r/f32-set! partials (r/block-id) blk)))
+
+(defkernel reduce-warp-max-f32 (data: ptr out: ptr n: i32 blocks: i32)
+  (let ((blk (rw/block-max-f32 (k/fold-max-f32 data n (k/threads blocks)))))
+    (gpu/f32-max! out 0i32 blk)))
+
+(defkernel warp-probe (out: ptr n: i32)
+  (let ((t (r/global-id)) (v (unchecked-add (unchecked-multiply 7i32 (r/global-id)) 3i32)) (lane (w/lane-id)))
+    (let ((down (w/shfl-down-i32 v 1i32)) (up (w/shfl-up-i32 v 2i32)) (x (w/shfl-xor-i32 v 5i32)) (idx (w/shfl-idx-i32 v 3i32))
+          (bal (w/ballot (= (rem lane 3i32) 0i32))) (fd (w/shfl-down-f32 (sitofp f32 v) 2i32)))
+      (do (r/i32-set! out (unchecked-multiply 8i32 t) lane)
+          (r/i32-set! out (unchecked-add (unchecked-multiply 8i32 t) 1i32) (w/subgroup-size))
+          (r/i32-set! out (unchecked-add (unchecked-multiply 8i32 t) 2i32) down)
+          (r/i32-set! out (unchecked-add (unchecked-multiply 8i32 t) 3i32) up)
+          (r/i32-set! out (unchecked-add (unchecked-multiply 8i32 t) 4i32) x)
+          (r/i32-set! out (unchecked-add (unchecked-multiply 8i32 t) 5i32) idx)
+          (r/i32-set! out (unchecked-add (unchecked-multiply 8i32 t) 6i32) bal)
+          (r/i32-set! out (unchecked-add (unchecked-multiply 8i32 t) 7i32) (f32->bits fd))))))

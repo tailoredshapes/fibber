@@ -6,7 +6,7 @@
 ;; trap's message, which only the runtime's trap entries take) is a null `Ptr`: the message is lost on the device, as on CUDA. OWNER: package WEBGPU-1.
 (ns native.wgsl.expr
   (:use lir.types lir.lit lir.ast native.wgsl.wx)
-  (:require [native.wgsl.atomic :as atomic]))
+  (:require [native.wgsl.atomic :as atomic] [native.wgsl.subgroup :as sg]))
 
 ;; ---------------------------------------------------------------- literals
 
@@ -98,7 +98,9 @@
 ;; `(atomicrmw OP ord p v)` on an i32: the helper of the prelude, bits in and out; the old value is the answer.
 (defun rmw-form :private (wf: Wf op: LRmwOp p: LExpr v: LExpr) -> str
   (let ((t (type-of! wf v)))
-    (cond (= t ty-float) (refuse wf "an f32 atomic (WGSL has atomic<i32> and atomic<u32> only; accumulate in i32 with a scale, or reduce in the workgroup)")
+    (cond (= t ty-float) (match (atomic/frmw-helper op)
+                           ((some h) (str "bitcast<f32>(" h "(" (wf-expr wf p) ", bitcast<u32>(" (wf-expr wf v) ")))"))
+                           (nil (refuse wf "an f32 atomicrmw operation WGSL lacks (fadd, fsub, fmax and fmin are compare-and-exchange loops)")))
           (not (= t ty-i32)) (refuse wf (str "an atomic on " (type-refusal t) " (WGSL atomics are 32-bit)"))
           :else (match (atomic/rmw-helper op)
                   ((some h) (i32-of (str h "(" (wf-expr wf p) ", " (u32-of (wf-expr wf v)) ")")))
@@ -234,7 +236,9 @@
         (= name "ctaid.x") "i32(fibw_wid.x)" (= name "ctaid.y") "i32(fibw_wid.y)" (= name "ctaid.z") "i32(fibw_wid.z)"
         (= name "ntid.x") "i32(wg_x)" (= name "ntid.y") "i32(wg_y)" (= name "ntid.z") "i32(wg_z)"
         (= name "nctaid.x") "i32(fibw_nwg.x)" (= name "nctaid.y") "i32(fibw_nwg.y)" (= name "nctaid.z") "i32(fibw_nwg.z)"
-        :else (refuse wf (str "(sreg " name "): no WGSL builtin carries it"))))
+        :else (match (sg/sreg-text name)
+                ((some t) t)
+                (nil (refuse wf (str "(sreg " name "): no WGSL builtin carries it"))))))
 
 (defun args-wgsl (wf: Wf args: (Vec LExpr)) -> str
   (str-join (vec (map-indexed (fn (i: i64 e: LExpr) (str (if (= i 0) "" ", ") (wf-expr wf e))) args))))
@@ -317,7 +321,7 @@
     ((KSreg name) (sreg-form wf name))
     ((KBarrier) "workgroupBarrier()")
     ((KCall c args _) (call-form wf c args))
-    ((KIntrin name _ _ args _) (intrin-form wf name args))
+    ((KIntrin name _ _ args _) (if (sg/intrin? name) (sg/form wf name args) (intrin-form wf name args)))
     ((KLoad t p _ _) (load-form wf t p))
     ((KGep _ t p idx) (gep-form wf t p idx))
     ((KStr _) "Ptr(0u, 0u)")
