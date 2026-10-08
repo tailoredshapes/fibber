@@ -37,7 +37,7 @@
 
 (defun rewrites-rest :private () -> (Vec (Pair str str))
   [
-   (Pair "(define internal (fib.pool-quiesce void) ()\n  (block entry (call @fib.rq-lock) (br test))\n  (block test\n    (br (and (icmp eq (load ptr @fib.rq-head) (ptr null)) (icmp eq (load i32 @fib.pool-busy) (i32 0))) done sleep))\n  (block sleep\n    (call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))\n    (br test))\n  (block done (call @fib.rq-unlock) (call @fib.lc-report) (ret)))"
+   (Pair "(define internal (fib.pool-quiesce void) ()\n  (block entry (call @fib.sched-quiesce) (call @fib.rq-lock) (br test))\n  (block test\n    (br (and (icmp eq (load ptr @fib.rq-head) (ptr null)) (icmp eq (load i32 @fib.pool-busy) (i32 0))) done sleep))\n  (block sleep\n    (call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))\n    (br test))\n  (block done (call @fib.rq-unlock) (call @fib.lc-report) (ret)))"
          "(define internal (fib.pool-quiesce void) ()\n  (block entry (br test))\n  (block test\n    (let ((t (call @fib.dequeue)))\n      (br (icmp eq t (ptr null)) done run)))\n  (block run (call @fib.run-one t) (br test))\n  (block done (call @fib.lc-report) (ret)))")
    (Pair "(call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))"
          "(call @fib.w.deadlock)")
@@ -76,6 +76,10 @@
    ;; the work-stealing pool (rt/sched.lir, rt/deque.lir): no worker, so a fork runs the task at once; no affinity call
    (Pair "(let ((cached (load i64 @fib.sched-n)))\n      (br (icmp ne cached (i64 0)) have compute)))"
          "(let ((cached (i64 0)))\n      (br (icmp eq cached (i64 0)) have compute)))")
+   (Pair "(call @pthread_cond_wait (load ptr @fib.sched-cond) (load ptr @fib.sched-mutex))"
+         "(call @fib.w.deadlock)")
+   (Pair "(call @pthread_cond_wait (load ptr @fib.sched-jcond) (load ptr @fib.sched-mutex))"
+         "(call @fib.w.deadlock)")
    (Pair "(declare sched_getaffinity i32 (i32 i64 ptr))\n"
          "")
    (Pair "(rc (call @sched_getaffinity (i32 0) (i64 128) mask))"

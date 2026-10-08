@@ -2,7 +2,7 @@
 ;; `(Task a)` as `spawn` makes one (closure in slot 9, result atom in 7, failure in 10) whose resume function (slot 6) is the pool
 ;; runner the compiler emits for its result type (emit.lower.threads `pool-entry`); a task with both a closure and a resume function is
 ;; a pool task, which is how fib.drive tells the tiers apart. Workers start on the first fork, W = FIB_THREADS, else the CPUs of the
-;; affinity mask (sched_getaffinity), capped by the cgroup v2 quota of /sys/fs/cgroup/cpu.max; one Chase-Lev deque per worker (Le, Pop,
+;; affinity mask (the affinity call of Linux), capped by the cgroup v2 quota of /sys/fs/cgroup/cpu.max; one Chase-Lev deque per worker (Le, Pop,
 ;; Cohen, Nardelli 2013: the orderings of docs/design/parallelism/proto/cl.lir, unchanged; a ring of 4096, a full ring runs the task
 ;; inline at the fork); an injector list for the threads that are not workers (main, spawned threads); random-victim stealing; an
 ;; eventcount (an epoch word, a count of sleepers, one mutex and one condition variable for the sleep itself) with the re-check after
@@ -130,80 +130,20 @@
 (define internal (fib.sched-knobs void) ()
   (block entry
     (let ((a (call @getenv (string "FIB_SPIN")))
-          (b (call @getenv (string "FIB_SCHED_SKIP"))))
+          (b (call @getenv (string "FIB_SCHED_SKIP")))
+          (end (alloca ptr)))
       (br (icmp eq a (ptr null)) second spin)))
   (block spin
-    (store (call @strtol a (ptr null) (i32 10)) @fib.sched-spin)
-    (br second))
+    (let ((n (call @fib.sched-num a end)))
+      (store (select (icmp slt n (i64 0)) (i64 32) n) @fib.sched-spin)
+      (br second)))
   (block second
     (br (icmp eq b (ptr null)) done skip))
   (block skip
-    (store (trunc i32 (call @strtol b (ptr null) (i32 10))) @fib.sched-skip)
-    (br done))
+    (let ((m (call @fib.sched-num b end)))
+      (store (select (icmp eq m (i64 0)) (i32 0) (i32 1)) @fib.sched-skip)
+      (br done)))
   (block done (ret)))
-
-;; ---- the eventcount
-
-;; After a push: a sleeper, if there is one, is woken. The fence orders the push before the read of the sleepers against a sleeper's
-;; announcement before its re-check (fib.sched-announce), so one of the two sees the other.
-(define internal (fib.sched-signal void) ()
-  (block entry
-    (fence seq_cst)
-    (br (and (icmp ne (load i32 @fib.sched-skip) (i32 0)) (icmp sgt (atomic-load monotonic i32 @fib.sched-idlers) (i32 0))) done sleepers?))
-  (block sleepers?
-    (br (icmp sgt (atomic-load monotonic i32 @fib.sched-sleepers) (i32 0)) wake done))
-  (block wake
-    (call @pthread_mutex_lock (load ptr @fib.sched-mutex))
-    (atomic-store release (add (atomic-load monotonic i32 @fib.sched-ec) (i32 1)) @fib.sched-ec)
-    (call @pthread_mutex_unlock (load ptr @fib.sched-mutex))
-    (call @pthread_cond_signal (load ptr @fib.sched-cond))
-    (br done))
-  (block done (ret)))
-
-;; A completion with a parked joiner: every sleeper is woken (a joiner waits for its own task's state, not for work).
-(define internal (fib.sched-wake-all void) ()
-  (block entry
-    (call @pthread_mutex_lock (load ptr @fib.sched-mutex))
-    (atomic-store release (add (atomic-load monotonic i32 @fib.sched-ec) (i32 1)) @fib.sched-ec)
-    (call @pthread_mutex_unlock (load ptr @fib.sched-mutex))
-    (call @pthread_cond_broadcast (load ptr @fib.sched-cond))
-    (call @pthread_cond_broadcast (load ptr @fib.sched-jcond))
-    (ret)))
-
-;; A thread that is not a worker sleeps until the epoch moves, on the joiners' condition.
-(define internal (fib.sched-sleep-joiner void) ((i32 epoch))
-  (block entry
-    (call @pthread_mutex_lock (load ptr @fib.sched-mutex))
-    (br test))
-  (block test
-    (br (icmp eq (atomic-load acquire i32 @fib.sched-ec) epoch) wait out))
-  (block wait
-    (call @pthread_cond_wait (load ptr @fib.sched-jcond) (load ptr @fib.sched-mutex))
-    (br test))
-  (block out (call @pthread_mutex_unlock (load ptr @fib.sched-mutex)) (ret)))
-
-;; The epoch to sleep against, read before the announcement; then "I am about to sleep".
-(define internal (fib.sched-announce i32) ()
-  (block entry
-    (let ((epoch (atomic-load acquire i32 @fib.sched-ec)))
-      (atomicrmw add seq_cst @fib.sched-sleepers (i32 1))
-      (fence seq_cst)
-      (ret epoch))))
-
-;; Sleeps until the epoch moves (the caller has announced and re-checked), then withdraws the announcement.
-(define internal (fib.sched-sleep void) ((i32 epoch))
-  (block entry
-    (call @pthread_mutex_lock (load ptr @fib.sched-mutex))
-    (br test))
-  (block test
-    (br (icmp eq (atomic-load acquire i32 @fib.sched-ec) epoch) wait out))
-  (block wait
-    (call @pthread_cond_wait (load ptr @fib.sched-cond) (load ptr @fib.sched-mutex))
-    (br test))
-  (block out
-    (call @pthread_mutex_unlock (load ptr @fib.sched-mutex))
-    (atomicrmw sub seq_cst @fib.sched-sleepers (i32 1))
-    (ret)))
 
 ;; ---- forking and running
 
@@ -469,196 +409,3 @@
       (br (icmp eq t (ptr null)) idle run)))
   (block run (call @fib.sched-run t) (br loop))
   (block idle (call @fib.sched-idle w) (br loop)))
-
-;; ---- joining
-
-;; Runs `task` on this thread if its driver can be claimed and it has not started (a joiner's inline run); 1 when it ran.
-(define internal (fib.sched-claim-run i1) ((ptr task))
-  (block entry
-    (let ((dp (getelementptr %struct.fib.task task (i32 0) (i32 4)))
-          (sp (getelementptr %struct.fib.task task (i32 0) (i32 3)))
-          (r (cmpxchg acq_rel acquire dp (i32 0) (i32 1))))
-      (br (extractvalue r 1) claimed no)))
-  (block claimed
-    (br (icmp eq (atomic-load acquire i32 sp) (i32 0)) resume unclaim))
-  (block resume
-    (atomic-store release (i32 1) sp)
-    (indirect-call (load ptr (getelementptr %struct.fib.task task (i32 0) (i32 6))) (fn void (ptr)) task)
-    (atomic-store release (i32 0) dp)
-    (ret (i1 1)))
-  (block unclaim (atomic-store release (i32 0) dp) (br no))
-  (block no (ret (i1 0))))
-
-;; Takes the waiter `node` out of the task's list, under its lock; 0 when it is not there (the completion took the list and wakes).
-(define internal (fib.sched-unregister i1) ((ptr task) (ptr node))
-  (block entry
-    (let ((lockp (getelementptr %struct.fib.task task (i32 0) (i32 5)))
-          (wp (getelementptr %struct.fib.task task (i32 0) (i32 8))))
-      (call @fib.lock lockp)
-      (br find)))
-  (block find
-    (let ((linkp (phi ptr (entry wp) (next nextp)))
-          (cur (load ptr linkp)))
-      (br (icmp eq cur (ptr null)) gone test)))
-  (block test (br (icmp eq cur node) unlink next))
-  (block next (let ((nextp (getelementptr i8 cur (i64 8)))) (br find)))
-  (block unlink
-    (atomic-store release (load ptr (getelementptr i8 node (i64 8))) linkp)
-    (call @fib.unlock lockp)
-    (call @free node)
-    (ret (i1 1)))
-  (block gone (call @fib.unlock lockp) (ret (i1 0))))
-
-;; Parks this thread until `task` is done or the epoch moves (a completion with a parked joiner; for a worker a fork too): a waiter
-;; node whose word is 1 on the task, under its lock, after the epoch is read; then the check of the state (a seq_cst fence between,
-;; against the completion's: fib.sched-wake-waiters), the re-check of work for a worker, and the sleep. A worker is a sleeper of the
-;; eventcount while it waits (a fork wakes it to help); another thread is not.
-(define internal (fib.sched-wait void) ((ptr task) (i1 worker))
-  (block entry (br worker announce plain))
-  (block announce (let ((e1 (call @fib.sched-announce))) (br go)))
-  (block plain (let ((e2 (atomic-load acquire i32 @fib.sched-ec))) (br go)))
-  (block go
-    (let ((epoch (phi i32 (announce e1) (plain e2)))
-          (lockp (getelementptr %struct.fib.task task (i32 0) (i32 5)))
-          (sp (getelementptr %struct.fib.task task (i32 0) (i32 3)))
-          (node (call @malloc (i64 16)))
-          (wp (getelementptr %struct.fib.task task (i32 0) (i32 8))))
-      (store (inttoptr ptr (i64 1)) node)
-      (call @fib.lock lockp)
-      (store (load ptr wp) (getelementptr i8 node (i64 8)))
-      (atomic-store release node wp)
-      (call @fib.unlock lockp)
-      (fence seq_cst)
-      (br (icmp eq (atomic-load acquire i32 sp) (i32 2)) done registered)))
-  (block done (br (call @fib.sched-unregister task node) withdraw registered))
-  (block registered (br worker recheck joiner))
-  (block recheck (br (call @fib.sched-any-work) abandon sleep))
-  (block abandon (call @fib.sched-unregister task node) (br withdraw))
-  (block sleep (call @fib.sched-sleep epoch) (call @fib.sched-unregister task node) (ret))
-  (block joiner (call @fib.sched-sleep-joiner epoch) (call @fib.sched-unregister task node) (ret))
-  (block withdraw
-    (br worker withdraw2 out))
-  (block withdraw2 (atomicrmw sub seq_cst @fib.sched-sleepers (i32 1)) (br out))
-  (block out (ret)))
-
-;; A joiner about to park looks at the task's state a few thousand times first: a task a thief took a moment ago is mostly done within
-;; a microsecond, and a park (a futex wait and the completion's wake-up) costs more than that. 1 when the task is done.
-(define internal (fib.sched-spin-done i1) ((ptr task))
-  (block entry (br loop))
-  (block loop
-    (let ((i (phi i64 (entry (i64 0)) (next i2))))
-      (br (icmp slt i (i64 3000)) look no)))
-  (block look
-    (br (icmp eq (atomic-load acquire i32 (getelementptr %struct.fib.task task (i32 0) (i32 3))) (i32 2)) yes next))
-  (block next (let ((i2 (add i (i64 1)))) (br loop)))
-  (block yes (ret (i1 1)))
-  (block no (ret (i1 0))))
-
-;; `join` of a pool task (from fib.drive). A worker runs the task itself when it can claim it, else helps with any work there is,
-;; and parks when there is none or it is too deep in helps. Another thread runs the task itself when it can claim it and the program
-;; catches (the runner isolates a trap then), else parks: a trap in a task run on a thread without a worker's chain could not be
-;; isolated. With no workers at all the task runs inline.
-(define internal (fib.sched-join void) ((ptr task))
-  (block entry
-    (let ((sp (getelementptr %struct.fib.task task (i32 0) (i32 3))))
-      (br loop)))
-  (block loop
-    (br (icmp eq (atomic-load acquire i32 sp) (i32 2)) done who))
-  (block who
-    (let ((w (call @fib.sched-self)))
-      (br (icmp eq w (ptr null)) other worker)))
-  (block other
-    (br (icmp eq (load i64 @fib.sched-n) (i64 0)) inline catching?))
-  (block inline (call @fib.sched-claim-run task) (br loop))
-  (block catching?
-    (br (icmp ne (atomic-load monotonic i32 @fib.sched-catching) (i32 0)) try park))
-  (block try (br (call @fib.sched-claim-run task) loop park))
-  (block park (br (call @fib.sched-spin-done task) loop park2))
-  (block park2 (call @fib.sched-wait task (i1 0)) (br loop))
-  (block worker
-    (br (call @fib.sched-claim-run task) loop help))
-  (block help
-    (br (icmp sge (load i64 (getelementptr i8 w (i64 200))) (load i64 @fib.sched-max-depth)) deep find))
-  (block find
-    (let ((t (call @fib.sched-find w)))
-      (br (icmp eq t (ptr null)) deep? run)))
-  (block deep? (br (call @fib.sched-spin-done task) loop idle))
-  (block idle (call @fib.sched-wait task (i1 1)) (br loop))
-  (block run (call @fib.sched-run t) (br loop))
-  (block deep (call @fib.sched-wait task (i1 0)) (br loop))
-  (block done (ret)))
-
-;; ---- blocking sections and the exit
-
-;; `(blocking ..)` on a worker: one more worker for the duration (up to W more; a spare that was started stays, parked, after).
-(define internal (fib.sched-block-enter void) ()
-  (block entry
-    (br (icmp eq (call @fib.sched-self) (ptr null)) done count))
-  (block count
-    (let ((b (add (atomicrmw add acq_rel @fib.sched-blocked (i64 1)) (i64 1)))
-          (n (load i64 @fib.sched-n)))
-      (call @fib.lock @fib.sched-inj-lock)
-      (let ((live (atomic-load acquire i64 @fib.sched-live)))
-        (br (and (icmp sgt (add n b) live) (icmp slt live (mul n (i64 2)))) more enough))))
-  (block more
-    (atomic-store release (add live (i64 1)) @fib.sched-live)
-    (atomicrmw add seq_cst @fib.sched-active (i64 1))
-    (call @fib.sched-start-thread (call @fib.sched-rec live))
-    (br enough))
-  (block enough (call @fib.unlock @fib.sched-inj-lock) (br done))
-  (block done (ret)))
-
-(define internal (fib.sched-block-leave void) ()
-  (block entry
-    (br (icmp eq (call @fib.sched-self) (ptr null)) done count))
-  (block count (atomicrmw sub acq_rel @fib.sched-blocked (i64 1)) (br done))
-  (block done (ret)))
-
-;; At the exit (fib.pool-quiesce): waits until every worker is parked with nothing left anywhere; a program that never forked
-;; returns at once.
-(define internal (fib.sched-quiesce void) ()
-  (block entry
-    (br (icmp eq (atomic-load acquire i32 @fib.sched-state) (i32 2)) test done))
-  (block test
-    (br (icmp eq (atomic-load acquire i64 @fib.sched-active) (i64 0)) check sleep))
-  (block check
-    (br (call @fib.sched-any-work) sleep done))
-  (block sleep
-    (let ((ts (alloca (align 8) i64 (i32 2))))
-      (store (i64 0) ts)
-      (store (i64 200000) (getelementptr i64 ts (i32 1)))
-      (call @nanosleep ts (ptr null))
-      (br test)))
-  (block done (ret)))
-
-;; The sum over the live records of the counter at `off`.
-(define internal (fib.sched-sum i64) ((i64 off))
-  (block entry (let ((n (atomic-load acquire i64 @fib.sched-live))) (br loop)))
-  (block loop
-    (let ((i (phi i64 (entry (i64 0)) (next i2)))
-          (acc (phi i64 (entry (i64 0)) (next acc2))))
-      (br (icmp slt i n) one done)))
-  (block one
-    (let ((acc2 (add acc (load i64 (getelementptr i8 (call @fib.sched-rec i) off))))
-          (i2 (add i (i64 1))))
-      (br next)))
-  (block next (br loop))
-  (block done (ret acc)))
-
-;; What the library asks the pool (lib/fib/os/sched.fib): 0 the worker count; 1 blocking enter; 2 blocking leave; 3 whether this
-;; thread is a worker; 4 tasks run by workers; 5 steals; 6 live workers; 7 forks run inline for a full ring; 8 whether the pool started.
-;; extern: (declare fib_sched_ctl i64 (i64 i64))
-(define internal (fib_sched_ctl i64) ((i64 op) (i64 a))
-  (block entry
-    (switch op other ((i64 0) count) ((i64 1) enter) ((i64 2) leave) ((i64 3) self) ((i64 4) run) ((i64 5) steals)
-      ((i64 6) live) ((i64 7) inline) ((i64 8) started)))
-  (block count (ret (call @fib.sched-count)))
-  (block enter (call @fib.sched-block-enter) (ret (i64 0)))
-  (block leave (call @fib.sched-block-leave) (ret (i64 0)))
-  (block self (ret (select (icmp ne (call @fib.sched-self) (ptr null)) (i64 1) (i64 0))))
-  (block run (ret (call @fib.sched-sum (i64 160))))
-  (block steals (ret (call @fib.sched-sum (i64 168))))
-  (block live (ret (atomic-load acquire i64 @fib.sched-live)))
-  (block inline (ret (call @fib.sched-sum (i64 184))))
-  (block started (ret (select (icmp eq (atomic-load acquire i32 @fib.sched-state) (i32 2)) (i64 1) (i64 0))))
-  (block other (ret (i64 -1))))

@@ -1,5 +1,5 @@
 #!/bin/bash
-# scripts/mutant-sched.sh: planted faults in the work-stealing pool (rt/sched.lir, rt/deque.lir, the pool runner of
+# scripts/mutant-sched.sh: planted faults in the work-stealing pool (rt/sched.lir, rt/park.lir, rt/deque.lir, the pool runner of
 # compiler/emit/lower/threads.fib; docs/design/parallelism.md 3.1, the acceptance rows of P-sched). The runtime is embedded in the
 # compiler, so each mutant copies the tree to a scratch directory, breaks ONE thing in the copy, regenerates compiler/emit/runtime.fib,
 # builds a stage 2 from the copy (about 90 s) and runs the cases and stress programs that pin the rule, under a timeout. Every one must
@@ -59,7 +59,7 @@ case $MODE in
   pop-fence-release) mut rt/deque.lir 's/\(atomic-store monotonic b bp\)\n      \(fence seq_cst\)/(atomic-store monotonic b bp)\n      (fence release)/'; expect_survive=1 ;;
   lost-wakeup)       mut rt/sched.lir 's/\(br \(call \@fib\.sched-any-work\) withdraw sleep\)\)\)\n  \(block withdraw \(atomicrmw sub seq_cst \@fib\.sched-sleepers \(i32 1\)\) \(br out\)\)/(br sleep)))\n  (block withdraw (atomicrmw sub seq_cst \@fib.sched-sleepers (i32 1)) (br out))/' ;;
   complete-no-fence) mut rt/sched.lir 's/\(atomic-store release \(i32 2\) \(getelementptr %struct\.fib\.task task \(i32 0\) \(i32 3\)\)\)\n      \(fence seq_cst\)/(atomic-store release (i32 2) (getelementptr %struct.fib.task task (i32 0) (i32 3)))/' ;;
-  park-not-help)     mut rt/sched.lir 's/\(br \(icmp sge \(load i64 \(getelementptr i8 w \(i64 200\)\)\) \(load i64 \@fib\.sched-max-depth\)\) deep find\)/(br (icmp sge (i64 0) (i64 0)) deep find)/'; mut rt/sched.lir 's/\(br \(call \@fib\.sched-claim-run task\) loop help\)/(br (icmp eq (i64 0) (i64 1)) loop help)/' ;;
+  park-not-help)     mut rt/park.lir 's/\(br \(icmp sge \(load i64 \(getelementptr i8 w \(i64 200\)\)\) \(load i64 \@fib\.sched-max-depth\)\) deep find\)/(br (icmp sge (i64 0) (i64 0)) deep find)/'; mut rt/park.lir 's/\(br \(call \@fib\.sched-claim-run task\) loop help\)/(br (icmp eq (i64 0) (i64 1)) loop help)/' ;;
   run-unclaimed)     mut rt/sched.lir 's/\(r \(cmpxchg acq_rel acquire dp \(i32 0\) \(i32 1\)\)\)\)\n      \(br \(extractvalue r 1\) claimed out\)\)\)\n  \(block claimed\n    \(br \(icmp ult/(r (cmpxchg acq_rel acquire dp (i32 0) (i32 1))))\n      (br claimed)))\n  (block claimed\n    (br (icmp ult/' ;;
   complete-first)    mut compiler/emit/lower/threads.fib 's/:else \(str-join \[head "      \(let \(" \(pool-call uw r\) "\)\\n" store finish "\)\)\)\)\\n"\]\)/:else (str-join [head "      (let (" (pool-call uw r) ")\\n      (call \@fib.sched-complete task prev)\\n" store "      (ret)))))\\n"])/' ;;
   check) ;;

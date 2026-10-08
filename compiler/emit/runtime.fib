@@ -2829,6 +2829,30 @@
 
 ;; ---- the worker count: FIB_THREADS, else the affinity mask capped by the cgroup quota (1 to 256)
 
+;; The decimal number at p (leading blanks skipped, digits only; no sign), -1 when there is none; *endp is left after the digits. No
+;; strtol: a WASI runtime has none of the guard section's declarations, and a number this small needs no more.
+(define internal (fib.sched-num i64) ((ptr p) (ptr endp))
+  (block entry (br skip))
+  (block skip
+    (let ((q (phi ptr (entry p) (blank q2)))
+          (c (load i8 q)))
+      (br (icmp eq c (i8 32)) blank digits)))
+  (block blank (let ((q2 (getelementptr i8 q (i64 1)))) (br skip)))
+  (block digits
+    (br (and (icmp uge (load i8 q) (i8 48)) (icmp ule (load i8 q) (i8 57))) scan none))
+  (block none (store q endp) (ret (i64 -1)))
+  (block scan (br loop))
+  (block loop
+    (let ((r (phi ptr (scan q) (more r2)))
+          (acc (phi i64 (scan (i64 0)) (more acc2)))
+          (d (load i8 r)))
+      (br (and (icmp uge d (i8 48)) (icmp ule d (i8 57))) more done)))
+  (block more
+    (let ((acc2 (select (icmp ult acc (i64 100000000000)) (add (mul acc (i64 10)) (zext i64 (sub d (i8 48)))) acc))
+          (r2 (getelementptr i8 r (i64 1))))
+      (br loop)))
+  (block done (store r endp) (ret acc)))
+
 ;; FIB_THREADS as a number, or 0 when unset or not a number from 1 to 256.
 (define internal (fib.sched-env-threads i64) ()
   (block entry
@@ -2837,7 +2861,7 @@
   (block none (ret (i64 0)))
   (block parse
     (let ((end (alloca ptr))
-          (n (call @strtol v end (i32 10)))
+          (n (call @fib.sched-num v end))
           (good (and (icmp ne (load i8 v) (i8 0))
                      (and (icmp eq (load i8 (load ptr end)) (i8 0)) (and (icmp sge n (i64 1)) (icmp sle n (i64 256)))))))
       (ret (select good n (i64 0))))))
@@ -2877,8 +2901,8 @@
     (br (icmp eq (load i8 buf) (i8 109)) none numbers))
   (block numbers
     (let ((end (alloca ptr))
-          (quota (call @strtol buf end (i32 10)))
-          (period (call @strtol (load ptr end) (ptr null) (i32 10))))
+          (quota (call @fib.sched-num buf end))
+          (period (call @fib.sched-num (load ptr end) end)))
       (br (and (icmp sgt quota (i64 0)) (icmp sgt period (i64 0))) ratio none)))
   (block ratio (ret (udiv (add quota (sub period (i64 1))) period))))
 
@@ -2909,7 +2933,7 @@
 ;; `(Task a)` as `spawn` makes one (closure in slot 9, result atom in 7, failure in 10) whose resume function (slot 6) is the pool
 ;; runner the compiler emits for its result type (emit.lower.threads `pool-entry`); a task with both a closure and a resume function is
 ;; a pool task, which is how fib.drive tells the tiers apart. Workers start on the first fork, W = FIB_THREADS, else the CPUs of the
-;; affinity mask (sched_getaffinity), capped by the cgroup v2 quota of /sys/fs/cgroup/cpu.max; one Chase-Lev deque per worker (Le, Pop,
+;; affinity mask (the affinity call of Linux), capped by the cgroup v2 quota of /sys/fs/cgroup/cpu.max; one Chase-Lev deque per worker (Le, Pop,
 ;; Cohen, Nardelli 2013: the orderings of docs/design/parallelism/proto/cl.lir, unchanged; a ring of 4096, a full ring runs the task
 ;; inline at the fork); an injector list for the threads that are not workers (main, spawned threads); random-victim stealing; an
 ;; eventcount (an epoch word, a count of sleepers, one mutex and one condition variable for the sleep itself) with the re-check after
@@ -3037,80 +3061,20 @@
 (define internal (fib.sched-knobs void) ()
   (block entry
     (let ((a (call @getenv (string \"FIB_SPIN\")))
-          (b (call @getenv (string \"FIB_SCHED_SKIP\"))))
+          (b (call @getenv (string \"FIB_SCHED_SKIP\")))
+          (end (alloca ptr)))
       (br (icmp eq a (ptr null)) second spin)))
   (block spin
-    (store (call @strtol a (ptr null) (i32 10)) @fib.sched-spin)
-    (br second))
+    (let ((n (call @fib.sched-num a end)))
+      (store (select (icmp slt n (i64 0)) (i64 32) n) @fib.sched-spin)
+      (br second)))
   (block second
     (br (icmp eq b (ptr null)) done skip))
   (block skip
-    (store (trunc i32 (call @strtol b (ptr null) (i32 10))) @fib.sched-skip)
-    (br done))
+    (let ((m (call @fib.sched-num b end)))
+      (store (select (icmp eq m (i64 0)) (i32 0) (i32 1)) @fib.sched-skip)
+      (br done)))
   (block done (ret)))
-
-;; ---- the eventcount
-
-;; After a push: a sleeper, if there is one, is woken. The fence orders the push before the read of the sleepers against a sleeper's
-;; announcement before its re-check (fib.sched-announce), so one of the two sees the other.
-(define internal (fib.sched-signal void) ()
-  (block entry
-    (fence seq_cst)
-    (br (and (icmp ne (load i32 @fib.sched-skip) (i32 0)) (icmp sgt (atomic-load monotonic i32 @fib.sched-idlers) (i32 0))) done sleepers?))
-  (block sleepers?
-    (br (icmp sgt (atomic-load monotonic i32 @fib.sched-sleepers) (i32 0)) wake done))
-  (block wake
-    (call @pthread_mutex_lock (load ptr @fib.sched-mutex))
-    (atomic-store release (add (atomic-load monotonic i32 @fib.sched-ec) (i32 1)) @fib.sched-ec)
-    (call @pthread_mutex_unlock (load ptr @fib.sched-mutex))
-    (call @pthread_cond_signal (load ptr @fib.sched-cond))
-    (br done))
-  (block done (ret)))
-
-;; A completion with a parked joiner: every sleeper is woken (a joiner waits for its own task's state, not for work).
-(define internal (fib.sched-wake-all void) ()
-  (block entry
-    (call @pthread_mutex_lock (load ptr @fib.sched-mutex))
-    (atomic-store release (add (atomic-load monotonic i32 @fib.sched-ec) (i32 1)) @fib.sched-ec)
-    (call @pthread_mutex_unlock (load ptr @fib.sched-mutex))
-    (call @pthread_cond_broadcast (load ptr @fib.sched-cond))
-    (call @pthread_cond_broadcast (load ptr @fib.sched-jcond))
-    (ret)))
-
-;; A thread that is not a worker sleeps until the epoch moves, on the joiners' condition.
-(define internal (fib.sched-sleep-joiner void) ((i32 epoch))
-  (block entry
-    (call @pthread_mutex_lock (load ptr @fib.sched-mutex))
-    (br test))
-  (block test
-    (br (icmp eq (atomic-load acquire i32 @fib.sched-ec) epoch) wait out))
-  (block wait
-    (call @pthread_cond_wait (load ptr @fib.sched-jcond) (load ptr @fib.sched-mutex))
-    (br test))
-  (block out (call @pthread_mutex_unlock (load ptr @fib.sched-mutex)) (ret)))
-
-;; The epoch to sleep against, read before the announcement; then \"I am about to sleep\".
-(define internal (fib.sched-announce i32) ()
-  (block entry
-    (let ((epoch (atomic-load acquire i32 @fib.sched-ec)))
-      (atomicrmw add seq_cst @fib.sched-sleepers (i32 1))
-      (fence seq_cst)
-      (ret epoch))))
-
-;; Sleeps until the epoch moves (the caller has announced and re-checked), then withdraws the announcement.
-(define internal (fib.sched-sleep void) ((i32 epoch))
-  (block entry
-    (call @pthread_mutex_lock (load ptr @fib.sched-mutex))
-    (br test))
-  (block test
-    (br (icmp eq (atomic-load acquire i32 @fib.sched-ec) epoch) wait out))
-  (block wait
-    (call @pthread_cond_wait (load ptr @fib.sched-cond) (load ptr @fib.sched-mutex))
-    (br test))
-  (block out
-    (call @pthread_mutex_unlock (load ptr @fib.sched-mutex))
-    (atomicrmw sub seq_cst @fib.sched-sleepers (i32 1))
-    (ret)))
 
 ;; ---- forking and running
 
@@ -3376,6 +3340,76 @@
       (br (icmp eq t (ptr null)) idle run)))
   (block run (call @fib.sched-run t) (br loop))
   (block idle (call @fib.sched-idle w) (br loop)))
+")
+
+;; park.lir
+(def RT-PARK: str
+";; fib.rt, parking and joining for the work-stealing pool (docs/design/parallelism.md 3.1; the pool itself is sched.lir, the deques deque.lir): the eventcount
+;; (epoch word, sleepers count, one mutex and condition variable: the re-check after the announcement is what keeps a wake-up from being lost), the
+;; short spin before a joiner parks, the waiter nodes of a task, `join` (help-while-waiting), `(blocking ..)`, the drain at exit and the control
+;; function the library asks (lib/fib/os/sched.fib). The tuning knobs, the globals and the records are in sched.lir and deque.lir.
+;; ---- the eventcount
+
+;; After a push: a sleeper, if there is one, is woken. The fence orders the push before the read of the sleepers against a sleeper's
+;; announcement before its re-check (fib.sched-announce), so one of the two sees the other.
+(define internal (fib.sched-signal void) ()
+  (block entry
+    (fence seq_cst)
+    (br (and (icmp ne (load i32 @fib.sched-skip) (i32 0)) (icmp sgt (atomic-load monotonic i32 @fib.sched-idlers) (i32 0))) done sleepers?))
+  (block sleepers?
+    (br (icmp sgt (atomic-load monotonic i32 @fib.sched-sleepers) (i32 0)) wake done))
+  (block wake
+    (call @pthread_mutex_lock (load ptr @fib.sched-mutex))
+    (atomic-store release (add (atomic-load monotonic i32 @fib.sched-ec) (i32 1)) @fib.sched-ec)
+    (call @pthread_mutex_unlock (load ptr @fib.sched-mutex))
+    (call @pthread_cond_signal (load ptr @fib.sched-cond))
+    (br done))
+  (block done (ret)))
+
+;; A completion with a parked joiner: every sleeper is woken (a joiner waits for its own task's state, not for work).
+(define internal (fib.sched-wake-all void) ()
+  (block entry
+    (call @pthread_mutex_lock (load ptr @fib.sched-mutex))
+    (atomic-store release (add (atomic-load monotonic i32 @fib.sched-ec) (i32 1)) @fib.sched-ec)
+    (call @pthread_mutex_unlock (load ptr @fib.sched-mutex))
+    (call @pthread_cond_broadcast (load ptr @fib.sched-cond))
+    (call @pthread_cond_broadcast (load ptr @fib.sched-jcond))
+    (ret)))
+
+;; A thread that is not a worker sleeps until the epoch moves, on the joiners' condition.
+(define internal (fib.sched-sleep-joiner void) ((i32 epoch))
+  (block entry
+    (call @pthread_mutex_lock (load ptr @fib.sched-mutex))
+    (br test))
+  (block test
+    (br (icmp eq (atomic-load acquire i32 @fib.sched-ec) epoch) wait out))
+  (block wait
+    (call @pthread_cond_wait (load ptr @fib.sched-jcond) (load ptr @fib.sched-mutex))
+    (br test))
+  (block out (call @pthread_mutex_unlock (load ptr @fib.sched-mutex)) (ret)))
+
+;; The epoch to sleep against, read before the announcement; then \"I am about to sleep\".
+(define internal (fib.sched-announce i32) ()
+  (block entry
+    (let ((epoch (atomic-load acquire i32 @fib.sched-ec)))
+      (atomicrmw add seq_cst @fib.sched-sleepers (i32 1))
+      (fence seq_cst)
+      (ret epoch))))
+
+;; Sleeps until the epoch moves (the caller has announced and re-checked), then withdraws the announcement.
+(define internal (fib.sched-sleep void) ((i32 epoch))
+  (block entry
+    (call @pthread_mutex_lock (load ptr @fib.sched-mutex))
+    (br test))
+  (block test
+    (br (icmp eq (atomic-load acquire i32 @fib.sched-ec) epoch) wait out))
+  (block wait
+    (call @pthread_cond_wait (load ptr @fib.sched-cond) (load ptr @fib.sched-mutex))
+    (br test))
+  (block out
+    (call @pthread_mutex_unlock (load ptr @fib.sched-mutex))
+    (atomicrmw sub seq_cst @fib.sched-sleepers (i32 1))
+    (ret)))
 
 ;; ---- joining
 
