@@ -21,7 +21,8 @@ B=$S/build
 bad=0
 ok() { echo "ok   $*"; }
 fail() { echo "FAIL $*"; bad=$((bad + 1)); }
-M() { make --no-print-directory BUILD="$B" "$@"; }   # the real Makefile against the scratch build directory
+# -o: a fresh checkout has arbitrary mtimes, so runtime.fib may look older than rt/*.lir; it is not regenerated here (and the tree is not touched)
+M() { make --no-print-directory -o compiler/emit/runtime.fib BUILD="$B" "$@"; }   # the real Makefile against the scratch build directory
 make --version | grep -q '^GNU Make 4\|^GNU Make 5' || { echo "graph.sh: GNU Make 4 is needed"; exit 2; }
 
 # fake products: the seed, F and every stamp of the full gate, newer than everything in the tree (and older than nothing)
@@ -37,8 +38,6 @@ fake_all() {
   touch "$seed" "$B"/F "$B"/F.lir "$B"/F3 "$B"/F3.lir "$B"/gen-runtime "$B"/adr "$B"/golden/tools/* "$B"/cases/*.txt
   sleep 0.05; touch "$B"/*.ok "$B"/golden/*.ok "$B"/tools/*.ok "$B"/cases/*.ok
 }
-# a fresh checkout has arbitrary mtimes: runtime.fib may look older than rt/*.lir; its content is right (build/runtime-drift.ok says so), so only its mtime is set
-touch compiler/emit/runtime.fib
 fake_all
 # the full gate's stamps, from the Makefile itself
 stamps=$(M -n -p 2> /dev/null | sed -n 's/^FULL_STAMPS := //p' | head -n 1)
