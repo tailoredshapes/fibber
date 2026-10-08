@@ -206,6 +206,14 @@ prelude can change. See [the CI workflow](.github/workflows/ci.yml).
 
 Recent compiler and library changes include:
 
+- A work-stealing pool: `(fork-task f)` makes a pool task (`join` as any
+  task's), with a Chase-Lev deque per worker, help-while-waiting joins,
+  parking on an eventcount and workers started lazily on the first fork
+  (`FIB_THREADS`, else the affinity mask and the cgroup quota);
+  `fib.parallel` (`fork`, `pmap`, `pfor`, `preduce`, `pscan`) runs on it, so
+  nested parallel calls fork tasks, not threads; `spawn` stays the thread
+  tier and `async` the stackless one. A trap in a pool task is the task's
+  failure. See [the parallelism design](docs/design/parallelism.md), 3.1 and 8.
 - Scalar `Option` values stored inline as a tag and payload, including in
   collection elements, closure captures and task frames. Options of ordinary
   objects remain nullable pointers; nested options and other payloads retain

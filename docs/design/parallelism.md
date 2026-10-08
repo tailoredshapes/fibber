@@ -453,3 +453,28 @@ help (it would make the caller's closure and what it captured immortal for good)
 Not done, and why the colour stays a possible later step: the share walk at hand-off (9.6 ns an object, once per task) and the retains of what a closure captured
 (once per chunk) remain; neither showed in a row. `fib.tensor` has no per-element closure of this kind (its parallel paths call a tile body once per tile through
 `fib.view.tiles`), so nothing there changed; its cases pass as before.
+
+---
+
+## 8. P-sched as built (`fork-task`, `rt/sched.lir`, `rt/park.lir`, `rt/deque.lir`, 2026-10-07)
+
+**The oversight.** Section 3.1 designed the pool and the plan table sized it (row P-sched); P-struct, P-count-a/b, P-det and P-tensor were built on `spawn` threads "so P-sched replaces the backend", and P-sched itself was never started. `lib/fib/parallel/chunks.fib` ran W OS-thread tasks with a fixed stride and its header said the pool tier would bound nesting. This section is the fix.
+
+| 3.1 item | As built | Where |
+|---|---|---|
+| one `Task` type, three tiers | `(fork-task f)` (builtin, `(fn :send () a) -> (Task a)`) makes the same `(Task a)` with a closure and a resume function (the pool runner of the result type, emitted once per type); `join`, `try-join`, `@t`, `task-failure` unchanged; `spawn` is T2, `async` T0 | `compiler/emit/lower/threads.fib` `lcx-fork-task`, `pool-entry`; spec/types.md 8.8 |
+| per-worker Chase-Lev deques, ring 4096, overflow runs inline | the orderings of `cl.lir` unchanged, slots stored release and loaded acquire (TSAN ignores standalone fences; same code on x86); a full ring runs the task at the fork | `rt/deque.lir` |
+| injector for non-workers | a list under a spinlock | `rt/deque.lir` |
+| random-victim stealing | own deque, injector, two random victims, then a sweep | `fib.sched-find` |
+| eventcount parking | epoch word, sleepers count, one mutex and condvar; 32 yield rounds (`FIB_SPIN`), then announce, `seq_cst` fence, re-check for work, sleep; a fork signals only when `sleepers > 0` **and no worker is in its spin phase** (`FIB_SCHED_SKIP`, default 1: 14 us to 0.65 us per fork-join on WSL2); a joiner spins 3000 loads on the task's state before it parks | `rt/park.lir`, `fib.sched-idle` |
+| help-while-waiting join | a worker claims the joined task and runs it, else runs other work, else parks on the task (a waiter node whose word is 1); depth bound 4000 tasks; a non-worker parks (in a catching program it runs the task itself when it can claim it); no workers (wasm): inline | `fib.sched-join`, `-wait` |
+| lazy start, worker count | first `fork-task`; `FIB_THREADS`, else `sched_getaffinity` capped by cgroup v2 `cpu.max`, 1 to 256; a program with no parallel work pays nothing (no thread, no allocation: hello world is 36 872 bytes, 80 fewer than before, and its only thread is the one it had) | `fib.sched-start`, `-count` |
+| `(blocking ..)` | macro in `fib.parallel`: starts one more worker (up to W more) for the duration | `fib.sched-block-enter` |
+| trap policy | catching program (ADR 0009): the runner runs the closure under its own catch, the trap is the task's failure on any thread, no thread dies. Otherwise: the worker's chain of tasks all fail with the message (a joiner helping inside would trap on it), their deque counts are released, the worker is replaced, `trap in task: MESSAGE` once | `fib.sched-fail`, `-failed`, `pool-entry` |
+| stack guard per worker | `fib.guard-enter` in the worker entry, as a spawned thread's | `fib.sched-worker` |
+| exit | `fib.pool-quiesce` drains the pool first (every worker parked, no work anywhere) | `fib.sched-quiesce` |
+| cancellation flag | **not built** (needs the interrupt flag of P-chan) | |
+| `fib.parallel` backend | `run-chunks` forks W runners onto the pool that take chunks from a shared counter and write results to per-chunk slots; `fork` of a scope is `fork-task`; `cpu-count` is the pool's count | `lib/fib/parallel/` |
+
+Measurements, planted-fault results and TSAN: `docs/shootout/parallel.md` ("P-sched"). Mutants: `scripts/mutant-sched.sh`; planted race: `scripts/tsan-planted.sh pool-handoff`; cases 8640 to 8648.
+Not done: `:grain`-controlled adaptive splitting, `pcalls`/`pvalues`, cancellation, arm64 stress runs, a model-checked deque, per-worker small-block allocator cache (see the allocator note in shootout).

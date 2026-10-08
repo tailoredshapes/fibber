@@ -561,7 +561,8 @@
 ;; A trap on the thread of a spawned task ends that task, not the process (docs/design/exceptions.md 4.1, stage 1): the message
 ;; goes to fd 2 as `trap in task: MESSAGE` in ONE write (a trace line of another thread must not land inside it), a share-marked copy of it is stored as the task's failure, the task completes (state
 ;; done, its waiters woken: a joiner finds the failure and traps in its turn, or try-join returns it), the thread releases its
-;; count of the task and ends. What the task's frames owned is abandoned (never freed): audit: abandoned.
+;; count of the task and ends. What the task's frames owned is abandoned (never freed): audit: abandoned. A pool task (sched.lir)
+;; fails the worker's chain of tasks instead, and the worker is replaced (fib.sched-fail).
 (define internal (fib.fail-task void) ((ptr task) (ptr bytes) (i64 n))
   (block entry
     (let ((line (call @malloc (add n (i64 16)))))
@@ -577,11 +578,16 @@
     (let ((msg (call @fib.str-from-bytes bytes n)))
       (call @fib.share msg)
       (atomic-store release msg (getelementptr %struct.fib.task task (i32 0) (i32 10)))
-      (call @fib.task-complete task)
-      (call @fib.release task)
-      (call @fib.thread-done)
-      (call @pthread_exit (ptr null))
-      (unreachable))))
+      (br (call @fib.sched-pool-task task) pool thread)))
+  (block pool
+    (call @fib.sched-fail task msg)
+    (unreachable))
+  (block thread
+    (call @fib.task-complete task)
+    (call @fib.release task)
+    (call @fib.thread-done)
+    (call @pthread_exit (ptr null))
+    (unreachable)))
 
 (define internal (fib.trap-bytes void) ((ptr bytes) (i64 n))
   (block entry

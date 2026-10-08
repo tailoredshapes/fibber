@@ -1,0 +1,18 @@
+;; spec:   types §8.8 (amended 2026-10-07, P-sched: traps in pool tasks); docs/adr/0001; rt/sched.lir
+;; expect: accept
+;; result: 0
+;; audit:  abandoned
+;; leaks:  1
+;; stage:  2
+;; roots:  ../../lib support
+;; A pool task that traps and is never joined does not end the process, silently or at all: the trap is written as `trap in task:` by the
+;; worker, the task is failed, the worker is replaced, and the program goes on: the second fork runs and is joined (a sleep leaves the first
+;; task time to trap first), main returns 0, and the exit drains the pool. The task itself is freed (its handle is dropped by main, its
+;; deque count by the worker that failed it); what its frames owned is abandoned: 1 object on every run.
+(ns main (:use fib.core fib.parallel fib.os))
+
+(defun main () -> i64
+  (let [t (fork-task (fn () (do (trap "never joined") 0)))
+        _ (sleep-ns 20000000)
+        v (join (fork-task (fn () 5)))]
+    (if (= v 5) 0 1)))

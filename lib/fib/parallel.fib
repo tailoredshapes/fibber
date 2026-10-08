@@ -1,13 +1,25 @@
-;; fib.parallel: structured parallelism on today's runtime (P-struct of docs/design/parallelism.md 3.2). Explicit: `(:use fib.parallel)`.
+;; fib.parallel: structured parallelism on the work-stealing pool (P-struct of docs/design/parallelism.md 3.2 over P-sched, 3.1: the
+;; builtin `fork-task`, rt/sched.lir). Explicit: `(:use fib.parallel)`.
 ;;
-;;   (cpu-count)                                  workers a call uses by default (fib.parallel.cpu)
-;;   (with-tasks [s] ..) (fork s f)               structured scopes (fib.parallel.scope)
+;;   (cpu-count)                                  workers a call uses by default: the pool's count (fib.parallel.cpu, fib.os.sched)
+;;   (with-tasks [s] ..) (fork s f)               structured scopes (fib.parallel.scope); a fork is a pool task
 ;;   (pmap f xs) (pmap-n f n) (pfor n f)          chunked, ordered (fib.parallel.pmap), over the engine of fib.parallel.chunks
+;;   (blocking body ..)                           around a call that blocks in the OS inside a task: one more worker for the duration
+;;   (pool-workers) (pool-worker?) (pool-started?) (pool-tasks-run) (pool-steals) (pool-live-workers)   the pool's control surface (fib.os.sched)
 ;;
 ;; The macros live here, in the facade, and name the parts' functions as `fib.parallel/NAME`: a macro's qualified names are
 ;; resolved in the module that uses it, which has `(:use fib.parallel)` and nothing of the parts.
 (ns fib.parallel (:use fib.core fib.seq fib.coll)
-  (:export-from fib.parallel.cpu fib.parallel.scope fib.parallel.chunks fib.parallel.pmap fib.parallel.reduce fib.parallel.scan))
+  (:export-from fib.os.sched fib.parallel.cpu fib.parallel.scope fib.parallel.chunks fib.parallel.pmap fib.parallel.reduce fib.parallel.scan))
+
+;; `(blocking body ..)`: the body is about to block in the OS (a read, a sleep, a lock) on a worker of the pool, so the pool starts one more
+;; worker for the duration (docs/design/parallelism.md 3.1, "Blocking"; Go's syscall hand-off, Java's ManagedBlocker). On a thread that is
+;; not a worker it is the body alone. The value is the body's.
+(defmacro blocking (... body)
+  (let ((r (gensym "blocking-result")))
+    `(do (fib.parallel/blocking-enter)
+         (let ((~r (do ~@body)))
+           (do (fib.parallel/blocking-leave) ~r)))))
 (defmacro with-tasks (spec ... body)
   (match spec
     ((Vec items)

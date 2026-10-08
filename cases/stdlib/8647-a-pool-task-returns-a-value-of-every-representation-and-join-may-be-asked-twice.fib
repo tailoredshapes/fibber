@@ -1,0 +1,34 @@
+;; spec:   types §8.8 (amended 2026-10-07, P-sched: the pool runner stores the result as a spawned task's thread does); compiler/emit/lower/threads.fib (pool-entry)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; The runner the compiler emits for each result type stores the task's value in its result atom as a thread's entry does: a unit, an
+;; integer, a float, a string, a Vec, a struct (a two-leaf value in a catching program, a pointer here), an Option of a scalar and a Pair.
+;; `join` of a done task answers the same value again, and `@t` is `join`.
+(ns main (:use fib.core fib.parallel tl.check))
+
+(defstruct Pt (x: i64 y: f64))
+
+(defun main () -> i64
+  (let [c (checks)
+        u (fork-task (fn () ()))
+        i (fork-task (fn () 7))
+        f (fork-task (fn () 2.5))
+        s (fork-task (fn () (str "a" "b")))
+        v (fork-task (fn () (vec (range 5))))
+        p (fork-task (fn () (Pt 3 1.5)))
+        o (fork-task (fn () (some 9)))
+        pr (fork-task (fn () (Pair 1 "one")))]
+    (do (join u)
+        (check c (= (join i) 7))
+        (check c (= @i 7))
+        (check c (= (join f) 2.5))
+        (check c (= (join s) "ab"))
+        (check c (= (join v) [0 1 2 3 4]))
+        (check c (= (. (join p) x) 3))
+        (check c (= (. @p y) 1.5))
+        (check c (= (join o) (some 9)))
+        (check c (= (. (join pr) snd) "one"))
+        (checks-result c))))

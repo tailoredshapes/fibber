@@ -1,22 +1,22 @@
-;; fib.parallel.chunks: the engine under pmap, pfor and the reductions (P-struct, docs/design/parallelism.md 3.2).
+;; fib.parallel.chunks: the engine under pmap, pfor and the reductions (P-struct, docs/design/parallelism.md 3.2), on the
+;; work-stealing pool (P-sched, 3.1).
 ;;
 ;; `(run-chunks workers n grain body)` splits the index range [0, n) into chunks of `grain` indices (the last one is shorter),
 ;; runs `(body lo hi)` once for every chunk, and returns the chunk results in chunk order.
 ;;
-;; The pool. At most `workers` tasks are ever live in one call, however many chunks there are: with W = min(workers, chunks)
-;; > 1, W tasks are spawned and task w runs the chunks w, w+W, w+2W, ... (a fixed stride, so which worker runs which chunk is
-;; a function of the numbers alone, and a run is repeatable). The caller only waits: it never runs a chunk itself, so a trap in
-;; any chunk is isolated in a task and reaches the caller the same way whichever worker had it. W = 1 (one worker, or one chunk) runs
-;; every chunk on the caller's thread with no task at all, which is what keeps one worker within a small factor of a plain loop.
-;; Under `ulimit -v 16000000` about 250 live threads exhaust the address space (each allocating thread gets a 64 MB malloc arena),
-;; so `fib.parallel.cpu/max-workers` (64) bounds `workers` in `par`.
-;; Nested calls (a body that itself calls pmap) multiply: W x W tasks. The pool tier of docs/design/parallelism.md 3.1 will bound that;
-;; until then a body of a parallel call should not start another.
+;; The pool. With W = min(workers, chunks) > 1, W runner tasks are forked onto the work-stealing pool (`fork-task`; the pool's own
+;; workers are `fib.os.sched/pool-workers`, the number `cpu-count` answers) and each runner takes the next chunk from a shared
+;; counter until none is left: at most `workers` chunk bodies run at once (case 7606), the chunks are balanced among the runners by
+;; demand, and a call is over-decomposed by whatever its grain says (eight chunks per worker by default: `pmap`'s `auto-grain`), so a
+;; slow chunk does not leave the others idle. Which runner runs which chunk varies from run to run; what a chunk computes does not, and
+;; each result goes to its chunk's slot of one shared Vec (an atom), read in order at the end. Nested calls (a body that itself calls pmap) fork onto the same pool: the number of threads
+;; stays the pool's whatever the nesting (case 8642). W = 1 (one worker, or one chunk) runs every chunk on the caller's thread with no
+;; task at all, which is what keeps one worker within a small factor of a plain loop.
 ;;
-;; Failure. All W tasks are joined with `try-join` whatever happens, then the call traps with the message of the failed task of the
-;; lowest worker number (the one that traps in a given run is not always the same one when several do, so a program that needs the
-;; exact message makes one chunk fail). The chunks that did not run (a worker ends at its first trap) have no results; the call
-;; has none either. What a trapped task owned is abandoned (stage 1 of exceptions).
+;; Failure. Every runner is joined with `try-join` whatever happens, then the call traps with the message of the failed runner of
+;; the lowest number (the one that traps in a given run is not always the same one when several do, so a program that needs the
+;; exact message makes one chunk fail). The call has no results then. What a trapped task owned is abandoned (stage 1 of exceptions);
+;; in a program that catches, the trap unwinds to the task's runner and nothing else is lost (ADR 0009, rt/sched.lir).
 (ns fib.parallel.chunks (:use fib.core fib.seq fib.coll fib.async fib.parallel.cpu))
 
 ;; How a call runs: the most workers it may use, the chunk size in indices (0: the call chooses), and `fast` (reductions: combine in
@@ -31,32 +31,44 @@
 
 (defun chunk-count (n: i64 grain: i64) -> i64 (quot (+ n (- grain 1)) grain))
 
-;; The results of the chunks w, w+step, w+2 step, ... (each chunk is [c grain, min(n, (c + 1) grain))).
+;; The results of the chunks w, w+step, w+2 step, ... (each chunk is [c grain, min(n, (c + 1) grain))), on this thread.
 (defun run-strided (body: (fn :send (i64 i64) r) n: i64 grain: i64 nc: i64 w: i64 step: i64) -> (Vec r)
   (loop [c w out []]
     (if (< c nc)
         (recur (+ c step) (conj out (body (* c grain) (min n (* (+ c 1) grain)))))
         out)))
 
-;; The chunk results of all workers, put back in chunk order: chunk c is the (c / W)-th result of worker c mod W.
-(defun interleave (parts: (Vec (Vec r)) nc: i64) -> (Vec r)
-  (let [w (vec-count parts)]
-    (loop [c 0 out []]
-      (if (< c nc) (recur (+ c 1) (conj out (nth (nth parts (rem c w)) (quot c w)))) out))))
+;; A runner: takes the next chunk from the shared counter until none is left, putting each result in its place; the number it ran.
+(defun run-dynamic (body: (fn :send (i64 i64) r) n: i64 grain: i64 nc: i64 next: (Atom i64) results: (Atom (Vec (Option r)))) -> i64
+  (loop [ran 0]
+    (let [c (- (swap! next inc) 1)]
+      (if (< c nc)
+          (let [o (some (body (* c grain) (min n (* (+ c 1) grain))))]
+            (do (swap! results (fn (rs: (Vec (Option r))) (assoc rs c o)))
+                (recur (+ ran 1))))
+          ran))))
+
+;; W runner tasks over a shared chunk counter, on the pool; the results land in `results` (a slot per chunk), so a runner that traps
+;; abandons only the chunk it was in (the audit of case 7608 is the same on every run).
+(defun fork-runners (body: (fn :send (i64 i64) r) n: i64 grain: i64 nc: i64 w: i64 results: (Atom (Vec (Option r)))) -> (Vec (Task i64))
+  (let [next (atom 0)]
+    (loop [k 0 ts []]
+      (if (< k w)
+          (recur (+ k 1) (conj ts (fork-task (fn () (run-dynamic body n grain nc next results)))))
+          ts))))
 
 (defun run-chunks (workers: i64 n: i64 grain: i64 body: (fn :send (i64 i64) r)) -> (Vec r)
   (do (when (< grain 1) (trap "parallel: the grain is at least 1"))
       (let [nc (chunk-count n grain) w (max 1 (min workers nc))]
         (if (= w 1)
             (run-strided body n grain nc 0 1)
-            (let [tasks (loop [k 0 ts []]
-                          (if (< k w) (recur (+ k 1) (conj ts (spawn (fn () (run-strided body n grain nc k w))))) ts))
-                  parts (cell [])
+            (let [results: (Atom (Vec (Option r))) (atom (vec (repeat nc nil)))
+                  tasks (fork-runners body n grain nc w results)
                   fails (cell [])]
               (do (doseq [t tasks]
                     (match (try-join t)
-                      ((Ok v) (set! parts (conj @parts v)))
+                      ((Ok v) ())
                       ((Err trap) (set! fails (conj @fails (. trap message))))))
                   (if (> (vec-count @fails) 0)
                       (trap (nth @fails 0))
-                      (interleave @parts nc))))))))
+                      (mapv (fn (o: (Option r)) (unwrap o)) @results))))))))

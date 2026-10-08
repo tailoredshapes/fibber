@@ -1,0 +1,31 @@
+;; docs/shootout/parallel/sched-fork.fib: the rows that need the pool (`fork-task`): the cost of a fork+join, a fork-join fib tree, and a
+;; wide fork. Usage: sched-fork ROW N RUNS. Rows: storm (N fork+join rounds inside one pool task), storm-main (the same from the main
+;; thread, through the injector), pfib (fork-join fib(N) with a sequential cut at 20), wide (N tasks forked before any join).
+(ns main (:use fib.core fib.parallel fib.os))
+
+(defun now () -> i64 (match (monotonic-ns) ((Ok x) x) ((Err _) 0)))
+(defun med (xs: (Vec i64)) -> i64 (nth (sort xs) (quot (count xs) 2)))
+(defun sfib (n: i64) -> i64 (if (< n 2) n (+ (sfib (- n 1)) (sfib (- n 2)))))
+(defun pfib (n: i64) -> i64
+  (if (< n 20) (sfib n)
+      (let [t (fork-task (fn () (pfib (- n 1)))) b (pfib (- n 2))] (+ (join t) b))))
+(defun storm (n: i64) -> i64 (loop [i 0 acc 0] (if (< i n) (recur (+ i 1) (+ acc (join (fork-task (fn () i))))) acc)))
+(defun wide (n: i64) -> i64
+  (let [ts (loop [i 0 out []] (if (< i n) (recur (+ i 1) (conj out (fork-task (fn () (* i 2))))) out))]
+    (reduce (fn (acc: i64 t: (Task i64)) (+ acc (join t))) 0 ts)))
+
+(defun row (name: str n: i64) -> i64
+  (cond (= name "storm") (join (fork-task (fn () (storm n))))
+        (= name "storm-main") (storm n)
+        (= name "pfib") (pfib n)
+        (= name "wide") (join (fork-task (fn () (wide n))))
+        :else -1))
+
+(defun main () -> i64
+  (let [a (args) name (nth a 0) n (unwrap (parse-long (nth a 1))) runs (unwrap (parse-long (nth a 2)))
+        times (cell []) v (cell 0)]
+    (do (dotimes (r (+ runs 1))
+          (let [t0 (now) x (row name n) t1 (now)]
+            (do (set! v x) (when (> r 0) (set! times (conj @times (- t1 t0)))))))
+        (println (str name " n=" n " us=" (quot (med @times) 1000) " ns-per-n=" (quot (med @times) (max 1 n)) " v=" @v))
+        0)))

@@ -5,14 +5,15 @@
   (:use emit.runtime) (:require [emit.os :as os] [emit.wasi :as wasi] [expand.targetos :as tos]))
 
 ;; The eleven parts in the order compile.rs:20 `include_str!`s them: core str array vec vecbuild atom thread task weak io sys; then alloc,
-;; the large-block cache (rt/alloc.lir), which the Rust runtime does not have.
+;; the large-block cache (rt/alloc.lir), which the Rust runtime does not have; deque, sched and park (the work-stealing pool, P-sched) follow task.
 (defun runtime-parts-for (os-name: str) -> (Vec str)
   (if (= os-name "Wasi")
-    (conj (mapv wasi/adapt [RT-CORE RT-STR RT-ARRAY RT-VEC RT-VECBUILD RT-ATOM RT-THREAD RT-TASK RT-WEAK RT-IO RT-SYS RT-ALLOC]) (wasi/shim))
+    (conj (mapv wasi/adapt [RT-CORE RT-STR RT-ARRAY RT-VEC RT-VECBUILD RT-ATOM RT-THREAD RT-TASK RT-DEQUE RT-SCHED RT-PARK RT-WEAK RT-IO RT-SYS RT-ALLOC]) (wasi/shim))
     (runtime-parts-posix os-name)))
 
 (defun runtime-parts-posix :private (os-name: str) -> (Vec str)
-  [(os/sys-for os-name RT-CORE) RT-STR RT-ARRAY RT-VEC RT-VECBUILD RT-ATOM (os/sys-for os-name RT-THREAD) (os/sys-for os-name RT-TASK) RT-WEAK RT-IO
+  [(os/sys-for os-name RT-CORE) RT-STR RT-ARRAY RT-VEC RT-VECBUILD RT-ATOM (os/sys-for os-name RT-THREAD) (os/sys-for os-name RT-TASK)
+   (os/sys-for os-name RT-DEQUE) (os/sys-for os-name RT-SCHED) (os/sys-for os-name RT-PARK) RT-WEAK RT-IO
    (os/sys-for os-name RT-SYS) (os/sys-for os-name RT-ALLOC)])
 
 ;; The runtime of the program being generated: for the OS of FIB_TARGET_TRIPLE, else the host's (expand.targetos).

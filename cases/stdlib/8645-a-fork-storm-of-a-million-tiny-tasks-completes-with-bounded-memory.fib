@@ -1,0 +1,35 @@
+;; spec:   docs/design/parallelism.md 3.1 (the deque: a fixed ring, overflow runs inline; 2.3 the cost of a task); rt/sched.lir, rt/deque.lir
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; A million tiny tasks forked and joined by one pool task (a worker's fast path: a push, a pop or a claim, no thread and no lock) complete
+;; with the right sum, and the process's resident memory grows by less than 64 MB over the storm (a task is freed when its handle and the
+;; deque's count are gone: a pool that kept every task, or every waiter node, would grow by hundreds of megabytes). A second storm forks
+;; 20 000 tasks before joining any: with one worker (FIB_THREADS=1, scripts/mutant-sched.sh `ring-overflow`) the ring of 4096 overflows
+;; and the rest run at the fork (`pool-inline-forks` counts them); with many, the thieves take them; every value is right either way.
+;; Where /proc is absent the memory check is skipped.
+(ns main (:use fib.core fib.parallel fib.os fib.os.memory tl.check))
+
+(defun storm (n: i64) -> i64
+  (loop [i 0 acc 0]
+    (if (< i n) (recur (+ i 1) (+ acc (join (fork-task (fn () i))))) acc)))
+
+(defun wide (n: i64) -> i64
+  (let [ts (loop [i 0 out []] (if (< i n) (recur (+ i 1) (conj out (fork-task (fn () (* i 2))))) out))]
+    (reduce (fn (acc: i64 t: (Task i64)) (+ acc (join t))) 0 ts)))
+
+(defun main () -> i64
+  (let [c (checks)
+        warm (join (fork-task (fn () (storm 1000))))
+        before (unwrap-or (rss-bytes) 0)
+        v (join (fork-task (fn () (storm 1000000))))
+        after (unwrap-or (rss-bytes) 0)
+        w (join (fork-task (fn () (wide 20000))))]
+    (do (check c (= v (quot (* 1000000 999999) 2)))
+        (check c (= warm (quot (* 1000 999) 2)))
+        (check c (< (- after before) 67108864))
+        (check c (= w (* 20000 19999)))
+        (check c (>= (pool-inline-forks) 0))
+        (checks-result c))))
