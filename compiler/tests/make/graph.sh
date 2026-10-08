@@ -53,18 +53,18 @@ if [ -z "$missing" ]; then ok "1 make help lists every public target ($(echo "$p
 
 # 2 nothing changed: up to date, no recipe
 if M -q gate-stamps; then ok "2a make -q gate-stamps: up to date"; else fail "2a make -q gate-stamps says something is out of date on fake products newer than the tree"; fi
-out=$(M -n gate-stamps 2>&1); rc=$?; n=$(echo "$out" | grep -c -v '^make\|^$' || true)
+out=$(M -n gate-stamps 2>&1); rc=$?; n=$(echo "$out" | grep -c -v -E '^(g?make|$)' || true)
 if [ "$rc" -eq 0 ] && [ "$n" -eq 0 ]; then ok "2b make -n gate-stamps runs no recipe"; else fail "2b make -n gate-stamps (exit $rc) would run $n lines: $(echo "$out" | head -3)"; fi
 
 # 3 one tool stamp older than its script: only that recipe runs
-touch -d '-1 day' "$B/tools/gen-skeleton.ok"
-run=$(M -n gate-stamps | grep -v '^make')
+touch -t 200001010000 "$B/tools/gen-skeleton.ok"
+run=$(M -n gate-stamps | grep -v -E '^g?make')
 if echo "$run" | grep -q 'tests/gen/skeleton.sh' && [ "$(echo "$run" | grep -c 'rm -f ')" -eq 1 ]; then ok "3 an old tool stamp reruns alone (1 recipe: gen-skeleton)"; else fail "3 expected exactly the gen-skeleton recipe, got: $(echo "$run" | grep -c 'rm -f ') recipes"; fi
 touch "$B/tools/gen-skeleton.ok"
 
 # 4 F older than a compiler source: F rebuilds and everything downstream reruns
-touch -d '-1 day' "$B/F"
-run=$(M -n gate-stamps | grep -v '^make')
+touch -t 200001010000 "$B/F"
+run=$(M -n gate-stamps | grep -v -E '^g?make')
 for want in 'build compiler/fibc.fib' 'cases cases/stdlib' 'golden.sh' 'tests/gen/skeleton.sh' 'adr --strict'; do
   echo "$run" | grep -q -- "$want" || { fail "4 with F out of date, nothing runs for: $want"; want=; }
   [ -n "$want" ] && ok "4 with F out of date the dry run has: $want"
@@ -73,8 +73,8 @@ touch "$B/F"; sleep 0.05; touch "$B"/*.ok "$B"/golden/*.ok "$B"/tools/*.ok "$B"/
 
 # 5 one stdlib case newer than its shard's table: that shard reruns, no other
 first=$(M -n -p 2> /dev/null | sed -n 's/^NAMES_stdlib.3 := //p' | head -n 1 | awk '{print $1}')
-touch -d '-1 day' "$B/cases/stdlib.3.txt"
-run=$(M -n gate-stamps | grep -v '^make' | grep -c 'cases cases/stdlib' || true)
+touch -t 200001010000 "$B/cases/stdlib.3.txt"
+run=$(M -n gate-stamps | grep -v -E '^g?make' | grep -c 'cases cases/stdlib' || true)
 if [ "$run" -eq 1 ]; then ok "5 an old shard table reruns alone (shard 3 of stdlib, first case $first)"; else fail "5 expected 1 stdlib shard to rerun, got $run"; fi
 touch "$B/cases/stdlib.3.txt"; sleep 0.05; touch "$B/cases/full.ok"
 
@@ -82,7 +82,7 @@ touch "$B/cases/stdlib.3.txt"; sleep 0.05; touch "$B/cases/full.ok"
 cp Makefile "$S/Makefile"; cp mk/*.mk "$S/mk/"
 sed -i 's|^$(TOOLS_DIR)/$(1).ok: $(F) $(call after_bar|$(TOOLS_DIR)/$(1).ok: $(call after_bar|' "$S/mk/tools.mk"
 grep -q '^$(TOOLS_DIR)/$(1).ok: $(call after_bar' "$S/mk/tools.mk" || { fail "6 the plant did not take (the tool rule changed shape?)"; }
-touch -d '-1 day' "$B/F"
+touch -t 200001010000 "$B/F"
 real=$(M -n "$B/tools/gen-skeleton.ok" | grep -c 'tests/gen/skeleton.sh' || true)
 planted=$(make --no-print-directory -f "$S/Makefile" BUILD="$B" -n "$B/tools/gen-skeleton.ok" | grep -c 'tests/gen/skeleton.sh' || true)
 if [ "$real" -eq 1 ] && [ "$planted" -eq 0 ]; then ok "6 a tool stamp without its F prerequisite is caught: the real graph reruns it after F, the planted copy does not"

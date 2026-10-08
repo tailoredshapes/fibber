@@ -38,6 +38,7 @@ linux-tool	@C@(numactl|lscpu|setarch|chrt|ionice|unshare|nsenter|setcap|chattr|f
 getopt	@C@getopt[[:space:]]	BSD getopt has no long options: a while/case loop
 grep-P	grep[[:space:]]+(-[a-zA-Z]*P|--perl-regexp)	BSD grep has no -P: grep -E, or awk, or perl -ne
 stat-c	@C@stat[[:space:]]+(-c|--format|--printf)	BSD stat has -f: wc -c < file for a size, or python3
+touch-d	@C@touch[[:space:]]+(-[a-zA-Z]*d|--date)	BSD touch -d takes an ISO time, not '-1 day': touch -t 200001010000 (a fixed old time), or touch -r REFERENCE
 date-d	@C@date[[:space:]]+(-d|--date)	BSD date has -j -f and -v: compute with python3 or awk
 readlink	@C@readlink[[:space:]]+(-[a-eg-z]*f|--canonicalize)	readlink -f needs macOS 12.3: (cd "$(dirname f)" && pwd)
 mktemp-gnu	@C@mktemp[[:space:]]+(--|-t[[:space:]]|-p[[:space:]])	BSD mktemp differs: mktemp -d "${TMPDIR:-/tmp}/name.XXXXXX"
@@ -107,6 +108,7 @@ linux-tool|setsid ./prog &
 getopt|getopt -o a -l long -- "$@"
 grep-P|grep -oP 'a\Kb' f
 stat-c|size=$(stat -c %s f)
+touch-d|touch -d '-1 day' f
 date-d|d=$(date -d yesterday +%F)
 readlink|r=$(readlink -f "$0")
 mktemp-gnu|t=$(mktemp --suffix=.fib)

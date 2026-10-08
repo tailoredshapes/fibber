@@ -17,10 +17,11 @@ ABS_BUILD := $(abspath $(BUILD))
 VERSION := $(strip $(shell tr -d '[:space:]' < VERSION))
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
-# macOS: what the scripts expect from GNU coreutils comes from scripts/portable (timeout, flock, nproc, sha256sum, sed -i, date %N, a ulimit -v that succeeds)
+# macOS: what the scripts expect from GNU coreutils comes from scripts/portable (timeout, flock, nproc, sha256sum, sed -i, date %N, `make` = this gmake, a ulimit -v that succeeds)
 ifeq ($(UNAME_S),Darwin)
   export PATH := $(CURDIR)/scripts/portable/bin:$(PATH)
   export BASH_ENV := $(CURDIR)/scripts/portable/bash-env.sh
+  export MAKE
 endif
 PLATFORM := $(shell echo "$(UNAME_S)-$(UNAME_M)" | tr 'A-Z' 'a-z' | sed 's/linux-amd64/linux-x86_64/; s/darwin-aarch64/darwin-arm64/')
 FIB_PLATFORM ?= $(PLATFORM)
