@@ -12,12 +12,30 @@
 # compiles its cases one after the other (`-j` only runs what is compiled side by side), so shards are what make compiling parallel. The
 # directories then run side by side too, and with GATE_SLOTS (scripts/lib/slots.sh) each shard holds a slot while it runs. Unset: one
 # `cases` process for each directory, one after the other's results, as CI has always run it.
+# The build's comparison recipe (mk/cases.mk, docs/design/build.md): `ci-stage2.sh --from DIR TABLE:CASEDIR:K..` runs nothing; the shard tables
+# DIR/TABLE.i.txt (i < K, with .err .code .secs beside them) were made by Make, and this collects them, compares the non-passing set with
+# the expected file and, for a full run of a directory, checks the floor of scripts/case-floor.expected. A TABLE named otherwise than its
+# CASEDIR (`sample:stdlib:4`) is a sample: the expected lines are those of the cases that ran, and the floor does not apply.
 set -u
 root=${GATE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
-f=${1:?usage: ci-stage2.sh F}
-out=${CI_STAGE2_OUT:-$(mktemp -d)}
-mkdir -p "$out"
 here=$(cd "$(dirname "$0")" && pwd)
+from=
+if [ "${1:-}" = --cases-line ]; then   # the gate's `cases:` line from the shard files: `cases: ownership 141s (exit 0), modules 7s (exit 0), ..`
+  d=${2:?usage: ci-stage2.sh --cases-line DIR TABLE:K..}; shift 2; sep=; line="cases:"
+  for spec in "$@"; do
+    IFS=: read -r name k <<< "$spec"; secs=0; code=0
+    for ((i = 0; i < k; i++)); do
+      s=$(cat "$d/$name.$i.secs" 2>/dev/null || echo 0); c=$(cat "$d/$name.$i.code" 2>/dev/null || echo none)
+      [ "$s" -gt "$secs" ] && secs=$s
+      if [ "$c" = none ] || [ "$code" = none ]; then code=none; elif [ "$c" -eq 124 ] || [ "$code" -eq 124 ]; then code=124; elif [ "$c" -gt "$code" ]; then code=$c; fi
+    done
+    line="$line$sep $name ${secs}s (exit $code)"; sep=,
+  done
+  echo "$line"; exit 0
+fi
+if [ "${1:-}" = --from ]; then from=${2:?usage: ci-stage2.sh --from DIR TABLE:CASEDIR:K..}; shift 2; f=make; out=$from
+else f=${1:?usage: ci-stage2.sh F | ci-stage2.sh --from DIR TABLE:CASEDIR:K..}; out=${CI_STAGE2_OUT:-$(mktemp -d)}; fi
+mkdir -p "$out"
 cd "$root"
 bad=0
 : > "$out/actual"
@@ -83,16 +101,28 @@ collect() {
   } > "$out/$name.txt"
 }
 
-shards=${CI_STAGE2_SHARDS:-1}
-pairs=("ownership:${LIMIT_OWNERSHIP:-400}:$(( (shards + 3) / 4 ))" "modules:${LIMIT_MODULES:-120}:1" "stdlib:${LIMIT_STDLIB:-1800}:$shards")
-if [ "$shards" -le 1 ]; then   # one process at a time, as ever
-  for pair in "${pairs[@]}"; do IFS=: read -r name limit k <<< "$pair"; launch "$name" "$limit" "$k"; wait; done
+sample=
+if [ -n "$from" ]; then   # the tables are there: TABLE:CASEDIR:K, the names dealt out as Make dealt them (mk/cases.mk)
+  pairs=()
+  for spec in "$@"; do
+    IFS=: read -r name cdir k <<< "$spec"
+    echo "$k" > "$out/$name.nshards"
+    if [ "$name" = "$cdir" ]; then case_names "cases/$cdir" | wc -l > "$out/$name.nnames"; else echo 0 > "$out/$name.nnames"; sample=$name; fi
+    pairs+=("$name:-:$k:$cdir")
+  done
 else
-  for pair in "${pairs[@]}"; do IFS=: read -r name limit k <<< "$pair"; launch "$name" "$limit" "$k"; done
-  wait
+  shards=${CI_STAGE2_SHARDS:-1}
+  pairs=("ownership:${LIMIT_OWNERSHIP:-400}:$(( (shards + 3) / 4 )):ownership" "modules:${LIMIT_MODULES:-120}:1:modules" "stdlib:${LIMIT_STDLIB:-1800}:$shards:stdlib")
+  if [ "$shards" -le 1 ]; then   # one process at a time, as ever
+    for pair in "${pairs[@]}"; do IFS=: read -r name limit k _ <<< "$pair"; launch "$name" "$limit" "$k"; wait; done
+  else
+    for pair in "${pairs[@]}"; do IFS=: read -r name limit k _ <<< "$pair"; launch "$name" "$limit" "$k"; done
+    wait
+  fi
+  [ -n "${CI_STAGE2_ONLY:-}" ] && sample=stdlib
 fi
 for pair in "${pairs[@]}"; do
-  IFS=: read -r name limit k <<< "$pair"; dir=cases/$name
+  IFS=: read -r name limit k cdir <<< "$pair"; dir=cases/$cdir
   echo "== $f cases $dir (limit ${limit}s)"
   collect "$name"
   code=$(cat "$out/$name.code")
@@ -103,15 +133,20 @@ for pair in "${pairs[@]}"; do
   total=$(sed -n 's/^\([0-9][0-9]*\) cases: .*/\1/p' "$out/$name.txt" | tail -n 1)
   if [ -z "$total" ] || [ "$total" -eq 0 ]; then echo "ci-stage2: $dir printed no case count (exit $code)"; tail -n 20 "$out/$name.err"; bad=1; continue; fi
   named=$(cat "$out/$name.nnames")
-  if [ "$(cat "$out/$name.nshards")" -gt 1 ] && [ "$total" -ne "$named" ]; then
+  if [ "$(cat "$out/$name.nshards")" -gt 1 ] && [ "$named" -gt 0 ] && [ "$total" -ne "$named" ]; then
     echo "ci-stage2: $dir ran $total cases in its shards, but $named were dealt out (a name that is the prefix of another?)"; bad=1; continue
   fi
   awk -v d="$dir" '$1 ~ /\.fib$/ && NF >= 2 && $2 != "pass" && $2 != "OPEN" { print d "/" $1 " " $2 }' "$out/$name.txt" >> "$out/actual"
+  # The case-count floor (scripts/case-floor.expected): a full run of a directory that ran fewer cases than its floor fails (a merge may have lost cases).
+  if [ "$name" = "$cdir" ] && [ -n "$from" ]; then
+    floor=$(awk -v d="$cdir" '$1 == d { print $2 }' "$here/case-floor.expected")
+    if [ -n "$floor" ] && [ "$total" -lt "$floor" ]; then echo "ci-stage2: $dir ran $total cases, the floor is $floor (scripts/case-floor.expected): a merge may have lost cases"; bad=1; fi
+  fi
 done
 sort -o "$out/actual" "$out/actual"
 grep -v -e '^#' -e '^[[:space:]]*$' scripts/ci-stage2.expected | sort > "$out/expected"
-if [ -n "${CI_STAGE2_ONLY:-}" ]; then   # a sample: only the expected lines of the stdlib cases that ran, all of the other directories'
-  awk '$1 ~ /\.fib$/ { print "cases/stdlib/" $1 }' "$out/stdlib.txt" | sort > "$out/ran"
+if [ -n "$sample" ]; then   # a sample: only the expected lines of the stdlib cases that ran, all of the other directories'
+  awk '$1 ~ /\.fib$/ { print "cases/stdlib/" $1 }' "$out/$sample.txt" | sort > "$out/ran"
   awk 'NR==FNR { ran[$1]=1; next } $1 !~ /^cases\/stdlib\// || ($1 in ran)' "$out/ran" "$out/expected" > "$out/expected.sel"
   mv "$out/expected.sel" "$out/expected"
 fi

@@ -169,3 +169,14 @@
 (defun lower-trap (fx: Fx) -> (Result unit LairError)
   (do (fx-intrinsic fx "llvm.trap" [] [])
       (Ok ())))
+
+;; `(barrier)`: NVPTX's `bar.sync 0` (LLVM 21's `llvm.nvvm.barrier.cta.sync.aligned.all` with barrier 0; `llvm.nvvm.barrier0` of earlier LLVMs is
+;; gone: looking it up gives id 0 and a crash in the intrinsic table); `(sreg NAME)`: the register's read intrinsic (spec/lir.md 6.9). Only a
+;; kernel target's backend lowers them to instructions; elsewhere LLVM reports an unknown intrinsic at code generation.
+(defun lower-barrier (fx: Fx) -> (Result unit LairError)
+  (let ((zero (core/const-int (lx-ty (. fx lx) ty-i32) 0 false)))
+    (do (fx-intrinsic fx "llvm.nvvm.barrier.cta.sync.aligned.all" [] [zero])
+        (Ok ()))))
+
+(defun lower-sreg (fx: Fx name: str) -> (Result i64 LairError)
+  (Ok (fx-intrinsic fx (str "llvm.nvvm.read.ptx.sreg." name) [] [])))

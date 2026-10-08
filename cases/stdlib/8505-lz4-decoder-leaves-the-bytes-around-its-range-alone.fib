@@ -1,0 +1,31 @@
+;; spec: docs/design/compress.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; roots: ../../lib support
+;; The fast decoder's slack proof (blockdec.fib): a block decoded into dst[100, 100+n) of a buffer with 0xAA canaries around it writes nothing outside; one decoded from inside a longer array whose bytes after
+;; the block look like a valid offset reads nothing past its length. 40 inputs of run, period-3 and text shapes, fast and HC.
+(ns main (:use tl.check fib.compress.lz4.mem fib.compress.lz4.block fib.compress.lz4.blockdec))
+(defun shape (k: i64 n: i64) -> (Array i8)
+  (let [c (cell (array n 0i8))]
+    (do (dotimes (i n) (array-set! &c i (trunc i8 (cond (= (rem k 3) 0) (rem (quot i 9) 5) (= (rem k 3) 1) (rem i 3) :else (rem (* i i) 17)))))
+        @c)))
+(defun canary-ok? (d: (Array i8) hc: bool) -> bool
+  (let [n (array-len d) dst (cell (array (+ n 300) -86i8)) z (if hc (block-compress-hc d 4) (block-compress d 1))]
+    (match (block-decompress-into z @dst 100 n)
+      ((Err _) false)
+      ((Ok r) (and (= r n) (bytes-eq (array-copy @dst 100 (+ 100 n)) d)
+                   (loop [i 0] (cond (>= i 100) true (not (= (array-get @dst i) -86i8)) false :else (recur (+ i 1))))
+                   (loop [i (+ 100 n)] (cond (>= i (array-len @dst)) true (not (= (array-get @dst i) -86i8)) false :else (recur (+ i 1)))))))))
+(defun input-side-ok? (d: (Array i8) hc: bool) -> bool
+  (let [z (if hc (block-compress-hc d 4) (block-compress d 1)) za (array (+ (array-len z) 64) 0i8) out (array (+ (array-len d) 200) 0i8)]
+    (do (copy-exact (data za) 0 (data z) 0 (array-len z))
+        (dotimes (i 32) (wr8 (data za) (+ (array-len z) (* 2 i)) 1))
+        (let [r (decode-block (data za) (array-len z) (data out) (array-len out) 0 0 (array-len d))]
+          (and (= r (array-len d)) (bytes-eq (array-copy out 0 (array-len d)) d))))))
+(defun main () -> i64
+  (let [c (checks)]
+    (do (dotimes (k 40)
+          (let [d (shape k (+ 13 (* k 17)))]
+            (do (check c (canary-ok? d (= (rem k 2) 0))) (check c (input-side-ok? d (= (rem k 2) 1))))))
+        (checks-result c))))

@@ -18,11 +18,21 @@
   (strings: (Cell (Vec StaticStr)) string-index: (Cell (Map str str))
    keywords: (Cell (Vec str)) keyword-index: (Cell (Map str i64)) keywords-sealed: (Cell bool)
    closures: (Cell (Vec StaticClosure)) closure-index: (Cell (Map str str))
-   vtables: (Cell (Vec StaticVtable)) vtable-index: (Cell (Map str str))))
+   vtables: (Cell (Vec StaticVtable)) vtable-index: (Cell (Map str str))
+   ;; Module-level items written in full by whoever needs them (the host index state and the shared-memory windows of fib.gpu,
+   ;; emit.lower.gpu; the kernel table of a kernel target, emit.compile), by name, each once.
+   items: (Cell (Vec str)) item-index: (Cell (Set str))))
 
 (defun statics-new () -> Statics
   (Statics (cell []) (cell (map-empty)) (cell []) (cell (map-empty)) (cell false)
-           (cell []) (cell (map-empty)) (cell []) (cell (map-empty))))
+           (cell []) (cell (map-empty)) (cell []) (cell (map-empty)) (cell []) (cell (set-empty))))
+
+;; The module item `lir` under the name `name`, added once; the answer is `@name`.
+(defun statics-item (st: Statics name: str lir: str) -> str
+  (do (when (not (contains? @(. st item-index) name))
+        (do (set! (. st items) (conj @(. st items) lir))
+            (set! (. st item-index) (conj @(. st item-index) name))))
+      (str-join ["@" name])))
 
 ;; The address of the immortal `str` object holding `text`. Rust: statics.rs:26 Statics::string
 (defun statics-string (st: Statics text: str tid-str: i64) -> str
@@ -100,7 +110,7 @@
 ;; The constants: strings, immortal closures, vtables, one piece each (the pieces `statics-render` joins; a string's is made once).
 ;; Rust: statics.rs:105 Statics::render
 (defun statics-render-pieces (st: Statics) -> (Vec str)
-  (into (into (mapv (fn (s: StaticStr) (. s lir)) @(. st strings))
+  (into (into (into (mapv (fn (s: StaticStr) (. s lir)) @(. st strings)) @(. st items))
               (mapv (fn (c: StaticClosure)
                       (str-join ["(constant internal " (unat (. c name)) " { i64 i32 i32 ptr } { (i64 0) (i32 " (str (. c tid))
                                  ") (i32 " (str flag-immortal) ") @" (. c code) " })\n"]))

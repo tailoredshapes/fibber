@@ -99,3 +99,12 @@ unwinds only while a catch is active on its thread; elsewhere it is the trap it 
 ## P-sched, 2026-10-07 (the lead's brief after the owner's "if it's not implemented that's either a regression or massive oversight")
 
 It was an oversight: P-sched (parallelism.md 3.1) was designed and sized and never built; the later packages were built on `spawn` threads behind a seam meant for it. Built now (parallelism.md section 8). Decisions: 1 the third tier is the builtin `fork-task` (not `fork`, which is `fib.os.process`'s name; `fib.parallel/fork` is the scope form over it) and returns the ordinary `(Task a)`. 2 A trap in a pool task is the task's failure, never a silent process death: unwinding to the runner in a catching program, else the worker's chain fails and the worker is replaced. 3 `run-chunks` uses W runners over a shared counter (dynamic balancing) rather than one task per chunk, so the abandoned count of a trapping call is the same on every run. 4 The deque's ring slots use release/acquire in addition to the paper's fences so that ThreadSanitizer sees the hand-off.
+
+## GPU (docs/design/gpu.md), the owner, 2026-10-07
+
+The kernel target and `fib.gpu` are CORE, not a driver: "I think its core, we just have to be careful to reject on platforms that don't have
+a gpu... 'Defkernel' is a smart way of making it a deliberate dev choice." So: `defkernel` is the deliberate opt-in; a program with a
+kernel built for a platform that has no kernel target is rejected with a clear message naming the kernel and the platform (never a silent
+CPU fallback); the drivers (fib-gpu-cuda, later Metal/Vulkan) stay in their own repositories per ADR 0011; the lIR forms of spec/lir.md
+§6.9a (`kernelcc`, `(sreg R)`, `(barrier)`, the align-1 rule) are accepted. Phase 1 (the `:kernel` core form, the source-level kernel
+checker, the launch ABI, the `fib.gpu` builtins and the `Device` protocol) is the next package.

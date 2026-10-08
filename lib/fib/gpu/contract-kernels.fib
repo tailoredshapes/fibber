@@ -1,0 +1,25 @@
+;; fib.gpu.contract-kernels: the kernels the device contract (fib.gpu.contract) launches: vector add, a register-tiled f32 GEMM and a device
+;; assert. A program that `:require`s this module has kernels, so it is built with `--kernel-target` and `(gpu/program-ptx)` is their PTX:
+;; a driver's spec does that (fib-gpu-cuda specs/contract-spec.fib). Nothing of fib.gpu's facade requires it, so an ordinary program has none.
+(ns fib.gpu.contract-kernels (:require [fib.gpu :as gpu]))
+
+;; c[i] = a[i] + b[i] below n.
+(defkernel contract-vadd (a: ptr b: ptr c: ptr n: i64)
+  (let ((i (gpu/global-id 0)))
+    (when (< i n) (gpu/f32-set! c i (+ (gpu/f32-at a i) (gpu/f32-at b i))))))
+
+;; C = A*B, square n, row major, one thread per element, one fma chain in increasing k (the CPU reference's order: bit exact).
+(defkernel contract-gemm (a: ptr b: ptr c: ptr n: i64)
+  (let ((col (gpu/global-id 0)) (row (gpu/global-id 1)))
+    (when (and (< row n) (< col n))
+      (gpu/f32-set! c (unchecked-add (unchecked-multiply row n) col)
+                    (loop ((k 0) (acc 0.0f32))
+                      (if (< k n)
+                          (recur (unchecked-add k 1) (simd/fma (gpu/f32-at a (unchecked-add (unchecked-multiply row n) k)) (gpu/f32-at b (unchecked-add (unchecked-multiply k n) col)) acc))
+                          acc))))))
+
+;; Traps when an element is not positive: the device assert the contract expects as the Err of the sync.
+(defkernel contract-assert (a: ptr n: i64)
+  (let ((i (gpu/global-id 0)))
+    (when (< i n)
+      (when (<= (gpu/f32-at a i) 0.0f32) (trap "contract-assert: an element is not positive")))))

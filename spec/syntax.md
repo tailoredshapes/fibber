@@ -1125,15 +1125,17 @@ vector operation), and `store-simd` takes a value of any vector type. They are `
 read and write any width, and `(splat (Simd f64 n) x)` is allowed inside it (spec/types.md 1.9). Case 7962 pins them at 2, 4 and 8 `f64` lanes and 4,
 8 and 16 `f32` lanes.
 
-`array-uninit-f32` and `array-uninit-f64` take an `i64` length and return
-`(Array f32)` and `(Array f64)`, respectively, only inside lexical `unsafe`.
+`array-uninit-f32`, `array-uninit-f64` and `array-uninit-i8` take an `i64` length and return
+`(Array f32)`, `(Array f64)` and `(Array i8)`, respectively, only inside lexical `unsafe`
+(`array-uninit-i8`, for byte buffers a codec fills before it returns them: the zero fill of a
+200 MB result is about a third of a parallel decode, docs/shootout/lz4.md).
 They allocate ordinary reference-counted native arrays without filling the
 payload. Negative lengths and lengths exceeding `(INT64_MAX - 24) / sizeof(T)`
 trap with `array-uninit: invalid length` before allocation. Callers must write
 an element before reading it and initialize every element before exposing the
 array to safe code. Destruction inspects no floating payload. These are
 native-stage primitives; the frozen Rust reference does not implement them.
-Cases 7016, 7055, 7070, and 7071 pin initialization, unsafe access, and bounds.
+Cases 7016, 7055, 7070, and 7071 pin initialization, unsafe access, and bounds; case 8506 pins the `i8` one.
 
 A fibber object reaches foreign code only as an address. `(raw e)` is
 the address of `e`'s object, valid for the duration of the enclosing
@@ -1742,6 +1744,25 @@ Errors (types §6.14): `lent place must be a private cell: a is used as a value 
 cannot be captured by a closure`, `view cell v is passed in-out and used again in the same call`, `await inside with-view`,
 `scoped type T can only be constructed inside unsafe`, `scoped value consumed: owned parameter p of f ...`.
 
+### 3.22 `defkernel` (GPU kernels; library `fib.gpu`)
+
+```
+(defkernel name (param*) body+)
+```
+
+**Decided** (owner, 2026-10-07, docs/design/decisions-2026-10-04.md GPU; implemented by package GPU-2, stage 2 only). A `defkernel` is
+the `defun` `(defun name (param*) :kernel -> unit (unsafe (do body+)))`: a kernel entry, `unit`-valued, its body in `unsafe` (it reads and
+writes raw device pointers), marked `:kernel` after its parameters (the mark the checker and the emitter read; `:kernel` is not written by
+hand: `defun-options` of types.lower skips it, `defun-kernel?` reads it). It is a core form by rule 2 of §4.1: it decides what a name refers to
+for the emitter (the kernel table, docs/design/gpu.md 4.2) and binds a name no driver may shadow. The parameters are scalars (`i8` to `i64`,
+`f32`, `f64`, `bool`) and raw `ptr`s (device buffers); the body is the kernel subset of types §2.17, checked at the source by own.kernel
+after inference, together with every function the body reaches. The same function compiles for the host (`fib.gpu/host-launch` runs it
+over a grid: the one-language guard, gpu.md 3.5); on a kernel target (`fibc build --target nvptx64-nvidia-cuda --emit ptx`, or the host
+build's `--kernel-target TRIPLE`) it is an entry of the kernel module named `name` with `-` as `_`. A program with a `defkernel` built as an
+executable for a platform with no kernel target is refused (`fibc: the program has the kernels .. and TRIPLE has no kernel target: build
+with --kernel-target nvptx64-nvidia-cuda ..`): there is no CPU fallback for a kernel. `defkernel` cannot be a macro's name
+(`MacroNamesCoreForm`) and is admitted at top level only. Cases: cases/stdlib 8530-8548; compiler/tests/native/gpu-emit.sh.
+
 ## 4. Core versus macro versus library
 
 ### 4.1 The rule (Decided)
@@ -1766,8 +1787,8 @@ preserving verdicts and error positions is a **macro**.
 
 ### 4.2 Core forms
 
-Twenty-three: `defun def fn let if do match loop recur defstruct . defenum
-defprotocol impl & async await unsafe extern quote defmacro ns var`
+Twenty-four: `defun def fn let if do match loop recur defstruct . defenum
+defprotocol impl & async await unsafe extern quote defmacro ns var defkernel` (§3.22)
 (`quasiquote`,
 `unquote`, `unquote-splicing` exist only until expansion). `set!`,
 `cell`, `deref`, `atom`, `swap!`, `reset!`, `weak`, `spawn`, `join` are
@@ -1792,6 +1813,7 @@ expander treat them as calls.
 | `Option` (built in, §3.9) | `some` (constructor), `nil` (a literal, §1.1); `nil?`, `some?`, `if-let` are prelude definitions (§4.4, §4.5) |
 | unsafe | `ptr+ load-i8 load-i16 load-i32 load-i64 load-ptr store-i8 ... store-ptr alloc free raw raw-retained release-raw`; `(alloc n)` is `n` zero bytes (§3.15) |
 | dynamic dispatch | `(dyn P e)`, `(dyn P :send e)` |
+| GPU (types §2.17, `fib.gpu`, GPU-2) | `gpu/local-id gpu/group-id gpu/group-size gpu/num-groups gpu/global-id gpu/barrier gpu/shared gpu/host-index-set! gpu/program-ptx`; `(gpu/shared :f32 N)` takes a literal element kind and a literal count (unsafe) |
 
 `set-field!`, `dyn` and the conversions that name a target type
 (`trunc` to `uitofp`) are **primitive forms**: each takes one operand

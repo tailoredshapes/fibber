@@ -69,7 +69,7 @@ type   ::= i1 | i8 | i16 | i32 | i64 | float | double | ptr
          | [N x type]                       ; an array of N elements, N ≥ 0 (§2.1)
 rtype  ::= type | void                      ; function results only
 fntype ::= (fn cc? rtype (type* ...?))      ; a function type, for indirect calls
-cc     ::= ccc | tailcc
+cc     ::= ccc | tailcc | kernelcc          ; kernelcc: a GPU kernel's entry (§6.9a, accepted 2026-10-07)
 ```
 
 - There is no `bool` (use `i1`), no `f32`/`f64` (use `float`/`double`),
@@ -149,6 +149,7 @@ item   ::= (defstruct NAME (type*))
          | (target (cpu STRING) (features STRING)?)        ; the CPU and features to generate code for (§4.5)
 mod    ::= private | internal | external           ; linkage (§4.3), at most one
          | hidden                                  ; visibility (§4.3)
+         | shared                                  ; a global in block-shared memory of a kernel target (§6.9a), `global` only
 block  ::= (block LABEL instr+)
 ```
 
@@ -653,6 +654,22 @@ OP ::= xchg add sub and nand or xor max min umax umin fadd fsub fmax fmin
 `(let ((x v)..) body..)` as §5.2 and §5.3. A `let` with no body is
 `let without a body`.
 
+### 6.9a Kernel forms (accepted by the owner on 2026-10-07; GPU-1, docs/design/gpu.md)
+
+Three additions for a **kernel target** (types.targets `kernel-row?`: `nvptx64-nvidia-cuda`), whose module is the kernels of a program and whose
+assembly is PTX; nothing of them runs on a CPU target, and lair refuses them there before LLVM sees them.
+
+| Form | Rule |
+|---|---|
+| `(define kernelcc (NAME void) (..) ..)` | the entry of a kernel: LLVM's `ptx_kernel` (71). `void` result, parameters scalars or `ptr`. Nothing in lIR calls it (a driver launches it by name); a `kernelcc` function on a target that is not a kernel target is `@NAME is kernelcc: only a kernel target .. lowers a kernel`; `tailcall` never targets it. `fn-type-str` prints it `(fn kernelcc void (..))` |
+| `(sreg R)` | `i32`: the special register `R` of the kernel's index space, one of `tid.{x,y,z}` (the thread's index in its block), `ctaid.{x,y,z}` (the block's in the grid), `ntid.{x,y,z}` (the block's size), `nctaid.{x,y,z}` (the grid's); any other `R` is the parse error `sreg: no special register R`. Lowered to `llvm.nvvm.read.ptx.sreg.R` |
+| `(barrier)` | void, not a terminator: every thread of the block waits until all have reached it (`bar.sync 0`; LLVM 21's `llvm.nvvm.barrier.cta.sync.aligned.all` with barrier 0: `llvm.nvvm.barrier0` is gone from LLVM 21). Not a phi operand |
+| `(global shared NAME T init)` | a global in the block-shared memory of a kernel target (LLVM address space 3, NVPTX `.shared`; accepted by the owner's GPU decision, implemented by GPU-2): `@NAME` is its generic address (an `addrspacecast` constant), so `load` and `store` through it are the ordinary forms and the backend makes `ld.shared`/`st.shared`; its content at block start is undefined (the initialiser is for the grammar: lair gives LLVM `undef`, NVPTX refuses an initialiser there); `internal` to the module. `shared` goes with `global` only (`constant cannot be shared`, `define cannot be shared`), once (`duplicate modifier shared`); on a target that is not a kernel target lair refuses it (`@NAME is shared: only a kernel target ..`). Emitted by `gpu/shared` (types.md 2.17) |
+
+`llvm.` stays reserved as a symbol prefix (§14 item 5): the two forms are instructions, as the fma family is. On a kernel target lair reads
+`(align 1)` on a scalar `load` or `store` as the scalar's natural alignment (the kernel subset indexes elements, never bytes; a byte-aligned
+access on a GPU is four accesses of a byte): docs/design/gpu.md 3.3 and native.lower.memory `kernel-align`.
+
 ### 6.10 What is not in lIR
 
 liar's ADR 021 "safe lIR" is removed: there is no `own`, `ref`,
@@ -1016,3 +1033,4 @@ one the passes used.
 | 10 | external global declarations `(declare-global NAME T)`, for `stderr` and other variables the C library or another module defines | **adopted** as proposed | §4.4 |
 | 11 | `volatile` and `(align N)` on `load`, `store` and `alloca` | **adopted** as proposed: `N` a power of two from 1 to 2^30; `volatile` is LLVM's, not atomic | §6.5 |
 | 12 | the instructions SIMD code needs (SIMD wave 2, package P0, owner decisions of 2026-10-04): `fma fmuladd fsqrt fabs ffloor fceil ftrunc fround froundeven fcopysign fmin fmax fminnum fmaxnum smin smax umin umax abs`; fast-math flags `reassoc contract arcp afn nsz` (never `nnan`, `ninf` or `fast`, which make poison) on `fadd fsub fmul fdiv frem fma reduce-fadd reduce-fmul`; the horizontal `reduce-*` family; conversions, saturating conversions and `ptrtoint`/`inttoptr` on vectors; a vector index in `getelementptr`; `masked-load`, `masked-store`, `gather`, `scatter`; the module form `(target (cpu ..) (features ..))` | **adopted** as designed in docs/design/simd-and-tensors.md 2.9, 2.10, with `nsz` allowed (it never makes poison) and `fmuladd` and `fcopysign` added; implemented by the compiler in fibber only (the Rust `lair` is the legacy oracle and does not have them: its harness skips the cases marked `;; stage: 2`) | §4.5, §6.1, §6.3, §6.4, §6.5 |
+| 13 | kernel forms for a kernel target: `kernelcc`, `(sreg R)`, `(barrier)`, and `(align 1)` on a scalar read as natural alignment there | **Accepted** (the owner, 2026-10-07): implemented in the parser, checker, printer and lair, exercised by compiler/tests/native/gpu-emit.sh and j-unit; docs/design/gpu.md. `fib.gpu` is core, not a driver: `defkernel` is the deliberate opt-in, and a build for a platform with no kernel target rejects the program with a clear message | §2, §6.9a |

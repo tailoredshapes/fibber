@@ -121,11 +121,12 @@ version and whose file another, or whose checksum is not a checksum, fails at th
   (plant-file "SEED" "url=https://github.com/tailoredshapes/fibber/releases/download/v9.0.0/fibc-9.0.0-linux-x86_64.tar.gz\nsha256=4842cb0700ad3147b4f1543737145645571c9e397c3dc027b104cd46d708d06b\n")
   (plant-file "SEED" "# empty\n"))
 
-(rule "the release path keeps its checks: package.sh runs check-version.sh, the workflow refuses a tag that is not v + VERSION"
-  (into (must-contain repo "scripts/package.sh" "\"$root/scripts/check-version.sh\"")
-        (into (must-contain repo ".github/workflows/release.yml" "test \"v$(cat VERSION)\" = \"$TAG\"")
-              (missing repo ["scripts/check-version.sh" "scripts/fetch-seed.sh"])))
-  (plant-file "scripts/package.sh" "#!/bin/sh\n")
+(rule "the release path keeps its checks: the release depends on build/version.ok, whose recipe is check-version.sh; the workflow refuses a tag that is not v + VERSION"
+  (into (must-contain repo "mk/stage2.mk" "scripts/check-version.sh")
+        (into (must-contain repo "mk/release.mk" "$(BUILD)/version.ok")
+              (into (must-contain repo ".github/workflows/release.yml" "test \"v$(cat VERSION)\" = \"$TAG\"")
+                    (missing repo ["scripts/check-version.sh" "scripts/fetch-seed.sh" "scripts/package.sh"]))))
+  (plant-file "mk/release.mk" "release:\n")
   (plant-remove "scripts/check-version.sh"))
 ```
 

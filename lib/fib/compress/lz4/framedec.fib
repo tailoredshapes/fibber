@@ -12,7 +12,7 @@
 ;; past `lim` + 32 (the caller has checked `need` against max-output, so a hostile size allocates nothing beyond it).
 (defun ensure (&ob: (Array i8) op: i64 need: i64 lim: i64) -> unit
   (when (> need (array-len @ob))
-    (let [nb (cell (array (if (> need (* 2 (array-len @ob))) need (max need (min (+ lim 32) (* 2 (array-len @ob))))) 0i8))]
+    (let [nb (cell (fresh (if (> need (* 2 (array-len @ob))) need (max need (min (+ lim 32) (* 2 (array-len @ob)))))))]
       (do (array-blit! &nb 0 @ob 0 op) (set! ob @nb)))))
 
 ;; Blocks of one frame from i: each is a size word (0: the end mark), its data and, with block checksums, the checksum. `w` is the dictionary window of independent
@@ -93,7 +93,7 @@
         :else
         (let [fcap (if (>= (. h csize) 0) (+ op (. h csize)) cap)
               w (if (and (> (array-len dict) 0) (. h indep)) (make-win dict (. h bmax)) (array 0 0i8))]
-          (do (when (>= (. h csize) 0) (ensure &ob op fcap fcap))
+          (do (if (>= (. h csize) 0) (ensure &ob op fcap fcap) (ensure &ob op (min (+ cap 32) (+ op (+ (. h bmax) (* 6 (array-len src))))) cap))
               (match (fix-kind (dec-frame src i &ob op h lo0 fcap w (array-len dict)) (< fcap cap))
                 ((Err e) (Err e))
                 ((Ok r) (check-content src r h &ob op)))))))

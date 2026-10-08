@@ -11,7 +11,8 @@
 ;;   :invalid-argument  an option the codec refuses (a block size that is none, a negative limit, a dictionary on a codec that has none)
 ;;   :checksum          a checksum in the data does not match the bytes (header, block or content)
 ;;   :io               a reader or writer the caller gave to a stream helper failed (the message says how)
-;; `message` is for people; a program branches on `kind`.
+;;   :internal         a worker of a parallel call trapped (a bug: the call fails, the process does not)
+;; `message` is for people; a program branches on `kind`. (:internal: see below.)
 (defstruct CompressError (kind: keyword message: str))
 (derive Eq CompressError)
 (derive Debug CompressError)
@@ -23,6 +24,7 @@
 (defun invalid-argument (m: str) -> CompressError (CompressError :invalid-argument m))
 (defun checksum-error (m: str) -> CompressError (CompressError :checksum m))
 (defun io-error (m: str) -> CompressError (CompressError :io m))
+(defun internal-error (m: str) -> CompressError (CompressError :internal m))
 (defun error-kind (e: CompressError) -> keyword (. e kind))
 
 ;; The default cap on a decompressed size: 256 MiB. A caller that expects more says so in `max-output`; one that expects less says so too. There is no "unlimited".
@@ -37,12 +39,16 @@
 ;;   checksum       record (compress) a checksum of the content; verify what is there (decompress: always verified when present)
 ;;   block-size     the format's block size in bytes (LZ4 frames: 65536, 262144, 1048576 or 4194304); 0 is the codec's default
 ;;   independent    blocks do not refer to each other (smaller output, random access, parallel); false: linked blocks
-;;   record-size    record the content size in the header (a one-shot compress knows it; a streaming one needs `size-hint`)
+;;   record-size    record the content size in the header when it is known (default true: a one-shot compress knows it, and a decoder can then allocate the result once;
+;;                  a streaming one knows it only from `size-hint`, and records nothing without)
 ;;   size-hint      streaming compress: the total size the stream will have, -1 unknown; with `record-size` it goes in the header and `finish` checks it
+;;   threads        workers for a codec with `:parallel`: 0 (the default) uses the machine's cores for an input large enough to pay for it (LZ4: 2 MiB to compress, 512 KiB to decompress, measured in docs/shootout/lz4.md) and one otherwise,
+;;                  1 is sequential, n at most that many (never more than the 64 of fib.parallel.cpu); THE RESULT DOES NOT DEPEND ON IT (the same bytes, the same error kind): the contract checks
+;;   verify         decompress: verify the checksums that are in the data (default true); false skips them, for a caller who knows the data is sound and wants the speed
 ;;   max-output     decompress: the most bytes the result may have; more is a `too-large` error. Default `default-max-output`
-(defstruct Options (level: i64 acceleration: i64 dictionary: (Array i8) checksum: bool block-checksum: bool block-size: i64 independent: bool record-size: bool size-hint: i64 max-output: i64))
+(defstruct Options (level: i64 acceleration: i64 dictionary: (Array i8) checksum: bool block-checksum: bool block-size: i64 independent: bool record-size: bool size-hint: i64 max-output: i64 threads: i64 verify: bool))
 
-(defun default-options () -> Options (Options 1 1 (array 0 0i8) true false 0 true false -1 default-max-output))
+(defun default-options () -> Options (Options 1 1 (array 0 0i8) true false 0 true true -1 default-max-output 0 true))
 ;; Options as the codec-neutral defaults, with the dictionary and the limit that callers usually vary.
 (defun with-level (o: Options level: i64) -> Options (with o (level level)))
 (defun with-max-output (o: Options n: i64) -> Options (with o (max-output n)))
@@ -53,6 +59,8 @@
 (defun with-independent (o: Options on: bool) -> Options (with o (independent on)))
 (defun with-record-size (o: Options on: bool) -> Options (with o (record-size on)))
 (defun with-size-hint (o: Options n: i64) -> Options (with o (size-hint n)))
+(defun with-threads (o: Options n: i64) -> Options (with o (threads n)))
+(defun with-verify (o: Options on: bool) -> Options (with o (verify on)))
 (defun with-acceleration (o: Options n: i64) -> Options (with o (acceleration n)))
 
 ;; One step of a decompressor: output (at most the decompressor's per-call limit), whether it needs more input before it can produce any (`needs-input`: false while the
@@ -73,7 +81,7 @@
   (decompressor-finish (self) -> (Result unit CompressError)))
 
 ;; A codec. `codec-name` is the format's name ("lz4"). `codec-capabilities` lists keywords from: :frame (self-delimiting frames with a magic number), :block (raw blocks
-;; with the length kept elsewhere), :levels, :streaming, :dictionary, :checksum, :content-size, :linked-blocks. A capability named must work and one not named must be an
+;; with the length kept elsewhere), :levels, :streaming, :dictionary, :checksum, :content-size, :linked-blocks, :parallel (honours `threads`). A capability named must work and one not named must be an
 ;; `unsupported` or `invalid-argument` error, never a silent change: the contract checks both. `codec-magics` lists the byte strings a frame of the format starts with
 ;; (for `detect`; empty for a format with no magic). `codec-max-compressed-size` is the most `compress` can return for n input bytes (n unknown for a stream: per block).
 (defprotocol Codec

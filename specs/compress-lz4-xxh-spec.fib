@@ -1,0 +1,49 @@
+;; The vectorised xxHash32 (an i32x4 of accumulators) against an independent scalar version written here, on 1,000,000 seeded random lengths and contents, one-shot and in random
+;; pieces (streaming), and against liblz4's own checksums through the reference vectors of compress-lz4-edge-spec.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.rng fib.compress.lz4.mem fib.compress.lz4.xxh32 fib.compress.corpus))
+
+;; The scalar reference: one accumulator at a time, exactly the algorithm of the xxHash specification, with plain i64 arithmetic masked to 32 bits.
+(defun m (x: i64) -> i64 (bit-and x 4294967295))
+(defun rl (x: i64 n: i64) -> i64 (m (bit-or (shl x n) (shr x (- 32 n)))))
+(defun rnd (acc: i64 inp: i64) -> i64 (m (unchecked-multiply (rl (m (+ acc (m (unchecked-multiply inp 2246822519)))) 13) 2654435761)))
+(defun le32 (a: (Array i8) i: i64) -> i64 (bit-or (bit-or (bit-and (zext i64 (array-get a i)) 255) (shl (bit-and (zext i64 (array-get a (+ i 1))) 255) 8))
+                                                 (bit-or (shl (bit-and (zext i64 (array-get a (+ i 2))) 255) 16) (shl (bit-and (zext i64 (array-get a (+ i 3))) 255) 24))))
+(defun scalar (a: (Array i8) seed: i64) -> i64
+  (let [n (array-len a)
+        h0 (if (>= n 16)
+             (loop [i 0 v1 (m (+ (+ seed 2654435761) 2246822519)) v2 (m (+ seed 2246822519)) v3 seed v4 (m (- seed 2654435761))]
+               (if (<= (+ i 16) n)
+                 (recur (+ i 16) (rnd v1 (le32 a i)) (rnd v2 (le32 a (+ i 4))) (rnd v3 (le32 a (+ i 8))) (rnd v4 (le32 a (+ i 12))))
+                 (m (+ (+ (+ (rl v1 1) (rl v2 7)) (+ (rl v3 12) (rl v4 18))) n))))
+             (m (+ (+ seed 374761393) n)))
+        i16 (* 16 (quot n 16))
+        h4 (loop [i i16 h h0] (if (<= (+ i 4) n) (recur (+ i 4) (m (unchecked-multiply (rl (m (+ h (m (unchecked-multiply (le32 a i) 3266489917)))) 17) 668265263))) (do (set-i i) h)))
+        k (* 4 (quot (- n i16) 4))
+        h5 (loop [j (+ i16 k) h h4] (if (< j n) (recur (+ j 1) (m (unchecked-multiply (rl (m (+ h (m (unchecked-multiply (bit-and (zext i64 (array-get a j)) 255) 374761393)))) 11) 2654435761))) h))
+        a1 (m (unchecked-multiply (bit-xor h5 (shr h5 15)) 2246822519))
+        a2 (m (unchecked-multiply (bit-xor a1 (shr a1 13)) 3266489917))]
+    (bit-xor a2 (shr a2 16))))
+(defun set-i (i: i64) -> unit ())
+
+(defun mismatches (count: i64 seed: i64) -> i64
+  (let [g (rng-new seed) buf (random-bytes seed 400)]
+    (loop [t 0 bad 0]
+      (if (>= t count) bad
+        (let [n (rng-below g 330) off (rng-below g 70) sd (if (= (rng-below g 4) 0) (rng-below g 4294967296) 0)
+              a (array-copy buf off (+ off n))
+              want (scalar a sd)
+              one (xxh32 a sd)
+              x (xxh-new sd) c1 (rng-below g (+ n 1))
+              _ (do (xxh-update! x a 0 c1) (xxh-update! x a c1 (- n c1)))
+              streamed (if (= sd 0) (xxh-digest x) want)]
+          (recur (+ t 1) (if (and (= want one) (= want streamed)) bad (+ bad 1))))))))
+
+(defspecs specs
+  (feature "xxHash32, vectorised"
+    (scenario "the published values: the empty input, abc, and the vectors of the lz4 frame tests"
+      (then (expect = [46947589 852579327] [(xxh32 (array 0 0i8) 0) (xxh32 (str-bytes "abc") 0)])
+            (expect = [46947589 852579327] [(scalar (array 0 0i8) 0) (scalar (str-bytes "abc") 0)])))
+    (scenario "1,000,000 random lengths (0 to 329, at random offsets into a buffer, some with a random seed): the vector, the scalar and the streamed digest agree"
+      (then (expect = 0 (mismatches 1000000 7))))))
+
+(defun main () -> i64 (run-main (specs)))

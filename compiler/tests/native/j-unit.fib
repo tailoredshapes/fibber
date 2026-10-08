@@ -3,7 +3,8 @@
 ;; the exit status is 0 when every check is ok. j-faults.sh plants a fault in each of the three modules and shows this program failing.
 (ns main
   (:require [lir :as front] [lir.diag :as diag] [lir.ast :as ast] [lir.types :as types] [native.error :as err] [native.jit :as jit]
-            [native.jit.names :as names] [native.jit.prune :as prune] [native.jit.trampoline :as tramp] [native.call :as call])
+            [native.jit.names :as names] [native.jit.prune :as prune] [native.jit.trampoline :as tramp] [native.call :as call]
+            [lir.print :as print] [fib.string :as s])
   (:use lir.ast))
 
 (defstruct Tally (failed: (Cell i64)))
@@ -148,11 +149,35 @@
       (expect-str t "session: a later module sees the first" (result-text (jit/session-add-source s "m3" "(declare plain i64 (i64))\n(define (twice i64) ((i64 x)) (block entry (ret (call @plain (call @plain x)))))")) "ok")
       (expect-str t "session: and calls it" (res-text (call-text (jit/session-address s "twice"))) "(Ok 22)")))
 
+;; --------------------------------------------------------------------------------------------------------- kernel forms (docs/design/gpu.md, spec/lir.md 6.9)
+
+(defun kernel-tests :private (t: Tally) -> unit
+  (let ((src "(define kernelcc (k void) ((ptr a) (i64 n)) (block entry (let ((i (sreg tid.x)) (j (sreg ctaid.y))) (barrier)) (ret)))\n"))
+    (do (expect-str t "kernel forms: kernelcc, sreg and barrier parse, check and print back" (print/print-module (module-of src)) src)
+        (say t (match (front/parse-and-check "(define (f i32) () (block entry (ret (sreg bogus))))") ((Ok _) false) ((Err ds) (= (. (nth ds 0) message) "sreg: no special register bogus")))
+             "kernel forms: an unknown special register is a parse error" "")
+        (say t (match (front/parse-and-check "(define (f void) () (block entry (barrier 1) (ret)))") ((Ok _) false) ((Err _) true))
+             "kernel forms: barrier takes no operand" "")
+        (say t (match (front/parse-and-check "(define (f i64) () (block entry (ret (sreg tid.x))))") ((Ok _) false) ((Err _) true))
+             "kernel forms: sreg is an i32, not an i64" "")
+        (match (jit/session-new 0)
+          ((Err e) (say t false "kernel forms: session" (err/lair-error-str e)))
+          ((Ok s) (say t (kernel-refused? s src) "kernel forms: lair refuses a kernelcc function on the host (a kernel is launched by a driver)" ""))))))
+
+;; lair refuses the module at lowering (native.lower `kernel-refusal`), before the x86 backend would meet ptx_kernel.
+(defun kernel-refused? :private (s: jit/JitSession src: str) -> bool
+  (match (jit/session-add-source s "k" src)
+    ((Err e) (s/includes? (err/lair-error-str e) "kernelcc"))
+    ((Ok _) (match (jit/session-c-entry s "k")
+              ((Ok _) false)
+              ((Err e) (s/includes? (err/lair-error-str e) "kernelcc"))))))
+
 (defun main () -> i64
   (let ((t (Tally (cell 0))))
     (do (names-tests t)
         (prune-tests t)
         (tramp-tests t)
+        (kernel-tests t)
         (match (jit/session-new 0)
           ((Err e) (say t false "session: new" (err/lair-error-str e)))
           ((Ok s) (do (session-tests t s) (jit/session-free s))))
