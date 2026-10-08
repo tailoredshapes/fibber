@@ -1,0 +1,46 @@
+;; spec: docs/design/compress.md 5.3 (the fast, the medium and the slow path of the decoder)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; 300 hand-built blocks of random sequences (literal runs of 0 to 700 bytes and matches of 4 to 1100, offsets from 1 up, so every extension byte count, every small-offset pattern and the three
+;; paths of the decoder occur) decode, with exact room and with 64 bytes to spare in the buffer, to what a plain byte-at-a-time decoder written here gives.
+(ns main (:use tl.check fib.compress.lz4.mem fib.compress.lz4.block))
+
+(defun lcg (x: i64) -> i64 (bit-and (+ (* x 1103515245) 12345) 2147483647))
+(defun rnd (&x: i64 n: i64) -> i64 (do (set! x (lcg @x)) (rem (shr @x 8) n)))
+
+;; Appends a length extension (the bytes after a nibble of 15).
+(defun put-ext2 (&b: (Vec i64) n: i64) -> unit
+  (let [full (quot n 255)] (do (dotimes (i full) (set! b (conj @b 255))) (set! b (conj @b (- n (* full 255)))))))
+
+;; The block of `seqs` sequences and the bytes it must give: random literals and matches (the last sequence is literals only).
+(defun bytes-of (v: (Vec i64)) -> (Array i8)
+  (let [a (cell (array (count v) 0i8))] (do (dotimes (i (count v)) (array-set! &a i (trunc i8 (nth v i)))) @a)))
+
+(defun build (seed: i64 seqs: i64) -> (Pair (Array i8) (Array i8))
+  (let [x (cell seed) blk (cell []) out (cell [])]
+    (do (dotimes (s seqs)
+          (let [last (= s (- seqs 1))
+                lit0 (if last (+ 5 (rnd &x 40)) (if (= (rnd &x 3) 0) (rnd &x 700) (rnd &x 20)))
+                lit (if (and (= s 0) (= lit0 0)) 3 lit0)
+                ml (+ 4 (if (= (rnd &x 4) 0) (rnd &x 1100) (rnd &x 30)))]
+            (do (set! blk (conj @blk (+ (shl (min lit 15) 4) (if last 0 (min (- ml 4) 15)))))
+                (when (>= lit 15) (put-ext2 &blk (- lit 15)))
+                (dotimes (k lit) (let [b (rnd &x 7)] (do (set! blk (conj @blk b)) (set! out (conj @out b)))))
+                (when (not last)
+                  (let [off (+ 1 (if (= (rnd &x 3) 0) (rnd &x (min (count @out) 65535)) (rnd &x (min (count @out) 12))))]
+                    (do (set! blk (conj (conj @blk (bit-and off 255)) (shr off 8)))
+                        (when (>= (- ml 4) 15) (put-ext2 &blk (- (- ml 4) 15)))
+                        (dotimes (k ml) (set! out (conj @out (nth @out (- (count @out) off)))))))))))
+        (Pair (bytes-of @blk) (bytes-of @out)))))
+
+(defun main () -> i64
+  (let [c (checks)]
+    (do (dotimes (t 300)
+          (let [p (build (+ 1 t) (+ 2 (rem t 9))) z (. p fst) want (. p snd) n (array-len want)]
+            (do (check c (match (block-decompress z n) ((Ok b) (bytes-eq b want)) ((Err _) false)))
+                (check c (let [dst (array (+ n 64) 0i8)]
+                           (match (block-decompress-into z dst 0 n) ((Ok k) (and (= k n) (bytes-eq (array-copy dst 0 n) want))) ((Err _) false)))))))
+        (checks-result c))))

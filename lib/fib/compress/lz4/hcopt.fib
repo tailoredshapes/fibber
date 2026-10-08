@@ -1,0 +1,120 @@
+;; fib.compress.lz4.hcopt: liblz4's OPTIMAL PARSER (LZ4HC_compress_optimal, levels 10 to 12), a port that makes the same choices: at each position it finds the longest match
+;; (`wider` with mode 1: pattern analysis and chain swap, LZ4HC_FindLongerMatch), prices every way to reach each of the next positions (a table of {price, offset, match length,
+;; literal length} in bytes: a literal run costs its length plus the extension bytes of its length, a sequence costs a token, an offset, its literals and the extension bytes of its
+;; match length), walks the prices to the end of the best path and writes the path. Level 12 searches at every position (`full`), levels 10 and 11 only where the price rises.
+;; The table lives in the encoder's state words after the 32 registers: entry k is the words 32 + 4k .. 32 + 4k + 3 = price, offset, match length (1: a literal), literal length;
+;; 4096 + 3 entries. The registers: 4 ip, 13 anchor, 14 op (as in hc3), 22 last_match_pos, 23 cur, 24 best_mlen, 25 best_off.
+;;   (hcopt-block sp lo s0 n dp ht ct st gen level) -> compressed length
+(ns fib.compress.lz4.hcopt (:use fib.core fib.seq fib.coll fib.compress.lz4.mem fib.compress.lz4.blockenc fib.compress.lz4.hc fib.compress.lz4.hc3))
+
+(def opt-num: i64 4096)
+
+(defun lit-price (n: i64) -> i64 (if (>= n 15) (u+ n (u+ 1 (quot (u- n 15) 255))) n))
+(defun seq-price (ll: i64 ml: i64) -> i64 (u+ (u+ 3 (lit-price ll)) (if (>= ml 19) (u+ 1 (quot (u- ml 19) 255)) 0)))
+
+(defun oi (k: i64 f: i64) -> i64 (shl (u+ 32 (u+ (shl k 2) f)) 3))
+(defun og (c: Hc k: i64 f: i64) -> i64 (rd64 (. c st) (oi k f)))
+(defun os (c: Hc k: i64 price: i64 off: i64 ml: i64 ll: i64) -> unit
+  (do (wr64 (. c st) (oi k 0) price) (wr64 (. c st) (oi k 1) off) (wr64 (. c st) (oi k 2) ml) (wr64 (. c st) (oi k 3) ll)))
+
+(defun sufficient (level: i64) -> i64 (cond (= level 10) 64 (= level 11) 128 :else (u- opt-num 1)))
+(defun full? (c: Hc) -> bool (>= (. c level) 12))
+
+;; A match at ip longer than min-len: its length, or 0.
+(defun find-longer (c: Hc ip: i64 min-len: i64) -> i64
+  (let [len (wider c ip ip min-len 1)] (if (<= len min-len) 0 len)))
+(defun off-at (c: Hc ip: i64) -> i64 (u- ip (gw c 3)))
+
+;; The three literals that may follow position lmp.
+(defun trail (c: Hc lmp: i64) -> unit
+  (loop [a 1] (when (<= a 3) (do (os c (u+ lmp a) (u+ (og c lmp 0) (lit-price a)) 0 1 a) (recur (u+ a 1))))))
+
+;; The prices of the positions before and at the first match.
+(defun init-prices (c: Hc llen: i64 len: i64 off: i64) -> unit
+  (do (loop [r 0] (when (< r 4) (do (os c r (lit-price (u+ llen r)) 0 1 (u+ llen r)) (recur (u+ r 1)))))
+      (loop [m 4] (when (<= m len) (do (os c m (seq-price llen m) off m llen) (recur (u+ m 1)))))
+      (sw c 22 len) (trail c len)))
+
+;; Not worth a search at cur: the next position costs no more.
+(defun skip? (c: Hc cur: i64) -> bool
+  (if (full? c)
+    (and (<= (og c (u+ cur 1) 0) (og c cur 0)) (< (og c (u+ cur 4) 0) (u+ (og c cur 0) 3)))
+    (<= (og c (u+ cur 1) 0) (og c cur 0))))
+
+;; Literals before a match at cur: positions cur + 1 .. cur + 3 reached by literals from cur.
+(defun price-lits (c: Hc cur: i64) -> unit
+  (let [base (og c cur 3)]
+    (loop [l 1]
+      (when (< l 4)
+        (let [price (u+ (u- (og c cur 0) (lit-price base)) (lit-price (u+ base l))) pos (u+ cur l)]
+          (do (when (< price (og c pos 0)) (os c pos price 0 1 (u+ base l)))
+              (recur (u+ l 1))))))))
+
+;; The cost of the sequence that ends at cur + ml: the literals before the match at cur are those of cur's own record when that is a literal run.
+(defun match-price (c: Hc cur: i64 ml: i64) -> i64
+  (if (= (og c cur 2) 1)
+    (let [ll (og c cur 3)] (u+ (if (> cur ll) (og c (u- cur ll) 0) 0) (seq-price ll ml)))
+    (u+ (og c cur 0) (seq-price 0 ml))))
+(defun match-ll (c: Hc cur: i64) -> i64 (if (= (og c cur 2) 1) (og c cur 3) 0))
+
+(defun price-match (c: Hc cur: i64 len: i64 off: i64) -> unit
+  (loop [ml 4]
+    (when (<= ml len)
+      (let [pos (u+ cur ml) price (match-price c cur ml)]
+        (do (when (or (> pos (u+ (gw c 22) 3)) (<= price (og c pos 0)))
+              (do (when (and (= ml len) (< (gw c 22) pos)) (sw c 22 pos))
+                  (os c pos price off ml (match-ll c cur))))
+            (recur (u+ ml 1)))))))
+
+;; The scan over cur = 1 .. last_match_pos - 1. True: a match long enough to be taken at once was found (registers 22 to 25 say where).
+(defun scan (c: Hc) -> bool
+  (let [ip (gw c 4) suff (sufficient (. c level))]
+    (loop [cur 1]
+      (cond (>= cur (gw c 22)) false
+            (>= (u+ ip cur) (. c mf1)) false
+            (skip? c cur) (recur (u+ cur 1))
+            :else
+            (let [len (find-longer c (u+ ip cur) (if (full? c) 3 (u- (gw c 22) cur)))]
+              (cond (= len 0) (recur (u+ cur 1))
+                    (or (> len suff) (>= (u+ len cur) opt-num))
+                    (do (sw c 24 len) (sw c 25 (off-at c (u+ ip cur))) (sw c 22 (u+ cur 1)) (sw c 23 cur) true)
+                    :else (let [off (off-at c (u+ ip cur))]
+                            (do (price-lits c cur) (price-match c cur len off) (trail c (gw c 22)) (recur (u+ cur 1))))))))))
+
+;; From the end of the best path back to its start, each record keeping the match that ends there, then the sequences written in order.
+(defun backtrack (c: Hc cur: i64 ml: i64 off: i64) -> unit
+  (loop [cand cur sml ml soff off]
+    (let [nml (og c cand 2) noff (og c cand 1)]
+      (do (wr64 (. c st) (oi cand 2) sml) (wr64 (. c st) (oi cand 1) soff)
+          (when (<= nml cand) (recur (u- cand nml) nml noff))))))
+
+(defun emit-path (c: Hc) -> unit
+  (let [lmp (gw c 22)]
+    (loop [r 0]
+      (when (< r lmp)
+        (let [ml (og c r 2) off (og c r 1) ip (gw c 4)]
+          (if (= ml 1) (do (sw c 4 (u+ ip 1)) (recur (u+ r 1)))
+            (do (enc! c ip (u- ip off) ml) (sw c 4 (u+ ip ml)) (recur (u+ r ml)))))))))
+
+(defun finish-path (c: Hc taken: bool) -> unit
+  (if taken
+    (backtrack c (gw c 23) (gw c 24) (gw c 25))
+    (let [lmp (gw c 22) ml (og c lmp 2) off (og c lmp 1)] (backtrack c (u- lmp ml) ml off)))
+  (emit-path c))
+
+(defun opt-step (c: Hc) -> unit
+  (let [ip (gw c 4) len (find-longer c ip 3)]
+    (cond (= len 0) (sw c 4 (u+ ip 1))
+          (> len (sufficient (. c level))) (do (enc! c ip (u- ip (off-at c ip)) len) (sw c 4 (u+ ip len)))
+          :else (do (init-prices c (u- ip (gw c 13)) len (off-at c ip))
+                    (finish-path c (scan c))))))
+
+(defun opt-run (c: Hc) -> i64
+  (loop []
+    (if (< (gw c 4) (. c mf1)) (do (opt-step c) (recur))
+      (hc-tail (. c sp) (. c iend) (gw c 13) (. c dp) (gw c 14)))))
+
+(defun hcopt-block (sp: ptr lo: i64 s0: i64 n: i64 dp: ptr ht: ptr ct: ptr st: ptr gen: i64 level: i64) -> i64
+  (if (< n 13) (put-seq sp s0 n dp 0 0 0)
+    (let [iend (u+ s0 n) c (Hc sp ht ct st dp gen lo iend (hc-depth level) (u+ (u- iend mf-limit) 1) (u- iend last-lits) level)]
+      (do (sw c 4 s0) (sw c 13 s0) (sw c 14 0) (sw c 15 0) (opt-run c)))))

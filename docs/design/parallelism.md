@@ -476,5 +476,7 @@ Not done, and why the colour stays a possible later step: the share walk at hand
 | cancellation flag | **not built** (needs the interrupt flag of P-chan) | |
 | `fib.parallel` backend | `run-chunks` forks W runners onto the pool that take chunks from a shared counter and write results to per-chunk slots; `fork` of a scope is `fork-task`; `cpu-count` is the pool's count | `lib/fib/parallel/` |
 
+The LZ4 codec's parallel engine (`fib.compress.par`, COMPRESS-3) forks its runners onto this pool (`docs/design/compress.md` 9.1): `Options.threads` is the number of jobs in flight, at most the pool, a call inside a `pmap` body adds no thread (case 8720), and a runner that traps is `try-join`ed into an `:internal` error. A task per job in an in-order window was measured against the shared-counter runners and lost 28% to 49% (`docs/shootout/lz4.md` 3).
+
 Measurements, planted-fault results and TSAN: `docs/shootout/parallel.md` ("P-sched"). Mutants: `scripts/mutant-sched.sh`; planted race: `scripts/tsan-planted.sh pool-handoff`; cases 8640 to 8648.
 Not done: `:grain`-controlled adaptive splitting, `pcalls`/`pvalues`, cancellation, arm64 stress runs, a model-checked deque, per-worker small-block allocator cache (see the allocator note in shootout).

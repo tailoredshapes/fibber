@@ -7,29 +7,37 @@
 ;; Registers (words of `st`, in bytes shl 3): 0 next position to insert (hc.fib), 2 and 3 the start and the source of the match `wider` found, 4 ip, 5 ref, 6 ml (ML1), 7 8 9 start0 ref0 ml0
 ;; (the first match as first found), 10 11 12 start2 ref2 ml2, 13 anchor, 14 op, 15 phase (0 find a first match, 2 look for ML2, 3 look for ML3, 9 done).
 ;;   (hc3-block sp lo s0 n dp ht ct st gen level) -> compressed length
-(ns fib.compress.lz4.hc3 (:use fib.core fib.seq fib.coll fib.compress.lz4.mem fib.compress.lz4.blockenc fib.compress.lz4.hc))
+(ns fib.compress.lz4.hc3 (:use fib.core fib.seq fib.coll fib.compress.lz4.mem fib.compress.lz4.blockenc fib.compress.lz4.hc fib.compress.lz4.hcpa))
 
-(defstruct Hc (sp: ptr ht: ptr ct: ptr st: ptr dp: ptr gen: i64 lo: i64 iend: i64 depth: i64 mf1: i64 mlim: i64))
+(defstruct Hc (sp: ptr ht: ptr ct: ptr st: ptr dp: ptr gen: i64 lo: i64 iend: i64 depth: i64 mf1: i64 mlim: i64 level: i64))
 
 (defun gw (c: Hc k: i64) -> i64 (rd64 (. c st) (shl k 3)))
 (defun sw (c: Hc k: i64 v: i64) -> unit (wr64 (. c st) (shl k 3) v))
 
 ;; The longest match for the bytes at ip that beats `longest`, down the chain (at most `depth` links), extended backwards as far as `low`: its length (or `longest` when none), and in
-;; registers 2 and 3 the start and the source of the match found.
-(defun wider (c: Hc ip: i64 low: i64 longest: i64) -> i64
+;; registers 2 and 3 the start and the source of the match found. `mode` 0 is the hash-chain parser's search (pattern analysis from level 9 up, the depth above 128), mode 1 the optimal
+;; parser's LZ4HC_FindLongerMatch (pattern analysis and CHAIN SWAP: after a candidate as long as the longest, the chain is left for the one through the position of the longest next
+;; distance: `swap`, in fib.compress.lz4.hcpa).
+(defun wider (c: Hc ip: i64 low: i64 longest: i64 mode: i64) -> i64
   (do (hc-insert (. c sp) (. c ht) (. c ct) (. c st) (. c gen) (. c lo) ip)
       (sw c 2 ip) (sw c 3 -1)
-      (let [sp (. c sp) ct (. c ct) gen (. c gen) lowest (max (. c lo) (u- ip 65535)) look (u- ip low) pat (rd32 sp ip)]
-        (loop [mi (u- (tget (. c ht) (hh sp ip)) gen) n (. c depth) best longest]
+      (let [sp (. c sp) ct (. c ct) gen (. c gen) lowest (max (. c lo) (u- ip 65535)) look (u- ip low) pat (rd32 sp ip) pa (or (= mode 1) (> (. c depth) 128))]
+        (loop [mi (u- (tget (. c ht) (hh sp ip)) gen) n (. c depth) best longest rep 0 srcl 0 mcp 0]
           (if (or (<= n 0) (< mi lowest) (>= mi ip)) best
             (let [hit (and (= (rd8 sp (u+ low best)) (rd8 sp (u+ (u- mi look) best))) (= (rd32 sp mi) pat))
                   back (if (and hit (> look 0)) (back-eq sp ip mi low (. c lo)) 0)
                   fwd (if hit (u+ 4 (count-eq sp (u+ ip 4) (u+ mi 4) (. c mlim))) 0)
-                  d (rd16 ct (shl (bit-and (u+ gen mi) 65535) 1))]
-              (if (> (u+ fwd back) best)
-                (do (sw c 2 (u- ip back)) (sw c 3 (u- mi back))
-                    (if (>= (u+ ip fwd) (. c mlim)) (u+ fwd back) (recur (u- mi d) (u- n 1) (u+ fwd back))))
-                (recur (u- mi d) (u- n 1) best))))))))
+                  best2 (if (> (u+ fwd back) best) (do (sw c 2 (u- ip back)) (sw c 3 (u- mi back)) (u+ fwd back)) best)]
+              (if (and (= mode 1) (= (u+ fwd back) best2) hit (<= (u+ mi best2) ip) (swap-chain sp ct gen mi best2 (. c st)) (> (rd64 (. c st) 208) 1))
+                (recur (u- mi (rd64 (. c st) 208)) (u- n 1) best2 rep srcl (rd64 (. c st) 216))
+                (let [d (rd16 ct (shl (bit-and (u+ gen mi) 65535) 1))]
+                  (if (and pa (= d 1) (= mcp 0))
+                    (do (pa-step sp (. c st) ct gen ip mi look lowest (. c mlim) best2 rep srcl)
+                        (let [act (gw c 16)]
+                          (cond (= act 0) (recur (u- mi d) (u- n 1) (gw c 18) (gw c 19) (gw c 20) mcp)
+                                (= act 1) (recur (gw c 17) (u- n 1) (gw c 18) (gw c 19) (gw c 20) mcp)
+                                :else (gw c 18))))
+                    (recur (u- mi (rd16 ct (shl (bit-and (u+ gen (u+ mi mcp)) 65535) 1))) (u- n 1) best2 rep srcl mcp))))))))))
 
 ;; Writes the sequence (literals from the anchor to ip, then a match of ml from ref) and moves the anchor to its end.
 (defun enc! (c: Hc ip: i64 ref: i64 ml: i64) -> unit
@@ -42,7 +50,7 @@
 (defun ph0 (c: Hc) -> unit
   (let [ip (gw c 4)]
     (if (>= ip (. c mf1)) (sw c 15 9)
-      (let [ml (wider c ip ip 3)]
+      (let [ml (wider c ip ip 3 0)]
         (if (< ml 4) (sw c 4 (u+ ip 1))
           (do (sw c 5 (gw c 3)) (sw c 6 ml) (sw c 7 ip) (sw c 8 (gw c 3)) (sw c 9 ml) (sw c 15 2)))))))
 
@@ -50,7 +58,7 @@
 ;; it; a first match that the second starts less than 3 bytes after is dropped for it; else on to phase 3.
 (defun ph2 (c: Hc) -> unit
   (let [ip (gw c 4) ml (gw c 6)
-        ml2 (if (<= (u+ ip ml) (mflimit c)) (wider c (u- (u+ ip ml) 2) ip ml) ml)]
+        ml2 (if (<= (u+ ip ml) (mflimit c)) (wider c (u- (u+ ip ml) 2) ip ml 0) ml)]
     (if (= ml2 ml) (do (enc! c ip (gw c 5) ml) (sw c 4 (gw c 13)) (sw c 15 0))
       (let [s2 (gw c 2) r2 (gw c 3) restore (and (< (gw c 7) ip) (< s2 (u+ ip (gw c 9))))
             ip1 (if restore (gw c 7) ip)]
@@ -90,7 +98,7 @@
 (defun ph3 (c: Hc) -> unit
   (let [ip (gw c 4) ml (gw c 6)]
     (do (trim2 c ip ml)
-        (let [s2 (gw c 10) m2 (gw c 12) m3 (if (<= (u+ s2 m2) (mflimit c)) (wider c (u- (u+ s2 m2) 3) s2 m2) m2)]
+        (let [s2 (gw c 10) m2 (gw c 12) m3 (if (<= (u+ s2 m2) (mflimit c)) (wider c (u- (u+ s2 m2) 3) s2 m2 0) m2)]
           (if (= m3 m2)
             (let [ml1 (if (< s2 (u+ ip ml)) (u- s2 ip) ml)]
               (do (enc! c ip (gw c 5) ml1) (enc! c s2 (gw c 11) m2) (sw c 4 (gw c 13)) (sw c 15 0)))
@@ -107,5 +115,5 @@
 
 (defun hc3-block (sp: ptr lo: i64 s0: i64 n: i64 dp: ptr ht: ptr ct: ptr st: ptr gen: i64 level: i64) -> i64
   (if (< n 13) (put-seq sp s0 n dp 0 0 0)
-    (let [iend (u+ s0 n) c (Hc sp ht ct st dp gen lo iend (hc-depth level) (u+ (u- iend mf-limit) 1) (u- iend last-lits))]
+    (let [iend (u+ s0 n) c (Hc sp ht ct st dp gen lo iend (hc-depth level) (u+ (u- iend mf-limit) 1) (u- iend last-lits) level)]
       (do (sw c 4 s0) (sw c 13 s0) (sw c 14 0) (sw c 15 0) (hc3-run c)))))
