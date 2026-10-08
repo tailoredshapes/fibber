@@ -32,6 +32,7 @@ while [ $# -gt 0 ]; do
 done
 out=${GOLDEN_OUT:-$HOME/.cache/fibber-scratch/golden}; mkdir -p "$out/tmp"
 export TMPDIR=$out/tmp FIB_LIB=$root/lib FIB_TARGET_CPU=x86-64-v2
+export FIB_PRUNE=0   # the emit suites show what the emitter makes for every def of the inputs (PRUNE-1, emit.prune, would drop the unread ones): the check is on the emission
 cd "$root" || exit 2
 if [ -z "$tools" ]; then
   [ -z "$fibc" ] && fibc=$HOME/.cache/fibber-scratch/gate-$(basename "$root")/F

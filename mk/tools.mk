@@ -30,6 +30,7 @@ tool_sh-driver-test-cmd := $(T)/driver/test-cmd.sh $(F_ABS) | $(T)/driver/test-c
 tool_sh-driver-static-host := $(T)/driver/static-host.sh $(F_ABS) | $(T)/driver/static-host.sh
 tool_sh-emit-runtime := $(T)/emit/runtime.sh $(F_ABS) $(TOOLS_OUT)/runtime | $(T)/emit/runtime.sh $(T)/emit/gen-runtime.fib $(T)/emit/unit-runtime.fib $(RT_LIR)
 tool_sh-emit-defs-order := $(T)/emit/defs-order.sh $(F_ABS) | $(T)/emit/defs-order.sh
+tool_sh-emit-prune := $(T)/emit/prune.sh $(F_ABS) $(TOOLS_OUT)/prune | $(T)/emit/prune.sh $(wildcard compiler/emit/prune.fib)
 tool_sh-stack-stack := $(T)/stack/stack.sh $(F_ABS) | $(wildcard $(T)/stack/*)
 tool_sh-own-peek := $(T)/own/peek.sh $(F_ABS) | $(T)/own/peek.sh $(wildcard $(T)/own/peek*)
 tool_sh-specs-plant-vec := $(T)/specs/plant-vec.sh $(F_ABS) | $(wildcard $(T)/specs/*)
@@ -56,7 +57,7 @@ tool_deps := $(T)/deps/run.sh $(F_ABS) | $(wildcard $(T)/deps/*)
 tool_sh-native-gpu-emit := $(T)/native/gpu-emit.sh | $(T)/native/gpu-emit.sh $(wildcard examples/gpu/*) $(wildcard compiler/native/*.fib)
 tool_sh-make-graph := $(T)/make/graph.sh | $(wildcard $(T)/make/*) Makefile $(wildcard mk/*.mk)
 
-TOOLS_QUICK := fibref-skeleton gen-skeleton lint-pipefail lint-portable sh-driver-check-lib sh-make-graph
+TOOLS_QUICK := sh-emit-prune fibref-skeleton gen-skeleton lint-pipefail lint-portable sh-driver-check-lib sh-make-graph
 TOOLS_FULL := $(TOOLS_QUICK) units-emit units-own units-types units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-emit-runtime sh-emit-defs-order sh-stack-stack \
   sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \

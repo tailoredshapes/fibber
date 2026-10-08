@@ -7,7 +7,7 @@
 ;; set and holds what needs no body, the runtime and `main`.
 ;; `compile-macro` (E11) is the macro-time module of one `defmacro` (macros/abi.rs's text is emit.macros.abi's).
 (ns emit.compile
-  (:require [fib.string :as s] [emit.defs.astmod :as am] [emit.cpucheck :as cc] [emit.wasi :as wasi] [expand.targetos :as tos] [types.targets :as tt])
+  (:require [fib.string :as s] [emit.defs.astmod :as am] [emit.cpucheck :as cc] [emit.wasi :as wasi] [expand.targetos :as tos] [types.targets :as tt] [emit.prune :as pr])
   (:use types.ty types.table types.decls types.init types.program own.program emit.value emit.names emit.objects emit.statics emit.program emit.inits
         emit.assemble emit.defs.mod emit.lower.cx emit.lower.mod emit.macros.abi types.target))
 
@@ -72,6 +72,26 @@
         (Ok m))
       (Ok m)))
 
+;; PRUNE-1 (emit.prune) applies to the text of an executable or a `fibc run` program for a posix target; FIB_PRUNE=0 turns it off (to measure what it saves).
+(defun prune? :private () -> bool
+  (and (not (= (sys-getenv "FIB_PRUNE") (some "0"))) (not (am/verifying?)) (not (= (tos/target-platform-name) "Wasi"))))
+
+;; The text of `main` with no initialiser in it: what the text of the program must keep alive besides its items.
+(defun main-roots :private (p: Program entry: str executable: bool) -> str
+  (let ((saved @(. p inits)))
+    (do (set! (. p inits) [])
+        (let ((t (main-part p entry executable)))
+          (do (set! (. p inits) saved) t)))))
+
+;; The module of the program once the bodies are emitted: without what nothing reaches (emit.prune), and with the initialisers of the `def`s made at run time
+;; that stay.
+(defun finished :private (p: Program defs-text: str entry: str executable: bool) -> Module
+  (if (prune?)
+      (let ((r (pr/prune-parts (module-parts p defs-text) (main-roots p entry executable) @(. p inits))))
+        (do (set! (. p inits) (. r snd))
+            (Module (. r fst) (main-part p entry executable) nil)))
+      (Module (module-parts p defs-text) (main-part p entry executable) nil)))
+
 ;; The Module of a program that has a `main`, planned, with its defs made and its entry requested. Rust: compile.rs:60 compile_module
 ;; The entry's name is the same whenever it is requested (names carry no counter): a module that stops at the defs knows it.
 (defun compile-module (typed: TypedProgram owned: OwnedProgram executable: bool) -> (Result Module str)
@@ -88,7 +108,7 @@
                 (host-kernel-table q)
                 (let ((entry (program-request q (BodyFun main) [])))
                   (match (emit-all q)
-                    ((Ok _) (verified q defs (Module (module-parts q @(. defs text)) (main-part q entry executable) nil)))
+                    ((Ok _) (verified q defs (finished q @(. defs text) entry executable)))
                     ((Err m) (pending-or-error q entry executable m))))))))))))
 
 ;; The module's `(target (cpu ..) (features ..))` form (spec/lir.md 4.5) for the target the front end was told: the CPU the checker chose its lane
