@@ -188,7 +188,7 @@ the 2 GB streams and what bounds each (memory bandwidth; one core of xxHash32), 
 ## 8. Tools
 
 `scripts/fetch-lz4-tools.sh` (the reference, the corpus, with checksums), `scripts/lz4-diff.{fib,py}` (both directions against liblz4), `scripts/lz4-sim.py` (a simulation of `LZ4_compress_generic` that agrees with it),
-`scripts/gen-lz4-vectors.py`, `scripts/lz4-interop.sh`, `scripts/lz4-bench.fib`, `scripts/mutant-lz4.sh` (43 faults), `scripts/lz4-hc-vectors.py` (liblz4's HC sizes and hashes for `specs/compress-lz4-hc-spec.fib`), `scripts/mutant-uninit-i8.sh`.
+`scripts/gen-lz4-vectors.py`, `scripts/lz4-interop.sh`, `scripts/lz4-bench.fib`, `scripts/mutant-lz4.sh` (45 faults), `scripts/lz4-hc-vectors.py` (liblz4's HC sizes and hashes for `specs/compress-lz4-hc-spec.fib`), `scripts/mutant-uninit-i8.sh`.
 
 ## 9. Threads (`Options.threads`, the `:parallel` capability)
 

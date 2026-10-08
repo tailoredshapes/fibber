@@ -6,8 +6,8 @@
 ;; roots: ../../lib support
 ;; Compress and decompress with `threads` 8 INSIDE the body of a pmap over 12 inputs (each of 1.3 MB, 64 KiB blocks, so every call forks runners) give the same bytes as the same calls
 ;; made one after the other, and the process has no more threads than the pool's workers plus the program's own: a call inside a pool task forks onto the pool and does not start 8 threads of its
-;; own (12 x 8 OS threads ran before the engine moved onto the pool). The thread count is read from /proc/self/task after the parallel work, and is sampled by a task inside the nest.
-(ns main (:use fib.core fib.parallel fib.os fib.os.process tl.check fib.compress.lz4.mem) (:require [fib.compress :as z] [fib.compress.lz4 :as lz4]))
+;; own (12 x 8 OS threads ran before the engine moved onto the pool). Each body also runs 16 jobs of the engine that sleep 4 ms before reading the thread count (/proc/self/task), so all the nest's runners are alive when it is read.
+(ns main (:use fib.core fib.parallel fib.os fib.os.process tl.check fib.compress.lz4.mem) (:require [fib.compress :as z] [fib.compress.lz4 :as lz4] [fib.compress.par :as p] [fib.compress.types :as t] [fib.os.time :as time]))
 
 (defun data (seed: i64) -> (Array i8)
   (let [c (cell (array 1300000 0i8))]
@@ -16,11 +16,16 @@
 
 (defun opts () -> z/Options (z/with-block-size (z/with-threads (z/default-options) 8) 65536))
 
+(defun sample () -> i64
+  (let [seen (atom 0)]
+    (do (p/run-jobs 8 16 (fn (j: i64) (do (time/sleep-ns 4000000) (swap! seen (fn (m: i64) (max m (unwrap-or (thread-count) 1)))) (t/Ok j))))
+        @seen)))
+
 (defun round-trip (seed: i64) -> (Pair (Array i8) i64)
   (let [d (data seed) k (lz4/lz4)]
     (match (z/compress k d (opts))
       ((Ok zb) (match (z/decompress k zb (opts))
-                 ((Ok back) (Pair zb (if (bytes-eq back d) (max 1 (unwrap-or (thread-count) 1)) -1)))
+                 ((Ok back) (Pair zb (if (bytes-eq back d) (max 1 (sample)) -1)))
                  ((Err _) (Pair zb -2))))
       ((Err _) (Pair (array 0 0i8) -3)))))
 

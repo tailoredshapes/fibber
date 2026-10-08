@@ -17,6 +17,7 @@
 #   linked-lo         framedec: a later frame may reach into the first   fast-copy-8      blockdec: the fast path copies 16 bytes at a distance of 8
 #   mid-islack mid-dslack  blockdec: the medium path's input / output slack is too small   mid-offset  the medium path checks only for offset 0   mid-pattern  small offsets use a distance of 8
 #   hc-opt-price  hcopt: a sequence costs one byte more   hc-pa-off  hc3: no pattern analysis   hc-swap-off  no chain swap   hc-opt-full  level 12 does not search everywhere   hc-opt-skip  the skip test is strict
+#   hash-total-lost  framedec: the bytes hashed inside the decode loop are not counted   hash-raw-order  framedec: a stored block does not wait for the pending range to be hashed
 #   par-nested-threads  par: runners are OS threads again (a call inside a pmap body multiplies them)   par-unbounded-flight  par: one runner per job, whatever `threads` says
 set -uo pipefail
 R=$(cd "$(dirname "$0")/.." && pwd)
@@ -27,7 +28,7 @@ MUTANTS=("$@")
 [ ${#MUTANTS[@]} -gt 0 ] || MUTANTS=(slack-dlim slack-ilim fast-small-pattern xxh-vector-rot par-order par-race-window par-lost-job par-max-output par-thread-dependent par-error-swallowed par-trap-kills par-checksum-skipped last-literals offset-65536 overlap-memmove nibble-overflow ext-255 no-verify match-past-end cap-off-by-one skip-content-crc skip-block-crc
                                      skip-header-crc block-crc-bytes dict-base stale-table hc-depth-zero reserved-bit offset-check fast-offset-0 linked-lo fast-copy-8
                                      mid-islack mid-dslack mid-offset mid-pattern par-nested-threads par-unbounded-flight
-                                     hc-opt-price hc-pa-off hc-swap-off hc-opt-full hc-opt-skip)
+                                     hc-opt-price hc-pa-off hc-swap-off hc-opt-full hc-opt-skip hash-total-lost hash-raw-order)
 
 sub() { perl -0pi -e "$2" "$1"; cmp -s "$1" "$1.orig" && { echo "mutant-lz4: pattern not found in $1: $2" >&2; return 1; }; return 0; }
 mutate() { # mutate NAME TREE
@@ -76,6 +77,8 @@ mutate() { # mutate NAME TREE
     hc-swap-off)      f=$d/hc3.fib; cp $f $f.orig; sub $f 's/\(and \(= mode 1\) \(= \(u\+ fwd back\) best2\)/(and (= mode 2) (= (u+ fwd back) best2)/' ;;
     hc-opt-full)      f=$d/hcopt.fib; cp $f $f.orig; sub $f 's/\(>= \(\. c level\) 12\)/(>= (. c level) 13)/' ;;
     hc-opt-skip)      f=$d/hcopt.fib; cp $f $f.orig; sub $f 's/\(<= \(og c \(u\+ cur 1\) 0\) \(og c cur 0\)\)\)\)/(< (og c (u+ cur 1) 0) (og c cur 0))))/' ;;
+    hash-total-lost)  f=$d/framedec.fib; cp $f $f.orig; sub $f 's/\(xset ck 4 \(\+ \(xw ck 4\) \(- hp \(hw k 0\)\)\)\)/(xset ck 4 (xw ck 4))/' ;;
+    hash-raw-order)   f=$d/framedec.fib; cp $f $f.orig; sub $f 's/\(hk-flush hk \@ob\) \(copy-exact \(data \@ob\) op \(data src\)/(copy-exact (data \@ob) op (data src)/' ;;
     *) echo "mutant-lz4: unknown mutant $1" >&2; return 1 ;;
   esac
 }

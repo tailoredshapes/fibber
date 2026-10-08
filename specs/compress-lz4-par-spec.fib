@@ -31,11 +31,14 @@
                                             (do (swap! top (fn (m: i64) (max m c))) (time/sleep-ns 2000000) (swap! now (fn (k: i64) (- k 1))) (Ok i)))))
         @top)))
 
-;; Round trips inside the body of a pmap with `threads` 8: the threads the process has when a body finishes (the others are mid-flight) must stay the pool's.
+;; A call inside the body of a pmap, with `threads` 8: the process's threads are sampled WHILE its jobs run (each sleeps a moment first, so every body's runners are alive at once: 12 bodies x 8
+;; runners would be 96 OS threads if the runners were threads), and its round trip is checked. Returns the most threads seen, or 1000 if the bytes were wrong.
 (defun nested-round (seed: i64) -> i64
-  (let [d (text (+ 200 seed) 700000) o (th (o64) 8) z (ok-bytes (compress (lz4) d o))]
-    (if (bytes-eq (ok-bytes (decompress (lz4) z o)) d) (unwrap-or (proc/thread-count) 1000) 1000)))
-;; The pool is started first (a pmap), the threads counted, and then 12 bodies of 8 threads each run: the count may grow by the spec harness's own tasks, not by 12 x 8.
+  (let [d (text (+ 200 seed) 300000) o (th (o64) 8) z (ok-bytes (compress (lz4) d o))
+        seen (atom 0)
+        _ (run-jobs 8 16 (fn (j: i64) (do (time/sleep-ns 4000000) (swap! seen (fn (m: i64) (max m (unwrap-or (proc/thread-count) 1000)))) (Ok j))))]
+    (if (bytes-eq (ok-bytes (decompress (lz4) z o)) d) @seen 1000)))
+;; The pool is started first (a pmap), the threads counted, and then 12 such bodies run: the count may grow by the spec harness's own tasks, not by 12 x 8.
 (defun nested-ok? () -> bool
   (let [warm (par/pmap (fn (i: i64) (* i i)) (vec (range 256))) base (unwrap-or (proc/thread-count) 1000)]
     (every? (fn (t: i64) (<= t (+ base 3))) (par/pmap nested-round (vec (range 12))))))
