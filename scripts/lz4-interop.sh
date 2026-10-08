@@ -18,7 +18,7 @@ if [ ${#FILES[@]} -eq 0 ]; then
   python3 "$R/scripts/lz4-interop-inputs.py" "$W"
   FILES=("$W/empty" "$W/one" "$W/zeros" "$W/random" "$W/text" "$T/silesia/dickens" "$T/silesia/xml" "$T/silesia/sao")
 fi
-FLAGSETS=("" "-1" "-3" "-9" "-12" "-B4" "-B5 -BI" "-B6 -BD" "-B7 -BD" "-BX" "--no-frame-crc" "-9 -BI -BX --no-frame-crc")
+FLAGSETS=("" "-1" "-3" "-9" "-12" "-B4" "-B5 -BI" "-B6 -BD" "-B7 -BD" "-BX" "--no-frame-crc" "-9 -BI -BX --no-frame-crc" "-BI -T4" "-BI -B4 -T3 -BX")
 n=0; bad=0
 for f in "${FILES[@]}"; do
   for fl in "${FLAGSETS[@]}"; do

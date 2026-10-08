@@ -1,22 +1,103 @@
-;; fib.compress.fd: streaming compression over file descriptors (fib.os.io): `compress-fd` and `decompress-fd` read the input fd in chunks, feed the codec, write what comes out, and
+;; fib.compress.fd: streaming compression over file descriptors (fib.os.io): `compress-fd` and `decompress-fd` read the input fd in chunks of 1 MiB, feed the codec, write what comes out, and
 ;; end the stream; memory is bounded by the codec's block size and `chunk` (64 KiB), not by the size of the stream. An fd is a file, a pipe, a socket (fib.os.net gives its fd), stdin.
 ;; The results are bytes written, or a CompressError (`:io` when the fd failed). The fds are the caller's: they are not closed here.
-;;   (compress-fd codec opts in-fd out-fd)     (decompress-fd codec opts in-fd out-fd)     (fd-reader fd) (fd-writer fd)
-(ns fib.compress.fd (:use fib.core fib.seq fib.coll fib.compress.types fib.compress.ops fib.os.errors) (:require [fib.os.io :as io]))
+;;   (compress-fd codec opts in-fd out-fd)     (decompress-fd codec opts in-fd out-fd)     (fd-reader fd size) (fd-writer fd)
+(ns fib.compress.fd (:use fib.core fib.seq fib.coll fib.async fib.compress.types fib.compress.ops fib.os.errors) (:require [fib.os.io :as io] [fib.os.time :as time]))
 
-(def chunk: i64 65536)
+(def chunk: i64 1048576)
+
+;; The read size: 1 MiB, or with `threads` 2 or more 4 MiB for each (at most 8), so that a stream of 4 MiB blocks has several blocks queued per call for the parallel decoder: the memory
+;; of a stream stays a few times that (docs/design/compress.md 9.3), whatever its length.
+(defun chunk-for (o: Options) -> i64 (if (>= (. o threads) 2) (* 4194304 (min 8 (. o threads))) chunk))
 
 (defun io-failed (e: OSError) -> CompressError (io-error (str (. e operation) ": " (. e message))))
 
 ;; The next chunk of the fd (empty at the end), retrying a read the system interrupted.
-(defun fd-reader (fd: i64) -> (fn () (Result (Array i8) CompressError))
-  (fn () (loop [] (match (io/read-fd fd chunk) ((Ok b) (Ok b)) ((Err e) (if (= (. e kind) Interrupted) (recur) (Err (io-failed e))))))))
+(defun fd-reader (fd: i64 size: i64) -> (fn () (Result (Array i8) CompressError))
+  (fn () (loop [] (match (io/read-fd fd size) ((Ok b) (Ok b)) ((Err e) (if (= (. e kind) Interrupted) (recur) (Err (io-failed e))))))))
 
 (defun fd-writer (fd: i64) -> (fn ((Array i8)) (Result unit CompressError))
   (fn (b: (Array i8)) (match (io/write-all fd b) ((Ok _) (Ok ())) ((Err e) (Err (io-failed e))))))
 
+;; ---- OVERLAPPED I/O (threads 2 or more): the reads run ahead and the writes run behind, each in a task of its own, through a BOUNDED queue (`cap` bytes: the producer sleeps while it is
+;; full, so memory stays a few chunks whatever the length), so that the disk, or the pipe, is busy while the workers compute. A queue is an atom holding the pending chunks and an atom
+;; holding their size; one producer and one consumer; the consumer polls with a short sleep (no condition variables in the runtime). Both tasks are always joined; a trap in one is an
+;; :internal error; a failure of the reader or writer reaches the caller as :io, as without threads.
+(defstruct Pipe (q: (Atom (Vec (Array i8))) bytes: (Atom i64) stop: (Atom bool) err: (Atom str)))
+(defun new-pipe () -> Pipe (Pipe (atom []) (atom 0) (atom false) (atom "")))
+(defun nap () -> unit (match (time/sleep-ns 100000) ((Ok _) ()) ((Err _) ())))
+
+(defun push! (p: Pipe b: (Array i8)) -> unit
+  (do (swap! (. p bytes) (fn (n: i64) (+ n (array-len b)))) (swap! (. p q) (fn (v: (Vec (Array i8))) (conj v b))) ()))
+
+;; Everything queued, taken at once (the consumer's side; producers only append, so the first n chunks are the ones read, and removing them is safe whatever was appended meanwhile).
+(defun bytes-of (v: (Vec (Array i8))) -> i64 (reduce (fn (a: i64 x: (Array i8)) (+ a (array-len x))) 0 v))
+(defun take-all! (p: Pipe) -> (Vec (Array i8))
+  (let [v @(. p q) n (count v)]
+    (do (swap! (. p q) (fn (cur: (Vec (Array i8))) (vec (drop n cur))))
+        (swap! (. p bytes) (fn (k: i64) (- k (bytes-of v))))
+        v)))
+
+;; The first chunk queued, or nil.
+(defun take-one! (p: Pipe) -> (Option (Array i8))
+  (let [v @(. p q)]
+    (if (empty? v) nil
+      (let [b (nth v 0)]
+        (do (swap! (. p q) (fn (cur: (Vec (Array i8))) (vec (drop 1 cur))))
+            (swap! (. p bytes) (fn (k: i64) (- k (array-len b))))
+            (some b))))))
+
+(defun wait-room (p: Pipe cap: i64) -> unit (when (and (> @(. p bytes) cap) (= @(. p err) "") (not @(. p stop))) (do (nap) (wait-room p cap))))
+
+;; The writer task: writes what is queued until the queue is stopped and empty.
+(defun write-task (fd: i64 p: Pipe) -> str
+  (loop []
+    (let [items (take-all! p)]
+      (if (empty? items)
+        (if @(. p stop) (if (empty? @(. p q)) "" (recur)) (do (nap) (recur)))
+        (match (loop [i 0] (if (>= i (count items)) (Ok ()) (match (io/write-all fd (nth items i)) ((Err e) (Err e)) ((Ok _) (recur (+ i 1))))))
+          ((Err e) (do (reset! (. p err) (str (. e operation) ": " (. e message))) (reset! (. p stop) true) (. e message)))
+          ((Ok _) (recur)))))))
+
+;; The reader task: reads ahead until end of input, an error, or a stop.
+(defun read-task (fd: i64 size: i64 cap: i64 p: Pipe) -> str
+  (loop []
+    (cond @(. p stop) ""
+          (> @(. p bytes) cap) (do (nap) (recur))
+          :else (match (io/read-fd fd size)
+                  ((Err e) (if (= (. e kind) Interrupted) (recur) (do (reset! (. p err) (str (. e operation) ": " (. e message))) (push! p (array 0 0i8)) "")))
+                  ((Ok b) (do (push! p b) (if (= (array-len b) 0) "" (recur))))))))
+
+(defun joined (t: (Task str)) -> (Option CompressError)
+  (match (try-join t) ((Ok m) (if (= m "") nil (some (io-error m)))) ((Err e) (some (internal-error (str "an I/O task trapped: " (. e message)))))))
+
+(defun pipe-reader (p: Pipe) -> (fn () (Result (Array i8) CompressError))
+  (fn () (loop [] (match (take-one! p)
+                    ((some b) (if (and (= (array-len b) 0) (not (= @(. p err) ""))) (Err (io-error @(. p err))) (Ok b)))
+                    (nil (do (nap) (recur)))))))
+
+(defun pipe-writer (p: Pipe cap: i64) -> (fn ((Array i8)) (Result unit CompressError))
+  (fn (b: (Array i8)) (do (wait-room p cap) (if (= @(. p err) "") (do (push! p b) (Ok ())) (Err (io-error @(. p err)))))))
+
+;; The stream run with a reader task and a writer task around it; both are stopped and joined whatever the stream's result.
+(defun overlapped (run: (fn ((fn () (Result (Array i8) CompressError)) (fn ((Array i8)) (Result unit CompressError))) (Result i64 CompressError)) in-fd: i64 out-fd: i64 size: i64) -> (Result i64 CompressError)
+  (let [cap (* 2 size) rp (new-pipe) wp (new-pipe)
+        rt (spawn (fn () (read-task in-fd size cap rp)))
+        wt (spawn (fn () (write-task out-fd wp)))
+        r (run (pipe-reader rp) (pipe-writer wp cap))
+        _ (reset! (. rp stop) true)
+        _ (reset! (. wp stop) true)
+        rj (joined rt) wj (joined wt)]
+    (match r
+      ((Err e) (Err e))
+      ((Ok n) (match wj ((some e) (Err e)) (nil (match rj ((some e) (Err e)) (nil (Ok n)))))))))
+
 (defun compress-fd (c: c o: Options in-fd: i64 out-fd: i64) -> (Result i64 CompressError) :where ((Codec c))
-  (compress-stream c o (fd-reader in-fd) (fd-writer out-fd)))
+  (if (>= (. o threads) 2)
+    (overlapped (fn (r: (fn () (Result (Array i8) CompressError)) w: (fn ((Array i8)) (Result unit CompressError))) (compress-stream c o r w)) in-fd out-fd (chunk-for o))
+    (compress-stream c o (fd-reader in-fd (chunk-for o)) (fd-writer out-fd))))
 
 (defun decompress-fd (c: c o: Options in-fd: i64 out-fd: i64) -> (Result i64 CompressError) :where ((Codec c))
-  (decompress-stream c o (fd-reader in-fd) (fd-writer out-fd)))
+  (if (>= (. o threads) 2)
+    (overlapped (fn (r: (fn () (Result (Array i8) CompressError)) w: (fn ((Array i8)) (Result unit CompressError))) (decompress-stream c o r w)) in-fd out-fd (chunk-for o))
+    (decompress-stream c o (fd-reader in-fd (chunk-for o)) (fd-writer out-fd))))

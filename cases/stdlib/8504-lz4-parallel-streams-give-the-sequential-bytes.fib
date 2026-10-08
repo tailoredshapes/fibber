@@ -1,0 +1,20 @@
+;; spec: docs/design/compress.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; roots: ../../lib support
+;; A 3 MiB stream in chunks of 70000 bytes with 3 threads (batches of 3 jobs of 1 MiB): the compressed bytes are those of the sequential stream, decompressing them in odd chunks with 3 threads gives the
+;; input, and a cut stream is truncated whatever the thread count.
+(ns main (:use tl.check fib.compress.lz4.mem) (:require [fib.compress :as z] [fib.compress.lz4 :as lz4]))
+(defun data () -> (Array i8)
+  (let [c (cell (array 3145728 0i8))] (do (dotimes (i 3145728) (array-set! &c i (trunc i8 (+ (rem (* i 13) 59) (if (= (rem i 777) 0) (quot i 777) 0))))) @c)))
+(defun main () -> i64
+  (let [c (checks) k (lz4/lz4) d (data) o (z/with-block-size (z/default-options) 65536) chunks (z/split-sizes d [70000])
+        z1 (match (z/compress-chunks k (z/with-threads o 1) chunks) ((Ok b) b) ((Err _) (array 0 0i8)))
+        z3 (match (z/compress-chunks k (z/with-threads o 3) chunks) ((Ok b) b) ((Err _) (array 0 0i8)))]
+    (do (check c (> (array-len z1) 1000))
+        (check c (bytes-eq z1 z3))
+        (check c (match (z/decompress-chunks k (z/with-threads o 3) (z/split-sizes z1 [99991])) ((Ok b) (bytes-eq b d)) ((Err _) false)))
+        (check c (match (z/decompress-chunks k (z/with-threads o 7) (z/split-sizes z1 [1000000])) ((Ok b) (bytes-eq b d)) ((Err _) false)))
+        (check c (match (z/decompress-chunks k (z/with-threads o 3) (z/split-sizes (array-copy z1 0 (- (array-len z1) 100)) [99991])) ((Err e) (= (. e kind) :truncated)) ((Ok _) false)))
+        (checks-result c))))

@@ -9,6 +9,9 @@
 ;;   :ignore-dictionary  compress is given no dictionary, so the output is as large as without
 ;;   :small-bound        max-compressed-size answers half of what it should (a preallocation that is too small)
 ;;   :overclaim          the capability list names `:rot13`, which nothing implements
+;;   :thread-dependent   compress with more than one thread uses another acceleration: the bytes depend on the thread count
+;;   :par-error-kind     decompress with more than one thread answers :internal where the sequential decoder says :corrupt
+;;   :par-ignore-limit   decompress with more than one thread is given the default limit instead of the caller's
 (ns fib.compress.fault (:use fib.core fib.seq fib.coll fib.test.core fib.compress.types fib.compress.ops))
 
 (defstruct Lenient (inner: (dyn Decompressor)))
@@ -19,7 +22,7 @@
 (defstruct Faulty (inner: (dyn Codec :send) fault: keyword held: (Cell (Option (dyn Compressor)))))
 (defun faulty (inner: (dyn Codec :send) fault: keyword) -> Faulty (Faulty inner fault (cell nil)))
 
-(defun faults () -> (Vec keyword) [:ignore-max-output :accept-truncation :drop-checksum :corrupt-boundary :reuse-state :ignore-dictionary :small-bound :overclaim])
+(defun faults () -> (Vec keyword) [:ignore-max-output :accept-truncation :drop-checksum :corrupt-boundary :reuse-state :ignore-dictionary :small-bound :overclaim :thread-dependent :par-error-kind :par-ignore-limit])
 
 (defun is? (f: Faulty k: keyword) -> bool (= (. f fault) k))
 
@@ -33,6 +36,9 @@
         (= fault :ignore-dictionary) ["a-dictionary-makes-text-smaller"]
         (= fault :small-bound) ["the-same-input-compresses-to-the-same-bytes-every-time"]
         (= fault :overclaim) ["the-codec-has-a-name"]
+        (= fault :thread-dependent) ["the-result-does-not-depend-on-the-thread-count"]
+        (= fault :par-error-kind) ["errors-and-limits-do-not-depend-on-the-thread-count"]
+        (= fault :par-ignore-limit) ["errors-and-limits-do-not-depend-on-the-thread-count"]
         :else []))
 
 (defun flip-middle (b: (Array i8)) -> (Array i8)
@@ -43,9 +49,11 @@
 (defun opts-for-compress (f: Faulty o: Options) -> Options
   (cond (is? f :drop-checksum) (with (with o (checksum false)) (block-checksum false))
         (is? f :ignore-dictionary) (with-dictionary o (array 0 0i8))
+        (and (is? f :thread-dependent) (not (= (. o threads) 1))) (with-acceleration o (+ (. o acceleration) 3))
         :else o))
 
-(defun opts-for-decompress (f: Faulty o: Options) -> Options (if (is? f :ignore-max-output) (with-max-output o default-max-output) o))
+(defun opts-for-decompress (f: Faulty o: Options) -> Options
+  (if (or (is? f :ignore-max-output) (and (is? f :par-ignore-limit) (not (= (. o threads) 1)))) (with-max-output o default-max-output) o))
 
 (defun faulty-compress (f: Faulty data: (Array i8) o: Options) -> (Result (Array i8) CompressError)
   (match (codec-compress (. f inner) data (opts-for-compress f o))
@@ -54,7 +62,9 @@
 
 (defun faulty-decompress (f: Faulty data: (Array i8) o: Options) -> (Result (Array i8) CompressError)
   (match (codec-decompress (. f inner) data (opts-for-decompress f o))
-    ((Err e) (if (and (is? f :accept-truncation) (= (. e kind) :truncated)) (Ok (array 0 0i8)) (Err e)))
+    ((Err e) (cond (and (is? f :accept-truncation) (= (. e kind) :truncated)) (Ok (array 0 0i8))
+                   (and (is? f :par-error-kind) (not (= (. o threads) 1)) (or (= (. e kind) :corrupt) (= (. e kind) :checksum))) (Err (internal-error "a worker failed"))
+                   :else (Err e)))
     ((Ok b) (Ok b))))
 
 (defun faulty-compressor (f: Faulty o: Options) -> (Result (dyn Compressor) CompressError)

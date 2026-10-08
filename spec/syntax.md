@@ -1125,15 +1125,17 @@ vector operation), and `store-simd` takes a value of any vector type. They are `
 read and write any width, and `(splat (Simd f64 n) x)` is allowed inside it (spec/types.md 1.9). Case 7962 pins them at 2, 4 and 8 `f64` lanes and 4,
 8 and 16 `f32` lanes.
 
-`array-uninit-f32` and `array-uninit-f64` take an `i64` length and return
-`(Array f32)` and `(Array f64)`, respectively, only inside lexical `unsafe`.
+`array-uninit-f32`, `array-uninit-f64` and `array-uninit-i8` take an `i64` length and return
+`(Array f32)`, `(Array f64)` and `(Array i8)`, respectively, only inside lexical `unsafe`
+(`array-uninit-i8`, for byte buffers a codec fills before it returns them: the zero fill of a
+200 MB result is about a third of a parallel decode, docs/shootout/lz4.md).
 They allocate ordinary reference-counted native arrays without filling the
 payload. Negative lengths and lengths exceeding `(INT64_MAX - 24) / sizeof(T)`
 trap with `array-uninit: invalid length` before allocation. Callers must write
 an element before reading it and initialize every element before exposing the
 array to safe code. Destruction inspects no floating payload. These are
 native-stage primitives; the frozen Rust reference does not implement them.
-Cases 7016, 7055, 7070, and 7071 pin initialization, unsafe access, and bounds.
+Cases 7016, 7055, 7070, and 7071 pin initialization, unsafe access, and bounds; case 8506 pins the `i8` one.
 
 A fibber object reaches foreign code only as an address. `(raw e)` is
 the address of `e`'s object, valid for the duration of the enclosing
