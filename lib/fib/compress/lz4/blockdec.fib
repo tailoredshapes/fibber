@@ -14,7 +14,7 @@
 ;;   the offset is checked by one unsigned compare: 1 <= off <= op2 - lo (zero wraps to a huge number), so a match reads only bytes in [lo, op2) and written bytes.
 ;; Anything the fast path does not take, or any check it fails, goes to `slow-seq`, which checks EVERY length and index and says which check failed. A length sum cannot overflow
 ;; (at most 255 times the input length). The packed result of the fast and slow paths is (i << 32) | op: inputs below 2 GiB and outputs below 4 GiB take the fast path; others only the slow.
-(ns fib.compress.lz4.blockdec (:use fib.core fib.seq fib.coll fib.compress.lz4.mem))
+(ns fib.compress.lz4.blockdec (:use fib.core fib.seq fib.coll fib.compress.lz4.mem fib.compress.lz4.xxh32))
 
 (def e-corrupt: i64 -1)
 (def e-truncated: i64 -2)
@@ -117,15 +117,30 @@
          (and (< lit 15) (< (bit-and tok 15) 15) (ult (u- (rd16 ip (u+ (u+ i 1) lit)) 1) (u- (u+ op lit) lo))))))
 
 (defun decode-block (ip: ptr ilen: i64 dp: ptr dlen: i64 op0: i64 lo: i64 cap: i64) -> i64
+  (decode-block-h ip ilen dp dlen op0 lo cap dp 0))
+
+;; ---- decoding with the content checksum of the PREVIOUS block hashed on the way (the sequential frame decoder: docs/shootout/lz4.md 2). xxHash32 is a chain of dependent multiplies
+;; (about 7 cycles per 16-byte stripe, whatever the cache) while the decoder leaves most of the core idle, so one stripe of the earlier block's output is hashed in every turn of the loop
+;; and the two instruction streams overlap in the core's window. `hs` points at words: 0 the next byte to hash (an index into dp), 1 the end of the range to hash, 2 to 5 the four lanes;
+;; both are handed back (the lanes and the position reached, a multiple of 16 from where it began). The range lies before op0 in dp, so nothing the decoder writes touches it.
+(defun hload (hs: ptr) -> (Simd i32 4)
+  (with-lane (with-lane (with-lane (with-lane (vs 0) 0 (trunc i32 (rd64 hs 16))) 1 (trunc i32 (rd64 hs 24))) 2 (trunc i32 (rd64 hs 32))) 3 (trunc i32 (rd64 hs 40))))
+(defun hfin (hs: ptr hend: i64 hp: i64 acc: (Simd i32 4) r: i64) -> i64
+  (do (when (> hend 0) (do (wr64 hs 0 hp) (wr64 hs 16 (lane32 acc 0)) (wr64 hs 24 (lane32 acc 1)) (wr64 hs 32 (lane32 acc 2)) (wr64 hs 40 (lane32 acc 3)))) r))
+
+(defun decode-block-h (ip: ptr ilen: i64 dp: ptr dlen: i64 op0: i64 lo: i64 cap: i64 hs: ptr hend: i64) -> i64
   (let [ilim (min (u- ilen 17) 2147483000) dlim (min (min (u- dlen 46) (u- cap 32)) 4294967000)
         ilenm (min ilen 2147483648) dlenm (min dlen 4294967000)]
-    (loop [i 0 op op0]
-      (if (fast? ip i op ilim dlim lo)
-        (let [tok (rd8 ip i) lit (shr tok 4) i2 (u+ (u+ i 1) lit) op2 (u+ op lit)]
-          (do (cp16 dp op ip (u+ i 1)) (fast-match dp op2 (rd16 ip i2)) (recur (u+ i2 2) (u+ op2 (u+ (bit-and tok 15) 4)))))
-        (let [m (if (< i ilim) (mid-seq ip ilen ilenm dp dlenm lo cap i op) 0)]
-          (if (> m 0) (recur (shr m 32) (bit-and m 4294967295))
-            (let [r (slow-seq ip ilen dp dlen lo cap i op)]
-              (cond (< r 0) r
-                    (>= r done-flag) (u- r done-flag)
-                    :else (recur (shr r 32) (bit-and r 4294967295))))))))))
+    (loop [i 0 op op0 hp (if (> hend 0) (rd64 hs 0) 0) acc (if (> hend 0) (hload hs) (vs 0))]
+      (let [go (<= (u+ hp 16) hend)
+            acc2 (if go (vround acc (unsafe (load-simd (ptr+ dp hp)))) acc)
+            hp2 (if go (u+ hp 16) hp)]
+        (if (fast? ip i op ilim dlim lo)
+          (let [tok (rd8 ip i) lit (shr tok 4) i2 (u+ (u+ i 1) lit) op2 (u+ op lit)]
+            (do (cp16 dp op ip (u+ i 1)) (fast-match dp op2 (rd16 ip i2)) (recur (u+ i2 2) (u+ op2 (u+ (bit-and tok 15) 4)) hp2 acc2)))
+          (let [m (if (< i ilim) (mid-seq ip ilen ilenm dp dlenm lo cap i op) 0)]
+            (if (> m 0) (recur (shr m 32) (bit-and m 4294967295) hp2 acc2)
+              (let [r (slow-seq ip ilen dp dlen lo cap i op)]
+                (cond (< r 0) (hfin hs hend hp2 acc2 r)
+                      (>= r done-flag) (hfin hs hend hp2 acc2 (u- r done-flag))
+                      :else (recur (shr r 32) (bit-and r 4294967295) hp2 acc2))))))))))

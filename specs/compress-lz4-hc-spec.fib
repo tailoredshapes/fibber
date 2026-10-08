@@ -1,0 +1,70 @@
+;; The HC encoder against liblz4 (COMPRESS-3, docs/design/compress.md 5): for eight deterministic inputs (matchy data of every distance and length, with runs: the generator below is
+;; the same arithmetic as `hcvec.py`, which printed the table) the block that `block-compress-hc` makes at levels 3, 5, 9, 10, 11 and 12 has the SIZE and the FNV-1a hash of the block that
+;; liblz4 1.10.0 (python `lz4.block`, mode high_compression) made for the same input. A byte-identical block is the proof that the parser (the lazy parser of levels 3 to 9, its pattern analysis
+;; from level 9, the optimal parser with chain swap from level 10) makes the same choices; `scripts/mutant-lz4.sh` plants a fault in each part and this spec kills it. The thorough check
+;; (30,000 inputs, both directions) is `scripts/lz4-diff.py`; this is the part of it that a spec can keep.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.compress.types fib.compress.lz4 fib.compress.lz4.mem fib.compress.lz4.block))
+
+(defun lcg (x: i64) -> i64 (bit-and (+ (* x 1103515245) 12345) 2147483647))
+
+;; The state is (x, length so far) in two cells; `out` is the buffer.
+(defun gen (seed: i64 n: i64 mode: i64) -> (Array i8)
+  (let [copy-p (nth [7 3 11 5 2 16] mode) run-p (nth [50 40 9 300 90 12] mode) maxd (nth [3000 60000 300 65000 1000 40000] mode)
+        out (cell (array n 0i8)) len (cell 0) x (cell seed)]
+    (do (loop []
+          (when (< @len n)
+            (let [r (do (set! x (lcg @x)) (shr @x 8))]
+              (do (cond (and (> @len 20) (= (rem r copy-p) 0))
+                        (let [d (+ 1 (rem (do (set! x (lcg @x)) (shr @x 8)) (min @len maxd)))
+                              l (+ 4 (rem (do (set! x (lcg @x)) (shr @x 8)) 40))]
+                          (dotimes (k l) (when (< @len n) (do (array-set! &out @len (array-get @out (- @len d))) (set! len (+ @len 1))))))
+                        (= (rem r run-p) 0)
+                        (let [b (+ 97 (rem (do (set! x (lcg @x)) (shr @x 8)) 13))
+                              l (+ 20 (rem (do (set! x (lcg @x)) (shr @x 8)) 600))]
+                          (dotimes (k l) (when (< @len n) (do (array-set! &out @len (trunc i8 b)) (set! len (+ @len 1))))))
+                        :else (do (array-set! &out @len (trunc i8 (+ 97 (rem r 13)))) (set! len (+ @len 1))))
+                  (recur)))))
+        @out)))
+
+(defun fnv (b: (Array i8)) -> i64
+  (loop [i 0 h 2166136261]
+    (if (>= i (array-len b)) h
+      (recur (+ i 1) (bit-and (* (bit-xor h (bit-and (zext i64 (array-get b i)) 255)) 16777619) 4294967295)))))
+
+(def inputs: (Vec (Vec i64)) [[1 30000 0] [2 80000 1] [3 150000 2] [4 60000 3] [5 200000 4] [6 100000 5] [7 12345 0] [8 70001 3]])
+(def levels: (Vec i64) [3 5 9 10 11 12])
+;; per input, per level: size and FNV-1a of liblz4's block
+(def want: (Vec (Vec i64))
+  [[4096 2811807460 4029 288674386 3860 769119187 3868 1224504695 3868 775343222 3852 164421079]
+   [10786 1802169834 10292 2825455785 9837 1328067680 9857 2031636168 9769 2149412308 9709 2669551587]
+   [6403 3256006762 6372 1863173087 5989 2333128311 6150 2130633992 6118 1533193652 5975 1487766628]
+   [17238 1676237418 15896 1735943221 15451 3670018133 15590 397618873 15387 3913543044 15355 1917329926]
+   [37754 1912508520 36807 120443293 36752 61541782 36713 375580655 36712 3518799633 36712 781093932]
+   [5888 2522886985 5851 1977153317 5547 4060305290 5706 191210592 5670 298352309 5536 3338898834]
+   [1692 946439451 1666 2693231722 1594 2661345 1599 1789945718 1596 1539203225 1591 1525051783]
+   [20382 3404572244 18908 4199911165 18399 72874415 18587 2764805223 18353 2098432278 18319 2072924567]])
+
+;; The input numbers and levels (indexes into `levels`) whose block differs from liblz4's, as "input/level".
+(defun differing (lvls: (Vec i64)) -> (Vec str)
+  (vec (mapcat (fn (i: i64)
+                 (let [in (nth inputs i) d (gen (nth in 0) (nth in 1) (nth in 2))]
+                   (vec (mapcat (fn (k: i64)
+                                  (let [z (block-compress-hc d (nth levels k))]
+                                    (if (and (= (array-len z) (nth (nth want i) (* 2 k))) (= (fnv z) (nth (nth want i) (+ 1 (* 2 k))))) [] [(str i "/L" (nth levels k))])))
+                                lvls))))
+               (range (count inputs)))))
+
+(defspecs specs
+  (feature "fib.compress.lz4 HC against liblz4"
+    (scenario "levels 3 and 5 (the lazy parser): eight inputs give liblz4's blocks, byte for byte"
+      (then (expect = [] (differing [0 1]))))
+    (scenario "level 9 (the lazy parser with pattern analysis): the same"
+      (then (expect = [] (differing [2]))))
+    (scenario "levels 10, 11 and 12 (the optimal parser with chain swap): the same"
+      (then (expect = [] (differing [3 4 5]))))
+    (scenario "every block decodes to its input"
+      (then (expect = true (every? (fn (i: i64) (let [in (nth inputs i) d (gen (nth in 0) (nth in 1) (nth in 2))]
+                                                  (every? (fn (lv: i64) (match (block-decompress (block-compress-hc d lv) (array-len d)) ((Ok b) (bytes-eq b d)) ((Err _) false))) [3 9 12])))
+                                   (range (count inputs))))))))
+
+(defun main () -> i64 (run-main (specs)))
