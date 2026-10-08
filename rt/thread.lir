@@ -15,6 +15,15 @@
 (declare pthread_attr_destroy i32 (ptr))
 (declare pthread_attr_setguardsize i32 (ptr i64))
 (global internal fib.threads-live i32 (i32 0))
+;; The threads this runtime started and that are still running: spawned threads (fib.spawn .. fib.thread-done), async workers, pool workers. The program's own thread is not in it
+;; (`fib_thread_count` adds it). The operating system's count is not the program's: a program run by `fibc run` shares its process with the compiler's own threads (its stack thread, the
+;; parked first thread), and on macOS there is no /proc to tell them apart by name.
+(global internal fib.thread-total i64 (i64 0))
+
+;; What fib.os.process/thread-count answers (extern: bound to this definition): the threads of the program, its own thread and the ones the runtime started for it.
+;; extern: (declare fib_thread_count i64 ())
+(define internal (fib_thread_count i64) ()
+  (block entry (ret (add (i64 1) (atomic-load monotonic i64 @fib.thread-total)))))
 ;; The stack of a task's thread and of a pool worker, in bytes (docs/design/stack.md), and the guard below it.
 (global internal fib.thread-stack i64 (i64 8388608))
 (global internal fib.thread-guard i64 (i64 65536))
@@ -32,6 +41,7 @@
 ;; mode writes the T line (compiler.md §4).
 (define internal (fib.spawn void) ((ptr task) (ptr entry))
   (block entry
+    (atomicrmw add monotonic @fib.thread-total (i64 1))
     (atomic-store monotonic (i32 1) @fib.mt)
     (call @fib.rq-lock)
     (store (add (load i32 @fib.threads-live) (i32 1)) @fib.threads-live)
@@ -63,6 +73,7 @@
 (define internal (fib.thread-done void) ()
   (block entry
     (call @fib.guard-leave)
+    (atomicrmw sub monotonic @fib.thread-total (i64 1))
     (call @fib.rq-lock)
     (store (sub (load i32 @fib.threads-live) (i32 1)) @fib.threads-live)
     (call @fib.rq-broadcast)
@@ -98,7 +109,6 @@
 (global internal fib.guard-ss-disable i32 (i32 2))
 (global internal fib.main-fn ptr (ptr null))
 (global internal fib.main-stack i64 (i64 0))
-(global internal fib.main-parked i64 (i64 0))
 ;; The distance from the end of a stack within which a fault is its overflow (the guard of the main stack is a megabyte, of a task's thread 64 KiB).
 (global internal fib.guard-window i64 (i64 1048576))
 
@@ -146,8 +156,6 @@
 ;; parent just before the fork). op 1: in the child, with that base: a thread that has no signal stack gets the parent's back (the child's memory has it, with its
 ;; bounds header). Linux keeps the signal stack across a fork, so there it does nothing; XNU does not (the new thread starts with none, and a child that
 ;; outruns its stack was killed by SIGILL, the kernel having no stack to push the signal frame on, with no message). Returns 1 when it set the stack.
-;; op 2: how many threads the runtime parks: 1 while `main` runs on the stack it made (fib.run-main; the first thread of the process only waits), else 0 (the
-;; thread count of macOS, fib.os.backend task-info, leaves that thread out as the /proc reader of fib.os.process does by its name).
 ;; extern: (declare fib_guard_ctl i64 (i64 i64))
 (define internal (fib_guard_ctl i64) ((i64 op) (i64 saved))
   (block entry
@@ -155,8 +163,7 @@
           (ss (alloca (align 8) i8 (i32 32)))
           (_q (call @sigaltstack (ptr null) cur))
           (sp (load ptr cur)))
-      (switch op restore ((i64 0) query) ((i64 2) parked))))
-  (block parked (ret (load i64 @fib.main-parked)))
+      (br (icmp eq op (i64 0)) query restore)))
   (block query (ret (ptrtoint i64 sp)))
   (block restore
     (br (and (icmp eq sp (ptr null)) (icmp ne saved (i64 0))) set none))
@@ -284,7 +291,6 @@
       (br (icmp eq mb (i64 0)) here spawn)))
   (block spawn
     (store (shl mb (i64 20)) @fib.main-stack)
-    (store (i64 1) @fib.main-parked)
     (call @pthread_attr_init attr)
     (call @pthread_attr_setguardsize attr (i64 1048576))
     (let ((rs (call @pthread_attr_setstacksize attr (shl mb (i64 20)))))
@@ -301,7 +307,6 @@
     (call @fib.guard-restore old)
     (ret))
   (block here
-    (store (i64 0) @fib.main-parked)
     (let ((lim (alloca (align 8) i8 (i32 16)))
           (_g (call @getrlimit (i32 3) lim))
           (cur (load i64 lim)))
