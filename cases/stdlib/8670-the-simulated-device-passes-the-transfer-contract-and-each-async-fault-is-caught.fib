@@ -1,0 +1,29 @@
+;; spec:   types §2.17; docs/design/gpu.md 6.8
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; fib.gpu.sim is a real implementation of the Device protocols with deterministic asynchrony (a copy happens when a wait or a sync forces it). The transfer contract
+;; (fib.gpu.contract-async, GpuTransferContract) holds on it: six scenarios. Each fault of fib.gpu.fault's `async-faults` wraps it and the scenario that names it FAILS:
+;; `:early-wait` (a wait that does not wait: the host sees the sentinel, not the bytes) and `:skip-pinned-check` (a copy waited for before it returns: nothing is ever in
+;; flight). A contract that could not fail would be worse than none.
+(ns main (:use tl.check fib.test.core fib.gpu.contract-async fib.gpu.fault) (:require [fib.gpu :as gpu] [fib.gpu.sim :as sim]))
+
+(defun real () -> (dyn gpu/Device) (dyn gpu/Device (sim/sim-device 1073741824)))
+(defun wrapped (f: keyword) -> (dyn gpu/Device) (dyn gpu/Device (faulty (real) f)))
+
+(defun main () -> i64
+  (let [c (checks)
+        ok (GpuTransferContract (fn () (real)))
+        early (GpuTransferContract (fn () (wrapped :early-wait)))
+        skip (GpuTransferContract (fn () (wrapped :skip-pinned-check)))]
+    (do (check c (= (count ok) 6))
+        (check c (= (contract-failures ok 1) []))
+        (check c (fault-caught? early :early-wait))
+        (check c (fault-caught? skip :skip-pinned-check))
+        (check c (not (fault-caught? ok :early-wait)))
+        (check c (not (fault-caught? ok :skip-pinned-check)))
+        (check c (< (count (contract-failures early 1)) 6))
+        (check c (< (count (contract-failures skip 1)) 6))
+        (check c (= (async-faults) [:early-wait :skip-pinned-check]))
+        (checks-result c))))

@@ -1,0 +1,18 @@
+;; spec:   types §6.15 (L2), §1.10; docs/design/gpu.md 6.8
+;; expect: reject
+;; error:   src is lent to
+;; stage:  2
+;; A second `with-copy-out` of the pinned buffer inside the extent of a `with-copy-in` of the same buffer is a second lend of one place: refused, as case 338 refuses two
+;; windows of one array. (The run-time form is the `:lent` Err of a second transfer, fib.gpu.contract-async.)
+(ns main (:use fib.view fib.gpu.lend) (:require [fib.gpu :as gpu] [fib.gpu.sim :as sim]))
+
+(defun pinned (d: (dyn gpu/Device) n: i64) -> (dyn gpu/Pinned)
+  (match (gpu/device-pinned d n) ((Ok p) p) ((Err e) (trap (. e message)))))
+
+(defun main () -> i64
+  (let [d (dyn gpu/Device (sim/sim-device 1048576))
+        s (match (gpu/device-stream d) ((Ok s) s) ((Err e) (trap (. e message))))
+        dv (match (gpu/device-alloc d 16) ((Ok b) b) ((Err e) (trap (. e message))))
+        src (cell (pinned d 16))
+        r (with-copy-in (src s dv 16) (with-copy-out (src s dv 16) 1))]
+    0))

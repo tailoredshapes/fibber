@@ -47,6 +47,26 @@
   (buffer-fill (self v: i8) -> (Result unit GpuError))
   (buffer-release (self) -> (Result unit GpuError)))
 
+;; Pinned host memory (gpu.md 6.8): `bytes` of host memory the driver can transfer from and to without a staging copy (CUDA: page-locked,
+;; `cuMemHostAlloc`; a driver without such memory gives plain host memory and `pinned-locked?` says false). Its owner is one holder at a time:
+;; `stream-copy-in` and `stream-copy-out` LEND it to a `Transfer`, which hands it back at `transfer-wait`; while lent (in flight), `pinned-write`,
+;; `pinned-read`, `pinned-release` and a second transfer are `:lent` errors, and a release is final (`:released` after). `pinned-handle` is the
+;; host address (data: a driver keys its states by it). Elements are f32; `pinned-write` fills from the start, `pinned-read` copies `count` out.
+(defprotocol Pinned
+  (pinned-bytes (self) -> i64)
+  (pinned-handle (self) -> i64)
+  (pinned-locked? (self) -> bool)
+  (pinned-write (self xs: (Array f32)) -> (Result unit GpuError))
+  (pinned-read (self count: i64) -> (Result (Array f32) GpuError))
+  (pinned-release (self) -> (Result unit GpuError)))
+
+;; An asynchronous copy in flight: the loan of a `Pinned` (and the lend of a device buffer to the stream). `transfer-done?` asks without blocking;
+;; `transfer-wait` blocks until the copy is complete and gives the pinned buffer back (the same one `stream-copy-in` or `-out` was given): a driver
+;; that returns before the copy completes breaks the contract (fib.gpu.contract, GpuAsyncContract, and its fault `:early-wait`).
+(defprotocol Transfer
+  (transfer-done? (self) -> (Result bool GpuError))
+  (transfer-wait (self) -> (Result (dyn Pinned) GpuError)))
+
 ;; A kernel of a loaded module: its name, its signature (the kinds of its parameters; empty when the module carried none) and the driver's
 ;; handle of it (data: a driver reads its own, as `buffer-handle`).
 (defprotocol Kernel
@@ -68,20 +88,27 @@
 ;; A stream: `stream-launch` runs `k` over `grid` blocks of `block` threads (one to three positive dimensions each) with `args`, checked
 ;; against the kernel's signature, asynchronously, lending the buffers among `args` until `stream-sync`; `stream-record` marks an event;
 ;; `stream-lend` lends buffers as a launch does, for a library call on the stream (cuBLAS); `stream-handle` is the driver's handle (data).
+;; `stream-copy-in` copies `bytes` from the pinned buffer to the device buffer, `stream-copy-out` from the device buffer to the pinned buffer, both
+;; asynchronously and in stream order with the launches: the pinned buffer is lent to the returned `Transfer` until its `transfer-wait`, the device
+;; buffer to the stream until `stream-sync` (as a launch lends it; a copy may follow a copy or a launch of the same stream on a buffer, a launch may
+;; follow a copy, and a launch after a launch of one buffer is still `:lent`). `bytes` beyond either buffer is `:invalid-argument`.
 (defprotocol Stream
   (stream-launch (self k: (dyn Kernel) grid: (Vec i64) block: (Vec i64) args: (Vec Arg)) -> (Result unit GpuError))
   (stream-sync (self) -> (Result unit GpuError))
   (stream-record (self e: (dyn Event)) -> (Result unit GpuError))
   (stream-lend (self bs: (Vec (dyn Buffer))) -> (Result unit GpuError))
+  (stream-copy-in (self dst: (dyn Buffer) src: (dyn Pinned) bytes: i64) -> (Result (dyn Transfer) GpuError))
+  (stream-copy-out (self src: (dyn Buffer) dst: (dyn Pinned) bytes: i64) -> (Result (dyn Transfer) GpuError))
   (stream-handle (self) -> i64))
 
-;; A device: its info, what it supports (`:ptx`, `:cubin`, `:pinned`, `:shared-memory`, `:events`, `:f64`), a module from source (PTX text as
+;; A device: its info, what it supports (`:ptx`, `:cubin`, `:pinned` (`device-pinned` is page-locked; a driver without that still answers with plain host memory, or `:unsupported`), `:shared-memory`, `:events`, `:f64`), a module from source (PTX text as
 ;; bytes, or a binary image where `:cubin` is supported), memory (`:out-of-memory` beyond it, never a trap), streams, events, `close`.
 (defprotocol Device
   (device-info (self) -> DeviceInfo)
   (device-supports? (self cap: keyword) -> bool)
   (device-load (self source: (Array i8)) -> (Result (dyn Module) GpuError))
   (device-alloc (self bytes: i64) -> (Result (dyn Buffer) GpuError))
+  (device-pinned (self bytes: i64) -> (Result (dyn Pinned) GpuError))
   (device-stream (self) -> (Result (dyn Stream) GpuError))
   (device-event (self) -> (Result (dyn Event) GpuError))
   (device-close (self) -> (Result unit GpuError)))
@@ -91,6 +118,34 @@
   (platform-name (self) -> str)
   (platform-device-count (self) -> (Result i64 GpuError))
   (platform-open (self ordinal: i64) -> (Result (dyn Device) GpuError)))
+
+;; ---- the lend states (shared by the drivers; the contract pins them)
+;;
+;; The state of a device buffer, as an i64 a driver keeps by handle: 0 idle, 2 released, else LENT, `kind + 4 * stream` with the stream's id (nonzero) and
+;; the kind 1 for a launch (or `stream-lend`), 3 for a copy. A stream's operations are ordered, so the same stream may follow a copy with a launch or
+;; a copy, and a launch with a copy; a launch after a launch of one buffer (a kernel that reads and writes through two parameters is a race) and any
+;; use from another stream or from the host are `:lent`. All lends end at `stream-sync`.
+(defun lent? (st: i64) -> bool (and (!= st 0) (!= st 2)))
+(defun lend-launch (st: i64 sid: i64) -> (Result i64 GpuError)
+  (cond (= st 2) (Err (gpu-error :released "launch: the buffer was released"))
+        (or (= st 0) (and (= (rem st 4) 3) (= (quot st 4) sid))) (Ok (+ 1 (* 4 sid)))
+        :else (Err (gpu-error :lent "launch: the buffer is lent to a running kernel: sync the stream first"))))
+(defun lend-copy (st: i64 sid: i64) -> (Result i64 GpuError)
+  (cond (= st 2) (Err (gpu-error :released "copy: the buffer was released"))
+        (= st 0) (Ok (+ 3 (* 4 sid)))
+        (= (quot st 4) sid) (Ok st)
+        :else (Err (gpu-error :lent "copy: the buffer is lent to another stream: sync it first"))))
+
+;; Pinned buffers: 0 idle, 1 in flight (lent to a transfer), 2 released. `pinned-use` is the check of a host access or a release, `pinned-lend` of a copy.
+(defun pinned-use (st: i64 what: str) -> (Result unit GpuError)
+  (cond (= st 2) (Err (gpu-error :released (str what ": the pinned buffer was released")))
+        (= st 1) (Err (gpu-error :lent (str what ": the pinned buffer is lent to a transfer in flight: wait for it first")))
+        :else (Ok ())))
+(defun copy-bytes-check (what: str bytes: i64 dev-bytes: i64 host-bytes: i64) -> (Result unit GpuError)
+  (cond (<= bytes 0) (Err (gpu-error :invalid-argument (str what ": " bytes " bytes")))
+        (> bytes dev-bytes) (Err (gpu-error :invalid-argument (str what ": " bytes " bytes do not fit the device buffer of " dev-bytes)))
+        (> bytes host-bytes) (Err (gpu-error :invalid-argument (str what ": " bytes " bytes do not fit the pinned buffer of " host-bytes)))
+        :else (Ok ())))
 
 ;; ---- the launch ABI
 
