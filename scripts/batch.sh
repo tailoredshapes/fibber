@@ -5,11 +5,11 @@
 # first, branches in the order given) and stops on a conflict, naming the commit and the branch. Then ONE gate (scripts/gate.sh --quick,
 # or --full with the flag) and, if it passes, ONE bench compare (scripts/bench/quick.sh). If the gate fails it finds the offending branch by
 # halving the batch: the gate again on the first half; failing, the offender is in it; passing, the first half is accepted and the search goes
-# on in the second half on top of it. Builds are reused: stage 2 is cached by the tree's stamp (scripts/lib/stage2.sh), so a half
-# that changes only cases or the tree it already built costs no build. Prints one report at the end. Exit 0 the batch is good, 1 it
-# is not (the report names the branch), 2 setup or a conflict.
+# on in the second half on top of it. Builds are reused: the gate is `make` (docs/design/build.md), whose targets are files under the
+# scratch worktree's build/, so a half that changes only cases or the tree it already built costs no build. Prints one report at the
+# end. Exit 0 the batch is good, 1 it is not (the report names the branch), 2 setup or a conflict.
 # Never touches main or any branch you name, never pushes: the scratch worktree and branch are deleted at the end (--keep keeps them).
-# Environment: BATCH_BASE (default main); GATE_OUT (default ~/.cache/fibber-scratch/gate-batch); FIBC/SEED as for gate.sh.
+# Environment: BATCH_BASE (default main); GATE_OUT (default ~/.cache/fibber-scratch/gate-batch: the logs, and the bench's scratch); FIBC/SEED as for gate.sh.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/.." && pwd)
@@ -92,7 +92,7 @@ if [ "$code" -eq 3 ]; then
 elif [ "$code" -eq 0 ]; then
   say "all ${#branches[@]} branches pass the gate together"
   if [ -n "$bench" ]; then
-    t0=$(now); "$here/bench/quick.sh" > "$GATE_OUT/batch-bench-$stamp.log" 2>&1; bcode=$?
+    t0=$(now); BENCH_FIBC=$wt/build/F "$here/bench/quick.sh" > "$GATE_OUT/batch-bench-$stamp.log" 2>&1; bcode=$?   # the F the gate just built
     say "bench compare (exit $bcode, $(elapsed "$t0" "$(now)") s): $(tail -n 1 "$GATE_OUT/batch-bench-$stamp.log"); log $GATE_OUT/batch-bench-$stamp.log"
     sed 's/^/  /' "$GATE_OUT/batch-bench-$stamp.log"
   fi

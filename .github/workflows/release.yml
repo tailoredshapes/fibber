@@ -1,7 +1,7 @@
 name: release
 
 # A pushed tag v* builds the release for that tag and attaches the tarball and SHA256SUMS to a GitHub release of the same name.
-#   v0.1.*  and later: fibc written in fibber (scripts/package.sh), built by the seed that SEED names (scripts/fetch-seed.sh); the tag
+#   v0.1.*  and later: fibc written in fibber (`make release`, mk/release.mk), built by the seed that SEED names (scripts/fetch-seed.sh); the tag
 #           has to equal v + the file VERSION. (The v0.0.* releases, the Rust tools, are built from tag seed-1; docs/rust-legacy.md.)
 # workflow_dispatch does the same for an existing tag given as input.
 
@@ -39,20 +39,15 @@ jobs:
           sudo apt-get install -y llvm-21-dev libpolly-21-dev libzstd-dev zlib1g-dev libxml2-dev
           /usr/lib/llvm-21/bin/llvm-config --version
 
-      - name: Fetch the seed
-        id: seed
-        timeout-minutes: 5
+      # `make release` (mk/release.mk, docs/design/build.md): the seed SEED names is fetched (gh, with the token) and verified under build/seed/, then
+      # stage 2, the stage check, the shipped binary (static LLVM, no rpath) and its checks, dist/fibc-VERSION-PLATFORM.tar.gz and SHA256SUMS.
+      - name: Package fibc
+        timeout-minutes: 95
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "fibc=$(scripts/fetch-seed.sh seed)" >> "$GITHUB_OUTPUT"
-
-      - name: Package fibc
-        timeout-minutes: 90
-        env:
-          FIBC: ${{ steps.seed.outputs.fibc }}
         run: |
           test "v$(cat VERSION)" = "$TAG" || { echo "tag $TAG is not v$(cat VERSION), the file VERSION" >&2; exit 1; }
-          scripts/package.sh dist
+          make release
 
       - name: Check the unpacked tarball runs with an empty environment
         timeout-minutes: 10

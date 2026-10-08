@@ -95,9 +95,9 @@ The rules read the table's `TargetRow` literals in `compiler/types/targets.fib` 
         [(Finding "compiler/types/targets.fib" 1 (str (count rs) " TargetRow literals, " (count (filterv supported-row? rs)) " supported"))]))
   (plant-file "compiler/types/targets.fib" "(ns types.targets)\n"))
 
-(rule "the release baseline in scripts/package.sh is x86-64-v3, and no live line of it names x86-64-v2"
-  (into (must-contain repo "scripts/package.sh" "plat=linux-x86_64;  default_cpu=x86-64-v3;") (grep-live repo ["scripts/package.sh"] "x86-64-v2"))
-  (plant "scripts/package.sh" "\nexport FIB_TARGET_CPU=x86-64-v2\n"))
+(rule "the release baseline in mk/release.mk is x86-64-v3, and no live line of it names x86-64-v2"
+  (into (must-contain repo "mk/release.mk" "RELEASE_CPU ?= x86-64-v3") (grep-live repo ["mk/release.mk"] "x86-64-v2"))
+  (plant "mk/release.mk" "\nRELEASE_CPU := x86-64-v2\n"))
 
 (rule "simd/fma without FMA lowers to the trap (emit.lower.simdfn), and executables call the start-up CPU check (emit.compile)"
   (into (must-contain repo "compiler/emit/lower/simdfn.fib" "(fma-trap cx)") (must-contain repo "compiler/emit/compile.fib" "(cc/cpu-check-call t)"))
