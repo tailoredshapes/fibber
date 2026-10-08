@@ -6,7 +6,7 @@
 ;;   (xxh32 bytes seed)                                 the checksum of the frame format
 ;; Explicit: `(:require [fib.compress.lz4 :as lz4])`. Nothing in fib.core refers to it.
 (ns fib.compress.lz4 (:use fib.core fib.seq fib.coll fib.compress.types fib.compress.lz4.mem fib.compress.lz4.block fib.compress.lz4.frame fib.compress.lz4.framedec
-                           fib.compress.lz4.scomp fib.compress.lz4.sdec fib.compress.lz4.xxh32 fib.compress.lz4.header)
+                           fib.compress.lz4.scomp fib.compress.lz4.sdec fib.compress.lz4.xxh32 fib.compress.lz4.header fib.compress.lz4.pframe fib.compress.lz4.pframedec fib.compress.par)
   (:export-from fib.compress.lz4.block fib.compress.lz4.xxh32))
 
 (defstruct Lz4 (n: i64))
@@ -28,15 +28,38 @@
 (defun check-level (o: Options) -> (Result unit CompressError)
   (if (> (. o level) 12) (Err (unsupported "LZ4 has levels up to 12")) (Ok ())))
 
+;; THREADS (docs/design/compress.md 9): 0 means the machine's cores, but only for an input of at least `par-cutoff` bytes (below that the threads cost more than they save: measured in
+;; docs/shootout/lz4.md); 1 is sequential; n is n workers whatever the size. Only independent blocks without a dictionary run in parallel; the result is the same either way.
+(def par-cutoff-compress: i64 2097152)
+(def par-cutoff-decompress: i64 524288)
+(defun workers-for (o: Options n: i64 cutoff: i64) -> i64
+  (cond (= (. o threads) 1) 1
+        (and (= (. o threads) 0) (< n cutoff)) 1
+        :else (worker-count (. o threads))))
+
+(defun lz4-compress (data: (Array i8) o: Options) -> (Result (Array i8) CompressError)
+  (match (check-level o)
+    ((Err e) (Err e))
+    ((Ok _)
+     (match (check-options o)
+       ((Err e) (Err e))
+       ((Ok _) (let [w (workers-for o (array-len data) par-cutoff-compress)]
+                 (if (and (> w 1) (. o independent) (= (array-len (. o dictionary)) 0)) (frame-compress-par data o w) (frame-compress data o))))))))
+
 (defun lz4-decompress (data: (Array i8) o: Options) -> (Result (Array i8) CompressError)
-  (if (= (array-len data) 0) (Err (truncated "empty input is not an LZ4 frame")) (frame-decompress data o)))
+  (if (= (array-len data) 0) (Err (truncated "empty input is not an LZ4 frame"))
+    (let [w (workers-for o (array-len data) par-cutoff-decompress)]
+      (if (<= w 1) (frame-decompress data o)
+        (match (frame-decompress-par data o w)
+          ((Err e) (Err e))
+          ((Ok r) (match r ((some out) (Ok out)) (nil (frame-decompress data o)))))))))
 
 (impl Codec Lz4
   (codec-name (self) "lz4")
-  (codec-capabilities (self) [:frame :block :block-size :levels :streaming :dictionary :checksum :content-size :linked-blocks])
+  (codec-capabilities (self) [:frame :block :block-size :levels :streaming :dictionary :checksum :content-size :linked-blocks :parallel])
   (codec-magics (self) [(magic-bytes)])
   (codec-max-compressed-size (self n) (frame-max-size n default-block-size))
-  (codec-compress (self data opts) (match (check-level opts) ((Err e) (Err e)) ((Ok _) (frame-compress data opts))))
+  (codec-compress (self data opts) (lz4-compress data opts))
   (codec-decompress (self data opts) (lz4-decompress data opts))
   (codec-compressor (self opts)
     (match (check-level opts)

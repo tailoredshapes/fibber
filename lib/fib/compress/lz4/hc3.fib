@@ -1,0 +1,111 @@
+;; fib.compress.lz4.hc3: the LZ4 HC parser of liblz4's LZ4HC_compress_hashChain (levels 3 to 9; 10 to 12 use it with a deeper search: liblz4 runs its optimal parser there, which is not
+;; ported), written as a machine over a small register file so that no function is long (ADR 0006): the matches ML1 (at ip), ML2 and ML3 are found one after the other by
+;; `wider` (a chain search that may extend a match backwards over the bytes before it, down to `low`, and must beat `longest`), and the three are arranged as liblz4 arranges them: a
+;; short first match is dropped for the second, a first match that a longer second one would squeeze is trimmed to 18 bytes, three ascending matches write the first and carry on
+;; with the other two, and so on (the comments of the phases say which case of the original they are). `Positions` are `gen + index` as in hc.fib; the chain and head tables are shared
+;; with it. A match is only ever used after its bytes were compared, so a mistake here costs ratio and never correctness.
+;; Registers (words of `st`, in bytes shl 3): 0 next position to insert (hc.fib), 2 and 3 the start and the source of the match `wider` found, 4 ip, 5 ref, 6 ml (ML1), 7 8 9 start0 ref0 ml0
+;; (the first match as first found), 10 11 12 start2 ref2 ml2, 13 anchor, 14 op, 15 phase (0 find a first match, 2 look for ML2, 3 look for ML3, 9 done).
+;;   (hc3-block sp lo s0 n dp ht ct st gen level) -> compressed length
+(ns fib.compress.lz4.hc3 (:use fib.core fib.seq fib.coll fib.compress.lz4.mem fib.compress.lz4.blockenc fib.compress.lz4.hc))
+
+(defstruct Hc (sp: ptr ht: ptr ct: ptr st: ptr dp: ptr gen: i64 lo: i64 iend: i64 depth: i64 mf1: i64 mlim: i64))
+
+(defun gw (c: Hc k: i64) -> i64 (rd64 (. c st) (shl k 3)))
+(defun sw (c: Hc k: i64 v: i64) -> unit (wr64 (. c st) (shl k 3) v))
+
+;; The longest match for the bytes at ip that beats `longest`, down the chain (at most `depth` links), extended backwards as far as `low`: its length (or `longest` when none), and in
+;; registers 2 and 3 the start and the source of the match found.
+(defun wider (c: Hc ip: i64 low: i64 longest: i64) -> i64
+  (do (hc-insert (. c sp) (. c ht) (. c ct) (. c st) (. c gen) (. c lo) ip)
+      (sw c 2 ip) (sw c 3 -1)
+      (let [sp (. c sp) ct (. c ct) gen (. c gen) lowest (max (. c lo) (u- ip 65535)) look (u- ip low) pat (rd32 sp ip)]
+        (loop [mi (u- (tget (. c ht) (hh sp ip)) gen) n (. c depth) best longest]
+          (if (or (<= n 0) (< mi lowest) (>= mi ip)) best
+            (let [hit (and (= (rd8 sp (u+ low best)) (rd8 sp (u+ (u- mi look) best))) (= (rd32 sp mi) pat))
+                  back (if (and hit (> look 0)) (back-eq sp ip mi low (. c lo)) 0)
+                  fwd (if hit (u+ 4 (count-eq sp (u+ ip 4) (u+ mi 4) (. c mlim))) 0)
+                  d (rd16 ct (shl (bit-and (u+ gen mi) 65535) 1))]
+              (if (> (u+ fwd back) best)
+                (do (sw c 2 (u- ip back)) (sw c 3 (u- mi back))
+                    (if (>= (u+ ip fwd) (. c mlim)) (u+ fwd back) (recur (u- mi d) (u- n 1) (u+ fwd back))))
+                (recur (u- mi d) (u- n 1) best))))))))
+
+;; Writes the sequence (literals from the anchor to ip, then a match of ml from ref) and moves the anchor to its end.
+(defun enc! (c: Hc ip: i64 ref: i64 ml: i64) -> unit
+  (let [anchor (gw c 13)]
+    (do (sw c 14 (put-fast (. c sp) anchor (u- ip anchor) (. c dp) (gw c 14) (u- ip ref) ml (. c iend))) (sw c 13 (u+ ip ml)))))
+
+(defun mflimit (c: Hc) -> i64 (u- (. c mf1) 1))
+
+;; Phase 0: a first match at ip, or the next position.
+(defun ph0 (c: Hc) -> unit
+  (let [ip (gw c 4)]
+    (if (>= ip (. c mf1)) (sw c 15 9)
+      (let [ml (wider c ip ip 3)]
+        (if (< ml 4) (sw c 4 (u+ ip 1))
+          (do (sw c 5 (gw c 3)) (sw c 6 ml) (sw c 7 ip) (sw c 8 (gw c 3)) (sw c 9 ml) (sw c 15 2)))))))
+
+;; Phase 2 (_Search2): a second match that starts inside ML1 and beats it. None: write ML1. One: a first match that was skipped before is restored when the second would squeeze
+;; it; a first match that the second starts less than 3 bytes after is dropped for it; else on to phase 3.
+(defun ph2 (c: Hc) -> unit
+  (let [ip (gw c 4) ml (gw c 6)
+        ml2 (if (<= (u+ ip ml) (mflimit c)) (wider c (u- (u+ ip ml) 2) ip ml) ml)]
+    (if (= ml2 ml) (do (enc! c ip (gw c 5) ml) (sw c 4 (gw c 13)) (sw c 15 0))
+      (let [s2 (gw c 2) r2 (gw c 3) restore (and (< (gw c 7) ip) (< s2 (u+ ip (gw c 9))))
+            ip1 (if restore (gw c 7) ip)]
+        (do (sw c 10 s2) (sw c 11 r2) (sw c 12 ml2)
+            (if (< (u- s2 ip1) 3)
+              (do (sw c 4 s2) (sw c 5 r2) (sw c 6 ml2) (sw c 15 2))
+              (do (sw c 5 (if restore (gw c 8) (gw c 5))) (sw c 6 (if restore (gw c 9) ml)) (sw c 4 ip1) (sw c 15 3))))))))
+
+;; ML1 is cut to 18 bytes (the optimal length of liblz4) when ML2 starts within 18 of it: ML2 is moved up to where ML1 now ends.
+(defun trim2 (c: Hc ip: i64 ml: i64) -> unit
+  (when (< (u- (gw c 10) ip) 18)
+    (let [s2 (gw c 10) m2 (gw c 12) nm0 (min ml 18)
+          nm (if (> (u+ ip nm0) (u- (u+ s2 m2) 4)) (u- (u+ (u- s2 ip) m2) 4) nm0) corr (u- nm (u- s2 ip))]
+      (when (> corr 0) (do (sw c 10 (u+ s2 corr)) (sw c 11 (u+ (gw c 11) corr)) (sw c 12 (u- m2 corr)))))))
+
+;; ML3 starts too close to ML2 for ML2 to stay, and ML1 can be written at once: ML2 is squeezed (or replaced by ML3); ML1 is written; ML3 becomes the next ML1.
+(defun seq3-first (c: Hc ip: i64 ml: i64 s3: i64 r3: i64 m3: i64) -> unit
+  (do (when (< (gw c 10) (u+ ip ml))
+        (let [corr (u- (u+ ip ml) (gw c 10)) m2c (u- (gw c 12) corr)]
+          (do (sw c 10 (u+ (gw c 10) corr)) (sw c 11 (u+ (gw c 11) corr)) (sw c 12 m2c)
+              (when (< m2c 4) (do (sw c 10 s3) (sw c 11 r3) (sw c 12 m3))))))
+      (enc! c ip (gw c 5) ml)
+      (sw c 7 (gw c 10)) (sw c 8 (gw c 11)) (sw c 9 (gw c 12))
+      (sw c 4 s3) (sw c 5 r3) (sw c 6 m3) (sw c 15 2)))
+
+;; Three ascending matches: ML1 is written (trimmed to where ML2 starts, or to 18), ML2 becomes ML1, ML3 becomes ML2.
+(defun ascend (c: Hc ip: i64 ml: i64 s3: i64 r3: i64 m3: i64) -> unit
+  (let [s2 (gw c 10) m2 (gw c 12)
+        ml1 (cond (>= s2 (u+ ip ml)) ml (>= (u- s2 ip) 18) (u- s2 ip)
+                  :else (let [a (min ml 18)] (if (> (u+ ip a) (u- (u+ s2 m2) 4)) (u- (u+ (u- s2 ip) m2) 4) a)))
+        corr (if (and (< s2 (u+ ip ml)) (< (u- s2 ip) 18)) (max 0 (u- ml1 (u- s2 ip))) 0)]
+    (do (enc! c ip (gw c 5) ml1)
+        (sw c 4 (u+ s2 corr)) (sw c 5 (u+ (gw c 11) corr)) (sw c 6 (u- m2 corr))
+        (sw c 10 s3) (sw c 11 r3) (sw c 12 m3))))
+
+;; Phase 3 (_Search3): a third match after ML2. None: write ML1 and ML2. One: see which of the three cases of liblz4 it is.
+(defun ph3 (c: Hc) -> unit
+  (let [ip (gw c 4) ml (gw c 6)]
+    (do (trim2 c ip ml)
+        (let [s2 (gw c 10) m2 (gw c 12) m3 (if (<= (u+ s2 m2) (mflimit c)) (wider c (u- (u+ s2 m2) 3) s2 m2) m2)]
+          (if (= m3 m2)
+            (let [ml1 (if (< s2 (u+ ip ml)) (u- s2 ip) ml)]
+              (do (enc! c ip (gw c 5) ml1) (enc! c s2 (gw c 11) m2) (sw c 4 (gw c 13)) (sw c 15 0)))
+            (let [s3 (gw c 2) r3 (gw c 3)]
+              (cond (>= s3 (u+ (u+ ip ml) 3)) (ascend c ip ml s3 r3 m3)
+                    (>= s3 (u+ ip ml)) (seq3-first c ip ml s3 r3 m3)
+                    :else (do (sw c 10 s3) (sw c 11 r3) (sw c 12 m3)))))))))
+
+(defun hc3-run (c: Hc) -> i64
+  (loop []
+    (let [ph (gw c 15)]
+      (cond (= ph 0) (do (ph0 c) (recur)) (= ph 2) (do (ph2 c) (recur)) (= ph 3) (do (ph3 c) (recur))
+            :else (hc-tail (. c sp) (. c iend) (gw c 13) (. c dp) (gw c 14))))))
+
+(defun hc3-block (sp: ptr lo: i64 s0: i64 n: i64 dp: ptr ht: ptr ct: ptr st: ptr gen: i64 level: i64) -> i64
+  (if (< n 13) (put-seq sp s0 n dp 0 0 0)
+    (let [iend (u+ s0 n) c (Hc sp ht ct st dp gen lo iend (hc-depth level) (u+ (u- iend mf-limit) 1) (u- iend last-lits))]
+      (do (sw c 4 s0) (sw c 13 s0) (sw c 14 0) (sw c 15 0) (hc3-run c)))))

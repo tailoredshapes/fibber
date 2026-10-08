@@ -30,15 +30,15 @@
 
 (defspecs specs
   (feature "fib.compress contract shape"
-    (scenario "the contract has its fifteen scenarios"
+    (scenario "the contract has its seventeen scenarios"
       (given [scs (CompressContract (fn () (lz4)))])
-      (then (expect = 15 (count scs))))
+      (then (expect = 17 (count scs))))
     (scenario "against real LZ4 every scenario holds"
       (given [scs (CompressContract (fn () (lz4)))])
       (then (expect = [] (contract-failures scs 1))))
     (scenario "every fault has scenarios, and they exist"
       (given [scs (CompressContract (fn () (lz4)))])
-      (then (expect = 8 (count (faults)))
+      (then (expect = 11 (count (faults)))
             (expect = [] (vec (filter (fn (f: keyword) (empty? (fault-scenarios f))) (faults))))
             (expect = [] (vec (mapcat (fn (f: keyword) (vec (filter (fn (w: str) (not (has-word? scs w))) (fault-scenarios f)))) (faults))))))
     (scenario "a decoder that ignores max-output fails the exact-limit scenario"
@@ -65,6 +65,15 @@
     (scenario "a capability list that names something nothing implements fails the honesty scenario"
       (given [scs (CompressContract (fn () (with-fault :overclaim)))])
       (then (expect = true (failing-word? scs "the-codec-has-a-name"))))
+    (scenario "compress whose bytes depend on the thread count fails the thread-count scenario"
+      (given [scs (CompressContract (fn () (with-fault :thread-dependent)))])
+      (then (expect = true (failing-word? scs "the-result-does-not-depend-on-the-thread-count"))))
+    (scenario "a parallel decoder that answers another error kind fails the errors-and-limits scenario"
+      (given [scs (CompressContract (fn () (with-fault :par-error-kind)))])
+      (then (expect = true (failing-word? scs "errors-and-limits-do-not-depend-on-the-thread-count"))))
+    (scenario "a parallel decoder that ignores max-output fails the errors-and-limits scenario"
+      (given [scs (CompressContract (fn () (with-fault :par-ignore-limit)))])
+      (then (expect = true (failing-word? scs "errors-and-limits-do-not-depend-on-the-thread-count"))))
     (scenario "a codec that copies its input fails what needs a real frame: truncation, magic numbers, the empty input, the limit"
       (given [scs (CompressContract copier)])
       (then (expect = true (failing-word? scs "truncated-input-at-every-prefix"))
