@@ -1,0 +1,92 @@
+;; fib.gpu.reduce: block reductions for kernels (docs/design/gpu.md 6.7), built on block-shared memory, the barrier and fib.gpu.atomic. All i32-indexed, the
+;; portable flavour (WGSL has no i64), and written so that Dawn's uniformity analysis (webgpu.md 3.6) accepts the barrier: no branch depends on the thread before
+;; a barrier, no checked arithmetic (a trap is a thread-dependent exit), a loop whose bound is uniform. Where a thread must not take part it computes the value
+;; anyway and `sel-i32`/`sel-f32` (a mask, no branch) drops it.
+;;
+;; Contract: every thread of the block calls a `block-*` function (it holds barriers), the block has a power of two threads, at most BLOCK (256). A block that
+;; does not is a device trap (`block-check`). The answer is for every thread of the block. The order is fixed (a tree: stride BLOCK/2 down to 1, thread t adds
+;; thread t+stride), so a float sum is the same on every run and on every device that follows IEEE f32; `sum-order` below is the CPU's copy of it.
+;; The order of the grid-level kernels (fib.gpu.reduce-kernels) is stated there.
+(ns fib.gpu.reduce (:use fib.core) (:require [fib.gpu.atomic :as at]))
+
+
+;; ---- the branch-free select (`gpu/select`: both operands computed, lIR `select`)
+
+(defun sel-i32 (c: bool a: i32 b: i32) -> i32 (gpu/select c a b))
+(defun sel-f32 (c: bool a: f32 b: f32) -> f32 (gpu/select c a b))
+
+;; ---- i32 accessors over the shared window
+
+(defun f32-at (p: ptr i: i32) -> f32 (unsafe (load-f32 (ptr+ p (sext i64 (unchecked-multiply 4i32 i))))))
+(defun f32-set! (p: ptr i: i32 v: f32) -> unit (unsafe (store-f32 (ptr+ p (sext i64 (unchecked-multiply 4i32 i))) v)))
+(defun i32-at (p: ptr i: i32) -> i32 (unsafe (load-i32 (ptr+ p (sext i64 (unchecked-multiply 4i32 i))))))
+(defun i32-set! (p: ptr i: i32 v: i32) -> unit (unsafe (store-i32 (ptr+ p (sext i64 (unchecked-multiply 4i32 i))) v)))
+
+(defun clamp :private (j: i32) -> i32 (sel-i32 (< j 255i32) j 255i32))
+
+(defun tid () -> i32 (trunc i32 (gpu/local-id 0)))
+(defun block-size () -> i32 (trunc i32 (gpu/group-size 0)))
+(defun block-id () -> i32 (trunc i32 (gpu/group-id 0)))
+(defun grid-blocks () -> i32 (trunc i32 (gpu/num-groups 0)))
+(defun global-id () -> i32 (trunc i32 (gpu/global-id 0)))
+
+;; The block is a power of two of at most BLOCK threads, else the device traps (a branch, taken by every thread alike, so uniform).
+(defun block-check () -> unit
+  (let ((n (block-size)))
+    (when (or (> n 256i32) (< n 1i32) (not (= (bit-and n (unchecked-subtract n 1i32)) 0i32)))
+      (trap "fib.gpu.reduce: the block must be a power of two of at most 256 threads"))))
+
+;; The host passes the number of blocks it launched (a kernel cannot read it where Dawn's uniformity analysis wants a uniform value: `num_workgroups` reaches the
+;; functions through a private variable, which Tint takes as non-uniform). A wrong number would read some elements twice, so it is checked: a device trap.
+;; The result is the threads of the grid.
+(defun grid-check (blocks: i32) -> unit
+  (when (not (= blocks (grid-blocks))) (trap "fib.gpu.reduce: the blocks argument is not the number of blocks launched")))
+(defun grid-total (blocks: i32) -> i32 (unchecked-multiply (block-size) blocks))
+
+;; ---- the combine, by kind: 0 add, 1 max, 2 min (signed i32; for f32 max is `>`, a NaN loses)
+
+(defun comb-i32 :private (kind: i32 a: i32 b: i32) -> i32
+  (sel-i32 (= kind 0i32) (unchecked-add a b) (sel-i32 (= kind 1i32) (sel-i32 (> b a) b a) (sel-i32 (< b a) b a))))
+(defun comb-f32 :private (kind: i32 a: f32 b: f32) -> f32
+  (sel-f32 (= kind 0i32) (+ a b) (sel-f32 (> b a) b a)))
+
+;; One tree reduction. Each step: read both operands, barrier, write, barrier (a thread's slot is read by the thread `stride` below it in the same step, so
+;; read and write are apart). The lanes that take no part write their own value back.
+(defun tree-i32 :private (v: i32 kind: i32) -> i32
+  (let ((s (unsafe (gpu/shared :i32 256))) (t (tid)))
+    (do (block-check) (i32-set! s t v) (gpu/barrier)
+        (loop ((stride (quot (block-size) 2i32)))
+          (when (> stride 0i32)
+            (let ((a (i32-at s t)) (b (i32-at s (clamp (unchecked-add t stride)))) (m (< t stride)))
+              (do (gpu/barrier) (i32-set! s t (sel-i32 m (comb-i32 kind a b) a)) (gpu/barrier)
+                  (recur (quot stride 2i32))))))
+        (i32-at s 0i32))))
+
+(defun tree-f32 :private (v: f32 kind: i32) -> f32
+  (let ((s (unsafe (gpu/shared :f32 256))) (t (tid)))
+    (do (block-check) (f32-set! s t v) (gpu/barrier)
+        (loop ((stride (quot (block-size) 2i32)))
+          (when (> stride 0i32)
+            (let ((a (f32-at s t)) (b (f32-at s (clamp (unchecked-add t stride)))) (m (< t stride)))
+              (do (gpu/barrier) (f32-set! s t (sel-f32 m (comb-f32 kind a b) a)) (gpu/barrier)
+                  (recur (quot stride 2i32))))))
+        (f32-at s 0i32))))
+
+;; The reductions of a block: every thread passes its value and gets the result. They share one window per function, so two calls in a kernel are apart
+;; by a `(gpu/barrier)` if some thread may still be reading the first call's window (the answer is read after the last barrier of the call, so a call that
+;; follows a call on the same thread needs none for that thread; for another thread, one).
+(defun block-sum-i32 (v: i32) -> i32 (tree-i32 v 0i32))
+(defun block-max-i32 (v: i32) -> i32 (tree-i32 v 1i32))
+(defun block-min-i32 (v: i32) -> i32 (tree-i32 v 2i32))
+(defun block-sum-f32 (v: f32) -> f32 (tree-f32 v 0i32))
+(defun block-max-f32 (v: f32) -> f32 (tree-f32 v 1i32))
+
+;; ---- the CPU's copy of the tree (what `block-sum-f32` computes for the values of one block of `(count xs)` threads, in its order), for tests
+
+(defun sum-order (xs: (Array f32)) -> f32
+  (let ((w (cell xs)))
+    (do (loop ((stride (quot (array-len xs) 2)))
+          (when (> stride 0)
+            (do (dotimes (t stride) (array-set! &w t (+ (array-get @w t) (array-get @w (+ t stride)))))
+                (recur (quot stride 2)))))
+        (array-get @w 0))))

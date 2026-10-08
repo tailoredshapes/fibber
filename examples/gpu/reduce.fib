@@ -1,0 +1,48 @@
+;; examples/gpu/reduce.fib: the grid reductions of fib.gpu.reduce-kernels (docs/design/gpu.md 6.7) on the host, and the CPU reference a device is compared with.
+;;   fibc run examples/gpu/reduce.fib            prints, for each configuration, the reference lines
+;;       ref NAME n blocks block VALUE...         (i32 values as they are; f32 values as their bits, f32->bits; `partials` one value per block)
+;;     and runs the kernels over a grid of one-thread blocks on the host (the host runs the threads one after another, so a block of more than one thread would
+;;     read the others' shared memory before they wrote it, gpu.md 3.5; with one thread the tree is the identity and the grid-stride fold, the atomics and the
+;;     partial slots are what is run), checks them against the reference, and exits with the number of mismatches.
+;; compiler/tests/native/gpu-device.sh runs the same configurations on the GPU (PTX through libcuda; WGSL through Dawn) and compares with the `ref` lines.
+(ns main (:require [fib.gpu :as gpu] [fib.gpu.reduce-kernels :as k] [fib.gpu.reduce-atomic-f32 :as ka] [fib.gpu.reduce-ref :as ref]))
+
+(defun configs () -> (Vec (Vec i64)) [[1000003 64 256] [1000003 7 32] [5 3 4] [1 1 1] [4096 16 128]])
+
+(defun bits (x: f32) -> i64 (sext i64 (f32->bits x)))
+
+(defun join-bits (xs: (Array f32)) -> str
+  (loop [i 0 out ""] (if (>= i (array-len xs)) out (recur (+ i 1) (str out (if (= i 0) "" ",") (bits (array-get xs i)))))))
+
+;; The kernels over `blocks` one-thread blocks on the host; the number of mismatches against the reference.
+(defun host-check (n: i64 blocks: i64) -> i64
+  (let [xi (ref/data-i32 n n) xf (ref/data-f32 n n)
+        out (cell (array 4 0i32)) outf (cell (array 2 0.0f32)) parts (cell (array blocks 0.0f32))
+        nn (trunc i32 n) bb (trunc i32 blocks)]
+    (do (array-set! &out 0 0i32) (array-set! &out 1 -2147483648i32) (array-set! &out 2 2147483647i32)
+        (array-set! &outf 0 -3.4028235e38f32) (array-set! &outf 1 0.0f32)
+        (gpu/host-launch [blocks] [1] (fn () (k/reduce-sum-i32 (gpu/array-data-i32 xi) (gpu/array-data-i32 @out) nn bb)))
+        (gpu/host-launch [blocks] [1] (fn () (k/reduce-max-i32 (gpu/array-data-i32 xi) (unsafe (ptr+ (gpu/array-data-i32 @out) 4)) nn bb)))
+        (gpu/host-launch [blocks] [1] (fn () (k/reduce-min-i32 (gpu/array-data-i32 xi) (unsafe (ptr+ (gpu/array-data-i32 @out) 8)) nn bb)))
+        (gpu/host-launch [blocks] [1] (fn () (k/reduce-max-f32 (gpu/array-data xf) (gpu/array-data @outf) nn bb)))
+        (gpu/host-launch [blocks] [1] (fn () (ka/reduce-sum-f32 (gpu/array-data xf) (unsafe (ptr+ (gpu/array-data @outf) 4)) nn bb)))
+        (gpu/host-launch [blocks] [1] (fn () (k/reduce-partials-f32 (gpu/array-data xf) (gpu/array-data @parts) nn bb)))
+        (+ (if (= (array-get @out 0) (ref/sum-i32 xi)) 0 1)
+           (if (= (array-get @out 1) (ref/max-i32 xi)) 0 1)
+           (if (= (array-get @out 2) (ref/min-i32 xi)) 0 1)
+           (if (= (bits (array-get @outf 0)) (bits (ref/max-f32 xf))) 0 1)
+           (if (<= (ref/abs64 (- (fpext f64 (array-get @outf 1)) (fpext f64 (ref/sum-f32 xf)))) (ref/sum-bound xf)) 0 1)
+           (if (= (join-bits @parts) (join-bits (ref/partials-f32 xf blocks 1))) 0 1)))))
+
+(defun main () -> i64
+  (loop [i 0 bad 0]
+    (if (>= i (count (configs)))
+        (do (println (str "host mismatches: " bad)) bad)
+        (let [c (nth (configs) i) n (nth c 0) blocks (nth c 1) block (nth c 2) xi (ref/data-i32 n n) xf (ref/data-f32 n n)]
+          (do (println (str "ref sum-i32 " n " " blocks " " block " " (ref/sum-i32 xi)))
+              (println (str "ref max-i32 " n " " blocks " " block " " (ref/max-i32 xi)))
+              (println (str "ref min-i32 " n " " blocks " " block " " (ref/min-i32 xi)))
+              (println (str "ref max-f32 " n " " blocks " " block " " (bits (ref/max-f32 xf))))
+              (println (str "ref sum-f32 " n " " blocks " " block " " (bits (ref/sum-f32 xf)) " " (ref/sum-bound xf)))
+              (println (str "ref partials " n " " blocks " " block " " (join-bits (ref/partials-f32 xf blocks block))))
+              (recur (+ i 1) (+ bad (host-check n blocks))))))))

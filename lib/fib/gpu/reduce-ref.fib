@@ -1,0 +1,59 @@
+;; fib.gpu.reduce-ref: the CPU's side of the grid reductions of fib.gpu.reduce-kernels (docs/design/gpu.md 6.7), for a driver's tests and for the host:
+;; deterministic data (`data-i32`, `data-f32`: the same on every machine and in the other languages a device harness is written in, so a harness need not
+;; receive the data), the results the integer kernels must give EXACTLY (`sum-i32` wraps, `max-i32`, `min-i32`), the f32 maximum (exact too), the f32 sum
+;; in the left-to-right order (what the atomic kernel is compared with, within `sum-bound`) and the per-block partials of `reduce-partials-f32`, which are
+;; BIT FOR BIT what the device writes: they follow its order (a thread adds its elements gid, gid + threads, .. from 0.0; the block adds by the tree, stride
+;; block/2 down to 1, thread t taking thread t + stride).
+;;   The generator: s(0) = seed, s(i+1) = (s(i) * 1664525 + 1013904223) mod 2^32; element i is s(i+1). An i32 is s - 2^31; an f32 is (s >> 8) / 2^23 - 1,
+;;   exact in f32 (24 bits), so in [-1, 1).
+(ns fib.gpu.reduce-ref (:use fib.core fib.seq fib.coll) (:require [fib.gpu.reduce :as r]))
+
+(defun next-state :private (s: i64) -> i64 (rem (+ (* s 1664525) 1013904223) 4294967296))
+
+(defun data-i32 (n: i64 seed: i64) -> (Array i32)
+  (let [out (cell (array n 0i32))]
+    (do (loop [i 0 s seed]
+          (when (< i n)
+            (let [t (next-state s)]
+              (do (array-set! &out i (trunc i32 (- t 2147483648))) (recur (+ i 1) t)))))
+        @out)))
+
+(defun data-f32 (n: i64 seed: i64) -> (Array f32)
+  (let [out (cell (array n 0.0f32))]
+    (do (loop [i 0 s seed]
+          (when (< i n)
+            (let [t (next-state s)]
+              (do (array-set! &out i (- (/ (sitofp f32 (quot t 256)) 8388608.0f32) 1.0f32)) (recur (+ i 1) t)))))
+        @out)))
+
+;; Wrapping i32 sum (the kernel adds with `unchecked-add`), the maximum, the minimum.
+(defun sum-i32 (xs: (Array i32)) -> i32
+  (loop [i 0 acc 0i32] (if (>= i (array-len xs)) acc (recur (+ i 1) (unchecked-add acc (array-get xs i))))))
+(defun max-i32 (xs: (Array i32)) -> i32
+  (loop [i 0 acc -2147483648i32] (if (>= i (array-len xs)) acc (recur (+ i 1) (if (> (array-get xs i) acc) (array-get xs i) acc)))))
+(defun min-i32 (xs: (Array i32)) -> i32
+  (loop [i 0 acc 2147483647i32] (if (>= i (array-len xs)) acc (recur (+ i 1) (if (< (array-get xs i) acc) (array-get xs i) acc)))))
+(defun max-f32 (xs: (Array f32)) -> f32
+  (loop [i 0 acc -3.4028235e38f32] (if (>= i (array-len xs)) acc (recur (+ i 1) (if (> (array-get xs i) acc) (array-get xs i) acc)))))
+
+;; |x| of an f64.
+(defun abs64 (x: f64) -> f64 (if (< x 0.0) (- 0.0 x) x))
+
+;; The f32 sum left to right in f32, and the bound the atomic kernel's result is within of it: n * 2^-24 * sum |x| (the textbook bound of any summation order).
+(defun sum-f32 (xs: (Array f32)) -> f32
+  (loop [i 0 acc 0.0f32] (if (>= i (array-len xs)) acc (recur (+ i 1) (+ acc (array-get xs i))))))
+(defun sum-bound (xs: (Array f32)) -> f64
+  (* (/ (sitofp f64 (array-len xs)) 16777216.0) (loop [i 0 acc 0.0] (if (>= i (array-len xs)) acc (recur (+ i 1) (+ acc (abs64 (fpext f64 (array-get xs i)))))))))
+
+;; What thread `gid` of a grid of `total` threads folds: elements gid, gid + total, .. below n, added from 0.0 in order.
+(defun thread-sum (xs: (Array f32) gid: i64 total: i64) -> f32
+  (loop [i gid acc 0.0f32] (if (>= i (array-len xs)) acc (recur (+ i total) (+ acc (array-get xs i))))))
+
+;; `reduce-partials-f32` for `blocks` blocks of `block` threads: block b's value, the tree over its threads' sums.
+(defun partials-f32 (xs: (Array f32) blocks: i64 block: i64) -> (Array f32)
+  (let [out (cell (array blocks 0.0f32)) total (* blocks block)]
+    (do (dotimes (b blocks)
+          (let [sums (cell (array block 0.0f32))]
+            (do (dotimes (t block) (array-set! &sums t (thread-sum xs (+ (* b block) t) total)))
+                (array-set! &out b (r/sum-order @sums)))))
+        @out)))

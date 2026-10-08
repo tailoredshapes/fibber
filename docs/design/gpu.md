@@ -45,7 +45,7 @@ over the arguments, below the noise of the sync. The one-language guard: `fibc r
 **Not in phase 1:** `with-launch`, the static lend of a device buffer (the run-time lent state in the driver is the backstop; the design
 of 3.3 stands: a scoped `DeviceBuffer` over the `with-view` machinery, phase 3); a typed launch form checked at compile time against the
 `defkernel`'s parameters (the run-time check covers every launch; the form needs the expander to see the kernel's types across modules);
-the barrier-uniformity check; pinned and async transfers; atomics; f16/bf16; the SPIR-V row.
+the barrier-uniformity check; pinned and async transfers (GPU-3 did atomics and the reductions: section 12); f16/bf16; the SPIR-V row.
 
 ## 1. Recommendation
 
@@ -424,3 +424,32 @@ removes the only part of the prototype that is a convention rather than a rule.
   spec ("test.sh: 0 failed").
 * `examples/gemm.fib` at 1024, 2048, 4096: the table of section 2 (exit 0 each).
 * `scripts/gate.sh --quick`: section 12 of the report.
+
+## 12. Atomics and reductions as built (GPU-3)
+
+Phase 2's items 6 and 7 of section 9 (atomics on the device; block and grid reductions). Verified on this machine's RTX 4080 SUPER (driver 610.57.04) through
+libcuda for PTX and through Dawn for WGSL (the adapter is the same GPU: vendor nvidia, architecture lovelace); `compiler/tests/native/gpu-device.sh` is the
+executable form and skips the device part, with a note, where there is none. Pinned memory and async transfers (item 8) are NOT done.
+
+| what | where | verdict |
+|---|---|---|
+| atomics as builtins | `gpu/atomic-{add,min,max,umin,umax,xchg,cas}-i32`, `gpu/atomic-add-i64`, `gpu/atomic-add-f32` (compiler/types/builtins.fib, emit.lower.gpu): one lIR `atomicrmw` or `cmpxchg`, monotonic, answering the OLD value; unsafe like `load-i32`; in the kernel subset (own.kernel); on the host the same instruction | PTX `atom.global.add.u32`, `atom.shared.max.s32`, `atom.global.min.s32`, `atom.global.max.u32`, `atom.relaxed.global.cas.b32`, `atom.global.add.f32`; the address space is inferred from the pointer (a `gpu/shared` word gives `atom.shared`) |
+| no new lIR form | `atomicrmw` and `cmpxchg` (lir.md 6.6) lower on the kernel target as they are; 6.9a says so | no spec and code disagreement found |
+| the library | `fib.gpu.atomic` (element-indexed, i32 index; `i32-add!` `i32-max!` .. discard the old value, `i32-fetch-add` `i32-cas` .. answer it; `f32-max!` is a compare-and-swap loop, exact) | exported by `fib.gpu` |
+| a branch-free select | `gpu/select c a b` (lIR `select`) | the reductions' tool for WebGPU (below) |
+| block reductions | `fib.gpu.reduce`: `block-sum-i32 -max-i32 -min-i32 block-sum-f32 -max-f32` over one shared window with `gpu/barrier`; a tree, stride block/2 down to 1, thread t takes thread t+stride; the block is a power of two of at most 256 threads (else a device trap); the answer is for every thread | the tree order is fixed, so the f32 sum is the same on every run and every IEEE device |
+| grid reductions | `fib.gpu.reduce-kernels` (`reduce-sum-i32 -max-i32 -min-i32 -max-f32 -partials-f32`, arguments `(data out n blocks)`), `fib.gpu.reduce-atomic-f32` (`reduce-sum-f32`, PTX only) | integer and f32-max results equal the CPU's exactly; `reduce-partials-f32` equals `fib.gpu.reduce-ref`'s `partials-f32` BIT FOR BIT; `reduce-sum-f32` (atomic, order of finishing blocks) is within n * 2^-24 * sum |x| of the left-to-right sum (measured difference 5e-3 at n = 10^6, the bound 3e4) |
+| the CPU reference | `fib.gpu.reduce-ref` (deterministic data from a generator a harness in another language repeats, the integer results, the left-to-right f32 sum and its bound, the per-block partials in the device order); `examples/gpu/reduce.fib` prints the reference and runs the kernels over one-thread blocks on the host | cases 8550-8555 (host), 8578-8579 (WGSL) |
+
+**WebGPU.** WGSL has atomics on `atomic<i32>` and `atomic<u32>` only, so a module that contains an atomic prints every storage buffer and workgroup array as
+`array<atomic<u32>>` and every plain access as `atomicLoad`/`atomicStore` (webgpu.md 3.7); a module with none prints what it always printed (the golden
+kernels.wgsl is unchanged). Signed min and max and `cas` are loops of `atomicCompareExchangeWeak`; an f32 or 64-bit atomic is refused by name. Dawn's
+uniformity analysis shaped the reductions: the printer makes any function with a branch a `loop { switch }` state machine, and Tint then takes a barrier in it
+as non-uniform when anything after the barrier branches on the thread. So the reductions have no thread-dependent branch in a function that holds a barrier
+(masks through `gpu/select`, folds in functions of their own, every thread doing the final atomic with the identity for those that must not add), and the
+number of blocks is a kernel argument checked against `gpu/num-groups` (a read of a builtin through a private variable is non-uniform to Tint). A device trap
+in the WGSL target returns zeros and goes on (webgpu.md 3.4), so a loop that steps by a trapped call's answer must not: the folds step past n if the total is 0.
+
+**Not done:** pinned host memory and async launch (item 8: `cuMemHostAlloc`, `cuMemcpyHtoDAsync` belong to the driver repository fib-gpu-cuda, which the
+core does not contain; the download at 0.4 GB/s is still the cost of not having it); a warp shuffle reduction (an intrinsic family); f32 atomic add and
+min/max through WGSL (no form); a relooper in the WGSL printer (webgpu.md 9.3), which would lift the branch rules above.

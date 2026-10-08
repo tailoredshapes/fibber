@@ -1,0 +1,23 @@
+;; spec:   types §2.17 (the gpu builtins: atomics), lir §6.6; docs/design/gpu.md 6.6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib
+;; Each `gpu/atomic-OP-T p v` answers the value that was in memory before and leaves the new one; `gpu/atomic-cas-i32 p e n` answers the old value and stores `n` only
+;; when it was `e` (so a second claim of the same slot sees the first's id). On a buffer of the host (outside a kernel: unsafe, a raw ptr), one thread.
+(ns main (:require [fib.gpu :as gpu]))
+(defun main () -> i64
+  (let [buf (cell (array 8 0i32)) p (gpu/array-data-i32 @buf)]
+    (unsafe
+      (do (array-set! &buf 0 10i32) (array-set! &buf 1 10i32) (array-set! &buf 2 10i32) (array-set! &buf 3 -1i32) (array-set! &buf 4 -1i32) (array-set! &buf 5 0i32)
+          (let [a (gpu/atomic-add-i32 p 5i32)                                            ; old 10, new 15
+                b (gpu/atomic-max-i32 (ptr+ p 4) 3i32)                                   ; old 10, 10 stays (3 < 10)
+                c (gpu/atomic-min-i32 (ptr+ p 8) 3i32)                                   ; old 10, new 3
+                d (gpu/atomic-umax-i32 (ptr+ p 12) 5i32)                                 ; -1 is the largest unsigned: old -1, stays
+                e (gpu/atomic-umin-i32 (ptr+ p 16) 5i32)                                 ; old -1, new 5
+                f (gpu/atomic-cas-i32 (ptr+ p 20) 0i32 7i32)                             ; first claim: old 0, now 7
+                g (gpu/atomic-cas-i32 (ptr+ p 20) 0i32 9i32)                             ; second claim: old 7, stays 7
+                h (gpu/atomic-xchg-i32 (ptr+ p 24) 4i32)]                                ; old 0, new 4
+            (+ (if (and (= a 10i32) (= b 10i32) (= c 10i32) (= d -1i32) (= e -1i32) (= f 0i32) (= g 7i32) (= h 0i32)) 0 1)
+               (if (and (= (array-get @buf 0) 15i32) (= (array-get @buf 1) 10i32) (= (array-get @buf 2) 3i32) (= (array-get @buf 3) -1i32)
+                        (= (array-get @buf 4) 5i32) (= (array-get @buf 5) 7i32) (= (array-get @buf 6) 4i32)) 0 2)))))))

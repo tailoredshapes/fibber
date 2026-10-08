@@ -288,6 +288,9 @@ Recent compiler and library changes include:
   (`ssh://git@localhost:2222/tailoredshapes/fib-gpu-cuda.git`, tag `v0.1.0`) passes the device contract `fib.gpu.contract` (7 of 7
   scenarios, 3 faults caught). Measured there: fibber's shared-memory GEMM at 17.1 TFLOPS at n = 4096 (47% of cuBLAS, the CUDA C kernel's
   speed), bit for bit the CPU's; [the GPU design](docs/design/gpu.md) has the table and what phase 2 and 3 still owe.
+- GPU atomics and reductions (GPU-3): `gpu/atomic-*` builtins (one `atomicrmw`/`cmpxchg` each: PTX `atom.*`, WGSL `atomic<u32>` buffers), `fib.gpu.atomic`, block reductions over shared memory
+  (`fib.gpu.reduce`) and grid reductions (`fib.gpu.reduce-kernels`) whose integer results equal the CPU's and whose f32 per-block partials are the CPU's bit for bit, run on the
+  RTX 4080 SUPER through PTX and through WebGPU by `compiler/tests/native/gpu-device.sh` ([the GPU design](docs/design/gpu.md) section 12; pinned/async transfers are not done).
 - WebGPU (the second kernel backend, WEBGPU-1): `fibc build --target wgsl-unknown-webgpu --emit wgsl` prints the same kernels as WGSL
   compute shaders ([the WebGPU design](docs/design/webgpu.md): the mapping of the kernel subset to WGSL, what is refused by name (i64, f64,
   pointer arithmetic beyond an index, builtins WGSL lacks), the binding model, the trap flag). They run on the native host through
