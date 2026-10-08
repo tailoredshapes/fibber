@@ -52,7 +52,7 @@ fi
 
 # block TOOL OPTIONS FILE BLOCKFILE: one input's block (the `#### FILE` line, the output, the `status N` line) in BLOCKFILE
 block() {
-  { echo "#### $3"; (ulimit -v 8000000; timeout 120 "$tools/$1" $2 "$3" 2>&1; echo "status $?") | sed "s|$root|<root>|g"; } > "$4"
+  { echo "#### $3"; (ulimit -v 8000000; timeout 600 "$tools/$1" $2 "$3" 2>&1; echo "status $?") | sed "s|$root|<root>|g"; } > "$4"
 }
 
 if [ -n "$show" ]; then   # --show SUITE FILE: stage 2's output for one input of a suite

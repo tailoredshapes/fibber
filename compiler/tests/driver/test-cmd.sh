@@ -127,5 +127,11 @@ EOF
 (unset FIB_LIB; cd "$t/away" && $s2 test -I "$root/lib" -I "$t/extra" uses-spec.fib > "$t/away.out" 2>&1); ck "-I lib and -I DIR from another directory, FIB_LIB unset: exit 0" $? 0
 (unset FIB_LIB; cd "$t/away" && $s2 test uses-spec.fib > /dev/null 2>&1); ck "the same without -I: exit 2 (no library, no module root)" $? 2
 (unset FIB_LIB; cd "$t/away" && $s2 test -I "$root/lib" uses-spec.fib > /dev/null 2>&1); ck "with the library but without the module root: exit 2" $? 2
+# DARWIN-3: a spec file that dies (any end that is no report: here a status of 77) is counted in the total and fails the run
+mkdir -p "$t/died"; cp "$t/specs/good-spec.fib" "$t/died/good-spec.fib"
+echo '(ns main) (defun main () -> i64 77)' > "$t/died/dies-spec.fib"
+$s2 test died > "$t/od" 2> /dev/null; ck "a spec file that dies: exit 1" $? 1
+ck "a spec file that dies: the total line says so" "$(grep '^total:' "$t/od" | grep -c ', 1 died ')" 1
+ck "a spec file that dies: DIED is reported" "$(grep -c 'DIED' "$t/od")" 1
 echo "test-cmd: $([ $fail = 0 ] && echo ok || echo FAILED)"
 exit $fail

@@ -3,7 +3,7 @@
 ;; goes on after the block with bytes that look like a valid offset (1 0 1 0 ..): a read past the end would make the last sequence take a match that is not there and the output would have
 ;; extra bytes. The output side: the buffer is surrounded by 0xAA canaries and must come out with the data in the range and the canaries untouched, for blocks of text, random bytes, runs,
 ;; patterns of every period from 1 to 20 (every small-offset path) and records, fast and HC, at 1500 sizes. `scripts/mutant-lz4.sh` plants a wrong limit on each side; this kills it.
-(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.rng fib.compress.types fib.compress.corpus fib.compress.lz4 fib.compress.lz4.mem fib.compress.lz4.blockdec))
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.rng fib.compress.types fib.compress.corpus fib.compress.lz4 fib.compress.lz4.mem fib.compress.lz4.blockdec) (:require [fib.os.platform.detect :as pd]))
 
 (defun gens () -> (Vec (fn (i64 i64) (Array i8)))
   [(fn (seed: i64 n: i64) (text seed n)) (fn (seed: i64 n: i64) (random-bytes seed n)) (fn (seed: i64 n: i64) (runs seed n))
@@ -59,13 +59,17 @@
 (extern mprotect :private (ptr i64 i32) -> i32)
 
 (defun null-ptr () -> ptr (let [slot (array 1 0)] (unsafe (load-ptr (ptr+ (raw slot) 24)))))
+;; The guard is one "page" of 16 KiB, the largest page of the systems we run on (Apple silicon: 16 KiB; Linux x86-64: 4 KiB, where it is four pages): mprotect wants a multiple of the
+;; page size and the block must end exactly at the guard. MAP_PRIVATE|MAP_ANON is 0x22 on Linux and 0x1002 on macOS (DARWIN-3: the Linux value died with status 139 on the Mac).
+(def pg: i64 16384)
+(defun anon-flags () -> i32 (if (= (pd/name (pd/current)) "Darwin") 4098i32 34i32))
 (defun guarded () -> ptr
-  (let [p (unsafe (mmap (null-ptr) 8192 3 34 -1 0))]
-    (do (unsafe (mprotect (ptr+ p 4096) 4096 0)) p)))
+  (let [p (unsafe (mmap (null-ptr) (* 2 pg) 3 (anon-flags) -1 0))]
+    (do (unsafe (mprotect (ptr+ p pg) pg 0)) p)))
 
 ;; The block of d placed to end at the guard, decoded into an ordinary array.
 (defun guard-input-ok? (g: ptr d: (Array i8) hc: bool) -> bool
-  (let [z (block-of d hc) zl (array-len z) at (- 4096 zl) out (array (+ (array-len d) 64) 0i8)]
+  (let [z (block-of d hc) zl (array-len z) at (- pg zl) out (array (+ (array-len d) 64) 0i8)]
     (if (> zl 4000) true
       (do (copy-exact g at (data z) 0 zl)
           (let [r (decode-block (unsafe (ptr+ g at)) zl (data out) (array-len out) 0 0 (array-len d))]
@@ -73,10 +77,10 @@
 
 ;; The block decoded into the range that ends at the guard (dlen = cap = the end of the page).
 (defun guard-output-ok? (g: ptr d: (Array i8) hc: bool) -> bool
-  (let [z (block-of d hc) n (array-len d) at (- 4096 n)]
+  (let [z (block-of d hc) n (array-len d) at (- pg n)]
     (if (> n 4000) true
-      (let [r (decode-block (data z) (array-len z) g 4096 at at 4096)]
-        (and (= r 4096) (bytes-eq (fill n (fn (i: i64) (unsafe (zext i64 (load-i8 (ptr+ g (+ at i))))))) d))))))
+      (let [r (decode-block (data z) (array-len z) g pg at at pg)]
+        (and (= r pg) (bytes-eq (fill n (fn (i: i64) (unsafe (zext i64 (load-i8 (ptr+ g (+ at i))))))) d))))))
 
 
 ;; ---- BAD OFFSETS in long blocks (the fast and medium paths, not only the slow one): the positions of the offsets of a block are found by walking its sequences; a block with any ONE of
