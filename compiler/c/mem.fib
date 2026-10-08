@@ -148,12 +148,16 @@
                     (emit! cf (str "for (;;) { " nw " = " (rmw-new op t dst v) "; if (__atomic_compare_exchange(" (atomic-ptr cf t p)
                                    ", &" dst ", &" nw ", 0, " (order-c o) ", __ATOMIC_RELAXED)) break; }")))))))))
 
+;; The operands of a `cmpxchg`, as C text: the pointer, the expected and the new value. (A record, not nine parameters: stack-passed arguments of a `tailcc`
+;; function ended in a call crash on AArch64 under the seed's code generator, lir2c on macOS, DARWIN-2.)
+(defstruct CmpX (weak: bool so: LOrdering fo: LOrdering t: LType p: str x: str n: str))
+
 ;; `{ T, i1 }`: the old value and whether the exchange happened.
-(defun cmpxchg! (cf: Cf weak: bool so: LOrdering fo: LOrdering t: LType p: str x: str n: str dst: str) -> unit
-  (let ((nw (lvalue! cf t n)))
-    (do (emit! cf (str dst ".f0 = " x ";"))
-        (emit! cf (str dst ".f1 = (uint8_t)__atomic_compare_exchange(" (atomic-ptr cf t p) ", &" dst ".f0, &" nw ", " (if weak "1" "0") ", "
-                       (order-c so) ", " (order-c fo) ");")))))
+(defun cmpxchg! (cf: Cf a: CmpX dst: str) -> unit
+  (let ((nw (lvalue! cf (. a t) (. a n))))
+    (do (emit! cf (str dst ".f0 = " (. a x) ";"))
+        (emit! cf (str dst ".f1 = (uint8_t)__atomic_compare_exchange(" (atomic-ptr cf (. a t) (. a p)) ", &" dst ".f0, &" nw ", " (if (. a weak) "1" "0") ", "
+                       (order-c (. a so)) ", " (order-c (. a fo)) ");")))))
 
 (defun fence! (cf: Cf sc: LScope o: LOrdering) -> unit
   (emit! cf (str (if (= sc ScSingleThread) "__atomic_signal_fence(" "__atomic_thread_fence(") (order-c o) ");")))
