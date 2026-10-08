@@ -1,0 +1,38 @@
+;; spec:   types §8.8 (amended 2026-10-07, P-sched: traps in pool tasks in a program that catches); docs/adr/0009; rt/sched.lir
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; In a program that catches (it has a `try`), the pool runner calls the task's closure under a catch of its own, so a trap in a pool task
+;; unwinds to the runner wherever the task runs: on a worker, and on main itself, which in such a program runs the task it joins when
+;; nobody took it first (a fork followed at once by its join). `try-join` answers the message; `join` of the failed task traps in the joiner
+;; and that trap is caught by the joiner's `try`; the worker count is unchanged (no thread ended); a struct result (a two-leaf value here)
+;; goes through the failure slot and still arrives. Nothing is abandoned: the runner unwound, so every frame released what it held (the
+;; audit is clean, where the same program without a `try` abandons what the trapping tasks owned: case 8641).
+(ns main (:use fib.core fib.ex fib.async fib.parallel fib.os tl.check))
+
+(defstruct Pt (x: i64 y: i64))
+
+(defun msg (r: (Result i64 Trap)) -> str (match r ((Err t) (. t message)) ((Ok v) "no trap")))
+
+(defun main () -> i64
+  (let [c (checks)
+        w (pool-workers)
+        ;; forked and joined at once: main runs it itself (or a worker took it); either way the trap is the task's failure
+        r1 (try-join (fork-task (fn () (do (trap "inline boom") 0))))
+        ;; a task that a worker runs (main is busy sleeping meanwhile)
+        t2 (fork-task (fn () (do (trap "worker boom") 0)))
+        _ (sleep-ns 10000000)
+        r2 (try-join t2)
+        caught (try (join (fork-task (fn () (do (quot 1 (- w w)) 0)))) (catch e (if (= (ex-message e) "integer / by zero") 10 0)))
+        pt (join (fork-task (fn () (Pt 4 5))))
+        tasks (vec (map (fn (i) (fork-task (fn () (if (= i 3) (trap "three") i)))) (range 8)))
+        oks (count (filter (fn (t: (Task i64)) (match (try-join t) ((Ok _) true) ((Err _) false))) tasks))]
+    (do (check c (= (msg r1) "inline boom"))
+        (check c (= (msg r2) "worker boom"))
+        (check c (= caught 10))
+        (check c (= (+ (. pt x) (. pt y)) 9))
+        (check c (= oks 7))
+        (check c (= (pool-live-workers) w))
+        (checks-result c))))

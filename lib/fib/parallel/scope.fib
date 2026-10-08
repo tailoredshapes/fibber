@@ -5,7 +5,7 @@
 ;;           b (fork s (fn () (parse y)))]
 ;;       (+ @a @b)))
 ;;
-;; `fork` is `spawn` that records the task in the scope. On exit `with-tasks` joins every task of the scope in the order of
+;; `fork` is `fork-task` (a pool task, P-sched) that records the task in the scope. On exit `with-tasks` joins every task of the scope in the order of
 ;; creation with `try-join` (so a trap in one does not stop the others being joined), then, if any of them trapped, traps in
 ;; the scope's joiner with the FIRST trap's message, exactly as `join` of that task would. `try-with-tasks` returns
 ;; `(Err (Trap message))` instead of trapping; the body's own value is `(Ok v)` otherwise.
@@ -13,18 +13,20 @@
 ;; What it does not do (stage 1 of exceptions, docs/design/exceptions.md 8): the siblings of a task that trapped are NOT
 ;; cancelled (there is no interrupt flag yet; they run to completion and are joined), a task that trapped abandons what its
 ;; frames and its closure owned (the audit says `abandoned`), and a trap in the BODY of the scope (not in a task) ends the
-;; process as every trap outside a task does, without joining the scope's tasks. The scope has no bound on live tasks (every
-;; `fork` is an OS thread, one per task): code that forks per item must use `pmap`/`pfor`, which run at most `workers` tasks.
-;; A scope holds tasks of one result type `a` (a scope of `unit` tasks is the usual one for effects).
+;; process as every trap outside a task does, without joining the scope's tasks. A task of the scope is a pool task, not a thread:
+;; a scope may fork per item (a fork costs about as much as a call: docs/shootout/parallel.md), and the pool's workers bound the
+;; parallelism. A scope holds tasks of one result type `a` (a scope of `unit` tasks is the usual one for effects).
 (ns fib.parallel.scope (:use fib.core fib.seq fib.coll fib.async))
 
 (defstruct (Scope a) (tasks: (Cell (Vec (Task a)))))
 
 (defun new-scope () -> (Scope a) (Scope (cell [])))
 
-;; Starts `f` on a thread of its own and records it in the scope; the task can be waited for at once with `@t`.
+;; Forks `f` onto the work-stealing pool (`fork-task`, docs/design/parallelism.md 3.1) and records it in the scope; the task can be
+;; waited for at once with `@t`. A task of the pool must not spin-wait for another pool task (it may block only through joins; `spawn`
+;; is the tier for a task that waits by reading an atom), and a call that blocks in the OS on a worker goes under `blocking`.
 (defun fork (s: (Scope a) f: (fn :send () a)) -> (Task a)
-  (let [t (spawn f)]
+  (let [t (fork-task f)]
     (do (set! (. s tasks) (conj @(. s tasks) t)) t)))
 
 ;; Joins every task of the scope, in the order of creation, and says what the first that trapped said, if any.

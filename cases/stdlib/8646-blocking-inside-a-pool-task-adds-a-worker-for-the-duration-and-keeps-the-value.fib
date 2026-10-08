@@ -1,0 +1,35 @@
+;; spec:   docs/design/parallelism.md 3.1 ("Blocking"); lib/fib/parallel.fib (blocking); lib/fib/os/sched.fib; rt/sched.lir
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; `(blocking body ..)` inside a pool task tells the pool that the body blocks in the OS: the pool starts one more worker (the count of live
+;; workers goes above the worker count by one for one blocking task; two at once make it two, bounded by 2W) and the pool keeps running
+;; other tasks meanwhile (a task forked during the sleep completes before the sleep ends on a pool of any size, since the sleeping worker's
+;; replacement is there to run it). The value of the form is the body's. Outside a pool task `blocking` is the body alone and starts nothing.
+(ns main (:use fib.core fib.parallel fib.os tl.check))
+
+(defun main () -> i64
+  (let [c (checks)
+        w (pool-workers)
+        outside (blocking (+ 20 22))
+        live0 (pool-live-workers)
+        inside (join (fork-task (fn () (blocking (do (sleep-ns 30000000) (pool-live-workers))))))
+        ;; two blocking tasks at once
+        a (fork-task (fn () (blocking (do (sleep-ns 40000000) 1))))
+        b (fork-task (fn () (blocking (do (sleep-ns 40000000) 2))))
+        both (+ (join a) (join b))
+        ;; with every worker blocked, a fork made meanwhile still completes: the replacements run it
+        blockers (vec (map (fn (i) (fork-task (fn () (blocking (do (sleep-ns 60000000) i))))) (range w)))
+        quick (join (fork-task (fn () 9)))
+        blocked-sum (reduce (fn (acc: i64 t: (Task i64)) (+ acc (join t))) 0 blockers)]
+    (do (check c (= outside 42))
+        (check c (or (= live0 0) (= live0 w)))
+        (check c (= inside (+ w 1)))
+        (check c (= both 3))
+        (check c (= quick 9))
+        (check c (= blocked-sum (quot (* w (- w 1)) 2)))
+        (check c (<= (pool-live-workers) (* 2 w)))
+        (check c (> (pool-live-workers) w))
+        (checks-result c))))

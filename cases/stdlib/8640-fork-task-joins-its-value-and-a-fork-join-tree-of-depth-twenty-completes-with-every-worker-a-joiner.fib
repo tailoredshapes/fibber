@@ -1,0 +1,40 @@
+;; spec:   types §8.8 (amended 2026-10-07, P-sched: fork-task); docs/design/parallelism.md 3.1 (join = help-while-waiting); rt/sched.lir
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; `(fork-task f)` makes a pool task whose `join` is `f`'s value, and the pool runs it on a worker thread (the task sees itself as a
+;; worker; main is not one). A binary fork-join tree of depth 20 (a million leaves, every inner task a joiner of two children) completes
+;; and sums right: with W workers all of them are joiners most of the time, so a join that parked instead of helping (running the joined
+;; task itself, or other tasks meanwhile) would deadlock the pool with W tasks waiting on children nobody runs (scripts/mutant-sched.sh
+;; `park-not-help` hangs this case). A chain of 5000 nested forks and joins completes too (a joiner runs an unstarted child itself, so the chain nests on
+;; one worker's stack as the same recursion without tasks would).
+(ns main (:use fib.core fib.parallel fib.os tl.check))
+
+(defun tree (depth: i64 at: i64) -> i64
+  (if (= depth 0)
+      at
+      (let [l (fork-task (fn () (tree (- depth 1) (* at 2))))
+            r (tree (- depth 1) (+ (* at 2) 1))]
+        (+ (join l) r))))
+
+;; the sum of the leaves [2^d, 2^(d+1)) of the tree rooted at 1
+(defun leaf-sum (depth: i64) -> i64
+  (let [lo (shl 1 depth)]
+    (loop [i lo acc 0] (if (< i (* lo 2)) (recur (+ i 1) (+ acc i)) acc))))
+
+(defun chain (n: i64) -> i64
+  (if (= n 0) 0 (+ 1 (join (fork-task (fn () (chain (- n 1))))))))
+
+(defun main () -> i64
+  (let [c (checks)
+        t (fork-task (fn () (if (pool-worker?) 41 0)))
+        v (join t)]
+    (do (check c (= v 41))
+        (check c (not (pool-worker?)))
+        (check c (pool-started?))
+        (check c (>= (pool-workers) 1))
+        (check c (= (tree 20 1) (leaf-sum 20)))
+        (check c (= (join (fork-task (fn () (chain 5000)))) 5000))
+        (checks-result c))))

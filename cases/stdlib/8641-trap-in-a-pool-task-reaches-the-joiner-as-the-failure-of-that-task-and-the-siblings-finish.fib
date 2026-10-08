@@ -1,0 +1,36 @@
+;; spec:   types §8.8 (amended 2026-10-07, P-sched: traps in pool tasks); docs/adr/0001; docs/design/parallelism.md 3.1 (trap policy); rt/sched.lir
+;; expect: accept
+;; result: 0
+;; audit:  abandoned
+;; leaks:  7
+;; stage:  2
+;; roots:  ../../lib support
+;; A trap in a pool task is that task's failure, exactly as a spawned task's: `try-join` answers `(Err (Trap message))` with the original
+;; message, a task that did not trap is unaffected, a task that traps inside a nested join fails the task that was joining it (its joiner
+;; would have trapped on it), and the pool goes on: the worker that ran the trapping task is replaced and later tasks run (the pool's count
+;; of live workers is still the worker count; the tasks-run counter grows). The program does not catch, so the trap cannot unwind: the
+;; worker's thread ends and what the trapped tasks' frames owned is abandoned (7 objects: what the three failed tasks' frames held,
+;; the share-marked messages among them), the same on every run.
+(ns main (:use fib.core fib.async fib.parallel fib.os tl.check))
+
+(defun msg (r: (Result i64 Trap)) -> str (match r ((Err t) (. t message)) ((Ok v) "no trap")))
+
+(defun main () -> i64
+  (let [c (checks)
+        hits (atom 0)
+        bad (fork-task (fn () (do (swap! hits inc) (trap "pool boom") 0)))
+        good (fork-task (fn () (do (sleep-ns 2000000) (swap! hits inc) 42)))
+        rb (try-join bad)
+        rg (try-join good)
+        ;; a task whose join of a trapping child is not under try: its own failure is the child's message
+        outer (fork-task (fn () (+ 1 (join (fork-task (fn () (do (quot 7 (- (vec-count [1]) 1)) 2)))))))
+        ro (try-join outer)
+        after (join (fork-task (fn () (do (swap! hits inc) 7))))]
+    (do (check c (= (msg rb) "pool boom"))
+        (check c (match rg ((Ok v) (= v 42)) ((Err _) false)))
+        (check c (= (msg ro) "integer / by zero"))
+        (check c (= after 7))
+        (check c (= @hits 3))
+        (check c (= (pool-live-workers) (pool-workers)))
+        (check c (>= (pool-tasks-run) 4))
+        (checks-result c))))

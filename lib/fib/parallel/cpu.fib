@@ -16,7 +16,7 @@
 ;;
 ;; `max-workers` bounds the pool: under `ulimit -v 16000000` about 250 live threads exhaust the address space,
 ;; because every allocating thread gets a 64 MB malloc arena; a pool of at most `max-workers` threads never gets near that.
-(ns fib.parallel.cpu (:use fib.core fib.seq fib.coll fib.os))
+(ns fib.parallel.cpu (:use fib.core fib.seq fib.coll fib.os fib.os.sched))
 
 (defun max-workers () -> i64 64)
 
@@ -85,5 +85,10 @@
 
 (defun online-cpus () -> i64 (match (available-cpus) ((Ok n) n) ((Err e) 0)))
 
-;; The number of workers a parallel call uses unless it is told otherwise.
-(defun cpu-count () -> i64 (least-known (online-cpus) (affinity-cpus) (cgroup-cpus)))
+;; The number of workers a parallel call uses unless it is told otherwise: the pool's own count (rt/sched.lir: FIB_THREADS, else the
+;; affinity mask capped by the cgroup v2 quota), never above what this module's own reading of the files says (`detected-cpus`, which
+;; also knows cgroup v1) and never above `max-workers`.
+(defun cpu-count () -> i64 (max 1 (min (pool-workers) (detected-cpus))))
+
+;; The count from the files alone, as before the pool: the least of online, affinity and quota.
+(defun detected-cpus () -> i64 (least-known (online-cpus) (affinity-cpus) (cgroup-cpus)))

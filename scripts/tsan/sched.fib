@@ -1,0 +1,47 @@
+;; scripts/tsan/sched.fib: threaded kernels of the work-stealing pool (rt/sched.lir, rt/deque.lir; docs/design/parallelism.md 3.1) for
+;; scripts/tsan.sh (scripts/tsan-suite.txt lists them). Each returns 0 when its answer is right and 1 when it is not, so a TSAN run also
+;; checks the answer. The deque's accesses are all atomic (TSAN cannot see a weakened fence there: the stress mutants of
+;; scripts/mutant-sched.sh are for that); what TSAN sees is the plain memory around it: the worker records, the chain, the injector nodes,
+;; the waiter nodes, the task's slots and the result atoms.
+;;   tree D         a fork-join tree of depth D (every worker a joiner; stealing, inline runs, parking on a task)
+;;   storm N        N fork+join rounds by one pool task (push, pop, claim) and N from main (the injector, a parked joiner)
+;;   wide N         N tasks forked before any is joined, from a task and from main (thieves on one deque; the injector)
+;;   pmap N         pmap, pfor and preduce of fib.parallel over N items on the pool
+;;   nested N       a pmap whose body pmaps (forks inside forks)
+;;   trap N         N pool tasks that trap, each asked with try-join (the chain, the worker replacement)
+;;   blocking N     N tasks each under `blocking` (a spare worker started)
+(ns main (:use fib.core fib.async fib.parallel fib.os))
+
+(defun tree (d: i64) -> i64
+  (if (= d 0) 1
+      (let ((t (fork-task (fn () (tree (- d 1))))) (b (tree (- d 1))))
+        (+ (join t) b))))
+
+(defun storm (n: i64) -> i64
+  (loop ((i 0) (acc 0)) (if (< i n) (recur (+ i 1) (+ acc (join (fork-task (fn () i))))) acc)))
+
+(defun wide (n: i64) -> i64
+  (let ((ts (loop ((i 0) (out [])) (if (< i n) (recur (+ i 1) (conj out (fork-task (fn () (* i 2))))) out))))
+    (reduce (fn (acc: i64 t: (Task i64)) (+ acc (join t))) 0 ts)))
+
+(defun run (kind: str n: i64) -> i64
+  (cond (= kind "tree") (if (= (join (fork-task (fn () (tree n)))) (shl 1 n)) 0 1)
+        (= kind "storm") (if (and (= (join (fork-task (fn () (storm n)))) (quot (* n (- n 1)) 2)) (= (storm n) (quot (* n (- n 1)) 2))) 0 1)
+        (= kind "wide") (if (and (= (join (fork-task (fn () (wide n)))) (* n (- n 1))) (= (wide n) (* n (- n 1)))) 0 1)
+        (= kind "pmap") (if (and (= (pmap (Par (cpu-count) 7 false) (fn (x) (* x x)) (vec (range n))) (mapv (fn (x) (* x x)) (vec (range n))))
+                                 (= (preduce + 0 (fn (x) x) (vec (range n))) (quot (* n (- n 1)) 2))
+                                 (let ((hits (atom 0))) (do (pfor n (fn (i) (do (swap! hits inc) ()))) (= @hits n))))
+                            0 1)
+        (= kind "nested") (if (= (reduce + 0 (pmap (fn (i) (reduce + 0 (pmap (fn (j) (+ i j)) (vec (range n))))) (vec (range n))))
+                               (* n (* n (- n 1))))
+                            0 1)
+        (= kind "trap") (let ((ts (vec (map (fn (i) (fork-task (fn () (if (= (rem i 3) 0) (trap "planted") i)))) (range n)))))
+                          (let ((bad (count (filter (fn (t: (Task i64)) (match (try-join t) ((Err e) (= (. e message) "planted")) ((Ok _) false))) ts))))
+                            (if (= bad (quot (+ n 2) 3)) 0 1)))
+        (= kind "blocking") (let ((ts (vec (map (fn (i) (fork-task (fn () (blocking (do (sleep-ns 1000000) i))))) (range n)))))
+                              (if (= (reduce (fn (acc: i64 t: (Task i64)) (+ acc (join t))) 0 ts) (quot (* n (- n 1)) 2)) 0 1))
+        :else 2))
+
+(defun main () -> i64
+  (let ((a (args)))
+    (run (nth a 0) (unwrap (parse-long (nth a 1))))))
