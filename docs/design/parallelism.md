@@ -480,3 +480,22 @@ The LZ4 codec's parallel engine (`fib.compress.par`, COMPRESS-3) forks its runne
 
 Measurements, planted-fault results and TSAN: `docs/shootout/parallel.md` ("P-sched"). Mutants: `scripts/mutant-sched.sh`; planted race: `scripts/tsan-planted.sh pool-handoff`; cases 8640 to 8648.
 Not done: `:grain`-controlled adaptive splitting, `pcalls`/`pvalues`, cancellation, arm64 stress runs, a model-checked deque, per-worker small-block allocator cache (see the allocator note in shootout).
+
+## DARWIN-3: idle workers that spin, measured
+
+Case 8645 (a million tiny tasks forked and joined by one pool task) on an M1 Ultra, seconds for 10 runs at `FIB_THREADS` = 1, 2, 4, 8, 16, 20:
+
+| | 1 | 2 | 4 | 8 | 16 | 20 |
+|---|---|---|---|---|---|---|
+| before (every idle worker spins 32 rounds of `sched_yield`) | 1.11 | 1.25 | 2.40 | 8.76 | 12.37 | 7.07 |
+| `FIB_SPIN=0` (park at once) | 0.99 | 1.16 | 1.57 | 9.66 | 38.76 | 40.33 |
+| after: at most 2 idle workers spin (`FIB_SPINNERS`, default 2) | 1.06 | 1.15 | 2.07 | 4.08 | 4.45 | 4.39 |
+| `FIB_SPINNERS=1` | 0.97 | 1.14 | 1.82 | 3.80 | 4.20 | 4.26 |
+| `FIB_SPINNERS=0` | 0.98 | 1.10 | 1.62 | 9.46 | 38.52 | 39.84 |
+
+A `sample` of the process at 8 workers: 2,784 samples in `swtch_pri` (`sched_yield` is a system call on Darwin) against 708 in `psynch_cvwait`: seven idle workers each yielding and sweeping every deque for a task
+the owner was about to pop itself. Parking at once is worse (every fork wakes a sleeper that finds the task gone), so the cap is the cure: `fib.sched-idle` counts the spinners in `fib.sched-idlers` and a worker
+that finds it at the cap parks without spinning. x86-64 Linux (28 CPUs, this box) shows the same shape, 0.87 s at one worker and 15.2 s at 28, and 7.4 s with the cap; a CPU-bound `pmap` and a fork tree
+are unchanged (0.43 / 0.09 / 0.04 s for 3 runs at 1 / 8 / 28 workers with and without it). What is left (4x at 8 workers on the Mac) is the steal of tasks that cost less than the steal: tried and not
+kept, a flag that stops a fork from signalling while a signalled sleeper has not yet woken (4.1 s, within the noise). The kill checks that can run here: `scripts/mutant-sched.sh check` (25 cases at 1, 2, 3
+workers) and `lost-wakeup` (killed), and the stress kernels `gap`, `storm`, `tree`, `wide` at 4, 8 and 28 workers (all exit 0).
