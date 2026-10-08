@@ -15,6 +15,8 @@
 #   slack-dlim / slack-ilim   blockdec: the fast path's output / input slack is too small (killed by the safety spec's canaries)   fast-small-pattern   blockdec: small offsets use a distance of 8
 #   xxh-vector-rot    xxh32: the vector round rotates by 14           par-order  par-race-window  par-lost-job  par-max-output  par-thread-dependent  par-error-swallowed  par-trap-kills  par-checksum-skipped (see docs/design/compress.md 9)
 #   linked-lo         framedec: a later frame may reach into the first   fast-copy-8      blockdec: the fast path copies 16 bytes at a distance of 8
+#   mid-islack mid-dslack  blockdec: the medium path's input / output slack is too small   mid-offset  the medium path checks only for offset 0   mid-pattern  small offsets use a distance of 8
+#   par-nested-threads  par: runners are OS threads again (a call inside a pmap body multiplies them)   par-unbounded-flight  par: one runner per job, whatever `threads` says
 set -uo pipefail
 R=$(cd "$(dirname "$0")/.." && pwd)
 FIBC=${FIBC:-$HOME/.cache/fibber-scratch/gate-$(basename "$R")/F}
@@ -22,7 +24,8 @@ FIBC=${FIBC:-$HOME/.cache/fibber-scratch/gate-$(basename "$R")/F}
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-lz4}
 MUTANTS=("$@")
 [ ${#MUTANTS[@]} -gt 0 ] || MUTANTS=(slack-dlim slack-ilim fast-small-pattern xxh-vector-rot par-order par-race-window par-lost-job par-max-output par-thread-dependent par-error-swallowed par-trap-kills par-checksum-skipped last-literals offset-65536 overlap-memmove nibble-overflow ext-255 no-verify match-past-end cap-off-by-one skip-content-crc skip-block-crc
-                                     skip-header-crc block-crc-bytes dict-base stale-table hc-depth-zero reserved-bit offset-check fast-offset-0 linked-lo fast-copy-8)
+                                     skip-header-crc block-crc-bytes dict-base stale-table hc-depth-zero reserved-bit offset-check fast-offset-0 linked-lo fast-copy-8
+                                     mid-islack mid-dslack mid-offset mid-pattern par-nested-threads par-unbounded-flight)
 
 sub() { perl -0pi -e "$2" "$1"; cmp -s "$1" "$1.orig" && { echo "mutant-lz4: pattern not found in $1: $2" >&2; return 1; }; return 0; }
 mutate() { # mutate NAME TREE
@@ -48,7 +51,7 @@ mutate() { # mutate NAME TREE
     fast-offset-0)    f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(ult \(u- \(rd16 ip \(u\+ \(u\+ i 1\) lit\)\) 1\) \(u- \(u\+ op lit\) lo\)\)/(<= (rd16 ip (u+ (u+ i 1) lit)) (u- (u+ op lit) lo))/' ;;
     linked-lo)        f=$d/framedec.fib; cp $f $f.orig; sub $f 's/\(if first 0 op\) cap/0 cap/' ;;
     fast-copy-8)      f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(cond \(>= off 16\) \(do \(cp16 dp op2 dp/(cond (>= off 8) (do (cp16 dp op2 dp/' ;;
-    fast-small-pattern) f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(let \[s \(\* off \(quot \(u\+ 7 off\) off\)\) src/(let [s 8 src/' ;;
+    fast-small-pattern) f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(let \[s \(period8 off\) src/(let [s 8 src/' ;;
     slack-dlim)       f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(u- dlen 46\)/(u- dlen 30)/' ;;
     slack-ilim)       f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(u- ilen 17\)/(u- ilen 10)/' ;;
     xxh-vector-rot)   f=$d/xxh32.fib; cp $f $f.orig; sub $f 's/\(shl a \(vs 13\)\) \(shr a \(vs 19\)\)/(shl a (vs 14)) (shr a (vs 18))/' ;;
@@ -60,6 +63,12 @@ mutate() { # mutate NAME TREE
     par-error-swallowed) f=$d/pframedec.fib; cp $f $f.orig; sub $f 's/\(if \(= \(\. e kind\) :internal\) \(Err e\) \(Ok nil\)\)/(if (= (. e kind) :internal) (Err e) (Ok (some (array 0 0i8))))/' ;;
     par-trap-kills)   f=$d/../par.fib; cp $f $f.orig; sub $f 's/\(Err \(internal \(str "a worker trapped: " \(\. e message\)\)\)\)/(trap "a worker trapped")/' ;;
     par-checksum-skipped) f=$d/pframedec.fib; cp $f $f.orig; sub $f 's/\(and \(\. o verify\) \(\. h cchk\)\)/false/' ;;
+    mid-islack)       f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(> \(u\+ i2 32\) ilenm\) 0/(> (u+ i2 8) ilenm) 0/' ;;
+    mid-dslack)       f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(> \(u\+ end 32\) dlenm\)/(> (u+ end 8) dlenm)/' ;;
+    mid-offset)       f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(not \(ult \(u- off 1\) \(u- op2 lo\)\)\)\) 0/(= off 0)) 0/' ;;
+    mid-pattern)      f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(far8 dp \(u\+ op2 24\) \(period8 off\) end\)/(far8 dp (u+ op2 24) 8 end)/' ;;
+    par-nested-threads) f=$d/../par.fib; cp $f $f.orig; sub $f 's/\(fork-task \(fn \(\) \(work next failed n job\)\)\)/(spawn (fn () (work next failed n job)))/' ;;
+    par-unbounded-flight) f=$d/../par.fib; cp $f $f.orig; sub $f 's/\(parallel \(min workers n\) n job\)/(parallel n n job)/' ;;
     *) echo "mutant-lz4: unknown mutant $1" >&2; return 1 ;;
   esac
 }

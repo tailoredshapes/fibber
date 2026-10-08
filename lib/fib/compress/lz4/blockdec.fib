@@ -62,10 +62,54 @@
   (cond (>= off 16) (do (cp16 dp op2 dp (u- op2 off)) (cp16 dp (u+ op2 16) dp (u- (u+ op2 16) off)))
         (>= off 8) (do (cp8 dp op2 dp (u- op2 off)) (cp8 dp (u+ op2 8) dp (u- (u+ op2 8) off)) (cp8 dp (u+ op2 16) dp (u- (u+ op2 16) off)))
         :else
-        (let [s (* off (quot (u+ 7 off) off)) src (u- op2 off)]
+        (let [s (period8 off) src (u- op2 off)]
           (do (wr8 dp op2 (rd8 dp src)) (wr8 dp (u+ op2 1) (rd8 dp (u+ src 1))) (wr8 dp (u+ op2 2) (rd8 dp (u+ src 2))) (wr8 dp (u+ op2 3) (rd8 dp (u+ src 3)))
               (wr8 dp (u+ op2 4) (rd8 dp (u+ src 4))) (wr8 dp (u+ op2 5) (rd8 dp (u+ src 5))) (wr8 dp (u+ op2 6) (rd8 dp (u+ src 6))) (wr8 dp (u+ op2 7) (rd8 dp (u+ src 7)))
               (cp8 dp (u+ op2 8) dp (u- (u+ op2 8) s)) (cp8 dp (u+ op2 16) dp (u- (u+ op2 16) s))))))
+
+;; ---- the MEDIUM path: a sequence with a long literal run or a long match (a nibble of 15, extension bytes), when the whole of it has room for wild copies.
+;; It reads the lengths with the bounded `ext-end`, then checks, once, everything its copies need, and declines (0) when any check fails: `slow-seq` then redoes the sequence from its
+;; start, so every error is the slow path's. Its SAFETY PROOF, with ilenm = min(ilen, 2^31), dlenm = min(dlen, 2^32 - 1000):
+;;   the literals are lit bytes at i1 and the offset is at i2 = i1 + lit; i2 + 32 <= ilenm: the 32-byte chunks of the literal copy read at most i1 + lit + 31 = i2 + 31 < ilenm, and the 2-byte offset
+;;     is inside; the match length's extension bytes are read by `ext-end`, which checks every index against ilen; the next position i4 < 2^31 fits the packed result.
+;;   op2 = op + lit; end = op2 + ml; end <= cap (no result byte at or past cap) and end + 32 <= dlenm: the literal chunks write at most op + lit + 31 < end + 32 and the match chunks at most
+;;     end + 31, all inside the buffer; the bytes written past `end` are not part of the result and are overwritten by the next sequence, as in the fast path; end < 2^32 fits the packed result.
+;;   1 <= off <= op2 - lo (one unsigned compare): the match reads only bytes in [lo, op2) and bytes this sequence wrote, in chunks of 32 (off >= 32), 16 (>= 16), 8 (>= 8) so that every chunk
+;;     reads bytes that are written by the chunks before it; below 8 the pattern's first 24 bytes are written by `fast-match` and the rest by 8-byte chunks from the least multiple of off that is >= 8.
+(defun wild32 (d: ptr from: i64 s: ptr sfrom: i64 end: i64) -> unit
+  (loop [k from] (when (< k end) (do (cp32 d k s (u+ sfrom (u- k from))) (recur (u+ k 32))))))
+(defun far32 (dp: ptr to: i64 off: i64 end: i64) -> unit
+  (loop [k to] (when (< k end) (do (cp32 dp k dp (u- k off)) (recur (u+ k 32))))))
+(defun far16 (dp: ptr to: i64 off: i64 end: i64) -> unit
+  (loop [k to] (when (< k end) (do (cp16 dp k dp (u- k off)) (recur (u+ k 16))))))
+(defun far8 (dp: ptr to: i64 off: i64 end: i64) -> unit
+  (loop [k to] (when (< k end) (do (cp8 dp k dp (u- k off)) (recur (u+ k 8))))))
+
+(defun period8 (off: i64) -> i64 (bit-and (shr 1012195045879056384 (shl off 3)) 255))
+
+(defun mid-match (dp: ptr op2: i64 off: i64 end: i64) -> unit
+  (cond (>= off 32) (far32 dp op2 off end)
+        (>= off 16) (far16 dp op2 off end)
+        (>= off 8) (far8 dp op2 off end)
+        :else (do (fast-match dp op2 off) (far8 dp (u+ op2 24) (period8 off) end))))
+
+(defun mid-seq (ip: ptr ilen: i64 ilenm: i64 dp: ptr dlenm: i64 lo: i64 cap: i64 i: i64 op: i64) -> i64
+  (let [tok (rd8 ip i) ln (shr tok 4) mn (bit-and tok 15)
+        le (if (= ln 15) (ext-end ip (u+ i 1) ilen) (u+ i 0))]
+    (if (< le 0) 0
+      (let [i1 (if (= ln 15) (u+ le 1) (u+ i 1))
+            lit (if (= ln 15) (ext-len ip (u+ i 1) le 15) ln)
+            i2 (u+ i1 lit)]
+        (if (> (u+ i2 32) ilenm) 0
+          (let [off (rd16 ip i2) i3 (u+ i2 2) op2 (u+ op lit)
+                me (if (= mn 15) (ext-end ip i3 ilen) i3)]
+            (if (or (< me 0) (not (ult (u- off 1) (u- op2 lo)))) 0
+              (let [i4 (if (= mn 15) (u+ me 1) i3)
+                    ml (u+ 4 (if (= mn 15) (ext-len ip i3 me 15) mn))
+                    end (u+ op2 ml)]
+                (if (or (> end cap) (> (u+ end 32) dlenm) (>= i4 2147483648)) 0
+                  (do (wild32 dp op ip i1 (u+ op lit)) (mid-match dp op2 off end)
+                      (bit-or (shl i4 32) end)))))))))))
 
 (defun fast? (ip: ptr i: i64 op: i64 ilim: i64 dlim: i64 lo: i64) -> bool
   (and (<= i ilim) (<= op dlim)
@@ -73,12 +117,15 @@
          (and (< lit 15) (< (bit-and tok 15) 15) (ult (u- (rd16 ip (u+ (u+ i 1) lit)) 1) (u- (u+ op lit) lo))))))
 
 (defun decode-block (ip: ptr ilen: i64 dp: ptr dlen: i64 op0: i64 lo: i64 cap: i64) -> i64
-  (let [ilim (min (u- ilen 17) 2147483000) dlim (min (min (u- dlen 46) (u- cap 32)) 4294967000)]
+  (let [ilim (min (u- ilen 17) 2147483000) dlim (min (min (u- dlen 46) (u- cap 32)) 4294967000)
+        ilenm (min ilen 2147483648) dlenm (min dlen 4294967000)]
     (loop [i 0 op op0]
       (if (fast? ip i op ilim dlim lo)
         (let [tok (rd8 ip i) lit (shr tok 4) i2 (u+ (u+ i 1) lit) op2 (u+ op lit)]
           (do (cp16 dp op ip (u+ i 1)) (fast-match dp op2 (rd16 ip i2)) (recur (u+ i2 2) (u+ op2 (u+ (bit-and tok 15) 4)))))
-        (let [r (slow-seq ip ilen dp dlen lo cap i op)]
-          (cond (< r 0) r
-                (>= r done-flag) (u- r done-flag)
-                :else (recur (shr r 32) (bit-and r 4294967295))))))))
+        (let [m (if (< i ilim) (mid-seq ip ilen ilenm dp dlenm lo cap i op) 0)]
+          (if (> m 0) (recur (shr m 32) (bit-and m 4294967295))
+            (let [r (slow-seq ip ilen dp dlen lo cap i op)]
+              (cond (< r 0) r
+                    (>= r done-flag) (u- r done-flag)
+                    :else (recur (shr r 32) (bit-and r 4294967295))))))))))

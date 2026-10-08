@@ -29,11 +29,12 @@
                    (loop [i 0] (cond (>= i 100) true (not (= (array-get dst i) -86i8)) false :else (recur (+ i 1))))
                    (loop [i (+ 100 (+ n extra))] (cond (>= i (array-len dst)) true (not (= (array-get dst i) -86i8)) false :else (recur (+ i 1)))))))))
 
-(defun failures (check: (fn (i64 i64 bool) bool) total: i64) -> i64
+(defun failures (check: (fn (i64 i64 bool) bool) total: i64) -> i64 (failures-to check total 600))
+(defun failures-to (check: (fn (i64 i64 bool) bool) total: i64 maxn: i64) -> i64
   (let [g (rng-new 77)]
     (loop [i 0 bad 0]
       (if (>= i total) bad
-        (let [n (rng-below g 600) seed (+ 1 (rng-below g 100000)) hc (= (rng-below g 3) 0)]
+        (let [n (rng-below g maxn) seed (+ 1 (rng-below g 100000)) hc (= (rng-below g 3) 0)]
           (recur (+ i 1) (if (check seed n hc) bad (+ bad 1))))))))
 
 (defspecs specs
@@ -41,6 +42,43 @@
     (scenario "input side: 1500 blocks decoded from inside a longer array give exactly the data (nothing is read past the length)"
       (then (expect = 0 (failures (fn (seed: i64 n: i64 hc: bool) (input-side-ok? ((nth (gens) (rem seed 6)) seed n) hc)) 1500))))
     (scenario "output side: 1500 blocks decoded into a range with canaries around it leave every canary alone, with the range exact and with 40 bytes of room to spare"
-      (then (expect = 0 (failures (fn (seed: i64 n: i64 hc: bool) (let [d ((nth (gens) (rem seed 6)) seed n)] (and (output-side-ok? d hc 0) (output-side-ok? d hc 40)))) 1500))))))
+      (then (expect = 0 (failures (fn (seed: i64 n: i64 hc: bool) (let [d ((nth (gens) (rem seed 6)) seed n)] (and (output-side-ok? d hc 0) (output-side-ok? d hc 40)))) 1500))))
+    (scenario "the medium path (long literal runs and matches, up to 6000 bytes): nothing is read past the input and nothing written outside the range, with none, 8, 33 and 40 bytes of room"
+      (then (expect = 0 (failures-to (fn (seed: i64 n: i64 hc: bool) (let [d ((nth (mid-gens) (rem seed 6)) seed n)] (and (input-side-ok? d hc) (output-side-ok? d hc 0) (output-side-ok? d hc 8) (output-side-ok? d hc 33) (output-side-ok? d hc 40)))) 600 6000))))
+    (scenario "guard pages: 2000 blocks (up to 4000 bytes, fast and HC, every generator) placed to END at an inaccessible page are decoded without reading one byte past them, and decoded into a range that ends at one without writing one byte past it"
+      (given [g (guarded)])
+      (then (expect = 0 (failures-to (fn (seed: i64 n: i64 hc: bool) (let [d ((nth (mid-gens) (rem seed 6)) seed n) d2 ((nth (gens) (rem seed 6)) seed (rem n 700))]
+                                                                          (and (guard-input-ok? g d hc) (guard-output-ok? g d hc) (guard-input-ok? g d2 hc) (guard-output-ok? g d2 hc)))) 2000 4000))))))
+
+;; ---- GUARD PAGES: the strongest form of the two proofs. Two pages are mapped and the second is made inaccessible; a block is placed so that it ENDS at the guard (a read of one byte past it is a
+;; SIGSEGV that kills this process, which is how `scripts/mutant-lz4.sh` kills a slack that is too small even when a wild read changes no byte of the result), and an output range is placed so that
+;; it ends at the guard with no room to spare (a wild write past it is the same crash).
+(extern mmap :private (ptr i64 i32 i32 i32 i64) -> ptr)
+(extern mprotect :private (ptr i64 i32) -> i32)
+
+(defun null-ptr () -> ptr (let [slot (array 1 0)] (unsafe (load-ptr (ptr+ (raw slot) 24)))))
+(defun guarded () -> ptr
+  (let [p (unsafe (mmap (null-ptr) 8192 3 34 -1 0))]
+    (do (unsafe (mprotect (ptr+ p 4096) 4096 0)) p)))
+
+;; The block of d placed to end at the guard, decoded into an ordinary array.
+(defun guard-input-ok? (g: ptr d: (Array i8) hc: bool) -> bool
+  (let [z (block-of d hc) zl (array-len z) at (- 4096 zl) out (array (+ (array-len d) 64) 0i8)]
+    (if (> zl 4000) true
+      (do (copy-exact g at (data z) 0 zl)
+          (let [r (decode-block (unsafe (ptr+ g at)) zl (data out) (array-len out) 0 0 (array-len d))]
+            (and (= r (array-len d)) (bytes-eq (array-copy out 0 (array-len d)) d)))))))
+
+;; The block decoded into the range that ends at the guard (dlen = cap = the end of the page).
+(defun guard-output-ok? (g: ptr d: (Array i8) hc: bool) -> bool
+  (let [z (block-of d hc) n (array-len d) at (- 4096 n)]
+    (if (> n 4000) true
+      (let [r (decode-block (data z) (array-len z) g 4096 at at 4096)]
+        (and (= r 4096) (bytes-eq (fill n (fn (i: i64) (unsafe (zext i64 (load-i8 (ptr+ g (+ at i))))))) d))))))
+
+;; Blocks of up to 6000 bytes take the decoder's MEDIUM path (long literal runs, long matches, extension bytes): the same two proofs at the larger sizes.
+(defun mid-gens () -> (Vec (fn (i64 i64) (Array i8)))
+  [(fn (seed: i64 n: i64) (runs seed n)) (fn (seed: i64 n: i64) (run-noise seed n)) (fn (seed: i64 n: i64) (text seed n))
+   (fn (seed: i64 n: i64) (cat2 (random-bytes seed (quot n 2)) (runs seed (- n (quot n 2))))) (fn (seed: i64 n: i64) (pattern seed (+ 1 (rem seed 40)) n)) (fn (seed: i64 n: i64) (records seed n))])
 
 (defun main () -> i64 (run-main (specs)))

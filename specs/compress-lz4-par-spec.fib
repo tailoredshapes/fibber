@@ -3,7 +3,8 @@
 ;; frames of many blocks (every kind of error in the middle of the frame: the same error kind whatever the worker count), and a fuzz of mutated many-block frames in which the
 ;; sequential and the parallel decoder must agree on every one.
 (ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.test.gen fib.rng fib.compress.types fib.compress.ops fib.compress.corpus fib.compress.gen fib.compress.lz4
-               fib.compress.lz4.mem fib.compress.lz4.header fib.compress.lz4.xxh32 fib.compress.par fib.compress.lz4.pframe fib.compress.lz4.pframedec fib.compress.lz4.framedec fib.compress.lz4.frame fib.compress.lz4.block))
+               fib.compress.lz4.mem fib.compress.lz4.header fib.compress.lz4.xxh32 fib.compress.par fib.compress.lz4.pframe fib.compress.lz4.pframedec fib.compress.lz4.framedec fib.compress.lz4.frame fib.compress.lz4.block)
+  (:require [fib.os.time :as time] [fib.os.process :as proc] [fib.os.sched :as sched] [fib.parallel :as par]))
 
 (defun bytes-of (v: (Vec i64)) -> (Array i8) (fill (count v) (fn (i: i64) (nth v i))))
 (defun ok-bytes (r: (Result (Array i8) CompressError)) -> (Array i8) (match r ((Ok b) b) ((Err _) (array 0 0i8))))
@@ -22,6 +23,22 @@
 (defun err-message (r: (Result (Vec i64) CompressError)) -> str (match r ((Ok _) "") ((Err e) (. e message))))
 (defun values-ok? (workers: i64 n: i64) -> bool
   (match (run-jobs workers n (fn (i: i64) (Ok (* i i)))) ((Ok v) (= v (vec (map (fn (i: i64) (* i i)) (range n))))) ((Err _) false)))
+
+;; The most jobs that were in flight at once: each job sleeps a moment, so a runner that is not bounded shows.
+(defun inflight-max (workers: i64 n: i64) -> i64
+  (let [now (atom 0) top (atom 0)]
+    (do (run-jobs workers n (fn (i: i64) (let [c (swap! now inc)]
+                                            (do (swap! top (fn (m: i64) (max m c))) (time/sleep-ns 2000000) (swap! now (fn (k: i64) (- k 1))) (Ok i)))))
+        @top)))
+
+;; Round trips inside the body of a pmap with `threads` 8: the threads the process has when a body finishes (the others are mid-flight) must stay the pool's.
+(defun nested-round (seed: i64) -> i64
+  (let [d (text (+ 200 seed) 700000) o (th (o64) 8) z (ok-bytes (compress (lz4) d o))]
+    (if (bytes-eq (ok-bytes (decompress (lz4) z o)) d) (unwrap-or (proc/thread-count) 1000) 1000)))
+;; The pool is started first (a pmap), the threads counted, and then 12 bodies of 8 threads each run: the count may grow by the spec harness's own tasks, not by 12 x 8.
+(defun nested-ok? () -> bool
+  (let [warm (par/pmap (fn (i: i64) (* i i)) (vec (range 256))) base (unwrap-or (proc/thread-count) 1000)]
+    (every? (fn (t: i64) (<= t (+ base 3))) (par/pmap nested-round (vec (range 12))))))
 
 ;; ---- the property: the same bytes for every thread count
 (defun comp-ok? (b: (Array i8) o: Options) -> bool
@@ -163,7 +180,11 @@
       (then (expect = [:internal :internal :internal] (vec (map (fn (w: i64) (err-kind (trapping-jobs w))) [2 7 16])))
             (expect = true (every? (fn (w: i64) (str-find (err-message (trapping-jobs w)) "boom" 0)) [2 7]))))
     (scenario "after a failure the pool is reusable: the next call works"
-      (then (expect = true (values-ok? 7 50)))))
+      (then (expect = true (values-ok? 7 50))))
+    (scenario "`threads` is the number of jobs in flight: never more than the workers asked for, and never more than the pool has"
+      (then (expect = true (every? (fn (w: i64) (<= (inflight-max w 40) (min w (max 1 (sched/pool-workers))))) [2 3 5]))))
+    (scenario "calls inside the body of a pmap run on the pool: the process gains no threads of its own (12 bodies of 8 threads), and the bytes are right"
+      (then (expect = true (nested-ok?)))))
   (feature "fib.compress.lz4: threads"
     (prop "compress is the same bytes for 1, 2, 3, 7 and 16 threads, and decompress gives the input, for random inputs, block sizes, levels and checksums" [x (gen-input)]
           (comp-ok? (materialize x) (opts-from x)))

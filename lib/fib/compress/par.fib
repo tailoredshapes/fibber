@@ -1,20 +1,23 @@
 ;; fib.compress.par: the parallel engine under the codecs' `threads` option (docs/design/compress.md 9). Explicit module.
-;; THE POOL. The runtime has no stealing pool yet (docs/design/parallelism.md 3.1 is a design and a prototype): a task is an OS thread. So the engine starts `workers` tasks and the
-;; JOBS 0 .. n-1 are SELF-SCHEDULED: every worker takes the next unclaimed index from one atom (a fetch-and-add), runs it, and comes back: a slow job delays one worker and the
-;; others take what is left (the balance of a stealing deque for jobs of one level, with one shared counter instead of deques). At most `workers` threads are live (the 64-thread cap
-;; of fib.parallel.cpu bounds them).
-;; ERRORS. A job is `(fn (i) (Result r CompressError))`. A worker that gets an error says so in `failed` and stops taking jobs; the others finish the job they are in and stop. EVERY task is
-;; joined whatever happens (no task outlives the call). The error returned is that of the LOWEST job index that failed: jobs are claimed in increasing order and a claimed job always finishes,
-;; so every index below the first failing one has been run, and the error is the one a sequential run would meet first: the same for every worker count. A worker that TRAPS (a bug in a
-;; job: ADR 0001 isolates it at the thread's entry) is joined with `try-join` and becomes an `:internal` error, not a dead process.
-;; RESULTS come back in index order. A job's result is moved between threads: arrays are fine, a `ptr` is not (not Send): `addr-of` and `ptr-at-addr` carry an address as an i64, which is
+;; THE POOL. Runners are tasks of the runtime's work-stealing pool (`fork-task`, docs/design/parallelism.md 8): this module makes no thread, so the threads of a program stay the pool's
+;; (`cpu-count`, FIB_THREADS) whatever `Options.threads` says and however deeply a program nests (de)compression inside a `pmap` body: a joiner that waits runs other tasks instead of sleeping.
+;; `Options.threads` is the number of JOBS IN FLIGHT: `worker-count` is it, at most the pool size (0: the pool size); a request for more only queues runners.
+;; SELF-SCHEDULING. The engine forks `workers` RUNNERS; the JOBS 0 .. n-1 are claimed by index from one atom (a fetch-and-add): a runner takes the next unclaimed index, runs it and comes back, so a
+;; slow job delays one runner and the others take what is left. Measured against one forked task per job with at most `workers` in flight (joined in index order, the next forked at each join):
+;; the counter is faster at every thread count (compress 1 MiB blocks, 8 threads: 3917 MB/s against 2487; decompress 12447 against 9912), because the in-order join idles a slot whenever a later job
+;; finishes first and pays a wake-up per job (docs/shootout/lz4.md 3).
+;; ERRORS. A job is `(fn (i) (Result r CompressError))`. A runner that gets an error says so in `failed` and stops taking jobs; the others finish the job they are in and stop. EVERY task is joined
+;; whatever happens (no task outlives the call). The error returned is that of the LOWEST job index that failed: jobs are claimed in increasing order and a claimed job always finishes, so every index
+;; below the first failing one has been run, and the error is the one a sequential run would meet first: the same for every worker count. A runner that TRAPS (a bug in a job: ADR 0001/0009, the
+;; pool's trap policy) is joined with `try-join` and becomes an `:internal` error, not a dead process.
+;; RESULTS come back in index order. A job's result is moved between tasks: arrays are fine, a `ptr` is not (not Send): `addr-of` and `ptr-at-addr` carry an address as an i64, which is
 ;; how a job writes into an output buffer its caller owns and keeps alive until the call returns (disjoint ranges: the caller's contract, stated where each use is).
 (ns fib.compress.par (:use fib.core fib.seq fib.coll fib.async fib.compress.types fib.parallel.cpu fib.compress.lz4.mem))
 
 (defun internal (m: str) -> CompressError (internal-error m))
 
 (defun worker-count (threads: i64) -> i64
-  (if (<= threads 0) (cpu-count) (min threads (max-workers))))
+  (if (<= threads 0) (cpu-count) (min threads (cpu-count))))
 
 ;; An address as a number, and back. UNSAFE: the buffer must outlive every use and the ranges written must be disjoint.
 (defun addr-of (p: ptr) -> i64
@@ -58,7 +61,7 @@
 
 (defun parallel (w: i64 n: i64 job: (fn :send (i64) (Result r CompressError))) -> (Result (Vec r) CompressError)
   (let [next (atom 0) failed (atom false)
-        ts (vec (map (fn (k: i64) (spawn (fn () (work next failed n job)))) (range w)))]
+        ts (vec (map (fn (k: i64) (fork-task (fn () (work next failed n job)))) (range w)))]
     (match (join-all ts)
       ((Err e) (Err e))
       ((Ok ds) (match (first-failure ds) ((some e) (Err e)) (nil (Ok (ordered ds))))))))
