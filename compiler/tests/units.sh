@@ -26,7 +26,9 @@ for f in $(comm -13 <(echo "$listed") <(echo "$present")); do echo "FAIL $f is i
 for f in $(comm -23 <(echo "$listed") <(echo "$present")); do echo "FAIL $f is listed but does not exist"; bad=1; done
 # build and run one program: prints its verdict line, returns 0 when it passes
 judge() {
-  local f=$1 n t0 o rc
+  local f=$1 n t0 o rc why
+  # macOS: a unit program that tests an x86-64 host is skipped, with its reason (compiler/tests/units.darwin-skip: FILE then the reason)
+  if [ "$(uname -s)" = Darwin ] && why=$(grep "^$f[[:space:]]" "$here/units.darwin-skip" 2> /dev/null); then echo "ok $f 0 s (skipped on macOS: ${why#*[[:space:]]})"; return 0; fi
   n=$(echo "${f#compiler/tests/}" | tr / _); o=$out/$n; t0=$(date +%s)
   if ! "$fibc" build "$f" -I compiler -I lib -L "$llvm" -l LLVM-21 -o "$o" > "$o.log" 2>&1; then
     echo "FAIL $f $(( $(date +%s) - t0 )) s (does not build: $(tail -n 1 "$o.log" | cut -c1-160))"; return 1; fi

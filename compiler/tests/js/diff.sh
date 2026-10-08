@@ -38,7 +38,7 @@ for x in "${inputs[@]}"; do
   if [ -d "$x" ]; then grep -lrE --include='*.lir' "^;; expect: ($kinds)" "$x" | sort >> "$list"; else echo "$x" >> "$list"; fi
 done
 # The fibber programs: each is emitted by its own job (one() below); a failed emit is a skip row.
-for d in "${emits[@]}"; do
+for d in ${emits[@]+"${emits[@]}"}; do
   : "${FIBC:?set FIBC for --emit}"
   if [ -f "$d" ]; then echo "$(cd "$(dirname "$d")" && pwd)/$(basename "$d")" >> "$list"; continue; fi
   ad=$(cd "$d" && pwd)

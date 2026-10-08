@@ -19,7 +19,7 @@ fi
 args=()
 for a in ${SERVER_ARGS:-}; do args+=(--arg "$a"); done
 ulimit -v "${ULIMIT_V:-16000000}"
-node "$here/replay.js" --server "$server" "${args[@]}" || { echo "lsp tests: FAILED" >&2; exit 1; }
+node "$here/replay.js" --server "$server" ${args[@]+"${args[@]}"} || { echo "lsp tests: FAILED" >&2; exit 1; }
 if [ "$mode" = planted ]; then
   for fault in range drop code framing; do
     if node "$here/replay.js" --server "$server" "${args[@]}" --fault "$fault" > "${TMPDIR:-/tmp}/lsp-fault-$fault.out" 2>&1; then

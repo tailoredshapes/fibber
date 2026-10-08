@@ -10,9 +10,11 @@
 MAC_EXPECTED := compiler/tests/expected-macos.txt
 MAC_SKIP_TOOLS := $(shell awk '$$1 == "tool" { print $$2 }' $(MAC_EXPECTED) 2> /dev/null)
 MAC_SKIP_STAGES := $(shell awk '$$1 == "stage" { print $$2 }' $(MAC_EXPECTED) 2> /dev/null)
+MAC_SKIP_GOLDEN := $(shell awk '$$1 == "golden" { print $$2 }' $(MAC_EXPECTED) 2> /dev/null)
+MAC_GOLDEN_STAMPS := $(filter-out $(addsuffix .ok,$(addprefix $(GOLDEN_DIR)/,$(MAC_SKIP_GOLDEN))),$(GOLDEN_STAMPS))
 MAC_TOOLS := $(filter-out $(MAC_SKIP_TOOLS),$(TOOLS_FULL))
 MAC_TOOL_STAMPS := $(addsuffix .ok,$(addprefix $(TOOLS_DIR)/,$(MAC_TOOLS)))
-MAC_FULL_STAMPS := $(BUILD)/version.ok $(BUILD)/runtime-drift.ok $(BUILD)/fixed-point.ok $(GOLDEN_STAMPS) $(MAC_TOOL_STAMPS) $(BUILD)/adr.ok $(CASES_DIR)/full.ok \
+MAC_FULL_STAMPS := $(BUILD)/version.ok $(BUILD)/runtime-drift.ok $(BUILD)/fixed-point.ok $(MAC_GOLDEN_STAMPS) $(MAC_TOOL_STAMPS) $(BUILD)/adr.ok $(CASES_DIR)/full.ok \
   $(if $(wildcard specs),$(BUILD)/specs.ok) $(filter-out $(MAC_SKIP_STAGES:%=$(BUILD)/%.ok),$(BUILD)/static.ok $(BUILD)/wasm.ok)
 MAC_QUICK_STAMPS := $(BUILD)/version.ok $(TOOLS_QUICK_STAMPS) $(CASES_DIR)/quick.ok
 MAC_STAMPS := $(if $(MAC_QUICK),$(MAC_QUICK_STAMPS),$(MAC_FULL_STAMPS)) $(BUILD)/mac-machine.ok
@@ -32,6 +34,6 @@ mac-report:
 	@for s in $(MAC_STAMPS); do n=$${s#$(BUILD)/}; n=$${n%.ok}; if [ -f $$s ]; then if grep -q '^SKIPPED' $$s; then echo "  $$n $$(cat $$s)"; else echo "  $$n $$(cat $$s) s"; fi; else echo "  $$n FAILED (no stamp)"; fi; done
 	@echo "  $$(scripts/ci-stage2.sh --cases-line $(CASES_DIR) $(if $(MAC_QUICK),ownership:$(OWN_SHARDS) modules:1 sample:$(QUICK_SHARDS),ownership:$(OWN_SHARDS) modules:1 stdlib:$(SHARDS)))"
 	@echo "== not run on macOS ($(MAC_EXPECTED))"
-	@awk '$$1 == "tool" || $$1 == "stage" { r = $$0; sub(/^[^ ]+ +[^ ]+ +/, "", r); printf "  %s %s: %s\n", $$1, $$2, r }' $(MAC_EXPECTED)
+	@awk '$$1 == "tool" || $$1 == "stage" || $$1 == "golden" { r = $$0; sub(/^[^ ]+ +[^ ]+ +/, "", r); printf "  %s %s: %s\n", $$1, $$2, r }' $(MAC_EXPECTED)
 	@if $(MAKE) -q --no-print-directory mac-stamps $(if $(MAC_QUICK),MAC_QUICK=1,); then echo "MAC-CHECK PASS$(if $(MAC_QUICK), (quick),)"; else echo "MAC-CHECK FAIL"; exit 1; fi
 .PHONY: mac-stamps mac-report mac-check
