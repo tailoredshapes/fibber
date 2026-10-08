@@ -123,7 +123,9 @@ No Rust toolchain was used.
 Searched `llvm/llvm-project` issues (read-only, 2026-10-08) for: tailcc, swifttailcc, sibling call, AArch64, stack arguments, callee pops.
 No report of this fault. Related and different: #168956 (x86 musttail sibcall miscompilation, closed), #199691 (x86 musttail with stack arguments, closed),
 #223545 and #217156 (AArch64 non-sibcall tail calls with FPDiff, closed), #213811 (AArch64 GlobalISel split arguments for tailcc, open), #206718 (AArch64 `byval` in
-tail calls, open). None covers a `ccc` callee called from a `tailcc` caller. Nothing was filed.
+tail calls, open), #167181 (AArch64 `musttail` from `tailcc`, open; a different call shape). None covers a `ccc` callee called from a `tailcc` caller.
+
+Filed 2026-10-08: https://github.com/llvm/llvm-project/issues/230214. A candidate fix with a lit test (SelectionDAG and GlobalISel, `isEligibleForTailCallOptimization`) exists as a local commit on `main`, not yet a pull request.
 
 ### Ready-to-file report
 
