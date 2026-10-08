@@ -5,7 +5,7 @@
 # case suites pass except the expected ones); `release` builds the tarball on a v* tag. The Rust jobs (`lairf`, `rust-seed`) went with the
 # Rust (ROADMAP stage 10); docs/rust-legacy.md says how to bring them back.
 # The seed comes from the cache directory FIB_SEED_CACHE (DIR/SHA256/seed.tar.gz): the runner has no GitHub login. Put a new seed there
-# (and its sha256 in SEED) when SEED moves.
+# (and its sha256 in SEED) when SEED moves. The jobs run `make` (docs/design/build.md); the Makefile reads FIB_SEED_CACHE.
 
 stages: [test, release]
 
@@ -29,13 +29,14 @@ stage2:
   stage: test
   timeout: 60m
   script:
-    - fibc=$(scripts/fetch-seed.sh "$CI_PROJECT_DIR/.seed")
-    - export FIBC=$fibc
-    - GATE_FRESH=1 GATE_OUT="$CI_PROJECT_DIR/.gate" scripts/gate.sh --full -j 6
+    # The full gate is `make gate` (docs/design/build.md): the seed SEED names is fetched and verified under build/seed/, stage 2 is built from it,
+    # and every stage is a stamp under build/. A fresh checkout has no stamps, so everything runs; -k runs every stage before the report says FAIL.
+    - make -k -j6 gate-stamps CASE_JOBS=6 || true
+    - make gate-report
   artifacts:
     when: on_failure
     expire_in: 3 days
-    paths: [.gate/*.log]
+    paths: [build/*.log, build/*/*.log, build/cases/*.txt, build/cases/*.err]
 
 # A v* tag builds the release tarball (package.sh: static LLVM, no liblair, x86-64-v2) and publishes it to this project's releases.
 release:
@@ -45,9 +46,8 @@ release:
   rules:
     - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
   script:
-    - fibc=$(scripts/fetch-seed.sh "$CI_PROJECT_DIR/.seed")
     - test "v$(cat VERSION)" = "$CI_COMMIT_TAG" || { echo "tag $CI_COMMIT_TAG is not v$(cat VERSION)" >&2; exit 1; }
-    - FIBC=$fibc scripts/package.sh dist
+    - make release   # mk/release.mk: the seed, stage 2, the stage check, the shipped binary and its checks, dist/fibc-*.tar.gz and SHA256SUMS
     - mkdir unpacked && tar -xzf dist/fibc-*-linux-x86_64.tar.gz -C unpacked
     - echo '(defun main () -> i64 (do (println "hello from fibber") 0))' > hello.fib
     - env -i unpacked/fibc-*/bin/fibc run hello.fib
@@ -69,8 +69,8 @@ shootout:
   allow_failure: true
   timeout: 3h
   script:
-    - fibc=$(scripts/fetch-seed.sh "$CI_PROJECT_DIR/.seed")
-    - FIBC=$fibc scripts/shootout/run.sh --size small,full --out shootout.tsv
+    - make seed
+    - FIBC=$(make -s print-seed) scripts/shootout/run.sh --size small,full --out shootout.tsv
   artifacts:
     expire_in: 30 days
     paths: [shootout.tsv]

@@ -17,14 +17,6 @@ jobs:
       - uses: actions/checkout@v4
         timeout-minutes: 5
 
-      - name: Fetch the seed (SEED names the release and its sha256)
-        timeout-minutes: 10
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          fibc=$(scripts/fetch-seed.sh "$RUNNER_TEMP/seed")
-          echo "SEED_FIBC=$fibc" >> "$GITHUB_ENV"
-
       # LLVM 21 for the link: llvm-21-dev has the static archives and llvm-config; zstd and zlib are the system libraries they name.
       - name: Install LLVM 21
         timeout-minutes: 15
@@ -35,52 +27,33 @@ jobs:
           sudo apt-get install -y llvm-21-dev libzstd-dev zlib1g-dev libxml2-dev libcurl4-openssl-dev python3 openssl
           echo "LLVM_CONFIG=/usr/lib/llvm-21/bin/llvm-config" >> "$GITHUB_ENV"
 
-      - name: Build stage 2 and check it
-        timeout-minutes: 30
-        run: |
-          set -eu
-          export FIB_LIB=$PWD/lib
-          read -r -a llvm < <(scripts/llvm-static.sh "$RUNNER_TEMP/llvm")
-          build() { "$1" build compiler/fibc.fib -I compiler -I lib "${llvm[@]}" -o "$2"; }
-          emit() { "$1" emit -I compiler -I lib compiler/fibc.fib; }
-          build "$SEED_FIBC" "$RUNNER_TEMP/F"
-          ! ldd "$RUNNER_TEMP/F" | grep -q -E 'liblair|libLLVM'
-          emit "$SEED_FIBC" > "$RUNNER_TEMP/emit.seed"
-          emit "$RUNNER_TEMP/F" > "$RUNNER_TEMP/emit.F"
-          # The seed's lIR differs from F's whenever main's compiler or library moved on: a note. The check is the
-          # fixed point: stage 2 built by the seed and stage 3 built by stage 2 emit the same lIR.
-          if cmp -s "$RUNNER_TEMP/emit.seed" "$RUNNER_TEMP/emit.F"; then echo "note: F emits the seed's lIR"; else echo "note: F emits different lIR from the seed (main moved on)"; fi
-          build "$RUNNER_TEMP/F" "$RUNNER_TEMP/F3"
-          emit "$RUNNER_TEMP/F3" > "$RUNNER_TEMP/emit.F3"
-          cmp "$RUNNER_TEMP/emit.F" "$RUNNER_TEMP/emit.F3"
-          echo "stage check: F (built by the seed) and F3 (built by F) emit the same lIR"
-
-      - name: Cases under stage 2
-        # Measured on a hosted runner: ownership 179 s, modules 18 s,
-        # stdlib 815-1098 s over three runs; the limits are about twice that.
-        timeout-minutes: 60
+      # The full gate is `make gate` (docs/design/build.md): the seed SEED names is fetched (gh, with the token) and verified under build/seed/,
+      # stage 2 is built from it with LLVM linked statically (as the release does), the fixed point, the golden checks, the tool tests, the ADRs
+      # and every case directory are stamps under build/. -k runs every stage; the report then says PASS or FAIL.
+      # Measured on a hosted runner (before make): ownership 179 s, modules 18 s, stdlib 815-1098 s; the limits are about twice that.
+      - name: The gate (make)
+        timeout-minutes: 100
         env:
-          LIMIT_OWNERSHIP: 600
-          LIMIT_MODULES: 120
-          LIMIT_STDLIB: 2400
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          export FIB_LIB=$PWD/lib
-          scripts/ci-stage2.sh "$RUNNER_TEMP/F"
+          make -k -j4 gate-stamps LLVM_LINK=static CASE_JOBS=4 LIMIT_STDLIB=2400 LIMIT_OWNERSHIP=600 || true
+          make gate-report LLVM_LINK=static
 
-      - name: Golden checks of the passes
-        timeout-minutes: 20
-        run: |
-          export FIB_LIB=$PWD/lib
-          mkdir -p "$RUNNER_TEMP/golden"
-          read -r -a llvm < <(scripts/llvm-static.sh "$RUNNER_TEMP/llvm")
-          mkdir -p "$RUNNER_TEMP/golden/tools"
-          for t in read expand types own explain emit lairf; do "$RUNNER_TEMP/F" build "compiler/$t.fib" -I compiler -I lib "${llvm[@]}" -o "$RUNNER_TEMP/golden/tools/$t"; done
-          GOLDEN_OUT="$RUNNER_TEMP/golden" compiler/tests/golden/golden.sh --tools "$RUNNER_TEMP/golden/tools"
+      - name: Keep the logs of a failed gate
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-logs
+          path: |
+            build/*.log
+            build/*/*.log
+            build/cases/*.txt
+            build/cases/*.err
 
       - name: Native OS services and ABI conformance
         timeout-minutes: 5
-        run: OS_FIBC="$RUNNER_TEMP/F" OS_TEST_OUT="$RUNNER_TEMP/os" bash scripts/test-os.sh
+        run: OS_FIBC="$PWD/build/F" OS_TEST_OUT="$RUNNER_TEMP/os" bash scripts/test-os.sh
 
       - name: Native HTTP interoperability and TLS
         timeout-minutes: 10
-        run: HTTP_FIBC="$RUNNER_TEMP/F" HTTP_TEST_OUT="$RUNNER_TEMP/http" bash scripts/test-http.sh
+        run: HTTP_FIBC="$PWD/build/F" HTTP_TEST_OUT="$RUNNER_TEMP/http" bash scripts/test-http.sh

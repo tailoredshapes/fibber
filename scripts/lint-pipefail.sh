@@ -10,7 +10,8 @@
 #   - the pipeline starts with `echo` or `printf` (a shell builtin writes its text in one go, which the pipe buffer takes before the consumer can leave), or
 #   - the pipeline is followed by `|| true` (or `|| :`: its status is thrown away), or
 #   - the line carries the marker `# pipe-ok` (a reviewed exception: say why on the line).
-# usage: scripts/lint-pipefail.sh [ROOT]      checks ROOT/scripts, ROOT/compiler/tests and ROOT/.github (default: this tree), then the selftest
+# Since MAKE-1 the Makefile and mk/*.mk are checked too: every recipe runs under `bash -eu -o pipefail` (mk/config.mk), so a recipe line is a pipefail line.
+# usage: scripts/lint-pipefail.sh [ROOT]      checks ROOT/scripts, ROOT/compiler/tests, ROOT/.github, ROOT/Makefile and ROOT/mk (default: this tree), then the selftest
 #        scripts/lint-pipefail.sh --selftest   only the plant: the rule must flag a planted `producer | head -1` and must pass the builtin and the marked forms
 # exit 0 when clean, 1 for findings or a failed selftest. Called by scripts/tools.sh (the `lint-pipefail` entry of the gate).
 set -u
@@ -21,6 +22,7 @@ lint() {
   awk '
     { lines[FILENAME, FNR] = $0 }
     /pipefail/ && $0 !~ /^[ \t]*#/ { pfile[FILENAME] = 1 }
+    FILENAME ~ /(^|\/)Makefile$|\.mk$/ { pfile[FILENAME] = 1 }   # every recipe runs under the pipefail of mk/config.mk
     { n[FILENAME] = FNR }
     END {
       for (f in n) {
@@ -62,9 +64,10 @@ selftest() {
   printf '#!/bin/bash\nset -o pipefail\nx=$(produce | awk '"'"'{print; exit}'"'"')\n' > "$d/bad-awk.sh"
   printf '#!/bin/bash\nset -uo pipefail\nok=$(echo "$out" | head -1)\nif printf "%%s" "$out" | grep -q x; then :; fi\nl=$(produce | head -1) # pipe-ok: one line\n' > "$d/good.sh"
   printf '#!/bin/bash\nproduce | head -1\n' > "$d/no-pipefail.sh"
+  printf 'x:\n\t@produce | head -1\n' > "$d/bad-recipe.mk"
   local bad=0 got
-  for f in bad-head bad-grep bad-awk; do
-    got=$(lint "$d/$f.sh")
+  for f in bad-head.sh bad-grep.sh bad-awk.sh bad-recipe.mk; do
+    got=$(lint "$d/$f")
     [ -n "$got" ] || { echo "lint-pipefail selftest: the planted $f.sh was not flagged" >&2; bad=1; }
   done
   for f in good no-pipefail; do
@@ -72,14 +75,14 @@ selftest() {
     [ -z "$got" ] || { echo "lint-pipefail selftest: $f.sh was flagged: $got" >&2; bad=1; }
   done
   rm -rf "$d"
-  [ $bad -eq 0 ] && echo "lint-pipefail selftest: 3 planted pipelines flagged, 2 clean files passed"
+  [ $bad -eq 0 ] && echo "lint-pipefail selftest: 4 planted pipelines flagged (one a Makefile recipe), 2 clean files passed"
   return $bad
 }
 
 [ "${1:-}" = "--selftest" ] && { selftest; exit $?; }
 root=${1:-$(cd "$here/.." && pwd)}
 files=()
-while IFS= read -r f; do files+=("$f"); done < <(find "$root/scripts" "$root/compiler/tests" "$root"/.github -type f \( -name '*.sh' -o -name '*.yml' \) ! -name lint-pipefail.sh 2>/dev/null | sort)
+while IFS= read -r f; do files+=("$f"); done < <({ find "$root/scripts" "$root/compiler/tests" "$root"/.github -type f \( -name '*.sh' -o -name '*.yml' \) ! -name lint-pipefail.sh; find "$root/Makefile" "$root/mk" -type f \( -name Makefile -o -name '*.mk' \); } 2>/dev/null | sort)
 [ ${#files[@]} -gt 20 ] || { echo "lint-pipefail: fewer than 20 scripts found under $root (a search of nothing finds nothing)" >&2; exit 1; }
 found=$(lint "${files[@]}")
 rc=0
