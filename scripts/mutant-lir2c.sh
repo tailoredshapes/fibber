@@ -13,7 +13,7 @@
 #   phi-copy       an edge assigns its phis one by one, without temporaries, and a use of a phi-bound name reads the phi variable itself (the
 #                  lost-copy / swap problem: the printer's edges read the let-bound copies, so both halves are planted to show the copy matters)
 #   fallthrough    an unconditional br emits no goto: the block falls through to the next one
-#   align          an (align 1) access is written as an aligned one
+#   align          the aligned(1) of an unaligned access is dropped (the access is written as an aligned one)
 # Environment: FIBC (a stage 2), LAIRF, CC (default gcc), OUT (scratch, default $TMPDIR/lir2c-mutants).
 set -u
 here=$(cd "$(dirname "$0")" && pwd); root=$(cd "$here/.." && pwd)
@@ -44,7 +44,7 @@ for mode in "${modes[@]}"; do
                   targets=("$jscases/branches.lir") ;;
     fallthrough)  sed -i 's|((KBr l) (goto! cf from l))|((KBr l) (if (= (count (unwrap-or (get (. cf phis) l) \[\])) 0) () (goto! cf from l)))|' "$d/c/func.fib"
                   targets=("$cases/fallthrough.lir") ;;
-    align)        sed -i 's|(match al ((some a) (< a (abi-align t))) (nil false)))|(match al ((some a) false) (nil false)))|' "$d/c/mem.fib"
+    align)        sed -i 's|(if unaligned ", aligned(1)" "")|""|' "$d/c/cx.fib"
                   targets=("$cases/alias-align.lir") ;;
     *) echo "unknown mode $mode"; exit 2 ;;
   esac

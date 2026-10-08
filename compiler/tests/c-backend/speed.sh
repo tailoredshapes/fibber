@@ -22,7 +22,7 @@ if [ ${#progs[@]} -eq 0 ]; then
 fi
 median() { sort -n | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }'; }
 time_of() { # time_of EXE ARGS: median elapsed seconds of RUNS runs, the output's sha1 in $sum
-  local exe=$1 args=$2 ts=() i s; sum=
+  local exe=$1 args=$2 ts=() i s; sum=""
   for i in $(seq "$runs"); do
     # shellcheck disable=SC2086
     /usr/bin/time -f "%e" -o "$work/t" bash -c "ulimit -v 16000000; exec \"$exe\" $args" > "$work/out" 2> "$work/err"
@@ -38,8 +38,8 @@ for p in "${progs[@]}"; do
   name=${p%%=*}; rest=${p#*=}; file=${rest%%:*}; args=${rest#*:}
   (cd "$root" && ulimit -v 16000000 && "$fibc" build "$file" -o "$work/$name.n" > "$work/$name.n.log" 2>&1) || { printf '%-16s native build FAILED\n' "$name"; bad=1; continue; }
   (cd "$root" && ulimit -v 16000000 && "$fibc" --via c --cc "$cc" build "$file" -o "$work/$name.c" > "$work/$name.c.log" 2>&1) || { printf '%-16s C build FAILED (%s)\n' "$name" "$work/$name.c.log"; bad=1; continue; }
-  tn=$(time_of "$work/$name.n" "$args"); sn=$sum
-  tc=$(time_of "$work/$name.c" "$args"); sc=$sum
+  time_of "$work/$name.n" "$args" > "$work/tn"; tn=$(cat "$work/tn"); sn=$sum
+  time_of "$work/$name.c" "$args" > "$work/tc"; tc=$(cat "$work/tc"); sc=$sum
   ratio=$(echo "scale=2; $tc / $tn" | bc -l | sed 's/^\./0./')
   if [ "$sn" = "$sc" ] && [ "$sn" != UNSTABLE ]; then v=same; else v="DIFFERENT ($sn vs $sc)"; bad=1; fi
   printf '%-16s %9s %9s %8s  %s\n' "$name" "$tn" "$tc" "$ratio" "$v"

@@ -30,12 +30,14 @@ one() {
   fi
   (timeout "$TMO" "$LAIRF" run "$f" > "$d/n.out" 2> "$d/n.err") 2> /dev/null; ns=$?
   [ $ns -eq 124 ] && { echo "skip $name: the native run timed out"; return; }
+  # cases that fault on purpose to reach the runtime's own SIGSEGV handler (rt/thread.lir), which the sanitizer runtime would replace
+  case $name in *8354-fork-child-overflow*) echo "skip $name: wild fault by design (the runtime's SIGSEGV handler is the subject)"; return ;; esac
   "$LIR2C" "$f" -o "$d/p.c" --cc "$cc" --allow-plain-tail-calls 2> "$d/t.err" || { echo "skip $name: lir2c refused: $(grep -m1 error: "$d/t.err" | head -c 150)"; return; }
   # shellcheck disable=SC2086
   "$cc" $CFLAGS -o "$d/p" "$d/p.c" -lm -lpthread 2> "$d/cc.err" || { echo "differ $name: cc failed: $(grep -m1 error "$d/cc.err" | head -c 150)"; return; }
   (ASAN_OPTIONS=detect_leaks=0:handle_segv=0:handle_sigbus=0:handle_abort=0:use_sigaltstack=0:allocator_may_return_null=1 UBSAN_OPTIONS=print_stacktrace=1 \
      timeout "$TMO" "$d/p" > "$d/c.out" 2> "$d/c.err") 2> /dev/null; cs=$?
-  if grep -qE 'runtime error:|Sanitizer' "$d/c.err"; then echo "report $name: $(grep -m1 -E 'runtime error:|Sanitizer' "$d/c.err" | head -c 220)"; return; fi
+  if grep -qE 'runtime error:|ERROR: .*Sanitizer' "$d/c.err"; then echo "report $name: $(grep -m1 -E 'runtime error:|ERROR: .*Sanitizer' "$d/c.err" | head -c 220)"; return; fi
   what=""
   [ $ns -ne $cs ] && what="exit $cs, native $ns"
   cmp -s "$d/n.out" "$d/c.out" || what="${what:+$what; }stdout differs"

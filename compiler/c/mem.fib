@@ -17,8 +17,12 @@
     ((TVector n e) (loop ((p 1)) (if (>= p (* n (scalar-size e))) p (recur (* p 2)))))
     (_ (scalar-size t))))
 
-(defun unaligned? :private (t: LType al: (Option i64)) -> bool
-  (match al ((some a) (< a (abi-align t))) (nil false)))
+;; Every plain access is written as an unaligned one. lIR promises the ABI alignment of a plain access and calls a misaligned one undefined (6.12);
+;; LLVM on x86-64 and AArch64 executes it. The runtime has such sites (rt/str.lir's UTF-8 scan loads an i64 at any byte offset; the emitter
+;; stores an i64 into a `[8 x i8]` field of a task at offset 4 mod 8), which UBSan found in the first sanitizer run. `aligned(1)` is a valid translation
+;; of that undefined behaviour and costs nothing on those targets (the same instruction); where the hardware needs alignment the C compiler
+;; makes byte accesses. Atomics keep their alignment (a misaligned atomic is a fault, not a slow access).
+(defun unaligned? :private (t: LType al: (Option i64)) -> bool true)
 
 (defun mask-vector? :private (t: LType) -> bool
   (match t ((TVector _ (TInt 1)) true) (_ false)))
