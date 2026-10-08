@@ -92,6 +92,11 @@ k8s-bench: k8s-image   ## the quick benchmarks on the bench node (BENCH="name.."
 	ssh -o BatchMode=yes $(BENCH_HOST) 'wsl -u root -e sleep 14400' > /dev/null 2>&1 & kp=$$!; trap "kill $$kp" EXIT; sleep 30; \
 	$(MAKE) --no-print-directory K8S_POOL=bench k8s-src k8s-seed && \
 	$(call k8s_run,bench,make -j4 CASE_JOBS=4 $(K8S_EXTRA) bench BENCH='$(BENCH)',$(or $(BENCH_CPU),8),$(or $(BENCH_MEM),8Gi))
+# The stdlib shards as an Indexed Job (one pod per shard, SHARDS of them, K8S_PAR at a time): F is built first by a plain job on the same volume.
+K8S_PAR ?= 8
+k8s-shards: k8s-image k8s-src k8s-seed   ## the stdlib case shards as an Indexed Job (SHARDS pods, K8S_PAR at once, K8S_SHARD_CPU/K8S_SHARD_MEM each), after a job that builds F
+	$(call k8s_run,prep,make -j$(K8S_J) build/F)
+	$(call k8s_run,shards,make CASE_JOBS=1 build/cases/stdlib.$$JOB_COMPLETION_INDEX.txt,$(or $(K8S_SHARD_CPU),1),$(or $(K8S_SHARD_MEM),3Gi),$(SHARDS),$(K8S_PAR))
 k8s-run: k8s-image k8s-src k8s-seed   ## any shell command in a pod, in the tree: make k8s-run CMD="build/F cases cases/stdlib --only 8283-str-replace-literal-char-and-regex-on-ascii-and-non-ascii.fib"
 	test -n "$(CMD)" || { echo "k8s-run: CMD='shell command' (run in /work/tree)" >&2; exit 2; }
 	$(call k8s_run,run,$(CMD))
