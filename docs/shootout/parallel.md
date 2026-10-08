@@ -201,8 +201,8 @@ that existed before: no worker is started until the first `fork-task`.
 | M1 steal without the compare-and-swap on `top` | killed: 8640 and 8645 crash (exit 139); `wide 20000` crashes; `tree 18` answers right |
 | M3 pop of the last item without the race for it | killed: 8640 and `tree 18` crash; 8645 and `wide` answer right |
 | M2 pop's fence `seq_cst` weakened to `release` | **survives** on x86, as the design's experiment found (a weakened fence needs a model checker): run and reported, not claimed |
-| lost wakeup (the eventcount's re-check removed) | killed by a hang under a 60 s timeout with `FIB_THREADS=1`; with 2 workers 2e5 rounds did not hang (the window is narrow) |
-| completion's `seq_cst` fence removed (a joiner registers after a completion saw no waiter) | killed: hangs at 2 and at 4 workers |
+| lost wakeup (the eventcount's re-check removed) | **hard to catch**: the window is a few instructions wide (the epoch protocol alone covers a push during the announcement). Reached only with `FIB_SPIN=1` and the `gap` kernel (forks as workers park): 1 hang in 12 runs of 1e5 rounds (the other 11 answered right; unmutated, 0 of 6 hang). Earlier, before the joiner spun before parking, the storm kernel hung at one worker; it no longer does. A model checker is the tool for this one |
+| completion's `seq_cst` fence removed (a joiner registers after a completion saw no waiter) | killed: `gap` at 4 workers and `storm` at 4 workers hang (at 2 workers `gap` answers right) |
 | join neither runs the task nor helps (the design's "deadlock" mutant) | killed: 8640 fails, `tree 16` crashes. (Parking instead of helping alone does *not* deadlock: a join that runs its own unstarted child is deadlock-free by itself.) |
 | a thief runs a task without claiming its driver | killed: 8640, 8645, `tree 18` |
 | the runner completes the task before it stores the result | killed by 8640 (wrong sum); 8647 survives |
