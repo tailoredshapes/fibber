@@ -92,38 +92,60 @@ scripts/fetch-*.sh ───────► ~/.cache/fibber-scratch/tools/<tool>
 A library repository (fib-hocon, fib-zlib, …) gets the same shape, small:
 
 ```make
-# Makefile of a fibber library: GNU Make 4 (gmake on macOS). `make test` is the gate.
+# fib-hocon: GNU Make 4 coordinates the tests (the template of fibber's docs/design/build.md 5). Targets are files under build/; a stamp
+# (build/X.ok) exists only when its check passed on the inputs it names, so a second `make test` runs nothing. macOS: `brew install make`, then gmake.
+#   make test            `fibc test` (the specs), then scripts/test.sh (the differential check and the fuzz run)
+#   make fibc            the pinned release (scripts/fetch-fibc.sh: sha256 checked) under build/fibc/<sha256>/bin/fibc
+#   make mutants         the planted faults (scripts/mutants.sh)
+#   make bench           the 10 MB speed run
+# FIBC=/path/to/fibc uses a compiler you have instead of the pinned release (an unreleased fibber: its stage 2 works).
+ifeq ($(filter 4.% 5.%,$(MAKE_VERSION)),)
+  $(error GNU Make 4 or later is needed (this is $(MAKE_VERSION)); on macOS: brew install make, then gmake)
+endif
+.DEFAULT_GOAL := help
 SHELL := bash
 .SHELLFLAGS := -eu -o pipefail -c
 .DELETE_ON_ERROR:
+.SECONDARY:
 BUILD ?= build
 FIBC_SHA := $(shell sed -n 's/^SHA256=//p' scripts/fetch-fibc.sh)
-FIBC ?= $(BUILD)/fibc/$(FIBC_SHA)/bin/fibc
+FIBC_DIR := $(abspath $(BUILD))/fibc/$(FIBC_SHA)
+FIBC_PINNED := $(FIBC_DIR)/bin/fibc
+FIBC ?= $(FIBC_PINNED)
 export FIBC
+SRC := $(shell find src specs specs-net tools -name '*.fib') deps.fib
+CORPUS := $(shell find corpus -type f)
 
-.PHONY: help test fibc mutants bench clean
-help: ## this list
-	@grep -hE '^[a-zA-Z0-9_./-]+:.*## ' $(MAKEFILE_LIST) | sed 's/:.*## /\t/' | sort
-$(BUILD)/fibc/$(FIBC_SHA)/bin/fibc: scripts/fetch-fibc.sh   ## the pinned release (sha256 checked)
-	@mkdir -p $(@D)/.. && scripts/fetch-fibc.sh $(@D)/../unpack > /dev/null && rm -rf $(@D) && mv $(@D)/../unpack/fibc-*/bin $(@D) && mv $(@D)/../unpack/fibc-*/share $(@D)/../share
-fibc: $(FIBC)   ## fetch the compiler (`make fibc FIBC=/path` uses one you have)
-$(BUILD)/specs.ok: $(FIBC) $(wildcard specs/*.fib src/**/*.fib src/*.fib) | $(BUILD)/
-	rm -f $@; $(FIBC) test specs && touch $@
-$(BUILD)/tests.ok: $(FIBC) $(BUILD)/specs.ok scripts/test.sh $(wildcard corpus/**) | $(BUILD)/
-	rm -f $@; scripts/test.sh && touch $@
-test: $(BUILD)/specs.ok $(BUILD)/tests.ok   ## `fibc test specs`, then scripts/test.sh (the differential and fuzz checks)
-$(BUILD)/mutants.ok: $(FIBC) scripts/mutants.sh $(wildcard src/**/*.fib specs/*.fib) | $(BUILD)/
-	rm -f $@; scripts/mutants.sh && touch $@
-mutants: $(BUILD)/mutants.ok   ## the planted faults (each must be caught by its spec)
-bench: $(FIBC)   ## the speed measurement
-	HOCON_BENCH=1 scripts/test.sh
-$(BUILD)/:
+# $(call stamp,CMD): CMD's output in the stamp's .log; the stamp holds the seconds it took and exists only when CMD passed.
+define stamp
+rm -f $@; t0=$$(date +%s); if { $(1); } > $(@:%.ok=%.log) 2>&1; then echo "$$(( $$(date +%s) - t0 ))" > $@; else echo "FAIL $@ (log: $(@:%.ok=%.log))"; tail -n 20 $(@:%.ok=%.log); exit 1; fi
+endef
+%/:
 	mkdir -p $@
+
+$(FIBC_PINNED): scripts/fetch-fibc.sh
+	rm -rf $(FIBC_DIR) && mkdir -p $(FIBC_DIR)/unpack && scripts/fetch-fibc.sh $(FIBC_DIR)/unpack > /dev/null
+	mv $(FIBC_DIR)/unpack/fibc-*/* $(FIBC_DIR)/ && rm -rf $(FIBC_DIR)/unpack && touch $@ && $@ --version   # touched: the tarball keeps the release-time mtime
+fibc: $(FIBC)   ## fetch the pinned fibc release (sha256 checked), or check the one FIBC names
+$(BUILD)/specs.ok: $(FIBC) $(SRC) | $(BUILD)/
+	$(call stamp,$(FIBC) test)
+$(BUILD)/tests.ok: $(BUILD)/specs.ok scripts/test.sh scripts/check-manifest.sh scripts/compare.py $(CORPUS) | $(BUILD)/
+	$(call stamp,scripts/test.sh)
+$(BUILD)/mutants.ok: $(FIBC) scripts/mutants.sh $(SRC) | $(BUILD)/
+	$(call stamp,scripts/mutants.sh)
+test: $(BUILD)/specs.ok $(BUILD)/tests.ok   ## the specs (`fibc test`), then scripts/test.sh: the differential check and 100000 mutated inputs
+	@echo "PASS: $$(cat $(BUILD)/specs.ok) s specs, $$(cat $(BUILD)/tests.ok) s tests"
+mutants: $(BUILD)/mutants.ok   ## the planted faults: each must be caught by the spec named for it
+bench: $(FIBC)   ## the 10 MB speed measurement (HOCON_BENCH=1 scripts/test.sh)
+	HOCON_BENCH=1 scripts/test.sh
+help:   ## this list
+	@grep -h -E '^[a-zA-Z0-9_./-]+:.*## ' $(MAKEFILE_LIST) | sed -E 's/:[^#]*## /\t/' | sort | awk -F'\t' '{ printf "  %-10s %s\n", $$1, $$2 }'
 clean:   ## remove build/
 	rm -rf $(BUILD)
+.PHONY: fibc test mutants bench help clean
 ```
 
-Applied to fib-hocon as the example (its CI runs `make test`); the others follow when they are next touched.
+Applied to fib-hocon as the example (commit f39a538 on its main: `make test` ran the specs in 60 s and scripts/test.sh in 24 s; a second `make test` ran nothing, 0.6 s); the others follow when they are next touched.
 
 ## 6. Tests of the build itself
 

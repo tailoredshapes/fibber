@@ -20,7 +20,11 @@ MUSL_LIBC := $(firstword $(wildcard $(MUSL_DIR)/$(MUSL_ARCH)/libc.a $(MUSL_DIR)/
 STATIC_CASES := 655- 665- 1709- 2228- 2650- 4005- 6106- 6222- 7304- 8000- 8001- 8002- 8003- 8060- 8061-
 STATIC_INPUTS := $(OWNERSHIP_NAMES:%=cases/ownership/%) $(call case_files,modules,$(MODULES_NAMES)) $(wildcard compiler/tests/driver/linklib.sh compiler/tests/driver/linklib/*) \
   $(foreach p,$(STATIC_CASES),$(wildcard cases/stdlib/$(p)*))
-$(BUILD)/static.ok: $(F) $(STATIC_INPUTS) $(MUSL_LIBC) | $(BUILD)/
+# the stamp also depends on whether the pieces are there (a SKIPPED stamp must not outlive a musl directory that appears later)
+# (written at parse time, only when its content changes, so `make -q` and `make -n` stay honest)
+cfg_write = $(shell mkdir -p $(BUILD); echo '$(2)' | cmp -s - $(1) || echo '$(2)' > $(1))
+$(call cfg_write,$(BUILD)/static.cfg,$(or $(MUSL_LIBC),none))
+$(BUILD)/static.ok: $(F) $(STATIC_INPUTS) $(MUSL_LIBC) $(BUILD)/static.cfg | $(BUILD)/
 ifeq ($(MUSL_LIBC),)
 	$(call skip,no musl pieces (FIB_MUSL_DIR, or make musl): the static build was not tested)
 else
@@ -40,8 +44,9 @@ musl: $(BUILD)/musl/$(MUSL_ARCH)/libc.a   ## build the musl pieces of `fibc buil
 TOOLS_CACHE ?= $(HOME)/.cache/fibber-scratch/tools
 WASI_SDK ?= $(patsubst %/,%,$(lastword $(wildcard $(TOOLS_CACHE)/wasm/wasi-sdk-*/)))
 export WASI_SDK
+$(call cfg_write,$(BUILD)/wasm.cfg,$(or $(WASI_SDK),none) $(shell command -v node))
 WASM_INPUTS := $(wildcard compiler/tests/wasm/*) $(OWNERSHIP_NAMES:%=cases/ownership/%) $(call case_files,modules,$(MODULES_NAMES))
-$(BUILD)/wasm.ok: $(F) $(WASM_INPUTS) | $(BUILD)/
+$(BUILD)/wasm.ok: $(F) $(WASM_INPUTS) $(BUILD)/wasm.cfg | $(BUILD)/
 ifeq ($(or $(WASI_SDK),$(WASM_LD),$(shell command -v wasm-ld 2> /dev/null)),)
 	$(call skip,no wasm toolchain (make fetch-wasm, then WASI_SDK): the wasm32-wasi build was not tested)
 else ifeq ($(shell command -v node 2> /dev/null),)

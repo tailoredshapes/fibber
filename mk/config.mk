@@ -54,7 +54,7 @@ LIMIT_STDLIB ?= 1800
 export FIB_LIB := $(ROOT)/lib
 # TMPDIR is outside the tree on purpose: with TMPDIR inside the worktree, cases/stdlib/8283 fails in a shard (expected 0, got 4294967296) and passes
 # with TMPDIR elsewhere (found in MAKE-1; reported, not explained). SCRATCH holds it, and the tool scripts' scratch.
-SCRATCH ?= $(HOME)/.cache/fibber-scratch/make-$(notdir $(ROOT))
+SCRATCH ?= $(HOME)/.cache/fibber-scratch/mk-$(shell echo $(ROOT) | md5sum | cut -c1-8)
 export TMPDIR := $(SCRATCH)/tmp
 $(shell mkdir -p $(TMPDIR))
 unexport LD_LIBRARY_PATH

@@ -13,6 +13,8 @@
 #   8  `make -n gate` runs no download when the seed is in place (no curl, wget, gh release download in the dry run)
 # usage: compiler/tests/make/graph.sh [SCRATCH]     (run anywhere; make 4 is needed)
 set -u
+# The test runs as a tool of the gate, inside make's environment (-j, GATE_FRESH, FIBC=F): none of it belongs to the graph under test.
+unset GATE_FRESH GATE_MODE MAKEFLAGS MFLAGS MAKELEVEL FIBC BUILDER GATE_BUDGET
 here=$(cd "$(dirname "$0")" && pwd); root=$(cd "$here/../../.." && pwd); cd "$root" || exit 2
 S=${1:-${TMPDIR:-/tmp}/make-graph.$$}; rm -rf "$S"; mkdir -p "$S/build" "$S/mk"
 B=$S/build

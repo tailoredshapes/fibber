@@ -64,8 +64,8 @@ after_bar = $(if $(1),$(if $(filter |,$(firstword $(1))),$(wordlist 2,999999,$(1
 
 define tool_target
 $(TOOLS_DIR)/$(1).ok: $(F) $(call after_bar,$(tool_$(1))) | $(TOOLS_DIR)/
-	rm -rf $(TOOLS_OUT)/$(1) $(TOOLS_OUT)/$(1).tmp; mkdir -p $(TOOLS_OUT)/$(1).tmp
-	$$(call stamp,timeout $(TOOLS_TIMEOUT) $(tool_env) TMPDIR=$(TOOLS_OUT)/$(1).tmp $(call upto_bar,$(tool_$(1))))
+	rm -rf $(TOOLS_OUT)/$(1); mkdir -p $(TOOLS_OUT)
+	$$(call stamp,timeout $(TOOLS_TIMEOUT) $(tool_env) TMPDIR=$(TOOLS_OUT) $(call upto_bar,$(tool_$(1))))
 endef
 $(foreach t,$(TOOLS_FULL),$(eval $(call tool_target,$(t))))
 TOOLS_QUICK_STAMPS := $(addsuffix .ok,$(addprefix $(TOOLS_DIR)/,$(TOOLS_QUICK)))
