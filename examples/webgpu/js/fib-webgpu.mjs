@@ -6,7 +6,7 @@
 //
 // The binding model is the WGSL's (compiler/native/wgsl.fib): group 0, binding 0 the uniform of scalar arguments (4 bytes each in order),
 // binding 1 the trap flag, bindings 2.. the buffer arguments in order; the workgroup size is the override constants wg_x, wg_y, wg_z. A
-// kernel's `// fib-kernel NAME T..` line is the signature a launch is checked against. Every error reaches the module as a negative status
+// kernel's `// fib.kernel-sig NAME: T..` line (GPU-2's launch ABI) is the signature a launch is checked against. Every error reaches the module as a negative status
 // and a text (`fib_gpu_error`); nothing throws into the module: no `navigator.gpu` is an Err of open.
 
 export class GpuError extends Error {
@@ -18,7 +18,7 @@ const LIMITS = { maxBuffers: 7, maxScalars: 16 };
 function parseSignatures(wgsl) {
   const kernels = new Map();
   for (const line of wgsl.split("\n")) {
-    const m = /^\/\/ fib-kernel (\S+)((?: \S+)*)$/.exec(line);
+    const m = /^\/\/ fib\.kernel-sig (\S+):((?: \S+)*)$/.exec(line);
     if (m) kernels.set(m[1], m[2].trim().split(/\s+/).filter(Boolean));
   }
   return kernels;

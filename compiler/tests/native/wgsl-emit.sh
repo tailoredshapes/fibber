@@ -2,15 +2,15 @@
 # The WebGPU kernel target (docs/design/webgpu.md; compiler/types/targets.fib `row-wgsl-webgpu`; native.wgsl): what `fibc build --target
 # wgsl-unknown-webgpu --emit wgsl` writes for examples/webgpu/kernels.fib, and what it refuses. No GPU is needed.
 #   1. the table has the row, marked a kernel target, and `fibc build` accepts it without --allow-unsupported;
-#   2. the WGSL holds the four kernels as `@compute @workgroup_size(wg_x, wg_y, wg_z)` entries with their `// fib-kernel` signature lines, the
+#   2. the WGSL holds the four kernels as `@compute @workgroup_size(wg_x, wg_y, wg_z)` entries with their `// fib.kernel-sig` signature lines, the
 #      binding model (the uniform at 0, the flag at 1, buf0 at 2), the override constants, `fma(` for `simd/fma`, the checked `+` of vaddi as
 #      `fibw_sadd_ovf(`, the trap as `atomicStore(&fibw_flag.flag, 1u)`, the index space as `fibw_lid`/`fibw_wid`, and NO i64, f64, u64 or `ptr<`
 #      (a pointer is `Ptr`), NO runtime function (`fib_alloc`), NO libc name; it equals the golden compiler/tests/native/wgsl/kernels.wgsl
 #      (--update rewrites the golden from this fibc: read the diff);
 #   3. naga validates it (`naga FILE.wgsl`: the tool of scripts/fetch-webgpu-tools.sh, skipped with a note when absent: NAGA names it);
-#   4. the same file still builds and runs for the host (`fibc run`: the three reference hashes);
+#   4. the same file still runs for the host (`fibc run`: 0) and cpu.fib prints the three reference hashes;
 #   5. the cases/stdlib/857x webgpu cases: each builds for the host (the case harness checks that) and its `;; webgpu-target = VERDICT | TEXT` line
-#      holds for the WebGPU target (accept: the WGSL has `fib-kernel k`; reject: the refusal names the kernel and contains TEXT);
+#      holds for the WebGPU target (accept: the WGSL has `fib.kernel-sig k:`; reject: the refusal names the kernel and contains TEXT);
 #   6. refusals: `--emit ptx`, `--emit llvm` and `--emit obj` on the WebGPU target; `--emit wgsl` on nvptx64 and for the host; an executable;
 #   7. planted faults: a WGSL with a binding index off by one, one without the override workgroup size, one whose trap never sets the flag, one
 #      whose checked + is a plain + must each fail check 2 (planted in a copy, the check function rerun on it).
@@ -23,7 +23,7 @@ export FIB_LIB=$root/lib
 NAGA=${NAGA:-$HOME/.cache/fibber-scratch/tools/naga/bin/naga}
 T=$(mktemp -d "${TMPDIR:-/tmp}/wgsl-emit.XXXXXX"); trap 'rm -rf "$T"' EXIT
 bad=0; ok() { echo "ok   $*"; }; no() { echo "FAIL $*"; bad=1; }
-K=examples/webgpu/kernels.fib; INC=(-I examples/gpu -I examples/webgpu); GOLD=compiler/tests/native/wgsl/kernels.wgsl
+K=examples/webgpu/kernels.fib; INC=(-I examples/webgpu); GOLD=compiler/tests/native/wgsl/kernels.wgsl
 emit() { "$F" build "${INC[@]}" --target wgsl-unknown-webgpu "$1" --emit wgsl -o "$2"; }
 
 # 1. the row
@@ -34,7 +34,7 @@ if emit "$K" "$T/k.wgsl" 2> "$T/err"; then ok "build --emit wgsl: accepted witho
 # 2. the WGSL
 wgsl_checks() { # wgsl_checks FILE: the content checks; prints what is wrong, returns 1 on any
   local f=$1 r=0
-  for want in '// fib-kernel vadd ptr ptr ptr i32' '// fib-kernel vaddi ptr ptr ptr i32' '// fib-kernel gemm ptr ptr ptr i32' '// fib-kernel assert_positive ptr i32' \
+  for want in '// fib.kernel-sig vadd: ptr ptr ptr i32' '// fib.kernel-sig vaddi: ptr ptr ptr i32' '// fib.kernel-sig gemm: ptr ptr ptr i32' '// fib.kernel-sig assert_positive: ptr i32' \
               '@compute @workgroup_size(wg_x, wg_y, wg_z)' 'fn vadd(' 'fn gemm(' 'fn assert_positive(' 'override wg_x: u32' \
               '@group(0) @binding(0) var<uniform> fibw_params' '@group(0) @binding(1) var<storage, read_write> fibw_flag' '@group(0) @binding(2) var<storage, read_write> buf0' \
               'fma(' 'fibw_sadd_ovf(' 'atomicStore(&fibw_flag.flag, 1u)' 'fibw_lid' 'fibw_wid' 'workgroupBarrier\|fibw_nwg'; do
@@ -57,7 +57,8 @@ if [ -x "$NAGA" ]; then
 else echo "note naga not found at $NAGA (scripts/fetch-webgpu-tools.sh naga): validation skipped"; fi
 
 # 4. the host still runs it
-"$F" run "${INC[@]}" "$K" > "$T/run" 2>&1 && grep -q "^gemm 256 " "$T/run" && ok "host: fibc run of the kernels file prints the reference hashes" || no "host run: $(tail -n 3 "$T/run")"
+"$F" run "${INC[@]}" "$K" > "$T/run" 2>&1 && [ "$(cat "$T/run")" = 0 ] && ok "host: fibc run of the kernels file: 0 (the kernels are ordinary functions there)" || no "host run of the kernels: $(tail -n 3 "$T/run")"
+"$F" run "${INC[@]}" examples/webgpu/cpu.fib > "$T/cpu" 2>&1 && grep -q "^gemm 256 " "$T/cpu" && ok "host: cpu.fib prints the three reference hashes" || no "cpu.fib: $(tail -n 3 "$T/cpu")"
 
 # 5. the cases
 for c in cases/stdlib/857[0-9]-webgpu-*.fib; do

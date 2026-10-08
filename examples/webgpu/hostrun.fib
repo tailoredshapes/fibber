@@ -1,0 +1,94 @@
+;; examples/webgpu/hostrun.fib: the host of the one-language runs (docs/design/webgpu.md 6), written once over fibber's `fib.gpu` protocols and no driver: it takes a
+;; `(dyn Platform)` and the kernels' source (WGSL, or PTX), launches the kernels of examples/webgpu/kernels.fib, prints the hash of each result in the form of
+;; kernels.fib's `main` (`NAME n HASH`) and checks it against the CPU reference. The mains that choose a driver are host.fib (`webgpu/platform`: wgpu-native
+;; natively, the JavaScript glue under wasm32) and host-cuda.fib (`cuda/platform`, fib-gpu-cuda): the same program, three drivers.
+;; `run-all` is 0 when every hash is the reference's, 1 on a mismatch; an Err when the driver fails. The assert kernel must trap on a non-positive input (the
+;; `:device-trap` Err of `stream-sync`) and pass on a positive one.
+(ns hostrun (:use fib.core fib.seq fib.coll) (:require [fib.gpu :as gpu] [refs :as k]))
+
+(defun as-f32 (xs: (Array i32)) -> (Array f32)
+  (let [out (cell (array (array-len xs) 0.0f32))]
+    (do (dotimes (i (array-len xs)) (array-set! &out i (bits->f32 (array-get xs i)))) @out)))
+
+(defun as-i32 (xs: (Array f32)) -> (Array i32)
+  (let [out (cell (array (array-len xs) 0i32))]
+    (do (dotimes (i (array-len xs)) (array-set! &out i (f32->bits (array-get xs i)))) @out)))
+
+(defun run-vadd (d: (dyn gpu/Device) s: (dyn gpu/Stream) m: (dyn gpu/Module)) -> (Result i64 gpu/GpuError)
+  (let [n k/VADD-N ha (k/fill-f32 n 1) hb (k/fill-f32 n 2)]
+    (try-let [kn (gpu/module-kernel m "vadd")
+              a (gpu/device-alloc d (* 4 n)) b (gpu/device-alloc d (* 4 n)) c (gpu/device-alloc d (* 4 n))
+              _ (gpu/buffer-upload a ha) _ (gpu/buffer-upload b hb)
+              _ (gpu/stream-launch s kn [(quot (+ n 255) 256)] [256] [(gpu/ABuf a) (gpu/ABuf b) (gpu/ABuf c) (gpu/AI32 (trunc i32 n))])
+              _ (gpu/stream-sync s)
+              hc (gpu/buffer-download c n)
+              _ (gpu/buffer-release a) _ (gpu/buffer-release b) _ (gpu/buffer-release c)]
+      (let [h (k/hash-f32 hc)]
+        (do (println (str "vadd " n " " h))
+            (Ok (if (= h (k/hash-f32 (k/vadd-ref ha hb))) 0 1)))))))
+
+(defun run-vaddi (d: (dyn gpu/Device) s: (dyn gpu/Stream) m: (dyn gpu/Module)) -> (Result i64 gpu/GpuError)
+  (let [n k/VADD-N ha (k/fill-i32 n 3) hb (k/fill-i32 n 4)]
+    (try-let [kn (gpu/module-kernel m "vaddi")
+              a (gpu/device-alloc d (* 4 n)) b (gpu/device-alloc d (* 4 n)) c (gpu/device-alloc d (* 4 n))
+              _ (gpu/buffer-upload a (as-f32 ha)) _ (gpu/buffer-upload b (as-f32 hb))
+              _ (gpu/stream-launch s kn [(quot (+ n 255) 256)] [256] [(gpu/ABuf a) (gpu/ABuf b) (gpu/ABuf c) (gpu/AI32 (trunc i32 n))])
+              _ (gpu/stream-sync s)
+              hc (gpu/buffer-download c n)
+              _ (gpu/buffer-release a) _ (gpu/buffer-release b) _ (gpu/buffer-release c)]
+      (let [h (k/hash-i32 (as-i32 hc))]
+        (do (println (str "vaddi " n " " h))
+            (Ok (if (= h (k/hash-i32 (k/vaddi-ref ha hb))) 0 1)))))))
+
+(defun worst-rel (got: (Array f32) ref: (Array f32)) -> f64
+  (loop [i 0 worst 0.0]
+    (if (>= i (array-len got))
+        worst
+        (let [r (fpext f64 (array-get ref i)) e (abs (- (fpext f64 (array-get got i)) r))]
+          (recur (+ i 1) (max worst (if (= r 0.0) e (/ e (abs r)))))))))
+
+;; The GEMM: the hash, and with `with-ref` the largest relative difference against the CPU (0 when the fma chain is fused the same way, gpu.md 2.1). A wasm
+;; host has no fused multiply-add (`simd/fma` traps on wasm32, ADR 0008), so it prints the hash only and the script compares it with the native CPU run's.
+(defun run-gemm (d: (dyn gpu/Device) s: (dyn gpu/Stream) m: (dyn gpu/Module) with-ref: bool) -> (Result i64 gpu/GpuError)
+  (let [n k/GEMM-N ha (k/fill-f32 (* n n) 5) hb (k/fill-f32 (* n n) 6)]
+    (try-let [kn (gpu/module-kernel m "gemm")
+              a (gpu/device-alloc d (* 4 n n)) b (gpu/device-alloc d (* 4 n n)) c (gpu/device-alloc d (* 4 n n))
+              _ (gpu/buffer-upload a ha) _ (gpu/buffer-upload b hb)
+              _ (gpu/stream-launch s kn [(quot n 64) (quot n 64)] [16 16] [(gpu/ABuf a) (gpu/ABuf b) (gpu/ABuf c) (gpu/AI32 (trunc i32 n))])
+              _ (gpu/stream-sync s)
+              hc (gpu/buffer-download c (* n n))
+              _ (gpu/buffer-release a) _ (gpu/buffer-release b) _ (gpu/buffer-release c)]
+      (let [h (k/hash-f32 hc)]
+        (do (println (str "gemm " n " " h))
+            (if (not with-ref)
+                (Ok 0)
+                (let [ref (k/gemm-ref ha hb n) worst (worst-rel hc ref)]
+                  (do (println (str "gemm " n " worst relative difference against the CPU: " worst (if (= h (k/hash-f32 ref)) " (bit exact)" "")))
+                      (Ok (if (<= worst 2.0e-5) 0 1))))))))))
+
+;; The assert kernel: `stream-sync` is Ok on a positive input and the `:device-trap` Err on one with a zero.
+(defun run-assert (d: (dyn gpu/Device) s: (dyn gpu/Stream) m: (dyn gpu/Module) positive: bool) -> (Result i64 gpu/GpuError)
+  (let [n 4096 xs (cell (array n 1.5f32))]
+    (do (when (not positive) (array-set! &xs 1000 0.0f32))
+        (try-let [kn (gpu/module-kernel m "assert_positive")
+                  a (gpu/device-alloc d (* 4 n))
+                  _ (gpu/buffer-upload a @xs)
+                  _ (gpu/stream-launch s kn [(quot n 256)] [256] [(gpu/ABuf a) (gpu/AI32 (trunc i32 n))])]
+          (match (gpu/stream-sync s)
+            ((Ok _) (do (println (str "assert " (if positive "positive: sync Ok" "zero: sync Ok (NOT trapped)"))) (Ok (if positive 0 1))))
+            ((Err e) (do (println (str "assert " (if positive "positive: sync Err (NOT expected): " "zero: sync Err (the device trap): ") (. e message)))
+                         (Ok (if (and (not positive) (= (. e kind) :device-trap)) 0 1)))))))))
+
+(defun run-all (p: (dyn gpu/Platform) source: (Array i8) with-ref: bool) -> (Result i64 gpu/GpuError)
+  (try-let [d (gpu/platform-open p 0)
+            s (gpu/device-stream d)
+            m (gpu/device-load d source)
+            r1 (run-vadd d s m) r2 (run-vaddi d s m) r3 (run-gemm d s m with-ref)
+            r4 (run-assert d s m true) r5 (run-assert d s m false)]
+    (do (println (str "device: " (. (gpu/device-info d) name)))
+        (Ok (max r1 (max r2 (max r3 (max r4 r5))))))))
+
+(defun report (r: (Result i64 gpu/GpuError)) -> i64
+  (match r
+    ((Ok code) (do (println (if (= code 0) "host: every result is the reference's" "host: a result differs")) code))
+    ((Err e) (do (println (str "gpu: " (. e kind) ": " (. e message))) 2))))

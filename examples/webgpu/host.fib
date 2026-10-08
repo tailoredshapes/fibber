@@ -1,101 +1,14 @@
-;; examples/webgpu/host.fib: the host of the WebGPU runs (docs/design/webgpu.md 6): launches the kernels of examples/webgpu/kernels.fib
-;; through the `webgpu` driver and prints the hash of each result in the form of kernels.fib's `main` (`NAME n HASH`), then checks them
-;; against the CPU references computed here. The same program is
-;;   the wasm host:   fibc build host.fib --target wasm32-wasi -I examples/gpu -I examples/webgpu -I examples/webgpu/js --export run -o host.wasm
+;; examples/webgpu/host.fib: the WebGPU host (docs/design/webgpu.md 6): hostrun.fib over `webgpu/platform`, the driver of the `-I` path that is given:
+;;   the wasm host:   fibc build host.fib --target wasm32-wasi -I examples/webgpu -I examples/webgpu/js --export run -o host.wasm
 ;;                    (node examples/webgpu/js/run.mjs host.wasm kernels.wgsl: the glue fib-webgpu.mjs provides the driver over navigator.gpu)
-;;   the native host: fibc build host.fib -I examples/gpu -I examples/webgpu -I fib-gpu-webgpu/src -o host   (the driver over wgpu-native)
-;; `run` takes the WGSL text (a pointer and a length: what `--emit wgsl` wrote) and returns 0 when every hash is the reference's, 1 on a
-;; mismatch, 2 on a driver error; the assert kernel must trap on a non-positive input (an Err of `sync`) and pass on a positive one.
-(ns main (:use fib.core fib.seq fib.coll) (:require [webgpu :as g] [kernels :as k] [fib.os.native :as n]))
+;;   the native host: fibc build host.fib -I examples/webgpu -I fib-gpu-webgpu/src -L fib-gpu-webgpu/lib -L $WGPU_NATIVE_DIR/lib -o host  (the driver over wgpu-native)
+;; `run` (wasm) takes the WGSL text (a pointer and a length: what `--emit wgsl` wrote) and returns 0 when every hash is the reference's, 1 on a mismatch, 2 on a
+;; driver error (no WebGPU in the host is the `:no-device` Err of `platform-open`, never a trap).
+(ns main (:use fib.core fib.seq fib.coll) (:require [webgpu :as g] [hostrun :as h] [fib.os.native :as n]))
 
-(defun run-vadd (d: g/Device s: g/Stream m: g/Module) -> (Result i64 g/GpuError)
-  (let [n k/VADD-N ha (k/fill-f32 n 1) hb (k/fill-f32 n 2)]
-    (try-let [kn (g/kernel m "vadd")
-              a (g/buffer d (* 4 n)) b (g/buffer d (* 4 n)) c (g/buffer d (* 4 n))
-              _ (g/upload-f32 a ha) _ (g/upload-f32 b hb)
-              _ (g/launch s kn [(quot (+ n 255) 256)] [256] [(g/ABuf a) (g/ABuf b) (g/ABuf c) (g/AI32 (trunc i32 n))])
-              _ (g/sync s)
-              hc (g/download-f32 c n)
-              _ (g/release a) _ (g/release b) _ (g/release c)]
-      (let [h (k/hash-f32 hc) ref (k/hash-f32 (k/vadd-ref ha hb))]
-        (do (println (str "vadd " n " " h))
-            (Ok (if (= h ref) 0 1)))))))
-
-(defun run-vaddi (d: g/Device s: g/Stream m: g/Module) -> (Result i64 g/GpuError)
-  (let [n k/VADD-N ha (k/fill-i32 n 3) hb (k/fill-i32 n 4)]
-    (try-let [kn (g/kernel m "vaddi")
-              a (g/buffer d (* 4 n)) b (g/buffer d (* 4 n)) c (g/buffer d (* 4 n))
-              _ (g/upload-i32 a ha) _ (g/upload-i32 b hb)
-              _ (g/launch s kn [(quot (+ n 255) 256)] [256] [(g/ABuf a) (g/ABuf b) (g/ABuf c) (g/AI32 (trunc i32 n))])
-              _ (g/sync s)
-              hc (g/download-i32 c n)
-              _ (g/release a) _ (g/release b) _ (g/release c)]
-      (let [h (k/hash-i32 hc) ref (k/hash-i32 (k/vaddi-ref ha hb))]
-        (do (println (str "vaddi " n " " h))
-            (Ok (if (= h ref) 0 1)))))))
-
-;; The GEMM: the hash, and with `with-ref` the largest relative difference against the CPU (0 when the fma chain is fused the same way,
-;; gpu.md 2.1). The wasm host has no fused multiply-add (`simd/fma` traps on wasm32, ADR 0008), so it prints the hash only and the script
-;; compares it with the native CPU run's.
-(defun run-gemm (d: g/Device s: g/Stream m: g/Module with-ref: bool) -> (Result i64 g/GpuError)
-  (let [n k/GEMM-N ha (k/fill-f32 (* n n) 5) hb (k/fill-f32 (* n n) 6)]
-    (try-let [kn (g/kernel m "gemm")
-              a (g/buffer d (* 4 n n)) b (g/buffer d (* 4 n n)) c (g/buffer d (* 4 n n))
-              _ (g/upload-f32 a ha) _ (g/upload-f32 b hb)
-              _ (g/launch s kn [(quot n 64) (quot n 64)] [16 16] [(g/ABuf a) (g/ABuf b) (g/ABuf c) (g/AI32 (trunc i32 n))])
-              _ (g/sync s)
-              hc (g/download-f32 c (* n n))
-              _ (g/release a) _ (g/release b) _ (g/release c)]
-      (let [h (k/hash-f32 hc)]
-        (do (println (str "gemm " n " " h))
-            (if (not with-ref)
-                (Ok 0)
-                (let [ref (k/gemm-ref ha hb n) worst (worst-rel hc ref)]
-                  (do (println (str "gemm " n " worst relative difference against the CPU: " worst (if (= h (k/hash-f32 ref)) " (bit exact)" "")))
-                      (Ok (if (<= worst 2.0e-5) 0 1))))))))))
-
-(defun worst-rel (got: (Array f32) ref: (Array f32)) -> f64
-  (loop [i 0 worst 0.0]
-    (if (>= i (array-len got))
-        worst
-        (let [r (fpext f64 (array-get ref i)) e (abs (- (fpext f64 (array-get got i)) r))]
-          (recur (+ i 1) (max worst (if (= r 0.0) e (/ e (abs r)))))))))
-
-;; The assert kernel: `sync` is Ok on a positive input and an Err (the device trap) on one with a zero.
-(defun run-assert (d: g/Device s: g/Stream m: g/Module positive: bool) -> (Result i64 g/GpuError)
-  (let [n 4096 xs (cell (k/fill-f32 n 7))]
-    (do (array-set! &xs 0 (if positive 1.0f32 0.0f32))
-        (dotimes (i n) (when (<= (array-get @xs i) 0.0f32) (array-set! &xs i 1.0f32)))
-        (when (not positive) (array-set! &xs 1000 0.0f32))
-        (try-let [kn (g/kernel m "assert_positive")
-                  a (g/buffer d (* 4 n))
-                  _ (g/upload-f32 a @xs)
-                  _ (g/launch s kn [(quot n 256)] [256] [(g/ABuf a) (g/AI32 (trunc i32 n))])]
-          (let [r (g/sync s)]
-            (match r
-              ((Ok _) (do (println (str "assert " (if positive "positive: sync Ok" "zero: sync Ok (NOT trapped)")))
-                          (match (g/release a) ((Ok _) (Ok (if positive 0 1))) ((Err e) (Err e)))))
-              ((Err e) (do (println (str "assert " (if positive "positive: sync Err (NOT expected): " "zero: sync Err (the device trap): ") (. e message)))
-                           (match (g/release a) ((Ok _) (Ok (if positive 1 0))) ((Err e2) (Err e2)))))))))))
-
-(defun run-all (wgsl: str with-ref: bool) -> (Result i64 g/GpuError)
-  (try-let [d (g/open)
-            s (g/stream d)
-            m (g/load-wgsl d wgsl)
-            r1 (run-vadd d s m) r2 (run-vaddi d s m) r3 (run-gemm d s m with-ref)
-            r4 (run-assert d s m true) r5 (run-assert d s m false)
-            _ (g/close d)]
-    (do (println (str "device: " (. d name)))
-        (Ok (max r1 (max r2 (max r3 (max r4 r5))))))))
-
-(defun report (r: (Result i64 g/GpuError)) -> i64
-  (match r
-    ((Ok code) (do (println (if (= code 0) "host: every result is the reference's" "host: a result differs")) code))
-    ((Err e) (do (println (str "webgpu: " (. e call) " failed (" (. e code) "): " (. e message))) 2))))
-
-;; The wasm export: the WGSL text at `p` of `len` bytes.
+;; The wasm export: the WGSL text at `p` of `len` bytes. The CPU's GEMM reference is not computed there (no fused multiply-add on wasm32).
 (defun run (p: ptr len: i64) -> i64
-  (report (run-all (str-from-bytes (n/bytes-at p len)) false)))
+  (h/report (h/run-all (g/platform) (n/bytes-at p len) false)))
 
 (defun main () -> i64
   (let [a (args)]
@@ -103,4 +16,4 @@
         (do (println "usage: host KERNELS.wgsl") 2)
         (match (try-slurp (nth a 0))
           ((Err e) (do (println (str "cannot read " (nth a 0) ": " e)) 2))
-          ((Ok wgsl) (report (run-all wgsl true)))))))
+          ((Ok wgsl) (h/report (h/run-all (g/platform) (str-bytes wgsl) true)))))))

@@ -1,79 +1,7 @@
-;; examples/webgpu/host-cuda.fib: the CUDA run of the kernels of examples/webgpu/kernels.fib (docs/design/webgpu.md 6: one `defkernel`,
-;; three runs). The same kernels as PTX (`fibc build --target nvptx64-nvidia-cuda --emit ptx`), launched through the fib-gpu-cuda driver
-;; (its `cuda` module, v0.0.1); prints the hash of each result in the form of kernels.fib's `main`, and checks it against the CPU reference.
-;;   fibc build examples/webgpu/host-cuda.fib -I examples/gpu -I examples/webgpu -I fib-gpu-cuda/src -o host-cuda; host-cuda KERNELS.ptx
-;; The driver moves f32 only: the i32 vectors cross as their bits (`bits->f32`, `f32->bits`: the same 32-bit words).
-(ns main (:use fib.core fib.seq fib.coll) (:require [cuda :as cu] [kernels :as k]))
-
-(defun as-f32 (xs: (Array i32)) -> (Array f32)
-  (let [out (cell (array (array-len xs) 0.0f32))]
-    (do (dotimes (i (array-len xs)) (array-set! &out i (bits->f32 (array-get xs i)))) @out)))
-
-(defun as-i32 (xs: (Array f32)) -> (Array i32)
-  (let [out (cell (array (array-len xs) 0i32))]
-    (do (dotimes (i (array-len xs)) (array-set! &out i (f32->bits (array-get xs i)))) @out)))
-
-(defun run-vadd (d: cu/Device s: cu/Stream m: cu/Module) -> (Result i64 cu/CudaError)
-  (let [n k/VADD-N ha (k/fill-f32 n 1) hb (k/fill-f32 n 2)]
-    (try-let [kn (cu/kernel m "vadd")
-              a (cu/buffer d (* 4 n)) b (cu/buffer d (* 4 n)) c (cu/buffer d (* 4 n))
-              _ (cu/upload-f32 a ha) _ (cu/upload-f32 b hb)
-              _ (cu/launch s kn [(quot (+ n 255) 256)] [256] [(cu/ABuf a) (cu/ABuf b) (cu/ABuf c) (cu/AI32 (trunc i32 n))])
-              _ (cu/sync s)
-              hc (cu/download-f32 c n)
-              _ (cu/release a) _ (cu/release b) _ (cu/release c)]
-      (let [h (k/hash-f32 hc)]
-        (do (println (str "vadd " n " " h))
-            (Ok (if (= h (k/hash-f32 (k/vadd-ref ha hb))) 0 1)))))))
-
-(defun run-vaddi (d: cu/Device s: cu/Stream m: cu/Module) -> (Result i64 cu/CudaError)
-  (let [n k/VADD-N ha (k/fill-i32 n 3) hb (k/fill-i32 n 4)]
-    (try-let [kn (cu/kernel m "vaddi")
-              a (cu/buffer d (* 4 n)) b (cu/buffer d (* 4 n)) c (cu/buffer d (* 4 n))
-              _ (cu/upload-f32 a (as-f32 ha)) _ (cu/upload-f32 b (as-f32 hb))
-              _ (cu/launch s kn [(quot (+ n 255) 256)] [256] [(cu/ABuf a) (cu/ABuf b) (cu/ABuf c) (cu/AI32 (trunc i32 n))])
-              _ (cu/sync s)
-              hc (cu/download-f32 c n)
-              _ (cu/release a) _ (cu/release b) _ (cu/release c)]
-      (let [h (k/hash-i32 (as-i32 hc))]
-        (do (println (str "vaddi " n " " h))
-            (Ok (if (= h (k/hash-i32 (k/vaddi-ref ha hb))) 0 1)))))))
-
-(defun run-gemm (d: cu/Device s: cu/Stream m: cu/Module) -> (Result i64 cu/CudaError)
-  (let [n k/GEMM-N ha (k/fill-f32 (* n n) 5) hb (k/fill-f32 (* n n) 6)]
-    (try-let [kn (cu/kernel m "gemm")
-              a (cu/buffer d (* 4 n n)) b (cu/buffer d (* 4 n n)) c (cu/buffer d (* 4 n n))
-              _ (cu/upload-f32 a ha) _ (cu/upload-f32 b hb)
-              _ (cu/launch s kn [(quot n 64) (quot n 64)] [16 16] [(cu/ABuf a) (cu/ABuf b) (cu/ABuf c) (cu/AI32 (trunc i32 n))])
-              _ (cu/sync s)
-              hc (cu/download-f32 c (* n n))
-              _ (cu/release a) _ (cu/release b) _ (cu/release c)]
-      (let [h (k/hash-f32 hc) ref (k/hash-f32 (k/gemm-ref ha hb n))]
-        (do (println (str "gemm " n " " h))
-            (println (str "gemm " n (if (= h ref) " bit exact against the CPU" " differs from the CPU")))
-            (Ok (if (= h ref) 0 1)))))))
-
-;; The assert kernel on a positive input (sync Ok) and on one with a zero (sync Err: the device trap; the context is lost after it, so it is last).
-(defun run-assert (d: cu/Device s: cu/Stream m: cu/Module positive: bool) -> (Result i64 cu/CudaError)
-  (let [n 4096 xs (cell (array n 1.5f32))]
-    (do (when (not positive) (array-set! &xs 1000 0.0f32))
-        (try-let [kn (cu/kernel m "assert_positive")
-                  a (cu/buffer d (* 4 n))
-                  _ (cu/upload-f32 a @xs)
-                  _ (cu/launch s kn [(quot n 256)] [256] [(cu/ABuf a) (cu/AI32 (trunc i32 n))])]
-          (match (cu/sync s)
-            ((Ok _) (do (println (str "assert " (if positive "positive: sync Ok" "zero: sync Ok (NOT trapped)"))) (Ok (if positive 0 1))))
-            ((Err e) (do (println (str "assert " (if positive "positive: sync Err (NOT expected): " "zero: sync Err (the device trap): ") (. e code) " " (. e message)))
-                         (Ok (if positive 1 0)))))))))
-
-(defun run-all (ptx: str) -> (Result i64 cu/CudaError)
-  (try-let [d (cu/open 0)
-            s (cu/stream d)
-            m (cu/load-ptx d ptx)
-            r1 (run-vadd d s m) r2 (run-vaddi d s m) r3 (run-gemm d s m)
-            r4 (run-assert d s m true) r5 (run-assert d s m false)]
-    (do (println (str "device: " (. d name) " " (cu/sm-name d)))
-        (Ok (max r1 (max r2 (max r3 (max r4 r5))))))))
+;; examples/webgpu/host-cuda.fib: the CUDA host of the same kernels (docs/design/webgpu.md 6): hostrun.fib over `cuda/platform`, the driver fib-gpu-cuda v0.1.0.
+;;   fibc build examples/webgpu/host-cuda.fib -I examples/webgpu -I fib-gpu-cuda/src -o host-cuda; host-cuda KERNELS.ptx
+;; where KERNELS.ptx is `fibc build --target nvptx64-nvidia-cuda --emit ptx examples/webgpu/kernels.fib` (the kernel-sig header is the launch ABI).
+(ns main (:use fib.core fib.seq fib.coll) (:require [cuda :as g] [hostrun :as h]))
 
 (defun main () -> i64
   (let [a (args)]
@@ -81,6 +9,4 @@
         (do (println "usage: host-cuda KERNELS.ptx") 2)
         (match (try-slurp (nth a 0))
           ((Err e) (do (println (str "cannot read " (nth a 0) ": " e)) 2))
-          ((Ok ptx) (match (run-all ptx)
-                      ((Ok code) (do (println (if (= code 0) "host-cuda: every result is the reference's" "host-cuda: a result differs")) code))
-                      ((Err e) (do (println (str "cuda: " (. e call) " failed (" (. e code) "): " (. e message))) 2))))))))
+          ((Ok ptx) (h/report (h/run-all (g/platform) (str-bytes ptx) true)))))))

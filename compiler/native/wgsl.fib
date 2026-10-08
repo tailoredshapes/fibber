@@ -9,7 +9,7 @@
 ;;   binding 1   storage   fibw_flag    the trap flag: 0 before the dispatch; 1 after a device trap (the driver reads it and reports Err)
 ;;   binding 2.. storage   buf0..      the pointer parameters in parameter order, as arrays of 32-bit words
 ;; The workgroup size is the override constants wg_x, wg_y, wg_z, set at pipeline creation (the launch's block). The line
-;; `// fib-kernel NAME T..` names each kernel's parameter types in order, for the driver to check a launch against.
+;; `// fib.kernel-sig NAME: T..` names each kernel's parameter kinds in order (GPU-2's launch ABI header), for the driver to check a launch against.
 (ns native.wgsl
   (:use lir.types lir.ast native.wgsl.wx)
   (:require [native.wgsl.func :as func] [fib.string :as s]))
@@ -98,12 +98,12 @@
 
 ;; ---------------------------------------------------------------- the entries
 
-(defun type-word :private (t: LType) -> str
-  (match t ((TPtr) "ptr") ((TInt 1) "bool") ((TInt 32) "i32") ((TFloat) "f32") (_ (type-str t))))
+(defun type-word :private (t: LType) -> str (type-str t))
 
-;; `// fib-kernel NAME T..`: the launch ABI line a driver checks arguments against.
+;; `// fib.kernel-sig NAME: T..`: the launch ABI line a driver checks arguments against, GPU-2's header (fib.gpu.device `parse-signatures`) with lIR's
+;; words for the kinds: ptr i32 float i1.
 (defun signature-line :private (f: LFunction) -> str
-  (str "// fib-kernel " (wname (. f name)) (str-join (vec (map (fn (t: LType) (str " " (type-word t))) (. (. f ty) params)))) "\n"))
+  (str "// fib.kernel-sig " (wname (. f name)) ":" (str-join (vec (map (fn (t: LType) (str " " (type-word t))) (. (. f ty) params)))) "\n"))
 
 (defun param-component :private (k: i64) -> str
   (str "fibw_params[" (quot k 4) "]." (nth ["x" "y" "z" "w"] (rem k 4))))

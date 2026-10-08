@@ -11,13 +11,13 @@
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd); cd "$root"
 F=${F:-${FIBC:-fibc}}; export FIB_LIB=$root/lib
-cuda=${FIB_GPU_CUDA:-$HOME/.cache/fibber-scratch/gpu1/fib-gpu-cuda}; webgpu=${FIB_GPU_WEBGPU:-$HOME/.cache/fibber-scratch/webgpu1/fib-gpu-webgpu}
+cuda=${FIB_GPU_CUDA:-$HOME/.cache/fibber-scratch/gpu2/fib-gpu-cuda}; webgpu=${FIB_GPU_WEBGPU:-$HOME/.cache/fibber-scratch/webgpu1/fib-gpu-webgpu}
 wg=${WGPU_NATIVE_DIR:-$HOME/.cache/fibber-scratch/tools/wgpu-native}
 export WASI_SDK=${WASI_SDK:-$HOME/.cache/fibber-scratch/tools/wasm/wasi-sdk-34.0-x86_64-linux}
 do_cuda=1; do_native=1; do_node=1; do_browser=0
 for a in "$@"; do case $a in --no-cuda) do_cuda=0 ;; --no-native) do_native=0 ;; --no-node) do_node=0 ;; --browser) do_browser=1 ;; esac; done
 T=$(mktemp -d "${TMPDIR:-/tmp}/webgpu-agree.XXXXXX"); trap 'rm -rf "$T"' EXIT
-bad=0; INC=(-I examples/webgpu -I examples/gpu)
+bad=0; INC=(-I examples/webgpu)
 hashes() { grep -E "^(vadd|vaddi|gemm) [0-9]+ [0-9]+$" "$1" | sort; }
 compare() { # compare NAME LOG: the hash lines against the CPU's
   if diff <(hashes "$T/cpu.log") <(hashes "$2") > "$T/d"; then echo "ok   $1: vadd, vaddi, gemm hash as the CPU's ($(grep -m1 device: "$2" | cut -c1-80))"
@@ -26,7 +26,7 @@ compare() { # compare NAME LOG: the hash lines against the CPU's
   else echo "FAIL $1: $(cat "$T/d" | head -n 4 | tr '\n' ' ')"; bad=1; fi
 }
 
-"$F" run "${INC[@]}" examples/webgpu/kernels.fib > "$T/cpu.log" 2>&1 || { echo "the CPU run failed: $(tail -n 2 "$T/cpu.log")"; exit 2; }
+"$F" run "${INC[@]}" examples/webgpu/cpu.fib > "$T/cpu.log" 2>&1 || { echo "the CPU run failed: $(tail -n 2 "$T/cpu.log")"; exit 2; }
 echo "cpu: $(hashes "$T/cpu.log" | tr '\n' ';')"
 "$F" build "${INC[@]}" --target wgsl-unknown-webgpu examples/webgpu/kernels.fib --emit wgsl -o "$T/k.wgsl" || exit 2
 

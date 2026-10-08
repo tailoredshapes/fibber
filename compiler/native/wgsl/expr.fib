@@ -91,7 +91,27 @@
 
 ;; ---------------------------------------------------------------- comparisons and casts
 
+;; A comparison of two i64 literals (the builtins' dimension select, `(icmp eq (i64 0) (i64 1))`) is a constant.
+(defun lit-compare :private (pr: LIPred a: LExpr b: LExpr) -> (Option str)
+  (match (. a kind)
+    ((KInt _ x) (match (. b kind)
+                  ((KInt _ y) (match (Pair (lit->i64 x) (lit->i64 y))
+                                ((Pair (some p) (some q)) (match pr
+                                                            ((IEq) (some (if (= p q) "true" "false"))) ((INe) (some (if (= p q) "false" "true")))
+                                                            ((ISlt) (some (if (< p q) "true" "false"))) ((ISle) (some (if (<= p q) "true" "false")))
+                                                            ((ISgt) (some (if (> p q) "true" "false"))) ((ISge) (some (if (>= p q) "true" "false")))
+                                                            (_ nil)))
+                                (_ nil)))
+                  (_ nil)))
+    (_ nil)))
+
 (defun icmp-form :private (wf: Wf pr: LIPred a: LExpr b: LExpr) -> str
+  (let ((t (type-of! wf a)) (folded (if (is-i64? (type-of! wf a)) (lit-compare pr a b) nil)))
+    (match folded
+      ((some c) c)
+      (nil (icmp-typed wf pr a b)))))
+
+(defun icmp-typed :private (wf: Wf pr: LIPred a: LExpr b: LExpr) -> str
   (let ((t (type-of! wf a)) (x (wf-expr wf a)) (y (wf-expr wf b)))
     (if (not (or (= t ty-i32) (= t ty-i1) (= t ty-ptr)))
         (refuse wf (str "a comparison of " (type-refusal t)))
@@ -115,7 +135,8 @@
 
 (defun cast-form :private (wf: Wf op: LCastOp to: LType v: LExpr) -> str
   (let ((from (type-of! wf v)))
-    (cond (not (some? (wgsl-type to))) (refuse wf (str "a conversion to " (type-refusal to)))
+    (cond (and (= op CTrunc) (is-i64? from) (= to ty-i32)) (i32-of (addr-u32 wf v))   ; the low 32 bits of i64 + - * << depend on the low 32 bits only
+          (not (some? (wgsl-type to))) (refuse wf (str "a conversion to " (type-refusal to)))
           (not (some? (wgsl-type from))) (refuse wf (str "a conversion from " (type-refusal from)))
           :else (let ((x (wf-expr wf v)))
                   (match op

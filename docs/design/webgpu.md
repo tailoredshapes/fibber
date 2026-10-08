@@ -144,7 +144,7 @@ The bindings, group 0, the same for every kernel of a module so that a driver ha
 
 The workgroup size is the override constants `wg_x wg_y wg_z` (defaults 64, 1, 1), set at pipeline creation from the launch's block: one
 pipeline per kernel and block size, cached by the driver. Both Dawn and naga take overrides in `@workgroup_size` (checked: the JS glue and
-wgpu-native set them). The first lines of the WGSL are the launch ABI (gpu.md 6.4 asked for one): `// fib-kernel NAME T..`, one per kernel,
+wgpu-native set them). The first lines of the WGSL are the launch ABI (gpu.md 6.4 asked for one): `// fib.kernel-sig NAME: T..` (GPU-2's header), one per kernel,
 the parameter kinds in order (`ptr`, `i32`, `f32`, `bool`); every driver checks a launch's arguments against it (the count, a buffer for a
 scalar or the reverse, one buffer twice) and refuses with the parameter's number. This is the first backend where "a wrong argument is an
 Err naming the parameter" holds; the PTX path still lacks it.

@@ -1,9 +1,9 @@
 // WGSL of the kernels of a fibber program, written by fibc (docs/design/webgpu.md): group 0 is binding 0 the uniform of scalar
 // parameters (4 bytes each, in order), binding 1 the trap flag, bindings 2.. the pointer parameters in order; wg_x/wg_y/wg_z the workgroup size.
-// fib-kernel vadd ptr ptr ptr i32
-// fib-kernel vaddi ptr ptr ptr i32
-// fib-kernel gemm ptr ptr ptr i32
-// fib-kernel assert_positive ptr i32
+// fib.kernel-sig vadd: ptr ptr ptr i32
+// fib.kernel-sig vaddi: ptr ptr ptr i32
+// fib.kernel-sig gemm: ptr ptr ptr i32
+// fib.kernel-sig assert_positive: ptr i32
 struct Ptr { buf: u32, off: u32 }
 struct OvI32 { v: i32, o: bool }
 struct FibTrap { flag: atomic<u32> }
@@ -398,12 +398,29 @@ fn assert_positive(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgr
   fibw_k_assert_positive(Ptr(0u, 0u), bitcast<i32>(fibw_params[0].x));
 }
 fn f_gpu32_global_id_x() -> i32 {
-  var t5: i32;
+  var t5: bool;
   var t2: i32;
+  var t22: i32;
+  var t11: i32;
+  var t14: i32;
+  var t20: bool;
+  var t18: i32;
+  var t12: bool;
+  var t9: i32;
+  var t6: i32;
   var t3: i32;
-  var t4: i32;
+  var t23: i32;
+  var t10: i32;
+  var t17: i32;
+  var t4: bool;
   var t1: i32;
-    t1 = i32(fibw_wid.x); t2 = i32(wg_x); t3 = (t1 * t2); t4 = i32(fibw_lid.x); t5 = (t3 + t4); return t5;
+  var t21: bool;
+  var t15: i32;
+  var t7: i32;
+  var t27: i32;
+  var t19: i32;
+  var t13: bool;
+    t1 = i32(fibw_wid.x); t2 = i32(fibw_wid.y); t3 = i32(fibw_wid.z); t4 = true; t5 = false; t6 = select(t3, t2, t5); t7 = select(t6, t1, t4);  t9 = i32(wg_x); t10 = i32(wg_y); t11 = i32(wg_z); t12 = true; t13 = false; t14 = select(t11, t10, t13); t15 = select(t14, t9, t12);  t17 = i32(fibw_lid.x); t18 = i32(fibw_lid.y); t19 = i32(fibw_lid.z); t20 = true; t21 = false; t22 = select(t19, t18, t21); t23 = select(t22, t17, t20);    t27 = bitcast<i32>(((bitcast<u32>(t7) * bitcast<u32>(t15)) + bitcast<u32>(t23))); return t27;
 }
 fn f_gpu32_f32_at(a_p0: Ptr, a_p1: i32) -> f32 {
   var p0: Ptr = a_p0;
@@ -440,10 +457,27 @@ fn f_gpu32_i32_set_(a_p0: Ptr, a_p1: i32, a_p2: i32) {
     return;
 }
 fn f_gpu32_global_id_y() -> i32 {
-  var t5: i32;
+  var t5: bool;
   var t2: i32;
+  var t22: i32;
+  var t11: i32;
+  var t14: i32;
+  var t20: bool;
+  var t18: i32;
+  var t12: bool;
+  var t9: i32;
+  var t6: i32;
   var t3: i32;
-  var t4: i32;
+  var t23: i32;
+  var t10: i32;
+  var t17: i32;
+  var t4: bool;
   var t1: i32;
-    t1 = i32(fibw_wid.y); t2 = i32(wg_y); t3 = (t1 * t2); t4 = i32(fibw_lid.y); t5 = (t3 + t4); return t5;
+  var t21: bool;
+  var t15: i32;
+  var t7: i32;
+  var t27: i32;
+  var t19: i32;
+  var t13: bool;
+    t1 = i32(fibw_wid.x); t2 = i32(fibw_wid.y); t3 = i32(fibw_wid.z); t4 = false; t5 = true; t6 = select(t3, t2, t5); t7 = select(t6, t1, t4);  t9 = i32(wg_x); t10 = i32(wg_y); t11 = i32(wg_z); t12 = false; t13 = true; t14 = select(t11, t10, t13); t15 = select(t14, t9, t12);  t17 = i32(fibw_lid.x); t18 = i32(fibw_lid.y); t19 = i32(fibw_lid.z); t20 = false; t21 = true; t22 = select(t19, t18, t21); t23 = select(t22, t17, t20);    t27 = bitcast<i32>(((bitcast<u32>(t7) * bitcast<u32>(t15)) + bitcast<u32>(t23))); return t27;
 }
