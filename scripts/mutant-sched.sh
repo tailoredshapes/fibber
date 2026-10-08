@@ -19,7 +19,10 @@
 #   pop-fence-release  M2: pop's seq_cst fence weakened to release. NOT detected on x86 in the design's experiment (the stores are ordered
 #                      there); it is run and reported, and a survival is EXPECTED, not a failure (the mode exits 0 either way and says so)
 #   lost-wakeup        the eventcount's re-check after the announcement is removed: a fork that saw no sleeper is never seen by the worker
-#                      that then sleeps; with two workers a storm of forks from main hangs (the timeout kills it)
+#                      that then sleeps. The window is a few instructions wide (the epoch protocol alone already covers a push during the
+#                      announcement), so it is reached only with a short spin phase (FIB_SPIN=1) and a program that forks right as workers park
+#                      (the `gap` kernel): a hang in about 1 run of 12 (measured 2026-10-07), hence 8 attempts; a survival of all 8 is possible
+#                      and is reported as such, not as a pass of the pool
 #   complete-no-fence  the seq_cst fence between a completion's store of the state and its load of the waiters is removed: a joiner that
 #                      registered between the two is never woken (a storm from main hangs)
 #   park-not-help      a join that neither runs the task itself nor helps with other work (the design's "deadlock" mutant): it parks; with every
@@ -99,7 +102,7 @@ stress() {
 case $MODE in
   steal-no-cas|pop-last-no-race|run-unclaimed) cases 8640- 8645-; stress tree 18 120; stress wide 20000 120 ;;
   pop-fence-release) cases 8640- 8645-; stress tree 18 120 ;;
-  lost-wakeup)       stress gap 20000 60 FIB_THREADS=2; stress gap 20000 60 FIB_THREADS=4; stress storm 200000 60 FIB_THREADS=1 ;;
+  lost-wakeup)       for i in 1 2 3 4 5 6 7 8; do stress gap 100000 40 FIB_THREADS=3 FIB_SPIN=1; done ;;
   complete-no-fence) stress gap 20000 60 FIB_THREADS=2; stress gap 20000 60 FIB_THREADS=4; stress storm 300000 60 FIB_THREADS=4 ;;
   park-not-help)     cases 8640-; stress tree 16 60 FIB_THREADS=4 ;;
   complete-first)    cases 8647- 8640- ;;
