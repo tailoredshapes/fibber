@@ -12,6 +12,8 @@
 ;;   :thread-dependent   compress with more than one thread uses another acceleration: the bytes depend on the thread count
 ;;   :par-error-kind     decompress with more than one thread answers :internal where the sequential decoder says :corrupt
 ;;   :par-ignore-limit   decompress with more than one thread is given the default limit instead of the caller's
+;;   :verify-sequential  decompress with one thread verifies the checksums whatever `verify` says (the sequential LZ4 decoder before DARWIN-2)
+;;   :verify-never       decompress never verifies the checksums, whatever `verify` says
 (ns fib.compress.fault (:use fib.core fib.seq fib.coll fib.test.core fib.compress.types fib.compress.ops))
 
 (defstruct Lenient (inner: (dyn Decompressor)))
@@ -22,7 +24,7 @@
 (defstruct Faulty (inner: (dyn Codec :send) fault: keyword held: (Cell (Option (dyn Compressor)))))
 (defun faulty (inner: (dyn Codec :send) fault: keyword) -> Faulty (Faulty inner fault (cell nil)))
 
-(defun faults () -> (Vec keyword) [:ignore-max-output :accept-truncation :drop-checksum :corrupt-boundary :reuse-state :ignore-dictionary :small-bound :overclaim :thread-dependent :par-error-kind :par-ignore-limit])
+(defun faults () -> (Vec keyword) [:ignore-max-output :accept-truncation :drop-checksum :corrupt-boundary :reuse-state :ignore-dictionary :small-bound :overclaim :thread-dependent :par-error-kind :par-ignore-limit :verify-sequential :verify-never])
 
 (defun is? (f: Faulty k: keyword) -> bool (= (. f fault) k))
 
@@ -39,6 +41,7 @@
         (= fault :thread-dependent) ["the-result-does-not-depend-on-the-thread-count"]
         (= fault :par-error-kind) ["errors-and-limits-do-not-depend-on-the-thread-count"]
         (= fault :par-ignore-limit) ["errors-and-limits-do-not-depend-on-the-thread-count"]
+        (or (= fault :verify-sequential) (= fault :verify-never)) ["verify-decides-whether-the-checksums"]
         :else []))
 
 (defun flip-middle (b: (Array i8)) -> (Array i8)
@@ -53,7 +56,10 @@
         :else o))
 
 (defun opts-for-decompress (f: Faulty o: Options) -> Options
-  (if (or (is? f :ignore-max-output) (and (is? f :par-ignore-limit) (not (= (. o threads) 1)))) (with-max-output o default-max-output) o))
+  (cond (or (is? f :ignore-max-output) (and (is? f :par-ignore-limit) (not (= (. o threads) 1)))) (with-max-output o default-max-output)
+        (and (is? f :verify-sequential) (= (. o threads) 1)) (with-verify o true)
+        (is? f :verify-never) (with-verify o false)
+        :else o))
 
 (defun faulty-compress (f: Faulty data: (Array i8) o: Options) -> (Result (Array i8) CompressError)
   (match (codec-compress (. f inner) data (opts-for-compress f o))

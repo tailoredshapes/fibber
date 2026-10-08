@@ -18,6 +18,7 @@
 #   mid-islack mid-dslack  blockdec: the medium path's input / output slack is too small   mid-offset  the medium path checks only for offset 0   mid-pattern  small offsets use a distance of 8
 #   hc-opt-price  hcopt: a sequence costs one byte more   hc-pa-off  hc3: no pattern analysis   hc-swap-off  no chain swap   hc-opt-full  level 12 does not search everywhere   hc-opt-skip  the skip test is strict
 #   hash-total-lost  framedec: the bytes hashed inside the decode loop are not counted   hash-raw-order  framedec: a stored block does not wait for the pending range to be hashed
+#   seq-ignores-verify  framedec: the sequential decoder checks the block and content checksums whatever Options.verify says (DARWIN-2; the parallel one honours it)
 #   par-nested-threads  par: runners are OS threads again (a call inside a pmap body multiplies them)   par-unbounded-flight  par: one runner per job, whatever `threads` says
 set -uo pipefail
 R=$(cd "$(dirname "$0")/.." && pwd)
@@ -28,7 +29,7 @@ MUTANTS=("$@")
 [ ${#MUTANTS[@]} -gt 0 ] || MUTANTS=(slack-dlim slack-ilim fast-small-pattern xxh-vector-rot par-order par-race-window par-lost-job par-max-output par-thread-dependent par-error-swallowed par-trap-kills par-checksum-skipped last-literals offset-65536 overlap-memmove nibble-overflow ext-255 no-verify match-past-end cap-off-by-one skip-content-crc skip-block-crc
                                      skip-header-crc block-crc-bytes dict-base stale-table hc-depth-zero reserved-bit offset-check fast-offset-0 linked-lo fast-copy-8
                                      mid-islack mid-dslack mid-offset mid-pattern par-nested-threads par-unbounded-flight
-                                     hc-opt-price hc-pa-off hc-swap-off hc-opt-full hc-opt-skip hash-total-lost hash-raw-order)
+                                     hc-opt-price hc-pa-off hc-swap-off hc-opt-full hc-opt-skip hash-total-lost hash-raw-order seq-ignores-verify)
 
 sub() { perl -0pi -e "$2" "$1"; cmp -s "$1" "$1.orig" && { echo "mutant-lz4: pattern not found in $1: $2" >&2; return 1; }; return 0; }
 mutate() { # mutate NAME TREE
@@ -42,8 +43,8 @@ mutate() { # mutate NAME TREE
     no-verify)        f=$d/blockenc.fib; cp $f $f.orig; sub $f 's/ \(= \(rd32 sp cand\) \(rd32 sp ip\)\)\)\)/ true))/' ;;
     match-past-end)   f=$d/blockenc.fib; cp $f $f.orig; sub $f 's/mlim \(u- iend last-lits\)/mlim iend/' ;;
     cap-off-by-one)   f=$d/blockdec.fib; cp $f $f.orig; sub $f 's/\(> lit \(u- cap op\)\) e-too-large/(> lit (u- (u+ cap 1) op)) e-too-large/' && sub $f 's/\(> ml \(u- cap op2\)\) e-too-large/(> ml (u- (u+ cap 1) op2)) e-too-large/' ;;
-    skip-content-crc) f=$d/framedec.fib; cp $f $f.orig; sub $f 's/\(and \(\. h cchk\) \(not \(= \(rd32 \(data src\)/(and false (not (= (rd32 (data src)/' ;;
-    skip-block-crc)   f=$d/framedec.fib; cp $f $f.orig; sub $f 's/\(and \(\. h bchk\) \(not \(= \(rd32 p/(and false (not (= (rd32 p/' ;;
+    skip-content-crc) f=$d/framedec.fib; cp $f $f.orig; sub $f 's/\(and \(\. h cchk\) \(\. hk verify\) \(not \(= \(rd32 \(data src\)/(and false (not (= (rd32 (data src)/' ;;
+    skip-block-crc)   f=$d/framedec.fib; cp $f $f.orig; sub $f 's/\(and \(\. h bchk\) \(\. hk verify\) \(not \(= \(rd32 p/(and false (not (= (rd32 p/' ;;
     skip-header-crc)  f=$d/header.fib; cp $f $f.orig; sub $f 's/\(not \(= \(rd8 p \(\+ pos \(\+ 4/(and false (= (rd8 p (+ pos (+ 4/' ;;
     block-crc-bytes)  f=$d/frame.fib; cp $f $f.orig; sub $f 's/\(xxh32-ptr \(unsafe \(ptr\+ dp \(u?\+ op 4\)\)\) len 0\)/(xxh32-ptr (unsafe (ptr+ dp op)) len 0)/' ;;
     dict-base)        f=$d/frame.fib; cp $f $f.orig; sub $f 's/\(copy-exact \(data w\) \(array-len dict\) \(data src\)/(copy-exact (data w) (+ 1 (array-len dict)) (data src)/' ;;
@@ -78,6 +79,7 @@ mutate() { # mutate NAME TREE
     hc-opt-full)      f=$d/hcopt.fib; cp $f $f.orig; sub $f 's/\(>= \(\. c level\) 12\)/(>= (. c level) 13)/' ;;
     hc-opt-skip)      f=$d/hcopt.fib; cp $f $f.orig; sub $f 's/\(<= \(og c \(u\+ cur 1\) 0\) \(og c cur 0\)\)\)\)/(< (og c (u+ cur 1) 0) (og c cur 0))))/' ;;
     hash-total-lost)  f=$d/framedec.fib; cp $f $f.orig; sub $f 's/\(xset ck 4 \(\+ \(xw ck 4\) \(- hp \(hw k 0\)\)\)\)/(xset ck 4 (xw ck 4))/' ;;
+    seq-ignores-verify) f=$d/framedec.fib; cp $f $f.orig; sub $f 's/\(\. h bchk\) \(\. hk verify\)/(. h bchk) true/' && sub $f 's/\(\. h cchk\) \(\. hk verify\)/(. h cchk) true/' ;;
     hash-raw-order)   f=$d/framedec.fib; cp $f $f.orig; sub $f 's/\(hk-flush hk \@ob\) \(copy-exact \(data \@ob\) op \(data src\)/(copy-exact (data \@ob) op (data src)/' ;;
     *) echo "mutant-lz4: unknown mutant $1" >&2; return 1 ;;
   esac
