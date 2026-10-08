@@ -50,20 +50,15 @@
 (extern _exit :private (i32) -> unit)
 ;; Bound to the runtime's own definition (rt/thread.lir `fib_guard_ctl`, as fib.os.sched's `fib_sched_ctl`): the signal stack of this thread around a fork.
 (extern fib_guard_ctl :private (i64 i64) -> i64)
+;; Bound to the runtime's own definition (rt/thread.lir): the threads of the program.
+(extern fib_thread_count :private () -> i64)
 (extern alarm :private (i32) -> i32)
 
-;; The threads of this process, from /proc/self/task, without the first thread of a program whose `main` runs on a stack the runtime made (rt/thread.lir
-;; `fib.run-main`): that thread only waits for `main`'s and the runtime names it `fib-parked`. nil where /proc cannot be read. On macOS (no /proc) the
-;; kernel is asked (fib.os.backend task-info: proc_pidinfo), the parked thread taken off the same way.
-(defun thread-count () -> (Option i64)
-  (let [kernel (b/task-info 0)]
-    (if (>= kernel 0)
-        (some kernel)
-        (match (dirs/list-directory "/proc/self/task")
-          ((Err _) nil)
-          ((Ok entries)
-           (some (count (filter (fn (e: dirs/DirectoryEntry) (not (= (unwrap-or (read-file (str "/proc/self/task/" (. e name) "/comm")) "") "fib-parked\n")))
-                                entries))))))))
+;; The threads of the PROGRAM: its own and the ones the runtime started for it (spawned threads, async and pool workers), by the runtime's own count (rt/thread.lir
+;; `fib_thread_count`), the same on every platform. It is not the operating system's count: a program run by `fibc run` shares its process with the compiler's threads (the
+;; stack thread of its main, the parked first thread), and macOS has no /proc to tell them apart by name (before DARWIN-3 this read /proc/self/task on Linux, without the
+;; thread named `fib-parked`, and asked proc_pidinfo on macOS: both counted the compiler's threads under `fibc run` of a compiler built by itself). Always `some`.
+(defun thread-count () -> (Option i64) (some (unsafe (fib_thread_count))))
 
 ;; A forked child: its process id and the files it writes (`dir/tag.res`, `.out`, `.err`).
 (defstruct ForkChild (pid: i64 base: str))

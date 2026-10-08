@@ -2107,6 +2107,15 @@
 (declare pthread_attr_destroy i32 (ptr))
 (declare pthread_attr_setguardsize i32 (ptr i64))
 (global internal fib.threads-live i32 (i32 0))
+;; The threads this runtime started and that are still running: spawned threads (fib.spawn .. fib.thread-done), async workers, pool workers. The program's own thread is not in it
+;; (`fib_thread_count` adds it). The operating system's count is not the program's: a program run by `fibc run` shares its process with the compiler's own threads (its stack thread, the
+;; parked first thread), and on macOS there is no /proc to tell them apart by name.
+(global internal fib.thread-total i64 (i64 0))
+
+;; What fib.os.process/thread-count answers (extern: bound to this definition): the threads of the program, its own thread and the ones the runtime started for it.
+;; extern: (declare fib_thread_count i64 ())
+(define internal (fib_thread_count i64) ()
+  (block entry (ret (add (i64 1) (atomic-load monotonic i64 @fib.thread-total)))))
 ;; The stack of a task's thread and of a pool worker, in bytes (docs/design/stack.md), and the guard below it.
 (global internal fib.thread-stack i64 (i64 8388608))
 (global internal fib.thread-guard i64 (i64 65536))
@@ -2124,6 +2133,7 @@
 ;; mode writes the T line (compiler.md §4).
 (define internal (fib.spawn void) ((ptr task) (ptr entry))
   (block entry
+    (atomicrmw add monotonic @fib.thread-total (i64 1))
     (atomic-store monotonic (i32 1) @fib.mt)
     (call @fib.rq-lock)
     (store (add (load i32 @fib.threads-live) (i32 1)) @fib.threads-live)
@@ -2155,6 +2165,7 @@
 (define internal (fib.thread-done void) ()
   (block entry
     (call @fib.guard-leave)
+    (atomicrmw sub monotonic @fib.thread-total (i64 1))
     (call @fib.rq-lock)
     (store (sub (load i32 @fib.threads-live) (i32 1)) @fib.threads-live)
     (call @fib.rq-broadcast)
@@ -2190,7 +2201,6 @@
 (global internal fib.guard-ss-disable i32 (i32 2))
 (global internal fib.main-fn ptr (ptr null))
 (global internal fib.main-stack i64 (i64 0))
-(global internal fib.main-parked i64 (i64 0))
 ;; The distance from the end of a stack within which a fault is its overflow (the guard of the main stack is a megabyte, of a task's thread 64 KiB).
 (global internal fib.guard-window i64 (i64 1048576))
 
@@ -2238,8 +2248,6 @@
 ;; parent just before the fork). op 1: in the child, with that base: a thread that has no signal stack gets the parent's back (the child's memory has it, with its
 ;; bounds header). Linux keeps the signal stack across a fork, so there it does nothing; XNU does not (the new thread starts with none, and a child that
 ;; outruns its stack was killed by SIGILL, the kernel having no stack to push the signal frame on, with no message). Returns 1 when it set the stack.
-;; op 2: how many threads the runtime parks: 1 while `main` runs on the stack it made (fib.run-main; the first thread of the process only waits), else 0 (the
-;; thread count of macOS, fib.os.backend task-info, leaves that thread out as the /proc reader of fib.os.process does by its name).
 ;; extern: (declare fib_guard_ctl i64 (i64 i64))
 (define internal (fib_guard_ctl i64) ((i64 op) (i64 saved))
   (block entry
@@ -2247,8 +2255,7 @@
           (ss (alloca (align 8) i8 (i32 32)))
           (_q (call @sigaltstack (ptr null) cur))
           (sp (load ptr cur)))
-      (switch op restore ((i64 0) query) ((i64 2) parked))))
-  (block parked (ret (load i64 @fib.main-parked)))
+      (br (icmp eq op (i64 0)) query restore)))
   (block query (ret (ptrtoint i64 sp)))
   (block restore
     (br (and (icmp eq sp (ptr null)) (icmp ne saved (i64 0))) set none))
@@ -2376,7 +2383,6 @@
       (br (icmp eq mb (i64 0)) here spawn)))
   (block spawn
     (store (shl mb (i64 20)) @fib.main-stack)
-    (store (i64 1) @fib.main-parked)
     (call @pthread_attr_init attr)
     (call @pthread_attr_setguardsize attr (i64 1048576))
     (let ((rs (call @pthread_attr_setstacksize attr (shl mb (i64 20)))))
@@ -2393,7 +2399,6 @@
     (call @fib.guard-restore old)
     (ret))
   (block here
-    (store (i64 0) @fib.main-parked)
     (let ((lim (alloca (align 8) i8 (i32 16)))
           (_g (call @getrlimit (i32 3) lim))
           (cur (load i64 lim)))
@@ -2574,6 +2579,7 @@
           (attr (alloca (align 8) i8 (i32 128)))
           (_a (call @fib.thread-attr attr))
           (rc (call @pthread_create handle attr @fib.worker (ptr null))))
+      (atomicrmw add monotonic @fib.thread-total (i64 1))
       (call @pthread_attr_destroy attr)
       (br (icmp ne rc (i32 0)) failed next)))
   (block failed
@@ -2983,6 +2989,10 @@
 (global internal fib.sched-idlers i32 (i32 0))
 (global internal fib.sched-skip i32 (i32 1))
 (global internal fib.sched-spin i64 (i64 32))
+;; At most this many idle workers spin at once (FIB_SPINNERS, default 2); the others park at once. Every idle worker spinning (a sched_yield a round, a sweep of every deque) cost more
+;; than it found: case 8645 (a million tiny tasks) took 0.1 s a run at one worker and 0.9 s at eight on an M1 Ultra (sched_yield is a system call there), 1.5 s at 16 on x86-64 Linux, and 0.4 to 0.7 s
+;; with the limit (docs/design/parallelism.md, DARWIN-3). A spinner that finds work leaves the count, so the next fork wakes the next sleeper.
+(global internal fib.sched-spinners i32 (i32 2))
 (global internal fib.sched-active i64 (i64 0))
 (global internal fib.sched-blocked i64 (i64 0))
 ;; 1 in a program that catches (set by the fork of a pool task in such a program, emit.lower.threads): the runner isolates a trap
@@ -3033,6 +3043,7 @@
           (attr (alloca (align 8) i8 (i32 128)))
           (_a (call @fib.thread-attr attr))
           (rc (call @pthread_create handle attr @fib.sched-worker w)))
+      (atomicrmw add monotonic @fib.thread-total (i64 1))
       (call @pthread_attr_destroy attr)
       (br (icmp ne rc (i32 0)) failed started)))
   (block failed (call @fib.fatal-c (string \"fork-task: cannot start a worker thread\")) (unreachable))
@@ -3084,7 +3095,7 @@
   (block up (atomic-store release (i32 2) @fib.sched-state) (br done))
   (block done (ret)))
 
-;; The tuning knobs from the environment: FIB_SPIN (rounds, 0 to 100000) and FIB_SCHED_SKIP (0 or 1).
+;; The tuning knobs from the environment: FIB_SPIN (rounds, 0 to 100000), FIB_SCHED_SKIP (0 or 1) and FIB_SPINNERS (idle workers that may spin at once).
 (define internal (fib.sched-knobs void) ()
   (block entry
     (let ((a (call @getenv (string \"FIB_SPIN\")))
@@ -3096,10 +3107,17 @@
       (store (select (icmp slt n (i64 0)) (i64 32) n) @fib.sched-spin)
       (br second)))
   (block second
-    (br (icmp eq b (ptr null)) done skip))
+    (br (icmp eq b (ptr null)) third skip))
   (block skip
     (let ((m (call @fib.sched-num b end)))
       (store (select (icmp eq m (i64 0)) (i32 0) (i32 1)) @fib.sched-skip)
+      (br third)))
+  (block third
+    (let ((c (call @getenv (string \"FIB_SPINNERS\"))))
+      (br (icmp eq c (ptr null)) done spinners)))
+  (block spinners
+    (let ((k (call @fib.sched-num c end)))
+      (store (select (icmp slt k (i64 0)) (i32 2) (trunc i32 (select (icmp sgt k (i64 1000000)) (i64 1000000) k))) @fib.sched-spinners)
       (br done)))
   (block done (ret)))
 
@@ -3286,6 +3304,7 @@
     (call @pthread_setspecific (load i32 @fib.task-key) (ptr null))
     (call @fib.guard-leave)
     (call @fib.sched-start-thread w)
+    (atomicrmw sub monotonic @fib.thread-total (i64 1))
     (call @pthread_exit (ptr null))
     (unreachable)))
 
@@ -3335,7 +3354,9 @@
 ;; An idle worker: a few rounds of looking with a yield between them, then the eventcount: announce, re-check, sleep. The re-check
 ;; after the announcement is what keeps a wake-up from being lost (a fork that saw no sleeper is seen here).
 (define internal (fib.sched-idle void) ((ptr w))
-  (block entry (atomicrmw add seq_cst @fib.sched-idlers (i32 1)) (br spin))
+  (block entry
+    (let ((o (atomicrmw add seq_cst @fib.sched-idlers (i32 1))))
+      (br (icmp sge o (load i32 @fib.sched-spinners)) leave spin)))
   (block spin
     (let ((i (phi i64 (entry (i64 0)) (again i2))))
       (br (icmp slt i (load i64 @fib.sched-spin)) look leave)))

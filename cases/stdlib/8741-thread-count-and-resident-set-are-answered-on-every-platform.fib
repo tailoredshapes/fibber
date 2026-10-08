@@ -7,7 +7,7 @@
 ;; `thread-count` is the threads of the process other than the one the runtime parks, and `rss-bytes` the resident set: from /proc on Linux, from proc_pidinfo on macOS (which has no /proc),
 ;; behind the same two functions. A program that has started nothing has one thread; a task that sleeps makes two while it runs and the count is no larger once it is joined;
 ;; touching 64 MB raises the resident set by most of it. (Before DARWIN-2 both answered "unknown" on macOS and the cases that bound threads and memory were Linux only.)
-(ns main (:use fib.core fib.async tl.check) (:require [fib.os :as os] [fib.os.memory :as mem] [tl.procstat :as ps]))
+(ns main (:use fib.core fib.async tl.check) (:require [fib.os :as os] [fib.os.memory :as mem]))
 
 (defun touch (n: i64) -> i64
   (let [c (cell (array n 1i8))] (do (array-set! &c (- n 1) 2i8) (+ (array-len @c) (sext i64 (array-get @c 0))))))
@@ -18,7 +18,7 @@
         busy (spawn (fn () (do (os/sleep-ns 300000000) 8)))
         during (os/thread-count)
         joined (join busy)
-        after (ps/settled-threads 2)
+        after (unwrap-or (os/thread-count) -1)
         before (mem/rss-bytes)
         big (cell (array 67108864 1i8))
         mid (mem/rss-bytes)

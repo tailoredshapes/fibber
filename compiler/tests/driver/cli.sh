@@ -76,4 +76,7 @@ ck "build --emit c FILE -o OUT (options first): the same C, compiled and run" "$
 ck "build with the options first: the same C as the file first" "$(cmp "$t/hc.c" "$t/hc2.c" && echo same)" same
 ck "build -o OUT -O 0 FILE (the file last) builds" "$($s2 build -o "$t/three-l" -O 0 "$t/three.fib" > /dev/null 2>&1; "$t/three-l"; echo $?)" 3
 ck "build --emit c with no file is the usage, exit 2" "$($s2 build --emit c -o "$t/nf.c" > /dev/null 2>&1; echo $?)" 2
+# DARWIN-3: `FIB_VIA=c fibc run` prints no allocation trace (FIB_TRACE) unless `run --trace` asks, which is what the case harness passes
+ck "FIB_VIA=c run: no trace lines on standard error" "$(FIB_VIA=c FIB_ALLOW_PLAIN_TAIL_CALLS=1 $s2 run "$t/hc.fib" 2>&1 >/dev/null | grep -c -E '^[AF] [0-9]+')" 0
+ck "FIB_VIA=c run --trace: the trace is there" "$(FIB_VIA=c FIB_ALLOW_PLAIN_TAIL_CALLS=1 $s2 run --trace "$t/hc.fib" 2>&1 >/dev/null | grep -c -E '^A [0-9]+' | awk '{ print ($1 > 0) ? "yes" : "no" }')" yes
 exit $fail

@@ -89,6 +89,12 @@ scripts/fetch-*.sh ───────► ~/.cache/fibber-scratch/tools/<tool>
   "On macOS ..." not "macOS: ...". The Linux-only convention stays the line `;; Linux only (...)` plus an entry in `ci-stage2.expected-darwin`.
   The slowness of the audit mode on macOS (case 6100: 127 s alone, 28 million allocations) is the trace itself: one `write(2)` per allocation, 55.9 million lines of
   standard error, 110 s of system time, a write costing about 2 us there; not changed (a buffered trace needs a flush on every exit, trap and fork path).
+- **DARWIN-3** (the 0.1.13 Mac verification): `thread-count` is the runtime's own count (`fib_thread_count`, rt/thread.lir: spawned threads, async and pool workers, plus the program's thread),
+  on every platform; the operating system's count included the compiler's own threads when a program ran under `fibc run` of a compiler built by a release, which the seed-built gate cannot see: the tool
+  `jit-selfhosted-threads` runs the thread-count program and the pool, stack and process cases through `build/F3`'s JIT (F3 is built by F), and fails on a Mac for the old code (`threads 2 3 8` for a
+  program with 1 2 8; case 8354 `expected 0, got 45`, 8642 `got 8`). `FIB_VIA=c fibc run` sets FIB_TRACE only for `run --trace` (the case harness). A spec file that dies is counted in the total line
+  (`, N died`) and the status is 1. The wait-until deadlines of the otel specs are 20 s (they return as soon as the condition holds). The golden `expand-porter` failure under load was not reproduced in 6 concurrent
+  runs; each input runs under `timeout` and `ulimit -v` and the output records the status, so a load-induced timeout shows as a differing input: the timeout is 600 s now, not 120.
 - **Tools installed for DARWIN-2** (development tools, owner's rule of 2026-10-08): `clang-21` 1:21.1.8-6ubuntu1 by `apt` on the Linux box (so the C backend's clang
   column could be run there as well as on the Mac); nothing on the Mac (Apple clang 21 and Homebrew's `llvm@21` were there; `~/Library/Logs/DiagnosticReports`
   crash reports gave the backtrace that `lldb` would have).

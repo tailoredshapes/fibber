@@ -133,25 +133,26 @@
       (eprint-raw (unwrap-or (read-file exe-err) ""))
       status))
 
-;; Builds `lir` through C into `dir` and runs it with FIB_TRACE=1, as driver.staticrun runs a static case: what the harness reads is the executable's.
-(defun build-and-run :private (lir: str file: str dir: str opt: i64 args: (Vec str)) -> i64
+;; Builds `lir` through C into `dir` and runs it, with FIB_TRACE=1 only for `run --trace` (what the case harness passes: the audit it reads is the executable's own, as driver.staticrun's);
+;; without it the trace lines (`A 1 o`, `F 2`) were printed on the standard error of every `FIB_VIA=c fibc run` (DARWIN-3).
+(defun build-and-run :private (lir: str file: str dir: str opt: i64 args: (Vec str) trace: bool) -> i64
   (let ((exe (str dir "/x")) (out (str dir "/out")) (err (str dir "/err")) (declared (ld/declared-libs lir)))
     (match (ld/lib-words declared)
       ((Err m) (do (eprintln m) 2))
       ((Ok words)
        (match (build-via-c lir file exe opt [] words)
          ((Err m) (do (eprintln (str "compile failed: " m)) 5))
-         ((Ok _) (do (native/setenv-set "FIB_TRACE" "1")
+         ((Ok _) (do (when trace (native/setenv-set "FIB_TRACE" "1"))
                      (let ((pid (p/spawn-executable exe (into [exe] args) out err 300)))
                        (if (< pid 0) 5 (report out err (p/wait-pid pid)))))))))))
 
 ;; `FIB_VIA=c fibc run FILE`. The C is compiled at -O1 at least: at -O0 gcc keeps every C local in its own stack slot (the printer makes one per
 ;; instruction), so a frame is several times LLVM's and a program that recurses two million frames deep (case 8353) overflows its stack.
-(defun run-via-c (file: str args: (Vec str) opt0: i64 roots: Roots rm: mk/RunnerMaker) -> i64
+(defun run-via-c (file: str trace: bool args: (Vec str) opt0: i64 roots: Roots rm: mk/RunnerMaker) -> i64
   (match (dfront/lower-kind file roots rm false)
     ((Err code) code)
     ((Ok lir)
      (match (p/make-temp-dir (tmp-dir))
        (nil 5)
-       ((some dir) (let ((r (build-and-run lir file dir (max opt0 1) args)))
+       ((some dir) (let ((r (build-and-run lir file dir (max opt0 1) args trace)))
                      (do (p/remove-file (str dir "/x")) (p/remove-file (str dir "/x.c")) (p/remove-file (str dir "/out")) (p/remove-file (str dir "/err")) (p/remove-dir dir) r)))))))

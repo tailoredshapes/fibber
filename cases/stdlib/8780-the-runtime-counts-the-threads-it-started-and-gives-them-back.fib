@@ -1,0 +1,35 @@
+;; spec: docs/design/test-harness.md 5 (fib.os.process thread-count); rt/thread.lir fib_thread_count; DARWIN-3
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; `thread-count` is the runtime's own count of the program's threads (itself, plus the threads it started: spawned threads, async and pool workers), not the operating system's, so it is the same
+;; under `fibc run` (where the compiler's threads share the process), in an executable, and on every platform. A program that starts nothing has 1; eight tasks that are running make it 9;
+;; when they are joined it is 1 again (a thread gives itself back in `fib.thread-done`, before it leaves the OS); 200 spawns one after another leave it at 1; and the first pool task adds the pool's
+;; workers, which stay: the count is then 1 plus the workers.
+(ns main (:use fib.core fib.async fib.parallel tl.check) (:require [fib.os :as os] [fib.os.sched :as sched]))
+
+(defun n () -> i64 (unwrap-or (os/thread-count) -1))
+
+(defun main () -> i64
+  (let [c (checks)
+        alone (n)
+        ts (vec (map (fn (i: i64) (spawn (fn () (do (os/sleep-ns 200000000) i)))) (range 8)))
+        busy (n)
+        sum (reduce (fn (acc: i64 t: (Task i64)) (+ acc (join t))) 0 ts)
+        after (n)
+        seq (loop [i 0 acc 0] (if (< i 200) (recur (+ i 1) (+ acc (join (spawn (fn () i))))) acc))
+        again (n)
+        pooled (join (fork-task (fn () 5)))
+        w (sched/pool-live-workers)
+        total (n)]
+    (do (check c (= alone 1))
+        (check c (= busy 9))
+        (check c (= sum 28))
+        (check c (= after 1))
+        (check c (= seq 19900))
+        (check c (= again 1))
+        (check c (= pooled 5))
+        (check c (= total (+ 1 w)))
+        (checks-result c))))
