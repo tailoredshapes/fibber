@@ -23,6 +23,23 @@ The two CI workflows fetch LLVM's installer (`wget -qO llvm.sh https://apt.llvm.
 own installer for apt, run on a CI runner only, and it fetches signed packages. The way out is a pinned apt source with the project's
 key; until then those two lines are listed.
 
+## Downloads recorded by K8S-1 (Kubernetes nodes, 2026-10-08)
+
+Each is pinned by a digest or checksum written in the repository (k8s/), not fetched from the same server at run time:
+
+| What | Where | Pin |
+|---|---|---|
+| ubuntu:26.04 base image | `k8s/ci.Dockerfile` | `ubuntu@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7` (multi-arch index) |
+| busybox:1.37 (loader pod) | `k8s/loader.yaml`, `k8s/arm64.yaml` | `busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e` |
+| registry:2 (later step, not deployed) | docs/design/build.md | `registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373` |
+| k3s v1.34.4+k3s1 arm64 binary (agent in the Lima VM) | `k8s/node-agent-arm64.sh` | sha256 `2a10a51c9bc04f0f02c2dd52c820399a97656164af7670d530cefd14a27b7b41`, checked with `sha256sum -c` (the amd64 k3s on lilnas was already installed, not downloaded) |
+| Lima 2.2.1 (Mac) | Homebrew bottle `lima--2.2.1.arm64_golden_gate` | Homebrew verifies the bottle's sha256 from its formula |
+| Node.js v26.10.0 (the wasm stage's node) | `k8s/ci.Dockerfile` (stage `node`) | sha256 `ca70e9e3...f022` (x64) and `7a6353f6...4ab5` (arm64) from nodejs.org's SHASUMS256.txt, checked with `sha256sum -c` in the build |
+| apt packages in the image and the VM | `k8s/ci.Dockerfile`, docker.io in the VM | apt's signed repositories |
+| the seed fibc | `SEED` | unchanged: `scripts/fetch-seed.sh` |
+
+`k8s/*.sh` is scanned by the rule below, so a download there needs a checksum line.
+
 ## Consequences
 
 - A new fetch script cannot be added without a checksum check, or an entry here that a reviewer sees.
@@ -55,7 +72,7 @@ key; until then those two lines are listed.
                 (if (or (empty? ds) (not (empty? (filterv (fn (n: NumLine) (check-line? (. n text))) ls))))
                     acc
                     (conj acc (Finding (. f path) (. (nth ds 0) n) (str (first-word-of (. (nth ds 0) text)) " downloads, and the file checks no checksum")))))))
-          [] (select repo ["scripts/**.sh" "compiler/tests/**.sh" ".github/workflows/*.yml" "Makefile" "mk/*.mk"])))
+          [] (select repo ["scripts/**.sh" "compiler/tests/**.sh" ".github/workflows/*.yml" "Makefile" "mk/*.mk" "k8s/*.sh"])))
 
 (rule "every script, workflow and Makefile that downloads also checks a sha256, except the two LLVM installer lines"
   (allowing (unchecked-downloads repo) [".github/workflows/ci.yml:wget" ".github/workflows/release.yml:wget"])

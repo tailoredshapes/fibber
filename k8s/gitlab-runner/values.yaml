@@ -1,0 +1,36 @@
+# NOT INSTALLED. NEEDS THE OWNER to supply a runner authentication token: create a project runner in the GitLab UI (the fibber project:
+# Settings > CI/CD > Runners > New project runner, tag `k8s`, "run untagged jobs" off) and copy the glrt-... token it shows once.
+# K8S-1 created no GitLab token, installed no chart and ran nothing from this file. Steps (docs/design/build.md, Kubernetes, GitLab runner):
+#   helm repo add gitlab https://charts.gitlab.io
+#   kubectl -n fibber-ci create secret generic gitlab-runner-token --from-literal=runner-token=glrt-XXXX --from-literal=runner-registration-token=""
+#   (add the egress rule for the GitLab host to k8s/netpol.yaml first: the policy allows DNS and HTTPS only; the local GitLab answers on
+#    http://<host-lan-ip>:PORT, so allow that one address and port, nothing wider)
+#   helm upgrade --install gitlab-runner gitlab/gitlab-runner --version CHART_VERSION -n fibber-ci -f k8s/gitlab-runner/values.yaml
+# (CHART_VERSION: the owner pins the chart release they trust; a downloaded chart is checked with `helm pull --verify` or its digest, ADR 0020.)
+gitlabUrl: http://GITLAB_LAN_ADDRESS:PORT/    # the local GitLab as a pod sees it (the git remote `gitlab` says localhost:2222 for ssh, which is not a pod's localhost)
+runners:
+  secret: gitlab-runner-token
+  config: |
+    [[runners]]
+      name = "fibber-k8s"
+      executor = "kubernetes"
+      [runners.kubernetes]
+        namespace = "fibber-ci"
+        image = "fibber-ci:91b6567496f3"
+        pull_policy = ["if-not-present"]
+        service_account = "fibber-ci"
+        priority_class_name = "fibber-ci-low"
+        cpu_request = "4"
+        cpu_limit = "12"
+        memory_request = "8Gi"
+        memory_limit = "24Gi"
+        poll_timeout = 600
+        [runners.kubernetes.node_selector]
+          "kubernetes.io/arch" = "amd64"
+        [[runners.kubernetes.volumes.pvc]]
+          name = "work-amd64"
+          mount_path = "/work"
+rbac:
+  create: false
+  serviceAccountName: fibber-ci
+concurrent: 1

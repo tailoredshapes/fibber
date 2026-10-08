@@ -1,0 +1,42 @@
+# The weekly full mutant sweep (`make mutants`: every planted-fault script, scripts/mutant-*.sh). Suspended: nothing runs until the owner unsuspends it:
+#   kubectl -n fibber-ci patch cronjob mutants-weekly -p '{"spec":{"suspend":false}}'        (make k8s-cron-apply applies this file)
+# It runs against the tree last streamed into the work volume (make k8s-src) and the image tagged below: refresh both before enabling.
+# Sunday 03:00 (the node's local time); one at a time; it fits the quota (8 CPU / 16 GiB) beside a gate pod only when the gate is not running.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mutants-weekly
+  namespace: fibber-ci
+spec:
+  schedule: "0 3 * * 0"
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels: {fibber/job: mutants}
+    spec:
+      ttlSecondsAfterFinished: 604800
+      backoffLimit: 0
+      activeDeadlineSeconds: 28800
+      template:
+        metadata:
+          labels: {fibber/job: mutants}
+        spec:
+          priorityClassName: fibber-ci-low
+          restartPolicy: Never
+          nodeSelector: {kubernetes.io/arch: amd64}
+          securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+          containers:
+            - name: ci
+              image: fibber-ci:91b6567496f3
+              imagePullPolicy: Never
+              command: [bash, -ceu, "mkdir -p \"$HOME\"; cd /work/tree; make -k -j8 mutants"]
+              resources:
+                requests: {cpu: "8", memory: 16Gi}
+                limits: {cpu: "8", memory: 16Gi}
+              volumeMounts: [{name: work, mountPath: /work}]
+          volumes:
+            - name: work
+              persistentVolumeClaim: {claimName: work-amd64}

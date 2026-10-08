@@ -1,0 +1,37 @@
+# `make k8s-netpol-test`: one pod tries what the policy allows (DNS, HTTPS to the internet) and what it must refuse (gear, the API server, kube-system, the LAN,
+# plain HTTP). The same pod runs in a scratch namespace without policies as the control: refused there too would mean the network, not the policy.
+# GEAR_POD_ADDR and GEAR_SVC_ADDR are the gear pod's and service's cluster addresses (read by the make target; the pod only connects, it sends nothing).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: netpol-probe
+  labels: {fibber/role: probe}
+spec:
+  restartPolicy: Never
+  priorityClassName: fibber-ci-low
+  nodeSelector: {kubernetes.io/arch: amd64}
+  containers:
+    - name: probe
+      image: fibber-ci:IMAGE_TAG
+      imagePullPolicy: Never
+      resources:
+        requests: {cpu: 50m, memory: 64Mi}
+        limits: {cpu: 500m, memory: 256Mi}
+      command:
+        - bash
+        - -c
+        - |
+          t() { if curl -s -o /dev/null -m 5 "$2"; then r=reachable; else r=BLOCKED; fi; printf '%-34s %-9s %s\n' "$1" "$r" "$2"; }
+          t "dns+https github.com (allowed)" https://github.com
+          t "https 1.1.1.1:443 (allowed)" https://1.1.1.1
+          t "http github.com:80" http://github.com
+          t "gear pod" "http://${GEAR_POD}"
+          t "gear service" "http://${GEAR_SVC}"
+          t "k8s API service" https://10.43.0.1:443
+          t "metrics-server (kube-system)" https://10.43.187.94:443
+          t "node LAN lilnas:6443" https://192.168.7.42:6443
+          t "node LAN lilnas:22" http://192.168.7.42:22
+          t "LAN router 192.168.7.1:80" http://192.168.7.1
+      env:
+        - {name: GEAR_POD, value: "GEAR_POD_ADDR"}
+        - {name: GEAR_SVC, value: "GEAR_SVC_ADDR"}

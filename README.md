@@ -56,6 +56,9 @@ libm, libstdc++, libgcc_s, libz and libzstd (`ldd bin/fibc` shows those
 and nothing else), and a C compiler (`cc`) for `fibc build`. To make a release
 yourself, see `scripts/package.sh`.
 
+**Kubernetes jobs.** `make k8s-apply`, then `make k8s-gate` (or `k8s-quick`, `k8s-mutants NAME=..`, `k8s-job TARGET=..`) runs the Make gate as a Job in the
+`fibber-ci` namespace of the local k3s; `K8S_ARCH=arm64` runs it on a native aarch64 Linux node. Topology, quotas, how to add a node: docs/design/build.md, section 7.
+
 **Building and testing on macOS (Apple Silicon).** The build is GNU Make 4 or later: macOS ships GNU Make 3.81 as `/usr/bin/make`, which the
 Makefile refuses with a message, so `brew install make` and run `gmake`. Also `brew install llvm@21` (keg-only; `llvm` alone is 22) and the
 Xcode command line tools. `gmake -j8 mac-check` is the gate for the Mac (mk/mac.mk): the full gate less the tools and stages that need Linux, each
