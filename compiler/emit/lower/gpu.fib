@@ -1,0 +1,114 @@
+;; compiler/emit/lower/gpu.fib: the `gpu/*` builtins of fib.gpu (spec/types.md 2.17, docs/design/gpu.md 3), lowered two ways:
+;;   on a kernel target (FIB_TARGET_TRIPLE names one, types.targets `kernel-triple?`) the index space is lIR's `(sreg R)` (spec/lir.md 6.9a),
+;;   the barrier `(barrier)`, and `(gpu/shared :f32 N)` a `(global shared ..)` of the module (address space 3: NVPTX `.shared`), one per call
+;;   site; on the host the index space is the state `fib.gpu.host-index` ([12 x i64]: local, group, group-size, num-groups, three each;
+;;   the sizes start at 1, the ids at 0) that `fib.gpu/host-launch` sets through `gpu/host-index-set!` as it runs a kernel over a grid, the
+;;   barrier is nothing (the host runs the threads one after another: a kernel whose result needs another thread's write before a
+;;   barrier does not reproduce on the host, gpu.md 3.5), and shared memory is a static buffer of the module. `gpu/program-ptx` is the
+;;   PTX `fibc build --kernel-target` made for the program's kernels (the file FIB_KERNEL_PTX names; "" without it, and on a kernel target).
+(ns emit.lower.gpu
+  (:require [types.targets :as tt])
+  (:use types.ty types.ast emit.value emit.ir emit.program emit.statics emit.lower.cx))
+
+(defun gpu-name? (name: str) -> bool
+  (one-of name ["gpu/local-id" "gpu/group-id" "gpu/group-size" "gpu/num-groups" "gpu/global-id" "gpu/barrier" "gpu/shared" "gpu/host-index-set!" "gpu/program-ptx"]))
+
+(defun one-of :private (x: str xs: (Vec str)) -> bool
+  (reduce (fn (acc: bool y: str) (or acc (= x y))) false xs))
+
+(defun kernel-target? :private () -> bool
+  (tt/kernel-triple? (sys-getenv "FIB_TARGET_TRIPLE")))
+
+;; The kind of index a builtin reads: its slot in the host state (0 local, 3 group, 6 group-size, 9 num-groups) and its special register.
+(defun index-slot :private (name: str) -> i64
+  (cond (= name "gpu/local-id") 0 (= name "gpu/group-id") 3 (= name "gpu/group-size") 6 :else 9))
+
+(defun sreg-base :private (name: str) -> str
+  (cond (= name "gpu/local-id") "tid" (= name "gpu/group-id") "ctaid" (= name "gpu/group-size") "ntid" :else "nctaid"))
+
+(defun arg :private (name: str a: (Vec V) i: i64) -> (Result V str)
+  (match (get a i) ((some v) (Ok v)) (nil (Err (str-join [name " without argument " (str i)])))))
+
+;; `(sreg R.x)`, `.y` or `.z` by the dimension `d` (a select chain LLVM folds for a constant), as an i64.
+(defun sreg-by-dim :private (cx: LowerCx base: str d: V) -> V
+  (let ((b (. cx b)))
+    (let ((x (fb-val b (str-join ["(sreg " base ".x)"]) LirI32))
+          (y (fb-val b (str-join ["(sreg " base ".y)"]) LirI32))
+          (z (fb-val b (str-join ["(sreg " base ".z)"]) LirI32)))
+      (let ((is0 (fb-val b (str-join ["(icmp eq " (v-text d) " (i64 0))"]) LirI1))
+            (is1 (fb-val b (str-join ["(icmp eq " (v-text d) " (i64 1))"]) LirI1)))
+        (let ((yz (fb-val b (str-join ["(select " (v-text is1) " " (v-text y) " " (v-text z) ")"]) LirI32)))
+          (let ((r (fb-val b (str-join ["(select " (v-text is0) " " (v-text x) " " (v-text yz) ")"]) LirI32)))
+            (fb-val b (str-join ["(sext i64 " (v-text r) ")"]) LirI64)))))))
+
+;; The host state, declared once: ids 0, sizes 1.
+(defun host-index-global :private (cx: LowerCx) -> str
+  (statics-item (. (. cx p) statics) "fib.gpu.host-index"
+                "(global internal fib.gpu.host-index [12 x i64] ([12 x i64] (i64 0) (i64 0) (i64 0) (i64 0) (i64 0) (i64 0) (i64 1) (i64 1) (i64 1) (i64 1) (i64 1) (i64 1)))\n"))
+
+(defun host-slot :private (cx: LowerCx slot: i64 d: V) -> V
+  (let ((g (host-index-global cx)) (b (. cx b)))
+    (let ((i (fb-val b (str-join ["(add " (v-text d) " (i64 " (str slot) "))"]) LirI64)))
+      (fb-val b (str-join ["(getelementptr i64 " g " " (v-text i) ")"]) LirPtr))))
+
+(defun index-read :private (cx: LowerCx name: str d: V) -> V
+  (if (kernel-target?)
+      (sreg-by-dim cx (sreg-base name) d)
+      (fb-val (. cx b) (str-join ["(load i64 " (v-text (host-slot cx (index-slot name) d)) ")"]) LirI64)))
+
+;; `group-id * group-size + local-id` along `d`, wrapping (a grid never reaches 2^63).
+(defun global-id :private (cx: LowerCx d: V) -> V
+  (let ((g (index-read cx "gpu/group-id" d)) (n (index-read cx "gpu/group-size" d)) (l (index-read cx "gpu/local-id" d)))
+    (let ((m (fb-val (. cx b) (str-join ["(mul " (v-text g) " " (v-text n) ")"]) LirI64)))
+      (fb-val (. cx b) (str-join ["(add " (v-text m) " " (v-text l) ")"]) LirI64))))
+
+;; The literal operands of `(gpu/shared :kind N)`: the element kind and the count.
+(defun shared-operands :private (e: Expr) -> (Result (Pair str i64) str)
+  (match (. e kind)
+    ((ECall _ args)
+     (if (= (count args) 2)
+         (match (Pair (nth args 0) (nth args 1))
+           ((Pair (ArgExpr k) (ArgExpr n))
+            (match (Pair (. k kind) (. n kind))
+              ((Pair (ELit (LitKeyword kind)) (ELit (LitInt count _))) (Ok (Pair kind count)))
+              (_ (Err "gpu/shared takes a literal element kind (:f32 :f64 :i32 :i64 :i8) and a literal count"))))
+           (_ (Err "gpu/shared takes a literal element kind and a literal count")))
+         (Err "gpu/shared takes two operands")))
+    (_ (Err "gpu/shared: not a call"))))
+
+(defun elem-lir :private (kind: str) -> (Option str)
+  (cond (= kind "f32") (some "float") (= kind "f64") (some "double") (= kind "i32") (some "i32") (= kind "i64") (some "i64") (= kind "i8") (some "i8") :else nil))
+
+;; One window of block-shared memory per call site: `fib.gpu.shared.N` of `[count x elem]`; on the host a zeroed static buffer.
+(defun shared-window :private (cx: LowerCx e: Expr) -> (Result V str)
+  (try-let ((ops (shared-operands e)))
+    (match (elem-lir (. ops fst))
+      (nil (Err (str-join ["gpu/shared: no element kind :" (. ops fst) " (one of :f32 :f64 :i32 :i64 :i8)"])))
+      ((some el)
+       (if (or (<= (. ops snd) 0) (> (. ops snd) 1048576))
+           (Err (str-join ["gpu/shared: a window of " (str (. ops snd)) " elements: 1 to 1048576"]))
+           (let ((name (str-join ["fib.gpu.shared." (str (. e id))]))
+                 (ty (str-join ["[" (str (. ops snd)) " x " el "]"])))
+             (Ok (VVal (statics-item (. (. cx p) statics) name
+                                     (str-join ["(global " (if (kernel-target?) "shared " "internal ") name " " ty " (zeroinitializer " ty "))\n"]))
+                       LirRaw))))))))
+
+(defun program-ptx :private (cx: LowerCx) -> V
+  (let ((text (if (kernel-target?) "" (match (sys-getenv "FIB_KERNEL_PTX") ((some path) (unwrap-or (read-file path) "")) (nil "")))))
+    (VVal (statics-string (. (. cx p) statics) text 0) LirPtr)))
+
+;; A `gpu/*` builtin call. `gpu/barrier` and `gpu/host-index-set!` are statements (unit).
+(defun lcx-gpu (cx: LowerCx name: str e: Expr a: (Vec V)) -> (Result V str)
+  (cond (= name "gpu/barrier") (do (when (kernel-target?) (fb-stmt (. cx b) "(barrier)")) (Ok VUnit))
+        (= name "gpu/global-id") (try-let ((d (arg name a 0))) (Ok (global-id cx d)))
+        (= name "gpu/shared") (shared-window cx e)
+        (= name "gpu/program-ptx") (Ok (program-ptx cx))
+        (= name "gpu/host-index-set!")
+        (try-let ((slot (arg name a 0)) (d (arg name a 1)) (v (arg name a 2)))
+          (if (kernel-target?)
+              (Ok VUnit)
+              (let ((i (fb-val (. cx b) (str-join ["(add " (v-text d) " " (v-text slot) ")"]) LirI64)))
+                (let ((p (fb-val (. cx b) (str-join ["(getelementptr i64 " (host-index-global cx) " " (v-text i) ")"]) LirPtr)))
+                  (do (fb-stmt (. cx b) (str-join ["(store " (v-text v) " " (v-text p) ")"]))
+                      (Ok VUnit))))))
+        :else (try-let ((d (arg name a 0))) (Ok (index-read cx name d)))))

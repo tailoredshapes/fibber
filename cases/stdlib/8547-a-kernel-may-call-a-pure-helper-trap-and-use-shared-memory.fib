@@ -1,0 +1,20 @@
+;; spec:   types §2.17 (the kernel subset), syntax §3.22 (defkernel); docs/design/gpu.md 3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; The allowed subset: a helper in the subset (checked like the kernel), checked arithmetic, `trap` (a device assert), `simd/fma` on scalars, a scalar cell as an accumulator, and `gpu/shared` (a static buffer on the host). The host run of a 2-block grid gives the CPU squares.
+(ns main (:require [fib.gpu :as gpu]))
+(defun sq (x: f32) -> f32 (simd/fma x x 0.0f32))
+(defkernel k (a: ptr c: ptr n: i64)
+  (let ((i (gpu/global-id 0)) (s (gpu/shared :f32 64)) (acc (cell 0.0f32)))
+    (when (< i n)
+      (do (when (< n 0) (trap "n is negative"))
+          (gpu/f32-set! s (gpu/local-id 0) (sq (gpu/f32-at a i)))
+          (set! acc (+ @acc (gpu/f32-at s (gpu/local-id 0))))
+          (gpu/f32-set! c i @acc)))))
+(defun main () -> i64
+  (let [n 100 a (cell (array n 0.0f32)) c (cell (array n 0.0f32))]
+    (do (dotimes (i n) (array-set! &a i (sitofp f32 i)))
+        (gpu/host-launch [2] [64] (fn () (k (gpu/array-data @a) (gpu/array-data @c) n)))
+        (loop [i 0 bad 0]
+          (if (>= i n) bad (recur (+ i 1) (if (= (f32->bits (* (sitofp f32 i) (sitofp f32 i))) (f32->bits (array-get @c i))) bad (+ bad 1))))))))

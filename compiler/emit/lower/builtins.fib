@@ -2,7 +2,7 @@
 ;; by name, a chain of `match`es (`builtin-core`, `builtin-text`, `builtin-mem`) since a fibber `match` takes no or-pattern. The cell load is the hub's `cell-load`.
 (ns emit.lower.builtins
   (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.layout emit.ir emit.program emit.objects.kinds
-        emit.lower.cx emit.lower.ops emit.lower.cells emit.lower.arith emit.lower.pattern emit.lower.strfind emit.lower.threads emit.lower.freeze emit.lower.simd emit.lower.simdmem emit.lower.catch))
+        emit.lower.cx emit.lower.ops emit.lower.cells emit.lower.arith emit.lower.pattern emit.lower.strfind emit.lower.threads emit.lower.freeze emit.lower.simd emit.lower.simdmem emit.lower.catch emit.lower.gpu))
 ;; Argument `i` of the builtin `name`. Rust: the closure `arg` of lower/builtins.rs:16
 (defun arg :private (name: str a: (Vec V) i: i64) -> (Result V str)
   (match (get a i)
@@ -10,7 +10,6 @@
     (nil (Err (str-join [name " without argument " (str i)])))))
 (defun one-of? :private (x: str xs: (Vec str)) -> bool
   (reduce (fn (acc: bool y: str) (or acc (= x y))) false xs))
-
 ;; A builtin call; `nil` when it does not return (`trap`). Rust: lower/builtins.rs:15 LowerCx::builtin
 (defun lcx-builtin (cx: LowerCx name: str e: Expr a: (Vec V) tys: (Vec Ty)) -> (Result (Option V) str)
   (cond
@@ -28,6 +27,7 @@
                     (str-join ["(call @fib.raise-object " (v-text x) ")"]))
           (Ok nil)))
     (= name "catch-run") (try-let ((f (arg name a 0))) (Ok (some (lcx-catch-run cx f))))
+    (gpu-name? name) (try-let ((v (lcx-gpu cx name e a))) (Ok (some v)))
     :else (try-let ((v (builtin-core cx name e a tys))) (Ok (some v)))))
 
 ;; ---- cells, weak references, the macro hooks, threads, `not`

@@ -1,10 +1,51 @@
 # fibber on a GPU: a kernel target, a device protocol, drivers
 
-Status: design and a measured prototype (GPU-1, 2026-10-07). The prototype is in this tree (the kernel target, `examples/gpu/`,
-`compiler/native/kernel.fib`, `compiler/tests/native/gpu-emit.sh`) and in the driver repository `fib-gpu-cuda`
-(`ssh://git@localhost:2222/tailoredshapes/fib-gpu-cuda.git`, tag `v0.0.1`). Every number in section 2 was measured on this machine
-(RTX 4080 SUPER, 16 GB, driver 610.57.04, CUDA 13.4, LLVM 21). spec/lir.md 6.9a and item 13 of its decision record are **Proposed** and
-wait for the owner, as does the whole of section 9.
+Status: **phase 1 built** (GPU-2, 2026-10-07), on the decision of docs/design/decisions-2026-10-04.md (GPU): the kernel target and `fib.gpu` are
+core, `defkernel` is the deliberate opt-in, a program with a kernel built for a platform with no kernel target is refused. Section 0 is what
+is built and where; sections 1 to 10 are the design as GPU-1 wrote it, kept as the record (what they call missing is in section 0's table
+when it landed). The driver is `fib-gpu-cuda` (`ssh://git@localhost:2222/tailoredshapes/fib-gpu-cuda.git`, tag `v0.1.0`). Every number
+was measured on this machine (RTX 4080 SUPER, 16 GB, driver 610.57.04, CUDA 13.4, LLVM 21).
+
+## 0. As built (phase 1, GPU-2)
+
+| what | where | the rule |
+|---|---|---|
+| `defkernel` as a core form | expand.top `kernel-defun`; types.lower `defun-kernel?`; types.decls `kernels` | spec/syntax.md 3.22: `(defkernel name (param*) body+)` is `(defun name (param*) :kernel -> unit (unsafe (do body+)))`; the mark is read by the checker and the emitter |
+| the kernel-subset checker | compiler/own/kernel.fib, after inference, before the ownership pass | spec/types.md 2.17: one error per kernel at its source position, the path when it is in a reached function (`:kernel-pure` is inferred); cases/stdlib 8530-8542 (thirteen refusals), scripts/mutant-gpu.sh (ten rules removed one at a time, each caught by a case) |
+| the `gpu/*` builtins | compiler/emit/lower/gpu.fib; lib/fib/gpu.fib (facade), lib/fib/gpu/host.fib | spec/types.md 2.17: `(sreg ..)`, `(barrier)`, `(global shared ..)` on a kernel target; the host index state, nothing, a static buffer on the host; `host-launch` runs a kernel over a grid on the CPU (the one-language guard: cases 8545-8547, examples/gpu/gpu.fib: vadd and gemm match a CPU loop, 0 mismatches) |
+| shared memory in lIR | spec/lir.md 6.9a `(global shared NAME T init)`; lir.parse, lir.print, native.lower `add-shared-global` | address space 3, `@NAME` the generic address; `gpu/shared` emits one per call site; the GEMM through it: 17.1 TFLOPS at 4096 (section 0.1) |
+| the kernel table and module | emit.compile `kernel-table`, `compile-kernels`; native.kernel reads `fib.kernel.NAME` | the `gpu-kernel-` name convention of GPU-1 is gone; the extractor's refusal (runtime, libc) is the backstop below the checker; the stack entries of a scalar cell (`fib.stack-init`, `fib.stack-end`) get device versions (three stores, no trace) |
+| the launch ABI | native.kernel `kernel-signatures`: `// fib.kernel-sig NAME: kind..` lines before the PTX; lib/fib/gpu/device.fib `parse-signatures`, `check-args`, `check-dims` | a launch with the wrong count or kind is `:arguments` naming the kernel and the position, before `cuLaunchKernel` (case 8548; the driver's `--wrong-args`; the contract) |
+| `--kernel-target TRIPLE` (FIB_KERNEL_TARGET) | driver.commands `build-with-kernels` | the program is lowered for the kernel target (the PTX to `OUT.ptx`, beside the executable: the inspectable by-product), then for the host with the PTX embedded (`gpu/program-ptx`, through FIB_KERNEL_PTX); `fibc run` and `fibc cases` run a kernel's body on the host (the development loop), `fibc build` of an executable needs the target or refuses |
+| the rejection on a platform with no kernel target | driver.commands `build-checked` | `fibc: the program has the kernels vadd, gemm (defkernel) and x86_64-pc-linux-gnu has no kernel target: build with --kernel-target nvptx64-nvidia-cuda (or FIB_KERNEL_TARGET), which embeds the kernels' PTX for a driver; there is no CPU fallback for a kernel`; `--kernel-target none` the same; wasm and JS hosts: the same message (no driver route; WebGPU is not designed, section 8) |
+| the `Device` protocols | lib/fib/gpu/device.fib: `Platform Device Module Kernel Buffer Stream Event`, `GpuError` (a kind), `DeviceInfo`, `Arg` | a program takes a `(dyn Platform)` from a driver and never names CUDA; ADR 0011 rule 4 (the allowance): `fib.gpu` declares no extern |
+| the contract | lib/fib/gpu/contract.fib (`GpuContract`: 6 scenarios; `GpuTrapContract`: the device assert, its own process), fault.fib (`:skip-lent-check`, `:swallow-assert`, `:ignore-signature`), contract-kernels.fib | fib-gpu-cuda v0.1.0 passes 7 of 7 and every fault is caught (`scripts/test.sh: 0 failed`) |
+| the gate | compiler/tests/native/gpu-emit.sh (20 checks, no GPU) in scripts/tools.sh's full mode | the driver's GPU tests stay in its repository (CI there needs a GitLab runner on the GPU box: shell executor, `libcuda.so.1`, cuBLAS, a fibc of GPU-2) |
+
+**Host semantics of the builtins** (documented, consistent): outside `host-launch` a kernel is the one thread (0,0,0) of a 1x1x1 grid
+(ids 0, sizes 1); inside, the index `host-launch` is on; `gpu/barrier` is nothing (threads run one after another, so a kernel that needs
+another thread's write before a barrier, the shared-memory GEMM, does not reproduce on the host: the device result is checked against the
+CPU's `fib.tensor` instead); `gpu/shared` is one static buffer per call site.
+
+### 0.1 Measured (GPU-2, fib-gpu-cuda `examples/gemm.fib`, median of 5; 3 at 4096; every result checked against the CPU)
+
+| n | CPU `fib.tensor` mmul, one core | fibber `gemm` (register 4x4) | fibber `gemm-smem` (64x64 shared-memory tiles) | CUDA C `gemm_reg` | CUDA C `gemm_smem` | cuBLAS | fibber smem / cuBLAS |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 73 GFLOPS (29 ms) | 8095 (0.265 ms) | 12495 (0.172 ms) | 7582 | 12633 | 25575 (0.084 ms) | 49% |
+| 2048 | 136 (126 ms) | 10645 (1.61 ms) | 16644 (1.03 ms) | 10619 | 16643 | 35099 (0.49 ms) | 47% |
+| 4096 | 132 (1045 ms) | 10923 (12.6 ms) | 17099 (8.04 ms) | 11042 | 16962 | 36229 (3.79 ms) | 47% |
+
+All four kernels are bit for bit the CPU's (the same fma order per element); fibber's shared-memory kernel (examples/gpu/kernels.fib
+`gemm-smem`: 16 accumulators as scalar cells, a counted inner loop of 16 LLVM unrolls) is the CUDA C one's speed, 1.57x the register
+kernel, the phase-2 target (16 TFLOPS) met in phase 1. Vector add on 2^22: 0 mismatches, 682 GB/s. A launch through the protocol with the
+signature check, followed by a sync: 6.1 to 6.2 us (fib-gpu-cuda `examples/launch-cost.fib`, 20000 launches); the host-side check is a loop
+over the arguments, below the noise of the sync. The one-language guard: `fibc run examples/gpu/gpu.fib -I examples/gpu` prints `host vadd
+100000: 0 mismatches; host gemm 128: 0 mismatches`.
+
+**Not in phase 1:** `with-launch`, the static lend of a device buffer (the run-time lent state in the driver is the backstop; the design
+of 3.3 stands: a scoped `DeviceBuffer` over the `with-view` machinery, phase 3); a typed launch form checked at compile time against the
+`defkernel`'s parameters (the run-time check covers every launch; the form needs the expander to see the kernel's types across modules);
+the barrier-uniformity check; pinned and async transfers; atomics; f16/bf16; the SPIR-V row.
 
 ## 1. Recommendation
 

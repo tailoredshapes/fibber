@@ -1,0 +1,13 @@
+;; spec:   types §2.17 (the kernel subset), syntax §3.22 (defkernel); docs/design/gpu.md 3
+;; expect: reject
+;; error:  kernel k: dyn: a kernel has no dynamic dispatch
+;; Protocol dispatch through `dyn` needs a vtable and an object: refused at the `dyn` form.
+(ns main (:require [fib.gpu :as gpu]))
+(defprotocol Scale (scale (self x: f32) -> f32))
+(defstruct Twice (k: i64))
+(impl Scale Twice (scale (self x) (* x 2.0f32)))
+(defun apply-scale (s: (dyn Scale) x: f32) -> f32 (scale s x))
+(defkernel k (a: ptr n: i64)
+  (let ((i (gpu/global-id 0)))
+    (when (< i n) (gpu/f32-set! a i (apply-scale (dyn Scale (Twice 2)) (gpu/f32-at a i))))))
+(defun main () -> i64 0)
