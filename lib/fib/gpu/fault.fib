@@ -4,7 +4,11 @@
 ;;   :skip-lent-check    a launch syncs at once, so nothing is ever lent: the lent-buffer scenario sees a download while "a kernel runs" succeed
 ;;   :swallow-assert     a sync that found a device trap answers Ok: the assert scenario (GpuTrapContract) sees no Err
 ;;   :ignore-signature   a kernel reports no signature, so a launch with the wrong arguments is not refused
-(ns fib.gpu.fault (:use fib.core fib.seq fib.coll fib.test.core fib.gpu.device))
+;; The faults of an asynchronous driver (`async-faults`, the scenarios of fib.gpu.contract-async that must fail):
+;;   :early-wait         `transfer-wait` returns at once with what the host sees then (the buffer is read before the copy is complete, as a driver that
+;;                       does not wait lets a program do), `transfer-done?` says true: a wait that does not wait
+;;   :skip-pinned-check  a copy is waited for before it returns, so no pinned buffer is ever in flight: the loan rules are never exercised
+(ns fib.gpu.fault (:use fib.core fib.seq fib.coll fib.test.core fib.gpu.device) (:require [fib.os.native :as n]))
 
 (defstruct Faulty (inner: (dyn Device) fault: keyword))
 (defstruct FaultyStream (inner: (dyn Stream) fault: keyword))
@@ -13,12 +17,15 @@
 
 (defun faulty (inner: (dyn Device) fault: keyword) -> Faulty (Faulty inner fault))
 (defun faults () -> (Vec keyword) [:skip-lent-check :swallow-assert :ignore-signature])
+(defun async-faults () -> (Vec keyword) [:early-wait :skip-pinned-check])
 
 ;; The words of the ids of the contract scenarios that must fail for each fault.
 (defun fault-scenarios (fault: keyword) -> (Vec str)
   (cond (= fault :skip-lent-check) ["lent-buffer-misuse"]
         (= fault :swallow-assert) ["a-device-assert"]
         (= fault :ignore-signature) ["a-launch-is-checked"]
+        (= fault :early-wait) ["a-wait-returns-after-the-copy-is-complete"]
+        (= fault :skip-pinned-check) ["a-pinned-buffer-in-flight"]
         :else []))
 
 (impl Kernel FaultyKernel
@@ -33,6 +40,39 @@
       ((Err e) (Err e))))
   (module-unload (self) (module-unload (. self inner))))
 
+;; The host's view of a pinned buffer, read straight from its address (what a program sees when a driver lets it read before the copy is done).
+(defun raw-floats :private (p: (dyn Pinned) count: i64) -> (Array f32)
+  (let [out (cell (array count 0.0f32)) base (n/pointer (pinned-handle p))]
+    (do (dotimes (i count) (array-set! &out i (unsafe (load-f32 (ptr+ base (* 4 i)))))) @out)))
+
+;; The pinned buffer a program gets from an early wait: reads answer the snapshot taken when the wait returned; everything else is the real buffer's.
+(defstruct SnapshotPinned (inner: (dyn Pinned) snap: (Array f32)))
+(impl Pinned SnapshotPinned
+  (pinned-bytes (self) (pinned-bytes (. self inner)))
+  (pinned-handle (self) (pinned-handle (. self inner)))
+  (pinned-locked? (self) (pinned-locked? (. self inner)))
+  (pinned-write (self xs) (pinned-write (. self inner) xs))
+  (pinned-read (self count)
+    (let [out (cell (array count 0.0f32))] (do (dotimes (i (min count (array-len (. self snap)))) (array-set! &out i (array-get (. self snap) i))) (Ok @out))))
+  (pinned-release (self) (pinned-release (. self inner))))
+
+(defstruct EarlyTransfer (inner: (dyn Transfer) pinned: (dyn Pinned)))
+(impl Transfer EarlyTransfer
+  (transfer-done? (self) (Ok true))
+  (transfer-wait (self)
+    (let [snap (raw-floats (. self pinned) (quot (pinned-bytes (. self pinned)) 4))]
+      (match (transfer-wait (. self inner)) ((Ok p) (Ok (dyn Pinned (SnapshotPinned p snap)))) ((Err e) (Err e))))))
+
+(defstruct DoneTransfer (pinned: (dyn Pinned)))
+(impl Transfer DoneTransfer
+  (transfer-done? (self) (Ok true))
+  (transfer-wait (self) (Ok (. self pinned))))
+
+(defun faulty-transfer :private (fault: keyword t: (dyn Transfer) p: (dyn Pinned)) -> (Result (dyn Transfer) GpuError)
+  (cond (= fault :early-wait) (Ok (dyn Transfer (EarlyTransfer t p)))
+        (= fault :skip-pinned-check) (match (transfer-wait t) ((Ok q) (Ok (dyn Transfer (DoneTransfer q)))) ((Err e) (Err e)))
+        :else (Ok t)))
+
 (impl Stream FaultyStream
   (stream-launch (self k grid block args)
     (match (stream-launch (. self inner) k grid block args)
@@ -44,6 +84,10 @@
       ((Ok u) (Ok u))))
   (stream-record (self e) (stream-record (. self inner) e))
   (stream-lend (self bs) (stream-lend (. self inner) bs))
+  (stream-copy-in (self dst src bytes)
+    (match (stream-copy-in (. self inner) dst src bytes) ((Ok t) (faulty-transfer (. self fault) t src)) ((Err e) (Err e))))
+  (stream-copy-out (self src dst bytes)
+    (match (stream-copy-out (. self inner) src dst bytes) ((Ok t) (faulty-transfer (. self fault) t dst)) ((Err e) (Err e))))
   (stream-handle (self) (stream-handle (. self inner))))
 
 (impl Device Faulty
@@ -51,6 +95,7 @@
   (device-supports? (self cap) (device-supports? (. self inner) cap))
   (device-load (self source) (match (device-load (. self inner) source) ((Ok m) (Ok (dyn Module (FaultyModule m (. self fault))))) ((Err e) (Err e))))
   (device-alloc (self bytes) (device-alloc (. self inner) bytes))
+  (device-pinned (self bytes) (device-pinned (. self inner) bytes))
   (device-stream (self) (match (device-stream (. self inner)) ((Ok s) (Ok (dyn Stream (FaultyStream s (. self fault))))) ((Err e) (Err e))))
   (device-event (self) (device-event (. self inner)))
   (device-close (self) (device-close (. self inner))))
@@ -64,3 +109,7 @@
 (defun mentions? (id: str word: str) -> bool (some? (str-find id word 0)))
 (defun failing-word? (scs: (Vec Scenario) word: str) -> bool (some? (first (filter (fn (f: str) (mentions? f word)) (contract-failures scs 1)))))
 (defun has-word? (scs: (Vec Scenario) word: str) -> bool (some? (first (filter (fn (s: Scenario) (mentions? (. s id) word)) scs))))
+
+;; True when every scenario named by the fault's words exists in `scs` and fails; a real device's contract, wrapped in the fault.
+(defun fault-caught? (scs: (Vec Scenario) fault: keyword) -> bool
+  (every? (fn (w: str) (and (has-word? scs w) (failing-word? scs w))) (fault-scenarios fault)))

@@ -1,0 +1,18 @@
+;; spec:   types §6.15 (L2), §1.10; docs/design/gpu.md 6.8
+;; expect: reject
+;; error:   src is lent to
+;; stage:  2
+;; The body of `with-copy-in` writes the pinned buffer whose copy is in flight: the place is frozen for the extent (L2), so the program is refused before it runs. The twin,
+;; case 440, writes it before the form and reads it after. At run time the same misuse is the `:lent` Err of `pinned-write` (fib.gpu.contract-async).
+(ns main (:use fib.view fib.gpu.lend) (:require [fib.gpu :as gpu] [fib.gpu.sim :as sim]))
+
+(defun pinned (d: (dyn gpu/Device) n: i64) -> (dyn gpu/Pinned)
+  (match (gpu/device-pinned d n) ((Ok p) p) ((Err e) (trap (. e message)))))
+
+(defun main () -> i64
+  (let [d (dyn gpu/Device (sim/sim-device 1048576))
+        s (match (gpu/device-stream d) ((Ok s) s) ((Err e) (trap (. e message))))
+        dv (match (gpu/device-alloc d 16) ((Ok b) b) ((Err e) (trap (. e message))))
+        src (cell (pinned d 16))
+        r (with-copy-in (src s dv 16) (gpu/pinned-write @src (array 4 0.0f32)))]
+    0))

@@ -1,0 +1,24 @@
+;; fib.gpu.contract-async-kernels: the kernels the asynchronous half of the device contract (fib.gpu.contract-async) launches, over i32 indices and
+;; i32 arguments only, so one source is PTX for a CUDA driver and WGSL for a WebGPU one (WGSL has no 64-bit integer, webgpu.md 6). A program that
+;; `:require`s this module has kernels: a driver's spec is built with `--kernel-target` (PTX, `(gpu/program-ptx)`) or `--target wgsl-unknown-webgpu
+;; --emit wgsl` (the WGSL text a driver loads).
+(ns fib.gpu.contract-async-kernels (:require [fib.gpu :as gpu]))
+
+(defun gid () -> i32 (trunc i32 (gpu/global-id 0)))
+(defun f32-at (p: ptr i: i32) -> f32 (unsafe (load-f32 (ptr+ p (sext i64 (unchecked-multiply 4i32 i))))))
+(defun f32-set! (p: ptr i: i32 v: f32) -> unit (unsafe (store-f32 (ptr+ p (sext i64 (unchecked-multiply 4i32 i))) v)))
+
+;; c[i] = a[i] + b[i] below n.
+(defkernel async-vadd (a: ptr b: ptr c: ptr n: i32)
+  (let ((i (gid)))
+    (when (< i n) (f32-set! c i (+ (f32-at a i) (f32-at b i))))))
+
+;; The long kernel: every thread runs `iters` steps of a dependent integer chain (a multiply and an xor, which LLVM does not fold to a closed form),
+;; then c[i] = a[i] + float(chain & 65535). The CPU runs the chain once (`spin-ref` of fib.gpu.contract-async) and the answer is one f32 add: bit for bit. 20 million steps are
+;; about 20 ms on a current GPU: a copy queued behind it cannot have completed when a driver that returns early gives the buffer back.
+(defkernel async-spin (a: ptr c: ptr n: i32 iters: i32)
+  (let ((i (gid)))
+    (when (< i n)
+      (let ((h (loop ((k 0i32) (x 12345i32))
+                 (if (< k iters) (recur (unchecked-add k 1i32) (bit-xor (unchecked-multiply x 1664525i32) 1013904223i32)) x))))
+        (f32-set! c i (+ (f32-at a i) (sitofp f32 (bit-and h 65535i32))))))))

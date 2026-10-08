@@ -45,7 +45,7 @@ over the arguments, below the noise of the sync. The one-language guard: `fibc r
 **Not in phase 1:** `with-launch`, the static lend of a device buffer (the run-time lent state in the driver is the backstop; the design
 of 3.3 stands: a scoped `DeviceBuffer` over the `with-view` machinery, phase 3); a typed launch form checked at compile time against the
 `defkernel`'s parameters (the run-time check covers every launch; the form needs the expander to see the kernel's types across modules);
-the barrier-uniformity check; pinned and async transfers (GPU-3 did atomics and the reductions: section 12); f16/bf16; the SPIR-V row.
+the barrier-uniformity check; f16/bf16; the SPIR-V row. (GPU-3 did atomics and the reductions: section 12; GPU-6 pinned memory and async transfers: section 13.)
 
 ## 1. Recommendation
 
@@ -429,7 +429,7 @@ removes the only part of the prototype that is a convention rather than a rule.
 
 Phase 2's items 6 and 7 of section 9 (atomics on the device; block and grid reductions). Verified on this machine's RTX 4080 SUPER (driver 610.57.04) through
 libcuda for PTX and through Dawn for WGSL (the adapter is the same GPU: vendor nvidia, architecture lovelace); `compiler/tests/native/gpu-device.sh` is the
-executable form and skips the device part, with a note, where there is none. Pinned memory and async transfers (item 8) are NOT done.
+executable form and skips the device part, with a note, where there is none. Pinned memory and async transfers (item 8) are section 13.
 
 | what | where | verdict |
 |---|---|---|
@@ -450,6 +450,49 @@ as non-uniform when anything after the barrier branches on the thread. So the re
 number of blocks is a kernel argument checked against `gpu/num-groups` (a read of a builtin through a private variable is non-uniform to Tint). A device trap
 in the WGSL target returns zeros and goes on (webgpu.md 3.4), so a loop that steps by a trapped call's answer must not: the folds step past n if the total is 0.
 
-**Not done:** pinned host memory and async launch (item 8: `cuMemHostAlloc`, `cuMemcpyHtoDAsync` belong to the driver repository fib-gpu-cuda, which the
-core does not contain; the download at 0.4 GB/s is still the cost of not having it); a warp shuffle reduction (an intrinsic family); f32 atomic add and
+**Not done:** (pinned host memory and async launch, item 8, are section 13); a warp shuffle reduction (an intrinsic family); f32 atomic add and
 min/max through WGSL (no form); a relooper in the WGSL printer (webgpu.md 9.3), which would lift the branch rules above.
+
+## 13. Pinned host memory and asynchronous copies as built (GPU-6)
+
+Item 8 of section 9. The protocol is in fibber (`lib/fib/gpu/device.fib`), the two drivers implement it in their repositories (fib-gpu-cuda, fib-gpu-webgpu, branch `async`), and one
+contract both pass (`lib/fib/gpu/contract-async.fib`). Verified on this machine's RTX 4080 SUPER (driver 610.57.04): libcuda for PTX, wgpu-native over Vulkan for WGSL.
+
+**The API.** `device-pinned d bytes` gives a `(dyn Pinned)`: `bytes` of host memory (`pinned-write`, `pinned-read` of f32, `pinned-bytes`, `pinned-handle` = its address,
+`pinned-locked?`, `pinned-release`). `stream-copy-in s dst src bytes` and `stream-copy-out s src dst bytes` copy between a device buffer and a pinned buffer asynchronously, in stream
+order with the launches, and answer a `(dyn Transfer)`: `transfer-done?` asks without blocking, `transfer-wait` blocks until the copy is complete and GIVES THE PINNED BUFFER BACK (the
+one it was given). A pinned buffer is owned by one holder at a time: the copy lends it to the transfer, and in flight `pinned-write`, `pinned-read`, `pinned-release` and a second
+copy are `:lent` Errs; a second wait is `:invalid-argument`; release is final (`:released`). A device buffer is lent to the stream by a copy as by a launch, until `stream-sync`, with the
+stream's order respected (`lend-copy`, `lend-launch` in device.fib): a copy may follow a copy or a launch of its stream, a launch may follow a copy, a launch after a launch of one
+buffer is still `:lent`, and any use from another stream or from the host is `:lent`. So `copy-in a; copy-in b; launch(a, b, c); copy-out c` needs no sync between its steps.
+
+**The static form.** The Errs are the dynamic backstop (3.3's rule 1, extended). `fib.gpu.lend` (explicit, with `fib.view`) is the compile-time form, a `with-view` over a lender:
+`(with-copy-in (p stream device-buffer bytes) body..)` and `with-copy-out` lend the pinned buffer in the cell `p` to the copy for the body and wait at the scope's exit; the value is `(Ok body-value)`
+or the Err of the copy. The checker already refuses what the dynamic rules refuse: the body touching `p` (`p is lent to #loan and cannot be used here`, case 441), a second copy of `p` inside
+(case 442), the loan escaping (S1/VC1/VC2, the machinery of ADR 0022); case 440 is the accepted twin and runs the form on the simulated device. `with-launch` (3.3), the same for a device
+buffer and a launch, is still not built.
+
+**The simulated device.** `fib.gpu.sim` is a real implementation of the protocols on host memory with deterministic asynchrony (a copy is queued and happens when a wait, a sync or the third
+`transfer-done?` forces it; it loads no kernel). It makes the transfer contract and its faults testable without a GPU, in the gate: case 8670.
+
+**The contract** (`fib.gpu.contract-async`). `GpuTransferContract [make]`: 6 scenarios (the pinned buffer's life, 4 MB through the device and back, the loan in flight, polling and the second wait, the
+copy checks, two streams); `GpuAsyncContract [make source]`: 2 scenarios over `fib.gpu.contract-async-kernels` (i32 only, so one source is PTX and WGSL): copy-in, launch, copy-out with no sync between
+them bit for bit the CPU's, and a copy queued behind a 20 ms kernel (`async-spin`, 20 million steps of a multiply-xor chain) that must not be `done?` at once and must hold the bytes after the wait.
+`fib.gpu.fault` gains `async-faults`: `:early-wait` (the wait returns at once, the program sees the bytes then, `done?` is true: caught by "a wait returns after the copy is complete") and
+`:skip-pinned-check` (the copy is waited for before it returns, nothing is ever in flight: caught by "a pinned buffer in flight is lent to its transfer"); `fault-caught?` checks that the scenarios a
+fault names exist and fail. Drivers also plant the faults in their own source (`scripts/test.sh --plant`): a wait that does not wait, a pinned buffer never in flight, a `done?` that is always true.
+The one honest limit: on a real device the transfer contract's round trip can pass under `:early-wait` (the DMA finishes before the host's stale read does); the long-kernel scenario is what
+catches it, deterministically. WebGPU's copy-in (`queue.writeBuffer`) copies the bytes when it returns, so a copy-in wait that does not wait is not observable and is not planted.
+
+**WebGPU.** Pinned memory there is plain host memory (`pinned-locked?` false, `device-supports? :pinned` false): WebGPU has no page-locked memory. The copy-in is `queue.writeBuffer`, a submit and
+`queue.onSubmittedWorkDone` (a fence); the copy-out a staging copy and `mapAsync`. Both deliver to C callbacks in the driver's shim (`fibwgpu_read_begin/_poll/_finish`, `fibwgpu_fence/_poll/_finish`):
+the existing mechanism; the fibber side only starts, polls and ends a request. The language still has no C-callback form (webgpu.md 5.2); with it the shim's six functions would shrink to the
+descriptor fills. The JavaScript driver answers `:unsupported` to the new calls.
+
+**Measured** (fib-gpu-cuda `examples/overlap.fib`, 32 MiB chunks of f32, a kernel of 5000 dependent fma steps per element so that copy and kernel take about the same time; every result checked
+bit for bit on a sample against the CPU): one copy-in 1.85 ms (17.8 GB/s), the kernel 1.96 ms, one copy-out 1.94 ms (17.3 GB/s). 96 chunks: pageable `buffer-upload`/`buffer-download` 894 ms (7.2 GB/s
+of host transfer; it varies from 1.5 to 8 GB/s run to run with the page faults of the fresh result array), pinned serial 533 ms (12.1 GB/s), pinned over 3 streams 306 ms (21.0 GB/s): copy and compute
+overlap, 1.74 times faster than the same pinned chunks one after the other and 2.9 times faster than pageable. The overlap is partial (the ideal for three equal stages is near 3x): the two copy
+directions share the bus, 21 GB/s aggregate against 17.8 alone each way. WebGPU (fib-gpu-webgpu `examples/overlap.fib`, the same program over WGSL): 1.11 times (48 chunks, serial 366 ms, piped 329 ms,
+kernel 6.4 ms against copy-in 5.4 ms and copy-out 3.3 ms): one queue, a `writeBuffer` that copies through a staging ring on the CPU, and a kernel that is the WGSL printer's state machine (30 ms for the
+work CUDA does in 0.8 ms at 2000 steps): the hardware has no second path to overlap on in this driver.

@@ -1,0 +1,179 @@
+;; fib.gpu.contract-async: what any `Device` driver must do about pinned host memory and asynchronous copies (docs/design/gpu.md 6.8), whoever
+;; implements it; the sibling of fib.gpu.contract, with the same shape. Two contracts:
+;;   GpuTransferContract [make]       no kernel: the pinned buffer's life, the loan to a transfer (in flight it is `:lent`, the wait gives it back), a wait that
+;;                                    returns only after the copy is complete, the polls, the checks, two streams. `fib.gpu.sim` passes it with no GPU.
+;;   GpuAsyncContract [make source]   with the kernels of fib.gpu.contract-async-kernels (`source`: PTX or WGSL as bytes): copy-in, launch and copy-out in
+;;                                    stream order with no sync between them, bit for bit the CPU's; and a copy queued behind a 20 ms kernel, which a driver
+;;                                    that returns before the copy completes gives back unfilled.
+;; fib.gpu.fault wraps a real device in the faults of an async driver (`:early-wait`, `:skip-pinned-check`); each must make its scenario FAIL.
+(ns fib.gpu.contract-async (:use fib.core fib.seq fib.coll fib.test.core fib.gpu.device fib.gpu.contract))
+
+(defun kind-t (r: (Result (dyn Transfer) GpuError)) -> keyword (match r ((Ok _) :ok) ((Err e) (. e kind))))
+(defun kind-p (r: (Result (dyn Pinned) GpuError)) -> keyword (match r ((Ok _) :ok) ((Err e) (. e kind))))
+(defun text-of (e: GpuError) -> str (str (. e kind) ": " (. e message)))
+
+;; The chain of `async-spin` on the host (the same wrapping i32 arithmetic) and the f32 it adds.
+(defun spin-ref (iters: i32) -> i32
+  (loop [k 0i32 x 12345i32]
+    (if (< k iters) (recur (unchecked-add k 1i32) (bit-xor (unchecked-multiply x 1664525i32) 1013904223i32)) x)))
+(defun spin-add (iters: i32) -> f32 (sitofp f32 (bit-and (spin-ref iters) 65535i32)))
+
+(defun verdict (bad: i64) -> str (if (= bad 0) "" (str bad " mismatches")))
+
+;; The pinned buffer's life: write, read, a read beyond it, its size, release, release again, use after release, a buffer of no bytes.
+(defun pinned-kinds (d: (dyn Device)) -> (Vec keyword)
+  (match (try-let [p (device-pinned d 4096)
+                   w (Ok (kind (pinned-write p (fill 1024 1))))
+                   r (pinned-read p 1024)
+                   same (Ok (if (= (mismatches (fill 1024 1) r) 0) :ok :bad-data))
+                   big (Ok (kind-f32 (pinned-read p 1025)))
+                   size (Ok (if (= (pinned-bytes p) 4096) :ok :bad-size))
+                   rel (Ok (kind (pinned-release p))) rel2 (Ok (kind (pinned-release p)))
+                   wr (Ok (kind (pinned-write p (fill 4 1)))) rd (Ok (kind-f32 (pinned-read p 4)))
+                   zero (Ok (kind-p (device-pinned d 0)))]
+           (Ok [w same big size rel rel2 wr rd zero]))
+    ((Ok ks) ks)
+    ((Err e) [(. e kind)])))
+
+;; `n` floats through the device and back: pinned -> device -> a second pinned buffer (a sentinel in it), two transfers on one stream with no sync, the waits
+;; give the buffers back (the same ones), and the bytes are the ones that went in. "" when so.
+(defun roundtrip-run (d: (dyn Device) n: i64) -> str
+  (match (try-let [s (device-stream d) a (device-pinned d (* 4 n)) b (device-pinned d (* 4 n)) dv (device-alloc d (* 4 n))
+                   src (Ok (fill n 3)) _ (pinned-write a src) _ (pinned-write b (array n -1.0f32))
+                   t1 (stream-copy-in s dv a (* 4 n)) t2 (stream-copy-out s dv b (* 4 n))
+                   a2 (transfer-wait t1) b2 (transfer-wait t2)
+                   same (Ok (and (= (pinned-handle a2) (pinned-handle a)) (= (pinned-handle b2) (pinned-handle b))))
+                   got (pinned-read b2 n)
+                   _ (stream-sync s) _ (pinned-release a2) _ (pinned-release b2) _ (buffer-release dv)]
+            (Ok (if same (verdict (mismatches src got)) "a wait did not hand back the buffer it was given")))
+    ((Ok m) m)
+    ((Err e) (text-of e))))
+
+;; The loan: with a copy-in in flight the pinned buffer refuses a write, a read, a release and a second transfer; the device buffer refuses a download, a release
+;; and a copy from another stream; the wait gives the pinned buffer back (a write is Ok), and a copy of the same stream follows (stream order).
+(defun inflight-kinds (d: (dyn Device)) -> (Vec keyword)
+  (let [n 65536 bytes (* 4 n)]
+    (match (try-let [s (device-stream d) s2 (device-stream d) a (device-pinned d bytes) b (device-pinned d bytes) dv (device-alloc d bytes)
+                     _ (pinned-write a (fill n 1))
+                     t (stream-copy-in s dv a bytes)
+                     k1 (Ok (kind (pinned-write a (fill 4 1)))) k2 (Ok (kind-f32 (pinned-read a 4))) k3 (Ok (kind (pinned-release a)))
+                     k4 (Ok (kind-t (stream-copy-in s dv a bytes)))
+                     k5 (Ok (kind-f32 (buffer-download dv 4))) k6 (Ok (kind (buffer-release dv)))
+                     k7 (Ok (kind-t (stream-copy-out s2 dv b bytes)))
+                     a2 (transfer-wait t)
+                     k8 (Ok (kind (pinned-write a2 (fill 4 1))))
+                     t2 (stream-copy-out s dv b bytes)
+                     b2 (transfer-wait t2)
+                     _ (stream-sync s)
+                     k9 (Ok (kind-f32 (buffer-download dv 4)))
+                     _ (pinned-release a2) _ (pinned-release b2) _ (buffer-release dv)]
+              (Ok [k1 k2 k3 k4 k5 k6 k7 k8 k9]))
+      ((Ok ks) ks)
+      ((Err e) [(. e kind)]))))
+
+;; A transfer is polled until done (bounded), then waited for; a second wait is refused.
+(defun poll-run (d: (dyn Device) n: i64) -> str
+  (match (try-let [s (device-stream d) a (device-pinned d (* 4 n)) b (device-pinned d (* 4 n)) dv (device-alloc d (* 4 n))
+                   src (Ok (fill n 5)) _ (pinned-write a src)
+                   t1 (stream-copy-in s dv a (* 4 n)) t2 (stream-copy-out s dv b (* 4 n))
+                   polls (Ok (loop [i 0] (match (transfer-done? t2) ((Ok true) i) ((Ok false) (if (> i 100000000) -1 (recur (+ i 1)))) ((Err _) -2))))
+                   b2 (transfer-wait t2) a2 (transfer-wait t1)
+                   again (Ok (match (transfer-wait t2) ((Ok _) :ok) ((Err e) (. e kind))))
+                   got (pinned-read b2 n) _ (stream-sync s)]
+            (Ok (cond (< polls 0) (str "transfer-done? never answered true (" polls ")")
+                      (not (= again :invalid-argument)) (str "a second wait was " again)
+                      :else (verdict (mismatches src got)))))
+    ((Ok m) m)
+    ((Err e) (text-of e))))
+
+;; The copy checks: more bytes than the device buffer, than the pinned buffer, none, and a released buffer on either side.
+(defun copy-check-kinds (d: (dyn Device)) -> (Vec keyword)
+  (match (try-let [s (device-stream d) a (device-pinned d 4096) big (device-pinned d 8192) dv (device-alloc d 4096) gone (device-alloc d 4096)
+                   _ (buffer-release gone) dead (device-pinned d 4096) _ (pinned-release dead)
+                   k1 (Ok (kind-t (stream-copy-in s dv big 8192))) k2 (Ok (kind-t (stream-copy-in s dv a 8192)))
+                   k3 (Ok (kind-t (stream-copy-in s dv a 0)))
+                   k4 (Ok (kind-t (stream-copy-in s gone a 4096))) k5 (Ok (kind-t (stream-copy-out s dv dead 4096)))
+                   _ (stream-sync s)]
+            (Ok [k1 k2 k3 k4 k5]))
+    ((Ok ks) ks)
+    ((Err e) [(. e kind)])))
+
+;; Two streams of one device, each with its own buffers, copied in and out at once: both come back right.
+(defun two-streams-run (d: (dyn Device) n: i64) -> str
+  (match (try-let [s1 (device-stream d) s2 (device-stream d)
+                   a1 (device-pinned d (* 4 n)) a2 (device-pinned d (* 4 n)) o1 (device-pinned d (* 4 n)) o2 (device-pinned d (* 4 n))
+                   d1 (device-alloc d (* 4 n)) d2 (device-alloc d (* 4 n))
+                   x1 (Ok (fill n 7)) x2 (Ok (fill n 11)) _ (pinned-write a1 x1) _ (pinned-write a2 x2)
+                   t1 (stream-copy-in s1 d1 a1 (* 4 n)) t2 (stream-copy-in s2 d2 a2 (* 4 n))
+                   u1 (stream-copy-out s1 d1 o1 (* 4 n)) u2 (stream-copy-out s2 d2 o2 (* 4 n))
+                   _ (transfer-wait t1) _ (transfer-wait t2) p1 (transfer-wait u1) p2 (transfer-wait u2)
+                   g1 (pinned-read p1 n) g2 (pinned-read p2 n) _ (stream-sync s1) _ (stream-sync s2)]
+            (Ok (+ (mismatches x1 g1) (mismatches x2 g2))))
+    ((Ok bad) (verdict bad))
+    ((Err e) (text-of e))))
+
+(defcontract GpuTransferContract [make]
+  (scenario "pinned buffers: write, read back, a read beyond the buffer, its size, release is final, a buffer of no bytes is refused"
+    (given [d (make)])
+    (then (expect = [:ok :ok :invalid-argument :ok :ok :released :released :released :invalid-argument] (pinned-kinds d))))
+  (scenario "a wait returns after the copy is complete: 4 MB through the device and back, the bytes are there and the buffers come back"
+    (given [d (make)])
+    (then (expect = "" (roundtrip-run d 1048576))))
+  (scenario "a pinned buffer in flight is lent to its transfer: write, read, release and a second copy are Errs, as are the device buffer's download, release and another stream's copy; the wait gives it back"
+    (given [d (make)])
+    (then (expect = [:lent :lent :lent :lent :lent :lent :lent :ok :ok] (inflight-kinds d))))
+  (scenario "a transfer is polled until done, then waited for once: the copy is complete, a second wait is refused"
+    (given [d (make)])
+    (then (expect = "" (poll-run d 262144))))
+  (scenario "copies are checked: more bytes than either buffer, no bytes, a released buffer on either side"
+    (given [d (make)])
+    (then (expect = [:invalid-argument :invalid-argument :invalid-argument :released :released] (copy-check-kinds d))))
+  (scenario "two streams copy in and out at once, each in its own order, and both come back right"
+    (given [d (make)])
+    (then (expect = "" (two-streams-run d 262144)))))
+
+;; ---- with kernels
+
+;; Copy-in of two vectors, a launch and the copy-out in stream order with no sync between them: the sum is bit for bit the CPU's.
+(defun pipeline-run (d: (dyn Device) src: (Array i8) n: i64) -> str
+  (match (try-let [m (device-load d src) k (module-kernel m "async_vadd") s (device-stream d)
+                   pa (device-pinned d (* 4 n)) pb (device-pinned d (* 4 n)) pc (device-pinned d (* 4 n))
+                   da (device-alloc d (* 4 n)) db (device-alloc d (* 4 n)) dc (device-alloc d (* 4 n))
+                   xa (Ok (fill n 1)) xb (Ok (fill n 2)) _ (pinned-write pa xa) _ (pinned-write pb xb) _ (pinned-write pc (array n -1.0f32))
+                   t1 (stream-copy-in s da pa (* 4 n)) t2 (stream-copy-in s db pb (* 4 n))
+                   _ (stream-launch s k [(quot (+ n 255) 256)] [256] [(ABuf da) (ABuf db) (ABuf dc) (AI32 (trunc i32 n))])
+                   t3 (stream-copy-out s dc pc (* 4 n))
+                   pc2 (transfer-wait t3) _ (transfer-wait t1) _ (transfer-wait t2)
+                   got (pinned-read pc2 n) _ (stream-sync s)
+                   _ (buffer-release da) _ (buffer-release db) _ (buffer-release dc) _ (module-unload m)]
+            (let [want (cell (array n 0.0f32))]
+              (do (dotimes (i n) (array-set! &want i (+ (array-get xa i) (array-get xb i))))
+                  (Ok (mismatches @want got)))))
+    ((Ok bad) (verdict bad))
+    ((Err e) (text-of e))))
+
+;; A copy-out queued behind a 20 ms kernel: not done when asked at once, complete when the wait returns (the sentinel is gone, every element is a[i] + the chain).
+(defun spin-run (d: (dyn Device) src: (Array i8) n: i64 iters: i32) -> str
+  (match (try-let [m (device-load d src) k (module-kernel m "async_spin") s (device-stream d)
+                   pa (device-pinned d (* 4 n)) pc (device-pinned d (* 4 n)) da (device-alloc d (* 4 n)) dc (device-alloc d (* 4 n))
+                   xa (Ok (fill n 4)) _ (pinned-write pa xa) _ (pinned-write pc (array n -1.0f32))
+                   t1 (stream-copy-in s da pa (* 4 n))
+                   _ (stream-launch s k [(quot (+ n 255) 256)] [256] [(ABuf da) (ABuf dc) (AI32 (trunc i32 n)) (AI32 iters)])
+                   t3 (stream-copy-out s dc pc (* 4 n))
+                   early (transfer-done? t3)
+                   pc2 (transfer-wait t3) _ (transfer-wait t1)
+                   got (pinned-read pc2 n) _ (stream-sync s)
+                   _ (buffer-release da) _ (buffer-release dc) _ (module-unload m)]
+            (let [add (spin-add iters) want (cell (array n 0.0f32))]
+              (do (dotimes (i n) (array-set! &want i (+ (array-get xa i) add)))
+                  (Ok (if early "done? was true behind a 20 ms kernel" (verdict (mismatches @want got)))))))
+    ((Ok m) m)
+    ((Err e) (text-of e))))
+
+(defcontract GpuAsyncContract [make source]
+  (scenario "a pipeline in stream order: copy-in, launch and copy-out with no sync between them is bit for bit the CPU's (vector add on 2^20)"
+    (given [d (make)])
+    (then (expect = "" (pipeline-run d source 1048576))))
+  (scenario "a wait returns after the copy is complete, even behind a long kernel: done? is false at once and the bytes are there after the wait"
+    (given [d (make)])
+    (then (expect = "" (spin-run d source 65536 20000000i32)))))
