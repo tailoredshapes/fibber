@@ -21,14 +21,17 @@ commands:
                          compile file through the JIT and run its main; the
                          args after -- are (args)
   build <file> -o <out> [-O N] [-L dir].. [-l lib].. [--emit obj|asm|llvm|ptx|wgsl]
+                        [--kernel-target TRIPLE|none]
                          compile file to an executable; each -l lib links
                          -llib, each -L dir is searched for libraries (-Ldir and
                          -llib are also taken); --emit writes the object, the
                          assembly or the LLVM IR instead and links nothing;
                          --emit ptx (a kernel target, --target nvptx64-nvidia-cuda)
-                         writes the PTX of the program's kernels (docs/design/gpu.md)
-                         --emit wgsl (the WebGPU kernel target, --target wgsl-unknown-webgpu)
-                         writes the WGSL of the program's kernels (docs/design/webgpu.md)
+                         writes the PTX of the program's kernels (docs/design/gpu.md);
+                         --kernel-target TRIPLE (or FIB_KERNEL_TARGET) builds the
+                         executable with the PTX of its kernels embedded (gpu/program-ptx)
+                         and beside it as OUT.ptx; a program with a defkernel and no
+                         kernel target (or --kernel-target none) is refused
   targets                print the table of code generation targets (one row per
                          target, tab-separated; docs/design/targets.md)
 
@@ -100,7 +103,7 @@ itrace and gen are commands of the Rust compiler (the test harness).")
 (defenum Command
   (CmdLsp)
   (CmdRun file: str trace: bool args: (Vec str) opt: i64)
-  (CmdBuild file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64 emit: str)
+  (CmdBuild file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64 emit: str kernel: str)
   (CmdTargets)
   (CmdEmit file: str)
   (CmdEmitDump opts: EmitOptions files: (Vec str))
@@ -122,7 +125,7 @@ itrace and gen are commands of the Rust compiler (the test harness).")
 (defun takes-roots? (c: Command) -> bool
   (match c
     ((CmdRun _ _ _ _) true)
-    ((CmdBuild _ _ _ _ _ _) true)
+    ((CmdBuild _ _ _ _ _ _ _) true)
     ((CmdEmit _) true)
     ((CmdEmitDump _ _) true)
     ((CmdExplain _) true)
@@ -178,27 +181,29 @@ itrace and gen are commands of the Rust compiler (the test harness).")
           (nil nil)
           ((some v) (if (= v "") nil (some (FlagVal flag v 2))))))))
 
-;; `build FILE -o OUT` and any number of `-L DIR` and `-l LIB`, and at most one `-O N` and one `--emit obj|asm|llvm|ptx`, in any order after the
-;; file; `-o` exactly once.
+;; `build FILE -o OUT` and any number of `-L DIR` and `-l LIB`, and at most one `-O N`, one `--emit obj|asm|llvm|ptx` and one
+;; `--kernel-target TRIPLE|none` (the kernel target of the program's kernels, docs/design/gpu.md 4.4; "" when not given: FIB_KERNEL_TARGET
+;; then applies), in any order after the file; `-o` exactly once.
 ;; Rust: command.rs:218 `parse_build`
 (defun parse-build :private (file: str rest: (Vec str)) -> Command
-  (loop ((i 0) (out nil) (dirs (vec-empty)) (libs (vec-empty)) (opt nil) (emit nil))
+  (loop ((i 0) (out nil) (dirs (vec-empty)) (libs (vec-empty)) (opt nil) (emit nil) (kernel nil))
     (if (>= i (count rest))
         (match out
           (nil CmdInvalid)
-          ((some o) (CmdBuild file o dirs libs (unwrap-or opt build-opt-level) (unwrap-or emit "exe"))))
+          ((some o) (CmdBuild file o dirs libs (unwrap-or opt build-opt-level) (unwrap-or emit "exe") (unwrap-or kernel ""))))
         (match (flag-value rest i)
           (nil CmdInvalid)
           ((some fv)
            (let ((name (. fv name)) (value (. fv value)) (next (+ i (. fv used))))
-             (cond (and (= name "-o") (nil? out)) (recur next (some value) dirs libs opt emit)
-                   (= name "-L") (recur next out (conj dirs value) libs opt emit)
-                   (= name "-l") (recur next out dirs (conj libs value) opt emit)
-                   (and (= name "--emit") (nil? emit) (in? value ["obj" "asm" "llvm" "ptx" "wgsl"])) (recur next out dirs libs opt (some value))
+             (cond (and (= name "-o") (nil? out)) (recur next (some value) dirs libs opt emit kernel)
+                   (= name "-L") (recur next out (conj dirs value) libs opt emit kernel)
+                   (= name "-l") (recur next out dirs (conj libs value) opt emit kernel)
+                   (and (= name "--emit") (nil? emit) (in? value ["obj" "asm" "llvm" "ptx" "wgsl"])) (recur next out dirs libs opt (some value) kernel)
+                   (and (= name "--kernel-target") (nil? kernel)) (recur next out dirs libs opt emit (some value))
                    (and (= name "-O") (nil? opt))
                      (match (opt-level value)
                        (nil CmdInvalid)
-                       ((some n) (recur next out dirs libs (some n) emit)))
+                       ((some n) (recur next out dirs libs (some n) emit kernel)))
                    :else CmdInvalid)))))))
 
 ;; The tail of `run`'s words from the file on. Rust: command.rs:266

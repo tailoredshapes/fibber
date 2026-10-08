@@ -1297,6 +1297,37 @@ reading it is a count-free `Borrowed(g)` (§6.1).
 
 ---
 
+### 2.17 GPU kernels: the `gpu/*` builtins and the kernel subset (GPU-2, stage 2 only)
+
+**Decided** (owner, 2026-10-07; docs/design/gpu.md 3). The builtins of `fib.gpu`, known to the checker by name (their rows in
+compiler/types/builtins.fib), each with a case (cases/stdlib 8545-8548) and a mutant (scripts/mutant-gpu.sh for the checker's rules):
+
+| builtin | type | on a kernel target (lIR, spec/lir.md 6.9a) | on the host |
+|---|---|---|---|
+| `(gpu/local-id d)` `(gpu/group-id d)` `(gpu/group-size d)` `(gpu/num-groups d)` | `(fn (i64) i64)`, `d` the dimension 0, 1 or 2 | `(sreg tid.x)`, `(sreg ctaid.x)`, `(sreg ntid.x)`, `(sreg nctaid.x)` (`.y`, `.z` by `d`) | the index `fib.gpu/host-launch` is running; outside a launch an id is 0 and a size 1 |
+| `(gpu/global-id d)` | `(fn (i64) i64)` | `group-id * group-size + local-id` | the same, from the host index |
+| `(gpu/barrier)` | `(fn () unit)` | `(barrier)`: every thread of the block waits | nothing (the host runs the threads one after another) |
+| `(gpu/shared :kind N)` | `(fn (keyword i64) ptr)`, unsafe; `:kind` one of `:f32 :f64 :i32 :i64 :i8`, `N` a literal 1 to 1048576 | a `(global shared NAME [N x T] ..)` of the module, one per call site: block-shared memory, address space 3, its content undefined at block start | a static buffer of the module (one for the whole host) |
+| `(gpu/host-index-set! slot d v)` | `(fn (i64 i64 i64) unit)`; `slot` 0 local, 3 group, 6 group-size, 9 num-groups | nothing | writes the host index (what `host-launch` uses) |
+| `(gpu/program-ptx)` | `(fn () str)` | `""` | the PTX of the program's kernels when built with `--kernel-target` (embedded), else `""` |
+
+**The kernel subset.** A `defkernel` (syntax §3.22) and every function it reaches (`:kernel-pure` is inferred: a function reached from a
+kernel is checked under the same rules, and the error names the path: `kernel k: .. (reached through k -> helper)`) may hold: scalars and
+`ptr`s (parameters, bindings, results), scalar cells (`(cell 0.0f32)`, `@c`, `(set! c v)`: an accumulator, a stack slot the emitter makes and
+LLVM's registers), arithmetic and comparison on scalars (the checked `+ - *` trap on the device), the conversions, the bit functions,
+`simd/fma` and the float family on scalars, `ptr+` and the scalar `load-*`/`store-*`, `trap` (a device assert: its message is the one
+string a kernel may hold), the `unchecked-*` family, `f32->bits` and kin, the `gpu/*` builtins, `if`, `do`, `let`, `loop`/`recur`
+(an unbounded loop is the GPU's problem), `unsafe`, `and`, `or`, `match` on literals. Refused, at the source position, by own.kernel after
+inference and before the ownership pass (one error per kernel, the first found): a constructor (any heap data: a struct, an enum, `some`, a
+Vec, a Map), a cell of an object, `atom`, `array`, `str`, `spawn`, `join`, `catch-run`/`throw-object` (what `try` expands to) and every other
+builtin outside the list above (the message names it); a string literal; a `Simd` value (the SIMD lane model is the CPU's, gpu.md 5.3); a
+closure, `async`, `await`, `quote`, `dyn`, `&`, a field read, `set-field!`, a `match` on data; an extern, a `def`; protocol dispatch through
+`dyn` or a bound (a built-in scalar instance is arithmetic; another instance's method is a function, checked like one); recursion, direct or
+mutual (the call graph of a kernel is acyclic: `recursion: fact is on the path k -> fact -> fact`); a parameter, binding or result whose type
+is a string, a lane vector or an object. The lIR-level refusal of native.kernel (anything that reaches the runtime or libc) stays as the
+backstop. Not checked: a `gpu/barrier` under a condition that differs between the threads of a block (undefined in PTX: the program's
+obligation, gpu.md 3.2). Cases: cases/stdlib 8530-8542 (one per refusal); mutants: scripts/mutant-gpu.sh.
+
 ## 3. The inference algorithm
 
 **Name (Decided, D3):** constraint-based Hindley–Milner with generalisation

@@ -85,6 +85,7 @@
            ((Ok [q defs])
             (do (set! (. q def-values) (merge @(. q def-values) @(. defs values)))
                 (inits-request q)
+                (host-kernel-table q)
                 (let ((entry (program-request q (BodyFun main) [])))
                   (match (emit-all q)
                     ((Ok _) (verified q defs (Module (module-parts q @(. defs text)) (main-part q entry executable) nil)))
@@ -178,22 +179,45 @@
     ((Err m) (Err m))
     ((Ok m) (match (. m pending) ((some msg) (Err msg)) (nil (Ok (for-target (str-concat (target-form typed) (module-text m)))))))))
 
-;; The kernels of the program as export specs, for a kernel target (docs/design/gpu.md 4): every function `defkernel` made (`gpu-kernel-NAME`, in any module
-;; of the program), exported as NAME. The emitter then lowers what the kernels reach, and native.kernel keeps that and drops the wrappers.
-(defun kernel-specs :private (typed: TypedProgram) -> (Vec (Pair str str))
-  (let ((g (. typed globals)) (pre tt/KERNEL-FUN-PREFIX))
-    (loop ((i 0) (out []))
-      (cond (>= i (table-count (. g funs))) out
-            (and (not (. (g-fun g i) is-macro)) (starts-with? (. (g-fun g i) name) pre))
-              (recur (+ i 1) (conj out (Pair (str-slice (. (g-fun g i) name) (str-len pre) (str-len (. (g-fun g i) name))) (. (g-fun g i) name))))
-            :else (recur (+ i 1) out)))))
+;; The kernel table (docs/design/gpu.md 4.2): one `(constant internal fib.kernel.NAME ptr @F)` per kernel of the program (`defkernel`, in any module;
+;; types.decls `kernels`), NAME the kernel's name as a driver asks for it, `@F` its function. On a kernel target native.kernel reads the table
+;; to find the entries; on the host it says the program has kernels (`fibc build` refuses an executable without a kernel target, driver.commands).
+(defun kernel-table :private (p: Program names: (Vec str)) -> unit
+  (let ((g (program-g p)) (ks @(. g kernels)))
+    (dotimes (i (count ks))
+      (let ((k (. (g-fun g (nth ks i)) name)))
+        (statics-item (. p statics) (str-join ["fib.kernel." k]) (str-join ["(constant internal fib.kernel." k " ptr @" (nth names i) ")
+"]))))))
+
+;; The module of a kernel target (docs/design/gpu.md 4.2): the runtime, the kernels and what they reach, the kernel table; no `main`, no wrappers
+;; (native.kernel extracts the kernel module from this one).
+(defun compile-kernels :private (typed: TypedProgram owned: OwnedProgram) -> (Result Module str)
+  (let ((p (emit.program/program-new typed owned)) (ks @(. (. typed globals) kernels)))
+    (try-let ((_ (inits-plan p)))
+      (match (make-defs-at p)
+        ((Err m) (Err m))
+        ((Ok [q defs])
+         (do (set! (. q def-values) (merge @(. q def-values) @(. defs values)))
+             (inits-request q)
+             (let ((names (mapv (fn (f: i64) (program-request q (BodyFun f) [])) ks)))
+               (try-let ((_ (emit-all q)))
+                 (do (kernel-table q names)
+                     (Ok (Module (module-parts q @(. defs text)) (inits-render q) nil)))))))))))
+
+;; The kernel table of a host program: the kernels' functions are requested (so a kernel body is checked and lowered for the host, the
+;; one-language guard of gpu.md 3.5) and the table written.
+(defun host-kernel-table (p: Program) -> unit
+  (let ((ks @(. (program-g p) kernels)))
+    (when (not (empty? ks))
+      (kernel-table p (mapv (fn (f: i64) (program-request p (BodyFun f) [])) ks)))))
 
 ;; The same for an executable, whose `main` returns the result as the process status and prints nothing (compiler.md §1); on a kernel target the
-;; module is the kernels' (the exports are the kernels, `kernel-specs`).
+;; module is the kernels' (`compile-kernels`).
 ;; Rust: compile.rs:53 compile_executable
 (defun compile-executable (typed: TypedProgram owned: OwnedProgram) -> (Result str str)
-  (match (let ((specs (if (tt/kernel-triple? (sys-getenv "FIB_TARGET_TRIPLE")) (kernel-specs typed) (export-specs))))
-           (if (empty? specs) (compile-module typed owned true) (compile-library typed owned specs)))
+  (match (cond (tt/kernel-triple? (sys-getenv "FIB_TARGET_TRIPLE")) (compile-kernels typed owned)
+               (empty? (export-specs)) (compile-module typed owned true)
+               :else (compile-library typed owned (export-specs)))
     ((Err m) (Err m))
     ((Ok m) (match (. m pending) ((some msg) (Err msg)) (nil (Ok (for-target (str-concat (target-form typed) (module-text m)))))))))
 

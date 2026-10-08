@@ -323,15 +323,31 @@
           ())
       (Ok ())))
 
+;; `(defkernel name (param*) body+)` (syntax §3.22) is the `defun` `(defun name (param*) :kernel -> unit (unsafe (do body+)))`: a kernel
+;; entry is `unit`-valued, its body reads and writes raw device pointers, and the `:kernel` mark is what the checker (own.kernel) and the
+;; emitter (the kernel module, docs/design/gpu.md 4.2) read. The same function compiles for the host as any other (the one-language guard).
+(defun kernel-defun :private (form: Stx) -> (Result Stx ExpandError)
+  (let ((items (items-of form)) (pos (. form pos)))
+    (cond (< (count items) 4) (Err (malformed "defkernel" "expected (defkernel name (param*) body+)" pos))
+          (not (match (. (nth items 1) kind) ((SSym _) true) (_ false))) (Err (malformed "defkernel" "expected a name" pos))
+          (not (match (. (nth items 2) kind) ((SList _) true) (_ false))) (Err (malformed "defkernel" "expected a parameter list" pos))
+          :else
+          (let ((at (fn (k: StxKind) (Stx k pos)))
+                (body (Stx (SList (into [(Stx (SSym "do") pos)] (vec (drop 3 items)))) pos)))
+            (Ok (Stx (SList [(at (SSym "defun")) (nth items 1) (nth items 2) (at (SKw "kernel")) (at (SSym "->")) (at (SSym "unit"))
+                             (Stx (SList [(at (SSym "unsafe")) body]) pos)])
+                     pos))))))
+
 ;; One definition with its `:private` marker already off. (definition_of)
-(defun definition-of :private (ex: Expander form: Stx first: bool) -> (Result Stx ExpandError)
-  (let ((name (head-or-empty form)))
-    (if (= name "defmacro")
-        (macro-definition ex form)
-        (try-let ((_ (note-defun (. ex ctx) form name))
-                  (f (desugared (. ex ctx) form name))
-                  (role (definition-role ex f name first)))
-          (walk ex f role)))))
+(defun definition-of :private (ex: Expander form0: Stx first: bool) -> (Result Stx ExpandError)
+  (try-let ((form (if (= (head-or-empty form0) "defkernel") (kernel-defun form0) (Ok form0))))
+    (let ((name (head-or-empty form)))
+      (if (= name "defmacro")
+          (macro-definition ex form)
+          (try-let ((_ (note-defun (. ex ctx) form name))
+                    (f (desugared (. ex ctx) form name))
+                    (role (definition-role ex f name first)))
+            (walk ex f role))))))
 
 ;; The name of the macro a walked defmacro form defines, if it has one.
 (defun defined-name :private (form: Stx) -> (Option str)

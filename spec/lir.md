@@ -149,6 +149,7 @@ item   ::= (defstruct NAME (type*))
          | (target (cpu STRING) (features STRING)?)        ; the CPU and features to generate code for (§4.5)
 mod    ::= private | internal | external           ; linkage (§4.3), at most one
          | hidden                                  ; visibility (§4.3)
+         | shared                                  ; a global in block-shared memory of a kernel target (§6.9a), `global` only
 block  ::= (block LABEL instr+)
 ```
 
@@ -662,7 +663,8 @@ assembly is PTX; nothing of them runs on a CPU target, and lair refuses them the
 |---|---|
 | `(define kernelcc (NAME void) (..) ..)` | the entry of a kernel: LLVM's `ptx_kernel` (71). `void` result, parameters scalars or `ptr`. Nothing in lIR calls it (a driver launches it by name); a `kernelcc` function on a target that is not a kernel target is `@NAME is kernelcc: only a kernel target .. lowers a kernel`; `tailcall` never targets it. `fn-type-str` prints it `(fn kernelcc void (..))` |
 | `(sreg R)` | `i32`: the special register `R` of the kernel's index space, one of `tid.{x,y,z}` (the thread's index in its block), `ctaid.{x,y,z}` (the block's in the grid), `ntid.{x,y,z}` (the block's size), `nctaid.{x,y,z}` (the grid's); any other `R` is the parse error `sreg: no special register R`. Lowered to `llvm.nvvm.read.ptx.sreg.R` |
-| `(barrier)` | void, not a terminator: every thread of the block waits until all have reached it (`bar.sync 0`, `llvm.nvvm.barrier0`). Not a phi operand |
+| `(barrier)` | void, not a terminator: every thread of the block waits until all have reached it (`bar.sync 0`; LLVM 21's `llvm.nvvm.barrier.cta.sync.aligned.all` with barrier 0: `llvm.nvvm.barrier0` is gone from LLVM 21). Not a phi operand |
+| `(global shared NAME T init)` | a global in the block-shared memory of a kernel target (LLVM address space 3, NVPTX `.shared`; accepted by the owner's GPU decision, implemented by GPU-2): `@NAME` is its generic address (an `addrspacecast` constant), so `load` and `store` through it are the ordinary forms and the backend makes `ld.shared`/`st.shared`; its content at block start is undefined (the initialiser is for the grammar: lair gives LLVM `undef`, NVPTX refuses an initialiser there); `internal` to the module. `shared` goes with `global` only (`constant cannot be shared`, `define cannot be shared`), once (`duplicate modifier shared`); on a target that is not a kernel target lair refuses it (`@NAME is shared: only a kernel target ..`). Emitted by `gpu/shared` (types.md 2.17) |
 
 `llvm.` stays reserved as a symbol prefix (§14 item 5): the two forms are instructions, as the fma family is. On a kernel target lair reads
 `(align 1)` on a scalar `load` or `store` as the scalar's natural alignment (the kernel subset indexes elements, never bytes; a byte-aligned

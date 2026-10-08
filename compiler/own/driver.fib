@@ -15,7 +15,7 @@
 (ns own.driver
   (:require [syntax.reader :as reader] [expand.program :as prog] [expand.error :as ee])
   (:use syntax.pos syntax.form syntax.error expand.ctx expand.types expand.error
-        types.error types.program types.driver types.target own.error own.program own.syntactic own.views own.top))
+        types.error types.program types.driver types.target own.error own.program own.syntactic own.views own.kernel own.top))
 
 ;; A program that passed the whole front end: its types (§3) and its ownership decisions (§6).
 (defstruct Checked (typed: TypedProgram owned: OwnedProgram))
@@ -30,11 +30,14 @@
         (match (infer-lowered-with l main library)
           ((Err errs) (Err (CeType errs)))
           ((Ok typed)
-           (match (analyse typed)
-             ((Err errs) (Err (CeOwn errs)))
-             ((Ok owned)
-              (let ((view-errs (views-owned typed owned)))
-                (if (empty? view-errs) (Ok (Checked typed owned)) (Err (CeOwn view-errs)))))))))))
+           (let ((kernel-errs (kernel-check typed)))   ; the kernel subset (own.kernel), at the source, after the types are known
+             (if (not (empty? kernel-errs))
+                 (Err (CeOwn kernel-errs))
+                 (match (analyse typed)
+                   ((Err errs) (Err (CeOwn errs)))
+                   ((Ok owned)
+                    (let ((view-errs (views-owned typed owned)))
+                      (if (empty? view-errs) (Ok (Checked typed owned)) (Err (CeOwn view-errs)))))))))))))
 
 (defun own-check-lowered (l: Lowered main: bool) -> (Result Checked CheckError)
   (own-check-lowered-with l main nil))
