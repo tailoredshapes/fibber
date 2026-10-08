@@ -209,7 +209,7 @@ simulation of `LZ4_compress_generic` (`scripts/lz4-sim.py`) that agrees with lib
   independence, content-size combination; blocks fast and HC): **60,000 checks, 0 failures** (run on the final tree). `scripts/lz4-interop.sh`: `examples/lz4.fib` against the `lz4` CLI both ways, 8 files x 14 flag sets
   (including `-T4`): **112 combinations x 2 directions, 0 failures** (run on the final tree). 122 frames and 40 blocks of the CLI's and liblz4's own output decode
   (`lib/fib/compress/lz4/vectors.fib`).
-* Specs (`fibc test specs`, every file green on the final tree: `compress-lz4-spec` 17 scenarios, `-edge-` 14, `-prop-` 9, **`-hc-` 4 (new)**, `-safety-` **4** (was 2), `-xxh-` 2, `-par-` **16** (was 14), `-hostile-` 5,
+* Specs (`fibc test specs`, every file green on the final tree: `compress-lz4-spec` 17 scenarios, `-edge-` 14, `-prop-` 9, **`-hc-` 4 (new)**, `-safety-` **5** (was 2), `-xxh-` 2, `-par-` **16** (was 14), `-hostile-` 5,
   `compress-contract-shape-spec` 15 (11 faults, each caught)). New: the HC spec above; in the safety spec the MEDIUM path at sizes to 6000 bytes with 0, 8, 33 and 40 bytes of room, and GUARD PAGES (two `mmap`ed
   pages, the second `mprotect`ed to nothing: a block placed to END at the guard is decoded, and one decoded into a range that ENDS at it, 2000 blocks each: an over-read or an over-write is a SIGSEGV that kills the
   process, which is how a slack that is too small is caught even when a wild read changes no byte of the result: the canary and garbage-after tests alone let `mid-islack` survive); in the par spec "`threads` is the
