@@ -1,0 +1,52 @@
+;; spec: docs/design/compress.md 5 (HC), docs/shootout/lz4.md 4
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; The HC block of levels 9, 10, 11 and 12 is liblz4 1.10.0's, byte for byte: three deterministic inputs (matchy data, runs, long and short distances; the generator is the arithmetic of
+;; scripts/lz4-hc-vectors.py, which printed the sizes and FNV-1a hashes below from python `lz4.block`). Level 9 runs liblz4's pattern analysis, 10 to 12 its optimal parser with chain swap.
+(ns main (:use tl.check fib.compress.lz4.mem fib.compress.lz4.block))
+
+(defun lcg (x: i64) -> i64 (bit-and (+ (* x 1103515245) 12345) 2147483647))
+
+;; The state is (x, length so far) in two cells; `out` is the buffer.
+(defun gen (seed: i64 n: i64 mode: i64) -> (Array i8)
+  (let [copy-p (nth [7 3 11 5 2 16] mode) run-p (nth [50 40 9 300 90 12] mode) maxd (nth [3000 60000 300 65000 1000 40000] mode)
+        out (cell (array n 0i8)) len (cell 0) x (cell seed)]
+    (do (loop []
+          (when (< @len n)
+            (let [r (do (set! x (lcg @x)) (shr @x 8))]
+              (do (cond (and (> @len 20) (= (rem r copy-p) 0))
+                        (let [d (+ 1 (rem (do (set! x (lcg @x)) (shr @x 8)) (min @len maxd)))
+                              l (+ 4 (rem (do (set! x (lcg @x)) (shr @x 8)) 40))]
+                          (dotimes (k l) (when (< @len n) (do (array-set! &out @len (array-get @out (- @len d))) (set! len (+ @len 1))))))
+                        (= (rem r run-p) 0)
+                        (let [b (+ 97 (rem (do (set! x (lcg @x)) (shr @x 8)) 13))
+                              l (+ 20 (rem (do (set! x (lcg @x)) (shr @x 8)) 600))]
+                          (dotimes (k l) (when (< @len n) (do (array-set! &out @len (trunc i8 b)) (set! len (+ @len 1))))))
+                        :else (do (array-set! &out @len (trunc i8 (+ 97 (rem r 13)))) (set! len (+ @len 1))))
+                  (recur)))))
+        @out)))
+
+(defun fnv (b: (Array i8)) -> i64
+  (loop [i 0 h 2166136261]
+    (if (>= i (array-len b)) h
+      (recur (+ i 1) (bit-and (* (bit-xor h (bit-and (zext i64 (array-get b i)) 255)) 16777619) 4294967295)))))
+
+
+;; input (seed n mode), then size and hash at levels 9, 10, 11, 12
+(def rows: (Vec (Vec i64))
+  [[2 80000 1  9837 1328067680 9857 2031636168 9769 2149412308 9709 2669551587]
+   [3 150000 2  5989 2333128311 6150 2130633992 6118 1533193652 5975 1487766628]
+   [7 12345 0  1594 2661345 1599 1789945718 1596 1539203225 1591 1525051783]])
+
+(defun main () -> i64
+  (let [c (checks)]
+    (do (dotimes (i (count rows))
+          (let [r (nth rows i) d (gen (nth r 0) (nth r 1) (nth r 2))]
+            (dotimes (k 4)
+              (let [z (block-compress-hc d (+ 9 k))]
+                (do (check c (= (array-len z) (nth r (+ 3 (* 2 k)))))
+                    (check c (= (fnv z) (nth r (+ 4 (* 2 k))))))))))
+        (checks-result c))))
