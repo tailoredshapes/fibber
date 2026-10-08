@@ -239,11 +239,23 @@ Through gcc 15.2.0 (`compiler/tests/c-backend/suite.sh --fibc F --cc gcc -j 4`):
 | `cases/stdlib` | 1,426 | 1,395 | 13 | 18 | 434 s |
 
 "the non-passing set is exactly `expected-gcc.txt`": the 13 are `1707` (fails natively too, `scripts/ci-stage2.expected`) and the 12 tensor
-cases above, each with its reason in the file. The audit cases pass: the traces are the executable's own. **Not run through clang**: clang
-is not installed on this machine and ADR 0020 forbids a quiet download; the clang rows of section 2 (musttail only between identical
-prototypes) are from its documentation, `expected-clang.txt` does not exist, and the printer's padding of `tailcc` prototypes equalises
-only the stack area, not the parameter lists, so on clang every tail call between differing prototypes is an error until
-`--allow-plain-tail-calls` (or a later universal-prototype step). Run `suite.sh --cc clang` where clang exists and read what it refuses. The `cases/stdlib` count of the merged tree is 1,454 (the floor); the table is the count
+cases above, each with its reason in the file. The audit cases pass: the traces are the executable's own. **Through clang** (DARWIN-2; clang 21.1.8 installed on the Linux box for this, and Apple clang on the Mac Studio, M1 Ultra):
+`suite.sh --cc clang` passes `--allow-plain-tail-calls` (clang's musttail is "identical prototypes only", so a tail call between two prototypes is
+an error: without the flag **1,168 cases are refused (116 of 372 ownership cases, the rest stdlib and modules)** at the first such call the runtime makes, `println` to
+`write-str`, `vec-nth` to `vnode-get`; the list is `expected-clang-strict.txt`, made by `suite.sh --cc clang --strict`). With the flag:
+
+| Machine | ownership | modules | stdlib | not passing |
+|---|---|---|---|---|
+| Linux x86-64, clang 21.1.8 | 372 / 372 | 32 / 32 | 1,459 of 1,478 (18 open) | `1707` only (fails natively too): `expected-clang.txt` |
+| macOS arm64, Apple clang | 372 / 372 | 32 / 32 | 1,445 of 1,478 | 15 in the first run: 5 passed again alone (load: 7604, 7693, 8037, 8103, 8283), `6262` was a printer bug (below), the rest are in `expected-clang-darwin.txt` with their reasons |
+
+Three findings of the clang runs, each fixed or recorded: (1) clang treats `malloc` as a builtin and removes an allocation whose result nothing reads, so the
+out-of-memory traps (cases 195, 922, 7881) never happened; `driver.viac` passes `-fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc` for clang (gcc's command
+line is unchanged). (2) `fib_fmuladd` was fused under `__FMA__`, which is x86-only; on AArch64 `__ARM_FEATURE_FMA` says it, and `simd/muladd` was two roundings
+there while `(has-fma)` said one (case 6262): the prelude tests both macros. (3) The printer crashed on macOS arm64 under the seed's own code generator: see section 10.
+Not explained: `6221` (a `Vec f64x4` / `Array i8x3` read back), `7083` and `7961` (fused tensor epilogue and fma GEMM at 8 and 16 lanes) fail through C on arm64
+only, the same programs pass natively (listed in `expected-clang-darwin.txt`).
+The `cases/stdlib` count of the merged tree is 1,454 (the floor); the table is the count
 at the time of the run, before the merge.
 
 ### The fixed point through C
@@ -259,12 +271,11 @@ OK: F_c emit compiler/fibc.fib == F emit compiler/fibc.fib (a58cf90099d52536)
 ```
 
 The compiler built through gcc emits the same 31,462,597 bytes of lIR as the LLVM-built one. (F_c is smaller than F: it is built by the C
-compiler at `-O2` from C with `-march=native`; F is LLVM's.) Not done: the same with clang (not installed).
+compiler at `-O2` from C with `-march=native`; F is LLVM's.) The same through clang (21.1.8, Linux): F_c built in 88 s from 81,490,461 bytes of C, both emits 33,108,660 bytes, identical (`9be85504e47b56a9`); through Apple clang on the Mac Studio (arm64): F_c built in 126 s, both emits 33,106,606 bytes, identical (`4fc00206c996c954`).
 
 ### The UB hunt
 
-`compiler/tests/c-backend/ubsan.sh`: the C of each stdlib case compiled with `-fsanitize=undefined,address` (gcc's sanitizers; clang is
-not on this machine) and run; the bar is zero reports.
+`compiler/tests/c-backend/ubsan.sh`: the C of each stdlib case compiled with `-fsanitize=undefined,address` (gcc's sanitizers, and clang's on the Mac: see the end of this section) and run; the bar is zero reports.
 
 `ubsan.sh` over every `cases/ownership` case and every sixth `cases/stdlib` case (526 programs): **clean 523, report 0, differ 0, skip 3**
 (two `open-` cases fibc cannot emit, and `8354`, which faults on purpose to reach the runtime's own SIGSEGV handler). The first run reported 13
@@ -384,3 +395,20 @@ aarch64-linux-gnu-gcc build hello.fib` makes an aarch64 PIE that prints `hello` 
   rule never bite): not built; the rows of section 2 say what happens instead.
 - **Clang** is not installed on this machine; its rows in section 2 come from its documentation and the probe is what decides at run
   time. The suites were not run through clang here.
+
+## 10. The crash on macOS arm64 (DARWIN-2)
+
+`fibc build --via c --cc clang` and `FIB_VIA=c fibc run` crashed the compiler itself on macOS (`fatal signal 10` with the default 256 MiB stack, `fatal signal 11`
+with `FIB_STACK_MB=0`), at any program, on any stack size, while the same code ran on Linux. Cause (from the crash report in `~/Library/Logs/DiagnosticReports`,
+which the runtime's handler leaves because it re-raises the signal: `pc` equal to `lr` equal to an address inside the stack, `KERN_PROTECTION_FAILURE`: a return
+to the stack): **LLVM 21 compiles a call in tail position inside a `tailcc` function that has stack-passed arguments, to a `ccc` function, as a sibling branch
+(`b callee`) after popping only part of the caller's own argument area**; the callee-pops convention of `tailcc` then leaves the caller's `sp` 16 bytes off and
+the caller returns through a corrupted frame. The function was `c.mem.cmpxchg!`, nine parameters (the ninth on the stack), ending in a drop (`b _fib.release-slow`);
+the printer reached it on the first `cmpxchg` (the runtime's `fib.lock`). Adding a diagnostic print changed the code and hid it. It is the same family as the
+`-O 0` finding of docs/design/aarch64.md 2.3, and a defect of every AArch64 program with a function of nine or more arguments ending in a call (the library has
+many: the tensor tiles, `lz4` `dec-comp`, `json`).
+Fixes: `native.lower.calls` marks a call between a `tailcc` function and a `ccc` one `notail` on AArch64 (`Lx aarch64`, `Fx tailcc-fn`); that reaches programs
+compiled by a compiler built from this tree. The compiler of the SEED is not fixed, and it compiles stage 2, so `cmpxchg!` (and `one-frame`, which a new
+parameter would have made nine) take a record instead of nine parameters. Tests: `cases/lir/instr/stackargs-sibcall.lir` (crashed at `-O 1` to `-O 3` on the Mac
+before: `fatal signal 10`/`11`; prints the sums after), `compiler/tests/native/a64-sibcall.sh` (the assembly for arm64 has `bl _srand`, not `b _srand`; the planted
+sibling branch is caught; on a Mac it also runs the case), case `8742`.

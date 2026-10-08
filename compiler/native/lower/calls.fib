@@ -74,6 +74,11 @@
              (wire (unwrap-or (. fe wire) (. fe ty)))
              (c0 (core/build-call (. fx b) (lx-fn-ty (. fx lx) wire) (. fe value) (narrow-args fx ty wire vals) "")))
          (do (unsafe (core/LLVMSetInstructionCallConv c0 (trunc i32 (cc-number (. fx lx) (. ty cc)))))
+             ;; AArch64: LLVM turns a call in tail position into a sibling call (`b callee`) even between a callee-pops `tailcc` function and a `ccc` one, and
+             ;; pops the caller's stack arguments wrongly (a `tailcc` function of nine or more arguments, ending in a call of `fib.release-slow`, returned to a
+             ;; stack address: lir2c on macOS, DARWIN-2). Such a call is `notail` (LLVMTailCallKind 3); a lIR `tailcall` is not affected.
+             (when (and (not tail) (. (. fx lx) aarch64) (not (= (. fx tailcc-fn) (= (. ty cc) CcTail))))
+               (unsafe (core/LLVMSetTailCallKind c0 3i32)))
              (let ((c (widen-result fx ty wire c0)))
                (cond (not tail) (Ok (match (. ty ret) ((some _) (some c)) (nil nil)))
                      :else (do (finish-tail fx c ty) (Ok nil))))))))

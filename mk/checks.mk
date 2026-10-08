@@ -57,3 +57,14 @@ else
 endif
 wasm: $(BUILD)/wasm.ok   ## cases as wasm modules under node, when the wasi-sdk is there
 .PHONY: adr specs static musl wasm
+
+# docs/design/aarch64-sibcall.md: the LLVM fault behind the DARWIN-2 crash, by llc alone (no fibber, no AArch64 hardware). LLC=/usr/lib/llvm-21/bin/llc to choose.
+# min.ll (an unmarked call) must be `bl callee`; min-tail.ll (the same call marked `tail`) is `b callee` while the fault stands. Not part of any gate.
+LLC ?= llc
+REPRO_SIBCALL := docs/repro/aarch64-sibcall
+repro-aarch64-sibcall:   ## the LLVM sibling-call fault by llc alone (docs/design/aarch64-sibcall.md); LLC=path
+	@$(LLC) --version | grep 'LLVM version'
+	@for f in min.ll min-tail.ll; do printf '%-13s %s\n' $$f "$$($(LLC) -mtriple=aarch64-linux-gnu -O2 $(REPRO_SIBCALL)/$$f -o - | grep -E '^[[:space:]]+bl?[[:space:]]+callee' | tr -s '\t ' ' ')"; done
+	@$(LLC) -mtriple=aarch64-linux-gnu -O2 $(REPRO_SIBCALL)/min-frame.ll -o - | grep -E '(sub|add)[[:space:]]+sp, sp|\[sp\], #|^[[:space:]]+bl?[[:space:]]+callee' | tr -s '\t ' ' '
+	@$(LLC) -mtriple=aarch64-linux-gnu -O2 $(REPRO_SIBCALL)/min.ll -o - | grep -qE '^[[:space:]]+bl[[:space:]]+callee' || { echo 'the unmarked call is not a bl: the control failed' >&2; exit 1; }
+.PHONY: repro-aarch64-sibcall

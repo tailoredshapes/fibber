@@ -87,7 +87,13 @@
 (defun cc-flags (opt: i64) -> (Vec str)
   (into [(str "-std=gnu11") (str "-O" (min opt 3)) "-ffp-contract=off" "-fno-math-errno" "-fno-delete-null-pointer-checks"
          "-Wall" "-Wextra" "-Wno-unused" "-Wno-array-bounds" "-Wno-stringop-overflow" "-Wno-psabi" "-Wno-tautological-compare" "-Wno-maybe-musttail-local-addr" "-Wno-maybe-uninitialized"]
-        (march)))
+        (into (clang-flags) (march))))
+
+;; clang treats `malloc` (and `calloc`, `realloc`) as a builtin and drops an allocation whose result it can prove unused, or pairs it with its free: the runtime's
+;; out-of-memory trap (cases 195, 922, 7881: a request too large to be met, whose result nothing reads) then never happens. The flags keep the call. (gcc keeps it
+;; as it is, so its command line is unchanged.) DARWIN-2.
+(defun clang-flags :private () -> (Vec str)
+  (if (some? (str-find (cc-name) "clang" 0)) ["-fno-builtin-malloc" "-fno-builtin-calloc" "-fno-builtin-realloc"] []))
 
 (defun run-compiler :private (argv: (Vec str) errfile: str) -> (Result unit str)
   (do (when (= (env "FIB_CC_VERBOSE") "1") (eprintln (str-join-with " " argv)))

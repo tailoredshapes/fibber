@@ -72,11 +72,11 @@ not claim `:streaming`: the contract's step-bound scenario fails it.
 
 ## 3. The contract
 
-`fib.compress.contract/CompressContract` is a `defcontract` of **17 scenarios**: honesty of the capability list; round trip on 73 corpus inputs (empty, 1 byte, incompressible, all-zero, long runs, text, repeating
+`fib.compress.contract/CompressContract` is a `defcontract` of **18 scenarios**: honesty of the capability list; round trip on 73 corpus inputs (empty, 1 byte, incompressible, all-zero, long runs, text, repeating
 patterns, records, at every edge size around 12/13, 15/16, 255/256, 4096, 64 KiB, block sizes); round trip under every option the codec lists; determinism and the size bound; streaming equals one-shot for
 chunkings of 1, 7, 4096, 65537 bytes and seeded random sizes; `max-output` exact (the size succeeds, one under is `:too-large`, one-shot and streamed); truncation at **every prefix** is an error, one-shot and
 streamed; corruption (a flipped byte under a checksum is an error or the original, without one it never traps and stays within the limit); concatenated frames; empty input; a dictionary (smaller, round trips, needed);
-decompressor steps bounded and `needs-input` honest; independent streams; magic numbers and detection; invalid arguments; and, for a codec with `:parallel`, **the result does not depend on the thread count** (compress: the same bytes for 1, 2, 3, 7 and 16 threads, one-shot and streamed; decompress: the same output) and **errors and limits do not depend on it** (a corrupt block, a corrupt tail and a cut frame give one error kind, and `max-output` is exact, for every thread count). A scenario that needs a capability the codec lacks is a skip row.
+decompressor steps bounded and `needs-input` honest; independent streams; magic numbers and detection; invalid arguments; and, for a codec with `:parallel`, **the result does not depend on the thread count** (compress: the same bytes for 1, 2, 3, 7 and 16 threads, one-shot and streamed; decompress: the same output) and **errors and limits do not depend on it** (a corrupt block, a corrupt tail and a cut frame give one error kind, and `max-output` is exact, for every thread count), and **`verify` decides whether the checksums are checked, the same for every thread count** (a bad content checksum and a bad block checksum: the original with `verify` false, a `checksum` error with it true). A scenario that needs a capability the codec lacks is a skip row.
 
 **What corruption is required to do.** LZ4 frames written with a content checksum (the default here) detect any change of the content, so a flipped byte is an error or decodes to the original (a flip in a
 don't-care field). A frame without checksums may decode to different bytes: the contract then requires only that nothing traps and the output stays within `max-output`.
@@ -96,6 +96,8 @@ don't-care field). A frame without checksums may decode to different bytes: the 
 | `:thread-dependent` | compress with more than one thread uses another acceleration | the result does not depend on the thread count |
 | `:par-error-kind` | decompress with more than one thread answers `:internal` where the sequential decoder says `:corrupt` | errors and limits do not depend on the thread count |
 | `:par-ignore-limit` | decompress with more than one thread gets the default limit instead of the caller's | errors and limits do not depend on the thread count |
+| `:verify-sequential` | decompress with one thread verifies the checksums whatever `verify` says (the sequential decoder before DARWIN-2) | verify decides whether the checksums are checked, the same for every thread count |
+| `:verify-never` | decompress never verifies, whatever `verify` says | verify decides whether the checksums are checked, the same for every thread count |
 
 The shape spec also runs the contract against a codec that copies its input (no frame, no magic, no limit): it fails truncation, magic numbers, the empty input and the limit.
 
@@ -195,7 +197,7 @@ the 2 GB streams and what bounds each (memory bandwidth; one core of xxHash32), 
 `Options.threads`: 0 (the default) is automatic (the machine's cores, but only for an input large enough to pay: LZ4 compresses in parallel from 2 MiB and decompresses from 512 KiB of compressed input, measured in
 `docs/shootout/lz4.md` 3), 1 is sequential, n is n workers whatever the size (never more than the 64 of `fib.parallel.cpu`). **The result does not depend on it**: the same bytes, the same output, the same error kind
 and the same exact `max-output` limit (contract scenarios 16 and 17, the property tests of `specs/compress-lz4-par-spec.fib`, planted faults). A codec without `:parallel` ignores the field. `Options.verify` (default
-true) says whether a decoder checks the checksums that are in the data.
+true) says whether a decoder checks the checksums that are in the data: the block checksums and the content checksum; the header checksum is always checked (the header is parsed before anything else is trusted). It is the same for every thread count and for the one-shot and the streaming decoder (contract scenario 18: a frame with a bad content checksum and one with a bad block checksum decode to the original with `verify` false and are a `checksum` error with it true, under 1, 2, 3, 7 and 16 threads; the faults `:verify-sequential` and `:verify-never` fail it; `scripts/mutant-lz4.sh seq-ignores-verify`). Before DARWIN-2 the sequential frame decoder ignored the field and the parallel one honoured it, so a frame with a bad checksum gave data with threads and an error without.
 
 ### 9.1 The engine (`fib.compress.par`)
 

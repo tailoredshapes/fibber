@@ -1,0 +1,41 @@
+;; expect: accept
+;; out: stackargs 509500
+;; out: stackargs-fp 20.5
+;; A `tailcc` function (the callee pops its stack arguments) of ten integer arguments, two of them on the stack on AArch64, that ends in a plain call of a
+;; `ccc` function (`srand`, which LLVM can neither inline nor drop): LLVM marks the call `tail` and, on AArch64, made it a sibling call (`b note`) after popping too little of the caller's argument area, so the
+;; caller found its stack pointer 16 bytes off and returned to a stack address (found by lir2c on macOS, DARWIN-2: `fatal signal 10` at the program counter;
+;; `native.lower.calls` marks such a call `notail`). `drive` calls `pop` in a loop and keeps its counters live across the calls; the sum is checked.
+;; Killed by: removing the `notail` mark (compiler/native/lower/calls.fib) on an AArch64 target.
+(declare printf i32 (ptr ...))
+(global internal sink i64 (i64 0))
+(global internal fsink double (double 0.0))
+(declare srand void (i32))
+(global popslot ptr @pop)
+(global fpopslot ptr @fpop)
+(define tailcc (pop void) ((i64 a) (i64 b) (i64 c) (i64 d) (i64 e) (i64 f) (i64 g) (i64 h) (i64 i) (i64 j))
+  (block entry
+    (store (add (add a j) (add (add b c) (add (add d e) (add f (add g (add h i)))))) @sink)
+    (call @srand (i32 7))
+    (ret)))
+(define tailcc (fpop void) ((double a) (double b) (double c) (double d) (double e) (double f) (double g) (double h) (double i) (double j))
+  (block entry
+    (store (fadd (fadd a j) (fadd (fadd b c) (fadd (fadd d e) (fadd f (fadd g (fadd h i)))))) @fsink)
+    (call @srand (i32 7))
+    (ret)))
+(define tailcc (drive i64) ((i64 i) (i64 n) (i64 acc))
+  (block entry (br (icmp eq i n) done more))
+  (block done (ret acc))
+  (block more
+    (indirect-call (load ptr @popslot) (fn tailcc void (i64 i64 i64 i64 i64 i64 i64 i64 i64 i64)) i (i64 0) (i64 0) (i64 0) (i64 0) (i64 0) (i64 0) (i64 0) (i64 0) (i64 10))
+    (tailcall @drive (add i (i64 1)) n (add acc (load i64 @sink)))))
+(define tailcc (fdrive double) ((i64 i) (i64 n) (double acc))
+  (block entry (br (icmp eq i n) done more))
+  (block done (ret acc))
+  (block more
+    (indirect-call (load ptr @fpopslot) (fn tailcc void (double double double double double double double double double double)) (double 0.5) (double 0.0) (double 0.0) (double 0.0) (double 0.0) (double 0.0) (double 0.0) (double 0.0) (double 0.0) (double 0.0))
+    (tailcall @fdrive (add i (i64 1)) n (fadd acc (load double @fsink)))))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "stackargs %lld\n") (call @drive (i64 0) (i64 1000) (i64 0)))
+    (call @printf (string "stackargs-fp %g\n") (call @fdrive (i64 0) (i64 41) (double 0.0)))
+    (ret (i32 0))))

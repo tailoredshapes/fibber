@@ -22,6 +22,7 @@ commands:
                          args after -- are (args)
   build <file> -o <out> [-O N] [-L dir].. [-l lib].. [--emit obj|asm|llvm|ptx|wgsl|c]
                         [--kernel-target TRIPLE|none]
+                         (the options may come before the file too)
                          compile file to an executable; each -l lib links
                          -llib, each -L dir is searched for libraries (-Ldir and
                          -llib are also taken); --emit writes the object, the
@@ -211,6 +212,21 @@ itrace and gen are commands of the Rust compiler (the test harness).")
                        ((some n) (recur next out dirs libs (some n) emit kernel)))
                    :else CmdInvalid)))))))
 
+;; `build`'s words after the command: the file first (`build FILE -o OUT --emit c`), or the options first (`build --emit c FILE -o OUT`, as `cc` takes
+;; them): the file is then the first word that is neither a flag nor a flag's value. Added: the options-first form printed the usage (DARWIN-2).
+(defun build-file-index :private (rest: (Vec str)) -> (Option i64)
+  (loop ((i 0))
+    (cond (>= i (count rest)) nil
+          (not (starts-with? (nth rest i) "-")) (some i)
+          :else (match (flag-value rest i)
+                  (nil nil)
+                  ((some fv) (recur (+ i (. fv used))))))))
+
+(defun parse-build-words :private (rest: (Vec str)) -> Command
+  (match (build-file-index rest)
+    (nil CmdInvalid)
+    ((some i) (parse-build (nth rest i) (into (vec (take i rest)) (drop (+ i 1) rest))))))
+
 ;; The tail of `run`'s words from the file on. Rust: command.rs:266
 (defun run-from :private (rest: (Vec str) at: i64 trace: bool opt: (Option i64)) -> Command
   (let ((tail (vec (drop at rest)))
@@ -266,7 +282,7 @@ itrace and gen are commands of the Rust compiler (the test harness).")
   (let ((n (count words))
         (head (if (> (count words) 0) (nth words 0) "")))
     (cond (= head "run") (parse-run (vec (drop 1 words)))
-          (and (= head "build") (>= n 2)) (parse-build (nth words 1) (vec (drop 2 words)))
+          (and (= head "build") (>= n 2)) (parse-build-words (vec (drop 1 words)))
           (and (= head "emit") (= n 2)) (CmdEmit (nth words 1))
           (= head "emit-dump") (match (emit-parse-args (vec (drop 1 words)))
                                  (nil CmdInvalid)

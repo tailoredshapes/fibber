@@ -1,0 +1,31 @@
+;; spec: docs/design/aarch64.md (tailcc stack arguments); cases/lir/instr/stackargs-sibcall.lir; DARWIN-2
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; A function of twelve parameters (four of them on the stack on AArch64) that ends by releasing an owned argument, called a hundred thousand times from a loop that keeps its own values
+;; live across the call. The C printer's `cmpxchg!` had nine parameters, and on arm64 macOS the seed's code generator turned its last call into a sibling branch that left the caller's
+;; stack pointer 16 bytes off: lir2c returned to a stack address. native.lower.calls now keeps such a call a call; the lIR case is cases/lir/instr/stackargs-sibcall.lir.
+(ns main (:use fib.core tl.check))
+
+(defstruct Rec (n: i64 name: str))
+
+(defun mix (a: Rec b: bool c: i64 d: i64 e: i64 f: str g: str h: str i: str j: str k: str l: str) -> i64
+  (let [x (+ (. a n) (+ (if b 1 0) (+ c (+ d e))))
+        y (+ (str-len f) (+ (str-len g) (+ (str-len h) (str-len i))))
+        z (+ (str-len j) (+ (str-len k) (str-len l)))]
+    (+ x (+ y z))))
+
+(defun drive (i: i64 acc: i64) -> i64
+  (if (= i 100000)
+      acc
+      (let [s (str "v" i)
+            r (mix (Rec i "r") (even? i) i 2 3 s "g" (str "h" i) "i" "j" (str "k" i) "l")]
+        (drive (+ i 1) (+ acc (rem r 1000))))))
+
+(defun main () -> i64
+  (let [c (checks) r (drive 0 0)]
+    (do (check c (= r (drive 0 0)))
+        (check c (> r 0))
+        (checks-result c))))

@@ -12,8 +12,8 @@
 ;; decoded by `decode-block-h`, one 16-byte stripe of the pending range is hashed in each turn of its loop (the hash is a chain of dependent multiplies and the decoder leaves the core idle:
 ;; the two overlap; docs/shootout/lz4.md 2), and what is left of it goes to the streaming hash afterwards. Anything else (a stored block, a dictionary, a held-back tail of the hash) first
 ;; hashes the pending range plainly, so the bytes reach the hash in order whatever the path. Words 2 to 7 are the hand-over to `decode-block-h` (position, end, the four lanes).
-(defstruct Hk (ck: Xxh w: (Array i64) on: bool))
-(defun hk-new (on: bool) -> Hk (Hk (xxh-new 0) (array 8 0) on))
+(defstruct Hk (ck: Xxh w: (Array i64) on: bool verify: bool))
+(defun hk-new (on: bool verify: bool) -> Hk (Hk (xxh-new 0) (array 8 0) on verify))
 (defun hw (k: Hk i: i64) -> i64 (unsafe (load-i64 (ptr+ (raw (. k w)) (+ 24 (shl i 3))))))
 (defun hset (k: Hk i: i64 v: i64) -> unit (unsafe (store-i64 (ptr+ (raw (. k w)) (+ 24 (shl i 3))) v)))
 (defun hs-ptr (k: Hk) -> ptr (unsafe (ptr+ (raw (. k w)) 40)))
@@ -51,7 +51,7 @@
         (cond (= wd 0) (Ok (Pos (+ i 4) op true))
               (> sz (. h bmax)) (Err (corrupt "a block is larger than the frame's block size"))
               (> (+ i (+ 4 (+ sz bsum))) n) (Err (truncated "the frame ends inside a block"))
-              (and (. h bchk) (not (= (rd32 p (+ i (+ 4 sz))) (xxh32-ptr (unsafe (ptr+ p (+ i 4))) sz 0)))) (Err (checksum-error "a block's checksum does not match"))
+              (and (. h bchk) (. hk verify) (not (= (rd32 p (+ i (+ 4 sz))) (xxh32-ptr (unsafe (ptr+ p (+ i 4))) sz 0)))) (Err (checksum-error "a block's checksum does not match"))
               (> (bit-and wd 2147483648) 0) (dec-raw src i sz &ob op cap bsum hk)
               :else (dec-comp src i sz &ob op h lo cap w dl bsum hk))))))
 
@@ -94,7 +94,7 @@
           :else (Ok (Pos (if (. h cchk) (+ i 4) i) end true)))))
 
 (defun check-content (src: (Array i8) r: Pos h: FrameHead &ob: (Array i8) op0: i64 hk: Hk) -> (Result Pos CompressError)
-  (if (and (. h cchk) (not (= (rd32 (data src) (- (. r pos) 4)) (do (hk-flush hk @ob) (xxh-digest (. hk ck))))))
+  (if (and (. h cchk) (. hk verify) (not (= (rd32 (data src) (- (. r pos) 4)) (do (hk-flush hk @ob) (xxh-digest (. hk ck))))))
     (Err (checksum-error "the content checksum does not match")) (Ok r)))
 
 (defun legacy-frame (src: (Array i8) i0: i64 &ob: (Array i8) op0: i64 cap: i64) -> (Result Pos CompressError)
@@ -119,22 +119,27 @@
 (defun fix-kind (r: (Result Pos CompressError) small: bool) -> (Result Pos CompressError)
   (match r ((Err e) (if (and small (= (. e kind) :too-large)) (Err (corrupt "the frame decodes to more than its content size")) (Err e))) ((Ok p) (Ok p))))
 
-(defun one-frame (src: (Array i8) i: i64 &ob: (Array i8) op: i64 h: FrameHead lo0: i64 cap: i64 dict: (Array i8)) -> (Result Pos CompressError)
+;; What a frame is decoded with beyond its place in the input and the output: the dictionary (the first frame's only) and whether the checksums in the data are checked.
+;; (A record, not two more parameters: a function of nine or more arguments has stack-passed ones, and the seed's code generator miscompiled that on AArch64, DARWIN-2.)
+(defstruct DictV (dict: (Array i8) verify: bool))
+
+(defun one-frame (src: (Array i8) i: i64 &ob: (Array i8) op: i64 h: FrameHead lo0: i64 cap: i64 dv: DictV) -> (Result Pos CompressError)
   (cond (= (. h kind) kind-skip) (if (> (+ i (+ 8 (. h skip))) (array-len src)) (Err (truncated "a skippable frame ends early")) (Ok (Pos (+ i (+ 8 (. h skip))) op true)))
         (= (. h kind) kind-legacy) (legacy-frame src i &ob op cap)
         (> (. h csize) (- cap op)) (Err (too-large "the frame's content size exceeds max-output"))
         (> (. h csize) (+ 1024 (* 255 (array-len src)))) (Err (corrupt "the frame's content size is more than its data can expand to"))
         :else
-        (let [fcap (if (>= (. h csize) 0) (+ op (. h csize)) cap)
+        (let [dict (. dv dict) verify (. dv verify)
+              fcap (if (>= (. h csize) 0) (+ op (. h csize)) cap)
               w (if (and (> (array-len dict) 0) (. h indep)) (make-win dict (. h bmax)) (array 0 0i8))
-              hk (hk-new (. h cchk))]
+              hk (hk-new (and verify (. h cchk)) verify)]
           (do (if (>= (. h csize) 0) (ensure &ob op fcap fcap) (ensure &ob op (min (+ cap 32) (+ op (+ (. h bmax) (* 6 (array-len src))))) cap))
               (match (fix-kind (dec-frame src i &ob op h lo0 fcap w (array-len dict) hk) (< fcap cap))
                 ((Err e) (Err e))
                 ((Ok r) (check-content src r h &ob op hk)))))))
 
 ;; The frames of src one after the other, into ob from index `base` (a dictionary's length: it sits at the start); the output end.
-(defun frame-loop (src: (Array i8) &ob: (Array i8) base: i64 cap: i64 dict: (Array i8)) -> (Result i64 CompressError)
+(defun frame-loop (src: (Array i8) &ob: (Array i8) base: i64 cap: i64 dict: (Array i8) verify: bool) -> (Result i64 CompressError)
   (let [n (array-len src) p (data src)]
     (loop [i 0 op base first true]
       (if (>= i n) (Ok op)
@@ -143,7 +148,7 @@
           ((Ok nothing)
            (match nothing
              (nil (Err (truncated "the input ends inside a frame header")))
-             ((some h) (match (one-frame src i &ob op h (if first 0 op) cap (if first dict (array 0 0i8)))
+             ((some h) (match (one-frame src i &ob op h (if first 0 op) cap (DictV (if first dict (array 0 0i8)) verify))
                          ((Err e) (Err e))
                          ((Ok r) (recur (. r pos) (. r op) false)))))))))))
 
@@ -158,6 +163,6 @@
            dl (array-len d)
            ob (cell (array dl 0i8))
            _ (copy-exact (data @ob) 0 (data d) 0 dl)]
-       (match (frame-loop src &ob dl (+ dl (. o max-output)) d)
+       (match (frame-loop src &ob dl (+ dl (. o max-output)) d (. o verify))
          ((Err e) (Err e))
          ((Ok end) (Ok (if (and (= dl 0) (= end (array-len @ob))) @ob (array-copy @ob dl end)))))))))

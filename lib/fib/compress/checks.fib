@@ -182,3 +182,21 @@
           (if (same-all? cut) [] ["a cut frame: the error kind depends on the threads"])
           (if (every? (fn (k: str) (= k "ok")) (lim n)) [] ["max-output at the exact size fails under some thread count"])
           (if (every? (fn (k: str) (= k ":too-large")) (lim (- n 1))) [] ["max-output one under is not too-large under every thread count"])])))
+
+;; ---- VERIFY: `Options.verify` decides whether the checksums in the data are checked, and the same for every thread count (DARWIN-2: the sequential decoder ignored it)
+;; A frame with a content checksum and block checksums (LZ4: ..block data, block checksum, end mark, content checksum): the last byte of the content checksum is the last
+;; byte of the frame, the last byte of the last block's checksum is 9 bytes before the end. Flipping one of them leaves the data sound: with verify true the frame is a
+;; `checksum` error, with verify false the original comes back, whichever of 1, 2, 3, 7 and 16 threads decodes it.
+(defun verify-failures (c: c) -> (Vec str) :where ((Codec c))
+  (let [s (find-sample "text 262145") d (. s data)
+        o (with-max-output (with-block-checksum (with-checksum (par-options c) true) true) 10000000)
+        z (ok-of (compress c d (with-threads o 1)))
+        n (array-len z)
+        counts (into [1] (thread-counts))
+        outs (fn (zz: (Array i8) on: bool) (vec (map (fn (t: i64) (decompress c zz (with-verify (with-threads o t) on))) counts)))
+        one (fn (name: str zz: (Array i8))
+              (cat [(if (every? (fn (k: str) (= k ":checksum")) (vec (map kind-of (outs zz true)))) [] [(str "verify true: a bad " name " checksum is not a checksum error under every thread count")])
+                    (if (every? (fn (r: (Result (Array i8) CompressError)) (is-bytes? r d)) (outs zz false)) [] [(str "verify false: a bad " name " checksum is not ignored under every thread count")])]))]
+    (cat [(if (every? (fn (r: (Result (Array i8) CompressError)) (is-bytes? r d)) (outs z true)) [] ["the sound frame does not decode under every thread count"])
+          (one "content" (flip z (- n 1) 1))
+          (one "block" (flip z (- n 9) 1))])))

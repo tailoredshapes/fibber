@@ -9,6 +9,10 @@
 (extern readdir :private (ptr) -> ptr)
 (extern _NSGetExecutablePath :private (ptr ptr) -> i32)
 (extern strlen :private (ptr) -> i64)
+(extern getpid :private () -> i32)
+(extern proc_pidinfo :private (i32 i32 i64 ptr i32) -> i32)
+;; Bound to the runtime's own definition (rt/thread.lir `fib_guard_ctl`): op 2 answers how many threads the runtime parks (the first thread of the process while main runs on a stack it made).
+(extern fib_guard_ctl :private (i64 i64) -> i64)
 (def abi: a/Abi (a/darwin-abi))
 (def platform-name: str "Darwin")
 (defun errno () -> i64 (unsafe (sext i64 (load-i32 (__error)))))
@@ -39,3 +43,12 @@
       (let [read-fd (load-i32 fds) write-fd (load-i32 (ptr+ fds 4))]
         (if (and (>= (fcntl read-fd 2i32 1) 0i32) (>= (fcntl write-fd 2i32 1) 0i32)) 0i32
           (let [saved (errno)] (do (close read-fd) (close write-fd) (trunc i32 (- 0 saved))))))))))
+;; This process's own numbers from `proc_pidinfo(PROC_PIDTASKINFO)`, the struct proc_taskinfo of 96 bytes (<sys/proc_info.h>): pti_resident_size at 8, pti_threadnum (int) at 84.
+;; field 0: the threads of the process other than the parked first thread (what /proc/self/task gives on Linux, fib.os.process thread-count); 1: the resident set in bytes. -1 when the kernel refuses.
+(defun task-info (field: i64) -> i64
+  (unsafe (let [buf (alloc 96) n (proc_pidinfo (getpid) 4i32 0 buf 96i32)
+                v (cond (< n 96i32) -1
+                        (= field 0) (- (sext i64 (load-i32 (ptr+ buf 84))) (fib_guard_ctl 2 0))
+                        (= field 1) (load-i64 (ptr+ buf 8))
+                        :else -1)]
+            (do (free buf) v))))
