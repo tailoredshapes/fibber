@@ -65,12 +65,12 @@ to write down, not an edit).
              "compiler/types/builtins.fib:store-i32"])
   (plant "compiler/types/builtins.fib" "\n(def zz-row: i64 (BuiltinSig \"zz-plant-builtin\" \"(fn () unit)\" \"\" [] false))\n"))
 
-(rule "every builtin is named in a case (cases/**.fib), except the twenty-two that no case names today"
+(rule "every builtin is named in a case (cases/**.fib), except the twenty-one that no case names today (store-i32: case 8573)"
   (allowing (unnamed-in repo (joined-text repo ["cases/**.fib"]) "cases/**.fib")
             ["compiler/types/builtins.fib:catch-active?" "compiler/types/builtins.fib:caught-message" "compiler/types/builtins.fib:caught-object"
              "compiler/types/builtins.fib:enum-params" "compiler/types/builtins.fib:finally-enter" "compiler/types/builtins.fib:finally-leave"
              "compiler/types/builtins.fib:load-i16" "compiler/types/builtins.fib:simd/kind" "compiler/types/builtins.fib:store-i16"
-             "compiler/types/builtins.fib:store-i32" "compiler/types/builtins.fib:struct-field-types" "compiler/types/builtins.fib:struct-params"
+             "compiler/types/builtins.fib:struct-field-types" "compiler/types/builtins.fib:struct-params"
              "compiler/types/builtins.fib:struct?" "compiler/types/builtins.fib:sys-clock-now" "compiler/types/builtins.fib:sys-close"
              "compiler/types/builtins.fib:sys-dup" "compiler/types/builtins.fib:sys-errno-text" "compiler/types/builtins.fib:sys-getenv"
              "compiler/types/builtins.fib:sys-isatty" "compiler/types/builtins.fib:sys-mkdir" "compiler/types/builtins.fib:sys-open"

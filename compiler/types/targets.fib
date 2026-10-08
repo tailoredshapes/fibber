@@ -130,13 +130,24 @@
 ;; Every row, in the order `fibc targets` prints them. The rest of LLVM's backends have no row yet (docs/design/targets.md 5).
 (defun target-rows () -> (Vec TargetRow)
   [(row-x86-64-linux) (row-aarch64-darwin) (row-aarch64-linux) (row-arm64-ios) (row-wasm32-wasip1) (row-wasm32-unknown)
-   (row-riscv64-linux) (row-x86-64-musl) (row-aarch64-musl) (row-nvptx64-cuda)])
+   (row-riscv64-linux) (row-x86-64-musl) (row-aarch64-musl) (row-nvptx64-cuda) (row-wgsl-webgpu)])
 
 ;; --- matching a triple
 
 (defun has :private (s: str t: str) -> bool (some? (str-find s t 0)))
 
 ;; The architecture of a triple, the text before the first `-`, with Apple's `arm64` read as `aarch64`.
+(def KERNEL-WGSL: str "kernel target: emits WGSL for a WebGPU driver to launch (--emit wgsl); no host runtime, no tail calls, FMA yes (docs/design/webgpu.md)")
+
+;; WebGPU through WGSL (docs/design/webgpu.md): the second KERNEL target. `fibc build --target wgsl-unknown-webgpu --emit wgsl` lowers the kernels of a
+;; program as the nvptx64 row does (the same lIR kernel module, native.kernel) and prints them as WGSL compute shaders (native.wgsl) instead of
+;; lowering them with LLVM, which has no WGSL backend: no data layout, no CPU. A driver (fib-gpu-webgpu over wgpu-native; the JS glue fib-webgpu.mjs
+;; over navigator.gpu) compiles the WGSL and launches. WGSL has no i64 and no f64: a kernel that uses them is refused by name.
+(defun row-wgsl-webgpu :private () -> TargetRow
+  (TargetRow "wgsl-unknown-webgpu" "wgsl" "webgpu" "Linux" ""
+             64 true "none" 128 "wgsl" "" true 1 0 1 1 "none" "wgsl" "none (a driver compiles the WGSL)" "" "none" (runtime-c-functions)
+             "emits WGSL (examples/webgpu); runtime-os Linux is a stand-in, no runtime is emitted" KERNEL-WGSL))
+
 (defun arch-of-triple (triple: str) -> str
   (let ((a (match (str-find triple "-" 0) ((some i) (str-slice triple 0 i)) (nil triple))))
     (if (= a "arm64") "aarch64" a)))
@@ -148,10 +159,11 @@
 ;; Whether a triple is for musl (`-musl`, `-linux-musl`): its own row, with the Linux code and the musl C library.
 (defun musl-triple? (triple: str) -> bool (has triple "-musl"))
 
-;; The OS of a triple as the rows name it: ios, darwin, wasi, none (a wasm triple with no OS), cuda (nvptx), linux, else other (freebsd, windows, ..: no row).
+;; The OS of a triple as the rows name it: ios, darwin, wasi, none (a wasm triple with no OS), cuda (nvptx), webgpu (wgsl), linux, else other (freebsd, windows, ..: no row).
 (defun os-of-triple (triple: str) -> str
   (cond (has triple "-ios") "ios"
         (has triple "-cuda") "cuda"
+        (has triple "-webgpu") "webgpu"
         (apple-triple? triple) "darwin"
         (has triple "wasi") "wasi"
         (starts-with? triple "wasm") "none"
@@ -187,9 +199,13 @@
 (defun row-buildable? (r: TargetRow) -> bool
   (or (row-supported? r) (starts-with? (. r support) "portability target") (kernel-row? r)))
 
-;; A kernel target (docs/design/gpu.md): its code is kernels for a driver to launch, never an executable; `fibc build` emits PTX for it and nothing else.
+;; A kernel target (docs/design/gpu.md): its code is kernels for a driver to launch, never an executable; `fibc build` emits PTX (or WGSL) for it and nothing else.
 (defun kernel-row? (r: TargetRow) -> bool
   (starts-with? (. r support) "kernel target"))
+
+;; The WebGPU kernel target (docs/design/webgpu.md): its kernels are printed as WGSL (object format `wgsl`), never lowered with LLVM.
+(defun wgsl-row? (r: TargetRow) -> bool
+  (and (kernel-row? r) (= (. r object-format) "wgsl")))
 
 ;; Whether the value of FIB_TARGET_TRIPLE (nil when unset) names a kernel target: the checker needs no `main` then and the emitter's roots are the kernels.
 (defun kernel-triple? (triple: (Option str)) -> bool

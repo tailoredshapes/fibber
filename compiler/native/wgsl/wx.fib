@@ -1,0 +1,205 @@
+;; compiler/native/wgsl/wx.fib: the state of the lIR-to-WGSL printer (docs/design/webgpu.md): the module context `Wx`, the function
+;; context `Wf`, the types a kernel may have in WGSL, the type of an expression, names, and the refusal (the first one wins: the
+;; printer goes on, the text is dropped). OWNER: package WEBGPU-1.
+;;
+;; WGSL has i32, u32, f32 and bool; no i64, no f64, no narrow integers, no SIMD values, no raw pointer arithmetic. The printer maps
+;; i1 to bool, i32 to i32, float to f32, ptr to `Ptr` (a storage buffer and a byte offset) and the pair of `sadd-overflow` to `OvI32`;
+;; anything else is refused by name, naming the function (and the kernel that reaches it) and the type. An i64 may appear in the
+;; address arithmetic of a `getelementptr` only (wx.fib `addr-temp?`: the binding is not printed, its uses are folded into the address).
+(ns native.wgsl.wx
+  (:use lir.types lir.lit lir.ast))
+
+;; The module context: the signatures of every function, the defined ones, the ones that may trap (reach `(trap)`), the ones that reach a `(barrier)`, the kernel that
+;; reaches each function (for the refusal), the string constants (a trap's message: a null `Ptr` on the device), the block-shared globals (name to the
+;; buffer number of its `var<workgroup>`: SHARED-BASE and up), the scalar cells (`%struct.fib.cell.T`: a stack slot of a kernel, spec/types.md 6.11, to its element T), the count of storage
+;; buffers (the most pointer parameters of a kernel), and the refusal.
+(def SHARED-BASE: i64 16)
+
+(defstruct Wx
+  (fns: (Map str LFnType)
+   defined: (Set str)
+   traps: (Set str)
+   barriers: (Set str)
+   owner: (Map str str)
+   strings: (Set str)
+   shared: (Map str i64)
+   cells: (Map str LType)
+   nbufs: i64
+   err: (Cell (Option str))))
+
+;; The function context: the module, the function, its block numbers, every `let` binding by name, the types found so far, the
+;; allocas (scalar locals), and the expression printer (set by native.wgsl.expr; the instruction printers call it for their operands).
+(defstruct Wf
+  (wx: Wx
+   f: LFunction
+   labels: (Map str i64)
+   binds: (Map str LExpr)
+   types: (Cell (Map str LType))
+   allocas: (Set str)
+   looped: bool
+   ex: (fn (Wf LExpr) str)))
+
+(defun wf-expr (wf: Wf e: LExpr) -> str ((. wf ex) wf e))
+
+;; ---------------------------------------------------------------- the refusal
+
+;; Records the first refusal of the module: the function, the kernel that reaches it, and `why`. Returns a placeholder for the text.
+(defun refuse (wf: Wf why: str) -> str
+  (let ((wx (. wf wx)) (fname (. (. wf f) name)))
+    (do (match @(. wx err)
+          ((some _) ())
+          (nil (set! (. wx err)
+                     (some (str "the webgpu target cannot take " (where-text wx fname) ": " why " (docs/design/webgpu.md 3)")))))
+        "/*refused*/")))
+
+(defun where-text :private (wx: Wx fname: str) -> str
+  (match (get (. wx owner) fname)
+    ((some k) (if (= k fname) (str "kernel " k) (str "function " fname " of kernel " k)))
+    (nil (str "function " fname))))
+
+;; ---------------------------------------------------------------- types
+
+;; The WGSL name of an lIR type a kernel may use; nil for one it may not (`type-refusal` says why).
+(defun wgsl-type (t: LType) -> (Option str)
+  (match t
+    ((TInt 1) (some "bool"))
+    ((TInt 32) (some "i32"))
+    ((TFloat) (some "f32"))
+    ((TPtr) (some "Ptr"))
+    ((TAnon fs) (if (and (= (count fs) 2) (= (nth fs 0) ty-i32) (= (nth fs 1) ty-i1)) (some "OvI32") nil))
+    (_ nil)))
+
+;; Why a type is not in WGSL.
+(defun type-refusal (t: LType) -> str
+  (match t
+    ((TInt 64) "i64 (WGSL has no 64-bit integer: index with i32)")
+    ((TDouble) "f64 (WGSL has no double: compute in f32)")
+    ((TInt b) (str "i" b " (WGSL has no narrow integer)"))
+    ((TVector _ _) "a SIMD value (a kernel is scalar code: the GPU supplies the lanes)")
+    (_ (str "the type " (type-str t) " (WGSL has no aggregate here)"))))
+
+;; The WGSL type of `t`, or the refusal.
+(defun wgsl-type! (wf: Wf t: LType) -> str
+  (match (wgsl-type t) ((some s) s) (nil (refuse wf (type-refusal t)))))
+
+(defun is-i64? (t: LType) -> bool (= t ty-i64))
+
+;; The zero of a WGSL type, what a function returns after a trap.
+(defun zero-of (t: (Option LType)) -> str
+  (match t
+    (nil "")
+    ((some (TInt 1)) "false")
+    ((some (TInt 32)) "i32(0)")
+    ((some (TFloat)) "f32(0.0)")
+    ((some (TPtr)) "Ptr(0u, 0u)")
+    ((some _) "OvI32(i32(0), false)")))
+
+;; ---------------------------------------------------------------- the type of an expression (as js.ty, for the scalar subset)
+
+(defun ty-or-ptr :private (o: (Option LType)) -> LType (unwrap-or o ty-ptr))
+
+(defun intrin-ty :private (wf: Wf args: (Vec LExpr)) -> (Option LType)
+  (if (= (count args) 0) nil (type-of wf (nth args 0))))
+
+(defun call-ty :private (wf: Wf c: LCallee) -> (Option LType)
+  (match c
+    ((CalDirect n) (match (get (. (. wf wx) fns) n) ((some t) (. t ret)) (nil nil)))
+    ((CalIndirect _ t) (. t ret))))
+
+(defun param-ty :private (wf: Wf n: str) -> (Option LType)
+  (let ((ps (. (. wf f) params)) (ts (. (. (. wf f) ty) params)))
+    (loop ((i 0))
+      (cond (>= i (count ps)) nil
+            (= (. (nth ps i) name) n) (some (nth ts i))
+            :else (recur (+ i 1))))))
+
+(defun local-ty :private (wf: Wf n: str) -> (Option LType)
+  (match (get @(. wf types) n)
+    ((some t) (some t))
+    (nil (match (get (. wf binds) n)
+           ((some b) (let ((t (type-of wf b)))
+                       (do (match t ((some x) (update! (. wf types) (fn (m) (assoc m n x)))) (nil ())) t)))
+           (nil (param-ty wf n))))))
+
+(defun mask-ty :private (t: LType) -> LType
+  (match t ((TVector n _) (TVector n ty-i1)) (_ ty-i1)))
+
+(defun path-ty :private (t: LType idx: (Vec LLit)) -> LType
+  (match t
+    ((TAnon fs) (if (and (= (count idx) 1) (< (unwrap-or (lit->i64 (nth idx 0)) 99) (count fs))) (nth fs (unwrap-or (lit->i64 (nth idx 0)) 0)) t))
+    (_ t)))
+
+;; The type of an expression; nil for a void one.
+(defun type-of (wf: Wf e: LExpr) -> (Option LType)
+  (match (. e kind)
+    ((KLocal n) (local-ty wf n))
+    ((KInt t _) (some t)) ((KFloat t _) (some t)) ((KVector t _) (some t)) ((KArray t _) (some t)) ((KZero t) (some t))
+    ((KBin _ a _) (type-of wf a)) ((KUn _ a) (type-of wf a)) ((KSelect _ a _) (type-of wf a))
+    ((KOverflow _ a _) (let ((t (ty-or-ptr (type-of wf a)))) (some (TAnon [t (mask-ty t)]))))
+    ((KICmp _ a _) (some (mask-ty (ty-or-ptr (type-of wf a)))))
+    ((KFCmp _ a _) (some (mask-ty (ty-or-ptr (type-of wf a)))))
+    ((KCast _ t _) (some t))
+    ((KExtractValue a idx) (some (path-ty (ty-or-ptr (type-of wf a)) idx)))
+    ((KLoad t _ _ _) (some t))
+    ((KGep _ _ _ _) (some ty-ptr)) ((KAlloca _ _ _) (some ty-ptr))
+    ((KIntrin _ _ _ args _) (intrin-ty wf args))
+    ((KCall c _ _) (call-ty wf c))
+    ((KPhi t _) (some t))
+    ((KSreg _) (some ty-i32))
+    ((KLet _ body) (if (= (count body) 0) nil (type-of wf (nth body (- (count body) 1)))))
+    ((KStore _ _ _ _) nil) ((KTrap) nil) ((KBarrier) nil)
+    ((KRet _) nil) ((KBr _) nil) ((KCondBr _ _ _) nil) ((KSwitch _ _ _) nil) ((KUnreachable) nil)
+    (_ (some ty-ptr))))
+
+(defun type-of! (wf: Wf e: LExpr) -> LType (ty-or-ptr (type-of wf e)))
+
+;; Whether a `let` binding is an address temporary: an i64 that is only ever folded into a `getelementptr` (never printed as a value).
+(defun addr-temp? (wf: Wf name: str) -> bool
+  (match (get (. wf binds) name)
+    ((some b) (is-i64? (type-of! wf b)))
+    (nil false)))
+
+;; ---------------------------------------------------------------- names
+
+(defun ident-byte? :private (b: i64) -> bool
+  (or (and (>= b 97) (<= b 122)) (and (>= b 65) (<= b 90)) (and (>= b 48) (<= b 57)) (= b 95)))
+
+;; An lIR name as a WGSL identifier: letters, digits and `_` stay (PTX names already, native.kernel `ptx-name`), any other byte is `_`.
+(defun wname (name: str) -> str
+  (let ((bs (str-bytes name)))
+    (str-join (loop ((i 0) (out []))
+                (if (>= i (array-len bs))
+                    out
+                    (let ((b (bit-and (zext i64 (array-get bs i)) 255)))
+                      (recur (+ i 1) (conj out (if (ident-byte? b) (str-from-bytes (array 1 (trunc i8 b))) "_")))))))))
+
+(defun phi-name (pos: i64) -> str (str "ph" pos))
+
+;; The private body of a kernel entry, called by the `@compute` entry of the same name.
+(defun body-name (k: str) -> str (str "fibw_k_" (wname k)))
+
+;; ---------------------------------------------------------------- scalar cells
+
+;; A scalar cell of a kernel (`(cell 0.0f32)`) is a stack object `%struct.fib.cell.T` = {header, T}: the printer makes it a `var` of T (the header is dropped, the
+;; `fib.stack-init`/`fib.stack-end` calls are no-ops) and a `getelementptr` into its value is the variable itself.
+(defun cell-elem (wx: Wx t: LType) -> (Option LType)
+  (match t ((TNamed n) (get (. wx cells) n)) (_ nil)))
+
+(defun stack-call? (n: str) -> bool (or (= n "fib_stack_init") (= n "fib_stack_end")))
+(defun stack-fn? (n: str) -> bool (or (stack-call? n) (= n "fib_init_hdr")))
+
+;; Whether the let `name` is the address of a cell's value: a `getelementptr` of a cell struct over a cell alloca.
+(defun cell-gep? (wf: Wf name: str) -> bool
+  (match (get (. wf binds) name)
+    ((some b) (match (. b kind)
+                ((KGep _ t p _) (and (some? (cell-elem (. wf wx) t)) (match (. p kind) ((KLocal n) (contains? (. wf allocas) n)) (_ false))))
+                (_ false)))
+    (nil false)))
+
+;; The variable a pointer operand names, if it is a scalar local: an alloca, or the address of a cell's value.
+(defun local-var (wf: Wf p: LExpr) -> (Option str)
+  (match (. p kind)
+    ((KLocal n) (cond (contains? (. wf allocas) n) (some (wname n))
+                      (cell-gep? wf n) (match (get (. wf binds) n) ((some b) (match (. b kind) ((KGep _ _ bp _) (match (. bp kind) ((KLocal base) (some (wname base))) (_ nil))) (_ nil))) (nil nil))
+                      :else nil))
+    (_ nil)))

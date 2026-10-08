@@ -277,6 +277,13 @@ Recent compiler and library changes include:
   (`ssh://git@localhost:2222/tailoredshapes/fib-gpu-cuda.git`, tag `v0.1.0`) passes the device contract `fib.gpu.contract` (7 of 7
   scenarios, 3 faults caught). Measured there: fibber's shared-memory GEMM at 17.1 TFLOPS at n = 4096 (47% of cuBLAS, the CUDA C kernel's
   speed), bit for bit the CPU's; [the GPU design](docs/design/gpu.md) has the table and what phase 2 and 3 still owe.
+- WebGPU (the second kernel backend, WEBGPU-1): `fibc build --target wgsl-unknown-webgpu --emit wgsl` prints the same kernels as WGSL
+  compute shaders ([the WebGPU design](docs/design/webgpu.md): the mapping of the kernel subset to WGSL, what is refused by name (i64, f64,
+  pointer arithmetic beyond an index, builtins WGSL lacks), the binding model, the trap flag). They run on the native host through
+  `fib-gpu-webgpu` (`ssh://git@localhost:2222/tailoredshapes/fib-gpu-webgpu.git`, tag `v0.0.1`, over wgpu-native) and from a fibber program
+  built for wasm32 through the JavaScript glue `examples/webgpu/js/fib-webgpu.mjs` over `navigator.gpu` (node with Dawn, Chromium). One
+  `defkernel`, five runs: `scripts/webgpu-agree.sh` compares the CPU, CUDA, wgpu-native, Dawn and Chromium results by hash (bit exact where
+  the host fuses `fma`; the register-tiled GEMM reaches 9.6 TFLOPS through WGSL on the same GPU where CUDA gives 10.9).
 
 The standard library in `lib/` follows Clojure's names and argument shapes,
 within fibber's static types and ownership model. Its specification and

@@ -1,0 +1,218 @@
+;; examples/webgpu/js/webgpu.fib: the JAVASCRIPT DRIVER of fibber's `fib.gpu.device` protocols (docs/design/webgpu.md 5.1): a fibber program built for
+;; wasm32-wasi calls these externs, which the glue module examples/webgpu/js/fib-webgpu.mjs provides as the imports `env.fib_gpu_*` over the
+;; browser's (or Dawn's, under node) `navigator.gpu`. `:lib "js"` marks them as the host's (native.linkwasm: `--allow-undefined`). The same `ns webgpu` and
+;; the same `platform` as the native driver fib-gpu-webgpu (over wgpu-native): a host program `(:require [webgpu :as g])` builds against either by its -I path.
+;; ADR 0011: the externs are in a driver, the core has none.
+;;
+;; Every call returns a Result with a `GpuError`: the glue answers a negative status and keeps its text (`fib_gpu_error`); the status is the kind
+;; (-2 -3 -4 `:no-device`: no `navigator.gpu`, no adapter, no device; -10 `:invalid-ptx`: the WGSL does not compile; -12 `:not-found`; -20 `:device-trap`;
+;; -1 `:invalid-argument`; else `:driver`). The glue never throws into the module: without WebGPU `platform-open` is an Err. Ownership (gpu.md 3.3) is
+;; kept on this side as in the other drivers: a buffer passed to `stream-launch` is lent until `stream-sync`; the lent, released and signature checks are the
+;; protocol's; a device trap (a kernel's `trap`, a checked `+` that overflows) is the `:device-trap` Err of `stream-sync` (the flag of the WGSL's binding 1).
+(ns webgpu (:use fib.core fib.seq fib.coll fib.gpu.device) (:require [fib.os.native :as n] [fib.os.time :as t]))
+
+(extern fib_gpu_open () -> i32 :lib "js")
+(extern fib_gpu_close () -> i32 :lib "js")
+(extern fib_gpu_name (ptr i32) -> i32 :lib "js")
+(extern fib_gpu_error (ptr i32) -> i32 :lib "js")
+(extern fib_gpu_load (ptr i32) -> i32 :lib "js")
+(extern fib_gpu_kernel (i32 ptr i32) -> i32 :lib "js")
+(extern fib_gpu_buffer (i32) -> i32 :lib "js")
+(extern fib_gpu_upload (i32 ptr i32) -> i32 :lib "js")
+(extern fib_gpu_download (i32 ptr i32) -> i32 :lib "js")
+(extern fib_gpu_launch (i32 i32 i32 i32 i32 i32 i32 ptr i32) -> i32 :lib "js")
+(extern fib_gpu_sync () -> i32 :lib "js")
+(extern fib_gpu_release (i32) -> i32 :lib "js")
+
+(defstruct JsPlatform (v: i64))
+;; `states`: buffer state by glue id: 0 idle, 1 lent until the stream syncs, 2 released; `times`: the wall clock of each event's record.
+(defstruct Dev (states: (Cell (Map i64 i64)) lent: (Cell (Vec i64)) times: (Cell (Map i64 i64))))
+(defstruct JsDevice (info: DeviceInfo d: Dev))
+(defstruct JsModule (id: i64 sigs: (Map str (Vec str))))
+(defstruct JsKernel (id: i64 name: str sig: (Vec str)))
+(defstruct JsBuffer (d: Dev id: i64 bytes: i64))
+(defstruct JsStream (d: Dev max-block: i64))
+(defstruct JsEvent (d: Dev id: i64))
+
+;; --- errors
+
+(defun text-of :private (f: (fn (ptr i32) i32) :borrow) -> str
+  (unsafe
+    (let [buf (alloc 1024)]
+      (let [len (f buf 1024i32)]
+        (let [s (if (> len 0i32) (n/c-string buf) "")]
+          (do (free buf) s))))))
+
+(defun kind-of-code :private (code: i32) -> keyword
+  (cond (or (= code -2i32) (= code -3i32) (= code -4i32)) :no-device
+        (= code -10i32) :invalid-ptx (= code -12i32) :not-found (= code -20i32) :device-trap (= code -1i32) :invalid-argument
+        :else :driver))
+
+(defun fail :private (code: i32) -> GpuError
+  (gpu-error (kind-of-code code) (text-of (fn (p: ptr cap: i32) (unsafe (fib_gpu_error p cap))))))
+
+(defun check :private (code: i32) -> (Result unit GpuError) (if (>= code 0i32) (Ok ()) (Err (fail code))))
+(defun id-result :private (code: i32) -> (Result i64 GpuError) (if (>= code 0i32) (Ok (sext i64 code)) (Err (fail code))))
+
+;; --- the platform and the device
+
+(defun platform () -> (dyn Platform) (dyn Platform (JsPlatform 0)))
+
+;; The host's WebGPU device: `:no-device` (never a trap) when the host has no `navigator.gpu`, no adapter or no device. The host's default limits (a
+;; 256 MiB buffer, 256 invocations a workgroup, 16 KiB of workgroup memory) are the info; the glue does not ask for more.
+(defun open-device :private (ordinal: i64) -> (Result JsDevice GpuError)
+  (if (not (= ordinal 0))
+      (Err (gpu-error :invalid-argument (str "no WebGPU device " ordinal ": the host has one")))
+      (try-let [_ (check (unsafe (fib_gpu_open)))]
+        (Ok (JsDevice (DeviceInfo (text-of (fn (p: ptr cap: i32) (unsafe (fib_gpu_name p cap)))) 268435456 0 0 0 256 16384)
+                      (Dev (cell {}) (cell []) (cell {})))))))
+
+(impl Platform JsPlatform
+  (platform-name (self) "webgpu-js")
+  (platform-device-count (self)
+    (match (open-device 0) ((Ok _) (Ok 1)) ((Err e) (if (= (. e kind) :no-device) (Ok 0) (Err e)))))
+  (platform-open (self ordinal) (match (open-device ordinal) ((Ok d) (Ok (dyn Device d))) ((Err e) (Err e)))))
+
+;; --- modules and kernels
+
+(defun with-text :private (text: str f: (fn (ptr i32) i32) :borrow) -> i32
+  (let [c (n/c-text text)]
+    (let [r (f c (trunc i32 (str-len text)))]
+      (do (unsafe (free c)) r))))
+
+(impl Module JsModule
+  (module-kernel (self name)
+    (match (get (. self sigs) name)
+      (nil (Err (gpu-error :not-found (str "no kernel " name " in the module"))))
+      ((some sig) (match (id-result (with-text name (fn (p: ptr len: i32) (unsafe (fib_gpu_kernel (trunc i32 (. self id)) p len)))))
+                    ((Ok id) (Ok (dyn Kernel (JsKernel id name sig))))
+                    ((Err e) (Err e))))))
+  (module-unload (self) (Ok ())))
+
+(impl Kernel JsKernel
+  (kernel-name (self) (. self name))
+  (kernel-signature (self) (. self sig))
+  (kernel-handle (self) (. self id)))
+
+;; --- memory
+
+(defun state-of :private (d: Dev h: i64) -> i64 (unwrap-or (get @(. d states) h) 0))
+(defun set-state! :private (d: Dev h: i64 s: i64) -> unit (set! (. d states) (assoc @(. d states) h s)))
+
+(defun usable :private (b: JsBuffer call: str) -> (Result unit GpuError)
+  (let [st (state-of (. b d) (. b id))]
+    (cond (= st 2) (Err (gpu-error :released (str call ": the buffer was released")))
+          (= st 1) (Err (gpu-error :lent (str call ": the buffer is lent to a running kernel: sync the stream first")))
+          :else (Ok ()))))
+
+(defun bytes-check :private (b: JsBuffer n: i64 call: str) -> (Result unit GpuError)
+  (if (> n (. b bytes)) (Err (gpu-error :invalid-argument (str call ": " n " bytes do not fit a buffer of " (. b bytes)))) (Ok ())))
+
+(defun f32-data :private (xs: (Array f32)) -> ptr (unsafe (ptr+ (raw xs) 24)))
+(defun i8-data :private (xs: (Array i8)) -> ptr (unsafe (ptr+ (raw xs) 24)))
+
+(defun write-to :private (b: JsBuffer data: ptr n: i64) -> (Result unit GpuError)
+  (try-let [_ (usable b "upload") _ (bytes-check b n "upload")]
+    (check (unsafe (fib_gpu_upload (trunc i32 (. b id)) data (trunc i32 n))))))
+
+(defun read-from :private (b: JsBuffer out: ptr n: i64) -> (Result unit GpuError)
+  (try-let [_ (usable b "download") _ (bytes-check b n "download")]
+    (check (unsafe (fib_gpu_download (trunc i32 (. b id)) out (trunc i32 n))))))
+
+(impl Buffer JsBuffer
+  (buffer-bytes (self) (. self bytes))
+  (buffer-handle (self) (. self id))
+  (buffer-upload (self xs) (write-to self (f32-data xs) (* 4 (array-len xs))))
+  (buffer-download (self count)
+    (let [out (cell (array count 0.0f32))] (try-let [_ (read-from self (f32-data @out) (* 4 count))] (Ok @out))))
+  (buffer-upload-bytes (self xs) (write-to self (i8-data xs) (array-len xs)))
+  (buffer-download-bytes (self count)
+    (let [out (cell (array count 0i8))] (try-let [_ (read-from self (i8-data @out) count)] (Ok @out))))
+  (buffer-fill (self v) (let [z (array (. self bytes) v)] (write-to self (i8-data z) (. self bytes))))
+  (buffer-release (self)
+    (try-let [_ (usable self "release") _ (check (unsafe (fib_gpu_release (trunc i32 (. self id)))))]
+      (do (set-state! (. self d) (. self id) 2) (Ok ())))))
+
+;; --- streams, launches, events
+
+(defun lend :private (d: Dev handles: (Vec i64)) -> (Result unit GpuError)
+  (loop [i 0]
+    (if (>= i (count handles))
+        (Ok ())
+        (let [h (nth handles i) st (state-of d h)]
+          (cond (= st 2) (Err (gpu-error :released "launch: the buffer was released"))
+                (= st 1) (Err (gpu-error :lent "launch: the buffer is lent to a running kernel: sync the stream first"))
+                :else (do (set-state! d h 1) (set! (. d lent) (conj @(. d lent) h)) (recur (+ i 1))))))))
+
+(defun dim :private (v: (Vec i64) i: i64) -> i32 (trunc i32 (if (< i (count v)) (nth v i) 1)))
+
+(defun webgpu-dims :private (name: str grid: (Vec i64) block: (Vec i64)) -> (Result unit GpuError)
+  (cond (some? (first (filter (fn (x: i64) (> x 65535)) grid))) (Err (gpu-error :launch (str "launch of " name ": a grid dimension over 65535 workgroups: " grid)))
+        (and (> (count block) 2) (> (nth block 2) 64)) (Err (gpu-error :launch (str "launch of " name ": a block of " (nth block 2) " invocations in z; WebGPU allows 64")))
+        :else (Ok ())))
+
+;; The argument table the glue reads: 8 bytes per argument, a kind (0 buffer, 1 i32 or bool, 2 f32) and the value's 32 bits.
+(defun arg-table :private (args: (Vec Arg)) -> ptr
+  (unsafe
+    (let [t (alloc (* 8 (max 1 (count args))))]
+      (do (dotimes (i (count args))
+            (let [s (ptr+ t (* 8 i))]
+              (match (nth args i)
+                ((ABuf b) (do (store-i32 s 0i32) (store-i32 (ptr+ s 4) (trunc i32 (buffer-handle b)))))
+                ((AI32 v) (do (store-i32 s 1i32) (store-i32 (ptr+ s 4) v)))
+                ((ABool v) (do (store-i32 s 1i32) (store-i32 (ptr+ s 4) (if v 1i32 0i32))))
+                ((AF32 x) (do (store-i32 s 2i32) (store-f32 (ptr+ s 4) x)))
+                (_ (store-i32 s 1i32)))))
+          t))))
+
+(defun launch-on :private (s: JsStream k: (dyn Kernel) grid: (Vec i64) block: (Vec i64) args: (Vec Arg)) -> (Result unit GpuError)
+  (let [name (kernel-name k)]
+    (try-let [_ (check-dims name grid block (. s max-block))
+              _ (webgpu-dims name grid block)
+              _ (check-args name (kernel-signature k) args)
+              _ (lend (. s d) (vec (keep (fn (a: Arg) (match a ((ABuf b) (some (buffer-handle b))) (_ nil))) args)))]
+      (let [t (arg-table args)]
+        (let [r (unsafe (fib_gpu_launch (trunc i32 (kernel-handle k)) (dim grid 0) (dim grid 1) (dim grid 2) (dim block 0) (dim block 1) (dim block 2) t (trunc i32 (count args))))]
+          (do (unsafe (free t))
+              (if (>= r 0i32) (Ok ()) (Err (let [e (fail r)] (if (= (. e kind) :driver) (gpu-error :launch (. e message)) e))))))))))
+
+(impl Stream JsStream
+  (stream-launch (self k grid block args) (launch-on self k grid block args))
+  (stream-sync (self)
+    (let [d (. self d) r (check (unsafe (fib_gpu_sync)))]
+      (do (doseq [h @(. d lent)] (when (= (state-of d h) 1) (set-state! d h 0)))
+          (set! (. d lent) [])
+          r)))
+  ;; An event is the wall clock at a point where the queue has drained (the glue waits for the queue in `sync`; a trap it reports there is the next sync's too).
+  (stream-record (self e)
+    (do (unsafe (fib_gpu_sync))
+        (set! (. (. self d) times) (assoc @(. (. self d) times) (event-handle e) (t/clock-now)))
+        (Ok ())))
+  (stream-lend (self bs) (lend (. self d) (mapv (fn (b: (dyn Buffer)) (buffer-handle b)) bs)))
+  (stream-handle (self) 0))
+
+(impl Event JsEvent
+  (event-handle (self) (. self id))
+  (event-elapsed-ms (self later)
+    (let [a (unwrap-or (get @(. (. self d) times) (. self id)) 0) b (unwrap-or (get @(. (. self d) times) (event-handle later)) 0)]
+      (Ok (/ (double (- b a)) 1.0e6)))))
+
+(impl Device JsDevice
+  (device-info (self) (. self info))
+  (device-supports? (self cap) (or (= cap :wgsl) (= cap :events)))
+  (device-load (self source)
+    (let [wgsl (str-from-bytes source)]
+      (match (id-result (with-text wgsl (fn (p: ptr len: i32) (unsafe (fib_gpu_load p len)))))
+        ((Ok id) (Ok (dyn Module (JsModule id (signatures-of source)))))
+        ((Err e) (Err e)))))
+  (device-alloc (self bytes)
+    (cond (<= bytes 0) (Err (gpu-error :invalid-argument (str "a buffer of " bytes " bytes")))
+          (> bytes (. (. self info) memory)) (Err (gpu-error :out-of-memory (str "a buffer of " bytes " bytes: the device's largest is " (. (. self info) memory))))
+          :else (match (id-result (unsafe (fib_gpu_buffer (trunc i32 bytes))))
+                  ((Ok id) (do (set-state! (. self d) id 0) (Ok (dyn Buffer (JsBuffer (. self d) id bytes)))))
+                  ((Err e) (Err e)))))
+  (device-stream (self) (Ok (dyn Stream (JsStream (. self d) (. (. self info) max-block)))))
+  (device-event (self)
+    (let [id (+ 1 (count @(. (. self d) times)))]
+      (do (set! (. (. self d) times) (assoc @(. (. self d) times) id 0)) (Ok (dyn Event (JsEvent (. self d) id))))))
+  (device-close (self) (check (unsafe (fib_gpu_close)))))

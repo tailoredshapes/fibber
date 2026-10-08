@@ -52,6 +52,7 @@ of data. It shows what each new row emits today and lists what stands between em
 | wasm32-unknown-unknown | 32 | none | 128, generic, `+simd128,+tail-call` | no | 0 | 0 (C) tail | static | wasm, `wasm-ld --no-entry --export-dynamic` | none (all 50) | Linux (stand-in) | emits | portability target |
 | riscv64-unknown-linux-gnu | 64 | pthreads | 128, generic-rv64, `+m,+a,+f,+d,+c,+zicsr,+zifencei` | yes (fmadd.d) | 0 | 8 (fastcc) tail | PIC | ELF lp64d, cc (riscv64 cross), `$RISCV_SYSROOT` | glibc | Linux | emits | parked: LLVM has no tailcc for RISC-V |
 | nvptx64-nvidia-cuda | 64 | none | 128, sm_89 | yes | 1 | 0 (C) tail | static | ptx, none (a driver loads it) | none (all 50) | Linux (stand-in; no runtime is emitted) | emits PTX, run by fib-gpu-cuda (docs/design/gpu.md) | kernel target |
+| wgsl-unknown-webgpu | 64 | none | 128, (none: no LLVM machine) | yes | 1 | 0 (C) tail | static | wgsl, none (a driver compiles it) | none (all 50) | Linux (stand-in; no runtime is emitted) | emits WGSL (the printer native.wgsl, not LLVM), run by fib-gpu-webgpu, the JS glue and Dawn (docs/design/webgpu.md) | kernel target |
 
 Data layouts (LLVM 21's, from the machine; checked by `targets-emit.sh` and `a64-emit.sh`):
 

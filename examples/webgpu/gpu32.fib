@@ -1,0 +1,19 @@
+;; examples/webgpu/gpu32.fib: the index space and the element accessors over i32, for kernels that run on every backend (docs/design/webgpu.md 3).
+;; WGSL has no i64, so a kernel for the WebGPU target indexes with i32; the same kernel runs through CUDA (PTX) unchanged. fib.gpu's builtins
+;; (`gpu/global-id` ..) give i64; `trunc i32` of them is exact for the indices a grid has, and the WGSL printer prints a `trunc i32` of an i64
+;; `+ - * <<` expression in 32-bit arithmetic (the low 32 bits of those depend on the low 32 bits only), so no i64 reaches WGSL.
+;; `ptr+` takes an i64 offset: the `sext` of an i32 byte count is the one i64 the printer accepts, and only as an address.
+(ns gpu32 (:require [fib.gpu :as gpu]))
+
+;; The thread's index in the whole grid along x or y, as i32 (the grid is sized by the host).
+(defun global-id-x () -> i32 (trunc i32 (gpu/global-id 0)))
+(defun global-id-y () -> i32 (trunc i32 (gpu/global-id 1)))
+(defun local-id-x () -> i32 (trunc i32 (gpu/local-id 0)))
+(defun group-id-x () -> i32 (trunc i32 (gpu/group-id 0)))
+(defun group-size-x () -> i32 (trunc i32 (gpu/group-size 0)))
+
+;; Element `i` of an f32 or i32 buffer at `p` (no bound check: the kernel checks its own, docs/design/gpu.md 3.2).
+(defun f32-at (p: ptr i: i32) -> f32 (unsafe (load-f32 (ptr+ p (sext i64 (unchecked-multiply 4i32 i))))))
+(defun f32-set! (p: ptr i: i32 v: f32) -> unit (unsafe (store-f32 (ptr+ p (sext i64 (unchecked-multiply 4i32 i))) v)))
+(defun i32-at (p: ptr i: i32) -> i32 (unsafe (load-i32 (ptr+ p (sext i64 (unchecked-multiply 4i32 i))))))
+(defun i32-set! (p: ptr i: i32 v: i32) -> unit (unsafe (store-i32 (ptr+ p (sext i64 (unchecked-multiply 4i32 i))) v)))

@@ -1,0 +1,52 @@
+;; examples/webgpu/refs.fib: the inputs and the CPU references of the kernels of examples/webgpu/kernels.fib, in the same fma order, and the hash every backend
+;; prints (docs/design/webgpu.md 6). Not in kernels.fib: GPU-2's rule is that a program with a kernel built for a platform with no kernel target is refused (there is
+;; no CPU fallback), and the host programs (hostrun.fib) need these functions without the kernels.
+(ns refs)
+
+(defun fill-f32 (n: i64 seed: i64) -> (Array f32)
+  (let ((out (cell (array n 0.0f32))))
+    (do (dotimes (i n) (array-set! &out i (/ (sitofp f32 (rem (+ (* i 7919) seed) 10007)) 97.0f32)))
+        @out)))
+
+(defun fill-i32 (n: i64 seed: i64) -> (Array i32)
+  (let ((out (cell (array n 0i32))))
+    (do (dotimes (i n) (array-set! &out i (trunc i32 (- (rem (+ (* i 7919) seed) 100003) 50000))))
+        @out)))
+
+(defun vadd-ref (a: (Array f32) b: (Array f32)) -> (Array f32)
+  (let ((out (cell (array (array-len a) 0.0f32))))
+    (do (dotimes (i (array-len a)) (array-set! &out i (+ (array-get a i) (array-get b i))))
+        @out)))
+
+(defun vaddi-ref (a: (Array i32) b: (Array i32)) -> (Array i32)
+  (let ((out (cell (array (array-len a) 0i32))))
+    (do (dotimes (i (array-len a)) (array-set! &out i (+ (array-get a i) (array-get b i))))
+        @out)))
+
+;; C = A*B with one fma chain per element in increasing k: the kernel's order.
+(defun gemm-ref (a: (Array f32) b: (Array f32) n: i64) -> (Array f32)
+  (let ((out (cell (array (* n n) 0.0f32))))
+    (do (dotimes (i n)
+          (dotimes (j n)
+            (array-set! &out (+ (* i n) j)
+                        (loop ((k 0) (acc 0.0f32))
+                          (if (>= k n) acc (recur (+ k 1) (simd/fma (array-get a (+ (* i n) k)) (array-get b (+ (* k n) j)) acc)))))))
+        @out)))
+
+;; FNV-1a over the 32-bit words of a result: the hash every backend prints.
+(defun hash-f32 (xs: (Array f32)) -> i64
+  (loop ((i 0) (h 2166136261))
+    (if (>= i (array-len xs)) h (recur (+ i 1) (hash-word h (zext i64 (f32->bits (array-get xs i))))))))
+
+(defun hash-i32 (xs: (Array i32)) -> i64
+  (loop ((i 0) (h 2166136261))
+    (if (>= i (array-len xs)) h (recur (+ i 1) (hash-word h (bit-and (zext i64 (array-get xs i)) 4294967295))))))
+
+(defun hash-word (h: i64 w: i64) -> i64
+  (loop ((k 0) (h h))
+    (if (>= k 4) h (recur (+ k 1) (bit-and (unchecked-multiply (bit-xor h (bit-and (shr w (* 8 k)) 255)) 16777619) 4294967295)))))
+
+;; The sizes of the agreement test: vadd and vaddi over 2^20 elements, GEMM at 256.
+(def VADD-N: i64 1048576)
+(def GEMM-N: i64 256)
+

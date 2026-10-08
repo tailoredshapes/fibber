@@ -318,7 +318,8 @@ supplies the parallelism; `Simd` values are refused in a kernel (NVPTX has `.v2`
 9. **The `Device` protocol in the core** (4.3) and `(DeviceBuffer T)`: a `fib.gpu` module with the protocol and no extern, a driver
    implementing it. Size: M.
 10. **Device tensors** (section 5). Size: M-L.
-11. **A second kernel row** (SPIR-V) and its driver; **Metal**. Size: L each.
+11. **A second kernel row** (SPIR-V) and its driver; **Metal**. Size: L each. The WGSL row (docs/design/webgpu.md) is the second row now and
+    reaches Metal through Dawn's own WGSL-to-MSL path (webgpu.md 9); SPIR-V stays the OpenCL route.
 12. **The name rule**: a kernel's PTX name is its fibber name with `-` as `_`; two kernels whose names differ only in a `-` collide (the
     extractor refuses the second; a better rule mangles).
 
@@ -357,7 +358,9 @@ supplies the parallelism; `Simd` values are refused in a kernel (NVPTX has `.v2`
   one file, `defkernel` beside `defun`, `fibc` splits by target. What SYCL adds, kernels as closures launched inline, is the design's
   `with-launch` form (3.3) once the checker exists; the prototype launches by name.
 * **WebGPU/WGSL for the wasm/JS targets.** A WGSL printer of the kernel's lIR (the same size as the MSL one: 4.4) gives the browser target a
-  GPU through `navigator.gpu`; the driver is JavaScript glue (docs/design/wasm.md 5.3's `jsbind`). Right for the browser, later.
+  GPU through `navigator.gpu`; the driver is JavaScript glue (docs/design/wasm.md 5.3's `jsbind`). **Built** (WEBGPU-1, docs/design/webgpu.md):
+  the second kernel row `wgsl-unknown-webgpu`, the printer `native.wgsl` over the same kernel module, the JS glue and the wasm host, and
+  `fib-gpu-webgpu` over wgpu-native for the native host; the same `defkernel` gives the CPU's result bit for bit through CUDA and WebGPU.
 * **A general NVPTX target** (the runtime on the GPU: allocation, tasks). Rejected: no libc, no threads in the runtime's sense, no tail
   calls; targets.md 5.5 said "a kernel-only subset" and the prototype confirms the subset is enough.
 

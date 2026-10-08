@@ -1,0 +1,19 @@
+;; examples/webgpu/host.fib: the WebGPU host (docs/design/webgpu.md 6): hostrun.fib over `webgpu/platform`, the driver of the `-I` path that is given:
+;;   the wasm host:   fibc build host.fib --target wasm32-wasi -I examples/webgpu -I examples/webgpu/js --export run -o host.wasm
+;;                    (node examples/webgpu/js/run.mjs host.wasm kernels.wgsl: the glue fib-webgpu.mjs provides the driver over navigator.gpu)
+;;   the native host: fibc build host.fib -I examples/webgpu -I fib-gpu-webgpu/src -L fib-gpu-webgpu/lib -L $WGPU_NATIVE_DIR/lib -o host  (the driver over wgpu-native)
+;; `run` (wasm) takes the WGSL text (a pointer and a length: what `--emit wgsl` wrote) and returns 0 when every hash is the reference's, 1 on a mismatch, 2 on a
+;; driver error (no WebGPU in the host is the `:no-device` Err of `platform-open`, never a trap).
+(ns main (:use fib.core fib.seq fib.coll) (:require [webgpu :as g] [hostrun :as h] [fib.os.native :as n]))
+
+;; The wasm export: the WGSL text at `p` of `len` bytes. The CPU's GEMM reference is not computed there (no fused multiply-add on wasm32).
+(defun run (p: ptr len: i64) -> i64
+  (h/report (h/run-all (g/platform) (n/bytes-at p len) false)))
+
+(defun main () -> i64
+  (let [a (args)]
+    (if (< (count a) 1)
+        (do (println "usage: host KERNELS.wgsl") 2)
+        (match (try-slurp (nth a 0))
+          ((Err e) (do (println (str "cannot read " (nth a 0) ": " e)) 2))
+          ((Ok wgsl) (h/report (h/run-all (g/platform) (str-bytes wgsl) true)))))))
