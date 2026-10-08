@@ -82,6 +82,16 @@ scripts/fetch-*.sh ───────► ~/.cache/fibber-scratch/tools/<tool>
   `BASH_ENV` (a `ulimit -v` that succeeds: macOS has no RLIMIT_AS). `scripts/lint-portable.sh` (a tool of the quick gate) fails on every other
   Linux-only tool or bash 4 feature unless the line says `# linux-only: reason`. The cases that fail only on a Mac are
   `scripts/ci-stage2.expected-darwin`; `LLVM_LIBDIR` defaults to Homebrew's `llvm@21`.
+  **DARWIN-2** moved most of those onto the Mac. The thread count and the resident set come from `proc_pidinfo(PROC_PIDTASKINFO)` behind `fib.os.backend`'s
+  `task-info` (`thread-count` of fib.os.process and `rss-bytes` of fib.os.memory keep their interfaces; the Linux code is unchanged), so cases 912, 919, 7532, 8642 run
+  on the Mac; a forked child gets its parent's signal stack back (XNU drops `sigaltstack` across `fork`; `fib_guard_ctl` in rt/thread.lir), so 8354 passes; only 8410
+  (a `/proc` file by definition) stays labelled. A comment line of a case header that begins `word:` is read as a header key (the parser refuses unknown keys): write
+  "On macOS ..." not "macOS: ...". The Linux-only convention stays the line `;; Linux only (...)` plus an entry in `ci-stage2.expected-darwin`.
+  The slowness of the audit mode on macOS (case 6100: 127 s alone, 28 million allocations) is the trace itself: one `write(2)` per allocation, 55.9 million lines of
+  standard error, 110 s of system time, a write costing about 2 us there; not changed (a buffered trace needs a flush on every exit, trap and fork path).
+- **Tools installed for DARWIN-2** (development tools, owner's rule of 2026-10-08): `clang-21` 1:21.1.8-6ubuntu1 by `apt` on the Linux box (so the C backend's clang
+  column could be run there as well as on the Mac); nothing on the Mac (Apple clang 21 and Homebrew's `llvm@21` were there; `~/Library/Logs/DiagnosticReports`
+  crash reports gave the backtrace that `lldb` would have).
 - **The generated runtime:** `compiler/emit/runtime.fib` is a real target of `rt/*.lir` and `build/gen-runtime` (built by the seed:
   the generator uses the library only); the recipe writes it only when the content changed, so a checkout whose `rt/` is newer
   than the committed file does not rebuild F for nothing. `build/runtime-drift.ok` is the comparison (the committed file equals

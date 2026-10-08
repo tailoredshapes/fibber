@@ -16,10 +16,10 @@ done
 CFLAGS="-std=gnu11 -O1 -g -march=native -ffp-contract=off -fno-math-errno -fno-delete-null-pointer-checks -w -fsanitize=undefined,address -fno-sanitize-recover=all"
 work=$(mktemp -d "${TMPDIR:-/tmp}/ubsan.XXXXXX"); trap 'rm -rf "$work"' EXIT
 list=$work/list; : > "$list"
-for x in "${inputs[@]}"; do
+for x in ${inputs[@]+"${inputs[@]}"}; do
   if [ -d "$x" ]; then grep -lrE --include='*.lir' "^;; expect: accept" "$x" | sort >> "$list"; else echo "$x" >> "$list"; fi
 done
-for d in "${emits[@]}"; do : "${FIBC:?}"; ad=$(cd "$d" && pwd); grep -lE '^;; expect: +(accept|trap)' "$ad"/*.fib | sort >> "$list"; done
+for d in ${emits[@]+"${emits[@]}"}; do : "${FIBC:?}"; ad=$(cd "$d" && pwd); grep -lE '^;; expect: +(accept|trap)' "$ad"/*.fib | sort >> "$list"; done
 one() {
   f=$1; name=${f#"$root"/}; d=$work/run/$(echo "$name" | tr '/' '_'); mkdir -p "$d"
   ulimit -c 0; ulimit -v unlimited 2> /dev/null; exec 2> /dev/null   # ASan reserves 16 TB of address space (and uses little of it)
