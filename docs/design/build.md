@@ -56,9 +56,18 @@ scripts/fetch-*.sh ───────► ~/.cache/fibber-scratch/tools/<tool>
   runs of a shard as before, and a tool script's own parallelism is its own: the kept scripts are not jobserver-aware, and the
   policy is that a recipe is one heavy process plus whatever that process always ran. The stdlib cases are `SHARDS` (default 16)
   targets, ownership 4, so Make schedules them.
-- **Recursion:** none, except `gate-report`, which asks `$(MAKE) -q` whether the gate's stamps are up to date (the report must
-  print PASS or FAIL after a `-k` run that left some stamps missing), and `scripts/batch.sh`, which runs `make` on a scratch
-  worktree.
+- **Recursion:** `gate` and `quick` call `$(MAKE) gate-report` after their stamps, and `gate-report` asks `$(MAKE) -q` whether every
+  stamp of the mode is current (so the report prints PASS or FAIL even after a `-k` run that left stamps missing). `scripts/gate.sh`
+  and `scripts/batch.sh` call make. Nothing else recurses.
+- **Scratch outside the tree.** `TMPDIR` and the tool scripts' scratch are under `SCRATCH` (default `~/.cache/fibber-scratch/mk-<hash of the
+  tree path>`), not under `build/`: with `TMPDIR` inside the worktree `cases/stdlib/8283-str-replace-...` fails in a shard (`expected 0, got
+  4294967296`) and passes with `TMPDIR` anywhere else (found while writing this; reported, not explained). A tool that opens a Unix socket
+  also needs a short path (`fibc serve`: 100 bytes), which is why the hash is short.
+- **Configuration is a file too.** `build/static.cfg` and `build/wasm.cfg` hold the musl library and the wasi-sdk the stamp was made for
+  (written when `make` reads the Makefile, only if the content changes), so a stamp that said SKIPPED is redone once the pieces exist.
+  Consequence: running make with and without `FIB_MUSL_DIR` alternately reruns the static stage each time.
+- **The seed is a path.** `build/seed/<sha256>/bin/fibc`: SEED is read for the sha256 and url, and is no prerequisite, so touching SEED
+  without changing it rebuilds nothing; a new sha256 is a new directory and a rebuild of F.
 - **Build directory:** `build/` in the tree (`BUILD=…` moves it), `dist/` for the release; both ignored by git and skipped by
   the ADR scan (`lib/fib/test/arch/repo.fib`). The seed is unpacked under `build/seed/<sha256>/`; downloads are cached across
   worktrees in `FIB_SEED_CACHE` (default `~/.cache/fibber-scratch/seeds`).
@@ -75,13 +84,13 @@ scripts/fetch-*.sh ───────► ~/.cache/fibber-scratch/tools/<tool>
 
 | Script | Now |
 |---|---|
-| `scripts/gate.sh` | thin wrapper: `--full` = `make -k -j$GATE_BUDGET gate-stamps` then `make gate-report`; `--quick` the same on `quick`; prints the same summary lines (`build:`, `cases:`, `== timing`, `GATE PASS (full)`) |
-| `scripts/tools.sh` | retired: its queue is `mk/tools.mk` (`make tools`); the script is a wrapper over `make tools` / `make tools-quick` |
-| `scripts/lib/slots.sh`, `scripts/lib/fibc-slot.sh` | retired by the jobserver; kept as no-ops for the scripts that still source them (golden.sh, mutants) |
+| `scripts/gate.sh` | thin wrapper, still takes `/tmp/fibsuite.lock`: `--full` = `make -k -j$GATE_BUDGET gate-stamps` then `make gate-report`; `--quick` the same on `quick`; prints the same summary lines (`build:`, `cases:`, `== timing`, `GATE PASS (full)`) |
+| `scripts/tools.sh` | wrapper: its queue is `mk/tools.mk` (`make tools`, `make tools-quick`, `make build/tools/NAME.ok`); prints the same `ok NAME N s` / `FAIL NAME` lines |
+| `scripts/lib/slots.sh`, `scripts/lib/fibc-slot.sh` | kept, unused by the gate: without `GATE_SLOTS` they run the command at once; `golden.sh` and old tool scripts still source them. `-j` of make is the budget |
 | `scripts/lib/stage2.sh` | kept for `scripts/bench/quick.sh` and `scripts/batch.sh` (the previous-F cache for the bench) |
 | `scripts/package.sh` | wrapper over `make release`; its checks are `mk/release.mk` targets (`build/release/binary.ok`, `build/release/tree.ok`) |
 | `scripts/fetch-seed.sh`, `scripts/build-musl.sh`, `scripts/llvm-static.sh`, `scripts/fetch-*.sh` | kept as recipe bodies (each checks its checksum) |
-| `scripts/ci-stage2.sh` | the comparison recipe: `--from DIR SPEC..` collects the shard tables Make produced and compares them with the expected set and the floor; the old `ci-stage2.sh F` still runs the directories itself |
+| `scripts/ci-stage2.sh` | the comparison recipe: `--from DIR TABLE:CASEDIR:K..` collects the shard tables Make produced and compares them with the expected set and the floor; the old `ci-stage2.sh F` still runs the directories itself |
 | `scripts/check-version.sh` | the recipe of `build/version.ok` |
 | `scripts/batch.sh` | kept (the lead's integrator); it calls `scripts/gate.sh`, which calls make |
 | `scripts/mac-check.sh` | kept; `make mac-check` runs it (gmake on the Mac) |
@@ -149,8 +158,7 @@ Applied to fib-hocon as the example (commit f39a538 on its main: `make test` ran
 
 ## 6. Tests of the build itself
 
-`compiler/tests/make/graph.sh` (the tool `sh-make-graph`) runs on a copy of the tree with a fake `F`: it checks that `make
+`compiler/tests/make/graph.sh` (the tool `sh-make-graph`, in the quick gate too) runs on a copy of the tree with a fake `F`: it checks that `make
 help` lists every public target, that a touched tool script reruns only its stamp, that a touched compiler source reruns the
 cases stamp, that a stamp is not written when its command fails, and that a planted missing prerequisite (a stamp without `F`)
-would be caught: the test edits the copy's Makefile and asserts the difference. `scripts/tests/make-incremental.sh` is the
-timed check on the real tree (`make gate` a second time is a no-op under 2 s).
+would be caught: the test edits the copy's Makefile and asserts the difference. The no-op gate on the real tree (`make gate` a second time: about 2 s) was timed by hand; see the MAKE-1 report.
