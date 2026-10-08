@@ -1,15 +1,12 @@
 ;; fib.compress.lz4.hc: LZ4 high compression (docs/design/compress.md 6.3), levels 3 to 12: a hash chain over every position (a 32768-entry head table of positions and a
 ;; 65536-entry table of 16-bit distances to the previous position of the same hash, indexed by the position's low 16 bits, as liblz4's LZ4HC does) searched to a depth that
-;; grows with the level (3: 4, 4: 8, 5: 16, 6: 32, 7: 64, 8: 128, 9: 256 as liblz4's table; 10, 11, 12: 512, 2048, 16384), with ONE-STEP LAZY MATCHING: a match is taken unless
-;; the next position has a match at least two bytes longer. This is not liblz4's parser: liblz4 looks three matches ahead at levels 3 to 9 and runs an optimal parser
-;; (LZ4HC_compress_optimal) at 10 to 12, so its output is a little smaller (docs/shootout/lz4.md measures how much). Every match is checked against the bytes before it
+;; grows with the level (3: 4, 4: 8, 5: 16, 6: 32, 7: 64, 8: 128, 9: 256 as liblz4's table; 10, 11, 12: 512, 2048, 16384), parsed by fib.compress.lz4.hc3 (liblz4's three-match lazy parser; liblz4's optimal parser at 10 to 12 is not ported). Every match is checked against the bytes before it
 ;; is used, so a bug here costs ratio, never correctness.
 ;; Positions are `gen + index` as in fib.compress.lz4.blockenc; `nxt` (word 0 of the state words) is the next position (in that coordinate) not yet in the chain.
-;;   (hc-block sp lo s0 n dp ht ct st gen level) -> compressed length
+;; The parser is in fib.compress.lz4.hc3; this module has the tables, the insertion and the depth.
 (ns fib.compress.lz4.hc (:use fib.core fib.seq fib.coll fib.compress.lz4.mem fib.compress.lz4.blockenc))
 
 (def hc-hash-log: i64 15)
-(def hc-sufficient: i64 64)
 
 (defun hc-depth (level: i64) -> i64
   (cond (<= level 3) 4 (= level 4) 8 (= level 5) 16 (= level 6) 32 (= level 7) 64 (= level 8) 128 (= level 9) 256
@@ -27,35 +24,4 @@
             ()))
         (when (> upto from) (wr64 st 0 (u+ gen upto))))))
 
-;; The best match for the bytes at ip longer than `minl`, searched down the chain at most `depth` links: (offset << 32) | length, or 0.
-(defun hc-find (sp: ptr ht: ptr ct: ptr gen: i64 lo: i64 ip: i64 mlim: i64 depth: i64 minl: i64) -> i64
-  (loop [mi (u- (tget ht (hh sp ip)) gen) n depth best minl bo 0]
-    (cond (or (<= n 0) (< mi lo) (>= mi ip) (> (u- ip mi) 65535) (>= (u+ ip best) mlim) (>= best hc-sufficient))
-          (if (> bo 0) (bit-or (shl bo 32) best) 0)
-          :else
-          (let [better (and (= (rd8 sp (u+ mi best)) (rd8 sp (u+ ip best))) (= (rd32 sp mi) (rd32 sp ip)))
-                l (if better (u+ 4 (count-eq sp (u+ ip 4) (u+ mi 4) mlim)) 0)
-                d (rd16 ct (shl (bit-and (u+ gen mi) 65535) 1))]
-            (if (> l best) (recur (u- mi d) (u- n 1) l (u- ip mi)) (recur (u- mi d) (u- n 1) best bo))))))
-
 (defun hc-tail (sp: ptr iend: i64 anchor: i64 dp: ptr op: i64) -> i64 (put-seq sp anchor (u- iend anchor) dp op 0 0))
-
-(defun hc-search (sp: ptr lo: i64 iend: i64 dp: ptr ht: ptr ct: ptr st: ptr gen: i64 depth: i64 ip0: i64 anchor0: i64) -> i64
-  (let [mf1 (u+ (u- iend mf-limit) 1) mlim (u- iend last-lits)]
-    (loop [ip ip0 anchor anchor0 op 0 cur -1]
-      (if (>= ip mf1) (hc-tail sp iend anchor dp op)
-        (let [m (if (>= cur 0) cur (do (hc-insert sp ht ct st gen lo ip) (hc-find sp ht ct gen lo ip mlim depth 3)))
-              len (bit-and m 4294967295)]
-          (if (= len 0) (recur (u+ ip 1) anchor op -1)
-            (let [m2 (if (and (< len hc-sufficient) (< (u+ ip 1) mf1))
-                       (do (hc-insert sp ht ct st gen lo (u+ ip 1)) (hc-find sp ht ct gen lo (u+ ip 1) mlim depth (u+ len 1)))
-                       0)]
-              (if (> m2 0) (recur (u+ ip 1) anchor op m2)
-                (let [off (shr m 32) b (back-eq sp ip (u- ip off) anchor lo)
-                      op2 (put-seq sp anchor (u- (u- ip b) anchor) dp op off (u+ len b))
-                      nip (u+ ip len)]
-                  (if (>= nip mf1) (hc-tail sp iend nip dp op2) (recur nip nip op2 -1)))))))))))
-
-(defun hc-block (sp: ptr lo: i64 s0: i64 n: i64 dp: ptr ht: ptr ct: ptr st: ptr gen: i64 level: i64) -> i64
-  (if (< n 13) (put-seq sp s0 n dp 0 0 0)
-    (hc-search sp lo (u+ s0 n) dp ht ct st gen (hc-depth level) s0 s0)))

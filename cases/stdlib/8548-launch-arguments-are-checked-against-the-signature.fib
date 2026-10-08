@@ -1,0 +1,37 @@
+;; spec:   types §2.17 (the kernel subset), syntax §3.22 (defkernel); docs/design/gpu.md 3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; The launch ABI (gpu.md 4.5): the PTX header's signatures are parsed, and a launch with the wrong count or kind is an :arguments error naming the kernel and the position; a matching launch passes; a module with no header checks nothing; the grid and block checks.
+(ns main (:use tl.check) (:require [fib.gpu :as gpu]))
+(defstruct B (n: i64))
+(impl gpu/Buffer B
+  (buffer-bytes (self) (. self n)) (buffer-handle (self) 0)
+  (buffer-upload (self xs) (Ok ())) (buffer-download (self count) (Ok (array count 0.0f32)))
+  (buffer-upload-bytes (self xs) (Ok ())) (buffer-download-bytes (self count) (Ok (array count 0i8)))
+  (buffer-fill (self v) (Ok ())) (buffer-release (self) (Ok ())))
+(defun buf () -> (dyn gpu/Buffer) (dyn gpu/Buffer (B 16)))
+(defun kind-of (r: (Result unit gpu/GpuError)) -> keyword (match r ((Ok _) :ok) ((Err e) (. e kind))))
+(defun text-of (r: (Result unit gpu/GpuError)) -> str (match r ((Ok _) "") ((Err e) (. e message))))
+(defun main () -> i64
+  (let [c (checks)
+        sigs (gpu/parse-signatures "// fib.kernel-sig vadd: ptr ptr ptr i64\n// fib.kernel-sig k: ptr i32\n//\n.version 7.8\n")
+        vadd (unwrap-or (get sigs "vadd") [])
+        good (gpu/check-args "vadd" vadd [(gpu/ABuf (buf)) (gpu/ABuf (buf)) (gpu/ABuf (buf)) (gpu/AI64 4)])
+        few (gpu/check-args "vadd" vadd [(gpu/ABuf (buf)) (gpu/AI64 4)])
+        wrong (gpu/check-args "vadd" vadd [(gpu/ABuf (buf)) (gpu/ABuf (buf)) (gpu/ABuf (buf)) (gpu/AF32 4.0f32)])
+        none (gpu/check-args "cubin" [] [(gpu/AI32 1i32)])]
+    (do (check c (= (count sigs) 2))
+        (check c (= vadd ["ptr" "ptr" "ptr" "i64"]))
+        (check c (= (unwrap-or (get sigs "k") []) ["ptr" "i32"]))
+        (check c (= (kind-of good) :ok))
+        (check c (= (kind-of few) :arguments))
+        (check c (= (text-of few) "launch of vadd: 2 arguments for 4 parameters (ptr ptr ptr i64)"))
+        (check c (= (kind-of wrong) :arguments))
+        (check c (= (text-of wrong) "launch of vadd: argument 4 is float, the parameter is i64"))
+        (check c (= (kind-of none) :ok))
+        (check c (= (kind-of (gpu/check-dims "k" [0] [256] 1024)) :launch))
+        (check c (= (kind-of (gpu/check-dims "k" [4] [2048] 1024)) :launch))
+        (check c (= (kind-of (gpu/check-dims "k" [4 4] [16 16] 1024)) :ok))
+        (checks-result c))))

@@ -1,0 +1,36 @@
+;; spec: docs/design/compress.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; roots: ../../lib support
+;; compress-fd and decompress-fd over real files: with `threads` 3 the reads run ahead and the writes run behind in tasks of their own through bounded queues, and the file written is byte for byte
+;; the one the sequential call writes; the round trip gives the data back; a failing read (a closed fd) is an :io error, with every task joined.
+(ns main (:use tl.check fib.compress.lz4.mem) (:require [fib.compress :as z] [fib.compress.fd :as zfd] [fib.compress.lz4 :as lz4] [fib.os.files :as files] [fib.os.io :as io]))
+(defun payload () -> (Array i8)
+  (let [c (cell (array 5000000 0i8))] (do (dotimes (i 5000000) (array-set! &c i (trunc i8 (+ (rem (* i 11) 47) (if (= (rem i 997) 0) (quot i 997) 0))))) @c)))
+(defun open-r (p: str) -> i64 (match (files/open-file p (files/default-file-options)) ((Ok fd) fd) ((Err _) -1)))
+(defun open-w (p: str) -> i64 (match (files/open-file p (with (files/default-file-options) (access files/WriteOnly) (create true) (truncate true))) ((Ok fd) fd) ((Err _) -1)))
+(defun run-c (o: z/Options src: str dst: str) -> bool
+  (let [i (open-r src) w (open-w dst) r (zfd/compress-fd (lz4/lz4) o i w)] (do (io/close-fd i) (io/close-fd w) (match r ((Ok _) true) ((Err _) false)))))
+(defun run-d (o: z/Options src: str dst: str) -> bool
+  (let [i (open-r src) w (open-w dst) r (zfd/decompress-fd (lz4/lz4) o i w)] (do (io/close-fd i) (io/close-fd w) (match r ((Ok _) true) ((Err _) false)))))
+(defun bad-read? (o: z/Options dst: str) -> bool
+  (let [w (open-w dst) r (zfd/compress-fd (lz4/lz4) o -1 w)] (do (io/close-fd w) (match r ((Err e) (= (. e kind) :io)) ((Ok _) false)))))
+(defun slurp (p: str) -> (Array i8) (match (files/read-file-bytes p 100000000) ((Ok b) b) ((Err _) (array 0 0i8))))
+(defun main () -> i64
+  (let [c (checks) d (payload) o (z/with-independent (z/with-block-size (z/default-options) 65536) true)
+        src "/tmp/fib-case-8509-src" a "/tmp/fib-case-8509-a" b "/tmp/fib-case-8509-b" out "/tmp/fib-case-8509-out"]
+    (do (check c (match (files/write-file-bytes src d) ((Ok _) true) ((Err _) false)))
+        (check c (run-c (z/with-threads o 1) src a))
+        (check c (run-c (z/with-threads o 3) src b))
+        (check c (bytes-eq (slurp a) (slurp b)))
+        (check c (> (array-len (slurp a)) 1000))
+        (check c (run-d (z/with-threads o 3) b out))
+        (check c (bytes-eq (slurp out) d))
+        (check c (run-d (z/with-threads o 1) a out))
+        (check c (bytes-eq (slurp out) d))
+        (check c (bad-read? (z/with-threads o 3) a))
+        (check c (bad-read? (z/with-threads o 1) a))
+        (check c (not (run-d (z/with-threads o 3) src out)))
+        (files/remove-file src) (files/remove-file a) (files/remove-file b) (files/remove-file out)
+        (checks-result c))))

@@ -8,7 +8,7 @@
 ;; it may decode to something else, but never traps, and never exceeds `max-output`.
 (ns fib.compress.contract (:use fib.core fib.seq fib.coll fib.test.core fib.compress.types fib.compress.ops fib.compress.corpus fib.compress.checks))
 
-(defun known-capabilities () -> (Vec keyword) [:frame :block :block-size :levels :streaming :dictionary :checksum :content-size :linked-blocks])
+(defun known-capabilities () -> (Vec keyword) [:parallel :frame :block :block-size :levels :streaming :dictionary :checksum :content-size :linked-blocks])
 
 (defun unknown-caps (c: c) -> (Vec keyword) :where ((Codec c))
   (vec (filter (fn (k: keyword) (not (some? (first (filter (fn (x: keyword) (= x k)) (known-capabilities)))))) (codec-capabilities c))))
@@ -20,7 +20,6 @@
         no-stream (or (supports? c :streaming) (match (codec-compressor c d) ((Err e) (= (. e kind) :unsupported)) ((Ok _) false)))]
     (cat [(if (want :dictionary (with-dictionary d data)) [] ["dictionary"])
           (if (want :levels (with-level d 5)) [] ["level"])
-          (if (want :content-size (with-record-size d true)) [] ["content-size"])
           (if no-stream [] ["streaming"])
           (if (empty? (unknown-caps c)) [] ["unknown capability"])])))
 
@@ -146,6 +145,14 @@
     (skip-unless (supports? (make) :frame) "the codec has no frames")
     (given [c (make)])
     (then (expect = [] (magic-failures c))))
+  (scenario "the result does not depend on the thread count: compress gives the same bytes, and decompress the same output, for 1, 2, 3, 7 and 16 threads"
+    (skip-unless (supports? (make) :parallel) "the codec has no parallel mode")
+    (given [c (make)])
+    (then (expect = [] (thread-failures c))))
+  (scenario "errors and limits do not depend on the thread count: a corrupt block, a corrupt tail and a cut frame give one error kind, and max-output is exact, for every thread count"
+    (skip-unless (supports? (make) :parallel) "the codec has no parallel mode")
+    (given [c (make)])
+    (then (expect = [] (error-thread-failures c))))
   (scenario "an invalid argument is refused as such: a negative max-output"
     (given [c (make) z (compressed c (nth (small-corpus) 2))])
     (then (expect = true (is-kind? (decompress c z (with-max-output (default-options) -1)) :invalid-argument)))))

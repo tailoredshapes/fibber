@@ -1,0 +1,36 @@
+;; spec:   docs/design/observability-and-databases.md 2 (fib.log sinks), stdlib §4 (fib.os make-pipe read-fd write-all), types §8.8
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: spawn
+;; Several tasks write JSON lines to one pipe while a spawned thread drains it; every line arrives whole, and all of them arrive. The records are 2 KB each
+;; and there are 800 of them (1.6 MB), more than the largest pipe Linux allows (fs.pipe-max-size, 1 MiB), so a program that read the pipe only after the
+;; writers were joined would always deadlock: that was the shape of specs/log-spec.fib's probe, which hung the file on 2026-10-07 once the machine's pipe
+;; quota (fs.pipe-user-pages-soft) cut every new pipe to two pages; it was taken for a runtime regression and was not one (the 0.1.11 release hung on
+;; it too). The writers are pool tasks (with-tasks), the reader an OS thread (spawn), as the spec's probe now does.
+(ns main (:use fib.core fib.seq fib.coll fib.log fib.parallel fib.async tl.check)
+  (:require [fib.os :as os] [fib.string :as string]))
+
+(defun drain (fd: i64) -> str
+  (loop [out ""]
+    (match (os/read-fd fd 65536)
+      ((Ok b) (if (= (array-len b) 0) out (recur (str out (str-from-bytes b)))))
+      ((Err _) out))))
+
+(defun whole-json? (l: str) -> bool
+  (and (> (str-len l) 2000) (string/starts-with? l "{\"ts\":") (string/ends-with? l "}")))
+
+(defun main () -> i64
+  (let [c (checks)
+        p (match (os/make-pipe) ((Ok p) p) ((Err e) (trap (. e message)))) r (. p fst) w (. p snd)
+        payload (string/join "" (repeat 2000 "x"))
+        lg (get-logger (log-system (json-lines w) (LevelTable INFO [])) "app")
+        drainer (spawn (fn () (let [text (drain r)] (do (os/close-fd r) text))))]
+    (do (with-tasks [s] (do (dotimes (t 4) (fork s (fn () (dotimes (i 200) (info lg payload :task t :i i))))) ()))
+        (os/close-fd w)
+        (let [lines (vec (filter (fn (l: str) (> (str-len l) 0)) (string/split (join drainer) "\n")))]
+          (do (check c (= (count lines) 800))
+              (check c (every? whole-json? lines))
+              (checks-result c))))))

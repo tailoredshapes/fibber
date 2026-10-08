@@ -1,0 +1,46 @@
+;; The SAFETY PROOF of the fast decoder (lib/fib/compress/lz4/blockdec.fib: the slack condition `i <= ilim, op <= dlim`) as an executable check: the decoder reads nothing past the
+;; input length it is given and writes nothing outside the output range it is given, however the sequences fall near the two ends. The input side: a block is decoded from an array that
+;; goes on after the block with bytes that look like a valid offset (1 0 1 0 ..): a read past the end would make the last sequence take a match that is not there and the output would have
+;; extra bytes. The output side: the buffer is surrounded by 0xAA canaries and must come out with the data in the range and the canaries untouched, for blocks of text, random bytes, runs,
+;; patterns of every period from 1 to 20 (every small-offset path) and records, fast and HC, at 1500 sizes. `scripts/mutant-lz4.sh` plants a wrong limit on each side; this kills it.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.rng fib.compress.types fib.compress.corpus fib.compress.lz4 fib.compress.lz4.mem fib.compress.lz4.blockdec))
+
+(defun gens () -> (Vec (fn (i64 i64) (Array i8)))
+  [(fn (seed: i64 n: i64) (text seed n)) (fn (seed: i64 n: i64) (random-bytes seed n)) (fn (seed: i64 n: i64) (runs seed n))
+   (fn (seed: i64 n: i64) (pattern seed (+ 1 (rem seed 20)) n)) (fn (seed: i64 n: i64) (records seed n)) (fn (seed: i64 n: i64) (run-noise seed n))])
+
+(defun block-of (d: (Array i8) hc: bool) -> (Array i8) (if hc (block-compress-hc d 4) (block-compress d 1)))
+
+;; The block decoded from inside a longer array: the garbage after it is `1 0 1 0 ..`.
+(defun input-side-ok? (d: (Array i8) hc: bool) -> bool
+  (let [z (block-of d hc) za (cat2 z (fill 64 (fn (i: i64) (if (= (rem i 2) 0) 1 0)))) out (array (+ (array-len d) 400) 0i8)
+        r (decode-block (data za) (array-len z) (data out) (array-len out) 0 0 (array-len d))]
+    (and (= r (array-len d)) (bytes-eq (array-copy out 0 (array-len d)) d))))
+
+(defun cat2 (a: (Array i8) b: (Array i8)) -> (Array i8)
+  (let [o (array (+ (array-len a) (array-len b)) 0i8)] (do (copy-exact (data o) 0 (data a) 0 (array-len a)) (copy-exact (data o) (array-len a) (data b) 0 (array-len b)) o)))
+
+;; The block decoded into dst[100, 100 + n + extra): nothing outside is written, the range holds the data.
+(defun output-side-ok? (d: (Array i8) hc: bool extra: i64) -> bool
+  (let [n (array-len d) dst (fill (+ n (+ 300 extra)) (fn (i: i64) -86)) z (block-of d hc)]
+    (match (block-decompress-into z dst 100 (+ n extra))
+      ((Err _) false)
+      ((Ok k) (and (= k n) (bytes-eq (array-copy dst 100 (+ 100 n)) d)
+                   (loop [i 0] (cond (>= i 100) true (not (= (array-get dst i) -86i8)) false :else (recur (+ i 1))))
+                   (loop [i (+ 100 (+ n extra))] (cond (>= i (array-len dst)) true (not (= (array-get dst i) -86i8)) false :else (recur (+ i 1)))))))))
+
+(defun failures (check: (fn (i64 i64 bool) bool) total: i64) -> i64
+  (let [g (rng-new 77)]
+    (loop [i 0 bad 0]
+      (if (>= i total) bad
+        (let [n (rng-below g 600) seed (+ 1 (rng-below g 100000)) hc (= (rng-below g 3) 0)]
+          (recur (+ i 1) (if (check seed n hc) bad (+ bad 1))))))))
+
+(defspecs specs
+  (feature "the decoder's slack proof"
+    (scenario "input side: 1500 blocks decoded from inside a longer array give exactly the data (nothing is read past the length)"
+      (then (expect = 0 (failures (fn (seed: i64 n: i64 hc: bool) (input-side-ok? ((nth (gens) (rem seed 6)) seed n) hc)) 1500))))
+    (scenario "output side: 1500 blocks decoded into a range with canaries around it leave every canary alone, with the range exact and with 40 bytes of room to spare"
+      (then (expect = 0 (failures (fn (seed: i64 n: i64 hc: bool) (let [d ((nth (gens) (rem seed 6)) seed n)] (and (output-side-ok? d hc 0) (output-side-ok? d hc 40)))) 1500))))))
+
+(defun main () -> i64 (run-main (specs)))

@@ -126,11 +126,11 @@
           ((Ok t) (recur (+ i 1) (conj out t)))))))
 
 ;; The modifiers at the front of a form and how many words they took.
-(defstruct Mods (linkage: LLinkage hidden: bool used: i64))
+(defstruct Mods (linkage: LLinkage hidden: bool used: i64 shared: bool))
 
 ;; The linkage word a modifier names, nil for `hidden` or a non-modifier; the second answer is whether it is a modifier at all.
 (defun modifier-code :private (word: str) -> i64
-  (cond (= word "private") 0 (= word "internal") 1 (= word "external") 2 (= word "hidden") 3 :else -1))
+  (cond (= word "private") 0 (= word "internal") 1 (= word "external") 2 (= word "hidden") 3 (= word "shared") 4 :else -1))
 
 (defun linkage-of :private (code: i64) -> LLinkage
   (cond (= code 0) lk-private (= code 1) lk-internal :else lk-external))
@@ -140,18 +140,19 @@
 
 ;; The linkage and visibility words at the front of `items`, and how many they took (spec/lir.md 4.3). (items.rs `modifiers`)
 (defun modifiers :private (items: (Vec Sexp)) -> (Result Mods Diagnostic)
-  (loop ((i 0) (linkage lk-external) (seen false) (hidden false))
+  (loop ((i 0) (linkage lk-external) (seen false) (hidden false) (shared false))
     (let ((word (if (< i (count items)) (atom-or-empty (nth items i)) ""))
           (code (modifier-code (if (< i (count items)) (atom-or-empty (nth items i)) ""))))
       (if (< code 0)
-          (Ok (Mods linkage hidden i))
+          (Ok (Mods linkage hidden i shared))
           (let ((is-linkage (< code 3))
-                (dup (if (< code 3) seen hidden)))
+                (dup (cond (< code 3) seen (= code 3) hidden :else shared)))
             (cond (and dup is-linkage (not (= (linkage-of code) linkage)))
                   (err (sexp-pos (nth items i)) (str (linkage-word linkage) " and " word " exclude each other"))
                   dup (err (sexp-pos (nth items i)) (str "duplicate modifier " word))
-                  is-linkage (recur (+ i 1) (linkage-of code) true hidden)
-                  :else (recur (+ i 1) linkage seen true)))))))
+                  is-linkage (recur (+ i 1) (linkage-of code) true hidden shared)
+                  (= code 3) (recur (+ i 1) linkage seen true shared)
+                  :else (recur (+ i 1) linkage seen hidden true)))))))
 
 ;; Whether any of the first n items is the atom `external`.
 (defun has-external? :private (items: (Vec Sexp) n: i64) -> bool
@@ -163,19 +164,21 @@
 ;; A `declare` or `declare-global` takes `hidden` only. (items.rs `declared_hidden`)
 (defun declared-hidden :private (op: str items: (Vec Sexp)) -> (Result Mods Diagnostic)
   (try-let ((m (modifiers items)))
-    (if (or (not (= (. m linkage) lk-external)) (has-external? items (. m used)))
-        (err (sexp-pos (nth items 0)) (str op " cannot be " (linkage-word (. m linkage))))
-        (Ok m))))
+    (cond (. m shared) (err (sexp-pos (nth items 0)) (str op " cannot be shared"))
+          (or (not (= (. m linkage) lk-external)) (has-external? items (. m used)))
+          (err (sexp-pos (nth items 0)) (str op " cannot be " (linkage-word (. m linkage))))
+          :else (Ok m))))
 
 (defun global :private (rest: (Vec Sexp) pos: i64 constant: bool) -> (Result LItem Diagnostic)
   (let ((op (if constant "constant" "global")))
     (try-let ((m (modifiers rest)))
       (let ((body (vec-from rest (. m used))))
         (try-let ((_ (arity op body 3 pos))
+                  (_ (if (and constant (. m shared)) (err pos "constant cannot be shared: shared memory is written by the block") (Ok ())))
                   (name (global-name (nth body 0)))
                   (ty (parse-type (nth body 1)))
                   (init (parse-expr (nth body 2))))
-          (Ok (ItGlobal (LGlobalDef name ty init constant (LModifiers (. m linkage) (. m hidden)) pos))))))))
+          (Ok (ItGlobal (LGlobalDef name ty init constant (LModifiers (. m linkage) (. m hidden)) pos (. m shared)))))))))
 
 (defun declare-global :private (rest: (Vec Sexp) pos: i64) -> (Result LItem Diagnostic)
   (try-let ((m (declared-hidden "declare-global" rest)))
@@ -197,7 +200,8 @@
           (Ok (ItDeclare (LDeclare name (LFnType (. split cc) ret (. ps types) (. ps varargs)) (. m hidden) pos))))))))
 
 (defun define :private (rest: (Vec Sexp) pos: i64) -> (Result LItem Diagnostic)
-  (try-let ((m (modifiers rest)))
+  (try-let ((m (modifiers rest))
+            (_ (if (. m shared) (err pos "define cannot be shared: shared is for a global of a kernel") (Ok ()))))
     (let ((after (vec-from rest (. m used)))
           (split (parse-cc (vec-from rest (. m used)))))
       (let ((body (vec-from after (. split used))))

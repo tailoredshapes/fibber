@@ -33,7 +33,7 @@ for mode in "${modes[@]}"; do
                   targets=("$cases/arith-edges.lir") ;;
     strict-alias) sed -i 's|__attribute__((may_alias" (if unaligned ", aligned(1)" "") "))|__attribute__((" (if unaligned "aligned(1)" "") "))|' "$d/c/cx.fib"
                   targets=("$cases/alias-align.lir") ;;
-    musttail)     sed -i 's|(cond must (emit! cf (str "__attribute__((musttail)) return " text ";"))|(cond (and must false) (emit! cf (str "__attribute__((musttail)) return " text ";")) must (emit! cf (str "return " text ";"))|' "$d/c/func.fib"
+    musttail)     sed -i 's|(emit! cf (str "__attribute__((musttail)) return " text ";"))|(emit! cf (str "return " text ";"))|' "$d/c/func.fib"
                   targets=("$cases/tail-lanes.lir" "$root/cases/lir/audit/t-cf.lir" "$root/cases/lir/audit/t-tail-many-tailcc.lir") ;;
     atomic-order) sed -i 's|((OSeqCst) "__ATOMIC_SEQ_CST")|((OSeqCst) "__ATOMIC_RELAXED")|' "$d/c/mem.fib"
                   targets=() ;;

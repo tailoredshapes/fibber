@@ -27,15 +27,24 @@
         h4 (loop [q i h h0] (if (<= (u+ q 4) end) (recur (u+ q 4) (mul (rotl (m32 (u+ h (mul (rd32 p q) p3))) 17) p4)) h))]
     (avalanche (bytes-tail p k end h4))))
 
+;; ---- the four accumulators as one i32x4: a stripe of 16 bytes is one vector load, a multiply, an add, a rotate and a multiply (the lane arithmetic wraps: `unchecked-`).
+(defun vs (x: i64) -> (Simd i32 4) (splat (Simd i32 4) (trunc i32 x)))
+(defun vround (acc: (Simd i32 4) inp: (Simd i32 4)) -> (Simd i32 4)
+  (let [a (unchecked-add acc (unchecked-multiply inp (vs p2)))
+        r (bit-or (shl a (vs 13)) (shr a (vs 19)))]
+    (unchecked-multiply r (vs p1))))
+(defun vstripes (p: ptr i0: i64 n: i64 acc0: (Simd i32 4)) -> (Simd i32 4)
+  (loop [i i0 acc acc0] (if (<= (u+ i 16) n) (recur (u+ i 16) (vround acc (unsafe (load-simd (ptr+ p i))))) acc)))
+(defun vinit (seed: i64) -> (Simd i32 4)
+  (with-lane (with-lane (with-lane (vs seed) 0 (trunc i32 (u+ (u+ seed p1) p2))) 1 (trunc i32 (u+ seed p2))) 3 (trunc i32 (u- seed p1))))
+(defun lane32 (v: (Simd i32 4) k: i64) -> i64 (zext i64 (lane v k)))
+(defun vsum (v: (Simd i32 4)) -> i64
+  (u+ (u+ (rotl (lane32 v 0) 1) (rotl (lane32 v 1) 7)) (u+ (rotl (lane32 v 2) 12) (rotl (lane32 v 3) 18))))
+
 (defun xxh32-ptr (p: ptr len: i64 seed: i64) -> i64
   (if (>= len 16)
-    (let [lim (u- len 16)
-          r (loop [i 0 v1 (m32 (u+ (u+ seed p1) p2)) v2 (m32 (u+ seed p2)) v3 seed v4 (m32 (u- seed p1))]
-              (if (<= i lim)
-                (recur (u+ i 16) (round v1 (rd32 p i)) (round v2 (rd32 p (u+ i 4))) (round v3 (rd32 p (u+ i 8))) (round v4 (rd32 p (u+ i 12))))
-                (u+ (u+ (rotl v1 1) (rotl v2 7)) (u+ (rotl v3 12) (rotl v4 18)))))
-          i16 (shl (shr len 4) 4)]
-      (tail p i16 len (m32 (u+ r len))))
+    (let [acc (vstripes p 0 len (vinit seed)) i16 (shl (shr len 4) 4)]
+      (tail p i16 len (m32 (u+ (vsum acc) len))))
     (tail p 0 len (m32 (u+ (u+ seed p5) len)))))
 
 (defun xxh32-range (a: (Array i8) off: i64 len: i64 seed: i64) -> i64 (xxh32-ptr (ptr-at a off) len seed))
@@ -64,9 +73,16 @@
     (do (when (> tk 0) (copy-exact tp held p 0 tk))
         (if (and (> held 0) (= (u+ held tk) 16))
           (do (xxh-stripe x tp 0) (xset x 5 0)) (xset x 5 (u+ held tk)))
-        (let [i (loop [i tk] (if (<= (u+ i 16) n) (do (xxh-stripe x p i) (recur (u+ i 16))) i))
+        (let [acc (vstripes p tk n (xload x))
+              i (u+ tk (shl (shr (u- n tk) 4) 4))
               left (u- n i)]
-          (when (> left 0) (do (copy-exact tp (xw x 5) p i left) (xset x 5 (u+ (xw x 5) left))))))))
+          (do (xstore x acc)
+              (when (> left 0) (do (copy-exact tp (xw x 5) p i left) (xset x 5 (u+ (xw x 5) left)))))))))
+
+(defun xload (x: Xxh) -> (Simd i32 4)
+  (with-lane (with-lane (with-lane (with-lane (vs 0) 0 (trunc i32 (xw x 0))) 1 (trunc i32 (xw x 1))) 2 (trunc i32 (xw x 2))) 3 (trunc i32 (xw x 3))))
+(defun xstore (x: Xxh v: (Simd i32 4)) -> unit
+  (do (xset x 0 (lane32 v 0)) (xset x 1 (lane32 v 1)) (xset x 2 (lane32 v 2)) (xset x 3 (lane32 v 3))))
 
 (defun xxh-update! (x: Xxh a: (Array i8) off: i64 len: i64) -> unit (xxh-feed x (ptr-at a off) len))
 

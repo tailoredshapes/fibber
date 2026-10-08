@@ -70,6 +70,8 @@ if [ "$mode" = full ]; then
   queue gen-planted "$t/gen/planted.sh"
   queue js-backend "$t/js/check.sh" "$out/js"
   queue deps "$t/deps/run.sh" "$FIBC"
+  # the kernel target (docs/design/gpu.md): the PTX of examples/gpu, the kernel checker's refusals, the host run of the kernels; no GPU needed
+  queue sh-native-gpu-emit env F="$FIBC" "$t/native/gpu-emit.sh"
 fi
 wait
 bad=0

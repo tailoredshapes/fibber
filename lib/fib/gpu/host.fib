@@ -1,0 +1,41 @@
+;; fib.gpu.host: a kernel on the host (docs/design/gpu.md 3.5, the one-language guard). A `defkernel` is an ordinary function too: `host-launch`
+;; runs it over a grid on the CPU, one thread after another, setting the index space the `gpu/*` builtins read on the host (`gpu/local-id`,
+;; `gpu/group-id`, `gpu/group-size`, `gpu/num-groups`, `gpu/global-id`), so the same kernel called here gives what the device gives, element
+;; for element, for every kernel that does not need another thread's write before a `gpu/barrier` (the host barrier is nothing: threads run
+;; to completion in order; a shared-memory kernel staged through a barrier reproduces on the host only when each thread reads what it wrote).
+;; Outside `host-launch` the ids are 0 and the sizes 1: a kernel called plainly is its thread (0,0,0) of a 1x1x1 grid.
+;; The element accessors are the kernel subset's: a `ptr` indexed by element (no check: the host sizes the grid, gpu.md 3.2).
+(ns fib.gpu.host (:use fib.core fib.seq fib.coll))
+
+(defun dim :private (v: (Vec i64) i: i64) -> i64 (if (< i (count v)) (nth v i) 1))
+
+(defun set-dims :private (slot: i64 v: (Vec i64)) -> unit
+  (do (gpu/host-index-set! slot 0 (dim v 0)) (gpu/host-index-set! slot 1 (dim v 1)) (gpu/host-index-set! slot 2 (dim v 2))))
+
+;; Runs `body` once per thread of `grid` blocks of `block` threads (one to three dimensions each), in order (z, y, x of the group, then z,
+;; y, x of the thread), with the index space set for it; the index space is reset after (ids 0, sizes 1).
+(defun host-launch (grid: (Vec i64) block: (Vec i64) body: (fn () unit) :borrow) -> unit
+  (do (set-dims 9 grid) (set-dims 6 block)
+      (dotimes (gz (dim grid 2))
+        (dotimes (gy (dim grid 1))
+          (dotimes (gx (dim grid 0))
+            (do (gpu/host-index-set! 3 0 gx) (gpu/host-index-set! 3 1 gy) (gpu/host-index-set! 3 2 gz)
+                (dotimes (tz (dim block 2))
+                  (dotimes (ty (dim block 1))
+                    (dotimes (tx (dim block 0))
+                      (do (gpu/host-index-set! 0 0 tx) (gpu/host-index-set! 0 1 ty) (gpu/host-index-set! 0 2 tz)
+                          (body)))))))))
+      (set-dims 0 [0 0 0]) (set-dims 3 [0 0 0]) (set-dims 6 [1 1 1]) (set-dims 9 [1 1 1])))
+
+;; Element `i` of a buffer of f32 at `p`, and the store of one (`gpu/f32-at`, `gpu/f32-set!` in a kernel: in the subset, no allocation).
+(defun f32-at (p: ptr i: i64) -> f32 (unsafe (load-f32 (ptr+ p (unchecked-multiply 4 i)))))
+(defun f32-set! (p: ptr i: i64 v: f32) -> unit (unsafe (store-f32 (ptr+ p (unchecked-multiply 4 i)) v)))
+(defun f64-at (p: ptr i: i64) -> f64 (unsafe (load-f64 (ptr+ p (unchecked-multiply 8 i)))))
+(defun f64-set! (p: ptr i: i64 v: f64) -> unit (unsafe (store-f64 (ptr+ p (unchecked-multiply 8 i)) v)))
+(defun i32-at (p: ptr i: i64) -> i32 (unsafe (load-i32 (ptr+ p (unchecked-multiply 4 i)))))
+(defun i32-set! (p: ptr i: i64 v: i32) -> unit (unsafe (store-i32 (ptr+ p (unchecked-multiply 4 i)) v)))
+(defun i64-at (p: ptr i: i64) -> i64 (unsafe (load-i64 (ptr+ p (unchecked-multiply 8 i)))))
+(defun i64-set! (p: ptr i: i64 v: i64) -> unit (unsafe (store-i64 (ptr+ p (unchecked-multiply 8 i)) v)))
+
+;; The data of a host array of f32 as a raw pointer (after the 24-byte header, spec/types.md 8.2): what a host run of a kernel takes.
+(defun array-data (xs: (Array f32)) -> ptr (unsafe (ptr+ (raw xs) 24)))

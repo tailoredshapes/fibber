@@ -2,7 +2,7 @@
 ;; `explain` (spec/compiler.md §1): each takes what the command line gave and the roots, prints what the Rust prints and returns
 ;; the exit status. The macro runner (`rm`, expand.maker) is the tool's: macros.runner by default, none with `--no-runner` (driver.front).
 (ns driver.commands
-  (:require [types.targets :as tt] [driver.front :as front] [expand.maker :as mk] [driver.native :as native] [driver.linkdecl :as ld] [driver.staticrun :as sr] [driver.viac :as viac] [emit.args :as ea] [emit.dump :as ed] [own.explain :as oe])
+  (:require [types.targets :as tt] [llvm.target :as lt] [driver.front :as front] [expand.maker :as mk] [driver.native :as native] [driver.linkdecl :as ld] [driver.staticrun :as sr] [driver.viac :as viac] [emit.args :as ea] [emit.dump :as ed] [own.explain :as oe])
   (:use expand.roots driver.args))
 
 ;; The message and status of a lIR module that lair stopped at. Rust: main.rs `fail`
@@ -60,24 +60,79 @@
 
 ;; `build`: the executable. A directory that cannot be read is refused first, before anything is compiled, then a target outside ADR 0008.
 ;; Rust: main.rs:200 `build`
-(defun cmd-build (file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64 emit: str roots: Roots rm: mk/RunnerMaker) -> i64
+(defun cmd-build (file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64 emit: str kernel: str roots: Roots rm: mk/RunnerMaker) -> i64
   (match (first (filter (fn (d: str) (not (native/readable-dir? d))) dirs))
     ((some d) (do (eprintln (str-join ["fibc: -L " d ": not a directory that can be read"])) front/exit-usage))
     (nil (if-some [r (refused-target)]
            (do (eprintln (str-join ["fibc: " (. r triple) " is not a supported target (" (tt/support-text r) "; docs/adr/0008-supported-isas-have-guaranteed-tail-calls-and-fma.md): "
                                     "its code would lack a guaranteed tail call or a fused multiply-add; --allow-unsupported builds it anyway"]))
                front/exit-usage)
-           (build-checked file out dirs libs opt emit roots rm)))))
+           (build-checked file out dirs libs opt emit kernel roots rm)))))
 
-(defun build-checked :private (file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64 emit: str roots: Roots rm: mk/RunnerMaker) -> i64
-  (match (front/lower-kind file roots rm true)
-    ((Err code) code)
-    ((Ok lir)
-     (cond (= emit "c") (match (viac/emit-c lir file out) ((Err m) (compile-failed m)) ((Ok _) 0))
-           (= emit "exe") (build-exe lir file out opt dirs libs)
-           :else (match (native/emit-lir lir out opt emit)
-                   ((Err m) (compile-failed m))
-                   ((Ok _) 0))))))
+;; The kernel target of the build (docs/design/gpu.md 4.4): `--kernel-target`, else FIB_KERNEL_TARGET; "" or "none" is none.
+(defun kernel-target-of :private (kernel: str) -> str
+  (let ((k (if (= kernel "") (unwrap-or (native/getenv-opt "FIB_KERNEL_TARGET") "") kernel)))
+    (if (= k "none") "" k)))
+
+;; The kernels a lowered program has, from its kernel table (`(constant internal fib.kernel.NAME ptr @F)`, emit.compile): their names.
+(defun kernels-in (lir: str) -> (Vec str)
+  (let ((mark "(constant internal fib.kernel."))
+    (loop ((from 0) (out []))
+      (match (str-find lir mark from)
+        (nil out)
+        ((some i) (let ((s (+ i (str-len mark))))
+                    (match (str-find lir " " s)
+                      (nil out)
+                      ((some j) (recur j (conj out (str-slice lir s j)))))))))))
+
+(defun platform-name :private () -> str
+  (match (native/getenv-opt "FIB_TARGET_TRIPLE")
+    ((some t) (if (or (= t "") (= t "host")) (lt/host-triple) t))
+    (nil (lt/host-triple))))
+
+(defun build-checked :private (file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64 emit: str kernel: str roots: Roots rm: mk/RunnerMaker) -> i64
+  (let ((kt (kernel-target-of kernel)))
+    (cond (not (= emit "exe"))
+          (match (front/lower-kind file roots rm true)
+            ((Err code) code)
+            ((Ok lir) (if (= emit "c")
+                          (match (viac/emit-c lir file out) ((Err m) (compile-failed m)) ((Ok _) 0))
+                          (match (native/emit-lir lir out opt emit) ((Err m) (compile-failed m)) ((Ok _) 0)))))
+          (not (= kt "")) (build-with-kernels file out dirs libs opt kt roots rm)
+          :else
+          (match (front/lower-kind file roots rm true)
+            ((Err code) code)
+            ((Ok lir)
+             (let ((ks (kernels-in lir)))
+               (if (empty? ks)
+                   (build-exe lir file out opt dirs libs)
+                   (do (eprintln (str-join ["fibc: the program has the kernel" (if (= (count ks) 1) " " "s ") (str-join-with ", " ks)
+                                            " (defkernel) and " (platform-name) " has no kernel target: build with --kernel-target nvptx64-nvidia-cuda "
+                                            "(or FIB_KERNEL_TARGET), which embeds the kernels' PTX for a driver; there is no CPU fallback for a kernel (docs/design/gpu.md 4.4)"]))
+                       front/exit-usage))))))))
+
+(defun str-join-with :private (sep: str xs: (Vec str)) -> str
+  (reduce (fn (acc: str x: str) (if (= acc "") x (str-join [acc sep x]))) "" xs))
+
+;; An executable with its kernels for the kernel target `kt` (docs/design/gpu.md 4.4): the program is lowered for `kt` (every pass, the kernel
+;; checker among them) and its kernel module written as PTX to OUT.ptx (with the signature header, the launch ABI), then lowered for the host
+;; with FIB_KERNEL_PTX naming that file, so that `(gpu/program-ptx)` is the PTX text embedded in the executable.
+(defun build-with-kernels :private (file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64 kt: str roots: Roots rm: mk/RunnerMaker) -> i64
+  (let ((host (unwrap-or (native/getenv-opt "FIB_TARGET_TRIPLE") "host")) (ptx (str-join [out ".ptx"])))
+    (if (not (tt/kernel-triple? (some kt)))
+        (do (eprintln (str-join ["fibc: --kernel-target " kt ": not a kernel target (`fibc targets` lists nvptx64-nvidia-cuda as one; docs/design/gpu.md)"])) front/exit-usage)
+        (do (native/setenv-set "FIB_TARGET_TRIPLE" kt)
+            (match (front/lower-kind file roots rm true)
+              ((Err code) (do (native/setenv-set "FIB_TARGET_TRIPLE" host) code))
+              ((Ok klir)
+               (match (native/emit-lir klir ptx opt "ptx")
+                 ((Err m) (do (native/setenv-set "FIB_TARGET_TRIPLE" host) (compile-failed m)))
+                 ((Ok _)
+                  (do (native/setenv-set "FIB_TARGET_TRIPLE" host)
+                      (native/setenv-set "FIB_KERNEL_PTX" ptx)
+                      (match (front/lower-kind file roots rm true)
+                        ((Err code) code)
+                        ((Ok lir) (build-exe lir file out opt dirs libs))))))))))))
 
 ;; The executable of `lir`: the libraries its modules declare (driver.linkdecl) are linked by the mode of the build, after the `-l` the command line gave; a link that fails
 ;; for one of them names the module that needs it. `--via c` builds it through the C compiler (driver.viac) instead of LLVM.
