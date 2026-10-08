@@ -1,0 +1,35 @@
+# The benchmark node's work volume and loader pod (make k8s-apply-bench). The node is the Ryzen 7 5800X's WSL2 Ubuntu, joined by k8s/node-agent.sh,
+# labelled fibber/role=bench and tainted fibber=bench:NoSchedule: only a job with K8S_POOL=bench (which tolerates that taint and selects the label) lands there.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: work-bench
+  namespace: fibber-ci
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources: {requests: {storage: 20Gi}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: loader-bench
+  namespace: fibber-ci
+  labels: {fibber/role: loader}
+spec:
+  priorityClassName: fibber-ci-low
+  restartPolicy: Always
+  nodeSelector: {kubernetes.io/arch: amd64, fibber/role: bench}
+  tolerations: [{key: fibber, operator: Equal, value: bench, effect: NoSchedule}]
+  securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+  containers:
+    - name: loader
+      image: busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+      command: [sleep, "2592000"]
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+        limits: {cpu: 100m, memory: 128Mi}
+      volumeMounts: [{name: work, mountPath: /work}]
+  volumes:
+    - name: work
+      persistentVolumeClaim: {claimName: work-bench}

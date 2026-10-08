@@ -1,0 +1,35 @@
+# The arm64 node's work volume and loader pod (make k8s-apply-arm64; the node is joined by k8s/node-agent-arm64.sh, docs/design/build.md).
+# The node is labelled fibber/role=arm64-ci and tainted fibber=ci:NoSchedule, so only pods that tolerate it (the fibber-ci jobs do) land there.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: work-arm64
+  namespace: fibber-ci
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources: {requests: {storage: 40Gi}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: loader-arm64
+  namespace: fibber-ci
+  labels: {fibber/role: loader}
+spec:
+  priorityClassName: fibber-ci-low
+  restartPolicy: Always
+  nodeSelector: {kubernetes.io/arch: arm64, fibber/role: arm64-ci}
+  tolerations: [{key: fibber, operator: Equal, value: ci, effect: NoSchedule}]
+  securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+  containers:
+    - name: loader
+      image: busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+      command: [sleep, "2592000"]
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+        limits: {cpu: 100m, memory: 128Mi}
+      volumeMounts: [{name: work, mountPath: /work}]
+  volumes:
+    - name: work
+      persistentVolumeClaim: {claimName: work-arm64}

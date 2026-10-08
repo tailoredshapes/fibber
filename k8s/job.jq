@@ -1,5 +1,5 @@
 # The Job template (rendered by mk/k8s.mk: `jq -n --arg name .. -f k8s/job.jq | kubectl apply -f -`; JSON so that a command needs no quoting).
-# Arguments: name kind arch cmd image cpu mem ttl deadline parallelism(0 = a plain job) shards(0 = not indexed) pvc
+# Arguments: pool (amd64, arm64 or bench: picks the node pool, its taint and its volume) name kind arch cmd image cpu mem ttl deadline parallelism(0 = a plain job) shards(0 = not indexed) pvc
 {
   apiVersion: "batch/v1",
   kind: "Job",
@@ -13,8 +13,8 @@
       spec: {
         priorityClassName: "fibber-ci-low",
         restartPolicy: "Never",
-        nodeSelector: {"kubernetes.io/arch": $arch},
-        tolerations: [{key: "fibber", operator: "Equal", value: "ci", effect: "NoSchedule"}],
+        nodeSelector: ({"kubernetes.io/arch": $arch} + (if $pool == "bench" then {"fibber/role": "bench"} else {} end)),
+        tolerations: [{key: "fibber", operator: "Equal", value: (if $pool == "bench" then "bench" else "ci" end), effect: "NoSchedule"}],
         securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000},
         containers: [{
           name: "ci",
