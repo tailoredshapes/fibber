@@ -456,7 +456,7 @@ Not done, and why the colour stays a possible later step: the share walk at hand
 
 ---
 
-## 8. P-sched as built (`fork-task`, `rt/sched.lir`, `rt/deque.lir`, 2026-10-07)
+## 8. P-sched as built (`fork-task`, `rt/sched.lir`, `rt/park.lir`, `rt/deque.lir`, 2026-10-07)
 
 **The oversight.** Section 3.1 designed the pool and the plan table sized it (row P-sched); P-struct, P-count-a/b, P-det and P-tensor were built on `spawn` threads "so P-sched replaces the backend", and P-sched itself was never started. `lib/fib/parallel/chunks.fib` ran W OS-thread tasks with a fixed stride and its header said the pool tier would bound nesting. This section is the fix.
 
@@ -466,9 +466,9 @@ Not done, and why the colour stays a possible later step: the share walk at hand
 | per-worker Chase-Lev deques, ring 4096, overflow runs inline | the orderings of `cl.lir` unchanged, slots stored release and loaded acquire (TSAN ignores standalone fences; same code on x86); a full ring runs the task at the fork | `rt/deque.lir` |
 | injector for non-workers | a list under a spinlock | `rt/deque.lir` |
 | random-victim stealing | own deque, injector, two random victims, then a sweep | `fib.sched-find` |
-| eventcount parking | epoch word, sleepers count, one mutex and condvar; 32 yield rounds, then announce, `seq_cst` fence, re-check for work, sleep; a fork signals only when `sleepers > 0` | `fib.sched-idle`, `-announce`, `-signal`, `-sleep` |
+| eventcount parking | epoch word, sleepers count, one mutex and condvar; 32 yield rounds (`FIB_SPIN`), then announce, `seq_cst` fence, re-check for work, sleep; a fork signals only when `sleepers > 0` **and no worker is in its spin phase** (`FIB_SCHED_SKIP`, default 1: 14 us to 0.65 us per fork-join on WSL2); a joiner spins 3000 loads on the task's state before it parks | `rt/park.lir`, `fib.sched-idle` |
 | help-while-waiting join | a worker claims the joined task and runs it, else runs other work, else parks on the task (a waiter node whose word is 1); depth bound 4000 tasks; a non-worker parks (in a catching program it runs the task itself when it can claim it); no workers (wasm): inline | `fib.sched-join`, `-wait` |
-| lazy start, worker count | first `fork-task`; `FIB_THREADS`, else `sched_getaffinity` capped by cgroup v2 `cpu.max`, 1 to 256; a program with no parallel work pays nothing (no thread, no allocation; hello world's binary grows only by the code of the unused functions) | `fib.sched-start`, `-count` |
+| lazy start, worker count | first `fork-task`; `FIB_THREADS`, else `sched_getaffinity` capped by cgroup v2 `cpu.max`, 1 to 256; a program with no parallel work pays nothing (no thread, no allocation: hello world is 36 872 bytes, 80 fewer than before, and its only thread is the one it had) | `fib.sched-start`, `-count` |
 | `(blocking ..)` | macro in `fib.parallel`: starts one more worker (up to W more) for the duration | `fib.sched-block-enter` |
 | trap policy | catching program (ADR 0009): the runner runs the closure under its own catch, the trap is the task's failure on any thread, no thread dies. Otherwise: the worker's chain of tasks all fail with the message (a joiner helping inside would trap on it), their deque counts are released, the worker is replaced, `trap in task: MESSAGE` once | `fib.sched-fail`, `-failed`, `pool-entry` |
 | stack guard per worker | `fib.guard-enter` in the worker entry, as a spawned thread's | `fib.sched-worker` |
