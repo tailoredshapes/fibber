@@ -10,7 +10,7 @@
 #                  do not depend on the worker count; 7606's "more than one chunk at once" is skipped with one worker, which has none)
 # environment: FIBC (the fibc that builds the mutated stage 2; required), MUT_OUT (scratch, default ~/.cache/fibber-scratch/mutant-sched-MODE),
 #   LLVM_LIBDIR (default /usr/lib/llvm-21/lib). Builds and runs under `ulimit -v 16000000`.
-# exit: 0 when every case failed under the mutant (or, for `check`, every check held), 1 otherwise, 2 for a setup error.
+# exit: 0 when at least one detector (a case or a stress run) failed under the mutant (or, for `check`, every check held), 1 otherwise, 2 for a setup error.
 #
 # The modes and what they plant (the design's rows in docs/design/parallelism.md 5, P-sched):
 #   steal-no-cas       M1 of cl.lir: steal takes the item without the compare-and-swap on top: two thieves take one task (a task run twice:
@@ -22,8 +22,9 @@
 #                      that then sleeps; with two workers a storm of forks from main hangs (the timeout kills it)
 #   complete-no-fence  the seq_cst fence between a completion's store of the state and its load of the waiters is removed: a joiner that
 #                      registered between the two is never woken (a storm from main hangs)
-#   park-not-help      a worker that cannot run the task it joins parks instead of helping: every worker inside a join, the deques full of
-#                      children nobody runs: the fork-join tree deadlocks
+#   park-not-help      a join that neither runs the task itself nor helps with other work (the design's "deadlock" mutant): it parks; with every
+#                      worker inside a join and the children in the deques, nothing runs them and the fork-join tree deadlocks. (Parking instead of
+#                      helping alone does NOT deadlock: a join that runs its own unstarted child is deadlock-free by itself; measured, 2026-10-07.)
 #   run-unclaimed      a thief runs a task without claiming its driver: the joiner and the thief both run it
 #   complete-first     the pool runner (emit.lower.threads pool-entry) completes the task before it stores the result: a joiner reads zero
 set -uo pipefail
@@ -58,7 +59,7 @@ case $MODE in
   pop-fence-release) mut rt/deque.lir 's/\(atomic-store monotonic b bp\)\n      \(fence seq_cst\)/(atomic-store monotonic b bp)\n      (fence release)/'; expect_survive=1 ;;
   lost-wakeup)       mut rt/sched.lir 's/\(br \(call \@fib\.sched-any-work\) withdraw sleep\)\)\)\n  \(block withdraw \(atomicrmw sub seq_cst \@fib\.sched-sleepers \(i32 1\)\) \(br out\)\)/(br sleep)))\n  (block withdraw (atomicrmw sub seq_cst \@fib.sched-sleepers (i32 1)) (br out))/' ;;
   complete-no-fence) mut rt/sched.lir 's/\(atomic-store release \(i32 2\) \(getelementptr %struct\.fib\.task task \(i32 0\) \(i32 3\)\)\)\n      \(fence seq_cst\)/(atomic-store release (i32 2) (getelementptr %struct.fib.task task (i32 0) (i32 3)))/' ;;
-  park-not-help)     mut rt/sched.lir 's/\(block help\n    \(br \(icmp sge \(load i64 \(getelementptr i8 w \(i64 200\)\)\) \(load i64 \@fib\.sched-max-depth\)\) deep find\)\)/(block help\n    (br deep))/' ;;
+  park-not-help)     mut rt/sched.lir 's/\(br \(icmp sge \(load i64 \(getelementptr i8 w \(i64 200\)\)\) \(load i64 \@fib\.sched-max-depth\)\) deep find\)/(br (icmp sge (i64 0) (i64 0)) deep find)/'; mut rt/sched.lir 's/\(br \(call \@fib\.sched-claim-run task\) loop help\)/(br (icmp eq (i64 0) (i64 1)) loop help)/' ;;
   run-unclaimed)     mut rt/sched.lir 's/\(r \(cmpxchg acq_rel acquire dp \(i32 0\) \(i32 1\)\)\)\)\n      \(br \(extractvalue r 1\) claimed out\)\)\)\n  \(block claimed\n    \(br \(icmp ult/(r (cmpxchg acq_rel acquire dp (i32 0) (i32 1))))\n      (br claimed)))\n  (block claimed\n    (br (icmp ult/' ;;
   complete-first)    mut compiler/emit/lower/threads.fib 's/:else \(str-join \[head "      \(let \(" \(pool-call uw r\) "\)\\n" store finish "\)\)\)\)\\n"\]\)/:else (str-join [head "      (let (" (pool-call uw r) ")\\n      (call \@fib.sched-complete task prev)\\n" store "      (ret)))))\\n"])/' ;;
   check) ;;
@@ -76,23 +77,24 @@ export FIB_LIB=$T/lib
 cd "$T" || exit 2
 "$F" build scripts/tsan/sched.fib -o "$OUT/sched-k" > "$OUT/k.log" 2>&1 || { tail -3 "$OUT/k.log"; exit 2; }
 rc=0
+killed=0; survived=0
 # cases CASE-PREFIX.. : each must fail (or time out) under the mutant
 cases() {
   for p in "$@"; do
     out=$(timeout 120 "$F" cases cases/stdlib --only "$p" 2>&1); code=$?
     line=$(echo "$out" | grep -E '^[0-9]+ cases:')
-    if [ $code -eq 124 ]; then echo "mutant $MODE: case $p hung and was killed, as it must"
-    elif echo "$line" | grep -q ' 0 fail' && echo "$line" | grep -q ' 0 header'; then echo "mutant $MODE: case $p SURVIVED: $line"; rc=1
-    else echo "mutant $MODE: case $p failed as it must: $(echo "$out" | grep -E 'FAIL|HEADER' | cut -c1-160 | head -1)"; fi
+    if [ $code -eq 124 ]; then killed=$((killed+1)); echo "mutant $MODE: case $p hung and was killed, as it must"
+    elif echo "$line" | grep -q ' 0 fail' && echo "$line" | grep -q ' 0 header'; then survived=$((survived+1)); echo "mutant $MODE: case $p SURVIVED: $line"
+    else killed=$((killed+1)); echo "mutant $MODE: case $p failed as it must: $(echo "$out" | grep -E 'FAIL|HEADER' | cut -c1-160 | head -1)"; fi
   done
 }
 # stress KIND N TIMEOUT [ENV..]: the kernel must not answer 0 (a wrong answer, a crash or the timeout)
 stress() {
   local kind=$1 n=$2 tmo=$3; shift 3
   env "$@" timeout "$tmo" "$OUT/sched-k" "$kind" "$n" > /dev/null 2>&1; local code=$?
-  if [ $code -eq 0 ]; then echo "mutant $MODE: stress $kind $n ($*) SURVIVED (answered right)"; rc=1
-  elif [ $code -eq 124 ]; then echo "mutant $MODE: stress $kind $n ($*) hung and was killed, as it must"
-  else echo "mutant $MODE: stress $kind $n ($*) failed as it must (exit $code)"; fi
+  if [ $code -eq 0 ]; then survived=$((survived+1)); echo "mutant $MODE: stress $kind $n ($*) SURVIVED (answered right)"
+  elif [ $code -eq 124 ]; then killed=$((killed+1)); echo "mutant $MODE: stress $kind $n ($*) hung and was killed, as it must"
+  else killed=$((killed+1)); echo "mutant $MODE: stress $kind $n ($*) failed as it must (exit $code)"; fi
 }
 case $MODE in
   steal-no-cas|pop-last-no-race|run-unclaimed) cases 8640- 8645-; stress tree 18 120; stress wide 20000 120 ;;
@@ -119,5 +121,8 @@ EOF
       if [ -n "$bad" ]; then echo "check FIB_THREADS=$n: FAILED: $bad"; rc=1; else echo "check FIB_THREADS=$n: $(echo "$out" | grep -E '^[0-9]+ cases:')"; fi
     done ;;
 esac
+if [ "$MODE" != check ]; then
+  if [ $killed -gt 0 ]; then echo "mutant $MODE: KILLED ($killed detectors failed, $survived did not)"; else echo "mutant $MODE: NOT KILLED by any detector"; rc=1; fi
+fi
 if [ "$expect_survive" = 1 ] && [ $rc -ne 0 ]; then echo "mutant $MODE: survived, as the design's experiment found on x86 (a weakened fence needs a model checker)"; rc=0; fi
 exit $rc

@@ -1,0 +1,33 @@
+;; docs/shootout/parallel/sched-rows.fib: the rows of docs/shootout/parallel.md "P-sched" that run on BOTH backends (the OS-thread chunks of
+;; before P-sched and the pool): they use only the macros of fib.parallel. Usage: sched-rows ROW N RUNS [WORKERS]; prints the median ms of RUNS
+;; (the first run is a warm-up and dropped) and a checksum. Rows: pmap (pmap-range of a trivial body, N items), preduce (f64 sum of N
+;; items), pfor-alloc (a body that allocates an 8-element Vec, N items), nested (a pmap of pmaps, N x 64 x 64), skew (N items, one in
+;; eight 3x heavier: what over-decomposition and stealing recover), seq (the same sum without tasks).
+(ns main (:use fib.core fib.parallel fib.os))
+
+(defun now () -> i64 (match (monotonic-ns) ((Ok x) x) ((Err _) 0)))
+(defun med (xs: (Vec i64)) -> i64 (nth (sort xs) (quot (count xs) 2)))
+
+(defun work (k: i64) -> i64
+  (loop [i 0 a k] (if (< i 400) (recur (+ i 1) (rem (+ (* a 31) i) 1000003)) a)))
+
+(defun row (name: str n: i64 par: Par) -> i64
+  (cond (= name "pmap") (reduce + 0 (pmap-range [i n par] (+ i 1)))
+        (= name "preduce") (let [r (preduce-range [i n par] + 0.0 (* 0.5 (sitofp f64 i)))] (fptosi i64 r))
+        (= name "pfor-alloc") (let [hits (atom 0)] (do (pfor-range [i n par] (swap! hits (fn (h) (+ h (count (vec (range 8))))))) @hits))
+        (= name "nested") (reduce + 0 (pmap-range [i n par] (reduce + 0 (pmap-range [j 64 par] (reduce + 0 (pmap-range [k 64 par] (+ i k)))))))
+        (= name "skew") (reduce + 0 (pmap-range [i n par] (if (= (rem i 8) 0) (work (work (work i))) (work i))))
+        (= name "seq") (loop [i 0 a 0] (if (< i n) (recur (+ i 1) (+ a (+ i 1))) a))
+        :else -1))
+
+(defun main () -> i64
+  (let [a (args) name (nth a 0) n (unwrap (parse-long (nth a 1))) runs (unwrap (parse-long (nth a 2)))
+        w (if (> (count a) 3) (unwrap (parse-long (nth a 3))) (cpu-count))
+        par (Par w 0 false)
+        times (cell [])
+        v (cell 0)]
+    (do (dotimes (r (+ runs 1))
+          (let [t0 (now) x (row name n par) t1 (now)]
+            (do (set! v x) (when (> r 0) (set! times (conj @times (- t1 t0)))))))
+        (println (str name " n=" n " w=" w " us=" (quot (med @times) 1000) " v=" @v))
+        0)))

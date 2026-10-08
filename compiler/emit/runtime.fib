@@ -2936,8 +2936,8 @@
 (global internal fib.sched-cond ptr (ptr null))
 ;; The condition a thread that is not a worker waits on for its task (it is no sleeper of the eventcount: a fork's signal is for a worker).
 (global internal fib.sched-jcond ptr (ptr null))
-;; A worker inside 4000 tasks or more (the frames of inline runs and helps nest) parks at a join it cannot run itself instead of
-;; helping with other work; a chain of inline runs itself is bounded only by the stack (as the same recursion without tasks would be).
+;; A worker inside 4000 tasks or more (the frames of inline runs and helps nest) sleeps, as a thread that is not a worker does, at a join
+;; it cannot run itself instead of helping with other work; a chain of inline runs itself is bounded only by the stack (as the same recursion without tasks would be).
 (global internal fib.sched-max-depth i64 (i64 4000))
 ;; The chain of a worker (the tasks it is inside) has 65536 entries; a deeper nesting of inline runs is a fatal error.
 (global internal fib.sched-chain-size i64 (i64 65536))
@@ -3413,9 +3413,10 @@
       (br (icmp eq (atomic-load acquire i32 sp) (i32 2)) done registered)))
   (block done (br (call @fib.sched-unregister task node) withdraw registered))
   (block registered (br worker recheck joiner))
-  (block recheck (br (call @fib.sched-any-work) withdraw sleep))
-  (block sleep (call @fib.sched-sleep epoch) (ret))
-  (block joiner (call @fib.sched-sleep-joiner epoch) (ret))
+  (block recheck (br (call @fib.sched-any-work) abandon sleep))
+  (block abandon (call @fib.sched-unregister task node) (br withdraw))
+  (block sleep (call @fib.sched-sleep epoch) (call @fib.sched-unregister task node) (ret))
+  (block joiner (call @fib.sched-sleep-joiner epoch) (call @fib.sched-unregister task node) (ret))
   (block withdraw
     (br worker withdraw2 out))
   (block withdraw2 (atomicrmw sub seq_cst @fib.sched-sleepers (i32 1)) (br out))
@@ -3449,7 +3450,7 @@
     (let ((t (call @fib.sched-find w)))
       (br (icmp eq t (ptr null)) deep run)))
   (block run (call @fib.sched-run t) (br loop))
-  (block deep (call @fib.sched-wait task (i1 1)) (br loop))
+  (block deep (call @fib.sched-wait task (i1 0)) (br loop))
   (block done (ret)))
 
 ;; ---- blocking sections and the exit
