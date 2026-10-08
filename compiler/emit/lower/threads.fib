@@ -224,7 +224,7 @@
                             (or (starts-with? r "{") (starts-with? r "<")) (str-join ["(indirect-call code (fn tailcc " r " (ptr ptr)) f (ptr null))"])
                             :else (str-join ["(extractvalue (indirect-call code (fn tailcc { " r " ptr } (ptr)) f) 0)"]))))
               (tail "      (call @fib.release task)\n      (call @fib.thread-done)\n      (ret (ptr null)))))\n"))
-          (try-let ((s (completion cx head call true tail result-ty)))
+          (try-let ((s (completion cx head call true "      (call @fib.thread-uncount)\n" tail result-ty)))
             (do (program-add-helper (. cx p) name s)
                 (Ok name)))))))
 
@@ -285,7 +285,7 @@
         (try-let ((l (program-lir (. cx p) result-ty)))
           (let ((param (match l ((some t) (str-join [" (" (lir-ty-text t) " v0)"])) (nil "")))
                 (head (str-join ["(define internal (" name " void) ((ptr task)" param ")\n  (block entry\n    (let ("])))
-            (try-let ((s (completion cx head (fn (r: str) "v0") false "      (ret))))\n" result-ty)))
+            (try-let ((s (completion cx head (fn (r: str) "v0") false "" "      (ret))))\n" result-ty)))
               (do (program-add-helper (. cx p) name s)
                   (Ok name))))))))
 
@@ -318,8 +318,9 @@
 ;; The completion of a task (§8.8, as the interpreter's `complete`): the body's value share-marked, stored into the result atom
 ;; under its lock (retained; the old content released), released as the step's temporary, and the state set to done, which wakes the
 ;; waiters. `call` gives, for the lIR text of the result type, the instruction producing the value when `bind` holds, else the name
-;; it is already bound to. Rust: lower/threads.rs:298 completion
-(defun completion :private (cx: LowerCx head: str call: (fn (str) str) bind: bool tail: str result-ty: Ty) -> (Result str str)
+;; it is already bound to. `pre` is the text just before the state is set (a thread's entry gives itself back to the thread count there, RACE-8780:
+;; once the task is done a joiner may read the count). Rust: lower/threads.rs:298 completion
+(defun completion :private (cx: LowerCx head: str call: (fn (str) str) bind: bool pre: str tail: str result-ty: Ty) -> (Result str str)
   (try-let ((l (program-lir (. cx p) result-ty))
             (aobj (program-object (. cx p) (TCon KAtom [result-ty])))
             (tobj (program-object (. cx p) (TCon KTask [result-ty]))))
@@ -331,4 +332,4 @@
                    (if bind
                        (str-join ["      (let ((v " (call (lir-ty-text t)) "))\n" (completion-store t "v" close)])
                        (completion-store t (call (lir-ty-text t)) close))))))
-      (Ok (str-join [head (completion-bindings (. tobj snd) (. aobj snd)) body "      (call @fib.task-complete task)\n" tail])))))
+      (Ok (str-join [head (completion-bindings (. tobj snd) (. aobj snd)) body pre "      (call @fib.task-complete task)\n" tail])))))
