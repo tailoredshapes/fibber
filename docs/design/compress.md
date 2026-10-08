@@ -127,13 +127,20 @@ frames**: positions are stored as `gen + index`, and a candidate is valid only w
 offset, as liblz4's `currentOffset`), and a 16 KB table is never re-zeroed. A candidate must also be before the position, and its bytes are verified, so a bug here costs ratio, not correctness. The common sequence
 (at most 14 literals, a match of 4 to 18) is emitted inline by `put-fast`.
 
-### 5.2 LZ4 HC (`hc`, `hc3`)
+### 5.2 LZ4 HC (`hc`, `hc3`, `hcpa`, `hcopt`)
 
-Levels 3 to 12: a hash chain over every position (32768 head entries and a 65536-entry table of 16-bit distances to the previous position of the same hash) searched to a depth of 4, 8, 16, 32, 64, 128, 256 (levels 3
-to 9, liblz4's table) and 512, 2048, 16384 (levels 10 to 12). The parser is a port of `LZ4HC_compress_hashChain`: three matches are found one after the other (`wider`: a chain search that may extend a match
-backwards), and arranged as liblz4 arranges them (a short first match is dropped, a first match that a longer second one would squeeze is trimmed to 18, three ascending matches write the first and carry on with the
-other two). It is written as a machine over a small register file (`st`, 16 words) so that no function passes the 50-line limit; its output is byte-identical to liblz4's at levels 3 to 8, 94% at level 9 (the pattern
-analysis for more than 128 attempts is not ported) and its ratio is within 0.3% at 10 to 12, where liblz4 runs an optimal parser that is not ported.
+Levels 3 to 12: a hash chain over every position (32768 head entries and a 65536-entry table of 16-bit distances to the previous position of the same hash) searched to a depth of 4, 8, 16, 32, 64, 128, 256
+(levels 3 to 9, liblz4's table) and 96, 512, 16384 (levels 10 to 12). **The output is byte-identical to liblz4 1.10.0 at every level** (30,000 seeded inputs, `docs/shootout/lz4.md` 4; `specs/compress-lz4-hc-spec.fib` keeps
+eight inputs at six levels as sizes and hashes of liblz4's blocks; case 8721).
+* Levels 3 to 9: a port of `LZ4HC_compress_hashChain`: three matches are found one after the other (`wider`: a chain search that may extend a match backwards), and arranged as liblz4 arranges them (a short
+  first match is dropped, a first match that a longer second one would squeeze is trimmed to 18, three ascending matches write the first and carry on with the other two). It is written as a machine over a small
+  register file (`st`, 32 words) so that no function passes the 50-line limit. From level 9 (depth above 128) the search runs liblz4's PATTERN ANALYSIS (`hcpa`): when the chain step is 1 and the bytes at the
+  position are a pattern of 1, 2 or 4 bytes, the search jumps over the run to its start or to the best aligned place instead of walking it byte by byte.
+* Levels 10 to 12: a port of `LZ4HC_compress_optimal` (`hcopt`): at each position the longest match (`wider` in mode 1: pattern analysis and CHAIN SWAP, `LZ4HC_FindLongerMatch`), the prices in bytes of
+  reaching each of the next positions by literals or by a match (a table of 4099 entries of {price, offset, match length, literal length} in the encoder's state words), a walk back from the end of the best path and
+  the sequences written in order. Level 12 searches at every position, levels 10 and 11 only where the price rises; a match longer than 64 / 128 / 4095 is taken at once.
+A match is only ever used after its bytes were compared, so a mistake costs ratio, never correctness. The parts that a size alone would not show (the prices, the skip test, the pattern jump, the chain swap) each
+have a planted fault in `scripts/mutant-lz4.sh` that the HC spec kills.
 
 ### 5.3 The decoder (`blockdec`) and its safety proof
 
@@ -175,13 +182,13 @@ result once and exactly; a streaming compressor records it only when it is given
 
 ## 7. Results
 
-`docs/shootout/lz4.md` has the measurements: single-thread speed against liblz4 (fast 1.19x slower and byte-identical, HC 3 to 9 byte-identical, decode 1.58x), the scaling curves to 16 threads, the cutoffs,
+`docs/shootout/lz4.md` has the measurements: single-thread speed against liblz4 (fast 1.19x slower and byte-identical, HC 3 to 12 byte-identical, decode 1.49x, frame decode with the content checksum 1.10x of block decode), the scaling curves to 16 threads, the cutoffs,
 the 2 GB streams and what bounds each (memory bandwidth; one core of xxHash32), and the assembly findings that drove the single-thread work.
 
 ## 8. Tools
 
 `scripts/fetch-lz4-tools.sh` (the reference, the corpus, with checksums), `scripts/lz4-diff.{fib,py}` (both directions against liblz4), `scripts/lz4-sim.py` (a simulation of `LZ4_compress_generic` that agrees with it),
-`scripts/gen-lz4-vectors.py`, `scripts/lz4-interop.sh`, `scripts/lz4-bench.fib`, `scripts/mutant-lz4.sh` (32 faults), `scripts/mutant-uninit-i8.sh`.
+`scripts/gen-lz4-vectors.py`, `scripts/lz4-interop.sh`, `scripts/lz4-bench.fib`, `scripts/mutant-lz4.sh` (43 faults), `scripts/lz4-hc-vectors.py` (liblz4's HC sizes and hashes for `specs/compress-lz4-hc-spec.fib`), `scripts/mutant-uninit-i8.sh`.
 
 ## 9. Threads (`Options.threads`, the `:parallel` capability)
 
@@ -192,13 +199,19 @@ true) says whether a decoder checks the checksums that are in the data.
 
 ### 9.1 The engine (`fib.compress.par`)
 
-The runtime has no work-stealing pool yet (`docs/design/parallelism.md` 3.1 is a design and a prototype): a task is an OS thread. The engine starts `workers` tasks and the JOBS `0 .. n-1` are SELF-SCHEDULED: every
-worker takes the next unclaimed index from one atom (a fetch-and-add), runs it, and comes back, so a slow job delays one worker and the others take what is left (the balance of a stealing deque for one level of
-jobs, with one shared counter instead of deques). A job is `(fn (i) (Result r CompressError))`. A worker that gets an error says so and stops taking jobs; the others finish the job they are in and stop; EVERY task
-is joined whatever happens (no task outlives the call). The error returned is that of the LOWEST failing index: jobs are claimed in increasing order and a claimed job always finishes, so every index below the first
-failing one has been run, and the error is the one a sequential run would meet first, whatever the worker count. A worker that TRAPS is joined with `try-join` (ADR 0001) and becomes an `:internal` error, not a dead
-process. Results come back in index order. A job's output goes into an array its caller owns through an ADDRESS (`addr-of` / `ptr-at-addr`: a `ptr` is not `Send`; the array outlives the call and the ranges
-written are disjoint: the caller's contract, stated where it is used).
+The jobs are tasks of the runtime's work-stealing pool (`docs/design/parallelism.md` 8, `fork-task`): the engine makes no thread of its own, so the threads of a program stay the pool's (`cpu-count`, `FIB_THREADS`)
+whatever `Options.threads` says and however deeply a program nests compression or decompression inside a `pmap` body (a joiner that waits runs other tasks: case 8720, the spec scenario of the same name, mutant
+`par-nested-threads`, which puts `spawn` back and makes 12 bodies x 8 threads). `Options.threads` is the number of JOBS IN FLIGHT, at most the pool size (0: the pool size); a request for more only queues runners.
+The 64-worker cap and the "no stealing pool yet" design are gone.
+The engine forks `workers` RUNNERS and the JOBS `0 .. n-1` are SELF-SCHEDULED: every runner takes the next unclaimed index from one atom (a fetch-and-add), runs it, and comes back, so a slow job delays one runner and
+the others take what is left. A job is `(fn (i) (Result r CompressError))`. A runner that gets an error says so and stops taking jobs; the others finish the job they are in and stop; EVERY task is joined whatever
+happens (no task outlives the call). The error returned is that of the LOWEST failing index: jobs are claimed in increasing order and a claimed job always finishes, so every index below the first failing one has been
+run, and the error is the one a sequential run meets first, whatever the worker count. A runner that TRAPS is joined with `try-join` (the pool's trap policy, ADR 0001/0009) and becomes an `:internal` error, not a dead
+process. Results come back in index order. A job's output goes into an array its caller owns through an ADDRESS (`addr-of` / `ptr-at-addr`: a `ptr` is not `Send`; the array outlives the call and the ranges written are
+disjoint: the caller's contract, stated where it is used).
+**Why a counter and not a task per job.** The alternative was measured: one forked task per job, at most `workers` unjoined, joined in index order with the next job forked at each join (it makes the lowest-error rule
+trivial). It loses at every thread count (compress, 1 MiB blocks, T = 2 / 4 / 8 / 16: 901 / 1645 / 2487 / 3506 MB/s against 1249 / 2364 / 3917 / 5350 for the counter; decompress without verification 3522 / 7402 / 9912 /
+9973 against 6851 / 11614 / 12447 / 11643): the in-order join idles a slot whenever a later job finishes first and pays a wake-up per job. About 1 MiB jobs are coarse enough that the counter's imbalance is nothing.
 
 ### 9.2 Compression of independent blocks (`pframe`)
 
@@ -217,13 +230,23 @@ recorded size): each job decodes into a buffer of its own and the buffers are co
 error kinds identical to the sequential decoder's. `max-output`: direct mode checks the declared size before anything is allocated; placement mode bounds the work by the sum of the stored/maximum block sizes (at most
 `max-output` plus one block) before any buffer is made and enforces the exact limit when placing: **a parallel decode never allocates more than `max-output` plus one block**. Block checksums are verified in the jobs;
 the content checksum is pipelined (a worker that finishes a job takes the checksum's lock if free and hashes every finished job in order), so it is bounded by one core of xxHash32 and not by the whole decode; it
-cannot be parallelised (xxHash32 of a concatenation is not a combination of the hashes of its parts) and `verify` false skips it. Concatenated frames, linked blocks, dictionaries and legacy frames decode
+cannot be parallelised: xxHash32 of a concatenation is not a function of the hashes of its parts (two 16-byte inputs with the same hash give different hashes once the same bytes follow them: `docs/shootout/lz4.md` 3), and the
+state after a block is the input of the next, each lane being v' = rotl(v + x P2, 13) P1, which has no closed form over a block. A dedicated hasher (one runner that hashes every finished job at once and decodes a job
+itself when none is ready) was built and measured and is NOT faster than the lock scheme: under load the hash of data that other cores wrote runs at 6 GB/s, not 10.8. `verify` false skips it. The SEQUENTIAL frame
+decoder instead hashes the previous block while it decodes the next (section 9.4). Concatenated frames, linked blocks, dictionaries and legacy frames decode
 sequentially.
 
 **Streams.** With `threads` of 2 or more (not automatic: the length of a stream is not known), independent blocks and no dictionary: the compressor holds input until it has a BATCH (workers x about 1 MiB), codes the
 batch in parallel, and returns its blocks in order; the decompressor, finding at least two whole blocks queued, decodes up to that many in parallel and returns their output in one step (a step is then bounded by
 workers x about 1 MiB of output instead of one block), consuming nothing unless it succeeds. Memory is a few MiB per worker, never the length of the stream. `fib.compress.fd` overlaps the I/O when threads are asked
 for: a reader task reads ahead and a writer task writes behind through bounded queues (the producer sleeps while the queue is full; both tasks are always joined).
+
+### 9.4 The sequential decoder hashes while it decodes
+
+xxHash32 is a chain of dependent multiplies (about 7 cycles per 16-byte stripe whatever the cache: 10.8 GB/s hot or cold) and the decoder leaves most of a core idle, so the one-thread frame decoder (`framedec`) keeps the
+output range of the block just decoded as PENDING and `decode-block-h` (`blockdec`) hashes one stripe of it in every turn of the decode loop, the two chains overlapping in the core's window; what is left goes to the
+streaming hash after the block. A stored block, a dictionary, or a held-back tail in the hash first hashes the pending range plainly, so the bytes reach the hash in order whatever the path. The plain `decode-block` is the same
+function with nothing to hash. Frame decode with the checksum, 64 KiB blocks, one thread: 2686 -> 3305 MB/s (block decode 3620).
 
 ## 10. A builtin: `array-uninit-i8`
 
@@ -233,5 +256,5 @@ return an array in which they wrote every byte, or a copy of the part they wrote
 
 ## 11. What is not here
 
-Optimal parsing at HC 10 to 12 (the lazy parser is within 0.3% of its size), `LZ4_compress_destSize`, partial decompression, writing legacy or skippable frames, a streaming decoder for legacy frames, a dictionary for raw blocks (the frame API has it), parallel linked blocks, parallel concatenated frames (one frame at a time is parallel), parallel decode without a recorded size at full speed (placement is 1.2 to 1.4x), the pattern analysis of HC 9,
+`LZ4_compress_destSize`, partial decompression, writing legacy or skippable frames, a streaming decoder for legacy frames, a dictionary for raw blocks (the frame API has it), parallel linked blocks, parallel concatenated frames (one frame at a time is parallel), parallel decode without a recorded size at full speed (placement is 1.2 to 1.4x),
 and a `ratio` limit option (a bomb is bounded by `max-output`, which a caller sets from what it expects). Dictionaries larger than 64 KiB use their last 64 KiB, as the format does.
