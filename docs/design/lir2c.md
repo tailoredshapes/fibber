@@ -253,8 +253,7 @@ Three findings of the clang runs, each fixed or recorded: (1) clang treats `mall
 out-of-memory traps (cases 195, 922, 7881) never happened; `driver.viac` passes `-fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc` for clang (gcc's command
 line is unchanged). (2) `fib_fmuladd` was fused under `__FMA__`, which is x86-only; on AArch64 `__ARM_FEATURE_FMA` says it, and `simd/muladd` was two roundings
 there while `(has-fma)` said one (case 6262): the prelude tests both macros. (3) The printer crashed on macOS arm64 under the seed's own code generator: see section 10.
-Not explained: `6221` (a `Vec f64x4` / `Array i8x3` read back), `7083` and `7961` (fused tensor epilogue and fma GEMM at 8 and 16 lanes) fail through C on arm64
-only, the same programs pass natively (listed in `expected-clang-darwin.txt`).
+Explained and fixed (C-ARM-1): `6221`, `7083` and `7961` failed through C on arm64 for one cause, section 11.
 The `cases/stdlib` count of the merged tree is 1,454 (the floor); the table is the count
 at the time of the run, before the merge.
 
@@ -412,3 +411,31 @@ compiled by a compiler built from this tree. The compiler of the SEED is not fix
 parameter would have made nine) take a record instead of nine parameters. Tests: `cases/lir/instr/stackargs-sibcall.lir` (crashed at `-O 1` to `-O 3` on the Mac
 before: `fatal signal 10`/`11`; prints the sums after), `compiler/tests/native/a64-sibcall.sh` (the assembly for arm64 has `bl _srand`, not `b _srand`; the planted
 sibling branch is caught; on a Mac it also runs the case), case `8742`.
+
+## 11. A musttail call with an argument passed by reference (C-ARM-1)
+
+Cases `6221` (a `Vec f64x4` read back), `7083` and `7961` (fused tensor epilogue and fma GEMM at 8 and 16 lanes) failed through C with Apple clang 21 on arm64
+only, with `FIB_VIA=c` (`result: expected 0, got 46` and `got 4611686018427387904`, the bits of 2.0). Minimal program: a `(Vec f64x4)` with one `conj`, one `nth`
+and one `assoc` of it (`(lane (nth v 7) 3)` printed `2.1246119516E-314`, a pointer read as a double). Not the vector load, the layout or the lane order: the
+cause is **a clang miscompile of `__attribute__((musttail))` when an argument is passed by hidden reference**. AArch64 passes a vector or aggregate over 16 bytes
+by reference to a copy; for `Collection.conj` of a `Vec f64x4`, a forwarding wrapper `(ptr, v4_f64) -> ptr` that musttail-calls `vec-conj` with the same prototype, clang
+emitted `sub sp, sp, #32; mov x1, sp; add sp, sp, #32; b vec-conj`: it passes the address of a stack slot it has already released (never filled), instead
+of forwarding the caller's own pointer. The callee then pushes whatever is on the stack. `-O0` is right (no tail call is made), `-O1` and up are wrong; UBSan and the
+warnings say nothing, removing that one `musttail` (and no other) makes the case pass. `7083` and `7961` fail with the same result and pass with the same fix.
+
+Fix (`compiler/c/func.fib` `tail-note`): a tail call whose callee has a parameter that is a vector or an aggregate of more than 16 bytes is written with the
+preprocessor,
+
+```
+#if defined(__clang__) && defined(__aarch64__)
+#warning "tail call to @f in @g has an argument of more than 16 bytes ... lowered to a plain call (--allow-plain-tail-calls): the stack may grow"
+return f(...);
+#else
+__attribute__((musttail)) return f(...);
+#endif
+```
+
+because the printer does not know the target (the C is the same for every row), and the C compiler does. Without `--allow-plain-tail-calls` the first branch is `#error`
+(a tail call that cannot be guaranteed is an error, section 2); gcc and clang on x86-64 are unchanged. A wrapper's deep recursion through such a call risks the
+stack as every plain call does; a self tail call is still a `goto`. Test: `compiler/tests/c-backend/cases/tail-wide-vector.lir` (`forward 0.0 doubled 0.0` through
+clang on arm64 before, `4.0 8.0 29.0` after, the native values; on x86-64 it runs as before), and the three cases are off `expected-clang-darwin.txt`.

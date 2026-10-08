@@ -1,0 +1,43 @@
+;; expect: accept
+;; out: forward 4.0
+;; out: doubled 8.0
+;; out: wide 29.0
+;; A `tailcc` call between two identical prototypes whose argument is a 256-bit vector. AArch64 passes such an argument by hidden
+;; reference, and Apple clang 21 compiles `__attribute__((musttail))` of it to a jump that hands the callee the address of a stack slot
+;; the caller has just released (cases 6221, 7083, 7961 through C on arm64: docs/design/lir2c.md section 11). The printer writes the
+;; call plain under clang on AArch64 (a `#warning`, so the run needs --allow-plain-tail-calls), `musttail` elsewhere; the value is
+;; forwarded as it came, computed in the wrapper, and the second of two wide arguments.
+(declare printf i32 (ptr ...))
+(define tailcc (get3 double) ((ptr p) (<4 x double> v))
+  (block entry (br (icmp eq p (ptr null)) fast slow))
+  (block fast (ret (extractelement v (i32 3))))
+  (block slow
+    (call @printf (string "slow %.1f %.1f\n") (extractelement v (i32 0)) (extractelement v (i32 0)))
+    (call @printf (string "slow %.1f %.1f\n") (extractelement v (i32 1)) (extractelement v (i32 0)))
+    (call @printf (string "slow %.1f %.1f\n") (extractelement v (i32 2)) (extractelement v (i32 0)))
+    (call @printf (string "slow %.1f %.1f\n") (extractelement v (i32 3)) (extractelement v (i32 0)))
+    (call @printf (string "slow %.1f %.1f\n") (extractelement v (i32 0)) (extractelement v (i32 0)))
+    (call @printf (string "slow %.1f %.1f\n") (extractelement v (i32 1)) (extractelement v (i32 0)))
+    (call @printf (string "slow %.1f %.1f\n") (extractelement v (i32 2)) (extractelement v (i32 0)))
+    (call @printf (string "slow %.1f %.1f\n") (extractelement v (i32 3)) (extractelement v (i32 0)))
+    (call @printf (string "slow %.1f %.1f\n") (extractelement v (i32 0)) (extractelement v (i32 0)))
+    (call @printf (string "slow %.1f %.1f\n") (extractelement v (i32 1)) (extractelement v (i32 0)))
+    (call @printf (string "slow %.1f %.1f\n") (extractelement v (i32 2)) (extractelement v (i32 0)))
+    (call @printf (string "slow %.1f %.1f\n") (extractelement v (i32 3)) (extractelement v (i32 0)))
+    (ret (extractelement v (i32 3)))))
+(define tailcc (forward double) ((ptr p) (<4 x double> v))
+  (block entry (tailcall @get3 p v)))
+(define tailcc (doubled double) ((ptr p) (<4 x double> v))
+  (block entry (tailcall @get3 p (fadd v v))))
+(define tailcc (sum2 double) ((i64 n) (<4 x double> a) (<4 x double> b))
+  (block entry (ret (fadd (fadd (extractelement a (i32 3)) (extractelement b (i32 2))) (sitofp double n)))))
+(define tailcc (wide double) ((i64 n) (<4 x double> a) (<4 x double> b))
+  (block entry (tailcall @sum2 n a b)))
+(define (main i32) ()
+  (block entry
+    (let ((v (<4 x double> 1.0 2.0 3.0 4.0))
+          (w (<4 x double> 1.0 2.0 3.0 20.0)))
+      (call @printf (string "forward %.1f\n") (call @forward (ptr null) v))
+      (call @printf (string "doubled %.1f\n") (call @doubled (ptr null) v))
+      (call @printf (string "wide %.1f\n") (call @wide (i64 6) w v))
+      (ret (i32 0)))))

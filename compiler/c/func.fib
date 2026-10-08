@@ -107,13 +107,33 @@
        (if (= n (. f name))
            (self-tail! cf args)
            (let ((text (call-text cf c args)))
-             (emit-tail! cf pos (tail-verdict cx pos (. f name) (. f ty) (str "@" n) (unwrap-or (get (. cx fns) n) (. f ty))) text (. (. f ty) ret)))))
+             (emit-tail! cf pos (tail-verdict cx pos (. f name) (. f ty) (str "@" n) (unwrap-or (get (. cx fns) n) (. f ty))) text (. (. f ty) ret)
+                         (tail-note cx (. f name) (str "@" n) (unwrap-or (get (. cx fns) n) (. f ty)))))))
       ((CalIndirect _ t)
        (let ((text (call-text cf c args)))
-         (emit-tail! cf pos (tail-verdict cx pos (. f name) (. f ty) "the callee" t) text (. (. f ty) ret)))))))
+         (emit-tail! cf pos (tail-verdict cx pos (. f name) (. f ty) "the callee" t) text (. (. f ty) ret)
+                     (tail-note cx (. f name) "the callee" t)))))))
 
-(defun emit-tail! :private (cf: Cf pos: i64 must: bool text: str ret: (Option LType)) -> unit
-  (cond must (do (set! (. cf must-tail) true) (emit! cf (str "__attribute__((musttail)) return " text ";")))
+;; A `musttail` call whose arguments include one the AArch64 convention passes by hidden reference (a vector or aggregate over 16 bytes)
+;; is miscompiled by Apple clang 21 (the callee is handed the address of a stack slot the caller has already released: cases 6221, 7083,
+;; 7961, docs/design/lir2c.md section 11). The printer does not know the target, so the C says it: under clang on AArch64 the call is plain
+;; (a `#warning` with `--allow-plain-tail-calls`, else a `#error`), elsewhere it is `musttail`. nil when no argument is such.
+(defun tail-note :private (cx: Cx caller: str callee: str tt: LFnType) -> (Option str)
+  (if (some? (find-first (fn (t: LType) (and (or (is-vector? t) (type-aggregate? t)) (> (layout-size cx t) 16))) (. tt params)))
+      (some (str "tail call to " callee " in @" caller " has an argument of more than 16 bytes, which clang on AArch64 passes by hidden reference and does not forward in a musttail call (it hands the callee the address of a dead stack slot)"))
+      nil))
+
+(defun emit-tail! :private (cf: Cf pos: i64 must: bool text: str ret: (Option LType) note: (Option str)) -> unit
+  (cond (and must (some? note))
+        (let ((plain (. (. (. cf cx) opts) plain-tails)))
+          (do (set! (. cf must-tail) true)
+              (emit! cf "#if defined(__clang__) && defined(__aarch64__)")
+              (emit! cf (str (if plain "#warning " "#error ") "\"" (unwrap-or note "") (if plain "; lowered to a plain call (--allow-plain-tail-calls): the stack may grow" "; --allow-plain-tail-calls lowers it to a plain call") "\""))
+              (if (nil? ret) (do (emit! cf (str text ";")) (emit! cf "return;")) (emit! cf (str "return " text ";")))
+              (emit! cf "#else")
+              (emit! cf (str "__attribute__((musttail)) return " text ";"))
+              (emit! cf "#endif")))
+        must (do (set! (. cf must-tail) true) (emit! cf (str "__attribute__((musttail)) return " text ";")))
         (nil? ret) (do (emit! cf (str text ";")) (emit! cf "return;"))
         :else (emit! cf (str "return " text ";"))))
 
