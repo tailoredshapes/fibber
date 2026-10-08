@@ -22,7 +22,6 @@ STATIC_INPUTS := $(OWNERSHIP_NAMES:%=cases/ownership/%) $(call case_files,module
   $(foreach p,$(STATIC_CASES),$(wildcard cases/stdlib/$(p)*))
 # the stamp also depends on whether the pieces are there (a SKIPPED stamp must not outlive a musl directory that appears later)
 # (written at parse time, only when its content changes, so `make -q` and `make -n` stay honest)
-cfg_write = $(shell mkdir -p $(BUILD); echo '$(2)' | cmp -s - $(1) || echo '$(2)' > $(1))
 $(call cfg_write,$(BUILD)/static.cfg,$(or $(MUSL_LIBC),none))
 $(BUILD)/static.ok: $(F) $(STATIC_INPUTS) $(MUSL_LIBC) $(BUILD)/static.cfg | $(BUILD)/
 ifeq ($(MUSL_LIBC),)

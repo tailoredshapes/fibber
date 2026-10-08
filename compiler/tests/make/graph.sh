@@ -21,7 +21,8 @@ B=$S/build
 bad=0
 ok() { echo "ok   $*"; }
 fail() { echo "FAIL $*"; bad=$((bad + 1)); }
-M() { make --no-print-directory BUILD="$B" "$@"; }   # the real Makefile against the scratch build directory
+# -o: a fresh checkout has arbitrary mtimes, so runtime.fib may look older than rt/*.lir; it is not regenerated here (and the tree is not touched)
+M() { make --no-print-directory -o compiler/emit/runtime.fib BUILD="$B" "$@"; }   # the real Makefile against the scratch build directory
 make --version | grep -q '^GNU Make 4\|^GNU Make 5' || { echo "graph.sh: GNU Make 4 is needed"; exit 2; }
 
 # fake products: the seed, F and every stamp of the full gate, newer than everything in the tree (and older than nothing)
@@ -97,6 +98,39 @@ if [ ! -e "$B/zz-partial" ]; then ok "7b a target written by a failing recipe is
 # 8 no download in the dry run of the gate when the seed is in place
 dl=$(M -n gate-stamps | grep -c -E '^(curl|wget|gh release download|git clone)' || true)
 if [ "$dl" -eq 0 ]; then ok "8 make -n gate-stamps lists no download"; else fail "8 the dry run would download: $dl lines"; fi
+
+# 9 the deal of cases to shards: a tiny tree with a fake F that lists the cases it is asked to run. Add a case in the middle, rename one,
+# delete one: after each, every case is in exactly one shard table (a shard's table made for the old deal must not be taken for the new
+# one). GRAPH_OLD_CASES_MK=FILE runs the test against another mk/cases.mk (the old deal fails it).
+T=$S/deal; rm -rf "$T"; mkdir -p "$T/build" "$T/cases/stdlib" "$T/cases/ownership" "$T/cases/modules" "$T/mk"
+cp Makefile "$T/"; cp mk/*.mk "$T/mk/"; [ -n "${GRAPH_OLD_CASES_MK:-}" ] && cp "$GRAPH_OLD_CASES_MK" "$T/mk/cases.mk"
+cp VERSION SEED "$T/"; for d in scripts compiler lib rt specs docs; do [ -e "$d" ] && ln -s "$root/$d" "$T/$d"; done
+for n in 100-a 110-b 120-c 130-d 140-e 150-f 160-g 170-h 180-i; do echo "; $n" > "$T/cases/stdlib/$n.fib"; done
+cat > "$T/fakeF" <<'FAKE'
+#!/bin/bash
+# fake `F cases DIR [--only NAME..] [-j N]`: one row per case asked for (all of DIR without --only), then the count line
+dir=$2; shift 2; names=()
+if [ "${1:-}" = --only ]; then shift; while [ $# -gt 0 ] && [ "$1" != -j ]; do names+=("$1"); shift; done; else mapfile -t names < <(ls "$dir"); fi
+echo "case  status  detail"; for n in "${names[@]}"; do echo "$n pass"; done
+echo; echo "${#names[@]} cases: ${#names[@]} pass, 0 fail, 0 pending, 0 header error"
+FAKE
+chmod +x "$T/fakeF"
+D() { make --no-print-directory -C "$T" SHARDS=3 OWN_SHARDS=1 QUICK_SHARDS=1 BUILD=build "$@"; }
+seedf=$(D -s -p 2> /dev/null | sed -n 's/^SEED_FIBC := //p' | head -n 1)
+mkdir -p "$T/$(dirname "$seedf")"; : > "$T/$seedf"; chmod +x "$T/$seedf"; sleep 0.05; cp "$T/fakeF" "$T/build/F"
+shards() { D build/cases/stdlib.0.txt build/cases/stdlib.1.txt build/cases/stdlib.2.txt > "$T/deal.log" 2>&1; }
+check_deal() { # check_deal LABEL: the tables hold each case of cases/stdlib exactly once
+  local want got
+  want=$(ls "$T/cases/stdlib" | LC_ALL=C sort); got=$(cat "$T"/build/cases/stdlib.[012].txt | awk '$2 == "pass" { print $1 }' | LC_ALL=C sort)
+  if [ "$want" = "$got" ]; then ok "9 $1: every case is in exactly one shard table ($(echo "$want" | wc -l) cases)"
+  else fail "9 $1: the tables differ from the cases (missing: $(comm -23 <(echo "$want") <(echo "$got") | tr '\n' ' ') extra or duplicated: $(comm -13 <(echo "$want") <(echo "$got") | tr '\n' ' ') $(echo "$got" | uniq -d | tr '\n' ' '))"; fi
+}
+shards; check_deal "first deal"
+n=$(D -n build/cases/stdlib.0.txt build/cases/stdlib.1.txt build/cases/stdlib.2.txt | grep -c '^start=')
+if [ "$n" -eq 0 ]; then ok "9 nothing changed: no shard reruns"; else fail "9 nothing changed, yet $n shard recipes would run"; fi
+echo "; new" > "$T/cases/stdlib/115-new.fib"; shards; check_deal "a case added in the middle"
+mv "$T/cases/stdlib/140-e.fib" "$T/cases/stdlib/141-e.fib"; shards; check_deal "a case renamed"
+rm "$T/cases/stdlib/100-a.fib"; shards; check_deal "a case deleted"
 
 [ -n "${KEEP:-}" ] || rm -rf "$S"
 echo "graph: $bad failed"
