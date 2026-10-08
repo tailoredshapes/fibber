@@ -444,12 +444,13 @@ executable form and skips the device part, with a note, where there is none. Pin
 **WebGPU.** WGSL has atomics on `atomic<i32>` and `atomic<u32>` only, so a module that contains an atomic prints every storage buffer and workgroup array as
 `array<atomic<u32>>` and every plain access as `atomicLoad`/`atomicStore` (webgpu.md 3.7); a module with none prints what it always printed (the golden
 kernels.wgsl is unchanged). Signed min and max and `cas` are loops of `atomicCompareExchangeWeak`; an f32 or 64-bit atomic is refused by name. Dawn's
-uniformity analysis shaped the reductions: the printer makes any function with a branch a `loop { switch }` state machine, and Tint then takes a barrier in it
-as non-uniform when anything after the barrier branches on the thread. So the reductions have no thread-dependent branch in a function that holds a barrier
-(masks through `gpu/select`, folds in functions of their own, every thread doing the final atomic with the identity for those that must not add), and the
-number of blocks is a kernel argument checked against `gpu/num-groups` (a read of a builtin through a private variable is non-uniform to Tint). A device trap
+uniformity analysis shaped the reductions until GPU-4: the printer made any function with a branch a `loop { switch }` state machine, and Tint then took a barrier in it
+as non-uniform when anything after the barrier branched on the thread. Since GPU-4 the printer structures control flow (webgpu.md 3.7), the block trees are
+branches (`when (< t stride)`) around their barriers, and the final atomics are `when (= tid 0)`; the results are the same (the CPU reference is unchanged, cases
+8550-8555 and the 30 device checks). The number of blocks is still a kernel argument checked against `gpu/num-groups` (a read of a builtin through a private
+variable is non-uniform to Tint), and a thread must not leave (`return`, `trap`) before a barrier. A device trap
 in the WGSL target returns zeros and goes on (webgpu.md 3.4), so a loop that steps by a trapped call's answer must not: the folds step past n if the total is 0.
 
 **Not done:** pinned host memory and async launch (item 8: `cuMemHostAlloc`, `cuMemcpyHtoDAsync` belong to the driver repository fib-gpu-cuda, which the
 core does not contain; the download at 0.4 GB/s is still the cost of not having it); a warp shuffle reduction (an intrinsic family); f32 atomic add and
-min/max through WGSL (no form); a relooper in the WGSL printer (webgpu.md 9.3), which would lift the branch rules above.
+min/max through WGSL (no form); 

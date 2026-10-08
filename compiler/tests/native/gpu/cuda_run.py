@@ -2,6 +2,7 @@
 """compiler/tests/native/gpu/cuda_run.py: runs the PTX of fib.gpu's atomics and reductions on a CUDA device through libcuda (ctypes) and compares with the CPU.
 usage: cuda_run.py reduce REDUCE.ptx REF.txt      the grid reductions against fibber's CPU answers (REF.txt: what `fibc run examples/gpu/reduce.fib` printed)
        cuda_run.py atomics ATOMICS.ptx            the atomics kernels of examples/gpu/atomics.fib against Python's count
+       cuda_run.py branch BRANCH.ptx              the kernels of branch.fib (a thread-dependent branch around a barrier) against Python's answers
        cuda_run.py badgrid REDUCE.ptx             a wrong `blocks` argument is a device trap, reported by the sync
 A test harness only (the product's driver is fib-gpu-cuda). It loads the PTX with cuModuleLoadData (the driver compiles it, so a PTX the driver rejects fails
 here), launches by kernel name, and prints one line per check: `ok ...` or `FAIL ...`. Exit 0 when every check holds, 1 on a failure, 3 when there is no
@@ -168,8 +169,36 @@ def badgrid_mode(ptx):
         check("sync" in str(e), f"a wrong blocks argument (3 for a grid of 4) is a device trap, reported by the sync: {e}")
 
 
+def branch_mode(ptx):
+    d = Dev(ptx)
+    for n in (99968, 100000):
+        grid = (n + 127) // 128
+        s = lcg(grid * 128, 9)
+        data = [((v >> 12) & 0xFFFF) if i < n else 0 for i, v in enumerate(s)]   # padded: parity and early read the whole last block
+        pd = d.alloc(struct.pack(f"{len(data)}i", *data))
+
+        def run(name, out_len):
+            po = d.alloc(bytes(4 * out_len))
+            d.launch(name, grid, 128, P(pd), P(po), I(n))
+            return list(struct.unpack(f"{out_len}i", d.read(po, 4 * out_len)))
+
+        def same(got, want, what):
+            check(got[:len(want)] == want, f"{what} n={n}: equals the CPU's ({got[:3]}..)")
+
+        base = lambda i: i - i % 128
+        if n % 128 == 0:
+            same(run("rev", len(data)), [data[base(i) + 127 - i % 128] for i in range(n)], "rev (a thread-dependent load, a barrier, a read of another thread's slot)")
+            par = [data[i] + 1000 if i % 2 == 0 else data[i] * 2 for i in range(len(data))]
+            same(run("parity", len(data)), [par[i ^ 1] for i in range(len(data))], "parity (an if/else, a barrier after the join)")
+        else:
+            same(run("tree_sum", grid), [sum(data[b * 128:(b + 1) * 128]) for b in range(grid)], f"tree-sum ({grid} block sums of the branchy tree)")
+            same(run("early", len(data)), [data[base(i) + 127 - i % 128] + 1 for i in range(n)], "early (a barrier, then a branch that skips the tail)")
+
+
 mode = sys.argv[1]
-if mode == "reduce":
+if mode == "branch":
+    branch_mode(sys.argv[2])
+elif mode == "reduce":
     reduce_mode(sys.argv[2], sys.argv[3])
 elif mode == "atomics":
     atomics_mode(sys.argv[2])

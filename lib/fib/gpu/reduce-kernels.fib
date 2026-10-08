@@ -17,9 +17,8 @@
 (defun elem-f32 :private (data: ptr n: i32 i: i32 ident: f32) -> f32
   (r/sel-f32 (< i n) (r/f32-at data (r/sel-i32 (< i n) i 0i32)) ident))
 
-;; The kernels end without a thread-dependent branch (WebGPU: the printer makes any function with a branch a state machine, and Dawn then takes the barrier in it as
-;; non-uniform, webgpu.md 3.6): every thread of the block holds the block's value, so `max` and `min` are done by every thread (idempotent), the sum by every thread with
-;; the value only in thread 0's (the others add 0), the partial by every thread (the same value into the same slot). The folds are functions of their own.
+;; Every thread of the block holds the block's value after the reduction: `max` and `min` are done by every thread (idempotent), the sum by thread 0 alone (a branch
+;; after the barriers; the WGSL printer structures it, webgpu.md 3.6), the partial by every thread (the same value into the same slot). The folds are functions of their own.
 ;; The distance between a thread's elements. After a device trap the WGSL target goes on with zeros (webgpu.md 3.4): `threads` then answers 0, and a loop that
 ;; stepped by it would never end, so a total below 1 steps past n.
 (defun stride :private (total: i32 n: i32) -> i32 (r/sel-i32 (> total 0i32) total (unchecked-add n 1i32)))
@@ -61,7 +60,7 @@
 
 (defkernel reduce-sum-i32 (data: ptr out: ptr n: i32 blocks: i32)
   (let ((blk (r/block-sum-i32 (fold-sum-i32 data n (threads blocks)))))
-    (gpu/i32-add! out 0i32 (r/sel-i32 (= (r/tid) 0i32) blk 0i32))))
+    (when (= (r/tid) 0i32) (gpu/i32-add! out 0i32 blk))))
 
 (defkernel reduce-max-i32 (data: ptr out: ptr n: i32 blocks: i32)
   (let ((blk (r/block-max-i32 (fold-max-i32 data n (threads blocks)))))
