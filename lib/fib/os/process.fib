@@ -48,16 +48,22 @@
 (extern creat :private (ptr i32) -> i32)
 (extern waitpid :private (i32 ptr i32) -> i32)
 (extern _exit :private (i32) -> unit)
+;; Bound to the runtime's own definition (rt/thread.lir `fib_guard_ctl`, as fib.os.sched's `fib_sched_ctl`): the signal stack of this thread around a fork.
+(extern fib_guard_ctl :private (i64 i64) -> i64)
 (extern alarm :private (i32) -> i32)
 
 ;; The threads of this process, from /proc/self/task, without the first thread of a program whose `main` runs on a stack the runtime made (rt/thread.lir
-;; `fib.run-main`): that thread only waits for `main`'s and the runtime names it `fib-parked`. nil where /proc cannot be read.
+;; `fib.run-main`): that thread only waits for `main`'s and the runtime names it `fib-parked`. nil where /proc cannot be read. On macOS (no /proc) the
+;; kernel is asked (fib.os.backend task-info: proc_pidinfo), the parked thread taken off the same way.
 (defun thread-count () -> (Option i64)
-  (match (dirs/list-directory "/proc/self/task")
-    ((Err _) nil)
-    ((Ok entries)
-     (some (count (filter (fn (e: dirs/DirectoryEntry) (not (= (unwrap-or (read-file (str "/proc/self/task/" (. e name) "/comm")) "") "fib-parked\n")))
-                          entries))))))
+  (let [kernel (b/task-info 0)]
+    (if (>= kernel 0)
+        (some kernel)
+        (match (dirs/list-directory "/proc/self/task")
+          ((Err _) nil)
+          ((Ok entries)
+           (some (count (filter (fn (e: dirs/DirectoryEntry) (not (= (unwrap-or (read-file (str "/proc/self/task/" (. e name) "/comm")) "") "fib-parked\n")))
+                                entries))))))))
 
 ;; A forked child: its process id and the files it writes (`dir/tag.res`, `.out`, `.err`).
 (defstruct ForkChild (pid: i64 base: str))
@@ -69,10 +75,11 @@
 ;; In the child: standard output and error to the files the parent named, the alarm, the closure, its value to the result file, out.
 ;; The child allocates nothing before its own standard error exists: under FIB_TRACE the parent's trace would see its allocations
 ;; under ordinals the parent also uses, so the paths are made in the parent.
-(defun child-run :private (f: (fn () str) outp: ptr errp: ptr res: str secs: i64) -> i64
+(defun child-run :private (f: (fn () str) outp: ptr errp: ptr res: str secs: i64 alt: i64) -> i64
   (unsafe
     (let [fo (creat outp 384i32) fe (creat errp 384i32)]
-      (do (dup2 fo 1i32) (dup2 fe 2i32)
+      (do (fib_guard_ctl 1 alt) ; macOS: the child starts without the signal stack its parent had, and a stack overflow would end it with SIGILL and no word
+          (dup2 fo 1i32) (dup2 fe 2i32)
           (when (> secs 0) (alarm (trunc i32 secs)))
           (write-file res (f))
           (_exit 0i32)
@@ -95,9 +102,10 @@
             outp (n/c-text (str base ".out"))
             errp (n/c-text (str base ".err"))
             res (str base ".res")
+            alt (unsafe (fib_guard_ctl 0 0))
             pid (unsafe (fork))]
         (cond (< pid 0i32) (let [e (last-error "fork")] (unsafe (do (free outp) (free errp) (Err e))))
-              (= pid 0i32) (do (child-run f outp errp res secs) (Err (invalid-input "fork" "unreachable")))
+              (= pid 0i32) (do (child-run f outp errp res secs alt) (Err (invalid-input "fork" "unreachable")))
               :else (unsafe (do (free outp) (free errp) (Ok (ForkChild (sext i64 pid) base))))))))
 
 ;; The exit status as `waitpid` says it: the code, or 128 and the signal.
