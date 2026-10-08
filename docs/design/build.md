@@ -277,7 +277,7 @@ gear-reviews 8, coredns 4, local-path-provisioner 1, metrics-server 1 (unchanged
 **arm64 node (native aarch64 Linux, Ubuntu 24.04 in a vz VM on the M1 Ultra, 7 CPU to jobs)**: there is no linux-aarch64 seed, so the first `fibc` was cross-compiled on lilnas
 (`F build compiler/fibc.fib --target aarch64-unknown-linux-gnu --emit obj`, 120 s) and linked in a pod (`gcc ... -lLLVM-21`): `fibc 0.1.12` / `aarch64`. That `fibc` built F in 109 s, and
 `make gate` (the same pod command) gave: ownership 372 pass, modules 32 pass, stdlib 1475 cases: 1456 pass, 1 fail (1707, expected), 18 open; `ci-stage2: ok (1 expected non-passing)`; fixed point,
-specs, ADRs, `sh-stack-stack`, the other tools and 25 of 28 golden suites pass; `static` passes after `make musl` for aarch64 (musl 1.2.5 tarball put on the volume: pods on this node have no DNS)
+specs, ADRs, `sh-stack-stack`, the other tools and 13 of 16 golden suites pass; `static` passes after `make musl` for aarch64 (musl 1.2.5 tarball put on the volume: pods on this node have no DNS)
 and `wasm` is SKIPPED (the wasi-sdk is x86-64 only). The failures are all tests that assume an x86 host, none a runtime fault: `golden/emit-defs`, `emit-fns`, `lair-llvm` (goldens recorded with the x86 triple and
 data layout), `tools/sh-driver-muladd`, `sh-driver-no-fma`, `sh-driver-cpu-check`, `sh-lanes-lanes` (`'x86-64-v4' is not a recognized processor for this target`), `js-backend` (`differ cases/lir/simd/target.lir`).
 **Weak memory**: the pool cases 8640-8648 at `FIB_THREADS=28` on 7 CPUs, 40 rounds: 40 of 40 passed (about 39 s a round; `k8s/stress-sched.sh`); `scripts/mutant-sched.sh check` (ring overflow, FIB_THREADS=1,2,3: 25 of 25 cases each) passed;
