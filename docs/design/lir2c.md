@@ -71,7 +71,7 @@ FIB_VIA=c FIB_CC=gcc fibc cases cases/ownership   # the case suite judged agains
 - **Vectors are GNU vector types** (`vector_size`), so `+ - * & | ^` and the comparisons are the compiler's and vectorise; a `<N x i1>` is
   a vector of bytes holding 0 or 1 (bit-packed in memory, as LLVM stores it), a `<N x ptr>` a vector of 64-bit addresses. What GNU vectors
   lack (division, saturating conversions, select by mask, masked loads and stores, gathers, scatters, reductions in lane order) is a loop
-  over the lanes. A lane count that is not a power of two has no C translation: an error naming the type and the position.
+  over the lanes. A lane count that is not a power of two is held in the next power of two (`phys-lanes`), the padding lanes never read.
 - **Exported symbols keep their lIR names through asm labels** (`__asm__("name")`, with a `_` prefix on Darwin by `FIB_SYM`), and every
   declared C function is a prototype from the lIR `declare` bound to its symbol the same way (ADR 0011: no header is read; the
   freestanding `<stdint.h>` and `<stddef.h>` are the only includes). A defined, exported function whose name holds a character the
@@ -87,6 +87,11 @@ FIB_VIA=c FIB_CC=gcc fibc cases cases/ownership   # the case suite judged agains
   `pthread_exit`, ADR 0001); `try`/`catch` is the hidden-result convention of docs/design/exceptions.md 9 (ADR 0009), ordinary values
   and branches. There are no landing pads in lIR and no `setjmp` anywhere. The stack-overflow handler (`sigaltstack`, `sigaction`, the
   `siginfo` read by offset) is lIR in `rt/thread.lir` and goes through the printer like everything else.
+- **Every plain access is `aligned(1)`.** lIR promises the ABI alignment of a plain `load`/`store` and calls a misaligned one undefined
+  (6.12); LLVM executes it on x86-64 and AArch64 and the runtime has such sites (section 4, UBSan), so the printer writes every plain access
+  through an `aligned(1)` typedef: the same instruction there, byte accesses where the hardware needs them. Atomics keep their alignment.
+- **A function with a `musttail` call is `noinline`.** gcc 15 inlines such a function and then cannot honour the attribute in the inlined
+  copy ("cannot tail-call: other reasons"); the call is a jump either way.
 - **Allocas are C locals**, one slot per call, except an `alloca` in a block that can reach itself (a loop), which is
   `__builtin_alloca_with_align`, one slot per execution as LLVM gives. Neither fibber's emitter nor the runtime allocas in a loop; the
   rule keeps the printer exact if one day they do.
@@ -102,7 +107,9 @@ The exact messages. `FILE:L:C:` is the lIR position; the C compiler's own diagno
 | `tailcall`, prototypes differ, the callee's stack-passed arguments fit the caller's (the SysV estimate: 6 integer and 8 vector registers, aggregates over 16 bytes in memory) | `musttail` | **error** `..: clang honours musttail only between identical prototypes, and (fn ..) differs from (fn ..); --allow-plain-tail-calls ..` | error as above |
 | `tailcall`, the callee needs more stack-passed argument bytes than the caller has | **error** `tail call to @g in @f cannot be guaranteed: the callee needs N bytes of stack-passed arguments and the caller has M (lIR's tailcc has no C equivalent); --allow-plain-tail-calls lowers it to a plain call` | error as the row above | error |
 | any of the three errors with `--allow-plain-tail-calls` | **warning** `..; lowered to a plain call (--allow-plain-tail-calls): the stack may grow`, and `return g(..)` | the same | the same |
-| `<N x T>` with N not a power of two | **error** `vector type <6 x i32> has no C translation: GNU vector types need a power-of-two lane count` | the same | the same |
+| `tailcall` between `tailcc` functions needing different stack areas | none: every `tailcc` prototype (definitions, declares, the function types of indirect calls) is padded with `int64_t padK` parameters, passed as 0, to the largest stack-passed-argument area any `tailcc` prototype of the module has (`tail-area`), so no callee needs more than its caller has | the same | (not applicable) |
+| `tailcall` whose result the C convention returns through a hidden pointer (a vector over 32 bytes, an aggregate over 16) | **error** `tail call to @g in @f cannot be guaranteed: a result of type <8 x double> is returned through a hidden pointer by the C convention (gcc: "memory reference after call"); --allow-plain-tail-calls ..` | the same | error |
+| `<N x T>` with N not a power of two | none: held in the next power of two, the padding lanes never read, loaded and stored lane by lane | the same | the same |
 | `define kernelcc`, `(sreg R)`, `(barrier)` (spec/lir.md 6.9a) | **error** `@k is kernelcc: kernel target forms have no C translation: use --kernel-target` (`sreg: ..`, `barrier: ..`) | the same | the same |
 | an exported definition whose name is not a plain symbol | **warning** `exported symbol checked-add is f_checked_2dadd in the C: the assembler takes no '-' or other such character in a symbol gcc may clone` | the same | the same |
 | every other construct | translated as section 3 says | the same | the same |
@@ -127,7 +134,7 @@ No `-fwrapv` (the semantics are in the helpers, section 1), no `-fno-strict-alia
 these flags the output compiles with `-Wall -Wextra` clean on gcc 15.2.0 over the three case suites (the differential harness counts a
 warning as a difference).
 
-### `--c-std`
+### `--c-std` (a note, not a flag)
 
 The output is C11 (`-std=gnu11`). GNU-only, and why each is needed: `__attribute__((vector_size))` and `__builtin_shufflevector`,
 `__builtin_convertvector` (vectors); `__attribute__((may_alias, aligned(1)))` (untyped memory); `__attribute__((musttail))` (guaranteed
@@ -195,7 +202,26 @@ is a difference too. Inputs: every `;; expect: accept` case under `cases/lir`, t
 `--emit DIR` the lIR stage 2 makes of each fibber case of DIR. `--reject` adds the reject cases: lir2c must refuse each with lairf's text.
 `--expect compiler/tests/c-backend/expected.txt` fails the run when the non-passing set is not exactly the listed one.
 
-RESULTS-DIFF
+### Results (2026-10-08; gcc 15.2.0, x86-64, this machine)
+
+| Corpus | pass | differ | refused | cc-error | skip |
+|---|---|---|---|---|---|
+| `cases/lir`, `compiler/tests/js/cases`, `compiler/tests/c-backend/cases`, accept and reject (`--reject`) | all but the listed | 1 (listed) | 0 | 0 | 0 |
+| `cases/ownership` and `cases/stdlib` through `fibc emit` (1,584 programs) | 1,561 | 0 | 12 (listed) | 0 | 11 |
+
+Commands: `compiler/tests/c-backend/diff.sh -j 4 --reject --expect compiler/tests/c-backend/expected.txt` ("OK: every ending other than pass is
+listed"), and `diff.sh -j 4 --emit cases/ownership --emit cases/stdlib`. The listed differences: `cases/lir/simd/target-host-lacks.lir`
+(`lairf run` refuses a module whose `(target ..)` asks for AVX-512 on a host without it; `lair build` and lir2c accept it, as in the JS
+backend). The 12 refusals are the tensor cases whose `fib.tensor.vmath.apply-lanes.8` tail-calls functions returning `<8 x double>`: gcc cannot
+jump to a callee that returns through a hidden pointer, and the printer says so (row 4 of section 2); `--allow-plain-tail-calls` makes each
+a warning and a plain call, and the four tried (7003, 7019, 7078, 7961) pass that way. The skips are the `open-` cases stage 2 does not
+compile. **No difference was a bug found in lair or the native path.**
+
+Bugs of the printer found on the way, each fixed and now pinned by a case: `lshr` of the saturating maximum computed on the signed value
+(`cases/lir/simd/convert.lir`); a `let` in operand position dropped its statements (`cases/lir/audit/cmp-aot.lir`); a symbol with a `-`
+in an asm label (`compiler/tests/js/cases/overflow-trap.lir`); pointer-vector lanes; C's rule that a tail call needs a callee whose
+stack-passed arguments fit the caller's, which sent every `tailcc` prototype to a common padded stack area; a result returned in memory;
+gcc inlining a function whose tail call is `musttail`; a lane count that is not a power of two (padding, `phys-lanes`).
 
 ### The case suites through the C route
 
@@ -204,7 +230,21 @@ C (driver.viac) and runs it with `FIB_TRACE=1`, so the audit traces (`;; audit:`
 stage's are. `compiler/tests/c-backend/suite.sh` runs the three directories and compares the non-passing set with
 `compiler/tests/c-backend/expected-gcc.txt` (and `expected-clang.txt`).
 
-RESULTS-SUITES
+Through gcc 15.2.0 (`compiler/tests/c-backend/suite.sh --fibc F --cc gcc -j 4`):
+
+| Directory | Cases | pass | fail | open | time |
+|---|---|---|---|---|---|
+| `cases/ownership` | 372 | 372 | 0 | 0 | 53 s |
+| `cases/modules` | 32 | 32 | 0 | 0 | 4 s |
+| `cases/stdlib` | 1,426 | 1,395 | 13 | 18 | 434 s |
+
+"the non-passing set is exactly `expected-gcc.txt`": the 13 are `1707` (fails natively too, `scripts/ci-stage2.expected`) and the 12 tensor
+cases above, each with its reason in the file. The audit cases pass: the traces are the executable's own. **Not run through clang**: clang
+is not installed on this machine and ADR 0020 forbids a quiet download; the clang rows of section 2 (musttail only between identical
+prototypes) are from its documentation, `expected-clang.txt` does not exist, and the printer's padding of `tailcc` prototypes equalises
+only the stack area, not the parameter lists, so on clang every tail call between differing prototypes is an error until
+`--allow-plain-tail-calls` (or a later universal-prototype step). Run `suite.sh --cc clang` where clang exists and read what it refuses. The `cases/stdlib` count of the merged tree is 1,454 (the floor); the table is the count
+at the time of the run, before the merge.
 
 ### The fixed point through C
 
@@ -212,21 +252,49 @@ RESULTS-SUITES
 equal `F emit compiler/fibc.fib`, the LLVM-built F's. The strongest test of the printer: the compiler is 30 MB of lIR, every construct
 fibber emits, compiled by gcc and then compiling itself.
 
-RESULTS-FIXED
+```
+F_c built through gcc -O2 in 113 s: 77996252 bytes of C, 1676108 lines; F_c is 7947968 bytes (F: 10252024)
+F emit: 22 s, 31462597 bytes; F_c emit: 27 s, 31462597 bytes
+OK: F_c emit compiler/fibc.fib == F emit compiler/fibc.fib (a58cf90099d52536)
+```
+
+The compiler built through gcc emits the same 31,462,597 bytes of lIR as the LLVM-built one. (F_c is smaller than F: it is built by the C
+compiler at `-O2` from C with `-march=native`; F is LLVM's.) Not done: the same with clang (not installed).
 
 ### The UB hunt
 
 `compiler/tests/c-backend/ubsan.sh`: the C of each stdlib case compiled with `-fsanitize=undefined,address` (gcc's sanitizers; clang is
 not on this machine) and run; the bar is zero reports.
 
-RESULTS-UBSAN
+`ubsan.sh` over every `cases/ownership` case and every sixth `cases/stdlib` case (526 programs): **clean 523, report 0, differ 0, skip 3**
+(two `open-` cases fibc cannot emit, and `8354`, which faults on purpose to reach the runtime's own SIGSEGV handler). The first run reported 13
+programs, all one cause: **misaligned plain accesses**, which lIR (6.12) calls undefined and LLVM executes on x86-64 and AArch64:
+`rt/str.lir`'s UTF-8 scan loads an `i64` at any byte offset (`(load i64 (getelementptr i8 p i))`, no `(align 1)`), and the emitter stores an
+`i64` into a `[8 x i8]` field of a task at offset 4 mod 8 (`store (i64 0) t3`, cases 32, 176, 269). These are findings for the owners of
+`rt/str.lir` and `emit.lower`; the printer's answer is `aligned(1)` on every plain access (c.mem `unaligned?`), a defined translation that
+costs nothing on those targets. The two `AddressSanitizer failed to allocate` lines of the OOM cases (195, 922) are the cases' own purpose.
+Leaks are off (the audit counts them on purpose). `-Wall -Wextra` is clean over the suites with the flags of section 2 (the harness
+counts a gcc warning as a difference).
 
 ### The planted faults
 
 `scripts/mutant-lir2c.sh` deforms a copy of the backend one way at a time, rebuilds lir2c from it and runs the targeted cases through the
 differential harness (or a textual check of the C):
 
-RESULTS-MUTANTS
+| Fault | Killed by |
+|---|---|
+| `wrap-trap`: the overflow flag always 0 | `c-backend/cases/arith-edges.lir`, `js/cases/overflow-trap.lir` |
+| `signed-shift`: `lshr` shifts the signed value | `arith-edges.lir` |
+| `strict-alias`: the typedefs lose `may_alias` | `alias-align.lir` (a loop and two pointers of one value stored and loaded as different types) |
+| `musttail`: the attribute dropped (judged at -O0; at -O2 gcc's own sibling-call pass rescues these programs) | `audit/t-cf.lir`, `audit/t-tail-many-tailcc.lir`, `tail-lanes.lir` |
+| `atomic-order`: `seq_cst` written relaxed | a textual check of the C of `instr/atomic.lir` (a weaker order is not observable on x86) |
+| `lane-order`: `shufflevector` operands swapped | `tail-lanes.lir` |
+| `phi-copy`: phis assigned one by one, and read back through the phi variable | `js/cases/branches.lir` (two phis that swap; fib by a pair swap) |
+| `fallthrough`: an unconditional `br` emits no `goto` | `fallthrough.lir` |
+| `align`: `aligned(1)` dropped | `alias-align.lir` |
+
+"killed" nine of nine, after two rounds: `strict-alias` and `musttail` first survived (the first tests did not make gcc exploit the
+fault), and `phi-copy` (the printer's edges read the let-bound copies, so the copy cannot be dropped alone); each was sharpened until it died.
 
 The backend's own cases (`compiler/tests/c-backend/cases/`) pin the semantics the planted faults attack: `arith-edges.lir` (wrapping,
 shifts, division, the counts, the overflow intrinsics, saturation, fmin/fmax, fma, bitcasts, masks), `alias-align.lir` (type punning,
@@ -237,7 +305,32 @@ stdlib cases 8600 to 8639 are fibber programs with the same edges (section 4.1 o
 
 ## 5. Speed
 
-RESULTS-SPEED
+`compiler/tests/c-backend/speed.sh --fibc F --cc gcc -n 3` (median of 3, wall seconds, `/tmp/fibsuite.lock` held, native = LLVM `-O2` with the
+host CPU, C = gcc 15.2.0 `-O2 -march=native`; the outputs are identical in every row):
+
+| Program | native s | C s | C / native |
+|---|---|---|---|
+| lazy-bound | 0.04 | 0.08 | 2.00 |
+| lazy-fused | 0.90 | 1.87 | 2.07 |
+| map-assoc-get | 0.36 | 0.41 | 1.13 |
+| num-f64 | 1.85 | 1.89 | 1.02 |
+| num-nbody | 0.74 | 1.00 | 1.35 |
+| set-conj | 0.36 | 0.35 | 0.97 |
+| strings | 0.79 | 0.69 | 0.87 |
+| vec-conj-pop | 1.08 | 1.38 | 1.27 |
+| vec-index | 0.44 | 0.66 | 1.50 |
+| vec-sort | 0.81 | 0.88 | 1.08 |
+| n-body (shootout, 500 000) | 0.07 | 0.08 | 1.14 |
+| binary-trees (16) | 0.17 | 0.16 | 0.94 |
+| fannkuch-redux (10) | 0.16 | 0.17 | 1.06 |
+| mandelbrot (2000) | 0.20 | 0.19 | 0.95 |
+| fasta (1 000 000) | 0.10 | 0.10 | 1.00 |
+
+Within 10% on 8 of 15 programs, and ahead of LLVM on 4 of those; 13% and 14% behind on two (`map-assoc-get`, `n-body`), and 27% to 2.1 times
+behind on five (`vec-conj-pop`, `num-nbody`, `vec-index`, `lazy-bound`, `lazy-fused`). The owner's hope (within 10%) is met by about half. The short runs (0.04 to 0.2 s) are noisy. No profile was taken of the slow rows; the likely causes are
+gcc not inlining across the many small `tailcc` functions the way LLVM does (each musttail function is `noinline`, c.func) and the
+`aligned(1)` accesses being opaque to gcc's alias analysis. Not measured: clang. Build time: the compiler itself takes gcc 113 s at `-O2`
+for 78 MB of C.
 
 ## 6. Bootstrap with only a C compiler
 
@@ -247,7 +340,21 @@ RESULTS-SPEED
 compiler needs the LLVM library at link time. What the C route gives today is a compiler built without an LLVM *compiler* (no clang, no
 seed binary), from a C file and the LLVM shared library.
 
-RESULTS-BOOTSTRAP
+`scripts/bootstrap-c.sh fibc.c OUT` in a `ubuntu:25.10` container with `gcc 15.2.0`, `libc6-dev` and `libllvm21` installed (the LLVM shared
+library; no clang, no fibber, `which clang fibc` empty), the tree mounted read-only (an Alpine or `debian:slim` image has no LLVM 21 library
+in its repositories, and building one is another package):
+
+```
+clang: none; fibc: none; gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
+bootstrap: cc cc (Ubuntu 15.2.0-4ubuntu4) 15.2.0; LLVM library LLVM-21 in /usr/lib/x86_64-linux-gnu
+bootstrap: fibc.c (77996252 bytes) compiled in 89 s: /out/work/fibc-c (7931696 bytes)
+fibc 0.1.12
+bootstrap: fibc-c built compiler/fibc.fib (LLVM, stage 2 of this tree) in 108 s: /out/work/F3
+bootstrap: OK, the fixed point holds: fibc-c and F3 emit the same lIR for compiler/fibc.fib (31462597 bytes, 46 s for both emits)
+```
+
+`fibc.c` is 78 MB (1.68 million lines; 10 MB compressed): too large to check in, so it is a release artifact
+(`fibc build --emit c compiler/fibc.fib -o fibc.c`), not a file of the tree.
 
 ## 7. Static via C
 
@@ -255,7 +362,15 @@ RESULTS-BOOTSTRAP
 the musl pieces of docs/design/static-linking.md (native.linkstatic `link-static-object`): no LLVM anywhere on the path, and no libc of
 the build machine is read (the generated C includes only the freestanding headers).
 
-RESULTS-STATIC
+```
+$ fibc --via c --cc gcc --static build hello.fib -o hello-static     (FIB_MUSL_DIR = the musl pieces of scripts/build-musl.sh)
+hello-static: ELF 64-bit LSB executable, x86-64, statically linked        83,200 bytes
+$ ldd hello-static            not a dynamic executable
+$ docker run --rm -v hello-static:/hello:ro <empty image> /hello           hello  (exit 0)
+```
+
+The image is `docker import` of an empty tar: nothing in it but the file. Cross: `F2 --target aarch64-unknown-linux-gnu --via c --cc
+aarch64-linux-gnu-gcc build hello.fib` makes an aarch64 PIE that prints `hello` under `qemu-aarch64`.
 
 ## 8. Not in this package
 
