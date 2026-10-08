@@ -3,7 +3,7 @@
 # A tool script holds one job of make's -j; what it runs inside is its own (docs/design/build.md 3). Each runs under TOOLS_TIMEOUT seconds
 # with FIBC = F, its scratch under build/tools/out/<name>; its output is build/tools/<name>.log.
 TOOLS_DIR := $(BUILD)/tools
-TOOLS_OUT := $(ABS_BUILD)/tools/out
+TOOLS_OUT := $(SCRATCH)/tools
 T := compiler/tests
 FUZZ_SELFTEST_DEADLINE ?= 8000
 tool_env := env FIBC=$(F_ABS) FUZZ_SELFTEST_DEADLINE=$(FUZZ_SELFTEST_DEADLINE) RESUME_OUT=$(TOOLS_OUT)/resume WINDOWS_SCRATCH=$(TOOLS_OUT)/windows
@@ -63,8 +63,8 @@ after_bar = $(if $(1),$(if $(filter |,$(firstword $(1))),$(wordlist 2,999999,$(1
 
 define tool_target
 $(TOOLS_DIR)/$(1).ok: $(F) $(call after_bar,$(tool_$(1))) | $(TOOLS_DIR)/
-	mkdir -p $(TOOLS_OUT)/$(1)
-	$$(call stamp,timeout $(TOOLS_TIMEOUT) $(tool_env) TMPDIR=$(TOOLS_OUT)/$(1) $(call upto_bar,$(tool_$(1))))
+	rm -rf $(TOOLS_OUT)/$(1) $(TOOLS_OUT)/$(1).tmp; mkdir -p $(TOOLS_OUT)/$(1).tmp
+	$$(call stamp,timeout $(TOOLS_TIMEOUT) $(tool_env) TMPDIR=$(TOOLS_OUT)/$(1).tmp $(call upto_bar,$(tool_$(1))))
 endef
 $(foreach t,$(TOOLS_FULL),$(eval $(call tool_target,$(t))))
 TOOLS_QUICK_STAMPS := $(addsuffix .ok,$(addprefix $(TOOLS_DIR)/,$(TOOLS_QUICK)))

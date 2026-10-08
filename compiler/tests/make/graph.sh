@@ -52,15 +52,15 @@ out=$(M -n gate-stamps 2>&1); rc=$?; n=$(echo "$out" | grep -c -v '^make\|^$' ||
 if [ "$rc" -eq 0 ] && [ "$n" -eq 0 ]; then ok "2b make -n gate-stamps runs no recipe"; else fail "2b make -n gate-stamps (exit $rc) would run $n lines: $(echo "$out" | head -3)"; fi
 
 # 3 one tool stamp older than its script: only that recipe runs
-touch -d '-1 day' "$B/tools/lint-pipefail.ok"
+touch -d '-1 day' "$B/tools/gen-skeleton.ok"
 run=$(M -n gate-stamps | grep -v '^make')
-if echo "$run" | grep -q 'scripts/lint-pipefail.sh' && [ "$(echo "$run" | grep -c 'rm -f ')" -eq 1 ]; then ok "3 an old tool stamp reruns alone (1 recipe: lint-pipefail)"; else fail "3 expected exactly the lint-pipefail recipe, got: $(echo "$run" | grep -c 'rm -f ') recipes"; fi
-touch "$B/tools/lint-pipefail.ok"
+if echo "$run" | grep -q 'tests/gen/skeleton.sh' && [ "$(echo "$run" | grep -c 'rm -f ')" -eq 1 ]; then ok "3 an old tool stamp reruns alone (1 recipe: gen-skeleton)"; else fail "3 expected exactly the gen-skeleton recipe, got: $(echo "$run" | grep -c 'rm -f ') recipes"; fi
+touch "$B/tools/gen-skeleton.ok"
 
 # 4 F older than a compiler source: F rebuilds and everything downstream reruns
 touch -d '-1 day' "$B/F"
 run=$(M -n gate-stamps | grep -v '^make')
-for want in 'build compiler/fibc.fib' 'cases cases/stdlib' 'golden.sh' 'scripts/lint-pipefail.sh' 'adr --strict'; do
+for want in 'build compiler/fibc.fib' 'cases cases/stdlib' 'golden.sh' 'tests/gen/skeleton.sh' 'adr --strict'; do
   echo "$run" | grep -q -- "$want" || { fail "4 with F out of date, nothing runs for: $want"; want=; }
   [ -n "$want" ] && ok "4 with F out of date the dry run has: $want"
 done
@@ -78,8 +78,8 @@ cp Makefile "$S/Makefile"; cp mk/*.mk "$S/mk/"
 sed -i 's|^$(TOOLS_DIR)/$(1).ok: $(F) $(call after_bar|$(TOOLS_DIR)/$(1).ok: $(call after_bar|' "$S/mk/tools.mk"
 grep -q '^$(TOOLS_DIR)/$(1).ok: $(call after_bar' "$S/mk/tools.mk" || { fail "6 the plant did not take (the tool rule changed shape?)"; }
 touch -d '-1 day' "$B/F"
-real=$(M -n "$B/tools/lint-pipefail.ok" | grep -c 'scripts/lint-pipefail.sh' || true)
-planted=$(make --no-print-directory -f "$S/Makefile" BUILD="$B" -n "$B/tools/lint-pipefail.ok" | grep -c 'scripts/lint-pipefail.sh' || true)
+real=$(M -n "$B/tools/gen-skeleton.ok" | grep -c 'tests/gen/skeleton.sh' || true)
+planted=$(make --no-print-directory -f "$S/Makefile" BUILD="$B" -n "$B/tools/gen-skeleton.ok" | grep -c 'tests/gen/skeleton.sh' || true)
 if [ "$real" -eq 1 ] && [ "$planted" -eq 0 ]; then ok "6 a tool stamp without its F prerequisite is caught: the real graph reruns it after F, the planted copy does not"
 else fail "6 real graph reran the tool stamp $real times, the planted copy $planted (want 1 and 0)"; fi
 touch "$B/F"; sleep 0.05; touch "$B"/*.ok "$B"/golden/*.ok "$B"/tools/*.ok "$B"/cases/*.ok

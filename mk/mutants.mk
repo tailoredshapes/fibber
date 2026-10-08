@@ -3,7 +3,7 @@
 # F, the script and the files it plants into (the .fib and .lir paths the script names). Not in the gate (mutation reviews run beside it);
 # `make -j8 mutants` runs them all, `make build/mutants/json.ok` one. Each runs with FIBC = F and its scratch under build/mutants/out/<name>.
 MUTANTS_DIR := $(BUILD)/mutants
-MUTANTS_OUT := $(ABS_BUILD)/mutants/out
+MUTANTS_OUT := $(SCRATCH)/mutants
 # what a mutant script plants into: the lib/, compiler/ and rt/ files its text names
 mutant_files = $(sort $(wildcard $(shell grep -o -E '(lib|compiler|rt)/[A-Za-z0-9_./-]+\.(fib|lir)' scripts/mutant-$(1).sh)))
 # the scripts that take [MUTANT..] (default: all) or nothing

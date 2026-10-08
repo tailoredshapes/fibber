@@ -17,7 +17,7 @@ endif
 # file: a rebuilt generator (a new seed, a prelude change) does not by itself rewrite the committed file, since its content would be the same
 # and F would be rebuilt for nothing; a changed rt/*.lir does. A hand-edited runtime.fib is newer than rt/, so it is not regenerated either:
 # build/runtime-drift.ok (which does depend on the generator) is what catches both.
-$(GEN_RUNTIME): compiler/tests/emit/gen-runtime.fib lib/prelude.fib $(BUILDER) | $(BUILD)/ $(BUILD)/tmp/
+$(GEN_RUNTIME): compiler/tests/emit/gen-runtime.fib lib/prelude.fib $(BUILDER) | $(BUILD)/
 	$(BUILDER) build $< $(BUILD_ARGS) -o $@
 $(RUNTIME_FIB): $(RT_LIR) | $(GEN_RUNTIME)
 	$(GEN_RUNTIME) rt > $@.new && mv $@.new $@
@@ -26,7 +26,7 @@ $(BUILD)/runtime-drift.ok: $(RUNTIME_FIB) $(RT_LIR) $(GEN_RUNTIME) | $(BUILD)/
 runtime: $(RUNTIME_FIB) $(BUILD)/runtime-drift.ok   ## regenerate compiler/emit/runtime.fib from rt/*.lir and check the committed file equals it
 
 # Stage 2: F, built by the seed (or BUILDER); F.lir is what F emits for itself; F3 is built by F; the fixed point is F.lir = F3.lir.
-$(F): $(COMPILER_SRC) $(BUILDER) $(LLVM_DEP) $(FRESH) | $(BUILD)/ $(BUILD)/tmp/
+$(F): $(COMPILER_SRC) $(BUILDER) $(LLVM_DEP) $(FRESH) | $(BUILD)/
 	rm -f $@ $(BUILD)/F3 $(BUILD)/F.lir $(BUILD)/F3.lir
 	t0=$$(date +%s); $(BUILDER) build compiler/fibc.fib $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $(BUILD)/F.log 2>&1 || { tail -n 20 $(BUILD)/F.log; exit 1; }; mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $(BUILD)/F.secs
 $(BUILD)/F.lir: $(F)

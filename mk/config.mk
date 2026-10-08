@@ -52,7 +52,11 @@ LIMIT_STDLIB ?= 1800
 
 # The environment every fibc of the build sees: the tree's library, scratch under build/, no LD_LIBRARY_PATH (a stage 2 links LLVM itself).
 export FIB_LIB := $(ROOT)/lib
-export TMPDIR := $(ABS_BUILD)/tmp
+# TMPDIR is outside the tree on purpose: with TMPDIR inside the worktree, cases/stdlib/8283 fails in a shard (expected 0, got 4294967296) and passes
+# with TMPDIR elsewhere (found in MAKE-1; reported, not explained). SCRATCH holds it, and the tool scripts' scratch.
+SCRATCH ?= $(HOME)/.cache/fibber-scratch/make-$(notdir $(ROOT))
+export TMPDIR := $(SCRATCH)/tmp
+$(shell mkdir -p $(TMPDIR))
 unexport LD_LIBRARY_PATH
 unexport GATE_SLOTS
 

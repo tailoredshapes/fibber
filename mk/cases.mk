@@ -29,7 +29,7 @@ endef
 # a directory run in one shard (K = 1) is run without --only, as CI always ran it.
 define shard_rule
 NAMES_$(1).$(4) := $(call shard_of,$(6),$(3),$(4))
-$(CASES_DIR)/$(1).$(4).txt: $(F) $$(call case_files,$(2),$$(NAMES_$(1).$(4))) $(SUPPORT_FILES) | $(CASES_DIR)/ $(BUILD)/tmp/
+$(CASES_DIR)/$(1).$(4).txt: $(F) $$(call case_files,$(2),$$(NAMES_$(1).$(4))) $(SUPPORT_FILES) | $(CASES_DIR)/
 	$$(call run_shard,$(2),$(5),$(if $(or $(7),$(filter-out 1,$(3))),--only $$(NAMES_$(1).$(4)),))
 endef
 $(foreach k,$(call SHARD_IDX,$(SHARDS)),$(eval $(call shard_rule,stdlib,stdlib,$(SHARDS),$(k),$(LIMIT_STDLIB),$(STDLIB_NAMES))))

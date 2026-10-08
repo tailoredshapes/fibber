@@ -21,7 +21,7 @@ endif
 release_build = FIB_TARGET_CPU=$(RELEASE_CPU) $(1) build compiler/fibc.fib $(BUILD_ARGS) $(RELEASE_LLVM_ARGS) -o $(2)
 release_emit = FIB_TARGET_CPU=$(RELEASE_CPU) $(1) emit $(BUILD_ARGS) compiler/fibc.fib
 
-$(RELEASE_DIR)/F: $(COMPILER_SRC) $(BUILDER) $(RELEASE_LLVM_DEP) $(BUILD)/version.ok | $(RELEASE_DIR)/ $(BUILD)/tmp/
+$(RELEASE_DIR)/F: $(COMPILER_SRC) $(BUILDER) $(RELEASE_LLVM_DEP) $(BUILD)/version.ok | $(RELEASE_DIR)/
 	$(call release_build,$(BUILDER),$@.new) && mv $@.new $@
 $(RELEASE_DIR)/emit.seed: $(COMPILER_SRC) $(BUILDER) | $(RELEASE_DIR)/
 	$(call release_emit,$(BUILDER)) > $@.new && mv $@.new $@

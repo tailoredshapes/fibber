@@ -20,7 +20,7 @@ MUSL_LIBC := $(firstword $(wildcard $(MUSL_DIR)/$(MUSL_ARCH)/libc.a $(MUSL_DIR)/
 STATIC_CASES := 655- 665- 1709- 2228- 2650- 4005- 6106- 6222- 7304- 8000- 8001- 8002- 8003- 8060- 8061-
 STATIC_INPUTS := $(OWNERSHIP_NAMES:%=cases/ownership/%) $(call case_files,modules,$(MODULES_NAMES)) $(wildcard compiler/tests/driver/linklib.sh compiler/tests/driver/linklib/*) \
   $(foreach p,$(STATIC_CASES),$(wildcard cases/stdlib/$(p)*))
-$(BUILD)/static.ok: $(F) $(STATIC_INPUTS) $(MUSL_LIBC) | $(BUILD)/ $(BUILD)/tmp/
+$(BUILD)/static.ok: $(F) $(STATIC_INPUTS) $(MUSL_LIBC) | $(BUILD)/
 ifeq ($(MUSL_LIBC),)
 	$(call skip,no musl pieces (FIB_MUSL_DIR, or make musl): the static build was not tested)
 else
@@ -31,7 +31,7 @@ else
 endif
 static: $(BUILD)/static.ok   ## cases as static (musl) executables, when the musl pieces are there
 # The musl pieces themselves (scripts/build-musl.sh: the pinned musl source, sha256 checked, built with gcc): `make musl`, or for aarch64 `make musl MUSL_ARCH=aarch64`.
-$(BUILD)/musl/$(MUSL_ARCH)/libc.a: scripts/build-musl.sh rt/static/cpuid.c | $(BUILD)/tmp/
+$(BUILD)/musl/$(MUSL_ARCH)/libc.a: scripts/build-musl.sh rt/static/cpuid.c |
 	scripts/build-musl.sh $(MUSL_ARCH) $(@D) $(MUSL_TARBALL)
 musl: $(BUILD)/musl/$(MUSL_ARCH)/libc.a   ## build the musl pieces of `fibc build --static` into build/musl/<arch>/ (downloads musl, sha256 checked)
 
@@ -41,7 +41,7 @@ TOOLS_CACHE ?= $(HOME)/.cache/fibber-scratch/tools
 WASI_SDK ?= $(patsubst %/,%,$(lastword $(wildcard $(TOOLS_CACHE)/wasm/wasi-sdk-*/)))
 export WASI_SDK
 WASM_INPUTS := $(wildcard compiler/tests/wasm/*) $(OWNERSHIP_NAMES:%=cases/ownership/%) $(call case_files,modules,$(MODULES_NAMES))
-$(BUILD)/wasm.ok: $(F) $(WASM_INPUTS) | $(BUILD)/ $(BUILD)/tmp/
+$(BUILD)/wasm.ok: $(F) $(WASM_INPUTS) | $(BUILD)/
 ifeq ($(or $(WASI_SDK),$(WASM_LD),$(shell command -v wasm-ld 2> /dev/null)),)
 	$(call skip,no wasm toolchain (make fetch-wasm, then WASI_SDK): the wasm32-wasi build was not tested)
 else ifeq ($(shell command -v node 2> /dev/null),)
