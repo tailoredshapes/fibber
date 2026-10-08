@@ -1,0 +1,27 @@
+;; spec:   types §2.17 (the gpu builtins: atomics), lir §6.6 (atomicrmw); docs/design/gpu.md 6.6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib ../../examples/gpu ../../examples/webgpu
+;; The atomics kernels of examples/gpu/atomics.fib run on the host over a grid (host-launch runs the threads one after another, so the atomic is one `atomicrmw` at a time):
+;; `hist` (atomic add) gives the CPU's count of 16 bins, and `tally` the count above a limit (add), the signed maximum and minimum (max, min) and the unsigned maximum (umax).
+(ns main (:require [fib.gpu :as gpu] [atomics :as a] [fib.gpu.reduce-ref :as ref]))
+(defun bins (xs: (Array i32)) -> (Array i32)
+  (let [out (cell (array 16 0i32))]
+    (do (dotimes (i (array-len xs))
+          (let [k (sext i64 (bit-and (array-get xs i) 15i32))] (array-set! &out k (+ 1i32 (array-get @out k)))))
+        @out)))
+(defun main () -> i64
+  (let [n 10000 raw (ref/data-i32 n 3) data (cell (array n 0i32)) h (cell (array 16 0i32)) t (cell (array 4 0i32))]
+    (do (dotimes (i n) (array-set! &data i (bit-and (array-get raw i) 15i32)))
+        (gpu/host-launch [(quot (+ n 255) 256)] [256] (fn () (a/hist (gpu/array-data-i32 @data) (gpu/array-data-i32 @h) (trunc i32 n))))
+        (array-set! &t 1 -2147483648i32) (array-set! &t 2 2147483647i32)
+        (gpu/host-launch [(quot (+ n 255) 256)] [256] (fn () (a/tally (gpu/array-data-i32 raw) (gpu/array-data-i32 @t) (trunc i32 n) 1000000i32)))
+        (let [want (bins @data)
+              above (loop [i 0 c 0i32] (if (>= i n) c (recur (+ i 1) (if (> (array-get raw i) 1000000i32) (+ c 1i32) c))))
+              umax (loop [i 0 m 0] (if (>= i n) m (recur (+ i 1) (let [u (bit-and (sext i64 (array-get raw i)) 4294967295)] (if (> u m) u m)))))]
+          (+ (loop [k 0 bad 0] (if (>= k 16) bad (recur (+ k 1) (if (= (array-get @h k) (array-get want k)) bad (+ bad 1)))))
+             (if (= (array-get @t 0) above) 0 1)
+             (if (= (array-get @t 1) (ref/max-i32 raw)) 0 1)
+             (if (= (array-get @t 2) (ref/min-i32 raw)) 0 1)
+             (if (= (bit-and (sext i64 (array-get @t 3)) 4294967295) umax) 0 1))))))

@@ -1,0 +1,9 @@
+;; fib.gpu.reduce-atomic-f32: the one grid reduction that needs an f32 atomic add, so it is for PTX only (WGSL refuses `atomicrmw fadd` by name, webgpu.md 3.7);
+;; the rest are in fib.gpu.reduce-kernels. `(reduce-sum-f32 data out n)` as that module's kernels: `out[0]` starts at 0.0, each block adds its tree sum with one
+;; `atomicrmw fadd`. NOT deterministic: the blocks add in the order they finish, so two runs may differ in the last bits. The bound against the CPU's left-to-right
+;; sum is the usual one, n * 2^-24 * sum |x|; fib.gpu.reduce-kernels' `reduce-partials-f32` is the deterministic form (the host adds the partials).
+(ns fib.gpu.reduce-atomic-f32 (:use fib.core) (:require [fib.gpu :as gpu] [fib.gpu.reduce :as r] [fib.gpu.reduce-kernels :as k]))
+
+(defkernel reduce-sum-f32 (data: ptr out: ptr n: i32 blocks: i32)
+  (let ((blk (r/block-sum-f32 (k/thread-sum data n (k/threads blocks)))))
+    (gpu/f32-add! out 0i32 (r/sel-f32 (= (r/tid) 0i32) blk 0.0f32))))

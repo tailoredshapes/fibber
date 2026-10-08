@@ -194,9 +194,13 @@ rounding) and compares with a tolerance, as gpu.md 2.1 derives one for sums in a
   in a function whose control flow before it depends on thread-varying data (a data-dependent `trap` path, an early `return`) is refused by Tint
   (the error is Dawn's, `the WGSL does not compile`, with the line); gpu.md 6.2's checker rule, "a barrier is not under an index-dependent condition", is its
   source-level half.
-* **Atomics**: `atomicAdd`, `atomicMax` .. on `atomic<i32>`/`atomic<u32>` in storage and workgroup memory; lIR's `atomicrmw` maps one to one
-  once a buffer can be declared `array<atomic<u32>>` (the printer would need the element type per buffer: a kernel attribute, or the
-  signature's `atomic ptr`). Not built.
+* **Atomics** (GPU-3, native/wgsl/atomic.fib): `atomicAdd`, `atomicMax` .. work on `atomic<i32>`/`atomic<u32>` in storage and workgroup memory only, and the
+  variable's type says so. The buffers are shared by every kernel of the module and bound by position, so the whole module switches: a module with an `atomicrmw`
+  or `cmpxchg` in any function prints every storage buffer as `array<atomic<u32>>`, every workgroup array as `array<atomic<u32>, N>`, and every plain access as
+  `atomicLoad`/`atomicStore` (`Wx.atomics`); a module with none prints the plain `array<u32>` (the golden kernels.wgsl is unchanged). `atomicrmw add/umin/umax/xchg`
+  on an i32 are the helpers `fibw_atomic_add` .. (a switch on the `Ptr`'s buffer, as `fibw_ld_u32`); signed `min`/`max` are a loop of `atomicCompareExchangeWeak`
+  (the buffer holds u32); `cmpxchg` answers the old value and retries a spurious failure of the weak exchange. Refused by name: an f32 atomic (`fadd`), a 64-bit
+  one, an atomic load or store, a cmpxchg whose success flag is used. Verified by naga, Tint and a run on an adapter (gpu-device.sh).
 * **f16**: behind WebGPU's `shader-f16` feature (`enable f16;` in the WGSL, `requiredFeatures` at device creation); lIR has no half type
   (gpu.md 6.5); when it has, `half` is `f16` here, with the feature requested by the driver when the WGSL enables it. Design only.
 * **64-bit**: never; an i64 kernel is refused by name. Index arithmetic is the one place i64 shows (GPU-2's `gpu/global-id` and the `ptr+` offset are i64): the
@@ -340,7 +344,7 @@ the MSL must be fibber's own. Not run: the Mac was not used in this package (`sc
    `fibgen` removes in turn.
 2. Timestamp queries in the drivers (the bench is wall clock), a persistent staging buffer for downloads, a uniform ring for launches.
 3. Structured printing of loops (the relooper): the shared-memory GEMM's 20x gap to the register-tiled one (section 2) is the test of whether the loop-and-switch
-   form is the cause; it would also lift the uniformity rule of 3.6 for barriers after thread-varying control flow. Atomics and f16 as they land in lIR.
+   form is the cause; it would also lift the uniformity rule of 3.6 for barriers after thread-varying control flow (gpu.md 12: even a branch AFTER the barrier in the same function trips Tint, today). f16 as it lands in lIR.
 4. The hardware Chromium run (6.2) on a machine whose Chromium is not sandboxed from the GPU; the Mac (section 7).
 5. `fib.gpu.contract` for 32-bit kernels: its kernels take `n: i64`; a WGSL driver cannot pass it. An i32 flavour of the contract in fib.gpu (parameterised by the
    index type) would let every driver run the same scenarios; today the driver's spec is a copy of its questions (section 5.2).

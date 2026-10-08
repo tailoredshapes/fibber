@@ -5,7 +5,8 @@
 ;; the private copies the entry sets (`fibw_lid`, `fibw_wid`, `fibw_nwg`) and the override `wg_x`.. for the block size. A string constant (a
 ;; trap's message, which only the runtime's trap entries take) is a null `Ptr`: the message is lost on the device, as on CUDA. OWNER: package WEBGPU-1.
 (ns native.wgsl.expr
-  (:use lir.types lir.lit lir.ast native.wgsl.wx))
+  (:use lir.types lir.lit lir.ast native.wgsl.wx)
+  (:require [native.wgsl.atomic :as atomic]))
 
 ;; ---------------------------------------------------------------- literals
 
@@ -84,10 +85,32 @@
 
 (defun extract-form :private (wf: Wf a: LExpr idx: (Vec LLit)) -> str
   (let ((k (if (= (count idx) 1) (unwrap-or (lit->i64 (nth idx 0)) 9) 9)))
-    (cond (not (= (wgsl-type (type-of! wf a)) (some "OvI32"))) (refuse wf "extractvalue of an aggregate that is not a checked result")
+    (cond (and (= k 0) (is-cmpxchg? a)) (cmpxchg-old wf a)
+          (not (= (wgsl-type (type-of! wf a)) (some "OvI32"))) (refuse wf "extractvalue of an aggregate that is not a checked result")
           (= k 0) (str (wf-expr wf a) ".v")
           (= k 1) (str (wf-expr wf a) ".o")
           :else (refuse wf "extractvalue beyond the checked pair"))))
+
+;; ---------------------------------------------------------------- atomics (native.wgsl.atomic)
+
+(defun is-cmpxchg? :private (a: LExpr) -> bool (match (. a kind) ((KCmpXchg _ _ _ _ _ _ _) true) (_ false)))
+
+;; `(atomicrmw OP ord p v)` on an i32: the helper of the prelude, bits in and out; the old value is the answer.
+(defun rmw-form :private (wf: Wf op: LRmwOp p: LExpr v: LExpr) -> str
+  (let ((t (type-of! wf v)))
+    (cond (= t ty-float) (refuse wf "an f32 atomic (WGSL has atomic<i32> and atomic<u32> only; accumulate in i32 with a scale, or reduce in the workgroup)")
+          (not (= t ty-i32)) (refuse wf (str "an atomic on " (type-refusal t) " (WGSL atomics are 32-bit)"))
+          :else (match (atomic/rmw-helper op)
+                  ((some h) (i32-of (str h "(" (wf-expr wf p) ", " (u32-of (wf-expr wf v)) ")")))
+                  (nil (refuse wf "an atomicrmw operation WGSL lacks (add, min, max, umin, umax and xchg on i32 are its)"))))))
+
+;; The old value of `(cmpxchg ord ord p expected new)` (the first of its pair).
+(defun cmpxchg-old :private (wf: Wf a: LExpr) -> str
+  (match (. a kind)
+    ((KCmpXchg _ _ _ _ p e n) (if (not (= (type-of! wf e) ty-i32))
+                                  (refuse wf (str "a cmpxchg on " (type-refusal (type-of! wf e)) " (WGSL atomics are 32-bit)"))
+                                  (i32-of (str "fibw_atomic_cas(" (wf-expr wf p) ", " (u32-of (wf-expr wf e)) ", " (u32-of (wf-expr wf n)) ")"))))
+    (_ (refuse wf "not a cmpxchg"))))
 
 ;; ---------------------------------------------------------------- comparisons and casts
 
@@ -299,8 +322,8 @@
     ((KGep _ t p idx) (gep-form wf t p idx))
     ((KStr _) "Ptr(0u, 0u)")
     ((KLet _ _) (refuse wf "a let in operand position"))
-    ((KAtomicLoad _ _ _ _) (refuse wf "an atomic (not in this target yet)"))
-    ((KAtomicStore _ _ _ _) (refuse wf "an atomic (not in this target yet)"))
-    ((KAtomicRmw _ _ _ _ _) (refuse wf "an atomic (not in this target yet)"))
-    ((KCmpXchg _ _ _ _ _ _ _) (refuse wf "an atomic (not in this target yet)"))
+    ((KAtomicLoad _ _ _ _) (refuse wf "an atomic load (a kernel reads with load; only atomicrmw and cmpxchg have a WGSL form)"))
+    ((KAtomicStore _ _ _ _) (refuse wf "an atomic store (a kernel writes with store; only atomicrmw and cmpxchg have a WGSL form)"))
+    ((KAtomicRmw op _ _ p v) (rmw-form wf op p v))
+    ((KCmpXchg _ _ _ _ _ _ _) (refuse wf "a cmpxchg whose success flag is used (WGSL's exchange is weak: compare the old value with the expected one)"))
     (_ (refuse wf "a SIMD or aggregate form"))))

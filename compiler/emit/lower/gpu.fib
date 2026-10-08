@@ -11,7 +11,8 @@
   (:use types.ty types.ast emit.value emit.ir emit.program emit.statics emit.lower.cx))
 
 (defun gpu-name? (name: str) -> bool
-  (one-of name ["gpu/local-id" "gpu/group-id" "gpu/group-size" "gpu/num-groups" "gpu/global-id" "gpu/barrier" "gpu/shared" "gpu/host-index-set!" "gpu/program-ptx"]))
+  (or (one-of name ["gpu/local-id" "gpu/group-id" "gpu/group-size" "gpu/num-groups" "gpu/global-id" "gpu/barrier" "gpu/shared" "gpu/select" "gpu/host-index-set!" "gpu/program-ptx"])
+      (some? (atomic-op name))))
 
 (defun one-of :private (x: str xs: (Vec str)) -> bool
   (reduce (fn (acc: bool y: str) (or acc (= x y))) false xs))
@@ -93,15 +94,38 @@
                                      (str-join ["(global " (if (kernel-target?) "shared " "internal ") name " " ty " (zeroinitializer " ty "))\n"]))
                        LirRaw))))))))
 
+;; ---- atomics (GPU-3): `gpu/atomic-OP-T p v` is `(atomicrmw OP monotonic p v)`, the old value; `gpu/atomic-cas-i32 p e n` the first of `cmpxchg`.
+;; lIR's `fadd` is the float add; on a kernel target LLVM makes `atom.global.add.f32` or `atom.shared.add.f32` (the address space is inferred).
+(defun atomic-op :private (name: str) -> (Option str)
+  (cond (not (starts-with? name "gpu/atomic-")) nil
+        (= name "gpu/atomic-add-f32") (some "fadd")
+        (= name "gpu/atomic-cas-i32") (some "cas")
+        :else (let ((rest (str-slice name 11 (str-len name))))
+                (cond (starts-with? rest "add-") (some "add") (starts-with? rest "min-") (some "min") (starts-with? rest "max-") (some "max")
+                      (starts-with? rest "umin-") (some "umin") (starts-with? rest "umax-") (some "umax") (starts-with? rest "xchg-") (some "xchg")
+                      :else nil))))
+
+(defun lcx-atomic :private (cx: LowerCx name: str a: (Vec V)) -> (Result V str)
+  (try-let ((p (arg name a 0)) (x (arg name a 1)))
+    (let ((op (unwrap-or (atomic-op name) "add")) (b (. cx b)))
+      (if (= op "cas")
+          (try-let ((n (arg name a 2)))
+            (Ok (fb-val b (str-join ["(extractvalue (cmpxchg monotonic monotonic " (v-text p) " " (v-text x) " " (v-text n) ") 0)"]) LirI32)))
+          (Ok (fb-val b (str-join ["(atomicrmw " op " monotonic " (v-text p) " " (v-text x) ")"])
+                      (let ((el (str-slice name (- (str-len name) 3) (str-len name)))) (cond (= el "f32") LirFloat (= el "i64") LirI64 :else LirI32))))))))
+
 (defun program-ptx :private (cx: LowerCx) -> V
   (let ((text (if (kernel-target?) "" (match (sys-getenv "FIB_KERNEL_PTX") ((some path) (unwrap-or (read-file path) "")) (nil "")))))
     (VVal (statics-string (. (. cx p) statics) text 0) LirPtr)))
 
 ;; A `gpu/*` builtin call. `gpu/barrier` and `gpu/host-index-set!` are statements (unit).
 (defun lcx-gpu (cx: LowerCx name: str e: Expr a: (Vec V)) -> (Result V str)
-  (cond (= name "gpu/barrier") (do (when (kernel-target?) (fb-stmt (. cx b) "(barrier)")) (Ok VUnit))
+  (cond (some? (atomic-op name)) (lcx-atomic cx name a)
+        (= name "gpu/barrier") (do (when (kernel-target?) (fb-stmt (. cx b) "(barrier)")) (Ok VUnit))
         (= name "gpu/global-id") (try-let ((d (arg name a 0))) (Ok (global-id cx d)))
         (= name "gpu/shared") (shared-window cx e)
+        (= name "gpu/select") (try-let ((c (arg name a 0)) (x (arg name a 1)) (y (arg name a 2)))
+                                (Ok (fb-val (. cx b) (str-join ["(select " (v-text c) " " (v-text x) " " (v-text y) ")"]) (unwrap-or (v-ty x) LirI32))))
         (= name "gpu/program-ptx") (Ok (program-ptx cx))
         (= name "gpu/host-index-set!")
         (try-let ((slot (arg name a 0)) (d (arg name a 1)) (v (arg name a 2)))

@@ -12,7 +12,7 @@
 ;; The module context: the signatures of every function, the defined ones, the ones that may trap (reach `(trap)`), the ones that reach a `(barrier)`, the kernel that
 ;; reaches each function (for the refusal), the string constants (a trap's message: a null `Ptr` on the device), the block-shared globals (name to the
 ;; buffer number of its `var<workgroup>`: SHARED-BASE and up), the scalar cells (`%struct.fib.cell.T`: a stack slot of a kernel, spec/types.md 6.11, to its element T), the count of storage
-;; buffers (the most pointer parameters of a kernel), and the refusal.
+;; buffers (the most pointer parameters of a kernel), whether any function uses an atomic (native.wgsl.atomic: then every buffer is atomic), and the refusal.
 (def SHARED-BASE: i64 16)
 
 (defstruct Wx
@@ -25,6 +25,7 @@
    shared: (Map str i64)
    cells: (Map str LType)
    nbufs: i64
+   atomics: bool
    err: (Cell (Option str))))
 
 ;; The function context: the module, the function, its block numbers, every `let` binding by name, the types found so far, the
@@ -141,6 +142,8 @@
     ((KCast _ t _) (some t))
     ((KExtractValue a idx) (some (path-ty (ty-or-ptr (type-of wf a)) idx)))
     ((KLoad t _ _ _) (some t))
+    ((KAtomicRmw _ _ _ _ v) (type-of wf v))
+    ((KCmpXchg _ _ _ _ _ e _) (some (TAnon [(ty-or-ptr (type-of wf e)) ty-i1])))
     ((KGep _ _ _ _) (some ty-ptr)) ((KAlloca _ _ _) (some ty-ptr))
     ((KIntrin _ _ _ args _) (intrin-ty wf args))
     ((KCall c _ _) (call-ty wf c))

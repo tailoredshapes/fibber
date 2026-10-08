@@ -1,0 +1,35 @@
+;; fib.gpu.atomic: atomics on a device buffer or block-shared memory by i32 element index (the portable flavour: WGSL has no i64) (docs/design/gpu.md 6.6, spec/types.md 2.17). The builtins
+;; `gpu/atomic-OP-T` take a raw address and answer the OLD value; these take the buffer and an element, like `f32-at`. `NAME!` discards the old
+;; value (a kernel is unit-valued, so a statement wants it), `fetch-NAME` answers it. All are relaxed (monotonic): atomicity, no ordering; a
+;; `gpu/barrier` orders what a block needs. On the host the same instruction runs, one thread at a time. `i32-umin!` and `i32-umax!` compare as
+;; unsigned; there is no f32 min or max (WGSL has no f32 atomic at all, and PTX would loop): `f32-max!` below is the library's compare-and-swap loop.
+(ns fib.gpu.atomic (:use fib.core))
+
+(defun at4 :private (p: ptr i: i32) -> ptr (unsafe (ptr+ p (sext i64 (unchecked-multiply 4i32 i)))))
+(defun at8 :private (p: ptr i: i32) -> ptr (unsafe (ptr+ p (sext i64 (unchecked-multiply 8i32 i)))))
+
+(defun i32-fetch-add (p: ptr i: i32 v: i32) -> i32 (unsafe (gpu/atomic-add-i32 (at4 p i) v)))
+(defun i32-fetch-min (p: ptr i: i32 v: i32) -> i32 (unsafe (gpu/atomic-min-i32 (at4 p i) v)))
+(defun i32-fetch-max (p: ptr i: i32 v: i32) -> i32 (unsafe (gpu/atomic-max-i32 (at4 p i) v)))
+(defun i32-fetch-xchg (p: ptr i: i32 v: i32) -> i32 (unsafe (gpu/atomic-xchg-i32 (at4 p i) v)))
+;; The old value; the exchange happened when it equals `expected`.
+(defun i32-cas (p: ptr i: i32 expected: i32 v: i32) -> i32 (unsafe (gpu/atomic-cas-i32 (at4 p i) expected v)))
+(defun f32-fetch-add (p: ptr i: i32 v: f32) -> f32 (unsafe (gpu/atomic-add-f32 (at4 p i) v)))
+(defun i64-fetch-add (p: ptr i: i32 v: i64) -> i64 (unsafe (gpu/atomic-add-i64 (at8 p i) v)))
+
+(defun i32-add! (p: ptr i: i32 v: i32) -> unit (do (i32-fetch-add p i v) ()))
+(defun i32-min! (p: ptr i: i32 v: i32) -> unit (do (i32-fetch-min p i v) ()))
+(defun i32-max! (p: ptr i: i32 v: i32) -> unit (do (i32-fetch-max p i v) ()))
+(defun i32-umin! (p: ptr i: i32 v: i32) -> unit (do (unsafe (gpu/atomic-umin-i32 (at4 p i) v)) ()))
+(defun i32-umax! (p: ptr i: i32 v: i32) -> unit (do (unsafe (gpu/atomic-umax-i32 (at4 p i) v)) ()))
+(defun f32-add! (p: ptr i: i32 v: f32) -> unit (do (f32-fetch-add p i v) ()))
+(defun i64-add! (p: ptr i: i32 v: i64) -> unit (do (i64-fetch-add p i v) ()))
+
+;; The maximum of an f32 element and `v` by compare-and-swap on its bits (a NaN `v` is ignored by `>`, as `fmax` ignores it): the result is
+;; order independent, so a device maximum equals the CPU's exactly.
+(defun f32-max! (p: ptr i: i32 v: f32) -> unit
+  (loop ((old (unsafe (load-i32 (at4 p i)))))
+    (if (> v (bits->f32 old))
+        (let ((seen (i32-cas p i old (f32->bits v))))
+          (if (= seen old) () (recur seen)))
+        ())))

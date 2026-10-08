@@ -1,0 +1,80 @@
+;; fib.gpu.reduce-kernels: grid-level reductions as kernels (docs/design/gpu.md 6.7). A program that `:require`s this module has kernels (so it is built with
+;; `--kernel-target`, as fib.gpu.contract-kernels), and the PTX or WGSL of a driver's spec carries them. Each takes `(data out n: i32)`: n elements of data, any
+;; grid and any block that fib.gpu.reduce takes (a power of two of at most 256 threads); a thread folds the elements `gid + b` for b = 0, threads, 2 threads, .. below n (the loop
+;; runs on `b`, which is the same for every thread: the elements past n are the identity, by a mask, so the barriers of the block reduction are uniform), the block reduces its
+;; threads (the tree of fib.gpu.reduce), thread 0 of each block combines the block's value into `out[0]` with one atomic. The host sets `out[0]` to the identity
+;; first (0 for sum, INT_MIN for max, INT_MAX for min, -inf for the f32 max).
+;;   reduce-sum-i32  reduce-max-i32  reduce-min-i32   exact: the result is the CPU's whatever the order (wrapping i32 add, max and min commute)
+;;   reduce-max-f32                                   exact (the max of f32 does not depend on the order; a NaN element is ignored)
+;;   reduce-sum-f32 (fib.gpu.reduce-atomic-f32: PTX only, WGSL has no f32 atomic): NOT deterministic, the blocks add into out[0] as they finish
+;;   reduce-partials-f32 (data partials n)            deterministic: block b writes its value to partials[b]; the host (or a second launch) adds the partials.
+;;                                                    A thread's elements and the tree are in a fixed order, `reduce/sum-order` and `thread-sum` below are the CPU's copy.
+(ns fib.gpu.reduce-kernels (:use fib.core) (:require [fib.gpu :as gpu] [fib.gpu.reduce :as r]))
+
+;; The element a thread reads at trip `k`, or `ident` past n (the read is clamped into the buffer; n >= 1 whenever there is a trip).
+(defun elem-i32 :private (data: ptr n: i32 i: i32 ident: i32) -> i32
+  (r/sel-i32 (< i n) (r/i32-at data (r/sel-i32 (< i n) i 0i32)) ident))
+(defun elem-f32 :private (data: ptr n: i32 i: i32 ident: f32) -> f32
+  (r/sel-f32 (< i n) (r/f32-at data (r/sel-i32 (< i n) i 0i32)) ident))
+
+;; The kernels end without a thread-dependent branch (WebGPU: the printer makes any function with a branch a state machine, and Dawn then takes the barrier in it as
+;; non-uniform, webgpu.md 3.6): every thread of the block holds the block's value, so `max` and `min` are done by every thread (idempotent), the sum by every thread with
+;; the value only in thread 0's (the others add 0), the partial by every thread (the same value into the same slot). The folds are functions of their own.
+;; The distance between a thread's elements. After a device trap the WGSL target goes on with zeros (webgpu.md 3.4): `threads` then answers 0, and a loop that
+;; stepped by it would never end, so a total below 1 steps past n.
+(defun stride :private (total: i32 n: i32) -> i32 (r/sel-i32 (> total 0i32) total (unchecked-add n 1i32)))
+
+(defun fold-sum-i32 (data: ptr n: i32 total: i32) -> i32
+  (let ((gid (r/global-id)) (step (stride total n)))
+    (loop ((b 0i32) (acc 0i32))
+      (if (< b n) (recur (unchecked-add b step) (unchecked-add acc (elem-i32 data n (unchecked-add gid b) 0i32))) acc))))
+
+(defun fold-max-i32 (data: ptr n: i32 total: i32) -> i32
+  (let ((gid (r/global-id)) (step (stride total n)))
+    (loop ((b 0i32) (acc -2147483648i32))
+      (if (< b n)
+          (let ((x (elem-i32 data n (unchecked-add gid b) -2147483648i32))) (recur (unchecked-add b step) (r/sel-i32 (> x acc) x acc)))
+          acc))))
+
+(defun fold-min-i32 (data: ptr n: i32 total: i32) -> i32
+  (let ((gid (r/global-id)) (step (stride total n)))
+    (loop ((b 0i32) (acc 2147483647i32))
+      (if (< b n)
+          (let ((x (elem-i32 data n (unchecked-add gid b) 2147483647i32))) (recur (unchecked-add b step) (r/sel-i32 (< x acc) x acc)))
+          acc))))
+
+;; One thread's fold for the f32 sums: elements gid, gid + total, .. added left to right from 0.0 (the CPU's copy is `ref-thread-sum`).
+(defun thread-sum (data: ptr n: i32 total: i32) -> f32
+  (let ((gid (r/global-id)) (step (stride total n)))
+    (loop ((b 0i32) (acc 0.0f32))
+      (if (< b n) (recur (unchecked-add b step) (+ acc (elem-f32 data n (unchecked-add gid b) 0.0f32))) acc))))
+
+(defun fold-max-f32 (data: ptr n: i32 total: i32) -> f32
+  (let ((gid (r/global-id)) (step (stride total n)))
+    (loop ((b 0i32) (acc -3.4028235e38f32))
+      (if (< b n)
+          (let ((x (elem-f32 data n (unchecked-add gid b) -3.4028235e38f32))) (recur (unchecked-add b step) (r/sel-f32 (> x acc) x acc)))
+          acc))))
+
+;; The threads of the grid, after the check that the host passed the number of blocks it launched.
+(defun threads (blocks: i32) -> i32 (do (r/grid-check blocks) (r/grid-total blocks)))
+
+(defkernel reduce-sum-i32 (data: ptr out: ptr n: i32 blocks: i32)
+  (let ((blk (r/block-sum-i32 (fold-sum-i32 data n (threads blocks)))))
+    (gpu/i32-add! out 0i32 (r/sel-i32 (= (r/tid) 0i32) blk 0i32))))
+
+(defkernel reduce-max-i32 (data: ptr out: ptr n: i32 blocks: i32)
+  (let ((blk (r/block-max-i32 (fold-max-i32 data n (threads blocks)))))
+    (gpu/i32-max! out 0i32 blk)))
+
+(defkernel reduce-min-i32 (data: ptr out: ptr n: i32 blocks: i32)
+  (let ((blk (r/block-min-i32 (fold-min-i32 data n (threads blocks)))))
+    (gpu/i32-min! out 0i32 blk)))
+
+(defkernel reduce-partials-f32 (data: ptr partials: ptr n: i32 blocks: i32)
+  (let ((blk (r/block-sum-f32 (thread-sum data n (threads blocks)))))
+    (r/f32-set! partials (r/block-id) blk)))
+
+(defkernel reduce-max-f32 (data: ptr out: ptr n: i32 blocks: i32)
+  (let ((blk (r/block-max-f32 (fold-max-f32 data n (threads blocks)))))
+    (gpu/f32-max! out 0i32 blk)))

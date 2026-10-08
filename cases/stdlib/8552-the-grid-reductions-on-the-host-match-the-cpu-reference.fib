@@ -1,0 +1,26 @@
+;; spec:   types §2.17 (the gpu builtins: atomics, select), lir §6.6; docs/design/gpu.md 6.7
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib
+;; The grid reductions of fib.gpu.reduce-kernels over a grid of one-thread blocks on the host (a tree over one thread is the identity; the grid-stride fold, the
+;; atomic combine and the partial slots are what runs): the integer sum (wrapping), max and min equal the CPU's exactly, the f32 maximum too, the per-block
+;; partials of `reduce-partials-f32` equal the reference's bit for bit (the CPU's copy of the device order). `examples/gpu/reduce.fib` does these for five shapes and
+;; compiler/tests/native/gpu-device.sh runs the same on a GPU.
+(ns main (:require [fib.gpu :as gpu] [fib.gpu.reduce-kernels :as k] [fib.gpu.reduce-ref :as ref]))
+(defun same-bits (a: (Array f32) b: (Array f32)) -> bool
+  (loop [i 0] (cond (>= i (array-len a)) true (not (= (f32->bits (array-get a i)) (f32->bits (array-get b i)))) false :else (recur (+ i 1)))))
+(defun main () -> i64
+  (let [n 5000 blocks 13 xi (ref/data-i32 n 9) xf (ref/data-f32 n 9)
+        out (cell (array 3 0i32)) of (cell (array 1 -3.4028235e38f32)) parts (cell (array blocks 0.0f32))]
+    (do (array-set! &out 1 -2147483648i32) (array-set! &out 2 2147483647i32)
+        (gpu/host-launch [blocks] [1] (fn () (k/reduce-sum-i32 (gpu/array-data-i32 xi) (gpu/array-data-i32 @out) (trunc i32 n) (trunc i32 blocks))))
+        (gpu/host-launch [blocks] [1] (fn () (k/reduce-max-i32 (gpu/array-data-i32 xi) (unsafe (ptr+ (gpu/array-data-i32 @out) 4)) (trunc i32 n) (trunc i32 blocks))))
+        (gpu/host-launch [blocks] [1] (fn () (k/reduce-min-i32 (gpu/array-data-i32 xi) (unsafe (ptr+ (gpu/array-data-i32 @out) 8)) (trunc i32 n) (trunc i32 blocks))))
+        (gpu/host-launch [blocks] [1] (fn () (k/reduce-max-f32 (gpu/array-data xf) (gpu/array-data @of) (trunc i32 n) (trunc i32 blocks))))
+        (gpu/host-launch [blocks] [1] (fn () (k/reduce-partials-f32 (gpu/array-data xf) (gpu/array-data @parts) (trunc i32 n) (trunc i32 blocks))))
+        (+ (if (= (array-get @out 0) (ref/sum-i32 xi)) 0 1)
+           (if (= (array-get @out 1) (ref/max-i32 xi)) 0 2)
+           (if (= (array-get @out 2) (ref/min-i32 xi)) 0 4)
+           (if (= (f32->bits (array-get @of 0)) (f32->bits (ref/max-f32 xf))) 0 8)
+           (if (same-bits @parts (ref/partials-f32 xf blocks 1)) 0 16)))))

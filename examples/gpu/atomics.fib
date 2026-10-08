@@ -1,0 +1,37 @@
+;; examples/gpu/atomics.fib: kernels that use the atomics of fib.gpu.atomic (docs/design/gpu.md 6.6), written over i32 indices so that they run on every
+;; backend: the host (fib.gpu/host-launch), PTX (`fibc build --target nvptx64-nvidia-cuda --emit ptx`) and WGSL (`--target wgsl-unknown-webgpu --emit wgsl`).
+;; The cases 8550-8553 run them on the host; compiler/tests/native/gpu-device.sh on the GPU, against the same CPU answers.
+;;   hist        bins[data[i]] += 1                          (atomic add; the answer is the CPU's count, whatever the order)
+;;   tally       out[0] counts the elements above `limit`, out[1] their maximum, out[2] minimum (signed), out[3] maximum as unsigned
+;;   claim       thread i tries to claim slot i mod 8 by a compare-and-swap from 0; out[0] counts the winners (one per slot)
+;;   block-max   each block's maximum through a block-shared word: every thread max-es its element into it, one barrier either side
+;; The barrier of block-max is not under a thread-dependent branch (a thread past the end contributes the identity through `sel-i32`): WebGPU's uniformity rule.
+(ns atomics (:require [fib.gpu :as gpu] [fib.gpu.reduce :as r] [gpu32 :as g]))
+
+(defkernel hist (data: ptr bins: ptr n: i32)
+  (let ((i (g/global-id-x)))
+    (when (< i n) (gpu/i32-add! bins (g/i32-at data i) 1i32))))
+
+(defkernel tally (data: ptr out: ptr n: i32 limit: i32)
+  (let ((i (g/global-id-x)))
+    (when (< i n)
+      (let ((x (g/i32-at data i)))
+        (do (when (> x limit) (gpu/i32-add! out 0i32 1i32))
+            (gpu/i32-max! out 1i32 x)
+            (gpu/i32-min! out 2i32 x)
+            (gpu/i32-umax! out 3i32 x))))))
+
+(defkernel claim (slots: ptr out: ptr n: i32)
+  (let ((i (g/global-id-x)))
+    (when (< i n)
+      (let ((old (gpu/i32-cas slots (rem i 8i32) 0i32 (unchecked-add i 1i32))))
+        (when (= old 0i32) (gpu/i32-add! out 0i32 1i32))))))
+
+(defkernel block-max (data: ptr out: ptr n: i32)
+  (let ((i (g/global-id-x)) (s (gpu/shared :i32 1)))
+    (let ((x (r/sel-i32 (< i n) (g/i32-at data (r/sel-i32 (< i n) i 0i32)) -2147483648i32)))
+      (do (g/i32-set! s 0i32 -2147483648i32)
+          (gpu/barrier)
+          (gpu/i32-max! s 0i32 x)
+          (gpu/barrier)
+          (gpu/i32-max! out (g/group-id-x) (g/i32-at s 0i32))))))

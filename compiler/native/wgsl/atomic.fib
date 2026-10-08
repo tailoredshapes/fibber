@@ -1,0 +1,54 @@
+;; compiler/native/wgsl/atomic.fib: atomics in WGSL (docs/design/webgpu.md 3.7, docs/design/gpu.md 6.6). WGSL has atomic<i32> and atomic<u32> only, in storage and
+;; workgroup memory, and a variable's type says so: a buffer that is ever the operand of an atomic is `array<atomic<u32>>`, and every access to it is `atomicLoad`
+;; or `atomicStore`. The buffers are bound by position and every kernel of the module shares one declaration, so the whole module switches: a module with no
+;; atomic prints the plain `array<u32>` it always did (the golden text is unchanged), a module with one prints every buffer and every workgroup array atomic.
+;; The helpers take a `Ptr` and switch on its buffer, as `fibw_ld_u32` does. add, exchange, umin and umax are WGSL's own; signed min and max are a
+;; compare-and-exchange loop (the buffer holds u32 and WGSL has no signed atomic on it); `cas` answers the OLD value, and retries a spurious failure of the weak
+;; exchange (old equal to expected without the exchange) so the answer means what lIR's cmpxchg means. f32 and 64-bit atomics have no WGSL form: refused by name.
+;; OWNER: package GPU-3.
+(ns native.wgsl.atomic
+  (:use lir.types lir.ast))
+
+;; The word `p` addresses in buffer `b` (a storage buffer `bufN` or a workgroup array `fibw_shN`), as an atomic place.
+(defun place :private (b: i64) -> str
+  (str "&" (if (< b 16) (str "buf" b) (str "fibw_sh" (- b 16))) "[p.off >> 2u]"))
+
+(defun cases :private (n: i64 sh: i64 body: (fn (str) str)) -> str
+  (str (str-join (vec (map (fn (i: i64) (str " case " i "u: { " (body (place i)) " }")) (range n))))
+       (str-join (vec (map (fn (i: i64) (str " case " (+ 16 i) "u: { " (body (place (+ 16 i))) " }")) (range sh))))))
+
+(defun simple :private (name: str fn-name: str n: i64 sh: i64) -> str
+  (str "fn fibw_atomic_" name "(p: Ptr, v: u32) -> u32 { var o = 0u; switch p.buf {"
+       (cases n sh (fn (pl: str) (str "o = " fn-name "(" pl ", v);"))) " default: { } } return o; }\n"))
+
+;; Signed min or max: load, compare as i32, exchange when the new value wins, retry when another thread got in.
+(defun signed :private (name: str cmp: str n: i64 sh: i64) -> str
+  (str "fn fibw_atomic_" name "(p: Ptr, v: u32) -> u32 { var o = 0u; switch p.buf {"
+       (cases n sh (fn (pl: str)
+                     (str "o = atomicLoad(" pl "); loop { if (!(bitcast<i32>(v) " cmp " bitcast<i32>(o))) { break; } "
+                          "let r = atomicCompareExchangeWeak(" pl ", o, v); if (r.exchanged) { break; } o = r.old_value; }")))
+       " default: { } } return o; }\n"))
+
+(defun cas :private (n: i64 sh: i64) -> str
+  (str "fn fibw_atomic_cas(p: Ptr, e: u32, v: u32) -> u32 { var o = 0u; switch p.buf {"
+       (cases n sh (fn (pl: str)
+                     (str "loop { let r = atomicCompareExchangeWeak(" pl ", e, v); o = r.old_value; if (r.exchanged || r.old_value != e) { break; } }")))
+       " default: { } } return o; }\n"))
+
+;; The helpers of a module with atomics, for `n` storage buffers and `sh` workgroup arrays.
+(defun helpers (n: i64 sh: i64) -> str
+  (str (simple "add" "atomicAdd" n sh) (simple "umin" "atomicMin" n sh) (simple "umax" "atomicMax" n sh) (simple "xchg" "atomicExchange" n sh)
+       (signed "smin" "<" n sh) (signed "smax" ">" n sh) (cas n sh)))
+
+;; Whether the expression is an atomic form.
+(defun atomic-form? (e: LExpr) -> bool
+  (match (. e kind)
+    ((KAtomicRmw _ _ _ _ _) true) ((KCmpXchg _ _ _ _ _ _ _) true) ((KAtomicLoad _ _ _ _) true) ((KAtomicStore _ _ _ _) true)
+    (_ false)))
+
+;; The helper an `atomicrmw` operation maps to; nil for one with no WGSL form.
+(defun rmw-helper (op: LRmwOp) -> (Option str)
+  (match op
+    ((RAdd) (some "fibw_atomic_add")) ((RMin) (some "fibw_atomic_smin")) ((RMax) (some "fibw_atomic_smax"))
+    ((RUMin) (some "fibw_atomic_umin")) ((RUMax) (some "fibw_atomic_umax")) ((RXchg) (some "fibw_atomic_xchg"))
+    (_ nil)))

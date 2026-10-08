@@ -1,6 +1,6 @@
 #!/bin/bash
 # The mutants of the kernel-subset checker (compiler/own/kernel.fib; docs/design/gpu.md 3, ADR 0014): each rule is removed in a copy of the
-# tree, a stage 2 is built from the copy, and the kernel cases of cases/stdlib (8530-8569) are run with it: the mutant must FAIL at least one
+# tree, a stage 2 is built from the copy, and the kernel cases of cases/stdlib (8530-8569; the atomics and reductions 8550-8555) are run with it: the mutant must FAIL at least one
 # case (the one that plants the thing the rule refuses), or the rule is not tested. Every mutant builds a compiler (about two minutes each).
 #   scripts/mutant-gpu.sh FIBC [--only NAME..]       FIBC: a stage 2 (the builder); NAME among the mutants below
 # Exit 0 when every mutant is caught, 1 otherwise. Scratch under ~/.cache/fibber-scratch/mutant-gpu.
@@ -10,7 +10,7 @@ fibc=${1:?usage: mutant-gpu.sh FIBC [--only NAME..]}; shift
 only=(); [ "${1:-}" = --only ] && { shift; only=("$@"); }
 out=$HOME/.cache/fibber-scratch/mutant-gpu; mkdir -p "$out"
 K=compiler/own/kernel.fib
-# name|sed expression that removes one rule
+# name|sed expression that removes one rule (name@FILE|sed: the rule is in FILE, a path under the tree, not compiler/own/kernel.fib)
 mutants=(
   'no-string|s/((ELit (LitStr _)) (fail cx (. e pos) "a string literal: a kernel has no strings (a trap'"'"'s message is the exception)"))/((ELit (LitStr _)) ())/'
   'no-closure|s/((EFn _) (fail cx (. e pos) "a closure: a kernel has no function values (call a named function; it is checked too)"))/((EFn _) ())/'
@@ -22,10 +22,14 @@ mutants=(
   'no-ctor|s/((EGlobal (GCtor t _)) (fail cx (. e pos) (str "a constructor of "/((EGlobal (GCtor t _)) (if true () (fail cx (. e pos) (str "a constructor of "/'
   'no-extern|s/((EGlobal (GExtern x)) (fail cx (. e pos) (str "a call of the extern "/((EGlobal (GExtern x)) (if true () (fail cx (. e pos) (str "a call of the extern "/'
   'no-object-cell|s/(some "a cell of an object: a kernel has cells of scalars only")/nil/'
+  'atomic-add-is-sub@compiler/emit/lower/gpu.fib|s/(starts-with? rest "add-") (some "add")/(starts-with? rest "add-") (some "sub")/'
+  'select-swapped@compiler/emit/lower/gpu.fib|s/(str-join \["(select " (v-text c) " " (v-text x) " " (v-text y) ")"\])/(str-join ["(select " (v-text c) " " (v-text y) " " (v-text x) ")"])/'
+  'cas-swaps-expected-and-new@compiler/emit/lower/gpu.fib|s/(v-text p) " " (v-text x) " " (v-text n) ") 0)"/(v-text p) " " (v-text n) " " (v-text x) ") 0)"/'
 )
 bad=0; n=0
 for m in "${mutants[@]}"; do
-  name=${m%%|*}; expr=${m#*|}
+  name=${m%%|*}; expr=${m#*|}; K=compiler/own/kernel.fib
+  case "$name" in *@*) K=${name#*@}; name=${name%%@*};; esac
   if [ ${#only[@]} -gt 0 ]; then skip=1; for o in "${only[@]}"; do [ "$o" = "$name" ] && skip=0; done; [ $skip = 1 ] && continue; fi
   n=$((n + 1)); d=$out/$name; rm -rf "$d"; mkdir -p "$d"
   cp -r "$root/compiler" "$root/lib" "$d/"
@@ -35,7 +39,7 @@ for m in "${mutants[@]}"; do
   if ! (cd "$d" && FIB_LIB=$d/lib "$fibc" build compiler/fibc.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o "$d/F" > "$d/build.log" 2>&1); then
     echo "FAIL $name: the mutant does not build ($(tail -n 1 "$d/build.log"))"; bad=1; continue
   fi
-  (cd "$root" && FIB_LIB=$root/lib "$d/F" cases cases/stdlib --only 853 854 -j 4 > "$d/cases.log" 2>&1)
+  (cd "$root" && FIB_LIB=$root/lib "$d/F" cases cases/stdlib --only 853 854 855 -j 4 > "$d/cases.log" 2>&1)
   if grep -q " 0 fail," "$d/cases.log"; then echo "FAIL $name: every kernel case still passes without the rule (the rule is not tested)"; bad=1
   else echo "ok   $name: caught by $(grep -c 'FAIL' "$d/cases.log") case(s): $(grep 'FAIL' "$d/cases.log" | awk '{print $1}' | tr '\n' ' ')"; fi
 done

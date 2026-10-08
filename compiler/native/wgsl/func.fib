@@ -6,7 +6,7 @@
 ;; A call of a function that may trap is followed by `if (fibw_trapped) { return ..; }`, so nothing runs after a device trap.
 (ns native.wgsl.func
   (:use lir.types lir.lit lir.ast native.wgsl.wx native.wgsl.expr)
-  (:require [lir.check.walk :as walk]))
+  (:require [lir.check.walk :as walk] [native.wgsl.atomic :as atomic]))
 
 ;; ---------------------------------------------------------------- what a function holds
 
@@ -42,13 +42,16 @@
 (defun self-tail? :private (fname: str e: LExpr) -> bool
   (match (. e kind) ((KCall (CalDirect n) _ true) (= n fname)) (_ false)))
 
-;; Whether the function contains `(trap)` itself.
 ;; Whether the function contains `(barrier)` itself.
 (defun has-barrier? (f: LFunction) -> bool
   (any-form? f (fn (e: LExpr) (match (. e kind) ((KBarrier) true) (_ false)))))
 
+;; Whether the function contains `(trap)` itself.
 (defun has-trap? (f: LFunction) -> bool
   (any-form? f (fn (e: LExpr) (match (. e kind) ((KTrap) true) (_ false)))))
+
+;; Whether the function contains an atomic form (native.wgsl.atomic).
+(defun has-atomic? (f: LFunction) -> bool (any-form? f atomic/atomic-form?))
 
 ;; The functions `f` calls.
 (defun callees (f: LFunction) -> (Vec str)

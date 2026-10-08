@@ -12,7 +12,7 @@
 ;; `// fib.kernel-sig NAME: T..` names each kernel's parameter kinds in order (GPU-2's launch ABI header), for the driver to check a launch against.
 (ns native.wgsl
   (:use lir.types lir.ast native.wgsl.wx)
-  (:require [native.wgsl.func :as func] [fib.string :as s]))
+  (:require [native.wgsl.func :as func] [native.wgsl.atomic :as atomic] [fib.string :as s]))
 
 ;; At most this many pointer parameters: WebGPU's default limit is 8 storage buffers per stage, and the trap flag takes one.
 (def MAX-BUFFERS: i64 7)
@@ -87,33 +87,36 @@
 
 ;; ---------------------------------------------------------------- the prelude
 
-(defun buffer-decls :private (n: i64) -> str
-  (str-join (vec (map (fn (i: i64) (str "@group(0) @binding(" (+ i 2) ") var<storage, read_write> buf" i ": array<u32>;\n")) (range n)))))
+(defun buffer-decls :private (n: i64 at: bool) -> str
+  (str-join (vec (map (fn (i: i64) (str "@group(0) @binding(" (+ i 2) ") var<storage, read_write> buf" i ": " (if at "array<atomic<u32>>" "array<u32>") ";\n")) (range n)))))
 
-(defun ld-cases :private (n: i64 sh: i64) -> str
-  (str (str-join (vec (map (fn (i: i64) (str " case " i "u: { return buf" i "[p.off >> 2u]; }")) (range n))))
-       (str-join (vec (map (fn (i: i64) (str " case " (+ SHARED-BASE i) "u: { return fibw_sh" i "[p.off >> 2u]; }")) (range sh))))))
+(defun ld-cases :private (n: i64 sh: i64 at: bool) -> str
+  (let ((rd (fn (a: str) (if at (str "atomicLoad(&" a ")") a))))
+    (str (str-join (vec (map (fn (i: i64) (str " case " i "u: { return " (rd (str "buf" i "[p.off >> 2u]")) "; }")) (range n))))
+         (str-join (vec (map (fn (i: i64) (str " case " (+ SHARED-BASE i) "u: { return " (rd (str "fibw_sh" i "[p.off >> 2u]")) "; }")) (range sh)))))))
 
-(defun st-cases :private (n: i64 sh: i64) -> str
-  (str (str-join (vec (map (fn (i: i64) (str " case " i "u: { buf" i "[p.off >> 2u] = v; }")) (range n))))
-       (str-join (vec (map (fn (i: i64) (str " case " (+ SHARED-BASE i) "u: { fibw_sh" i "[p.off >> 2u] = v; }")) (range sh))))))
+(defun st-cases :private (n: i64 sh: i64 at: bool) -> str
+  (let ((wr (fn (a: str) (if at (str "atomicStore(&" a ", v);") (str a " = v;")))))
+    (str (str-join (vec (map (fn (i: i64) (str " case " i "u: { " (wr (str "buf" i "[p.off >> 2u]")) " }")) (range n))))
+         (str-join (vec (map (fn (i: i64) (str " case " (+ SHARED-BASE i) "u: { " (wr (str "fibw_sh" i "[p.off >> 2u]")) " }")) (range sh)))))))
 
-(defun shared-decls :private (sh: (Vec (Pair str i64))) -> str
-  (str-join (vec (map-indexed (fn (i: i64 p: (Pair str i64)) (str "var<workgroup> fibw_sh" i ": array<u32, " (. p snd) ">;\n")) sh))))
+(defun shared-decls :private (sh: (Vec (Pair str i64)) at: bool) -> str
+  (str-join (vec (map-indexed (fn (i: i64 p: (Pair str i64)) (str "var<workgroup> fibw_sh" i ": array<" (if at "atomic<u32>" "u32") ", " (. p snd) ">;\n")) sh))))
 
-(defun prelude :private (n: i64 sh: (Vec (Pair str i64))) -> str
+(defun prelude :private (n: i64 sh: (Vec (Pair str i64)) at: bool) -> str
   (str "struct Ptr { buf: u32, off: u32 }\n"
        "struct OvI32 { v: i32, o: bool }\n"
        "struct FibTrap { flag: atomic<u32> }\n"
        "override wg_x: u32 = 64u;\noverride wg_y: u32 = 1u;\noverride wg_z: u32 = 1u;\n"
        "@group(0) @binding(0) var<uniform> fibw_params: array<vec4<u32>, 4>;\n"
        "@group(0) @binding(1) var<storage, read_write> fibw_flag: FibTrap;\n"
-       (buffer-decls n)
+       (buffer-decls n at)
        "var<private> fibw_lid: vec3<u32>;\nvar<private> fibw_wid: vec3<u32>;\nvar<private> fibw_nwg: vec3<u32>;\nvar<private> fibw_trapped: bool = false;\n"
        "fn fibw_trap() { fibw_trapped = true; atomicStore(&fibw_flag.flag, 1u); }\n"
-       (shared-decls sh)
-       "fn fibw_ld_u32(p: Ptr) -> u32 { switch p.buf {" (ld-cases n (count sh)) " default: { return 0u; } } }\n"
-       "fn fibw_st_u32(p: Ptr, v: u32) { switch p.buf {" (st-cases n (count sh)) " default: { } } }\n"
+       (shared-decls sh at)
+       "fn fibw_ld_u32(p: Ptr) -> u32 { switch p.buf {" (ld-cases n (count sh) at) " default: { return 0u; } } }\n"
+       "fn fibw_st_u32(p: Ptr, v: u32) { switch p.buf {" (st-cases n (count sh) at) " default: { } } }\n"
+       (if at (atomic/helpers n (count sh)) "")
        "fn fibw_ld_f32(p: Ptr) -> f32 { return bitcast<f32>(fibw_ld_u32(p)); }\n"
        "fn fibw_ld_i32(p: Ptr) -> i32 { return bitcast<i32>(fibw_ld_u32(p)); }\n"
        "fn fibw_st_f32(p: Ptr, v: f32) { fibw_st_u32(p, bitcast<u32>(v)); }\n"
@@ -180,11 +183,12 @@
       ((some e) (Err (str "the webgpu target cannot take " (unwrap e) " (docs/design/webgpu.md 3)")))
       (nil (let ((nbufs (max 1 (reduce (fn (a: i64 f: LFunction) (max a (ptr-count f))) 0 kernels)))
                  (shs (shared-globals m))
-                 (wx (Wx (fns-of m) (into #{} (map (fn (f: LFunction) (. f name)) fs)) (reach-set fs func/has-trap?) (reach-set fs func/has-barrier?) (owners fs) (string-globals m) (shared-map shs) (cell-map m) nbufs (cell nil)))
+                 (atomics (some? (find-first func/has-atomic? fs)))
+                 (wx (Wx (fns-of m) (into #{} (map (fn (f: LFunction) (. f name)) fs)) (reach-set fs func/has-trap?) (reach-set fs func/has-barrier?) (owners fs) (string-globals m) (shared-map shs) (cell-map m) nbufs atomics (cell nil)))
                  (text (str "// WGSL of the kernels of a fibber program, written by fibc (docs/design/webgpu.md): group 0 is binding 0 the uniform of scalar\n"
                             "// parameters (4 bytes each, in order), binding 1 the trap flag, bindings 2.. the pointer parameters in order; wg_x/wg_y/wg_z the workgroup size.\n"
                             (str-join (vec (map signature-line kernels)))
-                            (prelude nbufs shs)
+                            (prelude nbufs shs atomics)
                             (str-join (vec (map (fn (f: LFunction) (function-text wx f)) fs))))))
              (match @(. wx err)
                ((some e) (Err e))
