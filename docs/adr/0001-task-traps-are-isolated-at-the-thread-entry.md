@@ -54,7 +54,7 @@ The behaviour a program sees, as scenarios (these run through `fib.test`, in a f
     (then (expect = "twice" (trap-text a)) (expect = "twice" (trap-text b)))))
 ```
 
-The shape of the runtime: only a thread that has a task isolates, and only the thread entry gives it one.
+The shape of the runtime: only a thread that has a task isolates, and only the thread entry gives it one. (P-sched, 2026-10-07: the pool runner of rt/sched.lir is the second place: a pool task runs on a worker's thread, so the runner makes the task the thread's task for its duration and puts the previous one back; a trap in it fails the worker's chain of tasks, or unwinds to the runner in a catching program.)
 
 ```fibber fitness
 (rule "fib.fail-task is called by the trap path in rt/core.lir and by nothing else"
@@ -65,9 +65,14 @@ The shape of the runtime: only a thread that has a task isolates, and only the t
   (must-contain repo "rt/core.lir" "(call @pthread_getspecific (load i32 @fib.task-key))")
   (plant-file "rt/core.lir" "(define internal (fib.trap-bytes void) () (call @abort))"))
 
-(rule "only the thread entry stores the task key"
-  (grep-live repo ["rt/*.lir" "!rt/thread.lir"] "pthread_setspecific (load i32 @fib.task-key)")
+(rule "only the thread entry and the pool runner store the task key"
+  (grep-live repo ["rt/*.lir" "!rt/thread.lir" "!rt/sched.lir"] "pthread_setspecific (load i32 @fib.task-key)")
   (plant "rt/task.lir" "\n    (call @pthread_setspecific (load i32 @fib.task-key) task)\n"))
+
+(rule "the pool runner stores it too, and puts the previous task back"
+  (into (must-contain repo "rt/sched.lir" "pthread_setspecific (load i32 @fib.task-key) t)")
+        (must-contain repo "rt/sched.lir" "pthread_setspecific (load i32 @fib.task-key) prev)"))
+  (plant-file "rt/sched.lir" ""))
 
 (rule "the thread entry does store it"
   (must-contain repo "rt/thread.lir" "pthread_setspecific (load i32 @fib.task-key)")
