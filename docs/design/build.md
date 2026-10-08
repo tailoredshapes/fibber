@@ -75,6 +75,13 @@ scripts/fetch-*.sh ───────► ~/.cache/fibber-scratch/tools/<tool>
   downstream reruns. The default builder is always the seed, as CI's is; `BUILDER=path/to/fibc` names another.
 - **Downloads** stay in the fetch scripts (the recipe body), each with its checksum, so ADR 0020 holds; the lint of ADR 0020 and
   `scripts/lint-pipefail.sh` read `Makefile` and `mk/*.mk` too (a recipe line is a live line, whatever its leading tab, `@`, `-`).
+- **macOS (MAC-1):** `gmake mac-check` (`mk/mac.mk`) is the gate with the stages, tools and golden suites that cannot run on a Mac left out, each
+  with its reason in `compiler/tests/expected-macos.txt`, plus `scripts/mac-check.sh --with-f F` (the machine's own checks). GNU Make 3.81
+  (`/usr/bin/make`) stops in `mk/config.mk` with a message. The scripts assume GNU coreutils; on Darwin `mk/config.mk` puts `scripts/portable/bin`
+  first on `PATH` (`timeout`, `flock`, `nproc`, `sha256sum`, `sha1sum`, `md5sum`, `sed -i`, `date +%N`, `make` = gmake) and `scripts/portable/bash-env.sh` in
+  `BASH_ENV` (a `ulimit -v` that succeeds: macOS has no RLIMIT_AS). `scripts/lint-portable.sh` (a tool of the quick gate) fails on every other
+  Linux-only tool or bash 4 feature unless the line says `# linux-only: reason`. The cases that fail only on a Mac are
+  `scripts/ci-stage2.expected-darwin`; `LLVM_LIBDIR` defaults to Homebrew's `llvm@21`.
 - **The generated runtime:** `compiler/emit/runtime.fib` is a real target of `rt/*.lir` and `build/gen-runtime` (built by the seed:
   the generator uses the library only); the recipe writes it only when the content changed, so a checkout whose `rt/` is newer
   than the committed file does not rebuild F for nothing. `build/runtime-drift.ok` is the comparison (the committed file equals
