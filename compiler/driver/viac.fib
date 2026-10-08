@@ -1,0 +1,151 @@
+;; compiler/driver/viac.fib: the C route of `build` and `run` (docs/design/lir2c.md): `fibc build --emit c FILE -o OUT.c` writes the C of the
+;; program (one translation unit, the runtime included); `fibc build --via c --cc CC FILE -o EXE` writes it to a temporary file and runs the C
+;; compiler with the flags the semantics need (`cc-flags`); with `--static` the C is compiled to an object and linked against the musl pieces by
+;; native.linkstatic (no LLVM anywhere on that path). `FIB_VIA=c fibc run FILE` builds the program through C and runs it (so `FIB_VIA=c fibc
+;; cases DIR` judges the case suites against the C route, the audit traces included, as FIB_STATIC_CASES does for the static one).
+;;
+;; The environment: FIB_CC (the compiler, `--cc`; default `cc`), FIB_ALLOW_PLAIN_TAIL_CALLS=1 (`--allow-plain-tail-calls`), FIB_C_LINES=0 (no
+;; `#line` directives), FIB_CC_VERBOSE=1 (print the compiler's command line).
+;;
+;; The probe: before the first use of a compiler the driver compiles a few lines with it to learn whether `__attribute__((musttail))` is honoured,
+;; and whether between functions of different prototypes (c.policy); the answer is cached in $TMPDIR by the compiler's name.
+(ns driver.viac
+  (:use lir.diag expand.roots)
+  (:require [lir :as front] [lir.check :as check] [c.module :as cm] [c.cx :as cx] [c.policy :as policy] [native.link :as link]
+            [native.linkstatic :as ls] [native.target :as target] [native.error :as ne] [types.targets :as tt] [llvm.target :as lt] [driver.native :as native] [driver.proc :as p]
+            [driver.front :as dfront] [driver.linkdecl :as ld] [expand.maker :as mk]))
+
+(extern getpid :private () -> i32)
+
+(defun env (name: str) -> str (unwrap-or (native/getenv-opt name) ""))
+
+(defun via-c? () -> bool (= (env "FIB_VIA") "c"))
+
+(defun cc-name () -> str (let ((c (env "FIB_CC"))) (if (= c "") "cc" c)))
+
+(defun tmp-dir :private () -> str (unwrap-or (native/getenv-opt "TMPDIR") "/tmp"))
+
+;; ---------------------------------------------------------------- the probe
+
+(def probe-same: str "int64_t g(int64_t a); int64_t f(int64_t a) { __attribute__((musttail)) return g(a); }\n")
+(def probe-any: str "int64_t h(int64_t a, double b); int64_t k(int64_t a) { __attribute__((musttail)) return h(a, 1.0); }\n")
+
+(defun probe-compiles? :private (cc: str text: str tag: str) -> bool
+  (let ((src (str (tmp-dir) "/fibc-ccprobe-" (sext i64 (unsafe (getpid))) "-" tag ".c"))
+        (obj (str src ".o")) (err (str src ".err")))
+    (if (not (write-file src (str "typedef long int64_t;\n" text)))
+        false
+        (let ((r (link/run-cc [cc "-std=gnu11" "-O1" "-c" "-o" obj src] err)))
+          (do (p/remove-file src) (p/remove-file obj) (p/remove-file err)
+              (match r ((Ok _) true) ((Err _) false)))))))
+
+;; The facts of `cc`, probed once and cached as `musttail=0|1 any=0|1` under $TMPDIR; the table of c.policy is only the fallback when the
+;; compiler cannot be run at all.
+(defun probe (cc: str) -> cx/COpts
+  (let ((cache (str (tmp-dir) "/fibc-ccprobe-" (cx/mangle "" cc) ".txt"))
+        (plain (= (env "FIB_ALLOW_PLAIN_TAIL_CALLS") "1"))
+        (lines (not (= (env "FIB_C_LINES") "0"))))
+    (match (read-file cache)
+      ((some t) (cx/COpts cc (some? (str-find t "musttail=1" 0)) (some? (str-find t "any=1" 0)) plain lines))
+      (nil (let ((same (probe-compiles? cc probe-same "same")) (any (and same (probe-compiles? cc probe-any "any"))))
+             (do (write-file cache (str "musttail=" (if same "1" "0") " any=" (if any "1" "0") "\n"))
+                 (cx/COpts cc same any plain lines)))))))
+
+;; ---------------------------------------------------------------- the C
+
+;; The C of the lIR module `lir` (named `file` in diagnostics); the warnings are printed, an error is the result.
+(defun c-text (lir: str file: str opts: cx/COpts) -> (Result str str)
+  (match (front/parse-and-check lir)
+    ((Err ds) (Err (str-join-with "\n" (vec (map (fn (d: Diagnostic) (diag-in-file d file)) ds)))))
+    ((Ok m) (let ((c (cm/cx-new m file opts)) (text (cm/module-c c m)))
+              (do (doseq [l (cm/diag-lines c)] (eprintln l))
+                  (if (cx/has-errors? c) (Err "the C printer reported errors (above): nothing was written") (Ok text)))))))
+
+(defun str-join-with :private (sep: str items: (Vec str)) -> str
+  (loop ((i 0) (acc ""))
+    (if (>= i (count items)) acc (recur (+ i 1) (if (= i 0) (nth items 0) (str acc sep (nth items i)))))))
+
+;; `fibc build --emit c`: the C written to `out`.
+(defun emit-c (lir: str file: str out: str) -> (Result unit str)
+  (try-let [text (c-text lir file (probe (cc-name)))]
+    (if (write-file out text) (Ok ()) (Err (str "cannot write " out)))))
+
+;; ---------------------------------------------------------------- the compiler
+
+;; The `-march` of the build: the host's CPU for a host build (as LLVM uses the host's), x86-64-v3 for a cross x86-64 one (ADR 0008), nothing for
+;; another architecture (the cross compiler's default).
+(defun march :private () -> (Vec str)
+  (match (lt/requested-triple)
+    (nil ["-march=native"])
+    ((some t) (if (= (. (tt/target-row-of-triple t) arch) "x86_64") ["-march=x86-64-v3"] []))))
+
+;; The flags the semantics need (docs/design/lir2c.md section 2): -ffp-contract=off (only an explicit fma fuses), -fno-math-errno (sqrt is an
+;; instruction, no errno), and belt and braces for what the printer already guarantees (no -fno-strict-aliasing: every typed access carries may_alias, and scripts/mutant-lir2c.sh strict-alias checks it;
+;; -fno-delete-null-pointer-checks: it does pointer arithmetic in uintptr_t). -Wno-unused: lIR binds names it never reads and the runtime defines
+;; functions a program never calls; -Wno-array-bounds -Wno-stringop-overflow: gcc's object-size tracking sees through the uintptr_t casts and lIR
+;; addresses the bytes of a global past its declared type (a header followed by its elements); -Wno-psabi: 256-bit vector parameters.
+(defun cc-flags (opt: i64) -> (Vec str)
+  (into [(str "-std=gnu11") (str "-O" (min opt 3)) "-ffp-contract=off" "-fno-math-errno" "-fno-delete-null-pointer-checks"
+         "-Wall" "-Wextra" "-Wno-unused" "-Wno-array-bounds" "-Wno-stringop-overflow" "-Wno-psabi" "-Wno-tautological-compare" "-Wno-maybe-musttail-local-addr" "-Wno-maybe-uninitialized"]
+        (march)))
+
+(defun run-compiler :private (argv: (Vec str) errfile: str) -> (Result unit str)
+  (do (when (= (env "FIB_CC_VERBOSE") "1") (eprintln (str-join-with " " argv)))
+      (match (link/run-cc argv errfile)
+        ((Ok _) (Ok ()))
+        ((Err m) (Err (str (cc-name) " failed: " (unwrap-or (read-file errfile) m)))))))
+
+;; The executable `out` of the C file `src`: dynamic (`cc ... -o out src -lm -lpthread -L.. -l..`), or static (`cc -c`, then the musl link).
+(defun compile-c :private (src: str out: str opt: i64 dirs: (Vec str) libs: (Vec str)) -> (Result unit str)
+  (let ((errfile (str out ".cc.err")) (cc (cc-name)))
+    (match (target/static-triple)
+      ((some t) (let ((obj (str out ".o")))
+                  (try-let ((_ (run-compiler (into (into [cc] (cc-flags opt)) ["-c" "-o" obj src]) errfile))
+                            (_ (match (ls/link-static-object obj out dirs libs t) ((Ok _) (Ok ())) ((Err e) (Err (native-error e))))))
+                    (do (p/remove-file obj) (p/remove-file errfile) (Ok ())))))
+      (nil (let ((r (run-compiler (into (into (into [cc] (cc-flags opt)) ["-o" out src]) (link/link-args dirs libs)) errfile)))
+             (do (p/remove-file errfile) r))))))
+
+(defun native-error :private (e: ne/LairError) -> str (ne/lair-error-str e))
+
+;; `fibc build --via c`: the C of `lir` compiled by the C compiler into `out`.
+(defun build-via-c (lir: str file: str out: str opt: i64 dirs: (Vec str) libs: (Vec str)) -> (Result unit str)
+  (let ((src (str out ".c")))
+    (try-let ((text (c-text lir file (probe (cc-name))))
+              (_ (if (write-file src text) (Ok ()) (Err (str "cannot write " src))))
+              (_ (compile-c src out opt dirs libs)))
+      (do (when (not (= (env "FIB_CC_KEEP") "1")) (p/remove-file src)) (Ok ())))))
+
+;; ---------------------------------------------------------------- run
+
+(defun eprint-raw :private (s: str) -> unit
+  (when (not (= s ""))
+    (eprintln (if (= (str-byte-at s (- (str-len s) 1)) 10i8) (str-slice s 0 (- (str-len s) 1)) s))))
+
+(defun report :private (exe-out: str exe-err: str status: i64) -> i64
+  (do (print-raw (unwrap-or (read-file exe-out) ""))
+      (eprint-raw (unwrap-or (read-file exe-err) ""))
+      status))
+
+;; Builds `lir` through C into `dir` and runs it with FIB_TRACE=1, as driver.staticrun runs a static case: what the harness reads is the executable's.
+(defun build-and-run :private (lir: str file: str dir: str opt: i64 args: (Vec str)) -> i64
+  (let ((exe (str dir "/x")) (out (str dir "/out")) (err (str dir "/err")) (declared (ld/declared-libs lir)))
+    (match (ld/lib-words declared)
+      ((Err m) (do (eprintln m) 2))
+      ((Ok words)
+       (match (build-via-c lir file exe opt [] words)
+         ((Err m) (do (eprintln (str "compile failed: " m)) 5))
+         ((Ok _) (do (native/setenv-set "FIB_TRACE" "1")
+                     (let ((pid (p/spawn-executable exe (into [exe] args) out err 300)))
+                       (if (< pid 0) 5 (report out err (p/wait-pid pid)))))))))))
+
+;; `FIB_VIA=c fibc run FILE`. The C is compiled at -O1 at least: at -O0 gcc keeps every C local in its own stack slot (the printer makes one per
+;; instruction), so a frame is several times LLVM's and a program that recurses two million frames deep (case 8353) overflows its stack.
+(defun run-via-c (file: str args: (Vec str) opt0: i64 roots: Roots rm: mk/RunnerMaker) -> i64
+  (match (dfront/lower-kind file roots rm false)
+    ((Err code) code)
+    ((Ok lir)
+     (match (p/make-temp-dir (tmp-dir))
+       (nil 5)
+       ((some dir) (let ((r (build-and-run lir file dir (max opt0 1) args)))
+                     (do (p/remove-file (str dir "/x")) (p/remove-file (str dir "/x.c")) (p/remove-file (str dir "/out")) (p/remove-file (str dir "/err")) (p/remove-dir dir) r)))))))

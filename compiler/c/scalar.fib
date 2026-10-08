@@ -1,0 +1,141 @@
+;; compiler/c/scalar.fib: the C text of lIR's scalar operations on operand texts (docs/design/lir2c.md section 3). Each function takes the
+;; operands' C texts (names or literals: c.expr hoists every nested instruction into a temporary first, so a text has no effect and may be
+;; repeated) and the scalar type. Integer arithmetic goes through the helpers of c.prelude (wrapping, SIGFPE on a zero divisor, masked
+;; shifts); comparisons and float arithmetic are C's own, which are IEEE under -ffp-contract=off with no fast-math.
+;;
+;; Values: i1 is a uint8_t holding 0 or 1; i8..i64 are the signed intN_t; float and double themselves; ptr is a char *.
+(ns c.scalar
+  (:use lir.types lir.lit lir.ast c.cx))
+
+(defun p :private (a: str) -> str (str "(" a ")"))
+
+;; ---------------------------------------------------------------- literals
+
+;; The C text of an iK literal: signed for K from 8 to 64 (the minimum written as an expression, since its magnitude is not a literal), 0 or 1
+;; for i1.
+(defun int-literal (bits: i64 v: LLit) -> str
+  (let ((w (lit-low v bits)))
+    (cond (= bits 64) (if (= w (shl 1 63)) "(-9223372036854775807LL - 1)" (if (< w 0) (str "(" w "LL)") (str w "LL")))
+          (= bits 1) (str "(uint8_t)" w)
+          :else (let ((s (if (>= w (shl 1 (- bits 1))) (- w (shl 1 bits)) w)))
+                  (str "(int" bits "_t)" (if (< s 0) (str "(" s ")") (str s)))))))
+
+;; The exact C text of a double: a hexadecimal float literal (C99), so no decimal rounding happens between the two compilers.
+(defun double-literal (v: f64) -> str
+  (let ((bits (f64->bits v))
+        (sign (if (< bits 0) "-" ""))
+        (ex (bit-and (shr bits 52) 2047))
+        (mant (bit-and bits 4503599627370495)))
+    (cond (= ex 2047) (if (= mant 0) (str sign "__builtin_inf()") "__builtin_nan(\"\")")
+          (and (= ex 0) (= mant 0)) (str sign "0x0p+0")
+          (= ex 0) (str sign "0x0." (hex13 mant) "p-1022")
+          :else (str sign "0x1." (hex13 mant) "p" (let ((e (- ex 1023))) (if (>= e 0) (str "+" e) (str e)))))))
+
+(defun hex13 :private (m: i64) -> str
+  (loop ((k 12) (s ""))
+    (if (< k 0) s (recur (- k 1) (str s (str-slice hex-digits (bit-and (shr m (* k 4)) 15) (+ (bit-and (shr m (* k 4)) 15) 1)))))))
+
+(defun float-literal (t: LType v: f64) -> str
+  (if (= t ty-float) (str "(float)" (double-literal v)) (double-literal v)))
+
+;; ---------------------------------------------------------------- integer arithmetic
+
+(defun bin-word :private (op: LBinOp) -> str
+  (match op
+    ((BAdd) "add") ((BSub) "sub") ((BMul) "mul") ((BSDiv) "sdiv") ((BUDiv) "udiv") ((BSRem) "srem") ((BURem) "urem")
+    ((BShl) "shl") ((BLShr) "lshr") ((BAShr) "ashr")
+    ((BAnd) "and") ((BOr) "or") ((BXor) "xor")
+    ((BFAdd) "fadd") ((BFSub) "fsub") ((BFMul) "fmul") ((BFDiv) "fdiv") ((BFRem) "frem")))
+
+(defun bitwise-op :private (op: LBinOp) -> (Option str)
+  (match op ((BAnd) (some "&")) ((BOr) (some "|")) ((BXor) (some "^")) (_ nil)))
+
+;; i1: arithmetic modulo 2; a shift amount other than 0 is poison, so the value is the operand itself.
+(defun bin1 :private (op: LBinOp a: str b: str) -> str
+  (match op
+    ((BAdd) (str "(uint8_t)(" a " ^ " b ")")) ((BSub) (str "(uint8_t)(" a " ^ " b ")")) ((BXor) (str "(uint8_t)(" a " ^ " b ")"))
+    ((BMul) (str "(uint8_t)(" a " & " b ")")) ((BAnd) (str "(uint8_t)(" a " & " b ")")) ((BOr) (str "(uint8_t)(" a " | " b ")"))
+    ((BSDiv) (str "fib_div1(" a ", " b ")")) ((BUDiv) (str "fib_div1(" a ", " b ")"))
+    ((BSRem) (str "fib_rem1(" a ", " b ")")) ((BURem) (str "fib_rem1(" a ", " b ")"))
+    (_ a)))
+
+(defun float-bin :private (op: LBinOp single: bool a: str b: str) -> str
+  (match op
+    ((BFAdd) (p (str a " + " b))) ((BFSub) (p (str a " - " b))) ((BFMul) (p (str a " * " b))) ((BFDiv) (p (str a " / " b)))
+    ((BFRem) (str (if single "__builtin_fmodf(" "__builtin_fmod(") a ", " b ")"))
+    (_ "0")))
+
+;; A binary operation on scalars of type t.
+(defun bin-c (op: LBinOp t: LType a: str b: str) -> str
+  (match t
+    ((TInt 1) (bin1 op a b))
+    ((TInt k) (match (bitwise-op op)
+                ((some o) (str "(int" k "_t)(" a " " o " " b ")"))
+                (nil (str "fib_" (bin-word op) k "(" a ", " b ")"))))
+    ((TFloat) (float-bin op true a b))
+    (_ (float-bin op false a b))))
+
+;; A unary operation: fneg flips the sign bit as LLVM does; ctpop counts.
+(defun un-c (op: LUnOp t: LType a: str) -> str
+  (match op
+    ((UFNeg) (str "(- " a ")"))
+    ((UCtpop) (match t ((TInt 1) a) ((TInt k) (str "fib_ctpop" k "(" a ")")) (_ a)))))
+
+;; ---------------------------------------------------------------- comparisons
+
+(defun bool01 :private (c: str) -> str (str "(uint8_t)(" c ")"))
+
+(defun icmp-op :private (pr: LIPred) -> str
+  (match pr ((IEq) "==") ((INe) "!=") ((ISlt) "<") ((ISle) "<=") ((ISgt) ">") ((ISge) ">=")
+            ((IUlt) "<") ((IUle) "<=") ((IUgt) ">") ((IUge) ">=")))
+
+(defun icmp-signed? :private (pr: LIPred) -> bool
+  (match pr ((ISlt) true) ((ISle) true) ((ISgt) true) ((ISge) true) (_ false)))
+
+(defun icmp-unsigned? :private (pr: LIPred) -> bool
+  (match pr ((IUlt) true) ((IUle) true) ((IUgt) true) ((IUge) true) (_ false)))
+
+;; The operand as compared: the unsigned twin for an unsigned predicate (a pointer compares as an address), -v for a signed one on i1
+;; (whose 1 is -1).
+(defun cmp-operand :private (pr: LIPred t: LType a: str) -> str
+  (match t
+    ((TInt 1) (if (icmp-signed? pr) (str "(-(int)" a ")") a))
+    ((TPtr) (str "(uintptr_t)" a))
+    (_ (if (icmp-unsigned? pr) (str "(" (unsigned-ctype t) ")" a) a))))
+
+(defun icmp-c (pr: LIPred t: LType a: str b: str) -> str
+  (bool01 (str (cmp-operand pr t a) " " (icmp-op pr) " " (cmp-operand pr t b))))
+
+;; An ordered predicate is false on a NaN, as C's comparisons are; an unordered one is the negation of the ordered opposite.
+(defun fcmp-c (pr: LFPred a: str b: str) -> str
+  (match pr
+    ((FOeq) (bool01 (str a " == " b))) ((FOgt) (bool01 (str a " > " b))) ((FOge) (bool01 (str a " >= " b)))
+    ((FOlt) (bool01 (str a " < " b))) ((FOle) (bool01 (str a " <= " b)))
+    ((FUne) (bool01 (str a " != " b))) ((FUgt) (bool01 (str "!(" a " <= " b ")"))) ((FUge) (bool01 (str "!(" a " < " b ")")))
+    ((FUlt) (bool01 (str "!(" a " >= " b ")"))) ((FUle) (bool01 (str "!(" a " > " b ")")))
+    ((FOne) (bool01 (str a " < " b " || " a " > " b))) ((FUeq) (bool01 (str "!(" a " < " b " || " a " > " b ")")))
+    ((FOrd) (bool01 (str "!__builtin_isnan(" a ") && !__builtin_isnan(" b ")"))) ((FUno) (bool01 (str "__builtin_isnan(" a ") || __builtin_isnan(" b ")")))))
+
+;; ---------------------------------------------------------------- conversions
+
+(defun sat-name :private (op: str from: LType to: LType) -> str
+  (str "fib_" op "_sat" (if (= from ty-float) "32" "64") (int-bits to)))
+
+;; A conversion of one scalar from type `from` to type `to`; bitcast is c.expr's (it copies bytes).
+(defun cast-c (op: LCastOp from: LType to: LType v: str) -> str
+  (let ((tc (scalar-ctype to)) (uf (unsigned-ctype from)) (ut (unsigned-ctype to)))
+    (match op
+      ((CTrunc) (if (= to ty-i1) (str "(uint8_t)(" v " & 1)") (str "(" tc ")" v)))
+      ((CZExt) (str "(" tc ")(" uf ")" v))
+      ((CSExt) (if (= from ty-i1) (str "(" tc ")(-(int)" v ")") (str "(" tc ")" v)))
+      ((CFpTrunc) (str "(float)" v))
+      ((CFpExt) (str "(double)" v))
+      ((CFpToSi) (if (= to ty-i1) (str "(uint8_t)(fib_fptosi_sat" (if (= from ty-float) "32" "64") "8(" v ") & 1)") (str (sat-name "fptosi" from to) "(" v ")")))
+      ((CFpToUi) (if (= to ty-i1) (str "(uint8_t)(fib_fptoui_sat" (if (= from ty-float) "32" "64") "8(" v ") & 1)") (str (sat-name "fptoui" from to) "(" v ")")))
+      ((CFpToSiSat) (if (= to ty-i1) (str "(uint8_t)(fib_fptosi_sat" (if (= from ty-float) "32" "64") "8(" v ") & 1)") (str (sat-name "fptosi" from to) "(" v ")")))
+      ((CFpToUiSat) (if (= to ty-i1) (str "(uint8_t)(fib_fptoui_sat" (if (= from ty-float) "32" "64") "8(" v ") & 1)") (str (sat-name "fptoui" from to) "(" v ")")))
+      ((CSiToFp) (if (= from ty-i1) (str "(" tc ")(-(int)" v ")") (str "(" tc ")" v)))
+      ((CUiToFp) (str "(" tc ")(" uf ")" v))
+      ((CPtrToInt) (if (= to ty-i1) (str "(uint8_t)((uintptr_t)" v " & 1)") (str "(" tc ")(" ut ")(uintptr_t)" v)))
+      ((CIntToPtr) (str "(char *)(uintptr_t)(" uf ")" v))
+      ((CBitcast) v))))

@@ -1,0 +1,54 @@
+;; compiler/lir2c.fib: the C backend of lIR as a tool (docs/design/lir2c.md). It parses and checks a module as lair does (spec/lir.md
+;; section 10: the same reader and checker, compiler/lir), then writes one C translation unit (c.module). What the chosen C compiler cannot
+;; translate is reported by name and position: a warning where the program keeps its meaning, an error where it would not (then no file
+;; is written and the status is 1).
+;;   lir2c FILE.lir -o OUT.c [--cc gcc|clang] [--allow-plain-tail-calls] [--no-lines]
+;;   lir2c emit FILE.lir [the same options]        the C to standard output
+;; `--cc` names the compiler the C is for (its musttail facts, c.policy; default gcc); `--no-lines` leaves the `#line` directives out.
+;; Build: fibc build compiler/lir2c.fib -I compiler -I lib -o lir2c
+(ns main
+  (:use lir.diag)
+  (:require [lir :as front] [lir.check :as check] [c.module :as cm] [c.cx :as cx] [c.policy :as policy]))
+
+(def usage: str "usage:
+  lir2c FILE.lir -o OUT.c [--cc gcc|clang] [--allow-plain-tail-calls] [--no-lines]
+  lir2c emit FILE.lir [--cc gcc|clang] [--allow-plain-tail-calls] [--no-lines]")
+
+(defstruct Args (words: (Vec str) cc: str plain: bool lines: bool))
+
+(defun parse-args :private (argv: (Vec str)) -> Args
+  (loop ((i 0) (words: (Vec str) []) (cc "gcc") (plain false) (lines true))
+    (cond (>= i (count argv)) (Args words cc plain lines)
+          (and (= (nth argv i) "--cc") (< (+ i 1) (count argv))) (recur (+ i 2) words (nth argv (+ i 1)) plain lines)
+          (= (nth argv i) "--allow-plain-tail-calls") (recur (+ i 1) words cc true lines)
+          (= (nth argv i) "--no-lines") (recur (+ i 1) words cc plain false)
+          :else (recur (+ i 1) (conj words (nth argv i)) cc plain lines))))
+
+(defun diags-text :private (ds: (Vec Diagnostic) file: str) -> str
+  (str-join (vec (map-indexed (fn (i: i64 d: Diagnostic) (str (if (= i 0) "" "\n") (diag-in-file d file))) ds))))
+
+;; The C of the checked module of FILE; the warnings are printed, an error makes it an Err.
+(defun translate :private (file: str a: Args) -> (Result str str)
+  (match (read-file file)
+    (nil (Err (str file ": cannot read: No such file or directory (os error 2)")))
+    ((some src)
+     (match (front/parse-and-check src)
+       ((Err ds) (Err (diags-text ds file)))
+       ((Ok m) (match (check/check-main m)
+                 ((Err d) (Err (diag-in-file d file)))
+                 ((Ok _) (let ((c (cm/cx-new m file (policy/opts-for (. a cc) (. a plain) (. a lines))))
+                               (text (cm/module-c c m)))
+                           (do (doseq [l (cm/diag-lines c)] (eprintln l))
+                               (if (cx/has-errors? c) (Err "lir2c: not translated (see the errors above)") (Ok text)))))))))))
+
+(defun dispatch :private (argv: (Vec str)) -> (Result i64 str)
+  (let ((a (parse-args argv)) (w (. a words)))
+    (cond (and (= (count w) 2) (= (nth w 0) "emit")) (try-let [t (translate (nth w 1) a)] (do (print-raw t) (Ok 0)))
+          (and (= (count w) 3) (= (nth w 1) "-o"))
+          (try-let [t (translate (nth w 0) a)] (if (write-file (nth w 2) t) (Ok 0) (Err (str "lir2c: cannot write " (nth w 2)))))
+          :else (Err usage))))
+
+(defun main () -> i64
+  (match (dispatch (vec (args)))
+    ((Ok code) code)
+    ((Err msg) (do (eprintln msg) 1))))

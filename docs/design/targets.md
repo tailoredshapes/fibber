@@ -272,6 +272,15 @@ Results of `targets-emit.sh`, section 7:
 What it means that these emit: a valid object exists for the target, and that object would have the run-time faults of section 3 once it was
 linked and run.
 
+### 4.1 `--emit c`: an output kind of every CPU row (LIR2C-1)
+
+`fibc build --emit c` writes the program as one C translation unit and `--via c --cc CC` compiles it with a C compiler instead of LLVM
+(docs/design/lir2c.md). It is an output kind like `obj`, `asm` and `llvm`, not a row: the C is the row's lIR printed (the row still
+chooses the lane counts, the runtime OS and the libc), and the C compiler is what makes it code for the row's architecture, so a cross
+build is `--target aarch64-unknown-linux-gnu --via c --cc aarch64-linux-gnu-gcc` (hello runs under qemu-aarch64 that way). The kernel
+row (`nvptx64-nvidia-cuda`) has no C: `kernelcc`, `sreg` and `barrier` are errors of the printer. `--static` with `--via c` compiles the
+C to an object and links it against the musl pieces: a static executable with no LLVM anywhere on the path.
+
 ## 5. Plan
 
 Sizes: S is under a day, M one to three days, L about a week.

@@ -1,0 +1,91 @@
+;; compiler/c/prelude.fib: the C text every translation unit starts with (docs/design/lir2c.md section 3): the fixed-width types from the
+;; freestanding <stdint.h> (no function prototype comes from a header: every C function the module uses is declared from its lIR
+;; `declare`, ADR 0011), and the static inline helpers that give lIR's scalar semantics exactly:
+;;   - `fib_addN sub mul`: wrapping, computed on the unsigned twin and converted back (the conversion is modulo 2^N on gcc and clang, documented);
+;;   - `fib_sdivN srem udiv urem`: a zero divisor, or the minimum by -1, raises SIGFPE as x86-64's idiv does (undefined in lIR, 6.12: any
+;;     behaviour is a valid translation; this one is the native one);
+;;   - `fib_shlN lshr ashr`: the amount masked to the width (poison in lIR for an amount at or above it; the mask is what x86-64 does);
+;;   - `fib_ctpopN cttz ctlz abs smin smax umin umax`: never poison (cttz/ctlz of 0 is the width, abs of the minimum is the minimum);
+;;   - `fib_fmin fmax`: NaN-propagating with -0.0 below +0.0 (llvm.minimum/maximum); `fminnum fmaxnum`: NaN-ignoring (llvm.minnum/maxnum);
+;;   - `fib_fptosi_sat fptoui_sat`: saturating with NaN to 0 (llvm.fptosi.sat); the plain `fptosi`/`fptoui` go through them too, since any value
+;;     is a valid translation of poison and this one is defined;
+;;   - `fib_fmuladd`: fused where the C compiler targets FMA (`__FMA__`), a multiply and an add otherwise (either is allowed, spec/lir.md 6.1);
+;;     `fma` is always `__builtin_fma`, exact (ADR 0008).
+;; Nothing here is undefined behaviour: every helper is defined on every input.
+(ns c.prelude)
+
+(def int-ops-macro: (Vec str)
+  ["#define FIB_IOPS(N, T, U, W, M, MINV) \\"
+   "static inline T fib_add##N(T a, T b) { return (T)((W)(U)a + (W)(U)b); } \\"
+   "static inline T fib_sub##N(T a, T b) { return (T)((W)(U)a - (W)(U)b); } \\"
+   "static inline T fib_mul##N(T a, T b) { return (T)((W)(U)a * (W)(U)b); } \\"
+   "static inline T fib_sdiv##N(T a, T b) { if (b == 0 || (b == -1 && a == MINV)) fib_c_sigfpe(); return (T)(a / b); } \\"
+   "static inline T fib_srem##N(T a, T b) { if (b == 0 || (b == -1 && a == MINV)) fib_c_sigfpe(); return (T)(a % b); } \\"
+   "static inline T fib_udiv##N(T a, T b) { if (b == 0) fib_c_sigfpe(); return (T)((U)a / (U)b); } \\"
+   "static inline T fib_urem##N(T a, T b) { if (b == 0) fib_c_sigfpe(); return (T)((U)a % (U)b); } \\"
+   "static inline T fib_shl##N(T a, T b) { return (T)((W)(U)a << ((U)b & M)); } \\"
+   "static inline T fib_lshr##N(T a, T b) { return (T)((U)a >> ((U)b & M)); } \\"
+   "static inline T fib_ashr##N(T a, T b) { return (T)(a >> ((U)b & M)); } \\"
+   "static inline T fib_ctpop##N(T a) { return (T)__builtin_popcountll((uint64_t)(U)a); } \\"
+   "static inline T fib_cttz##N(T a) { return (U)a == 0 ? (T)N : (T)__builtin_ctzll((uint64_t)(U)a); } \\"
+   "static inline T fib_ctlz##N(T a) { return (U)a == 0 ? (T)N : (T)(__builtin_clzll((uint64_t)(U)a) - (64 - N)); } \\"
+   "static inline T fib_abs##N(T a) { return a < 0 ? (T)((W)0 - (W)(U)a) : a; } \\"
+   "static inline T fib_smin##N(T a, T b) { return a < b ? a : b; } \\"
+   "static inline T fib_smax##N(T a, T b) { return a > b ? a : b; } \\"
+   "static inline T fib_umin##N(T a, T b) { return (U)a < (U)b ? a : b; } \\"
+   "static inline T fib_umax##N(T a, T b) { return (U)a > (U)b ? a : b; }"
+   "FIB_IOPS(8, int8_t, uint8_t, uint32_t, 7, (-127 - 1))"
+   "FIB_IOPS(16, int16_t, uint16_t, uint32_t, 15, (-32767 - 1))"
+   "FIB_IOPS(32, int32_t, uint32_t, uint32_t, 31, (-2147483647 - 1))"
+   "FIB_IOPS(64, int64_t, uint64_t, uint64_t, 63, (-9223372036854775807LL - 1))"
+   "static inline uint8_t fib_div1(uint8_t a, uint8_t b) { if (b == 0) fib_c_sigfpe(); return a; }"
+   "static inline uint8_t fib_rem1(uint8_t a, uint8_t b) { if (b == 0) fib_c_sigfpe(); return (uint8_t)(a & 0); }"])
+
+(def float-ops-macro: (Vec str)
+  ["#define FIB_FOPS(S, T) \\"
+   "static inline T fib_fmin##S(T a, T b) { if (__builtin_isnan(a)) return a; if (__builtin_isnan(b)) return b; if (a == b) return __builtin_signbit(a) ? a : b; return a < b ? a : b; } \\"
+   "static inline T fib_fmax##S(T a, T b) { if (__builtin_isnan(a)) return a; if (__builtin_isnan(b)) return b; if (a == b) return __builtin_signbit(a) ? b : a; return a > b ? a : b; } \\"
+   "static inline T fib_fminnum##S(T a, T b) { if (__builtin_isnan(a)) return b; if (__builtin_isnan(b)) return a; return a < b ? a : b; } \\"
+   "static inline T fib_fmaxnum##S(T a, T b) { if (__builtin_isnan(a)) return b; if (__builtin_isnan(b)) return a; return a > b ? a : b; }"
+   "FIB_FOPS(32, float)"
+   "FIB_FOPS(64, double)"
+   "#define FIB_FSAT(S, F, N, T, U, MINV, MAXF, UMAXF) \\"
+   "static inline T fib_fptosi_sat##S##N(F x) { if (__builtin_isnan(x)) return 0; if (x <= (F)MINV) return (T)MINV; if (x >= (F)MAXF) return (T)((U)~(U)0 >> 1); return (T)x; } \\"
+   "static inline T fib_fptoui_sat##S##N(F x) { if (!(x > 0)) return 0; if (x >= (F)UMAXF) return (T)~(U)0; return (T)(U)x; }"
+   "#define FIB_FSAT2(S, F) \\"
+   "FIB_FSAT(S, F, 8, int8_t, uint8_t, (-127 - 1), 128.0, 256.0) \\"
+   "FIB_FSAT(S, F, 16, int16_t, uint16_t, (-32767 - 1), 32768.0, 65536.0) \\"
+   "FIB_FSAT(S, F, 32, int32_t, uint32_t, (-2147483647 - 1), 2147483648.0, 4294967296.0) \\"
+   "FIB_FSAT(S, F, 64, int64_t, uint64_t, (-9223372036854775807LL - 1), 9223372036854775808.0, 18446744073709551616.0)"
+   "FIB_FSAT2(32, float)"
+   "FIB_FSAT2(64, double)"
+   "#ifdef __FMA__"
+   "#define fib_fmuladd64(a, b, c) __builtin_fma(a, b, c)"
+   "#define fib_fmuladd32(a, b, c) __builtin_fmaf(a, b, c)"
+   "#else"
+   "#define fib_fmuladd64(a, b, c) ((a) * (b) + (c))"
+   "#define fib_fmuladd32(a, b, c) ((a) * (b) + (c))"
+   "#endif"])
+
+(def head: (Vec str)
+  ["/* generated by fibc (lir2c, docs/design/lir2c.md): C11 with GNU extensions; compile with -std=gnu11 -ffp-contract=off -fno-math-errno */"
+   "#include <stdint.h>"
+   "#include <stddef.h>"
+   "#ifdef __APPLE__"
+   "#define FIB_SYM(x) \"_\" x"
+   "#else"
+   "#define FIB_SYM(x) x"
+   "#endif"
+   "extern int fib_c_raise(int) __asm__(FIB_SYM(\"raise\"));"
+   "static inline void fib_c_sigfpe(void) { fib_c_raise(8); __builtin_trap(); }"
+   "typedef int8_t __attribute__((may_alias, aligned(1))) fib_la_i8;"
+   "typedef int16_t __attribute__((may_alias, aligned(1))) fib_la_i16;"
+   "typedef int32_t __attribute__((may_alias, aligned(1))) fib_la_i32;"
+   "typedef int64_t __attribute__((may_alias, aligned(1))) fib_la_i64;"
+   "typedef float __attribute__((may_alias, aligned(1))) fib_la_f32;"
+   "typedef double __attribute__((may_alias, aligned(1))) fib_la_f64;"
+   "typedef uint8_t __attribute__((may_alias)) fib_ma_u8;"])
+
+;; The whole prelude, each line with its newline.
+(defun prelude-text () -> str
+  (str-join (vec (map (fn (l: str) (str l "\n")) (into (into head int-ops-macro) float-ops-macro)))))

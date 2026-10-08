@@ -1,0 +1,82 @@
+;; expect: accept
+;; out: mutual 5000000 even
+;; out: closure 3000000
+;; out: self 10000000
+;; out: escape 4000000
+;; out: shuffle 8 1 6 3 5 4 2 7
+;; out: reduce -1 0 -1 4 24
+;; out: masked 11 2 13 4 -1 99
+;; out: order 1 2 3 4 5 6
+;; Tail calls C must keep as jumps (spec/lir.md 7.3; ADR 0008): `tailcc` mutual recursion between two prototypes 5 million deep (a plain
+;; call overflows an 8 MiB stack long before), an indirect tail call through a closure value, a self tail call 10 million deep, and a
+;; mutual recursion whose every frame has a stack slot whose address escapes (a C compiler's optional sibling-call optimisation declines
+;; such a frame; `musttail` makes it jump: scripts/mutant-lir2c.sh musttail). Lane
+;; order: a shuffle picking from both operands, in-order reductions (reduce-fadd of 1e16 + 1 - 1e16 is 0 lane by lane and 1 reassociated),
+;; masked loads with their passthru, and the evaluation order of call arguments (left to right, each with an effect).
+(declare printf i32 (ptr ...))
+(declare malloc ptr (i64))
+(define tailcc (is-even i1) ((i64 n))
+  (block entry (br (icmp eq n (i64 0)) yes no))
+  (block yes (ret (i1 1)))
+  (block no (tailcall @is-odd (sub n (i64 1)) (i64 7) (double 1.0))))
+(define tailcc (is-odd i1) ((i64 n) (i64 pad) (double pad2))
+  (block entry (br (icmp eq n (i64 0)) yes no))
+  (block yes (ret (i1 0)))
+  (block no (tailcall @is-even (sub n (i64 1)))))
+(define tailcc (count-down i64) ((ptr env) (i64 n) (i64 acc))
+  (block entry (br (icmp eq n (i64 0)) done more))
+  (block done (ret acc))
+  (block more
+    (let ((f (load ptr env)))
+      (indirect-tailcall f (fn tailcc i64 (ptr i64 i64)) env (sub n (i64 1)) (add acc (i64 1))))))
+(define (self i64) ((i64 n) (i64 acc))
+  (block entry (br (icmp eq n (i64 0)) done more))
+  (block done (ret acc))
+  (block more (tailcall @self (sub n (i64 1)) (add acc (i64 1)))))
+(global internal noted ptr (ptr null))
+(define (note void) ((ptr p))
+  (block entry (store p @noted) (ret)))
+(define tailcc (ping i64) ((i64 n) (i64 acc))
+  (block entry
+    (let ((slot (alloca i64)))
+      (store n slot)
+      (call @note slot)
+      (br (icmp eq n (i64 0)) done more)))
+  (block done (ret acc))
+  (block more (tailcall @pong (sub n (i64 1)) (add acc (i64 1)) (i64 0))))
+(define tailcc (pong i64) ((i64 n) (i64 acc) (i64 pad))
+  (block entry
+    (let ((slot (alloca i64)))
+      (store acc slot)
+      (call @note slot)
+      (br (icmp eq n (i64 0)) done more)))
+  (block done (ret acc))
+  (block more (tailcall @ping (sub n (i64 1)) (add acc (i64 1)))))
+(global internal counter i64 (i64 0))
+(define (next i64) ()
+  (block entry
+    (let ((v (add (load i64 @counter) (i64 1))))
+      (store v @counter)
+      (ret v))))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "mutual 5000000 %s\n") (select (call @is-even (i64 5000000)) (string "even") (string "odd")))
+    (let ((env (call @malloc (i64 8))))
+      (store @count-down env)
+      (call @printf (string "closure %lld\n") (call @count-down env (i64 3000000) (i64 0))))
+    (call @printf (string "self %lld\n") (call @self (i64 10000000) (i64 0)))
+    (call @printf (string "escape %lld\n") (call @ping (i64 4000000) (i64 0)))
+    (let ((s (shufflevector (<4 x i32> 1 2 3 4) (<4 x i32> 5 6 7 8) (<8 x i32> 7 0 5 2 4 3 1 6))))
+      (call @printf (string "shuffle %d %d %d %d %d %d %d %d\n") (extractelement s (i32 0)) (extractelement s (i32 1)) (extractelement s (i32 2))
+            (extractelement s (i32 3)) (extractelement s (i32 4)) (extractelement s (i32 5)) (extractelement s (i32 6)) (extractelement s (i32 7))))
+    (let ((v (<4 x double> 1e16 1.0 -1e16 0.0)))
+      (call @printf (string "reduce %g %g %lld %lld %lld\n") (reduce-fadd (double 0.0) (<4 x double> 1.0 -1e16 1e16 -1.0))
+            (reduce-fadd (double 0.0) v) (reduce-smin (<4 x i64> 3 -1 2 0)) (reduce-umax (<4 x i32> 4 1 2 0)) (reduce-mul (<4 x i32> 1 2 3 4))))
+    (let ((p (call @malloc (i64 64))))
+      (store (<4 x i32> 11 12 13 14) p)
+      (let ((m (masked-load <4 x i32> p (<4 x i1> 1 0 1 0) (<4 x i32> 1 2 3 4))))
+        (masked-store (<4 x i32> -1 -2 99 -4) (getelementptr i8 p (i64 16)) (<4 x i1> 1 0 1 0))
+        (call @printf (string "masked %d %d %d %d %d %d\n") (extractelement m (i32 0)) (extractelement m (i32 1)) (extractelement m (i32 2))
+              (extractelement m (i32 3)) (load i32 (getelementptr i8 p (i64 16))) (load i32 (getelementptr i8 p (i64 24))))))
+    (call @printf (string "order %lld %lld %lld %lld %lld %lld\n") (call @next) (call @next) (call @next) (call @next) (call @next) (call @next))
+    (ret (i32 0))))

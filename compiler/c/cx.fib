@@ -1,0 +1,258 @@
+;; compiler/c/cx.fib: the state of the lIR-to-C printer (docs/design/lir2c.md): the module context `Cx`, the function context `Cf`, C names,
+;; the diagnostics (a warning where the program keeps its meaning, an error where it would not: nothing is silently miscompiled), and the
+;; options the chosen C compiler sets (c.policy).
+;;
+;; Every lIR name becomes a C identifier under a prefix (`f_` a defined function, `x_` a declared one, `g_` a global, `v_` a local, `L_` a
+;; block, `p_` a phi): letters, digits and `_` stay, any other byte is `_` and two hex digits, `_` itself is `_5f`, so the mapping is injective.
+;; An exported symbol keeps its lIR name through an asm label (`__asm__("name")`), so the linker, `-l` libraries and link declarations see
+;; the same symbols as the LLVM build.
+(ns c.cx
+  (:use lir.types lir.lit lir.ast lir.diag))
+
+;; What the chosen C compiler can do (c.policy fills it from the probe or the table): `musttail` is whether `__attribute__((musttail))`
+;; is honoured; `musttail-any` whether it holds between functions of different prototypes (gcc 15: yes; clang: only identical ones);
+;; `plain-tails` is `--allow-plain-tail-calls`: a tail call the compiler cannot guarantee becomes a plain call and a warning instead of an error.
+(defstruct COpts (cc: str musttail: bool musttail-any: bool plain-tails: bool lines: bool))
+
+;; A warning (`error` false) or an error, at the position of the form.
+(defstruct CDiag (error: bool pos: i64 message: str))
+
+;; A phi of a block: its position (the name of its C variable), its type and its incoming values.
+(defstruct Phi (pos: i64 ty: LType inc: (Vec LBinding)))
+
+;; The module context. The cells collect what the functions ask for: interned types (typedef lines), hoisted constants (string bytes),
+;; function-pointer typedefs, and the diagnostics. `tail-area` is the stack-argument area every `tailcc` prototype is padded to (c.policy).
+(defstruct Cx
+  (structs: (Map str (Vec LType))
+   fns: (Map str LFnType)
+   defined: (Set str)
+   globals: (Set str)
+   types: (Cell (Map str str))
+   typedefs: (Cell (Vec str))
+   consts: (Cell (Vec str))
+   counter: (Cell i64)
+   diags: (Cell (Vec CDiag))
+   opts: COpts
+   file: str
+   tail-area: (Cell i64)))
+
+;; The function context: the module, the function, every `let` binding by name (for its type), the types found so far, the statements
+;; and declarations of the function being written, the phis of each block, and the expression printer (set by c.expr).
+(defstruct Cf
+  (cx: Cx
+   f: LFunction
+   binds: (Map str LExpr)
+   types: (Cell (Map str LType))
+   out: (Cell (Vec str))
+   decls: (Cell (Vec str))
+   counter: (Cell i64)
+   phis: (Map str (Vec Phi))
+   looped: (Set str)
+   label: (Cell str)
+   self-tail: (Cell bool)
+   must-tail: (Cell bool)
+   ex: (fn (Cf LExpr) str)))
+
+(defun cf-ex (cf: Cf e: LExpr) -> str ((. cf ex) cf e))
+
+;; ---------------------------------------------------------------- diagnostics
+
+(defun warn! (cx: Cx pos: i64 message: str) -> unit
+  (update! (. cx diags) (fn (v) (conj v (CDiag false pos message)))))
+
+(defun error! (cx: Cx pos: i64 message: str) -> unit
+  (update! (. cx diags) (fn (v) (conj v (CDiag true pos message)))))
+
+(defun diag-line (cx: Cx d: CDiag) -> str
+  (str (. cx file) ":" (pos-str (. d pos)) ": " (if (. d error) "error" "warning") ": " (. d message)))
+
+(defun has-errors? (cx: Cx) -> bool
+  (some? (find-first (fn (d: CDiag) (. d error)) @(. cx diags))))
+
+;; A type C cannot express, reported by name at the position (none today: a lane count that is not a power of two is padded, `phys-lanes`;
+;; the check stays as the place such an error goes). The lowering goes on, so every such type of the module is named.
+(defun type-ok! (cx: Cx pos: i64 t: LType) -> unit
+  (match t
+    ((TVector n _) (when (> n 1024)
+                     (error! cx pos (str "vector type " (ty-key t) " has no C translation"))))
+    ((TArray _ e) (type-ok! cx pos e))
+    ((TAnon fs) (run! (fn (f: LType) (type-ok! cx pos f)) fs))
+    ((TNamed _) (run! (fn (f: LType) (type-ok! cx pos f)) (agg-fields cx t)))
+    (_ ())))
+
+;; ---------------------------------------------------------------- names
+
+(def hex-digits: str "0123456789abcdef")
+
+(defun hex-byte (b: i64) -> str
+  (str (str-slice hex-digits (shr b 4) (+ (shr b 4) 1)) (str-slice hex-digits (bit-and b 15) (+ (bit-and b 15) 1))))
+
+(defun ident-byte? :private (b: i64) -> bool
+  (or (and (>= b 97) (<= b 122)) (and (>= b 65) (<= b 90)) (and (>= b 48) (<= b 57))))
+
+;; An lIR name as a C identifier under `prefix`: letters and digits stay, any other byte (`_` included) is `_` and two hex digits.
+(defun mangle (prefix: str name: str) -> str
+  (let ((bs (str-bytes name)))
+    (str prefix
+         (str-join (loop ((i 0) (out []))
+                     (if (>= i (array-len bs))
+                         out
+                         (let ((b (bit-and (zext i64 (array-get bs i)) 255)))
+                           (recur (+ i 1) (conj out (if (ident-byte? b) (str-from-bytes (array 1 (trunc i8 b))) (str "_" (hex-byte b))))))))))))
+
+(defun local-name (n: str) -> str (mangle "v_" n))
+(defun fn-name (n: str) -> str (mangle "f_" n))
+(defun extern-name (n: str) -> str (mangle "x_" n))
+(defun global-name (n: str) -> str (mangle "g_" n))
+(defun label-name (n: str) -> str (mangle "L_" n))
+(defun phi-name (pos: i64) -> str (str "p_" pos))
+
+;; The C name of a function as called: its definition, or the declaration of an external one.
+(defun callee-name (cx: Cx n: str) -> str
+  (if (contains? (. cx defined) n) (fn-name n) (extern-name n)))
+
+;; The C text of the address `@name`: a function's or a global's.
+(defun addr-text (cx: Cx n: str) -> str
+  (if (contains? (. cx globals) n) (str "(char *)&" (global-name n)) (str "(char *)" (callee-name cx n))))
+
+;; A fresh number for a hoisted constant or an interned type.
+(defun fresh (cx: Cx) -> i64
+  (let ((c (. cx counter)) (n @c)) (do (set! c (+ n 1)) n)))
+
+;; A fresh temporary of the function.
+(defun fresh-temp (cf: Cf) -> str
+  (let ((c (. cf counter)) (n @c)) (do (set! c (+ n 1)) (str "t" n))))
+
+;; A statement of the function being written.
+(defun emit! (cf: Cf line: str) -> unit
+  (update! (. cf out) (fn (v) (conj v line))))
+
+;; A declaration at the top of the function.
+(defun declare! (cf: Cf line: str) -> unit
+  (update! (. cf decls) (fn (v) (conj v line))))
+
+;; A hoisted constant line, ahead of the globals.
+(defun hoist-const! (cx: Cx line: str) -> unit
+  (update! (. cx consts) (fn (v) (conj v line))))
+
+;; ---------------------------------------------------------------- types
+
+;; The lIR text of a type, the key it is interned under.
+(defun ty-key (t: LType) -> str
+  (match t
+    ((TInt b) (str "i" b))
+    ((TFloat) "float")
+    ((TDouble) "double")
+    ((TPtr) "ptr")
+    ((TVector n e) (str "<" n " x " (ty-key e) ">"))
+    ((TNamed n) (str "%struct." n))
+    ((TAnon fs) (str "{" (str-join (vec (map (fn (f: LType) (str (ty-key f) ",")) fs))) "}"))
+    ((TArray n e) (str "[" n " x " (ty-key e) "]"))))
+
+(defun int-bits (t: LType) -> i64 (match t ((TInt b) b) (_ 0)))
+(defun is-vector? (t: LType) -> bool (match t ((TVector _ _) true) (_ false)))
+(defun elem-of (t: LType) -> LType (match t ((TVector _ e) e) (_ t)))
+(defun lanes-of (t: LType) -> i64 (match t ((TVector n _) n) (_ 1)))
+(defun is-float? (t: LType) -> bool (match t ((TFloat) true) ((TDouble) true) (_ false)))
+(defun is-ptr? (t: LType) -> bool (match t ((TPtr) true) (_ false)))
+
+(defun agg-fields (cx: Cx t: LType) -> (Vec LType)
+  (match t
+    ((TNamed n) (unwrap-or (get (. cx structs) n) (vec-empty)))
+    ((TAnon fs) fs)
+    (_ (vec-empty))))
+
+;; The scalar C types.
+(defun scalar-ctype (t: LType) -> str
+  (match t
+    ((TInt 1) "uint8_t") ((TInt 8) "int8_t") ((TInt 16) "int16_t") ((TInt 32) "int32_t") ((TInt 64) "int64_t")
+    ((TFloat) "float") ((TDouble) "double")
+    (_ "char *")))
+
+;; The unsigned twin of an integer scalar (wrapping arithmetic is done on it).
+(defun unsigned-ctype (t: LType) -> str
+  (match t
+    ((TInt 1) "uint8_t") ((TInt 8) "uint8_t") ((TInt 16) "uint16_t") ((TInt 32) "uint32_t") ((TInt 64) "uint64_t")
+    ((TPtr) "uint64_t")
+    (_ (scalar-ctype t))))
+
+;; The short name of a vector element: i1 lanes are bytes holding 0 or 1, ptr lanes are 64-bit addresses.
+(defun elem-tag (e: LType) -> str
+  (match e
+    ((TInt 1) "i8") ((TInt b) (str "i" b)) ((TFloat) "f32") ((TDouble) "f64") (_ "i64")))
+
+(defun elem-ctype :private (e: LType) -> str
+  (match e ((TInt 1) "int8_t") ((TPtr) "int64_t") (_ (scalar-ctype e))))
+
+(defun elem-size :private (e: LType) -> i64
+  (match e ((TInt 1) 1) ((TInt b) (quot b 8)) ((TFloat) 4) (_ 8)))
+
+(defun intern! :private (cx: Cx key: str name: str def: str) -> str
+  (do (update! (. cx types) (fn (m) (assoc m key name)))
+      (update! (. cx typedefs) (fn (v) (conj v def)))
+      name))
+
+;; The physical lanes of a vector: GNU vector types need a power-of-two count, so `<3 x float>` is held in a `v4_f32` whose last lane is
+;; never read (loops run over the lIR count; a padded vector is loaded and stored lane by lane, so no byte past the lIR value is touched).
+(defun phys-lanes (n: i64) -> i64
+  (loop ((p 1)) (if (>= p n) p (recur (* p 2)))))
+
+(defun padded? (t: LType) -> bool
+  (match t ((TVector n _) (not (= n (phys-lanes n)))) (_ false)))
+
+(defun vector-ctype :private (cx: Cx n0: i64 e: LType) -> str
+  (let ((n (phys-lanes n0)) (nm (str "v" n "_" (elem-tag e))) (key (ty-key (TVector n e))))
+    (match (get @(. cx types) key)
+      ((some s) s)
+      (nil (do (intern! cx (str "u" key) (str "v" n "_u" (elem-tag e))
+                        (str "typedef " (unsigned-ctype e) " __attribute__((vector_size(" (* n (elem-size e)) "))) v" n "_u" (elem-tag e) ";"))
+               (intern! cx key nm (str "typedef " (elem-ctype e) " __attribute__((vector_size(" (* n (elem-size e)) "))) " nm ";")))))))
+
+;; The unsigned twin of a vector type (interned with it).
+(defun uvector-ctype (cx: Cx t: LType) -> str
+  (do (ctype cx t) (unwrap-or (get @(. cx types) (str "u" (ty-key (TVector (phys-lanes (lanes-of t)) (elem-of t))))) "")))
+
+(defun fields-text :private (cx: Cx fs: (Vec LType)) -> str
+  (str-join (vec (map-indexed (fn (i: i64 f: LType) (str " " (ctype cx f) " f" i ";")) fs))))
+
+(defun struct-ctype :private (cx: Cx key: str name: str fs: (Vec LType)) -> str
+  (let ((body (fields-text cx fs)))
+    (match (get @(. cx types) key)
+      ((some s) s)
+      (nil (intern! cx key name (str name " {" body " };"))))))
+
+;; The C type of an lIR type, interned on first use (a struct's fields first, so every definition precedes its use).
+(defun ctype (cx: Cx t: LType) -> str
+  (match t
+    ((TVector n e) (vector-ctype cx n e))
+    ((TNamed n) (struct-ctype cx (ty-key t) (mangle "struct S_" n) (agg-fields cx t)))
+    ((TAnon fs) (match (get @(. cx types) (ty-key t))
+                  ((some s) s)
+                  (nil (struct-ctype cx (ty-key t) (str "struct A" (fresh cx)) fs))))
+    ((TArray n e) (match (get @(. cx types) (ty-key t))
+                    ((some s) s)
+                    (nil (let ((et (ctype cx e)) (nm (str "struct R" (fresh cx))))
+                           (intern! cx (ty-key t) nm (str nm " { " et " e[" n "]; };"))))))
+    (_ (scalar-ctype t))))
+
+;; The C type of a function's result: `void` for none.
+(defun ret-ctype (cx: Cx r: (Option LType)) -> str
+  (match r ((some t) (ctype cx t)) (nil "void")))
+
+;; The parameter list of a function type: `(void)` for none, `, ...` for a variadic one; a tailcc one padded to the module's stack area
+;; (c.policy `tail-pads`, whose count `pads` is given here so that c.cx does not depend on c.policy).
+(defun params-ctype-padded (cx: Cx f: LFnType pads: i64) -> str
+  (let ((ps (into (. f params) (vec (repeat pads ty-i64)))))
+    (cond (= (count ps) 0) (if (. f varargs) "()" "(void)")
+          :else (str "(" (str-join (vec (map-indexed (fn (i: i64 t: LType) (str (if (= i 0) "" ", ") (ctype cx t))) ps)))
+                     (if (. f varargs) ", ..." "") ")"))))
+
+
+
+;; The typed-pointer cast for a scalar or vector access at address `p`: `ma_` (may alias, the ABI alignment) or `ua_` (also unaligned).
+(defun access-ctype (cx: Cx t: LType unaligned: bool) -> str
+  (let ((base (ctype cx t)) (key (str (if unaligned "ua:" "ma:") (ty-key t))))
+    (match (get @(. cx types) key)
+      ((some s) s)
+      (nil (let ((nm (str (if unaligned "ua_" "ma_") (fresh cx))))
+             (intern! cx key nm (str "typedef " base " __attribute__((may_alias" (if unaligned ", aligned(1)" "") ")) " nm ";")))))))

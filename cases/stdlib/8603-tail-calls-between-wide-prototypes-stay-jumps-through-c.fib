@@ -1,0 +1,33 @@
+;; spec:   spec/lir.md 7.3 (tailcc), docs/adr/0008, docs/design/lir2c.md section 2 (the tailcc stack area)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; Mutual recursion between a function of two parameters and one of nine (three of them past the six integer registers of the C
+;; convention, so a C compiler cannot jump from the narrow one to the wide one unless every tailcc prototype carries the same stack
+;; area: c.policy `tail-area`), four million calls deep: a plain call in either direction overflows an 8 MiB stack long before. Also a
+;; call through a closure value in tail position, three million deep, and a self call of ten parameters. Each returns the count; `planted`
+;; lowers the tail calls to plain calls and must see the process die of a stack overflow.
+(ns main (:use fib.core tl.check))
+
+(defun narrow (n: i64 acc: i64) -> i64
+  (if (= n 0) acc (wide (- n 1) (+ acc 1) 1 2 3 4 5 6 7)))
+
+(defun wide (n: i64 acc: i64 a: i64 b: i64 c: i64 d: i64 e: i64 f: i64 g: i64) -> i64
+  (if (= n 0) (+ acc a b c d e f g) (narrow (- n 1) (+ acc 1))))
+
+(defun self-wide (n: i64 acc: i64 a: i64 b: i64 c: i64 d: i64 e: i64 f: i64 g: i64 h: i64) -> i64
+  (if (= n 0) (+ acc a b c d e f g h) (self-wide (- n 1) (+ acc 1) b c d e f g h a)))
+
+(defun through (k: (fn (i64 i64) i64) n: i64 acc: i64) -> i64
+  (if (= n 0) acc (k (- n 1) (+ acc 1))))
+
+(defun step (n: i64 acc: i64) -> i64 (through step n acc))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (narrow 4000000 0) 4000000))
+        (check c (= (wide 4000001 0 1 1 1 1 1 1 1) 4000001))
+        (check c (= (self-wide 5000000 0 1 2 3 4 5 6 7 8) 5000036))
+        (check c (= (through step 3000000 0) 3000000))
+        (checks-result c))))

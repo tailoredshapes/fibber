@@ -1,0 +1,86 @@
+;; expect: accept
+;; out: punned 4607182418800017408 1.5 3
+;; out: reuse 7 2.5 7
+;; out: unaligned 1311768467463790320 2.5 1.0 2.0 3.0 4.0
+;; out: agg 11 22 33 2.0
+;; out: masks 1 0 1 1 0 0 1 0 77
+;; out: hoist 1030987 0.0 -9223372036854775808
+;; out: twins 0 1065353216
+;; Memory the C must read as lIR reads it: a double stored and read back as an i64 at the same address and the other way round (type
+;; punning through memory, which C's strict aliasing forbids and lIR allows: the printer's may_alias typedefs); one block written as an i64
+;; and later as a double by functions the compiler can inline; i64, double and <4 x float> at addresses of alignment 1 (`(align 1)`, and a
+;; plain `load` through a pointer the compiler cannot see is aligned); a struct and an array moved whole; a <8 x i1> stored packed; and a
+;; loop that stores a double and loads an i64 at one address each turn (a compiler that takes the two types for disjoint hoists the load
+;; out of the loop: scripts/mutant-lir2c.sh strict-alias).
+(declare printf i32 (ptr ...))
+(declare malloc ptr (i64))
+(define (fill-d void) ((ptr p) (double v))
+  (block entry (store v p) (ret)))
+(define (read-i i64) ((ptr p))
+  (block entry (ret (load i64 p))))
+(define (fill-i void) ((ptr p) (i64 v))
+  (block entry (store v p) (ret)))
+(define (read-d double) ((ptr p))
+  (block entry (ret (load double p))))
+(defstruct three (i64 i64 i64))
+;; Two pointers of the same value: stores through one and loads through the other, of different types. A compiler that takes an i32
+;; access and a float access for disjoint answers 1 for the first load (the store of 0.0 moved past it).
+(define (twins i32) ((ptr pi) (ptr pf))
+  (block entry
+    (store (i32 1) pi)
+    (store (float 0.0) pf)
+    (let ((a (load i32 pi)))
+      (store (float 1.0) pf)
+      (ret (add a (load i32 pi))))))
+(define (main i32) ()
+  (block entry
+    (let ((p (call @malloc (i64 64))))
+      (store (double 1.0) p)
+      (let ((as-int (load i64 p)))
+        (store (i64 4609434218613702656) p)
+        (call @printf (string "punned %lld %.1f %lld\n") as-int (load double p)
+              (let ((q (getelementptr i8 p (i64 8))))
+                (store (i32 3) q)
+                (sext i64 (load i32 q)))))
+      (call @fill-i p (i64 7))
+      (let ((first (call @read-i p)))
+        (call @fill-d p (double 2.5))
+        (let ((second (call @read-d p)))
+          (call @fill-i p (i64 7))
+          (call @printf (string "reuse %lld %.1f %lld\n") first second (call @read-i p))))
+      (let ((u (getelementptr i8 p (i64 17))))
+        (store (align 1) (i64 1311768467463790320) u)
+        (store (align 1) (double 2.5) (getelementptr i8 u (i64 8)))
+        (store (align 1) (<4 x float> 1.0 2.0 3.0 4.0) (getelementptr i8 u (i64 16)))
+        (let ((v (load (align 1) <4 x float> (getelementptr i8 u (i64 16)))))
+          (call @printf (string "unaligned %lld %.1f %.1f %.1f %.1f %.1f\n") (load (align 1) i64 u) (load (align 1) double (getelementptr i8 u (i64 8)))
+                (fpext double (extractelement v (i32 0))) (fpext double (extractelement v (i32 1))) (fpext double (extractelement v (i32 2)))
+                (fpext double (extractelement v (i32 3))))))
+      (store (%struct.three (i64 11) (i64 22) (i64 33)) p)
+      (let ((s (load %struct.three p)) (arr (alloca [2 x double])))
+        (store ([2 x double] (double 1.0) (double 2.0)) arr)
+        (let ((a (load [2 x double] arr)))
+          (call @printf (string "agg %lld %lld %lld %.1f\n") (extractvalue s 0) (extractvalue s 1) (extractvalue s 2) (extractvalue a 1))))
+      (let ((m (icmp ne (<8 x i32> 1 0 1 1 0 0 1 0) (<8 x i32> 0 0 0 0 0 0 0 0))))
+        (store (i8 0) p)
+        (store m p)
+        (let ((back (load <8 x i1> p)))
+          (call @printf (string "masks %d %d %d %d %d %d %d %d %d\n") (zext i32 (extractelement back (i32 0))) (zext i32 (extractelement back (i32 1)))
+                (zext i32 (extractelement back (i32 2))) (zext i32 (extractelement back (i32 3))) (zext i32 (extractelement back (i32 4)))
+                (zext i32 (extractelement back (i32 5))) (zext i32 (extractelement back (i32 6))) (zext i32 (extractelement back (i32 7)))
+                (zext i32 (load i8 p)))))
+      (br hoist)))
+  (block hoist
+    (let ((i (phi i64 (entry (i64 0)) (hoist i2)))
+          (d (phi double (entry (double 0.0)) (hoist d2)))
+          (acc (phi i64 (entry (i64 0)) (hoist acc2)))
+          (d2 (fadd d (double 1.0)))
+          (i2 (add i (i64 1))))
+      (store d2 p)
+      (let ((acc2 (add acc (lshr (load i64 p) (i64 52)))))
+        (br (icmp slt i2 (i64 1000)) hoist hoisted))))
+  (block hoisted
+    (store (i64 -9223372036854775808) p)
+    (call @printf (string "hoist %lld %.1f %lld\n") acc2 (fsub (load double p) (load double p)) (load i64 p))
+    (call @printf (string "twins %d %d\n") (sub (call @twins p p) (i32 1065353216)) (call @twins p p))
+    (ret (i32 0))))

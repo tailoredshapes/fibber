@@ -1,0 +1,186 @@
+;; compiler/c/expr.fib: the C statements of an lIR expression (the dispatcher; docs/design/lir2c.md section 3). The printer is
+;; statement-oriented: every instruction's result is assigned to a C local (the `let` name it is bound to, or a fresh temporary), its
+;; operands having been assigned before it, in lIR's order (spec/lir.md 5.2). So an operand text is always a name or a literal, C's
+;; unspecified evaluation order never matters, and `select` evaluates both arms as lIR does. The C compiler undoes the temporaries.
+(ns c.expr
+  (:use lir.types lir.lit lir.ast lir.diag c.cx c.ty c.scalar c.vec c.mem c.call))
+
+;; A form whose C text has no effect and costs nothing to repeat: names and literals.
+(defun leaf-text :private (cf: Cf e: LExpr) -> (Option str)
+  (match (. e kind)
+    ((KLocal n) (some (local-name n)))
+    ((KGlobal n) (some (addr-text (. cf cx) n)))
+    ((KInt t v) (some (int-literal (int-bits t) v)))
+    ((KFloat t v) (some (float-literal t v)))
+    ((KNull) (some "(char *)0"))
+    ((KPhi _ _) (some (phi-name (. e pos))))
+    ((KZero t) (match t ((TPtr) (some "(char *)0")) ((TInt 64) (some "0LL")) ((TInt 1) (some "(uint8_t)0")) ((TInt _) (some "0")) ((TFloat) (some "0.0f")) ((TDouble) (some "0.0")) (_ nil)))
+    (_ nil)))
+
+;; A declared temporary of type t.
+(defun new-temp (cf: Cf t: LType) -> str
+  (let ((n (fresh-temp cf)))
+    (do (declare! cf (str (ctype (. cf cx) t) " " n ";")) n)))
+
+;; The C text of `e`'s value, its statements emitted.
+(defun expr-c (cf: Cf e: LExpr) -> str
+  (match (leaf-text cf e)
+    ((some s) s)
+    (nil (match (type-of cf e)
+           ((some t) (let ((n (new-temp cf t))) (do (type-ok! (. cf cx) (. e pos) t) (instr! cf e n) n)))
+           (nil (do (instr! cf e "") "0"))))))
+
+;; `(let ((x v)..))`: each binding assigned to its C local, declared here.
+(defun bind! (cf: Cf b: LBinding) -> unit
+  (let ((n (local-name (. b name))) (v (. b value)))
+    (do (line! cf (. b pos))
+        (match (type-of cf v)
+          ((some t) (do (type-ok! (. cf cx) (. b pos) t)
+                        (declare! cf (str (ctype (. cf cx) t) " " n ";"))
+                        (match (leaf-text cf v)
+                          ((some s) (emit! cf (str n " = " s ";")))
+                          (nil (instr! cf v n)))))
+          (nil (instr! cf v ""))))))
+
+;; A `#line` directive, so the C compiler's diagnostics name the lIR line.
+(defun line! (cf: Cf pos: i64) -> unit
+  (when (and (. (. (. cf cx) opts) lines) (> (pos-line pos) 0))
+    (emit! cf (str "#line " (pos-line pos) " \"" (. (. cf cx) file) "\""))))
+
+;; A form at statement level: its value, if any, is dropped.
+(defun stmt! (cf: Cf e: LExpr) -> unit
+  (match (. e kind)
+    ((KLet binds body) (do (run! (fn (b: LBinding) (bind! cf b)) binds) (run! (fn (x: LExpr) (stmt! cf x)) body)))
+    (_ (match (type-of cf e)
+         (nil (instr! cf e ""))
+         ((some _) (match (leaf-text cf e) ((some _) ()) (nil (do (expr-c cf e) ()))))))))
+
+;; ---------------------------------------------------------------- pieces
+
+(defun bytes-list :private (bs: (Array i8)) -> str
+  (str-join (loop ((i 0) (out []))
+              (if (>= i (array-len bs)) out
+                  (recur (+ i 1) (conj out (str (bit-and (zext i64 (array-get bs i)) 255) ",")))))))
+
+(defun string-const :private (cf: Cf bs: (Array i8)) -> str
+  (let ((n (str "s" (fresh (. cf cx)))))
+    (do (hoist-const! (. cf cx) (str "static const unsigned char " n "[] = {" (bytes-list bs) "0};"))
+        (str "(char *)" n))))
+
+;; The lanes of a `<N x ptr>` literal: null is 0, an address is an integer.
+(defun lane-elems-c :private (cf: Cf es: (Vec LExpr)) -> str
+  (str-join (vec (map-indexed (fn (i: i64 e: LExpr) (str (if (= i 0) "" ", ") (match (. e kind) ((KNull) "0") (_ (str "(int64_t)(uintptr_t)" (expr-c cf e)))))) es))))
+
+(defun elems-c :private (cf: Cf es: (Vec LExpr)) -> str
+  (str-join (vec (map-indexed (fn (i: i64 e: LExpr) (str (if (= i 0) "" ", ") (expr-c cf e))) es))))
+
+;; The C path of an extractvalue index list: `.f1` into a struct, `.e[2]` into an array.
+(defun path-c :private (cf: Cf t: LType idx: (Vec LLit)) -> str
+  (loop ((i 0) (t t) (acc ""))
+    (if (>= i (count idx))
+        acc
+        (let ((k (unwrap-or (lit->i64 (nth idx i)) 0)))
+          (match t
+            ((TArray _ e) (recur (+ i 1) e (str acc ".e[" k "]")))
+            (_ (recur (+ i 1) (nth (agg-fields (. cf cx) t) k) (str acc ".f" k))))))))
+
+(defun overflow! :private (cf: Cf op: LOvfOp a: LExpr b: LExpr dst: str) -> unit
+  (let ((t (type-of! cf a)) (e (elem-of t)) (x (expr-c cf a)) (y (expr-c cf b))
+        (bi (match op ((OvSAdd) "__builtin_add_overflow") ((OvSSub) "__builtin_sub_overflow") ((OvSMul) "__builtin_mul_overflow")))
+        (o (match op ((OvSAdd) "+") ((OvSSub) "-") ((OvSMul) "*"))))
+    (cond (= e ty-i1)
+          (do (emit! cf (str "{ int r = (-(int)" x ") " o " (-(int)" y "); " dst ".f0 = (uint8_t)(r & 1); " dst ".f1 = (uint8_t)(r < -1 || r > 0); }")))
+          (is-vector? t)
+          (let ((tmp (new-temp cf e)))
+            (lanes! cf (lanes-of t) (str "{ " dst ".f1[i] = (int8_t)" bi "(" x "[i], " y "[i], &" tmp "); " dst ".f0[i] = " tmp "; }")))
+          :else (emit! cf (str dst ".f1 = (uint8_t)" bi "(" x ", " y ", &" dst ".f0);")))))
+
+(defun bitcast! :private (cf: Cf to: LType v: LExpr dst: str) -> unit
+  (let ((from (type-of! cf v)) (x (expr-c cf v)))
+    (cond (= from to) (emit! cf (str dst " = " x ";"))
+          (and (is-vector? from) (= (elem-of from) ty-i1) (not (is-vector? to))) (mask-to-int! cf (lanes-of from) x dst)
+          (and (is-vector? to) (= (elem-of to) ty-i1) (not (is-vector? from))) (int-to-mask! cf (lanes-of to) x dst)
+          (and (is-vector? from) (is-vector? to) (not (= (elem-of from) ty-i1)) (not (= (elem-of to) ty-i1)))
+          (emit! cf (str dst " = (" (ctype (. cf cx) to) ")" x ";"))
+          :else (let ((src (lvalue! cf from x)))
+                  (emit! cf (str "__builtin_memcpy(&" dst ", &" src ", sizeof " dst ");"))))))
+
+(defun cast! :private (cf: Cf op: LCastOp to: LType v: LExpr dst: str) -> unit
+  (let ((from (type-of! cf v)))
+    (cond (= op CBitcast) (bitcast! cf to v dst)
+          (is-vector? from) (vcast! cf op from to (expr-c cf v) dst)
+          :else (emit! cf (str dst " = " (cast-c op from to (expr-c cf v)) ";")))))
+
+(defun select! :private (cf: Cf c: LExpr a: LExpr b: LExpr dst: str) -> unit
+  (let ((cs (expr-c cf c)) (as (expr-c cf a)) (bs (expr-c cf b)))
+    (if (is-vector? (type-of! cf c))
+        (vselect! cf (type-of! cf a) cs as bs dst)
+        (emit! cf (str dst " = " cs " ? " as " : " bs ";")))))
+
+(defun element-index :private (cf: Cf n: i64 i: LExpr) -> str
+  (match (expr-int-literal i)
+    ((some k) (lit-str k))
+    (nil (lane-index cf n i))))
+
+(defun kernel-form! :private (cf: Cf pos: i64 what: str) -> unit
+  (do (error! (. cf cx) pos (str what ": kernel target forms have no C translation: use --kernel-target"))
+      (emit! cf "__builtin_trap();")))
+
+;; ---------------------------------------------------------------- the dispatcher
+
+;; `e` computed into `dst` (a declared C local), or only for its effect when `dst` is empty.
+(defun instr! (cf: Cf e: LExpr dst: str) -> unit
+  (let ((cx (. cf cx)))
+    (match (. e kind)
+      ((KBin op a b) (let ((t (type-of! cf a)) (x (expr-c cf a)) (y (expr-c cf b)))
+                       (if (is-vector? t) (vbin! cf op t x y dst) (emit! cf (str dst " = " (bin-c op t x y) ";")))))
+      ((KUn op a) (let ((t (type-of! cf a)) (x (expr-c cf a)))
+                    (if (is-vector? t) (vun! cf op t x dst) (emit! cf (str dst " = " (un-c op t x) ";")))))
+      ((KOverflow op a b) (overflow! cf op a b dst))
+      ((KICmp pr a b) (let ((t (type-of! cf a)) (x (expr-c cf a)) (y (expr-c cf b)))
+                        (if (is-vector? t) (vicmp! cf pr t x y dst) (emit! cf (str dst " = " (icmp-c pr t x y) ";")))))
+      ((KFCmp pr a b) (let ((t (type-of! cf a)) (x (expr-c cf a)) (y (expr-c cf b)))
+                        (if (is-vector? t) (vfcmp! cf pr t x y dst) (emit! cf (str dst " = " (fcmp-c pr x y) ";")))))
+      ((KCast op t v) (cast! cf op t v dst))
+      ((KSelect c a b) (select! cf c a b dst))
+      ((KExtractElement v i) (let ((t (type-of! cf v)) (x (expr-c cf v)))
+                               (emit! cf (str dst " = " (if (is-ptr? (elem-of t)) "(char *)(uintptr_t)" "") x "[" (element-index cf (lanes-of t) i) "];"))))
+      ((KInsertElement v x i) (let ((t (type-of! cf v)) (vs (expr-c cf v)) (xs (expr-c cf x)) (is (element-index cf (lanes-of t) i)))
+                                (do (emit! cf (str dst " = " vs ";")) (emit! cf (str dst "[" is "] = " (if (is-ptr? (elem-of t)) "(int64_t)(uintptr_t)" "") xs ";")))))
+      ((KShuffle a b m) (let ((n (lanes-of (type-of! cf a))) (x (expr-c cf a)) (y (expr-c cf b))) (shuffle! cf n x y m dst)))
+      ((KExtractValue a idx) (let ((t (type-of! cf a)) (x (expr-c cf a))) (emit! cf (str dst " = " x (path-c cf t idx) ";"))))
+      ((KInsertValue a v idx) (let ((t (type-of! cf a)) (x (expr-c cf a)) (y (expr-c cf v)))
+                                (do (emit! cf (str dst " = " x ";")) (emit! cf (str dst (path-c cf t idx) " = " y ";")))))
+      ((KTrap) (emit! cf "__builtin_trap();"))
+      ((KSreg _) (kernel-form! cf (. e pos) "sreg"))
+      ((KBarrier) (kernel-form! cf (. e pos) "barrier"))
+      ((KIntrin name _ ty args _) (intrin! cf name ty args dst))
+      ((KCall c args _) (let ((t (call-text cf c args))) (emit! cf (if (= dst "") (str t ";") (str dst " = " t ";")))))
+      ((KLet binds body) (do (run! (fn (b: LBinding) (bind! cf b)) binds)
+                             (run! (fn (x: LExpr) (stmt! cf x)) (vec (take (- (count body) 1) body)))
+                             (if (= dst "")
+                                 (stmt! cf (nth body (- (count body) 1)))
+                                 (emit! cf (str dst " = " (expr-c cf (nth body (- (count body) 1))) ";")))))
+      ((KVector t es) (emit! cf (str dst " = (" (ctype cx t) "){" (if (is-ptr? (elem-of t)) (lane-elems-c cf es) (elems-c cf es)) "};")))
+      ((KStruct _ fs) (let ((t (type-of! cf e))) (emit! cf (str dst " = (" (ctype cx t) "){" (elems-c cf fs) "};"))))
+      ((KArray t es) (emit! cf (str dst " = (" (ctype cx t) "){{" (elems-c cf es) "}};")))
+      ((KZero _) (emit! cf (str "__builtin_memset(&" dst ", 0, sizeof " dst ");")))
+      ((KStr bs) (emit! cf (str dst " = " (string-const cf bs) ";")))
+      (_ (mem-instr! cf e dst)))))
+
+;; The memory and atomic forms (c.mem), and a leaf assigned to `dst`.
+(defun mem-instr! :private (cf: Cf e: LExpr dst: str) -> unit
+  (match (. e kind)
+    ((KAlloca t n al) (alloca! cf t n al @(. cf label) dst))
+    ((KLoad t p vol al) (load! cf t (expr-c cf p) vol al dst))
+    ((KStore v p vol al) (let ((t (type-of! cf v)) (vs (expr-c cf v)) (ps (expr-c cf p))) (store! cf t vs ps vol al)))
+    ((KGep _ t p idx) (gep! cf t p idx dst))
+    ((KAtomicLoad _ o t p) (atomic-load! cf o t (expr-c cf p) dst))
+    ((KAtomicStore _ o v p) (let ((t (type-of! cf v)) (vs (expr-c cf v)) (ps (expr-c cf p))) (atomic-store! cf o t vs ps)))
+    ((KAtomicRmw op _ o p v) (let ((t (type-of! cf v)) (ps (expr-c cf p)) (vs (expr-c cf v))) (atomic-rmw! cf op o t ps vs dst)))
+    ((KCmpXchg weak _ so fo p x n) (let ((t (type-of! cf x)) (ps (expr-c cf p)) (xs (expr-c cf x)) (ns (expr-c cf n)))
+                                     (cmpxchg! cf weak so fo t ps xs ns dst)))
+    ((KFence sc o) (fence! cf sc o))
+    (_ (match (leaf-text cf e)
+         ((some s) (emit! cf (str dst " = " s ";")))
+         (nil (do (error! (. cf cx) (. e pos) "a form the C printer does not translate") (emit! cf "__builtin_trap();")))))))

@@ -1,0 +1,133 @@
+;; compiler/c/module.fib: a checked lIR module as one C translation unit (docs/design/lir2c.md section 3). The output is, in order: the
+;; prelude (c.prelude), the interned types (vectors, structs, arrays, function pointers, access typedefs), the declarations of the external
+;; functions and variables (prototypes from the lIR `declare`s, each bound to its symbol by an asm label: no header is read), the
+;; prototypes of the defined functions and the tentative definitions of the globals (so items may refer to each other in any order, as in
+;; lIR), the hoisted constants (string bytes), the globals with their initialisers (static data, as LLVM lays them out), and the functions.
+(ns c.module
+  (:use lir.types lir.lit lir.ast lir.diag c.cx c.ty c.scalar c.expr c.func c.policy c.prelude))
+
+(defun fn-types :private (m: LModule) -> (Map str LFnType)
+  (reduce (fn (acc: (Map str LFnType) it: LItem)
+            (match it
+              ((ItDefine f) (assoc acc (. f name) (. f ty)))
+              ((ItDeclare d) (assoc acc (. d name) (. d ty)))
+              (_ acc)))
+          {} (. m items)))
+
+(defun names-of :private (m: LModule p: (fn (LItem) (Option str))) -> (Set str)
+  (reduce (fn (acc: (Set str) it: LItem) (match (p it) ((some n) (conj acc n)) (nil acc))) #{} (. m items)))
+
+(defun defines :private (m: LModule) -> (Vec LFunction)
+  (vec (mapcat (fn (it: LItem) (match it ((ItDefine f) [f]) (_ []))) (. m items))))
+
+(defun cx-new (m: LModule file: str opts: COpts) -> Cx
+  (let ((structs (reduce (fn (acc: (Map str (Vec LType)) it: LItem)
+                           (match it ((ItStruct s) (assoc acc (. s name) (. s fields))) (_ acc)))
+                         {} (. m items)))
+        (defined (names-of m (fn (it: LItem) (match it ((ItDefine f) (some (. f name))) (_ nil)))))
+        (globals (names-of m (fn (it: LItem) (match it ((ItGlobal g) (some (. g name))) ((ItDeclareGlobal g) (some (. g name))) (_ nil))))))
+    (let ((cx (Cx structs (fn-types m) defined globals (cell {}) (cell []) (cell []) (cell 0) (cell []) opts file (cell 0))))
+      (do (set! (. cx tail-area) (tail-area cx m)) cx))))
+
+;; ---------------------------------------------------------------- declarations
+
+;; The asm label of an lIR symbol defined elsewhere: a name with a character the assembler does not take bare is quoted, as LLVM quotes it
+;; (GNU as and LLVM's assembler accept a quoted symbol).
+(defun sym :private (n: str) -> str
+  (str " __asm__(FIB_SYM(\"" (if (plain-symbol? n) n (str "\\\"" n "\\\"")) "\"))"))
+
+;; The asm label of an exported definition: only a plain name keeps its lIR name. gcc derives the names of the clones it makes (`.part.0`,
+;; `.constprop.0`, `.cold`) from the label, and a quoted label with a suffix is not a symbol the assembler takes; such a definition keeps its
+;; C name instead, with a warning (nothing in the translation unit refers to it by the lIR name; only a `--export` library build would).
+(defun def-sym :private (cx: Cx pos: i64 n: str cname: str) -> str
+  (if (plain-symbol? n)
+      (sym n)
+      (do (warn! cx pos (str "exported symbol " n " is " cname " in the C: the assembler takes no '-' or other such character in a symbol gcc may clone"))
+          "")))
+
+(defun plain-symbol? :private (n: str) -> bool
+  (let ((bs (str-bytes n)))
+    (loop ((i 0))
+      (if (>= i (array-len bs))
+          true
+          (let ((b (bit-and (zext i64 (array-get bs i)) 255)))
+            (if (or (and (>= b 97) (<= b 122)) (and (>= b 65) (<= b 90)) (and (>= b 48) (<= b 57)) (= b 95) (= b 46) (= b 36))
+                (recur (+ i 1))
+                false))))))
+
+(defun hidden-attr :private (h: bool) -> str (if h "__attribute__((visibility(\"hidden\"))) " ""))
+
+(defun extern-line :private (cx: Cx it: LItem) -> str
+  (match it
+    ((ItDeclare d) (do (run! (fn (t: LType) (type-ok! cx (. d pos) t)) (. (. d ty) params))
+                       (str "extern " (hidden-attr (. d hidden)) (ret-ctype cx (. (. d ty) ret)) " " (extern-name (. d name)) (params-ctype-padded cx (. d ty) (tail-pads cx (. d ty))) (sym (. d name)) ";\n")))
+    ((ItDeclareGlobal g) (str "extern " (hidden-attr (. g hidden)) (ctype cx (. g ty)) " " (global-name (. g name)) (sym (. g name)) ";\n"))
+    (_ "")))
+
+;; The prototype of a defined function (none for main) and the tentative definition of a global: exported ones carry the asm label.
+(defun forward-line :private (cx: Cx it: LItem) -> str
+  (match it
+    ((ItDefine f) (if (= (. f name) "main") "" (str (head-text cx f) (if (= (. (. f mods) linkage) LkExternal) (def-sym cx (. f pos) (. f name) (fn-name (. f name))) "") ";\n")))
+    ((ItGlobal g) (let ((exported (= (. (. g mods) linkage) LkExternal)))
+                    (str (if exported "extern " "static ") (hidden-attr (. (. g mods) hidden)) (if (. g constant) "const " "") (ctype cx (. g ty)) " "
+                         (global-name (. g name)) (if exported (def-sym cx (. g pos) (. g name) (global-name (. g name))) "") ";\n")))
+    (_ "")))
+
+;; ---------------------------------------------------------------- initialisers
+
+(defun bytes-list :private (bs: (Array i8)) -> str
+  (str-join (loop ((i 0) (out []))
+              (if (>= i (array-len bs)) out
+                  (recur (+ i 1) (conj out (str (bit-and (zext i64 (array-get bs i)) 255) ",")))))))
+
+(defun elems-init :private (cx: Cx es: (Vec LExpr)) -> str
+  (str-join (vec (map-indexed (fn (i: i64 e: LExpr) (str (if (= i 0) "" ", ") (init-c cx e))) es))))
+
+;; The lanes of a `<N x ptr>` initialiser: null is 0, an address an integer.
+(defun lanes-init :private (cx: Cx es: (Vec LExpr)) -> str
+  (str-join (vec (map-indexed (fn (i: i64 x: LExpr) (str (if (= i 0) "" ", ") (match (. x kind) ((KNull) "0") (_ (str "(int64_t)(uintptr_t)" (init-c cx x)))))) es))))
+
+;; The static initialiser of a global: constants only (spec/lir.md 9).
+(defun init-c (cx: Cx e: LExpr) -> str
+  (match (. e kind)
+    ((KInt t v) (int-literal (int-bits t) v))
+    ((KFloat t v) (float-literal t v))
+    ((KNull) "(char *)0")
+    ((KGlobal n) (addr-text cx n))
+    ((KStr bs) (let ((n (str "s" (fresh cx))))
+                 (do (hoist-const! cx (str "static const unsigned char " n "[] = {" (bytes-list bs) "0};")) (str "(char *)" n))))
+    ((KVector t es) (str "{" (if (is-ptr? (elem-of t)) (lanes-init cx es) (elems-init cx es)) "}"))
+    ((KStruct _ fs) (str "{" (elems-init cx fs) "}"))
+    ((KArray _ es) (str "{{" (elems-init cx es) "}}"))
+    ((KZero t) (match t ((TPtr) "(char *)0") ((TInt _) "0") ((TFloat) "0") ((TDouble) "0") (_ "{0}")))
+    (_ (do (error! cx (. e pos) "a global initialiser the C printer does not translate") "0"))))
+
+(defun global-line :private (cx: Cx it: LItem) -> str
+  (match it
+    ((ItGlobal g) (let ((init (init-c cx (. g init))) (exported (= (. (. g mods) linkage) LkExternal)))
+                    (do (type-ok! cx (. g pos) (. g ty))
+                        (str (if exported "" "static ") (if (. g constant) "const " "") (ctype cx (. g ty)) " " (global-name (. g name)) " = " init ";\n"))))
+    (_ "")))
+
+;; ---------------------------------------------------------------- the module
+
+(defun lines-text :private (v: (Vec str)) -> str
+  (str-join (vec (map (fn (l: str) (str l "\n")) v))))
+
+;; The translation unit of the checked module `m` (read from `file`). The diagnostics are in the context afterwards (c.cx).
+(defun module-c (cx: Cx m: LModule) -> str
+  (let ((fns (str-join (vec (map (fn (f: LFunction) (str (function-c cx f) "\n")) (defines m)))))
+        (globals (str-join (vec (map (fn (it: LItem) (global-line cx it)) (. m items)))))
+        (externs (str-join (vec (map (fn (it: LItem) (extern-line cx it)) (. m items)))))
+        (forwards (str-join (vec (map (fn (it: LItem) (forward-line cx it)) (. m items))))))
+    (str (prelude-text)
+         "/* types */\n" (lines-text @(. cx typedefs))
+         "/* external functions and variables, from the lIR declares */\n" externs
+         "/* prototypes */\n" forwards
+         "/* constants */\n" (lines-text @(. cx consts))
+         "/* globals */\n" globals
+         "/* functions */\n" fns)))
+
+;; The diagnostics as lines, errors and warnings in the order they were met.
+(defun diag-lines (cx: Cx) -> (Vec str)
+  (vec (map (fn (d: CDiag) (diag-line cx d)) @(. cx diags))))

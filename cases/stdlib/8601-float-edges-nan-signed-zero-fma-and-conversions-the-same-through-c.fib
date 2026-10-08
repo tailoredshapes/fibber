@@ -1,0 +1,56 @@
+;; spec:   types §1.9 (simd/fma, simd/muladd), §2.12; docs/design/lir2c.md section 3 (the float rows of the C route)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; The float edges a C printer must keep: comparisons with a NaN are false (and `not=` true), -0.0 equals 0.0 but has the sign bit, the
+;; bits of a float survive a round trip through i64, `simd/fma` is one rounding (1e16 * 1e16 - 1e32 is not 0 when fused), conversions to
+;; integers truncate toward zero and saturate (types §8.12: a NaN is 0), and a float stays a float (single precision) through arithmetic.
+;; Each is the same natively and through C; `planted` expects the fused product to equal the unfused one and must see it differ.
+(ns main (:use fib.core tl.check))
+
+(defun idf (x: f64) -> f64 x)
+(defun idf32 (x: f32) -> f32 x)
+
+(defun nans (c: Checks) -> unit
+  (let ((nan (/ 0.0 (idf 0.0))) (one (idf 1.0)))
+    (do (check c (not (= nan nan)))
+        (check c (not= nan nan))
+        (check c (not (< nan one)))
+        (check c (not (> nan one)))
+        (check c (not (<= nan one)))
+        (check c (= (f64->bits 1.0) 4607182418800017408))
+        (check c (= (bits->f64 4607182418800017408) 1.0))
+        (check c (= (f64->bits (bits->f64 -6755399441055744)) -6755399441055744))   ; a NaN with a payload and the sign bit, bit for bit
+        (check c (= (neg 0.0) -0.0))
+        (check c (= (f64->bits (neg (idf 0.0))) -9223372036854775808))
+        (check c (= (f64->bits (idf 0.0)) 0))
+        (check c (< (/ 1.0 (neg (idf 0.0))) 0.0)))))
+
+(defun fused (c: Checks) -> unit
+  (let ((x (idf 1e16)) (y (idf 1e32)))
+    (do (check c (not= (simd/fma x x (neg y)) 0.0))            ; the exact product differs from the rounded one by 5.36616e15
+        (check c (= (- (* x x) y) 0.0))                         ; two roundings: the product rounds to y
+        (check c (= (simd/fma x x (neg y)) -5366162204393472.0))
+        (check c (= (simd/fma 1.0 1.0 2.220446049250313e-16) 1.0000000000000002))
+        (check c (= (simd/fma 2.0f32 3.0f32 1.0f32) 7.0f32)))))
+
+(defun conversions (c: Checks) -> unit
+  (let ((big (idf 1e30)) (nan (/ 0.0 (idf 0.0))) (f (idf32 16777217.0f32)))
+    (do (check c (= (fptosi i64 2.9) 2))
+        (check c (= (fptosi i64 -2.9) -2))
+        (check c (= (fptosi i64 big) 9223372036854775807))
+        (check c (= (fptosi i64 (neg big)) -9223372036854775808))
+        (check c (= (fptosi i64 nan) 0))
+        (check c (= (fptosi i8 300.0) 127i8))
+        (check c (= (fptosi i8 -300.0) -128i8))
+        (check c (= (sitofp f64 -3) -3.0))
+        (check c (= (sitofp f32 9007199254740993) 9007199254740992.0f32))
+        (check c (= f 16777216.0f32))                           ; a float holds 24 bits: 16777217 rounds to even
+        (check c (= (+ 16777216.0f32 1.0f32) 16777216.0f32))
+        (check c (= (fpext f64 (+ 0.1f32 0.2f32)) 0.30000001192092896)))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (nans c) (fused c) (conversions c)
+        (checks-result c))))

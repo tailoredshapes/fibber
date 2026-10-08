@@ -1,0 +1,150 @@
+;; compiler/c/vec.fib: vector forms (spec/lir.md 6.4, 6.5) as C (docs/design/lir2c.md section 3). A `<N x T>` is a GNU vector type
+;; (`vector_size`), so `+ - * & | ^` and the comparisons are the compiler's own (wrapping arithmetic on the unsigned twin, a comparison
+;; converted to the byte mask `<N x i1>`); what GNU vectors lack is a loop over the lanes in lane order: division, the saturating
+;; conversions, select by a mask, masked loads and stores, gathers and scatters, and every reduction (`reduce-fadd` without `reassoc` adds
+;; lane after lane, as the spec requires). `shufflevector` is `__builtin_shufflevector` (gcc 12, clang), `__builtin_convertvector` the
+;; element-wise conversions.
+(ns c.vec
+  (:use lir.types lir.lit lir.ast c.cx c.ty c.scalar))
+
+;; `for (int i = 0; i < n; i++) BODY`.
+(defun lanes! (cf: Cf n: i64 body: str) -> unit
+  (emit! cf (str "for (int i = 0; i < " n "; i++) " body)))
+
+(defun vt (cf: Cf t: LType) -> str (ctype (. cf cx) t))
+(defun uvt (cf: Cf t: LType) -> str (uvector-ctype (. cf cx) t))
+
+;; ---------------------------------------------------------------- arithmetic and comparisons
+
+(defun wrapping-op :private (op: LBinOp) -> (Option str)
+  (match op ((BAdd) (some "+")) ((BSub) (some "-")) ((BMul) (some "*")) (_ nil)))
+
+(defun plain-op :private (op: LBinOp) -> (Option str)
+  (match op ((BAnd) (some "&")) ((BOr) (some "|")) ((BXor) (some "^"))
+            ((BFAdd) (some "+")) ((BFSub) (some "-")) ((BFMul) (some "*")) ((BFDiv) (some "/")) (_ nil)))
+
+;; A binary operation on vectors of type t into dst: the compiler's operators where they have lIR's meaning, a lane loop over the scalar
+;; helpers otherwise (division, remainder, shifts on signed lanes).
+(defun vbin! (cf: Cf op: LBinOp t: LType a: str b: str dst: str) -> unit
+  (let ((e (elem-of t)) (n (lanes-of t)))
+    (match (wrapping-op op)
+      ((some o) (emit! cf (str dst " = (" (vt cf t) ")((" (uvt cf t) ")" a " " o " (" (uvt cf t) ")" b ");")))
+      (nil (match (plain-op op)
+             ((some o) (emit! cf (str dst " = " a " " o " " b ";")))
+             (nil (lanes! cf n (str dst "[i] = " (bin-c op e (str a "[i]") (str b "[i]")) ";"))))))))
+
+(defun vun! (cf: Cf op: LUnOp t: LType a: str dst: str) -> unit
+  (match op
+    ((UFNeg) (emit! cf (str dst " = -" a ";")))
+    ((UCtpop) (lanes! cf (lanes-of t) (str dst "[i] = " (un-c op (elem-of t) (str a "[i]")) ";")))))
+
+;; A comparison's mask: the compiler's vector comparison (lanes of -1 and 0, the element's width) narrowed to bytes and masked to 0 or 1.
+(defun vcmp! (cf: Cf t: LType c: str dst: str) -> unit
+  (let ((mt (mask-ty t)))
+    (emit! cf (str dst " = __builtin_convertvector(" c ", " (vt cf mt) ") & 1;"))))
+
+(defun icmp-operand :private (cf: Cf pr: LIPred t: LType a: str) -> str
+  (let ((u (match pr ((IUlt) true) ((IUle) true) ((IUgt) true) ((IUge) true) (_ false))))
+    (match (elem-of t)
+      ((TPtr) (str "(" (uvt cf t) ")" a))
+      ((TInt 1) (if (or u (= pr IEq) (= pr INe)) a (str "(- " a ")")))
+      (_ (if u (str "(" (uvt cf t) ")" a) a)))))
+
+(defun icmp-word :private (pr: LIPred) -> str
+  (match pr ((IEq) "==") ((INe) "!=") ((ISlt) "<") ((ISle) "<=") ((ISgt) ">") ((ISge) ">=")
+            ((IUlt) "<") ((IUle) "<=") ((IUgt) ">") ((IUge) ">=")))
+
+(defun vicmp! (cf: Cf pr: LIPred t: LType a: str b: str dst: str) -> unit
+  (vcmp! cf t (str "(" (icmp-operand cf pr t a) " " (icmp-word pr) " " (icmp-operand cf pr t b) ")") dst))
+
+;; A float comparison lane by lane through the scalar predicate (an unordered predicate is a negation, which the vector operators lack).
+(defun vfcmp! (cf: Cf pr: LFPred t: LType a: str b: str dst: str) -> unit
+  (lanes! cf (lanes-of t) (str dst "[i] = " (fcmp-c pr (str a "[i]") (str b "[i]")) ";")))
+
+(defun vselect! (cf: Cf t: LType c: str a: str b: str dst: str) -> unit
+  (lanes! cf (lanes-of t) (str dst "[i] = " c "[i] ? " a "[i] : " b "[i];")))
+
+;; ---------------------------------------------------------------- conversions
+
+(defun vcast! (cf: Cf op: LCastOp from: LType to: LType v: str dst: str) -> unit
+  (let ((fe (elem-of from)) (te (elem-of to)) (n (lanes-of from)) (tt (vt cf to)))
+    (match op
+      ((CTrunc) (emit! cf (str dst " = __builtin_convertvector(" v ", " tt ")" (if (= te ty-i1) " & 1" "") ";")))
+      ((CZExt) (emit! cf (str dst " = __builtin_convertvector((" (uvt cf from) ")" v ", " tt ");")))
+      ((CSExt) (emit! cf (str dst " = __builtin_convertvector(" (if (= fe ty-i1) (str "(- " v ")") v) ", " tt ");")))
+      ((CFpTrunc) (emit! cf (str dst " = __builtin_convertvector(" v ", " tt ");")))
+      ((CFpExt) (emit! cf (str dst " = __builtin_convertvector(" v ", " tt ");")))
+      ((CSiToFp) (emit! cf (str dst " = __builtin_convertvector(" (if (= fe ty-i1) (str "(- " v ")") v) ", " tt ");")))
+      ((CUiToFp) (emit! cf (str dst " = __builtin_convertvector((" (uvt cf from) ")" v ", " tt ");")))
+      ((CPtrToInt) (emit! cf (str dst " = __builtin_convertvector((" (uvt cf from) ")" v ", " tt ")" (if (= te ty-i1) " & 1" "") ";")))
+      ((CIntToPtr) (emit! cf (str dst " = (" tt ")__builtin_convertvector((" (uvt cf from) ")" v ", " (uvt cf to) ");")))
+      ((CBitcast) (emit! cf (str dst " = (" tt ")" v ";")))
+      (_ (lanes! cf n (str dst "[i] = " (cast-c op fe te (str v "[i]")) ";"))))))
+
+;; ---------------------------------------------------------------- elements, shuffles, bit masks
+
+;; A run-time lane index masked to the lane count (an out-of-range index is poison; the mask is a value, so this is defined).
+(defun lane-index (cf: Cf n: i64 i: LExpr) -> str
+  (str "((int)" (cf-ex cf i) " & " (- (phys-lanes n) 1) ")"))
+
+;; A mask index at or above the lIR lane count N names a lane of the second operand, which sits at physical lane (k - N) + P.
+(defun shuffle-index :private (n: i64 e: LExpr) -> i64
+  (let ((k (match (. e kind) ((KInt _ v) (unwrap-or (lit->i64 v) 0)) (_ 0))))
+    (if (>= k n) (+ (- k n) (phys-lanes n)) k)))
+
+(defun shuffle! (cf: Cf n: i64 a: str b: str m: LExpr dst: str) -> unit
+  (match (. m kind)
+    ((KVector mt es)
+     (let ((idx (vec (map (fn (e: LExpr) (shuffle-index n e)) es)))
+           (pad (- (phys-lanes (lanes-of mt)) (count es))))
+       (emit! cf (str dst " = __builtin_shufflevector(" a ", " b
+                      (str-join (vec (map (fn (k: i64) (str ", " k)) (into idx (vec (repeat pad 0)))))) ");"))))
+    (_ (emit! cf (str dst " = " a ";")))))
+
+;; `<N x i1>` to `iN` (the mask to an integer, lane i at bit i) and back.
+(defun mask-to-int! (cf: Cf n: i64 v: str dst: str) -> unit
+  (do (emit! cf (str dst " = 0;"))
+      (lanes! cf n (str dst " |= (" (scalar-ctype (TInt n)) ")((uint64_t)(" v "[i] & 1) << i);"))))
+
+(defun int-to-mask! (cf: Cf n: i64 v: str dst: str) -> unit
+  (lanes! cf n (str dst "[i] = (int8_t)(((uint64_t)(" (unsigned-ctype (TInt n)) ")" v " >> i) & 1);")))
+
+;; ---------------------------------------------------------------- reductions
+
+(defun reduce-bin :private (name: str) -> (Option LBinOp)
+  (cond (= name "reduce-add") (some BAdd) (= name "reduce-mul") (some BMul) (= name "reduce-and") (some BAnd)
+        (= name "reduce-or") (some BOr) (= name "reduce-xor") (some BXor)
+        (= name "reduce-fadd") (some BFAdd) (= name "reduce-fmul") (some BFMul) :else nil))
+
+(defun reduce-fn :private (name: str e: LType) -> str
+  (let ((w (if (= e ty-float) "32" (if (= e ty-double) "64" (str (int-bits e))))))
+    (cond (= name "reduce-smin") (str "fib_smin" w) (= name "reduce-smax") (str "fib_smax" w)
+          (= name "reduce-umin") (str "fib_umin" w) (= name "reduce-umax") (str "fib_umax" w)
+          (= name "reduce-fmin") (str "fib_fmin" w) (= name "reduce-fmax") (str "fib_fmax" w)
+          (= name "reduce-fminnum") (str "fib_fminnum" w) :else (str "fib_fmaxnum" w))))
+
+;; `dst = start op v[0] op v[1] ..` in lane order; an integer fold starts at lane 0.
+(defun reduce! (cf: Cf name: str t: LType start: (Option str) v: str dst: str) -> unit
+  (let ((e (elem-of t)) (n (lanes-of t)))
+    (match (reduce-bin name)
+      ((some op) (do (emit! cf (str dst " = " (match start ((some s) s) (nil (str v "[0]"))) ";"))
+                     (emit! cf (str "for (int i = " (if (some? start) 0 1) "; i < " n "; i++) " dst " = " (bin-c op e dst (str v "[i]")) ";"))))
+      (nil (do (emit! cf (str dst " = " v "[0];"))
+               (emit! cf (str "for (int i = 1; i < " n "; i++) " dst " = " (reduce-fn name e) "(" dst ", " v "[i]);")))))))
+
+;; ---------------------------------------------------------------- masked memory
+
+(defun lane-ptr :private (cf: Cf e: LType p: str) -> str
+  (str "((" (access-ctype (. cf cx) e true) " *)" p ")"))
+
+(defun masked-load! (cf: Cf t: LType p: str m: str pass: str dst: str) -> unit
+  (lanes! cf (lanes-of t) (str dst "[i] = " m "[i] ? " (lane-ptr cf (elem-of t) p) "[i] : " pass "[i];")))
+
+(defun masked-store! (cf: Cf t: LType v: str p: str m: str) -> unit
+  (lanes! cf (lanes-of t) (str "if (" m "[i]) " (lane-ptr cf (elem-of t) p) "[i] = " v "[i];")))
+
+(defun gather! (cf: Cf t: LType ps: str m: str pass: str dst: str) -> unit
+  (lanes! cf (lanes-of t) (str dst "[i] = " m "[i] ? *(" (access-ctype (. cf cx) (elem-of t) true) " *)(uintptr_t)" ps "[i] : " pass "[i];")))
+
+(defun scatter! (cf: Cf t: LType v: str ps: str m: str) -> unit
+  (lanes! cf (lanes-of t) (str "if (" m "[i]) *(" (access-ctype (. cf cx) (elem-of t) true) " *)(uintptr_t)" ps "[i] = " v "[i];")))
