@@ -144,3 +144,18 @@ At W=8 a cap of 8 is no cap. At W=16 the half-cap (8) is 797 against 725, 239 ag
 1. On the Ryzen 5800X the default of 2 regresses fine-grained fork workloads by 3.3x (8645 at 16 workers 2443 against 743 ms; `storm` 741 against 213; `wide` 223 against 67) relative to the behaviour before DARWIN-3, and improves none of the measured rows. Chunked `pmap`/`preduce`/`pfor`, `pfib`, parallel LZ4 and case 8642 are unaffected.
 2. A cap proportional to the pool wins clearly here: `max(2, workers / 2)` is within 10% of uncapped; a constant 4 is 1.7x off, 2 is 3.2x off. Whether that also keeps the Mac win (cap 2 of 20 workers: 8.8 s to 4.1 s per 10 runs) is not known: the Mac table has only the values 0, 1 and 2. The data to choose one rule for both machines needs a Mac run with `FIB_SPINNERS` of 5 and 10. A per-platform default (cap on Darwin, half or none on Linux) fits both measurements today.
 3. Limits: WSL2 guest; bare-metal Linux and Windows-native may differ. The 5800X has one CCD, so this does not test a two-CCD part (the task's "2 CCDs" does not describe this CPU).
+
+## SCHED-2 follow-up (2026-10-09): the rule that fixed it
+
+Fixed in `rt/sched.lir`: no cap on Linux (2 on Darwin), and spinners poll a hint word that a fork sets instead of sweeping every deque (docs/design/parallelism.md, SCHED-2). Same Ryzen, median of 5 interleaved runs, ms, the pre-fix binary against the fixed one
+(`scripts/bench/sched-matrix.py x86n 8,16 c8645,c8642,storm,storm-main,wide,pfib 5`, run at 20:07 after a WSL2 restart, load average 0.4):
+
+| | 8645 | storm | storm-main | wide |
+|---|---|---|---|---|
+| before, W=8 | 2239 | 649 | 321 | 172 |
+| after, W=8 | 712 | 210 | 254 | 138 (one noisy cell: the explicit no-cap row 58) |
+| before, W=16 | 2285 | 623 | 370 | 202 |
+| after, W=16 | 730 | 212 | 277 | 55 |
+
+Parallel LZ4 at 16 workers (MB/s of input): compress 5242 before, 5339 after; decompress 5857, 5987. A condvar round trip on this machine is 54 us (3 to 5 us on the Mac and the i7), which is why spinners matter here. The conclusion 2 above (a cap proportional to the pool) is
+superseded: the other two machines want a small cap unless the spin is made cheap, and the hint does that. The `pfor-alloc` side finding is `MALLOC_ARENA_MAX=2` in this document's own harness (reproduced on another machine: 870 ms against 500 ms at 4 workers with 2 and 64 arenas).

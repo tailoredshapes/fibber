@@ -466,7 +466,7 @@ Not done, and why the colour stays a possible later step: the share walk at hand
 | per-worker Chase-Lev deques, ring 4096, overflow runs inline | the orderings of `cl.lir` unchanged, slots stored release and loaded acquire (TSAN ignores standalone fences; same code on x86); a full ring runs the task at the fork | `rt/deque.lir` |
 | injector for non-workers | a list under a spinlock | `rt/deque.lir` |
 | random-victim stealing | own deque, injector, two random victims, then a sweep | `fib.sched-find` |
-| eventcount parking | epoch word, sleepers count, one mutex and condvar; 32 yield rounds (`FIB_SPIN`), then announce, `seq_cst` fence, re-check for work, sleep; a fork signals only when `sleepers > 0` **and no worker is in its spin phase** (`FIB_SCHED_SKIP`, default 1: 14 us to 0.65 us per fork-join on WSL2); a joiner spins 3000 loads on the task's state before it parks | `rt/park.lir`, `fib.sched-idle` |
+| eventcount parking | epoch word, sleepers count, one mutex and condvar; 32 yield rounds (`FIB_SPIN`), then announce, `seq_cst` fence, re-check for work, sleep; a fork signals only when `sleepers > 0` **and no worker is in its spin phase** (`FIB_SCHED_SKIP`, default 1: 14 us to 0.65 us per fork-join on WSL2); at most `FIB_SPINNERS` idle workers spin (default: no limit on Linux, 2 on Darwin; SCHED-2 below) and they poll one hint word, set by a fork, instead of sweeping every deque (`FIB_SPIN_HINT`, default 1); a joiner spins 3000 loads on the task's state before it parks | `rt/park.lir`, `fib.sched-idle` |
 | help-while-waiting join | a worker claims the joined task and runs it, else runs other work, else parks on the task (a waiter node whose word is 1); depth bound 4000 tasks; a non-worker parks (in a catching program it runs the task itself when it can claim it); no workers (wasm): inline | `fib.sched-join`, `-wait` |
 | lazy start, worker count | first `fork-task`; `FIB_THREADS`, else `sched_getaffinity` capped by cgroup v2 `cpu.max`, 1 to 256; a program with no parallel work pays nothing (no thread, no allocation: hello world is 36 872 bytes, 80 fewer than before, and its only thread is the one it had) | `fib.sched-start`, `-count` |
 | `(blocking ..)` | macro in `fib.parallel`: starts one more worker (up to W more) for the duration | `fib.sched-block-enter` |
@@ -482,6 +482,8 @@ Measurements, planted-fault results and TSAN: `docs/shootout/parallel.md` ("P-sc
 Not done: `:grain`-controlled adaptive splitting, `pcalls`/`pvalues`, cancellation, arm64 stress runs, a model-checked deque, per-worker small-block allocator cache (see the allocator note in shootout).
 
 ## DARWIN-3: idle workers that spin, measured
+
+(Superseded for Linux by SCHED-2 below: the cap of 2 is now the default on Darwin only.)
 
 Case 8645 (a million tiny tasks forked and joined by one pool task) on an M1 Ultra, seconds for 10 runs at `FIB_THREADS` = 1, 2, 4, 8, 16, 20:
 
@@ -499,3 +501,46 @@ that finds it at the cap parks without spinning. x86-64 Linux (28 CPUs, this box
 are unchanged (0.43 / 0.09 / 0.04 s for 3 runs at 1 / 8 / 28 workers with and without it). What is left (4x at 8 workers on the Mac) is the steal of tasks that cost less than the steal: tried and not
 kept, a flag that stops a fork from signalling while a signalled sleeper has not yet woken (4.1 s, within the noise). The kill checks that can run here: `scripts/mutant-sched.sh check` (25 cases at 1, 2, 3
 workers) and `lost-wakeup` (killed), and the stress kernels `gap`, `storm`, `tree`, `wide` at 4, 8 and 28 workers (all exit 0).
+
+## SCHED-2: the spinner cap per platform (2026-10-09)
+
+DARWIN-3's cap of 2 was measured on the M1 Ultra and the 28-thread i7-14700KF only. On the Ryzen 7 5800X under WSL2 (`docs/shootout/sched-ryzen.md`) it was 3x slower than no cap on fork storms
+(case 8645, 16 workers: 2443 ms against 743 ms). No cap that is a function of the pool size fits all three machines: the Mac wants 1 to 5 of 20 (8 spinners: 1.6x to 1.9x slower on 8645), the Ryzen wants
+half or more of 16 (4: 1.7x slower), the i7 wants 2 (16 or none: 1.5x to 2.4x slower on 8645 at 16/28 workers and on storm-main) before the change below. What differs is not `sched_yield` (C micro-benchmark `pp.c`, one thread
+yielding in a loop: 0.15 us Mac, 0.14 to 0.17 us i7, 0.7 us Ryzen/WSL2) but the cost of a park and wake: a condvar ping-pong round trip is 54 us on the Ryzen under WSL2, 3 to 5 us on the other two. A fork that finds no spinner pays
+the mutex and the futex wake, so on WSL2 spinners are what keeps forks cheap, and on the others spinners that sweep every deque on every round cost more than they find (the sweeps bounce the cache line of every owner's deque).
+
+Candidates measured (case 8645, wall ms, median of 5, 16 workers; `scripts/bench/sched-matrix.py`):
+
+| rule | Mac (M1 Ultra) | i7-14700KF | Ryzen 5800X (WSL2) |
+|---|---|---|---|
+| cap 2 (DARWIN-3) | 458 | 810 to 860 | 2447 |
+| cap 8 (half of 16) | 771 | 850 to 970 | 809 |
+| no cap, sweep every round | 1049 to 1073 | 1177 to 1285 | 716 |
+| no cap, never `sched_yield` (`FIB_SPIN_YIELD_AFTER`, removed) | 2924 | 1011 | 14266 |
+| cap 2, 10x or 1000x more spin rounds (`FIB_SPIN`) | 443 to 476 | 797 to 874 | not run |
+| no cap, spinners poll a hint word (**chosen** with the Darwin cap) | Mac keeps 2: 457 | 837 | 759 |
+
+The yield variants say that dropping `sched_yield` is much worse on every machine, and that longer spinning with a cap of 2 changes nothing: the cap bounds the thieves, not the sleep. The hint
+(`fib.sched-hint`: a fork sets it when it is clear, a spinner polls it with a load and only the one that clears it sweeps; a spinner that found work sets it for the next) makes the unlimited spin as cheap as the cap on the i7 and keeps the
+Ryzen's win. On the Mac it helps a no-cap spin (1.6x) but not enough (632 against 462 at 16 workers), so Darwin keeps its cap. The rule built: **the cap is 1 000 000 (none) on Linux and 2 on Darwin (`emit.os` rewrites the initialiser), the hint is on everywhere,
+`FIB_SPINNERS=N` and `FIB_SPIN_HINT=0` override.** `pool-spinners` (`fib.os.sched`, control op 9) reports the cap; case 8649 fails when the default reverts (checked: with the Linux default put back to 2 it reports `expected 0, got 4`).
+
+Result, the same binaries (before = cap 2, sweep every round; after = this rule), median of 5 interleaved, ms (`FIB_THREADS` = W):
+
+| | row | before | after |
+|---|---|---|---|
+| Ryzen W=16 | 8645 / storm / storm-main / wide | 2285 / 623 / 370 / 202 | 730 / 212 / 277 / 55 |
+| Ryzen W=8 | 8645 / storm / storm-main | 2239 / 649 / 321 | 712 / 210 / 254 |
+| i7 W=16 | 8645 / storm / storm-main / wide | 715 / 226 / 235 / 74 | 716 / 225 / 239 / 81 |
+| i7 W=28 | 8645 / storm / storm-main | 747 / 212 / 258 | 734 / 208 / 243 |
+| Mac W=8 | 8645 / storm / storm-main / wide | 402 / 113 / 437 / 40 | 377 / 107 / 518 / 34 |
+| Mac W=20 | 8645 / storm / storm-main | 431 / 132 / 682 | 415 / 117 / 848 |
+
+`c8642`, `pfib`, `pmap`, `preduce`, `pfor-alloc` and parallel LZ4 (Ryzen, 16 workers, MB/s: compress 5242 before, 5339 after; decompress 5857, 5987) are unchanged within noise. The Mac's `storm-main` at 20 workers is the one row
+that is not within 10% (848 against 682; the same configuration measured as the explicit `FIB_SPINNERS=2` row gave 917, so that cell is noise of about 25%); the Mac 8645 gain of DARWIN-3 (about 8.8 s to 4.1 s per 10 runs) is kept (0.38 to 0.46 s a run). Raw tables of the sweeps:
+`/tank/data/fibber-scratch/sched2/res-*.txt` (not in the tree). Measured under the machine's ordinary load: the i7 was at load average 2 to 14 (the benchmark's own threads count), the Mac 2 to 13, the Ryzen 1 to 4 after a WSL2 restart.
+Not found: a self-calibrating cap (measure the wake cost at pool start) was not needed once the hint existed; a CPU that is neither of the three (bare-metal Linux with an expensive wake, Windows native) is untested.
+
+`pfor-alloc` slower than 0.1.12 at 4 or more workers: reproduced on the i7 (4 workers: 870 ms with `MALLOC_ARENA_MAX=2`, 500 ms with 64 arenas; 8 workers 650 against 430). The benchmark harness pins glibc to 2 arenas, so the pool's 4 or more allocating
+workers contend on two arena locks; it is not the spinners (no row moves with `FIB_SPINNERS`). Why 0.1.12's per-call threads were not hit by the same limit was not investigated.

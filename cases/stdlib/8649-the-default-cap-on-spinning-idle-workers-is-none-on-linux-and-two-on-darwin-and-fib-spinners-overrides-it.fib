@@ -1,0 +1,26 @@
+;; spec:   docs/design/parallelism.md section 8 (SCHED-2), rt/sched.lir `fib.sched-spinners`; docs/shootout/sched-ryzen.md
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; The cap on idle workers that spin at once (`pool-spinners`) is the platform's default unless FIB_SPINNERS names one: no limit on Linux (a cap of 2 was 3x slower on a Ryzen 5800X
+;; under WSL2, case 8645 2443 ms against 743 ms at 16 workers), 2 on Darwin (DARWIN-3: 0.4 s against 0.7 to 1.1 s on an M1 Ultra). A default put back to 2 on Linux, or lifted on Darwin, fails here.
+(ns main (:use fib.core fib.parallel fib.os fib.os.sched tl.check) (:require [fib.os.platform :as plat]))
+
+(defun main () -> i64
+  (let [c (checks)
+        v (join (fork-task (fn () 7)))
+        cap (pool-spinners)
+        w (pool-workers)
+        env (getenv "FIB_SPINNERS")]
+    (do (check c (= v 7))
+        (check c (pool-started?))
+        (match env
+          ((some s) (match (parse-long s)
+                      ((some n) (check c (or (< n 0) (= cap n) (= cap 1000000))))
+                      (nil (check c true))))
+          (nil (if (= (plat/current) plat/Darwin)
+                   (check c (= cap 2))
+                   (check c (>= cap (max 16 w))))))
+        (checks-result c))))
