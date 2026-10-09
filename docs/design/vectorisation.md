@@ -1,5 +1,9 @@
 # Why our loops do not vectorise, and what would make them
 
+Current status: historical measurements and proposals on the recorded toolchain. Do not treat the ratios or the implementation census below as a benchmark of the current tree.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
+
 SIMD and tensors work, package V. Status: measurements and proposals; no compiler source was changed. Everything quoted
 here was produced on this machine (Intel i7-14700KF, AVX2 and FMA, no AVX-512; LLVM 21 `opt`/`llc`; the v0.1.5 seed
 `fibc`), under `/tmp/fibsuite.lock`; raw output is in `docs/design/vectorisation/results.log` and the `remarks-*.txt`

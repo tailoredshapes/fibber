@@ -25,7 +25,7 @@ the definitions were written). New collisions are refused.
 
 ## Consequences
 
-- A new form's collision is found in seconds by `fibc adr`, not at the end of a fixed-point build.
+- A new form's collision is found in seconds by `make adr`, not at the end of a fixed-point build.
 - A compiler function may not be named after a core form even when the form is not yet used in the compiler.
 - The core and primitive forms have no collisions today; the builtins have the four listed.
 

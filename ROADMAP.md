@@ -9,30 +9,34 @@ and every compiler bug became two.
 Nothing on this page counts as done until an executable test says so
 (spec/method.md).
 
-## State of play (2026-10-05)
+## State of play (2026-10-09)
 
-Stage 2, the compiler in fibber, is the compiler; the Rust tools were retired on 2026-10-05 (stage 10, below; docs/rust-legacy.md). `scripts/gate.sh --full` is the
-judge of main, and every merge since 2026-10-04 passed it (fixed point, 354 ownership and 27 module cases, the stdlib suite with only the
-recorded expected failure, case 1707). Streams since the bootstrap:
+The self-hosted stage-2 compiler is the active compiler; Rust tools were retired
+on October 5. Validation is the fixed point, maintained pass goldens, audited
+cases, behaviour specs and executable ADRs ([method](spec/method.md)). Historical
+milestone counts and measurements below describe their recorded commits.
 
-- **Performance**: the shootout against Java, Clojure and C ([docs/shootout.md](docs/shootout.md)); ranked remaining gaps in
-  [docs/shootout/improvements.md](docs/shootout/improvements.md) (k-nucleotide, binary-trees, n-body, pidigits are still 2.6 to 4.2x Java).
-- **SIMD and tensors**: lane vectors (`<<..>>` literals, checked integer arithmetic, masks, reductions, `fma`/`muladd`, `has-fma`),
-  `fib.tensor` with a packed fma GEMM and fused dense layers ([docs/shootout/simd.md](docs/shootout/simd.md),
-  [docs/shootout/tensor.md](docs/shootout/tensor.md)). Matrix multiplication is within about 1.15x of NumPy with OpenBLAS (single thread).
-- **Exclusive views**: scoped writable windows with ownership rules and disjoint parallel tiles
-  ([docs/design/exclusive-views.md](docs/design/exclusive-views.md)).
-- **Development loop**: `fibc run -O 0` uses the fast code generator; the compile server, REPL and editor services of
-  [docs/design/dev-loop.md](docs/design/dev-loop.md) are designed, not built (DV2 onward). The interpreter design
-  (docs/design/fibber-interpreter.md) is superseded: no rule 6 oracle.
-- **aarch64**: cross-emission and a native, self-hosting compiler on an Apple M1 Ultra; macOS packaging works; no darwin-arm64 release yet;
-  iOS, aarch64 Linux, the NEON GEMM tile and the aarch64 CPU rows are open ([docs/design/aarch64.md](docs/design/aarch64.md)).
-- **Libraries beyond the core**: `fib.os`, `fib.http`, `fib.logic` and `fib.logic.fd`, `fib.regex` (regex literals compile at compile time). The GraphQL engine (once `fib.lacinia`) moved to its own
-  repository, lacewing (`ssh://git@localhost:2222/tailoredshapes/lacewing.git`), pulled in with `fibc deps add`.
+- Development tools: `fibc check`, `serve`, `--server`, `repl` and `lsp`;
+  [dev-loop](docs/design/dev-loop.md) separates the original plan from built stages.
+- Native x86-64 and arm64, published Linux and Darwin seeds; C emission/building,
+  Linux musl static deployment, WASI and bare wasm, PTX and WGSL targets.
+  See the [platform matrix](docs/policy/platform-support.md).
+- SIMD, tensors, reverse-mode autodiff, exclusive views and disjoint tiles,
+  a work-stealing pool and structured parallelism. Recorded performance evidence
+  remains in [shootout](docs/shootout.md), with its dates and hardware.
+- Libraries: JSON/JSON Schema, LZ4 compression, OS, HTTP, DNS, crypto contracts,
+  unaudited client TLS, logging, OpenTelemetry, Merkle, SQL/database contracts,
+  bigint, decimal, formatting, RNG, datum, keywords, regex and relational search.
+  [Library reference](docs/reference/library/INDEX.md) inventories the source.
+- GraphQL (lacewing), HOCON, meshql and native database/GPU drivers are external
+  repositories. Configure an accessible git URL when adding these dependencies.
 
-**Open work, in the order I would take it:** reverse-mode autodiff on `fib.tensor` (design not written); the darwin-arm64 release; the
-remaining dev-loop packages (DV2 to DV10); the shootout gaps; last-axis reductions in `fib.tensor`; the port of meshql to fibber (deferred by
-the owner); `scripts/package.sh` and CI do not yet run the `muladd.sh` check; the ports the Rust retirement scheduled (`fibref`'s interpreter and memory audit, `fibgen`, `fibc lsp`: docs/rust-legacy.md, Follow-ups).
+**Remaining work:** interpreter/heap-audit and generator ports are contract stubs,
+not completed tools; task cancellation, parts of the development-loop plan,
+last-axis tensor performance and shootout gaps remain. Library planning rows
+that lack bindings are listed by ADR 0023.
+[Documentation acceptance and release decisions](docs/policy/stability.md) remain
+separate from these implementation tasks.
 
 ## M1. Specification — done
 
@@ -646,21 +650,22 @@ Binary releases of `fibc` on GitHub (README.md, Install; `scripts/package.sh`,
    registers) outside BLAKE3's own kernels; it fails if the shipped `fibc` lacks the start-up CPU check, and it runs
    the unpacked `fibc --version` and hello in an empty environment.
 5. The seed moves forward deliberately: a commit changes `SEED` to a newer release's url and sha256
-   (v0.1.5 is the `SEED` now; it was v0.1.3 until the flip, commit `0a86093`).
+   (v0.1.13 is the current `SEED`; see `SEED` for the pinned URLs and checksums).
 
 **Lessons: a seed is only usable if it runs on every CPU.** v0.1.2 died with SIGILL on a CPU other than the CI
 runner's (code generated for the build host), so v0.1.3 is built for a baseline CPU; v0.1.1 failed the unpack check.
 
 **The bootstrap chain.** `seed-1` (the Rust tools, a tag) builds v0.0.1 (the Rust tools, released; the first
 `SEED`), which builds v0.1.0, v0.1.1, v0.1.2 and v0.1.3 (stage 2, the compiler in fibber: the `SEED` file at each
-of those four tags names v0.0.1). v0.1.3 is the current `SEED` (commit `0a86093`): the first release that knows the
+of those four tags names v0.0.1). v0.1.3 became the `SEED` at commit `0a86093`: the first release that knows the
 in-place primitives (spec/types.md section 2.13.1) and is built for a baseline CPU.
 
 - [x] `fibc --version`; the relocatable tarball runs `hello.fib` with an
       empty environment (`scripts/package.sh`)
 - [x] v0.0.1 released and its sha256 recorded in `SEED`
 - [x] v0.1.3 released and recorded as the `SEED`
-- [ ] 1.0.0 readiness: the owner's call, not decided by any test
+- [ ] 1.0.0 readiness: executable acceptance checks plus owner approval of the
+      stability and platform promises ([proposal](docs/policy/stability.md))
 
 ## Decisions
 
@@ -674,7 +679,10 @@ in-place primitives (spec/types.md section 2.13.1) and is built for a baseline C
 
 ## Open decisions
 
-None that block work. Waiting on the owner: publishing a darwin-arm64 release; when to start the meshql port; whether to build reverse-mode autodiff next.
+The Darwin release, meshql port and reverse-mode autodiff are no longer open
+choices. The remaining release-policy choices are the proposed 1.0 stability
+classes, supported-platform promise and acceptance checklist
+([stability proposal](docs/policy/stability.md)).
 
 Older note: none. The last two (the colour argument inside an `impl` on a
 colour-parameterised type, and a forwarded `&` cell written through a

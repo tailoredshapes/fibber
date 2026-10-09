@@ -1,5 +1,12 @@
 # Bootstrap: the compiler in fibber (M6)
 
+> Source references: `crates/` and Rust `fibref`/`fibgen` paths in dated
+> sections refer to git tag `seed-1`, not files in this checkout. See
+> [the legacy source map](../docs/history/source-map.md) for retrieval and
+> current compiler counterparts. These historical citations do not reinstate
+> an interpreter oracle; [method.md](method.md) defines current validation.
+
+
 Status: **Proposed**, step by step; the whole of M6 has been done to its
 definition (2026-10-02, see ROADMAP M6): reader, expander with a macro
 runner, type checker, ownership checker and lIR emitter in `compiler/`, each

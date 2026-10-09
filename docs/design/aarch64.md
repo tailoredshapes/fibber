@@ -1,5 +1,9 @@
 # fibber on aarch64 (Apple Silicon macOS, iOS, Linux): package A64-0
 
+Current status: Darwin arm64 releases have been published since 0.1.7; `make mac-check` is the native Mac gate, and `make k8s-gate K8S_ARCH=arm64` selects native Linux nodes. The initial spike below is dated evidence; iOS remains cross-emission only.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
+
 Status: design and spike, 2026-10-05. Everything marked **ran on the Mac** was run on an Apple M1 Ultra (macOS 27.0.1, arm64, Apple clang 21,
 Homebrew `llvm@21` 21.1.8) over ssh, under `~/fibber-a64-scratch`. Everything marked **emitted only** was produced on x86-64 Linux and
 inspected, not run on aarch64. Nothing here ran on iOS, on aarch64 Linux or on an M4 (SME).

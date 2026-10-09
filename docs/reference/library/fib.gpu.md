@@ -1,0 +1,70 @@
+# fib.gpu
+
+Generated declaration inventory of [fib.gpu](../../../lib/fib/gpu.fib). Source links contain the full signatures and API comments; enum variants and protocol methods belong to their linked declaration.
+
+| Name | Declaration | Defined in |
+|---|---|---|
+| `Arg` | defenum | [lib/fib/gpu/device.fib:33](../../../lib/fib/gpu/device.fib#L33) |
+| `Buffer` | defprotocol | [lib/fib/gpu/device.fib:40](../../../lib/fib/gpu/device.fib#L40) |
+| `Device` | defprotocol | [lib/fib/gpu/device.fib:106](../../../lib/fib/gpu/device.fib#L106) |
+| `DeviceInfo` | defstruct | [lib/fib/gpu/device.fib:29](../../../lib/fib/gpu/device.fib#L29) |
+| `Event` | defprotocol | [lib/fib/gpu/device.fib:84](../../../lib/fib/gpu/device.fib#L84) |
+| `GpuError` | defstruct | [lib/fib/gpu/device.fib:20](../../../lib/fib/gpu/device.fib#L20) |
+| `Kernel` | defprotocol | [lib/fib/gpu/device.fib:72](../../../lib/fib/gpu/device.fib#L72) |
+| `Module` | defprotocol | [lib/fib/gpu/device.fib:78](../../../lib/fib/gpu/device.fib#L78) |
+| `Pinned` | defprotocol | [lib/fib/gpu/device.fib:55](../../../lib/fib/gpu/device.fib#L55) |
+| `Platform` | defprotocol | [lib/fib/gpu/device.fib:117](../../../lib/fib/gpu/device.fib#L117) |
+| `Stream` | defprotocol | [lib/fib/gpu/device.fib:95](../../../lib/fib/gpu/device.fib#L95) |
+| `Transfer` | defprotocol | [lib/fib/gpu/device.fib:66](../../../lib/fib/gpu/device.fib#L66) |
+| `arg-kind` | defun | [lib/fib/gpu/device.fib:36](../../../lib/fib/gpu/device.fib#L36) |
+| `array-data` | defun | [lib/fib/gpu/host.fib:41](../../../lib/fib/gpu/host.fib#L41) |
+| `array-data-i32` | defun | [lib/fib/gpu/host.fib:43](../../../lib/fib/gpu/host.fib#L43) |
+| `ballot` | defun | [lib/fib/gpu/warp.fib:25](../../../lib/fib/gpu/warp.fib#L25) |
+| `check-args` | defun | [lib/fib/gpu/device.fib:170](../../../lib/fib/gpu/device.fib#L170) |
+| `check-dims` | defun | [lib/fib/gpu/device.fib:182](../../../lib/fib/gpu/device.fib#L182) |
+| `copy-bytes-check` | defun | [lib/fib/gpu/device.fib:144](../../../lib/fib/gpu/device.fib#L144) |
+| `error-kind` | defun | [lib/fib/gpu/device.fib:25](../../../lib/fib/gpu/device.fib#L25) |
+| `f32-add!` | defun | [lib/fib/gpu/atomic.fib:28](../../../lib/fib/gpu/atomic.fib#L28) |
+| `f32-at` | defun | [lib/fib/gpu/host.fib:31](../../../lib/fib/gpu/host.fib#L31) |
+| `f32-fetch-add` | defun | [lib/fib/gpu/atomic.fib:18](../../../lib/fib/gpu/atomic.fib#L18) |
+| `f32-fetch-max` | defun | [lib/fib/gpu/atomic.fib:19](../../../lib/fib/gpu/atomic.fib#L19) |
+| `f32-fetch-min` | defun | [lib/fib/gpu/atomic.fib:20](../../../lib/fib/gpu/atomic.fib#L20) |
+| `f32-max!` | defun | [lib/fib/gpu/atomic.fib:34](../../../lib/fib/gpu/atomic.fib#L34) |
+| `f32-min!` | defun | [lib/fib/gpu/atomic.fib:29](../../../lib/fib/gpu/atomic.fib#L29) |
+| `f32-set!` | defun | [lib/fib/gpu/host.fib:32](../../../lib/fib/gpu/host.fib#L32) |
+| `f64-at` | defun | [lib/fib/gpu/host.fib:33](../../../lib/fib/gpu/host.fib#L33) |
+| `f64-set!` | defun | [lib/fib/gpu/host.fib:34](../../../lib/fib/gpu/host.fib#L34) |
+| `gpu-error` | defun | [lib/fib/gpu/device.fib:24](../../../lib/fib/gpu/device.fib#L24) |
+| `host-launch` | defun | [lib/fib/gpu/host.fib:17](../../../lib/fib/gpu/host.fib#L17) |
+| `i32-add!` | defun | [lib/fib/gpu/atomic.fib:23](../../../lib/fib/gpu/atomic.fib#L23) |
+| `i32-at` | defun | [lib/fib/gpu/host.fib:35](../../../lib/fib/gpu/host.fib#L35) |
+| `i32-cas` | defun | [lib/fib/gpu/atomic.fib:17](../../../lib/fib/gpu/atomic.fib#L17) |
+| `i32-fetch-add` | defun | [lib/fib/gpu/atomic.fib:12](../../../lib/fib/gpu/atomic.fib#L12) |
+| `i32-fetch-max` | defun | [lib/fib/gpu/atomic.fib:14](../../../lib/fib/gpu/atomic.fib#L14) |
+| `i32-fetch-min` | defun | [lib/fib/gpu/atomic.fib:13](../../../lib/fib/gpu/atomic.fib#L13) |
+| `i32-fetch-xchg` | defun | [lib/fib/gpu/atomic.fib:15](../../../lib/fib/gpu/atomic.fib#L15) |
+| `i32-max!` | defun | [lib/fib/gpu/atomic.fib:25](../../../lib/fib/gpu/atomic.fib#L25) |
+| `i32-min!` | defun | [lib/fib/gpu/atomic.fib:24](../../../lib/fib/gpu/atomic.fib#L24) |
+| `i32-set!` | defun | [lib/fib/gpu/host.fib:36](../../../lib/fib/gpu/host.fib#L36) |
+| `i32-umax!` | defun | [lib/fib/gpu/atomic.fib:27](../../../lib/fib/gpu/atomic.fib#L27) |
+| `i32-umin!` | defun | [lib/fib/gpu/atomic.fib:26](../../../lib/fib/gpu/atomic.fib#L26) |
+| `i64-add!` | defun | [lib/fib/gpu/atomic.fib:30](../../../lib/fib/gpu/atomic.fib#L30) |
+| `i64-at` | defun | [lib/fib/gpu/host.fib:37](../../../lib/fib/gpu/host.fib#L37) |
+| `i64-fetch-add` | defun | [lib/fib/gpu/atomic.fib:21](../../../lib/fib/gpu/atomic.fib#L21) |
+| `i64-set!` | defun | [lib/fib/gpu/host.fib:38](../../../lib/fib/gpu/host.fib#L38) |
+| `lane-id` | defun | [lib/fib/gpu/warp.fib:24](../../../lib/fib/gpu/warp.fib#L24) |
+| `lend-copy` | defun | [lib/fib/gpu/device.fib:133](../../../lib/fib/gpu/device.fib#L133) |
+| `lend-launch` | defun | [lib/fib/gpu/device.fib:129](../../../lib/fib/gpu/device.fib#L129) |
+| `lent?` | defun | [lib/fib/gpu/device.fib:128](../../../lib/fib/gpu/device.fib#L128) |
+| `parse-signatures` | defun | [lib/fib/gpu/device.fib:153](../../../lib/fib/gpu/device.fib#L153) |
+| `pinned-use` | defun | [lib/fib/gpu/device.fib:140](../../../lib/fib/gpu/device.fib#L140) |
+| `shfl-down-f32` | defun | [lib/fib/gpu/warp.fib:15](../../../lib/fib/gpu/warp.fib#L15) |
+| `shfl-down-i32` | defun | [lib/fib/gpu/warp.fib:14](../../../lib/fib/gpu/warp.fib#L14) |
+| `shfl-idx-f32` | defun | [lib/fib/gpu/warp.fib:21](../../../lib/fib/gpu/warp.fib#L21) |
+| `shfl-idx-i32` | defun | [lib/fib/gpu/warp.fib:20](../../../lib/fib/gpu/warp.fib#L20) |
+| `shfl-up-f32` | defun | [lib/fib/gpu/warp.fib:17](../../../lib/fib/gpu/warp.fib#L17) |
+| `shfl-up-i32` | defun | [lib/fib/gpu/warp.fib:16](../../../lib/fib/gpu/warp.fib#L16) |
+| `shfl-xor-f32` | defun | [lib/fib/gpu/warp.fib:19](../../../lib/fib/gpu/warp.fib#L19) |
+| `shfl-xor-i32` | defun | [lib/fib/gpu/warp.fib:18](../../../lib/fib/gpu/warp.fib#L18) |
+| `signatures-of` | defun | [lib/fib/gpu/device.fib:164](../../../lib/fib/gpu/device.fib#L164) |
+| `subgroup-size` | defun | [lib/fib/gpu/warp.fib:23](../../../lib/fib/gpu/warp.fib#L23) |

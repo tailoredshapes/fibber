@@ -1,0 +1,75 @@
+# fib.json
+
+Generated declaration inventory of [fib.json](../../../lib/fib/json.fib). Source links contain the full signatures and API comments; enum variants and protocol methods belong to their linked declaration.
+
+| Name | Declaration | Defined in |
+|---|---|---|
+| `Doc` | defstruct | [lib/fib/json/types.fib:84](../../../lib/fib/json/types.fib#L84) |
+| `Json` | defenum | [lib/fib/json/types.fib:6](../../../lib/fib/json/types.fib#L6) |
+| `JsonError` | defstruct | [lib/fib/json/types.fib:21](../../../lib/fib/json/types.fib#L21) |
+| `JsonEvent` | defenum | [lib/fib/json/types.fib:86](../../../lib/fib/json/types.fib#L86) |
+| `JsonOptions` | defstruct | [lib/fib/json/types.fib:31](../../../lib/fib/json/types.fib#L31) |
+| `ObjIndex` | defstruct | [lib/fib/json/types.fib:95](../../../lib/fib/json/types.fib#L95) |
+| `WriteOptions` | defstruct | [lib/fib/json/types.fib:81](../../../lib/fib/json/types.fib#L81) |
+| `datum->json` | defun | [lib/fib/json.fib:72](../../../lib/fib/json.fib#L72) |
+| `default-options` | defun | [lib/fib/json/types.fib:33](../../../lib/fib/json/types.fib#L33) |
+| `doc-write` | defun | [lib/fib/json.fib:65](../../../lib/fib/json.fib#L65) |
+| `doc-write-bytes` | defun | [lib/fib/json.fib:67](../../../lib/fib/json.fib#L67) |
+| `doc-write-node` | defun | [lib/fib/json.fib:66](../../../lib/fib/json.fib#L66) |
+| `doc-write-with` | defun | [lib/fib/json.fib:68](../../../lib/fib/json.fib#L68) |
+| `documents` | defun | [lib/fib/json.fib:31](../../../lib/fib/json.fib#L31) |
+| `e-bom` | def | [lib/fib/json/types.fib:51](../../../lib/fib/json/types.fib#L51) |
+| `e-control` | def | [lib/fib/json/types.fib:43](../../../lib/fib/json/types.fib#L43) |
+| `e-depth` | def | [lib/fib/json/types.fib:45](../../../lib/fib/json/types.fib#L45) |
+| `e-duplicate` | def | [lib/fib/json/types.fib:49](../../../lib/fib/json/types.fib#L49) |
+| `e-eof` | def | [lib/fib/json/types.fib:40](../../../lib/fib/json/types.fib#L40) |
+| `e-escape` | def | [lib/fib/json/types.fib:42](../../../lib/fib/json/types.fib#L42) |
+| `e-expected` | def | [lib/fib/json/types.fib:52](../../../lib/fib/json/types.fib#L52) |
+| `e-number` | def | [lib/fib/json/types.fib:41](../../../lib/fib/json/types.fib#L41) |
+| `e-range` | def | [lib/fib/json/types.fib:50](../../../lib/fib/json/types.fib#L50) |
+| `e-size` | def | [lib/fib/json/types.fib:48](../../../lib/fib/json/types.fib#L48) |
+| `e-surrogate` | def | [lib/fib/json/types.fib:47](../../../lib/fib/json/types.fib#L47) |
+| `e-trailing` | def | [lib/fib/json/types.fib:46](../../../lib/fib/json/types.fib#L46) |
+| `e-unexpected` | def | [lib/fib/json/types.fib:39](../../../lib/fib/json/types.fib#L39) |
+| `e-utf8` | def | [lib/fib/json/types.fib:44](../../../lib/fib/json/types.fib#L44) |
+| `elem` | defun | [lib/fib/json.fib:58](../../../lib/fib/json.fib#L58) |
+| `error-message` | defun | [lib/fib/json/types.fib:54](../../../lib/fib/json/types.fib#L54) |
+| `field` | defun | [lib/fib/json.fib:57](../../../lib/fib/json.fib#L57) |
+| `get-in` | defun | [lib/fib/json.fib:49](../../../lib/fib/json.fib#L49) |
+| `get-index` | defun | [lib/fib/json.fib:48](../../../lib/fib/json.fib#L48) |
+| `get-key` | defun | [lib/fib/json.fib:47](../../../lib/fib/json.fib#L47) |
+| `index-get` | defun | [lib/fib/json.fib:52](../../../lib/fib/json.fib#L52) |
+| `index-object` | defun | [lib/fib/json.fib:51](../../../lib/fib/json.fib#L51) |
+| `json->datum` | defun | [lib/fib/json.fib:71](../../../lib/fib/json.fib#L71) |
+| `lines-seq` | defun | [lib/fib/json.fib:35](../../../lib/fib/json.fib#L35) |
+| `make-error` | defun | [lib/fib/json/types.fib:72](../../../lib/fib/json/types.fib#L72) |
+| `node->json` | defun | [lib/fib/json.fib:64](../../../lib/fib/json.fib#L64) |
+| `node-bool` | defun | [lib/fib/json.fib:63](../../../lib/fib/json.fib#L63) |
+| `node-f64` | defun | [lib/fib/json.fib:62](../../../lib/fib/json.fib#L62) |
+| `node-i64` | defun | [lib/fib/json.fib:61](../../../lib/fib/json.fib#L61) |
+| `node-str` | defun | [lib/fib/json.fib:60](../../../lib/fib/json.fib#L60) |
+| `parse` | defun | [lib/fib/json.fib:25](../../../lib/fib/json.fib#L25) |
+| `parse-bytes` | defun | [lib/fib/json.fib:27](../../../lib/fib/json.fib#L27) |
+| `parse-bytes-with` | defun | [lib/fib/json.fib:28](../../../lib/fib/json.fib#L28) |
+| `parse-lines` | defun | [lib/fib/json.fib:37](../../../lib/fib/json.fib#L37) |
+| `parse-with` | defun | [lib/fib/json.fib:26](../../../lib/fib/json.fib#L26) |
+| `path` | defun | [lib/fib/json.fib:59](../../../lib/fib/json.fib#L59) |
+| `pointer` | defun | [lib/fib/json.fib:50](../../../lib/fib/json.fib#L50) |
+| `read-file` | defun | [lib/fib/json.fib:29](../../../lib/fib/json.fib#L29) |
+| `read-file-with` | defun | [lib/fib/json.fib:30](../../../lib/fib/json.fib#L30) |
+| `reduce-events` | defun | [lib/fib/json.fib:69](../../../lib/fib/json.fib#L69) |
+| `reduce-lines` | defun | [lib/fib/json.fib:32](../../../lib/fib/json.fib#L32) |
+| `reduce-lines-par` | defun | [lib/fib/json.fib:34](../../../lib/fib/json.fib#L34) |
+| `reduce-lines-par-map` | defun | [lib/fib/json.fib:36](../../../lib/fib/json.fib#L36) |
+| `tape` | defun | [lib/fib/json.fib:55](../../../lib/fib/json.fib#L55) |
+| `tape-with` | defun | [lib/fib/json.fib:56](../../../lib/fib/json.fib#L56) |
+| `to-json` | defun | [lib/fib/json.fib:75](../../../lib/fib/json.fib#L75) |
+| `tolerant-options` | defun | [lib/fib/json/types.fib:36](../../../lib/fib/json/types.fib#L36) |
+| `type-name` | defun | [lib/fib/json.fib:53](../../../lib/fib/json.fib#L53) |
+| `write` | defun | [lib/fib/json.fib:39](../../../lib/fib/json.fib#L39) |
+| `write-bytes` | defun | [lib/fib/json.fib:42](../../../lib/fib/json.fib#L42) |
+| `write-file` | defun | [lib/fib/json.fib:45](../../../lib/fib/json.fib#L45) |
+| `write-pretty` | defun | [lib/fib/json.fib:40](../../../lib/fib/json.fib#L40) |
+| `write-sink` | defun | [lib/fib/json.fib:44](../../../lib/fib/json.fib#L44) |
+| `write-to` | defun | [lib/fib/json.fib:43](../../../lib/fib/json.fib#L43) |
+| `write-with` | defun | [lib/fib/json.fib:41](../../../lib/fib/json.fib#L41) |

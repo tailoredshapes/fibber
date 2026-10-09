@@ -1,0 +1,69 @@
+# fib.autodiff
+
+Generated declaration inventory of [fib.autodiff](../../../lib/fib/autodiff.fib). Source links contain the full signatures and API comments; enum variants and protocol methods belong to their linked declaration.
+
+| Name | Declaration | Defined in |
+|---|---|---|
+| `Real` | defprotocol | [lib/fib/autodiff/real.fib:8](../../../lib/fib/autodiff/real.fib#L8) |
+| `accumulate` | defun | [lib/fib/autodiff/run.fib:18](../../../lib/fib/autodiff/run.fib#L18) |
+| `act-grad` | defun | [lib/fib/autodiff/nn.fib:27](../../../lib/fib/autodiff/nn.fib#L27) |
+| `adam-init` | defun | [lib/fib/autodiff/optim.fib:15](../../../lib/fib/autodiff/optim.fib#L15) |
+| `adam-step` | defun | [lib/fib/autodiff/optim.fib:38](../../../lib/fib/autodiff/optim.fib#L38) |
+| `add` | defun | [lib/fib/autodiff/ops.fib:36](../../../lib/fib/autodiff/ops.fib#L36) |
+| `backward` | defun | [lib/fib/autodiff/run.fib:42](../../../lib/fib/autodiff/run.fib#L42) |
+| `broadcast-to` | defun | [lib/fib/autodiff/ops.fib:115](../../../lib/fib/autodiff/ops.fib#L115) |
+| `column-sums` | defun | [lib/fib/autodiff/ops.fib:18](../../../lib/fib/autodiff/ops.fib#L18) |
+| `const-like` | defun | [lib/fib/autodiff/tape.fib:26](../../../lib/fib/autodiff/tape.fib#L26) |
+| `constant` | defun | [lib/fib/autodiff/tape.fib:25](../../../lib/fib/autodiff/tape.fib#L25) |
+| `dense` | defun | [lib/fib/autodiff/nn.fib:43](../../../lib/fib/autodiff/nn.fib#L43) |
+| `dense-forward` | defun | [lib/fib/autodiff/nn.fib:38](../../../lib/fib/autodiff/nn.fib#L38) |
+| `div` | defun | [lib/fib/autodiff/ops.fib:52](../../../lib/fib/autodiff/ops.fib#L52) |
+| `exp` | defun | [lib/fib/autodiff/ops.fib:65](../../../lib/fib/autodiff/ops.fib#L65) |
+| `fresh-id` | defun | [lib/fib/autodiff/tape.fib:21](../../../lib/fib/autodiff/tape.fib#L21) |
+| `gelu-grad` | defun | [lib/fib/autodiff/nn.fib:19](../../../lib/fib/autodiff/nn.fib#L19) |
+| `grad` | defn | [lib/fib/autodiff/run.fib:73](../../../lib/fib/autodiff/run.fib#L73) |
+| `ipow` | defun | [lib/fib/autodiff/optim.fib:19](../../../lib/fib/autodiff/optim.fib#L19) |
+| `leading-sum?` | defun | [lib/fib/autodiff/ops.fib:13](../../../lib/fib/autodiff/ops.fib#L13) |
+| `leaf` | defun | [lib/fib/autodiff/tape.fib:24](../../../lib/fib/autodiff/tape.fib#L24) |
+| `leaf-grad` | defun | [lib/fib/autodiff/run.fib:55](../../../lib/fib/autodiff/run.fib#L55) |
+| `log` | defun | [lib/fib/autodiff/ops.fib:68](../../../lib/fib/autodiff/ops.fib#L68) |
+| `matmul` | defun | [lib/fib/autodiff/nn.fib:8](../../../lib/fib/autodiff/nn.fib#L8) |
+| `mean` | defun | [lib/fib/autodiff/ops.fib:94](../../../lib/fib/autodiff/ops.fib#L94) |
+| `mul` | defun | [lib/fib/autodiff/ops.fib:46](../../../lib/fib/autodiff/ops.fib#L46) |
+| `needs?` | defun | [lib/fib/autodiff/tape.fib:28](../../../lib/fib/autodiff/tape.fib#L28) |
+| `neg` | defun | [lib/fib/autodiff/ops.fib:58](../../../lib/fib/autodiff/ops.fib#L58) |
+| `new-tape` | defun | [lib/fib/autodiff/tape.fib:19](../../../lib/fib/autodiff/tape.fib#L19) |
+| `nil-grad` | defun | [lib/fib/autodiff/run.fib:52](../../../lib/fib/autodiff/run.fib#L52) |
+| `no-grad` | defun | [lib/fib/autodiff/tape.fib:66](../../../lib/fib/autodiff/tape.fib#L66) |
+| `onehot` | defun | [lib/fib/autodiff/nn.fib:58](../../../lib/fib/autodiff/nn.fib#L58) |
+| `pick2` | defun | [lib/fib/autodiff/ops.fib:31](../../../lib/fib/autodiff/ops.fib#L31) |
+| `pop-entry` | defun | [lib/fib/autodiff/run.fib:12](../../../lib/fib/autodiff/run.fib#L12) |
+| `push-entry` | defun | [lib/fib/autodiff/tape.fib:30](../../../lib/fib/autodiff/tape.fib#L30) |
+| `record1` | defun | [lib/fib/autodiff/tape.fib:35](../../../lib/fib/autodiff/tape.fib#L35) |
+| `record2` | defun | [lib/fib/autodiff/tape.fib:42](../../../lib/fib/autodiff/tape.fib#L42) |
+| `record3` | defun | [lib/fib/autodiff/tape.fib:52](../../../lib/fib/autodiff/tape.fib#L52) |
+| `relu` | defun | [lib/fib/autodiff/ops.fib:85](../../../lib/fib/autodiff/ops.fib#L85) |
+| `relu-mask` | defun | [lib/fib/autodiff/ops.fib:82](../../../lib/fib/autodiff/ops.fib#L82) |
+| `reshape` | defun | [lib/fib/autodiff/ops.fib:108](../../../lib/fib/autodiff/ops.fib#L108) |
+| `run-grads` | defun | [lib/fib/autodiff/run.fib:60](../../../lib/fib/autodiff/run.fib#L60) |
+| `run-tape` | defun | [lib/fib/autodiff/run.fib:35](../../../lib/fib/autodiff/run.fib#L35) |
+| `scalar` | defun | [lib/fib/autodiff/real.fib:22](../../../lib/fib/autodiff/real.fib#L22) |
+| `scale` | defun | [lib/fib/autodiff/ops.fib:61](../../../lib/fib/autodiff/ops.fib#L61) |
+| `sgd-step` | defun | [lib/fib/autodiff/optim.fib:9](../../../lib/fib/autodiff/optim.fib#L9) |
+| `shape-of` | defun | [lib/fib/autodiff/ops.fib:34](../../../lib/fib/autodiff/ops.fib#L34) |
+| `sigmoid` | defun | [lib/fib/autodiff/ops.fib:77](../../../lib/fib/autodiff/ops.fib#L77) |
+| `silu-grad` | defun | [lib/fib/autodiff/nn.fib:14](../../../lib/fib/autodiff/nn.fib#L14) |
+| `softmax` | defun | [lib/fib/autodiff/nn.fib:54](../../../lib/fib/autodiff/nn.fib#L54) |
+| `softmax-cross-entropy` | defun | [lib/fib/autodiff/nn.fib:65](../../../lib/fib/autodiff/nn.fib#L65) |
+| `spread` | defun | [lib/fib/autodiff/run.fib:23](../../../lib/fib/autodiff/run.fib#L23) |
+| `step` | defun | [lib/fib/autodiff/run.fib:30](../../../lib/fib/autodiff/run.fib#L30) |
+| `stop-gradient` | defun | [lib/fib/autodiff/tape.fib:63](../../../lib/fib/autodiff/tape.fib#L63) |
+| `sub` | defun | [lib/fib/autodiff/ops.fib:41](../../../lib/fib/autodiff/ops.fib#L41) |
+| `sum` | defun | [lib/fib/autodiff/ops.fib:90](../../../lib/fib/autodiff/ops.fib#L90) |
+| `sum-axis` | defun | [lib/fib/autodiff/ops.fib:101](../../../lib/fib/autodiff/ops.fib#L101) |
+| `sum-leading` | defun | [lib/fib/autodiff/ops.fib:10](../../../lib/fib/autodiff/ops.fib#L10) |
+| `tanh` | defun | [lib/fib/autodiff/ops.fib:72](../../../lib/fib/autodiff/ops.fib#L72) |
+| `transpose` | defun | [lib/fib/autodiff/ops.fib:112](../../../lib/fib/autodiff/ops.fib#L112) |
+| `unbroadcast` | defun | [lib/fib/autodiff/ops.fib:21](../../../lib/fib/autodiff/ops.fib#L21) |
+| `value` | defun | [lib/fib/autodiff/tape.fib:27](../../../lib/fib/autodiff/tape.fib#L27) |
+| `value-and-grad` | defn | [lib/fib/autodiff/run.fib:67](../../../lib/fib/autodiff/run.fib#L67) |

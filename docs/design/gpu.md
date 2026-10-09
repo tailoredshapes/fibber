@@ -1,5 +1,9 @@
 # fibber on a GPU: a kernel target, a device protocol, drivers
 
+Current status: GPU-2 through GPU-6 are recorded in sections 0 and 12–14: PTX/WGSL kernels, atomics, shuffles and transfer protocols. Native driver evidence belongs to external driver repositories; the in-tree simulated device checks contracts without hardware. Sections 1–10 are the initial design.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
+
 Status: **phase 1 built** (GPU-2, 2026-10-07), on the decision of docs/design/decisions-2026-10-04.md (GPU): the kernel target and `fib.gpu` are
 core, `defkernel` is the deliberate opt-in, a program with a kernel built for a platform with no kernel target is refused. Section 0 is what
 is built and where; sections 1 to 10 are the design as GPU-1 wrote it, kept as the record (what they call missing is in section 0's table

@@ -1,0 +1,77 @@
+# fib.parallel
+
+Generated declaration inventory of [fib.parallel](../../../lib/fib/parallel.fib). Source links contain the full signatures and API comments; enum variants and protocol methods belong to their linked declaration.
+
+| Name | Declaration | Defined in |
+|---|---|---|
+| `Par` | defstruct | [lib/fib/parallel/chunks.fib:24](../../../lib/fib/parallel/chunks.fib#L24) |
+| `affinity-cpus` | defun | [lib/fib/parallel/cpu.fib:48](../../../lib/fib/parallel/cpu.fib#L48) |
+| `array-drop-ws` | defun | [lib/fib/parallel/cpu.fib:58](../../../lib/fib/parallel/cpu.fib#L58) |
+| `auto-grain` | defun | [lib/fib/parallel/pmap.fib:16](../../../lib/fib/parallel/pmap.fib#L16) |
+| `blocking` | defmacro | [lib/fib/parallel.fib:18](../../../lib/fib/parallel.fib#L18) |
+| `blocking-enter` | defun | [lib/fib/os/sched.fib:15](../../../lib/fib/os/sched.fib#L15) |
+| `blocking-leave` | defun | [lib/fib/os/sched.fib:16](../../../lib/fib/os/sched.fib#L16) |
+| `carries` | defun | [lib/fib/parallel/scan.fib:30](../../../lib/fib/parallel/scan.fib#L30) |
+| `cgroup-cpus` | defun | [lib/fib/parallel/cpu.fib:68](../../../lib/fib/parallel/cpu.fib#L68) |
+| `chunk-count` | defun | [lib/fib/parallel/chunks.fib:32](../../../lib/fib/parallel/chunks.fib#L32) |
+| `concat-chunks` | defun | [lib/fib/parallel/pmap.fib:40](../../../lib/fib/parallel/pmap.fib#L40) |
+| `cpu-count` | defun | [lib/fib/parallel/cpu.fib:91](../../../lib/fib/parallel/cpu.fib#L91) |
+| `cpu-list-count` | defun | [lib/fib/parallel/cpu.fib:36](../../../lib/fib/parallel/cpu.fib#L36) |
+| `detected-cpus` | defun | [lib/fib/parallel/cpu.fib:94](../../../lib/fib/parallel/cpu.fib#L94) |
+| `digit-runs` | defun | [lib/fib/parallel/cpu.fib:24](../../../lib/fib/parallel/cpu.fib#L24) |
+| `each-chunk` | defun | [lib/fib/parallel/pmap.fib:67](../../../lib/fib/parallel/pmap.fib#L67) |
+| `fold-chunk` | defun | [lib/fib/parallel/reduce.fib:52](../../../lib/fib/parallel/reduce.fib#L52) |
+| `fold-grain` | defun | [lib/fib/parallel/reduce.fib:41](../../../lib/fib/parallel/reduce.fib#L41) |
+| `fold-index-chunk` | defun | [lib/fib/parallel/reduce.fib:56](../../../lib/fib/parallel/reduce.fib#L56) |
+| `fork` | defun | [lib/fib/parallel/scope.fib:28](../../../lib/fib/parallel/scope.fib#L28) |
+| `fork-runners` | defun | [lib/fib/parallel/chunks.fib:53](../../../lib/fib/parallel/chunks.fib#L53) |
+| `index-chunk` | defun | [lib/fib/parallel/pmap.fib:33](../../../lib/fib/parallel/pmap.fib#L33) |
+| `least-known` | defun | [lib/fib/parallel/cpu.fib:83](../../../lib/fib/parallel/cpu.fib#L83) |
+| `left-combine` | defun | [lib/fib/parallel/reduce.fib:38](../../../lib/fib/parallel/reduce.fib#L38) |
+| `lesser-known` | defun | [lib/fib/parallel/cpu.fib:80](../../../lib/fib/parallel/cpu.fib#L80) |
+| `map-chunk` | defun | [lib/fib/parallel/pmap.fib:27](../../../lib/fib/parallel/pmap.fib#L27) |
+| `max-workers` | defun | [lib/fib/parallel/cpu.fib:21](../../../lib/fib/parallel/cpu.fib#L21) |
+| `new-scope` | defun | [lib/fib/parallel/scope.fib:23](../../../lib/fib/parallel/scope.fib#L23) |
+| `online-cpus` | defun | [lib/fib/parallel/cpu.fib:86](../../../lib/fib/parallel/cpu.fib#L86) |
+| `pair-up` | defun | [lib/fib/parallel/reduce.fib:26](../../../lib/fib/parallel/reduce.fib#L26) |
+| `par` | defun | [lib/fib/parallel/chunks.fib:26](../../../lib/fib/parallel/chunks.fib#L26) |
+| `pfold` | defn | [lib/fib/parallel/reduce.fib:68](../../../lib/fib/parallel/reduce.fib#L68) |
+| `pfold-chunks` | defun | [lib/fib/parallel/reduce.fib:46](../../../lib/fib/parallel/reduce.fib#L46) |
+| `pfor` | defn | [lib/fib/parallel/pmap.fib:76](../../../lib/fib/parallel/pmap.fib#L76) |
+| `pfor-chunks` | defun | [lib/fib/parallel/pmap.fib:72](../../../lib/fib/parallel/pmap.fib#L72) |
+| `pfor-range` | defmacro | [lib/fib/parallel.fib:78](../../../lib/fib/parallel.fib#L78) |
+| `pmap` | defn | [lib/fib/parallel/pmap.fib:59](../../../lib/fib/parallel/pmap.fib#L59) |
+| `pmap-chunks` | defun | [lib/fib/parallel/pmap.fib:56](../../../lib/fib/parallel/pmap.fib#L56) |
+| `pmap-chunks-array` | defun | [lib/fib/parallel/pmap.fib:53](../../../lib/fib/parallel/pmap.fib#L53) |
+| `pmap-each` | defmacro | [lib/fib/parallel.fib:55](../../../lib/fib/parallel.fib#L55) |
+| `pmap-n` | defn | [lib/fib/parallel/pmap.fib:63](../../../lib/fib/parallel/pmap.fib#L63) |
+| `pmap-range` | defmacro | [lib/fib/parallel.fib:67](../../../lib/fib/parallel.fib#L67) |
+| `pmap-seq` | defun | [lib/fib/parallel/pmap.fib:84](../../../lib/fib/parallel/pmap.fib#L84) |
+| `pool-inline-forks` | defun | [lib/fib/os/sched.fib:21](../../../lib/fib/os/sched.fib#L21) |
+| `pool-live-workers` | defun | [lib/fib/os/sched.fib:20](../../../lib/fib/os/sched.fib#L20) |
+| `pool-spinners` | defun | [lib/fib/os/sched.fib:24](../../../lib/fib/os/sched.fib#L24) |
+| `pool-started?` | defun | [lib/fib/os/sched.fib:22](../../../lib/fib/os/sched.fib#L22) |
+| `pool-steals` | defun | [lib/fib/os/sched.fib:19](../../../lib/fib/os/sched.fib#L19) |
+| `pool-tasks-run` | defun | [lib/fib/os/sched.fib:18](../../../lib/fib/os/sched.fib#L18) |
+| `pool-worker?` | defun | [lib/fib/os/sched.fib:17](../../../lib/fib/os/sched.fib#L17) |
+| `pool-workers` | defun | [lib/fib/os/sched.fib:14](../../../lib/fib/os/sched.fib#L14) |
+| `preduce` | defn | [lib/fib/parallel/reduce.fib:74](../../../lib/fib/parallel/reduce.fib#L74) |
+| `preduce-each` | defmacro | [lib/fib/parallel.fib:94](../../../lib/fib/parallel.fib#L94) |
+| `preduce-index-step` | defun | [lib/fib/parallel/reduce.fib:65](../../../lib/fib/parallel/reduce.fib#L65) |
+| `preduce-n` | defn | [lib/fib/parallel/reduce.fib:80](../../../lib/fib/parallel/reduce.fib#L80) |
+| `preduce-range` | defmacro | [lib/fib/parallel.fib:107](../../../lib/fib/parallel.fib#L107) |
+| `preduce-step` | defun | [lib/fib/parallel/reduce.fib:62](../../../lib/fib/parallel/reduce.fib#L62) |
+| `pscan` | defn | [lib/fib/parallel/scan.fib:48](../../../lib/fib/parallel/scan.fib#L48) |
+| `pscan-vec` | defun | [lib/fib/parallel/scan.fib:36](../../../lib/fib/parallel/scan.fib#L36) |
+| `quota-cpus` | defun | [lib/fib/parallel/cpu.fib:64](../../../lib/fib/parallel/cpu.fib#L64) |
+| `reduce-grain` | defun | [lib/fib/parallel/chunks.fib:30](../../../lib/fib/parallel/chunks.fib#L30) |
+| `run-chunks` | defun | [lib/fib/parallel/chunks.fib:60](../../../lib/fib/parallel/chunks.fib#L60) |
+| `run-dynamic` | defun | [lib/fib/parallel/chunks.fib:42](../../../lib/fib/parallel/chunks.fib#L42) |
+| `run-strided` | defun | [lib/fib/parallel/chunks.fib:35](../../../lib/fib/parallel/chunks.fib#L35) |
+| `scan-chunk` | defun | [lib/fib/parallel/scan.fib:20](../../../lib/fib/parallel/scan.fib#L20) |
+| `scope-exit` | defun | [lib/fib/parallel/scope.fib:44](../../../lib/fib/parallel/scope.fib#L44) |
+| `scope-failure` | defun | [lib/fib/parallel/scope.fib:33](../../../lib/fib/parallel/scope.fib#L33) |
+| `total-chunk` | defun | [lib/fib/parallel/scan.fib:15](../../../lib/fib/parallel/scan.fib#L15) |
+| `tree-combine` | defun | [lib/fib/parallel/reduce.fib:32](../../../lib/fib/parallel/reduce.fib#L32) |
+| `try-with-tasks` | defmacro | [lib/fib/parallel.fib:35](../../../lib/fib/parallel.fib#L35) |
+| `with-tasks` | defmacro | [lib/fib/parallel.fib:23](../../../lib/fib/parallel.fib#L23) |

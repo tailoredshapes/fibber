@@ -1,5 +1,7 @@
 # Documentation audit for 1.0.0 (DOCS-0)
 
+Resolution: [DOCS-1 corrections and evidence](docs-audit-resolution.md). The audit below is the original dated record, including its toolchain caveats.
+
 Status: audit, 2026-10-09, tree `f4423d5c` (VERSION 0.1.13). Read-only: this file is the only change. Evidence is `file:line` or quoted output.
 "Ran" means a command was run in this session. Scratch: `/tank/data/fibber-scratch/docs0`.
 

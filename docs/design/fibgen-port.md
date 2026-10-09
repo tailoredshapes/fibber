@@ -1,5 +1,9 @@
 # fibgen in fibber: the port plan (package G0)
 
+Current status: planned generator port with contract stubs. The skeleton check does not establish generated-program coverage.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
+
 Status: plan and contracts, 2026-10-05 (G0). **The source of truth for the shared types is the code**: `compiler/gen/` holds every record and
 variant as a real definition and every function as a stub whose body is `(trap "todo: MODULE FUNCTION")`, each with a comment naming the Rust
 file and function it ports (the pattern of `docs/design/lair-interfaces.md`). `compiler/tests/gen/skeleton.sh` builds a program that requires every module and

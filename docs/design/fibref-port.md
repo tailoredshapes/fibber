@@ -1,5 +1,9 @@
 # Porting the rest of `fibref`: plan, contracts and references
 
+Current status: planned port with contract stubs. Directory presence is not implementation evidence; the interpreter and independent heap-audit port remain incomplete.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
+
 Status: design (FPORT0, 2026-10-05). The only code is contract stubs (section 8) and recorded references (section 9). Every claim about the Rust
 names a file at tag `seed-1` (read with `git show seed-1:crates/fibref/src/...`); every number I ran this session is marked "ran" and is
 reproducible from the commands in section 9. Nothing here is **Decided** by the owner except what section 1 quotes; section 11 lists the

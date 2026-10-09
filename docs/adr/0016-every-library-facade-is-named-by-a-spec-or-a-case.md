@@ -22,7 +22,7 @@ name, and the list only shrinks.
 
 ## Consequences
 
-- A new area of the library (a facade) arrives with a case or a spec, or `fibc adr` refuses it.
+- A new area of the library (a facade) arrives with a case or a spec, or `make adr` refuses it.
 - Naming is not testing: a case that merely `:use`s a facade satisfies the rule. The depth of the coverage is judged by a person
   (the case lists, the mutant scripts); this rule keeps the floor.
 - A facade that is renamed or removed leaves no mention of the old name behind to hide a gap.

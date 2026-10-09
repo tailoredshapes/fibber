@@ -1,446 +1,82 @@
 # fibber
 
-A Lisp with memory safety and no garbage collector. Successor to
-[liar](https://github.com/tsmarsh/liar).
+A Lisp with static types, memory safety and no garbage collector. Fibber combines
+macros, ownership checking and native code for applications and numerical programs.
+Its compiler is written in Fibber. Successor to [liar](https://github.com/tsmarsh/liar).
 
+**Borrow first, count second.** Values inside their creating scope live and die
+with it. Escaping values are reference counted. The compiler chooses; programmers
+write neither lifetimes nor retain/release.
+
+```text
+Fibber source → Fibber compiler → lIR → LLVM IR → native
 ```
-fibber source → fibber → lIR → LLVM IR → native
-```
 
-**Memory model: borrow first, count second.** Values that stay inside
-the scope that created them live and die with that scope, with no
-bookkeeping. Values that escape it (returned, stored, captured by an
-escaping closure, sent to another thread) are reference counted. The
-compiler decides which is which; the programmer writes neither
-lifetimes nor retain/release.
-
-**Goal: a self-hosting language.** A fibber compiler written in fibber
-that compiles itself. See [ROADMAP.md](ROADMAP.md) for the milestones on
-the way; a small working language is one of them, not the destination.
+Start with the [tutorial](docs/tutorial/01-install-and-hello.md),
+[documentation map](docs/README.md) or [examples](examples/README.md).
+Collections, JSON/JSON Schema, LZ4, HTTP/DNS, OS services and database/crypto
+contracts are in the library. SIMD, tensors, autodiff, GPU protocols and relational
+search are explicit modules. See the [library index](docs/reference/library/INDEX.md).
+TLS is client-only and **UNAUDITED**; read [security and limits](docs/policy/limits.md).
 
 ## Install
 
-Releases are on the [GitHub releases page](https://github.com/tailoredshapes/fibber/releases):
-`fibc-VERSION-linux-x86_64.tar.gz` and, from 0.1.7, `fibc-VERSION-darwin-arm64.tar.gz`
-(Apple Silicon), with `SHA256SUMS`. The 0.0.x releases are
-the Rust tools (tag `seed-1`, docs/rust-legacy.md); from 0.1.0 `fibc` is the compiler written in fibber, built by
-itself, and stays 0.x until the owner says 1.0.0. The current release is
-0.1.13 (the file `VERSION`). Download your platform's tarball and `SHA256SUMS`, then:
+The current release and bootstrap seed are **0.1.13**, recorded in VERSION and SEED.
+Download your platform's archive and SHA256SUMS from
+[GitHub releases](https://github.com/tailoredshapes/fibber/releases):
 
-```
-sha256sum -c --ignore-missing SHA256SUMS     # fibc-0.1.13-linux-x86_64.tar.gz: OK  (macOS: shasum -a 256 -c)
-tar xzf fibc-0.1.13-linux-x86_64.tar.gz       # or fibc-0.1.13-darwin-arm64.tar.gz
-echo '(defun main () -> i64 (do (println "hello from fibber") 0))' > hello.fib
-fibc-0.1.13-linux-x86_64/bin/fibc --version   # fibc 0.1.13
-fibc-0.1.13-linux-x86_64/bin/fibc run hello.fib
-fibc-0.1.13-linux-x86_64/bin/fibc build hello.fib -o hello && ./hello
-```
-
-The darwin-arm64 binary is ad-hoc signed, not notarised: if macOS blocks a downloaded copy, remove the quarantine
-attribute (`xattr -d com.apple.quarantine fibc-0.1.13-darwin-arm64/bin/fibc`). `fibc build` needs the system C compiler
-(`cc`; Xcode's command line tools on a Mac) and a normal environment (it fails under a bare `env -i`: give it a `PATH`).
-The tarball holds one directory, `fibc-VERSION-PLATFORM/`:
-
-| Path | What |
-|------|------|
-| `bin/fibc` | the compiler |
-| `share/fibber/lib/` | the standard library source, found beside `bin/` by `fibc` itself |
-| `LICENSE`, `README.txt` | the licence (BSD 3-Clause) and a short layout note |
-
-No environment variable is needed: `bin/fibc` finds the library in
-`share/fibber/lib` by its own location, so move the unpacked directory as
-a whole (`bin/` and `share/` side by side). The code generator, lair, is
-written in fibber and links LLVM 21 statically into `bin/fibc`: there is no
-`lib/liblair.so`, and LLVM is not needed on your machine; it needs libc,
-libm, libstdc++, libgcc_s, libz and libzstd (`ldd bin/fibc` shows those
-and nothing else), and a C compiler (`cc`) for `fibc build`. To make a release
-yourself, see `scripts/package.sh`.
-
-**Kubernetes jobs.** `make k8s-apply`, then `make k8s-gate` (or `k8s-quick`, `k8s-mutants NAME=..`, `k8s-job TARGET=..`) runs the Make gate as a Job in the
-`fibber-ci` namespace of the local k3s; `K8S_ARCH=arm64` runs it on a native aarch64 Linux node. Topology, quotas, how to add a node: docs/design/build.md, section 7.
-
-**Building and testing on macOS (Apple Silicon).** The build is GNU Make 4 or later: macOS ships GNU Make 3.81 as `/usr/bin/make`, which the
-Makefile refuses with a message, so `brew install make` and run `gmake`. Also `brew install llvm@21` (keg-only; `llvm` alone is 22) and the
-Xcode command line tools. `gmake -j8 mac-check` is the gate for the Mac (mk/mac.mk): the full gate less the tools and stages that need Linux, each
-named with its reason in `compiler/tests/expected-macos.txt`, plus the machine checks of `scripts/mac-check.sh`; `MAC_QUICK=1` is the short set.
-The scripts assume GNU coreutils and bash 4; on a Mac `scripts/portable/` stands in (a `timeout`, `flock`, `nproc`, `sha256sum`, `sed -i` and `date +%N`
-that work there, and a `ulimit -v` that succeeds), which the Makefile puts on `PATH` itself and `. scripts/portable/env.sh` does for a script run by hand.
-`scripts/lint-portable.sh` fails the gate on any other Linux-only tool or bash 4 feature that is not marked `# linux-only: reason`.
-
-**Which CPU it needs.** `fibc` needs a 2013+ x86-64 CPU with AVX2 and FMA (x86-64-v3), or Apple
-Silicon/ARMv8, and on Linux glibc 2.33 or later. fibber supports only instruction sets with guaranteed tail calls and
-fused multiply-add (docs/adr/0008). On an older x86-64 CPU `fibc`, and every x86-64 program it
-builds, stops at start with `trap: this program needs x86-64-v3 (AVX2, FMA); this CPU lacks: ..`
-instead of crashing later with an illegal instruction.
-
-**Which CPU the code is for.** A release is built with `FIB_TARGET_CPU=x86-64-v3`
-(`scripts/package.sh` sets it unless it is already set), so that the `fibc`
-binary in the tarball runs on any x86-64 CPU with those instructions and not
-only on the one that built it. `FIB_TARGET_CPU` is read by lair (`compiler/llvm/target.fib`)
-whenever it generates code, so it also applies to the programs you compile: with the
-variable unset, empty or `host`, `fibc run` and `fibc build` on your machine generate code
-for **your host CPU** (its name and its features), and a program built that way may
-not run on an older CPU. To build a program that runs elsewhere, set it:
-
-```
-FIB_TARGET_CPU=x86-64-v3 fibc build hello.fib -o hello
-```
-
-Any other value is passed to LLVM as a CPU name with no extra features. A CPU below
-x86-64-v3 (`x86-64`, `x86-64-v2`) still builds, but it is outside the supported set: there
-`simd/fma` is a compile-time warning and a run-time trap (use `simd/muladd` for portable code).
-`fibc targets` lists the code generation targets and which are supported; riscv64 is parked
-(LLVM has no `tailcc` for RISC-V) and `fibc build --target` refuses it without `--allow-unsupported`.
-
-**Vector width (AVX-512).** `f64xn`, `:native` and `(native-lanes T)` stand for the width the CPU table prefers: 256 bits for every AVX2 CPU, 512 for
-`x86-64-v4`, Sapphire Rapids, Granite Rapids and Zen 4/5 (`compiler/types/targets.fib`; Skylake-X and the client AVX-512 cores stay at 256). The numeric library
-(`fib.tensor`) is written over that width: on a host with AVX-512, a program built for the host gets 512-bit kernels (1.6 to 1.7 times the matmul and dense-layer speed on
-Sapphire Rapids, 10 percent on Zen 4: docs/shootout/avx512-2026-10-06.md); a release binary built for `x86-64-v3` keeps the 256-bit ones. `FIB_VECTOR_BITS=128|256|512`
-overrides the width for one run (a width the CPU lacks is split into the registers it has: correct, slower). Design: docs/design/avx512.md.
-
-## Names that look alike
-
-A few names mean one thing unqualified and another under a module alias, and the rule is to **qualify, never rename** (spec/stdlib.md section 3, N15):
-
-| you want | write | not |
-|----------|-------|-----|
-| wait for a task | `(join t)` or `@t` | `(str/join ..)` |
-| join strings with a separator | `(str/join ", " xs)`, `(str/join xs)` | `(join ", " xs)`; the prelude's `str-join` takes a `(Vec str)` and no separator |
-| is x in this collection | `(includes? x coll)` (the element first, so `->>` threads the collection) | `(str/includes? ..)` |
-| does this string hold that text | `(str/includes? s sub)` (the string first, as Clojure's) | `(includes? ..)` |
-| where is it in a string | `(str/index-of s value)`, `(str/last-index-of s value)` (character offsets) | `(index-of ..)` |
-
-`(:require [fib.string :as str])` always; `(:use fib.string)` shadows the implicit `join` and `includes?` with the string ones. A `Range`, a `VSeq` or a `LSeq` is not a `Vec`, so `(if c (range n) [])` does not type-check: write `(if c (rangev n) [])` (also `mapcatv`, `sortv`, `sort-byv`), or `(vec (range n))`.
-
-A byte offset that splits a character traps (`str-slice [0, 2) splits a character`); ask first with `(str/char-boundary? s i)`, `(str/next-boundary s i)`, `(str/prev-boundary s i)`, or count in characters (`subs`, `str/index-of`).
-
-## Catching traps
-
-A trap (an index out of range, an integer overflow, `(trap msg)`, `unwrap` of `nil`) aborts the program unless a
-`try` of `fib.ex` is active on the thread; then it unwinds to that `try`, and every object the unwound frames owned
-is freed (the audit stays clean):
-
-```clojure
-(ns main (:use fib.core fib.ex))
-
-(defun main () -> i64
-  (try (nth [1 2 3] 10)
-       (catch e :when (= (ex-kind e) (some "index")) -1)
-       (finally (println "done"))))
-```
-
-`throw` throws an `(ex-info ..)`-shaped exception; with no `try` active it is the trap of its message. Out of memory,
-a stack overflow, a thread that cannot start and a trap inside a `finally` that runs while unwinding stay fatal. Only
-a program that catches pays for it: the others compile exactly as before (docs/adr/0009, docs/design/exceptions.md).
-
-## Projects and dependencies
-
-A project is a directory with a `deps.fib`; libraries come from git commits (or local directories). `fibc new`
-makes one:
-
-```
-fibc new hello                  # hello/deps.fib, src/hello/core.fib, src/main.fib, specs/hello-spec.fib
-cd hello
-fibc deps add acme/util --git https://github.com/acme/util.git --tag v1.2.0
-fibc run src/main.fib           # resolves, fetches, writes deps.lock; no -I needed
-fibc test                       # runs specs/*-spec.fib with the project's roots
-fibc deps tree
-```
-
-`deps.fib` is fibber data in the shape of Clojure's `deps.edn`:
-
-```clojure
-{:name "hello" :version "0.1.0"
- :paths ["src"]
- :deps {acme/util {:git/url "https://github.com/acme/util.git" :git/tag "v1.2.0"}
-        acme/json {:git/url "https://github.com/acme/json.git" :git/sha "<40-hex commit>"}
-        mine/x    {:local/root "../x"}}
- :aliases {:test {:extra-paths ["specs"]}}}
-```
-
-Every command that compiles (`run`, `build`, `test`, `emit`, `explain`) finds `deps.fib` in the working directory or
-above, resolves it against `deps.lock` (commit it: it pins every commit and its git tree id) and adds the project's
-`:paths` and each library's to the module roots. The same library wanted at two commits is an error naming who
-asked for what (choose with `:override`); a tag that moved since it was locked is refused until `fibc deps update
-NAME`; two libraries defining one module are refused. `--locked` refuses a stale lock, `--offline` never fetches,
-`--frozen` is both. Checkouts are cached read-only under `~/.cache/fibber/git` (`$FIBBER_HOME`) and verified on
-every build. **A dependency's macros run at compile time** (like Rust's proc-macros): depend only on code you
-trust. Resolution itself runs only `git`. Design and limits: docs/design/packages.md.
-
-## Deploying: static binaries, scratch images, Lambda
-
-`fibc build --static program.fib -o program` makes an executable with no dynamic loader and no shared library (musl, linked statically): it needs only the Linux kernel, so it runs in a `FROM scratch` Docker
-image and as an AWS Lambda custom-runtime `bootstrap`, whatever the host's libc. `--target aarch64-unknown-linux-gnu` (or `x86_64-...`) builds the other architecture from the same machine. A hello world is 77 KB; a program with JSON,
-tasks and an HTTP server, 469 KB, and its scratch image 469 kB.
-
-```
-fibc build --static examples/static-demo/demo.fib -o demo
-printf 'FROM scratch\nCOPY demo /demo\nENTRYPOINT ["/demo"]\n' > Dockerfile && docker build -t demo . && docker run demo batch /data.json
-```
-
-`--static` needs the musl pieces for the architecture (`libc.a`, `crt1.o`, ...): `scripts/build-musl.sh x86_64 DIR` builds them from a pinned musl source (needs gcc and make) and `FIB_MUSL_DIR=DIR` finds them; a release built with
-`WITH_MUSL=1 scripts/package.sh` ships them in `share/fibber/musl/`. An ordinary `fibc build` needs none of this. For aarch64 from an x86-64 machine you also need an aarch64 `ld` (`binutils-aarch64-linux-gnu`) or `ld.lld`.
-A module that needs a native library declares it (`(extern f ... :lib "NAME")`); `fibc build` links it only when the program reaches it, dynamically by default and bundled with `--static`, `--link curl=static` or `--link-mode static`,
-and a missing library is an error that names the module and the library. A scratch image has no CA certificates, no NSS and no time-zone data: see docs/design/static-linking.md (the measurements, what musl needed, the notes for TLS and DNS)
-and docs/design/platform-boundary.md (what the runtime assumes of the platform, and the tiers beyond: no libc, no operating system). `scripts/static-demo.sh` builds the demo into scratch images for both architectures and runs a Lambda
-`bootstrap` against a local fake of the Runtime API.
-
-## Editor
-
-`editors/vscode/` is a VS Code language pack for `.fib`: a TextMate grammar
-(highlighting of comments, strings, numbers, keywords, special forms, the
-library's macros, `x:` annotations, reader macros), language configuration
-(brackets, comments) and snippets. It has no build step; copy or symlink the
-directory to `~/.vscode/extensions/tailoredshapes.fibber-0.3.0` and reload the window.
-Versions 0.2.x also started `fibref lsp` for completion, hover and diagnostics; the Rust
-`fibref` is gone, so since 0.3.0 the pack is the grammar, configuration and snippets only
-(a language server, `fibc lsp`, is planned: docs/design/dev-loop.md). The release workflow also
-attaches the extension as `fibber-vscode-VERSION.vsix` to each release
-(`code --install-extension FILE.vsix`). Details: `editors/vscode/README.md`.
-
-## Status and development
-
-The active compiler is written in fibber: `compiler/fibc.fib` contains the
-front end and emitter, `compiler/lir/` checks lIR, and `compiler/native/`
-lowers it through the LLVM-C bindings in `compiler/llvm/`. The runtime
-remains lIR source (`rt/`). The Rust tools were retired on 2026-10-05: they are
-in git (tag `seed-1`), and docs/rust-legacy.md says how to build them again,
-what each gave and what was lost. New language work belongs in `compiler/`
-and `lib/`. The passes are checked against golden outputs recorded from the
-Rust oracles (`compiler/tests/golden/`).
-
-The current release and bootstrap seed are **0.1.5**, recorded in `VERSION`
-and `SEED`. The bootstrap check is a fixed point: stage 2 builds stage 3,
-and both emit byte-identical lIR for the compiler's source. Equality with
-an older seed's output is informational because the compiler and embedded
-prelude can change. See [the CI workflow](.github/workflows/ci.yml).
-
-Recent compiler and library changes include:
-
-- A work-stealing pool: `(fork-task f)` makes a pool task (`join` as any
-  task's), with a Chase-Lev deque per worker, help-while-waiting joins,
-  parking on an eventcount and workers started lazily on the first fork
-  (`FIB_THREADS`, else the affinity mask and the cgroup quota);
-  `fib.parallel` (`fork`, `pmap`, `pfor`, `preduce`, `pscan`) runs on it, so
-  nested parallel calls fork tasks, not threads; `spawn` stays the thread
-  tier and `async` the stackless one. A trap in a pool task is the task's
-  failure. See [the parallelism design](docs/design/parallelism.md), 3.1 and 8.
-- Scalar `Option` values stored inline as a tag and payload, including in
-  collection elements, closure captures and task frames. Options of ordinary
-  objects remain nullable pointers; nested options and other payloads retain
-  their boxed representation. See [the representation design](docs/design/unboxed-option.md).
-- Last-use moves, moves of fields out of dead owned objects, and reuse of
-  unique collection shells and arrays. Persistent updates preserve old
-  versions when another holder exists. See [the update rules](spec/stdlib.md#25-mutation-and-uniqueness).
-- Fusion of a sequence bound by `let` when it has one eligible consumer,
-  with tests for effect order and preservation of memoization when reused.
-- SIMD lane values, arithmetic, masks, reductions and target-dependent widths
-  through `fib.simd`, with native vector lowering. See [the SIMD measurements](docs/shootout/simd.md).
-- FastISel for `fibc run -O 0`, plus recorded development-loop timings.
-  The compiler server, incremental checking and session work are described in
-  [the development-loop design](docs/design/dev-loop.md); that design is not
-  a claim that every planned command exists.
-- Exclusive views: `with-view` lends a writable window over an `Array` that the
-  checker proves nothing else can reach, so a loop writes in place with no
-  copy and no per-element uniqueness test; `with-tiles` hands disjoint windows
-  to tasks. Windows run at about the speed of the array loop at `-O 2`.
-  See [the design](docs/design/exclusive-views.md).
-- aarch64: `--target TRIPLE` (or `FIB_TARGET_TRIPLE`) emits objects and
-  assembly for Linux, macOS and iOS triples. On an Apple M1 Ultra the cross-built
-  compiler runs, builds itself, and reaches the same fixed point as on x86;
-  `scripts/package.sh` builds a macOS tarball. No darwin-arm64 release has been
-  published, and iOS and aarch64 Linux have not been run. See
-  [the aarch64 design](docs/design/aarch64.md) and [the first numbers](docs/shootout/aarch64.md).
-- GraphQL lives in its own repository, lacewing: `ssh://git@localhost:2222/tailoredshapes/lacewing.git` (latest tag `v0.3.0`), pulled in with
-  `fibc deps add` (see Projects and dependencies). It is a GraphQL query engine in the shape of Clojure's Lacinia (compiled immutable schema, resolvers as plain
-  functions, ordered responses): typed schema construction, schema definition language (SDL) loading with resolvers attached by name, custom scalars, variables,
-  input objects, fragments, `@skip` and `@include`, whole-document validation before any resolver runs, and resolvers that see the selections beneath their field.
-  **Breaking since `v0.2.0`: `GqlField.resolver` is an `(Option GqlResolver)`** (SDL fields have none until one is attached). `v0.3.0` can resolve a query's fields in
-  parallel on native tasks (opt-in, `execute-with`), with the serial response. Not yet: mutations, subscriptions, introspection beyond `__typename`, enums,
-  interfaces, unions.
-- meshql in fibber: `meshql-fib` (`ssh://git@localhost:2222/tailoredshapes/meshql-fib.git`, `v0.2.0`) gives an entity a REST write surface and a GraphQL read surface
-  (on lacewing) from one declaration, with point-in-time reads and federation of graphlettes. It is the fourth implementation of the
-  [meshql](https://git.tildarc.com/tailoredshapes/meshql) contract and passes all five tiers (37 scenarios) against SQLite (`fib-db-sqlite`) and PostgreSQL
-  (`fib-db-postgres`); `meshql serve CONFIG` reads the HOCON configuration of the other implementations (`fib-hocon`).
-- HOCON configuration lives in its own repository, fib-hocon: `ssh://git@localhost:2222/tailoredshapes/fib-hocon.git` (tag `v0.1.0`), module
-  `hocon`. It has the parser, substitutions, includes, merging, durations and sizes, a `config->record` macro, and a differential harness
-  against Typesafe Config; its README has the features and the measurements.
-- Databases: `fib.db` (next.jdbc's shape: `execute!`, `with-transaction`, `with-connection`, `plan`), the driver contract
-  `fib.db.contract` and an in-memory fake driver `fib.db.memory` are in the library; drivers are libraries in their own repositories. The
-  SQLite driver is `fib-db-sqlite`: `ssh://git@localhost:2222/tailoredshapes/fib-db-sqlite.git`, module `sqlite`. The PostgreSQL driver is
-  `fib-db-postgres`: `ssh://git@localhost:2222/tailoredshapes/fib-db-postgres.git` (tag `v0.1.0`), module `postgres`: the wire protocol (version 3.0) written in
-  fibber over `fib.os.net`, with no libpq and no C library of its own; it passes `fib.db.contract` against PostgreSQL 14, 16 and 17 and opens a connection from
-  a libpq-shaped URL (`pg/open-url`). It cannot yet connect over TLS (`sslmode=require` is refused: `fib.tls`'s `Session` is not `Send`, so it cannot live in a
-  connection that moves between tasks; see [the Send-able TLS session design](docs/design/tls-send.md)). See [the contract](docs/design/db-contract.md).
-- Gherkin: `fib-gherkin` (`ssh://git@localhost:2222/tailoredshapes/fib-gherkin.git`, module `gherkin`) reads `.feature` files (Cucumber's
-  parser, all its languages, pickles, Cucumber Expressions) and runs them on `fib.test` with step definitions written in fibber, so
-  `fibc test` prints the scenarios under their Gherkin names and the `.feature` line that did not hold. It is a front end to the system in
-  [the test harness design](docs/design/test-harness.md); the design's "plain-text front end: rejected for now" (section 2.4) is this
-  library, built because a project asked for feature files.
-- GPU kernels (core, GPU-2): `(defkernel name (params) body)` is a core form (spec/syntax.md 3.22); its body is the kernel subset
-  (spec/types.md 2.17: scalars, pointers, scalar cells, arithmetic, loops, the `gpu/*` builtins: `gpu/global-id`, `gpu/barrier`,
-  `gpu/shared` block-shared memory), checked at the source (a string, an allocation, a closure, a Simd value, a task, recursion, dyn dispatch
-  are refused at their positions) and compiled for the host too (`fib.gpu/host-launch` runs a kernel over a grid on the CPU: `fibc run
-  examples/gpu/gpu.fib -I examples/gpu`). `fibc build --kernel-target nvptx64-nvidia-cuda` builds the executable with the kernels' PTX
-  embedded (`gpu/program-ptx`) and beside it as `OUT.ptx`, with the launch ABI (each kernel's signature in the PTX header); a program with a
-  kernel built for a platform with no kernel target is refused (no CPU fallback). The host side is the `fib.gpu.device` protocols
-  (`Platform Device Module Kernel Buffer Stream Event`), which a driver implements and a program uses without naming CUDA: `fib-gpu-cuda`
-  (`ssh://git@localhost:2222/tailoredshapes/fib-gpu-cuda.git`, tag `v0.1.0`) passes the device contract `fib.gpu.contract` (7 of 7
-  scenarios, 3 faults caught). Measured there: fibber's shared-memory GEMM at 17.1 TFLOPS at n = 4096 (47% of cuBLAS, the CUDA C kernel's
-  speed), bit for bit the CPU's; [the GPU design](docs/design/gpu.md) has the table and what phase 2 and 3 still owe.
-- GPU atomics and reductions (GPU-3): `gpu/atomic-*` builtins (one `atomicrmw`/`cmpxchg` each: PTX `atom.*`, WGSL `atomic<u32>` buffers), `fib.gpu.atomic`, block reductions over shared memory
-  (`fib.gpu.reduce`) and grid reductions (`fib.gpu.reduce-kernels`) whose integer results equal the CPU's and whose f32 per-block partials are the CPU's bit for bit, run on the
-  RTX 4080 SUPER through PTX and through WebGPU by `compiler/tests/native/gpu-device.sh` ([the GPU design](docs/design/gpu.md) section 12; pinned/async transfers are not done).
-- WebGPU (the second kernel backend, WEBGPU-1): `fibc build --target wgsl-unknown-webgpu --emit wgsl` prints the same kernels as WGSL
-  compute shaders ([the WebGPU design](docs/design/webgpu.md): the mapping of the kernel subset to WGSL, what is refused by name (i64, f64,
-  pointer arithmetic beyond an index, builtins WGSL lacks), the binding model, the trap flag). They run on the native host through
-  `fib-gpu-webgpu` (`ssh://git@localhost:2222/tailoredshapes/fib-gpu-webgpu.git`, tag `v0.0.1`, over wgpu-native) and from a fibber program
-  built for wasm32 through the JavaScript glue `examples/webgpu/js/fib-webgpu.mjs` over `navigator.gpu` (node with Dawn, Chromium). One
-  `defkernel`, five runs: `scripts/webgpu-agree.sh` compares the CPU, CUDA, wgpu-native, Dawn and Chromium results by hash (bit exact where
-  the host fuses `fma`; the register-tiled GEMM reaches 9.6 TFLOPS through WGSL on the same GPU where CUDA gives 10.9).
-
-The standard library in `lib/` follows Clojure's names and argument shapes,
-within fibber's static types and ownership model. Its specification and
-remaining work are in [spec/stdlib.md](spec/stdlib.md). The specifications,
-case headers and [ROADMAP.md](ROADMAP.md) contain both historical records
-and current rules; dated amendments identify changes.
-
-The explicit [`fib.tensor` numerical library](lib/fib/tensor/README.md) adds
-typed dense tensors, checked strided views, broadcasting, eager arithmetic,
-fused `axpby`, ordered and axis reductions, boolean masks, and matrix multiplication.
-Floating arithmetic uses native eight-lane `f32` and four-lane `f64` kernels;
-matrix multiplication uses register tiles and reusable packed panels. Explicit `sum-fast`/`dot-fast`
-permit reassociated reductions. After rebuilding stage 2, try
-`./F run examples/tensor.fib`; see the
-library README for API, safety contracts, and reproducible NumPy comparisons.
-Fused `t/dense` layers apply bias and an activation as each output tile is
-stored, and `t/softmax` and `t/layernorm` work row by row. On the recorded
-single-thread runs, matrix multiplication is within about 1.15x of NumPy with
-OpenBLAS, a float32 MLP forward pass is at parity with it, and softmax and
-layernorm are faster than NumPy; reductions along the last axis are still
-slower ([the comparison](docs/shootout/tensor.md)). This is a dense numerical
-foundation, not NumPy feature or performance parity.
-
-The explicit [`fib.logic` relational library](lib/fib/logic/README.md) adds
-finite typed terms, persistent unification with occurs checking, fair sequential
-search, and `fresh`/`conde` syntax. The same relation can infer missing values or
-enumerate answers; try `./F run examples/logic.fib`. Parallel search remains
-future work, with this engine serving as its tested reference.
-
-Its [`fib.logic.fd` extension](lib/fib/logic/README.md) adds compact and sparse
-finite integer domains, watched propagation for all-different and arithmetic
-constraints, batched model setup, and smallest-domain-first search. The port of [tsmarsh/sudoku](examples/sudoku/solver.fib)
-uses those constraints; build it with `./F build examples/sudoku.fib -I examples -I lib`.
-The [finite-domain design note](docs/design/finite-domains-and-sudoku.md) records
-the API, provenance, validation cases, and a comparison with the original
-Clojure/core.logic implementation.
-
-The [`fib.os` library](lib/fib/os/README.md) provides typed file and descriptor
-operations, directories, TCP sockets, polling, clocks, environment variables,
-process identity, executable discovery, system information, secure entropy, and
-bounded native memory streams. Shared errors and selected platform backends
-keep libc flags, layouts, and symbols out of application code. Linux is tested
-natively; the Darwin backend ran on Apple Silicon during the aarch64 work (see
-[its design](docs/design/aarch64.md)), but is not yet part of any automated
-gate. See the [OS design record](docs/design/os.md).
-
-The explicit [`fib.http` library](lib/fib/http/README.md) provides shared HTTP
-messages, a Ring-style HTTP/1.1 server (a task per connection, graceful stop,
-slowloris deadlines) and a Hato-style client (connection pool, redirects, typed
-errors, deadlines), both native over a `Transport` seam: no libcurl, no library
-to link, and they build `--static`. They include binary bodies, repeated
-headers, streaming bodies, chunked transfer in both directions, keep-alive and
-asynchronous requests. HTTPS is the next package: until a TLS transport is
-registered an `https` URL is a typed error, never a downgrade. Build the
-[server example](examples/http-server.fib) with `./F build examples/http-server.fib -I lib`
-and the [client example](examples/http-client.fib) the same way. See the library
-README for API contracts and [the design record](docs/design/http.md) for the architecture,
-limits and what is deferred.
-
-### Build and validate
-
-With a seed compiler on `PATH` and LLVM 21 development libraries installed:
+- `fibc-0.1.13-linux-x86_64.tar.gz`: glibc 2.33+, AVX2 and FMA (x86-64-v3).
+- `fibc-0.1.13-darwin-arm64.tar.gz`: Apple Silicon; published since 0.1.7.
 
 ```sh
-fibc build compiler/fibc.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o /tmp/fibc2
-/tmp/fibc2 build compiler/fibc.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o /tmp/fibc3
-/tmp/fibc2 emit -I compiler -I lib compiler/fibc.fib > /tmp/fibc2.lir
-/tmp/fibc3 emit -I compiler -I lib compiler/fibc.fib > /tmp/fibc3.lir
-cmp /tmp/fibc2.lir /tmp/fibc3.lir
+sha256sum -c --ignore-missing SHA256SUMS  # macOS: shasum -a 256 -c SHA256SUMS
+tar xzf fibc-0.1.13-linux-x86_64.tar.gz   # substitute darwin-arm64 on a Mac
+export PATH="$PWD/fibc-0.1.13-linux-x86_64/bin:$PATH"
+fibc --version
 ```
 
-`scripts/fetch-seed.sh /tmp/fibber-seed` fetches and verifies the seed named
-in `SEED`, and prints its compiler path. Release packaging links LLVM
-statically; the local build above links `libLLVM-21` dynamically.
+Keep `bin/` and `share/` together when relocating. Building programs needs `cc`
+(Xcode command-line tools on Mac). LLVM is bundled in release binaries.
+See [platform setup](docs/tutorial/01-install-and-hello.md#platform-setup-and-release-layout)
+for system dependencies, Mac quarantine handling and source builds.
+
+Save this as `hello.fib`:
+
+```fib run
+(defun main () -> i64 (do (println "hello from fibber") 0))
+```
+
+```text out
+hello from fibber
+0
+```
 
 ```sh
-FIBC=/tmp/fibc2 scripts/gate.sh --quick   # ownership, modules, stdlib sample
-FIBC=/tmp/fibc2 scripts/gate.sh --full    # fixed point and full case directories
-/tmp/fibc2 cases cases/stdlib --only 4010 4011 4015 -j 2
-/tmp/fibc2 run -O 0 program.fib          # fast development code generation
-/tmp/fibc2 build program.fib -o program  # optimized native executable
-/tmp/fibc2 explain program.fib          # ownership decisions
-/tmp/fibc2 emit program.fib             # generated lIR
+fibc run hello.fib
+fibc build hello.fib -o hello
+./hello
 ```
 
-The stage-2 case gate checks the non-passing set against
-[scripts/ci-stage2.expected](scripts/ci-stage2.expected), currently one
-known failure: the `def`-initialized atom case 1707. Cases marked `open`
-are counted separately; they are not passes. A changed non-passing set
-fails the gate, including a known failure that starts passing.
+`run` prints main's result; an executable uses it as its exit status.
 
-The [October 4 decisions](docs/design/decisions-2026-10-04.md) supersede the
-interpreter-oracle requirement: the interpreter is now a development
-and editor tool. The Rust interpreter is retired, and a port of its interpreter and
-memory audit to fibber is scheduled. The earlier interpreter/compiler
-comparison rules in [spec/method.md](spec/method.md) remain historical text
-pending consolidation; use the stage-2 gate for current compiler validation.
-There is no cargo anywhere in the build or the gate.
+## Working with Fibber
 
-## Performance
+- [Projects and dependencies](docs/guide/packages-and-dependencies.md),
+  [modules](docs/guide/modules-and-namespaces.md), [ownership](docs/guide/ownership-and-borrowing.md).
+- [Errors and traps](docs/guide/errors-traps-and-try.md),
+  [concurrency](docs/guide/concurrency-and-parallelism.md), [testing](docs/guide/testing.md).
+- [Tooling](docs/guide/tooling.md): `check`, `explain`, `serve`, `--server`, `repl`, `lsp`;
+  [VS Code setup](editors/vscode/README.md), [CLI reference](docs/reference/cli.md).
+- [Deployment](docs/guide/targets-and-deployment.md): static musl, C, wasm and cross targets;
+  [platform evidence](docs/policy/platform-support.md).
+- [Contributing](CONTRIBUTING.md): `make help`, `make quick`, `make gate`, `make doc-examples`.
 
-These are **recorded measurements**, not a fresh benchmark of the current
-checkout. The [quick baseline](scripts/bench/baseline.tsv), dated 2026-10-04,
-records a median of three runs on a 28-core host at tree stamp
-`97a9ee6a6019c82f`. Outputs are checked against recorded checksums.
+The self-hosting check is a fixed point: stage 2 builds stage 3 and both emit
+identical compiler lIR. Maintained stage-2 goldens, audited cases, behaviour specs
+and executable ADRs provide additional evidence ([method](spec/method.md)). Rust
+tools are retired at tag `seed-1` ([history](docs/rust-legacy.md)).
 
-| benchmark | seconds | workload |
-|---|---:|---|
-| num-f64 | 1.46 | scalar floating-point loop |
-| num-nbody | 0.59 | bodies stored in a vector, updated per step |
-| vec-conj-pop | 0.90 | repeated vector append and pop |
-| vec-index | 0.73 | repeated vector indexing |
-| vec-sort | 0.43 | sorting and sorting by a key |
-| map-assoc-get | 0.28 | map updates and lookups |
-| set-conj | 0.23 | set insertion and membership |
-| lazy-fused | 0.68 | directly consumed sequence pipeline |
-| lazy-bound | 0.03 | sequence pipeline bound through local variables |
-| strings | 0.65 | string construction, splitting, joining and search |
-
-The older PERF0 measurements and Rust comparisons are retained in
-[ROADMAP.md](ROADMAP.md#performance). They preceded the collection update
-work and should not be read as current ratios to Rust. The quick baseline
-is a regression reference, not evidence that all collections now match Rust.
-
-The [SIMD shootout](docs/shootout/simd.md) records separate scalar and SIMD
-fibber kernels alongside Java and C, with verified output and median-of-five
-measurements. On its AVX2 host, explicit SIMD reduced n-body from 5.98 to
-1.75 seconds, spectral-norm from 1.27 to 0.52, and mandelbrot from 10.82 to
-2.20. Algorithms and data layouts differ between some comparisons; the
-report explains those differences and the remaining gaps, including vector
-loads/stores, bounds-check overhead, FMA and boxed records.
-
-The [development-loop baseline](scripts/bench/dev-loop.tsv) records median
-startup-to-result times of 108 ms for an empty program, 139 ms for hello,
-and 332 ms for the medium program at `-O 0` (1,059 ms at `-O 2`). It uses
-a different recorded tree, `9deee19b87eb1f7a`.
-
-To measure your checkout without changing the recorded baselines:
-
-```sh
-FIBC=/tmp/fibc2 scripts/bench/quick.sh
-FIBC=/tmp/fibc2 scripts/bench/dev-loop.sh
-```
-
-The scripts serialize benchmark and gate runs through `/tmp/fibsuite.lock`.
-Use `--record` only when deliberately replacing a baseline.
+Fibber remains pre-1.0. The owner approves release promises alongside executable
+acceptance checks; [stability](docs/policy/stability.md) records the proposal.
+The [roadmap](ROADMAP.md), [changelog](CHANGELOG.md) and dated
+[performance records](docs/shootout/baseline-2026-10-04.md) retain development history.

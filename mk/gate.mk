@@ -7,9 +7,9 @@ GATE_MODE ?= full
 GATE_SPECS ?= 0
 GATE_STATIC ?= 0
 GATE_WASM ?= 0
-FULL_STAMPS := $(BUILD)/version.ok $(BUILD)/runtime-drift.ok $(BUILD)/fixed-point.ok $(GOLDEN_STAMPS) $(TOOLS_FULL_STAMPS) $(BUILD)/adr.ok $(CASES_DIR)/full.ok \
+FULL_STAMPS := $(BUILD)/version.ok $(BUILD)/runtime-drift.ok $(BUILD)/fixed-point.ok $(GOLDEN_STAMPS) $(TOOLS_FULL_STAMPS) $(BUILD)/adr.ok $(BUILD)/docs.ok $(CASES_DIR)/full.ok \
   $(BUILD)/static.ok $(BUILD)/wasm.ok $(if $(wildcard specs),$(BUILD)/specs.ok)
-QUICK_STAMPS := $(BUILD)/version.ok $(TOOLS_QUICK_STAMPS) $(CASES_DIR)/quick.ok $(if $(filter 1,$(GATE_STATIC)),$(BUILD)/static.ok) \
+QUICK_STAMPS := $(BUILD)/version.ok $(BUILD)/docs-quick.ok $(TOOLS_QUICK_STAMPS) $(CASES_DIR)/quick.ok $(if $(filter 1,$(GATE_STATIC)),$(BUILD)/static.ok) \
   $(if $(filter 1,$(GATE_WASM)),$(BUILD)/wasm.ok) $(if $(filter 1,$(GATE_SPECS)),$(if $(wildcard specs),$(BUILD)/specs.ok))
 GATE_STAMPS := $(if $(filter quick,$(GATE_MODE)),$(QUICK_STAMPS),$(FULL_STAMPS))
 

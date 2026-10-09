@@ -25,7 +25,7 @@ to write down, not an edit).
 
 ## Consequences
 
-- A builtin added to the table without a spec row and a case fails `fibc adr` at once. The row and the case may be as small as
+- A builtin added to the table without a spec row and a case fails `make adr` at once. The row and the case may be as small as
   the signature and one call, but they exist.
 - The `sys-*` builtins are reached through `fib.os` and covered by the cases of that library, not by a case that names them: they are
   in the list of exceptions for that reason, not because they are untested.

@@ -1,5 +1,9 @@
 # Catching traps: exceptions for fibber
 
+Current status: task trap isolation and `fib.ex` catching are recorded as built in sections 8–9 and ADR 0009. Sections 0–7 are the original EXC0 design and measurements.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
+
 Status: design (EXC0, 2026-10-05). Nothing in `compiler/`, `lib/`, `rt/` or `spec/` is changed; the only code is prototypes under
 `docs/design/exceptions/proto/` and every number below was run in this session on this machine (x86-64 Linux, 28 cores, shared with other
 agents, so timings carry noise; the command that produced each number is quoted). Nothing here is **Decided** by the owner except what

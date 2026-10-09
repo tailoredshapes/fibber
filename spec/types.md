@@ -1,5 +1,12 @@
 # fibber types and the ownership checker
 
+> Source references: `crates/` and Rust `fibref`/`fibgen` paths in dated
+> sections refer to git tag `seed-1`, not files in this checkout. See
+> [the legacy source map](../docs/history/source-map.md) for retrieval and
+> current compiler counterparts. These historical citations do not reinstate
+> an interpreter oracle; [method.md](method.md) defines current validation.
+
+
 Status: signed off. This file grew out of the three drafts under
 `spec/drafts/` (see `spec/drafts/SYNTHESIS.md`); on 2026-09-27 the owner
 accepted every open decision of the three review rounds as recommended,

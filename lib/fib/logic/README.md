@@ -3,7 +3,7 @@
 A sequential miniKanren-style library with typed finite terms, persistent
 unification, occurs checking, canonical reification, and fair FIFO search.
 
-```clojure
+```fib run
 (ns main (:require [fib.logic :as l]) (:use fib.logic))
 
 (defun main () -> i64

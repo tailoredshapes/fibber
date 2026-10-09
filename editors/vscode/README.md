@@ -1,10 +1,10 @@
 # fibber for VS Code
 
 Syntax highlighting, bracket and comment handling, and snippets for fibber (`.fib`).
-Plain TextMate grammar: no build step.
+The grammar has no build step; the language client needs `npm install` (below).
 
 Install without publishing: copy or symlink this directory to
-`~/.vscode/extensions/tailoredshapes.fibber-0.1.0` and reload the window.
+`~/.vscode/extensions/tailoredshapes.fibber-0.2.0` and reload the window.
 
 Highlighted: `;` and `#_` comments, strings with escapes, characters, integers (widths, `0x`, `0b`, `_`),
 floats, ratios, keywords, `true false nil`, definition names, special forms, the library's macros,
@@ -12,8 +12,8 @@ floats, ratios, keywords, `true false nil`, definition names, special forms, the
 
 ## Language server (completion, hover, diagnostics, go to definition, document symbols)
 
-The extension starts the language server of the compiler, `fibc lsp` (the same server is `fibref lsp`; one
-function, `lsp-main` of `compiler/lsp/server.fib`), through `vscode-languageclient`. The protocol is plain LSP
+The extension starts the language server of the compiler, `fibc lsp` (`lsp-main` of `compiler/lsp/server.fib`;
+the Rust `fibref lsp` predecessor is retired), through `vscode-languageclient`. The protocol is plain LSP
 over standard input and output with Content-Length framing, full-text sync and no custom messages. There is
 no bundler: `extension.js` is plain JS and the one npm dependency is the client library.
 

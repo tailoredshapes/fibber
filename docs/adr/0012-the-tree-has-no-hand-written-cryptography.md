@@ -28,7 +28,7 @@ was prose (a memory note and a design paragraph); nothing stopped a module from 
 
 ## Consequences
 
-- A person adding a hash to `lib/` is stopped by `fibc adr` if the code carries the standard constants. Code that computes a hash without
+- A person adding a hash to `lib/` is stopped by `make adr` if the code carries the standard constants. Code that computes a hash without
   them (a table-free SHA, a rewritten constant) is not stopped: the rule is a heuristic, and review stays the rule.
 - The non-cryptographic hashes of the library (map hashing, `fib.rng`) do not use these constants and are not touched.
 - A driver repository runs the contract against its own provider; that run is not part of this repository's gate (there is no C library

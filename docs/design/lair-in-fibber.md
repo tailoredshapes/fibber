@@ -1,5 +1,9 @@
 # lair in fibber
 
+Current status: native lowering is now in `compiler/native/`, with lIR checking in `compiler/lir/` and LLVM bindings in `compiler/llvm/`. The phase-0 proposal below records the migration rationale.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
+
 Status: design, written for phase 0 package 0B of the lair-in-fibber project (2026-10-04). Nothing here is code. A figure
 marked **measured** was produced in this session and its command is quoted; a figure marked **estimate** is arithmetic on
 measured figures or on ROADMAP numbers, and is a claim to be proved by the gates in section 3. Rust line counts are from

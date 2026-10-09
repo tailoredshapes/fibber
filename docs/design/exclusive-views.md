@@ -1,5 +1,9 @@
 # Exclusive views: a scoped exclusive borrow for writable windows
 
+Current status: the library macros and checker markers are specified in syntax §3.21 and types §6.15; see `lib/fib/view.fib`, tiles and ADR 0022. The original proposal below is historical; its draft core-form choice was superseded by macros.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
+
 Status: **design proposal, nothing implemented** (package D2 of SIMD wave 2; owner decision 3 of 2026-10-04: "writable views of a
 unique tensor are worth designing: a scoped exclusive borrow as a language feature"). No compiler, library or live-spec file
 changed. The spec rows are drafts under `docs/design/exclusive-views/` (`syntax-draft.md`, `types-draft.md`) and become spec only
@@ -422,7 +426,7 @@ the rule "a window is borrowed, never moved".
 
 The claims of section 8 and ADR 0007 (`docs/adr/0007-windows-run-within-1-3x-of-the-array-loop.md`) are checked against the numbers recorded
 here: one line per measurement, **newest last** (the last line of a key is the record that counts; the earlier ones are history). A line is
-`<!-- measure KEY VALUE UNIT DATE | cmd: COMMAND -->`; `fibc adr` reads them, and `adr --rerun` runs the command and compares the fresh value
+`<!-- measure KEY VALUE UNIT DATE | cmd: COMMAND -->`; the standalone ADR runner reads them, and `adr --rerun` runs the command and compares the fresh value
 (the command prints `measure KEY VALUE`). Ratios are window time over array time (or over the SIMD kernel), medians of the runs of
 `scripts/bench/windows.sh` on the 28-core machine, cache-resident kernels of 1,000 elements.
 

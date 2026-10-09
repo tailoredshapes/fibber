@@ -1,5 +1,9 @@
 # A behaviour-spec harness for fibber: `fib.test` and `fibc test`
 
+Current status: `fibc test` is the current behaviour-spec runner; `make specs` is in the full gate. The prototype measurements and staged recommendations below are historical, not the current gate definition.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
+
 Status: design with a working prototype, 2026-10-05. **Measured** means a command was run in this session and its output is quoted
 (section 8). **Prototype** means it exists in `lib/fib/test/` and `compiler/tests/harness-proto/` and `harness-proto/run.sh` passes.
 Anything else is design and is marked "not built". The prototype was built and run with the tree's stage 2 (`F`) from

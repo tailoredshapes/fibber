@@ -1,5 +1,12 @@
 # The standard library (M7)
 
+> Source references: `crates/` and Rust `fibref`/`fibgen` paths in dated
+> sections refer to git tag `seed-1`, not files in this checkout. See
+> [the legacy source map](../docs/history/source-map.md) for retrieval and
+> current compiler counterparts. These historical citations do not reinstate
+> an interpreter oracle; [method.md](method.md) defines current validation.
+
+
 Status: **Proposed; frozen for implementation after the third revision (2026-10-01)**: a change after this point goes through §9 and
 the owner, not through another revision of the page. The owner asked on 2026-10-01 for a library that "steals Clojure's, or as
 close to it", is as ergonomic as Clojure and has the run-time performance of Rust, said that no
@@ -1296,6 +1303,12 @@ leak-cycles=4` (A11 t55, a leak and not a safety failure); the cure is one share
 | N16 | **A function that must hand back a seq of a known length returns the Vec form under a `v` name** (package LIB-2): `(if c (range n) [])` does not type-check because a `Range` is not a `Vec` (§5 T8, S5), and a `seq-of` for it is a detour: `rangev`, `mapcatv`, `sortv`, `sort-byv` answer a `Vec`, as `mapv` and `filterv` do; `(vec (range n))` is the same value written long. | `(if c (rangev 3) [])` |
 
 ## 4. The function table
+
+This is the library **plan**, including names not yet bound. It is not an
+export reference. [ADR 0023's exceptions](../docs/adr/0023-unbound-rows.tsv)
+identify unbound rows and their reasons; the generated
+[library index](../docs/reference/library/INDEX.md) follows current facade
+exports and links their definitions. A planned signature is not a shipped API.
 
 Every name of the survey has one row: 673 names of `clojure.core` 1.12, `clojure.set`,
 `clojure.string`, `clojure.walk`, `clojure.data` and `clojure.math`, grouped by the module that holds

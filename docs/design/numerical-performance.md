@@ -1,5 +1,9 @@
 # Numerical kernel performance
 
+Current status: historical October 4 implementation and measurement record. The current API is in [fib.tensor](../../lib/fib/tensor/README.md); rerun the recorded commands for current performance.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
+
 Measured and implemented 2026-10-04. The public API remains eager and typed;
 ordered reductions keep their existing evaluation order.
 

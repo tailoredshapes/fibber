@@ -6,17 +6,16 @@ rests on anyone's word, including the author's.
 
 ## Rules
 
-1. **The spec is executable.** Every rule in the prose spec is also
-   implemented in a small reference interpreter that follows the rules
-   literally and optimises nothing. Where the prose and the interpreter
-   disagree, that is a bug in one of them, found and fixed before
-   anything else.
+1. **The spec has executable acceptance evidence.** Decided prose rules are
+   pinned by case verdicts, behaviour specs and architectural checks. Prose and
+   code disagreements are bugs to report and resolve explicitly. The original
+   independent Rust interpreter is retired at tag `seed-1`; it is not required
+   as an oracle by the current method (rule 6).
 
-2. **The interpreter audits memory.** Every heap allocation, retain,
-   release, free and access goes through an instrumented heap. A run
-   fails on use-after-free, double free, a count going negative, or any
-   allocation still live at exit that is not on a documented leak path
-   (see [ownership.md](ownership.md), cycles).
+2. **Compiled cases audit memory.** The runtime trace/audit checks allocations,
+   retains, releases and accesses. An accepted case must satisfy its stated audit
+   and allocation bound. The future interpreter/heap-audit port is additional
+   development evidence; contract stubs do not supply that evidence today.
 
 3. **Cases come before rules.** Each case in `cases/` states its
    expected verdict in its header before the rules that decide it are
@@ -76,9 +75,11 @@ rests on anyone's word, including the author's.
    accepted yet corrupt memory, or be rejected yet be safe. Each one it
    finds becomes a case.
 
-5. **Generated programs.** A generator produces random well-typed
-   programs. Every one the checker accepts must pass the memory audit.
-   Failures are minimised and added as cases.
+5. **Generated programs (port planned).** Random well-typed programs
+   accepted by the checker must pass the memory audit; failures are minimised
+   and added as cases. The Rust generator is retired and `compiler/gen/`
+   contains port contracts, so its skeleton check does not supply random
+   program coverage today. Restoring that coverage remains scheduled work.
 
 6. **The compiler is checked by executable evidence.** (Amended
    2026-10-06, the owner's decision of 2026-10-04: the comparison with a
@@ -87,7 +88,7 @@ rests on anyone's word, including the author's.
    through lIR to native code with its verdict and memory audit checked;
    the compiler compiles itself to a fixed point; the golden outputs under
    `compiler/tests/golden/` pin each pass; the behaviour specs
-   (`fibc test`) and the architecture decision records (`fibc adr`,
+   (`fibc test`) and the architecture decision records (`make adr`,
    docs/adr/) pin the rest. A feature is done when `scripts/gate.sh --full`
    passes, not before. An interpreter, when it returns (docs/design/fibref-port.md),
    is a development tool and an additional audit, not the judge.
@@ -100,5 +101,5 @@ rests on anyone's word, including the author's.
 
 Decisions are recorded in the spec chapter they affect, each marked
 **Decided** (with the owner's sign-off) or **Proposed**. A proposed
-decision can be implemented in the interpreter to test it, but nothing
+decision can be prototyped with executable cases to test it, but nothing
 downstream depends on it until it is decided.

@@ -1,5 +1,9 @@
 # A Lispy numerical library for Fibber
 
+Current status: the dense core and SIMD kernels are described by the [tensor API](../../lib/fib/tensor/README.md). The October 4 implementation brief below also contains future proposals.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
+
 Date: 2026-10-04. Status: proposal and implementation brief. The checked dense
 core and native SIMD kernels now exist in [fib.tensor](../../lib/fib/tensor/README.md);
 that README

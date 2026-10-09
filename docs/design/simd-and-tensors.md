@@ -1,5 +1,9 @@
 # SIMD vectors and `fib.tensor`
 
+Current status: historical proposal and decisions; the present API is documented in [fib.tensor](../../lib/fib/tensor/README.md) and `lib/fib/simd.fib`. Statements below about nothing being implemented refer to October 4.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
+
 Status: design, **revised 2026-10-04 with the owner's six decisions** (the box below; each is applied in the section it
 concerns, and section 7 is closed). Nothing here is implemented; no `.rs` or `.fib` source changed. Every statement about the existing
 compiler cites the file it was read in. Every number marked *measured* was produced in this session on the dev machine

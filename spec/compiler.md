@@ -1,5 +1,12 @@
 # fibc: the compiler
 
+> Source references: `crates/` and Rust `fibref`/`fibgen` paths in dated
+> sections refer to git tag `seed-1`, not files in this checkout. See
+> [the legacy source map](../docs/history/source-map.md) for retrieval and
+> current compiler counterparts. These historical citations do not reinstate
+> an interpreter oracle; [method.md](method.md) defines current validation.
+
+
 **Decided** (owner, 2026-09-30; proposed 2026-09-28, M4). What this page fixes is everything the
 compiler needs that types.md §8 does not already fix: the command
 line, how a program is assembled into lIR modules, the runtime

@@ -14,9 +14,9 @@ MAC_SKIP_GOLDEN := $(shell awk '$$1 == "golden" { print $$2 }' $(MAC_EXPECTED) 2
 MAC_GOLDEN_STAMPS := $(filter-out $(addsuffix .ok,$(addprefix $(GOLDEN_DIR)/,$(MAC_SKIP_GOLDEN))),$(GOLDEN_STAMPS))
 MAC_TOOLS := $(filter-out $(MAC_SKIP_TOOLS),$(TOOLS_FULL))
 MAC_TOOL_STAMPS := $(addsuffix .ok,$(addprefix $(TOOLS_DIR)/,$(MAC_TOOLS)))
-MAC_FULL_STAMPS := $(BUILD)/version.ok $(BUILD)/runtime-drift.ok $(BUILD)/fixed-point.ok $(MAC_GOLDEN_STAMPS) $(MAC_TOOL_STAMPS) $(BUILD)/adr.ok $(CASES_DIR)/full.ok \
+MAC_FULL_STAMPS := $(BUILD)/version.ok $(BUILD)/runtime-drift.ok $(BUILD)/fixed-point.ok $(MAC_GOLDEN_STAMPS) $(MAC_TOOL_STAMPS) $(BUILD)/adr.ok $(BUILD)/docs.ok $(CASES_DIR)/full.ok \
   $(if $(wildcard specs),$(BUILD)/specs.ok) $(filter-out $(MAC_SKIP_STAGES:%=$(BUILD)/%.ok),$(BUILD)/static.ok $(BUILD)/wasm.ok)
-MAC_QUICK_STAMPS := $(BUILD)/version.ok $(TOOLS_QUICK_STAMPS) $(CASES_DIR)/quick.ok
+MAC_QUICK_STAMPS := $(BUILD)/version.ok $(BUILD)/docs-quick.ok $(TOOLS_QUICK_STAMPS) $(CASES_DIR)/quick.ok
 MAC_STAMPS := $(if $(MAC_QUICK),$(MAC_QUICK_STAMPS),$(MAC_FULL_STAMPS)) $(BUILD)/mac-machine.ok
 
 $(BUILD)/mac-machine.ok: $(F) scripts/mac-check.sh scripts/portable/env.sh compiler/tests/native/a64-o0.sh | $(BUILD)/

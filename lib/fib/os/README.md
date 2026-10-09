@@ -26,11 +26,11 @@ File flags are represented by `FileOptions`, with `FileAccess` variants
 no creation, truncation, or append. Opening uses close-on-exec. `create-new`
 provides exclusive creation; permissions remain subject to the process umask.
 
-```clojure
+```fib run
 (ns main (:require [fib.os :as os]))
 
 (defun main () -> i64
-  (match (os/open-file "/tmp/example.dat"
+  (match (os/open-file "example.dat"
     (with (os/default-file-options)
       (access os/WriteOnly) (create-new true) (mode 384)))
     ((Err error) (do (eprintln (. error message)) 1))

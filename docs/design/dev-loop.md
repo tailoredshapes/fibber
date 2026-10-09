@@ -13,6 +13,11 @@ means derived from measured numbers by the stated arithmetic. Sections 0 to 7: n
 Contents: 0 the short answer; 1 method; 2 measurements; 3 the four options; 4 errors, tests, editor, notebooks; 5 recommendation and
 package plan; 6 decisions for the owner; 7 what was not measured; 8 the compile server; 9 the REPL; 10 tests and planted faults; 11 what remains.
 
+## Original plan (sections 0–7; historical)
+
+Unmarked code fences are sketches or dated transcripts; use the current
+[tooling guide](../guide/tooling.md) for commands.
+
 ## 0. The short answer
 
 1. The cost of a run is not the JIT. For a 2-line program, 100 of 152 ms is the front end, most of it the library; for a 176-line
@@ -391,6 +396,8 @@ under a second for a leaf change). For a human in an editor: DV2, DV8. For scien
 - Only one machine, shared with other jobs, 7 runs per number, 10% noise. The `p200` figures between batches (447, 501) show it.
 - The Rust interpreter could not run the library-heavy programs (older library), so its compute comparison is on `pold` only.
 
+
+## Implementation record (sections 8–11)
 
 ## 8. The compile server, as built (DV2 with the engine of DV3; 2026-10-07)
 

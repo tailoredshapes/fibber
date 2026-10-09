@@ -1,5 +1,9 @@
 # Parallelism for fibber: a work-stealing scheduler, structured scopes, parallel tensors, cheap shared counts
 
+Current status: pool scheduling and structured scopes are recorded as built in sections 7–8 and SCHED-2; cancellation remains proposed. Sections 0–6 are the original measured design.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
+
 Status: **design with measured prototypes; nothing here is implemented in the compiler, runtime, library or spec.** Every number was produced in
 this session on the toolchain of `main` at 455a85e (stage 2 built from that tree, tree stamp `3c81037761caea7c`), with the commands quoted. The
 prototypes are in `docs/design/parallelism/proto/` (fibber programs `p1`..`p7`, C `sched.c` and `rc.c`, lIR `cl.lir`, the scripts that ran them);

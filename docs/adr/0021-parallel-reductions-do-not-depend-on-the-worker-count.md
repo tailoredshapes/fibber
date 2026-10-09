@@ -24,7 +24,7 @@ tree depends on the number of workers, and the sequential path runs the same tre
 
 ## Consequences
 
-- A change to the default grain that reads the machine fails `fibc adr` before it reaches a case.
+- A change to the default grain that reads the machine fails `make adr` before it reaches a case.
 - Choosing speed over bits is explicit: `(with (par) (fast true))`, a `Par` with `fast` true.
 - `pmap` (an order-preserving map) is not a reduction and may chunk by the worker count; only the combine of a reduction must not.
 

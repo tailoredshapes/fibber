@@ -1,5 +1,9 @@
 # Automatic differentiation for fibber: a tape on `fib.tensor`, and the road to a compiler pass
 
+Current status: the tape, differentiable operations, neural-network operations and optimizers are in `lib/fib/autodiff/`, exercised by `specs/ad-core-spec.fib` and `ad-ops-spec.fib`. Compiler differentiation remains a proposal; the dated prototype measurements below are retained.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
+
 Status: **design with a working prototype**, 2026-10-06. **Measured** means a command was run in this session and its output is quoted
 (sections 2, 6, 7; the benchmark is `docs/shootout/autodiff.md`). **Built** means it is in `lib/fib/autodiff/` and a spec in `specs/` exercises it.
 Everything else is design and is marked "not built". The toolchain is `main` at a6d06ac plus this branch, stage 2 built by the v0.1.7 seed

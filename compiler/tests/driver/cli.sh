@@ -26,7 +26,7 @@ $s2 --version x > /dev/null 2>&1; ck "--version with a word after it: exit 2" $?
 $s2 > /dev/null 2>&1; ck "no command: exit 2" $? 2
 $s2 bogus > /dev/null 2>&1; ck "an unknown command: exit 2" $? 2
 ck "cases of a missing directory: exit 2" "$($s2 cases "$t/nodir" 2>&1; echo $?)" "$(printf 'fibc: cannot read cases in %s/nodir: No such file or directory (os error 2)\n2' "$t")"
-ck "gen is the Rust compiler's" "$($s2 gen 2>&1; echo $?)" "$(printf 'fibc: `gen` is a command of the Rust compiler (the test harness)\n2')"
+ck "gen is retired, with a clear refusal" "$($s2 gen 2>&1; echo $?)" "$(printf 'fibc: `gen` is retired; no port is available (docs/rust-legacy.md)\n2')"
 $s2 -I x help > /dev/null 2>&1; ck "-I with a command that reads no program: exit 2" $? 2
 ck "an unreadable file: the operating system's words, exit 2" "$($s2 emit "$t/nonexist.fib" 2>&1; echo $?)" "$(printf 'fibc: cannot read %s/nonexist.fib: No such file or directory (os error 2)\n2' "$t")"
 ck "a directory is not a program" "$($s2 emit "$t" 2>&1; echo $?)" "$(printf 'fibc: cannot read %s: Is a directory (os error 21)\n2' "$t")"

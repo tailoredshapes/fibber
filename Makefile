@@ -13,6 +13,7 @@ include $(MK)/golden.mk
 include $(MK)/cases.mk
 include $(MK)/tools.mk
 include $(MK)/checks.mk
+include $(MK)/docs.mk
 include $(MK)/gate.mk
 include $(MK)/release.mk
 include $(MK)/mac.mk

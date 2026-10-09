@@ -1,5 +1,12 @@
 # fibber syntax
 
+> Source references: `crates/` and Rust `fibref`/`fibgen` paths in dated
+> sections refer to git tag `seed-1`, not files in this checkout. See
+> [the legacy source map](../docs/history/source-map.md) for retrieval and
+> current compiler counterparts. These historical citations do not reinstate
+> an interpreter oracle; [method.md](method.md) defines current validation.
+
+
 Status: signed off. This file grew out of the three drafts under
 `spec/drafts/` (see `spec/drafts/SYNTHESIS.md`); on 2026-09-27 the owner
 accepted every open decision of the three review rounds as recommended,
@@ -1831,7 +1838,7 @@ evaluated left to right as in any call (§2), except that the name of an
 of `set!` (§3.11, §3.13). `array-set!` and `set-field!` are not values
 (types §2.13).
 
-### 4.4 Prelude macros (normative list for the reference implementation)
+### 4.4 Prelude macros (normative list for the expander)
 
 | Macro | Expands to |
 |---|---|
@@ -2106,7 +2113,7 @@ rule that produces the verdict. Library names used are listed in §4.5.
 
 ### 01-return-part-of-argument.fib
 
-```lisp
+```fib case
 ;; spec:   §4
 ;; expect: accept
 ;; result: 1
@@ -2132,7 +2139,7 @@ list owns, which the callee retains on return.
 
 ### 02-structural-sharing.fib
 
-```lisp
+```fib case
 ;; spec:   §5
 ;; expect: accept
 ;; result: 7
@@ -2152,7 +2159,7 @@ Unchanged.
 
 ### 03-store-borrowed-value.fib
 
-```lisp
+```fib case
 ;; spec:   §3.2
 ;; expect: accept
 ;; result: 5
@@ -2172,7 +2179,7 @@ Unchanged. `length` is the prelude string length.
 
 ### 04-branch-dependent-owner.fib
 
-```lisp
+```fib case
 ;; spec:   §4
 ;; expect: accept
 ;; result: 5
@@ -2191,7 +2198,7 @@ Unchanged.
 
 ### 05-closures-share-state.fib
 
-```lisp
+```fib case
 ;; spec:   §6
 ;; expect: accept
 ;; result: 2
@@ -2217,7 +2224,7 @@ closures sharing it.
 
 ### 06-capture-borrowed-param.fib
 
-```lisp
+```fib case
 ;; spec:   §3.3
 ;; expect: accept
 ;; result: 1
@@ -2234,7 +2241,7 @@ Unchanged.
 
 ### 07-recursive-accumulator.fib
 
-```lisp
+```fib case
 ;; spec:   §4, §5
 ;; expect: accept
 ;; result: 100000
@@ -2255,7 +2262,7 @@ next exists.
 
 ### 08-mutate-while-iterating.fib
 
-```lisp
+```fib case
 ;; spec:   §5
 ;; expect: accept
 ;; result: 6
@@ -2285,7 +2292,7 @@ in-place push.
 
 ### 09-iterator-outlives-source.fib
 
-```lisp
+```fib case
 ;; spec:   §3.1
 ;; expect: accept
 ;; result: 2
@@ -2304,7 +2311,7 @@ into the recipe it returns; that store is the escape that retains it.
 
 ### 10-atom-old-value.fib
 
-```lisp
+```fib case
 ;; spec:   §7
 ;; expect: accept
 ;; result: 1000
@@ -2324,7 +2331,7 @@ takes a `Vec`, so the case writes `(vec (range 1000))`. The result of `pmap` is 
 
 ### 11-borrow-across-await.fib
 
-```lisp
+```fib case
 ;; spec:   §8
 ;; expect: accept
 ;; result: 5
@@ -2344,7 +2351,7 @@ that uses `s` only before the `await` is in
 
 ### 12-reject-same-binding-twice-inout.fib
 
-```lisp
+```fib case
 ;; spec:   §5 (proposed)
 ;; expect: reject
 ;; error:  passed to more than one & parameter
@@ -2359,7 +2366,7 @@ Unchanged.
 
 ### 13-reject-cell-crosses-thread.fib
 
-```lisp
+```fib case
 ;; spec:   §7
 ;; expect: reject
 ;; error:  cell cannot be shared between threads
@@ -2372,7 +2379,7 @@ The argument of `pmap` changed with the flip, as in 10.
 
 ### 14-reject-inout-in-async.fib
 
-```lisp
+```fib case
 ;; spec:   §8
 ;; expect: reject
 ;; error:  & parameter in async function
@@ -2391,7 +2398,7 @@ async (proposed case 38).
 
 ### 15-cycle-through-cell-leaks.fib
 
-```lisp
+```fib case
 ;; spec:   §6 (proposed)
 ;; expect: accept
 ;; result: 1
@@ -2415,7 +2422,7 @@ exercise their rule).
 
 ### 16-coordinated-update-single-atom.fib
 
-```lisp
+```fib case
 ;; spec:   §7
 ;; expect: accept
 ;; result: 200
@@ -2441,7 +2448,7 @@ result is released at the step's end.
 
 ### 17-inout-and-borrow-same-call.fib
 
-```lisp
+```fib case
 ;; spec:   §5
 ;; expect: accept
 ;; result: 4
@@ -2460,7 +2467,7 @@ Unchanged.
 
 ### 18-reject-inout-captured-by-escaping-closure.fib
 
-```lisp
+```fib case
 ;; spec:   §5
 ;; expect: reject
 ;; error:  & parameter captured by escaping closure
@@ -2476,7 +2483,7 @@ Unchanged.
 
 ### 19-weak-parent-pointer.fib
 
-```lisp
+```fib case
 ;; spec:   §6
 ;; expect: accept
 ;; result: 2
@@ -2513,7 +2520,7 @@ Node)`.
 
 ### 20-weak-ref-to-dead-object.fib
 
-```lisp
+```fib case
 ;; spec:   §6
 ;; expect: accept
 ;; result: 1

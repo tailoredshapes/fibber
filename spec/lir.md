@@ -1,5 +1,12 @@
 # lIR
 
+> Source references: `crates/` and Rust `fibref`/`fibgen` paths in dated
+> sections refer to git tag `seed-1`, not files in this checkout. See
+> [the legacy source map](../docs/history/source-map.md) for retrieval and
+> current compiler counterparts. These historical citations do not reinstate
+> an interpreter oracle; [method.md](method.md) defines current validation.
+
+
 **Status: Decided** (owner, 2026-09-28; M3). The owner decided the seven
 open questions of the first M3 pass on 2026-09-28 (§14, items 1 to 7)
 and, the same day, the four additions of the second M3 pass — array

@@ -1,5 +1,9 @@
 # lair in fibber: the shared interfaces (package S1)
 
+Current status: historical migration contract. Current signatures are in `compiler/lir/` and `compiler/native/`; the initial stub descriptions below describe wave 1, not today.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
+
 Status: wave 1, package S1 (2026-10-04). This is the contract of the parallel packages R, K1, K2, L1, L2, C, J, A, H and F of
 section 3.2 of `lair-in-fibber.md`. **The source of truth is the code**: `compiler/lir/` and `compiler/native/` hold every
 signature, as a real definition (`lir.diag`, `lir.types`, `lir.lit`, `lir.ast`, and the records below) or as a stub whose

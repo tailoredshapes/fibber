@@ -25,7 +25,7 @@ version and whose file another, or whose checksum is not a checksum, fails at th
 
 ## Consequences
 
-- A `VERSION` bump that forgets `version.fib`, or the reverse, fails `fibc adr` in the full gate, not at the tag.
+- A `VERSION` bump that forgets `version.fib`, or the reverse, fails `make adr` in the full gate, not at the tag.
 - A new platform's seed is added as a url and a checksum together, in the form above.
 - `SEED` names a release that exists *when its sha256 matches the download*: `scripts/fetch-seed.sh` checks that and the gate's build uses it.
   Whether a url is *published* is not checked offline (see below).

@@ -1,4 +1,8 @@
-# Executable architecture decision records: `fibc adr`
+# Executable architecture decision records: standalone `make adr`
+
+Current status: `make adr` builds and runs the standalone `build/adr --strict`, in the full gate. `fibc adr` is still a proposed driver command. Original prototype plans below are dated history.
+
+Original record (dated statements and unmarked code fences below are historical sketches):
 
 Status: design with a working prototype, 2026-10-05. **Measured** means a command was run in this session and its output is quoted
 (section 9). **Prototype** means it exists in `lib/fib/test/arch*`, `compiler/adr*` and `docs/adr/` and `compiler/tests/adr/run.sh`

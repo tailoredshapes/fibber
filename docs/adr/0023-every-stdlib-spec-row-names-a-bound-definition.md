@@ -32,9 +32,9 @@ edit to slip through). The target is an empty list; each package that lands a tr
 
 ## Consequences
 
-- A row added to the table for a function that does not exist fails `fibc adr` at once, so the page cannot promise a name the library lacks without saying so.
+- A row added to the table for a function that does not exist fails `make adr` at once, so the page cannot promise a name the library lacks without saying so.
 - The list is the honest map of what remains: its reasons name the tranche or the missing language feature, and a package that implements a row deletes its line.
-- It is a **name** check, written to be cheap (a text rule over the parsed forms, about a second inside the `fibc adr` budget): it does not know that the name is bound in the module the
+- It is a **name** check, written to be cheap (a text rule over the parsed forms, about a second inside the `make adr` budget): it does not know that the name is bound in the module the
   section names for an unqualified row, nor that the signature matches the row, nor that a case runs it. Forms and macros are found through the compiler's string tables, so a name that merely
   appears as a whole string there counts; that errs towards accepting. The compile probe that found the 279 (a program of `(defun pN () NAME)` per head, scanned for `unbound name`)
   agreed with this rule on every function.
