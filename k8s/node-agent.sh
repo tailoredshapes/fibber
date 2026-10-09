@@ -7,7 +7,7 @@
 # The k3s binary is the server's release (v1.34.4+k3s1), fetched from the k3s release page and checked against the sha256 written here (docs/adr/0020).
 set -eu
 arch=${1:?ARCH amd64|arm64}; name=${2:?NAME}; role=${3:?ROLE}; taint=${4:?TAINT}
-server=${K3S_SERVER:-https://192.168.7.42:6443}
+server=${K3S_SERVER:?set K3S_SERVER to the k3s server URL, https://HOST:6443}
 V='v1.34.4+k3s1'
 case $arch in
   arm64) bin=k3s-arm64; sha=2a10a51c9bc04f0f02c2dd52c820399a97656164af7670d530cefd14a27b7b41 ;;

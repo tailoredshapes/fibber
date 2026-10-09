@@ -270,7 +270,7 @@ with `kCCHmacAlgSHA256` and friends, `CCKeyDerivationPBKDF(kCCPBKDF2, ..)` with 
 `ct=`. The contexts are plain structs a driver allocates. **HKDF, scrypt and Argon2id are not in the public CommonCrypto API** (HKDF is in CryptoKit,
 a Swift API): writing HKDF over `CCHmac` ourselves is the cryptography the owner's rule forbids, so an Apple driver lists no `:hkdf`, and the contract,
 which today requires `:hkdf`, would first have to make it optional like scrypt. That and `DYLD_INSERT_LIBRARIES` for the JIT are the open points. Not
-built for want of budget, not for want of a machine: the Mac Studio (`ssh tmarsh@192.168.7.254`) answered.
+built for want of budget, not for want of a machine: an Apple Silicon Mac answered.
 
 ## Measured
 

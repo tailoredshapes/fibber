@@ -4,7 +4,7 @@ Status: built and measured (WEBGPU-1, 2026-10-07). In this tree: the kernel-targ
 the WGSL printer `native.wgsl` (compiler/native/wgsl.fib and wgsl/), `--emit wgsl`, the JS host glue and the wasm host (examples/webgpu/js/),
 the example kernels and their CPU references (examples/webgpu/), the tests (compiler/tests/native/wgsl-emit.sh, cases/stdlib 8570-8577,
 scripts/webgpu-agree.sh, scripts/mutant-webgpu.sh) and the tool fetcher (scripts/fetch-webgpu-tools.sh). In its own repository: the native
-driver `fib-gpu-webgpu` (`ssh://git@localhost:2222/tailoredshapes/fib-gpu-webgpu.git`, tag `v0.0.1`). Every number below was measured on
+driver `fib-gpu-webgpu` (a separate package, not yet published; tag `v0.0.1`). Every number below was measured on
 this machine (RTX 4080 SUPER, driver 610.57.04, wgpu-native v29.0.1.1, Dawn via the `webgpu` npm package 0.6.2, naga-cli 30.0.1, node
 v26.10.0, Chromium 153 as a snap). The GPU design this extends is docs/design/gpu.md; the kernel subset, `defkernel`, the index space and
 the `Device` protocol are its (sections 3 and 4) and are not restated.

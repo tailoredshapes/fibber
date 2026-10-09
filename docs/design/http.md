@@ -81,7 +81,7 @@ over a Transport from an accepted socket, which is already how the server works.
   output it may produce (`max-response-bytes`): it must fail with `LimitError` rather than exceed it (a ratio limit is the decoder's business), and the client refuses any result over the cap too.
   Codings are undone last first (at most 4: more is a `ProtocolError`); if any listed coding has no decoder the body is returned as received with `content-encoding` kept (nothing is half decoded);
   after a full decode `content-encoding` and `content-length` are removed. `Accept-Encoding` lists the registered names, unless the caller set one or `decompress` is false. `request-stream` delivers the
-  wire body. **DEFLATE is not written here** (a primitive-class parser with a security history, ADR 0012's spirit): the decoders are the `fib-zlib` repo (`ssh://git@localhost:2222/tailoredshapes/fib-zlib.git`,
+  wire body. **DEFLATE is not written here** (a primitive-class parser with a security history, ADR 0012's spirit): the decoders are the `fib-zlib` repo (a separate package, not yet published),
   v0.1.0), a driver over libz (`:lib "z"`) with streaming inflate under a byte cap and an expansion ratio, registered with `(zh/with-zlib options)`. fibber ships only the seam, specs with fake decoders
   (stacked, partial, a bomb with a cap-honouring and a greedy decoder) and this text; the old whole-body seam (`(fn (bytes))`, no cap) is gone.
 - **Limits** are options with safe defaults: header bytes 65536, line 8192, header count 100, body 8 MiB (server) / response 8 MiB (client).

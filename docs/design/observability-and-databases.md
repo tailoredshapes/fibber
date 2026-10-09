@@ -487,7 +487,7 @@ cache (no prepare per call) and names read once per statement; target: within 20
 
 - **Where things are.** The core (`fib.db`, `fib.db.core`), the Driver contract (`fib.db.contract`) and an in-memory fake driver
   (`fib.db.memory`) are in fibber's library; their specs (`specs/db-*-spec.fib`) need no C library and run in the gate. The SQLite driver
-  is the library `fib-db-sqlite` in its own repository, `ssh://git@localhost:2222/tailoredshapes/fib-db-sqlite.git` (modules `sqlite`,
+  is the library `fib-db-sqlite` in its own package, not yet published (modules `sqlite`,
   `sqlite.ffi`, `sqlite.stmt`; not `fib.db.sqlite`: a project's module may not have the name of a module of the bundled library, and the
   v0.1.8 release bundles `fib.db.sqlite`), pulled in with `fibc deps add`. It runs the contract from `fib.db.contract` against itself.
   Open question 3 is answered by this: C-library specs run in the driver's repository, not in fibber's gate.

@@ -207,7 +207,7 @@ the namespace and the PriorityClass `fibber-ci-low`.
 ### Topology
 
 ```
-lilnas (192.168.7.42, amd64, 28 threads)   k3s server + agent                      pool amd64   PVC work-amd64   quota-capped
+lilnas (the k3s server, amd64, 28 threads)   k3s server + agent                      pool amd64   PVC work-amd64   quota-capped
 fibber-a64 (Lima VM on the Mac Studio)     k3s agent, aarch64, 8 vCPU / 16 GiB     pool arm64   PVC work-arm64   taint fibber=ci:NoSchedule    label fibber/role=arm64-ci
 fibber-ryzen (WSL2 Ubuntu on the 5800X)    k3s agent, amd64, 16 threads / 15 GB    pool bench   PVC work-bench   taint fibber=bench:NoSchedule label fibber/role=bench
 ```
@@ -263,11 +263,11 @@ A pod that fits no node (`FailedScheduling`, e.g. 8 CPUs on the 8-vCPU VM) is no
 1. On the node (systemd needed): put the server's node token in `/etc/rancher/k3s/agent-token` (mode 0600) **without printing it or putting it on a command line**:
    `sudo cat /var/lib/rancher/k3s/server/node-token | ssh NODE 'sudo bash -c "umask 077; mkdir -p /etc/rancher/k3s; cat > /etc/rancher/k3s/agent-token"'`.
 2. `ssh NODE 'sudo bash -s ARCH NAME ROLE TAINT' < k8s/node-agent.sh` (arguments: `arm64 fibber-a64 arm64-ci fibber=ci:NoSchedule`). It installs the k3s binary of the
-   server's version (sha256 in the script), writes `/etc/rancher/k3s/config.yaml` and the `k3s-agent` systemd unit, and starts it. The agent dials `192.168.7.42:6443`
+   server's version (sha256 in the script), writes `/etc/rancher/k3s/config.yaml` and the `k3s-agent` systemd unit, and starts it. The agent dials the server (`K3S_SERVER`, `https://HOST:6443`, required)
    outward; nothing needs to reach the node.
 3. Import the CI image there, `kubectl apply` a volume and loader for the pool (`k8s/arm64.yaml`, `k8s/bench.yaml` are the examples), add a branch to `k8s/job.jq` if the taint is new.
 
-Cross-node pod networking does **not** work and is not needed: the VM sits behind Lima's NAT (192.168.64.2) and WSL2 behind Hyper-V's (172.18.x), lilnas cannot
+Cross-node pod networking does **not** work and is not needed: the VM sits behind Lima's NAT (a 192.168.64.x address) and WSL2 behind Hyper-V's (172.18.x), lilnas cannot
 route to them, and flannel's VXLAN endpoint would have to be the node's LAN address with UDP 8472 forwarded. The API server reaches the kubelets (logs, exec, cp)
 through the agents' own outbound tunnel, which is all `make k8s-*` uses. Not tried: `--flannel-backend=wireguard-native` (it changes the server's flannel settings
 and restarts k3s) and `--node-external-ip` with a UDP forward.
@@ -295,7 +295,7 @@ and the quota is the same CPU either way, so the single pod is the default and t
 **Quota** (a gate pod held 12 of the 16 CPU): `Error creating: pods "probe-quota-6x6s4" is forbidden: exceeded quota: fibber-ci, requested: limits.cpu=8,limits.memory=8Gi,requests.cpu=8,requests.memory=8Gi, used: limits.cpu=13,limits.memory=25088Mi,requests.cpu=12020m,requests.memory=24608Mi, limited: limits.cpu=16,limits.memory=32Gi,requests.cpu=16,requests.memory=32Gi`;
 and `maximum cpu usage per Container is 16, but limit is 32` (LimitRange). `make k8s-gate` printed `k8s: fibber-gate-1791459523 REJECTED in 55 s` for the same cause.
 **Network policy** (`make k8s-netpol-test`): in `fibber-ci`, `https://github.com` and `https://1.1.1.1` reachable; `http://github.com`, the gear pod (`10.42.0.9:5090`), the gear service, the API service
-(`10.43.0.1:443`), metrics-server, `192.168.7.42:6443`, `:22` and the LAN router BLOCKED. The control pod in a scratch namespace without policies reached the gear pod and service (and `http://github.com`):
+(`10.43.0.1:443`), metrics-server, the node's own `:6443` and `:22` and the LAN router BLOCKED. The control pod in a scratch namespace without policies reached the gear pod and service (and `http://github.com`):
 the policy, not the network, blocked them.
 **TTL**: a job with `K8S_TTL=60` finished at 13:28:57 and `kubectl get` found neither the job nor its pod at 13:30:06; the first jobs of the day (TTL 3600) were gone from the list an hour later.
 **Other workloads**: `kubectl top node` before: `lilnas 2505m 8% 24279Mi 38%`; with a 12-CPU gate pod running: `16070m 57% 27348Mi 43%`; after: `2226m 7% 23242Mi 36%`. Restart counts before and after:
@@ -323,3 +323,17 @@ around with an ssh session holding `sleep` for the run. Before using this node a
 `k8s/gitlab-runner/values.yaml` is a Helm values file for the `gitlab/gitlab-runner` chart with the Kubernetes executor in `fibber-ci` (low priority class, the CI image, the work volume). **Not installed; it needs the owner
 to supply a runner authentication token** (GitLab UI: the fibber project, Settings > CI/CD > Runners > New project runner, tag `k8s`). Steps: the header of that file (create the Secret, allow the GitLab address and port in `k8s/netpol.yaml`, pin the chart version, `helm upgrade --install`).
 No GitLab token or deploy key was created.
+
+## 8. Machines and environment variables
+
+Scripts and make targets that need a machine other than the one you are on read its address from the environment. None has a default: unset, the script
+prints what to set and exits 2 (or, for the probes, skips that probe). `ssh` targets are whatever `ssh` accepts (`user@host`, or an alias in `~/.ssh/config`).
+
+| Variable | Used by | What |
+|---|---|---|
+| `FIB_MAC_HOST` | `compiler/tests/native/a64-cross-mac.sh`, `a64-fibc-on-mac.sh` (or `--host HOST`), `make k8s-image-arm64` (as `ARM_HOST`) | ssh target of an Apple Silicon Mac with `llvm@21` from Homebrew; the scripts use its `~/fibber-a64-scratch` only. `scripts/mac-check.sh` runs on the Mac itself and needs no variable. |
+| `FIB_RYZEN_HOST` | `make k8s-bench` (as `BENCH_HOST`) | ssh target of the WSL2 box that hosts the quiet x86 benchmark node. |
+| `K3S_SERVER` | `k8s/node-agent.sh` | URL of the k3s server a node joins, `https://HOST:6443`. Required. |
+| `FIB_K8S_NODE_ADDR`, `FIB_K8S_LAN_ROUTER` | `make k8s-netpol-test` | addresses on your LAN that the probe pod must fail to reach; empty, those probes are skipped. |
+
+The machine that took the measurements of a document is named in that document; its address is not part of the tree.

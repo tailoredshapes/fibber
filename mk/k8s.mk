@@ -76,18 +76,21 @@ k8s-job: k8s-image k8s-src k8s-seed   ## any make target in a pod: make k8s-job 
 	test -n "$(TARGET)" || { echo "k8s-job: TARGET=build/F (any make target)" >&2; exit 2; }
 	$(call k8s_run,job,make -j$(K8S_J) CASE_JOBS=$(CASE_JOBS) $(K8S_EXTRA) $(TARGET))
 # The arm64 node (docs/design/build.md, Kubernetes, arm64): a Lima VM on the Mac. Its image is built there (docker in the VM) and imported into its k3s.
-ARM_HOST ?= 192.168.7.254
-BENCH_HOST ?= tsmar@192.168.7.83
+# The hosts come from the environment (docs/design/build.md section 8): FIB_MAC_HOST (ssh target of the Mac that runs the Lima VM), FIB_RYZEN_HOST (ssh target of the WSL2 bench box). Default: none.
+ARM_HOST ?= $(FIB_MAC_HOST)
+BENCH_HOST ?= $(FIB_RYZEN_HOST)
 LIMA_VM ?= fibber-a64
 k8s-apply-arm64:   ## the arm64 node's work volume and loader pod (k8s/arm64.yaml); the node itself joins with k8s/node-agent-arm64.sh
 	kubectl apply -f k8s/arm64.yaml
-k8s-image-arm64:   ## build k8s/ci.Dockerfile inside the Lima VM (ARM_HOST, LIMA_VM) and import it into the VM's k3s containerd
+k8s-image-arm64:   ## build k8s/ci.Dockerfile inside the Lima VM (ARM_HOST=$$FIB_MAC_HOST, LIMA_VM) and import it into the VM's k3s containerd
+	test -n "$(ARM_HOST)" || { echo "k8s-image-arm64: set FIB_MAC_HOST (ssh target of the Mac)" >&2; exit 2; }
 	tar -C k8s -c ci.Dockerfile | ssh $(ARM_HOST) 'export PATH=/opt/homebrew/bin:$$PATH; limactl shell $(LIMA_VM) -- bash -c "mkdir -p ~/ctx && cd ~/ctx && tar -x && sudo docker build -q -f ci.Dockerfile -t $(K8S_IMAGE) . && sudo docker save $(K8S_IMAGE) | sudo k3s ctr -n k8s.io images import -"'
 k8s-apply-bench:   ## the benchmark node's work volume and loader pod (k8s/bench.yaml)
 	kubectl apply -f k8s/bench.yaml
 # On the Ryzen's WSL2 node (quiet x86): builds F, then runs the quick benchmarks (scripts/bench/quick.sh) against the baseline there.
 k8s-bench: K8S_POOL := bench
 k8s-bench: k8s-image   ## the quick benchmarks on the bench node (BENCH="name.." for some); BENCH_CPU=8 BENCH_MEM=8Gi by default
+	@test -n "$(BENCH_HOST)" || { echo "k8s-bench: set FIB_RYZEN_HOST (ssh target of the bench box)" >&2; exit 2; }
 	@echo "(WSL2 stops its VM when no wsl.exe session is open, which drops the node: an ssh session holding 'sleep' keeps it up for the whole run)"
 	ssh -o BatchMode=yes $(BENCH_HOST) 'wsl -u root -e sleep 14400' > /dev/null 2>&1 & kp=$$!; trap "kill $$kp" EXIT; sleep 30; \
 	$(MAKE) --no-print-directory K8S_POOL=bench k8s-src k8s-seed && \
@@ -113,7 +116,7 @@ k8s-clean-all: k8s-clean   ## also the loader pod and the work volumes (the tree
 # The network policy proof: the probe pod in fibber-ci (default deny + DNS + HTTPS) and the control in a scratch namespace without policies.
 k8s-netpol-test: k8s-image   ## prove the network policies: a pod in fibber-ci reaches the internet over HTTPS only, not gear, kube-system, the API or the LAN
 	gp=$$(kubectl -n gear get pod -o jsonpath='{.items[0].status.podIP}:5090'); gs=$$(kubectl -n gear get svc gear-reviews -o jsonpath='{.spec.clusterIP}:5090'); \
-	sed -e "s/IMAGE_TAG/$(K8S_TAG)/" -e "s/GEAR_POD_ADDR/$$gp/" -e "s/GEAR_SVC_ADDR/$$gs/" k8s/netpol-probe.yaml > $(K8S_DIR)/netpol-probe.yaml; \
+	sed -e "s/IMAGE_TAG/$(K8S_TAG)/" -e "s/GEAR_POD_ADDR/$$gp/" -e "s/GEAR_SVC_ADDR/$$gs/" -e "s/NODE_LAN_ADDR/$(FIB_K8S_NODE_ADDR)/" -e "s/LAN_ROUTER_ADDR/$(FIB_K8S_LAN_ROUTER)/" k8s/netpol-probe.yaml > $(K8S_DIR)/netpol-probe.yaml; \
 	kubectl create namespace fibber-ci-control > /dev/null; kubectl -n fibber-ci-control apply -f $(K8S_DIR)/netpol-probe.yaml > /dev/null; \
 	$(K8S_KUBECTL) delete pod netpol-probe --ignore-not-found > /dev/null; $(K8S_KUBECTL) apply -f $(K8S_DIR)/netpol-probe.yaml > /dev/null; \
 	sleep 45; echo "== fibber-ci (policies)"; $(K8S_KUBECTL) logs netpol-probe; echo "== control (scratch namespace, no policies)"; kubectl -n fibber-ci-control logs netpol-probe; \
