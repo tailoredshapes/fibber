@@ -1,6 +1,6 @@
 # fib.compress.lz4 against liblz4 1.10.0 (COMPRESS-1, COMPRESS-2, COMPRESS-3: fast, SIMD, parallel, on the pool)
 
-Machine: the Ryzen 7 5800X (WSL2 Ubuntu, `ssh tsmar@192.168.7.83`, 8 cores / 16 threads; one core pinned with `taskset -c 3` for single-thread rows; `ulimit -v 16000000`), binaries copied there, scratch only.
+Machine: the Ryzen 7 5800X (WSL2 Ubuntu, 8 cores / 16 threads; one core pinned with `taskset -c 3` for single-thread rows; `ulimit -v 16000000`), binaries copied there, scratch only.
 Corpus: Silesia (`silesia.zip`, sha256 `0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af`, 211 MB, 12 files, each as ONE block for the block rows; the 12 files concatenated into one
 211 MB input for the frame and scaling rows). Reference: lz4 v1.10.0 (`537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b`) built with `gcc -O3` (generic x86-64): `lz4bench` over
 `LZ4_compress_fast`, `LZ4_compress_HC`, `LZ4_decompress_safe` into a buffer allocated once, and the `lz4` CLI (`-T` multithreaded). Ours: `scripts/lz4-bench.fib` built with

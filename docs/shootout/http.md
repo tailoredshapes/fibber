@@ -4,7 +4,7 @@ Two measurements: HTTP-2 on the quiet Ryzen box (first), HTTP-1's original on th
 
 ## HTTP-2 (2026-10-07): the Ryzen box, before and after
 
-Box: ssh `tsmar@192.168.7.83`, WSL2 Ubuntu (kernel 6.6.87.2-microsoft-standard-WSL2), 16 cpus, load average 1.4 to 3.6 while running (a Windows host under WSL2 is not a quiet Linux:
+Box: a Ryzen 7 5800X under WSL2 Ubuntu (kernel 6.6.87.2-microsoft-standard-WSL2), 16 cpus, load average 1.4 to 3.6 while running (a Windows host under WSL2 is not a quiet Linux:
 loopback is slower than on the development box, which is why absolute numbers are lower), python 3.14.4, curl 8.18.0, the v0.1.11 release `fibc` (`fibc build` at -O2). Scratch directory only
 (`~/fibber-scratch/http2`). Two trees of `lib` + `scripts/bench`, **before** = commit 68e4cf6 (HTTP-1) and **after** = this package (HTTP-2) at f970860 plus the read-size change below,
 each built and run by the same `scripts/bench/http-bench.py --runs 5` (medians of 5), interleaved before, after, before, after in one session; the reference server is python's `http.server`

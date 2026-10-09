@@ -7,7 +7,7 @@ Original record (dated statements and unmarked code fences below are historical 
 Status: **phase 1 built** (GPU-2, 2026-10-07), on the decision of docs/design/decisions-2026-10-04.md (GPU): the kernel target and `fib.gpu` are
 core, `defkernel` is the deliberate opt-in, a program with a kernel built for a platform with no kernel target is refused. Section 0 is what
 is built and where; sections 1 to 10 are the design as GPU-1 wrote it, kept as the record (what they call missing is in section 0's table
-when it landed). The driver is `fib-gpu-cuda` (`ssh://git@localhost:2222/tailoredshapes/fib-gpu-cuda.git`, tag `v0.1.0`). Every number
+when it landed). The driver is `fib-gpu-cuda` (a separate package, not yet published; tag `v0.1.0`). Every number
 was measured on this machine (RTX 4080 SUPER, 16 GB, driver 610.57.04, CUDA 13.4, LLVM 21).
 
 ## 0. As built (phase 1, GPU-2)

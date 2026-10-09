@@ -2,12 +2,13 @@
 # Cross-compiles the compiler itself (compiler/fibc.fib, stage 2) and lairf to Mach-O arm64 objects on this x86 machine and links them on an Apple Silicon Mac
 # against Homebrew's LLVM 21 (keg-only: /opt/homebrew/opt/llvm@21), under the Mac's ~/fibber-a64-scratch only. Leaves ~/fibber-a64-scratch/fibc there (a native
 # stage 2 for the Mac: the first seed for `scripts/mac-check.sh`). Builds nothing from LLVM; the Mac needs `brew install llvm@21` and Xcode's command line tools.
-# usage: a64-fibc-on-mac.sh [--host HOST]       F=stage-2 fibc, L=lairf, LD_LIBRARY_PATH reaching libLLVM-21 (this machine's)
+# usage: a64-fibc-on-mac.sh [--host HOST]  (default host: $FIB_MAC_HOST, none if unset; docs/design/build.md section 8)       F=stage-2 fibc, L=lairf, LD_LIBRARY_PATH reaching libLLVM-21 (this machine's)
 # Exit: 0 linked and `fibc --version` ran on the Mac; 1 a step failed; 2 no Mac or no tools.
 set -u
 root=$(cd "$(dirname "$0")/../../.." && pwd); cd "$root"
-host=192.168.7.254; triple=${TRIPLE:-arm64-apple-macosx13.0.0}; llvm=${MAC_LLVM:-/opt/homebrew/opt/llvm@21}
+host=${FIB_MAC_HOST:-}; triple=${TRIPLE:-arm64-apple-macosx13.0.0}; llvm=${MAC_LLVM:-/opt/homebrew/opt/llvm@21}
 [ "${1:-}" = --host ] && host=$2
+[ -n "$host" ] || { echo "a64-fibc-on-mac: no Mac: set FIB_MAC_HOST (user@host for ssh) or pass --host HOST" >&2; exit 2; }
 : "${F:?F names the stage-2 fibc}" "${L:?L names lairf}"
 export FIB_LIB=$root/lib
 T=$(mktemp -d "${TMPDIR:-/tmp}/a64f.XXXXXX"); trap 'rm -rf "$T"' EXIT

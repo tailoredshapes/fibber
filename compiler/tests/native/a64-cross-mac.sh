@@ -1,13 +1,14 @@
 #!/bin/bash
 # Cross-compiles ownership cases (accept and trap verdicts) to Mach-O arm64 objects on this machine (F emit --target, lairf build --emit obj) and
 # runs them on an Apple Silicon Mac over ssh (scripts/mac-run-objects.sh), under the Mac's ~/fibber-a64-scratch only (removed afterwards).
-# usage: a64-cross-mac.sh [--host HOST] [--max N] [--glob 'cases/stdlib/62*.fib']..  [CASE.fib..]       F=stage-2 fibc, L=lairf, LD_LIBRARY_PATH reaching libLLVM-21
+# usage: a64-cross-mac.sh [--host HOST]  (default host: $FIB_MAC_HOST, none if unset; docs/design/build.md section 8) [--max N] [--glob 'cases/stdlib/62*.fib']..  [CASE.fib..]       F=stage-2 fibc, L=lairf, LD_LIBRARY_PATH reaching libLLVM-21
 #   default cases: the first --max (default 40) accept/trap cases of cases/ownership, sorted. TRIPLE overrides arm64-apple-macosx13.0.0.
 # Exit: 0 every run passes; 1 a case fails to compile or run; 2 no Mac or no tools.
 set -u
 root=$(cd "$(dirname "$0")/../../.." && pwd); cd "$root"
-host=192.168.7.254; max=40; globs=(); triple=${TRIPLE:-arm64-apple-macosx13.0.0}
+host=${FIB_MAC_HOST:-}; max=40; globs=(); triple=${TRIPLE:-arm64-apple-macosx13.0.0}
 while [ $# -gt 0 ]; do case $1 in --host) host=$2; shift 2 ;; --max) max=$2; shift 2 ;; --glob) globs+=("$2"); shift 2 ;; *) break ;; esac; done
+[ -n "$host" ] || { echo "a64-cross-mac: no Mac: set FIB_MAC_HOST (user@host for ssh) or pass --host HOST" >&2; exit 2; }
 : "${F:?F names the stage-2 fibc}" "${L:?L names lairf}"
 export FIB_LIB=$root/lib
 T=$(mktemp -d "${TMPDIR:-/tmp}/a64x.XXXXXX"); trap 'rm -rf "$T"' EXIT
