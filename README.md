@@ -12,7 +12,8 @@ write neither lifetimes nor retain/release.
 Fibber source → Fibber compiler → lIR → LLVM IR → native
 ```
 
-Start with the [tutorial](docs/tutorial/01-install-and-hello.md),
+Visit the [Fibber website](https://tailoredshapes.github.io/fibber/) for searchable
+documentation and a quick start. Start with the [tutorial](docs/tutorial/01-install-and-hello.md),
 [documentation map](docs/README.md) or [examples](examples/README.md).
 Collections, JSON/JSON Schema, LZ4, HTTP/DNS, OS services and database/crypto
 contracts are in the library. SIMD, tensors, autodiff, GPU protocols and relational

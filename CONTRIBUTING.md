@@ -29,6 +29,10 @@ with `make doc-reference`; commit the generated diff. `make doc-examples` checks
 examples, local links and reference equality. Python 3 is used for these checks,
 as for the existing WASI test suite.
 
+The [public documentation site](https://tailoredshapes.github.io/fibber/) is built
+from these same Markdown files. See [website setup](website/README.md) for
+`make docs-site`, local previews and automatic publishing from `main`.
+
 Never rewrite pushed history. A behavioural change needs cases with expected
 verdicts set before implementation; update goldens only for an intended change
 and inspect their diff. See [the docs map](docs/README.md) for current guides and

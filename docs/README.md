@@ -35,18 +35,17 @@ checked against source. Policy pages distinguish current limits from proposed
 - [Diagnostics](reference/diagnostics.md)
 - [File formats](reference/file-formats.md)
 - [Language reference](reference/language.md)
+- [CLI commands and flags](reference/cli.md)
+- [Builtin signatures](reference/builtins.md)
+- [Environment inventory](reference/environment.md)
+- [Library facade declarations](reference/library/INDEX.md)
+- [Compiler target table](reference/targets.md)
 
 ## Policy and limits
 
 - [Known limits and security boundaries](policy/limits.md)
 - [Platform support and evidence](policy/platform-support.md)
 - [Stability and the 1.0 proposal](policy/stability.md)
-
-- [CLI commands and flags](reference/cli.md)
-- [Builtin signatures](reference/builtins.md)
-- [Environment inventory](reference/environment.md)
-- [Library facade declarations](reference/library/INDEX.md)
-- [Compiler target table](reference/targets.md)
 
 ## Internals and history
 

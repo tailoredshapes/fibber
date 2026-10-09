@@ -200,7 +200,7 @@ def project_smoke(fibc):
 
 def paths():
     files = [ROOT / name for name in ['README.md', 'ROADMAP.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'SECURITY.md']]
-    for base in ['docs', 'spec', 'lib', 'editors', 'examples']:
+    for base in ['docs', 'spec', 'lib', 'editors', 'examples', 'website']:
         files.extend((ROOT / base).rglob('*.md'))
     return sorted(set(files))
 

@@ -2104,6 +2104,8 @@ of functions must live in one module.
 
 ---
 
+<a id="appendix-a--the-20-ownership-cases-in-this-syntax"></a>
+
 ## Appendix A — the 20 ownership cases in this syntax
 
 Headers (the `;;` lines) are the originals, unchanged. Bodies are the
