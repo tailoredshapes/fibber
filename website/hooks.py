@@ -17,7 +17,7 @@ ROUTES = {}
 
 def source_pages():
     pages = {'index.md': ROOT / 'website/index.md', 'project.md': ROOT / 'README.md'}
-    for base in ['docs/tutorial', 'docs/guide', 'docs/reference', 'docs/policy']:
+    for base in ['docs/tutorial', 'docs/hardway', 'docs/guide', 'docs/reference', 'docs/policy']:
         for path in sorted((ROOT / base).rglob('*.md')):
             pages[path.relative_to(ROOT).as_posix()] = path
     for name in ['docs/README.md', 'examples/README.md', 'CONTRIBUTING.md',

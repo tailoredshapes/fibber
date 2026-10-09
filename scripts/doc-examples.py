@@ -73,7 +73,7 @@ def examples(path):
         found.append((path, line, words, body, expected))
     if re.search(r'^examples: required\s*$', path.read_text(), re.M) and not found:
         raise ValueError(f'{path}: examples required but none marked')
-    if path.parent.name in {'tutorial', 'guide'}:
+    if path.parent.name in {'tutorial', 'hardway', 'guide'}:
         unmarked = [line for line, info, body in blocks
                     if info in {'lisp', 'clojure', ''} and body.lstrip().startswith('(')]
         if unmarked:
@@ -205,6 +205,53 @@ def paths():
     return sorted(set(files))
 
 
+def hardway_smoke(fibc, page=None):
+    """Check the course's published capstone as a real native CLI."""
+    page = page or ROOT / 'docs/hardway/16-capstone.md'
+    programs = [row for row in examples(page) if row[2] == ['fib', 'run']]
+    if len(programs) != 1:
+        return ['hardway capstone needs exactly one runnable starting program']
+    errors = []
+    with tempfile.TemporaryDirectory(prefix='fibber-hardway-') as scratch:
+        work = Path(scratch)
+        source = work / 'main.fib'
+        source.write_text(programs[0][3])
+        env = compiler_env()
+        try:
+            result = subprocess.run([fibc, 'build', str(source), '-I', str(ROOT / 'lib'),
+                                     '-O', '0', '-o', str(work / 'tally')],
+                                    cwd=work, env=env, capture_output=True, timeout=60)
+            if result.returncode:
+                return ['hardway capstone build failed:\n' +
+                        (result.stdout + result.stderr).decode(errors='replace')[-3000:]]
+            fixtures = [('sample', b'red blue\n\n green\tgold \n', 2, 4),
+                        ('empty', b'', 0, 0), ('blank', b' \t\n\n\t ', 0, 0),
+                        ('no-newline', b'red', 1, 1), ('crlf', b'red\r\nblue\r\n', 2, 2),
+                        ('unicode', 'café tea\n'.encode(), 1, 2),
+                        ('repeated-spaces', b'red  blue', 1, 2),
+                        ('path with spaces', b'red', 1, 1)]
+            checks = []
+            for name, content, lines, words in fixtures:
+                (work / name).write_bytes(content)
+                checks.append((name, [name], 0, f'lines={lines} words={words}\n'.encode(), b''))
+            (work / 'invalid').write_bytes(b'\xff')
+            (work / 'directory').mkdir()
+            for name in ['missing', 'invalid', 'directory']:
+                checks.append((name, [name], 1, b'', f'cannot read {name}\n'.encode()))
+            checks += [('no arguments', [], 2, b'', b'usage: tally FILE\n'),
+                       ('two arguments', ['sample', 'empty'], 2, b'', b'usage: tally FILE\n')]
+            for name, arguments, status, stdout, stderr in checks:
+                result = subprocess.run([str(work / 'tally'), *arguments], cwd=work,
+                                        env=env, capture_output=True, timeout=60)
+                if (result.returncode, result.stdout, result.stderr) != (status, stdout, stderr):
+                    errors.append(f'hardway capstone {name}: expected {(status, stdout, stderr)!r}, '
+                                  f'got {(result.returncode, result.stdout, result.stderr)!r}')
+        except subprocess.TimeoutExpired:
+            return ['hardway capstone timed out']
+    print(f'hardway capstone: {len(checks)} native CLI checks; {len(errors)} failures')
+    return errors
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fibc', default=os.environ.get('FIBC', 'build/F'))
@@ -242,6 +289,7 @@ def main():
         if not args.paths:
             errors.extend(smoke_examples(fibc, args.jobs))
             errors.extend(project_smoke(fibc))
+            errors.extend(hardway_smoke(fibc))
     print(f'docs: {len(rows)} checked examples; {unchecked} unmarked sketches; {len(files)} files; {len(errors)} failures')
     if errors:
         raise SystemExit('\n'.join(errors))

@@ -64,6 +64,34 @@ class Checks(unittest.TestCase):
     def test_fragment(self):
         self.assertTrue(self.run_document('```fib frag\n(println (+ 1 2))\n```\n'))
 
+    def test_hardway_spec_detects_broken_calculation(self):
+        page = ROOT / 'docs/hardway/14-specs.md'
+        program = docs.examples(page)[0]
+        self.assertTrue(docs.execute(program, FIBC)[0])
+        broken = list(program)
+        broken[3] = broken[3].replace('(+ (* price quantity) delivery)',
+                                    '(- (* price quantity) delivery)')
+        self.assertNotEqual(program[3], broken[3])
+        self.assertFalse(docs.execute(tuple(broken), FIBC)[0])
+
+    def test_hardway_cli_detects_bad_exit_status(self):
+        original = (ROOT / 'docs/hardway/16-capstone.md').read_text()
+        broken = original.replace('(do (eprintln "usage: tally FILE") 2)',
+                                  '(do (eprintln "usage: tally FILE") 0)')
+        self.assertNotEqual(original, broken)
+        errors = docs.hardway_smoke(FIBC, self.document(broken))
+        self.assertTrue(any('no arguments' in error for error in errors), errors)
+        self.assertTrue(any('two arguments' in error for error in errors), errors)
+
+    def test_hardway_unmarked_program_rejected(self):
+        path = self.document('```lisp\n(defun main () -> i64 0)\n```\n')
+        folder = path.parent / 'hardway'
+        folder.mkdir()
+        course = folder / 'exercise.md'
+        course.write_text(path.read_text())
+        with self.assertRaisesRegex(ValueError, 'unmarked language examples'):
+            docs.examples(course)
+
     def test_marker_faults(self):
         for text in ['```fib unknown\n0\n```\n',
                      '```fib reject\n0\n```\n',

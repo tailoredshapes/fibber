@@ -15,6 +15,8 @@ Fibber source → Fibber compiler → lIR → LLVM IR → native
 Visit the [Fibber website](https://tailoredshapes.github.io/fibber/) for searchable
 documentation and a quick start. Start with the [tutorial](docs/tutorial/01-install-and-hello.md),
 [documentation map](docs/README.md) or [examples](examples/README.md).
+For a practice-first course, [Learn Fibber the Hard Way](docs/hardway/README.md)
+has 16 exercises, deliberate failures and a native-command capstone.
 Collections, JSON/JSON Schema, LZ4, HTTP/DNS, OS services and database/crypto
 contracts are in the library. SIMD, tensors, autodiff, GPU protocols and relational
 search are explicit modules. See the [library index](docs/reference/library/INDEX.md).

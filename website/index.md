@@ -24,7 +24,7 @@ checking to Lisp, then compiles your code through LLVM to a native binary.
 <div class="fib-actions" markdown="1">
 
 [Try Fibber →](../docs/tutorial/01-install-and-hello.md){ .fib-button .fib-button-primary }
-[Explore the library](../docs/reference/library/INDEX.md){ .fib-button .fib-button-secondary }
+[Learn the hard way](../docs/hardway/README.md){ .fib-button .fib-button-secondary }
 
 </div>
 

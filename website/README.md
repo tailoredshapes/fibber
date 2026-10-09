@@ -1,6 +1,6 @@
 # GitHub Pages site
 
-The public site is built from the existing tutorial, guides, references, library
+The public site is built from the existing tutorial, Hard Way course, guides, references, library
 READMEs and selected specification chapters. `index.md` supplies the adoption
 page; the compiler's VERSION supplies its release links. Original Markdown
 remains in place and its executable markers remain checked by `make doc-examples`.

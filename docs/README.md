@@ -1,10 +1,14 @@
 # Documentation
 
-Start with the tutorial; guides describe the current surface. References are
+Start with the short tutorial or the exercise course; guides describe the current surface. References are
 checked against source. Policy pages distinguish current limits from proposed
 1.0 promises.
 
 ## Learn in order
+
+[Learn Fibber the Hard Way](hardway/README.md) is a practice-first route through
+16 exercises plus setup: type, predict, change, break and repair programs,
+then ship a tested file-processing command. The short tutorial below is a tour.
 
 - [Install and hello](tutorial/01-install-and-hello.md)
 - [Values and collections](tutorial/02-values-and-collections.md)
