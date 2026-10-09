@@ -29,6 +29,9 @@
 ;; than it found: case 8645 (a million tiny tasks) took 0.1 s a run at one worker and 0.9 s at eight on an M1 Ultra (sched_yield is a system call there), 1.5 s at 16 on x86-64 Linux, and 0.4 to 0.7 s
 ;; with the limit (docs/design/parallelism.md, DARWIN-3). A spinner that finds work leaves the count, so the next fork wakes the next sleeper.
 (global internal fib.sched-spinners i32 (i32 2))
+(global internal fib.sched-yield-after i64 (i64 0))
+(global internal fib.sched-usehint i32 (i32 0))
+(global internal fib.sched-hint i32 (i32 0))
 (global internal fib.sched-active i64 (i64 0))
 (global internal fib.sched-blocked i64 (i64 0))
 ;; 1 in a program that catches (set by the fork of a pool task in such a program, emit.lower.threads): the runner isolates a trap
@@ -149,6 +152,18 @@
       (store (select (icmp eq m (i64 0)) (i32 0) (i32 1)) @fib.sched-skip)
       (br third)))
   (block third
+    (let ((h (call @getenv (string "FIB_SPIN_HINT"))))
+      (br (icmp eq h (ptr null)) third1 hintk)))
+  (block hintk
+    (store (trunc i32 (call @fib.sched-num h end)) @fib.sched-usehint)
+    (br third1))
+  (block third1
+    (let ((y (call @getenv (string "FIB_SPIN_YIELD_AFTER"))))
+      (br (icmp eq y (ptr null)) third2 yafter)))
+  (block yafter
+    (store (call @fib.sched-num y end) @fib.sched-yield-after)
+    (br third2))
+  (block third2
     (let ((c (call @getenv (string "FIB_SPINNERS"))))
       (br (icmp eq c (ptr null)) done spinners)))
   (block spinners
@@ -397,9 +412,21 @@
     (let ((i (phi i64 (entry (i64 0)) (again i2))))
       (br (icmp slt i (load i64 @fib.sched-spin)) look leave)))
   (block look
-    (call @sched_yield)
+    (br (icmp slt i (load i64 @fib.sched-yield-after)) sweep yield))
+  (block yield (call @sched_yield) (br sweep))
+  (block sweep
+    (br (icmp eq (load i32 @fib.sched-usehint) (i32 0)) check hintcheck))
+  (block hintcheck
+    (br (icmp eq (atomic-load acquire i32 @fib.sched-hint) (i32 0)) again take))
+  (block take
+    (let ((old (atomicrmw xchg acq_rel @fib.sched-hint (i32 0))))
+      (br (icmp ne old (i32 0)) check again)))
+  (block check
     (br (call @fib.sched-any-work) found again))
-  (block found (atomicrmw sub seq_cst @fib.sched-idlers (i32 1)) (br out))
+  (block found
+    (br (icmp eq (load i32 @fib.sched-usehint) (i32 0)) found2 rehint))
+  (block rehint (atomic-store release (i32 1) @fib.sched-hint) (br found2))
+  (block found2 (atomicrmw sub seq_cst @fib.sched-idlers (i32 1)) (br out))
   (block leave (atomicrmw sub seq_cst @fib.sched-idlers (i32 1)) (br park))
   (block again (let ((i2 (add i (i64 1)))) (br spin)))
   (block park

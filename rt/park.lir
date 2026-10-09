@@ -9,6 +9,9 @@
 (define internal (fib.sched-signal void) ()
   (block entry
     (fence seq_cst)
+    (br (icmp eq (atomic-load monotonic i32 @fib.sched-hint) (i32 0)) hint start))
+  (block hint (atomic-store release (i32 1) @fib.sched-hint) (br start))
+  (block start
     (br (and (icmp ne (load i32 @fib.sched-skip) (i32 0)) (icmp sgt (atomic-load monotonic i32 @fib.sched-idlers) (i32 0))) done sleepers?))
   (block sleepers?
     (br (icmp sgt (atomic-load monotonic i32 @fib.sched-sleepers) (i32 0)) wake done))
@@ -241,12 +244,12 @@
   (block done (ret acc)))
 
 ;; What the library asks the pool (lib/fib/os/sched.fib): 0 the worker count; 1 blocking enter; 2 blocking leave; 3 whether this
-;; thread is a worker; 4 tasks run by workers; 5 steals; 6 live workers; 7 forks run inline for a full ring; 8 whether the pool started.
+;; thread is a worker; 4 tasks run by workers; 5 steals; 6 live workers; 7 forks run inline for a full ring; 8 whether the pool started; 9 the cap on idle workers that spin (fib.sched-spinners).
 ;; extern: (declare fib_sched_ctl i64 (i64 i64))
 (define internal (fib_sched_ctl i64) ((i64 op) (i64 a))
   (block entry
     (switch op other ((i64 0) count) ((i64 1) enter) ((i64 2) leave) ((i64 3) self) ((i64 4) run) ((i64 5) steals)
-      ((i64 6) live) ((i64 7) inline) ((i64 8) started)))
+      ((i64 6) live) ((i64 7) inline) ((i64 8) started) ((i64 9) spinners)))
   (block count (ret (call @fib.sched-count)))
   (block enter (call @fib.sched-block-enter) (ret (i64 0)))
   (block leave (call @fib.sched-block-leave) (ret (i64 0)))
@@ -256,4 +259,5 @@
   (block live (ret (atomic-load acquire i64 @fib.sched-live)))
   (block inline (ret (call @fib.sched-sum (i64 184))))
   (block started (ret (select (icmp eq (atomic-load acquire i32 @fib.sched-state) (i32 2)) (i64 1) (i64 0))))
+  (block spinners (ret (zext i64 (load i32 @fib.sched-spinners))))
   (block other (ret (i64 -1))))
