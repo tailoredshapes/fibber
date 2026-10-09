@@ -68,12 +68,19 @@
     (call @fib.guard-enter (load i64 @fib.thread-stack))
     (ret)))
 
-;; The last runtime call of a thread entry: one thread fewer, and
-;; whoever waits in fib.join-all is told.
+;; The thread gives itself back to the program's count (fib_thread_count) BEFORE it completes its task: completing publishes the done state a joiner
+;; waits for, so a joiner that returns from `join` then reads a count without this thread (RACE-8780: with the decrement after the completion, a
+;; joiner could read the count in the window and find the finished threads still in it). The release store of the done state orders it.
+(define internal (fib.thread-uncount void) ()
+  (block entry
+    (atomicrmw sub monotonic @fib.thread-total (i64 1))
+    (ret)))
+
+;; The last runtime call of a thread entry: one thread fewer for main's return (the count of the program is fib.thread-uncount's, before the
+;; completion), and whoever waits in fib.join-all is told.
 (define internal (fib.thread-done void) ()
   (block entry
     (call @fib.guard-leave)
-    (atomicrmw sub monotonic @fib.thread-total (i64 1))
     (call @fib.rq-lock)
     (store (sub (load i32 @fib.threads-live) (i32 1)) @fib.threads-live)
     (call @fib.rq-broadcast)

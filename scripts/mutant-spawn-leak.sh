@@ -7,6 +7,8 @@
 #   MODE      what is broken                                                         cases that must fail
 #   detach    a thread is not detached when it starts: its resources stay            912- 913-
 #   join-all  main's return does not wait for the threads still running              914-
+#   count-late a thread gives itself back to the thread count AFTER it completes its   8780-
+#             task (and a little later: a planted 20 ms delay), so a joiner reads it first (RACE-8780)
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default
 #   ~/.cache/fibber-scratch/mutant-spawn-leak-MODE), MUT_J (cases at once, default 1). The cases run under `ulimit -v 16000000`.
 # exit: 0 when every case failed under the mutant, 1 when one survived, 2 for a setup error. That the cases pass UNmutated is shown by an
@@ -21,6 +23,7 @@ unset LD_LIBRARY_PATH
 case $MODE in
   detach)   CASES=(912- 913-) ;;
   join-all) CASES=(914-) ;;
+  count-late) CASES=(8780-) ;;
   *) echo "mutant-spawn-leak: unknown MODE $MODE" >&2; exit 2 ;;
 esac
 
@@ -37,6 +40,11 @@ mut() {
 }
 case $MODE in
   detach)   mut rt/thread.lir 's/    \(call \@pthread_detach \(load i64 handle\)\)\n//' ;;
+  count-late)
+    # the uncount leaves the thread entry (compiler) and the fail path (core.lir) and comes back in thread-done, after a delay
+    mut compiler/emit/lower/threads.fib 's/\(completion cx head call true "      \(call \@fib\.thread-uncount\)\\n" tail/(completion cx head call true "" tail/'
+    mut rt/core.lir 's/    \(call \@fib\.thread-uncount\)\n//'
+    mut rt/thread.lir 's/    \(call \@fib\.guard-leave\)\n/    (call \@fib.guard-leave)\n    (let ((ts (alloca (align 8) i8 (i32 16)))) (store (i64 0) ts) (store (i64 20000000) (getelementptr i8 ts (i64 8))) (call \@nanosleep ts (ptr null)))\n    (call \@fib.thread-uncount)\n/' ;;
   join-all) mut rt/thread.lir 's/\(icmp sgt \(load i32 \@fib\.threads-live\) \(i32 0\)\)/(icmp sgt (load i32 \@fib.threads-live) (i32 99999999))/' ;;
 esac
 
