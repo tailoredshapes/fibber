@@ -21,8 +21,10 @@ ok() { echo "ok   $*"; }
 no() { echo "FAIL $*"; bad=1; }
 
 # 1. the cases
-res=$(FIB_VECTOR_BITS=512 "$F" cases cases/stdlib --only 700 701 702 703 704 705 706 707 708 709 774 796 -j 6 2>&1 | tail -1)
-case $res in *" 0 fail, 0 pending, 0 header error"*) ok "tensor cases at 512 bits: $res" ;; *) no "tensor cases at 512 bits: $res" ;; esac
+FIB_VECTOR_BITS=512 "$F" cases cases/stdlib --only 700 701 702 703 704 705 706 707 708 709 774 796 -j "${CASE_JOBS:-6}" > "$out/cases-512.log" 2>&1; code=$?
+res=$(tail -1 "$out/cases-512.log")
+if [ "$code" -eq 0 ] && [[ "$res" == *" 0 fail, 0 pending, 0 header error"* ]]; then ok "tensor cases at 512 bits: $res"
+else no "tensor cases at 512 bits: $res"; cat "$out/cases-512.log"; fi
 
 # 2. checksums of the benchmark kernels
 build() { # name cpu bits src [-I..]

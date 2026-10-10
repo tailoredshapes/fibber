@@ -56,6 +56,8 @@ scripts/fetch-*.sh ───────► ~/.cache/fibber-scratch/tools/<tool>
   runs of a shard as before, and a tool script's own parallelism is its own: the kept scripts are not jobserver-aware, and the
   policy is that a recipe is one heavy process plus whatever that process always ran. The stdlib cases are `SHARDS` (default 16)
   targets, ownership 4, so Make schedules them.
+  Hosted CI sets `CASE_JOBS=1` and `CHECK_JOBS=1` and caps Make's jobs at the runner's CPU count (at most four). Four recipes with four
+  case runners each oversubscribed the Mac's audit writes and the JavaScript tail-call check; the timed tests and their coverage stay the same.
 - **Recursion:** `gate` and `quick` call `$(MAKE) gate-report` after their stamps, and `gate-report` asks `$(MAKE) -q` whether every
   stamp of the mode is current (so the report prints PASS or FAIL even after a `-k` run that left stamps missing). `scripts/gate.sh`
   and `scripts/batch.sh` call make. Nothing else recurses.

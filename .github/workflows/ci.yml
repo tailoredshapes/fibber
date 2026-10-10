@@ -36,7 +36,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          make -k -j4 gate-stamps LLVM_LINK=static CASE_JOBS=4 LIMIT_STDLIB=2400 LIMIT_OWNERSHIP=600 || true
+          # Make owns the parallelism: four recipes must not each spawn four case runners.
+          ci_jobs=$(nproc)
+          [ "$ci_jobs" -le 4 ] || ci_jobs=4
+          make -k -j"$ci_jobs" gate-stamps LLVM_LINK=static CASE_JOBS=1 CHECK_JOBS=1 LIMIT_STDLIB=2400 LIMIT_OWNERSHIP=600 || true
           make gate-report LLVM_LINK=static
 
       - name: Keep the logs of a failed gate
@@ -59,8 +62,8 @@ jobs:
         run: HTTP_FIBC="$PWD/build/F" HTTP_TEST_OUT="$RUNNER_TEMP/http" bash scripts/test-http.sh
 
   # macOS (Apple Silicon, the macos-14 runner): `gmake mac-check` (mk/mac.mk): the gate less what macOS cannot run (compiler/tests/expected-macos.txt, each
-  # skip with its reason), plus the machine checks of scripts/mac-check.sh. The seed is SEED's darwin-arm64 row. UNTESTED ON THE RUNNER: the job was
-  # written from a run on an M1 Ultra (macOS 27, Homebrew llvm@21), not run on GitHub; a first run here may need the paths or the timeout adjusted.
+  # skip with its reason), plus the machine checks of scripts/mac-check.sh. The seed is SEED's darwin-arm64 row. The job was
+  # written from a run on an M1 Ultra (macOS 27, Homebrew llvm@21); the hosted macos-14 runner also exercises the gate.
   macos:
     runs-on: macos-14
     timeout-minutes: 150
@@ -78,7 +81,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gmake -k -j4 mac-stamps CASE_JOBS=4 LIMIT_STDLIB=3600 LIMIT_OWNERSHIP=1200 || true
+          ci_jobs=$(sysctl -n hw.ncpu)
+          [ "$ci_jobs" -le 4 ] || ci_jobs=4
+          gmake -k -j"$ci_jobs" mac-stamps CASE_JOBS=1 CHECK_JOBS=1 LIMIT_STDLIB=3600 LIMIT_OWNERSHIP=1200 || true
           gmake mac-report
 
       - name: Keep the logs of a failed Mac gate
