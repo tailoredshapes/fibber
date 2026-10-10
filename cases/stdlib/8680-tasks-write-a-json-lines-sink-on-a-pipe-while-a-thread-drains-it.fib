@@ -5,8 +5,9 @@
 ;; stage:  2
 ;; roots:  ../../lib support
 ;; covers: spawn
-;; Several tasks write JSON lines to one pipe while a spawned thread drains it; every line arrives whole, and all of them arrive. The records are 2 KB each
-;; and there are 800 of them (1.6 MB), more than the largest pipe Linux allows (fs.pipe-max-size, 1 MiB), so a program that read the pipe only after the
+;; Several tasks write JSON lines to one pipe while a spawned thread drains it; every line arrives whole, and all of them arrive. Direct writes stay
+;; under POSIX's minimum PIPE_BUF (512 bytes, also macOS's limit). A second probe uses 2 KB records through the async sink's single writer.
+;; Each probe writes over 1 MiB, more than the largest pipe Linux allows (fs.pipe-max-size), so a program that read the pipe only after the
 ;; writers were joined would always deadlock: that was the shape of specs/log-spec.fib's probe, which hung the file on 2026-10-07 once the machine's pipe
 ;; quota (fs.pipe-user-pages-soft) cut every new pipe to two pages; it was taken for a runtime regression and was not one (the 0.1.11 release hung on
 ;; it too). The writers are pool tasks (with-tasks), the reader an OS thread (spawn), as the spec's probe now does.
@@ -19,18 +20,29 @@
       ((Ok b) (if (= (array-len b) 0) out (recur (str out (str-from-bytes b)))))
       ((Err _) out))))
 
-(defun whole-json? (l: str) -> bool
-  (and (> (str-len l) 2000) (string/starts-with? l "{\"ts\":") (string/ends-with? l "}")))
+(defun whole-json? (l: str payload-size: i64) -> bool
+  (and (> (str-len l) payload-size) (< (str-len l) (+ payload-size 256))
+       (string/starts-with? l "{\"ts\":") (string/ends-with? l "}")))
 
-(defun main () -> i64
+(defun probe (payload-size: i64 per-task: i64 asynchronous: bool) -> i64
   (let [c (checks)
         p (match (os/make-pipe) ((Ok p) p) ((Err e) (trap (. e message)))) r (. p fst) w (. p snd)
-        payload (string/join "" (repeat 2000 "x"))
-        lg (get-logger (log-system (json-lines w) (LevelTable INFO [])) "app")
+        payload (string/join "" (repeat payload-size "x"))
+        inner (json-lines w)
+        queued (if asynchronous (some (async-sink inner 64 BlockProducer)) nil)
+        sink (match queued ((some a) (dyn Sink :send a)) (nil inner))
+        lg (get-logger (log-system sink (LevelTable INFO [])) "app")
         drainer (spawn (fn () (let [text (drain r)] (do (os/close-fd r) text))))]
-    (do (with-tasks [s] (do (dotimes (t 4) (fork s (fn () (dotimes (i 200) (info lg payload :task t :i i))))) ()))
+    (do (with-tasks [s] (do (dotimes (t 4) (fork s (fn () (dotimes (i per-task) (info lg payload :task t :i i))))) ()))
+        (match queued ((some a) (do (check c (= (sink-close a) (Ok ())))
+                                   (check c (= (async-failed a) 0))
+                                   (check c (= (async-dropped a) 0)))) (nil ()))
         (os/close-fd w)
         (let [lines (vec (filter (fn (l: str) (> (str-len l) 0)) (string/split (join drainer) "\n")))]
-          (do (check c (= (count lines) 800))
-              (check c (every? whole-json? lines))
+          (do (check c (= (count lines) (* 4 per-task)))
+              (check c (every? (fn (l: str) (whole-json? l payload-size)) lines))
+              (check c (or asynchronous (every? (fn (l: str) (<= (+ (str-len l) 1) 512)) lines)))
               (checks-result c))))))
+
+(defun main () -> i64
+  (bit-or (probe 200 2000 false) (shl (probe 2000 200 true) 8)))

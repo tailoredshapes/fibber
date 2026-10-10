@@ -129,7 +129,7 @@ wall clock read, the context concatenation, a heap `Datum` per field and the dyn
 `(defprotocol Sink (sink-write (self rec: LogRecord) -> (Result unit str)))`, chosen at start-up as `(dyn Sink :send ..)`.
 
 - **Thread safety:** a sink is called from many tasks. A line is rendered whole and written with one `write-all`, so lines do not
-  interleave on a pipe (a write of at most `PIPE_BUF`, 4096 bytes, is atomic) or an `O_APPEND` file. A longer line or a partial write
+  interleave on a pipe when the write is at most `PIPE_BUF` (4096 bytes on Linux, 512 on macOS; POSIX guarantees at least 512), or an `O_APPEND` file. A longer line or a partial write
   can interleave; the async sink below removes that by having one writer. The memory sink uses an atom.
 - **Failure:** a sink returns `Err`; the logger counts it in the system's failure atom and prints the first one to standard error
   (log4j's StatusLogger). A sink must not trap: a trap in a sink would end the logging task, and in `main` the process. Sinks written in
