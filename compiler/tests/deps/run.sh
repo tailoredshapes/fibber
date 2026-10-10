@@ -27,6 +27,11 @@ if [ "${DEPS_RENAME_GUARD:-1}" = 1 ]; then
            DEPS_RENAME_ENV=LD_PRELOAD; DEPS_RENAME_LIBRARY=$T/rename-guard.so ;;
     *) echo "deps: rename guard unsupported on $(uname -s)" >&2; exit 2 ;;
   esac
+  case $(uname -s) in
+    Darwin) cc "$here/rename-guard-probe.c" -o "$T/rename-guard-probe" || exit 1 ;;
+    Linux) cc "$here/rename-guard-probe.c" -ldl -o "$T/rename-guard-probe" || exit 1 ;;
+  esac
+  env "$DEPS_RENAME_ENV=$DEPS_RENAME_LIBRARY" "$T/rename-guard-probe" "$T" || exit 1
   export DEPS_RENAME_ENV DEPS_RENAME_LIBRARY DEPS_REAL_FIBC=$F
   cat > "$T/fibc-rename-guard" <<'EOF'
 #!/bin/sh

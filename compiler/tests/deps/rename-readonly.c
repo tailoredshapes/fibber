@@ -3,7 +3,20 @@
  * Files and writable directories retain the host's ordinary rename behaviour. */
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/stat.h>
+
+const int fibber_deps_rename_guard_loaded = 1;
+
+/* Interpose only the compiler, not its git/clang/chmod children. System tools
+ * can use a different Mach-O subtype (arm64e) from this arm64 test library. */
+__attribute__((constructor)) static void scope_to_process(void) {
+#ifdef __APPLE__
+    unsetenv("DYLD_INSERT_LIBRARIES");
+#else
+    unsetenv("LD_PRELOAD");
+#endif
+}
 
 static int readonly_directory(const char *path) {
     struct stat st;
