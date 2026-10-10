@@ -149,27 +149,50 @@ else
   cuda branch "$T/branch.ptx" > "$T/cuda.out" 2>&1; code=$?
   if [ $code -eq 0 ] && [ "$(grep -c '^ok' "$T/cuda.out")" -eq 4 ]; then ok "device (CUDA): 4 branch-around-barrier checks equal the CPU's"; else no "device (CUDA) branch: $(grep -v '^ok' "$T/cuda.out" | head -n 5)"; fi
 fi
-wg() { node $D/wgsl_run.mjs "$@" 2>&1 | grep -v '^Warning'; }
-wg badgrid "$T/reduce.wgsl" > "$T/wg.out"; code=${PIPESTATUS[0]}
+wg() {
+  node "$D/wgsl_run.mjs" "$@" 2>&1 | grep -v '^Warning'
+  # The filter may find no output; preserve skips (3/4) and runner failures.
+  return "${PIPESTATUS[0]}"
+}
+wg_status_checks() (
+  # Replace node only in this subshell; exercise the real wrapper without a GPU.
+  node() {
+    [ "$kind" = warning ] && printf 'Warning: adapter unavailable\n' >&2
+    [ "$kind" = result ] && printf 'Warning: limits\nok result\n'
+    return "$status"
+  }
+  for status in 0 1 3 4 137; do
+    for kind in empty warning result; do
+      expected=; [ "$kind" = result ] && expected='ok result'
+      output=$(wg probe unused.wgsl); actual=$?
+      if [ "$actual" -ne "$status" ] || [ "$output" != "$expected" ]; then
+        echo "     runner status $status ($kind): got $actual, output '$output'"
+        return 1
+      fi
+    done
+  done
+)
+if wg_status_checks; then ok "WebGPU wrapper: 15 exit-status and warning-filter checks"; else no "WebGPU wrapper lost the runner's status or output"; fi
+wg badgrid "$T/reduce.wgsl" > "$T/wg.out"; code=$?
 if [ "$code" -eq 3 ]; then echo "note no WebGPU adapter or the webgpu npm package: the WGSL runs are skipped"; wg_on=0
 else
   wg_on=1
-  grep -q "^ok" "$T/wg.out" && ok "device (WebGPU): $(head -c 160 "$T/wg.out")" || no "device (WebGPU) badgrid: $(cat "$T/wg.out")"
-  wg reduce "$T/reduce.wgsl" "$T/ref.txt" > "$T/wg.out"
-  if [ "$(grep -c '^FAIL' "$T/wg.out")" -eq 0 ] && [ "$(grep -c '^ok' "$T/wg.out")" -ge 25 ]; then ok "device (WebGPU): $(grep -c '^ok' "$T/wg.out") reduction checks equal fibber's CPU reference"; else no "device (WebGPU) reductions: $(grep -v '^ok' "$T/wg.out" | head -n 5)"; fi
-  wg branch "$T/branch.wgsl" > "$T/wg.out"
-  if [ "$(grep -c '^FAIL' "$T/wg.out")" -eq 0 ] && [ "$(grep -c '^ok' "$T/wg.out")" -eq 4 ]; then ok "device (WebGPU): 4 branch-around-barrier checks equal the CPU's"; else no "device (WebGPU) branch: $(grep -v '^ok' "$T/wg.out" | head -n 5)"; fi
-  wg atomics "$T/atomics.wgsl" > "$T/wg.out"
-  if [ "$(grep -c '^FAIL' "$T/wg.out")" -eq 0 ] && [ "$(grep -c '^ok' "$T/wg.out")" -ge 5 ]; then ok "device (WebGPU): $(grep -c '^ok' "$T/wg.out") atomics checks equal the CPU's"; else no "device (WebGPU) atomics: $(grep -v '^ok' "$T/wg.out" | head -n 5)"; fi
-  wg f32atomics "$T/f32.wgsl" > "$T/wg.out"
-  if [ "$(grep -c '^FAIL' "$T/wg.out")" -eq 0 ] && [ "$(grep -c '^ok' "$T/wg.out")" -ge 2 ]; then ok "device (WebGPU): the f32 atomics, a compare-and-exchange loop, equal the CPU's: $(head -n 1 "$T/wg.out" | cut -c1-130)"; else no "device (WebGPU) f32 atomics: $(grep -v '^ok' "$T/wg.out" | head -n 5)"; fi
-  wg probe "$T/warp.wgsl" > "$T/wg.out"; sub=${PIPESTATUS[0]}
+  [ "$code" -eq 0 ] && grep -q "^ok" "$T/wg.out" && ok "device (WebGPU): $(head -c 160 "$T/wg.out")" || no "device (WebGPU) badgrid: $(cat "$T/wg.out")"
+  wg reduce "$T/reduce.wgsl" "$T/ref.txt" > "$T/wg.out"; code=$?
+  if [ "$code" -eq 0 ] && [ "$(grep -c '^FAIL' "$T/wg.out")" -eq 0 ] && [ "$(grep -c '^ok' "$T/wg.out")" -ge 25 ]; then ok "device (WebGPU): $(grep -c '^ok' "$T/wg.out") reduction checks equal fibber's CPU reference"; else no "device (WebGPU) reductions: $(grep -v '^ok' "$T/wg.out" | head -n 5)"; fi
+  wg branch "$T/branch.wgsl" > "$T/wg.out"; code=$?
+  if [ "$code" -eq 0 ] && [ "$(grep -c '^FAIL' "$T/wg.out")" -eq 0 ] && [ "$(grep -c '^ok' "$T/wg.out")" -eq 4 ]; then ok "device (WebGPU): 4 branch-around-barrier checks equal the CPU's"; else no "device (WebGPU) branch: $(grep -v '^ok' "$T/wg.out" | head -n 5)"; fi
+  wg atomics "$T/atomics.wgsl" > "$T/wg.out"; code=$?
+  if [ "$code" -eq 0 ] && [ "$(grep -c '^FAIL' "$T/wg.out")" -eq 0 ] && [ "$(grep -c '^ok' "$T/wg.out")" -ge 5 ]; then ok "device (WebGPU): $(grep -c '^ok' "$T/wg.out") atomics checks equal the CPU's"; else no "device (WebGPU) atomics: $(grep -v '^ok' "$T/wg.out" | head -n 5)"; fi
+  wg f32atomics "$T/f32.wgsl" > "$T/wg.out"; code=$?
+  if [ "$code" -eq 0 ] && [ "$(grep -c '^FAIL' "$T/wg.out")" -eq 0 ] && [ "$(grep -c '^ok' "$T/wg.out")" -ge 2 ]; then ok "device (WebGPU): the f32 atomics, a compare-and-exchange loop, equal the CPU's: $(head -n 1 "$T/wg.out" | cut -c1-130)"; else no "device (WebGPU) f32 atomics: $(grep -v '^ok' "$T/wg.out" | head -n 5)"; fi
+  wg probe "$T/warp.wgsl" > "$T/wg.out"; sub=$?
   if [ "$sub" -eq 4 ]; then echo "note the adapter lacks the subgroups feature: the module was rejected by name ($(head -c 110 "$T/wg.out")); the warp runs are skipped"; sub_on=0
   else
     sub_on=1
-    [ "$(grep -c '^FAIL' "$T/wg.out")" -eq 0 ] && [ "$(grep -c '^ok' "$T/wg.out")" -ge 1 ] && ok "device (WebGPU): $(head -c 150 "$T/wg.out")" || no "device (WebGPU) warp probe: $(grep -v '^ok' "$T/wg.out" | head -n 5)"
-    wg warp "$T/warp.wgsl" "$T/ref.txt" > "$T/wg.out"
-    if [ "$(grep -c '^FAIL' "$T/wg.out")" -eq 0 ] && [ "$(grep -c '^ok' "$T/wg.out")" -ge 13 ]; then ok "device (WebGPU): $(grep -c '^ok' "$T/wg.out") warp-shuffle reduction checks equal fibber's CPU reference"; else no "device (WebGPU) warp reductions: $(grep -v '^ok' "$T/wg.out" | head -n 5)"; fi
+    [ "$sub" -eq 0 ] && [ "$(grep -c '^FAIL' "$T/wg.out")" -eq 0 ] && [ "$(grep -c '^ok' "$T/wg.out")" -ge 1 ] && ok "device (WebGPU): $(head -c 150 "$T/wg.out")" || no "device (WebGPU) warp probe: $(grep -v '^ok' "$T/wg.out" | head -n 5)"
+    wg warp "$T/warp.wgsl" "$T/ref.txt" > "$T/wg.out"; code=$?
+    if [ "$code" -eq 0 ] && [ "$(grep -c '^FAIL' "$T/wg.out")" -eq 0 ] && [ "$(grep -c '^ok' "$T/wg.out")" -ge 13 ]; then ok "device (WebGPU): $(grep -c '^ok' "$T/wg.out") warp-shuffle reduction checks equal fibber's CPU reference"; else no "device (WebGPU) warp reductions: $(grep -v '^ok' "$T/wg.out" | head -n 5)"; fi
   fi
 fi
 # a WGSL that requires subgroups is rejected BY NAME where the adapter lacks the feature (played by FIB_WEBGPU_NO_SUBGROUPS=1); a module that does not require them is not
@@ -186,9 +209,9 @@ sed 's/atom.shared.max.s32/atom.shared.xxx.s32/' "$T/atomics.ptx" > "$T/p.ptx"
 if ptx_checks "$T/reduce.ptx" "$T/p.ptx" > /dev/null; then no "planted: a PTX without atom.shared passed the text checks"; else ok "planted: a PTX without atom.shared fails the text checks"; fi
 sed 's/atomicCompareExchangeWeak/atomicXxx/g' "$T/atomics.wgsl" > "$T/p.wgsl"
 if wgsl_checks "$T/reduce.wgsl" "$T/p.wgsl" > /dev/null; then no "planted: a WGSL without compare-and-exchange passed the text checks"; else ok "planted: a WGSL without compare-and-exchange fails the text checks"; fi
-sed '0,/workgroupBarrier();/s//workgroupBarrier(); switch L {/' "$T/branch.wgsl" > "$T/p.wgsl"
+awk '!planted && sub(/workgroupBarrier\(\);/, "workgroupBarrier(); switch L {") { planted=1 } { print }' "$T/branch.wgsl" > "$T/p.wgsl"
 if branch_text "$T/p.wgsl" > /dev/null; then no "planted: a branch.wgsl with a state machine passed the text checks"; else ok "planted: a state machine in branch.wgsl fails the text checks"; fi
-sed '0,/workgroupBarrier();/s//if (fibw_lid.x < 3u) { workgroupBarrier(); }/' "$T/branch.wgsl" > "$T/p.wgsl"
+awk '!planted && sub(/workgroupBarrier\(\);/, "if (fibw_lid.x < 3u) { workgroupBarrier(); }") { planted=1 } { print }' "$T/branch.wgsl" > "$T/p.wgsl"
 if command -v node > /dev/null 2>&1 && node examples/webgpu/js/validate.mjs "$T/branch.wgsl" > /dev/null 2>&1; then
   if node examples/webgpu/js/validate.mjs "$T/p.wgsl" > "$T/tint" 2>&1; then no "planted: a barrier under a thread-dependent if was accepted by Tint"; else grep -q "uniform control flow" "$T/tint" && ok "planted: a barrier under a thread-dependent if is rejected by Tint (uniform control flow)" || no "planted Tint: $(head -n 3 "$T/tint")"; fi
 fi
