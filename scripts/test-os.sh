@@ -24,7 +24,7 @@ diff -u "$scratch/abi-c.txt" "$scratch/abi-fibber.txt"
 echo "OS ABI agrees with the host C headers"
 "$fibc" emit scripts/tests/os/darwin-backend.fib -I lib/platform/darwin -I lib > "$scratch/darwin-backend.lir"
 # This checks source typing/emission, not linking against a Darwin SDK or execution.
-if ! rg -q '__error' "$scratch/darwin-backend.lir"; then
+if ! grep -Fq '__error' "$scratch/darwin-backend.lir"; then
   echo "Darwin backend was not selected" >&2
   exit 1
 fi
