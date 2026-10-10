@@ -154,7 +154,8 @@ a name) and resolves its tag afresh.
   `github.com/a/b`, `git@github.com:a/b.git` the same, `file:///x/r.git` is `file/x/r`; each part keeps `[A-Za-z0-9._-]` and maps the
   rest to `_` (`.` and `..` become `_`).
 - A fetch: `git init` a fresh `SHA.tmp-PID`, `git fetch --depth 1 URL SHA` (exactly the commit; a server that refuses a fetch by id gets
-  a full fetch of branches and tags), `git checkout --detach SHA`, verify, `chmod -R a-w`, then **rename** into `SHA`. rename(2) is
+  a full fetch of branches and tags), `git checkout --detach SHA`, verify, `chmod -R a-w`, keep only the temporary root writable for
+  BSD's directory rename, then **rename** into `SHA` and remove that root's write permission. The contents stay read-only throughout. rename(2) is
   atomic: two builds fetching the same commit at once both succeed (the loser's rename fails on the existing directory and it removes
   its own copy); a fetch that dies leaves only a `.tmp-PID` directory beside the checkouts, never a partial `SHA` (such leftovers stay until removed by
   hand; `gc` would take them). No lock files are needed.

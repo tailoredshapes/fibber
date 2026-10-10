@@ -17,6 +17,23 @@ cleanup() { chmod -R u+w "$T" 2> /dev/null; rm -rf "$T"; }
 trap cleanup EXIT
 export FIBBER_HOME=$T/cache
 unset FIB_NO_PROJECT
+# Model BSD directory permissions even on a host whose rename accepts a sealed
+# root. Set DEPS_RENAME_GUARD=0 to check the unmodified host behaviour as well.
+if [ "${DEPS_RENAME_GUARD:-1}" = 1 ]; then
+  case $(uname -s) in
+    Darwin) cc -dynamiclib "$here/rename-readonly.c" -o "$T/rename-guard.dylib" || exit 1
+            DEPS_RENAME_ENV=DYLD_INSERT_LIBRARIES; DEPS_RENAME_LIBRARY=$T/rename-guard.dylib ;;
+    Linux) cc -shared -fPIC "$here/rename-readonly.c" -ldl -o "$T/rename-guard.so" || exit 1
+           DEPS_RENAME_ENV=LD_PRELOAD; DEPS_RENAME_LIBRARY=$T/rename-guard.so ;;
+    *) echo "deps: rename guard unsupported on $(uname -s)" >&2; exit 2 ;;
+  esac
+  export DEPS_RENAME_ENV DEPS_RENAME_LIBRARY DEPS_REAL_FIBC=$F
+  cat > "$T/fibc-rename-guard" <<'EOF'
+#!/bin/sh
+exec env "$DEPS_RENAME_ENV=$DEPS_RENAME_LIBRARY" "$DEPS_REAL_FIBC" "$@"
+EOF
+  chmod +x "$T/fibc-rename-guard"; F=$T/fibc-rename-guard
+fi
 . "$here/fixtures.sh"
 make_fixtures
 fail=0
@@ -44,6 +61,12 @@ ck "path: the project's root first, then util, then base" \
 checkout=$FIBBER_HOME/git/file${T}/remotes/util/$U1
 ck "cache: the checkout is at its sha" "$(git -C "$checkout" rev-parse HEAD)" "$U1"
 ck "cache: the checkout is read-only" "$(touch "$checkout/src/x" 2> /dev/null && echo writable || echo read-only)" read-only
+ck "cache: the checkout root is read-only" "$(touch "$checkout/x" 2> /dev/null && echo writable || echo read-only)" read-only
+# A reader may observe a competing fetch just after rename and before its root
+# is sealed. The cache-hit path must seal that root before returning it too.
+chmod u+w "$checkout"
+ck "cache: an existing checkout is reusable while its root is writable" "$(run deps tree)" 0
+ck "cache: reuse seals the checkout root" "$(touch "$checkout/x" 2> /dev/null && echo writable || echo read-only)" read-only
 
 # 2. The search path: a library comes before FIB_LIB (a module of the same name there is not taken).
 mkdir -p "$T/fiblib/acme"; printf '(ns acme.util)\n(defun util-value () -> i64 -5)\n(defmacro twice (x) x)\n' > "$T/fiblib/acme/util.fib"

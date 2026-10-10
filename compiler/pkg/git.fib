@@ -80,9 +80,13 @@
                      ((Ok "") (Ok (nth ids 1)))
                      ((Ok changed) (Err (str dir ": the checkout's files were changed: " (x/first-line changed))))))))))
 
+;; A path operand safe for BSD chmod, which does not accept `--` after MODE.
+(defun chmod-path :private (dir: str) -> str
+  (if (starts-with? dir "/") dir (str "./" dir)))
+
 ;; Removes a checkout or a partial one (it is read-only).
 (defun remove-tree (dir: str) -> unit
-  (do (x/run ["chmod" "-R" "u+w" "--" dir]) (x/run ["rm" "-rf" "--" dir]) ()))
+  (do (x/run ["chmod" "-R" "u+w" (chmod-path dir)]) (x/run ["rm" "-rf" "--" dir]) ()))
 
 ;; Fetches exactly `sha` into the fresh repository `tmp` and checks it out: shallow first; a server that refuses a commit by id gets a
 ;; full fetch of its branches and tags.
@@ -99,10 +103,24 @@
         (r (unsafe (rename a b))))
     (do (ffi/free-addr (ffi/ptr->addr a)) (ffi/free-addr (ffi/ptr->addr b)) (= r 0i32))))
 
-;; The checkout of `sha` of `url`, fetched when it is not in the cache; Ok its directory. With `offline`, a missing one is an error.
+;; BSD rename may need to update the directory's `..` entry. Seal its contents
+;; first, keep just the temporary root writable for the move, then seal that root.
+(defun permissions :private (mode: str dir: str recursive: bool) -> (Result unit str)
+  ;; BSD chmod does not recognise `--` after MODE; prefix relative paths instead.
+  (let ((r (x/run (into ["chmod"] (into (if recursive ["-R"] []) [mode (chmod-path dir)])))))
+    (if (= (. r status) 0) (Ok ()) (Err (str "cannot set checkout permissions on " dir ": " (x/why r))))))
+
+(defun publish :private (tmp: str dir: str) -> (Result str str)
+  (try-let [_ (permissions "a-w" tmp true)
+            _ (permissions "u+w" tmp false)]
+    (if (or (rename-dir tmp dir) (pp/dir? dir))
+        (try-let [_ (permissions "a-w" dir false)] (Ok dir))
+        (Err (str "cannot move the checkout into " dir)))))
+
+;; The checkout of `sha` of `url`, fetched when it is not in the cache; Ok its read-only directory. With `offline`, a missing one is an error.
 (defun ensure (url: str sha: str offline: bool) -> (Result str str)
   (let ((dir (checkout-dir url sha)))
-    (cond (pp/dir? dir) (Ok dir)
+    (cond (pp/dir? dir) (try-let [_ (permissions "a-w" dir false)] (Ok dir))
           offline (Err (str sha " of " url " is not in the cache (" dir ") and --offline forbids fetching it"))
           :else (fetch-new url sha dir))))
 
@@ -117,7 +135,5 @@
        (match (verify tmp sha)
          ((Err m) (do (remove-tree tmp) (Err m)))
          ((Ok _)
-          (do (x/run ["chmod" "-R" "a-w" "--" tmp])
-              (if (or (rename-dir tmp dir) (pp/dir? dir))
-                  (do (when (pp/dir? tmp) (remove-tree tmp)) (Ok dir))
-                  (do (remove-tree tmp) (Err (str "cannot move the checkout into " dir)))))))))))
+          (let ((result (publish tmp dir)))
+            (do (when (pp/dir? tmp) (remove-tree tmp)) result))))))))
