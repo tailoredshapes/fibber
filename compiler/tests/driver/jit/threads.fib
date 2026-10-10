@@ -1,8 +1,10 @@
-;; DARWIN-3: the threads of a program run by `fibc run` are the program's, not the compiler's. Prints the count alone, with one task sleeping, and after it is joined.
+;; DARWIN-3: the threads of a program run by `fibc run` are the program's, not the compiler's. Hold the task alive until its count is sampled.
 (ns main (:use fib.core fib.async) (:require [fib.os :as os]))
 (defun main () -> i64
   (let [alone (unwrap-or (os/thread-count) -1)
-        busy (spawn (fn () (do (os/sleep-ns 300000000) 8)))
+        release-busy (atom false)
+        busy (spawn (fn () (loop [] (if @release-busy 8 (do (os/sleep-ns 1000000) (recur))))))
         during (unwrap-or (os/thread-count) -1)
+        _ (reset! release-busy true)
         done (join busy)]
     (do (println alone during done) (+ (* 100 alone) during))))
