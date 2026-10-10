@@ -3,9 +3,33 @@
 ;; Build: fibc build compiler/tests/types/unit-target.fib -I compiler -I lib -o OUT     (no aarch64 code is generated: only the record is checked)
 (ns main (:use types.target types.check))
 
+(defun check-host-targets (cs: Checks) -> unit
+  (do
+    (check cs "a generic AArch64 host with no feature list still has FMA and 128-bit vectors"
+           (every? (fn (triple: str)
+                     (let ((t (target-of-host triple "generic" "")))
+                       (and (. t has-fma) (= (. t vector-bits) 128) (= (target-lanes t 64) 2)
+                            (= (. t cpu) "generic") (= (. t features) ""))))
+                   ["aarch64-apple-darwin" "arm64-apple-darwin25.0.0" "aarch64-unknown-linux-gnu"]))
+    (check cs "an unrecognised AArch64 CPU name also keeps baseline FMA"
+           (. (target-of-host "arm64-apple-darwin" "unknown-arm-cpu" "") has-fma))
+    (check cs "host detection preserves LLVM's CPU and feature strings"
+           (let ((t (target-of-host "aarch64-apple-darwin" "generic" "+neon,+crc")))
+             (and (. t has-fma) (= (. t cpu) "generic") (= (. t features) "+neon,+crc"))))
+    (check cs "a generic x86 host with no feature list is not promoted to the v3 release floor"
+           (= (target-of-host "x86_64-pc-linux-gnu" "generic" "") (Target "generic" "" 128 false)))
+    (check cs "x86 host detection still honours a disabled FMA feature"
+           (= (target-of-host "x86_64-apple-darwin" "haswell" "+avx2,-fma") (Target "haswell" "+avx2,-fma" 256 false)))
+    (check cs "x86 host detection preserves AVX-512 preferences and FMA"
+           (= (target-of-host "x86_64-pc-linux-gnu" "znver4" "+avx2,+fma,+avx512f")
+              (Target "znver4" "+avx2,+fma,+avx512f" 512 true)))
+    (check cs "an unlisted architecture does not acquire FMA"
+           (not (. (target-of-host "unknown-unknown-unknown" "generic" "") has-fma)))))
+
 (defun main () -> i64
   (let ((cs (checks-new)))
     (do
+      (check-host-targets cs)
       (check cs "x86-64 baseline: 128 bits, no fma" (and (= (. (target-of-cpu "x86-64") vector-bits) 128) (not (. (target-of-cpu "x86-64") has-fma))))
       (check cs "x86-64-v2: 128 bits, no fma" (and (= (. (target-of-cpu "x86-64-v2") vector-bits) 128) (not (. (target-of-cpu "x86-64-v2") has-fma))))
       (check cs "x86-64-v3: 256 bits, fma" (and (= (. (target-of-cpu "x86-64-v3") vector-bits) 256) (. (target-of-cpu "x86-64-v3") has-fma)))

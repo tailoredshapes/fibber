@@ -16,8 +16,27 @@ ck "x86-64-v3: the target form is the first line" "$(FIB_TARGET_CPU=x86-64-v3 "$
 host=$(env -u FIB_TARGET_CPU "$s2" emit "$T/plain.fib" | head -1)
 case $host in
   '(target (cpu "'*'") (features "'*'"))') echo "ok   unset: the host's CPU and its features: ${host:0:60}..." ;;
-  '(target (cpu "apple-'*'"))') [ "$(uname -s)" = Darwin ] && echo "ok   unset: the host's CPU (Apple Silicon: a named CPU, no feature list): $host" || { echo "FAIL unset: apple CPU on $(uname -s): [$host]"; bad=1; } ;;
+  '(target (cpu "'*'"))')
+    case "$(uname -s)-$(uname -m)" in
+      Darwin-arm64|Darwin-aarch64) echo "ok   unset: the ARM host's CPU with no feature list: $host" ;;
+      *) echo "FAIL unset: no host features on $(uname -s)-$(uname -m): [$host]"; bad=1 ;;
+    esac ;;
   *) echo "FAIL unset: wanted the host's target form, got [$host]"; bad=1 ;;
+esac
+# The real ARM host must report FMA and run fused arithmetic, including when LLVM calls the CPU generic and lists no features.
+case "$(uname -m)" in
+  arm64|aarch64)
+    cat > "$T/fma.fib" <<'EOF2'
+(ns main (:use fib.core))
+(defun main () -> i64
+  (let ((a (double (unwrap (parse-long (nth (args) 0))))))
+    (if (and (has-fma) (= (simd/fma a a (neg (* a a))) 1.0)
+             (= (lane (simd/fma (splat f64x2 a) (splat f64x2 a) (splat f64x2 (neg (* a a)))) 1) 1.0)) 0 1)))
+EOF2
+    env -u FIB_TARGET_CPU "$s2" run "$T/fma.fib" -- 134217729 > "$T/fma.out" 2>&1
+    ck "ARM host: fused arithmetic runs successfully" "$?" 0
+    ck "ARM host: has-fma and scalar/vector fused arithmetic" "$(cat "$T/fma.out")" 0 ;;
+  *) echo "skip ARM host FMA execution: this host is $(uname -m)" ;;
 esac
 lanes() { # CPU TYPE LANES: a function that takes TYPE and returns the explicit vector of LANES; the program is checked (emit is rejected or not)
   printf '(defun f (v: %s) -> %s v)\n(defun main () -> i64 7)\n' "$2" "$3" > "$T/l.fib"

@@ -58,7 +58,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_TARGET_TRIPLE` | [compiler/driver/commands.fib:56](../../compiler/driver/commands.fib#L56) |
 | `FIB_THREADS` | [rt/deque.lir:145](../../rt/deque.lir#L145) |
 | `FIB_TRACE` | [compiler/driver/commands.fib:48](../../compiler/driver/commands.fib#L48) |
-| `FIB_VECTOR_BITS` | [compiler/native/target.fib:28](../../compiler/native/target.fib#L28) |
+| `FIB_VECTOR_BITS` | [compiler/native/target.fib:29](../../compiler/native/target.fib#L29) |
 | `FIB_VIA` | [compiler/driver/viac.fib:22](../../compiler/driver/viac.fib#L22) |
 | `FIB_WASM_MAX_MEMORY` | [compiler/native/linkwasm.fib:75](../../compiler/native/linkwasm.fib#L75) |
 | `FIB_WASM_NAMES` | [compiler/native/linkwasm.fib:80](../../compiler/native/linkwasm.fib#L80) |
