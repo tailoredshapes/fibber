@@ -9,9 +9,6 @@
 (extern exp (f64) -> f64)
 (extern log (f64) -> f64)
 (extern tanh (f64) -> f64)
-(extern expf (f32) -> f32)
-(extern logf (f32) -> f32)
-(extern tanhf (f32) -> f32)
 
 (defun ulps (a: f64 b: f64) -> i64
   (cond (= a b) 0
@@ -30,7 +27,10 @@
 (defun op32 (op: i64 x: (t/Tensor f32)) -> (t/Tensor f32)
   (cond (= op 0) (t/exp x) (= op 1) (t/log x) :else (t/tanh x)))
 (defun lib64 (op: i64 x: f64) -> f64 (unsafe (cond (= op 0) (exp x) (= op 1) (log x) :else (tanh x))))
-(defun lib32 (op: i64 x: f32) -> f32 (unsafe (cond (= op 0) (expf x) (= op 1) (logf x) :else (tanhf x))))
+;; Round the f64 libm reference to f32. Older tanhf implementations (glibc 2.39
+;; in CI) can themselves be 2 ULP wrong; comparing with them rejects a correct
+;; tensor result. This keeps the 1 ULP bound and the independent scalar oracle.
+(defun lib32 (op: i64 x: f32) -> f32 (float (lib64 op (double x))))
 
 (defun worst64 (op: i64 xs: (Array f64)) -> i64
   (let ((n (array-len xs)) (y (t/to-array (op64 op (t/from-array [n] xs 0.0)))))
