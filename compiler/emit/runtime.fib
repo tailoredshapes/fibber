@@ -1985,7 +1985,10 @@
     (br (icmp eq mode (i64 1)) push forever))
   (block forever
     (store (i64 0) (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))
-    (br (icmp eq mode (i64 3)) maybetrace push))
+    (br (icmp eq mode (i64 3)) maybetrace def))
+  (block def
+    (br (icmp eq (call @fib.class (call @fib.tid p)) (i8 97)) register push))
+  (block register (call @fib.def-atom-register p) (br push))
   (block maybetrace (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced push))
   (block traced
     (call @fib.trace-line (i8 70) (load i64 (getelementptr i8 p (i64 -16))) (i8 0))
@@ -2004,6 +2007,43 @@
   (block entry
     (call @fib.walk p (i64 2))
     (ret)))
+
+;; A runtime def may contain an atom, including one inside an immortal graph.
+;; Register each atom once while it first becomes immortal. Initialization is
+;; single-threaded, and the records contain no counted references of their own.
+(defstruct fib.defatom (ptr ptr))
+(global internal fib.defatoms ptr (ptr null))
+(define internal (fib.def-atom-register void) ((ptr p))
+  (block entry
+    (let ((record (call @malloc (i64 16))))
+      (br (icmp eq record (ptr null)) oom save)))
+  (block oom (call @fib.fatal-c (string \"out of memory\")) (unreachable))
+  (block save
+    (store (load ptr @fib.defatoms) (getelementptr %struct.fib.defatom record (i32 0) (i32 0)))
+    (store p (getelementptr %struct.fib.defatom record (i32 0) (i32 1)))
+    (store record @fib.defatoms)
+    (ret)))
+
+;; After joining threads and quiescing the pool, release the final payloads of
+;; immortal atoms. The roots and their original immortal children stay immortal;
+;; values installed while main ran retain normal counts and must be released.
+;; Detaching the list makes repeated cleanup harmless.
+(define internal (fib.defs-drop void) ()
+  (block entry
+    (let ((head (load ptr @fib.defatoms)))
+      (store (ptr null) @fib.defatoms)
+      (br loop)))
+  (block loop
+    (let ((record (phi ptr (entry head) (drop next))))
+      (br (icmp eq record (ptr null)) done drop)))
+  (block drop
+    (let ((next (load ptr (getelementptr %struct.fib.defatom record (i32 0) (i32 0))))
+          (p (load ptr (getelementptr %struct.fib.defatom record (i32 0) (i32 1))))
+          (trace (load ptr (getelementptr %struct.fib.typerec @fib.types (call @fib.tid p) (i32 1)))))
+      (indirect-call trace (fn void (ptr ptr)) p @fib.release)
+      (call @free record)
+      (br loop)))
+  (block done (ret)))
 
 ;; `(freeze x)` (P-count-b, spec/types.md 8.2): the value graph of x becomes
 ;; IMMORTAL and SHARED, so that a retain or a release of any object in it is a
