@@ -48,8 +48,8 @@
     (fn (port: i64) (let [cl (build (with (default-options) (throw-exceptions false)))] (str (up cl (str "http://127.0.0.1:" port "/x") nil (producer 300000 10000)) "|" (up cl (str "http://127.0.0.1:" port "/x") (some 10) (producer 10 10)))))))
 
 ;; ---- liveness
-(defun idle-then-post (idle-ms: i64) -> (Pair str str)
-  (match (sv/run-server (fn (r: Request) (text-response 200 (. r request-method))) (with (st/default-options) (port 0) (idle-timeout-ms 150)))
+(defun idle-then-post (idle-ms: i64 options: st/Options) -> (Pair str str)
+  (match (sv/run-server (fn (r: Request) (text-response 200 (. r request-method))) (with options (port 0)))
     ((Err e) (Pair (error-message e) ""))
     ((Ok srv) (let [cl (build (default-options)) base (str "http://127.0.0.1:" (sv/port srv))
                     a (match (c/request-with cl (ClientRequest "GET" (str base "/") {} (array 0 0i8))) ((Ok r) (str-from-bytes (. r body))) ((Err e) (error-message e)))
@@ -98,10 +98,12 @@
       (then (expect = true (starts-with? r "body error:")) (expect = true (s-ends r "bytes=10 te=- cl=10")))))
   (feature "liveness of pooled connections"
     (scenario "a connection the server closed while idle is not reused: a POST (never retried) succeeds on a fresh one"
-      (given [r (idle-then-post 500)])
+      (given [r (idle-then-post 500 (with (st/default-options) (idle-timeout-ms 150)))])
       (then (expect = "GET,POST" (. r fst)) (expect = "2/0" (. r snd))))
     (scenario "a connection that is still alive is reused"
-      (given [r (idle-then-post 20)])
+      ;; The live peer keeps the normal server deadline. A 150 ms expiry made a
+      ;; scheduler pause turn this into the closed-peer case on a loaded Mac.
+      (given [r (idle-then-post 500 (st/default-options))])
       (then (expect = "GET,POST" (. r fst)) (expect = "1/1" (. r snd)))))
   (feature "stop with connections queued"
     (scenario "a connection the acceptor never took gets a 503 and an orderly end of stream; the one in service finishes"
