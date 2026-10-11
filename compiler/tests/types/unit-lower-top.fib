@@ -8,9 +8,10 @@
 ;; - the instances a field-less enum gets from the builtin protocols (`scalar_enum_instances`).
 ;; Run from the repository root.
 ;; Build: fibc build compiler/tests/types/unit-lower-top.fib -I compiler -I lib -o OUT
-(ns main (:use fib.string syntax.pos syntax.form syntax.reader types.ty types.error types.ast
-               types.table types.decls types.check types.lower.typeform types.lower.top
-               types.lower.mod))
+(ns tests.types.unit-lower-top (:use fib.string syntax.pos syntax.form syntax.reader types.ty types.error types.ast
+               types.table types.decls fib.test.unit types.lower.typeform types.lower.top
+               types.lower.mod)
+  (:require [fib.test.run :as test-runner]))
 
 (defun forms-of (src: str) -> (Vec Stx)
   (match (read-all src "t")
@@ -44,8 +45,8 @@
     ((Err es) (mapv (fn (e: TypeError) (str-join [(show (. (. e pos) line)) ":" (show (. (. e pos) col)) " " (. e message)])) es))))
 
 ;; got equals want; what `got` was when it is not
-(defun expect (cs: Checks name: str got: a want: a) :where ((Eq a) (Show a)) -> unit
-  (do (check cs name (= got want))
+(defun expect (cs: StepLog name: str got: a want: a) :where ((Eq a) (Show a)) -> unit
+  (do (is cs (= got want) name)
       (if (not (= got want))
           (println (str-join ["  want " (show want) "\n  got  " (show got)]))
           ())))
@@ -63,7 +64,7 @@
      (str-join [name " (" (join " " (mapv param-words (. parts params))) ") where=" (show (some? (. parts bounds)))
                 " ret=" (show (some? (. parts ret))) " body=" (show (count (. parts body)))]))))
 
-(defun defun-parts-checks (cs: Checks) -> unit
+(defun defun-parts-checks (cs: StepLog) -> unit
   (do (expect cs "plain" (parts-text "(defun f (a b) a)")
                "f (a b) where=false ret=false body=1")
       (expect cs "annotated, amp, borrow" (parts-text "(defun f (a: i64 &b c :borrow d: str :borrow) -> i64 1 2)")
@@ -104,7 +105,7 @@
     ((Err e) (text-of (Err e)))
     ((Ok [name ann init]) (str-join [name " ann=" (show (some? ann)) " init=" (show (. (. init pos) col))]))))
 
-(defun def-parts-checks (cs: Checks) -> unit
+(defun def-parts-checks (cs: StepLog) -> unit
   (do (expect cs "def" (def-text "(def a 1)")
                "a ann=false init=8")
       (expect cs "def with a type" (def-text "(def a: i64 1)")
@@ -129,7 +130,7 @@
      (str-join [name " " (match ty ((TFn k ps r) (str-join [(show (count ps)) (if (= k CSend) " send" " other")])) (_ "?"))
                 (if varargs " varargs" "")]))))
 
-(defun extern-checks (cs: Checks) -> unit
+(defun extern-checks (cs: StepLog) -> unit
   (do (expect cs "extern" (extern-text "(extern c (i64 ptr) -> unit)")
                "c 2 send")
       (expect cs "varargs among the options" (extern-text "(extern c (ptr) -> i32 :other :varargs)")
@@ -162,7 +163,7 @@
        ((Err es) (errs-text (Err es)))
        ((Ok it) [(items-text it)])))))
 
-(defun module-step-checks (cs: Checks) -> unit
+(defun module-step-checks (cs: StepLog) -> unit
   (do (expect cs "funs and defs get ids in order" (lower-text (world) "(defun f () 1) (def a 2) (defun g () 3) (def b 4) (ns x)")
                ["funs=[0 1] defs=[0 1] impls=[] macros=[]"])
       (expect cs "an empty module" (lower-text (world) "")
@@ -174,10 +175,9 @@
                ["1:13 unbound name nowhere" "1:48 unbound name nope" "1:29 unbound name nope2"])
       (expect cs "a def takes any initialiser (L15): a function value, a call, an if" (lower-text (world) "(defun f () 1) (def a (fn (x) x)) (def b (f)) (def c (if true 1 2))")
                ["funs=[0] defs=[0 1 2] impls=[] macros=[]"])
-      (check cs "a body error leaves the placeholder, the next funs are still lowered"
-             (let ((g (world)))
+      (is cs (let ((g (world)))
                (do (lower-text g "(defun f () nowhere) (defun h (a) a)")
-                   (and (= (count (. (g-fun g 1) params)) 1) (empty? (. (g-fun g 0) params))))))))
+                   (and (= (count (. (g-fun g 1) params)) 1) (empty? (. (g-fun g 0) params))))) "a body error leaves the placeholder, the next funs are still lowered")))
 
 ;; The `constant` field of each def of a module (the constant grammar of syntax §3.19): a literal, a
 ;; function, a constructor over constants and an earlier constant def are; a call of a function, a
@@ -187,7 +187,7 @@
     (do (lower-text g src)
         (mapv (fn (d: DefDef) (. d constant)) (table-rows (. g defs))))))
 
-(defun constant-checks (cs: Checks) -> unit
+(defun constant-checks (cs: StepLog) -> unit
   (do (expect cs "a literal, a function and a quoted form are constants" (constants-of "(defun f () 1) (def a 1) (def b f) (def c 'x)")
                [true true true])
       (expect cs "a call of a function is not" (constants-of "(defun f () 1) (def a (f))")
@@ -201,7 +201,7 @@
                (constants-of "(defun f () 1) (def a 1) (def b a) (def c (f)) (def d c) (def e later) (def later 2)")
                [true true false false false true])))
 
-(defun macro-checks (cs: Checks) -> unit
+(defun macro-checks (cs: StepLog) -> unit
   (let ((g (world)))
     (do (expect cs "a macro needs Form in the world" (lower-text g "(defmacro m (a) a)")
                ["1:1 Form is not declared"])
@@ -216,22 +216,28 @@
         (expect cs "macros are appended after the funs, their ids from the table's count" (lower-text g "(defmacro m (a ... r) a) (defun f () 1) (defmacro n () 1)")
                ["funs=[0] defs=[] impls=[] macros=[1 2]"])
         (let ((m (g-fun g 1)))
-          (check cs "the macro is a function over Form with a rest of (Vec Form)"
-                 (and (. m is-macro) (= (count (. m params)) 2)
+          (is cs (and (. m is-macro) (= (count (. m params)) 2)
                       (= (. (nth (. m params) 0) ann) (some (ANominal 7 [])))
-                      (= (. (nth (. m params) 1) ann) (some (ANominal 8 [(ANominal 7 [])])))))))))
+                      (= (. (nth (. m params) 1) ann) (some (ANominal 8 [(ANominal 7 [])])))) "the macro is a function over Form with a rest of (Vec Form)")))))
 
-(defun enum-checks (cs: Checks) -> unit
+(defun enum-checks (cs: StepLog) -> unit
   (let ((g (world)))
     (do (doseq [p ["Eq" "Ord" "Hash" "Show"]] (add-builtin-proto g p))
         (expect cs "a field-less enum gets Eq, Ord, Hash and Show" (lower-text g "(defenum Colour Red Green)")
                ["funs=[] defs=[] impls=[] macros=[]"])
         (expect cs "four instances, in the builtin protocols' order" (mapv (fn (i: InstanceDef) (. (g-proto g (. i proto)) name)) (table-rows (. g instances)))
                ["Eq" "Ord" "Hash" "Show"])
-        (check cs "of the builtin module, no methods" (every? (fn (i: InstanceDef) (and (= (. i module) module-builtin) (empty? (. i methods)))) (table-rows (. g instances)))))))
+        (is cs (every? (fn (i: InstanceDef) (and (= (. i module) module-builtin) (empty? (. i methods)))) (table-rows (. g instances))) "of the builtin module, no methods"))))
 
-(defun main () -> i64
-  (let ((cs (checks-new)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
     (do (defun-parts-checks cs) (def-parts-checks cs) (extern-checks cs) (constant-checks cs)
         (module-step-checks cs) (macro-checks cs) (enum-checks cs)
-        (finish cs))))
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-lower-top" [(test-case "checks" unit-steps "compiler/tests/types/unit-lower-top.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

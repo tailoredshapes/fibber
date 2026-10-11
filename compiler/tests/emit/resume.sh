@@ -13,5 +13,14 @@ mkdir -p "$S"
 (cd "$R" && "$FIBC" build compiler/tests/emit/unit-resume.fib -I compiler -I lib -L "${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" -l LLVM-21 -o "$S/resume-test")
 "$S/resume-test" cases > "$S/fib.out"
 if [ "$upd" -eq 1 ]; then cp "$S/fib.out" "$R/compiler/tests/emit/resume.golden"; echo "resume: golden updated"; fi
-"$S/resume-test" > "$S/checks.out" || { tail -5 "$S/checks.out"; exit 1; }
-cmp "$R/compiler/tests/emit/resume.golden" "$S/fib.out" && echo "resume: $(grep -c '^==' "$S/fib.out") cases byte for byte equal to resume.golden; $(grep -c '^ok' "$S/checks.out") checks ok"
+"$S/resume-test" --format json > "$S/checks.out" || { cat "$S/checks.out"; exit 1; }
+cmp "$R/compiler/tests/emit/resume.golden" "$S/fib.out"
+python3 - "$S/checks.out" "$S/fib.out" <<'PY_CHECK'
+import json, sys
+r = json.load(open(sys.argv[1]))
+assert r["summary"]["pass"] == 1 and len(r["results"]) == 1
+steps = r["results"][0]["steps"]
+assert steps and all(s["status"] == "held" for s in steps)
+cases = sum(line.startswith("==") for line in open(sys.argv[2]))
+print(f"resume: {cases} cases byte for byte equal to resume.golden; {len(steps)} checks ok")
+PY_CHECK

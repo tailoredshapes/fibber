@@ -4,8 +4,9 @@
 ;; `the_other_clause_of_a_library_head_is_not_a_stage`, `a_clause_head_of_the_modules_own_is_not_the_librarys`;
 ;; scan.rs `a_terminal_call_is_seen_by_name_and_arity`.
 ;; Build: fibc build compiler/tests/expand/unit-x9b.fib -I compiler -I lib -o OUT
-(ns main
-  (:use types.check syntax.pos syntax.form expand.build expand.params expand.fusetab expand.fusescan expand.fuse))
+(ns tests.expand.unit-x9b
+  (:use fib.test.unit syntax.pos syntax.form expand.build expand.params expand.fusetab expand.fusescan expand.fuse)
+  (:require [fib.test.run :as test-runner]))
 
 (defun p0 () -> Pos (Pos "t" 1 1 0 0))
 (defun s (name: str) -> Stx (sym name (p0)))
@@ -36,44 +37,42 @@
 (defun stage? (env: FuseEnv head: str) -> bool
   (some? (fuse-stage-call env (call-of head ["f" "c"]))))
 
-(defun main () -> i64
-  (let ((cs (checks-new)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
     (do
-      (check cs "a :borrow after a typed parameter's type is part of it"
-             (and (= (arity [(s "f:") (lst [(s "fn") (lst [(s "a")]) (s "b")]) (kw "borrow") (s "x:") (s "a")]) 2)
+      (is cs (and (= (arity [(s "f:") (lst [(s "fn") (lst [(s "a")]) (s "b")]) (kw "borrow") (s "x:") (s "a")]) 2)
                   (= (arity [(s "x:") (s "a") (kw "borrow")]) 1)
-                  (= (arity [(s "x:") (s "a") (kw "borrow") (s "y:") (s "b")]) 2)))
-      (check cs "only :borrow is taken, and only after a type"
-             (and (= (arity [(s "x:") (s "a") (kw "other")]) 2)
-                  (= (arity [(s "x") (kw "borrow")]) 2)))
-      (check cs "a clause suffix of the call's count is taken off the head"
-             (and (head-is? "map$2" 2 nil "map")
+                  (= (arity [(s "x:") (s "a") (kw "borrow") (s "y:") (s "b")]) 2)) "a :borrow after a typed parameter's type is part of it")
+      (is cs (and (= (arity [(s "x:") (s "a") (kw "other")]) 2)
+                  (= (arity [(s "x") (kw "borrow")]) 2)) "only :borrow is taken, and only after a type")
+      (is cs (and (head-is? "map$2" 2 nil "map")
                   (head-is? "fib.seq/map$2" 2 (some FacSeq) "map")
-                  (head-is? "sort$1" 1 nil "sort")))
-      (check cs "another count's suffix, or none, leaves the head as it is"
-             (and (head-is? "map$3" 2 nil "map$3")
+                  (head-is? "sort$1" 1 nil "sort")) "a clause suffix of the call's count is taken off the head")
+      (is cs (and (head-is? "map$3" 2 nil "map$3")
                   (head-is? "map" 2 nil "map")
-                  (head-is? "$" 0 nil "$")))
-      (check cs "a head of multibyte characters is cut byte-wise, never inside one"
-             (and (head-is? "é$2" 2 nil "é")
+                  (head-is? "$" 0 nil "$")) "another count's suffix, or none, leaves the head as it is")
+      (is cs (and (head-is? "é$2" 2 nil "é")
                   (head-is? "é" 1 nil "é")
-                  (head-is? "日本" 2 nil "日本")))
-      (check cs "a clause-picked library head still fuses"
-             (and (terminal? (env-of []) "sort$1" ["v"])
+                  (head-is? "日本" 2 nil "日本")) "a head of multibyte characters is cut byte-wise, never inside one")
+      (is cs (and (terminal? (env-of []) "sort$1" ["v"])
                   (stage? (env-of []) "map$2")
-                  (stage? (env-of []) "fib.seq/map$2")))
-      (check cs "the other clause of a library head is not a stage or a terminal"
-             (and (not (stage? (env-of []) "map$3"))
+                  (stage? (env-of []) "fib.seq/map$2")) "a clause-picked library head still fuses")
+      (is cs (and (not (stage? (env-of []) "map$3"))
                   (not (terminal? (env-of []) "sort$2" ["a" "b"]))
-                  (terminal? (env-of []) "sort-by$2" ["a" "b"])))
-      (check cs "a clause head of the module's own is not the library's"
-             (and (not (stage? (env-of ["map$2"]) "map$2"))
+                  (terminal? (env-of []) "sort-by$2" ["a" "b"])) "the other clause of a library head is not a stage or a terminal")
+      (is cs (and (not (stage? (env-of ["map$2"]) "map$2"))
                   (not (terminal? (env-of ["sort$1"]) "sort$1" ["v"]))
                   (not (stage? (env-of ["map"]) "map$2"))
-                  (stage? (env-of ["map$3"]) "map$2")))
-      (check cs "a terminal call is seen by name and arity"
-             (and (fuse-calls-a-terminal? (lst [(s "do") (lst [(s "sort$1") (s "v")])]))
+                  (stage? (env-of ["map$3"]) "map$2")) "a clause head of the module's own is not the library's")
+      (is cs (and (fuse-calls-a-terminal? (lst [(s "do") (lst [(s "sort$1") (s "v")])]))
                   (fuse-calls-a-terminal? (lst [(s "count") (s "v")]))
                   (not (fuse-calls-a-terminal? (lst [(s "sort$2") (s "a") (s "b")])))
-                  (not (fuse-calls-a-terminal? (lst [])))))
-      (finish cs))))
+                  (not (fuse-calls-a-terminal? (lst [])))) "a terminal call is seen by name and arity")
+      (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "expand/unit-x9b" [(test-case "checks" unit-steps "compiler/tests/expand/unit-x9b.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

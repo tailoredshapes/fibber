@@ -9,8 +9,9 @@
 ;; program before then, build it with `-I DIR` first, DIR holding stand-ins
 ;; for the two functions (DIR/types/lower/{impl-head,supers}.fib).
 ;; Build: fibc build compiler/tests/types/unit-solve-inst.fib -I compiler -I lib -o OUT
-(ns main (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
-               types.decls types.infer.cx types.infer.unify types.infer.solve types.check))
+(ns tests.types.unit-solve-inst (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
+               types.decls types.infer.cx types.infer.unify types.infer.solve fib.test.unit)
+  (:require [fib.test.run :as test-runner]))
 
 (def p0: Pos (Pos "t" 1 1 0 0))
 
@@ -76,91 +77,83 @@
     ((DkWeakable _) "weakable")
     (_ "other")))
 
-(defun instance-tests (cs: Checks) -> unit
+(defun instance-tests (cs: StepLog) -> unit
   (do
     (let ((cx (cx-of)))
       (do (defer-at cx (DkProto 0 [(ty-i64)] nil) 7)
-          (check cs "a type with an instance: solved, resolved to it, nothing left"
-                 (and (ok? (cx-solve-all cx)) (= (left cx) 0) (res-instance? cx 7 0 [])
-                      (= @(. (. cx u) sites) [7])))))
+          (is cs (and (ok? (cx-solve-all cx)) (= (left cx) 0) (res-instance? cx 7 0 [])
+                      (= @(. (. cx u) sites) [7])) "a type with an instance: solved, resolved to it, nothing left")))
     (let ((cx (cx-of)))
       (do (defer-at cx (DkProto 0 [(ty-nominal 2 [(ty-i64) (ty-i64)])] nil) 3)
-          (check cs "an instance's variables are fresh, in order; its context is solved in the next round"
-                 (and (ok? (cx-solve-all cx)) (= (left cx) 0)
+          (is cs (and (ok? (cx-solve-all cx)) (= (left cx) 0)
                       (res-instance? cx 3 1 [(TVar 0) (TVar 1)])
                       (same? cx (TVar 0) (ty-i64)) (same? cx (TVar 1) (ty-i64))
-                      (= (cx-fresh cx) (TVar 2))))))
+                      (= (cx-fresh cx) (TVar 2))) "an instance's variables are fresh, in order; its context is solved in the next round")))
     (let ((cx (cx-of)))
       (do (defer cx (DkProto 0 [(ty-nominal 2 [(ty-i64) (ty-str)])] nil))
-          (check cs "the context fails on the type that has no instance"
-                 (failed (cx-solve-all cx) NoInstance "no implementation of Show for str"))))
+          (is cs (failed (cx-solve-all cx) NoInstance "no implementation of Show for str") "the context fails on the type that has no instance")))
     (let ((cx (cx-of)))
       (do (defer cx (DkProto 0 [(ty-str)] nil))
-          (check cs "no instance at the head constructor"
-                 (failed (cx-solve-all cx) NoInstance "no implementation of Show for str"))))
+          (is cs (failed (cx-solve-all cx) NoInstance "no implementation of Show for str") "no instance at the head constructor")))
     (let ((cx (cx-of)) (v (cx-fresh cx)))
       (do (defer cx (DkProto 1 [(ty-str) v] nil))
-          (check cs "the instance's determined arguments are unified with the constraint's"
-                 (and (ok? (cx-solve-all cx)) (same? cx v (ty-i64))))))
+          (is cs (and (ok? (cx-solve-all cx)) (same? cx v (ty-i64))) "the instance's determined arguments are unified with the constraint's")))
     (let ((cx (cx-of)))
       (do (defer cx (DkProto 1 [(ty-str) (ty-cell (ty-i64))] nil))
-          (check cs "a determined argument that disagrees is a Unify error"
-                 (failed (cx-solve-all cx) Unify "cannot unify i64 with (Cell i64)"))))
+          (is cs (failed (cx-solve-all cx) Unify "cannot unify i64 with (Cell i64)") "a determined argument that disagrees is a Unify error")))
     (let ((cx (cx-of)) (v (cx-fresh cx)))
       (do (defer cx (DkProto 1 [(ty-nominal 2 [(ty-i64) (ty-str)]) v] nil))
-          (check cs "a determined argument may be a variable of the instance"
-                 (and (ok? (cx-solve-all cx)) (same? cx v (ty-i64))))))
+          (is cs (and (ok? (cx-solve-all cx)) (same? cx v (ty-i64))) "a determined argument may be a variable of the instance")))
     (let ((cx (cx-of)) (v (cx-fresh cx)))
       (do (set! (. (. cx u) fun) "caller")
           (cx-defer cx (DkProto 0 [(ty-nominal 3 [v])] nil) (Pos "t" 9 9 0 0) (some 4))
-          (check cs "an instance context gives one constraint of each kind, in order, from the same place"
-                 (and (ok? (cx-solve-all cx)) (= (left cx) 4)
+          (is cs (and (ok? (cx-solve-all cx)) (= (left cx) 4)
                       (= (mapv kind-name @(. (. cx u) deferred))
                          ["proto 0" "send 0" "object an instance context" "weakable"])
                       (every? (fn (d: Deferred) (and (nil? (. d site)) (= (. d fun) "caller")
                                                      (= (. (. d pos) line) 9)))
-                              @(. (. cx u) deferred))))))))
+                              @(. (. cx u) deferred))) "an instance context gives one constraint of each kind, in order, from the same place")))))
 
-(defun colour-tests (cs: Checks) -> unit
+(defun colour-tests (cs: StepLog) -> unit
   (do
     (let ((cx (cx-of)))
       (do (defer cx (DkProto 0 [(n-of CLocal (ty-i64))] nil))
-          (check cs "a head that fixes :send does not cover :local"
-                 (failed (cx-solve-all cx) NoInstance "no implementation of Show for (N :local i64)"))))
+          (is cs (failed (cx-solve-all cx) NoInstance "no implementation of Show for (N :local i64)") "a head that fixes :send does not cover :local")))
     (let ((cx (cx-of)))
       (do (defer cx (DkProto 0 [(n-of (CRigid 0) (ty-i64))] nil))
-          (check cs "nor a rigid colour"
-                 (match (cx-solve-all cx) ((Err e) (= (. e kind) NoInstance)) (_ false)))))
+          (is cs (match (cx-solve-all cx) ((Err e) (= (. e kind) NoInstance)) (_ false)) "nor a rigid colour")))
     (let ((cx (cx-of)))
       (do (defer cx (DkProto 0 [(n-of CSend (ty-i64))] nil))
-          (check cs "it covers :send itself"
-                 (and (ok? (cx-solve-all cx)) (= (left cx) 0)))))
+          (is cs (and (ok? (cx-solve-all cx)) (= (left cx) 0)) "it covers :send itself")))
     (let ((cx (cx-of)))
       (do (defer cx (DkProto 0 [(n-of (CVar 0) (ty-i64))] nil))
-          (check cs "a colour variable is left to unification: constraints both ways"
-                 (and (ok? (cx-solve-all cx)) (= (left cx) 0)
-                      (= (count @(. (. cx u) colours)) 2)))))))
+          (is cs (and (ok? (cx-solve-all cx)) (= (left cx) 0)
+                      (= (count @(. (. cx u) colours)) 2)) "a colour variable is left to unification: constraints both ways")))))
 
-(defun dyn-tests (cs: Checks) -> unit
+(defun dyn-tests (cs: StepLog) -> unit
   (let ((dyn-sub (TCon (KDyn 2 false) [(ty-i64)])))
     (do
       (let ((cx (cx-of)) (v (cx-fresh cx)))
         (do (defer-at cx (DkProto 1 [dyn-sub v] nil) 4)
-            (check cs "a dyn of a subprotocol is a dyn of its supertrait, arguments read off the super"
-                   (and (ok? (cx-solve-all cx)) (same? cx v (ty-i64))
-                        (match (get @(. (. cx t) resolutions) 4) ((some (ResDyn)) true) (_ false))))))
+            (is cs (and (ok? (cx-solve-all cx)) (same? cx v (ty-i64))
+                        (match (get @(. (. cx t) resolutions) 4) ((some (ResDyn)) true) (_ false))) "a dyn of a subprotocol is a dyn of its supertrait, arguments read off the super")))
       (let ((cx (cx-of)))
         (do (defer cx (DkProto 0 [dyn-sub] nil))
-            (check cs "a dyn is not an instance of an unrelated protocol"
-                   (failed (cx-solve-all cx) NoInstance "no implementation of Show for (dyn (Sub i64))"))))
+            (is cs (failed (cx-solve-all cx) NoInstance "no implementation of Show for (dyn (Sub i64))") "a dyn is not an instance of an unrelated protocol")))
       (let ((cx (cx-of)) (v (cx-fresh cx)))
         (do (defer cx (DkProto 2 [(TCon (KDyn 1 false) [(ty-i64)]) v] nil))
-            (check cs "a dyn of a supertrait is not a dyn of its subprotocol"
-                   (failed (cx-solve-all cx) NoInstance "no implementation of Sub for (dyn (Conv i64))")))))))
+            (is cs (failed (cx-solve-all cx) NoInstance "no implementation of Sub for (dyn (Conv i64))") "a dyn of a supertrait is not a dyn of its subprotocol"))))))
 
-(defun main () -> i64
-  (let ((cs (checks-new)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
     (do (instance-tests cs)
         (colour-tests cs)
         (dyn-tests cs)
-        (finish cs))))
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-solve-inst" [(test-case "checks" unit-steps "compiler/tests/types/unit-solve-inst.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

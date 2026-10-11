@@ -3,34 +3,35 @@
 ;; scheme and the display of a type error (error.rs display_names_the_
 ;; position).
 ;; Build: fibc build compiler/tests/types/unit-scheme.fib -I compiler -I lib -o OUT
-(ns main (:use types.ty types.scheme types.error types.check syntax.pos))
+(ns tests.types.unit-scheme (:use types.ty types.scheme types.error fib.test.unit syntax.pos)
+  (:require [fib.test.run :as test-runner]))
 
-(defun main () -> i64
-  (let ((cs (checks-new))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec))
         (s (Scheme 1 1 ["a"] [(PProto 0 [(TGen 0)])] [(BCaps (CGen 0) (TGen 0))]
                    (TFn (CGen 0) [(TGen 0)] (TGen 0)) [false] ["x"]))
         (i (scheme-instantiate-with s [(ty-i64)] [CSend])))
     (do
-      (check cs "instantiation substitutes the context" (= (. i preds) [(PProto 0 [(ty-i64)])]))
-      (check cs "instantiation substitutes the colour bounds"
-             (= (. i colour-bounds) [(BCaps CSend (ty-i64))]))
-      (check cs "instantiation substitutes the type"
-             (= (. i ty) (TFn CSend [(ty-i64)] (ty-i64))))
-      (check cs "has-amp is false for no & parameter" (not (scheme-has-amp s)))
-      (check cs "has-amp is true for an & parameter"
-             (scheme-has-amp (Scheme 0 0 [] [] [] (ty-i64) [false true] ["a" "b"])))
-      (check cs "mono has no variables"
-             (= (scheme-mono (ty-str)) (Scheme 0 0 [] [] [] (ty-str) [] [])))
-      (check cs "flow bounds instantiate their colours"
-             (= (. (scheme-instantiate-with
+      (is cs (= (. i preds) [(PProto 0 [(ty-i64)])]) "instantiation substitutes the context")
+      (is cs (= (. i colour-bounds) [(BCaps CSend (ty-i64))]) "instantiation substitutes the colour bounds")
+      (is cs (= (. i ty) (TFn CSend [(ty-i64)] (ty-i64))) "instantiation substitutes the type")
+      (is cs (not (scheme-has-amp s)) "has-amp is false for no & parameter")
+      (is cs (scheme-has-amp (Scheme 0 0 [] [] [] (ty-i64) [false true] ["a" "b"])) "has-amp is true for an & parameter")
+      (is cs (= (scheme-mono (ty-str)) (Scheme 0 0 [] [] [] (ty-str) [] [])) "mono has no variables")
+      (is cs (= (. (scheme-instantiate-with
                      (Scheme 0 2 [] [] [(BFlow (CGen 0) (CGen 1))] (ty-unit) [] [])
                      [] [CLocal CSend]) colour-bounds)
-                [(BFlow CLocal CSend)]))
-      (check cs "a type error displays its position and message"
-             (= (type-error-text (type-error Unify (Pos "f.fib" 3 7 0 1) "cannot unify i64 with str"))
-                "f.fib:3:7: cannot unify i64 with str"))
-      (check cs "error kinds are named" (= (error-kind-name DefCycle) "DefCycle"))
-      (check cs "the constructors set the kind"
-             (and (= (. (type-error-resolve (Pos "f" 1 1 0 0) "m") kind) Resolve)
-                  (= (. (type-error-other (Pos "f" 1 1 0 0) "m") kind) Other)))
-      (finish cs))))
+                [(BFlow CLocal CSend)]) "flow bounds instantiate their colours")
+      (is cs (= (type-error-text (type-error Unify (Pos "f.fib" 3 7 0 1) "cannot unify i64 with str"))
+                "f.fib:3:7: cannot unify i64 with str") "a type error displays its position and message")
+      (is cs (= (error-kind-name DefCycle) "DefCycle") "error kinds are named")
+      (is cs (and (= (. (type-error-resolve (Pos "f" 1 1 0 0) "m") kind) Resolve)
+                  (= (. (type-error-other (Pos "f" 1 1 0 0) "m") kind) Other)) "the constructors set the kind")
+      (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-scheme" [(test-case "checks" unit-steps "compiler/tests/types/unit-scheme.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

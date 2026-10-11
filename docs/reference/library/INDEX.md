@@ -57,6 +57,7 @@ All exports are pre-1.0; proposed S/E/I classes and “since” versions await e
 | [fib.test.arch](fib.test.arch.md) | 86 |
 | [fib.test.core](fib.test.core.md) | 30 |
 | [fib.test.run](fib.test.run.md) | 24 |
+| [fib.test.unit](fib.test.unit.md) | 12 |
 | [fib.tls](fib.tls.md) | 89 |
 | [fib.unix](fib.unix.md) | 30 |
 | [fib.view](fib.view.md) | 22 |

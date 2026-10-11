@@ -6,23 +6,23 @@
 ;; only its own bodies, units and functions. The records written here have the shape of those in
 ;; golden/*.txt; unit-golden.fib prints whole modules of those files. Prints `ok NAME` or `FAIL NAME`.
 ;; Build: fibc build compiler/tests/own/unit-dump.fib -I compiler -I lib -o OUT
-(ns main
+(ns tests.own.unit-dump
   (:require [own.args :as a] [own.dump :as d] [own.dump.text :as t] [own.dump.bodies :as b]
             [own.dump.units :as u] [types.dump.sections :as s] [types.args :as ta])
   (:use syntax.pos types.ty types.scheme types.table types.ast types.decls types.builtins types.program
-        types.infer.mod types.check own.error own.program own.driver))
+        types.infer.mod fib.test.unit own.error own.program own.driver)
+  (:require [fib.test.run :as test-runner]))
 
 (def pos: Pos (Pos "t.fib" 3 5 10 20))
 
-(defun word-checks (cs: Checks p: TypedProgram) -> unit
+(defun word-checks (cs: StepLog p: TypedProgram) -> unit
   (let ((g (. p globals)))
-    (do (check cs "ids: B and E before a number" (and (= (t/bid 428) "B428") (= (t/eid 3087) "E3087")))
-        (check cs "sites" (= (mapv t/site-text [(SiteBind 3) (SiteValue 4) (SiteCapture 5 6) (SiteEnv 7) (SiteGlobal 8)])
-                             ["b:3" "v:4" "cap:5:6" "env:7" "def:8"]))
-        (check cs "modes" (= (mapv t/mode-text [MScalar (MOwned false) (MOwned true) (MBorrowed (SiteBind 1)) (MDerived (SiteValue 2))])
-                             ["scalar" "owned" "owned!" "borrowed b:1" "derived v:2"]))
-        (check cs "an operation is kind, site, why, and every why has its word"
-               (= (t/ops-text [(Op OpRetain (SiteBind 1) WhyReturn) (Op OpRelease (SiteValue 2) WhyStore)
+    (do (is cs (and (= (t/bid 428) "B428") (= (t/eid 3087) "E3087")) "ids: B and E before a number")
+        (is cs (= (mapv t/site-text [(SiteBind 3) (SiteValue 4) (SiteCapture 5 6) (SiteEnv 7) (SiteGlobal 8)])
+                             ["b:3" "v:4" "cap:5:6" "env:7" "def:8"]) "sites")
+        (is cs (= (mapv t/mode-text [MScalar (MOwned false) (MOwned true) (MBorrowed (SiteBind 1)) (MDerived (SiteValue 2))])
+                             ["scalar" "owned" "owned!" "borrowed b:1" "derived v:2"]) "modes")
+        (is cs (= (t/ops-text [(Op OpRetain (SiteBind 1) WhyReturn) (Op OpRelease (SiteValue 2) WhyStore)
                                (Op OpEndStack (SiteEnv 3) WhyJoin) (Op OpRetain (SiteBind 1) WhyScopeExit)
                                (Op OpRetain (SiteBind 1) WhyStepEnd) (Op OpRetain (SiteBind 1) WhyDerivedExit)
                                (Op OpRetain (SiteBind 1) WhyDiscard) (Op OpRetain (SiteBind 1) WhyParamExit)
@@ -30,39 +30,31 @@
                                (Op OpRetain (SiteBind 1) WhyRecurOld)])
                   (str-join ["retain b:1 return; release v:2 store; end-stack env:3 join; retain b:1 scope-exit; "
                              "retain b:1 step-end; retain b:1 derived-exit; retain b:1 discard; retain b:1 param-exit; "
-                             "retain b:1 loop-init; retain b:1 jump; retain b:1 recur-old"])))
-        (check cs "no operation is no text" (= (t/ops-text []) ""))
-        (check cs "passes" (= (t/passes-text [PsScalar PsBorrow PsMove PsRetain PsAcquire PsForward PsOwnCell PsAlias PsKeepEnv])
-                              "scalar,borrow,move,retain,acquire,forward,own-cell,alias,keep-env"))
-        (check cs "tails"
-               (= (mapv t/tail-text [TlNotInTail TlTailCall (TlOrdinary BcAmpArgument) (TlOrdinary (BcAmpCaptured 4))
+                             "retain b:1 loop-init; retain b:1 jump; retain b:1 recur-old"])) "an operation is kind, site, why, and every why has its word")
+        (is cs (= (t/ops-text []) "") "no operation is no text")
+        (is cs (= (t/passes-text [PsScalar PsBorrow PsMove PsRetain PsAcquire PsForward PsOwnCell PsAlias PsKeepEnv])
+                              "scalar,borrow,move,retain,acquire,forward,own-cell,alias,keep-env") "passes")
+        (is cs (= (mapv t/tail-text [TlNotInTail TlTailCall (TlOrdinary BcAmpArgument) (TlOrdinary (BcAmpCaptured 4))
                                      (TlOrdinary (BcFrameOwned 2)) (TlOrdinary BcAsyncBody) (TlOrdinary BcExtern) (TlOrdinary BcStore)])
                   ["none" "tail" "ordinary:amp-argument" "ordinary:amp-captured:4" "ordinary:frame-owned:2"
-                   "ordinary:async-body" "ordinary:extern" "ordinary:store"]))
-        (check cs "callees by name: a builtin, a method of its protocol"
-               (= (mapv (fn (c: Callee) (t/callee-text p c))
+                   "ordinary:async-body" "ordinary:extern" "ordinary:store"]) "tails")
+        (is cs (= (mapv (fn (c: Callee) (t/callee-text p c))
                         [(CalFun 0) (CalAllOwned 1) (CalMethod 0 1) (CalBuiltin 0) CalCtor CalExtern CalValue])
-                  ["fun f" "allowned g" "method Area.perim" "builtin cell" "ctor" "extern" "value"]))
-        (check cs "parameter kinds: the reasons in the order given, owned alone if none is left"
-               (= (mapv t/param-kind-text [PkScalar PkAmp PkBorrowed (PkOwned [(OwRule1 "returned") OwDeclared (OwLoop "x")]) (PkOwned [])])
-                  ["scalar" "amp" "borrowed" "owned:rule1(returned),declared,loop(x)" "owned"]))
-        (check cs "the reasons, each of the five"
-               (= (t/whys-text [(OwRule1 "a") (OwRule2 "b") (OwRule3 "c") (OwLoop "d") OwDeclared])
-                  "rule1(a),rule2(b),rule3(c),loop(d),declared"))
-        (check cs "a parameter: B, its name from the table, kind, escapes, declared-borrow"
-               (= (t/param-text g (ParamOwn 1 (PkOwned [OwDeclared]) false true)) "B1 y owned:declared escapes=0 declared-borrow=1"))
-        (check cs "binding kinds"
-               (= (mapv t/bind-kind-text [BnScalar BnOwns (BnAliasOf (SiteBind 1)) (BnDerivedOf (SiteValue 2)) BnBorrowedParam BnOwnedParam BnAmpParam])
-                  ["scalar" "owns" "alias-of b:1" "derived-of v:2" "borrowed-param" "owned-param" "amp-param"]))
-        (check cs "allocations and flags" (and (= (mapv t/alloc-text [AlHeap AlStack AlNothing]) ["heap" "stack" "nothing"])
-                                               (= (t/flag-text true) "1") (= (t/flag-text false) "0")))
-        (check cs "the reason of a closure: no, or yes(REASON)" (and (= (t/reason-text nil) "no") (= (t/reason-text (some "async")) "yes(async)")))
-        (check cs "body keys: the method by instance and name, the all-owned ones by their own word"
-               (= (mapv (fn (k: BodyKey) (t/body-key-text g k))
+                  ["fun f" "allowned g" "method Area.perim" "builtin cell" "ctor" "extern" "value"]) "callees by name: a builtin, a method of its protocol")
+        (is cs (= (mapv t/param-kind-text [PkScalar PkAmp PkBorrowed (PkOwned [(OwRule1 "returned") OwDeclared (OwLoop "x")]) (PkOwned [])])
+                  ["scalar" "amp" "borrowed" "owned:rule1(returned),declared,loop(x)" "owned"]) "parameter kinds: the reasons in the order given, owned alone if none is left")
+        (is cs (= (t/whys-text [(OwRule1 "a") (OwRule2 "b") (OwRule3 "c") (OwLoop "d") OwDeclared])
+                  "rule1(a),rule2(b),rule3(c),loop(d),declared") "the reasons, each of the five")
+        (is cs (= (t/param-text g (ParamOwn 1 (PkOwned [OwDeclared]) false true)) "B1 y owned:declared escapes=0 declared-borrow=1") "a parameter: B, its name from the table, kind, escapes, declared-borrow")
+        (is cs (= (mapv t/bind-kind-text [BnScalar BnOwns (BnAliasOf (SiteBind 1)) (BnDerivedOf (SiteValue 2)) BnBorrowedParam BnOwnedParam BnAmpParam])
+                  ["scalar" "owns" "alias-of b:1" "derived-of v:2" "borrowed-param" "owned-param" "amp-param"]) "binding kinds")
+        (is cs (and (= (mapv t/alloc-text [AlHeap AlStack AlNothing]) ["heap" "stack" "nothing"])
+                                               (= (t/flag-text true) "1") (= (t/flag-text false) "0")) "allocations and flags")
+        (is cs (and (= (t/reason-text nil) "no") (= (t/reason-text (some "async")) "yes(async)")) "the reason of a closure: no, or yes(REASON)")
+        (is cs (= (mapv (fn (k: BodyKey) (t/body-key-text g k))
                         [(BodyFun 0) (BodyAllOwned 1) (BodyMethod 0 1) (BodyMethodOwned 0 0) (BodyDef 0)])
-                  ["fun f" "allowned g" "method 0 perim" "methodowned 0 area" "def k"]))
-        (check cs "the module of a body: that of its function, instance or def"
-               (= (mapv (fn (k: BodyKey) (t/body-module g k)) [(BodyFun 0) (BodyAllOwned 1) (BodyMethod 0 1) (BodyDef 0)]) [2 3 2 2])))))
+                  ["fun f" "allowned g" "method 0 perim" "methodowned 0 area" "def k"]) "body keys: the method by instance and name, the all-owned ones by their own word")
+        (is cs (= (mapv (fn (k: BodyKey) (t/body-module g k)) [(BodyFun 0) (BodyAllOwned 1) (BodyMethod 0 1) (BodyDef 0)]) [2 3 2 2]) "the module of a body: that of its function, instance or def"))))
 
 ;; the tables: modules 0 and 1 are the builtins and the prelude, 2 is `main`, 3 is `other`
 (defun tables () -> Globals
@@ -141,76 +133,65 @@
                                    (set-empty) (set-empty) (map-empty)))
                  (UnitFacts [(BodyAllOwned 1)] (facts-empty))]))
 
-(defun section-checks (cs: Checks p: TypedProgram o: OwnedProgram) -> unit
+(defun section-checks (cs: StepLog p: TypedProgram o: OwnedProgram) -> unit
   (let ((g (. p globals)))
-    (do (check cs "a body: its header, then its records kind by kind, each sorted"
-               (= (b/body-lines [] p (BodyFun 0) (body)) body-expected))
-        (check cs "bodies of a module: its own only, in the order decided"
-               (= (b/bodies-section [] p o 2) (b/body-lines [] p (BodyFun 0) (body))))
-        (check cs "an empty body is its header" (= (b/bodies-section [] p o 3) ["body fun g"]))
-        (check cs "the facts of a unit under the module of its first body"
-               (= (u/facts-section [] g o 2) facts-expected))
-        (check cs "a unit with no fact is its header" (= (u/facts-section [] g o 3) ["facts allowned g"]))
-        (check cs "a summary is `(OWNED,ESCAPES)` for each parameter"
-               (= (u/summary-section [] p o 2) ["summary f (1,1) (0,0)"]))
-        (check cs "the summaries follow the module, a function with no parameter is its name"
-               (= (u/summary-section [] p o 3) ["summary g"]))
-        (check cs "taken: a line for each function by id and each method by pair, of the module"
-               (= (u/taken-section [] g o 2) ["taken value f" "taken method 0 perim"]))
-        (check cs "taken in another module" (= (u/taken-section [] g o 3) ["taken value g"])))))
+    (do (is cs (= (b/body-lines [] p (BodyFun 0) (body)) body-expected) "a body: its header, then its records kind by kind, each sorted")
+        (is cs (= (b/bodies-section [] p o 2) (b/body-lines [] p (BodyFun 0) (body))) "bodies of a module: its own only, in the order decided")
+        (is cs (= (b/bodies-section [] p o 3) ["body fun g"]) "an empty body is its header")
+        (is cs (= (u/facts-section [] g o 2) facts-expected) "the facts of a unit under the module of its first body")
+        (is cs (= (u/facts-section [] g o 3) ["facts allowned g"]) "a unit with no fact is its header")
+        (is cs (= (u/summary-section [] p o 2) ["summary f (1,1) (0,0)"]) "a summary is `(OWNED,ESCAPES)` for each parameter")
+        (is cs (= (u/summary-section [] p o 3) ["summary g"]) "the summaries follow the module, a function with no parameter is its name")
+        (is cs (= (u/taken-section [] g o 2) ["taken value f" "taken method 0 perim"]) "taken: a line for each function by id and each method by pair, of the module")
+        (is cs (= (u/taken-section [] g o 3) ["taken value g"]) "taken in another module"))))
 
-(defun dump-checks (cs: Checks p: TypedProgram o: OwnedProgram) -> unit
+(defun dump-checks (cs: StepLog p: TypedProgram o: OwnedProgram) -> unit
   (let ((c (Checked p o))
         (shown (s/Shown 2 "main" "t.fib"))
         (opts (fn (words: (Vec str)) (. (unwrap (a/own-parse-args (into words ["f.fib"]))) opts))))
-    (do (check cs "a module's lines: header, bodies, facts, summary, taken"
-               (= (d/module-lines [] c shown (opts []))
+    (do (is cs (= (d/module-lines [] c shown (opts []))
                   (into (into (into ["-- module main t.fib"] body-expected) facts-expected)
-                        ["summary f (1,1) (0,0)" "taken value f" "taken method 0 perim"])))
-        (check cs "--sections taken prints the header and that section only"
-               (= (d/module-lines [] c shown (opts ["--sections" "taken"]))
-                  ["-- module main t.fib" "taken value f" "taken method 0 perim"]))
-        (check cs "--sections in any order, each once, in the order of the dump"
-               (= (d/module-lines [] c shown (opts ["--sections" "summary,facts"]))
-                  (into (into ["-- module main t.fib"] facts-expected) ["summary f (1,1) (0,0)"])))
-        (check cs "--sections error prints the header only"
-               (= (d/module-lines [] c shown (opts ["--sections" "error"])) ["-- module main t.fib"]))
-        (check cs "an ownership error is a record, its position relative to the file"
-               (= (. (d/own-error-dump ["== f"] [(own-error AmpTwice pos "twice") (own-error ImplEscapes (Pos "u.fib" 1 2 3 4) "m")] "t.fib" true) lines)
-                  ["== f" "error AmpTwice 3:5 10..20: twice" "error ImplEscapes 1:2 3..4@u.fib: m"]))
-        (check cs "and it prints no record when `error` is left out, with status 1"
-               (let ((x (d/own-error-dump ["== f"] [(own-error AmpTwice pos "twice")] "t.fib" false)))
-                 (and (= (. x lines) ["== f"]) (= (. x status) 1)))))))
+                        ["summary f (1,1) (0,0)" "taken value f" "taken method 0 perim"])) "a module's lines: header, bodies, facts, summary, taken")
+        (is cs (= (d/module-lines [] c shown (opts ["--sections" "taken"]))
+                  ["-- module main t.fib" "taken value f" "taken method 0 perim"]) "--sections taken prints the header and that section only")
+        (is cs (= (d/module-lines [] c shown (opts ["--sections" "summary,facts"]))
+                  (into (into ["-- module main t.fib"] facts-expected) ["summary f (1,1) (0,0)"])) "--sections in any order, each once, in the order of the dump")
+        (is cs (= (d/module-lines [] c shown (opts ["--sections" "error"])) ["-- module main t.fib"]) "--sections error prints the header only")
+        (is cs (= (. (d/own-error-dump ["== f"] [(own-error AmpTwice pos "twice") (own-error ImplEscapes (Pos "u.fib" 1 2 3 4) "m")] "t.fib" true) lines)
+                  ["== f" "error AmpTwice 3:5 10..20: twice" "error ImplEscapes 1:2 3..4@u.fib: m"]) "an ownership error is a record, its position relative to the file")
+        (is cs (let ((x (d/own-error-dump ["== f"] [(own-error AmpTwice pos "twice")] "t.fib" false)))
+                 (and (= (. x lines) ["== f"]) (= (. x status) 1))) "and it prints no record when `error` is left out, with status 1"))))
 
-(defun args-checks (cs: Checks) -> unit
+(defun args-checks (cs: StepLog) -> unit
   (let ((parse (fn (words: (Vec str)) (a/own-parse-args words))))
-    (do (check cs "files alone: every section but explain"
-               (let ((r (unwrap (parse ["x.fib" "y.fib"]))))
-                 (and (= (. r files) ["x.fib" "y.fib"]) (a/own-wants (. r opts) a/OsBody) (not (a/own-wants (. r opts) a/OsExplain)))))
-        (check cs "--sections names the sections, in any order, and replaces an earlier list"
-               (let ((o (. (unwrap (parse ["--sections" "body" "--sections" "taken,error" "x"])) opts)))
-                 (and (a/own-wants o a/OsTaken) (a/own-wants o a/OsError) (not (a/own-wants o a/OsBody)))))
-        (check cs "explain only when asked" (a/own-wants (. (unwrap (parse ["--sections" "explain" "x"])) opts) a/OsExplain))
-        (check cs "the flags and --implicit-lib"
-               (let ((o (. (unwrap (parse ["--library" "--implicit" "--prelude" "--implicit-lib" "a,b" "x"])) opts)))
-                 (and (. o library) (. o implicit) (. o prelude) (= (. o implicit-lib) (some ["a" "b"])))))
-        (check cs "the types options are those of the file loop"
-               (let ((o (a/base-options (. (unwrap (parse ["--library" "x"])) opts))))
-                 (and (. o library) (= (. o stage) ta/StInfer) (not (. o ast)))))
-        (check cs "a lone -- ends the options" (= (. (unwrap (parse ["--" "--library"])) files) ["--library"]))
-        (check cs "--implicit-lib \"\" is no library, and a file may be named like an option after a file"
-               (and (= (. (. (unwrap (parse ["--implicit-lib" "" "x"])) opts) implicit-lib) (some (vec-empty)))
-                    (= (. (unwrap (parse ["x" "--library"])) files) ["x" "--library"])))
-        (check cs "refused: no file, an unknown word, a section that is not one, an empty name"
-               (and (= (parse []) nil) (= (parse ["--library"]) nil) (= (parse ["--nope" "x"]) nil)
+    (do (is cs (let ((r (unwrap (parse ["x.fib" "y.fib"]))))
+                 (and (= (. r files) ["x.fib" "y.fib"]) (a/own-wants (. r opts) a/OsBody) (not (a/own-wants (. r opts) a/OsExplain)))) "files alone: every section but explain")
+        (is cs (let ((o (. (unwrap (parse ["--sections" "body" "--sections" "taken,error" "x"])) opts)))
+                 (and (a/own-wants o a/OsTaken) (a/own-wants o a/OsError) (not (a/own-wants o a/OsBody)))) "--sections names the sections, in any order, and replaces an earlier list")
+        (is cs (a/own-wants (. (unwrap (parse ["--sections" "explain" "x"])) opts) a/OsExplain) "explain only when asked")
+        (is cs (let ((o (. (unwrap (parse ["--library" "--implicit" "--prelude" "--implicit-lib" "a,b" "x"])) opts)))
+                 (and (. o library) (. o implicit) (. o prelude) (= (. o implicit-lib) (some ["a" "b"])))) "the flags and --implicit-lib")
+        (is cs (let ((o (a/base-options (. (unwrap (parse ["--library" "x"])) opts))))
+                 (and (. o library) (= (. o stage) ta/StInfer) (not (. o ast)))) "the types options are those of the file loop")
+        (is cs (= (. (unwrap (parse ["--" "--library"])) files) ["--library"]) "a lone -- ends the options")
+        (is cs (and (= (. (. (unwrap (parse ["--implicit-lib" "" "x"])) opts) implicit-lib) (some (vec-empty)))
+                    (= (. (unwrap (parse ["x" "--library"])) files) ["x" "--library"])) "--implicit-lib \"\" is no library, and a file may be named like an option after a file")
+        (is cs (and (= (parse []) nil) (= (parse ["--library"]) nil) (= (parse ["--nope" "x"]) nil)
                     (= (parse ["--sections" "type" "x"]) nil) (= (parse ["--sections" "body," "x"]) nil)
                     (= (parse ["--sections"]) nil) (= (parse ["--implicit-lib" "a,,b" "x"]) nil)
                     (= (parse ["--stage" "infer" "x"]) nil) (= (parse ["--ast" "x"]) nil) (= (parse ["--implicit-lib"]) nil)
-                    (= (parse ["--sections" "" "x"]) nil) (= (parse ["--sections" "Body" "x"]) nil))))))
+                    (= (parse ["--sections" "" "x"]) nil) (= (parse ["--sections" "Body" "x"]) nil)) "refused: no file, an unknown word, a section that is not one, an empty name"))))
 
-(defun main () -> i64
-  (let ((cs (checks-new))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec))
         (p (program-of (tables) [(UScc [0]) (UScc [1])]))
         (o (owned-of)))
     (do (word-checks cs p) (section-checks cs p o) (dump-checks cs p o) (args-checks cs)
-        (finish cs))))
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "own/unit-dump" [(test-case "checks" unit-steps "compiler/tests/own/unit-dump.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

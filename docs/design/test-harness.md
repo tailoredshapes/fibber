@@ -2,6 +2,23 @@
 
 Current status: `fibc test` is the current behaviour-spec runner; `make specs` is in the full gate. The prototype measurements and staged recommendations below are historical, not the current gate definition.
 
+Compiler units now use `fib.test.unit`: `deftest name [log]` creates a named
+test value, `is` records a boolean assertion, and `is=` records equality with
+expected/actual diagnostics. Both assertions retain source locations and
+evaluate their arguments once. Units and behaviour specs share `Scenario`,
+`Suite`, isolation, selection and reporters; their data lives in
+`fib.test.data`, which avoids importing behaviour macros into compiler units
+that already define helpers named `expect`.
+
+Every runnable compiler unit exports `tests() -> Suite`. `units.sh` generates
+four shared optimized executables (emit, own, types, rest), preserving the
+unit inventory and checking the exact suite membership in JSON reports.
+Each unit body runs in a child process with a 300-second timeout. The retained
+executables support selection without rebuilding. The five pending legacy
+programs retain independent checks that fail if a pending program passes.
+The public API's executable checks plant false assertions, empty tests,
+traps, hangs and duplicate ids and require the runner to reject each one.
+
 Original record (dated statements and unmarked code fences below are historical sketches):
 
 Status: design with a working prototype, 2026-10-05. **Measured** means a command was run in this session and its output is quoted

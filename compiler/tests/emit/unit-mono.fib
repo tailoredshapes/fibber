@@ -5,8 +5,9 @@
 ;; function, a def and a method. The classes and representatives of every ground type of 1,100 programs are judged by the
 ;; tool's `--layout` (columns `class` and `repr`, compare.sh, E2's report).
 ;; Build: fibc build compiler/tests/emit/unit-mono.fib -I compiler -I lib -o OUT
-(ns main (:use syntax.pos types.ty types.scheme types.table types.ast types.decls types.check own.program
-               emit.value emit.names emit.layout emit.mono))
+(ns tests.emit.unit-mono (:use syntax.pos types.ty types.scheme types.table types.ast types.decls fib.test.unit own.program
+               emit.value emit.names emit.layout emit.mono)
+  (:require [fib.test.run :as test-runner]))
 
 (def p0: Pos (Pos "t.fib" 1 1 0 1))
 (def unit-expr: Expr (Expr 0 p0 (ELit LitUnit)))
@@ -66,92 +67,77 @@
 (defun request (q: Queue g: Globals key: BodyKey tys: (Vec Ty)) -> str
   (queue-request q g (Inst key tys)))
 
-(defun main () -> i64
-  (let ((cs (checks-new)) (g (globals)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)) (g (globals)))
     (do
-      (check cs "classes: str, Option str, Option (Option str), Option i64 (a pair held by value, lever A), i64, unit, fn, raw ptr, dyn, a fieldless enum, a struct"
-             (= (mapv (fn (t: Ty) (class-word g t))
+      (is cs (= (mapv (fn (t: Ty) (class-word g t))
                       [(ty-str) (opt (ty-str)) (opt (opt (ty-str))) (opt (ty-i64)) (ty-i64) (ty-unit)
                        (TFn CLocal [] (ty-unit)) (ty-scalar SPtr) (TCon (KDyn 0 false) []) (nom 3 []) (nom 1 [])])
-                ["ptr" "opt" "boxed" "{ i1 i64 }" "i64" "unit" "ptr" "raw" "dyn" "i32" "ptr"]))
-      (check cs "a type variable has no class" (= (class-word g (TVar 0)) "err"))
-      (check cs "the representative of Boxed is Option (Option i64) (an Option i64 is a value now), of Opt Option str"
-             (and (= (representative g ClsBoxed) (opt (opt (ty-i64)))) (= (representative g ClsOpt) (opt (ty-str)))))
-      (check cs "representatives of every class"
-             (= (mapv (fn (c: RepClass) (mangle g (representative g c)))
+                ["ptr" "opt" "boxed" "{ i1 i64 }" "i64" "unit" "ptr" "raw" "dyn" "i32" "ptr"]) "classes: str, Option str, Option (Option str), Option i64 (a pair held by value, lever A), i64, unit, fn, raw ptr, dyn, a fieldless enum, a struct")
+      (is cs (= (class-word g (TVar 0)) "err") "a type variable has no class")
+      (is cs (and (= (representative g ClsBoxed) (opt (opt (ty-i64)))) (= (representative g ClsOpt) (opt (ty-str)))) "the representative of Boxed is Option (Option i64) (an Option i64 is a value now), of Opt Option str")
+      (is cs (= (mapv (fn (c: RepClass) (mangle g (representative g c)))
                        [(ClsScalar LirI1) (ClsScalar LirI8) (ClsScalar LirI16) (ClsScalar LirI32) (ClsScalar LirI64)
                         (ClsScalar LirFloat) (ClsScalar LirDouble) (ClsScalar LirRaw) ClsUnit ClsPtr ClsDyn])
-                ["bool" "i8" "i16" "i32" "i64" "f32" "f64" "ptr" "unit" "str" "$dyn.Sz_"]))
-      (check cs "the representative of a class is in that class, and an Option of it is in the class of an Option of the member"
-             (every? (fn (t: Ty)
+                ["bool" "i8" "i16" "i32" "i64" "f32" "f64" "ptr" "unit" "str" "$dyn.Sz_"]) "representatives of every class")
+      (is cs (every? (fn (t: Ty)
                        (match (class-of g t)
                          ((Err _) false)
                          ((Ok c)
                           (and (= (class-of g (representative g c)) (Ok c))
                                (= (class-of g (opt t)) (class-of g (opt (representative g c))))))))
-                     [(ty-str) (opt (ty-str)) (opt (opt (ty-str))) (opt (ty-i64)) (ty-i64) (ty-bool) (ty-unit)]))
-      (check cs "a raw ptr is a scalar class of its own: not str's"
-             (and (= (class-of g (ty-scalar SPtr)) (Ok (ClsScalar LirRaw)))
+                     [(ty-str) (opt (ty-str)) (opt (opt (ty-str))) (opt (ty-i64)) (ty-i64) (ty-bool) (ty-unit)]) "the representative of a class is in that class, and an Option of it is in the class of an Option of the member")
+      (is cs (and (= (class-of g (ty-scalar SPtr)) (Ok (ClsScalar LirRaw)))
                   (= (representative g (ClsScalar LirRaw)) (ty-scalar SPtr))
-                  (not (= (class-of g (ty-scalar SPtr)) (class-of g (ty-str))))))
-      (check cs "inst-subst replaces the quantified variables"
-             (= (inst-subst (Inst (BodyFun 0) [(ty-bool) (ty-str)]) (TFn CLocal [(TGen 1)] (opt (TGen 0))))
-                (TFn CLocal [(ty-str)] (opt (ty-bool)))))
+                  (not (= (class-of g (ty-scalar SPtr)) (class-of g (ty-str))))) "a raw ptr is a scalar class of its own: not str's")
+      (is cs (= (inst-subst (Inst (BodyFun 0) [(ty-bool) (ty-str)]) (TFn CLocal [(TGen 1)] (opt (TGen 0))))
+                (TFn CLocal [(ty-str)] (opt (ty-bool)))) "inst-subst replaces the quantified variables")
       ;; SOURCE: bounded and fun_key
       (let ((plain (twin [])) (proto (twin [(PProto 0 [(TGen 0)])])) (deep (twin [(PProto 0 [(nom 2 [(TFn CLocal [(TGen 1)] (ty-unit))])])]))
             (send (twin [(PSend (TGen 1))])))
-        (do (check cs "no bound: nothing is bounded"
-                   (= [(bounded plain 0) (bounded plain 1) (bounded send 1)] [false false false]))
-            (check cs "a protocol bound on a variable bounds it, and a variable inside a constraint's type"
-                   (= [(bounded proto 0) (bounded proto 1) (bounded deep 0) (bounded deep 1)] [true false false true]))
-            (check cs "fun-key: the representative of each class without bounds"
-                   (= (key-text g plain [(nom 1 []) (ty-bool)]) ["str" "bool"]))
-            (check cs "fun-key: an object is str, a boxed Option is Option i64"
-                   (= (key-text g plain [(nom 2 [(ty-i64)]) (opt (ty-i64))]) ["str" "$fib.prelude/Option.i64_"]))
-            (check cs "fun-key: a bounded variable keeps its full type"
-                   (= (key-text g proto [(nom 1 []) (nom 1 [])]) ["Pt" "str"]))
-            (check cs "fun-key: a raw ptr keeps its class, and is not str"
-                   (and (= (key-text g plain [(ty-scalar SPtr) (ty-bool)]) ["ptr" "bool"])
-                        (not (= (key-text g plain [(ty-scalar SPtr) (ty-bool)]) (key-text g plain [(ty-str) (ty-bool)])))))
-            (check cs "fun-key: a type variable is refused, with the layout's message"
-                   (= (mapv (fn (s: str) (str-slice s 0 6)) (key-text g plain [(ty-bool) (TVar 0)])) ["a type"]))))
+        (do (is cs (= [(bounded plain 0) (bounded plain 1) (bounded send 1)] [false false false]) "no bound: nothing is bounded")
+            (is cs (= [(bounded proto 0) (bounded proto 1) (bounded deep 0) (bounded deep 1)] [true false false true]) "a protocol bound on a variable bounds it, and a variable inside a constraint's type")
+            (is cs (= (key-text g plain [(nom 1 []) (ty-bool)]) ["str" "bool"]) "fun-key: the representative of each class without bounds")
+            (is cs (= (key-text g plain [(nom 2 [(ty-i64)]) (opt (ty-i64))]) ["str" "$fib.prelude/Option.i64_"]) "fun-key: an object is str, a boxed Option is Option i64")
+            (is cs (= (key-text g proto [(nom 1 []) (nom 1 [])]) ["Pt" "str"]) "fun-key: a bounded variable keeps its full type")
+            (is cs (and (= (key-text g plain [(ty-scalar SPtr) (ty-bool)]) ["ptr" "bool"])
+                        (not (= (key-text g plain [(ty-scalar SPtr) (ty-bool)]) (key-text g plain [(ty-str) (ty-bool)])))) "fun-key: a raw ptr keeps its class, and is not str")
+            (is cs (= (mapv (fn (s: str) (str-slice s 0 6)) (key-text g plain [(ty-bool) (TVar 0)])) ["a type"]) "fun-key: a type variable is refused, with the layout's message")))
       ;; SOURCE: the queue
       (let ((q (queue-new)) (key (BodyFun 0)))
-        (do (check cs "an empty queue pops nothing and has no overflow" (and (nil? (queue-pop q)) (nil? (queue-overflow q))))
+        (do (is cs (and (nil? (queue-pop q)) (nil? (queue-overflow q))) "an empty queue pops nothing and has no overflow")
             (let ((a (request q g key [(ty-str) (ty-bool)])) (b (request q g key [(ty-str) (ty-bool)]))
                   (c (request q g (BodyFun 1) [(ty-i64)])) (d (request q g (BodyDef 0) [])))
-              (do (check cs "a specialisation is named once" (and (= a "f.tw.str.bool") (= a b)))
-                  (check cs "the names of a function, another function, a def" (= [c d] ["f.pr.i64" "d.K"]))
-                  (check cs "first in first out, each once"
-                         (= (mapv (fn (i: Inst) (body-name g (. i key) (. i tys))) (drain q))
-                            ["f.tw.str.bool" "f.pr.i64" "d.K"]))))
-            (check cs "a body at the same key and other types is another specialisation"
-                   (= (request q g key [(ty-i64) (ty-bool)]) "f.tw.i64.bool"))))
+              (do (is cs (and (= a "f.tw.str.bool") (= a b)) "a specialisation is named once")
+                  (is cs (= [c d] ["f.pr.i64" "d.K"]) "the names of a function, another function, a def")
+                  (is cs (= (mapv (fn (i: Inst) (body-name g (. i key) (. i tys))) (drain q))
+                            ["f.tw.str.bool" "f.pr.i64" "d.K"]) "first in first out, each once")))
+            (is cs (= (request q g key [(ty-i64) (ty-bool)]) "f.tw.i64.bool") "a body at the same key and other types is another specialisation")))
       ;; SOURCE: the overflow rule
       (let ((q (queue-new)))
-        (do (check cs "depth 64 (63 boxes over an i64) is queued, not an overflow"
-                   (and (not (= (request q g (BodyFun 0) [(chain 63)]) "@overflow")) (nil? (queue-overflow q))))
-            (check cs "size 1000 (999 arguments) is queued too"
-                   (and (not (= (request q g (BodyFun 0) [(wide 999)]) "@overflow")) (nil? (queue-overflow q))))
-            (check cs "a function type counts its parameters and result"
-                   (not (= (request q g (BodyFun 0) [(TFn CLocal [(ty-i64)] (ty-i64))]) "@overflow")))
-            (check cs "depth 65 overflows: not queued, @overflow, and what it was is kept"
-                   (and (= (request q g (BodyFun 1) [(chain 64)]) "@overflow") (= (queue-overflow q) (some "pr"))))
-            (check cs "after an overflow every request is @overflow, the first message stays"
-                   (and (= (request q g (BodyDef 0) [(ty-i64)]) "@overflow") (= (queue-overflow q) (some "pr"))))
-            (check cs "what was queued before is still to pop" (not (nil? (queue-pop q))))))
+        (do (is cs (and (not (= (request q g (BodyFun 0) [(chain 63)]) "@overflow")) (nil? (queue-overflow q))) "depth 64 (63 boxes over an i64) is queued, not an overflow")
+            (is cs (and (not (= (request q g (BodyFun 0) [(wide 999)]) "@overflow")) (nil? (queue-overflow q))) "size 1000 (999 arguments) is queued too")
+            (is cs (not (= (request q g (BodyFun 0) [(TFn CLocal [(ty-i64)] (ty-i64))]) "@overflow")) "a function type counts its parameters and result")
+            (is cs (and (= (request q g (BodyFun 1) [(chain 64)]) "@overflow") (= (queue-overflow q) (some "pr"))) "depth 65 overflows: not queued, @overflow, and what it was is kept")
+            (is cs (and (= (request q g (BodyDef 0) [(ty-i64)]) "@overflow") (= (queue-overflow q) (some "pr"))) "after an overflow every request is @overflow, the first message stays")
+            (is cs (not (nil? (queue-pop q))) "what was queued before is still to pop")))
       (let ((q (queue-new)))
-        (do (check cs "size 1001 overflows"
-                   (and (= (request q g (BodyDef 0) [(wide 1000)]) "@overflow") (= (queue-overflow q) (some "K"))))
-            (check cs "nothing was queued" (nil? (queue-pop q)))))
+        (do (is cs (and (= (request q g (BodyDef 0) [(wide 1000)]) "@overflow") (= (queue-overflow q) (some "K"))) "size 1001 overflows")
+            (is cs (nil? (queue-pop q)) "nothing was queued")))
       (let ((q (queue-new)))
-        (do (check cs "an overflow in the second type of a key counts"
-                   (= (request q g (BodyMethod 0 0) [(ty-i64) (chain 64)]) "@overflow"))
-            (check cs "a method is described by its name and its protocol's" (= (queue-overflow q) (some "the method sz of Sz")))))
+        (do (is cs (= (request q g (BodyMethod 0 0) [(ty-i64) (chain 64)]) "@overflow") "an overflow in the second type of a key counts")
+            (is cs (= (queue-overflow q) (some "the method sz of Sz")) "a method is described by its name and its protocol's")))
       (let ((q (queue-new)))
         (do (request q g (BodyMethodOwned 0 0) [(chain 64)])
-            (check cs "an owned method too" (= (queue-overflow q) (some "the method sz of Sz")))))
+            (is cs (= (queue-overflow q) (some "the method sz of Sz")) "an owned method too")))
       (let ((q (queue-new)))
         (do (request q g (BodyAllOwned 1) [(chain 64)])
-            (check cs "an all-owned body is described by its function" (= (queue-overflow q) (some "pr")))))
-      (finish cs))))
+            (is cs (= (queue-overflow q) (some "pr")) "an all-owned body is described by its function")))
+      (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "emit/unit-mono" [(test-case "checks" unit-steps "compiler/tests/emit/unit-mono.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

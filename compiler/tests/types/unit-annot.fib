@@ -7,7 +7,8 @@
 ;; the protocol's methods as an implementor outside the module meets them (as
 ;; SuperEnv, HeadEnv and ClosedEnv of the lowering will).
 ;; Build: fibc build compiler/tests/types/unit-annot.fib -I compiler -I lib -o OUT
-(ns main (:use syntax.pos types.ty types.error types.ast types.annot types.check))
+(ns tests.types.unit-annot (:use syntax.pos types.ty types.error types.ast types.annot fib.test.unit)
+  (:require [fib.test.run :as test-runner]))
 
 (def p0: Pos (Pos "t.fib" 3 5 10 11))
 
@@ -25,89 +26,67 @@
     ((Ok _) "")
     ((Err e) (if (and (= (. e kind) Resolve) (= (. (. e pos) line) 3)) (. e message) "WRONG KIND OR POS"))))
 
-(defun gen-env (cs: Checks) -> unit
+(defun gen-env (cs: StepLog) -> unit
   (let ((env (gen-env-new))
         (t (conv (fn-ann [(tv "a") (tv "b")] (tv "a")) env)))
-    (do (check cs "GenEnv numbers variables and omitted colours"
-               (ok-is t (TFn (CGen 0) [(TGen 0) (TGen 1)] (TGen 0))))
-        (check cs "GenEnv records the names in order" (= @(. env names) ["a" "b"]))
-        (check cs "and counts the colours" (= @(. env colours) 1))
-        (check cs "a known variable is not added again"
-               (and (ok-is (conv (tv "b") env) (TGen 1)) (= @(. env names) ["a" "b"])))
+    (do (is cs (ok-is t (TFn (CGen 0) [(TGen 0) (TGen 1)] (TGen 0))) "GenEnv numbers variables and omitted colours")
+        (is cs (= @(. env names) ["a" "b"]) "GenEnv records the names in order")
+        (is cs (= @(. env colours) 1) "and counts the colours")
+        (is cs (and (ok-is (conv (tv "b") env) (TGen 1)) (= @(. env names) ["a" "b"])) "a known variable is not added again")
         (let ((pre (gen-env-with-names ["x" "y"])))
-          (do (check cs "with-names: the first variables are given" (ok-is (conv (tv "y") pre) (TGen 1)))
-              (check cs "and a new one follows them" (ok-is (conv (tv "z") pre) (TGen 2)))))
+          (do (is cs (ok-is (conv (tv "y") pre) (TGen 1)) "with-names: the first variables are given")
+              (is cs (ok-is (conv (tv "z") pre) (TGen 2)) "and a new one follows them")))
         (let ((e2 (gen-env-new)))
-          (do (check cs "an omitted colour in a function of a function: the outer first"
-                     (ok-is (conv (fn-ann [(fn-ann [] (AScalar SUnit))] (AScalar SUnit)) e2)
-                            (TFn (CGen 0) [(TFn (CGen 1) [] (ty-unit))] (ty-unit))))
-              (check cs "the next function goes on from there"
-                     (ok-is (conv (fn-ann [] (AScalar SI64)) e2) (TFn (CGen 2) [] (ty-i64))))))
+          (do (is cs (ok-is (conv (fn-ann [(fn-ann [] (AScalar SUnit))] (AScalar SUnit)) e2)
+                            (TFn (CGen 0) [(TFn (CGen 1) [] (ty-unit))] (ty-unit))) "an omitted colour in a function of a function: the outer first")
+              (is cs (ok-is (conv (fn-ann [] (AScalar SI64)) e2) (TFn (CGen 2) [] (ty-i64))) "the next function goes on from there")))
         (let ((e3 (gen-env-new)))
-          (do (check cs "a fixed colour makes none"
-                     (ok-is (conv (AFn (some (CaFixed CSend)) [] (AScalar SUnit)) e3) (TFn CSend [] (ty-unit))))
-              (check cs "and leaves the counter" (= @(. e3 colours) 0))
-              (check cs "a named colour is the next quantified one"
-                     (ok-is (conv (AFn (some (CaNamed "k")) [] (AScalar SUnit)) e3) (TFn (CGen 0) [] (ty-unit))))
-              (check cs "the same name is the same colour"
-                     (ok-is (conv (AFn (some (CaNamed "k")) [] (AScalar SUnit)) e3) (TFn (CGen 0) [] (ty-unit))))
-              (check cs "another name the next one"
-                     (ok-is (conv (AFn (some (CaNamed "j")) [] (AScalar SUnit)) e3) (TFn (CGen 1) [] (ty-unit))))
-              (check cs "an omitted colour goes on from the named ones"
-                     (ok-is (conv (fn-ann [] (AScalar SUnit)) e3) (TFn (CGen 2) [] (ty-unit))))
-              (check cs "a named colour as a colour argument"
-                     (ok-is (conv (AColourArg (CaNamed "j")) e3) (ty-colour-arg (CGen 1))))))
-        (check cs "local-colours: omitted colours are local and make no variable"
-               (let ((l (gen-env-local)))
+          (do (is cs (ok-is (conv (AFn (some (CaFixed CSend)) [] (AScalar SUnit)) e3) (TFn CSend [] (ty-unit))) "a fixed colour makes none")
+              (is cs (= @(. e3 colours) 0) "and leaves the counter")
+              (is cs (ok-is (conv (AFn (some (CaNamed "k")) [] (AScalar SUnit)) e3) (TFn (CGen 0) [] (ty-unit))) "a named colour is the next quantified one")
+              (is cs (ok-is (conv (AFn (some (CaNamed "k")) [] (AScalar SUnit)) e3) (TFn (CGen 0) [] (ty-unit))) "the same name is the same colour")
+              (is cs (ok-is (conv (AFn (some (CaNamed "j")) [] (AScalar SUnit)) e3) (TFn (CGen 1) [] (ty-unit))) "another name the next one")
+              (is cs (ok-is (conv (fn-ann [] (AScalar SUnit)) e3) (TFn (CGen 2) [] (ty-unit))) "an omitted colour goes on from the named ones")
+              (is cs (ok-is (conv (AColourArg (CaNamed "j")) e3) (ty-colour-arg (CGen 1))) "a named colour as a colour argument")))
+        (is cs (let ((l (gen-env-local)))
                  (and (ok-is (conv (fn-ann [(fn-ann [] (AScalar SUnit))] (AScalar SUnit)) l)
                              (TFn CLocal [(TFn CLocal [] (ty-unit))] (ty-unit)))
-                      (= @(. l colours) 0))))
-        (check cs "Self where it is not allowed"
-               (= (err-text (conv ASelf (gen-env-new))) "Self is only allowed in a protocol"))
-        (check cs "Self is TGen 0 where it is" (ok-is (conv ASelf (gen-env-with-self ["Self"])) (TGen 0))))))
+                      (= @(. l colours) 0))) "local-colours: omitted colours are local and make no variable")
+        (is cs (= (err-text (conv ASelf (gen-env-new))) "Self is only allowed in a protocol") "Self where it is not allowed")
+        (is cs (ok-is (conv ASelf (gen-env-with-self ["Self"])) (TGen 0)) "Self is TGen 0 where it is"))))
 
-(defun nodes (cs: Checks) -> unit
+(defun nodes (cs: StepLog) -> unit
   (let ((env (gen-env-new)))
-    (do (check cs "a scalar" (ok-is (conv (AScalar SF64) env) (ty-scalar SF64)))
-        (check cs "str" (ok-is (conv AStr env) (ty-str)))
-        (check cs "a builtin constructor" (ok-is (conv (ABuiltin KCell (tv "a")) env) (ty-cell (TGen 0))))
-        (check cs "a nominal type" (ok-is (conv (ANominal 3 [(tv "b") (AScalar SI64)]) env)
-                                         (ty-nominal 3 [(TGen 1) (ty-i64)])))
-        (check cs "dyn" (ok-is (conv (ADyn 2 [(tv "a")] true) env) (TCon (KDyn 2 true) [(TGen 0)])))
-        (check cs "dyn without arguments" (ok-is (conv (ADyn 2 [] false) env) (TCon (KDyn 2 false) [])))
-        (check cs "a fixed colour argument" (ok-is (conv (AColourArg (CaFixed CLocal)) env) (ty-colour-arg CLocal))))))
+    (do (is cs (ok-is (conv (AScalar SF64) env) (ty-scalar SF64)) "a scalar")
+        (is cs (ok-is (conv AStr env) (ty-str)) "str")
+        (is cs (ok-is (conv (ABuiltin KCell (tv "a")) env) (ty-cell (TGen 0))) "a builtin constructor")
+        (is cs (ok-is (conv (ANominal 3 [(tv "b") (AScalar SI64)]) env)
+                                         (ty-nominal 3 [(TGen 1) (ty-i64)])) "a nominal type")
+        (is cs (ok-is (conv (ADyn 2 [(tv "a")] true) env) (TCon (KDyn 2 true) [(TGen 0)])) "dyn")
+        (is cs (ok-is (conv (ADyn 2 [] false) env) (TCon (KDyn 2 false) [])) "dyn without arguments")
+        (is cs (ok-is (conv (AColourArg (CaFixed CLocal)) env) (ty-colour-arg CLocal)) "a fixed colour argument"))))
 
-(defun param-env (cs: Checks) -> unit
+(defun param-env (cs: StepLog) -> unit
   (let ((env (ParamEnv ["a" "k"] [false true] "Shape")))
-    (do (check cs "ParamEnv: a parameter is TGen i" (ok-is (conv (tv "a") env) (TGen 0)))
-        (check cs "ParamEnv rejects a foreign variable"
-               (= (err-text (conv (tv "b") env)) "type variable b is not a parameter of Shape"))
-        (check cs "a colour parameter is not a type"
-               (= (err-text (conv (tv "k") env)) "k is a colour parameter of Shape, not a type"))
-        (check cs "an omitted colour is local"
-               (ok-is (conv (fn-ann [] (AScalar SI64)) env) (TFn CLocal [] (ty-i64))))
-        (check cs "a named colour that is a colour parameter" (ok-is (conv (AFn (some (CaNamed "k")) [] (AScalar SUnit)) env)
-                                                                      (TFn (CGen 1) [] (ty-unit))))
-        (check cs "a colour argument naming it" (ok-is (conv (AColourArg (CaNamed "k")) env) (ty-colour-arg (CGen 1))))
-        (check cs "a named colour that is a type parameter"
-               (= (err-text (conv (AColourArg (CaNamed "a")) env)) "a is not a colour parameter of Shape"))
-        (check cs "a named colour that is nothing"
-               (= (err-text (conv (AFn (some (CaNamed "z")) [] (AScalar SUnit)) env)) "z is not a colour parameter of Shape"))
-        (check cs "Self is not allowed (the protocol's default)"
-               (= (err-text (conv ASelf env)) "Self is only allowed in a protocol"))
-        (check cs "an error in a nested position is the error"
-               (= (err-text (conv (ANominal 0 [(AScalar SI64) (fn-ann [(tv "q")] (AScalar SI64))]) env))
-                  "type variable q is not a parameter of Shape"))
-        (check cs "without colours given every parameter is a type"
-               (ok-is (conv (tv "k") (ParamEnv ["k"] [] "T")) (TGen 0))))))
+    (do (is cs (ok-is (conv (tv "a") env) (TGen 0)) "ParamEnv: a parameter is TGen i")
+        (is cs (= (err-text (conv (tv "b") env)) "type variable b is not a parameter of Shape") "ParamEnv rejects a foreign variable")
+        (is cs (= (err-text (conv (tv "k") env)) "k is a colour parameter of Shape, not a type") "a colour parameter is not a type")
+        (is cs (ok-is (conv (fn-ann [] (AScalar SI64)) env) (TFn CLocal [] (ty-i64))) "an omitted colour is local")
+        (is cs (ok-is (conv (AFn (some (CaNamed "k")) [] (AScalar SUnit)) env)
+                                                                      (TFn (CGen 1) [] (ty-unit))) "a named colour that is a colour parameter")
+        (is cs (ok-is (conv (AColourArg (CaNamed "k")) env) (ty-colour-arg (CGen 1))) "a colour argument naming it")
+        (is cs (= (err-text (conv (AColourArg (CaNamed "a")) env)) "a is not a colour parameter of Shape") "a named colour that is a type parameter")
+        (is cs (= (err-text (conv (AFn (some (CaNamed "z")) [] (AScalar SUnit)) env)) "z is not a colour parameter of Shape") "a named colour that is nothing")
+        (is cs (= (err-text (conv ASelf env)) "Self is only allowed in a protocol") "Self is not allowed (the protocol's default)")
+        (is cs (= (err-text (conv (ANominal 0 [(AScalar SI64) (fn-ann [(tv "q")] (AScalar SI64))]) env))
+                  "type variable q is not a parameter of Shape") "an error in a nested position is the error")
+        (is cs (ok-is (conv (tv "k") (ParamEnv ["k"] [] "T")) (TGen 0)) "without colours given every parameter is a type"))))
 
-(defun effects (cs: Checks) -> unit
+(defun effects (cs: StepLog) -> unit
   (let ((env (gen-env-new)))
-    (do (check cs "an error ends the conversion"
-               (= (err-text (conv (fn-ann [(tv "a") ASelf (tv "b")] (tv "c")) env)) "Self is only allowed in a protocol"))
-        (check cs "what came before it was done: the function's colour and the first variable"
-               (and (= @(. env colours) 1) (= @(. env names) ["a"])))
-        (check cs "what came after it was not: no b, no c" (not (includes? "b" @(. env names)))))))
+    (do (is cs (= (err-text (conv (fn-ann [(tv "a") ASelf (tv "b")] (tv "c")) env)) "Self is only allowed in a protocol") "an error ends the conversion")
+        (is cs (and (= @(. env colours) 1) (= @(. env names) ["a"])) "what came before it was done: the function's colour and the first variable")
+        (is cs (not (includes? "b" @(. env names))) "what came after it was not: no b, no c"))))
 
 ;; an implementor that takes every default of the protocol
 (defstruct Closed (rigid: i64))
@@ -123,38 +102,38 @@
   (ann-colour-param-arg (self name pos)
     (if (= name "k") (some (Ok (TGen (. self k)))) nil)))
 
-(defun defaults (cs: Checks) -> unit
+(defun defaults (cs: StepLog) -> unit
   (let ((c (Closed 7)) (h (Head 2)))
-    (do (check cs "an implementor's own methods" (ok-is (conv (tv "a") c) (TRigid 7)))
-        (check cs "default Self" (= (err-text (conv ASelf c)) "Self is only allowed in a protocol"))
-        (check cs "default named colour"
-               (= (err-text (conv (AFn (some (CaNamed "k")) [] (AScalar SUnit)) c)) "colour variable k is not allowed here"))
-        (check cs "default colour argument: the named colour, then its error"
-               (= (err-text (conv (AColourArg (CaNamed "k")) c)) "colour variable k is not allowed here"))
-        (check cs "a fixed colour argument needs no environment support"
-               (ok-is (conv (AColourArg (CaFixed CSend)) c) (ty-colour-arg CSend)))
-        (check cs "a colour argument the environment gives as a type"
-               (ok-is (conv (ANominal 1 [(AColourArg (CaNamed "k"))]) h) (ty-nominal 1 [(TGen 2)])))
-        (check cs "other names go the default way"
-               (= (err-text (conv (AColourArg (CaNamed "j")) h)) "colour variable j is not allowed here")))))
+    (do (is cs (ok-is (conv (tv "a") c) (TRigid 7)) "an implementor's own methods")
+        (is cs (= (err-text (conv ASelf c)) "Self is only allowed in a protocol") "default Self")
+        (is cs (= (err-text (conv (AFn (some (CaNamed "k")) [] (AScalar SUnit)) c)) "colour variable k is not allowed here") "default named colour")
+        (is cs (= (err-text (conv (AColourArg (CaNamed "k")) c)) "colour variable k is not allowed here") "default colour argument: the named colour, then its error")
+        (is cs (ok-is (conv (AColourArg (CaFixed CSend)) c) (ty-colour-arg CSend)) "a fixed colour argument needs no environment support")
+        (is cs (ok-is (conv (ANominal 1 [(AColourArg (CaNamed "k"))]) h) (ty-nominal 1 [(TGen 2)])) "a colour argument the environment gives as a type")
+        (is cs (= (err-text (conv (AColourArg (CaNamed "j")) h)) "colour variable j is not allowed here") "other names go the default way"))))
 
-(defun rigid-env (cs: Checks) -> unit
+(defun rigid-env (cs: StepLog) -> unit
   (let ((map (cell (map-empty))) (names (cell (vec-empty))) (cn (cell (map-empty))) (n (cell 10))
         (env (RigidEnv map names (fn () (do (set! n (+ @n 1)) (CRigid @n))) cn)))
-    (do (check cs "RigidEnv: a new name is the next rigid variable" (ok-is (conv (tv "a") env) (TRigid 0)))
-        (check cs "and the next" (ok-is (conv (tv "b") env) (TRigid 1)))
-        (check cs "a known one is the same" (and (ok-is (conv (tv "a") env) (TRigid 0)) (ok-is (conv (tv "b") env) (TRigid 1))))
-        (check cs "the caller's collections are the env's" (and (= @names ["a" "b"]) (= (get @map "b") (some 1))))
-        (check cs "an omitted colour comes from the function"
-               (ok-is (conv (fn-ann [] (AScalar SUnit)) env) (TFn (CRigid 11) [] (ty-unit))))
-        (check cs "a named colour is made once" (and (ok-is (conv (AColourArg (CaNamed "k")) env) (ty-colour-arg (CRigid 12)))
+    (do (is cs (ok-is (conv (tv "a") env) (TRigid 0)) "RigidEnv: a new name is the next rigid variable")
+        (is cs (ok-is (conv (tv "b") env) (TRigid 1)) "and the next")
+        (is cs (and (ok-is (conv (tv "a") env) (TRigid 0)) (ok-is (conv (tv "b") env) (TRigid 1))) "a known one is the same")
+        (is cs (and (= @names ["a" "b"]) (= (get @map "b") (some 1))) "the caller's collections are the env's")
+        (is cs (ok-is (conv (fn-ann [] (AScalar SUnit)) env) (TFn (CRigid 11) [] (ty-unit))) "an omitted colour comes from the function")
+        (is cs (and (ok-is (conv (AColourArg (CaNamed "k")) env) (ty-colour-arg (CRigid 12)))
                                                     (ok-is (conv (AColourArg (CaNamed "k")) env) (ty-colour-arg (CRigid 12)))
-                                                    (= @n 12)))
-        (check cs "Self is not allowed" (= (err-text (conv ASelf env)) "Self is only allowed in a protocol"))
-        (check cs "a function: its colour is made before its parameters' colours"
-               (ok-is (conv (fn-ann [(fn-ann [] (AScalar SUnit))] (tv "c")) env)
-                      (TFn (CRigid 13) [(TFn (CRigid 14) [] (ty-unit))] (TRigid 2)))))))
+                                                    (= @n 12)) "a named colour is made once")
+        (is cs (= (err-text (conv ASelf env)) "Self is only allowed in a protocol") "Self is not allowed")
+        (is cs (ok-is (conv (fn-ann [(fn-ann [] (AScalar SUnit))] (tv "c")) env)
+                      (TFn (CRigid 13) [(TFn (CRigid 14) [] (ty-unit))] (TRigid 2))) "a function: its colour is made before its parameters' colours"))))
+
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
+    (do (gen-env cs) (nodes cs) (param-env cs) (effects cs) (defaults cs) (rigid-env cs) (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-annot" [(test-case "checks" unit-steps "compiler/tests/types/unit-annot.fib")]))
 
 (defun main () -> i64
-  (let ((cs (checks-new)))
-    (do (gen-env cs) (nodes cs) (param-env cs) (effects cs) (defaults cs) (rigid-env cs) (finish cs))))
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

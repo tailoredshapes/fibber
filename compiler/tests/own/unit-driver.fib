@@ -8,8 +8,9 @@
 ;; Needs lib/prelude.fib in the working directory (run from the repository root). Prints `ok NAME`
 ;; or `FAIL NAME`.
 ;; Build: fibc build compiler/tests/own/unit-driver.fib -I compiler -I lib -o OUT
-(ns main
-  (:use types.check types.program own.error own.program own.driver own.syntactic types.decls))
+(ns tests.own.unit-driver
+  (:use fib.test.unit types.program own.error own.program own.driver own.syntactic types.decls)
+  (:require [fib.test.run :as test-runner]))
 
 (defun kind-of (r: (Result Checked CheckError)) -> str
   (match r
@@ -38,64 +39,60 @@
 (defun index-of (keys: (Vec BodyKey) k: BodyKey) -> i64
   (unwrap-or (find-first (fn (i: i64) (= (nth keys i) k)) (range (count keys))) -1))
 
-(defun check-accepted (cs: Checks) -> unit
+(defun check-accepted (cs: StepLog) -> unit
   (let [c (checked (own-check-source pt-keep "t.fib"))
         o (. c owned)
         keep (fun-id c "keep")
         main (fun-id c "main")
         b (. (nth (. (g-fun (. (. c typed) globals) keep) params) 0) binding)
         uf (find-first (fn (u: UnitFacts) (= (. u keys) [(BodyFun keep)])) (. o unit-facts))]
-    (do (check cs "accepted: a program is Ok with bodies for its functions, the callee's unit first"
-                (and (< (index-of (. o order) (BodyFun keep)) (index-of (. o order) (BodyFun main)))
-                     (contains? (. o bodies) (BodyFun keep)) (contains? (. o bodies) (BodyFun main))))
-        (check cs "accepted: a function that returns its parameter has the summary (owned, escapes)"
-                (= (get (. o summaries) keep) (some (Summary [(Pair true true)]))))
-        (check cs "accepted: its body says the parameter is owned for rule 1 and escapes"
-                (= (. (nth (. (unwrap (owned-fun o keep)) params) 0) kind) (PkOwned [(OwRule1 "returned")])))
-        (check cs "accepted: one fact record for each unit decided, with the keys of its bodies"
-                (= (mapv (fn (u: UnitFacts) (. u keys)) (filterv (fn (u: UnitFacts) (or (= (. u keys) [(BodyFun keep)]) (= (. u keys) [(BodyFun main)]))) (. o unit-facts)))
-                   [[(BodyFun keep)] [(BodyFun main)]]))
-        (check cs "accepted: the facts of keep are the fixpoint's"
-                (and (some? uf) (contains? (. (. (unwrap uf) facts) escapes) b)
-                     (= (get (. (. (unwrap uf) facts) owned) b) (some (set [(OwRule1 "returned")]))))))))
+    (do (is cs (and (< (index-of (. o order) (BodyFun keep)) (index-of (. o order) (BodyFun main)))
+                     (contains? (. o bodies) (BodyFun keep)) (contains? (. o bodies) (BodyFun main))) "accepted: a program is Ok with bodies for its functions, the callee's unit first")
+        (is cs (= (get (. o summaries) keep) (some (Summary [(Pair true true)]))) "accepted: a function that returns its parameter has the summary (owned, escapes)")
+        (is cs (= (. (nth (. (unwrap (owned-fun o keep)) params) 0) kind) (PkOwned [(OwRule1 "returned")])) "accepted: its body says the parameter is owned for rule 1 and escapes")
+        (is cs (= (mapv (fn (u: UnitFacts) (. u keys)) (filterv (fn (u: UnitFacts) (or (= (. u keys) [(BodyFun keep)]) (= (. u keys) [(BodyFun main)]))) (. o unit-facts)))
+                   [[(BodyFun keep)] [(BodyFun main)]]) "accepted: one fact record for each unit decided, with the keys of its bodies")
+        (is cs (and (some? uf) (contains? (. (. (unwrap uf) facts) escapes) b)
+                     (= (get (. (. (unwrap uf) facts) owned) b) (some (set [(OwRule1 "returned")])))) "accepted: the facts of keep are the fixpoint's"))))
 
-(defun check-taken (cs: Checks) -> unit
+(defun check-taken (cs: StepLog) -> unit
   (let [c (checked (own-check-source taken-src "t.fib"))
         o (. c owned)
         inc (fun-id c "inc")
         order (. o order)]
-    (do (check cs "taken: a function used as a value is in value-taken, one passed only called is not"
-                (and (contains? (. o value-taken) inc) (not (contains? (. o value-taken) (fun-id c "apply")))))
-        (check cs "taken: its all-owned body follows its own, and each has a record of facts"
-                (and (= (index-of order (BodyAllOwned inc)) (+ (index-of order (BodyFun inc)) 1))
-                     (= (count (filterv (fn (u: UnitFacts) (= (. u keys) [(BodyAllOwned inc)])) (. o unit-facts))) 1)))
-        (check cs "taken: an object parameter of an all-owned body is owned (declared), of the ordinary body borrowed"
-                (let [first (fun-id c "size-of")
+    (do (is cs (and (contains? (. o value-taken) inc) (not (contains? (. o value-taken) (fun-id c "apply")))) "taken: a function used as a value is in value-taken, one passed only called is not")
+        (is cs (and (= (index-of order (BodyAllOwned inc)) (+ (index-of order (BodyFun inc)) 1))
+                     (= (count (filterv (fn (u: UnitFacts) (= (. u keys) [(BodyAllOwned inc)])) (. o unit-facts))) 1)) "taken: its all-owned body follows its own, and each has a record of facts")
+        (is cs (let [first (fun-id c "size-of")
                       kind-in (fn (k: BodyKey) (. (nth (. (unwrap (get (. o bodies) k)) params) 0) kind))]
                   (and (= (kind-in (BodyAllOwned first)) (PkOwned [OwDeclared]))
-                       (= (kind-in (BodyFun first)) PkBorrowed))))
-        (check cs "taken: a scalar parameter stays a scalar"
-                (= (. (nth (. (unwrap (get (. o bodies) (BodyAllOwned inc))) params) 0) kind) PkScalar)))))
+                       (= (kind-in (BodyFun first)) PkBorrowed))) "taken: an object parameter of an all-owned body is owned (declared), of the ordinary body borrowed")
+        (is cs (= (. (nth (. (unwrap (get (. o bodies) (BodyAllOwned inc))) params) 0) kind) PkScalar) "taken: a scalar parameter stays a scalar"))))
 
-(defun check-rejected (cs: Checks) -> unit
+(defun check-rejected (cs: StepLog) -> unit
   (let [r (own-check-source "(defun keep (s: (Vec i64) :borrow) -> (Vec i64) s)\n(defun main () -> i64 0)\n" "b.fib")
         both (own-check-source "(defun twice (&a &b) 0)\n(defun main () -> i64 (let ((x (cell 0))) (+ (twice &x &x) true)))\n" "a.fib")]
-    (do (check cs "rejected: a :borrow parameter that escapes is a CeOwn after inference"
-                (and (= (kind-of r) "own") (= (text-of r) "b.fib:1:1: parameter s of keep is declared :borrow but escapes")))
-        (check cs "rejected: the `&` errors come before the type error"
-                (= (kind-of both) "own")))))
+    (do (is cs (and (= (kind-of r) "own") (= (text-of r) "b.fib:1:1: parameter s of keep is declared :borrow but escapes")) "rejected: a :borrow parameter that escapes is a CeOwn after inference")
+        (is cs (= (kind-of both) "own") "rejected: the `&` errors come before the type error"))))
 
-(defun main () -> i64
-  (let ((cs (checks-new))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec))
         (bad-type (own-check-source "(defun main () -> i64 (+ 1 true))\n" "t.fib"))
         (bad-read (own-check-source "(defun main () -> i64 (+ 1 2)\n" "r.fib"))
         (bad-name (own-check-source "(defun main () -> i64 (nosuchmacro 1 2) 0)\n" "n.fib")))
-    (do (check cs "a type error is a CeType" (= (kind-of bad-type) "type"))
-        (check cs "its text is FILE:L:C: MESSAGE" (= (text-of bad-type) "t.fib:1:28: cannot unify bool with i64"))
-        (check cs "a read error is a CeRead" (= (kind-of bad-read) "read"))
-        (check cs "its text names the file and the position" (= (text-of bad-read) "read: r.fib:1:1: unclosed ("))
-        (check cs "an unbound name is a type error (resolution)" (= (kind-of bad-name) "type"))
-        (check cs "and its text is the checker's" (= (text-of bad-name) "n.fib:1:24: unbound name nosuchmacro"))
-        (check cs "the `&` checks find nothing in a program with no body" (empty? (syntactic-check (globals-new))))
+    (do (is cs (= (kind-of bad-type) "type") "a type error is a CeType")
+        (is cs (= (text-of bad-type) "t.fib:1:28: cannot unify bool with i64") "its text is FILE:L:C: MESSAGE")
+        (is cs (= (kind-of bad-read) "read") "a read error is a CeRead")
+        (is cs (= (text-of bad-read) "read: r.fib:1:1: unclosed (") "its text names the file and the position")
+        (is cs (= (kind-of bad-name) "type") "an unbound name is a type error (resolution)")
+        (is cs (= (text-of bad-name) "n.fib:1:24: unbound name nosuchmacro") "and its text is the checker's")
+        (is cs (empty? (syntactic-check (globals-new))) "the `&` checks find nothing in a program with no body")
         (check-accepted cs) (check-taken cs) (check-rejected cs)
-        (finish cs))))
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "own/unit-driver" [(test-case "checks" unit-steps "compiler/tests/own/unit-driver.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

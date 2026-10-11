@@ -2,43 +2,49 @@
 ;; (`scalars_are_not_objects_and_everything_else_is`, `option_representation_follows_section_8_1`)
 ;; and the one of own/error.rs, over the globals `new-globals` makes. Prints `ok NAME` or `FAIL NAME`.
 ;; Build: fibc build compiler/tests/own/unit-objects.fib -I compiler -I lib -o OUT
-(ns main
-  (:use syntax.pos types.ty types.error types.decls types.init types.check own.objects own.error))
+(ns tests.own.unit-objects
+  (:use syntax.pos types.ty types.error types.decls types.init fib.test.unit own.objects own.error)
+  (:require [fib.test.run :as test-runner]))
 
-(defun check-objects (cs: Checks g: Globals) -> unit
-  (do (check cs "scalars are not objects"
-             (and (not (is-object g (ty-i64))) (not (is-object g (ty-unit)))))
-      (check cs "a str and a cell are objects" (and (is-object g (ty-str)) (is-object g (ty-cell (ty-i64)))))
-      (check cs "a quantified variable is an object" (is-object g (TGen 0)))
-      (check cs "an Option is an object" (is-object g (ty-nominal @(. g option) [(ty-i64)])))
-      (check cs "a function type is an object" (is-object g (TFn CSend [] (ty-unit))))))
+(defun check-objects (cs: StepLog g: Globals) -> unit
+  (do (is cs (and (not (is-object g (ty-i64))) (not (is-object g (ty-unit)))) "scalars are not objects")
+      (is cs (and (is-object g (ty-str)) (is-object g (ty-cell (ty-i64)))) "a str and a cell are objects")
+      (is cs (is-object g (TGen 0)) "a quantified variable is an object")
+      (is cs (is-object g (ty-nominal @(. g option) [(ty-i64)])) "an Option is an object")
+      (is cs (is-object g (TFn CSend [] (ty-unit))) "a function type is an object")))
 
-(defun check-reps (cs: Checks g: Globals) -> unit
+(defun check-reps (cs: StepLog g: Globals) -> unit
   (let ((opt (fn (t: Ty) (ty-nominal @(. g option) [t]))))
-    (do (check cs "an Option of a str is a pointer" (= (option-rep g (opt (ty-str))) (some OrPointer)))
-        (check cs "an Option of a cell is a pointer" (= (option-rep g (opt (ty-cell (ty-i64)))) (some OrPointer)))
-        (check cs "an Option of a scalar is a heap enum" (= (option-rep g (opt (ty-i64))) (some OrHeapEnum)))
-        (check cs "an Option of unit is a heap enum" (= (option-rep g (opt (ty-unit))) (some OrHeapEnum)))
-        (check cs "an Option of an Option is a heap enum" (= (option-rep g (opt (opt (ty-str)))) (some OrHeapEnum)))
-        (check cs "an Option of a dyn is a heap enum" (= (option-rep g (opt (TCon (KDyn 0 false) []))) (some OrHeapEnum)))
-        (check cs "an Option of a quantified variable is generic" (= (option-rep g (opt (TGen 0))) (some OrGeneric)))
-        (check cs "an Option of a variable or a rigid one is generic"
-               (and (= (option-rep g (opt (TVar 3))) (some OrGeneric)) (= (option-rep g (opt (TRigid 0))) (some OrGeneric))))
-        (check cs "a type that is not an Option has none" (= (option-rep g (ty-str)) nil)))))
+    (do (is cs (= (option-rep g (opt (ty-str))) (some OrPointer)) "an Option of a str is a pointer")
+        (is cs (= (option-rep g (opt (ty-cell (ty-i64)))) (some OrPointer)) "an Option of a cell is a pointer")
+        (is cs (= (option-rep g (opt (ty-i64))) (some OrHeapEnum)) "an Option of a scalar is a heap enum")
+        (is cs (= (option-rep g (opt (ty-unit))) (some OrHeapEnum)) "an Option of unit is a heap enum")
+        (is cs (= (option-rep g (opt (opt (ty-str)))) (some OrHeapEnum)) "an Option of an Option is a heap enum")
+        (is cs (= (option-rep g (opt (TCon (KDyn 0 false) []))) (some OrHeapEnum)) "an Option of a dyn is a heap enum")
+        (is cs (= (option-rep g (opt (TGen 0))) (some OrGeneric)) "an Option of a quantified variable is generic")
+        (is cs (and (= (option-rep g (opt (TVar 3))) (some OrGeneric)) (= (option-rep g (opt (TRigid 0))) (some OrGeneric))) "an Option of a variable or a rigid one is generic")
+        (is cs (= (option-rep g (ty-str)) nil) "a type that is not an Option has none"))))
 
-(defun check-errors (cs: Checks) -> unit
+(defun check-errors (cs: StepLog) -> unit
   (let ((pos (Pos "f.fib" 3 7 0 1))
         (e (own-error AmpCaptured pos "text")))
-    (do (check cs "an error's text names the position, then the message" (= (own-error-text e) "f.fib:3:7: text"))
-        (check cs "the messages of a CeOwn are in order" (= (check-error-messages (CeOwn [e e])) ["text" "text"]))
-        (check cs "a CeOwn is one line for each error" (= (check-error-text (CeOwn [e e])) "f.fib:3:7: text\nf.fib:3:7: text"))
-        (check cs "the kind's name is the variant's" (= (own-error-kind-name BorrowEscapes) "BorrowEscapes"))
-        (check cs "a read error says where it came from" (= (check-error-text (CeRead "m")) "read: m")))))
+    (do (is cs (= (own-error-text e) "f.fib:3:7: text") "an error's text names the position, then the message")
+        (is cs (= (check-error-messages (CeOwn [e e])) ["text" "text"]) "the messages of a CeOwn are in order")
+        (is cs (= (check-error-text (CeOwn [e e])) "f.fib:3:7: text\nf.fib:3:7: text") "a CeOwn is one line for each error")
+        (is cs (= (own-error-kind-name BorrowEscapes) "BorrowEscapes") "the kind's name is the variant's")
+        (is cs (= (check-error-text (CeRead "m")) "read: m") "a read error says where it came from"))))
 
-(defun main () -> i64
-  (let ((cs (checks-new)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
     (do (match (new-globals)
           ((Ok g) (do (check-objects cs g) (check-reps cs g)))
-          ((Err _) (check cs "new-globals" false)))
+          ((Err _) (is cs false "new-globals")))
         (check-errors cs)
-        (finish cs))))
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "own/unit-objects" [(test-case "checks" unit-steps "compiler/tests/own/unit-objects.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

@@ -9,8 +9,9 @@
 ;; and the Cx methods that need no printer (fresh, record, bind, binding,
 ;; defer, zonk, unify and flow when they succeed).
 ;; Build: fibc build compiler/tests/types/unit-unify.fib -I compiler -I lib -o OUT
-(ns main (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
-               types.decls types.infer.cx types.infer.unify types.check))
+(ns tests.types.unit-unify (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
+               types.decls types.infer.cx types.infer.unify fib.test.unit)
+  (:require [fib.test.run :as test-runner]))
 
 (def p0: Pos (Pos "t.fib" 1 1 0 1))
 
@@ -39,196 +40,154 @@
 
 (defun n-of (k: Colour a: Ty) -> Ty (ty-nominal 0 [(ty-colour-arg k) a]))
 
-(defun rust-tests (cs: Checks) -> unit
+(defun rust-tests (cs: StepLog) -> unit
   (let ((g (globals-new)))
     (do
       (let ((st (store-new)) (a (store-fresh st)))
-        (check cs "occurs check fails" (err? (run g st a (ty-cell a) false) UOccurs)))
+        (is cs (err? (run g st a (ty-cell a) false) UOccurs) "occurs check fails"))
       (let ((st (store-new)) (v (store-fresh st)))
-        (do (check cs "rigid does not unify with i64"
-                   (err? (run g st (TRigid 0) (ty-i64) false) UMismatch))
-            (check cs "rigid does not unify with another rigid"
-                   (err? (run g st (TRigid 0) (TRigid 1) false) UMismatch))
-            (check cs "a variable unifies with a rigid"
-                   (ok? (run g st v (TRigid 0) false)))))
+        (do (is cs (err? (run g st (TRigid 0) (ty-i64) false) UMismatch) "rigid does not unify with i64")
+            (is cs (err? (run g st (TRigid 0) (TRigid 1) false) UMismatch) "rigid does not unify with another rigid")
+            (is cs (ok? (run g st v (TRigid 0) false)) "a variable unifies with a rigid")))
       (let ((st (store-new))
             (flow1 (run g st (fn0 CLocal) (fn0 CSend) true))
             (flow2 (run g st (fn0 CLocal) (fn0 CSend) false)))
-        (do (check cs "a flow site pushes one constraint" (= (conn flow1) 1))
-            (check cs "a local source has an origin" (has-origin? (con-at flow1 0)))
-            (check cs "elsewhere both ways" (= (conn flow2) 2))))
+        (do (is cs (= (conn flow1) 1) "a flow site pushes one constraint")
+            (is cs (has-origin? (con-at flow1 0)) "a local source has an origin")
+            (is cs (= (conn flow2) 2) "elsewhere both ways")))
       (let ((st (store-new))
             (v (store-fresh st))
             (r (run g st (fn0 CSend) v true)))
-        (do (check cs "a variable at a flow site unifies" (ok? r))
-            (check cs "one constraint, from the send colour"
-                   (and (= (conn r) 1) (= (. (con-at r 0) from) CSend)))
-            (check cs "the variable is a copy with a colour variable"
-                   (match (store-zonk st v) ((TFn (CVar _) _ _) true) (_ false)))
-            (check cs "str does not unify with i64"
-                   (err? (run g st (TCon KStr []) (ty-i64) false) UMismatch)))))))
+        (do (is cs (ok? r) "a variable at a flow site unifies")
+            (is cs (and (= (conn r) 1) (= (. (con-at r 0) from) CSend)) "one constraint, from the send colour")
+            (is cs (match (store-zonk st v) ((TFn (CVar _) _ _) true) (_ false)) "the variable is a copy with a colour variable")
+            (is cs (err? (run g st (TCon KStr []) (ty-i64) false) UMismatch) "str does not unify with i64"))))))
 
-(defun colour-tests (cs: Checks) -> unit
+(defun colour-tests (cs: StepLog) -> unit
   (let ((g (globals-new)))
     (do
       (let ((st (store-new)) (v (store-fresh st)) (r (run g st v (fn0 CSend) true)))
-        (do (check cs "a variable as the source of a flow: copy colour below the original"
-                   (and (ok? r) (= (conn r) 1)
-                        (= (. (con-at r 0) from) (CVar 0)) (= (. (con-at r 0) to) CSend)))
-            (check cs "the constraint has no label and the position given"
-                   (and (nil? (. (con-at r 0) label)) (= (. (. (con-at r 0) pos) file) "t.fib")))
-            (check cs "a send source has no origin" (not (has-origin? (con-at r 0))))))
+        (do (is cs (and (ok? r) (= (conn r) 1)
+                        (= (. (con-at r 0) from) (CVar 0)) (= (. (con-at r 0) to) CSend)) "a variable as the source of a flow: copy colour below the original")
+            (is cs (and (nil? (. (con-at r 0) label)) (= (. (. (con-at r 0) pos) file) "t.fib")) "the constraint has no label and the position given")
+            (is cs (not (has-origin? (con-at r 0))) "a send source has no origin")))
       (let ((st (store-new)) (v (store-fresh st)) (r (run g st (fn0 CLocal) v true)))
-        (check cs "a local source into a variable: origin is the zonked source"
-               (and (= (conn r) 1) (= (. (con-at r 0) from) CLocal) (= (. (con-at r 0) to) (CVar 0))
+        (is cs (and (= (conn r) 1) (= (. (con-at r 0) from) CLocal) (= (. (con-at r 0) to) (CVar 0))
                     (match (. (con-at r 0) origin)
                       ((some w) (and (empty? (. w path)) (= (. w offending) (fn0 CLocal))))
-                      (_ false)))))
+                      (_ false))) "a local source into a variable: origin is the zonked source"))
       (let ((st (store-new)) (v (store-fresh st)))
         (do (run g st v (fn0 CSend) true)
-            (check cs "the next colour variable is the next number"
-                   (let ((w (store-fresh st)) (r (run g st w (fn0 CSend) true)))
-                     (= (. (con-at r 0) from) (CVar 1))))))
+            (is cs (let ((w (store-fresh st)) (r (run g st w (fn0 CSend) true)))
+                     (= (. (con-at r 0) from) (CVar 1))) "the next colour variable is the next number")))
       (let ((st (store-new)) (v (store-fresh st)) (r (run g st v (fn0 CSend) false)))
-        (check cs "not at a flow site a variable is bound to the type itself"
-               (and (ok? r) (= (conn r) 0) (= (store-zonk st v) (fn0 CSend)))))
+        (is cs (and (ok? r) (= (conn r) 0) (= (store-zonk st v) (fn0 CSend))) "not at a flow site a variable is bound to the type itself"))
       (let ((st (store-new)) (r (run g st (fn0 CSend) (fn0 CSend) false)))
-        (check cs "equal colours push nothing" (and (ok? r) (= (conn r) 0))))
+        (is cs (and (ok? r) (= (conn r) 0)) "equal colours push nothing"))
       (let ((st (store-new)) (r (run g st (fn0 (CVar 0)) (fn0 CSend) false)))
-        (check cs "a colour variable and send, not a flow: both ways"
-               (and (= (conn r) 2)
+        (is cs (and (= (conn r) 2)
                     (= (. (con-at r 0) from) (CVar 0)) (= (. (con-at r 0) to) CSend)
-                    (= (. (con-at r 1) from) CSend) (= (. (con-at r 1) to) (CVar 0)))))
+                    (= (. (con-at r 1) from) CSend) (= (. (con-at r 1) to) (CVar 0))) "a colour variable and send, not a flow: both ways"))
       (let ((st (store-new)) (r (run g st (fn0 CLocal) (fn0 CSend) false)))
-        (check cs "both ways: only the local source has an origin"
-               (and (has-origin? (con-at r 0)) (not (has-origin? (con-at r 1)))))))))
+        (is cs (and (has-origin? (con-at r 0)) (not (has-origin? (con-at r 1)))) "both ways: only the local source has an origin")))))
 
-(defun failure-tests (cs: Checks) -> unit
+(defun failure-tests (cs: StepLog) -> unit
   (let ((g (globals-new)))
     (do
       (let ((st (store-new))
             (r (run g st (TFn CLocal [] (ty-i64)) (TFn CSend [] (ty-str)) false)))
-        (check cs "constraints made before a mismatch stay pushed"
-               (and (err? r UMismatch) (= (conn r) 2))))
+        (is cs (and (err? r UMismatch) (= (conn r) 2)) "constraints made before a mismatch stay pushed"))
       (let ((st (store-new)) (r (run g st (TFn CLocal [(ty-i64)] (ty-i64)) (fn0 CSend) false)))
-        (check cs "function arities differ: mismatch, nothing pushed"
-               (and (err? r UMismatch) (= (conn r) 0))))
+        (is cs (and (err? r UMismatch) (= (conn r) 0)) "function arities differ: mismatch, nothing pushed"))
       (let ((st (store-new)))
-        (check cs "constructor arities differ"
-               (err? (run g st (TCon KArray [(ty-i64)]) (TCon KArray [(ty-i64) (ty-i64)]) false) UMismatch)))
+        (is cs (err? (run g st (TCon KArray [(ty-i64)]) (TCon KArray [(ty-i64) (ty-i64)]) false) UMismatch) "constructor arities differ"))
       (let ((st (store-new)))
-        (check cs "different constructors"
-               (err? (run g st (TCon KArray [(ty-i64)]) (TCon KWeak [(ty-i64)]) false) UMismatch)))
+        (is cs (err? (run g st (TCon KArray [(ty-i64)]) (TCon KWeak [(ty-i64)]) false) UMismatch) "different constructors"))
       (let ((st (store-new)))
-        (check cs "a function type is not a constructor"
-               (err? (run g st (fn0 CSend) (TCon KArray [(ty-i64)]) false) UMismatch)))
+        (is cs (err? (run g st (fn0 CSend) (TCon KArray [(ty-i64)]) false) UMismatch) "a function type is not a constructor"))
       (let ((st (store-new)))
-        (check cs "gen unifies with the same gen only"
-               (and (ok? (run g st (TGen 0) (TGen 0) false))
-                    (err? (run g st (TGen 0) (TGen 1) false) UMismatch))))
+        (is cs (and (ok? (run g st (TGen 0) (TGen 0) false))
+                    (err? (run g st (TGen 0) (TGen 1) false) UMismatch)) "gen unifies with the same gen only"))
       (let ((st (store-new)) (v (store-fresh st)))
-        (check cs "occurs through a function type"
-               (err? (run g st v (TFn CSend [v] (ty-i64)) false) UOccurs)))
+        (is cs (err? (run g st v (TFn CSend [v] (ty-i64)) false) UOccurs) "occurs through a function type"))
       (let ((st (store-new)) (v (store-fresh st)))
-        (check cs "occurs is checked before the flow copy is made"
-               (let ((r (run g st v (TFn CSend [] v) true)))
+        (is cs (let ((r (run g st v (TFn CSend [] v) true)))
                  (and (err? r UOccurs) (= (conn r) 0)
-                      (= (store-fresh-colour st) (CVar 0)))))))))
+                      (= (store-fresh-colour st) (CVar 0)))) "occurs is checked before the flow copy is made")))))
 
-(defun binding-tests (cs: Checks) -> unit
+(defun binding-tests (cs: StepLog) -> unit
   (let ((g (globals-new)))
     (do
       (let ((st (store-new)) (x (store-fresh st)) (y (store-fresh st)) (r (run g st x y false)))
-        (check cs "two variables: the first is bound to the second"
-               (and (ok? r) (= (store-resolve st x) y))))
+        (is cs (and (ok? r) (= (store-resolve st x) y)) "two variables: the first is bound to the second"))
       (let ((st (store-new)) (x (store-fresh st)))
-        (check cs "a variable with itself is a no-op"
-               (and (ok? (run g st x x false)) (= (store-resolve st x) x))))
+        (is cs (and (ok? (run g st x x false)) (= (store-resolve st x) x)) "a variable with itself is a no-op"))
       (let ((st (store-new)) (x (store-fresh st)) (y (store-fresh st))
             (r (run g st (TFn CSend [x] y) (TFn CSend [(ty-i64)] (ty-str)) false)))
-        (check cs "parameters and results unify, and bind"
-               (and (ok? r) (= (store-zonk st x) (ty-i64)) (= (store-zonk st y) (ty-str)))))
+        (is cs (and (ok? r) (= (store-zonk st x) (ty-i64)) (= (store-zonk st y) (ty-str))) "parameters and results unify, and bind"))
       (let ((st (store-new)) (x (store-fresh st))
             (r (run g st (ty-cell x) (ty-cell (ty-bool)) false)))
-        (check cs "arguments of a constructor unify"
-               (and (ok? r) (= (store-zonk st x) (ty-bool)))))
+        (is cs (and (ok? r) (= (store-zonk st x) (ty-bool))) "arguments of a constructor unify"))
       (let ((st (store-new)) (x (store-fresh st))
             (r (run g st (TCon KArray [x (ty-str)]) (TCon KArray [(ty-i64) (ty-i64)]) false)))
-        (check cs "arguments before the failing one stay bound"
-               (and (err? r UMismatch) (= (store-zonk st x) (ty-i64))))))))
+        (is cs (and (err? r UMismatch) (= (store-zonk st x) (ty-i64))) "arguments before the failing one stay bound")))))
 
-(defun colour-parameter-tests (cs: Checks) -> unit
+(defun colour-parameter-tests (cs: StepLog) -> unit
   (let ((g (globals-with-n)))
     (do
       (let ((st (store-new)) (r (run g st (n-of CSend (ty-i64)) (n-of CLocal (ty-i64)) false)))
-        (check cs "(N :send) and (N :local) do not unify, and push nothing"
-               (and (err? r UMismatch) (= (conn r) 0))))
+        (is cs (and (err? r UMismatch) (= (conn r) 0)) "(N :send) and (N :local) do not unify, and push nothing"))
       (let ((st (store-new)))
-        (check cs "(N :send) and (N :send) unify"
-               (ok? (run g st (n-of CSend (ty-i64)) (n-of CSend (ty-i64)) false))))
+        (is cs (ok? (run g st (n-of CSend (ty-i64)) (n-of CSend (ty-i64)) false)) "(N :send) and (N :send) unify"))
       (let ((st (store-new)))
-        (check cs "a rigid colour does not unify with send"
-               (err? (run g st (n-of (CRigid 0) (ty-i64)) (n-of CSend (ty-i64)) false) UMismatch)))
+        (is cs (err? (run g st (n-of (CRigid 0) (ty-i64)) (n-of CSend (ty-i64)) false) UMismatch) "a rigid colour does not unify with send"))
       (let ((st (store-new)))
-        (check cs "a rigid colour does not unify with local"
-               (err? (run g st (n-of (CRigid 0) (ty-i64)) (n-of CLocal (ty-i64)) false) UMismatch)))
+        (is cs (err? (run g st (n-of (CRigid 0) (ty-i64)) (n-of CLocal (ty-i64)) false) UMismatch) "a rigid colour does not unify with local"))
       (let ((st (store-new)))
-        (check cs "two rigid colours differ"
-               (err? (run g st (n-of (CRigid 0) (ty-i64)) (n-of (CRigid 1) (ty-i64)) false) UMismatch)))
+        (is cs (err? (run g st (n-of (CRigid 0) (ty-i64)) (n-of (CRigid 1) (ty-i64)) false) UMismatch) "two rigid colours differ"))
       (let ((st (store-new)) (r (run g st (n-of (CRigid 0) (ty-i64)) (n-of (CRigid 0) (ty-i64)) false)))
-        (check cs "the same rigid colour unifies" (and (ok? r) (= (conn r) 0))))
+        (is cs (and (ok? r) (= (conn r) 0)) "the same rigid colour unifies"))
       (let ((st (store-new)) (r (run g st (n-of CSend (ty-i64)) (n-of (CVar 0) (ty-i64)) true)))
-        (check cs "a colour variable at a colour parameter is constrained both ways, even at a flow site"
-               (and (ok? r) (= (conn r) 2))))
+        (is cs (and (ok? r) (= (conn r) 2)) "a colour variable at a colour parameter is constrained both ways, even at a flow site"))
       (let ((st (store-new)) (v (store-fresh st)))
-        (check cs "a variable argument at a colour parameter is not a fixed colour"
-               (ok? (run g st (n-of CSend (ty-i64)) (ty-nominal 0 [v (ty-i64)]) false))))
+        (is cs (ok? (run g st (n-of CSend (ty-i64)) (ty-nominal 0 [v (ty-i64)]) false)) "a variable argument at a colour parameter is not a fixed colour"))
       (let ((st (store-new)))
-        (check cs "a non-colour parameter with different fixed colours is a colour flow, not a mismatch"
-               (let ((r (run g st (ty-nominal 0 [(ty-colour-arg CSend) (fn0 CLocal)])
+        (is cs (let ((r (run g st (ty-nominal 0 [(ty-colour-arg CSend) (fn0 CLocal)])
                                   (ty-nominal 0 [(ty-colour-arg CSend) (fn0 CSend)]) false)))
-                 (and (ok? r) (= (conn r) 2))))))))
+                 (and (ok? r) (= (conn r) 2))) "a non-colour parameter with different fixed colours is a colour flow, not a mismatch")))))
 
 (defun cx-new () -> Cx
   (Cx (globals-new) (env-new) (store-new) (tables-new) (unit-new)))
 
-(defun cx-tests (cs: Checks) -> unit
+(defun cx-tests (cs: StepLog) -> unit
   (let ((cx (cx-new)))
     (do
-      (check cs "cx-fresh numbers variables from 0"
-             (= [(cx-fresh cx) (cx-fresh cx)] [(TVar 0) (TVar 1)]))
+      (is cs (= [(cx-fresh cx) (cx-fresh cx)] [(TVar 0) (TVar 1)]) "cx-fresh numbers variables from 0")
       (cx-record cx 7 (ty-i64))
       (cx-record cx 9 (ty-str))
-      (check cs "cx-record keeps the type and the order"
-             (and (= (get @(. (. cx t) expr-types) 7) (some (ty-i64)))
-                  (= @(. (. cx u) exprs) [7 9])))
+      (is cs (and (= (get @(. (. cx t) expr-types) 7) (some (ty-i64)))
+                  (= @(. (. cx u) exprs) [7 9])) "cx-record keeps the type and the order")
       (cx-bind cx 3 (ty-bool))
-      (check cs "cx-bind keeps the type and the order"
-             (and (= (get @(. (. cx t) binding-types) 3) (some (ty-bool)))
-                  (= @(. (. cx u) bindings) [3])))
-      (check cs "cx-binding finds a bound binding"
-             (match (cx-binding cx 3 p0) ((Ok t) (= t (ty-bool))) (_ false)))
+      (is cs (and (= (get @(. (. cx t) binding-types) 3) (some (ty-bool)))
+                  (= @(. (. cx u) bindings) [3])) "cx-bind keeps the type and the order")
+      (is cs (match (cx-binding cx 3 p0) ((Ok t) (= t (ty-bool))) (_ false)) "cx-binding finds a bound binding")
       (table-add (. (. cx g) bindings) (BindingInfo "zz" BkLet p0 nil))
-      (check cs "cx-binding of an unbound binding is the internal error"
-             (match (cx-binding cx 0 p0)
+      (is cs (match (cx-binding cx 0 p0)
                ((Err e) (and (= (. e kind) Other) (= (. e message) "internal: zz has no type")))
-               (_ false)))
+               (_ false)) "cx-binding of an unbound binding is the internal error")
       (set! (. (. cx u) fun) "main")
       (cx-defer cx (DkFloat (ty-i64)) p0 (some 4))
       (cx-defer cx (DkWeakable (ty-str)) p0 nil)
-      (check cs "cx-defer tags the unit's function and keeps the order"
-             (let ((ds @(. (. cx u) deferred)))
+      (is cs (let ((ds @(. (. cx u) deferred)))
                (and (= (count ds) 2) (= (. (nth ds 0) fun) "main") (= (. (nth ds 0) site) (some 4))
-                    (nil? (. (nth ds 1) site)) (match (. (nth ds 1) kind) ((DkWeakable t) (= t (ty-str))) (_ false)))))
+                    (nil? (. (nth ds 1) site)) (match (. (nth ds 1) kind) ((DkWeakable t) (= t (ty-str))) (_ false)))) "cx-defer tags the unit's function and keeps the order")
       (let ((a (cx-fresh cx)))
         (do (match (cx-unify cx a (ty-i64) p0) ((Ok _) ()) (_ ()))
-            (check cs "cx-unify binds, cx-zonk substitutes"
-                   (= (cx-zonk cx (ty-cell a)) (ty-cell (ty-i64))))))
-      (check cs "cx-unify and cx-flow push onto the unit's colours"
-             (let ((before (count @(. (. cx u) colours))))
+            (is cs (= (cx-zonk cx (ty-cell a)) (ty-cell (ty-i64))) "cx-unify binds, cx-zonk substitutes")))
+      (is cs (let ((before (count @(. (. cx u) colours))))
                (do (match (cx-flow cx (fn0 CLocal) (fn0 CSend) p0) ((Ok _) ()) (_ ()))
                    (match (cx-unify cx (fn0 CLocal) (fn0 CSend) p0) ((Ok _) ()) (_ ()))
-                   (= (- (count @(. (. cx u) colours)) before) 3)))))))
+                   (= (- (count @(. (. cx u) colours)) before) 3))) "cx-unify and cx-flow push onto the unit's colours"))))
 
 (defun error-of (r: (Result unit TypeError)) -> (Option TypeError)
   (match r ((Err e) (some e)) (_ nil)))
@@ -236,46 +195,37 @@
 (defun error-text (r: (Result unit TypeError)) -> str
   (match r ((Err e) (. e message)) (_ "no error")))
 
-(defun error-tests (cs: Checks) -> unit
+(defun error-tests (cs: StepLog) -> unit
   (let ((cx (cx-new))
         (pos (Pos "u.fib" 4 7 20 25)))
     (do
-      (check cs "a mismatch is a Unify error at the position given"
-             (match (error-of (cx-unify cx (ty-i64) (ty-str) pos))
+      (is cs (match (error-of (cx-unify cx (ty-i64) (ty-str) pos))
                ((some e) (and (= (. e kind) Unify) (= (. (. e pos) line) 4) (= (. (. e pos) col) 7)
                               (= (. e message) "cannot unify i64 with str")))
-               (nil false)))
-      (check cs "the types are zonked before they are printed"
-             (let ((a (cx-fresh cx)))
+               (nil false)) "a mismatch is a Unify error at the position given")
+      (is cs (let ((a (cx-fresh cx)))
                (do (cx-unify cx a (ty-i64) pos)
-                   (= (error-text (cx-unify cx a (ty-str) pos)) "cannot unify i64 with str"))))
-      (check cs "one printer for both types: two variables are a and b"
-             (= (error-text (cx-unify cx (TCon KArray [(TVar 40)]) (ty-cell (TVar 41)) pos))
-                "cannot unify (Array a) with (Cell b)"))
-      (check cs "an occurs failure is an Infinite error, each side printed by its own printer"
-             (match (error-of (cx-unify cx (TFn (CVar 9) [(TVar 50)] (TVar 51)) (TVar 50) pos))
+                   (= (error-text (cx-unify cx a (ty-str) pos)) "cannot unify i64 with str"))) "the types are zonked before they are printed")
+      (is cs (= (error-text (cx-unify cx (TCon KArray [(TVar 40)]) (ty-cell (TVar 41)) pos))
+                "cannot unify (Array a) with (Cell b)") "one printer for both types: two variables are a and b")
+      (is cs (match (error-of (cx-unify cx (TFn (CVar 9) [(TVar 50)] (TVar 51)) (TVar 50) pos))
                ((some e) (and (= (. e kind) Infinite)
                               (= (. e message) "cannot construct the infinite type: (fn (a) b) = a")))
-               (nil false)))
-      (check cs "a flow failure is a Unify error too"
-             (= (error-text (cx-flow cx (ty-i64) (ty-bool) pos)) "cannot unify i64 with bool"))
+               (nil false)) "an occurs failure is an Infinite error, each side printed by its own printer")
+      (is cs (= (error-text (cx-flow cx (ty-i64) (ty-bool) pos)) "cannot unify i64 with bool") "a flow failure is a Unify error too")
       (set! (. (. cx u) rigid-names) ["T"])
-      (check cs "rigid variables print by the unit's names"
-             (= (error-text (cx-unify cx (TRigid 0) (ty-i64) pos)) "cannot unify T with i64"))
-      (check cs "cx-show zonks, and each call has its own printer"
-             (and (= (cx-show cx (ty-cell (TVar 60))) "(Cell a)")
+      (is cs (= (error-text (cx-unify cx (TRigid 0) (ty-i64) pos)) "cannot unify T with i64") "rigid variables print by the unit's names")
+      (is cs (and (= (cx-show cx (ty-cell (TVar 60))) "(Cell a)")
                   (= (cx-show cx (ty-cell (TVar 61))) "(Cell a)")
-                  (= (cx-show cx (ty-cell (TRigid 0))) "(Cell T)")))
-      (check cs "cx-show of a bound variable is the zonked type"
-             (let ((a (cx-fresh cx)))
+                  (= (cx-show cx (ty-cell (TRigid 0))) "(Cell T)")) "cx-show zonks, and each call has its own printer")
+      (is cs (let ((a (cx-fresh cx)))
                (do (cx-unify cx a (ty-str) pos)
-                   (= (cx-show cx (ty-cell a)) "(Cell str)"))))
-      (check cs "cx-mismatch is the error of the same text"
-             (let ((e (cx-mismatch cx (ty-i64) (TRigid 0) pos)))
-               (and (= (. e kind) Unify) (= (. e message) "cannot unify i64 with T")))))))
+                   (= (cx-show cx (ty-cell a)) "(Cell str)"))) "cx-show of a bound variable is the zonked type")
+      (is cs (let ((e (cx-mismatch cx (ty-i64) (TRigid 0) pos)))
+               (and (= (. e kind) Unify) (= (. e message) "cannot unify i64 with T"))) "cx-mismatch is the error of the same text"))))
 
-(defun main () -> i64
-  (let ((cs (checks-new)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
     (do (rust-tests cs)
         (colour-tests cs)
         (failure-tests cs)
@@ -283,4 +233,11 @@
         (colour-parameter-tests cs)
         (cx-tests cs)
         (error-tests cs)
-        (finish cs))))
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-unify" [(test-case "checks" unit-steps "compiler/tests/types/unit-unify.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

@@ -3,7 +3,8 @@
 ;; the files joined with a line break after each, and the runtime's declarations are found as `runtime_declaration` finds them.
 ;; compiler/tests/emit/runtime.sh also regenerates the file and compares it byte for byte.
 ;; Build: fibc build compiler/tests/emit/unit-runtime.fib -I compiler -I lib -o OUT
-(ns main (:use types.check emit.runtime emit.rt))
+(ns tests.emit.unit-runtime (:use fib.test.unit emit.runtime emit.rt)
+  (:require [fib.test.run :as test-runner]))
 
 (def stems: (Vec str) ["core" "str" "array" "vec" "vecbuild" "atom" "thread" "task" "deque" "sched" "park" "weak" "io" "sys" "alloc"])
 
@@ -12,44 +13,40 @@
     (nil "")
     ((some t) t)))
 
-(defun main () -> i64
-  (let ((cs (checks-new))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec))
         (parts (runtime-parts-for "Linux")))   ; the raw rt/*.lir: another host (Darwin) has them rewritten by emit.os
     (do
-      (check cs "fifteen parts" (= (count parts) 15))
+      (is cs (= (count parts) 15) "fifteen parts")
       (doseq [i (range 13)]
-        (check cs (str-join ["part " (nth stems i) " is its file"])
-               (and (> (str-len (nth parts i)) 0) (= (nth parts i) (file-text (nth stems i))))))
-      (check cs "the text is every file and a line break"
-             (= (str-join (vec (mapcat (fn (p: str) [p "\n"]) parts))) (str-join (vec (mapcat (fn (st: str) [(file-text st) "\n"]) stems)))))
-      (check cs "malloc is declared by core"
-             (= (runtime-declaration "malloc") (some "(declare malloc ptr (i64))")))
-      (check cs "sched_yield is declared by atom (a part after the first)"
-             (= (runtime-declaration "sched_yield") (some "(declare sched_yield i32 ())")))
-      (check cs "fopen is declared by io, the last part"
-             (= (runtime-declaration "fopen") (some "(declare fopen ptr (ptr ptr))")))
-      (check cs "a name that is a prefix of another is not found"
-             (nil? (runtime-declaration "mallo")))
-      (check cs "an undeclared name is not found" (nil? (runtime-declaration "printf")))
-      (check cs "a definition is not a declaration" (nil? (runtime-declaration "fib.init")))
+        (is cs (and (> (str-len (nth parts i)) 0) (= (nth parts i) (file-text (nth stems i)))) (str-join ["part " (nth stems i) " is its file"])))
+      (is cs (= (str-join (vec (mapcat (fn (p: str) [p "\n"]) parts))) (str-join (vec (mapcat (fn (st: str) [(file-text st) "\n"]) stems)))) "the text is every file and a line break")
+      (is cs (= (runtime-declaration "malloc") (some "(declare malloc ptr (i64))")) "malloc is declared by core")
+      (is cs (= (runtime-declaration "sched_yield") (some "(declare sched_yield i32 ())")) "sched_yield is declared by atom (a part after the first)")
+      (is cs (= (runtime-declaration "fopen") (some "(declare fopen ptr (ptr ptr))")) "fopen is declared by io, the last part")
+      (is cs (nil? (runtime-declaration "mallo")) "a name that is a prefix of another is not found")
+      (is cs (nil? (runtime-declaration "printf")) "an undeclared name is not found")
+      (is cs (nil? (runtime-declaration "fib.init")) "a definition is not a declaration")
       ;; A64-1: the worker count of the pool asks sysconf by the platform's constant (_SC_NPROCESSORS_ONLN: 84 on glibc, 58 on Darwin; on a Mac sysconf(84) is -1,
       ;; which made the pool one worker).
       (let ((linux (str-join (runtime-parts-for "Linux"))) (darwin (str-join (runtime-parts-for "Darwin"))))
-        (do (check cs "Linux asks sysconf(84)" (and (some? (str-find linux "@sysconf (i32 84)" 0)) (nil? (str-find linux "@sysconf (i32 58)" 0))))
-            (check cs "Darwin asks sysconf(58)" (and (some? (str-find darwin "@sysconf (i32 58)" 0)) (nil? (str-find darwin "@sysconf (i32 84)" 0))))
+        (do (is cs (and (some? (str-find linux "@sysconf (i32 84)" 0)) (nil? (str-find linux "@sysconf (i32 58)" 0))) "Linux asks sysconf(84)")
+            (is cs (and (some? (str-find darwin "@sysconf (i32 58)" 0)) (nil? (str-find darwin "@sysconf (i32 84)" 0))) "Darwin asks sysconf(58)")
             ;; P-sched: the pool's affinity count is Linux's; Darwin falls back to sysconf, and its pthread keys are 8 bytes.
-            (check cs "Darwin has no sched_getaffinity and an 8-byte sched key"
-                   (and (nil? (str-find darwin "sched_getaffinity" 0)) (some? (str-find linux "(declare sched_getaffinity i32 (i32 i64 ptr))" 0))
-                        (some? (str-find darwin "(global internal fib.sched-key i64 (i64 0))" 0)) (nil? (str-find darwin "(load i32 @fib.sched-key)" 0))))
+            (is cs (and (nil? (str-find darwin "sched_getaffinity" 0)) (some? (str-find linux "(declare sched_getaffinity i32 (i32 i64 ptr))" 0))
+                        (some? (str-find darwin "(global internal fib.sched-key i64 (i64 0))" 0)) (nil? (str-find darwin "(load i32 @fib.sched-key)" 0))) "Darwin has no sched_getaffinity and an 8-byte sched key")
             ;; ALLOC-1: the large-block cache's three platform calls.
-            (check cs "Linux pins glibc's mmap threshold, Darwin has no mallopt"
-                   (and (some? (str-find linux "(call @mallopt (i32 -3) (i32 131072))" 0)) (nil? (str-find darwin "@mallopt" 0)) (nil? (str-find darwin "(declare mallopt" 0))))
-            (check cs "Darwin asks malloc_size and its approximate raw clock"
-                   (and (some? (str-find darwin "(declare malloc_size i64 (ptr))" 0)) (nil? (str-find darwin "malloc_usable_size" 0))
-                        (some? (str-find darwin "@clock_gettime (i32 5)" 0)) (some? (str-find linux "@clock_gettime (i32 6)" 0))))))
-      (check cs "a function marked `;; extern:` answers with its declaration"
-             (= (runtime-declaration "fib_alloc_ctl") (some "(declare fib_alloc_ctl i64 (i64 i64 i64))")))
-      (check cs "the pool's control function is declared the same way"
-             (= (runtime-declaration "fib_sched_ctl") (some "(declare fib_sched_ctl i64 (i64 i64))")))
-      (check cs "part alloc is its file" (= (nth parts 14) (file-text "alloc")))
-      (finish cs))))
+            (is cs (and (some? (str-find linux "(call @mallopt (i32 -3) (i32 131072))" 0)) (nil? (str-find darwin "@mallopt" 0)) (nil? (str-find darwin "(declare mallopt" 0))) "Linux pins glibc's mmap threshold, Darwin has no mallopt")
+            (is cs (and (some? (str-find darwin "(declare malloc_size i64 (ptr))" 0)) (nil? (str-find darwin "malloc_usable_size" 0))
+                        (some? (str-find darwin "@clock_gettime (i32 5)" 0)) (some? (str-find linux "@clock_gettime (i32 6)" 0))) "Darwin asks malloc_size and its approximate raw clock")))
+      (is cs (= (runtime-declaration "fib_alloc_ctl") (some "(declare fib_alloc_ctl i64 (i64 i64 i64))")) "a function marked `;; extern:` answers with its declaration")
+      (is cs (= (runtime-declaration "fib_sched_ctl") (some "(declare fib_sched_ctl i64 (i64 i64))")) "the pool's control function is declared the same way")
+      (is cs (= (nth parts 14) (file-text "alloc")) "part alloc is its file")
+      (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "emit/unit-runtime" [(test-case "checks" unit-steps "compiler/tests/emit/unit-runtime.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

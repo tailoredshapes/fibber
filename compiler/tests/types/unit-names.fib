@@ -7,8 +7,9 @@
 ;; `:private` names in each space and `(var m/x)` (g-value-any), re-exports, the
 ;; private-owner and the three messages of `g-unknown`.
 ;; Build: fibc build compiler/tests/types/unit-names.fib -I compiler -I lib -o OUT
-(ns main (:use syntax.pos syntax.form types.ty types.scheme types.ast types.table
-               types.decls types.names types.check))
+(ns tests.types.unit-names (:use syntax.pos syntax.form types.ty types.scheme types.ast types.table
+               types.decls types.names fib.test.unit)
+  (:require [fib.test.run :as test-runner]))
 
 (defun links (uses: (Vec i64) implicit: (Vec i64) reexports: (Vec i64)) -> Links
   (Links uses reexports implicit))
@@ -94,15 +95,15 @@
     ;; main
     (val g 8 "both" (GFun 40))))
 
-(defun vexp (cs: Checks name: str got: (Option GlobalRef) want: (Option GlobalRef)) -> unit
-  (check cs name (= got want)))
+(defun vexp (cs: StepLog name: str got: (Option GlobalRef) want: (Option GlobalRef)) -> unit
+  (is cs (= got want) name))
 
-(defun chains (cs: Checks) -> unit
+(defun chains (cs: StepLog) -> unit
   (let ((g (world)))
-    (do (check cs "the chain of main: itself, uses, implicit, prelude, builtins" (= (g-chain g 8) [8 6 7 2 3 1 0]))
-        (check cs "the chain of a module with no links" (= (g-chain g 4) [4 1 0])))))
+    (do (is cs (= (g-chain g 8) [8 6 7 2 3 1 0]) "the chain of main: itself, uses, implicit, prelude, builtins")
+        (is cs (= (g-chain g 4) [4 1 0]) "the chain of a module with no links"))))
 
-(defun shadowing (cs: Checks) -> unit
+(defun shadowing (cs: StepLog) -> unit
   (let ((g (world)))
     (do (vexp cs "own definition shadows the :use'd" (g-value g 8 "both") (some (GFun 40)))
         (vexp cs "two :use'd modules that agree" (g-value g 6 "both") (some (GFun 30)))
@@ -117,23 +118,21 @@
         (vexp cs "a name an implicit module exports, bare" (g-value g 8 "lib-fn") (some (GFun 20)))
         (vexp cs "the same definition from two implicit modules" (g-value g 8 "same-ic") (some (GFun 92))))))
 
-(defun ambiguity (cs: Checks) -> unit
+(defun ambiguity (cs: StepLog) -> unit
   (let ((g (world)))
     (do (vexp cs "two :use'd modules that differ: not resolved" (g-value g 8 "clash") nil)
-        (check cs "the ambiguity names the two modules" (= (g-ambiguity g 8 SpValue "clash") (some (Pair 6 7))))
-        (check cs "no ambiguity where they agree" (nil? (g-ambiguity g 8 SpValue "both")))
-        (check cs "no ambiguity for an unbound name" (nil? (g-ambiguity g 8 SpValue "nowhere")))
-        (check cs "the spaces are separate: a value T is unbound" (nil? (g-ambiguity g 8 SpValue "T")))
+        (is cs (= (g-ambiguity g 8 SpValue "clash") (some (Pair 6 7))) "the ambiguity names the two modules")
+        (is cs (nil? (g-ambiguity g 8 SpValue "both")) "no ambiguity where they agree")
+        (is cs (nil? (g-ambiguity g 8 SpValue "nowhere")) "no ambiguity for an unbound name")
+        (is cs (nil? (g-ambiguity g 8 SpValue "T")) "the spaces are separate: a value T is unbound")
         (vexp cs "two implicit modules that differ: not resolved" (g-value g 8 "ic") nil)
-        (check cs "implicit ambiguity names the implicit modules" (= (g-ambiguity g 8 SpValue "ic") (some (Pair 2 3))))
-        (check cs "a type clash" (and (nil? (g-type-name g 8 "T")) (= (g-ambiguity g 8 SpType "T") (some (Pair 6 7)))))
-        (check cs "a protocol clash" (and (nil? (g-proto-name g 8 "P")) (= (g-ambiguity g 8 SpProto "P") (some (Pair 6 7)))))
-        (check cs "g-unknown of a clash"
-               (= (g-unknown g 8 SpValue "clash" "unbound name") "clash is exported by both a and b; write a/clash or b/clash"))
-        (check cs "g-unknown of a type clash"
-               (= (g-unknown g 8 SpType "T" "unknown type") "T is exported by both a and b; write a/T or b/T")))))
+        (is cs (= (g-ambiguity g 8 SpValue "ic") (some (Pair 2 3))) "implicit ambiguity names the implicit modules")
+        (is cs (and (nil? (g-type-name g 8 "T")) (= (g-ambiguity g 8 SpType "T") (some (Pair 6 7)))) "a type clash")
+        (is cs (and (nil? (g-proto-name g 8 "P")) (= (g-ambiguity g 8 SpProto "P") (some (Pair 6 7)))) "a protocol clash")
+        (is cs (= (g-unknown g 8 SpValue "clash" "unbound name") "clash is exported by both a and b; write a/clash or b/clash") "g-unknown of a clash")
+        (is cs (= (g-unknown g 8 SpType "T" "unknown type") "T is exported by both a and b; write a/T or b/T") "g-unknown of a type clash"))))
 
-(defun qualified (cs: Checks) -> unit
+(defun qualified (cs: StepLog) -> unit
   (let ((g (world)))
     (do (vexp cs "a/x through the alias of a :use'd module" (g-value g 8 "a/clash") (some (GFun 31)))
         (vexp cs "b/x" (g-value g 8 "b/clash") (some (GFun 32)))
@@ -145,12 +144,12 @@
         (vexp cs "the name / is a plain name" (g-value g 8 "/") (some (GBuiltin 3)))
         (vexp cs "ns/ with an empty base is a plain name, not the namespace's name \"\"" (g-value g 8 "a/") nil)
         (vexp cs "// has an empty namespace: a plain name" (g-value g 8 "//") nil)
-        (check cs "a type of an alias" (= (g-type-name g 8 "a/T") (some 1)))
-        (check cs "a protocol of an alias" (= (g-proto-name g 8 "b/P") (some 8)))
-        (check cs "the prelude's type and protocol" (and (= (g-type-name g 8 "Option") (some 100))
-                                                          (= (g-proto-name g 8 "Show") (some 200)))))))
+        (is cs (= (g-type-name g 8 "a/T") (some 1)) "a type of an alias")
+        (is cs (= (g-proto-name g 8 "b/P") (some 8)) "a protocol of an alias")
+        (is cs (and (= (g-type-name g 8 "Option") (some 100))
+                                                          (= (g-proto-name g 8 "Show") (some 200))) "the prelude's type and protocol"))))
 
-(defun privacy (cs: Checks) -> unit
+(defun privacy (cs: StepLog) -> unit
   (let ((g (world)))
     (do (vexp cs "a private name in its own module" (g-value g 6 "hidden") (some (GFun 34)))
         (vexp cs "a private name from another module" (g-value g 8 "hidden") nil)
@@ -159,41 +158,42 @@
         (vexp cs "qualified, (var a/hidden)" (g-value-any g 8 "a/hidden") (some (GFun 34)))
         (vexp cs "g-value-any is still the ordinary lookup for a public name" (g-value-any g 8 "only-a") (some (GFun 33)))
         (vexp cs "g-value-any of a clash is still not resolved" (g-value-any g 8 "clash") nil)
-        (check cs "a private type is not visible" (nil? (g-type-name g 8 "Hidden")))
-        (check cs "a private type in its own module" (= (g-type-name g 6 "Hidden") (some 4)))
-        (check cs "private is per space: a value Hidden does not exist" (nil? (g-value g 6 "Hidden")))
-        (check cs "a private protocol is not visible" (nil? (g-proto-name g 8 "HiddenP")))
-        (check cs "a public protocol" (= (g-proto-name g 8 "Q") (some 9)))
+        (is cs (nil? (g-type-name g 8 "Hidden")) "a private type is not visible")
+        (is cs (= (g-type-name g 6 "Hidden") (some 4)) "a private type in its own module")
+        (is cs (nil? (g-value g 6 "Hidden")) "private is per space: a value Hidden does not exist")
+        (is cs (nil? (g-proto-name g 8 "HiddenP")) "a private protocol is not visible")
+        (is cs (= (g-proto-name g 8 "Q") (some 9)) "a public protocol")
         (vexp cs "a private prelude name is not visible" (g-value g 8 "pre-priv") nil)
-        (check cs "the owner of a private name" (= (g-private-owner g 8 SpValue "hidden") (some 6)))
-        (check cs "the owner, qualified" (= (g-private-owner g 8 SpValue "a/hidden") (some 6)))
-        (check cs "the owner of a private type" (= (g-private-owner g 8 SpType "Hidden") (some 6)))
-        (check cs "the owner of a private protocol" (= (g-private-owner g 8 SpProto "HiddenP") (some 6)))
-        (check cs "no owner in the module itself" (nil? (g-private-owner g 6 SpValue "hidden")))
-        (check cs "no owner of a public name" (nil? (g-private-owner g 8 SpValue "only-a")))
-        (check cs "the owner of a private prelude name" (= (g-private-owner g 8 SpValue "pre-priv") (some 1)))
-        (check cs "g-unknown: private"
-               (= (g-unknown g 8 SpValue "hidden" "unbound name") "hidden is private to a; it is not exported"))
-        (check cs "g-unknown: private prelude name"
-               (= (g-unknown g 8 SpValue "pre-priv" "unbound name") "pre-priv is private to fib.prelude; it is not exported"))
-        (check cs "g-unknown: nowhere"
-               (= (g-unknown g 8 SpValue "nowhere" "unbound name") "unbound name nowhere"))
-        (check cs "g-unknown: what is the caller's"
-               (= (g-unknown g 8 SpType "Nope" "unknown type") "unknown type Nope")))))
+        (is cs (= (g-private-owner g 8 SpValue "hidden") (some 6)) "the owner of a private name")
+        (is cs (= (g-private-owner g 8 SpValue "a/hidden") (some 6)) "the owner, qualified")
+        (is cs (= (g-private-owner g 8 SpType "Hidden") (some 6)) "the owner of a private type")
+        (is cs (= (g-private-owner g 8 SpProto "HiddenP") (some 6)) "the owner of a private protocol")
+        (is cs (nil? (g-private-owner g 6 SpValue "hidden")) "no owner in the module itself")
+        (is cs (nil? (g-private-owner g 8 SpValue "only-a")) "no owner of a public name")
+        (is cs (= (g-private-owner g 8 SpValue "pre-priv") (some 1)) "the owner of a private prelude name")
+        (is cs (= (g-unknown g 8 SpValue "hidden" "unbound name") "hidden is private to a; it is not exported") "g-unknown: private")
+        (is cs (= (g-unknown g 8 SpValue "pre-priv" "unbound name") "pre-priv is private to fib.prelude; it is not exported") "g-unknown: private prelude name")
+        (is cs (= (g-unknown g 8 SpValue "nowhere" "unbound name") "unbound name nowhere") "g-unknown: nowhere")
+        (is cs (= (g-unknown g 8 SpType "Nope" "unknown type") "unknown type Nope") "g-unknown: what is the caller's"))))
 
-(defun reexports (cs: Checks) -> unit
+(defun reexports (cs: StepLog) -> unit
   (let ((g (world)))
     (do (vexp cs "what a :use'd module re-exports" (g-value g 8 "from-c") (some (GFun 50)))
         (vexp cs "a re-exported private name is not visible" (g-value g 8 "c-private") nil)
         (vexp cs "two re-exports that agree" (g-value g 8 "dup") (some (GFun 70)))
         (vexp cs "two re-exports that differ: not resolved" (g-value g 8 "diff") nil)
-        (check cs "the ambiguity of re-exports names the re-exported modules"
-               (= (g-ambiguity g 8 SpValue "diff") (some (Pair 4 5))))
+        (is cs (= (g-ambiguity g 8 SpValue "diff") (some (Pair 4 5))) "the ambiguity of re-exports names the re-exported modules")
         (vexp cs "a re-export against another :use'd module's definition: not resolved" (g-value g 8 "x-re") nil)
-        (check cs "which names the :use'd modules"
-               (= (g-ambiguity g 8 SpValue "x-re") (some (Pair 6 7))))
+        (is cs (= (g-ambiguity g 8 SpValue "x-re") (some (Pair 6 7))) "which names the :use'd modules")
         (vexp cs "a module sees its own definition, whatever others re-export" (g-value g 4 "diff") (some (GFun 71))))))
 
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
+    (do (chains cs) (shadowing cs) (ambiguity cs) (qualified cs) (privacy cs) (reexports cs) (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-names" [(test-case "checks" unit-steps "compiler/tests/types/unit-names.fib")]))
+
 (defun main () -> i64
-  (let ((cs (checks-new)))
-    (do (chains cs) (shadowing cs) (ambiguity cs) (qualified cs) (privacy cs) (reexports cs) (finish cs))))
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

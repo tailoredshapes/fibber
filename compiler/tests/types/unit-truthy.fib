@@ -4,9 +4,10 @@
 ;; from its doc comments and from spec/types.md section 2.4; and the elaboration
 ;; (types.elab) of a guarded form, an `and` and an `or` with its new ids.
 ;; Build: fibc build compiler/tests/types/unit-truthy.fib -I compiler -I lib -o OUT
-(ns main (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast
+(ns tests.types.unit-truthy (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast
                types.decls types.init types.infer.cx types.infer.unify types.infer.expr
-               types.elab types.check))
+               types.elab fib.test.unit)
+  (:require [fib.test.run :as test-runner]))
 
 (def p0: Pos (Pos "t.fib" 1 1 0 1))
 
@@ -34,81 +35,66 @@
 (defun unifies? (cx: Cx a: Ty b: Ty) -> bool
   (match (cx-unify cx a b p0) ((Ok _) true) (_ false)))
 
-(defun lit-tests (cs: Checks) -> unit
+(defun lit-tests (cs: StepLog) -> unit
   (do
     (let ((st (store-new)) (v (store-fresh-lit st 5)) (w (store-fresh st)))
-      (check cs "a literal variable has its magnitude, a plain one none"
-             (and (= (store-lit-of st 0) (some 5)) (nil? (store-lit-of st 1)))))
+      (is cs (and (= (store-lit-of st 0) (some 5)) (nil? (store-lit-of st 1))) "a literal variable has its magnitude, a plain one none"))
     (let ((st (store-new)) (v (store-fresh-lit st -7)))
-      (do (check cs "the magnitude of a negative literal" (= (store-lit-of st 0) (some 7)))
+      (do (is cs (= (store-lit-of st 0) (some 7)) "the magnitude of a negative literal")
           (store-widen-lit st 0 3)
-          (check cs "widening keeps the larger" (= (store-lit-of st 0) (some 7)))
+          (is cs (= (store-lit-of st 0) (some 7)) "widening keeps the larger")
           (store-widen-lit st 0 9)
-          (check cs "widening takes the larger" (= (store-lit-of st 0) (some 9)))
-          (check cs "an unbound literal variable is i64 in messages"
-                 (= (store-zonk-default st (ty-cell v)) (ty-cell (ty-i64))))))
+          (is cs (= (store-lit-of st 0) (some 9)) "widening takes the larger")
+          (is cs (= (store-zonk-default st (ty-cell v)) (ty-cell (ty-i64))) "an unbound literal variable is i64 in messages")))
     (let ((cx (fresh-cx)))
       (let ((v (store-fresh-lit (. cx st) 5)))
-        (check cs "a literal takes f64" (unifies? cx v (ty-scalar SF64)))))
+        (is cs (unifies? cx v (ty-scalar SF64)) "a literal takes f64")))
     (let ((cx (fresh-cx)))
       (let ((v (store-fresh-lit (. cx st) 16777216)))
-        (check cs "2^24 fits an f32" (unifies? cx v (ty-scalar SF32)))))
+        (is cs (unifies? cx v (ty-scalar SF32)) "2^24 fits an f32")))
     (let ((cx (fresh-cx)))
       (let ((v (store-fresh-lit (. cx st) 16777217)))
-        (check cs "2^24 + 1 does not fit an f32" (not (unifies? cx v (ty-scalar SF32))))))
+        (is cs (not (unifies? cx v (ty-scalar SF32))) "2^24 + 1 does not fit an f32")))
     (let ((cx (fresh-cx)))
       (let ((v (store-fresh-lit (. cx st) 9007199254740993)))
-        (check cs "2^53 + 1 does not fit an f64" (not (unifies? cx v (ty-scalar SF64))))))
+        (is cs (not (unifies? cx v (ty-scalar SF64))) "2^53 + 1 does not fit an f64")))
     (let ((cx (fresh-cx)))
       (let ((v (store-fresh-lit (. cx st) 5)))
-        (check cs "a literal that fits is an i32 (LANG-2: narrow integer literals)" (unifies? cx v (ty-scalar SI32)))))
+        (is cs (unifies? cx v (ty-scalar SI32)) "a literal that fits is an i32 (LANG-2: narrow integer literals)")))
     (let ((cx (fresh-cx)))
       (let ((v (store-fresh-lit (. cx st) 4294967296)))
-        (check cs "a literal too big for an i32 is not an i32" (not (unifies? cx v (ty-scalar SI32))))))
+        (is cs (not (unifies? cx v (ty-scalar SI32))) "a literal too big for an i32 is not an i32")))
     (let ((cx (fresh-cx)))
       (let ((v (store-fresh-lit (. cx st) 5)))
-        (check cs "a literal is not an object" (not (unifies? cx v (ty-str))))))
+        (is cs (not (unifies? cx v (ty-str))) "a literal is not an object")))
     (let ((cx (fresh-cx)))
       (let ((v (store-fresh-lit (. cx st) 5)) (w (cx-fresh cx)))
         (do (unifies? cx w v)
-            (check cs "a plain variable adopts what the literal variable adopts"
-                   (and (unifies? cx w (ty-scalar SF64))
-                        (= (cx-zonk cx v) (ty-scalar SF64)))))))
+            (is cs (and (unifies? cx w (ty-scalar SF64))
+                        (= (cx-zonk cx v) (ty-scalar SF64))) "a plain variable adopts what the literal variable adopts"))))
     (let ((cx (fresh-cx)))
       (let ((v (store-fresh-lit (. cx st) 4294967296)) (w (cx-fresh cx)))
         (do (unifies? cx v w)
-            (check cs "the literal variable stays the representative"
-                   (not (unifies? cx w (ty-scalar SI32)))))))))
+            (is cs (not (unifies? cx w (ty-scalar SI32))) "the literal variable stays the representative"))))))
 
-(defun truthy-tests (cs: Checks) -> unit
+(defun truthy-tests (cs: StepLog) -> unit
   (let ((cx (fresh-cx)))
     (do
       (cx-bind cx 0 (opt cx (ty-i64)))
-      (check cs "a bool and an option: the type of the last"
-             (ty-is? cx (infer cx (ex 1 (EAnd [(bool-lit 2) (local 3)]))) (opt cx (ty-i64))))
-      (check cs "an option is a test"
-             (ty-is? cx (infer cx (ex 4 (EAnd [(local 5) (bool-lit 6)]))) (ty-bool)))
-      (check cs "an integer is never a test"
-             (fails? (infer cx (ex 7 (EAnd [(int 8) (bool-lit 9)])))
-                     "a value of type i64 is always true; write the test"))
-      (check cs "or: an option with a default is the value"
-             (ty-is? cx (infer cx (ex 10 (EOr [(local 11) (int 12)]))) (ty-i64)))
-      (check cs "or of options is an option"
-             (ty-is? cx (infer cx (ex 13 (EOr [(local 14) (local 15)]))) (opt cx (ty-i64))))
-      (check cs "or of bools is a bool"
-             (ty-is? cx (infer cx (ex 16 (EOr [(bool-lit 17) (bool-lit 18)]))) (ty-bool)))
-      (check cs "a guarded form with value bodies is an option"
-             (ty-is? cx (infer cx (ex 19 (EGuarded [(guard (bool-lit 20) (int 21))]))) (opt cx (ty-i64))))
-      (check cs "a guarded form with unit bodies is unit"
-             (ty-is? cx (infer cx (ex 22 (EGuarded [(guard (local 23) (unit-lit 24))]))) (ty-unit)))
-      (check cs "a guarded form tests with an option"
-             (match (infer cx (ex 25 (EGuarded [(guard (local 26) (int 27)) (guard (bool-lit 28) (int 29))])))
-               ((Ok _) true) (_ false)))
-      (check cs "a guarded body of another type is a mismatch"
-             (fails? (infer cx (ex 30 (EGuarded [(guard (bool-lit 31) (int 32)) (guard (bool-lit 33) (bool-lit 34))])))
-                     "cannot unify bool with i64"))
-      (check cs "an elided arm is a fresh variable"
-             (match (infer cx (ex 35 EElided)) ((Ok (TVar _)) true) (_ false))))))
+      (is cs (ty-is? cx (infer cx (ex 1 (EAnd [(bool-lit 2) (local 3)]))) (opt cx (ty-i64))) "a bool and an option: the type of the last")
+      (is cs (ty-is? cx (infer cx (ex 4 (EAnd [(local 5) (bool-lit 6)]))) (ty-bool)) "an option is a test")
+      (is cs (fails? (infer cx (ex 7 (EAnd [(int 8) (bool-lit 9)])))
+                     "a value of type i64 is always true; write the test") "an integer is never a test")
+      (is cs (ty-is? cx (infer cx (ex 10 (EOr [(local 11) (int 12)]))) (ty-i64)) "or: an option with a default is the value")
+      (is cs (ty-is? cx (infer cx (ex 13 (EOr [(local 14) (local 15)]))) (opt cx (ty-i64))) "or of options is an option")
+      (is cs (ty-is? cx (infer cx (ex 16 (EOr [(bool-lit 17) (bool-lit 18)]))) (ty-bool)) "or of bools is a bool")
+      (is cs (ty-is? cx (infer cx (ex 19 (EGuarded [(guard (bool-lit 20) (int 21))]))) (opt cx (ty-i64))) "a guarded form with value bodies is an option")
+      (is cs (ty-is? cx (infer cx (ex 22 (EGuarded [(guard (local 23) (unit-lit 24))]))) (ty-unit)) "a guarded form with unit bodies is unit")
+      (is cs (match (infer cx (ex 25 (EGuarded [(guard (local 26) (int 27)) (guard (bool-lit 28) (int 29))])))
+               ((Ok _) true) (_ false)) "a guarded form tests with an option")
+      (is cs (fails? (infer cx (ex 30 (EGuarded [(guard (bool-lit 31) (int 32)) (guard (bool-lit 33) (bool-lit 34))])))
+                     "cannot unify bool with i64") "a guarded body of another type is a mismatch")
+      (is cs (match (infer cx (ex 35 EElided)) ((Ok (TVar _)) true) (_ false)) "an elided arm is a fresh variable"))))
 
 ;; ---- elaboration
 
@@ -122,7 +108,7 @@
 
 (defun is-if? (e: Expr) -> bool (match (. e kind) ((EIf _ _ _) true) (_ false)))
 
-(defun elab-tests (cs: Checks) -> unit
+(defun elab-tests (cs: StepLog) -> unit
   (do
     (let ((cx (fresh-cx)))
       (let ((n (g-next-expr (. cx g))))
@@ -131,29 +117,33 @@
                   (t (opt cx (ty-i64))))
               (do (infer cx e)
                   (let ((out (elab-program cx e)))
-                    (check cs "a guarded form is an if, keeping its id"
-                           (and (is-if? out) (= (. out id) 100)))))))))
+                    (is cs (and (is-if? out) (= (. out id) 100)) "a guarded form is an if, keeping its id")))))))
     (let ((cx (fresh-cx)))
       (do (cx-bind cx 0 (opt cx (ty-i64)))
           (let ((e (ex 200 (EAnd [(local 201) (bool-lit 202)]))))
             (do (infer cx e)
                 (let ((out (elab-program cx e)))
-                  (check cs "an and over an option test is an if over a match"
-                         (match (. out kind)
+                  (is cs (match (. out kind)
                            ((EIf c _ _) (match (. c kind) ((EMatch _ cls) (= (count cls) 2)) (_ false)))
-                           (_ false))))))))
+                           (_ false)) "an and over an option test is an if over a match"))))))
     (let ((cx (fresh-cx)))
       (do (cx-bind cx 0 (opt cx (ty-i64)))
           (let ((e (ex 300 (EOr [(local 301) (int 302)]))))
             (do (infer cx e)
                 (let ((out (elab-program cx e)))
-                  (check cs "an or with a default is a match on some with a binding"
-                         (and (match (. out kind) ((EMatch _ cls) (= (count cls) 2)) (_ false))
-                              (= (. (g-binding (. cx g) 1) name) "or-value"))))))))))
+                  (is cs (and (match (. out kind) ((EMatch _ cls) (= (count cls) 2)) (_ false))
+                              (= (. (g-binding (. cx g) 1) name) "or-value")) "an or with a default is a match on some with a binding"))))))))
 
-(defun main () -> i64
-  (let ((cs (checks-new)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
     (do (lit-tests cs)
         (truthy-tests cs)
         (elab-tests cs)
-        (finish cs))))
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-truthy" [(test-case "checks" unit-steps "compiler/tests/types/unit-truthy.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

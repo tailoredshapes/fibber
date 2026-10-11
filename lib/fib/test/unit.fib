@@ -1,0 +1,47 @@
+;; fib.test.unit: named unit tests using fib.test's scenarios, isolation and reporters.
+;; A test receives its own assertion log explicitly; no global registry or shared test state.
+(ns fib.test.unit
+  (:use fib.test.core)
+  (:export-from fib.test.data))
+
+;; Existing functions can supply a test without a macro. Empty assertion logs fail in the runner.
+(defun test-case (name: str run: (fn :send () (Vec StepRun)) at: str) -> Scenario
+  (Scenario (slugify name) name [] [] (fn (_seed: i64) (run)) at))
+
+(defun unit-suite (name: str tests: (Vec Scenario)) -> Suite
+  (feature-suite name tests))
+
+;; (deftest name [t] body..) defines a function returning a test value. Each run creates a fresh log.
+(defmacro deftest (name bindings ... body)
+  (match bindings
+    ((Vec bs)
+     (if (= (vec-count bs) 1)
+         (let ((t (vec-nth bs 0))
+               (label (match name ((Sym n) n) (_ (trap "deftest: the name is a symbol")))))
+           (match t
+             ((Sym _) `(defun ~name () -> Scenario
+                         (test-case ~(Str label)
+                           (fn () (let ((~t (new-rec))) (do ~@body (rec-steps ~t))))
+                           (call-pos))))
+             (_ (trap "deftest: the assertion log is a symbol"))))
+         (trap "deftest: use one assertion log, [t]")))
+    (_ (trap "deftest: use one assertion log, [t]"))))
+
+;; Boolean assertion, with an optional description. Both log and expression are evaluated once.
+(defmacro is (t expression ... description)
+  (if (> (vec-count description) 1)
+      (trap "is: at most one description")
+      (let ((r (gensym "log")) (ok (gensym "ok"))
+            (label (if (= (vec-count description) 1) (vec-nth description 0) `(form-text (quote ~expression)))))
+        `(let ((~r ~t) (~ok ~expression))
+           (judge-true ~r ~label (call-pos) ~ok)))))
+
+;; Equality assertion for Debug values: records expected and actual, each evaluated once.
+(defmacro is= (t expected actual ... description)
+  (if (> (vec-count description) 1)
+      (trap "is=: at most one description")
+      (let ((r (gensym "log")) (e (gensym "expected")) (a (gensym "actual"))
+            (label (if (= (vec-count description) 1) (vec-nth description 0)
+                       `(form-text (quote (= ~expected ~actual))))))
+        `(let ((~r ~t) (~e ~expected) (~a ~actual))
+           (judge ~r ~label (call-pos) (= ~e ~a) (pr-str ~e) (pr-str ~a))))))

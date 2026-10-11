@@ -13,10 +13,11 @@
 ;; The tool's `--layout` compares the same code over every ground type of 1,100 programs (compare.sh, E2's report).
 ;; Run from the repository root (the golden file is read by its path).
 ;; Build: fibc build compiler/tests/emit/unit-objects.fib -I compiler -I lib -o OUT
-(ns main
+(ns tests.emit.unit-objects
   (:require [fib.string :as s])
-  (:use syntax.pos types.ty types.table types.decls types.program types.check own.program emit.value emit.objects
-        emit.statics emit.program))
+  (:use syntax.pos types.ty types.table types.decls types.program fib.test.unit own.program emit.value emit.objects
+        emit.statics emit.program)
+  (:require [fib.test.run :as test-runner]))
 
 ;; The text of the lIR function NAME in src, up to the next one ("" if there is none).
 (defun function (src: str name: str) -> str
@@ -51,66 +52,63 @@
 (defun empty-typed () -> TypedProgram
   (TypedProgram (globals-new) (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) [] []))
 
-(defun walk-checks (cs: Checks) -> unit
+(defun walk-checks (cs: StepLog) -> unit
   (let ((raw (objects-render (table LirRaw))) (obj (objects-render (table LirPtr))))
     (doseq [i (range 6)]
       (let ((d (str-join ["drop." (str i)])) (t (str-join ["trace." (str i)])) (h (str-join ["share." (str i)])))
-        (do (check cs (str-join ["kind " (str i) ": a raw slot is not released, traced or shared"])
-                   (and (not (includes (function raw d) "fib.defer"))
+        (do (is cs (and (not (includes (function raw d) "fib.defer"))
                         (not (includes (function raw t) "indirect-call"))
-                        (not (includes (function raw h) "fib.share-queue"))))
-            (check cs (str-join ["kind " (str i) ": an object slot is"])
-                   (and (includes (function obj d) "fib.defer")
+                        (not (includes (function raw h) "fib.share-queue"))) (str-join ["kind " (str i) ": a raw slot is not released, traced or shared"]))
+            (is cs (and (includes (function obj d) "fib.defer")
                         (includes (function obj t) "indirect-call")
-                        (includes (function obj h) "fib.share-queue"))))))))
+                        (includes (function obj h) "fib.share-queue")) (str-join ["kind " (str i) ": an object slot is"])))))))
 
-(defun main () -> i64
-  (let ((cs (checks-new)) (o (objects-new)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)) (o (objects-new)))
     (do
-      (check cs "a new table is empty" (and (objects-is-empty o) (= (objects-len o) 0)))
+      (is cs (and (objects-is-empty o) (= (objects-len o) 0)) "a new table is empty")
       (let ((a (objects-intern o "o.Box" "(Box i64)" (ObStruct [(some LirI64)])))
             (b (objects-intern o "o.Box" "(Box i64)" (ObStruct [(some LirI64)]))))
-        (check cs "an object type is registered once" (and (= a 0) (= b 0))))
+        (is cs (and (= a 0) (= b 0)) "an object type is registered once"))
       (objects-intern o "o.List" "(List str)" (ObEnum [[] [(some LirPtr) (some LirPtr)]]))
       (objects-intern o "fib.array.ptr" "(Array str)" (ObArray LirPtr))
       (objects-intern o "fib.cell.ptr" "(Cell str)" (ObCell LirPtr))
       (objects-intern o "clo.k" "closure" (ObClosure [LirI64 LirPtr]))
-      (check cs "five objects, the third's tid is 2" (and (= (objects-len o) 5) (= (. (objects-get o 2) tid) 2)))
-      (check cs "sizes: an enum's is its largest variant's" (= [(obj-size (objects-get o 1)) (obj-size (objects-get o 2))] [40 24]))
-      (check cs "offsets of a struct, of the variants of an enum"
-             (= [(obj-offsets (objects-get o 0) nil) (obj-offsets (objects-get o 1) (some 1)) (obj-offsets (objects-get o 1) (some 0))]
-                [[16] [24 32] []]))
-      (check cs "the classes: cell c, atom a, the rest o"
-             (= (mapv (fn (i: i64) (obj-class (objects-get o i))) (range 5)) [111 111 111 99 111]))
-      (check cs "slots of a struct and of a variant"
-             (= [(obj-slots (objects-get o 0) nil) (obj-slots (objects-get o 1) (some 1)) (obj-slots (objects-get o 1) nil)]
-                [[(some LirI64)] [(some LirPtr) (some LirPtr)] []]))
-      (check cs "the struct of a variant is named after its object" (= (obj-variant-sname (objects-get o 1) 1) "o.List.v1"))
-      (check cs "the struct of a variant: the header, the tag and the slots"
-             (includes (objects-render o) "(defstruct o.List.v1 (i64 i32 i32 i32 ptr ptr))\n"))
-      (check cs "a string and an array end in an unsized member"
-             (let ((r (objects-render o)))
+      (is cs (and (= (objects-len o) 5) (= (. (objects-get o 2) tid) 2)) "five objects, the third's tid is 2")
+      (is cs (= [(obj-size (objects-get o 1)) (obj-size (objects-get o 2))] [40 24]) "sizes: an enum's is its largest variant's")
+      (is cs (= [(obj-offsets (objects-get o 0) nil) (obj-offsets (objects-get o 1) (some 1)) (obj-offsets (objects-get o 1) (some 0))]
+                [[16] [24 32] []]) "offsets of a struct, of the variants of an enum")
+      (is cs (= (mapv (fn (i: i64) (obj-class (objects-get o i))) (range 5)) [111 111 111 99 111]) "the classes: cell c, atom a, the rest o")
+      (is cs (= [(obj-slots (objects-get o 0) nil) (obj-slots (objects-get o 1) (some 1)) (obj-slots (objects-get o 1) nil)]
+                [[(some LirI64)] [(some LirPtr) (some LirPtr)] []]) "slots of a struct and of a variant")
+      (is cs (= (obj-variant-sname (objects-get o 1) 1) "o.List.v1") "the struct of a variant is named after its object")
+      (is cs (includes (objects-render o) "(defstruct o.List.v1 (i64 i32 i32 i32 ptr ptr))\n") "the struct of a variant: the header, the tag and the slots")
+      (is cs (let ((r (objects-render o)))
                (and (includes r "(defstruct o.Box (i64 i32 i32 i64))\n")
-                    (includes r "(defstruct fib.array.ptr (i64 i32 i32 i64 [0 x ptr]))\n"))))
+                    (includes r "(defstruct fib.array.ptr (i64 i32 i32 i64 [0 x ptr]))\n"))) "a string and an array end in an unsized member")
       (let ((raw (layouts LirRaw)) (obj (layouts LirPtr)))
-        (do (check cs "a raw pointer slot is laid out and written as a pointer slot is" (= raw obj))
-            (check cs "not vacuous: i32 at 16, the pointer at 24, the i8 at 32, and the struct says ptr"
-                   (and (includes (nth raw 0) "(defstruct o.S (i64 i32 i32 i32 ptr i8))") (= (nth raw (- (count raw) 2)) "[16 24 32]")))))
+        (do (is cs (= raw obj) "a raw pointer slot is laid out and written as a pointer slot is")
+            (is cs (and (includes (nth raw 0) "(defstruct o.S (i64 i32 i32 i32 ptr i8))") (= (nth raw (- (count raw) 2)) "[16 24 32]")) "not vacuous: i32 at 16, the pointer at 24, the i8 at 32, and the struct says ptr")))
       (walk-checks cs)
       (let ((p (emit.program/program-new (empty-typed) (owned-program-new))))
         (do (program-closure-object p "l.f.main.13645" [LirI64 LirPtr])
             (match (read-file "compiler/tests/emit/golden/fresh-program-and-closure.types")
-              (nil (check cs "the golden file is there" false))
-              ((some golden) (check cs "ORACLE: the types section of a fresh program and a closure, byte for byte"
-                                    (= (objects-render (. p objects)) golden))))))
+              (nil (is cs false "the golden file is there"))
+              ((some golden) (is cs (= (objects-render (. p objects)) golden) "ORACLE: the types section of a fresh program and a closure, byte for byte")))))
       (let ((t (objects-new)))
         (let ((tid (objects-intern t "task.k" "task k" (ObTask [LirPtr] []))))
-          (do (check cs "a task without a frame: header, three i32, five pointers (resume, result, waiters, closure, failure), a capture" (= (obj-size (objects-get t tid)) 80))
+          (do (is cs (= (obj-size (objects-get t tid)) 80) "a task without a frame: header, three i32, five pointers (resume, result, waiters, closure, failure), a capture")
               (objects-set-task-frame t tid [(FrVal LirI64) (FrBytes 12)])
-              (check cs "the frame is known once the body is lowered: an i64, then 12 bytes at 8"
-                     (and (= (obj-size (objects-get t tid)) 104)
-                          (includes (objects-render t) "(defstruct task.k (i64 i32 i32 i32 i32 i32 ptr ptr ptr ptr ptr ptr i64 [12 x i8]))\n")))
+              (is cs (and (= (obj-size (objects-get t tid)) 104)
+                          (includes (objects-render t) "(defstruct task.k (i64 i32 i32 i32 i32 i32 ptr ptr ptr ptr ptr ptr i64 [12 x i8]))\n")) "the frame is known once the body is lowered: an i64, then 12 bytes at 8")
               (let ((c (objects-intern t "o.P" "P" (ObStruct [(some LirI64)]))))
                 (do (objects-set-task-frame t c [(FrVal LirI64)])
-                    (check cs "the frame of an object that is no task is left alone" (= (obj-size (objects-get t c)) 24)))))))
-      (finish cs))))
+                    (is cs (= (obj-size (objects-get t c)) 24) "the frame of an object that is no task is left alone"))))))
+      (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "emit/unit-objects" [(test-case "checks" unit-steps "compiler/tests/emit/unit-objects.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

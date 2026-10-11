@@ -73,6 +73,15 @@ scripts/fetch-*.sh ───────► ~/.cache/fibber-scratch/tools/<tool>
 - **Build directory:** `build/` in the tree (`BUILD=…` moves it), `dist/` for the release; both ignored by git and skipped by
   the ADR scan (`lib/fib/test/arch/repo.fib`). The seed is unpacked under `build/seed/<sha256>/`; downloads are cached across
   worktrees in `FIB_SEED_CACHE` (default `~/.cache/fibber-scratch/seeds`).
+- **Compiler units:** `compiler/tests/units.run` lists modules exporting suites.
+  `units.sh` builds shared emit/own/types/rest runners at the normal optimized
+  build level, then runs the unit bodies in forked children. Shared compiler
+  dependencies are compiled once per group. Logs separate build and execution
+  time; the retained binary accepts `--only`, `--list`, JSON/TAP and isolation
+  flags. `unit-groups.py` checks the complete unit inventory and
+  `unit-report.py` checks that every selected module actually reported a pass.
+  Pending units still run independently. `UNITS_JOBS` controls group concurrency
+  in a standalone invocation; Make schedules the groups in the gate.
 - **`GATE_FRESH=1`** (or `make clean-build`): `build/F` gets a `FORCE` prerequisite, so it is rebuilt from the seed and everything
   downstream reruns. The default builder is always the seed, as CI's is; `BUILDER=path/to/fibc` names another.
 - **Downloads** stay in the fetch scripts (the recipe body), each with its checksum, so ADR 0020 holds; the lint of ADR 0020 and

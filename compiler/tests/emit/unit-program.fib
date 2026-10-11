@@ -3,9 +3,10 @@
 ;; `def`s made at run time, and the words of the tool. SOURCE: every expected text is read off the Rust it replaces (program.rs:221,
 ;; :258, :285; inits.rs:92, :118, :146; emit_dump/args.rs tests); the whole-module judge is `fibc emit-dump` on the corpus (compare.sh).
 ;; Build: fibc build compiler/tests/emit/unit-program.fib -I compiler -I lib -o OUT
-(ns main
-  (:use syntax.pos syntax.form types.ty types.ast types.table types.decls types.program types.check own.program
-        emit.value emit.mono emit.statics emit.program emit.inits emit.args))
+(ns tests.emit.unit-program
+  (:use syntax.pos syntax.form types.ty types.ast types.table types.decls types.program fib.test.unit own.program
+        emit.value emit.mono emit.statics emit.program emit.inits emit.args)
+  (:require [fib.test.run :as test-runner]))
 
 (def p0: Pos (Pos "t.fib" 1 1 0 1))
 
@@ -35,53 +36,45 @@
                              (Pair 4 (DefValue "def.slot.4" (some LirRaw)))]))
               p)))))
 
-(defun main () -> i64
-  (let ((cs (checks-new))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec))
         (p (emit.program/program-new (empty-typed) (owned-program-new))))
     (do
       ;; ---- quotes and helpers
-      (check cs "quote names count from 1" (and (= (program-fresh-quote p) "@q.1") (= (program-fresh-quote p) "@q.2")))
-      (check cs "a helper is new once" (not (program-has-helper p "str-eq")))
+      (is cs (and (= (program-fresh-quote p) "@q.1") (= (program-fresh-quote p) "@q.2")) "quote names count from 1")
+      (is cs (not (program-has-helper p "str-eq")) "a helper is new once")
       (program-add-helper p "str-eq" "(define internal (h ptr) ())\n")
-      (check cs "a helper is known, and its text is a function" (and (program-has-helper p "str-eq") (= @(. p funcs) ["(define internal (h ptr) ())\n"])))
+      (is cs (and (program-has-helper p "str-eq") (= @(. p funcs) ["(define internal (h ptr) ())\n"])) "a helper is known, and its text is a function")
       ;; ---- closures come out in the order they were asked, then the queue
-      (check cs "a closure's code name" (= (program-request-closure p (inst0) "f.main" 7) "l.f.main.7"))
+      (is cs (= (program-request-closure p (inst0) "f.main" 7) "l.f.main.7") "a closure's code name")
       (program-request-closure p (inst0) "f.main" 9)
-      (check cs "no body is queued: the closures come out first in order, then nothing"
-             (match (program-next-work p)
+      (is cs (match (program-next-work p)
                ((some (WorkClosure _ lit name)) (and (= lit 7) (= name "l.f.main.7")
                                                      (match (program-next-work p) ((some (WorkClosure _ l2 _)) (and (= l2 9) (nil? (program-next-work p)))) (_ false))))
-               (_ false)))
+               (_ false)) "no body is queued: the closures come out first in order, then nothing")
       ;; ---- externs
-      (check cs "a unit extern with an i64: void result" (ok? (program-declare-extern p (extern-def "foo" (fn-ty [(ty-i64)] (ty-unit)) false))))
-      (check cs "declared once, a vararg one with the dots" 
-             (do (program-declare-extern p (extern-def "foo" (fn-ty [(ty-i64)] (ty-unit)) false))
+      (is cs (ok? (program-declare-extern p (extern-def "foo" (fn-ty [(ty-i64)] (ty-unit)) false))) "a unit extern with an i64: void result")
+      (is cs (do (program-declare-extern p (extern-def "foo" (fn-ty [(ty-i64)] (ty-unit)) false))
                  (program-declare-extern p (extern-def "bar" (fn-ty [(ty-i64) (ty-i64)] (ty-i64)) true))
-                 (= (program-render-externs p) "(declare foo void (i64))\n(declare bar i64 (i64 i64 ...))\n")))
-      (check cs "an extern the runtime declares the same way is not declared again"
-             (do (program-declare-extern p (extern-def "malloc" (fn-ty [(ty-i64)] (TCon KStr [])) false))
-                 (= (program-render-externs p) "(declare foo void (i64))\n(declare bar i64 (i64 i64 ...))\n")))
-      (check cs "one that disagrees is an error that names both"
-             (match (program-declare-extern p (extern-def "malloc" (fn-ty [(ty-i64)] (ty-i64)) false))
+                 (= (program-render-externs p) "(declare foo void (i64))\n(declare bar i64 (i64 i64 ...))\n")) "declared once, a vararg one with the dots")
+      (is cs (do (program-declare-extern p (extern-def "malloc" (fn-ty [(ty-i64)] (TCon KStr [])) false))
+                 (= (program-render-externs p) "(declare foo void (i64))\n(declare bar i64 (i64 i64 ...))\n")) "an extern the runtime declares the same way is not declared again")
+      (is cs (match (program-declare-extern p (extern-def "malloc" (fn-ty [(ty-i64)] (ty-i64)) false))
                ((Err m) (= m "extern malloc conflicts with the runtime's (declare malloc ptr (i64))"))
-               (_ false)))
-      (check cs ":fixed N declares only N parameters before the dots, so the calls' further arguments are variadic ones (Apple arm64 puts them on the stack)"
-             (do (program-declare-extern p (ExternDef "fc" (fn-ty [(ty-i64) (ty-i64) (ty-i64)] (ty-i64)) true p0 2 "" ""))
+               (_ false)) "one that disagrees is an error that names both")
+      (is cs (do (program-declare-extern p (ExternDef "fc" (fn-ty [(ty-i64) (ty-i64) (ty-i64)] (ty-i64)) true p0 2 "" ""))
                  (and (some? (str-find (program-render-externs p) "(declare fc i64 (i64 i64 ...))" 0))
-                      (nil? (str-find (program-render-externs p) "(declare fc i64 (i64 i64 i64 ...))" 0)))))
-      (check cs "an extern without a function type is an error"
-             (match (program-declare-extern p (extern-def "x" (ty-i64) false)) ((Err m) (= m "an extern without a function type")) (_ false)))
-      (check cs "a unit parameter is an error"
-             (match (program-declare-extern p (extern-def "y" (fn-ty [(ty-unit)] (ty-i64)) false)) ((Err m) (= m "a unit extern parameter")) (_ false)))
+                      (nil? (str-find (program-render-externs p) "(declare fc i64 (i64 i64 i64 ...))" 0)))) ":fixed N declares only N parameters before the dots, so the calls' further arguments are variadic ones (Apple arm64 puts them on the stack)")
+      (is cs (match (program-declare-extern p (extern-def "x" (ty-i64) false)) ((Err m) (= m "an extern without a function type")) (_ false)) "an extern without a function type is an error")
+      (is cs (match (program-declare-extern p (extern-def "y" (fn-ty [(ty-unit)] (ty-i64)) false)) ((Err m) (= m "a unit extern parameter")) (_ false)) "a unit parameter is an error")
       ;; ---- keyword helpers
-      (check cs "no helpers asked for, no text" (= (program-render-keyword-helpers p) ""))
+      (is cs (= (program-render-keyword-helpers p) "") "no helpers asked for, no text")
       (let ((q (emit.program/program-new (empty-typed) (owned-program-new))))
         (do (statics-keyword (. q statics) "b")
             (statics-keyword (. q statics) "a")
             (set! (. q keyword-helpers) true)
             (let ((text (program-render-keyword-helpers q)))
-              (do (check cs "kw.show, kw.hash, kw.rank over the keywords by id; ranks by name; the strings interned :k then k per keyword"
-                         (= text (str-join ["(define internal (kw.show ptr) ((i64 k))\n  (block entry (switch k bad ((i64 0) k0) ((i64 1) k1)))\n"
+              (do (is cs (= text (str-join ["(define internal (kw.show ptr) ((i64 k))\n  (block entry (switch k bad ((i64 0) k0) ((i64 1) k1)))\n"
                                             "  (block k0 (ret (call @fib.str-copy @str.0)))\n  (block k1 (ret (call @fib.str-copy @str.2)))\n"
                                             "  (block bad (unreachable)))\n"
                                             "(define internal (kw.hash i64) ((i64 k))\n  (block entry (switch k bad ((i64 0) k0) ((i64 1) k1)))\n"
@@ -89,17 +82,14 @@
                                             "  (block bad (unreachable)))\n"
                                             "(define internal (kw.rank i64) ((i64 k))\n  (block entry (switch k bad ((i64 0) k0) ((i64 1) k1)))\n"
                                             "  (block k1 (ret (i64 0)))\n  (block k0 (ret (i64 1)))\n"
-                                            "  (block bad (unreachable)))\n"])))
-                  (check cs "the strings are numbered in the order of first use: :b was the first"
-                         (= (statics-string (. q statics) ":b" 0) "@str.0"))))))
+                                            "  (block bad (unreachable)))\n"])) "kw.show, kw.hash, kw.rank over the keywords by id; ranks by name; the strings interned :k then k per keyword")
+                  (is cs (= (statics-string (. q statics) ":b" 0) "@str.0") "the strings are numbered in the order of first use: :b was the first")))))
       ;; ---- the def made at run time
       (let ((ps (init-p [(Init 0 2 "d.A" true) (Init 1 2 "d.B" false) (Init 2 3 "d.C" false) (Init 3 2 "d.D" false) (Init 4 2 "d.E" false)])))
-        (do (check cs "slots: one global per def with a type, zero by type (a pointer null, a double 0.0, an i64 0)"
-                   (= (inits-slot-text ps)
+        (do (is cs (= (inits-slot-text ps)
                       (str-join ["(global internal def.slot.0 ptr (ptr null))\n" "(global internal def.slot.1 i64 (i64 0))\n"
-                                 "(global internal def.slot.3 double (double 0.0))\n" "(global internal def.slot.4 ptr (ptr null))\n"])))
-            (check cs "init functions by maximal runs of a module, then fib.defs-init calls them in order"
-                   (= (inits-render ps)
+                                 "(global internal def.slot.3 double (double 0.0))\n" "(global internal def.slot.4 ptr (ptr null))\n"])) "slots: one global per def with a type, zero by type (a pointer null, a double 0.0, an i64 0)")
+            (is cs (= (inits-render ps)
                       (str-join ["(define internal (fib.init.m2.0 void) ()\n  (block entry (store (string \"def A: \") @fib.initdef) (let ((v0 (call @d.A))) "
                                  "(call @fib.immortalise v0) (store v0 @def.slot.0) (store (string \"def B: \") @fib.initdef) (let ((v1 (call @d.B))) "
                                  "(store v1 @def.slot.1) (ret)))))\n"
@@ -107,25 +97,28 @@
                                  "(define internal (fib.init.m2.2 void) ()\n  (block entry (store (string \"def D: \") @fib.initdef) (let ((v0 (call @d.D))) "
                                  "(store v0 @def.slot.3) (store (string \"def E: \") @fib.initdef) (let ((v1 (call @d.E))) (store v1 @def.slot.4) (ret)))))\n"
                                  "(define internal (fib.defs-init void) ()\n  (block entry (call @fib.init.m2.0) (call @fib.init.m3.1) (call @fib.init.m2.2) "
-                                 "(call @fib.init-done) (ret)))\n"])))))
-      (check cs "no inits, no text" (and (= (inits-render p) "") (= (inits-slot-text p) "")))
+                                 "(call @fib.init-done) (ret)))\n"])) "init functions by maximal runs of a module, then fib.defs-init calls them in order")))
+      (is cs (and (= (inits-render p) "") (= (inits-slot-text p) "")) "no inits, no text")
       ;; ---- the words of the tool
-      (check cs "options then files" (match (parsed ["--sections" "fns,runtime" "--fn" "f.main" "a.fib" "b.fib"])
+      (is cs (match (parsed ["--sections" "fns,runtime" "--fn" "f.main" "a.fib" "b.fib"])
                                        ((some r) (and (= (. r files) ["a.fib" "b.fib"]) (= (. (. r opts) sections) (some ["fns" "runtime"]))
                                                       (= (. (. r opts) fn-prefix) (some "f.main"))))
-                                       (nil false)))
-      (check cs "--layout and --macro stand alone"
-             (and (some? (parsed ["--layout" "a"])) (some? (parsed ["--macro" "m" "a"]))
+                                       (nil false)) "options then files")
+      (is cs (and (some? (parsed ["--layout" "a"])) (some? (parsed ["--macro" "m" "a"]))
                   (nil? (parsed ["--layout" "--macro" "m" "a"])) (nil? (parsed ["--layout" "--sections" "main" "a"]))
-                  (nil? (parsed ["--macro" "m" "--fn" "f" "a"]))))
-      (check cs "a lone -- ends the options, so a file may be named like one"
-             (match (parsed ["--" "--layout"]) ((some r) (and (= (. r files) ["--layout"]) (not (. (. r opts) layout)))) (nil false)))
-      (check cs "refused: no file, an unknown option, an unknown section, a missing or empty value"
-             (and (nil? (parsed [])) (nil? (parsed ["--sections" "main"])) (nil? (parsed ["--bogus" "a"])) (nil? (parsed ["--sections" "main,nope" "a"]))
-                  (nil? (parsed ["--sections"])) (nil? (parsed ["--fn" "" "a"])) (nil? (parsed ["--macro"]))))
-      (check cs "what is printed: all by default, the functions with --fn, the sections listed"
-             (let ((all (emit-options-default)))
+                  (nil? (parsed ["--macro" "m" "--fn" "f" "a"]))) "--layout and --macro stand alone")
+      (is cs (match (parsed ["--" "--layout"]) ((some r) (and (= (. r files) ["--layout"]) (not (. (. r opts) layout)))) (nil false)) "a lone -- ends the options, so a file may be named like one")
+      (is cs (and (nil? (parsed [])) (nil? (parsed ["--sections" "main"])) (nil? (parsed ["--bogus" "a"])) (nil? (parsed ["--sections" "main,nope" "a"]))
+                  (nil? (parsed ["--sections"])) (nil? (parsed ["--fn" "" "a"])) (nil? (parsed ["--macro"]))) "refused: no file, an unknown option, an unknown section, a missing or empty value")
+      (is cs (let ((all (emit-options-default)))
                (and (emit-wants all "types") (emit-wants all "fns")
                     (match (parsed ["--fn" "f.m" "a"]) ((some r) (and (emit-wants (. r opts) "fns") (not (emit-wants (. r opts) "main")))) (nil false))
-                    (match (parsed ["--sections" "main,types" "a"]) ((some r) (and (emit-wants (. r opts) "types") (not (emit-wants (. r opts) "fns")))) (nil false)))))
-      (finish cs))))
+                    (match (parsed ["--sections" "main,types" "a"]) ((some r) (and (emit-wants (. r opts) "types") (not (emit-wants (. r opts) "fns")))) (nil false)))) "what is printed: all by default, the functions with --fn, the sections listed")
+      (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "emit/unit-program" [(test-case "checks" unit-steps "compiler/tests/emit/unit-program.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

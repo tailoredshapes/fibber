@@ -4,8 +4,9 @@
 ;; names left out, re-exports followed), `g-instance`, the type-def helpers
 ;; and the order of `expr-children`.
 ;; Build: fibc build compiler/tests/types/unit-decls.fib -I compiler -I lib -o OUT
-(ns main (:use syntax.pos syntax.form types.ty types.scheme types.ast types.table
-               types.decls types.check))
+(ns tests.types.unit-decls (:use syntax.pos syntax.form types.ty types.scheme types.ast types.table
+               types.decls fib.test.unit)
+  (:require [fib.test.run :as test-runner]))
 
 (def p0: Pos (Pos "t.fib" 1 1 0 1))
 
@@ -15,17 +16,17 @@
 (defun links (uses: (Vec i64) implicit: (Vec i64) reexports: (Vec i64)) -> Links
   (Links uses reexports implicit))
 
-(defun tables (cs: Checks) -> unit
+(defun tables (cs: StepLog) -> unit
   (let ((t (table-new))
         (a (table-add t "a"))
         (b (table-add t "b")))
-    (do (check cs "table ids count from 0" (and (= a 0) (= b 1) (= (table-count t) 2)))
+    (do (is cs (and (= a 0) (= b 1) (= (table-count t) 2)) "table ids count from 0")
         (table-set t 0 "z")
-        (check cs "table-set replaces a row" (= (table-rows t) ["z" "b"]))
-        (check cs "table-find of a missing id is nil" (nil? (table-find t 5)))
-        (check cs "table-get" (= (table-get t 1) "b")))))
+        (is cs (= (table-rows t) ["z" "b"]) "table-set replaces a row")
+        (is cs (nil? (table-find t 5)) "table-find of a missing id is nil")
+        (is cs (= (table-get t 1) "b") "table-get"))))
 
-(defun modules (cs: Checks) -> unit
+(defun modules (cs: StepLog) -> unit
   (let ((g (globals-new))
         (builtin (g-add-module g "<builtin>" (links [] [] []) (map-empty)))
         (prelude (g-add-module g "fib.prelude" (links [] [] []) (map-empty)))
@@ -33,16 +34,13 @@
         (a (g-add-module g "a" (links [] [] []) (map-empty)))
         (main (g-add-module g "main" (links [a] [lib] [a]) (assoc (map-empty) "x" a))))
     (do
-      (check cs "module ids are 0 1 2 .." (= [builtin prelude lib a main] [0 1 2 3 4]))
-      (check cs "chain: itself, uses, implicit, prelude, builtins"
-             (= (. (g-module g main) chain) [4 3 2 1 0]))
-      (check cs "aliases: implicit, then aliases, then uses by ns"
-             (and (= (get (. (g-module g main) aliases) "a") (some 3))
+      (is cs (= [builtin prelude lib a main] [0 1 2 3 4]) "module ids are 0 1 2 ..")
+      (is cs (= (. (g-module g main) chain) [4 3 2 1 0]) "chain: itself, uses, implicit, prelude, builtins")
+      (is cs (and (= (get (. (g-module g main) aliases) "a") (some 3))
                   (= (get (. (g-module g main) aliases) "fib.lib") (some 2))
-                  (= (get (. (g-module g main) aliases) "x") (some 3))))
-      (check cs "module-id skips the builtins and the prelude"
-             (and (= (g-module-id g "a") (some 3)) (nil? (g-module-id g "fib.prelude"))))
-      (check cs "module name" (= (g-module-name g main) "main"))
+                  (= (get (. (g-module g main) aliases) "x") (some 3))) "aliases: implicit, then aliases, then uses by ns")
+      (is cs (and (= (g-module-id g "a") (some 3)) (nil? (g-module-id g "fib.prelude"))) "module-id skips the builtins and the prelude")
+      (is cs (= (g-module-name g main) "main") "module name")
       (names-make-private (g-names g a) SpValue "hidden")
       (set! (. (g-names g a) values) (assoc @(. (g-names g a) values) "zeta" (GFun 0)))
       (set! (. (g-names g a) values) (assoc @(. (g-names g a) values) "hidden" (GFun 1)))
@@ -50,43 +48,45 @@
       (set! (. (g-names g main) values) (assoc @(. (g-names g main) values) "mine" (GFun 2)))
       (run! (fn (n: str) (set! (. (g-names g a) values) (assoc @(. (g-names g a) values) n (GFun 3))))
             ["pear" "apple" "mango" "kiwi" "fig" "date" "cherry" "banana"])
-      (check cs "private names are recorded per space"
-             (and (names-is-private (g-names g a) SpValue "hidden")
-                  (not (names-is-private (g-names g a) SpType "hidden"))))
-      (check cs "exports: public names, sorted, with the re-exports"
-             (and (= (g-exports g a)
+      (is cs (and (names-is-private (g-names g a) SpValue "hidden")
+                  (not (names-is-private (g-names g a) SpType "hidden"))) "private names are recorded per space")
+      (is cs (and (= (g-exports g a)
                      ["Alpha" "apple" "banana" "cherry" "date" "fig" "kiwi" "mango" "pear" "zeta"])
                   (= (g-exports g main)
-                     ["Alpha" "apple" "banana" "cherry" "date" "fig" "kiwi" "mango" "mine" "pear" "zeta"]))))))
+                     ["Alpha" "apple" "banana" "cherry" "date" "fig" "kiwi" "mango" "mine" "pear" "zeta"])) "exports: public names, sorted, with the re-exports"))))
 
-(defun defs (cs: Checks) -> unit
+(defun defs (cs: StepLog) -> unit
   (let ((g (globals-new))
         (td (TypeDef "T" 2 ["a" "k"] [false true] (TsEnum [(VariantDef "A" [])]) p0)))
     (do
-      (check cs "head-args: a TGen, a colour argument at a colour parameter"
-             (= (typedef-head-args td) [(TGen 0) (ty-colour-arg (CGen 1))]))
-      (check cs "a field-less enum" (typedef-is-fieldless-enum td))
-      (check cs "a struct is not a field-less enum"
-             (not (typedef-is-fieldless-enum (TypeDef "S" 2 [] [] (TsStruct []) p0))))
-      (check cs "next-expr counts from 0" (and (= (g-next-expr g) 0) (= (g-next-expr g) 1)))
-      (check cs "an instance is found by protocol and head constructor"
-             (let ((i (InstanceDef 3 KStr 2 [] (ty-str) [] [] [] p0)))
+      (is cs (= (typedef-head-args td) [(TGen 0) (ty-colour-arg (CGen 1))]) "head-args: a TGen, a colour argument at a colour parameter")
+      (is cs (typedef-is-fieldless-enum td) "a field-less enum")
+      (is cs (not (typedef-is-fieldless-enum (TypeDef "S" 2 [] [] (TsStruct []) p0))) "a struct is not a field-less enum")
+      (is cs (and (= (g-next-expr g) 0) (= (g-next-expr g) 1)) "next-expr counts from 0")
+      (is cs (let ((i (InstanceDef 3 KStr 2 [] (ty-str) [] [] [] p0)))
                (do (table-add (. g instances) i)
                    (set! (. g instance-index) (assoc @(. g instance-index) (InstKey 3 KStr) 0))
                    (and (some? (g-instance g 3 KStr)) (nil? (g-instance g 3 KArray))
-                        (nil? (g-instance g 4 KStr)))))))))
+                        (nil? (g-instance g 4 KStr))))) "an instance is found by protocol and head constructor"))))
 
-(defun children (cs: Checks) -> unit
+(defun children (cs: StepLog) -> unit
   (let ((call (Expr 9 p0 (ECall (lit 1) [(ArgExpr (lit 2)) (ArgAmp 7 p0) (ArgExpr (lit 3))])))
         (mat (Expr 9 p0 (EMatch (lit 1)
                 [(Clause (Pattern p0 PWild) (some (lit 2)) (lit 3) false)
                  (Clause (Pattern p0 PWild) nil (lit 4) false)])))
         (set (Expr 9 p0 (ESet (PlAmp 1) (lit 5)))))
-    (do (check cs "call: head, then expression arguments" (= (ids (expr-children call)) [1 2 3]))
-        (check cs "match: scrutinee, guard, body, body" (= (ids (expr-children mat)) [1 2 3 4]))
-        (check cs "set of an & place: only the value" (= (ids (expr-children set)) [5]))
-        (check cs "a literal has no children" (empty? (expr-children (lit 1)))))))
+    (do (is cs (= (ids (expr-children call)) [1 2 3]) "call: head, then expression arguments")
+        (is cs (= (ids (expr-children mat)) [1 2 3 4]) "match: scrutinee, guard, body, body")
+        (is cs (= (ids (expr-children set)) [5]) "set of an & place: only the value")
+        (is cs (empty? (expr-children (lit 1))) "a literal has no children"))))
+
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
+    (do (tables cs) (modules cs) (defs cs) (children cs) (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-decls" [(test-case "checks" unit-steps "compiler/tests/types/unit-decls.fib")]))
 
 (defun main () -> i64
-  (let ((cs (checks-new)))
-    (do (tables cs) (modules cs) (defs cs) (children cs) (finish cs))))
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

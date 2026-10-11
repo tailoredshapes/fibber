@@ -6,10 +6,11 @@
 ;; a block (parameters, bindings, closure, calls, `recur`, operations in the order they run, the
 ;; blocks of the literals after it); a module sees only its own bodies. Prints `ok NAME` or `FAIL NAME`.
 ;; Build: fibc build compiler/tests/own/unit-explain.fib -I compiler -I lib -o OUT
-(ns main
+(ns tests.own.unit-explain
   (:require [own.explain.names :as n] [own.explain :as x])
   (:use syntax.pos syntax.form types.ty types.scheme types.table types.ast types.decls types.builtins
-        types.program types.infer.mod types.check own.program))
+        types.program types.infer.mod fib.test.unit own.program)
+  (:require [fib.test.run :as test-runner]))
 
 (defun pos-at (line: i64 col: i64) -> Pos (Pos "t.fib" line col 0 0))
 
@@ -124,91 +125,80 @@
                          (BodyFun 1) (body-own-new))
                   keys (map-empty) (set-empty) (set-empty) [])))
 
-(defun show-checks (cs: Checks p: TypedProgram) -> unit
+(defun show-checks (cs: StepLog p: TypedProgram) -> unit
   (let ((s (fn (e: Expr) (n/names-show p e)))
         (call (fn (id: i64 h: Expr args: (Vec Arg)) (ex id 3 4 (ECall h args)))))
-    (do (check cs "at: @line:col" (= (n/names-at (local 1 12 34 0)) "@12:34"))
-        (check cs "a local, a function, a def, a method head are their names"
-               (= (mapv s [(local 1 1 1 2) (gfun 2 0) (ex 3 1 1 (EGlobal (GDef 0))) (ex 4 1 1 (EGlobal (GMethod 0 0)))])
-                  ["z" "f" "k" "area"]))
-        (check cs "literals: an integer, a bool, a string; any other is `<expr @L:C>`"
-               (= (mapv s [(ex 1 1 1 (ELit (LitInt -7 I64))) (ex 2 1 1 (ELit (LitBool true))) (lit-str 3 "hi")
+    (do (is cs (= (n/names-at (local 1 12 34 0)) "@12:34") "at: @line:col")
+        (is cs (= (mapv s [(local 1 1 1 2) (gfun 2 0) (ex 3 1 1 (EGlobal (GDef 0))) (ex 4 1 1 (EGlobal (GMethod 0 0)))])
+                  ["z" "f" "k" "area"]) "a local, a function, a def, a method head are their names")
+        (is cs (= (mapv s [(ex 1 1 1 (ELit (LitInt -7 I64))) (ex 2 1 1 (ELit (LitBool true))) (lit-str 3 "hi")
                            (ex 4 5 6 (ELit (LitFloat 1.5 F64))) (ex 5 5 6 (ELit (LitKeyword "k")))])
-                  ["-7" "true" "\"hi\"" "<expr @5:6>" "<expr @5:6>"]))
-        (check cs "a string as Rust's {:?}: \\ \" and the escapes, controls as \\u{hex}, the rest as it is"
-               (= (mapv (fn (t: str) (s (lit-str 1 t)))
+                  ["-7" "true" "\"hi\"" "<expr @5:6>" "<expr @5:6>"]) "literals: an integer, a bool, a string; any other is `<expr @L:C>`")
+        (is cs (= (mapv (fn (t: str) (s (lit-str 1 t)))
                         ["q\"\\'" "a\tb\r\n" (char->str (i32->char 0i32)) (char->str (i32->char 27i32))
                          (char->str (i32->char 127i32)) (char->str (i32->char 133i32)) "é😀" ""])
-                  ["\"q\\\"\\\\'\"" "\"a\\tb\\r\\n\"" "\"\\0\"" "\"\\u{1b}\"" "\"\\u{7f}\"" "\"\\u{85}\"" "\"é😀\"" "\"\""]))
-        (check cs "a deref is `@` and the place, a field `(. x f)`"
-               (= (mapv s [(ex 1 1 1 (EDeref (PlAmp 5) "")) (ex 2 1 1 (EDeref (PlExpr (local 3 1 1 0)) ""))
+                  ["\"q\\\"\\\\'\"" "\"a\\tb\\r\\n\"" "\"\\0\"" "\"\\u{1b}\"" "\"\\u{7f}\"" "\"\\u{85}\"" "\"é😀\"" "\"\""]) "a string as Rust's {:?}: \\ \" and the escapes, controls as \\u{hex}, the rest as it is")
+        (is cs (= (mapv s [(ex 1 1 1 (EDeref (PlAmp 5) "")) (ex 2 1 1 (EDeref (PlExpr (local 3 1 1 0)) ""))
                            (ex 4 1 1 (EField (local 5 1 1 1) "len" "len"))])
-                  ["@r" "@x" "(. y len)"]))
-        (check cs "a call is its head, with `..` for arguments; a head that is not a name is shown"
-               (= (mapv s [(call 1 (gfun 2 0) []) (call 3 (local 4 1 1 0) [(ArgExpr (local 5 1 1 1))])
+                  ["@r" "@x" "(. y len)"]) "a deref is `@` and the place, a field `(. x f)`")
+        (is cs (= (mapv s [(call 1 (gfun 2 0) []) (call 3 (local 4 1 1 0) [(ArgExpr (local 5 1 1 1))])
                            (call 6 (call 7 (gfun 8 1) []) [(ArgAmp 1 (pos-at 1 1))])
                            (call 9 (ex 10 8 9 (EFn (FnLit nil [] nil (local 11 1 1 0) []))) [])])
-                  ["(f)" "(x ..)" "((g) ..)" "(<closure @8:9>)"]))
-        (check cs "a closure, a task and any other expression"
-               (= (mapv s [(ex 1 7 8 (EFn (FnLit nil [] nil (local 2 1 1 0) []))) (ex 3 7 8 (EAsync (local 4 1 1 0) []))
+                  ["(f)" "(x ..)" "((g) ..)" "(<closure @8:9>)"]) "a call is its head, with `..` for arguments; a head that is not a name is shown")
+        (is cs (= (mapv s [(ex 1 7 8 (EFn (FnLit nil [] nil (local 2 1 1 0) []))) (ex 3 7 8 (EAsync (local 4 1 1 0) []))
                            (ex 5 7 8 (EDo [])) (ex 6 7 8 (EUnsafe (local 7 1 1 0)))])
-                  ["<closure @7:8>" "<async @7:8>" "<expr @7:8>" "<expr @7:8>"])))))
+                  ["<closure @7:8>" "<async @7:8>" "<expr @7:8>" "<expr @7:8>"]) "a closure, a task and any other expression"))))
 
-(defun site-checks (cs: Checks p: TypedProgram) -> unit
+(defun site-checks (cs: StepLog p: TypedProgram) -> unit
   (let ((body (f-body))
         (ix (n/names-index (f-body)))
         (site (fn (s: Site) (n/names-site p (n/names-index (f-body)) s))))
-    (do (check cs "index: every expression of the body by id, the literals' bodies included"
-               (and (= (count ix) 18) (= (. (unwrap (get ix 13)) id) 13) (= (. (unwrap (get ix 1)) id) (. body id))
-                    (not (contains? ix 99))))
-        (check cs "sites: a binding, a capture, a def by name; a value by its expression"
-               (= (mapv site [(SiteBind 3) (SiteCapture 8 1) (SiteGlobal 0) (SiteValue 2) (SiteValue 15)])
-                  ["w" "y" "k" "(g ..)" "x"]))
-        (check cs "a value not in the body is `<value N>`, an environment is of its closure or just `env`"
-               (= (mapv site [(SiteValue 99) (SiteEnv 8) (SiteEnv 99)])
-                  ["<value 99>" "env of <closure @5:3>" "env"])))))
+    (do (is cs (and (= (count ix) 18) (= (. (unwrap (get ix 13)) id) 13) (= (. (unwrap (get ix 1)) id) (. body id))
+                    (not (contains? ix 99))) "index: every expression of the body by id, the literals' bodies included")
+        (is cs (= (mapv site [(SiteBind 3) (SiteCapture 8 1) (SiteGlobal 0) (SiteValue 2) (SiteValue 15)])
+                  ["w" "y" "k" "(g ..)" "x"]) "sites: a binding, a capture, a def by name; a value by its expression")
+        (is cs (= (mapv site [(SiteValue 99) (SiteEnv 8) (SiteEnv 99)])
+                  ["<value 99>" "env of <closure @5:3>" "env"]) "a value not in the body is `<value N>`, an environment is of its closure or just `env`"))))
 
-(defun word-checks (cs: Checks p: TypedProgram) -> unit
+(defun word-checks (cs: StepLog p: TypedProgram) -> unit
   (let ((ix (n/names-index (f-body))))
-    (do (check cs "an operation is kind, [site] and (reason), and every reason has its words"
-               (= (mapv (fn (w: Why) (n/names-op p ix (Op OpRetain (SiteBind 0) w)))
+    (do (is cs (= (mapv (fn (w: Why) (n/names-op p ix (Op OpRetain (SiteBind 0) w)))
                         [WhyReturn WhyStore WhyJoin WhyScopeExit WhyStepEnd WhyDerivedExit WhyDiscard WhyParamExit
                          WhyLoopInit WhyJump WhyRecurOld])
                   ["retain [x] (return)" "retain [x] (store)" "retain [x] (join)" "retain [x] (exit)"
                    "retain [x] (step end)" "retain [x] (derived exit)" "retain [x] (discard)" "retain [x] (exit)"
-                   "retain [x] (loop init)" "retain [x] (jump)" "retain [x] (old loop value)"]))
-        (check cs "the three kinds of operation"
-               (= (mapv (fn (k: OpKind) (n/names-op p ix (Op k (SiteValue 2) WhyJoin))) [OpRetain OpRelease OpEndStack])
-                  ["retain [(g ..)] (join)" "release [(g ..)] (join)" "end-stack [(g ..)] (join)"]))
-        (check cs "passes"
-               (= (mapv n/names-pass [PsScalar PsBorrow PsMove PsRetain PsAcquire PsForward PsOwnCell PsAlias PsKeepEnv])
-                  ["scalar" "borrow" "moved" "retain" "acquire" "forward" "own cell" "alias" "env kept"]))
-        (check cs "tails: a tail call, a construction, a call, and the rule that made one ordinary"
-               (= (mapv (fn (t: Tail) (n/names-tail p t CalValue)) [TlTailCall TlNotInTail])
-                  ["tail-call" "call"]))
-        (check cs "a constructor that is not in tail position is a construction; in tail position it is what the tail says"
-               (= [(n/names-tail p TlNotInTail CalCtor) (n/names-tail p TlTailCall CalCtor)] ["construct" "tail-call"]))
-        (check cs "every reason a tail call is ordinary"
-               (= (mapv (fn (b: Because) (n/names-tail p (TlOrdinary b) (CalFun 0)))
+                   "retain [x] (loop init)" "retain [x] (jump)" "retain [x] (old loop value)"]) "an operation is kind, [site] and (reason), and every reason has its words")
+        (is cs (= (mapv (fn (k: OpKind) (n/names-op p ix (Op k (SiteValue 2) WhyJoin))) [OpRetain OpRelease OpEndStack])
+                  ["retain [(g ..)] (join)" "release [(g ..)] (join)" "end-stack [(g ..)] (join)"]) "the three kinds of operation")
+        (is cs (= (mapv n/names-pass [PsScalar PsBorrow PsMove PsRetain PsAcquire PsForward PsOwnCell PsAlias PsKeepEnv])
+                  ["scalar" "borrow" "moved" "retain" "acquire" "forward" "own cell" "alias" "env kept"]) "passes")
+        (is cs (= (mapv (fn (t: Tail) (n/names-tail p t CalValue)) [TlTailCall TlNotInTail])
+                  ["tail-call" "call"]) "tails: a tail call, a construction, a call, and the rule that made one ordinary")
+        (is cs (= [(n/names-tail p TlNotInTail CalCtor) (n/names-tail p TlTailCall CalCtor)] ["construct" "tail-call"]) "a constructor that is not in tail position is a construction; in tail position it is what the tail says")
+        (is cs (= (mapv (fn (b: Because) (n/names-tail p (TlOrdinary b) (CalFun 0)))
                         [BcAmpArgument (BcAmpCaptured 1) (BcFrameOwned 0) BcAsyncBody BcExtern BcStore])
                   ["call (b: & argument)" "call (b: &y captured by an argument)"
                    "call (e: frame-owned argument 1 at a borrowed position)" "call (f: async body)" "call (extern)"
-                   "call (a store, not a call)"])))))
+                   "call (a store, not a call)"]) "every reason a tail call is ordinary"))))
 
-(defun block-checks (cs: Checks p: TypedProgram o: OwnedProgram) -> unit
-  (do (check cs "a body with every line of a block, then the blocks of its literals"
-             (= (x/explain-lines p o 2 ) (into (into (into (into f-expected ["defun h.owned : "]) tiny)
+(defun block-checks (cs: StepLog p: TypedProgram o: OwnedProgram) -> unit
+  (do (is cs (= (x/explain-lines p o 2 ) (into (into (into (into f-expected ["defun h.owned : "]) tiny)
                                                      (into ["impl Area/perim for str"] tiny))
                                                (into (into ["impl Area/area.owned for str"] tiny)
-                                                     (into ["def k"] tiny)))))
-      (check cs "a module sees its own bodies only, and a key the pass did not decide prints nothing"
-             (and (= (x/explain-lines p o 3) (into ["defun g : "] tiny)) (= (x/explain-lines p o 1) [])))
-      (check cs "`explain` is the main module's lines, each ended by a newline"
-             (= (x/explain p o) (str-join (mapv (fn (l: str) (str-concat l "\n")) (x/explain-lines p o 2)))))))
+                                                     (into ["def k"] tiny)))) "a body with every line of a block, then the blocks of its literals")
+      (is cs (and (= (x/explain-lines p o 3) (into ["defun g : "] tiny)) (= (x/explain-lines p o 1) [])) "a module sees its own bodies only, and a key the pass did not decide prints nothing")
+      (is cs (= (x/explain p o) (str-join (mapv (fn (l: str) (str-concat l "\n")) (x/explain-lines p o 2)))) "`explain` is the main module's lines, each ended by a newline")))
 
-(defun main () -> i64
-  (let ((cs (checks-new))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec))
         (p (program-of (tables)))
         (o (owned-of)))
     (do (show-checks cs p) (site-checks cs p) (word-checks cs p) (block-checks cs p o)
-        (finish cs))))
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "own/unit-explain" [(test-case "checks" unit-steps "compiler/tests/own/unit-explain.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

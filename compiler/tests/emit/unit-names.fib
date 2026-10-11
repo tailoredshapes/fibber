@@ -6,8 +6,9 @@
 ;; the library's `Reducible` and a closure (marked ORACLE below); the `.owned` and `d.`
 ;; names have no emitted example and are read from `body_name` (marked SOURCE).
 ;; Build: fibc build compiler/tests/emit/unit-names.fib -I compiler -I lib -o OUT
-(ns main (:use syntax.pos types.ty types.scheme types.table types.ast types.decls
-               types.check own.program emit.names))
+(ns tests.emit.unit-names (:use syntax.pos types.ty types.scheme types.table types.ast types.decls
+               fib.test.unit own.program emit.names)
+  (:require [fib.test.run :as test-runner]))
 
 (def p0: Pos (Pos "t.fib" 1 1 0 1))
 (def unit-expr: Expr (Expr 0 p0 (ELit LitUnit)))
@@ -48,24 +49,23 @@
         (table-add (. g defs) (DefDef "K" 2 nil unit-expr false p0))
         g)))
 
-(defun expect (cs: Checks name: str got: str want: str) -> unit
+(defun expect (cs: StepLog name: str got: str want: str) -> unit
   (do (if (= got want) () (println (str-join ["  got:  " got "\n  want: " want])))
-      (check cs name (= got want))))
+      (is cs (= got want) name)))
 
-(defun main () -> i64
-  (let ((cs (checks-new)) (g (globals)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)) (g (globals)))
     (do
       (expect cs "Vec i64 of the prelude" (mangle g (nom 0 [(ty-i64)])) "$fib.prelude/Vec.i64_")
       (expect cs "nested" (mangle g (nom 0 [(nom 0 [(ty-i64)])])) "$fib.prelude/Vec.$fib.prelude/Vec.i64__")
-      (check cs "nested differs from flat" (not (= (mangle g (nom 0 [(nom 0 [(ty-i64)])])) (mangle g (nom 0 [(ty-i64)])))))
+      (is cs (not (= (mangle g (nom 0 [(nom 0 [(ty-i64)])])) (mangle g (nom 0 [(ty-i64)])))) "nested differs from flat")
       (expect cs "str" (mangle g (ty-str)) "str")
       (expect cs "the main module's Box" (mangle g (nom 1 [(ty-i64)])) "$Box.i64_")
       (expect cs "the prelude's Box" (mangle g (nom 4 [(ty-i64)])) "$fib.prelude/Box.i64_")
       (expect cs "the main module's Pt is bare" (mangle g (nom 2 [])) "Pt")
       (expect cs "a module's Pt is behind a slash" (mangle g (nom 3 [])) "a/Pt")
       (expect cs "a gen prints as tN" (mangle g (nom 1 [(TGen 0)])) "$Box.t0_")
-      (check cs "colours are erased"
-             (= (mangle g (TFn CSend [(ty-i64)] (ty-i64))) (mangle g (TFn CLocal [(ty-i64)] (ty-i64)))))
+      (is cs (= (mangle g (TFn CSend [(ty-i64)] (ty-i64))) (mangle g (TFn CLocal [(ty-i64)] (ty-i64)))) "colours are erased")
       (expect cs "module prefix of the main module" (module-prefix g 2) "")
       (expect cs "module prefix of the builtins" (module-prefix g 0) "fib.builtin.")
       (expect cs "module prefix of another" (module-prefix g 1) "fib.prelude.")
@@ -85,4 +85,11 @@
       (expect cs "SOURCE the all-owned method" (body-name g (BodyMethodOwned 0 0) []) "m.Sz.sz.Pt.owned")
       (expect cs "SOURCE a def" (body-name g (BodyDef 0) []) "d.K")
       (expect cs "ORACLE a closure" (closure-name "f.main" 12851) "l.f.main.12851")
-      (finish cs))))
+      (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "emit/unit-names" [(test-case "checks" unit-steps "compiler/tests/emit/unit-names.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

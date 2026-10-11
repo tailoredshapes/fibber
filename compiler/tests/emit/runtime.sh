@@ -9,5 +9,12 @@ R=$(cd "$(dirname "$0")/../../.." && pwd); cd "$R"; mkdir -p "$S"
 "$S/gen-runtime" rt > "$S/runtime.fib"
 cmp "$S/runtime.fib" compiler/emit/runtime.fib || { echo "runtime.fib has drifted from rt: regenerate it"; exit 1; }
 "$FIBC" build compiler/tests/emit/unit-runtime.fib -I compiler -I lib -o "$S/unit-runtime"
-"$S/unit-runtime" > "$S/unit.out" || { grep -v '^ok' "$S/unit.out" | head; exit 1; }
-echo "runtime: regenerated runtime.fib equals the committed file; $(grep -c '^ok' "$S/unit.out") checks ok"
+"$S/unit-runtime" --format json > "$S/unit.out" || { cat "$S/unit.out"; exit 1; }
+python3 - "$S/unit.out" <<'PY_CHECK'
+import json, sys
+r = json.load(open(sys.argv[1]))
+assert r["summary"]["pass"] == 1 and len(r["results"]) == 1
+steps = r["results"][0]["steps"]
+assert steps and all(s["status"] == "held" for s in steps)
+print(f"runtime: regenerated runtime.fib equals the committed file; {len(steps)} checks ok")
+PY_CHECK

@@ -1,62 +1,54 @@
 ;; compiler/tests/types/unit-target.fib: the Target record of types.target, per architecture (SC1). `has-fma` is the compile-time constant `(has-fma)` and is
 ;; independent of the lane count: every aarch64 CPU has NEON's fused multiply-add with 128-bit vectors (2 f64 lanes), x86 has it with the `fma` feature or a v3+ CPU.
 ;; Build: fibc build compiler/tests/types/unit-target.fib -I compiler -I lib -o OUT     (no aarch64 code is generated: only the record is checked)
-(ns main (:use types.target types.check))
+(ns tests.types.unit-target (:use types.target fib.test.unit)
+  (:require [fib.test.run :as test-runner]))
 
-(defun check-host-targets (cs: Checks) -> unit
+(defun check-host-targets (cs: StepLog) -> unit
   (do
-    (check cs "a generic AArch64 host with no feature list still has FMA and 128-bit vectors"
-           (every? (fn (triple: str)
+    (is cs (every? (fn (triple: str)
                      (let ((t (target-of-host triple "generic" "")))
                        (and (. t has-fma) (= (. t vector-bits) 128) (= (target-lanes t 64) 2)
                             (= (. t cpu) "generic") (= (. t features) ""))))
-                   ["aarch64-apple-darwin" "arm64-apple-darwin25.0.0" "aarch64-unknown-linux-gnu"]))
-    (check cs "an unrecognised AArch64 CPU name also keeps baseline FMA"
-           (. (target-of-host "arm64-apple-darwin" "unknown-arm-cpu" "") has-fma))
-    (check cs "host detection preserves LLVM's CPU and feature strings"
-           (let ((t (target-of-host "aarch64-apple-darwin" "generic" "+neon,+crc")))
-             (and (. t has-fma) (= (. t cpu) "generic") (= (. t features) "+neon,+crc"))))
-    (check cs "a generic x86 host with no feature list is not promoted to the v3 release floor"
-           (= (target-of-host "x86_64-pc-linux-gnu" "generic" "") (Target "generic" "" 128 false)))
-    (check cs "x86 host detection still honours a disabled FMA feature"
-           (= (target-of-host "x86_64-apple-darwin" "haswell" "+avx2,-fma") (Target "haswell" "+avx2,-fma" 256 false)))
-    (check cs "x86 host detection preserves AVX-512 preferences and FMA"
-           (= (target-of-host "x86_64-pc-linux-gnu" "znver4" "+avx2,+fma,+avx512f")
-              (Target "znver4" "+avx2,+fma,+avx512f" 512 true)))
-    (check cs "an unlisted architecture does not acquire FMA"
-           (not (. (target-of-host "unknown-unknown-unknown" "generic" "") has-fma)))))
+                   ["aarch64-apple-darwin" "arm64-apple-darwin25.0.0" "aarch64-unknown-linux-gnu"]) "a generic AArch64 host with no feature list still has FMA and 128-bit vectors")
+    (is cs (. (target-of-host "arm64-apple-darwin" "unknown-arm-cpu" "") has-fma) "an unrecognised AArch64 CPU name also keeps baseline FMA")
+    (is cs (let ((t (target-of-host "aarch64-apple-darwin" "generic" "+neon,+crc")))
+             (and (. t has-fma) (= (. t cpu) "generic") (= (. t features) "+neon,+crc"))) "host detection preserves LLVM's CPU and feature strings")
+    (is cs (= (target-of-host "x86_64-pc-linux-gnu" "generic" "") (Target "generic" "" 128 false)) "a generic x86 host with no feature list is not promoted to the v3 release floor")
+    (is cs (= (target-of-host "x86_64-apple-darwin" "haswell" "+avx2,-fma") (Target "haswell" "+avx2,-fma" 256 false)) "x86 host detection still honours a disabled FMA feature")
+    (is cs (= (target-of-host "x86_64-pc-linux-gnu" "znver4" "+avx2,+fma,+avx512f")
+              (Target "znver4" "+avx2,+fma,+avx512f" 512 true)) "x86 host detection preserves AVX-512 preferences and FMA")
+    (is cs (not (. (target-of-host "unknown-unknown-unknown" "generic" "") has-fma)) "an unlisted architecture does not acquire FMA")))
 
-(defun main () -> i64
-  (let ((cs (checks-new)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
     (do
       (check-host-targets cs)
-      (check cs "x86-64 baseline: 128 bits, no fma" (and (= (. (target-of-cpu "x86-64") vector-bits) 128) (not (. (target-of-cpu "x86-64") has-fma))))
-      (check cs "x86-64-v2: 128 bits, no fma" (and (= (. (target-of-cpu "x86-64-v2") vector-bits) 128) (not (. (target-of-cpu "x86-64-v2") has-fma))))
-      (check cs "x86-64-v3: 256 bits, fma" (and (= (. (target-of-cpu "x86-64-v3") vector-bits) 256) (. (target-of-cpu "x86-64-v3") has-fma)))
-      (check cs "haswell and znver4 have fma" (and (. (target-of-cpu "haswell") has-fma) (. (target-of-cpu "znver4") has-fma)))
-      (check cs "apple-m1: fma with only 128-bit vectors (2 f64 lanes)"
-             (let ((t (target-of-cpu "apple-m1")))
-               (and (. t has-fma) (= (. t vector-bits) 128) (= (target-lanes t 64) 2))))
-      (check cs "apple-m2, cortex-a76, neoverse-n1, aarch64: fma"
-             (every? (fn (c: str) (. (target-of-cpu c) has-fma)) ["apple-m2" "cortex-a76" "neoverse-n1" "aarch64" "armv8.2-a"]))
-      (check cs "a host x86 with +avx2,+fma: fma, 256 bits"
-             (let ((t (target-of-features "skylake" "+avx2,+fma,+sse4.2"))) (and (. t has-fma) (= (. t vector-bits) 256))))
-      (check cs "a host x86 with avx2 but fma switched off has none" (not (. (target-of-features "haswell" "+avx2,-fma") has-fma)))
-      (check cs "a host x86 with no features: no fma" (not (. (target-of-features "x86-64" "+sse2,+sse4.2") has-fma)))
-      (check cs "an aarch64 host: fma, 128 bits, from the CPU name or the NEON feature"
-             (and (. (target-of-features "apple-m1" "+neon,+fp-armv8") has-fma) (. (target-of-features "generic" "+neon,+fp-armv8") has-fma)
-                  (= (. (target-of-features "apple-m1" "+neon") vector-bits) 128)))
+      (is cs (and (= (. (target-of-cpu "x86-64") vector-bits) 128) (not (. (target-of-cpu "x86-64") has-fma))) "x86-64 baseline: 128 bits, no fma")
+      (is cs (and (= (. (target-of-cpu "x86-64-v2") vector-bits) 128) (not (. (target-of-cpu "x86-64-v2") has-fma))) "x86-64-v2: 128 bits, no fma")
+      (is cs (and (= (. (target-of-cpu "x86-64-v3") vector-bits) 256) (. (target-of-cpu "x86-64-v3") has-fma)) "x86-64-v3: 256 bits, fma")
+      (is cs (and (. (target-of-cpu "haswell") has-fma) (. (target-of-cpu "znver4") has-fma)) "haswell and znver4 have fma")
+      (is cs (let ((t (target-of-cpu "apple-m1")))
+               (and (. t has-fma) (= (. t vector-bits) 128) (= (target-lanes t 64) 2))) "apple-m1: fma with only 128-bit vectors (2 f64 lanes)")
+      (is cs (every? (fn (c: str) (. (target-of-cpu c) has-fma)) ["apple-m2" "cortex-a76" "neoverse-n1" "aarch64" "armv8.2-a"]) "apple-m2, cortex-a76, neoverse-n1, aarch64: fma")
+      (is cs (let ((t (target-of-features "skylake" "+avx2,+fma,+sse4.2"))) (and (. t has-fma) (= (. t vector-bits) 256))) "a host x86 with +avx2,+fma: fma, 256 bits")
+      (is cs (not (. (target-of-features "haswell" "+avx2,-fma") has-fma)) "a host x86 with avx2 but fma switched off has none")
+      (is cs (not (. (target-of-features "x86-64" "+sse2,+sse4.2") has-fma)) "a host x86 with no features: no fma")
+      (is cs (and (. (target-of-features "apple-m1" "+neon,+fp-armv8") has-fma) (. (target-of-features "generic" "+neon,+fp-armv8") has-fma)
+                  (= (. (target-of-features "apple-m1" "+neon") vector-bits) 128)) "an aarch64 host: fma, 128 bits, from the CPU name or the NEON feature")
       ;; the AVX-512 wave (docs/design/avx512.md): 512 bits where it pays, 256 where AVX-512 throttles or has one fma unit
-      (check cs "x86-64-v4, sapphirerapids, graniterapids, znver4, znver5: 512 bits, fma"
-             (every? (fn (c: str) (and (= (. (target-of-cpu c) vector-bits) 512) (. (target-of-cpu c) has-fma)))
-                     ["x86-64-v4" "sapphirerapids" "graniterapids" "znver4" "znver5"]))
-      (check cs "skylake-avx512, cascadelake, icelake-server, tigerlake, haswell, znver3: 256 bits"
-             (every? (fn (c: str) (= (. (target-of-cpu c) vector-bits) 256)) ["skylake-avx512" "cascadelake" "icelake-server" "tigerlake" "haswell" "znver3"]))
-      (check cs "a host with +avx512f on a CPU the table prefers 512 for: 512 bits"
-             (= (. (target-of-features "sapphirerapids" "+avx2,+fma,+avx512f,+avx512vl") vector-bits) 512))
-      (check cs "a host with +avx512f on a CPU the table keeps at 256, or that it lacks: 256 bits"
-             (and (= (. (target-of-features "skylake-avx512" "+avx2,+fma,+avx512f") vector-bits) 256)
-                  (= (. (target-of-features "znver9" "+avx2,+fma,+avx512f") vector-bits) 256)))
-      (check cs "a CPU the table prefers 512 for but without +avx512f in the host's list: 256 bits"
-             (= (. (target-of-features "znver4" "+avx2,+fma") vector-bits) 256))
-      (finish cs))))
+      (is cs (every? (fn (c: str) (and (= (. (target-of-cpu c) vector-bits) 512) (. (target-of-cpu c) has-fma)))
+                     ["x86-64-v4" "sapphirerapids" "graniterapids" "znver4" "znver5"]) "x86-64-v4, sapphirerapids, graniterapids, znver4, znver5: 512 bits, fma")
+      (is cs (every? (fn (c: str) (= (. (target-of-cpu c) vector-bits) 256)) ["skylake-avx512" "cascadelake" "icelake-server" "tigerlake" "haswell" "znver3"]) "skylake-avx512, cascadelake, icelake-server, tigerlake, haswell, znver3: 256 bits")
+      (is cs (= (. (target-of-features "sapphirerapids" "+avx2,+fma,+avx512f,+avx512vl") vector-bits) 512) "a host with +avx512f on a CPU the table prefers 512 for: 512 bits")
+      (is cs (and (= (. (target-of-features "skylake-avx512" "+avx2,+fma,+avx512f") vector-bits) 256)
+                  (= (. (target-of-features "znver9" "+avx2,+fma,+avx512f") vector-bits) 256)) "a host with +avx512f on a CPU the table keeps at 256, or that it lacks: 256 bits")
+      (is cs (= (. (target-of-features "znver4" "+avx2,+fma") vector-bits) 256) "a CPU the table prefers 512 for but without +avx512f in the host's list: 256 bits")
+      (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-target" [(test-case "checks" unit-steps "compiler/tests/types/unit-target.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

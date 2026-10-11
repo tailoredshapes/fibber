@@ -5,7 +5,8 @@
 ;; layout of whole programs is judged by the `--layout` dump (spec/bootstrap.md) once the
 ;; oracle prints it; these checks are the Rust rules read arm by arm.
 ;; Build: fibc build compiler/tests/emit/unit-layout.fib -I compiler -I lib -o OUT
-(ns main (:use syntax.pos types.ty types.table types.decls types.check emit.value emit.layout))
+(ns tests.emit.unit-layout (:use syntax.pos types.ty types.table types.decls fib.test.unit emit.value emit.layout)
+  (:require [fib.test.run :as test-runner]))
 
 (def p0: Pos (Pos "t.fib" 1 1 0 1))
 
@@ -36,58 +37,51 @@
 (defun rep (g: Globals t: Ty) -> str
   (match (option-rep g t) ((Ok (OptNull)) "null") ((Ok (OptBoxed)) "boxed") ((Ok (OptValue)) "value") ((Err _) "err")))
 
-(defun main () -> i64
-  (let ((cs (checks-new)) (g (globals)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)) (g (globals)))
     (do
-      (check cs "the header is 16 bytes" (= (struct-size (layout-header)) 16))
-      (check cs "i64 i32 i32 i64 ptr is 32" (= (struct-size [LirI64 LirI32 LirI32 LirI64 LirPtr]) 32))
-      (check cs "i64 i32 i32 i32 ptr is 32" (= (struct-size [LirI64 LirI32 LirI32 LirI32 LirPtr]) 32))
-      (check cs "i64 i32 i32 i1 is 24" (= (struct-size [LirI64 LirI32 LirI32 LirI1]) 24))
-      (check cs "i64 i32 i32 dyn is 32" (= (struct-size [LirI64 LirI32 LirI32 LirDyn]) 32))
-      (check cs "an empty struct is 0" (= (struct-size []) 0))
-      (check cs "offsets of the header and a dyn"
-             (= (field-offsets (mapv size-align [LirI64 LirI32 LirI32 LirDyn])) [0 8 12 16]))
-      (check cs "offsets pad to the alignment"
-             (= (field-offsets (mapv size-align [LirI1 LirI16 LirI8 LirFloat LirI64 LirI1])) [0 2 4 8 16 24]))
-      (check cs "size-align of each" 
-             (= (mapv size-align [LirI1 LirI8 LirI16 LirI32 LirFloat LirI64 LirDouble LirPtr LirRaw LirDyn])
-                [(Pair 1 1) (Pair 1 1) (Pair 2 2) (Pair 4 4) (Pair 4 4) (Pair 8 8) (Pair 8 8) (Pair 8 8) (Pair 8 8) (Pair 16 8)]))
-      (check cs "the flags" (= [flag-shared flag-has-weak flag-stack flag-immortal] [1 2 4 8]))
-      (check cs "scalars"
-             (= (mapv (fn (s: Scalar) (lt g (ty-scalar s))) (scalar-all))
-                ["i1" "i8" "i16" "i32" "i64" "float" "double" "i32" "i64" "unit" "raw"]))
-      (check cs "str, cell, task, array, fn are pointers"
-             (= [(lt g (ty-str)) (lt g (ty-cell (ty-i64))) (lt g (ty-task (ty-i64)))
+      (is cs (= (struct-size (layout-header)) 16) "the header is 16 bytes")
+      (is cs (= (struct-size [LirI64 LirI32 LirI32 LirI64 LirPtr]) 32) "i64 i32 i32 i64 ptr is 32")
+      (is cs (= (struct-size [LirI64 LirI32 LirI32 LirI32 LirPtr]) 32) "i64 i32 i32 i32 ptr is 32")
+      (is cs (= (struct-size [LirI64 LirI32 LirI32 LirI1]) 24) "i64 i32 i32 i1 is 24")
+      (is cs (= (struct-size [LirI64 LirI32 LirI32 LirDyn]) 32) "i64 i32 i32 dyn is 32")
+      (is cs (= (struct-size []) 0) "an empty struct is 0")
+      (is cs (= (field-offsets (mapv size-align [LirI64 LirI32 LirI32 LirDyn])) [0 8 12 16]) "offsets of the header and a dyn")
+      (is cs (= (field-offsets (mapv size-align [LirI1 LirI16 LirI8 LirFloat LirI64 LirI1])) [0 2 4 8 16 24]) "offsets pad to the alignment")
+      (is cs (= (mapv size-align [LirI1 LirI8 LirI16 LirI32 LirFloat LirI64 LirDouble LirPtr LirRaw LirDyn])
+                [(Pair 1 1) (Pair 1 1) (Pair 2 2) (Pair 4 4) (Pair 4 4) (Pair 8 8) (Pair 8 8) (Pair 8 8) (Pair 8 8) (Pair 16 8)]) "size-align of each")
+      (is cs (= [flag-shared flag-has-weak flag-stack flag-immortal] [1 2 4 8]) "the flags")
+      (is cs (= (mapv (fn (s: Scalar) (lt g (ty-scalar s))) (scalar-all))
+                ["i1" "i8" "i16" "i32" "i64" "float" "double" "i32" "i64" "unit" "raw"]) "scalars")
+      (is cs (= [(lt g (ty-str)) (lt g (ty-cell (ty-i64))) (lt g (ty-task (ty-i64)))
                  (lt g (TCon KArray [(ty-i64)])) (lt g (TFn CLocal [] (ty-unit)))]
-                ["ptr" "ptr" "ptr" "ptr" "ptr"]))
-      (check cs "a weak of a dyn is a dyn, any other weak a pointer"
-             (= [(lt g (TCon KWeak [(TCon (KDyn 0 false) [])])) (lt g (TCon KWeak [(ty-str)]))] ["{ ptr ptr }" "ptr"]))
-      (check cs "a dyn" (= (lt g (TCon (KDyn 0 true) [])) "{ ptr ptr }"))
-      (check cs "a fieldless enum is an i32, a struct and a data enum pointers, an Option of a scalar a pair held by value"
-             (= [(lt g (nom 1 [])) (lt g (nom 2 [])) (lt g (nom 3 [(ty-i64)])) (lt g (nom 0 [(ty-i64)]))]
-                ["i32" "ptr" "ptr" "{ i1 i64 }"]))
-      (check cs "a type variable is refused"
-             (= [(lt g (TVar 0)) (lt g (TGen 0)) (lt g (TRigid 0))] ["err a type" "err a type" "err a type"]))
-      (check cs "a raw ptr is not an object pointer"
-             (and (= (lt g (ty-scalar SPtr)) "raw") (not (= (lir-ty g (ty-scalar SPtr)) (lir-ty g (ty-str))))))
-      (check cs "is-object"
-             (= [(is-object g (ty-bool)) (is-object g (ty-str)) (is-object g (nom 1 [])) (is-object g (nom 2 []))
+                ["ptr" "ptr" "ptr" "ptr" "ptr"]) "str, cell, task, array, fn are pointers")
+      (is cs (= [(lt g (TCon KWeak [(TCon (KDyn 0 false) [])])) (lt g (TCon KWeak [(ty-str)]))] ["{ ptr ptr }" "ptr"]) "a weak of a dyn is a dyn, any other weak a pointer")
+      (is cs (= (lt g (TCon (KDyn 0 true) [])) "{ ptr ptr }") "a dyn")
+      (is cs (= [(lt g (nom 1 [])) (lt g (nom 2 [])) (lt g (nom 3 [(ty-i64)])) (lt g (nom 0 [(ty-i64)]))]
+                ["i32" "ptr" "ptr" "{ i1 i64 }"]) "a fieldless enum is an i32, a struct and a data enum pointers, an Option of a scalar a pair held by value")
+      (is cs (= [(lt g (TVar 0)) (lt g (TGen 0)) (lt g (TRigid 0))] ["err a type" "err a type" "err a type"]) "a type variable is refused")
+      (is cs (and (= (lt g (ty-scalar SPtr)) "raw") (not (= (lir-ty g (ty-scalar SPtr)) (lir-ty g (ty-str))))) "a raw ptr is not an object pointer")
+      (is cs (= [(is-object g (ty-bool)) (is-object g (ty-str)) (is-object g (nom 1 [])) (is-object g (nom 2 []))
                  (is-object g (TFn CLocal [] (ty-unit))) (is-object g (ty-scalar SPtr))]
-                [false true false true true false]))
-      (check cs "option-payload" (= [(option-payload g (nom 0 [(ty-i64)])) (option-payload g (nom 2 []))] [(some (ty-i64)) nil]))
-      (check cs "an option of an object is a null pointer, of a scalar a pair held by value, of an option or unit a box"
-             (= [(rep g (ty-str)) (rep g (ty-i64)) (rep g (nom 0 [(ty-str)])) (rep g (ty-unit))
+                [false true false true true false]) "is-object")
+      (is cs (= [(option-payload g (nom 0 [(ty-i64)])) (option-payload g (nom 2 []))] [(some (ty-i64)) nil]) "option-payload")
+      (is cs (= [(rep g (ty-str)) (rep g (ty-i64)) (rep g (nom 0 [(ty-str)])) (rep g (ty-unit))
                  (rep g (ty-scalar SPtr)) (rep g (nom 1 [])) (rep g (nom 2 [])) (rep g (TFn CLocal [] (ty-unit)))]
-                ["null" "value" "boxed" "boxed" "value" "value" "null" "null"]))
-      (check cs "an option is a pointer" (= (lt g (nom 0 [(ty-str)])) "ptr"))
-      (check cs "an option of a type variable is refused" (= (rep g (TVar 3)) "err"))
-      (check cs "field types are substituted"
-             (match (field-tys [(FieldDef "v" (TGen 0)) (FieldDef "w" (ty-bool))] [(ty-str)])
-               ((Ok tys) (= tys [(ty-str) (ty-bool)])) ((Err _) false)))
-      (check cs "variants of a struct have one unnamed row"
-             (match (variants g 2 [])
-               ((Ok vs) (= vs [(Variant nil [(ty-i64) (ty-str)])])) ((Err _) false)))
-      (check cs "variants of an enum are named, at the arguments"
-             (match (variants g 3 [(ty-i64)])
-               ((Ok vs) (= vs [(Variant (some "Circle") [(ty-i64)]) (Variant (some "Dot") [])])) ((Err _) false)))
-      (finish cs))))
+                ["null" "value" "boxed" "boxed" "value" "value" "null" "null"]) "an option of an object is a null pointer, of a scalar a pair held by value, of an option or unit a box")
+      (is cs (= (lt g (nom 0 [(ty-str)])) "ptr") "an option is a pointer")
+      (is cs (= (rep g (TVar 3)) "err") "an option of a type variable is refused")
+      (is cs (match (field-tys [(FieldDef "v" (TGen 0)) (FieldDef "w" (ty-bool))] [(ty-str)])
+               ((Ok tys) (= tys [(ty-str) (ty-bool)])) ((Err _) false)) "field types are substituted")
+      (is cs (match (variants g 2 [])
+               ((Ok vs) (= vs [(Variant nil [(ty-i64) (ty-str)])])) ((Err _) false)) "variants of a struct have one unnamed row")
+      (is cs (match (variants g 3 [(ty-i64)])
+               ((Ok vs) (= vs [(Variant (some "Circle") [(ty-i64)]) (Variant (some "Dot") [])])) ((Err _) false)) "variants of an enum are named, at the arguments")
+      (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "emit/unit-layout" [(test-case "checks" unit-steps "compiler/tests/emit/unit-layout.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

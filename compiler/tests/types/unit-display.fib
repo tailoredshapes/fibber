@@ -7,7 +7,8 @@
 ;; qualified printer (a nominal type's and a protocol's name behind a module prefix;
 ;; a predicate's head is not qualified, as in Rust).
 ;; Build: fibc build compiler/tests/types/unit-display.fib -I compiler -I lib -o OUT
-(ns main (:use syntax.pos types.ty types.table types.decls types.display types.check))
+(ns tests.types.unit-display (:use syntax.pos types.ty types.table types.decls types.display fib.test.unit)
+  (:require [fib.test.run :as test-runner]))
 
 (def p0: Pos (Pos "t.fib" 1 1 0 1))
 
@@ -23,14 +24,14 @@
         (table-add (. g protos) (ProtoDef "Conv" 3 ["a"] [] [] p0))
         g)))
 
-(defun expect (cs: Checks name: str got: str want: str) -> unit
+(defun expect (cs: StepLog name: str got: str want: str) -> unit
   (do (if (= got want) () (println (str-join ["  got:  " got "\n  want: " want])))
-      (check cs name (= got want))))
+      (is cs (= got want) name)))
 
 (defun nom (id: i64 args: (Vec Ty)) -> Ty (TCon (KNominal id) args))
 (defun fn-ty (k: Colour ps: (Vec Ty) r: Ty) -> Ty (TFn k ps r))
 
-(defun letters (cs: Checks) -> unit
+(defun letters (cs: StepLog) -> unit
   (do (expect cs "letter 0" (letter-name 0) "a")
       (expect cs "letter 25" (letter-name 25) "z")
       (expect cs "letter 26 cycles with a suffix" (letter-name 26) "a1")
@@ -38,7 +39,7 @@
       (expect cs "letter 51" (letter-name 51) "z1")
       (expect cs "letter 52" (letter-name 52) "a2")))
 
-(defun scalars (cs: Checks) -> unit
+(defun scalars (cs: StepLog) -> unit
   (let ((p (printer-new (globals))))
     (do (expect cs "scalars" (str-join (mapv (fn (s: Scalar) (str-join [(printer-ty p (ty-scalar s)) ","])) (scalar-all)))
                 "bool,i8,i16,i32,i64,f32,f64,char,keyword,unit,ptr,")
@@ -49,7 +50,7 @@
                            (printer-ty p (ty-task (ty-unit)))])
                 "(Array i64)(Cell i64)(Atom bool)(Weak str)(Task unit)"))))
 
-(defun variables (cs: Checks) -> unit
+(defun variables (cs: StepLog) -> unit
   (let ((g (globals))
         (p (printer-new g))
         (f (fn-ty CLocal [(TVar 7) (TVar 3)] (TVar 7))))
@@ -73,7 +74,7 @@
               (expect cs "no names at all" (printer-ty p (TGen 0)) "t0"))))))
 
 
-(defun colours (cs: Checks) -> unit
+(defun colours (cs: StepLog) -> unit
   (let ((g (globals))
         (p (printer-with-names g [] ["R" "S"])))
     (do (expect cs ":send" (printer-ty p (fn-ty CSend [] (ty-i64))) "(fn :send () i64)")
@@ -91,7 +92,7 @@
                 (printer-ty (printer-new g) (fn-ty CLocal [(fn-ty CLocal [(TVar 1)] (TVar 2))] (TVar 3)))
                 "(fn :local ((fn :local (a) b)) c)"))))
 
-(defun nominals (cs: Checks) -> unit
+(defun nominals (cs: StepLog) -> unit
   (let ((p (printer-new (globals))))
     (do (expect cs "a nominal type with an argument" (printer-ty p (nom 0 [(ty-i64)])) "(Box i64)")
         (expect cs "a nominal type without arguments" (printer-ty p (nom 1 [])) "Unit0")
@@ -109,14 +110,14 @@
                 (printer-ty p (nom 3 [(ty-colour-arg CSend) (ty-colour-arg CSend)]))
                 "(Mixed (fn :send () unit) :send)"))))
 
-(defun dyns (cs: Checks) -> unit
+(defun dyns (cs: StepLog) -> unit
   (let ((p (printer-new (globals))))
     (do (expect cs "dyn" (printer-ty p (TCon (KDyn 0 false) [])) "(dyn Show)")
         (expect cs "dyn :send" (printer-ty p (TCon (KDyn 0 true) [])) "(dyn Show :send)")
         (expect cs "dyn with arguments" (printer-ty p (TCon (KDyn 1 false) [(ty-i64)])) "(dyn (Conv i64))")
         (expect cs "dyn with arguments :send" (printer-ty p (TCon (KDyn 1 true) [(ty-i64)])) "(dyn (Conv i64) :send)"))))
 
-(defun preds (cs: Checks) -> unit
+(defun preds (cs: StepLog) -> unit
   (let ((p (printer-new (globals))))
     (do (expect cs "a protocol predicate" (printer-pred p (PProto 1 [(TVar 4)])) "(Conv a)")
         (expect cs "Send" (printer-pred p (PSend (ty-i64))) "(Send i64)")
@@ -125,7 +126,7 @@
         (expect cs "a protocol predicate without arguments has a space, as in Rust"
                 (printer-pred p (PProto 0 [])) "(Show )"))))
 
-(defun qualified (cs: Checks) -> unit
+(defun qualified (cs: StepLog) -> unit
   (let ((p (printer-qualified (globals) (fn (m: i64) (str-join ["m" (show m) "."])))))
     (do (expect cs "a nominal type behind its module" (printer-ty p (nom 0 [(ty-i64)])) "(m2.Box i64)")
         (expect cs "without arguments" (printer-ty p (nom 1 [])) "m2.Unit0")
@@ -134,7 +135,14 @@
         (expect cs "scalars and builtins are not qualified" (printer-ty p (ty-cell (ty-i64))) "(Cell i64)")
         (expect cs "a predicate's head is not qualified" (printer-pred p (PProto 1 [(ty-i64)])) "(Conv i64)"))))
 
-(defun main () -> i64
-  (let ((cs (checks-new)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
     (do (letters cs) (scalars cs) (variables cs) (colours cs) (nominals cs) (dyns cs) (preds cs) (qualified cs)
-        (finish cs))))
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-display" [(test-case "checks" unit-steps "compiler/tests/types/unit-display.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

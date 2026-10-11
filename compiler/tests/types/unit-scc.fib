@@ -13,9 +13,10 @@
 ;; one dropped) and `check-poly-bounds` for a unit that used nothing
 ;; polymorphically.
 ;; Build: fibc build compiler/tests/types/unit-scc.fib -I compiler -I lib -o OUT
-(ns main (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
+(ns tests.types.unit-scc (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
                types.decls types.infer.cx types.infer.colour types.infer.general types.infer.scc
-               types.check))
+               fib.test.unit)
+  (:require [fib.test.run :as test-runner]))
 
 (def p0: Pos (Pos "t.fib" 1 1 0 1))
 
@@ -27,45 +28,37 @@
 (defun fun-def (name: str params: (Vec ParamDecl)) -> FunDef
   (FunDef name 2 params nil [] (body) false p0))
 
-(defun try-tests (cs: Checks) -> unit
+(defun try-tests (cs: StepLog) -> unit
   (do
-    (check cs "try-times: the results in order of the indexes"
-           (match (try-times 4 (fn (i: i64) (Ok (* i i))))
+    (is cs (match (try-times 4 (fn (i: i64) (Ok (* i i))))
              ((Ok v) (= v [0 1 4 9]))
-             (_ false)))
-    (check cs "try-times: no steps, no results"
-           (match (try-times 0 (fn (i: i64) (Ok i))) ((Ok v) (empty? v)) (_ false)))
+             (_ false)) "try-times: the results in order of the indexes")
+    (is cs (match (try-times 0 (fn (i: i64) (Ok i))) ((Ok v) (empty? v)) (_ false)) "try-times: no steps, no results")
     (let ((calls (cell 0)))
       (let ((r (try-times 5 (fn (i: i64)
                               (do (set! calls (+ @calls 1))
                                   (if (= i 2) (Err (type-error-other p0 "stop")) (Ok i)))))))
-        (check cs "try-times: the first error stops the loop, later steps do not run"
-               (and (= @calls 3) (match r ((Err e) (= (. e message) "stop")) (_ false))))))))
+        (is cs (and (= @calls 3) (match r ((Err e) (= (. e message) "stop")) (_ false))) "try-times: the first error stops the loop, later steps do not run")))))
 
-(defun member-tests (cs: Checks) -> unit
+(defun member-tests (cs: StepLog) -> unit
   (let ((cx (cx-new))
         (f (fun-def "f" [(param 0 "x" false) (param 1 "y" true)])))
     (match (member-sig cx f)
       ((Ok r)
        (let ((sig (. r fst)))
          (do
-           (check cs "member-sig: fresh variables for the parameters in order, then for the result"
-                  (and (= (. sig params) [(TVar 0) (TVar 1)]) (= (. sig ret) (TVar 2))))
-           (check cs "member-sig: amps and names of the parameters"
-                  (and (= (. sig amps) [false true]) (= (. sig names) ["x" "y"])))
-           (check cs "member-sig: not fully annotated, so no annotation scheme" (nil? (. r snd)))
-           (check cs "member-sig: a parameter is bound at its type, an `&` one as a cell of it"
-                  (and (match (cx-binding cx 0 p0) ((Ok t) (= t (TVar 0))) (_ false))
-                       (match (cx-binding cx 1 p0) ((Ok t) (= t (ty-cell (TVar 1)))) (_ false))))
-           (check cs "member-sig: the bindings are recorded in the unit"
-                  (= @(. (. cx u) bindings) [0 1])))))
-      (_ (check cs "member-sig: succeeds" false)))
+           (is cs (and (= (. sig params) [(TVar 0) (TVar 1)]) (= (. sig ret) (TVar 2))) "member-sig: fresh variables for the parameters in order, then for the result")
+           (is cs (and (= (. sig amps) [false true]) (= (. sig names) ["x" "y"])) "member-sig: amps and names of the parameters")
+           (is cs (nil? (. r snd)) "member-sig: not fully annotated, so no annotation scheme")
+           (is cs (and (match (cx-binding cx 0 p0) ((Ok t) (= t (TVar 0))) (_ false))
+                       (match (cx-binding cx 1 p0) ((Ok t) (= t (ty-cell (TVar 1)))) (_ false))) "member-sig: a parameter is bound at its type, an `&` one as a cell of it")
+           (is cs (= @(. (. cx u) bindings) [0 1]) "member-sig: the bindings are recorded in the unit"))))
+      (_ (is cs false "member-sig: succeeds")))
     (match (member-sig (cx-new) (fun-def "g" []))
-      ((Ok r) (check cs "member-sig: no parameters, a fresh result, no scheme"
-                     (and (empty? (. (. r fst) params)) (= (. (. r fst) ret) (TVar 0)) (nil? (. r snd)))))
-      (_ (check cs "member-sig: no parameters, succeeds" false)))))
+      ((Ok r) (is cs (and (empty? (. (. r fst) params)) (= (. (. r fst) ret) (TVar 0)) (nil? (. r snd))) "member-sig: no parameters, a fresh result, no scheme"))
+      (_ (is cs false "member-sig: no parameters, succeeds")))))
 
-(defun signatures-tests (cs: Checks) -> unit
+(defun signatures-tests (cs: StepLog) -> unit
   (let ((cx (cx-new))
         (members [(fun-def "f" [(param 0 "x" false)]) (fun-def "g" [(param 1 "y" true) (param 2 "z" false)])]))
     (do
@@ -73,20 +66,16 @@
       (match (scc-signatures cx members [4 5])
         ((Ok maps)
          (do
-           (check cs "scc-signatures: one rigid map per member, empty here"
-                  (and (= (count maps) 2) (empty? (nth maps 0)) (empty? (nth maps 1))))
-           (check cs "scc-signatures: a signature per id, in member order (variables 0 1 for f, 2 3 4 for g)"
-                  (let ((m @(. (. cx u) mono)))
+           (is cs (and (= (count maps) 2) (empty? (nth maps 0)) (empty? (nth maps 1))) "scc-signatures: one rigid map per member, empty here")
+           (is cs (let ((m @(. (. cx u) mono)))
                     (and (= (count m) 2)
                          (match (get m 4) ((some s) (and (= (. s params) [(TVar 0)]) (= (. s ret) (TVar 1)))) (_ false))
-                         (match (get m 5) ((some s) (and (= (. s params) [(TVar 2) (TVar 3)]) (= (. s ret) (TVar 4)))) (_ false)))))
-           (check cs "scc-signatures: no annotation schemes, no polymorphic variables"
-                  (and (empty? @(. (. cx u) poly)) (empty? @(. (. cx u) poly-vars))))
-           (check cs "scc-signatures: the unit's rigid map is left empty (its end-of-member reset needs annotations: pending P11)"
-                  (empty? @(. (. cx u) rigid-map)))))
-        (_ (check cs "scc-signatures: succeeds" false))))))
+                         (match (get m 5) ((some s) (and (= (. s params) [(TVar 2) (TVar 3)]) (= (. s ret) (TVar 4)))) (_ false)))) "scc-signatures: a signature per id, in member order (variables 0 1 for f, 2 3 4 for g)")
+           (is cs (and (empty? @(. (. cx u) poly)) (empty? @(. (. cx u) poly-vars))) "scc-signatures: no annotation schemes, no polymorphic variables")
+           (is cs (empty? @(. (. cx u) rigid-map)) "scc-signatures: the unit's rigid map is left empty (its end-of-member reset needs annotations: pending P11)")))
+        (_ (is cs false "scc-signatures: succeeds"))))))
 
-(defun scheme-tests (cs: Checks) -> unit
+(defun scheme-tests (cs: StepLog) -> unit
   (let ((cx (cx-new))
         (f (fun-def "f" [(param 0 "x" false) (param 1 "y" true)])))
     (do
@@ -95,31 +84,23 @@
         (match (annotation-scheme cx f sig)
           ((Ok s)
            (do
-             (check cs "annotation-scheme: the rigid variables in order of first occurrence, named by the unit's names"
-                    (and (= (. s n-vars) 2) (= (. s var-names) ["d" "b"]) (= (. s n-colours) 0)))
-             (check cs "annotation-scheme: the type with Gens, a send function"
-                    (= (. s ty) (TFn CSend [(TGen 0) (TCon KArray [(TGen 1) (TGen 0)])] (TGen 1))))
-             (check cs "annotation-scheme: amps and parameter names are the signature's, no context, no colour bounds"
-                    (and (= (. s amps) [false true]) (= (. s params) ["x" "y"])
-                         (empty? (. s preds)) (empty? (. s colour-bounds))))))
-          (_ (check cs "annotation-scheme: succeeds" false))))
+             (is cs (and (= (. s n-vars) 2) (= (. s var-names) ["d" "b"]) (= (. s n-colours) 0)) "annotation-scheme: the rigid variables in order of first occurrence, named by the unit's names")
+             (is cs (= (. s ty) (TFn CSend [(TGen 0) (TCon KArray [(TGen 1) (TGen 0)])] (TGen 1))) "annotation-scheme: the type with Gens, a send function")
+             (is cs (and (= (. s amps) [false true]) (= (. s params) ["x" "y"])
+                         (empty? (. s preds)) (empty? (. s colour-bounds))) "annotation-scheme: amps and parameter names are the signature's, no context, no colour bounds")))
+          (_ (is cs false "annotation-scheme: succeeds"))))
       (match (annotation-scheme cx f (MonoSig [(ty-i64)] [false] ["x"] (ty-i64)))
-        ((Ok s) (check cs "annotation-scheme: a closed signature quantifies nothing"
-                       (and (= (. s n-vars) 0) (empty? (. s var-names)) (= (. s ty) (TFn CSend [(ty-i64)] (ty-i64))))))
-        (_ (check cs "annotation-scheme: closed, succeeds" false))))))
+        ((Ok s) (is cs (and (= (. s n-vars) 0) (empty? (. s var-names)) (= (. s ty) (TFn CSend [(ty-i64)] (ty-i64)))) "annotation-scheme: a closed signature quantifies nothing"))
+        (_ (is cs false "annotation-scheme: closed, succeeds"))))))
 
-(defun kind-tests (cs: Checks) -> unit
+(defun kind-tests (cs: StepLog) -> unit
   (do
-    (check cs "pred-kind: a protocol bound is a dispatch constraint with no method"
-           (match (pred-kind (PProto 3 [(TVar 1)]) "f") ((DkProto p args m) (and (= p 3) (= args [(TVar 1)]) (nil? m))) (_ false)))
-    (check cs "pred-kind: Send with an empty path"
-           (match (pred-kind (PSend (TVar 1)) "f") ((DkSend t path) (and (= t (TVar 1)) (empty? path))) (_ false)))
-    (check cs "pred-kind: Object is named by the function"
-           (match (pred-kind (PObject (TVar 1)) "f") ((DkObject t who) (and (= t (TVar 1)) (= who "f"))) (_ false)))
-    (check cs "pred-kind: Weakable"
-           (match (pred-kind (PWeakable (TVar 1)) "f") ((DkWeakable t) (= t (TVar 1))) (_ false)))))
+    (is cs (match (pred-kind (PProto 3 [(TVar 1)]) "f") ((DkProto p args m) (and (= p 3) (= args [(TVar 1)]) (nil? m))) (_ false)) "pred-kind: a protocol bound is a dispatch constraint with no method")
+    (is cs (match (pred-kind (PSend (TVar 1)) "f") ((DkSend t path) (and (= t (TVar 1)) (empty? path))) (_ false)) "pred-kind: Send with an empty path")
+    (is cs (match (pred-kind (PObject (TVar 1)) "f") ((DkObject t who) (and (= t (TVar 1)) (= who "f"))) (_ false)) "pred-kind: Object is named by the function")
+    (is cs (match (pred-kind (PWeakable (TVar 1)) "f") ((DkWeakable t) (= t (TVar 1))) (_ false)) "pred-kind: Weakable")))
 
-(defun order-tests (cs: Checks) -> unit
+(defun order-tests (cs: StepLog) -> unit
   (let ((cx (cx-new)))
     (let ((v0 (store-fresh (. cx st))))
       (do
@@ -128,29 +109,24 @@
               (cols (Colours (map-empty) (set-empty) [] [])))
           (do
             (store-bind (. cx st) 3 (ty-i64))
-            (check cs "scc-order: first occurrences across the roots, rigid kept, an enclosing level's variable and a bound one dropped"
-                   (= (scc-order cx (Closed [[(KeyVar 1) (KeyRigid 0) (KeyVar 0)] [(KeyVar 3) (KeyVar 2) (KeyVar 1)]] cols []))
-                      [(KeyVar 1) (KeyRigid 0) (KeyVar 2)]))
-            (check cs "scc-order: no roots, nothing to quantify"
-                   (empty? (scc-order cx (Closed [] cols []))))
-            (check cs "scc-order: a rigid variable repeated in two roots is one key"
-                   (= (scc-order cx (Closed [[(KeyRigid 1)] [(KeyRigid 1) (KeyRigid 0)]] cols []))
-                      [(KeyRigid 1) (KeyRigid 0)]))))
+            (is cs (= (scc-order cx (Closed [[(KeyVar 1) (KeyRigid 0) (KeyVar 0)] [(KeyVar 3) (KeyVar 2) (KeyVar 1)]] cols []))
+                      [(KeyVar 1) (KeyRigid 0) (KeyVar 2)]) "scc-order: first occurrences across the roots, rigid kept, an enclosing level's variable and a bound one dropped")
+            (is cs (empty? (scc-order cx (Closed [] cols []))) "scc-order: no roots, nothing to quantify")
+            (is cs (= (scc-order cx (Closed [[(KeyRigid 1)] [(KeyRigid 1) (KeyRigid 0)]] cols []))
+                      [(KeyRigid 1) (KeyRigid 0)]) "scc-order: a rigid variable repeated in two roots is one key")))
         (let ((top (cx-new)) (cols (Colours (map-empty) (set-empty) [] [])))
           (let ((w (store-fresh (. top st))))
-            (check cs "scc-order: at the top level (level 0) no variable is generalised, a rigid one still is"
-                   (= (scc-order top (Closed [[(KeyVar 0) (KeyRigid 2)]] cols [])) [(KeyRigid 2)]))))))))
+            (is cs (= (scc-order top (Closed [[(KeyVar 0) (KeyRigid 2)]] cols [])) [(KeyRigid 2)]) "scc-order: at the top level (level 0) no variable is generalised, a rigid one still is")))))))
 
-(defun poly-bounds-tests (cs: Checks) -> unit
+(defun poly-bounds-tests (cs: StepLog) -> unit
   (let ((cx (cx-new))
         (cols (Colours (map-empty) (set-empty) [] []))
         (members [(fun-def "f" [])]))
-    (check cs "check-poly-bounds: a member never used polymorphically needs nothing listed"
-           (match (check-poly-bounds cx members [0] [(map-empty)] [[]] (Closed [[]] cols [(Pair (PSend (TRigid 0)) nil)]))
-             ((Ok _) true) (_ false)))))
+    (is cs (match (check-poly-bounds cx members [0] [(map-empty)] [[]] (Closed [[]] cols [(Pair (PSend (TRigid 0)) nil)]))
+             ((Ok _) true) (_ false)) "check-poly-bounds: a member never used polymorphically needs nothing listed")))
 
-(defun main () -> i64
-  (let ((cs (checks-new)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
     (do (try-tests cs)
         (member-tests cs)
         (signatures-tests cs)
@@ -158,4 +134,11 @@
         (kind-tests cs)
         (order-tests cs)
         (poly-bounds-tests cs)
-        (finish cs))))
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-scc" [(test-case "checks" unit-steps "compiler/tests/types/unit-scc.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

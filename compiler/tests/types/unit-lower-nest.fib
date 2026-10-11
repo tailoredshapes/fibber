@@ -5,8 +5,9 @@
 ;; lines its levels have. The forms are built, not read (the reader stops at 1000).
 ;; Run from the repository root, under `ulimit -s 262144` for the deepest.
 ;; Build: fibc build compiler/tests/types/unit-lower-nest.fib -I compiler -I lib -o OUT
-(ns main (:use fib.string syntax.pos syntax.form types.check tests.types.lower-support
-               tests.types.lower-body-support))
+(ns tests.types.unit-lower-nest (:use fib.string syntax.pos syntax.form fib.test.unit tests.types.lower-support
+               tests.types.lower-body-support)
+  (:require [fib.test.run :as test-runner]))
 
 (defun sym (s: str) -> Stx (Stx (SSym s) p0))
 (defun lst (xs: (Vec Stx)) -> Stx (Stx (SList xs) p0))
@@ -28,16 +29,22 @@
 (def shapes: (Vec (Pair str i64))
   [(Pair "if" 3) (Pair "let" 3) (Pair "call" 3) (Pair "fn" 2) (Pair "match" 4) (Pair "loop" 3)])
 
-(defun depth (cs: Checks sh: (Pair str i64) n: i64) -> unit
+(defun depth (cs: StepLog sh: (Pair str i64) n: i64) -> unit
   (let ((shape (. sh fst))
         (forms [(lst [(sym "defun") (sym "g") (lst [(sym "a") (sym "b")]) (sym "a")])
                 (lst [(sym "defun") (sym "f") (lst [(sym "x")]) (nested shape n)])])
         (lines (forms-lines forms "nest.fib")))
-    (do (check cs (str-join ["nest " shape " " (show n) " (" (show (count lines)) " lines)"])
-               (and (= (count lines) (+ (* n (. sh snd)) 3)) (= (nth lines 0) "ast fun f")))
+    (do (is cs (and (= (count lines) (+ (* n (. sh snd)) 3)) (= (nth lines 0) "ast fun f")) (str-join ["nest " shape " " (show n) " (" (show (count lines)) " lines)"]))
         (if (< (count lines) 3) (println (nth lines 0)) ()))))
 
-(defun main () -> i64
-  (let ((cs (checks-new)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
     (do (run! (fn (n: i64) (run! (fn (sh: (Pair str i64)) (depth cs sh n)) shapes)) [150 900 1990])
-        (finish cs))))
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-lower-nest" [(test-case "checks" unit-steps "compiler/tests/types/unit-lower-nest.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

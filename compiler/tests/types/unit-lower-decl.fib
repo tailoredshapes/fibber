@@ -10,9 +10,10 @@
 ;;   what a failing declaration leaves in the tables (the type, the constructors before the clash).
 ;; Run from the repository root.
 ;; Build: fibc build compiler/tests/types/unit-lower-decl.fib -I compiler -I lib -o OUT
-(ns main (:use fib.string syntax.pos syntax.form syntax.print types.ty types.error types.ast
-               types.table types.decls types.names types.check tests.types.lower-support
-               types.lower.typeform types.lower.decl))
+(ns tests.types.unit-lower-decl (:use fib.string syntax.pos syntax.form syntax.print types.ty types.error types.ast
+               types.table types.decls types.names fib.test.unit tests.types.lower-support
+               types.lower.typeform types.lower.decl)
+  (:require [fib.test.run :as test-runner]))
 
 ;; ---- the cases
 
@@ -22,13 +23,13 @@
    "decl-variant-twice" "decl-two-enums" "decl-bad-field-form" "decl-accumulate"
    "decl-quirk-head" "decl-quirk-colon-param" "decl-dup-after-colour"])
 
-(defun case (cs: Checks name: str) -> unit
+(defun case (cs: StepLog name: str) -> unit
   (let ((file (str-join [name ".fib"]))
         (got (single-lines name))
         (want (lines-of (file-text (str-join [dir name ".out"])))))
     (if (= got want)
-        (check cs (str-join ["case " name " (" (show (count want)) " lines)"]) true)
-        (do (check cs (str-join ["case " name]) false)
+        (is cs true (str-join ["case " name " (" (show (count want)) " lines)"]))
+        (do (is cs false (str-join ["case " name]))
             (println (str-join ["  want " (join "\n        " want)]))
             (println (str-join ["  got  " (join "\n        " got)]))))))
 
@@ -43,13 +44,13 @@
       ((Err e) (str-join [(show (. (. e pos) line)) ":" (show (. (. e pos) col)) " " (. e message)
                           (if (= (. e kind) Resolve) "" " [WRONG KIND]")])))))
 
-(defun dec (cs: Checks src: str want: str) -> unit
+(defun dec (cs: StepLog src: str want: str) -> unit
   (let ((got (dec-text (world-main) src)))
     (if (= got want)
-        (check cs (str-join [src " => " want]) true)
-        (do (check cs src false) (println (str-join ["  want " want])) (println (str-join ["  got  " got]))))))
+        (is cs true (str-join [src " => " want]))
+        (do (is cs false src) (println (str-join ["  want " want])) (println (str-join ["  got  " got]))))))
 
-(defun malformed (cs: Checks) -> unit
+(defun malformed (cs: StepLog) -> unit
   (do (dec cs "(defstruct A)" "1:1 expected (defstruct Name (field+))")
       (dec cs "(defstruct A (x: i64) 5)" "1:1 expected (defstruct Name (field+))")
       (dec cs "(defstruct 5 (x: i64))" "1:12 expected Name or (Name tvar+)")
@@ -85,37 +86,31 @@
 
 (defun values-of (g: Globals) -> (Map str GlobalRef) @(. (g-names g module-main) values))
 
-(defun leftovers (cs: Checks) -> unit
+(defun leftovers (cs: StepLog) -> unit
   (let ((g (world-main)))
-    (do (check cs "an error in a head or in the fields declares nothing"
-               (and (= (dec-text g "(defstruct (A) (x: i64))") "1:12 expected Name or (Name tvar+)")
+    (do (is cs (and (= (dec-text g "(defstruct (A) (x: i64))") "1:12 expected Name or (Name tvar+)")
                     (= (dec-text g "(defstruct A (x:))") "1:15 annotation without a type")
                     (= (dec-text g "(defenum E A (5))") "1:14 a variant is (Variant field*) or Variant")
                     (= (table-count (. g types)) 0)
-                    (= (map-count (values-of g)) 0)))
-        (check cs "a struct: the type and its constructor"
-               (and (= (dec-text g "(defstruct A (x: i64))") "ok")
+                    (= (map-count (values-of g)) 0)) "an error in a head or in the fields declares nothing")
+        (is cs (and (= (dec-text g "(defstruct A (x: i64))") "ok")
                     (= (table-count (. g types)) 1)
                     (= (get (values-of g) "A") (some (GCtor 0 nil)))
-                    (= (g-type-name g module-main "A") (some 0))))
-        (check cs "a type declared twice: the second is an error and adds nothing"
-               (and (= (dec-text g "(defstruct A (y: i64))") "1:1 type A is already defined")
-                    (= (table-count (. g types)) 1)))
-        (check cs "an enum whose variant is a defined constructor: the type is there, the variants before the clash too"
-               (and (= (dec-text g "(defenum E B A C)") "1:1 A is already defined")
+                    (= (g-type-name g module-main "A") (some 0))) "a struct: the type and its constructor")
+        (is cs (and (= (dec-text g "(defstruct A (y: i64))") "1:1 type A is already defined")
+                    (= (table-count (. g types)) 1)) "a type declared twice: the second is an error and adds nothing")
+        (is cs (and (= (dec-text g "(defenum E B A C)") "1:1 A is already defined")
                     (= (table-count (. g types)) 2)
                     (= (g-type-name g module-main "E") (some 1))
                     (= (get (values-of g) "B") (some (GCtor 1 (some 0))))
                     (= (get (values-of g) "A") (some (GCtor 0 nil)))
-                    (= (get (values-of g) "C") nil)))
-        (check cs "a variant defined twice in one enum"
-               (and (= (dec-text g "(defenum F X Y X)") "1:1 X is already defined")
+                    (= (get (values-of g) "C") nil)) "an enum whose variant is a defined constructor: the type is there, the variants before the clash too")
+        (is cs (and (= (dec-text g "(defenum F X Y X)") "1:1 X is already defined")
                     (= (get (values-of g) "X") (some (GCtor 2 (some 0))))
-                    (= (get (values-of g) "Y") (some (GCtor 2 (some 1))))))
-        (check cs "a type name and a value name are different spaces"
-               (and (= (dec-text g "(defenum Pair2 Pair2)") "ok")
+                    (= (get (values-of g) "Y") (some (GCtor 2 (some 1))))) "a variant defined twice in one enum")
+        (is cs (and (= (dec-text g "(defenum Pair2 Pair2)") "ok")
                     (= (g-type-name g module-main "Pair2") (some 3))
-                    (= (get (values-of g) "Pair2") (some (GCtor 3 (some 0)))))))))
+                    (= (get (values-of g) "Pair2") (some (GCtor 3 (some 0))))) "a type name and a value name are different spaces"))))
 
 ;; ---- the raw declarations and the shapes
 
@@ -129,71 +124,66 @@
 (defun field-forms (fs: (Vec RawField)) -> (Vec str)
   (mapv (fn (f: RawField) (match (. f ty) ((some t) (stx-show t)) (nil "-"))) fs))
 
-(defun raws (cs: Checks) -> unit
+(defun raws (cs: StepLog) -> unit
   (let ((g (world-main))
         (s (raw-of g "(defstruct S (x: i64 y z: (Cell str)))"))
         (c (raw-of g "(defstruct (C k :colour) (f: (fn k () unit) x))"))
         (p (raw-of g "(defstruct (P a) (x: a))"))
         (e (raw-of g "(defenum E (A) B (Cx i64 y: str (Cell i64)) (D x: i64) (F))")))
-    (do (check cs "a struct: ids, no variants, fields with their forms (unannotated: none)"
-               (and (= (. s id) 0) (not (some? (. s variants)))
+    (do (is cs (and (= (. s id) 0) (not (some? (. s variants)))
                     (= (field-names (. s fields)) ["x" "y" "z"])
-                    (= (field-forms (. s fields)) ["i64" "-" "(Cell str)"])))
-        (check cs "an unannotated field adds a parameter named after it"
-               (and (= (. (g-ty g 0) params) ["y"]) (= (. (g-ty g 0) colours) [])))
-        (check cs "with colour parameters it adds a plain one"
-               (and (= (. (g-ty g 1) params) ["k" "x"]) (= (. (g-ty g 1) colours) [true false])))
-        (check cs "a parameterless declaration of annotated fields only has no parameters"
-               (and (= (. (g-ty g 2) params) ["a"]) (= (. p id) 2) (= (. (g-ty g 2) colours) [])))
-        (check cs "the declared type has an empty shape until resolved"
-               (match (. (g-ty g 0) shape) ((TsStruct fs) (empty? fs)) (_ false)))
-        (check cs "an enum: its variants in order, a positional field named by its position"
-               (and (= (. e id) 3) (= (. c id) 1)
+                    (= (field-forms (. s fields)) ["i64" "-" "(Cell str)"])) "a struct: ids, no variants, fields with their forms (unannotated: none)")
+        (is cs (and (= (. (g-ty g 0) params) ["y"]) (= (. (g-ty g 0) colours) [])) "an unannotated field adds a parameter named after it")
+        (is cs (and (= (. (g-ty g 1) params) ["k" "x"]) (= (. (g-ty g 1) colours) [true false])) "with colour parameters it adds a plain one")
+        (is cs (and (= (. (g-ty g 2) params) ["a"]) (= (. p id) 2) (= (. (g-ty g 2) colours) [])) "a parameterless declaration of annotated fields only has no parameters")
+        (is cs (match (. (g-ty g 0) shape) ((TsStruct fs) (empty? fs)) (_ false)) "the declared type has an empty shape until resolved")
+        (is cs (and (= (. e id) 3) (= (. c id) 1)
                     (match (. e variants)
                       ((some vs)
                        (= (mapv (fn (v: (Pair str (Vec RawField))) (. v fst)) vs) ["A" "B" "Cx" "D" "F"]))
-                      (nil false))))
-        (check cs "positions count the fields before them, annotated or not"
-               (match (. e variants)
+                      (nil false))) "an enum: its variants in order, a positional field named by its position")
+        (is cs (match (. e variants)
                  ((some vs) (= (mapv (fn (v: (Pair str (Vec RawField))) (field-names (. v snd))) vs)
                                [[] [] ["0" "y" "2"] ["x"] []]))
-                 (nil false))))))
+                 (nil false)) "positions count the fields before them, annotated or not"))))
 
 (defun shape-text (g: Globals id: i64) -> str
   (join "\n" (drop 1 (type-lines g (g-ty g id) "t"))))
 
-(defun resolved (cs: Checks) -> unit
+(defun resolved (cs: StepLog) -> unit
   (let ((g (world-main))
         (a (raw-of g "(defstruct A (x: i64 y z: (Cell str)))"))
         (b (raw-of g "(defstruct B (x: Nope))"))
         (c (raw-of g "(defenum C (D i64) (E (Cell Nope)) (F str))"))
         (d (raw-of g "(defstruct (D2 a) (x: (Cell a) y: a))")))
-    (do (check cs "resolve-shape of a struct sets its fields: annotated by their types, others by their parameter"
-               (and (match (resolve-shape g module-main a) ((Ok _) true) (_ false))
+    (do (is cs (and (match (resolve-shape g module-main a) ((Ok _) true) (_ false))
                     (= (match (. (g-ty g 0) shape)
                          ((TsStruct fs) (mapv (fn (f: FieldDef) (. f ty)) fs))
                          (_ []))
-                       [(ty-i64) (TGen 0) (TCon KCell [(ty-str)])])))
-        (check cs "a failing field leaves the shape as it was"
-               (and (match (resolve-shape g module-main b) ((Err e) (= (. e message) "unknown type Nope")) (_ false))
-                    (match (. (g-ty g 1) shape) ((TsStruct fs) (empty? fs)) (_ false))))
-        (check cs "an enum fails at its first failing variant, and keeps no shape"
-               (and (match (resolve-shape g module-main c) ((Err e) (= (. e message) "unknown type Nope")) (_ false))
-                    (match (. (g-ty g 2) shape) ((TsStruct fs) (empty? fs)) (_ false))))
-        (check cs "a type's own parameters are variables, `TGen` at their position"
-               (and (match (resolve-shape g module-main d) ((Ok _) true) (_ false))
+                       [(ty-i64) (TGen 0) (TCon KCell [(ty-str)])])) "resolve-shape of a struct sets its fields: annotated by their types, others by their parameter")
+        (is cs (and (match (resolve-shape g module-main b) ((Err e) (= (. e message) "unknown type Nope")) (_ false))
+                    (match (. (g-ty g 1) shape) ((TsStruct fs) (empty? fs)) (_ false))) "a failing field leaves the shape as it was")
+        (is cs (and (match (resolve-shape g module-main c) ((Err e) (= (. e message) "unknown type Nope")) (_ false))
+                    (match (. (g-ty g 2) shape) ((TsStruct fs) (empty? fs)) (_ false))) "an enum fails at its first failing variant, and keeps no shape")
+        (is cs (and (match (resolve-shape g module-main d) ((Ok _) true) (_ false))
                     (= (shape-text g 3)
-                       "  field x : (Cell a)\n  field y : a"))))))
+                       "  field x : (Cell a)\n  field y : a")) "a type's own parameters are variables, `TGen` at their position"))))
 
-(defun annotations (cs: Checks) -> unit
+(defun annotations (cs: StepLog) -> unit
   (let ((f (fn (src: str) (annotation-name (nth (forms-of src "t") 0)))))
-    (check cs "annotation-name: `x:` is x, a plain symbol, a colon inside, a number are none"
-           (and (= (f "x:") (some "x")) (= (f "xy:") (some "xy")) (= (f "x") nil) (= (f "a:b") nil)
+    (is cs (and (= (f "x:") (some "x")) (= (f "xy:") (some "xy")) (= (f "x") nil) (= (f "a:b") nil)
                 (= (f "5") nil) (= (f "(x:)") nil) (= (f ":k") nil)
-                (= (annotation-name (Stx (SSym ":") p0)) nil)))))
+                (= (annotation-name (Stx (SSym ":") p0)) nil)) "annotation-name: `x:` is x, a plain symbol, a colon inside, a number are none")))
 
-(defun main () -> i64
-  (let ((cs (checks-new)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
     (do (doseq [n case-names] (case cs n))
         (annotations cs) (malformed cs) (leftovers cs) (raws cs) (resolved cs)
-        (finish cs))))
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-lower-decl" [(test-case "checks" unit-steps "compiler/tests/types/unit-lower-decl.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

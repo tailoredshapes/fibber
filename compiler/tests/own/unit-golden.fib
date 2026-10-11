@@ -5,10 +5,11 @@
 ;; ids included. Together with unit-dump.fib they show every kind of line the dump has. Prints
 ;; `ok NAME` or `FAIL NAME`.
 ;; Build: fibc build compiler/tests/own/unit-golden.fib -I compiler -I lib -o OUT
-(ns main
+(ns tests.own.unit-golden
   (:require [own.args :as a] [own.dump :as d] [types.dump.sections :as s] [types.args :as ta])
   (:use syntax.pos types.ty types.scheme types.table types.ast types.decls types.builtins types.program
-        types.infer.mod types.check own.program own.driver))
+        types.infer.mod fib.test.unit own.program own.driver)
+  (:require [fib.test.run :as test-runner]))
 
 (def pos: Pos (Pos "t.fib" 1 1 0 1))
 
@@ -189,12 +190,17 @@
                                      (conj (set-empty) 431) (map-empty) (map-empty) (set-empty) (set-empty) (map-empty)))
                    (UnitFacts [(BodyFun 1)] (facts-empty))])))
 
-(defun main () -> i64
-  (let ((cs (checks-new))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec))
         (gw (tables ["keep" "mk" "main"] ["s" "n" "x"]))
         (gg (tables ["grow" "bar" "x" "vec-count" "vec-conj" "append"] ["_" "_" "v" "x" "a"])))
-    (do (check cs "golden/worked.fib: the example of spec §7.5, every line of its module"
-               (= (lines-of gw (worked-owned) "compiler/tests/own/golden/worked.fib") worked-expected))
-        (check cs "golden/full.fib: a loop, a recur, an & parameter, the facts of a loop variable, the summaries"
-               (= (lines-of gg (grow-owned) "compiler/tests/own/golden/full.fib") grow-expected))
-        (finish cs))))
+    (do (is cs (= (lines-of gw (worked-owned) "compiler/tests/own/golden/worked.fib") worked-expected) "golden/worked.fib: the example of spec §7.5, every line of its module")
+        (is cs (= (lines-of gg (grow-owned) "compiler/tests/own/golden/full.fib") grow-expected) "golden/full.fib: a loop, a recur, an & parameter, the facts of a loop variable, the summaries")
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "own/unit-golden" [(test-case "checks" unit-steps "compiler/tests/own/unit-golden.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

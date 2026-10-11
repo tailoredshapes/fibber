@@ -2,7 +2,8 @@
 ;; (`i128::MAX` is 170141183460469231731687303715884105727, `u64::MAX` 18446744073709551615) and the ranges of parse/literal.rs `int_fits`
 ;; (its test `integer_ranges`).
 ;; Build: fibc build compiler/tests/lir/unit-lit.fib -I compiler -I lib -o OUT
-(ns main (:use types.check lir.lit))
+(ns tests.lir.unit-lit (:use fib.test.unit lir.lit)
+  (:require [fib.test.run :as test-runner]))
 
 ;; The magnitude of the decimal text, as parse/literal.rs `int_token` reads it, or nil when it exceeds i128::MAX.
 (defun parse-dec (s: str) -> (Option LLit)
@@ -21,34 +22,35 @@
     ((some v) (lit-fits-int? bits (if neg (lit-neg v) v)))
     (nil false)))
 
-(defun main () -> i64
-  (let ((cs (checks-new)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
     (do
-      (check cs "decimal text round trips through lit-mul-add and lit-str"
-             (and (= (shown "0") "0") (= (shown "7") "7") (= (shown "4294967296") "4294967296")
+      (is cs (and (= (shown "0") "0") (= (shown "7") "7") (= (shown "4294967296") "4294967296")
                   (= (shown "18446744073709551615") "18446744073709551615")
                   (= (shown "18446744073709551616") "18446744073709551616")
-                  (= (shown "170141183460469231731687303715884105727") "170141183460469231731687303715884105727")))
-      (check cs "a magnitude above i128::MAX is out of range, as the 41 nines of the Rust test are"
-             (and (= (shown "170141183460469231731687303715884105728") "overflow")
-                  (= (shown "99999999999999999999999999999999999999999") "overflow")))
-      (check cs "negation prints with a sign, the minimum is its own negation"
-             (and (= (lit-str (lit-neg (lit-of 5))) "-5")
+                  (= (shown "170141183460469231731687303715884105727") "170141183460469231731687303715884105727")) "decimal text round trips through lit-mul-add and lit-str")
+      (is cs (and (= (shown "170141183460469231731687303715884105728") "overflow")
+                  (= (shown "99999999999999999999999999999999999999999") "overflow")) "a magnitude above i128::MAX is out of range, as the 41 nines of the Rust test are")
+      (is cs (and (= (lit-str (lit-neg (lit-of 5))) "-5")
                   (= (lit-str (lit-of -9223372036854775808)) "-9223372036854775808")
                   (= (lit-str (lit-neg (lit-pow2 127))) "-170141183460469231731687303715884105728")
-                  (= (lit-neg (lit-of 0)) (lit-of 0))))
-      (check cs "int_fits: -2^(K-1) to 2^K - 1"
-             (and (fits 8 "255" false) (not (fits 8 "256" false)) (fits 8 "128" true) (not (fits 8 "129" true))
+                  (= (lit-neg (lit-of 0)) (lit-of 0))) "negation prints with a sign, the minimum is its own negation")
+      (is cs (and (fits 8 "255" false) (not (fits 8 "256" false)) (fits 8 "128" true) (not (fits 8 "129" true))
                   (fits 64 "18446744073709551615" false) (not (fits 64 "18446744073709551616" false))
                   (fits 64 "9223372036854775808" true) (not (fits 64 "9223372036854775809" true))
-                  (fits 1 "1" false) (fits 1 "1" true) (not (fits 1 "2" false)) (not (fits 1 "2" true))))
-      (check cs "comparison is signed on the high word, unsigned on the low"
-             (and (= (lit-cmp (lit-of -1) (lit-of 1)) -1) (= (lit-cmp (lit-of 1) (lit-of -1)) 1)
+                  (fits 1 "1" false) (fits 1 "1" true) (not (fits 1 "2" false)) (not (fits 1 "2" true))) "int_fits: -2^(K-1) to 2^K - 1")
+      (is cs (and (= (lit-cmp (lit-of -1) (lit-of 1)) -1) (= (lit-cmp (lit-of 1) (lit-of -1)) 1)
                   (= (lit-cmp (LLit 0 -1) (LLit 0 1)) 1) (= (lit-cmp (LLit 0 -1) (LLit 1 0)) -1)
                   (= (lit-cmp (lit-of 3) (lit-of 3)) 0)
-                  (u64-lt 1 -1) (not (u64-lt -1 1))))
-      (check cs "lit-low is (v as u128) & mask(bits) and lit->i64 is nil above i64"
-             (and (= (lit-low (lit-of -1) 8) 255) (= (lit-low (lit-of 300) 8) 44) (= (lit-low (lit-of -1) 64) -1)
+                  (u64-lt 1 -1) (not (u64-lt -1 1))) "comparison is signed on the high word, unsigned on the low")
+      (is cs (and (= (lit-low (lit-of -1) 8) 255) (= (lit-low (lit-of 300) 8) 44) (= (lit-low (lit-of -1) 64) -1)
                   (= (lit-low (lit-of -1) 1) 1) (= (lit->i64 (lit-of -7)) (some -7))
-                  (= (lit->i64 (lit-pow2 64)) nil) (= (lit->i64 (LLit 0 -1)) nil)))
-      (finish cs))))
+                  (= (lit->i64 (lit-pow2 64)) nil) (= (lit->i64 (LLit 0 -1)) nil)) "lit-low is (v as u128) & mask(bits) and lit->i64 is nil above i64")
+      (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "lir/unit-lit" [(test-case "checks" unit-steps "compiler/tests/lir/unit-lit.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

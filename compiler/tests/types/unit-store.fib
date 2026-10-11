@@ -5,7 +5,8 @@
 ;; level 0, and a store at scale (50,000 variables bound in a chain and
 ;; resolved: the guard of plan G1, a Vec indexed by id would take minutes).
 ;; Build: fibc build compiler/tests/types/unit-store.fib -I compiler -I lib -o OUT
-(ns main (:use types.ty types.store types.check))
+(ns tests.types.unit-store (:use types.ty types.store fib.test.unit)
+  (:require [fib.test.run :as test-runner]))
 
 (defun var-id (t: Ty) -> i64
   (match t ((TVar v) v) (_ -1)))
@@ -18,48 +19,49 @@
           (do (store-bind s (var-id v) prev) (recur (+ i 1) v)))
         prev)))
 
-(defun main () -> i64
-  (let ((cs (checks-new)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
     (do
       (let ((s (store-new))
             (a (store-fresh s))
             (b (store-fresh s)))
         (do (store-bind s (var-id a) b)
             (store-bind s (var-id b) (ty-i64))
-            (check cs "resolve follows links" (= (store-resolve s a) (ty-i64)))
-            (check cs "zonk substitutes" (= (store-zonk s (ty-cell a)) (ty-cell (ty-i64))))))
+            (is cs (= (store-resolve s a) (ty-i64)) "resolve follows links")
+            (is cs (= (store-zonk s (ty-cell a)) (ty-cell (ty-i64))) "zonk substitutes")))
       (let ((s (store-new)))
         (do (store-enter s)
             (let ((outer (store-fresh s)))
               (do (store-enter s)
                   (let ((inner (store-fresh s)))
-                    (do (check cs "inner variable is at level 2"
-                               (= (store-level-of s (var-id inner)) (some 2)))
+                    (do (is cs (= (store-level-of s (var-id inner)) (some 2)) "inner variable is at level 2")
                         (store-bind s (var-id outer) (ty-cell inner))
-                        (check cs "binding lowers levels"
-                               (= (store-level-of s (var-id inner)) (some 1)))
-                        (check cs "a bound variable has no level"
-                               (nil? (store-level-of s (var-id outer))))))))))
+                        (is cs (= (store-level-of s (var-id inner)) (some 1)) "binding lowers levels")
+                        (is cs (nil? (store-level-of s (var-id outer))) "a bound variable has no level")))))))
       (let ((s (store-new))
             (a (store-fresh s))
             (b (store-fresh s)))
         (do (store-bind s (var-id b) (ty-cell a))
-            (check cs "occurs sees through links" (store-occurs s (var-id a) b))
-            (check cs "occurs is false for an unrelated variable"
-                   (not (store-occurs s (var-id b) a)))))
+            (is cs (store-occurs s (var-id a) b) "occurs sees through links")
+            (is cs (not (store-occurs s (var-id b) a)) "occurs is false for an unrelated variable")))
       (let ((s (store-new)))
-        (check cs "variables are numbered from 0 in order"
-               (= [(store-fresh s) (store-fresh s) (store-fresh s)] [(TVar 0) (TVar 1) (TVar 2)])))
+        (is cs (= [(store-fresh s) (store-fresh s) (store-fresh s)] [(TVar 0) (TVar 1) (TVar 2)]) "variables are numbered from 0 in order"))
       (let ((s (store-new)))
-        (check cs "colour variables are numbered from 0"
-               (= [(store-fresh-colour s) (store-fresh-colour s)] [(CVar 0) (CVar 1)])))
+        (is cs (= [(store-fresh-colour s) (store-fresh-colour s)] [(CVar 0) (CVar 1)]) "colour variables are numbered from 0"))
       (let ((s (store-new)))
         (do (store-leave s)
-            (check cs "leave stops at level 0" (= (store-level s) 0))
+            (is cs (= (store-level s) 0) "leave stops at level 0")
             (store-enter s) (store-enter s) (store-leave s)
-            (check cs "enter and leave" (= (store-level s) 1))))
+            (is cs (= (store-level s) 1) "enter and leave")))
       (let ((s (store-new))
             (end (chain s 50000)))
-        (do (check cs "a chain of 50000 resolves to its end" (= (store-resolve s end) (ty-i64)))
-            (check cs "and zonks to it" (= (store-zonk s (ty-cell end)) (ty-cell (ty-i64))))))
-      (finish cs))))
+        (do (is cs (= (store-resolve s end) (ty-i64)) "a chain of 50000 resolves to its end")
+            (is cs (= (store-zonk s (ty-cell end)) (ty-cell (ty-i64))) "and zonks to it")))
+      (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-store" [(test-case "checks" unit-steps "compiler/tests/types/unit-store.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

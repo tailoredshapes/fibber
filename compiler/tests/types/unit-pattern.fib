@@ -7,9 +7,10 @@
 ;; `binding_ann`, `lit_type`, and the vector pattern left unknown at the close
 ;; of a unit (`default-vec-patterns` through `cx-close`).
 ;; Build: fibc build compiler/tests/types/unit-pattern.fib -I compiler -I lib -o OUT
-(ns main (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table
+(ns tests.types.unit-pattern (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table
                types.ast types.decls types.init types.infer.cx types.infer.general
-               types.infer.pattern types.infer.unify types.infer.solve types.check))
+               types.infer.pattern types.infer.unify types.infer.solve fib.test.unit)
+  (:require [fib.test.run :as test-runner]))
 
 (def p0: Pos (Pos "t.fib" 1 1 0 1))
 
@@ -59,177 +60,152 @@
 (defun failed (r: (Result unit TypeError) kind: ErrorKind msg: str) -> bool
   (match r ((Err e) (and (= (. e kind) kind) (= (. e message) msg))) (_ false)))
 
-(defun simple-tests (cs: Checks) -> unit
+(defun simple-tests (cs: StepLog) -> unit
   (do
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
-      (check cs "a wildcard binds nothing and constrains nothing"
-             (and (ok? (cx-check-pattern cx (pat PWild) s)) (empty? @(. (. cx u) bindings))
-                  (= (cx-zonk cx s) s) (= (ndef cx) 0))))
+      (is cs (and (ok? (cx-check-pattern cx (pat PWild) s)) (empty? @(. (. cx u) bindings))
+                  (= (cx-zonk cx s) s) (= (ndef cx) 0)) "a wildcard binds nothing and constrains nothing"))
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
-      (check cs "a variable is bound at the scrutinee's type"
-             (and (ok? (cx-check-pattern cx (bind 7) s)) (= (bound cx 7) s)
-                  (= @(. (. cx u) bindings) [7]))))
+      (is cs (and (ok? (cx-check-pattern cx (bind 7) s)) (= (bound cx 7) s)
+                  (= @(. (. cx u) bindings) [7])) "a variable is bound at the scrutinee's type"))
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
-      (check cs "a literal gives the scrutinee its type and defers Eq"
-             (and (ok? (cx-check-pattern cx (pat (PLit (LitInt 1 I32))) s))
+      (is cs (and (ok? (cx-check-pattern cx (pat (PLit (LitInt 1 I32))) s))
                   (= (cx-zonk cx s) (ty-scalar SI32)) (= (ndef cx) 1)
                   (match (. (nth @(. (. cx u) deferred) 0) kind)
                     ((DkProto p args m) (and (= args [(ty-scalar SI32)]) (nil? m)))
-                    (_ false)))))
+                    (_ false))) "a literal gives the scrutinee its type and defers Eq"))
     (let ((cx (fresh-cx)))
-      (check cs "a literal against another type: the unify error at the pattern, no Eq deferred"
-             (and (failed (cx-check-pattern cx (pat (PLit (LitBool true))) (ty-i64)) Unify
+      (is cs (and (failed (cx-check-pattern cx (pat (PLit (LitBool true))) (ty-i64)) Unify
                           "cannot unify i64 with bool")
-                  (= (ndef cx) 0))))
+                  (= (ndef cx) 0)) "a literal against another type: the unify error at the pattern, no Eq deferred"))
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
-      (check cs "an as pattern binds the whole and checks the inside"
-             (and (ok? (cx-check-pattern cx (pat (PAs (bind 2) 1)) s))
-                  (= @(. (. cx u) bindings) [1 2]) (= (bound cx 1) s) (= (bound cx 2) s))))
+      (is cs (and (ok? (cx-check-pattern cx (pat (PAs (bind 2) 1)) s))
+                  (= @(. (. cx u) bindings) [1 2]) (= (bound cx 1) s) (= (bound cx 2) s)) "an as pattern binds the whole and checks the inside"))
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
-      (check cs "the literal types: strings, chars, floats, keywords, unit"
-             (and (= (lit-type (LitStr "a")) (ty-str)) (= (lit-type (LitChar \a)) (ty-scalar SChar))
+      (is cs (and (= (lit-type (LitStr "a")) (ty-str)) (= (lit-type (LitChar \a)) (ty-scalar SChar))
                   (= (lit-type (LitFloat 1.0 F32)) (ty-scalar SF32))
                   (= (lit-type (LitFloat 1.0 F64)) (ty-scalar SF64))
                   (= (lit-type (LitKeyword "k")) (ty-scalar SKeyword))
                   (= (lit-type LitUnit) (ty-unit)) (= (lit-type (LitInt 1 I8)) (ty-scalar SI8))
                   (= (lit-type (LitInt 1 I16)) (ty-scalar SI16))
-                  (= (lit-type (LitInt 1 I64)) (ty-i64)) (= (lit-type (LitBool false)) (ty-bool)))))))
+                  (= (lit-type (LitInt 1 I64)) (ty-i64)) (= (lit-type (LitBool false)) (ty-bool))) "the literal types: strings, chars, floats, keywords, unit"))))
 
-(defun ctor-tests (cs: Checks) -> unit
+(defun ctor-tests (cs: StepLog) -> unit
   (do
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
-      (check cs "a struct pattern: fresh arguments in order, fields at their types"
-             (and (ok? (cx-check-pattern cx (pat (PCtor 5 nil [(bind 1) (bind 2)])) s))
+      (is cs (and (ok? (cx-check-pattern cx (pat (PCtor 5 nil [(bind 1) (bind 2)])) s))
                   (= (cx-zonk cx s) (s-of (TVar 1)))
-                  (= (bound cx 1) (ty-i64)) (= (bound cx 2) (TVar 1)))))
+                  (= (bound cx 1) (ty-i64)) (= (bound cx 2) (TVar 1))) "a struct pattern: fresh arguments in order, fields at their types"))
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
-      (check cs "a colour parameter's argument is a fresh colour (a function of that colour), not a type variable"
-             (and (ok? (cx-check-pattern cx (pat (PCtor 7 nil [(bind 1)])) s))
+      (is cs (and (ok? (cx-check-pattern cx (pat (PCtor 7 nil [(bind 1)])) s))
                   (= (cx-zonk cx s) (ty-nominal 7 [(ty-colour-arg (CVar 0))]))
-                  (= (bound cx 1) (TFn (CVar 0) [] (ty-i64))) (= (cx-fresh cx) (TVar 1)))))
+                  (= (bound cx 1) (TFn (CVar 0) [] (ty-i64))) (= (cx-fresh cx) (TVar 1))) "a colour parameter's argument is a fresh colour (a function of that colour), not a type variable"))
     (let ((cx (fresh-cx)))
-      (check cs "a struct pattern against the wrong type"
-             (failed (cx-check-pattern cx (pat (PCtor 5 nil [])) (ty-i64)) Unify
-                     "cannot unify i64 with (S a)")))
+      (is cs (failed (cx-check-pattern cx (pat (PCtor 5 nil [])) (ty-i64)) Unify
+                     "cannot unify i64 with (S a)") "a struct pattern against the wrong type"))
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
-      (check cs "an enum variant's fields (Option's Some, variant 1)"
-             (and (ok? (cx-check-pattern cx (pat (PCtor 0 (some 1) [(bind 3)])) s))
-                  (= (cx-zonk cx s) (ty-nominal 0 [(TVar 1)])) (= (bound cx 3) (TVar 1)))))
+      (is cs (and (ok? (cx-check-pattern cx (pat (PCtor 0 (some 1) [(bind 3)])) s))
+                  (= (cx-zonk cx s) (ty-nominal 0 [(TVar 1)])) (= (bound cx 3) (TVar 1))) "an enum variant's fields (Option's Some, variant 1)"))
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
-      (check cs "a field-less variant (None, variant 0) has no field patterns to check"
-             (and (ok? (cx-check-pattern cx (pat (PCtor 0 (some 0) [])) s))
-                  (= (cx-zonk cx s) (ty-nominal 0 [(TVar 1)])))))
+      (is cs (and (ok? (cx-check-pattern cx (pat (PCtor 0 (some 0) [])) s))
+                  (= (cx-zonk cx s) (ty-nominal 0 [(TVar 1)]))) "a field-less variant (None, variant 0) has no field patterns to check"))
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
-      (check cs "more sub-patterns than fields: the extras are not checked (Rust zip)"
-             (and (ok? (cx-check-pattern cx (pat (PCtor 0 (some 0) [(bind 8)])) s))
-                  (empty? @(. (. cx u) bindings)))))
+      (is cs (and (ok? (cx-check-pattern cx (pat (PCtor 0 (some 0) [(bind 8)])) s))
+                  (empty? @(. (. cx u) bindings))) "more sub-patterns than fields: the extras are not checked (Rust zip)"))
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
-      (check cs "the first error stops the sub-patterns"
-             (and (failed (cx-check-pattern cx (pat (PCtor 5 nil [(pat (PLit (LitBool true))) (bind 2)])) s)
+      (is cs (and (failed (cx-check-pattern cx (pat (PCtor 5 nil [(pat (PLit (LitBool true))) (bind 2)])) s)
                           Unify "cannot unify i64 with bool")
-                  (empty? @(. (. cx u) bindings)))))))
+                  (empty? @(. (. cx u) bindings))) "the first error stops the sub-patterns"))))
 
-(defun vec-tests (cs: Checks) -> unit
+(defun vec-tests (cs: StepLog) -> unit
   (do
     (let ((cx (fresh-cx)) (s (vec-of (cx-fresh cx))))
-      (check cs "a vector pattern against a Vec: every element at the element type"
-             (and (ok? (cx-check-pattern cx (pat (PVec [(bind 1) (pat (PLit (LitInt 0 I64)))] RestExact)) s))
-                  (= (bound cx 1) (ty-i64)) (same? cx s (vec-of (ty-i64))))))
+      (is cs (and (ok? (cx-check-pattern cx (pat (PVec [(bind 1) (pat (PLit (LitInt 0 I64)))] RestExact)) s))
+                  (= (bound cx 1) (ty-i64)) (same? cx s (vec-of (ty-i64)))) "a vector pattern against a Vec: every element at the element type"))
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
-      (check cs "a vector pattern with a rest against an unknown scrutinee: a Vec, the rest binds it"
-             (and (ok? (cx-check-pattern cx (pat (PVec [(bind 1)] (RestBind 2))) s))
+      (is cs (and (ok? (cx-check-pattern cx (pat (PVec [(bind 1)] (RestBind 2))) s))
                   (same? cx s (vec-of (TVar 1))) (same? cx (bound cx 2) (vec-of (TVar 1)))
-                  (same? cx (bound cx 1) (TVar 1)) (= (ndef cx) 0))))
+                  (same? cx (bound cx 1) (TVar 1)) (= (ndef cx) 0)) "a vector pattern with a rest against an unknown scrutinee: a Vec, the rest binds it"))
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
-      (check cs "without a rest an unknown scrutinee defers: a variable of its own per element"
-             (and (ok? (cx-check-pattern cx (pat (PVec [(bind 1) (bind 2)] RestIgnore)) s))
+      (is cs (and (ok? (cx-check-pattern cx (pat (PVec [(bind 1) (bind 2)] RestIgnore)) s))
                   (= (cx-zonk cx s) s) (= (ndef cx) 1) (= (bound cx 1) (TVar 1)) (= (bound cx 2) (TVar 2))
                   (match (. (nth @(. (. cx u) deferred) 0) kind)
                     ((DkVecPat sc parts) (and (= sc s) (= parts [(TVar 1) (TVar 2)])))
-                    (_ false)))))
+                    (_ false))) "without a rest an unknown scrutinee defers: a variable of its own per element"))
     (let ((cx (fresh-cx)))
-      (check cs "a vector pattern against a non-Vec: the unify error"
-             (failed (cx-check-pattern cx (pat (PVec [(bind 1)] RestExact)) (ty-i64)) Unify
-                     "cannot unify i64 with (Vec a)")))
+      (is cs (failed (cx-check-pattern cx (pat (PVec [(bind 1)] RestExact)) (ty-i64)) Unify
+                     "cannot unify i64 with (Vec a)") "a vector pattern against a non-Vec: the unify error"))
     (let ((cx (cx-of (world-without-vec))) (s (cx-fresh cx)))
-      (check cs "a vector pattern needs the prelude's Vec"
-             (failed (cx-check-pattern cx (pat (PVec [(bind 1)] (RestBind 2))) s) Other
-                     "vector patterns need the prelude's Vec")))
+      (is cs (failed (cx-check-pattern cx (pat (PVec [(bind 1)] (RestBind 2))) s) Other
+                     "vector patterns need the prelude's Vec") "a vector pattern needs the prelude's Vec"))
     (let ((cx (fresh-cx)) (s (pair-of (ty-i64) (ty-str))))
-      (check cs "a Pair: the fields in order, each at its type"
-             (and (ok? (cx-check-pattern cx (pat (PVec [(bind 1) (bind 2)] RestExact)) s))
-                  (= (bound cx 1) (ty-i64)) (= (bound cx 2) (ty-str)))))
+      (is cs (and (ok? (cx-check-pattern cx (pat (PVec [(bind 1) (bind 2)] RestExact)) s))
+                  (= (bound cx 1) (ty-i64)) (= (bound cx 2) (ty-str))) "a Pair: the fields in order, each at its type"))
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
-      (check cs "a Pair once known: the let's tail `& _` takes nothing"
-             (and (ok? (cx-check-pattern cx (pat (PVec [(bind 1) (bind 2)] RestIgnore)) (pair-of s s)))
-                  (same? cx (bound cx 1) s))))
+      (is cs (and (ok? (cx-check-pattern cx (pat (PVec [(bind 1) (bind 2)] RestIgnore)) (pair-of s s)))
+                  (same? cx (bound cx 1) s)) "a Pair once known: the let's tail `& _` takes nothing"))
     (let ((cx (fresh-cx)) (s (ty-nominal 4 [(ty-i64) (ty-i64) (ty-i64)])))
-      (check cs "a Triple with too few elements"
-             (failed (cx-check-pattern cx (pat (PVec [(bind 1) (bind 2)] RestExact)) s) Other
-                     "a vector pattern of a Triple takes exactly its 3 field(s) and no rest, the pattern has 2 element(s)")))
+      (is cs (failed (cx-check-pattern cx (pat (PVec [(bind 1) (bind 2)] RestExact)) s) Other
+                     "a vector pattern of a Triple takes exactly its 3 field(s) and no rest, the pattern has 2 element(s)") "a Triple with too few elements"))
     (let ((cx (fresh-cx)) (s (pair-of (ty-i64) (ty-i64))))
-      (check cs "a Pair with a rest binding"
-             (failed (cx-check-pattern cx (pat (PVec [(bind 1) (bind 2)] (RestBind 3))) s) Other
-                     "a vector pattern of a Pair takes exactly its 2 field(s) and no rest, the pattern has 2 element(s)")))
+      (is cs (failed (cx-check-pattern cx (pat (PVec [(bind 1) (bind 2)] (RestBind 3))) s) Other
+                     "a vector pattern of a Pair takes exactly its 2 field(s) and no rest, the pattern has 2 element(s)") "a Pair with a rest binding"))
     (let ((cx (fresh-cx)) (s (ty-nominal 6 [(ty-i64) (ty-i64)])))
-      (check cs "main's own Pair is not a tuple: it is not a Vec"
-             (failed (cx-check-pattern cx (pat (PVec [(bind 1)] RestExact)) s) Unify
-                     "cannot unify (Pair i64 i64) with (Vec a)")))))
+      (is cs (failed (cx-check-pattern cx (pat (PVec [(bind 1)] RestExact)) s) Unify
+                     "cannot unify (Pair i64 i64) with (Vec a)") "main's own Pair is not a tuple: it is not a Vec"))))
 
-(defun close-tests (cs: Checks) -> unit
+(defun close-tests (cs: StepLog) -> unit
   (do
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
       (do (cx-check-pattern cx (pat (PVec [(bind 1) (bind 2)] RestIgnore)) s)
-          (check cs "a vector pattern still unknown at the close of the unit is a Vec's"
-                 (and (match (cx-close cx []) ((Ok _) true) (_ false))
+          (is cs (and (match (cx-close cx []) ((Ok _) true) (_ false))
                       (same? cx s (vec-of (TVar 1))) (same? cx (bound cx 1) (bound cx 2))
-                      (= (ndef cx) 0)))))
+                      (= (ndef cx) 0)) "a vector pattern still unknown at the close of the unit is a Vec's")))
     (let ((cx (fresh-cx)) (s (cx-fresh cx)))
       (do (cx-check-pattern cx (pat (PVec [(bind 1)] RestIgnore)) s)
           (cx-unify cx s (pair-of (ty-i64) (ty-i64)) p0)
-          (check cs "or a tuple's, if the scrutinee became one: the arity error is at the pattern"
-                 (match (cx-close cx [])
+          (is cs (match (cx-close cx [])
                    ((Err e) (and (= (. e kind) Other)
                                  (= (. e message) "a vector pattern of a Pair takes exactly its 2 field(s) and no rest, the pattern has 1 element(s)")))
-                   (_ false)))))))
+                   (_ false)) "or a tuple's, if the scrutinee became one: the arity error is at the pattern")))))
 
 ;; The deferred `[p..]` is solved by the worklist once the scrutinee is known.
-(defun deferred-tests (cs: Checks) -> unit
+(defun deferred-tests (cs: StepLog) -> unit
   (let ((cx (fresh-cx)) (s (cx-fresh cx)))
     (do (cx-check-pattern cx (pat (PVec [(bind 1) (bind 2)] RestIgnore)) s)
         (cx-unify cx s (vec-of (ty-str)) p0)
-        (check cs "solve_all settles a deferred vector pattern once the scrutinee is a Vec"
-               (and (ok? (cx-solve-all cx)) (= (ndef cx) 0)
-                    (= (bound cx 1) (ty-str)) (= (bound cx 2) (ty-str)))))))
+        (is cs (and (ok? (cx-solve-all cx)) (= (ndef cx) 0)
+                    (= (bound cx 1) (ty-str)) (= (bound cx 2) (ty-str))) "solve_all settles a deferred vector pattern once the scrutinee is a Vec"))))
 
-(defun ann-tests (cs: Checks) -> unit
+(defun ann-tests (cs: StepLog) -> unit
   (do
     (let ((g (world)))
       (do (table-add (. g bindings) (BindingInfo "x" BkLet p0 nil))
           (table-add (. g bindings) (BindingInfo "y" BkLet p0 (some (AScalar SI32))))
           (table-add (. g bindings) (BindingInfo "z" BkLet p0 (some (AVar "a"))))
           (let ((cx (cx-of g)))
-            (do (check cs "binding_ann: none without an annotation, the type with one"
-                       (and (ann-is (cx-binding-ann cx 0 p0) nil)
-                            (ann-is (cx-binding-ann cx 1 p0) (some (ty-scalar SI32)))))
-                (check cs "binding_ann: a named variable is the unit's rigid one"
-                       (and (ann-is (cx-binding-ann cx 2 p0) (some (TRigid 0)))
-                           (= @(. (. cx u) rigid-names) ["a"])))
+            (do (is cs (and (ann-is (cx-binding-ann cx 0 p0) nil)
+                            (ann-is (cx-binding-ann cx 1 p0) (some (ty-scalar SI32)))) "binding_ann: none without an annotation, the type with one")
+                (is cs (and (ann-is (cx-binding-ann cx 2 p0) (some (TRigid 0)))
+                           (= @(. (. cx u) rigid-names) ["a"])) "binding_ann: a named variable is the unit's rigid one")
                 (let ((v (cx-fresh cx)))
-                  (check cs "let_binding_type: an unannotated variable keeps the initialiser's type"
-                         (ok-is (cx-let-binding-type cx (bind 0) v p0) v)))
-                (check cs "let_binding_type: an annotated one is the annotation, the initialiser flows into it"
-                       (let ((v (cx-fresh cx)))
+                  (is cs (ok-is (cx-let-binding-type cx (bind 0) v p0) v) "let_binding_type: an unannotated variable keeps the initialiser's type"))
+                (is cs (let ((v (cx-fresh cx)))
                          (and (ok-is (cx-let-binding-type cx (bind 1) v p0) (ty-scalar SI32))
-                              (= (cx-zonk cx v) (ty-scalar SI32)))))
-                (check cs "let_binding_type: the mismatch is at the given position"
-                       (match (cx-let-binding-type cx (bind 1) (ty-str) p0)
+                              (= (cx-zonk cx v) (ty-scalar SI32)))) "let_binding_type: an annotated one is the annotation, the initialiser flows into it")
+                (is cs (match (cx-let-binding-type cx (bind 1) (ty-str) p0)
                          ((Err e) (and (= (. e kind) Unify) (= (. e message) "cannot unify str with i32")))
-                         (_ false)))
-                (check cs "let_binding_type: any other pattern is the initialiser's type"
-                       (ok-is (cx-let-binding-type cx (pat PWild) (ty-str) p0) (ty-str)))))))))
+                         (_ false)) "let_binding_type: the mismatch is at the given position")
+                (is cs (ok-is (cx-let-binding-type cx (pat PWild) (ty-str) p0) (ty-str)) "let_binding_type: any other pattern is the initialiser's type")))))))
+
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
+    (do (simple-tests cs) (ctor-tests cs) (vec-tests cs) (close-tests cs) (deferred-tests cs) (ann-tests cs)
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-pattern" [(test-case "checks" unit-steps "compiler/tests/types/unit-pattern.fib")]))
 
 (defun main () -> i64
-  (let ((cs (checks-new)))
-    (do (simple-tests cs) (ctor-tests cs) (vec-tests cs) (close-tests cs) (deferred-tests cs) (ann-tests cs)
-        (finish cs))))
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

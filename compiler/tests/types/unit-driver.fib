@@ -5,9 +5,10 @@
 ;; `:use`s before the implicit modules. `lower-modules` and `check-source` run the whole
 ;; of lowering, which is judged by `compare.sh` (the stubs of P3 to P5 trap until then).
 ;; Build: fibc build compiler/tests/types/unit-driver.fib -I compiler -I lib -o OUT
-(ns main
+(ns tests.types.unit-driver
   (:require [types.driver :as d] [types.init :as init] [expand.types :as ex])
-  (:use syntax.pos syntax.form types.error types.table types.decls types.check))
+  (:use syntax.pos syntax.form types.error types.table types.decls fib.test.unit)
+  (:require [fib.test.run :as test-runner]))
 
 (defun spec (ns: str requires: (Vec ex/Require) uses: (Vec str) exports: (Vec str) implicit: (Vec str))
     -> ex/ModuleSpec
@@ -30,39 +31,37 @@
     ((Ok _) "ok")
     ((Err es) (str-join [(show (count es)) ":" (. (nth es 0) message) "@" (. (. (nth es 0) pos) file)]))))
 
-(defun main () -> i64
-  (let ((cs (checks-new))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec))
         (ids (assoc (map-empty) "a" 2))
         (form (Stx (SSym "x") (Pos "t.fib" 3 1 20 21))))
     (do
       (let ((g (base))
             (r (d/add-linked g (spec "m" [(ex/Require "x" "a")] ["a"] ["a"] ["a"]) ids [form])))
-        (do (check cs "a linked module gets the next id" (= (id-of r) 3))
+        (do (is cs (= (id-of r) 3) "a linked module gets the next id")
             (let ((m (g-module g 3)))
-              (do (check cs "its chain is itself, its uses, its implicit, the prelude, the builtins"
-                         (= (. m chain) [3 2 2 1 0]))
-                  (check cs "its uses and re-exports" (and (= (. m uses) [2]) (= (. m reexports) [2])))
-                  (check cs "its aliases are the implicit modules, the requires and the uses by name"
-                         (and (= (get (. m aliases) "x") (some 2)) (= (get (. m aliases) "a") (some 2))))))))
+              (do (is cs (= (. m chain) [3 2 2 1 0]) "its chain is itself, its uses, its implicit, the prelude, the builtins")
+                  (is cs (and (= (. m uses) [2]) (= (. m reexports) [2])) "its uses and re-exports")
+                  (is cs (and (= (get (. m aliases) "x") (some 2)) (= (get (. m aliases) "a") (some 2))) "its aliases are the implicit modules, the requires and the uses by name")))))
       (let ((g (base)))
-        (do (check cs "a use that is not loaded is an error at the first form"
-                   (= (message (d/add-linked g (spec "m" [] ["zz"] [] []) ids [form]))
-                      "1:module zz is not loaded@t.fib"))
-            (check cs "with no form the error is at the builtins"
-                   (= (message (d/add-linked g (spec "m" [] ["zz"] [] []) ids []))
-                      "1:module zz is not loaded@<builtin>"))
-            (check cs "the requires are read before the uses"
-                   (= (message (d/add-linked g (spec "m" [(ex/Require "x" "q")] ["zz"] [] ["yy"]) ids [form]))
-                      "1:module q is not loaded@t.fib"))
-            (check cs "the uses are read before the implicit modules"
-                   (= (message (d/add-linked g (spec "m" [] ["zz"] [] ["yy"]) ids [form]))
-                      "1:module zz is not loaded@t.fib"))
-            (check cs "an implicit module that is not loaded"
-                   (= (message (d/add-linked g (spec "m" [] [] [] ["yy"]) ids [form]))
-                      "1:module yy is not loaded@t.fib"))
-            (check cs "an export that is not loaded is skipped"
-                   (= (id-of (d/add-linked g (spec "m" [] [] ["nope"] []) ids [form])) 3))
-            (check cs "a failed add does not add a module" (= (table-count (. g modules)) 4))))
-      (check cs "builtin-pos is the builtins' position"
-             (let ((p (init/builtin-pos))) (and (= (. p file) "<builtin>") (= (. p line) 0) (= (. p col) 0))))
-      (finish cs))))
+        (do (is cs (= (message (d/add-linked g (spec "m" [] ["zz"] [] []) ids [form]))
+                      "1:module zz is not loaded@t.fib") "a use that is not loaded is an error at the first form")
+            (is cs (= (message (d/add-linked g (spec "m" [] ["zz"] [] []) ids []))
+                      "1:module zz is not loaded@<builtin>") "with no form the error is at the builtins")
+            (is cs (= (message (d/add-linked g (spec "m" [(ex/Require "x" "q")] ["zz"] [] ["yy"]) ids [form]))
+                      "1:module q is not loaded@t.fib") "the requires are read before the uses")
+            (is cs (= (message (d/add-linked g (spec "m" [] ["zz"] [] ["yy"]) ids [form]))
+                      "1:module zz is not loaded@t.fib") "the uses are read before the implicit modules")
+            (is cs (= (message (d/add-linked g (spec "m" [] [] [] ["yy"]) ids [form]))
+                      "1:module yy is not loaded@t.fib") "an implicit module that is not loaded")
+            (is cs (= (id-of (d/add-linked g (spec "m" [] [] ["nope"] []) ids [form])) 3) "an export that is not loaded is skipped")
+            (is cs (= (table-count (. g modules)) 4) "a failed add does not add a module")))
+      (is cs (let ((p (init/builtin-pos))) (and (= (. p file) "<builtin>") (= (. p line) 0) (= (. p col) 0))) "builtin-pos is the builtins' position")
+      (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-driver" [(test-case "checks" unit-steps "compiler/tests/types/unit-driver.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

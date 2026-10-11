@@ -5,7 +5,8 @@
 ;; --sections ast,error`, ids relative to the first of `f`, made by lower-body-gen.py), compared
 ;; line by line. Run from the repository root.
 ;; Build: fibc build compiler/tests/types/unit-lower-expr.fib -I compiler -I lib -o OUT
-(ns main (:use fib.string syntax.pos types.check tests.types.lower-support tests.types.lower-body-support))
+(ns tests.types.unit-lower-expr (:use fib.string syntax.pos fib.test.unit tests.types.lower-support tests.types.lower-body-support)
+  (:require [fib.test.run :as test-runner]))
 
 (def case-names: (Vec str)
   ["amp" "async" "async-empty" "atoms" "body-many" "concat" "convert" "do-empty" "do-one" "dyn"
@@ -19,16 +20,23 @@
    "err-vec-amp-pair" "err-vec-rest" "if-one-armed" "if-chain" "if-chain-else" "and" "or"
    "and-or-edge" "not" "elided"])
 
-(defun case (cs: Checks name: str) -> unit
+(defun case (cs: StepLog name: str) -> unit
   (let ((got (case-lines name))
         (want (lines-of (file-text (str-join [body-dir name ".out"])))))
     (if (= got want)
-        (check cs (str-join ["case " name " (" (show (count want)) " lines)"]) true)
-        (do (check cs (str-join ["case " name]) false)
+        (is cs true (str-join ["case " name " (" (show (count want)) " lines)"]))
+        (do (is cs false (str-join ["case " name]))
             (println (str-join ["  want: " (join "\n        " want)]))
             (println (str-join ["  got:  " (join "\n        " got)]))))))
 
-(defun main () -> i64
-  (let ((cs (checks-new)))
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
     (do (run! (fn (n: str) (case cs n)) case-names)
-        (finish cs))))
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-lower-expr" [(test-case "checks" unit-steps "compiler/tests/types/unit-lower-expr.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))
