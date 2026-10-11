@@ -1,0 +1,41 @@
+;; One context per native build: scratch, binary identities, target and counters.
+(ns native.liro.context
+  (:use native.error)
+  (:require [native.liro.io :as io] [native.liro.hash :as hash] [native.timing :as timing]
+            [native.target :as target] [llvm.target :as lt] [fib.os :as os]))
+
+(defstruct LiroContext (scratch: str cache: str contract: str hits: (Cell i64) misses: (Cell i64) compiled: (Cell i64) libraries: (Vec str)))
+(defun error-result (r: (Result a str)) -> (Result a LairError)
+  (match r ((Ok v) (Ok v)) ((Err e) (Err (ErrBackend (str "liro: " e))))))
+(defun option (name: str) -> str (unwrap-or (sys-getenv name) ""))
+(defun cache-root () -> str
+  (let ((configured (option "FIB_LIRO_CACHE")))
+    (cond (= configured "off") ""
+          (not (= configured "")) configured
+          (not (= (option "XDG_CACHE_HOME") "")) (str (option "XDG_CACHE_HOME") "/fibber/liro")
+          (not (= (option "HOME") "")) (str (option "HOME") "/.cache/fibber/liro")
+          :else "")))
+(defun setting-lines (names: (Vec str)) -> str
+  (str-join (mapv (fn (n: str) (let ((v (option n))) (str n "=" (str-len v) ":" v "\n"))) names)))
+
+(defun context-new (opt: i64) -> (Result LiroContext LairError)
+  (let ((cache (cache-root)))
+    (try-let [scratch (error-result (io/temporary (if (= cache "") (os/temp-directory) cache)))]
+      (match (context-initialize opt cache scratch)
+        ((Ok c) (Ok c))
+        ((Err e) (do (io/remove-tree scratch) (Err e)))))))
+
+(defun context-initialize :private (opt: i64 cache: str scratch: str) -> (Result LiroContext LairError)
+    (try-let [identity (error-result (hash/backend-identity scratch))
+              host (target/machine-target opt)]
+      (let ((contract (str "liro-schema=1\n" identity "triple=" (. host triple) "\nlayout=" (. host data-layout)
+                           "\nopt=" opt "\nhost-cpu=" (lt/host-cpu-name) "\nhost-features=" (lt/host-features) "\n"
+                           "relocation=pic\npipeline=default<O" opt ">\n"
+                           (setting-lines ["FIB_TARGET_CPU" "FIB_TARGET_TRIPLE" "FIB_TARGET_FEATURES" "FIB_VECTOR_BITS" "FIB_CATCH" "FIB_LIRO_MODE"]))))
+        (do (target/machine-dispose host)
+            (Ok (LiroContext scratch cache contract (cell 0) (cell 0) (cell 0) []))))))
+
+(defun context-close (c: LiroContext) -> unit
+  (do (when (= (sys-getenv "FIB_LIRO_STATS") (some "1"))
+        (eprintln (str "liro: hits=" @(. c hits) " misses=" @(. c misses) " compiled=" @(. c compiled))))
+      (io/remove-tree (. c scratch))))

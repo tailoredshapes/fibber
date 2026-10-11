@@ -6,7 +6,9 @@
 
 (ns native.api
   (:use lir.ast native.error native.jit native.aot)
-  (:require [native.pipeline :as pipe] [native.link :as link] [native.kernel :as kernel] [native.wgsl :as wgsl] [native.target :as target] [types.targets :as tt]))
+  (:require [native.pipeline :as pipe] [native.link :as link] [native.kernel :as kernel] [native.wgsl :as wgsl] [native.target :as target] [types.targets :as tt]
+            [native.liro.build :as liro] [native.liro.file :as liro-file]
+            [native.liro.link :as liro-link] [native.libraries :as libraries] [native.timing :as timing]))
 
 
 (defstruct Jit (session: JitSession))
@@ -84,9 +86,13 @@
   (cond (= path "") (Err "path is empty")
         :else (match (level-check opt)
                 ((Err m) (Err m))
-                ((Ok l) (match (pipe/for-executable src)
+                ((Ok l) (match (checked-executable src)
                           ((Err e) (Err (lair-error-str e)))
-                          ((Ok m) (unit-result (aot-build-executable m path path (AotOptions l libs dirs)))))))))
+                          ((Ok m) (unit-result (liro/build-executable m path path (AotOptions l libs dirs)))))))))
+
+(defun checked-executable :private (src: str) -> (Result LModule LairError)
+  (let ((t (timing/started)) (r (pipe/for-executable src)))
+    (do (timing/report "lir.check" t) r)))
 
 ;; The output of `--emit KIND` (obj, asm, llvm; ptx is asm on a kernel target, whose assembly is PTX, and nothing elsewhere; wgsl is the WebGPU
 ;; kernel target's own printer, `emit-wgsl`, and never LLVM's).
@@ -124,7 +130,19 @@
 ;; Compiles the module `src`, which must satisfy the `main` rule, to an object, assembly or LLVM IR (`kind`) written to `path`, for the target of
 ;; FIB_TARGET_TRIPLE (else the host); links nothing. On a kernel target the module is the program's kernels and the assembly is PTX. (`fibc build --emit`)
 (defun emit-file (src: str path: str opt: i64 kind: str) -> (Result unit str)
-  (if (= kind "wgsl") (emit-wgsl src path) (emit-llvm-file src path opt kind)))
+  (cond (= kind "wgsl") (emit-wgsl src path)
+        (= kind "liro") (try-let [_ (level-check opt)
+                                   _ (if (target/cross-target?) (Err "--emit liro initially supports the native host") (Ok ()))
+                                   m (match (pipe/check-source src) ((Ok v) (Ok v)) ((Err e) (Err (lair-error-str e))))
+                                   libs (libraries/lib-words (libraries/declared-libs src))]
+                         (unit-result (liro-file/export-file m path opt libs)))
+        :else (emit-llvm-file src path opt kind)))
+
+(defun link-objects (objects: (Vec str) out: str opt: i64 libs: (Vec str) dirs: (Vec str)) -> (Result unit str)
+  (try-let [_ (level-check opt)
+            _ (if (target/cross-target?) (Err "liro linking initially supports the native host") (Ok ()))
+            _ (if (or (= out "") (empty? objects)) (Err "liro linking needs objects and an output path") (Ok ()))]
+    (unit-result (liro-link/link-files objects out (AotOptions opt libs dirs)))))
 
 (defun emit-llvm-file :private (src: str path: str opt: i64 kind: str) -> (Result unit str)
   (try-let [l (level-check opt)

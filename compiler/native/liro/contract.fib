@@ -1,0 +1,38 @@
+;; A unit's interface includes calling conventions and transitively needed layouts.
+(ns native.liro.contract
+  (:use lir.ast lir.types)
+  (:require [native.liro.partition :as part] [lir.print :as print]))
+
+(defun interface (m: LModule) -> str
+  (print/print-module (LModule (mapv part/declaration (. m items)))))
+
+(defun exports (m: LModule) -> (Vec str)
+  (vec (sort (mapv part/symbol-name (filter part/defined? (. m items))))))
+
+;; Partitions originate in one checked program. Joining their interfaces checks
+;; that a declaration still agrees with its selected owner, before invoking cc.
+(defun same-abi? (a: LItem b: LItem) -> bool
+  (match [(part/declaration a) (part/declaration b)]
+    ([(ItDeclare x) (ItDeclare y)] (= (. x ty) (. y ty)))
+    ([(ItDeclareGlobal x) (ItDeclareGlobal y)] (= (. x ty) (. y ty)))
+    (_ false)))
+
+(defun validate-units (original: LModule units: (Vec LModule)) -> (Result unit str)
+  (let ((owners (cell (map-empty))) (fault (cell ""))
+        (expected (set (exports original))))
+    (do (doseq [m units]
+          (doseq [it (. m items)]
+            (when (part/defined? it)
+              (let ((n (part/symbol-name it)))
+                (do (when (contains? @owners n) (set! fault (str "duplicate liro owner: " n)))
+                    (set! owners (assoc @owners n it)))))))
+        (doseq [n (vec expected)]
+          (when (not (contains? @owners n)) (set! fault (str "missing liro owner: " n))))
+        (doseq [m units]
+          (doseq [it (. m items)]
+            (when (not (part/defined? it))
+              (match (get @owners (part/symbol-name it))
+                (nil ())
+                ((some owner) (when (not (same-abi? it owner))
+                                (set! fault (str "incompatible liro import: " (part/symbol-name it)))))))))
+        (if (= @fault "") (Ok ()) (Err @fault)))))

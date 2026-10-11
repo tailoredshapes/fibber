@@ -18,7 +18,7 @@ ifeq ($(FIB_PLATFORM),darwin-arm64)
 else
   RELEASE_CPU ?= x86-64-v3
 endif
-release_build = FIB_TARGET_CPU=$(RELEASE_CPU) $(1) build compiler/fibc.fib $(BUILD_ARGS) $(RELEASE_LLVM_ARGS) -o $(2)
+release_build = FIB_LIRO_CACHE=off FIB_TARGET_CPU=$(RELEASE_CPU) $(1) build compiler/fibc.fib $(BUILD_ARGS) $(RELEASE_LLVM_ARGS) -o $(2)
 release_emit = FIB_TARGET_CPU=$(RELEASE_CPU) $(1) emit $(BUILD_ARGS) compiler/fibc.fib
 
 $(RELEASE_DIR)/F: $(COMPILER_SRC) $(BUILDER) $(RELEASE_LLVM_DEP) $(BUILD)/version.ok | $(RELEASE_DIR)/

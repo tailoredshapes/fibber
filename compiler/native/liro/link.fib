@@ -1,0 +1,44 @@
+;; Validate independently supplied interfaces before the platform linker runs.
+(ns native.liro.link
+  (:use native.error native.liro.context lir.ast)
+  (:require [native.liro.file :as file] [native.liro.contract :as contract]
+            [native.liro.partition :as part] [native.link :as link]
+            [native.aot :as aot] [native.timing :as timing]))
+
+(defun read-all (c: LiroContext paths: (Vec str)) -> (Result (Vec file/LiroFile) str)
+  (loop ((i 0) (out []))
+    (if (= i (count paths)) (Ok out)
+        (try-let [f (file/read-artifact c (nth paths i) i)] (recur (+ i 1) (conj out f))))))
+
+(defun compatible (files: (Vec file/LiroFile)) -> (Result unit str)
+  (let ((owners (cell (map-empty))) (layouts (cell (map-empty))) (fault (cell "")))
+    (do (doseq [f files]
+          (doseq [it (. (. f interface) items)]
+            (let ((n (part/symbol-name it)))
+              (do (when (contains? (set (. f exports)) n)
+                    (do (when (contains? @owners n) (set! fault (str "duplicate liro owner: " n)))
+                        (set! owners (assoc @owners n it))))
+                  (match it
+                    ((ItStruct s) (do (match (get @layouts (. s name))
+                                        ((some fields) (when (not (= fields (. s fields))) (set! fault (str "incompatible liro layout: " (. s name)))))
+                                        (nil ()))
+                                      (set! layouts (assoc @layouts (. s name) (. s fields)))))
+                    (_ ()))))))
+        (doseq [f files]
+          (doseq [n (. f exports)]
+            (when (not (contains? @owners n)) (set! fault (str "missing liro export: " n))))
+          (doseq [it (. (. f interface) items)]
+            (match (get @owners (part/symbol-name it))
+              ((some owner) (when (not (contract/same-abi? it owner)) (set! fault (str "incompatible liro ABI: " (part/symbol-name it)))))
+              (nil ()))))
+        (if (= @fault "") (Ok ()) (Err @fault)))))
+
+(defun link-files (paths: (Vec str) out: str opts: aot/AotOptions) -> (Result unit LairError)
+  (try-let [dirs (aot/library-dirs (. opts lib-dirs)) c (context-new (. opts opt-level))]
+    (let ((result (try-let [files (error-result (read-all c paths))
+                            _ (error-result (compatible files))]
+                    (let ((t (timing/started))
+                          (libs (distinct (into (. opts libs) (mapcat (fn (f: file/LiroFile) (. f libraries)) files))))
+                          (r (link/link-paths (mapv (fn (f: file/LiroFile) (. f path)) files) out dirs (vec libs))))
+                      (do (timing/report "link" t) r)))))
+      (do (context-close c) result))))

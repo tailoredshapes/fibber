@@ -1,0 +1,44 @@
+;; LIRO filesystem operations. Entries are directories published by one rename.
+(ns native.liro.io
+  (:require [fib.os :as os] [native.link :as writer] [llvm.ffi :as ffi]))
+(extern link :private (ptr ptr) -> i32)
+
+(defun os-message (e: os/OSError) -> str (str (. e operation) ": " (. e message)))
+(defun io-result (r: (Result a os/OSError)) -> (Result a str)
+  (match r ((Ok v) (Ok v)) ((Err e) (Err (os-message e)))))
+
+(defun directory? (p: str) -> bool (match (os/list-directory p) ((Ok _) true) ((Err _) false)))
+(defun parent-of (p: str) -> str
+  (loop ((i (- (str-len p) 1)))
+    (cond (< i 0) "" (= (str-byte-at p i) 47i8) (str-slice p 0 (max 1 i)) :else (recur (- i 1)))))
+(defun mkdirs (p: str) -> (Result unit str)
+  (cond (or (= p "") (= p "/") (directory? p)) (Ok ())
+        :else (let ((parent (parent-of p)))
+                (try-let [_ (mkdirs parent)]
+                  (match (os/create-directory p 448)
+                    ((Ok _) (Ok ()))
+                    ((Err e) (if (directory? p) (Ok ()) (Err (os-message e)))))))))
+
+(defun temporary (parent: str) -> (Result str str)
+  (try-let [_ (mkdirs parent)] (io-result (os/create-temp-directory (str parent "/.liro-XXXXXX")))))
+
+(defun remove-tree (p: str) -> unit
+  (do (match (os/list-directory p)
+        ((Err _) (os/remove-file p))
+        ((Ok es) (do (doseq [e es]
+                       (let ((child (str p "/" (. e name))))
+                         (if (= (. e kind) os/Directory) (remove-tree child) (do (os/remove-file child) ()))))
+                     (os/remove-directory p))))
+      ()))
+
+(defun write-text (p: str text: str) -> (Result unit str)
+  (writer/write-bytes p (str-bytes text)))
+(defun rename (from: str to: str) -> (Result unit str) (io-result (os/rename-file from to)))
+
+;; A build owns a hard link before validation, so replacement of a corrupt entry
+;; cannot remove an object another build is about to link.
+(defun snapshot (from: str to: str) -> (Result unit str)
+  (let ((a (ffi/bytes-new from)) (b (ffi/bytes-new to))
+        (r (unsafe (link a b))))
+    (do (ffi/free-addr (ffi/ptr->addr a)) (ffi/free-addr (ffi/ptr->addr b))
+        (if (= r 0i32) (Ok ()) (Err "cannot snapshot liro object")))))

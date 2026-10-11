@@ -55,6 +55,7 @@ then ship a tested file-processing command. The short tutorial below is a tour.
 
 - [Design index](design/README.md): dated proposals and implementation evidence.
 - [ADRs](adr/0001-task-traps-are-isolated-at-the-thread-entry.md): executable architecture decisions.
+- [Compiled lIR objects](adr/0024-compiled-lir-objects-are-reused-and-linked-into-one-executable.md): proposed native-object caching and linking into one executable.
 - [Specification](../spec/syntax.md): normative rules; stdlib planning rows are labelled.
 - [History/source map](history/source-map.md), [Rust retirement](rust-legacy.md).
 - [Examples](../examples/README.md), [contributing](../CONTRIBUTING.md).

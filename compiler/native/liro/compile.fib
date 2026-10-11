@@ -1,0 +1,46 @@
+;; Verified lIR -> immutable native object. Lowering/optimization run only on a miss.
+(ns native.liro.compile
+  (:use lir.ast native.error native.liro.context)
+  (:require [lir.check :as check] [lir.print :as print] [native.aot :as aot]
+            [native.liro.io :as io] [native.liro.hash :as hash] [native.liro.artifact :as artifact]
+            [native.timing :as timing] [native.link :as link] [native.liro.contract :as contract]
+            [fib.json :as json]))
+
+(defun inputs (c: LiroContext m: LModule) -> str
+  (json/write (json/JObj ["settings" "interface" "exports" "binding" "libraries"]
+    [(json/JStr (. c contract)) (json/JStr (contract/interface m))
+     (json/JArr (mapv json/JStr (contract/exports m)))
+     (json/JStr "fully-specialized-lir; program tables and initialization have one owner")
+     (json/JArr (mapv json/JStr (. c libraries)))])))
+
+(defun module-text (m: LModule) -> str (print/print-module m))
+
+(defun checked (m: LModule) -> (Result unit LairError)
+  (match (check/check m) ((Ok _) (Ok ())) ((Err ds) (Err (ErrInvalid ds)))))
+
+(defun compile-miss (c: LiroContext m: LModule opt: i64 key: str contract: str) -> (Result str LairError)
+  (try-let [staged (error-result (io/temporary (. c scratch)))]
+    (let ((t (timing/started))
+          (result (do (set! (. c compiled) (+ @(. c compiled) 1))
+                      (aot/aot-emit m (str "liro-" key) aot/OutObject (aot/AotOptions opt [] [])))))
+      (do (timing/report "liro.compile" t)
+          (match result
+            ((Err e) (do (io/remove-tree staged) (Err e)))
+            ((Ok bytes)
+             (try-let [_ (error-result (link/write-bytes (artifact/object-path staged) bytes))
+                       _ (error-result (artifact/seal c staged key contract))
+                       _ (error-result (io/snapshot (artifact/object-path staged) (str (. c scratch) "/built-" key ".liro")))
+                       _ (error-result (artifact/publish c staged (str (. c cache) "/" key) key contract))]
+               (Ok (str (. c scratch) "/built-" key ".liro")))))))))
+
+(defun compile-object (c: LiroContext m: LModule opt: i64) -> (Result str LairError)
+  (try-let [_ (checked m)
+            contract (Ok (inputs c m))
+            key (error-result (hash/text-digest (str contract "\n" (print/print-module m)) (. c scratch)))]
+    (let ((entry (str (. c cache) "/" key)))
+      (match (if (= (. c cache) "") (Err "cache disabled") (artifact/snapshot-valid c entry key contract))
+        ((Ok path) (do (set! (. c hits) (+ @(. c hits) 1)) (Ok path)))
+        ((Err reason)
+         (do (set! (. c misses) (+ @(. c misses) 1))
+             (when (= (sys-getenv "FIB_LIRO_STATS") (some "1")) (eprintln (str "liro: miss " key " " reason)))
+             (compile-miss c m opt key contract)))))))

@@ -1,0 +1,15 @@
+;; Only publication is serialized. The OS releases flock when a writer dies.
+;; Lock files keep their inode: deleting one while a reader holds it splits locks.
+(ns native.liro.lock (:require [llvm.ffi :as ffi]))
+(extern creat :private (ptr i32) -> i32)
+(extern flock :private (i32 i32) -> i32)
+(extern close :private (i32) -> i32)
+
+(defun acquire (path: str) -> (Result i32 str)
+  (unsafe (let ((p (ffi/bytes-new path)) (fd (creat p 384i32)))
+    (do (free p)
+        (cond (< fd 0i32) (Err "cannot create liro publication lock")
+              (= (flock fd 2i32) 0i32) (Ok fd)
+              :else (do (close fd) (Err "cannot lock liro publication")))))))
+
+(defun release (fd: i32) -> unit (unsafe (do (flock fd 8i32) (close fd) ())))

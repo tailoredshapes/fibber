@@ -14,7 +14,7 @@ commands:
   run [--trace] [-O N] <file> [-- arg..]
                          compile file through the JIT and run its main; the
                          args after -- are (args)
-  build <file> -o <out> [-O N] [-L dir].. [-l lib].. [--emit obj|asm|llvm|ptx|wgsl|c]
+  build <file> -o <out> [-O N] [-L dir].. [-l lib].. [--emit liro|obj|asm|llvm|ptx|wgsl|c]
                         [--kernel-target TRIPLE|none]
                          (the options may come before the file too)
                          compile file to an executable; each -l lib links
@@ -41,6 +41,13 @@ that `targets` does not list as supported or a portability target (riscv64 is
 parked) unless --allow-unsupported is given (FIB_ALLOW_UNSUPPORTED=1)
 
 Build/link options (before --):
+  --cache-dir DIR        keep compiled lIR objects under DIR (FIB_LIRO_CACHE)
+  --no-cache             compile without reading or writing the object cache
+  --whole-program        optimize the program as one compilation unit
+  --cache-stats          report object hits, misses and backend compilations
+  --time                 report compilation phase timings on standard error
+                         --emit liro writes OUT and OUT.meta; build OUT.liro
+                         -o EXE validates and links the supplied object
   --static               link a static Linux executable with musl (FIB_MUSL_DIR)
   --link NAME=static|dynamic
                          choose the link mode of a declared native library; repeatable

@@ -4,7 +4,8 @@
 (ns native.cli
   (:require [fib.string :as s] [llvm.ffi :as ffi] [lir.parse :as parse] [lir.dump :as dump] [lir.diag :as diag] [native.pipeline :as pipe]
             [native.error :as err] [native.aot :as aot] [native.jit :as jit] [native.link :as link] [native.cases :as cases]
-            [native.cases.walk :as walk] [native.fuzz :as fuzz] [native.cases.header :as hdr] [native.call :as call])
+            [native.cases.walk :as walk] [native.fuzz :as fuzz] [native.cases.header :as hdr] [native.call :as call]
+            [native.liro.build :as liro] [native.liro.file :as liro-file] [native.api :as api] [native.libraries :as libraries])
   (:use lir.ast lir.types))
 
 (extern exit :private (i32) -> unit)
@@ -15,7 +16,8 @@
   lair [--target TRIPLE] ..     the target of check/build/emit-llvm: FIB_TARGET_TRIPLE (docs/design/aarch64.md); `build` then needs --emit
   lair check FILE.lir
   lair run [-O n] FILE.lir [ARGS..]
-  lair build FILE.lir -o OUT [-O n] [--emit obj|asm|llvm] [-L DIR].. [-l LIB]..
+  lair build FILE.lir -o OUT [-O n] [--emit liro|obj|asm|llvm] [-L DIR].. [-l LIB]..
+  lair link FILE.liro.. -o OUT [-O n] [-L DIR].. [-l LIB]..
   lair emit-llvm FILE.lir
   lair dump-ast FILE.lir
   lair cases DIR..
@@ -114,7 +116,7 @@
 ;; -------------------------------------------------------------------------------------------------- build
 
 ;; What `build` was asked for so far (cli.rs `build`'s locals).
-(defstruct BuildArgs (out: (Option str) opt: i64 emit: (Option aot/AotOutput) libs: (Vec str) dirs: (Vec str)))
+(defstruct BuildArgs (out: (Option str) opt: i64 emit: (Option aot/AotOutput) liro: bool libs: (Vec str) dirs: (Vec str)))
 
 (defun emit-kind :private (v: str) -> (Result aot/AotOutput str)
   (cond (= v "obj") (Ok aot/OutObject)
@@ -128,13 +130,14 @@
         (= flag "-O") (try-let [n (opt-level v)] (Ok (with b (opt n))))
         (= flag "-L") (Ok (with b (dirs (conj (. b dirs) v))))
         (= flag "-l") (Ok (with b (libs (conj (. b libs) v))))
-        :else (try-let [k (emit-kind v)] (Ok (with b (emit (some k)))))))
+        (= v "liro") (Ok (with b (liro true)))
+        :else (try-let [k (emit-kind v)] (Ok (with b (emit (some k)) (liro false))))))
 
 (defun build-flag? :private (a: str) -> bool
   (or (= a "-o") (= a "-O") (= a "-L") (= a "-l") (= a "--emit")))
 
 (defun parse-build :private (words: (Vec str)) -> (Result BuildArgs str)
-  (loop ((i 0) (b (BuildArgs nil 0 nil [] [])))
+  (loop ((i 0) (b (BuildArgs nil 0 nil false [] [])))
     (cond (>= i (count words)) (Ok b)
           (not (build-flag? (nth words i))) (Err (str "unknown option " (nth words i) "\n" usage))
           (>= (+ i 1) (count words)) (Err (str (nth words i) " needs a value"))
@@ -143,14 +146,26 @@
 
 (defun build-output :private (b: BuildArgs file: str src: str out: str) -> (Result unit str)
   (let ((opts (aot/AotOptions (. b opt) (. b libs) (. b dirs))))
+    (if (. b liro)
+      (try-let [m (rendered (pipe/check-source src) file)
+                libs (libraries/lib-words (libraries/declared-libs src))]
+        (rendered (liro-file/export-file m out (. b opt) libs) file))
     (match (. b emit)
       (nil (try-let [m (rendered (pipe/for-executable src) file)]
-             (rendered (aot/aot-build-executable m file out opts) file)))
+             (rendered (liro/build-executable m file out opts) file)))
       ((some kind) (try-let [m (rendered (pipe/check-source src) file)
                              bytes (rendered (aot/aot-emit m file kind opts) file)]
                      (match (link/write-bytes out bytes)
                        ((Err e) (Err (str out ": " e)))
-                       ((Ok _) (Ok ()))))))))
+                       ((Ok _) (Ok ())))))))))
+
+(defun link-cmd :private (rest: (Vec str)) -> (Result i64 str)
+  (let ((split (count (take-while (fn (s: str) (not (starts-with? s "-"))) rest))))
+    (try-let [b (parse-build (vec (drop split rest)))
+              out (match (. b out) ((some s) (Ok s)) (nil (Err "link needs -o OUT")))
+              _ (if (or (. b liro) (some? (. b emit))) (Err "link does not take --emit") (Ok ()))
+              _ (api/link-objects (vec (take split rest)) out (. b opt) (. b libs) (. b dirs))]
+      (Ok 0))))
 
 (defun build-cmd :private (rest: (Vec str)) -> (Result i64 str)
   (if (empty? rest)
@@ -241,6 +256,7 @@
         (cond (= cmd "check") (check-cmd rest)
               (= cmd "run") (run-cmd rest)
               (= cmd "build") (build-cmd rest)
+              (= cmd "link") (link-cmd rest)
               (= cmd "emit-llvm") (emit-llvm-cmd rest)
               (= cmd "dump-ast") (dump-ast-cmd rest)
               (= cmd "cases") (cases-cmd rest)

@@ -1,0 +1,76 @@
+;; Explicit artifacts are copied out of the cache. A damaged supplied pair is an
+;; error; unlike a cache entry it cannot be repaired without the checked source.
+(ns native.liro.file
+  (:use native.error native.liro.context lir.ast native.liro.deps)
+  (:require [native.liro.compile :as compile] [native.liro.artifact :as artifact]
+            [native.liro.hash :as hash] [native.liro.io :as io] [native.link :as link]
+            [native.liro.contract :as contract] [native.liro.partition :as part]
+            [fib.os :as os] [fib.json :as json] [lir.parse :as parse] [lir.diag :as diag]))
+
+(defstruct LiroFile (path: str interface: LModule exports: (Vec str) libraries: (Vec str)))
+(defun string-field (j: json/Json name: str) -> (Result str str)
+  (match (json/get-key j name) ((some (json/JStr s)) (Ok s)) (_ (Err (str "invalid liro field: " name)))))
+(defun json-read (s: str) -> (Result json/Json str)
+  (match (json/parse s) ((Ok j) (Ok j)) ((Err e) (Err (str "invalid liro manifest: " (. e message))))))
+
+(defun export-object (c: LiroContext m: LModule obj: str out: str) -> (Result unit str)
+  (try-let [bytes (io/io-result (os/read-file-bytes obj 1073741824))
+            digest (hash/file-digest obj (. c scratch))
+            key (hash/text-digest (str (compile/inputs c m) "\n" (lir-text m)) (. c scratch))
+            _ (link/write-bytes out bytes)
+            _ (io/write-text (str out ".meta") (artifact/manifest-text key (compile/inputs c m) digest))]
+    (Ok ())))
+
+(defun lir-text (m: LModule) -> str
+  ;; Kept in compile so the cache and exported artifact use precisely one key.
+  (compile/module-text m))
+
+(defun export-file (m: LModule out: str opt: i64 libraries: (Vec str)) -> (Result unit LairError)
+  (try-let [_ (error-result (binding-check m))
+            base (context-new opt) c (Ok (with base (libraries libraries)))]
+    (let ((result (match (compile/compile-object c m opt)
+                    ((Err e) (Err e))
+                    ((Ok obj) (error-result (export-object c m obj out))))))
+      (do (context-close c) result))))
+
+;; Backend cache units are chosen from a freshly emitted complete program.
+;; A standalone Fib artifact must own its tables; independently emitted ordinals
+;; cannot be combined as if they were an ABI for a precompiled Fib library.
+(defun binding-check (m: LModule) -> (Result unit str)
+  (let ((d (deps-new)) (own (set (contract/exports m))))
+    (do (doseq [it (. m items)] (item-deps d it))
+        (if (and (some? (find-first (fn (n: str) (or (starts-with? n "fib.") (starts-with? n "kw."))) (vec @(. d symbols))))
+                 (not (contains? own "fib.types")))
+            (Err "standalone liro using the Fib runtime must own its program type tables")
+            (Ok ())))))
+
+(defun read-artifact (c: LiroContext path: str i: i64) -> (Result LiroFile str)
+  (try-let [text (match (read-file (str path ".meta")) ((some s) (Ok s)) (nil (Err "missing liro manifest")))
+            meta (json-read text) key (string-field meta "key") digest (string-field meta "object")
+            inputs (string-field meta "inputs") fields (json-read inputs)
+            settings (string-field fields "settings") iface (string-field fields "interface")
+            _ (if (and (hash/hex? key) (hash/hex? digest) (= text (artifact/manifest-text key inputs digest)))
+                  (Ok ()) (Err "incompatible liro manifest format"))
+            _ (if (= settings (. c contract)) (Ok ()) (Err "incompatible liro target or backend settings"))
+            m (match (parse/parse-source iface) ((Ok x) (Ok x)) ((Err d) (Err (diag/diag-str d))))
+            names (string-list fields "exports") libraries (string-list fields "libraries")
+            _ (if (= inputs (json/write (json/JObj ["settings" "interface" "exports" "binding" "libraries"]
+                            [(json/JStr settings) (json/JStr iface) (json/JArr (mapv json/JStr names))
+                             (json/JStr "fully-specialized-lir; program tables and initialization have one owner")
+                             (json/JArr (mapv json/JStr libraries))])))
+                  (Ok ()) (Err "incompatible liro input contract"))
+            snapshot (Ok (str (. c scratch) "/supplied-" i ".liro"))
+            bytes (io/io-result (os/read-file-bytes path 1073741824))
+            _ (link/write-bytes snapshot bytes) actual (hash/file-digest snapshot (. c scratch))
+            _ (if (= actual digest) (Ok ()) (Err "corrupted liro object"))]
+    (Ok (LiroFile snapshot m names libraries))))
+
+(defun string-list (fields: json/Json name: str) -> (Result (Vec str) str)
+  (match (json/get-key fields name)
+    ((some (json/JArr names))
+     (loop ((i 0) (out []))
+       (if (= i (count names)) (Ok out)
+           (match (nth names i)
+             ((json/JStr n) (recur (+ i 1) (conj out n)))
+             (_ (Err (str "invalid liro " name)))))))
+    (_ (Err (str "missing liro " name)))))

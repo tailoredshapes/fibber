@@ -1,0 +1,61 @@
+;; A manifest is regenerated from the expected contract and object digest.
+;; Exact equality rejects unknown fields, truncation and changed compatibility data.
+(ns native.liro.artifact
+  (:use native.liro.context)
+  (:require [native.liro.hash :as hash] [native.liro.io :as io] [native.liro.lock :as lock]
+            [fib.json :as json]))
+
+(defun object-path (entry: str) -> str (str entry "/unit.liro"))
+(defun manifest-path (entry: str) -> str (str entry "/unit.liro.meta"))
+(defun manifest-text (key: str contract: str digest: str) -> str
+  (str (json/write (json/JObj ["format" "key" "object" "inputs"]
+       [(json/JInt 1) (json/JStr key) (json/JStr digest) (json/JStr contract)])) "\n"))
+
+(defun snapshot-valid (c: LiroContext entry: str key: str contract: str) -> (Result str str)
+  (let ((path (str (. c scratch) "/hit-" key ".liro")))
+    (try-let [_ (io/snapshot (object-path entry) path)
+              digest (hash/file-digest path (. c scratch))]
+      (if (= (read-file (manifest-path entry)) (some (manifest-text key contract digest))) (Ok path)
+          (do (sys-unlink path) (Err "incompatible or corrupted manifest/object"))))))
+
+(defun validate (c: LiroContext entry: str key: str contract: str) -> (Result unit str)
+  (match (read-file (manifest-path entry))
+    (nil (Err "missing manifest"))
+    ((some meta)
+     (try-let [digest (hash/file-digest (object-path entry) (. c scratch))]
+       (if (= meta (manifest-text key contract digest)) (Ok ()) (Err "incompatible or corrupted manifest/object"))))))
+
+(defun cached? (c: LiroContext entry: str key: str contract: str) -> bool
+  (if (= (. c cache) "") false
+      (match (validate c entry key contract)
+        ((Ok _) true)
+        ((Err _) false))))
+
+(defun seal (c: LiroContext staged: str key: str contract: str) -> (Result unit str)
+  (try-let [digest (hash/file-digest (object-path staged) (. c scratch))
+            _ (io/write-text (manifest-path staged) (manifest-text key contract digest))]
+    (Ok ())))
+
+;; An existing valid winner is reused. A damaged entry is quarantined by rename.
+(defun publish (c: LiroContext staged: str entry: str key: str contract: str) -> (Result str str)
+  (if (= (. c cache) "") (Ok (object-path staged))
+      (try-let [fd (lock/acquire (str (. c cache) "/lock-" key))]
+        (let ((result (publish-locked c staged entry key contract)))
+          (do (lock/release fd) result)))))
+
+(defun accept-winner (c: LiroContext staged: str entry: str) -> (Result str str)
+  (try-let [a (hash/file-digest (object-path staged) (. c scratch))
+            b (hash/file-digest (object-path entry) (. c scratch))]
+    (if (= a b) (do (io/remove-tree staged) (Ok (object-path entry)))
+        (Err "competing writers produced different liro objects"))))
+
+(defun publish-locked (c: LiroContext staged: str entry: str key: str contract: str) -> (Result str str)
+  (cond (cached? c entry key contract) (accept-winner c staged entry)
+        :else (do (when (io/directory? entry)
+                    (let ((bad (str (. c scratch) "/bad-" key)))
+                      (match (io/rename entry bad) ((Ok _) (io/remove-tree bad)) ((Err _) ()))))
+                  (match (io/rename staged entry)
+                    ((Ok _) (Ok (object-path entry)))
+                    ((Err e) (if (cached? c entry key contract)
+                                 (accept-winner c staged entry)
+                                 (Err e)))))))

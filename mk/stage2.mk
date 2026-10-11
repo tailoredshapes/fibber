@@ -28,11 +28,11 @@ runtime: $(RUNTIME_FIB) $(BUILD)/runtime-drift.ok   ## regenerate compiler/emit/
 # Stage 2: F, built by the seed (or BUILDER); F.lir is what F emits for itself; F3 is built by F; the fixed point is F.lir = F3.lir.
 $(F): $(COMPILER_SRC) $(BUILDER) $(LLVM_DEP) $(FRESH) | $(BUILD)/
 	rm -f $@ $(BUILD)/F3 $(BUILD)/F.lir $(BUILD)/F3.lir
-	t0=$$(date +%s); $(BUILDER) build compiler/fibc.fib $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $(BUILD)/F.log 2>&1 || { tail -n 20 $(BUILD)/F.log; exit 1; }; mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $(BUILD)/F.secs
+	t0=$$(date +%s); FIB_LIRO_CACHE=off $(BUILDER) build compiler/fibc.fib $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $(BUILD)/F.log 2>&1 || { tail -n 20 $(BUILD)/F.log; exit 1; }; mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $(BUILD)/F.secs
 $(BUILD)/F.lir: $(F)
 	$(F) emit $(BUILD_ARGS) compiler/fibc.fib > $@.new 2> $(BUILD)/F.lir.err && mv $@.new $@
 $(BUILD)/F3: $(F) $(LLVM_DEP)
-	$(F) build compiler/fibc.fib $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $(BUILD)/F3.log 2>&1 || { tail -n 20 $(BUILD)/F3.log; exit 1; }; mv $@.new $@
+	FIB_LIRO_CACHE=off $(F) build compiler/fibc.fib $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $(BUILD)/F3.log 2>&1 || { tail -n 20 $(BUILD)/F3.log; exit 1; }; mv $@.new $@
 $(BUILD)/F3.lir: $(BUILD)/F3
 	$(BUILD)/F3 emit $(BUILD_ARGS) compiler/fibc.fib > $@.new 2> $(BUILD)/F3.lir.err && mv $@.new $@
 $(BUILD)/fixed-point.ok: $(BUILD)/F.lir $(BUILD)/F3.lir

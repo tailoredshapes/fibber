@@ -44,6 +44,7 @@ tool_sh-fibref-heap-gold := $(T)/fibref/heap-gold.sh | $(wildcard $(T)/fibref/he
 tool_sh-native-h-checks := $(T)/native/h-checks.sh | $(wildcard $(T)/native/h-*) $(wildcard $(T)/native/h-cases/*)
 tool_jit-selfhosted-threads := $(T)/driver/jit-selfhosted.sh $(F_ABS) $(abspath $(BUILD)/F3) | $(T)/driver/jit-selfhosted.sh $(T)/driver/jit/threads.fib $(BUILD)/F3 $(wildcard rt/*.lir)
 tool_sh-native-l1-unit := $(T)/native/l1-unit.sh | $(wildcard $(T)/native/l1-*)
+tool_sh-native-liro := env LLVMLIB=$(LLVM_LIBDIR) bash $(T)/native/liro.sh | $(T)/native/liro.sh $(T)/native/liro/check.py $(T)/native/liro/mutants.py $(T)/native/liro/api.fib $(T)/native/liro/reuse.fib $(wildcard compiler/native/liro/*.fib)
 tool_sh-native-a64-sibcall := $(T)/native/a64-sibcall.sh $(F_ABS) | $(T)/native/a64-sibcall.sh cases/lir/instr/stackargs-sibcall.lir $(wildcard compiler/native/lower/*.fib)
 tool_sh-harness-proto-run := $(T)/harness-proto/run.sh | $(wildcard $(T)/harness-proto/*) $(wildcard $(T)/harness-proto/cases/*)
 tool_lsp-unit := $(T)/lsp/run.sh | $(wildcard $(T)/lsp/*) $(wildcard compiler/lsp/*.fib)
@@ -63,7 +64,7 @@ TOOLS_QUICK := sh-emit-prune fibref-skeleton gen-skeleton lint-pipefail lint-por
 TOOLS_FULL := $(TOOLS_QUICK) unit-api units-emit units-own units-types units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-emit-runtime sh-emit-defs-order sh-stack-stack \
   sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
-  sh-native-l1-unit jit-selfhosted-threads sh-native-a64-sibcall sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
+  sh-native-l1-unit sh-native-liro jit-selfhosted-threads sh-native-a64-sibcall sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
 # The command is every word up to the `|`, the inputs every word after it.
 upto_bar = $(if $(filter |,$(firstword $(1))),,$(if $(1),$(firstword $(1)) $(call upto_bar,$(wordlist 2,999999,$(1))),))
 after_bar = $(if $(1),$(if $(filter |,$(firstword $(1))),$(wordlist 2,999999,$(1)),$(call after_bar,$(wordlist 2,999999,$(1)))),)

@@ -3,7 +3,7 @@
 (ns native.aot
   (:use lir.diag lir.types lir.lit lir.ast native.error native.link native.linkstatic native.linkwasm)
   (:require [lir.check :as check] [native.lower :as nl] [native.owned :as owned] [native.target :as target] [native.passes :as passes]
-            [llvm.target :as lt] [llvm.core :as core] [llvm.ffi :as ffi]))
+            [llvm.target :as lt] [llvm.core :as core] [llvm.ffi :as ffi] [native.timing :as timing]))
 
 
 ;; What `aot-emit` produces (aot.rs `Output`).
@@ -44,24 +44,29 @@
 
 ;; Optimises the lowered module at the machine's level and produces `out`.
 (defun finish :private (o: owned/Owned host: target/Machine out: AotOutput level: i64) -> (Result (Array i8) LairError)
-  (match (passes/optimize (. o module) (. host tm) level)
-    ((Err e) (Err e))
-    ((Ok _) (match out
-              ((OutLlvmIr) (Ok (text-bytes (owned/owned-ir o))))
-              (_ (generate (. host tm) (. o module) out))))))
+  (let ((t (timing/started)) (r (passes/optimize (. o module) (. host tm) level)))
+    (do (timing/report "llvm.optimize" t)
+        (match r
+          ((Err e) (Err e))
+          ((Ok _) (match out
+                    ((OutLlvmIr) (Ok (text-bytes (owned/owned-ir o))))
+                    (_ (let ((t (timing/started)) (r (generate (. host tm) (. o module) out)))
+                         (do (timing/report "llvm.codegen" t) r)))))))))
 
 ;; Compiles a checked module for the host: lower, optimise, emit. (aot.rs `emit`)
 (defun aot-emit (m: LModule name: str out: AotOutput opts: AotOptions) -> (Result (Array i8) LairError)
   (match (target/machine-target (. opts opt-level))
     ((Err e) (Err e))
-    ((Ok host) (let ((r (match (nl/lower m name (. host triple) (. host data-layout))
+    ((Ok host) (let ((t (timing/started)) (lowered (nl/lower m name (. host triple) (. host data-layout))))
+                (do (timing/report "llvm.lower" t)
+                (let ((r (match lowered
                           ((Err e) (Err e))
                           ((Ok o) (let ((b (finish o host out (. opts opt-level))))
                                     (do (owned/owned-dispose o) b))))))
-                 (do (target/machine-dispose host) r)))))
+                 (do (target/machine-dispose host) r)))))))
 
 ;; The canonical directories of `dirs`, or the first refusal as a backend error.
-(defun library-dirs :private (dirs: (Vec str)) -> (Result (Vec str) LairError)
+(defun library-dirs (dirs: (Vec str)) -> (Result (Vec str) LairError)
   (loop ((i 0) (acc []))
     (if (>= i (count dirs))
         (Ok acc)

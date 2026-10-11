@@ -1,0 +1,50 @@
+;; Dependencies are collected from the AST, not @ characters inside strings.
+(ns native.liro.deps
+  (:use lir.ast lir.types)
+  (:require [lir.check.walk :as walk]))
+
+(defstruct LiroDeps (symbols: (Cell (Set str)) structs: (Cell (Set str))))
+(defun deps-new () -> LiroDeps (LiroDeps (cell (set-empty)) (cell (set-empty))))
+(defun add-symbol (d: LiroDeps n: str) -> unit (set! (. d symbols) (conj @(. d symbols) n)))
+(defun add-struct (d: LiroDeps n: str) -> unit (set! (. d structs) (conj @(. d structs) n)))
+
+(defun type-deps (d: LiroDeps t: LType) -> unit
+  (match t
+    ((TNamed n) (add-struct d n))
+    ((TAnon fs) (doseq [f fs] (type-deps d f)))
+    ((TVector _ e) (type-deps d e))
+    ((TArray _ e) (type-deps d e))
+    (_ ())))
+(defun fn-deps (d: LiroDeps t: LFnType) -> unit
+  (do (doseq [p (. t params)] (type-deps d p))
+      (match (. t ret) ((some r) (type-deps d r)) (nil ()))))
+
+(defun expr-types (d: LiroDeps e: LExpr) -> unit
+  (match (. e kind)
+    ((KInt t _) (type-deps d t)) ((KFloat t _) (type-deps d t))
+    ((KVector t _) (type-deps d t)) ((KArray t _) (type-deps d t))
+    ((KZero t) (type-deps d t)) ((KCast _ t _) (type-deps d t))
+    ((KAlloca t _ _) (type-deps d t)) ((KLoad t _ _ _) (type-deps d t))
+    ((KGep _ t _ _) (type-deps d t)) ((KAtomicLoad _ _ t _) (type-deps d t))
+    ((KStruct n _) (match n ((some s) (add-struct d s)) (nil ())))
+    ((KIntrin _ _ t _ _) (match t ((some v) (type-deps d v)) (nil ())))
+    ((KPhi t _) (type-deps d t))
+    (_ ())))
+
+(defun expr-deps (d: LiroDeps e: LExpr) -> unit
+  (do (expr-types d e)
+      (match (. e kind)
+        ((KGlobal n) (add-symbol d n))
+        ((KCall callee _ _)
+         (match callee ((CalDirect n) (add-symbol d n)) ((CalIndirect _ t) (fn-deps d t))))
+        (_ ()))
+      (doseq [kid (walk/children e)] (expr-deps d kid))))
+
+(defun item-deps (d: LiroDeps it: LItem) -> unit
+  (match it
+    ((ItDefine f) (do (fn-deps d (. f ty)) (doseq [b (. f blocks)] (doseq [e (. b body)] (expr-deps d e)))))
+    ((ItGlobal g) (do (type-deps d (. g ty)) (expr-deps d (. g init))))
+    ((ItDeclare f) (fn-deps d (. f ty)))
+    ((ItDeclareGlobal g) (type-deps d (. g ty)))
+    ((ItStruct s) (doseq [t (. s fields)] (type-deps d t)))
+    (_ ())))

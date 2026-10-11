@@ -1,0 +1,47 @@
+;; SHA-256 comes from the platform tool, never a hand-written crypto algorithm.
+;; Arguments are passed as argv; the shell script only redirects a quoted path.
+(ns native.liro.hash
+  (:require [native.link :as link] [native.liro.io :as io] [fib.os :as os]
+            [fib.os.platform :as platform] [llvm.ffi :as ffi] [llvm.support :as support]))
+(extern dladdr :private (ptr ptr) -> i32)
+(extern LLVMGetVersion :private (ptr ptr ptr) -> unit)
+
+(defun hex? (s: str) -> bool
+  (and (= (str-len s) 64)
+       (every? (fn (i: i64) (let ((b (str-byte-at s i)))
+                 (or (and (>= b 48i8) (<= b 57i8)) (and (>= b 97i8) (<= b 102i8))))) (range 64))))
+
+(defun file-digest (file: str scratch: str) -> (Result str str)
+  (let ((out (str scratch "/digest.out")) (err (str scratch "/digest.err"))
+        (command (if (= (platform/current) platform/Darwin) ["/usr/bin/shasum" "-a" "256"] ["sha256sum"])))
+    (try-let [_ (link/run-cc (into ["sh" "-c" "liro_output=$1; liro_input=$2; shift 2; exec \"$@\" < \"$liro_input\" > \"$liro_output\"" "liro-hash" out file]
+                                 command) err)]
+      (let ((text (unwrap-or (read-file out) "")))
+        (if (and (>= (str-len text) 64) (hex? (str-slice text 0 64))) (Ok (str-slice text 0 64))
+            (Err "liro: SHA-256 tool returned an invalid digest"))))))
+
+(defun text-digest (text: str scratch: str) -> (Result str str)
+  (let ((file (str scratch "/digest.input")))
+    (try-let [_ (io/write-text file text)] (file-digest file scratch))))
+
+(defun llvm-version () -> str
+  (unsafe (let ((a (alloc 4)) (b (alloc 4)) (c (alloc 4)))
+    (do (LLVMGetVersion a b c)
+        (let ((v (str (zext i64 (load-i32 a)) "." (zext i64 (load-i32 b)) "." (zext i64 (load-i32 c)))))
+          (do (free a) (free b) (free c) v))))))
+
+;; dladdr is the four-pointer POSIX Dl_info on both initial 64-bit hosts.
+(defun llvm-path () -> (Option str)
+  (unsafe (let ((name (ffi/bytes-new "LLVMGetVersion")) (info (alloc 32)))
+    (do (support/LLVMLoadLibraryPermanently (ffi/addr->ptr 0))
+        (let ((address (support/LLVMSearchForAddressOfSymbol name))
+              (found (if (= address 0) 0i32 (dladdr (ffi/addr->ptr address) info))))
+          (let ((p (if (= found 0i32) nil (some (ffi/c-string-at (load-i64 info))))))
+            (do (free name) (free info) p)))))))
+
+(defun backend-identity (scratch: str) -> (Result str str)
+  (try-let [exe (io/io-result (os/executable-path)) binary (file-digest exe scratch)
+            llvm (match (llvm-path)
+                   (nil (Ok binary))
+                   ((some path) (if (= path exe) (Ok binary) (file-digest path scratch))))]
+    (Ok (str "compiler=" binary "\nllvm=" (llvm-version) ":" llvm "\n"))))
