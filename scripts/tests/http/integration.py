@@ -241,14 +241,17 @@ class ServerTests(unittest.TestCase):
         server = FibberServer()
         sock = socket.create_connection(("127.0.0.1", server.port), 3)
         try:
-            sock.sendall(b"GET ")
-            start = time.monotonic()
-            server.close()
-            self.assertLess(time.monotonic() - start, 1.5)
-            try:
-                self.assertEqual(sock.recv(1), b"")
-            except ConnectionResetError:
-                pass  # closed with the request's first bytes still unread by the server: a reset is a close too
+            with sock.makefile("rb") as stream:
+                # A response proves the acceptor handed this peer to a worker.
+                # Stopping before acceptance instead gives a queued peer a 503.
+                sock.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                status, headers, body = raw_response(stream)
+                self.assertEqual((status, body), (200, b"ok"))
+                self.assertEqual(headers[b"connection"], [b"keep-alive"])
+                start = time.monotonic()
+                server.close()
+                self.assertLess(time.monotonic() - start, 1.5)
+                self.assertEqual(stream.read(1), b"")
         finally:
             sock.close()
 
