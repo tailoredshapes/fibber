@@ -1,7 +1,7 @@
 # mk/checks.mk: the executable ADRs, the specs, the static and the wasm stages (each a stamp under build/).
 ADR_INPUTS := $(shell find docs spec scripts cases specs rt .github editors compiler lib mk -type f -not -path 'compiler/tests/golden/*' | LC_ALL=C sort) SEED VERSION Makefile
 $(BUILD)/adr: compiler/adr.fib $(wildcard compiler/adr/*.fib) $(F) | $(BUILD)/
-	$(F) build compiler/adr.fib $(BUILD_ARGS) -o $@.new > $@.log 2>&1 || { tail -n 20 $@.log; exit 1; }; mv $@.new $@
+	t0=$$(date +%s); $(F) build compiler/adr.fib $(BUILD_ARGS) -o $@.new > $@.log 2>&1 || { tail -n 20 $@.log; exit 1; }; mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $@.secs
 # The ADRs read the whole tree (docs/design/executable-adrs.md); --strict: an accepted ADR with no check that runs is a failure too.
 $(BUILD)/adr.ok: $(BUILD)/adr $(ADR_INPUTS)
 	$(call stamp,FIBC=$(F_ABS) $(BUILD)/adr --strict)

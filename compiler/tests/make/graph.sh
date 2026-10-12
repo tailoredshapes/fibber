@@ -11,6 +11,7 @@
 #      stamp, the real one does (the check can fail: it fails on the planted copy)
 #   7  a stamp is not written when its command fails, and a target a failed recipe changed is removed (.DELETE_ON_ERROR)
 #   8  `make -n gate` runs no download when the seed is in place (no curl, wget, gh release download in the dry run)
+#  12  with F3 out of date only fixed-point and jit-selfhosted-threads rerun: the second wave of the gate waits for F alone (and a planted F3 prerequisite is seen)
 #  10  `make mac-check`'s stamps are the full gate's less the tools and stages of compiler/tests/expected-macos.txt (a listed tool is not run, an unlisted one is; the check
 #      fails on a planted extra line and on a listed name that is no tool)
 # usage: compiler/tests/make/graph.sh [SCRATCH]     (run anywhere; make 4 is needed)
@@ -147,6 +148,17 @@ case " $full " in *" $B/tools/no-such-tool.ok "*) fail "10 the plant no-such-too
 
 if python3 "$here/mac-gate.py"; then ok "11 the Mac launcher budgets hardware and reports failures"
 else fail "11 the Mac launcher checks failed"; fi
+
+# 12 only the fixed point and the tool that runs F3 wait for F3: with F3 out of date, the stamps that rerun are those two (the second wave of the
+# gate needs F alone, so it is not held up by the fixed point). The planted copy has wasm.ok depend on F3 as well; the check must see it.
+fake_all; touch -t 200001010000 "$B/F3" "$B/F3.lir"
+want=$(printf '%s\n' "$B/fixed-point.ok" "$B/tools/jit-selfhosted-threads.ok")
+got=$(M -n gate-stamps | grep -o '^rm -f [^ ;]*\.ok' | sed 's/^rm -f //' | LC_ALL=C sort)
+if [ "$got" = "$(echo "$want" | LC_ALL=C sort)" ]; then ok "12 with F3 out of date only fixed-point and jit-selfhosted-threads rerun"; else fail "12 stamps that wait for F3: $(echo $got) (want fixed-point and jit-selfhosted-threads)"; fi
+cp Makefile "$S/Makefile"; printf '$(BUILD)/wasm.ok: $(BUILD)/F3\n' > "$S/mk/zz3.mk"; printf '\ninclude $(MK)/zz3.mk\n' >> "$S/Makefile"
+got=$(make --no-print-directory -f "$S/Makefile" BUILD="$B" -n gate-stamps | grep -o '^rm -f [^ ;]*\.ok' | sed 's/^rm -f //' | LC_ALL=C sort)
+if [ "$got" = "$(printf '%s\n' $want "$B/wasm.ok" | LC_ALL=C sort)" ]; then ok "12 plant: a stamp made to depend on F3 reruns with F3 (the check above sees it)"; else fail "12 plant: wasm.ok with an F3 prerequisite did not show: $(echo $got)"; fi
+touch "$B/F3" "$B/F3.lir"; sleep 0.05; touch "$B"/*.ok "$B"/golden/*.ok "$B"/tools/*.ok "$B"/cases/*.ok
 
 [ -n "${KEEP:-}" ] || rm -rf "$S"
 echo "graph: $bad failed"

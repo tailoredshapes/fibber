@@ -202,6 +202,26 @@ help` lists every public target, that a touched tool script reruns only its stam
 cases stamp, that a stamp is not written when its command fails, and that a planted missing prerequisite (a stamp without `F`)
 would be caught: the test edits the copy's Makefile and asserts the difference. The no-op gate on the real tree (`make gate` a second time: about 2 s) was timed by hand; see the MAKE-1 report.
 
+### The gate budget
+
+The gate is the alarm for the cost of the test suite. Every `make gate` and `make quick` ends with a `== budget` block from `scripts/gate-report.py`:
+wall seconds, summed stamp seconds, average parallelism (summed over wall), the critical path (the chain of stamps that ended last, each started when the one
+before it ended; reconstructed from the stamp mtimes and their recorded seconds), the five longest, and the idle time (seconds with fewer than `-j`/4 stamps
+running). It compares them with `scripts/gate-budget.tsv` (mode, stamp, seconds, with the date, commit and `-j` of the run it came from) and prints a `WARN
+budget:` line when the wall exceeds the baseline by more than 15% (only for a run that did at least 90% of the baseline's work), when a stamp exceeds its
+recorded time by more than 50% and 5 s, or when a stamp has no baseline entry. WARN does not fail the gate; `GATE_BUDGET_STRICT=1` makes it fail.
+The summed seconds are stamp seconds (wall time of each recipe), not CPU time. The test of the reporter is `compiler/tests/make/gate-report.py` (a planted slow
+stamp warns, an unchanged run does not).
+
+A WARN is a question about the change that caused it: explain it (I/O, network, a concurrency wait, a stamp that grew) or make it cheaper. Raising the
+baseline is a reviewed change: `make clean-build && make -j12 gate` on a quiet box, then `make gate-baseline` (`GATE_MODE=quick` for the quick rows), and
+the diff of `scripts/gate-budget.tsv` goes in the commit that explains it. The target refuses a run where some stamp was already current. The same file orders
+the gate: the fixed point first, then stamps longest first, so the long ones start as soon as F exists.
+
+F and F3 are built partitioned (`GATE_PARTITION=1`, `GATE_UNIT_JOBS=8`, `GATE_IMPORT=80`, mk/stage2.mk, docs/design/compile-performance.md); a builder without the
+mode (a seed older than the feature) ignores the variables and builds whole-program, and `build/F.mode`, `build/F3.mode` say which. Releases stay whole-program.
+`GATE_CONTROL=1` adds a whole-program F3 as a control stamp (about 105 s of one core); `make release` always checks the fixed point with whole-program builds.
+
 ## 7. Kubernetes: jobs and tests on lilnas's k3s (package K8S-1, 2026-10-08)
 
 The owner: "If you want to push pods for jobs and testing. If you do setup k8s lilnas should be the orchestrator". lilnas already ran a k3s

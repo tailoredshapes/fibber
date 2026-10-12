@@ -45,11 +45,11 @@ $(F): $(COMPILER_SRC) $(BUILDER) $(LLVM_DEP) $(FRESH) | $(BUILD)/
 	rm -f $@ $(BUILD)/F3 $(BUILD)/F.lir $(BUILD)/F3.lir $(BUILD)/F3.secs
 	$(call stage_mode,$(BUILDER)) > $(BUILD)/F.mode; t0=$$(date +%s); $(STAGE_ENV) $(BUILDER) build compiler/fibc.fib $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $(BUILD)/F.log 2>&1 || { tail -n 20 $(BUILD)/F.log; exit 1; }; mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $(BUILD)/F.secs
 $(BUILD)/F.lir: $(F)
-	$(F) emit $(BUILD_ARGS) compiler/fibc.fib > $@.new 2> $(BUILD)/F.lir.err && mv $@.new $@
+	t0=$$(date +%s); $(F) emit $(BUILD_ARGS) compiler/fibc.fib > $@.new 2> $(BUILD)/F.lir.err && mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $(BUILD)/F.lir.secs
 $(BUILD)/F3: $(F) $(LLVM_DEP)
 	$(call stage_mode,$(F)) > $(BUILD)/F3.mode; t0=$$(date +%s); $(STAGE_ENV) $(F) build compiler/fibc.fib $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $(BUILD)/F3.log 2>&1 || { tail -n 20 $(BUILD)/F3.log; exit 1; }; mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $(BUILD)/F3.secs
 $(BUILD)/F3.lir: $(BUILD)/F3
-	$(BUILD)/F3 emit $(BUILD_ARGS) compiler/fibc.fib > $@.new 2> $(BUILD)/F3.lir.err && mv $@.new $@
+	t0=$$(date +%s); $(BUILD)/F3 emit $(BUILD_ARGS) compiler/fibc.fib > $@.new 2> $(BUILD)/F3.lir.err && mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $(BUILD)/F3.lir.secs
 $(BUILD)/fixed-point.ok: $(BUILD)/F.lir $(BUILD)/F3.lir
 	$(call stamp,cmp $(BUILD)/F.lir $(BUILD)/F3.lir && echo "fixed point: F and F3 emit the same lIR ($$(wc -c < $(BUILD)/F.lir) bytes)")
 # The control (GATE_CONTROL=1 adds it to the full gate; `make release` always runs the whole-program stage check): F builds a whole-program F3w, one
