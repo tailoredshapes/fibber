@@ -93,6 +93,11 @@ scripts/fetch-*.sh ───────► ~/.cache/fibber-scratch/tools/<tool>
   `BASH_ENV` (a `ulimit -v` that succeeds: macOS has no RLIMIT_AS). `scripts/lint-portable.sh` (a tool of the quick gate) fails on every other
   Linux-only tool or bash 4 feature unless the line says `# linux-only: reason`. The cases that fail only on a Mac are
   `scripts/ci-stage2.expected-darwin`; `LLVM_LIBDIR` defaults to Homebrew's `llvm@21`.
+  The local launcher `scripts/mac-gate.sh --full` selects Make's job budget from the performance-core count and RAM: at most twelve jobs,
+  reserving 16 GiB and allowing 3 GiB per job, with a minimum of one. It uses one worker per recipe (`CASE_JOBS`, `CHECK_JOBS`, `UNITS_JOBS`),
+  holds `/tmp/fibsuite.lock`, and prints total wall time. On the M1 Ultra with 16 performance cores and 64 GiB RAM it selects twelve jobs.
+  `--plan` prints the commands without running Make; `--quick` selects the quick Mac gate. `GATE_BUDGET` overrides the budget;
+  `GATE_ROOT`, `BUILD`, `SCRATCH` and `BUILDER` select another checkout, output paths, or compiler. The default compiler is the released seed.
   **DARWIN-2** moved most of those onto the Mac. The thread count and the resident set come from `proc_pidinfo(PROC_PIDTASKINFO)` behind `fib.os.backend`'s
   `task-info` (`thread-count` of fib.os.process and `rss-bytes` of fib.os.memory keep their interfaces; the Linux code is unchanged), so cases 912, 919, 7532, 8642 run
   on the Mac; a forked child gets its parent's signal stack back (XNU drops `sigaltstack` across `fork`; `fib_guard_ctl` in rt/thread.lir), so 8354 passes; only 8410

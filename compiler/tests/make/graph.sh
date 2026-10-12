@@ -145,6 +145,9 @@ for t in lint-portable gen-skeleton sh-driver-cli; do case " $mac " in *" $B/too
 # the plant: a listed name that is no tool must be caught by the same test
 case " $full " in *" $B/tools/no-such-tool.ok "*) fail "10 the plant no-such-tool is a tool?" ;; *) ok "10 plant: a listed name that is no tool is not in the gate (the loop above would fail on it)" ;; esac
 
+if python3 "$here/mac-gate.py"; then ok "11 the Mac launcher budgets hardware and reports failures"
+else fail "11 the Mac launcher checks failed"; fi
+
 [ -n "${KEEP:-}" ] || rm -rf "$S"
 echo "graph: $bad failed"
 exit $((bad > 0))

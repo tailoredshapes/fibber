@@ -58,7 +58,7 @@ tool_js-backend := $(T)/js/check.sh $(TOOLS_OUT)/js | $(wildcard $(T)/js/*) $(wi
 tool_deps := $(T)/deps/run.sh $(F_ABS) | $(wildcard $(T)/deps/*)
 tool_sh-native-gpu-emit := $(T)/native/gpu-emit.sh | $(T)/native/gpu-emit.sh $(wildcard examples/gpu/*) $(wildcard compiler/native/*.fib)
 tool_sh-native-gpu-device := $(T)/native/gpu-device.sh | $(T)/native/gpu-device.sh $(wildcard compiler/tests/native/gpu/*) $(wildcard examples/gpu/*) $(wildcard lib/fib/gpu/*.fib) $(wildcard compiler/native/*.fib compiler/native/wgsl/*.fib)
-tool_sh-make-graph := $(T)/make/graph.sh | $(wildcard $(T)/make/*) Makefile $(wildcard mk/*.mk)
+tool_sh-make-graph := $(T)/make/graph.sh | $(wildcard $(T)/make/*) scripts/mac-gate.sh Makefile $(wildcard mk/*.mk)
 
 TOOLS_QUICK := sh-emit-prune fibref-skeleton gen-skeleton lint-pipefail lint-portable sh-driver-check-lib sh-make-graph
 TOOLS_FULL := $(TOOLS_QUICK) unit-api units-emit units-own units-types units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
