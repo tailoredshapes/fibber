@@ -13,6 +13,21 @@ else
   FRESH :=
 endif
 
+# How the gate builds F and F3 (docs/design/compile-performance.md): the units of the program compiled by GATE_UNIT_JOBS workers (101 s of one
+# core become about 50 s), the small callees copied into each unit (FIB_LIRO_IMPORT=80, so the compiler stays within 7% of whole-program speed).
+# A builder that has no partitioned mode (a seed older than the feature) ignores the variables and builds whole-program; build/F.mode and
+# build/F3.mode say which it was. GATE_PARTITION=0 builds whole-program. Release builds (mk/release.mk) are always whole-program (ADR 0024).
+GATE_PARTITION ?= 1
+GATE_UNIT_JOBS ?= 8
+GATE_IMPORT ?= 80
+ifeq ($(GATE_PARTITION),1)
+  STAGE_ENV := FIB_LIRO_CACHE=off FIB_LIRO_PARTITION=1 FIB_LIRO_JOBS=$(GATE_UNIT_JOBS) FIB_LIRO_IMPORT=$(GATE_IMPORT)
+else
+  STAGE_ENV := FIB_LIRO_CACHE=off
+endif
+# $(call stage_mode,BUILDER): partitioned when the builder knows the variable and GATE_PARTITION=1, else whole-program
+stage_mode = if [ "$(GATE_PARTITION)" = 1 ] && grep -q FIB_LIRO_PARTITION "$$(command -v $(1))"; then echo partitioned; else echo whole-program; fi
+
 # The generator of compiler/emit/runtime.fib uses the library only, so the seed builds it. The generator is an order-only prerequisite of the
 # file: a rebuilt generator (a new seed, a prelude change) does not by itself rewrite the committed file, since its content would be the same
 # and F would be rebuilt for nothing; a changed rt/*.lir does. A hand-edited runtime.fib is newer than rt/, so it is not regenerated either:
@@ -27,16 +42,22 @@ runtime: $(RUNTIME_FIB) $(BUILD)/runtime-drift.ok   ## regenerate compiler/emit/
 
 # Stage 2: F, built by the seed (or BUILDER); F.lir is what F emits for itself; F3 is built by F; the fixed point is F.lir = F3.lir.
 $(F): $(COMPILER_SRC) $(BUILDER) $(LLVM_DEP) $(FRESH) | $(BUILD)/
-	rm -f $@ $(BUILD)/F3 $(BUILD)/F.lir $(BUILD)/F3.lir
-	t0=$$(date +%s); FIB_LIRO_CACHE=off $(BUILDER) build compiler/fibc.fib $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $(BUILD)/F.log 2>&1 || { tail -n 20 $(BUILD)/F.log; exit 1; }; mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $(BUILD)/F.secs
+	rm -f $@ $(BUILD)/F3 $(BUILD)/F.lir $(BUILD)/F3.lir $(BUILD)/F3.secs
+	$(call stage_mode,$(BUILDER)) > $(BUILD)/F.mode; t0=$$(date +%s); $(STAGE_ENV) $(BUILDER) build compiler/fibc.fib $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $(BUILD)/F.log 2>&1 || { tail -n 20 $(BUILD)/F.log; exit 1; }; mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $(BUILD)/F.secs
 $(BUILD)/F.lir: $(F)
-	$(F) emit $(BUILD_ARGS) compiler/fibc.fib > $@.new 2> $(BUILD)/F.lir.err && mv $@.new $@
+	t0=$$(date +%s); $(F) emit $(BUILD_ARGS) compiler/fibc.fib > $@.new 2> $(BUILD)/F.lir.err && mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $(BUILD)/F.lir.secs
 $(BUILD)/F3: $(F) $(LLVM_DEP)
-	FIB_LIRO_CACHE=off $(F) build compiler/fibc.fib $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $(BUILD)/F3.log 2>&1 || { tail -n 20 $(BUILD)/F3.log; exit 1; }; mv $@.new $@
+	$(call stage_mode,$(F)) > $(BUILD)/F3.mode; t0=$$(date +%s); $(STAGE_ENV) $(F) build compiler/fibc.fib $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $(BUILD)/F3.log 2>&1 || { tail -n 20 $(BUILD)/F3.log; exit 1; }; mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $(BUILD)/F3.secs
 $(BUILD)/F3.lir: $(BUILD)/F3
-	$(BUILD)/F3 emit $(BUILD_ARGS) compiler/fibc.fib > $@.new 2> $(BUILD)/F3.lir.err && mv $@.new $@
+	t0=$$(date +%s); $(BUILD)/F3 emit $(BUILD_ARGS) compiler/fibc.fib > $@.new 2> $(BUILD)/F3.lir.err && mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $(BUILD)/F3.lir.secs
 $(BUILD)/fixed-point.ok: $(BUILD)/F.lir $(BUILD)/F3.lir
 	$(call stamp,cmp $(BUILD)/F.lir $(BUILD)/F3.lir && echo "fixed point: F and F3 emit the same lIR ($$(wc -c < $(BUILD)/F.lir) bytes)")
+# The control (GATE_CONTROL=1 adds it to the full gate; `make release` always runs the whole-program stage check): F builds a whole-program F3w, one
+# core for about 105 s, and its lIR must equal F's. It proves the partitioned build and the whole-program build agree.
+$(BUILD)/F3w: $(F) $(LLVM_DEP)
+	FIB_LIRO_CACHE=off $(F) build compiler/fibc.fib $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $(BUILD)/F3w.log 2>&1 || { tail -n 20 $(BUILD)/F3w.log; exit 1; }; mv $@.new $@
+$(BUILD)/fixed-point-whole.ok: $(BUILD)/F.lir $(BUILD)/F3w
+	$(call stamp,$(BUILD)/F3w emit $(BUILD_ARGS) compiler/fibc.fib > $(BUILD)/F3w.lir && cmp $(BUILD)/F.lir $(BUILD)/F3w.lir && echo "control: the whole-program F3w emits the same lIR as F")
 F: $(F)   ## stage 2, build/F, built by the seed (BUILDER=... or FIBC=... names another builder; GATE_FRESH=1 rebuilds it)
 fixed-point: $(BUILD)/fixed-point.ok   ## the stage check: F builds F3 and both emit the same lIR for compiler/fibc.fib
 

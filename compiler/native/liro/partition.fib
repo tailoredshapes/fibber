@@ -2,7 +2,8 @@
 ;; Program-local IDs remain in the checked bodies and glue initializers. The front
 ;; end emits them again for every build; a changed number changes its owner's key.
 (ns native.liro.partition
-  (:use lir.ast lir.types native.liro.deps))
+  (:use lir.ast lir.types native.liro.deps)
+  (:require [lir.check.walk :as walk]))
 
 (defstruct LiroIndex (symbols: (Map str LItem) structs: (Map str LStructDef) target: (Vec LItem)))
 (defun symbol-name (it: LItem) -> str
@@ -29,18 +30,41 @@
     ((ItGlobal g) (ItDeclareGlobal (LGlobalDecl (. g name) (. g ty) (. (. g mods) hidden) (. g pos))))
     (_ it)))
 
-(defun bucket (it: LItem) -> str
+;; Opt-in experiment knobs (docs/design/compile-performance.md); the defaults are the 16 hash groups of ADR 0024.
+;; FIB_LIRO_UNITS=N: N code groups. FIB_LIRO_SPLIT=hash|ns1|ns2|ns3: group by the function-name hash, or by the hash of the
+;; first 1, 2 or 3 dotted segments of its namespace (functions of one namespace stay together, so they can inline into one another).
+(defun split-count () -> i64
+  (match (sys-getenv "FIB_LIRO_UNITS")
+    ((some s) (match (parse-long s) ((some n) (if (> n 0) n 16)) (nil 16)))
+    (nil 16)))
+(defun strip-kind (n: str) -> str
+  (cond (starts-with? n "l.") (strip-kind (str-slice n 2 (str-len n)))
+        (starts-with? n "f.") (str-slice n 2 (str-len n))
+        :else n))
+(defun segments (n: str k: i64) -> str
+  (loop ((i 0) (seen 0))
+    (cond (>= i (str-len n)) n
+          (= (str-byte-at n i) 46i8) (if (= (+ seen 1) k) (str-slice n 0 i) (recur (+ i 1) (+ seen 1)))
+          :else (recur (+ i 1) seen))))
+(defun split-key (n: str mode: str) -> str
+  (cond (= mode "ns1") (segments (strip-kind n) 1)
+        (= mode "ns2") (segments (strip-kind n) 2)
+        (= mode "ns3") (segments (strip-kind n) 3)
+        :else n))
+
+(defun bucket (it: LItem count: i64 mode: str) -> str
   (match it
     ((ItGlobal _) "glue")
     ((ItDefine f) (let ((n (. f name)))
       (cond (starts-with? n "fib.") "runtime"
             (or (starts-with? n "drop.") (starts-with? n "trace.") (starts-with? n "share.")) "walkers"
-            :else (str "code-" (bit-and (hash n) 15)))))
+            :else (str "code-" (rem (bit-and (hash (split-key n mode)) 1073741823) count)))))
     (_ "")))
 (defun groups-of (m: LModule) -> (Map str (Vec LItem))
-  (reduce (fn (groups: (Map str (Vec LItem)) it: LItem)
-            (if (defined? it) (let ((b (bucket it))) (assoc groups b (conj (unwrap-or (get groups b) []) (exported it)))) groups))
-          {} (. m items)))
+  (let ((count (split-count)) (mode (unwrap-or (sys-getenv "FIB_LIRO_SPLIT") "hash")))
+    (reduce (fn (groups: (Map str (Vec LItem)) it: LItem)
+              (if (defined? it) (let ((b (bucket it count mode))) (assoc groups b (conj (unwrap-or (get groups b) []) (exported it)))) groups))
+            {} (. m items))))
 
 (defun needed-structs (idx: LiroIndex d: LiroDeps) -> (Vec LItem)
   (let ((work (cell (vec @(. d structs)))) (done (cell (set-empty))) (out (cell [])))
@@ -68,6 +92,44 @@
               (LModule (into (into (into (. idx target) (needed-structs idx d)) imports)
                              (vec (sort-by symbol-name defs)))))))))
 
-(defun modules (m: LModule) -> (Vec LModule)
+;; Opt-in cross-unit inlining (experiment): FIB_LIRO_IMPORT=T copies every function of at most T expression nodes that a unit
+;; calls into that unit as an internal definition, so LLVM can inline it; FIB_LIRO_IMPORT_DEPTH=D (default 2) rounds of copies
+;; (a copy's own callees are copied the next round). The owner keeps the one external definition; the glue unit gets none (a global
+;; initializer must name the owner). T=0 (default) copies nothing.
+(defun env-count (name: str default: i64) -> i64
+  (match (sys-getenv name) ((some s) (unwrap-or (parse-long s) default)) (nil default)))
+(defun count-expr (acc: (Cell i64) e: LExpr) -> unit
+  (do (set! acc (+ @acc 1)) (doseq [k (walk/children e)] (count-expr acc k))))
+(defun fn-size (f: LFunction) -> i64
+  (let ((acc (cell 0))) (do (doseq [b (. f blocks)] (doseq [e (. b body)] (count-expr acc e))) @acc)))
+(defun small-def (idx: LiroIndex n: str limit: i64) -> (Option LItem)
+  (match (get (. idx symbols) n)
+    ((some it) (match it ((ItDefine f) (if (<= (fn-size f) limit) (some (internal-copy it)) nil)) (_ nil)))
+    (nil nil)))
+(defun internal-copy (it: LItem) -> LItem
+  (match it ((ItDefine f) (ItDefine (with f (mods (LModifiers LkInternal false))))) (_ it)))
+(defun wanted (defs: (Vec LItem) own: (Set str)) -> (Vec str)
+  (let ((d (deps-new)))
+    (do (doseq [it defs] (item-deps d it))
+        (vec (sort (vec (filter (fn (n: str) (not (contains? own n))) (vec @(. d symbols)))))))))
+(defun copies-of (idx: LiroIndex defs: (Vec LItem) limit: i64 depth: i64) -> (Vec LItem)
+  (loop ((round 0) (frontier defs) (own (set (mapv symbol-name defs))) (out []))
+    (if (= round depth) out
+        (let ((picked (vec (keep (fn (n: str) (small-def idx n limit)) (wanted frontier own)))))
+          (if (= (count picked) 0) out
+              (recur (+ round 1) picked (into own (mapv symbol-name picked)) (into out picked)))))))
+(defun unit-defs (idx: LiroIndex defs: (Vec LItem)) -> (Vec LItem)
+  (let ((limit (env-count "FIB_LIRO_IMPORT" 0)))
+    (if (<= limit 0) defs (into defs (copies-of idx defs limit (env-count "FIB_LIRO_IMPORT_DEPTH" 2))))))
+
+(defun modules-with (m: LModule copy: bool) -> (Vec LModule)
   (let ((idx (index-of m)) (groups (groups-of m)))
-    (mapv (fn (name: str) (unit-module idx (unwrap-or (get groups name) []))) (vec (sort (keys groups))))))
+    (mapv (fn (name: str)
+            (let ((defs (unwrap-or (get groups name) [])))
+              (unit-module idx (if (and copy (not (= name "glue"))) (unit-defs idx defs) defs))))
+          (vec (sort (keys groups))))))
+(defun modules (m: LModule) -> (Vec LModule) (modules-with m false))
+;; The units to compile: `modules` plus the copies, which are checked after the plain units were validated.
+(defun modules-to-compile (m: LModule) -> (Vec LModule) (modules-with m (> (env-count "FIB_LIRO_IMPORT" 0) 0)))
+(defun validation-units (m: LModule units: (Vec LModule)) -> (Vec LModule)
+  (if (and (> (count units) 1) (> (env-count "FIB_LIRO_IMPORT" 0) 0)) (modules m) units))

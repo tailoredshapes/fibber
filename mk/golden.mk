@@ -10,7 +10,7 @@ golden_tool = $(word 2,$(subst |, ,$(filter $(1)|%,$(GOLDEN_ROWS))))
 GOLDEN_STAMPS := $(addsuffix .ok,$(addprefix $(GOLDEN_DIR)/,$(GOLDEN_SUITES)))
 
 $(GOLDEN_DIR)/tools/%: compiler/%.fib $(F) $(LLVM_DEP) | $(GOLDEN_DIR)/tools/
-	$(F) build $< $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $@.log 2>&1 || { tail -n 20 $@.log; exit 1; }; mv $@.new $@
+	t0=$$(date +%s); $(F) build $< $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $@.log 2>&1 || { tail -n 20 $@.log; exit 1; }; mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $@.secs
 
 define golden_suite
 $(GOLDEN_DIR)/$(1).ok: $(GOLDEN_DIR)/tools/$(call golden_tool,$(1)) compiler/tests/golden/$(1).files compiler/tests/golden/$(1).golden compiler/tests/golden/golden.sh compiler/tests/golden/suites.sh $$(shell cat compiler/tests/golden/$(1).files) | $(GOLDEN_DIR)/

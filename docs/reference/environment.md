@@ -31,8 +31,14 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LINK` | [compiler/fibc.fib:71](../../compiler/fibc.fib#L71) |
 | `FIB_LINK_MODE` | [compiler/fibc.fib:69](../../compiler/fibc.fib#L69) |
 | `FIB_LIRO_CACHE` | [compiler/fibc.fib:61](../../compiler/fibc.fib#L61) |
+| `FIB_LIRO_IMPORT` | [compiler/native/liro/partition.fib:122](../../compiler/native/liro/partition.fib#L122) |
+| `FIB_LIRO_IMPORT_DEPTH` | [compiler/native/liro/partition.fib:123](../../compiler/native/liro/partition.fib#L123) |
+| `FIB_LIRO_JOBS` | [compiler/native/liro/parallel.fib:10](../../compiler/native/liro/parallel.fib#L10) |
 | `FIB_LIRO_MODE` | [compiler/fibc.fib:62](../../compiler/fibc.fib#L62) |
+| `FIB_LIRO_PARTITION` | [compiler/native/liro/parallel.fib:14](../../compiler/native/liro/parallel.fib#L14) |
+| `FIB_LIRO_SPLIT` | [compiler/native/liro/partition.fib:64](../../compiler/native/liro/partition.fib#L64) |
 | `FIB_LIRO_STATS` | [compiler/fibc.fib:64](../../compiler/fibc.fib#L64) |
+| `FIB_LIRO_UNITS` | [compiler/native/liro/partition.fib:37](../../compiler/native/liro/partition.fib#L37) |
 | `FIB_LOG` | [lib/fib/log/core.fib:126](../../lib/fib/log/core.fib#L126) |
 | `FIB_LOG_ASYNC` | [lib/fib/log/config.fib:32](../../lib/fib/log/config.fib#L32) |
 | `FIB_LOG_FILE` | [lib/fib/log/config.fib:31](../../lib/fib/log/config.fib#L31) |
