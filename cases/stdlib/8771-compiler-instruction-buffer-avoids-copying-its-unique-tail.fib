@@ -1,0 +1,19 @@
+;; spec:   docs/adr/0025-the-emitter-builds-structured-lir.md; stdlib §2.5 (Cell update preserves shared values)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; allocs: <= 1400
+;; stage:  2
+;; roots:  ../../lib ../../compiler
+;; A private builder appends 1024 instructions with a reused operand. The bound
+;; permits instruction records and trie growth, but rejects copying the tail
+;; and rebuilding the vector shell on every append. Snapshot persistence is
+;; checked independently by tests.emit.unit-ir's held-snapshots.
+(ns main (:use emit.ir) (:require [emit.node :as n]))
+
+(defun main () -> i64
+  (let ((builder (fb-new "buffer" nil [] false))
+        (instruction (n/call "callee" [(n/local "operand")])))
+    (do (dotimes (i 1024) (fb-stmt builder instruction))
+        (fb-term builder (n/ret nil))
+        (if (= (count @(. (fb-block builder) items)) 1025) 0 1))))

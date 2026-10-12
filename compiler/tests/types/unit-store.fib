@@ -19,6 +19,19 @@
           (do (store-bind s (var-id v) prev) (recur (+ i 1) v)))
         prev)))
 
+(defun snapshots (cs: StepLog) -> unit
+  (let ((s (store-new)) (v (store-fresh-lit s 3)) (id (var-id v)))
+    (let ((nodes @(. s nodes)) (lits @(. s lits)))
+      (do (store-widen-lit s id 90)
+          (store-bind s id (ty-i64))
+          (store-fresh s)
+          (is cs (= (map-count nodes) 1) "a held node snapshot excludes fresh variables")
+          (is cs (match (get nodes id) ((some (Unbound level)) (= level 0)) (_ false))
+              "binding preserves the old node snapshot")
+          (is cs (= (get lits id) (some 3)) "widening preserves the old literal snapshot")
+          (is cs (= (store-lit-of s id) (some 90)) "the live store widens the literal")
+          (is cs (= (store-resolve s v) (ty-i64)) "the live store resolves the binding")))))
+
 (defun unit-steps () -> (Vec StepRun)
   (let ((cs (new-rec)))
     (do
@@ -57,6 +70,7 @@
             (end (chain s 50000)))
         (do (is cs (= (store-resolve s end) (ty-i64)) "a chain of 50000 resolves to its end")
             (is cs (= (store-zonk s (ty-cell end)) (ty-cell (ty-i64))) "and zonks to it")))
+      (snapshots cs)
       (rec-steps cs))))
 
 (defun tests () -> Suite

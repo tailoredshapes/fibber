@@ -147,6 +147,29 @@
             (fb-term f (nx/ret nil))
             (is cs (= (count (s/split-lines (fb-render f))) 100004) "100000 statements render")))))
 
+(defun held-snapshots (cs: StepLog) -> unit
+  (let ((f (fb-new "snapshots" nil [] false))
+        (value (nx/integer lt/ty-i64 7)))
+    (do (fb-stmt f (nx/call "first" []))
+        (let ((items @(. (fb-block f) items)) (blocks @(. f blocks)))
+          (do (dotimes (i 100) (fb-stmt f (nx/call "later" [])))
+              (fb-term f (nx/branch "next")) (fb-open f "next")
+              (is cs (= (count items) 1) "a held instruction snapshot keeps its length")
+              (is cs (match (nth items 0) ((ItStmt e) (= (nx/text e) "(call @first)")) (_ false))
+                  "a held instruction snapshot keeps its operand")
+              (is cs (= (count blocks) 1) "a held block-vector snapshot excludes later blocks")
+              (is cs (= (count @(. f blocks)) 2) "the live builder gets the new block")))
+        (fb-phi f LirI64 [(PhiEdge "entry" value)])
+        (let ((phis @(. (fb-block f) phis)))
+          (do (fb-phi f LirI64 [(PhiEdge "entry" value)])
+              (is cs (= (count phis) 1) "a held phi snapshot excludes later phis")
+              (is cs (= (count @(. (fb-block f) phis)) 2) "the live block gets the new phi")))
+        (fb-entry-alloca f lt/ty-i64 8)
+        (let ((allocas @(. f allocas)))
+          (do (fb-entry-alloca f lt/ty-i64 8)
+              (is cs (= (count allocas) 1) "a held alloca snapshot excludes later allocations")
+              (is cs (= (count @(. f allocas)) 2) "the live builder gets the new alloca"))))))
+
 (defun unit-steps () -> (Vec StepRun)
   (let ((cs (new-rec)))
     (do (renders-lets-around-void cs)
@@ -156,6 +179,7 @@
         (golden-f cs)
         (golden-g cs)
         (unterminated-and-big cs)
+        (held-snapshots cs)
         (rec-steps cs))))
 
 (defun tests () -> Suite

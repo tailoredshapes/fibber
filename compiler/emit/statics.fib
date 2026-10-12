@@ -30,8 +30,8 @@
 ;; The module item `lir` under the name `name`, added once; the answer is `@name`.
 (defun statics-item (st: Statics name: str item: la/LItem) -> str
   (do (when (not (contains? @(. st item-index) name))
-        (do (set! (. st items) (conj @(. st items) item))
-            (set! (. st item-index) (conj @(. st item-index) name))))
+        (do (cell-update! (. st items) (fn (items: (Vec la/LItem)) (conj items item)))
+            (cell-update! (. st item-index) (fn (names: (Set str)) (conj names name)))))
       (str-join ["@" name])))
 
 ;; The address of the immortal `str` object holding `text`. Rust: statics.rs:26 Statics::string
@@ -40,8 +40,8 @@
     n
     (let ((i (count @(. st strings)))
           (name (str-join ["@str." (str (count @(. st strings)))])))
-      (do (set! (. st strings) (conj @(. st strings) (StaticStr tid-str text (render-string i tid-str text))))
-          (set! (. st string-index) (assoc @(. st string-index) text name))
+      (do (cell-update! (. st strings) (fn (strings: (Vec StaticStr)) (conj strings (StaticStr tid-str text (render-string i tid-str text)))))
+          (cell-update! (. st string-index) (fn (names: (Map str str)) (assoc names text name)))
           name))))
 
 ;; The interned id of a keyword. Once the table is sealed, a keyword that is not in it is a broken invariant: a trap, as the
@@ -52,8 +52,8 @@
     (if @(. st keywords-sealed)
         (trap (str-join ["the keyword :" k " was interned after the keyword table was sealed"]))
         (let ((id (count @(. st keywords))))
-          (do (set! (. st keywords) (conj @(. st keywords) k))
-              (set! (. st keyword-index) (assoc @(. st keyword-index) k id))
+          (do (cell-update! (. st keywords) (fn (keywords: (Vec str)) (conj keywords k)))
+              (cell-update! (. st keyword-index) (fn (ids: (Map str i64)) (assoc ids k id)))
               id)))))
 
 ;; Seals the table: the ids given out so far are the table a macro module exports (`fibm.kw.K`, compiler.md §6), so a keyword that
@@ -70,8 +70,8 @@
   (if-some [n (get @(. st closure-index) code)]
     n
     (let ((name (str-join ["@clo." (str (count @(. st closures)))])))
-      (do (set! (. st closures) (conj @(. st closures) (StaticClosure name code tid)))
-          (set! (. st closure-index) (assoc @(. st closure-index) code name))
+      (do (cell-update! (. st closures) (fn (closures: (Vec StaticClosure)) (conj closures (StaticClosure name code tid))))
+          (cell-update! (. st closure-index) (fn (names: (Map str str)) (assoc names code name)))
           name))))
 
 ;; The immortal closures made so far, by address name (`@clo.N`). Rust: statics.rs:83 Statics::closure_names
@@ -84,8 +84,8 @@
   (if-some [n (get @(. st vtable-index) name)]
     n
     (let ((global (str-join ["@vt." (str (count @(. st vtables)))])))
-      (do (set! (. st vtables) (conj @(. st vtables) (StaticVtable global slots)))
-          (set! (. st vtable-index) (assoc @(. st vtable-index) name global))
+      (do (cell-update! (. st vtables) (fn (vtables: (Vec StaticVtable)) (conj vtables (StaticVtable global slots))))
+          (cell-update! (. st vtable-index) (fn (names: (Map str str)) (assoc names name global)))
           global))))
 
 ;; Whether a vtable of this name exists already. Rust: statics.rs:100 Statics::has_vtable

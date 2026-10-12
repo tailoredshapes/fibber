@@ -9,11 +9,9 @@
 ;;
 ;; Shapes: the Rust `Store` is a struct of Cells (the pattern of
 ;; `ExpandCtx`: every function takes it and changes it through `set!`).
-;; The nodes are a `(Map i64 VarNode)` keyed by variable id, not a Vec: an
-;; `assoc` at an index of a Vec is O(n) in the library today (plan G1:
-;; 16,000 assocs took 12 s), a Map's is O(log n). The choice is private to
-;; this module: the Map is reached only through the functions below, so a
-;; later Vec with an O(log n) `assoc` changes this file alone. A variable
+;; The nodes are a `(Map i64 VarNode)` keyed by variable id. Mutating a
+;; private map uses `cell-update!` so a unique path can be updated in place;
+;; a held snapshot still copies. The choice is private to this module. A variable
 ;; id is the number of nodes before it was made, as Rust's index, so the
 ;; ids are allocated in the same order. `leave` does not go below 0.
 (ns types.store (:use types.ty))
@@ -50,14 +48,15 @@
 ;; A fresh unification variable at the current level.
 (defun store-fresh (s: Store) -> Ty
   (let ((id (map-count @(. s nodes))))
-    (do (set! (. s nodes) (assoc @(. s nodes) id (Unbound @(. s level))))
-        (TVar id))))
+    (let ((level @(. s level)))
+      (do (cell-update! (. s nodes) (fn (nodes: (Map i64 VarNode)) (assoc nodes id (Unbound level))))
+          (TVar id)))))
 
 ;; A fresh variable for the integer literal n (Rust `fresh_lit`).
 (defun store-fresh-lit (s: Store n: i64) -> Ty
   (let ((t (store-fresh s)))
     (match t
-      ((TVar v) (do (set! (. s lits) (assoc @(. s lits) v (lit-magnitude n))) t))
+      ((TVar v) (do (cell-update! (. s lits) (fn (lits: (Map i64 i64)) (assoc lits v (lit-magnitude n)))) t))
       (_ t))))
 
 ;; The magnitude of n (`unsigned_abs`; the one that does not fit saturates).
@@ -72,7 +71,7 @@
 
 ;; Records that v also stands for a literal of magnitude m.
 (defun store-widen-lit (s: Store v: i64 m: i64) -> unit
-  (set! (. s lits) (assoc @(. s lits) v (max (unwrap-or (get @(. s lits) v) 0) m))))
+  (cell-update! (. s lits) (fn (lits: (Map i64 i64)) (assoc lits v (max (unwrap-or (get lits v) 0) m)))))
 
 ;; t zonked, with every literal variable still unbound as `i64`, for messages.
 (defun store-zonk-default (s: Store t: Ty) -> Ty
@@ -114,16 +113,16 @@
 (defun compress :private (s: Store path: (Vec i64) rep: Ty) -> unit
   (if (empty? path)
       ()
-      (set! (. s nodes)
-            (reduce (fn (m: (Map i64 VarNode) p: i64) (assoc m p (Link rep)))
-                    @(. s nodes) path))))
+      (cell-update! (. s nodes)
+        (fn (nodes: (Map i64 VarNode))
+          (reduce (fn (m: (Map i64 VarNode) p: i64) (assoc m p (Link rep))) nodes path)))))
 
 ;; Binds the unbound variable v to t, lowering the level of the unbound
 ;; variables of t to v's (Rémy). The caller has done the occurs check.
 (defun store-bind (s: Store v: i64 t: Ty) -> unit
   (let ((level (unwrap-or (store-level-of s v) @(. s level))))
     (do (run! (fn (u: i64) (lower-level s u level)) (ty-vars t))
-        (set! (. s nodes) (assoc @(. s nodes) v (Link t))))))
+        (cell-update! (. s nodes) (fn (nodes: (Map i64 VarNode)) (assoc nodes v (Link t)))))))
 
 ;; Lowers the level of the unbound representative of variable u to level
 ;; if it is higher.
@@ -132,7 +131,7 @@
     ((TVar r)
      (match (get @(. s nodes) r)
        ((some (Unbound l))
-        (set! (. s nodes) (assoc @(. s nodes) r (Unbound (min l level)))))
+        (cell-update! (. s nodes) (fn (nodes: (Map i64 VarNode)) (assoc nodes r (Unbound (min l level))))))
        (_ ())))
     (_ ())))
 

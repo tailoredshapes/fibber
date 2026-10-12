@@ -11,8 +11,9 @@
 ;; - the builder is a struct of Cells, passed borrowed (the pattern of `Store`
 ;;   and `ExpandCtx`): `fb-fresh f` changes `f`. A block is a struct of Cells
 ;;   too (items, phis, closed), so that an instruction appended to a block of
-;;   a hundred thousand is `(set! items (conj @items x))`, in place, not a
-;;   copy of the block; `blocks` is a Cell of a Vec of those shared handles.
+;;   a hundred thousand uses `cell-update!`: the vector moves out of its cell
+;;   before conj, so a unique tail is updated in place. A held snapshot still
+;;   copies. `blocks` is a Cell of a Vec of those shared handles.
 ;; - Rust's tuples `(String, String)`, `(LirTy, String)` are the structs
 ;;   `PhiEdge` and `LirParam`; `IrItem::Bind(n, text, ty)` is `ItBind`.
 ;; - the methods of `FnBuilder` are `fb-NAME`; `targets` is `ir-targets`.
@@ -76,9 +77,9 @@
 ;; Opens a new block and makes it current; dead unless a live terminator has
 ;; named it. Rust: ir.rs:93 open
 (defun fb-open (f: FnBuilder label: str) -> unit
-  (do (set! (. f blocks)
-            (conj @(. f blocks) (block-new label (not (contains? @(. f live-targets) label)))))
-      (set! (. f cur) (- (count @(. f blocks)) 1))))
+  (let ((dead (not (contains? @(. f live-targets) label))))
+    (do (cell-update! (. f blocks) (fn (blocks: (Vec Block)) (conj blocks (block-new label dead))))
+        (set! (. f cur) (- (count @(. f blocks)) 1)))))
 
 ;; Whether some block of that label is dead. Rust: ir.rs:103 is_dead
 (defun fb-is-dead (f: FnBuilder label: str) -> bool
@@ -88,7 +89,7 @@
 (defun fb-push :private (f: FnBuilder item: IrItem) -> unit
   (let ((b (fb-block f)))
     (when (and (not @(. b closed)) (not (. b dead)))
-      (set! (. b items) (conj @(. b items) item)))))
+      (cell-update! (. b items) (fn (items: (Vec IrItem)) (conj items item))))))
 
 ;; Binds `instr`'s value to a fresh name and returns it. Rust: ir.rs:108 val
 (defun fb-val (f: FnBuilder instr: LExpr ty: LirTy) -> V
@@ -128,7 +129,7 @@
   (let ((b (fb-block f)))
     (do (when (and (not @(. b closed)) (not (. b dead)))
           (doseq [l (ir-targets instr)]
-            (set! (. f live-targets) (conj @(. f live-targets) l))))
+            (cell-update! (. f live-targets) (fn (labels: (Set str)) (conj labels l)))))
         (fb-push f (ItStmt instr))
         (set! (. b closed) true))))
 
@@ -139,7 +140,8 @@
     (do (when-not (. b dead)
           (let ((edges (mapv (fn (e: PhiEdge) (LBinding (. e label) (. e value) 0))
                             (filterv (fn (e: PhiEdge) (not (fb-is-dead f (. e label)))) incoming))))
-            (set! (. b phis) (conj @(. b phis) (Phi name (n/node (KPhi (lir-type ty) edges)) ty)))))
+            (let ((phi (Phi name (n/node (KPhi (lir-type ty) edges)) ty)))
+              (cell-update! (. b phis) (fn (phis: (Vec Phi)) (conj phis phi))))))
         (v-local name ty))))
 
 ;; The text of a phi with one more edge: the last `)` is replaced.
@@ -166,7 +168,7 @@
 ;; every execution of its site (types §8.2). Rust: ir.rs:177 entry_alloca
 (defun fb-entry-alloca (f: FnBuilder ty: LType size: i64) -> LExpr
   (let ((name (fb-fresh f)))
-    (do (set! (. f allocas) (conj @(. f allocas) (Alloca name (n/alloca ty) size)))
+    (do (cell-update! (. f allocas) (fn (allocas: (Vec Alloca)) (conj allocas (Alloca name (n/alloca ty) size))))
         (n/local name))))
 
 ;; The `(let (..) s)` of the pending bindings around the statement s.

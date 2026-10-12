@@ -98,7 +98,7 @@
 ;; Rust: program.rs:125 Program::request_closure
 (defun program-request-closure (p: Program owner: Inst owner-name: str lit: i64) -> str
   (let ((name (closure-name owner-name lit)))
-    (do (set! (. p closures) (conj @(. p closures) (WorkClosure owner lit name)))
+    (do (cell-update! (. p closures) (fn (closures: (Vec Work)) (conj closures (WorkClosure owner lit name))))
         name)))
 
 ;; Rust: program.rs:136 Program::next_work
@@ -179,10 +179,11 @@
                   (_ (Err (str "invalid runtime declaration of " (. d name))))))
                (nil
                 (do (when (not-any? (fn (item: la/LItem) (match item ((la/ItDeclare other) (= (. other name) (. d name))) (_ false))) @(. p externs))
-                      (set! (. p externs) (conj @(. p externs) decl)))
+                      (cell-update! (. p externs) (fn (externs: (Vec la/LItem)) (conj externs decl))))
                     (when-not (= (. d lib) "")
                       (let ((note (Pair (. d lib) (. d owner))))
-                        (when-not (includes? note @(. p link-notes)) (set! (. p link-notes) (conj @(. p link-notes) note)))))
+                        (when-not (includes? note @(. p link-notes))
+                          (cell-update! (. p link-notes) (fn (notes: (Vec (Pair str str))) (conj notes note))))))
                     (Ok ())))))))))
     (_ (Err "an extern without a function type"))))
 
@@ -198,11 +199,14 @@
 
 ;; Rust: program.rs:269 Program::add_helper
 (defun program-add-helper (p: Program name: str func: la/LFunction) -> unit
-  (do (set! (. p helpers) (assoc @(. p helpers) name true))
-      (set! (. p funcs) (conj @(. p funcs) func))))
+  (do (program-mark-helper p name)
+      (program-add-function p func)))
+
+(defun program-add-function (p: Program func: la/LFunction) -> unit
+  (cell-update! (. p funcs) (fn (funcs: (Vec la/LFunction)) (conj funcs func))))
 
 (defun program-mark-helper (p: Program name: str) -> unit
-  (set! (. p helpers) (assoc @(. p helpers) name true)))
+  (cell-update! (. p helpers) (fn (helpers: (Map str bool)) (assoc helpers name true))))
 
 ;; Rust: program.rs:275 Program::render_externs
 (defun program-render-externs (p: Program) -> str
