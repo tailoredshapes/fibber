@@ -10,11 +10,12 @@
   (:use syntax.form expand.types expand.ctx))
 
 (defstruct Shared (base: (Cell (Option ExpandCtx)) prelude: (Cell (Vec Stx))
-                   key: (Cell str) ctx: (Cell (Option ExpandCtx)) done: (Cell (Vec Expanded))))
+                   key: (Cell str) ctx: (Cell (Option ExpandCtx)) done: (Cell (Vec Expanded))
+                   hint: (Cell (Option (Pair str i64)))))
 
 (defstruct Start (ctx: ExpandCtx prelude: (Vec Stx)))
 
-(defun shared-new () -> Shared (Shared (cell nil) (cell (vec-empty)) (cell "") (cell nil) (cell (vec-empty))))
+(defun shared-new () -> Shared (Shared (cell nil) (cell (vec-empty)) (cell "") (cell nil) (cell (vec-empty)) (cell nil)))
 
 ;; A fresh copy of the context after the expander's prelude and `lib/prelude.fib`, and the prelude's forms (the macro runner takes them).
 (defun shared-start (sh: Shared) -> (Result Start str)
@@ -75,9 +76,8 @@
 (defun content-key-of (names: str texts: (Vec str) prelude: str) -> str
   (str-join [names "#" (str-join (mapv (fn (t: str) (str-join [(show (hash t)) ":" (show (str-len t)) ","])) texts)) "#" (show (hash prelude)) ":" (show (str-len prelude))]))
 
-;; What the loader of a batch tells its check: the key of the first `k` modules of the program, the library. Set before the check of each file.
-(def hint: (Atom (Option (Pair str i64))) (atom nil))
+;; What the loader of a batch tells its check: the key of the first `k` modules of the program, the library. Kept in the batch's `Shared`
+;; and set before the check of each file.
+(defun hint-set (sh: Shared key: str k: i64) -> unit (set! (. sh hint) (some (Pair key k))))
 
-(defun hint-set (key: str k: i64) -> unit (reset! hint (some (Pair key k))))
-
-(defun hint-get () -> (Option (Pair str i64)) @hint)
+(defun hint-get (sh: Shared) -> (Option (Pair str i64)) @(. sh hint))
