@@ -42,6 +42,10 @@ tool_sh-serve-run := $(T)/serve/run.sh $(F_ABS) | $(wildcard $(T)/serve/*)
 # the three batch comparisons (each builds its own emit tool), and the server edits. PERSIST_PARTS are queued right after the fixed point (mk/gate.mk).
 PERSIST_PARTS := cmd-0 cmd-1 cmd-2 batch-verify batch-onoff batch-single server
 $(foreach p,$(PERSIST_PARTS),$(eval tool_sh-persist-$(p) := $(T)/persist/run.sh $(F_ABS) $(p) | $(wildcard $(T)/persist/*)))
+# The three batch shares use the emit tool the golden suites already build (build/golden/tools/emit: F builds compiler/emit.fib, the same program they
+# would each build, 24 s of one core each): one build for the four users (docs/design/gate-profile.md).
+PERSIST_EMIT_BIN := $(abspath $(GOLDEN_DIR)/tools/emit)
+$(foreach p,batch-verify batch-onoff batch-single,$(eval tool_sh-persist-$(p) := env PERSIST_EMIT=$(PERSIST_EMIT_BIN) $(T)/persist/run.sh $(F_ABS) $(p) | $(wildcard $(T)/persist/*) $(GOLDEN_DIR)/tools/emit))
 PERSIST_STAMPS := $(addprefix sh-persist-,$(PERSIST_PARTS))
 tool_sh-emit-resume := $(T)/emit/resume.sh $(F_ABS) | $(T)/emit/resume.sh
 tool_sh-emit-windows := $(T)/emit/windows.sh $(F_ABS) | $(T)/emit/windows.sh $(T)/emit/inspect.fib
