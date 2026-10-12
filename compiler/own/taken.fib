@@ -31,7 +31,11 @@
 ;; Rust: taken.rs:66 `for_each_value`: the globals named as a value in every body of the program that was checked (the units, in
 ;; the order they were checked; a program checked on demand, types.infer.demand, has no unit for what it cannot reach, and a body that
 ;; was not typed has no resolutions to read): `defun`s, `impl` methods, `def`s.
-(defun taken-values :private (p: TypedProgram) -> (Vec TakenValue)
+(defun taken-values (p: TypedProgram) -> (Vec TakenValue)
+  (taken-values-in p (. p units)))
+
+;; `taken-values` of the given units of `p` only (own.staged takes those of the library once and those of the program on each run).
+(defun taken-values-in (p: TypedProgram units: (Vec UnitRef)) -> (Vec TakenValue)
   (let ((g (. p globals)))
     (reduce (fn (acc: (Vec TakenValue) u: UnitRef)
               (match u
@@ -39,22 +43,25 @@
                 ((UMacro f) (values-in (. (g-fun g f) body) acc))
                 ((UImplMethod i m) (values-in (. (nth (. (table-get (. g instances) i) methods) m) body) acc))
                 ((UDef d) (values-in (. (g-def g d) init) acc))))
-            [] (. p units))))
+            [] units)))
 
 ;; Rust: taken.rs:22 `value_taken`: the `defun`s used as values anywhere: a function name in any
 ;; position but the head of a call (§8.4); they have an all-owned body.
 (defun value-taken (p: TypedProgram) -> (Set i64)
+  (value-taken-of (taken-values p)))
+
+(defun value-taken-of (vs: (Vec TakenValue)) -> (Set i64)
   (reduce (fn (acc: (Set i64) v: TakenValue)
             (match (. v ref) ((GFun f) (conj acc f)) (_ acc)))
-          (set-empty) (taken-values p)))
+          (set-empty) vs))
 
 ;; Rust: taken.rs:47 `implementations`: the implementations `(instance, method)` that the method
 ;; value e of method i of proto may run.
-(defun implementations :private (p: TypedProgram insts: (Vec InstanceDef) e: i64 proto: i64 i: i64)
+(defun implementations :private (p: TypedProgram insts: (Vec InstanceDef) from: i64 e: i64 proto: i64 i: i64)
   -> (Vec (Pair i64 i64))
   (let ((candidates (match (get (. p resolutions) e)
-                      ((some (ResInstance k _)) [k])
-                      (_ (filterv (fn (k: i64) (= (. (nth insts k) proto) proto)) (range (count insts)))))))
+                      ((some (ResInstance k _)) (if (>= k from) [k] []))
+                      (_ (filterv (fn (k: i64) (= (. (nth insts k) proto) proto)) (range from (count insts)))))))
     (vec (keep (fn (k: i64)
                  (if-some [m (find-first (fn (m: i64) (= (. (nth (. (nth insts k) methods) m) index) i))
                                          (range (count (. (nth insts k) methods))))]
@@ -65,9 +72,14 @@
 ;; Rust: taken.rs:35 `methods_taken`: the method implementations `(instance, method)` that a method
 ;; value may run; a built-in instance has no implementation to run and is left out.
 (defun methods-taken (p: TypedProgram) -> (Set (Pair i64 i64))
+  (methods-taken-of p (taken-values p) 0))
+
+;; `methods-taken` for the values `vs` of `p`, counting only the instances from row `from` on (own.staged: the values of the library against
+;; the instances of the program, and those of the program against all of them).
+(defun methods-taken-of (p: TypedProgram vs: (Vec TakenValue) from: i64) -> (Set (Pair i64 i64))
   (let ((insts (table-rows (. (. p globals) instances))))
     (reduce (fn (acc: (Set (Pair i64 i64)) v: TakenValue)
               (match (. v ref)
-                ((GMethod proto i) (into acc (implementations p insts (. v expr) proto i)))
+                ((GMethod proto i) (into acc (implementations p insts from (. v expr) proto i)))
                 (_ acc)))
-            (set-empty) (taken-values p))))
+            (set-empty) vs)))

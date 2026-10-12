@@ -152,6 +152,9 @@
    vec: (Cell (Option i64))
    deref-proto: (Cell (Option i64))
    expr-count: (Cell i64)
+   ;; The next id of an expression the elaboration makes (types.elab): its own range, above every id lowering gives, so that the ids of the
+   ;; program's expressions do not depend on when the library was elaborated (own.staged).
+   elab-count: (Cell i64)
    ;; The code generation target the front end was told (nil: none, `target-default` stands for it); set once before lowering.
    target: (Cell (Option Target))
    ;; Compile-time warnings, `FILE:LINE:COL: warning: TEXT`, each once, in the order found; the driver prints them (driver.front).
@@ -166,7 +169,7 @@
   (Globals (table-new) (table-new) (table-new) (table-new) (table-new)
            (table-new) (table-new) (table-new) (table-new)
            (cell module-main) (cell (map-empty)) (cell 0) (cell nil) (cell nil)
-           (cell nil) (cell 0) (cell nil) (cell []) (cell [])))
+           (cell nil) (cell 0) (cell elab-id-base) (cell nil) (cell []) (cell [])))
 
 ;; The target `:native`, `f32xn` and `native-lanes` are resolved against: the one the front end was told, else the default.
 (defun g-target (g: Globals) -> Target
@@ -213,6 +216,14 @@
   (match (get @(. g instance-index) (InstKey proto con))
     ((some i) (table-find (. g instances) i))
     (nil nil)))
+
+;; The first id of an expression made by the elaboration: 2^40, far above the ids lowering makes.
+(def elab-id-base: i64 1099511627776)
+
+;; The next id of an expression the elaboration makes.
+(defun g-next-elab-expr (g: Globals) -> i64
+  (let ((id @(. g elab-count)))
+    (do (set! (. g elab-count) (+ id 1)) id)))
 
 ;; The next expression id (`ExprId(expr_count)`, then one more).
 (defun g-next-expr (g: Globals) -> i64

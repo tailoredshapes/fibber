@@ -29,7 +29,7 @@
   (:require [syntax.reader :as reader] [syntax.dump :as sdump] [expand.modules :as mods]
             [expand.program :as prog] [types.driver :as driver] [expand.shared :as sh])
   (:use syntax.pos syntax.form syntax.error expand.error expand.types expand.ctx expand.roots expand.maker
-        types.args types.error types.decls types.dump.normal types.dump.tables types.dump.sections))
+        types.args types.error types.decls types.program types.dump.normal types.dump.tables types.dump.sections))
 
 ;; One file's output: its lines and the status it adds. A line has no newline.
 (defstruct Dumped (lines: (Vec str) status: i64))
@@ -212,12 +212,13 @@
 (defun expand-shared :private (lines: (Vec str) ctx: ExpandCtx loaded: (Vec Loaded) runner: Runner s: sh/Shared)
     -> (Result (Vec Expanded) Dumped)
   (let ((k (sh/implicit-count loaded)) (n (count loaded)) (key (sh/prefix-key loaded k)))
+    (do (sh/hint-set (sh/content-key loaded k) k)
     (match (sh/shared-prefix s key)
       ((some p) (expand-range lines (. p fst) loaded runner k n (. p snd)))
       (nil (match (expand-range lines ctx loaded runner 0 k (vec-empty))
              ((Err d) (Err d))
              ((Ok done) (do (when (> k 0) (sh/shared-keep s key ctx done))
-                            (expand-range lines ctx loaded runner k n done))))))))
+                            (expand-range lines ctx loaded runner k n done)))))))))
 
 (defun dump-program-shared :private (lines: (Vec str) source: str file: str opts: Options roots: Roots rm: RunnerMaker
                                      check: (fn ((Vec str) (Vec Expanded) (Vec Stx) (Vec Shown) str Options) Dumped) :borrow
@@ -243,9 +244,31 @@
           (nil (Dumped (conj header "unreadable") 2))
           ((some source) (dump-program-shared header source file opts roots rm check s))))))
 
-;; `types-file-with` for a file of a batch.
-(defun types-file-shared (file: str opts: Options rm: RunnerMaker s: sh/Shared) -> Dumped
-  (dump-file-shared file opts (roots-default) rm check-and-dump s))
+;; `check-and-dump` where the typed program, past the lowering stage, is the one `infer` gives for the modules, the prelude and whether `main` is
+;; required (the persistent checker keeps the library's, own.staged); lowering errors and inference errors are told the same way.
+(defun check-and-dump-via :private (infer: (fn ((Vec Expanded) (Vec Stx) bool) (Result TypedProgram (Vec TypeError))) :borrow
+                                    lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx)
+                                    layout: (Vec Shown) home: str opts: Options) -> Dumped
+  (if (= (. opts stage) StLower)
+      (check-and-dump lines modules prelude layout home opts)
+      (let ((a (match (infer modules prelude (not (. opts library)))
+                 ((Err errs) (error-dump lines errs home (wants opts SecError)))
+                 ((Ok t) (Dumped (sections-text lines (View (. t globals) (some t)) layout opts) 0)))))
+        (if (= (sys-getenv "FIB_CHECK_CACHE") (some "verify"))   ; the control: the whole check as well, the same bytes (own.staged)
+            (let ((b (check-and-dump lines modules prelude layout home opts)))
+              (if (and (= (. a lines) (. b lines)) (= (. a status) (. b status)))
+                  a
+                  (do (eprintln (str-join ["check-cache verify: the output differs for " home]))
+                      (Dumped (conj (. a lines) "#### CHECK-CACHE MISMATCH") 97))))
+            a))))
+
+;; `types-file-with` for a file of a batch, typed by `infer`.
+(defun types-file-shared (file: str opts: Options rm: RunnerMaker s: sh/Shared
+                          infer: (fn ((Vec Expanded) (Vec Stx) bool) (Result TypedProgram (Vec TypeError))) :borrow) -> Dumped
+  (dump-file-shared file opts (roots-default) rm
+                    (fn (lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx) layout: (Vec Shown) home: str o: Options)
+                      (check-and-dump-via infer lines modules prelude layout home o))
+                    s))
 
 ;; What the tool prints before its first file: the `builtins` table when the `tables` section is
 ;; asked for (`types_here`).

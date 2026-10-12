@@ -1,0 +1,246 @@
+;; compiler/own/staged.fib: the persistent checker (docs/design/persistent-checker.md). The front end through the ownership pass in two
+;; stages: the first `k` modules (the library: the implicit modules) lowered, typed, elaborated and decided once, the state kept; then,
+;; for each program, a copy of that state continues with the program's own modules. A tool that checks many programs in one process
+;; (`emit-dump --batch`, `types --batch`), the server and the REPL pay for the library once.
+;;
+;; The state kept (`Prefix`) is never changed: a program works on copies of its Cells (types.persist), so a program cannot change what
+;; the next one starts from. What the second stage reads of the first: the globals (tables, names, counters), the checker (environment,
+;; store, tables, the units in order) and the ownership state (summaries, bodies, the order, the sets of functions and methods taken as
+;; values). What the library's decisions would depend on in the program, and how each is handled:
+;; - the functions whose value the program takes, and the method implementations a method value may run (own.taken): the library's
+;;   units are all decided with an all-owned body as well (`top-start` with every function), so the program's takes need nothing from
+;;   the library again; the sets in the finished program are the true ones (the library's takes, the program's, and the library's
+;;   method values against the program's instances).
+;; - the instances the program adds: a library body never names one (it would not have checked), so the library's resolutions are final.
+;; - the expression ids: the library is lowered first in every flow, so its ids are the same; the elaboration of the library, which
+;;   runs before the program is lowered, takes its new ids from a range of its own (types.decls `elab-id-base`), so the program's ids,
+;;   and the closure names that carry them, are those of a run that lowers everything first. The ids of the bindings the elaboration
+;;   makes (one for each `or` pattern) are not kept apart: the program's binding ids are shifted by their count; nothing prints a
+;;   binding id but the dumps of the `tables` section (no golden holds one).
+;; A library that does not check (an error in the prefix) is not kept: the run is the whole check, as without a memo.
+(ns own.staged
+  (:require [expand.shared :as sh])
+  (:use syntax.form expand.types types.ty types.table types.decls types.target types.error types.program types.driver types.persist
+        types.elab types.infer.cx types.infer.mod types.infer.demand own.error own.program own.syntactic own.views own.kernel
+        own.taken own.top own.driver))
+
+;; How many rows each table had after the first stage: what the second stage starts from.
+(defstruct Cuts (funs: i64 defs: i64 insts: i64 kernels: i64 order: i64 units: i64))
+
+;; The state after the first `k` modules. `top` is nil when the ownership pass was not run (a tool that only types).
+(defstruct Prefix
+  (lw: Lowering ck: Checker cuts: Cuts top: (Option TopState) known: (Set (Pair i64 i64)) taken: (Vec TakenValue) k: i64 print: str))
+
+;; The sizes of everything the kept state holds, as text: the control (FIB_CHECK_CACHE=verify) that a run did not change it, by comparing this
+;; before and after (a run that wrote into the kept tables or cells would change a size).
+(defun state-print (lw: Lowering ck: Checker) -> str
+  (let ((g (. lw g)) (t (. ck t)) (st (. ck st)))
+    (str-join (mapv (fn (n: i64) (str (show n) " "))
+                    [(table-count (. g types)) (table-count (. g protos)) (table-count (. g instances)) (table-count (. g funs)) (table-count (. g defs))
+                     (table-count (. g externs)) (table-count (. g builtin-schemes)) (table-count (. g bindings)) (table-count (. g modules))
+                     @(. g expr-count) @(. g elab-count) (map-count @(. g instance-index)) (count @(. g warnings)) (count @(. g kernels))
+                     (map-count @(. (. ck env) funs)) (map-count @(. (. ck env) defs)) (map-count @(. st nodes)) @(. st colours) @(. st level)
+                     (map-count @(. t expr-types)) (map-count @(. t binding-types)) (map-count @(. t instantiations)) (map-count @(. t resolutions))
+                     (map-count @(. t fn-colours)) (count @(. ck order)) (count @(. ck errors)) (count (. lw items))
+                     (reduce (fn (a: i64 m: ModuleInfo) (+ a (map-count @(. (. m names) values)))) 0 (table-rows (. g modules)))]))))
+
+;; The memo of one process: the prefix last built, under the key the caller gave it (nil, or a prefix that did not check: `bad`).
+(defstruct Memo (key: (Cell str) prefix: (Cell (Option Prefix)) bad: (Cell str)))
+
+(defun memo-new () -> Memo (Memo (cell "") (cell nil) (cell "")))
+
+(defun type-stop :private (errs: (Vec TypeError)) -> CheckError (CeType errs))
+
+;; ---- the first stage
+
+(defun all-funs :private (units: (Vec UnitRef)) -> (Set i64)
+  (reduce (fn (acc: (Set i64) u: UnitRef)
+            (match u
+              ((UScc fs) (into acc fs))
+              ((UMacro f) (conj acc f))
+              (_ acc)))
+          (set-empty) units))
+
+;; The ownership pass over the library with every function and method decided as if its value were taken, then the true sets.
+(defun prefix-own :private (lw: Lowering ck: Checker k: i64 p: TypedProgram) -> (Result Prefix CheckError)
+  (let ((g (. lw g)) (kerrs (kernel-check p)))
+    (if (not (empty? kerrs))
+        (Err (CeOwn kerrs))
+        (let ((known (method-units p))
+              (tvs (taken-values p))
+              (t (analyse-from p known (top-start (all-funs (. p units)) known) (. p units))))
+          (if (not (empty? (. t errors)))
+              (Err (CeOwn (. t errors)))
+              (let ((verrs (views-owned p (. t prog))))
+                (if (not (empty? verrs))
+                    (Err (CeOwn verrs))
+                    (Ok (Prefix lw ck (Cuts (table-count (. g funs)) (table-count (. g defs)) (table-count (. g instances))
+                                            (count @(. g kernels)) (count (. (. t prog) order)) (count (. p units)))
+                                (some (TopState (with (. t prog) (value-taken (value-taken-of tvs)) (methods-taken (methods-taken-of p tvs 0)))
+                                                [] (. t hoisted)))
+                                known tvs k (state-print lw ck))))))))))
+
+;; The first `k` of `modules` and the prelude lowered, typed (every unit, no demand), elaborated, and decided when `own`.
+(defun prefix-build (modules: (Vec Expanded) prelude: (Vec Stx) target: (Option Target) k: i64 own: bool) -> (Result Prefix CheckError)
+  (match (lower-first modules prelude target k)
+    ((Err errs) (Err (CeType errs)))
+    ((Ok lw)
+     (let ((g (. lw g)) (amp (if own (into (syntactic-check g) (views-syntactic g)) [])))
+       (if (not (empty? amp))
+           (Err (CeOwn amp))
+           (let ((ck (checker-new g)))
+             (do (checker-module-of ck (. lw prelude) nil)
+                 (doseq [items (. lw items)] (checker-module-of ck items nil))
+                 (if (not (empty? @(. ck errors)))
+                     (Err (CeType @(. ck errors)))
+                     (do (elaborate g (. ck t))
+                         (let ((p (program-new g (. ck env) (. ck t) @(. ck order))))
+                           (if own
+                               (prefix-own lw ck k p)
+                               (Ok (Prefix lw ck (Cuts (table-count (. g funs)) (table-count (. g defs)) (table-count (. g instances))
+                                                       (count @(. g kernels)) 0 (count (. p units)))
+                                           nil (set-empty) [] k (state-print lw ck))))))))))))))
+
+;; The prefix for `key`: the kept one, else built from `modules` and kept (a prefix that does not check is remembered as bad, with its error).
+(defun prefix-of (m: Memo key: str modules: (Vec Expanded) prelude: (Vec Stx) target: (Option Target) k: i64 own: bool)
+    -> (Result Prefix CheckError)
+  (match @(. m prefix)
+    ((some p) :when (= @(. m key) key) (Ok p))
+    (_ (if (= @(. m bad) key)
+           (Err (CeInternal "the library does not check"))
+           (match (prefix-build modules prelude target k own)
+             ((Ok p) (do (set! (. m key) key) (set! (. m prefix) (some p)) (Ok p)))
+             ((Err e) (do (set! (. m bad) key) (Err e))))))))
+
+;; ---- the second stage
+
+;; The copy of the state a program starts from: its globals with the program's modules lowered into them.
+(defun stage-lower (pre: Prefix modules: (Vec Expanded)) -> (Result Lowering (Vec TypeError))
+  (let ((lw (. pre lw)))
+    (lower-more (Lowering (globals-copy (. lw g)) (. lw prelude) (. lw items) (. lw ids)) modules (. pre k))))
+
+;; Types the program's modules in a copy of the kept checker, elaborates them: the typed program, or the errors. With `library` (one flag for each
+;; module: whether it is the library's) the units of the library the program cannot reach are left unchecked (types.infer.demand), as `own-check-lowered-with`
+;; does; the modules of the kept state are checked whole.
+(defun stage-infer (pre: Prefix lw: Lowering main: bool library: (Option (Vec bool))) -> (Result TypedProgram (Vec TypeError))
+  (let ((g (. lw g)) (c (. pre cuts)) (ck (checker-copy (. pre ck) (. lw g)))
+        (want (match library
+                (nil nil)
+                ((some flags) (some (demand-of g (. lw prelude) (. lw items) flags))))))
+    (do (doseq [items (drop (. pre k) (. lw items))] (checker-module-of ck items want))
+        (when main (checker-check-main ck))
+        (if (empty? @(. ck errors))
+            (do (elaborate-from g (. ck t) (. c funs) (. c defs) (. c insts))
+                (Ok (program-new g (. ck env) (. ck t) @(. ck order))))
+            (Err @(. ck errors))))))
+
+;; The ownership pass over the program's units, from the state the library left: the sets of what is taken as a value are the true ones for
+;; the whole program (a function or method of the library already has its all-owned body, see `prefix-own`).
+(defun stage-own (pre: Prefix p: TypedProgram) -> (Result OwnedProgram CheckError)
+  (match (. pre top)
+    (nil (Err (CeInternal "the kept state has no ownership pass")))
+    ((some top)
+     (let ((c (. pre cuts))
+           (mine (vec (drop (. c units) (. p units))))
+           (tvs (taken-values-in p mine))
+           (vt (into (. (. top prog) value-taken) (vec (value-taken-of tvs))))
+           (mt (into (into (. (. top prog) methods-taken) (vec (methods-taken-of p tvs 0)))
+                     (vec (methods-taken-of p (. pre taken) (. c insts)))))
+           (known (into (. pre known) (vec (method-units-in mine))))
+           (t (analyse-from p known (TopState (with (. top prog) (value-taken vt) (methods-taken mt)) [] (. top hoisted)) mine)))
+       (if (empty? (. t errors)) (Ok (. t prog)) (Err (CeOwn (. t errors))))))))
+
+;; The checks of `own-check-lowered-with` for the program's part, in its order: the `&` checks, inference, the kernels, the ownership pass,
+;; the view rules.
+(defun stage-check (pre: Prefix modules: (Vec Expanded) main: bool library: (Option (Vec bool))) -> (Result Checked CheckError)
+  (let ((t0 (sys-clock-now)))
+    (match (stage-lower pre modules)
+      ((Err errs) (Err (CeType errs)))
+      ((Ok lw)
+       (let ((c (. pre cuts)) (g (. lw g)) (t1 (phase-note "stage.lower" t0))
+             (amp (into (syntactic-check-from g (. c funs) (. c insts) (. c defs)) (views-syntactic-from g (. c funs) (. c insts) (. c defs)))))
+         (if (not (empty? amp))
+             (Err (CeOwn amp))
+             (match (stage-infer pre lw main library)
+               ((Err errs) (Err (CeType errs)))
+               ((Ok p) (stage-decide pre p (phase-note "stage.infer" t1))))))))))
+
+;; The kernels, the ownership pass and the view rules of the program's part.
+(defun stage-decide :private (pre: Prefix p: TypedProgram t0: i64) -> (Result Checked CheckError)
+  (let ((c (. pre cuts)) (kerrs (kernel-check-from p (. c kernels))))
+    (if (not (empty? kerrs))
+        (Err (CeOwn kerrs))
+        (match (stage-own pre p)
+          ((Err e) (Err e))
+          ((Ok owned)
+           (let ((verrs (views-owned-from p owned (. c order))) (t1 (phase-note "stage.own" t0)))
+             (if (empty? verrs) (Ok (Checked p owned)) (Err (CeOwn verrs)))))))))
+
+;; ---- the entry points
+
+;; `own-check-modules` for `main`: lower, check, decide.
+(defun check-whole (modules: (Vec Expanded) prelude: (Vec Stx) target: (Option Target) main: bool library: (Option (Vec bool)))
+    -> (Result Checked CheckError)
+  (match (lower-modules-for modules prelude target)
+    ((Err errs) (Err (CeType errs)))
+    ((Ok l) (own-check-lowered-with l main library))))
+
+;; The front end through the ownership pass of the expanded `modules` whose first `k` are the library under `key` (the contents of the
+;; prelude and of those modules, and the target): the library's state from the memo, built once. The checked program is that of
+;; `own-check-modules-for` with `main`, apart from the ids the elaboration of the library takes.
+(defun staged-check (m: Memo key: str k: i64 modules: (Vec Expanded) prelude: (Vec Stx) target: (Option Target) main: bool
+                     library: (Option (Vec bool))) -> (Result Checked CheckError)
+  (match (prefix-of m key modules prelude target k true)
+    ((Ok pre) (let ((r (stage-check pre modules main library)))
+                (if (intact? pre) r (Err (CeInternal "FIB_CHECK_CACHE=verify: a run changed the kept library state")))))
+    ((Err _) (check-whole modules prelude target main library))))
+
+;; Whether the kept state is as it was made (the control of FIB_CHECK_CACHE=verify; otherwise true without looking).
+(defun intact? :private (pre: Prefix) -> bool
+  (or (not (= (cache-mode) "verify")) (= (state-print (. pre lw) (. pre ck)) (. pre print))))
+
+;; `check-modules` (types only) the same way: the typed program, or the errors of lowering and inference.
+(defun staged-typed (m: Memo key: str k: i64 modules: (Vec Expanded) prelude: (Vec Stx) main: bool) -> (Result TypedProgram (Vec TypeError))
+  (match (prefix-of m key modules prelude nil k false)
+    ((Ok pre)
+     (match (stage-lower pre modules)
+       ((Err errs) (Err errs))
+       ((Ok lw) (let ((r (stage-infer pre lw main nil)))
+                  (if (intact? pre) r (Err [(type-error-other (builtin-pos) "FIB_CHECK_CACHE=verify: a run changed the kept library state")]))))))
+    ((Err _)
+     (match (lower-modules modules prelude)
+       ((Err errs) (Err errs))
+       ((Ok l) (infer-lowered l main))))))
+
+;; `staged-check` for the library the loader of a batch named (expand.shared `hint-set`): the whole check when there is no memo or no hint.
+(defun check-with-hint (memo: (Option Memo) modules: (Vec Expanded) prelude: (Vec Stx) main: bool) -> (Result Checked CheckError)
+  (match memo
+    ((some m) (match (sh/hint-get)
+                ((some h) (staged-check m (. h fst) (. h snd) modules prelude nil main nil))
+                (nil (check-whole modules prelude nil main nil))))
+    (nil (check-whole modules prelude nil main nil))))
+
+;; `staged-typed` for the library the loader of a batch named, as `check-with-hint`.
+(defun typed-with-hint (m: Memo modules: (Vec Expanded) prelude: (Vec Stx) main: bool) -> (Result TypedProgram (Vec TypeError))
+  (match (sh/hint-get)
+    ((some h) (staged-typed m (. h fst) (. h snd) modules prelude main))
+    (nil (typed-whole modules prelude main))))
+
+;; The whole check of the types, nothing kept.
+(defun typed-whole (modules: (Vec Expanded) prelude: (Vec Stx) main: bool) -> (Result TypedProgram (Vec TypeError))
+  (match (lower-modules modules prelude)
+    ((Err errs) (Err errs))
+    ((Ok l) (infer-lowered l main))))
+
+;; FIB_CHECK_CACHE: `off` (the whole check each time), `verify` (both ways, the caller compares what they give), else `on`.
+(defun cache-mode () -> str
+  (match (sys-getenv "FIB_CHECK_CACHE")
+    ((some "off") "off")
+    ((some "verify") "verify")
+    (_ "on")))
+
+;; Whether the state the memo keeps is as it was made (the programs checked through it did not change it).
+(defun memo-intact? (m: Memo) -> bool
+  (match @(. m prefix)
+    ((some pre) (= (state-print (. pre lw) (. pre ck)) (. pre print)))
+    (nil true)))

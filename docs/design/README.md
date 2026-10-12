@@ -44,6 +44,7 @@ earlier plan where they differ.
 - [OS abstraction](os.md)
 - [Projects and git dependencies: fibber's first package manager](packages.md)
 - [Parallelism for fibber: a work-stealing scheduler, structured scopes, parallel tensors, cheap shared counts](parallelism.md)
+- [The persistent checker: the library lowered, typed and decided once](persistent-checker.md)
 - [The platform boundary: what fibber bundles and what it assumes](platform-boundary.md)
 - [Sequential relational search](relational-search.md)
 - [SIMD vectors and `fib.tensor`](simd-and-tensors.md)

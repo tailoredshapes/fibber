@@ -241,19 +241,24 @@
     (_ (top-unit p (hoist-methods p known t (. (unit-refs p u) methods) (set-empty)) u))))
 
 ;; The method units of the program.
-(defun method-units :private (p: TypedProgram) -> (Set (Pair i64 i64))
+(defun method-units (p: TypedProgram) -> (Set (Pair i64 i64))
+  (method-units-in (. p units)))
+
+(defun method-units-in (units: (Vec UnitRef)) -> (Set (Pair i64 i64))
   (reduce (fn (acc: (Set (Pair i64 i64)) u: UnitRef)
             (match u ((UImplMethod i m) (conj acc (Pair i m))) (_ acc)))
-          (set-empty) (. p units)))
+          (set-empty) units))
+
+;; The pass over `units` from the state `t`: `known` is every method unit of the program (the ones of units not yet met included).
+(defun analyse-from (p: TypedProgram known: (Set (Pair i64 i64)) t: TopState units: (Vec UnitRef)) -> TopState
+  (reduce (fn (a: TopState u: UnitRef) (order-unit p known a u)) t units))
+
+;; The state before the first unit, with the functions whose value is taken and the method implementations a method value may run.
+(defun top-start (vt: (Set i64) mt: (Set (Pair i64 i64))) -> TopState
+  (TopState (with (owned-program-new) (value-taken vt) (methods-taken mt)) [] (set-empty)))
 
 ;; Rust: top.rs:25 `analyse`: runs the ownership pass over a typed program: the `OwnedProgram`
 ;; (with the facts of each unit in `unit-facts`), or the ownership errors.
 (defun analyse (p: TypedProgram) -> (Result OwnedProgram (Vec OwnError))
-  (let [known (method-units p)
-        t (reduce (fn (t: TopState u: UnitRef) (order-unit p known t u))
-                  (TopState (with (owned-program-new)
-                              (value-taken (value-taken p))
-                              (methods-taken (methods-taken p)))
-                            [] (set-empty))
-                  (. p units))]
+  (let [t (analyse-from p (method-units p) (top-start (value-taken p) (methods-taken p)) (. p units))]
     (if (empty? (. t errors)) (Ok (. t prog)) (Err (. t errors)))))

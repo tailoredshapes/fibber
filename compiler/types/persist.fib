@@ -1,0 +1,55 @@
+;; compiler/types/persist.fib: copies of the checker's state, so that a state kept after the library can be used again
+;; (docs/design/persistent-checker.md). Everything the lowering and the inference change is a Cell of persistent values
+;; (maps, vectors, numbers), a Table (a Cell over an array that is copied by the first write to a shared one), or a Names
+;; (six Cells) inside a ModuleInfo row. A copy of the Cells is a state that continues where the first stopped and is not
+;; changed by what the copy goes on to do, the way serve.snap does it for the expander's context.
+;; The constructors are positional on purpose: a field added to Globals, Names, Env, Store, Tables or Checker makes this
+;; file fail to compile, which is better than a snapshot that forgets the field.
+(ns types.persist
+  (:use types.ty types.scheme types.store types.table types.ast types.decls types.infer.cx types.infer.mod))
+
+(defun names-copy :private (n: Names) -> Names
+  (Names (cell @(. n values)) (cell @(. n types)) (cell @(. n protos))
+         (cell @(. n private-values)) (cell @(. n private-types)) (cell @(. n private-protos))))
+
+(defun module-copy :private (m: ModuleInfo) -> ModuleInfo
+  (ModuleInfo (. m ns) (names-copy (. m names)) (. m chain) (. m uses) (. m implicit) (. m reexports) (. m aliases)))
+
+;; The modules table with every row's Names copied (the rows hold Cells, which a shared array would share).
+(defun modules-copy :private (t: (Table ModuleInfo)) -> (Table ModuleInfo)
+  (let ((c (table-new)))
+    (do (doseq [m (table-rows t)] (table-add c (module-copy m)))
+        c)))
+
+;; Globals equal to `g` and independent of it.
+(defun globals-copy (g: Globals) -> Globals
+  (Globals (table-copy (. g types)) (table-copy (. g protos)) (table-copy (. g instances))
+           (table-copy (. g funs)) (table-copy (. g defs)) (table-copy (. g externs))
+           (table-copy (. g builtin-schemes)) (table-copy (. g bindings))
+           (modules-copy (. g modules))
+           (cell @(. g main))
+           (cell @(. g instance-index))
+           (cell @(. g option))
+           (cell @(. g form))
+           (cell @(. g vec))
+           (cell @(. g deref-proto))
+           (cell @(. g expr-count))
+           (cell @(. g elab-count))
+           (cell @(. g target))
+           (cell @(. g warnings))
+           (cell @(. g kernels))))
+
+(defun env-copy :private (e: Env) -> Env
+  (Env (cell @(. e funs)) (cell @(. e defs))))
+
+(defun store-copy :private (s: Store) -> Store
+  (Store (cell @(. s nodes)) (cell @(. s colours)) (cell @(. s level)) (cell @(. s lits))))
+
+(defun tables-copy :private (t: Tables) -> Tables
+  (Tables (cell @(. t expr-types)) (cell @(. t binding-types)) (cell @(. t instantiations))
+          (cell @(. t resolutions)) (cell @(. t fn-colours)) (cell @(. t kw-sites))))
+
+;; A checker equal to `ck` and independent of it, over the globals `g` (the copy of ck's globals the caller made).
+(defun checker-copy (ck: Checker g: Globals) -> Checker
+  (Checker g (env-copy (. ck env)) (store-copy (. ck st)) (tables-copy (. ck t))
+           (cell @(. ck errors)) (cell @(. ck order)) (cell @(. ck failed))))

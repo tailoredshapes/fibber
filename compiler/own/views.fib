@@ -295,6 +295,10 @@
 
 ;; The view-rule errors of the whole lowered program, before inference. Nothing is scanned unless `fib.view` is in the program.
 (defun views-syntactic (g: Globals) -> (Vec OwnError)
+  (views-syntactic-from g 0 0 0))
+
+;; `views-syntactic` of the functions from row `f0`, the instances from row `i0` and the defs from row `d0` on (see syntactic-check-from).
+(defun views-syntactic-from (g: Globals f0: i64 i0: i64 d0: i64) -> (Vec OwnError)
   (let [scoped (scoped-types g)]
     (if (empty? (vec scoped))
         []
@@ -302,14 +306,14 @@
                                 (into acc (body-errors g scoped (. f body)
                                                        (mapv (fn (p: ParamDecl) (. p binding))
                                                              (filterv (fn (p: ParamDecl) (. p amp)) (. f params))))))
-                              [] (table-rows (. g funs)))
+                              [] (table-rows-from (. g funs) f0))
               in-impls (reduce (fn (acc: (Vec OwnError) i: InstanceDef)
                                  (reduce (fn (a: (Vec OwnError) m: ImplMethod)
                                            (into a (body-errors g scoped (. m body) [])))
                                          acc (. i methods)))
-                               in-funs (table-rows (. g instances)))]
+                               in-funs (table-rows-from (. g instances) i0))]
           (reduce (fn (acc: (Vec OwnError) d: DefDef) (into acc (body-errors g scoped (. d init) [])))
-                  in-impls (table-rows (. g defs)))))))
+                  in-impls (table-rows-from (. g defs) d0))))))
 
 ;; ---- the pass after the ownership pass
 
@@ -351,6 +355,11 @@
 ;; VC1 and S1 over the bodies of the `defun`s: a view cell, and an `&` parameter of scoped type, is read only by peeks; a parameter
 ;; of scoped type is neither owned nor escapes. The library `fib.view` is trusted as `unsafe` code is.
 (defun views-owned (p: TypedProgram o: OwnedProgram) -> (Vec OwnError)
+  (views-owned-from p o 0))
+
+;; `views-owned` of the bodies decided from position `start` of `(. o order)` on (the earlier ones are those of a state kept after the
+;; library, which was checked when it was made: own.staged).
+(defun views-owned-from (p: TypedProgram o: OwnedProgram start: i64) -> (Vec OwnError)
   (let [g (. p globals) scoped (scoped-types g)]
     (if (empty? (vec scoped))
         []
@@ -362,7 +371,7 @@
                            acc
                            (into acc (fun-view-errors p o scoped f d)))))
                     (_ acc)))
-                [] (. o order)))))
+                [] (vec (drop start (. o order)))))))
 
 (defun fun-view-errors :private (p: TypedProgram o: OwnedProgram scoped: (Set i64) f: i64 d: FunDef) -> (Vec OwnError)
   (let [g (. p globals)

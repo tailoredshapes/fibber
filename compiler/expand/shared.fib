@@ -6,7 +6,7 @@
 ;; under a key of their files (they are expanded the same for every program). Nothing here changes what a file expands to: a tool run with and without
 ;; `--batch` prints the same bytes, which the golden check compares.
 (ns expand.shared
-  (:require [expand.modules :as mods] [expand.program :as prog] [serve.snap :as snap])
+  (:require [expand.modules :as mods] [expand.program :as prog] [expand.libdir :as libdir] [serve.snap :as snap])
   (:use syntax.form expand.types expand.ctx))
 
 (defstruct Shared (base: (Cell (Option ExpandCtx)) prelude: (Cell (Vec Stx))
@@ -61,3 +61,23 @@
 
 ;; What a batch tool prints after each file's section, so that a caller can cut the stream: `#### status N`, the status that file adds.
 (defun batch-trailer (status: i64) -> str (str-concat "#### status " (show status)))
+
+;; ---- the library prefix of the program being checked (the persistent checker, own.staged)
+
+;; The key of the library the checker keeps its state for: the files of the first `k` of `loaded` (names and contents) and the text of
+;; `lib/prelude.fib`. A change to any of them is a different key.
+(defun content-key (loaded: (Vec Loaded) k: i64) -> str
+  (content-key-of (prefix-key loaded k)
+                  (mapv (fn (i: i64) (unwrap-or (read-file (. (nth loaded i) file)) "")) (range k))
+                  (unwrap-or (read-file (str-concat (libdir/library-dir) "/prelude.fib")) "")))
+
+;; `content-key` from the names and files of the modules (`prefix-key`), the text of each and the text of the prelude.
+(defun content-key-of (names: str texts: (Vec str) prelude: str) -> str
+  (str-join [names "#" (str-join (mapv (fn (t: str) (str-join [(show (hash t)) ":" (show (str-len t)) ","])) texts)) "#" (show (hash prelude)) ":" (show (str-len prelude))]))
+
+;; What the loader of a batch tells its check: the key of the first `k` modules of the program, the library. Set before the check of each file.
+(def hint: (Atom (Option (Pair str i64))) (atom nil))
+
+(defun hint-set (key: str k: i64) -> unit (reset! hint (some (Pair key k))))
+
+(defun hint-get () -> (Option (Pair str i64)) @hint)

@@ -7,7 +7,7 @@ MUTANTS_OUT := $(SCRATCH)/mutants
 # what a mutant script plants into: the lib/, compiler/ and rt/ files its text names
 mutant_files = $(sort $(wildcard $(shell grep -o -E '(lib|compiler|rt)/[A-Za-z0-9_./-]+\.(fib|lir)' scripts/mutant-$(1).sh)))
 # the scripts that take [MUTANT..] (default: all) or nothing
-MUTANTS_ALL := blit deps elem-get fieldmove followup http json json-schema lz4 merkle peek recur regex-literal simd-literal utf8-rt crypto-encoding dns
+MUTANTS_ALL := blit deps elem-get fieldmove followup http json json-schema lz4 merkle peek recur regex-literal simd-literal utf8-rt crypto-encoding dns persist
 # the scripts that take MODE|all
 MUTANTS_MODE_ALL := obs parallel
 # the scripts that take F as their argument
