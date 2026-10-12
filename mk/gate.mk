@@ -7,8 +7,9 @@ GATE_MODE ?= full
 GATE_SPECS ?= 0
 GATE_STATIC ?= 0
 GATE_WASM ?= 0
+GATE_CONTROL ?= 0
 FULL_STAMPS := $(BUILD)/version.ok $(BUILD)/runtime-drift.ok $(BUILD)/fixed-point.ok $(GOLDEN_STAMPS) $(TOOLS_FULL_STAMPS) $(BUILD)/adr.ok $(BUILD)/docs.ok $(CASES_DIR)/full.ok \
-  $(BUILD)/static.ok $(BUILD)/wasm.ok $(if $(wildcard specs),$(BUILD)/specs.ok)
+  $(BUILD)/static.ok $(BUILD)/wasm.ok $(if $(wildcard specs),$(BUILD)/specs.ok) $(if $(filter 1,$(GATE_CONTROL)),$(BUILD)/fixed-point-whole.ok)
 QUICK_STAMPS := $(BUILD)/version.ok $(BUILD)/docs-quick.ok $(TOOLS_QUICK_STAMPS) $(CASES_DIR)/quick.ok $(if $(filter 1,$(GATE_STATIC)),$(BUILD)/static.ok) \
   $(if $(filter 1,$(GATE_WASM)),$(BUILD)/wasm.ok) $(if $(filter 1,$(GATE_SPECS)),$(if $(wildcard specs),$(BUILD)/specs.ok))
 GATE_STAMPS := $(if $(filter quick,$(GATE_MODE)),$(QUICK_STAMPS),$(FULL_STAMPS))
@@ -31,5 +32,5 @@ gate-report:
 	@if $(MAKE) -q --no-print-directory $(if $(filter quick,$(GATE_MODE)),quick-stamps,gate-stamps) GATE_MODE=$(GATE_MODE); then echo "GATE PASS ($(GATE_MODE))"; else echo "GATE FAIL ($(GATE_MODE))"; exit 1; fi
 
 clean-build:   ## remove F, F3 and every stamp (the next gate builds from the seed, as GATE_FRESH=1 does)
-	rm -rf $(BUILD)/F $(BUILD)/F.lir $(BUILD)/F.secs $(BUILD)/F3 $(BUILD)/F3.lir $(BUILD)/*.ok $(BUILD)/golden $(BUILD)/tools $(BUILD)/cases $(BUILD)/adr $(BUILD)/gen-runtime
+	rm -rf $(BUILD)/F $(BUILD)/F.lir $(BUILD)/F.secs $(BUILD)/F3 $(BUILD)/F3w $(BUILD)/F3.lir $(BUILD)/*.ok $(BUILD)/golden $(BUILD)/tools $(BUILD)/cases $(BUILD)/adr $(BUILD)/gen-runtime
 .PHONY: gate quick gate-stamps quick-stamps gate-report clean-build
