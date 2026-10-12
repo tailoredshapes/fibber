@@ -35,10 +35,11 @@ fake_all() {
   mkdir -p "$(dirname "$seed")"; : > "$seed"; chmod +x "$seed"
   for f in $(M -n -p 2> /dev/null | sed -n 's/^FULL_STAMPS := //p' | head -n 1); do mkdir -p "$(dirname "$f")"; echo 1 > "$f"; done
   for f in F F.lir F3 F3.lir gen-runtime adr; do : > "$B/$f"; done; chmod +x "$B/F" "$B/F3" "$B/gen-runtime" "$B/adr"
-  mkdir -p "$B/golden/tools" "$B/tools" "$B/cases"; for t in read expand types own explain emit lairf; do : > "$B/golden/tools/$t"; done
+  # LLVM_LINK=static (CI) makes the merged-LLVM args file a prerequisite of F and the golden tools: it is a product too
+  mkdir -p "$B/llvm-static" "$B/golden/tools" "$B/tools" "$B/cases"; : > "$B/llvm-static/args"; for t in read expand types own explain emit lairf; do : > "$B/golden/tools/$t"; done
   for f in $(M -n -p 2> /dev/null | grep -o "^$B/cases/[a-z]*\.[0-9]*\.txt" | sort -u); do echo "1 cases: 1 pass" > "$f"; done
   # products now (newer than any file of the tree), the stamps a moment later (newer than the products)
-  touch "$seed" "$B"/F "$B"/F.lir "$B"/F3 "$B"/F3.lir "$B"/gen-runtime "$B"/adr "$B"/golden/tools/* "$B"/cases/*.txt
+  touch "$seed" "$B"/llvm-static/args "$B"/F "$B"/F.lir "$B"/F3 "$B"/F3.lir "$B"/gen-runtime "$B"/adr "$B"/golden/tools/* "$B"/cases/*.txt
   sleep 0.05; touch "$B"/*.ok "$B"/golden/*.ok "$B"/tools/*.ok "$B"/cases/*.ok
 }
 fake_all
@@ -155,8 +156,9 @@ fake_all; touch -t 200001010000 "$B/F3" "$B/F3.lir"
 want=$(printf '%s\n' "$B/fixed-point.ok" "$B/tools/jit-selfhosted-threads.ok")
 got=$(M -n gate-stamps | grep -o '^rm -f [^ ;]*\.ok' | sed 's/^rm -f //' | LC_ALL=C sort)
 if [ "$got" = "$(echo "$want" | LC_ALL=C sort)" ]; then ok "12 with F3 out of date only fixed-point and jit-selfhosted-threads rerun"; else fail "12 stamps that wait for F3: $(echo $got) (want fixed-point and jit-selfhosted-threads)"; fi
-cp Makefile "$S/Makefile"; printf '$(BUILD)/wasm.ok: $(BUILD)/F3\n' > "$S/mk/zz3.mk"; printf '\ninclude $(MK)/zz3.mk\n' >> "$S/Makefile"
-got=$(make --no-print-directory -f "$S/Makefile" BUILD="$B" -n gate-stamps | grep -o '^rm -f [^ ;]*\.ok' | sed 's/^rm -f //' | LC_ALL=C sort)
+# a clean copy: check 6 left a mutated tools.mk and zz.mk in $S/mk, and the planted make takes the same -o and MAC_QUICK= as M
+rm -rf "$S/mk"; mkdir -p "$S/mk"; cp Makefile "$S/Makefile"; cp mk/*.mk "$S/mk/"; printf '$(BUILD)/wasm.ok: $(BUILD)/F3\n' > "$S/mk/zz3.mk"; printf '\ninclude $(MK)/zz3.mk\n' >> "$S/Makefile"
+got=$(make --no-print-directory -o compiler/emit/runtime.fib -f "$S/Makefile" BUILD="$B" MAC_QUICK= -n gate-stamps | grep -o '^rm -f [^ ;]*\.ok' | sed 's/^rm -f //' | LC_ALL=C sort)
 if [ "$got" = "$(printf '%s\n' $want "$B/wasm.ok" | LC_ALL=C sort)" ]; then ok "12 plant: a stamp made to depend on F3 reruns with F3 (the check above sees it)"; else fail "12 plant: wasm.ok with an F3 prerequisite did not show: $(echo $got)"; fi
 touch "$B/F3" "$B/F3.lir"; sleep 0.05; touch "$B"/*.ok "$B"/golden/*.ok "$B"/tools/*.ok "$B"/cases/*.ok
 
