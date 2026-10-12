@@ -305,12 +305,20 @@ def parallel_checks(probe, scratch, env):
     status(scratch / "par-whole", env, 8)
     opted = dict(off, FIB_LIRO_PARTITION="1")
     outs = []
+    # One output name in three directories: the macOS linker puts the output's file name in the code signature and derives LC_UUID from the
+    # output path (the objects and their order are the same; 'par-1' against 'par-4' differed in those two fields alone on an M1).
     for name, jobs in [("par-1", "1"), ("par-4", "4"), ("par-4b", "4")]:
-        p = run([probe, "build", 2, src, scratch / name], dict(opted, FIB_LIRO_JOBS=jobs))
+        (scratch / name).mkdir()
+        out = scratch / name / "par"
+        p = run([probe, "build", 2, src, out], dict(opted, FIB_LIRO_JOBS=jobs))
         assert len(re.findall(r"liro: unit \d+", p.stderr)) > 1, p.stderr
-        status(scratch / name, env, 8)
-        outs.append((scratch / name).read_bytes())
+        status(out, env, 8)
+        outs.append(out.read_bytes())
     assert outs[0] == outs[1] == outs[2], "unit order, not completion order, decides the link"
+    other = scratch / "par-other"
+    other.mkdir()
+    run([probe, "build", 2, write(scratch / "par-other.lir", BASE.replace("(i64 7)", "(i64 9)")), other / "par"], dict(opted, FIB_LIRO_JOBS="4"))
+    assert (other / "par").read_bytes() != outs[0], "the comparison must see a different program"
     plain = unit_defs(p)
     for extra in [{"FIB_LIRO_UNITS": "3"}, {"FIB_LIRO_SPLIT": "ns2"}, {"FIB_LIRO_UNITS": "64", "FIB_LIRO_SPLIT": "ns3"}]:
         p = run([probe, "build", 2, src, scratch / "par-x"], dict(opted, FIB_LIRO_JOBS="4", **extra))
