@@ -24,9 +24,11 @@ GATE_STAMPS := $(if $(filter quick,$(GATE_MODE)),$(QUICK_STAMPS),$(FULL_STAMPS))
 GATE_START := $(shell date +%s)
 GATE_JOBS := $(or $(patsubst -j%,%,$(filter -j%,$(MAKEFLAGS))),$(shell getconf _NPROCESSORS_ONLN))
 
-gate-stamps: $(FULL_STAMPS)
+# The longest suite (golden/expand-porter) waits for the build of its tool, which is no stamp: asked for early, so that suite does not start last.
+GATE_HEAD := $(GOLDEN_DIR)/tools/expand
+gate-stamps: $(GATE_HEAD) $(FULL_STAMPS)
 quick-stamps: $(QUICK_STAMPS)
-gate: $(FULL_STAMPS)   ## the full gate: stage 2 from the seed, the fixed point, golden, tools, ADRs, every case directory, static, wasm, specs; then the report
+gate: $(GATE_HEAD) $(FULL_STAMPS)   ## the full gate: stage 2 from the seed, the fixed point, golden, tools, ADRs, every case directory, static, wasm, specs; then the report
 	@$(MAKE) --no-print-directory gate-report GATE_MODE=full GATE_T0=$(GATE_START) GATE_JOBS=$(GATE_JOBS)
 quick: $(QUICK_STAMPS)   ## the quick gate: stage 2, the tool skeletons, ownership, modules and a sample of the stdlib cases; then the report
 	@$(MAKE) --no-print-directory gate-report GATE_MODE=quick GATE_T0=$(GATE_START) GATE_JOBS=$(GATE_JOBS)
