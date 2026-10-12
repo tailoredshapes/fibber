@@ -16,7 +16,9 @@ FULL_UNORDERED := $(BUILD)/gate-report.ok $(BUILD)/version.ok $(BUILD)/runtime-d
 # longest first (the baseline), then those the baseline has not seen. Only fixed-point.ok and the tool that runs F3 (jit-selfhosted-threads)
 # wait for F3; every other stamp needs F alone (compiler/tests/make/graph.sh, check 11).
 GATE_COSTLY := $(addprefix $(BUILD)/,$(addsuffix .ok,$(shell [ -f $(GATE_BASELINE) ] && awk -F'\t' '$$1 == "full" && $$2 !~ /^@/ { print $$3 " " $$2 }' $(GATE_BASELINE) | LC_ALL=C sort -rn | cut -d' ' -f2)))
-FULL_STAMPS := $(BUILD)/fixed-point.ok $(filter-out $(BUILD)/fixed-point.ok,$(filter $(FULL_UNORDERED),$(GATE_COSTLY))) $(filter-out $(BUILD)/fixed-point.ok $(GATE_COSTLY),$(FULL_UNORDERED))
+# GATE_EARLY: the persist shards (about 25 to 50 s each, a stamp the baseline has not seen would be queued last) go right after the fixed point.
+GATE_EARLY := $(addsuffix .ok,$(addprefix $(TOOLS_DIR)/,$(PERSIST_STAMPS)))
+FULL_STAMPS := $(BUILD)/fixed-point.ok $(GATE_EARLY) $(filter-out $(BUILD)/fixed-point.ok $(GATE_EARLY),$(filter $(FULL_UNORDERED),$(GATE_COSTLY))) $(filter-out $(BUILD)/fixed-point.ok $(GATE_EARLY) $(GATE_COSTLY),$(FULL_UNORDERED))
 QUICK_STAMPS := $(BUILD)/gate-report.ok $(BUILD)/version.ok $(BUILD)/docs-quick.ok $(TOOLS_QUICK_STAMPS) $(CASES_DIR)/quick.ok $(if $(filter 1,$(GATE_STATIC)),$(BUILD)/static.ok) \
   $(if $(filter 1,$(GATE_WASM)),$(BUILD)/wasm.ok) $(if $(filter 1,$(GATE_SPECS)),$(if $(wildcard specs),$(BUILD)/specs.ok))
 GATE_STAMPS := $(if $(filter quick,$(GATE_MODE)),$(QUICK_STAMPS),$(FULL_STAMPS))
