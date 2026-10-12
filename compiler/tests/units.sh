@@ -52,7 +52,8 @@ jobs=${UNITS_JOBS:-1}
 case $jobs in ''|*[!0-9]*|0) echo "units: UNITS_JOBS must be positive" >&2; exit 2 ;; esac
 while IFS= read -r group; do
   (run_group "$group" > "$out/$group.log" 2>&1; echo $? > "$out/$group.rc") &
-  while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do sleep 0.1; done
+  # one job at a time (the default, and the gate's one merged group): wait for the group itself, not a poll every 0.1 s that forks twice each time
+  if [ "$jobs" -le 1 ]; then wait "$!"; else while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do sleep 0.1; done; fi
 done < "$out/groups"
 wait
 while IFS= read -r group; do
