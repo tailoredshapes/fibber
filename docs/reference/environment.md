@@ -18,6 +18,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_CC` | [compiler/driver/viac.fib:24](../../compiler/driver/viac.fib#L24) |
 | `FIB_CC_KEEP` | [compiler/driver/viac.fib:123](../../compiler/driver/viac.fib#L123) |
 | `FIB_CC_VERBOSE` | [compiler/driver/viac.fib:99](../../compiler/driver/viac.fib#L99) |
+| `FIB_CHECK_CACHE` | [compiler/driver/front.fib:104](../../compiler/driver/front.fib#L104) |
 | `FIB_C_LINES` | [compiler/driver/viac.fib:47](../../compiler/driver/viac.fib#L47) |
 | `FIB_EMIT_EXE` | [compiler/driver/commands.fib:14](../../compiler/driver/commands.fib#L14) |
 | `FIB_EXPORTS` | [compiler/emit/compile.fib:128](../../compiler/emit/compile.fib#L128) |
@@ -66,7 +67,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_TARGET_FEATURES` | [compiler/llvm/target.fib:196](../../compiler/llvm/target.fib#L196) |
 | `FIB_TARGET_TRIPLE` | [compiler/driver/commands.fib:56](../../compiler/driver/commands.fib#L56) |
 | `FIB_THREADS` | [rt/deque.lir:145](../../rt/deque.lir#L145) |
-| `FIB_TIME` | [compiler/driver/front.fib:106](../../compiler/driver/front.fib#L106) |
+| `FIB_TIME` | [compiler/driver/front.fib:138](../../compiler/driver/front.fib#L138) |
 | `FIB_TRACE` | [compiler/driver/commands.fib:48](../../compiler/driver/commands.fib#L48) |
 | `FIB_VECTOR_BITS` | [compiler/native/liro/context.fib:34](../../compiler/native/liro/context.fib#L34) |
 | `FIB_VIA` | [compiler/driver/viac.fib:22](../../compiler/driver/viac.fib#L22) |
