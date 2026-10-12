@@ -16,6 +16,9 @@
 (declare getenv ptr (ptr))
 (declare strlen i64 (ptr))
 (declare snprintf i32 (ptr i64 ptr ...))
+(declare fdopen ptr (i32 ptr))
+(declare setvbuf i32 (ptr ptr i32 i64))
+(declare fflush i32 (ptr))
 ;; the quotient of float `quot` is rounded toward zero by libm (lower/arith.rs)
 (declare trunc double (double))
 (declare truncf float (float))
@@ -27,6 +30,11 @@
 ;; Trace mode (compiler.md §4): 1 when FIB_TRACE is set; the next
 ;; ordinal; and a buffer for one line.
 (global internal fib.tracing i32 (i32 0))
+;; The stream the trace lines go to in trace mode: a buffered stdio stream on fd 2 (64 KiB), so that a run of millions of events is not millions of
+;; write calls (docs/design/gate-profile.md). Null outside trace mode, or when fdopen failed: then each line is one write, as it was. A line is
+;; one fwrite (stdio holds the stream's lock for the call, so lines of two threads do not mix), exit() flushes the stream, and every place that
+;; writes to fd 2 by itself, or ends the process with abort, calls fib.trace-flush first so that the order of the bytes on fd 2 is the order of the events.
+(global internal fib.errf ptr (ptr null))
 ;; The expansion-time hooks of a macro module (compiler.md §6): null
 ;; in a program, where the builtins they serve never run.
 (global internal fibm.gensym-hook ptr (ptr null))
@@ -55,7 +63,30 @@
     (call @fib.lc-init)
     (let ((v (call @getenv (string "FIB_TRACE"))))
       (br (icmp eq v (ptr null)) done set)))
-  (block set (store (i32 1) @fib.tracing) (br done))
+  (block set
+    (store (i32 1) @fib.tracing)
+    (let ((f (call @fdopen (i32 2) (string "w"))))
+      (store f @fib.errf)
+      (br (icmp eq f (ptr null)) done buffered)))
+  (block buffered (call @setvbuf (load ptr @fib.errf) (ptr null) (i32 0) (i64 65536)) (br done))
+  (block done (ret)))
+
+;; Trace bytes (whole lines) to fd 2: through the buffered stream, or by write where there is none.
+(define internal (fib.trace-out void) ((ptr buf) (i64 n))
+  (block entry (br (icmp eq (load ptr @fib.errf) (ptr null)) raw buffered))
+  (block raw (call @write (i32 2) buf n) (ret))
+  (block buffered (call @fwrite buf (i64 1) n (load ptr @fib.errf)) (ret)))
+
+;; The buffered trace lines go out now (before an abort, and before bytes written to fd 2 by other means).
+(define internal (fib.trace-flush void) ()
+  (block entry (br (icmp eq (load ptr @fib.errf) (ptr null)) done go))
+  (block go (call @fflush (load ptr @fib.errf)) (br done))
+  (block done (ret)))
+
+;; fib.trace-flush for a write the program makes itself: only fd 2 shares the stream's order.
+(define internal (fib.trace-flush-fd void) ((i64 fd))
+  (block entry (br (icmp eq fd (i64 2)) go done))
+  (block go (call @fib.trace-flush) (br done))
   (block done (ret)))
 
 ;; One trace line: "K n c\n" or "K n\n" (c = 0: no class).
@@ -65,11 +96,11 @@
       (br (icmp eq class (i8 0)) short long)))
   (block long
     (let ((len (call @snprintf buf (i64 64) (string "%c %lld %c\n") (zext i32 kind) n (zext i32 class))))
-      (call @write (i32 2) buf (sext i64 len))
+      (call @fib.trace-out buf (sext i64 len))
       (ret)))
   (block short
     (let ((len2 (call @snprintf buf (i64 64) (string "%c %lld\n") (zext i32 kind) n)))
-      (call @write (i32 2) buf (sext i64 len2))
+      (call @fib.trace-out buf (sext i64 len2))
       (ret))))
 
 (define internal (fib.next-ordinal i64) ()
@@ -539,6 +570,7 @@
 ;; "trap: MESSAGE\n" to fd 2, then abort: what a trap is where it is not isolated, and what a fatal failure is everywhere.
 (define internal (fib.fatal-bytes void) ((ptr bytes) (i64 n))
   (block entry
+    (call @fib.trace-flush)
     (call @write (i32 2) (string "trap: ") (i64 6))
     (let ((pre (load ptr @fib.initdef)))
       (br (icmp eq pre (ptr null)) body named)))
@@ -571,6 +603,7 @@
     (call @memcpy line (string "trap in task: ") (i64 14))
     (call @memcpy (getelementptr i8 line (i64 14)) bytes n)
     (store (i8 10) (getelementptr i8 line (add n (i64 14))))
+    (call @fib.trace-flush)
     (call @write (i32 2) line (add n (i64 15)))
     (call @free line)
     (br record))
@@ -795,6 +828,7 @@
 
 (define internal (fib.fatal-finally void) ((ptr bytes) (i64 n))
   (block entry
+    (call @fib.trace-flush)
     (call @write (i32 2) (string "trap: in a finally clause run while unwinding: ") (i64 47))
     (call @write (i32 2) bytes n)
     (call @write (i32 2) (string "\n") (i64 1))
