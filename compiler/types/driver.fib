@@ -93,15 +93,39 @@
                 (try-let ((items (define g d)))
                   (Ok (Pair m items)))))))))
 
-;; The items of each of modules in order, each lowered against the ones before it.
-(defun lower-each :private (g: Globals modules: (Vec Expanded)) -> (Result (Vec ModuleItems) (Vec TypeError))
-  (loop ((i 0) (ids (map-empty)) (items (vec-empty)))
+;; The items of each of modules from index `i0` on, each lowered against the ones before it and `ids` (the modules before `i0`, by namespace),
+;; after `items0`: all the items and all the ids.
+(defun lower-each-from :private (g: Globals modules: (Vec Expanded) i0: i64 ids0: (Map str i64) items0: (Vec ModuleItems))
+    -> (Result (Pair (Vec ModuleItems) (Map str i64)) (Vec TypeError))
+  (loop ((i i0) (ids ids0) (items items0))
     (if (>= i (count modules))
-        (Ok items)
+        (Ok (Pair items ids))
         (let ((e (nth modules i)))
           (match (lower-module g e ids)
             ((Err es) (Err es))
             ((Ok [m its]) (recur (+ i 1) (assoc ids (. (. e spec) ns) m) (conj items its))))))))
+
+;; The items of each of modules in order, each lowered against the ones before it.
+(defun lower-each :private (g: Globals modules: (Vec Expanded)) -> (Result (Vec ModuleItems) (Vec TypeError))
+  (try-let ((r (lower-each-from g modules 0 (map-empty) (vec-empty))))
+    (Ok (. r fst))))
+
+;; The state of lowering after the prelude and the first modules: the globals, the prelude's items, the items of each module
+;; lowered so far and the ids of those modules by namespace (the state the persistent checker keeps, own.staged).
+(defstruct Lowering (g: Globals prelude: ModuleItems items: (Vec ModuleItems) ids: (Map str i64)))
+
+;; Steps 1 to 3 of §3.5 for the prelude and the first `k` of modules, in new globals for the target `target`.
+(defun lower-first (modules: (Vec Expanded) prelude: (Vec Stx) target: (Option Target) k: i64) -> (Result Lowering (Vec TypeError))
+  (try-let ((g (errs-of (new-globals))))
+    (do (set! (. g target) target)
+        (try-let ((prelude-items (lower-prelude g prelude))
+                  (r (lower-each-from g (vec (take k modules)) 0 (map-empty) (vec-empty))))
+          (Ok (Lowering g prelude-items (. r fst) (. r snd)))))))
+
+;; The same state continued: modules from index `from` of `modules` (all of them) lowered into the globals of `lw`, which are changed.
+(defun lower-more (lw: Lowering modules: (Vec Expanded) from: i64) -> (Result Lowering (Vec TypeError))
+  (try-let ((r (lower-each-from (. lw g) modules from (. lw ids) (. lw items))))
+    (Ok (Lowering (. lw g) (. lw prelude) (. r fst) (. r snd)))))
 
 ;; Steps 1 to 3 of §3.5 for the prelude and the program's modules, given in
 ;; dependency order with the main module last: each is declared against the ones

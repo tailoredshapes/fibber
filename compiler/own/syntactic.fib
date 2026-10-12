@@ -20,16 +20,21 @@
 ;; Rust: syntactic.rs:24 `check`: both checks over every body of the program, in definition
 ;; order (`defun`s and macros, `impl` methods, `def`s): the `AmpTwice` and `AmpInAsync` errors.
 (defun syntactic-check (g: Globals) -> (Vec OwnError)
+  (syntactic-check-from g 0 0 0))
+
+;; `syntactic-check` of the functions from row `f0`, the instances from row `i0` and the defs from row `d0` on (the rows before are those of a
+;; state kept after the library, which was checked when it was made: own.staged).
+(defun syntactic-check-from (g: Globals f0: i64 i0: i64 d0: i64) -> (Vec OwnError)
   (let ((in-funs (reduce (fn (acc: (Vec OwnError) f: FunDef)
                            (into (into acc (async-function f)) (distinct-amps g (. f body))))
-                         [] (table-rows (. g funs))))
+                         [] (table-rows-from (. g funs) f0)))
         (in-impls (reduce (fn (acc: (Vec OwnError) i: InstanceDef)
                             (reduce (fn (a: (Vec OwnError) m: ImplMethod)
                                       (into a (distinct-amps g (. m body))))
                                     acc (. i methods)))
-                          in-funs (table-rows (. g instances)))))
+                          in-funs (table-rows-from (. g instances) i0))))
     (reduce (fn (acc: (Vec OwnError) d: DefDef) (into acc (distinct-amps g (. d init))))
-            in-impls (table-rows (. g defs)))))
+            in-impls (table-rows-from (. g defs) d0))))
 
 ;; Rust: syntactic.rs:43 `visit`: calls f on e and every expression inside it, `fn` and `async`
 ;; bodies included, in pre-order.

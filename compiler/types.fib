@@ -19,8 +19,8 @@
 ;; `fibc build compiler/types.fib` proves every module of the port compiles; the
 ;; modules are in dependency order.
 (ns main
-  (:require [types.args :as cli] [types.dump :as dump] [expand.maker :as mk] [expand.shared :as sh] [macros.runner :as mr])
-  (:use types.ty types.scheme types.error types.store types.table types.ast types.decls
+  (:require [types.args :as cli] [types.dump :as dump] [expand.maker :as mk] [expand.shared :as sh] [macros.runner :as mr] [own.staged :as st])
+  (:use syntax.form expand.types types.ty types.scheme types.error types.store types.table types.ast types.decls
         types.names types.display types.annot types.builtins types.init
         types.lower.typeform types.lower.decl types.lower.private types.lower.defaults
         types.lower.protos types.lower.impl-head types.lower.supers types.lower.top
@@ -50,9 +50,10 @@
 
 ;; `--batch`: one process for many files, the library expanded once (expand.shared). Each file's output is as without it, then `#### status N`.
 (defun types-batch (files: (Vec str) opts: cli/Options rm: mk/RunnerMaker) -> i64
-  (let ((s (sh/shared-new)))
+  (let ((s (sh/shared-new)) (memo (st/memo-new)))
     (reduce (fn (status: i64 file: str)
-              (let ((d (dump/types-file-shared file opts rm s)))
+              (let ((d (dump/types-file-shared file opts rm s
+                         (fn (modules: (Vec Expanded) prelude: (Vec Stx) main: bool) (st/typed-with-hint memo modules prelude main)))))
                 (do (print-lines (dump/header-lines opts))
                     (print-lines (. d lines))
                     (println (sh/batch-trailer (. d status)))
