@@ -10,7 +10,7 @@
 ;; (pending: never a pass); the larger wins. It links every module of compiler/emit/, so that `fibc build compiler/emit.fib` proves each
 ;; compiles; the modules are in dependency order.
 (ns main
-  (:require [expand.maker :as mk] [expand.roots :as er] [macros.runner :as mr])
+  (:require [expand.maker :as mk] [expand.shared :as sh] [expand.roots :as er] [macros.runner :as mr])
   (:use emit.value emit.text emit.ir emit.names emit.layout emit.mono emit.objects emit.statics emit.runtime emit.rt
         emit.program emit.inits emit.lower.cx emit.lower.mod emit.lower.ops emit.lower.ctrl
         emit.lower.values emit.lower.call emit.lower.arith emit.lower.objects emit.lower.cells
@@ -18,7 +18,7 @@
         emit.lower.builtins emit.lower.threads emit.resume emit.macros.abi emit.layout-dump emit.assemble emit.defs.mod
         emit.compile emit.args emit.dump types.dump))
 
-(def usage: str "usage: emit [--sections LIST | --fn PREFIX | --layout | --macro NAME] [--] FILE..")
+(def usage: str "usage: emit [--batch] [--sections LIST | --fn PREFIX | --layout | --macro NAME] [--] FILE..")
 
 ;; Prints the output of each of files in order, and returns the largest status.
 (defun emit-files (files: (Vec str) o: EmitOptions rm: mk/RunnerMaker) -> i64
@@ -28,8 +28,21 @@
                   (max status (. d status)))))
           0 files))
 
+;; `--batch`: one process for many files, the library expanded once (expand.shared). Each file's output is as without it, then `#### status N`.
+(defun emit-batch (files: (Vec str) o: EmitOptions rm: mk/RunnerMaker) -> i64
+  (let ((s (sh/shared-new)))
+    (reduce (fn (status: i64 file: str)
+              (let ((d (emit-file-shared file o (er/roots-default) rm s)))
+                (do (doseq [line (. d lines)] (println line))
+                    (println (sh/batch-trailer (. d status)))
+                    (max status (. d status)))))
+            0 files)))
+
 (defun main () -> i64
-  (let ((nr (mk/take-no-runner (vec (args)))))
-    (match (emit-parse-args (. nr words))
-      (nil (do (eprintln usage) 2))
-      ((some parsed) (emit-files (. parsed files) (. parsed opts) (mr/maker-for (. nr no-runner)))))))
+  (let ((b (sh/take-batch (vec (args)))))
+    (let ((nr (mk/take-no-runner (. b snd))))
+      (match (emit-parse-args (. nr words))
+        (nil (do (eprintln usage) 2))
+        ((some parsed) (if (. b fst)
+                           (emit-batch (. parsed files) (. parsed opts) (mr/maker-for (. nr no-runner)))
+                           (emit-files (. parsed files) (. parsed opts) (mr/maker-for (. nr no-runner)))))))))

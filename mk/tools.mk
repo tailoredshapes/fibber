@@ -15,9 +15,9 @@ tool_lint-pipefail := scripts/lint-pipefail.sh | $(shell find scripts $(T) .gith
 tool_lint-portable := scripts/lint-portable.sh | $(shell find scripts $(T) -type f \( -name '*.sh' -o -name '*.mk' \)) Makefile $(wildcard mk/*.mk)
 tool_sh-driver-check-lib := $(T)/driver/check-lib.sh $(F_ABS) | $(T)/driver/check-lib.sh $(wildcard $(T)/driver/linklib/*)
 tool_unit-api := $(T)/unit/run.sh $(TOOLS_OUT)/unit-api | $(wildcard $(T)/unit/*) $(T)/unit-groups.py $(T)/unit-report.py
-tool_units-emit := env UNITS_DIR=emit $(T)/units.sh $(TOOLS_OUT)/units-emit | $(T)/units.sh $(T)/unit-groups.py $(T)/unit-report.py $(T)/units.run $(T)/units.pending $(T)/units.elsewhere $(wildcard $(T)/emit/unit-*.fib)
-tool_units-own := env UNITS_DIR=own $(T)/units.sh $(TOOLS_OUT)/units-own | $(T)/units.sh $(T)/unit-groups.py $(T)/unit-report.py $(T)/units.run $(T)/units.pending $(T)/units.elsewhere $(wildcard $(T)/own/unit-*.fib)
-tool_units-types := env UNITS_DIR=types $(T)/units.sh $(TOOLS_OUT)/units-types | $(T)/units.sh $(T)/unit-groups.py $(T)/unit-report.py $(T)/units.run $(T)/units.pending $(T)/units.elsewhere $(wildcard $(T)/types/*.fib)
+# units-all: every unit module (units.run) as ONE executable at -O 1; units-rest: the ordinary control, a group built as before at -O 2 (docs/design/test-pyramid.md).
+# One group per directory (UNITS_DIR=emit|own|types|rest) still works by hand.
+tool_units-all := env UNITS_DIR=run UNITS_MERGE=1 UNITS_OPT=1 $(T)/units.sh $(TOOLS_OUT)/units-all | $(T)/units.sh $(T)/unit-groups.py $(T)/unit-report.py $(T)/units.run $(T)/units.pending $(T)/units.elsewhere $(wildcard $(T)/*/unit-*.fib) $(wildcard $(T)/types/*.fib) $(wildcard $(T)/gen/*.fib)
 tool_units-rest := env UNITS_DIR=rest $(T)/units.sh $(TOOLS_OUT)/units-rest | $(T)/units.sh $(T)/unit-groups.py $(T)/unit-report.py $(T)/units.run $(T)/units.pending $(T)/units.elsewhere $(wildcard $(T)/*/unit-*.fib) $(wildcard $(T)/gen/*.fib)
 tool_units-pending := env UNITS_DIR=pending $(T)/units.sh $(TOOLS_OUT)/units-pending | $(T)/units.sh $(T)/unit-groups.py $(T)/unit-report.py $(T)/units.run $(T)/units.pending $(T)/units.elsewhere $(wildcard $(T)/*/unit-*.fib)
 tool_shootout-compile := $(T)/shootout-compile.sh $(TOOLS_OUT)/shootout-compile | $(T)/shootout-compile.sh $(wildcard docs/shootout/parallel/*.fib)
@@ -61,7 +61,7 @@ tool_sh-native-gpu-device := $(T)/native/gpu-device.sh | $(T)/native/gpu-device.
 tool_sh-make-graph := $(T)/make/graph.sh | $(wildcard $(T)/make/*) scripts/mac-gate.sh Makefile $(wildcard mk/*.mk)
 
 TOOLS_QUICK := sh-emit-prune fibref-skeleton gen-skeleton lint-pipefail lint-portable sh-driver-check-lib sh-make-graph
-TOOLS_FULL := $(TOOLS_QUICK) unit-api units-emit units-own units-types units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
+TOOLS_FULL := $(TOOLS_QUICK) unit-api units-all units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-emit-runtime sh-emit-defs-order sh-stack-stack \
   sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
   sh-native-l1-unit sh-native-liro jit-selfhosted-threads sh-native-a64-sibcall sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps

@@ -19,7 +19,7 @@
 ;; `fibc build compiler/types.fib` proves every module of the port compiles; the
 ;; modules are in dependency order.
 (ns main
-  (:require [types.args :as cli] [types.dump :as dump] [expand.maker :as mk] [macros.runner :as mr])
+  (:require [types.args :as cli] [types.dump :as dump] [expand.maker :as mk] [expand.shared :as sh] [macros.runner :as mr])
   (:use types.ty types.scheme types.error types.store types.table types.ast types.decls
         types.names types.display types.annot types.builtins types.init
         types.lower.typeform types.lower.decl types.lower.private types.lower.defaults
@@ -33,7 +33,7 @@
         types.exhaust types.program types.driver))
 
 (def usage: str
-  "usage: types [--stage lower|infer] [--sections LIST] [--library] [--implicit] [--implicit-lib LIST] [--prelude] [--ast] [--tables] [--] FILE..")
+  "usage: types [--stage lower|infer] [--sections LIST] [--library] [--implicit] [--implicit-lib LIST] [--prelude] [--ast] [--tables] [--batch] [--] FILE..")
 
 ;; Prints the lines of a dump, each ended by a newline.
 (defun print-lines (lines: (Vec str))
@@ -48,8 +48,22 @@
                       (max status (. d status)))))
               0 files)))
 
+;; `--batch`: one process for many files, the library expanded once (expand.shared). Each file's output is as without it, then `#### status N`.
+(defun types-batch (files: (Vec str) opts: cli/Options rm: mk/RunnerMaker) -> i64
+  (let ((s (sh/shared-new)))
+    (reduce (fn (status: i64 file: str)
+              (let ((d (dump/types-file-shared file opts rm s)))
+                (do (print-lines (dump/header-lines opts))
+                    (print-lines (. d lines))
+                    (println (sh/batch-trailer (. d status)))
+                    (max status (. d status)))))
+            0 files)))
+
 (defun main () -> i64
-  (let ((nr (mk/take-no-runner (vec (args)))))
-    (match (cli/parse-args (. nr words))
-      (nil (do (eprintln usage) 2))
-      ((some parsed) (types-files (. parsed files) (. parsed opts) (mr/maker-for (. nr no-runner)))))))
+  (let ((b (sh/take-batch (vec (args)))))
+    (let ((nr (mk/take-no-runner (. b snd))))
+      (match (cli/parse-args (. nr words))
+        (nil (do (eprintln usage) 2))
+        ((some parsed) (if (. b fst)
+                           (types-batch (. parsed files) (. parsed opts) (mr/maker-for (. nr no-runner)))
+                           (types-files (. parsed files) (. parsed opts) (mr/maker-for (. nr no-runner)))))))))

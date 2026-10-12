@@ -7,7 +7,7 @@
 ;; (the harness counts it as pending, never as a pass). The sections that need no body, `runtime` and `main`, are printed all the same.
 ;; `--macro NAME` (package E11): the macro-time module of the macro, `compile-macro` (emit.macros.front finds the macro, emit-macro prints it).
 (ns emit.dump
-  (:require [fib.string :as s] [types.driver :as driver] [types.dump :as dump] [syntax.dump :as sdump] [lir.ast :as la] [lir.print :as print])
+  (:require [fib.string :as s] [types.driver :as driver] [types.dump :as dump] [syntax.dump :as sdump] [lir.ast :as la] [lir.print :as print] [expand.shared :as sh])
   (:use syntax.form expand.types expand.roots expand.maker types.args types.dump.sections own.error own.program own.driver
         emit.args emit.assemble emit.compile emit.layout-dump emit.macros.abi emit.macros.front))
 
@@ -116,6 +116,15 @@
         (dump/dump-file-with file (options-default) roots rm
                       (fn (lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx) shown: (Vec Shown) home: str opts: Options)
                         (emit-check o lines modules prelude shown home opts))))))
+
+;; `emit-file-with` for a file of a batch (expand.shared): the same lines and status. The layout and macro dumps take the old path.
+(defun emit-file-shared (file: str o: EmitOptions roots: Roots rm: RunnerMaker s: sh/Shared) -> dump/Dumped
+  (if (or (. o layout) (some? (. o macro-name)))
+      (emit-file-with file o roots rm)
+      (dump/dump-file-shared file (options-default) roots rm
+                             (fn (lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx) shown: (Vec Shown) home: str opts: Options)
+                               (emit-check o lines modules prelude shown home opts))
+                             s)))
 
 ;; `emit-file-with` and no macro runner (stage 2a).
 (defun emit-file-in (file: str o: EmitOptions roots: Roots) -> dump/Dumped
