@@ -10,7 +10,7 @@ All times below are measured, on the box that built `main-gate71` (28 cores, loa
 
 | Layer | What | Tests | Cost in the gate (s, CPU of stamps) | Shape |
 |-------|------|-------|-------------------------------------|-------|
-| unit modules | `compiler/tests/*/unit-*.fib`, `fib.test.unit` | 78 modules, 3188 assertions | units-emit 38, units-own 34, units-types 34, units-rest 11, units-pending 96 | one native executable per group, run once |
+| unit modules | `compiler/tests/*/unit-*.fib`, `fib.test.unit` | 78 modules, 3188 assertions | before: units-emit 38, units-own 34, units-types 34, units-rest 11, units-pending 96; now `units-all` (one executable), `units-rest` (control), `units-pending` | one native executable for all, run once |
 | golden, reader | `reader-dump`, `reader-print` | 1184 + 1184 inputs | 12 + 9 | one process per input |
 | golden, expand | `expand-porter`, `expand-e1`, `expand-r` | 944 + 91 + 160 | 123 + 14 + 26 | one process per input (before this slice) |
 | golden, types / own / explain | `types-infer`, `types-top-*`, `own-*`, `explain-amp` | 54, 29+34, 6+2, 7 | 28, 7+8, 2+3, 3 | one process per input |
@@ -56,7 +56,7 @@ reader -> expand -> types -> own -> emit
   output for the library, the own layer from the types layer's, the emit layer from the own layer's.
 - Top: a few programs through the real `fibc build`, so the toolchain is still tested as built. These stay one process per test on purpose.
 
-## 3. What this slice converted
+## 3. First slice (TEST-1): what was converted
 
 `expand --batch` (compiler/expand.fib, `Batch` in compiler/expand/dump.fib): one process expands many files. The context after the expander's
 prelude and `lib/prelude.fib` is built once; the context after the implicit modules (keyed by their files) is built once; each file starts from
@@ -86,18 +86,81 @@ a stale pending entry was never reported. It now uses the exit status of the exe
 | `compiler/serve/snap.fib`: gensym counter not copied (`(cell 0)`) | same | all three FAIL: "batch and per-process output differ on ..." (the control catches a snapshot that forgets state) |
 | a passing unit moved to `units.pending` | units-pending | FAIL "passes now: move it from units.pending to units.run" (was silently PENDING before the fix) |
 
-## 4. What remains
+## 4. Second slice (TEST-2)
+
+### Where the unit-group time really goes (measured; the first slice said LLVM and link, then front end: both partly wrong)
+
+| Step (all 78 modules in one executable) | Seconds |
+|---|---|
+| front (read, expand, types, own) | 14.5 |
+| of which expansion (serve `check` stats on the `types` group: expand 1.4, load 0.1, check 4.1, lower 0.5, total 6.2) | about a fifth |
+| lir.emit | 14.5 |
+| LLVM, objects in the cache (warm) | 0 |
+| LLVM, cache off, `-O 2` | 225 s build in all |
+| LLVM, cache off, `-O 1` | 108 s build in all, and the run is as fast (4.5 s, against 4.7 at `-O 2`) |
+| LLVM, cache off, `-O 0` | 51 s build, but the run is 14.6 s |
+
+So the expander's context snapshot (`serve.snap`) cannot be the lever for the units: expansion is a fifth of the front end, and the type and
+ownership checks of the whole program and the lowering are not kept by the serve engine (dev-loop.md 8.1, "Not kept"). What is shared by merging is the
+front end and the lowering of the compiler code the groups have in common; what is saved by `-O 1` is the cold LLVM cost.
+
+Converted: `units-emit`, `units-own` and `units-types` are gone as stamps; `units-all` builds every unit of `units.run` as ONE executable at `-O 1`
+(`UNITS_DIR=run UNITS_MERGE=1 UNITS_OPT=1`), and `units-rest` stays a group built the ordinary way at `-O 2` (the control: the toolchain still builds
+an executable the old way). `UNITS_DIR=emit|own|types|rest` still works by hand. The reports agree: the same 78 suites, 3188 assertions,
+every row's status and every step's text and status equal (`IDENTICAL`, from the four group reports against the merged one).
+
+| Stamp (solo, warm cache, same box and load) | Before (s) | After (s) |
+|---|---|---|
+| units-emit (build+run) | 31.9 | merged into units-all |
+| units-own | 15.1 | merged |
+| units-types | 27.0 | merged |
+| units-rest | 5.6 | 5.6 (the control, unchanged) |
+| the four together | 79.6 | units-all 45 (build 39, run 6) plus units-rest 5.6 = 50.6 |
+| the same in the gate-budget baseline (33 + 21 + 26 + 7) | 87 | not re-measured in the gate |
+
+The target "well under 40 s" for the four stamps is not met: 45 s for the 78 modules and 50 with the control. The remainder is the front end and lowering of
+the compiler under test, which only a persistent checker (DV6) would cut.
+
+### `types --batch`, `emit-dump --batch`
+
+The same idea as `expand --batch`, in `compiler/expand/shared.fib` (`Shared`): the context after the preludes, and the context after the implicit
+modules together with those modules as expanded (what the checker takes), kept as snapshots under a key of the implicit modules' files; a dump with
+`--prelude` takes the old path. `golden.sh` runs the suites of the three tools in one process each, with the per-input control (`GOLDEN_CONTROL`, default 40).
+
+| Stamp (solo) | Before, per process (s) | After, batch (s) |
+|---|---|---|
+| types-infer (54) | 16.7 | 13.3 |
+| types-top-sections (34) | 5.9 | 2.8 |
+| types-top-ast (29) | 5.0 | 2.5 |
+| emit-fns (105) | 59.1 | 55.2 |
+| emit-defs (3) | 2.2 | 2.6 (noise) |
+
+The gain is small for `emit-fns`: its 0.55 s per input is the type check, ownership check and lowering of the library definitions the program
+reaches (`FIB_PRUNE=0` lowers all of them), none of which the expansion snapshot keeps. The goldens are byte-identical in both modes (`ok` for each suite, both ways).
+
+Not converted, and why: `reader-*` (8 ms per input) and `lair-*` (15 ms per input) have no front-end cost: the process start is all there is.
+`own-*` and `explain-amp` (0.17 s per input, 15 inputs, about 5 s together) would gain at most the expansion, a few tenths of a second: not worth a mode.
+
+### Power (faults planted, reverted)
+
+| Fault | Suite | Result |
+|---|---|---|
+| `compiler/emit/names.fib:69` `"d."` to `"D."`, `compiler/types/ty.fib:104` `SI64` to `SI32` | units-all | 25 scenarios FAIL (emit-unit-names, -defs, -layout, -mono, -program, own-unit-driver, ...), exit 1 |
+| `compiler/types/ty.fib:104` `SI64` to `SI32` | types-infer, batch | FAIL against the golden |
+| `compiler/emit/names.fib:69` | emit-fns, emit-defs, batch | both FAIL against the golden |
+| `compiler/expand/shared.fib` keeps no expanded implicit modules | types-infer, emit-fns, batch | both FAIL: "batch and per-process output differ on ..." (the control) |
+| a snapshot that drops `gensyms` or `macros` of the context | types-infer, emit-fns | NOT caught: the inputs of those suites expand no gensym and no user macro of the library after the snapshot, so the suites do not exercise that state; `expand-*` suites do (slice 1) |
+
+## 5. What remains
 
 | Item | Cost now (s) | Estimated gain (estimates, not measured) | Note |
 |------|--------------|----------------|------|
-| `emit-fns` (105 inputs, 0.8 s each) | 84 | most of it: one process, the library lowered once | the same batch idea for the emit tool |
-| `types-infer`, `types-top-*` (117 inputs) | 28 + 15 | about 35 | types tool in batch: the library's types once |
-| `reader-dump`, `reader-print` (2368 inputs) | 21 | about 15 | tiny inputs, process start only |
-| unit groups (4 stamps) | 117 | needs the front end of the compiler cached across builds | the `liro` object cache already hits; the front end (read to emit) is not cached. A server-style or per-module front-end cache is the lever, not the JIT |
-| `lair-*` goldens | 19 | small | already cheap |
+| `emit-fns` | 55 | most of it, with a lowering cache for the library definitions | the same library defs are lowered 105 times |
+| units-all | 45 | needs a persistent type and ownership checker (DV6) | `-O 1` and merging are done |
+| `reader-*`, `lair-*`, `own-*` | 30 | small | process start only |
 | cases (stdlib 16 shards) | about 600 CPU | large, but each case is an end-to-end program on purpose | a `fibc cases` that builds all cases of a shard as one module is future work |
 
-## 5. The rule for a new test
+## 6. The rule for a new test
 
 Put a test at the lowest layer that can fail for the fault it is about.
 
