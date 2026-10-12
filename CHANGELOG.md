@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.15
+
+- Compilation: a cache-off build can partition into units and compile them in parallel
+  (`FIB_LIRO_PARTITION=1`, `FIB_LIRO_JOBS=N`, `FIB_LIRO_IMPORT=N` copies callees of at most N
+  nodes into each unit); the cold self-build of the compiler drops from about 101 s to 35 s with
+  byte-identical output at 1 and 8 jobs. Default builds and releases are unchanged (whole-program).
+  Measurements and the open questions: `docs/design/compile-performance.md`.
+- `expand --batch` expands many files in one process from a snapshot of the library context
+  (the compiler's golden checks use it: 944 inputs in 16 s instead of 123 s).
+- The gate prints a budget report (wall, parallelism, critical path) and warns on regressions
+  against `scripts/gate-budget.tsv` (`docs/design/build.md`, "The gate budget").
+- Documentation: `docs/design/test-pyramid.md`; `fibc repl` in the tooling guide.
+
 ## 0.1.14
 
 - Scheduler: no spinner cap on Linux (2 on Darwin), a hint word for spinning workers,
