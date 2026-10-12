@@ -251,9 +251,16 @@
                                     layout: (Vec Shown) home: str opts: Options) -> Dumped
   (if (= (. opts stage) StLower)
       (check-and-dump lines modules prelude layout home opts)
-      (match (infer modules prelude (not (. opts library)))
-        ((Err errs) (error-dump lines errs home (wants opts SecError)))
-        ((Ok t) (Dumped (sections-text lines (View (. t globals) (some t)) layout opts) 0)))))
+      (let ((a (match (infer modules prelude (not (. opts library)))
+                 ((Err errs) (error-dump lines errs home (wants opts SecError)))
+                 ((Ok t) (Dumped (sections-text lines (View (. t globals) (some t)) layout opts) 0)))))
+        (if (= (sys-getenv "FIB_CHECK_CACHE") (some "verify"))   ; the control: the whole check as well, the same bytes (own.staged)
+            (let ((b (check-and-dump lines modules prelude layout home opts)))
+              (if (and (= (. a lines) (. b lines)) (= (. a status) (. b status)))
+                  a
+                  (do (eprintln (str-join ["check-cache verify: the output differs for " home]))
+                      (Dumped (conj (. a lines) "#### CHECK-CACHE MISMATCH") 97))))
+            a))))
 
 ;; `types-file-with` for a file of a batch, typed by `infer`.
 (defun types-file-shared (file: str opts: Options rm: RunnerMaker s: sh/Shared

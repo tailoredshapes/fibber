@@ -10,7 +10,8 @@
 ;; a check of text already seen costs the load.
 (ns serve.incr
   (:require [expand.modules :as mods] [expand.maker :as mk] [expand.roots :as roots] [expand.program :as prog] [expand.libdir :as libdir]
-            [macros.runner :as mr] [fib.string :as s] [syntax.reader :as reader] [types.driver :as td] [native.target :as nt] [serve.snap :as snap] [serve.diag :as dg])
+            [macros.runner :as mr] [fib.string :as s] [syntax.reader :as reader] [types.driver :as td] [native.target :as nt] [serve.snap :as snap] [serve.diag :as dg]
+            [expand.shared :as sh] [own.staged :as st] [emit.compile :as ec])
   (:use syntax.form expand.types expand.ctx expand.error types.error types.program types.driver own.error own.driver))
 
 (defstruct Entry (ctx: ExpandCtx exp: Expanded))
@@ -24,12 +25,13 @@
    prelude: (Cell (Vec Stx))
    base: (Cell (Option ExpandCtx))
    session: (Cell (Option mr/Session))
-   verdicts: (Cell (Map str (Vec dg/Diag)))))
+   verdicts: (Cell (Map str (Vec dg/Diag)))
+   memo: st/Memo))
 
 (def entries-max: i64 4000)
 
 (defun engine-new () -> Engine
-  (Engine (cell (map-empty)) (cell 0) (cell (vec-empty)) (cell nil) (cell nil) (cell (map-empty))))
+  (Engine (cell (map-empty)) (cell 0) (cell (vec-empty)) (cell nil) (cell nil) (cell (map-empty)) (st/memo-new)))
 
 (defun empty-stats () -> Stats (Stats 0 0 0 false 0 0 0 0 0))
 
@@ -119,6 +121,11 @@
 
 ;; ---- the check
 
+;; How many of the modules are the implicit library, and the key of its state: the module key of the last of them (the content of those modules and the prelude).
+(defun library-key :private (loaded: (Vec Loaded) keys: (Vec i64)) -> (Pair i64 str)
+  (let ((k (sh/implicit-count loaded)))
+    (if (= k 0) (Pair 0 "") (Pair k (show (nth keys (- k 1)))))))
+
 (defun library-flags :private (modules: (Vec Expanded) target: str) -> (Vec bool)
   (mapv (fn (i: i64) (and (< i (- (count modules) 1)) (and (empty? (. (. (nth modules i) spec) implicit)) (not (= (. (. (nth modules i) spec) ns) target)))))
         (range (count modules))))
@@ -137,7 +144,7 @@
 
 (defstruct Front (checked: (Result Checked (Vec dg/Diag)) stats: Stats key: str))
 
-(defun typecheck :private (modules: (Vec Expanded) prelude: (Vec Stx) main: bool file: str target: str) -> (Pair (Result Checked (Vec dg/Diag)) i64)
+(defun typecheck-whole :private (modules: (Vec Expanded) prelude: (Vec Stx) main: bool file: str target: str) -> (Pair (Result Checked (Vec dg/Diag)) i64)
   (let ((t0 (sys-clock-now)))
     (match (lower-modules-for modules prelude (some (nt/target-info)))
       ((Err es) (Pair (Err (dg/type-diags es)) (ms-since t0)))
@@ -146,6 +153,35 @@
          (match (own-check-lowered-with l main (some (library-flags modules target)))
            ((Ok c) (Pair (Ok c) lowered))
            ((Err x) (Pair (Err (dg/check-diags file x)) lowered))))))))
+
+;; The same through the persistent checker (own.staged): the first `k` modules (the implicit library, under `key`) are lowered, typed and decided once.
+(defun typecheck-staged :private (e: Engine modules: (Vec Expanded) prelude: (Vec Stx) main: bool file: str target: str k: i64 key: str)
+    -> (Pair (Result Checked (Vec dg/Diag)) i64)
+  (match (st/staged-check (. e memo) key k modules prelude (some (nt/target-info)) main (some (library-flags modules target)))
+    ((Ok c) (Pair (Ok c) 0))
+    ((Err x) (Pair (Err (dg/check-diags file x)) 0))))
+
+;; The text two checks must share: the lIR of a program that held, else the diagnostics.
+(defun front-text :private (r: (Result Checked (Vec dg/Diag))) -> str
+  (match r
+    ((Ok c) (match (ec/compile-ast (. c typed) (. c owned))
+              ((Ok m) (ec/emitted-text m))
+              ((Err m) (str-concat "unsupported: " m))))
+    ((Err ds) (str-join (mapv (fn (d: dg/Diag) (str-concat (dg/diag-text d) "\n")) ds)))))
+
+;; Typing and ownership of the expanded program. The first `k` modules are the implicit library, `key` its content: when the cache is on (FIB_CHECK_CACHE not
+;; `off`) their state is the engine's kept one. `verify` checks both ways and answers an internal error when the lIR or the diagnostics differ.
+(defun typecheck :private (e: Engine modules: (Vec Expanded) prelude: (Vec Stx) main: bool file: str target: str k: i64 key: str)
+    -> (Pair (Result Checked (Vec dg/Diag)) i64)
+  (let ((mode (st/cache-mode)))
+    (cond (or (= mode "off") (= k 0)) (typecheck-whole modules prelude main file target)
+          (= mode "verify")
+          (let ((a (typecheck-staged e modules prelude main file target k key))
+                (b (typecheck-whole modules prelude main file target)))
+            (if (= (front-text (. a fst)) (front-text (. b fst)))
+                a
+                (Pair (Err [(dg/diag-nowhere "internal/CheckCache" file "FIB_CHECK_CACHE=verify: the persistent checker and the whole check differ")]) 0)))
+          :else (typecheck-staged e modules prelude main file target k key))))
 
 ;; What a request asks of the front end: the file (as the diagnostics name it), the file the loader starts from (`start`: the file itself, or for a library module a
 ;; one-line program that requires it), that text, the module roots, whether `main` is required ("yes", "no", "auto": when the file defines it), whether
@@ -224,11 +260,11 @@
     (match (. ex snd)
       ((Err ds) (do (store-verdict e vkey ds)
                     (Front (Err ds) (Stats n (. ex fst) (- n (. ex fst)) false t1 (ms-since t2) 0 0 (ms-since t0)) vkey)))
-      ((Ok modules) (front-typed e j modules prelude main vkey (Stats n (. ex fst) (- n (. ex fst)) false t1 (ms-since t2) 0 0 0) t0)))))
+      ((Ok modules) (front-typed e j modules prelude main vkey (Stats n (. ex fst) (- n (. ex fst)) false t1 (ms-since t2) 0 0 0) t0 (library-key loaded keys))))))
 
-(defun front-typed :private (e: Engine j: Job modules: (Vec Expanded) prelude: (Vec Stx) main: bool vkey: str st0: Stats t0: i64) -> Front
+(defun front-typed :private (e: Engine j: Job modules: (Vec Expanded) prelude: (Vec Stx) main: bool vkey: str st0: Stats t0: i64 lib: (Pair i64 str)) -> Front
   (let ((t3 (sys-clock-now))
-        (tc (typecheck modules prelude main (. j file) (. j target)))
+        (tc (typecheck e modules prelude main (. j file) (. j target) (. lib fst) (. lib snd)))
         (r (. tc fst))
         (t4 (sys-clock-now))
         (st (Stats (. st0 modules) (. st0 reused) (. st0 expanded) false (. st0 load-ms) (. st0 expand-ms) (. tc snd) (- (quot (- t4 t3) 1000000) (. tc snd)) (ms-since t0))))

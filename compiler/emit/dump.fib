@@ -74,8 +74,20 @@
     ((Err m) (unsupported-dump lines m))
     ((Ok m) (dump/Dumped (sections-lines lines m o) (module-status m o)))))
 
-;; The check of an expanded program: the front end's records when it does not check, else the module.
+;; The check of an expanded program: the front end's records when it does not check, else the module. With a memo (the persistent checker, own.staged)
+;; the library's state is the kept one; FIB_CHECK_CACHE=verify checks both ways and fails the file when what is printed differs.
 (defun emit-check :private (o: EmitOptions memo: (Option st/Memo) lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx) shown: (Vec Shown) home: str opts: Options)
+    -> dump/Dumped
+  (let ((a (emit-check-with o memo lines modules prelude home)))
+    (if (and (some? memo) (= (st/cache-mode) "verify"))
+        (let ((b (emit-check-with o nil lines modules prelude home)))
+          (if (and (= (. a lines) (. b lines)) (= (. a status) (. b status)))
+              a
+              (do (eprintln (str-join ["check-cache verify: the output differs for " home]))
+                  (dump/Dumped (conj (. a lines) "#### CHECK-CACHE MISMATCH") 97))))
+        a)))
+
+(defun emit-check-with :private (o: EmitOptions memo: (Option st/Memo) lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx) home: str)
     -> dump/Dumped
   (match (st/check-with-hint memo modules prelude true)
     ((Err (CeType errs)) (dump/error-dump lines errs home true))
@@ -120,7 +132,7 @@
       (emit-file-with file o roots rm)
       (dump/dump-file-shared file (options-default) roots rm
                              (fn (lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx) shown: (Vec Shown) home: str opts: Options)
-                               (emit-check o (some memo) lines modules prelude shown home opts))
+                               (emit-check o (if (= (st/cache-mode) "off") nil (some memo)) lines modules prelude shown home opts))
                              s)))
 
 ;; `emit-file-with` and no macro runner (stage 2a).

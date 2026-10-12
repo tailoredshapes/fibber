@@ -1,0 +1,96 @@
+;; compiler/tests/own/unit-staged.fib: the persistent checker (own.staged, docs/design/persistent-checker.md) in one process: programs checked
+;; through the kept state of the prelude and through the whole check give the same lIR or the same error; a program does not change the kept
+;; state; a different key (a different prelude) is a different state. The library here is the prelude (the implicit modules are the tools'
+;; and the server's: compiler/tests/persist/run.sh). Needs lib/prelude.fib in the working directory (run from the repository root).
+;; Build: fibc build compiler/tests/own/unit-staged.fib -I compiler -I lib -o OUT
+(ns tests.own.unit-staged
+  (:use fib.test.unit syntax.form expand.types expand.ctx expand.error types.error own.error own.program own.driver own.staged types.driver)
+  (:require [fib.test.run :as test-runner] [expand.program :as prog] [syntax.reader :as reader] [emit.compile :as ec] [expand.shared :as sh]))
+
+;; The prelude forms of the text `lib` and the program `src` expanded after them, as the module `main`.
+(defun expanded (lib: str src: str) -> (Result (Pair (Vec Stx) (Vec Expanded)) str)
+  (let ((ctx (ctx-new)))
+    (match (prog/prelude-forms-of ctx lib)
+      ((Err m) (Err m))
+      ((Ok prelude)
+       (match (reader/read-all src "t.fib")
+         ((Err _) (Err "read"))
+         ((Ok forms)
+          (match (prog/expand-program forms ctx (no-runner))
+            ((Err e) (Err (expand-error-text e)))
+            ((Ok ex) (Ok (Pair prelude [(Expanded (module-spec-main) ex)]))))))))))
+
+;; What two checks must agree on: the lIR, or the error.
+(defun text-of (r: (Result Checked CheckError)) -> str
+  (match r
+    ((Ok c) (match (ec/compile-ast (. c typed) (. c owned))
+              ((Ok m) (ec/emitted-text m))
+              ((Err m) (str-concat "unsupported: " m))))
+    ((Err e) (str-concat "error: " (check-error-text e)))))
+
+(def prelude-text: str (unwrap-or (read-file "lib/prelude.fib") ""))
+
+(defun whole (src: str) -> str
+  (match (expanded prelude-text src)
+    ((Err m) m)
+    ((Ok [prelude mods]) (text-of (own-check-modules mods prelude)))))
+
+(defun staged (m: Memo key: str lib: str src: str) -> str
+  (match (expanded lib src)
+    ((Err e) e)
+    ((Ok [prelude mods]) (text-of (staged-check m key 0 mods prelude nil true nil)))))
+
+(def programs: (Vec (Pair str str))
+  [(Pair "a program" "(defun main () -> i64 (vec-count [1 2 3]))\n")
+   (Pair "a name the library has, defined by the program" "(defun vec-count (v: (Vec i64)) -> i64 100)\n(defun main () -> i64 (vec-count [1 2]))\n")
+   (Pair "a protocol with an instance for a library type and one for the program's" "(defprotocol Twice (twice [self]))\n(impl Twice i64 (twice (self) (* self 2)))\n(defstruct Box (v: i64))\n(impl Twice Box (twice (self) (. self v)))\n(defun main () -> i64 (+ (twice 4) (twice (Box 5))))\n")
+   (Pair "a closure" "(defun adder (n: i64) -> (fn (i64) i64) (fn (x: i64) (+ x n)))\n(defun main () -> i64 ((adder 3) 4))\n")
+   (Pair "a library function taken as a value" "(defun apply (f: (fn ((Vec i64)) i64) v: (Vec i64)) -> i64 (f v))\n(defun main () -> i64 (apply vec-count [1 2 3]))\n")
+   (Pair "a method value of the program's protocol" "(defprotocol Twice (twice [self]))\n(impl Twice i64 (twice (self) (* self 2)))\n(defun main () -> i64 (vec-count (mapv twice [1 2 3])))\n")
+   (Pair "a type error" "(defun main () -> i64 (+ 1 true))\n")
+   (Pair "a type error naming a library function" "(defun main () -> i64 (vec-count 3))\n")
+   (Pair "an ownership error" "(defun keep (s: (Vec i64) :borrow) -> (Vec i64) s)\n(defun main () -> i64 (vec-count (keep [1])))\n")
+   (Pair "an unbound name" "(defun main () -> i64 (nosuchfn 1))\n")])
+
+(defun agree (cs: StepLog) -> unit
+  (let ((m (memo-new)))
+    (do (doseq [pr programs]
+          (let ((w (whole (. pr snd))) (a (staged m "k" prelude-text (. pr snd))) (b (staged m "k" prelude-text (. pr snd))))
+            (do (is cs (and (= a w) (> (str-len w) 5)) (str-concat "the kept state and the whole check agree on: " (. pr fst)))
+                (is cs (= b w) (str-concat "and again from the kept state: " (. pr fst))))))
+        (is cs (memo-intact? m) "the programs did not change the kept state"))))
+
+(defun keys (cs: StepLog) -> unit
+  (let ((m (memo-new))
+        (src "(defun main () -> i64 (zzz-test))\n")
+        (lib2 (str-concat prelude-text "\n(defun zzz-test () -> i64 7)\n")))
+    (do (is cs (starts-with? (staged m "A" prelude-text src) "error: ") "key A, the prelude: a name only the other prelude has is unbound")
+        (is cs (not (starts-with? (staged m "B" lib2 src) "error: ")) "key B, the prelude with that name added: the program checks (the kept state of A is not used)")
+        (is cs (starts-with? (staged m "A" prelude-text src) "error: ") "key A again: the state is rebuilt for it, the name is unbound again")
+        (is cs (= (staged m "B" lib2 src) (whole-with lib2 src)) "key B again equals the whole check with that prelude"))))
+
+(defun whole-with (lib: str src: str) -> str
+  (match (expanded lib src)
+    ((Err m) m)
+    ((Ok [prelude mods]) (text-of (own-check-modules mods prelude)))))
+
+(defun library-key (cs: StepLog) -> unit
+  (let ((a (sh/content-key-of "fib.core@a.fib#fib.seq@b.fib" ["text a" "text b"] "prelude"))
+        (same (sh/content-key-of "fib.core@a.fib#fib.seq@b.fib" ["text a" "text b"] "prelude")))
+    (do (is cs (= a same) "the key of the same files and prelude is the same")
+        (is cs (not (= a (sh/content-key-of "fib.core@a.fib#fib.seq@b.fib" ["text a" "text b!"] "prelude"))) "an edit of an implicit module changes the key")
+        (is cs (not (= a (sh/content-key-of "fib.core@a.fib#fib.seq@b.fib" ["text a" "text b"] "prelude!"))) "an edit of the prelude changes the key")
+        (is cs (not (= a (sh/content-key-of "fib.core@a.fib#fib.seq@c.fib" ["text a" "text b"] "prelude"))) "another file for a module changes the key")
+        (is cs (not (= a (sh/content-key-of "fib.core@a.fib" ["text a"] "prelude"))) "fewer implicit modules change the key"))))
+
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec)))
+    (do (agree cs) (keys cs) (library-key cs)
+        (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "own/unit-staged" [(test-case "staged" unit-steps "compiler/tests/own/unit-staged.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

@@ -6,8 +6,8 @@
 ;; `MacroNeedsEvaluator` record on stderr, exit 1), `front-check` being the one place that expands. The reason a file or a module cannot be read is the operating system's, asked for as Rust prints it (driver.native `fault-of`).
 (ns driver.front
   (:require [syntax.dump :as sdump] [expand.modules :as mods] [expand.maker :as mk] [types.driver :as td] [emit.compile :as ec] [driver.native :as native] [native.target :as nt]
-            [fib.string :as s])
-  (:use syntax.form expand.error expand.types expand.ctx expand.roots own.error own.program own.driver))
+            [expand.shared :as sh] [own.staged :as st] [fib.string :as s])
+  (:use syntax.form expand.error expand.types expand.ctx expand.roots own.error own.program own.driver types.target))
 
 ;; The exit statuses of a program the compiler stops at. Rust: harness/child.rs EXIT_REJECTED, EXIT_UNSUPPORTED, EXIT_COMPILE_FAILED
 (def exit-usage: i64 2)
@@ -74,10 +74,41 @@
                    (do (td/phase-note "front.expand" t0) r))
             ((Err e) (expand-stop e file))
             ((Ok modules)
-             (match (let ((target (some (nt/target-info))))
-                      (if demand (own-check-modules-on-demand-for modules prelude target) (own-check-modules-for modules prelude target)))
+             (match (check-modules loaded modules prelude (some (nt/target-info)) demand)
                ((Err e) (check-stop e))
                ((Ok c) (FrontChecked c)))))))))))
+
+;; The whole check of the expanded program: lowering, inference, ownership; on demand, the units of the library the program cannot reach are left out.
+(defun check-whole :private (modules: (Vec Expanded) prelude: (Vec Stx) target: (Option Target) demand: bool) -> (Result Checked CheckError)
+  (if demand (own-check-modules-on-demand-for modules prelude target) (own-check-modules-for modules prelude target)))
+
+;; The same through the persistent checker (own.staged): the implicit library lowered, typed and decided first, the program's modules after it. A process
+;; that checks one program gains nothing from keeping the library's state; this is for FIB_CHECK_CACHE=on and =verify (docs/design/persistent-checker.md).
+(defun check-staged :private (loaded: (Vec Loaded) modules: (Vec Expanded) prelude: (Vec Stx) target: (Option Target) demand: bool) -> (Result Checked CheckError)
+  (let ((k (sh/implicit-count loaded)))
+    (if (= k 0)
+        (check-whole modules prelude target demand)
+        (st/staged-check (st/memo-new) (sh/content-key loaded k) k modules prelude target true (if demand (some (library-flags modules)) nil)))))
+
+;; The lIR of a checked program, or why there is none: what two checks of one program must agree on.
+(defun checked-text :private (r: (Result Checked CheckError)) -> str
+  (match r
+    ((Ok c) (match (ec/compile-ast (. c typed) (. c owned))
+              ((Ok m) (ec/emitted-text m))
+              ((Err m) (str-concat "unsupported: " m))))
+    ((Err e) (str-concat "error: " (check-error-text e)))))
+
+;; FIB_CHECK_CACHE=verify checks both ways and fails when the lIR (or the error) differs; `on` uses the persistent checker; else the whole check.
+(defun check-modules :private (loaded: (Vec Loaded) modules: (Vec Expanded) prelude: (Vec Stx) target: (Option Target) demand: bool)
+    -> (Result Checked CheckError)
+  (match (sys-getenv "FIB_CHECK_CACHE")
+    ((some "on") (check-staged loaded modules prelude target demand))
+    ((some "verify")
+     (let ((a (check-staged loaded modules prelude target demand)) (b (check-whole modules prelude target demand)))
+       (if (= (checked-text a) (checked-text b))
+           b
+           (Err (CeInternal "FIB_CHECK_CACHE=verify: the persistent checker and the whole check differ")))))
+    (_ (check-whole modules prelude target demand))))
 
 ;; The checked program of `file`, or the exit status after the message of what stopped it. Rust: main.rs:47 `lower_kind` (first half)
 (defun check-file (file: str roots: Roots rm: mk/RunnerMaker demand: bool) -> (Result Checked i64)
