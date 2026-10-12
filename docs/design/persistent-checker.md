@@ -1,0 +1,127 @@
+# The persistent checker: the library lowered, typed and decided once
+
+Measured 2026-10-12 on the lilnas box (28 threads, shared with other agents, every heavy job under `nice`), stage 2 built from this tree by the seed v0.1.15.
+Numbers are the quoted outputs of `FIB_TIME=1` (the phases of the front end, `time front.PHASE N ms`, new in this change) and of the commands named.
+Branch `worktree-agent-a4d57e26ccac7cac2`.
+
+Every compile type-checks, ownership-checks and lowers the library definitions the program reaches again, from scratch. The expander's context is kept
+across programs (`serve.snap`, `expand.shared`); the checker's was not (dev-loop.md 8.1, 11.1). This record is what was measured, what was built, what
+it costs and what it is checked by.
+
+## 1. Where the time goes
+
+`fibc emit FILE --time` with `FIB_TIME=1` prints `front.expand`, `front.lower` (the prelude and every module declared and defined into the globals),
+`front.infer`, `front.elaborate` and `front.own` (the ownership pass); `front` is the sum with the read and load. `LIB` below is the library: the
+prelude and the implicit modules (`fib.core`, `fib.seq`, `fib.coll`, `fib.print` and their parts), whose units are the same in every run. The split
+of inference and of the ownership pass by module came from a temporary per-unit timer (not kept).
+
+| Run | front | expand | lower | infer | elab | own | check+lower share of front | library part of infer + own |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| (a) `main` printing hello | 136 ms | 37 | 35 | 12 | 3 | 25 | 55% | all of it (75 ms) |
+| (a) 20-line program (a record, a map, closures) | 391 ms | 189 | 37 | 37 | 4 | 90 | 43% | 151 of 168 ms (infer USER 4, own USER 13) |
+| (a) 149-line program (`scripts/bench/windows.fib`) | 1097 ms | 878 | 44 | 41 | 5 | 84 | 16% | 125 of 174 ms |
+| (b) the `types` unit group (40 modules, `UNITS_DIR=types`) | 5.9 to 6.4 s | 1.4 | 0.48 | 1.15 to 1.28 | 0.04 | 2.6 to 2.9 | 70% | 0.16 of 1.2 s and 0.48 of 2.8 s: 0.64 s |
+| (c) one `emit-dump` input (compiler/tests/emit, no demand) | 0.67 s wall | | 55 | 126 | 4 | 347 | 79% | all of it (1,000 units: 909 decided) |
+| (d) a REPL input (`(f 3)`) | | | ~40 | ~16 | 3 | ~30 | | all of it; the whole input costs 205 ms with the JIT |
+
+Reading:
+
+- (b) is the record's one negative result. The 4.1 s of check of the `types` group is the compiler's own modules (40 test modules and the
+  compiler they import): user code to the checker, different in every group. The library is 0.64 s of it, about 10% of the front end: below the 25% that
+  makes a snapshot worth building for `units-all`, `units-*` or a one-shot `fibc build`. Nothing here helps those; see section 6.
+- (c) is the case the idea was made for. A tool that checks many programs in one process (`emit-dump --batch`, `types --batch`, the golden suites) and
+  checks the whole library for each (its `library` is nil: no demand) spends 0.53 of 0.67 s on it, and 105 inputs cost 51.8 s in one process
+  (`emit-tool --batch --sections fns` over `emit-fns.files`, measured before the change).
+- (d) and the server: the library is all of the check, 60 to 120 ms of 205.
+- A one-shot `fibc run` of the 20-line program takes 0.43 to 0.48 s wall; its check is 168 ms. There is nothing to reuse in one process, and the
+  on-disk cache (section 6) would have to load the state faster than the 75 to 150 ms it saves.
+
+## 2. What is kept, and what it depends on
+
+The first stage: the prelude and the first `k` modules of the program (the implicit library) lowered, typed with no demand (every unit), elaborated, and
+decided by the ownership pass. The second stage, for each program: a copy of that state continues with the program's own modules. `own.staged` has both;
+`types.persist` the copies.
+
+The state, and why a copy of it is a state (the audit the dev-loop record asked for):
+
+| Part | Representation | Copy |
+|---|---|---|
+| `Globals`: nine tables | `(Table a)`: a Cell over an array that is copied by the first write to a shared one (`types.table`) | `table-copy`: a new Cell over the same array |
+| `Globals`: `modules` | a table whose rows hold `Names`, six Cells | `modules-copy`: the rows rebuilt with fresh Cells |
+| `Globals`: counters and indexes (`main`, `instance-index`, `option`, `form`, `vec`, `deref-proto`, `expr-count`, `elab-count`, `target`, `warnings`, `kernels`) | Cells of persistent values | a new Cell |
+| `Checker`: `env` (2), `st` (the substitution: 4), `t` (the tables: 6), `errors`, `order`, `failed` | Cells of persistent maps and vectors | new Cells (`checker-copy`) |
+| ownership: `TopState` (summaries, bodies, order, unit facts, the sets taken as values, the methods decided ahead) | a value | none needed |
+
+No top-level mutable state exists in `types/`, `own/` (a `def` may not hold a Cell; the grep for atoms is empty). The constructors in `types.persist` are
+positional: a field added to `Globals`, `Names`, `Env`, `Store`, `Tables` or `Checker` makes the file fail to compile.
+
+What the library's results would depend on in the program, and how each is handled:
+
+- **The functions the program takes as values, and the methods a method value may run** (`own.taken`): the library's units are all decided with an
+  all-owned body as well (`top-start` with every function and method of the library), so the program's takes need nothing from the library again. The sets
+  in the finished program are the true ones: the library's takes, the program's, and the library's method values against the program's instances
+  (`methods-taken-of` with its first instance row).
+- **Instances the program adds**: a library body never names one (it would not have checked), so the library's resolutions are final.
+- **The expression ids**: the library is lowered first in every flow and keeps its ids. The elaboration made new nodes with ids from the counter of
+  lowering, after the program was lowered; kept after the library it would shift the program's ids, and the closure names carry them (`l.f.main.17137`).
+  The elaboration now takes its ids from its own range (`elab-id-base`, 2^40). Nothing prints them but the `tables` and `ast` dumps of nodes the
+  elaboration made (no golden holds one).
+- **Demand** (`types.infer.demand`): the server and the CLI check only the library units the program can reach. The kept state checks all of the
+  first `k` modules. The program's modules are checked with the demand computed over everything; the checked program has more units (the library's
+  all), and the emitter reaches by call, so the lIR is the same (section 4).
+
+The key: `expand.shared/content-key` for the tools (the names and files of the first `k` modules, the text of each, the text of `lib/prelude.fib`), the
+module-key chain of `serve.incr` for the server and the REPL (the content of the prelude and of every module up to the last implicit one). The compiler's
+own build is the process: the kept state lives in memory and is never written, so a rebuilt compiler is a new process with nothing kept. A cache on disk
+would need the build in its key (the hash of the executable), and was not built.
+
+Where it is kept: `own.staged/Memo`, one prefix, in the tool's loop (`emit --batch`, `types --batch`), in the engine (`serve`, `repl`). Not kept: the
+program's modules, anything of a program that did not check (a prefix that does not check is remembered as bad and the whole check is used).
+
+## 3. Diagnostics
+
+Positions come from the lowered forms, unchanged. The order of errors is that of the whole check: the `&` checks of the program's rows, inference, the
+kernels, the ownership pass, the view rules (`stage-check` follows `own-check-lowered-with` step by step). The library's rows are not checked again
+(`syntactic-check-from`, `views-syntactic-from`, `kernel-check-from`, `views-owned-from`, `elaborate-from`, each with the first row of the
+program); a library that does not check is not kept. The checker's messages print unification variables by their order of appearance, not by id, so
+the substitution carrying the library's variables changes nothing.
+
+## 4. The controls
+
+`FIB_CHECK_CACHE`: unset or `on`, the tools, the server and the REPL use the kept state; `off`, the whole check each time; `verify`, both, and a
+difference is a failure. The command line (`fibc run|build|emit|check`) is off unless `on` or `verify`: one process has nothing to reuse.
+
+1. `verify` in `fibc` (`driver.front`): the program checked both ways, the lIR of each compared byte for byte (the error text when it is rejected), and
+   the kept state's sizes compared before and after (`state-print`: a run that wrote into it changes a size). `emit --batch` and `types --batch` do the
+   same per input, on what they print (`#### CHECK-CACHE MISMATCH`, status 97). The server answers an internal error.
+2. `compiler/tests/own/unit-staged.fib` (in `units-all`): ten programs through the kept state of the prelude and through the whole check (shadowing a
+   library name, an instance for a library type, a library function taken as a value, a method value, a closure, three rejections), each twice; the
+   state unchanged; a different key is a different state; the library key changes when a module's text, the prelude, a file name or the number of modules does.
+3. `compiler/tests/persist/run.sh` (`tools`): the programs of that directory through `fibc emit` unset, on and verify; the same and the first 20 inputs of
+   `emit-fns` through `emit --batch` under verify, against `off` and against one process each; a server whose prelude, and whose implicit module
+   `fib.seq.consumers2`, is edited: the program is rejected after the edit and accepted again after it is undone.
+4. `scripts/mutant-persist.sh`: planted faults, one at a time in a copy: the copy of the globals drops the instance index, the expression counter, the
+   elaboration counter; the copy of the checker drops the substitution or the resolutions; the ownership pass starts without the summaries, without
+   the program's takes, without the library's method values against the program's instances; the decided-ahead set or the known methods are lost; a
+   table copy shares the table; the key is ignored; the library key ignores the prelude or the texts; the elaboration takes its ids from lowering; the
+   program's elaboration starts at row 0. Results in section 7.
+5. The goldens: `golden.sh` runs every 40th input of a batch suite as a process of its own and fails when the blocks differ (`GOLDEN_CONTROL`).
+   `types-infer`, `types-top-*`, `emit-fns` and `emit-defs` pass with the kept state.
+
+## 5. What was built
+
+| File | What |
+|---|---|
+| `compiler/types/persist.fib` | the copies (above) |
+| `compiler/own/staged.fib` | `Prefix`, `Memo`, `prefix-build`, `stage-lower/infer/own/check`, `staged-check`, `staged-typed`, the hint entry points |
+| `compiler/types/driver.fib` | `lower-first`, `lower-more`, `phase-note` |
+| `compiler/types/elab.fib`, `decls.fib` | `elaborate-from`; the elaboration's own id range |
+| `compiler/own/{top,taken,syntactic,views,kernel}.fib` | the `-from` and `-of` forms of what ran over the whole program |
+| `compiler/expand/shared.fib` | `content-key`, the hint the loader of a batch gives its check |
+| `compiler/{emit,types}.fib`, `emit/dump.fib`, `types/dump.fib` | the batch tools use the kept state |
+| `compiler/serve/incr.fib` | the engine keeps a memo; `typecheck` is staged, whole or verified |
+| `compiler/driver/front.fib` | `check-modules`: whole, `on`, `verify` |
+
+## 6. Results
+
+See section 7 (filled in from the measurements of this change).
