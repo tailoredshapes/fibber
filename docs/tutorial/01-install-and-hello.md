@@ -15,6 +15,8 @@ fibc build hello.fib -o hello
 ./hello
 ```
 
+To experiment without a file, run `fibc repl`; see [the REPL](../guide/tooling.md#the-repl).
+
 `run` uses a JIT and prints main's result after the program's own output. A built
 executable uses main's integer result as its exit status. Building needs `cc`.
 [Next: values](02-values-and-collections.md).

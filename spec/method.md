@@ -10,11 +10,13 @@ rests on anyone's word, including the author's.
    pinned by case verdicts, behaviour specs and architectural checks. Prose and
    code disagreements are bugs to report and resolve explicitly. The original
    independent Rust interpreter is retired at tag `seed-1`; it is not required
-   as an oracle by the current method (rule 6).
+   as an oracle by the current method (rule 6). `fibc repl` (written in fibber,
+   docs/design/dev-loop.md §9) is a development tool over the compiler's own engine,
+   not an independent implementation, so it supplies no oracle either.
 
 2. **Compiled cases audit memory.** The runtime trace/audit checks allocations,
    retains, releases and accesses. An accepted case must satisfy its stated audit
-   and allocation bound. The future interpreter/heap-audit port is additional
+   and allocation bound. The interpreter/heap-audit port still owed is additional
    development evidence; contract stubs do not supply that evidence today.
 
 3. **Cases come before rules.** Each case in `cases/` states its

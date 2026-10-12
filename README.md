@@ -62,13 +62,30 @@ fibc build hello.fib -o hello
 
 `run` prints main's result; an executable uses it as its exit status.
 
+Or skip the file: `fibc repl` is a read-eval-print loop. Definitions persist, a
+redefinition is re-checked against everything that uses it, and a refused or
+trapping input leaves the session unchanged.
+
+```text
+$ fibc repl
+fib> (defun sq (x: i64) -> i64 (* x x))
+; defined sq
+fib> (sq 7)
+49
+fib> :type (map sq [1 2 3])
+(map sq [1 2 3]) : (LSeq i64)
+```
+
+Values do not persist between inputs (the session is its source text); see the
+[tooling guide](docs/guide/tooling.md#the-repl).
+
 ## Working with Fibber
 
 - [Projects and dependencies](docs/guide/packages-and-dependencies.md),
   [modules](docs/guide/modules-and-namespaces.md), [ownership](docs/guide/ownership-and-borrowing.md).
 - [Errors and traps](docs/guide/errors-traps-and-try.md),
   [concurrency](docs/guide/concurrency-and-parallelism.md), [testing](docs/guide/testing.md).
-- [Tooling](docs/guide/tooling.md): `check`, `explain`, `serve`, `--server`, `repl`, `lsp`;
+- [Tooling](docs/guide/tooling.md): `repl`, `check`, `explain`, `serve`, `--server`, `lsp`;
   [VS Code setup](editors/vscode/README.md), [CLI reference](docs/reference/cli.md).
 - [Deployment](docs/guide/targets-and-deployment.md): static musl, C, wasm and cross targets;
   [platform evidence](docs/policy/platform-support.md).
