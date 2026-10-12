@@ -1,0 +1,49 @@
+(ns tests.types.unit-table (:use types.table fib.test.unit)
+  (:require [fib.test.run :as runner]))
+
+(defun dense-rows (cs: StepLog) -> unit
+  (let ((t (table-new)))
+    (do (is cs (= (table-count t) 0) "a new table is empty")
+        (is cs (= (table-rows t) []) "an empty table has no rows")
+        (dotimes (i 4097) (table-add t (str i)))
+        (is cs (= (table-count t) 4097) "growth crosses array and vector boundaries")
+        (is cs (every? (fn (i: i64) (= (table-get t i) (str i))) (range 4097))
+            "every allocated id reads its original row")
+        (let ((snapshot (table-rows t)) (backing @(. t rows)))
+          (do (dotimes (i 4097) (table-set t i (str (- 0 i))))
+              (table-add t "last")
+              (is cs (= (count snapshot) 4097) "a held snapshot excludes later rows")
+              (is cs (every? (fn (i: i64) (= (nth snapshot i) (str i))) (range 4097))
+                  "replacement preserves every row of a held snapshot")
+              (is cs (and (= (array-len backing) 4097)
+                          (every? (fn (i: i64) (= (array-get backing i) (some (str i)))) (range 4097)))
+                  "a shared backing array keeps its rows across writes and growth")
+              (is cs (every? (fn (i: i64) (= (table-get t i) (str (- 0 i)))) (range 4097))
+                  "replacement updates every live row")
+              (is cs (= (table-get t 4097) "last") "the next id is still consecutive")))
+        (is cs (and (nil? (table-find t -1)) (nil? (table-find t 4098)))
+            "negative and one-past-end ids are missing"))))
+
+(defun row-kinds (cs: StepLog) -> unit
+  (let ((t (table-new)))
+    (do (table-add t nil) (table-add t (some "present"))
+        (is cs (= (table-find t 0) (some nil)) "a nil row is present")
+        (is cs (= (table-get t 1) (some "present")) "nested option rows retain their payload")))
+  (let ((t (table-new)) (c (cell 7)))
+    (do (table-add t c)
+        (is cs (= @(table-get t 0) 7) "non-Send rows need no closure capture")
+        (table-set t 0 (cell 9))
+        (is cs (and (= @c 7) (= @(table-get t 0) 9)) "replacement preserves the earlier Cell")))
+  (let ((t (table-new)))
+    (do (dotimes (i 33) (table-add t i))
+        (table-set t 32 900)
+        (is cs (= (table-rows t) (conj (vec (range 32)) 900)) "scalar rows cross the first growth boundary"))))
+
+(defun steps () -> (Vec StepRun)
+  (let ((cs (new-rec))) (do (dense-rows cs) (row-kinds cs) (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "types/unit-table" [(test-case "checks" steps "compiler/tests/types/unit-table.fib")]))
+
+(defun main () -> i64
+  (runner/run-main-with [(tests)] (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))
