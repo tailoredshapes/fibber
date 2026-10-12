@@ -37,7 +37,19 @@ RECURSION = """(define internal (even i64) ((i64 n))
 """
 
 
+TIMING = os.environ.get("LIRO_TIMING")
+
+
 def run(argv, env, ok=True):
+    t0 = time.monotonic()
+    try:
+        return _run(argv, env, ok)
+    finally:
+        if TIMING:
+            print(f"time {time.monotonic() - t0:7.2f}s {Path(str(argv[0])).name} {argv[1] if len(argv) > 1 else ''}", flush=True)
+
+
+def _run(argv, env, ok=True):
     p = subprocess.run([str(a) for a in argv], cwd=ROOT, env=env,
                        text=True, capture_output=True, timeout=240)
     if ok and p.returncode:
@@ -310,22 +322,47 @@ def parallel_checks(probe, scratch, env):
     print("ok opt-in cache-off units compile in parallel, link in unit order, and match across jobs, splits and copies")
 
 
+def phase(name, fn, *args):
+    t0 = time.monotonic()
+    fn(*args)
+    if TIMING:
+        print(f"phase {time.monotonic() - t0:7.2f}s {name}", flush=True)
+
+
 def main():
-    fibc = Path(os.environ.get("FIBC", sys.argv[1] if len(sys.argv) > 1 else "build/F")).resolve()
+    """check.py [FIBC] [all | checks | plant NAME]: the stamps of mk/tools.mk run the groups apart, `all` runs every one."""
+    args = sys.argv[1:]
+    explicit = args.pop(0) if args and args[0] not in GROUPS else "build/F"
+    fibc = Path(os.environ.get("FIBC", explicit)).resolve()
+    group = args[0] if args else "all"
+    assert group in GROUPS, f"group {group}: one of {sorted(GROUPS)}"
     with tempfile.TemporaryDirectory(prefix="fibber-liro-test-", dir=os.environ.get("TMPDIR")) as directory:
         scratch = Path(directory)
         env = dict(os.environ, FIB_LIB=str(ROOT / "lib"), FIB_LIRO_CACHE=str(scratch / "cache"),
                    FIB_LIRO_STATS="1", FIB_TIME="1")
-        probe = scratch / "api"
-        build_probe(fibc, probe, env)
-        cache_checks(probe, scratch, env)
-        artifact_checks(probe, scratch, env)
-        concurrency_checks(probe, scratch, env)
-        identity_checks(fibc, scratch, env)
-        parallel_checks(probe, scratch, env)
-        from mutants import check_plants
-        check_plants(fibc, scratch, env, ROOT)
-    print("LIRO PASS")
+        if group in {"all", "checks"}:
+            run_checks(fibc, scratch, env)
+        from mutants import PLANTS, check_plant
+        if group == "plant":
+            assert len(args) == 2 and args[1] in PLANTS, f"plant NAME: one of {sorted(PLANTS)}"
+            phase("plant " + args[1], check_plant, args[1], fibc, scratch, env, ROOT)
+        if group == "all":
+            from mutants import check_plants
+            check_plants(fibc, scratch, env, ROOT)
+    print("LIRO PASS " + " ".join(args or ["all"]))
+
+
+GROUPS = {"all", "checks", "plant"}
+
+
+def run_checks(fibc, scratch, env):
+    probe = scratch / "api"
+    phase('build_probe', build_probe, fibc, probe, env)
+    phase('cache_checks', cache_checks, probe, scratch, env)
+    phase('artifact_checks', artifact_checks, probe, scratch, env)
+    phase('concurrency_checks', concurrency_checks, probe, scratch, env)
+    phase('identity_checks', identity_checks, fibc, scratch, env)
+    phase('parallel_checks', parallel_checks, probe, scratch, env)
 
 
 if __name__ == "__main__":

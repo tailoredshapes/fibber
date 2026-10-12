@@ -1,4 +1,6 @@
 """Source mutations prove the behavioral checks notice broken reuse contracts."""
+import os
+import time
 from pathlib import Path
 import shutil
 
@@ -20,25 +22,33 @@ PLANTS = {
 }
 
 
+def check_plant(name, fibc, scratch, env, root):
+    patches = PLANTS[name]
+    directory = scratch / name
+    directory.mkdir()
+    compiler = directory / "compiler"
+    shutil.copytree(root / "compiler", compiler,
+                    ignore=shutil.ignore_patterns("tests", "__pycache__"))
+    for relative, before, after in patches:
+        source = compiler / relative
+        text = source.read_text()
+        assert text.count(before) == 1, (name, relative, before)
+        source.write_text(text.replace(before, after))
+    probe = directory / "api"
+    changed_env = dict(env, FIB_LIRO_CACHE=str(directory / "cache"))
+    t0 = time.monotonic()
+    build_probe(fibc, probe, changed_env, compiler)
+    if os.environ.get("LIRO_TIMING"):
+        print(f"phase {time.monotonic() - t0:7.2f}s plant-build {name}", flush=True)
+    test = artifact_checks if name in {"abi-check-disabled", "checksum-disabled"} else cache_checks
+    try:
+        test(probe, directory, changed_env)
+    except AssertionError:
+        print(f"ok planted {name}: behavioral check fails")
+    else:
+        raise AssertionError(f"plant {name} survived the checks")
+
+
 def check_plants(fibc, scratch, env, root):
-    for name, patches in PLANTS.items():
-        directory = scratch / name
-        directory.mkdir()
-        compiler = directory / "compiler"
-        shutil.copytree(root / "compiler", compiler,
-                        ignore=shutil.ignore_patterns("tests", "__pycache__"))
-        for relative, before, after in patches:
-            source = compiler / relative
-            text = source.read_text()
-            assert text.count(before) == 1, (name, relative, before)
-            source.write_text(text.replace(before, after))
-        probe = directory / "api"
-        changed_env = dict(env, FIB_LIRO_CACHE=str(directory / "cache"))
-        build_probe(fibc, probe, changed_env, compiler)
-        test = artifact_checks if name in {"abi-check-disabled", "checksum-disabled"} else cache_checks
-        try:
-            test(probe, directory, changed_env)
-        except AssertionError:
-            print(f"ok planted {name}: behavioral check fails")
-        else:
-            raise AssertionError(f"plant {name} survived the checks")
+    for name in PLANTS:
+        check_plant(name, fibc, scratch, env, root)
