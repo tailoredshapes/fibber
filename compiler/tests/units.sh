@@ -2,6 +2,8 @@
 # Compiler unit modules export suites, compiled together by emit/own/types/rest. The
 # generated executables support fib.test's --only, --list, JSON/TAP and isolation flags.
 # FIBC names stage 2. Usage: units.sh [OUTDIR] [FILE..]; UNITS_DIR selects a group.
+# UNITS_DIR=run is every unit of units.run (no pending ones); UNITS_MERGE=1 builds the selected units as ONE executable (group "all");
+# UNITS_OPT=N builds with -O N (the gate uses 1: the same results, a cold LLVM cache costs half as much as at -O2, docs/design/test-pyramid.md).
 # Every unit-*.fib must be in units.run, units.pending or units.elsewhere.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -16,7 +18,7 @@ names() { grep -v '^#' "$here/$1" | grep -v '^$' | sed 's/[[:space:]].*//'; }
 part=${UNITS_DIR:-all}; files=("$@")
 if [ ${#files[@]} -eq 0 ]; then
   case $part in
-    all) while IFS= read -r f; do files+=("$f"); done < <(names units.run) ;;
+    all|run) while IFS= read -r f; do files+=("$f"); done < <(names units.run) ;;
     pending) ;;
     rest) while IFS= read -r f; do files+=("$f"); done < <(names units.run | grep -v -e '^compiler/tests/emit/' -e '^compiler/tests/own/' -e '^compiler/tests/types/') ;;
     emit|own|types) while IFS= read -r f; do files+=("$f"); done < <(names units.run | grep "^compiler/tests/$part/") ;;
@@ -35,7 +37,7 @@ bad=0
 run_group() {
   local group=$1 t0 rc
   t0=$(date +%s)
-  if ! "$fibc" build "$out/$group.fib" -I compiler -I lib -L "$llvm" -l LLVM-21 -o "$out/$group" > "$out/$group.build.log" 2>&1; then
+  if ! "$fibc" build "$out/$group.fib" -I compiler -I lib -L "$llvm" -l LLVM-21 ${UNITS_OPT:+-O "$UNITS_OPT"} -o "$out/$group" > "$out/$group.build.log" 2>&1; then
     echo "FAIL units/$group build (log: $out/$group.build.log)"; tail -n 12 "$out/$group.build.log"; return 1
   fi
   echo "units/$group build $(( $(date +%s) - t0 )) s"

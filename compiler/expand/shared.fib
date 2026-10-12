@@ -1,0 +1,63 @@
+;; compiler/expand/shared.fib: the expansion of the library, done once for a batch of programs (docs/design/test-pyramid.md). A tool that
+;; checks many files in one process (`types --batch`, `emit-dump --batch`) expands for each file the expander's prelude, `lib/prelude.fib` and the
+;; implicit modules (what the files do not change); here that is kept as snapshots of the expander's context (serve.snap: a context is cells of
+;; persistent values, so a copy continues where the first stopped and is not changed by what the copy goes on to expand). `base` is the context
+;; after the preludes; the second part is the context after the implicit modules and the modules they read, with those modules as expanded,
+;; under a key of their files (they are expanded the same for every program). Nothing here changes what a file expands to: a tool run with and without
+;; `--batch` prints the same bytes, which the golden check compares.
+(ns expand.shared
+  (:require [expand.modules :as mods] [expand.program :as prog] [serve.snap :as snap])
+  (:use syntax.form expand.types expand.ctx))
+
+(defstruct Shared (base: (Cell (Option ExpandCtx)) prelude: (Cell (Vec Stx))
+                   key: (Cell str) ctx: (Cell (Option ExpandCtx)) done: (Cell (Vec Expanded))))
+
+(defstruct Start (ctx: ExpandCtx prelude: (Vec Stx)))
+
+(defun shared-new () -> Shared (Shared (cell nil) (cell (vec-empty)) (cell "") (cell nil) (cell (vec-empty))))
+
+;; A fresh copy of the context after the expander's prelude and `lib/prelude.fib`, and the prelude's forms (the macro runner takes them).
+(defun shared-start (sh: Shared) -> (Result Start str)
+  (match @(. sh base)
+    ((some c) (Ok (Start (snap/ctx-snapshot c) @(. sh prelude))))
+    (nil (let ((ctx (ctx-new)))
+           (match (prog/prelude-forms ctx)
+             ((Err m) (Err m))
+             ((Ok forms) (do (set! (. sh base) (some (snap/ctx-snapshot ctx)))
+                             (set! (. sh prelude) forms)
+                             (Ok (Start ctx forms)))))))))
+
+;; How many of loaded, from the start, are implicit (the loader reads them first).
+(defun implicit-count (loaded: (Vec Loaded)) -> i64
+  (loop ((i 0)) (if (and (< i (count loaded)) (. (nth loaded i) implicit)) (recur (+ i 1)) i)))
+
+(defun prefix-key (loaded: (Vec Loaded) k: i64) -> str
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i k)
+        (recur (+ i 1) (conj acc (str-join [(. (. (nth loaded i) spec) ns) "@" (. (nth loaded i) file)])))
+        (str-join acc))))
+
+;; The context after the implicit modules `key` names, and those modules as expanded, when they are kept.
+(defun shared-prefix (sh: Shared key: str) -> (Option (Pair ExpandCtx (Vec Expanded)))
+  (match @(. sh ctx)
+    (nil nil)
+    ((some c) (if (= key @(. sh key)) (some (Pair (snap/ctx-snapshot c) @(. sh done))) nil))))
+
+;; Keeps ctx (copied) and the expanded modules as the state after the implicit modules `key` names.
+(defun shared-keep (sh: Shared key: str ctx: ExpandCtx done: (Vec Expanded)) -> unit
+  (do (set! (. sh key) key)
+      (set! (. sh ctx) (some (snap/ctx-snapshot ctx)))
+      (set! (. sh done) done)))
+
+;; The words of a command line without the `--batch` that stands among its options (before a lone `--`), and whether there was one.
+(defun take-batch (words: (Vec str)) -> (Pair bool (Vec str))
+  (loop ((i 0) (found false) (out (vec-empty)) (open true))
+    (if (< i (count words))
+        (let ((w (nth words i)))
+          (if (and open (= w "--batch"))
+              (recur (+ i 1) true out open)
+              (recur (+ i 1) found (conj out w) (and open (!= w "--")))))
+        (Pair found out))))
+
+;; What a batch tool prints after each file's section, so that a caller can cut the stream: `#### status N`, the status that file adds.
+(defun batch-trailer (status: i64) -> str (str-concat "#### status " (show status)))

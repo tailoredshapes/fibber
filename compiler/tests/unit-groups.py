@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Generate shared unit runners. Test modules, not source rewriting, supply suites."""
+import os
 import pathlib
 import sys
 
@@ -24,6 +25,8 @@ def generate(out, selected):
     for file in selected:
         part = pathlib.Path(file).parent.name
         group = part if part in {"emit", "own", "types"} else "rest"
+        if os.environ.get("UNITS_MERGE") == "1":
+            group = "all"  # one executable: the front end and the lowering of the compiler are paid once, not once for each group
         groups.setdefault(group, []).append(file)
     out.mkdir(parents=True, exist_ok=True)
     for group, files in groups.items():
