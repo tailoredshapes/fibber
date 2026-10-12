@@ -63,7 +63,7 @@ tool_sh-native-a64-sibcall := $(T)/native/a64-sibcall.sh $(F_ABS) | $(T)/native/
 tool_sh-harness-proto-run := $(T)/harness-proto/run.sh | $(wildcard $(T)/harness-proto/*) $(wildcard $(T)/harness-proto/cases/*)
 tool_lsp-unit := env LSP_UNIT_OUT=$(TOOLS_OUT)/lsp-unit $(T)/lsp/run.sh | $(wildcard $(T)/lsp/*) $(wildcard $(T)/lsp/fix/*) $(wildcard compiler/lsp/*.fib)
 tool_lsp-server := $(T)/lsp/server.sh $(TOOLS_OUT)/lsp-server | $(wildcard $(T)/lsp/*) $(wildcard $(T)/lsp/fix/*) $(wildcard compiler/lsp/*.fib)
-tool_lsp-hardening := bash -c "$(T)/lsp/build.sh $(TOOLS_OUT)/lsp-hard && node $(T)/lsp/hardening.js --server $(TOOLS_OUT)/lsp-hard && node $(T)/lsp/fuzz.js --selftest" | $(wildcard $(T)/lsp/*) $(wildcard compiler/lsp/*.fib)
+tool_lsp-hardening := $(T)/lsp/hardening.sh $(TOOLS_OUT)/lsp-hard | $(wildcard $(T)/lsp/*) $(wildcard compiler/lsp/*.fib)
 tool_fibref-heap := $(T)/fibref/heap.sh | $(wildcard $(T)/fibref/*) $(wildcard compiler/fibref/*.fib compiler/fibref/*/*.fib)
 tool_gen-rng := $(T)/gen/rng-check.sh | $(wildcard $(T)/gen/*)
 tool_gen-compare := bash -c "$(F_ABS) build compiler/fibgen.fib -I compiler -I lib -o $(TOOLS_OUT)/fibgen && $(T)/gen/compare.sh $(TOOLS_OUT)/fibgen pipelines 1 300" | $(wildcard $(T)/gen/*) $(wildcard compiler/gen/*.fib compiler/gen/*/*.fib)
