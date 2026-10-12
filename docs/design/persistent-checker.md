@@ -124,4 +124,61 @@ difference is a failure. The command line (`fibc run|build|emit|check`) is off u
 
 ## 6. Results
 
-See section 7 (filled in from the measurements of this change).
+Before: the sources of 492da102 (tools built from them by the same F); after: this tree. Solo runs of the box (load 2 to 5), wall seconds.
+
+| | before | after |
+|---|---:|---:|
+| `golden/emit-fns` (105 inputs, `golden.sh --tools .. --only`) | 56.6 s | 6.4 s |
+| `golden/types-infer` (54) | 13.6 s | 1.9 s |
+| `golden/emit-defs` (3) | 2.6 s | 1.8 s |
+| `emit --batch --sections fns` over the 105 inputs, one process | 51.8 s | 4.3 s |
+| `golden/tools/types`, `golden/tools/emit` (tool builds) | about 35 s each | about 35 s each |
+| `tools/units-all` (79 modules, 3,218 assertions pass) | | 65 s (build 57, run 8); it does not use the kept state, and the library is 10% of its front end |
+| server: `check` of an edited 1-function program, warm (median of 11) | 165 ms | 28 ms; the first request builds the state: 657 ms against 199 |
+| REPL: cost of each input after the first (31 inputs against 1) | 188 ms | 87 ms; the first input +500 ms |
+| `fibc emit` hello, `fibc run` hello (median of 5) | 188, 227 ms | the same (the kept state is off on the command line); with `FIB_CHECK_CACHE=on` 630, 756 ms |
+| `fibc emit`, `fibc run` of the 149-line `windows.fib` | 1111, 1766 ms | the same; `on`: 1560, 2460 ms |
+| `make -j6 quick` | | 53 s, GATE PASS (stamps already current were not rerun) |
+
+The fixed point holds: `make fixed-point` built F and F3 and both emit the same lIR for `compiler/fibc.fib` (31,931,595 bytes).
+
+The new floor, and what remains:
+
+- The first program of a process pays 0.46 to 0.55 s for the state (the whole library checked and decided with an all-owned body for every function,
+  once). A tool, server or REPL that checks fewer than two or three programs loses.
+- A batch input costs about 40 ms in all (4.3 s for 105: the program's lowering, units and copying of the kept cells, and the emitter); the split
+  between the check and the emitter was not measured.
+- The REPL's 87 ms per input is no longer the check (`stage.*` notes: 1 to 2 ms); the rest (expansion, lIR emission, JIT) was not split.
+- The one-shot command line and `units-all`, `units-*`, `fibc build` of one program have nothing to reuse. A cache on disk would have to load a state
+  of about 35 MB of RSS (125 MB against 92 MB for hello) faster than the 75 to 170 ms the check takes; fibber has no serialiser for its structs, and
+  loading the whole library's state to use 52 of its units (hello) is the wrong shape. Not built.
+- The demand pruning of the one-shot path stays as it is; the kept state checks the whole library, which is why it needs the first-program cost.
+
+## 7. The planted faults and the full runs
+
+`scripts/mutant-persist.sh` (16 plants; 12 run by default, `no-intact-check` on request) with the unit program and `emit --batch` under verify:
+
+```
+KILLED instance-index (unit: failed, batch: failed)    KILLED tables-shared (unit: failed, batch: failed)
+KILLED expr-counter (unit: failed, batch: failed)      KILLED key-ignored (unit: failed, batch: differs*)
+KILLED elab-counter (unit: lived, batch: failed)       KILLED key-no-prelude (unit: failed, batch: differs*)
+KILLED store-nodes (unit: lived, batch: failed)        KILLED key-no-texts (unit: failed, batch: differs*)
+KILLED resolutions (unit: failed, batch: failed)       KILLED elab-ids (unit: failed, batch: failed)
+KILLED summaries (unit: failed, batch: failed)         KILLED no-intact-check (unit: failed, batch: lived)
+KILLED program-takes (unit: lived, batch: failed)
+```
+
+`*` the first run compared the batch output with the baseline's without allowing for the copy of `lib/` at another path, so "differs" was not a kill; the
+unit program killed all three on its own. The script now normalises the path. Four plants SURVIVE and are documented in the script, not run by default,
+because they change nothing a program can observe today: `method-takes` (no library body can take a method value without a resolved instance: the
+emitter refuses it), `hoisted` and `known` (a method decided ahead of its place is decided again with the same result), `reelaborate` (a body elaborated
+twice is the same body).
+
+Full runs with `FIB_CHECK_CACHE=verify` (every program checked both ways in its own process, the lIR compared byte for byte, the kept state's sizes
+compared before and after): `cases/ownership` 375 pass; `cases/modules` 32 pass; the quick stdlib sample 99 pass and 1 open, the same table as without;
+all of `cases/stdlib` (`fibc cases -j 6`): 1,500 cases, 1,482 pass, 18 open, a table identical to the run without verify.
+The command line runs the kept state through `check-staged` with a fresh memo, so these runs prove the second stage against the whole check, not a hit
+across programs; the hit across programs is `emit --batch` (golden controls, `persist/run.sh`) and the server.
+
+Default on or off: on for `emit --batch`, `types --batch`, `fibc serve` and `fibc repl` (every control above is clean); off for `fibc run|build|emit|check`
+(it costs 0.4 s there); `FIB_CHECK_CACHE=off` turns it off everywhere, `verify` checks both ways.
