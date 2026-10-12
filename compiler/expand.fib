@@ -24,7 +24,7 @@
 (ns main (:require [expand.args :as cli] [expand.dump :as dump] [macros.runner :as mr]))
 
 (def usage: str
-  "usage: expand [--prelude] [--context] [--implicit] [--implicit-lib LIST] [--no-runner] [--max-steps N] [--max-depth N] [--max-forms N] [--] FILE..")
+  "usage: expand [--prelude] [--context] [--implicit] [--implicit-lib LIST] [--batch] [--no-runner] [--max-steps N] [--max-depth N] [--max-forms N] [--] FILE..")
 
 (defun max-status (a: i64 b: i64) -> i64 (if (> a b) a b))
 
@@ -46,7 +46,34 @@
               (recur (+ i 1) (max-status status (. d status)))))
         status)))
 
+(def batch-trailer: str "#### status ")
+
+;; `--batch`: one process for many files, the library state built once (expand.dump `Batch`). The output is each file's
+;; section as without it, followed by the line `#### status N` (the status that file adds), so a caller can split it.
+(defun expand-batch (files: (Vec str) opts: cli/Options) -> i64
+  (let ((b (dump/batch-new)))
+    (loop ((i 0) (status 0))
+      (if (< i (count files))
+          (let ((d (dump/expand-file-batch (nth files i) opts (mr/runner-maker) b)))
+            (do (print-lines (. d lines))
+                (println (str-concat batch-trailer (show (. d status))))
+                (recur (+ i 1) (max-status status (. d status)))))
+          status))))
+
+;; The words without `--batch` (before a lone `--`), and whether it was there.
+(defun without-batch (words: (Vec str)) -> (Pair bool (Vec str))
+  (loop ((i 0) (found false) (out (vec-empty)) (open true))
+    (if (< i (count words))
+        (let ((w (nth words i)))
+          (if (and open (= w "--batch"))
+              (recur (+ i 1) true out open)
+              (recur (+ i 1) found (conj out w) (and open (!= w "--")))))
+        (Pair found out))))
+
 (defun main () -> i64
-  (match (cli/parse-args (args))
-    (nil (do (eprintln usage) 2))
-    ((some parsed) (expand-files (. parsed files) (. parsed opts)))))
+  (let ((p (without-batch (args))))
+    (match (cli/parse-args (. p snd))
+      (nil (do (eprintln usage) 2))
+      ((some parsed) (if (. p fst)
+                         (expand-batch (. parsed files) (. parsed opts))
+                         (expand-files (. parsed files) (. parsed opts)))))))

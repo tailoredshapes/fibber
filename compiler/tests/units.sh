@@ -57,16 +57,26 @@ while IFS= read -r group; do
   cat "$out/$group.log"; [ "$(cat "$out/$group.rc")" = 0 ] || bad=1
 done < "$out/groups"
 
-# Pending units keep their independent legacy checks. A passing one is a stale entry.
+# Pending units keep their independent legacy checks. A passing one is a stale entry. The builds are independent, so they run
+# UNITS_PENDING_JOBS at a time (default 5; the report keeps the order of units.pending).
+check_pending() {
+  local f=$1 n exe
+  n=$(echo "${f#compiler/tests/}" | tr / _); exe=$out/$n
+  if "$fibc" build "$f" -I compiler -I lib -L "$llvm" -l LLVM-21 -o "$exe" > "$exe.log" 2>&1 \
+     && timeout 300 "$exe" > "$exe.out" 2>&1; then   # the runner of fib.test exits 0 only when every scenario held
+    echo "FAIL $f passes now: move it from units.pending to units.run"; return 1
+  fi
+  echo "PENDING $f"
+}
 if [ $# -eq 0 ] && { [ "$part" = all ] || [ "$part" = pending ]; }; then
+  pjobs=${UNITS_PENDING_JOBS:-5}; k=0
   while IFS= read -r f; do
-    n=$(echo "${f#compiler/tests/}" | tr / _); exe=$out/$n
-    if "$fibc" build "$f" -I compiler -I lib -L "$llvm" -l LLVM-21 -o "$exe" > "$exe.log" 2>&1 \
-       && timeout 300 "$exe" > "$exe.out" 2>&1 \
-       && ! grep -q '^FAIL' "$exe.out" && grep -q '^ok' "$exe.out"; then
-      echo "FAIL $f passes now: move it from units.pending to units.run"; bad=1
-    else echo "PENDING $f"; fi
+    (check_pending "$f" > "$out/pending.$k.log" 2>&1; echo $? > "$out/pending.$k.rc") &
+    k=$((k + 1))
+    while [ "$(jobs -rp | wc -l)" -ge "$pjobs" ]; do sleep 0.1; done
   done < <(names units.pending)
+  wait
+  for ((i = 0; i < k; i++)); do cat "$out/pending.$i.log"; [ "$(cat "$out/pending.$i.rc")" = 0 ] || bad=1; done
 fi
 echo "${#selected[@]} unit modules run"
 exit "$bad"
