@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased documentation corrections
+## 0.1.14
+
+- Scheduler: no spinner cap on Linux (2 on Darwin), a hint word for spinning workers,
+  `FIB_SPINNERS` and `FIB_SPIN_HINT`; the thread count is released before its task
+  completes (fixes a rare early-exit race). Measurements: `docs/shootout/sched-ryzen.md`.
+- Compilation: the emitter builds structured lIR with no text intermediary (ADR 0025);
+  compiled-lIR objects are cached and linked per unit (ADR 0024, `--no-cache`,
+  `--whole-program`, `--time`, `--cache-stats`); release and bootstrap builds stay whole-program.
+- Unread run-time definitions and the unreachable runtime are pruned from emitted lIR
+  (`FIB_PRUNE=0` disables); an initialiser that can trap is kept.
+- GPU: kernel atomics, block and warp reductions, structured control flow in WGSL,
+  warp shuffles (PTX `shfl.sync`, WGSL subgroups), f32 atomics on WebGPU, pinned host
+  memory and asynchronous copies (`Pinned`, `Transfer`).
+- C backend: no `musttail` with an argument over 16 bytes under clang on AArch64.
+- Documentation: a documentation site, the Hard Way course, checked examples, policy
+  pages; `fibc repl` is documented in the tooling guide.
+
+## Documentation corrections
 
 The documentation now distinguishes the shipped 0.1.13 surface, historical designs
 and proposed 1.0 promises. No 1.0 stability commitment has been made.
