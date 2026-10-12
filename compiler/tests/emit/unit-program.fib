@@ -6,7 +6,9 @@
 (ns tests.emit.unit-program
   (:use syntax.pos syntax.form types.ty types.ast types.table types.decls types.program fib.test.unit own.program
         emit.value emit.mono emit.statics emit.program emit.inits emit.args)
-  (:require [fib.test.run :as test-runner]))
+  (:require [fib.test.run :as test-runner])
+  (:require [emit.node :as nx] [lir.ast :as la] [lir.types :as lt] [emit.function :as f] [lir.print :as print])
+  (:require [tests.emit.normalized :as normal]))
 
 (def p0: Pos (Pos "t.fib" 1 1 0 1))
 
@@ -31,9 +33,9 @@
           (do (set! (. p inits) inits)
               (set! (. p def-slots)
                     (reduce (fn (m: (Map i64 DefValue) kv: (Pair i64 DefValue)) (assoc m (. kv fst) (. kv snd))) (map-empty)
-                            [(Pair 0 (DefValue "def.slot.0" (some LirPtr))) (Pair 1 (DefValue "def.slot.1" (some LirI64)))
-                             (Pair 2 (DefValue "def.slot.2" nil)) (Pair 3 (DefValue "def.slot.3" (some LirDouble)))
-                             (Pair 4 (DefValue "def.slot.4" (some LirRaw)))]))
+                            [(Pair 0 (DefValue (some (nx/global "def.slot.0")) (some LirPtr))) (Pair 1 (DefValue (some (nx/global "def.slot.1")) (some LirI64)))
+                             (Pair 2 (DefValue (some (nx/global "def.slot.2")) nil)) (Pair 3 (DefValue (some (nx/global "def.slot.3")) (some LirDouble)))
+                             (Pair 4 (DefValue (some (nx/global "def.slot.4")) (some LirRaw)))]))
               p)))))
 
 (defun unit-steps () -> (Vec StepRun)
@@ -43,8 +45,8 @@
       ;; ---- quotes and helpers
       (is cs (and (= (program-fresh-quote p) "@q.1") (= (program-fresh-quote p) "@q.2")) "quote names count from 1")
       (is cs (not (program-has-helper p "str-eq")) "a helper is new once")
-      (program-add-helper p "str-eq" "(define internal (h ptr) ())\n")
-      (is cs (and (program-has-helper p "str-eq") (= @(. p funcs) ["(define internal (h ptr) ())\n"])) "a helper is known, and its text is a function")
+      (program-add-helper p "str-eq" (f/make "h" (some lt/ty-ptr) [] lt/cc-c []))
+      (is cs (and (program-has-helper p "str-eq") (and (= (count @(. p funcs)) 1) (= (. (nth @(. p funcs) 0) name) "h"))) "a helper is known, and its text is a function")
       ;; ---- closures come out in the order they were asked, then the queue
       (is cs (= (program-request-closure p (inst0) "f.main" 7) "l.f.main.7") "a closure's code name")
       (program-request-closure p (inst0) "f.main" 9)
@@ -74,7 +76,7 @@
             (statics-keyword (. q statics) "a")
             (set! (. q keyword-helpers) true)
             (let ((text (program-render-keyword-helpers q)))
-              (do (is cs (= text (str-join ["(define internal (kw.show ptr) ((i64 k))\n  (block entry (switch k bad ((i64 0) k0) ((i64 1) k1)))\n"
+              (do (is cs (= text (normal/text (str-join ["(define internal (kw.show ptr) ((i64 k))\n  (block entry (switch k bad ((i64 0) k0) ((i64 1) k1)))\n"
                                             "  (block k0 (ret (call @fib.str-copy @str.0)))\n  (block k1 (ret (call @fib.str-copy @str.2)))\n"
                                             "  (block bad (unreachable)))\n"
                                             "(define internal (kw.hash i64) ((i64 k))\n  (block entry (switch k bad ((i64 0) k0) ((i64 1) k1)))\n"
@@ -82,22 +84,22 @@
                                             "  (block bad (unreachable)))\n"
                                             "(define internal (kw.rank i64) ((i64 k))\n  (block entry (switch k bad ((i64 0) k0) ((i64 1) k1)))\n"
                                             "  (block k1 (ret (i64 0)))\n  (block k0 (ret (i64 1)))\n"
-                                            "  (block bad (unreachable)))\n"])) "kw.show, kw.hash, kw.rank over the keywords by id; ranks by name; the strings interned :k then k per keyword")
+                                            "  (block bad (unreachable)))\n"]))) "kw.show, kw.hash, kw.rank over the keywords by id; ranks by name; the strings interned :k then k per keyword")
                   (is cs (= (statics-string (. q statics) ":b" 0) "@str.0") "the strings are numbered in the order of first use: :b was the first")))))
       ;; ---- the def made at run time
       (let ((ps (init-p [(Init 0 2 "d.A" true) (Init 1 2 "d.B" false) (Init 2 3 "d.C" false) (Init 3 2 "d.D" false) (Init 4 2 "d.E" false)])))
         (do (is cs (= (inits-slot-text ps)
-                      (str-join ["(global internal def.slot.0 ptr (ptr null))\n" "(global internal def.slot.1 i64 (i64 0))\n"
-                                 "(global internal def.slot.3 double (double 0.0))\n" "(global internal def.slot.4 ptr (ptr null))\n"])) "slots: one global per def with a type, zero by type (a pointer null, a double 0.0, an i64 0)")
+                      (normal/text (str-join ["(global internal def.slot.0 ptr (ptr null))\n" "(global internal def.slot.1 i64 (i64 0))\n"
+                                 "(global internal def.slot.3 double (double 0.0))\n" "(global internal def.slot.4 ptr (ptr null))\n"]))) "slots: one global per def with a type, zero by type (a pointer null, a double 0.0, an i64 0)")
             (is cs (= (inits-render ps)
-                      (str-join ["(define internal (fib.init.m2.0 void) ()\n  (block entry (store (string \"def A: \") @fib.initdef) (let ((v0 (call @d.A))) "
+                      (normal/text (str-join ["(define internal (fib.init.m2.0 void) ()\n  (block entry (store (string \"def A: \") @fib.initdef) (let ((v0 (call @d.A))) "
                                  "(call @fib.immortalise v0) (store v0 @def.slot.0) (store (string \"def B: \") @fib.initdef) (let ((v1 (call @d.B))) "
                                  "(store v1 @def.slot.1) (ret)))))\n"
                                  "(define internal (fib.init.m3.1 void) ()\n  (block entry (store (string \"def C: \") @fib.initdef) (call @d.C) (ret)))\n"
                                  "(define internal (fib.init.m2.2 void) ()\n  (block entry (store (string \"def D: \") @fib.initdef) (let ((v0 (call @d.D))) "
                                  "(store v0 @def.slot.3) (store (string \"def E: \") @fib.initdef) (let ((v1 (call @d.E))) (store v1 @def.slot.4) (ret)))))\n"
                                  "(define internal (fib.defs-init void) ()\n  (block entry (call @fib.init.m2.0) (call @fib.init.m3.1) (call @fib.init.m2.2) "
-                                 "(call @fib.init-done) (ret)))\n"])) "init functions by maximal runs of a module, then fib.defs-init calls them in order")))
+                                 "(call @fib.init-done) (ret)))\n"]))) "init functions by maximal runs of a module, then fib.defs-init calls them in order")))
       (is cs (and (= (inits-render p) "") (= (inits-slot-text p) "")) "no inits, no text")
       ;; ---- the words of the tool
       (is cs (match (parsed ["--sections" "fns,runtime" "--fn" "f.main" "a.fib" "b.fib"])

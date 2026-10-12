@@ -10,7 +10,8 @@
 ;; `simd/min-num` and `simd/max-num` are IEEE minNum and maxNum (a NaN operand loses). `simd/abs` of an integer traps on the minimum, as `neg` does.
 ;; `simd/round` is to nearest with ties away from zero, `simd/round-even` ties to even. Memory access to arrays is emit.lower.simdmem.
 (ns emit.lower.simdfn
-  (:use types.ty types.ast types.decls emit.value emit.ir emit.program emit.layout emit.lower.cx emit.lower.simd))
+  (:use types.ty types.ast types.decls emit.value emit.ir emit.program emit.layout emit.lower.cx emit.lower.simd)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 (defun ty-of :private (x: V) -> LirTy (unwrap-or (v-ty x) LirI64))
 
@@ -32,12 +33,12 @@
         :else nil))
 
 ;; Traps when a lane (or the scalar) of `a` is the minimum of its integer type: the absolute value does not fit.
-(defun abs-check :private (cx: LowerCx t: LirTy a: str) -> unit
-  (let ((m (str (shl -1 (- (lir-ty-bits (elem-of t)) 1)))))
+(defun abs-check :private (cx: LowerCx t: LirTy a: la/LExpr) -> unit
+  (let ((m (shl -1 (- (lir-ty-bits (elem-of t)) 1))))
     (if (vec? t)
-        (let ((amin (val cx (str-join ["(icmp eq " a " " (vconst t m) ")"]) (LirVec LirI1 (lanes-of t)))))
-          (lcx-trap-if cx (val cx (str-join ["(reduce-or " (v-text amin) ")"]) LirI1) (str-join ["integer overflow in abs at " (vec-name t)])))
-        (lcx-trap-if cx (val cx (str-join ["(icmp eq " a " (" (lir-ty-text t) " " m "))"]) LirI1)
+        (let ((amin (val cx (nx/compare-int la/IEq a (vconst t (nx/integer (lir-type (elem-of t)) m))) (LirVec LirI1 (lanes-of t)))))
+          (lcx-trap-if cx (val cx (nx/intrinsic "reduce-or" 0 nil [(v-expr amin)] nil) LirI1) (str-join ["integer overflow in abs at " (vec-name t)])))
+        (lcx-trap-if cx (val cx (nx/compare-int la/IEq a (nx/integer (lir-type t) m)) LirI1)
                      (str-join ["integer overflow in abs at " (lir-ty-text t)])))))
 
 (defun lcx-simd-fn (cx: LowerCx name: str a: (Vec V)) -> (Result V str)
@@ -45,9 +46,9 @@
     (match (fn-instr name (float-elem? t))
       (nil (Err (str-join ["unsupported: " name])))
       ((some op)
-       (do (when (and (= name "simd/abs") (not (float-elem? t))) (abs-check cx t (v-text (nth a 0))))
+       (do (when (and (= name "simd/abs") (not (float-elem? t))) (abs-check cx t (v-expr (nth a 0))))
            (when (and (= name "simd/fma") (not (. (g-target (program-g (. cx p))) has-fma))) (fma-trap cx))
-           (Ok (val cx (str-join ["(" (if (= name "simd/fma") (fma-op cx) op) (str-join (mapv (fn (v: V) (str-concat " " (v-text v))) a)) ")"]) t)))))))
+           (Ok (val cx (nx/intrinsic (if (= name "simd/fma") (fma-op cx) op) 0 nil (mapv v-expr a) nil) t)))))))
 
 ;; ---- simd/fma without FMA hardware (docs/adr/0008)
 
@@ -96,7 +97,7 @@
           (or (= (elem-of from) LirI1) (= (elem-of to) LirI1)) (Err "simd/convert does not convert a mask")
           :else (match (conv-instr (elem-of from) (elem-of to))
                   (nil (Ok x))
-                  ((some op) (Ok (val cx (str-join ["(" op " " (lir-ty-text to) " " (v-text x) ")"]) to)))))))
+                  ((some op) (Ok (val cx (nx/conversion op (lir-type to) (v-expr x)) to)))))))
 
 ;; `(simd/bitcast v)` to the vector type `to` (the lane count is the same by the checker's signature): the bits of each lane are the bits of the lane of the
 ;; result, so the lanes must be as wide as each other (`f64x4` and `i64x4`, `f32x8` and `i32x8`); a mask is not a lane type here.
@@ -107,7 +108,7 @@
           (not (= (elem-bits (elem-of from)) (elem-bits (elem-of to))))
             (Err (str-join ["simd/bitcast: the lanes of " (vec-name from) " and " (vec-name to) " differ in width"]))
           (= from to) (Ok x)
-          :else (Ok (val cx (str-join ["(bitcast " (lir-ty-text to) " " (v-text x) ")"]) to)))))
+          :else (Ok (val cx (nx/cast la/CBitcast (lir-type to) (v-expr x)) to)))))
 
 ;; ---- movemask, ctz, clz (JSON-2)
 
@@ -124,26 +125,25 @@
 ;; shifted to bit 16k.
 (defun lcx-movemask-halves :private (cx: LowerCx x: V n: i64) -> V
   (let ((pieces (mapv (fn (k: i64)
-                        (let ((half (val cx (str-join ["(shufflevector " (v-text x) " " (v-text x) " " (mask-text (vec (range (* 16 k) (* 16 (+ k 1))))) ")"]) (LirVec LirI1 16))))
-                          (let ((b (val cx (str-join ["(bitcast i16 " (v-text half) ")"]) LirI16)))
-                            (let ((z (val cx (str-join ["(zext i64 " (v-text b) ")"]) LirI64)))
-                              (if (= k 0) z (val cx (str-join ["(shl " (v-text z) " (i64 " (str (* 16 k)) "))"]) LirI64))))))
+                        (let ((half (val cx (nx/shuffle (v-expr x) (v-expr x) (mask-text (vec (range (* 16 k) (* 16 (+ k 1)))))) (LirVec LirI1 16))))
+                          (let ((b (val cx (nx/cast la/CBitcast lt/ty-i16 (v-expr half)) LirI16)))
+                            (let ((z (val cx (nx/cast la/CZExt lt/ty-i64 (v-expr b)) LirI64)))
+                              (if (= k 0) z (val cx (nx/binary la/BShl (v-expr z) (nx/integer lt/ty-i64 (* 16 k))) LirI64))))))
                       (range (quot n 16)))))
-    (reduce (fn (acc: V v: V) (val cx (str-join ["(or " (v-text acc) " " (v-text v) ")"]) LirI64)) (nth pieces 0) (drop 1 pieces))))
+    (reduce (fn (acc: V v: V) (val cx (nx/binary la/BOr (v-expr acc) (v-expr v)) LirI64)) (nth pieces 0) (drop 1 pieces))))
 
 (defun lcx-movemask-whole :private (cx: LowerCx x: V n: i64) -> V
     (let ((w (cond (<= n 8) 8 (<= n 16) 16 (<= n 32) 32 :else 64)))
       (let ((wt (cond (= w 8) LirI8 (= w 16) LirI16 (= w 32) LirI32 :else LirI64))
             (m (if (= n w)
                    x
-                   (val cx (str-join ["(shufflevector " (v-text x) " (zeroinitializer " (lir-ty-text (ty-of x)) ") "
-                                      (mask-text (mapv (fn (i: i64) (if (< i n) i n)) (range w))) ")"]) (LirVec LirI1 w)))))
-        (let ((b (val cx (str-join ["(bitcast " (lir-ty-text wt) " " (v-text m) ")"]) wt)))
-          (if (= w 64) b (val cx (str-join ["(zext i64 " (v-text b) ")"]) LirI64))))))
+                   (val cx (nx/shuffle (v-expr x) (nx/zero (lir-type (ty-of x))) (mask-text (mapv (fn (i: i64) (if (< i n) i n)) (range w)))) (LirVec LirI1 w)))))
+        (let ((b (val cx (nx/cast la/CBitcast (lir-type wt) (v-expr m)) wt)))
+          (if (= w 64) b (val cx (nx/cast la/CZExt lt/ty-i64 (v-expr b)) LirI64))))))
 
 ;; `ctz x` and `clz x` of an integer: the lIR `cttz` and `ctlz` (a zero has as many zeros as the type has bits, never poison).
 (defun lcx-count-zeros (cx: LowerCx name: str x: V) -> V
-  (val cx (str-join ["(" (if (= name "ctz") "cttz" "ctlz") " " (v-text x) ")"]) (ty-of x)))
+  (val cx (nx/intrinsic (if (= name "ctz") "cttz" "ctlz") 0 nil [(v-expr x)] nil) (ty-of x)))
 
 ;; ---- shuffles and constants
 
@@ -172,11 +172,11 @@
       ((some idx)
        (if (some? (find-first (fn (i: i64) (or (< i 0) (>= i (* 2 (lanes-of t))))) idx))
            (Err (str-join ["simd/shuffle: an index is outside 0 .. " (str (- (* 2 (lanes-of t)) 1))]))
-           (Ok (val cx (str-join ["(shufflevector " (v-text a) " " (v-text b) " " (mask-text idx) ")"]) (LirVec (elem-of t) (count idx)))))))))
+           (Ok (val cx (nx/shuffle (v-expr a) (v-expr b) (mask-text idx)) (LirVec (elem-of t) (count idx)))))))))
 
 (defun lcx-simd-reverse (cx: LowerCx x: V) -> V
   (let ((t (ty-of x)))
-    (val cx (str-join ["(shufflevector " (v-text x) " " (v-text x) " " (mask-text (mapv (fn (i: i64) (- (- (lanes-of t) 1) i)) (range (lanes-of t)))) ")"]) t)))
+    (val cx (nx/shuffle (v-expr x) (v-expr x) (mask-text (mapv (fn (i: i64) (- (- (lanes-of t) 1) i)) (range (lanes-of t))))) t)))
 
 ;; The code of a lane type: the width of an integer, 100 plus the width of a float, 1 for a mask.
 (defun lane-kind :private (e: LirTy) -> i64

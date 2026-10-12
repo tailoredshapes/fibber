@@ -1,0 +1,51 @@
+;; Only dynamic operator choices use words. Their operands and types stay trees.
+(ns emit.node.words (:use lir.ast lir.types lir.lit))
+
+(defun binary-word (word: str) -> LBinOp
+  (cond (= word "add") BAdd (= word "sub") BSub (= word "mul") BMul
+        (= word "sdiv") BSDiv (= word "udiv") BUDiv (= word "srem") BSRem (= word "urem") BURem
+        (= word "fadd") BFAdd (= word "fsub") BFSub (= word "fmul") BFMul (= word "fdiv") BFDiv (= word "frem") BFRem
+        (= word "and") BAnd (= word "or") BOr (= word "xor") BXor
+        (= word "shl") BShl (= word "lshr") BLShr (= word "ashr") BAShr
+        :else (trap (str "emitter: unknown binary operation " word))))
+
+(defun cast-word (word: str) -> LCastOp
+  (cond (= word "trunc") CTrunc (= word "zext") CZExt (= word "sext") CSExt
+        (= word "fptrunc") CFpTrunc (= word "fpext") CFpExt
+        (= word "fptosi") CFpToSi (= word "fptoui") CFpToUi
+        (= word "sitofp") CSiToFp (= word "uitofp") CUiToFp
+        (= word "ptrtoint") CPtrToInt (= word "inttoptr") CIntToPtr
+        (= word "bitcast") CBitcast (= word "fptosi-sat") CFpToSiSat (= word "fptoui-sat") CFpToUiSat
+        :else (trap (str "emitter: unknown conversion " word))))
+
+(defun int-predicate (word: str) -> LIPred
+  (cond (= word "eq") IEq (= word "ne") INe (= word "slt") ISlt (= word "sle") ISle
+        (= word "sgt") ISgt (= word "sge") ISge (= word "ult") IUlt (= word "ule") IUle
+        (= word "ugt") IUgt (= word "uge") IUge
+        :else (trap (str "emitter: unknown integer predicate " word))))
+
+(defun float-predicate (word: str) -> LFPred
+  (cond (= word "oeq") FOeq (= word "one") FOne (= word "olt") FOlt (= word "ole") FOle
+        (= word "ogt") FOgt (= word "oge") FOge (= word "ord") FOrd (= word "ueq") FUeq
+        (= word "une") FUne (= word "ult") FUlt (= word "ule") FUle (= word "ugt") FUgt
+        (= word "uge") FUge (= word "uno") FUno
+        :else (trap (str "emitter: unknown floating predicate " word))))
+
+(defun type-word (word: str) -> LType
+  (match (scalar-keyword word)
+    ((some ty) ty)
+    (nil (if (starts-with? word "%struct.")
+             (TNamed (str-slice word 8 (str-len word)))
+             (trap (str "emitter: expected a scalar or named type, found " word))))))
+
+(defun operation (word: str a: LExpr b: LExpr) -> LExpr
+  (LExpr (cond (starts-with? word "icmp ") (KICmp (int-predicate (str-slice word 5 (str-len word))) a b)
+               (starts-with? word "fcmp ") (KFCmp (float-predicate (str-slice word 5 (str-len word))) a b)
+               (= word "sadd-overflow") (KOverflow OvSAdd a b)
+               (= word "ssub-overflow") (KOverflow OvSSub a b)
+               (= word "smul-overflow") (KOverflow OvSMul a b)
+               (or (starts-with? word "shfl-") (= word "shuffle-xor")) (KIntrin word 0 nil [a b] nil)
+               :else (KBin (binary-word word) a b)) 0))
+
+(defun conversion (word: str ty: LType value: LExpr) -> LExpr
+  (LExpr (KCast (cast-word word) ty value) 0))

@@ -3,7 +3,8 @@
 ;; releases of a failing call) is emit.lower.call's; the rest of the builtins (`caught-message`, `throw-object`, ..) are runtime calls of
 ;; emit.lower.builtins.
 (ns emit.lower.catch
-  (:use emit.value emit.ir emit.program emit.objects.kinds emit.lower.cx emit.lower.ops))
+  (:use emit.value emit.ir emit.program emit.objects.kinds emit.lower.cx emit.lower.ops)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; `(catch-run f)` (docs/design/exceptions.md 4.2): `f` called with a catch active on the thread; 0 when it returned, else the kind of
 ;; the failure it returned (fib.catch-leave keeps it for `caught-message`/`caught-object`). In a program that does not pass failures on
@@ -11,10 +12,10 @@
 (defun lcx-catch-run (cx: LowerCx f: V) -> V
   (let ((b (. cx b)) (uw (and (. (. cx p) unwinding) (not @(. (. cx p) macro-module)))))
     (do (lcx-retain cx f)
-        (let ((s (fb-val b "(call @fib.catch-enter)" LirPtr))
-              (code (lcx-load cx LirPtr (lcx-gep cx "fib.closure" (v-text f) slot-closure-code))))
+        (let ((s (fb-val b (nx/call "fib.catch-enter" []) LirPtr))
+              (code (lcx-load cx LirPtr (lcx-gep cx "fib.closure" (v-expr f) slot-closure-code))))
           (if uw
-              (let ((ex (fb-val b (str-join ["(indirect-call " (v-text code) " (fn tailcc ptr (ptr)) " (v-text f) ")"]) LirPtr)))
-                (fb-val b (str-join ["(call @fib.catch-leave " (v-text s) " " (v-text ex) ")"]) LirI64))
-              (do (fb-stmt b (str-join ["(indirect-call " (v-text code) " (fn tailcc void (ptr)) " (v-text f) ")"]))
-                  (fb-val b (str-join ["(call @fib.catch-leave " (v-text s) " (ptr null))"]) LirI64)))))))
+              (let ((ex (fb-val b (nx/indirect-call (v-expr code) (lt/LFnType lt/cc-tail (some lt/ty-ptr) [lt/ty-ptr] false) [(v-expr f)] false) LirPtr)))
+                (fb-val b (nx/call "fib.catch-leave" [(v-expr s) (v-expr ex)]) LirI64))
+              (do (fb-stmt b (nx/indirect-call (v-expr code) (lt/LFnType lt/cc-tail nil [lt/ty-ptr] false) [(v-expr f)] false))
+                  (fb-val b (nx/call "fib.catch-leave" [(v-expr s) (nx/null)]) LirI64)))))))

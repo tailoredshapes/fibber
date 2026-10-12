@@ -100,7 +100,7 @@ The rules read the table's `TargetRow` literals in `compiler/types/targets.fib` 
   (plant "mk/release.mk" "\nRELEASE_CPU := x86-64-v2\n"))
 
 (rule "simd/fma without FMA lowers to the trap (emit.lower.simdfn), and executables call the start-up CPU check (emit.compile)"
-  (into (must-contain repo "compiler/emit/lower/simdfn.fib" "(fma-trap cx)") (must-contain repo "compiler/emit/compile.fib" "(cc/cpu-check-call t)"))
+  (into (must-contain repo "compiler/emit/lower/simdfn.fib" "(fma-trap cx)") (must-contain repo "compiler/emit/compile.fib" "(cc/cpu-check-code t)"))
   (plant-file "compiler/emit/lower/simdfn.fib" "(ns emit.lower.simdfn)\n"))
 ```
 

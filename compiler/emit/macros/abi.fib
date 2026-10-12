@@ -4,7 +4,7 @@
 ;; `ccc` and exported. Replaces crates/fibc/src/macros/abi.rs (the text is the Rust's, byte for byte) and `macro_forms` of
 ;; macros/mod.rs; `compile-macro` is emit.compile's.
 (ns emit.macros.abi
-  (:require [fib.string :as s])
+  (:require [fib.string :as s] [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f] [lir.print :as print])
   (:use syntax.pos syntax.form expand.types emit.value emit.layout emit.lower.cx))
 
 ;; The layout of the built-in `Form`. Rust: macros/abi.rs:14 FormLayout (`tags: [u32; 11]`): `sname` is the `Form` object's struct name
@@ -17,82 +17,92 @@
 (defun abi-widths () -> (Vec str) ["i8" "i16" "i32" "i64" "f32" "f64"])
 (defun abi-variants () -> (Vec str) ["Sym" "Kw" "Int" "Flt" "Str" "Chr" "Bool" "Nil" "List" "Vec" "Map"])
 
-;; `fibm.kw-count.K`, the number of keywords the module interned, and `fibm.kw.K`, the name of the keyword with a given id as an immortal
-;; `str` object, or null for an id that is none (below 0 or from the count up). The ids are 0 to count - 1, in the order interned.
-;; Rust: macros/abi.rs:152 render_keywords
+(defun surface :private (word: str k: str ret: (Option lt/LType) params: (Vec (Pair str lt/LType)) blocks: (Vec la/LBlock)) -> la/LItem
+  (la/ItDefine (f/external (f/make (str "fibm." word "." k) ret params lt/cc-c blocks))))
+
+(defun abi-keyword-items (strs: (Vec str) k: i64) -> (Vec la/LItem)
+  (let ((suffix (str k))
+        (cases (mapv (fn (i: i64) (la/LCase (n/integer lt/ty-i64 i) (str "kw" i))) (range (count strs))))
+        (blocks (mapv (fn (i: i64) (f/block (str "kw" i) [(n/ret (some (n/reference (nth strs i))))])) (range (count strs)))))
+    [(surface "kw-count" suffix (some lt/ty-i64) [] [(f/block "entry" [(n/ret (some (n/integer lt/ty-i64 (count strs))))])])
+     (surface "kw" suffix (some lt/ty-ptr) [(Pair "id" lt/ty-i64)]
+       (conj (into [(f/block "entry" [(n/switch (n/local "id") "none" cases)])] blocks)
+             (f/block "none" [(n/ret (some (n/null)))])))]))
+
 (defun abi-render-keywords (strs: (Vec str) k: i64) -> str
-  (let ((cases (str-join (mapv (fn (i: i64) (str-join [" ((i64 " (str i) ") kw" (str i) ")"])) (range (count strs)))))
-        (blocks (str-join (mapv (fn (i: i64) (str-join ["\n  (block kw" (str i) " (ret " (nth strs i) "))"])) (range (count strs))))))
-    (str-join ["(define (fibm.kw-count." (str k) " i64) () (block entry (ret (i64 " (str (count strs)) "))))\n"
-               "(define (fibm.kw." (str k) " ptr) ((i64 id))\n"
-               "  (block entry (switch id none" cases "))" blocks "\n"
-               "  (block none (ret (ptr null))))\n"])))
+  (print/print-module (la/LModule (abi-keyword-items strs k))))
 
-;; The entry that runs the macro body `body` on `n` `Form` (or rest vector) arguments. Rust: macros/abi.rs:41 (the first writeln)
-(defun abi-entry :private (body: str n: i64 k: str) -> str
-  (let ((ids (range n)))
-    (str-join ["(define (fibm.entry." k " ptr) (" (s/join " " (mapv (fn (i: i64) (str-join ["(ptr a" (str i) ")"])) ids)) ")\n"
-               "  (block entry (ret (call @" body " " (s/join " " (mapv (fn (i: i64) (str-join ["a" (str i)])) ids)) "))))\n"])))
+(defun abi-entry :private (body: str count: i64 k: str) -> la/LItem
+  (surface "entry" k (some lt/ty-ptr)
+    (mapv (fn (i: i64) (Pair (str "a" i) lt/ty-ptr)) (range count))
+    [(f/block "entry" [(n/ret (some (n/call body (mapv (fn (i: i64) (n/local (str "a" i))) (range count)))))])]))
 
-;; The constructors of strings, forms and vectors. Rust: macros/abi.rs:58 (the second writeln, up to `fibm.form`)
-(defun abi-constructors :private (f: FormLayout k: str) -> str
-  (let ((sn (. f sname)) (tags (. f tags)) (v (. f vec)))
-    (str-join [
-      "(define (fibm.str." k " ptr) ((ptr bytes) (i64 n))\n"
-      "  (block entry\n"
-      "    (let ((r (call @fib.str-new n)))\n"
-      "      (call @memcpy (call @fib.str-bytes-ptr r) bytes n)\n"
-      "      (ret r))))\n"
-      "(define (fibm.form." k " ptr) ((i32 tag) (i64 a) (i64 b) (ptr p))\n"
-      "  (block entry\n"
-      "    (let ((o (call @fib.alloc (i64 " (str (. f size)) ") (i32 " (str (. f tid)) ")))\n"
-      "          (f0 (getelementptr %struct." sn ".v0 o (i32 0) (i32 4)))\n"
-      "          (f1 (getelementptr %struct." sn ".v2 o (i32 0) (i32 5))))\n"
-      "      (store (i32 " (str flag-immortal) ") (getelementptr %struct.fib.hdr o (i32 0) (i32 2)))\n"
-      "      (store (i64 0) (getelementptr %struct.fib.hdr o (i32 0) (i32 0)))\n"
-      "      (store tag (getelementptr %struct." sn " o (i32 0) (i32 3)))\n"
-      "      (switch tag done ((i32 " (str (nth tags 0)) ") ptrf) ((i32 " (str (nth tags 1)) ") ptrf) ((i32 " (str (nth tags 2)) ") intf) ((i32 " (str (nth tags 3)) ") fltf) ((i32 " (str (nth tags 4)) ") ptrf) ((i32 " (str (nth tags 5)) ") chrf) ((i32 " (str (nth tags 6)) ") boolf) ((i32 " (str (nth tags 8)) ") ptrf) ((i32 " (str (nth tags 9)) ") ptrf) ((i32 " (str (nth tags 10)) ") ptrf))))\n"
-      "  (block ptrf (store p f0) (br done))\n"
-      "  (block intf (store a f0) (store b f1) (br done))\n"
-      "  (block fltf (store (bitcast double a) f0) (store b f1) (br done))\n"
-      "  (block chrf (store (trunc i32 a) (getelementptr %struct." sn ".v5 o (i32 0) (i32 4))) (br done))\n"
-      "  (block boolf (store (trunc i1 a) (getelementptr %struct." sn ".v6 o (i32 0) (i32 4))) (br done))\n"
-      "  (block done (ret o)))\n"])))
+(defun abi-form :private (layout: FormLayout k: str) -> la/LItem
+  (let ((sn (. layout sname)) (tags (. layout tags)))
+    (let ((cases (mapv (fn (i: i64)
+                        (la/LCase (n/integer lt/ty-i32 (nth tags i))
+                                  (cond (= i 2) "intf" (= i 3) "fltf" (= i 5) "chrf" (= i 6) "boolf" :else "ptrf")))
+                      [0 1 2 3 4 5 6 8 9 10])))
+      (surface "form" k (some lt/ty-ptr) [(Pair "tag" lt/ty-i32) (Pair "a" lt/ty-i64) (Pair "b" lt/ty-i64) (Pair "p" lt/ty-ptr)]
+        [(f/block "entry" [(f/bound [(f/binding "o" (n/call "fib.alloc" [(n/integer lt/ty-i64 (. layout size)) (n/integer lt/ty-i32 (. layout tid))]))
+                                    (f/binding "f0" (f/field (str sn ".v0") (n/local "o") 4))
+                                    (f/binding "f1" (f/field (str sn ".v2") (n/local "o") 5))]
+                          [(n/store (n/integer lt/ty-i32 flag-immortal) (f/field "fib.hdr" (n/local "o") 2) nil)
+                           (n/store (n/integer lt/ty-i64 0) (f/field "fib.hdr" (n/local "o") 0) nil)
+                           (n/store (n/local "tag") (f/field sn (n/local "o") 3) nil)
+                           (n/switch (n/local "tag") "done" cases)])])
+         (f/block "ptrf" [(n/store (n/local "p") (n/local "f0") nil) (n/branch "done")])
+         (f/block "intf" [(n/store (n/local "a") (n/local "f0") nil) (n/store (n/local "b") (n/local "f1") nil) (n/branch "done")])
+         (f/block "fltf" [(n/store (n/cast la/CBitcast lt/ty-double (n/local "a")) (n/local "f0") nil)
+                          (n/store (n/local "b") (n/local "f1") nil) (n/branch "done")])
+         (f/block "chrf" [(n/store (n/cast la/CTrunc lt/ty-i32 (n/local "a")) (f/field (str sn ".v5") (n/local "o") 4) nil) (n/branch "done")])
+         (f/block "boolf" [(n/store (n/cast la/CTrunc lt/ty-i1 (n/local "a")) (f/field (str sn ".v6") (n/local "o") 4) nil) (n/branch "done")])
+         (f/block "done" [(n/ret (some (n/local "o")))])]))))
 
-;; The readers of forms and vectors and the hooks. Rust: macros/abi.rs:58 (the rest of the second writeln)
-(defun abi-readers :private (f: FormLayout k: str) -> str
-  (let ((sn (. f sname)) (tags (. f tags)) (v (. f vec)))
-    (str-join [
-      "(define (fibm.vec." k " ptr) ((ptr buf) (i64 n))\n"
-      "  (block entry (ret (call @fib.vec-build buf n (i64 8) (i8 1) (i32 " (str (. v tvec)) ") (i32 " (str (. v tnode)) ") (i32 " (str (. v tarr)) ") (i32 " (str (. v tnarr)) ")))))\n"
-      "(define (fibm.tag." k " i32) ((ptr o))\n"
-      "  (block entry (ret (load i32 (getelementptr %struct." sn " o (i32 0) (i32 3))))))\n"
-      "(define (fibm.f0-ptr." k " ptr) ((ptr o))\n"
-      "  (block entry (ret (load ptr (getelementptr %struct." sn ".v0 o (i32 0) (i32 4))))))\n"
-      "(define (fibm.f0-i64." k " i64) ((ptr o))\n"
-      "  (block entry (ret (load i64 (getelementptr %struct." sn ".v2 o (i32 0) (i32 4))))))\n"
-      "(define (fibm.f0-f64." k " double) ((ptr o))\n"
-      "  (block entry (ret (load double (getelementptr %struct." sn ".v3 o (i32 0) (i32 4))))))\n"
-      "(define (fibm.f0-i32." k " i32) ((ptr o))\n"
-      "  (block entry (ret (load i32 (getelementptr %struct." sn ".v5 o (i32 0) (i32 4))))))\n"
-      "(define (fibm.f0-i1." k " i32) ((ptr o))\n"
-      "  (block entry (ret (zext i32 (load i1 (getelementptr %struct." sn ".v6 o (i32 0) (i32 4)))))))\n"
-      "(define (fibm.f1-i64." k " i64) ((ptr o))\n"
-      "  (block entry (ret (load i64 (getelementptr %struct." sn ".v2 o (i32 0) (i32 5))))))\n"
-      "(define (fibm.str-len." k " i64) ((ptr s)) (block entry (ret (call @fib.str-len s))))\n"
-      "(define (fibm.str-ptr." k " ptr) ((ptr s)) (block entry (ret (call @fib.str-bytes-ptr s))))\n"
-      "(define (fibm.vec-len." k " i64) ((ptr v)) (block entry (ret (call @fib.vec-len v))))\n"
-      "(define (fibm.vec-elem." k " ptr) ((ptr v) (i64 i))\n"
-      "  (block entry (ret (load ptr (call @fib.vec-elem-ptr v i (i64 8))))))\n"
-      "(define (fibm.set-hooks." k " void) ((ptr gensym) (ptr reflect) (ptr cx))\n"
-      "  (block entry (store gensym @fibm.gensym-hook) (store reflect @fibm.reflect-hook) (store cx @fibm.hook-cx) (ret)))\n"
-      "(define (fibm.set-trap-hook." k " void) ((ptr trap))\n"
-      "  (block entry (store trap @fibm.trap-hook) (ret)))\n"
-      "(define (fibm.init." k " void) () (block entry (call @fib.init) (ret)))\n"])))
+(defun abi-constructors :private (layout: FormLayout k: str) -> (Vec la/LItem)
+  [(surface "str" k (some lt/ty-ptr) [(Pair "bytes" lt/ty-ptr) (Pair "n" lt/ty-i64)]
+     [(f/block "entry" [(f/bound [(f/binding "r" (n/call "fib.str-new" [(n/local "n")]))]
+                                 [(n/call "memcpy" [(n/call "fib.str-bytes-ptr" [(n/local "r")]) (n/local "bytes") (n/local "n")])
+                                  (n/ret (some (n/local "r")))])])])
+   (abi-form layout k)])
 
-;; The lIR of the module's surface; `entry` runs the macro body `body` on `n` `Form` (or rest vector) arguments. Rust: macros/abi.rs:40 render
-(defun abi-render (f: FormLayout body: str n: i64 k: i64) -> str
-  (str-join [(abi-render-keywords (. f keyword-strs) k) (abi-entry body n (str k)) (abi-constructors f (str k)) (abi-readers f (str k))]))
+(defun form-reader :private (layout: FormLayout k: str word: str variant: str slot: i64 ty: lt/LType widen: bool) -> la/LItem
+  (let ((value (n/load ty (f/field (str (. layout sname) variant) (n/local "o") slot) nil)))
+    (surface word k (some (if widen lt/ty-i32 ty)) [(Pair "o" lt/ty-ptr)]
+      [(f/block "entry" [(n/ret (some (if widen (n/cast la/CZExt lt/ty-i32 value) value)))])])) )
+
+(defun call-reader :private (k: str word: str runtime: str ty: lt/LType) -> la/LItem
+  (surface word k (some ty) [(Pair "s" lt/ty-ptr)] [(f/block "entry" [(n/ret (some (n/call runtime [(n/local "s")])))])]))
+
+(defun abi-readers :private (layout: FormLayout k: str) -> (Vec la/LItem)
+  (let ((v (. layout vec)))
+    [(surface "vec" k (some lt/ty-ptr) [(Pair "buf" lt/ty-ptr) (Pair "n" lt/ty-i64)]
+       [(f/block "entry" [(n/ret (some (n/call "fib.vec-build" [(n/local "buf") (n/local "n") (n/integer lt/ty-i64 8) (n/integer lt/ty-i8 1)
+                              (n/integer lt/ty-i32 (. v tvec)) (n/integer lt/ty-i32 (. v tnode)) (n/integer lt/ty-i32 (. v tarr)) (n/integer lt/ty-i32 (. v tnarr))])))])])
+     (form-reader layout k "tag" "" 3 lt/ty-i32 false)
+     (form-reader layout k "f0-ptr" ".v0" 4 lt/ty-ptr false)
+     (form-reader layout k "f0-i64" ".v2" 4 lt/ty-i64 false)
+     (form-reader layout k "f0-f64" ".v3" 4 lt/ty-double false)
+     (form-reader layout k "f0-i32" ".v5" 4 lt/ty-i32 false)
+     (form-reader layout k "f0-i1" ".v6" 4 lt/ty-i1 true)
+     (form-reader layout k "f1-i64" ".v2" 5 lt/ty-i64 false)
+     (call-reader k "str-len" "fib.str-len" lt/ty-i64)
+     (call-reader k "str-ptr" "fib.str-bytes-ptr" lt/ty-ptr)
+     (call-reader k "vec-len" "fib.vec-len" lt/ty-i64)
+     (surface "vec-elem" k (some lt/ty-ptr) [(Pair "v" lt/ty-ptr) (Pair "i" lt/ty-i64)]
+       [(f/block "entry" [(n/ret (some (n/load lt/ty-ptr (n/call "fib.vec-elem-ptr" [(n/local "v") (n/local "i") (n/integer lt/ty-i64 8)]) nil)))])])
+     (surface "set-hooks" k nil [(Pair "gensym" lt/ty-ptr) (Pair "reflect" lt/ty-ptr) (Pair "cx" lt/ty-ptr)]
+       [(f/block "entry" [(n/store (n/local "gensym") (n/global "fibm.gensym-hook") nil) (n/store (n/local "reflect") (n/global "fibm.reflect-hook") nil)
+                          (n/store (n/local "cx") (n/global "fibm.hook-cx") nil) (n/ret nil)])])
+     (surface "set-trap-hook" k nil [(Pair "trap" lt/ty-ptr)] [(f/block "entry" [(n/store (n/local "trap") (n/global "fibm.trap-hook") nil) (n/ret nil)])])
+     (surface "init" k nil [] [(f/block "entry" [(n/call "fib.init" []) (n/ret nil)])])]))
+
+(defun abi-items (layout: FormLayout body: str count: i64 k: i64) -> (Vec la/LItem)
+  (into (into (conj (abi-keyword-items (. layout keyword-strs) k) (abi-entry body count (str k)))
+              (abi-constructors layout (str k))) (abi-readers layout (str k))))
+
+(defun abi-render (layout: FormLayout body: str count: i64 k: i64) -> str
+  (print/print-module (la/LModule (abi-items layout body count k))))
 
 ;; ---- the forms of a macro-time module
 

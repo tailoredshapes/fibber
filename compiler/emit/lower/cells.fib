@@ -4,7 +4,8 @@
 ;; is Rust's: a `gep` before the access it feeds, an operand's retain before the call it is passed to.
 (ns emit.lower.cells
   (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.layout emit.ir emit.objects emit.program
-        emit.lower.cx emit.lower.ops emit.lower.objects emit.lower.window emit.lower.atoms))
+        emit.lower.cx emit.lower.ops emit.lower.objects emit.lower.window emit.lower.atoms)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; The content of a cell, atom, weak reference or task type; `nil` for any other type.
 (defun content-of :private (t: Ty) -> (Option Ty)
@@ -22,7 +23,7 @@
     ((PlExpr e) (try-let ((v (lcx-value cx e)) (t (lcx-ty cx e))) (Ok (Pair v t))))))
 
 ;; The content of a cell, `(call @fib.lock ..)` and `unlock` around the load of an atom's, retained (§8.6, never elided).
-(defun cell-load :private (cx: LowerCx sname: str cell: str ty: Ty) -> (Result V str)
+(defun cell-load :private (cx: LowerCx sname: str cell: la/LExpr ty: Ty) -> (Result V str)
   ((. (. cx hub) cell-load) cx sname cell ty))
 
 ;; `@p`: the content, retained (§8.6, never elided). Rust: lower/cells.rs:25 LowerCx::deref_place
@@ -37,7 +38,7 @@
     (match (. r snd)
       ((TCon (KCell) args)
        (try-let ((o (lcx-object-of cx (. r snd))))
-         (cell-load cx (. o sname) (v-text (. r fst)) (nth args 0))))
+         (cell-load cx (. o sname) (v-expr (. r fst)) (nth args 0))))
       (_ (Err "a peek of something that is not a cell")))))
 
 ;; An atom's content: for a scalar one atomic load (emit.lower.atoms); else under the lock: lock, load, retain, unlock: one atomic step (§8.6).
@@ -45,18 +46,18 @@
   (try-let ((l (program-lir (. cx p) content)))
     (match l
       ((some lt) (if (scalar-atom-lir? lt)
-                     (Ok (scalar-atom-load cx (lcx-gep cx sname (v-text c) slot-atom-value) lt))
+                     (Ok (scalar-atom-load cx (lcx-gep cx sname (v-expr c) slot-atom-value) lt))
                      (atom-deref-locked cx c sname content)))
       (nil (atom-deref-locked cx c sname content)))))
 
 (defun atom-deref-locked :private (cx: LowerCx c: V sname: str content: Ty) -> (Result V str)
-  (let ((lockp (lcx-gep cx sname (v-text c) slot-atom-lock)))
-    (do (fb-stmt (. cx b) (str-join ["(call @fib.lock " lockp ")"]))
-        (let ((vp (lcx-gep cx sname (v-text c) slot-atom-value)))
+  (let ((lockp (lcx-gep cx sname (v-expr c) slot-atom-lock)))
+    (do (fb-stmt (. cx b) (nx/call "fib.lock" [lockp]))
+        (let ((vp (lcx-gep cx sname (v-expr c) slot-atom-value)))
           (try-let ((l (program-lir (. cx p) content)))
             (let ((v (match l ((some lt) (lcx-load cx lt vp)) (nil VUnit))))
               (do (lcx-retain cx v)
-                  (fb-stmt (. cx b) (str-join ["(call @fib.unlock " lockp ")"]))
+                  (fb-stmt (. cx b) (nx/call "fib.unlock" [lockp]))
                   (Ok v))))))))
 
 ;; Rust: lower/cells.rs:30 LowerCx::deref_val
@@ -70,14 +71,14 @@
        (_ (try-let ((o (lcx-object-of cx t)))
             (match t
               ((TCon (KAtom) _) (atom-deref cx c (. o sname) content))
-              (_ (try-let ((v (cell-load cx (. o sname) (v-text c) content)))
+              (_ (try-let ((v (cell-load cx (. o sname) (v-expr c) content)))
                    (do (lcx-retain cx v)
                        (Ok v)))))))))))
 
 ;; A heap enum `Option` object with `tag` and, for `some`, its consumed payload. Rust: lower/cells.rs:98 option_object
-(defun option-object :private (cx: LowerCx tid: i64 sname: str size: i64 tag: i64 payload: (Option V)) -> str
+(defun option-object :private (cx: LowerCx tid: i64 sname: str size: i64 tag: i64 payload: (Option V)) -> la/LExpr
   (let ((p (lcx-heap-alloc cx tid size)) (vs (str-join [sname ".v" (str tag)])))
-    (do (fb-stmt (. cx b) (str-join ["(store (i32 " (str tag) ") " (lcx-gep cx vs p slot-enum-tag) ")"]))
+    (do (fb-stmt (. cx b) (nx/store (nx/integer lt/ty-i32 tag) (lcx-gep cx vs p slot-enum-tag) nil))
         (when-some [v payload] (lcx-store cx v (lcx-gep cx vs p slot-variant-field0)))
         p)))
 
@@ -88,19 +89,19 @@
       (Err "a weak reference to an Option")
       (let ((b (. cx b)) (g (program-g (. cx p))))
         (try-let ((o (lcx-object-of cx (ty-nominal @(. g option) [target]))))
-          (let ((bx (fb-val b (str-join ["(extractvalue " (v-text w) " 0)"]) LirPtr))
-                (vt (fb-val b (str-join ["(extractvalue " (v-text w) " 1)"]) LirPtr)))
-            (let ((t (fb-val b (str-join ["(call @fib.upgrade " (v-text bx) ")"]) LirPtr)))
-              (let ((gone (fb-val b (str-join ["(icmp eq " (v-text t) " (ptr null))"]) LirI1))
+          (let ((bx (fb-val b (nx/extract (v-expr w) 0) LirPtr))
+                (vt (fb-val b (nx/extract (v-expr w) 1) LirPtr)))
+            (let ((t (fb-val b (nx/call "fib.upgrade" [(v-expr bx)]) LirPtr)))
+              (let ((gone (fb-val b (nx/compare-int la/IEq (v-expr t) (nx/null)) LirI1))
                     (lnil (fb-label b "wnil")) (lsome (fb-label b "wsome")) (ljoin (fb-label b "wup")))
-                (do (fb-term b (str-join ["(br " (v-text gone) " " lnil " " lsome ")"]))
+                (do (fb-term b (nx/conditional (v-expr gone) lnil lsome))
                     (fb-open b lnil)
                     (let ((pn (option-object cx (. o tid) (. o sname) (. o size) 0 nil)))
-                      (do (fb-term b (str-join ["(br " ljoin ")"]))
+                      (do (fb-term b (nx/branch ljoin))
                           (fb-open b lsome)
-                          (let ((d (fb-val b (str-join ["{ " (v-text t) " " (v-text vt) " }"]) LirDyn)))
+                          (let ((d (fb-val b (nx/aggregate [(v-expr t) (v-expr vt)]) LirDyn)))
                             (let ((ps (option-object cx (. o tid) (. o sname) (. o size) 1 (some d))))
-                              (do (fb-term b (str-join ["(br " ljoin ")"]))
+                              (do (fb-term b (nx/branch ljoin))
                                   (fb-open b ljoin)
                                   (Ok (fb-phi b LirPtr [(PhiEdge lnil pn) (PhiEdge lsome ps)])))))))))))))))
 
@@ -108,7 +109,7 @@
 (defun upgrade :private (cx: LowerCx w: V target: Ty) -> (Result V str)
   (try-let ((rep (option-rep (program-g (. cx p)) target)))
     (match rep
-      ((OptNull) (Ok (fb-val (. cx b) (str-join ["(call @fib.upgrade " (v-text w) ")"]) LirPtr)))
+      ((OptNull) (Ok (fb-val (. cx b) (nx/call "fib.upgrade" [(v-expr w)]) LirPtr)))
       ((OptValue) (Err "a weak reference to a scalar"))
       ((OptBoxed) (upgrade-dyn cx w target)))))
 
@@ -120,7 +121,7 @@
      (try-let ((o (lcx-object-of cx t)) (l (program-lir (. cx p) (nth args 0))))
        (match l
          ((some lt) (if (scalar-atom-lir? lt)
-                        (do (scalar-atom-store cx (lcx-gep cx (. o sname) (v-text a) slot-atom-value) lt v)
+                        (do (scalar-atom-store cx (lcx-gep cx (. o sname) (v-expr a) slot-atom-value) lt v)
                             (Ok VUnit))
                         (reset-locked cx a args o v)))
          (nil (reset-locked cx a args o v)))))
@@ -128,14 +129,14 @@
 
 (defun reset-locked :private (cx: LowerCx a: V args: (Vec Ty) o: ObjAt v: V) -> (Result V str)
   (do (when-some [w (lcx-obj-word cx v)]
-        (fb-stmt (. cx b) (str-join ["(call @fib.share-into " (v-text a) " " w ")"])))
-      (let ((lockp (lcx-gep cx (. o sname) (v-text a) slot-atom-lock)))
-        (do (fb-stmt (. cx b) (str-join ["(call @fib.lock " lockp ")"]))
-            (let ((vp (lcx-gep cx (. o sname) (v-text a) slot-atom-value)))
+        (fb-stmt (. cx b) (nx/call "fib.share-into" [(v-expr a) w])))
+      (let ((lockp (lcx-gep cx (. o sname) (v-expr a) slot-atom-lock)))
+        (do (fb-stmt (. cx b) (nx/call "fib.lock" [lockp]))
+            (let ((vp (lcx-gep cx (. o sname) (v-expr a) slot-atom-value)))
               (try-let ((l (program-lir (. cx p) (nth args 0))))
                 (let ((old (match l ((some lt) (lcx-load cx lt vp)) (nil VUnit))))
                   (do (lcx-store cx v vp)
-                      (fb-stmt (. cx b) (str-join ["(call @fib.unlock " lockp ")"]))
+                      (fb-stmt (. cx b) (nx/call "fib.unlock" [lockp]))
                       (lcx-release cx old)
                       (Ok VUnit)))))))))
 
@@ -144,33 +145,33 @@
   (match (v-ty x)
     ((some (LirOpt inner))
      ;; An `(Option scalar)` held as a pair: the tags are the same and the payloads are (a `nil`'s payload is zero, so two `nil`s are).
-     (let ((b (. cx b)) (part (fn (v: V i: i64 t: LirTy) (fb-val (. cx b) (str-join ["(extractvalue " (v-text v) " " (str i) ")"]) t))))
+     (let ((b (. cx b)) (part (fn (v: V i: i64 t: LirTy) (fb-val (. cx b) (nx/extract (v-expr v) i) t))))
        (let ((tags (same-bits cx (part x 0 LirI1) (part y 0 LirI1)))
              (vals (same-bits cx (part x 1 inner) (part y 1 inner))))
-         (fb-val b (str-join ["(and " (v-text tags) " " (v-text vals) ")"]) LirI1))))
+         (fb-val b (nx/binary la/BAnd (v-expr tags) (v-expr vals)) LirI1))))
     (_ (same-bits-word cx x y))))
 
 (defun same-bits-word :private (cx: LowerCx x: V y: V) -> V
-  (let ((b (. cx b)) (a (v-text x)) (c (v-text y)))
+  (let ((b (. cx b)) (a (v-expr x)) (c (v-expr y)))
     (let ((cast (fn (ty: str)
-                  (let ((ia (fb-val b (str-join ["(bitcast " ty " " a ")"]) (if (= ty "i32") LirI32 LirI64)))
-                        (ib (fb-val b (str-join ["(bitcast " ty " " c ")"]) (if (= ty "i32") LirI32 LirI64))))
-                    (fb-val b (str-join ["(icmp eq " (v-text ia) " " (v-text ib) ")"]) LirI1)))))
+                  (let ((ia (fb-val b (nx/cast la/CBitcast (nx/type-word ty) a) (if (= ty "i32") LirI32 LirI64)))
+                        (ib (fb-val b (nx/cast la/CBitcast (nx/type-word ty) c) (if (= ty "i32") LirI32 LirI64))))
+                    (fb-val b (nx/compare-int la/IEq (v-expr ia) (v-expr ib)) LirI1)))))
       (match (v-ty x)
         ((some (LirFloat)) (cast "i32"))
         ((some (LirDouble)) (cast "i64"))
         ((some (LirDyn))
-         (let ((oa (fb-val b (str-join ["(extractvalue " a " 0)"]) LirPtr)) (ob (fb-val b (str-join ["(extractvalue " c " 0)"]) LirPtr)))
-           (fb-val b (str-join ["(icmp eq " (v-text oa) " " (v-text ob) ")"]) LirI1)))
-        (_ (fb-val b (str-join ["(icmp eq " a " " c ")"]) LirI1))))))
+         (let ((oa (fb-val b (nx/extract a 0) LirPtr)) (ob (fb-val b (nx/extract c 0) LirPtr)))
+           (fb-val b (nx/compare-int la/IEq (v-expr oa) (v-expr ob)) LirI1)))
+        (_ (fb-val b (nx/compare-int la/IEq a c) LirI1))))))
 
 ;; The stores of a swap that found the atom unchanged: the new value share-marked and stored under the lock, the snapshot released twice.
-(defun swap-store :private (cx: LowerCx a: V lockp: str vp: str old: V new: V) -> unit
+(defun swap-store :private (cx: LowerCx a: V lockp: la/LExpr vp: la/LExpr old: V new: V) -> unit
   (do (when-some [w (lcx-obj-word cx new)]
-        (fb-stmt (. cx b) (str-join ["(call @fib.share-into " (v-text a) " " w ")"])))
+        (fb-stmt (. cx b) (nx/call "fib.share-into" [(v-expr a) w])))
       (lcx-store cx new vp)
       (lcx-retain cx new)
-      (fb-stmt (. cx b) (str-join ["(call @fib.unlock " lockp ")"]))
+      (fb-stmt (. cx b) (nx/call "fib.unlock" [lockp]))
       (lcx-release cx old)
       (lcx-release cx old)))
 
@@ -185,38 +186,38 @@
            (nil (Err "swap! on an atom of unit"))
            ((some l)
             (if (scalar-atom-lir? l)
-                (lcx-scalar-swap cx (lcx-gep cx (. o sname) (v-text a) slot-atom-value) l content f)
+                (lcx-scalar-swap cx (lcx-gep cx (. o sname) (v-expr a) slot-atom-value) l content f)
                 (swap-locked cx a o l content f)))))))
     (_ (Err "swap! on a non-atom"))))
 
 (defun swap-locked :private (cx: LowerCx a: V o: ObjAt l: LirTy content: Ty f: V) -> (Result V str)
   (let ((b (. cx b)))
-    (let ((lockp (lcx-gep cx (. o sname) (v-text a) slot-atom-lock)) (vp (lcx-gep cx (. o sname) (v-text a) slot-atom-value))
+    (let ((lockp (lcx-gep cx (. o sname) (v-expr a) slot-atom-lock)) (vp (lcx-gep cx (. o sname) (v-expr a) slot-atom-value))
           (head (fb-label b "swap")) (done (fb-label b "swapped")))
-      (do (fb-term b (str-join ["(br " head ")"]))
+      (do (fb-term b (nx/branch head))
           (fb-open b head)
-          (fb-stmt b (str-join ["(call @fib.lock " lockp ")"]))
+          (fb-stmt b (nx/call "fib.lock" [lockp]))
           (let ((old (lcx-load cx l vp)))
             (do (lcx-retain cx old)
-                (fb-stmt b (str-join ["(call @fib.unlock " lockp ")"]))
+                (fb-stmt b (nx/call "fib.unlock" [lockp]))
                 (lcx-retain cx old)
                 (lcx-retain cx f)
                 ;; the snapshot's count is the frame's while `f` runs: released if `f` fails (f releases its own argument)
                 (set! (. cx pending) (conj @(. cx pending) old))
                 (try-let ((new ((. (. cx hub) emit-call) cx (TgValue f) [old] content false))
                           (popped (Ok (set! (. cx pending) (pop @(. cx pending))))))
-                  (do (fb-stmt b (str-join ["(call @fib.lock " lockp ")"]))
+                  (do (fb-stmt b (nx/call "fib.lock" [lockp]))
                       (let ((cur (lcx-load cx l vp)))
                         (let ((same (same-bits cx cur old)) (lyes (fb-label b "unchanged")) (lno (fb-label b "changed")))
-                          (do (fb-term b (str-join ["(br " (v-text same) " " lyes " " lno ")"]))
+                          (do (fb-term b (nx/conditional (v-expr same) lyes lno))
                               (fb-open b lyes)
                               (swap-store cx a lockp vp old new)
-                              (fb-term b (str-join ["(br " done ")"]))
+                              (fb-term b (nx/branch done))
                               (fb-open b lno)
-                              (fb-stmt b (str-join ["(call @fib.unlock " lockp ")"]))
+                              (fb-stmt b (nx/call "fib.unlock" [lockp]))
                               (lcx-release cx old)
                               (lcx-release cx new)
-                              (fb-term b (str-join ["(br " head ")"]))
+                              (fb-term b (nx/branch head))
                               (fb-open b done)
                               (Ok new))))))))))))
 
@@ -231,29 +232,29 @@
          (nil (Err "compare-and-set! on an atom of unit"))
          ((some l)
           (if (scalar-atom-lir? l)
-              (Ok (lcx-scalar-compare-and-set cx (lcx-gep cx (. o sname) (v-text a) slot-atom-value) l old new))
+              (Ok (lcx-scalar-compare-and-set cx (lcx-gep cx (. o sname) (v-expr a) slot-atom-value) l old new))
               (cas-locked cx a o l old new))))))
     (_ (Err "compare-and-set! on a non-atom"))))
 
 (defun cas-locked :private (cx: LowerCx a: V o: ObjAt l: LirTy old: V new: V) -> (Result V str)
-  (let ((b (. cx b)) (lockp (lcx-gep cx (. o sname) (v-text a) slot-atom-lock)) (vp (lcx-gep cx (. o sname) (v-text a) slot-atom-value))
+  (let ((b (. cx b)) (lockp (lcx-gep cx (. o sname) (v-expr a) slot-atom-lock)) (vp (lcx-gep cx (. o sname) (v-expr a) slot-atom-value))
         (lyes (fb-label (. cx b) "casyes")) (lno (fb-label (. cx b) "casno")) (ljoin (fb-label (. cx b) "casdone")))
     (do (when-some [w (lcx-obj-word cx new)]
-          (fb-stmt b (str-join ["(call @fib.share-into " (v-text a) " " w ")"])))
-        (fb-stmt b (str-join ["(call @fib.lock " lockp ")"]))
+          (fb-stmt b (nx/call "fib.share-into" [(v-expr a) w])))
+        (fb-stmt b (nx/call "fib.lock" [lockp]))
         (let ((cur (lcx-load cx l vp)))
-          (do (fb-term b (str-join ["(br " (v-text (same-bits cx cur old)) " " lyes " " lno ")"]))
+          (do (fb-term b (nx/conditional (v-expr (same-bits cx cur old)) lyes lno))
               (fb-open b lyes)
               (lcx-store cx new vp)
-              (fb-stmt b (str-join ["(call @fib.unlock " lockp ")"]))
+              (fb-stmt b (nx/call "fib.unlock" [lockp]))
               (lcx-release cx cur)
-              (fb-term b (str-join ["(br " ljoin ")"]))
+              (fb-term b (nx/branch ljoin))
               (fb-open b lno)
-              (fb-stmt b (str-join ["(call @fib.unlock " lockp ")"]))
+              (fb-stmt b (nx/call "fib.unlock" [lockp]))
               (lcx-release cx new)
-              (fb-term b (str-join ["(br " ljoin ")"]))
+              (fb-term b (nx/branch ljoin))
               (fb-open b ljoin)
-              (Ok (fb-phi b LirI1 [(PhiEdge lyes "(i1 1)") (PhiEdge lno "(i1 0)")])))))))
+              (Ok (fb-phi b LirI1 [(PhiEdge lyes (nx/integer lt/ty-i1 1)) (PhiEdge lno (nx/integer lt/ty-i1 0))])))))))
 
 ;; `(cell-update! c f)`: the content moved out of the cell (a null left in the slot, no retain), `f` called on it as an owned argument,
 ;; its result stored without a retain. The cell holds one count throughout, so a value unique before is unique inside `f`.
@@ -265,10 +266,10 @@
          (match lt
            (nil (Err "cell-update! on a cell of unit"))
            ((some l)
-            (let ((vp (lcx-gep cx (. o sname) (v-text c) slot-cell-value)))
+            (let ((vp (lcx-gep cx (. o sname) (v-expr c) slot-cell-value)))
               (let ((old (lcx-load cx l vp)))
                 (do (match l
-                      ((LirPtr) (fb-stmt b (str-join ["(store (ptr null) " vp ")"])))
+                      ((LirPtr) (fb-stmt b (nx/store (nx/null) vp nil)))
                       ((LirDyn) (lcx-retain cx old))
                       (_ ()))
                     (lcx-retain cx f)
@@ -285,8 +286,8 @@
   (try-let ((r (place cx pl)) (new (lcx-value cx v)))
     (match (. r snd)
       ((TCon (KCell) args)
-       (try-let ((o (lcx-object-of cx (. r snd))) (old (cell-load cx (. o sname) (v-text (. r fst)) (nth args 0))))
-         (do (lcx-store cx new (lcx-gep cx (. o sname) (v-text (. r fst)) slot-cell-value))
+       (try-let ((o (lcx-object-of cx (. r snd))) (old (cell-load cx (. o sname) (v-expr (. r fst)) (nth args 0))))
+         (do (lcx-store cx new (lcx-gep cx (. o sname) (v-expr (. r fst)) slot-cell-value))
              (lcx-release cx old)
              (Ok VUnit))))
       ((TCon (KAtom) _) (Err "atoms"))
@@ -296,7 +297,7 @@
 (defun lcx-new-slot (cx: LowerCx e: Expr v: V atom: bool) -> (Result V str)
   (try-let ((t (lcx-ty cx e)) (o (lcx-object-of cx t)) (p (lcx-alloc-at cx (. e id) (. o tid) (. o sname) (. o size))))
     (let ((field (if atom
-                     (do (fb-stmt (. cx b) (str-join ["(store (i32 0) " (lcx-gep cx (. o sname) p slot-cell-value) ")"]))
+                     (do (fb-stmt (. cx b) (nx/store (nx/integer lt/ty-i32 0) (lcx-gep cx (. o sname) p slot-cell-value) nil))
                          (lcx-gep cx (. o sname) p slot-atom-value))
                      (lcx-gep cx (. o sname) p slot-cell-value))))
       (do (lcx-store cx v field)
@@ -319,34 +320,34 @@
       ((TCon (KCell) cargs)
        (let ((st (nth cargs 0)))
          (try-let ((at (field-at cx st "set-field!" f)) (co (lcx-object-of cx cell-ty)) (so (lcx-object-of cx st)))
-           (try-let ((content (cell-load cx (. co sname) (v-text cell) st)))
-             (lcx-unique-write cx (. co sname) (v-text cell) content (. so sname) (. so tid) (. so size) (. at slot) x
+           (try-let ((content (cell-load cx (. co sname) (v-expr cell) st)))
+             (lcx-unique-write cx (. co sname) (v-expr cell) content (. so sname) (. so tid) (. so size) (. at slot) x
                                (nth (. at tys) (. at index)))))))
       (_ (Err "set-field! on a non-cell")))))
 
 ;; The unique-write protocol shared by `set-field!` and `array-set!` on a fixed-layout object: in place when unique, else copy, write,
 ;; store the copy, release the old. Rust: lower/cells.rs:320 LowerCx::unique_write
-(defun lcx-unique-write (cx: LowerCx cell-s: str cell: str content: V sname: str tid: i64 size: i64 slot: i64 x: V elem-ty: Ty) -> (Result V str)
+(defun lcx-unique-write (cx: LowerCx cell-s: str cell: la/LExpr content: V sname: str tid: i64 size: i64 slot: i64 x: V elem-ty: Ty) -> (Result V str)
   (let ((b (. cx b)))
-    (let ((unique (fb-val b (str-join ["(call @fib.unique? " (v-text content) ")"]) LirI1))
+    (let ((unique (fb-val b (nx/call "fib.unique?" [(v-expr content)]) LirI1))
           (li (fb-label b "inplace")) (lc (fb-label b "copy")) (lj (fb-label b "written")))
-      (do (fb-term b (str-join ["(br " (v-text unique) " " li " " lc ")"]))
+      (do (fb-term b (nx/conditional (v-expr unique) li lc))
           (fb-open b li)
           (try-let ((elt (program-lir (. cx p) elem-ty)))
-            (let ((field (lcx-gep cx sname (v-text content) slot)))
+            (let ((field (lcx-gep cx sname (v-expr content) slot)))
               (do (when-some [t elt]
                     (let ((old (lcx-load cx t field)))
                       (do (lcx-store cx x field) (lcx-release cx old))))
-                  (fb-term b (str-join ["(br " lj ")"]))
+                  (fb-term b (nx/branch lj))
                   (fb-open b lc)
-                  (let ((copy (fb-val b (str-join ["(call @fib.copy-object " (v-text content) " (i64 " (str size) ") (i32 " (str tid) "))"]) LirPtr)))
-                    (do (fb-stmt b (str-join ["(call @trace." (str tid) " " (v-text copy) " @fib.retain)"]))
-                        (let ((cfield (lcx-gep cx sname (v-text copy) slot)))
+                  (let ((copy (fb-val b (nx/call "fib.copy-object" [(v-expr content) (nx/integer lt/ty-i64 size) (nx/integer lt/ty-i32 tid)]) LirPtr)))
+                    (do (fb-stmt b (nx/call (str "trace." tid) [(v-expr copy) (nx/global "fib.retain")]))
+                        (let ((cfield (lcx-gep cx sname (v-expr copy) slot)))
                           (do (when-some [t elt]
                                 (let ((old (lcx-load cx t cfield)))
                                   (do (lcx-store cx x cfield) (lcx-release cx old))))
                               (lcx-store cx copy (lcx-gep cx cell-s cell slot-cell-value))
                               (lcx-release cx content)
-                              (fb-term b (str-join ["(br " lj ")"]))
+                              (fb-term b (nx/branch lj))
                               (fb-open b lj)
                               (Ok VUnit))))))))))))

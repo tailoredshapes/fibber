@@ -3,7 +3,7 @@
 ;; exit 0 the result as the last line of standard output) is the executable's own: it is built from the lIR `run` uses, whose `main` prints its result. So
 ;; `FIB_STATIC_CASES=1 FIB_STATIC=1 fibc cases DIR` judges the same headers against the static build.
 (ns driver.staticrun
-  (:require [driver.native :as native] [driver.proc :as p] [driver.front :as front] [driver.linkdecl :as ld] [expand.maker :as mk])
+  (:require [driver.native :as native] [driver.proc :as p] [driver.front :as front] [driver.linkdecl :as ld] [expand.maker :as mk] [emit.compile :as ec])
   (:use expand.roots driver.verdict))
 
 (defun static-cases? () -> bool
@@ -22,19 +22,19 @@
         status)))
 
 ;; Builds `lir` into `exe` and runs it, its streams in files beside it.
-(defun build-and-run :private (lir: str dir: str opt: i64 args: (Vec str)) -> i64
-  (let ((exe (str dir "/x")) (out (str dir "/out")) (err (str dir "/err")) (declared (ld/declared-libs lir)))
+(defun build-and-run :private (lir: ec/Emitted dir: str opt: i64 args: (Vec str)) -> i64
+  (let ((exe (str dir "/x")) (out (str dir "/out")) (err (str dir "/err")) (declared (ld/from-notes (. lir links))))
     (match (ld/lib-words declared)
       ((Err m) (do (eprintln m) 2))
       ((Ok words)
-       (match (native/build-lir lir exe opt [] words)
+       (match (native/build-module (. lir ast) exe opt [] words)
          ((Err m) (do (eprintln (str "compile failed: " (ld/explain-failure m declared))) 5))
          ((Ok _) (do (native/setenv-set "FIB_TRACE" "1")
                      (let ((pid (p/spawn-executable exe (into [exe] args) out err 300)))
                        (if (< pid 0) 5 (report out err (p/wait-pid pid)))))))))))
 
 (defun run-static (file: str args: (Vec str) opt: i64 roots: Roots rm: mk/RunnerMaker) -> i64
-  (match (front/lower-kind file roots rm false)
+  (match (front/lower-module file roots rm false)
     ((Err code) code)
     ((Ok lir)
      (match (p/make-temp-dir (unwrap-or (native/getenv-opt "TMPDIR") "/tmp"))

@@ -26,7 +26,7 @@
 ;; Rust: macros/mod.rs `JitRunner::{module, build, run}`, bridge.rs, module.rs `Fns::{input_object, input_items, to_form}`.
 (ns macros.runner
   (:require [native.api :as jit] [native.call :as call] [native.fibm :as fibm] [lair.ffi :as ffi] [fib.string :as s] [emit.compile :as ec]
-            [emit.macros.abi :as abi] [own.driver :as od] [own.error :as oerr] [expand.macrons :as macrons])
+            [emit.macros.abi :as abi] [own.driver :as od] [own.error :as oerr] [expand.macrons :as macrons] [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f])
   (:use syntax.pos syntax.form expand.error expand.types expand.ctx expand.maker))
 
 ;; The state of one runner: the forms of the prelude the macros are checked with, the JIT session (made at the first macro), the
@@ -96,13 +96,15 @@
 
 ;; The trap hook of the module made for the k-th macro (see the header): `(fn void (ptr ptr ptr i64))` over the context, the position
 ;; (a C string or null), the message's bytes and their count; the message goes to the reflection hook as a `str` object.
-(defun trap-shim :private (k: str) -> str
-  (str-join ["(define (fibm.trap-shim." k " void) ((ptr cx) (ptr pos) (ptr bytes) (i64 n))\n"
-             "  (block entry\n"
-             "    (let ((s (call @fib.str-new n)))\n"
-             "      (call @memcpy (call @fib.str-bytes-ptr s) bytes n)\n"
-             "      (indirect-call (load ptr @fibm.reflect-hook) (fn ptr (ptr ptr ptr)) cx pos s)\n"
-             "      (unreachable))))\n"]))
+(defun trap-shim :private (k: str) -> la/LItem
+  (la/ItDefine (f/external (f/make (str "fibm.trap-shim." k) nil
+    [(Pair "cx" lt/ty-ptr) (Pair "pos" lt/ty-ptr) (Pair "bytes" lt/ty-ptr) (Pair "n" lt/ty-i64)] lt/cc-c
+    [(f/block "entry" [(f/bound [(f/binding "s" (n/call "fib.str-new" [(n/local "n")]))]
+        [(n/call "memcpy" [(n/call "fib.str-bytes-ptr" [(n/local "s")]) (n/local "bytes") (n/local "n")])
+         (n/indirect-call (n/load lt/ty-ptr (n/global "fibm.reflect-hook") nil)
+                          (lt/LFnType lt/cc-c (some lt/ty-ptr) [lt/ty-ptr lt/ty-ptr lt/ty-ptr] false)
+                          [(n/local "cx") (n/local "pos") (n/local "s")] false)
+         (n/unreachable)])])]))))
 
 ;; Installs the trap shim of the module k in the module.
 (defun install-trap-hook :private (j: jit/Jit k: i64) -> (Result unit str)
@@ -117,11 +119,11 @@
           ((Ok _) (Ok ()))))))))
 
 ;; Adds the module text to the session as the k-th, looks its surface up, starts its runtime and hooks its traps.
-(defun load-module :private (s: Session def: MacroDef k: i64 text: str) -> (Result fibm/Fibm ExpandErrKind)
+(defun load-module :private (s: Session def: MacroDef k: i64 ast: la/LModule) -> (Result fibm/Fibm ExpandErrKind)
   (match (session-jit s)
     ((Err m) (Err (failed def m)))
     ((Ok j)
-     (match (jit/jit-add-source j (str-join ["macro." (. def name) "." (show k)]) (str-concat text (trap-shim (show k))))
+     (match (jit/jit-add-module j (str-join ["macro." (. def name) "." (show k)]) (la/LModule (conj (. ast items) (trap-shim (show k)))))
        ((Err m) (Err (failed def m)))
        ((Ok _)
         (do (set! (. s built) (+ k 1))
@@ -200,7 +202,7 @@
            (n (+ (count (. def params)) (if (some? (. def rest)) 1 0))))
        (match (ec/compile-macro (. c typed) (. c owned) (. def name) n k)
          ((Err m) (Err (failed def m)))
-         ((Ok mm) (load-module s def k (. mm text))))))))
+         ((Ok mm) (load-module s def k (. mm ast))))))))
 
 ;; The module of the macro, built on its first use. Rust: JitRunner::module
 (defun session-module :private (s: Session def: MacroDef ctx: ExpandCtx) -> (Result fibm/Fibm ExpandErrKind)

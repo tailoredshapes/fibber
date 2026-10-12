@@ -2,7 +2,7 @@
 ;; `explain` (spec/compiler.md §1): each takes what the command line gave and the roots, prints what the Rust prints and returns
 ;; the exit status. The macro runner (`rm`, expand.maker) is the tool's: macros.runner by default, none with `--no-runner` (driver.front).
 (ns driver.commands
-  (:require [fib.string :as s] [types.targets :as tt] [llvm.target :as lt] [driver.front :as front] [expand.maker :as mk] [driver.native :as native] [driver.linkdecl :as ld] [driver.staticrun :as sr] [driver.viac :as viac] [emit.args :as ea] [emit.dump :as ed] [own.explain :as oe])
+  (:require [fib.string :as s] [types.targets :as tt] [llvm.target :as lt] [driver.front :as front] [expand.maker :as mk] [driver.native :as native] [driver.linkdecl :as ld] [driver.staticrun :as sr] [driver.viac :as viac] [emit.args :as ea] [emit.dump :as ed] [own.explain :as oe] [emit.compile :as ec] [lir.ast :as la])
   (:use expand.roots driver.args))
 
 ;; The message and status of a lIR module that lair stopped at. Rust: main.rs `fail`
@@ -42,11 +42,11 @@
         :else (cmd-run-jit file trace args opt roots rm)))
 
 (defun cmd-run-jit :private (file: str trace: bool args: (Vec str) opt: i64 roots: Roots rm: mk/RunnerMaker) -> i64
-  (match (front/lower-kind file roots rm false)
+  (match (front/lower-module file roots rm false)
     ((Err code) code)
     ((Ok lir)
      (do (when trace (native/setenv-set "FIB_TRACE" "1"))
-         (match (native/run-lir file lir opt args)
+         (match (native/run-module file (. lir ast) opt args)
            ((Err m) (compile-failed m))
            ((Ok code) code))))))
 
@@ -95,17 +95,17 @@
     (cond (and (= emit "exe") (s/ends-with? file ".liro"))
           (match (native/link-liro file out opt dirs libs) ((Err m) (compile-failed m)) ((Ok _) 0))
           (not (= emit "exe"))
-          (match (front/lower-kind file roots rm true)
+          (match (front/lower-module file roots rm true)
             ((Err code) code)
             ((Ok lir) (if (= emit "c")
-                          (match (viac/emit-c lir file out) ((Err m) (compile-failed m)) ((Ok _) 0))
-                          (match (native/emit-lir lir out opt emit) ((Err m) (compile-failed m)) ((Ok _) 0)))))
+                          (match (viac/emit-c (ec/emitted-text lir) file out) ((Err m) (compile-failed m)) ((Ok _) 0))
+                          (match (emit-product lir out opt emit) ((Err m) (compile-failed m)) ((Ok _) 0)))))
           (not (= kt "")) (build-with-kernels file out dirs libs opt kt roots rm)
           :else
-          (match (front/lower-kind file roots rm true)
+          (match (front/lower-module file roots rm true)
             ((Err code) code)
             ((Ok lir)
-             (let ((ks (kernels-in lir)))
+             (let ((ks (kernel-names (. lir ast))))
                (if (empty? ks)
                    (build-exe lir file out opt dirs libs)
                    (do (eprintln (str-join ["fibc: the program has the kernel" (if (= (count ks) 1) " " "s ") (str-join-with ", " ks)
@@ -124,26 +124,26 @@
     (if (not (tt/kernel-triple? (some kt)))
         (do (eprintln (str-join ["fibc: --kernel-target " kt ": not a kernel target (`fibc targets` lists nvptx64-nvidia-cuda as one; docs/design/gpu.md)"])) front/exit-usage)
         (do (native/setenv-set "FIB_TARGET_TRIPLE" kt)
-            (match (front/lower-kind file roots rm true)
+            (match (front/lower-module file roots rm true)
               ((Err code) (do (native/setenv-set "FIB_TARGET_TRIPLE" host) code))
               ((Ok klir)
-               (match (native/emit-lir klir ptx opt "ptx")
+               (match (emit-product klir ptx opt "ptx")
                  ((Err m) (do (native/setenv-set "FIB_TARGET_TRIPLE" host) (compile-failed m)))
                  ((Ok _)
                   (do (native/setenv-set "FIB_TARGET_TRIPLE" host)
                       (native/setenv-set "FIB_KERNEL_PTX" ptx)
-                      (match (front/lower-kind file roots rm true)
+                      (match (front/lower-module file roots rm true)
                         ((Err code) code)
                         ((Ok lir) (build-exe lir file out opt dirs libs))))))))))))
 
 ;; The executable of `lir`: the libraries its modules declare (driver.linkdecl) are linked by the mode of the build, after the `-l` the command line gave; a link that fails
 ;; for one of them names the module that needs it. `--via c` builds it through the C compiler (driver.viac) instead of LLVM.
-(defun build-exe :private (lir: str file: str out: str opt: i64 dirs: (Vec str) libs: (Vec str)) -> i64
-  (let ((declared (ld/declared-libs lir)))
+(defun build-exe :private (lir: ec/Emitted file: str out: str opt: i64 dirs: (Vec str) libs: (Vec str)) -> i64
+  (let ((declared (ld/from-notes (. lir links))))
     (match (ld/lib-words declared)
       ((Err m) (do (eprintln m) front/exit-usage))
       ((Ok words)
-       (match (if (viac/via-c?) (viac/build-via-c lir file out opt dirs (into libs words)) (native/build-lir lir out opt dirs (into libs words)))
+       (match (if (viac/via-c?) (viac/build-via-c (ec/emitted-text lir) file out opt dirs (into libs words)) (native/build-module (. lir ast) out opt dirs (into libs words)))
          ((Err m) (compile-failed (ld/explain-failure m declared)))
          ((Ok _) 0))))))
 
@@ -176,3 +176,14 @@
          (let ((bad (filter (fn (m: str) (match (check-verdict [m] roots rm) ((Ok _) false) ((Err _) true))) mods)))
            (do (doseq [m bad] (eprintln (str-join ["FAIL " m ": " (match (check-verdict [m] roots rm) ((Err x) (. x snd)) ((Ok _) "")) ])))
                (if (empty? bad) (do (eprintln (str-concat "rejected:\n" (. e snd))) (. e fst)) (. e fst))))))))
+
+(defun kernel-names (ast: la/LModule) -> (Vec str)
+  (vec (keep (fn (it: la/LItem)
+               (match it
+                 ((la/ItGlobal g) (if (and (. g constant) (starts-with? (. g name) "fib.kernel."))
+                                     (some (str-slice (. g name) 11 (str-len (. g name)))) nil))
+                 (_ nil))) (. ast items))))
+
+(defun emit-product :private (m: ec/Emitted out: str opt: i64 kind: str) -> (Result unit str)
+  (try-let ((libs (ld/lib-words (ld/from-notes (. m links)))))
+    (native/emit-module (. m ast) out opt kind libs)))

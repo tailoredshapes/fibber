@@ -6,7 +6,7 @@
 ;; LD_LIBRARY_PATH.
 ;; `run` calls `main` on the stack of the driver's thread through `call-i64`, as the Rust calls it on its own.
 (ns driver.native
-  (:require [native.api :as jit] [native.call :as call] [lair.ffi :as ffi] [fib.os.native :as os]))
+  (:require [native.api :as jit] [native.call :as call] [lair.ffi :as ffi] [fib.os.native :as os] [lir.ast :as la]))
 
 (extern getenv :private (ptr) -> ptr)
 (extern setenv :private (ptr ptr i32) -> i32)
@@ -131,3 +131,15 @@
 ;; is linked (`fibc build --emit`, docs/design/targets.md).
 (defun emit-lir (lir: str out: str opt: i64 kind: str) -> (Result unit str)
   (jit/emit-file lir out opt kind))
+
+(defun run-module (file: str ast: la/LModule opt: i64 args: (Vec str)) -> (Result i64 str)
+  (try-let ((j (if (= opt 0) (jit/jit-new-fast-codegen opt) (jit/jit-new opt)))
+            (_ (jit/jit-add-module j file ast)) (addr (jit/jit-c-entry j "main"))
+            (r (call-main addr (into [file] args))))
+    (Ok (bit-and r 255))))
+
+(defun build-module (ast: la/LModule out: str opt: i64 dirs: (Vec str) libs: (Vec str)) -> (Result unit str)
+  (jit/build-executable-module ast out opt libs dirs))
+
+(defun emit-module (ast: la/LModule out: str opt: i64 kind: str libs: (Vec str)) -> (Result unit str)
+  (jit/emit-module ast out opt kind libs))

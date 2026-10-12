@@ -4,26 +4,27 @@
 ;; Below the call protocol: what it needs from above (`method_value`, `builtin_value`) it calls through the hub.
 (ns emit.lower.objects
   (:use types.ty types.scheme types.ast types.decls types.init own.program emit.value emit.layout emit.mono emit.ir emit.objects emit.statics
-        emit.program emit.lower.cx emit.lower.ops))
+        emit.program emit.lower.cx emit.lower.ops)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; The object of allocation site `e`: on the heap through `fib.alloc`, or a `STACK` object in the site's entry-block slot (§8.2), as the
 ;; plan decided. Rust: lower/objects.rs:20 LowerCx::alloc_at
-(defun lcx-alloc-at (cx: LowerCx e: i64 tid: i64 sname: str size: i64) -> (Result str str)
+(defun lcx-alloc-at (cx: LowerCx e: i64 tid: i64 sname: str size: i64) -> (Result la/LExpr str)
   (match (get (. (. cx own) allocs) e)
     ((some (AlStack))
      (let ((slot (match (get @(. cx stack-slots) e)
                    ((some s) s)
-                   (nil (let ((s (fb-entry-alloca (. cx b) (str-join ["%struct." sname]) size)))
+                   (nil (let ((s (fb-entry-alloca (. cx b) (lt/TNamed sname) size)))
                           (do (set! (. cx stack-slots) (assoc @(. cx stack-slots) e s))
                               s))))))
-       (do (fb-stmt (. cx b) (str-join ["(call @fib.stack-init " slot " (i32 " (str tid) "))"]))
+       (do (fb-stmt (. cx b) (nx/call "fib.stack-init" [slot (nx/integer lt/ty-i32 tid)]))
            (Ok slot))))
     ((some (AlNothing)) (Err "an allocation the plan says allocates nothing"))
     (_ (Ok (lcx-heap-alloc cx tid size)))))
 
 ;; A counted heap object of `size` bytes, count 1. Rust: lower/objects.rs:43 LowerCx::heap_alloc
-(defun lcx-heap-alloc (cx: LowerCx tid: i64 size: i64) -> str
-  (v-text (fb-val (. cx b) (str-join ["(call @fib.alloc (i64 " (str size) ") (i32 " (str tid) "))"]) LirPtr)))
+(defun lcx-heap-alloc (cx: LowerCx tid: i64 size: i64) -> la/LExpr
+  (v-expr (fb-val (. cx b) (nx/call "fib.alloc" [(nx/integer lt/ty-i64 size) (nx/integer lt/ty-i32 tid)]) LirPtr)))
 
 ;; An object type's id, struct name and size.
 (defstruct ObjAt (tid: i64 sname: str size: i64))
@@ -38,13 +39,13 @@
     -> (Result V str)
   (try-let ((p (lcx-alloc-at cx (. e id) (. o tid) sname (. o size))))
     (do (when-some [i tag]
-          (fb-stmt (. cx b) (str-join ["(store (i32 " (str i) ") " (lcx-gep cx sname p slot-enum-tag) ")"])))
+          (fb-stmt (. cx b) (nx/store (nx/integer lt/ty-i32 i) (lcx-gep cx sname p slot-enum-tag) nil)))
         (lcx-store-fields cx sname p base vals)
         (Ok (VVal p LirPtr)))))
 
 ;; The fields of the object `p` overwritten by `vals` from slot `base`, each old value released (a null one, a slot a steal emptied, is
 ;; no work).
-(defun overwrite-fields :private (cx: LowerCx sname: str p: str base: i64 vals: (Vec V)) -> unit
+(defun overwrite-fields :private (cx: LowerCx sname: str p: la/LExpr base: i64 vals: (Vec V)) -> unit
   (do (reduce (fn (slot: i64 v: V)
                 (match v
                   ((VUnit) slot)
@@ -68,20 +69,20 @@
        (let ((f (. cx b)))
          (match (Pair sv (get (. (. cx own) allocs) (. e id)))
            ((Pair (VVal sh (LirPtr)) (some (AlHeap))) :when (= st t)
-            (let ((unique (fb-val f (str-join ["(call @fib.unique? " sh ")"]) LirI1))
+            (let ((unique (fb-val f (nx/call "fib.unique?" [sh]) LirI1))
                   (lr (fb-label f "reuse")) (lf (fb-label f "fresh")) (lj (fb-label f "built")))
-              (do (fb-term f (str-join ["(br " (v-text unique) " " lr " " lf ")"]))
+              (do (fb-term f (nx/conditional (v-expr unique) lr lf))
                   (fb-open f lr)
                   (overwrite-fields cx sname sh base vals)
                   (let ((from-reuse (fb-current f)))
-                    (do (fb-term f (str-join ["(br " lj ")"]))
+                    (do (fb-term f (nx/branch lj))
                         (fb-open f lf)
                         (try-let ((q (fresh-object cx e o sname base tag vals)))
                           (do (lcx-release cx sv)
                               (let ((from-fresh (fb-current f)))
-                                (do (fb-term f (str-join ["(br " lj ")"]))
+                                (do (fb-term f (nx/branch lj))
                                     (fb-open f lj)
-                                    (Ok (fb-phi f LirPtr [(PhiEdge from-reuse sh) (PhiEdge from-fresh (v-text q))])))))))))))
+                                    (Ok (fb-phi f LirPtr [(PhiEdge from-reuse sh) (PhiEdge from-fresh (v-expr q))])))))))))))
            (_ (try-let ((q (fresh-object cx e o sname base tag vals)))
                 (do (lcx-release cx sv) (Ok q))))))))))
 
@@ -103,7 +104,7 @@
                        ((some i) (build-object cx e o (str-join [(. o sname) ".v" (str i)]) slot-variant-field0 variant vals))))))))))))
 
 ;; Stores values into consecutive fields from `base`, skipping `unit` values. Rust: lower/objects.rs:84 LowerCx::store_fields
-(defun lcx-store-fields (cx: LowerCx sname: str p: str base: i64 vals: (Vec V)) -> unit
+(defun lcx-store-fields (cx: LowerCx sname: str p: la/LExpr base: i64 vals: (Vec V)) -> unit
   (do (reduce (fn (slot: i64 v: V)
                 (match v
                   ((VUnit) slot)
@@ -118,9 +119,9 @@
     (match l
       ((some (LirOpt inner))
        (match variant
-         ((some 0) (Ok (VVal (lir-zero (LirOpt inner)) (LirOpt inner))))
+         ((some 0) (Ok (VVal (lir-zero-node (LirOpt inner)) (LirOpt inner))))
          (_ (match (first vals)
-              ((some v) (Ok (fb-val (. cx b) (str-join ["{ (i1 1) " (v-text v) " }"]) (LirOpt inner))))
+              ((some v) (Ok (fb-val (. cx b) (nx/aggregate [(nx/integer lt/ty-i1 1) (v-expr v)]) (LirOpt inner))))
               (nil (Err "some without a payload"))))))
       (_ (Err "an Option held as a value without a pair type")))))
 
@@ -176,7 +177,7 @@
             (l (program-lir (. cx p) (nth (. at tys) (. at index)))))
     (Ok (match l
           ((some lt)
-           (let [r (lcx-load cx lt (lcx-gep cx (. obj snd) (v-text v) (. at slot)))]
+           (let [r (lcx-load cx lt (lcx-gep cx (. obj snd) (v-expr v) (. at slot)))]
              (do (set! (. cx origins) (assoc @(. cx origins) (field-origin-key e) (Origin v (. obj snd) (. at slot))))
                  r)))
           (nil VUnit)))))
@@ -211,10 +212,10 @@
                  (let ((size (obj-size-pb (objects-get (. (. cx p) objects) tid) (program-pb (. cx p)))))
                    (try-let ((vals (capture-values cx own)) (p (lcx-alloc-at cx (. e id) tid sname size)))
                      (do (match (get (. (. cx own) allocs) (. e id))
-                           ((some (AlStack)) (set! (. cx closure-slots) (conj @(. cx closure-slots) p)))
+                           ((some (AlStack)) (set! (. cx closure-slots) (conj @(. cx closure-slots) (nx/operand-name p))))
                            (_ ()))
                          (let ((codep (lcx-gep cx sname p slot-closure-code)))
-                           (do (fb-stmt (. cx b) (str-join ["(store @" code " " codep ")"]))
+                           (do (fb-stmt (. cx b) (nx/store (nx/global code) codep nil))
                                (lcx-store-fields cx sname p slot-capture0 vals)
                                (Ok (VVal p LirPtr)))))))))))))))
 
@@ -237,11 +238,11 @@
 ;; A `def`'s value: its constant, or a load of the slot the init functions fill before `main`. Rust: lower/objects.rs:233 (the `Def` arm)
 (defun def-value :private (cx: LowerCx d: i64) -> (Result V str)
   (match (get @(. (. cx p) def-values) d)
-    ((some (DefValue text (some l))) (Ok (VVal text l)))
+    ((some (DefValue expr (some l))) (Ok (VVal (unwrap expr) l)))
     ((some (DefValue _ nil)) (Ok VUnit))
     (nil
      (match (get @(. (. cx p) def-slots) d)
-       ((some (DefValue slot (some l))) (Ok (lcx-load cx l (str-join ["@" slot]))))
+       ((some (DefValue slot (some l))) (Ok (lcx-load cx l (unwrap slot))))
        ((some (DefValue _ nil)) (Ok VUnit))
        (nil (Err (str-join ["def " (. (g-def (program-g (. cx p)) d) name)
                             " is read where it has no value: it is not a constant and no init function makes it here"])))))))
@@ -257,7 +258,7 @@
        (try-let ((key (fun-key (program-g (. cx p)) scheme tys)))
          (let ((code (program-request (. cx p) (BodyAllOwned f) key)))
            (let ((r (program-closure-object (. cx p) code [])))
-             (Ok (VVal (statics-closure (. (. cx p) statics) code (. r fst)) LirPtr)))))))))
+             (Ok (VVal (nx/reference (statics-closure (. (. cx p) statics) code (. r fst))) LirPtr)))))))))
 
 ;; A global name as a value: a named function's immortal closure (§8.4), a field-less variant's index, a `def`.
 ;; Rust: lower/objects.rs:210 LowerCx::global

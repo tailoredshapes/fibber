@@ -1,5 +1,5 @@
 ;; compiler/emit/program.fib: the state of the emission: the typed program and the ownership tables it reads, the object table, the static
-;; data, the queue of work and the text made so far (spec/compiler.md §2). Replaces crates/fibc/src/program.rs.
+;; data, the queue of work and generated functions made so far (spec/compiler.md §2). Replaces crates/fibc/src/program.rs.
 ;; `Program` is a struct of Cells passed borrowed (plan D1); the Rust `c: &Checked` is its two parts, `typed`
 ;; and `owned` (own.driver's `Checked` is not needed here). The `closures` VecDeque is a Vec with a head index;
 ;; `helpers` (a HashSet) is a `(Map str bool)`; Rust's `(String, Option<LirTy>)` of a def is a `DefValue`.
@@ -8,7 +8,7 @@
 ;; The runtime's own `declare` (`runtime-declaration`) is emit.rt's.
 ;; E11 added the last field, `macro-module` (Rust `macro_module: bool`, set by `compile-macro`): a trap of a macro module fails the expansion.
 (ns emit.program
-  (:require [fib.string :as s] [fib.unix :as unix] [emit.os :as os])
+  (:require [fib.string :as s] [fib.unix :as unix] [emit.os :as os] [lir.ast :as la] [lir.types :as lt] [emit.node :as node] [emit.lirdata :as data] [lir.print :as print] [expand.targetos :as tos] [emit.function :as f])
   (:use types.ty types.ast types.decls types.display types.init types.program own.program emit.value emit.layout emit.names
         emit.mono emit.objects emit.statics emit.rt emit.kwdyn))
 
@@ -16,7 +16,7 @@
 (defenum Work (WorkBody inst: Inst) (WorkClosure owner: Inst lit: i64 name: str))
 
 ;; The address and lIR type of a def's value. Rust: program.rs:48 `(String, Option<LirTy>)`
-(defstruct DefValue (text: str ty: (Option LirTy)))
+(defstruct DefValue (expr: (Option la/LExpr) ty: (Option LirTy)))
 
 ;; One `def` made at run time (X8, L15): the `def`, the module that defines it, the code name of its initialiser's body, and whether
 ;; its value is an object to make immortal. Rust: inits.rs:42 Init
@@ -26,13 +26,13 @@
 ;; every `def` made at run time, as a `DefValue`) and `inits` (those `def`s in the order their init functions make them)
 (defstruct Program
   (typed: TypedProgram owned: OwnedProgram objects: Objects statics: Statics queue: Queue
-   closures: (Cell (Vec Work)) closures-head: (Cell i64) funcs: (Cell (Vec str)) externs: (Cell (Vec str))
+   closures: (Cell (Vec Work)) closures-head: (Cell i64) funcs: (Cell (Vec la/LFunction)) externs: (Cell (Vec la/LItem))
    helpers: (Cell (Map str bool)) def-values: (Cell (Map i64 DefValue)) quotes: (Cell (Map i64 str))
-   quote-text: (Cell str) quote-counter: (Cell i64) keyword-helpers: (Cell bool)
+   quote-text: (Cell (Vec la/LItem)) quote-counter: (Cell i64) keyword-helpers: (Cell bool)
    def-slots: (Cell (Map i64 DefValue)) inits: (Cell (Vec Init))
    macro-module: (Cell bool) unwinding: bool
    ;; the bytes of a pointer in the target's memory (4 on wasm32): the layouts of the objects are computed from it. 8 while the JIT runs, which is the host's.
-   pb: (Cell i64)))
+   pb: (Cell i64) runtime: (Vec la/LItem) runtime-host: (Vec la/LItem) link-notes: (Cell (Vec (Pair str str)))))
 
 ;; Whether the program catches (stage 2 of docs/design/exceptions.md, ADR 0009): some body calls `catch-run`. Only then do its functions
 ;; return a failure next to their value (emit.lower.call); a program that never catches has no observer of a failure, so a trap aborts
@@ -52,8 +52,9 @@
 ;; Rust: program.rs:60 Program::new
 (defun program-new (typed: TypedProgram owned: OwnedProgram) -> Program
   (let ((p (Program typed owned (objects-new) (statics-new) (queue-new) (cell []) (cell 0) (cell []) (cell [])
-                    (cell (map-empty)) (cell (map-empty)) (cell (map-empty)) (cell "") (cell 0) (cell false)
-                    (cell (map-empty)) (cell []) (cell false) (program-unwinds? typed owned) (cell (os/target-pointer-bytes)))))
+                    (cell (map-empty)) (cell (map-empty)) (cell (map-empty)) (cell []) (cell 0) (cell false)
+                    (cell (map-empty)) (cell []) (cell false) (program-unwinds? typed owned) (cell (os/target-pointer-bytes))
+                    (runtime-items-target) (runtime-items-host) (cell []))))
     (do (objects-intern (. p objects) "fib.str" "str" ObStr)
         (objects-intern (. p objects) "fib.array.i8" "(Array i8)" (ObArray LirI8))
         (objects-intern (. p objects) "fib.weakbox" "weak box" ObWeak)
@@ -62,14 +63,14 @@
 
 ;; The program the rest of the module is lowered for after the JIT made the constants at the host's pointer width: the same types, objects (their layouts are computed on
 ;; demand), static data and definitions of the `def`s and their values, and the same work to do: every body and closure the first pass asked for is lowered again, at `pb`
-;; (the queue is copied with its head at the start; the closures are asked for again by the bodies that make them, so each name is the one the statics and the constants already hold), into text that is made afresh.
+;; (the queue is copied with its head at the start; the closures are asked for again by the bodies that make them, so each name is the one the statics and the constants already hold), into functions made afresh.
 (defun program-rebuilt (p: Program pb: i64) -> Program
   (let ((q (. p queue)))
     (Program (. p typed) (. p owned) (. p objects) (. p statics)
              (Queue (cell @(. q pending)) (cell 0) (cell @(. q names)) (cell nil))
              (cell []) (cell 0) (cell []) (cell [])
-             (cell (map-empty)) (cell @(. p def-values)) (cell (map-empty)) (cell "") (cell 0) (cell false)
-             (cell @(. p def-slots)) (cell @(. p inits)) (cell false) (. p unwinding) (cell pb))))
+             (cell (map-empty)) (cell @(. p def-values)) (cell (map-empty)) (cell []) (cell 0) (cell false)
+             (cell @(. p def-slots)) (cell @(. p inits)) (cell false) (. p unwinding) (cell pb) (. p runtime) (. p runtime-host) (cell @(. p link-notes)))))
 
 ;; The bytes of a pointer of the program's layouts.
 (defun program-pb (p: Program) -> i64 @(. p pb))
@@ -164,25 +165,25 @@
      (let ((g (program-g p)))
        (try-let ((ps (try-map (fn (t: Ty)
                                 (try-let ((l (lir-ty g t)))
-                                  (match l
-                                    (nil (Err "a unit extern parameter"))
-                                    ((some x) (Ok (lir-ty-text x))))))
-                              params))
-                 (r (lir-ty g ret)))
-         (let ((decl (str-join ["(declare " (. d name) " " (match r (nil "void") ((some x) (lir-ty-text x))) " ("
-                                (s/join " " (if (. d varargs) (conj (if (and (>= (. d fixed) 0) (< (. d fixed) (count ps))) (vec (take (. d fixed) ps)) ps) "...") ps)) "))\n"])))
-           (match (runtime-declaration (. d name))
-             ((some own)
-              (if (= (s/trim own) (s/trim decl))
-                  (Ok ())
-                  (Err (str-join ["extern " (. d name) " conflicts with the runtime's " own]))))
-             (nil (do (when (not-any? (fn (x: str) (= x decl)) @(. p externs))
-                        (set! (. p externs) (conj @(. p externs) decl)))
-                      (when (not (= (. d lib) ""))
-                        (let ((note (str-join [";; link-lib: " (. d lib) " " (. d owner) "\n"])))
-                          (when (not-any? (fn (x: str) (= x note)) @(. p externs))
-                            (set! (. p externs) (conj @(. p externs) note)))))
-                      (Ok ()))))))))
+                                  (match l (nil (Err "a unit extern parameter")) ((some x) (Ok (lir-type x)))))) params))
+                 (result (lir-ty g ret)))
+         (let ((fixed (if (and (. d varargs) (>= (. d fixed) 0) (< (. d fixed) (count ps))) (vec (take (. d fixed) ps)) ps))
+               (rtype (match result ((some t) (some (lir-type t))) (nil nil))))
+           (let ((ty (lt/LFnType lt/cc-c rtype fixed (. d varargs)))
+                 (decl (la/ItDeclare (la/LDeclare (. d name) (lt/LFnType lt/cc-c rtype fixed (. d varargs)) false 0))))
+             (match (runtime-declaration (. d name))
+               ((some own)
+                (match (first (data/read-runtime own))
+                  ((some (la/ItDeclare runtime))
+                   (if (= (. runtime ty) ty) (Ok ()) (Err (str-join ["extern " (. d name) " conflicts with the runtime's " own]))))
+                  (_ (Err (str "invalid runtime declaration of " (. d name))))))
+               (nil
+                (do (when (not-any? (fn (item: la/LItem) (match item ((la/ItDeclare other) (= (. other name) (. d name))) (_ false))) @(. p externs))
+                      (set! (. p externs) (conj @(. p externs) decl)))
+                    (when-not (= (. d lib) "")
+                      (let ((note (Pair (. d lib) (. d owner))))
+                        (when-not (includes? note @(. p link-notes)) (set! (. p link-notes) (conj @(. p link-notes) note)))))
+                    (Ok ())))))))))
     (_ (Err "an extern without a function type"))))
 
 ;; Rust: program.rs:258 Program::fresh_quote
@@ -196,35 +197,44 @@
   (contains? @(. p helpers) name))
 
 ;; Rust: program.rs:269 Program::add_helper
-(defun program-add-helper (p: Program name: str text: str) -> unit
+(defun program-add-helper (p: Program name: str func: la/LFunction) -> unit
   (do (set! (. p helpers) (assoc @(. p helpers) name true))
-      (set! (. p funcs) (conj @(. p funcs) text))))
+      (set! (. p funcs) (conj @(. p funcs) func))))
+
+(defun program-mark-helper (p: Program name: str) -> unit
+  (set! (. p helpers) (assoc @(. p helpers) name true)))
 
 ;; Rust: program.rs:275 Program::render_externs
 (defun program-render-externs (p: Program) -> str
-  (str-join @(. p externs)))
+  (print/print-module (la/LModule @(. p externs))))
 
 ;; Rust: program.rs:285 Program::render_keyword_helpers
+(defun program-keyword-items (p: Program) -> (Vec la/LItem)
+  (cond (not @(. p keyword-helpers)) []
+        (program-has-helper p "kw.dyn") (dyn-keyword-items (. p statics) (statics-keywords (. p statics)))
+        :else (static-keyword-items (. p statics) (statics-keywords (. p statics)))))
+
 (defun program-render-keyword-helpers (p: Program) -> str
-  (cond (not @(. p keyword-helpers)) ""
-        (program-has-helper p "kw.dyn") (dyn-keyword-helpers (. p statics) (statics-keywords (. p statics)))
-        :else
-      (let ((st (. p statics)) (names (statics-keywords (. p statics))) (n (count (statics-keywords (. p statics)))))
-        ;; per keyword, in order, the `:k` text is interned and then the name: that numbers the `@str.N` of both
-        (let ((pairs (mapv (fn (i: i64)
-                             (let ((colon (statics-string st (str-join [":" (nth names i)]) 0))
-                                   (name (statics-string st (nth names i) 0)))
-                               (Pair (str-join ["  (block k" (str i) " (ret (call @fib.str-copy " colon ")))\n"])
-                                     (str-join ["  (block k" (str i) " (ret (call @fib.str-hash " name ")))\n"]))))
-                           (range n)))
-              (cases (s/join " " (mapv (fn (i: i64) (str-join ["((i64 " (str i) ") k" (str i) ")"])) (range n))))
-              (order (sort-by (fn (i: i64) (nth names i)) (range n))))
-          (let ((switch (str-join ["  (block entry (switch k bad " cases "))\n"]))
-                (bad "  (block bad (unreachable)))\n")
-                (ranks (mapv (fn (r: i64) (str-join ["  (block k" (str (nth order r)) " (ret (i64 " (str r) ")))\n"])) (range n))))
-            (str-join ["(define internal (kw.show ptr) ((i64 k))\n" switch (str-join (mapv (fn (q: (Pair str str)) (. q fst)) pairs)) bad
-                       "(define internal (kw.hash i64) ((i64 k))\n" switch (str-join (mapv (fn (q: (Pair str str)) (. q snd)) pairs)) bad
-                       "(define internal (kw.rank i64) ((i64 k))\n" switch (str-join ranks) bad]))))))
+  (print/print-module (la/LModule (program-keyword-items p))))
+
+(defun static-keyword-items :private (st: Statics names: (Vec str)) -> (Vec la/LItem)
+  (let ((n (count names)))
+    ;; Intern :k before k, retaining the order of the static string identities.
+    (let ((pairs (mapv (fn (i: i64)
+                         (let ((colon (statics-string st (str ":" (nth names i)) 0))
+                               (name (statics-string st (nth names i) 0)))
+                           (Pair (f/block (str "k" i) [(node/ret (some (node/call "fib.str-copy" [(node/reference colon)])))])
+                                 (f/block (str "k" i) [(node/ret (some (node/call "fib.str-hash" [(node/reference name)])))])))) (range n)))
+          (cases (mapv (fn (i: i64) (la/LCase (node/integer lt/ty-i64 i) (str "k" i))) (range n)))
+          (order (sort-by (fn (i: i64) (nth names i)) (range n))))
+      (let ((entry (f/block "entry" [(node/switch (node/local "k") "bad" cases)]))
+            (bad (f/block "bad" [(node/unreachable)]))
+            (ranks (mapv (fn (i: i64) (f/block (str "k" (nth order i)) [(node/ret (some (node/integer lt/ty-i64 i)))])) (range n))))
+        [(la/ItDefine (f/make "kw.show" (some lt/ty-ptr) [(Pair "k" lt/ty-i64)] lt/cc-c
+                              (conj (into [entry] (mapv (fn (q: (Pair la/LBlock la/LBlock)) (. q fst)) pairs)) bad)))
+         (la/ItDefine (f/make "kw.hash" (some lt/ty-i64) [(Pair "k" lt/ty-i64)] lt/cc-c
+                              (conj (into [entry] (mapv (fn (q: (Pair la/LBlock la/LBlock)) (. q snd)) pairs)) bad)))
+         (la/ItDefine (f/make "kw.rank" (some lt/ty-i64) [(Pair "k" lt/ty-i64)] lt/cc-c (conj (into [entry] ranks) bad)))]))))
 
 ;; Rust: program.rs:315 Program::task_object
 (defun program-task-object (p: Program code: str caps: (Vec LirTy)) -> (Pair i64 str)
@@ -245,3 +255,7 @@
     ((LirOpt s) (str-join ["opt." (tyname s)]))
     ((LirVec e n) (str-join ["vec" (str n) "x" (tyname e)]))
     (_ (lir-ty-text t))))
+
+
+(defun runtime-items-host :private () -> (Vec la/LItem) (data/read-runtime (runtime-text-host)))
+(defun runtime-items-target :private () -> (Vec la/LItem) (data/read-runtime (runtime-text)))

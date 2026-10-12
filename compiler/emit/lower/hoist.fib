@@ -7,6 +7,7 @@
 ;; same index. A loop that is in an async body or mentions `await`/`async` is left alone (an SSA value would have to live in the frame).
 ;; The one visible difference: a zero-trip loop over a shared array still copies it.
 (ns emit.lower.hoist
+  (:require [emit.node :as nx])
   (:use types.ty types.ast types.init own.program emit.value emit.layout emit.ir emit.program emit.lower.cx emit.lower.ctrl emit.lower.builtins))
 
 (defun builtin-name :private (cx: LowerCx h: Expr) -> str
@@ -79,11 +80,11 @@
   (try-let ((t (lcx-binding-ty cx c)))
     (match (get @(. cx locals) c)
       ((some (LocalVal cv))
-       (if (and (cell-of-array? t) (nil? (get @(. cx hoisted) (v-text cv))))
+       (if (and (cell-of-array? t) (nil? (get @(. cx hoisted) (nx/operand-name (v-expr cv)))))
            (try-let ((r (arr-info cx "array-set!" e [t])) (content (array-own cx r t [cv] false)))
              (let ((n (lcx-load cx LirI64 (array-len-ptr cx r content))))
-               (do (set! (. cx hoisted) (assoc (assoc @(. cx hoisted) (v-text cv) (Pair content n)) (v-text content) (Pair content n)))
-                   (Ok [(v-text cv) (v-text content)]))))
+               (do (set! (. cx hoisted) (assoc (assoc @(. cx hoisted) (nx/operand-name (v-expr cv)) (Pair content n)) (nx/operand-name (v-expr content)) (Pair content n)))
+                   (Ok [(nx/operand-name (v-expr cv)) (nx/operand-name (v-expr content))]))))
            (Ok [])))
       (_ (Ok [])))))
 
@@ -127,11 +128,11 @@
         (try-let ((t (lcx-binding-ty cx (nth bs i))))
           (match (get @(. cx locals) (nth bs i))
             ((some (LocalVal av))
-             (if (and (array-ty? t) (nil? (get @(. cx hoisted) (v-text av))))
+             (if (and (array-ty? t) (nil? (get @(. cx hoisted) (nx/operand-name (v-expr av)))))
                  (try-let ((r (arr-info cx "array-get" e [t])))
                    (let ((n (lcx-load cx LirI64 (array-len-ptr cx r av))))
-                     (do (set! (. cx hoisted) (assoc @(. cx hoisted) (v-text av) (Pair av n)))
-                         (recur (+ i 1) (conj out (v-text av))))))
+                     (do (set! (. cx hoisted) (assoc @(. cx hoisted) (nx/operand-name (v-expr av)) (Pair av n)))
+                         (recur (+ i 1) (conj out (nx/operand-name (v-expr av)))))))
                  (recur (+ i 1) out)))
             (_ (recur (+ i 1) out)))))))
 

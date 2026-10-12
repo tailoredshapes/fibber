@@ -7,9 +7,9 @@
 #            and compiler/fibc.fib
 #   --fault  FIB_AST_VERIFY=fault: the tree builder leaves the runtime out; every unit that emits must then be REJECTED by the
 #            comparison (a check that cannot fail is worse than none)
-# Per unit, `FIBC emit UNIT` is run twice: plain (the text path, no trees compared) and with FIB_AST_VERIFY=1, which makes every
+# Per unit, `FIBC emit UNIT` is run twice: plain (the structured path, no reader comparison) and with FIB_AST_VERIFY=1, which makes every
 # session, and the final module, compare `lir.print` of its trees with `lir.print` of the whole text read again (emit.defs.astmod
-# `verify-module`: the pieces also join to the text of the parts). SAME: the same status and standard output, no FIB_AST_VERIFY
+# `verify-module`: the complete item sequence is compared). SAME: the same status and standard output, no FIB_AST_VERIFY
 # message. DIFF otherwise. NOEMIT: the unit does not emit (a case that is meant to be rejected): both runs agree on that and it is
 # not counted as a pass. Exit 0 only when there is at least one SAME and no DIFF (with --fault: at least one DETECTED and no MISSED).
 set -u
@@ -23,6 +23,9 @@ done
 here=$(cd "$(dirname "$0")" && pwd); root=$(cd "$here/../../.." && pwd)
 cd "$root" || exit 2
 export FIB_LIB=${FIB_LIB:-$root/lib}
+# The verifying mode assembles the complete module for its independent reader
+# comparison. Keep both runs complete so reachability is tested by prune.sh.
+export FIB_PRUNE=0
 T=$(mktemp -d "${TMPDIR:-/tmp}/h1-ast.XXXXXX"); trap 'rm -rf "$T"' EXIT
 if [ $# -gt 0 ]; then units=("$@"); else
   units=(compiler/fibc.fib cases/ownership/*.fib cases/modules/*/main.fib)

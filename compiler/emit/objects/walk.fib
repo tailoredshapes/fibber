@@ -7,7 +7,7 @@
 ;; Replaces crates/fibc/src/objects/walk.rs (150 lines of Rust before its test). The Rust `walker` takes the action as a closure;
 ;; its three callers are the three words `drop`, `trace` and `share`, so the word picks the action here.
 (ns emit.objects.walk
-  (:require [fib.string :as s])
+  (:require [fib.string :as s] [emit.node :as n] [emit.function :as f] [lir.ast :as la] [lir.types :as lt])
   (:use emit.value emit.objects.kinds))
 
 ;; The struct a group of children is read through, and the index of each child slot in it.
@@ -48,55 +48,52 @@
       (_ [(Group sn [])]))))
 
 ;; What a `drop`, a `trace` or a `share` does to a child, whose text is `child`.
-(defun act :private (what: str child: str) -> str
-  (cond (= what "drop") (str-join ["(call @fib.defer wl " child ")"])
-        (= what "trace") (str-join ["(indirect-call cb (fn void (ptr)) " child ")"])
-        :else (str-join ["(call @fib.share-queue wl " child ")"])))
+(defun act :private (what: str child: la/LExpr) -> la/LExpr
+  (cond (= what "drop") (n/call "fib.defer" [(n/local "wl") child])
+        (= what "trace") (n/indirect-call (n/local "cb") (lt/LFnType lt/cc-c nil [lt/ty-ptr] false) [child] false)
+        :else (n/call "fib.share-queue" [(n/local "wl") child])))
 
-(defun gep :private (sn: str i: i64) -> str
-  (str-join ["(getelementptr %struct." sn " p (i32 0) (i32 " (str i) "))"]))
+(defun gep :private (sn: str i: i64) -> la/LExpr (f/field sn (n/local "p") i))
 
 ;; The action on each child slot, the children read as `ptr` (a `dyn` slot's first word is its object, as a `ptr` slot is).
 ;; Rust: walk.rs:155 releases
-(defun releases :private (what: str g: Group) -> str
-  (s/join " " (mapv (fn (i: i64) (act what (str-join ["(load ptr " (gep (. g sname) i) ")"]))) (. g slots))))
+(defun releases :private (what: str g: Group) -> (Vec la/LExpr)
+  (mapv (fn (i: i64) (act what (n/load lt/ty-ptr (gep (. g sname) i) nil))) (. g slots)))
 
 ;; The walker of an array of counted elements: a loop up, or down for a drop. Rust: walk.rs:128 array_walker
-(defun array-walker :private (head: str o: ObjInfo what: str) -> str
-  (let ((sn (. o sname)) (down (= what "drop")))
-    (let ((n (str-join ["(load i64 " (gep sn slot-len) ")"]))
-          (start (if down "last" "(i64 0)"))
-          (more (if down "(icmp sge i (i64 0))" "(icmp slt i n)"))
-          (step (if down "(sub i (i64 1))" "(add i (i64 1))")))
-      (str-join [head
-                 "  (block entry (let ((n " n ") (last (sub n (i64 1)))) (br loop)))\n"
-                 "  (block loop (let ((i (phi i64 (entry " start ") (next i2)))) (br " more " body done)))\n"
-                 "  (block body (let ((e (load ptr (getelementptr %struct." sn " p (i32 0) (i32 " (str slot-elems) ") i)))) "
-                 (act what "e") " (br next)))\n"
-                 "  (block next (let ((i2 " step ")) (br loop)))\n"
-                 "  (block done (ret)))\n"]))))
+(defun array-walker :private (o: ObjInfo what: str) -> (Vec la/LBlock)
+  (let ((sn (. o sname)) (down (= what "drop"))
+        (start (if (= what "drop") (n/local "last") (n/integer lt/ty-i64 0)))
+        (more (n/compare-int (if (= what "drop") la/ISge la/ISlt) (n/local "i") (if (= what "drop") (n/integer lt/ty-i64 0) (n/local "n"))))
+        (step (n/binary (if (= what "drop") la/BSub la/BAdd) (n/local "i") (n/integer lt/ty-i64 1))))
+    [(f/block "entry" [(f/bound [(f/binding "n" (n/load lt/ty-i64 (gep sn slot-len) nil))
+                                (f/binding "last" (n/binary la/BSub (n/local "n") (n/integer lt/ty-i64 1)))] [(n/branch "loop")])])
+     (f/block "loop" [(f/bound [(f/binding "i" (n/node (la/KPhi lt/ty-i64 [(f/binding "entry" start) (f/binding "next" (n/local "i2"))])))]
+                               [(n/conditional more "body" "done")])])
+     (f/block "body" [(f/bound [(f/binding "e" (n/load lt/ty-ptr (n/gep (lt/TNamed sn) (n/local "p")
+                                                                                [(n/integer lt/ty-i32 0) (n/integer lt/ty-i32 slot-elems) (n/local "i")]) nil))]
+                               [(act what (n/local "e")) (n/branch "next")])])
+     (f/block "next" [(f/bound [(f/binding "i2" step)] [(n/branch "loop")])])
+     (f/block "done" [(n/ret nil)])]))
 
 ;; The text of the walker of an enum: a switch on the tag, a block per variant.
-(defun enum-walker :private (head: str o: ObjInfo what: str groups: (Vec Group)) -> str
-  (let ((cases (s/join " " (mapv (fn (i: i64) (str-join ["((i32 " (str i) ") v" (str i) ")"])) (range (count groups))))))
-    (str-join (into [head "  (block entry (switch (load i32 " (gep (. o sname) slot-enum-tag) ") done " cases "))\n"]
-                    (conj (vec (map-indexed (fn (i: i64 g: Group)
-                                              (str-join ["  (block v" (str i) " " (releases what g) " (br done))\n"]))
-                                            groups))
-                          "  (block done (ret)))\n")))))
+(defun enum-walker :private (o: ObjInfo what: str groups: (Vec Group)) -> (Vec la/LBlock)
+  (let ((cases (mapv (fn (i: i64) (la/LCase (n/integer lt/ty-i32 i) (str "v" i))) (range (count groups))))
+        (blocks (vec (map-indexed (fn (i: i64 g: Group) (f/block (str "v" i) (conj (releases what g) (n/branch "done")))) groups))))
+    (conj (into [(f/block "entry" [(n/switch (n/load lt/ty-i32 (gep (. o sname) slot-enum-tag) nil) "done" cases)])] blocks)
+          (f/block "done" [(n/ret nil)]))))
 
 ;; A `drop.N`, `trace.N` or `share.N` function (WHAT is `drop`, `trace` or `share`): the action on each child pointer of
 ;; the object (an enum's by its tag through `switch`; an array's elements in a loop). A drop goes through the fields in
 ;; reverse, for the worklist. Rust: walk.rs:77 walker
-(defun walker (o: ObjInfo what: str) -> str
+(defun walker (o: ObjInfo what: str) -> la/LFunction
   (let ((drop (= what "drop"))
-        (head (str-join ["(define internal (" what "." (str (. o tid)) " void) "
-                         (if (= what "trace") "((ptr p) (ptr cb))" "((ptr p) (ptr wl))") "\n"])))
-    (cond (match (. o kind) ((ObArray t) (counted-ty t)) (_ false)) (array-walker head o what)
-          (and drop (match (. o kind) ((ObWeak) true) (_ false)))
-            (str-join [head "  (block entry (call @fib.weak-drop p) (ret)))\n"])
-          :else
-            (let ((groups (mapv (fn (g: Group) (if drop (Group (. g sname) (vec (reverse (. g slots)))) g)) (child-fields o))))
-              (match (. o kind)
-                ((ObEnum _) (enum-walker head o what groups))
-                (_ (str-join [head "  (block entry " (releases what (nth groups 0)) " (ret)))\n"])))))))
+        (params [(Pair "p" lt/ty-ptr) (Pair (if (= what "trace") "cb" "wl") lt/ty-ptr)]))
+    (f/make (str what "." (. o tid)) nil params lt/cc-c
+            (cond (match (. o kind) ((ObArray t) (counted-ty t)) (_ false)) (array-walker o what)
+                  (and drop (match (. o kind) ((ObWeak) true) (_ false)))
+                  [(f/block "entry" [(n/call "fib.weak-drop" [(n/local "p")]) (n/ret nil)])]
+                  :else (let ((groups (mapv (fn (g: Group) (if drop (Group (. g sname) (vec (reverse (. g slots)))) g)) (child-fields o))))
+                          (match (. o kind)
+                            ((ObEnum _) (enum-walker o what groups))
+                            (_ [(f/block "entry" (conj (releases what (nth groups 0)) (n/ret nil)))])))))))

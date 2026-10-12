@@ -7,7 +7,8 @@
   (:use types.ty types.ast types.decls types.program types.table types.init own.program syntax.form emit.value emit.text emit.layout
         emit.ir emit.mono emit.statics emit.objects emit.program emit.resume emit.lower.cx emit.lower.ops emit.lower.ctrl
         emit.lower.values emit.lower.call emit.lower.arith emit.lower.objects emit.lower.cells emit.lower.dynamic
-        emit.lower.pattern emit.lower.quote emit.lower.threads emit.lower.simd emit.lower.hoist))
+        emit.lower.pattern emit.lower.quote emit.lower.threads emit.lower.simd emit.lower.hoist)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; The functions the modules below call upward, as the Rust methods they stand for (the hub of emit.lower.cx).
 (defun hub-default () -> Hub
@@ -25,7 +26,7 @@
 (defun param-slot :private (p: Program inst: Inst i: i64 b: i64) -> (Result ParamSlot str)
   (try-let ((t (binding-ty p inst b)) (l (program-lir p t)))
     (Ok (match l
-          ((some x) (let ((pn (str-join ["p" (str i)]))) (ParamSlot b (VVal pn x) (some (LirParam x pn)))))
+          ((some x) (let ((pn (str-join ["p" (str i)]))) (ParamSlot b (v-local pn x) (some (LirParam x pn)))))
           (nil (ParamSlot b VUnit nil))))))
 
 (defun param-slots :private (p: Program inst: Inst bs: (Vec i64)) -> (Result (Vec ParamSlot) str)
@@ -38,7 +39,7 @@
   (doseq [s ps] (set! (. cx locals) (assoc @(. cx locals) (. s binding) (LocalVal (. s v))))))
 
 (defun ret-term :private (cx: LowerCx v: V) -> unit
-  (fb-term (. cx b) (match v ((VUnit) "(ret)") ((VVal s _) (str-join ["(ret " s ")"])))))
+  (fb-term (. cx b) (match v ((VUnit) (nx/ret nil)) ((VVal s _) (nx/ret (some s))))))
 
 ;; Lowers the body, returns its value, and records the function. Rust: lower/mod.rs:276 Cx::finish_with
 (defun finish-with :private (cx: LowerCx body: Expr) -> (Result unit str)
@@ -46,7 +47,7 @@
     (do (set! (. (. cx b) ret) l)
         (try-let ((flow (lcx-expr cx body)))
           (do (match flow ((FlowVal v) (ret-term cx v)) ((FlowJump) ()))
-              (set! (. (. cx p) funcs) (conj @(. (. cx p) funcs) (fb-render (. cx b))))
+              (set! (. (. cx p) funcs) (conj @(. (. cx p) funcs) (fb-function (. cx b))))
               (Ok ()))))))
 
 ;; The parameter bindings of the body a key names.
@@ -88,7 +89,7 @@
              (do (bind-params cx ps)
                  (match (. inst key) ((BodyDef _) (lcx-set-unwind cx false)) (_ ()))
                  (set! (. cx fatal) (and @(. (. cx b) unwind) (takes-slots? p (body-expr g (. inst key)))))
-                 (when env (set! (. cx env) (some (VVal "env" LirPtr))))
+                 (when env (set! (. cx env) (some (VVal (nx/local "env") LirPtr))))
                  (finish-with cx (body-expr g (. inst key)))))))))))
 
 ;; The captures of a closure body, loaded from `env` in capture order into their bindings. Rust: lower/mod.rs:462 load_captures
@@ -99,7 +100,7 @@
      (try-let ((caps (lcx-capture-tys cx oc)))
        (let ((sname (. (program-closure-object (. cx p) (. cx name) caps) snd)))
          (do (doseq [i (range (min (count (. oc captures)) (count caps)))]
-               (let ((slot (lcx-gep cx sname "env" (+ slot-capture0 i))))
+               (let ((slot (lcx-gep cx sname (nx/local "env") (+ slot-capture0 i))))
                  (let ((v (lcx-load cx (nth caps i) slot)))
                    (set! (. cx locals) (assoc @(. cx locals) (. (nth (. oc captures) i) binding) (LocalVal v))))))
              (Ok ())))))))
@@ -123,7 +124,7 @@
 (defun emit-fn :private (p: Program owner: Inst own: BodyOwn lits: (Map i64 Expr) e: Expr f: FnLit name: str) -> (Result unit str)
   (try-let ((ps (param-slots p owner (mapv (fn (q: FnParam) (. q binding)) (. f params)))))
     (let ((cx (lcx-build p owner own name (into [(LirParam LirPtr "env")] (params-sig ps)) true (hub-default) lits))
-          (env (VVal "env" LirPtr)))
+          (env (VVal (nx/local "env") LirPtr)))
       (do (set! (. cx env) (some env))
           (set! (. cx fatal) (and @(. (. cx b) unwind) (takes-slots? p (. f body))))
           (when-some (n (. f name)) (set! (. cx locals) (assoc @(. cx locals) n (LocalVal env))))
@@ -134,7 +135,7 @@
 ;; Loads the captures of a task from its object into their bindings; the point of the frame is the field after them.
 (defun load-task-captures :private (cx: LowerCx oc: ClosureOwn caps: (Vec LirTy) sname: str) -> unit
   (doseq [i (range (min (count (. oc captures)) (count caps)))]
-    (let ((slot (lcx-gep cx sname "env" (+ slot-task-capture0 i))))
+    (let ((slot (lcx-gep cx sname (nx/local "env") (+ slot-task-capture0 i))))
       (let ((v (lcx-load cx (nth caps i) slot)))
         (set! (. cx locals) (assoc @(. cx locals) (. (nth (. oc captures) i) binding) (LocalVal v)))))))
 
@@ -149,7 +150,7 @@
 ;; Rust: lower/mod.rs:171 emit_async
 (defun emit-async :private (p: Program owner: Inst own: BodyOwn lits: (Map i64 Expr) e: Expr body: Expr name: str) -> (Result unit str)
   (let ((cx (lcx-build p owner own name [(LirParam LirPtr "env")] false (hub-default) lits)))
-    (do (set! (. cx env) (some (VVal "env" LirPtr)))
+    (do (set! (. cx env) (some (VVal (nx/local "env") LirPtr)))
         (match (get (. own closures) (. e id))
           (nil (Err "no plan for an async literal"))
           ((some oc)
@@ -172,7 +173,7 @@
                   (do (set! (. cx async-frame) nil)
                       (try-let ((frame (make-resumable (. cx b) (ResumeShape (. task snd) prologue states complete point))))
                         (do (objects-set-task-frame (. (. cx p) objects) (. task fst) frame)
-                            (set! (. (. cx p) funcs) (conj @(. (. cx p) funcs) (fb-render (. cx b))))
+                            (set! (. (. cx p) funcs) (conj @(. (. cx p) funcs) (fb-function (. cx b))))
                             (Ok ())))))))))))
 
 ;; The Vec runtime ids of `(Vec elem)` outside any body (for the macro surface, `compile_macro`). Any body key whose definition
@@ -192,7 +193,7 @@
                     (let ((l (unwrap-or lt LirI64)))
                       ;; An integer literal that took a float type (stdlib §7 L19).
                       (if (or (= l LirFloat) (= l LirDouble))
-                          (Ok (VVal (str-join ["(" (lir-ty-text l) " " (float-lir-text (sitofp f64 n)) ")"]) l))
+                          (Ok (VVal (nx/floating (lir-type l) (sitofp f64 n)) l))
                           (Ok (v-int l n))))))
     ;; A float literal that took the element type of a vector it is an operand of (types 1.9) has that type, not its own width.
     ((LitFloat x w) (try-let ((ty (lcx-ty cx e)) (lt (program-lir (. cx p) ty)))
@@ -200,8 +201,8 @@
                                  ((some (LirFloat)) LirFloat)
                                  ((some (LirDouble)) LirDouble)
                                  (_ (match w ((F32) LirFloat) ((F64) LirDouble))))))
-                        (Ok (VVal (str-join ["(" (lir-ty-text t) " " (float-lir-text x) ")"]) t)))))
-    ((LitStr s) (Ok (VVal (statics-string (. (. cx p) statics) s 0) LirPtr)))
+                        (Ok (VVal (nx/floating (lir-type t) x) t)))))
+    ((LitStr s) (Ok (VVal (nx/reference (statics-string (. (. cx p) statics) s 0)) LirPtr)))
     ((LitChar c) (Ok (v-int LirI32 (long c))))
     ((LitBool b) (Ok (v-int LirI1 (if b 1 0))))
     ((LitKeyword k) (Ok (v-int LirI64 (statics-keyword (. (. cx p) statics) k))))

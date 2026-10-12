@@ -1,0 +1,56 @@
+;; Structural checks pin the distinctions that textual emitter rewrites lost.
+(ns tests.emit.unit-structured
+  (:use fib.test.unit)
+  (:require [fib.test.run :as runner] [emit.node :as n] [emit.function :as f]
+            [lir.ast :as la] [lir.types :as lt] [lir.rewrite :as rewrite]
+            [native.api :as api] [native.pipeline :as pipe] [emit.prune :as prune]))
+
+(defun renamed (expr: la/LExpr) -> la/LExpr (rewrite/substitute-locals expr {"t1" "t9"}))
+
+(defun rewrite-checks (cs: StepLog) -> unit
+  (let ((operand (n/local "t1")))
+    (do (is cs (match (. (renamed (la/LExpr (la/KLoad lt/ty-i64 operand true (some 32)) 71)) kind)
+                 ((la/KLoad ty ptr volatile align)
+                  (and (= ty lt/ty-i64) (= (n/text ptr) "t9") volatile (= align (some 32)))) (_ false))
+            "rewriting a volatile load keeps its type and alignment")
+        (is cs (= (. (renamed (la/LExpr (la/KLoad lt/ty-i64 operand true nil) 71)) pos) 71)
+            "rewriting preserves diagnostic positions")
+        (is cs (match (. (renamed (n/intrinsic "fma" la/fm-contract nil [operand operand operand] (some 16))) kind)
+                 ((la/KIntrin name flags ty args align)
+                  (and (= name "fma") (= flags la/fm-contract) (nil? ty) (= (mapv n/text args) ["t9" "t9" "t9"]) (= align (some 16)))) (_ false))
+            "intrinsic flags and alignment survive operand substitution")
+        (is cs (match (. (renamed (n/node (la/KCmpXchg true la/sc-single-thread la/OAcqRel la/OAcquire operand operand operand))) kind)
+                 ((la/KCmpXchg weak scope success failure ptr expected value)
+                  (and weak (= scope la/sc-single-thread) (= success la/OAcqRel) (= failure la/OAcquire)
+                       (= (mapv n/text [ptr expected value]) ["t9" "t9" "t9"]))) (_ false))
+            "compare-exchange scope, weakness, and both orderings survive substitution")
+        (is cs (match (. (renamed (n/conditional operand "t1" "other")) kind)
+                 ((la/KCondBr condition yes no) (and (= (n/text condition) "t9") (= yes "t1") (= no "other"))) (_ false))
+            "branch destinations are labels, independent of local operands")
+        (is cs (match (. (renamed (n/indirect-call operand (lt/LFnType lt/cc-tail (some lt/ty-i64) [lt/ty-i64] false) [operand] true)) kind)
+                 ((la/KCall (la/CalIndirect ptr ty) args tail)
+                  (and (= (n/text ptr) "t9") (= (. ty cc) lt/cc-tail) (= (. ty ret) (some lt/ty-i64))
+                       (= (mapv n/text args) ["t9"]) tail)) (_ false))
+            "indirect callee operands change while their signature and tail convention stay") )))
+
+(defun invalid-module :private () -> la/LModule
+  (la/LModule [(la/ItDefine (f/external (f/make "main" (some lt/ty-i32) [] lt/cc-c
+                                            [(f/block "entry" [(n/ret (some (n/local "missing")))])])))]))
+
+(defun module-checks (cs: StepLog) -> unit
+  (let ((bad (invalid-module)))
+    (do (is cs (match (pipe/check-module bad) ((Err _) true) (_ false)) "generated modules undergo whole-module LIR verification")
+        (is cs (match (api/build-executable-module bad "/tmp/fibber-invalid-structured-module" 0 [] [])
+                 ((Err message) (some? (str-find message "missing" 0))) (_ false))
+            "AOT rejects an undefined operand before reaching code generation or the cache")
+        (let ((item (la/ItGlobal (la/LGlobalDef "literal" lt/ty-ptr (n/string "@phantom (call @other)") true (la/LModifiers la/lk-internal false) 0 false))))
+          (is cs (empty? (prune/refs-of item)) "quoted text contributes no reachability edges"))
+        (let ((func (f/make "sample" nil [] lt/cc-c
+                      [(f/block "entry" [(n/call "callee" [(n/global "data") (n/string "@ignored")]) (n/ret nil)])])))
+          (is cs (= (prune/refs-of (la/ItDefine func)) ["callee" "data"]) "calls and global operands create structural dependencies")))))
+
+(defun steps () -> (Vec StepRun)
+  (let ((cs (new-rec))) (do (rewrite-checks cs) (module-checks cs) (rec-steps cs))))
+(defun tests () -> Suite
+  (unit-suite "emit/unit-structured" [(test-case "checks" steps "compiler/tests/emit/unit-structured.fib")]))
+(defun main () -> i64 (runner/run-main-with [(tests)] (vec (args))))

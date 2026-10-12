@@ -8,7 +8,8 @@
   (:require [fib.string :as s])
   (:use types.ty types.scheme types.ast types.decls types.table types.init types.infer.cx own.program emit.value emit.layout emit.ir
         emit.mono emit.objects emit.program emit.lower.cx emit.lower.ops emit.lower.arith emit.lower.builtins
-        emit.lower.dynamic emit.lower.objects emit.lower.simd emit.lower.window))
+        emit.lower.dynamic emit.lower.objects emit.lower.simd emit.lower.window)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; ---- arguments
 
@@ -72,9 +73,9 @@
   (try-let ((cell-ty (lcx-binding-ty cx b)) (content-ty (cell-content cell-ty "an & parameter that is not a cell"))
             (obj (program-object (. cx p) cell-ty)))
     (let ((tid (. obj fst)) (sname (. obj snd)))
-      (let ((slot (fb-entry-alloca (. cx b) (str-join ["%struct." sname]) (obj-size-pb (objects-get (. (. cx p) objects) tid) (program-pb (. cx p))))))
-        (do (fb-stmt (. cx b) (str-join ["(call @fib.stack-init " slot " (i32 " (str tid) "))"]))
-            (try-let ((var (lcx-local cx b)) (content (lcx-cell-load cx sname (v-text var) content-ty)))
+      (let ((slot (fb-entry-alloca (. cx b) (lt/TNamed sname) (obj-size-pb (objects-get (. (. cx p) objects) tid) (program-pb (. cx p))))))
+        (do (fb-stmt (. cx b) (nx/call "fib.stack-init" [slot (nx/integer lt/ty-i32 tid)]))
+            (try-let ((var (lcx-local cx b)) (content (lcx-cell-load cx sname (v-expr var) content-ty)))
               (do (when (not take) (lcx-retain cx content))
                   (lcx-store cx content (lcx-gep cx sname slot slot-cell-value))
                   (Ok (VVal slot LirPtr)))))))))
@@ -96,20 +97,20 @@
 (defun call-write-back :private (cx: LowerCx var: i64 private: V cell-ty: Ty took: bool) -> (Result unit str)
   (try-let ((content-ty (cell-content cell-ty "a write-back to a non-cell")) (obj (program-object (. cx p) cell-ty)))
     (let ((sname (. obj snd)))
-      (try-let ((content (lcx-cell-load cx sname (v-text private) content-ty)) (target (lcx-local cx var))
-                (old (lcx-cell-load cx sname (v-text target) content-ty)))
-        (do (lcx-store cx content (lcx-gep cx sname (v-text target) slot-cell-value))
+      (try-let ((content (lcx-cell-load cx sname (v-expr private) content-ty)) (target (lcx-local cx var))
+                (old (lcx-cell-load cx sname (v-expr target) content-ty)))
+        (do (lcx-store cx content (lcx-gep cx sname (v-expr target) slot-cell-value))
             (when (not took) (lcx-release cx old))
-            (fb-stmt (. cx b) (str-join ["(call @fib.stack-end " (v-text private) ")"]))
+            (fb-stmt (. cx b) (nx/call "fib.stack-end" [(v-expr private)]))
             (Ok ()))))))
 
 ;; The content of a cell object. Rust: lower/call.rs:173 LowerCx::cell_load
-(defun lcx-cell-load (cx: LowerCx sname: str cell: str content-ty: Ty) -> (Result V str)
-  (match (get @(. cx hoisted) cell)
+(defun lcx-cell-load (cx: LowerCx sname: str cell: la/LExpr content-ty: Ty) -> (Result V str)
+  (match (get @(. cx hoisted) (nx/operand-name cell))
     ((some h) (Ok (. h fst)))
     (nil (cell-load-field cx sname cell content-ty))))
 
-(defun cell-load-field :private (cx: LowerCx sname: str cell: str content-ty: Ty) -> (Result V str)
+(defun cell-load-field :private (cx: LowerCx sname: str cell: la/LExpr content-ty: Ty) -> (Result V str)
   (let ((field (lcx-gep cx sname cell slot-cell-value)))
     (try-let ((l (program-lir (. cx p) content-ty)))
       (Ok (match l ((some t) (lcx-load cx t field)) (nil VUnit))))))
@@ -280,34 +281,35 @@
 ;; ---- the call itself
 
 ;; The texts of the values that are not `unit`.
-(defun call-arg-texts :private (vals: (Vec V)) -> (Vec str)
+(defun call-args :private (vals: (Vec V)) -> (Vec la/LExpr)
   (vec (keep (fn (v: V) (match v ((VVal s _) (some s)) ((VUnit) nil))) vals)))
 
-(defun call-ret-text :private (ret: (Option LirTy) uw: bool) -> str
+(defun call-ret-type :private (ret: (Option LirTy) uw: bool) -> (Option lt/LType)
   (match ret
-    ((some t) (if (and uw (not (lir-aggregate? t))) (str-join ["{ " (lir-ty-text t) " ptr }"]) (lir-ty-text t)))
-    (nil (if uw "ptr" "void"))))
+    ((some t) (some (if (and uw (not (lir-aggregate? t))) (lt/TAnon [(lir-type t) lt/ty-ptr]) (lir-type t))))
+    (nil (if uw (some lt/ty-ptr) nil))))
 
 ;; The types of the parameters after `this`: the texts of the types of the values that have one.
-(defun call-param-tys :private (vals: (Vec V)) -> str
-  (s/join " " (into ["ptr"] (vec (keep (fn (v: V) (match v ((VVal _ t) (some (lir-ty-text t))) ((VUnit) nil))) vals)))))
+(defun call-param-types :private (vals: (Vec V)) -> (Vec lt/LType)
+  (into [lt/ty-ptr] (vec (keep (fn (v: V) (match v ((VVal _ t) (some (lir-type t))) ((VUnit) nil))) vals))))
 
 ;; The text of the call or tail call of `target` (§8.4): direct, an extern, a vtable's code or a closure's code pointer.
-(defun call-instr :private (cx: LowerCx target: Target vals0: (Vec V) ret: (Option LirTy) tail: bool uw: bool slot: (Option str)) -> (Result str str)
+(defun call-instr :private (cx: LowerCx target: Target vals0: (Vec V) ret: (Option LirTy) tail: bool uw: bool slot: (Option la/LExpr)) -> (Result la/LExpr str)
   (let ((vals (match slot ((some s) (conj vals0 (VVal s LirPtr))) (nil vals0)))
-        (args (call-arg-texts vals)) (indirect (if tail "indirect-tailcall" "indirect-call")))
+        (args (call-args vals)))
     (match target
       ((TgDirect name env)
-       (Ok (str-join ["(" (if tail "tailcall" "call") " @" name (if env " (ptr null)" "") " " (s/join " " args) ")"])))
-      ((TgExtern name) (Ok (str-join ["(call @" name " " (s/join " " args) ")"])))
+       (let ((actual (if env (into [(nx/null)] args) args)))
+         (Ok (if tail (nx/tail-call name actual) (nx/call name actual)))))
+      ((TgExtern name) (Ok (nx/call name args)))
       ((TgCode code this)
-       (Ok (str-join ["(" indirect " " code " (fn tailcc " (call-ret-text ret uw) " (" (call-param-tys (vec (drop 1 vals))) ")) " this " "
-                      (s/join " " (vec (drop 1 args))) ")"])))
+       (Ok (nx/indirect-call code (lt/LFnType lt/cc-tail (call-ret-type ret uw) (call-param-types (vec (drop 1 vals))) false)
+                             (into [this] (vec (drop 1 args))) tail)))
       ((TgValue clo)
-       (let ((codep (lcx-gep cx "fib.closure" (v-text clo) slot-closure-code)))
+       (let ((codep (lcx-gep cx "fib.closure" (v-expr clo) slot-closure-code)))
          (let ((code (lcx-load cx LirPtr codep)))
-           (Ok (str-join ["(" indirect " " (v-text code) " (fn tailcc " (call-ret-text ret uw) " (" (call-param-tys vals) ")) " (v-text clo) " "
-                          (s/join " " args) ")"])))))
+           (Ok (nx/indirect-call (v-expr code) (lt/LFnType lt/cc-tail (call-ret-type ret uw) (call-param-types vals) false)
+                                 (into [(v-expr clo)] args) tail)))))
       (_ (Err "not a callable target")))))
 
 ;; Whether the target returns a failure next to its value (docs/design/exceptions.md 4.2): in a program that catches, every body, closure
@@ -321,7 +323,7 @@
   (let ((uw (callee-unwinds? cx target)))
     (try-let ((ret (program-lir (. cx p) rt))
               (slot (Ok (if (and uw (match ret ((some t) (lir-aggregate? t)) (nil false)))
-                            (some (if tail "exs" (fresh-slot cx)))
+                            (some (if tail (nx/local "exs") (fresh-slot cx)))
                             nil)))
               (instr (call-instr cx target vals ret tail uw slot)))
       (cond
@@ -332,35 +334,35 @@
                 (nil (do (fb-stmt (. cx b) instr) (Ok VUnit))))))))
 
 ;; The failure slot of one call of a function with a two-leaf result (emit.ir `lir-aggregate?`), null before the call.
-(defun fresh-slot :private (cx: LowerCx) -> str
-  (let ((s (fb-entry-alloca (. cx b) "ptr" 8)))
-    (do (fb-stmt (. cx b) (str-join ["(store (ptr null) " s ")"])) s)))
+(defun fresh-slot :private (cx: LowerCx) -> la/LExpr
+  (let ((s (fb-entry-alloca (. cx b) lt/ty-ptr 8)))
+    (do (fb-stmt (. cx b) (nx/store (nx/null) s nil)) s)))
 
 ;; A call of a function that may return a failure: its value, after the branch to the unwinding when the failure is not null.
-(defun call-checked :private (cx: LowerCx instr: str ret: (Option LirTy) slot: (Option str)) -> V
+(defun call-checked :private (cx: LowerCx instr: la/LExpr ret: (Option LirTy) slot: (Option la/LExpr)) -> V
   (let ((b (. cx b)))
     (match ret
       ((some t) :when (some? slot)
        (let ((v (fb-val b instr t)))
-         (do (unwind-branch cx (fb-val b (str-join ["(load ptr " (unwrap slot) ")"]) LirPtr)) v)))
+         (do (unwind-branch cx (fb-val b (nx/load lt/ty-ptr (unwrap slot) nil) LirPtr)) v)))
       ((some t)
        (let ((r (fb-val b instr t)))
-         (let ((v (fb-val b (str-join ["(extractvalue " (v-text r) " 0)"]) t))
-               (ex (fb-val b (str-join ["(extractvalue " (v-text r) " 1)"]) LirPtr)))
+         (let ((v (fb-val b (nx/extract (v-expr r) 0) t))
+               (ex (fb-val b (nx/extract (v-expr r) 1) LirPtr)))
            (do (unwind-branch cx ex) v))))
       (nil (do (unwind-branch cx (fb-val b instr LirPtr)) VUnit)))))
 
 (defun unwind-branch :private (cx: LowerCx ex: V) -> unit
   (let ((b (. cx b)) (lu (fb-label (. cx b) "unwind")) (lk (fb-label (. cx b) "returned")))
-    (do (fb-term b (str-join ["(br (icmp ne " (v-text ex) " (ptr null)) " lu " " lk ")"]))
+    (do (fb-term b (nx/conditional (nx/compare-int la/INe (v-expr ex) (nx/null)) lu lk))
         (fb-open b lu)
-        (lcx-unwind-exit cx (v-text ex))
+        (lcx-unwind-exit cx (v-expr ex))
         (fb-open b lk))))
 
 ;; The unwinding of the frame with the failure `ex` (the hub's `unwind`): the `&` arguments of the call written back, the pending
 ;; arguments and what the plan says the frame holds here released, the failure returned. Where the frame cannot pass it on, the trap
 ;; it is, as before (fib.unwound-fatal).
-(defun lcx-unwind-exit (cx: LowerCx ex: str) -> unit
+(defun lcx-unwind-exit (cx: LowerCx ex: la/LExpr) -> unit
   (let ((b (. cx b)))
     (match (if (lcx-catchable? cx) @(. cx unwind-ops) nil)
       (nil (unwind-fatal cx ex))
@@ -368,15 +370,15 @@
        (match (unwind-releases cx ops)
          ((Err _) (unwind-fatal cx ex))
          ((Ok _) (if (fb-slot? b)
-                     (do (fb-stmt b (str-join ["(store " ex " exs)"]))
-                         (fb-term-raw b (str-join ["(ret (zeroinitializer " (lir-ty-text (unwrap @(. b ret))) "))"])))
+                     (do (fb-stmt b (nx/store ex (nx/local "exs") nil))
+                         (fb-term-raw b (nx/ret (some (nx/zero (lir-type (unwrap @(. b ret))))))))
                      (fb-term-raw b (match @(. b ret)
-                                      ((some t) (str-join ["(ret { (zeroinitializer " (lir-ty-text t) ") " ex " })"]))
-                                      (nil (str-join ["(ret " ex ")"])))))))))))
+                                      ((some t) (nx/ret (some (nx/aggregate [(nx/zero (lir-type t)) ex]))))
+                                      (nil (nx/ret (some ex))))))))))))
 
-(defun unwind-fatal :private (cx: LowerCx ex: str) -> unit
-  (do (fb-stmt (. cx b) (str-join ["(call @fib.unwound-fatal " ex ")"]))
-      (fb-term (. cx b) "(unreachable)")))
+(defun unwind-fatal :private (cx: LowerCx ex: la/LExpr) -> unit
+  (do (fb-stmt (. cx b) (nx/call "fib.unwound-fatal" [ex]))
+      (fb-term (. cx b) (nx/unreachable))))
 
 (defun unwind-releases :private (cx: LowerCx ops: (Vec Op)) -> (Result unit str)
   (try-let ((wb (match @(. cx unwind-wb)
@@ -426,7 +428,7 @@
               ((some result)
                (try-let ((wb (call-write-backs cx own vals tys)))
                  (if tail
-                     (do (fb-term (. cx b) (match result ((VUnit) "(ret)") ((VVal s _) (str-join ["(ret " s ")"]))))
+                     (do (fb-term (. cx b) (match result ((VUnit) (nx/ret nil)) ((VVal s _) (nx/ret (some s)))))
                          (Ok FlowJump))
                      (Ok (FlowVal result)))))))))))
 

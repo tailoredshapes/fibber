@@ -4,7 +4,7 @@
 ;; corpus (compare.sh): it needs liblair.
 ;; Build: fibc build compiler/tests/emit/unit-defs.fib -I compiler -I lib -o OUT
 (ns tests.emit.unit-defs
-  (:require [fib.string :as s])
+  (:require [fib.string :as s] [emit.node :as n] [lir.ast :as la] [lir.types :as lt] [lir.print :as print] [tests.emit.normalized :as normal])
   (:use syntax.pos syntax.form types.ty types.ast types.table types.decls types.program fib.test.unit types.infer.mod own.program
         emit.value emit.program emit.inits emit.defs.data)
   (:require [fib.test.run :as test-runner]))
@@ -28,7 +28,9 @@
 
 (defun array-i64 () -> Ty (TCon KArray [(ty-i64)]))
 
-(defun ok-str (r: (Result str str)) -> str (match r ((Ok s) s) ((Err m) (str-join ["error: " m]))))
+(defun ok-str (r: (Result la/LExpr str)) -> str
+  (match r ((Ok expr) (n/text expr)) ((Err message) (str "error: " message))))
+(defun defs-text (d: Defs) -> str (print/print-module (la/LModule @(. d items))))
 
 (defun unit-steps () -> (Vec StepRun)
   (let ((cs (new-rec))
@@ -36,23 +38,23 @@
         (d (defs-new)))
     (do
       (is cs (and (= (all-def-ids p) [0 1 2]) (= (def-ids p) [0 2])) "every def in the order of the units; the constant ones are def_ids")
-      (is cs (and (= @(. d text) "") (= @(. d constants) []) (= @(. d counter) 0)) "no constant yet")
+      (is cs (and (= (defs-text d) "") (= @(. d constants) []) (= @(. d counter) 0)) "no constant yet")
       ;; type ids: str 0, (Array i8) 1, weak 2, task 3, so the first object made here is 4
-      (is cs (and (= (ok-str (defs-emit-array d p (array-i64) LirI64 ["(i64 1)" "(i64 -2)"])) "@def.1")
-                  (= @(. d text)
-                     "(constant internal def.1 { i64 i32 i32 i64 [2 x i64] } { (i64 0) (i32 4) (i32 8) (i64 2) ([2 x i64] (i64 1) (i64 -2)) })\n")
+      (is cs (and (= (ok-str (defs-emit-array d p (array-i64) LirI64 [(some (n/integer lt/ty-i64 1)) (some (n/integer lt/ty-i64 -2))])) "@def.1")
+                  (= (defs-text d)
+                     (normal/text "(constant internal def.1 { i64 i32 i32 i64 [2 x i64] } { (i64 0) (i32 4) (i32 8) (i64 2) ([2 x i64] (i64 1) (i64 -2)) })\n"))
                   (= @(. d constants) ["@def.1"])) "an array: the header, the length, the elements; the name is @def.1, not yet in the text before")
       (is cs (and (= (ok-str (defs-emit-array d p (array-i64) LirI64 [])) "@def.2")
-                  (s/ends-with? @(. d text)
-                     "(constant internal def.2 { i64 i32 i32 i64 [0 x i64] } { (i64 0) (i32 4) (i32 8) (i64 0) ([0 x i64] ) })\n")) "an empty array keeps the space before the closing paren, as the Rust's join of nothing")
+                  (s/ends-with? (defs-text d)
+                     (normal/text "(constant internal def.2 { i64 i32 i32 i64 [0 x i64] } { (i64 0) (i32 4) (i32 8) (i64 0) ([0 x i64] ) })\n"))) "an empty array keeps the space before the closing paren, as the Rust's join of nothing")
       (is cs (match (defs-emit-array d p (ty-i64) LirI64 [])
                ((Err _) true) ((Ok _) false)) "an array of something that is not an array type has no layout")
-      (is cs (and (= (ok-str (defs-emit-object d p (nom 1 []) nil ["(i64 3)" "" "@str.0"])) "@def.3")
-                  (s/ends-with? @(. d text)
-                                  "(constant internal def.3 %struct.o.Pt (%struct.o.Pt (i64 0) (i32 5) (i32 8) (i64 3) @str.0))\n")) "a struct: the header then the fields, a unit field (empty text) left out")
+      (is cs (and (= (ok-str (defs-emit-object d p (nom 1 []) nil [(some (n/integer lt/ty-i64 3)) nil (some (n/global "str.0"))])) "@def.3")
+                  (s/ends-with? (defs-text d)
+                                  (normal/text "(constant internal def.3 %struct.o.Pt (%struct.o.Pt (i64 0) (i32 5) (i32 8) (i64 3) @str.0))\n"))) "a struct: the header then the fields, a unit field (empty text) left out")
       (is cs (and (= (ok-str (defs-emit-object d p (nom 2 [(ty-i64)]) (some 1) [])) "@def.4")
-                  (s/includes? @(. d text) " (i32 8) (i32 1)))\n")
-                  (s/includes? @(. d text) "(constant internal def.4 %struct.o.$Shape.i64_.v1 (%struct.o.$Shape.i64_.v1 (i64 0)")) "a variant: the struct is named .vN and the tag follows the header")
+                  (s/includes? (defs-text d) " (i32 8) (i32 1)))\n")
+                  (s/includes? (defs-text d) "(constant internal def.4 %struct.o.$Shape.i64_.v1 (%struct.o.$Shape.i64_.v1 (i64 0)")) "a variant: the struct is named .vN and the tag follows the header")
       (is cs (= @(. d constants) ["@def.1" "@def.2" "@def.3" "@def.4"]) "the constants are named in the order they were made")
       (is cs (match (field-types p (nom 1 []) nil) ((Ok tys) (= tys [(ty-i64) (ty-str)])) (_ false)) "field types of a struct (no tag: the first row)")
       (is cs (and (match (field-types p (nom 2 [(ty-i64)]) (some 0)) ((Ok tys) (= tys [(ty-i64)])) (_ false))

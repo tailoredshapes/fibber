@@ -5,14 +5,14 @@
 ;; (a module cannot call its importer back, so the data had to be below both).
 ;; The index of Rust's `HashMap<String, u32>` is a `(Map str i64)`: only looked up, never iterated.
 (ns emit.objects
-  (:require [fib.string :as s])
+  (:require [fib.string :as s] [emit.node :as n] [lir.ast :as la] [lir.types :as lt] [lir.print :as print])
   (:use types.ty types.decls emit.value emit.text emit.layout emit.objects.walk)
   (:export-from emit.objects.kinds))
 
 ;; The table, in interning order. Rust: objects.rs:171 Objects. `structs` and `walkers` hold the text rendered for a type id, so
 ;; that a module assembled again for every `def` of a program (emit.defs.jit) renders each type once; a task type's entry is dropped
 ;; when its frame is set, the one change an entry's type undergoes.
-(defstruct Objects (list: (Cell (Vec ObjInfo)) index: (Cell (Map str i64)) structs: (Cell (Map i64 str)) walkers: (Cell (Map i64 str))))
+(defstruct Objects (list: (Cell (Vec ObjInfo)) index: (Cell (Map str i64)) structs: (Cell (Map i64 (Vec la/LItem))) walkers: (Cell (Map i64 (Vec la/LItem)))))
 
 (defun objects-new () -> Objects (Objects (cell []) (cell (map-empty)) (cell (map-empty)) (cell (map-empty))))
 
@@ -138,47 +138,39 @@
   (s/join " " (mapv frame-text fs)))
 
 ;; The `defstruct` of an object, and of each variant of an enum. Rust: objects.rs:285 render_structs
-(defun render-structs :private (o: ObjInfo) -> str
-  (let ((trailing (match (. o kind)
-                    ((ObStr) " [0 x i8]")
-                    ((ObArray t) (str-join [" [0 x " (lir-mem-text t) "]"]))
-                    (_ ""))))
-    (str-join
-      (into [(str-join ["(defstruct " (. o sname) " (" (frame-words (obj-fields o)) trailing "))\n"])]
-            (match (. o kind)
-              ((ObEnum vs)
-               (mapv (fn (i: i64)
-                       (str-join ["(defstruct " (obj-variant-sname o i) " (" (frame-words (variant-fields o (some i))) "))\n"]))
-                     (range (count vs))))
-              (_ []))))))
+(defun render-structs :private (o: ObjInfo) -> (Vec la/LItem)
+  (let ((trailing (match (. o kind) ((ObStr) [(lt/TArray 0 lt/ty-i8)]) ((ObArray t) [(lt/TArray 0 (lir-mem-type t))]) (_ []))))
+    (into [(la/ItStruct (la/LStructDef (. o sname) (into (mapv frame-type (obj-fields o)) trailing) 0))]
+          (match (. o kind)
+            ((ObEnum variants)
+             (mapv (fn (i: i64) (la/ItStruct (la/LStructDef (obj-variant-sname o i) (mapv frame-type (variant-fields o (some i))) 0)))
+                   (range (count variants))))
+            (_ [])))))
 
 ;; The type table and the class table. Rust: objects.rs:317 render_tables
-(defun render-tables :private (list: (Vec ObjInfo) pb: i64) -> str
-  (let ((n (str (count list)))
-        (rec (fn (o: ObjInfo)
-               (str-join ["(%struct.fib.typerec @drop." (str (. o tid)) " @trace." (str (. o tid))
-                          " (string " (lir-quote (. o name)) ") (i64 " (str (obj-size-pb o pb)) ") @share." (str (. o tid)) ")"])))
-        (class (fn (o: ObjInfo) (str-join ["(i8 " (str (obj-class o)) ")"])))
-        (kind (fn (o: ObjInfo) (str-join ["(i8 " (str (obj-kind o)) ")"]))))
-    (str-join ["(constant internal fib.types [" n " x %struct.fib.typerec] ([" n " x %struct.fib.typerec] "
-               (s/join " " (mapv rec list)) "))\n"
-               "(constant internal fib.classes [" n " x i8] ([" n " x i8] " (s/join " " (mapv class list)) "))\n"
-               "(constant internal fib.kinds [" n " x i8] ([" n " x i8] " (s/join " " (mapv kind list)) "))\n"])))
+(defun render-tables :private (objects: (Vec ObjInfo) pb: i64) -> (Vec la/LItem)
+  (let ((records (mapv (fn (o: ObjInfo)
+                        (n/named-aggregate "fib.typerec" [(n/global (str "drop." (. o tid))) (n/global (str "trace." (. o tid)))
+                                                         (n/string (. o name)) (n/integer lt/ty-i64 (obj-size-pb o pb))
+                                                         (n/global (str "share." (. o tid)))])) objects))
+        (types-ty (lt/TArray (count objects) (lt/TNamed "fib.typerec")))
+        (bytes-ty (lt/TArray (count objects) lt/ty-i8)))
+    [(table-constant "fib.types" types-ty records)
+     (table-constant "fib.classes" bytes-ty (mapv (fn (o: ObjInfo) (n/integer lt/ty-i8 (obj-class o))) objects))
+     (table-constant "fib.kinds" bytes-ty (mapv (fn (o: ObjInfo) (n/integer lt/ty-i8 (obj-kind o))) objects))]))
 
 ;; The text of the `defstruct`s of `o`, and of its three walkers, kept in `os` once rendered.
-(defun struct-text :private (os: Objects o: ObjInfo) -> str
-  (if-some [t (get @(. os structs) (. o tid))]
-    t
-    (let ((t (render-structs o)))
-      (do (set! (. os structs) (assoc @(. os structs) (. o tid) t))
-          t))))
+(defun struct-text :private (os: Objects o: ObjInfo) -> (Vec la/LItem)
+  (if-some [items (get @(. os structs) (. o tid))]
+    items
+    (let ((items (render-structs o)))
+      (do (set! (. os structs) (assoc @(. os structs) (. o tid) items)) items))))
 
-(defun walker-text :private (os: Objects o: ObjInfo) -> str
-  (if-some [t (get @(. os walkers) (. o tid))]
-    t
-    (let ((t (str-join [(walker o "drop") (walker o "trace") (walker o "share")])))
-      (do (set! (. os walkers) (assoc @(. os walkers) (. o tid) t))
-          t))))
+(defun walker-text :private (os: Objects o: ObjInfo) -> (Vec la/LItem)
+  (if-some [items (get @(. os walkers) (. o tid))]
+    items
+    (let ((items (mapv (fn (what: str) (la/ItDefine (walker o what))) ["drop" "trace" "share"])))
+      (do (set! (. os walkers) (assoc @(. os walkers) (. o tid) items)) items))))
 
 ;; Every `defstruct`, `drop`, `trace` and `share` function, and the type and class tables, as the pieces `objects-render` joins: the pieces
 ;; of an object are the same text every time (`struct-text`, `walker-text`), which the in-memory hand-over parses once (emit.defs.astmod).
@@ -187,13 +179,23 @@
   (objects-render-pieces-pb os 8))
 
 (defun objects-render-pieces-pb (os: Objects pb: i64) -> (Vec str)
-  (let ((list @(. os list)))
-    (into (into (mapv (fn (o: ObjInfo) (struct-text os o)) list)
-                (mapv (fn (o: ObjInfo) (walker-text os o)) list))
-          [(render-tables list pb)])))
+  (mapv (fn (item: la/LItem) (print/print-module (la/LModule [item]))) (objects-items-pb os pb)))
 
 (defun objects-render (os: Objects) -> str
   (str-join (objects-render-pieces os)))
 
 (defun objects-render-pb (os: Objects pb: i64) -> str
   (str-join (objects-render-pieces-pb os pb)))
+
+
+(defun frame-type :private (slot: FrameSlot) -> lt/LType
+  (match slot ((FrVal ty) (lir-mem-type ty)) ((FrBytes count) (lt/TArray count lt/ty-i8))))
+
+(defun table-constant :private (name: str ty: lt/LType values: (Vec la/LExpr)) -> la/LItem
+  (la/ItGlobal (la/LGlobalDef name ty (n/array-value ty values) true (la/LModifiers la/lk-internal false) 0 false)))
+
+(defun objects-items-pb (os: Objects pb: i64) -> (Vec la/LItem)
+  (let ((objects @(. os list)))
+    (into (into (vec (mapcat (fn (o: ObjInfo) (struct-text os o)) objects))
+                (vec (mapcat (fn (o: ObjInfo) (walker-text os o)) objects)))
+          (render-tables objects pb))))

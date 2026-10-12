@@ -8,9 +8,11 @@
 ;;   `Lir` (`LirI64`, `LirDyn`), and `V`'s are `VVal` and `VUnit`.
 ;; - Rust's `Option<LirTy>` is `(Option LirTy)`; `None` is `unit`'s type.
 ;; - Rust's `u32` of `bits` is an i64.
-(ns emit.value)
+(ns emit.value
+  (:use lir.types lir.ast)
+  (:require [emit.node :as n]))
 
-;; An lIR first-class type this compiler uses, as text. `LirPtr` is the
+;; An lIR representation used by the language lowering. `LirPtr` is the
 ;; pointer to an object (types §8.2), a counted pointer which retain, release,
 ;; drop and trace follow; `LirRaw` is a raw `ptr` of a program (types §8.1,
 ;; syntax §3.15), uncounted, `ptr` in lIR text and in layout but its own
@@ -76,22 +78,62 @@
 
 ;; A value: an SSA name, a global address or a literal, with its type; `VUnit`
 ;; is no value (`unit`).
-(defenum V (VVal text: str ty: LirTy) VUnit)
-(derive Eq V)
+(defenum V (VVal expr: LExpr ty: LirTy) VUnit)
+
+(impl Eq V
+  (= (self other)
+    (match self
+      ((VUnit) (match other ((VUnit) true) (_ false)))
+      ((VVal a t) (match other ((VVal b u) (and (= t u) (= (n/text a) (n/text b)))) (_ false))))))
 
 ;; Rust: value.rs:73 text (the text of `unit` is empty)
 (defun v-text (v: V) -> str
-  (match v ((VUnit) "") ((VVal s _) s)))
+  (match v ((VUnit) "") ((VVal e _) (n/text e))))
+
+(defun v-expr (v: V) -> LExpr
+  (match v ((VVal e _) e) ((VUnit) (trap "unit has no lIR operand"))))
 
 ;; Rust: value.rs:80 ty
 (defun v-ty (v: V) -> (Option LirTy)
   (match v ((VUnit) nil) ((VVal _ t) (some t))))
 
 ;; Rust: value.rs:87 null
-(defun v-null () -> V (VVal "(ptr null)" LirPtr))
+(defun v-null () -> V (VVal (n/null) LirPtr))
 
 ;; An integer literal of type t; the text of n is the decimal digits with a
 ;; `-` for a negative one and no `+`: Rust's `{n}` of an i64 and fibber's `str`
 ;; of an i64 agree (unit-value.fib checks the extremes). Rust: value.rs:91 int
 (defun v-int (t: LirTy n: i64) -> V
-  (VVal (str-join ["(" (lir-ty-text t) " " (str n) ")"]) t))
+  (VVal (n/integer (lir-type t) n) t))
+
+(defun v-local (name: str ty: LirTy) -> V (VVal (n/local name) ty))
+(defun v-global (name: str ty: LirTy) -> V (VVal (n/global name) ty))
+
+;; The type objects are the checker/backend's shared scalar constants.
+(defun lir-type (t: LirTy) -> LType
+  (match t
+    ((LirI1) ty-i1) ((LirI8) ty-i8) ((LirI16) ty-i16)
+    ((LirI32) ty-i32) ((LirI64) ty-i64)
+    ((LirFloat) ty-float) ((LirDouble) ty-double)
+    ((LirPtr) ty-ptr) ((LirRaw) ty-ptr)
+    ((LirDyn) (TAnon [ty-ptr ty-ptr]))
+    ((LirOpt of) (TAnon [ty-i1 (lir-type of)]))
+    ((LirVec of lanes) (TVector lanes (lir-type of)))))
+
+(defun lir-mem-type (t: LirTy) -> LType
+  (match t
+    ((LirVec _ _) (TArray (quot (vec-mem-bytes t) 8) ty-i64))
+    (_ (lir-type t))))
+
+(defun lir-align (t: LirTy) -> (Option i64)
+  (match t ((LirVec _ _) (some 8)) (_ nil)))
+
+(defun lir-zero-node (t: LirTy) -> LExpr
+  (match t
+    ((LirPtr) (n/null)) ((LirRaw) (n/null))
+    ((LirFloat) (n/floating ty-float 0.0))
+    ((LirDouble) (n/floating ty-double 0.0))
+    ((LirDyn) (n/zero (lir-type t)))
+    ((LirOpt _) (n/zero (lir-type t)))
+    ((LirVec _ _) (n/zero (lir-type t)))
+    (_ (n/integer (lir-type t) 0))))

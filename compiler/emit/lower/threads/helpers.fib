@@ -1,0 +1,144 @@
+;; Structured thread entries, pool runners, and async completion helpers.
+;; The calls and count operations retain the ordering of the original emitter.
+(ns emit.lower.threads.helpers
+  (:use types.ty types.decls emit.value emit.names emit.layout emit.objects emit.program emit.ir emit.lower.cx)
+  (:require [emit.node :as n] [emit.function :as f] [lir.ast :as la] [lir.types :as lt]))
+
+(defun unwinding :private (cx: LowerCx) -> bool
+  (and (. (. cx p) unwinding) (not @(. (. cx p) macro-module))))
+
+(defun result-word :private (ty: LirTy value: la/LExpr) -> (Option la/LExpr)
+  (match ty ((LirPtr) (some value)) ((LirDyn) (some (n/extract value 0))) (_ nil)))
+
+(defun completion-bindings :private (tsname: str asname: str) -> (Vec la/LBinding)
+  [(f/binding "atom" (n/load lt/ty-ptr (f/field tsname (n/local "task") slot-task-result) nil))
+   (f/binding "lockp" (f/field asname (n/local "atom") slot-atom-lock))
+   (f/binding "vp" (f/field asname (n/local "atom") slot-atom-value))])
+
+(defun store-result :private (ty: (Option LirTy) value: la/LExpr) -> (Vec la/LExpr)
+  (match ty
+    (nil [(n/call "fib.lock" [(n/local "lockp")]) (n/call "fib.unlock" [(n/local "lockp")])])
+    ((some t)
+     (let ((word (result-word t value))
+           (write [(n/store value (n/local "vp") (lir-align t))]))
+       (let ((after (match word
+                      ((some w)
+                       [(n/call "fib.retain" [w]) (n/call "fib.unlock" [(n/local "lockp")])
+                        (n/call "fib.release" [(unwrap (result-word t (n/local "old")))]) (n/call "fib.release" [w])])
+                      (nil [(n/call "fib.unlock" [(n/local "lockp")])]))))
+         (into (match word ((some w) [(n/call "fib.share" [w])]) (nil []))
+               [(n/call "fib.lock" [(n/local "lockp")])
+                (f/bound [(f/binding "old" (n/load (lir-type t) (n/local "vp") (lir-align t)))] (into write after))]))))))
+
+(defun closure-bindings :private (tsname: str) -> (Vec la/LBinding)
+  [(f/binding "f" (n/load lt/ty-ptr (f/field tsname (n/local "task") slot-task-closure) nil))
+   (f/binding "code" (n/load lt/ty-ptr (f/field "fib.closure" (n/local "f") slot-closure-code) nil))])
+
+(defun plain-call :private (result: (Option LirTy)) -> la/LExpr
+  (n/indirect-call (n/local "code")
+                   (lt/LFnType lt/cc-tail (match result ((some t) (some (lir-type t))) (nil nil)) [lt/ty-ptr] false)
+                   [(n/local "f")] false))
+
+;; A spawned thread has no catch below its closure. The same ABI is used as
+;; before: aggregate results take a null failure slot; scalar results yield T.
+(defun thread-call :private (result: (Option LirTy) uw: bool) -> la/LExpr
+  (cond (not uw) (plain-call result)
+        (nil? result) (n/call "fib.unwound-check"
+                            [(n/indirect-call (n/local "code") (lt/LFnType lt/cc-tail (some lt/ty-ptr) [lt/ty-ptr] false)
+                                              [(n/local "f")] false)])
+        :else
+          (let ((t (unwrap result)))
+            (if (lir-aggregate? t)
+                (n/indirect-call (n/local "code") (lt/LFnType lt/cc-tail (some (lir-type t)) [lt/ty-ptr lt/ty-ptr] false)
+                                 [(n/local "f") (n/null)] false)
+                (n/extract (n/indirect-call (n/local "code")
+                                           (lt/LFnType lt/cc-tail (some (lt/TAnon [(lir-type t) lt/ty-ptr])) [lt/ty-ptr] false)
+                                           [(n/local "f")] false) 0)))))
+
+(defun thread-entry (cx: LowerCx result-ty: Ty tsname: str) -> (Result str str)
+  (let ((name (str "fib.thread." (mangle (program-g (. cx p)) result-ty))))
+    (if (program-has-helper (. cx p) name)
+        (Ok name)
+        (try-let ((result (program-lir (. cx p) result-ty))
+                  (atom (program-object (. cx p) (TCon KAtom [result-ty]))))
+          (let ((call (thread-call result (unwinding cx)))
+                (tail [(n/call "fib.thread-uncount" []) (n/call "fib.task-complete" [(n/local "task")])
+                       (n/call "fib.release" [(n/local "task")]) (n/call "fib.thread-done" []) (n/ret (some (n/null)))])
+                (bindings (into (closure-bindings tsname) (completion-bindings tsname (. atom snd)))))
+            (let ((body (match result
+                          (nil (into [call] (into (store-result nil (n/null)) tail)))
+                          ((some _)
+                           [(f/bound [(f/binding "v" call)] (into (store-result result (n/local "v")) tail))]))))
+              (do (program-add-helper (. cx p) name
+                                      (f/make name (some lt/ty-ptr) [(Pair "task" lt/ty-ptr)] lt/cc-c
+                                              [(f/block "entry" [(n/call "fib.thread-enter" [(n/local "task")]) (f/bound bindings body)])]))
+                  (Ok name))))))))
+
+(defun pool-result-bindings :private (result: (Option LirTy) uw: bool) -> (Vec la/LBinding)
+  (cond (not uw) (if (nil? result) [] [(f/binding "r" (plain-call result))])
+        (nil? result)
+        [(f/binding "ex" (n/indirect-call (n/local "code") (lt/LFnType lt/cc-tail (some lt/ty-ptr) [lt/ty-ptr] false)
+                                         [(n/local "f")] false))]
+        :else
+        (let ((t (unwrap result)))
+          (if (lir-aggregate? t)
+              [(f/binding "r" (n/indirect-call (n/local "code") (lt/LFnType lt/cc-tail (some (lir-type t)) [lt/ty-ptr lt/ty-ptr] false)
+                                               [(n/local "f") (n/local "exs")] false))
+               (f/binding "ex" (n/load lt/ty-ptr (n/local "exs") nil))]
+              [(f/binding "r" (n/indirect-call (n/local "code")
+                                               (lt/LFnType lt/cc-tail (some (lt/TAnon [(lir-type t) lt/ty-ptr])) [lt/ty-ptr] false)
+                                               [(n/local "f")] false))
+               (f/binding "ex" (n/extract (n/local "r") 1))]))))
+
+(defun pool-store :private (result: (Option LirTy) uw: bool) -> (Vec la/LExpr)
+  (match result
+    (nil (store-result nil (n/null)))
+    ((some t)
+     [(f/bound [(f/binding "v" (if (and uw (not (lir-aggregate? t))) (n/extract (n/local "r") 0) (n/local "r")))]
+               (store-result result (n/local "v")))])))
+
+(defun pool-blocks :private (result: (Option LirTy) uw: bool bindings: (Vec la/LBinding)) -> (Vec la/LBlock)
+  (let ((finish [(n/call "fib.sched-complete" [(n/local "task") (n/local "prev")]) (n/ret nil)])
+        (calls (pool-result-bindings result uw)))
+    (if uw
+        (let ((before (if (and (some? result) (lir-aggregate? (unwrap result))) [(n/store (n/null) (n/local "exs") nil)] [])))
+          [(f/block "entry" [(f/bound bindings
+                                      (into before [(f/bound calls [(n/call "fib.catch-leave" [(n/local "cs") (n/null)])
+                                                                   (n/conditional (n/compare-int la/INe (n/local "ex") (n/null)) "failed" "ok")])]))])
+           (f/block "failed" (into [(n/call "fib.sched-failed" [(n/local "task") (n/local "ex")])] finish))
+           (f/block "ok" (into (pool-store result true) finish))])
+        [(f/block "entry" [(f/bound bindings
+                                    (if (empty? calls)
+                                        (into [(plain-call result)] (into (pool-store result false) finish))
+                                        [(f/bound calls (into (pool-store result false) finish))]))])])))
+
+(defun pool-entry (cx: LowerCx result-ty: Ty) -> (Result str str)
+  (let ((name (str "fib.pool." (mangle (program-g (. cx p)) result-ty))))
+    (if (program-has-helper (. cx p) name)
+        (Ok name)
+        (try-let ((result (program-lir (. cx p) result-ty))
+                  (atom (program-object (. cx p) (TCon KAtom [result-ty])))
+                  (task (program-object (. cx p) (TCon KTask [result-ty]))))
+          (let ((uw (unwinding cx))
+                (bindings (into [(f/binding "prev" (n/call "fib.sched-enter" [(n/local "task")]))]
+                                (closure-bindings (. task snd)))))
+            (let ((bindings (into bindings (if uw [(f/binding "cs" (n/call "fib.catch-enter" []))] []))))
+              (let ((bindings (into (into bindings (if (and uw (some? result) (lir-aggregate? (unwrap result)))
+                                                        [(f/binding "exs" (n/alloca lt/ty-ptr))] []))
+                                    (completion-bindings (. task snd) (. atom snd)))))
+                (do (program-add-helper (. cx p) name (f/make name nil [(Pair "task" lt/ty-ptr)] lt/cc-c
+                                                             (pool-blocks result uw bindings)))
+                    (Ok name)))))))))
+
+(defun lcx-complete-helper (cx: LowerCx code: str result-ty: Ty) -> (Result str str)
+  (let ((name (str "fib.complete." code)))
+    (if (program-has-helper (. cx p) name)
+        (Ok name)
+        (try-let ((result (program-lir (. cx p) result-ty))
+                  (atom (program-object (. cx p) (TCon KAtom [result-ty])))
+                  (task (program-object (. cx p) (TCon KTask [result-ty]))))
+          (let ((params (into [(Pair "task" lt/ty-ptr)] (match result ((some t) [(Pair "v0" (lir-type t))]) (nil []))))
+                (body (into (store-result result (n/local "v0")) [(n/call "fib.task-complete" [(n/local "task")]) (n/ret nil)])))
+            (do (program-add-helper (. cx p) name (f/make name nil params lt/cc-c
+                                                         [(f/block "entry" [(f/bound (completion-bindings (. task snd) (. atom snd)) body)])]))
+                (Ok name)))))))

@@ -5,24 +5,30 @@
 (ns emit.lower.show
   (:require [fib.string :as s])
   (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.layout emit.names emit.ir emit.statics emit.program
-        emit.lower.cx emit.lower.ops emit.lower.simd))
+        emit.lower.cx emit.lower.ops emit.lower.simd)
+  (:require [emit.node :as nx] [emit.function :as ff]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; The call a scalar's `show` is. `x` is the value; an integer narrower than 64 bits is widened first. Rust: show.rs:17
-(defun scalar-show :private (cx: LowerCx sc: Scalar x: V) -> str
-  (let ((xt (v-text x)) (p (. cx p)))
+(defun scalar-show :private (cx: LowerCx sc: Scalar value: V) -> la/LExpr
+  (if (= sc SUnit)
+      (nx/call "fib.str-copy" [(nx/reference (statics-string (. (. cx p) statics) "()" 0))])
+      (scalar-show-value cx sc value)))
+
+(defun scalar-show-value :private (cx: LowerCx sc: Scalar x: V) -> la/LExpr
+  (let ((xt (v-expr x)) (p (. cx p)))
     (match sc
-      ((SBool) (str-join ["(call @fib.show-bool " xt ")"]))
-      ((SChar) (str-join ["(call @fib.show-char " xt ")"]))
-      ((SI64) (str-join ["(call @fib.show-int " xt ")"]))
-      ((SPtr) (str-join ["(call @fib.show-ptr " xt ")"]))
-      ((SUnit) (str-join ["(call @fib.str-copy " (statics-string (. p statics) "()" 0) ")"]))
+      ((SBool) (nx/call "fib.show-bool" [xt]))
+      ((SChar) (nx/call "fib.show-char" [xt]))
+      ((SI64) (nx/call "fib.show-int" [xt]))
+      ((SPtr) (nx/call "fib.show-ptr" [xt]))
+      ((SUnit) (nx/call "fib.str-copy" [(nx/reference (statics-string (. p statics) "()" 0))]))
       ((SKeyword) (do (set! (. p keyword-helpers) true)
-                      (str-join ["(call @kw.show " xt ")"])))
-      ((SF32) (str-join ["(call @fib.show-float " xt ")"]))
-      ((SF64) (str-join ["(call @fib.show-double " xt ")"]))
+                      (nx/call "kw.show" [xt])))
+      ((SF32) (nx/call "fib.show-float" [xt]))
+      ((SF64) (nx/call "fib.show-double" [xt]))
       ;; SI8, SI16, SI32
-      (_ (let ((w (fb-val (. cx b) (str-join ["(sext i64 " xt ")"]) LirI64)))
-           (str-join ["(call @fib.show-int " (v-text w) ")"]))))))
+      (_ (let ((w (fb-val (. cx b) (nx/cast la/CSExt lt/ty-i64 xt) LirI64)))
+           (nx/call "fib.show-int" [(v-expr w)]))))))
 
 ;; `show` on a field-less enum: a fresh copy of the variant's name. The helper function is made once per enum.
 ;; Rust: show.rs:84 enum_show_helper
@@ -35,15 +41,12 @@
           ((TsEnum vs)
            (let ((strs (mapv (fn (v: VariantDef) (statics-string (. p statics) (. v name) 0)) vs))
                  (idx (vec (range (count vs)))))
-             (do (program-add-helper
-                   p name
-                   (str-join ["(define internal (" name " ptr) ((i32 i))\n  (block entry (switch i bad "
-                              (s/join " " (mapv (fn (i: i64) (str-join ["((i32 " (str i) ") v" (str i) ")"])) idx)) "))\n"
-                              (str-join (mapv (fn (i: i64)
-                                                (str-join ["  (block v" (str i) " (ret (call @fib.str-copy " (nth strs i) ")))\n"]))
-                                              idx))
-                              "  (block bad (unreachable)))\n"]))
-                 (Ok name))))))))
+             (let ((cases (mapv (fn (i: i64) (la/LCase (nx/integer lt/ty-i32 i) (str "v" i))) idx))
+                   (blocks (mapv (fn (i: i64) (ff/block (str "v" i) [(nx/ret (some (nx/call "fib.str-copy" [(nx/reference (nth strs i))])))])) idx)))
+               (do (program-add-helper p name (ff/make name (some lt/ty-ptr) [(Pair "i" lt/ty-i32)] lt/cc-c
+                                                       (into (into [(ff/block "entry" [(nx/switch (nx/local "i") "bad" cases)])] blocks)
+                                                             [(ff/block "bad" [(nx/unreachable)])])))
+                   (Ok name)))))))))
 
 (defun fieldless-enum? :private (g: Globals t: Ty) -> bool
   (match t
@@ -57,18 +60,18 @@
 
 ;; A fresh `str` of `text`.
 (defun simd-piece :private (cx: LowerCx text: str) -> V
-  (fb-val (. cx b) (str-join ["(call @fib.str-copy " (statics-string (. (. cx p) statics) text 0) ")"]) LirPtr))
+  (fb-val (. cx b) (nx/call "fib.str-copy" [(nx/reference (statics-string (. (. cx p) statics) text 0))]) LirPtr))
 
 ;; `acc` and `p` joined into a fresh `str`; both are released.
 (defun simd-append :private (cx: LowerCx acc: V p: V) -> V
-  (let ((r (fb-val (. cx b) (str-join ["(call @fib.str-concat " (v-text acc) " " (v-text p) ")"]) LirPtr)))
+  (let ((r (fb-val (. cx b) (nx/call "fib.str-concat" [(v-expr acc) (v-expr p)]) LirPtr)))
     (do (lcx-release cx acc) (lcx-release cx p) r)))
 
 (defun simd-show :private (cx: LowerCx x: V sc: Scalar lt: LirTy) -> (Result V str)
   (loop ((i 0) (acc (simd-piece cx "<<")))
     (if (>= i (lanes-of lt))
         (Ok (simd-append cx acc (simd-piece cx (str-join [">>" (simd-suffix sc)]))))
-        (try-let ((s (lcx-native-show cx (fb-val (. cx b) (str-join ["(extractelement " (v-text x) " (i32 " (str i) "))"]) (elem-of lt))
+        (try-let ((s (lcx-native-show cx (fb-val (. cx b) (nx/extract-lane (v-expr x) (nx/integer lt/ty-i32 i)) (elem-of lt))
                                       (TCon (KScalar sc) []))))
           (recur (+ i 1) (simd-append cx (if (= i 0) acc (simd-append cx acc (simd-piece cx " "))) s))))))
 
@@ -85,36 +88,41 @@
   (let ((g (program-g (. cx p))))
     (try-let ((call (match t
                       ((TCon (KScalar sc) _) (Ok (scalar-show cx sc x)))
-                      ((TCon (KStr) _) (Ok (str-join ["(call @fib.str-copy " (v-text x) ")"])))
+                      ((TCon (KStr) _) (Ok (nx/call "fib.str-copy" [(v-expr x)])))
                       (_ (if (fieldless-enum? g t)
                              (try-let ((f (match t ((TCon (KNominal id) _) (enum-show-helper cx id)) (_ (Err "show of a non-enum")))))
-                               (Ok (str-join ["(call @" f " " (v-text x) ")"])))
+                               (Ok (nx/call f [(v-expr x)])))
                              (Err (str-join ["show of " (mangle g t)])))))))
       (Ok (fb-val (. cx b) call LirPtr)))))
 
 ;; The hash of a scalar, as the 64-bit value `conv` makes of `instr`.
-(defun hash-val :private (cx: LowerCx instr: str) -> V
+(defun hash-val :private (cx: LowerCx instr: la/LExpr) -> V
   (fb-val (. cx b) instr LirI64))
 
 ;; Rust: lower/show.rs:48 LowerCx::native_hash
-(defun lcx-native-hash (cx: LowerCx x: V t: Ty) -> (Result V str)
-  (let ((g (program-g (. cx p))) (xt (v-text x)))
+(defun lcx-native-hash (cx: LowerCx value: V ty: Ty) -> (Result V str)
+  (match ty
+    ((TCon (KScalar (SUnit)) _) (Ok (v-int LirI64 0)))
+    (_ (native-hash-value cx value ty))))
+
+(defun native-hash-value :private (cx: LowerCx x: V t: Ty) -> (Result V str)
+  (let ((g (program-g (. cx p))) (xt (v-expr x)))
     (match t
       ((TCon (KScalar sc) _)
        (match sc
          ((SI64) (Ok x))
-         ((SBool) (Ok (hash-val cx (str-join ["(zext i64 " xt ")"]))))
-         ((SChar) (Ok (hash-val cx (str-join ["(zext i64 " xt ")"]))))
-         ((SF64) (Ok (hash-val cx (str-join ["(call @fib.double-hash " xt ")"]))))
-         ((SF32) (let ((d (fb-val (. cx b) (str-join ["(fpext double " xt ")"]) LirDouble)))
-                   (Ok (hash-val cx (str-join ["(call @fib.double-hash " (v-text d) ")"])))))
-         ((SPtr) (Ok (hash-val cx (str-join ["(ptrtoint i64 " xt ")"]))))
+         ((SBool) (Ok (hash-val cx (nx/cast la/CZExt lt/ty-i64 xt))))
+         ((SChar) (Ok (hash-val cx (nx/cast la/CZExt lt/ty-i64 xt))))
+         ((SF64) (Ok (hash-val cx (nx/call "fib.double-hash" [xt]))))
+         ((SF32) (let ((d (fb-val (. cx b) (nx/cast la/CFpExt lt/ty-double xt) LirDouble)))
+                   (Ok (hash-val cx (nx/call "fib.double-hash" [(v-expr d)])))))
+         ((SPtr) (Ok (hash-val cx (nx/cast la/CPtrToInt lt/ty-i64 xt))))
          ((SUnit) (Ok (v-int LirI64 0)))
          ((SKeyword) (do (set! (. (. cx p) keyword-helpers) true)
-                         (Ok (hash-val cx (str-join ["(call @kw.hash " xt ")"])))))
+                         (Ok (hash-val cx (nx/call "kw.hash" [xt])))))
          ;; SI8, SI16, SI32
-         (_ (Ok (hash-val cx (str-join ["(sext i64 " xt ")"]))))))
-      ((TCon (KStr) _) (Ok (hash-val cx (str-join ["(call @fib.str-hash " xt ")"]))))
+         (_ (Ok (hash-val cx (nx/cast la/CSExt lt/ty-i64 xt))))))
+      ((TCon (KStr) _) (Ok (hash-val cx (nx/call "fib.str-hash" [xt]))))
       (_ (if (fieldless-enum? g t)
-             (Ok (hash-val cx (str-join ["(sext i64 " xt ")"])))
+             (Ok (hash-val cx (nx/cast la/CSExt lt/ty-i64 xt)))
              (Err (str-join ["hash of " (mangle g t)])))))))

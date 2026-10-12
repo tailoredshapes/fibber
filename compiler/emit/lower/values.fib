@@ -5,7 +5,8 @@
 ;; `wrapper-open` and `wrapper-close`, so no closure captures the borrowed context.
 (ns emit.lower.values
   (:use types.ty types.ast types.decls types.program types.builtins types.infer.cx types.table types.init own.program emit.value
-        emit.names emit.mono emit.ir emit.statics emit.program emit.lower.cx emit.lower.ops emit.lower.arith emit.lower.builtins))
+        emit.names emit.mono emit.ir emit.statics emit.program emit.lower.cx emit.lower.ops emit.lower.arith emit.lower.builtins)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; The plan of a generated wrapper: it has no expressions of its own. Rust: lower/values.rs:21 empty_plan
 (defun empty-plan () -> BodyOwn
@@ -23,7 +24,7 @@
         (match fty
           ((TFn _ params ret)
            (try-let ((lirs (try-map (fn (t: Ty) (program-lir (. cx p) t)) params)))
-             (let ((vals (mapv (fn (i: i64) (match (nth lirs i) ((some l) (VVal (str-join ["p" (str i)]) l)) (nil VUnit)))
+             (let ((vals (mapv (fn (i: i64) (match (nth lirs i) ((some l) (v-local (str-join ["p" (str i)]) l)) (nil VUnit)))
                                (range (count params))))
                    (sig (into [(LirParam LirPtr "env")]
                               (vec (keep (fn (i: i64) (match (nth lirs i) ((some l) (some (LirParam l (str-join ["p" (str i)])))) (nil nil)))
@@ -31,20 +32,20 @@
                (let ((w (lcx-sub cx (. cx inst) (empty-plan) name sig)))
                  (try-let ((rl (program-lir (. cx p) ret)))
                    (do (set! (. (. w b) ret) rl)
-                       (set! (. w env) (some (VVal "env" LirPtr)))
+                       (set! (. w env) (some (VVal (nx/local "env") LirPtr)))
                        (set! (. w locals) (assoc @(. w locals) 4294967295 (LocalVal VUnit)))
                        (Ok (some (Wrapper w vals params ret)))))))))
           (_ (Err "a function value without a function type"))))))
 
 ;; Returns `v` and records the finished function as a helper. Rust: lower/values.rs:107 Cx::wrapper, after the body
 (defun wrapper-close :private (w: Wrapper name: str v: V) -> unit
-  (do (fb-term (. (. w cx) b) (match v ((VUnit) "(ret)") ((VVal s _) (str-join ["(ret " s ")"]))))
-      (program-add-helper (. (. w cx) p) name (fb-render (. (. w cx) b)))))
+  (do (fb-term (. (. w cx) b) (match v ((VUnit) (nx/ret nil)) ((VVal s _) (nx/ret (some s)))))
+      (program-add-helper (. (. w cx) p) name (fb-function (. (. w cx) b)))))
 
 ;; The closure object of `code` without captures: the address of its immortal static.
 (defun closure-value :private (cx: LowerCx code: str) -> V
   (let ((r (program-closure-object (. cx p) code [])))
-    (VVal (statics-closure (. (. cx p) statics) code (. r fst)) LirPtr)))
+    (VVal (nx/reference (statics-closure (. (. cx p) statics) code (. r fst))) LirPtr)))
 
 ;; The index in `ms` of the implementation of method `i` of the protocol.
 (defun method-position :private (ms: (Vec ImplMethod) i: i64) -> (Option i64)

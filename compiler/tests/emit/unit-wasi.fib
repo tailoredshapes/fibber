@@ -2,7 +2,7 @@
 ;; WASI adaptation of the runtime (emit.wasi) applies to the runtime as it is: every text it rewrites is in rt/*.lir (a change of the runtime that moves one fails here, not on a machine with a wasm
 ;; toolchain), what it rewrites is gone, and what it adds is there. Every check names a value a wrong table or a stale rewrite would change.
 ;; Build: fibc build compiler/tests/emit/unit-wasi.fib -I compiler -I lib -o OUT
-(ns tests.emit.unit-wasi (:use fib.test.unit types.targets emit.value emit.layout emit.runtime) (:require [emit.wasi :as w] [emit.os :as os])
+(ns tests.emit.unit-wasi (:use fib.test.unit types.targets emit.value emit.layout emit.runtime) (:require [emit.wasi :as w] [emit.os :as os] [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f] [lir.print :as print])
   (:require [fib.test.run :as test-runner]))
 
 (defun runtime () -> str
@@ -42,7 +42,11 @@
       (is cs (let ((shim (w/shim)))
                (and (has shim "((i32 44) m44)") (has shim "(block m44 (ret (i32 2)))") (has shim "((i32 2) m2)") (has shim "(block m2 (ret (i32 44)))")
                     (has shim "(block m17 (ret (i32 20)))") (has shim "(block m22 (ret (i32 28)))"))) "the errno maps are switches over the table: ENOENT 44 <-> 2, EEXIST 20 <-> 17, EINVAL 28 <-> 22")
-      (is cs (let ((t (w/finish "(declare clock_gettime i32 (i32 ptr))\n (call @clock_gettime (i32 1) t) (call @clock_gettime id u)")))
+      (is cs (let ((t (print/print-module (w/finish-module (la/LModule
+        [(la/ItDeclare (la/LDeclare "clock_gettime" (lt/LFnType lt/cc-c (some lt/ty-i32) [lt/ty-i32 lt/ty-ptr] false) false 0))
+         (la/ItDefine (f/make "f" nil [(Pair "id" lt/ty-i32) (Pair "t" lt/ty-ptr) (Pair "u" lt/ty-ptr)] lt/cc-c
+           [(f/block "entry" [(n/call "clock_gettime" [(n/integer lt/ty-i32 1) (n/local "t")])
+                              (n/call "clock_gettime" [(n/local "id") (n/local "u")]) (n/ret nil)])]))])))))
                (and (not (has t "(declare clock_gettime i32 (i32 ptr))")) (has t "(call @fib.w.clock-gettime (i32 1) t)") (has t "(call @fib.w.clock-gettime id u)")
                     (has t "(define internal (fib.w.clock-gettime i32)") (has t "(store (sext i64 (load i32 at)) at)"))) "the finishing pass renames clock_gettime everywhere and defines the wrapper that widens tv_nsec")
       (is cs (= (w/adapt "(define internal (f void) () (block entry (ret)))") "(define internal (f void) () (block entry (ret)))") "a text with none of the patterns is left as it is by the part rewrite")

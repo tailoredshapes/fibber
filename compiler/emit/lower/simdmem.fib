@@ -8,7 +8,8 @@
 ;; The vector type is the context's for the loads (`n` is never an argument). Every access promises the alignment of the element only.
 (ns emit.lower.simdmem
   (:use types.ty types.scheme types.ast own.program emit.value emit.layout emit.ir emit.program emit.objects.kinds
-        emit.lower.cx emit.lower.ops emit.lower.simd emit.lower.simdfn))
+        emit.lower.cx emit.lower.ops emit.lower.simd emit.lower.simdfn)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 (defstruct SArr (tid: i64 sname: str esize: i64 align: i64 vt: LirTy))
 
@@ -24,60 +25,62 @@
          (_ (Err "a vector access needs an array of integers or floats")))))
     (_ (Err "a vector access on a non-array"))))
 
-(defun len-of :private (cx: LowerCx r: SArr arr: str) -> V
+(defun len-of :private (cx: LowerCx r: SArr arr: la/LExpr) -> V
   (lcx-load cx LirI64 (lcx-gep cx (. r sname) arr slot-len)))
 
-(defun elem-ptr :private (cx: LowerCx r: SArr arr: str i: V) -> str
-  (v-text (fb-val (. cx b) (str-join ["(getelementptr %struct." (. r sname) " " arr " (i32 0) (i32 " (str slot-elems) ") " (v-text i) ")"]) LirPtr)))
+(defun elem-ptr :private (cx: LowerCx r: SArr arr: la/LExpr i: V) -> la/LExpr
+  (v-expr (fb-val (. cx b) (nx/gep (lt/TNamed (. r sname)) arr [(nx/integer lt/ty-i32 0) (nx/integer lt/ty-i32 slot-elems) (v-expr i)]) LirPtr)))
 
 (defun lanes-t :private (r: SArr) -> i64 (lanes-of (. r vt)))
 
 (defun mask-t :private (r: SArr) -> LirTy (LirVec LirI1 (lanes-t r)))
 
-(defun iota :private (r: SArr) -> str
-  (str-join (into ["(<" (str (lanes-t r)) " x i64>"] (into (mapv (fn (i: i64) (str-concat " " (str i))) (range (lanes-t r))) [")"]))))
+(defun iota :private (r: SArr) -> la/LExpr
+  (nx/vector-value (lt/TVector (lanes-t r) lt/ty-i64)
+                   (mapv (fn (i: i64) (nx/integer lt/ty-i64 i)) (range (lanes-t r)))))
 
-(defun cmp :private (cx: LowerCx op: str a: str b: str t: LirTy) -> V
-  (val cx (str-join ["(" op " " a " " b ")"]) t))
+(defun cmp :private (cx: LowerCx op: str a: la/LExpr b: la/LExpr t: LirTy) -> V
+  (val cx (nx/operation op a b) t))
 
 ;; Traps with `msg` unless `0 <= i` and `i + k <= len` (a whole vector: k the lane count; a tail: k 0).
-(defun check-span :private (cx: LowerCx r: SArr arr: str i: V k: i64 msg: str) -> unit
+(defun check-span :private (cx: LowerCx r: SArr arr: la/LExpr i: V k: i64 msg: str) -> unit
   (let ((len (len-of cx r arr)))
-    (let ((hi (val cx (str-join ["(add " (v-text i) " (i64 " (str k) "))"]) LirI64)))
-      (let ((b1 (cmp cx "icmp slt" (v-text i) "(i64 0)" LirI1)) (b2 (cmp cx "icmp sgt" (v-text hi) (v-text len) LirI1)))
-        (lcx-trap-if cx (cmp cx "or" (v-text b1) (v-text b2) LirI1) msg)))))
+    (let ((hi (val cx (nx/binary la/BAdd (v-expr i) (nx/integer lt/ty-i64 k)) LirI64)))
+      (let ((b1 (cmp cx "icmp slt" (v-expr i) (nx/integer lt/ty-i64 0) LirI1)) (b2 (cmp cx "icmp sgt" (v-expr hi) (v-expr len) LirI1)))
+        (lcx-trap-if cx (cmp cx "or" (v-expr b1) (v-expr b2) LirI1) msg)))))
 
 ;; The lane index vector `i + k` and the mask of the lanes whose element does not exist (or lies before the array).
-(defun bad-lanes :private (cx: LowerCx r: SArr arr: str i: V m: V) -> V
+(defun bad-lanes :private (cx: LowerCx r: SArr arr: la/LExpr i: V m: V) -> V
   (let ((it (LirVec LirI64 (lanes-t r))))
-    (let ((idx (cmp cx "add" (v-text (splat-lanes cx it i)) (iota r) it)) (len (len-of cx r arr)))
-      (let ((ok (cmp cx "icmp ult" (v-text idx) (v-text (splat-lanes cx it len)) (mask-t r))))
-        (cmp cx "and" (v-text m) (v-text (cmp cx "xor" (v-text ok) (vconst (mask-t r) "1") (mask-t r))) (mask-t r))))))
+    (let ((idx (cmp cx "add" (v-expr (splat-lanes cx it i)) (iota r) it)) (len (len-of cx r arr)))
+      (let ((ok (cmp cx "icmp ult" (v-expr idx) (v-expr (splat-lanes cx it len)) (mask-t r))))
+        (cmp cx "and" (v-expr m) (v-expr (cmp cx "xor" (v-expr ok) (vconst (mask-t r) (nx/integer lt/ty-i1 1)) (mask-t r))) (mask-t r))))))
 
-(defun check-masked :private (cx: LowerCx r: SArr arr: str i: V m: V msg: str) -> unit
+(defun check-masked :private (cx: LowerCx r: SArr arr: la/LExpr i: V m: V msg: str) -> unit
   (let ((bad (bad-lanes cx r arr i m)))
-    (lcx-trap-if cx (val cx (str-join ["(reduce-or " (v-text bad) ")"]) LirI1) msg)))
+    (lcx-trap-if cx (val cx (nx/intrinsic "reduce-or" 0 nil [(v-expr bad)] nil) LirI1) msg)))
 
 ;; The mask of the lanes of a tail: lane k is active when k < len - i (after the check 0 <= i <= len).
-(defun tail-mask :private (cx: LowerCx r: SArr arr: str i: V msg: str) -> V
+(defun tail-mask :private (cx: LowerCx r: SArr arr: la/LExpr i: V msg: str) -> V
   (do (check-span cx r arr i 0 msg)
-      (let ((it (LirVec LirI64 (lanes-t r))) (rem (cmp cx "sub" (v-text (len-of cx r arr)) (v-text i) LirI64)))
-        (cmp cx "icmp slt" (iota r) (v-text (splat-lanes cx it rem)) (mask-t r)))))
+      (let ((it (LirVec LirI64 (lanes-t r))) (rem (cmp cx "sub" (v-expr (len-of cx r arr)) (v-expr i) LirI64)))
+        (cmp cx "icmp slt" (iota r) (v-expr (splat-lanes cx it rem)) (mask-t r)))))
 
-(defun zero-vec :private (r: SArr) -> str (str-join ["(zeroinitializer " (lir-ty-text (. r vt)) ")"]))
+(defun zero-vec :private (r: SArr) -> la/LExpr (nx/zero (lir-type (. r vt))))
 
-(defun al :private (r: SArr) -> str (str-join ["(align " (str (. r align)) ")"]))
+(defun al :private (r: SArr) -> (Option i64) (some (. r align)))
 
-(defun load-at :private (cx: LowerCx r: SArr arr: str i: V name: str a: (Vec V)) -> V
-  (let ((vt (lir-ty-text (. r vt))) (p (elem-ptr cx r arr i)))
-    (cond (= name "simd-load") (do (check-span cx r arr i (lanes-t r) "simd-load: lanes out of range of the array")
-                                   (val cx (str-join ["(load " (al r) " " vt " " p ")"]) (. r vt)))
-          (= name "simd-load-unchecked") (val cx (str-join ["(load " (al r) " " vt " " p ")"]) (. r vt))
+(defun load-at :private (cx: LowerCx r: SArr arr: la/LExpr i: V name: str a: (Vec V)) -> V
+  (let ((vt (lir-type (. r vt))) (p (elem-ptr cx r arr i)))
+    (cond (= name "simd-load")
+          (do (check-span cx r arr i (lanes-t r) "simd-load: lanes out of range of the array")
+              (val cx (nx/load vt p (al r)) (. r vt)))
+          (= name "simd-load-unchecked") (val cx (nx/load vt p (al r)) (. r vt))
           (= name "simd-load-masked")
-            (do (check-masked cx r arr i (nth a 2) "simd-load-masked: an active lane is out of range of the array")
-                (val cx (str-join ["(masked-load " vt " " p " " (v-text (nth a 2)) " " (v-text (nth a 3)) " " (al r) ")"]) (. r vt)))
+          (do (check-masked cx r arr i (nth a 2) "simd-load-masked: an active lane is out of range of the array")
+              (val cx (nx/intrinsic "masked-load" 0 (some vt) [p (v-expr (nth a 2)) (v-expr (nth a 3))] (al r)) (. r vt)))
           :else (let ((m (tail-mask cx r arr i "simd-load-tail: index out of range of the array")))
-                  (val cx (str-join ["(masked-load " vt " " p " " (v-text m) " " (zero-vec r) " " (al r) ")"]) (. r vt))))))
+                  (val cx (nx/intrinsic "masked-load" 0 (some vt) [p (v-expr m) (zero-vec r)] (al r)) (. r vt))))))
 
 
 ;; ---- stores
@@ -86,31 +89,31 @@
 ;; scalars, so the copy retains nothing. Returns the array now in the cell.
 (defun own-array :private (cx: LowerCx r: SArr cell-ty: Ty arr-ty: Ty cell: V) -> (Result V str)
   (try-let ((co (program-object (. cx p) cell-ty)))
-    (let ((cell-s (. co snd)) (c (v-text cell)))
+    (let ((cell-s (. co snd)) (c (v-expr cell)))
       (try-let ((content ((. (. cx hub) cell-load) cx cell-s c arr-ty)))
         (let ((b (. cx b))
-              (ok (fb-val b (str-join ["(call @fib.unique? " (v-text content) ")"]) LirI1))
+              (ok (fb-val b (nx/call "fib.unique?" [(v-expr content)]) LirI1))
               (lc (fb-label b "scopy")) (lj (fb-label b "sowned")))
-          (do (fb-term b (str-join ["(br " (v-text ok) " " lj " " lc ")"]))
+          (do (fb-term b (nx/conditional (v-expr ok) lj lc))
               (fb-open b lc)
-              (let ((copy (fb-val b (str-join ["(call @fib.array-slice " (v-text content) " (i64 0) " (v-text (len-of cx r (v-text content)))
-                                               " (i32 " (str (. r tid)) ") (i64 " (str (. r esize)) "))"]) LirPtr)))
+              (let ((copy (fb-val b (nx/call "fib.array-slice" [(v-expr content) (nx/integer lt/ty-i64 0) (v-expr (len-of cx r (v-expr content))) (nx/integer lt/ty-i32 (. r tid)) (nx/integer lt/ty-i64 (. r esize))]) LirPtr)))
                 (do (lcx-store cx copy (lcx-gep cx cell-s c slot-cell-value))
                     (lcx-release cx content)
-                    (fb-term b (str-join ["(br " lj ")"]))))
+                    (fb-term b (nx/branch lj))))
               (fb-open b lj)
               ((. (. cx hub) cell-load) cx cell-s c arr-ty)))))))
 
-(defun store-at :private (cx: LowerCx r: SArr arr: str i: V name: str a: (Vec V)) -> unit
-  (let ((v (v-text (nth a 2))) (p (elem-ptr cx r arr i)))
-    (cond (= name "simd-store!") (do (check-span cx r arr i (lanes-t r) "simd-store!: lanes out of range of the array")
-                                     (fb-stmt (. cx b) (str-join ["(store " (al r) " " v " " p ")"])))
-          (= name "simd-store-unchecked!") (fb-stmt (. cx b) (str-join ["(store " (al r) " " v " " p ")"]))
+(defun store-at :private (cx: LowerCx r: SArr arr: la/LExpr i: V name: str a: (Vec V)) -> unit
+  (let ((v (v-expr (nth a 2))) (p (elem-ptr cx r arr i)))
+    (cond (= name "simd-store!")
+          (do (check-span cx r arr i (lanes-t r) "simd-store!: lanes out of range of the array")
+              (fb-stmt (. cx b) (nx/store v p (al r))))
+          (= name "simd-store-unchecked!") (fb-stmt (. cx b) (nx/store v p (al r)))
           (= name "simd-store-masked!")
-            (do (check-masked cx r arr i (nth a 3) "simd-store-masked!: an active lane is out of range of the array")
-                (fb-stmt (. cx b) (str-join ["(masked-store " v " " p " " (v-text (nth a 3)) " " (al r) ")"])))
+          (do (check-masked cx r arr i (nth a 3) "simd-store-masked!: an active lane is out of range of the array")
+              (fb-stmt (. cx b) (nx/intrinsic "masked-store" 0 nil [v p (v-expr (nth a 3))] (al r))))
           :else (let ((m (tail-mask cx r arr i "simd-store-tail!: index out of range of the array")))
-                  (fb-stmt (. cx b) (str-join ["(masked-store " v " " p " " (v-text m) " " (al r) ")"]))))))
+                  (fb-stmt (. cx b) (nx/intrinsic "masked-store" 0 nil [v p (v-expr m)] (al r)))))))
 
 (defun simd-mem-name? (name: str) -> bool
   (contains? (set ["simd-load" "simd-load-unchecked" "simd-load-masked" "simd-load-tail"
@@ -126,10 +129,10 @@
               (match (nth tys 0)
                 ((TCon (KCell) args)
                  (try-let ((r (simd-arr cx (nth args 0) (nth tys 2))) (arr (own-array cx r (nth tys 0) (nth args 0) (nth a 0))))
-                   (do (store-at cx r (v-text arr) (nth a 1) name a) (Ok VUnit))))
+                   (do (store-at cx r (v-expr arr) (nth a 1) name a) (Ok VUnit))))
                 (_ (Err (str-join [name " on a non-cell"]))))
               (try-let ((vt (lcx-ty cx e)) (r (simd-arr cx (nth tys 0) vt)))
-                (Ok (load-at cx r (v-text (nth a 0)) (nth a 1) name a))))
+                (Ok (load-at cx r (v-expr (nth a 0)) (nth a 1) name a))))
         (= name "simd/convert") (try-let ((t (lcx-ty cx e)) (l (program-lir (. cx p) t)))
                                   (match l ((some lt) (lcx-simd-convert cx (nth a 0) lt)) (nil (Err "simd/convert to unit"))))
         (= name "simd/bitcast") (try-let ((t (lcx-ty cx e)) (l (program-lir (. cx p) t)))
@@ -148,8 +151,8 @@
   (if (= name "load-simd")
       (try-let ((vt (lcx-ty cx e)) (l (program-lir (. cx p) vt)))
         (match l
-          ((some lt) (Ok (val cx (str-join ["(load (align 1) " (lir-ty-text lt) " " (v-text (nth a 0)) ")"]) lt)))
+          ((some lt) (Ok (val cx (nx/load (lir-type lt) (v-expr (nth a 0)) (some 1)) lt)))
           (nil (Err "load-simd of unit"))))
-    (do (fb-stmt (. cx b) (str-join ["(store (align 1) " (v-text (nth a 1)) " " (v-text (nth a 0)) ")"])) (Ok VUnit))))
+    (do (fb-stmt (. cx b) (nx/store (v-expr (nth a 1)) (v-expr (nth a 0)) (some 1))) (Ok VUnit))))
 
 (defun simd-extra-name? (name: str) -> bool (or (simd-mem-name? name) (simd-fn-name? name) (simd-ptr-name? name)))

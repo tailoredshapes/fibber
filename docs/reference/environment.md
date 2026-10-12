@@ -13,14 +13,14 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_ALLOC_STATS` | [rt/alloc.lir:344](../../rt/alloc.lir#L344) |
 | `FIB_ALLOW_PLAIN_TAIL_CALLS` | [compiler/driver/viac.fib:46](../../compiler/driver/viac.fib#L46) |
 | `FIB_ALLOW_UNSUPPORTED` | [compiler/driver/commands.fib:59](../../compiler/driver/commands.fib#L59) |
-| `FIB_AST_VERIFY` | [compiler/emit/defs/astmod.fib:28](../../compiler/emit/defs/astmod.fib#L28) |
+| `FIB_AST_VERIFY` | [compiler/emit/defs/astmod.fib:10](../../compiler/emit/defs/astmod.fib#L10) |
 | `FIB_CATCH` | [compiler/emit/program.fib:41](../../compiler/emit/program.fib#L41) |
 | `FIB_CC` | [compiler/driver/viac.fib:24](../../compiler/driver/viac.fib#L24) |
 | `FIB_CC_KEEP` | [compiler/driver/viac.fib:123](../../compiler/driver/viac.fib#L123) |
 | `FIB_CC_VERBOSE` | [compiler/driver/viac.fib:99](../../compiler/driver/viac.fib#L99) |
 | `FIB_C_LINES` | [compiler/driver/viac.fib:47](../../compiler/driver/viac.fib#L47) |
 | `FIB_EMIT_EXE` | [compiler/driver/commands.fib:14](../../compiler/driver/commands.fib#L14) |
-| `FIB_EXPORTS` | [compiler/emit/compile.fib:124](../../compiler/emit/compile.fib#L124) |
+| `FIB_EXPORTS` | [compiler/emit/compile.fib:128](../../compiler/emit/compile.fib#L128) |
 | `FIB_JS_ARGV0` | [compiler/lir2js.fib:60](../../compiler/lir2js.fib#L60) |
 | `FIB_JS_RT` | [compiler/lir2js.fib:46](../../compiler/lir2js.fib#L46) |
 | `FIB_JS_UNLINK` | [compiler/lir2js.fib:59](../../compiler/lir2js.fib#L59) |
@@ -46,8 +46,8 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LSP_ISOLATE` | [compiler/lsp/server.fib:43](../../compiler/lsp/server.fib#L43) |
 | `FIB_MUSL_DIR` | [compiler/native/linkstatic.fib:66](../../compiler/native/linkstatic.fib#L66) |
 | `FIB_NO_PROJECT` | [compiler/fibc.fib:90](../../compiler/fibc.fib#L90) |
-| `FIB_PRUNE` | [compiler/emit/compile.fib:77](../../compiler/emit/compile.fib#L77) |
-| `FIB_RESULT_STDOUT` | [compiler/emit/compile.fib:22](../../compiler/emit/compile.fib#L22) |
+| `FIB_PRUNE` | [compiler/emit/compile.fib:82](../../compiler/emit/compile.fib#L82) |
+| `FIB_RESULT_STDOUT` | [compiler/emit/compile.fib:26](../../compiler/emit/compile.fib#L26) |
 | `FIB_SCHED_SKIP` | [rt/sched.lir:143](../../rt/sched.lir#L143) |
 | `FIB_SPIN` | [rt/sched.lir:142](../../rt/sched.lir#L142) |
 | `FIB_SPINNERS` | [rt/sched.lir:163](../../rt/sched.lir#L163) |

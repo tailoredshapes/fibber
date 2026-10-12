@@ -11,7 +11,8 @@
 ;; A window that was not registered (a parameter of a kernel) loads the two fields at the access.
 (ns emit.lower.window
   (:use types.ty types.ast types.decls own.program emit.value emit.layout emit.ir emit.objects emit.program emit.lower.cx emit.lower.ops
-        emit.lower.objects))
+        emit.lower.objects)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; Whether `t` is a window type of the library `fib.view`.
 (defun window-ty? (cx: LowerCx t: Ty) -> bool
@@ -25,48 +26,48 @@
 ;; The base address and the length of the window `w` of type `t`, read from its object.
 (defun window-fields :private (cx: LowerCx t: Ty w: V) -> (Result (Pair V V) str)
   (try-let ((o (lcx-object-of cx t)) (bf (field-at cx t "window" "base")) (lf (field-at cx t "window" "len")))
-    (Ok (Pair (lcx-load cx LirRaw (lcx-gep cx (. o sname) (v-text w) (. bf slot)))
-              (lcx-load cx LirI64 (lcx-gep cx (. o sname) (v-text w) (. lf slot)))))))
+    (Ok (Pair (lcx-load cx LirRaw (lcx-gep cx (. o sname) (v-expr w) (. bf slot)))
+              (lcx-load cx LirI64 (lcx-gep cx (. o sname) (v-expr w) (. lf slot)))))))
 
 ;; The window `w` has just been made and stored in the cell `cell` (a cell of type `(Cell t)`): its two fields are read once, kept under the
 ;; window's address, and a read of the cell's content is the window itself (the table of a hoisted array, emit.lower.hoist, is the same
 ;; shape: a cell's text to its content, the content's text to what is known of it).
 (defun window-register (cx: LowerCx t: Ty cell: V w: V) -> (Result unit str)
   (try-let ((fl (window-fields cx t w)))
-    (do (set! (. cx hoisted) (assoc @(. cx hoisted) (v-text w) fl))
-        (set! (. cx hoisted) (assoc @(. cx hoisted) (v-text cell) (Pair w w)))
+    (do (set! (. cx hoisted) (assoc @(. cx hoisted) (nx/operand-name (v-expr w)) fl))
+        (set! (. cx hoisted) (assoc @(. cx hoisted) (nx/operand-name (v-expr cell)) (Pair w w)))
         (Ok ()))))
 
 ;; The base and length of `w`: the registered ones, else read now.
 (defun window-regs :private (cx: LowerCx t: Ty w: V) -> (Result (Pair V V) str)
-  (match (get @(. cx hoisted) (v-text w))
+  (match (get @(. cx hoisted) (nx/operand-name (v-expr w)))
     ((some h) (Ok h))
     (nil (window-fields cx t w))))
 
 ;; The window in a cell: the registered content, else a load of the cell's slot.
 (defun window-of-cell :private (cx: LowerCx cell-ty: Ty cell: V) -> (Result V str)
-  (match (get @(. cx hoisted) (v-text cell))
+  (match (get @(. cx hoisted) (nx/operand-name (v-expr cell)))
     ((some h) (Ok (. h fst)))
-    (nil (try-let ((o (lcx-object-of cx cell-ty))) (Ok (lcx-load cx LirPtr (lcx-gep cx (. o sname) (v-text cell) slot-cell-value)))))))
+    (nil (try-let ((o (lcx-object-of cx cell-ty))) (Ok (lcx-load cx LirPtr (lcx-gep cx (. o sname) (v-expr cell) slot-cell-value)))))))
 
 ;; The index is below the length as an unsigned number (so a negative index fails too), else the library's own failure runs (and, were it
 ;; ever to return, the runtime's trap: an access that failed the compare is never made).
 (defun window-check :private (cx: LowerCx i: V n: V slow: (fn () (Result V str))) -> (Result unit str)
   (let ((b (. cx b))
-        (ok (fb-val (. cx b) (str-join ["(icmp ult " (v-text i) " " (v-text n) ")"]) LirI1))
+        (ok (fb-val (. cx b) (nx/compare-int la/IUlt (v-expr i) (v-expr n)) LirI1))
         (lo (fb-label (. cx b) "winb")) (lt (fb-label (. cx b) "wino")))
-    (do (fb-term b (str-join ["(br " (v-text ok) " " lo " " lt ")"]))
+    (do (fb-term b (nx/conditional (v-expr ok) lo lt))
         (fb-open b lt)
         (try-let ((c (slow)))
-          (do (fb-stmt b (str-join ["(call @fib.trap-index " (v-text i) " " (v-text n) ")"]))   ; the library's call traps; if it did not, this does
-              (fb-term b "(unreachable)")
+          (do (fb-stmt b (nx/call "fib.trap-index" [(v-expr i) (v-expr n)]))   ; the library's call traps; if it did not, this does
+              (fb-term b (nx/unreachable))
               (fb-open b lo)
               (Ok ()))))))
 
 ;; The address of element `i` of 4- or 8-byte elements from `base`.
-(defun window-addr :private (cx: LowerCx base: V i: V width: i64) -> str
-  (let ((off (fb-val (. cx b) (str-join ["(mul " (v-text i) " (i64 " (str width) "))"]) LirI64)))
-    (v-text (fb-val (. cx b) (str-join ["(getelementptr i8 " (v-text base) " " (v-text off) ")"]) LirRaw))))
+(defun window-addr :private (cx: LowerCx base: V i: V width: i64) -> la/LExpr
+  (let ((off (fb-val (. cx b) (nx/binary la/BMul (v-expr i) (nx/integer lt/ty-i64 width)) LirI64)))
+    (v-expr (fb-val (. cx b) (nx/gep lt/ty-i8 (v-expr base) [(v-expr off)]) LirRaw))))
 
 ;; The element types the library's `ViewElem` has an instance for and a lane of 4 or 8 bytes: the ones lowered here.
 (defun window-elem? :private (l: (Option LirTy)) -> bool

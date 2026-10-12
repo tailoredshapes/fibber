@@ -1,0 +1,68 @@
+;; Structural expression rewrites. Operator flags, types, positions, callees
+;; and control-flow labels are carried through explicitly.
+(ns lir.rewrite (:use lir.ast lir.types))
+
+(defun map-binding :private (b: LBinding f: (fn (LExpr) LExpr)) -> LBinding
+  (LBinding (. b name) (f (. b value)) (. b pos)))
+
+(defun map-case :private (c: LCase f: (fn (LExpr) LExpr)) -> LCase
+  (LCase (f (. c value)) (. c label)))
+
+(defun map-callee :private (c: LCallee f: (fn (LExpr) LExpr)) -> LCallee
+  (match c ((CalDirect _) c) ((CalIndirect p ty) (CalIndirect (f p) ty))))
+
+(defun map-optional :private (e: (Option LExpr) f: (fn (LExpr) LExpr)) -> (Option LExpr)
+  (match e ((some x) (some (f x))) (nil nil)))
+
+(defun map-children (e: LExpr f: (fn (LExpr) LExpr)) -> LExpr
+  (let ((kind (map-values (. e kind) f)))
+    (LExpr kind (. e pos))))
+
+(defun map-values :private (k: LKind f: (fn (LExpr) LExpr)) -> LKind
+  (match k
+    ((KVector ty es) (KVector ty (mapv f es)))
+    ((KStruct name es) (KStruct name (mapv f es)))
+    ((KArray ty es) (KArray ty (mapv f es)))
+    ((KUn op a) (KUn op (f a)))
+    ((KCast op ty a) (KCast op ty (f a)))
+    ((KExtractValue a ix) (KExtractValue (f a) ix))
+    ((KRet v) (KRet (map-optional v f)))
+    ((KCondBr c yes no) (KCondBr (f c) yes no))
+    ((KAlloca ty count align) (KAlloca ty (map-optional count f) align))
+    ((KBin op a b) (KBin op (f a) (f b)))
+    ((KOverflow op a b) (KOverflow op (f a) (f b)))
+    ((KICmp pred a b) (KICmp pred (f a) (f b)))
+    ((KFCmp pred a b) (KFCmp pred (f a) (f b)))
+    ((KExtractElement a b) (KExtractElement (f a) (f b)))
+    ((KInsertValue a b ix) (KInsertValue (f a) (f b) ix))
+    ((KSelect a b c) (KSelect (f a) (f b) (f c)))
+    ((KInsertElement a b c) (KInsertElement (f a) (f b) (f c)))
+    ((KShuffle a b c) (KShuffle (f a) (f b) (f c)))
+    (_ (map-memory k f))))
+
+(defun map-memory :private (k: LKind f: (fn (LExpr) LExpr)) -> LKind
+  (match k
+    ((KLoad ty p vol align) (KLoad ty (f p) vol align))
+    ((KStore v p vol align) (KStore (f v) (f p) vol align))
+    ((KGep inbounds ty p ix) (KGep inbounds ty (f p) (mapv f ix)))
+    ((KAtomicLoad scope order ty p) (KAtomicLoad scope order ty (f p)))
+    ((KAtomicStore scope order v p) (KAtomicStore scope order (f v) (f p)))
+    ((KAtomicRmw op scope order p v) (KAtomicRmw op scope order (f p) (f v)))
+    ((KCmpXchg weak scope success failure p old new)
+     (KCmpXchg weak scope success failure (f p) (f old) (f new)))
+    ((KIntrin name flags ty args align) (KIntrin name flags ty (mapv f args) align))
+    ((KCall callee args tail) (KCall (map-callee callee f) (mapv f args) tail))
+    ((KSwitch v default cases) (KSwitch (f v) default (mapv (fn (c: LCase) (map-case c f)) cases)))
+    ((KPhi ty edges) (KPhi ty (mapv (fn (b: LBinding) (map-binding b f)) edges)))
+    ((KLet binds body) (KLet (mapv (fn (b: LBinding) (map-binding b f)) binds) (mapv f body)))
+    (_ k)))
+
+;; Replace local operands only. A quoted string, a global, a direct callee,
+;; a binding name or a CFG label is never mistaken for a local operand.
+(defun substitute-locals (e: LExpr names: (Map str str)) -> LExpr
+  (match (. e kind)
+    ((KLocal name)
+     (match (get names name)
+       ((some replacement) (LExpr (KLocal replacement) (. e pos)))
+       (nil e)))
+    (_ (map-children e (fn (child: LExpr) (substitute-locals child names))))))

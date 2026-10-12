@@ -1,0 +1,41 @@
+;; Structural assertions for emitted external LIR. Every counted operation is
+;; an AST node; quoted text and physical line layout cannot affect the counts.
+(ns main (:use lir.ast)
+  (:require [lir.parse :as parse] [lir.diag :as diag] [lir.check.walk :as walk]))
+
+(defun count-expr (expr: LExpr predicate: (fn (LExpr) bool)) -> i64
+  (+ (if (predicate expr) 1 0)
+     (reduce (fn (total: i64 child: LExpr) (+ total (count-expr child predicate))) 0 (walk/children expr))))
+(defun count-block (block: LBlock predicate: (fn (LExpr) bool)) -> i64
+  (reduce (fn (total: i64 expr: LExpr) (+ total (count-expr expr predicate))) 0 (. block body)))
+(defun count-function (func: LFunction predicate: (fn (LExpr) bool)) -> i64
+  (reduce (fn (total: i64 block: LBlock) (+ total (count-block block predicate))) 0 (. func blocks)))
+(defun call? (expr: LExpr name: str) -> bool
+  (match (. expr kind) ((KCall (CalDirect callee) _ _) (= callee name)) (_ false)))
+(defun count-operation? (expr: LExpr) -> bool (or (call? expr "fib.retain") (call? expr "fib.release")))
+(defun window-call? (expr: LExpr) -> bool
+  (match (. expr kind) ((KCall (CalDirect name) _ _) (starts-with? name "f.fib.view.win-")) (_ false)))
+(defun loop-block? (label: str) -> bool
+  (some? (find-first (fn (prefix: str) (starts-with? label prefix)) ["then" "loop" "winb" "wino" "ok"])))
+(defun check-windows (func: LFunction) -> i64
+  (let ((cells (count-function func (fn (expr: LExpr) (call? expr "fib.stack-init"))))
+        (bounds (count-function func (fn (expr: LExpr) (match (. expr kind) ((KICmp (IUlt) _ _) true) (_ false)))))
+        (stray (reduce (fn (total: i64 block: LBlock)
+                        (+ total (if (starts-with? (. block label) "wino") 0 (count-block block window-call?)))) 0 (. func blocks)))
+        (counts (reduce (fn (total: i64 block: LBlock)
+                         (+ total (if (loop-block? (. block label)) (count-block block count-operation?) 0))) 0 (. func blocks))))
+    (do (println (str "windows: " cells " stack cells, " bounds " unsigned bound checks, " stray " calls outside failure blocks, " counts " count operations in loop blocks"))
+        (if (and (= cells 2) (>= bounds 2) (= stray 0) (= counts 0)) 0 1))))
+(defun inspect (mode: str path: str name: str) -> (Result i64 str)
+  (try-let ((source (match (read-file path) ((some source) (Ok source)) (nil (Err (str "cannot read " path)))))
+            (module (match (parse/parse-source source) ((Ok module) (Ok module)) ((Err error) (Err (diag/diag-str error)))))
+            (func (match (first (keep (fn (item: LItem) (match item ((ItDefine func) (if (= (. func name) name) (some func) nil)) (_ nil))) (. module items)))
+                    ((some func) (Ok func)) (nil (Err (str "no emitted function " name))))))
+    (cond (= mode "counts") (do (println (count-function func count-operation?)) (Ok 0))
+          (= mode "windows") (Ok (check-windows func))
+          :else (Err (str "unknown inspection " mode)))))
+(defun main () -> i64
+  (let ((words (vec (args))))
+    (if (not (= (count words) 3)) (do (eprintln "usage: inspect counts|windows INPUT.lir FUNCTION") 2)
+        (match (inspect (nth words 0) (nth words 1) (nth words 2))
+          ((Ok code) code) ((Err message) (do (eprintln message) 2))))))

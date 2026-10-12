@@ -4,7 +4,7 @@
 ;; server's: the library's expansion is done once per session. It is a development tool, not a specification oracle (ADR 0005).
 (ns serve.repl
   (:require [serve.replcore :as rc] [serve.incr :as inc] [serve.line :as ln] [serve.sock :as sk] [serve.diag :as dg] [driver.native :as native]
-            [expand.roots :as roots] [fib.string :as s]))
+            [expand.roots :as roots] [fib.string :as s] [emit.compile :as ec]))
 
 (defstruct Repl (sess: rc/Session eng: inc/Engine rts: roots/Roots ed: ln/Editor echo: bool))
 
@@ -21,11 +21,11 @@ a redefinition replaces the earlier definition and is refused, with the dependen
 ;; ---- running
 
 ;; Runs `lir` in a process of its own, standard streams the terminal's; its status.
-(defun run-here (file: str lir: str) -> i64
+(defun run-here (file: str lir: ec/Emitted) -> i64
   (let ((pid (sk/fork-process)))
     (cond (< pid 0) -1
           (= pid 0) (do (sk/default-interrupt) (sk/no-core)
-                        (match (native/run-lir file lir 0 (vec-empty))
+                        (match (native/run-module file (. lir ast) 0 (vec-empty))
                           ((Ok code) (sk/exit-flush code))
                           ((Err m) (do (eprintln (str "compile failed: " m)) (sk/exit-flush 5))))
                         0)

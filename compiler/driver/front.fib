@@ -91,7 +91,7 @@
 
 ;; The front end and the lowering: the lIR text of `file` (of an executable when `executable`), or the exit status that says why
 ;; not, its message already printed. The lowering's warnings (types.decls `warnings`: simd/fma without FMA) go to standard error first. Rust: main.rs:47 `lower_kind`
-(defun lower-kind (file: str roots: Roots rm: mk/RunnerMaker executable: bool) -> (Result str i64)
+(defun lower-module (file: str roots: Roots rm: mk/RunnerMaker executable: bool) -> (Result ec/Emitted i64)
   (match (check-file-timed file roots rm)
     ((Err code) (Err code))
     ((Ok c)
@@ -106,8 +106,12 @@
     (do (when (= (sys-getenv "FIB_TIME") (some "1"))
           (eprintln (str "time front " (quot (- (sys-clock-now) t) 1000000) " ms"))) r)))
 
-(defun compile-timed :private (c: Checked executable: bool) -> (Result str str)
+(defun compile-timed :private (c: Checked executable: bool) -> (Result ec/Emitted str)
   (let ((t (sys-clock-now))
-        (r (if executable (ec/compile-executable (. c typed) (. c owned)) (ec/compile (. c typed) (. c owned)))))
+        (r (if executable (ec/compile-executable-ast (. c typed) (. c owned)) (ec/compile-ast (. c typed) (. c owned)))))
     (do (when (= (sys-getenv "FIB_TIME") (some "1"))
           (eprintln (str "time lir.emit " (quot (- (sys-clock-now) t) 1000000) " ms"))) r)))
+
+;; Source text is produced only for tools that explicitly request a serialization.
+(defun lower-kind (file: str roots: Roots rm: mk/RunnerMaker executable: bool) -> (Result str i64)
+  (try-let ((m (lower-module file roots rm executable))) (Ok (ec/emitted-text m))))

@@ -13,16 +13,17 @@
 ;; `hub-default` in emit.lower.mod (the only constructor). A context for a generated body (a wrapper, a vtable function) is
 ;; `lcx-sub` of the context it is made in: it keeps the hub.
 (ns emit.lower.cx
-  (:use syntax.pos types.ty types.decls types.table types.program types.ast types.init own.program emit.value emit.layout emit.ir emit.mono emit.program))
+  (:use syntax.pos types.ty types.decls types.table types.program types.ast types.init own.program emit.value emit.layout emit.ir emit.mono emit.program)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; What an expression yielded: a value, or a jump (the block ended). Rust: lower/mod.rs:38 Flow
 (defenum Flow (FlowVal v: V) FlowJump)
 
 ;; A local: a value, or a stack slot and its type. Rust: lower/mod.rs:47 Local
-(defenum Local (LocalVal v: V) (LocalSlot name: str ty: (Option LirTy)))
+(defenum Local (LocalVal v: V) (LocalSlot name: la/LExpr ty: (Option LirTy)))
 
 ;; One loop variable. Rust: lower/mod.rs:54 `(BindingId, String, Option<LirTy>)`
-(defstruct LoopVar (binding: i64 name: str ty: (Option LirTy)))
+(defstruct LoopVar (binding: i64 name: la/LExpr ty: (Option LirTy)))
 ;; An enclosing loop. Rust: lower/mod.rs:54 LoopCx
 (defstruct LoopCx (vars: (Vec LoopVar) head: str))
 
@@ -41,7 +42,7 @@
 ;; What a call goes to. Rust: lower/call.rs:18 Target
 (defenum Target
   (TgDirect name: str env: bool) (TgValue v: V) (TgBuiltin name: str) (TgNative proto: str method: str)
-  (TgCtor type: i64 variant: (Option i64)) (TgCode code: str this: str) (TgExtern name: str))
+  (TgCtor type: i64 variant: (Option i64)) (TgCode code: la/LExpr this: la/LExpr) (TgExtern name: str))
 
 ;; The functions a lowering module calls upward, filled by emit.lower.mod (see the header). The Rust names are the methods
 ;; `expr` (lower/mod.rs:333), `method_value` (values.rs:29) and `builtin_value` (values.rs:73).
@@ -49,17 +50,17 @@
   (expr: (fn (LowerCx Expr) (Result Flow str))
    method-value: (fn (LowerCx Expr i64 i64) (Result V str))
    builtin-value: (fn (LowerCx Expr i64) (Result V str))
-   cell-load: (fn (LowerCx str str Ty) (Result V str))
+   cell-load: (fn (LowerCx str la/LExpr Ty) (Result V str))
    emit-call: (fn (LowerCx Target (Vec V) Ty bool) (Result V str))
    join-value: (fn (LowerCx V Ty) (Result V str))
    instance-of-pred: (fn (LowerCx Pred) (Result (Pair i64 (Vec Ty)) str))
-   unwind: (fn (LowerCx str) unit)))
+   unwind: (fn (LowerCx la/LExpr) unit)))
 
 ;; The context of one function. Rust: lower/mod.rs:60 Cx (15 fields, and the hub)
 (defstruct LowerCx
   (p: Program inst: Inst own: BodyOwn name: str b: FnBuilder
    locals: (Cell (Map i64 Local)) values: (Cell (Map i64 V)) value-sites: (Set i64)
-   env: (Cell (Option V)) loops: (Cell (Vec LoopCx)) stack-slots: (Cell (Map i64 str))
+   env: (Cell (Option V)) loops: (Cell (Vec LoopCx)) stack-slots: (Cell (Map i64 la/LExpr))
    lits: (Map i64 Expr) rests: (Cell (Vec RestSlot)) closure-slots: (Cell (Set str))
    async-frame: (Cell (Option AsyncFrame)) hub: Hub
    at: (Cell (Option Expr)) origins: (Cell (Map i64 Origin))
@@ -141,7 +142,7 @@
 (defun lcx-local (cx: LowerCx b: i64) -> (Result V str)
   (match (get @(. cx locals) b)
     ((some (LocalVal v)) (Ok v))
-    ((some (LocalSlot slot (some t))) (Ok (fb-val (. cx b) (str-join ["(load " (lir-ty-text t) " " slot ")"]) t)))
+    ((some (LocalSlot slot (some t))) (Ok (fb-val (. cx b) (nx/load (lir-type t) slot nil) t)))
     ((some (LocalSlot _ nil)) (Ok VUnit))
     (nil (Err (str-join ["unbound local " (. (g-binding (program-g (. cx p)) b) name)])))))
 
@@ -157,13 +158,13 @@
       ((FlowVal v) (Ok v))
       ((FlowJump)
        (try-let ((t (lcx-ty cx e)) (l (program-lir (. cx p) t)))
-         (Ok (match l ((some x) (VVal (fb-fresh (. cx b)) x)) (nil VUnit))))))))
+         (Ok (match l ((some x) (v-local (fb-fresh (. cx b)) x)) (nil VUnit))))))))
 
 ;; The object word of a value: the pointer itself, or a `dyn`'s first word; `nil` for a scalar. Rust: lower/mod.rs:418 Cx::obj_word
-(defun lcx-obj-word (cx: LowerCx v: V) -> (Option str)
+(defun lcx-obj-word (cx: LowerCx v: V) -> (Option la/LExpr)
   (match v
     ((VVal s (LirPtr)) (some s))
-    ((VVal s (LirDyn)) (some (v-text (fb-val (. cx b) (str-join ["(extractvalue " s " 0)"]) LirPtr))))
+    ((VVal s (LirDyn)) (some (v-expr (fb-val (. cx b) (nx/extract s 0) LirPtr))))
     (_ nil)))
 
 ;; `text` as the body of an lIR string literal. Rust: lower/fault.rs:11 lir_text
@@ -177,13 +178,13 @@
 ;; A trap with a C-string message: the block ends here. In a macro module (`macro-module`) a trap fails the expansion through the
 ;; module's hook and carries the position of the expression being lowered (`at`). Rust: lower/fault.rs:18 Cx::trap_c
 (defun lcx-trap-c (cx: LowerCx msg: str) -> unit
-  (let ((plain (str-join ["(call @fib.trap-c (string \"" msg "\"))"])))
+  (let ((plain (nx/call "fib.trap-c" [(nx/string msg)])))
     (lcx-fail cx (match @(. cx at)
                    ((some e) (if @(. (. cx p) macro-module)
-                                 (str-join ["(call @fib.trap-at-c (string \"" (lir-text (pos-text (. e pos))) "\") (string \"" msg "\"))"])
+                                 (nx/call "fib.trap-at-c" [(nx/string (pos-text (. e pos))) (nx/string msg)])
                                  plain))
                    (nil plain))
-              (str-join ["(call @fib.raise-c (string \"" msg "\"))"]))))
+              (nx/call "fib.raise-c" [(nx/string msg)]))))
 
 ;; Runs `f` with failures fatal (a region that leaves something moved from).
 (defun fatal-while (cx: LowerCx f: (fn () (Result V str))) -> (Result V str)
@@ -197,32 +198,32 @@
   (and @(. (. cx b) unwind) (not @(. cx fatal)) (some? @(. cx unwind-ops))))
 
 ;; A trap: `plain` (a call that does not return) where it is not caught, else `raise` (a call giving the failure) and the unwinding.
-(defun lcx-fail (cx: LowerCx plain: str raise: str) -> unit
+(defun lcx-fail (cx: LowerCx plain: la/LExpr raise: la/LExpr) -> unit
   (if (lcx-catchable? cx)
-      ((. (. cx hub) unwind) cx (v-text (fb-val (. cx b) raise LirPtr)))
+      ((. (. cx hub) unwind) cx (v-expr (fb-val (. cx b) raise LirPtr)))
       (do (fb-stmt (. cx b) plain)
-          (fb-term (. cx b) "(unreachable)"))))
+          (fb-term (. cx b) (nx/unreachable)))))
 
 ;; `(getelementptr %struct.S p (i32 0) (i32 i))`. Rust: lower/mod.rs:439 Cx::gep
-(defun lcx-gep (cx: LowerCx sname: str p: str i: i64) -> str
-  (v-text (fb-val (. cx b) (str-join ["(getelementptr %struct." sname " " p " (i32 0) (i32 " (str i) "))"]) LirPtr)))
+(defun lcx-gep (cx: LowerCx sname: str p: la/LExpr i: i64) -> la/LExpr
+  (v-expr (fb-val (. cx b) (nx/gep (lt/TNamed sname) p [(nx/integer lt/ty-i32 0) (nx/integer lt/ty-i32 i)]) LirPtr)))
 
 ;; Rust: lower/mod.rs:449 Cx::load
-(defun lcx-load (cx: LowerCx t: LirTy ptr: str) -> V
-  (fb-val (. cx b) (str-join ["(load " (lir-align-text t) (lir-ty-text t) " " ptr ")"]) t))
+(defun lcx-load (cx: LowerCx t: LirTy ptr: la/LExpr) -> V
+  (fb-val (. cx b) (nx/load (lir-type t) ptr (lir-align t)) t))
 
 ;; Rust: lower/mod.rs:453 Cx::store
-(defun lcx-store (cx: LowerCx v: V ptr: str) -> unit
+(defun lcx-store (cx: LowerCx v: V ptr: la/LExpr) -> unit
   (match v
-    ((VVal s t) (fb-stmt (. cx b) (str-join ["(store " (lir-align-text t) s " " ptr ")"])))
+    ((VVal s t) (fb-stmt (. cx b) (nx/store s ptr (lir-align t))))
     (_ ())))
 
 ;; A call of a runtime function with these arguments (a `unit` argument is no text); a value of `ret`, or unit when there is none.
 ;; Here, not in emit.lower.builtins as the stub had it, because emit.lower.strfind calls it and builtins calls strfind (E8).
 ;; Rust: lower/builtins.rs:238 Cx::rt_call
 (defun lcx-rt-call (cx: LowerCx f: str a: (Vec V) ret: (Option LirTy)) -> V
-  (let ((texts (mapv v-text (filterv (fn (v: V) (match v ((VUnit) false) (_ true))) a)))
-        (instr (str-join ["(call @" f " " (str-join (vec (interpose " " texts))) ")"])))
+  (let ((texts (mapv v-expr (filterv (fn (v: V) (match v ((VUnit) false) (_ true))) a)))
+        (instr (nx/call f (into [] texts))))
     (match ret
       ((some t) (fb-val (. cx b) instr t))
       (nil (do (fb-stmt (. cx b) instr) VUnit)))))
@@ -230,7 +231,7 @@
 ;; Traps with `msg` when `c` holds; continues in a fresh block. Rust: arith.rs:200 LowerCx::trap_if
 (defun lcx-trap-if (cx: LowerCx c: V msg: str) -> unit
   (let ((lt (fb-label (. cx b) "trap")) (lk (fb-label (. cx b) "ok")))
-    (do (fb-term (. cx b) (str-join ["(br " (v-text c) " " lt " " lk ")"]))
+    (do (fb-term (. cx b) (nx/conditional (v-expr c) lt lk))
         (fb-open (. cx b) lt)
         (lcx-trap-c cx msg)
         (fb-open (. cx b) lk))))

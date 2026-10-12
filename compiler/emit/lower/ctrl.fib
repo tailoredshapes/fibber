@@ -3,7 +3,8 @@
 ;; that intern or emit is the Rust's: a label or a value asked for earlier shifts every later name of the function.
 (ns emit.lower.ctrl
   (:use types.ty types.ast types.init own.program emit.value emit.layout emit.ir emit.program emit.lower.cx emit.lower.ops
-        emit.lower.pattern))
+        emit.lower.pattern)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; Rust: lower/ctrl.rs:13 Cx::let_form
 (defun lcx-let-form (cx: LowerCx bs: (Vec LetBind) body: Expr) -> (Result Flow str)
@@ -30,7 +31,7 @@
       (try-let ((flow (lcx-expr cx body)))
         (match flow
           ((FlowVal v) (let ((at (fb-current (. cx b))))
-                         (do (fb-term (. cx b) (str-join ["(br " lj ")"]))
+                         (do (fb-term (. cx b) (nx/branch lj))
                              (Ok (some (Pair at v))))))
           ((FlowJump) (Ok nil))))))
 
@@ -55,7 +56,7 @@
 (defun lcx-if-both :private (cx: LowerCx e: Expr c: Expr t: Expr f: Expr) -> (Result Flow str)
   (try-let ((cv (lcx-value cx c)))
     (let ((lt (fb-label (. cx b) "then")) (lf (fb-label (. cx b) "else")) (lj (fb-label (. cx b) "join")))
-      (do (fb-term (. cx b) (str-join ["(br " (v-text cv) " " lt " " lf ")"]))
+      (do (fb-term (. cx b) (nx/conditional (v-expr cv) lt lf))
           (try-let ((rt (lcx-ty cx e)) (ty (program-lir (. cx p) rt))
                     (from-then (branch cx lt t lj)) (from-else (branch cx lf f lj)))
             (lcx-join-branches cx lj ty (vec (keep (fn (x: (Option (Pair str V))) x) [from-then from-else]))))))))
@@ -69,7 +70,7 @@
           (match ty
             (nil (Ok (FlowVal VUnit)))
             ((some t)
-             (Ok (FlowVal (fb-phi (. cx b) t (mapv (fn (p: (Pair str V)) (PhiEdge (. p fst) (v-text (. p snd)))) incoming)))))))))
+             (Ok (FlowVal (fb-phi (. cx b) t (mapv (fn (p: (Pair str V)) (PhiEdge (. p fst) (v-expr (. p snd)))) incoming)))))))))
 
 ;; The false edge of a clause's guard: the plan's operations for it, then on to the next clause.
 (defun guard-edge :private (cx: LowerCx guard: (Option Expr) next: str) -> (Result unit str)
@@ -78,10 +79,10 @@
     ((some g)
      (try-let ((gv (lcx-value cx g)))
        (let ((ok (fb-label (. cx b) "guard")) (fail (fb-label (. cx b) "gfail")))
-         (do (fb-term (. cx b) (str-join ["(br " (v-text gv) " " ok " " fail ")"]))
+         (do (fb-term (. cx b) (nx/conditional (v-expr gv) ok fail))
              (fb-open (. cx b) fail)
              (try-let ((ran (lcx-run-ops cx (unwrap-or (get (. (. cx own) guard-fail) (. g id)) []))))
-               (do (fb-term (. cx b) (str-join ["(br " next ")"]))
+               (do (fb-term (. cx b) (nx/branch next))
                    (fb-open (. cx b) ok)
                    (Ok ())))))))))
 
@@ -89,7 +90,7 @@
 (defun lcx-match-form (cx: LowerCx e: Expr s: Expr cls: (Vec Clause)) -> (Result Flow str)
   (try-let ((v (lcx-value cx s)) (st (lcx-ty cx s)) (rt (lcx-ty cx e)) (ty (program-lir (. cx p) rt)))
     (let ((lj (fb-label (. cx b) "mjoin")) (first-next (fb-label (. cx b) "clause")))
-      (do (fb-term (. cx b) (str-join ["(br " first-next ")"]))
+      (do (fb-term (. cx b) (nx/branch first-next))
           (loop ((i 0) (next first-next) (incoming []))
             (if (< i (count cls))
                 (let ((c (nth cls i)))
@@ -100,7 +101,7 @@
                           (recur (+ i 1) after
                                  (match bf
                                    ((FlowVal bv) (let ((at (fb-current (. cx b))))
-                                                   (do (fb-term (. cx b) (str-join ["(br " lj ")"]))
+                                                   (do (fb-term (. cx b) (nx/branch lj))
                                                        (conj incoming (Pair at bv)))))
                                    ((FlowJump) incoming)))))))
                 (do (fb-open (. cx b) next)
@@ -114,7 +115,7 @@
 (defun loop-var :private (cx: LowerCx lb: LoopBind) -> (Result LoopVar str)
   (try-let ((v (lcx-value cx (. lb init))))
     (let ((t (v-ty v)))
-      (let ((slot (fb-entry-alloca (. cx b) (match t ((some x) (lir-ty-text x)) (nil "i64"))
+      (let ((slot (fb-entry-alloca (. cx b) (match t ((some x) (lir-type x)) (nil lt/ty-i64))
                                    (match t ((some x) (. (size-align-pb (program-pb (. cx p)) x) fst)) (nil (program-pb (. cx p)))))))
         (do (lcx-store cx v slot)
             (set! (. cx locals) (assoc @(. cx locals) (. lb binding) (LocalSlot slot t)))
@@ -124,7 +125,7 @@
 (defun lcx-loop-form (cx: LowerCx e: Expr vs: (Vec LoopBind) body: Expr) -> (Result Flow str)
   (try-let ((vars (try-map (fn (lb: LoopBind) (loop-var cx lb)) vs)))
     (let ((head (fb-label (. cx b) "loop")))
-      (do (fb-term (. cx b) (str-join ["(br " head ")"]))
+      (do (fb-term (. cx b) (nx/branch head))
           (fb-open (. cx b) head)
           (set! (. cx loops) (conj @(. cx loops) (LoopCx vars head)))
           (let ((flow (lcx-expr cx body)))
@@ -151,5 +152,5 @@
          ((some lp)
           (do (doseq [i (range (min (count (. lp vars)) (count vals)))]
                 (lcx-store cx (nth vals i) (. (nth (. lp vars) i) name)))
-              (fb-term (. cx b) (str-join ["(br " (. lp head) ")"]))
+              (fb-term (. cx b) (nx/branch (. lp head)))
               (Ok FlowJump))))))))

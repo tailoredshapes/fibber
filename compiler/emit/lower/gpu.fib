@@ -8,7 +8,8 @@
 ;;   PTX `fibc build --kernel-target` made for the program's kernels (the file FIB_KERNEL_PTX names; "" without it, and on a kernel target).
 (ns emit.lower.gpu
   (:require [types.targets :as tt])
-  (:use types.ty types.ast emit.value emit.ir emit.program emit.statics emit.lower.cx))
+  (:use types.ty types.ast emit.value emit.ir emit.program emit.statics emit.lower.cx)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 (defun gpu-name? (name: str) -> bool
   (or (one-of name ["gpu/local-id" "gpu/group-id" "gpu/group-size" "gpu/num-groups" "gpu/global-id" "gpu/barrier" "gpu/shared" "gpu/select" "gpu/host-index-set!" "gpu/program-ptx" "gpu/subgroup-size" "gpu/lane-id" "gpu/ballot"])
@@ -33,35 +34,38 @@
 ;; `(sreg R.x)`, `.y` or `.z` by the dimension `d` (a select chain LLVM folds for a constant), as an i64.
 (defun sreg-by-dim :private (cx: LowerCx base: str d: V) -> V
   (let ((b (. cx b)))
-    (let ((x (fb-val b (str-join ["(sreg " base ".x)"]) LirI32))
-          (y (fb-val b (str-join ["(sreg " base ".y)"]) LirI32))
-          (z (fb-val b (str-join ["(sreg " base ".z)"]) LirI32)))
-      (let ((is0 (fb-val b (str-join ["(icmp eq " (v-text d) " (i64 0))"]) LirI1))
-            (is1 (fb-val b (str-join ["(icmp eq " (v-text d) " (i64 1))"]) LirI1)))
-        (let ((yz (fb-val b (str-join ["(select " (v-text is1) " " (v-text y) " " (v-text z) ")"]) LirI32)))
-          (let ((r (fb-val b (str-join ["(select " (v-text is0) " " (v-text x) " " (v-text yz) ")"]) LirI32)))
-            (fb-val b (str-join ["(sext i64 " (v-text r) ")"]) LirI64)))))))
+    (let ((x (fb-val b (nx/node (la/KSreg (str base ".x"))) LirI32))
+          (y (fb-val b (nx/node (la/KSreg (str base ".y"))) LirI32))
+          (z (fb-val b (nx/node (la/KSreg (str base ".z"))) LirI32)))
+      (let ((is0 (fb-val b (nx/compare-int la/IEq (v-expr d) (nx/integer lt/ty-i64 0)) LirI1))
+            (is1 (fb-val b (nx/compare-int la/IEq (v-expr d) (nx/integer lt/ty-i64 1)) LirI1)))
+        (let ((yz (fb-val b (nx/select (v-expr is1) (v-expr y) (v-expr z)) LirI32)))
+          (let ((r (fb-val b (nx/select (v-expr is0) (v-expr x) (v-expr yz)) LirI32)))
+            (fb-val b (nx/cast la/CSExt lt/ty-i64 (v-expr r)) LirI64)))))))
 
 ;; The host state, declared once: ids 0, sizes 1.
-(defun host-index-global :private (cx: LowerCx) -> str
-  (statics-item (. (. cx p) statics) "fib.gpu.host-index"
-                "(global internal fib.gpu.host-index [12 x i64] ([12 x i64] (i64 0) (i64 0) (i64 0) (i64 0) (i64 0) (i64 0) (i64 1) (i64 1) (i64 1) (i64 1) (i64 1) (i64 1)))\n"))
+(defun host-index-global :private (cx: LowerCx) -> la/LExpr
+  (let ((ty (lt/TArray 12 lt/ty-i64))
+        (values (mapv (fn (i: i64) (nx/integer lt/ty-i64 (if (< i 6) 0 1))) (range 12))))
+    (nx/reference (statics-item (. (. cx p) statics) "fib.gpu.host-index"
+      (la/ItGlobal (la/LGlobalDef "fib.gpu.host-index" ty (nx/array-value ty values) false
+                                 (la/LModifiers la/lk-internal false) 0 false))))))
 
 (defun host-slot :private (cx: LowerCx slot: i64 d: V) -> V
   (let ((g (host-index-global cx)) (b (. cx b)))
-    (let ((i (fb-val b (str-join ["(add " (v-text d) " (i64 " (str slot) "))"]) LirI64)))
-      (fb-val b (str-join ["(getelementptr i64 " g " " (v-text i) ")"]) LirPtr))))
+    (let ((i (fb-val b (nx/binary la/BAdd (v-expr d) (nx/integer lt/ty-i64 slot)) LirI64)))
+      (fb-val b (nx/gep lt/ty-i64 g [(v-expr i)]) LirPtr))))
 
 (defun index-read :private (cx: LowerCx name: str d: V) -> V
   (if (kernel-target?)
       (sreg-by-dim cx (sreg-base name) d)
-      (fb-val (. cx b) (str-join ["(load i64 " (v-text (host-slot cx (index-slot name) d)) ")"]) LirI64)))
+      (fb-val (. cx b) (nx/load lt/ty-i64 (v-expr (host-slot cx (index-slot name) d)) nil) LirI64)))
 
 ;; `group-id * group-size + local-id` along `d`, wrapping (a grid never reaches 2^63).
 (defun global-id :private (cx: LowerCx d: V) -> V
   (let ((g (index-read cx "gpu/group-id" d)) (n (index-read cx "gpu/group-size" d)) (l (index-read cx "gpu/local-id" d)))
-    (let ((m (fb-val (. cx b) (str-join ["(mul " (v-text g) " " (v-text n) ")"]) LirI64)))
-      (fb-val (. cx b) (str-join ["(add " (v-text m) " " (v-text l) ")"]) LirI64))))
+    (let ((m (fb-val (. cx b) (nx/binary la/BMul (v-expr g) (v-expr n)) LirI64)))
+      (fb-val (. cx b) (nx/binary la/BAdd (v-expr m) (v-expr l)) LirI64))))
 
 ;; The literal operands of `(gpu/shared :kind N)`: the element kind and the count.
 (defun shared-operands :private (e: Expr) -> (Result (Pair str i64) str)
@@ -77,8 +81,10 @@
          (Err "gpu/shared takes two operands")))
     (_ (Err "gpu/shared: not a call"))))
 
-(defun elem-lir :private (kind: str) -> (Option str)
-  (cond (= kind "f32") (some "float") (= kind "f64") (some "double") (= kind "i32") (some "i32") (= kind "i64") (some "i64") (= kind "i8") (some "i8") :else nil))
+(defun elem-lir :private (kind: str) -> (Option lt/LType)
+  (cond (= kind "f32") (some lt/ty-float) (= kind "f64") (some lt/ty-double)
+        (= kind "i32") (some lt/ty-i32) (= kind "i64") (some lt/ty-i64)
+        (= kind "i8") (some lt/ty-i8) :else nil))
 
 ;; One window of block-shared memory per call site: `fib.gpu.shared.N` of `[count x elem]`; on the host a zeroed static buffer.
 (defun shared-window :private (cx: LowerCx e: Expr) -> (Result V str)
@@ -89,9 +95,10 @@
        (if (or (<= (. ops snd) 0) (> (. ops snd) 1048576))
            (Err (str-join ["gpu/shared: a window of " (str (. ops snd)) " elements: 1 to 1048576"]))
            (let ((name (str-join ["fib.gpu.shared." (str (. e id))]))
-                 (ty (str-join ["[" (str (. ops snd)) " x " el "]"])))
-             (Ok (VVal (statics-item (. (. cx p) statics) name
-                                     (str-join ["(global " (if (kernel-target?) "shared " "internal ") name " " ty " (zeroinitializer " ty "))\n"]))
+                 (ty (lt/TArray (. ops snd) el)))
+             (Ok (VVal (nx/reference (statics-item (. (. cx p) statics) name
+                         (la/ItGlobal (la/LGlobalDef name ty (nx/zero ty) false
+                           (la/LModifiers (if (kernel-target?) la/lk-external la/lk-internal) false) 0 (kernel-target?)))))
                        LirRaw))))))))
 
 ;; ---- atomics (GPU-3): `gpu/atomic-OP-T p v` is `(atomicrmw OP monotonic p v)`, the old value; `gpu/atomic-cas-i32 p e n` the first of `cmpxchg`.
@@ -111,10 +118,15 @@
   (try-let ((p (arg name a 0)) (x (arg name a 1)))
     (let ((op (unwrap-or (atomic-op name) "add")) (b (. cx b)))
       (if (= op "cas")
-          (try-let ((n (arg name a 2)))
-            (Ok (fb-val b (str-join ["(extractvalue (cmpxchg monotonic monotonic " (v-text p) " " (v-text x) " " (v-text n) ") 0)"]) LirI32)))
-          (Ok (fb-val b (str-join ["(atomicrmw " op " monotonic " (v-text p) " " (v-text x) ")"])
-                      (let ((el (str-slice name (- (str-len name) 3) (str-len name)))) (cond (= el "f32") LirFloat (= el "i64") LirI64 :else LirI32))))))))
+          (try-let ((value (arg name a 2)))
+            (Ok (fb-val b (nx/extract (nx/node (la/KCmpXchg false la/sc-system la/OMonotonic la/OMonotonic
+                                                           (v-expr p) (v-expr x) (v-expr value))) 0) LirI32)))
+          (let ((rmw (cond (= op "add") la/RAdd (= op "min") la/RMin (= op "max") la/RMax
+                           (= op "umin") la/RUMin (= op "umax") la/RUMax (= op "xchg") la/RXchg
+                           (= op "fadd") la/RFAdd (= op "fmax") la/RFMax :else la/RFMin))
+                (el (str-slice name (- (str-len name) 3) (str-len name))))
+            (Ok (fb-val b (nx/node (la/KAtomicRmw rmw la/sc-system la/OMonotonic (v-expr p) (v-expr x)))
+                        (cond (= el "f32") LirFloat (= el "i64") LirI64 :else LirI32))))))))
 
 ;; ---- warp shuffles (GPU-5): `gpu/shfl-{down,up,xor,idx}-{i32,f32} v lane` is lIR `(shfl-MODE v lane)`, `gpu/subgroup-size` `(sreg warpsize)`, `gpu/lane-id`
 ;; `(sreg laneid)`, `gpu/ballot c` `(ballot c)`. On the host every thread is a subgroup of one (the threads run one after another): a shuffle answers its own value,
@@ -126,36 +138,36 @@
 
 (defun lcx-warp :private (cx: LowerCx name: str a: (Vec V)) -> (Result V str)
   (let ((b (. cx b)) (kt (kernel-target?)))
-    (cond (= name "gpu/subgroup-size") (Ok (fb-val b (if kt "(sreg warpsize)" "(i32 1)") LirI32))
-          (= name "gpu/lane-id") (Ok (fb-val b (if kt "(sreg laneid)" "(i32 0)") LirI32))
+    (cond (= name "gpu/subgroup-size") (Ok (fb-val b (if kt (nx/node (la/KSreg "warpsize")) (nx/integer lt/ty-i32 1)) LirI32))
+          (= name "gpu/lane-id") (Ok (fb-val b (if kt (nx/node (la/KSreg "laneid")) (nx/integer lt/ty-i32 0)) LirI32))
           (= name "gpu/ballot")
           (try-let ((c (arg name a 0)))
-            (Ok (fb-val b (if kt (str-join ["(ballot " (v-text c) ")"]) (str-join ["(select " (v-text c) " (i32 1) (i32 0))"])) LirI32)))
+            (Ok (fb-val b (if kt (nx/intrinsic "ballot" 0 nil [(v-expr c)] nil) (nx/select (v-expr c) (nx/integer lt/ty-i32 1) (nx/integer lt/ty-i32 0))) LirI32)))
           :else (try-let ((x (arg name a 0)) (l (arg name a 1)))
                   (if kt
-                      (Ok (fb-val b (str-join ["(" (unwrap-or (shfl-mode name) "shfl-down") " " (v-text x) " " (v-text l) ")"]) (unwrap-or (v-ty x) LirI32)))
+                      (Ok (fb-val b (nx/operation (unwrap-or (shfl-mode name) "shfl-down") (v-expr x) (v-expr l)) (unwrap-or (v-ty x) LirI32)))
                       (Ok x))))))
 
 (defun program-ptx :private (cx: LowerCx) -> V
   (let ((text (if (kernel-target?) "" (match (sys-getenv "FIB_KERNEL_PTX") ((some path) (unwrap-or (read-file path) "")) (nil "")))))
-    (VVal (statics-string (. (. cx p) statics) text 0) LirPtr)))
+    (VVal (nx/reference (statics-string (. (. cx p) statics) text 0)) LirPtr)))
 
 ;; A `gpu/*` builtin call. `gpu/barrier` and `gpu/host-index-set!` are statements (unit).
 (defun lcx-gpu (cx: LowerCx name: str e: Expr a: (Vec V)) -> (Result V str)
   (cond (some? (atomic-op name)) (lcx-atomic cx name a)
         (or (some? (shfl-mode name)) (one-of name ["gpu/subgroup-size" "gpu/lane-id" "gpu/ballot"])) (lcx-warp cx name a)
-        (= name "gpu/barrier") (do (when (kernel-target?) (fb-stmt (. cx b) "(barrier)")) (Ok VUnit))
+        (= name "gpu/barrier") (do (when (kernel-target?) (fb-stmt (. cx b) (nx/node la/KBarrier))) (Ok VUnit))
         (= name "gpu/global-id") (try-let ((d (arg name a 0))) (Ok (global-id cx d)))
         (= name "gpu/shared") (shared-window cx e)
         (= name "gpu/select") (try-let ((c (arg name a 0)) (x (arg name a 1)) (y (arg name a 2)))
-                                (Ok (fb-val (. cx b) (str-join ["(select " (v-text c) " " (v-text x) " " (v-text y) ")"]) (unwrap-or (v-ty x) LirI32))))
+                                (Ok (fb-val (. cx b) (nx/select (v-expr c) (v-expr x) (v-expr y)) (unwrap-or (v-ty x) LirI32))))
         (= name "gpu/program-ptx") (Ok (program-ptx cx))
         (= name "gpu/host-index-set!")
         (try-let ((slot (arg name a 0)) (d (arg name a 1)) (v (arg name a 2)))
           (if (kernel-target?)
               (Ok VUnit)
-              (let ((i (fb-val (. cx b) (str-join ["(add " (v-text d) " " (v-text slot) ")"]) LirI64)))
-                (let ((p (fb-val (. cx b) (str-join ["(getelementptr i64 " (host-index-global cx) " " (v-text i) ")"]) LirPtr)))
-                  (do (fb-stmt (. cx b) (str-join ["(store " (v-text v) " " (v-text p) ")"]))
+              (let ((i (fb-val (. cx b) (nx/binary la/BAdd (v-expr d) (v-expr slot)) LirI64)))
+                (let ((p (fb-val (. cx b) (nx/gep lt/ty-i64 (host-index-global cx) [(v-expr i)]) LirPtr)))
+                  (do (fb-stmt (. cx b) (nx/store (v-expr v) (v-expr p) nil))
                       (Ok VUnit))))))
         :else (try-let ((d (arg name a 0))) (Ok (index-read cx name d)))))

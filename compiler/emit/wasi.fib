@@ -11,7 +11,8 @@
 ;;   * the clock takes a pointer to a clock object (`_CLOCK_MONOTONIC`, `_CLOCK_REALTIME`) where Linux takes a number, and a `timespec`'s `tv_nsec` is a 4-byte `long`;
 ;;   * `AT_FDCWD` is -2 and the open flags are WASI's (`fib.w.oflags` maps the Linux words the library passes);
 ;;   * no `madvise`, no `mallopt` (wasi-libc's malloc grows the linear memory with `memory.grow`: that is the page provider), no `pipe` or `dup`.
-(ns emit.wasi)
+(ns emit.wasi (:require [lir.ast :as la] [lir.types :as lt] [lir.rewrite :as rewrite]
+                             [emit.node :as n] [emit.function :as f] [lir.print :as print]))
 
 (defun replace :private (text: str old: str new: str) -> str
   (loop [offset 0 parts: (Vec str) []]
@@ -164,15 +165,36 @@
 ;; The whole module of a WASI program, after the runtime and the library are in it: `clock_gettime` (the runtime's calls and `fib.os.time`'s extern) is the shim's, which takes the
 ;; numeric clock id (0 realtime, anything else monotonic) where wasi-libc takes a pointer to a clock object, and leaves `tv_nsec` as the 8-byte word every reader of a
 ;; `timespec` here expects (it is a 4-byte `long` in wasi-libc, and the 4 bytes after it are not written).
-(defun finish (text: str) -> str
-  (str-concat
-    (replace (replace text "(declare clock_gettime i32 (i32 ptr))\n" "") "@clock_gettime " "@fib.w.clock-gettime ")
-    (str-join ["(declare-global _CLOCK_MONOTONIC i32)\n"
-               "(declare-global _CLOCK_REALTIME i32)\n"
-               "(declare clock_gettime i32 (ptr ptr))\n"
-               "(define internal (fib.w.clock-gettime i32) ((i32 id) (ptr ts))\n"
-               "  (block entry\n"
-               "    (let ((r (call @clock_gettime (select (icmp eq id (i32 0)) @_CLOCK_REALTIME @_CLOCK_MONOTONIC) ts))\n"
-               "          (at (getelementptr i8 ts (i64 8))))\n"
-               "      (store (sext i64 (load i32 at)) at)\n"
-               "      (ret r))))\n"])))
+(defun clock-references :private (expr: la/LExpr) -> la/LExpr
+  (let ((mapped (rewrite/map-children expr clock-references)))
+    (match (. mapped kind)
+      ((la/KGlobal "clock_gettime") (la/LExpr (la/KGlobal "fib.w.clock-gettime") (. mapped pos)))
+      ((la/KCall (la/CalDirect "clock_gettime") args tail)
+       (la/LExpr (la/KCall (la/CalDirect "fib.w.clock-gettime") args tail) (. mapped pos)))
+      (_ mapped))))
+
+(defun clock-item :private (it: la/LItem) -> la/LItem
+  (match it
+    ((la/ItDefine func)
+     (la/ItDefine (la/LFunction (. func name) (. func ty) (. func params)
+                     (mapv (fn (b: la/LBlock) (la/LBlock (. b label) (mapv clock-references (. b body)) (. b pos))) (. func blocks))
+                     (. func mods) (. func pos))))
+    ((la/ItGlobal g)
+     (la/ItGlobal (la/LGlobalDef (. g name) (. g ty) (clock-references (. g init)) (. g constant) (. g mods) (. g pos) (. g shared))))
+    (_ it)))
+
+(defun clock-wrapper :private () -> la/LItem
+  (la/ItDefine (f/make "fib.w.clock-gettime" (some lt/ty-i32) [(Pair "id" lt/ty-i32) (Pair "ts" lt/ty-ptr)] lt/cc-c
+    [(f/block "entry" [(f/bound
+       [(f/binding "r" (n/call "clock_gettime" [(n/select (n/compare-int la/IEq (n/local "id") (n/integer lt/ty-i32 0))
+                                                                      (n/global "_CLOCK_REALTIME") (n/global "_CLOCK_MONOTONIC")) (n/local "ts")]))
+        (f/binding "at" (n/gep lt/ty-i8 (n/local "ts") [(n/integer lt/ty-i64 8)]))]
+       [(n/store (n/cast la/CSExt lt/ty-i64 (n/load lt/ty-i32 (n/local "at") nil)) (n/local "at") nil) (n/ret (some (n/local "r")))])])])) )
+
+(defun finish-module (module: la/LModule) -> la/LModule
+  (let ((items (filterv (fn (it: la/LItem) (match it ((la/ItDeclare d) (not (= (. d name) "clock_gettime"))) (_ true))) (. module items))))
+    (la/LModule (into (mapv clock-item items)
+      [(la/ItDeclareGlobal (la/LGlobalDecl "_CLOCK_MONOTONIC" lt/ty-i32 false 0))
+       (la/ItDeclareGlobal (la/LGlobalDecl "_CLOCK_REALTIME" lt/ty-i32 false 0))
+       (la/ItDeclare (la/LDeclare "clock_gettime" (lt/LFnType lt/cc-c (some lt/ty-i32) [lt/ty-ptr lt/ty-ptr] false) false 0))
+       (clock-wrapper)]))))

@@ -9,7 +9,8 @@
 ;; CPU names of types.targets' table), else the host's feature list (`+avx2,+fma,..`) intersected with the features below. x86-64 itself, a CPU the table
 ;; does not know, any other architecture and any OS but Linux (glibc) get no check: aarch64 has FMA in its baseline, and a build for a CPU with more
 ;; (FIB_TARGET_CPU=apple-m2, say) is not checked there (docs/adr/0008, Consequences).
-(ns emit.cpucheck (:use types.target types.targets) (:require [expand.targetos :as tos]))
+(ns emit.cpucheck (:use types.target types.targets) (:require [expand.targetos :as tos] [lir.ast :as la] [lir.types :as lt]
+    [emit.node :as n] [emit.function :as f] [lir.print :as print]))
 
 ;; A feature: LLVM's name, the name the message shows, and where glibc keeps its active bit: leaf (0 is CPUID 1, 1 is CPUID 7, 2 is CPUID 0x80000001,
 ;; glibc's CPUID_INDEX_*), register (0 eax, 1 ebx, 2 ecx, 3 edx) and bit.
@@ -77,37 +78,50 @@
 ;; ---- the lIR
 
 ;; The mask of bit `b` of an i32, as lIR writes the constant (bit 31 is the sign).
-(defun bit-mask :private (b: i64) -> str
-  (if (= b 31) "-2147483648" (str (shl 1 b))))
+(defun bit-mask :private (b: i64) -> i64
+  (if (= b 31) -2147483648 (shl 1 b)))
 
 ;; The test of feature `k` (block `cK`): its active word, the bit, on to `mK` when it is clear, else to the next test.
-(defun test-block :private (k: i64 f: CpuFeature) -> str
-  (let ((n (str k)) (next (str "c" (+ k 1))))
-    (str-join ["  (block c" n "\n    (let ((l" n " (call @__x86_get_cpuid_feature_leaf (i32 " (str (. f leaf)) ")))\n"
-               "          (w" n " (load i32 (getelementptr i8 l" n " (i64 " (str (+ 16 (* 4 (. f reg)))) ")))))\n"
-               "      (br (icmp eq (and w" n " (i32 " (bit-mask (. f bit)) ")) (i32 0)) m" n " " next ")))\n"
-               "  (block m" n "\n    (call @fib.cpu-lacks first (string \"" (. f shown) "\") (i64 " (str (str-len (. f shown))) "))\n    (br " next "))\n"])))
+(defun test-block :private (k: i64 feature: CpuFeature) -> (Vec la/LBlock)
+  (let ((leaf (str "l" k)) (word (str "w" k)) (next (str "c" (+ k 1))))
+    [(f/block (str "c" k)
+       [(f/bound [(f/binding leaf (n/call "__x86_get_cpuid_feature_leaf" [(n/integer lt/ty-i32 (. feature leaf))]))
+                  (f/binding word (n/load lt/ty-i32 (n/gep lt/ty-i8 (n/local leaf) [(n/integer lt/ty-i64 (+ 16 (* 4 (. feature reg))))]) nil))]
+                 [(n/conditional (n/compare-int la/IEq (n/binary la/BAnd (n/local word) (n/integer lt/ty-i32 (bit-mask (. feature bit))))
+                                                      (n/integer lt/ty-i32 0)) (str "m" k) next)])])
+     (f/block (str "m" k) [(n/call "fib.cpu-lacks" [(n/local "first") (n/string (. feature shown)) (n/integer lt/ty-i64 (str-len (. feature shown)))])
+                            (n/branch next)])]))
 
 ;; `fib.cpu-check` and its helper for the target `t`, or "" when the target gets no check.
+(defun cpu-check-items (t: Target) -> (Vec la/LItem)
+  (let ((features (required-features t)))
+    (if (or (empty? features) (not (x86-linux? t))) []
+        (let ((head (message-head t features)))
+          [(la/ItDeclare (la/LDeclare "__x86_get_cpuid_feature_leaf" (lt/LFnType lt/cc-c (some lt/ty-ptr) [lt/ty-i32] false) false 0))
+           (cpu-lacks-item head)
+           (la/ItDefine (f/make "fib.cpu-check" nil [] lt/cc-c
+             (into (into [(f/block "entry" [(f/bound [(f/binding "first" (n/alloca lt/ty-i64))]
+                          [(n/store (n/integer lt/ty-i64 0) (n/local "first") nil) (n/branch "c0")])])]
+                         (vec (mapcat (fn (k: i64) (test-block k (nth features k))) (range (count features)))))
+                   [(f/block (str "c" (count features)) [(n/conditional (n/compare-int la/IEq (n/load lt/ty-i64 (n/local "first") nil) (n/integer lt/ty-i64 0)) "fine" "missing")])
+                    (f/block "fine" [(n/ret nil)])
+                    (f/block "missing" [(n/call "write" [(n/integer lt/ty-i32 2) (n/string "\n") (n/integer lt/ty-i64 1)])
+                                         (n/call "abort" []) (n/unreachable)])])))]))))
+
+(defun cpu-lacks-item :private (head: str) -> la/LItem
+  (la/ItDefine (f/make "fib.cpu-lacks" nil [(Pair "first" lt/ty-ptr) (Pair "name" lt/ty-ptr) (Pair "n" lt/ty-i64)] lt/cc-c
+    [(f/block "entry" [(n/conditional (n/compare-int la/IEq (n/load lt/ty-i64 (n/local "first") nil) (n/integer lt/ty-i64 0)) "head" "more")])
+     (f/block "head" [(n/call "write" [(n/integer lt/ty-i32 2) (n/string head) (n/integer lt/ty-i64 (str-len head))])
+                       (n/store (n/integer lt/ty-i64 1) (n/local "first") nil) (n/branch "put")])
+     (f/block "more" [(n/call "write" [(n/integer lt/ty-i32 2) (n/string ", ") (n/integer lt/ty-i64 2)]) (n/branch "put")])
+     (f/block "put" [(n/call "write" [(n/integer lt/ty-i32 2) (n/local "name") (n/local "n")]) (n/ret nil)])])))
+
 (defun cpu-check-defs (t: Target) -> str
-  (let ((fs (required-features t)))
-    (if (or (empty? fs) (not (x86-linux? t)))
-        ""
-        (let ((head (message-head t fs)))
-          (str-join
-            ["(declare __x86_get_cpuid_feature_leaf ptr (i32))\n"
-             "(define internal (fib.cpu-lacks void) ((ptr first) (ptr name) (i64 n))\n"
-             "  (block entry (br (icmp eq (load i64 first) (i64 0)) head more))\n"
-             "  (block head (call @write (i32 2) (string \"" head "\") (i64 " (str (str-len head)) ")) (store (i64 1) first) (br put))\n"
-             "  (block more (call @write (i32 2) (string \", \") (i64 2)) (br put))\n"
-             "  (block put (call @write (i32 2) name n) (ret)))\n"
-             "(define internal (fib.cpu-check void) ()\n"
-             "  (block entry\n    (let ((first (alloca i64)))\n      (store (i64 0) first)\n      (br c0)))\n"
-             (str-join (mapv (fn (k: i64) (test-block k (nth fs k))) (range (count fs))))
-             "  (block c" (str (count fs)) " (br (icmp eq (load i64 first) (i64 0)) fine missing))\n"
-             "  (block fine (ret))\n"
-             "  (block missing (call @write (i32 2) (string \"\\n\") (i64 1)) (call @abort) (unreachable)))\n"])))))
+  (print/print-module (la/LModule (cpu-check-items t))))
 
 ;; The first statement of an executable's `main` when the target has a check.
+(defun cpu-check-code (t: Target) -> (Vec la/LExpr)
+  (if (or (empty? (required-features t)) (not (x86-linux? t))) [] [(n/call "fib.cpu-check" [])]))
+
 (defun cpu-check-call (t: Target) -> str
-  (if (= (cpu-check-defs t) "") "" "(call @fib.cpu-check)\n    "))
+  (if (empty? (cpu-check-code t)) "" "(call @fib.cpu-check)\n    "))

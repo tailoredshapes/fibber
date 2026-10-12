@@ -1,181 +1,114 @@
-;; compiler/emit/prune.fib: PRUNE-1. The lIR of a program without what nothing reaches: the internal functions, globals and constants of the
-;; runtime and of the program that `main` (and what has an outside role) cannot get to, and the `def`s made at run time whose value nobody reads.
-;; The bodies the program asks for are already demanded one by one (emit.mono's queue); what stays in the text after that is the whole runtime
-;; (about half of it dead in a small program), the globals and constants of values nothing reads, and the initialisers of every `def` of every
-;; loaded module (`fib.unix` alone makes a dozen before `main`).
-;;
-;; Roots: every item that is not `internal` or `private` (`main`, the exports of a library), every piece of text that is not an item (the
-;; `declare`s, `defstruct`s, `target`), the kernel table `fib.kernel.*` (driver.commands reads it from the text), what the text of `main` names
-;; (`root-text`), and the initialisers that may do something. A `def` made at run time must run before `main` and may trap, loop or act (syntax
-;; §3.19, case 1706: an unread `def broken (trap ..)` stops the program), so it is dropped only when nobody reads its slot AND its body provably
-;; cannot: it is one block (no branch, so no loop and no checked path), mentions no division, remainder, checked operation, trap, raise, abort, unreachable,
-;; integer-made pointer, atomic or indirect call, and names nothing but data (constants, globals) and the count operations `fib.retain`
-;; and `fib.release`. A call of a function of the program (it might trap: not proved total), an allocation (it might run out of memory)
-;; or anything else keeps the `def`. Literals, a read of another `def`, a named string or constant: dropped when unread.
-;; The text is cut where a line starts with `(` at the left margin, which the emitter does for every item and never inside one (strings escape
-;; their line breaks).
+;; Reachability and initializer safety operate on lIR nodes. String constants
+;; never create symbol dependencies. Initializers retain their source order.
 (ns emit.prune
-  (:use emit.assemble emit.program))
+  (:use emit.assemble emit.program)
+  (:require [lir.ast :as la] [lir.check.walk :as walk]))
 
-;; The search: the items by name (the program's, the runtime's), the names found live, the names to scan, and, for a pure `def`, its slot's
-;; name and the name of its body (reaching the slot reaches the body).
-(defstruct Search (prog: (Map str str) rts: (Map str str) live: (Cell (Map str bool)) work: (Cell (Vec str))
-                   lazy: (Map str str)))
+(defstruct Search (prog: (Map str la/LItem) rts: (Map str la/LItem)
+                   live: (Cell (Map str bool)) work: (Cell (Vec str)) lazy: (Map str str)))
 
-;; --- the text in pieces
-;; The text in pieces that join back to it: each ends after the line break that comes before a line starting with `(`.
-(defun split-pieces (text: str) -> (Vec str)
-  (loop ((from 0) (out []))
-    (match (str-find text "\n(" from)
-      (nil (conj out (str-slice text from (str-len text))))
-      ((some i) (recur (+ i 1) (conj out (str-slice text from (+ i 1))))))))
+(defun item-name (it: la/LItem) -> str
+  (match it ((la/ItDefine f) (. f name)) ((la/ItGlobal g) (. g name)) (_ "")))
 
-;; Whether the byte ends a name: a space or control character, a parenthesis, a quote.
-(defun name-end? :private (c: i8) -> bool
-  (or (<= c 32i8) (= c 40i8) (= c 41i8) (= c 34i8)))
+(defun root? :private (it: la/LItem) -> bool
+  (let ((name (item-name it)))
+    (or (= name "") (starts-with? name "fib.kernel.")
+        (match it
+          ((la/ItDefine f) (la/linkage-exported? (. (. f mods) linkage)))
+          ((la/ItGlobal g) (la/linkage-exported? (. (. g mods) linkage)))
+          (_ true)))))
 
-;; The end of the word that starts at `i`.
-(defun word-end :private (s: str i: i64) -> i64
-  (loop ((k i)) (if (and (< k (str-len s)) (not (name-end? (str-byte-at s k)))) (recur (+ k 1)) k)))
+(defun expr-refs :private (expr: la/LExpr out: (Cell (Vec str))) -> unit
+  (do (match (. expr kind)
+        ((la/KGlobal name) (set! out (conj @out name)))
+        ((la/KCall (la/CalDirect name) _ _) (set! out (conj @out name)))
+        (_ ()))
+      (doseq [child (walk/children expr)] (expr-refs child out))))
 
-(defun skip-space :private (s: str i: i64) -> i64
-  (loop ((k i)) (if (and (< k (str-len s)) (<= (str-byte-at s k) 32i8)) (recur (+ k 1)) k)))
+(defun refs-of (it: la/LItem) -> (Vec str)
+  (let ((out (cell [])))
+    (do (match it
+          ((la/ItDefine f) (doseq [b (. f blocks)] (doseq [e (. b body)] (expr-refs e out))))
+          ((la/ItGlobal g) (expr-refs (. g init) out))
+          (_ ()))
+        @out)))
 
-(defun modifier? :private (w: str) -> bool
-  (or (= w "hidden") (= w "shared") (= w "external") (= w "tailcc") (= w "ccc") (= w "kernelcc")))
-
-;; The name an item defines, from the position after its keyword, and whether the item is internal or private; the name is "" for a word we do not know.
-(defun item-name :private (s: str from: i64 define: bool) -> (Pair str bool)
-  (loop ((i from) (local false))
-    (let ((j (skip-space s i)))
-      (if (>= j (str-len s))
-          (Pair "" false)
-          (if (and define (= (str-byte-at s j) 40i8))
-              (Pair (str-slice s (+ j 1) (word-end s (+ j 1))) local)
-              (let ((e (word-end s j)) (w (str-slice s j (word-end s j))))
-                (cond (or (= w "internal") (= w "private")) (recur e true)
-                      (modifier? w) (recur e local)
-                      define (Pair "" false)
-                      :else (Pair w local))))))))
-
-;; The name of the item a piece is and whether it is internal; the name is "" for text that is not a definition.
-(defun piece-item :private (s: str) -> (Pair str bool)
-  (cond (starts-with? s "(define ") (item-name s 8 true)
-        (starts-with? s "(global ") (item-name s 8 false)
-        (starts-with? s "(constant ") (item-name s 10 false)
-        :else (Pair "" false)))
-
-;; Every name that follows an `@` in the text.
-(defun refs-of (s: str) -> (Vec str)
-  (loop ((from 0) (out []))
-    (match (str-find s "@" from)
-      (nil out)
-      ((some i) (let ((e (word-end s (+ i 1))))
-                  (recur e (if (> e (+ i 1)) (conj out (str-slice s (+ i 1) e)) out)))))))
-
-;; --- the search
 (defun reach :private (st: Search name: str) -> unit
   (when (not (contains? @(. st live) name))
     (do (set! (. st live) (assoc @(. st live) name true))
         (set! (. st work) (conj @(. st work) name)))))
 
-(defun reach-all :private (st: Search names: (Vec str)) -> unit
-  (doseq [n names] (reach st n)))
+(defun reach-all :private (st: Search names: (Vec str)) -> unit (doseq [n names] (reach st n)))
+(defun item-of :private (st: Search name: str) -> (Option la/LItem)
+  (match (get (. st prog) name) ((some it) (some it)) (nil (get (. st rts) name))))
 
-(defun text-of :private (st: Search name: str) -> (Option str)
-  (match (get (. st prog) name)
-    ((some t) (some t))
-    (nil (get (. st rts) name))))
-
-;; Scans the names found live until none is left: what an item mentions is live, and so is the body of a `def` whose slot it is.
 (defun run-work :private (st: Search) -> unit
   (loop ()
     (let ((w @(. st work)))
       (when (> (count w) 0)
-        (let ((n (nth w (- (count w) 1))))
+        (let ((name (nth w (- (count w) 1))))
           (do (set! (. st work) (vec-pop w))
-              (match (text-of st n) ((some t) (reach-all st (refs-of t))) (nil ()))
-              (match (get (. st lazy) n) ((some b) (reach st b)) (nil ()))
+              (match (item-of st name) ((some it) (reach-all st (refs-of it))) (nil ()))
+              (match (get (. st lazy) name) ((some body) (reach st body)) (nil ()))
               (recur)))))))
 
-;; The tokens of a body that can trap or do something: a division or remainder, a checked operation, an unreachable, a pointer made from an integer, an
-;; atomic access, an indirect call.
-(defun risky-text? :private (t: str) -> bool
-  (some? (find-first (fn (w: str) (some? (str-find t w 0)))
-                     ["div" "rem" "overflow" "unreachable" "inttoptr" "atomic" "cmpxchg" "indirect" "trap" "raise" "abort"])))
+;; Operations whose evaluation can trap, loop, or act prevent lazy elimination.
+(defun risky? :private (e: la/LExpr) -> bool
+  (or (match (. e kind)
+        ((la/KBin op _ _) (includes? op [la/BSDiv la/BUDiv la/BSRem la/BURem la/BFDiv la/BFRem]))
+        ((la/KOverflow _ _ _) true) ((la/KTrap) true) ((la/KUnreachable) true)
+        ((la/KCast (la/CIntToPtr) _ _) true)
+        ((la/KAtomicLoad _ _ _ _) true) ((la/KAtomicStore _ _ _ _) true)
+        ((la/KAtomicRmw _ _ _ _ _) true) ((la/KCmpXchg _ _ _ _ _ _ _) true) ((la/KFence _ _) true)
+        ((la/KCall (la/CalIndirect _ _) _ _) true)
+        ((la/KBr _) true) ((la/KCondBr _ _ _) true) ((la/KSwitch _ _ _) true)
+        ((la/KIntrin name _ _ _ _) (or (some? (str-find name "div" 0)) (some? (str-find name "rem" 0))))
+        (_ false))
+      (some? (find-first risky? (walk/children e)))))
 
-;; How many times `w` is in `t`.
-(defun occurrences :private (t: str w: str) -> i64
-  (loop ((from 0) (n 0))
-    (match (str-find t w from) (nil n) ((some i) (recur (+ i 1) (+ n 1))))))
+(defun ref-ok? :private (st: Search name: str) -> bool
+  (or (= name "fib.retain") (= name "fib.release")
+      (match (get (. st prog) name) ((some (la/ItGlobal _)) true) (_ false))))
 
-;; A name a pure body may mention: the count operations (they cannot trap), or a global or constant (data: its address or its value).
-(defun ref-ok? :private (st: Search r: str) -> bool
-  (or (= r "fib.retain") (= r "fib.release")
-      (match (get (. st prog) r)
-        ((some t) (or (starts-with? t "(constant ") (starts-with? t "(global ")))
-        (nil false))))
-
-;; Whether the initialiser body `name` provably does nothing and cannot trap, loop, run out of memory or call anything (see the header): one block (no
-;; branch, so no loop and no checked path), no risky operation, and no name but data and the count operations. When in doubt: no.
 (defun pure-body? (st: Search name: str) -> bool
   (match (get (. st prog) name)
-    (nil false)
-    ((some t) (and (= (occurrences t "(block ") 1) (not (risky-text? t)) (every? (fn (r: str) (ref-ok? st r)) (refs-of t))))))
+    ((some (la/ItDefine f))
+     (and (= (count (. f blocks)) 1)
+          (not-any? risky? (. (nth (. f blocks) 0) body))
+          (every? (fn (r: str) (ref-ok? st r)) (refs-of (la/ItDefine f)))))
+    (_ false)))
 
+(defun index-items :private (items: (Vec la/LItem) roots: (Cell (Vec la/LItem))) -> (Map str la/LItem)
+  (reduce (fn (m: (Map str la/LItem) it: la/LItem)
+            (do (when (root? it) (set! roots (conj @roots it)))
+                (if (= (item-name it) "") m (assoc m (item-name it) it)))) {} items))
 
-;; --- the whole
-(defstruct Field (pieces: (Vec str) items: (Vec (Pair str bool))))
+(defun live-items :private (items: (Vec la/LItem) live: (Map str bool)) -> (Vec la/LItem)
+  (filterv (fn (it: la/LItem) (or (root? it) (contains? live (item-name it)))) items))
 
-(defun field-of :private (text: str) -> Field
-  (let ((ps (split-pieces text))) (Field ps (mapv piece-item ps))))
+(defun slot-name :private (i: Init) -> str (str "def.slot." (. i def-id)))
+(defun lazy-inits :private (st: Search inits: (Vec Init)) -> (Map str str)
+  (reduce (fn (m: (Map str str) i: Init) (if (pure-body? st (. i body)) (assoc m (slot-name i) (. i body)) m)) {} inits))
 
-;; Indexes the named pieces of the field in `m` and notes the roots: what is not internal, and the text that is not an item.
-(defun index-field :private (f: Field m: (Map str str) roots: (Cell (Vec str))) -> (Map str str)
-  (let ((acc (cell m)))
-    (do (dotimes (k (count (. f pieces)))
-          (let ((it (nth (. f items) k)) (p (nth (. f pieces) k)))
-            (if (= (. it fst) "")
-                (set! roots (conj @roots p))
-                (do (set! acc (assoc @acc (. it fst) p))
-                    (when (or (not (. it snd)) (starts-with? (. it fst) "fib.kernel.")) (set! roots (conj @roots p)))))))
-        @acc)))
-
-(defun live-text :private (f: Field live: (Map str bool)) -> str
-  (str-join (mapv (fn (k: i64) -> str
-                    (let ((it (nth (. f items) k)))
-                      (if (or (= (. it fst) "") (not (. it snd)) (starts-with? (. it fst) "fib.kernel.") (contains? live (. it fst))) (nth (. f pieces) k) "")))
-                  (vec (range (count (. f pieces)))))))
-
-(defun slot-name :private (i: Init) -> str (str-join ["def.slot." (str (. i def-id))]))
-
-;; Seeds the search: the roots' own mentions, the text of `main`, the fixed names, and the initialisers that may do something.
-(defun seed :private (st: Search roots: (Vec str) root-text: str inits: (Vec Init)) -> unit
-  (do (doseq [r roots] (reach-all st (refs-of r)))
-      (reach-all st (refs-of root-text))
+(defun seed :private (st: Search roots: (Vec la/LItem) main: (Vec la/LItem) inits: (Vec Init)) -> unit
+  (do (doseq [it (into roots main)] (reach-all st (refs-of it)))
       (reach-all st ["fib.initdef" "fib.immortalise" "fib.init-done"])
       (doseq [i inits]
         (when (not (contains? (. st lazy) (slot-name i)))
           (do (reach st (. i body)) (reach st (slot-name i)))))
       (run-work st)))
 
-;; The pure initialisers: their slots to their bodies.
-(defun lazy-inits :private (st: Search inits: (Vec Init)) -> (Map str str)
-  (reduce (fn (m: (Map str str) i: Init) (if (pure-body? st (. i body)) (assoc m (slot-name i) (. i body)) m)) {} inits))
-
-;; The parts of the module without what nothing reaches, and the initialisers that stay (in their order). `root-text` is the text of `main`
-;; with no initialiser in it.
-(defun prune-parts (parts: Parts root-text: str inits: (Vec Init)) -> (Pair Parts (Vec Init))
-  (let ((fs (mapv field-of [(. parts runtime) (. parts externs) (. parts types) (. parts statics) (. parts keywords) (. parts defs) (. parts quotes)]))
-        (fns (mapv field-of (. parts fns)))
-        (roots (cell [])))
-    (let ((rts (index-field (nth fs 0) {} roots)))
-      (let ((prog (reduce (fn (m: (Map str str) f: Field) (index-field f m roots)) {} (into (mapv (fn (k: i64) (nth fs k)) [1 2 3 4 5 6]) fns))))
-        (let ((lazy (lazy-inits (Search prog rts (cell {}) (cell []) {}) inits)))
-          (let ((st (Search prog rts (cell {}) (cell []) lazy)))
-            (do (seed st @roots root-text inits)
-                (let ((live @(. st live)))
-                  (Pair (Parts (live-text (nth fs 0) live) (live-text (nth fs 1) live) (live-text (nth fs 2) live) (live-text (nth fs 3) live)
-                               (live-text (nth fs 4) live) (live-text (nth fs 5) live) (live-text (nth fs 6) live)
-                               (filterv (fn (t: str) (not (= t ""))) (mapv (fn (f: Field) (live-text f live)) fns)))
-                        (filterv (fn (i: Init) (or (not (contains? lazy (slot-name i))) (contains? live (slot-name i)))) inits))))))))))
+(defun prune-parts (parts: Parts main: (Vec la/LItem) inits: (Vec Init)) -> (Pair Parts (Vec Init))
+  (let ((roots (cell [])))
+    (let ((rts (index-items (. parts runtime) roots))
+          (prog (index-items (into (into (into (into (into (into (. parts externs) (. parts types)) (. parts statics))
+                                                   (. parts keywords)) (. parts defs)) (. parts quotes)) (. parts fns)) roots)))
+      (let ((lazy (lazy-inits (Search prog rts (cell {}) (cell []) {}) inits)))
+        (let ((st (Search prog rts (cell {}) (cell []) lazy)))
+          (do (seed st @roots main inits)
+              (let ((live @(. st live)))
+                (Pair (Parts (live-items (. parts runtime) live) (live-items (. parts externs) live)
+                             (live-items (. parts types) live) (live-items (. parts statics) live)
+                             (live-items (. parts keywords) live) (live-items (. parts defs) live)
+                             (live-items (. parts quotes) live) (live-items (. parts fns) live) (. parts links))
+                      (filterv (fn (i: Init) (or (not (contains? lazy (slot-name i))) (contains? live (slot-name i)))) inits)))))))))

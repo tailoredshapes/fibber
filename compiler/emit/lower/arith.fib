@@ -3,7 +3,8 @@
 ;; strings, with every check types §8.12 requires, and the conversion primitives. The order of the instructions is the Rust's: a fresh
 ;; name asked for earlier shifts every later one of the function. Where the Rust has `"a" | "b" =>` arms this is `case`.
 (ns emit.lower.arith
-  (:use types.ty types.ast emit.value emit.ir emit.program emit.layout emit.lower.cx emit.lower.cells emit.lower.show emit.lower.simd))
+  (:use types.ty types.ast emit.value emit.ir emit.program emit.layout emit.lower.cx emit.lower.cells emit.lower.show emit.lower.simd)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 (defun arith-some :private (r: (Result V str)) -> (Result (Option V) str)
   (match r ((Ok v) (Ok (some v))) ((Err e) (Err e))))
@@ -11,7 +12,7 @@
 (defun in? :private (m: str xs: (Vec str)) -> bool
   (some? (first (filter (fn (x: str) (= x m)) xs))))
 
-(defun arith-val :private (cx: LowerCx instr: str t: LirTy) -> V
+(defun arith-val :private (cx: LowerCx instr: la/LExpr t: LirTy) -> V
   (fb-val (. cx b) instr t))
 
 ;; The most negative integer of the width `t`.
@@ -40,9 +41,9 @@
   (match y
     (nil (Err "a string comparison without its second operand"))
     ((some y)
-     (let ((c (arith-val cx (str-join ["(call @fib.str-cmp " (v-text x) " " (v-text y) ")"]) LirI32)))
+     (let ((c (arith-val cx (nx/call "fib.str-cmp" [(v-expr x) (v-expr y)]) LirI32)))
        (try-let ((pred (compare-pred method false)))
-         (Ok (arith-val cx (str-join ["(icmp " pred " " (v-text c) " (i32 0))"]) LirI1)))))))
+         (Ok (arith-val cx (nx/compare-int (nx/int-predicate pred) (v-expr c) (nx/integer lt/ty-i32 0)) LirI1)))))))
 
 ;; ---- floats
 
@@ -50,15 +51,15 @@
 ;; zero by the C library's `trunc` or `truncf` (lIR has no float truncation, and the formula `(a - (rem a b)) / b` differs from
 ;; `(a / b).trunc()`: 2.9999999999999996 for 9.6 and 2.8, where the truncated quotient is 3.0). Rust: arith.rs:77 float_binary
 (defun float-binary :private (cx: LowerCx method: str x: V y: V) -> V
-  (let ((t (unwrap-or (v-ty x) LirDouble)) (a (v-text x)) (b (v-text y)))
-    (let ((op (fn (name: str) (arith-val cx (str-join ["(" name " " a " " b ")"]) t)))
-          (cmp (fn (pred: str) (arith-val cx (str-join ["(fcmp " pred " " a " " b ")"]) LirI1))))
+  (let ((t (unwrap-or (v-ty x) LirDouble)) (a (v-expr x)) (b (v-expr y)))
+    (let ((op (fn (name: str) (arith-val cx (nx/operation name a b) t)))
+          (cmp (fn (pred: str) (arith-val cx (nx/compare-float (nx/float-predicate pred) a b) LirI1))))
       (cond (= method "+") (op "fadd")
             (= method "-") (op "fsub")
             (= method "*") (op "fmul")
             (= method "fdiv") (op "fdiv")
             (= method "quot") (let ((q (op "fdiv")))
-                                (arith-val cx (str-join ["(call @" (if (= t LirFloat) "truncf" "trunc") " " (v-text q) ")"]) t))
+                                (arith-val cx (nx/call (if (= t LirFloat) "truncf" "trunc") [(v-expr q)]) t))
             (= method "rem") (op "frem")
             (= method "=") (cmp "oeq")
             (= method "!=") (cmp "une")
@@ -70,67 +71,65 @@
 ;; ---- integers
 
 ;; `+`, `-`, `*` with the overflow trap of §8.12.
-(defun int-checked :private (cx: LowerCx method: str t: LirTy a: str b: str) -> V
+(defun int-checked :private (cx: LowerCx method: str t: LirTy a: la/LExpr b: la/LExpr) -> V
   (let ((op (cond (= method "+") "sadd-overflow" (= method "-") "ssub-overflow" :else "smul-overflow")))
-    (let ((r (arith-val cx (str-join ["(" op " " a " " b ")"]) t)))
-      (let ((ovf (arith-val cx (str-join ["(extractvalue " (v-text r) " 1)"]) LirI1)))
+    (let ((r (arith-val cx (nx/operation op a b) t)))
+      (let ((ovf (arith-val cx (nx/extract (v-expr r) 1) LirI1)))
         (do (lcx-trap-if cx ovf (str-join ["integer overflow in " method " at " (lir-ty-text t)]))
-            (arith-val cx (str-join ["(extractvalue " (v-text r) " 0)"]) t))))))
+            (arith-val cx (nx/extract (v-expr r) 0) t))))))
 
 ;; The shifts: the count masked to the width, so no shift is by more than the width.
-(defun int-shift :private (cx: LowerCx method: str t: LirTy a: str b: str) -> V
-  (let ((w (lir-ty-text t)))
-    (let ((m (arith-val cx (str-join ["(and " b " (" w " " (str (- (lir-ty-bits t) 1)) "))"]) t))
-          (op (cond (= method "shl") "shl" (= method "shr") "lshr" :else "ashr")))
-      (arith-val cx (str-join ["(" op " " a " " (v-text m) ")"]) t))))
+(defun int-shift :private (cx: LowerCx method: str t: LirTy a: la/LExpr b: la/LExpr) -> V
+  (let ((mask (nx/integer (lir-type t) (- (lir-ty-bits t) 1)))
+        (op (cond (= method "shl") la/BShl (= method "shr") la/BLShr :else la/BAShr)))
+    (let ((m (arith-val cx (nx/binary la/BAnd b mask) t)))
+      (arith-val cx (nx/binary op a (v-expr m)) t))))
 
 ;; `/` (and `quot`) or `rem` with the checks of §8.12. `nil` when the operation cannot return: lIR refuses a division by a constant zero
 ;; outright (lir.md §6.1), so a literal divisor of 0 is the trap alone. Rust: arith.rs:150 int_division
-(defun int-division :private (cx: LowerCx method: str a: str b: str t: LirTy) -> (Option V)
-  (let ((w (lir-ty-text t)))
-    (if (= b (str-join ["(" w " 0)"]))
-        (do (lcx-trap-c cx (str-join ["integer " method " by zero"])) nil)
-        (let ((zero (arith-val cx (str-join ["(icmp eq " b " (" w " 0))"]) LirI1)))
-          (do (lcx-trap-if cx zero (str-join ["integer " method " by zero"]))
-              (let ((amin (arith-val cx (str-join ["(icmp eq " a " (" w " " (str (int-min t)) "))"]) LirI1))
-                    (bm1 (arith-val cx (str-join ["(icmp eq " b " (" w " -1))"]) LirI1)))
-                (let ((both (arith-val cx (str-join ["(and " (v-text amin) " " (v-text bm1) ")"]) LirI1)))
-                  (do (lcx-trap-if cx both (str-join ["integer overflow in " method " at " w]))
-                      (some (arith-val cx (str-join ["(" (if (= method "/") "sdiv" "srem") " " a " " b ")"]) t))))))))))
+(defun int-division :private (cx: LowerCx method: str a: la/LExpr b: la/LExpr t: LirTy) -> (Option V)
+  (if (nx/integer-zero? b)
+      (do (lcx-trap-c cx (str-join ["integer " method " by zero"])) nil)
+      (let ((zero (arith-val cx (nx/compare-int la/IEq b (nx/integer (lir-type t) 0)) LirI1)))
+        (do (lcx-trap-if cx zero (str-join ["integer " method " by zero"]))
+            (let ((amin (arith-val cx (nx/compare-int la/IEq a (nx/integer (lir-type t) (int-min t))) LirI1))
+                  (bm1 (arith-val cx (nx/compare-int la/IEq b (nx/integer (lir-type t) -1)) LirI1)))
+              (let ((both (arith-val cx (nx/binary la/BAnd (v-expr amin) (v-expr bm1)) LirI1)))
+                (do (lcx-trap-if cx both (str-join ["integer overflow in " method " at " (lir-ty-text t)]))
+                    (some (arith-val cx (nx/binary (if (= method "/") la/BSDiv la/BSRem) a b) t)))))))))
 
 ;; Comparisons and the rest of the integer methods; `None` when the operation cannot return (a literal division by zero).
 ;; `quot` is the division the builtin `/` was (stdlib §7 L30); its traps name `/`. Rust: arith.rs:103 int_binary
 (defun int-binary :private (cx: LowerCx method0: str x: V y: V) -> (Result (Option V) str)
-  (let ((method (if (= method0 "quot") "/" method0)) (t (unwrap-or (v-ty x) LirI64)) (a (v-text x)) (b (v-text y)))
+  (let ((method (if (= method0 "quot") "/" method0)) (t (unwrap-or (v-ty x) LirI64)) (a (v-expr x)) (b (v-expr y)))
     (cond (in? method ["+" "-" "*"]) (Ok (some (int-checked cx method t a b)))
           (in? method ["/" "rem"]) (Ok (int-division cx method a b t))
-          (= method "bit-and") (Ok (some (arith-val cx (str-join ["(and " a " " b ")"]) t)))
-          (= method "bit-or") (Ok (some (arith-val cx (str-join ["(or " a " " b ")"]) t)))
-          (= method "bit-xor") (Ok (some (arith-val cx (str-join ["(xor " a " " b ")"]) t)))
+          (= method "bit-and") (Ok (some (arith-val cx (nx/binary la/BAnd a b) t)))
+          (= method "bit-or") (Ok (some (arith-val cx (nx/binary la/BOr a b) t)))
+          (= method "bit-xor") (Ok (some (arith-val cx (nx/binary la/BXor a b) t)))
           (in? method ["shl" "shr" "sar"]) (Ok (some (int-shift cx method t a b)))
           ;; `false` is below `true`: an `i1` is compared as the unsigned 0 and 1 it holds, where `slt` would read `true` as -1. The
           ;; signed integers and the characters (code points, never negative) compare signed.
           :else (try-let ((pred (compare-pred method (= t LirI1))))
-                  (Ok (some (arith-val cx (str-join ["(icmp " pred " " a " " b ")"]) LirI1)))))))
+                  (Ok (some (arith-val cx (nx/compare-int (nx/int-predicate pred) a b) LirI1)))))))
 
 ;; Rust: arith.rs:178 int_unary
 (defun int-unary :private (cx: LowerCx method: str x: V) -> (Result V str)
-  (let ((t (unwrap-or (v-ty x) LirI64)) (a (v-text x)))
-    (let ((w (lir-ty-text t)))
-      (cond (= method "neg")
-            (let ((amin (arith-val cx (str-join ["(icmp eq " a " (" w " " (str (int-min t)) "))"]) LirI1)))
-              (do (lcx-trap-if cx amin (str-join ["integer overflow in neg at " w]))
-                  (Ok (arith-val cx (str-join ["(sub (" w " 0) " a ")"]) t))))
-            (= method "bit-not") (Ok (arith-val cx (str-join ["(xor " a " (" w " -1))"]) t))
-            (= method "popcount") (Ok (arith-val cx (str-join ["(ctpop " a ")"]) t))
-            :else (Err (str-join ["unary " method]))))))
+  (let ((t (unwrap-or (v-ty x) LirI64)) (a (v-expr x)))
+    (cond (= method "neg")
+          (let ((amin (arith-val cx (nx/compare-int la/IEq a (nx/integer (lir-type t) (int-min t))) LirI1)))
+            (do (lcx-trap-if cx amin (str-join ["integer overflow in neg at " (lir-ty-text t)]))
+                (Ok (arith-val cx (nx/binary la/BSub (nx/integer (lir-type t) 0) a) t))))
+          (= method "bit-not") (Ok (arith-val cx (nx/binary la/BXor a (nx/integer (lir-type t) -1)) t))
+          (= method "popcount") (Ok (arith-val cx (nx/unary la/UCtpop a) t))
+          :else (Err (str-join ["unary " method])))))
 
 ;; `<` and its fellows on keywords: by name, as the interpreter's, where the interned ids only order by first use.
 ;; Rust: arith.rs:56 keyword_order
 (defun keyword-order :private (cx: LowerCx method: str x: V y: V) -> (Result (Option V) str)
   (do (set! (. (. cx p) keyword-helpers) true)
-      (let ((a (arith-val cx (str-join ["(call @kw.rank " (v-text x) ")"]) LirI64)))
-        (let ((b (arith-val cx (str-join ["(call @kw.rank " (v-text y) ")"]) LirI64)))
+      (let ((a (arith-val cx (nx/call "kw.rank" [(v-expr x)]) LirI64)))
+        (let ((b (arith-val cx (nx/call "kw.rank" [(v-expr y)]) LirI64)))
           (int-binary cx method a b)))))
 
 ;; ---- the method of a native instance
@@ -155,7 +154,7 @@
            (float-ty? t) (Ok (some (float-binary cx method x y2)))
            :else (int-binary cx method x y2)))
     (nil (if (float-ty? t)
-             (Ok (some (arith-val cx (str-join ["(fneg " (v-text x) ")"]) t)))
+             (Ok (some (arith-val cx (nx/unary la/UFNeg (v-expr x)) t)))
              (arith-some (int-unary cx method x))))))
 
 ;; The vector type of an operand pair of a native method, when either operand is a lane vector.
@@ -184,13 +183,13 @@
 ;; ---- conversions
 
 ;; The instruction of a conversion primitive to the lIR type `to` of the value text `x`.
-(defun convert-instr :private (op: ConvOp to: LirTy x: str) -> str
-  (let ((tt (lir-ty-text to)))
+(defun convert-instr :private (op: ConvOp to: LirTy x: la/LExpr) -> la/LExpr
+  (let ((tt (lir-type to)))
     (match op
-      ((CvIntToInt c) (str-join ["(" (match c ((Trunc) "trunc") ((Zext) "zext") ((Sext) "sext")) " " tt " " x ")"]))
-      ((CvFloatToFloat) (if (= to LirFloat) (str-join ["(fptrunc float " x ")"]) (str-join ["(fpext double " x ")"])))
-      ((CvFloatToInt signed) (str-join ["(" (if signed "fptosi-sat" "fptoui-sat") " " tt " " x ")"]))
-      ((CvIntToFloat signed) (str-join ["(" (if signed "sitofp" "uitofp") " " tt " " x ")"])))))
+      ((CvIntToInt c) (nx/conversion (match c ((Trunc) "trunc") ((Zext) "zext") ((Sext) "sext")) tt x))
+      ((CvFloatToFloat) (if (= to LirFloat) (nx/cast la/CFpTrunc lt/ty-float x) (nx/cast la/CFpExt lt/ty-double x)))
+      ((CvFloatToInt signed) (nx/conversion (if signed "fptosi-sat" "fptoui-sat") tt x))
+      ((CvIntToFloat signed) (nx/conversion (if signed "sitofp" "uitofp") tt x)))))
 
 ;; Whether `op` between two types of the same lIR type changes nothing.
 (defun convert-noop? :private (op: ConvOp) -> bool
@@ -205,7 +204,7 @@
        (match (v-ty v)
          (nil (Err "conversion of unit"))
          ((some from)
-          (let ((instr (convert-instr op to (v-text v))))
+          (let ((instr (convert-instr op to (v-expr v))))
             (if (and (= from to) (convert-noop? op))
                 (Ok v)
                 (Ok (arith-val cx instr to))))))))))
@@ -220,4 +219,4 @@
                   :else nil)))
     (match to
       (nil (Err (str-join ["builtin " name])))
-      ((some t) (Ok (arith-val cx (str-join ["(bitcast " (lir-ty-text t) " " (v-text x) ")"]) t))))))
+      ((some t) (Ok (arith-val cx (nx/cast la/CBitcast (lir-type t) (v-expr x)) t))))))

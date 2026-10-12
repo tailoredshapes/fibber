@@ -6,37 +6,38 @@
 (ns emit.lower.quote
   (:require [fib.string :as s])
   (:use types.ty types.scheme types.ast types.decls types.init own.program emit.value emit.layout emit.ir emit.statics emit.text emit.program
-        emit.lower.cx emit.lower.pattern syntax.form))
+        emit.lower.cx emit.lower.pattern syntax.form)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; Adds a line to the text of the quoted constants.
-(defun add-quote-line :private (p: Program line: str) -> unit
-  (set! (. p quote-text) (str-join [@(. p quote-text) line "\n"])))
+(defun add-quote-line :private (p: Program name: str ty: lt/LType value: la/LExpr) -> unit
+  (set! (. p quote-text) (conj @(. p quote-text)
+                             (la/ItGlobal (la/LGlobalDef (bare name) ty value true (la/LModifiers la/lk-internal false) 0 false)))))
 
 ;; The name of a constant without its `@`.
 (defun bare :private (name: str) -> str
   (str-slice name 1 (str-len name)))
 
 ;; `(i64 N)` and the like.
-(defun lit-text :private (ty: str n: i64) -> str
-  (str-join ["(" ty " " (str n) ")"]))
+(defun lit-text :private (ty: str value: i64) -> la/LExpr (nx/integer (nx/type-word ty) value))
 
 ;; The variant name and field texts of a form: the strings and keywords it names are interned in this order. Rust: quote.rs:42
-(defun form-fields :private (cx: LowerCx f: Stx form-ty: Ty) -> (Result (Pair str (Vec str)) str)
+(defun form-fields :private (cx: LowerCx f: Stx form-ty: Ty) -> (Result (Pair str (Vec la/LExpr)) str)
   (let ((st (. (. cx p) statics)))
     (match (. f kind)
-      ((SSym x) (Ok (Pair "Sym" [(statics-string st x 0)])))
-      ((SKw k) (Ok (Pair "Kw" [(statics-string st k 0)])))
+      ((SSym x) (Ok (Pair "Sym" [(nx/reference (statics-string st x 0))])))
+      ((SKw k) (Ok (Pair "Kw" [(nx/reference (statics-string st k 0))])))
       ((SInt v w) (let ((wk (statics-keyword st (int-width-suffix w))))
                     (Ok (Pair "Int" [(lit-text "i64" v) (lit-text "i64" wk)]))))
       ((SFlt v w) (let ((wk (statics-keyword st (flt-width-suffix w))))
-                    (Ok (Pair "Flt" [(str-join ["(double " (float-lir-text v) ")"]) (lit-text "i64" wk)]))))
-      ((SStr x) (Ok (Pair "Str" [(statics-string st x 0)])))
+                    (Ok (Pair "Flt" [(nx/floating lt/ty-double v) (lit-text "i64" wk)]))))
+      ((SStr x) (Ok (Pair "Str" [(nx/reference (statics-string st x 0))])))
       ((SChr c) (Ok (Pair "Chr" [(lit-text "i32" (long c))])))
       ((syntax.form/SBool b) (Ok (Pair "Bool" [(lit-text "i1" (if b 1 0))])))
       ((SNil) (Ok (Pair "Nil" [])))
-      ((SList items) (try-let ((v (forms-vec cx items form-ty))) (Ok (Pair "List" [v]))))
-      ((SVec items) (try-let ((v (forms-vec cx items form-ty))) (Ok (Pair "Vec" [v]))))
-      ((SMap items) (try-let ((v (forms-vec cx items form-ty))) (Ok (Pair "Map" [v])))))))
+      ((SList items) (try-let ((v (forms-vec cx items form-ty))) (Ok (Pair "List" [(nx/reference v)]))))
+      ((SVec items) (try-let ((v (forms-vec cx items form-ty))) (Ok (Pair "Vec" [(nx/reference v)]))))
+      ((SMap items) (try-let ((v (forms-vec cx items form-ty))) (Ok (Pair "Map" [(nx/reference v)])))))))
 
 ;; The position of the variant called `name`.
 (defun variant-index :private (vs: (Vec VariantDef) name: str) -> (Option i64)
@@ -46,7 +47,7 @@
         nil)))
 
 ;; The constant of one form; its name. Rust: quote.rs:32 form_constant
-(defun form-constant :private (cx: LowerCx f: Stx) -> (Result str str)
+(defun form-constant :private (cx: LowerCx form: Stx) -> (Result str str)
   (let ((p (. cx p)) (g (program-g (. cx p))))
     (match @(. g form)
       (nil (Err "the prelude defines no Form"))
@@ -56,14 +57,14 @@
            (match (. (g-ty g form-id) shape)
              ((TsStruct _) (Err "Form is not an enum"))
              ((TsEnum vs)
-              (try-let ((vf (form-fields cx f form-ty)))
+              (try-let ((vf (form-fields cx form form-ty)))
                 (match (variant-index vs (. vf fst))
                   (nil (Err (str-join ["Form has no variant " (. vf fst)])))
                   ((some tag)
-                   (let ((name (program-fresh-quote p)) (vsname (str-join [(. o snd) ".v" (str tag)])))
-                     (do (add-quote-line p (str-join ["(constant internal " (bare name) " %struct." vsname " (%struct." vsname
-                                                      " (i64 0) (i32 " (str (. o fst)) ") (i32 " (str flag-immortal) ") (i32 "
-                                                      (str tag) ") " (s/join " " (. vf snd)) "))"]))
+                   (let ((name (program-fresh-quote p)) (vsname (str-join [(. o snd) ".v" (str tag)]))
+                         (header [(nx/integer lt/ty-i64 0) (nx/integer lt/ty-i32 (. o fst))
+                                  (nx/integer lt/ty-i32 flag-immortal) (nx/integer lt/ty-i32 tag)]))
+                     (do (add-quote-line p name (lt/TNamed vsname) (nx/named-aggregate vsname (into header (. vf snd))))
                          (Ok name))))))))))))))
 
 ;; An immortal `(Vec Form)` of up to 32 items: `VecEmpty`, or a `VecOf` whose tail array holds them all (the layout `build_vec`
@@ -74,51 +75,54 @@
       (nil (Err "the prelude defines no Vec"))
       ((some vec-id)
        (try-let ((o (program-object p (ty-nominal vec-id [form-ty]))))
-         (let ((vtid (str (. o fst))) (vsname (. o snd)) (name (program-fresh-quote p)) (imm (str flag-immortal)))
+         (let ((vsname (. o snd)) (name (program-fresh-quote p))
+               (header [(nx/integer lt/ty-i64 0) (nx/integer lt/ty-i32 (. o fst)) (nx/integer lt/ty-i32 flag-immortal)]))
            (if (empty? items)
-               (do (add-quote-line p (str-join ["(constant internal " (bare name) " %struct." vsname ".v0 (%struct." vsname ".v0 (i64 0) (i32 "
-                                                vtid ") (i32 " imm ") (i32 0)))"]))
-                   (Ok name))
+               (let ((ty (str vsname ".v0")))
+                 (do (add-quote-line p name (lt/TNamed ty) (nx/named-aggregate ty (conj header (nx/integer lt/ty-i32 0))))
+                     (Ok name)))
                (if (> (count items) 32)
                    (Err "a quoted vector of more than 32 items")
                    (try-let ((elems (try-map (fn (it: Stx) (form-constant cx it)) items))
                              (a (program-object p (TCon KArray [form-ty]))))
-                     (let ((arr (program-fresh-quote p)) (n (str (count items))))
-                       (do (add-quote-line p (str-join ["(constant internal " (bare arr) " { i64 i32 i32 i64 [" n " x ptr] } { (i64 0) (i32 "
-                                                        (str (. a fst)) ") (i32 " imm ") (i64 " n ") ([" n " x ptr] " (s/join " " elems) ") })"]))
-                           (add-quote-line p (str-join ["(constant internal " (bare name) " %struct." vsname ".v1 (%struct." vsname
-                                                        ".v1 (i64 0) (i32 " vtid ") (i32 " imm ") (i32 1) (i64 " n ") (i64 5) (ptr null) "
-                                                        arr "))"]))
+                     (let ((arr (program-fresh-quote p)) (length (count items))
+                           (array-ty (lt/TArray (count items) lt/ty-ptr))
+                           (vec-ty (str vsname ".v1")))
+                       (do (add-quote-line p arr (lt/TAnon [lt/ty-i64 lt/ty-i32 lt/ty-i32 lt/ty-i64 array-ty])
+                                           (nx/aggregate [(nx/integer lt/ty-i64 0) (nx/integer lt/ty-i32 (. a fst))
+                                                          (nx/integer lt/ty-i32 flag-immortal) (nx/integer lt/ty-i64 length)
+                                                          (nx/array-value array-ty (mapv nx/reference elems))]))
+                           (add-quote-line p name (lt/TNamed vec-ty)
+                                           (nx/named-aggregate vec-ty (into header [(nx/integer lt/ty-i32 1) (nx/integer lt/ty-i64 length)
+                                                                                  (nx/integer lt/ty-i64 5) (nx/null) (nx/reference arr)])))
                            (Ok name))))))))))))
 
 ;; `(quote f)`: the address of its immortal graph. Rust: lower/quote.rs:20 LowerCx::quote
 (defun lcx-quote (cx: LowerCx e: Expr f: Stx) -> (Result V str)
   (let ((p (. cx p)))
     (match (get @(. p quotes) (. e id))
-      ((some name) (Ok (VVal name LirPtr)))
+      ((some name) (Ok (VVal (nx/reference name) LirPtr)))
       (nil (try-let ((name (form-constant cx f)))
              (do (set! (. p quotes) (assoc @(. p quotes) (. e id) name))
-                 (Ok (VVal name LirPtr))))))))
+                 (Ok (VVal (nx/reference name) LirPtr))))))))
 
 ;; The `(concat v..)` of the values `vals`, of vector type `t` with element `elem`: their lengths added, their elements gathered into
 ;; a scratch buffer and the vector built from it, as `build_vec` builds it. Rust: quote.rs:152 (after the parts are lowered)
 (defun concat-vals :private (cx: LowerCx vals: (Vec V) t: Ty elem: Ty) -> (Result V str)
   (try-let ((ids (lcx-vec-tids cx t elem)))
-    (let ((b (. cx b)) (esize (str (. ids esize))))
+    (let ((b (. cx b)) (esize (. ids esize)))
       (let ((total (reduce (fn (acc: V v: V)
-                             (let ((len (fb-val b (str-join ["(call @fib.vec-len " (v-text v) ")"]) LirI64)))
-                               (fb-val b (str-join ["(add " (v-text acc) " " (v-text len) ")"]) LirI64)))
-                           (fb-val b "(i64 0)" LirI64) vals)))
-        (let ((scratch (fb-val b (str-join ["(call @malloc (mul " (v-text total) " (i64 " esize ")))"]) LirPtr)))
+                             (let ((len (fb-val b (nx/call "fib.vec-len" [(v-expr v)]) LirI64)))
+                               (fb-val b (nx/binary la/BAdd (v-expr acc) (v-expr len)) LirI64)))
+                           (fb-val b (nx/integer lt/ty-i64 0) LirI64) vals)))
+        (let ((scratch (fb-val b (nx/call "malloc" [(nx/binary la/BMul (v-expr total) (nx/integer lt/ty-i64 esize))]) LirPtr)))
           (let ((at (reduce (fn (at: V v: V)
-                              (fb-val b (str-join ["(call @fib.vec-gather " (v-text v) " " (v-text scratch) " " (v-text at) " (i64 " esize "))"])
+                              (fb-val b (nx/call "fib.vec-gather" [(v-expr v) (v-expr scratch) (v-expr at) (nx/integer lt/ty-i64 esize)])
                                       LirI64))
                             (v-int LirI64 0) vals)))
-            (let ((r (fb-val b (str-join ["(call @fib.vec-build " (v-text scratch) " " (v-text total) " (i64 " esize ") (i8 "
-                                          (str (. ids counted)) ") (i32 " (str (. ids tvec)) ") (i32 " (str (. ids tnode)) ") (i32 "
-                                          (str (. ids tarr)) ") (i32 " (str (. ids tnarr)) "))"])
+            (let ((r (fb-val b (nx/call "fib.vec-build" [(v-expr scratch) (v-expr total) (nx/integer lt/ty-i64 esize) (nx/integer lt/ty-i8 (. ids counted)) (nx/integer lt/ty-i32 (. ids tvec)) (nx/integer lt/ty-i32 (. ids tnode)) (nx/integer lt/ty-i32 (. ids tarr)) (nx/integer lt/ty-i32 (. ids tnarr))])
                              LirPtr)))
-              (do (fb-stmt b (str-join ["(call @free " (v-text scratch) ")"]))
+              (do (fb-stmt b (nx/call "free" [(v-expr scratch)]))
                   (Ok r)))))))))
 
 ;; `(concat v..)`: a fresh vector of every part's elements. `e` is the whole call, whose type is the vector's even when there are no

@@ -6,16 +6,17 @@
 ;; Rust's multi-name arms are single ones.
 (ns emit.lower.pattern
   (:use types.ty types.scheme types.ast types.decls types.names types.init own.program emit.value emit.layout emit.ir emit.objects.kinds
-        emit.statics emit.text emit.program emit.lower.cx))
+        emit.statics emit.text emit.program emit.lower.cx)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; Continues in a fresh block when `c` holds, else goes to `fail`. Rust: pattern.rs:178 branch
 (defun branch :private (cx: LowerCx c: V fail: str) -> unit
   (let ((ok (fb-label (. cx b) "ok")))
-    (do (fb-term (. cx b) (str-join ["(br " (v-text c) " " ok " " fail ")"]))
+    (do (fb-term (. cx b) (nx/conditional (v-expr c) ok fail))
         (fb-open (. cx b) ok))))
 
 ;; A comparison value: `(icmp eq x (T n))` and the like.
-(defun test-val :private (cx: LowerCx text: str) -> V
+(defun test-val :private (cx: LowerCx text: la/LExpr) -> V
   (fb-val (. cx b) text LirI1))
 
 (defun bind-local :private (cx: LowerCx b: i64 v: V) -> unit
@@ -33,23 +34,26 @@
          (match (. def shape) ((TsStruct _) true) (_ false)))))
 
 ;; The test of a literal pattern against the value. Rust: pattern.rs:188 lit_test
-(defun lit-test :private (cx: LowerCx l: Lit v: V) -> (Result V str)
-  (let ((x (v-text v)) (st (. (. cx p) statics)))
+(defun lit-test :private (cx: LowerCx lit: Lit value: V) -> (Result V str)
+  (match lit ((LitUnit) (Ok (v-int LirI1 1))) (_ (lit-test-value cx lit value))))
+
+(defun lit-test-value :private (cx: LowerCx l: Lit v: V) -> (Result V str)
+  (let ((x (v-expr v)) (st (. (. cx p) statics)))
     (match l
       ((LitInt n _)
        (match (v-ty v)
-         ((some t) (Ok (test-val cx (str-join ["(icmp eq " x " (" (lir-ty-text t) " " (str n) "))"]))))
+         ((some t) (Ok (test-val cx (nx/compare-int la/IEq x (nx/integer (lir-type t) n)))))
          (nil (Err "literal pattern on unit"))))
       ((LitFloat f _)
        (match (v-ty v)
-         ((some t) (Ok (test-val cx (str-join ["(fcmp oeq " x " (" (lir-ty-text t) " " (float-lir-text f) "))"]))))
+         ((some t) (Ok (test-val cx (nx/compare-float la/FOeq x (nx/floating (lir-type t) f)))))
          (nil (Err "literal pattern on unit"))))
-      ((LitChar c) (Ok (test-val cx (str-join ["(icmp eq " x " (i32 " (str (long c)) "))"]))))
-      ((LitBool b) (Ok (test-val cx (str-join ["(icmp eq " x " (i1 " (if b "1" "0") "))"]))))
+      ((LitChar c) (Ok (test-val cx (nx/compare-int la/IEq x (nx/integer lt/ty-i32 (long c))))))
+      ((LitBool b) (Ok (test-val cx (nx/compare-int la/IEq x (nx/integer lt/ty-i1 (if b 1 0))))))
       ((LitKeyword k) (let ((id (statics-keyword st k)))
-                        (Ok (test-val cx (str-join ["(icmp eq " x " (i64 " (str id) "))"])))))
+                        (Ok (test-val cx (nx/compare-int la/IEq x (nx/integer lt/ty-i64 id))))))
       ((LitStr s) (let ((lit (statics-string st s 0)))
-                    (Ok (test-val cx (str-join ["(call @fib.str-eq " x " " lit ")"])))))
+                    (Ok (test-val cx (nx/call "fib.str-eq" [x (nx/reference lit)])))))
       ((LitUnit) (Ok (v-int LirI1 1))))))
 
 ;; Whether the field type `ft` is an `Option` of a pointer that is no `Option`, which is the pointer itself (`OptNull`): the payload of a
@@ -70,7 +74,7 @@
         (let ((ft (nth fields i)) (p (nth subs i)))
           (try-let ((lt (program-lir (. cx p) ft)))
             (let ((fv (match lt
-                        ((some l) (lcx-load cx l (lcx-gep cx sname (v-text v) slot)))
+                        ((some l) (lcx-load cx l (lcx-gep cx sname (v-expr v) slot)))
                         (nil VUnit))))
               (do (match (. p kind)
                     ((PBind b) (when (some? lt)
@@ -86,8 +90,8 @@
 
 ;; The test that the tag of the enum object `v` is `want`, branching to `fail` otherwise. Rust: pattern.rs:218
 (defun check-tag :private (cx: LowerCx sname: str v: V want: i64 fail: str) -> unit
-  (let ((tag (lcx-load cx LirI32 (lcx-gep cx sname (v-text v) slot-enum-tag))))
-    (branch cx (test-val cx (str-join ["(icmp eq " (v-text tag) " (i32 " (str want) "))"])) fail)))
+  (let ((tag (lcx-load cx LirI32 (lcx-gep cx sname (v-expr v) slot-enum-tag))))
+    (branch cx (test-val cx (nx/compare-int la/IEq (v-expr tag) (nx/integer lt/ty-i32 want))) fail)))
 
 ;; A struct or enum pattern on an object of type `t` (arguments `args`). Rust: pattern.rs:205 ctor_pattern (after the tests of
 ;; `Option` and of field-less enums)
@@ -110,7 +114,7 @@
         (option-pattern cx variant subs v t fail)
         (let ((def (g-ty g id)))
           (if (typedef-is-fieldless-enum def)
-              (do (branch cx (test-val cx (str-join ["(icmp eq " (v-text v) " (i32 " (str (unwrap-or variant 0)) "))"])) fail)
+              (do (branch cx (test-val cx (nx/compare-int la/IEq (v-expr v) (nx/integer lt/ty-i32 (unwrap-or variant 0)))) fail)
                   (Ok ()))
               (match t
                 ((TCon (KNominal _) args) (object-pattern cx def id args variant subs v t fail))
@@ -121,15 +125,15 @@
 (defun boxed-option :private (cx: LowerCx is-some: bool payload: Ty subs: (Vec Pattern) v: V t: Ty fail: str) -> (Result unit str)
   (try-let ((o (program-object (. cx p) t)))
     (let ((sname (. o snd))
-          (null (test-val cx (str-join ["(icmp eq " (v-text v) " (ptr null))"])))
+          (null (test-val cx (nx/compare-int la/IEq (v-expr v) (nx/null))))
           (lnull (fb-label (. cx b) "onull")) (ltag (fb-label (. cx b) "otag")) (lok (fb-label (. cx b) "ok")))
-      (do (fb-term (. cx b) (str-join ["(br " (v-text null) " " lnull " " ltag ")"]))
+      (do (fb-term (. cx b) (nx/conditional (v-expr null) lnull ltag))
           (fb-open (. cx b) lnull)
-          (fb-term (. cx b) (str-join ["(br " (if is-some fail lok) ")"]))
+          (fb-term (. cx b) (nx/branch (if is-some fail lok)))
           (fb-open (. cx b) ltag)
-          (let ((tag (lcx-load cx LirI32 (lcx-gep cx sname (v-text v) slot-enum-tag)))
-                (c (test-val cx (str-join ["(icmp eq " (v-text tag) " (i32 " (if is-some "1" "0") "))"]))))
-            (do (fb-term (. cx b) (str-join ["(br " (v-text c) " " lok " " fail ")"]))
+          (let ((tag (lcx-load cx LirI32 (lcx-gep cx sname (v-expr v) slot-enum-tag)))
+                (c (test-val cx (nx/compare-int la/IEq (v-expr tag) (nx/integer lt/ty-i32 (if is-some 1 0))))))
+            (do (fb-term (. cx b) (nx/conditional (v-expr c) lok fail))
                 (fb-open (. cx b) lok)
                 (if is-some
                     (sub-patterns cx (str-join [sname ".v1"]) slot-variant-field0 [payload] subs v fail)
@@ -140,12 +144,12 @@
 (defun value-option :private (cx: LowerCx is-some: bool payload: Ty subs: (Vec Pattern) v: V fail: str) -> (Result unit str)
   (match (v-ty v)
     ((some (LirOpt inner))
-     (let ((tag (fb-val (. cx b) (str-join ["(extractvalue " (v-text v) " 0)"]) LirI1)))
+     (let ((tag (fb-val (. cx b) (nx/extract (v-expr v) 0) LirI1)))
        (do (if is-some
                (branch cx tag fail)
-               (branch cx (test-val cx (str-join ["(xor " (v-text tag) " (i1 1))"])) fail))
+               (branch cx (test-val cx (nx/binary la/BXor (v-expr tag) (nx/integer lt/ty-i1 1))) fail))
            (if (and is-some (= (count subs) 1) (not (wild? (nth subs 0))))
-               (lcx-match-pattern cx (nth subs 0) (fb-val (. cx b) (str-join ["(extractvalue " (v-text v) " 1)"]) inner) payload fail)
+               (lcx-match-pattern cx (nth subs 0) (fb-val (. cx b) (nx/extract (v-expr v) 1) inner) payload fail)
                (Ok ())))))
     (_ (Err "an Option of a scalar held as something that is not a pair"))))
 
@@ -157,7 +161,7 @@
        (try-let ((rep (option-rep g payload)))
          (match rep
            ((OptNull)
-            (do (branch cx (test-val cx (str-join ["(icmp " (if is-some "ne" "eq") " " (v-text v) " (ptr null))"])) fail)
+            (do (branch cx (test-val cx (nx/compare-int (nx/int-predicate (if is-some "ne" "eq")) (v-expr v) (nx/null))) fail)
                 (if (and is-some (= (count subs) 1))
                     (lcx-match-pattern cx (nth subs 0) v payload fail)
                     (Ok ()))))
@@ -167,17 +171,17 @@
 ;; The element `i` of the vector `v`, read as `vec-nth` reads it with no count operation. Rust: pattern.rs:90
 (defun vec-elem :private (cx: LowerCx v: V i: i64 el: (Option LirTy) esize: i64) -> V
   (match el
-    ((some l) (lcx-load cx l (v-text (fb-val (. cx b)
-                                             (str-join ["(call @fib.vec-elem-ptr " (v-text v) " (i64 " (str i) ") (i64 " (str esize) "))"])
+    ((some l) (lcx-load cx l (v-expr (fb-val (. cx b)
+                                             (nx/call "fib.vec-elem-ptr" [(v-expr v) (nx/integer lt/ty-i64 i) (nx/integer lt/ty-i64 esize)])
                                              LirPtr))))
     (nil VUnit)))
 
 ;; A vector pattern of `elem`s (§8.3): the length test, then each element; a rest is noted for `lcx-build-rests`.
 ;; Rust: pattern.rs:63 vec_pattern, after the tuple and element type tests
 (defun vec-elements :private (cx: LowerCx subs: (Vec Pattern) rest: Rest v: V t: Ty elem: Ty fail: str) -> (Result unit str)
-  (let ((n (fb-val (. cx b) (str-join ["(call @fib.vec-len " (v-text v) ")"]) LirI64))
+  (let ((n (fb-val (. cx b) (nx/call "fib.vec-len" [(v-expr v)]) LirI64))
         (k (count subs)))
-    (let ((c (test-val cx (str-join ["(icmp " (match rest ((RestExact) "eq") (_ "sge")) " " (v-text n) " (i64 " (str k) "))"]))))
+    (let ((c (test-val cx (nx/compare-int (nx/int-predicate (match rest ((RestExact) "eq") (_ "sge"))) (v-expr n) (nx/integer lt/ty-i64 k)))))
       (do (branch cx c fail)
           (try-let ((el (program-lir (. cx p) elem)))
             (let ((esize (match el ((some l) (. (size-align-pb (program-pb (. cx p)) l) fst)) (nil 0))))
@@ -207,7 +211,7 @@
 (defun lcx-bind-irrefutable (cx: LowerCx pat: Pattern v: V t: Ty) -> (Result unit str)
   (let ((fail (fb-label (. cx b) "nomatch")) (ok (fb-label (. cx b) "bound")))
     (try-let ((matched (lcx-match-pattern cx pat v t fail)) (rests (lcx-build-rests cx)))
-      (do (fb-term (. cx b) (str-join ["(br " ok ")"]))
+      (do (fb-term (. cx b) (nx/branch ok))
           (fb-open (. cx b) fail)
           (lcx-trap-c cx "no match clause matched")
           (fb-open (. cx b) ok)
@@ -230,9 +234,7 @@
     ((TCon (KNominal _) args)
      (try-let ((ids (lcx-vec-tids cx t (nth args 0))))
        (Ok (fb-val (. cx b)
-                   (str-join ["(call @fib.vec-drop " (v-text v) " (i64 " (str k) ") (i64 " (str (. ids esize)) ") (i8 "
-                              (str (. ids counted)) ") (i32 " (str (. ids tvec)) ") (i32 " (str (. ids tnode)) ") (i32 "
-                              (str (. ids tarr)) ") (i32 " (str (. ids tnarr)) "))"])
+                   (nx/call "fib.vec-drop" [(v-expr v) (nx/integer lt/ty-i64 k) (nx/integer lt/ty-i64 (. ids esize)) (nx/integer lt/ty-i8 (. ids counted)) (nx/integer lt/ty-i32 (. ids tvec)) (nx/integer lt/ty-i32 (. ids tnode)) (nx/integer lt/ty-i32 (. ids tarr)) (nx/integer lt/ty-i32 (. ids tnarr))])
                    LirPtr))))
     (_ (Err "a rest of a non-Vec"))))
 

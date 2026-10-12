@@ -4,7 +4,8 @@
 ;; this module (call dispatches through `dyn_target`): it is the hub's `instance-of-pred`.
 (ns emit.lower.dynamic
   (:use types.ty types.scheme types.ast types.decls types.table types.init own.program emit.value emit.names emit.mono emit.ir emit.statics
-        emit.program emit.lower.cx emit.lower.arith))
+        emit.program emit.lower.cx emit.lower.arith)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; Every supertrait constraint `p` entails, transitively, depth first, each protocol once (§4.1 rule 2).
 ;; Rust: lower/dynamic.rs:178 super_closure
@@ -47,7 +48,7 @@
   (try-let ((lirs (try-map (fn (t: Ty) (program-lir (. cx p) t)) params)))
     (Ok (Pair (vec (keep (fn (j: i64) (match (nth lirs j) ((some l) (some (LirParam l (str-join ["p" (str j)])))) (nil nil)))
                          (range (count params))))
-              (mapv (fn (j: i64) (match (nth lirs j) ((some l) (VVal (str-join ["p" (str j)]) l)) (nil VUnit)))
+              (mapv (fn (j: i64) (match (nth lirs j) ((some l) (v-local (str-join ["p" (str j)]) l)) (nil VUnit)))
                     (range (count params)))))))
 
 ;; The body of a native slot, recorded as a helper: the native method run on the parameters, then returned.
@@ -59,8 +60,8 @@
         (match r
           (nil (Err "a native method that does not return"))
           ((some v)
-           (do (fb-term (. w b) (match v ((VUnit) "(ret)") ((VVal s _) (str-join ["(ret " s ")"]))))
-               (program-add-helper (. cx p) name (fb-render (. w b)))
+           (do (fb-term (. w b) (match v ((VUnit) (nx/ret nil)) ((VVal s _) (nx/ret (some s)))))
+               (program-add-helper (. cx p) name (fb-function (. w b)))
                (Ok name))))))))
 
 ;; The slots of a vtable for `p` at the instance `index`: one for each method of `p`.
@@ -113,9 +114,9 @@
         (match pos
           (nil (Err (str-join [(. (g-proto g q) name) " is not a supertrait of " (. (g-proto g p) name)])))
           ((some k)
-           (let ((vt (fb-val (. cx b) (str-join ["(extractvalue " (v-text v) " 1)"]) LirPtr)))
-             (let ((slot (fb-val (. cx b) (str-join ["(getelementptr ptr " (v-text vt) " (i64 " (str (+ n k)) "))"]) LirPtr)))
-               (Ok (lcx-load cx LirPtr (v-text slot)))))))))))
+           (let ((vt (fb-val (. cx b) (nx/extract (v-expr v) 1) LirPtr)))
+             (let ((slot (fb-val (. cx b) (nx/gep lt/ty-ptr (v-expr vt) [(nx/integer lt/ty-i64 (+ n k))]) LirPtr)))
+               (Ok (lcx-load cx LirPtr (v-expr slot)))))))))))
 
 ;; `(dyn P e)`: the value with the vtable of `(P, head type of e)`, or an upcast of a `dyn` value through its supertrait slot.
 ;; Rust: lower/dynamic.rs:19 LowerCx::dyn_of
@@ -125,21 +126,21 @@
       ((TCon (KDyn q _) _)
        (if (= q p)
            (Ok v)
-           (let ((obj (fb-val (. cx b) (str-join ["(extractvalue " (v-text v) " 0)"]) LirPtr)))
+           (let ((obj (fb-val (. cx b) (nx/extract (v-expr v) 0) LirPtr)))
              (try-let ((vt (super-vtable cx v q p)))
-               (Ok (fb-val (. cx b) (str-join ["{ " (v-text obj) " " (v-text vt) " }"]) LirDyn))))))
+               (Ok (fb-val (. cx b) (nx/aggregate [(v-expr obj) (v-expr vt)]) LirDyn))))))
       (_ (try-let ((vt (vtable-for cx p t)))
-           (Ok (fb-val (. cx b) (str-join ["{ " (v-text v) " " vt " }"]) LirDyn)))))))
+           (Ok (fb-val (. cx b) (nx/aggregate [(v-expr v) (nx/reference vt)]) LirDyn)))))))
 
 ;; The target of method `i` of protocol `q` called on the `dyn` receiver `recv` of type `t`. Rust: lower/dynamic.rs:150 LowerCx::dyn_target
 (defun lcx-dyn-target (cx: LowerCx recv: V t: Ty q: i64 i: i64) -> (Result Target str)
   (match t
     ((TCon (KDyn p _) _)
-     (let ((obj (fb-val (. cx b) (str-join ["(extractvalue " (v-text recv) " 0)"]) LirPtr)))
+     (let ((obj (fb-val (. cx b) (nx/extract (v-expr recv) 0) LirPtr)))
        (try-let ((vt (if (= p q)
-                         (Ok (fb-val (. cx b) (str-join ["(extractvalue " (v-text recv) " 1)"]) LirPtr))
+                         (Ok (fb-val (. cx b) (nx/extract (v-expr recv) 1) LirPtr))
                          (super-vtable cx recv p q))))
-         (let ((slot (fb-val (. cx b) (str-join ["(getelementptr ptr " (v-text vt) " (i64 " (str i) "))"]) LirPtr)))
-           (let ((code (lcx-load cx LirPtr (v-text slot))))
-             (Ok (TgCode (v-text code) (v-text obj))))))))
+         (let ((slot (fb-val (. cx b) (nx/gep lt/ty-ptr (v-expr vt) [(nx/integer lt/ty-i64 i)]) LirPtr)))
+           (let ((code (lcx-load cx LirPtr (v-expr slot))))
+             (Ok (TgCode (v-expr code) (v-expr obj))))))))
     (_ (Err "a dyn call on a non-dyn receiver"))))

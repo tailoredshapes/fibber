@@ -1,67 +1,68 @@
-;; compiler/emit/assemble.fib: the module's text in its parts, and the loop that emits every body and closure queued
+;; compiler/emit/assemble.fib: the module's structured items in their sections, and the loop that emits every body and closure queued
 ;; (spec/compiler.md §2). Replaces compile.rs:71 `emit_all`, :175 `module_parts`, `assemble_parts` and the types `Parts` and `Module`
 ;; (compile.rs:211-262), which are not in emit.compile because emit.defs.mod needs `emit-all` and `assemble-parts` (it assembles
 ;; the module so far for every `def` it runs) and emit.compile needs `emit-defs`: a module cannot call its caller.
 ;; A stub reached makes `emit-body` and `emit-closure` return an error whose message starts with `todo: ` (pending, never a pass):
 ;; `emit-all` passes it on, and emit.compile makes it the `pending` of the `Module`.
 (ns emit.assemble
+  (:require [lir.ast :as la] [lir.print :as print] [emit.lirdata :as data])
   (:use types.ty own.program emit.value emit.mono emit.objects emit.statics emit.program emit.inits emit.rt emit.lower.mod emit.defs.data))
 
 ;; The text of a module before its `main`, in the pieces `assemble-parts` puts together, in this order (`fibc emit-dump --sections`):
 ;; the runtime, the `extern` declarations, the object structs and the type table, the static data, the keyword helpers, the values
 ;; of the `def`s, the quoted constants, then every function in the order its body was finished. Rust: compile.rs:211 Parts
-(defstruct Parts (runtime: str externs: str types: str statics: str keywords: str defs: str quotes: str fns: (Vec str)))
+(defstruct Parts (runtime: (Vec la/LItem) externs: (Vec la/LItem) types: (Vec la/LItem)
+                  statics: (Vec la/LItem) keywords: (Vec la/LItem) defs: (Vec la/LItem)
+                  quotes: (Vec la/LItem) fns: (Vec la/LItem) links: (Vec (Pair str str))))
 
 ;; A program's lIR module: Parts, then lIR's `main`; `pending` is the first stub reached, when emitting stopped at one (the parts
 ;; after the runtime are then empty). Rust: compile.rs:243 Module
-(defstruct Module (parts: Parts main: str pending: (Option str)))
+(defstruct Module (parts: Parts main: (Vec la/LItem) pending: (Option str)))
 
 ;; The parts of a module that stopped at a stub: only the runtime is known.
 (defun parts-pending () -> Parts
-  (Parts (runtime-text) "" "" "" "" "" "" []))
+  (Parts (data/read-runtime (runtime-text)) [] [] [] [] [] [] [] []))
 
 ;; The pieces one after the other. Rust: compile.rs:226 Parts::text
+(defun parts-items (parts: Parts) -> (Vec la/LItem)
+  (into (into (into (into (into (into (into (. parts runtime) (. parts externs)) (. parts types)) (. parts statics))
+                                (. parts keywords)) (. parts defs)) (. parts quotes)) (. parts fns)))
+
+(defun link-text (links: (Vec (Pair str str))) -> str
+  (str-join (mapv (fn (l: (Pair str str)) (str ";; link-lib: " (. l fst) " " (. l snd) "\n")) links)))
+
 (defun parts-text (parts: Parts) -> str
-  (str-join (into [(. parts runtime) (. parts externs) (. parts types) (. parts statics) (. parts keywords) (. parts defs)
-                   (. parts quotes)]
-                  (. parts fns))))
+  (str (link-text (. parts links)) (print/print-module (la/LModule (parts-items parts)))))
 
 ;; The text `fibc emit` prints. Rust: compile.rs:253 Module::text
+(defun module-ast (m: Module) -> la/LModule
+  (la/LModule (into (parts-items (. m parts)) (. m main))))
+
 (defun module-text (m: Module) -> str
-  (str-join [(parts-text (. m parts)) (. m main)]))
+  (str (link-text (. (. m parts) links)) (print/print-module (module-ast m))))
 
 ;; The runtime, the tables, the static data and every function: what a program and a macro module share, and what `emit_defs`
 ;; assembles again for every `def` it runs, so the program's functions and quoted constants are copied and left in place.
 ;; Rust: compile.rs:269 module_parts
-(defun module-parts (p: Program defs: str) -> Parts
-  (module-parts-with (runtime-text) p defs))
+(defun module-parts (p: Program defs: (Vec la/LItem)) -> Parts
+  (module-parts-with (. p runtime) p defs))
 
 ;; `module-parts` with the text of the runtime `rt` (the target's for a program, the host's for what the JIT runs: emit.rt).
-(defun module-parts-with (rt: str p: Program defs: str) -> Parts
-  ;; The names of the keyword helpers intern strings: they come before the statics are rendered.
-  (let ((keywords (program-render-keyword-helpers p))
-        (externs (program-render-externs p))
-        (types (objects-render-pb (. p objects) (program-pb p))))
-    (let ((statics (statics-render (. p statics))))
-      ;; §3.19, L15: the slot globals of the `def`s made at run time come with the values of the constant `def`s.
-      (let ((slots (inits-slot-text p)))
-        (Parts rt externs types statics keywords (str-join [slots defs]) @(. p quote-text) @(. p funcs))))))
+(defun module-parts-with (rt: (Vec la/LItem) p: Program defs: (Vec la/LItem)) -> Parts
+  ;; Keywords intern their strings before statics are collected.
+  (let ((keywords (program-keyword-items p))
+        (types (objects-items-pb (. p objects) (program-pb p))))
+    (Parts rt @(. p externs) types (statics-items (. p statics)) keywords
+           (into (inits-slot-items p) defs) @(. p quote-text)
+           (mapv (fn (f: la/LFunction) (la/ItDefine f)) @(. p funcs)) @(. p link-notes))))
 
-;; The pieces of `module-parts`' text, in the order of `parts-text`: each is the text of whole lIR items that is the same every time the module
-;; is assembled again (a function, a static string, the text of one object's structs), so that the hand-over to the JIT (emit.defs.astmod) parses
-;; each once. `(str-join (module-pieces p d))` is `(assemble-parts p @(. d text))`, which the verifying mode checks.
-(defun module-pieces (p: Program d: Defs) -> (Vec str)
-  (let ((keywords (program-render-keyword-helpers p))
-        (externs @(. p externs))
-        (types (objects-render-pieces-pb (. p objects) (program-pb p))))
-    (let ((statics (statics-render-pieces (. p statics))))
-      (let ((slots (inits-slot-text p)))
-        (into (into (into (into (into (into [(runtime-text-host)] externs) types) statics) [keywords slots]) @(. d pieces))
-              (into [@(. p quote-text)] @(. p funcs)))))))
+;; The host module's items so far, reused by each constant-evaluation session.
+(defun module-items (p: Program d: Defs) -> (Vec la/LItem)
+  (parts-items (module-parts-with (. p runtime-host) p @(. d items))))
 
 ;; Rust: compile.rs:285 assemble_parts
-(defun assemble-parts (p: Program defs: str) -> str
-  (parts-text (module-parts-with (runtime-text-host) p defs)))
+(defun assemble-parts (p: Program defs: (Vec la/LItem)) -> str
+  (parts-text (module-parts-with (. p runtime-host) p defs)))
 
 ;; Emits every body and closure queued so far. Rust: compile.rs:71 emit_all
 (defun emit-all (p: Program) -> (Result unit str)

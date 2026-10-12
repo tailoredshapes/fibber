@@ -7,7 +7,8 @@
 (ns main
   (:require [fib.string :as s])
   (:use syntax.pos types.ty types.decls types.program types.check types.ast own.program emit.value emit.ir emit.mono emit.program
-        emit.objects emit.lower.cx emit.lower.mod emit.lower.threads))
+        emit.objects emit.lower.cx emit.lower.mod emit.lower.threads)
+  (:require [emit.node :as nx] [lir.ast :as la] [lir.types :as lt] [lir.print :as print]))
 
 (defun no-hub () -> Hub (hub-default))
 
@@ -22,8 +23,9 @@
 (defun lit (id: i64) -> Expr (Expr id (Pos "t" 0 0 0 0) (ELit LitUnit)))
 (defun lines (ls: (Vec str)) -> str (str-join (mapv (fn (l: str) (str-join [l "\n"])) ls)))
 (defun text-of (cx: LowerCx) -> str (fb-render (. cx b)))
-(defun funcs-of (cx: LowerCx) -> (Vec str) @(. (. cx p) funcs))
-(defun ok-v (r: (Result V str)) -> V (match r ((Ok v) v) ((Err m) (VVal m LirPtr))))
+(defun funcs-of (cx: LowerCx) -> (Vec str)
+  (mapv (fn (func: la/LFunction) (print/print-module (la/LModule [(la/ItDefine func)]))) @(. (. cx p) funcs)))
+(defun ok-v (r: (Result V str)) -> V (match r ((Ok v) v) ((Err m) (VVal (nx/local m) LirPtr))))
 (defun idx-of (text: str w: str) -> i64 (match (s/index-of text w) ((some i) i) (nil -1)))
 (defun i64-t () -> Ty (ty-scalar SI64))
 (defun err-is (r: (Result V str) m: str) -> bool (= r (Err m)))
@@ -98,7 +100,7 @@
 
 (defun spawn-of (result: Ty) -> (Pair LowerCx (Result V str))
   (let ((cx (cx-of (assoc (map-empty) 7 (ty-task result)) (no-hub))))
-    (Pair cx (lcx-spawn cx (lit 7) (VVal "f0" LirPtr)))))
+    (Pair cx (lcx-spawn cx (lit 7) (VVal (nx/local "f0") LirPtr)))))
 
 ;; The function `spawn` of an i64 task builds: the Rust's instructions (`fibc emit` of `(spawn (fn () 1))`, 2026-10-02), the names renumbered
 ;; from t1 and the atom's type id (4 here, 5 in that program).
@@ -127,12 +129,12 @@
                (= (text-of (. a fst)) (spawn-i64-text)))
         (check cs "spawn of a non-task is an error"
                (let ((cx (cx-of (assoc (map-empty) 7 (i64-t)) (no-hub))))
-                 (err-is (lcx-spawn cx (lit 7) (VVal "f0" LirPtr)) "spawn without a Task type"))))))
+                 (err-is (lcx-spawn cx (lit 7) (VVal (nx/local "f0") LirPtr)) "spawn without a Task type"))))))
 
 (defun join-checks (cs: Checks) -> unit
   (let ((cx (cx-of (assoc (map-empty) 7 (i64-t)) (no-hub))))
     (do (check cs "join of an i64 task: drive, then the result loaded from the atom"
-               (let ((r (lcx-join cx (lit 7) (VVal "t0" LirPtr))) (text (text-of cx)))
+               (let ((r (lcx-join cx (lit 7) (VVal (nx/local "t0") LirPtr))) (text (text-of cx)))
                  (and (match r ((Ok (VVal _ (LirI64))) true) (_ false))
                       (s/includes? text "(call @fib.drive t0)")
                       (s/includes? text "(getelementptr %struct.fib.task t0 (i32 0) (i32 7))")
@@ -140,12 +142,12 @@
                       (s/includes? text "(getelementptr %struct.fib.atom.i64 t2 (i32 0) (i32 4))"))))
         (check cs "join of a unit task has no value and retains nothing"
                (let ((cx2 (cx-of (map-empty) (no-hub))))
-                 (and (= (lcx-join-value cx2 (VVal "t0" LirPtr) (ty-unit)) (Ok VUnit))
+                 (and (= (lcx-join-value cx2 (VVal (nx/local "t0") LirPtr) (ty-unit)) (Ok VUnit))
                       (not (s/includes? (text-of cx2) "(call @fib.retain"))
                       (s/includes? (text-of cx2) "(call @fib.drive t0)")))))))
 
 (defun await-checks (cs: Checks) -> unit
-  (let ((cx (cx-of (assoc (map-empty) 7 (ty-task (i64-t))) (hub-of (VVal "t9" LirPtr)))))
+  (let ((cx (cx-of (assoc (map-empty) 7 (ty-task (i64-t))) (hub-of (VVal (nx/local "t9") LirPtr)))))
     (do (check cs "await outside an async body is an error"
                (err-is (lcx-await-task cx (lit 7)) "await outside an async body"))
         (set! (. cx async-frame) (some (AsyncFrame "task.l.f.a" 10 [])))

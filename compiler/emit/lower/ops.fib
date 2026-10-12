@@ -2,7 +2,8 @@
 ;; Replaces crates/fibc/src/lower/ops.rs (94 lines of Rust). `value-sites` (ops.rs:14) is in emit.lower.cx, where the context is
 ;; built: a constructor cannot call a module above it.
 (ns emit.lower.ops
-  (:use types.ty types.ast types.init own.program emit.value emit.ir emit.program emit.objects emit.lower.cx))
+  (:use types.ty types.ast types.init own.program emit.value emit.ir emit.program emit.objects emit.lower.cx)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; The value a site names; `nil` for a `def` (immortal: every operation on it is a no-op). Rust: lower/ops.rs:33 Cx::site
 (defun lcx-site (cx: LowerCx s: Site) -> (Result (Option V) str)
@@ -37,7 +38,7 @@
 ;; Rust: lower/ops.rs:69 Cx::retain
 (defun lcx-retain (cx: LowerCx v: V) -> unit
   (when-some (w (lcx-obj-word cx v))
-    (fb-stmt (. cx b) (str-join ["(call @fib.retain " w ")"]))))
+    (fb-stmt (. cx b) (nx/call "fib.retain" [w]))))
 
 ;; `PsSteal` of the value `v` of the pattern variable `b` (own.program): when the shell it was read from is unique at run time, `v` moves out
 ;; of the shell (its slot is nulled) and keeps its count; else it is retained as `PsRetain` does. A variable without an origin, or a value that is
@@ -49,15 +50,15 @@
      (match (Pair v (. o shell))
        ((Pair (VVal _ (LirPtr)) (VVal sh (LirPtr)))
         (let ((f (. cx b)))
-          (let ((unique (fb-val f (str-join ["(call @fib.unique? " sh ")"]) LirI1))
+          (let ((unique (fb-val f (nx/call "fib.unique?" [sh]) LirI1))
                 (ls (fb-label f "steal")) (lk (fb-label f "keep")) (lj (fb-label f "stolen")))
-            (do (fb-term f (str-join ["(br " (v-text unique) " " ls " " lk ")"]))
+            (do (fb-term f (nx/conditional (v-expr unique) ls lk))
                 (fb-open f ls)
-                (fb-stmt f (str-join ["(store (ptr null) " (lcx-gep cx (. o sname) sh (. o slot)) ")"]))
-                (fb-term f (str-join ["(br " lj ")"]))
+                (fb-stmt f (nx/store (nx/null) (lcx-gep cx (. o sname) sh (. o slot)) nil))
+                (fb-term f (nx/branch lj))
                 (fb-open f lk)
                 (lcx-retain cx v)
-                (fb-term f (str-join ["(br " lj ")"]))
+                (fb-term f (nx/branch lj))
                 (fb-open f lj)))))
        (_ (lcx-retain cx v))))))
 
@@ -74,7 +75,7 @@
 ;; Rust: lower/ops.rs:75 Cx::release
 (defun lcx-release (cx: LowerCx v: V) -> unit
   (when-some (w (lcx-obj-word cx v))
-    (fb-stmt (. cx b) (str-join ["(call @fib.release " w ")"]))))
+    (fb-stmt (. cx b) (nx/call "fib.release" [w]))))
 
 ;; The type of the value a site names, when the plan says (a binding or an expression); `nil` for the others.
 (defun site-ty :private (cx: LowerCx s: Site) -> (Option Ty)
@@ -86,7 +87,7 @@
 ;; The inline drop of a stack cell `w` of type `t`: the release of its one counted slot, which is what `drop.N` queues, without the
 ;; worklist and the indirect call of `fib.drop-fields` (the cell idiom of the library makes one per update). A cell of a scalar or of
 ;; unit holds nothing to release. Gives false when `t` is not a cell: the caller drops through the type record.
-(defun end-cell :private (cx: LowerCx w: str t: Ty) -> (Result bool str)
+(defun end-cell :private (cx: LowerCx w: la/LExpr t: Ty) -> (Result bool str)
   (match t
     ((TCon (KCell) args)
      (try-let ((o (program-object (. cx p) t)) (l (program-lir (. cx p) (nth args 0))))
@@ -104,9 +105,9 @@
   (match (lcx-obj-word cx v)
     (nil (Err "the plan ends a scalar as a stack object"))
     ((some w)
-     (do (fb-stmt (. cx b) (str-join ["(call @fib.stack-end " w ")"]))
-         (if (contains? @(. cx closure-slots) w)
+     (do (fb-stmt (. cx b) (nx/call "fib.stack-end" [w]))
+         (if (contains? @(. cx closure-slots) (nx/operand-name w))
              (Ok ())
              (try-let ((done (match ty (nil (Ok false)) ((some t) (end-cell cx w t)))))
-               (do (when (not done) (fb-stmt (. cx b) (str-join ["(call @fib.drop-fields " w ")"])))
+               (do (when (not done) (fb-stmt (. cx b) (nx/call "fib.drop-fields" [w])))
                    (Ok ()))))))))

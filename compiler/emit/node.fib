@@ -1,0 +1,60 @@
+;; Structured lIR operands and instructions. Emission builds the same nodes
+;; the lIR checker and native backend consume; printing is a boundary operation.
+(ns emit.node
+  (:use lir.types lir.lit lir.ast)
+  (:require [lir.print :as print])
+  (:export-from emit.node.words))
+
+(defun node (kind: LKind) -> LExpr (LExpr kind 0))
+(defun local (name: str) -> LExpr (node (KLocal name)))
+(defun global (name: str) -> LExpr (node (KGlobal name)))
+(defun reference (name: str) -> LExpr
+  (if (starts-with? name "@") (global (str-slice name 1 (str-len name))) (local name)))
+(defun integer (ty: LType value: i64) -> LExpr (node (KInt ty (lit-of value))))
+(defun floating (ty: LType value: f64) -> LExpr (node (KFloat ty value)))
+(defun null () -> LExpr (node kind-null))
+(defun string (value: str) -> LExpr (node (KStr (str-bytes value))))
+(defun zero (ty: LType) -> LExpr (node (KZero ty)))
+(defun aggregate (fields: (Vec LExpr)) -> LExpr (node (KStruct nil fields)))
+(defun named-aggregate (name: str fields: (Vec LExpr)) -> LExpr (node (KStruct (some name) fields)))
+(defun array-value (ty: LType fields: (Vec LExpr)) -> LExpr (node (KArray ty fields)))
+(defun vector-value (ty: LType fields: (Vec LExpr)) -> LExpr (node (KVector ty fields)))
+(defun binary (op: LBinOp a: LExpr b: LExpr) -> LExpr (node (KBin op a b)))
+(defun unary (op: LUnOp value: LExpr) -> LExpr (node (KUn op value)))
+(defun overflow (op: LOvfOp a: LExpr b: LExpr) -> LExpr (node (KOverflow op a b)))
+(defun compare-int (pred: LIPred a: LExpr b: LExpr) -> LExpr (node (KICmp pred a b)))
+(defun compare-float (pred: LFPred a: LExpr b: LExpr) -> LExpr (node (KFCmp pred a b)))
+(defun cast (op: LCastOp ty: LType value: LExpr) -> LExpr (node (KCast op ty value)))
+(defun select (condition: LExpr yes: LExpr no: LExpr) -> LExpr (node (KSelect condition yes no)))
+(defun extract (value: LExpr index: i64) -> LExpr (node (KExtractValue value [(lit-of index)])))
+(defun insert (value: LExpr field: LExpr index: i64) -> LExpr (node (KInsertValue value field [(lit-of index)])))
+(defun extract-lane (value: LExpr index: LExpr) -> LExpr (node (KExtractElement value index)))
+(defun insert-lane (value: LExpr field: LExpr index: LExpr) -> LExpr (node (KInsertElement value field index)))
+(defun shuffle (a: LExpr b: LExpr mask: LExpr) -> LExpr (node (KShuffle a b mask)))
+(defun alloca (ty: LType) -> LExpr (node (KAlloca ty nil nil)))
+(defun load (ty: LType pointer: LExpr align: (Option i64)) -> LExpr (node (KLoad ty pointer false align)))
+(defun store (value: LExpr pointer: LExpr align: (Option i64)) -> LExpr (node (KStore value pointer false align)))
+(defun gep (ty: LType pointer: LExpr indices: (Vec LExpr)) -> LExpr (node (KGep false ty pointer indices)))
+(defun call (name: str args: (Vec LExpr)) -> LExpr (node (KCall (CalDirect name) args false)))
+(defun indirect-call (pointer: LExpr ty: LFnType args: (Vec LExpr) tail: bool) -> LExpr
+  (node (KCall (CalIndirect pointer ty) args tail)))
+(defun tail-call (name: str args: (Vec LExpr)) -> LExpr (node (KCall (CalDirect name) args true)))
+(defun ret (value: (Option LExpr)) -> LExpr (node (KRet value)))
+(defun branch (label: str) -> LExpr (node (KBr label)))
+(defun conditional (condition: LExpr yes: str no: str) -> LExpr (node (KCondBr condition yes no)))
+(defun switch (value: LExpr default: str cases: (Vec LCase)) -> LExpr (node (KSwitch value default cases)))
+(defun unreachable () -> LExpr (node kind-unreachable))
+(defun intrinsic (name: str flags: i64 ty: (Option LType) args: (Vec LExpr) align: (Option i64)) -> LExpr
+  (node (KIntrin name flags ty args align)))
+
+(defun integer-zero? (expr: LExpr) -> bool
+  (match (. expr kind) ((KInt _ value) (and (= (. value hi) 0) (= (. value lo) 0))) (_ false)))
+
+;; Tables of hoisted values use reference identities, never rendered code.
+(defun operand-name (expr: LExpr) -> str
+  (match (. expr kind)
+    ((KLocal name) name) ((KGlobal name) (str "@" name))
+    (_ (trap "emitter: a value table key must be a local or global reference"))))
+
+;; Compatibility renderer for the emitter's existing textual boundary.
+(defun text (expr: LExpr) -> str (print/print-expr expr))

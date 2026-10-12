@@ -7,7 +7,7 @@
 ;; (the harness counts it as pending, never as a pass). The sections that need no body, `runtime` and `main`, are printed all the same.
 ;; `--macro NAME` (package E11): the macro-time module of the macro, `compile-macro` (emit.macros.front finds the macro, emit-macro prints it).
 (ns emit.dump
-  (:require [fib.string :as s] [types.driver :as driver] [types.dump :as dump] [syntax.dump :as sdump])
+  (:require [fib.string :as s] [types.driver :as driver] [types.dump :as dump] [syntax.dump :as sdump] [lir.ast :as la] [lir.print :as print])
   (:use syntax.form expand.types expand.roots expand.maker types.args types.dump.sections own.error own.program own.driver
         emit.args emit.assemble emit.compile emit.layout-dump emit.macros.abi emit.macros.front))
 
@@ -18,36 +18,20 @@
   (let ((start (loop ((i 0)) (if (and (< i (str-len m)) (<= (str-byte-at m i) 32i8)) (recur (+ i 1)) i))))
     (str-slice m start (loop ((i start)) (if (and (< i (str-len m)) (> (str-byte-at m i) 32i8)) (recur (+ i 1)) i)))))
 
-;; The name of a function's text: the head after its modifiers, `(define internal tailcc (f.sq i64) ..` is `f.sq`. Rust: sections.rs:46 fn_name
-(defun fn-name :private (text: str) -> (Option str)
-  (if (not (starts-with? text "(define "))
-      nil
-      (match (str-find text "(" 8)
-        (nil nil)
-        ((some open)
-         (let ((end (loop ((i (+ open 1))) (if (and (< i (str-len text)) (> (str-byte-at text i) 32i8) (not (= (str-byte-at text i) 41i8))) (recur (+ i 1)) i))))
-           (if (= end (+ open 1)) nil (some (str-slice text (+ open 1) end))))))))
-
 ;; The functions whose name starts with the prefix, or all. Rust: sections.rs:40 push_fns
-(defun fns-text :private (fns: (Vec str) prefix: (Option str)) -> str
-  (str-join (vec (filter (fn (f: str)
-                      (match prefix
-                        (nil true)
-                        ((some pre) (match (fn-name f) (nil false) ((some n) (starts-with? n pre))))))
-                    fns))))
+(defun fns-text :private (items: (Vec la/LItem) prefix: (Option str)) -> (Vec la/LItem)
+  (filterv (fn (it: la/LItem)
+             (match prefix (nil true) ((some pre) (match it ((la/ItDefine f) (starts-with? (. f name) pre)) (_ false))))) items))
 
 ;; The text of one section of the module. Rust: sections.rs:13 text
 (defun section-body :private (m: Module sec: str prefix: (Option str)) -> str
   (let ((p (. m parts)))
-    (cond (= sec "runtime") (. p runtime)
-          (= sec "externs") (. p externs)
-          (= sec "types") (. p types)
-          (= sec "statics") (. p statics)
-          (= sec "keywords") (. p keywords)
-          (= sec "defs") (. p defs)
-          (= sec "quotes") (. p quotes)
-          (= sec "fns") (fns-text (. p fns) prefix)
-          :else (. m main))))
+    (let ((items (cond (= sec "runtime") (. p runtime) (= sec "externs") (. p externs)
+                       (= sec "types") (. p types) (= sec "statics") (. p statics)
+                       (= sec "keywords") (. p keywords) (= sec "defs") (. p defs)
+                       (= sec "quotes") (. p quotes) (= sec "fns") (fns-text (. p fns) prefix)
+                       :else (. m main))))
+      (str (if (= sec "externs") (link-text (. p links)) "") (print/print-module (la/LModule items))))))
 
 ;; A text as the lines to print: each section is one element, its last line break left to `println`.
 (defun text-line :private (text: str) -> (Vec str)
@@ -109,7 +93,7 @@
     ((Err msg) (if (starts-with? msg "todo: ")
                    (do (eprintln msg) (dump/Dumped lines pending-status))
                    (unsupported-dump lines msg)))
-    ((Ok mm) (dump/Dumped (into (conj lines (str-join [";; == macro " (. m key)])) (text-line (. mm text))) 0))))
+    ((Ok mm) (dump/Dumped (into (conj lines (str-join [";; == macro " (. m key)])) (text-line (print/print-module (. mm ast)))) 0))))
 
 ;; The check of the macro's forms, as a program of their own, and the module. Rust: `check_forms` and `macro_text`
 (defun emit-macro :private (file: str name: str rm: RunnerMaker) -> dump/Dumped
