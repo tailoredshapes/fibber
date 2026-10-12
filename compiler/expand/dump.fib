@@ -37,7 +37,7 @@
 ;;   record `error Prelude 0:0 0..0: MESSAGE`.
 (ns expand.dump
   (:require [syntax.reader :as reader] [syntax.dump :as sdump] [expand.modules :as mods]
-            [expand.program :as prog] [expand.dumpctx :as dctx])
+            [expand.program :as prog] [expand.dumpctx :as dctx] [serve.snap :as snap])
   (:use syntax.pos syntax.form syntax.error expand.error expand.types expand.ctx
         expand.args expand.roots expand.maker))
 
@@ -180,3 +180,80 @@
 ;; `expand-file-with` and no runner at all (stage 2a).
 (defun expand-file (file: str opts: Options) -> Dumped
   (expand-file-with file opts (no-runner-maker)))
+
+;; ----------------------------------------------------- batch: library state built once
+;; One process, many files (`expand --batch`, compiler/tests/golden/golden.sh): every file starts from the context a fresh `dump-program` would
+;; build, but the work that does not depend on the file is done once. Both parts are snapshots of the context (serve.snap), so a file's expansion
+;; cannot change what the next file starts from. `base` is the context after the expander's prelude and `lib/prelude.fib`, with the limits
+;; applied, and its baseline; `shared` is the context after the implicit modules (the library's facades and what they read), keyed by their
+;; files, which are expanded the same for every program. Only a dump with no runner and no `--implicit` is shared (the implicit modules print
+;; nothing then, and no macro of the program runs); any other dump takes `expand-file-with` as it was.
+(defstruct Batch (base: (Cell (Option ExpandCtx)) baseline: (Cell (Option dctx/Baseline))
+                  shared-key: (Cell str) shared: (Cell (Option ExpandCtx))))
+
+(defun batch-new () -> Batch (Batch (cell nil) (cell nil) (cell "") (cell nil)))
+
+;; A fresh copy of the base context, made on the first call.
+(defun batch-base :private (b: Batch opts: Options) -> (Result ExpandCtx str)
+  (match @(. b base)
+    ((some c) (Ok (snap/ctx-snapshot c)))
+    (nil (let ((ctx (ctx-new)))
+           (match (prog/prelude-forms ctx)
+             ((Err m) (Err m))
+             ((Ok _) (do (apply-limits ctx (. opts limits))
+                         (set! (. b baseline) (some (dctx/baseline-of ctx)))
+                         (set! (. b base) (some (snap/ctx-snapshot ctx)))
+                         (Ok ctx))))))))
+
+(defun batch-baseline :private (b: Batch) -> dctx/Baseline
+  (match @(. b baseline) ((some x) (dctx/Baseline (. x texts))) (nil (dctx/baseline-empty))))
+
+;; How many of loaded, from the start, are implicit (the loader reads them first), and the vector of loaded from i to j.
+(defun implicit-prefix :private (loaded: (Vec Loaded)) -> i64
+  (loop ((i 0)) (if (and (< i (count loaded)) (. (nth loaded i) implicit)) (recur (+ i 1)) i)))
+
+(defun slice-loaded :private (loaded: (Vec Loaded) from: i64 to: i64) -> (Vec Loaded)
+  (loop ((i from) (acc (vec-empty))) (if (< i to) (recur (+ i 1) (conj acc (nth loaded i))) acc)))
+
+(defun prefix-key :private (loaded: (Vec Loaded) k: i64) -> str
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i k)
+        (recur (+ i 1) (conj acc (str-join [(. (. (nth loaded i) spec) ns) "@" (. (nth loaded i) file)])))
+        (str-join acc))))
+
+;; The shared context for key, when the cache holds it: a copy of it.
+(defun shared-for :private (b: Batch key: str) -> (Option ExpandCtx)
+  (match @(. b shared)
+    (nil nil)
+    ((some c) (if (= key @(. b shared-key)) (some (snap/ctx-snapshot c)) nil))))
+
+;; The sections of loaded, the implicit modules from the shared snapshot when the cache holds them (expanded once otherwise).
+(defun dump-shared :private (lines: (Vec str) ctx: ExpandCtx loaded: (Vec Loaded) b: Batch opts: Options) -> Dumped
+  (let ((k (implicit-prefix loaded)) (n (count loaded)) (key (prefix-key loaded k)))
+    (match (shared-for b key)
+      ((some c) (dump-modules lines c (slice-loaded loaded k n) (no-runner) (batch-baseline b) opts))
+      (nil
+       (let ((d (dump-modules lines ctx (slice-loaded loaded 0 k) (no-runner) (batch-baseline b) opts)))
+         (if (or (= k 0) (!= (. d status) 0))
+             d
+             (do (set! (. b shared-key) key)
+                 (set! (. b shared) (some (snap/ctx-snapshot ctx)))
+                 (dump-modules (. d lines) ctx (slice-loaded loaded k n) (no-runner) (batch-baseline b) opts))))))))
+
+(defun dump-program-batch :private (lines: (Vec str) source: str file: str opts: Options b: Batch) -> Dumped
+  (match (batch-base b opts)
+    ((Err m) (failed lines (record "Prelude" no-position m)))
+    ((Ok ctx)
+     (match (mods/try-load-with source file (roots-default) (implicit-of opts))
+       ((Err e) (failed lines (load-record e file)))
+       ((Ok loaded) (dump-shared lines ctx loaded b opts))))))
+
+;; `expand-file-with` for a file of a batch: the same lines and status.
+(defun expand-file-batch (file: str opts: Options rm: RunnerMaker b: Batch) -> Dumped
+  (if (or (. opts prelude) (. opts implicit) (. opts context) (is-evaluator? (. opts runner)))
+      (expand-file-with file opts rm)
+      (match (read-file file)
+        (nil (Dumped [(str-concat "== " file) "unreadable"] 2))
+        ((some source) (dump-program-batch [(str-concat "== " file)] source file opts b)))))
+
+(defun is-evaluator? :private (k: RunnerKind) -> bool (match k ((Evaluator) true) ((NoRunner) false)))

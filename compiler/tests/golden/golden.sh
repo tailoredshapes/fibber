@@ -62,6 +62,28 @@ if [ -n "$show" ]; then   # --show SUITE FILE: stage 2's output for one input of
   done < <(suite_table)
   echo "golden: no suite $show" >&2; exit 2
 fi
+# batch_suite NAME OPTIONS FILES NEW: the expand suites in ONE process (`expand --batch`, the library state built once: docs/design/test-pyramid.md), the
+# same blocks as `block` makes one process at a time (GOLDEN_BATCH=0 does that). The tool ends each input's section with `#### status N`; awk cuts the stream
+# into one block per input. Every GOLDEN_CONTROL-th input (default 40, 0 = none) is also run as a process of its own and must give the same block, byte
+# for byte: the control that the two modes still agree. A stream that stops early leaves inputs without a block, which is a failure.
+batch_suite() {
+  local name=$1 opts=$2 files=$3 new=$4 stream=$out/stream.$1 dir=$out/blk.$1 i=0 f ctl=${GOLDEN_CONTROL:-40}
+  rm -rf "$dir"; mkdir -p "$dir"
+  # shellcheck disable=SC2046,SC2086
+  (ulimit -v 8000000; timeout 1800 "$tools/expand" --batch $opts $(cat "$files") 2>&1) | sed "s|$root|<root>|g" > "$stream"
+  awk -v dir="$dir" -v files="$files" 'BEGIN { while ((getline l < files) > 0) f[n++] = l; i = 0; out = dir "/" i; print "#### " f[0] > out }
+    /^#### status [0-9]+$/ { sub(/^#### /, ""); print > out; close(out); i++; if (i < n) { out = dir "/" i; print "#### " f[i] > out }; next }
+    { print > out }' "$stream"
+  while read -r f; do
+    if [ ! -s "$dir/$i" ] || ! grep -q '^status [0-9]*$' "$dir/$i"; then echo "FAIL $name: batch gave no result for $f (see $stream)"; return 1; fi
+    if [ "$ctl" -gt 0 ] && [ $((i % ctl)) -eq 0 ]; then
+      block expand "$opts" "$f" "$out/block.$name"
+      cmp -s "$out/block.$name" "$dir/$i" || { echo "FAIL $name: batch and per-process output differ on $f"; diff "$out/block.$name" "$dir/$i" | head -5; return 1; }
+    fi
+    shape "$name" "$dir/$i" "$f" >> "$new"; i=$((i + 1))
+  done < "$files"
+  rm -rf "$dir" "$stream"
+}
 # run_suite NAME TOOL OPTIONS GLOBS: one suite; prints its lines, returns 1 if it failed (run in the background, $jobs at a time)
 run_suite() {
   local name=$1 tool=$2 opts=$3 globs=$4 files=$here/$1.files gold=$here/$1.golden new=$out/$1.new f
@@ -72,7 +94,11 @@ run_suite() {
   fi
   [ -f "$files" ] && [ -f "$gold" ] || { [ "$rescan" -eq 1 ] || { echo "FAIL $name: no golden ($name.golden)"; return 1; }; }
   : > "$new"
-  while read -r f; do block "$tool" "$opts" "$f" "$out/block.$name"; shape "$name" "$out/block.$name" "$f" >> "$new"; done < "$files"
+  if [ "$tool" = expand ] && [ "${GOLDEN_BATCH:-1}" = 1 ]; then
+    batch_suite "$name" "$opts" "$files" "$new" || return 1
+  else
+    while read -r f; do block "$tool" "$opts" "$f" "$out/block.$name"; shape "$name" "$out/block.$name" "$f" >> "$new"; done < "$files"
+  fi
   if [ "$update" -eq 1 ]; then cp "$new" "$gold"; echo "updated $name ($(wc -l < "$files") inputs)"; return 0; fi
   if cmp -s "$new" "$gold"; then echo "ok $name ($(wc -l < "$files") inputs)"; return 0; fi
   echo "FAIL $name: $(diff "$gold" "$new" | grep -m1 '^[<>]' | cut -c1-160)"; diff "$gold" "$new" | head -8; return 1
