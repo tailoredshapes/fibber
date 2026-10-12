@@ -1,0 +1,45 @@
+;; Opt-in parallel compilation of the units of one build, with the object cache off (docs/design/compile-performance.md).
+;; FIB_LIRO_PARTITION=1 lets a cache-off build partition instead of compiling whole-program; it then compiles its units here, with
+;; FIB_LIRO_JOBS=N (default 1) of them at once, whatever N is: the executable does not depend on it. Each unit lowers in
+;; its own LLVM context and target machine, so the workers share nothing but the (immutable) units; the objects are written, and linked, in unit order whatever the order the workers finish in.
+(ns native.liro.parallel
+  (:use lir.ast native.error native.liro.context fib.parallel)
+  (:require [lir.check :as check] [native.aot :as aot] [native.link :as link] [native.timing :as timing]))
+
+(defun jobs () -> i64
+  (match (sys-getenv "FIB_LIRO_JOBS")
+    ((some s) (match (parse-long s) ((some n) (max 1 n)) (nil 1)))
+    (nil 1)))
+
+(defun opted-in? () -> bool (= (sys-getenv "FIB_LIRO_PARTITION") (some "1")))
+
+(defun unit-bytes (m: LModule i: i64 opt: i64) -> (Result (Array i8) LairError)
+  (let ((t (timing/started)))
+    (match (check/check m)
+      ((Err ds) (Err (ErrInvalid ds)))
+      ((Ok _) (let ((r (aot/aot-emit m (str "liro-unit-" i) aot/OutObject (aot/AotOptions opt [] []))))
+                (do (timing/report "liro.unit" t) r))))))
+
+(defun write-objects (c: LiroContext results: (Vec (Result (Array i8) LairError))) -> (Result (Vec str) LairError)
+  (loop ((i 0) (paths []))
+    (if (= i (count results)) (Ok paths)
+        (match (nth results i)
+          ((Err e) (Err e))
+          ((Ok bytes)
+           (let ((p (str (. c scratch) "/unit-" i ".o")))
+             (try-let [_ (error-result (link/write-bytes p bytes))]
+               (recur (+ i 1) (conj paths p)))))))))
+
+(defun compile-parallel (c: LiroContext units: (Vec LModule) opt: i64 workers: i64) -> (Result (Vec str) LairError)
+  (let ((n (count units))
+        (results (pmap-range [i n (Par workers 1 false)] (unit-bytes (nth units i) i opt))))
+    (write-objects c results)))
+
+(defun defs-of (m: LModule) -> i64
+  (count (filter (fn (it: LItem) (match it ((ItDefine _) true) (_ false))) (. m items))))
+
+;; FIB_LIRO_STATS=1: one line per unit, its items and its definitions.
+(defun report-units (units: (Vec LModule)) -> unit
+  (when (= (sys-getenv "FIB_LIRO_STATS") (some "1"))
+    (doseq [i (range (count units))]
+      (eprintln (str "liro: unit " i " items=" (count (. (nth units i) items)) " defs=" (defs-of (nth units i)))))))

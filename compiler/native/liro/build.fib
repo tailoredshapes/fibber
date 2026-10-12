@@ -3,15 +3,15 @@
   (:use lir.ast native.error native.liro.context)
   (:require [native.aot :as aot] [native.target :as target] [native.link :as link]
             [native.liro.compile :as compile] [native.liro.partition :as partition]
-            [native.liro.contract :as contract] [native.timing :as timing]))
+            [native.liro.contract :as contract] [native.timing :as timing] [native.liro.parallel :as par]))
 
 (defun eligible? () -> bool
-  (and (not (= (sys-getenv "FIB_LIRO_CACHE") (some "off")))
+  (and (or (par/opted-in?) (not (= (sys-getenv "FIB_LIRO_CACHE") (some "off"))))
        (not (target/cross-target?)) (nil? (target/static-triple)) (nil? (target/wasm-triple))))
 
 (defun build-cached (m: LModule path: str opts: aot/AotOptions) -> (Result unit LairError)
   (try-let [dirs (aot/library-dirs (. opts lib-dirs)) c (context-new (. opts opt-level))]
-    (let ((units (if (= (sys-getenv "FIB_LIRO_MODE") (some "whole")) [m] (partition/modules m))))
+    (let ((units (if (= (sys-getenv "FIB_LIRO_MODE") (some "whole")) [m] (partition/modules-to-compile m))))
     (let ((result (match (compile-units c m units (. opts opt-level))
                     ((Err e) (Err e))
                     ((Ok objects) (let ((t (timing/started))
@@ -20,11 +20,14 @@
       (do (context-close c) result)))))
 
 (defun compile-units (c: LiroContext original: LModule units: (Vec LModule) opt: i64) -> (Result (Vec str) LairError)
-  (try-let [_ (error-result (contract/validate-units original units))]
-  (loop ((i 0) (objects []))
-    (if (= i (count units)) (Ok objects)
-        (try-let [obj (compile/compile-object c (nth units i) opt)]
-          (recur (+ i 1) (conj objects obj)))))))
+  (try-let [_ (error-result (contract/validate-units original (partition/validation-units original units)))]
+  (do (par/report-units units)
+  (if (= (. c cache) "")
+      (par/compile-parallel c units opt (par/jobs))
+      (loop ((i 0) (objects []))
+        (if (= i (count units)) (Ok objects)
+            (try-let [obj (compile/compile-object c (nth units i) opt)]
+              (recur (+ i 1) (conj objects obj)))))))))
 
 (defun build-executable (m: LModule name: str path: str opts: aot/AotOptions) -> (Result unit LairError)
   (if (eligible?) (build-cached m path opts) (aot/aot-build-executable m name path opts)))

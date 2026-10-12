@@ -280,6 +280,36 @@ def identity_checks(fibc, scratch, env):
     print("ok changed type/keyword order, closures, dyn/bound dispatch, generic calls and layout edit; clean audits")
 
 
+def unit_defs(p):
+    return sum(int(m) for m in re.findall(r"liro: unit \d+ items=\d+ defs=(\d+)", p.stderr))
+
+
+def parallel_checks(probe, scratch, env):
+    """Cache-off partitioned builds are opt-in, parallel and deterministic (docs/design/compile-performance.md)."""
+    src = write(scratch / "par.lir", BASE)
+    off = dict(env, FIB_LIRO_CACHE="off")
+    whole = run([probe, "build", 2, src, scratch / "par-whole"], off)
+    assert "liro: unit" not in whole.stderr, "a cache-off build must stay whole-program unless opted in"
+    status(scratch / "par-whole", env, 8)
+    opted = dict(off, FIB_LIRO_PARTITION="1")
+    outs = []
+    for name, jobs in [("par-1", "1"), ("par-4", "4"), ("par-4b", "4")]:
+        p = run([probe, "build", 2, src, scratch / name], dict(opted, FIB_LIRO_JOBS=jobs))
+        assert len(re.findall(r"liro: unit \d+", p.stderr)) > 1, p.stderr
+        status(scratch / name, env, 8)
+        outs.append((scratch / name).read_bytes())
+    assert outs[0] == outs[1] == outs[2], "unit order, not completion order, decides the link"
+    plain = unit_defs(p)
+    for extra in [{"FIB_LIRO_UNITS": "3"}, {"FIB_LIRO_SPLIT": "ns2"}, {"FIB_LIRO_UNITS": "64", "FIB_LIRO_SPLIT": "ns3"}]:
+        p = run([probe, "build", 2, src, scratch / "par-x"], dict(opted, FIB_LIRO_JOBS="4", **extra))
+        status(scratch / "par-x", env, 8)
+        assert unit_defs(p) == plain, (extra, p.stderr)
+    p = run([probe, "build", 2, src, scratch / "par-i"], dict(opted, FIB_LIRO_JOBS="4", FIB_LIRO_IMPORT="1000"))
+    status(scratch / "par-i", env, 8)
+    assert unit_defs(p) > plain, "copies of small callees must appear in the importing units"
+    print("ok opt-in cache-off units compile in parallel, link in unit order, and match across jobs, splits and copies")
+
+
 def main():
     fibc = Path(os.environ.get("FIBC", sys.argv[1] if len(sys.argv) > 1 else "build/F")).resolve()
     with tempfile.TemporaryDirectory(prefix="fibber-liro-test-", dir=os.environ.get("TMPDIR")) as directory:
@@ -292,6 +322,7 @@ def main():
         artifact_checks(probe, scratch, env)
         concurrency_checks(probe, scratch, env)
         identity_checks(fibc, scratch, env)
+        parallel_checks(probe, scratch, env)
         from mutants import check_plants
         check_plants(fibc, scratch, env, ROOT)
     print("LIRO PASS")
