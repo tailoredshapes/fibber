@@ -84,7 +84,7 @@ sys.exit(int(os.environ.get('REPORT_STATUS' if 'mac-report' in sys.argv else 'ST
         self.assertEqual(calls[1]['args'][:2], ['--no-print-directory', 'mac-report'])
         for call in calls:
             self.assertEqual(call['cwd'], str(ROOT))
-            self.assertEqual(call['workers'], ['1', '1', '1'])
+            self.assertEqual(call['workers'], ['4', '2', '1'])
             self.assertIn('BUILD=build with spaces', call['args'])
             self.assertIn('MAC_QUICK=1', call['args'])
 

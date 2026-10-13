@@ -94,7 +94,7 @@ scripts/fetch-*.sh ───────► ~/.cache/fibber-scratch/tools/<tool>
   Linux-only tool or bash 4 feature unless the line says `# linux-only: reason`. The cases that fail only on a Mac are
   `scripts/ci-stage2.expected-darwin`; `LLVM_LIBDIR` defaults to Homebrew's `llvm@21`.
   The local launcher `scripts/mac-gate.sh --full` selects Make's job budget from the performance-core count and RAM: at most twelve jobs,
-  reserving 16 GiB and allowing 3 GiB per job, with a minimum of one. It uses one worker per recipe (`CASE_JOBS`, `CHECK_JOBS`, `UNITS_JOBS`),
+  reserving 16 GiB and allowing 3 GiB per job, with a minimum of one. It gives each recipe `CASE_JOBS=4` case workers and `CHECK_JOBS=2` programs (the Makefile's defaults; the environment overrides them; `UNITS_JOBS=1`),
   holds `/tmp/fibsuite.lock`, and prints total wall time. On the M1 Ultra with 16 performance cores and 64 GiB RAM it selects twelve jobs.
   `--plan` prints the commands without running Make; `--quick` selects the quick Mac gate. `GATE_BUDGET` overrides the budget;
   `GATE_ROOT`, `BUILD`, `SCRATCH` and `BUILDER` select another checkout, output paths, or compiler. The default compiler is the released seed.

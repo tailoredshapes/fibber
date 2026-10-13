@@ -14,8 +14,14 @@ MAC_SKIP_GOLDEN := $(shell awk '$$1 == "golden" { print $$2 }' $(MAC_EXPECTED) 2
 MAC_GOLDEN_STAMPS := $(filter-out $(addsuffix .ok,$(addprefix $(GOLDEN_DIR)/,$(MAC_SKIP_GOLDEN))),$(GOLDEN_STAMPS))
 MAC_TOOLS := $(filter-out $(MAC_SKIP_TOOLS),$(TOOLS_FULL))
 MAC_TOOL_STAMPS := $(addsuffix .ok,$(addprefix $(TOOLS_DIR)/,$(MAC_TOOLS)))
-MAC_FULL_STAMPS := $(BUILD)/version.ok $(BUILD)/runtime-drift.ok $(BUILD)/fixed-point.ok $(MAC_GOLDEN_STAMPS) $(MAC_TOOL_STAMPS) $(BUILD)/adr.ok $(BUILD)/docs.ok $(CASES_DIR)/full.ok \
+MAC_FULL_UNORDERED := $(BUILD)/version.ok $(BUILD)/runtime-drift.ok $(BUILD)/fixed-point.ok $(MAC_GOLDEN_STAMPS) $(MAC_TOOL_STAMPS) $(BUILD)/adr.ok $(BUILD)/docs.ok $(CASES_DIR)/full.ok \
   $(if $(wildcard specs),$(BUILD)/specs.ok) $(filter-out $(MAC_SKIP_STAGES:%=$(BUILD)/%.ok),$(BUILD)/static.ok $(BUILD)/wasm.ok)
+# The order make starts them in is the Linux gate's (mk/gate.mk): the fixed point first (its chain F.lir, F3, F3.lir is the longest), the persist
+# shards, then by the recorded cost, longest first (scripts/gate-budget.tsv), then those the baseline has not seen. In declaration order the
+# longest stamp, `specs`, started last and ran alone for the final minutes of the gate.
+MAC_FULL_STAMPS := $(BUILD)/fixed-point.ok $(filter $(MAC_FULL_UNORDERED),$(GATE_EARLY)) \
+  $(filter-out $(BUILD)/fixed-point.ok $(GATE_EARLY),$(filter $(MAC_FULL_UNORDERED),$(GATE_COSTLY))) \
+  $(filter-out $(BUILD)/fixed-point.ok $(GATE_EARLY) $(GATE_COSTLY),$(MAC_FULL_UNORDERED))
 MAC_QUICK_STAMPS := $(BUILD)/version.ok $(BUILD)/docs-quick.ok $(TOOLS_QUICK_STAMPS) $(CASES_DIR)/quick.ok
 MAC_STAMPS := $(if $(MAC_QUICK),$(MAC_QUICK_STAMPS),$(MAC_FULL_STAMPS)) $(BUILD)/mac-machine.ok
 
