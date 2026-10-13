@@ -1,7 +1,7 @@
 # Stability and the 1.0 proposal
 
 Status: pre-1.0 policy clarification; the freeze below is a **proposal**.
-VERSION and SEED currently name 0.1.15. Nothing here publishes a 1.0 promise.
+VERSION and SEED currently name 0.1.16. Nothing here publishes a 1.0 promise.
 
 The owner decides release timing and the promised surface. Executable checks
 establish whether that surface meets its acceptance criteria; approval and
