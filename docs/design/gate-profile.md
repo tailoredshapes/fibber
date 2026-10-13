@@ -73,3 +73,39 @@ The `lsp-hardening` and persist changes alter stamp costs: `scripts/gate-budget.
 - **cmd-0** persist share is 16.5 s against 7 s for cmd-1/2 on a cold run (disk first touch, 15% D): the three cmd shares could be rebalanced; not measured warm.
 - Hardware counters (cache misses, IPC), `pidstat -d`: not collected; I/O wait is inferred from the D-state sampler, `time -v` file-system counters and strace.
 - The lilnas rows were taken at load 3 to 6 from other users and are context, not baselines.
+
+## Mac (M1 Ultra), why the Linux gains did not carry over
+
+Studio: M1 Ultra, 20 cores (16 performance), 64 GB, macOS, llvm@21 from Homebrew, the darwin-arm64 seed of v0.1.16; the Linux comparison is lilnas (28 threads, the 0.1.15 linux seed). Each row is one run from a cold start (`FIB_LIRO_CACHE=off`, `/usr/bin/time`); the Studio had a background load of about 4 from other processes (the Claude app, a VM), lilnas 2 to 5. `FIB_TIME=1` phases. No concurrency setting was missing: `build/F.mode` and `build/F3.mode` read `partitioned` (the seed contains `FIB_LIRO_PARTITION`), and the wall falls with `FIB_LIRO_JOBS` as it does on Linux.
+
+| F built by the seed, cache off | Mac wall s | Mac user s | Mac peak RSS | Linux wall s | Linux user s |
+|---|---:|---:|---:|---:|---:|
+| whole program | 105.1 | 103.5 | 3.7 GB | 100.9 | 99.4 |
+| partitioned, import 80, JOBS=1 | 113.9 | 112.8 | 1.7 GB | 115.0 | 113.8 |
+| JOBS=4 | 69.0 | 121.0 | 1.9 GB | | |
+| JOBS=8 (the gate) | 55.0 | 123.8 | 2.4 GB | 45.3 | 130.1 |
+| JOBS=16 | 50.6 | 130.9 | 3.7 GB | | |
+| JOBS=20 | 46.4 | 135.2 | 3.9 GB | | |
+| JOBS=8, no import | 43.5 | 56.2 | 1.6 GB | 30.8 | 45.9 |
+| F builds F3, JOBS=8 | 54.4 | 123.4 | 2.6 GB | 45.8 | 132.0 |
+| F builds F3, JOBS=20 / JOBS=3 | 50.9 / 69.9 | 128.8 / 121.5 | | | |
+| F builds F3, whole program | 105.0 | 103.7 | 3.7 GB | | |
+
+- Whole to partitioned is 1.9x on the Mac (105 to 55 s) and 2.2x on Linux (101 to 46 s). Jobs beyond 8 buy 4 s on 20 cores; `GATE_UNIT_JOBS=8` is right.
+- The serial part is larger on the Mac: `front` is 11.0 s on both, `lir.emit` is 24.1 to 25.3 s on the Mac and 10.4 to 11.2 s on Linux. A 9 s `sample` of `F emit` at 13 s: 4939 of 6500 samples of the compiler's thread are `LLJIT::lookup` to `IRCompileLayer::emit` to `SimpleCompiler` (LLVM code generation of the JIT'd macro and def modules, legacy pass manager, 4700 samples), with `RegisterClassInfo::runOnMachineFunction` and the SelectionDAG at the top. That is the serial floor (36 s against 22 s) and is not a setting; not investigated further (the sessions are `session-new-fast-codegen`).
+- `FIB_LIRO_IMPORT=80` doubles the CPU of a partitioned build (124 s against 56 s without it) on both systems; on the 3-core hosted runner that CPU is the wall (130 s of CPU, 122 s measured in CI run 38315968316 for F, not 6 minutes). The import is kept: it is what keeps F within 7% of whole-program speed.
+
+Full `mac-stamps` from cold (build and caches wiped, seed kept), M1 Ultra, `scripts/gate-report.py`:
+
+| settings | wall s | summed s | parallelism | longest |
+|---|---:|---:|---:|---|
+| CI's: `-j20 CASE_JOBS=1 CHECK_JOBS=1` | 699 | 4390 | 6.3 | specs 513 s alone for the last 437 s |
+| `-j20 CASE_JOBS=4 CHECK_JOBS=2` | 323 | 3912 | 12.1 | units-all 163 s |
+| `-j12 CASE_JOBS=4 CHECK_JOBS=2`, stamps ordered by cost (mk/mac.mk) | 375 | 2865 | 7.6 | golden/reader-dump 100 s |
+| the same, and the `timeout` shim in Perl | 338 | 2793 | 8.2 | specs 119 s |
+| Linux baseline (`scripts/gate-budget.tsv`, jobs 12) | 324 | 3203 | | |
+
+- `specs` is `F test specs -j CASE_JOBS`: 513 s at 1, 118 to 127 s at 4. With `CASE_JOBS=1` it was also the last stamp in `MAC_FULL_STAMPS` (declaration order, not the Linux gate's cost order), so it started last and ran alone. In the hosted run it started at 22:50:07 and ended at 23:00:05, the last ten minutes of a 40-minute job whose other stamps had ended at about 22:55.
+- `scripts/mac-gate.sh` (written the day before, "no new full-suite timing run") hard-wired `CASE_JOBS=1 CHECK_JOBS=1`, copied from the hosted-CI line.
+- The `timeout` of `scripts/portable/bin` was a Python script: 35 ms a call (7.0 s for 200 calls) against 14 ms in Perl under the same load (2.9 s), 4 ms for an empty Perl. `golden/reader-dump` (1184 inputs, one `timeout` each) solo: 95.3 and 95.3 s with Python, 60.2 and 59.8 s with Perl. Both gave the same status and output in the 15 probes of a test script run on Linux (0, 1, 7, 124, `-k` escalation, 126, 127, 125, 137, a forwarded TERM = 143, stdin and stdout passed through). What is left of the 60 s is process start: sys time 25 s for 1184 runs, each a program that links `libLLVM.dylib`; Linux runs the same suite in 10 s (baseline).
+- Hosted `macos-14` has 3 cores: the 3191 s of stamps in that run divide to 18 minutes at best, plus 2 for F, so about 20 to 25 minutes is the floor of this gate there; 40 minutes came from the serial `specs` tail and 3-core contention.
