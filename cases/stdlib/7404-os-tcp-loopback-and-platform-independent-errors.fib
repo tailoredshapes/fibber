@@ -16,10 +16,14 @@
           ((Err _) (check c false))
           ((Ok client) (do
             (check c (= (net/send-all client (str-bytes "socket") 1000 (atom false)) (Ok ())))
+            ;; Every socket here is nonblocking, the accepted one too, and delivery over loopback is
+            ;; not complete when send returns on every OS (macOS CI saw WouldBlock): wait, bounded, as a caller must.
+            (net/ready? (. listener fd) false 1000)
             (match (net/accept-tcp (. listener fd))
               ((Err _) (check c false))
               ((Ok accepted) (do
                 (check c (= (. accepted peer) "127.0.0.1"))
+                (net/ready? (. accepted fd) false 1000)
                 (check c (match (os/read-fd (. accepted fd) 64) ((Ok bytes) (= (str-from-bytes bytes) "socket")) (_ false)))
                 (check c (= (os/close-fd (. accepted fd)) (Ok ()))))))
             (check c (= (os/close-fd client) (Ok ()))))))
