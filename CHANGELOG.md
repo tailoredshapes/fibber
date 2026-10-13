@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.16
+
+- The type and ownership checker keeps the checked library between programs: `emit --batch`,
+  `types --batch`, `fibc serve` and `fibc repl` check the library once and reuse it (a warm server
+  check of an edited program 165 ms to 28 ms; REPL input 188 ms to 87 ms). One-shot commands are
+  unchanged. `FIB_CHECK_CACHE=off|on|verify` (`verify` checks every program both ways and fails on
+  any difference). Design and controls: `docs/design/persistent-checker.md`.
+- `fibc run --trace` writes its heap events through a 64 KiB buffer, flushed at exit and before any
+  trap or abort, instead of one `write` per event (the stdlib cases run in 144 s instead of 222 s).
+- `FIB_TIME=1` prints the phases of the front end (expand, lower, infer, elaborate, own).
+- Gate: the persistent-checker controls, `lsp-hardening` and the unit runner are faster and
+  parallel; profile in `docs/design/gate-profile.md`.
+
 ## 0.1.15
 
 - Compilation: a cache-off build can partition into units and compile them in parallel
