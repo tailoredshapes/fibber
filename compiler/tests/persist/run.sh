@@ -40,7 +40,13 @@ done
 
 # ---- 2. the batch tool
 if want batch-verify || want batch-onoff || want batch-single; then
-if "$fibc" build compiler/emit.fib -I compiler -I lib -L "${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" -l LLVM-21 -o "$out/emit" > "$out/emit.build" 2>&1; then
+# PERSIST_EMIT names an emit tool built from compiler/emit.fib by this stage 2 (the gate passes the one build/golden/tools/emit already is: three shares,
+# one build); unset, the share builds its own.
+if [ -n "${PERSIST_EMIT:-}" ] && [ -x "$PERSIST_EMIT" ]; then cp "$PERSIST_EMIT" "$out/emit"
+elif [ -n "${PERSIST_EMIT:-}" ]; then echo "FAIL PERSIST_EMIT=$PERSIST_EMIT is not an executable"; exit 1
+elif "$fibc" build compiler/emit.fib -I compiler -I lib -L "${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" -l LLVM-21 -o "$out/emit" > "$out/emit.build" 2>&1; then :
+else bad "emit tool does not build: $(tail -n 5 "$out/emit.build")"; fi
+if [ -x "$out/emit" ]; then
   files=("$here"/*.fib)
   while IFS= read -r l; do files+=("$l"); done < <(head -n 20 "$root/compiler/tests/golden/emit-fns.files")
   if want batch-verify; then
@@ -57,7 +63,7 @@ if "$fibc" build compiler/emit.fib -I compiler -I lib -L "${LLVM_LIBDIR:-/usr/li
   rm -f "$out/batch.single"; for f in "${files[@]}"; do FIB_PRUNE=0 "$out/emit" "$f" >> "$out/batch.single" 2>&1; echo "#### status $?" >> "$out/batch.single"; done
   if [ "$(grep -v '^#### status' "$out/batch.on" | md5sum)" = "$(grep -v '^#### status' "$out/batch.single" | md5sum)" ]; then ok "and equals one process for each input"; else bad "emit --batch differs from one process for each input"; fi
   fi
-else bad "emit tool does not build: $(tail -n 5 "$out/emit.build")"; fi
+fi
 fi
 
 

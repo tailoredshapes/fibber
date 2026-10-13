@@ -2,7 +2,9 @@
 // Regression cases for what fuzz.js and the load measurements found in the language server (each is the minimal input of a finding), and the
 // bounds that keep it so. Each case names the finding it pins; the planted faults of mutants.sh (utf8, nsslice, stack, bound, symbols, cache)
 // each make one of them fail.
-// usage: node hardening.js --server CMD [--arg W].. [--only NAME]      Exit: 0 all held; 1 a case failed.
+// usage: node hardening.js --server CMD [--arg W].. [--only NAME] [--parallel]      Exit: 0 all held; 1 a case failed.
+// --parallel: the cases are independent (each its own server), so they run side by side; only a case that measures latency (it is a timing
+// assertion, 'latency:') runs alone afterwards, on a quiet machine, as it does serially. The report keeps the order of the cases.
 const assert = require('node:assert');
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
@@ -10,7 +12,7 @@ const { spawn } = require('node:child_process');
 const opt = { args: [] };
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
-  if (a === '--server') opt.server = process.argv[++i]; else if (a === '--arg') opt.args.push(process.argv[++i]); else if (a === '--only') opt.only = process.argv[++i];
+  if (a === '--server') opt.server = process.argv[++i]; else if (a === '--arg') opt.args.push(process.argv[++i]); else if (a === '--only') opt.only = process.argv[++i]; else if (a === '--parallel') opt.parallel = true;
   else { console.error(`hardening: unknown option ${a}`); process.exit(2); }
 }
 if (!opt.server) { console.error('usage: node hardening.js --server CMD [--arg W].. [--only NAME]'); process.exit(2); }
@@ -141,13 +143,23 @@ const CASES = process.env.HARDEN_TRAP_BUILD === '1' ? TRAP_CASES : {
   },
 };
 
+async function runCase(name, f) {
+  const c = new Client(); const t = Date.now();
+  try { await f(c); return { name, text: `ok   ${name} (${Date.now() - t} ms)` }; }
+  catch (e) { return { name, failed: true, text: `FAIL ${name}\n     ${String(e.message || e).split('\n').join('\n     ')}` }; }
+  finally { c.child.kill('SIGKILL'); }
+}
 (async () => {
-  const failures = [];
-  for (const [name, f] of Object.entries(CASES)) {
-    if (opt.only && !name.startsWith(opt.only)) continue;
-    const c = new Client(); const t = Date.now();
-    try { await f(c); console.log(`ok   ${name} (${Date.now() - t} ms)`); } catch (e) { failures.push(name); console.log(`FAIL ${name}\n     ${String(e.message || e).split('\n').join('\n     ')}`); } finally { c.child.kill('SIGKILL'); }
-  }
+  const chosen = Object.entries(CASES).filter(([name]) => !opt.only || name.startsWith(opt.only));
+  const timed = (name) => name.startsWith('latency:');
+  const results = [];
+  if (opt.parallel) {
+    results.push(...await Promise.all(chosen.filter(([n]) => !timed(n)).map(([n, f]) => runCase(n, f))));
+    for (const [n, f] of chosen.filter(([n]) => timed(n))) results.push(await runCase(n, f));
+    results.sort((a, b) => chosen.findIndex(([n]) => n === a.name) - chosen.findIndex(([n]) => n === b.name));
+  } else for (const [n, f] of chosen) results.push(await runCase(n, f));
+  const failures = results.filter((r) => r.failed);
+  for (const r of results) console.log(r.text);
   console.log(failures.length ? `${failures.length} failed` : 'all passed');
   process.exit(failures.length ? 1 : 0);
 })();
