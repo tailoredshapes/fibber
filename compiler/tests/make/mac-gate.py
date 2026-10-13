@@ -42,7 +42,7 @@ sys.exit(int(os.environ.get('REPORT_STATUS' if 'mac-report' in sys.argv else 'ST
     def run_gate(self, *args, **extra):
         env = os.environ.copy()
         for name in ('GATE_BUDGET', 'GATE_ROOT', 'BUILD', 'SCRATCH', 'BUILDER',
-                     'MAC_QUICK', 'LIMIT_STDLIB', 'LIMIT_OWNERSHIP'):
+                     'MAC_QUICK', 'LIMIT_STDLIB', 'LIMIT_OWNERSHIP', 'CASE_JOBS', 'CHECK_JOBS', 'UNITS_JOBS'):
             env.pop(name, None)
         env.update(PATH=f"{self.base}:{env['PATH']}", MAKE=str(self.base / 'gmake'),
                    PERF='16', PHYSICAL='20', MEMORY=str(64 * 1024**3),
