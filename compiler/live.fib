@@ -1,0 +1,44 @@
+;; compiler/live.fib: the live-session prototype as a tool (docs/design/live-repl.md; compiler/live/FINDINGS.md).
+;;   live load [--threads N] [--swaps M] [--work W] [--opt O] [--fault F] [--direct]
+;;       the swap under load at the lIR level (live.load): N threads call `handler` through its stub while this thread swaps it M times
+;;   live run FILE [--opt O] [--fault F]
+;;       a scripted fibber session (live.session): one input per line, definitions and expressions, against ONE resident JIT session
+;; Faults (live.swap, live.session): free-first no-wait two-step no-count skip-check skip-program-check.
+;; Build: F build compiler/live.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o live
+(ns main
+  (:require [driver.args :as a] [driver.native :as native] [expand.roots :as roots] [live.jit :as lj] [live.swap :as sw] [live.load :as load]
+            [live.session :as ls] [fib.string :as s]))
+
+(defun flag (words: (Vec str) name: str default: str) -> str
+  (loop ((i 0))
+    (cond (>= i (- (count words) 1)) default
+          (= (nth words i) name) (nth words (+ i 1))
+          :else (recur (+ i 1)))))
+
+(defun has-flag? (words: (Vec str) name: str) -> bool (some? (first (filterv (fn (w: str) (= w name)) words))))
+
+(defun int-flag (words: (Vec str) name: str default: i64) -> i64
+  (match (parse-long (flag words name (show default))) ((some n) n) (nil default)))
+
+(defun cmd-load (words: (Vec str)) -> i64
+  (let ((threads (int-flag words "--threads" 8)) (swaps (int-flag words "--swaps" 1000)) (work (int-flag words "--work" 16))
+        (opt (int-flag words "--opt" 0)) (fault (flag words "--fault" "")) (direct (has-flag? words "--direct")) (mismatch (has-flag? words "--mismatch")))
+    (do (println (str "load: threads " threads ", swaps " swaps ", work " work ", opt " opt (if (= fault "") "" (str ", fault " fault)) (if direct ", direct calls" "") (if mismatch ", body 2 mismatched" "")))
+        (match (try-let ((j (lj/live-jit-new opt)) (r (sw/registry-new j fault))) (load/run-load r threads swaps work direct mismatch))
+          ((Err m) (do (println (str "load FAIL: " m)) 1))
+          ((Ok o) (if (load/report o threads fault) 0 1))))))
+
+(defun cmd-run (words: (Vec str) dirs: (Vec str)) -> i64
+  (let ((file (if (empty? words) "" (nth words 0))) (opt (int-flag words "--opt" 0)) (fault (flag words "--fault" "")))
+    (match (if (= file "") nil (read-file file))
+      (nil (do (eprintln (str "live run: cannot read " file)) 2))
+      ((some text) (ls/run-script text (roots/roots-from-env dirs (native/getenv-opt "FIB_LIB")) opt fault)))))
+
+(defun main () -> i64
+  (let ((_ (native/ignore-sigpipe))
+        (split (a/split-roots (vec (args))))
+        (words (. split rest)))
+    (cond (empty? words) (do (eprintln "usage: live load [--threads N] [--swaps M] [--fault F] | live run FILE [--fault F]") 2)
+          (= (nth words 0) "load") (cmd-load (vec (drop 1 words)))
+          (= (nth words 0) "run") (cmd-run (vec (drop 1 words)) (. split dirs))
+          :else (do (eprintln (str "live: unknown command " (nth words 0))) 2))))
