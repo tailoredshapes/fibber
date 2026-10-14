@@ -1,0 +1,89 @@
+;; compiler/live/jit.fib: a resident JIT session whose modules can be added under resource trackers and removed one by one.
+;; PROTOTYPE (docs/design/live-repl.md). It is `native.jit`'s `JitSession` (the same LLJIT, names rules, prune, lowering and
+;; optimisation) with one difference: `add-tracked` hands the module to ORC under a tracker of its own (live.orc), so that `remove`
+;; can free that module's code later, while `native.jit/session-add-module` adds under the default tracker, where nothing is ever freed.
+;; The names rules of spec/lir.md section 11 still hold for what is added; a removed module's names are forgotten (`forget-names`),
+;; so the next version of a function can define the same symbol again.
+(ns live.jit
+  (:use lir.ast lir.types native.error native.jit native.jit.names native.jit.prune native.jit.trampoline)
+  (:require [lir :as front] [lir.check :as check] [native.lower :as nl] [native.owned :as owned] [native.passes :as passes]
+            [native.target :as target] [llvm.support :as support] [llvm.orc :as orc] [live.orc :as lorc] [native.call :as call]))
+
+(defstruct LiveJit (s: JitSession opt: i64))
+
+;; A session: `opt` 0 is the fast code generator (FastISel, as `fibc run -O 0`), 1 to 3 the full one.
+(defun live-jit-new (opt: i64) -> (Result LiveJit str)
+  (match (if (= opt 0) (session-new-fast-codegen 0) (session-new opt))
+    ((Err e) (Err (lair-error-str e)))
+    ((Ok s) (Ok (LiveJit s opt)))))
+
+(defun lljit (j: LiveJit) -> i64 (. (. j s) lljit))
+
+(defun unit-of :private (r: (Result unit LairError)) -> (Result unit str)
+  (match r ((Err e) (Err (lair-error-str e))) ((Ok _) (Ok ()))))
+
+;; Parses and checks lIR text as a module.
+(defun parse-module (src: str) -> (Result LModule str)
+  (match (front/parse-and-check src)
+    ((Err ds) (Err (lair-error-str (ErrInvalid ds))))
+    ((Ok m) (Ok m))))
+
+;; The module checked (lir.check), the session's names rules applied, pruned, lowered and optimised; its LLVM context and module.
+(defun lowered :private (j: LiveJit name: str m: LModule) -> (Result owned/Owned str)
+  (let ((s (. j s)))
+    (try-let ((_ (match (check/check m) ((Err ds) (Err (lair-error-str (ErrInvalid ds)))) ((Ok _) (Ok ()))))
+              (_ (unit-of (names-check @(. s names) m support/process-defines?)))
+              (_ (unit-of (target/target-runnable m)))
+              (o (match (nl/lower (dead-internals m) name (. s triple) (. s data-layout)) ((Err e) (Err (lair-error-str e))) ((Ok o) (Ok o)))))
+      (match (passes/optimize (. o module) 0 (. j opt))
+        ((Err e) (do (owned/owned-dispose o) (Err (lair-error-str e))))
+        ((Ok _) (Ok o))))))
+
+;; Adds the module under a new tracker and returns the tracker (the handle `remove` takes).
+(defun add-tracked (j: LiveJit name: str m: LModule) -> (Result i64 str)
+  (try-let ((o (lowered j name m)))
+    (let ((rt (lorc/tracker-new (lljit j))))
+      (match (lorc/add-module-tracked (lljit j) rt (. o ctx) (. o module))
+        ((Err msg) (do (lorc/tracker-release rt) (Err msg)))
+        ((Ok _) (do (set! (. (. j s) names) (names-record @(. (. j s) names) name m)) (Ok rt)))))))
+
+;; Adds lIR text under a new tracker.
+(defun add-source-tracked (j: LiveJit name: str src: str) -> (Result i64 str)
+  (try-let ((m (parse-module src))) (add-tracked j name m)))
+
+;; Adds a module for the life of the session (the default tracker): the base of a session.
+(defun add-resident (j: LiveJit name: str m: LModule) -> (Result unit str)
+  (unit-of (session-add-module (. j s) name m)))
+
+(defun add-resident-source (j: LiveJit name: str src: str) -> (Result unit str)
+  (unit-of (session-add-source (. j s) name src)))
+
+;; Frees the module under `rt` and forgets the exported names it defined (`names`), so that they can be defined again.
+(defun remove (j: LiveJit rt: i64 names: (Vec str)) -> (Result unit str)
+  (try-let ((_ (lorc/tracker-remove rt)))
+    (do (lorc/tracker-release rt)
+        (forget-names j names)
+        (Ok ()))))
+
+(defun forget-names (j: LiveJit names: (Vec str)) -> unit
+  (let ((s (. j s)) (n @(. (. j s) names)))
+    (set! (. s names) (JitNames (reduce (fn (acc: (Map str Exported) k: str) (dissoc acc k)) (. n exported) names) (. n hidden)))))
+
+;; The address of an exported symbol, compiled if need be.
+(defun address (j: LiveJit name: str) -> (Result i64 str)
+  (match (session-address (. j s) name) ((Err e) (Err (lair-error-str e))) ((Ok a) (Ok a))))
+
+;; The address of an exported global (a variable: `session-address` is for functions).
+(defun global-address (j: LiveJit name: str) -> (Result i64 str)
+  (orc/lookup (lljit j) name))
+
+;; A `ccc` entry to `name` (the function, or a trampoline for a `tailcc` one, made once, resident).
+(defun c-entry (j: LiveJit name: str) -> (Result i64 str)
+  (match (session-c-entry (. j s) name) ((Err e) (Err (lair-error-str e))) ((Ok a) (Ok a))))
+
+(defun signature (j: LiveJit name: str) -> (Result LFnType str)
+  (match (session-signature (. j s) name) ((Err e) (Err (lair-error-str e))) ((Ok t) (Ok t))))
+
+;; Calls the `ccc` function at `addr` with integer arguments; the result word.
+(defun call (addr: i64 args: (Vec i64)) -> (Result i64 str)
+  (call/call-i64 addr args))
