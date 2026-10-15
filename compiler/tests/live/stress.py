@@ -208,7 +208,7 @@ check('swaps after the retirement run right', c5[0] > c4[0] and c5[1] == 0 and c
 # ---- transcript 7 of the design, in the terminal client: the lines' shape (the bytes of a generation are not reported, LV2 (f))
 out, r = terminal(a.sock, [':status', ':retire', ':pause', ':retire', ':resume'])
 matches('transcript 7', out, [r'; attached to .*stress-app\.fib \(pid %d, generation %d, catching\); 9 threads, pool \d+ workers' % (a.p.pid, gen),
-                              r'; generation %d; generations kept \d+; modules kept \d+; threads: 9 spawned threads \(0 parked\) and \d+ pool workers \(\d+ active\); values: \d+ resident; inputs \d+' % gen,
+                              r'; generation %d; generations kept \d+; modules kept \d+; threads: 9 spawned threads \(0 parked\) and \d+ pool workers \(\d+ active\); values: \d+ resident; inputs \d+; tests: idle' % gen,
                               r'; not quiescent: no pause was requested; pause first \[not-quiescent\]',
                               r'; paused at 10 pause points; pool idle \(\d+ workers\)',
                               r'; removed 20 generations; 2 kept \(generation %d\)' % gen,
