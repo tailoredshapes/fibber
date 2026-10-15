@@ -9,16 +9,17 @@
 ;; closure constant is never retired (`pins`): a heap closure made by the body may still name it, and nothing walks the heap to tell
 ;; (the lift is in the design's status). A code part of bodies alone is retired at quiescence (serve.liveretire).
 ;; The refs of a module (`code-refs`) are what the pause-point analysis reads: for each body or literal of a stubbed family, the names of
-;; the code and the sinks it reaches directly, with its own statics (per-program names, `clo.N`, `vt.N`) resolved to what they name.
+;; the code and the sinks it reaches directly, with its own statics (per-program names, `clo.N`, `vt.N`, `q.N`) resolved to what they name.
 (ns serve.livesplit
   (:use lir.ast)
-  (:require [live.extract :as ex] [serve.livetable :as lt] [fib.string :as s]))
+  (:require [live.extract :as ex] [serve.livetable :as lt] [emit.statics :as st] [fib.string :as s]))
 
 ;; A body, a method or a closure literal of the program's own.
 (defun code-name? (name: str) -> bool (or (s/starts-with? name "f.") (s/starts-with? name "m.") (s/starts-with? name "l.")))
 (defun literal? (name: str) -> bool (s/starts-with? name "l."))
-;; A static that names code: a closure constant or a vtable, numbered per program.
-(defun code-static? (name: str) -> bool (or (s/starts-with? name "clo.") (s/starts-with? name "vt.")))
+;; A static numbered per program (emit.statics `program-static?`): a closure constant, a vtable or a quoted form. It goes with the code,
+;; never with the exported data: exported, a later program's cut would declare its own `q.N` (another form) from the base and read it.
+(defun code-static? (name: str) -> bool (st/program-static? name))
 
 (defun item-name (it: LItem) -> str (unwrap-or (ex/item-name it) ""))
 
