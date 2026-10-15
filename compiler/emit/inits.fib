@@ -1,7 +1,8 @@
 ;; compiler/emit/inits.fib: the `def`s made at run time (syntax §3.19, types §2.16, L15, X8). Replaces crates/fibc/src/inits.rs
 ;; (159 lines of Rust; its header there is the description of the scheme). A `def` whose initialiser is a constant expression is
 ;; evaluated while compiling and emitted as static data (emit.defs.mod); any other is evaluated before `main`, once, by an init
-;; function: `inits-plan` chooses those `def`s, gives each a slot (`def.slot.N`, a global of the module) and requests its body;
+;; function: `inits-plan` chooses those `def`s, gives each a slot (`def.slot.N`, a global of the module; `live.d.NAME` with its setter for
+;; a `def` of the program's own in live mode, emit.program `live-def-slot`) and requests its body;
 ;; `inits-slot-text` is the globals and `inits-render` the init functions and `fib.defs-init`, which calls them in order, a
 ;; maximal run of `def`s of one module being one init function, `fib.init.mN.K`.
 ;; `all-def-ids` is the Rust `defs::all_def_ids` (defs/mod.rs:50): emit.defs.mod's `def-ids` (the constants) is E10's.
@@ -29,9 +30,10 @@
              (match lt
                ((some (LirDyn)) (Err (str-join ["def " (. dd name) ": a def made at run time holds a dyn value"])))
                (_ (let ((body (body-name (program-g p) (BodyDef d) []))
-                        (object (match lt ((some (LirPtr)) true) (_ false))))
-                    (do (set! (. p def-slots) (assoc @(. p def-slots) d (DefValue (some (n/global (str "def.slot." d))) lt)))
-                        (set! (. p inits) (conj @(. p inits) (Init d (. dd module) body object)))
+                        (object (match lt ((some (LirPtr)) true) (_ false)))
+                        (slot (unwrap-or (live-def-slot p d lt) (str "def.slot." d))))
+                    (do (set! (. p def-slots) (assoc @(. p def-slots) d (DefValue (some (n/global slot)) lt)))
+                        (set! (. p inits) (conj @(. p inits) (Init d (. dd module) body object slot)))
                         (Ok ())))))))))))
 
 ;; Chooses the `def`s made at run time and gives each its slot. Runs before the constants are made, because a function a constant names may
@@ -83,15 +85,16 @@
 (defun inits-render (p: Program) -> str (print/print-module (la/LModule (inits-items p))))
 
 
+;; A live slot (`live.d.NAME`, LT4) comes with its setter.
 (defun inits-slot-items (p: Program) -> (Vec la/LItem)
-  (vec (keep (fn (i: Init)
-               (match (get @(. p def-slots) (. i def-id))
-                 ((some dv)
-                  (match (. dv ty)
-                    ((some ty) (some (la/ItGlobal (la/LGlobalDef (str "def.slot." (. i def-id)) (lir-type ty) (slot-zero ty)
-                                                               false (la/LModifiers la/lk-internal false) 0 false))))
-                    (nil nil)))
-                 (nil nil))) @(. p inits))))
+  (vec (mapcat (fn (i: Init)
+                 (match (get @(. p def-slots) (. i def-id))
+                   ((some dv)
+                    (match (. dv ty)
+                      ((some ty) (into [(la/ItGlobal (la/LGlobalDef (. i slot) (lir-type ty) (slot-zero ty) false (la/LModifiers la/lk-internal false) 0 false))]
+                                       (if (s/starts-with? (. i slot) "live.") [(live-def-setter (. i slot) (lir-type ty))] [])))
+                      (nil [])))
+                   (nil []))) @(. p inits))))
 
 (defun inits-items (p: Program) -> (Vec la/LItem)
   (let ((runs (module-runs @(. p inits))))

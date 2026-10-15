@@ -530,7 +530,9 @@ Decisions for the owner:
    - A plain `def` re-evaluates its expression on redefinition (Clojure's `def`); a `defonce`-style form keeps the existing value, for
      atoms, connections and servers that a redefinition must not reset.
    - A new `def` in a loaded file gets a slot in the new generation (LT4 of live-meshql.md), its initialiser run once.
-   This is LT4 of docs/design/live-meshql.md with the old value retired and dropped instead of leaked.
+   This is LT4 of docs/design/live-meshql.md with the old value retired and dropped instead of leaked. Built (2026-10-15, serve.livedefs;
+   live-meshql.md 10 has the status): a type change is refused `live/Def` rather than re-checked, and a value of more than one word
+   (held inline by resident code) cannot be redefined.
 2. **The project's live entry mimics Clojure's `user.clj`**: a `dev/live.fib` in the project that starts the app and exposes the helpers
    (`rebuild!`, the test entry); `fibc run --live APP --with SPEC` is the general form later (live-meshql.md §8, decision 1).
 3. **Redefinition is a live-environment feature only.** Slots, stubs, retire lists and `def` redefinition exist only in code compiled

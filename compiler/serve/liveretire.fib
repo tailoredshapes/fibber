@@ -12,7 +12,7 @@
 ;; vtable is kept whatever its family (serve.livesplit `pins`): a heap value may name it. Both lift with a walk of the heap from the
 ;; def slots at quiescence (the type table's trace functions exist) or with stack scanning (3.3), neither built.
 (ns serve.liveretire
-  (:require [serve.livesess :as ls] [serve.livetable :as lt] [fib.string :as s] [fib.unix :as unix]))
+  (:require [serve.livesess :as ls] [serve.livetable :as lt] [serve.livedefs :as ld] [fib.string :as s] [fib.unix :as unix]))
 
 ;; ---- the runtime's counts
 
@@ -94,12 +94,13 @@
                     ((Err m) (Err m))
                     ((Ok _) (recur (vec (rest gens)) kept (Retired (+ (. r removed) 1) (. r kept) (. r pinned))))))))))))
 
-;; Every generation no slot names and no parked thread can be in removed; the caller has established quiescence (`threads`).
+;; Every generation no slot names and no parked thread can be in removed, and the old values of redefined `def`s dropped (LT4,
+;; serve.livedefs `drop-retired`); the caller has established quiescence (`threads`).
 (defun retire (sx: ls/Sess) -> (Result Retired str)
   (let ((bearing (pause-bearing sx)))
     (loop ((fams (vec (. @(. sx table) families))) (r (Retired 0 0 [])))
       (match (first fams)
-        (nil (Ok r))
+        (nil (try-let ((_ (ld/drop-retired sx bearing))) (Ok r)))
         ((some p) (match (retire-family sx bearing (. p fst) (. p snd) r)
                     ((Err m) (Err m))
                     ((Ok r2) (recur (vec (rest fams)) r2))))))))

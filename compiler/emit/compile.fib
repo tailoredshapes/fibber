@@ -8,7 +8,7 @@
 ;; `compile-macro` (E11) is the macro-time module of one `defmacro` (macros/abi.rs's text is emit.macros.abi's).
 (ns emit.compile
   (:require [fib.string :as s] [emit.defs.astmod :as am] [emit.cpucheck :as cc] [emit.live :as live] [emit.wasi :as wasi] [expand.targetos :as tos] [types.targets :as tgt] [emit.typetext :as tt] [emit.prune :as pr] [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f] [lir.print :as print])
-  (:use types.ty types.table types.decls types.init types.program own.program emit.value emit.names emit.objects emit.statics emit.program emit.inits
+  (:use types.ty types.ast types.table types.decls types.names types.init types.program own.program emit.value emit.names emit.objects emit.statics emit.program emit.inits
         emit.assemble emit.defs.mod emit.lower.cx emit.lower.mod emit.macros.abi types.target))
 
 ;; The text of a macro module. Rust: compile.rs:88 MacroModule
@@ -107,6 +107,7 @@
 ;; caller. Empty for a monomorphic request, which uses `tys` as before.
 ;; `module` (LM1): the module the function is of when it is not the main module's (a `load` of a program module, serve.liveload:
 ;; `f.routes.route` is the function `route` of module `routes`); nil looks the bare name up in the main module as before.
+;; `impl` "def:" (LT4) asks for the initialiser of the `def` `name` (of `module`), lowered even when the running program has it.
 (defstruct BodyRequest (name: str owned: bool tys: (Vec Ty) impl: (Option str) tys-text: (Vec str) module: (Option str)))
 
 ;; The function a request names: of its module when it has one, else of the main module.
@@ -124,12 +125,26 @@
 (defun request-all :private (q: Program typed: TypedProgram owned: OwnedProgram requests: (Vec BodyRequest)) -> unit
   (doseq [r requests]
     (match (. r impl)
-      ((some key) (request-impl q typed owned key))
+      ((some key) (if (= key "def:") (request-def q typed r) (request-impl q typed owned key)))
       (nil (match (request-fun typed r)
              (nil ())
              ((some f) (let ((key (if (. r owned) (BodyAllOwned f) (BodyFun f))))
                          (when (contains? (. owned bodies) key)
                            (match (request-tys typed r) ((some tys) (do (program-request q key tys) ())) (nil ()))))))))))
+
+;; A `def`'s initialiser (`impl` "def:", LT4: a live session redefining the def runs the new one under a name of its own): lowered even
+;; when the running program has a body of that name (it is taken out of the resident set).
+(defun request-def :private (q: Program typed: TypedProgram r: BodyRequest) -> unit
+  (let ((g (. typed globals)))
+    (match (def-of-request g r)
+      (nil ())
+      ((some d) (do (set! (. q resident) (disj @(. q resident) (body-name g (BodyDef d) []))) (program-request q (BodyDef d) []) (live-const-slot q d) ())))))
+
+(defun def-of-request :private (g: Globals r: BodyRequest) -> (Option i64)
+  (let ((m (match (. r module)
+             (nil (some @(. g main)))
+             ((some name) (find-first (fn (i: i64) (= (g-module-name g i) name)) (range (table-count (. g modules))))))))
+    (match m (nil nil) ((some i) (match (g-value g i (. r name)) ((some (GDef d)) (some d)) (_ nil))))))
 
 ;; The methods of the instances keyed `key` (and their all-owned bodies where a method value may run them).
 (defun request-impl :private (q: Program typed: TypedProgram owned: OwnedProgram key: str) -> unit

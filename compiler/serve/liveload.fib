@@ -4,7 +4,7 @@
 ;; it; the hint names the flag). Its definitions are diffed by key (serve.replcore `classify`, the keys of a REPL input) against the
 ;; session's copy of the module (the file as the base read it, then the text last loaded): a changed function or `impl` is a family to
 ;; swap, a new function (or `impl`) a family at generation 0, a removed function `live/Removed` (its stub stays and the running program
-;; may call it), a changed or new `def` `live/Def` (LT4), a changed type `live/Layout`, a changed macro `live/Macro`, a changed extern
+;; may call it), a changed `def` redefined and a new one made (serve.livedefs, LT4; a type change `live/Def`), a changed type `live/Layout`, a changed macro `live/Macro`, a changed extern
 ;; `live/Extern`. Every refusal of the file is listed, at the definition's position in the file, and if any rule refuses nothing is
 ;; applied. Else the program of the session's text with the loaded text as the module's override (`Sess.texts`: the engine reads it in
 ;; place of the file, serve.incr `Job.texts`) is checked whole, the rules of serve.liverules compared with the live table, the changed
@@ -13,9 +13,9 @@
 ;; `eval` of its changed definitions (serve.liveswap `input`). `reload` loads again every file loaded in this session whose disk content
 ;; differs from the loaded text, in load order; `status` lists the loaded files, `stale` when the disk differs.
 (ns serve.liveload
-  (:require [serve.livesess :as ls] [serve.liveswap :as lsw] [serve.livetable :as lt] [serve.liverules :as lr] [serve.replcore :as rc]
+  (:require [serve.livesess :as ls] [serve.liveswap :as lsw] [serve.livetable :as lt] [serve.livedefs :as ld] [serve.liverules :as lr] [serve.replcore :as rc]
             [serve.diag :as dg] [serve.incr :as inc] [emit.compile :as ec] [emit.program :as ep] [expand.modules :as mods] [syntax.reader :as reader]
-            [live.extract :as ex] [pkg.paths :as pp] [fib.string :as s]))
+            [live.extract :as ex] [pkg.paths :as pp] [own.driver :as od] [fib.string :as s]))
 
 ;; A module's text as the session holds it: the file (as the loader or the user named it) and the text the running program's bodies
 ;; of the module were compiled from.
@@ -138,7 +138,7 @@
   (cond (s/starts-with? (. d key) "type:") "type"
         (s/starts-with? (. d key) "impl:") "impl"
         (s/starts-with? (. d key) "text:") "text"
-        (s/starts-with? (. d text) "(def ") "def"
+        (ld/def-text? d) "def"
         (s/starts-with? (. d text) "(defmacro ") "macro"
         (s/starts-with? (. d text) "(extern ") "extern"
         :else "fun"))
@@ -163,8 +163,6 @@
   (let ((k (kind-of d)) (n (. d name)) (added (= what "added")))
     (cond (and (= what "removed") (or (= k "fun") (= k "impl")))
             (refusal text d "live/Removed" (str n " was removed; its stub stays and the running program may call it") (str "keep a definition of " n ", or :restart"))
-          (= k "def") (refusal text d "live/Def" (if added (str n " is a new def; a def of a loaded file is made at a restart (LT4)") (str n " is a def of the program; a def is immortal and read count-free"))
-                               (if added "(def ..) at the REPL makes a session def; :restart" ":restart"))
           (and (= k "type") (s/starts-with? (. d text) "(defprotocol ")) (if added nil (refusal text d "live/Protocol" (str n " is a protocol of the running program; its dispatch rows are in every caller") ":restart"))
           (= k "type") (if added nil (refusal text d "live/Layout" (str n " " what "; values of " n " exist in the running program") ":restart"))
           (= k "macro") (if added nil (refusal text d "live/Macro" (str n " is a macro; its users were expanded with the old one") ":restart"))
@@ -222,15 +220,29 @@
         (families (vec (mapcat (fn (d: rc/Def) (families-of sx prefix d)) (. diff changed))))
         (impls (mapv (fn (d: rc/Def) (. d key)) (filterv (fn (d: rc/Def) (= (kind-of d) "impl")) (into (. diff changed) (. diff added)))))
         (new-fns (filterv (fn (d: rc/Def) (= (kind-of d) "fun")) (. diff added))))
-    (let ((requests (into (mapv (fn (d: rc/Def) (ec/BodyRequest (. d name) false [] nil [] (some ns))) new-fns) (lsw/requests-of sx [] families impls)))
+    (let ((redefs (ld/redefs-of (. diff changed) (some ns)))
+          (requests (into (mapv (fn (d: rc/Def) (ec/BodyRequest (. d name) false [] nil [] (some ns))) new-fns) (lsw/requests-of sx [] families impls)))
           (fr (rc/front-texts (. sx eng) (. sx rts) (rc/source-of @(. (. sx rc) clauses) @(. (. sx rc) defs) "") "yes" true (assoc @(. sx texts) ns text))))
       (match (. fr checked)
         ((Err ds) (result file ns defs [] (checker-refused sx ds)))
-        ((Ok c) (match (lr/check-rules @(. sx table) c @(. sx defined))
-                  ((some r) (result file ns defs [] (lsw/unchanged sx (refused (. r code) (str file ":1:1: " (. r message)) (. r hint)))))
-                  (nil (match (lsw/emit-swapping sx c (. fr stats) requests families gen)
+        ((Ok c) (match (rules-refusal sx file text c redefs)
+                  ((some a) (result file ns defs [] (lsw/unchanged sx a)))
+                  (nil (match (lsw/emit-swapping sx c (. fr stats) (into requests (ld/def-requests redefs)) families gen)
                          ((Err ds) (result file ns defs [] (checker-refused sx ds)))
-                         ((Ok [made changed]) (apply-load ld sx file ns text defs made changed (fresh-families sx ns (. diff added)) gen))))))))))
+                         ((Ok [made changed]) (match (ld/shape-refusal made redefs)
+                                                ((some r) (result file ns defs [] (lsw/unchanged sx (def-refused file text r))))
+                                                (nil (apply-load ld sx file ns text defs made changed (fresh-families sx ns (. diff added)) gen redefs))))))))))))
+
+;; The rules of the live table at `FILE:1:1`, then the type rule of a redefined `def` at the definition (serve.livedefs).
+(defun rules-refusal :private (sx: ls/Sess file: str text: str c: od/Checked redefs: (Vec ld/Redef)) -> (Option ls/Answer)
+  (match (lr/check-rules @(. sx table) c @(. sx defined))
+    ((some r) (some (refused (. r code) (str file ":1:1: " (. r message)) (. r hint))))
+    (nil (match (ld/type-refusal sx c redefs) ((some r) (some (def-refused file text r))) (nil nil)))))
+
+;; A redefinition refused, at its definition's line in the file.
+(defun def-refused :private (file: str text: str r: ld/DefRefusal) -> ls/Answer
+  (let ((at (match (first (filterv (fn (d: rc/Def) (= (. d name) (. r name))) (defs-of text))) ((some d) (pos-of text d)) (nil (Pair 1 1)))))
+    (refused-all file [(Refusal "live/Def" (. r message) ":restart" (. at fst) (. at snd))])))
 
 ;; The families `fresh` (new to the table: a new function of the loaded module, a new `impl`'s methods) cut out, added under a tracker
 ;; of their own and kept: their stubs and slots are resident from now on, generation 0 of their families.
@@ -261,14 +273,16 @@
 
 ;; The accepted load applied: the override, the slots, the new families, the swap; the table after; the copy and the loaded list. A cut
 ;; that fails is reported as broken with the override restored (what was added stays resident but unreachable).
-(defun apply-load :private (ld: Loads sx: ls/Sess file: str ns: str text: str defs: (Vec rc/Def) made: ls/Made changed: (Vec str) fresh: (Vec str) gen: i64) -> LoadResult
+(defun apply-load :private (ld: Loads sx: ls/Sess file: str ns: str text: str defs: (Vec rc/Def) made: ls/Made changed: (Vec str) fresh: (Vec str) gen: i64
+                            redefs: (Vec ld/Redef)) -> LoadResult
   (let ((snap @(. sx texts)) (shown (mapv (fn (f: str) (shown-name ns f)) changed)) (defined (mapv (fn (f: str) (shown-name ns f)) fresh)))
     (do (set! (. sx texts) (assoc snap ns text))
-        (match (try-let ((_ (ls/make-slots sx made)) (_ (make-new sx made fresh))) (lsw/swap-all sx made changed gen))
+        (match (try-let ((_ (ld/make-slots sx made)) (_ (ld/apply-redefs sx made redefs)) (_ (make-new sx made fresh))) (lsw/swap-all sx made changed gen))
           ((Err m) (do (set! (. sx texts) snap) (result file ns defs [] (lsw/unchanged sx (ls/Broken m)))))
           ((Ok [jit patch])
            (do (set! (. sx table) (lt/table-after @(. sx table) (ls/live-bodies sx) (. made c) changed gen))
                (ls/set-generations sx (lt/generations-of @(. sx table)))
+               (ld/note-types sx (. made c))
                (set! (. ld copies) (assoc @(. ld copies) ns (Copy file text)))
                (note-loaded ld ns file)
                (result file ns defs shown

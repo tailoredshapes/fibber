@@ -1,0 +1,74 @@
+;; compiler/serve/liveexpr.fib: an expression input of a live session (docs/design/live-repl.md 3.5; package LV1, out of serve.livesess
+;; since LT4): its program (the session's text with an entry `live-entry-N` that writes the value's `pr-str` to a file the session reads,
+;; or runs it for its effect when the type has no Debug), the `def`s it reaches made (serve.livedefs `make-slots`), the entry cut out,
+;; run on the attach thread under `live-guard` (a trap is `failed`), and freed unless something resident could point into it.
+(ns serve.liveexpr
+  (:use lir.ast lir.types)
+  (:require [serve.livesess :as ls] [serve.livedefs :as ld] [serve.diag :as dg] [emit.compile :as ec] [emit.node :as n] [emit.function :as f]
+            [live.jit :as lj] [live.extract :as ex] [fib.unix :as unix] [fib.string :as s]))
+
+;; The entry of input `n`: a name of its own, so that its closure literals (and their object types, shared by every program of the
+;; session) are nobody else's.
+(defun entry-name :private (n: i64) -> str (str "live-entry-" n))
+
+(defun entry-tail :private (n: i64 expr: str print: bool) -> str
+  (str "(defun " (entry-name n) " (live-fd: i64) -> i64 (live-guard live-fd (fn () -> i64 (do "
+       (if print (str "(live-write live-fd (pr-str " expr "))") expr) " 0))))\n"))
+
+;; A `ccc` entry `name` of one word (the descriptor) to `body`, a `tailcc` function of the same parameter; the first word of its result
+;; (a value next to a failure under the catching convention).
+(defun entry-item :private (name: str body: str ty: LFnType) -> LItem
+  (let ((call (n/call body [(n/local "fd")])))
+    (let ((value (match (. ty ret) ((some (TAnon _)) (n/extract call 0)) (_ call))))
+      (ItDefine (f/external (f/make name (some ty-i64) [(Pair "fd" ty-i64)] cc-c [(f/block "entry" [(n/ret (some value))])]))))))
+
+(defun debug-missing? :private (ds: (Vec dg/Diag)) -> bool (some? (first (filterv (fn (d: dg/Diag) (s/includes? (. d message) "implementation of Debug")) ds))))
+
+;; The program of expression input `n`: its value printed with `pr-str`, or run for its effect alone when its type has no Debug.
+(defun expression-program :private (sx: ls/Sess n: i64 expr: str) -> (Result (Pair ls/Made bool) (Vec dg/Diag))
+  (let ((req [(ec/BodyRequest (entry-name n) false [] nil [] nil)]))
+    (match (ls/program-of sx (entry-tail n expr true) req)
+      ((Ok made) (Ok (Pair made true)))
+      ((Err ds) (if (debug-missing? ds)
+                    (match (ls/program-of sx (entry-tail n expr false) req) ((Ok made) (Ok (Pair made false))) ((Err ds2) (Err ds2)))
+                    (Err ds))))))
+
+;; The text an input wrote to the output file, which is then removed.
+(defun take-output :private (sx: ls/Sess) -> str
+  (let ((t (unwrap-or (read-file (. sx out)) "")))
+    (do (unix/fd-unlink (. sx out)) t)))
+
+;; The entry run with the output file's descriptor: its status and what it wrote.
+(defun run-entry :private (sx: ls/Sess addr: i64) -> (Result (Pair i64 str) str)
+  (match (unix/fd-open (. sx out) (+ unix/O_WRONLY (+ unix/O_CREAT unix/O_TRUNC)) 384)
+    ((Err e) (Err (str "cannot open " (. sx out) ": " (unix/errno-text e))))
+    ((Ok fd) (let ((r (lj/call addr [fd])))
+               (do (unix/fd-close fd)
+                   (match r ((Err m) (Err m)) ((Ok st) (Ok (Pair st (take-output sx))))))))))
+
+;; The entry of input `n` cut out as `live.expr.N.body` (generation 0 of the entry, emit.live), entered through `live.expr.N`, run,
+;; and freed unless pinned.
+(defun run-expression :private (sx: ls/Sess n: i64 m: LModule) -> (Result (Pair i64 str) str)
+  (let ((pi (ex/index-of m)) (name (str "live.expr." n)) (stub (str "f." (entry-name n))))
+    (let ((body (if (some? (get pi (str stub ".g0"))) (str stub ".g0") stub)))
+      (try-let ((fd (match (get pi body) ((some (ItDefine fd)) (Ok fd)) (_ (Err (str "live: the program has no " (entry-name n))))))
+                (a (ls/add-cut sx m [(Pair body (str name ".body"))] [] [(entry-item name (str name ".body") (. fd ty))]))
+                (addr (lj/address (ls/jit-of sx) name))
+                (r (run-entry sx addr)))
+        (if (ex/pins? (. a module))
+            (do (ls/keep-module sx a) (Ok r))
+            (match (lj/remove (ls/jit-of sx) (. a rt) [name (str name ".body")]) ((Err e) (Err e)) ((Ok _) (Ok r))))))))
+
+(defun expression-input (sx: ls/Sess expr: str) -> ls/Answer
+  (let ((n @(. sx inputs)))
+    (expression-answer sx n (expression-program sx n expr))))
+
+(defun expression-answer :private (sx: ls/Sess n: i64 program: (Result (Pair ls/Made bool) (Vec dg/Diag))) -> ls/Answer
+  (match program
+    ((Err ds) (ls/Refused (ls/shown-of sx ds (ls/input-line sx) @(. (. sx rc) defs)) ds "check" ""))
+    ((Ok [made printed])
+     (match (try-let ((_ (ld/make-slots sx made))) (run-expression sx n (. made m)))
+       ((Err m) (ls/Broken m))
+       ((Ok [st text]) (cond (= st 134) (ls/Failed text (. made stats))
+                             (= st 0) (ls/Value (if printed (some text) nil) 0 (. made stats))
+                             :else (ls/Value nil st (. made stats))))))))

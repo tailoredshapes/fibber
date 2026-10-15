@@ -110,7 +110,7 @@
           ((Err m) (p/error-response r "internal" m))
           ((Ok rd) (p/response r true [(Pair "removed" (j/json-int (. rd removed))) (Pair "kept" (j/json-int (. rd kept)))
                                        (Pair "pinned" (j/JArr (mapv (fn (p: (Pair str str)) (j/json-obj [(Pair "function" (j/json-str (. p fst))) (Pair "reason" (j/json-str (. p snd)))])) (. rd pinned))))
-                                       (Pair "pinned_text" (j/json-str (lr/pinned-text rd)))
+                                       (Pair "pinned_text" (j/json-str (lr/pinned-text rd))) (Pair "defs" (defs-json (. l sx)))
                                        (Pair "generation" (j/json-int (lsw/generation (. l sx))))]))))))
 
 (defun op-eval :private (l: Live r: p/Req) -> str
@@ -141,13 +141,20 @@
                                              [(Pair "stats" (p/stats-json stats))])))))
        (other (answer-json l r other))))))
 
+;; The `def`s redefined (LT4, serve.livedefs): how many redefinitions, the old values waiting for a retirement, the ones dropped (freed)
+;; and the ones that were immortal (never freed).
+(defun defs-json :private (sx: ls/Sess) -> j/JVal
+  (let ((d @(. sx defs)))
+    (j/json-obj [(Pair "redefined" (j/json-int (. d redefined))) (Pair "retiring" (j/json-int (count (. d retired))))
+                 (Pair "dropped" (j/json-int (. d dropped))) (Pair "immortal" (j/json-int (. d immortal)))])))
+
 (defun op-status :private (l: Live r: p/Req) -> str
   (let ((sx (. l sx)))
     (p/response r true [(Pair "generation" (j/json-int (lsw/generation sx)))
                         (Pair "generations" (j/json-obj [(Pair "count" (j/json-int (+ 1 (lt/generations-kept @(. sx table))))) (Pair "kept" (j/json-int (ls/modules-kept sx)))
                                                          (Pair "functions" (j/json-int (lt/family-count @(. sx table))))]))
                         (Pair "values" (j/json-obj [(Pair "resident" (strs (ls/resident-names sx))) (Pair "count" (j/json-int (count (ls/resident-names sx))))]))
-                        (Pair "threads" (threads-json (lr/threads sx)))
+                        (Pair "threads" (threads-json (lr/threads sx))) (Pair "defs" (defs-json sx))
                         (Pair "tests" (ltt/tests-json (. l tests)))
                         (Pair "loaded" (loaded-json l)) (Pair "live" (j/json-str (ll/rule-text (. l loads) sx)))
                         (Pair "inputs" (j/json-int (ls/inputs-made sx))) (Pair "requests" (j/json-int @(. l served)))
