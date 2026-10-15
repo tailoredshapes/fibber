@@ -1,0 +1,96 @@
+;; compiler/emit/defs/cache.fib: the constant defs' values kept across the programs of a live session (docs/design/live-incremental.md
+;; 2.2 item 1, package LE1; emit.program `DefCache`, held by the session's `Tables`). The base of a session evaluates every constant `def`
+;; through the JIT (emit.defs.jit) and the values are the resident program's for good; a later program of the session has the same defs
+;; under the same body names and would evaluate each again, in a module that carries every object type of the session (8 s of a 9 s emit
+;; on a 300-module program: 1.3 of the design). So `emit-def` asks here first: a hit replays the constant items the reading appended
+;; (their `@def.N` names among the program's constants, the counter past them) and records the value; a miss evaluates and keeps.
+;; What keeps a replay right: (1) the key is the body name AND the lowered initialiser (`source`: the text of `d.NAME` as this program
+;; lowered it), so a definition that changed between two programs (a required module edited on disk between inputs) is a miss;
+;; (2) every program of a session numbers its constants past what the session gave out (`DefCache.next`), so a replayed `@def.N` is the
+;; name the resident base defines and a fresh one never collides with it (`cache-replay` refuses a collision as an internal error).
+;; Before LE1 every program numbered from 0, and an input's fresh constant (a `require`d module's def) could take the name of one the
+;; base defines: the cut (live.extract) then declared the base's under that name and the input read another def's value (seen in
+;; compiler/tests/live/defcache.py's `extra` scenario: a `(Vec str)` of two read fib.http's header names). The numbering holds under
+;; FIB_LIVE_EMIT=off too, which turns off the replay alone;
+;; (3) a value that names a closure or a vtable static (`@clo.N`, `@vt.N`: each program numbers its own until LE2) is never kept, and is
+;; evaluated by every program. FIB_LIVE_EMIT=verify (emit.program `live-emit-mode`) evaluates a hit again and compares (emit.defs.jit).
+(ns emit.defs.cache
+  (:require [lir.ast :as la] [lir.print :as print] [lir.rewrite :as rw] [fib.string :as s])
+  (:use emit.program emit.defs.data))
+
+;; The lowered initialiser of `body` as this program made it (lowered before the value is asked for): the fingerprint of the definition.
+(defun def-source (p: Program body: str) -> str
+  (match (find-first (fn (f: la/LFunction) (= (. f name) body)) @(. p funcs))
+    (nil "")
+    ((some f) (print/print-module (la/LModule [(la/ItDefine f)])))))
+
+;; Whether values are replayed at all: not under FIB_LIVE_EMIT=off (the numbering of the session stays).
+(defun replaying? :private () -> bool (not (= (live-emit-mode) "off")))
+
+;; The entry kept for `body`, when it was evaluated from this same definition.
+(defun cache-lookup (c: DefCache body: str source: str) -> (Option DefEntry)
+  (match (if (replaying?) (get @(. c entries) body) nil)
+    ((some e) (if (= (. e source) source) (some e) nil))
+    (nil nil)))
+
+(defun own-static? :private (name: str) -> bool (or (s/starts-with? name "clo.") (s/starts-with? name "vt.")))
+
+;; Whether an expression names a closure or a vtable static anywhere in it.
+(defun names-static? :private (e: la/LExpr) -> bool
+  (let ((found (cell (match (. e kind) ((la/KGlobal nm) (own-static? nm)) (_ false)))))
+    (do (rw/map-children e (fn (c: la/LExpr) (do (when (names-static? c) (set! found true)) c)))
+        @found)))
+
+(defun item-static? :private (it: la/LItem) -> bool
+  (match it ((la/ItGlobal g) (names-static? (. g init))) (_ false)))
+
+;; Whether the value, or a constant it reaches, names a static of the program's own (`@clo.N`, `@vt.N`): not kept (LE2).
+(defun holds-statics? (v: DefValue items: (Vec la/LItem)) -> bool
+  (or (match (. v expr) ((some e) (names-static? e)) (nil false))
+      (some? (find-first item-static? items))))
+
+;; The value of `body`, evaluated from `source`, kept with the items its reading appended, unless it names a static of the program's own.
+(defun cache-store (c: DefCache body: str source: str v: DefValue items: (Vec la/LItem)) -> unit
+  (when (and (replaying?) (not (holds-statics? v items)))
+    (set! (. c entries) (assoc @(. c entries) body (DefEntry source v items)))))
+
+;; The session's highest constant number raised to `counter` (a program's, after a def of its own is made or replayed).
+(defun cache-numbered (c: DefCache counter: i64) -> unit
+  (set! (. c next) (max @(. c next) counter)))
+
+;; The number N of a constant item `def.N`, 0 for any other item.
+(defun constant-number :private (it: la/LItem) -> i64
+  (match it
+    ((la/ItGlobal g) (if (s/starts-with? (. g name) "def.") (unwrap-or (parse-long (str-slice (. g name) 4 (str-len (. g name)))) 0) 0))
+    (_ 0)))
+
+;; The kept items appended to `defs` as the reading would have appended them: each item, its `@def.N` among the constants, the counter
+;; past it. A name the program's constants hold already means the session's numbering is broken: an internal error, not a replay.
+(defun cache-replay (defs: Defs items: (Vec la/LItem)) -> (Result unit str)
+  (loop ((i 0))
+    (if (>= i (count items))
+        (Ok ())
+        (let ((it (nth items i)) (n (constant-number (nth items i))))
+          (let ((name (str "@def." n)))
+            (if (and (> n 0) (includes? name @(. defs constants)))
+                (Err (str "live: the constant " name " of a replayed def is numbered twice in this program"))
+                (do (defs-append defs it)
+                    (when (> n 0)
+                      (do (cell-update! (. defs constants) (fn (cs: (Vec str)) (conj cs name)))
+                          (set! (. defs counter) (max @(. defs counter) n))))
+                    (recur (+ i 1)))))))))
+
+;; The number before the first kept constant of `items` (`counter` when there is none): a fresh evaluation numbered from there gives the
+;; kept items their own names, so `verify` compares texts.
+(defun number-before (items: (Vec la/LItem) counter: i64) -> i64
+  (match (find-first (fn (it: la/LItem) (> (constant-number it) 0)) items)
+    ((some it) (- (constant-number it) 1))
+    (nil counter)))
+
+;; A copy of `defs` (the module so far) whose next constant is numbered past `from`: what a verifying evaluation reads and appends to.
+(defun defs-copy-at (d: Defs from: i64) -> Defs
+  (Defs (cell @(. d items)) (cell @(. d values)) (cell @(. d constants)) (cell from)))
+
+;; A value and its items as text: what `verify` compares.
+(defun printed (v: DefValue items: (Vec la/LItem)) -> str
+  (str (match (. v expr) ((some e) (print/print-expr e)) (nil "")) "\n" (print/print-module (la/LModule items))))

@@ -86,15 +86,15 @@
                (Ok ())))))))
 
 ;; The tables of one program of the session: the session's objects (the type ids every walker reads), strings and keywords (plain data
-;; and ids, the same in every program, declared from the base by name), the generations and the bodies of live mode, and closures and
-;; vtables of the program's own: those name code, and a later program does not emit the code of a closure or a vtable it does not make,
-;; so it must not carry the base's.
+;; and ids, the same in every program, declared from the base by name), the generations and the bodies of live mode, the constant defs'
+;; values and the runtime's items (LE1, docs/design/live-incremental.md 2.2), and closures and vtables of the program's own: those name
+;; code, and a later program does not emit the code of a closure or a vtable it does not make, so it must not carry the base's.
 (defun program-tables :private (sx: Sess) -> ep/Tables
   (let ((s (. (. sx tables) statics)))
     (ep/Tables (. (. sx tables) objects)
                (st/Statics (. s strings) (. s string-index) (. s keywords) (. s keyword-index) (. s keywords-sealed)
                            (cell []) (cell (map-empty)) (cell []) (cell (map-empty)) (cell []) (cell (set-empty)))
-               (. (. sx tables) generations) (. (. sx tables) bodies))))
+               (. (. sx tables) generations) (. (. sx tables) bodies) (. (. sx tables) defs) (. (. sx tables) runtime))))
 
 ;; The generation each family is lowered under by the next program (serve.liveswap sets the swapped ones ahead of their emit).
 (defun set-generations (sx: Sess gens: (Map str i64)) -> unit (set! (. (. sx tables) generations) gens))
@@ -116,12 +116,15 @@
       ((Err ds) (Err ds))
       ((Ok c) (emit-checked sx c (. fr stats) requests)))))
 
-;; The checked program emitted (again, with other generations: serve.liveswap).
+;; The checked program emitted (again, with other generations: serve.liveswap). A replayed def value that FIB_LIVE_EMIT=verify finds
+;; wrong (emit.defs.jit `verify-replay`) is `live/EmitVerify`; anything else the emitter refuses is `live/Unsupported`.
 (defun emit-checked (sx: Sess c: od/Checked stats: inc/Stats requests: (Vec ec/BodyRequest)) -> (Result Made (Vec dg/Diag))
   (let ((t0 (sys-clock-now)))
     (match (do (set! (. (. (. c typed) globals) live-modules) @(. sx live-modules))
                (ec/compile-executable-ast-with (. c typed) (. c owned) (some (program-tables sx)) requests))
-      ((Err m) (Err [(dg/diag-nowhere "live/Unsupported" rc/repl-file (str "unsupported: " m))]))
+      ((Err m) (Err [(if (s/starts-with? m "verify: ")
+                         (dg/diag-nowhere "live/EmitVerify" rc/repl-file m)
+                         (dg/diag-nowhere "live/Unsupported" rc/repl-file (str "unsupported: " m)))]))
       ((Ok e) (Ok (Made (. e ast) c stats (inc/ms-since t0)))))))
 
 ;; The whole program with `tail` after the session's text.

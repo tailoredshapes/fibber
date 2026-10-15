@@ -8,7 +8,7 @@
 ;; widens its result in lIR: a narrow integer by `sext` (`zext` for an `i1`), a `float` by `fpext`. The text of this module is
 ;; never printed, only the constants it makes. Memory is read through raw pointers (`unsafe`), from addresses held as `i64`s.
 (ns emit.defs.jit
-  (:require [native.api :as jit] [native.call :as call] [lair.ffi :as ffi] [emit.defs.astmod :as am] [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f])
+  (:require [native.api :as jit] [native.call :as call] [lair.ffi :as ffi] [emit.defs.astmod :as am] [emit.defs.cache :as dc] [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f])
   (:use types.ty own.program emit.value emit.text emit.layout emit.objects emit.statics emit.program emit.assemble emit.defs.data))
 
 ;; What a `def`'s entry returned, or a field held. Rust: defs/jit.rs:88 Raw (the `f32` is widened, as `float_text(f64::from(x))`)
@@ -258,8 +258,54 @@
           (Ok m))
         (Ok m))))
 
-;; Evaluates the initialiser of def number k (`d`, a constant) and records its value for the ones after (syntax §3.19).
-;; Rust: defs/jit.rs:25-69, the body of the loop of `emit_defs`
+;; The value of def number k, whose initialiser is the body `body` of type `t`, evaluated through the JIT: the module so far with the
+;; entry, the runtime initialiser and the address getters of the constants so far, in a session of its own.
+(defun evaluate-def :private (p: Program defs: Defs k: i64 body: str t: Ty lt: (Option LirTy)) -> (Result DefValue str)
+  (let ((entry (str-join ["fib.defentry." (str k)]))
+        (known (into @(. defs constants) (statics-closure-names (. p statics)))))
+    (try-let ((m (session-module p defs k (session-tail k body entry lt known)))
+              (v (in-session p defs k m entry known t lt)))
+      (Ok (DefValue v lt)))))
+
+(defun record-def :private (p: Program defs: Defs d: i64 dv: DefValue) -> unit
+  (do (set! (. p def-values) (assoc @(. p def-values) d dv))
+      (set! (. defs values) (assoc @(. defs values) d dv))))
+
+;; FIB_LIVE_EMIT=verify: the value kept for `body` evaluated again, into a copy of the module so far numbered so that the fresh constants
+;; get the kept names, and compared as text with the kept value and items; a difference is the refusal `live/EmitVerify`.
+(defun verify-replay :private (p: Program defs: Defs k: i64 body: str t: Ty lt: (Option LirTy) e: DefEntry) -> (Result unit str)
+  (let ((scratch (dc/defs-copy-at defs (dc/number-before (. e items) @(. defs counter)))))
+    (try-let ((fresh (evaluate-def p scratch k body t lt)))
+      (let ((kept (dc/printed (. e value) (. e items)))
+            (got (dc/printed fresh (vec (drop (count @(. defs items)) @(. scratch items))))))
+        (if (= kept got)
+            (Ok ())
+            (Err (str "verify: the value the session keeps for " body " differs from its evaluation: kept " (clipped kept) " evaluated " (clipped got))))))))
+
+;; The first 200 bytes of a text (a value's items can be a table of thousands of lines).
+(defun clipped :private (text: str) -> str
+  (if (> (str-len text) 200) (str (str-slice text 0 200) " ..") text))
+
+;; A def of a live session's program (emit.program `DefCache`, emit.defs.cache): the value the session keeps for this definition is
+;; replayed; else it is evaluated and kept. Either way the session's numbering is raised past this program's constants.
+(defun cached-def :private (p: Program c: DefCache defs: Defs k: i64 d: i64 body: str t: Ty lt: (Option LirTy)) -> (Result unit str)
+  (let ((source (dc/def-source p body)))
+    (match (dc/cache-lookup c body source)
+      ((some e)
+       (try-let ((_v (if (= (live-emit-mode) "verify") (verify-replay p defs k body t lt e) (Ok ())))
+                 (_r (dc/cache-replay defs (. e items))))
+         (do (dc/cache-numbered c @(. defs counter))
+             (Ok (record-def p defs d (. e value))))))
+      (nil
+       (let ((n0 (count @(. defs items))))
+         (try-let ((dv (evaluate-def p defs k body t lt)))
+           (do (dc/cache-store c body source dv (vec (drop n0 @(. defs items))))
+               (dc/cache-numbered c @(. defs counter))
+               (Ok (record-def p defs d dv)))))))))
+
+;; Evaluates the initialiser of def number k (`d`, a constant) and records its value for the ones after (syntax §3.19); in a live
+;; session, replays the value the session keeps for it (`cached-def`). The body is lowered first either way: the statics it names must
+;; exist in this program. Rust: defs/jit.rs:25-69, the body of the loop of `emit_defs`
 (defun emit-def (p: Program defs: Defs k: i64 d: i64) -> (Result unit str)
   (match (get (. (. p typed) def-types) d)
     (nil (Err "a def without a type"))
@@ -267,11 +313,6 @@
      (let ((body (program-request p (BodyDef d) [])))
        (try-let ((_a (emit-all p))
                  (lt (program-lir p t)))
-         (let ((entry (str-join ["fib.defentry." (str k)]))
-               (known (into @(. defs constants) (statics-closure-names (. p statics)))))
-           (try-let ((m (session-module p defs k (session-tail k body entry lt known)))
-                     (v (in-session p defs k m entry known t lt)))
-               (let ((dv (DefValue v lt)))
-                 (do (set! (. p def-values) (assoc @(. p def-values) d dv))
-                     (set! (. defs values) (assoc @(. defs values) d dv))
-                     (Ok ()))))))))))
+         (match (. p def-cache)
+           (nil (try-let ((dv (evaluate-def p defs k body t lt))) (Ok (record-def p defs d dv))))
+           ((some c) (cached-def p c defs k d body t lt))))))))

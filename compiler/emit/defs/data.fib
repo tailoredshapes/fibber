@@ -9,8 +9,12 @@
 ;; Constant items and their values stay structured throughout evaluation.
 (defstruct Defs (items: (Cell (Vec LItem)) values: (Cell (Map i64 DefValue)) constants: (Cell (Vec str)) counter: (Cell i64)))
 
-(defun defs-new () -> Defs
-  (Defs (cell []) (cell (map-empty)) (cell []) (cell 0)))
+(defun defs-new () -> Defs (defs-new-from 0))
+
+;; `Defs` whose constants are numbered past `n`: a live session's program numbers its own past every number the session gave out
+;; (emit.program `DefCache.next`), so that a constant replayed from the session and a fresh one never share a name.
+(defun defs-new-from (n: i64) -> Defs
+  (Defs (cell []) (cell (map-empty)) (cell []) (cell n)))
 
 ;; The `def`s made at compile time as static data: those whose initialiser is a constant expression (syntax §3.19); the others are
 ;; made at run time by the init functions of emit.inits. Rust: defs/mod.rs:58 def_ids
@@ -24,7 +28,7 @@
         (cell-update! (. d constants) (fn (constants: (Vec str)) (conj constants (str-join ["@def." (str n)]))))
         n)))
 
-(defun defs-append :private (d: Defs item: LItem) -> unit
+(defun defs-append (d: Defs item: LItem) -> unit
   (cell-update! (. d items) (fn (items: (Vec LItem)) (conj items item))))
 
 ;; An array constant of `t = (Array E)` with these element nodes. Rust: defs/mod.rs:62 Defs::emit_array

@@ -40,12 +40,20 @@
 #   signature-ignored    the signature rule is not applied: a function redefined with another       compiler/tests/live/swap.sh (transcript 5's
 #                        scheme (an added parameter) is accepted; its callers' calls are typed lIR  first refusal does not come; the server's
 #                        of the old one (LV2, 3.4)                                                  calls of `handle` read a register for `db`)
+#   defcache-stale       the def cache is keyed by the body name alone, not by the lowered          compiler/tests/live/defcache.sh (the required
+#                        initialiser too: a definition that changed between two programs is        module edited on disk still reads 5 and
+#                        replayed from the old one (LE1, docs/design/live-incremental.md 2.2)       ["a" "b"]; under verify the replay is refused)
+#   defcache-no-items    a replayed value's constant items are not appended to the program: the     compiler/tests/live/defcache.sh (every input
+#                        value names a `@def.N` the module lacks (LE1)                               reading a def is refused: no such global)
+#   defcache-verify-blind  FIB_LIVE_EMIT=verify compares nothing (planted with defcache-stale, so   compiler/tests/live/defcache.sh (the verify
+#                        that there is a wrong replay for it to miss)                                app reads the edited module's old values
+#                                                                                                    instead of refusing the input)
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-live-MODE),
 #              MUT_QUICK=1 runs stubs.sh --quick (hello's golden and the deep recursion; no case tables: kills both mutants in under a minute after the build).
 # A mutant of lib/ alone (sink-ignored, override-ignored) builds nothing: the case's `roots:` header names the copy's lib, and FIBC runs it.
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|defcache-stale|defcache-no-items|defcache-verify-blind}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -83,6 +91,10 @@ case $MODE in
                        patch compiler/serve/liveswap.fib '[own.driver :as od] [types.init :as ti]' '[own.driver :as od] [types.init :as ti] [live.jit :as lj]' ;;
   summary-ignored)  patch compiler/serve/liverules.fib '       (nil (summary-rule c f fid))))' '       (nil nil)))' ;;
   signature-ignored) patch compiler/serve/liverules.fib '     (match (signature-rule c f fid session-defs)' '     (match (if true nil (signature-rule c f fid session-defs))' ;;
+  defcache-stale) patch compiler/emit/defs/cache.fib '    ((some e) (if (= (. e source) source) (some e) nil))' '    ((some e) (some e))' ;;
+  defcache-no-items) patch compiler/emit/defs/cache.fib '                (do (defs-append defs it)' '                (do ()' ;;
+  defcache-verify-blind) patch compiler/emit/defs/cache.fib '    ((some e) (if (= (. e source) source) (some e) nil))' '    ((some e) (some e))'
+                         patch compiler/emit/defs/jit.fib '        (if (= kept got)' '        (if true' ;;
   *) echo "mutant-live: unknown mode $MODE" >&2; exit 2 ;;
 esac
 case $MODE in
@@ -100,6 +112,7 @@ case $MODE in
   stub-*) what="the stubs test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/stubs.sh" "$F" "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
   value-reevaluated|trap-not-caught) what="the attach test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/attach.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored) what="the swap test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/swap.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
+  defcache-*) what="the defcache test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/defcache.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   deps-stubbed-by-default|project-paths-not-stubbed) what="the project test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/project.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   *) what="case 8423"  # the case's `roots:` header names ../../lib: run from a copy of cases/stdlib beside the mutated lib
      mkdir -p "$OUT/cases/stdlib"; cp -r "$R"/cases/stdlib/8423-*.fib "$R/cases/stdlib/support" "$OUT/cases/stdlib/"
