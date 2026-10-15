@@ -616,3 +616,21 @@ every second in the background, all 200 or 404/410, none refused). What it does 
   input each while 8 threads read both, 53 to 58 s (about 55 ms each); every read was 3 or 5 and the sum 768 or 1280; `retire` dropped
   every old vector made at run time. Each redefinition keeps its module for good (the new initialiser, its entry, a new constant's
   static data), as LV1 (e) keeps an input's: a thousand redefinitions are a thousand kept modules.
+- **Status 2026-10-15, LT6** (driver.testlive; `--live` kept in `test`'s words by fibc `test-words?`, which also sets FIB_LIVE so the
+  project's live roots resolve; driver.test `report-runs`; the test compiler/tests/live/testlive.sh; the mutant `child-spawned-anyway` of
+  scripts/mutant-live.sh). `fibc test --live [PATH..]` finds the spec files as `fibc test` does and runs serve.live `run-live` in its own
+  process over a host program with no app (`test-host.fib` in the live directory, shared by the user's sessions and written through a
+  rename; its `main` waits until `(reset! live-test-stop true)` is evaluated, or the process is killed), each spec file loaded by `--with`,
+  the module roots the command line's, each spec's directory and its project's (driver.test `project-roots`). `fibc test --connect
+  SOCK|PID [PATH..] [options]` sends one `test` request per file (`spec`, `seed`, `jobs`, `only`, `list`, `isolate`) on one connection and
+  reads each answer as a child's end (0 and 1 ran, 2 nothing selected, 134 died, a refusal an error), rendering the document in the
+  format asked for with the library's own `plain` and `tap` (json and `--list` as the runner wrote them); the report and the exit status are
+  driver.test's. Measured on lilnas (testlive.sh, the specs of test-cmd.sh): every row of test-cmd.sh that a session can hold is the same
+  report byte for byte and the same status; the session is up in 1.5 s; one scenario 352 ms through the session against 1,570 ms
+  spawned (the spec is tiny: the spawned run is the front end of fib.test). Not measured: meshql-fib's 20 s scenario (1.3), because its
+  specs need OpenSSL, whose symbols the JIT does not find on lilnas (`undefined symbol @OpenSSL_version_num`, spawned and live alike).
+  Not built: (a) a gherkin spec (the request names `spec`, so the entry is `(spec.NAME/specs)`; a `runner` is not offered by `fibc test`);
+  (b) a spec that does not compile refuses the whole session (`--live` exits 3), where `fibc test` reports it as one file's ERROR; a spec
+  whose `main` does not run its `specs` (test-cmd.sh's dying spec) is not reproduced (the session never calls `main`); (c) `--timeout`
+  and `--isolate fork` are refused (exit 2), as the `test` op refuses them; (d) two spec files of one base name are one module
+  `spec.NAME` and are refused; (e) the runs are sequential (one test at a time in a session), `-j N` is each file's scenarios N at a time.
