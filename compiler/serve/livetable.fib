@@ -1,0 +1,106 @@
+;; compiler/serve/livetable.fib: the live table of a session (docs/design/live-repl.md 2.1, 3.1; package LV2). Per FAMILY of stubbed
+;; bodies of the running program (emit.live `family-name`: a function with its all-owned twin and its specialisations, or a method):
+;; the generation its slots point at, the function's scheme and ownership summary as the checker gave them at the last accepted
+;; generation (what serve.liverules compares a new program against), and every generation added under a tracker (kept: nothing is
+;; retired before LV3). The session's own generation counts the inputs that swapped something. The bodies of a family are what the
+;; programs of the session registered (emit.program `Tables.bodies`); a body a later program does not make (a specialisation nobody
+;; calls any more) keeps its slot as it is.
+(ns serve.livetable
+  (:require [emit.program :as ep] [emit.names :as en] [types.ty :as ty] [types.scheme :as sc] [types.decls :as td]
+            [types.table :as tb] [own.program :as op] [own.driver :as od] [types.dump.scheme :as ds]))
+
+;; A generation added under a tracker: its number, the tracker, the module's name and the bodies it defines.
+(defstruct Generation (n: i64 rt: i64 module: str names: (Vec str)))
+
+;; `scheme`: the function's scheme as the signature rule compares it and as a message shows it (`scheme-texts`).
+(defstruct Family (generation: i64 scheme: (Option (Pair str str)) summary: (Option op/Summary) gens: (Vec Generation)))
+
+(defstruct Table (families: (Map str Family) generation: i64))
+
+(defun table-new () -> Table (Table {} 0))
+
+;; ---- names
+
+(defun digits? :private (t: str) -> bool
+  (and (> (str-len t) 0) (not-any? (fn (i: i64) (let ((c (str-byte-at t i))) (or (< c 48i8) (> c 57i8)))) (range (str-len t)))))
+
+;; `NAME.gK` without its generation; any other name as it is.
+(defun strip-generation (name: str) -> str
+  (loop ((i (- (str-len name) 1)))
+    (cond (< i 1) name
+          (and (= (str-byte-at name i) 103i8) (= (str-byte-at name (- i 1)) 46i8))   ; `.g`
+            (if (digits? (str-slice name (+ i 1) (str-len name))) (str-slice name 0 (- i 1)) name)
+          (or (< (str-byte-at name i) 48i8) (> (str-byte-at name i) 57i8)) name
+          :else (recur (- i 1)))))
+
+;; The names of the bodies of a family.
+(defun body-names (bodies: (Map str (Vec ep/LiveBody)) family: str) -> (Vec str)
+  (mapv (fn (b: ep/LiveBody) (. b name)) (unwrap-or (get bodies family) [])))
+
+;; Whether `name` (a generation's suffix taken off) is a stubbed body of any family: its stub, slot and bodies are the running program's.
+(defun registered? (bodies: (Map str (Vec ep/LiveBody)) name: str) -> bool
+  (some? (first (filterv (fn (fam: (Vec ep/LiveBody)) (some? (first (filterv (fn (b: ep/LiveBody) (= (. b name) name)) fam)))) (vec (vals bodies))))))
+
+;; ---- the checker's view of a function
+
+;; The id of every function of the program by its family's name.
+(defun fun-ids (g: td/Globals) -> (Map str i64)
+  (reduce (fn (acc: (Map str i64) i: i64) (assoc acc (en/body-name g (op/BodyFun i) []) i)) {} (range (tb/table-count (. g funs)))))
+
+;; A function's scheme as two texts, printed in its own program's names (a type's id is the program's own: two programs of the
+;; session number their types differently, so a scheme crosses programs as text, never as a value): the shape the signature rule
+;; compares (colours erased, display names dropped) and the scheme as a message shows it.
+(defun scheme-texts (c: od/Checked sch: sc/Scheme) -> (Pair str str)
+  (let ((g (. (. c typed) globals)))
+    (Pair (ds/show-scheme-in g (scheme-shape sch)) (ds/show-scheme-in g sch))))
+
+(defun scheme-of (c: od/Checked ids: (Map str i64) family: str) -> (Option (Pair str str))
+  (match (get ids family)
+    ((some f) (match (get (. (. c typed) fun-schemes) f) ((some sch) (some (scheme-texts c sch))) (nil nil)))
+    (nil nil)))
+
+(defun summary-of (c: od/Checked ids: (Map str i64) family: str) -> (Option op/Summary)
+  (match (get ids family) ((some f) (get (. (. c owned) summaries) f)) (nil nil)))
+
+;; A scheme as the signature rule compares it: colours erased (they have no representation, types §8.4), the display names dropped.
+(defun scheme-shape (sch: sc/Scheme) -> sc/Scheme
+  (let ((erase (fn (t: ty/Ty) (ty/ty-map-colours t (fn (k: ty/Colour) ty/CLocal)))))
+    (sc/Scheme (. sch n-vars) 0 [] (mapv (fn (p: ty/Pred) (ty/pred-map-tys p erase)) (. sch preds)) [] (erase (. sch ty)) (. sch amps) [])))
+
+;; ---- the table
+
+(defun generations-of (t: Table) -> (Map str i64)
+  (reduce (fn (acc: (Map str i64) p: (Pair str Family)) (assoc acc (. p fst) (. (. p snd) generation))) {} (vec (. t families))))
+
+;; The family `family` as `c`'s program made it, at generation `gen`, keeping `old`'s generations.
+(defun family-of :private (c: od/Checked ids: (Map str i64) family: str gen: i64 old: (Option Family)) -> Family
+  (Family gen (scheme-of c ids family) (summary-of c ids family) (match old ((some f) (. f gens)) (nil []))))
+
+;; The table of the base: every family the base made, at generation 0.
+;; The table of the base: every family the base made, at generation 0.
+(defun table-of-base (bodies: (Map str (Vec ep/LiveBody)) c: od/Checked) -> Table
+  (let ((ids (fun-ids (. (. c typed) globals))))
+    (Table (reduce (fn (acc: (Map str Family) family: str) (assoc acc family (family-of c ids family 0 nil))) {} (vec (keys bodies))) 0)))
+
+;; The table after an input: the families of `swapped` at generation `gen`, every family's scheme and summary as the program has them
+;; (the rules kept them equal), the families the program made and the table lacked added at generation 0 (a new function), and the
+;; session's generation `gen` when something was swapped.
+(defun table-after (t: Table bodies: (Map str (Vec ep/LiveBody)) c: od/Checked swapped: (Vec str) gen: i64) -> Table
+  (let ((ids (fun-ids (. (. c typed) globals))))
+    (Table (reduce (fn (acc: (Map str Family) family: str)
+                     (let ((old (get (. t families) family)))
+                       (assoc acc family (family-of c ids family (if (includes? family swapped) gen (match old ((some f) (. f generation)) (nil 0))) old))))
+                   {} (vec (keys bodies)))
+           (if (empty? swapped) (. t generation) gen))))
+
+;; `t` with generation `g` recorded for `family`.
+(defun add-generation (t: Table family: str g: Generation) -> Table
+  (match (get (. t families) family)
+    (nil t)
+    ((some f) (Table (assoc (. t families) family (Family (. f generation) (. f scheme) (. f summary) (conj (. f gens) g))) (. t generation)))))
+
+;; How many generations the table keeps under trackers (the base's generation 0 is resident and not counted).
+(defun generations-kept (t: Table) -> i64
+  (reduce (fn (acc: i64 f: Family) (+ acc (count (. f gens)))) 0 (vec (vals (. t families)))))
+
+(defun family-count (t: Table) -> i64 (count (. t families)))

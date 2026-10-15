@@ -1,0 +1,96 @@
+;; compiler/serve/liverules.fib: the rules a body swap must pass (docs/design/live-repl.md 3.4; package LV2), applied to a program
+;; that already checks: the callers of every function of the running program were compiled against its scheme (its calls are typed
+;; lIR) and its ownership summary (an owned position is a count the caller hands over, spec/ownership.md §4), so a program in which any
+;; family's scheme or summary differs from the live table's is refused whole: nothing is emitted, the session is unchanged. Each
+;; refusal is one diagnostic with a `live/*` code and a hint that says what to do.
+(ns serve.liverules
+  (:require [serve.livetable :as lt] [types.decls :as td] [own.program :as op] [own.driver :as od]))
+
+(defstruct Refusal (code: str message: str hint: str))
+
+;; The first rule the program of `c` breaks against the table `t`, if any. `session-defs` is how many definitions the session added
+;; (the hint of a signature refusal says they are kept by a restart).
+(defun check-rules (t: lt/Table c: od/Checked session-defs: i64) -> (Option Refusal)
+  (let ((ids (lt/fun-ids (. (. c typed) globals))))
+    (loop ((fams (vec (keys (. t families)))))
+      (match (first fams)
+        (nil nil)
+        ((some family)
+         (match (family-rules t c ids family session-defs)
+           ((some r) (some r))
+           (nil (recur (vec (rest fams))))))))))
+
+(defun family-rules :private (t: lt/Table c: od/Checked ids: (Map str i64) family: str session-defs: i64) -> (Option Refusal)
+  (match (Pair (get (. t families) family) (get ids family))
+    ([(some f) (some fid)]
+     (match (signature-rule c f fid session-defs)
+       ((some r) (some r))
+       (nil (summary-rule c f fid))))
+    (_ nil)))
+
+;; ---- signature: the scheme after must be the scheme before, compared as types with colours erased
+
+(defun signature-rule :private (c: od/Checked f: lt/Family fid: i64 session-defs: i64) -> (Option Refusal)
+  (match (Pair (. f scheme) (get (. (. c typed) fun-schemes) fid))
+    ([(some was) (some sch)]
+     (let ((now (lt/scheme-texts c sch)))
+       (if (= (. was fst) (. now fst))
+         nil
+         (let ((name (. (td/g-fun (. (. c typed) globals) fid) name)))
+           (some (Refusal "live/Signature"
+                          (str name " now has type " (. now snd) ", was " (. was snd) "; callers were compiled against the old one")
+                          (str ":restart changes signatures; the session's " session-defs (if (= session-defs 1) " definition is" " definitions are") " kept and replayed")))))))
+    (_ nil)))
+
+;; ---- summary: every parameter's mode (borrowed or owned) and escape must be what the callers hand over
+
+(defun summary-rule :private (c: od/Checked f: lt/Family fid: i64) -> (Option Refusal)
+  (match (Pair (. f summary) (get (. (. c owned) summaries) fid))
+    ([(some was) (some now)]
+     (if (= was now)
+         nil
+         (let ((def (td/g-fun (. (. c typed) globals) fid)) (i (first-difference (. was params) (. now params))))
+           (some (refusal-of (. def name) (param-name def i) (owned-why c fid i) (nth-or (. was params) i) (nth-or (. now params) i))))))
+    (_ nil)))
+
+;; The index of the first parameter whose (owned, escapes) differs; the shorter list's length when one is a prefix of the other.
+(defun first-difference :private (was: (Vec (Pair bool bool)) now: (Vec (Pair bool bool))) -> i64
+  (loop ((i 0))
+    (cond (or (>= i (count was)) (>= i (count now))) i
+          (= (nth was i) (nth now i)) (recur (+ i 1))
+          :else i)))
+
+(defun param-name :private (def: td/FunDef i: i64) -> str
+  (if (< i (count (. def params))) (. (nth (. def params) i) name) (str "parameter " i)))
+
+;; Why parameter `i` of the function's body is owned now (own.program `OwnedWhy`: `stored`, `returned`, `rule 2: ..`), in the words of
+;; `fibc explain`.
+(defun owned-why :private (c: od/Checked fid: i64 i: i64) -> str
+  (match (get (. (. c owned) bodies) (op/BodyFun fid))
+    (nil "owned")
+    ((some body)
+     (if (>= i (count (. body params)))
+         "owned"
+         (match (. (nth (. body params) i) kind)
+           ((op/PkOwned whys) (match (first whys)
+                                ((some (op/OwRule1 x)) x)
+                                ((some (op/OwRule2 x)) (str "rule 2: " x))
+                                ((some (op/OwRule3 x)) (str "rule 3: " x))
+                                ((some (op/OwLoop x)) (str "rule 1 " x))
+                                ((some (op/OwSteal x)) x)
+                                (_ "declared")))
+           (_ "owned"))))))
+
+(defun nth-or :private (ps: (Vec (Pair bool bool)) i: i64) -> (Pair bool bool)
+  (if (< i (count ps)) (nth ps i) (Pair false false)))
+
+(defun refusal-of :private (name: str p: str why: str was: (Pair bool bool) now: (Pair bool bool)) -> Refusal
+  (cond (and (not (. was fst)) (. now fst))
+          (Refusal "live/Summary" (str name "'s parameter " p " was borrowed and is now owned (" why "); callers pass it borrowed")
+                   (str "store (clone " p "), or :restart"))
+        (and (. was fst) (not (. now fst)))
+          (Refusal "live/Summary" (str name "'s parameter " p " was owned and is now borrowed; callers hand it over") ":restart")
+        (. now snd)
+          (Refusal "live/Summary" (str name "'s parameter " p " now escapes (" why "); callers were compiled against a parameter that did not") ":restart")
+        :else
+          (Refusal "live/Summary" (str name "'s parameter " p " no longer escapes; callers were compiled against a parameter that did") ":restart")))

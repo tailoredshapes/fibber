@@ -1,7 +1,9 @@
 ;; compiler/serve/live.fib: `fibc run --live FILE [-- arg..]` (docs/design/live-repl.md 2.1 to 2.3, package LV1): the program runs in
 ;; this process, as the base of a resident session (serve.livesess), and an attach socket (serve.livesock) answers requests about it
 ;; while it runs: one JSON object per line in and out (serve.proto, the shapes of `fibc serve`), a connection open for many requests,
-;; one request at a time. Ops: `hello`, `eval` (`text`: what `fibc repl` takes), `type` (`expr`), `inspect` (`name`), `status`.
+;; one request at a time. Ops: `hello`, `eval` (`text`: what `fibc repl` takes; a redefinition of a function is a body swap, serve.liveswap,
+;; answered `swapped` with the generation and the swap's figures, or refused with a `live/*` code and a `hint`), `type` (`expr`),
+;; `inspect` (`name`; a function's generation and bodies too), `status` (the generation, the generations kept).
 ;; Threads: the attach server runs on the driver's thread, which already holds the session (its engine and emitter are single-threaded
 ;; state: a `Cell`-bearing struct cannot be given to `spawn`); the program's `main` runs on a thread of its own (`live.run`: the runtime's
 ;; own main stack, rt/thread.lir `fib.run-main`), which says when it has ended (`done`) and wakes the accept. The design's 2.1 has the
@@ -9,7 +11,7 @@
 ;; the C library (what the program buffered is written). The socket is made before `main` is called, its path printed on standard error
 ;; and set as FIB_LIVE_SOCKET for the program.
 (ns serve.live
-  (:require [serve.livesess :as ls] [serve.livesock :as lsk] [serve.sock :as sk] [serve.proto :as p] [serve.incr :as inc] [serve.diag :as dg]
+  (:require [serve.livesess :as ls] [serve.liveswap :as lsw] [serve.livetable :as lt] [serve.livesock :as lsk] [serve.sock :as sk] [serve.proto :as p] [serve.incr :as inc] [serve.diag :as dg]
             [lsp.json :as j] [driver.native :as native] [driver.version :as v] [native.call :as call] [lair.ffi :as ffi]
             [expand.roots :as roots] [expand.maker :as mk] [fib.unix :as unix] [fib.string :as s]))
 
@@ -21,24 +23,30 @@
 
 (defun strs :private (xs: (Vec str)) -> j/JVal (j/JArr (mapv j/json-str xs)))
 
-(defun answer-json :private (r: p/Req a: ls/Answer) -> str
+(defun times-json :private (t: ls/Times) -> j/JVal
+  (j/json-obj [(Pair "check_ms" (j/json-int (. t check))) (Pair "emit_ms" (j/json-int (. t emit))) (Pair "jit_ms" (j/json-int (. t jit))) (Pair "patch_ms" (j/json-int (. t patch)))]))
+
+(defun answer-json :private (l: Live r: p/Req a: ls/Answer) -> str
   (match a
-    ((ls/Defined names st) (p/response r true [(Pair "defined" (strs names)) (Pair "generation" (j/json-int 0)) (Pair "stats" (p/stats-json st))]))
+    ((ls/Defined names st) (p/response r true [(Pair "defined" (strs names)) (Pair "generation" (j/json-int (lsw/generation (. l sx)))) (Pair "stats" (p/stats-json st))]))
+    ((ls/Swapped defined swapped gen t st)
+     (p/response r true [(Pair "defined" (strs defined)) (Pair "swapped" (strs swapped)) (Pair "generation" (j/json-int gen)) (Pair "swap" (times-json t)) (Pair "stats" (p/stats-json st))]))
     ((ls/Value text st stats)
      (p/response r (= st 0) (into (match text ((some t) [(Pair "value" (j/json-str t))]) (nil []))
                                   [(Pair "exit" (j/json-int st)) (Pair "stats" (p/stats-json stats))])))
     ((ls/Failed m st) (p/response r false [(Pair "failed" (j/json-str m)) (Pair "exit" (j/json-int 134)) (Pair "trapped" (j/JBool true)) (Pair "stats" (p/stats-json st))]))
-    ((ls/Refused shown ds code) (p/response r false [(Pair "shown" (strs shown)) (Pair "diagnostics" (p/diags-json ds (map-empty))) (Pair "code" (j/json-str code))]))
+    ((ls/Refused shown ds code hint) (p/response r false [(Pair "shown" (strs shown)) (Pair "diagnostics" (p/diags-json ds (map-empty))) (Pair "code" (j/json-str code))
+                                                        (Pair "hint" (j/json-str hint)) (Pair "generation" (j/json-int (lsw/generation (. l sx))))]))
     ((ls/Broken m) (p/error-response r "internal" m))))
 
 (defun op-hello :private (l: Live r: p/Req) -> str
-  (p/response r true [(Pair "pid" (j/json-int (sk/process-id))) (Pair "program" (j/json-str (. (. l sx) file))) (Pair "generation" (j/json-int 0))
+  (p/response r true [(Pair "pid" (j/json-int (sk/process-id))) (Pair "program" (j/json-str (. (. l sx) file))) (Pair "generation" (j/json-int (lsw/generation (. l sx))))
                       (Pair "version" (j/json-str v/version)) (Pair "catching" (j/JBool true))]))
 
 (defun op-eval :private (l: Live r: p/Req) -> str
   (match (p/field-str r "text")
     (nil (p/error-response r "bad-request" "eval needs a string `text`"))
-    ((some text) (answer-json r (ls/input (. l sx) text)))))
+    ((some text) (answer-json l r (lsw/input (. l sx) text)))))
 
 (defun op-type :private (l: Live r: p/Req) -> str
   (match (p/field-str r "expr")
@@ -47,22 +55,27 @@
                    ((Ok t) (p/response r true [(Pair "type" (j/json-str t))]))
                    ((Err lines) (p/response r false [(Pair "shown" (strs lines)) (Pair "code" (j/json-str "check"))]))))))
 
-;; `inspect`: the value of the name (as `eval` prints it) and its type.
+;; `inspect`: the value of the name (as `eval` prints it) and its type; for a function of the running program its generation and the
+;; bodies its slots name.
 (defun op-inspect :private (l: Live r: p/Req) -> str
   (match (p/field-str r "name")
     (nil (p/error-response r "bad-request" "inspect needs a string `name`"))
     ((some name)
-     (match (ls/input (. l sx) name)
+     (match (lsw/input (. l sx) name)
        ((ls/Value text st stats)
         (p/response r true (into (match text ((some t) [(Pair "value" (j/json-str t))]) (nil []))
-                                 [(Pair "type" (j/json-str (match (ls/type-of (. l sx) name) ((Ok t) t) ((Err _) "?")))) (Pair "generation" (j/json-int 0))
-                                  (Pair "stats" (p/stats-json stats))])))
-       (other (answer-json r other))))))
+                                 (into [(Pair "type" (j/json-str (match (ls/type-of (. l sx) name) ((Ok t) t) ((Err _) "?"))))]
+                                       (into (match (lsw/function-info (. l sx) name)
+                                               ((some [gen bodies]) [(Pair "generation" (j/json-int gen)) (Pair "bodies" (strs bodies))])
+                                               (nil [(Pair "generation" (j/json-int (lsw/generation (. l sx))))]))
+                                             [(Pair "stats" (p/stats-json stats))])))))
+       (other (answer-json l r other))))))
 
 (defun op-status :private (l: Live r: p/Req) -> str
   (let ((sx (. l sx)))
-    (p/response r true [(Pair "generation" (j/json-int 0))
-                        (Pair "generations" (j/json-obj [(Pair "count" (j/json-int 1)) (Pair "kept" (j/json-int (ls/modules-kept sx)))]))
+    (p/response r true [(Pair "generation" (j/json-int (lsw/generation sx)))
+                        (Pair "generations" (j/json-obj [(Pair "count" (j/json-int (+ 1 (lt/generations-kept @(. sx table))))) (Pair "kept" (j/json-int (ls/modules-kept sx)))
+                                                         (Pair "functions" (j/json-int (lt/family-count @(. sx table))))]))
                         (Pair "values" (j/json-obj [(Pair "resident" (strs (ls/resident-names sx))) (Pair "count" (j/json-int (count (ls/resident-names sx))))]))
                         (Pair "inputs" (j/json-int (ls/inputs-made sx))) (Pair "requests" (j/json-int @(. l served)))
                         (Pair "pid" (j/json-int (sk/process-id))) (Pair "socket" (j/json-str (. l path)))])))

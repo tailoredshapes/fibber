@@ -545,3 +545,29 @@ Decisions for the owner:
   input whose program numbers a `def` of the base differently is refused rather than read a wrong slot; (h) a `def` of the library the program
   never reached is made when an input first reaches it, on the attach thread; (i) `--trace` is set after the compiler's own JIT sessions
   are up, so a later input that runs a macro traces that macro's session on standard error.
+- **Status 2026-10-15, LV2** (serve.liveswap, serve.livetable, serve.liverules; emit.live's generations and body registry; the test
+  compiler/tests/live/swap.sh over swap-app.fib; the mutants patch-before-jit, old-tracker-removed, summary-ignored, signature-ignored
+  of scripts/mutant-live.sh): a function or an `impl` defined again at the REPL is a body swap of its family (the function, its all-owned
+  twin and every specialisation the programs made; a method), emitted under the session's next generation, cut out with declarations
+  for everything resident, added under a tracker of its own and kept, its slots stored with `live.patch` (a release store) after the
+  lookup; the rules 3.4 `live/Signature` and `live/Summary` over every family of the live table, with a `hint`; `swapped`, `generation`
+  and `swap` (`check_ms`, `emit_ms`, `jit_ms`, `patch_ms`) in the answer; `status.generations.count`; `inspect` of a function gives its
+  generation and bodies. Where it differs from the text above: (a) the families swapped are exactly those the input's text redefines
+  (the diff of the session's definitions), not a comparison of emitted lIR: the base is emitted from the file and an input from the
+  REPL's text, whose position strings differ in every body, so lIR cannot be compared; an input whose `ns` clauses change what a name
+  of an unchanged body resolves to does not swap that body; (b) a summary refusal says what the parameter is now (`stored`,
+  `returned`: own.program's reason), not the position of the store; the scheme in a signature refusal is printed with its colour
+  (`(fn :send (Request) Response)`); (c) `fn-type-str` of the stub is not compared: the rules are the checker's, as 3.4 says; (d) the
+  `SCC` row of 3.4 is subsumed: a swap of `f` cannot change another body's code while every summary is equal, and a caller's lowering
+  reads nothing else of its callee; (e) the emit is of the whole program in the session's tables (the cut is per family), not a mode of
+  the emitter's queue (§4.4); the whole-program check is the engine's (LV4 memoises the program's prefix); (f) no generation is
+  retired, and `status` prints the count, not the bytes (ORC does not report them); (g) `hello`'s thread and pool counts are LV3's;
+  (h) an `impl` is keyed `impl:PROTO HEAD` by the REPL (serve.replcore), so a later `impl` of the same head replaces the earlier in
+  `fibc repl` as well; (i) transcript 5's first line cannot come out as written: `main` gives `handle` to `run-server`, which fixes its
+  type, so a signature change of `handle` is the checker's refusal (`cannot unify .. in the definition of main`), which also leaves the
+  session unchanged; the signature rule's own refusal needs a change every caller still accepts (the test's `tag`, only ever
+  `(str (tag))`, redefined to return a `str`), and `(route db req)` itself needs `route` at two arities (`defn`; `defun` has no arity
+  overloading); (j) the live/orc and live/jit bindings of the prototype are used as they are, not moved to llvm/orc.fib and
+  native/jit.fib; (k) a specialisation of a function nothing in the text reaches (one an earlier input instantiated) is not emitted
+  again by a swap and keeps its slot: a type's id is one program's, so the live table cannot ask for it by type; the methods of a
+  redefined `impl` are asked for by the `impl`'s key, reached or not.

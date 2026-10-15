@@ -7,7 +7,7 @@
 ;; set and holds what needs no body, the runtime and `main`.
 ;; `compile-macro` (E11) is the macro-time module of one `defmacro` (macros/abi.rs's text is emit.macros.abi's).
 (ns emit.compile
-  (:require [fib.string :as s] [emit.defs.astmod :as am] [emit.cpucheck :as cc] [emit.wasi :as wasi] [expand.targetos :as tos] [types.targets :as tt] [emit.prune :as pr] [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f] [lir.print :as print])
+  (:require [fib.string :as s] [emit.defs.astmod :as am] [emit.cpucheck :as cc] [emit.live :as live] [emit.wasi :as wasi] [expand.targetos :as tos] [types.targets :as tt] [emit.prune :as pr] [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f] [lir.print :as print])
   (:use types.ty types.table types.decls types.init types.program own.program emit.value emit.names emit.objects emit.statics emit.program emit.inits
         emit.assemble emit.defs.mod emit.lower.cx emit.lower.mod emit.macros.abi types.target))
 
@@ -97,17 +97,31 @@
             (Module (. r fst) (main-part p entry executable) nil)))
       (Module (module-parts p defs-items) (main-part p entry executable) nil)))
 
-;; A body a live session asks for whether or not `main` reaches it (compiler/live): the function's name as the program knows it, and
-;; whether the all-owned closure body (`f.NAME.owned`, types §8.4) is meant rather than the function's own. A name the program has no
-;; function of is skipped.
-(defstruct BodyRequest (name: str owned: bool))
+;; A body a live session asks for whether or not `main` reaches it (compiler/live, serve.liveswap): the function's name as the program
+;; knows it, whether the all-owned closure body (`f.NAME.owned`, types §8.4) is meant rather than the function's own, and the types of
+;; the specialisation (none for a monomorphic function); or, with `impl` (`impl:PROTO HEAD`, emit.live `impl-key`), every method of that
+;; instance. A name the program has no function of is skipped, as is a body the ownership pass made no plan for (an all-owned body of
+;; a function whose value nothing takes).
+(defstruct BodyRequest (name: str owned: bool tys: (Vec Ty) impl: (Option str)))
 
 ;; The bodies of `requests` queued.
-(defun request-all :private (q: Program typed: TypedProgram requests: (Vec BodyRequest)) -> unit
+(defun request-all :private (q: Program typed: TypedProgram owned: OwnedProgram requests: (Vec BodyRequest)) -> unit
   (doseq [r requests]
-    (match (program-fun typed (. r name))
-      (nil ())
-      ((some f) (do (program-request q (if (. r owned) (BodyAllOwned f) (BodyFun f)) []) ())))))
+    (match (. r impl)
+      ((some key) (request-impl q typed owned key))
+      (nil (match (program-fun typed (. r name))
+             (nil ())
+             ((some f) (let ((key (if (. r owned) (BodyAllOwned f) (BodyFun f))))
+                         (when (contains? (. owned bodies) key) (do (program-request q key (. r tys)) ())))))))))
+
+;; The methods of the instances keyed `key` (and their all-owned bodies where a method value may run them).
+(defun request-impl :private (q: Program typed: TypedProgram owned: OwnedProgram key: str) -> unit
+  (let ((g (. typed globals)))
+    (doseq [i (range (table-count (. g instances)))]
+      (when (= (live/impl-key g i) key)
+        (doseq [m (range (count (. (table-get (. g instances) i) methods)))]
+          (doseq [k [(BodyMethod i m) (BodyMethodOwned i m)]]
+            (when (contains? (. owned bodies) k) (do (program-request q k []) ()))))))))
 
 ;; The Module of a program that has a `main`, planned, with its defs made and its entry requested. Rust: compile.rs:60 compile_module
 ;; The entry's name is the same whenever it is requested (names carry no counter): a module that stops at the defs knows it.
@@ -130,7 +144,7 @@
             (do (set! (. q def-values) (merge @(. q def-values) @(. defs values)))
                 (inits-request q)
                 (host-kernel-table q)
-                (request-all q typed requests)
+                (request-all q typed owned requests)
                 (let ((entry (program-request q (BodyFun main) [])))
                   (match (emit-all q)
                     ((Ok _) (verified q defs (finished q @(. defs items) entry executable (not (empty? requests)))))

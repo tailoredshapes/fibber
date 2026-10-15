@@ -1,0 +1,86 @@
+(ns main (:use fib.http fib.http.server) (:require [fib.unix :as u] [fib.string :as st]))
+;; The program of compiler/tests/live/swap.sh: an HTTP app of the shape of docs/design/live-repl.md 5 (`main` gives `handle` to
+;; `run-server` as a value, so the server holds a closure constant made before any swap), with a worker thread calling `work` in a loop
+;; and counting answers that are neither body's (the swap stress), a generic function used at two types, a method, and a named
+;; function kept in an atom. The port is `--port N` of its arguments; `main` waits until `stop` is set through the attach socket.
+(defrecord Item (id: i64 name: str))
+(defrecord Db (items: (Vec Item)))
+(defprotocol Greet (greet (self) -> str))
+(impl Greet Item (greet (self) (str "hi " (. self name))))
+
+(def items: (Atom (Map i64 Item)) (atom {1 (Item 1 "apple") 2 (Item 2 "pear")}))
+(def last: (Atom (Option Request)) (atom nil))
+(def stop: (Atom bool) (atom false))
+(def calls: (Atom i64) (atom 0))
+(def bad: (Atom i64) (atom 0))
+
+(defun score (n: i64) -> i64 (* n 10))
+(def scorer: (Atom (fn (i64) i64)) (atom score))
+
+(defun twice (x: a) :where ((Num a)) -> a (+ x x))
+
+;; Called only as `(str (tag))`: a redefinition that returns a `str` still checks, and is the signature rule's to refuse.
+(defun tag () -> i64 7)
+
+;; The value of `name` in the query string, "" when absent.
+(defun query (req: Request name: str) -> str
+  (match (. req query-string)
+    (nil "")
+    ((some q) (let ((hit (first (filterv (fn (kv: str) (st/starts-with? kv (str name "="))) (st/split q "&")))))
+                (match hit ((some kv) (str-slice kv (+ 1 (str-len name)) (str-len kv))) (nil ""))))))
+
+;; `/items/7` is 7; anything else 0.
+(defun parse-id (path: str) -> i64
+  (if (st/starts-with? path "/items/") (unwrap-or (parse-long (str-slice path 7 (str-len path))) 0) 0))
+
+;; The bug of transcript 4: whatever the path, the first item.
+(defun item-of (path: str) -> (Option Item) (get @items 1))
+
+(defun path-of (req: Request) -> str
+  (match (str-find (. req uri) "?" 0) ((some i) (str-slice (. req uri) 0 i)) (nil (. req uri))))
+
+;; The two arities of transcript 5 of the design: the second routes with a `Db` nobody passes.
+(defn route
+  ([db: Db req: Request] -> Response (route req))
+  ([req: Request] -> Response (route-path req (path-of req))))
+
+(defun route-path (req: Request path: str) -> Response
+  (cond (= path "/") (text-response 200 (str "root " (query req "name")))
+          (st/starts-with? path "/items/") (match (item-of path) ((some it) (text-response 200 (. it name))) (nil (text-response 404 "no such item")))
+          (st/starts-with? path "/greet/") (match (get @items (unwrap-or (parse-long (str-slice path 7 (str-len path))) 0)) ((some it) (text-response 200 (greet it))) (nil (text-response 404 "nobody")))
+          (st/starts-with? path "/score/") (text-response 200 (str (@scorer (unwrap-or (parse-long (str-slice path 7 (str-len path))) 0))))
+          (= path "/twice") (text-response 200 (str (twice 21) " " (twice 1.5)))
+          (= path "/calls") (text-response 200 (str @calls " " @bad))
+          (= path "/tag") (text-response 200 (str (tag)))
+          :else (text-response 404 "not found")))
+
+(defun handle (req: Request) -> Response (route req))
+
+;; About a hundred microseconds of work, answering 1; the stress swaps it for a body answering 2, and back.
+(defun work (n: i64) -> i64
+  (loop ((i 0) (acc n)) (if (< i 4000) (recur (+ i 1) (+ acc (rem (* i 7) 13))) (- (rem acc 1) -1))))
+
+(defun worker () -> i64
+  (loop ((n 0))
+    (if @stop
+        n
+        (let ((r (work n)))
+          (do (when (not (or (= r 1) (= r 2))) (swap! bad inc))
+              (swap! calls inc)
+              (recur (+ n 1)))))))
+
+(defun port-arg () -> i64
+  (let ((as (vec (args))))
+    (loop ((i 0)) (cond (>= (+ i 1) (count as)) 0 (= (nth as i) "--port") (unwrap-or (parse-long (nth as (+ i 1))) 0) :else (recur (+ i 1))))))
+
+(defun main () -> i64
+  (match (run-server handle (with (default-options) (port (port-arg)) (workers 4)))
+    ((Err e) (do (println (str "app: cannot listen: " (error-message e))) 1))
+    ((Ok server)
+     (let ((t (spawn (fn () -> i64 (worker)))))
+       (do (println (str "app: listening on " (port server)))
+           (loop () (if @stop () (do (u/sleep-ns 20000000) (recur))))
+           (let ((n (join t)))
+             (do (stop-server server)
+                 (println (str "app: stopped after " n " calls, bad " @bad))
+                 0)))))))

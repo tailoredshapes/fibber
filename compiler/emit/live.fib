@@ -9,12 +9,27 @@
 ;; checker refuses a tail call, and the stub is a call and a return instead.
 ;; The closure literals of a generation carry its name (`l.NAME.g0.N`, emit.names `closure-name` over the code name), so a later
 ;; generation's literals are its own and a heap closure made by an old body keeps naming old code.
+;; A session (LV2, serve.liveswap) names the generation each FAMILY of bodies is lowered under (`Program.live-gens`: a function, its
+;; all-owned twin and its specialisations are one family, named `f.NAME`; a method's family is its own name) and reads which stubbed
+;; bodies a program made (`Program.live-bodies`, registered by `add-stub`), so that a swap emits a family under its next generation and
+;; cuts exactly its bodies out.
 (ns emit.live
-  (:require [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f] [expand.modules :as mods])
-  (:use types.decls types.table own.program emit.program emit.statics))
+  (:require [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f] [expand.modules :as mods] [emit.mono :as mono])
+  (:use types.ty types.decls types.table types.display own.program emit.program emit.statics emit.names))
 
 ;; `NAME.gK`: the body of generation K.
 (defun generation-name (name: str g: i64) -> str (str name ".g" g))
+
+;; The family of the body `key`: the name of the function (`f.NAME`, its all-owned twin and its specialisations included), or the
+;; method's own name.
+(defun family-name (g: Globals key: BodyKey) -> str
+  (match key
+    ((BodyAllOwned fid) (body-name g (BodyFun fid) []))
+    (_ (body-name g key []))))
+
+;; The generation family `family` is lowered under in this program: the session's, else 0.
+(defun family-generation (p: Program family: str) -> i64
+  (unwrap-or (get @(. p live-gens) family) 0))
 
 ;; `live.NAME`: the slot the stub of NAME loads.
 (defun slot-name (name: str) -> str (str "live." name))
@@ -49,9 +64,34 @@
   (and (. p live) (not @(. p macro-module))
        (match (key-module (program-g p) key) ((some m) (program-module? (program-g p) m)) (nil false))))
 
-;; The name the body of `key` is lowered under: generation 0's when it is stubbed, else `name` itself.
+;; The name the body of `key` is lowered under: its family's generation's when it is stubbed, else `name` itself.
 (defun body-code-name (p: Program key: BodyKey name: str) -> str
-  (if (live-body? p key) (generation-name name 0) name))
+  (if (live-body? p key) (generation-name name (family-generation p (family-name (program-g p) key))) name))
+
+;; The record of a stubbed body for the session (emit.program `LiveBody`): the function's name when it is the main module's (so a
+;; session can ask for its body by name), the all-owned flag, whether it is a specialisation, and a method's `impl` key.
+(defun live-body :private (g: Globals inst: mono/Inst name: str) -> LiveBody
+  (let ((generic (not (empty? (. inst tys)))))
+    (match (. inst key)
+      ((BodyFun fid) (LiveBody name (main-fun-name g fid) false generic nil))
+      ((BodyAllOwned fid) (LiveBody name (main-fun-name g fid) true generic nil))
+      ((BodyMethod i _) (LiveBody name nil false generic (some (impl-key g i))))
+      ((BodyMethodOwned i _) (LiveBody name nil true generic (some (impl-key g i))))
+      ((BodyDef _) (LiveBody name nil false generic nil)))))
+
+(defun main-fun-name :private (g: Globals fid: i64) -> (Option str)
+  (let ((d (g-fun g fid))) (if (= (. d module) @(. g main)) (some (. d name)) nil)))
+
+;; `impl:PROTO HEAD`, as serve.replcore keys an `impl` form: the protocol's name and the head type printed with the instance's own
+;; variable names (`(Vec a)`), which is the form's own text when it was written so.
+(defun impl-key (g: Globals i: i64) -> str
+  (let ((inst (table-get (. g instances) i)))
+    (str "impl:" (. (g-proto g (. inst proto)) name) " " (printer-ty (printer-with-names g (. inst var-names) []) (. inst head)))))
+
+(defun register-body :private (p: Program family: str body: LiveBody) -> unit
+  (let ((have (unwrap-or (get @(. p live-bodies) family) [])))
+    (when (not-any? (fn (b: LiveBody) (= (. b name) (. body name))) have)
+      (set! (. p live-bodies) (assoc @(. p live-bodies) family (conj have body))))))
 
 ;; How many scalars or vectors a result holds, structs and arrays flattened; a named struct counts as too many (its fields are not known
 ;; here), a vector wider than 512 bits too.
@@ -98,11 +138,13 @@
             (= (. (nth fs i) name) code) (some (nth fs i))
             :else (recur (- i 1))))))
 
-;; Adds the stub `name` and its slot for the body lowered under `code`, once the body is in the program.
-(defun add-stub (p: Program name: str code: str) -> (Result unit str)
+;; Adds the stub `name` and its slot for the body of `inst` lowered under `code`, once the body is in the program, and registers the
+;; body with its family for the session.
+(defun add-stub (p: Program inst: mono/Inst name: str code: str) -> (Result unit str)
   (match (function-named p code)
     (nil (Err (str "live: no body " code " to stub")))
     ((some body)
      (do (statics-item (. p statics) (slot-name name) (slot-item name body))
          (program-add-function p (stub-function name body))
+         (register-body p (family-name (program-g p) (. inst key)) (live-body (program-g p) inst name))
          (Ok ())))))

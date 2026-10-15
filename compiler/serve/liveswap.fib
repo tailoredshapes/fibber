@@ -1,0 +1,204 @@
+;; compiler/serve/liveswap.fib: the inputs of a live session and the body swap (docs/design/live-repl.md 3.1 to 3.4; package LV2).
+;; A definition input is first refused by what its text redefines (`main`, a type, a `def`, a macro, an `extern`: what the running
+;; program was compiled against and a swap cannot change), else the program of the merged session text is checked once (the engine's
+;; persistent checker) and emitted with the families the text redefines (a function's, an `impl`'s methods) under the session's next
+;; generation; the rules of serve.liverules compare every family's scheme and summary with the live table's (a caller's code depends
+;; on nothing else of its callee: its name is the stub's, and in a catching program every body returns a failure next to its value).
+;; The swap: the new bodies cut out of the program (live.extract: everything the base has is declared, the new literals and statics
+;; copied), added under a tracker of their own and kept, their addresses looked up (ORC compiles them then), and only then each slot
+;; stored with `live.patch` (a release store; the stubs load with acquire). A caller that loaded the old address runs the old body,
+;; which stays mapped: no generation is retired here (LV3). A refusal, from the text, the checker, the rules or the cut, leaves the
+;; session text, the table and the program as they were. Known hole: an input whose `ns` clauses change what a name of an unchanged
+;; body resolves to does not swap that body.
+(ns serve.liveswap
+  (:use lir.ast)
+  (:require [serve.livesess :as ls] [serve.livetable :as lt] [serve.liverules :as lr] [serve.replcore :as rc] [serve.diag :as dg] [serve.incr :as inc]
+            [emit.compile :as ec] [emit.program :as ep] [live.extract :as ex] [own.driver :as od] [types.init :as ti] [fib.string :as s]))
+
+;; ---- what the text may not redefine
+
+(defun replaced? :private (sx: ls/Sess d: rc/Def) -> bool
+  (some? (first (filterv (fn (o: rc/Def) (= (. o key) (. d key))) @(. (. sx rc) defs)))))
+
+(defun refusal-code :private (sx: ls/Sess d: rc/Def) -> (Option str)
+  (cond (= (. d name) "main") (some "live/Main")
+        (not (replaced? sx d)) nil
+        (s/starts-with? (. d text) "(defprotocol ") (some "live/Protocol")
+        (s/starts-with? (. d key) "type:") (some "live/Layout")
+        (s/starts-with? (. d text) "(def ") (some "live/Def")
+        (s/starts-with? (. d text) "(defmacro ") (some "live/Macro")
+        (s/starts-with? (. d text) "(extern ") (some "live/Extern")
+        :else nil))
+
+(defun refusal-text :private (code: str name: str) -> str
+  (cond (= code "live/Main") "`main` is the program's; it changes with a restart"
+        (= code "live/Layout") (str name " changed; values of " name " exist in the running program")
+        (= code "live/Protocol") (str name " is a protocol of the running program; its dispatch rows are in every caller")
+        (= code "live/Def") (str name " is a def of the session or the program; a def is immortal and read count-free. Define a new name")
+        (= code "live/Macro") (str name " is a macro; its users were expanded with the old one")
+        :else (str name " is an extern of the running program")))
+
+(defun refused :private (code: str shown: str hint: str) -> ls/Answer
+  (ls/Refused (into [(str "<input>:1:1: " shown " [" code "]")] (if (= hint "") [] [(str "  hint: " hint)]))
+              [(dg/diag-nowhere code rc/repl-file shown)] code hint))
+
+(defun refused-def :private (sx: ls/Sess defs: (Vec rc/Def)) -> (Option ls/Answer)
+  (first (vec (keep (fn (d: rc/Def)
+                      (match (refusal-code sx d)
+                        (nil nil)
+                        ((some code) (some (refused code (refusal-text code (. d name)) ":restart")))))
+                    defs))))
+
+;; ---- the families an input redefines
+
+;; The family of a redefined function (`f.NAME`: the main module's prefix is empty), or of every method of a redefined `impl`.
+(defun families-of-def :private (sx: ls/Sess d: rc/Def) -> (Vec str)
+  (cond (s/starts-with? (. d key) "val:") [(str "f." (. d name))]
+        (s/starts-with? (. d key) "impl:")
+          (vec (keep (fn (p: (Pair str (Vec ep/LiveBody)))
+                       (if (some? (first (filterv (fn (b: ep/LiveBody) (= (. b impl) (some (. d key)))) (. p snd)))) (some (. p fst)) nil))
+                     (vec (ls/live-bodies sx))))
+        :else []))
+
+(defun predicted-families :private (sx: ls/Sess defs: (Vec rc/Def)) -> (Vec str)
+  (vec (mapcat (fn (d: rc/Def) (families-of-def sx d)) (filterv (fn (d: rc/Def) (replaced? sx d)) defs))))
+
+;; The bodies asked for whether or not `main` reaches them: the new functions', the registered bodies of the functions to swap that
+;; are not specialisations (a specialisation is reached from `main`, or it was an input's: its types are that program's and cannot be
+;; asked for again; it keeps its slot), and every method of the `impl`s redefined.
+(defun requests-of :private (sx: ls/Sess new-fns: (Vec str) families: (Vec str) impls: (Vec str)) -> (Vec ec/BodyRequest)
+  (into (into (conj (mapv (fn (nm: str) (ec/BodyRequest nm false [] nil)) new-fns) (ec/BodyRequest "main" false [] nil))
+              (mapv (fn (key: str) (ec/BodyRequest "" false [] (some key))) impls))
+        (vec (mapcat (fn (family: str)
+                       (vec (keep (fn (b: ep/LiveBody) (match (. b fun) ((some f) (if (. b generic) nil (some (ec/BodyRequest f (. b owned) [] nil)))) (nil nil)))
+                                  (unwrap-or (get (ls/live-bodies sx) family) []))))
+                     families))))
+
+(defun impl-keys :private (sx: ls/Sess defs: (Vec rc/Def)) -> (Vec str)
+  (mapv (fn (d: rc/Def) (. d key)) (filterv (fn (d: rc/Def) (and (replaced? sx d) (s/starts-with? (. d key) "impl:"))) defs)))
+
+;; ---- the program of an input
+
+;; The program emitted with `families` under generation `gen`; the families among them the program made a body of (a generic function
+;; nobody instantiates has none: it swaps into the text only).
+(defun emit-swapping :private (sx: ls/Sess c: od/Checked stats: inc/Stats requests: (Vec ec/BodyRequest) families: (Vec str) gen: i64)
+    -> (Result (Pair ls/Made (Vec str)) (Vec dg/Diag))
+  (do (ls/set-generations sx (reduce (fn (acc: (Map str i64) f: str) (assoc acc f gen)) (lt/generations-of @(. sx table)) families))
+      (match (ls/emit-checked sx c stats requests)
+        ((Err ds) (Err ds))
+        ((Ok made) (let ((pi (ex/index-of (. made m))))
+                     (Ok (Pair made (filterv (fn (f: str) (some? (first (filterv (fn (nm: str) (some? (get pi (str nm ".g" gen)))) (lt/body-names (ls/live-bodies sx) f)))))
+                                             families))))))))
+
+;; ---- the swap
+
+(defstruct Swap (made: ls/Made families: (Vec str) gen: i64 jit-ms: i64 patch-ms: i64))
+
+;; One family's bodies of generation `gen` cut out of the program, added under a tracker and kept, each slot patched once the code is
+;; resident; the generation recorded.
+(defun swap-family :private (sx: ls/Sess made: ls/Made family: str gen: i64) -> (Result (Pair i64 i64) str)
+  (let ((pi (ex/index-of (. made m)))
+        (names (filterv (fn (nm: str) (some? (get pi (str nm ".g" gen)))) (lt/body-names (ls/live-bodies sx) family))))
+    (let ((coded (mapv (fn (nm: str) (str nm ".g" gen)) names)) (t0 (sys-clock-now)))
+      (try-let ((a (ls/add-cut sx (. made m) (mapv (fn (nm: str) (Pair nm nm)) coded) [] []))
+                (addrs (ti/try-map (fn (nm: str) (ls/address-of sx nm)) coded))
+                (jit-ms (Ok (inc/ms-since t0)))
+                (t1 (Ok (sys-clock-now)))
+                (_ (publish sx names addrs)))
+        (do (ls/keep-module sx a)
+            (set! (. sx table) (lt/add-generation @(. sx table) family (lt/Generation gen (. a rt) (. a name) coded)))
+            (Ok (Pair jit-ms (inc/ms-since t1))))))))
+
+;; The slots of `names` stored with the addresses of their new bodies: a release store each, after every body is resident.
+(defun publish :private (sx: ls/Sess names: (Vec str) addrs: (Vec i64)) -> (Result unit str)
+  (loop ((i 0))
+    (if (>= i (count names))
+        (Ok ())
+        (match (try-let ((slot (ls/slot-address sx (str "live." (nth names i))))) (ls/patch sx slot (nth addrs i)))
+          ((Err m) (Err m))
+          ((Ok _) (recur (+ i 1)))))))
+
+(defun swap-all :private (sx: ls/Sess made: ls/Made families: (Vec str) gen: i64) -> (Result (Pair i64 i64) str)
+  (loop ((fs families) (jit 0) (patch 0))
+    (match (first fs)
+      (nil (Ok (Pair jit patch)))
+      ((some family) (match (swap-family sx made family gen)
+                       ((Err m) (Err m))
+                       ((Ok [j p]) (recur (vec (rest fs)) (+ jit j) (+ patch p))))))))
+
+;; ---- a definition input
+
+(defun session-defs :private (sx: ls/Sess) -> i64 @(. sx defined))
+
+(defun new-functions :private (sx: ls/Sess defs: (Vec rc/Def)) -> (Vec str)
+  (mapv (fn (d: rc/Def) (. d name)) (filterv (fn (d: rc/Def) (not (replaced? sx d))) (ls/function-defs defs))))
+
+;; What is kept after a refusal: the generations the next program emits under are the table's.
+(defun unchanged :private (sx: ls/Sess a: ls/Answer) -> ls/Answer
+  (do (ls/set-generations sx (lt/generations-of @(. sx table))) a))
+
+;; A definition input: refused by the text rules, else its program checked and settled (nothing of the session changes until the
+;; program checks, the rules pass and the lIR is settled), then the text accepted, the new defs' slots and the new functions made
+;; resident, the changed families swapped.
+(defun define-input :private (sx: ls/Sess defs: (Vec rc/Def) clauses: (Vec str)) -> ls/Answer
+  (match (refused-def sx defs)
+    ((some r) r)
+    (nil
+     (let ((cs (rc/merge-clauses @(. (. sx rc) clauses) clauses)) (merged (rc/merge-defs @(. (. sx rc) defs) defs))
+           (new-fns (new-functions sx defs)) (predicted (predicted-families sx defs)) (gen (+ 1 (. @(. sx table) generation))))
+       (let ((at (+ 2 (rc/lines-in (rc/defs-text (vec (take (- (count merged) (count defs)) merged))))))
+             (fr (rc/front (. sx eng) (. sx rts) (rc/source-of cs merged "") "yes" true)))
+         (match (. fr checked)
+           ((Err ds) (unchanged sx (ls/Refused (ls/shown-of sx ds at merged) ds "check" "")))
+           ((Ok c) (match (lr/check-rules @(. sx table) c (session-defs sx))
+                     ((some r) (unchanged sx (refused (. r code) (. r message) (. r hint))))
+                     (nil (match (emit-swapping sx c (. fr stats) (requests-of sx new-fns predicted (impl-keys sx defs)) predicted gen)
+                            ((Err ds) (unchanged sx (ls/Refused (ls/shown-of sx ds at merged) ds (match (first ds) ((some d) (. d code)) (nil "check")) "")))
+                            ((Ok [made changed]) (apply-input sx made cs merged defs clauses new-fns changed gen))))))))))))
+
+;; The accepted input applied: the text, the slots, the new functions, the swap; the table after. A cut that fails is reported as
+;; broken with the text restored (what was added stays resident but unreachable).
+(defun apply-input :private (sx: ls/Sess made: ls/Made cs: (Vec str) merged: (Vec rc/Def) defs: (Vec rc/Def) clauses: (Vec str) new-fns: (Vec str)
+                             changed: (Vec str) gen: i64) -> ls/Answer
+  (let ((snap (Pair @(. (. sx rc) clauses) @(. (. sx rc) defs))) (names (mapv (fn (d: rc/Def) (. d name)) defs)))
+    (do (set! (. (. sx rc) clauses) cs) (set! (. (. sx rc) defs) merged) (set! (. sx defined) (+ @(. sx defined) (count defs)))
+        (match (try-let ((_ (ls/make-slots sx made)) (_ (ls/make-functions sx made new-fns))) (swap-all sx made changed gen))
+          ((Err m) (do (set! (. (. sx rc) clauses) (. snap fst)) (set! (. (. sx rc) defs) (. snap snd)) (set! (. sx defined) (- @(. sx defined) (count defs)))
+                       (unchanged sx (ls/Broken m))))
+          ((Ok [jit patch])
+           (do (set! (. sx table) (lt/table-after @(. sx table) (ls/live-bodies sx) (. made c) changed gen))
+               (ls/set-generations sx (lt/generations-of @(. sx table)))
+               (if (empty? changed)
+                   (ls/Defined (into names clauses) (. made stats))
+                   (ls/Swapped (filterv (fn (nm: str) (not (includes? (str "f." nm) changed))) (into names clauses))
+                               (mapv shown-family changed) gen
+                               (ls/Times (. (. made stats) total-ms) (. made emit-ms) jit patch) (. made stats)))))))))
+
+;; A family as the answer names it: a function by its name, a method by its body's name.
+(defun shown-family :private (family: str) -> str
+  (if (s/starts-with? family "f.") (str-slice family 2 (str-len family)) family))
+
+;; ---- inputs
+
+;; One input: definitions, then one expression at most (the REPL's rule for a request).
+(defun input (sx: ls/Sess text: str) -> ls/Answer
+  (match (rc/classify text)
+    ((rc/Blank) (ls/Defined [] (inc/Stats 0 0 0 true 0 0 0 0 0)))
+    ((rc/Unreadable m) (ls/Refused [(str "<input>:" m)] [] "read" ""))
+    ((rc/Parts defs clauses exprs)
+     (cond (> (count exprs) 1) (ls/Refused ["<input>:1:1: one expression for each input [live/Input]"] [] "live/Input" "")
+           (and (empty? defs) (empty? clauses)) (ls/expression-input sx (nth exprs 0))
+           :else (match (define-input sx defs clauses)
+                   ((ls/Defined names st) (if (empty? exprs) (ls/Defined names st) (ls/expression-input sx (nth exprs 0))))
+                   ((ls/Swapped d sw g t st) (if (empty? exprs) (ls/Swapped d sw g t st) (ls/expression-input sx (nth exprs 0))))
+                   (other other))))))
+
+;; The session's generation.
+(defun generation (sx: ls/Sess) -> i64 (. @(. sx table) generation))
+
+;; A function of the running program, by the name the user wrote: its generation and the bodies its slots name.
+(defun function-info (sx: ls/Sess name: str) -> (Option (Pair i64 (Vec str)))
+  (let ((family (str "f." name)))
+    (match (get (. @(. sx table) families) family)
+      (nil nil)
+      ((some f) (some (Pair (. f generation) (mapv (fn (nm: str) (str nm ".g" (. f generation))) (lt/body-names (ls/live-bodies sx) family))))))))
