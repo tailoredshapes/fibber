@@ -9,9 +9,12 @@ function kept in an atom) runs the new body; a method swap; a generic function w
 `work` between two bodies while the worker calls it (every answer is one of the two; the app lives; `status` counts the generations);
 a new function swaps nothing; a `defonce` of a def keeps it (LT4); the text refusals (live/Layout,
 live/Protocol, live/Main) and the checker's; a trap after a
-swap is still caught; the end of the program through the socket.
+swap is still caught; change by expanded form (LM2): a `require` that moves the alias `alt` to another module with the same function
+swaps the caller of `alt/which`, a redefined macro swaps its user and refuses nothing, a comment-only change swaps nothing; the end of
+the program through the socket.
 The mutants of scripts/mutant-live.sh that must make this fail: patch-before-jit, old-tracker-removed (the 200 swaps crash the app),
-summary-ignored and signature-ignored (transcript 5's refusals do not come, and the accepted change breaks the app)."""
+summary-ignored and signature-ignored (transcript 5's refusals do not come, and the accepted change breaks the app), diff-by-text (the
+`require` input swaps nothing), hash-with-positions (every definition after a changed one is swapped too)."""
 import json, os, re, shutil, socket, subprocess, sys, tempfile, time, urllib.request, urllib.error
 
 fibc = os.path.abspath(sys.argv[1])
@@ -98,7 +101,7 @@ def matches(name, got, want):
     check(name, ok, '\n  got:  %s\n  want: %s' % (got, want))
 
 port = free_port()
-a = App(app, ['--', '--port', str(port)])
+a = App(app, ['-I', here, '--', '--port', str(port)])   # -I: the session's programs find swapalt/ (the base finds it beside the file)
 check('started', a.sock is not None and a.alive() and 'app: listening on %d' % port in a.stdout(), 'stderr: %s stdout: %s' % (a.stderr()[-800:], a.stdout()))
 if a.sock is None or not a.alive(): a.p.kill(); sys.exit(1)
 c = Client(a.sock)
@@ -211,6 +214,22 @@ s = c.ask(op='status')
 check('status counts the generations', s.get('generation') == gen and s['generations']['count'] == gen + 1 and s['generations']['functions'] > 10, s)
 i = c.ask(op='inspect', name='work')
 check('inspect work', i.get('generation') == gen and 'f.work.g%d' % gen in i.get('bodies', []), i)
+
+# ---- change by expanded form (LM2, docs/design/live-incremental.md 2.4 item 3): a body is swapped iff its expansion changed
+check('before: /alt', get(port, '/alt') == (200, 'one 10'), get(port, '/alt'))
+s = c.eval('(require [swapalt.two :as alt])')
+check('require moved: the caller of alt/which swapped', s.get('ok') and s.get('swapped') == ['alt-which'] and s.get('generation') == gen + 1
+      and get(port, '/alt') == (200, 'two 10'), (s, get(port, '/alt')))
+gen += 1
+s = c.eval('(defmacro seven () `(* 7 10))')
+check('macro redefined: its user swapped', s.get('ok') and s.get('swapped') == ['macro-user'] and s.get('generation') == gen + 1
+      and get(port, '/alt') == (200, 'two 73'), (s, get(port, '/alt')))
+gen += 1
+s = c.eval('(defun alt-which () -> str\n  ;; a comment: the text changes, the expansion does not\n  (alt/which))')
+check('comment only: nothing swapped', s.get('ok') and not s.get('swapped') and s.get('generation') == gen
+      and get(port, '/alt') == (200, 'two 73'), (s, get(port, '/alt')))
+i = c.ask(op='inspect', name='alt-which')
+check('comment only: generation kept', i.get('generation') == gen - 1, i)
 
 # ---- the end of the program through the socket
 check('stop', c.eval('(reset! stop true)').get('ok'))

@@ -332,7 +332,7 @@ disk already, so the replay of the session text covers only the REPL's definitio
 A `load` is one input: the merged program (overrides, session text) is checked whole; every family's scheme and summary is compared with
 the table (the LV2 rules); the module's definitions are diffed against the session's copy of the module (the text of the loaded file, or the
 file as the base read it) by key (`rc/classify`'s keys, which the same reader gives for a file: `val:NAME`, `type:NAME`, `impl:P H`,
-`text:SRC`); a changed `type:` key is `live/Layout`, a changed `defmacro` `live/Macro` (until LM2 swaps its users), a changed `extern`
+`text:SRC`); a changed `type:` key is `live/Layout`, a changed `defmacro` `live/Macro` (until LM2 swaps its users; since LM2 accepted), a changed `extern`
 `live/Extern`, a changed or new `def` `live/Def` (until LT4), a removed function `live/Removed` (its stub stays and the running program
 may call it: refused), `main` `live/Main`. If any rule refuses, **nothing is applied**: not the override, not the table, not a slot, and the
 answer lists every refusal of the file, not the first (the transcript 6 of live-repl.md §5). If all pass, the changed families (with LM2:
@@ -463,6 +463,29 @@ Decisions for the owner:
   2 ms` (the check is 59 modules, 8 expanded again: the loaded module and the 7 after it in the load order, 3.3); the meshql scenario of
   live-meshql.md 7 is a step of meshql-fib's `scripts/live-demo.py` on its `live-dev` branch (the on-item edit loaded, curl 410, the
   file restored and loaded again), guarded so that a fibc without the op skips it.
+- **Status 2026-10-15, LM2** (`compiler/serve/livediff.fib`; `Table.hashes` and `with-hashes` in `serve.livetable`; `inc/Front.modules`,
+  the expanded modules of a program that checked; `serve.livesess` `note-hashes` and `accepted-hashes`; `serve.liveswap` `changes-of`,
+  `checked-input`, `merge-session`; `serve.liveload` `swap-checked`; `compiler/tests/live/swap.sh` extended (swap-app.fib requires
+  `swapalt.one :as alt` and `swapalt.two :as two`; the `require` that moves `alt` swaps `alt-which` and nothing else, the redefined macro
+  `seven` swaps `macro-user` and refuses nothing, a comment-only redefinition swaps nothing; `unit-livediff.fib` first), `load.sh` (a
+  comment-only edit of `route` loaded swaps nothing), the mutants `diff-by-text` and `hash-with-positions` of `scripts/mutant-live.sh`,
+  `prefix-dropped` moved to the hash key). The hash of a definition is over its expanded form printed without positions (syntax.print),
+  with three normalisations section 2.4 did not name: (a) **`alias/name` resolved to the alias's module** (the expander leaves an
+  ordinary call `x/f` as written; the checker resolves it, so without this the `require` input changes no expanded form); (b)
+  **gensyms renumbered in their order in the form** (`#p.N` counts across the module, so a redefinition, which moves the definition to
+  the end of the session's text, would renumber every later macro use); (c) **the module's `:use`s appended** (an unqualified name a
+  used module gives is resolved after expansion too; a changed `:use` swaps every body of the module, an over-approximation). Keys are
+  `f.PREFIX.NAME` and `impl:PROTO HEAD`; only the main module and the live modules are hashed. Where it differs: (d) **the base's hashes
+  come from the warm engine** (LE5: the base goes through the driver's front end, which keeps no expanded forms); a session that was not
+  warmed makes them on its first definition input (one more front end on the session's text); (e) **a redefined macro keeps its place**
+  in the session's text (`merge-session`; serve.replcore `merge-defs` puts a redefinition last, which would expand its users before it:
+  `unbound name`); the line of a checker's diagnostic in such an input is then off by the macros moved; (f) a changed `type:`, `extern` or
+  `def` is still refused or redefined by its text (the rules of 3.5); (g) found on the way: a session's program does not find a module
+  beside the main file that the base found there (`load/Missing`): swap.py and stress.py start swap-app.fib with `-I` its directory. (h)
+  A redefinition with the text the definition has is accepted and swaps nothing (LV2 swapped it again): stress.py's swaps after the
+  retirement now start from the other body. (i) A macro that quotes positions into its expansion (`expect` of fib.test) makes its user change when
+  the user moves in the session's text: a redefinition moved to the end swaps the definitions after its old place that quote positions
+  (test.py: redefining `classify` swaps `specs` too, whose reported positions were stale before).
 - **Status 2026-10-15, LE5 and LE4** (`serve.live` `warm-engine`, `serve.livesess` `warm`; `serve.live` `op-inspect`, `serve.liveswap`
   `family-info` and `def-info`, `serve.liveclient` `:inspect`; `compiler/tests/live/attach.sh` extended, the mutants `warm-skipped` and
   `inspect-runs-input` of `scripts/mutant-live.sh`). LE5 is 3.7 (a): the socket line is printed and `main` started first, then the

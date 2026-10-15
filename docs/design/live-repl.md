@@ -212,7 +212,8 @@ functions; LLVM at `-O 0` would not inline them anyway.
 
 Covered by milestone 1 (LV2): the body of a `defun`/`defn` of a program module, including its closure literals, loops, `let`s, local `fn`s;
 a method body of an `impl` whose instance already exists (the method's stub is `m.PROTO.NAME.$T_`, the same mechanism); a `defmacro` body
-is **not** (a macro ran at expansion time; its users would need re-expansion: refused, `live/Macro`, until LV5 reloads a module).
+is **not** (a macro ran at expansion time; its users would need re-expansion: refused, `live/Macro`, until LV5 reloads a module). Since
+LM2 (docs/design/live-incremental.md 2.4 item 3) a redefined macro is accepted and the bodies whose expansion changed are swapped.
 Tracing is a swap: `trace handle` emits a generation whose body is `(let ((r (f.g{K-1} args..))) (live/note "handle" (show args..) (show r)) r)`,
 calling the previous generation's body directly (not the stub), and `untrace` patches the slot back to generation K-1's address; a trace
 survives a later swap of the same function by re-wrapping. A function the program never instantiated (dead, or generic and unused) swaps
@@ -255,7 +256,7 @@ definition, and a `hint` field that says what to do:
 | layout | the diff of the session touches a `defrecord`, `defstruct`, `defenum`, `derive`, a field type, a variant | `live/Layout`: `Pt changed; values of Pt exist in the running program. :restart` |
 | protocol | a `defprotocol` or `impl` added, removed or changed, including a new instance (its vtable and dispatch rows are in every caller) | `live/Protocol` |
 | def | a `def`'s type changed, or a program `def` (not a session one) is redefined | `live/Def`: a program `def` is immortal and read by every function count-free; the session may add defs, not change the program's (3.5) |
-| macro | a `defmacro` changed, or a swapped body uses a macro that changed | `live/Macro` (until LV5: reload the module) |
+| macro | a `defmacro` changed, or a swapped body uses a macro that changed | `live/Macro` (until LV5: reload the module); lifted by LM2: its users, whose expanded form changed, are swapped |
 | extern | an `extern` changed | `live/Extern` |
 | SCC | the swap changes which functions `f` calls such that its SCC's all-owned bodies change membership | handled by swapping every member (the SCC is in the live table); refused as `live/Summary` only if a member's summary changes |
 | main | `main` redefined | `live/Main`: `:restart` |

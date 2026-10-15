@@ -86,8 +86,9 @@
 #   load-reads-disk      the loader ignores the loaded text and reads the module's file: an        compiler/tests/live/load.sh (the expression
 #                        expression input after a disk edit picks up a half-saved file (LM1, 3.4)   input after the half-saved file is refused)
 #   prefix-dropped       the family of a loaded module's function is named without the module      compiler/tests/live/load.sh (`routes/route` is
-#                        prefix (`f.route` for `f.routes.route`): nothing is swapped, the call      not in `swapped`; the next call answers the
-#                        answers the old body (LM1, 3.2; live-dev.md 6 item 2 of meshql-fib)        old value)
+#                        prefix (`f.route` for `f.routes.route`; LM2: the key of its hash,          not in `swapped`; the next call answers the
+#                        serve.livediff): nothing is swapped, the call answers the old body (LM1,   old value)
+#                        3.2; live-dev.md 6 item 2 of meshql-fib)
 #   removed-ignored      a function removed from the loaded file is accepted: its stub stays and    compiler/tests/live/load.sh (the load that
 #                        names a body the text no longer has (LM1, 3.5: live/Removed)               removes `helper` is not refused; the call of
 #                                                                                                   `helper` after it is refused by the checker)
@@ -102,13 +103,17 @@
 #                        pays the cold front end (LE5, docs/design/live-incremental.md 3.7)         is false; the first input's `reused` is 0)
 #   inspect-runs-input   `inspect` without `value` evaluates the name as an input instead of        compiler/tests/live/attach.sh (the answer
 #                        looking it up (LE4, 3.8)                                                   carries `stats` and no `scheme`)
+#   diff-by-text         the families swapped are those whose text the input redefines, not those   compiler/tests/live/swap.sh (the `require` that
+#                        whose expanded form changed (LM2, docs/design/live-incremental.md 2.4)     moves `alt` swaps nothing: /alt answers one)
+#   hash-with-positions  a definition's hash covers its position: every definition after a changed  compiler/tests/live/swap.sh (the `require`
+#                        one (or after a longer `ns` header) is swapped too (LM2)                   input's `swapped` lists them all)
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-live-MODE),
 #              MUT_QUICK=1 runs stubs.sh --quick (hello's golden and the deep recursion; no case tables: kills both mutants in under a minute after the build)
 #              and stress.sh --quick (100 swaps), defs.sh --quick (100 redefinitions).
 # A mutant of lib/ alone (sink-ignored, override-ignored) builds nothing: the case's `roots:` header names the copy's lib, and FIBC runs it.
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|quote-shared|partial-load|load-reads-disk|prefix-dropped|removed-ignored|def-slot-plain-store|old-def-freed|init-run-twice|warm-skipped|inspect-runs-input|child-spawned-anyway}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|quote-shared|partial-load|load-reads-disk|prefix-dropped|removed-ignored|def-slot-plain-store|old-def-freed|init-run-twice|warm-skipped|inspect-runs-input|child-spawned-anyway|diff-by-text|hash-with-positions}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -173,13 +178,16 @@ case $MODE in
           (result file ns defs [] (refused-all file refusals))' '      (if false
           (result file ns defs [] (refused-all file refusals))' ;;
   load-reads-disk) patch compiler/expand/modules.fib '(visit-source ld ns file (unwrap-or (get (. ld texts) ns) source))' '(visit-source ld ns file source)' ;;
-  prefix-dropped) patch compiler/serve/liveload.fib '(cond (= (kind-of d) "fun") [(str "f." prefix (. d name))]' '(cond (= (kind-of d) "fun") [(str "f." (. d name))]' ;;
+  prefix-dropped) patch compiler/serve/livediff.fib '(let ((prefix (if main "" (str (. (. m spec) ns) ".")))' '(let ((prefix "")' ;;
   def-slot-plain-store) patch compiler/emit/program.fib '(node/node (la/KAtomicStore la/ScSystem la/ORelease (node/local "v") (node/global slot)))' '(node/store (node/local "v") (node/global slot) nil)' ;;
   old-def-freed) patch compiler/serve/livedefs.fib '                (note-olds sx todo olds)' '                (try-let ((at (drop-address sx))) (ti/try-map (fn (v: i64) (if (= v 0) (Ok 0) (lj/call at [v]))) olds))
                 (note-olds sx todo (mapv (fn (v: i64) 0) olds))' ;;
   init-run-twice) patch compiler/serve/livedefs.fib '                  (_ (ls/run-void (ls/jit-of sx) init-name)))' '                  (_ (ls/run-void (ls/jit-of sx) init-name)) (_ (ls/run-void (ls/jit-of sx) init-name)))' ;;
   removed-ignored) patch compiler/serve/liveload.fib '    (cond (and (= what "removed") (or (= k "fun") (= k "impl")))' '    (cond (and (= what "never") (or (= k "fun") (= k "impl")))' ;;
   warm-skipped) patch compiler/serve/live.fib '                (do (warm-engine l trace)' '                (do ()' ;;
+  diff-by-text) patch compiler/serve/liveswap.fib '(changes-of sx olds fr)' '(ldf/Changes (vec (mapcat (fn (d: rc/Def) (if (s/starts-with? (. d key) "val:") [(str "f." (. d name))] (ldf/families-of-key (ls/live-bodies sx) (. d key)))) (filterv (fn (d: rc/Def) (replaced? sx d)) defs)))
+                                (mapv (fn (d: rc/Def) (. d key)) (filterv (fn (d: rc/Def) (and (replaced? sx d) (s/starts-with? (. d key) "impl:"))) defs)) (. (changes-of sx olds fr) hashes))' ;;
+  hash-with-positions) patch compiler/serve/livediff.fib '(str (pr/stx-show (canon f (gensyms-in f {}) aliases)) "\n" uses))' '(str (pr/stx-show (canon f (gensyms-in f {}) aliases)) "\n" uses " @" (. (. f pos) start)))' ;;
   inspect-runs-input) patch compiler/serve/live.fib '(if (p/field-bool r "value") (inspect-value l r name) (inspect-lookup l r name))' '(inspect-value l r name)' ;;
   *) echo "mutant-live: unknown mode $MODE" >&2; exit 2 ;;
 esac
@@ -202,7 +210,7 @@ case $MODE in
   retire-without-pause) what="the socket stress"; FIB_LIB="$R/lib" "$R/compiler/tests/live/stress.sh" "$F" --socket-only "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
   patch-plain-store) what="the TSAN stress"; TSAN_OUT="$OUT/tsan" FIB_LIB="$R/lib" "$R/compiler/tests/live/stress.sh" "$F" --tsan-only "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
   value-reevaluated|trap-not-caught|warm-skipped|inspect-runs-input) what="the attach test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/attach.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
-  patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored) what="the swap test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/swap.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
+  patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|diff-by-text|hash-with-positions) what="the swap test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/swap.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   defcache-*) what="the defcache test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/defcache.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested) what="the queue test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/queue.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run) what="the live test op's test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/test.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
