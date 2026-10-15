@@ -463,3 +463,20 @@ Decisions for the owner:
   2 ms` (the check is 59 modules, 8 expanded again: the loaded module and the 7 after it in the load order, 3.3); the meshql scenario of
   live-meshql.md 7 is a step of meshql-fib's `scripts/live-demo.py` on its `live-dev` branch (the on-item edit loaded, curl 410, the
   file restored and loaded again), guarded so that a fibc without the op skips it.
+- **Status 2026-10-15, LE5 and LE4** (`serve.live` `warm-engine`, `serve.livesess` `warm`; `serve.live` `op-inspect`, `serve.liveswap`
+  `family-info` and `def-info`, `serve.liveclient` `:inspect`; `compiler/tests/live/attach.sh` extended, the mutants `warm-skipped` and
+  `inspect-runs-input` of `scripts/mutant-live.sh`). LE5 is 3.7 (a): the socket line is printed and `main` started first, then the
+  engine's front end runs on the session's text (the base's files and the loaded texts, `mainmode "yes"`, `want true`) on the driver's
+  thread; a client that connects meanwhile waits in the listener's queue, and `hello` answers `warm`. Where it differs: (a) no warm-up
+  under `--trace` (every child of `fibc cases` runs so, and the engine's macro sessions would trace on standard error) nor for a program
+  that ends within 100 ms of its `def`s being made (a run nobody attaches to would otherwise wait for the warm-up to exit); `warm` is
+  then false. LE4 is 3.8 with these choices: a function answers `kind`, `generation`, `bodies`, `scheme` (the table's display text) and
+  `summary` (each parameter `borrowed` or `owned`, with ` escapes`); a `def` answers `kind`, `type` (the last accepted program's
+  catalogue, `DefState.types`) and `slot` (`live.d.NAME` or `def.slot.N`; none for static data); a name that is neither is
+  `unknown-name`; `value: true` is the old `inspect` (an expression input, with `stats`). The expression input needed no change: since
+  LE3 its only request is the entry, and `main` and everything resident are answered by name. Measured on lilnas (attach.sh's app.fib,
+  58 modules): the first input `reused 57, expanded 1, check_ms 5` (cold: `reused 0, check_ms 1013 to 1222`); `inspect` 0 ms in the
+  probe's harness; `(count [1])` 31 to 54 ms. meshql-fib's `scripts/live-demo.sh` (305 modules): the first swap 335 to 362 ms wall
+  (`check 157 to 172 ms`; 9,019 ms on the same machine without LE5), start-up to the first HTTP answer 8.51 to 9.07 s (8.42 s
+  without); `hello` waits for the warm-up when it comes first (8.8 to 9.7 s). The demo's check "a session def is accepted once and
+  refused again (live/Def)" fails with and without LE5: it predates LT4, which made a `def` redefinable.

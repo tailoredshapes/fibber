@@ -46,8 +46,9 @@ tool_sh-live-run := $(T)/live/run.sh $(F_ABS) | $(wildcard $(T)/live/*) $(wildca
 # libraries' under --live-deps); LT1 (3.2): fib.test.run's argv override and report sink (the collected report is the child's, byte for byte)
 tool_sh-live-project := $(T)/live/project.sh $(F_ABS) | $(T)/live/project.sh $(T)/live/project-stubs.golden $(T)/deps/fixtures.sh compiler/emit/live.fib compiler/pkg/modules.fib compiler/driver/front.fib compiler/fibc.fib $(wildcard compiler/serve/live*.fib)
 tool_sh-live-hooks := $(T)/live/hooks.sh $(F_ABS) | $(T)/live/hooks.sh $(T)/live/hooks.fib $(T)/live/hooks-spec.fib $(T)/live/hookspecs.fib lib/fib/test/run.fib
-# LV1: the attach socket of `fibc run --live` (serve.live*), over a real socket against app.fib, and the peer-uid unit (about 2 minutes)
-tool_sh-live-attach := $(T)/live/attach.sh $(F_ABS) | $(T)/live/attach.sh $(T)/live/attach.py $(T)/live/app.fib $(T)/live/unit-livesock.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib)
+# LV1: the attach socket of `fibc run --live` (serve.live*), over a real socket against app.fib, and the peer-uid unit (about 2 minutes); LE5 (the
+# engine warmed before the first connection: serve.incr, serve.replcore) and LE4 (`inspect` as a lookup) of docs/design/live-incremental.md
+tool_sh-live-attach := $(T)/live/attach.sh $(F_ABS) | $(T)/live/attach.sh $(T)/live/attach.py $(T)/live/app.fib $(T)/live/unit-livesock.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/serve/incr.fib compiler/serve/replcore.fib
 # LV2: body swaps in the running program (serve.liveswap, serve.livetable, serve.liverules): swap-app.fib's server holds the handler as a value, a worker
 # thread calls the swapped function; the design's transcripts 1, 4 and 5 through the terminal client (about 2 minutes)
 tool_sh-live-swap := $(T)/live/swap.sh $(F_ABS) | $(T)/live/swap.sh $(T)/live/swap.py $(T)/live/swap-app.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/emit/live.fib

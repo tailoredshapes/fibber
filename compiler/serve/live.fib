@@ -3,7 +3,8 @@
 ;; while it runs: one JSON object per line in and out (serve.proto, the shapes of `fibc serve`), a connection open for many requests,
 ;; one request at a time. Ops: `hello`, `eval` (`text`: what `fibc repl` takes; a redefinition of a function is a body swap, serve.liveswap,
 ;; answered `swapped` with the generation and the swap's figures, or refused with a `live/*` code and a `hint`), `type` (`expr`),
-;; `inspect` (`name`; a function's generation and bodies too), `status` (the generation, the generations kept, the threads), and the
+;; `inspect` (`name`: a lookup in the live table and the last catalogue, package LE4; `value: true` evaluates it), `status` (the
+;; generation, the generations kept, the threads), and the
 ;; pause, resume and retirement of serve.liveretire (package LV3): `pause` (`timeout_ms`, default 5000: the program's threads park at
 ;; their pause points; answers whether it is quiescent and what still runs), `resume`, `retire` (at quiescence: the generations no slot
 ;; names and no parked thread can be in are freed; otherwise `not-quiescent`); `test` (serve.livetest, package LT2 of
@@ -15,14 +16,16 @@
 ;; own main stack, rt/thread.lir `fib.run-main`), which says when it has ended (`done`) and wakes the accept. The design's 2.1 has the
 ;; two the other way round; the mechanics are the same. The process ends as `fibc run` ends: the program's result printed, exit through
 ;; the C library (what the program buffered is written). The socket is made before `main` is called, its path printed on standard error
-;; and set as FIB_LIVE_SOCKET for the program.
+;; and set as FIB_LIVE_SOCKET for the program. Before the first connection is accepted the engine is warmed on the base's text (LE5).
 (ns serve.live
   (:require [serve.livesess :as ls] [serve.liveswap :as lsw] [serve.livetable :as lt] [serve.liveretire :as lr] [serve.livetest :as ltt] [serve.liveload :as ll] [serve.livesock :as lsk] [serve.sock :as sk] [serve.proto :as p] [serve.incr :as inc] [serve.diag :as dg]
             [lsp.json :as j] [driver.native :as native] [driver.version :as v] [native.call :as call] [lair.ffi :as ffi]
             [expand.roots :as roots] [expand.maker :as mk] [fib.unix :as unix] [fib.string :as s]))
 
 ;; `conns` numbers the connections served: a `test` answers on the connection that asked, by number (a descriptor is reused by a later one).
-(defstruct Live (sx: ls/Sess listener: i64 path: str done: (Atom (Option i64)) served: (Cell i64) conns: (Cell i64) tests: ltt/Tests loads: ll/Loads))
+(defstruct Live (sx: ls/Sess listener: i64 path: str done: (Atom (Option i64)) served: (Cell i64) conns: (Cell i64) tests: ltt/Tests loads: ll/Loads
+                    ;; whether the engine was warmed on the base's text before the first connection (LE5, `warm-engine`)
+                    warm: (Cell bool)))
 
 (def poll-ms: i64 250)
 
@@ -86,7 +89,7 @@
     (p/response r true [(Pair "pid" (j/json-int (sk/process-id))) (Pair "program" (j/json-str (. (. l sx) file))) (Pair "generation" (j/json-int (lsw/generation (. l sx))))
                         (Pair "version" (j/json-str v/version)) (Pair "catching" (j/JBool true))
                         (Pair "threads" (j/json-int (. t spawned))) (Pair "pool" (j/json-int (. t workers)))
-                        (Pair "with" (strs (. (. (. l sx) rts) with)))])))
+                        (Pair "with" (strs (. (. (. l sx) rts) with))) (Pair "warm" (j/JBool @(. l warm)))])))
 
 ;; `pause`: the program's threads asked to park at their pause points, and up to `timeout_ms` (5000) of waiting for quiescence.
 (defun op-pause :private (l: Live r: p/Req) -> str
@@ -125,21 +128,39 @@
                    ((Ok t) (p/response r true [(Pair "type" (j/json-str t))]))
                    ((Err lines) (p/response r false [(Pair "shown" (strs lines)) (Pair "code" (j/json-str "check"))]))))))
 
-;; `inspect`: the value of the name (as `eval` prints it) and its type; for a function of the running program its generation and the
-;; bodies its slots name.
+;; `inspect` (LE4, docs/design/live-incremental.md 3.8): a lookup, no front end and no input. A function of the running program
+;; answers from the live table (its generation, the bodies its slots name, its scheme as the table keeps it, its parameters' modes);
+;; a `def` from the last accepted program's catalogue (its type and its slot). With `value: true` the name is evaluated as an `eval` of
+;; it (the cost of an expression input; the answer then has its `value` and `stats`).
 (defun op-inspect :private (l: Live r: p/Req) -> str
   (match (p/field-str r "name")
     (nil (p/error-response r "bad-request" "inspect needs a string `name`"))
-    ((some name)
-     (match (lsw/input (. l sx) name)
-       ((ls/Value text st stats)
-        (p/response r true (into (match text ((some t) [(Pair "value" (j/json-str t))]) (nil []))
-                                 (into [(Pair "type" (j/json-str (match (ls/type-of (. l sx) name) ((Ok t) t) ((Err _) "?"))))]
-                                       (into (match (lsw/function-info (. l sx) name)
-                                               ((some [gen bodies]) [(Pair "generation" (j/json-int gen)) (Pair "bodies" (strs bodies))])
-                                               (nil [(Pair "generation" (j/json-int (lsw/generation (. l sx))))]))
-                                             [(Pair "stats" (p/stats-json stats))])))))
-       (other (answer-json l r other))))))
+    ((some name) (if (p/field-bool r "value") (inspect-value l r name) (inspect-lookup l r name)))))
+
+(defun mode-text :private (p: (Pair bool bool)) -> str (str (if (. p fst) "owned" "borrowed") (if (. p snd) " escapes" "")))
+
+(defun inspect-lookup :private (l: Live r: p/Req name: str) -> str
+  (let ((sx (. l sx)))
+    (match (lsw/family-info sx name)
+      ((some f) (p/response r true [(Pair "kind" (j/json-str "function")) (Pair "generation" (j/json-int (. f generation))) (Pair "bodies" (strs (lsw/family-bodies sx name f)))
+                                    (Pair "scheme" (j/json-str (match (. f scheme) ((some s) (. s snd)) (nil "?"))))
+                                    (Pair "summary" (strs (match (. f summary) ((some sm) (mapv mode-text (. sm params))) (nil []))))]))
+      (nil (match (lsw/def-info sx name)
+             ((some [ty slot]) (p/response r true (into [(Pair "kind" (j/json-str "def")) (Pair "type" (j/json-str ty)) (Pair "generation" (j/json-int (lsw/generation sx)))]
+                                                        (match slot ((some sl) [(Pair "slot" (j/json-str sl))]) (nil [])))))
+             (nil (p/error-response r "unknown-name" (str name " is neither a function of the running program nor a def; `value: true` evaluates it"))))))))
+
+;; `inspect` with `value: true`: the name's value (as `eval` prints it) and its type, a function's generation and bodies too.
+(defun inspect-value :private (l: Live r: p/Req name: str) -> str
+  (match (lsw/input (. l sx) name)
+    ((ls/Value text st stats)
+     (p/response r true (into (match text ((some t) [(Pair "value" (j/json-str t))]) (nil []))
+                              (into [(Pair "type" (j/json-str (match (ls/type-of (. l sx) name) ((Ok t) t) ((Err _) "?"))))]
+                                    (into (match (lsw/function-info (. l sx) name)
+                                            ((some [gen bodies]) [(Pair "generation" (j/json-int gen)) (Pair "bodies" (strs bodies))])
+                                            (nil [(Pair "generation" (j/json-int (lsw/generation (. l sx))))]))
+                                          [(Pair "stats" (p/stats-json stats))])))))
+    (other (answer-json l r other))))
 
 ;; The `def`s redefined (LT4, serve.livedefs): how many redefinitions, the old values waiting for a retirement, the ones dropped (freed)
 ;; and the ones that were immortal (never freed).
@@ -248,19 +269,34 @@
 
 (defun say-lines :private (lines: (Vec str)) -> unit (doseq [x lines] (eprintln x)))
 
+;; The warm engine (LE5, docs/design/live-incremental.md 3.7): once the program's `main` runs on its thread and before the first
+;; connection is accepted, the engine's front end runs on the base's text here, on the driver's thread (idle until a client comes; a
+;; client that connects meanwhile waits in the listener's queue), so that the first input does not pay the cold front end. `hello`
+;; answers whether it ran and checked. Not under `--trace` (the harness of `fibc cases` runs every child so, and the engine's macro
+;; sessions would trace on standard error), nor for a program that ends within `grace-ms` of its `def`s being made (a run that nobody
+;; attaches to would wait for the warm-up before it can exit).
+(def grace-ms: i64 100)
+
+(defun warm-engine :private (l: Live trace: bool) -> unit
+  (when (not trace)
+    (do (wait-ready l)
+        (loop ((n 0)) (when (and (not (program-ended? l)) (< n grace-ms)) (do (unix/sleep-ns 1000000) (recur (+ n 1)))))
+        (when (not (program-ended? l)) (set! (. l warm) (ls/warm (. l sx)))))))
+
 ;; The booted session on its socket (in a private directory): the path on standard error, `main` started on its thread, the requests
 ;; answered until it ends; its status. The socket is unlinked at the end.
-(defun serve-program :private (sx: ls/Sess dir: str path: str pid: i64 loads: ll/Loads) -> i64
+(defun serve-program :private (sx: ls/Sess dir: str path: str pid: i64 loads: ll/Loads trace: bool) -> i64
   (match (ls/run-address sx)
     ((Err m) (do (eprintln (str "compile failed: " m)) 5))
     ((Ok addr)
      (match (lsk/listen-private dir path)
        ((Err m) (do (eprintln (str "fibc: live: " m)) 2))
        ((Ok listener)
-        (let ((l (Live sx listener path (atom nil) (cell 0) (cell 0) (ltt/tests-new (lsk/test-path dir pid) (lsk/test-err-path dir pid)) loads)))
+        (let ((l (Live sx listener path (atom nil) (cell 0) (cell 0) (ltt/tests-new (lsk/test-path dir pid) (lsk/test-err-path dir pid)) loads (cell false))))
           (do (eprintln (str "fibc: live at " path))
               (let ((t (start-program addr (. l done) listener)))
-                (do (accept-loop l)
+                (do (warm-engine l trace)
+                    (accept-loop l)
                     (unix/fd-close listener) (unix/fd-unlink path)
                     (join t))))))))))
 
@@ -287,7 +323,7 @@
                        (match (ls/boot sx (. argv fst) (. argv snd))
                          ((Err m) (do (eprintln (str "compile failed: " m)) 5))
                          ((Ok _)
-                          (let ((code (serve-program sx dir path pid loads)))
+                          (let ((code (serve-program sx dir path pid loads trace)))
                             (do (unix/fd-unlink (lsk/output-path dir pid)) (unix/fd-unlink (lsk/test-path dir pid)) (unix/fd-unlink (lsk/test-err-path dir pid))
                                 (sk/exit-flush code)
                                 code)))))))))))))))
