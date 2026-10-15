@@ -30,7 +30,7 @@ done
 # shellcheck source=../lib/stage2.sh
 . "$here/../lib/stage2.sh"
 take_suite_lock
-QUICK="num-f64 num-nbody vec-conj-pop vec-index vec-sort map-assoc-get set-conj lazy-fused lazy-bound strings"
+QUICK="num-f64 num-nbody vec-conj-pop vec-index vec-sort map-assoc-get set-conj lazy-fused lazy-bound strings live-hello live-num-nbody"
 names=${*:-$QUICK}
 
 if [ -n "${BENCH_FIBC:-}" ]; then fibc=$BENCH_FIBC; used="$BENCH_FIBC"; pick_builder >/dev/null 2>&1 || true
@@ -38,20 +38,26 @@ else stage2_ensure || exit 2; fibc=$GATE_OUT/F; used="stage 2 of tree $(tree_sta
 work=$GATE_OUT/bench; mkdir -p "$work"
 median() { sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}'; }
 
-# Builds NAME with the compiler, cached by the compiler's identity and the source's hash.
+# The program a row is built from: a row `live-NAME` is NAME.fib built in live mode (FIB_LIVE=1: the stubs and the catching convention of
+# docs/design/live-repl.md, package LV0), so its delta against NAME's row is the cost of the stub; the design bounds live-num-nbody at
+# 1.3x num-nbody.
+bench_source() { case $1 in live-*) echo "${1#live-}" ;; *) echo "$1" ;; esac; }
+# Builds NAME with the compiler, cached by the compiler's identity, the source's hash and the mode.
 build_bench() {
-  local n=$1 key
-  key=$(sha1sum < "$fibc" | cut -c1-12)-$(sha1sum < "$src/$n.fib" | cut -c1-12)
+  local n=$1 key f live=0
+  f=$src/$(bench_source "$n").fib
+  case $n in live-*) live=1 ;; esac
+  key=$(sha1sum < "$fibc" | cut -c1-12)-$(sha1sum < "$f" | cut -c1-12)-live$live
   if [ "$(cat "$work/$n.key" 2>/dev/null)" = "$key" ] && [ -x "$work/$n" ]; then return 0; fi
   rm -f "$work/$n"
-  (ulimit -v 16000000; "$fibc" build "$src/$n.fib" -o "$work/$n" > "$work/$n.build.log" 2>&1) || return 1
+  (ulimit -v 16000000; FIB_LIVE=$live "$fibc" build "$f" -o "$work/$n" > "$work/$n.build.log" 2>&1) || return 1
   echo "$key" > "$work/$n.key"
 }
 
 rows=$work/rows.tsv; : > "$rows"; bad=0; reg=0
 printf '%-14s %9s %9s %8s  %s\n' name base_s now_s delta% verdict
 for n in $names; do
-  if [ ! -f "$src/$n.fib" ]; then echo "quick.sh: no benchmark $n" >&2; exit 2; fi
+  if [ ! -f "$src/$(bench_source "$n").fib" ]; then echo "quick.sh: no benchmark $n" >&2; exit 2; fi
   if ! build_bench "$n"; then printf '%-14s build FAILED (%s)\n' "$n" "$work/$n.build.log"; bad=1; continue; fi
   ts=(); sum=
   for i in $(seq "$runs"); do

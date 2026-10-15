@@ -8,7 +8,7 @@
         emit.ir emit.mono emit.statics emit.objects emit.program emit.resume emit.lower.cx emit.lower.ops emit.lower.ctrl
         emit.lower.values emit.lower.call emit.lower.arith emit.lower.objects emit.lower.cells emit.lower.dynamic
         emit.lower.pattern emit.lower.quote emit.lower.threads emit.lower.simd emit.lower.hoist)
-  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt] [emit.live :as live]))
 
 ;; The functions the modules below call upward, as the Rust methods they stand for (the hub of emit.lower.cx).
 (defun hub-default () -> Hub
@@ -77,20 +77,24 @@
          (_ (recur (into (pop stack) (expr-children e)))))))))
 
 ;; Emits the function of `inst` into the program. Rust: lower/mod.rs:84 emit_body
+;; In live mode a body of the program's own modules is lowered under its generation name and reached through a stub of the name the
+;; callers use (emit.live).
 (defun emit-body (p: Program inst: Inst) -> (Result unit str)
   (let ((g (program-g p)))
     (match (get (. (. p owned) bodies) (. inst key))
       (nil (Err "no plan for the body"))
       ((some own)
        (let ((name (queue-request (. p queue) g inst))
+             (code (live/body-code-name p (. inst key) name))
              (env (match (. inst key) ((BodyAllOwned _) true) ((BodyMethodOwned _ _) true) (_ false))))
          (try-let ((ps (param-slots p inst (key-params g (. inst key)))))
-           (let ((cx (lcx-new p inst own name (into (if env [(LirParam LirPtr "env")] []) (params-sig ps)))))
+           (let ((cx (lcx-new p inst own code (into (if env [(LirParam LirPtr "env")] []) (params-sig ps)))))
              (do (bind-params cx ps)
                  (match (. inst key) ((BodyDef _) (lcx-set-unwind cx false)) (_ ()))
                  (set! (. cx fatal) (and @(. (. cx b) unwind) (takes-slots? p (body-expr g (. inst key)))))
                  (when env (set! (. cx env) (some (VVal (nx/local "env") LirPtr))))
-                 (finish-with cx (body-expr g (. inst key)))))))))))
+                 (try-let ((_ (finish-with cx (body-expr g (. inst key)))))
+                   (if (= code name) (Ok ()) (live/add-stub p name code)))))))))))
 
 ;; The captures of a closure body, loaded from `env` in capture order into their bindings. Rust: lower/mod.rs:462 load_captures
 (defun load-captures :private (cx: LowerCx e: Expr) -> (Result unit str)
