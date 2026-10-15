@@ -51,6 +51,11 @@ tool_sh-live-attach := $(T)/live/attach.sh $(F_ABS) | $(T)/live/attach.sh $(T)/l
 # LV2: body swaps in the running program (serve.liveswap, serve.livetable, serve.liverules): swap-app.fib's server holds the handler as a value, a worker
 # thread calls the swapped function; the design's transcripts 1, 4 and 5 through the terminal client (about 2 minutes)
 tool_sh-live-swap := $(T)/live/swap.sh $(F_ABS) | $(T)/live/swap.sh $(T)/live/swap.py $(T)/live/swap-app.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/emit/live.fib
+# LV3: swaps under load, the pause and the retirement (serve.liveretire, serve.livesplit, rt/live.lir, fib.os.live, the pause points of fib.http.server):
+# the socket stress (stress-app.fib: 8 threads and the pool under 1000 swaps, pause, retire, resume; swap-app.fib's http pause points) and the
+# ThreadSanitizer run of the stub and slot protocol (stress-tsan.fib in live mode with stress-swapper.lir appended), about two minutes each
+tool_sh-live-stress := $(T)/live/stress.sh $(F_ABS) --socket-only | $(T)/live/stress.sh $(T)/live/stress.py $(T)/live/stress-app.fib $(T)/live/swap-app.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/emit/live.fib rt/live.lir lib/fib/os/live.fib $(wildcard lib/fib/http/server/*.fib)
+tool_sh-live-stress-tsan := env TSAN_OUT=$(TOOLS_OUT)/live-stress-tsan $(T)/live/stress.sh $(F_ABS) --tsan-only | $(T)/live/stress.sh $(T)/live/stress-tsan.fib $(T)/live/stress-swapper.lir scripts/tsan.sh scripts/tsan-baseline.txt compiler/emit/live.fib rt/live.lir lib/fib/os/live.fib
 # The persistent checker's controls (run.sh, about 2 minutes whole) as independent stamps of at most about 50 s: the command-line programs in three groups,
 # the three batch comparisons (each builds its own emit tool), and the server edits. PERSIST_PARTS are queued right after the fixed point (mk/gate.mk).
 PERSIST_PARTS := cmd-0 cmd-1 cmd-2 batch-verify batch-onoff batch-single server prefix
@@ -90,7 +95,8 @@ tool_sh-make-graph := $(T)/make/graph.sh | $(wildcard $(T)/make/*) scripts/mac-g
 TOOLS_QUICK := sh-emit-prune fibref-skeleton gen-skeleton lint-pipefail lint-portable sh-driver-check-lib sh-make-graph
 TOOLS_FULL := $(TOOLS_QUICK) unit-api units-all units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-emit-runtime sh-emit-defs-order sh-stack-stack \
-  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap $(PERSIST_STAMPS) sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
+  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap sh-live-stress sh-live-stress-tsan \
+  $(PERSIST_STAMPS) sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
   sh-native-l1-unit $(LIRO_STAMPS) jit-selfhosted-threads sh-native-a64-sibcall sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
 # The command is every word up to the `|`, the inputs every word after it.
 upto_bar = $(if $(filter |,$(firstword $(1))),,$(if $(1),$(firstword $(1)) $(call upto_bar,$(wordlist 2,999999,$(1))),))

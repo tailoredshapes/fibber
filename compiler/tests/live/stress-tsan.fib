@@ -1,0 +1,63 @@
+;; result: 0
+(ns main (:require [fib.os.live :as live]))
+;; The ThreadSanitizer program of compiler/tests/live/stress.sh (package LV3 of docs/design/live-repl.md section 6): the stub and slot
+;; protocol of live mode under TSAN without a session. Emitted with FIB_LIVE=1 (`fibc emit`: the program's functions behind stubs and
+;; slots, the catching convention), its lIR gets compiler/tests/live/stress-swapper.lir appended (scripts/tsan.sh TSAN_APPEND): the
+;; definition of `fib_live_stress_swap`, which stores the address of `work-alt`'s body into `work`'s slot with the runtime's
+;; `fib.live-patch` (rt/live.lir: the release store the session's `live.patch` makes) and `work`'s own back, N times, passing a pause
+;; point between. Eight spawned workers and four pool tasks call `work` through its stub (the acquire load) meanwhile and count answers
+;; of neither body; `main` requests a pause (fib_live_ctl 0), waits until every spawned thread is parked (the counters under the run
+;; queue's mutex), reads the quiescence check, and resumes. The result is the bad count: 0.
+;;   stress-tsan SWAPS CALLS     (default 300 swaps, 20000 calls per thread)
+;; What TSAN sees here: the slot's acquire load against the release store (a plain store in either is reported: scripts/tsan-planted.sh
+;; live-patch, scripts/mutant-live.sh patch-plain-store and stub-plain-load), the pause counters, the pool. What it cannot see: a
+;; weakened order among the atomics, and ORC's writing of a new generation's code before its address is stored, which only the session
+;; does (compiler/tests/live/stress.py is that run).
+(extern fib_live_stress_swap :private (i64) -> i64)
+(extern fib_live_ctl :private (i64 i64) -> i64)
+
+(defun work (n: i64) -> i64
+  (loop ((i 0) (acc n)) (if (< i 200) (recur (+ i 1) (+ acc (rem (* i 7) 13))) (- (rem acc 1) -1))))
+
+;; The other body: `work`'s slot is made to name it (its body is `f.work-alt.g0`; it is called once so that it is emitted).
+(defun work-alt (n: i64) -> i64
+  (loop ((i 0) (acc n)) (if (< i 200) (recur (+ i 1) (+ acc (rem (* i 11) 17))) (- (rem acc 1) -2))))
+
+(defun ok? (r: i64) -> bool (or (= r 1) (= r 2)))
+
+(defun worker (k: i64) -> i64
+  (loop ((i 0) (b 0))
+    (if (< i k)
+        (do (when (= (rem i 64) 63) (live/pause-point))
+            (recur (+ i 1) (if (ok? (work i)) b (+ b 1))))
+        b)))
+
+(defun pool-batch (k: i64) -> i64
+  (loop ((i 0) (b 0)) (if (< i k) (recur (+ i 1) (if (ok? (work i)) b (+ b 1))) b)))
+
+(defun arg-or (i: i64 default: i64) -> i64
+  (let ((as (vec (args)))) (if (> (count as) i) (unwrap-or (parse-long (nth as i)) default) default)))
+
+;; A pause round: requested, every spawned thread parked (up to 3 s), the quiescence check read (0 here: this thread is not parked),
+;; resumed. 0 when every thread parked, 1 when not.
+(defun pause-round () -> i64
+  (do (unsafe (fib_live_ctl 0 0))
+      (let ((r (loop ((i 0))
+                 (cond (= (unsafe (fib_live_ctl 2 0)) (unsafe (fib_live_ctl 3 0))) 0
+                       (> i 3000) 1
+                       :else (do (sys-sleep 1000000) (recur (+ i 1)))))))
+        (do (unsafe (fib_live_ctl 4 0))
+            (unsafe (fib_live_ctl 1 0))
+            r))))
+
+(defun main () -> i64
+  (let ((swaps (arg-or 1 300)) (calls (arg-or 2 20000)))
+    (if (not (= (work-alt 0) 2))
+        1
+        (let ((ws (mapv (fn (i: i64) -> (Task i64) (spawn (fn () -> i64 (worker calls)))) (vec (range 8))))
+              (ts (mapv (fn (i: i64) -> (Task i64) (fork-task (fn () -> i64 (pool-batch calls)))) (vec (range 4))))
+              (sw (spawn (fn () -> i64 (unsafe (fib_live_stress_swap swaps))))))
+          (let ((unparked (pause-round)))
+            (let ((bad (+ (reduce + 0 (mapv (fn (t: (Task i64)) -> i64 (join t)) ws)) (reduce + 0 (mapv (fn (t: (Task i64)) -> i64 (join t)) ts)))))
+              (do (join sw)
+                  (+ bad (* 1000 unparked)))))))))

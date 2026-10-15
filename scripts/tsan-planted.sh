@@ -10,8 +10,10 @@
 #   upgrade-atomic  the count read of `fib.upgrade` (rt/weak.lir) plain again: reported as a race with retain-slow's atomic add  case: ownership/110
 #   pool-handoff  the ring slot of the work-stealing deque (rt/deque.lir) published and read with plain accesses instead of release/acquire (fib.sched-push, fib.sched-steal, fib.sched-pop; TSAN
 #               ignores standalone fences, so the slot is the edge it sees): the task a thief takes is reported as a race with the owner's writes   kernel: sched tree
-#   all         all five (default)
-# usage: scripts/tsan-planted.sh [atomic-mt|tile-seed|enqueue-share|upgrade-atomic|pool-handoff|all]       environment: F (as tsan.sh), PLANT_OUT (scratch), TSAN_RUNS (default 5)
+#   live-patch  the release store of a live swap (`fib.live-patch`, rt/live.lir) made a plain store on the LLVM IR: the stub's acquire load of the slot
+#               (emit.live) must be reported as a race with it   program: compiler/tests/live/stress-tsan.fib in live mode, with its swapper appended (LV3)
+#   all         all six (default)
+# usage: scripts/tsan-planted.sh [atomic-mt|tile-seed|enqueue-share|upgrade-atomic|pool-handoff|live-patch|all]       environment: F (as tsan.sh), PLANT_OUT (scratch), TSAN_RUNS (default 5)
 # exit: 0 every planted race was reported and the unplanted program was silent, 1 one was missed or the unplanted run reported it, 2 setup
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -66,6 +68,14 @@ if [ "$mode" = all ] || [ "$mode" = pool-handoff ]; then
   TSAN_SED='/^define internal void @fib\.sched-push\(/,/^}/s/store atomic ptr (%[a-z0-9.]+), (ptr %[a-z0-9.]+) release, align 8/store ptr \1, \2, align 8/; /^define internal ptr @fib\.sched-(steal|pop)\(/,/^}/s/load atomic ptr, (ptr %[a-z0-9.]+) acquire, align 8/load ptr, \1, align 8/' run pool-planted "$P" tree 12
   run pool-clean "$P" tree 12
   verdict pool-handoff pool-planted pool-clean "fib.sched"
+fi
+if [ "$mode" = all ] || [ "$mode" = live-patch ]; then
+  L=$root/compiler/tests/live/stress-tsan.fib
+  export FIB_LIVE=1 TSAN_APPEND=$root/compiler/tests/live/stress-swapper.lir
+  TSAN_SED='/^define internal void @fib\.live-patch\(/,/^}/s/store atomic ptr (%[a-z0-9.]+), (ptr %[a-z0-9.]+) release, align 8/store ptr \1, \2, align 8/' run live-planted "$L" 100 20000
+  run live-clean "$L" 100 20000
+  unset FIB_LIVE TSAN_APPEND
+  verdict live-patch live-planted live-clean "fib.live-patch"
 fi
 [ $bad = 0 ] && echo "tsan-planted: every planted race was reported" || echo "tsan-planted: FAILED"
 exit $bad

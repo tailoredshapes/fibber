@@ -612,3 +612,45 @@ Decisions for the owner:
   native/jit.fib; (k) a specialisation of a function nothing in the text reaches (one an earlier input instantiated) is not emitted
   again by a swap and keeps its slot: a type's id is one program's, so the live table cannot ask for it by type; the methods of a
   redefined `impl` are asked for by the `impl`'s key, reached or not.
+- **Status 2026-10-15, LV3** (rt/live.lir; lib/fib/os/live.fib; the pause points of fib.http.server; serve.liveretire, serve.livesplit;
+  the ops `pause`, `resume`, `retire`, `status.threads`, `hello.threads`/`pool`; `:pause`, `:resume`, `:retire` in the client; the test
+  compiler/tests/live/stress.sh over stress-app.fib and swap-app.fib with its TSAN part over stress-tsan.fib; the mutants
+  retire-without-pause and patch-plain-store, stub-plain-load's TSAN kill, and the planted fault live-patch of scripts/tsan-planted.sh):
+  the stress of the row (8 spawned threads and the pool's tasks calling `f` while the attach thread swaps it 1,000 times; a thread inside
+  a 1.5 s call during a swap of it; a trap in a worker task and in a pool task), the pause at the program's pause points, the retirement
+  at quiescence, the resumed stress. Where it differs from the text above: (a) **quiescence as built** (rt/live.lir, where the memory
+  orders are argued): the threads parked at a pause point equal the spawned threads alive plus one (`main`'s thread, which `fib.run-main`
+  makes outside `fib.threads-live`), the async pool's queue is empty with no worker busy, and the work-stealing pool is not started or
+  has every worker asleep with no work (the check of `fib.sched-quiesce` without its wait); a pause point reached by a pool worker is
+  ignored (a pool task is done when it returns). (b) **which generation a parked thread's frame is in is not known** (3.3 says "the one
+  the pause point's frame is in"): `retire` keeps every generation of every family whose code reaches a pause point, by a fixed point
+  over the references the session notes of each body and literal (direct calls of stubs, literals of its own, closure constants and
+  vtables it names: serve.livesplit `code-refs`, serve.liveretire `pause-bearing`), and reports them `pinned (pause-point)`. Not followed:
+  a closure or `dyn` value read from the heap and called on the way to a pause point, when the function that made it was swapped while
+  the thread was parked below it; the lift is a walk of the heap from the def slots at quiescence, or stack scanning. (c) **a
+  generation's statics outlive its code**: a swap's cut is split (serve.livesplit) into a data part, resident for good (new strings,
+  keywords, a type's walkers and rows, and the stub, slot and generation-0 body of a function the base never reached), and a code part
+  under the tracker (the bodies and literals that carry the generation, with the closure constants that name a literal); a code part
+  that holds a literal or a closure constant is never retired (`pinned (closures)`), since a heap closure made by the body may still
+  name it (the prototype's rule, FINDINGS §3), so a body with a lambda keeps its old generations until a restart; a body of calls and
+  arithmetic (the stress's `f`, a handler of `str` and calls) is freed. (d) `status` reports counts, not bytes (ORC does not report them).
+  (e) **transcript 7 is matched in its lines' shape, not its bytes**: `:status` prints `threads: 9 spawned threads (0 parked) and 28 pool
+  workers (3 active)`, the refusal is `; not quiescent: no pause was requested; pause first [not-quiescent]` (or what still runs:
+  `1 thread not at a pause point, pool 3 active`), `:pause` prints `; paused at 10 pause points; pool idle (28 workers)` or that it is
+  not quiescent after the timeout (5 s, `:pause MS`; the request stands and `:resume` lifts it), `:retire` prints `; removed 20
+  generations; 2 kept (generation 23)` with `, pinned: handle (pause-point)` when something is; the `; note:` after a swap comes when the
+  pool has started; the transcript's `(def job (future (pmap ..)))` is not run as written (a `future` of a 1.5 s call is the long call
+  of the test). (f) **a trap in a worker task is not fatal in a live program**: FINDINGS (4) and (3) say a trap on another thread is
+  fatal; in stage 2's catching convention a spawned task's trap is its failure (ADR 0001) and a pool task's too (parallelism.md 8, the
+  runner's own catch), and `try-join` answers `(Err (Trap "nth: index out of range"))` for both while the program runs on (the test's
+  `trap in a spawned worker task`, `trap in a pool task`). (g) **what ThreadSanitizer covers** (stress.sh's tsan part, `scripts/tsan.sh`
+  with `TSAN_APPEND`): the program is emitted in live mode with the real stubs, slots and runtime, and a swapper appended as lIR stores
+  the two bodies' addresses into `f.work`'s slot with the runtime's `fib.live-patch` while 8 threads and 4 pool tasks call through the
+  stub and the main thread runs a pause round; a plain store (the planted fault, the mutant) or a plain load (the mutant) is a report
+  `data race | atomic read f.work | write fib.live-patch | global 'live.f.work'`. Not covered by TSAN: ORC's writing of a generation's
+  code before its address is stored (only the session does that: the socket stress is the run), the removal of a tracker, and a
+  weakened order among the atomics (which the socket stress and retire-without-pause are for, not a proof). (h) The pause point is also
+  in a kept-alive connection's wait between requests (fib.http.server.connection), not only the accept loop: with a connection open the
+  server is quiescent. (i) A swap of the stress app costs about 146 ms (check 26, emit about 90, jit under 10: the emit of the whole
+  program, LV2 (e)), so the 1,000 swaps are about two and a half minutes of the socket part; the two parts are stamps of their own in
+  mk/tools.mk (full gate only).

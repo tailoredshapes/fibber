@@ -1,0 +1,60 @@
+(ns main (:use fib.async) (:require [fib.unix :as u] [fib.os.live :as live]))
+;; The program of compiler/tests/live/stress.sh (package LV3 of docs/design/live-repl.md section 6): the swap stress. Eight spawned
+;; workers call `f` in a loop, and a driver thread forks batches of pool tasks that call it too, while the attach thread swaps `f`
+;; between two bodies answering 1 and 2; every answer must be one of the two (`bad`, `pool-bad`). Every thread passes a pause point
+;; (fib.os.live): the workers every 64th call, the driver between batches, `main` in its idle loop, so the session can pause the
+;; program, retire the old generations of `f`, and resume it. `slow` is the long call a thread is inside during a swap; `boom` the
+;; call that traps, for a worker task; the counts are read through the attach socket. `main` waits until `stop` is set there.
+(def stop: (Atom bool) (atom false))
+(def calls: (Atom i64) (atom 0))         ; calls of `f` by the spawned workers
+(def bad: (Atom i64) (atom 0))           ; their answers that were neither body's
+(def pool-calls: (Atom i64) (atom 0))    ; calls of `f` by the pool tasks
+(def pool-bad: (Atom i64) (atom 0))
+(def batches: (Atom i64) (atom 0))
+
+;; A few microseconds of work answering 1; the stress swaps it for a body answering 2, and back.
+(defun f (n: i64) -> i64
+  (loop ((i 0) (acc n)) (if (< i 1000) (recur (+ i 1) (+ acc (rem (* i 7) 13))) (- (rem acc 1) -1))))
+
+(defun ok? (r: i64) -> bool (or (= r 1) (= r 2)))
+
+;; A spawned worker: `f` in a loop until `stop`; every 64th call the count is published and a pause point passed.
+(defun worker () -> i64
+  (loop ((n 0) (b 0))
+    (if @stop
+        (do (swap! bad + b) n)
+        (let ((r (f n)))
+          (do (when (= (rem n 64) 63) (do (swap! calls + 64) (live/pause-point)))
+              (recur (+ n 1) (if (ok? r) b (+ b 1))))))))
+
+;; A pool task: `f` 500 times; its answers that were neither body's.
+(defun pool-batch (k: i64) -> i64
+  (loop ((i 0) (b 0)) (if (< i 500) (recur (+ i 1) (if (ok? (f (+ i k))) b (+ b 1))) b)))
+
+;; The driver: 16 pool tasks at a time, joined, then a pause point; until `stop`.
+(defun pool-driver () -> i64
+  (loop ((rounds 0))
+    (if @stop
+        rounds
+        (let ((ts (mapv (fn (k: i64) -> (Task i64) (fork-task (fn () -> i64 (pool-batch k)))) (vec (range 16)))))
+          (do (swap! pool-bad + (reduce + 0 (mapv (fn (t: (Task i64)) -> i64 (join t)) ts)))
+              (swap! pool-calls + 8000)
+              (swap! batches inc)
+              (live/pause-point)
+              (recur (+ rounds 1)))))))
+
+;; A long call: 1500 ms asleep, then n + 1. The stress swaps it while a thread is inside: the swap must not wait, the old body finishes.
+(defun slow (n: i64) -> i64 (do (u/sleep-ns 1500000000) (+ n 1)))
+
+;; A call that traps (the index is out of range), for a worker task.
+(defun boom (n: i64) -> i64 (nth [1 2] n))
+
+(defun main () -> i64
+  (let ((ws (mapv (fn (i: i64) -> (Task i64) (spawn (fn () -> i64 (worker)))) (vec (range 8))))
+        (pd (spawn (fn () -> i64 (pool-driver)))))
+    (do (println "app: started")
+        (when @stop (do (slow 0) (boom 0) ()))   ; never: `slow` and `boom` are reached, so the base emits them (a function the base lacks swaps into the text only)
+        (loop () (if @stop () (do (live/pause-point) (u/sleep-ns 20000000) (recur))))
+        (let ((n (reduce + 0 (mapv (fn (t: (Task i64)) -> i64 (join t)) ws))) (rounds (join pd)))
+          (do (println (str "app: stopped after " n " calls, bad " @bad "; pool " @pool-calls " calls in " rounds " rounds, bad " @pool-bad))
+              0)))))
