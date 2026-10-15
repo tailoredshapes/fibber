@@ -239,4 +239,18 @@ Controls, all with stage 2 of this tree (`F`, the 0.1.16 seed's build), 2026-10-
 4. `scripts/mutant-persist.sh`: two new plants, `chain-key-ignored` (own.chain uses a kept state whatever the key: the unit program's
    `chain` step reads a stale answer) and `prefix-key-ignores-text` (serve.incr keys the chain by the module's name only: the server
    control, part 3 run with a `fibc` built from the planted copy, is accepted a program it must reject); the twelve plants of section 7
-   run again with the chain tests in the unit program. Results in the LV4 report (live-repl.md 8).
+   run again with the chain tests in the unit program. The run of 2026-10-15 (`MUT_JOBS=3`, `FIBC` stage 2 of this tree), all killed:
+   ```
+   KILLED instance-index (unit: failed, batch: failed, server: not-run)   KILLED tables-shared (unit: failed, batch: failed, server: not-run)
+   KILLED expr-counter (unit: failed, batch: failed, server: not-run)     KILLED key-ignored (unit: failed, batch: lived, server: not-run)
+   KILLED elab-counter (unit: lived, batch: failed, server: not-run)      KILLED key-no-prelude (unit: failed, batch: lived, server: not-run)
+   KILLED store-nodes (unit: lived, batch: failed, server: not-run)       KILLED key-no-texts (unit: failed, batch: lived, server: not-run)
+   KILLED resolutions (unit: failed, batch: failed, server: not-run)      KILLED elab-ids (unit: failed, batch: failed, server: not-run)
+   KILLED summaries (unit: failed, batch: failed, server: not-run)        KILLED chain-key-ignored (unit: failed, batch: lived, server: not-run)
+   KILLED program-takes (unit: lived, batch: failed, server: not-run)     KILLED prefix-key-ignores-text (unit: lived, batch: lived, server: failed)
+   ```
+   `prefix-key-ignores-text` lives through the unit program and the batch (neither goes through the engine) and is killed by the server
+   control alone, at the step it is planted for: `FAIL server: an edit of the first module was not seen (a stale kept state answered)`.
+   The three key plants of the library (`key-ignored`, `key-no-prelude`, `key-no-texts`) now read `batch: lived` where section 7 had
+   `differs*`: with the path normalised the batch cannot see them (its inputs share one library), and the unit program kills them, as
+   section 7 said it did on its own.
