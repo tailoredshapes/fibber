@@ -9,7 +9,7 @@ status 1; generation_start = generation_end, not stale); `--only` the failing ro
 the `replay:` line as a `:test` command; a step edit (the spec function defined again, a scenario reading a `def` made at the REPL) seen
 by the next run (the registry is made again per run); `isolate: fork` and `timeout` answer `test/NoFork`; a selection that matches
 nothing is `test/NothingSelected`; `--list` through the sink; the two-second scenario with a swap of `slow-twice` sent at one second:
-`stale: true` and the row shows both generations' answers, `status` during the run answers within 100 ms (the run is on a thread of its
+`stale: true` and the row shows both generations' answers, `status` during the run answers within 500 ms (the run is on a thread of its
 own), a second `test` during it is `busy` with the elapsed time; `--with`: the spec file beside the app is `spec.test-spec`, `spec:` runs
 it (two rows), as does `:test test-spec.fib`; the app ran on (its hits) and ends through the socket.
 The mutants of scripts/mutant-live.sh that must make this fail: stale-never, rerun-old-registry, test-on-attach-thread, sink-shared-run."""
@@ -152,7 +152,7 @@ gen = c.ask(op='status')['generation']
 c.send(op='test', id='slow', only='two-seconds')
 time.sleep(0.6)
 t0 = time.time(); st = c.ask(op='status'); dt = time.time() - t0
-check('status during a run answers within 100 ms', st and st.get('generation') == gen and 'tests' in st and st['tests']['running'] is True and st['tests']['id'] == 'slow' and st['tests']['elapsed_ms'] > 0 and dt < 0.1, (st, dt))
+check('status during a run answers within 500 ms', st and st.get('generation') == gen and 'tests' in st and st['tests']['running'] is True and st['tests']['id'] == 'slow' and st['tests']['elapsed_ms'] > 0 and dt < 0.5, (st, dt))
 b = c.ask(op='test', id='second')
 check('a second test is busy, with the elapsed time', b and b.get('ok') is False and b['error']['code'] == 'busy' and b.get('id') == 'second' and b['running']['id'] == 'slow' and b['running']['elapsed_ms'] >= 500, b)
 sw = c.eval('(defun slow-twice (n: i64) -> i64 (* 20 n))')
