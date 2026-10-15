@@ -1,0 +1,146 @@
+;; compiler/driver/testlive.fib: `fibc test --live [PATH..]` and `fibc test --connect SOCK|PID [PATH..] [options]` (docs/design/live-meshql.md
+;; 6, package LT6). `--live` makes the spec files resident in one live process with no app: a host program whose `main` waits (until
+;; `(reset! live-test-stop true)` is evaluated in it, or the process is killed) with each spec file loaded beside it by `--with`
+;; (serve.live `run-live`, as `fibc run --live HOST --with SPEC..`); the socket is printed on standard error. `--connect` sends one
+;; `test` request per spec file to that session (serve.livetest) instead of spawning a `fibc run` per file, and prints the report and exits
+;; exactly as `fibc test` does (driver.test `report-runs`): the answer's document rendered in the format asked for (plain and tap through
+;; the library's own `plain` and `tap`, json as the runner wrote it), its status read as a child's. The spec's front end and JIT are paid
+;; once, by `--live`; a run is the entry's compile and the scenarios. `--timeout` and `--isolate fork` are refused (a live process has
+;; threads: serve.livewords). Any other words go to driver.test unchanged.
+(ns driver.testlive
+  (:require [driver.test :as dt] [driver.native :as native] [serve.live :as live] [serve.liveclient :as lc] [serve.livesock :as lsk]
+            [serve.livewords :as lw] [serve.sock :as sk] [lsp.json :as j] [fib.test.run :as tr] [fib.unix :as unix] [expand.roots :as roots]
+            [expand.modules :as mods] [expand.maker :as mk] [fib.os.files :as osf]))
+
+;; The words of `test` with `--live` and `--connect TARGET` taken out.
+(defstruct LiveWords (live: bool connect: str rest: (Vec str)))
+
+(defun live-words (words: (Vec str)) -> (Result LiveWords str)
+  (loop ((i 0) (acc (LiveWords false "" [])))
+    (cond (>= i (count words)) (Ok acc)
+          (= (nth words i) "--live") (recur (+ i 1) (LiveWords true (. acc connect) (. acc rest)))
+          (= (nth words i) "--connect") (if (>= (+ i 1) (count words))
+                                            (Err "--connect wants a socket or a process id")
+                                            (recur (+ i 2) (LiveWords (. acc live) (nth words (+ i 1)) (. acc rest))))
+          :else (recur (+ i 1) (LiveWords (. acc live) (. acc connect) (conj (. acc rest) (nth words i)))))))
+
+;; ---- --live: the session
+
+;; The host: no app, a `main` that waits to be told to stop.
+(def host-text: str
+  "(ns main (:require [fib.unix :as live-test-unix]))
+;; the host of `fibc test --live` (driver.testlive): the spec files are loaded beside it; (reset! live-test-stop true) ends it
+(def live-test-stop: (Atom bool) (atom false))
+(defun main () -> i64 (do (loop () (if @live-test-stop () (do (live-test-unix/sleep-ns 50000000) (recur)))) 0))
+")
+
+(defun dirname :private (path: str) -> str
+  (loop ((i (- (str-len path) 1)))
+    (cond (< i 0) "."
+          (= (str-byte-at path i) 47i8) (if (= i 0) "/" (str-slice path 0 i))
+          :else (recur (- i 1)))))
+
+;; The module roots of the session: the command line's, then each spec file's own directory and its project's (driver.test
+;; `project-roots`, what `fibc test` passes each child).
+(defun spec-dirs :private (files: (Vec str) dirs: (Vec str)) -> (Vec str)
+  (reduce (fn (acc: (Vec str) f: str) (into (conj acc (dirname f)) (dt/project-roots f))) dirs files))
+
+;; Two spec files of one base name would be one module `spec.NAME` (expand.modules `with-name`).
+(defun clash :private (files: (Vec str)) -> (Option str)
+  (let ((names (mapv mods/with-name files)))
+    (if (= (count (set names)) (count names)) nil
+        (some (str "two spec files are the module " (unwrap-or (first (filterv (fn (n: str) (> (count (filterv (fn (m: str) (= m n)) names)) 1)) names)) "")
+                   "; run them in two sessions")))))
+
+;; The host file, one for every session of this user (the live directory is private): written when it is not there or differs, through a
+;; file of this process renamed over it, so a session starting meanwhile reads the old text or the new, never half. Not removed: a live
+;; program ends by `exit` (serve.live), and the next session reads it again.
+(defun host-file :private (dir: str pid: i64) -> (Result str str)
+  (let ((host (str dir "/test-host.fib")) (tmp (str dir "/" pid ".host.tmp")))
+    (cond (= (read-file host) (some host-text)) (Ok host)
+          (not (write-file tmp host-text)) (Err (str "cannot write " tmp))
+          :else (match (osf/rename-file tmp host) ((Ok _) (Ok host)) ((Err _) (Err (str "cannot write " host)))))))
+
+(defun serve-files :private (files: (Vec str) dirs: (Vec str) rm: mk/RunnerMaker) -> i64
+  (let ((dir (lsk/live-dir)) (pid (sk/process-id)))
+    (match (try-let ((_ (lsk/make-private-dir dir)) (host (host-file dir pid))) (Ok host))
+      ((Err m) (dt/usage-error m))
+      ((Ok host)
+       (do (native/setenv-set "FIB_LIVE" "1")
+           (eprintln (str "fibc test: loading " (count files) " spec file" (if (= (count files) 1) "" "s") " live; once the socket is printed, fibc test --connect "
+                          pid " [PATH..] [options] runs them here"))
+           (live/run-live host [] 0 false (roots/roots-with (roots/roots-from-env (spec-dirs files dirs) (native/getenv-opt "FIB_LIB")) files) rm))))))
+
+;; `test --live [PATH..]`: the spec files as `fibc test` finds them, resident until the host is stopped.
+(defun serve-live :private (words: (Vec str)) -> (Result (Vec str) str)
+  (cond (some? (first (filterv (fn (w: str) (starts-with? w "-")) words)))
+          (Err "--live takes spec paths only; the options go to each run: fibc test --connect PID [PATH..] [options]")
+        :else (match (dt/spec-files words)
+                ((Err m) (Err m))
+                ((Ok files) (match (clash files) ((some m) (Err m)) (nil (Ok files)))))))
+
+;; ---- --connect: the runs
+
+(defun request-of :private (file: str o: dt/TestOpts) -> str
+  (lc/req "test" (into [(Pair "spec" (j/json-str file)) (Pair "seed" (j/json-int (. o seed))) (Pair "jobs" (j/json-int (. o jobs)))]
+                       (into (if (= (. o only) "") [] [(Pair "only" (j/json-str (. o only)))])
+                             (into (if (. o list) [(Pair "list" (j/JBool true))] [])
+                                   (if (= (. o isolate) "") [] [(Pair "isolate" (j/json-str (. o isolate)))]))))))
+
+(defun str-at :private (v: j/JVal key: str) -> str (match (j/json-get v key) ((some x) (unwrap-or (j/json-as-str x) "")) (nil "")))
+
+;; What a refusal or a failed run says, as a child's standard error would: the message, the hint, the trap.
+(defun error-text :private (v: j/JVal) -> str
+  (let ((e (unwrap-or (j/json-get v "error") j/JNull))
+        (shown (match (j/json-get v "shown") ((some (j/JArr xs)) (mapv (fn (x: j/JVal) (unwrap-or (j/json-as-str x) "")) xs)) (_ []))))
+    (str (str-at e "message") " [" (if (= (str-at e "code") "") (str-at v "code") (str-at e "code")) "]\n" (str-join (mapv (fn (l: str) (str l "\n")) shown))
+         (str-at v "hint") "\n" (str-at v "trapped") "\n")))
+
+;; The answer's document as the child would have printed it in the format asked for: the `--list` listing and json as written.
+(defun rendered :private (o: dt/TestOpts v: j/JVal) -> str
+  (if (or (. o list) (= (. o format) "json"))
+      (str-at v "text")
+      (match (j/json-get v "report")
+        ((some (j/JObj ks vs)) (let ((rows (lw/rows-of (j/JObj ks vs))))
+                                 (if (= (. o format) "tap") (tr/tap rows (. o seed)) (tr/plain rows (. o seed)))))
+        (_ (str-at v "text")))))
+
+;; An answer as a spec process's end: 0 and 1 ran (the report), 2 nothing selected (its message names `no scenario matches` for `--only`,
+;; as the child's does), 134 a trap outside a scenario (died); a refusal (no `status`: a spec the session did not load, `busy`) an error.
+(defun run-of-answer (file: str o: dt/TestOpts v: j/JVal) -> dt/FileRun
+  (match (j/json-get v "status")
+    ((some (j/JInt st)) (if (or (= st 0) (= st 1)) (dt/FileRun file st (rendered o v) "") (dt/FileRun file st "" (error-text v))))
+    (_ (dt/FileRun file 4 "" (error-text v)))))
+
+(defun run-one :private (c: lc/Client file: str o: dt/TestOpts) -> dt/FileRun
+  (match (lc/exchange c (request-of file o))
+    ((Err m) (dt/FileRun file -1 "" (str "the live session: " m)))
+    ((Ok line) (match (j/json-parse line)
+                 ((Err _) (dt/FileRun file -1 "" (str "the live session answered: " line)))
+                 ((Ok v) (run-of-answer file o v))))))
+
+(defun run-connected :private (target: str files: (Vec str) o: dt/TestOpts) -> i64
+  (match (lc/connect target)
+    ((Err m) (dt/usage-error (str "no live session answers at " target " (" m "); start one with fibc test --live [PATH..]")))
+    ((Ok c) (let ((rs (loop ((i 0) (out [])) (if (>= i (count files)) out (recur (+ i 1) (conj out (run-one c (nth files i) o)))))))
+              (do (unix/fd-close (. c fd)) (dt/report-runs rs o))))))
+
+(defun connect-test :private (target: str words: (Vec str)) -> i64
+  (match (dt/parse-test words)
+    ((Err m) (dt/usage-error m))
+    ((Ok o) (cond (not (= (. o timeout) "")) (dt/usage-error (str "--timeout is refused with --connect: " lw/no-fork-hint))
+                  (= (. o isolate) "fork") (dt/usage-error (str "--isolate fork is refused with --connect: " lw/no-fork-hint))
+                  :else (match (dt/spec-files (. o paths))
+                          ((Err m) (dt/usage-error m))
+                          ((Ok files) (do (native/ignore-sigpipe) (run-connected target files o))))))))
+
+;; ---- the command
+
+;; `test [--live | --connect SOCK|PID] ..`; `dirs` are the module roots of the command line, `rm` the macro runner of the session.
+(defun cmd-test (words: (Vec str) dirs: (Vec str) rm: mk/RunnerMaker) -> i64
+  (match (live-words words)
+    ((Err m) (dt/usage-error m))
+    ((Ok w) (cond (and (. w live) (not (= (. w connect) ""))) (dt/usage-error "--live starts a session and --connect uses one: give one of them")
+                  (. w live) (match (serve-live (. w rest)) ((Err m) (dt/usage-error m)) ((Ok files) (serve-files files dirs rm)))
+                  (not (= (. w connect) "")) (connect-test (. w connect) (. w rest))
+                  :else (dt/cmd-test words dirs)))))

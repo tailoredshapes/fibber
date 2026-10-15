@@ -10,12 +10,12 @@
 ;; the default is the macro runner of macros.runner, which JITs each macro through lair); for `emit-dump` the statuses of
 ;; compiler/emit.fib (0, 1, 2, 3, 70 pending).
 ;; `lsp` serves the language server (lsp.server `lsp-main`, packages L0 to L5) on standard input and output; it takes `-I`.
-;; `test [PATH..] [options]` is driver.test (docs/design/test-harness.md 6). `cases DIR [--only PREFIX..]` is driver.harness (H1).
+;; `test [PATH..] [options]` is driver.test (docs/design/test-harness.md 6), `test --live` and `test --connect` driver.testlive. `cases DIR [--only PREFIX..]` is driver.harness (H1).
 ;; The retired Rust commands `itrace` and `gen` are refused with status 2; their ports remain planned development tools.
 ;; Build: `fibc build compiler/fibc.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o OUT`, run from the repository root (lair is native.*, fibber over LLVM: no liblair).
 (ns main
   (:require [driver.static :as st] [driver.args :as a] [driver.commands :as c] [driver.native :as native] [expand.roots :as roots] [expand.maker :as mk]
-            [macros.runner :as mr] [driver.harness :as hn] [driver.test :as dt] [driver.version :as v] [lsp.server :as lsp]
+            [macros.runner :as mr] [driver.harness :as hn] [driver.testlive :as dtl] [driver.version :as v] [lsp.server :as lsp]
             [pkg.project-mode :as pm] [pkg.modules :as md] [pkg.paths :as pp] [pkg.resolve :as rs] [pkg.deps-cmd :as deps] [pkg.new :as new] [serve.cmd :as sc] [emit.program :as ep]))
 
 (defun refuse (word: str) -> i64
@@ -32,7 +32,7 @@
     ((a/CmdCheck mods) (c/cmd-check mods rts rm))
     ((a/CmdLsp) (lsp/lsp-main rts))
     ((a/CmdCases dir only jobs) (hn/cmd-cases dir only jobs))
-    ((a/CmdTest words) (dt/cmd-test words dirs))
+    ((a/CmdTest words) (dtl/cmd-test words dirs rm))
     ((a/CmdDeps words) (deps/cmd-deps pf words))
     ((a/CmdNew words) (new/cmd-new words))
     ((a/CmdServe words) (sc/cmd-serve words (. rts dirs)))
@@ -53,6 +53,15 @@
   (let ((rest (take-target-words words)))
     (do (st/apply-static) rest)))
 
+;; Whether the words are `test`'s (the first that is not a `-I DIR`): `test --live` keeps its word for driver.testlive (the session of
+;; the spec files), and sets FIB_LIVE as `run --live` does, so that the project's live roots are resolved.
+(defun test-words? :private (words: (Vec str)) -> bool
+  (loop ((i 0))
+    (cond (>= i (count words)) false
+          (= (nth words i) "-I") (recur (+ i 2))
+          (starts-with? (nth words i) "-I") (recur (+ i 1))
+          :else (= (nth words i) "test"))))
+
 (defun take-target-words :private (words: (Vec str)) -> (Vec str)
   (loop ((i 0) (out []))
     (cond (>= i (count words)) out
@@ -61,7 +70,7 @@
           (= (nth words i) "--no-cache") (do (native/setenv-set "FIB_LIRO_CACHE" "off") (recur (+ i 1) out))
           (= (nth words i) "--whole-program") (do (native/setenv-set "FIB_LIRO_MODE" "whole") (recur (+ i 1) out))
           (= (nth words i) "--time") (do (native/setenv-set "FIB_TIME" "1") (recur (+ i 1) out))
-          (= (nth words i) "--live") (do (native/setenv-set "FIB_LIVE" "1") (recur (+ i 1) out))
+          (= (nth words i) "--live") (do (native/setenv-set "FIB_LIVE" "1") (recur (+ i 1) (if (test-words? words) (conj out "--live") out)))
           (= (nth words i) "--live-deps") (do (native/setenv-set "FIB_LIVE_DEPS" "1") (recur (+ i 1) out))
           (and (= (nth words i) "--with") (< (+ i 1) (count words)))
             (do (native/setenv-set "FIB_LIVE_WITH" (str (unwrap-or (native/getenv-opt "FIB_LIVE_WITH") "") (if (= (unwrap-or (native/getenv-opt "FIB_LIVE_WITH") "") "") "" ":") (nth words (+ i 1))))

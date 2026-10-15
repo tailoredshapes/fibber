@@ -73,6 +73,9 @@
 #                        (LT2, 3.2 step 1: it answers nothing yet and goes back to its socket)     two-second scenario is not answered in 100 ms)
 #   sink-shared-run      two runs at once: the `busy` refusal is gone and both write the session's compiler/tests/live/test.sh (the second `test`
 #                        one report file (LT2, 3.2: one test at a time)                             during the run is started, not refused `busy`)
+#   child-spawned-anyway `fibc test --connect` runs the specs as `fibc test` does, a `fibc run` per   compiler/tests/live/testlive.sh (the second
+#                        file, instead of sending `test` to the session (LT6): the reports are the  run of one scenario is a spawned run's time
+#                        same, the time is not                                                       again; the session's status has no last run)
 #   quote-shared         a quoted form `@q.N` is not a static numbered per program (emit.statics  compiler/tests/live/quotes.sh (a spec function
 #                        `program-static?`): the split exports a swap's quotes with the data, the    swapped at the REPL, then a base scenario's `run`:
 #                        next input's cut declares its own `q.N` from the base and reads another   the app dies at 0xe; `specs` swapped to one
@@ -105,7 +108,7 @@
 # A mutant of lib/ alone (sink-ignored, override-ignored) builds nothing: the case's `roots:` header names the copy's lib, and FIBC runs it.
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|quote-shared|partial-load|load-reads-disk|prefix-dropped|removed-ignored|def-slot-plain-store|old-def-freed|init-run-twice|warm-skipped|inspect-runs-input}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|quote-shared|partial-load|load-reads-disk|prefix-dropped|removed-ignored|def-slot-plain-store|old-def-freed|init-run-twice|warm-skipped|inspect-runs-input|child-spawned-anyway}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -164,6 +167,7 @@ case $MODE in
   sink-shared-run) patch compiler/serve/livetest.fib '  (match @(. t running)
     ((some run) (some (busy r run)))' '  (match (if true nil @(. t running))
     ((some run) (some (busy r run)))' ;;
+  child-spawned-anyway) patch compiler/driver/testlive.fib '(not (= (. w connect) "")) (connect-test (. w connect) (. w rest))' '(not (= (. w connect) "")) (dt/cmd-test (. w rest) dirs)' ;;
   quote-shared) patch compiler/emit/statics.fib '  (or (s/starts-with? name "clo.") (s/starts-with? name "vt.") (s/starts-with? name "q.")))' '  (or (s/starts-with? name "clo.") (s/starts-with? name "vt.")))' ;;
   partial-load) patch compiler/serve/liveload.fib '      (if (not (empty? refusals))
           (result file ns defs [] (refused-all file refusals))' '      (if false
@@ -202,6 +206,7 @@ case $MODE in
   defcache-*) what="the defcache test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/defcache.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested) what="the queue test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/queue.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run) what="the live test op's test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/test.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
+  child-spawned-anyway) what="the test --live test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/testlive.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   quote-shared) what="the quotes test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/quotes.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   def-slot-plain-store) what="the TSAN defs test"; TSAN_OUT="$OUT/tsan" FIB_LIB="$R/lib" "$R/compiler/tests/live/defs.sh" "$F" --tsan-only > "$OUT/test.log" 2>&1; rc=$? ;;
   old-def-freed|init-run-twice) what="the defs test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/defs.sh" "$F" --socket-only "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
