@@ -1,7 +1,7 @@
 ;; compiler/serve/livewatch.fib: `watch` of a live session (docs/design/live-meshql.md 3.8, package LT5): the poll of dev-loop.md 4.2
 ;; (vanilla, not inotify): `stat` of the session's live module files (serve.liveload's copies: the files the running program's bodies came
 ;; from) and of the files under the directories the request named (feature files, data), compared with the stamps of the last scan
-;; (inode, size, modification time). The poll runs on the attach thread in the connection loop of the watching connection (serve.live),
+;; (inode, size, modification time), reported once stable over two scans. The poll runs on the attach thread in the connection loop of the watching connection (serve.live),
 ;; at most once per `interval-ms`, and never while a test runs (a change made meanwhile is seen when the run ends): a scan is a `stat` per
 ;; file, and the loop already wakes every 250 ms, so there is no thread and nothing of the session crosses one. What a change does is
 ;; serve.live's: a module file is loaded (serve.liveload), a refusal emitted and nothing rerun; else the last test is rerun (`last: true`).
@@ -16,13 +16,14 @@
 
 (def missing: Stamp (Stamp -1 0 0 0))
 
-;; The watch of a session: the number of the watching connection (0: off), the directories named, the stamps of the last scan, when it
-;; was, and whether the run in progress is the watch's (its answer is an event).
-(defstruct Watch (conn: (Cell i64) dirs: (Cell (Vec str)) seen: (Cell (Map str Stamp)) at: (Cell i64) ours: (Cell bool)))
+;; The watch of a session: the number of the watching connection (0: off), the directories named, the stamps acted on (a file's stamp
+;; when the watch started or when its change was last reported), the stamps of the last scan, when it was, and whether the run in progress
+;; is the watch's (its answer is an event).
+(defstruct Watch (conn: (Cell i64) dirs: (Cell (Vec str)) seen: (Cell (Map str Stamp)) last: (Cell (Map str Stamp)) at: (Cell i64) ours: (Cell bool)))
 
 (def interval-ms: i64 200)
 
-(defun watch-new () -> Watch (Watch (cell 0) (cell []) (cell {}) (cell 0) (cell false)))
+(defun watch-new () -> Watch (Watch (cell 0) (cell []) (cell {}) (cell {}) (cell 0) (cell false)))
 
 ;; ---- stat
 
@@ -67,9 +68,9 @@
 ;; The watch on for connection `cid`: the stamps now are the base (a change is a change after this); the number of files watched.
 (defun start (w: Watch ld: ll/Loads cid: i64 dirs: (Vec str)) -> i64
   (do (set! (. w conn) cid) (set! (. w dirs) dirs)
-      (let ((now (scan w ld))) (do (set! (. w seen) now) (set! (. w at) (sys-clock-now)) (count now)))))
+      (let ((now (scan w ld))) (do (set! (. w seen) now) (set! (. w last) now) (set! (. w at) (sys-clock-now)) (count now)))))
 
-(defun stop (w: Watch) -> unit (do (set! (. w conn) 0) (set! (. w seen) {}) ()))
+(defun stop (w: Watch) -> unit (do (set! (. w conn) 0) (set! (. w seen) {}) (set! (. w last) {}) ()))
 
 (defun on? (w: Watch) -> bool (> @(. w conn) 0))
 
@@ -79,17 +80,25 @@
 (defstruct Changes (modules: (Vec str) others: (Vec str)))
 
 ;; The changes since the last scan, when connection `cid` watches, no test runs (`busy`) and `interval-ms` have passed; nil otherwise or
-;; when nothing changed. A file that appears is a change, one that disappears too (its load is refused: no file).
+;; when nothing changed. A file that appears is a change, one that disappears too (its load is refused: no file). A file is reported
+;; only once its stamp is the same in two consecutive scans (the debounce: a file an editor is still writing, caught half-written, is
+;; not loaded and refused; its change is reported at the first scan after the writes stop), and then once: the stamp is noted as acted on.
 (defun poll (w: Watch ld: ll/Loads cid: i64 busy: bool) -> (Option Changes)
   (if (or (not (= @(. w conn) cid)) (or busy (< (inc/ms-since @(. w at)) interval-ms)))
       nil
-      (let ((before @(. w seen)) (now (scan w ld)) (mods (module-files ld)))
-        (do (set! (. w seen) now) (set! (. w at) (sys-clock-now))
-            (let ((changed (vec (sort (filterv (fn (f: str) (match (get before f) ((some b) (not (same? b (unwrap-or (get now f) missing)))) (nil true)))
-                                               (vec (keys now)))))))
+      (let ((seen @(. w seen)) (prev @(. w last)) (now (scan w ld)) (mods (module-files ld)))
+        (let ((changed (vec (sort (filterv (fn (f: str) (let ((st (unwrap-or (get now f) missing)))
+                                                          (and (settled? prev f st) (match (get seen f) ((some b) (not (same? b st))) (nil true)))))
+                                           (vec (keys now)))))))
+          (do (set! (. w last) now) (set! (. w at) (sys-clock-now))
+              (set! (. w seen) (reduce (fn (acc: (Map str Stamp) f: str) (assoc acc f (unwrap-or (get now f) missing))) seen changed))
               (if (empty? changed)
                   nil
                   (some (Changes (filterv (fn (f: str) (includes? f mods)) changed) (filterv (fn (f: str) (not (includes? f mods))) changed)))))))))
+
+;; Whether file `f`'s stamp `st` is the one the previous scan saw.
+(defun settled? :private (prev: (Map str Stamp) f: str st: Stamp) -> bool
+  (match (get prev f) ((some p) (same? p st)) (nil false)))
 
 ;; ---- events
 

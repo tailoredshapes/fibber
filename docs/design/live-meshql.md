@@ -646,7 +646,9 @@ every second in the background, all 200 or 404/410, none refused). What it does 
   3.8: (a) **no thread**: the poll runs on the attach thread in the watching connection's loop, which already wakes every 250 ms, at most
   once per 200 ms and never while a test runs (a change made meanwhile is seen when the run ends); a scan is one `stat` per file (inode,
   size, modification time with nanoseconds; the `struct stat` offsets of Linux and Darwin), so it does not hold the attach thread
-  (`status` is answered while watching), and nothing of the session crosses a thread. (b) **The files**: the session's live module files
+  (`status` is answered while watching), and nothing of the session crosses a thread. A change is acted on only when the file's stamp
+  is the same in two consecutive scans (the debounce, added by the live bugs' fix: before it a file caught half-written was loaded,
+  refused, then loaded again), so a change is seen one scan (about 250 ms) later. (b) **The files**: the session's live module files
   (serve.liveload's copies, the main file among them) and the regular files under the `dirs` (depth first, dot names skipped: an
   editor's temporary files); a file in the `dirs` that is not a module file is a "feature file": its change reruns without a load. No
   default directory: `:watch on` alone watches the module files. (c) **The events** are the answers with an `event` field first:
