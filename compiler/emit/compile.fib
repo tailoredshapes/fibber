@@ -89,21 +89,40 @@
           (do (set! (. p inits) saved) t)))))
 
 ;; The module of the program once the bodies are emitted: without what nothing reaches (emit.prune), and with the initialisers of the `def`s made at run time
-;; that stay.
-(defun finished :private (p: Program defs-items: (Vec la/LItem) entry: str executable: bool) -> Module
-  (if (prune?)
+;; that stay. With `keep-all` nothing is pruned: the bodies `compile-module-with` was asked for are not reached by `main`.
+(defun finished :private (p: Program defs-items: (Vec la/LItem) entry: str executable: bool keep-all: bool) -> Module
+  (if (and (prune?) (not keep-all))
       (let ((r (pr/prune-parts (module-parts p defs-items) (main-roots p entry executable) @(. p inits))))
         (do (set! (. p inits) (. r snd))
             (Module (. r fst) (main-part p entry executable) nil)))
       (Module (module-parts p defs-items) (main-part p entry executable) nil)))
 
+;; A body a live session asks for whether or not `main` reaches it (compiler/live): the function's name as the program knows it, and
+;; whether the all-owned closure body (`f.NAME.owned`, types §8.4) is meant rather than the function's own. A name the program has no
+;; function of is skipped.
+(defstruct BodyRequest (name: str owned: bool))
+
+;; The bodies of `requests` queued.
+(defun request-all :private (q: Program typed: TypedProgram requests: (Vec BodyRequest)) -> unit
+  (doseq [r requests]
+    (match (program-fun typed (. r name))
+      (nil ())
+      ((some f) (do (program-request q (if (. r owned) (BodyAllOwned f) (BodyFun f)) []) ())))))
+
 ;; The Module of a program that has a `main`, planned, with its defs made and its entry requested. Rust: compile.rs:60 compile_module
 ;; The entry's name is the same whenever it is requested (names carry no counter): a module that stops at the defs knows it.
 (defun compile-module (typed: TypedProgram owned: OwnedProgram executable: bool) -> (Result Module str)
+  (compile-module-with typed owned executable nil []))
+
+;; As `compile-module`, numbered in `tables` when given (emit.program `program-new-with`: a live session's, shared by every program of
+;; the session) and with the bodies of `requests` emitted whether or not `main` reaches them (then nothing is pruned): a live session's
+;; functions are called by code that is already resident, not by this program's `main`.
+(defun compile-module-with (typed: TypedProgram owned: OwnedProgram executable: bool tables: (Option Tables) requests: (Vec BodyRequest))
+    -> (Result Module str)
   (match (program-fun typed "main")
     (nil (Err "the program has no main"))
     ((some main)
-     (let ((p (emit.program/program-new typed owned)))
+     (let ((p (emit.program/program-new-with typed owned tables)))
        (try-let ((_ (inits-plan p)))
          (match (make-defs-at p)
            ((Err m) (pending-or-error p (body-name (program-g p) (BodyFun main) []) executable m))
@@ -111,9 +130,10 @@
             (do (set! (. q def-values) (merge @(. q def-values) @(. defs values)))
                 (inits-request q)
                 (host-kernel-table q)
+                (request-all q typed requests)
                 (let ((entry (program-request q (BodyFun main) [])))
                   (match (emit-all q)
-                    ((Ok _) (verified q defs (finished q @(. defs items) entry executable)))
+                    ((Ok _) (verified q defs (finished q @(. defs items) entry executable (not (empty? requests)))))
                     ((Err m) (pending-or-error q entry executable m))))))))))))
 
 ;; The module's `(target (cpu ..) (features ..))` form (spec/lir.md 4.5) for the target the front end was told: the CPU the checker chose its lane
@@ -247,6 +267,11 @@
     (cond (tt/kernel-triple? (sys-getenv "FIB_TARGET_TRIPLE")) (compile-kernels typed owned)
           (empty? (export-specs)) (compile-module typed owned true)
           :else (compile-library typed owned (export-specs)))))
+
+;; The executable's module (the host, no kernels, no exports) numbered in a live session's `tables`, with the bodies of `requests`
+;; (`compile-module-with`).
+(defun compile-executable-ast-with (typed: TypedProgram owned: OwnedProgram tables: (Option Tables) requests: (Vec BodyRequest)) -> (Result Emitted str)
+  (finished-product typed (compile-module-with typed owned true tables requests)))
 
 (defun compile-executable (typed: TypedProgram owned: OwnedProgram) -> (Result str str)
   (try-let ((m (compile-executable-ast typed owned))) (Ok (emitted-text m))))

@@ -47,14 +47,36 @@
                                               (vals (. body calls)))))
                          (vals (. owned bodies))))))
 
+;; The id tables a program numbers its objects and statics in: the type ids (`fib.types`' rows, read by `fib.release` and every walker)
+;; and the names of strings, keywords, immortal closures and vtables (`str.N`, `clo.N`). They are plain literals in the emitted code,
+;; given out in the order of first use, so two programs that differ in one body disagree on them. A live session (compiler/live) gives
+;; every program of the session the same `Tables`: a type or static already numbered keeps its number and a new one is appended
+;; (compiler/live/FINDINGS.md says what broke without this). A program made with `program-new` has tables of its own.
+(defstruct Tables (objects: Objects statics: Statics))
+
+(defun tables-new () -> Tables (Tables (objects-new) (statics-new)))
+
+;; The statics of a program numbered in `shared`: the same strings, keywords, closures and vtables (the cells are shared, so an
+;; addition is seen by every program of the session), and `items` of the program's own (the module-level items written in full by name:
+;; the slots of live mode, the kernel table, the gpu windows belong to one module).
+(defun shared-statics :private (shared: Statics) -> Statics
+  (Statics (. shared strings) (. shared string-index) (. shared keywords) (. shared keyword-index) (. shared keywords-sealed)
+           (. shared closures) (. shared closure-index) (. shared vtables) (. shared vtable-index) (cell []) (cell (set-empty))))
+
 ;; `str` is type id 0: the literals need it before any body runs; the runtime's own text names the byte array and the weak box.
 ;; (E2 wrote this and the object functions below, which `--layout` needs; E3 owns the rest of this module.)
 ;; Rust: program.rs:60 Program::new
 (defun program-new (typed: TypedProgram owned: OwnedProgram) -> Program
-  (let ((p (Program typed owned (objects-new) (statics-new) (queue-new) (cell []) (cell 0) (cell []) (cell [])
+  (program-new-with typed owned nil))
+
+;; A program numbered in `tables` when given (a live session's), else in tables of its own.
+(defun program-new-with (typed: TypedProgram owned: OwnedProgram tables: (Option Tables)) -> Program
+  (let ((p (Program typed owned (match tables ((some t) (. t objects)) (nil (objects-new)))
+                    (match tables ((some t) (shared-statics (. t statics))) (nil (statics-new)))
+                    (queue-new) (cell []) (cell 0) (cell []) (cell [])
                     (cell (map-empty)) (cell (map-empty)) (cell (map-empty)) (cell []) (cell 0) (cell false)
-                    (cell (map-empty)) (cell []) (cell false) (program-unwinds? typed owned) (cell (os/target-pointer-bytes))
-                    (runtime-items-target) (runtime-items-host) (cell []))))
+                    (cell (map-empty)) (cell []) (cell false) (program-unwinds? typed owned)
+                    (cell (os/target-pointer-bytes)) (runtime-items-target) (runtime-items-host) (cell []))))
     (do (objects-intern (. p objects) "fib.str" "str" ObStr)
         (objects-intern (. p objects) "fib.array.i8" "(Array i8)" (ObArray LirI8))
         (objects-intern (. p objects) "fib.weakbox" "weak box" ObWeak)
