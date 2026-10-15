@@ -188,9 +188,9 @@ out, r = terminal(a.sock, [':test --format json', ':test --timeout 3', ':test --
 matches('the client refuses the three words', out, [r'; attached to .*', r'; the report is rendered here.*', r'; a hung scenario cannot be killed.*', r'; fork isolation is refused.*', r'; unknown word --bogus.*'])
 
 # ---- a step edit: a spec function made at the REPL, one scenario reading a def made there, run as `suites`; the step's text edited
-# (the function defined again: a swap) and the rerun shows the edit: the registry (the closures) is made again by every run.
-# Last, because after a swap of a function that makes closures a call of the base's closures crashes the app (an LV2 defect found by
-# this test; the scratch probe `edited-then-base`: reported, not fixed here)
+# (the function defined again: a swap) and the rerun shows the edit: the registry (the closures) is made again by every run. Then the
+# base's own spec once more: a swap of a function whose program quotes a form (`expect`) once broke every later cut of the base's
+# `specs` (the per-program `@q.N` exported by the split; quotes.py pins it in full)
 gen = c.ask(op='status')['generation']
 d = c.eval('(def limit: (Atom i64) (atom 10))')
 check('a def at the REPL', d.get('ok') and d.get('defined') == ['limit'], d)
@@ -203,6 +203,9 @@ check('the step edited: the spec function swapped', s.get('ok') and s.get('swapp
 t = c.ask(op='test', last=True)
 check('the edited step runs on the rerun', t.get('ok') is True and statuses(t) == ['fail'] and row(t, 'reads the REPL def')['steps'][-1]['expected'] == '12' and row(t, 'reads the REPL def')['steps'][-1]['actual'] == '10', t)
 check('the REPL def changed, the step sees it', c.eval('(reset! limit 12)').get('ok') and statuses(c.ask(op='test', last=True)) == ['pass'])
+t = c.ask(op='test', only='a-positive-number')
+check('the base spec after the step edit: its scenario runs', t and t.get('ok') is True and statuses(t) == ['pass'], t)
+check('the base scenario\'s run after the step edit answers', c.value('(count ((. (nth (. (nth (specs) 0) scenarios) 0) run) 1))') == '2' and a.alive(), a.stderr()[-200:])
 
 # ---- the end of the program through the socket
 check('stop', c.eval('(reset! stop true)').get('ok'))

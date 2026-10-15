@@ -1,0 +1,34 @@
+(ns main (:require [serve.livetable :as lt] [emit.program :as ep] [emit.statics :as st]))
+;; The names of the live table (serve.livetable) and the statics numbered per program (emit.statics `program-static?`): a nested closure
+;; literal (`l.l.CODE.gK.N.M`) carries its generation and its family as the outer one does, a library literal and a table-append function
+;; carry none, and a quoted form `q.N` is a program's own static as a closure constant and a vtable are, while a string, a constant def
+;; and a slot are the session's. Built and run by compiler/tests/live/quotes.sh (no LLVM). Exit 0 when every check holds.
+(defun check (name: str ok: bool) -> i64
+  (do (println (str (if ok "ok " "FAIL ") name)) (if ok 0 1)))
+
+(defun index () -> (Map str str)
+  (lt/family-index {"f.edited" [(ep/LiveBody "f.edited" (some "edited") false false nil [])]}))
+
+(defun checks-names () -> i64
+  (+ (check "a literal stripped to its body" (= (lt/strip-literal "l.f.edited.g1.31411") "f.edited.g1"))
+     (+ (check "a nested literal stripped to its body" (= (lt/strip-literal "l.l.f.edited.g1.31411.31401") "f.edited.g1"))
+        (+ (check "a body is left as it is" (= (lt/strip-literal "f.edited.g1") "f.edited.g1"))
+           (+ (check "the generation of a literal" (= (lt/generation-number "l.f.edited.g1.31411") (some 1)))
+              (+ (check "the generation of a nested literal" (= (lt/generation-number "l.l.f.edited.g1.31411.31401") (some 1)))
+                 (+ (check "a library literal has no generation" (nil? (lt/generation-number "l.f.fib.test.core.flat.20521")))
+                    (+ (check "a table-append function has no generation" (nil? (lt/generation-number "live.types.append.5")))
+                       (+ (check "the family of a nested literal" (= (lt/family-of-name (index) "l.l.f.edited.g1.31411.31401") (some "f.edited")))
+                          (check "a library literal has no family" (nil? (lt/family-of-name (index) "l.f.fib.test.core.flat.20521"))))))))))))
+
+(defun checks-statics () -> i64
+  (+ (check "a quoted form is the program's own" (st/program-static? "q.8"))
+     (+ (check "a closure constant is the program's own" (st/program-static? "clo.0"))
+        (+ (check "a vtable is the program's own" (st/program-static? "vt.1"))
+           (+ (check "a string is the session's" (not (st/program-static? "str.8")))
+              (+ (check "a constant def is the session's" (not (st/program-static? "def.3")))
+                 (check "a slot is the session's" (not (st/program-static? "live.f.edited")))))))))
+
+(defun main () -> i64
+  (let ((bad (+ (checks-names) (checks-statics))))
+    (do (println (str "unit-livetable: " (if (= bad 0) "ok" (str bad " failed"))))
+        bad)))

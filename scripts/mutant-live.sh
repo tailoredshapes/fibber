@@ -73,13 +73,17 @@
 #                        (LT2, 3.2 step 1: it answers nothing yet and goes back to its socket)     two-second scenario is not answered in 100 ms)
 #   sink-shared-run      two runs at once: the `busy` refusal is gone and both write the session's compiler/tests/live/test.sh (the second `test`
 #                        one report file (LT2, 3.2: one test at a time)                             during the run is started, not refused `busy`)
+#   quote-shared         a quoted form `@q.N` is not a static numbered per program (emit.statics  compiler/tests/live/quotes.sh (a spec function
+#                        `program-static?`): the split exports a swap's quotes with the data, the    swapped at the REPL, then a base scenario's `run`:
+#                        next input's cut declares its own `q.N` from the base and reads another   the app dies at 0xe; `specs` swapped to one
+#                        program's form (docs/design/live-meshql.md 10)                            binding answers `no match clause matched`)
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-live-MODE),
 #              MUT_QUICK=1 runs stubs.sh --quick (hello's golden and the deep recursion; no case tables: kills both mutants in under a minute after the build)
 #              and stress.sh --quick (100 swaps).
 # A mutant of lib/ alone (sink-ignored, override-ignored) builds nothing: the case's `roots:` header names the copy's lib, and FIBC runs it.
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|quote-shared}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -138,6 +142,7 @@ case $MODE in
   sink-shared-run) patch compiler/serve/livetest.fib '  (match @(. t running)
     ((some run) (some (busy r run)))' '  (match (if true nil @(. t running))
     ((some run) (some (busy r run)))' ;;
+  quote-shared) patch compiler/emit/statics.fib '  (or (s/starts-with? name "clo.") (s/starts-with? name "vt.") (s/starts-with? name "q.")))' '  (or (s/starts-with? name "clo.") (s/starts-with? name "vt.")))' ;;
   *) echo "mutant-live: unknown mode $MODE" >&2; exit 2 ;;
 esac
 case $MODE in
@@ -163,6 +168,7 @@ case $MODE in
   defcache-*) what="the defcache test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/defcache.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested) what="the queue test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/queue.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run) what="the live test op's test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/test.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
+  quote-shared) what="the quotes test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/quotes.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   deps-stubbed-by-default|project-paths-not-stubbed) what="the project test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/project.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   *) what="case 8423"  # the case's `roots:` header names ../../lib: run from a copy of cases/stdlib beside the mutated lib
      mkdir -p "$OUT/cases/stdlib"; cp -r "$R"/cases/stdlib/8423-*.fib "$R/cases/stdlib/support" "$OUT/cases/stdlib/"

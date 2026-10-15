@@ -193,8 +193,10 @@ Three additions to `emit.program/Tables`, all written by the base's emit and rea
    or a lazily filled `def` of emit.rt (the runtime text is a constant of the build). Small; goes with LE1.
 3. **Closure and vtable statics shared by name** (LE2): today `statics-closure` names an immortal closure `@clo.N` by the count of the
    program's own `closures` cell and `statics-vtable` names `@vt.N` the same way, so two programs of a session number them differently,
-   which is why `program-tables` gives each program fresh closure and vtable cells and `live.extract/own-static?` copies them into every
-   cut (LV1 note (f)). In live mode (`p.live`) the name is the key instead: `clo.CODE` for the closure whose code is `CODE` (a stub name,
+   which is why `program-tables` gives each program fresh closure and vtable cells and the session copies them into every cut (LV1 note
+   (f); emit.statics `program-static?` is the one predicate: serve.livesess, serve.livesplit and emit.defs.cache read it). A quoted form
+   `@q.N` (emit.program `program-fresh-quote`) is numbered per program the same way and is under the same rule since the swap crash of
+   docs/design/live-meshql.md 10; LE2 shares it by content as it shares the others. In live mode (`p.live`) the name is the key instead: `clo.CODE` for the closure whose code is `CODE` (a stub name,
    resident), `vt.NAME` for the vtable of instance `NAME` (mangled as `emit.names` mangles). Then the cells can be shared, the cut
    declares a static the base has and copies only a new one, and a def value that holds `@clo.f.x.owned` means the same object in every
    program. Plain mode keeps the counters, so a plain emit stays byte-identical (the LV0 guard, `compiler/tests/live/stubs.sh`'s golden).
