@@ -1,17 +1,17 @@
-;; spec: docs/design/live-meshql.md 3.2 (the argv override and the report sink); package LT1
+;; spec: docs/design/live-meshql.md 3.2 (the argv and the report sink of a live run); package LT1
 ;; expect: accept
 ;; result: 0
 ;; audit: clean
 ;; stage: 2
 ;; roots: ../../lib support
-;; covers: fib.test argv-override report-sink
-;; A live session runs a spec's `main` with the words `fibc test` would pass a child and reads the report from a buffer: `argv-override` stands in for
-;; `(args)` and `report-sink` for standard output (lib/fib/test/run.fib, the hooks). Three scenarios; the override selects one (`--only x --format json`) and
-;; the sink collects the document: fib.test's JSON (schema 1) for that one passing scenario, from its summary to its last byte, status 0. With both hooks
-;; cleared, `run-main` reads `(args)` again (the case has none: every scenario runs, plain format, printed), which the children of `fibc test` rely on.
-;; compiler/tests/live/hooks.sh compares the collected document with the one a child prints, and checks a selection that matches nothing (status 2,
-;; nothing in the sink): that one writes its message to standard error, which this audited case must not do (a write to fd 2 can split a buffered trace
-;; line, and the audit then reports a free of an object it never saw allocated).
+;; covers: fib.test run-main-into
+;; A live session runs a spec's suites with the words `fibc test` would pass a child and reads the report from a buffer: `run-main-into` takes both as
+;; parameters, the words in place of `(args)` and a sink in place of standard output (lib/fib/test/run.fib; a library keeps no state, docs/adr/0013).
+;; Three scenarios; the words select one (`--only x --format json`) and the sink collects the document: fib.test's JSON (schema 1) for that one passing
+;; scenario, from its summary to its last byte, status 0. `run-main` afterwards reads `(args)` as before (the case has none: every scenario runs, plain
+;; format, printed), which the children of `fibc test` rely on. compiler/tests/live/hooks.sh compares the collected document with the one a child prints,
+;; and checks a selection that matches nothing (status 2, nothing in the sink): that one writes its message to standard error, which this audited case
+;; must not do (a write to fd 2 can split a buffered trace line, and the audit then reports a free of an object it never saw allocated).
 ;; Mutants (scripts/mutant-live.sh): sink-ignored (the document is printed and the buffer stays empty: result 2), override-ignored (`(args)` is read: the
 ;; three run in plain format into the buffer: result 2).
 (ns main (:use fib.core fib.seq fib.coll fib.print fib.test.core fib.test.run))
@@ -21,11 +21,6 @@
     (scenario "x holds" (given [a 1]) (then (expect = 1 a)))
     (scenario "y holds" (given [b 2]) (then (expect = 2 b)))
     (scenario "z holds" (given [c 3]) (then (expect = 3 c)))))
-
-(def buf: (Atom str) (atom ""))
-
-(defun collect (text: str) -> unit
-  (do (swap! buf (fn (s: str) (str s text))) ()))
 
 (def head: str "{\"schema\":1,\"seed\":1,\"summary\":{\"total\":1,\"pass\":1,\"fail\":0,\"trap\":0,\"timeout\":0},\"results\":[{\"suite\":\"Hooks\",\"impl\":\"\",\"id\":\"Hooks/x-holds\",\"text\":\"x holds\",\"covers\":[],\"status\":\"pass\"")
 
@@ -42,10 +37,6 @@
         :else 0))
 
 (defun main () -> i64
-  (do (reset! report-sink (some collect))
-      (reset! argv-override (some ["--only" "x" "--format" "json"]))
-      (let ((st1 (run-main (specs)))
-            (doc @buf))
-        (do (reset! argv-override nil)
-            (reset! report-sink nil)
-            (judge st1 doc (run-main (specs)))))))
+  (let ((buf (atom ""))
+        (st1 (run-main-into (specs) ["--only" "x" "--format" "json"] (fn (text: str) (do (swap! buf (fn (s: str) (str s text))) ())))))
+    (judge st1 @buf (run-main (specs)))))

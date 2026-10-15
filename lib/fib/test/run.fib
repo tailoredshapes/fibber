@@ -1,7 +1,7 @@
 ;; fib.test.run: the runner and the reporters of fib.test (docs/design/test-harness.md §4, §5). `run-main` takes the suites of a spec
 ;; file and the command line (`--only SUBSTR`, `--seed N`, `-j N`, `--format plain|json`, `--list`, `--no-isolate`, `--timeout SECS`)
 ;; and returns the exit status: 0 every scenario held, 1 one did not, 2 the command line or a selection that matches nothing. A live
-;; session reads the words from `argv-override` and writes the report through `report-sink` (the hooks, below) instead.
+;; session gives the words and a sink for the report to `run-main-into` instead.
 ;;
 ;; ISOLATION. A failed `expect` is a value (`Broke`) and never stops anything. A trap is the scenario's own, and there are two ways to keep it
 ;; from ending the run (`--isolate`):
@@ -168,23 +168,10 @@
       (do (loop ((i @emitted)) (if (< i (count all)) (do (stream (nth all i)) (recur (+ i 1))) ()))
           all))))
 
-;; ---- the hooks of a live session (docs/design/live-meshql.md 3.2, package LT1) ---------------------------------------------------------
-
-;; The command line `run-main` reads instead of `(args)` when set: a live session's `test` op sets it to the words `fibc test` would pass
-;; a child and calls the spec's `main`, whose files stay as they are. A program may set it itself; `fibc test`'s children never do.
-(def argv-override: (Atom (Option (Vec str))) (atom nil))
-
-;; Where the report goes instead of standard output when set: the rows as `streamer` makes them, the document `report` writes, the
-;; `--list` listing. Process-wide, so one run at a time is a rule of the session, not a limitation of the runner.
-(def report-sink: (Atom (Option (fn :send (str) unit))) (atom nil))
-
-;; `text` to the sink, or printed.
-(defun emit-report (text: str) -> unit
-  (match @report-sink
-    (nil (print text))
-    ((some sink) (sink text))))
-
 ;; ---- reporters --------------------------------------------------------------------------------------------------------------------
+;; Every byte of a report goes through `out`, the sink `run-main-into` is given: standard output for `fibc test`'s children (`run-main`,
+;; `run-main-with`), a buffer for a live session's `test` op (docs/design/live-meshql.md 3.2, package LT1). A parameter, not a global:
+;; a library keeps no state (docs/adr/0013).
 
 (defun pad :private (s: str w: i64) -> str
   (loop ((o s)) (if (< (str-len o) w) (recur (str o " ")) o)))
@@ -227,12 +214,12 @@
 
 ;; The row printed as it is made, the head of its group first when the group changes: the same text as `plain-rows` makes when the
 ;; suites of one head are next to each other, which they are in a spec file.
-(defun streamer (o: SpecOpts) -> (fn (ScenarioRow) unit)
+(defun streamer (o: SpecOpts out: (fn (str) unit)) -> (fn (ScenarioRow) unit)
   (let ((last (cell "#none#")))
     (fn (r: ScenarioRow)
       (if (= (. o format) "plain")
-          (do (if (= (label r) @last) () (do (emit-report (str (label r) "\n")) (set! last (label r))))
-              (emit-report (str "  " (row-plain r))))
+          (do (if (= (label r) @last) () (do (out (str (label r) "\n")) (set! last (label r))))
+              (out (str "  " (row-plain r))))
           ()))))
 
 (defun plain-summary (rows: (Vec ScenarioRow) seed: i64) -> str
@@ -335,30 +322,37 @@
                 (= a "--no-isolate") (recur (+ i 1) (assoc m "isolate" "none"))
                 :else (Err (str "unknown argument " a)))))))
 
-(defun report :private (rows: (Vec ScenarioRow) o: SpecOpts) -> i64
-  (do (emit-report (cond (= (. o format) "json") (json rows (. o seed))
-                         (= (. o format) "tap") (tap rows (. o seed))
-                         :else (plain-summary rows (. o seed))))
+(defun report :private (rows: (Vec ScenarioRow) o: SpecOpts out: (fn (str) unit)) -> i64
+  (do (out (cond (= (. o format) "json") (json rows (. o seed))
+                 (= (. o format) "tap") (tap rows (. o seed))
+                 :else (plain-summary rows (. o seed))))
       (if (= (count (filter (fn (r: ScenarioRow) (not (or (= (. r status) "pass") (= (. r status) "skip")))) rows)) 0) 0 1)))
 
-(defun run-forked-in :private (js: (Vec ScenarioJob) o: SpecOpts) -> i64
+(defun run-forked-in :private (js: (Vec ScenarioJob) o: SpecOpts out: (fn (str) unit)) -> i64
   (match (os/create-temp-directory (str (os/temp-directory) "/fibtest-XXXXXX"))
     ((Err _) (do (eprintln "fibc test: cannot make a scratch directory") 2))
-    ((Ok tmp) (let ((rows (run-forked js tmp (. o jobs) (. o secs) (streamer o))))
+    ((Ok tmp) (let ((rows (run-forked js tmp (. o jobs) (. o secs) (streamer o out))))
                 (do (os/remove-directory tmp)
-                    (report rows o))))))
+                    (report rows o out))))))
 
-(defun run-jobs :private (js: (Vec ScenarioJob) o: SpecOpts) -> i64
-  (cond (= (. o isolate) "none") (let ((st (streamer o))) (report (mapv (fn (j: ScenarioJob) (let ((r (run-here j))) (do (st r) r))) js) o))
-        (= (. o isolate) "task") (report (run-tasks js (. o jobs) (streamer o)) o)
-        :else (run-forked-in js o)))
+(defun run-jobs :private (js: (Vec ScenarioJob) o: SpecOpts out: (fn (str) unit)) -> i64
+  (cond (= (. o isolate) "none") (let ((st (streamer o out))) (report (mapv (fn (j: ScenarioJob) (let ((r (run-here j))) (do (st r) r))) js) o out))
+        (= (. o isolate) "task") (report (run-tasks js (. o jobs) (streamer o out)) o out)
+        :else (run-forked-in js o out)))
 
-;; The whole run of a spec file: its suites and the command line (`(args)`, or `argv-override` when a live session set it).
+;; The whole run of a spec file: its suites and the command line (`(args)`), the report on standard output.
 (defun run-main (suites: (Vec Suite)) -> i64
-  (run-main-with suites (unwrap-or @argv-override (vec (args)))))
+  (run-main-with suites (vec (args))))
 
 ;; The same with the command line given (a spec that is a case passes its own words).
 (defun run-main-with (suites: (Vec Suite) argv: (Vec str)) -> i64
+  (run-main-into suites argv (fn (text: str) (print text))))
+
+;; The same with the report written through `out` instead of standard output: a live session's `test` op gives the words `fibc test`
+;; would pass a child and a buffer (docs/design/live-meshql.md 3.2), and reads the status from the result. Every byte the run prints
+;; goes through `out`: the rows as they are made, the document or the summary, the `--list` listing; a refusal is still a message on
+;; standard error and status 2.
+(defun run-main-into (suites: (Vec Suite) argv: (Vec str) out: (fn (str) unit)) -> i64
   (match (parse-args argv)
     ((Err m) (do (eprintln (str "fibc test: " m)) 2))
     ((Ok o)
@@ -367,5 +361,5 @@
        (cond (not (= (count (set (mapv (fn (j: ScenarioJob) (. (. j sc) id)) all))) (count all)))
                (do (eprintln "fibc test: two scenarios have the same id; give one an (id \"..\")") 2)
              (empty? js) (do (eprintln (str "fibc test: no scenario matches '" (. o only) "'; a run with nothing to run is not a pass")) 2)
-             (. o list) (do (emit-report (list-plain js)) 0)
-             :else (run-jobs js o))))))
+             (. o list) (do (out (list-plain js)) 0)
+             :else (run-jobs js o out))))))

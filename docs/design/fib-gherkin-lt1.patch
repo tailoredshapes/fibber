@@ -1,26 +1,53 @@
-fib-gherkin v0.1.1: the argv override and the report sink of fib.test.run (package LT1 of docs/design/live-meshql.md, section 3.2)
+fib-gherkin v0.1.1: a run with the words and the report sink given (package LT1 of docs/design/live-meshql.md, section 3.2)
 
 Against fib-gherkin v0.1.0 (52e47fcf97007ebd8259b15df9a4fd24ff77f388). fibber's lib/fib/test/run.fib (this change) defines
-`argv-override` (an `(Atom (Option (Vec str)))`: the words a live session's `test` op passes instead of `(args)`), `report-sink`
-(an `(Atom (Option (fn :send (str) unit)))`: where the report goes instead of standard output) and `emit-report` (text to the sink,
-or printed). gherkin.cli `:use`s fib.test.run, so the three names are in scope unqualified. Two hunks: `run` reads the override as
-`fib.test.run/run-main` does, and the `--messages` stream goes through the sink as the report does. Nothing changes for `fibc test`
-(its children never set the atoms). meshql-fib pins v0.1.0 in deps.lock: bump to v0.1.1 after the release.
+`run-main-into suites argv out`: the words `fibc test` would pass a child in place of `(args)`, and a sink `out: (fn (str) unit)`
+in place of standard output for every byte of the report. Parameters, not atoms: a library keeps no state (docs/adr/0013). gherkin.cli
+gets the same shape: `run-into pattern reg argv out` is the general entry, `run-with` and `run` are it with standard output. Nothing
+changes for `fibc test` (`run` still reads `(args)` and prints). meshql-fib pins v0.1.0 in deps.lock: bump to v0.1.1 after the release.
 
 --- a/src/gherkin/cli.fib
 +++ b/src/gherkin/cli.fib
-@@ ;; `--messages`: the run as Cucumber messages on standard output instead of fib.test's report; the status is 0 when every scenario held.
- (defun messages-status (pattern: str reg: (Registry w) o: Opts) -> i64
+@@
+-(defun run-suites (suites: (Vec Suite) reg: (Registry w) argv: (Vec str)) -> i64
++(defun run-suites (suites: (Vec Suite) reg: (Registry w) argv: (Vec str) out: (fn (str) unit)) -> i64
+   (let ((listing (some? (first (filter (fn (a: str) (= a "--list")) argv)))))
+     (if listing
+-        (run-main-with suites argv)
++        (run-main-into suites argv out)
+         (let ((bad (run-all (. reg before-all))))
+           (if (not (= bad ""))
+               (do (eprintln (str "gherkin: a before-all hook failed: " bad)) (run-all (. reg after-all)) 1)
+-              (try (run-main-with suites argv)
++              (try (run-main-into suites argv out)
+                    (finally (let ((after (run-all (. reg after-all))))
+                               (if (= after "") () (eprintln (str "gherkin: an after-all hook failed: " after)))))))))))
+@@
+-(defun run-with (pattern: str reg: (Registry w) argv: (Vec str)) -> i64
++;; The run with the command line and the report's sink given: a live session's `test` op (docs/design/live-meshql.md 3.2) passes the
++;; words `fibc test` would pass a child and a buffer; `run-with` and `run` are this with standard output.
++(defun run-into (pattern: str reg: (Registry w) argv: (Vec str) out: (fn (str) unit)) -> i64
+   (let ((cli (split-cli argv)))
+     (cond (not (empty? (. reg problems))) (do (for-each-line (. reg problems)) 2)
+           :else (match (parse-tags (. cli tags))
+                   ((Err m) (finish m))
+                   ((Ok e) (if (. cli messages)
+-                              (messages-status pattern reg (Opts e (. cli name) (. cli dry)))
++                              (messages-status pattern reg (Opts e (. cli name) (. cli dry)) out)
+                               (match (suites pattern reg (Opts e (. cli name) (. cli dry)))
+                                 ((Err m) (finish m))
+-                                ((Ok ss) (run-suites ss reg (. cli rest))))))))))
++                                ((Ok ss) (run-suites ss reg (. cli rest) out)))))))))
++
++(defun run-with (pattern: str reg: (Registry w) argv: (Vec str)) -> i64
++  (run-into pattern reg argv (fn (text: str) (print text))))
+@@
+-(defun messages-status (pattern: str reg: (Registry w) o: Opts) -> i64
++(defun messages-status (pattern: str reg: (Registry w) o: Opts out: (fn (str) unit)) -> i64
    (match (run-messages pattern reg o)
      ((Err m) (finish m))
 -    ((Ok r) (do (print (. r fst)) (if (. r snd) 0 1)))))
-+    ((Ok r) (do (emit-report (. r fst)) (if (. r snd) 0 1)))))
-@@
--;; Runs the features and returns the exit status, 0 when every scenario held: the body of a spec's `main`.
--(defun run (pattern: str reg: (Registry w)) -> i64 (run-with pattern reg (vec (args))))
-+;; Runs the features and returns the exit status, 0 when every scenario held: the body of a spec's `main`. The command line is `(args)`, or
-+;; `fib.test.run/argv-override` when a live session set it (the `test` op of docs/design/live-meshql.md 3.2).
-+(defun run (pattern: str reg: (Registry w)) -> i64 (run-with pattern reg (unwrap-or @argv-override (vec (args)))))
++    ((Ok r) (do (out (. r fst)) (if (. r snd) 0 1)))))
 
 --- a/deps.fib
 +++ b/deps.fib
@@ -29,7 +56,7 @@ or printed). gherkin.cli `:use`s fib.test.run, so the three names are in scope u
 - :version "0.1.0"
 + :version "0.1.1"
 
-Acceptance in fib-gherkin (a spec under specs/, run by `fibc test`): a program that sets `argv-override` to `["--only" ID "--format" "json"]`
-and `report-sink` to a buffer, calls `(run "features/*.feature" (steps))` and reads the fib.test JSON of that one scenario from the buffer,
+Acceptance in fib-gherkin (a spec under specs/, run by `fibc test`): a program that calls `(run-into "features/*.feature" (steps)
+["--only" ID "--format" "json"] sink)` with a sink that appends to a buffer reads the fib.test JSON of that one scenario from the buffer,
 nothing on standard output; the same with `--messages` reads the message stream from the buffer. The existing specs stay green: nothing
-of `fibc test`'s path changes. Requires a fibber whose lib/fib/test/run.fib has the hooks (the release that carries LT1).
+of `fibc test`'s path changes. Requires a fibber whose lib/fib/test/run.fib has `run-main-into` (the release that carries LT1).

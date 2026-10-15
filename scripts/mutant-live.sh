@@ -16,9 +16,9 @@
 #                        too (LT3, docs/design/live-meshql.md 4)                                      golden's `default:` line gains acme.*)
 #   project-paths-not-stubbed  in a project no module of the project's own is live (only the main    compiler/tests/live/project.sh (the
 #                        module): the project's own bodies are direct calls (LT3)                     golden's lines lose app.core)
-#   sink-ignored         fib.test.run's `report` prints the document instead of writing the sink      cases/stdlib 8423 (the buffer is empty:
-#                        (LT1, docs/design/live-meshql.md 3.2)                                        result 2); compiler/tests/live/hooks.sh
-#   override-ignored     `run-main` reads `(args)` and not `argv-override` (LT1)                      cases/stdlib 8423 (`--only x` not applied:
+#   sink-ignored         fib.test.run's `report` prints the document instead of writing `out`, the   cases/stdlib 8423 (the buffer is empty:
+#                        sink `run-main-into` was given (LT1, docs/design/live-meshql.md 3.2)         result 2); compiler/tests/live/hooks.sh
+#   override-ignored     `run-main-into` parses `(args)` and not the words it was given (LT1)         cases/stdlib 8423 (`--only x` not applied:
 #                                                                                                     three plain rows in the buffer: result 2)
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-live-MODE),
 #              MUT_QUICK=1 runs stubs.sh --quick (hello's golden and the deep recursion; no case tables: kills both mutants in under a minute after the build).
@@ -49,8 +49,8 @@ case $MODE in
   stub-plain-load)  patch compiler/emit/live.fib '(n/node (la/KAtomicLoad la/ScSystem la/OAcquire lt/ty-ptr (n/global slot)))' '(n/load lt/ty-ptr (n/global slot) nil)' ;;
   deps-stubbed-by-default) patch compiler/emit/live.fib '((some names) (or (= m @(. g main)) (contains? names (g-module-name g m))))' '((some names) (mods/sees-implicit (g-module-name g m) (mods/implicit-lib)))' ;;
   project-paths-not-stubbed) patch compiler/emit/live.fib '((some names) (or (= m @(. g main)) (contains? names (g-module-name g m))))' '((some names) (= m @(. g main)))' ;;
-  sink-ignored) patch lib/fib/test/run.fib '(do (emit-report (cond (= (. o format) "json")' '(do (print (cond (= (. o format) "json")' ;;
-  override-ignored) patch lib/fib/test/run.fib '(run-main-with suites (unwrap-or @argv-override (vec (args)))))' '(run-main-with suites (vec (args))))' ;;
+  sink-ignored) patch lib/fib/test/run.fib '(do (out (cond (= (. o format) "json")' '(do (print (cond (= (. o format) "json")' ;;
+  override-ignored) patch lib/fib/test/run.fib '  (match (parse-args argv)' '  (match (parse-args (vec (args)))' ;;
   *) echo "mutant-live: unknown mode $MODE" >&2; exit 2 ;;
 esac
 case $MODE in
