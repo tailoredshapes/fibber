@@ -21,6 +21,9 @@
 #   TSAN_ULIMIT   `ulimit -v` for the instrumented run (default unlimited: TSAN reserves tens of terabytes of address space for its shadow
 #                 memory, so the 16 GB cap of the other tools cannot apply; the real memory is a few times the program's)
 #   TSAN_SED      a sed -E expression applied to the LLVM IR before instrumentation: a PLANTED fault (scripts/tsan-planted.sh)
+#   TSAN_APPEND   a file of lIR appended to the emitted program before it is turned into LLVM IR; the program's `(declare NAME ..)` of each
+#                 function the file defines is dropped (an `extern` of the program that the test, not the runtime, defines:
+#                 compiler/tests/live/stress-swapper.lir)
 #   FIB_LIB       the library directory (default: the tree's lib/)
 #   MALLOC_ARENA_MAX is set to 2 for the runs.
 #
@@ -75,9 +78,17 @@ w=$OUT/work/$name; mkdir -p "$w"; rm -f "$w"/run.*
 # the case's `;; roots:` header names its support directories, relative to the file
 incs=(); for r in $(head -1 < <(sed -n 's/^;; roots:[ \t]*//p' "$prog")); do incs+=(-I "$(cd "$(dirname "$prog")" && cd "$r" 2>/dev/null && pwd)"); done
 (ulimit -v 16000000; "$F" emit "${incs[@]}" "$prog" > "$w/p.lir") 2> "$w/emit.err" || { echo "tsan: emit failed: $(head -3 "$w/emit.err")" >&2; exit 2; }
+if [ -n "${TSAN_APPEND:-}" ]; then
+  [ -f "$TSAN_APPEND" ] || { echo "tsan: no such file to append: $TSAN_APPEND" >&2; exit 2; }
+  for nm in $(sed -n 's/^(define \(internal \)\{0,1\}(\([^ )]*\).*/\2/p' "$TSAN_APPEND"); do sed -i "/^(declare $nm /d" "$w/p.lir"; done
+  cat "$TSAN_APPEND" >> "$w/p.lir"
+fi
 (ulimit -v 16000000; "$lairf" emit-llvm "$w/p.lir" > "$w/p.ll") 2> "$w/llvm.err" || { echo "tsan: emit-llvm failed: $(head -3 "$w/llvm.err")" >&2; exit 2; }
 [ -n "${TSAN_SED:-}" ] && { cp "$w/p.ll" "$w/p.pre.ll"; sed -i -E "$TSAN_SED" "$w/p.ll"; cmp -s "$w/p.ll" "$w/p.pre.ll" && { echo "tsan: TSAN_SED changed nothing" >&2; exit 2; }; }
-sed -E 's/^(define [^{]*) \{$/\1 sanitize_thread {/' "$w/p.ll" > "$w/p.t.ll"
+# every define, the ones whose return type is an aggregate (`{ i64, ptr }`: a catching program's functions, docs/adr/0009) included: the
+# attribute goes before the body's brace, the last on the line (LV3 found `[^{]*` stopping at the type's brace, which left a catching
+# program's own functions uninstrumented; TSAN instruments atomics whatever the attribute, plain accesses only under it)
+sed -E 's/^(define .*) \{$/\1 sanitize_thread {/' "$w/p.ll" > "$w/p.t.ll"
 [ "$(grep -c '^define .*sanitize_thread' "$w/p.t.ll")" -gt 0 ] || { echo "tsan: no define was marked sanitize_thread" >&2; exit 2; }
 "$LLVM/opt" -passes=tsan "$w/p.t.ll" -S -o "$w/p.tsan.ll" && "$LLVM/llc" -O1 -relocation-model=pic -filetype=obj "$w/p.tsan.ll" -o "$w/p.o" \
   && gcc -fsanitize=thread "$w/p.o" -o "$w/p.bin" -lm || { echo "tsan: instrumented build failed" >&2; exit 2; }

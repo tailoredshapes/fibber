@@ -1,8 +1,10 @@
-(ns main (:use fib.http fib.http.server) (:require [fib.unix :as u] [fib.string :as st]))
+(ns main (:use fib.http fib.http.server) (:require [fib.unix :as u] [fib.string :as st] [fib.os.live :as live]))
 ;; The program of compiler/tests/live/swap.sh: an HTTP app of the shape of docs/design/live-repl.md 5 (`main` gives `handle` to
 ;; `run-server` as a value, so the server holds a closure constant made before any swap), with a worker thread calling `work` in a loop
 ;; and counting answers that are neither body's (the swap stress), a generic function used at two types, a method, and a named
 ;; function kept in an atom. The port is `--port N` of its arguments; `main` waits until `stop` is set through the attach socket.
+;; The worker and `main` pass a pause point (fib.os.live) so that compiler/tests/live/stress.sh can pause the program at its server's
+;; own pause points (the accept loop, a kept-alive connection's wait) and retire a swapped `handle`.
 (defrecord Item (id: i64 name: str))
 (defrecord Db (items: (Vec Item)))
 (defprotocol Greet (greet (self) -> str))
@@ -67,6 +69,7 @@
         (let ((r (work n)))
           (do (when (not (or (= r 1) (= r 2))) (swap! bad inc))
               (swap! calls inc)
+              (when (= (rem n 64) 63) (live/pause-point))
               (recur (+ n 1)))))))
 
 (defun port-arg () -> i64
@@ -79,7 +82,7 @@
     ((Ok server)
      (let ((t (spawn (fn () -> i64 (worker)))))
        (do (println (str "app: listening on " (port server)))
-           (loop () (if @stop () (do (u/sleep-ns 20000000) (recur))))
+           (loop () (if @stop () (do (live/pause-point) (u/sleep-ns 20000000) (recur))))
            (let ((n (join t)))
              (do (stop-server server)
                  (println (str "app: stopped after " n " calls, bad " @bad))

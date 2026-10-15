@@ -107,7 +107,7 @@ check('before: root', get(port, '/?name=tom') == (200, 'root tom'))
 
 # ---- transcript 1: edit a handler in a running server (the server holds `handle` as a closure value made at start-up)
 out, r = terminal(a.sock, ['(defun handle (req: Request) -> Response (text-response 200 (str "hello, " (query req "name"))))'])
-matches('transcript 1', out, [r'; attached to .*swap-app\.fib \(pid %d, generation 0, catching\)' % a.p.pid,
+matches('transcript 1', out, [r'; attached to .*swap-app\.fib \(pid %d, generation 0, catching\); \d+ threads, pool \d+ workers' % a.p.pid,
                               r'; swapped handle \(generation 1\): check \d+ ms, emit \d+ ms, jit \d+ ms'])
 check('transcript 1: curl', get(port, '/?name=tom') == (200, 'hello, tom'), get(port, '/?name=tom'))
 check('transcript 1: every path', get(port, '/items/7') == (200, 'hello, '), get(port, '/items/7'))

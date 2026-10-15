@@ -1,0 +1,116 @@
+;; compiler/serve/liveretire.fib: the pause, the quiescence and the retirement of old generations (docs/design/live-repl.md 3.3;
+;; package LV3). The runtime side is rt/live.lir (`fib_live_ctl`, read and told through serve.livesess `ctl`): `pause` asks every
+;; thread of the program to park at its next pause point (fib.os.live `pause-point`: the http server's accept loop and its waits between
+;; requests, an app's idle loop) and waits, up to a timeout, for quiescence: every spawned thread and the program's main thread parked,
+;; the async pool idle, every pool worker asleep with no work anywhere. `retire` at quiescence frees the code of every generation that
+;; no slot names and no parked thread can be in; not at quiescence it refuses. Which generations a parked thread can be in: its stack
+;; is the frames from its entry to the pause point, in program bodies that reach the pause point by direct calls, by closure literals
+;; of their own, by closure constants and vtables they name; the analysis below (`pause-bearing`) follows exactly those references over
+;; the refs the session noted (serve.livesplit `code-refs`) and keeps every generation of such a family. What it does not follow: a
+;; closure or a `dyn` value read from the heap (an atom, a def) and called on the way to the pause point, when the function that made
+;; it was swapped while the thread was parked below it; and a generation whose code part holds a literal, a closure constant or a
+;; vtable is kept whatever its family (serve.livesplit `pins`): a heap value may name it. Both lift with a walk of the heap from the
+;; def slots at quiescence (the type table's trace functions exist) or with stack scanning (3.3), neither built.
+(ns serve.liveretire
+  (:require [serve.livesess :as ls] [serve.livetable :as lt] [fib.string :as s] [fib.unix :as unix]))
+
+;; ---- the runtime's counts
+
+(defstruct Threads (spawned: i64 paused: i64 pausing: bool quiescent: bool workers: i64 active: i64 busy: i64))
+
+(defun count-of :private (sx: ls/Sess op: i64) -> i64 (match (ls/ctl sx op 0) ((Ok n) n) ((Err _) -1)))
+
+;; What the program's threads are doing: the spawned threads alive and how many of them (and main) are parked, whether a pause is
+;; requested and whether the program is quiescent, the pool's live and active workers, the async pool's busy workers.
+(defun threads (sx: ls/Sess) -> Threads
+  (Threads (count-of sx 3) (count-of sx 2) (= (count-of sx 7) 1) (= (count-of sx 4) 1) (count-of sx 6) (count-of sx 5) (count-of sx 9)))
+
+;; What is still running, for a message: `2 spawned threads not at a pause point, pool 3 active`.
+(defun running-text (t: Threads) -> str
+  (let ((unparked (- (+ (. t spawned) 1) (. t paused))))
+    (str-join (vec (interpose ", " (into (if (> unparked 0) [(str unparked (if (= unparked 1) " thread" " threads") " not at a pause point")] [])
+                                         (into (if (> (. t active) 0) [(str "pool " (. t active) " active")] [])
+                                               (if (> (. t busy) 0) [(str "async " (. t busy) " busy")] []))))))))
+
+;; ---- pause and resume
+
+;; The pause requested, then up to `timeout-ms` of waiting (5 ms at a time) for quiescence; the threads as they are at the end. The
+;; request stands whether or not quiescence came: a thread that reaches a pause point later parks there, until `resume`.
+(defun pause (sx: ls/Sess timeout-ms: i64) -> (Result Threads str)
+  (try-let ((_ (ls/ctl sx 0 0)))
+    (let ((limit (+ (sys-clock-now) (* timeout-ms 1000000))))
+      (loop ()
+        (let ((t (threads sx)))
+          (if (or (. t quiescent) (>= (sys-clock-now) limit))
+              (Ok t)
+              (do (unix/sleep-ns 5000000) (recur))))))))
+
+(defun resume (sx: ls/Sess) -> (Result Threads str)
+  (try-let ((_ (ls/ctl sx 1 0))) (Ok (threads sx))))
+
+;; ---- which families a parked thread can be in
+
+(defun sink? :private (name: str) -> bool
+  (or (s/starts-with? name "f.fib.os.live.pause-point") (= name "fib_live_ctl")))
+
+;; The families whose code reaches a pause point: those with a body or literal that names the pause point, then, to a fixed point,
+;; those with a body or literal that names a body, stub or literal of such a family.
+(defun pause-bearing (sx: ls/Sess) -> (Set str)
+  (let ((index (lt/family-index (ls/live-bodies sx))) (refs (vec (ls/refs sx))))
+    (loop ((bearing (set-empty)))
+      (let ((grown (reduce (fn (acc: (Set str) p: (Pair str (Vec str)))
+                             (match (lt/family-of-name index (. p fst))
+                               (nil acc)
+                               ((some family)
+                                (if (or (contains? acc family) (not (reaches? index acc (. p snd)))) acc (conj acc family)))))
+                           bearing refs)))
+        (if (= (count grown) (count bearing)) grown (recur grown))))))
+
+(defun reaches? :private (index: (Map str str) bearing: (Set str) refs: (Vec str)) -> bool
+  (some? (first (filterv (fn (r: str) (or (sink? r) (match (lt/family-of-name index r) ((some f) (contains? bearing f)) (nil false)))) refs))))
+
+;; ---- retirement
+
+;; What a retirement did: the generations removed, the trackers kept (the current generation of each swapped family and the pinned
+;; ones), and the families kept beyond their current generation with the reason (`pause-point`, `closures`).
+(defstruct Retired (removed: i64 kept: i64 pinned: (Vec (Pair str str))))
+
+(defun pin-reason :private (bearing: (Set str) family: str g: lt/Generation) -> (Option str)
+  (cond (contains? bearing family) (some "pause-point")
+        (not (empty? (. g pins))) (some "closures")
+        :else nil))
+
+;; One family's generations: the current one kept, the pinned ones kept and named, the rest removed (serve.livesess `drop-module`).
+(defun retire-family :private (sx: ls/Sess bearing: (Set str) family: str f: lt/Family acc: Retired) -> (Result Retired str)
+  (loop ((gens (. f gens)) (kept []) (r acc))
+    (match (first gens)
+      (nil (do (set! (. sx table) (lt/set-generations @(. sx table) family kept)) (Ok r)))
+      ((some g)
+       (if (= (. g n) (. f generation))
+           (recur (vec (rest gens)) (conj kept g) (Retired (. r removed) (+ (. r kept) 1) (. r pinned)))
+           (match (pin-reason bearing family g)
+             ((some why) (recur (vec (rest gens)) (conj kept g) (Retired (. r removed) (+ (. r kept) 1) (conj (. r pinned) (Pair family why)))))
+             (nil (match (ls/drop-module sx (. g rt) (. g names) (. g noted))
+                    ((Err m) (Err m))
+                    ((Ok _) (recur (vec (rest gens)) kept (Retired (+ (. r removed) 1) (. r kept) (. r pinned))))))))))))
+
+;; Every generation no slot names and no parked thread can be in removed; the caller has established quiescence (`threads`).
+(defun retire (sx: ls/Sess) -> (Result Retired str)
+  (let ((bearing (pause-bearing sx)))
+    (loop ((fams (vec (. @(. sx table) families))) (r (Retired 0 0 [])))
+      (match (first fams)
+        (nil (Ok r))
+        ((some p) (match (retire-family sx bearing (. p fst) (. p snd) r)
+                    ((Err m) (Err m))
+                    ((Ok r2) (recur (vec (rest fams)) r2))))))))
+
+;; The pinned families as a message names them: `handle (pause-point), score (closures)`.
+(defun pinned-text (r: Retired) -> str
+  (str-join (vec (interpose ", " (mapv (fn (p: (Pair str str)) (str (shown (. p fst)) " (" (. p snd) ")")) (dedupe (. r pinned)))))))
+
+(defun shown :private (family: str) -> str (if (s/starts-with? family "f.") (str-slice family 2 (str-len family)) family))
+
+(defun dedupe :private (ps: (Vec (Pair str str))) -> (Vec (Pair str str))
+  (. (reduce (fn (acc: (Pair (Vec (Pair str str)) (Set str)) p: (Pair str str))
+               (if (contains? (. acc snd) (. p fst)) acc (Pair (conj (. acc fst) p) (conj (. acc snd) (. p fst)))))
+             (Pair [] (set-empty)) ps) fst))

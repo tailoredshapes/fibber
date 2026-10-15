@@ -1,0 +1,101 @@
+;; compiler/serve/livesplit.fib: the lIR of one generation in two parts, and what its code refers to (docs/design/live-repl.md 3.3;
+;; package LV3). A swap's cut (live.extract) holds the family's new bodies and whatever of the program the base lacks: new string
+;; and keyword statics, closure literals, closure constants and vtables, the walkers and rows of a type made in the input, and the
+;; stub, slot and generation-0 body of a function the base never reached (dead there, reached by the new body). A resident value may
+;; point at a static (a string literal stored in an atom is the static object), a stub and a slot are named by every later program,
+;; so all of that outlives the code: the CODE part is exactly what carries the swap's generation, the bodies `NAME.gK` and their
+;; literals `l.NAME.gK.N`, with the closure constants that name such a literal; it is added under the generation's tracker, declaring
+;; the rest. The DATA part, everything else, is added to the session for good, exported. A code part that holds a literal or a
+;; closure constant is never retired (`pins`): a heap closure made by the body may still name it, and nothing walks the heap to tell
+;; (the lift is in the design's status). A code part of bodies alone is retired at quiescence (serve.liveretire).
+;; The refs of a module (`code-refs`) are what the pause-point analysis reads: for each body or literal of a stubbed family, the names of
+;; the code and the sinks it reaches directly, with its own statics (per-program names, `clo.N`, `vt.N`) resolved to what they name.
+(ns serve.livesplit
+  (:use lir.ast)
+  (:require [live.extract :as ex] [serve.livetable :as lt] [fib.string :as s]))
+
+;; A body, a method or a closure literal of the program's own.
+(defun code-name? (name: str) -> bool (or (s/starts-with? name "f.") (s/starts-with? name "m.") (s/starts-with? name "l.")))
+(defun literal? (name: str) -> bool (s/starts-with? name "l."))
+;; A static that names code: a closure constant or a vtable, numbered per program.
+(defun code-static? (name: str) -> bool (or (s/starts-with? name "clo.") (s/starts-with? name "vt.")))
+
+(defun item-name (it: LItem) -> str (unwrap-or (ex/item-name it) ""))
+
+;; Whether the item is the code of generation `gen`: a body or literal that carries it, or a code static (numbered per program, so
+;; never exported with the data; a closure constant is a value that may reach the heap, so it pins the generation).
+(defun code-item? :private (gen: i64 it: LItem) -> bool
+  (match it
+    ((ItDefine fd) (= (lt/generation-number (. fd name)) (some gen)))
+    ((ItGlobal g) (code-static? (. g name)))
+    (_ false)))
+
+;; Data that outlives the generation's code: any definition that is not its code.
+(defun data-item? :private (gen: i64 it: LItem) -> bool
+  (and (not (code-item? gen it)) (match it ((ItDefine _) true) ((ItGlobal _) true) (_ false))))
+
+(defun shared-item? :private (it: LItem) -> bool
+  (match it ((ItDeclare _) true) ((ItDeclareGlobal _) true) ((ItStruct _) true) ((ItTarget _) true) (_ false)))
+
+(defun exported :private (it: LItem) -> LItem
+  (match it
+    ((ItDefine fd) (ItDefine (LFunction (. fd name) (. fd ty) (. fd params) (. fd blocks) (LModifiers LkExternal (. (. fd mods) hidden)) (. fd pos))))
+    ((ItGlobal g) (ItGlobal (LGlobalDef (. g name) (. g ty) (. g init) (. g constant) (LModifiers LkExternal (. (. g mods) hidden)) (. g pos) (. g shared))))
+    (_ it)))
+
+(defun declaration :private (it: LItem) -> (Option LItem)
+  (match it
+    ((ItDefine fd) (some (ItDeclare (LDeclare (. fd name) (. fd ty) false 0))))
+    ((ItGlobal g) (some (ItDeclareGlobal (LGlobalDecl (. g name) (. g ty) false 0))))
+    (_ nil)))
+
+(defstruct Split (data: LModule code: LModule pins: (Vec str)))
+
+;; Whether the module defines anything (a part of declarations alone is not added).
+(defun defines? (m: LModule) -> bool
+  (some? (first (filterv (fn (it: LItem) (match it ((ItDefine _) true) ((ItGlobal _) true) (_ false))) (. m items)))))
+
+;; The module of generation `gen` split: the data part (the declarations and structs the cut made, the data items exported) and the
+;; code part (the same declarations and structs, a declaration of each data item, the code items), with the names of the code items
+;; that pin it. When a data item names a code item (a generation-0 body of a newly reached function that uses a closure constant),
+;; nothing is split: everything goes with the code, pinned by what it holds.
+(defun split (m: LModule gen: i64) -> Split
+  (let ((shared (filterv shared-item? (. m items)))
+        (data (filterv (fn (it: LItem) (data-item? gen it)) (. m items)))
+        (code (filterv (fn (it: LItem) (code-item? gen it)) (. m items))))
+    (let ((code-names (reduce (fn (acc: (Set str) it: LItem) (conj acc (item-name it))) (set-empty) code))
+          (pins (filterv (fn (nm: str) (or (literal? nm) (code-static? nm))) (mapv item-name code))))
+      (if (some? (first (filterv (fn (it: LItem) (some? (first (filterv (fn (r: str) (contains? code-names r)) (ex/item-refs it))))) data)))
+          (Split (LModule shared) (LModule (. m items)) (into pins (mapv item-name data)))
+          (Split (LModule (into shared (mapv exported data)))
+                 (LModule (into (into shared (vec (keep declaration data))) code))
+                 pins)))))
+
+;; ---- refs
+
+;; The refs of each code item of `m` (a body, a method, a literal; a module of the base holds the library's too, which the caller
+;; drops by family), the module's own code statics resolved to the names they hold, repetitions and statics removed.
+(defun code-refs (m: LModule) -> (Map str (Vec str))
+  (let ((statics (reduce (fn (acc: (Map str (Vec str)) it: LItem)
+                           (let ((nm (item-name it))) (if (code-static? nm) (assoc acc nm (ex/item-refs it)) acc)))
+                         {} (. m items))))
+    (reduce (fn (acc: (Map str (Vec str)) it: LItem)
+              (let ((nm (item-name it)))
+                (if (and (code-name? nm) (match it ((ItDefine _) true) (_ false)))
+                    (assoc acc nm (resolved statics (ex/item-refs it)))
+                    acc)))
+            {} (. m items))))
+
+;; `refs` with each code static replaced by what it names (a closure constant names a stub or a literal, a vtable names methods),
+;; without repetitions.
+(defun resolved :private (statics: (Map str (Vec str)) refs: (Vec str)) -> (Vec str)
+  (let ((seen (cell (set-empty))) (out (cell [])))
+    (do (walk statics refs seen out) @out)))
+
+(defun walk :private (statics: (Map str (Vec str)) refs: (Vec str) seen: (Cell (Set str)) out: (Cell (Vec str))) -> unit
+  (doseq [r refs]
+    (when (not (contains? @seen r))
+      (do (set! seen (conj @seen r))
+          (match (get statics r)
+            ((some more) (walk statics more seen out))
+            (nil (when (not (code-static? r)) (set! out (conj @out r)))))))))

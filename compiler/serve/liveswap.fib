@@ -94,20 +94,20 @@
 
 (defstruct Swap (made: ls/Made families: (Vec str) gen: i64 jit-ms: i64 patch-ms: i64))
 
-;; One family's bodies of generation `gen` cut out of the program, added under a tracker and kept, each slot patched once the code is
-;; resident; the generation recorded.
+;; One family's bodies of generation `gen` cut out of the program (its statics resident for good, its code under a tracker of its own:
+;; serve.livesess `add-generation`) and kept, each slot patched once the code is resident; the generation recorded with what pins it.
 (defun swap-family :private (sx: ls/Sess made: ls/Made family: str gen: i64) -> (Result (Pair i64 i64) str)
   (let ((pi (ex/index-of (. made m)))
         (names (filterv (fn (nm: str) (some? (get pi (str nm ".g" gen)))) (lt/body-names (ls/live-bodies sx) family))))
     (let ((coded (mapv (fn (nm: str) (str nm ".g" gen)) names)) (t0 (sys-clock-now)))
-      (try-let ((a (ls/add-cut sx (. made m) (mapv (fn (nm: str) (Pair nm nm)) coded) [] []))
+      (try-let ((ap (ls/add-generation sx (. made m) (mapv (fn (nm: str) (Pair nm nm)) coded) gen))
                 (addrs (ti/try-map (fn (nm: str) (ls/address-of sx nm)) coded))
                 (jit-ms (Ok (inc/ms-since t0)))
                 (t1 (Ok (sys-clock-now)))
                 (_ (publish sx names addrs)))
-        (do (ls/keep-module sx a)
-            (set! (. sx table) (lt/add-generation @(. sx table) family (lt/Generation gen (. a rt) (. a name) coded)))
-            (Ok (Pair jit-ms (inc/ms-since t1))))))))
+        (let ((a (. ap fst)) (noted (ls/keep-module sx (. ap fst))))
+          (do (set! (. sx table) (lt/add-generation @(. sx table) family (lt/Generation gen (. a rt) (. a name) coded (. ap snd) noted)))
+              (Ok (Pair jit-ms (inc/ms-since t1)))))))))
 
 ;; The slots of `names` stored with the addresses of their new bodies: a release store each, after every body is resident.
 (defun publish :private (sx: ls/Sess names: (Vec str) addrs: (Vec i64)) -> (Result unit str)

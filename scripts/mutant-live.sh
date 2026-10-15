@@ -9,9 +9,9 @@
 #                        traps `stack overflow` (LV0). A million deep (ownership cases 53, 164) is   golden names the tail jump)
 #                        NOT enough: main's stack (rt/thread.lir) holds a million stub frames
 #   stub-plain-load      the stub reads the slot with a plain load, not an acquire load: a caller     compiler/tests/live/stubs.sh (hello's
-#                        may jump into code the swap has not finished writing (LV0). Until LV2's    golden names the acquire load; LV2's
-#                        swap stress exists this is killed by the text of hello's golden only, not  TSAN run is the kill that matters)
-#                        by a run
+#                        may jump into code the swap has not finished writing (LV0)                 golden names the acquire load) and
+#                                                                                                   stress.sh --tsan-only (the plain load against
+#                                                                                                   the release store is a NEW TSAN report)
 #   deps-stubbed-by-default  in a project the name rule is kept: the libraries' bodies are stubbed   compiler/tests/live/project.sh (the
 #                        too (LT3, docs/design/live-meshql.md 4)                                      golden's `default:` line gains acme.*)
 #   project-paths-not-stubbed  in a project no module of the project's own is live (only the main    compiler/tests/live/project.sh (the
@@ -48,12 +48,19 @@
 #   defcache-verify-blind  FIB_LIVE_EMIT=verify compares nothing (planted with defcache-stale, so   compiler/tests/live/defcache.sh (the verify
 #                        that there is a wrong replay for it to miss)                                app reads the edited module's old values
 #                                                                                                    instead of refusing the input)
+#   retire-without-pause `retire` does not ask whether the program is quiescent: the old generations compiler/tests/live/stress.sh --socket-only
+#                        of `f` are freed under 8 threads and the pool calling it (LV3, 3.3)        (the refusal does not come; the program dies
+#                                                                                                   in freed code: nobody answers the next check)
+#   patch-plain-store    the runtime's `fib.live-patch` (rt/live.lir, the store of a swap) is a     compiler/tests/live/stress.sh --tsan-only (the
+#                        plain store, not a release store: a caller may jump into code the swap    stub's acquire load against a plain store is
+#                        has not finished writing (LV3)                                             a NEW ThreadSanitizer report)
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-live-MODE),
-#              MUT_QUICK=1 runs stubs.sh --quick (hello's golden and the deep recursion; no case tables: kills both mutants in under a minute after the build).
+#              MUT_QUICK=1 runs stubs.sh --quick (hello's golden and the deep recursion; no case tables: kills both mutants in under a minute after the build)
+#              and stress.sh --quick (100 swaps).
 # A mutant of lib/ alone (sink-ignored, override-ignored) builds nothing: the case's `roots:` header names the copy's lib, and FIBC runs it.
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|defcache-stale|defcache-no-items|defcache-verify-blind}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -95,6 +102,8 @@ case $MODE in
   defcache-no-items) patch compiler/emit/defs/cache.fib '                (do (defs-append defs it)' '                (do ()' ;;
   defcache-verify-blind) patch compiler/emit/defs/cache.fib '    ((some e) (if (= (. e source) source) (some e) nil))' '    ((some e) (some e))'
                          patch compiler/emit/defs/jit.fib '        (if (= kept got)' '        (if true' ;;
+  retire-without-pause) patch compiler/serve/live.fib '    (if (not (and (. t pausing) (. t quiescent)))' '    (if false' ;;
+  patch-plain-store) patch compiler/emit/runtime.fib '  (block entry (atomic-store release (inttoptr ptr v) slot) (ret)))' '  (block entry (store (inttoptr ptr v) slot) (ret)))' ;;
   *) echo "mutant-live: unknown mode $MODE" >&2; exit 2 ;;
 esac
 case $MODE in
@@ -109,7 +118,12 @@ esac
 cd "$R" || exit 2
 quick=(); [ "${MUT_QUICK:-}" = 1 ] && quick=(--quick)
 case $MODE in
-  stub-*) what="the stubs test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/stubs.sh" "$F" "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
+  stub-no-tailcall) what="the stubs test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/stubs.sh" "$F" "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
+  stub-plain-load) what="the stubs test and the TSAN stress"
+     FIB_LIB="$R/lib" "$R/compiler/tests/live/stubs.sh" "$F" "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$?
+     TSAN_OUT="$OUT/tsan" FIB_LIB="$R/lib" "$R/compiler/tests/live/stress.sh" "$F" --tsan-only "${quick[@]}" >> "$OUT/test.log" 2>&1 || rc=1 ;;
+  retire-without-pause) what="the socket stress"; FIB_LIB="$R/lib" "$R/compiler/tests/live/stress.sh" "$F" --socket-only "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
+  patch-plain-store) what="the TSAN stress"; TSAN_OUT="$OUT/tsan" FIB_LIB="$R/lib" "$R/compiler/tests/live/stress.sh" "$F" --tsan-only "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
   value-reevaluated|trap-not-caught) what="the attach test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/attach.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored) what="the swap test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/swap.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   defcache-*) what="the defcache test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/defcache.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;

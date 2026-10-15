@@ -3,7 +3,10 @@
 ;; while it runs: one JSON object per line in and out (serve.proto, the shapes of `fibc serve`), a connection open for many requests,
 ;; one request at a time. Ops: `hello`, `eval` (`text`: what `fibc repl` takes; a redefinition of a function is a body swap, serve.liveswap,
 ;; answered `swapped` with the generation and the swap's figures, or refused with a `live/*` code and a `hint`), `type` (`expr`),
-;; `inspect` (`name`; a function's generation and bodies too), `status` (the generation, the generations kept).
+;; `inspect` (`name`; a function's generation and bodies too), `status` (the generation, the generations kept, the threads), and the
+;; pause, resume and retirement of serve.liveretire (package LV3): `pause` (`timeout_ms`, default 5000: the program's threads park at
+;; their pause points; answers whether it is quiescent and what still runs), `resume`, `retire` (at quiescence: the generations no slot
+;; names and no parked thread can be in are freed; otherwise `not-quiescent`).
 ;; Threads: the attach server runs on the driver's thread, which already holds the session (its engine and emitter are single-threaded
 ;; state: a `Cell`-bearing struct cannot be given to `spawn`); the program's `main` runs on a thread of its own (`live.run`: the runtime's
 ;; own main stack, rt/thread.lir `fib.run-main`), which says when it has ended (`done`) and wakes the accept. The design's 2.1 has the
@@ -11,7 +14,7 @@
 ;; the C library (what the program buffered is written). The socket is made before `main` is called, its path printed on standard error
 ;; and set as FIB_LIVE_SOCKET for the program.
 (ns serve.live
-  (:require [serve.livesess :as ls] [serve.liveswap :as lsw] [serve.livetable :as lt] [serve.livesock :as lsk] [serve.sock :as sk] [serve.proto :as p] [serve.incr :as inc] [serve.diag :as dg]
+  (:require [serve.livesess :as ls] [serve.liveswap :as lsw] [serve.livetable :as lt] [serve.liveretire :as lr] [serve.livesock :as lsk] [serve.sock :as sk] [serve.proto :as p] [serve.incr :as inc] [serve.diag :as dg]
             [lsp.json :as j] [driver.native :as native] [driver.version :as v] [native.call :as call] [lair.ffi :as ffi]
             [expand.roots :as roots] [expand.maker :as mk] [fib.unix :as unix] [fib.string :as s]))
 
@@ -26,11 +29,19 @@
 (defun times-json :private (t: ls/Times) -> j/JVal
   (j/json-obj [(Pair "check_ms" (j/json-int (. t check))) (Pair "emit_ms" (j/json-int (. t emit))) (Pair "jit_ms" (j/json-int (. t jit))) (Pair "patch_ms" (j/json-int (. t patch)))]))
 
+;; The program's threads (serve.liveretire): the spawned threads alive and the ones parked at a pause point (main among them), whether
+;; a pause is requested and whether the program is quiescent, the pool's live and active workers, the async pool's busy workers.
+(defun threads-json :private (t: lr/Threads) -> j/JVal
+  (j/json-obj [(Pair "spawned" (j/json-int (. t spawned))) (Pair "paused" (j/json-int (. t paused))) (Pair "pausing" (j/JBool (. t pausing)))
+               (Pair "quiescent" (j/JBool (. t quiescent))) (Pair "pool_workers" (j/json-int (. t workers))) (Pair "pool_active" (j/json-int (. t active)))
+               (Pair "async_busy" (j/json-int (. t busy)))]))
+
 (defun answer-json :private (l: Live r: p/Req a: ls/Answer) -> str
   (match a
     ((ls/Defined names st) (p/response r true [(Pair "defined" (strs names)) (Pair "generation" (j/json-int (lsw/generation (. l sx)))) (Pair "stats" (p/stats-json st))]))
     ((ls/Swapped defined swapped gen t st)
-     (p/response r true [(Pair "defined" (strs defined)) (Pair "swapped" (strs swapped)) (Pair "generation" (j/json-int gen)) (Pair "swap" (times-json t)) (Pair "stats" (p/stats-json st))]))
+     (p/response r true [(Pair "defined" (strs defined)) (Pair "swapped" (strs swapped)) (Pair "generation" (j/json-int gen)) (Pair "swap" (times-json t))
+                         (Pair "threads" (threads-json (lr/threads (. l sx)))) (Pair "stats" (p/stats-json st))]))
     ((ls/Value text st stats)
      (p/response r (= st 0) (into (match text ((some t) [(Pair "value" (j/json-str t))]) (nil []))
                                   [(Pair "exit" (j/json-int st)) (Pair "stats" (p/stats-json stats))])))
@@ -40,8 +51,35 @@
     ((ls/Broken m) (p/error-response r "internal" m))))
 
 (defun op-hello :private (l: Live r: p/Req) -> str
-  (p/response r true [(Pair "pid" (j/json-int (sk/process-id))) (Pair "program" (j/json-str (. (. l sx) file))) (Pair "generation" (j/json-int (lsw/generation (. l sx))))
-                      (Pair "version" (j/json-str v/version)) (Pair "catching" (j/JBool true))]))
+  (let ((t (lr/threads (. l sx))))
+    (p/response r true [(Pair "pid" (j/json-int (sk/process-id))) (Pair "program" (j/json-str (. (. l sx) file))) (Pair "generation" (j/json-int (lsw/generation (. l sx))))
+                        (Pair "version" (j/json-str v/version)) (Pair "catching" (j/JBool true))
+                        (Pair "threads" (j/json-int (. t spawned))) (Pair "pool" (j/json-int (. t workers)))])))
+
+;; `pause`: the program's threads asked to park at their pause points, and up to `timeout_ms` (5000) of waiting for quiescence.
+(defun op-pause :private (l: Live r: p/Req) -> str
+  (match (lr/pause (. l sx) (unwrap-or (p/field-int r "timeout_ms") 5000))
+    ((Err m) (p/error-response r "internal" m))
+    ((Ok t) (p/response r true [(Pair "paused" (j/JBool (. t quiescent))) (Pair "threads" (threads-json t))
+                                (Pair "running" (j/json-str (if (. t quiescent) "" (lr/running-text t))))]))))
+
+(defun op-resume :private (l: Live r: p/Req) -> str
+  (match (lr/resume (. l sx))
+    ((Err m) (p/error-response r "internal" m))
+    ((Ok t) (p/response r true [(Pair "resumed" (j/JBool true)) (Pair "threads" (threads-json t))]))))
+
+;; `retire`: at quiescence (a pause requested and every thread parked, the pools idle) the old generations freed; else refused with
+;; what still runs. The result: `removed`, `kept`, `pinned` (the families kept beyond their current generation, with the reason).
+(defun op-retire :private (l: Live r: p/Req) -> str
+  (let ((t (lr/threads (. l sx))))
+    (if (not (and (. t pausing) (. t quiescent)))
+        (p/error-response r "not-quiescent" (str "not quiescent: " (if (. t pausing) (lr/running-text t) "no pause was requested") "; pause first"))
+        (match (lr/retire (. l sx))
+          ((Err m) (p/error-response r "internal" m))
+          ((Ok rd) (p/response r true [(Pair "removed" (j/json-int (. rd removed))) (Pair "kept" (j/json-int (. rd kept)))
+                                       (Pair "pinned" (j/JArr (mapv (fn (p: (Pair str str)) (j/json-obj [(Pair "function" (j/json-str (. p fst))) (Pair "reason" (j/json-str (. p snd)))])) (. rd pinned))))
+                                       (Pair "pinned_text" (j/json-str (lr/pinned-text rd)))
+                                       (Pair "generation" (j/json-int (lsw/generation (. l sx))))]))))))
 
 (defun op-eval :private (l: Live r: p/Req) -> str
   (match (p/field-str r "text")
@@ -77,6 +115,7 @@
                         (Pair "generations" (j/json-obj [(Pair "count" (j/json-int (+ 1 (lt/generations-kept @(. sx table))))) (Pair "kept" (j/json-int (ls/modules-kept sx)))
                                                          (Pair "functions" (j/json-int (lt/family-count @(. sx table))))]))
                         (Pair "values" (j/json-obj [(Pair "resident" (strs (ls/resident-names sx))) (Pair "count" (j/json-int (count (ls/resident-names sx))))]))
+                        (Pair "threads" (threads-json (lr/threads sx)))
                         (Pair "inputs" (j/json-int (ls/inputs-made sx))) (Pair "requests" (j/json-int @(. l served)))
                         (Pair "pid" (j/json-int (sk/process-id))) (Pair "socket" (j/json-str (. l path)))])))
 
@@ -88,6 +127,9 @@
               (= op "type") (op-type l r)
               (= op "inspect") (op-inspect l r)
               (= op "status") (op-status l r)
+              (= op "pause") (op-pause l r)
+              (= op "resume") (op-resume l r)
+              (= op "retire") (op-retire l r)
               (= op "ping") (p/response r true [(Pair "pong" (j/JBool true))])
               :else (p/error-response r "unknown-op" (str "unknown op `" op "`"))))))
 
