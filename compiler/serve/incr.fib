@@ -5,13 +5,13 @@
 ;; longest prefix of modules it already has and expands the rest. Modules after a changed one are expanded again even when they do not use it: the
 ;; order is the dependency order, and the context after a module is a function of everything before it. Macros: one runner session is kept, and a macro
 ;; is built once for the key of the module that defines it (macros.runner `session-key`), so an edit rebuilds the macros of the modules from it on.
-;; Typing and the ownership pass run on the whole expanded program every time, with the library's units not reached by the main module left unchecked
-;; (types.infer.demand): they are not cached, which is the floor of the loop (section 8.5). A verdict (the diagnostics of `check`) is kept by key, so
-;; a check of text already seen costs the load.
+;; Typing and the ownership pass go through the persistent checker: the implicit library's state is kept once (own.staged) and the state after each of
+;; the program's own modules under the module's key (own.chain, docs/design/persistent-checker.md 8), so a request re-checks the modules from the first
+;; changed one, the last module at least. A verdict (the diagnostics of `check`) is kept by key, so a check of text already seen costs the load.
 (ns serve.incr
   (:require [expand.modules :as mods] [expand.maker :as mk] [expand.roots :as roots] [expand.program :as prog] [expand.libdir :as libdir]
             [macros.runner :as mr] [fib.string :as s] [syntax.reader :as reader] [types.driver :as td] [native.target :as nt] [serve.snap :as snap] [serve.diag :as dg]
-            [expand.shared :as sh] [own.staged :as st] [emit.compile :as ec])
+            [expand.shared :as sh] [own.staged :as st] [own.chain :as ch] [emit.compile :as ec])
   (:use syntax.form expand.types expand.ctx expand.error types.error types.program types.driver own.error own.driver))
 
 (defstruct Entry (ctx: ExpandCtx exp: Expanded))
@@ -154,10 +154,17 @@
            ((Ok c) (Pair (Ok c) lowered))
            ((Err x) (Pair (Err (dg/check-diags file x)) lowered))))))))
 
-;; The same through the persistent checker (own.staged): the first `k` modules (the implicit library, under `key`) are lowered, typed and decided once.
-(defun typecheck-staged :private (e: Engine modules: (Vec Expanded) prelude: (Vec Stx) main: bool file: str target: str k: i64 key: str)
+;; The keys the checker keeps the state after each of the program's modules under (own.chain): the module keys, which cover the text and the
+;; name of the module and of every module before it; never the modules' names alone (scripts/mutant-persist.sh `prefix-key-ignores-text`).
+(defun check-keys :private (keys: (Vec i64) loaded: (Vec Loaded)) -> (Vec str)
+  (mapv show keys))
+
+;; The same through the persistent checker (own.staged, own.chain): the first `k` modules (the implicit library, under `key`) are lowered, typed
+;; and decided once, and the program's own modules before the last are kept under their keys, so a request re-checks the modules from the first
+;; changed one.
+(defun typecheck-staged :private (e: Engine modules: (Vec Expanded) prelude: (Vec Stx) main: bool file: str target: str k: i64 key: str keys: (Vec str))
     -> (Pair (Result Checked (Vec dg/Diag)) i64)
-  (match (st/staged-check (. e memo) key k modules prelude (some (nt/target-info)) main (some (library-flags modules target)))
+  (match (ch/staged-check-chain (. e memo) key k keys modules prelude (some (nt/target-info)) main (some (library-flags modules target)))
     ((Ok c) (Pair (Ok c) 0))
     ((Err x) (Pair (Err (dg/check-diags file x)) 0))))
 
@@ -171,17 +178,17 @@
 
 ;; Typing and ownership of the expanded program. The first `k` modules are the implicit library, `key` its content: when the cache is on (FIB_CHECK_CACHE not
 ;; `off`) their state is the engine's kept one. `verify` checks both ways and answers an internal error when the lIR or the diagnostics differ.
-(defun typecheck :private (e: Engine modules: (Vec Expanded) prelude: (Vec Stx) main: bool file: str target: str k: i64 key: str)
+(defun typecheck :private (e: Engine modules: (Vec Expanded) prelude: (Vec Stx) main: bool file: str target: str k: i64 key: str keys: (Vec str))
     -> (Pair (Result Checked (Vec dg/Diag)) i64)
   (let ((mode (st/cache-mode)))
     (cond (or (= mode "off") (= k 0)) (typecheck-whole modules prelude main file target)
           (= mode "verify")
-          (let ((a (typecheck-staged e modules prelude main file target k key))
+          (let ((a (typecheck-staged e modules prelude main file target k key keys))
                 (b (typecheck-whole modules prelude main file target)))
             (if (= (front-text (. a fst)) (front-text (. b fst)))
                 a
                 (Pair (Err [(dg/diag-nowhere "internal/CheckCache" file "FIB_CHECK_CACHE=verify: the persistent checker and the whole check differ")]) 0)))
-          :else (typecheck-staged e modules prelude main file target k key))))
+          :else (typecheck-staged e modules prelude main file target k key keys))))
 
 ;; What a request asks of the front end: the file (as the diagnostics name it), the file the loader starts from (`start`: the file itself, or for a library module a
 ;; one-line program that requires it), that text, the module roots, whether `main` is required ("yes", "no", "auto": when the file defines it), whether
@@ -260,11 +267,13 @@
     (match (. ex snd)
       ((Err ds) (do (store-verdict e vkey ds)
                     (Front (Err ds) (Stats n (. ex fst) (- n (. ex fst)) false t1 (ms-since t2) 0 0 (ms-since t0)) vkey)))
-      ((Ok modules) (front-typed e j modules prelude main vkey (Stats n (. ex fst) (- n (. ex fst)) false t1 (ms-since t2) 0 0 0) t0 (library-key loaded keys))))))
+      ((Ok modules) (front-typed e j modules prelude main vkey (Stats n (. ex fst) (- n (. ex fst)) false t1 (ms-since t2) 0 0 0) t0 (library-key loaded keys)
+                                 (check-keys keys loaded))))))
 
-(defun front-typed :private (e: Engine j: Job modules: (Vec Expanded) prelude: (Vec Stx) main: bool vkey: str st0: Stats t0: i64 lib: (Pair i64 str)) -> Front
+(defun front-typed :private (e: Engine j: Job modules: (Vec Expanded) prelude: (Vec Stx) main: bool vkey: str st0: Stats t0: i64 lib: (Pair i64 str)
+                             keys: (Vec str)) -> Front
   (let ((t3 (sys-clock-now))
-        (tc (typecheck e modules prelude main (. j file) (. j target) (. lib fst) (. lib snd)))
+        (tc (typecheck e modules prelude main (. j file) (. j target) (. lib fst) (. lib snd) keys))
         (r (. tc fst))
         (t4 (sys-clock-now))
         (st (Stats (. st0 modules) (. st0 reused) (. st0 expanded) false (. st0 load-ms) (. st0 expand-ms) (. tc snd) (- (quot (- t4 t3) 1000000) (. tc snd)) (ms-since t0))))

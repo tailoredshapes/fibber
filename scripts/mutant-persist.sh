@@ -29,13 +29,19 @@
 # against the program's instances. hoisted, known: a method decided ahead of its place is decided again with the same result (only the order of the
 # bodies in the ownership program changes, which the emitter does not read). reelaborate: elaborating a body twice gives the same body.
 #   no-intact-check   own.staged: the control that a run left the kept state alone always says yes (with tables-shared this one must live)
+# The program-prefix memo (own.chain, docs/design/live-repl.md package LV4); the unit program's chain tests and the server control see these:
+#   chain-key-ignored         own.chain: the kept state after a program module is used whatever the key (a stale state answers an edited module)
+#   prefix-key-ignores-text   serve.incr: the keys the chain keeps a program module's state under hold the module's name, not its text (stale)
+# The third control, `server`, runs for the mutants named in SERVER_MUTANTS only: it builds `fibc` from the copy (a minute) and runs the server
+# part of compiler/tests/persist/run.sh with it (a two-module program whose first module is edited must be rejected).
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/.." && pwd)
 fibc=${FIBC:-$root/build/F}
 out=${MUT_OUT:-${TMPDIR:-/tmp}/mutant-persist}
 llvm=${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}
 jobs=${MUT_JOBS:-3}
-all="instance-index expr-counter elab-counter store-nodes resolutions summaries program-takes tables-shared key-ignored key-no-prelude key-no-texts elab-ids"
+all="instance-index expr-counter elab-counter store-nodes resolutions summaries program-takes tables-shared key-ignored key-no-prelude key-no-texts elab-ids chain-key-ignored prefix-key-ignores-text"
+server_mutants=" prefix-key-ignores-text "
 want=("$@"); [ ${#want[@]} -eq 0 ] && want=($all)
 mkdir -p "$out"
 
@@ -65,6 +71,10 @@ M = {
  'elab-ids': ('compiler/types/elab.fib', '(g-next-elab-expr (. el g))', '(g-next-expr (. el g))'),
  'reelaborate': ('compiler/own/staged.fib', '(elaborate-from g (. ck t) (. c funs) (. c defs) (. c insts))', '(elaborate-from g (. ck t) 0 0 0)'),
  'no-intact-check': ('compiler/own/staged.fib', '(or (not (= (cache-mode) "verify")) (= (state-print (. pre lw) (. pre ck)) (. pre print)))', 'true'),
+ 'chain-key-ignored': ('compiler/own/chain.fib', '(match (get @(. m chain) (nth keys (- i 1)))', '(match (first (vals @(. m chain)))'),
+ 'prefix-key-ignores-text': ('compiler/serve/incr.fib', '''(defun check-keys :private (keys: (Vec i64) loaded: (Vec Loaded)) -> (Vec str)
+  (mapv show keys))''', '''(defun check-keys :private (keys: (Vec i64) loaded: (Vec Loaded)) -> (Vec str)
+  (mapv (fn (l: Loaded) (. (. l spec) ns)) loaded))'''),
 }
 f, old, new = M[name]
 p = d + '/' + f
@@ -94,8 +104,16 @@ one() {
     # a clean run of the unmutated tool on the same inputs is the baseline of "failed": any difference from it counts, a changed status too
     if [ "$batch" = lived ] && ! cmp -s "$out/base.out" <(sed "s|$d/lib|$root/lib|g" "$d/batch.out"); then batch=differs; fi   # the copy of lib/ is at another path
   fi
-  if [ "$unit" = lived ] && [ "$batch" = lived ]; then echo "SURVIVED $n (unit: $unit, batch: $batch)"; return 1; fi
-  echo "KILLED $n (unit: $unit, batch: $batch)"
+  local server=not-run
+  if [[ "$server_mutants" == *" $n "* ]]; then
+    server=lived
+    ( cd "$d" && "$fibc" build compiler/fibc.fib -I compiler -I lib -L "$llvm" -l LLVM-21 -o "$d/fibc" > "$d/fibc.build" 2>&1 ) || server=build-error
+    if [ "$server" = lived ]; then
+      ( cd "$root" && PERSIST_OUT=$d/persist timeout 900 "$root/compiler/tests/persist/run.sh" "$d/fibc" server > "$d/server.out" 2>&1 ) || server=failed
+    fi
+  fi
+  if [ "$unit" = lived ] && [ "$batch" = lived ] && [ "$server" != failed ] && [ "$server" != build-error ]; then echo "SURVIVED $n (unit: $unit, batch: $batch, server: $server)"; return 1; fi
+  echo "KILLED $n (unit: $unit, batch: $batch, server: $server)"
 }
 
 # the baseline: the unmutated tool and its output on the inputs of the batch control

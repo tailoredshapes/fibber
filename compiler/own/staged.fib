@@ -43,16 +43,19 @@
                      (map-count @(. t fn-colours)) (count @(. ck order)) (count @(. ck errors)) (count (. lw items))
                      (reduce (fn (a: i64 m: ModuleInfo) (+ a (map-count @(. (. m names) values)))) 0 (table-rows (. g modules)))]))))
 
-;; The memo of one process: the prefix last built, under the key the caller gave it (nil, or a prefix that did not check: `bad`).
-(defstruct Memo (key: (Cell str) prefix: (Cell (Option Prefix)) bad: (Cell str)))
+;; The memo of one process: the prefix last built, under the key the caller gave it (nil, or a prefix that did not check: `bad`), and the
+;; chain (own.chain): the state after each of a program's own modules, under the key of that module (`chain`), and the keys of the modules
+;; that did not check whole (`chain-bad`).
+(defstruct Memo (key: (Cell str) prefix: (Cell (Option Prefix)) bad: (Cell str) chain: (Cell (Map str Prefix)) chain-bad: (Cell (Set str))))
 
-(defun memo-new () -> Memo (Memo (cell "") (cell nil) (cell "")))
+(defun memo-new () -> Memo (Memo (cell "") (cell nil) (cell "") (cell (map-empty)) (cell (set-empty))))
 
 (defun type-stop :private (errs: (Vec TypeError)) -> CheckError (CeType errs))
 
 ;; ---- the first stage
 
-(defun all-funs :private (units: (Vec UnitRef)) -> (Set i64)
+;; The `defun`s and macros of `units`.
+(defun all-funs (units: (Vec UnitRef)) -> (Set i64)
   (reduce (fn (acc: (Set i64) u: UnitRef)
             (match u
               ((UScc fs) (into acc fs))
@@ -122,6 +125,12 @@
 ;; module: whether it is the library's) the units of the library the program cannot reach are left unchecked (types.infer.demand), as `own-check-lowered-with`
 ;; does; the modules of the kept state are checked whole.
 (defun stage-infer (pre: Prefix lw: Lowering main: bool library: (Option (Vec bool))) -> (Result TypedProgram (Vec TypeError))
+  (match (stage-infer-ck pre lw main library)
+    ((Ok r) (Ok (. r fst)))
+    ((Err errs) (Err errs))))
+
+;; `stage-infer` with the checker the program was typed in (the state after the program's modules: own.chain keeps it).
+(defun stage-infer-ck (pre: Prefix lw: Lowering main: bool library: (Option (Vec bool))) -> (Result (Pair TypedProgram Checker) (Vec TypeError))
   (let ((g (. lw g)) (c (. pre cuts)) (ck (checker-copy (. pre ck) (. lw g)))
         (want (match library
                 (nil nil)
@@ -130,7 +139,7 @@
         (when main (checker-check-main ck))
         (if (empty? @(. ck errors))
             (do (elaborate-from g (. ck t) (. c funs) (. c defs) (. c insts))
-                (Ok (program-new g (. ck env) (. ck t) @(. ck order))))
+                (Ok (Pair (program-new g (. ck env) (. ck t) @(. ck order)) ck)))
             (Err @(. ck errors))))))
 
 ;; The ownership pass over the program's units, from the state the library left: the sets of what is taken as a value are the true ones for
@@ -191,11 +200,11 @@
                      library: (Option (Vec bool))) -> (Result Checked CheckError)
   (match (prefix-of m key modules prelude target k true)
     ((Ok pre) (let ((r (stage-check pre modules main library)))
-                (if (intact? pre) r (Err (CeInternal "FIB_CHECK_CACHE=verify: a run changed the kept library state")))))
+                (if (prefix-intact? pre) r (Err (CeInternal "FIB_CHECK_CACHE=verify: a run changed the kept library state")))))
     ((Err _) (check-whole modules prelude target main library))))
 
 ;; Whether the kept state is as it was made (the control of FIB_CHECK_CACHE=verify; otherwise true without looking).
-(defun intact? :private (pre: Prefix) -> bool
+(defun prefix-intact? (pre: Prefix) -> bool
   (or (not (= (cache-mode) "verify")) (= (state-print (. pre lw) (. pre ck)) (. pre print))))
 
 ;; `check-modules` (types only) the same way: the typed program, or the errors of lowering and inference.
@@ -205,7 +214,7 @@
      (match (stage-lower pre modules)
        ((Err errs) (Err errs))
        ((Ok lw) (let ((r (stage-infer pre lw main nil)))
-                  (if (intact? pre) r (Err [(type-error-other (builtin-pos) "FIB_CHECK_CACHE=verify: a run changed the kept library state")]))))))
+                  (if (prefix-intact? pre) r (Err [(type-error-other (builtin-pos) "FIB_CHECK_CACHE=verify: a run changed the kept library state")]))))))
     ((Err _)
      (match (lower-modules modules prelude)
        ((Err errs) (Err errs))
@@ -238,8 +247,12 @@
     ((some "verify") "verify")
     (_ "on")))
 
-;; Whether the state the memo keeps is as it was made (the programs checked through it did not change it).
+;; Whether the state the memo keeps, the library's and the chain's, is as it was made (the programs checked through it did not change it).
 (defun memo-intact? (m: Memo) -> bool
-  (match @(. m prefix)
-    ((some pre) (= (state-print (. pre lw) (. pre ck)) (. pre print)))
-    (nil true)))
+  (and (match @(. m prefix)
+         ((some pre) (made-so? pre))
+         (nil true))
+       (reduce-kv (fn (ok: bool key: str pre: Prefix) (and ok (made-so? pre))) true @(. m chain))))
+
+(defun made-so? :private (pre: Prefix) -> bool
+  (= (state-print (. pre lw) (. pre ck)) (. pre print)))
