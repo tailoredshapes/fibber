@@ -4,8 +4,9 @@ A measured prototype of the hardest mechanism behind a Clojure-style live enviro
 a resident JIT session that keeps compiled modules and values alive across inputs and replaces one function while other threads
 call it. Code: `compiler/live/` (the mechanism `orc.fib jit.fib stub.fib swap.fib`, the load scenario `load.fib`, the fibber-level
 session `extract.fib session.fib`) and the tool `compiler/live.fib`; the checks `compiler/tests/live/run.sh`. Two small hooks in the
-emitter (`emit.program/program-new-with`, `emit.compile/compile-executable-ast-with`), both marked PROTOTYPE, both leaving the existing
-entry points unchanged. Everything below was run on 2026-10-14 on lilnas (28 cores, shared) with stage 2 built from this tree by the
+emitter (`emit.program/program-new-with` with a `Tables`, `emit.compile/compile-executable-ast-with` with `BodyRequest`s; written as
+PROTOTYPE, made mergeable by LV0), both leaving the existing entry points unchanged (their lIR is byte for byte what it was).
+Everything below was run on 2026-10-14 on lilnas (28 cores, shared) with stage 2 built from this tree by the
 seed v0.1.16; the commands are quoted so that the numbers can be made again. The logs named below are under
 `/tank/data/fibber-scratch/live2/`.
 
