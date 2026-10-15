@@ -56,7 +56,7 @@ same() { # same NAME STATUS ARGS..
   $s2 test "$@" > "$t/n.out" 2> /dev/null; local rn=$?
   $s2 test --connect "$pid" "$@" > "$t/c.out" 2> "$t/c.err"; local rc=$?
   ck "$name: exit $want (spawned $rn, live $rc)" "$rn $rc" "$want $want"
-  if cmp -s "$t/n.out" "$t/c.out"; then echo "ok    $name: the same report"; else echo "FAIL  $name: the reports differ"; diff "$t/n.out" "$t/c.out" | head -10; fail=1; fi
+  if cmp -s "$t/n.out" "$t/c.out"; then echo "ok    $name: the same report"; else echo "FAIL  $name: the reports differ"; diff "$t/n.out" "$t/c.out" | head -10 || true; fail=1; fi  # pipe-ok: a short diff listing
 }
 same "a holding spec" 0 specs/good-spec.fib
 ck "a holding spec: the total line" "$(grep '^total:' "$t/c.out")" "total: 2 scenarios: 2 pass, 0 fail, 0 trap, 0 timeout in 1 spec files (seed 1)"
