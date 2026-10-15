@@ -1,0 +1,54 @@
+(ns main (:use fib.http fib.http.server) (:require [fib.unix :as u] [fib.string :as st]))
+;; The program of compiler/tests/live/queue.sh (package LE3 of docs/design/live-incremental.md 2.3): an HTTP app whose swaps exercise
+;; the queue mode. It has a handler with a closure literal (swapped more than once, so the second generation's bodies and literals must
+;; carry a new generation, not collide with the first's); a generic `dup` used at two types only through a resident helper (so a swap of
+;; `dup` must request its registered specialisations explicitly, since the queue mode does not reach them from the resident caller); a
+;; `probe` that, once swapped, calls a generic at a type the base never instantiated (a new specialisation the swap must lower, not answer
+;; by name); and a handful of constant defs so a whole emit is measurably slower than a swap's cut. The port is `--port N`; `main` ends
+;; when the file `--stop PATH` exists.
+(defrecord Rec (key: str n: i64))
+
+(def primes: (Vec i64) [2 3 5 7 11 13])
+(def greeting: str "hello")
+(def limit: i64 3)
+(def recs: (Vec Rec) [(Rec "a" 1) (Rec "b" 2) (Rec "c" 3) (Rec "d" 4) (Rec "e" 5)
+                      (Rec "f" 6) (Rec "g" 7) (Rec "h" 8) (Rec "i" 9) (Rec "j" 10)])
+
+;; A generic used at i64 and f64, reached only through the resident `summary` (never from a swapped body): a swap of `dup` must
+;; re-request both specialisations by their recorded type text.
+(defun dup (x: a) :where ((Num a)) -> a (+ x x))
+(defun summary () -> str (str (dup 3) " " (dup 2.5)))
+
+;; A generic the base never instantiates; `probe` is swapped to call it at `str`, a new specialisation the swap must lower.
+(defun box (x: a) -> i64 7)
+(defun probe () -> i64 0)
+
+;; The sum of every record's n: a little work over the records, so the whole program is not trivial to emit.
+(defun recs-sum () -> i64 (reduce + 0 (mapv (fn (r: Rec) (. r n)) recs)))
+
+(defun path-of (req: Request) -> str
+  (match (str-find (. req uri) "?" 0) ((some i) (str-slice (. req uri) 0 i)) (nil (. req uri))))
+
+;; `route` takes a tag function, so `handle` carries a closure literal (the lambda it passes).
+(defun route (req: Request tag: (fn (str) str)) -> Response
+  (let ((path (path-of req)))
+    (cond (= path "/h") (text-response 200 (tag (str (recs-sum) " " greeting " " (pr-str primes))))
+          (= path "/calc") (text-response 200 (summary))
+          (= path "/probe") (text-response 200 (str (probe)))
+          :else (text-response 404 "not found"))))
+
+(defun handle (req: Request) -> Response (route req (fn (s: str) -> str (str "v0 " s))))
+
+(defun arg-after (flag: str) -> str
+  (let ((as (vec (args))))
+    (loop ((i 0)) (cond (>= (+ i 1) (count as)) "" (= (nth as i) flag) (nth as (+ i 1)) :else (recur (+ i 1))))))
+
+(defun main () -> i64
+  (match (run-server handle (with (default-options) (port (unwrap-or (parse-long (arg-after "--port")) 0)) (workers 2)))
+    ((Err e) (do (println (str "app: cannot listen: " (error-message e))) 1))
+    ((Ok server)
+     (do (println (str "app: listening on " (port server)))
+         (loop () (if (some? (read-file (arg-after "--stop"))) () (do (u/sleep-ns 50000000) (recur))))
+         (stop-server server)
+         (println "app: stopped")
+         0))))

@@ -9,7 +9,7 @@
 ;; never printed, only the constants it makes. Memory is read through raw pointers (`unsafe`), from addresses held as `i64`s.
 (ns emit.defs.jit
   (:require [native.api :as jit] [native.call :as call] [lair.ffi :as ffi] [emit.defs.astmod :as am] [emit.defs.cache :as dc] [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f])
-  (:use types.ty own.program emit.value emit.text emit.layout emit.objects emit.statics emit.program emit.assemble emit.defs.data))
+  (:use types.ty own.program emit.value emit.text emit.layout emit.objects emit.statics emit.mono emit.program emit.assemble emit.defs.data))
 
 ;; What a `def`'s entry returned, or a field held. Rust: defs/jit.rs:88 Raw (the `f32` is widened, as `float_text(f64::from(x))`)
 ;; `DrOpt` is an `(Option scalar)` held as the pair `{ i1 t }`: its tag and its payload.
@@ -286,22 +286,48 @@
 (defun clipped :private (text: str) -> str
   (if (> (str-len text) 200) (str (str-slice text 0 200) " ..") text))
 
+;; The program state before a def's body is lowered (LE3): the length of `funcs` and the queue's cursor, so a cache miss can undo the
+;; cheap skip-on lowering and lower again with the resident set cleared, so that the fresh JIT the value is evaluated in has the
+;; resident code the body reaches (a function held as a value, a resident function called by the initialiser). A hit never pays this.
+(defstruct DefSnap (funcs: i64 resident: (Set str) pending: (Vec Inst) head: i64 names: (Map Inst str)))
+
+(defun def-snapshot :private (p: Program) -> DefSnap
+  (let ((q (. p queue))) (DefSnap (count @(. p funcs)) @(. p resident) @(. q pending) @(. q head) @(. q names))))
+
+;; `p` wound back to `s` with its resident set replaced (empty, to lower the body's reachable code; or the real set, to restore it).
+(defun def-restore :private (p: Program s: DefSnap resident: (Set str)) -> unit
+  (let ((q (. p queue)))
+    (do (set! (. p funcs) (vec (take (. s funcs) @(. p funcs))))
+        (set! (. q pending) (. s pending)) (set! (. q head) (. s head)) (set! (. q names) (. s names))
+        (set! (. p resident) resident))))
+
+;; A cache hit: the kept value's items are replayed and recorded; under `verify` the value is evaluated again and compared.
+(defun replay-def :private (p: Program c: DefCache defs: Defs k: i64 d: i64 body: str t: Ty lt: (Option LirTy) e: DefEntry) -> (Result unit str)
+  (try-let ((_v (if (= (live-emit-mode) "verify") (verify-replay p defs k body t lt e) (Ok ())))
+            (_r (dc/cache-replay defs (. e items))))
+    (do (dc/cache-numbered c @(. defs counter))
+        (Ok (record-def p defs d (. e value))))))
+
+;; A cache miss: the skip-on lowering is wound back and the body lowered again with the resident set cleared, so the body's reachable
+;; resident code is in the program and so in the fresh JIT the value is evaluated in; then the value is evaluated and kept.
+(defun miss-def :private (p: Program c: DefCache defs: Defs k: i64 d: i64 t: Ty lt: (Option LirTy) snap: DefSnap source: str) -> (Result unit str)
+  (do (def-restore p snap (set-empty))
+      (let ((body (program-request p (BodyDef d) [])))
+        (try-let ((_a (emit-all p))
+                  (_r (Ok (set! (. p resident) (. snap resident))))
+                  (n0 (Ok (count @(. defs items))))
+                  (dv (evaluate-def p defs k body t lt)))
+          (do (dc/cache-store c body source dv (vec (drop n0 @(. defs items))))
+              (dc/cache-numbered c @(. defs counter))
+              (Ok (record-def p defs d dv)))))))
+
 ;; A def of a live session's program (emit.program `DefCache`, emit.defs.cache): the value the session keeps for this definition is
-;; replayed; else it is evaluated and kept. Either way the session's numbering is raised past this program's constants.
-(defun cached-def :private (p: Program c: DefCache defs: Defs k: i64 d: i64 body: str t: Ty lt: (Option LirTy)) -> (Result unit str)
+;; replayed; else it is evaluated (with the resident code it reaches lowered, LE3) and kept.
+(defun cached-def :private (p: Program c: DefCache defs: Defs k: i64 d: i64 t: Ty lt: (Option LirTy) snap: DefSnap body: str) -> (Result unit str)
   (let ((source (dc/def-source p body)))
     (match (dc/cache-lookup c body source)
-      ((some e)
-       (try-let ((_v (if (= (live-emit-mode) "verify") (verify-replay p defs k body t lt e) (Ok ())))
-                 (_r (dc/cache-replay defs (. e items))))
-         (do (dc/cache-numbered c @(. defs counter))
-             (Ok (record-def p defs d (. e value))))))
-      (nil
-       (let ((n0 (count @(. defs items))))
-         (try-let ((dv (evaluate-def p defs k body t lt)))
-           (do (dc/cache-store c body source dv (vec (drop n0 @(. defs items))))
-               (dc/cache-numbered c @(. defs counter))
-               (Ok (record-def p defs d dv)))))))))
+      ((some e) (replay-def p c defs k d body t lt e))
+      (nil (miss-def p c defs k d t lt snap source)))))
 
 ;; Evaluates the initialiser of def number k (`d`, a constant) and records its value for the ones after (syntax §3.19); in a live
 ;; session, replays the value the session keeps for it (`cached-def`). The body is lowered first either way: the statics it names must
@@ -310,9 +336,14 @@
   (match (get (. (. p typed) def-types) d)
     (nil (Err "a def without a type"))
     ((some t)
-     (let ((body (program-request p (BodyDef d) [])))
+     ;; Under verify every def is evaluated again (a hit's value is checked against a fresh evaluation), so lower the body's reachable
+     ;; resident code now (the resident set cleared), as a miss does; otherwise skip resident and only a miss pays to re-lower.
+     (let ((snap (def-snapshot p))
+           (_v (when (= (live-emit-mode) "verify") (set! (. p resident) (set-empty))))
+           (body (program-request p (BodyDef d) [])))
        (try-let ((_a (emit-all p))
+                 (_r (Ok (set! (. p resident) (. snap resident))))
                  (lt (program-lir p t)))
          (match (. p def-cache)
            (nil (try-let ((dv (evaluate-def p defs k body t lt))) (Ok (record-def p defs d dv))))
-           ((some c) (cached-def p c defs k d body t lt))))))))
+           ((some c) (cached-def p c defs k d t lt snap body))))))))

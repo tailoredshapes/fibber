@@ -97,7 +97,16 @@
     (ep/Tables (. (. sx tables) objects)
                (st/Statics (. s strings) (. s string-index) (. s keywords) (. s keyword-index) (. s keywords-sealed)
                            (cell []) (cell (map-empty)) (cell []) (cell (map-empty)) (cell []) (cell (set-empty)))
-               (. (. sx tables) generations) (. (. sx tables) bodies) (. (. sx tables) defs) (. (. sx tables) runtime))))
+               (. (. sx tables) generations) (. (. sx tables) bodies) (. (. sx tables) defs) (. (. sx tables) runtime)
+               (cell (resident-set sx)))))
+
+;; The queue mode's resident set (LE3, docs/design/live-incremental.md 2.3): the code names the running program already has, which is
+;; exactly the index of the base and every kept module the session exports (`Sess.base`; every stubbed body `f.NAME.gK`, every library
+;; body, `main`, the defs' init bodies, the slots and stubs). A request for a body whose code name is in it is answered by name and not
+;; lowered (emit.program `program-request`). The base's own emit sees this empty (`base` is `{}` until `install-base`), so it lowers the
+;; whole program; every later input lowers only what the set lacks.
+(defun resident-set :private (sx: Sess) -> (Set str)
+  (reduce (fn (acc: (Set str) nm: str) (conj acc nm)) (set-empty) (vec (keys @(. sx base)))))
 
 ;; The generation each family is lowered under by the next program (serve.liveswap sets the swapped ones ahead of their emit).
 (defun set-generations (sx: Sess gens: (Map str i64)) -> unit (set! (. (. sx tables) generations) gens))
@@ -433,7 +442,7 @@
 
 ;; The program of expression input `n`: its value printed with `pr-str`, or run for its effect alone when its type has no Debug.
 (defun expression-program :private (sx: Sess n: i64 expr: str) -> (Result (Pair Made bool) (Vec dg/Diag))
-  (let ((req [(ec/BodyRequest (entry-name n) false [] nil)]))
+  (let ((req [(ec/BodyRequest (entry-name n) false [] nil [])]))
     (match (program-of sx (entry-tail n expr true) req)
       ((Ok made) (Ok (Pair made true)))
       ((Err ds) (if (debug-missing? ds)

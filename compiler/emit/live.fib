@@ -14,26 +14,12 @@
 ;; bodies a program made (`Program.live-bodies`, registered by `add-stub`), so that a swap emits a family under its next generation and
 ;; cuts exactly its bodies out.
 (ns emit.live
-  (:require [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f] [expand.modules :as mods] [emit.mono :as mono])
+  (:require [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f] [emit.mono :as mono])
   (:use types.ty types.decls types.table types.display own.program emit.program emit.statics emit.names))
-
-;; `NAME.gK`: the body of generation K.
-(defun generation-name (name: str g: i64) -> str (str name ".g" g))
 
 ;; The runtime a live program keeps whether or not it reaches them (emit.prune, emit.compile `finished`): what the session's attach
 ;; thread asks of it (`fib_live_ctl`: the pause and the quiescence of rt/live.lir, package LV3) and the release store of a swap.
 (def runtime-roots: (Vec str) ["fib_live_ctl" "fib.live-patch"])
-
-;; The family of the body `key`: the name of the function (`f.NAME`, its all-owned twin and its specialisations included), or the
-;; method's own name.
-(defun family-name (g: Globals key: BodyKey) -> str
-  (match key
-    ((BodyAllOwned fid) (body-name g (BodyFun fid) []))
-    (_ (body-name g key []))))
-
-;; The generation family `family` is lowered under in this program: the session's, else 0.
-(defun family-generation (p: Program family: str) -> i64
-  (unwrap-or (get @(. p live-gens) family) 0))
 
 ;; `live.NAME`: the slot the stub of NAME loads.
 (defun slot-name (name: str) -> str (str "live." name))
@@ -42,46 +28,25 @@
 ;; field of the program's `Globals` (`live-modules`): the driver (driver.front `note-live-modules`) sets it from FIB_LIVE_ROOTS, which
 ;; `fibc` fills in a project with its own roots (`deps.fib` :paths, with `test` its test paths) and, under `--live-deps` (FIB_LIVE_DEPS),
 ;; the libraries' (pkg.modules `live-roots`), so that a dependency's code stays a direct call unless asked for. `nil` (outside a project,
-;; or a session that never set it) is the name rule below: every module not named `fib.*` is the program's.
+;; or a session that never set it) is the name rule (emit.program `program-module?`): every module not named `fib.*` is the program's.
 (defun set-live-modules (g: Globals names: (Option (Set str))) -> unit
   (set! (. g live-modules) names))
 
-;; Whether module `m` is the program's own: not the builtins or the prelude, and, in a project, the main module or one of
-;; `live-modules`; elsewhere a module that is not the library's (the loader's own rule, expand.modules `sees-implicit`: a library module
-;; is one the implicit modules are not given to).
-(defun program-module? (g: Globals m: i64) -> bool
-  (and (not (= m module-builtin)) (not (= m module-prelude))
-       (match @(. g live-modules)
-         (nil (mods/sees-implicit (g-module-name g m) (mods/implicit-lib)))
-         ((some names) (or (= m @(. g main)) (contains? names (g-module-name g m)))))))
-
-(defun key-module :private (g: Globals key: BodyKey) -> (Option i64)
-  (match key
-    ((BodyFun fid) (some (. (g-fun g fid) module)))
-    ((BodyAllOwned fid) (some (. (g-fun g fid) module)))
-    ((BodyMethod i _) (some (. (table-get (. g instances) i) module)))
-    ((BodyMethodOwned i _) (some (. (table-get (. g instances) i) module)))
-    ((BodyDef _) nil)))
-
-;; Whether the body `key` is emitted behind a stub: live mode, not a macro module, a function or a method of the program's own modules.
-(defun live-body? (p: Program key: BodyKey) -> bool
-  (and (. p live) (not @(. p macro-module))
-       (match (key-module (program-g p) key) ((some m) (program-module? (program-g p) m)) (nil false))))
-
-;; The name the body of `key` is lowered under: its family's generation's when it is stubbed, else `name` itself.
-(defun body-code-name (p: Program key: BodyKey name: str) -> str
-  (if (live-body? p key) (generation-name name (family-generation p (family-name (program-g p) key))) name))
+;; The specialisation's types as the printer wrote them (LE3): a swap reads them back to re-request a registered generic body.
+(defun tys-text :private (g: Globals inst: mono/Inst) -> (Vec str)
+  (mapv (fn (t: Ty) (printer-ty (printer-new g) t)) (. inst tys)))
 
 ;; The record of a stubbed body for the session (emit.program `LiveBody`): the function's name when it is the main module's (so a
-;; session can ask for its body by name), the all-owned flag, whether it is a specialisation, and a method's `impl` key.
+;; session can ask for its body by name), the all-owned flag, whether it is a specialisation, a method's `impl` key, and the
+;; specialisation's types as text (LE3).
 (defun live-body :private (g: Globals inst: mono/Inst name: str) -> LiveBody
-  (let ((generic (not (empty? (. inst tys)))))
+  (let ((generic (not (empty? (. inst tys)))) (tt (tys-text g inst)))
     (match (. inst key)
-      ((BodyFun fid) (LiveBody name (main-fun-name g fid) false generic nil))
-      ((BodyAllOwned fid) (LiveBody name (main-fun-name g fid) true generic nil))
-      ((BodyMethod i _) (LiveBody name nil false generic (some (impl-key g i))))
-      ((BodyMethodOwned i _) (LiveBody name nil true generic (some (impl-key g i))))
-      ((BodyDef _) (LiveBody name nil false generic nil)))))
+      ((BodyFun fid) (LiveBody name (main-fun-name g fid) false generic nil tt))
+      ((BodyAllOwned fid) (LiveBody name (main-fun-name g fid) true generic nil tt))
+      ((BodyMethod i _) (LiveBody name nil false generic (some (impl-key g i)) tt))
+      ((BodyMethodOwned i _) (LiveBody name nil true generic (some (impl-key g i)) tt))
+      ((BodyDef _) (LiveBody name nil false generic nil tt)))))
 
 (defun main-fun-name :private (g: Globals fid: i64) -> (Option str)
   (let ((d (g-fun g fid))) (if (= (. d module) @(. g main)) (some (. d name)) nil)))

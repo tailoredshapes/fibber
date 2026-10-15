@@ -1,0 +1,93 @@
+;; compiler/emit/typetext.fib: reading a monomorphisation type back from the text the printer wrote (`printer-ty`), for the queue
+;; mode's specialisation requests (LE3, docs/design/live-incremental.md 2.4 item 4). A swap records each registered specialisation's
+;; types as text (emit.live `tys-text`) and re-requests the generic body by them, because a specialisation reached only through a
+;; resident caller is otherwise never lowered. The text is resolved in the swapping program's own `Globals`, where the type ids are
+;; that program's; a type the text names but the program has no definition of (an input's private type) does not resolve, and the
+;; design keeps its slot rather than swap it (so this returns `nil` and the caller skips the request).
+;; It handles what a specialisation type argument can be: a scalar (`i64`, `f64`, `bool`, ..), `str`, a container (`(Vec T)`,
+;; `(Array T)`, `(Cell T)`, `(Atom T)`, `(Weak T)`, `(Task T)`), a `(Simd T N)`, a lane count, and a nominal type by name. A `dyn`
+;; or a function type does not resolve (a specialisation is never keyed by one; §8.4).
+(ns emit.typetext
+  (:require [fib.string :as s])
+  (:use types.ty types.decls types.table))
+
+;; The tokens of a type expression: `(`, `)` and the words between them (`i64`, `Vec`, `42`). A word runs from `start` to the current
+;; index; a delimiter flushes it and, for a paren, is itself a token.
+(defun tokens :private (text: str) -> (Vec str)
+  (let ((out (cell [])) (start (cell 0)))
+    (do (doseq [i (range (str-len text))]
+          (let ((c (str-byte-at text i)))
+            (when (or (= c 40i8) (= c 41i8) (= c 32i8))   ; ( ) or space
+              (do (when (> i @start) (set! out (conj @out (str-slice text @start i))))
+                  (when (not (= c 32i8)) (set! out (conj @out (str-slice text i (+ i 1)))))
+                  (set! start (+ i 1))))))
+        (when (> (str-len text) @start) (set! out (conj @out (str-slice text @start (str-len text)))))
+        @out)))
+
+;; The id of the nominal type named `name` (the first one: a name in two modules is a known ambiguity, docs 5 risk 3).
+(defun nominal-id :private (g: Globals name: str) -> (Option i64)
+  (loop ((i 0))
+    (cond (>= i (table-count (. g types))) nil
+          (= (. (g-ty g i) name) name) (some i)
+          :else (recur (+ i 1)))))
+
+(defun scalar-of :private (name: str) -> (Option Scalar)
+  (cond (= name "bool") (some SBool) (= name "i8") (some SI8) (= name "i16") (some SI16) (= name "i32") (some SI32)
+        (= name "i64") (some SI64) (= name "f32") (some SF32) (= name "f64") (some SF64) (= name "char") (some SChar)
+        (= name "keyword") (some SKeyword) (= name "unit") (some SUnit) :else nil))
+
+;; A bare word as a type: a scalar, `str`, a lane count (a number), or a nominal of no arguments.
+(defun atom-ty :private (g: Globals w: str) -> (Option Ty)
+  (cond (= w "str") (some (ty-str))
+        (some? (scalar-of w)) (match (scalar-of w) ((some sc) (some (ty-scalar sc))) (nil nil))
+        (some? (parse-long w)) (match (parse-long w) ((some n) (some (ty-nat n))) (nil nil))
+        :else (match (nominal-id g w) ((some id) (some (ty-nominal id []))) (nil nil))))
+
+;; The container constructor named `head`, if `head` is one; the number of arguments it takes is not checked here.
+(defun container-con :private (head: str) -> (Option Con)
+  (cond (= head "Array") (some KArray) (= head "Cell") (some KCell) (= head "Atom") (some KAtom)
+        (= head "Weak") (some KWeak) (= head "Task") (some KTask) :else nil))
+
+;; One type from `toks` at `i`: a word, or `( head arg.. )`. The answer is the type and the index past it, or nil (unresolvable).
+(defun parse-at :private (g: Globals toks: (Vec str) i: i64) -> (Option (Pair Ty i64))
+  (if (>= i (count toks))
+      nil
+      (let ((t (nth toks i)))
+        (cond (= t "(") (parse-list g toks (+ i 1))
+              (= t ")") nil
+              :else (match (atom-ty g t) ((some ty) (some (Pair ty (+ i 1)))) (nil nil))))))
+
+;; The arguments of a `( head arg.. )` form, from the token after `head`.
+(defun parse-args :private (g: Globals toks: (Vec str) i: i64 acc: (Vec Ty)) -> (Option (Pair (Vec Ty) i64))
+  (cond (>= i (count toks)) nil
+        (= (nth toks i) ")") (some (Pair acc (+ i 1)))
+        :else (match (parse-at g toks i) (nil nil) ((some [a j]) (parse-args g toks j (conj acc a))))))
+
+(defun parse-list :private (g: Globals toks: (Vec str) i: i64) -> (Option (Pair Ty i64))
+  (if (>= i (count toks))
+      nil
+      (let ((head (nth toks i)))
+        (cond (or (= head "dyn") (= head "fn") (= head "(") (= head ")")) nil
+              :else
+                (match (parse-args g toks (+ i 1) [])
+                  (nil nil)
+                  ((some [args j])
+                   (cond (and (= head "Simd") (= (count args) 2)) (some (Pair (ty-simd (nth args 0) (nth args 1)) j))
+                         (some? (container-con head)) (match (container-con head)
+                                                        ((some con) (some (Pair (TCon con args) j))) (nil nil))
+                         :else (match (nominal-id g head)
+                                 ((some id) (some (Pair (ty-nominal id args) j)))
+                                 (nil nil)))))))))
+
+;; The type the text `text` names, in `g`'s terms, or nil when the program has no definition for a name in it.
+(defun ty-of-text (g: Globals text: str) -> (Option Ty)
+  (match (parse-at g (tokens text) 0)
+    ((some [ty i]) (if (= i (count (tokens text))) (some ty) nil))
+    (nil nil)))
+
+;; The types of `texts`, all of them or none (a specialisation is requested only when every type reads back).
+(defun tys-of-text (g: Globals texts: (Vec str)) -> (Option (Vec Ty))
+  (loop ((i 0) (out []))
+    (if (>= i (count texts))
+        (some out)
+        (match (ty-of-text g (nth texts i)) ((some ty) (recur (+ i 1) (conj out ty))) (nil nil)))))

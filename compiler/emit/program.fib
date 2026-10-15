@@ -8,8 +8,8 @@
 ;; The runtime's own `declare` (`runtime-declaration`) is emit.rt's.
 ;; E11 added the last field, `macro-module` (Rust `macro_module: bool`, set by `compile-macro`): a trap of a macro module fails the expansion.
 (ns emit.program
-  (:require [fib.string :as s] [fib.unix :as unix] [emit.os :as os] [lir.ast :as la] [lir.types :as lt] [emit.node :as node] [emit.lirdata :as data] [lir.print :as print] [expand.targetos :as tos] [emit.function :as f])
-  (:use types.ty types.ast types.decls types.display types.init types.program own.program emit.value emit.layout emit.names
+  (:require [fib.string :as s] [fib.unix :as unix] [emit.os :as os] [lir.ast :as la] [lir.types :as lt] [emit.node :as node] [emit.lirdata :as data] [lir.print :as print] [expand.targetos :as tos] [expand.modules :as mods] [emit.function :as f])
+  (:use types.ty types.ast types.decls types.table types.display types.init types.program own.program emit.value emit.layout emit.names
         emit.mono emit.objects emit.statics emit.rt emit.kwdyn))
 
 ;; The work the queue hands out: a body, or a closure of an owner. Rust: program.rs:24 Work
@@ -37,6 +37,9 @@
    live-gens: (Cell (Map str i64)) live-bodies: (Cell (Map str (Vec LiveBody)))
    ;; the session's constant defs' values (`Tables.defs`, LE1; emit.defs.cache reads and fills it), none for a program of its own
    def-cache: (Option DefCache)
+   ;; the queue mode's resident set (`Tables.resident`, LE3): the code names the running program already has. A body whose code name
+   ;; is in it is answered by its name and never queued (`program-request`); empty for a plain emit, so an ordinary build is unchanged.
+   resident: (Cell (Set str))
    ;; the bytes of a pointer in the target's memory (4 on wasm32): the layouts of the objects are computed from it. 8 while the JIT runs, which is the host's.
    pb: (Cell i64) runtime: (Vec la/LItem) runtime-host: (Vec la/LItem) link-notes: (Cell (Vec (Pair str str)))))
 
@@ -92,15 +95,24 @@
    ;; every stubbed body the programs made, by family, as `emit.live/add-stub` registers them (the live table reads it)
    generations: (Cell (Map str i64)) bodies: (Cell (Map str (Vec LiveBody)))
    ;; the constant defs' values (LE1) and the runtime's items, parsed once per session rather than once per program
-   defs: DefCache runtime: (Cell (Option RuntimeItems))))
+   defs: DefCache runtime: (Cell (Option RuntimeItems))
+   ;; the queue mode's resident set (LE3, docs/design/live-incremental.md 2.3): the code names (`f.handle.owned.g2`, `f.main`,
+   ;; `d.fib.os.backend.platform-name`, `f.fib.prelude.vec-nth.str`) the running program already has, filled by the session from the
+   ;; base's index and every kept module's. A request for a body whose code name is in it is answered by its name, not lowered. Empty
+   ;; for the base's own emit (nothing is resident yet) and for a program of its own.
+   resident: (Cell (Set str))))
 
 ;; A body behind a stub: its name (`f.NAME.$T_`, `f.NAME.owned`, `m.P.NAME.$T_`), the function's name when it is one of the main
 ;; module (for `emit.compile/BodyRequest`), whether it is the all-owned twin, whether it is a specialisation (its types are not kept:
 ;; a type's id is one program's, and two programs of a session number their types differently), and for a method the key of its
 ;; `impl` as the REPL keys one (`impl:PROTO HEAD`).
-(defstruct LiveBody (name: str fun: (Option str) owned: bool generic: bool impl: (Option str)))
+;; `tys-text` (LE3): the specialisation's types as the printer wrote them in the registering program (`printer-ty`), empty for a
+;; monomorphic body. A swap requests a registered generic body by these texts (serve.liveswap `requests-of`), since a specialisation
+;; reached only through a resident caller is otherwise never lowered (docs/design/live-incremental.md 2.4 item 4); a text that cannot
+;; be read back in the session's terms keeps its slot.
+(defstruct LiveBody (name: str fun: (Option str) owned: bool generic: bool impl: (Option str) tys-text: (Vec str)))
 
-(defun tables-new () -> Tables (Tables (objects-new) (statics-new) (cell (map-empty)) (cell (map-empty)) (def-cache-new) (cell nil)))
+(defun tables-new () -> Tables (Tables (objects-new) (statics-new) (cell (map-empty)) (cell (map-empty)) (def-cache-new) (cell nil) (cell (set-empty))))
 
 ;; The runtime's items: the tables' when given (parsed on the first program of the session), else parsed now.
 (defun runtime-of :private (tables: (Option Tables)) -> RuntimeItems
@@ -139,6 +151,7 @@
                     (match tables ((some t) (. t generations)) (nil (cell (map-empty))))
                     (match tables ((some t) (. t bodies)) (nil (cell (map-empty))))
                     (def-cache-of tables)
+                    (match tables ((some t) (. t resident)) (nil (cell (set-empty))))
                     (cell (os/target-pointer-bytes)) (. rt target) (. rt host) (cell []))))
     (do (objects-intern (. p objects) "fib.str" "str" ObStr)
         (objects-intern (. p objects) "fib.array.i8" "(Array i8)" (ObArray LirI8))
@@ -156,7 +169,7 @@
              (cell []) (cell 0) (cell []) (cell [])
              (cell (map-empty)) (cell @(. p def-values)) (cell (map-empty)) (cell []) (cell 0) (cell false)
              (cell @(. p def-slots)) (cell @(. p inits)) (cell false) (. p unwinding) (. p live) (. p live-gens) (. p live-bodies)
-             (. p def-cache) (cell pb) (. p runtime) (. p runtime-host) (cell @(. p link-notes)))))
+             (. p def-cache) (. p resident) (cell pb) (. p runtime) (. p runtime-host) (cell @(. p link-notes)))))
 
 ;; The bytes of a pointer of the program's layouts.
 (defun program-pb (p: Program) -> i64 @(. p pb))
@@ -175,11 +188,65 @@
 (defun program-lir (p: Program t: Ty) -> (Result (Option LirTy) str)
   (lir-ty (program-g p) t))
 
+;; ---- live mode: the generation of a family, and the code name a body is lowered under (docs/design/live-repl.md 3.1, package LV0;
+;; moved here from emit.live for LE3's queue mode, which decides residency from the code name in `program-request`).
+
+;; `NAME.gK`: the body of generation K.
+(defun generation-name (name: str g: i64) -> str (str name ".g" g))
+
+;; The family of the body `key`: the function (`f.NAME`, its all-owned twin and its specialisations included), or the method's own name.
+(defun family-name (g: Globals key: BodyKey) -> str
+  (match key
+    ((BodyAllOwned fid) (body-name g (BodyFun fid) []))
+    (_ (body-name g key []))))
+
+;; The generation family `family` is lowered under in this program: the session's, else 0.
+(defun family-generation (p: Program family: str) -> i64
+  (unwrap-or (get @(. p live-gens) family) 0))
+
+(defun key-module :private (g: Globals key: BodyKey) -> (Option i64)
+  (match key
+    ((BodyFun fid) (some (. (g-fun g fid) module)))
+    ((BodyAllOwned fid) (some (. (g-fun g fid) module)))
+    ((BodyMethod i _) (some (. (table-get (. g instances) i) module)))
+    ((BodyMethodOwned i _) (some (. (table-get (. g instances) i) module)))
+    ((BodyDef _) nil)))
+
+;; Whether module `m` is the program's own (not the builtins or the prelude; in a project the main module or one of `live-modules`;
+;; elsewhere a module that is not the library's). The name rule of emit.live `program-module?`.
+(defun program-module? (g: Globals m: i64) -> bool
+  (and (not (= m module-builtin)) (not (= m module-prelude))
+       (match @(. g live-modules)
+         (nil (mods/sees-implicit (g-module-name g m) (mods/implicit-lib)))
+         ((some names) (or (= m @(. g main)) (contains? names (g-module-name g m)))))))
+
+;; Whether the body `key` is emitted behind a stub: live mode, not a macro module, a function or a method of the program's own modules.
+(defun live-body? (p: Program key: BodyKey) -> bool
+  (and (. p live) (not @(. p macro-module))
+       (match (key-module (program-g p) key) ((some m) (program-module? (program-g p) m)) (nil false))))
+
+;; The name the body of `key` is lowered under: its family's generation's when it is stubbed, else `name` itself.
+(defun body-code-name (p: Program key: BodyKey name: str) -> str
+  (if (live-body? p key) (generation-name name (family-generation p (family-name (program-g p) key))) name))
+
+;; Whether the queue mode is on: it is, unless FIB_LIVE_QUEUE is "0" (every request is then lowered as before LE3, the whole program;
+;; the session's answers are the same, only slower, so it is a measurement and debugging switch, not a behaviour one).
+(defun queue-mode? :private () -> bool (not (= (unix/getenv "FIB_LIVE_QUEUE") (some "0"))))
+
+;; Whether a request for `key` at `tys` is answered by its name rather than lowered: the queue mode's one rule (LE3). The body's code
+;; name is already in the running program (the base's index, or a kept module's): the cut declares it and no new code is generated. A
+;; plain emit has an empty resident set, so nothing is skipped and the lIR is byte-identical.
+(defun resident-request? :private (p: Program key: BodyKey tys: (Vec Ty)) -> bool
+  (and (not @(. p macro-module)) (queue-mode?)
+       (contains? @(. p resident) (body-code-name p key (body-name (program-g p) key tys)))))
+
 ;; Rust: program.rs:113 Program::request
 (defun program-request (p: Program key: BodyKey tys: (Vec Ty)) -> str
   ;; Colours have no representation (§8.4): one specialisation serves every colour instantiation.
-  (queue-request (. p queue) (program-g p)
-                 (Inst key (mapv (fn (t: Ty) (ty-map-colours t (fn (k: Colour) CLocal))) tys))))
+  (let ((inst (Inst key (mapv (fn (t: Ty) (ty-map-colours t (fn (k: Colour) CLocal))) tys))))
+    (if (resident-request? p key (. inst tys))
+        (body-name (program-g p) key (. inst tys))
+        (queue-request (. p queue) (program-g p) inst))))
 
 ;; Rust: program.rs:125 Program::request_closure
 (defun program-request-closure (p: Program owner: Inst owner-name: str lit: i64) -> str

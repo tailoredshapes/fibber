@@ -67,10 +67,12 @@
 ;; are not specialisations (a specialisation is reached from `main`, or it was an input's: its types are that program's and cannot be
 ;; asked for again; it keeps its slot), and every method of the `impl`s redefined.
 (defun requests-of :private (sx: ls/Sess new-fns: (Vec str) families: (Vec str) impls: (Vec str)) -> (Vec ec/BodyRequest)
-  (into (into (conj (mapv (fn (nm: str) (ec/BodyRequest nm false [] nil)) new-fns) (ec/BodyRequest "main" false [] nil))
-              (mapv (fn (key: str) (ec/BodyRequest "" false [] (some key))) impls))
+  (into (into (conj (mapv (fn (nm: str) (ec/BodyRequest nm false [] nil [])) new-fns) (ec/BodyRequest "main" false [] nil []))
+              (mapv (fn (key: str) (ec/BodyRequest "" false [] (some key) [])) impls))
         (vec (mapcat (fn (family: str)
-                       (vec (keep (fn (b: ep/LiveBody) (match (. b fun) ((some f) (if (. b generic) nil (some (ec/BodyRequest f (. b owned) [] nil)))) (nil nil)))
+                       ;; every registered body of the family: a monomorphic one by name, a specialisation by its recorded type text
+                       ;; (LE3), since the queue mode does not reach either from a resident caller.
+                       (vec (keep (fn (b: ep/LiveBody) (match (. b fun) ((some f) (some (ec/BodyRequest f (. b owned) [] nil (. b tys-text)))) (nil nil)))
                                   (unwrap-or (get (ls/live-bodies sx) family) []))))
                      families))))
 
