@@ -524,3 +524,9 @@ Decisions for the owner:
    This is LT4 of docs/design/live-meshql.md with the old value retired and dropped instead of leaked.
 2. **The project's live entry mimics Clojure's `user.clj`**: a `dev/live.fib` in the project that starts the app and exposes the helpers
    (`rebuild!`, the test entry); `fibc run --live APP --with SPEC` is the general form later (live-meshql.md §8, decision 1).
+3. **Redefinition is a live-environment feature only.** Slots, stubs, retire lists and `def` redefinition exist only in code compiled
+   with `--live` (`FIB_LIVE`). A normal `run`, an AOT `build` and a release binary compile a `def` as the immutable, immortal constant
+   it is today (types §2.16), with no slot, no indirection and no cost, and a second definition of the same name stays the compile
+   error it is. `fibc build --live` (LV8) is the only way to get a live binary, and only by asking. The test that guards this is the
+   LV0 one already merged (a plain emit mentions neither `live.` nor `.g0`, byte-identical to before); LT4 adds the same check for
+   defs: a plain emit has no def slot and a duplicate `def` still errors.
