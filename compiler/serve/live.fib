@@ -10,7 +10,8 @@
 ;; names and no parked thread can be in are freed; otherwise `not-quiescent`); `test` (serve.livetest, package LT2 of
 ;; docs/design/live-meshql.md): a spec run on a thread of its own, answered when it ends (`status.tests` meanwhile; `busy` for a second);
 ;; `load` (`file`: a module of the program edited on disk, swapped as one input, serve.liveload, package LM1 of
-;; docs/design/live-incremental.md 3) and `reload` (every loaded file whose disk content changed), `status.loaded` and `status.live`.
+;; docs/design/live-incremental.md 3) and `reload` (every loaded file whose disk content changed), `status.loaded` and `status.live`;
+;; `watch` (`on`, `dirs`: serve.livewatch, package LT5: a changed file loaded and the last test rerun, answered as events).
 ;; Threads: the attach server runs on the driver's thread, which already holds the session (its engine and emitter are single-threaded
 ;; state: a `Cell`-bearing struct cannot be given to `spawn`); the program's `main` runs on a thread of its own (`live.run`: the runtime's
 ;; own main stack, rt/thread.lir `fib.run-main`), which says when it has ended (`done`) and wakes the accept. The design's 2.1 has the
@@ -18,14 +19,16 @@
 ;; the C library (what the program buffered is written). The socket is made before `main` is called, its path printed on standard error
 ;; and set as FIB_LIVE_SOCKET for the program. Before the first connection is accepted the engine is warmed on the base's text (LE5).
 (ns serve.live
-  (:require [serve.livesess :as ls] [serve.liveswap :as lsw] [serve.livetable :as lt] [serve.liveretire :as lr] [serve.livetest :as ltt] [serve.liveload :as ll] [serve.livesock :as lsk] [serve.sock :as sk] [serve.proto :as p] [serve.incr :as inc] [serve.diag :as dg]
+  (:require [serve.livesess :as ls] [serve.liveswap :as lsw] [serve.livetable :as lt] [serve.liveretire :as lr] [serve.livetest :as ltt] [serve.liveload :as ll] [serve.livewatch :as lwt] [serve.livesock :as lsk] [serve.sock :as sk] [serve.proto :as p] [serve.incr :as inc] [serve.diag :as dg]
             [lsp.json :as j] [driver.native :as native] [driver.version :as v] [native.call :as call] [lair.ffi :as ffi]
             [expand.roots :as roots] [expand.maker :as mk] [fib.unix :as unix] [fib.string :as s]))
 
 ;; `conns` numbers the connections served: a `test` answers on the connection that asked, by number (a descriptor is reused by a later one).
 (defstruct Live (sx: ls/Sess listener: i64 path: str done: (Atom (Option i64)) served: (Cell i64) conns: (Cell i64) tests: ltt/Tests loads: ll/Loads
                     ;; whether the engine was warmed on the base's text before the first connection (LE5, `warm-engine`)
-                    warm: (Cell bool)))
+                    warm: (Cell bool)
+                    ;; `watch` (LT5, serve.livewatch): the files polled for the watching connection
+                    watch: lwt/Watch))
 
 (def poll-ms: i64 250)
 
@@ -74,6 +77,32 @@
     ((some file) (let ((f (load-fields l (ll/load-file (. l loads) (. l sx) file)))) (p/response r (. f fst) (. f snd))))))
 
 ;; `reload`: `loaded` holds one answer per file loaded again (none when no loaded file changed on disk); `ok` when every one was.
+;; `watch` (LT5): `on: true` polls the session's live module files and the files under `dirs` for this connection (until `on: false` or
+;; the connection ends); a change is answered by events on it: `{"event":"load", ..}` per module file loaded, then `{"event":"test", ..}`
+;; when the last test is rerun (none after a refusal, nor when no test has run). `files`: how many files are watched.
+(defun op-watch :private (l: Live r: p/Req cid: i64) -> str
+  (if (p/field-bool r "on")
+      (let ((n (lwt/start (. l watch) (. l loads) cid (unwrap-or (p/field-strs r "dirs") []))))
+        (p/response r true [(Pair "watching" (j/JBool true)) (Pair "files" (j/json-int n))]))
+      (do (lwt/stop (. l watch)) (p/response r true [(Pair "watching" (j/JBool false))]))))
+
+;; One poll of the watch (serve.livewatch) on the watching connection: the changed module files loaded, each answered as a `load` event;
+;; when every load was accepted and a test ran before, the last one rerun (`last: true`), its answer a `test` event when it ends (a run
+;; that cannot start answers now). Whether the connection is usable.
+(defun watch-step :private (l: Live conn: i64 cid: i64) -> bool
+  (match (lwt/poll (. l watch) (. l loads) cid (ltt/running? (. l tests)))
+    (nil true)
+    ((some ch)
+     (let ((loads (mapv (fn (f: str) (load-fields l (ll/load-file (. l loads) (. l sx) f))) (. ch modules))))
+       (and (every? (fn (f: (Pair bool (Vec (Pair str j/JVal)))) (write-ok conn (lwt/as-event "load" (p/response (p/Req j/JNull "load" j/JNull) (. f fst) (. f snd))))) loads)
+            (if (and (every? (fn (f: (Pair bool (Vec (Pair str j/JVal)))) (. f fst)) loads) (some? @(. (. l tests) last-sel)))
+                (match (ltt/op-test (. l sx) (. l tests) (p/Req (j/json-str "watch") "test" (j/json-obj [(Pair "last" (j/JBool true))])) cid)
+                  (nil (do (lwt/note-ours (. l watch)) true))
+                  ((some line) (write-ok conn (lwt/as-event "test" line))))
+                true))))))
+
+(defun write-ok :private (conn: i64 line: str) -> bool (match (sk/write-line conn line) ((Ok _) true) ((Err _) false)))
+
 (defun op-reload :private (l: Live r: p/Req) -> str
   (let ((results (mapv (fn (x: ll/LoadResult) (load-fields l x)) (ll/reload-all (. l loads) (. l sx)))))
     (p/response r (every? (fn (f: (Pair bool (Vec (Pair str j/JVal)))) (. f fst)) results)
@@ -176,7 +205,7 @@
                                                          (Pair "functions" (j/json-int (lt/family-count @(. sx table))))]))
                         (Pair "values" (j/json-obj [(Pair "resident" (strs (ls/resident-names sx))) (Pair "count" (j/json-int (count (ls/resident-names sx))))]))
                         (Pair "threads" (threads-json (lr/threads sx))) (Pair "defs" (defs-json sx))
-                        (Pair "tests" (ltt/tests-json (. l tests)))
+                        (Pair "tests" (ltt/tests-json (. l tests))) (Pair "watch" (lwt/watch-json (. l watch)))
                         (Pair "loaded" (loaded-json l)) (Pair "live" (j/json-str (ll/rule-text (. l loads) sx)))
                         (Pair "inputs" (j/json-int (ls/inputs-made sx))) (Pair "requests" (j/json-int @(. l served)))
                         (Pair "pid" (j/json-int (sk/process-id))) (Pair "socket" (j/json-str (. l path)))])))
@@ -190,6 +219,7 @@
               (= op "eval") (op-eval l r)
               (= op "load") (op-load l r)
               (= op "reload") (op-reload l r)
+              (= op "watch") (op-watch l r conn)
               (= op "type") (op-type l r)
               (= op "inspect") (op-inspect l r)
               (= op "status") (op-status l r)
@@ -216,7 +246,7 @@
 (defun answer-finished :private (l: Live conn: i64 cid: i64) -> bool
   (match (ltt/finish (. l sx) (. l tests))
     (nil true)
-    ((some [asked line]) (if (= asked cid) (match (sk/write-line conn line) ((Ok _) true) ((Err _) false)) true))))
+    ((some [asked line]) (let ((out (lwt/finished-line (. l watch) line))) (if (= asked cid) (write-ok conn out) true)))))
 
 ;; One connection: a request per line, answered on the same line (a `test` later, when its run ends), until the peer closes or the
 ;; program ends.
@@ -226,6 +256,7 @@
         (loop ()
           (cond (program-ended? l) ()
                 (not (answer-finished l conn cid)) ()
+                (not (watch-step l conn cid)) ()
                 (not (sk/wait-readable conn poll-ms)) (recur)
                 :else (match (sk/conn-read-line c)
                         ((Ok nil) ())
@@ -234,6 +265,7 @@
                                      ()))
                         ((Ok (some line)) (let ((a (handle-line l line cid)))
                                             (if (= a "") (recur) (match (sk/write-line conn a) ((Ok _) (recur)) ((Err _) ()))))))))
+        (when (= @(. (. l watch) conn) cid) (lwt/stop (. l watch)))
         (unix/fd-close conn)
         ())))
 
@@ -292,7 +324,7 @@
      (match (lsk/listen-private dir path)
        ((Err m) (do (eprintln (str "fibc: live: " m)) 2))
        ((Ok listener)
-        (let ((l (Live sx listener path (atom nil) (cell 0) (cell 0) (ltt/tests-new (lsk/test-path dir pid) (lsk/test-err-path dir pid)) loads (cell false))))
+        (let ((l (Live sx listener path (atom nil) (cell 0) (cell 0) (ltt/tests-new (lsk/test-path dir pid) (lsk/test-err-path dir pid)) loads (cell false) (lwt/watch-new))))
           (do (eprintln (str "fibc: live at " path))
               (let ((t (start-program addr (. l done) listener)))
                 (do (warm-engine l trace)

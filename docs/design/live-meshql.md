@@ -634,3 +634,20 @@ every second in the background, all 200 or 404/410, none refused). What it does 
   whose `main` does not run its `specs` (test-cmd.sh's dying spec) is not reproduced (the session never calls `main`); (c) `--timeout`
   and `--isolate fork` are refused (exit 2), as the `test` op refuses them; (d) two spec files of one base name are one module
   `spec.NAME` and are refused; (e) the runs are sequential (one test at a time in a session), `-j N` is each file's scenarios N at a time.
+- **Status 2026-10-15, LT5** (serve.livewatch: the stamps, the scan, the poll, the events; serve.live `op-watch`, `watch-step`,
+  `status.watch`; serve.liveclient `:watch on [DIR..]|off` and the events between inputs; the test compiler/tests/live/watch.sh over
+  watch-app.fib and watch-handler.fib; the mutants `watch-no-load` and `watch-reruns-on-refusal` of scripts/mutant-live.sh). The op is
+  `{"op":"watch","on":true,"dirs":[DIR..]}` (answered `watching`, `files`: how many are watched) and `"on":false`. Where it differs from
+  3.8: (a) **no thread**: the poll runs on the attach thread in the watching connection's loop, which already wakes every 250 ms, at most
+  once per 200 ms and never while a test runs (a change made meanwhile is seen when the run ends); a scan is one `stat` per file (inode,
+  size, modification time with nanoseconds; the `struct stat` offsets of Linux and Darwin), so it does not hold the attach thread
+  (`status` is answered while watching), and nothing of the session crosses a thread. (b) **The files**: the session's live module files
+  (serve.liveload's copies, the main file among them) and the regular files under the `dirs` (depth first, dot names skipped: an
+  editor's temporary files); a file in the `dirs` that is not a module file is a "feature file": its change reruns without a load. No
+  default directory: `:watch on` alone watches the module files. (c) **The events** are the answers with an `event` field first:
+  `{"event":"load", "ok":.., "file":.., "swapped":..}` per changed module file (as `load` answers), then, when every load was accepted
+  and a test ran before in the session, `{"event":"test", "id":"watch", ..}` when the rerun (`last: true`) ends; a refused load emits
+  its refusal and reruns nothing, and a change before any test reruns nothing (no event but the loads). (d) The watch belongs to the
+  connection: it ends with `watch off` or when the connection closes. The terminal client prints the events as they come between
+  inputs (the prompt written again after each); `--json` forwards them as lines. Measured on lilnas under a running gate (load average
+  above 60): an edit of the handler's file to the rerun's event, 3.4 s (the design's 1.5 s is the idle figure; the test asserts 10 s).
