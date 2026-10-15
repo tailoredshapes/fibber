@@ -235,8 +235,37 @@
                    (if fieldless (lcx-construct cx e t v []) (Err "a constructor as a value"))))
               (nil (Err "a constructor as a value"))))))))
 
-;; A `def`'s value: its constant, or a load of the slot the init functions fill before `main`. Rust: lower/objects.rs:233 (the `Def` arm)
+;; A `def`'s value: its constant, or a load of the slot the init functions fill before `main`; in live mode a def of the program's own
+;; read by a body that is not a def's initialiser loads its live slot (`live-read`). Rust: lower/objects.rs:233 (the `Def` arm)
 (defun def-value :private (cx: LowerCx d: i64) -> (Result V str)
+  (match (live-read cx d)
+    ((some v) (Ok v))
+    (nil (def-value-plain cx d))))
+
+;; The def's value and whether it is a constant: its constant value, or the slot of a def made at run time.
+(defun def-entry :private (p: Program d: i64) -> (Option (Pair DefValue bool))
+  (match (get @(. p def-values) d)
+    ((some v) (some (Pair v true)))
+    (nil (match (get @(. p def-slots) d) ((some v) (some (Pair v false))) (nil nil)))))
+
+;; LT4 (docs/design/live-repl.md 9): in live mode, outside a def's initialiser (which reads the value the program text gives), a `def` of
+;; the program's own with a slot (emit.program `live-def-slot`) is read with an acquire load of `live.d.NAME`, so that a redefinition's
+;; release store (`live.d.NAME.set`) is seen on the next read. A constant's slot and setter are made where it is first read, the slot
+;; holding the constant. Nothing of this happens outside live mode.
+(defun live-read :private (cx: LowerCx d: i64) -> (Option V)
+  (let ((p (. cx p)))
+    (if (or (not (. p live)) (match (. (. cx inst) key) ((BodyDef _) true) (_ false)))
+        nil
+        (match (def-entry p d)
+          ((some [(DefValue (some e) (some l)) constant])
+           (match (live-def-slot p d (some l))
+             (nil nil)
+             ((some slot)
+              (do (when constant (do (live-const-slot p d) ()))
+                  (some (fb-val (. cx b) (nx/node (la/KAtomicLoad la/ScSystem la/OAcquire (lir-type l) (nx/global slot))) l))))))
+          (_ nil)))))
+
+(defun def-value-plain :private (cx: LowerCx d: i64) -> (Result V str)
   (match (get @(. (. cx p) def-values) d)
     ((some (DefValue expr (some l))) (Ok (VVal (unwrap expr) l)))
     ((some (DefValue _ nil)) (Ok VUnit))

@@ -19,8 +19,8 @@
 (defstruct DefValue (expr: (Option la/LExpr) ty: (Option LirTy)))
 
 ;; One `def` made at run time (X8, L15): the `def`, the module that defines it, the code name of its initialiser's body, and whether
-;; its value is an object to make immortal. Rust: inits.rs:42 Init
-(defstruct Init (def-id: i64 module: i64 body: str object: bool))
+;; its value is an object to make immortal, and its slot (`def.slot.N`; `live.d.NAME` in live mode, `live-def-slot`). Rust: inits.rs:42 Init
+(defstruct Init (def-id: i64 module: i64 body: str object: bool slot: str))
 
 ;; Rust: program.rs:37 Program (13 fields; `c` is two) and, since X8, `def_slots` (the slot, a global of the module, and the type of
 ;; every `def` made at run time, as a `DefValue`) and `inits` (those `def`s in the order their init functions make them)
@@ -221,6 +221,36 @@
        (match @(. g live-modules)
          (nil (mods/sees-implicit (g-module-name g m) (mods/implicit-lib)))
          ((some names) (or (= m @(. g main)) (contains? names (g-module-name g m)))))))
+
+;; The slot of a `def` of the program's own modules in live mode (docs/design/live-repl.md 9, package LT4): `live.d.NAME` (the body's name
+;; with `live.`), a global the bodies read with an acquire load and a session stores with `live.d.NAME.set` (a release store), so that a
+;; redefinition of the `def` is seen by resident code on its next read. Only a value of one word or less has one (an atomic load needs a
+;; scalar); nil otherwise, and always outside live mode: a plain emit reads a constant inline and a run-time def from `def.slot.N`.
+(defun live-def-slot (p: Program d: i64 l: (Option LirTy)) -> (Option str)
+  (let ((g (program-g p)))
+    (if (and (. p live) (not @(. p macro-module)) (program-module? g (. (g-def g d) module))
+             (match l ((some (LirI8)) true) ((some (LirI16)) true) ((some (LirI32)) true) ((some (LirI64)) true)
+                      ((some (LirFloat)) true) ((some (LirDouble)) true) ((some (LirPtr)) true) (_ false)))
+        (some (str "live." (body-name g (BodyDef d) [])))
+        nil)))
+
+;; The live slot of a constant `def` (its constant the slot's initial value) and its setter, made once in the program; nil when the
+;; def is not a constant or has no slot. A body that reads the def makes them (emit.lower.objects `live-read`), and so does a session's
+;; request for the def's initialiser (emit.compile `request-def`: the session compares the new constant with the resident one).
+(defun live-const-slot (p: Program d: i64) -> (Option str)
+  (match (get @(. p def-values) d)
+    ((some (DefValue (some e) (some l)))
+     (match (live-def-slot p d (some l))
+       (nil nil)
+       ((some slot) (do (statics-item (. p statics) slot (la/ItGlobal (la/LGlobalDef slot (lir-type l) e false (la/LModifiers la/lk-internal false) 0 false)))
+                        (statics-item (. p statics) (str slot ".set") (live-def-setter slot (lir-type l)))
+                        (some slot)))))
+    (_ nil)))
+
+;; `live.d.NAME.set V`: the release store of a new value into the slot `slot` (external: the prune keeps it, a session calls it).
+(defun live-def-setter (slot: str ty: lt/LType) -> la/LItem
+  (la/ItDefine (f/external (f/make (str slot ".set") nil [(Pair "v" ty)] lt/cc-c
+                                   [(f/block "entry" [(node/node (la/KAtomicStore la/ScSystem la/ORelease (node/local "v") (node/global slot))) (node/ret nil)])]))))
 
 ;; Whether the body `key` is emitted behind a stub: live mode, not a macro module, a function or a method of the program's own modules.
 (defun live-body? (p: Program key: BodyKey) -> bool

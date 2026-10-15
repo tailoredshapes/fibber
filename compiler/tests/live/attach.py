@@ -6,8 +6,8 @@ usage: attach.py FIBC [ROOT]    Exit 0 when every check held. Each check prints 
 What is tested: the socket (0700 directory, 0600 file, the path on standard error and in hello); hello; the design's atom transcript
 (a `def` counter answers 1 then 2); a def read by three later inputs; a trap answered `failed` and the next input working; the
 program's own defs read and changed live while its worker runs; type, inspect, status; new functions, records and closures kept in an
-atom; a function defined again is swapped (LV2: compiler/tests/live/swap.py is the swap's own test); the refusals (live/Def, live/Main,
-the checker's); 1,000 malformed lines; a second client waiting; the terminal and
+atom; a function defined again is swapped (LV2: compiler/tests/live/swap.py is the swap's own test); a session def defined again (defonce keeps it, def
+makes it again: LT4); the refusals (live/Main, the checker's); 1,000 malformed lines; a second client waiting; the terminal and
 --json clients; `not-live`; a wrong uid refused (planted: FIB_LIVE_OWN_UID); a program that does not check; the end of the program
 through the socket, its output and exit as `fibc run`'s."""
 import json, os, random, shutil, signal, socket, stat, subprocess, sys, tempfile, time
@@ -121,7 +121,7 @@ check('type of def', (c.ask(op='type', expr='counter') or {}).get('type') == '(A
 i = c.ask(op='inspect', name='names')
 check('inspect', i and i.get('value') == '["a" "b"]' and i.get('type') == '(Vec str)', i)
 s = c.ask(op='status')
-check('status', s and s.get('generation') == 0 and s['generations']['count'] == 1 and s['values']['count'] >= 1 and 'def.slot' in ''.join(s['values']['resident']) and s.get('inputs', 0) > 5 and s.get('pid') == a.p.pid, s)   # names and late are constants: static data, no slot
+check('status', s and s.get('generation') == 0 and s['generations']['count'] == 1 and s['values']['count'] >= 1 and ('def.slot' in ''.join(s['values']['resident']) or 'live.d.' in ''.join(s['values']['resident'])) and s.get('inputs', 0) > 5 and s.get('pid') == a.p.pid, s)   # names and late are constants: static data, no slot
 
 # ---- new definitions after boot: a function, a record, a closure kept in an atom
 check('defun', (c.eval('(defun twice (x: i64) -> i64 (* 2 x))') or {}).get('defined') == ['twice'] and c.value('(twice 21)') == '42')
@@ -136,8 +136,11 @@ check('unit expression', (lambda r: r and r.get('ok') and 'value' not in r)(c.ev
 # ---- refusals: nothing changes
 r = c.eval('(defun twice (x: i64) -> i64 (* 3 x))')
 check('swapped', r and r.get('ok') and r.get('swapped') == ['twice'] and r.get('generation') == 1 and c.value('(twice 21)') == '63', r)
+r = c.eval('(defonce counter: (Atom i64) (atom 9))')
+check('defonce keeps the value', r and r.get('ok') and c.value('@counter') == '3', r)
 r = c.eval('(def counter: (Atom i64) (atom 9))')
-check('def again refused', r and r.get('ok') is False and r.get('code') == 'live/Def' and c.value('@counter') == '3', r)
+check('def again re-evaluated (LT4)', r and r.get('ok') and c.value('@counter') == '9' and c.value('(bump)') == '10', r)
+check('def again: counter back to 3', (c.eval('(def counter: (Atom i64) (atom 3))') or {}).get('ok') and c.value('@counter') == '3')
 r = c.eval('(defun main () -> i64 0)')
 check('main refused', r and r.get('code') == 'live/Main', r)
 r = c.eval('(+ 1 "a")')

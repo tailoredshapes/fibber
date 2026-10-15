@@ -587,3 +587,32 @@ every second in the background, all 200 or 404/410, none refused). What it does 
   all use it; a nested closure literal (`l.l.NAME.gK.N.M`) now carries its generation too (serve.livetable `strip-literal`), so the
   split keeps it with the code. compiler/tests/live/quotes.sh pins it (the mutant `quote-shared` of scripts/mutant-live.sh), and
   test.sh runs the base's spec after its step edit.
+- **Status 2026-10-15, LT4** (emit.program `live-def-slot` and `live-def-setter`, emit.lower.objects `live-read`, emit.inits, emit.prune
+  `Init.slot`, emit.compile `request-def` (`BodyRequest.impl` "def:"); serve.livedefs, serve.liveexpr (the expressions, out of
+  serve.livesess); serve.liveswap, serve.liveload, serve.liveretire; the test compiler/tests/live/defs.sh over defs-app.fib and
+  defs-cfg.fib, its TSAN part over defs-tsan.fib with defs-swapper.lir; the mutants `def-slot-plain-store`, `old-def-freed`,
+  `init-run-twice` of scripts/mutant-live.sh). Built as the owner's decision 1 of docs/design/live-repl.md 9 says, with these
+  differences from the row above: (a) **the old value is dropped, not leaked**: a redefinition stores the new value with the setter
+  `live.d.NAME.set` (a release store; every body of the program's own reads `live.d.NAME` with an acquire load, live mode only) and puts
+  the old object on the session's list; `retire` (at quiescence, serve.liveretire) releases it (`fib.release`, the destructor included)
+  unless the code of a family a parked thread can be in reads the slot (its frame may borrow the value count-free across the pause point;
+  the value waits for the next retirement). A copy the program stored holds a count of its own (a borrowed `def` stored is retained),
+  so a drop frees only what nobody holds. A new value is shared (`fib.share`) and keeps its count; the program's first value, made before
+  `main` and immortal, or static data, is never freed (`status.defs.immortal` counts it). `status.defs` and `retire`'s `defs`:
+  `redefined`, `retiring`, `dropped`, `immortal`. (b) **A type change is refused, not re-checked**: `live/Def` names both types
+  (`limit is a def of type i64 in the running program and str here`); a change its dependents do not survive is the checker's
+  refusal first. (c) **A value of more than one word** (an `Option`, a `dyn`, a `bool`'s `i1`) has no slot (resident code holds it
+  inline): its redefinition is `live/Def`. (d) **`defonce`** (the library's macro, a `def`) keeps the value: the text is accepted and
+  nothing runs; a plain `def` re-evaluates (Clojure's `def`). (e) **A constant** is stored, not run: its slot's initial value is the
+  constant, and any input whose program has the slot with another value than the running program holds (a redefinition, or a
+  required module edited on disk and read anew: compiler/tests/live/defcache.sh) stores the program's value first (serve.livedefs
+  `sync-constants`; the old constant is static data, never freed). A constant no resident body reads has no slot: the text is enough,
+  and the next program that reads it makes the slot. A run-time `def` is evaluated by an entry of the input. (f) A new `def`
+  of a loaded file is made as a session `def` is (serve.livedefs `make-slots`), its initialiser run once; a removed `def` is accepted
+  (the checker refuses a removal that a remaining definition needs). (g) An initialiser that traps aborts the program, as a session
+  `def`'s does (LV1 (d)). (h) A plain emit is byte-identical: `fibc emit compiler/fibc.fib` by this F and by main's F compare equal,
+  and defs.sh's guard checks that a plain emit of the app has no `live.d.` and that a second `def` of a name is still `x is already
+  defined`. Measured on lilnas: 1,000 redefinitions of an i64 (a constant, stored) and a 256-element vector (made at run time) in one
+  input each while 8 threads read both, 53 to 58 s (about 55 ms each); every read was 3 or 5 and the sum 768 or 1280; `retire` dropped
+  every old vector made at run time. Each redefinition keeps its module for good (the new initialiser, its entry, a new constant's
+  static data), as LV1 (e) keeps an input's: a thousand redefinitions are a thousand kept modules.

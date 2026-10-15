@@ -1,0 +1,17 @@
+;; compiler/tests/live/defs-swapper.lir: the redefiner of compiler/tests/live/defs-tsan.fib, appended to the program's emitted lIR by
+;; compiler/tests/live/defs.sh (scripts/tsan.sh TSAN_APPEND; the program's `extern` of it is dropped). `fib_live_defs_swap N` stores 5
+;; and then 3 into the slot of `limit` through its setter `live.d.limit.set` (the release store a session's redefinition makes), N times,
+;; a yield after each store so that the readers see both.
+(define (fib_live_defs_swap i64) ((i64 n))
+  (block entry (br loop))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (next i2))))
+      (br (icmp slt i n) one done)))
+  (block one
+    (call @live.d.limit.set (i64 5))
+    (call @sched_yield)
+    (call @live.d.limit.set (i64 3))
+    (call @sched_yield)
+    (br next))
+  (block next (let ((i2 (add i (i64 1)))) (br loop)))
+  (block done (ret n)))

@@ -7,7 +7,8 @@ What is tested: transcripts 1, 4 and 5 of the design through `fibc repl --connec
 numbers are this sequence's); a swapped function called through a closure value made before the swap (the server's handler, a
 function kept in an atom) runs the new body; a method swap; a generic function with two instantiations swaps both; 200 swaps of
 `work` between two bodies while the worker calls it (every answer is one of the two; the app lives; `status` counts the generations);
-a new function swaps nothing; the text refusals (live/Def, live/Layout, live/Protocol, live/Main) and the checker's; a trap after a
+a new function swaps nothing; a `defonce` of a def keeps it (LT4); the text refusals (live/Layout,
+live/Protocol, live/Main) and the checker's; a trap after a
 swap is still caught; the end of the program through the socket.
 The mutants of scripts/mutant-live.sh that must make this fail: patch-before-jit, old-tracker-removed (the 200 swaps crash the app),
 summary-ignored and signature-ignored (transcript 5's refusals do not come, and the accepted change breaks the app)."""
@@ -179,8 +180,9 @@ i = c.ask(op='inspect', name='thrice')
 check('inspect a function', i.get('generation') == 8 and 'f.thrice.g8' in i.get('bodies', []) and 'f.thrice.owned.g8' in i.get('bodies', []), i)
 
 # ---- the text refusals, each unchanged
-for name, text, code in [('def', '(def items: (Atom (Map i64 Item)) (atom {}))', 'live/Def'),
-                         ('type', '(defrecord Item (id: i64 name: str kind: str))', 'live/Layout'),
+r = c.eval('(defonce items: (Atom (Map i64 Item)) (atom {}))')
+check('defonce of a def keeps it', r.get('ok') is True and r.get('generation') == 8 and get(port, '/items/2') == (200, 'pear'), r)
+for name, text, code in [('type', '(defrecord Item (id: i64 name: str kind: str))', 'live/Layout'),
                          ('protocol', '(defprotocol Greet (greet (self) -> str) (wave (self) -> str))', 'live/Protocol'),
                          ('main', '(defun main () -> i64 0)', 'live/Main')]:
     r = c.eval(text)

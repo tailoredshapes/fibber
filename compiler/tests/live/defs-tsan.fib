@@ -1,0 +1,30 @@
+;; result: 0
+(ns main (:require [fib.os.live :as live]))
+;; The ThreadSanitizer program of compiler/tests/live/defs.sh (package LT4): the slot of a redefinable `def` under TSAN without a session.
+;; Emitted with FIB_LIVE=1, a `def` of the program is read by every body with an acquire load of its slot `live.d.NAME` and stored by
+;; `live.d.NAME.set` (a release store: emit.program `live-def-slot`, `live-def-setter`, what a session's redefinition calls); its lIR gets
+;; compiler/tests/live/defs-swapper.lir appended (scripts/tsan.sh TSAN_APPEND): `fib_live_defs_swap N` stores 5 and 3 into `limit`
+;; through the setter N times. Eight spawned workers read `limit` through a function meanwhile and count a value that is neither; the
+;; result is that count: 0. A plain store in the setter (scripts/mutant-live.sh def-slot-plain-store) is a report.
+;;   defs-tsan SWAPS READS     (default 300 swaps, 20000 reads per thread)
+(extern fib_live_defs_swap :private (i64) -> i64)
+
+(def limit: i64 3)
+
+(defun read-limit () -> i64 limit)
+
+(defun worker (k: i64) -> i64
+  (loop ((i 0) (b 0))
+    (if (< i k)
+        (let ((l (read-limit))) (recur (+ i 1) (if (or (= l 3) (= l 5)) b (+ b 1))))
+        b)))
+
+(defun arg-or (i: i64 default: i64) -> i64
+  (let ((as (vec (args)))) (if (> (count as) i) (unwrap-or (parse-long (nth as i)) default) default)))
+
+(defun main () -> i64
+  (let ((swaps (arg-or 1 300)) (reads (arg-or 2 20000)))
+    (let ((ws (mapv (fn (i: i64) -> (Task i64) (spawn (fn () -> i64 (worker reads)))) (vec (range 8))))
+          (sw (spawn (fn () -> i64 (unsafe (fib_live_defs_swap swaps))))))
+      (let ((bad (reduce + 0 (mapv (fn (t: (Task i64)) -> i64 (join t)) ws))))
+        (do (join sw) bad)))))

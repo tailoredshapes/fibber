@@ -7,7 +7,7 @@
 ;; calls any more) keeps its slot as it is.
 (ns serve.livetable
   (:require [emit.program :as ep] [emit.names :as en] [types.ty :as ty] [types.scheme :as sc] [types.decls :as td]
-            [types.table :as tb] [own.program :as op] [own.driver :as od] [types.dump.scheme :as ds]))
+            [types.table :as tb] [own.program :as op] [own.driver :as od] [types.dump.scheme :as ds] [types.display :as tdi]))
 
 ;; A generation added under a tracker: its number, the tracker, the module's name, the bodies it defines, the names of the code
 ;; items that pin it (a closure literal, a closure constant, a vtable: serve.livesplit; empty when it can be retired), and the items
@@ -144,3 +144,25 @@
       (if (= stripped code) nil (parse-long (str-slice code (+ (str-len stripped) 2) (str-len code)))))))
 
 (defun family-count (t: Table) -> i64 (count (. t families)))
+;; ---- defs (package LT4, serve.livedefs)
+
+;; A value a redefinition took out of its slot `slot` (`live.d.NAME`), dropped at a retirement (`value` is the object's address).
+(defstruct RetiredDef (slot: str value: i64))
+
+;; The defs of a session: each `def`'s type as text by its body name (`d.NAME`, what a redefinition must keep), the values waiting for a
+;; retirement, the address of the session's drop function (0 before the first redefinition of an object), and the counts: the
+;; redefinitions applied (a constant's stores included), the old values dropped (freed, destructor included), and the old values that were immortal (a `def` made
+;; before `main` or static data: never freed).
+;; `stored`: the initial value (as lIR text) of each constant's live slot as last stored by a session, where it differs from the base's.
+(defstruct DefState (types: (Map str str) retired: (Vec RetiredDef) drop: i64 redefined: i64 dropped: i64 immortal: i64 stored: (Map str str)))
+
+(defun def-state-new () -> DefState (DefState {} [] 0 0 0 0 {}))
+
+;; The type of every `def` of `c`'s program as text, by its body name.
+(defun def-types-of (c: od/Checked) -> (Map str str)
+  (let ((g (. (. c typed) globals)))
+    (reduce (fn (acc: (Map str str) d: i64)
+              (match (get (. (. c typed) def-types) d)
+                ((some t) (assoc acc (en/body-name g (op/BodyDef d) []) (tdi/printer-ty (tdi/printer-new g) t)))
+                (nil acc)))
+            {} (range (tb/table-count (. g defs))))))
