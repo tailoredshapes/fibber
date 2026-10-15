@@ -7,7 +7,7 @@
 ;; set and holds what needs no body, the runtime and `main`.
 ;; `compile-macro` (E11) is the macro-time module of one `defmacro` (macros/abi.rs's text is emit.macros.abi's).
 (ns emit.compile
-  (:require [fib.string :as s] [emit.defs.astmod :as am] [emit.cpucheck :as cc] [emit.live :as live] [emit.wasi :as wasi] [expand.targetos :as tos] [types.targets :as tt] [emit.prune :as pr] [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f] [lir.print :as print])
+  (:require [fib.string :as s] [emit.defs.astmod :as am] [emit.cpucheck :as cc] [emit.live :as live] [emit.wasi :as wasi] [expand.targetos :as tos] [types.targets :as tgt] [emit.typetext :as tt] [emit.prune :as pr] [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f] [lir.print :as print])
   (:use types.ty types.table types.decls types.init types.program own.program emit.value emit.names emit.objects emit.statics emit.program emit.inits
         emit.assemble emit.defs.mod emit.lower.cx emit.lower.mod emit.macros.abi types.target))
 
@@ -102,7 +102,15 @@
 ;; the specialisation (none for a monomorphic function); or, with `impl` (`impl:PROTO HEAD`, emit.live `impl-key`), every method of that
 ;; instance. A name the program has no function of is skipped, as is a body the ownership pass made no plan for (an all-owned body of
 ;; a function whose value nothing takes).
-(defstruct BodyRequest (name: str owned: bool tys: (Vec Ty) impl: (Option str)))
+;; `tys-text` (LE3): a registered specialisation's types as text (emit.live `tys-text`), resolved in this program's globals when the
+;; request is made (`request-tys`); a swap requests a generic body this way, since the queue mode does not reach it from a resident
+;; caller. Empty for a monomorphic request, which uses `tys` as before.
+(defstruct BodyRequest (name: str owned: bool tys: (Vec Ty) impl: (Option str) tys-text: (Vec str)))
+
+;; The types of a request in this program's terms: `tys` when the request has no text; else the text read back (emit.typetext), or
+;; nil when a type it names has no definition here (an input's private type: the specialisation keeps its slot, docs 2.4 item 4).
+(defun request-tys :private (typed: TypedProgram r: BodyRequest) -> (Option (Vec Ty))
+  (if (empty? (. r tys-text)) (some (. r tys)) (tt/tys-of-text (. typed globals) (. r tys-text))))
 
 ;; The bodies of `requests` queued.
 (defun request-all :private (q: Program typed: TypedProgram owned: OwnedProgram requests: (Vec BodyRequest)) -> unit
@@ -112,7 +120,8 @@
       (nil (match (program-fun typed (. r name))
              (nil ())
              ((some f) (let ((key (if (. r owned) (BodyAllOwned f) (BodyFun f))))
-                         (when (contains? (. owned bodies) key) (do (program-request q key (. r tys)) ())))))))))
+                         (when (contains? (. owned bodies) key)
+                           (match (request-tys typed r) ((some tys) (do (program-request q key tys) ())) (nil ()))))))))))
 
 ;; The methods of the instances keyed `key` (and their all-owned bodies where a method value may run them).
 (defun request-impl :private (q: Program typed: TypedProgram owned: OwnedProgram key: str) -> unit
@@ -278,7 +287,7 @@
 ;; Rust: compile.rs:53 compile_executable
 (defun compile-executable-ast (typed: TypedProgram owned: OwnedProgram) -> (Result Emitted str)
   (finished-product typed
-    (cond (tt/kernel-triple? (sys-getenv "FIB_TARGET_TRIPLE")) (compile-kernels typed owned)
+    (cond (tgt/kernel-triple? (sys-getenv "FIB_TARGET_TRIPLE")) (compile-kernels typed owned)
           (empty? (export-specs)) (compile-module typed owned true)
           :else (compile-library typed owned (export-specs)))))
 

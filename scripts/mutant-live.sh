@@ -51,6 +51,16 @@
 #   retire-without-pause `retire` does not ask whether the program is quiescent: the old generations compiler/tests/live/stress.sh --socket-only
 #                        of `f` are freed under 8 threads and the pool calling it (LV3, 3.3)        (the refusal does not come; the program dies
 #                                                                                                   in freed code: nobody answers the next check)
+#   resident-by-family   the queue mode checks the family name, not the body's code name, for        compiler/tests/live/queue.sh (the swapped
+#                        residency: the swapped generation is itself resident, so it is never        generation is answered by name, never lowered:
+#                        lowered (LE3, docs/design/live-incremental.md 2.3)                           the handler swap has no effect)
+#   skip-new-specialisation  a specialisation the running program lacks is answered by name instead   compiler/tests/live/queue.sh (`probe`'s new
+#                        of lowered: ORC's lookup of the missing code fails (LE3)                      `box` specialisation is missing: /probe fails)
+#   literal-counter-per-program  a generation's bodies and literals do not carry the generation, so    compiler/tests/live/queue.sh (the handler's
+#                        a later swap's names collide with the resident ones (LE3)                     generation collides: the swap is refused/broken)
+#   specialisation-not-requested  a swap requests only the specialisations `main` reaches, not the     compiler/tests/live/queue.sh (`dup`'s f64
+#                        family's registered ones: a generic reached through a resident caller is      instantiation is not swapped: /calc is wrong)
+#                        missed (LE3)
 #   patch-plain-store    the runtime's `fib.live-patch` (rt/live.lir, the store of a swap) is a     compiler/tests/live/stress.sh --tsan-only (the
 #                        plain store, not a release store: a caller may jump into code the swap    stub's acquire load against a plain store is
 #                        has not finished writing (LV3)                                             a NEW ThreadSanitizer report)
@@ -60,7 +70,7 @@
 # A mutant of lib/ alone (sink-ignored, override-ignored) builds nothing: the case's `roots:` header names the copy's lib, and FIBC runs it.
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -102,6 +112,10 @@ case $MODE in
   defcache-no-items) patch compiler/emit/defs/cache.fib '                (do (defs-append defs it)' '                (do ()' ;;
   defcache-verify-blind) patch compiler/emit/defs/cache.fib '    ((some e) (if (= (. e source) source) (some e) nil))' '    ((some e) (some e))'
                          patch compiler/emit/defs/jit.fib '        (if (= kept got)' '        (if true' ;;
+  resident-by-family) patch compiler/emit/program.fib '(contains? @(. p resident) (body-code-name p key (body-name (program-g p) key tys)))' '(contains? @(. p resident) (family-name (program-g p) key))' ;;
+  skip-new-specialisation) patch compiler/emit/program.fib '(contains? @(. p resident) (body-code-name p key (body-name (program-g p) key tys)))' '(or (not (empty? tys)) (contains? @(. p resident) (body-code-name p key (body-name (program-g p) key tys))))' ;;
+  literal-counter-per-program) patch compiler/emit/program.fib '(generation-name name (family-generation p (family-name (program-g p) key)))' 'name' ;;
+  specialisation-not-requested) patch compiler/serve/liveswap.fib '(ec/BodyRequest f (. b owned) [] nil (. b tys-text))' '(ec/BodyRequest f (. b owned) [] nil [])' ;;
   retire-without-pause) patch compiler/serve/live.fib '    (if (not (and (. t pausing) (. t quiescent)))' '    (if false' ;;
   patch-plain-store) patch compiler/emit/runtime.fib '  (block entry (atomic-store release (inttoptr ptr v) slot) (ret)))' '  (block entry (store (inttoptr ptr v) slot) (ret)))' ;;
   *) echo "mutant-live: unknown mode $MODE" >&2; exit 2 ;;
@@ -127,6 +141,7 @@ case $MODE in
   value-reevaluated|trap-not-caught) what="the attach test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/attach.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored) what="the swap test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/swap.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   defcache-*) what="the defcache test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/defcache.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
+  resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested) what="the queue test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/queue.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   deps-stubbed-by-default|project-paths-not-stubbed) what="the project test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/project.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   *) what="case 8423"  # the case's `roots:` header names ../../lib: run from a copy of cases/stdlib beside the mutated lib
      mkdir -p "$OUT/cases/stdlib"; cp -r "$R"/cases/stdlib/8423-*.fib "$R/cases/stdlib/support" "$OUT/cases/stdlib/"
