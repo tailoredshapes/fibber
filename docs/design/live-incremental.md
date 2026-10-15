@@ -459,7 +459,7 @@ Decisions for the owner:
   is the rule's name and the count of live modules (`project paths (3 modules); --live-deps widens`, or `every module not named
   fib.*`), not the per-library listing of 3.6; (g) the main module's own file is loaded as an `eval` of the definitions that differ from
   the file as last loaded (the session's own inputs are not in that copy), with the file's `ns` clauses; a definition the file dropped is
-  `live/Removed`; (h) `:type` reads the files, not the overrides (`rc/type-of-expr` is unchanged). Measured on the load test's two-module
+  `live/Removed`; (h) `:type` reads the overrides as every input does (`rc/type-of-expr-texts`; it read the files until the live bugs' fix). Measured on the load test's two-module
   app on lilnas under a running gate (load average above 30): a `load` that swaps one function is `check 429 to 437 ms, emit 2 ms, jit
   2 ms` (the check is 59 modules, 8 expanded again: the loaded module and the 7 after it in the load order, 3.3); the meshql scenario of
   live-meshql.md 7 is a step of meshql-fib's `scripts/live-demo.py` on its `live-dev` branch (the on-item edit loaded, curl 410, the

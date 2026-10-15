@@ -8,12 +8,12 @@ What is tested: an edit of `route` loaded: `swapped: ["routes/route"]`, the sess
 answer the edit; a bad edit is refused with a diagnostic at src/routes.fib:L:C and nothing changes; a file with one refused definition
 (an arity change of `route`, which app.fib calls; a def whose type changes, live/Def, LT4) applies nothing: the good edit of `greet` in the same file is
 not swapped and the answer lists the refusal; a removed function is live/Removed and still callable; `reload` after a second edit swaps
-again and `reload` with no change swaps nothing; an edit of a comment only swaps nothing (LM2); a half-saved file on disk is not seen by an expression input (the override), `status`
+again and `reload` with no change swaps nothing; an edit of a comment only swaps nothing (LM2); a half-saved file on disk is not seen by an expression input nor `:type` (the override), `status`
 says the file is stale; a new function in the loaded file is defined and then swapped; a file whose module the program lacks is
 live/NotLoaded with the `require` hint; a load of the main module's file defines its new function; the terminal client's `:load`,
 `:status` and `:reload` lines; the app ends through the socket.
 The mutants of scripts/mutant-live.sh that must make this fail: partial-load, load-reads-disk, prefix-dropped, removed-ignored,
-rules-at-file-start."""
+rules-at-file-start, type-reads-disk."""
 import json, os, re, shutil, socket, subprocess, sys, tempfile, time
 
 fibc = os.path.abspath(sys.argv[1])
@@ -200,6 +200,8 @@ check('a comment-only edit swaps nothing', l.get('ok') is True and not l.get('sw
 write_routes(edited('(defun route (path: str) -> str (str prefix "? " path))', '(defun route (path: str) -> str (str prefix "?? " path', edited('(defun route (path: str) -> str (str prefix " " path))', '(defun route (path: str) -> str (str prefix "? " path))')))
 v = c.eval('(r/route "x")')
 check('an expression input runs the loaded text, not the half-saved disk file', v.get('value') == '"route? x"', v)
+t = c.ask(op='type', expr='(r/route "x")')
+check(':type reads the loaded text, not the half-saved disk file', t.get('ok') is True and t.get('type') == 'str', t)
 st = c.ask(op='status')
 check('status: stale while the disk differs', st.get('loaded') and st['loaded'][0]['stale'] is True, st.get('loaded'))
 r = c.ask(op='reload')
