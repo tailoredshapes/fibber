@@ -66,13 +66,13 @@
 ;; The bodies asked for whether or not `main` reaches them: the new functions', the registered bodies of the functions to swap that
 ;; are not specialisations (a specialisation is reached from `main`, or it was an input's: its types are that program's and cannot be
 ;; asked for again; it keeps its slot), and every method of the `impl`s redefined.
-(defun requests-of :private (sx: ls/Sess new-fns: (Vec str) families: (Vec str) impls: (Vec str)) -> (Vec ec/BodyRequest)
-  (into (into (conj (mapv (fn (nm: str) (ec/BodyRequest nm false [] nil [])) new-fns) (ec/BodyRequest "main" false [] nil []))
-              (mapv (fn (key: str) (ec/BodyRequest "" false [] (some key) [])) impls))
+(defun requests-of (sx: ls/Sess new-fns: (Vec str) families: (Vec str) impls: (Vec str)) -> (Vec ec/BodyRequest)
+  (into (into (conj (mapv (fn (nm: str) (ec/BodyRequest nm false [] nil [] nil)) new-fns) (ec/BodyRequest "main" false [] nil [] nil))
+              (mapv (fn (key: str) (ec/BodyRequest "" false [] (some key) [] nil)) impls))
         (vec (mapcat (fn (family: str)
-                       ;; every registered body of the family: a monomorphic one by name, a specialisation by its recorded type text
-                       ;; (LE3), since the queue mode does not reach either from a resident caller.
-                       (vec (keep (fn (b: ep/LiveBody) (match (. b fun) ((some f) (some (ec/BodyRequest f (. b owned) [] nil (. b tys-text)))) (nil nil)))
+                       ;; every registered body of the family: a monomorphic one by name (with its module, LM1), a specialisation by its
+                       ;; recorded type text (LE3), since the queue mode does not reach either from a resident caller.
+                       (vec (keep (fn (b: ep/LiveBody) (match (. b fun) ((some f) (some (ec/BodyRequest f (. b owned) [] nil (. b tys-text) (. b module)))) (nil nil)))
                                   (unwrap-or (get (ls/live-bodies sx) family) []))))
                      families))))
 
@@ -83,7 +83,7 @@
 
 ;; The program emitted with `families` under generation `gen`; the families among them the program made a body of (a generic function
 ;; nobody instantiates has none: it swaps into the text only).
-(defun emit-swapping :private (sx: ls/Sess c: od/Checked stats: inc/Stats requests: (Vec ec/BodyRequest) families: (Vec str) gen: i64)
+(defun emit-swapping (sx: ls/Sess c: od/Checked stats: inc/Stats requests: (Vec ec/BodyRequest) families: (Vec str) gen: i64)
     -> (Result (Pair ls/Made (Vec str)) (Vec dg/Diag))
   (do (ls/set-generations sx (reduce (fn (acc: (Map str i64) f: str) (assoc acc f gen)) (lt/generations-of @(. sx table)) families))
       (match (ls/emit-checked sx c stats requests)
@@ -120,7 +120,7 @@
           ((Err m) (Err m))
           ((Ok _) (recur (+ i 1)))))))
 
-(defun swap-all :private (sx: ls/Sess made: ls/Made families: (Vec str) gen: i64) -> (Result (Pair i64 i64) str)
+(defun swap-all (sx: ls/Sess made: ls/Made families: (Vec str) gen: i64) -> (Result (Pair i64 i64) str)
   (loop ((fs families) (jit 0) (patch 0))
     (match (first fs)
       (nil (Ok (Pair jit patch)))
@@ -136,7 +136,7 @@
   (mapv (fn (d: rc/Def) (. d name)) (filterv (fn (d: rc/Def) (not (replaced? sx d))) (ls/function-defs defs))))
 
 ;; What is kept after a refusal: the generations the next program emits under are the table's.
-(defun unchanged :private (sx: ls/Sess a: ls/Answer) -> ls/Answer
+(defun unchanged (sx: ls/Sess a: ls/Answer) -> ls/Answer
   (do (ls/set-generations sx (lt/generations-of @(. sx table))) a))
 
 ;; A definition input: refused by the text rules, else its program checked and settled (nothing of the session changes until the
@@ -149,7 +149,7 @@
      (let ((cs (rc/merge-clauses @(. (. sx rc) clauses) clauses)) (merged (rc/merge-defs @(. (. sx rc) defs) defs))
            (new-fns (new-functions sx defs)) (predicted (predicted-families sx defs)) (gen (+ 1 (. @(. sx table) generation))))
        (let ((at (+ 2 (rc/lines-in (rc/defs-text (vec (take (- (count merged) (count defs)) merged))))))
-             (fr (rc/front (. sx eng) (. sx rts) (rc/source-of cs merged "") "yes" true)))
+             (fr (rc/front-texts (. sx eng) (. sx rts) (rc/source-of cs merged "") "yes" true @(. sx texts))))
          (match (. fr checked)
            ((Err ds) (unchanged sx (ls/Refused (ls/shown-of sx ds at merged) ds "check" "")))
            ((Ok c) (match (lr/check-rules @(. sx table) c (session-defs sx))
@@ -177,7 +177,7 @@
                                (ls/Times (. (. made stats) total-ms) (. made emit-ms) jit patch) (. made stats)))))))))
 
 ;; A family as the answer names it: a function by its name, a method by its body's name.
-(defun shown-family :private (family: str) -> str
+(defun shown-family (family: str) -> str
   (if (s/starts-with? family "f.") (str-slice family 2 (str-len family)) family))
 
 ;; ---- inputs

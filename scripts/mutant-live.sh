@@ -73,13 +73,24 @@
 #                        (LT2, 3.2 step 1: it answers nothing yet and goes back to its socket)     two-second scenario is not answered in 100 ms)
 #   sink-shared-run      two runs at once: the `busy` refusal is gone and both write the session's compiler/tests/live/test.sh (the second `test`
 #                        one report file (LT2, 3.2: one test at a time)                             during the run is started, not refused `busy`)
+#   partial-load         a load whose text rules refuse a definition (a changed def) goes on to     compiler/tests/live/load.sh (the good edit of
+#                        swap the good definitions of the file: the half-applied state is read      `greet` in the file with the changed def is
+#                        (LM1, docs/design/live-incremental.md 3.5: all or nothing)                 swapped: "hi a" where "hello a" must stay)
+#   load-reads-disk      the loader ignores the loaded text and reads the module's file: an        compiler/tests/live/load.sh (the expression
+#                        expression input after a disk edit picks up a half-saved file (LM1, 3.4)   input after the half-saved file is refused)
+#   prefix-dropped       the family of a loaded module's function is named without the module      compiler/tests/live/load.sh (`routes/route` is
+#                        prefix (`f.route` for `f.routes.route`): nothing is swapped, the call      not in `swapped`; the next call answers the
+#                        answers the old body (LM1, 3.2; live-dev.md 6 item 2 of meshql-fib)        old value)
+#   removed-ignored      a function removed from the loaded file is accepted: its stub stays and    compiler/tests/live/load.sh (the load that
+#                        names a body the text no longer has (LM1, 3.5: live/Removed)               removes `helper` is not refused; the call of
+#                                                                                                   `helper` after it is refused by the checker)
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-live-MODE),
 #              MUT_QUICK=1 runs stubs.sh --quick (hello's golden and the deep recursion; no case tables: kills both mutants in under a minute after the build)
 #              and stress.sh --quick (100 swaps).
 # A mutant of lib/ alone (sink-ignored, override-ignored) builds nothing: the case's `roots:` header names the copy's lib, and FIBC runs it.
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|partial-load|load-reads-disk|prefix-dropped|removed-ignored}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -138,6 +149,12 @@ case $MODE in
   sink-shared-run) patch compiler/serve/livetest.fib '  (match @(. t running)
     ((some run) (some (busy r run)))' '  (match (if true nil @(. t running))
     ((some run) (some (busy r run)))' ;;
+  partial-load) patch compiler/serve/liveload.fib '      (if (not (empty? refusals))
+          (result file ns defs [] (refused-all file refusals))' '      (if false
+          (result file ns defs [] (refused-all file refusals))' ;;
+  load-reads-disk) patch compiler/expand/modules.fib '(visit-source ld ns file (unwrap-or (get (. ld texts) ns) source))' '(visit-source ld ns file source)' ;;
+  prefix-dropped) patch compiler/serve/liveload.fib '(cond (= (kind-of d) "fun") [(str "f." prefix (. d name))]' '(cond (= (kind-of d) "fun") [(str "f." (. d name))]' ;;
+  removed-ignored) patch compiler/serve/liveload.fib '    (cond (and (= what "removed") (or (= k "fun") (= k "impl")))' '    (cond (and (= what "never") (or (= k "fun") (= k "impl")))' ;;
   *) echo "mutant-live: unknown mode $MODE" >&2; exit 2 ;;
 esac
 case $MODE in
@@ -163,6 +180,7 @@ case $MODE in
   defcache-*) what="the defcache test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/defcache.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested) what="the queue test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/queue.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run) what="the live test op's test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/test.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
+  partial-load|load-reads-disk|prefix-dropped|removed-ignored) what="the load test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/load.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   deps-stubbed-by-default|project-paths-not-stubbed) what="the project test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/project.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   *) what="case 8423"  # the case's `roots:` header names ../../lib: run from a copy of cases/stdlib beside the mutated lib
      mkdir -p "$OUT/cases/stdlib"; cp -r "$R"/cases/stdlib/8423-*.fib "$R/cases/stdlib/support" "$OUT/cases/stdlib/"

@@ -7,7 +7,9 @@
 ;; pause, resume and retirement of serve.liveretire (package LV3): `pause` (`timeout_ms`, default 5000: the program's threads park at
 ;; their pause points; answers whether it is quiescent and what still runs), `resume`, `retire` (at quiescence: the generations no slot
 ;; names and no parked thread can be in are freed; otherwise `not-quiescent`); `test` (serve.livetest, package LT2 of
-;; docs/design/live-meshql.md): a spec run on a thread of its own, answered when it ends (`status.tests` meanwhile; `busy` for a second).
+;; docs/design/live-meshql.md): a spec run on a thread of its own, answered when it ends (`status.tests` meanwhile; `busy` for a second);
+;; `load` (`file`: a module of the program edited on disk, swapped as one input, serve.liveload, package LM1 of
+;; docs/design/live-incremental.md 3) and `reload` (every loaded file whose disk content changed), `status.loaded` and `status.live`.
 ;; Threads: the attach server runs on the driver's thread, which already holds the session (its engine and emitter are single-threaded
 ;; state: a `Cell`-bearing struct cannot be given to `spawn`); the program's `main` runs on a thread of its own (`live.run`: the runtime's
 ;; own main stack, rt/thread.lir `fib.run-main`), which says when it has ended (`done`) and wakes the accept. The design's 2.1 has the
@@ -15,12 +17,12 @@
 ;; the C library (what the program buffered is written). The socket is made before `main` is called, its path printed on standard error
 ;; and set as FIB_LIVE_SOCKET for the program.
 (ns serve.live
-  (:require [serve.livesess :as ls] [serve.liveswap :as lsw] [serve.livetable :as lt] [serve.liveretire :as lr] [serve.livetest :as ltt] [serve.livesock :as lsk] [serve.sock :as sk] [serve.proto :as p] [serve.incr :as inc] [serve.diag :as dg]
+  (:require [serve.livesess :as ls] [serve.liveswap :as lsw] [serve.livetable :as lt] [serve.liveretire :as lr] [serve.livetest :as ltt] [serve.liveload :as ll] [serve.livesock :as lsk] [serve.sock :as sk] [serve.proto :as p] [serve.incr :as inc] [serve.diag :as dg]
             [lsp.json :as j] [driver.native :as native] [driver.version :as v] [native.call :as call] [lair.ffi :as ffi]
             [expand.roots :as roots] [expand.maker :as mk] [fib.unix :as unix] [fib.string :as s]))
 
 ;; `conns` numbers the connections served: a `test` answers on the connection that asked, by number (a descriptor is reused by a later one).
-(defstruct Live (sx: ls/Sess listener: i64 path: str done: (Atom (Option i64)) served: (Cell i64) conns: (Cell i64) tests: ltt/Tests))
+(defstruct Live (sx: ls/Sess listener: i64 path: str done: (Atom (Option i64)) served: (Cell i64) conns: (Cell i64) tests: ltt/Tests loads: ll/Loads))
 
 (def poll-ms: i64 250)
 
@@ -38,19 +40,46 @@
                (Pair "quiescent" (j/JBool (. t quiescent))) (Pair "pool_workers" (j/json-int (. t workers))) (Pair "pool_active" (j/json-int (. t active)))
                (Pair "async_busy" (j/json-int (. t busy)))]))
 
-(defun answer-json :private (l: Live r: p/Req a: ls/Answer) -> str
+;; The fields of an input's answer, and whether it is `ok`.
+(defun answer-fields :private (l: Live a: ls/Answer) -> (Pair bool (Vec (Pair str j/JVal)))
   (match a
-    ((ls/Defined names st) (p/response r true [(Pair "defined" (strs names)) (Pair "generation" (j/json-int (lsw/generation (. l sx)))) (Pair "stats" (p/stats-json st))]))
+    ((ls/Defined names st) (Pair true [(Pair "defined" (strs names)) (Pair "generation" (j/json-int (lsw/generation (. l sx)))) (Pair "stats" (p/stats-json st))]))
     ((ls/Swapped defined swapped gen t st)
-     (p/response r true [(Pair "defined" (strs defined)) (Pair "swapped" (strs swapped)) (Pair "generation" (j/json-int gen)) (Pair "swap" (times-json t))
-                         (Pair "threads" (threads-json (lr/threads (. l sx)))) (Pair "stats" (p/stats-json st))]))
+     (Pair true [(Pair "defined" (strs defined)) (Pair "swapped" (strs swapped)) (Pair "generation" (j/json-int gen)) (Pair "swap" (times-json t))
+                 (Pair "threads" (threads-json (lr/threads (. l sx)))) (Pair "stats" (p/stats-json st))]))
     ((ls/Value text st stats)
-     (p/response r (= st 0) (into (match text ((some t) [(Pair "value" (j/json-str t))]) (nil []))
-                                  [(Pair "exit" (j/json-int st)) (Pair "stats" (p/stats-json stats))])))
-    ((ls/Failed m st) (p/response r false [(Pair "failed" (j/json-str m)) (Pair "exit" (j/json-int 134)) (Pair "trapped" (j/JBool true)) (Pair "stats" (p/stats-json st))]))
-    ((ls/Refused shown ds code hint) (p/response r false [(Pair "shown" (strs shown)) (Pair "diagnostics" (p/diags-json ds (map-empty))) (Pair "code" (j/json-str code))
-                                                        (Pair "hint" (j/json-str hint)) (Pair "generation" (j/json-int (lsw/generation (. l sx))))]))
-    ((ls/Broken m) (p/error-response r "internal" m))))
+     (Pair (= st 0) (into (match text ((some t) [(Pair "value" (j/json-str t))]) (nil []))
+                          [(Pair "exit" (j/json-int st)) (Pair "stats" (p/stats-json stats))])))
+    ((ls/Failed m st) (Pair false [(Pair "failed" (j/json-str m)) (Pair "exit" (j/json-int 134)) (Pair "trapped" (j/JBool true)) (Pair "stats" (p/stats-json st))]))
+    ((ls/Refused shown ds code hint) (Pair false [(Pair "shown" (strs shown)) (Pair "diagnostics" (p/diags-json ds (map-empty))) (Pair "code" (j/json-str code))
+                                                  (Pair "hint" (j/json-str hint)) (Pair "generation" (j/json-int (lsw/generation (. l sx))))]))
+    ((ls/Broken m) (Pair false [(Pair "error" (j/json-obj [(Pair "code" (j/json-str "internal")) (Pair "message" (j/json-str m))]))]))))
+
+(defun answer-json :private (l: Live r: p/Req a: ls/Answer) -> str
+  (let ((f (answer-fields l a))) (p/response r (. f fst) (. f snd))))
+
+;; The fields of a load's answer: the file, its module, its definitions and the changed ones, then the input's.
+(defun load-fields :private (l: Live x: ll/LoadResult) -> (Pair bool (Vec (Pair str j/JVal)))
+  (let ((f (answer-fields l (. x answer))))
+    (Pair (. f fst) (into [(Pair "file" (j/json-str (. x file))) (Pair "module" (j/json-str (. x module))) (Pair "definitions" (j/json-int (. x definitions)))
+                           (Pair "changed" (strs (. x changed)))]
+                          (. f snd)))))
+
+(defun op-load :private (l: Live r: p/Req) -> str
+  (match (p/field-str r "file")
+    (nil (p/error-response r "bad-request" "load needs a string `file`"))
+    ((some file) (let ((f (load-fields l (ll/load-file (. l loads) (. l sx) file)))) (p/response r (. f fst) (. f snd))))))
+
+;; `reload`: `loaded` holds one answer per file loaded again (none when no loaded file changed on disk); `ok` when every one was.
+(defun op-reload :private (l: Live r: p/Req) -> str
+  (let ((results (mapv (fn (x: ll/LoadResult) (load-fields l x)) (ll/reload-all (. l loads) (. l sx)))))
+    (p/response r (every? (fn (f: (Pair bool (Vec (Pair str j/JVal)))) (. f fst)) results)
+                [(Pair "loaded" (j/JArr (mapv (fn (f: (Pair bool (Vec (Pair str j/JVal)))) (j/json-obj (into [(Pair "ok" (j/JBool (. f fst)))] (. f snd)))) results)))
+                 (Pair "generation" (j/json-int (lsw/generation (. l sx))))])))
+
+(defun loaded-json :private (l: Live) -> j/JVal
+  (j/JArr (mapv (fn (p: (Pair (Pair str str) bool)) (j/json-obj [(Pair "file" (j/json-str (. (. p fst) fst))) (Pair "module" (j/json-str (. (. p fst) snd))) (Pair "stale" (j/JBool (. p snd)))]))
+                (ll/loaded-files (. l loads)))))
 
 (defun op-hello :private (l: Live r: p/Req) -> str
   (let ((t (lr/threads (. l sx))))
@@ -120,6 +149,7 @@
                         (Pair "values" (j/json-obj [(Pair "resident" (strs (ls/resident-names sx))) (Pair "count" (j/json-int (count (ls/resident-names sx))))]))
                         (Pair "threads" (threads-json (lr/threads sx)))
                         (Pair "tests" (ltt/tests-json (. l tests)))
+                        (Pair "loaded" (loaded-json l)) (Pair "live" (j/json-str (ll/rule-text (. l loads) sx)))
                         (Pair "inputs" (j/json-int (ls/inputs-made sx))) (Pair "requests" (j/json-int @(. l served)))
                         (Pair "pid" (j/json-int (sk/process-id))) (Pair "socket" (j/json-str (. l path)))])))
 
@@ -130,6 +160,8 @@
         (cond (= op "hello") (op-hello l r)
               (= op "test") (unwrap-or (ltt/op-test (. l sx) (. l tests) r conn) "")
               (= op "eval") (op-eval l r)
+              (= op "load") (op-load l r)
+              (= op "reload") (op-reload l r)
               (= op "type") (op-type l r)
               (= op "inspect") (op-inspect l r)
               (= op "status") (op-status l r)
@@ -211,14 +243,14 @@
 
 ;; The booted session on its socket (in a private directory): the path on standard error, `main` started on its thread, the requests
 ;; answered until it ends; its status. The socket is unlinked at the end.
-(defun serve-program :private (sx: ls/Sess dir: str path: str pid: i64) -> i64
+(defun serve-program :private (sx: ls/Sess dir: str path: str pid: i64 loads: ll/Loads) -> i64
   (match (ls/run-address sx)
     ((Err m) (do (eprintln (str "compile failed: " m)) 5))
     ((Ok addr)
      (match (lsk/listen-private dir path)
        ((Err m) (do (eprintln (str "fibc: live: " m)) 2))
        ((Ok listener)
-        (let ((l (Live sx listener path (atom nil) (cell 0) (cell 0) (ltt/tests-new (lsk/test-path dir pid) (lsk/test-err-path dir pid)))))
+        (let ((l (Live sx listener path (atom nil) (cell 0) (cell 0) (ltt/tests-new (lsk/test-path dir pid) (lsk/test-err-path dir pid)) loads)))
           (do (eprintln (str "fibc: live at " path))
               (let ((t (start-program addr (. l done) listener)))
                 (do (accept-loop l)
@@ -228,12 +260,13 @@
 ;; `fibc run --live FILE [-- arg..]`: the program checked and made resident (a program that does not check makes no socket), its
 ;; runtime started (`--trace`: FIB_TRACE is set only now, after the compiler's own JIT sessions are up, as `fibc run` sets it after
 ;; lowering; a later input that runs a macro traces that macro's session too), then the socket before `main`, its path in
-;; FIB_LIVE_SOCKET and on standard error, and an exit as `fibc run`'s.
+;; FIB_LIVE_SOCKET and on standard error, and an exit as `fibc run`'s. The session's copies of the live modules' text (serve.liveload)
+;; are read once the base is made, before `main` runs.
 (defun run-live (file: str args: (Vec str) opt: i64 trace: bool rts: roots/Roots rm: mk/RunnerMaker) -> i64
   (match (read-file file)
     (nil (do (eprintln (str "fibc: cannot read " file)) 2))
     ((some text)
-     (let ((dir (lsk/live-dir)) (pid (sk/process-id)))
+     (let ((dir (lsk/live-dir)) (pid (sk/process-id)) (loads (ll/loads-new)))
        (let ((path (lsk/socket-path dir pid)) (sx (ls/sess-new rts file opt (lsk/output-path dir pid))) (argv (program-args (into [file] args))))
          (do (native/setenv-set "FIB_LIVE_SOCKET" path)
              (match (ls/load-program sx text)
@@ -243,10 +276,11 @@
                   ((Err code) code)
                   ((Ok _)
                    (do (when trace (native/setenv-set "FIB_TRACE" "1"))
+                       (ll/snapshot-base loads sx text)
                        (match (ls/boot sx (. argv fst) (. argv snd))
                          ((Err m) (do (eprintln (str "compile failed: " m)) 5))
                          ((Ok _)
-                          (let ((code (serve-program sx dir path pid)))
+                          (let ((code (serve-program sx dir path pid loads)))
                             (do (unix/fd-unlink (lsk/output-path dir pid)) (unix/fd-unlink (lsk/test-path dir pid)) (unix/fd-unlink (lsk/test-err-path dir pid))
                                 (sk/exit-flush code)
                                 code)))))))))))))))

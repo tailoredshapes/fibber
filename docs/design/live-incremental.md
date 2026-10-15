@@ -13,7 +13,7 @@ Code read: `compiler/serve/{livesess,liveswap,livetable,liverules,live,liveclien
 `compiler/emit/{compile,program,mono,live,statics,assemble,lower/mod}.fib`, `compiler/emit/defs/{mod,jit,data}.fib`, `compiler/own/chain.fib`,
 `compiler/expand/modules.fib`, `compiler/pkg/modules.fib`, `compiler/driver/front.fib`, live-repl.md, live-meshql.md, persistent-checker.md §8.
 
-Contents: 0 the short answer; 1 the profile; 2 incremental emit; 3 module-level swap (`load`); 4 packages; 5 risks and decisions.
+Contents: 0 the short answer; 1 the profile; 2 incremental emit; 3 module-level swap (`load`); 4 packages; 5 risks and decisions; 6 built.
 
 ## 0. The short answer
 
@@ -432,3 +432,32 @@ Decisions for the owner:
    `FIB_LIVE_EMIT=verify`; `FIB_LIVE_DEBUG=cut`. None is a core form or a builtin, and `compiler/` defines no function named `load` or
    `reload` as a top-level name of a module the session would capture (the self-hosting trap, CLAUDE.md): `expand.modules` has
    `load-program`, `serve.repl` has `cmd-load`; the op names are strings, not forms.
+
+## 6. Built
+
+- **Status 2026-10-15, LM1** (`compiler/serve/liveload.fib`; `Sess.texts` and `rc/front-texts`, the engine's `Job.texts` and
+  `engine-front-texts`, the loader's `try-load-texts` (`expand.modules`: a `Loader.texts` read in place of a module's file, by module
+  name); `BodyRequest.module` and `types.program/program-fun-in`; `LiveBody.fun` for every stubbed function with its `module`; the ops
+  `load` and `reload`, `status.loaded` and `status.live` in `serve.live`; `:load FILE`, `:reload` and the `:status` line in
+  `serve.liveclient`; `FIB_LIVE_LIBS` set by fibc in a project for the hint; the test `compiler/tests/live/load.sh` (load.py over
+  load-app.fib and load-routes.fib, 39 checks), `project.sh` extended (`live/NotLive` with `--live-deps=acme/util` in the hint, the swap
+  of `acme.util/util-value` under `--live-deps`), the mutants `partial-load`, `load-reads-disk`, `prefix-dropped`, `removed-ignored` of
+  `scripts/mutant-live.sh`). Where it differs from section 3: (a) **the override is keyed by module name, not file path** (the loader
+  finds the file as before and reads the text given instead; the path the user gave is kept for `status` and `reload`), so `:load` takes
+  any spelling of the path and the diagnostics of a loaded module are at the loader's path (`src/routes.fib:L:C`); (b) **the session's
+  copy of a module before its first load is the file as read once more right after the base is made** (`snapshot-base`, on the driver's
+  thread before `main` runs: the base goes through the driver's front end, which keeps no text), and the program's module set is the
+  base's (a module brought in by a later `require` input is `live/NotLoaded` to `load`); (c) **a new function or `impl` of a loaded
+  file is accepted** (a family at generation 0, made resident as a session function is, named `routes/extra` in `defined`), a new type
+  or macro too (the checker's rules apply), a new `def` or `extern` refused (`live/Def`, `live/Extern`); a `derive` or an `impl` of no
+  head that changed is `live/Unsupported`; (d) **a changed function the running program never reached** (no registered body) swaps into
+  the text only, as LV2 (a) says of a generic nobody instantiates; it is not in `swapped`; (e) the per-family rules refusal (`live/
+  Signature`, `live/Summary`) is reported at `FILE:1:1` (the checker's view has no position of the family in the file); (f) `status.live`
+  is the rule's name and the count of live modules (`project paths (3 modules); --live-deps widens`, or `every module not named
+  fib.*`), not the per-library listing of 3.6; (g) the main module's own file is loaded as an `eval` of the definitions that differ from
+  the file as last loaded (the session's own inputs are not in that copy), with the file's `ns` clauses; a definition the file dropped is
+  `live/Removed`; (h) `:type` reads the files, not the overrides (`rc/type-of-expr` is unchanged). Measured on the load test's two-module
+  app on lilnas under a running gate (load average above 30): a `load` that swaps one function is `check 429 to 437 ms, emit 2 ms, jit
+  2 ms` (the check is 59 modules, 8 expanded again: the loaded module and the 7 after it in the load order, 3.3); the meshql scenario of
+  live-meshql.md 7 is a step of meshql-fib's `scripts/live-demo.py` on its `live-dev` branch (the on-item edit loaded, curl 410, the
+  file restored and loaded again), guarded so that a fibc without the op skips it.

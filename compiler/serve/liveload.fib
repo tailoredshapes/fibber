@@ -1,0 +1,317 @@
+;; compiler/serve/liveload.fib: `load FILE` and `reload` of a live session (docs/design/live-incremental.md 3, package LM1): a module
+;; of the running program edited on disk and swapped as one input. The file names its module in its `(ns ..)` form; the module must be
+;; one of the program's (`live/NotLoaded`) and live (`live/NotLive`: a library of a project is direct calls unless `--live-deps` named
+;; it; the hint names the flag). Its definitions are diffed by key (serve.replcore `classify`, the keys of a REPL input) against the
+;; session's copy of the module (the file as the base read it, then the text last loaded): a changed function or `impl` is a family to
+;; swap, a new function (or `impl`) a family at generation 0, a removed function `live/Removed` (its stub stays and the running program
+;; may call it), a changed or new `def` `live/Def` (LT4), a changed type `live/Layout`, a changed macro `live/Macro`, a changed extern
+;; `live/Extern`. Every refusal of the file is listed, at the definition's position in the file, and if any rule refuses nothing is
+;; applied. Else the program of the session's text with the loaded text as the module's override (`Sess.texts`: the engine reads it in
+;; place of the file, serve.incr `Job.texts`) is checked whole, the rules of serve.liverules compared with the live table, the changed
+;; families emitted under one generation and swapped (serve.liveswap), and the text becomes the session's view of the module: an
+;; expression input between a disk edit and `reload` runs the loaded text, not the disk's. A load of the main module's own file is an
+;; `eval` of its changed definitions (serve.liveswap `input`). `reload` loads again every file loaded in this session whose disk content
+;; differs from the loaded text, in load order; `status` lists the loaded files, `stale` when the disk differs.
+(ns serve.liveload
+  (:require [serve.livesess :as ls] [serve.liveswap :as lsw] [serve.livetable :as lt] [serve.liverules :as lr] [serve.replcore :as rc]
+            [serve.diag :as dg] [serve.incr :as inc] [emit.compile :as ec] [emit.program :as ep] [expand.modules :as mods] [syntax.reader :as reader]
+            [live.extract :as ex] [pkg.paths :as pp] [fib.string :as s]))
+
+;; A module's text as the session holds it: the file (as the loader or the user named it) and the text the running program's bodies
+;; of the module were compiled from.
+(defstruct Copy (file: str text: str))
+
+;; The load state of a session: the session's copy of every live module's text by module name (filled from the base's files at start,
+;; replaced by each accepted load), the files loaded in load order (module name and the path given), the program's modules (the
+;; base's; `require` inputs are not counted), and the project's libraries with their roots (FIB_LIVE_LIBS, set by fibc in a project)
+;; for the hint of `live/NotLive`.
+(defstruct Loads (copies: (Cell (Map str Copy)) loaded: (Cell (Vec (Pair str str))) modules: (Cell (Set str)) libs: (Vec (Pair str (Vec str)))))
+
+;; What a load came to: the file, its module, how many definitions the file holds and which changed (the families' shown names), and
+;; the input's answer.
+(defstruct LoadResult (file: str module: str definitions: i64 changed: (Vec str) answer: ls/Answer))
+
+(defun loads-new () -> Loads (Loads (cell {}) (cell []) (cell (set-empty)) (libs-of-env)))
+
+;; `NAME=DIR:DIR;NAME=DIR` of FIB_LIVE_LIBS.
+(defun libs-of-env :private () -> (Vec (Pair str (Vec str)))
+  (match (sys-getenv "FIB_LIVE_LIBS")
+    (nil [])
+    ((some v) (vec (keep (fn (entry: str)
+                           (match (str-find entry "=" 0)
+                             (nil nil)
+                             ((some i) (some (Pair (str-slice entry 0 i) (pp/split-on (str-slice entry (+ i 1) (str-len entry)) ":"))))))
+                         (pp/split-on v ";"))))))
+
+;; Whether module `ns` is live (emit.program `program-module?`, the base's rule): in a project the modules under its paths and the
+;; libraries' under --live-deps; outside a project, every module not named `fib.*`.
+(defun live-module? :private (sx: ls/Sess ns: str) -> bool
+  (match @(. sx live-modules)
+    (nil (mods/sees-implicit ns (mods/implicit-lib)))
+    ((some names) (contains? names ns))))
+
+;; The session's copies at start: the file of every live module of the base program (`text` is the main file's), read once more as
+;; the base read it, and the program's module set.
+(defun snapshot-base (ld: Loads sx: ls/Sess text: str) -> unit
+  (match (mods/try-load-in text (. sx file) (. sx rts))
+    ((Err _) ())
+    ((Ok loaded)
+     (doseq [l loaded]
+       (let ((ns (. (. l spec) ns)))
+         (do (set! (. ld modules) (conj @(. ld modules) ns))
+             (if (= (. l file) (. sx file))
+                 (set! (. ld copies) (assoc @(. ld copies) "main" (Copy (. sx file) text)))
+                 (when (and (not (. l implicit)) (live-module? sx ns))
+                   (match (read-file (. l file))
+                     (nil ())
+                     ((some t) (set! (. ld copies) (assoc @(. ld copies) ns (Copy (. l file) t)))))))))))))
+
+;; ---- the file
+
+(defun same-file? :private (a: str b: str) -> bool (= (pp/under (pp/cwd) a) (pp/under (pp/cwd) b)))
+
+;; The module the file's `ns` form names ("main" without one).
+(defun ns-of :private (text: str file: str) -> str
+  (match (reader/read-all text file)
+    ((Err _) "main")
+    ((Ok forms) (match (mods/spec-of forms "main") ((Ok spec) (. spec ns)) ((Err _) "main")))))
+
+(defun refused :private (code: str shown: str hint: str) -> ls/Answer
+  (ls/Refused (into [(str shown " [" code "]")] (if (= hint "") [] [(str "  hint: " hint)])) [(dg/diag-nowhere code rc/repl-file shown)] code hint))
+
+(defun result :private (file: str ns: str defs: (Vec rc/Def) changed: (Vec str) a: ls/Answer) -> LoadResult
+  (LoadResult file ns (count defs) changed a))
+
+;; The alias of the hint's `require`: the module's last segment.
+(defun alias-of :private (ns: str) -> str
+  (loop ((i (- (str-len ns) 1)))
+    (cond (< i 0) ns
+          (= (str-byte-at ns i) 46i8) (str-slice ns (+ i 1) (str-len ns))
+          :else (recur (- i 1)))))
+
+;; The library whose roots hold `file`, when FIB_LIVE_LIBS names one.
+(defun lib-of-file :private (ld: Loads file: str) -> (Option str)
+  (let ((f (pp/under (pp/cwd) file)))
+    (match (first (filterv (fn (l: (Pair str (Vec str))) (some? (first (filterv (fn (r: str) (s/starts-with? f (str r "/"))) (. l snd))))) (. ld libs)))
+      ((some l) (some (. l fst)))
+      (nil nil))))
+
+(defun not-live :private (ld: Loads sx: ls/Sess file: str ns: str) -> ls/Answer
+  (match @(. sx live-modules)
+    (nil (refused "live/NotLive" (str file ":1:1: " ns " is the library's; its functions are direct calls in the running program") ":restart with the module outside the library"))
+    ((some _) (refused "live/NotLive" (str file ":1:1: " ns " is a library of the project; its functions are direct calls in the running program")
+                       (str "start with --live-deps" (match (lib-of-file ld file) ((some n) (str "=" n)) (nil "")) " to make it live")))))
+
+;; A file loaded: read, classified, its module found and checked against the program's, then diffed and swapped.
+(defun load-file (ld: Loads sx: ls/Sess file: str) -> LoadResult
+  (match (read-file file)
+    (nil (result file "" [] [] (refused "live/NoFile" (str file ": cannot read the file") "")))
+    ((some text)
+     (match (rc/classify text)
+       ((rc/Unreadable m) (result file "" [] [] (refused "read" (str file ":" m) "")))
+       ((rc/Blank) (result file "" [] [] (refused "read" (str file ":1:1: the file is empty") "")))
+       ((rc/Parts defs clauses exprs)
+        (let ((ns (ns-of text file)))
+          (cond (not (empty? exprs)) (result file ns defs [] (refused "live/Input" (str file ":1:1: a module is definitions only; a top-level expression cannot be loaded") ""))
+                (or (= ns "main") (same-file? file (. sx file))) (load-main ld sx file text defs clauses)
+                (not (contains? @(. ld modules) ns))
+                  (result file ns defs [] (refused "live/NotLoaded" (str file ":1:1: the program has no module " ns) (str "(require [" ns " :as " (alias-of ns) "]) at the REPL loads it")))
+                (not (live-module? sx ns)) (result file ns defs [] (not-live ld sx file ns))
+                :else (load-module ld sx file ns text defs))))))))
+
+;; ---- the diff by key
+
+(defstruct Diff (changed: (Vec rc/Def) added: (Vec rc/Def) removed: (Vec rc/Def)))
+
+(defun defs-of :private (text: str) -> (Vec rc/Def)
+  (match (rc/classify text) ((rc/Parts ds _ _) ds) (_ [])))
+
+(defun diff-defs :private (olds: (Vec rc/Def) news: (Vec rc/Def)) -> Diff
+  (let ((old-by (reduce (fn (acc: (Map str rc/Def) d: rc/Def) (assoc acc (. d key) d)) {} olds))
+        (new-keys (reduce (fn (acc: (Set str) d: rc/Def) (conj acc (. d key))) (set-empty) news)))
+    (Diff (filterv (fn (d: rc/Def) (match (get old-by (. d key)) ((some o) (not (= (. o text) (. d text)))) (nil false))) news)
+          (filterv (fn (d: rc/Def) (nil? (get old-by (. d key)))) news)
+          (filterv (fn (d: rc/Def) (not (contains? new-keys (. d key)))) olds))))
+
+;; What a definition is: `fun`, `def`, `macro`, `extern`, `type` (a protocol too), `impl`, or `text` (a `derive`, an `impl` of no head).
+(defun kind-of :private (d: rc/Def) -> str
+  (cond (s/starts-with? (. d key) "type:") "type"
+        (s/starts-with? (. d key) "impl:") "impl"
+        (s/starts-with? (. d key) "text:") "text"
+        (s/starts-with? (. d text) "(def ") "def"
+        (s/starts-with? (. d text) "(defmacro ") "macro"
+        (s/starts-with? (. d text) "(extern ") "extern"
+        :else "fun"))
+
+;; A refusal of the text rules: its code, the message and the hint, at the definition's position in the file.
+(defstruct Refusal (code: str message: str hint: str line: i64 col: i64))
+
+;; The line and column of a definition's text in the file (1:1 when it is not there: a removed one).
+(defun pos-of :private (text: str d: rc/Def) -> (Pair i64 i64)
+  (match (str-find text (. d text) 0)
+    (nil (Pair 1 1))
+    ((some off) (loop ((i 0) (line 1) (col 1))
+                  (cond (>= i off) (Pair line col)
+                        (= (str-byte-at text i) 10i8) (recur (+ i 1) (+ line 1) 1)
+                        :else (recur (+ i 1) line (+ col 1)))))))
+
+(defun refusal :private (text: str d: rc/Def code: str message: str hint: str) -> (Option Refusal)
+  (let ((p (pos-of text d))) (some (Refusal code message hint (. p fst) (. p snd)))))
+
+;; The text rule a definition `what` (`changed`, `added`, `removed`) breaks, if any.
+(defun rule-of :private (text: str what: str d: rc/Def) -> (Option Refusal)
+  (let ((k (kind-of d)) (n (. d name)) (added (= what "added")))
+    (cond (and (= what "removed") (or (= k "fun") (= k "impl")))
+            (refusal text d "live/Removed" (str n " was removed; its stub stays and the running program may call it") (str "keep a definition of " n ", or :restart"))
+          (= k "def") (refusal text d "live/Def" (if added (str n " is a new def; a def of a loaded file is made at a restart (LT4)") (str n " is a def of the program; a def is immortal and read count-free"))
+                               (if added "(def ..) at the REPL makes a session def; :restart" ":restart"))
+          (and (= k "type") (s/starts-with? (. d text) "(defprotocol ")) (if added nil (refusal text d "live/Protocol" (str n " is a protocol of the running program; its dispatch rows are in every caller") ":restart"))
+          (= k "type") (if added nil (refusal text d "live/Layout" (str n " " what "; values of " n " exist in the running program") ":restart"))
+          (= k "macro") (if added nil (refusal text d "live/Macro" (str n " is a macro; its users were expanded with the old one") ":restart"))
+          (= k "extern") (refusal text d "live/Extern" (str n " is an extern" (if added "; a new extern binds at a restart" " of the running program")) ":restart")
+          (= k "text") (refusal text d "live/Unsupported" (str "a derive or an impl of no head " what "; it cannot be swapped") ":restart")
+          :else nil)))
+
+;; Every refusal of the text rules over the diff, in the file's order: the changed and the added definitions, then the removed.
+(defun refusals-of :private (text: str diff: Diff) -> (Vec Refusal)
+  (let ((of (fn (what: str ds: (Vec rc/Def)) (vec (keep (fn (d: rc/Def) (rule-of text what d)) ds)))))
+    (into (into (of "changed" (. diff changed)) (of "added" (. diff added))) (of "removed" (. diff removed)))))
+
+(defun refused-all :private (file: str rs: (Vec Refusal)) -> ls/Answer
+  (ls/Refused (conj (mapv (fn (r: Refusal) (str file ":" (. r line) ":" (. r col) ": " (. r message) " [" (. r code) "]")) rs) (str "  hint: " (. (nth rs 0) hint)))
+              (mapv (fn (r: Refusal) (dg/Diag (. r code) file (. r line) (. r col) 0 0 (. r message))) rs)
+              (. (nth rs 0) code) (. (nth rs 0) hint)))
+
+;; ---- the swap of a module
+
+;; The family of a changed function (`f.MODULE.NAME`: the body name with the module's prefix, emit.names) or of every method of a
+;; changed `impl` (keyed `impl:PROTO HEAD` program-wide).
+(defun families-of :private (sx: ls/Sess prefix: str d: rc/Def) -> (Vec str)
+  (cond (= (kind-of d) "fun") [(str "f." prefix (. d name))]
+        (= (kind-of d) "impl") (vec (keep (fn (p: (Pair str (Vec ep/LiveBody)))
+                                           (if (some? (first (filterv (fn (b: ep/LiveBody) (= (. b impl) (some (. d key)))) (. p snd)))) (some (. p fst)) nil))
+                                         (vec (ls/live-bodies sx))))
+        :else []))
+
+;; A family as the answer names it: `routes/route` for `f.routes.route`; a method by its body's name.
+(defun shown-name :private (ns: str family: str) -> str
+  (let ((head (str "f." ns ".")))
+    (if (s/starts-with? family head) (str ns "/" (str-slice family (str-len head) (str-len family))) (lsw/shown-family family))))
+
+(defun code-of :private (ds: (Vec dg/Diag)) -> str (match (first ds) ((some d) (. d code)) (nil "check")))
+
+(defun checker-refused :private (sx: ls/Sess ds: (Vec dg/Diag)) -> ls/Answer
+  (lsw/unchanged sx (ls/Refused (ls/shown-of sx ds (ls/input-line sx) @(. (. sx rc) defs)) ds (code-of ds) "")))
+
+;; The module's new text diffed against the session's copy: the text rules first (every refusal listed, nothing applied), then the
+;; program with the text as the module's override checked whole, the rules of the live table, the emit of the changed families under
+;; the next generation, and the swap.
+(defun load-module :private (ld: Loads sx: ls/Sess file: str ns: str text: str defs: (Vec rc/Def)) -> LoadResult
+  (let ((diff (diff-defs (defs-of (copy-text ld ns)) defs)))
+    (let ((refusals (refusals-of text diff)))
+      (if (not (empty? refusals))
+          (result file ns defs [] (refused-all file refusals))
+          (swap-module ld sx file ns text defs diff)))))
+
+;; The session's copy of a module's text ("" before any: a module the base did not read).
+(defun copy-text :private (ld: Loads ns: str) -> str
+  (match (get @(. ld copies) ns) ((some c) (. c text)) (nil "")))
+
+(defun swap-module :private (ld: Loads sx: ls/Sess file: str ns: str text: str defs: (Vec rc/Def) diff: Diff) -> LoadResult
+  (let ((prefix (str ns ".")) (gen (+ 1 (lsw/generation sx)))
+        (families (vec (mapcat (fn (d: rc/Def) (families-of sx prefix d)) (. diff changed))))
+        (impls (mapv (fn (d: rc/Def) (. d key)) (filterv (fn (d: rc/Def) (= (kind-of d) "impl")) (into (. diff changed) (. diff added)))))
+        (new-fns (filterv (fn (d: rc/Def) (= (kind-of d) "fun")) (. diff added))))
+    (let ((requests (into (mapv (fn (d: rc/Def) (ec/BodyRequest (. d name) false [] nil [] (some ns))) new-fns) (lsw/requests-of sx [] families impls)))
+          (fr (rc/front-texts (. sx eng) (. sx rts) (rc/source-of @(. (. sx rc) clauses) @(. (. sx rc) defs) "") "yes" true (assoc @(. sx texts) ns text))))
+      (match (. fr checked)
+        ((Err ds) (result file ns defs [] (checker-refused sx ds)))
+        ((Ok c) (match (lr/check-rules @(. sx table) c @(. sx defined))
+                  ((some r) (result file ns defs [] (lsw/unchanged sx (refused (. r code) (str file ":1:1: " (. r message)) (. r hint)))))
+                  (nil (match (lsw/emit-swapping sx c (. fr stats) requests families gen)
+                         ((Err ds) (result file ns defs [] (checker-refused sx ds)))
+                         ((Ok [made changed]) (apply-load ld sx file ns text defs made changed (fresh-families sx ns (. diff added)) gen))))))))))
+
+;; The families `fresh` (new to the table: a new function of the loaded module, a new `impl`'s methods) cut out, added under a tracker
+;; of their own and kept: their stubs and slots are resident from now on, generation 0 of their families.
+(defun make-new :private (sx: ls/Sess made: ls/Made fresh: (Vec str)) -> (Result unit str)
+  (let ((pi (ex/index-of (. made m))) (bodies (ls/live-bodies sx)))
+    (let ((roots (vec (mapcat (fn (fam: str) (mapv (fn (nm: str) (Pair nm nm)) (filterv (fn (nm: str) (some? (get pi nm))) (lt/body-names bodies fam)))) fresh))))
+      (if (empty? roots)
+          (Ok ())
+          (try-let ((a (ls/add-cut sx (. made m) roots [] []))) (do (ls/keep-module sx a) (Ok ())))))))
+
+;; The families of the loaded module the program registered that the table lacks and whose stub is not resident: its new functions
+;; (`f.NS.NAME`) and the methods of its new `impl`s. The session's own entries are registered too and are not the module's; a function
+;; of the module an expression input reached first is registered and resident (its stub in that input's kept module) without being in
+;; the table, and is not new: cutting its stub again would define it twice.
+(defun fresh-families :private (sx: ls/Sess ns: str added: (Vec rc/Def)) -> (Vec str)
+  (let ((before (. @(. sx table) families)) (prefix (str ns ".")) (base @(. sx base))
+        (impls (vec (mapcat (fn (d: rc/Def) (families-of sx prefix d)) (filterv (fn (d: rc/Def) (= (kind-of d) "impl")) added)))))
+    (filterv (fn (f: str) (and (nil? (get before f)) (nil? (get base f)) (or (s/starts-with? f (str "f." prefix)) (includes? f impls))))
+             (vec (keys (ls/live-bodies sx))))))
+
+;; The file noted among the loaded ones, in the order of first loads (a module loaded again keeps its place, with the path given now).
+(defun note-loaded :private (ld: Loads ns: str file: str) -> unit
+  (let ((had (some? (first (filterv (fn (p: (Pair str str)) (= (. p fst) ns)) @(. ld loaded))))))
+    (do (set! (. ld loaded) (if had
+                                (mapv (fn (p: (Pair str str)) (if (= (. p fst) ns) (Pair ns file) p)) @(. ld loaded))
+                                (conj @(. ld loaded) (Pair ns file))))
+        ())))
+
+;; The accepted load applied: the override, the slots, the new families, the swap; the table after; the copy and the loaded list. A cut
+;; that fails is reported as broken with the override restored (what was added stays resident but unreachable).
+(defun apply-load :private (ld: Loads sx: ls/Sess file: str ns: str text: str defs: (Vec rc/Def) made: ls/Made changed: (Vec str) fresh: (Vec str) gen: i64) -> LoadResult
+  (let ((snap @(. sx texts)) (shown (mapv (fn (f: str) (shown-name ns f)) changed)) (defined (mapv (fn (f: str) (shown-name ns f)) fresh)))
+    (do (set! (. sx texts) (assoc snap ns text))
+        (match (try-let ((_ (ls/make-slots sx made)) (_ (make-new sx made fresh))) (lsw/swap-all sx made changed gen))
+          ((Err m) (do (set! (. sx texts) snap) (result file ns defs [] (lsw/unchanged sx (ls/Broken m)))))
+          ((Ok [jit patch])
+           (do (set! (. sx table) (lt/table-after @(. sx table) (ls/live-bodies sx) (. made c) changed gen))
+               (ls/set-generations sx (lt/generations-of @(. sx table)))
+               (set! (. ld copies) (assoc @(. ld copies) ns (Copy file text)))
+               (note-loaded ld ns file)
+               (result file ns defs shown
+                       (if (empty? changed)
+                           (ls/Defined defined (. made stats))
+                           (ls/Swapped defined shown gen (ls/Times (. (. made stats) total-ms) (. made emit-ms) jit patch) (. made stats))))))))))
+
+;; ---- the main module's file
+
+;; A load of the main module's own file: its definitions that differ from the session's copy of the file (the file as the base read
+;; it, then as last loaded; the session's own inputs are not in it) are one `eval` input, with the file's `ns` clauses; a definition
+;; the file no longer has is `live/Removed`.
+(defun load-main :private (ld: Loads sx: ls/Sess file: str text: str defs: (Vec rc/Def) clauses: (Vec str)) -> LoadResult
+  (let ((diff (diff-defs (defs-of (copy-text ld "main")) defs)))
+    (let ((removed (refusals-of text (Diff [] [] (. diff removed)))) (news (into (. diff changed) (. diff added))))
+      (cond (not (empty? removed)) (result file "main" defs [] (refused-all file removed))
+            (empty? news) (do (set! (. ld copies) (assoc @(. ld copies) "main" (Copy file text))) (note-loaded ld "main" file)
+                              (result file "main" defs [] (ls/Defined [] (inc/empty-stats))))
+            :else (let ((a (lsw/input sx (str "(ns main " (str-join (vec (interpose " " clauses))) ")\n" (rc/defs-text news)))))
+                    (do (match a
+                          ((ls/Refused _ _ _ _) ())
+                          ((ls/Broken _) ())
+                          (_ (do (set! (. ld copies) (assoc @(. ld copies) "main" (Copy file text))) (note-loaded ld "main" file))))
+                        (result file "main" defs (mapv (fn (d: rc/Def) (. d name)) (. diff changed)) a)))))))
+
+;; ---- reload and status
+
+;; Whether the disk's content of a loaded file differs from the text last loaded (or the file is gone).
+(defun stale? :private (ld: Loads p: (Pair str str)) -> bool
+  (match (get @(. ld copies) (. p fst))
+    (nil false)
+    ((some c) (not (= (read-file (. p snd)) (some (. c text)))))))
+
+;; `reload`: every loaded file whose content differs from the loaded text, loaded again in load order; the results.
+(defun reload-all (ld: Loads sx: ls/Sess) -> (Vec LoadResult)
+  (vec (keep (fn (p: (Pair str str)) (if (stale? ld p) (some (load-file ld sx (. p snd))) nil)) @(. ld loaded))))
+
+;; The loaded files for `status`: each with its module and whether it is stale.
+(defun loaded-files (ld: Loads) -> (Vec (Pair (Pair str str) bool))
+  (mapv (fn (p: (Pair str str)) (Pair (Pair (. p snd) (. p fst)) (stale? ld p))) @(. ld loaded)))
+
+;; The live-module rule in force, for `status`.
+(defun rule-text (ld: Loads sx: ls/Sess) -> str
+  (match @(. sx live-modules)
+    (nil "every module not named fib.*")
+    ((some names) (str "project paths (" (count names) " modules); " (if (empty? (. ld libs)) "no libraries" "--live-deps widens")))))
