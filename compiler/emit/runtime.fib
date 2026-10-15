@@ -3824,10 +3824,14 @@
   (block entry (atomic-store release (inttoptr ptr v) slot) (ret)))
 
 ;; A pause point: returns at once unless a pause is requested, else parks
-;; here, counted, until the resume.
+;; here, counted, until the resume. On a worker of the pool (a pool task
+;; that calls one) it is ignored: a worker parks only in the pool's own idle,
+;; which is what the quiescence check reads of it.
 (define internal (fib.live-pause-point void) ()
   (block entry
-    (br (icmp eq (atomic-load acquire i32 @fib.live-pausing) (i32 0)) done park))
+    (br (icmp eq (atomic-load acquire i32 @fib.live-pausing) (i32 0)) done worker?))
+  (block worker?
+    (br (icmp eq (call @fib.sched-self) (ptr null)) park done))
   (block park
     (call @fib.rq-lock)
     (store (add (load i32 @fib.live-paused) (i32 1)) @fib.live-paused)
