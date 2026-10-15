@@ -9,8 +9,10 @@
   (:require [emit.program :as ep] [emit.names :as en] [types.ty :as ty] [types.scheme :as sc] [types.decls :as td]
             [types.table :as tb] [own.program :as op] [own.driver :as od] [types.dump.scheme :as ds]))
 
-;; A generation added under a tracker: its number, the tracker, the module's name and the bodies it defines.
-(defstruct Generation (n: i64 rt: i64 module: str names: (Vec str)))
+;; A generation added under a tracker: its number, the tracker, the module's name, the bodies it defines, the names of the code
+;; items that pin it (a closure literal, a closure constant, a vtable: serve.livesplit; empty when it can be retired), and the items
+;; whose refs the session noted for it (serve.liveretire drops them with the generation).
+(defstruct Generation (n: i64 rt: i64 module: str names: (Vec str) pins: (Vec str) noted: (Vec str)))
 
 ;; `scheme`: the function's scheme as the signature rule compares it and as a message shows it (`scheme-texts`).
 (defstruct Family (generation: i64 scheme: (Option (Pair str str)) summary: (Option op/Summary) gens: (Vec Generation)))
@@ -99,8 +101,40 @@
     (nil t)
     ((some f) (Table (assoc (. t families) family (Family (. f generation) (. f scheme) (. f summary) (conj (. f gens) g))) (. t generation)))))
 
+;; `t` with the generations of `family` replaced by `gens` (a retirement, serve.liveretire).
+(defun set-generations (t: Table family: str gens: (Vec Generation)) -> Table
+  (match (get (. t families) family)
+    (nil t)
+    ((some f) (Table (assoc (. t families) family (Family (. f generation) (. f scheme) (. f summary) gens)) (. t generation)))))
+
 ;; How many generations the table keeps under trackers (the base's generation 0 is resident and not counted).
 (defun generations-kept (t: Table) -> i64
   (reduce (fn (acc: i64 f: Family) (+ acc (count (. f gens)))) 0 (vec (vals (. t families)))))
+
+;; The family of each registered body, by the body's name.
+(defun family-index (bodies: (Map str (Vec ep/LiveBody))) -> (Map str str)
+  (reduce (fn (acc: (Map str str) p: (Pair str (Vec ep/LiveBody)))
+            (reduce (fn (a: (Map str str) b: ep/LiveBody) (assoc a (. b name) (. p fst))) acc (. p snd)))
+          {} (vec bodies)))
+
+;; `l.CODE.N` (a closure literal of the body CODE, emit.names `closure-name`) without its number; any other name as it is.
+(defun strip-literal (name: str) -> str
+  (if (not (and (> (str-len name) 2) (= (str-byte-at name 0) 108i8) (= (str-byte-at name 1) 46i8)))   ; `l.`
+      name
+      (loop ((i (- (str-len name) 1)))
+        (cond (< i 3) name
+              (= (str-byte-at name i) 46i8) (if (digits? (str-slice name (+ i 1) (str-len name))) (str-slice name 2 i) name)
+              (or (< (str-byte-at name i) 48i8) (> (str-byte-at name i) 57i8)) name
+              :else (recur (- i 1))))))
+
+;; The family of the code named `name` (a stub, a body of any generation, a literal of one), or nil (the library's, the runtime's).
+(defun family-of-name (index: (Map str str) name: str) -> (Option str)
+  (get index (strip-generation (strip-literal name))))
+
+;; The generation a body or literal name carries (`NAME.gK`, `l.NAME.gK.N`), or nil (a stub, a slot, a static).
+(defun generation-number (name: str) -> (Option i64)
+  (let ((code (strip-literal name)))
+    (let ((stripped (strip-generation code)))
+      (if (= stripped code) nil (parse-long (str-slice code (+ (str-len stripped) 2) (str-len code)))))))
 
 (defun family-count (t: Table) -> i64 (count (. t families)))

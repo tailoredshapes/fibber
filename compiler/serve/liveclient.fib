@@ -1,7 +1,8 @@
 ;; compiler/serve/liveclient.fib: `fibc repl --connect SOCK|PID [--json]` (docs/design/live-repl.md 2.4, package LV1): the client of a
 ;; program started with `fibc run --live` (serve.live). The terminal form reads inputs as the REPL does (serve.line: editing on a
 ;; terminal, plain lines from a pipe; an input continues while its brackets are open) and sends each as an `eval`, printing the value,
-;; `; failed: ..` for a caught trap, `; defined ..`, or the refusal's lines; `:type EXPR`, `:inspect NAME`, `:status`, `:help`, `:quit`.
+;; `; failed: ..` for a caught trap, `; defined ..`, or the refusal's lines; `:type EXPR`, `:inspect NAME`, `:status`, `:pause [MS]`,
+;; `:resume`, `:retire` (serve.liveretire, package LV3), `:help`, `:quit`.
 ;; `--json` is the stdio form for an agent or an editor: one request per line in, forwarded as it is, one answer per line out. When
 ;; nothing listens at the socket (the program was not started with `--live`, or has ended) every request is answered `not-live`.
 (ns serve.liveclient
@@ -11,7 +12,9 @@
 (def help-text: str
   "inputs: definitions (def defun defrecord ..) are made resident in the running program; a function defined again is swapped (its callers
         use the new body from their next call); an expression is evaluated there and its value printed
-:type EXPR      the type of EXPR         :inspect NAME  the value and type of NAME      :status  the session's figures
+:type EXPR      the type of EXPR         :inspect NAME  the value and type of NAME      :status  the session's figures and threads
+:pause [MS]     the program parks at its pause points (up to MS ms, 5000, waiting for quiescence)    :resume  lets it run again
+:retire         at quiescence, frees the code of every old generation no thread can be in
 :help           this                     :quit (ctrl-d) end the client; the program goes on")
 
 (defstruct Client (fd: i64 conn: sk/Conn))
@@ -69,12 +72,20 @@
                                       (println (str "; refused; the session and the program are unchanged" (if (some? (field v "generation")) (str " (generation " (int-of v "generation") ")") ""))))
         (some? (field v "value")) (println (str-of v "value"))
         (not (empty? (strs-of v "swapped"))) (do (when (not (empty? (strs-of v "defined"))) (println (str "; defined " (join-words (strs-of v "defined")))))
-                                                 (println (swapped-line v)))
+                                                 (println (swapped-line v))
+                                                 (when (running? v) (println (str "; note: " (threads-text v) " are running; generation " (- (int-of v "generation") 1)
+                                                                                  " is kept until :retire at a quiescent point"))))
         (some? (field v "defined")) (println (str "; defined " (join-words (strs-of v "defined"))))
         (some? (field v "type")) (println (str-of v "type"))
         (some? (field v "generations")) (println (str "; generation " (int-of v "generation") "; generations kept " (int-of (unwrap-or (field v "generations") j/JNull) "count")
                                                     "; modules kept " (int-of (unwrap-or (field v "generations") j/JNull) "kept")
+                                                    "; threads: " (threads-text v)
                                                     "; values: " (int-of (unwrap-or (field v "values") j/JNull) "count") " resident; inputs " (int-of v "inputs")))
+        (some? (field v "paused")) (println (paused-line v))
+        (some? (field v "resumed")) (println (str "; resumed; " (threads-text v)))
+        (some? (field v "removed")) (println (str "; removed " (int-of v "removed") (if (= (int-of v "removed") 1) " generation" " generations")
+                                                 "; " (int-of v "kept") " kept" (if (= (str-of v "pinned_text") "") "" (str ", pinned: " (str-of v "pinned_text")))
+                                                 " (generation " (int-of v "generation") ")"))
         (not (= (int-of v "exit") 0)) (println (str "; the input ended with status " (int-of v "exit")))
         :else ()))
 
@@ -83,6 +94,25 @@
   (let ((t (unwrap-or (field v "swap") j/JNull)))
     (str "; swapped " (join-words (strs-of v "swapped")) " (generation " (int-of v "generation") "): check " (int-of t "check_ms") " ms, emit " (int-of t "emit_ms")
          " ms, jit " (int-of t "jit_ms") " ms")))
+
+(defun threads-of :private (v: j/JVal) -> j/JVal (unwrap-or (field v "threads") j/JNull))
+(defun bool-of :private (v: j/JVal key: str) -> bool (match (field v key) ((some (j/JBool b)) b) (_ false)))
+
+;; `1 spawned thread (1 parked) and 28 pool workers (27 active)`
+(defun threads-text :private (v: j/JVal) -> str
+  (let ((t (threads-of v)))
+    (str (int-of t "spawned") (if (= (int-of t "spawned") 1) " spawned thread" " spawned threads") " (" (int-of t "paused") " parked) and "
+         (int-of t "pool_workers") (if (= (int-of t "pool_workers") 1) " pool worker" " pool workers") " (" (int-of t "pool_active") " active)")))
+
+;; The note after a swap is for a program whose pool has started (the design's transcript 7): its tasks may be inside the old body.
+(defun running? :private (v: j/JVal) -> bool (> (int-of (threads-of v) "pool_workers") 0))
+
+;; `; paused at 3 pause points; pool idle` or `; pause requested, not quiescent after the timeout: 1 thread not at a pause point`
+(defun paused-line :private (v: j/JVal) -> str
+  (let ((t (threads-of v)))
+    (if (bool-of v "paused")
+        (str "; paused at " (int-of t "paused") (if (= (int-of t "paused") 1) " pause point" " pause points") "; pool idle (" (int-of t "pool_workers") " workers)")
+        (str "; pause requested, not quiescent after the timeout: " (str-of v "running") "; :resume lifts it"))))
 
 (defun send :private (c: Client line: str) -> bool
   (match (exchange c line)
@@ -105,6 +135,9 @@
           (= (. w fst) ":type") (send c (req "type" [(Pair "expr" (j/json-str (. w snd)))]))
           (= (. w fst) ":inspect") (send c (req "inspect" [(Pair "name" (j/json-str (. w snd)))]))
           (= (. w fst) ":status") (send c (req "status" []))
+          (= (. w fst) ":pause") (send c (req "pause" (match (parse-long (. w snd)) ((some ms) [(Pair "timeout_ms" (j/json-int ms))]) (nil []))))
+          (= (. w fst) ":resume") (send c (req "resume" []))
+          (= (. w fst) ":retire") (send c (req "retire" []))
           (s/starts-with? t ":") (do (println (str "; unknown command " (. w fst) "; :help lists them")) true)
           :else (send c (req "eval" [(Pair "text" (j/json-str t))])))))
 
@@ -121,7 +154,8 @@
     ((Err _) ())
     ((Ok answer) (match (j/json-parse answer)
                    ((Ok v) (println (str "; attached to " (str-of v "program") " (pid " (int-of v "pid") ", generation " (int-of v "generation")
-                                         (if (match (field v "catching") ((some (j/JBool true)) true) (_ false)) ", catching" "") ")")))
+                                         (if (match (field v "catching") ((some (j/JBool true)) true) (_ false)) ", catching" "") "); "
+                                         (int-of v "threads") (if (= (int-of v "threads") 1) " thread" " threads") ", pool " (int-of v "pool") " workers")))
                    ((Err _) ())))))
 
 (defun terminal-loop :private (c: Client) -> i64
