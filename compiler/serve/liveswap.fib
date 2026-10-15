@@ -44,12 +44,48 @@
                         ((some code) (some (refused code (refusal-text code (. d name)) ":restart")))))
                     defs))))
 
+;; The redefined macros of `news`: each keeps its place in the session's text (`merge-session`).
+(defun kept-macros :private (olds: (Vec rc/Def) news: (Vec rc/Def)) -> (Vec rc/Def)
+  (filterv (fn (d: rc/Def) (and (s/starts-with? (. d text) "(defmacro ") (some? (first (filterv (fn (o: rc/Def) (= (. o key) (. d key))) olds))))) news))
+
 ;; The session's definitions with `news` merged in (serve.replcore `merge-defs`: a redefinition last), except that a redefined macro
 ;; keeps its place: the definitions after it that use it are expanded with the new one (LM2).
 (defun merge-session :private (olds: (Vec rc/Def) news: (Vec rc/Def)) -> (Vec rc/Def)
-  (let ((macros (filterv (fn (d: rc/Def) (and (s/starts-with? (. d text) "(defmacro ") (some? (first (filterv (fn (o: rc/Def) (= (. o key) (. d key))) olds))))) news)))
+  (let ((macros (kept-macros olds news)))
     (rc/merge-defs (mapv (fn (o: rc/Def) (unwrap-or (first (filterv (fn (m: rc/Def) (= (. m key) (. o key))) macros)) o)) olds)
                    (filterv (fn (d: rc/Def) (nil? (first (filterv (fn (m: rc/Def) (= (. m key) (. d key))) macros)))) news))))
+
+;; The line the input's definitions start on in the merged text: after the header, the definitions that are not the input's tail (the
+;; tail is the input's definitions but its kept macros).
+(defun input-start :private (olds: (Vec rc/Def) merged: (Vec rc/Def) news: (Vec rc/Def)) -> i64
+  (let ((tail (- (count news) (count (kept-macros olds news)))))
+    (+ 2 (rc/lines-in (rc/defs-text (vec (take (- (count merged) tail) merged)))))))
+
+;; Where each definition of the input is: its first line in the merged text, its lines, and its first line as the input counts it (`at`
+;; and then the input's definitions in their order, as serve.replcore `show-diag` reads a line at or after `at`).
+(defun input-spans :private (merged: (Vec rc/Def) news: (Vec rc/Def) at: i64) -> (Vec (Pair (Pair i64 i64) i64))
+  (let ((starts (fn (ds: (Vec rc/Def) from: i64) -> (Map str i64)
+                  (. (reduce (fn (acc: (Pair (Map str i64) i64) d: rc/Def) (Pair (assoc (. acc fst) (. d key) (. acc snd)) (+ (. acc snd) (+ 1 (rc/lines-in (. d text))))))
+                             (Pair {} from) ds) fst))))
+    (let ((in-merged (starts merged 2)) (in-input (starts news at)))
+      (vec (keep (fn (d: rc/Def) (match (Pair (get in-merged (. d key)) (get in-input (. d key)))
+                                   ([(some m) (some i)] (some (Pair (Pair m (+ 1 (rc/lines-in (. d text)))) i)))
+                                   (_ nil)))
+                 news)))))
+
+;; A diagnostic of the merged text moved to its line in the input: a redefined macro kept in place is not in the merged text's tail, so
+;; without this the lines of the input's definitions are off by the macros' lines.
+(defun input-diag :private (spans: (Vec (Pair (Pair i64 i64) i64)) d: dg/Diag) -> dg/Diag
+  (if (not (= (. d file) rc/repl-file))
+      d
+      (match (first (filterv (fn (sp: (Pair (Pair i64 i64) i64)) (and (>= (. d line) (. (. sp fst) fst)) (< (. d line) (+ (. (. sp fst) fst) (. (. sp fst) snd))))) spans))
+        (nil d)
+        ((some sp) (dg/Diag (. d code) (. d file) (+ (. sp snd) (- (. d line) (. (. sp fst) fst))) (. d col) (. d start) (. d end) (. d message))))))
+
+;; The shown lines of an input's diagnostics (serve.livesess `shown-of`) at the input's lines.
+(defun shown-input :private (sx: ls/Sess ds: (Vec dg/Diag) at: i64 merged: (Vec rc/Def) news: (Vec rc/Def)) -> (Vec str)
+  (let ((spans (input-spans merged news at)))
+    (ls/shown-of sx (mapv (fn (d: dg/Diag) (input-diag spans d)) ds) at merged)))
 
 ;; ---- the families an input changed
 
@@ -138,10 +174,10 @@
     ((some r) r)
     (nil
      (let ((olds (ls/accepted-hashes sx)) (cs (rc/merge-clauses @(. (. sx rc) clauses) clauses)) (merged (merge-session @(. (. sx rc) defs) defs)))
-       (let ((at (+ 2 (rc/lines-in (rc/defs-text (vec (take (- (count merged) (count defs)) merged))))))
+       (let ((at (input-start @(. (. sx rc) defs) merged defs))
              (fr (rc/front-texts (. sx eng) (. sx rts) (rc/source-of cs merged "") "yes" true @(. sx texts))))
          (match (. fr checked)
-           ((Err ds) (unchanged sx (ls/Refused (ls/shown-of sx ds at merged) ds "check" "")))
+           ((Err ds) (unchanged sx (ls/Refused (shown-input sx ds at merged defs) ds "check" "")))
            ((Ok c) (checked-input sx defs clauses (Pair cs merged) at c fr (changes-of sx olds fr)))))))))
 
 ;; A definition input whose program checked: the rules, the emit of the changed families under the next generation, the shape of the
@@ -153,7 +189,7 @@
     (match (rules-refusal sx c redefs)
       ((some a) (unchanged sx a))
       (nil (match (emit-swapping sx c (. fr stats) (into (requests-of sx new-fns (. ch families) (. ch impls)) (ld/def-requests redefs)) (. ch families) gen)
-             ((Err ds) (unchanged sx (ls/Refused (ls/shown-of sx ds at merged) ds (match (first ds) ((some d) (. d code)) (nil "check")) "")))
+             ((Err ds) (unchanged sx (ls/Refused (shown-input sx ds at merged defs) ds (match (first ds) ((some d) (. d code)) (nil "check")) "")))
              ((Ok [made changed]) (match (ld/shape-refusal made redefs)
                                     ((some r) (unchanged sx (def-refused r)))
                                     (nil (apply-input sx made text defs clauses new-fns changed gen redefs (. ch hashes))))))))))

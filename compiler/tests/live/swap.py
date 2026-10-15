@@ -230,6 +230,9 @@ check('comment only: nothing swapped', s.get('ok') and not s.get('swapped') and 
       and get(port, '/alt') == (200, 'two 73'), (s, get(port, '/alt')))
 i = c.ask(op='inspect', name='alt-which')
 check('comment only: generation kept', i.get('generation') == gen - 1, i)
+s = c.eval('(defmacro seven () `(* 7 10))\n(defun broken-one () -> i64\n  (+ 1 "x"))')
+check('a refusal in an input that redefines a macro: at the input\'s line', s.get('ok') is False and s.get('shown') and re.match(r'<input>:3:\d+: .*\[type/', s['shown'][0])
+      and s.get('generation') == gen, s)
 
 # ---- the end of the program through the socket
 check('stop', c.eval('(reset! stop true)').get('ok'))
