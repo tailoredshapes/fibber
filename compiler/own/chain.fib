@@ -1,0 +1,131 @@
+;; compiler/own/chain.fib: the program-prefix memo of the persistent checker (docs/design/live-repl.md 4 item 1, package LV4). own.staged
+;; keeps the checker's state after the library; this keeps it after each of a program's own modules as well, under the module's key (the
+;; key serve.incr gives a module: its text and name after the key of every module before it), so a request whose first modules are
+;; unchanged starts from the state after the longest of them that is kept and checks only the rest. The last module is never kept: it is
+;; the one a swap edits, and the only one `main` is required of.
+;;
+;; A module kept this way is checked as the library is (own.staged `prefix-build`): every unit, no demand, and every function decided with
+;; an all-owned body as well, since a later module may take it as a value. The whole check (types.infer.demand) leaves a unit of a
+;; non-last module that nothing reaches unchecked; so a module that does not check whole is not kept (`chain-bad`) and the rest of the
+;; program is checked from the state before it, with demand, which is the whole check's answer for it. The emitter reaches bodies by
+;; call, so the extra units checked change nothing it emits (persistent-checker.md 2).
+;;
+;; The memory: each kept state is a copy of Cells over persistent maps (shared structure) and of tables whose arrays are copied by the
+;; first write after the copy (types.table), so a state costs what the module added and one array copy per table (meshql-fib's server,
+;; 253 program modules: 431 states kept after a transcript of edits, the server's RSS 56 MB against 57 without them). `chain-max` bounds
+;; the number kept, as serve.incr's `entries-max` bounds the expander's; past it the chain starts again (the library's state stays).
+(ns own.chain
+  (:use syntax.form expand.types types.ty types.table types.decls types.target types.error types.program types.driver types.infer.mod
+        own.error own.program own.syntactic own.views own.kernel own.taken own.top own.driver own.staged))
+
+(def chain-max: i64 4000)
+
+;; The kept state after the most modules of `modules` (at most `n` - 1 of them, never fewer than the library's `k`): its length and itself.
+(defun longest-kept :private (m: Memo keys: (Vec str) k: i64 n: i64 lib: Prefix) -> (Pair i64 Prefix)
+  (loop ((i (- n 1)))
+    (if (<= i k)
+        (Pair k lib)
+        (match (get @(. m chain) (nth keys (- i 1)))
+          ((some pre) (Pair i pre))
+          (nil (recur (- i 1)))))))
+
+(defun store-prefix :private (m: Memo key: str pre: Prefix) -> unit
+  (let ((c @(. m chain)))
+    (set! (. m chain) (assoc (if (>= (map-count c) chain-max) (map-empty) c) key pre))))
+
+;; The ownership pass over the new units of `p` (those after the kept state's) with every function and method decided as if its value
+;; were taken, from the kept state's decisions; the state with the true sets of what is taken, the method units now known, and the new
+;; units' taken values.
+(defun extend-own :private (pre: Prefix p: TypedProgram) -> (Result (Pair TopState (Pair (Set (Pair i64 i64)) (Vec TakenValue))) CheckError)
+  (match (. pre top)
+    (nil (Err (CeInternal "the kept state has no ownership pass")))
+    ((some top)
+     (let ((c (. pre cuts))
+           (mine (vec (drop (. c units) (. p units))))
+           (tvs (taken-values-in p mine))
+           (news (method-units-in mine))
+           (known (into (. pre known) (vec news)))
+           (prog (. top prog))
+           (all (TopState (with prog (value-taken (into (. prog value-taken) (vec (all-funs mine))))
+                                     (methods-taken (into (. prog methods-taken) (vec news))))
+                          [] (. top hoisted)))
+           (t (analyse-from p known all mine)))
+       (if (not (empty? (. t errors)))
+           (Err (CeOwn (. t errors)))
+           (let ((vt (into (. prog value-taken) (vec (value-taken-of tvs))))
+                 (mt (into (into (. prog methods-taken) (vec (methods-taken-of p tvs 0)))
+                           (vec (methods-taken-of p (. pre taken) (. c insts))))))
+             (Ok (Pair (TopState (with (. t prog) (value-taken vt) (methods-taken mt)) [] (. t hoisted))
+                       (Pair known tvs)))))))))
+
+;; The kernels, the ownership pass and the view rules of the module just typed; the state after it.
+(defun extend-decide :private (pre: Prefix lw: Lowering ck: Checker p: TypedProgram k: i64) -> (Result Prefix CheckError)
+  (let ((c (. pre cuts)) (g (. lw g)) (kerrs (kernel-check-from p (. c kernels))))
+    (if (not (empty? kerrs))
+        (Err (CeOwn kerrs))
+        (match (extend-own pre p)
+          ((Err e) (Err e))
+          ((Ok [top [known tvs]])
+           (let ((verrs (views-owned-from p (. top prog) (. c order))))
+             (if (not (empty? verrs))
+                 (Err (CeOwn verrs))
+                 (Ok (Prefix lw ck (Cuts (table-count (. g funs)) (table-count (. g defs)) (table-count (. g instances))
+                                         (count @(. g kernels)) (count (. (. top prog) order)) (count (. p units)))
+                             (some top) known (into (. pre taken) tvs) k (state-print lw ck))))))))))
+
+;; The state after the first `j` modules continued by module `j`, checked whole: the state after `j` + 1 modules, or the error.
+(defun prefix-extend (pre: Prefix modules: (Vec Expanded) j: i64) -> (Result Prefix CheckError)
+  (match (stage-lower pre (vec (take (+ j 1) modules)))
+    ((Err errs) (Err (CeType errs)))
+    ((Ok lw)
+     (let ((c (. pre cuts)) (g (. lw g))
+           (amp (into (syntactic-check-from g (. c funs) (. c insts) (. c defs)) (views-syntactic-from g (. c funs) (. c insts) (. c defs)))))
+       (if (not (empty? amp))
+           (Err (CeOwn amp))
+           (match (stage-infer-ck pre lw false nil)
+             ((Err errs) (Err (CeType errs)))
+             ((Ok [p ck]) (extend-decide pre lw ck p (+ j 1)))))))))
+
+;; From the kept state after `j` modules, the states after each further module up to the last but one, each kept under its key; a module
+;; that does not check whole is remembered as bad and ends the chain there. The state the rest of the program starts from.
+(defun extend-chain :private (m: Memo keys: (Vec str) modules: (Vec Expanded) j: i64 pre: Prefix) -> Prefix
+  (if (>= j (- (count modules) 1))
+      pre
+      (let ((key (nth keys j)))
+        (if (contains? @(. m chain-bad) key)
+            pre
+            (let ((t0 (sys-clock-now)))
+              (match (prefix-extend pre modules j)
+                ((Ok next) (do (store-prefix m key next)
+                               (phase-note (str "stage.extend " (. (. (nth modules j) spec) ns)) t0)
+                               (extend-chain m keys modules (+ j 1) next)))
+                ((Err _) (do (set! (. m chain-bad) (conj @(. m chain-bad) key))
+                             pre))))))))
+
+;; The library flags for the rest of the program: none when no module after the kept state is the library's (the demand, which
+;; is computed over the whole program, would prune nothing, and the kept modules were checked whole).
+(defun rest-library :private (pre: Prefix library: (Option (Vec bool))) -> (Option (Vec bool))
+  (match library
+    (nil nil)
+    ((some flags) (if (some? (find-first (fn (b: bool) b) (vec (drop (. pre k) flags)))) library nil))))
+
+;; `staged-check` with a key for each of the modules (`keys`, the chain of serve.incr: a module's key covers its text and name and those
+;; of every module before it) besides the library's `lib-key` for the first `k`. The state after the longest prefix of the program's
+;; modules that is kept continues with the rest; the states after the modules checked on the way, up to the last but one, are kept.
+;; Under FIB_CHECK_CACHE=verify a run that changed a kept state is an internal error. The checked program is `staged-check`'s.
+(defun staged-check-chain (m: Memo lib-key: str k: i64 keys: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx) target: (Option Target)
+                           main: bool library: (Option (Vec bool))) -> (Result Checked CheckError)
+  (let ((n (count modules)))
+    (if (or (not (= (count keys) n)) (< n (+ k 2)))
+        (staged-check m lib-key k modules prelude target main library)
+        (match (prefix-of m lib-key modules prelude target k true)
+          ((Err _) (check-whole modules prelude target main library))
+          ((Ok lib)
+           (let ((start (longest-kept m keys k n lib))
+                 (pre (extend-chain m keys modules (. start fst) (. start snd)))
+                 (t0 (sys-clock-now))
+                 (r (stage-check pre modules main (rest-library pre library))))
+             (do (phase-note (str "stage.rest " (- n (. pre k)) " of " (- n k) " program modules (" (- (. start fst) k) " kept)") t0)
+                 (if (and (prefix-intact? lib) (prefix-intact? pre))
+                     r
+                     (Err (CeInternal "FIB_CHECK_CACHE=verify: a run changed a kept state"))))))))))

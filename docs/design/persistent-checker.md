@@ -119,7 +119,8 @@ difference is a failure. The command line (`fibc run|build|emit|check`) is off u
 | `compiler/own/{top,taken,syntactic,views,kernel}.fib` | the `-from` and `-of` forms of what ran over the whole program |
 | `compiler/expand/shared.fib` | `content-key`, the hint the loader of a batch gives its check |
 | `compiler/{emit,types}.fib`, `emit/dump.fib`, `types/dump.fib` | the batch tools use the kept state |
-| `compiler/serve/incr.fib` | the engine keeps a memo; `typecheck` is staged, whole or verified |
+| `compiler/serve/incr.fib` | the engine keeps a memo; `typecheck` is staged, whole or verified; the program's modules through the chain (section 8) |
+| `compiler/own/chain.fib` | the program-prefix memo (section 8): `staged-check-chain`, `prefix-extend` |
 | `compiler/driver/front.fib` | `check-modules`: whole, `on`, `verify` |
 
 ## 6. Results
@@ -182,3 +183,74 @@ across programs; the hit across programs is `emit --batch` (golden controls, `pe
 
 Default on or off: on for `emit --batch`, `types --batch`, `fibc serve` and `fibc repl` (every control above is clean); off for `fibc run|build|emit|check`
 (it costs 0.4 s there); `FIB_CHECK_CACHE=off` turns it off everywhere, `verify` checks both ways.
+
+## 8. The program-prefix memo (2026-10-15, package LV4 of live-repl.md)
+
+The server and the REPL checked a program's own modules whole at every request (section 6: the REPL's 87 ms per input was not the check,
+but a live session of a real app re-checks the app: live-meshql.md 1.4 measured 3.5 to 4 s per input for meshql-fib). `own.chain` keeps
+the checker's state after each of the program's modules as well, not only after the library:
+
+- **What is kept.** For a request whose modules are `m_0 .. m_{n-1}` (the first `k` the implicit library), the state after `m_0 .. m_i` for
+  each `i` from `k` to `n - 2`, as a `Prefix` of own.staged (the same copies: types.persist), under the key serve.incr gives `m_i`
+  (`module-key`: its text and name after the key of every module before it). The last module is never kept: it is the one a swap edits
+  and the only one `main` is required of. `Memo` holds them (`chain`, at most 4,000 as the expander's entries; past that the chain starts
+  again, the library's state stays) and the keys of the modules that did not check (`chain-bad`).
+- **A request** (`own.chain/staged-check-chain`, the engine's `typecheck-staged`): from the longest kept prefix of its modules
+  (`longest-kept`: the keys from the last but one backwards), the modules up to the last but one are checked one at a time and each state
+  kept (`prefix-extend`); then the rest, the last module at least, by `stage-check` as before. So an edit of `m_i` re-checks `m_i .. m_{n-1}`;
+  an edit of the last module re-checks it alone.
+- **How a kept module is checked.** As the library is (`prefix-build`): every unit, no demand, and every function and method decided with
+  an all-owned body as well (`extend-own`: a later module may take it as a value; the true sets of what is taken are recorded after, as
+  `prefix-own` does). The server's `library-flags` flag only the modules that do not see the implicit library (`fib.*`), so an app's own
+  modules were checked whole already, and for them this is the same check; a `fib.*` module the program pulls in (not implicit: `fib.tls`,
+  `fib.json.schema`, `fib.http.client` ...) was checked on demand and is now checked whole. One that does not check whole (a unit nothing
+  reaches that does not type) is remembered as bad, and the rest of the program is checked from the state before it with the library
+  flags, which is the whole check's answer for it (the unit test's `chain-bad`).
+- **The rest of the program** is checked with the library flags only when a module of it is the library's; when the kept modules reach the
+  last but one, the demand (`demand-of`, a walk over the whole program) is not computed at all.
+- **The ids.** As for the library (section 2): a module is lowered in the same order as in the whole run, so its expression, function, def
+  and instance ids are the same; the elaboration's ids are in its own range; the binding ids of the elaboration's `or` bindings shift the
+  later modules' (nothing the emitter prints holds one). The controls below compare the lIR byte for byte.
+- `FIB_TIME=1` prints `stage.extend NS` for each module kept on the way and `stage.rest R of P program modules (J kept)`.
+
+Controls, all with stage 2 of this tree (`F`, the 0.1.16 seed's build), 2026-10-15:
+
+1. `compiler/tests/own/unit-staged.fib`, the steps `chain` and `chain-bad` (13 assertions): a program of three modules through the chain equals
+   the whole check, twice; the last, then the first module edited (the keys change): the edited program's answer (the edit changes the lIR,
+   checked); the first restored: its kept state used again; a middle module with an unreached unit that does not type: the chain answers as
+   the whole check under the library flags (accepted), both reject it with every unit checked; `memo-intact?` covers the chain's states.
+   Output: `1 scenarios: 1 pass` with the 39 steps `held`.
+2. `compiler/tests/persist/run.sh F prefix` (part 4): the compiler's `syntax/` modules (12 modules, 2,087 lines with `util/text` and
+   `app/main.fib`) as the app, three servers (`FIB_CHECK_CACHE` on, off, verify) over one transcript (a swap of `answer` in the last
+   module three times, a function appended to `syntax/print.fib`, a swap again), by `--server emit`:
+   ```
+   ok prefix: every step of the transcript holds under on, off and verify (2087 lines, 12 syntax modules)
+   ok prefix: the lIR of each step is byte-identical under on, off and verify
+   ok prefix: and the last step's equals fibc emit's
+     prefix timing: swap of one function in the last module, check ms (median of 3): on 1 (front total 28), off 236; cold on 884 1009, middle-module edit on 259 334
+   ok prefix: the swap's check with the kept state is under 80 ms (1 ms; the whole check 236 ms)
+   ```
+   The swap's check is 1 ms against 236 for the whole program (the front end 28 ms in all: the load and the expansion of the one module).
+   The first request costs 884 ms (the library's state plus eleven modules checked whole and kept); an edit of `syntax.print` (the third
+   module in the order) re-checks the ten after it: 259 ms, above the whole check's 236, since each is decided with an all-owned body as
+   well and a state is copied after each.
+3. `compiler/tests/persist/run.sh F server` (part 3, extended): a program of two modules; its last module edited checks; its first module
+   loses a function: rejected; restored: accepted (the kept state is under the text's key).
+4. `scripts/mutant-persist.sh`: two new plants, `chain-key-ignored` (own.chain uses a kept state whatever the key: the unit program's
+   `chain` step reads a stale answer) and `prefix-key-ignores-text` (serve.incr keys the chain by the module's name only: the server
+   control, part 3 run with a `fibc` built from the planted copy, is accepted a program it must reject); the twelve plants of section 7
+   run again with the chain tests in the unit program. The run of 2026-10-15 (`MUT_JOBS=3`, `FIBC` stage 2 of this tree), all killed:
+   ```
+   KILLED instance-index (unit: failed, batch: failed, server: not-run)   KILLED tables-shared (unit: failed, batch: failed, server: not-run)
+   KILLED expr-counter (unit: failed, batch: failed, server: not-run)     KILLED key-ignored (unit: failed, batch: lived, server: not-run)
+   KILLED elab-counter (unit: lived, batch: failed, server: not-run)      KILLED key-no-prelude (unit: failed, batch: lived, server: not-run)
+   KILLED store-nodes (unit: lived, batch: failed, server: not-run)       KILLED key-no-texts (unit: failed, batch: lived, server: not-run)
+   KILLED resolutions (unit: failed, batch: failed, server: not-run)      KILLED elab-ids (unit: failed, batch: failed, server: not-run)
+   KILLED summaries (unit: failed, batch: failed, server: not-run)        KILLED chain-key-ignored (unit: failed, batch: lived, server: not-run)
+   KILLED program-takes (unit: lived, batch: failed, server: not-run)     KILLED prefix-key-ignores-text (unit: lived, batch: lived, server: failed)
+   ```
+   `prefix-key-ignores-text` lives through the unit program and the batch (neither goes through the engine) and is killed by the server
+   control alone, at the step it is planted for: `FAIL server: an edit of the first module was not seen (a stale kept state answered)`.
+   The three key plants of the library (`key-ignored`, `key-no-prelude`, `key-no-texts`) now read `batch: lived` where section 7 had
+   `differs*`: with the path normalised the batch cannot see them (its inputs share one library), and the unit program kills them, as
+   section 7 said it did on its own.

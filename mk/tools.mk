@@ -50,7 +50,7 @@ tool_sh-live-hooks := $(T)/live/hooks.sh $(F_ABS) | $(T)/live/hooks.sh $(T)/live
 tool_sh-live-attach := $(T)/live/attach.sh $(F_ABS) | $(T)/live/attach.sh $(T)/live/attach.py $(T)/live/app.fib $(T)/live/unit-livesock.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib)
 # The persistent checker's controls (run.sh, about 2 minutes whole) as independent stamps of at most about 50 s: the command-line programs in three groups,
 # the three batch comparisons (each builds its own emit tool), and the server edits. PERSIST_PARTS are queued right after the fixed point (mk/gate.mk).
-PERSIST_PARTS := cmd-0 cmd-1 cmd-2 batch-verify batch-onoff batch-single server
+PERSIST_PARTS := cmd-0 cmd-1 cmd-2 batch-verify batch-onoff batch-single server prefix
 $(foreach p,$(PERSIST_PARTS),$(eval tool_sh-persist-$(p) := $(T)/persist/run.sh $(F_ABS) $(p) | $(wildcard $(T)/persist/*)))
 # The three batch shares use the emit tool the golden suites already build (build/golden/tools/emit: F builds compiler/emit.fib, the same program they
 # would each build, 24 s of one core each): one build for the four users (docs/design/gate-profile.md).

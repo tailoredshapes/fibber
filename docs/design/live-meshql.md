@@ -159,6 +159,13 @@ LV4, the dependencies are a prefix the app never changes (they come first in dep
 milliseconds (FINDINGS: 0.3 ms per swap at the lIR level; live-repl.md 1: 2 to 3 ms of code generation for a 15-line function). **LV4 is
 on the critical path of this scenario**, not a convenience: a 4 s swap is tolerable, a 0.5 s one is Clojure.
 
+**Measured with LV4 built (2026-10-15, live-repl.md 8, the table there)**: through `F serve`, a function appended to a module, the engine's
+check time: the last module 8 to 9 ms (the front end 112 to 129 ms, the load of the 304 files most of it), `meshql.restlette` (module 247
+of 253) 128 ms (front end 0.26 s), `meshql.store` (202) 0.9 s, `meshql.json` (137) 2.5 s, that is the whole check again; the first request
+6.2 s against 2.7 before (every kept module checked whole and decided all-owned). The estimate above held for the handler (0.3 to 0.7 s
+estimated, 0.26 measured) and for the session module; an edit early in the order is not helped, which the dependency-aware invalidation
+noted there would fix.
+
 ## 2. The acceptance scenario, walked through the code
 
 ### 2.1 The server: where a swap is seen, and where it is not

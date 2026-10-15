@@ -5,7 +5,8 @@
 ;; Build: fibc build compiler/tests/own/unit-staged.fib -I compiler -I lib -o OUT
 (ns tests.own.unit-staged
   (:use fib.test.unit syntax.form expand.types expand.ctx expand.error types.error own.error own.program own.driver own.staged types.driver)
-  (:require [fib.test.run :as test-runner] [expand.program :as prog] [syntax.reader :as reader] [emit.compile :as ec] [expand.shared :as sh]))
+  (:require [fib.test.run :as test-runner] [expand.program :as prog] [syntax.reader :as reader] [emit.compile :as ec] [expand.shared :as sh]
+            [expand.modules :as mods] [own.chain :as ch]))
 
 ;; The prelude forms of the text `lib` and the program `src` expanded after them, as the module `main`.
 (defun expanded (lib: str src: str) -> (Result (Pair (Vec Stx) (Vec Expanded)) str)
@@ -83,9 +84,85 @@
         (is cs (not (= a (sh/content-key-of "fib.core@a.fib#fib.seq@c.fib" ["text a" "text b"] "prelude"))) "another file for a module changes the key")
         (is cs (not (= a (sh/content-key-of "fib.core@a.fib" ["text a"] "prelude"))) "fewer implicit modules change the key"))))
 
+;; ---- the chain (own.chain): the state after each of a program's own modules
+
+;; A program of several modules, each given as its text (its `ns` form first), expanded in order after the prelude `lib`; no implicit modules.
+(defun expanded-modules (lib: str srcs: (Vec str)) -> (Result (Pair (Vec Stx) (Vec Expanded)) str)
+  (let ((ctx (ctx-new)))
+    (match (prog/prelude-forms-of ctx lib)
+      ((Err m) (Err m))
+      ((Ok prelude)
+       (loop ((i 0) (out []))
+         (if (>= i (count srcs))
+             (Ok (Pair prelude out))
+             (match (expand-module ctx (nth srcs i) (str "m" i ".fib"))
+               ((Err m) (Err m))
+               ((Ok ex) (recur (+ i 1) (conj out ex))))))))))
+
+(defun expand-module (ctx: ExpandCtx src: str file: str) -> (Result Expanded str)
+  (match (reader/read-all src file)
+    ((Err _) (Err "read"))
+    ((Ok forms)
+     (match (mods/spec-of forms "main")
+       ((Err m) (Err m))
+       ((Ok spec0)
+        (let ((spec (with spec0 (implicit []))))
+          (do (mods/begin-spec ctx spec)
+              (match (prog/expand-program forms ctx (no-runner))
+                ((Err e) (Err (expand-error-text e)))
+                ((Ok ex) (Ok (mods/end-spec ctx spec ex)))))))))))
+
+(defun whole-modules (srcs: (Vec str) library: (Option (Vec bool))) -> str
+  (match (expanded-modules prelude-text srcs)
+    ((Err m) m)
+    ((Ok [prelude mods]) (text-of (check-whole mods prelude nil true library)))))
+
+;; The chain for `srcs` under `keys` (one for each module; the library is the prelude under "k").
+(defun chained (m: Memo keys: (Vec str) srcs: (Vec str) library: (Option (Vec bool))) -> str
+  (match (expanded-modules prelude-text srcs)
+    ((Err e) e)
+    ((Ok [prelude mods]) (text-of (ch/staged-check-chain m "k" 0 keys mods prelude nil true library)))))
+
+(def mod-a: str "(ns app.a)\n(defun twice (n: i64) -> i64 (* n 2))\n(defun hold (f: (fn (i64) i64) n: i64) -> i64 (f n))\n")
+(def mod-a2: str "(ns app.a)\n(defun twice (n: i64) -> i64 (* n 3))\n(defun hold (f: (fn (i64) i64) n: i64) -> i64 (f n))\n")
+(def mod-b: str "(ns app.b (:require [app.a :as a]))\n(defun thrice (n: i64) -> i64 (+ (a/twice n) n))\n(defun by-value (n: i64) -> i64 (a/hold a/twice n))\n")
+(def mod-b-bad: str "(ns app.b (:require [app.a :as a]))\n(defun thrice (n: i64) -> i64 (+ (a/twice n) n))\n(defun stray () -> i64 (+ 1 true))\n")
+(def mod-main: str "(ns main (:require [app.b :as b]))\n(defun main () -> i64 (+ (b/thrice 7) (b/by-value 1)))\n")
+(def mod-main2: str "(ns main (:require [app.b :as b]))\n(defun main () -> i64 (+ (b/thrice 8) (b/by-value 2)))\n")
+
+(defun chain (cs: StepLog) -> unit
+  (let ((m (memo-new)))
+    (do (is cs (= (chained m ["a" "b" "m"] [mod-a mod-b mod-main] nil) (whole-modules [mod-a mod-b mod-main] nil))
+            "a program of three modules through the chain equals the whole check")
+        (is cs (= (map-count @(. m chain)) 2) "the states after the first two modules are kept, not the last")
+        (is cs (= (chained m ["a" "b" "m"] [mod-a mod-b mod-main] nil) (whole-modules [mod-a mod-b mod-main] nil))
+            "and again, from the kept states")
+        (is cs (= (chained m ["a" "b" "m2"] [mod-a mod-b mod-main2] nil) (whole-modules [mod-a mod-b mod-main2] nil))
+            "the last module edited: the rest is checked from the state after the second")
+        (is cs (= (chained m ["a2" "b2" "m2"] [mod-a2 mod-b mod-main2] nil) (whole-modules [mod-a2 mod-b mod-main2] nil))
+            "the first module edited (its keys and the ones after it change): the answer is the edited program's")
+        (is cs (not (= (whole-modules [mod-a2 mod-b mod-main2] nil) (whole-modules [mod-a mod-b mod-main2] nil)))
+            "(the edit changes the lIR, so a stale state would show)")
+        (is cs (= (chained m ["a" "b" "m2"] [mod-a mod-b mod-main2] nil) (whole-modules [mod-a mod-b mod-main2] nil))
+            "the first module restored: its kept state is used again")
+        (is cs (memo-intact? m) "the programs did not change any kept state"))))
+
+;; A module that does not check whole (a unit nothing reaches that does not type) is not kept; from the state before it the rest is
+;; checked with the library flags, which is the whole check's answer.
+(defun chain-bad (cs: StepLog) -> unit
+  (let ((m (memo-new)) (flags (some [true true false])))
+    (do (is cs (= (chained m ["a" "bb" "m"] [mod-a mod-b-bad mod-main] flags) (whole-modules [mod-a mod-b-bad mod-main] flags))
+            "a middle module whose unreached unit does not type: the chain answers as the whole check (accepted under the library flags)")
+        (is cs (= (map-count @(. m chain)) 1) "the state after the first module is kept, the bad module's is not")
+        (is cs (= (chained m ["a" "bb" "m"] [mod-a mod-b-bad mod-main] flags) (whole-modules [mod-a mod-b-bad mod-main] flags))
+            "and again")
+        (is cs (= (chained m ["a" "bb" "m"] [mod-a mod-b-bad mod-main] nil) (whole-modules [mod-a mod-b-bad mod-main] nil))
+            "with every unit checked both reject it")
+        (is cs (memo-intact? m) "the kept state is as it was made"))))
+
 (defun unit-steps () -> (Vec StepRun)
   (let ((cs (new-rec)))
-    (do (agree cs) (keys cs) (library-key cs)
+    (do (agree cs) (keys cs) (library-key cs) (chain cs) (chain-bad cs)
         (rec-steps cs))))
 
 (defun tests () -> Suite

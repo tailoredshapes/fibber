@@ -5,10 +5,16 @@
 #  2. the same programs and the first inputs of the emit-fns golden through `emit --batch` (one process, the library kept) with FIB_CHECK_CACHE=verify, which
 #     checks each input both ways: no input ends in `#### CHECK-CACHE MISMATCH`; and the blocks equal those of one process for each input.
 #  3. `fibc serve`: after an edit of the prelude, and of a module of the implicit library, a program that used them is checked again with the edit (the kept
-#     state is not used for another library), and once the edit is reverted it checks again.
+#     state is not used for another library), and once the edit is reverted it checks again; and a program of two modules whose first is edited (its
+#     kept state, own.chain, is not used for another text): rejected after the edit, accepted once it is undone.
+#  4. the program-prefix memo (own.chain, docs/design/live-repl.md package LV4): the compiler's syntax/ modules (about 2,000 lines) as the app with
+#     app/main.fib as the last module, through three servers (FIB_CHECK_CACHE on, off, verify) over one transcript of edits (a one-function swap in the
+#     last module three times, an edit of a middle module, a swap again): every answer of `verify` holds; the lIR of each step is the same under the three,
+#     and the last step's equals `fibc emit`'s; the swap's check under `on` is under 80 ms (median of the three swaps), printed against `off`.
 # PART (default: all) runs one independent share, so make runs the shares side by side (mk/tools.mk, PERSIST_PARTS):
 #   cmd-0 cmd-1 cmd-2  part 1 for every third program (by position in the sorted list);  batch-verify  the verify run of part 2;
-#   batch-onoff  the batch with the kept library against the batch without it;  batch-single  the batch against one process for each input;  server  part 3.
+#   batch-onoff  the batch with the kept library against the batch without it;  batch-single  the batch against one process for each input;  server  part 3;
+#   prefix  part 4.
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 fibc=${1:-${FIBC:-fibc}}
@@ -87,7 +93,70 @@ sed -i 's/^(defun second /(defun second-gone /' "$out/lib/fib/seq/consumers2.fib
 [ "$(ask)" != 0 ] && ok "server: after an implicit module lost second the program is rejected" || bad "server: an edit of an implicit module was not seen"
 sed -i 's/^(defun second-gone /(defun second /' "$out/lib/fib/seq/consumers2.fib"
 [ "$(ask)" = 0 ] && ok "server: the module restored, the program checks" || bad "server: restoring the module was not seen"
+# a program of two modules: the first is kept by the chain (own.chain) under the key of its text; an edit of it must be seen
+mkdir -p "$out/two/app"
+printf '(ns app.lib)\n(defun pick (v: (Vec i64)) -> i64 (unwrap-or (first v) 0))\n' > "$out/two/app/lib.fib"
+printf '(ns main (:require [app.lib :as l]))\n(defun main () -> i64 (l/pick [1 2 3]))\n' > "$out/two/main.fib"
+ask2() { "$fibc" --server check "$out/two/main.fib" --socket "$FIBC_SOCKET" -q -I "$out/two" > "$out/ask2.out" 2>&1; echo $?; }
+[ "$(ask2)" = 0 ] && ok "server: a program of two modules checks" || bad "server: the two-module program does not check: $(head -c 300 "$out/ask2.out")"
+sed -i 's/^(defun main () -> i64 (l\/pick \[1 2 3\]))/(defun main () -> i64 (l\/pick [1 2]))/' "$out/two/main.fib"
+[ "$(ask2)" = 0 ] && ok "server: its last module edited, it checks (the first module's kept state is used)" || bad "server: the last module's edit broke the check: $(head -c 300 "$out/ask2.out")"
+sed -i 's/^(defun pick /(defun pick-gone /' "$out/two/app/lib.fib"
+[ "$(ask2)" != 0 ] && ok "server: after the first module lost pick the program is rejected (the kept state of its old text is not used)" || bad "server: an edit of the first module was not seen (a stale kept state answered)"
+sed -i 's/^(defun pick-gone /(defun pick /' "$out/two/app/lib.fib"
+[ "$(ask2)" = 0 ] && ok "server: the first module restored, the program checks" || bad "server: restoring the first module was not seen"
 "$fibc" --server shutdown --socket "$FIBC_SOCKET" > /dev/null 2>&1; wait "$pid" 2> /dev/null
+fi
+
+# ---- 4. the program-prefix memo: a 2,000-line app, a swap in its last module
+if want prefix; then
+app=$out/app; mkdir -p "$app/syntax" "$app/util"
+cp "$root"/compiler/syntax/*.fib "$app/syntax/"; cp "$root/compiler/util/text.fib" "$app/util/"; cp "$here/app/main.fib" "$app/main.fib"
+lines=$(cat "$app"/syntax/*.fib "$app/util/text.fib" "$app/main.fib" | wc -l)
+export FIB_LIB=$root/lib
+pids=()
+for mode in on off verify; do
+  FIB_CHECK_CACHE=$mode "$fibc" serve --socket "$out/p-$mode.sock" > "$out/p-$mode.log" 2>&1 & pids+=($!)
+done
+for mode in on off verify; do
+  for i in $(seq 40); do "$fibc" --server ping --socket "$out/p-$mode.sock" > /dev/null 2>&1 && break; sleep 0.3; done
+done
+# step MODE NAME: the emit request; its lIR and its check time (ms) to files
+step() {
+  "$fibc" --server emit "$app/main.fib" --socket "$out/p-$1.sock" --json -I "$app" > "$out/p-$1-$2.json" 2>&1
+  python3 - "$out/p-$1-$2.json" "$out/p-$1-$2" <<'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+open(sys.argv[2] + ".lir", "w").write(d.get("lir", "") or "")
+st = d.get("stats", {})
+open(sys.argv[2] + ".ms", "w").write("%d %d\n" % (st.get("check_ms", -1), st.get("total_ms", -1)))
+open(sys.argv[2] + ".ok", "w").write("ok" if d.get("ok") and not any("CheckCache" in x.get("code", "") for x in d.get("diagnostics", [])) else "fail")
+EOF
+}
+swap() { sed -i "s/^(defun answer (n: i64) -> i64 .*/(defun answer (n: i64) -> i64 $1)/" "$app/main.fib"; }
+steps="cold swap1 swap2 middle swap3"
+for s in $steps; do
+  case $s in swap1) swap "(* n 3)" ;; swap2) swap "(+ n 1)" ;; middle) printf '\n(defun persist-probe () -> i64 7)\n' >> "$app/syntax/print.fib" ;; swap3) swap "(- n 1)" ;; esac
+  for mode in on off verify; do step "$mode" "$s"; done
+done
+for mode in on off verify; do "$fibc" --server shutdown --socket "$out/p-$mode.sock" > /dev/null 2>&1; done
+wait "${pids[@]}" 2> /dev/null
+env -u FIB_CHECK_CACHE "$fibc" emit "$app/main.fib" -I "$app" > "$out/p-oneshot.lir" 2> "$out/p-oneshot.err"
+held=1; same=1
+for s in $steps; do
+  for mode in on off verify; do [ "$(cat "$out/p-$mode-$s.ok" 2>/dev/null)" = ok ] || { held=0; echo "  $mode $s: $(head -c 300 "$out/p-$mode-$s.json")"; }; done
+  { cmp -s "$out/p-on-$s.lir" "$out/p-off-$s.lir" && cmp -s "$out/p-on-$s.lir" "$out/p-verify-$s.lir" && [ -s "$out/p-on-$s.lir" ]; } || { same=0; echo "  $s: the lIR differs among on, off and verify"; }
+done
+[ "$held" = 1 ] && ok "prefix: every step of the transcript holds under on, off and verify ($lines lines, $(ls "$app/syntax" | wc -l) syntax modules)" || bad "prefix: a step failed"
+[ "$same" = 1 ] && ok "prefix: the lIR of each step is byte-identical under on, off and verify" || bad "prefix: the lIR differs"
+cmp -s "$out/p-on-swap3.lir" "$out/p-oneshot.lir" && ok "prefix: and the last step's equals fibc emit's" || bad "prefix: the last step's lIR differs from fibc emit's ($(wc -c < "$out/p-oneshot.lir") bytes one-shot, $(head -c 200 "$out/p-oneshot.err"))"
+grep -c 'stage.rest' "$out/p-on.log" > /dev/null 2>&1 || true
+med() { sort -n | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}'; }
+on_ms=$(for s in swap1 swap2 swap3; do cut -d' ' -f1 "$out/p-on-$s.ms"; done | med)
+off_ms=$(for s in swap1 swap2 swap3; do cut -d' ' -f1 "$out/p-off-$s.ms"; done | med)
+on_tot=$(for s in swap1 swap2 swap3; do cut -d' ' -f2 "$out/p-on-$s.ms"; done | med)
+echo "  prefix timing: swap of one function in the last module, check ms (median of 3): on $on_ms (front total $on_tot), off $off_ms; cold on $(cat "$out/p-on-cold.ms"), middle-module edit on $(cat "$out/p-on-middle.ms")"
+[ -n "$on_ms" ] && [ "$on_ms" -lt 80 ] && ok "prefix: the swap's check with the kept state is under 80 ms ($on_ms ms; the whole check $off_ms ms)" || bad "prefix: the swap's check is not under 80 ms: on $on_ms ms, off $off_ms ms"
 fi
 
 if [ -z "${PERSIST_OUT:-}" ]; then rm -rf "$out"; fi

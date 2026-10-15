@@ -322,7 +322,11 @@ live session of a real app needs:
    Cell of persistent values) holds for the program's modules as for the library's; what changes is where the copy is taken (after module
    `k`, any `k`) and the demand (`types.infer.demand` must be computed over the whole program before the prefix is checked, as it is for the
    library now). **Estimate**: without it, a swap in a 3,000-line app costs 0.46 ms per line of type and ownership checking (dev-loop.md 2.2)
-   = about 1.4 s; with it, the edited module only.
+   = about 1.4 s; with it, the edited module only. **Built 2026-10-15 (LV4, `own.chain`; persistent-checker.md 8)**, with two differences
+   from this text: the state is kept after *every* module up to the last but one (a chain under the modules' keys), not after one prefix, so
+   an edit of module `i` re-checks `i` and the modules after it; and a kept module is checked whole, every unit and every function decided
+   with an all-owned body as well, as the library is, instead of with the demand of the program (a `fib.*` module the program pulls in was
+   checked on demand before; an app's own modules were checked whole already). Measured on meshql-fib (section 8).
 2. **Per-definition incrementality inside a module** (DV6 proper) is not needed for the first milestones: a module that is a screenful
    costs 30 to 70 ms. It is needed when the app is one big file. Not in this plan.
 3. **Summaries as values, comparable.** The signature rule needs the scheme of a function from the catalogue (`lsp.catalog/catalog-value`
@@ -545,3 +549,40 @@ Decisions for the owner:
   input whose program numbers a `def` of the base differently is refused rather than read a wrong slot; (h) a `def` of the library the program
   never reached is made when an input first reaches it, on the attach thread; (i) `--trace` is set after the compiler's own JIT sessions
   are up, so a later input that runs a macro traces that macro's session on standard error.
+- **Status 2026-10-15, LV4 (the program-prefix memo) built**: `compiler/own/chain.fib` (`own.chain`), `compiler/own/staged.fib` (the `Memo`
+  holds the chain), `compiler/serve/incr.fib` (the engine checks through it). The function the session calls, through the engine it already
+  uses (`inc/engine-front`; nothing in `serve/live*.fib` changes): `(own.chain/staged-check-chain memo lib-key k keys modules prelude target
+  main library)`. Its contract: `keys` has one key per module (the engine's `module-key` chain: a module's key covers its text and name and
+  those of every module before it; `lib-key` is the library's, the first `k` modules'); the answer is `staged-check`'s (the whole check's
+  program, the ids apart, persistent-checker.md 2); the checker's state after each module from the first not kept up to the last but one is
+  kept in `memo.chain` under its key, so a later request with the same keys up to module `i` checks only the modules after `i`; the last
+  module is always checked (and `main` required of it when `main`); a module that does not check whole is remembered in `memo.chain-bad`
+  and never kept; under `FIB_CHECK_CACHE=verify` the engine compares the result with the whole check's lIR or diagnostics and a changed kept
+  state is an internal error; `FIB_CHECK_CACHE=off` bypasses it. The memo is the engine's (`Engine.memo`), one per session, no global state
+  (ADR 0013). Measured, `--server check` through `F serve` on meshql-fib's server program (304 modules, 51 implicit, 253 "program" modules
+  of which about 150 are `fib.*` modules the program pulls in; a function appended to a module as the edit; `check_ms` is the engine's typing
+  and ownership time, `total` its front end with the load of 304 files, about 100 ms, and the expansion of the edited modules):
+
+  | edit | before (main 5301e051) check / total | after (LV4) check / total | modules re-checked after |
+  |---|---|---|---|
+  | first request of the process | 2,735 / 4,002 ms | 6,181 / 8,010 ms | 253 (252 kept) |
+  | the last module (`src/main.fib`, 253 of 253), three times | 2,453 to 2,669 / 2,560 to 2,783 ms | 8 to 9 / 112 to 129 ms | 1 |
+  | a handler module near the end (`meshql.restlette`, 247), twice | 2,639 to 2,648 / 2,770 to 2,782 ms | 128 to 129 / 257 to 263 ms | 7 |
+  | the store, the middle of meshql's own modules (`meshql.store`, 202) | 2,692 / 2,967 ms | 907 / 1,245 ms | 52 |
+  | the first of meshql's own modules (`meshql.json`, 137) | 2,682 / 3,441 ms | 2,520 / 3,397 ms | 117 |
+
+  The swap of the design's scenario (a handler in `meshql.restlette` or `meshql.server`, or the session's own module last) is 0.1 to 0.3 s
+  of front end, 8 to 130 ms of it the check; the load of the files is now the floor. Honest readings: (1) module order does make an early
+  edit re-check most of the program: `meshql.json` is module 137 of 253 and an edit of it costs the whole check again (2.5 s), because the
+  chain is prefix-only (everything after the edited module is re-checked, used or not); the fix is dependency-aware invalidation: re-check
+  only the modules that (transitively) require the edited one, which needs the states kept per module to be composable out of order, or a
+  per-module summary (its exported schemes and summaries) compared before deciding that a dependent must be re-checked, which is DV6's
+  shape; not built. (2) The first request costs 6.2 s of check against 2.7: the chain checks every module whole and decides every function
+  with an all-owned body as well, where the whole check prunes the `fib.*` modules' unreached units by demand; a live session pays it once
+  at start-up (which is 10 s already), and again after an edit early in the order. The fix, if it matters: keep a `fib.*` module's state with
+  the demand it was checked under and reuse it while a later request's demand over it is a subset, or decide the all-owned body lazily when
+  a later module takes the function as a value. (3) The server's RSS after the transcript was 56 MB with the chain and 57 MB without it
+  (`ps -o rss` of the `serve` process): the kept states share their structure.
+  The acceptance of the row: `compiler/tests/persist/run.sh F prefix` (the 2,087-line app: the swap's check 1 ms against 236 whole, every
+  step byte-identical under on, off and verify and `fibc emit`), `run.sh F server` (an edit of a kept module is seen), the unit program's
+  `chain` and `chain-bad` steps, and `scripts/mutant-persist.sh` with `chain-key-ignored` and `prefix-key-ignores-text` (persistent-checker.md 8).
