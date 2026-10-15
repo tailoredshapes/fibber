@@ -1,0 +1,110 @@
+;; compiler/serve/livewatch.fib: `watch` of a live session (docs/design/live-meshql.md 3.8, package LT5): the poll of dev-loop.md 4.2
+;; (vanilla, not inotify): `stat` of the session's live module files (serve.liveload's copies: the files the running program's bodies came
+;; from) and of the files under the directories the request named (feature files, data), compared with the stamps of the last scan
+;; (inode, size, modification time). The poll runs on the attach thread in the connection loop of the watching connection (serve.live),
+;; at most once per `interval-ms`, and never while a test runs (a change made meanwhile is seen when the run ends): a scan is a `stat` per
+;; file, and the loop already wakes every 250 ms, so there is no thread and nothing of the session crosses one. What a change does is
+;; serve.live's: a module file is loaded (serve.liveload), a refusal emitted and nothing rerun; else the last test is rerun (`last: true`).
+;; Nothing here needs LLVM.
+(ns serve.livewatch
+  (:require [serve.liveload :as ll] [serve.incr :as inc] [lsp.json :as j] [lair.ffi :as ffi] [fib.os :as os] [fib.os.abi :as a] [fib.string :as s]))
+
+(extern stat :private (ptr ptr) -> i32)
+
+;; A file's stamp: inode, size, modification time (seconds, nanoseconds); a file that cannot be read has inode -1.
+(defstruct Stamp (ino: i64 size: i64 sec: i64 nsec: i64))
+
+(def missing: Stamp (Stamp -1 0 0 0))
+
+;; The watch of a session: the number of the watching connection (0: off), the directories named, the stamps of the last scan, when it
+;; was, and whether the run in progress is the watch's (its answer is an event).
+(defstruct Watch (conn: (Cell i64) dirs: (Cell (Vec str)) seen: (Cell (Map str Stamp)) at: (Cell i64) ours: (Cell bool)))
+
+(def interval-ms: i64 200)
+
+(defun watch-new () -> Watch (Watch (cell 0) (cell []) (cell {}) (cell 0) (cell false)))
+
+;; ---- stat
+
+;; `struct stat` of the host: the inode is the second word on both; Linux (x86-64 and aarch64 alike) has the size at 48 and `st_mtim`
+;; at 88, Darwin (64-bit inodes) `st_mtimespec` at 48 and the size at 96.
+(defun stamp-of (path: str) -> Stamp
+  (unsafe
+    (let ((p (ffi/bytes-new path)) (buf (alloc 256)) (darwin (. a/host sockaddr-length)))
+      (let ((r (stat p buf)))
+        (let ((st (if (< r 0i32)
+                      missing
+                      (Stamp (load-i64 (ptr+ buf 8)) (load-i64 (ptr+ buf (if darwin 96 48))) (load-i64 (ptr+ buf (if darwin 48 88)))
+                             (load-i64 (ptr+ buf (if darwin 56 96)))))))
+          (do (free buf) (ffi/free-addr (ffi/ptr->addr p)) st))))))
+
+(defun same? :private (x: Stamp y: Stamp) -> bool
+  (and (= (. x ino) (. y ino)) (and (= (. x size) (. y size)) (and (= (. x sec) (. y sec)) (= (. x nsec) (. y nsec))))))
+
+;; ---- the files
+
+;; The session's live module files (the main file among them), as serve.liveload holds them.
+(defun module-files (ld: ll/Loads) -> (Vec str)
+  (mapv (fn (c: ll/Copy) (. c file)) (vec (vals @(. ld copies)))))
+
+;; The regular files under `dir`, depth first (names that start with `.` skipped: an editor's swap files), at most 8 levels down.
+(defun files-under :private (dir: str depth: i64) -> (Vec str)
+  (match (os/list-directory dir)
+    ((Err _) [])
+    ((Ok es) (vec (mapcat (fn (e: os/DirectoryEntry)
+                            (let ((p (str dir "/" (. e name))))
+                              (cond (s/starts-with? (. e name) ".") []
+                                    (= (. e kind) os/Directory) (if (< depth 8) (files-under p (+ depth 1)) [])
+                                    :else [p])))
+                          es)))))
+
+(defun scan :private (w: Watch ld: ll/Loads) -> (Map str Stamp)
+  (reduce (fn (acc: (Map str Stamp) f: str) (assoc acc f (stamp-of f))) {}
+          (into (module-files ld) (vec (mapcat (fn (d: str) (files-under d 0)) @(. w dirs))))))
+
+;; ---- on and off
+
+;; The watch on for connection `cid`: the stamps now are the base (a change is a change after this); the number of files watched.
+(defun start (w: Watch ld: ll/Loads cid: i64 dirs: (Vec str)) -> i64
+  (do (set! (. w conn) cid) (set! (. w dirs) dirs)
+      (let ((now (scan w ld))) (do (set! (. w seen) now) (set! (. w at) (sys-clock-now)) (count now)))))
+
+(defun stop (w: Watch) -> unit (do (set! (. w conn) 0) (set! (. w seen) {}) ()))
+
+(defun on? (w: Watch) -> bool (> @(. w conn) 0))
+
+;; ---- the poll
+
+;; What a scan found: the module files changed (to load) and the other files changed, each in order of their names.
+(defstruct Changes (modules: (Vec str) others: (Vec str)))
+
+;; The changes since the last scan, when connection `cid` watches, no test runs (`busy`) and `interval-ms` have passed; nil otherwise or
+;; when nothing changed. A file that appears is a change, one that disappears too (its load is refused: no file).
+(defun poll (w: Watch ld: ll/Loads cid: i64 busy: bool) -> (Option Changes)
+  (if (or (not (= @(. w conn) cid)) (or busy (< (inc/ms-since @(. w at)) interval-ms)))
+      nil
+      (let ((before @(. w seen)) (now (scan w ld)) (mods (module-files ld)))
+        (do (set! (. w seen) now) (set! (. w at) (sys-clock-now))
+            (let ((changed (vec (sort (filterv (fn (f: str) (match (get before f) ((some b) (not (same? b (unwrap-or (get now f) missing)))) (nil true)))
+                                               (vec (keys now)))))))
+              (if (empty? changed)
+                  nil
+                  (some (Changes (filterv (fn (f: str) (includes? f mods)) changed) (filterv (fn (f: str) (not (includes? f mods))) changed)))))))))
+
+;; ---- events
+
+;; An answer line as an event: `{"event":KIND, ..the answer's fields}`.
+(defun as-event (kind: str line: str) -> str
+  (match (j/json-parse line)
+    ((Ok (j/JObj ks vs)) (j/json-text (j/JObj (into ["event"] ks) (into [(j/json-str kind)] vs))))
+    (_ (j/json-text (j/json-obj [(Pair "event" (j/json-str kind)) (Pair "text" (j/json-str line))])))))
+
+;; A finished run's answer line: an event `test` when the watch started the run (the flag cleared), else the line as it is.
+(defun finished-line (w: Watch line: str) -> str
+  (if @(. w ours) (do (set! (. w ours) false) (as-event "test" line)) line))
+
+(defun note-ours (w: Watch) -> unit (do (set! (. w ours) true) ()))
+
+;; `status.watch`: whether a connection watches, the directories and how many files.
+(defun watch-json (w: Watch) -> j/JVal
+  (j/json-obj [(Pair "on" (j/JBool (on? w))) (Pair "dirs" (j/JArr (mapv j/json-str @(. w dirs)))) (Pair "files" (j/json-int (count (keys @(. w seen)))))]))

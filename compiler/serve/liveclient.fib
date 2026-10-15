@@ -5,7 +5,8 @@
 ;; `:resume`, `:retire` (serve.liveretire, package LV3), `:test [SPEC] [words of fibc test]` and `:test` alone to rerun the last selection
 ;; (serve.livetest, package LT2 of docs/design/live-meshql.md 3.9: the answer's document rendered as `fibc test` prints a file, through
 ;; serve.livewords), `:load FILE` and `:reload` (serve.liveload, package LM1: a module of the program edited on disk, swapped as one
-;; input; `:status` lists the loaded files), `:help`, `:quit`.
+;; input; `:status` lists the loaded files), `:watch on [DIR..]` and `:watch off` (serve.livewatch, package LT5: the events a change
+;; brings are printed as they come, between inputs), `:help`, `:quit`.
 ;; `--json` is the stdio form for an agent or an editor: one request per line in, forwarded as it is, one answer per line out. When
 ;; nothing listens at the socket (the program was not started with `--live`, or has ended) every request is answered `not-live`.
 (ns serve.liveclient
@@ -23,23 +24,68 @@
                 first --with file) and prints the rows as fibc test does; :test alone reruns the last selection
 :load FILE      a module of the program edited on disk: its changed functions are swapped, all or nothing; the loaded text is what the
                 session sees of the module until the next :load or :reload       :reload  loads again every loaded file that changed
+:watch on [DIR..]  a changed module file is loaded and the last :test rerun (the files under DIR too: feature files rerun it
+                without a load); a refused load reruns nothing       :watch off  stops it
 :help           this                     :quit (ctrl-d) end the client; the program goes on")
 
-(defstruct Client (fd: i64 conn: sk/Conn))
+;; `json`: the stdio form (an event line is printed as it is); `watching`: `:watch on` was answered (events may come between inputs).
+(defstruct Client (fd: i64 conn: sk/Conn json: bool watching: (Cell bool)))
 
-(defun connect (target: str) -> (Result Client str)
+(defun connect (target: str json: bool) -> (Result Client str)
   (match (sk/connect-unix (lsk/resolve-target target))
     ((Err m) (Err m))
-    ((Ok fd) (Ok (Client fd (sk/conn-new fd))))))
+    ((Ok fd) (Ok (Client fd (sk/conn-new fd) json (cell false))))))
 
-;; One request and its answer line.
+(defun event? :private (line: str) -> bool (s/starts-with? line "{\"event\":"))
+
+;; One request and its answer line; the events (serve.livewatch) that come before it are shown. An answer that says `watching` sets
+;; whether events come between inputs.
 (defun exchange (c: Client line: str) -> (Result str str)
   (match (sk/write-line (. c fd) line)
     ((Err m) (Err m))
-    ((Ok _) (match (sk/conn-read-line (. c conn))
-              ((Err m) (Err m))
-              ((Ok nil) (Err "the program closed the connection"))
-              ((Ok (some l)) (Ok l))))))
+    ((Ok _) (loop ()
+              (match (sk/conn-read-line (. c conn))
+                ((Err m) (Err m))
+                ((Ok nil) (Err "the program closed the connection"))
+                ((Ok (some l)) (if (event? l) (do (show-event c l) (recur)) (do (note-watch c l) (Ok l)))))))))
+
+(defun note-watch :private (c: Client line: str) -> unit
+  (match (j/json-parse line)
+    ((Ok v) (match (field v "watching") ((some (j/JBool b)) (do (set! (. c watching) b) ())) (_ ())))
+    ((Err _) ())))
+
+;; Whether a line can be read from `c` within `ms` milliseconds: one is buffered, or the descriptor is readable (or has ended).
+(defun line-ready? :private (c: sk/Conn ms: i64) -> bool
+  (let ((pend @(. c pending)))
+    (or (loop ((i 0)) (cond (>= i (array-len pend)) false (= (array-get pend i) 10i8) true :else (recur (+ i 1))))
+        (sk/wait-readable (. c fd) ms))))
+
+;; An event line: as it is in the stdio form; else a `load` as `:load` prints it, a `test` as `:test` does after the line that says why.
+(defun show-event :private (c: Client line: str) -> unit
+  (if (. c json)
+      (println line)
+      (match (j/json-parse line)
+        ((Err _) (println line))
+        ((Ok v) (do (when (= (str-of v "event") "test") (println "; watch: a file changed; the last :test again"))
+                    (show-answer v))))))
+
+;; The events that are there now, shown (on a terminal over the prompt, which is written again after each).
+(defun drain-events :private (c: Client tty: bool prompt: str) -> unit
+  (loop ()
+    (when (line-ready? (. c conn) 0)
+      (match (sk/conn-read-line (. c conn))
+        ((Ok (some l)) (do (when tty (do (native/write-stdout "\r\x1b[K") ())) (show-event c l) (when tty (do (native/write-stdout prompt) ())) (recur)))
+        (_ ())))))
+
+;; While watching: the events that come are shown until input `in` can be read. On a terminal the prompt is written first, and the line
+;; editor's own prompt then overwrites it (`\r`).
+(defun await-input :private (c: Client in: sk/Conn tty: bool prompt: str) -> unit
+  (when @(. c watching)
+    (do (when tty (do (native/write-stdout prompt) ()))
+        (loop ()
+          (if (line-ready? in 250)
+              (when tty (do (native/write-stdout "\r") ()))
+              (do (drain-events c tty prompt) (recur)))))))
 
 (defun req (op: str fields: (Vec (Pair str j/JVal))) -> str
   (j/json-text (j/json-obj (into [(Pair "op" (j/json-str op))] fields))))
@@ -53,7 +99,7 @@
 (defun json-loop :private (c: (Option Client) why: str) -> i64
   (let ((in (sk/conn-new 0)))
     (loop ((bad 0))
-      (match (sk/conn-read-line in)
+      (match (do (match c ((some cl) (await-input cl in false "")) (nil ())) (sk/conn-read-line in))
         ((Ok nil) (if (> bad 0) 2 0))
         ((Err _) (if (> bad 0) 2 0))
         ((Ok (some line))
@@ -75,6 +121,7 @@
 ;; What the answer to an input says, as the REPL would print it.
 (defun show-answer :private (v: j/JVal) -> unit
   (cond (some? (field v "generations")) (show-status v)
+        (some? (field v "watching")) (println (if (bool-of v "watching") (str "; watching " (int-of v "files") " files") "; watch off"))
         (some? (field v "loaded")) (show-reload v)
         (some? (field v "file")) (show-load v)
         (some? (field v "error")) (println (str "; " (str-of (unwrap-or (field v "error") j/JNull) "message") " [" (str-of (unwrap-or (field v "error") j/JNull) "code") "]"))
@@ -228,6 +275,9 @@
           (= (. w fst) ":retire") (send c (req "retire" []))
           (= (. w fst) ":load") (if (= (. w snd) "") (do (println "; :load needs a file") true) (send c (req "load" [(Pair "file" (j/json-str (. w snd)))])))
           (= (. w fst) ":reload") (send c (req "reload" []))
+          (= (. w fst) ":watch") (match (watch-request (words-of (. w snd)))
+                                   ((Err m) (do (println (str "; " m)) true))
+                                   ((Ok line) (send c line)))
           (= (. w fst) ":test") (match (test-request (words-of (. w snd)))
                                   ((Err m) (do (println (str "; " m)) true))
                                   ((Ok line) (send c line)))
@@ -244,6 +294,12 @@
                 (or (= ch "'") (= ch "\"")) (recur (+ i 1) cur ch out)
                 (= ch " ") (if (= cur "") (recur (+ i 1) "" "" out) (recur (+ i 1) "" "" (conj out cur)))
                 :else (recur (+ i 1) (str cur ch) "" out))))))
+
+;; `:watch on [DIR..]` and `:watch off`.
+(defun watch-request :private (words: (Vec str)) -> (Result str str)
+  (cond (and (> (count words) 0) (= (nth words 0) "on")) (Ok (req "watch" [(Pair "on" (j/JBool true)) (Pair "dirs" (j/JArr (mapv j/json-str (vec (drop 1 words)))))]))
+        (and (= (count words) 1) (= (nth words 0) "off")) (Ok (req "watch" [(Pair "on" (j/JBool false))]))
+        :else (Err ":watch on [DIR..] or :watch off")))
 
 (defun continue-input :private (ed: ln/Editor text: str) -> (Result (Option str) str)
   (if (and (rc/incomplete? text) (not (s/starts-with? (s/trim text) ":")))
@@ -266,7 +322,7 @@
   (let ((ed (ln/editor-new 0)))
     (do (hello c)
         (loop ()
-          (match (ln/read-line ed "fib> " false)
+          (match (do (await-input c (. ed conn) (. ed tty) "fib> ") (ln/read-line ed "fib> " false))
             ((Err m) (do (eprintln (str "fibc repl: " m)) 2))
             ((Ok nil) 0)
             ((Ok (some l)) (match (continue-input ed l)
@@ -277,7 +333,7 @@
 ;; `fibc repl --connect TARGET [--json]`: 0 at the end of the input; 2 when no program answered (every request answered `not-live`).
 (defun connect-main (target: str json: bool) -> i64
   (do (native/ignore-sigpipe)
-      (match (connect target)
+      (match (connect target json)
         ((Err m) (if json
                      (json-loop nil m)
                      (do (eprintln (str "fibc repl: not-live: " m "; start the program with fibc run --live")) 2)))

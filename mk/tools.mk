@@ -63,6 +63,9 @@ tool_sh-live-queue := $(T)/live/queue.sh $(F_ABS) | $(T)/live/queue.sh $(T)/live
 # LT2 (docs/design/live-meshql.md 3): the `test` op of a live session (serve.livetest, serve.livewords, `--with`): test-app.fib's spec run from the socket
 # and the terminal client, a swap during a two-second scenario (stale), busy, the spec loaded beside the app; the unit of the pure half (about three minutes)
 tool_sh-live-test := $(T)/live/test.sh $(F_ABS) | $(T)/live/test.sh $(T)/live/test.py $(T)/live/test-app.fib $(T)/live/test-spec.fib $(T)/live/unit-livetest.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/expand/modules.fib compiler/expand/roots.fib lib/fib/test/run.fib
+# LT5 (docs/design/live-meshql.md 3.8): `watch` of a live session (serve.livewatch): an edit of the handler's module file loaded and the last test
+# rerun as events, a feature file's change rerun without a load, a refused load rerun nothing, `watch off` quiet (about a minute)
+tool_sh-live-watch := $(T)/live/watch.sh $(F_ABS) | $(T)/live/watch.sh $(T)/live/watch.py $(T)/live/watch-app.fib $(T)/live/watch-handler.fib $(wildcard compiler/serve/live*.fib) lib/fib/test/run.fib
 tool_sh-live-testlive := $(T)/live/testlive.sh $(F_ABS) | $(T)/live/testlive.sh compiler/driver/testlive.fib compiler/driver/test.fib compiler/fibc.fib $(wildcard compiler/serve/live*.fib) lib/fib/test/run.fib
 # the statics numbered per program (emit.statics `program-static?`: a quoted form `@q.N`, a closure constant, a vtable) across a swap: a spec function
 # swapped at the REPL (the `expect` macro quotes its form) and the base's scenarios run after it, `specs` itself swapped between three bindings and one
@@ -121,7 +124,7 @@ tool_sh-live-defs := $(T)/live/defs.sh $(F_ABS) --socket-only | $(T)/live/defs.s
 tool_sh-live-defs-tsan := env TSAN_OUT=$(TOOLS_OUT)/live-defs-tsan $(T)/live/defs.sh $(F_ABS) --tsan-only | $(T)/live/defs.sh $(T)/live/defs-tsan.fib $(T)/live/defs-swapper.lir scripts/tsan.sh scripts/tsan-baseline.txt compiler/emit/program.fib compiler/emit/lower/objects.fib
 TOOLS_FULL := $(TOOLS_QUICK) unit-api units-all units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-emit-runtime sh-emit-defs-order sh-stack-stack \
-  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap sh-live-defcache sh-live-queue sh-live-test sh-live-testlive sh-live-quotes sh-live-load sh-live-stress sh-live-stress-tsan sh-live-defs sh-live-defs-tsan \
+  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap sh-live-defcache sh-live-queue sh-live-test sh-live-testlive sh-live-watch sh-live-quotes sh-live-load sh-live-stress sh-live-stress-tsan sh-live-defs sh-live-defs-tsan \
   $(PERSIST_STAMPS) sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
   sh-native-l1-unit $(LIRO_STAMPS) jit-selfhosted-threads sh-native-a64-sibcall sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
 # The command is every word up to the `|`, the inputs every word after it.
