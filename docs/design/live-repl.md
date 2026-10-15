@@ -530,3 +530,18 @@ Decisions for the owner:
    error it is. `fibc build --live` (LV8) is the only way to get a live binary, and only by asking. The test that guards this is the
    LV0 one already merged (a plain emit mentions neither `live.` nor `.g0`, byte-identical to before); LT4 adds the same check for
    defs: a plain emit has no def slot and a duplicate `def` still errors.
+
+- **Status 2026-10-15**: LV0 (emit.live) and LV1 (serve.live, serve.livesess, serve.livesock, serve.liveclient; compiler/tests/live/attach.sh)
+  are built. Where LV1 as built differs from the text above: (a) the attach server runs on the driver's thread and the program's `main` on a
+  thread of its own (2.1 has them the other way round; the session's engine is `Cell` state and cannot be given to `spawn`); (b) a session
+  `def` may not be redefined (`live/Def`, where 3.5 says a redefinition leaks the old value), nor a function (`live/Swap`: a body swap is LV2),
+  nor a type (`live/Layout`), nor `main` (`live/Main`); (c) an expression's `stdout` is not captured (its `pr-str` value is written to a file
+  of its own; `println` in it goes where the program's output goes); (d) a `def` whose initialiser traps aborts the program (the init runs
+  outside the guard); (e) every input module that holds a static or a lambda is kept for good (`live.extract/pins?`), `status.generations.kept`
+  counts them, and nothing is retired (LV3); (f) each program of the session has its own closure and vtable statics (shared objects, strings
+  and keywords), since a later program does not emit the code of a closure it does not make; (g) the base is the program as `fibc run` makes
+  it (the driver's front end on the file, pruned, the same trace: the case tables agree under FIB_LIVE=1), while an input is checked against
+  the REPL's re-assembled text of the program (`<session>:L:C` in a diagnostic about a program definition, as `fibc repl` shows one), and an
+  input whose program numbers a `def` of the base differently is refused rather than read a wrong slot; (h) a `def` of the library the program
+  never reached is made when an input first reaches it, on the attach thread; (i) `--trace` is set after the compiler's own JIT sessions
+  are up, so a later input that runs a macro traces that macro's session on standard error.

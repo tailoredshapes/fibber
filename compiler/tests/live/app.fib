@@ -1,0 +1,27 @@
+(ns main (:require [fib.unix :as u]))
+;; The program of compiler/tests/live/attach.sh: a worker thread counts ticks (and sums squares on the pool every so often) while
+;; `main` waits to be told to stop, which the test does through the attach socket: `(reset! stop true)`. Its defs are what the
+;; inputs read and change live (`@ticks`, `(swap! label ..)`).
+(def ticks: (Atom i64) (atom 0))
+(def sums: (Atom i64) (atom 0))
+(def stop: (Atom bool) (atom false))
+(def label: (Atom str) (atom "idle"))
+
+(defun square-sum (n: i64) -> i64
+  (reduce + 0 (pmap (fn (x: i64) -> i64 (* x x)) (vec (range n)))))
+
+(defun tick-loop () -> i64
+  (loop ((n 0))
+    (if @stop
+        n
+        (do (swap! ticks inc)
+            (when (= (rem n 50) 0) (swap! sums + (square-sum 10)))
+            (u/sleep-ns 1000000)
+            (recur (+ n 1))))))
+
+(defun main () -> i64
+  (let ((t (spawn (fn () -> i64 (tick-loop)))))
+    (do (println "app: started")
+        (loop () (if @stop () (do (u/sleep-ns 20000000) (recur))))
+        (println (str "app: stopped after " (join t) " ticks, label " @label))
+        0)))

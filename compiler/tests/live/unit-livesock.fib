@@ -1,0 +1,18 @@
+(ns main (:require [serve.livesock :as lsk]))
+;; The peer-uid rule of the attach socket (serve.livesock, docs/design/live-repl.md 2.5) with planted uids: the same user is admitted,
+;; another is not, a uid that could not be read (-1) is not, root is not another user's; and the names of the socket. Built and run by
+;; compiler/tests/live/attach.sh (no LLVM: serve.livesock links none). Exit 0 when every check holds.
+(defun check (name: str ok: bool) -> i64
+  (do (println (str (if ok "ok " "FAIL ") name)) (if ok 0 1)))
+
+(defun main () -> i64
+  (let ((bad (+ (check "same uid admitted" (lsk/peer-allowed? 1000 1000))
+                (+ (check "other uid refused" (not (lsk/peer-allowed? 1001 1000)))
+                   (+ (check "unreadable uid refused" (not (lsk/peer-allowed? -1 1000)))
+                      (+ (check "root is not this user" (not (lsk/peer-allowed? 0 1000)))
+                         (+ (check "own uid is the process's" (and (>= (lsk/own-uid) 0) (lsk/peer-allowed? (lsk/own-uid) (lsk/own-uid))))
+                            (+ (check "socket path" (= (lsk/socket-path "/run/u/fib-live" 48213) "/run/u/fib-live/48213.sock"))
+                               (+ (check "pid resolves in the live directory" (= (lsk/resolve-target "48213") (lsk/socket-path (lsk/live-dir) 48213)))
+                                  (check "a path is itself" (= (lsk/resolve-target "/tmp/x.sock") "/tmp/x.sock")))))))))))
+    (do (println (str "unit-livesock: " (if (= bad 0) "ok" (str bad " failed"))))
+        bad)))

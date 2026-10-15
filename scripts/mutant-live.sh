@@ -20,12 +20,19 @@
 #                        (LT1, docs/design/live-meshql.md 3.2)                                        result 2); compiler/tests/live/hooks.sh
 #   override-ignored     `run-main` reads `(args)` and not `argv-override` (LT1)                      cases/stdlib 8423 (`--only x` not applied:
 #                                                                                                     three plain rows in the buffer: result 2)
+#   value-reevaluated    a session `def` is not made resident: its slot is left in the input's      compiler/tests/live/attach.sh (the atom
+#                        module, so every later input gets a slot of its own, never initialised,    counter of the design's transcript does not
+#                        and the value of a `def` does not persist from one input to the next (LV1) answer 1 then 2: the second read is not of
+#                                                                                                   the same atom)
+#   trap-not-caught      an expression's entry runs without `live-guard` (the `try` of fib.ex):     compiler/tests/live/attach.sh (`(nth [1 2] 5)`
+#                        a trap in an input aborts the program instead of answering `failed` (LV1)  ends the program; the next input has nobody
+#                                                                                                   to answer it)
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-live-MODE),
 #              MUT_QUICK=1 runs stubs.sh --quick (hello's golden and the deep recursion; no case tables: kills both mutants in under a minute after the build).
 # A mutant of lib/ alone (sink-ignored, override-ignored) builds nothing: the case's `roots:` header names the copy's lib, and FIBC runs it.
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -51,6 +58,10 @@ case $MODE in
   project-paths-not-stubbed) patch compiler/emit/live.fib '((some names) (or (= m @(. g main)) (contains? names (g-module-name g m))))' '((some names) (= m @(. g main)))' ;;
   sink-ignored) patch lib/fib/test/run.fib '(do (emit-report (cond (= (. o format) "json")' '(do (print (cond (= (. o format) "json")' ;;
   override-ignored) patch lib/fib/test/run.fib '(run-main-with suites (unwrap-or @argv-override (vec (args)))))' '(run-main-with suites (vec (args))))' ;;
+  value-reevaluated) patch compiler/serve/livesess.fib '      (if (empty? slots)
+          (Ok ())' '      (if true
+          (Ok ())' ;;
+  trap-not-caught)  patch compiler/serve/livesess.fib '-> i64 (live-guard live-fd (fn () -> i64 (do "' '-> i64 ((fn () -> i64 (do "' ;;
   *) echo "mutant-live: unknown mode $MODE" >&2; exit 2 ;;
 esac
 case $MODE in
@@ -66,6 +77,7 @@ cd "$R" || exit 2
 quick=(); [ "${MUT_QUICK:-}" = 1 ] && quick=(--quick)
 case $MODE in
   stub-*) what="the stubs test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/stubs.sh" "$F" "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
+  value-reevaluated|trap-not-caught) what="the attach test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/attach.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   deps-stubbed-by-default|project-paths-not-stubbed) what="the project test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/project.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   *) what="case 8423"  # the case's `roots:` header names ../../lib: run from a copy of cases/stdlib beside the mutated lib
      mkdir -p "$OUT/cases/stdlib"; cp -r "$R"/cases/stdlib/8423-*.fib "$R/cases/stdlib/support" "$OUT/cases/stdlib/"

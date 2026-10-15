@@ -1,0 +1,429 @@
+;; compiler/serve/livesess.fib: the resident session of `fibc run --live` (docs/design/live-repl.md 2.1, 3.5; package LV1). The
+;; program is the base of ONE resident JIT (live.jit, live.extract: the mechanism of the prototype compiler/live/session.fib, which keeps
+;; its own checks): its runtime and its `def`s are initialised once (`live.boot`) and its `main` runs once (`live.run`). An input of the
+;; attach thread (serve.live) is a whole program checked as the REPL checks one (serve.replcore: the program's text, the session's
+;; definitions, the input), emitted in the session's tables (emit.program `Tables`, so its ids agree with the resident code) and cut
+;; (live.extract) to what the base lacks:
+;;   - an expression: its entry `f.live-entry` run once with the output file's descriptor and freed, unless something resident could point
+;;     into it (live.extract `pins?`); its value is `pr-str` written to the file, a trap is caught by `live-guard` (the session's first
+;;     definition, `try` of fib.ex) and answered as `failed`;
+;;   - a `def`: its slot and an init function of its own (the emitter's init of the whole module would evaluate the program's `def`s
+;;     again), run once on the attach thread, resident for good and exported, so that every later input reads the one object (the atom
+;;     of the design's transcript answers 1 then 2); a constant `def` is static data of each input;
+;;   - a `defun`: its stub, slot and generation-0 body (emit.live), resident and exported, so one slot exists for LV2 to patch.
+;; Refused (nothing changes): a redefinition of a function (`live/Swap`: body swaps are LV2), of a `def` (`live/Def`), of a type
+;; (`live/Layout`), `main` (`live/Main`); a program that does not check (the checker's diagnostics, as the REPL shows them).
+(ns serve.livesess
+  (:use lir.ast lir.types)
+  (:require [serve.replcore :as rc] [serve.incr :as inc] [serve.diag :as dg] [expand.roots :as roots] [emit.compile :as ec]
+            [emit.program :as ep] [emit.statics :as st] [emit.node :as n] [emit.function :as f] [live.jit :as lj] [live.extract :as ex]
+            [types.decls :as td] [emit.names :as en] [own.program :as op] [driver.front :as front] [expand.maker :as mk] [lair.ffi :as ffi]
+            [fib.unix :as unix] [fib.string :as s]))
+
+(def guard-clauses: (Vec str) ["(:use fib.ex)"])
+
+;; The guard: the expression's value (or a trap's message) goes to the descriptor the entry was given, through the builtin `sys-write`
+;; (fib.unix would bring a run-time `def` of fib.os into the base, and the trace of the program would not be `fibc run`'s); 134 is
+;; the status of a trap.
+(def guard-text: str
+  "(defun live-write (live-fd: i64 text: str) -> unit (let ((bs (str-bytes text))) (do (sys-write live-fd bs 0 (array-len bs)) ())))\n(defun live-guard (live-fd: i64 f: (fn () i64)) -> i64 (try (f) (catch e (do (live-write live-fd (ex-message e)) 134))))")
+
+(defstruct Sess
+  (rc: rc/Session eng: inc/Engine rts: roots/Roots file: str opt: i64 out: str tables: ep/Tables
+   jit: (Cell (Option lj/LiveJit)) base: (Cell (Map str LItem)) rows: (Cell i64) inputs: (Cell i64)
+   resident: (Cell (Vec str)) kept: (Cell i64)
+   ;; the `def` each slot of the base holds (`def.slot.N` to its name): an input's program must agree (`slots-agree`)
+   slot-names: (Cell (Map str str))))
+
+(defun sess-new (rts: roots/Roots file: str opt: i64 out: str) -> Sess
+  (Sess (rc/session-new) (inc/engine-new) rts file opt out (ep/tables-new) (cell nil) (cell {}) (cell 0) (cell 0) (cell []) (cell 0) (cell {})))
+
+;; What an input came to.
+(defenum Answer
+  (Defined names: (Vec str) stats: inc/Stats)
+  (Value text: (Option str) status: i64 stats: inc/Stats)
+  (Failed message: str stats: inc/Stats)
+  (Refused shown: (Vec str) diags: (Vec dg/Diag) code: str)
+  (Broken message: str))
+
+;; A program made: its module, the checker's globals (the names of the `def`s by id) and the front end's figures.
+(defstruct Made (m: LModule g: td/Globals stats: inc/Stats))
+
+;; ---- the program's text
+
+(defun def-named :private (sx: Sess name: str) -> (Option rc/Def)
+  (first (filterv (fn (d: rc/Def) (= (. d name) name)) @(. (. sx rc) defs))))
+
+;; The program's text as the session: its `ns` clauses and definitions, after the guard's. The program must be one module `main`.
+(defun load-program (sx: Sess text: str) -> (Result unit (Vec str))
+  (match (rc/classify text)
+    ((rc/Unreadable m) (Err [(str (. sx file) ":" m)]))
+    ((rc/Blank) (Err [(str (. sx file) ": the program is empty")]))
+    ((rc/Parts defs clauses exprs)
+     (if (not (empty? exprs))
+         (Err [(str (. sx file) ": a live program is definitions only; a top-level expression cannot be resident")])
+         (let ((cs (rc/merge-clauses guard-clauses clauses)) (ds (into [(rc/Def "val:live-guard" "live-guard" guard-text)] defs)))   ; one Def holds both guard functions: its text is a line each
+           (do (set! (. (. sx rc) clauses) cs) (set! (. (. sx rc) defs) ds)
+               (if (nil? (def-named sx "main")) (Err [(str (. sx file) ": the program has no main")]) (Ok ()))))))))
+
+;; The tables of one program of the session: the session's objects (the type ids every walker reads), strings and keywords (plain data
+;; and ids, the same in every program, declared from the base by name), and closures and vtables of the program's own: those name
+;; code, and a later program does not emit the code of a closure or a vtable it does not make, so it must not carry the base's.
+(defun program-tables :private (sx: Sess) -> ep/Tables
+  (let ((s (. (. sx tables) statics)))
+    (ep/Tables (. (. sx tables) objects)
+               (st/Statics (. s strings) (. s string-index) (. s keywords) (. s keyword-index) (. s keywords-sealed)
+                           (cell []) (cell (map-empty)) (cell []) (cell (map-empty)) (cell []) (cell (set-empty))))))
+
+;; Whether a name is a program's own static (a closure `clo.N` or a vtable `vt.N`): copied by every cut, never declared from the base.
+(defun own-static? :private (name: str) -> bool (or (s/starts-with? name "clo.") (s/starts-with? name "vt.")))
+
+(defun base-index :private (m: LModule) -> (Map str LItem)
+  (reduce (fn (acc: (Map str LItem) p: (Pair str LItem)) (if (own-static? (. p fst)) acc (assoc acc (. p fst) (. p snd)))) {} (vec (ex/index-of m))))
+
+;; The whole program with `tail` after the session's text, checked and emitted in the session's tables with the bodies of `requests`.
+(defun program-of :private (sx: Sess tail: str requests: (Vec ec/BodyRequest)) -> (Result Made (Vec dg/Diag))
+  (let ((defs @(. (. sx rc) defs)) (clauses @(. (. sx rc) clauses)))
+    (let ((fr (rc/front (. sx eng) (. sx rts) (rc/source-of clauses defs tail) "yes" true)))
+      (match (. fr checked)
+        ((Err ds) (Err ds))
+        ((Ok c) (match (ec/compile-executable-ast-with (. c typed) (. c owned) (some (program-tables sx)) requests)
+                  ((Err m) (Err [(dg/diag-nowhere "live/Unsupported" rc/repl-file (str "unsupported: " m))]))
+                  ((Ok e) (Ok (Made (. e ast) (. (. c typed) globals) (. fr stats))))))))))
+
+(defun shown-of :private (sx: Sess ds: (Vec dg/Diag) at: i64) -> (Vec str)
+  (mapv (fn (d: dg/Diag) (rc/show-diag d at @(. (. sx rc) defs))) ds))
+
+(defun input-line :private (sx: Sess) -> i64 (+ 2 (rc/lines-in (rc/defs-text @(. (. sx rc) defs)))))
+
+;; ---- boot and run
+
+(defun jit-of :private (sx: Sess) -> lj/LiveJit (match @(. sx jit) ((some j) j) (nil (trap "live: not booted"))))
+
+(defun run-void :private (j: lj/LiveJit name: str) -> (Result unit str)
+  (try-let ((a (lj/c-entry j name)) (_ (lj/call a []))) (Ok ())))
+
+;; What the program's `main` does, split (compile.fib `main-items`, which this must keep step with): `live.boot` (the runtime, the
+;; arguments), `live.main-body` (the `def`s, then the entry; `live.ready` says the `def`s are made: an input may read them from then
+;; on) and `live.run` (`live.main-body` on the stack the runtime makes, the joins and the drops, the result printed as `fibc run` prints
+;; it; 0). The program's trace is that of `fibc run`: the case tables agree (compiler/tests/live/stubs.sh).
+(defun boot-items :private (has-defs: bool unwinds: bool) -> (Vec LItem)
+  (let ((call (n/call "f.main" [])))
+    [(ItDefine (f/external (f/make "live.boot" nil [(Pair "argc" ty-i32) (Pair "argv" ty-ptr)] cc-c
+                                   [(f/block "entry" [(n/call "fib.init" []) (n/call "fib.set-args" [(n/local "argc") (n/local "argv")]) (n/ret nil)])])))
+     (ItGlobal (LGlobalDef "live.ready" ty-i64 (n/integer ty-i64 0) false (LModifiers LkExternal false) 0 false))
+     (ItDefine (f/external (f/make "live.main-body" nil [] cc-c
+                                   [(f/block "entry" (into (if has-defs [(n/call "fib.defs-init" [])] [])
+                                                           [(n/store (n/integer ty-i64 1) (n/global "live.ready") nil)
+                                                            (f/bound [(f/binding "r" (if unwinds (n/extract call 0) call))]
+                                                                     [(n/store (n/local "r") (n/global "fib.main-r") nil) (n/ret nil)])]))])))
+     (ItDefine (f/external (f/make "live.run" (some ty-i64) [] cc-c
+                                   [(f/block "entry" [(n/call "fib.run-main" [(n/global "live.main-body")])
+                                                      (f/bound [(f/binding "r" (n/load ty-i64 (n/global "fib.main-r") nil))]
+                                                               [(n/call "fib.join-all" []) (n/call "fib.pool-quiesce" []) (n/call "fib.defs-drop" [])
+                                                                (n/call "printf" [(n/string "%lld\n") (n/local "r")])
+                                                                (n/ret (some (n/integer ty-i64 0)))])])])))]))
+
+(defun unwinds? :private (pi: (Map str LItem)) -> bool
+  (match (get pi "f.main") ((some (ItDefine fd)) (match (. (. fd ty) ret) ((some (TAnon _)) true) (_ false))) (_ false)))
+
+;; The base: the program as `fibc run` makes it, through the driver's front end on the file (the same text, positions, macro runner and
+;; rejection text; a program that does not check is reported as `fibc run` reports it, the exit status answered), emitted in the
+;; session's tables, pruned (a `def` of the library the program does not reach is made when an input first reaches it, `make-slots`),
+;; every item exported and the type tables widened (live.extract `prepare-base`), with the items above, resident. Nothing of the
+;; program has run yet.
+(defun make-base (sx: Sess rm: mk/RunnerMaker) -> (Result unit i64)
+  (match (front/check-file (. sx file) (. sx rts) rm true)
+    ((Err code) (Err code))
+    ((Ok c)
+     (do (doseq [w @(. (. (. c typed) globals) warnings)] (eprintln w))
+         (match (ec/compile-executable-ast-with (. c typed) (. c owned) (some (program-tables sx)) [])
+           ((Err m) (do (eprintln (str "unsupported: " m)) (Err front/exit-unsupported)))
+           ((Ok e) (match (lj/live-jit-new (. sx opt))
+                     ((Err m) (do (eprintln (str "compile failed: " m)) (Err front/exit-compile-failed)))
+                     ((Ok j) (install-base sx j (. e ast) (. (. c typed) globals))))))))))
+
+(defun install-base :private (sx: Sess j: lj/LiveJit m: LModule g: td/Globals) -> (Result unit i64)
+  (let ((prepared (. (ex/prepare-base m []) fst)))
+    (let ((pi (ex/index-of prepared)))
+      (let ((base (LModule (into (. prepared items) (boot-items (some? (get pi "fib.defs-init")) (unwinds? pi))))))
+        (match (lj/add-resident j "live.base" base)
+          ((Err msg) (do (eprintln (str "compile failed: " msg)) (Err front/exit-compile-failed)))
+          ((Ok _) (do (set! (. sx jit) (some j)) (set! (. sx base) (base-index base)) (set! (. sx rows) (ex/table-length m))
+                      (set! (. sx slot-names) (slot-names-of g m))
+                      (Ok ()))))))))
+
+(defun slot-names-of :private (g: td/Globals m: LModule) -> (Map str str)
+  (reduce (fn (acc: (Map str str) it: LItem)
+            (match it
+              ((ItGlobal gl) (if (s/starts-with? (. gl name) "def.slot.") (assoc acc (. gl name) (. (slot-def g (. gl name)) fst)) acc))
+              (_ acc)))
+          {} (. m items)))
+
+;; `live.boot` run here with the program's arguments: the program's runtime is up (it reads FIB_TRACE now, as `fibc run`'s does after
+;; the compiler is done with the program), not yet its `main`.
+(defun boot (sx: Sess argc: i64 argv: i64) -> (Result unit str)
+  (try-let ((addr (lj/c-entry (jit-of sx) "live.boot"))
+            (_ (lj/call addr [argc argv])))
+    (Ok ())))
+
+;; The address of `live.run`: the caller runs it on the thread of its choice (serve.live: the program's thread).
+(defun run-address (sx: Sess) -> (Result i64 str) (lj/c-entry (jit-of sx) "live.run"))
+
+;; Whether `live.main-body` has made the program's `def`s (the first input waits for it).
+(defun ready? (sx: Sess) -> bool
+  (match (lj/global-address (jit-of sx) "live.ready")
+    ((Ok a) (not (= (unsafe (load-i64 (ffi/addr->ptr a))) 0)))
+    ((Err _) false)))
+
+;; ---- the cut of an input
+
+(defstruct Added (name: str rt: i64 module: LModule))
+
+(defun resident-name? :private (sx: Sess name: str) -> bool
+  (or (s/starts-with? name "def.slot.") (s/starts-with? name "live.")
+      (ex/session-function? (mapv (fn (d: rc/Def) (. d name)) @(. (. sx rc) defs)) (if (s/ends-with? name ".g0") (str-slice name 0 (- (str-len name) 3)) name))))
+
+;; The items of a cut that later inputs must find in the base (a slot, a function's stub, slot and body) exported.
+(defun export-resident :private (sx: Sess items: (Vec LItem)) -> (Vec LItem)
+  (mapv (fn (it: LItem)
+          (match it
+            ((ItDefine fd) (if (resident-name? sx (. fd name)) (ItDefine (LFunction (. fd name) (. fd ty) (. fd params) (. fd blocks) (LModifiers LkExternal false) (. fd pos))) it))
+            ((ItGlobal g) (if (resident-name? sx (. g name)) (ItGlobal (LGlobalDef (. g name) (. g ty) (. g init) (. g constant) (LModifiers LkExternal false) (. g pos) (. g shared))) it))
+            (_ it)))
+        items))
+
+;; The module of the program's items the base lacks, from `roots` (renamed, exported) and `extra` (walked), then `tail` (not walked:
+;; an entry that names a renamed root), with the type-table rows the program added (live.extract `append-item`, stored by
+;; `live.types.append.N` before anything else of the module runs), under a tracker of its own.
+(defun add-cut :private (sx: Sess m: LModule roots: (Vec (Pair str str)) extra: (Vec LItem) tail: (Vec LItem)) -> (Result Added str)
+  (let ((j (jit-of sx)) (nr @(. sx inputs)) (name (str "live.in." nr)))
+    (do (set! (. sx inputs) (+ nr 1))
+        (try-let ((rows (ex/append-item m @(. sx rows) (str "live.types.append." nr)))
+                  (grew (Ok (> (. rows snd) @(. sx rows))))
+                  (cut (ex/extract @(. sx base) m {} roots (into (if grew (. rows fst) []) extra)))
+                  (module (Ok (LModule (export-resident sx (into (. cut items) tail)))))
+                  (rt (lj/add-tracked j name module))
+                  (_ (if grew (run-void j (str "live.types.append." nr)) (Ok ()))))
+          (do (set! (. sx rows) (max @(. sx rows) (. rows snd)))
+              (Ok (Added name rt module)))))))
+
+;; A module kept for good: its exported items join the base, so later inputs declare them.
+(defun keep-module :private (sx: Sess a: Added) -> unit
+  (do (set! (. sx kept) (+ @(. sx kept) 1))
+      (doseq [it (. (. a module) items)]
+        (match it
+          ((ItDefine fd) (when (linkage-exported? (. (. fd mods) linkage)) (set! (. sx base) (assoc @(. sx base) (. fd name) it))))
+          ((ItGlobal g) (when (linkage-exported? (. (. g mods) linkage)) (set! (. sx base) (assoc @(. sx base) (. g name) it))))
+          (_ ())))))
+
+;; ---- definitions
+
+(defun refusal-code :private (sx: Sess d: rc/Def) -> (Option str)
+  (cond (= (. d name) "main") (some "live/Main")
+        (nil? (first (filterv (fn (o: rc/Def) (= (. o key) (. d key))) @(. (. sx rc) defs)))) nil
+        (s/starts-with? (. d key) "type:") (some "live/Layout")
+        (s/starts-with? (. d text) "(def ") (some "live/Def")
+        :else (some "live/Swap")))
+
+(defun refusal-text :private (code: str name: str) -> str
+  (cond (= code "live/Main") (str "`main` is the program's; it changes with a restart")
+        (= code "live/Layout") (str name " is a type of the running program; values of it exist. A type changes with a restart")
+        (= code "live/Def") (str name " is a def of the session or the program; a def is immortal and read count-free. Define a new name")
+        :else (str name " is a function of the running program; a body swap is package LV2 and not in this build. Define a new name")))
+
+(defun refused-def :private (sx: Sess defs: (Vec rc/Def)) -> (Option Answer)
+  (first (vec (keep (fn (d: rc/Def)
+                      (match (refusal-code sx d)
+                        (nil nil)
+                        ((some code) (some (Refused [(str "<input>:1:1: " (refusal-text code (. d name)) " [" code "]")]
+                                                    [(dg/diag-nowhere code rc/repl-file (refusal-text code (. d name)))] code)))))
+                    defs))))
+
+;; A definition input: refused by the live rules above, else checked as the REPL checks one (the text is changed only when the program of
+;; every definition checks), then what the base lacks is made resident: the slots and inits of the new `def`s, the new functions.
+(defun define-input :private (sx: Sess defs: (Vec rc/Def) clauses: (Vec str)) -> Answer
+  (match (refused-def sx defs)
+    ((some r) r)
+    (nil
+     (match (rc/define-input (. sx rc) (. sx eng) (. sx rts) defs clauses)
+       ((rc/Refused shown ds) (Refused shown ds "check"))
+       ((rc/Defined names st)
+        (let ((snap (Pair @(. (. sx rc) clauses) @(. (. sx rc) defs))))
+          (match (make-resident sx defs)
+            ((Ok _) (Defined (into names clauses) st))
+            ((Err m) (do (set! (. (. sx rc) clauses) (. snap fst)) (set! (. (. sx rc) defs) (. snap snd)) (Broken m))))))
+       (_ (Defined [] (inc/Stats 0 0 0 true 0 0 0 0 0)))))))
+
+(defun new-functions :private (defs: (Vec rc/Def)) -> (Vec str)
+  (mapv (fn (d: rc/Def) (. d name)) (filterv (fn (d: rc/Def) (and (s/starts-with? (. d key) "val:") (not (s/starts-with? (. d text) "(def ")))) defs)))
+
+;; The program of the definitions (every body of the new functions asked for: `main` reaches none of them), its new slots made, then
+;; its new functions cut out, added, kept.
+(defun make-resident :private (sx: Sess defs: (Vec rc/Def)) -> (Result unit str)
+  (let ((fns (new-functions defs)))
+    (match (program-of sx "" (conj (mapv (fn (nm: str) (ec/BodyRequest nm false)) fns) (ec/BodyRequest "main" false)))
+      ((Err ds) (Err (str-join (vec (interpose "\n" (shown-of sx ds (input-line sx)))))))
+      ((Ok made)
+       (let ((pi (ex/index-of (. made m))))
+         (let ((roots (mapv (fn (nm: str) (Pair (str "f." nm) (str "f." nm))) (filterv (fn (nm: str) (some? (get pi (str "f." nm)))) fns))))
+           (try-let ((_ (make-slots sx made))
+                     (_ (if (empty? roots)
+                            (Ok ())
+                            (try-let ((a (add-cut sx (. made m) roots [] [])))
+                              (do (keep-module sx a)
+                                  (set! (. sx resident) (into @(. sx resident) (mapv (fn (r: (Pair str str)) (. r fst)) roots)))
+                                  (Ok ()))))))
+             (Ok ()))))))))
+
+;; Whether every slot an input's program shares with the base names the base's `def` (the ids are given in the order the modules are
+;; loaded; a program whose modules came in another order would read another def's slot: refused before anything of it is added).
+(defun slots-agree :private (sx: Sess made: Made) -> (Result unit str)
+  (match (first (vec (keep (fn (it: LItem)
+                             (match it
+                               ((ItGlobal gl) (match (get @(. sx slot-names) (. gl name))
+                                                (nil nil)
+                                                ((some want) (let ((got (. (slot-def (. made g) (. gl name)) fst)))
+                                                               (if (= want got) nil (some (str "live: " (. gl name) " is " got " in the input's program but " want " in the running program; the input is refused")))))))
+                               (_ nil)))
+                           (. (. made m) items))))
+    (nil (Ok ()))
+    ((some m) (Err m))))
+
+;; The `def`s of a program the base lacks (an input's own, or the library's that the program did not reach) made resident: their slots
+;; exported and one init function of theirs, run once here in the order of their ids (syntax §3.19), kept for good.
+(defun make-slots :private (sx: Sess made: Made) -> (Result unit str)
+  (let ((slots (new-slots sx (. made m))) (init-name (str "live.defs." @(. sx inputs))))
+    (try-let ((_ (slots-agree sx made)))
+      (if (empty? slots)
+          (Ok ())
+          (try-let ((a (add-cut sx (. made m) [] (conj (mapv (fn (p: (Pair str LItem)) (. p snd)) slots) (defs-init (. made g) init-name slots)) []))
+                    (_ (run-void (jit-of sx) init-name)))
+            (do (keep-module sx a)
+                (set! (. sx resident) (into @(. sx resident) (mapv (fn (p: (Pair str LItem)) (. p fst)) slots)))
+                (Ok ())))))))
+
+;; The `def.slot.N` globals of the program the base lacks: the new `def`s made at run time, each exported, by name.
+(defun new-slots :private (sx: Sess m: LModule) -> (Vec (Pair str LItem))
+  (vec (keep (fn (it: LItem)
+               (match it
+                 ((ItGlobal g) (if (and (s/starts-with? (. g name) "def.slot.") (nil? (get @(. sx base) (. g name))))
+                                   (some (Pair (. g name) (ItGlobal (LGlobalDef (. g name) (. g ty) (. g init) (. g constant) (LModifiers LkExternal false) (. g pos) (. g shared)))))
+                                   nil))
+                 (_ nil)))
+             (. m items))))
+
+;; The `def` of a slot `def.slot.N`: its name and the name of its body (emit.names: `d.NAME`, with the module's prefix).
+(defun slot-def :private (g: td/Globals slot: str) -> (Pair str str)
+  (match (parse-long (str-slice slot 9 (str-len slot)))
+    ((some d) (Pair (. (td/g-def g d) name) (en/body-name g (op/BodyDef d) [])))
+    (nil (Pair "?" "?"))))
+
+(defun object-slot? :private (it: LItem) -> bool
+  (match it ((ItGlobal g) (= (. g ty) TPtr)) (_ false)))
+
+;; The init function of the new slots, as emit.inits `init-body` writes one (`fib.initdef` named, the value immortalised when it is an
+;; object, stored); the body of a `def` NAME of the main module is `d.NAME` (emit.names).
+(defun defs-init :private (g: td/Globals name: str slots: (Vec (Pair str LItem))) -> LItem
+  (let ((body (loop ((k (- (count slots) 1)) (tail [(n/ret nil)]))
+                (if (< k 0)
+                    tail
+                    (let ((slot (. (nth slots k) fst)) (dn (slot-def g (. (nth slots k) fst))) (v (str "v" k))
+                          (object (object-slot? (. (nth slots k) snd))))
+                      (recur (- k 1)
+                             [(n/store (n/string (str "def " (. dn fst) ": ")) (n/global "fib.initdef") nil)
+                              (f/bound [(f/binding v (n/call (. dn snd) []))]
+                                       (into (if object [(n/call "fib.immortalise" [(n/local v)])] [])
+                                             (into [(n/store (n/local v) (n/global slot) nil)] tail)))]))))))
+    (ItDefine (f/external (f/make name nil [] cc-c [(f/block "entry" body)])))))
+
+;; ---- expressions
+
+;; The entry of input `n`: a name of its own, so that its closure literals (and their object types, shared by every program of the
+;; session) are nobody else's.
+(defun entry-name :private (n: i64) -> str (str "live-entry-" n))
+
+(defun entry-tail :private (n: i64 expr: str print: bool) -> str
+  (str "(defun " (entry-name n) " (live-fd: i64) -> i64 (live-guard live-fd (fn () -> i64 (do "
+       (if print (str "(live-write live-fd (pr-str " expr "))") expr) " 0))))\n"))
+
+;; A `ccc` entry `name` of one word (the descriptor) to `body`, a `tailcc` function of the same parameter; the first word of its result
+;; (a value next to a failure under the catching convention).
+(defun entry-item :private (name: str body: str ty: LFnType) -> LItem
+  (let ((call (n/call body [(n/local "fd")])))
+    (let ((value (match (. ty ret) ((some (TAnon _)) (n/extract call 0)) (_ call))))
+      (ItDefine (f/external (f/make name (some ty-i64) [(Pair "fd" ty-i64)] cc-c [(f/block "entry" [(n/ret (some value))])]))))))
+
+(defun debug-missing? :private (ds: (Vec dg/Diag)) -> bool
+  (some? (first (filterv (fn (d: dg/Diag) (s/includes? (. d message) "implementation of Debug")) ds))))
+
+;; The program of expression input `n`: its value printed with `pr-str`, or run for its effect alone when its type has no Debug.
+(defun expression-program :private (sx: Sess n: i64 expr: str) -> (Result (Pair Made bool) (Vec dg/Diag))
+  (let ((req [(ec/BodyRequest (entry-name n) false)]))
+    (match (program-of sx (entry-tail n expr true) req)
+      ((Ok made) (Ok (Pair made true)))
+      ((Err ds) (if (debug-missing? ds)
+                    (match (program-of sx (entry-tail n expr false) req) ((Ok made) (Ok (Pair made false))) ((Err ds2) (Err ds2)))
+                    (Err ds))))))
+
+;; The text an input wrote to the output file, which is then removed.
+(defun take-output :private (sx: Sess) -> str
+  (let ((t (unwrap-or (read-file (. sx out)) "")))
+    (do (unix/fd-unlink (. sx out)) t)))
+
+;; The entry run with the output file's descriptor: its status and what it wrote.
+(defun run-entry :private (sx: Sess addr: i64) -> (Result (Pair i64 str) str)
+  (match (unix/fd-open (. sx out) (+ unix/O_WRONLY (+ unix/O_CREAT unix/O_TRUNC)) 384)
+    ((Err e) (Err (str "cannot open " (. sx out) ": " (unix/errno-text e))))
+    ((Ok fd) (let ((r (lj/call addr [fd])))
+               (do (unix/fd-close fd)
+                   (match r ((Err m) (Err m)) ((Ok st) (Ok (Pair st (take-output sx))))))))))
+
+;; The entry of input `n` cut out as `live.expr.N.body` (generation 0 of the entry, emit.live), entered through `live.expr.N`, run,
+;; and freed unless pinned.
+(defun run-expression :private (sx: Sess n: i64 m: LModule) -> (Result (Pair i64 str) str)
+  (let ((pi (ex/index-of m)) (name (str "live.expr." n)) (stub (str "f." (entry-name n))))
+    (let ((body (if (some? (get pi (str stub ".g0"))) (str stub ".g0") stub)))
+      (try-let ((fd (match (get pi body) ((some (ItDefine fd)) (Ok fd)) (_ (Err (str "live: the program has no " (entry-name n))))))
+                (a (add-cut sx m [(Pair body (str name ".body"))] [] [(entry-item name (str name ".body") (. fd ty))]))
+                (addr (lj/address (jit-of sx) name))
+                (r (run-entry sx addr)))
+        (if (ex/pins? (. a module))
+            (do (keep-module sx a) (Ok r))
+            (match (lj/remove (jit-of sx) (. a rt) [name (str name ".body")]) ((Err e) (Err e)) ((Ok _) (Ok r))))))))
+
+(defun expression-input :private (sx: Sess expr: str) -> Answer
+  (let ((n @(. sx inputs)))
+    (expression-answer sx n (expression-program sx n expr))))
+
+(defun expression-answer :private (sx: Sess n: i64 program: (Result (Pair Made bool) (Vec dg/Diag))) -> Answer
+  (match program
+    ((Err ds) (Refused (shown-of sx ds (input-line sx)) ds "check"))
+    ((Ok [made printed])
+     (match (try-let ((_ (make-slots sx made))) (run-expression sx n (. made m)))
+       ((Err m) (Broken m))
+       ((Ok [st text]) (cond (= st 134) (Failed text (. made stats))
+                             (= st 0) (Value (if printed (some text) nil) 0 (. made stats))
+                             :else (Value nil st (. made stats))))))))
+
+;; ---- inputs
+
+;; One input: definitions, then one expression at most (the REPL's rule for a request).
+(defun input (sx: Sess text: str) -> Answer
+  (match (rc/classify text)
+    ((rc/Blank) (Defined [] (inc/Stats 0 0 0 true 0 0 0 0 0)))
+    ((rc/Unreadable m) (Refused [(str "<input>:" m)] [] "read"))
+    ((rc/Parts defs clauses exprs)
+     (cond (> (count exprs) 1) (Refused ["<input>:1:1: one expression for each input [live/Input]"] [] "live/Input")
+           (and (empty? defs) (empty? clauses)) (expression-input sx (nth exprs 0))
+           :else (match (define-input sx defs clauses)
+                   ((Defined names st) (if (empty? exprs) (Defined names st) (expression-input sx (nth exprs 0))))
+                   (other other))))))
+
+;; `:type`: the checker's type of an expression (serve.replcore).
+(defun type-of (sx: Sess expr: str) -> (Result str (Vec str))
+  (rc/type-of-expr (. sx rc) (. sx eng) (. sx rts) expr))
+
+(defun resident-names (sx: Sess) -> (Vec str) @(. sx resident))
+(defun modules-kept (sx: Sess) -> i64 @(. sx kept))
+(defun inputs-made (sx: Sess) -> i64 @(. sx inputs))

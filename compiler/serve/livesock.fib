@@ -1,0 +1,88 @@
+;; compiler/serve/livesock.fib: the attach socket of a live program (docs/design/live-repl.md 2.5, package LV1): where it is, its
+;; permissions, and the check that the peer is the process's own user. The socket is `$XDG_RUNTIME_DIR/fib-live/PID.sock`, else
+;; `/tmp/fib-live-$USER/PID.sock`; the directory is made 0700 and the socket file 0600 (serve.sock `chmod-private`, as `fibc serve`); a
+;; peer whose uid is not the process's is closed before a line is read. No TCP, no network. The listen, accept, connect and lines are
+;; serve.sock's. Nothing here needs LLVM (compiler/tests/live/unit-livesock.fib builds without it).
+(ns serve.livesock
+  (:require [serve.sock :as sk] [fib.unix :as unix] [fib.os.abi :as a] [lair.ffi :as ffi] [fib.string :as s]))
+
+(extern getsockopt :private (i32 i32 i32 ptr ptr) -> i32)
+(extern getuid :private () -> i32)
+(extern chmod :private (ptr i32) -> i32)
+(extern shutdown :private (i32 i32) -> i32)
+
+;; ---- where
+
+(defun fallback-dir :private () -> str
+  (str "/tmp/fib-live-" (unwrap-or (unix/getenv "USER") "user")))
+
+;; The directory of the live sockets of this user.
+(defun live-dir () -> str
+  (match (unix/getenv "XDG_RUNTIME_DIR")
+    ((some d) (if (= d "") (fallback-dir) (str d "/fib-live")))
+    (nil (fallback-dir))))
+
+(defun socket-path (dir: str pid: i64) -> str (str dir "/" (show pid) ".sock"))
+
+;; The output file of an input's value, beside the socket (an expression writes `pr-str` of its value to it: serve.livesess).
+(defun output-path (dir: str pid: i64) -> str (str dir "/" (show pid) ".out"))
+
+;; What `--connect` names: a pid (a whole number) is that process's socket in the live directory, anything else a path.
+(defun resolve-target (target: str) -> str
+  (match (parse-long target)
+    ((some pid) (socket-path (live-dir) pid))
+    (nil target)))
+
+;; ---- permissions
+
+(defun chmod-path :private (path: str mode: i64) -> bool
+  (let ((p (ffi/bytes-new path)))
+    (let ((r (unsafe (chmod p (trunc i32 mode)))))
+      (do (ffi/free-addr (ffi/ptr->addr p)) (= r 0i32)))))
+
+;; The directory, made if need be, with mode 0700 (a directory that is there but cannot be made private, another user's, is refused).
+(defun make-private-dir (dir: str) -> (Result unit str)
+  (do (unix/fd-mkdir dir 448)
+      (if (chmod-path dir 448) (Ok ()) (Err (str "cannot make " dir " a private directory (0700)")))))
+
+;; A listening socket at `path` (in a directory made private first), the file 0600.
+(defun listen-private (dir: str path: str) -> (Result i64 str)
+  (match (make-private-dir dir)
+    ((Err m) (Err m))
+    ((Ok _) (match (sk/listen-unix path 16)
+              ((Err m) (Err m))
+              ((Ok fd) (do (sk/chmod-private path) (Ok fd)))))))
+
+;; Ends a listening socket from another thread: a blocked accept returns with an error.
+(defun shutdown-socket (fd: i64) -> unit (do (unsafe (shutdown (trunc i32 fd) 2i32)) ()))
+
+;; ---- who
+
+;; The uid of the peer of a unix socket: SO_PEERCRED on Linux (level SOL_SOCKET 1, option 17, `struct ucred {pid, uid, gid}`) and
+;; LOCAL_PEERCRED on Darwin (level SOL_LOCAL 0, option 1, `struct xucred {version, uid, ..}`): the uid is the second 32-bit word of both.
+;; -1 when it cannot be read.
+(defun peer-uid (fd: i64) -> i64
+  (unsafe
+    (let ((buf (alloc 128)) (len (alloc 8)) (darwin (. a/host sockaddr-length)))
+      (do (dotimes (i 16) (store-i64 (ptr+ buf (* i 8)) 0))
+          (store-i32 len 128i32)
+          (let ((r (getsockopt (trunc i32 fd) (if darwin 0i32 1i32) (if darwin 1i32 17i32) buf len)))
+            (let ((uid (if (< r 0i32) -1 (zext i64 (load-i32 (ptr+ buf 4))))))
+              (do (free buf) (free len) uid)))))))
+
+;; The uid the process answers to: its own, or FIB_LIVE_OWN_UID (a test hook, compiler/tests/live/attach.sh: a planted value can only
+;; refuse more, never admit another user).
+(defun own-uid () -> i64
+  (match (unix/getenv "FIB_LIVE_OWN_UID")
+    ((some v) (match (parse-long (s/trim v)) ((some n) n) (nil (zext i64 (unsafe (getuid))))))
+    (nil (zext i64 (unsafe (getuid))))))
+
+;; Whether a peer of uid `peer` may attach to a process of uid `own`: the same user only (docs/design/live-repl.md 2.5); a uid that
+;; could not be read is refused.
+(defun peer-allowed? (peer: i64 own: i64) -> bool (and (>= peer 0) (= peer own)))
+
+;; The peer of `fd` checked; the connection is closed when it is refused.
+(defun admit (fd: i64) -> bool
+  (if (peer-allowed? (peer-uid fd) (own-uid))
+      true
+      (do (unix/fd-close fd) false)))
