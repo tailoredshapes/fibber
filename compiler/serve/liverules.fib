@@ -6,7 +6,7 @@
 (ns serve.liverules
   (:require [serve.livetable :as lt] [types.decls :as td] [own.program :as op] [own.driver :as od]))
 
-(defstruct Refusal (code: str message: str hint: str))
+(defstruct Refusal (code: str message: str hint: str family: str))
 
 ;; The first rule the program of `c` breaks against the table `t`, if any. `session-defs` is how many definitions the session added
 ;; (the hint of a signature refusal says they are kept by a restart).
@@ -23,14 +23,14 @@
 (defun family-rules :private (t: lt/Table c: od/Checked ids: (Map str i64) family: str session-defs: i64) -> (Option Refusal)
   (match (Pair (get (. t families) family) (get ids family))
     ([(some f) (some fid)]
-     (match (signature-rule c f fid session-defs)
+     (match (signature-rule c f fid family session-defs)
        ((some r) (some r))
-       (nil (summary-rule c f fid))))
+       (nil (summary-rule c f fid family))))
     (_ nil)))
 
 ;; ---- signature: the scheme after must be the scheme before, compared as types with colours erased
 
-(defun signature-rule :private (c: od/Checked f: lt/Family fid: i64 session-defs: i64) -> (Option Refusal)
+(defun signature-rule :private (c: od/Checked f: lt/Family fid: i64 family: str session-defs: i64) -> (Option Refusal)
   (match (Pair (. f scheme) (get (. (. c typed) fun-schemes) fid))
     ([(some was) (some sch)]
      (let ((now (lt/scheme-texts c sch)))
@@ -39,18 +39,19 @@
          (let ((name (. (td/g-fun (. (. c typed) globals) fid) name)))
            (some (Refusal "live/Signature"
                           (str name " now has type " (. now snd) ", was " (. was snd) "; callers were compiled against the old one")
-                          (str ":restart changes signatures; the session's " session-defs (if (= session-defs 1) " definition is" " definitions are") " kept and replayed")))))))
+                          (str ":restart changes signatures; the session's " session-defs (if (= session-defs 1) " definition is" " definitions are") " kept and replayed")
+                          family))))))
     (_ nil)))
 
 ;; ---- summary: every parameter's mode (borrowed or owned) and escape must be what the callers hand over
 
-(defun summary-rule :private (c: od/Checked f: lt/Family fid: i64) -> (Option Refusal)
+(defun summary-rule :private (c: od/Checked f: lt/Family fid: i64 family: str) -> (Option Refusal)
   (match (Pair (. f summary) (get (. (. c owned) summaries) fid))
     ([(some was) (some now)]
      (if (= was now)
          nil
          (let ((def (td/g-fun (. (. c typed) globals) fid)) (i (first-difference (. was params) (. now params))))
-           (some (refusal-of (. def name) (param-name def i) (owned-why c fid i) (nth-or (. was params) i) (nth-or (. now params) i))))))
+           (some (refusal-of family (. def name) (param-name def i) (owned-why c fid i) (nth-or (. was params) i) (nth-or (. now params) i))))))
     (_ nil)))
 
 ;; The index of the first parameter whose (owned, escapes) differs; the shorter list's length when one is a prefix of the other.
@@ -84,13 +85,13 @@
 (defun nth-or :private (ps: (Vec (Pair bool bool)) i: i64) -> (Pair bool bool)
   (if (< i (count ps)) (nth ps i) (Pair false false)))
 
-(defun refusal-of :private (name: str p: str why: str was: (Pair bool bool) now: (Pair bool bool)) -> Refusal
+(defun refusal-of :private (family: str name: str p: str why: str was: (Pair bool bool) now: (Pair bool bool)) -> Refusal
   (cond (and (not (. was fst)) (. now fst))
           (Refusal "live/Summary" (str name "'s parameter " p " was borrowed and is now owned (" why "); callers pass it borrowed")
-                   (str "store (clone " p "), or :restart"))
+                   (str "store (clone " p "), or :restart") family)
         (and (. was fst) (not (. now fst)))
-          (Refusal "live/Summary" (str name "'s parameter " p " was owned and is now borrowed; callers hand it over") ":restart")
+          (Refusal "live/Summary" (str name "'s parameter " p " was owned and is now borrowed; callers hand it over") ":restart" family)
         (. now snd)
-          (Refusal "live/Summary" (str name "'s parameter " p " now escapes (" why "); callers were compiled against a parameter that did not") ":restart")
+          (Refusal "live/Summary" (str name "'s parameter " p " now escapes (" why "); callers were compiled against a parameter that did not") ":restart" family)
         :else
-          (Refusal "live/Summary" (str name "'s parameter " p " no longer escapes; callers were compiled against a parameter that did") ":restart")))
+          (Refusal "live/Summary" (str name "'s parameter " p " no longer escapes; callers were compiled against a parameter that did") ":restart" family)))

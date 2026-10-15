@@ -12,7 +12,8 @@ again and `reload` with no change swaps nothing; an edit of a comment only swaps
 says the file is stale; a new function in the loaded file is defined and then swapped; a file whose module the program lacks is
 live/NotLoaded with the `require` hint; a load of the main module's file defines its new function; the terminal client's `:load`,
 `:status` and `:reload` lines; the app ends through the socket.
-The mutants of scripts/mutant-live.sh that must make this fail: partial-load, load-reads-disk, prefix-dropped, removed-ignored."""
+The mutants of scripts/mutant-live.sh that must make this fail: partial-load, load-reads-disk, prefix-dropped, removed-ignored,
+rules-at-file-start."""
 import json, os, re, shutil, socket, subprocess, sys, tempfile, time
 
 fibc = os.path.abspath(sys.argv[1])
@@ -169,6 +170,14 @@ check('the swapped function answers', c.value('(r/helper 1)') == '3', c.value('(
 write_routes(edited('(defun route (path: str) -> str (str prefix " " path))', '(defun route (path: str) -> str (str prefix "! " path))'))
 l = c.load('src/routes.fib')
 check('and back', l.get('ok') is True and l.get('swapped') == ['routes/helper'] and l.get('generation') == 3 and c.value('(r/helper 1)') == '2', l)
+
+# ---- a rules refusal (live/Signature: helper is in the live table now) is reported at the definition's line, not 1:1
+write_routes(edited('(defun helper (n: i64) -> i64 (* n 2))', '(defun helper (n: i64) -> str (str n))',
+                    edited('(defun route (path: str) -> str (str prefix " " path))', '(defun route (path: str) -> str (str prefix "! " path))')))
+l = c.load('src/routes.fib')
+check('a signature refusal is at the definition in the file', l.get('ok') is False and l.get('code') == 'live/Signature'
+      and re.match(r'src/routes\.fib:11:1: helper now has type .*\[live/Signature\]', shown_at(l, 'live/Signature'))
+      and l['diagnostics'][0]['line'] == 11 and l['diagnostics'][0]['col'] == 1 and c.ask(op='status').get('generation') == 3, l)
 
 # ---- reload after a second edit swaps again; reload with no change swaps nothing
 write_routes(edited('(defun route (path: str) -> str (str prefix " " path))', '(defun route (path: str) -> str (str prefix "? " path))'))

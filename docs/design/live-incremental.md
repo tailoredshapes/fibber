@@ -454,7 +454,8 @@ Decisions for the owner:
   or macro too (the checker's rules apply), a new `def` or `extern` refused (`live/Def`, `live/Extern`; since LT4 a `def` is made or redefined, live-meshql.md 10); a `derive` or an `impl` of no
   head that changed is `live/Unsupported`; (d) **a changed function the running program never reached** (no registered body) swaps into
   the text only, as LV2 (a) says of a generic nobody instantiates; it is not in `swapped`; (e) the per-family rules refusal (`live/
-  Signature`, `live/Summary`) is reported at `FILE:1:1` (the checker's view has no position of the family in the file); (f) `status.live`
+  Signature`, `live/Summary`) is reported at the refused function's definition in the file (`FILE:1:1` until the live bugs' fix, below;
+  still so for a family that is not the file's); (f) `status.live`
   is the rule's name and the count of live modules (`project paths (3 modules); --live-deps widens`, or `every module not named
   fib.*`), not the per-library listing of 3.6; (g) the main module's own file is loaded as an `eval` of the definitions that differ from
   the file as last loaded (the session's own inputs are not in that copy), with the file's `ns` clauses; a definition the file dropped is

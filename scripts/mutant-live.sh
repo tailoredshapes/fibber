@@ -112,13 +112,15 @@
 #                        3.8)
 #   watch-reruns-on-refusal  the watch reruns the last test after a load that was refused (LT5)       compiler/tests/live/watch.sh (a test event
 #                                                                                                   follows the refusal)
+#   rules-at-file-start  a load's live/Signature or live/Summary refusal is reported at FILE:1:1,   compiler/tests/live/load.sh (the signature
+#                        not at the refused function's definition in the file                       refusal of helper is not at 11:1)
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-live-MODE),
 #              MUT_QUICK=1 runs stubs.sh --quick (hello's golden and the deep recursion; no case tables: kills both mutants in under a minute after the build)
 #              and stress.sh --quick (100 swaps), defs.sh --quick (100 redefinitions).
 # A mutant of lib/ alone (sink-ignored, override-ignored) builds nothing: the case's `roots:` header names the copy's lib, and FIBC runs it.
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|quote-shared|partial-load|load-reads-disk|prefix-dropped|removed-ignored|def-slot-plain-store|old-def-freed|init-run-twice|warm-skipped|inspect-runs-input|child-spawned-anyway|diff-by-text|hash-with-positions|watch-no-load|watch-reruns-on-refusal}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|quote-shared|partial-load|load-reads-disk|prefix-dropped|removed-ignored|def-slot-plain-store|old-def-freed|init-run-twice|warm-skipped|inspect-runs-input|child-spawned-anyway|diff-by-text|hash-with-positions|watch-no-load|watch-reruns-on-refusal|rules-at-file-start}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -154,8 +156,8 @@ case $MODE in
                 (_ (let ((gens (. (unwrap-or (get (. @(. sx table) families) family) (lt/Family 0 nil nil [])) gens)))
                      (if (empty? gens) (Ok ()) (lj/remove (ls/jit-of sx) (. (nth gens (- (count gens) 1)) rt) (. (nth gens (- (count gens) 1)) names))))))'
                        patch compiler/serve/liveswap.fib '[own.driver :as od] [types.init :as ti]' '[own.driver :as od] [types.init :as ti] [live.jit :as lj]' ;;
-  summary-ignored)  patch compiler/serve/liverules.fib '       (nil (summary-rule c f fid))))' '       (nil nil)))' ;;
-  signature-ignored) patch compiler/serve/liverules.fib '     (match (signature-rule c f fid session-defs)' '     (match (if true nil (signature-rule c f fid session-defs))' ;;
+  summary-ignored)  patch compiler/serve/liverules.fib '       (nil (summary-rule c f fid family))))' '       (nil nil)))' ;;
+  signature-ignored) patch compiler/serve/liverules.fib '     (match (signature-rule c f fid family session-defs)' '     (match (if true nil (signature-rule c f fid family session-defs))' ;;
   defcache-stale) patch compiler/emit/defs/cache.fib '    ((some e) (if (= (. e source) source) (some e) nil))' '    ((some e) (some e))' ;;
   defcache-no-items) patch compiler/emit/defs/cache.fib '                (do (defs-append defs it)' '                (do ()' ;;
   defcache-verify-blind) patch compiler/emit/defs/cache.fib '    ((some e) (if (= (. e source) source) (some e) nil))' '    ((some e) (some e))'
@@ -195,6 +197,9 @@ case $MODE in
   hash-with-positions) patch compiler/serve/livediff.fib '(str (pr/stx-show (canon f (gensyms-in f {}) aliases)) "\n" uses))' '(str (pr/stx-show (canon f (gensyms-in f {}) aliases)) "\n" uses " @" (. (. f pos) start)))' ;;
   watch-no-load) patch compiler/serve/live.fib '(ll/load-file (. l loads) (. l sx) f))) (. ch modules))' '(ll/load-file (. l loads) (. l sx) f))) (filterv (fn (f: str) false) (. ch modules)))' ;;
   watch-reruns-on-refusal) patch compiler/serve/live.fib '(if (and (every? (fn (f: (Pair bool (Vec (Pair str j/JVal)))) (. f fst)) loads) (some? @(. (. l tests) last-sel)))' '(if (some? @(. (. l tests) last-sel))' ;;
+  rules-at-file-start) patch compiler/serve/liveload.fib '    ((some d) (pos-of text d))
+    (nil (Pair 1 1))))' '    ((some d) (Pair 1 1))
+    (nil (Pair 1 1))))' ;;
   inspect-runs-input) patch compiler/serve/live.fib '(if (p/field-bool r "value") (inspect-value l r name) (inspect-lookup l r name))' '(inspect-value l r name)' ;;
   *) echo "mutant-live: unknown mode $MODE" >&2; exit 2 ;;
 esac
@@ -226,7 +231,7 @@ case $MODE in
   quote-shared) what="the quotes test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/quotes.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   def-slot-plain-store) what="the TSAN defs test"; TSAN_OUT="$OUT/tsan" FIB_LIB="$R/lib" "$R/compiler/tests/live/defs.sh" "$F" --tsan-only > "$OUT/test.log" 2>&1; rc=$? ;;
   old-def-freed|init-run-twice) what="the defs test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/defs.sh" "$F" --socket-only "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
-  partial-load|load-reads-disk|prefix-dropped|removed-ignored) what="the load test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/load.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
+  partial-load|load-reads-disk|prefix-dropped|removed-ignored|rules-at-file-start) what="the load test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/load.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   deps-stubbed-by-default|project-paths-not-stubbed) what="the project test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/project.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   *) what="case 8423"  # the case's `roots:` header names ../../lib: run from a copy of cases/stdlib beside the mutated lib
      mkdir -p "$OUT/cases/stdlib"; cp -r "$R"/cases/stdlib/8423-*.fib "$R/cases/stdlib/support" "$OUT/cases/stdlib/"
