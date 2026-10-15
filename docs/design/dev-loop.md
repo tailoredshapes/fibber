@@ -621,7 +621,7 @@ Run on 2026-10-07, each built from a copy with the seed v0.1.11: all six KILLED 
    Needs the audit that every part of `Globals` and `Checker` is a `Cell` of persistent values, as `ExpandCtx` is.
 2. **Generated code.** `run` and `test` JIT the program each time. Per-function modules, or a module for each source module with the ORC resource trackers
    (`LLVMOrcResourceTrackerRemove`), would let a changed function be replaced. Section 3 estimated at most 55 ms of 330 for lazy compilation; the spec runs here are 1.5 to 2 s of code generation.
-3. **A REPL with resident values** (needs 2).
+3. **A REPL with resident values** (needs 2). Designed in [live-repl.md](live-repl.md) (2026-10-14): the app runs in the compiler's process, program functions are called through patchable slots, a swap is a new ORC resource tracker and one store.
 4. **`fibc check`** is another package's: the client's fallback for `check` should call it.
 5. **The editor** (section 8.6), `cases --watch` and the fork-per-case harness (section 4.2): not built.
 6. The type checker is whole-program, so a check of a library module needs the program that requires it: a library module (`fib.*`) is checked as the module a one-line program requires, which
