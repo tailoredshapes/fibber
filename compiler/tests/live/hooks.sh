@@ -1,9 +1,9 @@
 #!/bin/bash
-# compiler/tests/live/hooks.sh: the hooks of fib.test.run a live session's `test` op needs (docs/design/live-meshql.md 3.2, package LT1):
-# `argv-override` read by `run-main` instead of `(args)`, `report-sink` written instead of standard output.
+# compiler/tests/live/hooks.sh: the entry of fib.test.run a live session's `test` op needs (docs/design/live-meshql.md 3.2, package LT1):
+# `run-main-into suites argv out`, the words in place of `(args)` and a sink in place of standard output, both parameters (docs/adr/0013).
 #   compiler/tests/live/hooks.sh [FIBC]       FIBC is stage 2 (default $FIBC)
-# hooks.fib runs hookspecs' three scenarios with the override set to the words `fibc test` passes a child (`--format json --seed 1 -j 1`) and
-# the sink collecting into a buffer it writes to a file; hooks-spec.fib is the same scenarios as a plain spec file. Checks:
+# hooks.fib runs hookspecs' three scenarios with the words `fibc test` passes a child (`--format json --seed 1 -j 1`) and a sink collecting
+# into a buffer it writes to a file; hooks-spec.fib is the same scenarios as a plain spec file. Checks:
 #   1. hooks.fib prints nothing but the result line of `fibc run`, and its result is the runner's status (1: a scenario fails)
 #   2. the collected document is byte for byte what `fibc run hooks-spec.fib -- --format json --seed 1 -j 1` prints (what `fibc test`'s child prints)
 #   3. the `results` of `fibc test hooks-spec.fib --format json` are the collected document's (the parent adds `files` and keeps the rows)

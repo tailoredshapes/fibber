@@ -18,7 +18,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_CC` | [compiler/driver/viac.fib:24](../../compiler/driver/viac.fib#L24) |
 | `FIB_CC_KEEP` | [compiler/driver/viac.fib:123](../../compiler/driver/viac.fib#L123) |
 | `FIB_CC_VERBOSE` | [compiler/driver/viac.fib:99](../../compiler/driver/viac.fib#L99) |
-| `FIB_CHECK_CACHE` | [compiler/driver/front.fib:112](../../compiler/driver/front.fib#L112) |
+| `FIB_CHECK_CACHE` | [compiler/driver/front.fib:114](../../compiler/driver/front.fib#L114) |
 | `FIB_C_LINES` | [compiler/driver/viac.fib:47](../../compiler/driver/viac.fib#L47) |
 | `FIB_EMIT_EXE` | [compiler/driver/commands.fib:14](../../compiler/driver/commands.fib#L14) |
 | `FIB_EXPORTS` | [compiler/emit/compile.fib:148](../../compiler/emit/compile.fib#L148) |
@@ -42,7 +42,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LIRO_UNITS` | [compiler/native/liro/partition.fib:37](../../compiler/native/liro/partition.fib#L37) |
 | `FIB_LIVE` | [compiler/emit/program.fib:57](../../compiler/emit/program.fib#L57) |
 | `FIB_LIVE_DEPS` | [compiler/fibc.fib:65](../../compiler/fibc.fib#L65) |
-| `FIB_LIVE_ROOTS` | [compiler/driver/front.fib:67](../../compiler/driver/front.fib#L67) |
+| `FIB_LIVE_ROOTS` | [compiler/driver/front.fib:68](../../compiler/driver/front.fib#L68) |
 | `FIB_LOG` | [lib/fib/log/core.fib:126](../../lib/fib/log/core.fib#L126) |
 | `FIB_LOG_ASYNC` | [lib/fib/log/config.fib:32](../../lib/fib/log/config.fib#L32) |
 | `FIB_LOG_FILE` | [lib/fib/log/config.fib:31](../../lib/fib/log/config.fib#L31) |
@@ -70,7 +70,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_TARGET_FEATURES` | [compiler/llvm/target.fib:196](../../compiler/llvm/target.fib#L196) |
 | `FIB_TARGET_TRIPLE` | [compiler/driver/commands.fib:56](../../compiler/driver/commands.fib#L56) |
 | `FIB_THREADS` | [rt/deque.lir:145](../../rt/deque.lir#L145) |
-| `FIB_TIME` | [compiler/driver/front.fib:146](../../compiler/driver/front.fib#L146) |
+| `FIB_TIME` | [compiler/driver/front.fib:148](../../compiler/driver/front.fib#L148) |
 | `FIB_TRACE` | [compiler/driver/commands.fib:48](../../compiler/driver/commands.fib#L48) |
 | `FIB_VECTOR_BITS` | [compiler/native/liro/context.fib:34](../../compiler/native/liro/context.fib#L34) |
 | `FIB_VIA` | [compiler/driver/viac.fib:22](../../compiler/driver/viac.fib#L22) |

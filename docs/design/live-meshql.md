@@ -36,8 +36,9 @@ script; 8 decisions for the owner; 9 not measured.
    Clojure users do with `dev/user.clj`: no compiler work), `fibc run --live APP --with SPEC` (the loader takes the spec file under a
    module name of its own), or `fibc test --live` (the spec program is the session, the scenarios start the server). The recommendation
    is the first now and the second as the general form; it is the owner's decision (section 8).
-4. **A test run in the live process is an `eval` with three things the library must offer**: an argv override read by `fib.test.run` and
-   `gherkin.cli` instead of `(args)`, a report sink instead of `print`, and the run on a thread of its own so the attach thread stays free.
+4. **A test run in the live process is an `eval` with three things the library must offer**: an entry that takes the words instead of
+   reading `(args)` and a report sink instead of `print` (`fib.test.run/run-main-into`, `gherkin.cli/run-into`: parameters, as docs/adr/0013
+   wants; the session calls that entry, not the spec's `main`, 3.2), and the run on a thread of its own so the attach thread stays free.
    The `test` op (section 3.1) is that, with `--only`, `--tags`, `--name`, `--seed`, `-j`, `--isolate task|none` and the fib.test JSON report
    (schema 1, unchanged) in its answer, plus `generation_start`/`generation_end` and `stale`. Fork isolation is refused in a live process
    (the server's threads exist: `fork-start` refuses by rule, and the test-harness design says why); `task` is the default. The step
@@ -262,25 +263,31 @@ before-all hook, a feature file that does not parse: the message is gherkin's).
 
 ### 3.2 How it runs
 
-1. The attach thread takes the request, refuses if a test is running (`busy`), records `generation_start`, sets the **argv override** to
-   the words `fibc test` would pass a child (`driver.test/passed`: `--format json --seed N -j N [--only ..] [--list] [--isolate ..]`, plus
-   `--tags`/`--name`/`--dry-run` for gherkin) and the **report sink** to a buffer, and `spawn`s the test thread; it answers nothing yet and
-   goes back to its socket (a `status` or a swap may arrive meanwhile).
-2. The test thread calls the entry: under (a) the registered expression's function (a session `defun` the dev file names, or the
-   expression the client gave at `hello`), under (b) `spec.X/main`. The entry calls `g/run` or `run-main`, which read the override instead
-   of `(args)` and write through the sink instead of `print`. Scenarios run as `run-jobs` runs them today: `task` spawns and joins each,
-   `none` runs them on the test thread. The entry runs under `catch-run` (the live program is catching), so a trap outside a scenario is
-   `test/Trapped`, not the app's end.
+1. The attach thread takes the request, refuses if a test is running (`busy`), records `generation_start`, makes the **words** `fibc test`
+   would pass a child (`driver.test/passed`: `--format json --seed N -j N [--only ..] [--list] [--isolate ..]`, plus
+   `--tags`/`--name`/`--dry-run` for gherkin) and a **sink** that appends to a buffer, and `spawn`s the test thread; it answers nothing yet
+   and goes back to its socket (a `status` or a swap may arrive meanwhile).
+2. The test thread calls the entry with the words and the sink: under (a) the registered entry (a session `defun` the dev file names, or
+   the expression the client gave at `hello`), under (b) the spec's suites. The entry is `(fib.test.run/run-main-into SUITES WORDS SINK)` for
+   a fib.test spec and `(gherkin.cli/run-into PATTERN REGISTRY WORDS SINK)` for a gherkin one: the run reads the words instead of `(args)`
+   and writes every byte of the report through the sink instead of `print`. Scenarios run as `run-jobs` runs them today: `task` spawns
+   and joins each, `none` runs them on the test thread. The entry runs under `catch-run` (the live program is catching), so a trap outside
+   a scenario is `test/Trapped`, not the app's end.
 3. The test thread ends: the sink holds the report, the entry's status is the exit code; `generation_end` is read; the answer is sent on
    the connection that asked (with the request's `id`), as the `timeout` answers of live-repl.md 2.3 arrive later as events.
 
-The library changes this needs (LT1): in `lib/fib/test/run.fib`, `(def argv-override: (Atom (Option (Vec str))) (atom nil))` read by
-`run-main` (`(run-main-with suites (unwrap-or @argv-override (vec (args))))`), and `(def report-sink: (Atom (Option (fn :send (str) unit))) (atom nil))`
-used by `report` and `streamer` in place of `print`; in fib-gherkin, `gherkin.cli/run` reads the same override (a release v0.1.1; meshql-fib
-pins v0.1.0 in deps.lock: a bump). Both are atoms a program may set itself (a spec that is a case already passes its own words to
-`run-main-with`); nothing changes for `fibc test`, whose children never set them. Why an atom and not a parameter: the spec's `main` has
-no parameters and is the entry by convention (`fibc test` runs `fibc run FILE -- OPTIONS`); the override keeps the convention and the
-files as they are. The sink is process-wide, so one test at a time (3.3) is a rule, not a limitation.
+The library changes this needs (LT1, built): in `lib/fib/test/run.fib`, `run-main-into suites argv out` takes the words and the sink
+(`out: (fn (str) unit)`) as parameters, and `run-main-with` and `run-main` are it with standard output; `report`, `streamer` and the
+`--list` listing write through `out`. In fib-gherkin, `gherkin.cli/run-into pattern reg argv out` the same, `run-with` and `run` over it
+(docs/design/fib-gherkin-lt1.patch, a release v0.1.1; meshql-fib pins v0.1.0 in deps.lock: a bump). Nothing changes for `fibc test`,
+whose children call `run-main` and print. Why parameters and not atoms a session would set: a library keeps no global mutable state
+(docs/adr/0013; the first cut used two atoms and the fitness check refused them). The consequence for the session: it cannot call an
+unmodified spec `main` (that one reads `(args)` and prints), so the entry it calls is the explicit one. **The convention**: a fib.test
+spec exposes its suites as a function, which `defspecs`/`defspecs-main` already define publicly (`(specs)` in a spec file, so
+`(run-main-into (specs) WORDS SINK)` runs the file); a gherkin spec exposes its registry (`(contract-steps)` in meshql-fib) and the
+session calls `run-into` with the feature pattern. Under (a) the dev entry registers that expression; under (b) `--with FILE` takes the
+file's `specs` (or a function the request names) as the entry, and a spec file whose suites are not exposed is refused (`test/NoSpec`,
+the hint names `defspecs`). One test at a time (3.3) stays a rule of the session: the sink is the session's buffer, not the library's.
 
 ### 3.3 Isolation in the live process
 
@@ -409,7 +416,7 @@ MODE` plants one fault in a copy, as live-repl.md 6 prescribes); the live test s
 | Pkg | Scope | Files | Acceptance (executable) | Mutants that must be killed | Depends | Size |
 |---|---|---|---|---|---|---|
 | **LT0** the project's dev entry (meshql-fib, not fibber) | `meshql.cli/serve` (moved from `src/main.fib`), `dev/live.fib`: a `main` that serves and `:require`s `cert.steps`, `cert.proposed`, `gherkin`; `(meshql.cli/rebuild! path)` holding the `App` in an atom so the handler reads it per request (the frozen-closure convention, 2.1) | meshql-fib `src/meshql/cli.fib`, `dev/live.fib`, `src/main.fib` | `scripts/test.sh` unchanged and green; `fibc run --live dev/live.fib -- serve examples/farm/config.conf` answers the farm-test's first query; `scripts/live-test.sh` (new): the acceptance script of section 7, run end to end once LT2 exists, its transcript diffed against the one in section 7 (timings masked) | `rebuild-not-read` (the handler keeps its first `App`: the script's "rebuild" step still answers the old route) | LV1 | 40 (+ the script 60) |
-| **LT1** argv override and report sink | `fib.test.run`: `argv-override`, `report-sink`, read by `run-main`, `report`, `streamer`; `gherkin.cli/run` reads the override (fib-gherkin v0.1.1); nothing changes for `fibc test` | `lib/fib/test/run.fib`; fib-gherkin `src/gherkin/cli.fib` | `compiler/tests/driver/test-cmd.sh`: its 29 checks unchanged; a stdlib case `cases/stdlib/test-live-override.fib`: sets the override to `--only x --format json`, the sink to a buffer, calls `run-main` on three scenarios, and the buffer equals `fibc test --format json`'s document for the same spec byte for byte (`files` aside), nothing on stdout | `sink-ignored` (the report is printed anyway: the case reads an empty buffer), `override-ignored` (`(args)` read: the case's `--only` selects nothing: status 2) | none | 60 (+ 15 in fib-gherkin) |
+| **LT1** the words and the report sink as parameters (built) | `fib.test.run/run-main-into suites argv out`: the words in place of `(args)`, every byte of the report through `out` (`report`, `streamer`, `--list`); `run-main-with` and `run-main` over it; `gherkin.cli/run-into` the same (fib-gherkin v0.1.1, docs/design/fib-gherkin-lt1.patch); nothing changes for `fibc test`. Parameters, not atoms: docs/adr/0013 (3.2 says what the session calls instead of `main`) | `lib/fib/test/run.fib`; fib-gherkin `src/gherkin/cli.fib` | `compiler/tests/driver/test-cmd.sh` unchanged (44 checks); `cases/stdlib/8423`: `run-main-into` with `--only x --format json` and a buffer: the buffer is fib.test's document for the one scenario, status 0, and `run-main` reads `(args)` after; `compiler/tests/live/hooks.sh`: the collected document is byte for byte what `fibc run SPEC -- --format json --seed 1 -j 1` prints (plain too), nothing on stdout, `--list` and a selection that matches nothing (status 2) through the sink | `sink-ignored` (the report is printed anyway: the case reads an empty buffer), `override-ignored` (`(args)` parsed instead of the words: three plain rows in the buffer) | none | 60 (+ 15 in fib-gherkin) |
 | **LT2** the `test` op, `:test`, rerun, stale | `serve/livetest.fib` (new): the request, the test thread, the override and sink, `generation_start/end`, `stale`, `threads_after`, the refusals (`test/NoFork` ..), `last`; the client's rendering through `plain-rows`/`plain-summary` and the `replay` rewrite; row events at `-j 1`; (b) of 2.3 as its second half: `--with` in the loader, `spec.X/main` as the entry | `serve/livetest.fib`, `serve/liveclient.fib`, `serve/repl.fib`, `expand/modules.fib` (for `--with`) | `compiler/tests/live/test.sh`: a 4-scenario spec (one planted failing step, one trapping, one printing) under a live hello app with a `(def hits (atom 0))` the scenarios bump: the JSON answer has the four rows with the statuses `fibc test` gives them, `stdout` holds the print; `--only` the failing row; swap the function under test (an `eval` of the `defun`), `:test` (rerun-last): the row passes; a `def` at the REPL read by a scenario; `isolate: fork` answers `test/NoFork`; a 2 s scenario with a swap sent at 1 s: `stale: true`, the rows show both generations' answers; a second `test` during it: `busy` with the elapsed time; `status` during a run answers within 100 ms; `--with` loads a spec file beside the app and `test` runs it | `stale-never` (generations not compared), `rerun-old-registry` (the entry's registry cached: the swapped step is not seen: a planted "step edit" in the test fails), `test-on-attach-thread` (the `status` during a run times out), `sink-shared-run` (two runs allowed at once: the reports interleave: the JSON of the second fails to parse) | LV1, LV2, LT1 | 500 (+ 60 for `--with`) |
 | **LT3** the project-paths live rule, `--live-deps` | `program-module?` asks the loader's owner (project paths or test paths) when in project mode; `--live-deps [NAME..]`/`FIB_LIVE_DEPS`; the name rule outside a project | `emit/live.fib`, `pkg/modules.fib` (owner per module), `driver/args.fib`, `driver/commands.fib` | `compiler/tests/live/stubs.sh` extended: a fixture project with one git dependency (the `scripts/mutant-deps.sh` fixtures): `emit` under `--live` has stubs for the project's modules only, under `--live-deps` for the dependency's too, the counts fixed in a golden; outside the project (`-I`), the name rule as today (the `hello-stubs.golden`) | `deps-stubbed-by-default` (the golden's count), `project-paths-not-stubbed` (the fixture's own module has no slot) | LV0 | 120 |
 | **LT4** defs in a loaded file | a new `def` in a loaded program file: a slot in the generation's module, the initialiser run once on the attach thread, immortalised; a redefined `def` of the same type: new immortal value, release store, the old leaked and counted; a changed type stays `live/Def` | `serve/livetable.fib`, `emit/live.fib`, `emit/inits.fib` | `compiler/tests/live/defs.sh`: a program whose handler reads `(def limit: i64 3)`; `load` the file with `limit` 5: the next call answers with 5 and `status.values.leaked_bytes` grew; a new `def` added and read by a swapped body works; a `def` whose type changes is refused `live/Def`; under the LV3 stress (8 threads reading the def while it is redefined 1,000 times) every read is 3 or 5 and nothing crashes; `scripts/tsan.sh` on the stress reports nothing | `def-slot-plain-store` (TSAN), `old-def-freed` (the stress crashes), `init-run-twice` (an initialiser with a side effect counted once) | LV2, LV3 | 250 |

@@ -61,12 +61,14 @@
     (_ (FrontRejected (check-error-text e)))))
 
 ;; The live module rule of a project (emit.live `program-module?`, docs/design/live-meshql.md 4): with FIB_LIVE_ROOTS set (fibc sets it in
-;; a project), the modules whose file is under one of its directories are the live ones; unset, emit.live keeps its name rule.
-(defun note-live-modules :private (loaded: (Vec Loaded)) -> unit
-  (live/set-live-modules
-    (match (sys-getenv "FIB_LIVE_ROOTS")
-      (nil nil)
-      ((some text) (some (md/live-modules (mapv (fn (l: Loaded) (Pair (. (. l spec) ns) (. l file))) loaded) (pp/split-on text ":")))))))
+;; a project), the modules whose file is under one of its directories are the live ones, recorded on the checked program's globals; unset,
+;; emit.live keeps its name rule.
+(defun note-live-modules :private (c: Checked loaded: (Vec Loaded)) -> Checked
+  (do (live/set-live-modules (. (. c typed) globals)
+        (match (sys-getenv "FIB_LIVE_ROOTS")
+          (nil nil)
+          ((some text) (some (md/live-modules (mapv (fn (l: Loaded) (Pair (. (. l spec) ns) (. l file))) loaded) (pp/split-on text ":"))))))
+      c))
 
 ;; Reads, expands, types and checks `source` (named `file` in positions), its modules looked for in `roots`, exactly as the Rust
 ;; front end does before it lowers. Rust: front.rs:45 `check_in`
@@ -78,13 +80,13 @@
        (match (mods/try-load-in source file roots)
          ((Err e) (FrontRejected (load-failure e roots)))
          ((Ok loaded)
-          (match (let ((t0 (sys-clock-now)) (_ (note-live-modules loaded)) (r (mods/expand-all loaded ctx (mk/maker-runner rm prelude loaded))))
+          (match (let ((t0 (sys-clock-now)) (r (mods/expand-all loaded ctx (mk/maker-runner rm prelude loaded))))
                    (do (td/phase-note "front.expand" t0) r))
             ((Err e) (expand-stop e file))
             ((Ok modules)
              (match (check-modules loaded modules prelude (some (nt/target-info)) demand)
                ((Err e) (check-stop e))
-               ((Ok c) (FrontChecked c)))))))))))
+               ((Ok c) (FrontChecked (note-live-modules c loaded))))))))))))
 
 ;; The whole check of the expanded program: lowering, inference, ownership; on demand, the units of the library the program cannot reach are left out.
 (defun check-whole :private (modules: (Vec Expanded) prelude: (Vec Stx) target: (Option Target) demand: bool) -> (Result Checked CheckError)
