@@ -454,11 +454,12 @@ Decisions for the owner:
   or macro too (the checker's rules apply), a new `def` or `extern` refused (`live/Def`, `live/Extern`; since LT4 a `def` is made or redefined, live-meshql.md 10); a `derive` or an `impl` of no
   head that changed is `live/Unsupported`; (d) **a changed function the running program never reached** (no registered body) swaps into
   the text only, as LV2 (a) says of a generic nobody instantiates; it is not in `swapped`; (e) the per-family rules refusal (`live/
-  Signature`, `live/Summary`) is reported at `FILE:1:1` (the checker's view has no position of the family in the file); (f) `status.live`
+  Signature`, `live/Summary`) is reported at the refused function's definition in the file (`FILE:1:1` until the live bugs' fix, below;
+  still so for a family that is not the file's); (f) `status.live`
   is the rule's name and the count of live modules (`project paths (3 modules); --live-deps widens`, or `every module not named
   fib.*`), not the per-library listing of 3.6; (g) the main module's own file is loaded as an `eval` of the definitions that differ from
   the file as last loaded (the session's own inputs are not in that copy), with the file's `ns` clauses; a definition the file dropped is
-  `live/Removed`; (h) `:type` reads the files, not the overrides (`rc/type-of-expr` is unchanged). Measured on the load test's two-module
+  `live/Removed`; (h) `:type` reads the overrides as every input does (`rc/type-of-expr-texts`; it read the files until the live bugs' fix). Measured on the load test's two-module
   app on lilnas under a running gate (load average above 30): a `load` that swaps one function is `check 429 to 437 ms, emit 2 ms, jit
   2 ms` (the check is 59 modules, 8 expanded again: the loaded module and the 7 after it in the load order, 3.3); the meshql scenario of
   live-meshql.md 7 is a step of meshql-fib's `scripts/live-demo.py` on its `live-dev` branch (the on-item edit loaded, curl 410, the
@@ -479,8 +480,14 @@ Decisions for the owner:
   come from the warm engine** (LE5: the base goes through the driver's front end, which keeps no expanded forms); a session that was not
   warmed makes them on its first definition input (one more front end on the session's text); (e) **a redefined macro keeps its place**
   in the session's text (`merge-session`; serve.replcore `merge-defs` puts a redefinition last, which would expand its users before it:
-  `unbound name`); the line of a checker's diagnostic in such an input is then off by the macros moved; (f) a changed `type:`, `extern` or
-  `def` is still refused or redefined by its text (the rules of 3.5); (g) found on the way: a session's program does not find a module
+  `unbound name`); a checker's diagnostic in such an input is moved to its line in the input (serve.liveswap `input-diag`; it was off
+  by the macros kept in place until the live bugs' fix); (f) a changed `type:` or `extern` is
+  still refused by its text (the rules of 3.5 run before the program is checked, so the expanded form is not there yet; moving them
+  after the check is not cheap), and a `def` of a loaded file whose text changed is redefined only when its expanded form did too
+  (key `d.PREFIX.NAME`, `Changes.defs`; a comment or layout edit keeps the value; a `def` with no recorded hash is redefined; since
+  the live bugs' fix: it was by text). A `def` of an input at the REPL is still redefined by its text (Clojure's `def` re-evaluates),
+  and so is one of the main module's file (a load of it is an `eval` of the definitions whose text changed); a `defonce` and a `def`
+  of one value expand alike, so changing one to the other in a loaded file redefines nothing; (g) found on the way: a session's program does not find a module
   beside the main file that the base found there (`load/Missing`): swap.py and stress.py start swap-app.fib with `-I` its directory. (h)
   A redefinition with the text the definition has is accepted and swaps nothing (LV2 swapped it again): stress.py's swaps after the
   retirement now start from the other body. (i) A macro that quotes positions into its expansion (`expect` of fib.test) makes its user change when
@@ -503,3 +510,17 @@ Decisions for the owner:
   (`check 157 to 172 ms`; 9,019 ms on the same machine without LE5), start-up to the first HTTP answer 8.51 to 9.07 s (8.42 s
   without); `hello` waits for the warm-up when it comes first (8.8 to 9.7 s). The demo's check "a session def is accepted once and
   refused again (live/Def)" fails with and without LE5: it predates LT4, which made a `def` redefinable.
+- **Status 2026-10-15, live bugs** (one commit each; the tests and the mutants named are the pins). (1) A load's `live/Signature` or
+  `live/Summary` refusal is at the refused function's definition in the file (serve.liverules `Refusal.family`, serve.liveload
+  `family-pos`; load.py, the mutant `rules-at-file-start`). (2) `:type` reads the loaded texts (`rc/type-of-expr-texts`; load.py, the
+  mutant `type-reads-disk`). (3) and (4) are live-meshql.md 10 (LT6 (b), (d); LT5 (a)). (5) A diagnostic of an input that redefines a
+  macro is at the input's line (LM2 (e); swap.py). (6) A `def` of a loaded file is redefined by expanded form (LM2 (f); unit-livediff,
+  load.py). (7) **The first redefinition of a function nothing reached answers `defined`, not `swapped`, and that is left as it is**:
+  such a function has no registered body (the base pruned it: `main` does not reach it), so it is in no family of the live table and
+  there is no slot to patch; the redefinition changes the session's text only (as 6 (d) says of a load), and the first program that
+  reaches it (an expression input, or a later definition that calls it) lowers it from that text and registers it, after which a
+  redefinition is a swap (`generation` 1). Measured on a probe (`unused`, never called by `main`): `(defun unused ..)` answers
+  `defined ["unused"]` at generation 0, `(unused 1)` then answers the new body's value, the next redefinition `swapped ["unused"]` at
+  generation 1; with `(unused 1)` first, the first redefinition is already `swapped`. Answering `swapped` would name a swap that did
+  not happen (no generation, no patch); the answer is the truth of what the session did.
+

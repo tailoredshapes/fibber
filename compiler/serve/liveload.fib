@@ -220,9 +220,9 @@
   (let ((file (. at fst)) (ns (. at snd)) (gen (+ 1 (lsw/generation sx))) (families (. ch families))
         (impls (into (. ch impls) (mapv (fn (d: rc/Def) (. d key)) (filterv (fn (d: rc/Def) (= (kind-of d) "impl")) (. diff added)))))
         (new-fns (filterv (fn (d: rc/Def) (= (kind-of d) "fun")) (. diff added))))
-    (let ((redefs (ld/redefs-of (. diff changed) (some ns)))
+    (let ((redefs (ld/redefs-of (filterv (fn (d: rc/Def) (includes? (str "d." ns "." (. d name)) (. ch defs))) (. diff changed)) (some ns)))
           (requests (into (mapv (fn (d: rc/Def) (ec/BodyRequest (. d name) false [] nil [] (some ns))) new-fns) (lsw/requests-of sx [] families impls))))
-      (match (rules-refusal sx file text c redefs)
+      (match (rules-refusal sx at text c redefs)
         ((some a) (result file ns defs [] (lsw/unchanged sx a)))
         (nil (match (lsw/emit-swapping sx c (. fr stats) (into requests (ld/def-requests redefs)) families gen)
                ((Err ds) (result file ns defs [] (checker-refused sx ds)))
@@ -230,11 +230,20 @@
                                       ((some r) (result file ns defs [] (lsw/unchanged sx (def-refused file text r))))
                                       (nil (apply-load ld sx file ns text defs made changed (fresh-families sx ns (. diff added)) gen redefs (. ch hashes)))))))))))
 
-;; The rules of the live table at `FILE:1:1`, then the type rule of a redefined `def` at the definition (serve.livedefs).
-(defun rules-refusal :private (sx: ls/Sess file: str text: str c: od/Checked redefs: (Vec ld/Redef)) -> (Option ls/Answer)
-  (match (lr/check-rules @(. sx table) c @(. sx defined))
-    ((some r) (some (refused (. r code) (str file ":1:1: " (. r message)) (. r hint))))
-    (nil (match (ld/type-refusal sx c redefs) ((some r) (some (def-refused file text r))) (nil nil)))))
+;; The rules of the live table at the refused family's definition in the file (`FILE:1:1` when the family is not the file's: a function
+;; of another module whose scheme the load changed), then the type rule of a redefined `def` at the definition (serve.livedefs).
+(defun rules-refusal :private (sx: ls/Sess at: (Pair str str) text: str c: od/Checked redefs: (Vec ld/Redef)) -> (Option ls/Answer)
+  (let ((file (. at fst)))
+    (match (lr/check-rules @(. sx table) c @(. sx defined))
+      ((some r) (let ((p (family-pos text (. at snd) (. r family))))
+                  (some (refused-all file [(Refusal (. r code) (. r message) (. r hint) (. p fst) (. p snd))]))))
+      (nil (match (ld/type-refusal sx c redefs) ((some r) (some (def-refused file text r))) (nil nil))))))
+
+;; The line and column of family `f.NS.NAME`'s definition in the module's text; 1:1 when the text has none.
+(defun family-pos :private (text: str ns: str family: str) -> (Pair i64 i64)
+  (match (first (filterv (fn (d: rc/Def) (and (= (kind-of d) "fun") (= (str "f." ns "." (. d name)) family))) (defs-of text)))
+    ((some d) (pos-of text d))
+    (nil (Pair 1 1))))
 
 ;; A redefinition refused, at its definition's line in the file.
 (defun def-refused :private (file: str text: str r: ld/DefRefusal) -> ls/Answer

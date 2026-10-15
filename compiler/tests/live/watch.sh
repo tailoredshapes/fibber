@@ -2,7 +2,7 @@
 # compiler/tests/live/watch.sh [FIBC]: the checks of `watch` of a live session (package LT5 of docs/design/live-meshql.md 3.8;
 # serve.livewatch, serve.live `watch-step`, serve.liveclient `:watch`): watch.py over a real socket against watch-app.fib with
 # watch-handler.fib as src/handler.fib and a feature file, edited on disk while the connection watches (its docstring lists the checks),
-# about a minute. Exit 0 when every check holds. The mutants of scripts/mutant-live.sh (watch-no-load, watch-reruns-on-refusal) must make
+# about a minute. Exit 0 when every check holds. The mutants of scripts/mutant-live.sh (watch-no-load, watch-reruns-on-refusal, watch-no-debounce) must make
 # it fail.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)

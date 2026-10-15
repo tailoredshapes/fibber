@@ -2,6 +2,7 @@
 ;; The hashes of serve.livediff (LM2, docs/design/live-incremental.md 2.4 item 3) over forms read from text: a comment or a layout
 ;; change and a definition's place leave a hash as it was; an alias moved to another module changes its user's hash and no other's;
 ;; gensyms numbered differently by the expander are the same; the keys (a function's family with its module's prefix, an `impl`'s);
+;; a `def`'s hash and key;
 ;; the library is not hashed; the changes (a new definition is not one; a changed `impl` names its method families). Built and run by
 ;; compiler/tests/live/swap.sh (no LLVM). Exit 0 when every check holds.
 (defun check (name: str ok: bool) -> i64
@@ -56,7 +57,19 @@
               (= (. ch families) ["f.routes.r" "m.Greet.greet.Item"]))
        (check "the changed impl's key" (= (. ch impls) ["impl:Greet Item"])))))
 
+;; A `def` (LM2 left it to its text; the live bugs' fix): keyed by its body `d.PREFIX.NAME`, a comment leaves its hash, a value
+;; changes it, and `changes` names a def whose hash changed or that has none recorded.
+(defun checks-defs () -> i64
+  (let ((h0 (hashes "a" "(def n: i64 5)" app))
+        (comment (hashes "a" "(def n: i64\n  ;; a comment\n  5)" app))
+        (valued (hashes "a" "(def n: i64 6)" app)))
+    (let ((ch (ldf/changes (assoc h0 "d.gone" 0) (ldf/hashes-of [(module "routes" "a" "(def n: i64 6)\n(def m: i64 1)") (module "main" "a" "")] nil) (bodies))))
+      (+ (check "a def's key is its body's" (some? (get h0 "d.routes.n")))
+         (+ (check "a comment does not change a def's hash" (same-key h0 comment "d.routes.n"))
+            (+ (check "a value changes a def's hash" (not (same-key h0 valued "d.routes.n")))
+               (check "the changed defs: the one whose value changed, the one with no hash" (= (. ch defs) ["d.routes.n" "d.routes.m"]))))))))
+
 (defun main () -> i64
-  (let ((bad (+ (checks-hashes) (+ (checks-gensyms) (checks-changes)))))
+  (let ((bad (+ (checks-hashes) (+ (checks-gensyms) (+ (checks-changes) (checks-defs))))))
     (do (println (str "unit-livediff: " (if (= bad 0) "ok" (str bad " failed"))))
         bad)))

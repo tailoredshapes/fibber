@@ -53,10 +53,12 @@
 (defun form-text (f: Stx aliases: (Map str str) uses: str) -> str
   (str (pr/stx-show (canon f (gensyms-in f {}) aliases)) "\n" uses))
 
-;; The key of a top-level form: a function's family, an `impl`'s key; "" for anything else.
+;; The key of a top-level form: a function's family, an `impl`'s key, a `def`'s body (`d.PREFIX.NAME`, emit.names; a `defonce` is a
+;; `def` once expanded); "" for anything else.
 (defun key-of :private (f: Stx prefix: str) -> str
   (let ((h (sym-at f 0)) (items (items-of f)))
     (cond (or (= h "defun") (= h "defn")) (if (= (sym-at f 1) "") "" (str "f." prefix (sym-at f 1)))
+          (= h "def") (let ((n (sym-at f 1))) (cond (= n "") "" (s/ends-with? n ":") (str "d." prefix (str-slice n 0 (- (str-len n) 1))) :else (str "d." prefix n)))
           (and (= h "impl") (>= (count items) 3) (not (= (sym-at f 1) ""))) (str "impl:" (sym-at f 1) " " (pr/stx-show (nth items 2)))
           :else "")))
 
@@ -105,11 +107,14 @@
   (vec (keep (fn (p: (Pair str i64)) (match (get olds (. p fst)) ((some h) (if (= h (. p snd)) nil (some (. p fst)))) (nil nil))) news)))
 
 ;; What an input's program changed: the families to swap (a changed function's, every method family of a changed `impl`), the changed
-;; `impl`s' keys (their methods are asked for by key: emit.compile `BodyRequest`), and the program's hashes, recorded when it is accepted.
-(defstruct Changes (families: (Vec str) impls: (Vec str) hashes: (Vec (Pair str i64))))
+;; `impl`s' keys (their methods are asked for by key: emit.compile `BodyRequest`), the `def`s whose expanded form changed or that have
+;; no recorded hash (a load redefines only those of the defs whose text changed: serve.liveload), and the program's hashes, recorded
+;; when it is accepted.
+(defstruct Changes (families: (Vec str) impls: (Vec str) defs: (Vec str) hashes: (Vec (Pair str i64))))
 
 (defun changes (olds: (Map str i64) news: (Vec (Pair str i64)) bodies: (Map str (Vec ep/LiveBody))) -> Changes
   (let ((keys (changed-keys olds news)))
     (Changes (reduce (fn (acc: (Vec str) k: str) (into acc (filterv (fn (f: str) (not (includes? f acc))) (families-of-key bodies k)))) [] keys)
              (filterv (fn (k: str) (s/starts-with? k "impl:")) keys)
+             (vec (keep (fn (p: (Pair str i64)) (if (and (s/starts-with? (. p fst) "d.") (not (= (get olds (. p fst)) (some (. p snd))))) (some (. p fst)) nil)) news))
              news)))

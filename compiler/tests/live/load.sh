@@ -3,7 +3,7 @@
 # serve.liveload, serve.incr `Job.texts`, expand.modules `try-load-texts`, emit.compile `BodyRequest.module`, serve.liveclient `:load`):
 # load.py over a real socket against load-app.fib with load-routes.fib as src/routes.fib, edited on disk between loads (its docstring lists
 # the checks), about two minutes. Exit 0 when every check holds. The mutants of scripts/mutant-live.sh (partial-load, load-reads-disk,
-# prefix-dropped, removed-ignored) must make it fail.
+# prefix-dropped, removed-ignored, rules-at-file-start, type-reads-disk) must make it fail.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)

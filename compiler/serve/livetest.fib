@@ -11,7 +11,7 @@
   (:use lir.ast lir.types)
   (:require [serve.livesess :as ls] [serve.livedefs :as ld] [serve.livewords :as lw] [serve.liveswap :as lsw] [serve.liveretire :as lr] [serve.replcore :as rc] [serve.proto :as p]
             [serve.diag :as dg] [serve.incr :as inc] [lsp.json :as j] [live.extract :as ex] [live.jit :as lj] [emit.compile :as ec] [emit.function :as f]
-            [emit.node :as n] [native.call :as call] [fib.unix :as unix] [fib.string :as s]))
+            [emit.node :as n] [native.call :as call] [fib.unix :as unix] [fib.string :as s] [pkg.paths :as pp]))
 
 ;; A run in progress: the request's id and the number of the connection it came on, when it started and the generation then, its selection, the
 ;; entry's module (kept or freed at the end: serve.livesess `run-expression`'s rule), and `done`, set by the test thread with the entry's status.
@@ -20,10 +20,15 @@
 ;; What the last run came to, for `status` (3.9).
 (defstruct Finished (scenarios: i64 ms: i64 status: i64))
 
-;; The test state of a session: the run in progress (at most one), the last selection (`last: true`) and result, the report and trap files.
-(defstruct Tests (running: (Cell (Option Running)) last-sel: (Cell (Option lw/Selection)) last: (Cell (Option Finished)) report: str err: str))
+;; A spec file the session was asked to hold and does not (`fibc test --live`, driver.testlive): its absolute path, the status a spawned
+;; run of it would end with (3: it does not compile; 4: it cannot be run) and what that run would say. A `test` of it answers so.
+(defstruct Unheld (file: str status: i64 text: str))
 
-(defun tests-new (report: str err: str) -> Tests (Tests (cell nil) (cell nil) (cell nil) report err))
+;; The test state of a session: the run in progress (at most one), the last selection (`last: true`) and result, the report and trap
+;; files, the spec files not held.
+(defstruct Tests (running: (Cell (Option Running)) last-sel: (Cell (Option lw/Selection)) last: (Cell (Option Finished)) report: str err: str unheld: (Vec Unheld)))
+
+(defun tests-new (report: str err: str unheld: (Vec Unheld)) -> Tests (Tests (cell nil) (cell nil) (cell nil) report err unheld))
 
 (defun running? (t: Tests) -> bool (some? @(. t running)))
 
@@ -44,15 +49,34 @@
 (defun own-specs? :private (sx: ls/Sess) -> bool
   (some? (first (filterv (fn (d: rc/Def) (= (. d key) "val:specs")) @(. (. sx rc) defs)))))
 
+;; The unheld file a request's `spec` names (by absolute path, under the session's working directory), if any.
+(defun unheld-of :private (t: Tests r: p/Req) -> (Option Unheld)
+  (match (p/field-str r "spec")
+    (nil nil)
+    ((some f) (let ((abs (pp/under (pp/cwd) f))) (first (filterv (fn (u: Unheld) (= (. u file) abs)) (. t unheld)))))))
+
+;; The answer for an unheld file: the run's status as a spawned run's, its text as the lines `shown`.
+(defun unheld-answer :private (r: p/Req u: Unheld) -> str
+  (let ((code (if (= (. u status) 3) "test/NotCompiled" "test/NotHeld")))
+    (p/response r false [(Pair "error" (j/json-obj [(Pair "code" (j/json-str code))
+                                                    (Pair "message" (j/json-str (str (. u file) (if (= (. u status) 3) " does not compile" " is not held by the session"))))]))
+                         (Pair "code" (j/json-str code)) (Pair "status" (j/json-int (. u status)))
+                         (Pair "shown" (j/JArr (mapv j/json-str (filterv (fn (l: str) (not (= l ""))) (vec (s/split-lines (. u text)))))))])))
+
 ;; The `test` request: refused now, `busy`, or started (nil: the answer comes from `finish`).
 (defun op-test (sx: ls/Sess t: Tests r: p/Req conn: i64) -> (Option str)
   (match @(. t running)
     ((some run) (some (busy r run)))
-    (nil (match (lw/selection-of r (own-specs? sx) (. (. sx rts) with) @(. t last-sel))
-           ((Err ref) (some (refused r ref)))
-           ((Ok sel) (match (launch sx t r conn sel)
-                       ((Err line) (some line))
-                       ((Ok _) nil)))))))
+    (nil (match (unheld-of t r)
+           ((some u) (some (unheld-answer r u)))
+           (nil (op-start sx t r conn))))))
+
+(defun op-start :private (sx: ls/Sess t: Tests r: p/Req conn: i64) -> (Option str)
+  (match (lw/selection-of r (own-specs? sx) (. (. sx rts) with) @(. t last-sel))
+    ((Err ref) (some (refused r ref)))
+    ((Ok sel) (match (launch sx t r conn sel)
+                ((Err line) (some line))
+                ((Ok _) nil)))))
 
 ;; ---- the entry
 

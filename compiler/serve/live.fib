@@ -317,14 +317,14 @@
 
 ;; The booted session on its socket (in a private directory): the path on standard error, `main` started on its thread, the requests
 ;; answered until it ends; its status. The socket is unlinked at the end.
-(defun serve-program :private (sx: ls/Sess dir: str path: str pid: i64 loads: ll/Loads trace: bool) -> i64
+(defun serve-program :private (sx: ls/Sess dir: str path: str pid: i64 loads: ll/Loads trace: bool unheld: (Vec ltt/Unheld)) -> i64
   (match (ls/run-address sx)
     ((Err m) (do (eprintln (str "compile failed: " m)) 5))
     ((Ok addr)
      (match (lsk/listen-private dir path)
        ((Err m) (do (eprintln (str "fibc: live: " m)) 2))
        ((Ok listener)
-        (let ((l (Live sx listener path (atom nil) (cell 0) (cell 0) (ltt/tests-new (lsk/test-path dir pid) (lsk/test-err-path dir pid)) loads (cell false) (lwt/watch-new))))
+        (let ((l (Live sx listener path (atom nil) (cell 0) (cell 0) (ltt/tests-new (lsk/test-path dir pid) (lsk/test-err-path dir pid) unheld) loads (cell false) (lwt/watch-new))))
           (do (eprintln (str "fibc: live at " path))
               (let ((t (start-program addr (. l done) listener)))
                 (do (warm-engine l trace)
@@ -336,8 +336,9 @@
 ;; runtime started (`--trace`: FIB_TRACE is set only now, after the compiler's own JIT sessions are up, as `fibc run` sets it after
 ;; lowering; a later input that runs a macro traces that macro's session too), then the socket before `main`, its path in
 ;; FIB_LIVE_SOCKET and on standard error, and an exit as `fibc run`'s. The session's copies of the live modules' text (serve.liveload)
-;; are read once the base is made, before `main` runs.
-(defun run-live (file: str args: (Vec str) opt: i64 trace: bool rts: roots/Roots rm: mk/RunnerMaker) -> i64
+;; are read once the base is made, before `main` runs. `unheld`: the spec files `fibc test --live` was given and does not hold
+;; (serve.livetest `Unheld`).
+(defun run-live (file: str args: (Vec str) opt: i64 trace: bool rts: roots/Roots rm: mk/RunnerMaker unheld: (Vec ltt/Unheld)) -> i64
   (match (read-file file)
     (nil (do (eprintln (str "fibc: cannot read " file)) 2))
     ((some text)
@@ -355,7 +356,7 @@
                        (match (ls/boot sx (. argv fst) (. argv snd))
                          ((Err m) (do (eprintln (str "compile failed: " m)) 5))
                          ((Ok _)
-                          (let ((code (serve-program sx dir path pid loads trace)))
+                          (let ((code (serve-program sx dir path pid loads trace unheld)))
                             (do (unix/fd-unlink (lsk/output-path dir pid)) (unix/fd-unlink (lsk/test-path dir pid)) (unix/fd-unlink (lsk/test-err-path dir pid))
                                 (sk/exit-flush code)
                                 code)))))))))))))))

@@ -8,9 +8,10 @@ What is tested: `watch on` with `dirs` answers how many files it watches; a chan
 a `test` (the row fails: the handler answers "v1"), an edit of the handler's file brings a `load` event (`swapped` handler/handle) and then
 a `test` event whose row passes (within 10 s; the design's 1.5 s is the figure on an idle machine); a change of the feature file brings a
 `test` event and no `load`; `status` is answered while watching and says so; an edit the checker refuses brings the refusal as a `load`
-event and no `test` event in 4 s; the good edit after it is loaded and rerun; `watch off`: an edit brings no event in 3 s and is not loaded;
+event and no `test` event in 4 s; the good edit after it is loaded and rerun; a file written in place slowly (8 bytes per 10 ms) is loaded once, whole, never
+half-written (the debounce); `watch off`: an edit brings no event in 3 s and is not loaded;
 the terminal client's `:watch on DIR` and `:watch off` lines; the app ends through the socket.
-The mutants of scripts/mutant-live.sh that must make this fail: watch-no-load, watch-reruns-on-refusal."""
+The mutants of scripts/mutant-live.sh that must make this fail: watch-no-load, watch-reruns-on-refusal, watch-no-debounce."""
 import json, os, shutil, socket, subprocess, sys, tempfile, time
 
 fibc = os.path.abspath(sys.argv[1])
@@ -156,6 +157,16 @@ check('refused edit: the program keeps the old handler', c.ask(op='eval', text='
 save(handler_file, handler('(defun handle (n: i64) -> str (str "v" (+ 1 n)))'))
 ev = c.wait_events(60, is_test)
 check('the good edit after it: loaded and rerun', [e.get('event') for e in ev] == ['load', 'test'] and ev[0].get('ok') is True and row(ev[1], 'the handler').get('status') == 'pass', ev)
+
+# ---- the debounce: the handler's file written in place slowly (every prefix of the new text is refused: an unclosed form); no scan may
+# load it half-written: one load, accepted, then the rerun
+slow = handler('(defun handle (n: i64) -> str\n  ;; ' + 'padding ' * 150 + '\n  (str "v" (+ n 1)))')
+with open(handler_file, 'w') as f:
+    for i in range(0, len(slow), 8):
+        f.write(slow[i:i + 8]); f.flush(); time.sleep(0.01)
+ev = c.wait_events(60, is_test)
+check('a slow write: loaded once whole, never half-written, then rerun', [e.get('event') for e in ev] == ['load', 'test'] and ev[0].get('ok') is True
+      and ev[0].get('swapped') == ['handler/handle'] and row(ev[1], 'the handler').get('status') == 'pass', ev)
 
 # ---- watch off
 w = c.ask(op='watch', on=False)
