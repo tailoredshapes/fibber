@@ -547,8 +547,9 @@ Decisions for the owner:
   nor a type (`live/Layout`), nor `main` (`live/Main`); (c) an expression's `stdout` is not captured (its `pr-str` value is written to a file
   of its own; `println` in it goes where the program's output goes); (d) a `def` whose initialiser traps aborts the program (the init runs
   outside the guard); (e) every input module that holds a static or a lambda is kept for good (`live.extract/pins?`), `status.generations.kept`
-  counts them, and nothing is retired (LV3); (f) each program of the session has its own closure and vtable statics (shared objects, strings
-  and keywords), since a later program does not emit the code of a closure it does not make; (g) the base is the program as `fibc run` makes
+  counts them, and nothing is retired (LV3); (f) each program of the session has its own closure, vtable and quoted-form statics (shared objects,
+  strings and keywords), since a later program does not emit the code of a closure it does not make (emit.statics `program-static?`: never
+  exported from a cut nor declared from the base); (g) the base is the program as `fibc run` makes
   it (the driver's front end on the file, pruned, the same trace: the case tables agree under FIB_LIVE=1), while an input is checked against
   the REPL's re-assembled text of the program (`<session>:L:C` in a diagnostic about a program definition, as `fibc repl` shows one), and an
   input whose program numbers a `def` of the base differently is refused rather than read a wrong slot; (h) a `def` of the library the program
@@ -635,7 +636,9 @@ Decisions for the owner:
   the thread was parked below it; the lift is a walk of the heap from the def slots at quiescence, or stack scanning. (c) **a
   generation's statics outlive its code**: a swap's cut is split (serve.livesplit) into a data part, resident for good (new strings,
   keywords, a type's walkers and rows, and the stub, slot and generation-0 body of a function the base never reached), and a code part
-  under the tracker (the bodies and literals that carry the generation, with the closure constants that name a literal); a code part
+  under the tracker (the bodies and literals that carry the generation, with the statics numbered per program: closure constants,
+  vtables and quoted forms, emit.statics `program-static?`, which must never be exported, since a later program's cut would declare
+  its own `q.N` from the base: the crash of live-meshql.md 10); a code part
   that holds a literal or a closure constant is never retired (`pinned (closures)`), since a heap closure made by the body may still
   name it (the prototype's rule, FINDINGS §3), so a body with a lambda keeps its old generations until a restart; a body of calls and
   arithmetic (the stress's `f`, a handler of `str` and calls) is freed. (d) `status` reports counts, not bytes (ORC does not report them).

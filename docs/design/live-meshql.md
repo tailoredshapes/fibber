@@ -572,10 +572,18 @@ every second in the background, all 200 or 404/410, none refused). What it does 
   says of every input's program; a `--with` file's rows carry its own file. (f) The client refuses `--format`, `--timeout` and
   `--isolate fork` with the reason, as the program does (`test/Format`, `test/NoFork`); `:test SPEC` takes a file or, in brackets,
   an expression of the suites.
-- **Found, not fixed (LV2)**: after a swap of a function that makes closures, a call of the base's closures can crash the program
-  (`fatal signal 11 at 0xe`), deterministically: in test-app.fib, `(defspecs edited ..)` at the REPL with one scenario, a call of its
-  scenario's `run`, the same `defspecs` again with the step's expectation changed (a swap of `edited`), a call of the new `run`
-  (right), then a call of a scenario `run` of the base's `specs`: the crash; the same with `specs` itself swapped from a scenario
-  of three `given` bindings to one of one. A function returning plain closures (`(let ((a x)) (fn () a))` swapped to three captures
-  and back) does not reproduce it. The scratch probes are under /tank/data/fibber-scratch/lt2 (`probe6.py`, cases `edited-then-base`,
-  `specs-long-short`); test.sh runs its step edit last so that no base closure is called after it.
+- **Found by LT2, fixed (the quote statics across a swap)**: after a swap of a function that makes closures, a call of the base's
+  closures crashed the program (`fatal signal 11 at 0xe`), deterministically: in test-app.fib, `(defspecs edited ..)` at the REPL with
+  one scenario, the same `defspecs` again with the step's expectation changed (a swap of `edited`; no run of either is needed), then
+  a call of a scenario `run` of the base's `specs`: the crash; `specs` itself swapped from a scenario of three `given` bindings to one
+  of one crashed the same way, and from one to three answered `no match clause matched`. A function returning plain closures
+  (`(let ((a x)) (fn () a))` swapped to three captures and back) did not reproduce it. The cause was not the closures: the `expect`
+  macro quotes its form (`(then-line (quote ..))`), and a quoted form is a constant `@q.N` numbered per program (emit.program
+  `program-fresh-quote`), like `@clo.N` and `@vt.N` and unlike `@str.N`. LV3's split of a swap's cut (serve.livesplit) exported every
+  global that was not the generation's code into the session's base, `q.N` among them, so the next input's cut declared its own `q.N`
+  (another form, of another shape) from the base instead of copying it: the base's `specs`, pruned out of the base (`main` does not
+  reach it) and first lowered by that input, read program 2's `q.8` as its own. The fix: `emit.statics/program-static?` names the
+  statics numbered per program (`clo.`, `vt.`, `q.`), and the split, the base index (serve.livesess) and the def cache (emit.defs.cache)
+  all use it; a nested closure literal (`l.l.NAME.gK.N.M`) now carries its generation too (serve.livetable `strip-literal`), so the
+  split keeps it with the code. compiler/tests/live/quotes.sh pins it (the mutant `quote-shared` of scripts/mutant-live.sh), and
+  test.sh runs the base's spec after its step edit.
