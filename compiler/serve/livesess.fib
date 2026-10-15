@@ -33,10 +33,14 @@
    jit: (Cell (Option lj/LiveJit)) base: (Cell (Map str LItem)) rows: (Cell i64) inputs: (Cell i64)
    resident: (Cell (Vec str)) kept: (Cell i64)
    ;; the `def` each slot of the base holds (`def.slot.N` to its name): an input's program must agree (`slots-agree`)
-   slot-names: (Cell (Map str str))))
+   slot-names: (Cell (Map str str))
+   ;; the base's live modules (types.decls `Globals` `live-modules`: the project rule of docs/design/live-meshql.md 4, set by driver.front
+   ;; from FIB_LIVE_ROOTS; nil is the name rule): every input's program gets the same, so a body an input makes for a module the base left
+   ;; a direct call (a dependency's) is a direct call too, and only the project's own get stubs and slots
+   live-modules: (Cell (Option (Set str)))))
 
 (defun sess-new (rts: roots/Roots file: str opt: i64 out: str) -> Sess
-  (Sess (rc/session-new) (inc/engine-new) rts file opt out (ep/tables-new) (cell nil) (cell {}) (cell 0) (cell 0) (cell []) (cell 0) (cell {})))
+  (Sess (rc/session-new) (inc/engine-new) rts file opt out (ep/tables-new) (cell nil) (cell {}) (cell 0) (cell 0) (cell []) (cell 0) (cell {}) (cell nil)))
 
 ;; What an input came to.
 (defenum Answer
@@ -51,10 +55,9 @@
 
 ;; ---- the program's text
 
-(defun def-named :private (sx: Sess name: str) -> (Option rc/Def)
-  (first (filterv (fn (d: rc/Def) (= (. d name) name)) @(. (. sx rc) defs))))
-
 ;; The program's text as the session: its `ns` clauses and definitions, after the guard's. The program must be one module `main`.
+;; That it has a `main` is the front end's check (`make-base`: types.driver `checker-check-main`, after expansion), not the text's: a spec
+;; file's `main` is made by the macro `defspecs-main` (fib.test.core), and `fibc test`'s children run under FIB_LIVE=1 when it is set.
 (defun load-program (sx: Sess text: str) -> (Result unit (Vec str))
   (match (rc/classify text)
     ((rc/Unreadable m) (Err [(str (. sx file) ":" m)]))
@@ -64,7 +67,7 @@
          (Err [(str (. sx file) ": a live program is definitions only; a top-level expression cannot be resident")])
          (let ((cs (rc/merge-clauses guard-clauses clauses)) (ds (into [(rc/Def "val:live-guard" "live-guard" guard-text)] defs)))   ; one Def holds both guard functions: its text is a line each
            (do (set! (. (. sx rc) clauses) cs) (set! (. (. sx rc) defs) ds)
-               (if (nil? (def-named sx "main")) (Err [(str (. sx file) ": the program has no main")]) (Ok ()))))))))
+               (Ok ())))))))
 
 ;; The tables of one program of the session: the session's objects (the type ids every walker reads), strings and keywords (plain data
 ;; and ids, the same in every program, declared from the base by name), and closures and vtables of the program's own: those name
@@ -87,7 +90,8 @@
     (let ((fr (rc/front (. sx eng) (. sx rts) (rc/source-of clauses defs tail) "yes" true)))
       (match (. fr checked)
         ((Err ds) (Err ds))
-        ((Ok c) (match (ec/compile-executable-ast-with (. c typed) (. c owned) (some (program-tables sx)) requests)
+        ((Ok c) (match (do (set! (. (. (. c typed) globals) live-modules) @(. sx live-modules))
+                           (ec/compile-executable-ast-with (. c typed) (. c owned) (some (program-tables sx)) requests))
                   ((Err m) (Err [(dg/diag-nowhere "live/Unsupported" rc/repl-file (str "unsupported: " m))]))
                   ((Ok e) (Ok (Made (. e ast) (. (. c typed) globals) (. fr stats))))))))))
 
@@ -137,6 +141,7 @@
     ((Err code) (Err code))
     ((Ok c)
      (do (doseq [w @(. (. (. c typed) globals) warnings)] (eprintln w))
+         (set! (. sx live-modules) @(. (. (. c typed) globals) live-modules))
          (match (ec/compile-executable-ast-with (. c typed) (. c owned) (some (program-tables sx)) [])
            ((Err m) (do (eprintln (str "unsupported: " m)) (Err front/exit-unsupported)))
            ((Ok e) (match (lj/live-jit-new (. sx opt))
