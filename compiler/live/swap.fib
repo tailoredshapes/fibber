@@ -1,0 +1,120 @@
+;; compiler/live/swap.fib: a function's versions in a live session, and the swap that replaces one while other threads call it.
+;; PROTOTYPE (docs/design/live-repl.md). The mechanism is the stub of live.stub (an indirection through one atomic pointer, with
+;; in-flight counters per epoch parity for quiescence) over resource trackers (live.orc): a new version is a module of its own added under
+;; a tracker; the swap publishes its address, waits for the calls that may be inside the old version, and removes the old tracker.
+;;
+;; `Faults` are the planted faults of compiler/tests/live/mutants.sh (each must turn a check red): `free-first` removes the old module
+;; before the new address is published; `no-wait` publishes and removes without waiting for quiescence; `two-step` publishes through a
+;; null pointer first (a swap that is not one atomic store); `no-count` is a stub that keeps no in-flight counters (live.stub); `skip-check`
+;; accepts a version whose type differs from the stub's.
+(ns live.swap
+  (:use lir.types lir.ast)
+  (:require [live.jit :as lj] [live.stub :as stub] [lir.print :as print] [llvm.ffi :as ffi]))
+
+(defstruct Version (n: i64 rt: i64 pinned: bool))
+
+;; A live function: its stub's type and the addresses of the stub's globals and of the helpers, the versions alive (the current one last).
+(defstruct Live (name: str ty: LFnType slot: i64 epoch: i64 inflight: i64 versions: (Cell (Vec Version)) next: (Cell i64)))
+
+(defstruct Helpers (store: i64 store2: i64 fetch-add: i64 load: i64 yield: i64))
+
+(defstruct Registry (j: lj/LiveJit h: Helpers lives: (Cell (Map str Live)) fault: str waits: (Cell i64) spins: (Cell i64)))
+
+(defun fault? (r: Registry f: str) -> bool (= (. r fault) f))
+
+;; The registry over a session: the helpers module is added once, resident.
+(defun registry-new (j: lj/LiveJit fault: str) -> (Result Registry str)
+  (try-let ((_ (lj/add-resident-source j "live.rt" (stub/helpers-source)))
+            (store (lj/address j "live.rt.store")) (store2 (lj/address j "live.rt.store-two-step"))
+            (fa (lj/address j "live.rt.fetch-add")) (ld (lj/address j "live.rt.load")) (y (lj/address j "live.rt.yield")))
+    (Ok (Registry j (Helpers store store2 fa ld y) (cell {}) fault (cell 0) (cell 0)))))
+
+(defun live-of (r: Registry name: str) -> (Option Live) (get @(. r lives) name))
+
+;; Makes the stub of `name : ty` (resident) and the registry's record of it; the slot is null until the first version is installed.
+(defun define-live (r: Registry name: str ty: LFnType) -> (Result Live str)
+  (let ((j (. r j)))
+    (try-let ((_ (lj/add-resident-source j (str "live.stub." name) (stub/stub-source name ty (not (fault? r "no-count")))))
+              (slot (lj/global-address j (stub/slot-name name)))
+              (epoch (lj/global-address j (stub/epoch-name name)))
+              (inflight (lj/global-address j (stub/inflight-name name))))
+      (let ((l (Live name ty slot epoch inflight (cell []) (cell 1))))
+        (do (set! (. r lives) (assoc @(. r lives) name l))
+            (Ok l))))))
+
+;; The define of `name` in `m` renamed to `vname` and exported; everything else as it is.
+(defun versioned-module (m: LModule name: str vname: str) -> LModule
+  (LModule (mapv (fn (it: LItem)
+                   (match it
+                     ((ItDefine f) (if (= (. f name) name)
+                                       (ItDefine (LFunction vname (. f ty) (. f params) (. f blocks) (LModifiers LkExternal false) (. f pos)))
+                                       it))
+                     (_ it)))
+                 (. m items))))
+
+(defun type-of-define :private (m: LModule name: str) -> (Option LFnType)
+  (first (vec (keep (fn (it: LItem) (match it ((ItDefine f) (if (= (. f name) name) (some (. f ty)) nil)) (_ nil))) (. m items)))))
+
+;; A version of `l` from a module that defines `name` with the stub's type; `pinned` keeps it from ever being freed (a module whose
+;; statics may be referenced by resident values). The version is added and compiled but not yet published.
+(defun add-version (r: Registry l: Live m: LModule pinned: bool) -> (Result Version str)
+  (let ((n @(. l next)) (vname (stub/version-name (. l name) @(. l next))))
+    (try-let ((ty (match (type-of-define m (. l name)) ((some t) (Ok t)) (nil (Err (str "live: the module does not define " (. l name))))))
+              (_ (if (or (= ty (. l ty)) (fault? r "skip-check"))
+                     (Ok ())
+                     (Err (str "live: " (. l name) " is " (fn-type-str ty) " but the resident callers were compiled against " (fn-type-str (. l ty)) "; refused"))))
+              (rt (lj/add-tracked (. r j) vname (versioned-module m (. l name) vname)))
+              (_ (lj/address (. r j) vname)))
+      (do (set! (. l next) (+ n 1))
+          (Ok (Version n rt pinned))))))
+
+(defun call-h :private (addr: i64 args: (Vec i64)) -> i64
+  (match (lj/call addr args) ((Ok v) v) ((Err m) (trap (str "live.swap: " m)))))
+
+;; Waits until no call is inside the old parity: bumps the epoch and spins until every shard's counter of the old parity is 0 (a
+;; yield each 64 spins).
+(defun wait-quiescent :private (r: Registry l: Live) -> unit
+  (let ((h (. r h)) (old (call-h (. h fetch-add) [(. l epoch) 1])))
+    (let ((parity (bit-and old 1)))
+      (loop ((spins 0))
+        (if (all-zero? r l parity)
+            (do (set! (. r waits) (+ @(. r waits) 1)) (set! (. r spins) (+ @(. r spins) spins)) ())
+            (do (when (= (bit-and spins 63) 63) (call-h (. h yield) []))
+                (recur (+ spins 1))))))))
+
+(defun all-zero? :private (r: Registry l: Live parity: i64) -> bool
+  (loop ((shard 0))
+    (cond (>= shard stub/shards) true
+          (= (call-h (. (. r h) load) [(+ (. l inflight) (* 8 (stub/counter-word shard parity)))]) 0) (recur (+ shard 1))
+          :else false)))
+
+(defun free-version :private (r: Registry l: Live v: Version) -> (Result unit str)
+  (if (. v pinned) (Ok ()) (lj/remove (. r j) (. v rt) [(stub/version-name (. l name) (. v n))])))
+
+;; Publishes `v` as the current version of `l`: the slot store, the grace period, the old version freed. The faults change the order
+;; or leave a step out.
+(defun publish (r: Registry l: Live v: Version) -> (Result unit str)
+  (let ((h (. r h)) (olds @(. l versions)))
+    (try-let ((addr (lj/address (. r j) (stub/version-name (. l name) (. v n))))
+              (_ (if (fault? r "free-first") (free-all r l olds) (Ok ()))))
+      (do (call-h (if (fault? r "two-step") (. h store2) (. h store)) [(. l slot) addr])
+          (when (not (fault? r "no-wait")) (wait-quiescent r l))
+          (set! (. l versions) [v])
+          (if (fault? r "free-first") (Ok ()) (free-all r l olds))))))
+
+(defun free-all :private (r: Registry l: Live vs: (Vec Version)) -> (Result unit str)
+  (loop ((i 0))
+    (if (>= i (count vs))
+        (Ok ())
+        (match (free-version r l (nth vs i))
+          ((Err m) (Err m))
+          ((Ok _) (recur (+ i 1)))))))
+
+;; A whole swap: the version added from `m` (checked against the stub's type) and published; its number.
+(defun swap (r: Registry l: Live m: LModule pinned: bool) -> (Result i64 str)
+  (try-let ((v (add-version r l m pinned))
+            (_ (publish r l v)))
+    (Ok (. v n))))
+
+(defun current-version (l: Live) -> i64
+  (let ((vs @(. l versions))) (if (empty? vs) 0 (. (nth vs (- (count vs) 1)) n))))

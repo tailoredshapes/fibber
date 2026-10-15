@@ -1,0 +1,96 @@
+;; compiler/emit/live.fib: live mode's stubs and slots (docs/design/live-repl.md 3.1, package LV0). In a program compiled with
+;; `fibc run --live` (FIB_LIVE; emit.program `live-mode?`) every body of the program's own modules (a function, its all-owned twin, a
+;; method of its impls; never the library's, the prelude's or a macro module's) is lowered under a generation name, `NAME.g0`, and the
+;; name every caller, closure constant and vtable uses, `NAME`, is a stub: it loads the current generation's address from the slot
+;; `live.NAME` (a global holding `@NAME.g0`) with an acquire load and tail-jumps to it. A later generation (LV2) stores the address of
+;; `NAME.gK` into the slot with a release store: the callers follow without being touched, and a caller that loaded the old address runs
+;; the old body, which stays mapped. The stub is a `tailcall`, so it adds no frame: a recursion a million deep (cases/ownership 53 and
+;; 164) is as deep as without it. Where the result could be returned in memory (spec/lir.md 7.3 rule 5: more than two leaves) the
+;; checker refuses a tail call, and the stub is a call and a return instead.
+;; The closure literals of a generation carry its name (`l.NAME.g0.N`, emit.names `closure-name` over the code name), so a later
+;; generation's literals are its own and a heap closure made by an old body keeps naming old code.
+(ns emit.live
+  (:require [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f] [expand.modules :as mods])
+  (:use types.decls types.table own.program emit.program emit.statics))
+
+;; `NAME.gK`: the body of generation K.
+(defun generation-name (name: str g: i64) -> str (str name ".g" g))
+
+;; `live.NAME`: the slot the stub of NAME loads.
+(defun slot-name (name: str) -> str (str "live." name))
+
+;; Whether module `m` is the program's own: not the builtins, the prelude or a library module (the loader's own rule, expand.modules
+;; `sees-implicit`: a library module is one the implicit modules are not given to).
+(defun program-module? (g: Globals m: i64) -> bool
+  (and (not (= m module-builtin)) (not (= m module-prelude)) (mods/sees-implicit (g-module-name g m) (mods/implicit-lib))))
+
+(defun key-module :private (g: Globals key: BodyKey) -> (Option i64)
+  (match key
+    ((BodyFun fid) (some (. (g-fun g fid) module)))
+    ((BodyAllOwned fid) (some (. (g-fun g fid) module)))
+    ((BodyMethod i _) (some (. (table-get (. g instances) i) module)))
+    ((BodyMethodOwned i _) (some (. (table-get (. g instances) i) module)))
+    ((BodyDef _) nil)))
+
+;; Whether the body `key` is emitted behind a stub: live mode, not a macro module, a function or a method of the program's own modules.
+(defun live-body? (p: Program key: BodyKey) -> bool
+  (and (. p live) (not @(. p macro-module))
+       (match (key-module (program-g p) key) ((some m) (program-module? (program-g p) m)) (nil false))))
+
+;; The name the body of `key` is lowered under: generation 0's when it is stubbed, else `name` itself.
+(defun body-code-name (p: Program key: BodyKey name: str) -> str
+  (if (live-body? p key) (generation-name name 0) name))
+
+;; How many scalars or vectors a result holds, structs and arrays flattened; a named struct counts as too many (its fields are not known
+;; here), a vector wider than 512 bits too.
+(defun leaves :private (t: lt/LType) -> i64
+  (match t
+    ((lt/TAnon fs) (reduce (fn (acc: i64 x: lt/LType) (+ acc (leaves x))) 0 fs))
+    ((lt/TArray k e) (* k (leaves e)))
+    ((lt/TNamed _) 3)
+    ((lt/TVector _ _) (if (> (unwrap-or (lt/type-bits t) 0) 512) 3 1))
+    (_ 1)))
+
+;; Whether the stub can tail-jump (spec/lir.md 7.3 rule 5); else it calls and returns.
+(defun tail-jump? :private (ty: lt/LFnType) -> bool
+  (match (. ty ret) (nil true) ((some r) (<= (leaves r) 2))))
+
+;; The current generation's address: an acquire load of the slot (the swap's store is a release store, so the code the address names
+;; is complete when the load sees it).
+(defun slot-load :private (slot: str) -> la/LExpr
+  (n/node (la/KAtomicLoad la/ScSystem la/OAcquire lt/ty-ptr (n/global slot))))
+
+(defun stub-body :private (ty: lt/LFnType args: (Vec la/LExpr)) -> (Vec la/LExpr)
+  (if (tail-jump? ty)
+      [(n/indirect-call (n/local "at") ty args true)]
+      (match (. ty ret)
+        (nil [(n/indirect-call (n/local "at") ty args false) (n/ret nil)])
+        ((some _) [(f/bound [(f/binding "r" (n/indirect-call (n/local "at") ty args false))] [(n/ret (some (n/local "r")))])]))))
+
+;; The stub `name` of the body `body`: the body's type, convention and parameter names, one block.
+(defun stub-function (name: str body: la/LFunction) -> la/LFunction
+  (let ((args (mapv (fn (q: la/LParam) (n/local (. q name))) (. body params))))
+    (la/LFunction name (. body ty) (. body params)
+                  [(f/block "entry" [(f/bound [(f/binding "at" (slot-load (slot-name name)))] (stub-body (. body ty) args))])]
+                  (la/LModifiers la/lk-internal false) 0)))
+
+;; The slot of `name`, holding generation 0's address.
+(defun slot-item :private (name: str body: la/LFunction) -> la/LItem
+  (la/ItGlobal (la/LGlobalDef (slot-name name) lt/ty-ptr (n/global (. body name)) false (la/LModifiers la/lk-internal false) 0 false)))
+
+;; The function `code` of the program: the last one added, in the ordinary course.
+(defun function-named :private (p: Program code: str) -> (Option la/LFunction)
+  (let ((fs @(. p funcs)))
+    (loop ((i (- (count fs) 1)))
+      (cond (< i 0) nil
+            (= (. (nth fs i) name) code) (some (nth fs i))
+            :else (recur (- i 1))))))
+
+;; Adds the stub `name` and its slot for the body lowered under `code`, once the body is in the program.
+(defun add-stub (p: Program name: str code: str) -> (Result unit str)
+  (match (function-named p code)
+    (nil (Err (str "live: no body " code " to stub")))
+    ((some body)
+     (do (statics-item (. p statics) (slot-name name) (slot-item name body))
+         (program-add-function p (stub-function name body))
+         (Ok ())))))

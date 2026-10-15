@@ -38,6 +38,10 @@ tool_sh-specs-plant-vec := $(T)/specs/plant-vec.sh $(F_ABS) | $(wildcard $(T)/sp
 tool_sh-lanes-lanes := $(T)/lanes/lanes.sh $(F_ABS) | $(wildcard $(T)/lanes/*)
 tool_sh-repl-run := $(T)/repl/run.sh $(F_ABS) | $(wildcard $(T)/repl/*)
 tool_sh-serve-run := $(T)/serve/run.sh $(F_ABS) | $(wildcard $(T)/serve/*)
+# live mode (docs/design/live-repl.md): LV0's stubs and slots (hello's golden, the deep recursion, the case tables with and without --live), and the
+# resident-session prototype's checks (compiler/live, built as a tool that links LLVM: about 3 minutes)
+tool_sh-live-stubs := $(T)/live/stubs.sh $(F_ABS) -j $(CASE_JOBS) | $(T)/live/stubs.sh $(T)/live/hello.fib $(T)/live/deep.fib $(T)/live/hello-stubs.golden compiler/emit/live.fib
+tool_sh-live-run := $(T)/live/run.sh $(F_ABS) | $(wildcard $(T)/live/*) $(wildcard compiler/live/*.fib) compiler/live.fib
 # The persistent checker's controls (run.sh, about 2 minutes whole) as independent stamps of at most about 50 s: the command-line programs in three groups,
 # the three batch comparisons (each builds its own emit tool), and the server edits. PERSIST_PARTS are queued right after the fixed point (mk/gate.mk).
 PERSIST_PARTS := cmd-0 cmd-1 cmd-2 batch-verify batch-onoff batch-single server
@@ -77,7 +81,7 @@ tool_sh-make-graph := $(T)/make/graph.sh | $(wildcard $(T)/make/*) scripts/mac-g
 TOOLS_QUICK := sh-emit-prune fibref-skeleton gen-skeleton lint-pipefail lint-portable sh-driver-check-lib sh-make-graph
 TOOLS_FULL := $(TOOLS_QUICK) unit-api units-all units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-emit-runtime sh-emit-defs-order sh-stack-stack \
-  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run $(PERSIST_STAMPS) sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
+  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-run $(PERSIST_STAMPS) sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
   sh-native-l1-unit $(LIRO_STAMPS) jit-selfhosted-threads sh-native-a64-sibcall sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
 # The command is every word up to the `|`, the inputs every word after it.
 upto_bar = $(if $(filter |,$(firstword $(1))),,$(if $(1),$(firstword $(1)) $(call upto_bar,$(wordlist 2,999999,$(1))),))

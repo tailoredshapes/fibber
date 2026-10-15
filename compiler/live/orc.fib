@@ -1,0 +1,38 @@
+;; compiler/live/orc.fib: the ORC resource trackers (llvm-c/Orc.h, LLJIT.h) that compiler/llvm/orc.fib does not bind: a module added
+;; under a tracker can be removed from the session on its own, which `LLVMOrcLLJITAddLLVMIRModule` (the default tracker) cannot.
+;; PROTOTYPE (docs/design/live-repl.md): the live session adds each version of a function under its own tracker and removes the old
+;; one once no call is inside it (live.swap).
+;;
+;; Ownership: `tracker-new` returns a tracker the caller releases with `tracker-release` (its ref count); `add-module-tracked` consumes
+;; the thread-safe module as `llvm.orc/add-module` does; `tracker-remove` frees the module's code and symbols, and every address the
+;; session gave out for them is dead from then on.
+(ns live.orc (:require [llvm.ffi :as ffi] [llvm.support :as support]))
+
+(extern LLVMOrcJITDylibCreateResourceTracker :private (i64) -> i64)
+(extern LLVMOrcLLJITAddLLVMIRModuleWithRT :private (i64 i64 i64) -> i64)
+(extern LLVMOrcResourceTrackerRemove :private (i64) -> i64)
+(extern LLVMOrcReleaseResourceTracker :private (i64) -> unit)
+(extern LLVMOrcLLJITGetMainJITDylib :private (i64) -> i64)
+(extern LLVMOrcCreateNewThreadSafeContextFromLLVMContext :private (i64) -> i64)
+(extern LLVMOrcCreateNewThreadSafeModule :private (i64 i64) -> i64)
+(extern LLVMOrcDisposeThreadSafeContext :private (i64) -> unit)
+
+;; A new tracker on the main JITDylib of the session `jit`.
+(defun tracker-new (jit: i64) -> i64
+  (unsafe (LLVMOrcJITDylibCreateResourceTracker (LLVMOrcLLJITGetMainJITDylib jit))))
+
+;; Adds `module` (made in `ctx`) under the tracker `rt`. On success the session owns both; on `Err` the caller still does.
+(defun add-module-tracked (jit: i64 rt: i64 ctx: i64 module: i64) -> (Result unit str)
+  (unsafe
+    (let ((tsc (LLVMOrcCreateNewThreadSafeContextFromLLVMContext ctx))
+          (tsm (LLVMOrcCreateNewThreadSafeModule module tsc)))
+      (do (LLVMOrcDisposeThreadSafeContext tsc)
+          (support/status (LLVMOrcLLJITAddLLVMIRModuleWithRT jit rt tsm))))))
+
+;; Removes everything added under `rt`: its code is freed.
+(defun tracker-remove (rt: i64) -> (Result unit str)
+  (unsafe (support/status (LLVMOrcResourceTrackerRemove rt))))
+
+;; Drops the caller's reference to `rt` (the module stays unless it was removed).
+(defun tracker-release (rt: i64) -> unit
+  (unsafe (LLVMOrcReleaseResourceTracker rt)))

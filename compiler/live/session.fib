@@ -1,0 +1,270 @@
+;; compiler/live/session.fib: a fibber session over ONE resident JIT (PROTOTYPE, docs/design/live-repl.md; compiler/live/FINDINGS.md).
+;; The text of the session is serve.replcore's (every input is a whole program, checked whole); what differs from `fibc repl` is what
+;; runs: the first input makes the base, a program of the session's definitions compiled once and kept, with its runtime initialised and
+;; its `def`s evaluated once (so a value persists from input to input); each later input cuts out of its own program the function it
+;; redefines (added as a new version and swapped in, live.swap) or the expression's `main` (added, called, and freed unless something
+;; resident could point into it), with declarations for everything the base has (live.extract). The whole-program check runs on every
+;; input before anything is added; a redefinition whose emitted type differs from the stub's is refused (live.swap `add-version`).
+;; Traps: every expression runs under `try` in `live-guard`, the session's first definition, so a trap in it unwinds (stage 2 of
+;; docs/design/exceptions.md) and the session goes on; a trap elsewhere (another thread, a `finally`) is fatal, as in any program.
+(ns live.session
+  (:use lir.ast lir.types)
+  (:require [serve.replcore :as rc] [serve.incr :as inc] [serve.diag :as dg] [expand.roots :as roots] [emit.compile :as ec] [emit.program :as ep]
+            [own.driver :as od] [live.jit :as lj] [live.swap :as sw] [live.extract :as ex] [live.stub :as stub]
+            [lir.print :as print] [fib.string :as s]))
+
+(def guard-text: str
+  "(defun live-guard (f: (fn () i64)) -> i64 (try (f) (catch e (do (println (str \"trap: \" (ex-message e))) 134))))")
+
+;; What a live function's version was made from: the text of its definition, and the checker's type of the function then.
+(defstruct Made (text: str type: str))
+
+(defstruct Live
+  (rc: rc/Session eng: inc/Engine rts: roots/Roots opt: i64 fault: str
+   jit: (Cell (Option lj/LiveJit)) reg: (Cell (Option sw/Registry))
+   tables: ep/Tables
+   base: (Cell (Map str LItem)) made: (Cell (Map str Made)) rows: (Cell i64) exprs: (Cell i64) defs-at-boot: (Cell i64)))
+
+(defun live-new (rts: roots/Roots opt: i64 fault: str) -> Live
+  (Live (rc/session-new) (inc/engine-new) rts opt fault (cell nil) (cell nil) (ep/tables-new)
+        (cell {}) (cell {}) (cell 0) (cell 0) (cell 0)))
+
+(defun booted? (l: Live) -> bool (some? @(. l jit)))
+
+(defun fault? (l: Live f: str) -> bool (= (. l fault) f))
+
+;; ---- the program of an input
+
+;; The whole program with `main` running `expr` under the guard, checked and emitted (numbered in the session's tables).
+(defun program-of (l: Live expr: str) -> (Result LModule (Vec str))
+  (program-with l expr (made-requests l)))
+
+;; The live functions by their fibber names: every program emits their direct bodies, so that a definition input swaps at once and not
+;; at the next expression that happens to reach the function. The all-owned closure body (`f.NAME.owned`) cannot be asked for: its
+;; ownership plan exists only in a program that makes a closure of the function, so it is refreshed by the next such program (FINDINGS.md).
+(defun made-requests (l: Live) -> (Vec ec/BodyRequest)
+  (mapv (fn (nm: str) (ec/BodyRequest (fn-of-emitted nm) false)) (filterv (fn (nm: str) (not (s/ends-with? nm ".owned"))) (vec (keys @(. l made))))))
+
+(defun program-with (l: Live expr: str requests: (Vec ec/BodyRequest)) -> (Result LModule (Vec str))
+  (let ((defs @(. (. l rc) defs)) (clauses @(. (. l rc) clauses)))
+    (let ((tail (str "(defun main () -> i64 (live-guard (fn () -> i64 (do " expr " 0))))\n"))
+          (at (+ 2 (rc/lines-in (rc/defs-text defs)))))
+      (let ((f (rc/front (. l eng) (. l rts) (rc/source-of clauses defs tail) "yes" true)))
+        (match (. f checked)
+          ((Err ds) (Err (mapv (fn (d: dg/Diag) (rc/show-diag d at defs)) ds)))
+          ((Ok c) (match (ec/compile-executable-ast-with (. c typed) (. c owned) (some (. l tables)) requests)
+                    ((Err m) (Err [(str "unsupported: " m)]))
+                    ((Ok e) (Ok (. e ast))))))))))
+
+(defun session-fns (l: Live) -> (Vec str)
+  (mapv (fn (d: rc/Def) (. d name)) (filterv (fn (d: rc/Def) (s/starts-with? (. d key) "val:")) @(. (. l rc) defs))))
+
+(defun def-text (l: Live name: str) -> str
+  (match (first (filterv (fn (d: rc/Def) (= (. d name) name)) @(. (. l rc) defs))) ((some d) (. d text)) (nil "")))
+
+(defun def-count (l: Live) -> i64
+  (count (filterv (fn (d: rc/Def) (and (s/starts-with? (. d key) "val:") (s/starts-with? (. d text) "(def "))) @(. (. l rc) defs))))
+
+;; ---- boot
+
+(defun lives-of :private (l: Live base: LModule) -> (Map str LFnType)
+  (reduce (fn (acc: (Map str LFnType) it: LItem)
+            (match it ((ItDeclare d) (if (ex/session-function? (session-fns l) (. d name)) (assoc acc (. d name) (. d ty)) acc)) (_ acc)))
+          {} (. base items)))
+
+;; The base from the program of `0`: stubs for the session functions, the prepared base resident, the runtime and the defs initialised.
+(defun boot (l: Live) -> (Result unit str)
+  (try-let ((m (match (program-of l "0") ((Err lines) (Err (str-join (vec (interpose "\n" lines))))) ((Ok m) (Ok m))))
+            (j (lj/live-jit-new (. l opt)))
+            (r (sw/registry-new j (. l fault))))
+    (let ((prepared (ex/prepare-base m (session-fns l))))
+      (do (set! (. l jit) (some j)) (set! (. l reg) (some r))
+          (try-let ((_ (install-stubs l r (. prepared snd)))
+                    (_ (lj/add-resident j "live.base" (. prepared fst)))
+                    (_ (publish-v1 l r (. prepared snd)))
+                    (_ (run-void j "fib.init"))
+                    (_ (call-entry j "fib.set-args" [0 0]))
+                    (_ (run-void j "fib.defs-init")))
+            (do (set! (. l base) (ex/index-of (. prepared fst)))
+                (set! (. l rows) (ex/table-length m))
+                (set! (. l defs-at-boot) (def-count l))
+                (doseq [p (. prepared snd)] (note-made l (. p fst)))
+                (Ok ())))))))
+
+(defun install-stubs :private (l: Live r: sw/Registry lives: (Vec (Pair str LFnType))) -> (Result unit str)
+  (loop ((i 0))
+    (if (>= i (count lives))
+        (Ok ())
+        (match (sw/define-live r (. (nth lives i) fst) (. (nth lives i) snd))
+          ((Err m) (Err m))
+          ((Ok _) (recur (+ i 1)))))))
+
+;; Version 1 of each live function is the base's `NAME.v1`: published through the stub without a module of its own (pinned: it is the base).
+(defun publish-v1 :private (l: Live r: sw/Registry lives: (Vec (Pair str LFnType))) -> (Result unit str)
+  (loop ((i 0))
+    (if (>= i (count lives))
+        (Ok ())
+        (match (sw/live-of r (. (nth lives i) fst))
+          (nil (Err "live: no stub"))
+          ((some lv) (match (sw/publish r lv (sw/Version 1 0 true))
+                       ((Err m) (Err m))
+                       ((Ok _) (do (set! (. lv next) 2) (recur (+ i 1))))))))))
+
+(defun run-void :private (j: lj/LiveJit name: str) -> (Result unit str)
+  (try-let ((a (lj/c-entry j name)) (_ (lj/call a []))) (Ok ())))
+
+(defun call-entry :private (j: lj/LiveJit name: str args: (Vec i64)) -> (Result i64 str)
+  (try-let ((a (lj/c-entry j name))) (lj/call a args)))
+
+(defun fn-of-emitted :private (emitted: str) -> str
+  (let ((bare (str-slice emitted 2 (str-len emitted))))
+    (if (s/ends-with? bare ".owned") (str-slice bare 0 (- (str-len bare) 6)) bare)))
+
+(defun note-made :private (l: Live emitted: str) -> unit
+  (let ((name (fn-of-emitted emitted)))
+    (set! (. l made) (assoc @(. l made) emitted (Made (def-text l name) (checker-type l name))))))
+
+;; The checker's type of a session function, as `:type` shows it (serve.replcore).
+(defun checker-type (l: Live name: str) -> str
+  (match (rc/type-of-expr (. l rc) (. l eng) (. l rts) name) ((Ok t) t) ((Err _) "?")))
+
+;; The live function whose checker type the new text changed, if any: its callers were compiled against the old type.
+(defun type-changed :private (l: Live) -> (Option str)
+  (first (vec (keep (fn (p: (Pair str Made))
+                      (let ((name (fn-of-emitted (. p fst))) (now (checker-type l (fn-of-emitted (. p fst)))))
+                        (if (= now (. (. p snd) type))
+                            nil
+                            (some (str "live: " name " is now " now " but the resident callers were compiled against " (. (. p snd) type) "; refused")))))
+                    (vec @(. l made))))))
+
+;; ---- after boot: versions and expressions
+
+(defun jit-of :private (l: Live) -> lj/LiveJit (match @(. l jit) ((some j) j) (nil (trap "live: not booted"))))
+(defun reg-of :private (l: Live) -> sw/Registry (match @(. l reg) ((some r) r) (nil (trap "live: not booted"))))
+
+(defun live-types :private (l: Live) -> (Map str LFnType)
+  (reduce (fn (acc: (Map str LFnType) nm: str) (match (sw/live-of (reg-of l) nm) ((some lv) (assoc acc nm (. lv ty))) (nil acc)))
+          {} (vec (keys @(. l made)))))
+
+;; The session functions the program emits that have no stub yet (first reached now) or whose text changed since their version: each
+;; gets a stub if it has none, then a version cut from this program and swapped in.
+(defun refresh-functions :private (l: Live m: LModule) -> (Result (Vec str) str)
+  (let ((emitted (filterv (fn (nm: str) (ex/session-function? (session-fns l) nm)) (vec (keys (ex/index-of m))))))
+    (loop ((i 0) (swapped []))
+      (if (>= i (count emitted))
+          (Ok swapped)
+          (let ((nm (nth emitted i)))
+            (match (refresh-one l m nm)
+              ((Err e) (Err e))
+              ((Ok true) (recur (+ i 1) (conj swapped nm)))
+              ((Ok false) (recur (+ i 1) swapped))))))))
+
+(defun refresh-one :private (l: Live m: LModule nm: str) -> (Result bool str)
+  (let ((r (reg-of l)) (text (def-text l (fn-of-emitted nm))))
+    (match (get @(. l made) nm)
+      ((some made) (if (= (. made text) text) (Ok false) (new-version l m nm)))
+      (nil (match (ex/define-of m nm)
+             (nil (Ok false))
+             ((some fd) (try-let ((_ (sw/define-live r nm (. fd ty)))) (new-version l m nm))))))))
+
+(defun new-version :private (l: Live m: LModule nm: str) -> (Result bool str)
+  (let ((r (reg-of l)))
+    (match (sw/live-of r nm)
+      (nil (Err "live: no stub"))
+      ((some lv)
+       (try-let ((cut (ex/extract @(. l base) m (assoc (live-types l) nm (. lv ty)) [(Pair nm nm)] []))
+                 (_ (sw/swap r lv cut (ex/pins? cut))))
+         (do (note-made l nm) (Ok true)))))))
+
+;; The expression: its `main` cut out as `live.expr.N.body`, entered through `live.expr.N`, run, and freed unless pinned.
+(defun run-expression :private (l: Live m: LModule) -> (Result i64 str)
+  (let ((j (jit-of l)) (n @(. l exprs)) (name (str "live.expr." n)))
+    (do (set! (. l exprs) (+ n 1))
+        (try-let ((fd (match (ex/define-of m "f.main") ((some f) (Ok f)) (nil (Err "live: the program has no f.main"))))
+                  (rows (ex/append-item m @(. l rows) (str "live.types.append." n)))
+                  (cut (ex/extract @(. l base) m (live-types l) [(Pair "f.main" (str name ".body"))] (if (> (. rows snd) @(. l rows)) (. rows fst) [])))
+                  (module (Ok (LModule (conj (. cut items) (ex/entry-item name (str name ".body") (. fd ty))))))
+                  (rt (lj/add-tracked j name module))
+                  (_ (if (> (. rows snd) @(. l rows)) (run-void j (str "live.types.append." n)) (Ok ())))
+                  (addr (lj/address j name))
+                  (v (lj/call addr [])))
+          (do (set! (. l rows) (max @(. l rows) (. rows snd)))
+              (if (ex/pins? module)
+                  (Ok v)
+                  (match (lj/remove j rt [name (str name ".body")]) ((Err e) (Err e)) ((Ok _) (Ok v)))))))))
+
+;; ---- inputs
+
+(defun show-lines :private (lines: (Vec str)) -> unit (doseq [x lines] (println x)))
+
+(defun snapshot :private (l: Live) -> (Pair (Vec str) (Vec rc/Def)) (Pair @(. (. l rc) clauses) @(. (. l rc) defs)))
+
+(defun restore :private (l: Live snap: (Pair (Vec str) (Vec rc/Def))) -> unit
+  (do (set! (. (. l rc) clauses) (. snap fst)) (set! (. (. l rc) defs) (. snap snd))))
+
+;; A definition input: the whole-program check (serve.replcore), then, once booted, the program emitted and the changed functions swapped.
+;; A `def` after boot is refused: its slot would not be resident (FINDINGS.md).
+;; The session starts (boots) at the first expression: the defs entered before it are the resident ones.
+(defun define-input :private (l: Live defs: (Vec rc/Def) clauses: (Vec str)) -> bool
+  (let ((snap (snapshot l)))
+    (match (rc/define-input (. l rc) (. l eng) (. l rts) defs clauses)
+      ((rc/Refused shown _) (do (show-lines shown) (println "; refused; the session is unchanged") false))
+      ((rc/Defined names _)
+       (if (not (booted? l))
+           (do (println (str "; defined " (str-join (vec (interpose ", " names))))) true)
+           (match (after-define l)
+             ((Err m) (do (restore l snap) (println m) (println "; refused; the session is unchanged") false))
+             ((Ok swapped) (do (println (str "; " (if (empty? swapped) "defined " "redefined ") (str-join (vec (interpose ", " names)))
+                                             (if (empty? swapped) "" (str " (swapped " (str-join (vec (interpose ", " swapped))) ")"))))
+                               true)))))
+      (_ true))))
+
+(defun after-define :private (l: Live) -> (Result (Vec str) str)
+  (cond (and (> (def-count l) @(. l defs-at-boot)) (not (fault? l "skip-program-check")))
+        (Err "live: a def added after the session started would not be resident (its slot is made at boot); refused")
+        :else
+        (match (if (fault? l "skip-check") nil (type-changed l))
+          ((some why) (Err why))
+          (nil (try-let ((m (match (program-of l "0") ((Err lines) (Err (str-join (vec (interpose "\n" lines))))) ((Ok m) (Ok m)))))
+                 (refresh-functions l m))))))
+
+;; An expression input: the program, the functions it reaches refreshed, then the expression run in the resident session.
+(defun expression-input :private (l: Live expr: str) -> unit
+  (match (program-of l (str "(prn " expr ")"))
+    ((Err lines) (if (some? (first (filterv (fn (x: str) (s/includes? x "implementation of Debug")) lines)))
+                     (run-program l (program-of l expr))
+                     (do (show-lines lines) (println "; refused"))))
+    (ok (run-program l ok))))
+
+(defun run-program :private (l: Live r: (Result LModule (Vec str))) -> unit
+  (match r
+    ((Err lines) (do (show-lines lines) (println "; refused")))
+    ((Ok m) (match (try-let ((_ (refresh-functions l m))) (run-expression l m))
+              ((Err e) (println (str e "\n; the input did not run")))
+              ((Ok v) (when (not (= v 0)) (println (str "; status " v))))))))
+
+(defun input (l: Live text: str) -> unit
+  (match (rc/classify text)
+    ((rc/Blank) ())
+    ((rc/Unreadable m) (println (str "<input>:" m)))
+    ((rc/Parts defs clauses exprs)
+     (let ((ok (if (and (empty? defs) (empty? clauses)) true (define-input l defs clauses))))
+       (when ok
+         (do (when (and (not (empty? exprs)) (not (booted? l)))
+               (match (boot l) ((Err m) (println (str "live: boot failed: " m))) ((Ok _) (println "; session started"))))
+             (doseq [e exprs] (expression-input l e))))))))
+
+;; `live run FILE`: one input per line (a line starting with `;` is a comment); the lines are echoed as a transcript.
+(defun run-script (text: str rts: roots/Roots opt: i64 fault: str) -> i64
+  (let ((l (live-new rts opt fault))
+        (t0 (sys-clock-now)))
+    (do (rc/define-input (. l rc) (. l eng) rts [(rc/Def "val:live-guard" "live-guard" guard-text)] ["(:use fib.ex)"])
+        (doseq [line (s/split-lines text)]
+          (let ((t (s/trim line)))
+            (when (and (not (= t "")) (not (s/starts-with? t ";")))
+              (let ((t1 (sys-clock-now)))
+                (do (println (str "fib> " t))
+                    (input l t)
+                    (println (str "; " (quot (- (sys-clock-now) t1) 1000000) " ms")))))))
+        (println (str "; session total " (quot (- (sys-clock-now) t0) 1000000) " ms"))
+        0)))

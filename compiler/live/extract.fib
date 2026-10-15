@@ -1,0 +1,208 @@
+;; compiler/live/extract.fib: the lIR surgery of the live session (PROTOTYPE, docs/design/live-repl.md). The emitter makes a whole
+;; program for every input (serve.replcore: state is source); the session keeps ONE resident base (the first program) and, for each
+;; later input, cuts out of its program only what is new: the function being redefined, or the expression's `main`, with the internals
+;; they reach copied and everything the base exports declared. The base is prepared once: every definition exported, each session
+;; function `f.NAME` renamed to its version 1 and called through a stub (live.stub), the type tables widened to mutable arrays with room
+;; for the rows later inputs append. Type ids and static names agree between programs because every program of the session is numbered
+;; in the same tables (emit.program `program-new-with`); without that the ids in a later program's code would not match the resident
+;; tables (compiler/live/FINDINGS.md).
+(ns live.extract
+  (:use lir.ast lir.types)
+  (:require [lir.rewrite :as rw] [emit.node :as n] [emit.function :as f] [fib.string :as s]))
+
+(def table-cap: i64 2048)
+(def tables: (Vec str) ["fib.types" "fib.classes" "fib.kinds"])
+
+;; ---- names
+
+(defun item-name (it: LItem) -> (Option str)
+  (match it
+    ((ItDefine fd) (some (. fd name)))
+    ((ItGlobal g) (some (. g name)))
+    ((ItDeclare d) (some (. d name)))
+    ((ItDeclareGlobal g) (some (. g name)))
+    (_ nil)))
+
+;; The global names an expression mentions: `@name` operands and direct callees, with repetitions.
+(defun expr-refs (e: LExpr) -> (Vec str)
+  (let ((own (match (. e kind)
+               ((KGlobal nm) [nm])
+               ((KCall callee _ _) (match callee ((CalDirect nm) [nm]) (_ [])))
+               (_ [])))
+        (kids (cell [])))
+    (do (rw/map-children e (fn (c: LExpr) (do (set! kids (into @kids (expr-refs c))) c)))
+        (into own @kids))))
+
+(defun item-refs (it: LItem) -> (Vec str)
+  (match it
+    ((ItDefine fd) (vec (mapcat (fn (b: LBlock) (vec (mapcat expr-refs (. b body)))) (. fd blocks))))
+    ((ItGlobal g) (expr-refs (. g init)))
+    (_ [])))
+
+;; The items of a module by name (structs and the target are not named here).
+(defun index-of (m: LModule) -> (Map str LItem)
+  (reduce (fn (acc: (Map str LItem) it: LItem) (match (item-name it) ((some nm) (assoc acc nm it)) (nil acc))) {} (. m items)))
+
+(defun define-of (m: LModule name: str) -> (Option LFunction)
+  (match (get (index-of m) name) ((some (ItDefine fd)) (some fd)) (_ nil)))
+
+;; ---- the base
+
+(defun exported :private (mods: LModifiers) -> LModifiers (LModifiers LkExternal (. mods hidden)))
+
+(defun rename-define :private (fd: LFunction new-name: str) -> LFunction
+  (LFunction new-name (. fd ty) (. fd params) (. fd blocks) (exported (. fd mods)) (. fd pos)))
+
+;; The rows of a table's initialiser.
+(defun table-rows (g: LGlobalDef) -> (Vec LExpr)
+  (match (. (. g init) kind) ((KArray _ es) es) (_ [])))
+
+(defun elem-type :private (t: LType) -> LType (match t ((TArray _ e) e) (_ t)))
+
+;; The table as a mutable global of `table-cap` rows: its rows, then zero rows.
+(defun widen-table :private (g: LGlobalDef) -> LGlobalDef
+  (let ((e (elem-type (. g ty))) (rows (table-rows g)))
+    (let ((ty (TArray table-cap e))
+          (all (into rows (mapv (fn (_i: i64) (LExpr (KZero e) 0)) (range (- table-cap (count rows)))))))
+      (LGlobalDef (. g name) ty (LExpr (KArray ty all) 0) false (exported (. g mods)) (. g pos) (. g shared)))))
+
+(defun table? :private (name: str) -> bool (some? (first (filterv (fn (t: str) (= t name)) tables))))
+
+;; Whether `name` is the emitted form of a session function: `f.NAME` or `f.NAME.owned`.
+(defun session-function? (session-fns: (Vec str) name: str) -> bool
+  (some? (first (filterv (fn (x: str) (or (= name (str "f." x)) (= name (str "f." x ".owned")))) session-fns))))
+
+;; The base: everything exported; the session functions renamed to `NAME.v1` with a declaration of `NAME` (the stub, added before the
+;; base) in their place; the tables widened. The live functions found, with their types.
+(defun prepare-base (m: LModule session-fns: (Vec str)) -> (Pair LModule (Vec (Pair str LFnType)))
+  (let ((lives (cell [])))
+    (let ((items (vec (mapcat (fn (it: LItem)
+                                (match it
+                                  ((ItDefine fd)
+                                   (if (session-function? session-fns (. fd name))
+                                       (do (set! lives (conj @lives (Pair (. fd name) (. fd ty))))
+                                           [(ItDefine (rename-define fd (str (. fd name) ".v1"))) (ItDeclare (LDeclare (. fd name) (. fd ty) false (. fd pos)))])
+                                       [(ItDefine (LFunction (. fd name) (. fd ty) (. fd params) (. fd blocks) (exported (. fd mods)) (. fd pos)))]))
+                                  ((ItGlobal g) [(ItGlobal (if (table? (. g name)) (widen-table g) (LGlobalDef (. g name) (. g ty) (. g init) (. g constant) (exported (. g mods)) (. g pos) (. g shared))))])
+                                  (_ [it])))
+                              (. m items)))))
+      (Pair (LModule items) @lives))))
+
+;; ---- extraction
+
+(defstruct Cut (base: (Map str LItem) program: (Map str LItem) live: (Map str LFnType) out: (Cell (Vec LItem)) seen: (Cell (Map str bool)) todo: (Cell (Vec str))))
+
+(defun declaration-of :private (it: LItem) -> (Option LItem)
+  (match it
+    ((ItDefine fd) (some (ItDeclare (LDeclare (. fd name) (. fd ty) false 0))))
+    ((ItGlobal g) (some (ItDeclareGlobal (LGlobalDecl (. g name) (. g ty) false 0))))
+    ((ItDeclare _) (some it))
+    ((ItDeclareGlobal _) (some it))
+    (_ nil)))
+
+(defun emit-item :private (c: Cut it: LItem) -> unit (set! (. c out) (conj @(. c out) it)))
+
+(defun want :private (c: Cut names: (Vec str)) -> unit
+  (doseq [nm names] (when (not (contains? @(. c seen) nm)) (do (set! (. c seen) (assoc @(. c seen) nm true)) (set! (. c todo) (conj @(. c todo) nm))))))
+
+;; One name: a live function is declared (the stub); a name the base has is declared as the base defines it; else the program's item is
+;; copied and what it mentions wanted.
+(defun resolve :private (c: Cut nm: str) -> (Result unit str)
+  (match (get (. c live) nm)
+    ((some ty) (do (emit-item c (ItDeclare (LDeclare nm ty false 0))) (Ok ())))
+    (nil
+     (match (get (. c base) nm)
+       ((some it) (match (declaration-of it) ((some d) (do (emit-item c d) (Ok ()))) (nil (Ok ()))))
+       (nil (match (get (. c program) nm)
+              ((some it) (do (emit-item c it) (want c (item-refs it)) (Ok ())))
+              (nil (Err (str "live: " nm " is defined neither in the session nor in the input's program")))))))))
+
+(defun drain :private (c: Cut) -> (Result unit str)
+  (loop ()
+    (let ((todo @(. c todo)))
+      (if (empty? todo)
+          (Ok ())
+          (do (set! (. c todo) (vec (drop 1 todo)))
+              (match (resolve c (nth todo 0))
+                ((Err m) (Err m))
+                ((Ok _) (recur))))))))
+
+(defun structs-and-target :private (m: LModule) -> (Vec LItem)
+  (filterv (fn (it: LItem) (match it ((ItStruct _) true) ((ItTarget _) true) (_ false))) (. m items)))
+
+;; The module of the roots: each root is the program's define under a new exported name, then everything they reach, with the program's
+;; structs and target. `live` are the session functions and their types: they are declared, never copied, so a call reaches the stub.
+(defun extract (base: (Map str LItem) program: LModule live: (Map str LFnType) roots: (Vec (Pair str str)) extra: (Vec LItem)) -> (Result LModule str)
+  (let ((pi (index-of program))
+        (c (Cut base pi live (cell (structs-and-target program)) (cell {}) (cell []))))
+    (try-let ((_ (root-items c pi roots)))
+      (do (doseq [it extra] (match (item-name it) ((some nm) (set! (. c seen) (assoc @(. c seen) nm true))) (nil ())))
+          (doseq [it extra] (do (emit-item c it) (want c (item-refs it))))
+          (try-let ((_ (drain c)))
+            (Ok (LModule @(. c out))))))))
+
+(defun root-items :private (c: Cut pi: (Map str LItem) roots: (Vec (Pair str str))) -> (Result unit str)
+  (loop ((i 0))
+    (if (>= i (count roots))
+        (Ok ())
+        (let ((r (nth roots i)))
+          (match (get pi (. r fst))
+            ((some (ItDefine fd))
+             (do (emit-item c (ItDefine (rename-define fd (. r snd))))
+                 (want c (item-refs (ItDefine fd)))
+                 (recur (+ i 1))))
+            (_ (Err (str "live: the input's program does not define " (. r fst)))))))))
+
+;; ---- the expression's entry
+
+;; A `ccc` entry `name` that calls `body` (a `tailcc` function of no parameters) and returns the first word of its result (the value of a
+;; function that returns `{ i64, ptr }` under the catching convention, or the `i64` itself).
+(defun entry-item (name: str body: str ty: LFnType) -> LItem
+  (let ((call (n/call body []))
+        (value (match (. ty ret)
+                 ((some (TAnon _)) (n/extract call 0))
+                 (_ call))))
+    (ItDefine (f/external (f/make name (some ty-i64) [] cc-c [(f/block "entry" [(n/ret (some value))])])))))
+
+;; ---- the tables
+
+;; The row name of a type-table row (its third field, the type's name).
+(defun row-name (row: LExpr) -> str
+  (match (. row kind)
+    ((KStruct _ fields) (if (> (count fields) 2) (match (. (nth fields 2) kind) ((KStr bytes) (str-from-bytes bytes)) (_ "?")) "?"))
+    (_ "?")))
+
+;; The function `name` that stores rows `from`.. of each table of `program` into the resident tables (declared here as the base widened them).
+(defun append-item (program: LModule from: i64 name: str) -> (Result (Pair (Vec LItem) i64) str)
+  (let ((pi (index-of program)))
+    (let ((stores (vec (mapcat (fn (t: str) (table-stores pi t from)) tables)))
+          (n (match (get pi "fib.types") ((some (ItGlobal g)) (count (table-rows g))) (_ from))))
+      (Ok (Pair (into (mapv (fn (t: str) (table-decl pi t)) tables)
+                      [(ItDefine (f/external (f/make name nil [] cc-c [(f/block "entry" (conj stores (n/ret nil)))])))])
+                n)))))
+
+(defun table-decl :private (pi: (Map str LItem) t: str) -> LItem
+  (match (get pi t)
+    ((some (ItGlobal g)) (ItDeclareGlobal (LGlobalDecl t (TArray table-cap (elem-type (. g ty))) false 0)))
+    (_ (ItDeclareGlobal (LGlobalDecl t ty-i8 false 0)))))
+
+(defun table-stores :private (pi: (Map str LItem) t: str from: i64) -> (Vec LExpr)
+  (match (get pi t)
+    ((some (ItGlobal g))
+     (let ((rows (table-rows g)) (e (elem-type (. g ty))))
+       (mapv (fn (i: i64) (LExpr (KStore (nth rows i) (LExpr (KGep false e (n/global t) [(n/integer ty-i64 i)]) 0) false nil) 0))
+             (range from (count rows)))))
+    (_ [])))
+
+(defun table-length (program: LModule) -> i64
+  (match (get (index-of program) "fib.types") ((some (ItGlobal g)) (count (table-rows g))) (_ 0)))
+
+;; Whether the module holds anything a resident value could point at once its code is gone: a static (an immortal string or closure, a
+;; vtable), a lambda's code, or a type-table row's walkers.
+(defun pins? (m: LModule) -> bool
+  (some? (first (filterv (fn (it: LItem)
+                           (match it
+                             ((ItGlobal _) true)
+                             ((ItDefine fd) (or (s/starts-with? (. fd name) "l.") (s/starts-with? (. fd name) "drop.") (s/starts-with? (. fd name) "live.types.")))
+                             (_ false)))
+                         (. m items)))))

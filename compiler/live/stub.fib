@@ -1,0 +1,95 @@
+;; compiler/live/stub.fib: the indirection a live function is called through, as lIR text. PROTOTYPE (docs/design/live-repl.md).
+;;
+;; A function NAME of type TY that may be redefined while it runs is compiled under a versioned symbol (`NAME.vN`) and reached by every
+;; caller through the stub `NAME`, which has the function's own type and convention: the callers compiled earlier call `NAME` by name,
+;; as they would the function, so none of them is touched by a swap. The stub:
+;;
+;;   (global NAME.slot ptr)          the current version's address: ONE aligned pointer, written with a seq_cst atomic store by the swap
+;;                                   and read with a seq_cst atomic load by every call, so a call sees entirely one version
+;;   (global NAME.epoch i64)         the swap's generation: bumped after the slot is written
+;;   (global NAME.inflight [16 x i64]) two counters 64 bytes apart (words 0 and 8), one for each parity of the epoch: a call adds 1 to
+;;                                   the counter of the epoch it read before loading the slot and subtracts 1 after the callee returned
+;;
+;; The swap (live.swap) stores the new address, bumps the epoch and waits until the counter of the OLD parity is 0: every call that
+;; could have loaded the old address incremented that counter before its load (seq_cst, program order), so when the swap sees it at 0
+;; after the bump every such call has returned, and the old module can be freed (quiescence, as an RCU grace period). A call that read
+;; the old epoch after the bump increments the old counter too and only delays the swap; it loads the slot after its increment, so it
+;; sees the new address. Two atomic read-modify-writes per call is the price (measured in live.load: the cost table of FINDINGS.md).
+(ns live.stub
+  (:use lir.types))
+
+;; The names of the stub's three globals.
+(defun slot-name (name: str) -> str (str name ".slot"))
+(defun epoch-name (name: str) -> str (str name ".epoch"))
+(defun inflight-name (name: str) -> str (str name ".inflight"))
+
+;; `NAME.vN`: the symbol of version N.
+(defun version-name (name: str n: i64) -> str (str name ".v" n))
+
+(defun params-text :private (ty: LFnType) -> str
+  (str-join-with " " (vec (map (fn (i: i64) -> str (str "(" (type-str (nth (. ty params) i)) " a" i ")")) (range (count (. ty params)))))))
+
+(defun args-text :private (ty: LFnType) -> str
+  (str-join-with " " (vec (map (fn (i: i64) -> str (str "a" i)) (range (count (. ty params)))))))
+
+(defun cc-word :private (ty: LFnType) -> str
+  (match (. ty cc) ((CcTail) "tailcc ") (_ "")))
+
+;; The call through the slot: `(indirect-call p (fn CC RET (T..)) a..)`, then the return of its value.
+(defun call-and-return :private (ty: LFnType) -> str
+  (let ((call (str "(indirect-call p " (fn-type-str ty) (if (empty? (. ty params)) "" " ") (args-text ty) ")")))
+    (match (. ty ret)
+      ((some _) (str "(let ((r " call ")) (atomicrmw sub seq_cst c (i64 1)) (ret r))"))
+      (nil (str call " (atomicrmw sub seq_cst c (i64 1)) (ret)")))))
+
+;; The in-flight counters are sharded by thread: `shards` shards (a power of two) of two parities, each counter on a cache line of its
+;; own (8 words), a thread's shard the top bits of its pthread_self times the golden ratio. One shared counter costs 300 ns a call with
+;; 8 threads (the cache line bounces: measured, FINDINGS.md); sharded, a call touches a line that is mostly its own.
+(def shards: i64 16)
+
+(defun inflight-words () -> i64 (* shards 16))
+
+;; The word index of the counter of `shard` and `parity`.
+(defun counter-word (shard: i64 parity: i64) -> i64 (+ (* shard 16) (* parity 8)))
+
+;; The stub module for NAME : TY. With `counted` false the in-flight counters are not kept (the planted fault `no-count`: a swap then
+;; waits for nothing and frees code a call may be inside).
+(defun stub-source (name: str ty: LFnType counted: bool) -> str
+  (let ((inc (if counted "(atomicrmw add seq_cst c (i64 1))" ""))
+        (body (if counted (call-and-return ty) (uncounted-call ty))))
+    (str "(declare pthread_self ptr ())\n"
+         "(global " (slot-name name) " ptr (ptr null))\n"
+         "(global " (epoch-name name) " i64 (i64 0))\n"
+         "(global " (inflight-name name) " [" (inflight-words) " x i64] (zeroinitializer [" (inflight-words) " x i64]))\n"
+         "(define " (cc-word ty) "(" name " " (ret-str (. ty ret)) ") (" (params-text ty) ")\n"
+         "  (block entry\n"
+         "    (let ((e (atomic-load seq_cst i64 @" (epoch-name name) "))\n"
+         "          (shard (lshr (mul (ptrtoint i64 (call @pthread_self)) (i64 -7046029254386353131)) (i64 " (- 64 (shard-bits)) ")))\n"
+         "          (c (getelementptr i64 @" (inflight-name name) " (add (shl shard (i64 4)) (shl (and e (i64 1)) (i64 3))))))\n"
+         "      " inc "\n"
+         "      (let ((p (atomic-load seq_cst ptr @" (slot-name name) ")))\n"
+         "        " body "))))\n")))
+
+(defun shard-bits :private () -> i64
+  (loop ((b 0)) (if (>= (shl 1 b) shards) b (recur (+ b 1)))))
+
+(defun uncounted-call :private (ty: LFnType) -> str
+  (let ((call (str "(indirect-call p " (fn-type-str ty) (if (empty? (. ty params)) "" " ") (args-text ty) ")")))
+    (match (. ty ret)
+      ((some _) (str "(ret " call ")"))
+      (nil (str call " (ret)")))))
+
+;; The helpers the swap calls through native.call (fibber cannot make an atomic store to an address of its own): all `ccc`.
+;;   live.rt.store SLOT V         seq_cst store of V as a pointer
+;;   live.rt.store-two-step SLOT V   null first, then V: the planted fault `two-step` (a call between the two stores calls address 0)
+;;   live.rt.fetch-add P D        atomicrmw add, the old value
+;;   live.rt.load P               seq_cst load
+;;   live.rt.yield                sched_yield, for the wait loop
+(defun helpers-source () -> str
+  "(declare sched_yield i32 ())
+(define (live.rt.store void) ((ptr slot) (i64 v)) (block entry (atomic-store seq_cst (inttoptr ptr v) slot) (ret)))
+(define (live.rt.store-two-step void) ((ptr slot) (i64 v)) (block entry (atomic-store seq_cst (ptr null) slot) (atomic-store seq_cst (inttoptr ptr v) slot) (ret)))
+(define (live.rt.fetch-add i64) ((ptr p) (i64 d)) (block entry (ret (atomicrmw add seq_cst p d))))
+(define (live.rt.load i64) ((ptr p)) (block entry (ret (atomic-load seq_cst i64 p))))
+(define (live.rt.yield void) () (block entry (call @sched_yield) (ret)))
+")

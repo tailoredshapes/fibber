@@ -1,0 +1,106 @@
+;; compiler/live/load.fib: the swap under load, at the lIR level. PROTOTYPE (docs/design/live-repl.md).
+;; N threads (pthreads started on the JIT's worker function) call `handler` through its stub in a loop while this thread swaps it
+;; `swaps` times between two bodies; each body answers x*1000 + its tag (1 or 2) after a little work. A thread counts its calls, the
+;; answers that are of neither body (a torn call, a wrong ABI, a stale pointer that still runs), and how often the tag changed (so the
+;; swaps were seen). A freed body that is still called, or a null slot, ends the process by a signal: the check script reads the status.
+(ns live.load
+  (:use lir.types lir.ast)
+  (:require [live.jit :as lj] [live.swap :as sw] [llvm.ffi :as ffi]))
+
+(extern pthread_create :private (ptr ptr ptr ptr) -> i32)
+(extern pthread_join :private (i64 ptr) -> i32)
+
+;; Version `tag`: x*1000 + tag after `work` dependent multiplications (so a call is long enough to be inside when a swap lands).
+(defun body-source (name: str tag: i64 work: i64) -> str
+  (str "(define (" name " i64) ((i64 x))\n"
+       "  (block entry (br loop))\n"
+       "  (block loop (let ((i (phi i64 (entry (i64 0)) (loop i2))) (acc (phi i64 (entry x) (loop acc2))))\n"
+       "    (let ((i2 (add i (i64 1))) (acc2 (add (mul acc (i64 3)) (i64 1))))\n"
+       "      (br (icmp slt i2 (i64 " work ")) loop done))))\n"
+       "  (block done (ret (add (mul x (i64 1000)) (select (icmp eq acc2 (i64 123456789)) (i64 999) (i64 " tag "))))))\n"))
+
+;; The worker: calls `callee` with 7 until the record's word 0 is set; words 1 bad, 2 calls, 3 changes, 4 last tag.
+(defun worker-source (fname: str callee: str) -> str
+  (str "(declare " callee " i64 (i64))\n"
+       "(define (" fname " ptr) ((ptr rec))\n"
+       "  (block entry (br loop))\n"
+       "  (block loop (br (icmp ne (atomic-load seq_cst i64 rec) (i64 0)) done body))\n"
+       "  (block body\n"
+       "    (let ((r (call @" callee " (i64 7))) (tag (sub r (i64 7000))) (calls (getelementptr i64 rec (i64 2))))\n"
+       "      (store (add (load i64 calls) (i64 1)) calls)\n"
+       "      (br (or (icmp eq tag (i64 1)) (icmp eq tag (i64 2))) ok bad)))\n"
+       "  (block bad (let ((p (getelementptr i64 rec (i64 1)))) (store (add (load i64 p) (i64 1)) p) (br loop)))\n"
+       "  (block ok (let ((lastp (getelementptr i64 rec (i64 4))) (last (load i64 lastp)))\n"
+       "    (store tag lastp)\n"
+       "    (br (icmp ne last tag) changed loop)))\n"
+       "  (block changed (let ((ch (getelementptr i64 rec (i64 3)))) (store (add (load i64 ch) (i64 1)) ch) (br loop)))\n"
+       "  (block done (ret (ptr null))))\n"))
+
+(defstruct Thread (tid: ptr rec: ptr))
+
+(defun start-thread :private (worker: i64) -> (Result Thread str)
+  (let ((rec (ffi/words-new [0 0 0 0 0 0 0 0])) (tid (ffi/slot-new)))
+    (if (= (unsafe (pthread_create tid (ffi/addr->ptr 0) (ffi/addr->ptr worker) rec)) 0i32)
+        (Ok (Thread tid rec))
+        (Err "pthread_create failed"))))
+
+(defun stop-and-join :private (t: Thread) -> (Vec i64)
+  (do (unsafe (store-i64 (. t rec) 1))
+      (unsafe (pthread_join (load-i64 (. t tid)) (ffi/addr->ptr 0)))
+      (mapv (fn (i: i64) (unsafe (load-i64 (ptr+ (. t rec) (* 8 i))))) [1 2 3])))
+
+(defstruct Outcome (swaps: i64 swap-ns: i64 calls: i64 bad: i64 changes: i64 waits: i64 spins: i64 wall-ns: i64))
+
+(defun fixed-body :private (tag: i64) -> str
+  (body-source (str "handler.direct" tag) tag 16))
+
+;; Body 2 with another signature (a second parameter, added to the answer): what a swap must refuse, since the callers pass one argument.
+(defun mismatched-source (work: i64) -> str
+  (str "(define (handler i64) ((i64 x) (i64 y))\n"
+       "  (block entry (ret (add (mul x (i64 1000)) (add (i64 2) y)))))\n"))
+
+;; Swaps `handler` `swaps` times between the two bodies while `threads` workers call it; the counts. With `direct`, the workers call a
+;; resident copy of body 1 directly (no stub), for the cost of the stub against a plain call. With `mismatch`, body 2 has another signature.
+(defun run-load (r: sw/Registry threads: i64 swaps: i64 work: i64 direct: bool mismatch: bool) -> (Result Outcome str)
+  (let ((j (. r j)))
+    (try-let ((l (sw/define-live r "handler" (LFnType CcC (some ty-i64) [ty-i64] false)))
+              (m1 (lj/parse-module (body-source "handler" 1 work)))
+              (m2 (lj/parse-module (if mismatch (mismatched-source work) (body-source "handler" 2 work))))
+              (_ (sw/swap r l m1 false))
+              (_ (lj/add-resident-source j "handler.direct" (fixed-body 1)))
+              (_ (lj/add-resident-source j "live.worker" (worker-source "live.worker" (if direct "handler.direct1" "handler"))))
+              (worker (lj/address j "live.worker"))
+              (ts (start-threads worker threads)))
+      (let ((t0 (sys-clock-now)))
+        (try-let ((ns (swap-loop r l m1 m2 swaps)))
+          (let ((counts (mapv stop-and-join ts)) (wall (- (sys-clock-now) t0)))
+            (Ok (Outcome swaps ns (sum-of counts 1) (sum-of counts 0) (sum-of counts 2) @(. r waits) @(. r spins) wall))))))))
+
+(defun start-threads :private (worker: i64 n: i64) -> (Result (Vec Thread) str)
+  (loop ((i 0) (acc []))
+    (if (>= i n)
+        (Ok acc)
+        (match (start-thread worker)
+          ((Err m) (Err m))
+          ((Ok t) (recur (+ i 1) (conj acc t)))))))
+
+(defun sum-of :private (rows: (Vec (Vec i64)) k: i64) -> i64
+  (reduce (fn (acc: i64 row: (Vec i64)) (+ acc (nth row k))) 0 rows))
+
+;; `swaps` swaps, alternating the bodies; the nanoseconds they took.
+(defun swap-loop :private (r: sw/Registry l: sw/Live m1: LModule m2: LModule swaps: i64) -> (Result i64 str)
+  (let ((t0 (sys-clock-now)))
+    (loop ((i 0))
+      (if (>= i swaps)
+          (Ok (- (sys-clock-now) t0))
+          (match (sw/swap r l (if (= (bit-and i 1) 0) m2 m1) false)
+            ((Err m) (Err m))
+            ((Ok _) (recur (+ i 1))))))))
+
+(defun report (o: Outcome threads: i64 fault: str) -> bool
+  (let ((ok (and (= (. o bad) 0) (> (. o changes) 0) (> (. o calls) 0))))
+    (do (println (str "swaps: " (. o swaps) " in " (quot (. o swap-ns) 1000000) " ms, mean " (quot (. o swap-ns) (max 1 (* 1000 (. o swaps)))) " us each; grace periods waited " (. o waits) ", spins " (. o spins)))
+        (println (str "calls: " (. o calls) " by " threads " threads, bad " (. o bad) ", tag changes seen " (. o changes)
+                      ", " (quot (* (. o calls) 1000) (max 1 (quot (. o wall-ns) 1000000))) " calls/s"))
+        (println (str "load " (if (= fault "") "" (str "(fault " fault ") ")) (if ok "PASS" "FAIL")))
+        ok)))
