@@ -21,7 +21,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_CHECK_CACHE` | [compiler/driver/front.fib:114](../../compiler/driver/front.fib#L114) |
 | `FIB_C_LINES` | [compiler/driver/viac.fib:47](../../compiler/driver/viac.fib#L47) |
 | `FIB_EMIT_EXE` | [compiler/driver/commands.fib:14](../../compiler/driver/commands.fib#L14) |
-| `FIB_EXPORTS` | [compiler/emit/compile.fib:179](../../compiler/emit/compile.fib#L179) |
+| `FIB_EXPORTS` | [compiler/emit/compile.fib:194](../../compiler/emit/compile.fib#L194) |
 | `FIB_JS_ARGV0` | [compiler/lir2js.fib:60](../../compiler/lir2js.fib#L60) |
 | `FIB_JS_RT` | [compiler/lir2js.fib:46](../../compiler/lir2js.fib#L46) |
 | `FIB_JS_UNLINK` | [compiler/lir2js.fib:59](../../compiler/lir2js.fib#L59) |
@@ -45,9 +45,9 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LIVE_EMIT` | [compiler/emit/program.fib:85](../../compiler/emit/program.fib#L85) |
 | `FIB_LIVE_LIBS` | [compiler/fibc.fib:114](../../compiler/fibc.fib#L114) |
 | `FIB_LIVE_OWN_UID` | [compiler/serve/livesock.fib:80](../../compiler/serve/livesock.fib#L80) |
-| `FIB_LIVE_QUEUE` | [compiler/emit/program.fib:236](../../compiler/emit/program.fib#L236) |
+| `FIB_LIVE_QUEUE` | [compiler/emit/program.fib:266](../../compiler/emit/program.fib#L266) |
 | `FIB_LIVE_ROOTS` | [compiler/driver/front.fib:68](../../compiler/driver/front.fib#L68) |
-| `FIB_LIVE_SOCKET` | [compiler/serve/live.fib:271](../../compiler/serve/live.fib#L271) |
+| `FIB_LIVE_SOCKET` | [compiler/serve/live.fib:278](../../compiler/serve/live.fib#L278) |
 | `FIB_LIVE_WITH` | [compiler/fibc.fib:67](../../compiler/fibc.fib#L67) |
 | `FIB_LOG` | [lib/fib/log/core.fib:126](../../lib/fib/log/core.fib#L126) |
 | `FIB_LOG_ASYNC` | [lib/fib/log/config.fib:32](../../lib/fib/log/config.fib#L32) |
