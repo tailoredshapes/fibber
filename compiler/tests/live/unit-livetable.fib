@@ -1,8 +1,9 @@
-(ns main (:require [serve.livetable :as lt] [emit.program :as ep] [emit.statics :as st]))
+(ns main (:require [serve.livetable :as lt] [serve.livesplit :as sp] [emit.program :as ep] [emit.statics :as st]))
 ;; The names of the live table (serve.livetable) and the statics numbered per program (emit.statics `program-static?`): a nested closure
 ;; literal (`l.l.CODE.gK.N.M`) carries its generation and its family as the outer one does, a library literal and a table-append function
-;; carry none, and a quoted form `q.N` is a program's own static as a closure constant and a vtable are, while a string, a constant def
-;; and a slot are the session's. Built and run by compiler/tests/live/quotes.sh (no LLVM). Exit 0 when every check holds.
+;; carry none, and a quoted form `q.N` is a program's own static, while a closure constant and a vtable (named by content in live mode,
+;; LE2), a string, a constant def and a slot are the session's; a closure constant of a generation's literal goes with that generation's
+;; code (serve.livesplit `code-static?`), one of a stub does not. Built and run by compiler/tests/live/quotes.sh (no LLVM). Exit 0 when every check holds.
 (defun check (name: str ok: bool) -> i64
   (do (println (str (if ok "ok " "FAIL ") name)) (if ok 0 1)))
 
@@ -22,11 +23,13 @@
 
 (defun checks-statics () -> i64
   (+ (check "a quoted form is the program's own" (st/program-static? "q.8"))
-     (+ (check "a closure constant is the program's own" (st/program-static? "clo.0"))
-        (+ (check "a vtable is the program's own" (st/program-static? "vt.1"))
-           (+ (check "a string is the session's" (not (st/program-static? "str.8")))
-              (+ (check "a constant def is the session's" (not (st/program-static? "def.3")))
-                 (check "a slot is the session's" (not (st/program-static? "live.f.edited")))))))))
+     (+ (check "a closure constant is shared by name" (and (st/shared-static? "clo.f.edited.owned") (not (st/program-static? "clo.f.edited.owned"))))
+        (+ (check "a vtable is shared by name" (and (st/shared-static? "vt.main.Shape.vt.Sq") (not (st/program-static? "vt.main.Shape.vt.Sq"))))
+           (+ (check "a closure of a generation's literal goes with its code" (sp/code-static? "clo.l.f.edited.g2.31411"))
+              (+ (check "a closure of a stub and a vtable are data" (not (or (sp/code-static? "clo.f.edited.owned") (sp/code-static? "vt.main.Shape.vt.Sq"))))
+                 (+ (check "a string is the session's" (not (or (st/program-static? "str.8") (st/shared-static? "str.8"))))
+                    (+ (check "a constant def is the session's" (not (st/program-static? "def.3")))
+                       (check "a slot is the session's" (not (st/program-static? "live.f.edited")))))))))))
 
 (defun main () -> i64
   (let ((bad (+ (checks-names) (checks-statics))))

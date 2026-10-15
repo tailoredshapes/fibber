@@ -1,0 +1,29 @@
+(ns main (:require [fib.unix :as u]))
+;; The program of compiler/tests/live/statics.sh (package LE2 of docs/design/live-incremental.md 2.2 item 3): closure constants and
+;; vtables named by content in live mode. A constant def holds three named functions as values (`ops`), `apply-op` calls through it, a
+;; protocol has two instances called through `(dyn Shape)`, `pick` makes a closure in a body (after the defs' closures, so a program
+;; that numbered its closures would give the next number to another code), and `cube` is never a value in the base (a swapped body makes
+;; the first closure of it). `main` waits until `stop` is set through the attach socket.
+(defprotocol Shape (area (self) -> i64))
+(defrecord Sq (side: i64))
+(defrecord Rect (w: i64 h: i64))
+(impl Shape Sq (area (self) (* (. self side) (. self side))))
+(impl Shape Rect (area (self) (* (. self w) (. self h))))
+
+(defun inc1 (n: i64) -> i64 (+ n 1))
+(defun dbl (n: i64) -> i64 (* n 2))
+(defun neg (n: i64) -> i64 (- 0 n))
+(defun cube (n: i64) -> i64 (* n (* n n)))
+(def ops: (Vec (fn (i64) i64)) [inc1 dbl neg])
+(defun sq1 (n: i64) -> i64 (+ (* n n) 1))
+(def stop: (Atom bool) (atom false))
+
+(defun apply-op (i: i64 n: i64) -> i64 ((nth ops i) n))
+(defun pick () -> (fn (i64) i64) sq1)
+(defun shape-area (s: (dyn Shape)) -> i64 (area s))
+(defun areas () -> i64 (+ (shape-area (dyn Shape (Sq 3))) (shape-area (dyn Shape (Rect 2 5)))))
+
+(defun main () -> i64
+  (do (println (str "app: ready " (apply-op 0 1) " " (apply-op 1 1) " " (apply-op 2 1) " " (cube 2) " " ((pick) 2) " " (areas)))
+      (loop () (if @stop () (do (u/sleep-ns 20000000) (recur))))
+      0))

@@ -23,12 +23,12 @@
         (do (is cs (= [(statics-string s "hi" 0) (statics-string s "hi" 0) (statics-string s "" 0) (statics-string s "ab" 3)]
                       ["@str.0" "@str.0" "@str.1" "@str.2"]) "a string is named @str.N by first use and shared")
             (is cs (= [(statics-keyword s "a") (statics-keyword s "b") (statics-keyword s "a")] [0 1 0]) "keywords of another table are numbered from 0")
-            (is cs (= [(statics-closure s "f.g.owned" 3) (statics-closure s "f.h" 4) (statics-closure s "f.g.owned" 3)]
+            (is cs (= [(statics-closure s "f.g.owned" 3 false) (statics-closure s "f.h" 4 false) (statics-closure s "f.g.owned" 3 false)]
                       ["@clo.0" "@clo.1" "@clo.0"]) "closures are named @clo.N by their code, shared, in order")
             (is cs (= (statics-closure-names s) ["@clo.0" "@clo.1"]) "closure-names")
-            (is cs (and (= (statics-vtable s "Show.str" ["@m.Show.show.str"]) "@vt.0")
-                        (= (statics-vtable s "Show.str" ["@other"]) "@vt.0")
-                        (= (statics-vtable s "Eq.str" ["@a" "@b"]) "@vt.1")
+            (is cs (and (= (statics-vtable s "Show.str" ["@m.Show.show.str"] false) "@vt.0")
+                        (= (statics-vtable s "Show.str" ["@other"] false) "@vt.0")
+                        (= (statics-vtable s "Eq.str" ["@a" "@b"] false) "@vt.1")
                         (statics-has-vtable s "Eq.str") (not (statics-has-vtable s "Show.i64"))) "vtables are named @vt.N by their name; has-vtable")
             (is cs (= (statics-render s)
                       (normal/text (str-join
@@ -44,17 +44,25 @@
             (is cs (= (statics-render s)
                       (normal/text "(constant internal str.0 { i64 i32 i32 i64 [3 x i8] } { (i64 0) (i32 0) (i32 8) (i64 2) ([3 x i8] (i8 97) (i8 98) (i8 0)) })\n")) "ORACLE: the string \"ab\" of case 106")))
       (let ((s (statics-new)))
-        (do (statics-closure s "f.fib.core.num.even?.owned.i64" 6)
+        (do (statics-closure s "f.fib.core.num.even?.owned.i64" 6 false)
             (is cs (= (statics-render s)
                       (normal/text "(constant internal clo.0 { i64 i32 i32 ptr } { (i64 0) (i32 6) (i32 8) @f.fib.core.num.even?.owned.i64 })\n")) "ORACLE: the immortal closure of a named function")))
       (let ((s (statics-new)))
-        (do (statics-vtable s "Show.Named" ["@m.fib.builtin.Show.show.Named"])
+        (do (statics-vtable s "Show.Named" ["@m.fib.builtin.Show.show.Named"] false)
             (is cs (= (statics-render s) (normal/text "(constant internal vt.0 [1 x ptr] ([1 x ptr] @m.fib.builtin.Show.show.Named))\n")) "ORACLE: a vtable of one slot")))
       (let ((s (statics-new)))
         (do (statics-string s "a\"b\\c\né" 0)
             (is cs (= (statics-render s)
                       (normal/text (str-join ["(constant internal str.0 { i64 i32 i32 i64 [9 x i8] } { (i64 0) (i32 0) (i32 8) (i64 8) ([9 x i8] "
                                  "(i8 97) (i8 34) (i8 98) (i8 92) (i8 99) (i8 10) (i8 195) (i8 169) (i8 0)) })\n"]))) "the bytes of a string: a quote, a backslash, a line break, a two-byte character")))
+      (let ((s (statics-new)))
+        (is cs (= [(statics-closure s "f.g.owned" 3 true) (statics-closure s "l.f.h.g2.0" 4 true) (statics-closure s "f.g.owned" 3 true)
+                   (statics-vtable s "Show.vt.str" ["@m.Show.show.str"] true) (statics-vtable s "Show.vt.str" [] true)]
+                  ["@clo.f.g.owned" "@clo.l.f.h.g2.0" "@clo.f.g.owned" "@vt.Show.vt.str" "@vt.Show.vt.str"])
+            "live mode (LE2): a closure is named @clo.CODE and a vtable @vt.NAME, the same in every program of a session"))
+      (is cs (and (shared-static? "clo.f.g.owned") (shared-static? "vt.Show.vt.str") (not (shared-static? "q.3")) (not (shared-static? "str.0"))
+                  (program-static? "q.3") (not (program-static? "clo.f.g.owned")))
+          "closures and vtables are shared by name; a quoted form is the program's own")
       (is cs (= (statics-render (statics-new)) "") "nothing to render is empty")
       (rec-steps cs))))
 

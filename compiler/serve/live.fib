@@ -145,10 +145,13 @@
                                        (Pair "pinned_text" (j/json-str (lr/pinned-text rd))) (Pair "defs" (defs-json (. l sx)))
                                        (Pair "generation" (j/json-int (lsw/generation (. l sx))))]))))))
 
+;; Under FIB_LIVE_DEBUG=cut the answer has `cut`: the names the input's cuts defined (LE2's test reads that a swap declares the base's
+;; closures and vtables rather than copying them).
 (defun op-eval :private (l: Live r: p/Req) -> str
   (match (p/field-str r "text")
     (nil (p/error-response r "bad-request" "eval needs a string `text`"))
-    ((some text) (answer-json l r (lsw/input (. l sx) text)))))
+    ((some text) (let ((_ (ls/take-cut (. l sx))) (f (answer-fields l (lsw/input (. l sx) text))))
+                   (p/response r (. f fst) (if (ls/cut-debug?) (conj (. f snd) (Pair "cut" (strs (ls/take-cut (. l sx))))) (. f snd)))))))
 
 (defun op-type :private (l: Live r: p/Req) -> str
   (match (p/field-str r "expr")
@@ -198,9 +201,10 @@
     (j/json-obj [(Pair "redefined" (j/json-int (. d redefined))) (Pair "retiring" (j/json-int (count (. d retired))))
                  (Pair "dropped" (j/json-int (. d dropped))) (Pair "immortal" (j/json-int (. d immortal)))])))
 
+;; With `statics: true`, `statics`: the closure constants and vtables of the running program by name (LE2: one per code, one per instance).
 (defun op-status :private (l: Live r: p/Req) -> str
   (let ((sx (. l sx)))
-    (p/response r true [(Pair "generation" (j/json-int (lsw/generation sx)))
+    (p/response r true (into (if (p/field-bool r "statics") [(Pair "statics" (strs (ls/shared-statics sx)))] []) [(Pair "generation" (j/json-int (lsw/generation sx)))
                         (Pair "generations" (j/json-obj [(Pair "count" (j/json-int (+ 1 (lt/generations-kept @(. sx table))))) (Pair "kept" (j/json-int (ls/modules-kept sx)))
                                                          (Pair "functions" (j/json-int (lt/family-count @(. sx table))))]))
                         (Pair "values" (j/json-obj [(Pair "resident" (strs (ls/resident-names sx))) (Pair "count" (j/json-int (count (ls/resident-names sx))))]))
@@ -208,7 +212,7 @@
                         (Pair "tests" (ltt/tests-json (. l tests))) (Pair "watch" (lwt/watch-json (. l watch)))
                         (Pair "loaded" (loaded-json l)) (Pair "live" (j/json-str (ll/rule-text (. l loads) sx)))
                         (Pair "inputs" (j/json-int (ls/inputs-made sx))) (Pair "requests" (j/json-int @(. l served)))
-                        (Pair "pid" (j/json-int (sk/process-id))) (Pair "socket" (j/json-str (. l path)))])))
+                        (Pair "pid" (j/json-int (sk/process-id))) (Pair "socket" (j/json-str (. l path)))]))))
 
 ;; `test` (serve.livetest, package LT2) answers later, from `finish` in the connection loop: "" here is no answer yet.
 (defun dispatch :private (l: Live r: p/Req conn: i64) -> str
