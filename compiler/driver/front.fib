@@ -6,7 +6,7 @@
 ;; `MacroNeedsEvaluator` record on stderr, exit 1), `front-check` being the one place that expands. The reason a file or a module cannot be read is the operating system's, asked for as Rust prints it (driver.native `fault-of`).
 (ns driver.front
   (:require [syntax.dump :as sdump] [expand.modules :as mods] [expand.maker :as mk] [types.driver :as td] [emit.compile :as ec] [driver.native :as native] [native.target :as nt]
-            [expand.shared :as sh] [own.staged :as st] [fib.string :as s])
+            [expand.shared :as sh] [own.staged :as st] [fib.string :as s] [emit.live :as live] [pkg.modules :as md] [pkg.paths :as pp])
   (:use syntax.form expand.error expand.types expand.ctx expand.roots own.error own.program own.driver types.target))
 
 ;; The exit statuses of a program the compiler stops at. Rust: harness/child.rs EXIT_REJECTED, EXIT_UNSUPPORTED, EXIT_COMPILE_FAILED
@@ -60,6 +60,14 @@
     ((CeInternal m) (FrontFailed m))
     (_ (FrontRejected (check-error-text e)))))
 
+;; The live module rule of a project (emit.live `program-module?`, docs/design/live-meshql.md 4): with FIB_LIVE_ROOTS set (fibc sets it in
+;; a project), the modules whose file is under one of its directories are the live ones; unset, emit.live keeps its name rule.
+(defun note-live-modules :private (loaded: (Vec Loaded)) -> unit
+  (live/set-live-modules
+    (match (sys-getenv "FIB_LIVE_ROOTS")
+      (nil nil)
+      ((some text) (some (md/live-modules (mapv (fn (l: Loaded) (Pair (. (. l spec) ns) (. l file))) loaded) (pp/split-on text ":")))))))
+
 ;; Reads, expands, types and checks `source` (named `file` in positions), its modules looked for in `roots`, exactly as the Rust
 ;; front end does before it lowers. Rust: front.rs:45 `check_in`
 (defun front-check (source: str file: str roots: Roots rm: mk/RunnerMaker demand: bool) -> Front
@@ -70,7 +78,7 @@
        (match (mods/try-load-in source file roots)
          ((Err e) (FrontRejected (load-failure e roots)))
          ((Ok loaded)
-          (match (let ((t0 (sys-clock-now)) (r (mods/expand-all loaded ctx (mk/maker-runner rm prelude loaded))))
+          (match (let ((t0 (sys-clock-now)) (_ (note-live-modules loaded)) (r (mods/expand-all loaded ctx (mk/maker-runner rm prelude loaded))))
                    (do (td/phase-note "front.expand" t0) r))
             ((Err e) (expand-stop e file))
             ((Ok modules)

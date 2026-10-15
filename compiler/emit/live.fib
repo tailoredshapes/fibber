@@ -19,10 +19,24 @@
 ;; `live.NAME`: the slot the stub of NAME loads.
 (defun slot-name (name: str) -> str (str "live." name))
 
-;; Whether module `m` is the program's own: not the builtins, the prelude or a library module (the loader's own rule, expand.modules
-;; `sees-implicit`: a library module is one the implicit modules are not given to).
+;; The modules whose bodies are live, by name, when the program is compiled in a project (docs/design/live-meshql.md 4, package LT3):
+;; the driver (driver.front `note-live-modules`) sets them from FIB_LIVE_ROOTS, which `fibc` fills in a project with its own roots
+;; (`deps.fib` :paths, with `test` its test paths) and, under `--live-deps` (FIB_LIVE_DEPS), the libraries' (pkg.modules `live-roots`),
+;; so that a dependency's code stays a direct call unless asked for. `nil` (outside a project, or a session that never set it) is the
+;; name rule below: every module not named `fib.*` is the program's.
+(def live-modules: (Atom (Option (Set str))) (atom nil))
+
+(defun set-live-modules (names: (Option (Set str))) -> unit
+  (reset! live-modules names))
+
+;; Whether module `m` is the program's own: not the builtins or the prelude, and, in a project, the main module or one of
+;; `live-modules`; elsewhere a module that is not the library's (the loader's own rule, expand.modules `sees-implicit`: a library module
+;; is one the implicit modules are not given to).
 (defun program-module? (g: Globals m: i64) -> bool
-  (and (not (= m module-builtin)) (not (= m module-prelude)) (mods/sees-implicit (g-module-name g m) (mods/implicit-lib))))
+  (and (not (= m module-builtin)) (not (= m module-prelude))
+       (match @live-modules
+         (nil (mods/sees-implicit (g-module-name g m) (mods/implicit-lib)))
+         ((some names) (or (= m @(. g main)) (contains? names (g-module-name g m)))))))
 
 (defun key-module :private (g: Globals key: BodyKey) -> (Option i64)
   (match key
