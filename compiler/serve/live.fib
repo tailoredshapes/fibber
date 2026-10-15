@@ -1,0 +1,180 @@
+;; compiler/serve/live.fib: `fibc run --live FILE [-- arg..]` (docs/design/live-repl.md 2.1 to 2.3, package LV1): the program runs in
+;; this process, as the base of a resident session (serve.livesess), and an attach socket (serve.livesock) answers requests about it
+;; while it runs: one JSON object per line in and out (serve.proto, the shapes of `fibc serve`), a connection open for many requests,
+;; one request at a time. Ops: `hello`, `eval` (`text`: what `fibc repl` takes), `type` (`expr`), `inspect` (`name`), `status`.
+;; Threads: the attach server runs on the driver's thread, which already holds the session (its engine and emitter are single-threaded
+;; state: a `Cell`-bearing struct cannot be given to `spawn`); the program's `main` runs on a thread of its own (`live.run`: the runtime's
+;; own main stack, rt/thread.lir `fib.run-main`), which says when it has ended (`done`) and wakes the accept. The design's 2.1 has the
+;; two the other way round; the mechanics are the same. The process ends as `fibc run` ends: the program's result printed, exit through
+;; the C library (what the program buffered is written). The socket is made before `main` is called, its path printed on standard error
+;; and set as FIB_LIVE_SOCKET for the program.
+(ns serve.live
+  (:require [serve.livesess :as ls] [serve.livesock :as lsk] [serve.sock :as sk] [serve.proto :as p] [serve.incr :as inc] [serve.diag :as dg]
+            [lsp.json :as j] [driver.native :as native] [driver.version :as v] [native.call :as call] [lair.ffi :as ffi]
+            [expand.roots :as roots] [expand.maker :as mk] [fib.unix :as unix] [fib.string :as s]))
+
+(defstruct Live (sx: ls/Sess listener: i64 path: str done: (Atom (Option i64)) served: (Cell i64)))
+
+(def poll-ms: i64 250)
+
+;; ---- answers
+
+(defun strs :private (xs: (Vec str)) -> j/JVal (j/JArr (mapv j/json-str xs)))
+
+(defun answer-json :private (r: p/Req a: ls/Answer) -> str
+  (match a
+    ((ls/Defined names st) (p/response r true [(Pair "defined" (strs names)) (Pair "generation" (j/json-int 0)) (Pair "stats" (p/stats-json st))]))
+    ((ls/Value text st stats)
+     (p/response r (= st 0) (into (match text ((some t) [(Pair "value" (j/json-str t))]) (nil []))
+                                  [(Pair "exit" (j/json-int st)) (Pair "stats" (p/stats-json stats))])))
+    ((ls/Failed m st) (p/response r false [(Pair "failed" (j/json-str m)) (Pair "exit" (j/json-int 134)) (Pair "trapped" (j/JBool true)) (Pair "stats" (p/stats-json st))]))
+    ((ls/Refused shown ds code) (p/response r false [(Pair "shown" (strs shown)) (Pair "diagnostics" (p/diags-json ds (map-empty))) (Pair "code" (j/json-str code))]))
+    ((ls/Broken m) (p/error-response r "internal" m))))
+
+(defun op-hello :private (l: Live r: p/Req) -> str
+  (p/response r true [(Pair "pid" (j/json-int (sk/process-id))) (Pair "program" (j/json-str (. (. l sx) file))) (Pair "generation" (j/json-int 0))
+                      (Pair "version" (j/json-str v/version)) (Pair "catching" (j/JBool true))]))
+
+(defun op-eval :private (l: Live r: p/Req) -> str
+  (match (p/field-str r "text")
+    (nil (p/error-response r "bad-request" "eval needs a string `text`"))
+    ((some text) (answer-json r (ls/input (. l sx) text)))))
+
+(defun op-type :private (l: Live r: p/Req) -> str
+  (match (p/field-str r "expr")
+    (nil (p/error-response r "bad-request" "type needs a string `expr`"))
+    ((some expr) (match (ls/type-of (. l sx) expr)
+                   ((Ok t) (p/response r true [(Pair "type" (j/json-str t))]))
+                   ((Err lines) (p/response r false [(Pair "shown" (strs lines)) (Pair "code" (j/json-str "check"))]))))))
+
+;; `inspect`: the value of the name (as `eval` prints it) and its type.
+(defun op-inspect :private (l: Live r: p/Req) -> str
+  (match (p/field-str r "name")
+    (nil (p/error-response r "bad-request" "inspect needs a string `name`"))
+    ((some name)
+     (match (ls/input (. l sx) name)
+       ((ls/Value text st stats)
+        (p/response r true (into (match text ((some t) [(Pair "value" (j/json-str t))]) (nil []))
+                                 [(Pair "type" (j/json-str (match (ls/type-of (. l sx) name) ((Ok t) t) ((Err _) "?")))) (Pair "generation" (j/json-int 0))
+                                  (Pair "stats" (p/stats-json stats))])))
+       (other (answer-json r other))))))
+
+(defun op-status :private (l: Live r: p/Req) -> str
+  (let ((sx (. l sx)))
+    (p/response r true [(Pair "generation" (j/json-int 0))
+                        (Pair "generations" (j/json-obj [(Pair "count" (j/json-int 1)) (Pair "kept" (j/json-int (ls/modules-kept sx)))]))
+                        (Pair "values" (j/json-obj [(Pair "resident" (strs (ls/resident-names sx))) (Pair "count" (j/json-int (count (ls/resident-names sx))))]))
+                        (Pair "inputs" (j/json-int (ls/inputs-made sx))) (Pair "requests" (j/json-int @(. l served)))
+                        (Pair "pid" (j/json-int (sk/process-id))) (Pair "socket" (j/json-str (. l path)))])))
+
+(defun dispatch :private (l: Live r: p/Req) -> str
+  (let ((op (. r op)))
+    (do (set! (. l served) (+ @(. l served) 1))
+        (cond (= op "hello") (op-hello l r)
+              (= op "eval") (op-eval l r)
+              (= op "type") (op-type l r)
+              (= op "inspect") (op-inspect l r)
+              (= op "status") (op-status l r)
+              (= op "ping") (p/response r true [(Pair "pong" (j/JBool true))])
+              :else (p/error-response r "unknown-op" (str "unknown op `" op "`"))))))
+
+(defun handle-line :private (l: Live line: str) -> str
+  (match (p/parse-request line)
+    ((Err m) (p/bad-request m))
+    ((Ok r) (dispatch l r))))
+
+;; ---- connections
+
+(defun program-ended? :private (l: Live) -> bool (some? @(. l done)))
+
+;; A read error that leaves the connection usable (a line that is not UTF-8, or too long: consumed) is answered; any other ends it.
+(defun recoverable? :private (m: str) -> bool (or (s/starts-with? m "the line") (s/starts-with? m "the input")))
+
+;; One connection: a request per line, answered on the same line, until the peer closes or the program ends.
+(defun serve-connection :private (l: Live conn: i64) -> unit
+  (let ((c (sk/conn-new conn)))
+    (do (loop ()
+          (cond (program-ended? l) ()
+                (not (sk/wait-readable conn poll-ms)) (recur)
+                :else (match (sk/conn-read-line c)
+                        ((Ok nil) ())
+                        ((Err m) (if (recoverable? m)
+                                     (match (sk/write-line conn (p/bad-request m)) ((Ok _) (recur)) ((Err _) ()))
+                                     ()))
+                        ((Ok (some line)) (match (sk/write-line conn (handle-line l line)) ((Ok _) (recur)) ((Err _) ()))))))
+        (unix/fd-close conn)
+        ())))
+
+;; The program's `def`s made (`live.main-body` is at its entry) before the first request reads one: at most five seconds, then as it is.
+(defun wait-ready :private (l: Live) -> unit
+  (loop ((n 0))
+    (when (and (not (ls/ready? (. l sx))) (not (program-ended? l)) (< n 500))
+      (do (unix/sleep-ns 10000000) (recur (+ n 1))))))
+
+;; The accept loop, until the program ends (its thread shuts the listener down: the accept fails) or the listener fails.
+(defun accept-loop :private (l: Live) -> unit
+  (loop ()
+    (if (program-ended? l)
+        ()
+        (match (sk/accept-unix (. l listener))
+          ((Err _) ())
+          ((Ok conn) (do (when (lsk/admit conn) (do (wait-ready l) (serve-connection l conn))) (recur)))))))
+
+;; ---- the program's thread
+
+;; The program's `main` on a thread of its own; when it returns, `done` holds its status and the listener is shut down.
+(defun start-program :private (addr: i64 done: (Atom (Option i64)) listener: i64) -> (Task i64)
+  (spawn (fn () -> i64
+           (let ((r (match (call/call-i64 addr []) ((Ok c) (bit-and c 255)) ((Err _) 5))))
+             (do (reset! done (some r)) (lsk/shutdown-socket listener) r)))))
+
+;; `argc` and `argv` for `fib.set-args`: NUL-terminated copies, kept for the life of the process (the program reads them as `(args)`).
+(defun program-args :private (words: (Vec str)) -> (Pair i64 i64)
+  (let ((copies (mapv (fn (w: str) (ffi/ptr->addr (ffi/bytes-new w))) words)))
+    (Pair (count words) (ffi/ptr->addr (ffi/words-new copies)))))
+
+;; ---- the command
+
+(defun say-lines :private (lines: (Vec str)) -> unit (doseq [x lines] (eprintln x)))
+
+;; The booted session on its socket (in a private directory): the path on standard error, `main` started on its thread, the requests
+;; answered until it ends; its status. The socket is unlinked at the end.
+(defun serve-program :private (sx: ls/Sess dir: str path: str) -> i64
+  (match (ls/run-address sx)
+    ((Err m) (do (eprintln (str "compile failed: " m)) 5))
+    ((Ok addr)
+     (match (lsk/listen-private dir path)
+       ((Err m) (do (eprintln (str "fibc: live: " m)) 2))
+       ((Ok listener)
+        (let ((l (Live sx listener path (atom nil) (cell 0))))
+          (do (eprintln (str "fibc: live at " path))
+              (let ((t (start-program addr (. l done) listener)))
+                (do (accept-loop l)
+                    (unix/fd-close listener) (unix/fd-unlink path)
+                    (join t))))))))))
+
+;; `fibc run --live FILE [-- arg..]`: the program checked and made resident (a program that does not check makes no socket), its
+;; runtime started (`--trace`: FIB_TRACE is set only now, after the compiler's own JIT sessions are up, as `fibc run` sets it after
+;; lowering; a later input that runs a macro traces that macro's session too), then the socket before `main`, its path in
+;; FIB_LIVE_SOCKET and on standard error, and an exit as `fibc run`'s.
+(defun run-live (file: str args: (Vec str) opt: i64 trace: bool rts: roots/Roots rm: mk/RunnerMaker) -> i64
+  (match (read-file file)
+    (nil (do (eprintln (str "fibc: cannot read " file)) 2))
+    ((some text)
+     (let ((dir (lsk/live-dir)) (pid (sk/process-id)))
+       (let ((path (lsk/socket-path dir pid)) (sx (ls/sess-new rts file opt (lsk/output-path dir pid))) (argv (program-args (into [file] args))))
+         (do (native/setenv-set "FIB_LIVE_SOCKET" path)
+             (match (ls/load-program sx text)
+               ((Err lines) (do (eprintln "rejected:") (say-lines lines) 3))
+               ((Ok _)
+                (match (ls/make-base sx rm)
+                  ((Err code) code)
+                  ((Ok _)
+                   (do (when trace (native/setenv-set "FIB_TRACE" "1"))
+                       (match (ls/boot sx (. argv fst) (. argv snd))
+                         ((Err m) (do (eprintln (str "compile failed: " m)) 5))
+                         ((Ok _)
+                          (let ((code (serve-program sx dir path)))
+                            (do (unix/fd-unlink (lsk/output-path dir pid))
+                                (sk/exit-flush code)
+                                code)))))))))))))))

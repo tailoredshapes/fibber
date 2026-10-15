@@ -12,11 +12,18 @@
 #                        may jump into code the swap has not finished writing (LV0). Until LV2's    golden names the acquire load; LV2's
 #                        swap stress exists this is killed by the text of hello's golden only, not  TSAN run is the kill that matters)
 #                        by a run
+#   value-reevaluated    a session `def` is not made resident: its slot is left in the input's      compiler/tests/live/attach.sh (the atom
+#                        module, so every later input gets a slot of its own, never initialised,    counter of the design's transcript does not
+#                        and the value of a `def` does not persist from one input to the next (LV1) answer 1 then 2: the second read is not of
+#                                                                                                   the same atom)
+#   trap-not-caught      an expression's entry runs without `live-guard` (the `try` of fib.ex):     compiler/tests/live/attach.sh (`(nth [1 2] 5)`
+#                        a trap in an input aborts the program instead of answering `failed` (LV1)  ends the program; the next input has nobody
+#                                                                                                   to answer it)
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-live-MODE),
-#              MUT_QUICK=1 runs stubs.sh --quick (hello's golden and the deep recursion; no case tables: kills both mutants in under a minute after the build).
+#              MUT_QUICK=1 runs stubs.sh --quick (hello's golden and the deep recursion; no case tables: kills both LV0 mutants in under a minute after the build).
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|value-reevaluated|trap-not-caught}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -37,17 +44,23 @@ case $MODE in
   stub-no-tailcall) patch compiler/emit/live.fib '  (if (tail-jump? ty)
       [(n/indirect-call (n/local "at") ty args true)]' '  (if false
       [(n/indirect-call (n/local "at") ty args true)]' ;;
-  stub-plain-load)  patch compiler/emit/live.fib '(n/node (la/KAtomicLoad la/ScSystem la/OAcquire lt/ty-ptr (n/global slot)))' '(n/load lt/ty-ptr (n/global slot) nil)' ;;
+  stub-plain-load)  patch compiler/emit/live.fib '(n/node (la/KAtomicLoad la/ScSystem la/OAcquire lt/ty-ptr (n/global slot)))' '(n/load lt/ty-ptr (n/global slot) nil)'; TEST=stubs ;;
+  value-reevaluated) patch compiler/serve/livesess.fib '      (if (empty? slots)
+          (Ok ())' '      (if true
+          (Ok ())'; TEST=attach ;;
+  trap-not-caught)  patch compiler/serve/livesess.fib '-> i64 (live-guard live-fd (fn () -> i64 (do "' '-> i64 ((fn () -> i64 (do "'; TEST=attach ;;
   *) echo "mutant-live: unknown mode $MODE" >&2; exit 2 ;;
 esac
+case $MODE in stub-*) TEST=stubs ;; esac
 cd "$OUT" || exit 2
 echo "mutant-live: building the $MODE mutant ..."
 ( ulimit -v 16000000; "$FIBC" build compiler/fibc.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o "$OUT/F" ) > "$OUT/build.log" 2>&1 \
   || { echo "mutant-live: the mutant does not build (see $OUT/build.log)"; tail -5 "$OUT/build.log"; exit 2; }
 cd "$R" || exit 2
 quick=(); [ "${MUT_QUICK:-}" = 1 ] && quick=(--quick)
-FIB_LIB="$R/lib" "$R/compiler/tests/live/stubs.sh" "$OUT/F" "${quick[@]}" > "$OUT/test.log" 2>&1
+if [ "$TEST" = stubs ]; then FIB_LIB="$R/lib" "$R/compiler/tests/live/stubs.sh" "$OUT/F" "${quick[@]}" > "$OUT/test.log" 2>&1
+else FIB_LIB="$R/lib" "$R/compiler/tests/live/attach.sh" "$OUT/F" > "$OUT/test.log" 2>&1; fi
 rc=$?
 grep -E '^FAIL' "$OUT/test.log" | head -5 || true  # pipe-ok: a short failure listing
-if [ $rc -ne 0 ]; then echo "mutant-live: $MODE KILLED by the stubs test (exit $rc)"; exit 0; fi
-echo "mutant-live: $MODE SURVIVED: the stubs test passed under the mutant"; exit 1
+if [ $rc -ne 0 ]; then echo "mutant-live: $MODE KILLED by the $TEST test (exit $rc)"; exit 0; fi
+echo "mutant-live: $MODE SURVIVED: the $TEST test passed under the mutant"; exit 1

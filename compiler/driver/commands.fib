@@ -2,7 +2,7 @@
 ;; `explain` (spec/compiler.md §1): each takes what the command line gave and the roots, prints what the Rust prints and returns
 ;; the exit status. The macro runner (`rm`, expand.maker) is the tool's: macros.runner by default, none with `--no-runner` (driver.front).
 (ns driver.commands
-  (:require [fib.string :as s] [types.targets :as tt] [llvm.target :as lt] [driver.front :as front] [expand.maker :as mk] [driver.native :as native] [driver.linkdecl :as ld] [driver.staticrun :as sr] [driver.viac :as viac] [emit.args :as ea] [emit.dump :as ed] [own.explain :as oe] [emit.compile :as ec] [lir.ast :as la])
+  (:require [fib.string :as s] [types.targets :as tt] [llvm.target :as lt] [driver.front :as front] [expand.maker :as mk] [driver.native :as native] [driver.linkdecl :as ld] [driver.staticrun :as sr] [driver.viac :as viac] [emit.args :as ea] [emit.dump :as ed] [own.explain :as oe] [emit.compile :as ec] [emit.program :as ep] [serve.live :as live] [lir.ast :as la])
   (:use expand.roots driver.args))
 
 ;; The message and status of a lIR module that lair stopped at. Rust: main.rs `fail`
@@ -36,9 +36,12 @@
           (if (= w 0) status w)))))
 
 ;; `run`: the module through the JIT, `main` called, its status the status. Rust: main.rs:154 `run`
+;; `--live` (FIB_LIVE, emit.program `live-mode?`): the program runs as the base of a resident session with an attach socket (serve.live,
+;; docs/design/live-repl.md); its front end is the session's engine, the macro runner the default one.
 (defun cmd-run (file: str trace: bool args: (Vec str) opt: i64 roots: Roots rm: mk/RunnerMaker) -> i64
   (cond (viac/via-c?) (viac/run-via-c file trace args opt roots rm)
         (sr/static-cases?) (sr/run-static file args opt roots rm)
+        (ep/live-mode?) (live/run-live file args opt trace roots rm)
         :else (cmd-run-jit file trace args opt roots rm)))
 
 (defun cmd-run-jit :private (file: str trace: bool args: (Vec str) opt: i64 roots: Roots rm: mk/RunnerMaker) -> i64

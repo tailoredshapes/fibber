@@ -1,0 +1,136 @@
+;; compiler/serve/liveclient.fib: `fibc repl --connect SOCK|PID [--json]` (docs/design/live-repl.md 2.4, package LV1): the client of a
+;; program started with `fibc run --live` (serve.live). The terminal form reads inputs as the REPL does (serve.line: editing on a
+;; terminal, plain lines from a pipe; an input continues while its brackets are open) and sends each as an `eval`, printing the value,
+;; `; failed: ..` for a caught trap, `; defined ..`, or the refusal's lines; `:type EXPR`, `:inspect NAME`, `:status`, `:help`, `:quit`.
+;; `--json` is the stdio form for an agent or an editor: one request per line in, forwarded as it is, one answer per line out. When
+;; nothing listens at the socket (the program was not started with `--live`, or has ended) every request is answered `not-live`.
+(ns serve.liveclient
+  (:require [serve.livesock :as lsk] [serve.sock :as sk] [serve.line :as ln] [serve.replcore :as rc] [lsp.json :as j]
+            [driver.native :as native] [fib.unix :as unix] [fib.string :as s]))
+
+(def help-text: str
+  "inputs: definitions (def defun defrecord ..) are made resident in the running program; an expression is evaluated there and its value printed
+:type EXPR      the type of EXPR         :inspect NAME  the value and type of NAME      :status  the session's figures
+:help           this                     :quit (ctrl-d) end the client; the program goes on")
+
+(defstruct Client (fd: i64 conn: sk/Conn))
+
+(defun connect (target: str) -> (Result Client str)
+  (match (sk/connect-unix (lsk/resolve-target target))
+    ((Err m) (Err m))
+    ((Ok fd) (Ok (Client fd (sk/conn-new fd))))))
+
+;; One request and its answer line.
+(defun exchange (c: Client line: str) -> (Result str str)
+  (match (sk/write-line (. c fd) line)
+    ((Err m) (Err m))
+    ((Ok _) (match (sk/conn-read-line (. c conn))
+              ((Err m) (Err m))
+              ((Ok nil) (Err "the program closed the connection"))
+              ((Ok (some l)) (Ok l))))))
+
+(defun req (op: str fields: (Vec (Pair str j/JVal))) -> str
+  (j/json-text (j/json-obj (into [(Pair "op" (j/json-str op))] fields))))
+
+(defun not-live-line (why: str) -> str
+  (j/json-text (j/json-obj [(Pair "id" j/JNull) (Pair "ok" (j/JBool false))
+                            (Pair "error" (j/json-obj [(Pair "code" (j/json-str "not-live")) (Pair "message" (j/json-str (str "no live program answers (" why "); start it with fibc run --live")))]))])))
+
+;; ---- --json: lines through
+
+(defun json-loop :private (c: (Option Client) why: str) -> i64
+  (let ((in (sk/conn-new 0)))
+    (loop ((bad 0))
+      (match (sk/conn-read-line in)
+        ((Ok nil) (if (> bad 0) 2 0))
+        ((Err _) (if (> bad 0) 2 0))
+        ((Ok (some line))
+         (match c
+           (nil (do (println (not-live-line why)) (recur (+ bad 1))))
+           ((some cl) (match (exchange cl line)
+                        ((Ok answer) (do (println answer) (recur bad)))
+                        ((Err m) (do (println (not-live-line m)) 2))))))))))
+
+;; ---- the terminal form
+
+(defun field :private (v: j/JVal key: str) -> (Option j/JVal) (j/json-get v key))
+(defun str-of :private (v: j/JVal key: str) -> str (match (field v key) ((some x) (unwrap-or (j/json-as-str x) "")) (nil "")))
+(defun strs-of :private (v: j/JVal key: str) -> (Vec str)
+  (match (field v key) ((some (j/JArr xs)) (mapv (fn (x: j/JVal) (unwrap-or (j/json-as-str x) "")) xs)) (_ [])))
+(defun int-of :private (v: j/JVal key: str) -> i64 (match (field v key) ((some (j/JInt n)) n) (_ 0)))
+(defun join-words :private (xs: (Vec str)) -> str (str-join (vec (interpose ", " xs))))
+
+;; What the answer to an input says, as the REPL would print it.
+(defun show-answer :private (v: j/JVal) -> unit
+  (cond (some? (field v "error")) (println (str "; " (str-of (unwrap-or (field v "error") j/JNull) "message") " [" (str-of (unwrap-or (field v "error") j/JNull) "code") "]"))
+        (some? (field v "failed")) (println (str "; failed: " (str-of v "failed") " (caught; the program is unaffected)"))
+        (some? (field v "shown")) (do (doseq [l (strs-of v "shown")] (println l)) (println "; refused; the session and the program are unchanged"))
+        (some? (field v "value")) (println (str-of v "value"))
+        (some? (field v "defined")) (println (str "; defined " (join-words (strs-of v "defined"))))
+        (some? (field v "type")) (println (str-of v "type"))
+        (some? (field v "generations")) (println (str "; generation " (int-of v "generation") "; modules kept " (int-of (unwrap-or (field v "generations") j/JNull) "kept")
+                                                    "; values: " (int-of (unwrap-or (field v "values") j/JNull) "count") " resident; inputs " (int-of v "inputs")))
+        (not (= (int-of v "exit") 0)) (println (str "; the input ended with status " (int-of v "exit")))
+        :else ()))
+
+(defun send :private (c: Client line: str) -> bool
+  (match (exchange c line)
+    ((Err m) (do (eprintln (str "fibc repl: " m)) false))
+    ((Ok answer) (match (j/json-parse answer)
+                   ((Err m) (do (eprintln (str "fibc repl: the answer is not JSON: " m)) false))
+                   ((Ok v) (do (show-answer v) true))))))
+
+(defun split-word :private (text: str) -> (Pair str str)
+  (match (str-find text " " 0)
+    (nil (Pair text ""))
+    ((some i) (Pair (str-slice text 0 i) (s/trim (str-slice text (+ i 1) (str-len text)))))))
+
+;; A command or an input; false to end the session.
+(defun step :private (c: Client text: str) -> bool
+  (let ((t (s/trim text)) (w (split-word (s/trim text))))
+    (cond (= t "") true
+          (or (= (. w fst) ":quit") (= (. w fst) ":q")) false
+          (= (. w fst) ":help") (do (println help-text) true)
+          (= (. w fst) ":type") (send c (req "type" [(Pair "expr" (j/json-str (. w snd)))]))
+          (= (. w fst) ":inspect") (send c (req "inspect" [(Pair "name" (j/json-str (. w snd)))]))
+          (= (. w fst) ":status") (send c (req "status" []))
+          (s/starts-with? t ":") (do (println (str "; unknown command " (. w fst) "; :help lists them")) true)
+          :else (send c (req "eval" [(Pair "text" (j/json-str t))])))))
+
+(defun continue-input :private (ed: ln/Editor text: str) -> (Result (Option str) str)
+  (if (and (rc/incomplete? text) (not (s/starts-with? (s/trim text) ":")))
+      (match (ln/read-line ed "...  " false)
+        ((Err m) (Err m))
+        ((Ok nil) (Ok (some text)))
+        ((Ok (some l)) (continue-input ed (str text "\n" l))))
+      (Ok (some text))))
+
+(defun hello :private (c: Client) -> unit
+  (match (exchange c (req "hello" []))
+    ((Err _) ())
+    ((Ok answer) (match (j/json-parse answer)
+                   ((Ok v) (println (str "; attached to " (str-of v "program") " (pid " (int-of v "pid") ", generation " (int-of v "generation")
+                                         (if (match (field v "catching") ((some (j/JBool true)) true) (_ false)) ", catching" "") ")")))
+                   ((Err _) ())))))
+
+(defun terminal-loop :private (c: Client) -> i64
+  (let ((ed (ln/editor-new 0)))
+    (do (hello c)
+        (loop ()
+          (match (ln/read-line ed "fib> " false)
+            ((Err m) (do (eprintln (str "fibc repl: " m)) 2))
+            ((Ok nil) 0)
+            ((Ok (some l)) (match (continue-input ed l)
+                             ((Err m) (do (eprintln (str "fibc repl: " m)) 2))
+                             ((Ok nil) 0)
+                             ((Ok (some text)) (if (step c text) (recur) 0)))))))))
+
+;; `fibc repl --connect TARGET [--json]`: 0 at the end of the input; 2 when no program answered (every request answered `not-live`).
+(defun connect-main (target: str json: bool) -> i64
+  (do (native/ignore-sigpipe)
+      (match (connect target)
+        ((Err m) (if json
+                     (json-loop nil m)
+                     (do (eprintln (str "fibc repl: not-live: " m "; start the program with fibc run --live")) 2)))
+        ((Ok c) (let ((code (if json (json-loop (some c) "") (terminal-loop c))))
+                  (do (unix/fd-close (. c fd)) code))))))

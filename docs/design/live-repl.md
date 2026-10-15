@@ -507,3 +507,17 @@ Decisions for the owner:
 - **Measured** (section 1): a REPL input today is 8 to 15 ms of front end and 35 to 53 ms of fork, JIT and run; values do not persist (the
   atom reads 1 twice). **Estimated, not measured**: the cost of a one-function swap (2 to 3 ms of code generation plus the check of the
   edited module, 30 to 70 ms for a screenful), the memory of kept generations, the stub's call overhead (bounded by LV0's bench row).
+- **Status 2026-10-15**: LV0 (emit.live) and LV1 (serve.live, serve.livesess, serve.livesock, serve.liveclient; compiler/tests/live/attach.sh)
+  are built. Where LV1 as built differs from the text above: (a) the attach server runs on the driver's thread and the program's `main` on a
+  thread of its own (2.1 has them the other way round; the session's engine is `Cell` state and cannot be given to `spawn`); (b) a session
+  `def` may not be redefined (`live/Def`, where 3.5 says a redefinition leaks the old value), nor a function (`live/Swap`: a body swap is LV2),
+  nor a type (`live/Layout`), nor `main` (`live/Main`); (c) an expression's `stdout` is not captured (its `pr-str` value is written to a file
+  of its own; `println` in it goes where the program's output goes); (d) a `def` whose initialiser traps aborts the program (the init runs
+  outside the guard); (e) every input module that holds a static or a lambda is kept for good (`live.extract/pins?`), `status.generations.kept`
+  counts them, and nothing is retired (LV3); (f) each program of the session has its own closure and vtable statics (shared objects, strings
+  and keywords), since a later program does not emit the code of a closure it does not make; (g) the base is the program as `fibc run` makes
+  it (the driver's front end on the file, pruned, the same trace: the case tables agree under FIB_LIVE=1), while an input is checked against
+  the REPL's re-assembled text of the program (`<session>:L:C` in a diagnostic about a program definition, as `fibc repl` shows one), and an
+  input whose program numbers a `def` of the base differently is refused rather than read a wrong slot; (h) a `def` of the library the program
+  never reached is made when an input first reaches it, on the attach thread; (i) `--trace` is set after the compiler's own JIT sessions
+  are up, so a later input that runs a macro traces that macro's session on standard error.
