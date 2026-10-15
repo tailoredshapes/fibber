@@ -208,9 +208,27 @@
 ;; The session's generation.
 (defun generation (sx: ls/Sess) -> i64 (. @(. sx table) generation))
 
-;; A function of the running program, by the name the user wrote: its generation and the bodies its slots name.
+;; ---- `inspect` as a lookup (LE4, docs/design/live-incremental.md 3.8): the live table and the last accepted program's catalogue
+
+;; A name as the user wrote it as a body name's tail: `tick-loop` (the main module's), `routes/route` (module `routes`: `routes.route`).
+(defun body-tail :private (name: str) -> str (s/replace name "/" "."))
+
+;; A function of the running program, by the name the user wrote: its family's entry in the live table.
+(defun family-info (sx: ls/Sess name: str) -> (Option lt/Family) (get (. @(. sx table) families) (str "f." (body-tail name))))
+
+;; The bodies a family's slots name now.
+(defun family-bodies (sx: ls/Sess name: str f: lt/Family) -> (Vec str)
+  (mapv (fn (nm: str) (str nm ".g" (. f generation))) (lt/body-names (ls/live-bodies sx) (str "f." (body-tail name)))))
+
+;; A function's generation and the bodies its slots name.
 (defun function-info (sx: ls/Sess name: str) -> (Option (Pair i64 (Vec str)))
-  (let ((family (str "f." name)))
-    (match (get (. @(. sx table) families) family)
+  (match (family-info sx name) (nil nil) ((some f) (some (Pair (. f generation) (family-bodies sx name f))))))
+
+;; A `def` of the session or the program, by the name the user wrote: its type as the last accepted program's checker printed it, and
+;; the slot that holds it (`live.d.NAME` of a redefinable def, `def.slot.N` of one made at run time; nil for static data).
+(defun def-info (sx: ls/Sess name: str) -> (Option (Pair str (Option str)))
+  (let ((body (str "d." (body-tail name))))
+    (match (get (. @(. sx defs) types) body)
       (nil nil)
-      ((some f) (some (Pair (. f generation) (mapv (fn (nm: str) (str nm ".g" (. f generation))) (lt/body-names (ls/live-bodies sx) family))))))))
+      ((some ty) (some (Pair ty (cond (some? (get @(. sx base) (str "live." body))) (some (str "live." body))
+                                      :else (first (vec (keep (fn (p: (Pair str str)) (if (= (. p snd) name) (some (. p fst)) nil)) (vec @(. sx slot-names))))))))))))

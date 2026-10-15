@@ -5,7 +5,8 @@ work running while the inputs are evaluated.
 usage: attach.py FIBC [ROOT]    Exit 0 when every check held. Each check prints `ok NAME` or `FAIL NAME: why`.
 What is tested: the socket (0700 directory, 0600 file, the path on standard error and in hello); hello; the design's atom transcript
 (a `def` counter answers 1 then 2); a def read by three later inputs; a trap answered `failed` and the next input working; the
-program's own defs read and changed live while its worker runs; type, inspect, status; new functions, records and closures kept in an
+program's own defs read and changed live while its worker runs; the warm engine (LE5: hello's `warm`, the first input's figures);
+type, inspect (LE4: a lookup in under 20 ms, `value: true`), an expression in under 150 ms, status; new functions, records and closures kept in an
 atom; a function defined again is swapped (LV2: compiler/tests/live/swap.py is the swap's own test); a session def defined again (defonce keeps it, def
 makes it again: LT4); the refusals (live/Main, the checker's); 1,000 malformed lines; a second client waiting; the terminal and
 --json clients; `not-live`; a wrong uid refused (planted: FIB_LIVE_OWN_UID); a program that does not check; the end of the program
@@ -90,10 +91,13 @@ c = Client(a.sock)
 h = c.ask(op='hello', id=1)
 check('hello', h and h.get('ok') and h.get('pid') == a.p.pid and h.get('program', '').endswith('app.fib') and h.get('generation') == 0 and h.get('catching') is True and h.get('id') == 1, h)
 check('hello version', h and isinstance(h.get('version'), str) and h['version'][0].isdigit(), h)
+check('hello warm (LE5)', h and h.get('warm') is True, h)
 
 # ---- values persist: the design's transcript (section 1 of docs/design/live-repl.md)
 d = c.eval('(def counter: (Atom i64) (atom 0))')
 check('def counter', d and d.get('ok') and d.get('defined') == ['counter'], d)
+st = (d or {}).get('stats', {})   # LE5: the engine was warmed before the first connection: the first input expands the session module alone
+check('first input warm (LE5)', st.get('modules', 0) > 1 and st.get('reused') == st['modules'] - 1 and st.get('check_ms', 9999) < 300, st)
 check('counter 1', c.value('(do (swap! counter inc) @counter)') == '1')
 check('counter 2', c.value('(do (swap! counter inc) @counter)') == '2')
 check('def names', (c.eval('(def names: (Vec str) ["a" "b"])') or {}).get('defined') == ['names'])
@@ -118,8 +122,26 @@ check('pool from input', c.value('(reduce + 0 (pmap (fn (x: i64) -> i64 (* x 2))
 # ---- type, inspect, status
 check('type', (c.ask(op='type', expr='(+ 1 2)') or {}).get('type') == 'i64')
 check('type of def', (c.ask(op='type', expr='counter') or {}).get('type') == '(Atom i64)')
-i = c.ask(op='inspect', name='names')
-check('inspect', i and i.get('value') == '["a" "b"]' and i.get('type') == '(Vec str)', i)
+def timed(**req):   # the best wall of three (ms) and the last answer: a loaded machine adds to one
+    best, ans = None, None
+    for _ in range(3):
+        t0 = time.time(); ans = c.ask(**req); ms = (time.time() - t0) * 1000
+        best = ms if best is None else min(best, ms)
+    return best, ans
+# LE4: inspect is a lookup in the live table and the last catalogue (no front end, no stats); `value: true` evaluates
+ms, i = timed(op='inspect', name='handle')
+check('inspect a function (LE4)', i and i.get('ok') and i.get('kind') == 'function' and i.get('generation') == 0 and 'f.handle.g0' in i.get('bodies', [])
+      and i.get('scheme') == '(fn :send (Request) Response)' and i.get('summary') == ['borrowed'] and 'stats' not in i and 'value' not in i, i)
+check('inspect under 20 ms (LE4)', ms < 20, ms)
+ms, i = timed(op='inspect', name='names')
+check('inspect a def (LE4)', i and i.get('ok') and i.get('kind') == 'def' and i.get('type') == '(Vec str)' and 'stats' not in i and 'value' not in i, i)
+check('inspect a def under 20 ms', ms < 20, ms)
+i = c.ask(op='inspect', name='names', value=True)
+check('inspect value', i and i.get('value') == '["a" "b"]' and i.get('type') == '(Vec str)' and 'stats' in i, i)
+i = c.ask(op='inspect', name='no-such-name')
+check('inspect unknown', i and i.get('ok') is False and i.get('error', {}).get('code') == 'unknown-name', i)
+ms, i = timed(op='eval', text='(count [1])')
+check('expression under 150 ms (LE4)', i and i.get('value') == '1' and ms < 150, (ms, i))
 s = c.ask(op='status')
 check('status', s and s.get('generation') == 0 and s['generations']['count'] == 1 and s['values']['count'] >= 1 and ('def.slot' in ''.join(s['values']['resident']) or 'live.d.' in ''.join(s['values']['resident'])) and s.get('inputs', 0) > 5 and s.get('pid') == a.p.pid, s)   # names and late are constants: static data, no slot
 

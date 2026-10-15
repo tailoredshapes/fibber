@@ -1,7 +1,7 @@
 ;; compiler/serve/liveclient.fib: `fibc repl --connect SOCK|PID [--json]` (docs/design/live-repl.md 2.4, package LV1): the client of a
 ;; program started with `fibc run --live` (serve.live). The terminal form reads inputs as the REPL does (serve.line: editing on a
 ;; terminal, plain lines from a pipe; an input continues while its brackets are open) and sends each as an `eval`, printing the value,
-;; `; failed: ..` for a caught trap, `; defined ..`, or the refusal's lines; `:type EXPR`, `:inspect NAME`, `:status`, `:pause [MS]`,
+;; `; failed: ..` for a caught trap, `; defined ..`, or the refusal's lines; `:type EXPR`, `:inspect NAME` (a lookup, LE4), `:status`, `:pause [MS]`,
 ;; `:resume`, `:retire` (serve.liveretire, package LV3), `:test [SPEC] [words of fibc test]` and `:test` alone to rerun the last selection
 ;; (serve.livetest, package LT2 of docs/design/live-meshql.md 3.9: the answer's document rendered as `fibc test` prints a file, through
 ;; serve.livewords), `:load FILE` and `:reload` (serve.liveload, package LM1: a module of the program edited on disk, swapped as one
@@ -15,7 +15,7 @@
 (def help-text: str
   "inputs: definitions (def defun defrecord ..) are made resident in the running program; a function defined again is swapped (its callers
         use the new body from their next call); an expression is evaluated there and its value printed
-:type EXPR      the type of EXPR         :inspect NAME  the value and type of NAME      :status  the session's figures and threads
+:type EXPR      the type of EXPR         :inspect NAME  a function's generation and scheme, a def's type   :status  the session's figures and threads
 :pause [MS]     the program parks at its pause points (up to MS ms, 5000, waiting for quiescence)    :resume  lets it run again
 :retire         at quiescence, frees the code of every old generation no thread can be in
 :test [SPEC] [--only ID] [--tags EXPR] [--name RE] [--seed N] [-j N] [--isolate task|none] [--list] [--dry-run]
@@ -78,6 +78,7 @@
         (some? (field v "loaded")) (show-reload v)
         (some? (field v "file")) (show-load v)
         (some? (field v "error")) (println (str "; " (str-of (unwrap-or (field v "error") j/JNull) "message") " [" (str-of (unwrap-or (field v "error") j/JNull) "code") "]"))
+        (some? (field v "kind")) (println (inspect-line v))
         (some? (field v "failed")) (println (str "; failed: " (str-of v "failed") " (caught; the program is unaffected)"))
         (some? (field v "shown")) (do (doseq [l (strs-of v "shown")] (println l))
                                       (println (str "; refused; the session and the program are unchanged" (if (some? (field v "generation")) (str " (generation " (int-of v "generation") ")") ""))))
@@ -96,6 +97,14 @@
                                                  " (generation " (int-of v "generation") ")"))
         (not (= (int-of v "exit") 0)) (println (str "; the input ended with status " (int-of v "exit")))
         :else ()))
+
+;; `:inspect NAME` (LE4): `; function, generation 2: (fn (i64) i64); bodies f.f.g2, f.f.owned.g2; parameters borrowed` or
+;; `; def of type (Atom i64), slot live.d.counter`.
+(defun inspect-line :private (v: j/JVal) -> str
+  (if (= (str-of v "kind") "function")
+      (str "; function, generation " (int-of v "generation") ": " (str-of v "scheme") "; bodies " (join-words (strs-of v "bodies"))
+           (if (empty? (strs-of v "summary")) "" (str "; parameters " (join-words (strs-of v "summary")))))
+      (str "; def of type " (str-of v "type") (if (= (str-of v "slot") "") "" (str ", slot " (str-of v "slot"))))))
 
 ;; `:status`: the generation, the generations and modules kept, the threads, the values, the inputs, the tests, the loaded files.
 (defun show-status :private (v: j/JVal) -> unit

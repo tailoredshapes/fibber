@@ -47,7 +47,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LIVE_OWN_UID` | [compiler/serve/livesock.fib:80](../../compiler/serve/livesock.fib#L80) |
 | `FIB_LIVE_QUEUE` | [compiler/emit/program.fib:266](../../compiler/emit/program.fib#L266) |
 | `FIB_LIVE_ROOTS` | [compiler/driver/front.fib:68](../../compiler/driver/front.fib#L68) |
-| `FIB_LIVE_SOCKET` | [compiler/serve/live.fib:278](../../compiler/serve/live.fib#L278) |
+| `FIB_LIVE_SOCKET` | [compiler/serve/live.fib:314](../../compiler/serve/live.fib#L314) |
 | `FIB_LIVE_WITH` | [compiler/fibc.fib:67](../../compiler/fibc.fib#L67) |
 | `FIB_LOG` | [lib/fib/log/core.fib:126](../../lib/fib/log/core.fib#L126) |
 | `FIB_LOG_ASYNC` | [lib/fib/log/config.fib:32](../../lib/fib/log/config.fib#L32) |
