@@ -12,7 +12,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_ALLOC_DECAY_MS` | [rt/alloc.lir:309](../../rt/alloc.lir#L309) |
 | `FIB_ALLOC_STATS` | [rt/alloc.lir:344](../../rt/alloc.lir#L344) |
 | `FIB_ALLOW_PLAIN_TAIL_CALLS` | [compiler/driver/viac.fib:46](../../compiler/driver/viac.fib#L46) |
-| `FIB_ALLOW_UNSUPPORTED` | [compiler/driver/commands.fib:59](../../compiler/driver/commands.fib#L59) |
+| `FIB_ALLOW_UNSUPPORTED` | [compiler/driver/commands.fib:62](../../compiler/driver/commands.fib#L62) |
 | `FIB_AST_VERIFY` | [compiler/emit/defs/astmod.fib:10](../../compiler/emit/defs/astmod.fib#L10) |
 | `FIB_CATCH` | [compiler/emit/program.fib:43](../../compiler/emit/program.fib#L43) |
 | `FIB_CC` | [compiler/driver/viac.fib:24](../../compiler/driver/viac.fib#L24) |
@@ -25,8 +25,8 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_JS_ARGV0` | [compiler/lir2js.fib:60](../../compiler/lir2js.fib#L60) |
 | `FIB_JS_RT` | [compiler/lir2js.fib:46](../../compiler/lir2js.fib#L46) |
 | `FIB_JS_UNLINK` | [compiler/lir2js.fib:59](../../compiler/lir2js.fib#L59) |
-| `FIB_KERNEL_PTX` | [compiler/driver/commands.fib:134](../../compiler/driver/commands.fib#L134) |
-| `FIB_KERNEL_TARGET` | [compiler/driver/commands.fib:74](../../compiler/driver/commands.fib#L74) |
+| `FIB_KERNEL_PTX` | [compiler/driver/commands.fib:137](../../compiler/driver/commands.fib#L137) |
+| `FIB_KERNEL_TARGET` | [compiler/driver/commands.fib:77](../../compiler/driver/commands.fib#L77) |
 | `FIB_LAIR_WORKERS` | [compiler/native/cases.fib:19](../../compiler/native/cases.fib#L19) |
 | `FIB_LIB` | [compiler/emit/macros/front.fib:82](../../compiler/emit/macros/front.fib#L82) |
 | `FIB_LINK` | [compiler/fibc.fib:75](../../compiler/fibc.fib#L75) |
@@ -42,7 +42,9 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LIRO_UNITS` | [compiler/native/liro/partition.fib:37](../../compiler/native/liro/partition.fib#L37) |
 | `FIB_LIVE` | [compiler/emit/program.fib:57](../../compiler/emit/program.fib#L57) |
 | `FIB_LIVE_DEPS` | [compiler/fibc.fib:65](../../compiler/fibc.fib#L65) |
+| `FIB_LIVE_OWN_UID` | [compiler/serve/livesock.fib:76](../../compiler/serve/livesock.fib#L76) |
 | `FIB_LIVE_ROOTS` | [compiler/driver/front.fib:68](../../compiler/driver/front.fib#L68) |
+| `FIB_LIVE_SOCKET` | [compiler/serve/live.fib:166](../../compiler/serve/live.fib#L166) |
 | `FIB_LOG` | [lib/fib/log/core.fib:126](../../lib/fib/log/core.fib#L126) |
 | `FIB_LOG_ASYNC` | [lib/fib/log/config.fib:32](../../lib/fib/log/config.fib#L32) |
 | `FIB_LOG_FILE` | [lib/fib/log/config.fib:31](../../lib/fib/log/config.fib#L31) |
@@ -68,10 +70,10 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_STATIC_LD` | [compiler/native/linkstatic.fib:90](../../compiler/native/linkstatic.fib#L90) |
 | `FIB_TARGET_CPU` | [compiler/llvm/target.fib:105](../../compiler/llvm/target.fib#L105) |
 | `FIB_TARGET_FEATURES` | [compiler/llvm/target.fib:196](../../compiler/llvm/target.fib#L196) |
-| `FIB_TARGET_TRIPLE` | [compiler/driver/commands.fib:56](../../compiler/driver/commands.fib#L56) |
+| `FIB_TARGET_TRIPLE` | [compiler/driver/commands.fib:59](../../compiler/driver/commands.fib#L59) |
 | `FIB_THREADS` | [rt/deque.lir:145](../../rt/deque.lir#L145) |
 | `FIB_TIME` | [compiler/driver/front.fib:148](../../compiler/driver/front.fib#L148) |
-| `FIB_TRACE` | [compiler/driver/commands.fib:48](../../compiler/driver/commands.fib#L48) |
+| `FIB_TRACE` | [compiler/driver/commands.fib:51](../../compiler/driver/commands.fib#L51) |
 | `FIB_VECTOR_BITS` | [compiler/native/liro/context.fib:34](../../compiler/native/liro/context.fib#L34) |
 | `FIB_VIA` | [compiler/driver/viac.fib:22](../../compiler/driver/viac.fib#L22) |
 | `FIB_WASM_MAX_MEMORY` | [compiler/native/linkwasm.fib:75](../../compiler/native/linkwasm.fib#L75) |
