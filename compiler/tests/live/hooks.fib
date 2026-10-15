@@ -1,0 +1,21 @@
+;; compiler/tests/live/hooks.fib: hookspecs' scenarios run as a live session's `test` op would run them (docs/design/live-meshql.md 3.2, package
+;; LT1): the words after `--` are the file the collected report is written to and then the words `fibc test` passes a child, which go into
+;; `argv-override`; `report-sink` collects what the runner would have printed. Nothing is printed: standard output holds only the result line
+;; `fibc run` adds, and that result is the runner's status (1 here: one scenario fails).
+(ns main (:use fib.core fib.seq fib.coll fib.print fib.test.run) (:require [hookspecs :as h]))
+
+(def buf: (Atom str) (atom ""))
+
+(defun collect (text: str) -> unit
+  (do (swap! buf (fn (s: str) (str s text))) ()))
+
+(defun main () -> i64
+  (let ((argv (vec (args))))
+    (if (empty? argv)
+        (do (eprintln "hooks: usage: hooks.fib -- OUT [words of fibc test..]") 2)
+        (do (reset! report-sink (some collect))
+            (reset! argv-override (some (vec (drop 1 argv))))
+            (let ((status (run-main (h/specs))))
+              (do (reset! argv-override nil)
+                  (reset! report-sink nil)
+                  (if (write-file (nth argv 0) @buf) status 3)))))))

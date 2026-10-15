@@ -1,6 +1,7 @@
 ;; fib.test.run: the runner and the reporters of fib.test (docs/design/test-harness.md §4, §5). `run-main` takes the suites of a spec
 ;; file and the command line (`--only SUBSTR`, `--seed N`, `-j N`, `--format plain|json`, `--list`, `--no-isolate`, `--timeout SECS`)
-;; and returns the exit status: 0 every scenario held, 1 one did not, 2 the command line or a selection that matches nothing.
+;; and returns the exit status: 0 every scenario held, 1 one did not, 2 the command line or a selection that matches nothing. A live
+;; session reads the words from `argv-override` and writes the report through `report-sink` (the hooks, below) instead.
 ;;
 ;; ISOLATION. A failed `expect` is a value (`Broke`) and never stops anything. A trap is the scenario's own, and there are two ways to keep it
 ;; from ending the run (`--isolate`):
@@ -167,6 +168,22 @@
       (do (loop ((i @emitted)) (if (< i (count all)) (do (stream (nth all i)) (recur (+ i 1))) ()))
           all))))
 
+;; ---- the hooks of a live session (docs/design/live-meshql.md 3.2, package LT1) ---------------------------------------------------------
+
+;; The command line `run-main` reads instead of `(args)` when set: a live session's `test` op sets it to the words `fibc test` would pass
+;; a child and calls the spec's `main`, whose files stay as they are. A program may set it itself; `fibc test`'s children never do.
+(def argv-override: (Atom (Option (Vec str))) (atom nil))
+
+;; Where the report goes instead of standard output when set: the rows as `streamer` makes them, the document `report` writes, the
+;; `--list` listing. Process-wide, so one run at a time is a rule of the session, not a limitation of the runner.
+(def report-sink: (Atom (Option (fn :send (str) unit))) (atom nil))
+
+;; `text` to the sink, or printed.
+(defun emit-report (text: str) -> unit
+  (match @report-sink
+    (nil (print text))
+    ((some sink) (sink text))))
+
 ;; ---- reporters --------------------------------------------------------------------------------------------------------------------
 
 (defun pad :private (s: str w: i64) -> str
@@ -214,8 +231,8 @@
   (let ((last (cell "#none#")))
     (fn (r: ScenarioRow)
       (if (= (. o format) "plain")
-          (do (if (= (label r) @last) () (do (print (str (label r) "\n")) (set! last (label r))))
-              (print (str "  " (row-plain r))))
+          (do (if (= (label r) @last) () (do (emit-report (str (label r) "\n")) (set! last (label r))))
+              (emit-report (str "  " (row-plain r))))
           ()))))
 
 (defun plain-summary (rows: (Vec ScenarioRow) seed: i64) -> str
@@ -319,9 +336,9 @@
                 :else (Err (str "unknown argument " a)))))))
 
 (defun report :private (rows: (Vec ScenarioRow) o: SpecOpts) -> i64
-  (do (print (cond (= (. o format) "json") (json rows (. o seed))
-                   (= (. o format) "tap") (tap rows (. o seed))
-                   :else (plain-summary rows (. o seed))))
+  (do (emit-report (cond (= (. o format) "json") (json rows (. o seed))
+                         (= (. o format) "tap") (tap rows (. o seed))
+                         :else (plain-summary rows (. o seed))))
       (if (= (count (filter (fn (r: ScenarioRow) (not (or (= (. r status) "pass") (= (. r status) "skip")))) rows)) 0) 0 1)))
 
 (defun run-forked-in :private (js: (Vec ScenarioJob) o: SpecOpts) -> i64
@@ -336,9 +353,9 @@
         (= (. o isolate) "task") (report (run-tasks js (. o jobs) (streamer o)) o)
         :else (run-forked-in js o)))
 
-;; The whole run of a spec file: its suites and the command line (`(args)`).
+;; The whole run of a spec file: its suites and the command line (`(args)`, or `argv-override` when a live session set it).
 (defun run-main (suites: (Vec Suite)) -> i64
-  (run-main-with suites (vec (args))))
+  (run-main-with suites (unwrap-or @argv-override (vec (args)))))
 
 ;; The same with the command line given (a spec that is a case passes its own words).
 (defun run-main-with (suites: (Vec Suite) argv: (Vec str)) -> i64
@@ -350,5 +367,5 @@
        (cond (not (= (count (set (mapv (fn (j: ScenarioJob) (. (. j sc) id)) all))) (count all)))
                (do (eprintln "fibc test: two scenarios have the same id; give one an (id \"..\")") 2)
              (empty? js) (do (eprintln (str "fibc test: no scenario matches '" (. o only) "'; a run with nothing to run is not a pass")) 2)
-             (. o list) (do (print (list-plain js)) 0)
+             (. o list) (do (emit-report (list-plain js)) 0)
              :else (run-jobs js o))))))

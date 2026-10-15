@@ -62,3 +62,33 @@
 
 (defun module-file :private (name: str) -> str
   (str (pp/join-sep (pp/split-on name ".") "/") ".fib"))
+
+;; ---- the live module rule (docs/design/live-meshql.md 4, package LT3; emit.live `program-module?`) ---------------------------------
+
+;; What FIB_LIVE_DEPS (`--live-deps`) asks of the libraries: nil none (unset, "" or "0"); some names the ones named, comma-separated,
+;; every one when "1".
+(defun live-deps-wanted (v: (Option str)) -> (Option (Vec str))
+  (match v
+    (nil nil)
+    ((some text) (cond (or (= text "") (= text "0")) nil
+                       (= text "1") (some [])
+                       :else (some (vec (filter (fn (n: str) (not (= n ""))) (pp/split-on text ","))))))))
+
+;; The directories whose modules are live in a project: its own roots (with `test`, its test paths too), then the roots of the
+;; libraries `deps` asks for (`live-deps-wanted`: none, every one, or those named as deps.lock names them).
+(defun live-roots (p: pj/PkgProject libs: (Vec rs/PkgLib) test: bool deps: (Option (Vec str))) -> (Vec str)
+  (let ((wanted (fn (l: rs/PkgLib)
+                  (match deps
+                    (nil false)
+                    ((some names) (or (empty? names) (some? (first (filter (fn (n: str) (= n (. l name))) names)))))))))
+    (reduce (fn (acc: (Vec str) l: rs/PkgLib) (if (wanted l) (into acc (lib-roots l)) acc)) (project-roots p test) libs)))
+
+;; Whether `file` (as the loader names it: relative to the working directory, or absolute) is under one of `roots`.
+(defun file-under? :private (file: str roots: (Vec str)) -> bool
+  (let ((cwd (pp/cwd))
+        (f (pp/under cwd file)))
+    (some? (first (filter (fn (r: str) (starts-with? f (str (pp/under cwd r) "/"))) roots)))))
+
+;; The modules, by name, whose file is under one of `roots`: `files` is each loaded module's name and file.
+(defun live-modules (files: (Vec (Pair str str)) roots: (Vec str)) -> (Set str)
+  (set (mapv (fn (p: (Pair str str)) (. p fst)) (filter (fn (p: (Pair str str)) (file-under? (. p snd) roots)) files))))

@@ -16,7 +16,7 @@
 (ns main
   (:require [driver.static :as st] [driver.args :as a] [driver.commands :as c] [driver.native :as native] [expand.roots :as roots] [expand.maker :as mk]
             [macros.runner :as mr] [driver.harness :as hn] [driver.test :as dt] [driver.version :as v] [lsp.server :as lsp]
-            [pkg.project-mode :as pm] [pkg.deps-cmd :as deps] [pkg.new :as new] [serve.cmd :as sc]))
+            [pkg.project-mode :as pm] [pkg.modules :as md] [pkg.deps-cmd :as deps] [pkg.new :as new] [serve.cmd :as sc] [emit.program :as ep]))
 
 (defun refuse (word: str) -> i64
   (do (eprintln (str-join ["fibc: `" word "` is retired; no port is available (docs/rust-legacy.md)"])) 2))
@@ -62,6 +62,9 @@
           (= (nth words i) "--whole-program") (do (native/setenv-set "FIB_LIRO_MODE" "whole") (recur (+ i 1) out))
           (= (nth words i) "--time") (do (native/setenv-set "FIB_TIME" "1") (recur (+ i 1) out))
           (= (nth words i) "--live") (do (native/setenv-set "FIB_LIVE" "1") (recur (+ i 1) out))
+          (= (nth words i) "--live-deps") (do (native/setenv-set "FIB_LIVE_DEPS" "1") (recur (+ i 1) out))
+          (starts-with? (nth words i) "--live-deps=")
+            (do (native/setenv-set "FIB_LIVE_DEPS" (str-slice (nth words i) 12 (str-len (nth words i)))) (recur (+ i 1) out))
           (= (nth words i) "--cache-stats") (do (native/setenv-set "FIB_LIRO_STATS" "1") (recur (+ i 1) out))
           (and (= (nth words i) "--cache-dir") (< (+ i 1) (count words)))
             (do (native/setenv-set "FIB_LIRO_CACHE" (nth words (+ i 1))) (recur (+ i 2) out))
@@ -84,17 +87,37 @@
             (do (native/setenv-set "FIB_TARGET_TRIPLE" (nth words (+ i 1))) (recur (+ i 2) out))
           :else (recur (+ i 1) (conj out (nth words i))))))
 
+;; Whether `cmd` compiles a program in the project of the working directory, and with the project's test paths (`test`): nil for a
+;; command that does not.
+(defun project-command? :private (cmd: a/Command) -> (Option bool)
+  (match cmd
+    ((a/CmdTest _) (some true))
+    ((a/CmdRun _ _ _ _) (some false))
+    ((a/CmdBuild _ _ _ _ _ _ _) (some false))
+    ((a/CmdEmit _) (some false))
+    ((a/CmdExplain _) (some false))
+    ((a/CmdCheck _) (some false))
+    (_ nil)))
+
+;; In live mode (`--live`, FIB_LIVE) the project's own modules are the live ones and the libraries' are not unless `--live-deps`
+;; (FIB_LIVE_DEPS): FIB_LIVE_ROOTS names the directories (docs/design/live-meshql.md 4, package LT3; read by driver.front for emit.live).
+;; A value already in the environment is kept: the children of `fibc test` inherit their parent's, which resolved the project.
+(defun live-roots-env :private (r: pm/PkgResolved test: bool) -> unit
+  (when (and (ep/live-mode?) (nil? (native/getenv-opt "FIB_LIVE_ROOTS")))
+    (native/setenv-set "FIB_LIVE_ROOTS"
+                       (str-join (vec (interpose ":" (md/live-roots (. r project) (. r libs) test (md/live-deps-wanted (native/getenv-opt "FIB_LIVE_DEPS")))))))))
+
 ;; The module roots a project adds for a command that compiles a program (pkg.project-mode; none outside a project). `test` passes them to
 ;; its children as -I, and FIB_NO_PROJECT keeps the children from resolving again.
 (defun project-dirs :private (cmd: a/Command pf: pm/PkgFlags) -> (Result (Vec str) str)
-  (match cmd
-    ((a/CmdTest _) (let ((r (pm/project-dirs pf true))) (do (native/setenv-set "FIB_NO_PROJECT" "1") r)))
-    ((a/CmdRun _ _ _ _) (pm/project-dirs pf false))
-    ((a/CmdBuild _ _ _ _ _ _ _) (pm/project-dirs pf false))
-    ((a/CmdEmit _) (pm/project-dirs pf false))
-    ((a/CmdExplain _) (pm/project-dirs pf false))
-    ((a/CmdCheck _) (pm/project-dirs pf false))
-    (_ (Ok []))))
+  (match (project-command? cmd)
+    (nil (Ok []))
+    ((some test)
+     (try-let [r (pm/project-resolved pf)]
+       (do (when test (native/setenv-set "FIB_NO_PROJECT" "1"))
+           (Ok (match r
+                 (nil [])
+                 ((some pr) (do (live-roots-env pr test) (md/search-dirs (. pr project) (. pr libs) test))))))))))
 
 ;; A `-I DIR` that holds a `prelude.fib` is the library too, as FIB_LIB names it (expand.libdir), unless FIB_LIB is set: `fibc test -I /path/to/lib specs` from any
 ;; directory (the children of `test` inherit the variable). LIBFIX-1; compiler/tests/driver/test-cmd.sh.

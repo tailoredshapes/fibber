@@ -11,12 +11,16 @@ beside the file, then under each -I dir in order, then under each directory of
 $FIB_LIB, then in the library directory `lib` (spec/syntax.md §5).
 
 commands:
-  run [--trace] [--live] [-O N] <file> [-- arg..]
+  run [--trace] [--live [--live-deps]] [-O N] <file> [-- arg..]
                          compile file through the JIT and run its main; the
                          args after -- are (args); --live (or FIB_LIVE=1)
                          compiles the program for live redefinition: its own
                          functions behind stubs and slots, and catching
-                         (docs/design/live-repl.md)
+                         (docs/design/live-repl.md); in a project its own
+                         modules (the :paths of deps.fib) are live and its
+                         libraries are not unless --live-deps (FIB_LIVE_DEPS=1,
+                         or --live-deps=NAME,.. for some of them); outside a
+                         project every module not named fib.* is live
   build <file> -o <out> [-O N] [-L dir].. [-l lib].. [--emit liro|obj|asm|llvm|ptx|wgsl|c]
                         [--kernel-target TRIPLE|none]
                          (the options may come before the file too)
