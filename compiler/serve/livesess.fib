@@ -49,11 +49,13 @@
    defined: (Cell i64)
    ;; what each resident body or literal of a stubbed family refers to (serve.livesplit `code-refs`), for the pause-point analysis of a
    ;; retirement (serve.liveretire); a retired generation's entries go with it
-   refs: (Cell (Map str (Vec str)))))
+   refs: (Cell (Map str (Vec str)))
+   ;; the loaded modules' text by module name (serve.liveload, LM1): every program of the session reads it instead of the file
+   texts: (Cell (Map str str))))
 
 (defun sess-new (rts: roots/Roots file: str opt: i64 out: str) -> Sess
   (Sess (rc/session-new) (inc/engine-new) rts file opt out (ep/tables-new) (cell nil) (cell {}) (cell 0) (cell 0) (cell []) (cell 0) (cell {}) (cell nil)
-        (cell (lt/table-new)) (cell 0) (cell {})))
+        (cell (lt/table-new)) (cell 0) (cell {}) (cell {})))
 
 ;; What an input came to. `Swapped`: definitions made and bodies swapped, the session's generation and the swap's figures (ms).
 (defenum Answer
@@ -124,7 +126,7 @@
 ;; The whole program of `clauses` and `defs` with `tail` after them, checked (the engine's persistent checker) and emitted in the
 ;; session's tables with the bodies of `requests`.
 (defun program-of-text (sx: Sess clauses: (Vec str) defs: (Vec rc/Def) tail: str requests: (Vec ec/BodyRequest)) -> (Result Made (Vec dg/Diag))
-  (let ((fr (rc/front (. sx eng) (. sx rts) (rc/source-of clauses defs tail) "yes" true)))
+  (let ((fr (rc/front-texts (. sx eng) (. sx rts) (rc/source-of clauses defs tail) "yes" true @(. sx texts))))
     (match (. fr checked)
       ((Err ds) (Err ds))
       ((Ok c) (emit-checked sx c (. fr stats) requests)))))
@@ -438,12 +440,11 @@
     (let ((value (match (. ty ret) ((some (TAnon _)) (n/extract call 0)) (_ call))))
       (ItDefine (f/external (f/make name (some ty-i64) [(Pair "fd" ty-i64)] cc-c [(f/block "entry" [(n/ret (some value))])]))))))
 
-(defun debug-missing? :private (ds: (Vec dg/Diag)) -> bool
-  (some? (first (filterv (fn (d: dg/Diag) (s/includes? (. d message) "implementation of Debug")) ds))))
+(defun debug-missing? :private (ds: (Vec dg/Diag)) -> bool (some? (first (filterv (fn (d: dg/Diag) (s/includes? (. d message) "implementation of Debug")) ds))))
 
 ;; The program of expression input `n`: its value printed with `pr-str`, or run for its effect alone when its type has no Debug.
 (defun expression-program :private (sx: Sess n: i64 expr: str) -> (Result (Pair Made bool) (Vec dg/Diag))
-  (let ((req [(ec/BodyRequest (entry-name n) false [] nil [])]))
+  (let ((req [(ec/BodyRequest (entry-name n) false [] nil [] nil)]))
     (match (program-of sx (entry-tail n expr true) req)
       ((Ok made) (Ok (Pair made true)))
       ((Err ds) (if (debug-missing? ds)
@@ -491,8 +492,7 @@
                              :else (Value nil st (. made stats))))))))
 
 ;; `:type`: the checker's type of an expression (serve.replcore).
-(defun type-of (sx: Sess expr: str) -> (Result str (Vec str))
-  (rc/type-of-expr (. sx rc) (. sx eng) (. sx rts) expr))
+(defun type-of (sx: Sess expr: str) -> (Result str (Vec str)) (rc/type-of-expr (. sx rc) (. sx eng) (. sx rts) expr))
 
 (defun resident-names (sx: Sess) -> (Vec str) @(. sx resident))
 (defun modules-kept (sx: Sess) -> i64 @(. sx kept))

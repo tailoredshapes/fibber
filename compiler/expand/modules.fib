@@ -248,6 +248,9 @@
 ;; The modules read so far and the ones being read (`Loader`).
 (defstruct Loader :private
   (main-dir: str roots: Roots implicit: (Vec str)
+   ;; the text of a module by its name, read in place of its file (a live
+   ;; session's loaded modules, docs/design/live-incremental.md 3.3)
+   texts: (Map str str)
    ;; whether the modules read now are the implicit ones and what they
    ;; depend on
    in-implicit: (Cell bool)
@@ -261,7 +264,14 @@
 ;; built-in root (`try_load_in`), and the implicit modules of
 ;; `implicit-lib` come before the program's.
 (defun try-load-in (source: str file: str roots: Roots) -> (Result (Vec Loaded) LoadErr)
-  (try-load-with source file roots (implicit-lib)))
+  (try-load-texts source file roots (map-empty)))
+
+;; `try-load-in` with `texts` read in place of the files of the modules
+;; it names (by module name): a live session's loaded modules
+;; (docs/design/live-incremental.md 3.3, package LM1). The file is still
+;; looked for (its name is the positions'), its content is not read.
+(defun try-load-texts (source: str file: str roots: Roots texts: (Map str str)) -> (Result (Vec Loaded) LoadErr)
+  (load-all source file roots (implicit-lib) texts))
 
 ;; `try-load-in` with the implicit modules `implicit` instead of
 ;; `implicit-lib`, in the order they are loaded: the program sees them as
@@ -271,6 +281,10 @@
 ;; (`try_load_with`).
 (defun try-load-with (source: str file: str roots: Roots implicit: (Vec str))
     -> (Result (Vec Loaded) LoadErr)
+  (load-all source file roots implicit (map-empty)))
+
+(defun load-all :private (source: str file: str roots: Roots implicit: (Vec str) texts: (Map str str))
+    -> (Result (Vec Loaded) LoadErr)
   (match (reader/read-all source file)
     ((Err e) (Err (LoadRead e)))
     ((Ok forms)
@@ -278,7 +292,7 @@
        ((Err e) (Err e))
        ((Ok spec0)
         (let ((spec (with-regex spec0 forms))
-              (ld (Loader (path-parent file) roots implicit (cell false) (cell [(. spec ns)])
+              (ld (Loader (path-parent file) roots implicit texts (cell false) (cell [(. spec ns)])
                           (cell (map-empty)) (cell (vec-empty)))))
           (match (load-implicit ld spec)
             ((Err e) (Err e))
@@ -354,7 +368,7 @@
         :else
          (match (roots-find (. ld roots) (. ld main-dir) ns)
            ((LookupMissing file) (Err (LoadMissing ns file)))
-           ((LookupFound file source) (visit-source ld ns file source)))))
+           ((LookupFound file source) (visit-source ld ns file (unwrap-or (get (. ld texts) ns) source))))))
 
 (defun visit-source :private (ld: Loader ns: str file: str source: str) -> (Result unit LoadErr)
   (match (reader/read-all source file)

@@ -21,7 +21,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_CHECK_CACHE` | [compiler/driver/front.fib:114](../../compiler/driver/front.fib#L114) |
 | `FIB_C_LINES` | [compiler/driver/viac.fib:47](../../compiler/driver/viac.fib#L47) |
 | `FIB_EMIT_EXE` | [compiler/driver/commands.fib:14](../../compiler/driver/commands.fib#L14) |
-| `FIB_EXPORTS` | [compiler/emit/compile.fib:171](../../compiler/emit/compile.fib#L171) |
+| `FIB_EXPORTS` | [compiler/emit/compile.fib:179](../../compiler/emit/compile.fib#L179) |
 | `FIB_JS_ARGV0` | [compiler/lir2js.fib:60](../../compiler/lir2js.fib#L60) |
 | `FIB_JS_RT` | [compiler/lir2js.fib:46](../../compiler/lir2js.fib#L46) |
 | `FIB_JS_UNLINK` | [compiler/lir2js.fib:59](../../compiler/lir2js.fib#L59) |
@@ -43,10 +43,11 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LIVE` | [compiler/emit/program.fib:64](../../compiler/emit/program.fib#L64) |
 | `FIB_LIVE_DEPS` | [compiler/fibc.fib:65](../../compiler/fibc.fib#L65) |
 | `FIB_LIVE_EMIT` | [compiler/emit/program.fib:85](../../compiler/emit/program.fib#L85) |
+| `FIB_LIVE_LIBS` | [compiler/fibc.fib:114](../../compiler/fibc.fib#L114) |
 | `FIB_LIVE_OWN_UID` | [compiler/serve/livesock.fib:80](../../compiler/serve/livesock.fib#L80) |
-| `FIB_LIVE_QUEUE` | [compiler/emit/program.fib:234](../../compiler/emit/program.fib#L234) |
+| `FIB_LIVE_QUEUE` | [compiler/emit/program.fib:236](../../compiler/emit/program.fib#L236) |
 | `FIB_LIVE_ROOTS` | [compiler/driver/front.fib:68](../../compiler/driver/front.fib#L68) |
-| `FIB_LIVE_SOCKET` | [compiler/serve/live.fib:238](../../compiler/serve/live.fib#L238) |
+| `FIB_LIVE_SOCKET` | [compiler/serve/live.fib:271](../../compiler/serve/live.fib#L271) |
 | `FIB_LIVE_WITH` | [compiler/fibc.fib:67](../../compiler/fibc.fib#L67) |
 | `FIB_LOG` | [lib/fib/log/core.fib:126](../../lib/fib/log/core.fib#L126) |
 | `FIB_LOG_ASYNC` | [lib/fib/log/config.fib:32](../../lib/fib/log/config.fib#L32) |
@@ -60,7 +61,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LOG_QUEUE` | [lib/fib/log/config.fib:33](../../lib/fib/log/config.fib#L33) |
 | `FIB_LSP_ISOLATE` | [compiler/lsp/server.fib:43](../../compiler/lsp/server.fib#L43) |
 | `FIB_MUSL_DIR` | [compiler/native/linkstatic.fib:66](../../compiler/native/linkstatic.fib#L66) |
-| `FIB_NO_PROJECT` | [compiler/fibc.fib:120](../../compiler/fibc.fib#L120) |
+| `FIB_NO_PROJECT` | [compiler/fibc.fib:124](../../compiler/fibc.fib#L124) |
 | `FIB_PRUNE` | [compiler/emit/compile.fib:82](../../compiler/emit/compile.fib#L82) |
 | `FIB_RESULT_STDOUT` | [compiler/emit/compile.fib:26](../../compiler/emit/compile.fib#L26) |
 | `FIB_SCHED_SKIP` | [rt/sched.lir:143](../../rt/sched.lir#L143) |

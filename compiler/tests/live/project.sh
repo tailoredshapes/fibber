@@ -12,6 +12,9 @@
 #   outside   the same program outside the project (-I only): the name rule as before (every module not named fib.*)
 # Then: without live mode the emit has no slot; the parent `fibc test` exports FIB_LIVE_ROOTS to its children (a scenario reads it: the
 # project's src and specs, not the library) and exports nothing without live mode; the program runs under FIB_LIVE=1 with its answer.
+# Then LM1 (docs/design/live-incremental.md 3.6; serve.liveload): dev/load.fib run under --live, a `load` of acme.util's file is
+# live/NotLive with `--live-deps=acme/util` in the hint; under --live-deps the same load swaps acme.util/util-value and the running
+# program's loop reads the new value.
 # scripts/mutant-live.sh deps-stubbed-by-default and project-paths-not-stubbed must each turn the golden red. Exit 0 when every check holds.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -91,5 +94,47 @@ FIB_LIVE=1 "$fibc" test specs > "$T/test.out" 2> "$T/test.err"; rc=$?
 ck "fibc test under FIB_LIVE=1 exports FIB_LIVE_ROOTS to its children: the scenario passes" "$rc $(grep -c '^total: 1 scenarios: 1 pass' "$T/test.out")" "0 1"
 "$fibc" test specs > "$T/test2.out" 2> /dev/null; rc=$?
 ck "fibc test without live mode exports nothing: the scenario fails" "$rc" 1
+
+# LM1: a load of a library module in a live session: refused without --live-deps (the hint names the library), swapped with it
+cat > "$T/p/app/dev/load.fib" <<'EOF'
+(ns main (:require [acme.util :as u] [fib.unix :as unix]))
+(def stop: (Atom bool) (atom false))
+(def seen: (Atom i64) (atom 0))
+(defun main () -> i64 (do (println "app: ready") (loop () (if @stop 0 (do (reset! seen (u/util-value)) (unix/sleep-ns 20000000) (recur))))))
+EOF
+mkdir -p "$T/rt"
+live_start() { # live_start [WORDS..]: dev/load.fib under `run --live WORDS` in the background; sets live_pid and sock (empty when it did not come up)
+  XDG_RUNTIME_DIR=$T/rt "$fibc" run --live "$@" dev/load.fib > "$T/live.out" 2> "$T/live.err" & live_pid=$!
+  sock=
+  for _ in $(seq 900); do
+    s=$(sed -n 's/^fibc: live at //p' "$T/live.err" | head -n 1)
+    if [ -n "$s" ] && [ -S "$s" ] && grep -q 'app: ready' "$T/live.out"; then sock=$s; break; fi
+    kill -0 "$live_pid" 2> /dev/null || break
+    sleep 0.1
+  done
+}
+live_ask() { printf '%s\n' "$1" | XDG_RUNTIME_DIR=$T/rt "$fibc" repl --connect "$sock" --json 2> /dev/null; }
+live_stop() { live_ask '{"op":"eval","text":"(reset! stop true)"}' > /dev/null; wait "$live_pid"; }
+live_start
+if [ -z "$sock" ]; then echo "FAIL  the live app did not come up"; tail -5 "$T/live.err"; bad=1; kill "$live_pid" 2> /dev/null
+else
+  a=$(live_ask "{\"op\":\"load\",\"file\":\"$util_src/acme/util.fib\"}")
+  ck "a load of a library module under --live is live/NotLive" "$(echo "$a" | grep -o '"code":"live/NotLive"' | head -n 1)" '"code":"live/NotLive"'
+  ck "the hint names the flag and the library" "$(echo "$a" | grep -c 'start with --live-deps=acme/util to make it live')" 1
+  ck "status says the project rule" "$(live_ask '{"op":"status"}' | grep -c '"live":"project paths (')" 1
+  live_stop
+fi
+sed 's/(\* 10 (b\/base-value))/(* 11 (b\/base-value))/' "$util_src/acme/util.fib" > "$T/util.fib"
+grep -q '(\* 11 (b/base-value))' "$T/util.fib" || { echo "FAIL  the fixture's util-value is not the one this test edits"; bad=1; }
+live_start --live-deps
+if [ -z "$sock" ]; then echo "FAIL  the live app did not come up under --live-deps"; tail -5 "$T/live.err"; bad=1; kill "$live_pid" 2> /dev/null
+else
+  ck "before the load the program reads 10" "$(live_ask '{"op":"eval","text":"@seen"}' | grep -o '"value":"[0-9]*"')" '"value":"10"'
+  a=$(live_ask "{\"op\":\"load\",\"file\":\"$T/util.fib\"}")
+  ck "under --live-deps the library module's function swaps" "$(echo "$a" | grep -o '"swapped":\["acme.util/util-value"\]')" '"swapped":["acme.util/util-value"]'
+  sleep 0.3
+  ck "the running program's loop reads the new body" "$(live_ask '{"op":"eval","text":"@seen"}' | grep -o '"value":"[0-9]*"')" '"value":"11"'
+  live_stop
+fi
 [ "$bad" = 0 ] && echo "live project: ok" || echo "live project: FAILED"
 exit "$bad"

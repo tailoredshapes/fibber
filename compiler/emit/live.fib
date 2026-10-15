@@ -36,20 +36,21 @@
 (defun tys-text :private (g: Globals inst: mono/Inst) -> (Vec str)
   (mapv (fn (t: Ty) (printer-ty (printer-new g) t)) (. inst tys)))
 
-;; The record of a stubbed body for the session (emit.program `LiveBody`): the function's name when it is the main module's (so a
-;; session can ask for its body by name), the all-owned flag, whether it is a specialisation, a method's `impl` key, and the
-;; specialisation's types as text (LE3).
+;; The record of a stubbed body for the session (emit.program `LiveBody`): the function's name and its module (nil for the main
+;; module's), so a session can ask for its body by name, the all-owned flag, whether it is a specialisation, a method's `impl` key,
+;; and the specialisation's types as text (LE3).
 (defun live-body :private (g: Globals inst: mono/Inst name: str) -> LiveBody
   (let ((generic (not (empty? (. inst tys)))) (tt (tys-text g inst)))
     (match (. inst key)
-      ((BodyFun fid) (LiveBody name (main-fun-name g fid) false generic nil tt))
-      ((BodyAllOwned fid) (LiveBody name (main-fun-name g fid) true generic nil tt))
-      ((BodyMethod i _) (LiveBody name nil false generic (some (impl-key g i)) tt))
-      ((BodyMethodOwned i _) (LiveBody name nil true generic (some (impl-key g i)) tt))
-      ((BodyDef _) (LiveBody name nil false generic nil tt)))))
+      ((BodyFun fid) (LiveBody name (some (. (g-fun g fid) name)) false generic nil tt (fun-module g fid)))
+      ((BodyAllOwned fid) (LiveBody name (some (. (g-fun g fid) name)) true generic nil tt (fun-module g fid)))
+      ((BodyMethod i _) (LiveBody name nil false generic (some (impl-key g i)) tt nil))
+      ((BodyMethodOwned i _) (LiveBody name nil true generic (some (impl-key g i)) tt nil))
+      ((BodyDef _) (LiveBody name nil false generic nil tt nil)))))
 
-(defun main-fun-name :private (g: Globals fid: i64) -> (Option str)
-  (let ((d (g-fun g fid))) (if (= (. d module) @(. g main)) (some (. d name)) nil)))
+;; The module of a function by name, nil for the main module's (whose bodies are asked for by the bare name).
+(defun fun-module :private (g: Globals fid: i64) -> (Option str)
+  (let ((d (g-fun g fid))) (if (= (. d module) @(. g main)) nil (some (g-module-name g (. d module))))))
 
 ;; `impl:PROTO HEAD`, as serve.replcore keys an `impl` form: the protocol's name and the head type printed with the instance's own
 ;; variable names (`(Vec a)`), which is the form's own text when it was written so.

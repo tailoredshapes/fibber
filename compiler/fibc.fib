@@ -16,7 +16,7 @@
 (ns main
   (:require [driver.static :as st] [driver.args :as a] [driver.commands :as c] [driver.native :as native] [expand.roots :as roots] [expand.maker :as mk]
             [macros.runner :as mr] [driver.harness :as hn] [driver.test :as dt] [driver.version :as v] [lsp.server :as lsp]
-            [pkg.project-mode :as pm] [pkg.modules :as md] [pkg.paths :as pp] [pkg.deps-cmd :as deps] [pkg.new :as new] [serve.cmd :as sc] [emit.program :as ep]))
+            [pkg.project-mode :as pm] [pkg.modules :as md] [pkg.paths :as pp] [pkg.resolve :as rs] [pkg.deps-cmd :as deps] [pkg.new :as new] [serve.cmd :as sc] [emit.program :as ep]))
 
 (defun refuse (word: str) -> i64
   (do (eprintln (str-join ["fibc: `" word "` is retired; no port is available (docs/rust-legacy.md)"])) 2))
@@ -105,10 +105,14 @@
 ;; In live mode (`--live`, FIB_LIVE) the project's own modules are the live ones and the libraries' are not unless `--live-deps`
 ;; (FIB_LIVE_DEPS): FIB_LIVE_ROOTS names the directories (docs/design/live-meshql.md 4, package LT3; read by driver.front for emit.live).
 ;; A value already in the environment is kept: the children of `fibc test` inherit their parent's, which resolved the project.
+;; FIB_LIVE_LIBS names every library with its roots (`NAME=DIR:DIR;NAME=DIR`), live or not: a live session's `load` of a module of a
+;; library that is not live names the library in its hint (`--live-deps=NAME`; serve.liveload, package LM1).
 (defun live-roots-env :private (r: pm/PkgResolved test: bool) -> unit
   (when (and (ep/live-mode?) (nil? (native/getenv-opt "FIB_LIVE_ROOTS")))
-    (native/setenv-set "FIB_LIVE_ROOTS"
-                       (str-join (vec (interpose ":" (md/live-roots (. r project) (. r libs) test (md/live-deps-wanted (native/getenv-opt "FIB_LIVE_DEPS")))))))))
+    (do (native/setenv-set "FIB_LIVE_ROOTS"
+                           (str-join (vec (interpose ":" (md/live-roots (. r project) (. r libs) test (md/live-deps-wanted (native/getenv-opt "FIB_LIVE_DEPS")))))))
+        (native/setenv-set "FIB_LIVE_LIBS"
+                           (str-join (vec (interpose ";" (mapv (fn (l: rs/PkgLib) (str (. l name) "=" (str-join (vec (interpose ":" (md/lib-roots l)))))) (. r libs)))))))))
 
 ;; The module roots a project adds for a command that compiles a program (pkg.project-mode; none outside a project). `test` passes them to
 ;; its children as -I, and FIB_NO_PROJECT keeps the children from resolving again.

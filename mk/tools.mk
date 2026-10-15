@@ -44,7 +44,7 @@ tool_sh-live-stubs := $(T)/live/stubs.sh $(F_ABS) -j $(CASE_JOBS) | $(T)/live/st
 tool_sh-live-run := $(T)/live/run.sh $(F_ABS) | $(wildcard $(T)/live/*) $(wildcard compiler/live/*.fib) compiler/live.fib
 # LT3 (docs/design/live-meshql.md 4): the live module rule in a project (a fixture project with a git dependency: the project's modules are live, the
 # libraries' under --live-deps); LT1 (3.2): fib.test.run's argv override and report sink (the collected report is the child's, byte for byte)
-tool_sh-live-project := $(T)/live/project.sh $(F_ABS) | $(T)/live/project.sh $(T)/live/project-stubs.golden $(T)/deps/fixtures.sh compiler/emit/live.fib compiler/pkg/modules.fib compiler/driver/front.fib compiler/fibc.fib
+tool_sh-live-project := $(T)/live/project.sh $(F_ABS) | $(T)/live/project.sh $(T)/live/project-stubs.golden $(T)/deps/fixtures.sh compiler/emit/live.fib compiler/pkg/modules.fib compiler/driver/front.fib compiler/fibc.fib $(wildcard compiler/serve/live*.fib)
 tool_sh-live-hooks := $(T)/live/hooks.sh $(F_ABS) | $(T)/live/hooks.sh $(T)/live/hooks.fib $(T)/live/hooks-spec.fib $(T)/live/hookspecs.fib lib/fib/test/run.fib
 # LV1: the attach socket of `fibc run --live` (serve.live*), over a real socket against app.fib, and the peer-uid unit (about 2 minutes)
 tool_sh-live-attach := $(T)/live/attach.sh $(F_ABS) | $(T)/live/attach.sh $(T)/live/attach.py $(T)/live/app.fib $(T)/live/unit-livesock.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib)
@@ -66,6 +66,10 @@ tool_sh-live-test := $(T)/live/test.sh $(F_ABS) | $(T)/live/test.sh $(T)/live/te
 # swapped at the REPL (the `expect` macro quotes its form) and the base's scenarios run after it, `specs` itself swapped between three bindings and one
 # (serve.livesplit `split` keeps them with the code, never exports them); the unit of the names (a nested literal's generation; about a minute)
 tool_sh-live-quotes := $(T)/live/quotes.sh $(F_ABS) | $(T)/live/quotes.sh $(T)/live/quotes.py $(T)/live/unit-livetable.fib $(T)/live/test-app.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/emit/statics.fib compiler/emit/defs/cache.fib
+# LM1 (docs/design/live-incremental.md 3): `load` and `reload` of a live session (serve.liveload; the engine's module text overrides, serve.incr `Job.texts`
+# and expand.modules `try-load-texts`; emit.compile `BodyRequest.module`): load-app.fib with load-routes.fib edited on disk and loaded through the socket
+# and the terminal client; all or nothing, live/Removed, live/NotLoaded, the override against a half-saved file (about two minutes)
+tool_sh-live-load := $(T)/live/load.sh $(F_ABS) | $(T)/live/load.sh $(T)/live/load.py $(T)/live/load-app.fib $(T)/live/load-routes.fib $(wildcard compiler/serve/live*.fib) compiler/serve/incr.fib compiler/serve/replcore.fib compiler/expand/modules.fib compiler/emit/live.fib compiler/emit/compile.fib compiler/types/program.fib
 # LV3: swaps under load, the pause and the retirement (serve.liveretire, serve.livesplit, rt/live.lir, fib.os.live, the pause points of fib.http.server):
 # the socket stress (stress-app.fib: 8 threads and the pool under 1000 swaps, pause, retire, resume; swap-app.fib's http pause points) and the
 # ThreadSanitizer run of the stub and slot protocol (stress-tsan.fib in live mode with stress-swapper.lir appended), about two minutes each
@@ -110,7 +114,7 @@ tool_sh-make-graph := $(T)/make/graph.sh | $(wildcard $(T)/make/*) scripts/mac-g
 TOOLS_QUICK := sh-emit-prune fibref-skeleton gen-skeleton lint-pipefail lint-portable sh-driver-check-lib sh-make-graph
 TOOLS_FULL := $(TOOLS_QUICK) unit-api units-all units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-emit-runtime sh-emit-defs-order sh-stack-stack \
-  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap sh-live-defcache sh-live-queue sh-live-test sh-live-quotes sh-live-stress sh-live-stress-tsan \
+  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap sh-live-defcache sh-live-queue sh-live-test sh-live-quotes sh-live-load sh-live-stress sh-live-stress-tsan \
   $(PERSIST_STAMPS) sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
   sh-native-l1-unit $(LIRO_STAMPS) jit-selfhosted-threads sh-native-a64-sibcall sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
 # The command is every word up to the `|`, the inputs every word after it.

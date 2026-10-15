@@ -62,14 +62,15 @@
 (defun module-key (prev: i64 text: str ns: str) -> i64
   (hash-combine (hash-combine (hash-combine prev (hash text)) (str-len text)) (hash ns)))
 
-;; The text of a loaded module: the request's own text for the main file, else the file.
-(defun text-of (l: Loaded file: str source: str) -> str
-  (if (= (. l file) file) source (unwrap-or (read-file (. l file)) "")))
+;; The text of a loaded module: the request's own text for the main file, the job's text for a module it overrides (`Job.texts`, by
+;; module name: a live session's loaded modules), else the file.
+(defun text-of (l: Loaded file: str source: str texts: (Map str str)) -> str
+  (if (= (. l file) file) source (unwrap-or (get texts (. (. l spec) ns)) (unwrap-or (read-file (. l file)) ""))))
 
 ;; The keys of the loaded modules, in order, from the key of the prelude.
-(defun keys-of (base: i64 loaded: (Vec Loaded) file: str source: str) -> (Vec i64)
+(defun keys-of (base: i64 loaded: (Vec Loaded) file: str source: str texts: (Map str str)) -> (Vec i64)
   (. (reduce (fn (acc: (Pair i64 (Vec i64)) l: Loaded)
-               (let ((k (module-key (. acc fst) (text-of l file source) (. (. l spec) ns))))
+               (let ((k (module-key (. acc fst) (text-of l file source texts) (. (. l spec) ns))))
                  (Pair k (conj (. acc snd) k))))
              (Pair base (vec-empty)) loaded)
      snd))
@@ -192,8 +193,9 @@
 
 ;; What a request asks of the front end: the file (as the diagnostics name it), the file the loader starts from (`start`: the file itself, or for a library module a
 ;; one-line program that requires it), that text, the module roots, whether `main` is required ("yes", "no", "auto": when the file defines it), whether
-;; the program itself is wanted (a run) or only the verdict (a check), and the module whose every unit is checked ("" for the program's own).
-(defstruct Job (file: str start: str source: str rts: roots/Roots mainmode: str want: bool target: str))
+;; the program itself is wanted (a run) or only the verdict (a check), the module whose every unit is checked ("" for the program's own), and the text of the
+;; modules read in place of their files, by module name (`texts`: a live session's loaded modules, docs/design/live-incremental.md 3.3; empty otherwise).
+(defstruct Job (file: str start: str source: str rts: roots/Roots mainmode: str want: bool target: str texts: (Map str str)))
 
 ;; A library module (`fib.*`) is not a program: it sees no implicit module and may define no `main`. It is checked as the module a one-line program requires, which
 ;; sees the implicit modules the library's own instances come from; its own units are all checked, the others' only when reached. The text is the file's on disk.
@@ -207,7 +209,7 @@
         (let ((ns (. spec ns)) (rel (str (str-replace-all ns "." "/") ".fib")))
           (if (mods/sees-implicit ns (mods/implicit-lib))
               nil
-              (some (Job file "<check>" (str "(ns main (:require [" ns " :as target]))\n") (root-for rts file rel) "no" want ns)))))))))
+              (some (Job file "<check>" (str "(ns main (:require [" ns " :as target]))\n") (root-for rts file rel) "no" want ns (map-empty))))))))))
 
 (defun str-replace-all :private (s: str from: str to: str) -> str
   (str-join (vec (interpose to (split-on s from)))))
@@ -225,28 +227,33 @@
           (= file rel) (roots/Roots (into ["."] (. rts dirs)) (. rts builtin) (. rts with))
           :else rts)))
 
-(defun job-of (file: str source: str rts: roots/Roots mainmode: str want: bool) -> Job
+(defun job-of (file: str source: str rts: roots/Roots mainmode: str want: bool texts: (Map str str)) -> Job
   (match (library-job file source rts want)
     ((some j) j)
-    (nil (Job file file source rts mainmode want ""))))
+    (nil (Job file file source rts mainmode want "" texts))))
 
 ;; The front end of a job through typing and ownership. Without `want` (a check), text seen before is answered from its verdict with no `Checked`: `Err []` is a
 ;; program that held, and `stats.verdict` says it came from the cache. With `want` (a run) the program is always made.
 (defun engine-front (e: Engine file: str source: str rts: roots/Roots mainmode: str want: bool) -> Front
-  (engine-job e (job-of file source rts mainmode want)))
+  (engine-job e (job-of file source rts mainmode want (map-empty))))
+
+;; `engine-front` with `texts` read in place of the files of the modules they name (a live session's loaded modules, package LM1): the keys
+;; are over the text given, so the module and every module after it in the load order are expanded and checked again when it changes.
+(defun engine-front-texts (e: Engine file: str source: str rts: roots/Roots mainmode: str want: bool texts: (Map str str)) -> Front
+  (engine-job e (job-of file source rts mainmode want texts)))
 
 (defun engine-job (e: Engine j: Job) -> Front
   (let ((t0 (sys-clock-now)))
     (match (prelude-of e)
       ((Err ds) (Front (Err ds) (empty-stats) ""))
       ((Ok [prelude base-ctx])
-       (match (mods/try-load-in (. j source) (. j start) (. j rts))
+       (match (mods/try-load-texts (. j source) (. j start) (. j rts) (. j texts))
          ((Err x) (Front (Err [(dg/load-diag x)]) (empty-stats) ""))
          ((Ok loaded) (front-loaded e j loaded prelude base-ctx t0)))))))
 
 (defun front-loaded :private (e: Engine j: Job loaded: (Vec Loaded) prelude: (Vec Stx) base-ctx: ExpandCtx t0: i64) -> Front
   (let ((t1 (ms-since t0))
-        (keys (keys-of @(. e prelude-key) loaded (. j start) (. j source)))
+        (keys (keys-of @(. e prelude-key) loaded (. j start) (. j source) (. j texts)))
         (mm (. j mainmode))
         (main (cond (= mm "yes") true (= mm "no") false :else (defines-main? (. (nth loaded (- (count loaded) 1)) forms))))
         (vkey (str (show (nth keys (- (count keys) 1))) "/" (show (hash (. j file))) "/" (if main "m" "l")))
