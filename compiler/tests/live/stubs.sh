@@ -13,7 +13,9 @@
 #    (docs/design/live-repl.md 3.5, risk 5 of section 7), and a case whose header pins what the non-catching convention does (a trap
 #    that abandons objects) differs under FIB_CATCH=all with or without stubs: the stubs are judged against the catching table
 #    (FIB_LIVE=1 and FIB_CATCH=all must agree row for row), and the rows where the catching table differs from the plain one must be
-#    exactly those of catching.expected (one `DIR/CASE` per line): a new one is a failure, as is one that no longer differs.
+#    exactly those of catching.expected (one `DIR/CASE` per line): a new one is a failure, as is one that no longer differs. The cases
+#    catching.expected lists are always in the sample: the sample's stride is the case count over 100, so a case added to cases/stdlib
+#    moves which cases the stride picks (8423 moved it from 14 to 15 and 8690 fell out, which read as "no longer differs").
 # Exit 0 when every check holds.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -64,7 +66,8 @@ if [ "$r" = "$plain" ]; then echo "ok run --live: $r"; else echo "FAIL run --liv
 if [ -z "$quick" ]; then
   stdlib_names() { (cd cases/stdlib && for e in $(LC_ALL=C ls); do if [ -f "$e" ]; then [[ $e == *.fib ]] && echo "$e" || true; elif [ -f "$e/main.fib" ]; then echo "$e"; fi; done); }
   n=$(stdlib_names | wc -l); step=$(( n / 100 > 0 ? n / 100 : 1 ))
-  sample=$({ stdlib_names | awk -v k="$step" 'NR % k == 0'; sed -n 's|^cases/stdlib/\([^ ]*\) .*|\1|p' scripts/ci-stage2.expected | sed 's|/main.fib$||'; } | LC_ALL=C sort -u | tr '\n' ' ')
+  sample=$({ stdlib_names | awk -v k="$step" 'NR % k == 0'; sed -n 's|^cases/stdlib/\([^ ]*\) .*|\1|p' scripts/ci-stage2.expected | sed 's|/main.fib$||'
+             sed -n 's|^cases/stdlib/||p' "$here/catching.expected" | sed 's|/main.fib$||'; } | LC_ALL=C sort -u | tr '\n' ' ')
   rows() { awk 'NR > 1 && NF >= 2 && $2 != "" && $1 != "" && $0 !~ /^[0-9]+ cases:/ && $0 !~ /^$/ { print $1 }' "$1"; }  # the case names of a table
   table() { # table NAME DIR [--only ..]: the case table of a directory, plain, catching and live
     local name=$1 dir=$2; shift 2
