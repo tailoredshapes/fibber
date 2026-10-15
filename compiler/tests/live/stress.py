@@ -198,7 +198,7 @@ check('load runs after the resume', c4[0] > c3[0] and c4[2] > c3[2] and c4[1] ==
 t = c.ask(op='status')['threads']
 check('nothing parked after the resume', t.get('paused') == 0 and t.get('pausing') is False, t)
 for n in range(20):
-    s = c.eval(bodies[n % 2])
+    s = c.eval(bodies[gen % 2])   # the other body: the one `f` has now is redefined with no change (LM2: nothing swapped)
     if s.get('swapped') != ['f']: check('swap after retire %d' % n, False, s); break
     gen += 1
 time.sleep(0.5)
@@ -248,7 +248,7 @@ def keepalive_get(s, port, path):
     return head.split(b'\r\n')[0].decode(), body.decode()
 
 port = free_port()
-b = App(os.path.join(here, 'swap-app.fib'), ['--', '--port', str(port)], ready='app: listening')
+b = App(os.path.join(here, 'swap-app.fib'), ['-I', here, '--', '--port', str(port)], ready='app: listening')
 check('http app started', b.sock is not None and b.alive() and 'app: listening on %d' % port in b.stdout(), 'stderr: %s stdout: %s' % (b.stderr()[-800:], b.stdout()))
 if b.sock is None or not b.alive(): b.p.kill(); sys.exit(1)
 c = Client(b.sock)

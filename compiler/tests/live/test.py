@@ -134,13 +134,15 @@ check('unchanged after the refusals', c.ask(op='status').get('generation') == 0 
 out, r = terminal(a.sock, [':test --only zero',
                            '(defun classify (n: i64) -> str (cond (< n 0) "neg" (= n 0) "zero" :else "pos"))',
                            ':test'])
-# the positions are the session's text's (`<repl>:L:C`: the input's program is the REPL's re-assembled text, live-repl.md 9 (g))
+# the positions are the session's text's (`<repl>:L:C`: the input's program is the REPL's re-assembled text, live-repl.md 9 (g));
+# `specs` is swapped too (LM2: change by expanded form): the redefined `classify` moves to the end of that text, so the positions its
+# `expect`s quote change, and with them its expansion
 matches('fix and rerun', out, [r'; attached to .*test-app\.fib \(pid %d, generation 0, catching\); \d+ threads?, pool \d+ workers' % a.p.pid,
                                r'Classify', r'  FAIL  zero', r'        Given h = \(bump\)', r'      > Then "zero" = \(classify 0\)', r'          expected: "zero"', r'          actual:   "pos"',
                                r'          at <repl>:\d+:\d+', r'        id Classify/zero  \(<repl>:\d+:\d+\)', r'',
                                r'1 scenarios: 0 pass, 1 fail, 0 trap, 0 timeout \(seed 1\)', r"replay: :test --only 'Classify/zero' --seed 1",
                                r'; 1 scenario in \d+ ms \(generation 0\)',
-                               r'; swapped classify \(generation 1\): check \d+ ms, emit \d+ ms, jit \d+ ms',
+                               r'; swapped specs, classify \(generation 1\): check \d+ ms, emit \d+ ms, jit \d+ ms',
                                r'Classify', r'  pass  zero', r'', r'1 scenarios: 1 pass, 0 fail, 0 trap, 0 timeout \(seed 1\)',
                                r'; 1 scenario in \d+ ms \(generation 1\)'])
 t = c.ask(op='test', last=True)
@@ -156,7 +158,7 @@ check('status during a run answers within 500 ms', st and st.get('generation') =
 b = c.ask(op='test', id='second')
 check('a second test is busy, with the elapsed time', b and b.get('ok') is False and b['error']['code'] == 'busy' and b.get('id') == 'second' and b['running']['id'] == 'slow' and b['running']['elapsed_ms'] >= 500, b)
 sw = c.eval('(defun slow-twice (n: i64) -> i64 (* 20 n))')
-check('a swap lands during the run', sw.get('swapped') == ['slow-twice'] and sw.get('generation') == gen + 1, sw)
+check('a swap lands during the run', sw.get('swapped') == ['specs', 'slow-twice'] and sw.get('generation') == gen + 1, sw)
 t = c.answer()
 check('the run is stale and the row shows both generations', t and t.get('id') == 'slow' and t.get('stale') is True and t.get('generation_start') == gen and t.get('generation_end') == gen + 1
       and statuses(t) == ['fail'] and row(t, 'two seconds')['steps'][-1]['expected'] == '6' and row(t, 'two seconds')['steps'][-1]['actual'] == '60', t)

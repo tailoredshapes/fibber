@@ -23,7 +23,7 @@
   (:require [serve.replcore :as rc] [serve.incr :as inc] [serve.diag :as dg] [serve.livetable :as lt] [expand.roots :as roots] [emit.compile :as ec]
             [emit.program :as ep] [emit.statics :as st] [emit.node :as n] [emit.function :as f] [live.jit :as lj] [live.extract :as ex]
             [types.decls :as td] [emit.names :as en] [own.program :as op] [own.driver :as od] [driver.front :as front] [expand.maker :as mk] [lair.ffi :as ffi]
-            [serve.livesplit :as sp] [fib.unix :as unix] [fib.string :as s]))
+            [serve.livesplit :as sp] [serve.livediff :as ldf] [fib.unix :as unix] [fib.string :as s]))
 
 (def guard-clauses: (Vec str) ["(:use fib.ex)"])
 
@@ -273,10 +273,24 @@
 ;; The warm engine (LE5, docs/design/live-incremental.md 3.7): the engine's front end run once on the session's text as it stands (the
 ;; base's files, the loaded texts), so that its expanded modules and the checker's chain are kept and the first input costs what any
 ;; input costs (the session module expanded again, nothing else); whether that text checked.
+;; It also records the hashes of the text's expanded forms (LM2, `note-hashes`).
 (defun warm (sx: Sess) -> bool
-  (match (. (rc/front-texts (. sx eng) (. sx rts) (rc/source-of @(. (. sx rc) clauses) @(. (. sx rc) defs) "") "yes" true @(. sx texts)) checked)
-    ((Ok _) true)
-    ((Err _) false)))
+  (let ((fr (rc/front-texts (. sx eng) (. sx rts) (rc/source-of @(. (. sx rc) clauses) @(. (. sx rc) defs) "") "yes" true @(. sx texts))))
+    (match (. fr checked)
+      ((Ok _) (do (note-hashes sx fr) true))
+      ((Err _) false))))
+
+;; The hash of every definition's expanded form of a program that checked, recorded in the live table as the accepted program's
+;; (LM2, serve.livediff): what the next input's program is compared with.
+(defun note-hashes (sx: Sess fr: inc/Front) -> unit
+  (set! (. sx table) (lt/with-hashes @(. sx table) (ldf/hash-map-of (ldf/hashes-of (. fr modules) @(. sx live-modules))))))
+
+;; The hashes of the last accepted program: the warm engine's, else made now from the session's text (a session that was not warmed:
+;; docs/design/live-incremental.md 6, LE5 (a)).
+(defun accepted-hashes (sx: Sess) -> (Map str i64)
+  (match (. @(. sx table) hashes)
+    ((some hs) hs)
+    (nil (do (warm sx) (unwrap-or (. @(. sx table) hashes) {})))))
 
 ;; The address of `live.run`: the caller runs it on the thread of its choice (serve.live: the program's thread).
 (defun run-address (sx: Sess) -> (Result i64 str) (lj/c-entry (jit-of sx) "live.run"))

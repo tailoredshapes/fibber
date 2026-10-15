@@ -17,9 +17,14 @@
 ;; `scheme`: the function's scheme as the signature rule compares it and as a message shows it (`scheme-texts`).
 (defstruct Family (generation: i64 scheme: (Option (Pair str str)) summary: (Option op/Summary) gens: (Vec Generation)))
 
-(defstruct Table (families: (Map str Family) generation: i64))
+;; `hashes` (LM2, serve.livediff): the hash of each definition's expanded form at the last accepted program, by key (`f.NAME`, the
+;; family of a function; `impl:PROTO HEAD`); nil until the session's text was first expanded (the warm engine, or the first input).
+(defstruct Table (families: (Map str Family) generation: i64 hashes: (Option (Map str i64))))
 
-(defun table-new () -> Table (Table {} 0))
+(defun table-new () -> Table (Table {} 0 nil))
+
+;; `t` with the hashes of the program accepted last.
+(defun with-hashes (t: Table hs: (Map str i64)) -> Table (Table (. t families) (. t generation) (some hs)))
 
 ;; ---- names
 
@@ -79,10 +84,9 @@
   (Family gen (scheme-of c ids family) (summary-of c ids family) (match old ((some f) (. f gens)) (nil []))))
 
 ;; The table of the base: every family the base made, at generation 0.
-;; The table of the base: every family the base made, at generation 0.
 (defun table-of-base (bodies: (Map str (Vec ep/LiveBody)) c: od/Checked) -> Table
   (let ((ids (fun-ids (. (. c typed) globals))))
-    (Table (reduce (fn (acc: (Map str Family) family: str) (assoc acc family (family-of c ids family 0 nil))) {} (vec (keys bodies))) 0)))
+    (Table (reduce (fn (acc: (Map str Family) family: str) (assoc acc family (family-of c ids family 0 nil))) {} (vec (keys bodies))) 0 nil)))
 
 ;; The table after an input: the families of `swapped` at generation `gen`, every family's scheme and summary as the program has them
 ;; (the rules kept them equal), the families the program made and the table lacked added at generation 0 (a new function), and the
@@ -93,19 +97,19 @@
                      (let ((old (get (. t families) family)))
                        (assoc acc family (family-of c ids family (if (includes? family swapped) gen (match old ((some f) (. f generation)) (nil 0))) old))))
                    {} (vec (keys bodies)))
-           (if (empty? swapped) (. t generation) gen))))
+           (if (empty? swapped) (. t generation) gen) (. t hashes))))
 
 ;; `t` with generation `g` recorded for `family`.
 (defun add-generation (t: Table family: str g: Generation) -> Table
   (match (get (. t families) family)
     (nil t)
-    ((some f) (Table (assoc (. t families) family (Family (. f generation) (. f scheme) (. f summary) (conj (. f gens) g))) (. t generation)))))
+    ((some f) (Table (assoc (. t families) family (Family (. f generation) (. f scheme) (. f summary) (conj (. f gens) g))) (. t generation) (. t hashes)))))
 
 ;; `t` with the generations of `family` replaced by `gens` (a retirement, serve.liveretire).
 (defun set-generations (t: Table family: str gens: (Vec Generation)) -> Table
   (match (get (. t families) family)
     (nil t)
-    ((some f) (Table (assoc (. t families) family (Family (. f generation) (. f scheme) (. f summary) gens)) (. t generation)))))
+    ((some f) (Table (assoc (. t families) family (Family (. f generation) (. f scheme) (. f summary) gens)) (. t generation) (. t hashes)))))
 
 ;; How many generations the table keeps under trackers (the base's generation 0 is resident and not counted).
 (defun generations-kept (t: Table) -> i64

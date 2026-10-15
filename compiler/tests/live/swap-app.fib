@@ -1,10 +1,12 @@
-(ns main (:use fib.http fib.http.server) (:require [fib.unix :as u] [fib.string :as st] [fib.os.live :as live]))
+(ns main (:use fib.http fib.http.server) (:require [fib.unix :as u] [fib.string :as st] [fib.os.live :as live] [swapalt.one :as alt] [swapalt.two :as two]))
 ;; The program of compiler/tests/live/swap.sh: an HTTP app of the shape of docs/design/live-repl.md 5 (`main` gives `handle` to
 ;; `run-server` as a value, so the server holds a closure constant made before any swap), with a worker thread calling `work` in a loop
 ;; and counting answers that are neither body's (the swap stress), a generic function used at two types, a method, and a named
 ;; function kept in an atom. The port is `--port N` of its arguments; `main` waits until `stop` is set through the attach socket.
 ;; The worker and `main` pass a pause point (fib.os.live) so that compiler/tests/live/stress.sh can pause the program at its server's
 ;; own pause points (the accept loop, a kept-alive connection's wait) and retire a swapped `handle`.
+;; LM2: `alt-which` calls `alt/which` (swapalt.one; swapalt.two has a `which` too) and `macro-user` expands the macro `seven`: an input
+;; that moves `alt` to swapalt.two, or redefines `seven`, changes their expanded forms and not their text.
 (defrecord Item (id: i64 name: str))
 (defrecord Db (items: (Vec Item)))
 (defprotocol Greet (greet (self) -> str))
@@ -46,6 +48,10 @@
   ([db: Db req: Request] -> Response (route req))
   ([req: Request] -> Response (route-path req (path-of req))))
 
+(defmacro seven () `(+ 3 4))
+(defun macro-user () -> i64 (+ (seven) (str-len (two/which))))
+(defun alt-which () -> str (alt/which))
+
 (defun route-path (req: Request path: str) -> Response
   (cond (= path "/") (text-response 200 (str "root " (query req "name")))
           (st/starts-with? path "/items/") (match (item-of path) ((some it) (text-response 200 (. it name))) (nil (text-response 404 "no such item")))
@@ -54,6 +60,7 @@
           (= path "/twice") (text-response 200 (str (twice 21) " " (twice 1.5)))
           (= path "/calls") (text-response 200 (str @calls " " @bad))
           (= path "/tag") (text-response 200 (str (tag)))
+          (= path "/alt") (text-response 200 (str (alt-which) " " (macro-user)))
           :else (text-response 404 "not found")))
 
 (defun handle (req: Request) -> Response (route req))

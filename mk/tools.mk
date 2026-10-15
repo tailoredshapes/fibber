@@ -51,7 +51,7 @@ tool_sh-live-hooks := $(T)/live/hooks.sh $(F_ABS) | $(T)/live/hooks.sh $(T)/live
 tool_sh-live-attach := $(T)/live/attach.sh $(F_ABS) | $(T)/live/attach.sh $(T)/live/attach.py $(T)/live/app.fib $(T)/live/unit-livesock.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/serve/incr.fib compiler/serve/replcore.fib
 # LV2: body swaps in the running program (serve.liveswap, serve.livetable, serve.liverules): swap-app.fib's server holds the handler as a value, a worker
 # thread calls the swapped function; the design's transcripts 1, 4 and 5 through the terminal client (about 2 minutes)
-tool_sh-live-swap := $(T)/live/swap.sh $(F_ABS) | $(T)/live/swap.sh $(T)/live/swap.py $(T)/live/swap-app.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/emit/live.fib
+tool_sh-live-swap := $(T)/live/swap.sh $(F_ABS) | $(T)/live/swap.sh $(T)/live/swap.py $(T)/live/unit-livediff.fib $(T)/live/swap-app.fib $(wildcard $(T)/live/swapalt/*.fib) $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/emit/live.fib compiler/serve/incr.fib
 # LE1 (docs/design/live-incremental.md 2.2, 4): the constant defs' values kept in the session's Tables (emit.defs.cache): defcache-app.fib's defs read
 # through three generations and by expressions, a required module edited on disk read anew, FIB_LIVE_EMIT=off and =verify agreeing with the cache
 # on, the emit of a swap under a third of the cache-off one (about two minutes)
@@ -74,7 +74,7 @@ tool_sh-live-load := $(T)/live/load.sh $(F_ABS) | $(T)/live/load.sh $(T)/live/lo
 # LV3: swaps under load, the pause and the retirement (serve.liveretire, serve.livesplit, rt/live.lir, fib.os.live, the pause points of fib.http.server):
 # the socket stress (stress-app.fib: 8 threads and the pool under 1000 swaps, pause, retire, resume; swap-app.fib's http pause points) and the
 # ThreadSanitizer run of the stub and slot protocol (stress-tsan.fib in live mode with stress-swapper.lir appended), about two minutes each
-tool_sh-live-stress := $(T)/live/stress.sh $(F_ABS) --socket-only | $(T)/live/stress.sh $(T)/live/stress.py $(T)/live/stress-app.fib $(T)/live/swap-app.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/emit/live.fib rt/live.lir lib/fib/os/live.fib $(wildcard lib/fib/http/server/*.fib)
+tool_sh-live-stress := $(T)/live/stress.sh $(F_ABS) --socket-only | $(T)/live/stress.sh $(T)/live/stress.py $(T)/live/stress-app.fib $(T)/live/swap-app.fib $(wildcard $(T)/live/swapalt/*.fib) $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/emit/live.fib rt/live.lir lib/fib/os/live.fib $(wildcard lib/fib/http/server/*.fib)
 tool_sh-live-stress-tsan := env TSAN_OUT=$(TOOLS_OUT)/live-stress-tsan $(T)/live/stress.sh $(F_ABS) --tsan-only | $(T)/live/stress.sh $(T)/live/stress-tsan.fib $(T)/live/stress-swapper.lir scripts/tsan.sh scripts/tsan-baseline.txt compiler/emit/live.fib rt/live.lir lib/fib/os/live.fib
 # The persistent checker's controls (run.sh, about 2 minutes whole) as independent stamps of at most about 50 s: the command-line programs in three groups,
 # the three batch comparisons (each builds its own emit tool), and the server edits. PERSIST_PARTS are queued right after the fixed point (mk/gate.mk).

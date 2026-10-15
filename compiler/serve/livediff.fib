@@ -1,0 +1,115 @@
+;; compiler/serve/livediff.fib: what a live input changed, by expanded form (docs/design/live-incremental.md 2.4 item 3, package LM2).
+;; A family is changed iff the hash of its definition's EXPANDED form differs from the one recorded at its last accepted program (the
+;; live table's `hashes`), not its text: a definition whose text is the same but whose expansion differs (a `require` alias moved to
+;; another module, a macro it uses redefined) is swapped; one whose text changed only in a comment or in its layout is not. The form
+;; is printed without positions (syntax.print), its `alias/name` symbols with the alias's module in its module's `:require`s (the
+;; checker resolves them after the expander, which leaves them as written), its gensyms (`#p.N`, numbered across the module by the
+;; expander's context) renumbered in their order in the form, and the module's `:use`s appended (a name a used module gives is resolved
+;; after expansion too: a changed `:use` changes every definition of the module, an over-approximation). Keys: `f.PREFIX.NAME` for a
+;; `defun` (the family of the function, emit.names: the main module's prefix is empty), `impl:PROTO HEAD` for an `impl` (as the REPL
+;; and emit.live `impl-key` name one). Only the main module and the live modules are hashed (the library's bodies have no stubs).
+(ns serve.livediff
+  (:require [emit.program :as ep] [syntax.print :as pr] [fib.string :as s])
+  (:use syntax.form expand.types))
+
+;; ---- forms
+
+(defun items-of :private (f: Stx) -> (Vec Stx)
+  (match (. f kind) ((SList items) items) (_ [])))
+
+(defun sym-at :private (f: Stx i: i64) -> str
+  (let ((items (items-of f)))
+    (if (< i (count items)) (match (. (nth items i) kind) ((SSym n) n) (_ "")) "")))
+
+(defun gensym? :private (n: str) -> bool (and (> (str-len n) 1) (= (str-byte-at n 0) 35i8) (some? (str-find n "." 1))))   ; `#p.N`
+
+;; The gensyms of a form, each by its order of first appearance.
+(defun gensyms-in :private (f: Stx acc: (Map str i64)) -> (Map str i64)
+  (match (. f kind)
+    ((SSym n) (if (and (gensym? n) (nil? (get acc n))) (assoc acc n (count acc)) acc))
+    ((SList items) (reduce (fn (a: (Map str i64) x: Stx) (gensyms-in x a)) acc items))
+    ((SVec items) (reduce (fn (a: (Map str i64) x: Stx) (gensyms-in x a)) acc items))
+    ((SMap items) (reduce (fn (a: (Map str i64) x: Stx) (gensyms-in x a)) acc items))
+    (_ acc)))
+
+;; A symbol as the hash sees it: a gensym by its order in the form, `alias/name` with the alias's module.
+(defun canon-sym :private (n: str gs: (Map str i64) aliases: (Map str str)) -> str
+  (match (get gs n)
+    ((some k) (str "#g." k))
+    (nil (match (str-find n "/" 1)
+           (nil n)
+           ((some i) (match (get aliases (str-slice n 0 i)) ((some ns) (str ns (str-slice n i (str-len n)))) (nil n)))))))
+
+(defun canon :private (f: Stx gs: (Map str i64) aliases: (Map str str)) -> Stx
+  (let ((each (fn (items: (Vec Stx)) (mapv (fn (x: Stx) (canon x gs aliases)) items))))
+    (match (. f kind)
+      ((SSym n) (Stx (SSym (canon-sym n gs aliases)) (. f pos)))
+      ((SList items) (Stx (SList (each items)) (. f pos)))
+      ((SVec items) (Stx (SVec (each items)) (. f pos)))
+      ((SMap items) (Stx (SMap (each items)) (. f pos)))
+      (_ f))))
+
+;; The text a definition's hash is over: the form without positions, then the module's `:use`s.
+(defun form-text (f: Stx aliases: (Map str str) uses: str) -> str
+  (str (pr/stx-show (canon f (gensyms-in f {}) aliases)) "\n" uses))
+
+;; The key of a top-level form: a function's family, an `impl`'s key; "" for anything else.
+(defun key-of :private (f: Stx prefix: str) -> str
+  (let ((h (sym-at f 0)) (items (items-of f)))
+    (cond (or (= h "defun") (= h "defn")) (if (= (sym-at f 1) "") "" (str "f." prefix (sym-at f 1)))
+          (and (= h "impl") (>= (count items) 3) (not (= (sym-at f 1) ""))) (str "impl:" (sym-at f 1) " " (pr/stx-show (nth items 2)))
+          :else "")))
+
+;; ---- modules
+
+(defun alias-map :private (spec: ModuleSpec) -> (Map str str)
+  (reduce (fn (acc: (Map str str) r: Require) (assoc acc (. r alias) (. r ns))) {} (. spec requires)))
+
+;; Whether a module's bodies are stubbed: the main module, a module of the live set (the project rule), any module not `fib.*` (the
+;; name rule: `live` nil).
+(defun hashed? :private (ns: str main: bool live: (Option (Set str))) -> bool
+  (or main (match live ((some st) (contains? st ns)) (nil (not (s/starts-with? ns "fib."))))))
+
+(defun module-hashes :private (m: Expanded main: bool acc: (Vec (Pair str i64))) -> (Vec (Pair str i64))
+  (let ((prefix (if main "" (str (. (. m spec) ns) "."))) (aliases (alias-map (. m spec)))
+        (uses (str-join (vec (interpose " " (. (. m spec) uses))))))
+    (reduce (fn (a: (Vec (Pair str i64)) f: Stx)
+              (let ((k (key-of f prefix))) (if (= k "") a (conj a (Pair k (hash (form-text f aliases uses)))))))
+            acc (. m forms))))
+
+;; The hash of every definition of the stubbed modules of a program (the main module last), in the program's order.
+(defun hashes-of (modules: (Vec Expanded) live: (Option (Set str))) -> (Vec (Pair str i64))
+  (let ((n (count modules)))
+    (reduce (fn (acc: (Vec (Pair str i64)) i: i64)
+              (let ((m (nth modules i)) (main (= i (- n 1))))
+                (if (hashed? (. (. m spec) ns) main live) (module-hashes m main acc) acc)))
+            [] (range n))))
+
+(defun hash-map-of (hs: (Vec (Pair str i64))) -> (Map str i64)
+  (reduce (fn (acc: (Map str i64) p: (Pair str i64)) (assoc acc (. p fst) (. p snd))) {} hs))
+
+;; ---- the families a program changed
+
+;; The families of a changed key: a function's own when the program registered bodies of it, every method family of an `impl`.
+(defun families-of-key (bodies: (Map str (Vec ep/LiveBody)) key: str) -> (Vec str)
+  (cond (s/starts-with? key "impl:")
+          (vec (keep (fn (p: (Pair str (Vec ep/LiveBody)))
+                       (if (some? (first (filterv (fn (b: ep/LiveBody) (= (. b impl) (some key))) (. p snd)))) (some (. p fst)) nil))
+                     (vec bodies)))
+        (some? (get bodies key)) [key]
+        :else []))
+
+;; The keys whose hash in `news` differs from the one in `olds`, in the program's order; a key `olds` lacks (a new definition) is not
+;; a change.
+(defun changed-keys (olds: (Map str i64) news: (Vec (Pair str i64))) -> (Vec str)
+  (vec (keep (fn (p: (Pair str i64)) (match (get olds (. p fst)) ((some h) (if (= h (. p snd)) nil (some (. p fst)))) (nil nil))) news)))
+
+;; What an input's program changed: the families to swap (a changed function's, every method family of a changed `impl`), the changed
+;; `impl`s' keys (their methods are asked for by key: emit.compile `BodyRequest`), and the program's hashes, recorded when it is accepted.
+(defstruct Changes (families: (Vec str) impls: (Vec str) hashes: (Vec (Pair str i64))))
+
+(defun changes (olds: (Map str i64) news: (Vec (Pair str i64)) bodies: (Map str (Vec ep/LiveBody))) -> Changes
+  (let ((keys (changed-keys olds news)))
+    (Changes (reduce (fn (acc: (Vec str) k: str) (into acc (filterv (fn (f: str) (not (includes? f acc))) (families-of-key bodies k)))) [] keys)
+             (filterv (fn (k: str) (s/starts-with? k "impl:")) keys)
+             news)))

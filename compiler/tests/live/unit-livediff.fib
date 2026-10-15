@@ -1,0 +1,62 @@
+(ns main (:require [serve.livediff :as ldf] [emit.program :as ep] [syntax.reader :as reader]) (:use syntax.form syntax.pos expand.types))
+;; The hashes of serve.livediff (LM2, docs/design/live-incremental.md 2.4 item 3) over forms read from text: a comment or a layout
+;; change and a definition's place leave a hash as it was; an alias moved to another module changes its user's hash and no other's;
+;; gensyms numbered differently by the expander are the same; the keys (a function's family with its module's prefix, an `impl`'s);
+;; the library is not hashed; the changes (a new definition is not one; a changed `impl` names its method families). Built and run by
+;; compiler/tests/live/swap.sh (no LLVM). Exit 0 when every check holds.
+(defun check (name: str ok: bool) -> i64
+  (do (println (str (if ok "ok " "FAIL ") name)) (if ok 0 1)))
+
+(defun forms (text: str) -> (Vec Stx)
+  (match (reader/read-all text "<unit>") ((Ok fs) fs) ((Err _) [])))
+
+(defun module (ns: str alias-to: str text: str) -> Expanded
+  (Expanded (ModuleSpec ns [(Require "x" alias-to)] [] [] []) (forms text)))
+
+;; The hashes of a program of a module `routes` (x is `alias-to`) and the main module `text`.
+(defun hashes (alias-to: str routes: str text: str) -> (Map str i64)
+  (ldf/hash-map-of (ldf/hashes-of [(module "fib.lib" "fib.core" "(defun lib () -> i64 1)") (module "routes" alias-to routes) (module "main" "a" text)] nil)))
+
+(def app: str "(defun f () -> i64 (x/g))\n(defun h () -> i64 2)\n(impl Greet Item (greet (self) \"hi\"))\n")
+
+(defun same-key (a: (Map str i64) b: (Map str i64) key: str) -> bool
+  (match [(get a key) (get b key)] ([(some p) (some q)] (= p q)) (_ false)))
+
+(defun checks-hashes () -> i64
+  (let ((h0 (hashes "a" "(defun r () -> i64 (x/g))" app))
+        (comment (hashes "a" "(defun r () -> i64\n  ;; a comment\n  (x/g))" app))
+        (moved (hashes "b" "(defun r () -> i64 (x/g))" app))
+        (placed (hashes "a" "(defun r () -> i64 (x/g))" (str "(defun new-one () -> i64 0)\n\n" app))))
+    (+ (check "the keys: a module's function with its prefix, the main module's without, an impl's" (and (some? (get h0 "f.routes.r")) (some? (get h0 "f.f")) (some? (get h0 "impl:Greet Item"))))
+       (+ (check "the library is not hashed" (nil? (get h0 "f.fib.lib.lib")))
+          (+ (check "a comment does not change the hash" (same-key h0 comment "f.routes.r"))
+             (+ (check "the alias moved changes its user's hash" (not (same-key h0 moved "f.routes.r")))
+                (+ (check "the alias of another module is not the main module's" (same-key h0 moved "f.f"))
+                   (check "a definition's place is not in its hash" (and (same-key h0 placed "f.f") (same-key h0 placed "f.h"))))))))))
+
+(defun at () -> Pos (Pos "<unit>" 1 1 0 0))
+(defun sym (n: str) -> Stx (Stx (SSym n) (at)))
+(defun defun-of (body: (Vec Stx)) -> Stx (Stx (SList (into [(sym "defun") (sym "k") (Stx (SList []) (at))] body)) (at)))
+(defun hash-of (f: Stx) -> i64 (match (get (ldf/hash-map-of (ldf/hashes-of [(Expanded (ModuleSpec "main" [] [] [] []) [f])] nil)) "f.k") ((some h) h) (nil 0)))
+
+(defun checks-gensyms () -> i64
+  (+ (check "gensyms numbered by the module are renumbered in the form" (= (hash-of (defun-of [(sym "#let.3") (sym "#let.3")])) (hash-of (defun-of [(sym "#let.9") (sym "#let.9")]))))
+     (check "two gensyms are not one" (not (= (hash-of (defun-of [(sym "#let.3") (sym "#let.4")])) (hash-of (defun-of [(sym "#let.9") (sym "#let.9")])))))))
+
+(defun bodies () -> (Map str (Vec ep/LiveBody))
+  {"f.routes.r" [(ep/LiveBody "f.routes.r" (some "r") false false nil [] (some "routes"))]
+   "m.Greet.greet.Item" [(ep/LiveBody "m.Greet.greet.Item" nil false false (some "impl:Greet Item") [] nil)]})
+
+(defun checks-changes () -> i64
+  (let ((olds (hashes "a" "(defun r () -> i64 (x/g))" app))
+        (ch (ldf/changes olds (ldf/hashes-of [(module "routes" "b" "(defun r () -> i64 (x/g))\n(defun s () -> i64 1)")
+                                              (module "main" "a" (str "(defun f () -> i64 (x/g))\n(defun h () -> i64 2)\n(impl Greet Item (greet (self) \"hey\"))\n"))] nil)
+                         (bodies))))
+    (+ (check "the changed families: the alias's user, the changed impl's methods; a new function is not a change"
+              (= (. ch families) ["f.routes.r" "m.Greet.greet.Item"]))
+       (check "the changed impl's key" (= (. ch impls) ["impl:Greet Item"])))))
+
+(defun main () -> i64
+  (let ((bad (+ (checks-hashes) (+ (checks-gensyms) (checks-changes)))))
+    (do (println (str "unit-livediff: " (if (= bad 0) "ok" (str bad " failed"))))
+        bad)))

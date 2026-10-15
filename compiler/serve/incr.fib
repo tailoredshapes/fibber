@@ -143,7 +143,8 @@
                             (_ false)))
                         forms))))
 
-(defstruct Front (checked: (Result Checked (Vec dg/Diag)) stats: Stats key: str))
+;; `modules`: the expanded modules of a program that checked (a live session hashes its definitions' expanded forms, serve.livediff), else empty.
+(defstruct Front (checked: (Result Checked (Vec dg/Diag)) stats: Stats key: str modules: (Vec Expanded)))
 
 (defun typecheck-whole :private (modules: (Vec Expanded) prelude: (Vec Stx) main: bool file: str target: str) -> (Pair (Result Checked (Vec dg/Diag)) i64)
   (let ((t0 (sys-clock-now)))
@@ -245,10 +246,10 @@
 (defun engine-job (e: Engine j: Job) -> Front
   (let ((t0 (sys-clock-now)))
     (match (prelude-of e)
-      ((Err ds) (Front (Err ds) (empty-stats) ""))
+      ((Err ds) (Front (Err ds) (empty-stats) "" []))
       ((Ok [prelude base-ctx])
        (match (mods/try-load-texts (. j source) (. j start) (. j rts) (. j texts))
-         ((Err x) (Front (Err [(dg/load-diag x)]) (empty-stats) ""))
+         ((Err x) (Front (Err [(dg/load-diag x)]) (empty-stats) "" []))
          ((Ok loaded) (front-loaded e j loaded prelude base-ctx t0)))))))
 
 (defun front-loaded :private (e: Engine j: Job loaded: (Vec Loaded) prelude: (Vec Stx) base-ctx: ExpandCtx t0: i64) -> Front
@@ -259,7 +260,7 @@
         (vkey (str (show (nth keys (- (count keys) 1))) "/" (show (hash (. j file))) "/" (if main "m" "l")))
         (n (count loaded)))
     (match (if (. j want) nil (get @(. e verdicts) vkey))
-      ((some ds) (Front (Err ds) (Stats n n 0 true t1 0 0 0 (ms-since t0)) vkey))
+      ((some ds) (Front (Err ds) (Stats n n 0 true t1 0 0 0 (ms-since t0)) vkey []))
       (nil (front-expand e j loaded prelude base-ctx keys main vkey t1 t0)))))
 
 (defun store-verdict :private (e: Engine key: str ds: (Vec dg/Diag)) -> unit
@@ -273,7 +274,7 @@
         (n (count loaded)))
     (match (. ex snd)
       ((Err ds) (do (store-verdict e vkey ds)
-                    (Front (Err ds) (Stats n (. ex fst) (- n (. ex fst)) false t1 (ms-since t2) 0 0 (ms-since t0)) vkey)))
+                    (Front (Err ds) (Stats n (. ex fst) (- n (. ex fst)) false t1 (ms-since t2) 0 0 (ms-since t0)) vkey [])))
       ((Ok modules) (front-typed e j modules prelude main vkey (Stats n (. ex fst) (- n (. ex fst)) false t1 (ms-since t2) 0 0 0) t0 (library-key loaded keys)
                                  (check-keys keys loaded))))))
 
@@ -285,4 +286,4 @@
         (t4 (sys-clock-now))
         (st (Stats (. st0 modules) (. st0 reused) (. st0 expanded) false (. st0 load-ms) (. st0 expand-ms) (. tc snd) (- (quot (- t4 t3) 1000000) (. tc snd)) (ms-since t0))))
     (do (store-verdict e vkey (match r ((Ok _) (vec-empty)) ((Err ds) ds)))
-        (Front r st vkey))))
+        (Front r st vkey (match r ((Ok _) modules) ((Err _) []))))))
