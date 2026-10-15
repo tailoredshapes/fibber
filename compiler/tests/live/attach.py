@@ -6,7 +6,8 @@ usage: attach.py FIBC [ROOT]    Exit 0 when every check held. Each check prints 
 What is tested: the socket (0700 directory, 0600 file, the path on standard error and in hello); hello; the design's atom transcript
 (a `def` counter answers 1 then 2); a def read by three later inputs; a trap answered `failed` and the next input working; the
 program's own defs read and changed live while its worker runs; type, inspect, status; new functions, records and closures kept in an
-atom; the refusals (live/Swap, live/Def, live/Main, the checker's); 1,000 malformed lines; a second client waiting; the terminal and
+atom; a function defined again is swapped (LV2: compiler/tests/live/swap.py is the swap's own test); the refusals (live/Def, live/Main,
+the checker's); 1,000 malformed lines; a second client waiting; the terminal and
 --json clients; `not-live`; a wrong uid refused (planted: FIB_LIVE_OWN_UID); a program that does not check; the end of the program
 through the socket, its output and exit as `fibc run`'s."""
 import json, os, random, shutil, signal, socket, stat, subprocess, sys, tempfile, time
@@ -120,7 +121,7 @@ check('type of def', (c.ask(op='type', expr='counter') or {}).get('type') == '(A
 i = c.ask(op='inspect', name='names')
 check('inspect', i and i.get('value') == '["a" "b"]' and i.get('type') == '(Vec str)', i)
 s = c.ask(op='status')
-check('status', s and s.get('generation') == 0 and s['values']['count'] >= 1 and 'def.slot' in ''.join(s['values']['resident']) and s.get('inputs', 0) > 5 and s.get('pid') == a.p.pid, s)   # names and late are constants: static data, no slot
+check('status', s and s.get('generation') == 0 and s['generations']['count'] == 1 and s['values']['count'] >= 1 and 'def.slot' in ''.join(s['values']['resident']) and s.get('inputs', 0) > 5 and s.get('pid') == a.p.pid, s)   # names and late are constants: static data, no slot
 
 # ---- new definitions after boot: a function, a record, a closure kept in an atom
 check('defun', (c.eval('(defun twice (x: i64) -> i64 (* 2 x))') or {}).get('defined') == ['twice'] and c.value('(twice 21)') == '42')
@@ -134,7 +135,7 @@ check('unit expression', (lambda r: r and r.get('ok') and 'value' not in r)(c.ev
 
 # ---- refusals: nothing changes
 r = c.eval('(defun twice (x: i64) -> i64 (* 3 x))')
-check('swap refused', r and r.get('ok') is False and r.get('code') == 'live/Swap' and c.value('(twice 21)') == '42', r)
+check('swapped', r and r.get('ok') and r.get('swapped') == ['twice'] and r.get('generation') == 1 and c.value('(twice 21)') == '63', r)
 r = c.eval('(def counter: (Atom i64) (atom 9))')
 check('def again refused', r and r.get('ok') is False and r.get('code') == 'live/Def' and c.value('@counter') == '3', r)
 r = c.eval('(defun main () -> i64 0)')
@@ -148,7 +149,7 @@ check('two expressions', r and r.get('code') == 'live/Input', r)
 check('blank', (c.eval('   ') or {}).get('ok') is True)
 r = c.eval('(+ 1')
 check('unreadable', r and r.get('ok') is False and r.get('shown'), r)
-check('still alive', c.value('(twice 2)') == '4')
+check('still alive', c.value('(twice 2)') == '6')
 
 # ---- malformed lines: the program survives them all
 random.seed(7)
@@ -188,8 +189,8 @@ r = subprocess.run([fibc, 'repl', '--connect', a.sock], input='(swap! counter in
                    capture_output=True, text=True, cwd=root, env=env, timeout=120, preexec_fn=limit)
 out = r.stdout.splitlines()
 check('client terminal', r.returncode == 0 and out[0].startswith('; attached to ') and 'app.fib' in out[0] and 'catching' in out[0] and out[1] == '4' and out[2].startswith('; failed: ')
-      and out[3] == '(Atom i64)' and out[4] == '; defined thrice' and out[5] == '15' and out[6].startswith('<input>:1:1: thrice is a function') and '[live/Swap]' in out[6]
-      and out[7].startswith('; refused') and out[8].startswith('; generation 0;'), (r.returncode, r.stdout, r.stderr))
+      and out[3] == '(Atom i64)' and out[4] == '; defined thrice' and out[5] == '15' and out[6].startswith('; swapped thrice (generation 2): check ')
+      and out[7].startswith('; generation 2; generations kept 3;'), (r.returncode, r.stdout, r.stderr))
 r = subprocess.run([fibc, 'repl', '--connect', '4000000', '--json'], input='{"op":"hello"}\n', capture_output=True, text=True, cwd=root, env=env, timeout=120, preexec_fn=limit)
 check('not-live --json', r.returncode == 2 and r.stdout.count('\n') == 1 and json.loads(r.stdout).get('error', {}).get('code') == 'not-live', (r.returncode, r.stdout, r.stderr))
 r = subprocess.run([fibc, 'repl', '--connect', '4000000'], input='(+ 1 2)\n', capture_output=True, text=True, cwd=root, env=env, timeout=120, preexec_fn=limit)

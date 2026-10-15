@@ -33,6 +33,8 @@
    macro-module: (Cell bool) unwinding: bool
    ;; live mode (`live-mode?`): the bodies of the program's own modules are emitted behind stubs and slots (emit.live), and the program catches.
    live: bool
+   ;; the session's generations and stubbed bodies (`Tables`): shared by every program of a live session, the program's own otherwise.
+   live-gens: (Cell (Map str i64)) live-bodies: (Cell (Map str (Vec LiveBody)))
    ;; the bytes of a pointer in the target's memory (4 on wasm32): the layouts of the objects are computed from it. 8 while the JIT runs, which is the host's.
    pb: (Cell i64) runtime: (Vec la/LItem) runtime-host: (Vec la/LItem) link-notes: (Cell (Vec (Pair str str)))))
 
@@ -61,9 +63,19 @@
 ;; given out in the order of first use, so two programs that differ in one body disagree on them. A live session (compiler/live) gives
 ;; every program of the session the same `Tables`: a type or static already numbered keeps its number and a new one is appended
 ;; (compiler/live/FINDINGS.md says what broke without this). A program made with `program-new` has tables of its own.
-(defstruct Tables (objects: Objects statics: Statics))
+(defstruct Tables (objects: Objects statics: Statics
+   ;; live mode across the programs of a session (docs/design/live-repl.md 3.1, package LV2): the generation each family of bodies is
+   ;; lowered under (`f.NAME` for a function, its all-owned twin and specialisations; a method's name for a method), 0 when unnamed, and
+   ;; every stubbed body the programs made, by family, as `emit.live/add-stub` registers them (the live table reads it)
+   generations: (Cell (Map str i64)) bodies: (Cell (Map str (Vec LiveBody)))))
 
-(defun tables-new () -> Tables (Tables (objects-new) (statics-new)))
+;; A body behind a stub: its name (`f.NAME.$T_`, `f.NAME.owned`, `m.P.NAME.$T_`), the function's name when it is one of the main
+;; module (for `emit.compile/BodyRequest`), whether it is the all-owned twin, whether it is a specialisation (its types are not kept:
+;; a type's id is one program's, and two programs of a session number their types differently), and for a method the key of its
+;; `impl` as the REPL keys one (`impl:PROTO HEAD`).
+(defstruct LiveBody (name: str fun: (Option str) owned: bool generic: bool impl: (Option str)))
+
+(defun tables-new () -> Tables (Tables (objects-new) (statics-new) (cell (map-empty)) (cell (map-empty))))
 
 ;; The statics of a program numbered in `shared`: the same strings, keywords, closures and vtables (the cells are shared, so an
 ;; addition is seen by every program of the session), and `items` of the program's own (the module-level items written in full by name:
@@ -85,6 +97,8 @@
                     (queue-new) (cell []) (cell 0) (cell []) (cell [])
                     (cell (map-empty)) (cell (map-empty)) (cell (map-empty)) (cell []) (cell 0) (cell false)
                     (cell (map-empty)) (cell []) (cell false) (or (live-mode?) (program-unwinds? typed owned)) (live-mode?)
+                    (match tables ((some t) (. t generations)) (nil (cell (map-empty))))
+                    (match tables ((some t) (. t bodies)) (nil (cell (map-empty))))
                     (cell (os/target-pointer-bytes)) (runtime-items-target) (runtime-items-host) (cell []))))
     (do (objects-intern (. p objects) "fib.str" "str" ObStr)
         (objects-intern (. p objects) "fib.array.i8" "(Array i8)" (ObArray LirI8))
@@ -101,7 +115,8 @@
              (Queue (cell @(. q pending)) (cell 0) (cell @(. q names)) (cell nil))
              (cell []) (cell 0) (cell []) (cell [])
              (cell (map-empty)) (cell @(. p def-values)) (cell (map-empty)) (cell []) (cell 0) (cell false)
-             (cell @(. p def-slots)) (cell @(. p inits)) (cell false) (. p unwinding) (. p live) (cell pb) (. p runtime) (. p runtime-host) (cell @(. p link-notes)))))
+             (cell @(. p def-slots)) (cell @(. p inits)) (cell false) (. p unwinding) (. p live) (. p live-gens) (. p live-bodies)
+             (cell pb) (. p runtime) (. p runtime-host) (cell @(. p link-notes)))))
 
 ;; The bytes of a pointer of the program's layouts.
 (defun program-pb (p: Program) -> i64 @(. p pb))

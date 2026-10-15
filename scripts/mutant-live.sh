@@ -27,12 +27,25 @@
 #   trap-not-caught      an expression's entry runs without `live-guard` (the `try` of fib.ex):     compiler/tests/live/attach.sh (`(nth [1 2] 5)`
 #                        a trap in an input aborts the program instead of answering `failed` (LV1)  ends the program; the next input has nobody
 #                                                                                                   to answer it)
+#   patch-before-jit     a swap stores the slots (with 0: the address is not known yet) BEFORE the   compiler/tests/live/swap.sh (the worker thread
+#                        new bodies are looked up, so a call during ORC's compilation of the new     calling `work` during one of the 200 swaps
+#                        generation jumps to address 0 (LV2; docs/design/live-repl.md 3.1 step 4)   jumps to 0: the app dies, the next check
+#                                                                                                   has nobody to answer it)
+#   old-tracker-removed  a swap removes the previous generation's tracker right after the patch:    compiler/tests/live/swap.sh (the worker is
+#                        a thread in the old body runs freed code (LV2; 3.3: generations are kept)   inside the old `work` when its code is freed:
+#                                                                                                   the app dies)
+#   summary-ignored      the summary rule is not applied: a body whose parameter was borrowed and   compiler/tests/live/swap.sh (transcript 5's
+#                        is now owned (stored) is accepted; its callers hand nothing over (LV2, 3.4) second refusal does not come; `handle` then
+#                                                                                                   stores a request its caller releases)
+#   signature-ignored    the signature rule is not applied: a function redefined with another       compiler/tests/live/swap.sh (transcript 5's
+#                        scheme (an added parameter) is accepted; its callers' calls are typed lIR  first refusal does not come; the server's
+#                        of the old one (LV2, 3.4)                                                  calls of `handle` read a register for `db`)
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-live-MODE),
 #              MUT_QUICK=1 runs stubs.sh --quick (hello's golden and the deep recursion; no case tables: kills both mutants in under a minute after the build).
 # A mutant of lib/ alone (sink-ignored, override-ignored) builds nothing: the case's `roots:` header names the copy's lib, and FIBC runs it.
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -62,6 +75,14 @@ case $MODE in
           (Ok ())' '      (if true
           (Ok ())' ;;
   trap-not-caught)  patch compiler/serve/livesess.fib '-> i64 (live-guard live-fd (fn () -> i64 (do "' '-> i64 ((fn () -> i64 (do "' ;;
+  patch-before-jit) patch compiler/serve/liveswap.fib '                (addrs (ti/try-map (fn (nm: str) (ls/address-of sx nm)) coded))' '                (_ (publish sx names (mapv (fn (nm: str) 0) names)))
+                (addrs (ti/try-map (fn (nm: str) (ls/address-of sx nm)) coded))' ;;
+  old-tracker-removed) patch compiler/serve/liveswap.fib '                (_ (publish sx names addrs)))' '                (_ (publish sx names addrs))
+                (_ (let ((gens (. (unwrap-or (get (. @(. sx table) families) family) (lt/Family 0 nil nil [])) gens)))
+                     (if (empty? gens) (Ok ()) (lj/remove (ls/jit-of sx) (. (nth gens (- (count gens) 1)) rt) (. (nth gens (- (count gens) 1)) names))))))'
+                       patch compiler/serve/liveswap.fib '[own.driver :as od] [types.init :as ti]' '[own.driver :as od] [types.init :as ti] [live.jit :as lj]' ;;
+  summary-ignored)  patch compiler/serve/liverules.fib '       (nil (summary-rule c f fid))))' '       (nil nil)))' ;;
+  signature-ignored) patch compiler/serve/liverules.fib '     (match (signature-rule c f fid session-defs)' '     (match (if true nil (signature-rule c f fid session-defs))' ;;
   *) echo "mutant-live: unknown mode $MODE" >&2; exit 2 ;;
 esac
 case $MODE in
@@ -78,6 +99,7 @@ quick=(); [ "${MUT_QUICK:-}" = 1 ] && quick=(--quick)
 case $MODE in
   stub-*) what="the stubs test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/stubs.sh" "$F" "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
   value-reevaluated|trap-not-caught) what="the attach test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/attach.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
+  patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored) what="the swap test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/swap.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   deps-stubbed-by-default|project-paths-not-stubbed) what="the project test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/project.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   *) what="case 8423"  # the case's `roots:` header names ../../lib: run from a copy of cases/stdlib beside the mutated lib
      mkdir -p "$OUT/cases/stdlib"; cp -r "$R"/cases/stdlib/8423-*.fib "$R/cases/stdlib/support" "$OUT/cases/stdlib/"

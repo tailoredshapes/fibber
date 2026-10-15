@@ -9,7 +9,8 @@
             [driver.native :as native] [fib.unix :as unix] [fib.string :as s]))
 
 (def help-text: str
-  "inputs: definitions (def defun defrecord ..) are made resident in the running program; an expression is evaluated there and its value printed
+  "inputs: definitions (def defun defrecord ..) are made resident in the running program; a function defined again is swapped (its callers
+        use the new body from their next call); an expression is evaluated there and its value printed
 :type EXPR      the type of EXPR         :inspect NAME  the value and type of NAME      :status  the session's figures
 :help           this                     :quit (ctrl-d) end the client; the program goes on")
 
@@ -64,14 +65,24 @@
 (defun show-answer :private (v: j/JVal) -> unit
   (cond (some? (field v "error")) (println (str "; " (str-of (unwrap-or (field v "error") j/JNull) "message") " [" (str-of (unwrap-or (field v "error") j/JNull) "code") "]"))
         (some? (field v "failed")) (println (str "; failed: " (str-of v "failed") " (caught; the program is unaffected)"))
-        (some? (field v "shown")) (do (doseq [l (strs-of v "shown")] (println l)) (println "; refused; the session and the program are unchanged"))
+        (some? (field v "shown")) (do (doseq [l (strs-of v "shown")] (println l))
+                                      (println (str "; refused; the session and the program are unchanged" (if (some? (field v "generation")) (str " (generation " (int-of v "generation") ")") ""))))
         (some? (field v "value")) (println (str-of v "value"))
+        (not (empty? (strs-of v "swapped"))) (do (when (not (empty? (strs-of v "defined"))) (println (str "; defined " (join-words (strs-of v "defined")))))
+                                                 (println (swapped-line v)))
         (some? (field v "defined")) (println (str "; defined " (join-words (strs-of v "defined"))))
         (some? (field v "type")) (println (str-of v "type"))
-        (some? (field v "generations")) (println (str "; generation " (int-of v "generation") "; modules kept " (int-of (unwrap-or (field v "generations") j/JNull) "kept")
+        (some? (field v "generations")) (println (str "; generation " (int-of v "generation") "; generations kept " (int-of (unwrap-or (field v "generations") j/JNull) "count")
+                                                    "; modules kept " (int-of (unwrap-or (field v "generations") j/JNull) "kept")
                                                     "; values: " (int-of (unwrap-or (field v "values") j/JNull) "count") " resident; inputs " (int-of v "inputs")))
         (not (= (int-of v "exit") 0)) (println (str "; the input ended with status " (int-of v "exit")))
         :else ()))
+
+;; `; swapped handle (generation 1): check 41 ms, emit 6 ms, jit 9 ms`
+(defun swapped-line :private (v: j/JVal) -> str
+  (let ((t (unwrap-or (field v "swap") j/JNull)))
+    (str "; swapped " (join-words (strs-of v "swapped")) " (generation " (int-of v "generation") "): check " (int-of t "check_ms") " ms, emit " (int-of t "emit_ms")
+         " ms, jit " (int-of t "jit_ms") " ms")))
 
 (defun send :private (c: Client line: str) -> bool
   (match (exchange c line)
