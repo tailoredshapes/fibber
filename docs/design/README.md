@@ -36,6 +36,7 @@ earlier plan where they differ.
 - [lair in fibber](lair-in-fibber.md)
 - [lair in fibber: the shared interfaces (package S1)](lair-interfaces.md)
 - [A C backend for lIR](lir2c.md)
+- [Live sessions: emit only what changed, and swap any module](live-incremental.md)
 - [A live REPL: change a running program without restarting it](live-repl.md)
 - [Live meshql-fib: tests from a REPL attached to the running server](live-meshql.md)
 - [Macro names: templates resolve in the macro's module (MACRO-NS)](macro-names.md)
