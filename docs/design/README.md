@@ -37,6 +37,7 @@ earlier plan where they differ.
 - [lair in fibber: the shared interfaces (package S1)](lair-interfaces.md)
 - [A C backend for lIR](lir2c.md)
 - [A live REPL: change a running program without restarting it](live-repl.md)
+- [Live meshql-fib: tests from a REPL attached to the running server](live-meshql.md)
 - [Macro names: templates resolve in the macro's module (MACRO-NS)](macro-names.md)
 - [fib.merkle: merkle trees](merkle.md)
 - [A Lispy numerical library for Fibber](numerical-library.md)
