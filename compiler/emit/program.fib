@@ -35,6 +35,8 @@
    live: bool
    ;; the session's generations and stubbed bodies (`Tables`): shared by every program of a live session, the program's own otherwise.
    live-gens: (Cell (Map str i64)) live-bodies: (Cell (Map str (Vec LiveBody)))
+   ;; the session's constant defs' values (`Tables.defs`, LE1; emit.defs.cache reads and fills it), none for a program of its own
+   def-cache: (Option DefCache)
    ;; the bytes of a pointer in the target's memory (4 on wasm32): the layouts of the objects are computed from it. 8 while the JIT runs, which is the host's.
    pb: (Cell i64) runtime: (Vec la/LItem) runtime-host: (Vec la/LItem) link-notes: (Cell (Vec (Pair str str)))))
 
@@ -58,6 +60,27 @@
 (defun live-mode? () -> bool
   (match (unix/getenv "FIB_LIVE") (nil false) ((some v) (not (or (= v "") (= v "0"))))))
 
+;; The value of a constant `def` kept across the programs of a live session (docs/design/live-incremental.md 2.2 item 1, package LE1;
+;; emit.defs.cache): the lowered initialiser it was evaluated from (`source`: a definition that changed is a miss), the value, and the
+;; constant items its reading appended (`@def.N`).
+(defstruct DefEntry (source: str value: DefValue items: (Vec la/LItem)))
+
+;; The constant defs' values of a session, by the def's body name (`d.MODULE.NAME`: stable across the programs of a session, where the
+;; ids are not), and `next`, the highest constant number any program of the session gave out: every program numbers its constants past
+;; it, so a replayed `@def.N` is the name the resident base defines and a fresh one never collides with it.
+(defstruct DefCache (entries: (Cell (Map str DefEntry)) next: (Cell i64)))
+
+(defun def-cache-new () -> DefCache (DefCache (cell (map-empty)) (cell 0)))
+
+;; The runtime's items (emit.rt's text parsed) for the target and for the host: constant for a process, parsed once per session.
+(defstruct RuntimeItems (target: (Vec la/LItem) host: (Vec la/LItem)))
+
+;; FIB_LIVE_EMIT (docs/design/live-incremental.md 2.5): how the programs of a live session make their constant defs. Unset: a def whose
+;; value the session's `Tables` hold is replayed (LE1); `verify`: replayed and evaluated again, a difference refusing the input
+;; (`live/EmitVerify`); `off`: every program evaluates every def through the JIT, as every emit did before LE1 (the constants are still
+;; numbered past the session's: an input's fresh constant never takes the name of one the base defines).
+(defun live-emit-mode () -> str (unwrap-or (unix/getenv "FIB_LIVE_EMIT") ""))
+
 ;; The id tables a program numbers its objects and statics in: the type ids (`fib.types`' rows, read by `fib.release` and every walker)
 ;; and the names of strings, keywords, immortal closures and vtables (`str.N`, `clo.N`). They are plain literals in the emitted code,
 ;; given out in the order of first use, so two programs that differ in one body disagree on them. A live session (compiler/live) gives
@@ -67,7 +90,9 @@
    ;; live mode across the programs of a session (docs/design/live-repl.md 3.1, package LV2): the generation each family of bodies is
    ;; lowered under (`f.NAME` for a function, its all-owned twin and specialisations; a method's name for a method), 0 when unnamed, and
    ;; every stubbed body the programs made, by family, as `emit.live/add-stub` registers them (the live table reads it)
-   generations: (Cell (Map str i64)) bodies: (Cell (Map str (Vec LiveBody)))))
+   generations: (Cell (Map str i64)) bodies: (Cell (Map str (Vec LiveBody)))
+   ;; the constant defs' values (LE1) and the runtime's items, parsed once per session rather than once per program
+   defs: DefCache runtime: (Cell (Option RuntimeItems))))
 
 ;; A body behind a stub: its name (`f.NAME.$T_`, `f.NAME.owned`, `m.P.NAME.$T_`), the function's name when it is one of the main
 ;; module (for `emit.compile/BodyRequest`), whether it is the all-owned twin, whether it is a specialisation (its types are not kept:
@@ -75,7 +100,20 @@
 ;; `impl` as the REPL keys one (`impl:PROTO HEAD`).
 (defstruct LiveBody (name: str fun: (Option str) owned: bool generic: bool impl: (Option str)))
 
-(defun tables-new () -> Tables (Tables (objects-new) (statics-new) (cell (map-empty)) (cell (map-empty))))
+(defun tables-new () -> Tables (Tables (objects-new) (statics-new) (cell (map-empty)) (cell (map-empty)) (def-cache-new) (cell nil)))
+
+;; The runtime's items: the tables' when given (parsed on the first program of the session), else parsed now.
+(defun runtime-of :private (tables: (Option Tables)) -> RuntimeItems
+  (match tables
+    (nil (RuntimeItems (runtime-items-target) (runtime-items-host)))
+    ((some t) (match @(. t runtime)
+                ((some r) r)
+                (nil (let ((r (RuntimeItems (runtime-items-target) (runtime-items-host))))
+                       (do (set! (. t runtime) (some r)) r)))))))
+
+;; The def cache a program's constant defs are kept in and numbered by: the tables' in a live session; none for a program of its own.
+(defun def-cache-of :private (tables: (Option Tables)) -> (Option DefCache)
+  (match tables (nil nil) ((some t) (some (. t defs)))))
 
 ;; The statics of a program numbered in `shared`: the same strings, keywords, closures and vtables (the cells are shared, so an
 ;; addition is seen by every program of the session), and `items` of the program's own (the module-level items written in full by name:
@@ -92,14 +130,16 @@
 
 ;; A program numbered in `tables` when given (a live session's), else in tables of its own.
 (defun program-new-with (typed: TypedProgram owned: OwnedProgram tables: (Option Tables)) -> Program
-  (let ((p (Program typed owned (match tables ((some t) (. t objects)) (nil (objects-new)))
+  (let ((rt (runtime-of tables))
+        (p (Program typed owned (match tables ((some t) (. t objects)) (nil (objects-new)))
                     (match tables ((some t) (shared-statics (. t statics))) (nil (statics-new)))
                     (queue-new) (cell []) (cell 0) (cell []) (cell [])
                     (cell (map-empty)) (cell (map-empty)) (cell (map-empty)) (cell []) (cell 0) (cell false)
                     (cell (map-empty)) (cell []) (cell false) (or (live-mode?) (program-unwinds? typed owned)) (live-mode?)
                     (match tables ((some t) (. t generations)) (nil (cell (map-empty))))
                     (match tables ((some t) (. t bodies)) (nil (cell (map-empty))))
-                    (cell (os/target-pointer-bytes)) (runtime-items-target) (runtime-items-host) (cell []))))
+                    (def-cache-of tables)
+                    (cell (os/target-pointer-bytes)) (. rt target) (. rt host) (cell []))))
     (do (objects-intern (. p objects) "fib.str" "str" ObStr)
         (objects-intern (. p objects) "fib.array.i8" "(Array i8)" (ObArray LirI8))
         (objects-intern (. p objects) "fib.weakbox" "weak box" ObWeak)
@@ -116,7 +156,7 @@
              (cell []) (cell 0) (cell []) (cell [])
              (cell (map-empty)) (cell @(. p def-values)) (cell (map-empty)) (cell []) (cell 0) (cell false)
              (cell @(. p def-slots)) (cell @(. p inits)) (cell false) (. p unwinding) (. p live) (. p live-gens) (. p live-bodies)
-             (cell pb) (. p runtime) (. p runtime-host) (cell @(. p link-notes)))))
+             (. p def-cache) (cell pb) (. p runtime) (. p runtime-host) (cell @(. p link-notes)))))
 
 ;; The bytes of a pointer of the program's layouts.
 (defun program-pb (p: Program) -> i64 @(. p pb))

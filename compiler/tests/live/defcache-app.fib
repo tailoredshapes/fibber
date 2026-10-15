@@ -1,0 +1,93 @@
+(ns main (:use fib.http fib.http.server) (:require [fib.unix :as u] [fib.string :as st]))
+;; The program of compiler/tests/live/defcache.sh (package LE1 of docs/design/live-incremental.md 4): an HTTP app whose handler reads
+;; the constant defs below (an array, a struct with a string, an Option, a scalar, a str, and a named function as a value: the guard of
+;; LE2), and forty more constant records so that an input's emit is measurably the defs' when they are evaluated again. The main
+;; module holds no run-time def (no atom): a `(require ..)` input that adds a module before it moves no slot of the running program.
+;; The port is `--port N` of its arguments; `main` ends when the file `--stop PATH` exists.
+(defrecord Person (name: str age: i64))
+(defrecord Row (key: str weights: (Vec i64) tag: (Option str)))
+
+(def primes: (Vec i64) [2 3 5 7 11 13])
+(def owner: Person (Person "ada" 36))
+(def maybe: (Option i64) (some 7))
+(def limit: i64 3)
+(def greeting: str "hello")
+(defun score (n: i64) -> i64 (* n 10))
+(def scorer: (fn (i64) i64) score)
+
+(def row0: Row (Row "k0" [0 1 2 3] (some "t0")))
+(def row1: Row (Row "k1" [1 2 3 4] (some "t1")))
+(def row2: Row (Row "k2" [2 3 4 5] nil))
+(def row3: Row (Row "k3" [3 4 5 6] (some "t3")))
+(def row4: Row (Row "k4" [4 5 6 7] (some "t4")))
+(def row5: Row (Row "k5" [5 6 7 8] nil))
+(def row6: Row (Row "k6" [6 7 8 9] (some "t6")))
+(def row7: Row (Row "k7" [7 8 9 10] (some "t7")))
+(def row8: Row (Row "k8" [8 9 10 11] nil))
+(def row9: Row (Row "k9" [9 10 11 12] (some "t9")))
+(def row10: Row (Row "k10" [10 11 12 13] (some "t10")))
+(def row11: Row (Row "k11" [11 12 13 14] nil))
+(def row12: Row (Row "k12" [12 13 14 15] (some "t12")))
+(def row13: Row (Row "k13" [13 14 15 16] (some "t13")))
+(def row14: Row (Row "k14" [14 15 16 17] nil))
+(def row15: Row (Row "k15" [15 16 17 18] (some "t15")))
+(def row16: Row (Row "k16" [16 17 18 19] (some "t16")))
+(def row17: Row (Row "k17" [17 18 19 20] nil))
+(def row18: Row (Row "k18" [18 19 20 21] (some "t18")))
+(def row19: Row (Row "k19" [19 20 21 22] (some "t19")))
+(def row20: Row (Row "k20" [20 21 22 23] nil))
+(def row21: Row (Row "k21" [21 22 23 24] (some "t21")))
+(def row22: Row (Row "k22" [22 23 24 25] (some "t22")))
+(def row23: Row (Row "k23" [23 24 25 26] nil))
+(def row24: Row (Row "k24" [24 25 26 27] (some "t24")))
+(def row25: Row (Row "k25" [25 26 27 28] (some "t25")))
+(def row26: Row (Row "k26" [26 27 28 29] nil))
+(def row27: Row (Row "k27" [27 28 29 30] (some "t27")))
+(def row28: Row (Row "k28" [28 29 30 31] (some "t28")))
+(def row29: Row (Row "k29" [29 30 31 32] nil))
+(def row30: Row (Row "k30" [30 31 32 33] (some "t30")))
+(def row31: Row (Row "k31" [31 32 33 34] (some "t31")))
+(def row32: Row (Row "k32" [32 33 34 35] nil))
+(def row33: Row (Row "k33" [33 34 35 36] (some "t33")))
+(def row34: Row (Row "k34" [34 35 36 37] (some "t34")))
+(def row35: Row (Row "k35" [35 36 37 38] nil))
+(def row36: Row (Row "k36" [36 37 38 39] (some "t36")))
+(def row37: Row (Row "k37" [37 38 39 40] (some "t37")))
+(def row38: Row (Row "k38" [38 39 40 41] nil))
+(def row39: Row (Row "k39" [39 40 41 42] (some "t39")))
+(def rows: (Vec Row) [row0 row1 row2 row3 row4 row5 row6 row7 row8 row9 row10 row11 row12 row13 row14 row15 row16 row17 row18 row19
+                      row20 row21 row22 row23 row24 row25 row26 row27 row28 row29 row30 row31 row32 row33 row34 row35 row36 row37 row38 row39])
+
+;; The sum of every weight of every row, and the count of the tagged ones: what the handler shows of the forty records.
+(defun rows-sum () -> i64 (reduce + 0 (mapv (fn (r: Row) (reduce + 0 (. r weights))) rows)))
+(defun rows-tagged () -> i64 (count (filterv (fn (r: Row) (some? (. r tag))) rows)))
+
+;; Every def above, as one line: the handler's answer to /defs.
+(defun show-defs () -> str
+  (str (pr-str primes) " " (. owner name) " " (. owner age) " " (pr-str maybe) " " limit " " greeting " " (scorer 3) " "
+       (count rows) " " (rows-sum) " " (rows-tagged) " " (. row39 key)))
+
+(defun path-of (req: Request) -> str
+  (match (str-find (. req uri) "?" 0) ((some i) (str-slice (. req uri) 0 i)) (nil (. req uri))))
+
+(defun route (req: Request version: str) -> Response
+  (let ((path (path-of req)))
+    (cond (= path "/defs") (text-response 200 (str version " " (show-defs)))
+          (st/starts-with? path "/score/") (text-response 200 (str (scorer (unwrap-or (parse-long (str-slice path 7 (str-len path))) 0))))
+          :else (text-response 404 "not found"))))
+
+(defun handle (req: Request) -> Response (route req "v0"))
+
+(defun arg-after (flag: str) -> str
+  (let ((as (vec (args))))
+    (loop ((i 0)) (cond (>= (+ i 1) (count as)) "" (= (nth as i) flag) (nth as (+ i 1)) :else (recur (+ i 1))))))
+
+(defun main () -> i64
+  (match (run-server handle (with (default-options) (port (unwrap-or (parse-long (arg-after "--port")) 0)) (workers 2)))
+    ((Err e) (do (println (str "app: cannot listen: " (error-message e))) 1))
+    ((Ok server)
+     (do (println (str "app: listening on " (port server)))
+         (loop () (if (some? (read-file (arg-after "--stop"))) () (do (u/sleep-ns 50000000) (recur))))
+         (stop-server server)
+         (println "app: stopped")
+         0))))

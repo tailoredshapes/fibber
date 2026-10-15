@@ -14,7 +14,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_ALLOW_PLAIN_TAIL_CALLS` | [compiler/driver/viac.fib:46](../../compiler/driver/viac.fib#L46) |
 | `FIB_ALLOW_UNSUPPORTED` | [compiler/driver/commands.fib:62](../../compiler/driver/commands.fib#L62) |
 | `FIB_AST_VERIFY` | [compiler/emit/defs/astmod.fib:10](../../compiler/emit/defs/astmod.fib#L10) |
-| `FIB_CATCH` | [compiler/emit/program.fib:45](../../compiler/emit/program.fib#L45) |
+| `FIB_CATCH` | [compiler/emit/program.fib:47](../../compiler/emit/program.fib#L47) |
 | `FIB_CC` | [compiler/driver/viac.fib:24](../../compiler/driver/viac.fib#L24) |
 | `FIB_CC_KEEP` | [compiler/driver/viac.fib:123](../../compiler/driver/viac.fib#L123) |
 | `FIB_CC_VERBOSE` | [compiler/driver/viac.fib:99](../../compiler/driver/viac.fib#L99) |
@@ -40,8 +40,9 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LIRO_SPLIT` | [compiler/native/liro/partition.fib:64](../../compiler/native/liro/partition.fib#L64) |
 | `FIB_LIRO_STATS` | [compiler/fibc.fib:68](../../compiler/fibc.fib#L68) |
 | `FIB_LIRO_UNITS` | [compiler/native/liro/partition.fib:37](../../compiler/native/liro/partition.fib#L37) |
-| `FIB_LIVE` | [compiler/emit/program.fib:59](../../compiler/emit/program.fib#L59) |
+| `FIB_LIVE` | [compiler/emit/program.fib:61](../../compiler/emit/program.fib#L61) |
 | `FIB_LIVE_DEPS` | [compiler/fibc.fib:65](../../compiler/fibc.fib#L65) |
+| `FIB_LIVE_EMIT` | [compiler/emit/program.fib:82](../../compiler/emit/program.fib#L82) |
 | `FIB_LIVE_OWN_UID` | [compiler/serve/livesock.fib:76](../../compiler/serve/livesock.fib#L76) |
 | `FIB_LIVE_ROOTS` | [compiler/driver/front.fib:68](../../compiler/driver/front.fib#L68) |
 | `FIB_LIVE_SOCKET` | [compiler/serve/live.fib:179](../../compiler/serve/live.fib#L179) |

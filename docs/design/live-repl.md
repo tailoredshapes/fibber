@@ -511,6 +511,11 @@ Decisions for the owner:
 - **Measured** (section 1): a REPL input today is 8 to 15 ms of front end and 35 to 53 ms of fork, JIT and run; values do not persist (the
   atom reads 1 twice). **Estimated, not measured**: the cost of a one-function swap (2 to 3 ms of code generation plus the check of the
   edited module, 30 to 70 ms for a screenful), the memory of kept generations, the stub's call overhead (bounded by LV0's bench row).
+- **Built later, LE1 (2026-10-15; docs/design/live-incremental.md 2.2 item 1, package LE1)**: the constant `def`s' values are kept in the
+  session's `Tables` (emit.program `DefCache`, emit.defs.cache) keyed by the def's body name and its lowered initialiser, and every program
+  of a session numbers its constants past the session's; an input replays them instead of evaluating each through a JIT of its own.
+  `FIB_LIVE_EMIT=verify` evaluates a replayed value again and refuses a difference (`live/EmitVerify`); `=off` evaluates everything.
+  Test: compiler/tests/live/defcache.sh; mutants `defcache-stale`, `defcache-no-items`, `defcache-verify-blind`.
 
 ## 9. Decisions of 2026-10-15 (owner)
 
