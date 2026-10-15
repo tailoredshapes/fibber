@@ -6,7 +6,8 @@
 ;; `inspect` (`name`; a function's generation and bodies too), `status` (the generation, the generations kept, the threads), and the
 ;; pause, resume and retirement of serve.liveretire (package LV3): `pause` (`timeout_ms`, default 5000: the program's threads park at
 ;; their pause points; answers whether it is quiescent and what still runs), `resume`, `retire` (at quiescence: the generations no slot
-;; names and no parked thread can be in are freed; otherwise `not-quiescent`).
+;; names and no parked thread can be in are freed; otherwise `not-quiescent`); `test` (serve.livetest, package LT2 of
+;; docs/design/live-meshql.md): a spec run on a thread of its own, answered when it ends (`status.tests` meanwhile; `busy` for a second).
 ;; Threads: the attach server runs on the driver's thread, which already holds the session (its engine and emitter are single-threaded
 ;; state: a `Cell`-bearing struct cannot be given to `spawn`); the program's `main` runs on a thread of its own (`live.run`: the runtime's
 ;; own main stack, rt/thread.lir `fib.run-main`), which says when it has ended (`done`) and wakes the accept. The design's 2.1 has the
@@ -14,11 +15,12 @@
 ;; the C library (what the program buffered is written). The socket is made before `main` is called, its path printed on standard error
 ;; and set as FIB_LIVE_SOCKET for the program.
 (ns serve.live
-  (:require [serve.livesess :as ls] [serve.liveswap :as lsw] [serve.livetable :as lt] [serve.liveretire :as lr] [serve.livesock :as lsk] [serve.sock :as sk] [serve.proto :as p] [serve.incr :as inc] [serve.diag :as dg]
+  (:require [serve.livesess :as ls] [serve.liveswap :as lsw] [serve.livetable :as lt] [serve.liveretire :as lr] [serve.livetest :as ltt] [serve.livesock :as lsk] [serve.sock :as sk] [serve.proto :as p] [serve.incr :as inc] [serve.diag :as dg]
             [lsp.json :as j] [driver.native :as native] [driver.version :as v] [native.call :as call] [lair.ffi :as ffi]
             [expand.roots :as roots] [expand.maker :as mk] [fib.unix :as unix] [fib.string :as s]))
 
-(defstruct Live (sx: ls/Sess listener: i64 path: str done: (Atom (Option i64)) served: (Cell i64)))
+;; `conns` numbers the connections served: a `test` answers on the connection that asked, by number (a descriptor is reused by a later one).
+(defstruct Live (sx: ls/Sess listener: i64 path: str done: (Atom (Option i64)) served: (Cell i64) conns: (Cell i64) tests: ltt/Tests))
 
 (def poll-ms: i64 250)
 
@@ -54,7 +56,8 @@
   (let ((t (lr/threads (. l sx))))
     (p/response r true [(Pair "pid" (j/json-int (sk/process-id))) (Pair "program" (j/json-str (. (. l sx) file))) (Pair "generation" (j/json-int (lsw/generation (. l sx))))
                         (Pair "version" (j/json-str v/version)) (Pair "catching" (j/JBool true))
-                        (Pair "threads" (j/json-int (. t spawned))) (Pair "pool" (j/json-int (. t workers)))])))
+                        (Pair "threads" (j/json-int (. t spawned))) (Pair "pool" (j/json-int (. t workers)))
+                        (Pair "with" (strs (. (. (. l sx) rts) with)))])))
 
 ;; `pause`: the program's threads asked to park at their pause points, and up to `timeout_ms` (5000) of waiting for quiescence.
 (defun op-pause :private (l: Live r: p/Req) -> str
@@ -116,13 +119,16 @@
                                                          (Pair "functions" (j/json-int (lt/family-count @(. sx table))))]))
                         (Pair "values" (j/json-obj [(Pair "resident" (strs (ls/resident-names sx))) (Pair "count" (j/json-int (count (ls/resident-names sx))))]))
                         (Pair "threads" (threads-json (lr/threads sx)))
+                        (Pair "tests" (ltt/tests-json (. l tests)))
                         (Pair "inputs" (j/json-int (ls/inputs-made sx))) (Pair "requests" (j/json-int @(. l served)))
                         (Pair "pid" (j/json-int (sk/process-id))) (Pair "socket" (j/json-str (. l path)))])))
 
-(defun dispatch :private (l: Live r: p/Req) -> str
+;; `test` (serve.livetest, package LT2) answers later, from `finish` in the connection loop: "" here is no answer yet.
+(defun dispatch :private (l: Live r: p/Req conn: i64) -> str
   (let ((op (. r op)))
     (do (set! (. l served) (+ @(. l served) 1))
         (cond (= op "hello") (op-hello l r)
+              (= op "test") (unwrap-or (ltt/op-test (. l sx) (. l tests) r conn) "")
               (= op "eval") (op-eval l r)
               (= op "type") (op-type l r)
               (= op "inspect") (op-inspect l r)
@@ -133,10 +139,10 @@
               (= op "ping") (p/response r true [(Pair "pong" (j/JBool true))])
               :else (p/error-response r "unknown-op" (str "unknown op `" op "`"))))))
 
-(defun handle-line :private (l: Live line: str) -> str
+(defun handle-line :private (l: Live line: str conn: i64) -> str
   (match (p/parse-request line)
     ((Err m) (p/bad-request m))
-    ((Ok r) (dispatch l r))))
+    ((Ok r) (dispatch l r conn))))
 
 ;; ---- connections
 
@@ -145,18 +151,29 @@
 ;; A read error that leaves the connection usable (a line that is not UTF-8, or too long: consumed) is answered; any other ends it.
 (defun recoverable? :private (m: str) -> bool (or (s/starts-with? m "the line") (s/starts-with? m "the input")))
 
-;; One connection: a request per line, answered on the same line, until the peer closes or the program ends.
+;; A finished test run (serve.livetest) answered on the connection that asked, when it is this one, number `cid` (the program serves
+;; one at a time; a run whose connection is gone is recorded for `status` and its answer dropped); whether this connection is usable.
+(defun answer-finished :private (l: Live conn: i64 cid: i64) -> bool
+  (match (ltt/finish (. l sx) (. l tests))
+    (nil true)
+    ((some [asked line]) (if (= asked cid) (match (sk/write-line conn line) ((Ok _) true) ((Err _) false)) true))))
+
+;; One connection: a request per line, answered on the same line (a `test` later, when its run ends), until the peer closes or the
+;; program ends.
 (defun serve-connection :private (l: Live conn: i64) -> unit
-  (let ((c (sk/conn-new conn)))
-    (do (loop ()
+  (let ((c (sk/conn-new conn)) (cid (+ @(. l conns) 1)))
+    (do (set! (. l conns) cid)
+        (loop ()
           (cond (program-ended? l) ()
+                (not (answer-finished l conn cid)) ()
                 (not (sk/wait-readable conn poll-ms)) (recur)
                 :else (match (sk/conn-read-line c)
                         ((Ok nil) ())
                         ((Err m) (if (recoverable? m)
                                      (match (sk/write-line conn (p/bad-request m)) ((Ok _) (recur)) ((Err _) ()))
                                      ()))
-                        ((Ok (some line)) (match (sk/write-line conn (handle-line l line)) ((Ok _) (recur)) ((Err _) ()))))))
+                        ((Ok (some line)) (let ((a (handle-line l line cid)))
+                                            (if (= a "") (recur) (match (sk/write-line conn a) ((Ok _) (recur)) ((Err _) ()))))))))
         (unix/fd-close conn)
         ())))
 
@@ -194,14 +211,14 @@
 
 ;; The booted session on its socket (in a private directory): the path on standard error, `main` started on its thread, the requests
 ;; answered until it ends; its status. The socket is unlinked at the end.
-(defun serve-program :private (sx: ls/Sess dir: str path: str) -> i64
+(defun serve-program :private (sx: ls/Sess dir: str path: str pid: i64) -> i64
   (match (ls/run-address sx)
     ((Err m) (do (eprintln (str "compile failed: " m)) 5))
     ((Ok addr)
      (match (lsk/listen-private dir path)
        ((Err m) (do (eprintln (str "fibc: live: " m)) 2))
        ((Ok listener)
-        (let ((l (Live sx listener path (atom nil) (cell 0))))
+        (let ((l (Live sx listener path (atom nil) (cell 0) (cell 0) (ltt/tests-new (lsk/test-path dir pid) (lsk/test-err-path dir pid)))))
           (do (eprintln (str "fibc: live at " path))
               (let ((t (start-program addr (. l done) listener)))
                 (do (accept-loop l)
@@ -229,7 +246,7 @@
                        (match (ls/boot sx (. argv fst) (. argv snd))
                          ((Err m) (do (eprintln (str "compile failed: " m)) 5))
                          ((Ok _)
-                          (let ((code (serve-program sx dir path)))
-                            (do (unix/fd-unlink (lsk/output-path dir pid))
+                          (let ((code (serve-program sx dir path pid)))
+                            (do (unix/fd-unlink (lsk/output-path dir pid)) (unix/fd-unlink (lsk/test-path dir pid)) (unix/fd-unlink (lsk/test-err-path dir pid))
                                 (sk/exit-flush code)
                                 code)))))))))))))))

@@ -536,3 +536,46 @@ every second in the background, all 200 or 404/410, none refused). What it does 
   not run; `fork` is refused in a live process by rule and that part of the suite stays a `fibc test` matter.
 - Memory of kept generations over a session of swaps (FINDINGS 3): no swap exists to measure.
 - A second latency run per row to put error bars on 1.2; the machine was shared and one run of 100 to 300 requests is what is quoted.
+
+## 10. Built
+
+- **Status 2026-10-15, LT1** (lib/fib/test/run.fib `run-main-into`; fib-gherkin `gherkin.cli/run-into`, the patch of
+  docs/design/fib-gherkin-lt1.patch applied on a branch of fib-gherkin's head, which is v0.2.0, so the release is v0.2.1, not v0.1.1;
+  its `specs/into-spec.fib` is the acceptance of the patch's last paragraph: the JSON of one scenario, a failing one, the plain rows,
+  `--tags` and `--list`, `--messages`, nothing selected, all through the sink).
+- **Status 2026-10-15, LT2** (serve.livetest: the request, the thread, the finish; serve.livewords: the selection and its refusals, the
+  words, the entry's text, the client's rendering, without LLVM; the `test` op and `status.tests` in serve.live; `:test` in
+  serve.liveclient; `--with` in expand.roots `Roots.with`, expand.modules `visit-with`, fibc `FIB_LIVE_WITH`; the test
+  compiler/tests/live/test.sh over test-app.fib and test-spec.fib with unit-livetest.fib; the mutants stale-never,
+  rerun-old-registry, test-on-attach-thread, sink-shared-run of scripts/mutant-live.sh). Where it differs from sections 3 and 6:
+  (a) **the entry**: `fib.test.run/run-main-into SUITES WORDS SINK` where SUITES is an expression of the request (`suites`), a
+  `--with` file's `(spec.NAME/specs)` (`spec`, by file or module name), or, with neither, the program's own `(specs)` when its text
+  defines one (a `defspecs` in the app: the dev entry of 2.3 (a)), else the first `--with` file's; `runner` is an expression of a
+  function of the words and the sink for a gherkin spec (`(fn (argv out) (g/run-into "features/*.feature" (steps) argv out))`),
+  which the session calls as it is; no entry is `test/NoSpec`. The session's text gains `(:require [fib.test.run :as live-test-run])`
+  and `(:require [spec.NAME :as spec.NAME])` for each `--with` file at the first run (a module is named in full only by a module that
+  requires it: types.names `lookup`), and the `--with` modules are read before the main module's own dependencies so that require
+  finds them. (b) **the entry is a definition of the session's program**, `live-test-N`, compiled as an expression input is
+  (serve.livesess `program-of`, `add-cut`), entered through a `ccc` function of two descriptors (the report's file and the trap's),
+  called on a thread of its own with native.call as `main` is (serve.live `start-program`); the sink is `live-write` of the guard;
+  the entry's module holds a closure literal (the sink) and is kept for good, as an expression's is; its copy of fib.test.run's bodies
+  is emitted per run (about 250 to 300 ms for one scenario on lilnas, the check of the program 30 to 50 ms of it: the transcript's
+  `; 1 scenario in 304 ms (generation 0)`, where `fibc test` costs the spec's front end and JIT again). (c) **the answer**: `report`
+  (the document, when the sink holds one), `text` (what the sink holds: the `--list` listing, or nothing after a trap), `status`,
+  `generation_start`, `generation_end`, `stale`, `ms`, `threads_after`; status 2 is `test/NothingSelected` (the runner's message is on
+  the program's standard error, not in the answer), 134 `test/Trapped` with the message; a second request is `busy` with the running
+  request's `id` and `elapsed_ms`; `last: true` repeats the previous selection (`test/NoLast` before any). It is written on the
+  connection that asked, by the connection's number (a descriptor is reused); a run whose connection closed goes on, its result is
+  recorded for `status` and its answer dropped. (d) **not built**: `stdout`/`stderr` of the scenarios (a scenario's `println` goes
+  where the program's output goes, as an expression's does: live-repl.md 9 (c)); the row events at `-j 1` (the JSON reporter streams
+  no rows); `cancel`. (e) **the rows' positions are the session's text's** (`<repl>:L:C` in `at` and `id`), as live-repl.md 9 (g)
+  says of every input's program; a `--with` file's rows carry its own file. (f) The client refuses `--format`, `--timeout` and
+  `--isolate fork` with the reason, as the program does (`test/Format`, `test/NoFork`); `:test SPEC` takes a file or, in brackets,
+  an expression of the suites.
+- **Found, not fixed (LV2)**: after a swap of a function that makes closures, a call of the base's closures can crash the program
+  (`fatal signal 11 at 0xe`), deterministically: in test-app.fib, `(defspecs edited ..)` at the REPL with one scenario, a call of its
+  scenario's `run`, the same `defspecs` again with the step's expectation changed (a swap of `edited`), a call of the new `run`
+  (right), then a call of a scenario `run` of the base's `specs`: the crash; the same with `specs` itself swapped from a scenario
+  of three `given` bindings to one of one. A function returning plain closures (`(let ((a x)) (fn () a))` swapped to three captures
+  and back) does not reproduce it. The scratch probes are under /tank/data/fibber-scratch/lt2 (`probe6.py`, cases `edited-then-base`,
+  `specs-long-short`); test.sh runs its step edit last so that no base closure is called after it.

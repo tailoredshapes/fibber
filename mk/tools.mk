@@ -59,6 +59,9 @@ tool_sh-live-defcache := $(T)/live/defcache.sh $(F_ABS) | $(T)/live/defcache.sh 
 # `requests-of`): queue-app.fib's swaps lower only the changed family against the resident program; the handler swapped twice, a generic
 # swapped through a resident caller, a new specialisation, and the swap's emit under 60 ms with the queue mode on vs a whole emit off
 tool_sh-live-queue := $(T)/live/queue.sh $(F_ABS) | $(T)/live/queue.sh $(T)/live/queue.py $(T)/live/queue-app.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/emit/*.fib) $(wildcard compiler/emit/defs/*.fib) compiler/emit/typetext.fib
+# LT2 (docs/design/live-meshql.md 3): the `test` op of a live session (serve.livetest, serve.livewords, `--with`): test-app.fib's spec run from the socket
+# and the terminal client, a swap during a two-second scenario (stale), busy, the spec loaded beside the app; the unit of the pure half (about three minutes)
+tool_sh-live-test := $(T)/live/test.sh $(F_ABS) | $(T)/live/test.sh $(T)/live/test.py $(T)/live/test-app.fib $(T)/live/test-spec.fib $(T)/live/unit-livetest.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/expand/modules.fib compiler/expand/roots.fib lib/fib/test/run.fib
 # LV3: swaps under load, the pause and the retirement (serve.liveretire, serve.livesplit, rt/live.lir, fib.os.live, the pause points of fib.http.server):
 # the socket stress (stress-app.fib: 8 threads and the pool under 1000 swaps, pause, retire, resume; swap-app.fib's http pause points) and the
 # ThreadSanitizer run of the stub and slot protocol (stress-tsan.fib in live mode with stress-swapper.lir appended), about two minutes each
@@ -103,7 +106,7 @@ tool_sh-make-graph := $(T)/make/graph.sh | $(wildcard $(T)/make/*) scripts/mac-g
 TOOLS_QUICK := sh-emit-prune fibref-skeleton gen-skeleton lint-pipefail lint-portable sh-driver-check-lib sh-make-graph
 TOOLS_FULL := $(TOOLS_QUICK) unit-api units-all units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-emit-runtime sh-emit-defs-order sh-stack-stack \
-  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap sh-live-defcache sh-live-queue sh-live-stress sh-live-stress-tsan \
+  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap sh-live-defcache sh-live-queue sh-live-test sh-live-stress sh-live-stress-tsan \
   $(PERSIST_STAMPS) sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
   sh-native-l1-unit $(LIRO_STAMPS) jit-selfhosted-threads sh-native-a64-sibcall sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
 # The command is every word up to the `|`, the inputs every word after it.

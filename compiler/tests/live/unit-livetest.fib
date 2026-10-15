@@ -1,0 +1,78 @@
+(ns main (:require [serve.livewords :as lw] [serve.proto :as p] [lsp.json :as j] [fib.string :as s]))
+;; The pure half of the live session's `test` op (serve.livewords, docs/design/live-meshql.md 3.1, 3.5, 3.8, package LT2): the selection
+;; a request asks for and its refusals, the words `fibc test` would pass a child, the entry's text, the rendering of the answer's
+;; document as `fibc test` prints a file with the `replay:` lines as `:test` commands, the status line. Built and run by
+;; compiler/tests/live/test.sh (no LLVM: serve.livewords links none). Exit 0 when every check holds.
+(defun check (name: str ok: bool) -> i64
+  (do (println (str (if ok "ok " "FAIL ") name)) (if ok 0 1)))
+
+(defun req (line: str) -> p/Req
+  (match (p/parse-request line) ((Ok r) r) ((Err m) (trap m))))
+
+(defun sel (line: str own: bool with: (Vec str)) -> (Result lw/Selection lw/Refusal)
+  (lw/selection-of (req line) own with nil))
+
+(defun code-of (r: (Result lw/Selection lw/Refusal)) -> str
+  (match r ((Ok _) "ok") ((Err ref) (. ref code))))
+
+(defun words-of (line: str) -> str
+  (match (sel line true []) ((Ok sl) (str-join (vec (interpose " " (lw/words-of sl))))) ((Err ref) (. ref code))))
+
+(def report-text: str
+  "{\"schema\":1,\"seed\":3,\"summary\":{\"total\":2,\"pass\":1,\"fail\":1,\"trap\":0,\"timeout\":0},\"results\":[{\"suite\":\"Classify\",\"impl\":\"\",\"id\":\"Classify/a-positive-number\",\"text\":\"a positive number\",\"covers\":[],\"status\":\"pass\",\"message\":\"\",\"at\":\"app.fib:3:5\",\"steps\":[{\"kind\":\"Given\",\"text\":\"Given h = (bump)\",\"status\":\"held\",\"at\":\"\"},{\"kind\":\"Then\",\"text\":\"Then \\\"pos\\\" = (classify 3)\",\"status\":\"held\",\"at\":\"app.fib:3:40\"}]},{\"suite\":\"Classify\",\"impl\":\"\",\"id\":\"Classify/zero\",\"text\":\"zero\",\"covers\":[],\"status\":\"fail\",\"message\":\"\",\"at\":\"app.fib:4:5\",\"steps\":[{\"kind\":\"Given\",\"text\":\"Given h = (bump)\",\"status\":\"held\",\"at\":\"\"},{\"kind\":\"Then\",\"text\":\"Then \\\"zero\\\" = (classify 0)\",\"status\":\"broke\",\"expected\":\"\\\"zero\\\"\",\"actual\":\"\\\"pos\\\"\",\"at\":\"app.fib:4:30\"}]}]}")
+
+(def want-rows: str
+  "Classify\n  pass  a positive number\n  FAIL  zero\n        Given h = (bump)\n      > Then \"zero\" = (classify 0)\n          expected: \"zero\"\n          actual:   \"pos\"\n          at app.fib:4:30\n        id Classify/zero  (app.fib:4:5)\n\n2 scenarios: 1 pass, 1 fail, 0 trap, 0 timeout (seed 3)\nreplay: :test --only 'Classify/zero' --seed 3\n")
+
+(defun report () -> j/JVal (match (j/json-parse report-text) ((Ok v) v) ((Err m) (trap m))))
+
+(defun answer (fields: str) -> j/JVal
+  (match (j/json-parse (str "{\"id\":1,\"ok\":true,\"report\":" report-text "," fields "}")) ((Ok v) v) ((Err m) (trap m))))
+
+(defun checks () -> i64
+  (+ (check "default entry: the program's (specs)" (= (code-of (sel "{\"op\":\"test\"}" true [])) "ok"))
+     (+ (check "default entry: the first --with file" (match (sel "{\"op\":\"test\"}" false ["specs/cart-spec.fib"]) ((Ok sl) (= (. sl entry) "(spec.cart-spec/specs)")) ((Err _) false)))
+        (+ (check "no entry: test/NoSpec" (= (code-of (sel "{\"op\":\"test\"}" false [])) "test/NoSpec"))
+           (+ (check "spec by file" (match (sel "{\"op\":\"test\",\"spec\":\"a/b/x-spec.fib\"}" true []) ((Ok sl) (= (. sl entry) "(spec.x-spec/specs)")) ((Err _) false)))
+              (+ (check "spec by module name" (match (sel "{\"op\":\"test\",\"spec\":\"spec.x-spec\"}" true []) ((Ok sl) (= (. sl entry) "(spec.x-spec/specs)")) ((Err _) false)))
+                 (+ (check "runner" (match (sel "{\"op\":\"test\",\"runner\":\"(fn (a o) (g/run-into \\\"f/*.feature\\\" (steps) a o))\"}" false []) ((Ok sl) (. sl runner)) ((Err _) false)))
+                    (+ (check "isolate fork: test/NoFork" (= (code-of (sel "{\"op\":\"test\",\"isolate\":\"fork\"}" true [])) "test/NoFork"))
+                       (+ (check "timeout: test/NoFork" (= (code-of (sel "{\"op\":\"test\",\"timeout\":5}" true [])) "test/NoFork"))
+                          (+ (check "format: test/Format" (= (code-of (sel "{\"op\":\"test\",\"format\":\"tap\"}" true [])) "test/Format"))
+                             (+ (check "last with nothing before: test/NoLast" (= (code-of (sel "{\"op\":\"test\",\"last\":true}" true [])) "test/NoLast"))
+                                (+ (check "last repeats the selection" (match (lw/selection-of (req "{\"op\":\"test\",\"last\":true}") true [] (some (lw/Selection "(specs)" false "zero" "" "" 4 1 "task" false false)))
+                                                                         ((Ok sl) (and (= (. sl only) "zero") (= (. sl seed) 4))) ((Err _) false)))
+                                   (check "a bad isolate" (= (code-of (sel "{\"op\":\"test\",\"isolate\":\"thread\"}" true [])) "test/BadIsolate"))))))))))))))
+
+(defun checks-words () -> i64
+  (+ (check "the words of a plain request" (= (words-of "{\"op\":\"test\"}") "--format json --seed 1 -j 1 --isolate task"))
+     (+ (check "the words of a selection" (= (words-of "{\"op\":\"test\",\"only\":\"zero\",\"seed\":7,\"jobs\":4,\"isolate\":\"none\",\"list\":true,\"tags\":\"@a\",\"name\":\"^x\",\"dry\":true}")
+                                             "--format json --seed 7 -j 4 --isolate none --only zero --list --tags @a --name ^x --dry-run"))
+        (+ (check "a quoted word" (= (lw/quoted "a \"b\" \\ c\nd") "\"a \\\"b\\\" \\\\ c\\nd\""))
+           (+ (check "the entry text calls run-main-into with the words and the sink"
+                     (match (sel "{\"op\":\"test\",\"only\":\"zero\"}" true [])
+                       ((Ok sl) (let ((t (lw/entry-text 3 sl)))
+                                  (and (s/starts-with? t "(defun live-test-3 (live-fd: i64 live-efd: i64) -> i64 (try ")
+                                       (s/includes? t "(live-test-run/run-main-into (specs) [\"--format\" \"json\" \"--seed\" \"1\" \"-j\" \"1\" \"--isolate\" \"task\" \"--only\" \"zero\"] live-out)")
+                                       (s/includes? t "(catch live-e (do (live-write live-efd (ex-message live-e)) 134))"))))
+                       ((Err _) false)))
+              (+ (check "the entry text of a runner calls it" (match (sel "{\"op\":\"test\",\"runner\":\"(fn (a o) (r a o))\"}" false [])
+                                                                 ((Ok sl) (s/includes? (lw/entry-text 0 sl) "((fn (a o) (r a o)) [\"--format\""))
+                                                                 ((Err _) false)))
+                 (check "the clauses of the first run" (= (lw/test-clauses ["x/y-spec.fib"]) ["(:require [fib.test.run :as live-test-run])" "(:require [spec.y-spec :as spec.y-spec])"]))))))))
+
+(defun checks-render () -> i64
+  (+ (check "the document rendered as fibc test prints a file, replay as :test" (= (lw/report-text (report)) want-rows))
+     (+ (check "the run's line" (= (lw/test-line (answer "\"ms\":31,\"generation_start\":2,\"generation_end\":2")) "; 2 scenarios in 31 ms (generation 2)"))
+        (+ (check "the stale note" (= (lw/test-line (answer "\"ms\":2031,\"generation_start\":3,\"generation_end\":4"))
+                                      "; 2 scenarios in 2031 ms (generation 4)\n; generation changed during the run (3 -> 4); :test to rerun"))
+           (+ (check "status: idle" (= (lw/tests-text (match (j/json-parse "{\"running\":false}") ((Ok v) v) ((Err m) (trap m)))) "tests: idle"))
+              (+ (check "status: running" (= (lw/tests-text (match (j/json-parse "{\"running\":true,\"entry\":\"(specs)\",\"only\":\"zero\",\"elapsed_ms\":312400}") ((Ok v) v) ((Err m) (trap m))))
+                                             "tests: running (specs) --only zero for 312 s"))
+                 (check "status: the last run" (= (lw/tests-text (match (j/json-parse "{\"running\":false,\"last\":{\"scenarios\":6,\"ms\":180,\"status\":0}}") ((Ok v) v) ((Err m) (trap m))))
+                                                  "tests: idle (last: 6 scenarios, 180 ms)"))))))))
+
+(defun main () -> i64
+  (let ((bad (+ (checks) (+ (checks-words) (checks-render)))))
+    (do (println (str "unit-livetest: " (if (= bad 0) "ok" (str bad " failed"))))
+        bad)))

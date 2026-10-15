@@ -1,0 +1,132 @@
+;; compiler/serve/livewords.fib: the pure half of a live session's `test` op (docs/design/live-meshql.md 3.1, 3.5, 3.8; package LT2):
+;; the selection a request asks for and its refusals, the words `fibc test` would pass a child, the text of the entry the session
+;; compiles, and the client's rendering of the answer (the fib.test JSON document as `fibc test` prints a file, through the library's own
+;; `plain-rows` and `plain-summary`, the `replay:` lines rewritten as `:test` commands). Nothing here needs LLVM or a session:
+;; compiler/tests/live/unit-livetest.fib checks it as a unit.
+(ns serve.livewords
+  (:require [serve.proto :as p] [lsp.json :as j] [expand.modules :as mods] [fib.test.run :as tr] [fib.test.core :as tc] [fib.string :as s]))
+
+;; What a run runs: `entry` is an expression of the suites (`(specs)`, `(spec.cart-spec/specs)`) given to `fib.test.run/run-main-into`,
+;; or, with `runner`, an expression of a function of the words and the sink (`gherkin.cli/run-into` with its pattern and registry
+;; applied: `(fn (argv out) (g/run-into "features/*.feature" (steps) argv out))`); the rest is `fibc test`'s selection, and `--tags`,
+;; `--name` and `--dry-run` are gherkin's (a fib.test entry refuses them, as `fibc test` would).
+(defstruct Selection (entry: str runner: bool only: str tags: str name: str seed: i64 jobs: i64 isolate: str list: bool dry: bool))
+
+;; Why a request is refused before anything runs: a `test/*` code, the message and a hint (3.1).
+(defstruct Refusal (code: str message: str hint: str))
+
+(defun str-field :private (r: p/Req key: str) -> str (unwrap-or (p/field-str r key) ""))
+
+;; The module a `spec` names: a module name already (`spec.x`), or a `--with` file's (expand.modules `with-name`).
+(defun spec-module (spec: str) -> str
+  (if (s/starts-with? spec "spec.") spec (mods/with-name spec)))
+
+;; The entry of a request: `runner`, `suites`, `spec` (a `--with` file), else the default (the program's own `(specs)` when it defines one,
+;; else the first `--with` file's), else `test/NoSpec`.
+(defun entry-of :private (r: p/Req own-specs: bool with: (Vec str)) -> (Result (Pair str bool) Refusal)
+  (cond (some? (p/field-str r "runner")) (Ok (Pair (str-field r "runner") true))
+        (some? (p/field-str r "suites")) (Ok (Pair (str-field r "suites") false))
+        (some? (p/field-str r "spec")) (Ok (Pair (str "(" (spec-module (str-field r "spec")) "/specs)") false))
+        own-specs (Ok (Pair "(specs)" false))
+        (not (empty? with)) (Ok (Pair (str "(" (mods/with-name (nth with 0)) "/specs)") false))
+        :else (Err (Refusal "test/NoSpec" "no spec: the program defines no `specs` and no --with spec was loaded"
+                            "a spec exposes its suites as (specs) (defspecs); fibc run --live APP --with SPEC loads one beside the app; or give `suites` or `runner`"))))
+
+(def no-fork-hint: str "a live process has threads (the attach thread, the app's), so fork isolation is refused by fib.os.process's own rule and a hung scenario cannot be killed: use --isolate task (the default) or none here, and fibc test --timeout in a process of its own for that scenario")
+
+;; The selection a request asks for, or why it is refused: `isolate: fork` and `timeout` (`test/NoFork`), `format` (the answer's report
+;; is the JSON document; the client renders it), `last: true` with no earlier run (`test/NoLast`), no entry (`test/NoSpec`).
+(defun selection-of (r: p/Req own-specs: bool with: (Vec str) last: (Option Selection)) -> (Result Selection Refusal)
+  (cond (p/field-bool r "last") (match last
+                                  ((some sel) (Ok sel))
+                                  (nil (Err (Refusal "test/NoLast" "nothing to rerun: no test has run in this session" "give a selection: :test [SPEC] [--only ID] .."))))
+        (or (= (str-field r "isolate") "fork") (some? (p/field-int r "timeout")))
+          (Err (Refusal "test/NoFork" (if (= (str-field r "isolate") "fork") "--isolate fork is refused in a live process" "--timeout selects fork isolation, which is refused in a live process") no-fork-hint))
+        (not (or (= (str-field r "isolate") "") (or (= (str-field r "isolate") "task") (= (str-field r "isolate") "none"))))
+          (Err (Refusal "test/BadIsolate" (str "--isolate is task or none here, not " (str-field r "isolate")) no-fork-hint))
+        (some? (p/field-str r "format")) (Err (Refusal "test/Format" "the answer's report is always the fib.test JSON document (the client renders it as fibc test prints a file)" "drop --format; fibc repl --connect --json passes the document through"))
+        :else (match (entry-of r own-specs with)
+                ((Err ref) (Err ref))
+                ((Ok [entry runner])
+                 (Ok (Selection entry runner (str-field r "only") (str-field r "tags") (str-field r "name") (unwrap-or (p/field-int r "seed") 1)
+                                (max 1 (unwrap-or (p/field-int r "jobs") 1)) (if (= (str-field r "isolate") "") "task" (str-field r "isolate"))
+                                (p/field-bool r "list") (p/field-bool r "dry")))))))
+
+;; ---- the words and the entry
+
+;; The words `fibc test` would pass a child for the selection (driver.test `passed`, with the gherkin ones after).
+(defun words-of (sel: Selection) -> (Vec str)
+  (into ["--format" "json" "--seed" (show (. sel seed)) "-j" (show (. sel jobs)) "--isolate" (. sel isolate)]
+        (into (if (= (. sel only) "") [] ["--only" (. sel only)])
+              (into (if (. sel list) ["--list"] [])
+                    (into (if (= (. sel tags) "") [] ["--tags" (. sel tags)])
+                          (into (if (= (. sel name) "") [] ["--name" (. sel name)])
+                                (if (. sel dry) ["--dry-run"] [])))))))
+
+;; A string as a fibber literal.
+(defun quoted (text: str) -> str
+  (str "\"" (reduce (fn (acc: str c: char) (str acc (cond (= c \\) "\\\\" (= c \") "\\\"" (= c \newline) "\\n" :else (str c)))) "" (s/chars text)) "\""))
+
+(defun words-text (ws: (Vec str)) -> str
+  (str "[" (str-join (vec (interpose " " (mapv quoted ws)))) "]"))
+
+(defun entry-name (n: i64) -> str (str "live-test-" n))
+
+;; The clauses the session's text gains at the first run: the runner's module under a name of its own, and each `--with` module under
+;; its own name (a module is named in full only when the program requires it: types.names `lookup`; the app may require nothing of
+;; fib.test and nothing names a `--with` module).
+(defun test-clauses (with: (Vec str)) -> (Vec str)
+  (into ["(:require [fib.test.run :as live-test-run])"]
+        (mapv (fn (f: str) (str "(:require [" (mods/with-name f) " :as " (mods/with-name f) "])")) with)))
+
+;; The entry of run `n`: a function of the report's descriptor and the trap's, `(run-main-into ENTRY WORDS SINK)` (or the runner called
+;; with the words and the sink) under a `try`; the sink writes every byte through the session's `live-write`; a trap outside a scenario
+;; is its message on the second descriptor and 134 (`test/Trapped`). The entry is evaluated by every run: the suites (a registry's step
+;; closures) are made again, so an edited step is seen (3.6; the mutant `rerun-old-registry`).
+(defun entry-text (n: i64 sel: Selection) -> str
+  (let ((words (words-text (words-of sel))))
+    (str "(defun " (entry-name n) " (live-fd: i64 live-efd: i64) -> i64 (try (let ((live-out (fn (live-t: str) (live-write live-fd live-t)))) "
+         (if (. sel runner)
+             (str "(" (. sel entry) " " words " live-out)")
+             (str "(live-test-run/run-main-into " (. sel entry) " " words " live-out)"))
+         ") (catch live-e (do (live-write live-efd (ex-message live-e)) 134))))\n")))
+
+;; ---- the client's rendering
+
+(defun str-at :private (v: j/JVal key: str) -> str (match (j/json-get v key) ((some x) (unwrap-or (j/json-as-str x) "")) (nil "")))
+(defun int-at :private (v: j/JVal key: str) -> i64 (match (j/json-get v key) ((some (j/JInt n)) n) (_ 0)))
+(defun arr-at :private (v: j/JVal key: str) -> (Vec j/JVal) (match (j/json-get v key) ((some (j/JArr xs)) xs) (_ [])))
+(defun strs-at :private (v: j/JVal key: str) -> (Vec str) (mapv (fn (x: j/JVal) (unwrap-or (j/json-as-str x) "")) (arr-at v key)))
+
+(defun step-of :private (v: j/JVal) -> tc/StepRun
+  (tc/StepRun (str-at v "kind") (str-at v "text") (if (= (str-at v "status") "held") tc/Held (tc/Broke (str-at v "expected") (str-at v "actual"))) (str-at v "at")))
+
+;; A row of the document (test-harness.md 6.3) as the library's `ScenarioRow` (the plan is not in the document; no reporter reads it).
+(defun row-of (v: j/JVal) -> tr/ScenarioRow
+  (tr/ScenarioRow (str-at v "suite") (str-at v "impl") (str-at v "id") (str-at v "text") (strs-at v "covers") [] (str-at v "status")
+                  (mapv step-of (arr-at v "steps")) (str-at v "message") (str-at v "at")))
+
+(defun rows-of (report: j/JVal) -> (Vec tr/ScenarioRow) (mapv row-of (arr-at report "results")))
+
+;; The summary's `replay: --only 'ID' --seed N` lines as `:test` commands (3.5).
+(defun replay-rewrite (text: str) -> str (s/replace text "replay: --only " "replay: :test --only "))
+
+;; The document rendered as `fibc test` prints a file: the rows, then the summary.
+(defun report-text (report: j/JVal) -> str
+  (let ((rows (rows-of report)))
+    (str (tr/plain-rows rows) (replay-rewrite (tr/plain-summary rows (int-at report "seed"))))))
+
+;; `; 5 scenarios in 2031 ms (generation 2)`, and the stale note after it (3.7).
+(defun test-line (v: j/JVal) -> str
+  (let ((n (match (j/json-get v "report") ((some rep) (int-at (unwrap-or (j/json-get rep "summary") j/JNull) "total")) (nil 0)))
+        (g0 (int-at v "generation_start")) (g1 (int-at v "generation_end")))
+    (str "; " n (if (= n 1) " scenario" " scenarios") " in " (int-at v "ms") " ms (generation " g1 ")"
+         (if (= g0 g1) "" (str "\n; generation changed during the run (" g0 " -> " g1 "); :test to rerun")))))
+
+;; `tests: idle`, `tests: running ID for 312 s`, `tests: idle (last: 6 scenarios, 180 ms)` of `:status` (3.9).
+(defun tests-text (t: j/JVal) -> str
+  (cond (match (j/json-get t "running") ((some (j/JBool b)) b) (_ false))
+          (str "tests: running " (str-at t "entry") (if (= (str-at t "only") "") "" (str " --only " (str-at t "only"))) " for " (quot (int-at t "elapsed_ms") 1000) " s")
+        (some? (j/json-get t "last")) (let ((l (unwrap-or (j/json-get t "last") j/JNull)))
+                                        (str "tests: idle (last: " (int-at l "scenarios") " scenarios, " (int-at l "ms") " ms)"))
+        :else "tests: idle"))
