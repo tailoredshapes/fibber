@@ -11,7 +11,7 @@ beside the file, then under each -I dir in order, then under each directory of
 $FIB_LIB, then in the library directory `lib` (spec/syntax.md §5).
 
 commands:
-  run [--trace] [--live [--live-deps]] [-O N] <file> [-- arg..]
+  run [--trace] [--live [--live-deps] [--with SPEC]..] [-O N] <file> [-- arg..]
                          compile file through the JIT and run its main; the
                          args after -- are (args); --live (or FIB_LIVE=1)
                          compiles the program for live redefinition: its own
@@ -23,7 +23,10 @@ commands:
                          deps.fib) are live and its libraries are not unless
                          --live-deps (FIB_LIVE_DEPS=1, or --live-deps=NAME,.. for
                          some of them); outside a project every module not named
-                         fib.* is live
+                         fib.* is live; each --with SPEC (a spec file) is loaded
+                         beside the program as the module spec.NAME, so that the
+                         session's `test` op (`:test` of the client) runs it
+                         (docs/design/live-meshql.md 3)
   build <file> -o <out> [-O N] [-L dir].. [-l lib].. [--emit liro|obj|asm|llvm|ptx|wgsl|c]
                         [--kernel-target TRIPLE|none]
                          (the options may come before the file too)

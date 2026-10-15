@@ -283,9 +283,44 @@
           (match (load-implicit ld spec)
             ((Err e) (Err e))
             ((Ok spec)
-             (match (visit-all ld (module-spec-deps spec))
+             (match (visit-with ld (. roots with))
                ((Err e) (Err e))
-               ((Ok _) (Ok (conj @(. ld out) (Loaded spec file forms false)))))))))))))
+               ((Ok _) (match (visit-all ld (module-spec-deps spec))
+                         ((Err e) (Err e))
+                         ((Ok _) (Ok (conj @(. ld out) (Loaded spec file forms false)))))))))))))))
+
+;; The module name of a `--with FILE`: `spec.NAME`, NAME the file's base name without `.fib` (`a/b/cart-spec.fib` is `spec.cart-spec`).
+(defun with-name (file: str) -> str
+  (let ((base (loop ((i 0) (from 0))
+                (cond (>= i (str-len file)) (str-slice file from (str-len file))
+                      (= (str-byte-at file i) 47i8) (recur (+ i 1) (+ i 1))
+                      :else (recur (+ i 1) from)))))
+    (str-concat "spec." (if (and (> (str-len base) 4) (= (str-slice base (- (str-len base) 4) (str-len base)) ".fib"))
+                            (str-slice base 0 (- (str-len base) 4))
+                            base))))
+
+;; The `--with` files of the roots (docs/design/live-meshql.md 2.3 (b), package LT2): each read as the module `with-name` says, whatever
+;; its own `ns` form says (a spec file is `ns main`, and its `main` becomes `spec.NAME/main`), before the main module's own dependencies
+;; (a `:require` of `spec.NAME` by the main module, which a live session's inputs add to name `spec.NAME/specs`, then finds it read).
+;; A file that cannot be read is a missing module.
+(defun visit-with :private (ld: Loader files: (Vec str)) -> (Result unit LoadErr)
+  (loop ((i 0))
+    (if (>= i (count files))
+        (Ok ())
+        (let ((file (nth files i)))
+          (match (read-file file)
+            (nil (Err (LoadMissing (with-name file) file)))
+            ((some source)
+             (match (reader/read-all source file)
+               ((Err e) (Err (LoadRead e)))
+               ((Ok forms)
+                (match (spec-in forms "main")
+                  ((Err e) (Err e))
+                  ((Ok spec0)
+                   (let ((spec (with-regex (ModuleSpec (with-name file) (. spec0 requires) (. spec0 uses) (. spec0 exports) (. spec0 implicit)) forms)))
+                     (match (visit-spec ld (give-implicit ld spec) file forms)
+                       ((Err e) (Err e))
+                       ((Ok _) (recur (+ i 1)))))))))))))))
 
 ;; The implicit modules read first, when the main module sees them: the
 ;; spec of the main module, with them given to it.
