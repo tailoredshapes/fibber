@@ -510,3 +510,17 @@ Decisions for the owner:
   (`check 157 to 172 ms`; 9,019 ms on the same machine without LE5), start-up to the first HTTP answer 8.51 to 9.07 s (8.42 s
   without); `hello` waits for the warm-up when it comes first (8.8 to 9.7 s). The demo's check "a session def is accepted once and
   refused again (live/Def)" fails with and without LE5: it predates LT4, which made a `def` redefinable.
+- **Status 2026-10-15, live bugs** (one commit each; the tests and the mutants named are the pins). (1) A load's `live/Signature` or
+  `live/Summary` refusal is at the refused function's definition in the file (serve.liverules `Refusal.family`, serve.liveload
+  `family-pos`; load.py, the mutant `rules-at-file-start`). (2) `:type` reads the loaded texts (`rc/type-of-expr-texts`; load.py, the
+  mutant `type-reads-disk`). (3) and (4) are live-meshql.md 10 (LT6 (b), (d); LT5 (a)). (5) A diagnostic of an input that redefines a
+  macro is at the input's line (LM2 (e); swap.py). (6) A `def` of a loaded file is redefined by expanded form (LM2 (f); unit-livediff,
+  load.py). (7) **The first redefinition of a function nothing reached answers `defined`, not `swapped`, and that is left as it is**:
+  such a function has no registered body (the base pruned it: `main` does not reach it), so it is in no family of the live table and
+  there is no slot to patch; the redefinition changes the session's text only (as 6 (d) says of a load), and the first program that
+  reaches it (an expression input, or a later definition that calls it) lowers it from that text and registers it, after which a
+  redefinition is a swap (`generation` 1). Measured on a probe (`unused`, never called by `main`): `(defun unused ..)` answers
+  `defined ["unused"]` at generation 0, `(unused 1)` then answers the new body's value, the next redefinition `swapped ["unused"]` at
+  generation 1; with `(unused 1)` first, the first redefinition is already `swapped`. Answering `swapped` would name a swap that did
+  not happen (no generation, no patch); the answer is the truth of what the session did.
+
