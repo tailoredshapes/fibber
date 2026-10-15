@@ -1,0 +1,21 @@
+;; fib.os.live: what a program says to and asks of the live session it runs in (docs/design/live-repl.md 2.2, 3.3; package LV3;
+;; rt/live.lir). Not part of the `fib.os` facade, as fib.os.sched is not: `fib_live_ctl` is a function of the runtime of this tree.
+;;   (socket)         the path of the attach socket when the program runs under `fibc run --live` (FIB_LIVE_SOCKET), else nil
+;;   (pause-point)    where the program is idle (a server's accept loop between connections: fib.http.server calls it there; an
+;;                    app's own idle loop): returns at once, unless the session asked for a pause, in which case the thread parks
+;;                    here, counted, until `resume`. At a pause point no frame of this thread is in a body that a retirement could free
+;;                    (serve.liveretire keeps the generations of every function that reaches a pause point). Ignored on a worker of
+;;                    the pool (a pool task is done when it returns; the pool's idle is its pause). Not for the attach thread's own
+;;                    inputs: an expression that calls it while a pause is requested waits for a resume nobody can send.
+;;   (pausing?)       whether a pause is requested; (paused-threads) how many threads are parked at a pause point
+;; In a program that is not live nothing ever requests a pause, and a pause point costs one acquire load.
+(ns fib.os.live (:require [fib.os.environment :as env]))
+;; Bound to the runtime's own definition (rt/live.lir marks it `;; extern:`; emit.rt), not to a C library.
+(extern fib_live_ctl :private (i64 i64) -> i64)
+
+(defun ctl :private (op: i64 a: i64) -> i64 (unsafe (fib_live_ctl op a)))
+
+(defun socket () -> (Option str) (env/getenv "FIB_LIVE_SOCKET"))
+(defun pause-point () -> unit (do (ctl 8 0) ()))
+(defun pausing? () -> bool (= (ctl 7 0) 1))
+(defun paused-threads () -> i64 (ctl 2 0))

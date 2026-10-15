@@ -3763,6 +3763,161 @@
   (block other (ret (i64 -1))))
 ")
 
+;; live.lir
+(def RT-LIVE: str
+";; fib.rt, the live session (docs/design/live-repl.md 3.3, package LV3): the
+;; pause points a live program parks at, the release store of a swap, and
+;; what the attach thread (serve.live: the compiler's own thread, not one of
+;; the program's) asks and tells through `fib_live_ctl`. A program that is
+;; not live never sets `fib.live-pausing`, so a pause point costs it one
+;; acquire load.
+;;
+;; The protocol and its memory orders:
+;;   fib.live-pausing  i32  1 while a pause is requested: stored with release
+;;                          order under the run queue's mutex (ctl 0 and 1);
+;;                          read with an acquire load on the fast path of a
+;;                          pause point, and again under the mutex before each
+;;                          wait (the condition variable's rule: the predicate
+;;                          is re-read under the mutex after every wake)
+;;   fib.live-paused   i32  the threads parked at a pause point: a plain word
+;;                          under the run queue's mutex, with a broadcast on
+;;                          the run queue's condition at each change, as
+;;                          fib.threads-live is kept (thread.lir)
+;; A thread that finds the flag set takes the mutex, counts itself in,
+;; broadcasts, and waits on the condition until the flag is clear; it counts
+;; itself out before it returns. The attach thread's quiescence check (ctl 4)
+;; reads `fib.live-paused`, `fib.threads-live` (the spawned threads), the
+;; async pool's queue and busy count (task.lir) under the same mutex, and the
+;; work-stealing pool's `fib.sched-active` and work (park.lir, sched.lir) with
+;; acquire loads. Quiescent: every spawned thread and the program's main
+;; thread is parked here (paused = threads-live + 1: fib.run-main's thread is
+;; not in threads-live), no async task is queued or running, and every pool
+;; worker is asleep with no work anywhere.
+;;
+;; Why that is enough for a retirement (serve.liveretire) to free a
+;; generation's code: a parked thread executes no instruction of the program
+;; until it reads the flag clear under the mutex, and the resume (ctl 1)
+;; stores the clear flag under the mutex AFTER the attach thread returned
+;; from ORC's removal (program order on the attach thread; the mutex's
+;; release and acquire order the two threads). A sleeping pool worker runs
+;; program code only after it takes a task, and a task is forked only by a
+;; program thread (all parked) or by a running task (none: `fib.sched-active`
+;; 0 and no work, read with acquire loads against the worker's seq_cst
+;; decrement before its sleep, park.lir fib.sched-idle). The current
+;; generation of every slot is never removed, so the next call of a resumed
+;; thread goes through its stub to code that is mapped.
+;;
+;; What ThreadSanitizer sees of this: the plain counters under the mutex, the
+;; slot's acquire load against the patch's release store (a plain store in
+;; either place is reported: scripts/mutant-live.sh patch-plain-store,
+;; stub-plain-load). It does not see a weakened order among the atomics
+;; (CLAUDE.md), which the socket stress of compiler/tests/live/stress.sh and
+;; the mutant retire-without-pause are for.
+(global internal fib.live-pausing i32 (i32 0))
+(global internal fib.live-paused i32 (i32 0))
+
+;; `live.patch` of a session (serve.livesess): the release store of a
+;; generation's address into a slot. The stub's load is an acquire load
+;; (emit.live), so a caller that sees the new address sees the code ORC
+;; finished writing before the swap looked the address up.
+(define internal (fib.live-patch void) ((ptr slot) (i64 v))
+  (block entry (atomic-store release (inttoptr ptr v) slot) (ret)))
+
+;; A pause point: returns at once unless a pause is requested, else parks
+;; here, counted, until the resume.
+(define internal (fib.live-pause-point void) ()
+  (block entry
+    (br (icmp eq (atomic-load acquire i32 @fib.live-pausing) (i32 0)) done park))
+  (block park
+    (call @fib.rq-lock)
+    (store (add (load i32 @fib.live-paused) (i32 1)) @fib.live-paused)
+    (call @fib.rq-broadcast)
+    (br test))
+  (block test
+    (br (icmp eq (atomic-load acquire i32 @fib.live-pausing) (i32 0)) leave sleep))
+  (block sleep
+    (call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))
+    (br test))
+  (block leave
+    (store (sub (load i32 @fib.live-paused) (i32 1)) @fib.live-paused)
+    (call @fib.rq-broadcast)
+    (call @fib.rq-unlock)
+    (br done))
+  (block done (ret)))
+
+;; The flag stored under the mutex (so that a waiter's re-read under the
+;; mutex and the store are ordered), every sleeper told.
+(define internal (fib.live-set-pausing void) ((i32 v))
+  (block entry
+    (call @fib.rq-lock)
+    (atomic-store release v @fib.live-pausing)
+    (call @fib.rq-broadcast)
+    (call @fib.rq-unlock)
+    (ret)))
+
+;; Whether the work-stealing pool is quiet: not started, or every worker
+;; asleep with nothing to take (the check of fib.sched-quiesce, park.lir,
+;; without the wait).
+(define internal (fib.live-pool-quiet i1) ()
+  (block entry
+    (br (icmp eq (atomic-load acquire i32 @fib.sched-state) (i32 2)) started quiet))
+  (block started
+    (br (icmp eq (atomic-load acquire i64 @fib.sched-active) (i64 0)) check busy))
+  (block check (ret (xor (call @fib.sched-any-work) (i1 1))))
+  (block busy (ret (i1 0)))
+  (block quiet (ret (i1 1))))
+
+;; Quiescent (above): under the mutex the parked count against the spawned
+;; threads and main, the async queue and its busy workers; then the pool.
+(define internal (fib.live-quiescent i64) ()
+  (block entry
+    (call @fib.rq-lock)
+    (let ((parked (icmp eq (load i32 @fib.live-paused) (add (load i32 @fib.threads-live) (i32 1))))
+          (async (and (icmp eq (load ptr @fib.rq-head) (ptr null)) (icmp eq (load i32 @fib.pool-busy) (i32 0)))))
+      (call @fib.rq-unlock)
+      (br (and parked async) pool no)))
+  (block pool (ret (select (call @fib.live-pool-quiet) (i64 1) (i64 0))))
+  (block no (ret (i64 0))))
+
+;; A count kept under the mutex: 0 the parked threads, 1 the spawned threads
+;; alive, 2 the async pool's busy workers.
+(define internal (fib.live-count i64) ((i64 which))
+  (block entry
+    (call @fib.rq-lock)
+    (switch which other ((i64 0) paused) ((i64 1) threads) ((i64 2) busy)))
+  (block paused (let ((a (load i32 @fib.live-paused))) (br join)))
+  (block threads (let ((b (load i32 @fib.threads-live))) (br join)))
+  (block busy (let ((c (load i32 @fib.pool-busy))) (br join)))
+  (block other (br join))
+  (block join
+    (let ((r (phi i32 (paused a) (threads b) (busy c) (other (i32 0)))))
+      (call @fib.rq-unlock)
+      (ret (zext i64 r)))))
+
+;; What the library (lib/fib/os/live.fib) and the attach thread ask (extern:
+;; bound to this definition): 0 request a pause; 1 resume; 2 the threads
+;; parked; 3 the spawned threads alive; 4 whether quiescent; 5 the pool's
+;; active workers; 6 the pool's live workers; 7 whether a pause is requested;
+;; 8 a pause point (the library's `pause-point`); 9 the async pool's busy
+;; workers.
+;; extern: (declare fib_live_ctl i64 (i64 i64))
+(define internal (fib_live_ctl i64) ((i64 op) (i64 a))
+  (block entry
+    (switch op other ((i64 0) pause) ((i64 1) resume) ((i64 2) paused) ((i64 3) threads) ((i64 4) quiescent)
+      ((i64 5) active) ((i64 6) workers) ((i64 7) pausing) ((i64 8) point) ((i64 9) busy)))
+  (block pause (call @fib.live-set-pausing (i32 1)) (ret (i64 0)))
+  (block resume (call @fib.live-set-pausing (i32 0)) (ret (i64 0)))
+  (block paused (ret (call @fib.live-count (i64 0))))
+  (block threads (ret (call @fib.live-count (i64 1))))
+  (block quiescent (ret (call @fib.live-quiescent)))
+  (block active (ret (atomic-load acquire i64 @fib.sched-active)))
+  (block workers (ret (atomic-load acquire i64 @fib.sched-live)))
+  (block pausing (ret (zext i64 (atomic-load acquire i32 @fib.live-pausing))))
+  (block point (call @fib.live-pause-point) (ret (i64 0)))
+  (block busy (ret (call @fib.live-count (i64 2))))
+  (block other (ret (i64 -1))))
+")
+
 ;; weak.lir
 (def RT-WEAK: str
 ";; fib.rt, weak references (types §8.7). A weak box is the header, a

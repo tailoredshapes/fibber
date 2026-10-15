@@ -90,22 +90,24 @@
 (defun lazy-inits :private (st: Search inits: (Vec Init)) -> (Map str str)
   (reduce (fn (m: (Map str str) i: Init) (if (pure-body? st (. i body)) (assoc m (slot-name i) (. i body)) m)) {} inits))
 
-(defun seed :private (st: Search roots: (Vec la/LItem) main: (Vec la/LItem) inits: (Vec Init)) -> unit
+(defun seed :private (st: Search roots: (Vec la/LItem) main: (Vec la/LItem) inits: (Vec Init) extra: (Vec str)) -> unit
   (do (doseq [it (into roots main)] (reach-all st (refs-of it)))
-      (reach-all st ["fib.initdef" "fib.immortalise" "fib.init-done"])
+      (reach-all st (into ["fib.initdef" "fib.immortalise" "fib.init-done"] extra))
       (doseq [i inits]
         (when (not (contains? (. st lazy) (slot-name i)))
           (do (reach st (. i body)) (reach st (slot-name i)))))
       (run-work st)))
 
-(defun prune-parts (parts: Parts main: (Vec la/LItem) inits: (Vec Init)) -> (Pair Parts (Vec Init))
+;; `extra`: names kept alive besides what `main` reaches (a live program keeps the runtime's `fib_live_ctl` and `fib.live-patch` for the
+;; attach thread of its session, rt/live.lir, whether or not the program calls a pause point).
+(defun prune-parts (parts: Parts main: (Vec la/LItem) inits: (Vec Init) extra: (Vec str)) -> (Pair Parts (Vec Init))
   (let ((roots (cell [])))
     (let ((rts (index-items (. parts runtime) roots))
           (prog (index-items (into (into (into (into (into (into (. parts externs) (. parts types)) (. parts statics))
                                                    (. parts keywords)) (. parts defs)) (. parts quotes)) (. parts fns)) roots)))
       (let ((lazy (lazy-inits (Search prog rts (cell {}) (cell []) {}) inits)))
         (let ((st (Search prog rts (cell {}) (cell []) lazy)))
-          (do (seed st @roots main inits)
+          (do (seed st @roots main inits extra)
               (let ((live @(. st live)))
                 (Pair (Parts (live-items (. parts runtime) live) (live-items (. parts externs) live)
                              (live-items (. parts types) live) (live-items (. parts statics) live)

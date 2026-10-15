@@ -3,7 +3,8 @@
 `fib.os` provides named OS operations, typed options, and shared errors. It
 includes files, descriptors, directories, clocks, environment variables, process
 identity, executable discovery, system information, and secure random bytes.
-`fib.os.net`, `fib.os.platform`, and `fib.os.memory-stream` are explicit modules.
+`fib.os.net`, `fib.os.platform`, `fib.os.memory-stream`, `fib.os.sched` (the pool's control surface) and `fib.os.live` (what a
+program says to the live session it runs in: `(live/pause-point)`, `(live/socket)`; docs/design/live-repl.md 3.3) are explicit modules.
 
 The native Linux implementation is exercised by the test suite. A Darwin backend
 and runtime adaptation are included and checked for source typing and emission;

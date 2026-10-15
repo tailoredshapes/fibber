@@ -3,11 +3,14 @@
 ;; head (absolute from its first byte), then the body.
 (ns fib.http.server.connection (:use fib.core fib.seq fib.coll fib.http.types fib.http.headers fib.http.bytes fib.http.wire
                                      fib.http.transport fib.http.reader fib.http.body fib.http.server.types fib.http.server.reply)
-  (:require [fib.os.time :as time]))
+  (:require [fib.os.time :as time] [fib.os.live :as live]))
 (defun ms (n: i64) -> i64 (* n 1000000))
+;; Each slice of the wait between requests is a pause point of the live session (fib.os.live): a kept-alive connection parks there when the
+;; session pauses, with no frame of the program's own code on its stack.
 (defun await-request :private (t: Transport r: Reader o: Options stop: (Atom bool)) -> (Result bool Error)
   (let [limit (+ (time/clock-now) (ms (. o idle-timeout-ms)))]
     (loop []
+      (live/pause-point)
       (cond (or @stop (>= (time/clock-now) limit)) (Ok false)
             :else (do (t-deadline t (min limit (+ (time/clock-now) (ms 100))))
                       (match (fill r) ((Ok b) (Ok b)) ((Err (Timeout _ _)) (recur)) ((Err e) (Err e))))))))

@@ -6,7 +6,7 @@
 (ns tests.emit.unit-runtime (:use fib.test.unit emit.runtime emit.rt)
   (:require [fib.test.run :as test-runner]))
 
-(def stems: (Vec str) ["core" "str" "array" "vec" "vecbuild" "atom" "thread" "task" "deque" "sched" "park" "weak" "io" "sys" "alloc"])
+(def stems: (Vec str) ["core" "str" "array" "vec" "vecbuild" "atom" "thread" "task" "deque" "sched" "park" "live" "weak" "io" "sys" "alloc"])
 
 (defun file-text (stem: str) -> str
   (match (read-file (str-join ["rt/" stem ".lir"]))
@@ -17,8 +17,8 @@
   (let ((cs (new-rec))
         (parts (runtime-parts-for "Linux")))   ; the raw rt/*.lir: another host (Darwin) has them rewritten by emit.os
     (do
-      (is cs (= (count parts) 15) "fifteen parts")
-      (doseq [i (range 13)]
+      (is cs (= (count parts) 16) "sixteen parts")
+      (doseq [i (range 14)]
         (is cs (and (> (str-len (nth parts i)) 0) (= (nth parts i) (file-text (nth stems i)))) (str-join ["part " (nth stems i) " is its file"])))
       (is cs (= (str-join (vec (mapcat (fn (p: str) [p "\n"]) parts))) (str-join (vec (mapcat (fn (st: str) [(file-text st) "\n"]) stems)))) "the text is every file and a line break")
       (is cs (= (runtime-declaration "malloc") (some "(declare malloc ptr (i64))")) "malloc is declared by core")
@@ -41,7 +41,8 @@
                         (some? (str-find darwin "@clock_gettime (i32 5)" 0)) (some? (str-find linux "@clock_gettime (i32 6)" 0))) "Darwin asks malloc_size and its approximate raw clock")))
       (is cs (= (runtime-declaration "fib_alloc_ctl") (some "(declare fib_alloc_ctl i64 (i64 i64 i64))")) "a function marked `;; extern:` answers with its declaration")
       (is cs (= (runtime-declaration "fib_sched_ctl") (some "(declare fib_sched_ctl i64 (i64 i64))")) "the pool's control function is declared the same way")
-      (is cs (= (nth parts 14) (file-text "alloc")) "part alloc is its file")
+      (is cs (= (runtime-declaration "fib_live_ctl") (some "(declare fib_live_ctl i64 (i64 i64))")) "the live session's control function is declared the same way (rt/live.lir)")
+      (is cs (= (nth parts 15) (file-text "alloc")) "part alloc is its file")
       (rec-steps cs))))
 
 (defun tests () -> Suite
