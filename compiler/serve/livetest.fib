@@ -1,0 +1,165 @@
+;; compiler/serve/livetest.fib: the `test` op of a live session (docs/design/live-meshql.md 3.1 to 3.8; package LT2): a spec run in the
+;; running program from the attached REPL. The attach thread takes the request (serve.livewords decides the selection and its refusals),
+;; compiles the run's entry as an input of the session (serve.livesess: a `defun` of the merged program, cut out and added under a
+;; tracker of its own), opens the session's report file and `spawn`s the test thread, which calls the entry with the two descriptors;
+;; then it answers nothing and goes back to its socket, so `status` answers and a swap lands while the scenarios run (3.7: nothing
+;; waits for a test, and a run that straddles a swap is `stale`). The connection loop (serve.live) polls `finish`: when the thread has
+;; set `done`, the report file is read, the answer built (the fib.test JSON document unchanged, the status, the generations at the
+;; start and the end, `stale`, `ms`, `threads_after`) and written on the connection that asked. One run at a time (`busy`): the report
+;; file is the session's, not the library's (3.2); `last: true` repeats the previous selection (3.8).
+(ns serve.livetest
+  (:use lir.ast lir.types)
+  (:require [serve.livesess :as ls] [serve.livewords :as lw] [serve.liveswap :as lsw] [serve.liveretire :as lr] [serve.replcore :as rc] [serve.proto :as p]
+            [serve.diag :as dg] [serve.incr :as inc] [lsp.json :as j] [live.extract :as ex] [live.jit :as lj] [emit.compile :as ec] [emit.function :as f]
+            [emit.node :as n] [native.call :as call] [fib.unix :as unix] [fib.string :as s]))
+
+;; A run in progress: the request's id and the number of the connection it came on, when it started and the generation then, its selection, the
+;; entry's module (kept or freed at the end: serve.livesess `run-expression`'s rule), and `done`, set by the test thread with the entry's status.
+(defstruct Running (id: j/JVal conn: i64 t0: i64 gen0: i64 sel: lw/Selection added: ls/Added name: str done: (Atom (Option i64))))
+
+;; What the last run came to, for `status` (3.9).
+(defstruct Finished (scenarios: i64 ms: i64 status: i64))
+
+;; The test state of a session: the run in progress (at most one), the last selection (`last: true`) and result, the report and trap files.
+(defstruct Tests (running: (Cell (Option Running)) last-sel: (Cell (Option lw/Selection)) last: (Cell (Option Finished)) report: str err: str))
+
+(defun tests-new (report: str err: str) -> Tests (Tests (cell nil) (cell nil) (cell nil) report err))
+
+(defun running? (t: Tests) -> bool (some? @(. t running)))
+
+;; ---- the request
+
+(defun refused :private (r: p/Req ref: lw/Refusal) -> str
+  (p/response r false [(Pair "error" (j/json-obj [(Pair "code" (j/json-str (. ref code))) (Pair "message" (j/json-str (. ref message)))]))
+                       (Pair "code" (j/json-str (. ref code))) (Pair "hint" (j/json-str (. ref hint)))]))
+
+(defun elapsed-ms :private (run: Running) -> i64 (inc/ms-since (. run t0)))
+
+;; `busy`: the id of the run and how long it has run (3.1).
+(defun busy :private (r: p/Req run: Running) -> str
+  (p/response r false [(Pair "error" (j/json-obj [(Pair "code" (j/json-str "busy")) (Pair "message" (j/json-str (str "a test is running (" (elapsed-ms run) " ms so far); one run at a time")))]))
+                       (Pair "running" (j/json-obj [(Pair "id" (. run id)) (Pair "elapsed_ms" (j/json-int (elapsed-ms run)))]))]))
+
+;; Whether the session's program defines `specs` (a `defspecs` of the spec file that is the app: the dev entry of 2.3 (a)).
+(defun own-specs? :private (sx: ls/Sess) -> bool
+  (some? (first (filterv (fn (d: rc/Def) (= (. d key) "val:specs")) @(. (. sx rc) defs)))))
+
+;; The `test` request: refused now, `busy`, or started (nil: the answer comes from `finish`).
+(defun op-test (sx: ls/Sess t: Tests r: p/Req conn: i64) -> (Option str)
+  (match @(. t running)
+    ((some run) (some (busy r run)))
+    (nil (match (lw/selection-of r (own-specs? sx) (. (. sx rts) with) @(. t last-sel))
+           ((Err ref) (some (refused r ref)))
+           ((Ok sel) (match (launch sx t r conn sel)
+                       ((Err line) (some line))
+                       ((Ok _) nil)))))))
+
+;; ---- the entry
+
+;; A `ccc` entry `name` of two words (the descriptors) to `body`, a `tailcc` function of the same parameters; the first word of its
+;; result (a value next to a failure under the catching convention).
+(defun entry-item :private (name: str body: str ty: LFnType) -> LItem
+  (let ((call (n/call body [(n/local "fd") (n/local "efd")])))
+    (let ((value (match (. ty ret) ((some (TAnon _)) (n/extract call 0)) (_ call))))
+      (ItDefine (f/external (f/make name (some ty-i64) [(Pair "fd" ty-i64) (Pair "efd" ty-i64)] cc-c [(f/block "entry" [(n/ret (some value))])]))))))
+
+;; The entry of run `n` cut out as `live.test.N.body` (generation 0 of the entry, emit.live), entered through `live.test.N`: its
+;; address and its module.
+(defun cut-entry :private (sx: ls/Sess n: i64 m: LModule) -> (Result (Pair ls/Added i64) str)
+  (let ((pi (ex/index-of m)) (name (str "live.test." n)) (stub (str "f." (lw/entry-name n))))
+    (let ((body (if (some? (get pi (str stub ".g0"))) (str stub ".g0") stub)))
+      (try-let ((fd (match (get pi body) ((some (ItDefine fd)) (Ok fd)) (_ (Err (str "live: the program has no " (lw/entry-name n))))))
+                (a (ls/add-cut sx m [(Pair body (str name ".body"))] [] [(entry-item name (str name ".body") (. fd ty))]))
+                (addr (lj/address (ls/jit-of sx) name)))
+        (Ok (Pair a addr))))))
+
+(defun open-out :private (path: str) -> (Result i64 str)
+  (match (unix/fd-open path (+ unix/O_WRONLY (+ unix/O_CREAT unix/O_TRUNC)) 384)
+    ((Err e) (Err (str "cannot open " path ": " (unix/errno-text e))))
+    ((Ok fd) (Ok fd))))
+
+;; The test thread: the entry called with the descriptors (native.call, as the program's `main` is called: serve.live `start-program`),
+;; the files closed, `done` set with the status. Nothing of the session (`Cell` state) crosses to it: the address, the descriptors and
+;; the atom. (The mutant `test-on-attach-thread` waits for it here, and `status` cannot be answered meanwhile.)
+(defun start-thread :private (addr: i64 fd: i64 efd: i64 done: (Atom (Option i64))) -> unit
+  (do (spawn (fn () -> i64
+               (let ((r (match (call/call-i64 addr [fd efd]) ((Ok c) c) ((Err _) 134))))
+                 (do (unix/fd-close fd) (unix/fd-close efd) (reset! done (some r)) r))))
+      ()))
+
+;; The run started: the entry's program checked (a refusal is the checker's diagnostics, shown as the REPL shows them), its new slots
+;; made, the entry cut out, the files opened, the thread started, `running` set. `Err` is the answer line of a refusal.
+(defun launch :private (sx: ls/Sess t: Tests r: p/Req conn: i64 sel: lw/Selection) -> (Result unit str)
+  (let ((n (ls/inputs-made sx)) (gen0 (lsw/generation sx)) (t0 (sys-clock-now)))
+    (do (set! (. (. sx rc) clauses) (rc/merge-clauses @(. (. sx rc) clauses) (lw/test-clauses (. (. sx rts) with))))
+    (match (ls/program-of sx (lw/entry-text n sel) [(ec/BodyRequest (lw/entry-name n) false [] nil)])
+      ((Err ds) (Err (p/response r false [(Pair "shown" (j/JArr (mapv j/json-str (ls/shown-of sx ds (ls/input-line sx) @(. (. sx rc) defs))))) (Pair "diagnostics" (p/diags-json ds (map-empty)))
+                                          (Pair "code" (j/json-str (match (first ds) ((some d) (. d code)) (nil "check"))))
+                                          (Pair "hint" (j/json-str "the entry is (fib.test.run/run-main-into SUITES words sink): SUITES must be a (Vec Suite) of the program (a `specs` of defspecs, or a --with file's spec.NAME/specs)"))])))
+      ((Ok made)
+       (match (try-let ((_ (ls/make-slots sx made)) (cut (cut-entry sx n (. made m))) (fd (open-out (. t report))) (efd (open-out (. t err))))
+                (let ((done (atom nil)))
+                  (do (start-thread (. cut snd) fd efd done)
+                      (set! (. t running) (some (Running (. r id) conn t0 gen0 sel (. cut fst) (str "live.test." n) done)))
+                      (set! (. t last-sel) (some sel))
+                      (Ok ()))))
+         ((Err m) (Err (p/error-response r "internal" m)))
+         ((Ok _) (Ok ()))))))))
+
+;; ---- the end of a run
+
+(defun read-text :private (path: str) -> str
+  (let ((t (unwrap-or (read-file path) ""))) (do (unix/fd-unlink path) t)))
+
+;; The entry's module freed, unless something resident could point into it (a closure literal: the sink is one, so it is kept).
+(defun release :private (sx: ls/Sess run: Running) -> unit
+  (if (ex/pins? (. (. run added) module))
+      (do (ls/keep-module sx (. run added)) ())
+      (match (lj/remove (ls/jit-of sx) (. (. run added) rt) [(. run name) (str (. run name) ".body")]) (_ ()))))
+
+(defun summary-total :private (report: j/JVal) -> i64
+  (match (j/json-path report ["summary" "total"]) ((some (j/JInt n)) n) (_ 0)))
+
+(defun nothing-text :private (sel: lw/Selection) -> str
+  (if (= (. sel only) "")
+      "nothing ran: the runner answered 2 (two scenarios with one id, or a word it refuses: its message is on the program's standard error); a run with nothing to run is not a pass"
+      (str "no scenario matches '" (. sel only) "'; a run with nothing to run is not a pass")))
+
+;; The answer of a finished run: the document (`report`, when the sink holds one: `--list` and a trap leave `text` alone), the status
+;; as `fibc test` exits, the generations and `stale`, `ms`, `threads_after`; status 2 is `test/NothingSelected`, 134 `test/Trapped`.
+(defun answer :private (sx: ls/Sess run: Running status: i64 text: str trap: str) -> str
+  (let ((r (p/Req (. run id) "test" j/JNull)) (gen1 (lsw/generation sx)) (ms (elapsed-ms run))
+        (report (match (j/json-parse text) ((Ok v) v) ((Err _) j/JNull))))
+    (let ((common [(Pair "status" (j/json-int status)) (Pair "report" report) (Pair "text" (j/json-str text))
+                   (Pair "generation_start" (j/json-int (. run gen0))) (Pair "generation_end" (j/json-int gen1)) (Pair "stale" (j/JBool (not (= (. run gen0) gen1))))
+                   (Pair "ms" (j/json-int ms)) (Pair "threads_after" (j/json-int (. (lr/threads sx) spawned))) (Pair "generation" (j/json-int gen1))]))
+      (cond (= status 134) (p/response r false (into [(Pair "error" (j/json-obj [(Pair "code" (j/json-str "test/Trapped")) (Pair "message" (j/json-str (str "the entry trapped outside a scenario: " trap)))]))
+                                                      (Pair "code" (j/json-str "test/Trapped")) (Pair "trapped" (j/json-str trap))] common))
+            (= status 2) (p/response r false (into [(Pair "error" (j/json-obj [(Pair "code" (j/json-str "test/NothingSelected")) (Pair "message" (j/json-str (nothing-text (. run sel))))]))
+                                                    (Pair "code" (j/json-str "test/NothingSelected"))] common))
+            :else (p/response r true common)))))
+
+;; The run in progress, when its thread is done: the answer line and the connection it goes to; `running` cleared, `last` recorded.
+(defun finish (sx: ls/Sess t: Tests) -> (Option (Pair i64 str))
+  (match @(. t running)
+    (nil nil)
+    ((some run)
+     (match @(. run done)
+       (nil nil)
+       ((some status)
+        (let ((text (read-text (. t report))) (trap (read-text (. t err))))
+          (let ((line (answer sx run status text trap)))
+            (do (release sx run)
+                (set! (. t last) (some (Finished (summary-total (match (j/json-parse text) ((Ok v) v) ((Err _) j/JNull))) (elapsed-ms run) status)))
+                (set! (. t running) nil)
+                (some (Pair (. run conn) line))))))))))
+
+;; `status.tests`: whether a run is on, its id, entry, `only` and elapsed time; else the last run's figures (3.9).
+(defun tests-json (t: Tests) -> j/JVal
+  (match @(. t running)
+    ((some run) (j/json-obj [(Pair "running" (j/JBool true)) (Pair "id" (. run id)) (Pair "entry" (j/json-str (. (. run sel) entry))) (Pair "only" (j/json-str (. (. run sel) only)))
+                             (Pair "elapsed_ms" (j/json-int (elapsed-ms run)))]))
+    (nil (j/json-obj (into [(Pair "running" (j/JBool false))]
+                           (match @(. t last)
+                             ((some l) [(Pair "last" (j/json-obj [(Pair "scenarios" (j/json-int (. l scenarios))) (Pair "ms" (j/json-int (. l ms))) (Pair "status" (j/json-int (. l status)))]))])
+                             (nil [])))))))

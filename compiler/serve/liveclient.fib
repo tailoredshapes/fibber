@@ -2,11 +2,13 @@
 ;; program started with `fibc run --live` (serve.live). The terminal form reads inputs as the REPL does (serve.line: editing on a
 ;; terminal, plain lines from a pipe; an input continues while its brackets are open) and sends each as an `eval`, printing the value,
 ;; `; failed: ..` for a caught trap, `; defined ..`, or the refusal's lines; `:type EXPR`, `:inspect NAME`, `:status`, `:pause [MS]`,
-;; `:resume`, `:retire` (serve.liveretire, package LV3), `:help`, `:quit`.
+;; `:resume`, `:retire` (serve.liveretire, package LV3), `:test [SPEC] [words of fibc test]` and `:test` alone to rerun the last selection
+;; (serve.livetest, package LT2 of docs/design/live-meshql.md 3.9: the answer's document rendered as `fibc test` prints a file, through
+;; serve.livewords), `:help`, `:quit`.
 ;; `--json` is the stdio form for an agent or an editor: one request per line in, forwarded as it is, one answer per line out. When
 ;; nothing listens at the socket (the program was not started with `--live`, or has ended) every request is answered `not-live`.
 (ns serve.liveclient
-  (:require [serve.livesock :as lsk] [serve.sock :as sk] [serve.line :as ln] [serve.replcore :as rc] [lsp.json :as j]
+  (:require [serve.livesock :as lsk] [serve.sock :as sk] [serve.line :as ln] [serve.replcore :as rc] [serve.livewords :as lw] [lsp.json :as j]
             [driver.native :as native] [fib.unix :as unix] [fib.string :as s]))
 
 (def help-text: str
@@ -15,6 +17,9 @@
 :type EXPR      the type of EXPR         :inspect NAME  the value and type of NAME      :status  the session's figures and threads
 :pause [MS]     the program parks at its pause points (up to MS ms, 5000, waiting for quiescence)    :resume  lets it run again
 :retire         at quiescence, frees the code of every old generation no thread can be in
+:test [SPEC] [--only ID] [--tags EXPR] [--name RE] [--seed N] [-j N] [--isolate task|none] [--list] [--dry-run]
+                runs the spec in the program (SPEC: a --with file, or an expression of the suites; none: the program's (specs), else the
+                first --with file) and prints the rows as fibc test does; :test alone reruns the last selection
 :help           this                     :quit (ctrl-d) end the client; the program goes on")
 
 (defstruct Client (fd: i64 conn: sk/Conn))
@@ -71,6 +76,7 @@
         (some? (field v "shown")) (do (doseq [l (strs-of v "shown")] (println l))
                                       (println (str "; refused; the session and the program are unchanged" (if (some? (field v "generation")) (str " (generation " (int-of v "generation") ")") ""))))
         (some? (field v "value")) (println (str-of v "value"))
+        (some? (field v "generation_start")) (show-test v)
         (not (empty? (strs-of v "swapped"))) (do (when (not (empty? (strs-of v "defined"))) (println (str "; defined " (join-words (strs-of v "defined")))))
                                                  (println (swapped-line v))
                                                  (when (running? v) (println (str "; note: " (threads-text v) " are running; generation " (- (int-of v "generation") 1)
@@ -80,7 +86,8 @@
         (some? (field v "generations")) (println (str "; generation " (int-of v "generation") "; generations kept " (int-of (unwrap-or (field v "generations") j/JNull) "count")
                                                     "; modules kept " (int-of (unwrap-or (field v "generations") j/JNull) "kept")
                                                     "; threads: " (threads-text v)
-                                                    "; values: " (int-of (unwrap-or (field v "values") j/JNull) "count") " resident; inputs " (int-of v "inputs")))
+                                                    "; values: " (int-of (unwrap-or (field v "values") j/JNull) "count") " resident; inputs " (int-of v "inputs")
+                                                    "; " (lw/tests-text (unwrap-or (field v "tests") j/JNull))))
         (some? (field v "paused")) (println (paused-line v))
         (some? (field v "resumed")) (println (str "; resumed; " (threads-text v)))
         (some? (field v "removed")) (println (str "; removed " (int-of v "removed") (if (= (int-of v "removed") 1) " generation" " generations")
@@ -88,6 +95,37 @@
                                                  " (generation " (int-of v "generation") ")"))
         (not (= (int-of v "exit") 0)) (println (str "; the input ended with status " (int-of v "exit")))
         :else ()))
+
+;; A finished test run: the document's rows and summary as `fibc test` prints them (the `replay:` lines as `:test` commands), the
+;; listing of `--list`, or the trap's message; then the run's line and the stale note (serve.livewords).
+(defun show-test :private (v: j/JVal) -> unit
+  (do (match (field v "report")
+        ((some (j/JObj ks vs)) (print (lw/report-text (j/JObj ks vs))))
+        (_ (print (str-of v "text"))))
+      (when (some? (field v "error")) (println (str "; " (str-of (unwrap-or (field v "error") j/JNull) "message") " [" (str-of (unwrap-or (field v "error") j/JNull) "code") "]")))
+      (println (lw/test-line v))))
+
+;; `:test` words to the request's fields: SPEC (a file, or an expression of the suites in brackets) first, then the words of `fibc test`
+;; (3.9); `--format`, `--timeout` and `--isolate fork` are refused here with the reason, as the program would refuse them.
+(defun test-request :private (words: (Vec str)) -> (Result str str)
+  (loop ((i 0) (fields []))
+    (if (>= i (count words))
+        (Ok (req "test" (if (empty? fields) [(Pair "last" (j/JBool true))] fields)))
+        (let ((w (nth words i)) (v (if (< (+ i 1) (count words)) (nth words (+ i 1)) "")))
+          (cond (and (= i 0) (not (s/starts-with? w "-")))
+                  (recur (+ i 1) (conj fields (if (s/starts-with? w "(") (Pair "suites" (j/json-str w)) (Pair "spec" (j/json-str w)))))
+                (= w "--format") (Err "the report is rendered here as fibc test prints it; --json passes the document through")
+                (= w "--timeout") (Err "a hung scenario cannot be killed in a live process: run it under fibc test --timeout in a process of its own")
+                (and (= w "--isolate") (= v "fork")) (Err "fork isolation is refused in a live process (it has threads); task (the default) or none")
+                (or (= w "--only") (or (= w "--tags") (or (= w "--name") (= w "--isolate"))))
+                  (recur (+ i 2) (conj fields (Pair (str-slice w 2 (str-len w)) (j/json-str v))))
+                (or (= w "--seed") (or (= w "-j") (= w "--jobs")))
+                  (match (parse-long v)
+                    (nil (Err (str w " wants a whole number")))
+                    ((some n) (recur (+ i 2) (conj fields (Pair (if (= w "--seed") "seed" "jobs") (j/json-int n))))))
+                (= w "--list") (recur (+ i 1) (conj fields (Pair "list" (j/JBool true))))
+                (= w "--dry-run") (recur (+ i 1) (conj fields (Pair "dry" (j/JBool true))))
+                :else (Err (str "unknown word " w "; :help lists :test's")))))))
 
 ;; `; swapped handle (generation 1): check 41 ms, emit 6 ms, jit 9 ms`
 (defun swapped-line :private (v: j/JVal) -> str
@@ -138,8 +176,22 @@
           (= (. w fst) ":pause") (send c (req "pause" (match (parse-long (. w snd)) ((some ms) [(Pair "timeout_ms" (j/json-int ms))]) (nil []))))
           (= (. w fst) ":resume") (send c (req "resume" []))
           (= (. w fst) ":retire") (send c (req "retire" []))
+          (= (. w fst) ":test") (match (test-request (words-of (. w snd)))
+                                  ((Err m) (do (println (str "; " m)) true))
+                                  ((Ok line) (send c line)))
           (s/starts-with? t ":") (do (println (str "; unknown command " (. w fst) "; :help lists them")) true)
           :else (send c (req "eval" [(Pair "text" (j/json-str t))])))))
+
+;; The words of a `:test` line, apart at spaces; a quoted word (`--only 'a b'`) is one word.
+(defun words-of :private (text: str) -> (Vec str)
+  (loop ((i 0) (cur "") (quote "") (out []))
+    (if (>= i (str-len text))
+        (if (= cur "") out (conj out cur))
+        (let ((ch (str-slice text i (+ i 1))))
+          (cond (not (= quote "")) (if (= ch quote) (recur (+ i 1) cur "" out) (recur (+ i 1) (str cur ch) quote out))
+                (or (= ch "'") (= ch "\"")) (recur (+ i 1) cur ch out)
+                (= ch " ") (if (= cur "") (recur (+ i 1) "" "" out) (recur (+ i 1) "" "" (conj out cur)))
+                :else (recur (+ i 1) (str cur ch) "" out))))))
 
 (defun continue-input :private (ed: ln/Editor text: str) -> (Result (Option str) str)
   (if (and (rc/incomplete? text) (not (s/starts-with? (s/trim text) ":")))

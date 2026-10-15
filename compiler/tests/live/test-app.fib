@@ -1,0 +1,29 @@
+(ns main (:use fib.core fib.seq fib.coll fib.print fib.test.core fib.test.run) (:require [fib.unix :as u]))
+;; compiler/tests/live/test-app.fib: the program of compiler/tests/live/test.sh (package LT2 of docs/design/live-meshql.md): a live app
+;; that is its own spec (the dev entry of 2.3 (a): `(specs)` is the session's default entry). `main` waits to be told to stop through
+;; the attach socket (`(reset! stop true)`); the scenarios bump `hits`, and `classify` is the function under test: 0 is "pos" (planted:
+;; the "zero" scenario fails until the test swaps `classify`), "a trapping step" traps, "a printing step" prints, and "two seconds"
+;; calls `slow-twice` before and after a two-second sleep, so a swap of `slow-twice` during it shows both generations' answers.
+(def hits: (Atom i64) (atom 0))
+(def stop: (Atom bool) (atom false))
+
+(defun classify (n: i64) -> str (if (< n 0) "neg" "pos"))
+
+(defun slow-twice (n: i64) -> i64 (* 2 n))
+
+(defun bump () -> i64 (swap! hits inc))
+
+(defspecs specs
+  (feature "Classify"
+    (scenario "a positive number" (given [h (bump)]) (then (expect = "pos" (classify 3))))
+    (scenario "zero" (given [h (bump)]) (then (expect = "zero" (classify 0))))
+    (scenario "a trapping step" (given [h (bump) v (nth [1 2] 5)]) (then (expect = 1 v)))
+    (scenario "a printing step" (given [h (bump) p (println "hello from a scenario")]) (then (expect = "neg" (classify -1)))))
+  (feature "Slow"
+    (scenario "two seconds" (given [a (slow-twice 3) z (u/sleep-ns 2000000000) b (slow-twice 3)]) (then (expect = a b)))))
+
+(defun main () -> i64
+  (do (println "app: ready")
+      (loop () (if @stop () (do (u/sleep-ns 20000000) (recur))))
+      (println (str "app: stopped after " @hits " hits"))
+      0))

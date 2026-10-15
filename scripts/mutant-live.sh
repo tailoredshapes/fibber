@@ -54,13 +54,22 @@
 #   patch-plain-store    the runtime's `fib.live-patch` (rt/live.lir, the store of a swap) is a     compiler/tests/live/stress.sh --tsan-only (the
 #                        plain store, not a release store: a caller may jump into code the swap    stub's acquire load against a plain store is
 #                        has not finished writing (LV3)                                             a NEW ThreadSanitizer report)
+#   stale-never          a test run's answer never says `stale`: the generations at its start and   compiler/tests/live/test.sh (the two-second
+#                        end are not compared (LT2, docs/design/live-meshql.md 3.7)                  scenario with a swap at one second is not stale)
+#   rerun-old-registry   the suites (the registry: the scenario closures) are evaluated once, into compiler/tests/live/test.sh (the step edited at
+#                        a resident def at the first run, and every later run reads that value,    the REPL is not seen by the rerun: the old
+#                        instead of the entry being evaluated by every run (LT2, 3.6)               closure runs and the row still passes)
+#   test-on-attach-thread  the attach thread waits for the test thread: a run holds the socket      compiler/tests/live/test.sh (`status` during the
+#                        (LT2, 3.2 step 1: it answers nothing yet and goes back to its socket)     two-second scenario is not answered in 100 ms)
+#   sink-shared-run      two runs at once: the `busy` refusal is gone and both write the session's compiler/tests/live/test.sh (the second `test`
+#                        one report file (LT2, 3.2: one test at a time)                             during the run is started, not refused `busy`)
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-live-MODE),
 #              MUT_QUICK=1 runs stubs.sh --quick (hello's golden and the deep recursion; no case tables: kills both mutants in under a minute after the build)
 #              and stress.sh --quick (100 swaps).
 # A mutant of lib/ alone (sink-ignored, override-ignored) builds nothing: the case's `roots:` header names the copy's lib, and FIBC runs it.
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -104,6 +113,17 @@ case $MODE in
                          patch compiler/emit/defs/jit.fib '        (if (= kept got)' '        (if true' ;;
   retire-without-pause) patch compiler/serve/live.fib '    (if (not (and (. t pausing) (. t quiescent)))' '    (if false' ;;
   patch-plain-store) patch compiler/emit/runtime.fib '  (block entry (atomic-store release (inttoptr ptr v) slot) (ret)))' '  (block entry (store (inttoptr ptr v) slot) (ret)))' ;;
+  stale-never) patch compiler/serve/livetest.fib '(Pair "stale" (j/JBool (not (= (. run gen0) gen1))))' '(Pair "stale" (j/JBool false))' ;;
+  rerun-old-registry)
+    patch compiler/serve/livetest.fib '    (do (set! (. (. sx rc) clauses) (rc/merge-clauses @(. (. sx rc) clauses) (lw/test-clauses (. (. sx rts) with))))' '    (do (set! (. (. sx rc) clauses) (rc/merge-clauses @(. (. sx rc) clauses) (lw/test-clauses (. (. sx rts) with))))
+        (when (not (. sel runner)) (match (lsw/input sx (str "(def live-test-cache " (. sel entry) ")")) (_ ())))'
+    patch compiler/serve/livewords.fib '             (str "(live-test-run/run-main-into " (. sel entry) " " words " live-out)"))' '             (str "(live-test-run/run-main-into live-test-cache " words " live-out)"))' ;;
+  test-on-attach-thread) patch compiler/serve/livetest.fib '                 (do (unix/fd-close fd) (unix/fd-close efd) (reset! done (some r)) r))))
+      ()))' '                 (do (unix/fd-close fd) (unix/fd-close efd) (reset! done (some r)) r))))
+      (loop () (if (nil? @done) (do (unix/sleep-ns 1000000) (recur)) ()))))' ;;
+  sink-shared-run) patch compiler/serve/livetest.fib '  (match @(. t running)
+    ((some run) (some (busy r run)))' '  (match (if true nil @(. t running))
+    ((some run) (some (busy r run)))' ;;
   *) echo "mutant-live: unknown mode $MODE" >&2; exit 2 ;;
 esac
 case $MODE in
@@ -127,6 +147,7 @@ case $MODE in
   value-reevaluated|trap-not-caught) what="the attach test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/attach.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored) what="the swap test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/swap.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   defcache-*) what="the defcache test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/defcache.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
+  stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run) what="the live test op's test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/test.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   deps-stubbed-by-default|project-paths-not-stubbed) what="the project test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/project.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   *) what="case 8423"  # the case's `roots:` header names ../../lib: run from a copy of cases/stdlib beside the mutated lib
      mkdir -p "$OUT/cases/stdlib"; cp -r "$R"/cases/stdlib/8423-*.fib "$R/cases/stdlib/support" "$OUT/cases/stdlib/"
