@@ -524,3 +524,55 @@ Decisions for the owner:
   generation 1; with `(unused 1)` first, the first redefinition is already `swapped`. Answering `swapped` would name a swap that did
   not happen (no generation, no patch); the answer is the truth of what the session did.
 
+
+## 7. Retirement against what running state holds (2026-10-15)
+
+**The bug.** A retirement (serve.liveretire, at quiescence) frees the code of every generation that no slot names and that no parked
+thread can be in. Which generations a parked thread can be in was decided by following, from each family's bodies, the direct calls
+and the closure constants and literals of the family's own, over the program's families alone. A thread can reach its pause point by
+other calls: through a function value read from the heap (an atom or a `def` holding a function, a stored handler), a `dyn` method,
+or a library function that calls back. Such a thread parked inside generation K of a family the analysis did not mark, the family was
+swapped, the retirement freed K, and on `resume` the thread returned into freed code. Reproduced by `compiler/tests/live/retire.sh`
+(retire-app.fib: the worker's `step` calls `(@hook)`, `hook` holds `park`, `park` calls the pause point; `step` swapped while the worker
+is parked in it, then `retire`, then `resume`): before the fix the retirement answered `removed 1` with `step` not pinned, and the
+program died with `fatal signal 11` on the resume. The def values of LT4 had the same hole: an old value whose slot a body read before
+parking is held only while that body's family is pause-bearing (serve.livedefs `slots-read-by`).
+
+**What was not broken.** A closure made by a swapped generation and held by running state (in an atom, in a `def`, run by a spawned
+thread) points at a literal of that generation, and a generation whose code part holds a literal, a closure constant or a vtable is
+never retired (serve.livesplit `pins`, `pinned (closures)`). retire.sh checks this too: the closures of a retired family's old
+generations answer after the retirement, and the thread spawned by one counts on.
+
+**The two choices, and the one taken.** (a) Refuse the swap (`live/*`) when it would strand a frame: the swap cannot know it, since
+which body a thread will be parked in is decided at the pause, not at the swap; a swap refused for every body that may reach a pause
+point through a call it does not name would refuse most handlers. (b) Keep the generation alive while something can be in it: by
+counting (an entry and exit count per generation, paid by every call of every live body: against the owner's bar for swaps and for the
+running program), or by pinning what a sound analysis says a parked thread can be in. Taken: (b) by pinning, the analysis made sound
+(serve.livereach). It runs only at a retirement; a swap only records what its new code calls.
+
+**The analysis (serve.livereach).** Over every definition the session holds (the base with the library and the runtime, every kept
+module, a swap's data part as well as its code part), the graph of calls: a direct call is an edge to its callee; an indirect call of
+lIR function type T is an edge to every definition of type T whose address some code or static takes (`@NAME` as a value). The
+lowering calls a closure's code, a vtable's method and a task's runner with the type its definition has, so these are all the targets
+an indirect call can have. Taking an address is no edge (a closure handed to `spawn` runs on another thread). Two indirect calls are
+not followed: a stub's call through its slot (a family's stubs and bodies of every generation are one node, so that call is inside the
+node) and a type walker's `trace.N` calling the visitor it is given (the runtime passes only its own visitors, never a task's runner,
+whose type `(fn void (ptr))` the visitor shares; following it would make every body that releases an object pause-bearing). A closure
+literal is a node of its own. The pause-bearing nodes are those from which `fib.os.live/pause-point` or `fib_live_ctl` is reached; every
+generation of a pause-bearing family is kept (`pinned (pause-point)`). On the tests' apps the precision is what it was: stress-app's `f`
+and swap-app's `handle` are still freed (stress.sh's checks unchanged), retire-app's `step` is pinned and `bump` (calls and arithmetic)
+is freed.
+
+**What it still keeps that a stack scan would free.** Every generation of a pause-bearing family, whether or not a thread is in it now,
+and every generation holding a literal. Both lift with stack scanning (live-repl.md 3.3) and a heap walk from the def slots; neither is
+built.
+
+**Cost.** A swap records the calls of its new items (a walk of the cut it already made); the base's are recorded once at start-up. On
+meshql-fib's `scripts/live-demo.sh` (305 modules, lilnas, three runs each, alternating, the same tree before and after): the swap of
+`handle` end to end 360 to 471 ms before and 396 to 432 after (the second swap 322 to 413 and 336 to 364), the `load` of
+`meshql.restlette` 0.5 to 0.7 s both, start-up to the first answer 10.4 to 10.6 s before and 10.1 to 11.6 after: within the runs'
+noise, and a swap stays about 25 times faster than the 10 s start-up a recompile costs. The retirement's own cost on meshql is not
+measured: its `dev/live.fib` does not reach quiescence (`pause` times out after 10 s, before and after), so it never retires.
+
+**Test and mutant.** `compiler/tests/live/retire.sh` (retire.py over retire-app.fib; mk/tools.mk `sh-live-retire`, full gate); the mutant
+`retire-dynamic-unfollowed` of `scripts/mutant-live.sh` (the analysis ignores indirect calls, as before) must make it fail.

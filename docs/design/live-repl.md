@@ -636,7 +636,9 @@ Decisions for the owner:
   over the references the session notes of each body and literal (direct calls of stubs, literals of its own, closure constants and
   vtables it names: serve.livesplit `code-refs`, serve.liveretire `pause-bearing`), and reports them `pinned (pause-point)`. Not followed:
   a closure or `dyn` value read from the heap and called on the way to a pause point, when the function that made it was swapped while
-  the thread was parked below it; the lift is a walk of the heap from the def slots at quiescence, or stack scanning. (c) **a
+  the thread was parked below it; the lift is a walk of the heap from the def slots at quiescence, or stack scanning. (Since
+  2026-10-15 followed, with the library's and the runtime's calls: indirect calls by their lIR type, serve.livereach; the retirement
+  had freed a generation a parked thread was in: docs/design/live-incremental.md 7.) (c) **a
   generation's statics outlive its code**: a swap's cut is split (serve.livesplit) into a data part, resident for good (new strings,
   keywords, a type's walkers and rows, and the stub, slot and generation-0 body of a function the base never reached), and a code part
   under the tracker (the bodies and literals that carry the generation, with the statics numbered per program: closure constants,

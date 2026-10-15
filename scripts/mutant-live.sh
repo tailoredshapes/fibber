@@ -120,13 +120,17 @@
 #                        second of one base name too: the session is refused whole (exit 3)        never prints its socket)
 #   watch-no-debounce    the watch acts on a file whose stamp changed since the last scan, stable or   compiler/tests/live/watch.sh (the slow
 #                        not: a file caught half-written is loaded and refused (LT5)                  write brings a refused load event)
+#   retire-dynamic-unfollowed  the pause-point analysis ignores indirect calls (a closure's code, a        compiler/tests/live/retire.sh (the worker
+#                        `dyn` method), as it did before serve.livereach: a body that reaches its   parked in `step` through `hook` returns
+#                        pause point through a function value from the heap is retired under the    into freed code on the resume: the program
+#                        thread parked in it (docs/design/live-incremental.md 7)                    dies, `step` is not pinned)
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-live-MODE),
 #              MUT_QUICK=1 runs stubs.sh --quick (hello's golden and the deep recursion; no case tables: kills both mutants in under a minute after the build)
 #              and stress.sh --quick (100 swaps), defs.sh --quick (100 redefinitions).
 # A mutant of lib/ alone (sink-ignored, override-ignored) builds nothing: the case's `roots:` header names the copy's lib, and FIBC runs it.
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|quote-shared|partial-load|load-reads-disk|prefix-dropped|removed-ignored|def-slot-plain-store|old-def-freed|init-run-twice|warm-skipped|inspect-runs-input|child-spawned-anyway|diff-by-text|hash-with-positions|watch-no-load|watch-reruns-on-refusal|rules-at-file-start|type-reads-disk|unheld-held|watch-no-debounce}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|quote-shared|partial-load|load-reads-disk|prefix-dropped|removed-ignored|def-slot-plain-store|old-def-freed|init-run-twice|warm-skipped|inspect-runs-input|child-spawned-anyway|diff-by-text|hash-with-positions|watch-no-load|watch-reruns-on-refusal|rules-at-file-start|type-reads-disk|unheld-held|watch-no-debounce|retire-dynamic-unfollowed}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -209,6 +213,7 @@ case $MODE in
   type-reads-disk) patch compiler/serve/livesess.fib '(rc/type-of-expr-texts (. sx rc) (. sx eng) (. sx rts) expr @(. sx texts))' '(rc/type-of-expr (. sx rc) (. sx eng) (. sx rts) expr)' ;;
   unheld-held) patch compiler/driver/testlive.fib '(match (unheld-of e rts (. acc fst) f)' '(match (if true nil (unheld-of e rts (. acc fst) f))' ;;
   watch-no-debounce) patch compiler/serve/livewatch.fib '  (match (get prev f) ((some p) (same? p st)) (nil false)))' '  true)' ;;
+  retire-dynamic-unfollowed) patch compiler/serve/livereach.fib '((CalIndirect _ ty) (set! (. sn ind) (conj @(. sn ind) (str "ind:" (lty/fn-type-str ty))))))' '((CalIndirect _ ty) ()))' ;;
   inspect-runs-input) patch compiler/serve/live.fib '(if (p/field-bool r "value") (inspect-value l r name) (inspect-lookup l r name))' '(inspect-value l r name)' ;;
   *) echo "mutant-live: unknown mode $MODE" >&2; exit 2 ;;
 esac
@@ -241,6 +246,7 @@ case $MODE in
   def-slot-plain-store) what="the TSAN defs test"; TSAN_OUT="$OUT/tsan" FIB_LIB="$R/lib" "$R/compiler/tests/live/defs.sh" "$F" --tsan-only > "$OUT/test.log" 2>&1; rc=$? ;;
   old-def-freed|init-run-twice) what="the defs test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/defs.sh" "$F" --socket-only "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
   partial-load|load-reads-disk|prefix-dropped|removed-ignored|rules-at-file-start|type-reads-disk) what="the load test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/load.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
+  retire-dynamic-unfollowed) what="the retire test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/retire.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   deps-stubbed-by-default|project-paths-not-stubbed) what="the project test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/project.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   *) what="case 8423"  # the case's `roots:` header names ../../lib: run from a copy of cases/stdlib beside the mutated lib
      mkdir -p "$OUT/cases/stdlib"; cp -r "$R"/cases/stdlib/8423-*.fib "$R/cases/stdlib/support" "$OUT/cases/stdlib/"

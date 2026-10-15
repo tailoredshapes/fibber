@@ -8,14 +8,11 @@
 ;; the rest. The DATA part, everything else, is added to the session for good, exported. A code part that holds a literal or a
 ;; closure constant is never retired (`pins`): a heap closure made by the body may still name it, and nothing walks the heap to tell
 ;; (the lift is in the design's status). A code part of bodies alone is retired at quiescence (serve.liveretire).
-;; The refs of a module (`code-refs`) are what the pause-point analysis reads: for each body or literal of a stubbed family, the names of
-;; the code and the sinks it reaches directly, with its own statics (per-program names, `clo.N`, `vt.N`, `q.N`) resolved to what they name.
+;; What a module's code calls, for the pause-point analysis, is serve.livereach's.
 (ns serve.livesplit
   (:use lir.ast)
   (:require [live.extract :as ex] [serve.livetable :as lt] [emit.statics :as st] [fib.string :as s]))
 
-;; A body, a method or a closure literal of the program's own.
-(defun code-name? (name: str) -> bool (or (s/starts-with? name "f.") (s/starts-with? name "m.") (s/starts-with? name "l.")))
 (defun literal? (name: str) -> bool (s/starts-with? name "l."))
 ;; A static numbered per program (emit.statics `program-static?`): a closure constant, a vtable or a quoted form. It goes with the code,
 ;; never with the exported data: exported, a later program's cut would declare its own `q.N` (another form) from the base and read it.
@@ -71,32 +68,3 @@
           (Split (LModule (into shared (mapv exported data)))
                  (LModule (into (into shared (vec (keep declaration data))) code))
                  pins)))))
-
-;; ---- refs
-
-;; The refs of each code item of `m` (a body, a method, a literal; a module of the base holds the library's too, which the caller
-;; drops by family), the module's own code statics resolved to the names they hold, repetitions and statics removed.
-(defun code-refs (m: LModule) -> (Map str (Vec str))
-  (let ((statics (reduce (fn (acc: (Map str (Vec str)) it: LItem)
-                           (let ((nm (item-name it))) (if (code-static? nm) (assoc acc nm (ex/item-refs it)) acc)))
-                         {} (. m items))))
-    (reduce (fn (acc: (Map str (Vec str)) it: LItem)
-              (let ((nm (item-name it)))
-                (if (and (code-name? nm) (match it ((ItDefine _) true) (_ false)))
-                    (assoc acc nm (resolved statics (ex/item-refs it)))
-                    acc)))
-            {} (. m items))))
-
-;; `refs` with each code static replaced by what it names (a closure constant names a stub or a literal, a vtable names methods),
-;; without repetitions.
-(defun resolved :private (statics: (Map str (Vec str)) refs: (Vec str)) -> (Vec str)
-  (let ((seen (cell (set-empty))) (out (cell [])))
-    (do (walk statics refs seen out) @out)))
-
-(defun walk :private (statics: (Map str (Vec str)) refs: (Vec str) seen: (Cell (Set str)) out: (Cell (Vec str))) -> unit
-  (doseq [r refs]
-    (when (not (contains? @seen r))
-      (do (set! seen (conj @seen r))
-          (match (get statics r)
-            ((some more) (walk statics more seen out))
-            (nil (when (not (code-static? r)) (set! out (conj @out r)))))))))
