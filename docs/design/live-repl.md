@@ -507,3 +507,20 @@ Decisions for the owner:
 - **Measured** (section 1): a REPL input today is 8 to 15 ms of front end and 35 to 53 ms of fork, JIT and run; values do not persist (the
   atom reads 1 twice). **Estimated, not measured**: the cost of a one-function swap (2 to 3 ms of code generation plus the check of the
   edited module, 30 to 70 ms for a screenful), the memory of kept generations, the stub's call overhead (bounded by LV0's bench row).
+
+## 9. Decisions of 2026-10-15 (owner)
+
+1. **A `def` must be redefinable in a running app** ("we absolutely need the ability to redefine a def"). This replaces the "immortal,
+   leaked by design" rule of 3.4 and 3.5 for redefinitions. Rules:
+   - Same type: the slot's pointer is swapped with a release store (readers load with acquire); the old value goes on a retire list and
+     is **dropped, destructor included, after a grace period** (the epoch mechanism that frees old code), not leaked. A borrow of a def
+     cannot outlive the function that took it (ownership checker), so quiescence of all threads past the swap makes the drop safe. A
+     value that cannot be dropped yet stays on the list (never freed early, the swap never blocks).
+   - Different type: treated as a signature change: dependents are re-checked and the swap is accepted only if they still check,
+     otherwise refused with the checker's message.
+   - A plain `def` re-evaluates its expression on redefinition (Clojure's `def`); a `defonce`-style form keeps the existing value, for
+     atoms, connections and servers that a redefinition must not reset.
+   - A new `def` in a loaded file gets a slot in the new generation (LT4 of live-meshql.md), its initialiser run once.
+   This is LT4 of docs/design/live-meshql.md with the old value retired and dropped instead of leaked.
+2. **The project's live entry mimics Clojure's `user.clj`**: a `dev/live.fib` in the project that starts the app and exposes the helpers
+   (`rebuild!`, the test entry); `fibc run --live APP --with SPEC` is the general form later (live-meshql.md §8, decision 1).
