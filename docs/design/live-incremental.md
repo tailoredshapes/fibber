@@ -481,8 +481,13 @@ Decisions for the owner:
   warmed makes them on its first definition input (one more front end on the session's text); (e) **a redefined macro keeps its place**
   in the session's text (`merge-session`; serve.replcore `merge-defs` puts a redefinition last, which would expand its users before it:
   `unbound name`); a checker's diagnostic in such an input is moved to its line in the input (serve.liveswap `input-diag`; it was off
-  by the macros kept in place until the live bugs' fix); (f) a changed `type:`, `extern` or
-  `def` is still refused or redefined by its text (the rules of 3.5); (g) found on the way: a session's program does not find a module
+  by the macros kept in place until the live bugs' fix); (f) a changed `type:` or `extern` is
+  still refused by its text (the rules of 3.5 run before the program is checked, so the expanded form is not there yet; moving them
+  after the check is not cheap), and a `def` of a loaded file whose text changed is redefined only when its expanded form did too
+  (key `d.PREFIX.NAME`, `Changes.defs`; a comment or layout edit keeps the value; a `def` with no recorded hash is redefined; since
+  the live bugs' fix: it was by text). A `def` of an input at the REPL is still redefined by its text (Clojure's `def` re-evaluates),
+  and so is one of the main module's file (a load of it is an `eval` of the definitions whose text changed); a `defonce` and a `def`
+  of one value expand alike, so changing one to the other in a loaded file redefines nothing; (g) found on the way: a session's program does not find a module
   beside the main file that the base found there (`load/Missing`): swap.py and stress.py start swap-app.fib with `-I` its directory. (h)
   A redefinition with the text the definition has is accepted and swaps nothing (LV2 swapped it again): stress.py's swaps after the
   retirement now start from the other body. (i) A macro that quotes positions into its expansion (`expect` of fib.test) makes its user change when

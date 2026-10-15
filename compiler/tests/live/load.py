@@ -8,7 +8,7 @@ What is tested: an edit of `route` loaded: `swapped: ["routes/route"]`, the sess
 answer the edit; a bad edit is refused with a diagnostic at src/routes.fib:L:C and nothing changes; a file with one refused definition
 (an arity change of `route`, which app.fib calls; a def whose type changes, live/Def, LT4) applies nothing: the good edit of `greet` in the same file is
 not swapped and the answer lists the refusal; a removed function is live/Removed and still callable; `reload` after a second edit swaps
-again and `reload` with no change swaps nothing; an edit of a comment only swaps nothing (LM2); a half-saved file on disk is not seen by an expression input nor `:type` (the override), `status`
+again and `reload` with no change swaps nothing; an edit of a comment only swaps nothing (LM2), of a def's comment redefines nothing; a half-saved file on disk is not seen by an expression input nor `:type` (the override), `status`
 says the file is stale; a new function in the loaded file is defined and then swapped; a file whose module the program lacks is
 live/NotLoaded with the `require` hint; a load of the main module's file defines its new function; the terminal client's `:load`,
 `:status` and `:reload` lines; the app ends through the socket.
@@ -195,6 +195,17 @@ write_routes(edited('(defun route (path: str) -> str (str prefix " " path))', '(
 l = c.load('src/routes.fib')
 check('a comment-only edit swaps nothing', l.get('ok') is True and not l.get('swapped') and l.get('changed') == [] and l.get('generation') == 4
       and c.value('(r/route "x")') == '"route? x"', l)
+cur = open(routes_file).read()
+write_routes(cur + '\n(def counter: (Atom i64) (atom 0))\n')
+l = c.load('src/routes.fib')
+check('a new def of a run-time value is made', l.get('ok') is True and c.value('(swap! r/counter inc)') == '1', l)
+write_routes(cur + '\n(def counter: (Atom i64)\n  ;; a comment only: the expanded form is the same\n  (atom 0))\n')
+l = c.load('src/routes.fib')
+check('a comment-only edit of a def redefines nothing (by expanded form, as functions): its value is kept', l.get('ok') is True and not l.get('swapped')
+      and l.get('generation') == 4 and c.value('@r/counter') == '1', (l, c.value('@r/counter')))
+write_routes(cur + '\n(def counter: (Atom i64) (atom 10))\n')
+l = c.load('src/routes.fib')
+check('a def whose expanded form changed is redefined', l.get('ok') is True and c.value('@r/counter') == '10', (l, c.value('@r/counter')))
 
 # ---- the override: a half-saved file on disk is not seen by an expression input; reload brings the disk in
 write_routes(edited('(defun route (path: str) -> str (str prefix "? " path))', '(defun route (path: str) -> str (str prefix "?? " path', edited('(defun route (path: str) -> str (str prefix " " path))', '(defun route (path: str) -> str (str prefix "? " path))')))
