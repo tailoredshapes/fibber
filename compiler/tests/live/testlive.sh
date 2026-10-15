@@ -7,7 +7,9 @@
 # scenario (the bound is generous, for a loaded machine: under 5 s and under half the spawned run; the design's numbers are 20 s and
 # under 1 s for meshql-fib, 1.3), and the session's `status` must show that the run was its own (`tests.last`: 1 scenario). Refusals:
 # --timeout and --isolate fork (exit 2), a spec the session did not load (ERROR, exit 2), no session (exit 2), --live with an option.
-# The mutant `child-spawned-anyway` of scripts/mutant-live.sh (--connect runs `fibc test` as before) must make it fail.
+# A spec that does not compile and a second spec of one base name are given to --live: the session serves the others, and a run of either
+# is that file's ERROR (`does not compile` with its diagnostic, `cannot be run` with the reason), as `fibc test` reports a spec that fails.
+# The mutants `child-spawned-anyway` (--connect runs `fibc test` as before) and `unheld-held` of scripts/mutant-live.sh must make it fail.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
@@ -36,6 +38,8 @@ spec skips/s-spec.fib '"Skips"' '' '    (scenario "needs a thing that is not her
     (scenario "holds" (skip-unless (= 1 1) "never") (given [a 1]) (then (expect = 1 a)))'
 spec uses-spec.fib '"Roots"' ' (:require [helper.greet :as g])' '    (scenario "a module from the second -I" (then (expect = "hello" (g/greeting))))'
 spec other-spec.fib '"Other"' '' '    (scenario "never loaded" (then (expect = 1 1)))'
+spec broken-spec.fib '"Broken"' '' '    (scenario "does not compile" (given [a 1]) (then (expect = 1 (+ a "x"))))'
+mkdir -p "$t/dup"; spec dup/good-spec.fib '"Dup"' '' '    (scenario "same base name" (then (expect = 1 1)))'
 printf '(ns helper.greet)\n(defun greeting () -> str "hello")\n' > "$t/extra/helper/greet.fib"
 cd "$t" || exit 2
 
@@ -43,7 +47,7 @@ $s2 test --live --only x specs > /dev/null 2> "$t/e0"; ck "--live with an option
 $s2 test --connect 999999999 specs/good-spec.fib > /dev/null 2> "$t/e0"; ck "--connect with no session: exit 2" $? 2
 
 t0=$(ms)
-$s2 test -I "$t/extra" --live specs trap-spec.fib skips uses-spec.fib > "$t/live.out" 2> "$t/live.err" &
+$s2 test -I "$t/extra" --live specs trap-spec.fib skips uses-spec.fib broken-spec.fib dup > "$t/live.out" 2> "$t/live.err" &
 pid=$!
 for _ in $(seq 1200); do grep -q 'live at' "$t/live.err" && break; kill -0 "$pid" 2> /dev/null || break; sleep 0.25; done
 ck "--live prints the socket" "$(grep -c "fibc: live at .*/$pid.sock" "$t/live.err")" 1
@@ -81,6 +85,18 @@ same "skip: json" 0 skips --format json
 same "skip: tap" 0 skips --format tap
 same "--seed 7" 1 specs --seed 7
 $s2 test -I "$t/extra" --connect "$pid" uses-spec.fib > "$t/c.out" 2>&1; ck "a module under a second -I of --live: exit 0" $? 0
+
+# a spec that does not compile and one of a base name another has: the session serves the others; each is its file's ERROR
+ck "the session names the spec that does not compile" "$(grep -c 'broken-spec.fib is not held' "$t/live.err")" 1
+$s2 test broken-spec.fib > "$t/n.out" 2> /dev/null; rn=$?
+$s2 test --connect "$pid" broken-spec.fib > "$t/c.out" 2> /dev/null; rc=$?
+ck "a spec that does not compile: exit 2 (spawned $rn, live $rc)" "$rn $rc" "2 2"
+ck "a spec that does not compile: the same ERROR line" "$(grep 'ERROR' "$t/c.out")" "$(grep 'ERROR' "$t/n.out")"
+ck "a spec that does not compile: the same diagnostic" "$(grep -c 'broken-spec.fib:4:' "$t/c.out") $(grep 'broken-spec.fib:4:' "$t/c.out")" "1 $(grep 'broken-spec.fib:4:' "$t/n.out")"
+$s2 test --connect "$pid" specs/good-spec.fib broken-spec.fib > "$t/c.out" 2> /dev/null; rc=$?
+ck "with a good spec: exit 2, the good one ran" "$rc $(grep -c 'ERROR: does not compile' "$t/c.out") $(grep '^total:' "$t/c.out")" "2 1 total: 2 scenarios: 2 pass, 0 fail, 0 trap, 0 timeout in 1 spec files (seed 1)"
+$s2 test --connect "$pid" dup/good-spec.fib > "$t/c.out" 2> /dev/null; rc=$?
+ck "a second spec of one base name: exit 2, the reason" "$rc $(grep -c "ERROR: cannot be run" "$t/c.out") $(grep -c 'its module spec.good-spec is specs/good-spec.fib.s too' "$t/c.out")" "2 1 1"
 
 # refusals
 $s2 test --connect "$pid" trap-spec.fib --timeout 1 > /dev/null 2>&1; ck "--timeout with --connect: exit 2" $? 2

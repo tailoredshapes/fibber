@@ -630,10 +630,15 @@ every second in the background, all 200 or 404/410, none refused). What it does 
   spawned (the spec is tiny: the spawned run is the front end of fib.test). Not measured: meshql-fib's 20 s scenario (1.3), because its
   specs need OpenSSL, whose symbols the JIT does not find on lilnas (`undefined symbol @OpenSSL_version_num`, spawned and live alike).
   Not built: (a) a gherkin spec (the request names `spec`, so the entry is `(spec.NAME/specs)`; a `runner` is not offered by `fibc test`);
-  (b) a spec that does not compile refuses the whole session (`--live` exits 3), where `fibc test` reports it as one file's ERROR; a spec
+  (b) a spec that does not compile is not loaded (each spec file is checked alone first, with one engine, before the session starts;
+  this costs the session's start about 2.5 s for testlive.sh's six files on lilnas), the session serves the others, and a run of it
+  answers status 3 with the diagnostics as `fibc run` prints them (`test/NotCompiled`), so `--connect` reports it as one file's ERROR
+  as `fibc test` does (it refused the whole session, exit 3, until the live bugs' fix); a spec
   whose `main` does not run its `specs` (test-cmd.sh's dying spec) is not reproduced (the session never calls `main`); (c) `--timeout`
   and `--isolate fork` are refused (exit 2), as the `test` op refuses them; (d) two spec files of one base name are one module
-  `spec.NAME` and are refused; (e) the runs are sequential (one test at a time in a session), `-j N` is each file's scenarios N at a time.
+  `spec.NAME`: the first is loaded and a run of the second answers status 4 with the reason (`test/NotHeld`: `its module spec.NAME is
+  FILE's too; a session holds one spec module of a name`), an ERROR of that file; naming the modules by path would change the name a
+  `:test x-spec.fib` or `--with` user gives, so it was not done. `--connect` sends each spec as an absolute path; (e) the runs are sequential (one test at a time in a session), `-j N` is each file's scenarios N at a time.
 - **Status 2026-10-15, LT5** (serve.livewatch: the stamps, the scan, the poll, the events; serve.live `op-watch`, `watch-step`,
   `status.watch`; serve.liveclient `:watch on [DIR..]|off` and the events between inputs; the test compiler/tests/live/watch.sh over
   watch-app.fib and watch-handler.fib; the mutants `watch-no-load` and `watch-reruns-on-refusal` of scripts/mutant-live.sh). The op is
