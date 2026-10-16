@@ -45,10 +45,10 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LIVE_DEPS` | [compiler/fibc.fib:74](../../compiler/fibc.fib#L74) |
 | `FIB_LIVE_EMIT` | [compiler/emit/program.fib:85](../../compiler/emit/program.fib#L85) |
 | `FIB_LIVE_LIBS` | [compiler/fibc.fib:123](../../compiler/fibc.fib#L123) |
-| `FIB_LIVE_OWN_UID` | [compiler/serve/livesock.fib:80](../../compiler/serve/livesock.fib#L80) |
+| `FIB_LIVE_OWN_UID` | [compiler/serve/livesock.fib:81](../../compiler/serve/livesock.fib#L81) |
 | `FIB_LIVE_QUEUE` | [compiler/emit/program.fib:238](../../compiler/emit/program.fib#L238) |
 | `FIB_LIVE_ROOTS` | [compiler/driver/front.fib:68](../../compiler/driver/front.fib#L68) |
-| `FIB_LIVE_SOCKET` | [compiler/serve/live.fib:351](../../compiler/serve/live.fib#L351) |
+| `FIB_LIVE_SOCKET` | [compiler/serve/live.fib:353](../../compiler/serve/live.fib#L353) |
 | `FIB_LIVE_WITH` | [compiler/fibc.fib:76](../../compiler/fibc.fib#L76) |
 | `FIB_LOG` | [lib/fib/log/core.fib:126](../../lib/fib/log/core.fib#L126) |
 | `FIB_LOG_ASYNC` | [lib/fib/log/config.fib:32](../../lib/fib/log/config.fib#L32) |
