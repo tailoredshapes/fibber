@@ -2,12 +2,12 @@
 ;; (159 lines of Rust; its header there is the description of the scheme). A `def` whose initialiser is a constant expression is
 ;; evaluated while compiling and emitted as static data (emit.defs.mod); any other is evaluated before `main`, once, by an init
 ;; function: `inits-plan` chooses those `def`s, gives each a slot (`def.slot.N`, a global of the module; `live.d.NAME` with its setter for
-;; a `def` of the program's own in live mode, emit.program `live-def-slot`) and requests its body;
+;; a `def` of the program's own in live mode, emit.livedef `live-def-slot`) and requests its body;
 ;; `inits-slot-text` is the globals and `inits-render` the init functions and `fib.defs-init`, which calls them in order, a
 ;; maximal run of `def`s of one module being one init function, `fib.init.mN.K`.
 ;; `all-def-ids` is the Rust `defs::all_def_ids` (defs/mod.rs:50): emit.defs.mod's `def-ids` (the constants) is E10's.
 (ns emit.inits
-  (:require [fib.string :as s] [emit.node :as n] [lir.ast :as la] [lir.types :as lt] [emit.function :as f] [lir.print :as print])
+  (:require [fib.string :as s] [emit.node :as n] [lir.ast :as la] [lir.types :as lt] [emit.function :as f] [lir.print :as print] [emit.livedef :as eld])
   (:use types.ty types.decls types.init types.program types.infer.mod own.program emit.value emit.program emit.names))
 
 ;; Every `def` of the program, in the order the checker typed them, which is the order they are evaluated in (syntax §3.19).
@@ -31,7 +31,7 @@
                ((some (LirDyn)) (Err (str-join ["def " (. dd name) ": a def made at run time holds a dyn value"])))
                (_ (let ((body (body-name (program-g p) (BodyDef d) []))
                         (object (match lt ((some (LirPtr)) true) (_ false)))
-                        (slot (unwrap-or (live-def-slot p d lt) (str "def.slot." d))))
+                        (slot (unwrap-or (eld/live-def-slot p d lt) (str "def.slot." d))))
                     (do (set! (. p def-slots) (assoc @(. p def-slots) d (DefValue (some (n/global slot)) lt)))
                         (set! (. p inits) (conj @(. p inits) (Init d (. dd module) body object slot)))
                         (Ok ())))))))))))
@@ -63,11 +63,15 @@
                           ((some dv)
                            (match (. dv ty)
                              (nil (into [head (n/call (. i body) [])] tail))
-                             ((some _) [head (f/bound [(f/binding value (n/call (. i body) []))]
+                             ((some l) [head (f/bound [(f/binding value (n/call (. i body) []))]
                                              (into (if (. i object) [(n/call "fib.immortalise" [(n/local value)])] [])
-                                                   (into [(n/store (n/local value) (unwrap (. dv expr)) nil)] tail)))])))
+                                                   (into [(slot-store (. i slot) l (n/local value) (unwrap (. dv expr)))] tail)))])))
                           (nil (into [head] tail)))))
               (recur (- k 1) next)))))))
+
+;; The store of an initialiser's value into its slot: a boxed live slot (emit.livedef) through its setter, which makes the box.
+(defun slot-store :private (slot: str l: LirTy v: la/LExpr at: la/LExpr) -> la/LExpr
+  (if (and (s/starts-with? slot "live.") (not (eld/live-word? l))) (n/call (str slot ".set") [v]) (n/store v at nil)))
 
 (defun init-function :private (p: Program name: str run: (Vec Init)) -> la/LFunction
   (f/make name nil [] lt/cc-c [(f/block "entry" (init-body p run))]))
@@ -85,14 +89,16 @@
 (defun inits-render (p: Program) -> str (print/print-module (la/LModule (inits-items p))))
 
 
-;; A live slot (`live.d.NAME`, LT4) comes with its setter.
+;; A live slot (`live.d.NAME`, LT4) comes with its setter (and, boxed, its drop; it starts null, the init's setter makes the box).
 (defun inits-slot-items (p: Program) -> (Vec la/LItem)
   (vec (mapcat (fn (i: Init)
                  (match (get @(. p def-slots) (. i def-id))
                    ((some dv)
                     (match (. dv ty)
-                      ((some ty) (into [(la/ItGlobal (la/LGlobalDef (. i slot) (lir-type ty) (slot-zero ty) false (la/LModifiers la/lk-internal false) 0 false))]
-                                       (if (s/starts-with? (. i slot) "live.") [(live-def-setter (. i slot) (lir-type ty))] [])))
+                      ((some ty) (if (s/starts-with? (. i slot) "live.")
+                                     (into [(la/ItGlobal (la/LGlobalDef (. i slot) (eld/live-slot-type ty) (if (eld/live-word? ty) (slot-zero ty) (n/null)) false (la/LModifiers la/lk-internal false) 0 false))]
+                                           (eld/live-def-items (. i slot) ty nil))
+                                     [(la/ItGlobal (la/LGlobalDef (. i slot) (lir-type ty) (slot-zero ty) false (la/LModifiers la/lk-internal false) 0 false))]))
                       (nil [])))
                    (nil []))) @(. p inits))))
 

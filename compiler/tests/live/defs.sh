@@ -6,10 +6,10 @@
 #   socket  defs.py over a real socket against defs-app.fib with defs-cfg.fib (its docstring lists the checks; 1000 redefinitions under
 #           8 reading threads, about two minutes; --quick is 100)
 #   tsan    scripts/tsan.sh --check over defs-tsan.fib emitted in live mode with defs-swapper.lir appended (TSAN_APPEND): the readers'
-#           acquire load of `live.d.limit` against the setter's release store; clean is no report beyond scripts/tsan-baseline.txt in
-#           TSAN_RUNS runs (2 here)
-# Exit 0 when every check holds. The mutants of scripts/mutant-live.sh: def-slot-plain-store (tsan), old-def-freed and init-run-twice
-# (socket) must make it fail.
+#           acquire load of `live.d.limit` against the setter's release store, and of the boxed `live.d.pair` (an Option: a new box per
+#           store) against its setter's; clean is no report beyond scripts/tsan-baseline.txt in TSAN_RUNS runs (2 here)
+# Exit 0 when every check holds. The mutants of scripts/mutant-live.sh: def-slot-plain-store and boxed-in-place (tsan), old-def-freed,
+# init-run-twice, retype-no-readers and unswappable-reader-accepted (socket) must make it fail.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)

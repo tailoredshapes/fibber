@@ -4,8 +4,12 @@
 ;; functions in a loop, a pause point every 64 reads, and count a read that is neither the old value nor the new one (`limit` 3 or 5,
 ;; the sum 768 or 1280) in `bad`; defs.py redefines both a thousand times through the socket meanwhile (`table` with an initialiser that
 ;; reads `zero`, so that each value is made at run time and the old one is dropped at a retirement). A freed old vector read by a
-;; worker (scripts/mutant-live.sh old-def-freed) is a wrong sum or a crash. `cfg` (defs-cfg.fib, copied to src/cfg.fib) is the module
-;; defs.py edits and loads; `stop` ends the program.
+;; worker (scripts/mutant-live.sh old-def-freed) is a wrong sum or a crash. The workers also read `pair`, an `Option` held in a box (not
+;; one word: emit.livedef), which defs.py redefines between `(some 5)` and `nil` as often: a read of anything else is a torn value
+;; (scripts/mutant-live.sh boxed-in-place). A ninth thread, the labeler, keeps `(show-label)` and `(plus-one)` in `shown`: defs.py
+;; changes `label`'s type (its reader `show-label` is swapped in the same input: scripts/mutant-live.sh retype-no-readers) and tries to
+;; change `count-base`'s (its reader `plus-one` would not type-check) and `ready-text`'s (read by `main`, which cannot be swapped).
+;; `cfg` (defs-cfg.fib, copied to src/cfg.fib) is the module defs.py edits and loads; `stop` ends the program.
 (def stop: (Atom bool) (atom false))
 (def bad: (Atom i64) (atom 0))
 (def counter: (Atom i64) (atom 0))
@@ -14,15 +18,32 @@
 (def table: (Vec i64) (vec (repeat 256 3)))
 (def label: i64 1)
 (def maybe: (Option i64) (some 1))
+(def flag: bool true)
+(def pair: (Option i64) (some 5))
+(def count-base: i64 2)
+(def ready-text: str "app: ready ")
+(def shown: (Atom str) (atom ""))
 
 (defun read-limit () -> i64 limit)
 (defun table-sum () -> i64 (reduce + 0 table))
 (defun show-label () -> str (str label))
 (defun maybe-value () -> i64 (unwrap-or maybe 0))
+(defun flag-text () -> str (if flag "yes" "no"))
+(defun pair-ok? () -> bool (match pair ((some x) (= x 5)) (nil true)))
+(defun plus-one () -> i64 (+ count-base 1))
 
 (defun good-read? () -> bool
   (let ((l (read-limit)) (t (table-sum)))
-    (and (or (= l 3) (= l 5)) (or (= t 768) (= t 1280)))))
+    (and (or (= l 3) (= l 5)) (or (= t 768) (= t 1280)) (pair-ok?))))
+
+(defun labeler () -> i64
+  (loop ((i 0))
+    (if @stop
+        i
+        (do (reset! shown (str (show-label) " " (plus-one)))
+            (u/sleep-ns 1000000)
+            (live/pause-point)
+            (recur (+ i 1))))))
 
 (defun worker () -> i64
   (loop ((i 0))
@@ -33,8 +54,8 @@
             (recur (+ i 1))))))
 
 (defun main () -> i64
-  (let ((ws (mapv (fn (i: i64) -> (Task i64) (spawn (fn () -> i64 (worker)))) (vec (range 8)))))
-    (do (println (str "app: ready " (c/base-value)))
+  (let ((ws (conj (mapv (fn (i: i64) -> (Task i64) (spawn (fn () -> i64 (worker)))) (vec (range 8))) (spawn (fn () -> i64 (labeler))))))
+    (do (println (str ready-text (c/base-value)))
         (loop () (if @stop () (do (u/sleep-ns 20000000) (live/pause-point) (recur))))
         (let ((reads (reduce + 0 (mapv (fn (t: (Task i64)) -> i64 (join t)) ws))))
           (do (println (str "app: stopped, bad " @bad (if (> reads 0) "" ", no reads"))) 0)))))

@@ -1,26 +1,57 @@
 ;; compiler/serve/livedefs.fib: the `def`s of a live session (docs/design/live-repl.md 3.5 and 9, package LT4 of docs/design/live-meshql.md).
-;; A `def` of the program's own modules is read by every body through its slot `live.d.NAME` with an acquire load (emit.program
-;; `live-def-slot`; live mode only: a plain emit reads a constant inline and a run-time def from `def.slot.N`, and a second `def` of a
-;; name is the error it was). Here:
+;; A `def` of the program's own modules is read by every body through its slot `live.d.NAME` with an acquire load (emit.livedef; live
+;; mode only: a plain emit reads a constant inline and a run-time def from `def.slot.N`, and a second `def` of a name is the error it
+;; was). A value of one word is the slot's content; any other (a `bool`, an `Option` or a `dyn` held inline, a lane vector) is boxed: the
+;; slot holds a box's address, a setter makes a new box for every store, so a reader sees the whole old value or the whole new one. Here:
 ;;   - `make-slots`: the `def`s an input's program has and the running program lacks (a session `def`, a new `def` of a loaded file, a
 ;;     library `def` first reached) made resident, their initialisers run once on the attach thread, in the order of their ids;
-;;   - a redefinition (the same name defined again at the REPL or in a loaded file): its type must be the running program's (resident
-;;     code reads the slot as that type; else `live/Def`) and its value one word (`live/Def` otherwise: resident code holds the value
-;;     inline). A run-time `def`'s new initialiser is lowered under a name of its own (emit.compile `request-def`), cut out, and run once
-;;     on the attach thread by an entry that shares the value (`fib.share`: every thread reads it, so its counts are atomic) and stores
-;;     it with `live.d.NAME.set` (a release store); the next read of any thread sees it. A constant is stored by `sync-constants`. A
-;;     `defonce` keeps the value: its text is accepted and nothing runs. A slot nothing resident reads (a constant no body of the running
-;;     program reads) has no setter: the text is enough.
+;;   - a redefinition (the same name defined again at the REPL or in a loaded file). A run-time `def`'s new initialiser is lowered under
+;;     a name of its own (emit.compile `request-def`), cut out, and run once on the attach thread by an entry that shares the value
+;;     (`fib.share`: every thread reads it, so its counts are atomic; a boxed value's setter shares the object in it) and stores it with
+;;     `live.d.NAME.set` (a release store); the next read of any thread sees it. A constant is stored by `sync-constants`. A `defonce`
+;;     keeps the value: its text is accepted and nothing runs. A slot nothing resident reads (a constant no body of the running program
+;;     reads) has no setter: the text is enough. A redefinition that CHANGES the type gets a new slot (`live.d.NAME.K`, K the input's
+;;     generation; serve.liveretype finds and swaps the readers, which read the new slot); the old slot keeps the old value for code
+;;     still running in an old generation, and that value is retired as below;
 ;;   - the old value is not freed at the store: a thread may be reading it. It waits on the session's list until a retirement (the
-;;     program quiescent, serve.liveretire), and is dropped then (`fib.release`, the destructor included) unless a family a parked
-;;     thread can be in reads the slot (its frame may borrow the value count-free across the pause point): it waits for the next one. A
-;;     copy the program stored anywhere holds a count of its own (a borrowed def stored is retained), so the drop frees only what no one
-;;     holds. An immortal old value (made before `main`, or static data) is never freed and is counted as such.
+;;     program quiescent, serve.liveretire), and is dropped then (`fib.release`, the destructor included; a box by its slot's drop)
+;;     unless a family a parked thread can be in reads the slot (its frame may borrow the value count-free across the pause point): it
+;;     waits for the next one. A copy the program stored anywhere holds a count of its own (a borrowed def stored is retained), so the
+;;     drop frees only what no one holds. An immortal old value (made before `main`, or static data) is never freed and is counted as such.
 (ns serve.livedefs
   (:use lir.ast lir.types)
   (:require [serve.livesess :as ls] [serve.livetable :as lt] [serve.replcore :as rc] [emit.compile :as ec] [emit.node :as n]
-            [emit.function :as f] [live.jit :as lj] [live.extract :as ex] [types.decls :as td] [types.init :as ti] [own.driver :as od]
-            [types.table :as tb] [emit.names :as en] [own.program :as op] [fib.string :as s]))
+            [emit.function :as f] [emit.livedef :as eld] [live.jit :as lj] [live.extract :as ex] [types.decls :as td] [types.init :as ti]
+            [types.table :as tb] [emit.names :as en] [own.program :as op] [own.driver :as od] [lair.ffi :as ffi] [fib.string :as s]))
+
+;; ---- slot names
+
+;; The slot of the def whose body is `body` now (its version after a type change: `DefState.slots`).
+(defun slot-of (sx: ls/Sess body: str) -> str (eld/live-slot-name body (unwrap-or (get (. @(. sx defs) slots) body) 0)))
+
+(defun digits? :private (t: str) -> bool
+  (and (> (str-len t) 0) (not-any? (fn (i: i64) (let ((c (str-byte-at t i))) (or (< c 48i8) (> c 57i8)))) (range (str-len t)))))
+
+;; A live slot's name without its version (`live.d.NAME.K`) and without `.box` (a constant's static box): `live.d.NAME`. A def's name
+;; never is digits, so a last part of digits is a version.
+(defun slot-base (name: str) -> str
+  (let ((nm (if (s/ends-with? name ".box") (str-slice name 0 (- (str-len name) 4)) name)))
+    (loop ((i (- (str-len nm) 1)))
+      (cond (< i 7) nm
+            (= (str-byte-at nm i) 46i8) (if (digits? (str-slice nm (+ i 1) (str-len nm))) (str-slice nm 0 i) nm)
+            :else (recur (- i 1))))))
+
+;; Whether slot `slot` holds a box (its drop is the running program's or the input's).
+(defun boxed? (sx: ls/Sess pi: (Map str LItem) slot: str) -> bool
+  (or (some? (get pi (str slot ".drop"))) (some? (get @(. sx base) (str slot ".drop")))))
+
+;; The functions of slot `slot` that the session calls (its setter and drop) when the running program lacks them: kept with a cut.
+(defun slot-functions :private (sx: ls/Sess pi: (Map str LItem) slot: str) -> (Vec LItem)
+  (vec (keep (fn (nm: str) (if (some? (get @(. sx base) nm)) nil (get pi nm))) [(str slot ".set") (str slot ".drop")])))
+
+;; The word slot `slot` holds now, read on the attach thread (the only thread that stores a slot), or 0 when it is not resident.
+(defun slot-word :private (sx: ls/Sess slot: str) -> i64
+  (match (ls/slot-address sx slot) ((Ok a) (unsafe (load-i64 (ffi/addr->ptr a)))) ((Err _) 0)))
 
 ;; ---- new defs
 
@@ -39,35 +70,39 @@
     ((some m) (Err m))))
 
 ;; What an input's program needs of the running program's `def`s before anything of it runs: the slots agree, the new `def`s made, and
-;; the constants whose text changed stored (`sync-constants`).
-(defun make-slots (sx: ls/Sess made: ls/Made) -> (Result unit str)
-  (try-let ((_ (slots-agree sx made)) (_ (make-new sx made))) (sync-constants sx made)))
+;; the constants whose text changed stored (`sync-constants`). `skip`: the new slots of the redefinitions that change type (made by
+;; `apply-redefs` with the new initialiser, not here with the old one).
+(defun make-slots (sx: ls/Sess made: ls/Made) -> (Result unit str) (make-slots-skipping sx made (set-empty)))
+
+(defun make-slots-skipping (sx: ls/Sess made: ls/Made skip: (Set str)) -> (Result unit str)
+  (try-let ((_ (slots-agree sx made)) (_ (make-new sx made skip))) (sync-constants sx made)))
 
 ;; The `def`s of a program the base lacks (an input's own, a loaded file's new one, or the library's that the program did not reach)
 ;; made resident: their slots exported and one init function of theirs, run once here in the order of their ids (syntax §3.19), kept
 ;; for good.
-(defun make-new :private (sx: ls/Sess made: ls/Made) -> (Result unit str)
-  (let ((slots (new-slots sx made)) (init-name (str "live.defs." @(. sx inputs))))
+(defun make-new :private (sx: ls/Sess made: ls/Made skip: (Set str)) -> (Result unit str)
+  (let ((slots (filterv (fn (p: (Pair str LItem)) (not (contains? skip (. p fst)))) (new-slots sx made))) (init-name (str "live.defs." @(. sx inputs))))
     (if (empty? slots)
         (Ok ())
-        (try-let ((a (ls/add-cut sx (. made m) [] (into (conj (mapv (fn (p: (Pair str LItem)) (. p snd)) slots) (defs-init (ls/made-g made) init-name slots))
-                                                      (setters (. made m) slots)) []))
+        (try-let ((a (ls/add-cut sx (. made m) [] (into (conj (mapv (fn (p: (Pair str LItem)) (. p snd)) slots) (defs-init sx made init-name slots))
+                                                      (setters sx (. made m) slots)) []))
                   (_ (ls/run-void (ls/jit-of sx) init-name)))
           (do (ls/keep-module sx a)
               (set! (. sx resident) (into @(. sx resident) (mapv (fn (p: (Pair str LItem)) (. p fst)) slots)))
               (Ok ()))))))
 
-;; The setters of the new live slots (`live.d.NAME.set`), so that a later redefinition can store them.
-(defun setters :private (m: LModule slots: (Vec (Pair str LItem))) -> (Vec LItem)
-  (let ((pi (ex/index-of m))) (vec (keep (fn (p: (Pair str LItem)) (get pi (str (. p fst) ".set"))) slots))))
+;; The setters (and drops) of the new live slots, so that a later redefinition can store them.
+(defun setters :private (sx: ls/Sess m: LModule slots: (Vec (Pair str LItem))) -> (Vec LItem)
+  (let ((pi (ex/index-of m))) (vec (mapcat (fn (p: (Pair str LItem)) (slot-functions sx pi (. p fst))) slots))))
 
-;; A slot of a `def` made at run time: `def.slot.N`, or a live slot `live.d.NAME` (not its setter) whose `def` is not a constant.
+;; A slot of a `def` made at run time: `def.slot.N`, or a live slot `live.d.NAME` (not its setter, not a constant's box) whose `def` is
+;; not a constant.
 (defun init-slot? :private (constants: (Set str) name: str) -> bool
   (or (s/starts-with? name "def.slot.")
-      (and (s/starts-with? name "live.d.") (not (s/ends-with? name ".set")) (not (contains? constants name)))))
+      (and (s/starts-with? name "live.d.") (not (s/ends-with? name ".set")) (not (s/ends-with? name ".box")) (not (contains? constants (slot-base name))))))
 
-;; The live slots of the constant `def`s of the program (a constant's slot holds its value from the start: nothing to run).
-(defun constant-slots :private (g: td/Globals) -> (Set str)
+;; The live slots of the constant `def`s of the program (a constant's slot holds its value from the start: nothing to run), unversioned.
+(defun constant-slots (g: td/Globals) -> (Set str)
   (reduce (fn (acc: (Set str) d: i64)
             (if (. (td/g-def g d) constant) (conj acc (str "live." (en/body-name g (op/BodyDef d) []))) acc))
           (set-empty) (range (tb/table-count (. g defs)))))
@@ -83,65 +118,96 @@
                    (_ nil)))
                (. (. made m) items)))))
 
-;; The `def` of a slot: its name (for a trap's message) and its body's name. A live slot `live.d.NAME` is the body `d.NAME`.
+;; The `def` of a slot: its name (for a trap's message) and its body's name. A live slot `live.d.NAME` (of any version) is the body `d.NAME`.
 (defun slot-body :private (g: td/Globals slot: str) -> (Pair str str)
   (if (s/starts-with? slot "live.")
-      (let ((body (str-slice slot 5 (str-len slot)))) (Pair (str-slice body 2 (str-len body)) body))
+      (let ((base (slot-base slot)))
+        (let ((body (str-slice base 5 (str-len base)))) (Pair (str-slice body 2 (str-len body)) body)))
       (ls/slot-def g slot)))
 
 (defun object-slot? :private (it: LItem) -> bool
   (match it ((ItGlobal g) (= (. g ty) TPtr)) (_ false)))
 
-;; The init function of the new slots, as emit.inits `init-body` writes one (`fib.initdef` named, stored). An object of a `def.slot.N` is
-;; immortalised as the program's are; an object of a live slot is shared and keeps its count, so that a redefinition can drop it.
-(defun defs-init :private (g: td/Globals name: str slots: (Vec (Pair str LItem))) -> LItem
-  (let ((body (loop ((k (- (count slots) 1)) (tail [(n/ret nil)]))
-                (if (< k 0)
-                    tail
-                    (let ((slot (. (nth slots k) fst)) (v (str "v" k)) (object (object-slot? (. (nth slots k) snd))))
-                      (let ((dn (slot-body g slot)))
+;; The store of a new slot's first value: a boxed one through its setter (which makes the box and shares the object in it), an object of
+;; a live slot shared and stored (it keeps its count, so that a redefinition can drop it), an object of a `def.slot.N` immortalised as the
+;; program's are.
+(defun first-store :private (sx: ls/Sess pi: (Map str LItem) slot: str object: bool v: str) -> (Vec LExpr)
+  (cond (boxed? sx pi slot) [(n/call (str slot ".set") [(n/local v)])]
+        :else (into (if object [(n/call (if (s/starts-with? slot "live.") "fib.share" "fib.immortalise") [(n/local v)])] [])
+                    [(n/store (n/local v) (n/global slot) nil)])))
+
+;; The init function of the new slots, as emit.inits `init-body` writes one (`fib.initdef` named, stored).
+(defun defs-init :private (sx: ls/Sess made: ls/Made name: str slots: (Vec (Pair str LItem))) -> LItem
+  (let ((g (ls/made-g made)) (pi (ex/index-of (. made m))))
+    (let ((body (loop ((k (- (count slots) 1)) (tail [(n/ret nil)]))
+                  (if (< k 0)
+                      tail
+                      (let ((slot (. (nth slots k) fst)) (v (str "v" k)) (dn (slot-body g (. (nth slots k) fst))))
                         (recur (- k 1)
                                [(n/store (n/string (str "def " (. dn fst) ": ")) (n/global "fib.initdef") nil)
                                 (f/bound [(f/binding v (n/call (. dn snd) []))]
-                                         (into (if object [(n/call (if (s/starts-with? slot "live.") "fib.share" "fib.immortalise") [(n/local v)])] [])
-                                               (into [(n/store (n/local v) (n/global slot) nil)] tail)))])))))))
-    (ItDefine (f/external (f/make name nil [] cc-c [(f/block "entry" body)])))))
+                                         (into (first-store sx pi slot (object-slot? (. (nth slots k) snd)) v) tail))]))))))
+      (ItDefine (f/external (f/make name nil [] cc-c [(f/block "entry" body)]))))))
 
 ;; ---- constants whose text changed under the running program
 
 ;; A constant `def` is read by resident code from its live slot, whose initial value is the constant the program that made the slot
-;; had. When the text changes (a redefinition at the REPL or in a loaded file, or a required module edited on disk and read anew by
-;; the next input), the input's program has the slot with the new constant: every such slot whose value differs from the one the
-;; running program holds (the base's, or the last stored here) is stored with the program's, by an entry of the input, before anything
-;; else of it runs. The old constant is static data and is never freed; the new one is kept with the entry's module.
-(defun changed-constants :private (sx: ls/Sess made: ls/Made) -> (Vec LGlobalDef)
-  (let ((constants (constant-slots (ls/made-g made))) (stored (. @(. sx defs) stored)))
+;; had (a boxed one's: the static box's). When the text changes (a redefinition at the REPL or in a loaded file, or a required module
+;; edited on disk and read anew by the next input), the input's program has the slot with the new constant: every such slot whose value
+;; differs from the one the running program holds (the base's, or the last stored here) is stored with the program's, by an entry of the
+;; input, before anything else of it runs. The old constant is static data and is never freed; a boxed slot's old box is retired (the
+;; slot's drop keeps the static one). The new constant is kept with the entry's module.
+(defun changed-constants :private (sx: ls/Sess made: ls/Made) -> (Vec (Pair str LExpr))
+  (let ((constants (constant-slots (ls/made-g made))) (pi (ex/index-of (. made m))))
     (vec (keep (fn (it: LItem)
                  (match it
                    ((ItGlobal g)
-                    (if (contains? constants (. g name))
-                        (match (get @(. sx base) (. g name))
-                          ((some (ItGlobal b)) (let ((now (unwrap-or (get stored (. g name)) (n/text (. b init)))))
-                                                 (if (= now (n/text (. g init))) nil (some g))))
-                          (_ nil))
-                        nil))
+                    (let ((box (s/ends-with? (. g name) ".box")))
+                      (let ((slot (if box (str-slice (. g name) 0 (- (str-len (. g name)) 4)) (. g name))))
+                        (if (and (s/starts-with? slot "live.d.") (contains? constants (slot-base slot)) (or box (nil? (get pi (str slot ".box")))))
+                            (match (held-text sx slot)
+                              ((some now) (if (= now (n/text (. g init))) nil (some (Pair slot (. g init)))))
+                              (nil nil))
+                            nil))))
                    (_ nil)))
                (. (. made m) items)))))
 
+;; The value the running program's slot `slot` holds, as the text of a constant: the last stored by the session ("" after a run-time
+;; value: no constant equals it), else the base's (its static box's for a boxed slot; "" for a slot the base made at run time, noted
+;; at the start: serve.livetable `run-time-stored`); nil when the slot is not resident.
+(defun held-text :private (sx: ls/Sess slot: str) -> (Option str)
+  (match (get (. @(. sx defs) stored) slot)
+    ((some t) (some t))
+    (nil (match (get @(. sx base) slot)
+           ((some (ItGlobal b)) (match (get @(. sx base) (str slot ".box"))
+                                  ((some (ItGlobal bx)) (some (n/text (. bx init))))
+                                  (_ (some (n/text (. b init))))))
+           (_ nil)))))
+
+;; What a constant's store takes out of slot `slot`: a box (its drop keeps the static one), or an object made at run time (the slot held
+;; no constant: `held-text` ""); nothing for a constant, which is static data.
+(defun constant-old :private (sx: ls/Sess pi: (Map str LItem) slot: str) -> (Option lt/RetiredDef)
+  (cond (boxed? sx pi slot) (some (lt/RetiredDef slot (slot-word sx slot) (str slot ".drop")))
+        (and (= (held-text sx slot) (some "")) (match (get @(. sx base) slot) ((some (ItGlobal g)) (= (. g ty) TPtr)) (_ false)))
+          (some (lt/RetiredDef slot (slot-word sx slot) ""))
+        :else nil))
+
 (defun sync-constants :private (sx: ls/Sess made: ls/Made) -> (Result unit str)
-  (let ((gs (changed-constants sx made)) (name (str "live.sync." @(. sx inputs))))
-    (if (empty? gs)
+  (let ((cs (changed-constants sx made)) (name (str "live.sync." @(. sx inputs))) (pi (ex/index-of (. made m))))
+    (if (empty? cs)
         (Ok ())
         (let ((entry (ItDefine (f/external (f/make name (some ty-i64) [] cc-c
-                                                   [(f/block "entry" (conj (mapv (fn (g: LGlobalDef) (n/call (str (. g name) ".set") [(. g init)])) gs)
-                                                                           (n/ret (some (n/integer ty-i64 0)))))])))))
-          (try-let ((a (ls/add-cut sx (. made m) [] [entry] []))
+                                                   [(f/block "entry" (conj (mapv (fn (c: (Pair str LExpr)) (n/call (str (. c fst) ".set") [(. c snd)])) cs)
+                                                                           (n/ret (some (n/integer ty-i64 0)))))]))))
+              (olds (vec (keep (fn (c: (Pair str LExpr)) (constant-old sx pi (. c fst))) cs))))
+          (try-let ((a (ls/add-cut sx (. made m) [] (into [entry] (vec (mapcat (fn (c: (Pair str LExpr)) (slot-functions sx pi (. c fst))) cs))) []))
                     (at (lj/c-entry (ls/jit-of sx) name))
                     (_ (lj/call at [])))
             (let ((d @(. sx defs)))
               (do (ls/keep-module sx a)
-                  (set! (. sx defs) (lt/DefState (. d types) (. d retired) (. d drop) (+ (. d redefined) (count gs)) (. d dropped) (. d immortal)
-                                                 (reduce (fn (acc: (Map str str) g: LGlobalDef) (assoc acc (. g name) (n/text (. g init)))) (. d stored) gs)))
+                  (set! (. sx defs) (lt/defs-redefined d (count cs) (filterv (fn (r: lt/RetiredDef) (not (= (. r value) 0))) olds)
+                                                       (reduce (fn (acc: (Map str str) c: (Pair str LExpr)) (assoc acc (. c fst) (n/text (. c snd)))) (. d stored) cs)
+                                                       (. d slots)))
                   (Ok ()))))))))
 
 ;; ---- redefinitions
@@ -149,6 +215,9 @@
 ;; A `def` an input defines again: its name, its module (nil: the main module's), its body's name (`d.NAME`, `d.MODULE.NAME`), and
 ;; whether it keeps the value (`defonce`).
 (defstruct Redef (name: str module: (Option str) body: str keep: bool))
+
+;; A redefinition that changes the def's type: its body, the slot resident code reads now and the new slot (`live.d.NAME.K`).
+(defstruct Retype (body: str old: str new: str))
 
 (defun def-text? (d: rc/Def) -> bool (or (s/starts-with? (. d text) "(def ") (s/starts-with? (. d text) "(defonce ")))
 
@@ -164,79 +233,104 @@
 ;; A refusal of a redefinition: the definition and the message.
 (defstruct DefRefusal (name: str message: str))
 
-;; The first redefinition whose type is not the running program's: resident code reads the slot as the old type.
-(defun type-refusal (sx: ls/Sess c: od/Checked rs: (Vec Redef)) -> (Option DefRefusal)
-  (let ((now (lt/def-types-of c)) (was (. @(. sx defs) types)))
-    (first (vec (keep (fn (r: Redef)
-                        (match (get was (. r body))
-                          (nil nil)
-                          ((some old) (match (get now (. r body))
-                                        ((some new) (if (= old new) nil
-                                                        (some (DefRefusal (. r name) (str (. r name) " is a def of type " old " in the running program and " new " here; a def changes type at a restart")))))
-                                        (nil nil)))))
-                      rs)))))
-
 ;; The lowered result type of a redefinition's initialiser in the input's program.
 (defun result-type :private (made: ls/Made r: Redef) -> (Option LType)
   (match (get (ex/index-of (. made m)) (. r body)) ((some (ItDefine fd)) (. (. fd ty) ret)) (_ nil)))
 
-(defun word? :private (t: (Option LType)) -> bool
-  (match t ((some (TInt b)) (>= b 8)) ((some (TFloat)) true) ((some (TDouble)) true) ((some (TPtr)) true) (_ false)))
+(defun retype-of (ts: (Vec Retype) body: str) -> (Option Retype) (first (filterv (fn (t: Retype) (= (. t body) body)) ts)))
 
-;; The first redefinition whose value is not one word (an `Option`, a `dyn`, a `bool`): it has no slot, resident code holds it inline.
-(defun shape-refusal (made: ls/Made rs: (Vec Redef)) -> (Option DefRefusal)
-  (first (vec (keep (fn (r: Redef)
-                      (if (or (. r keep) (word? (result-type made r))) nil
-                          (some (DefRefusal (. r name) (str (. r name) " is a def whose value resident code holds inline (not one word); it changes at a restart")))))
-                    rs))))
+;; The slot a redefinition stores: the new one of a type change, else the def's slot now.
+(defun target-slot (sx: ls/Sess ts: (Vec Retype) r: Redef) -> str
+  (match (retype-of ts (. r body)) ((some t) (. t new)) (nil (slot-of sx (. r body)))))
 
-;; The entry of redefinition `r`: the new initialiser (cut out as `renamed`) run, an object shared, the old value read (only this
-;; thread stores the slot) and the new one stored with the setter's release store; the old object's address is the result, else 0.
-(defun entry-item :private (name: str r: Redef renamed: str ty: LType) -> LItem
-  (let ((slot (str "live." (. r body))) (object (= ty TPtr)))
-    (ItDefine (f/external (f/make name (some ty-i64) [] cc-c
-      [(f/block "entry"
-         [(n/store (n/string (str "def " (. r name) ": ")) (n/global "fib.initdef") nil)
-          (f/bound [(f/binding "v" (n/call renamed []))]
-                   (into (if object [(n/call "fib.share" [(n/local "v")])] [])
-                         [(f/bound [(f/binding "old" (n/load ty (n/global slot) nil))]
-                                   [(n/call (str slot ".set") [(n/local "v")])
-                                    (n/ret (some (if object (n/cast CPtrToInt ty-i64 (n/local "old")) (n/integer ty-i64 0))))])]))])])))))
+;; The first redefinition whose value has no slot in the input's program (a raw pointer: emit.livedef): resident code holds it inline.
+(defun shape-refusal (sx: ls/Sess made: ls/Made rs: (Vec Redef) ts: (Vec Retype)) -> (Option DefRefusal)
+  (let ((pi (ex/index-of (. made m))))
+    (first (vec (keep (fn (r: Redef)
+                        (if (or (. r keep) (some? (get pi (str (target-slot sx ts r) ".set")))) nil
+                            (some (DefRefusal (. r name) (str (. r name) " is a def whose value has no live slot (a raw pointer: resident code holds it inline); it changes at a restart")))))
+                      rs)))))
 
-;; The redefinitions that store a slot: those that do not keep their value and whose slot the running program has (a setter resident).
-;; A constant's slot is stored by `sync-constants` (the program's slot holds the new constant).
-(defun storing :private (sx: ls/Sess made: ls/Made rs: (Vec Redef)) -> (Vec Redef)
+;; The entry of redefinition `r` into `slot`: the new initialiser (cut out as `renamed`) run, an object shared, the old value read (only
+;; this thread stores the slot; a box's address for a boxed slot) and the new one stored with the setter's release store (a boxed value's
+;; setter makes its box); the old object's or box's address is the result, else 0. A type change reads no old value here: the new slot
+;; is empty, the old one's value is retired by `retype-olds`.
+(defun entry-item :private (name: str r: Redef renamed: str ty: LType slot: str boxed: bool fresh: bool) -> LItem
+  (let ((object (and (= ty TPtr) (not boxed))))
+    (let ((old (cond fresh (n/integer ty-i64 0)
+                     boxed (n/cast CPtrToInt ty-i64 (n/load TPtr (n/global slot) nil))
+                     object (n/cast CPtrToInt ty-i64 (n/load ty (n/global slot) nil))
+                     :else (n/integer ty-i64 0))))
+      (ItDefine (f/external (f/make name (some ty-i64) [] cc-c
+        [(f/block "entry"
+           [(n/store (n/string (str "def " (. r name) ": ")) (n/global "fib.initdef") nil)
+            (f/bound [(f/binding "v" (n/call renamed []))]
+                     (into (if object [(n/call "fib.share" [(n/local "v")])] [])
+                           [(f/bound [(f/binding "old" old)]
+                                     [(n/call (str slot ".set") [(n/local "v")]) (n/ret (some (n/local "old")))])]))])]))))))
+
+;; The redefinitions that store a slot: those that do not keep their value and whose slot the running program has (a setter resident),
+;; or whose type changes (the new slot is the input's). A constant's slot is stored by `sync-constants` (the program's slot holds the
+;; new constant; a new constant slot of a type change is the program's with its value).
+(defun storing :private (sx: ls/Sess made: ls/Made rs: (Vec Redef) ts: (Vec Retype)) -> (Vec Redef)
   (let ((constants (constant-slots (ls/made-g made))))
-    (filterv (fn (r: Redef) (let ((slot (str "live." (. r body))))
-                              (and (not (. r keep)) (not (contains? constants slot)) (some? (get @(. sx base) (str slot ".set"))))))
+    (filterv (fn (r: Redef) (and (not (. r keep)) (not (contains? constants (str "live." (. r body))))
+                                 (or (some? (retype-of ts (. r body))) (some? (get @(. sx base) (str (slot-of sx (. r body)) ".set"))))))
              rs)))
 
 ;; The redefinitions applied, after the input's new slots are made: the new initialisers cut out under names of their own with their
-;; entries, kept, each entry run once; the old objects put on the list for a retirement.
-(defun apply-redefs (sx: ls/Sess made: ls/Made rs: (Vec Redef)) -> (Result unit str)
-  (let ((todo (storing sx made rs)) (k @(. sx inputs)))
+;; entries (and the setters and drops of new slots), kept, each entry run once; the old values put on the list for a retirement. The
+;; slots of the type changes (`ts`) are the session's already (`note-slots`).
+(defun apply-redefs (sx: ls/Sess made: ls/Made rs: (Vec Redef) ts: (Vec Retype)) -> (Result unit str)
+  (let ((todo (storing sx made rs ts)) (k @(. sx inputs)) (pi (ex/index-of (. made m))) (gone (retype-olds sx ts)))
     (if (empty? todo)
-        (Ok ())
-        (let ((renamed (fn (r: Redef) -> str (str (. r body) ".r" k))) (entry (fn (i: i64) -> str (str "live.redef." k "." i))))
-          (try-let ((items (ti/try-map (fn (i: i64) (match (result-type made (nth todo i))
-                                                     ((some ty) (Ok (entry-item (entry i) (nth todo i) (renamed (nth todo i)) ty)))
-                                                     (nil (Err (str "live: no initialiser of " (. (nth todo i) name) " in the input's program")))))
+        (do (note-olds sx 0 [] [] gone) (Ok ()))
+        (let ((renamed (fn (r: Redef) -> str (str (. r body) ".r" k))) (entry (fn (i: i64) -> str (str "live.redef." k "." i)))
+              (slot (fn (r: Redef) -> str (slot-of sx (. r body)))))
+          (try-let ((items (ti/try-map (fn (i: i64) (let ((r (nth todo i)))
+                                                     (match (result-type made r)
+                                                       ((some ty) (Ok (entry-item (entry i) r (renamed r) ty (slot r) (boxed? sx pi (slot r)) (some? (retype-of ts (. r body))))))
+                                                       (nil (Err (str "live: no initialiser of " (. r name) " in the input's program"))))))
                                        (vec (range (count todo)))))
-                    (a (ls/add-cut sx (. made m) (mapv (fn (r: Redef) (Pair (. r body) (renamed r))) todo) items []))
+                    (a (ls/add-cut sx (. made m) (mapv (fn (r: Redef) (Pair (. r body) (renamed r))) todo)
+                                   (into items (vec (mapcat (fn (r: Redef) (slot-functions sx pi (slot r))) todo))) []))
                     (olds (ti/try-map (fn (i: i64) (try-let ((at (lj/c-entry (ls/jit-of sx) (entry i)))) (lj/call at []))) (vec (range (count todo))))))
-            (do (ls/keep-module sx a)
-                (note-olds sx todo olds)
-                (Ok ())))))))
+            (let ((kinds (mapv (fn (r: Redef) (Pair (slot r) (if (boxed? sx pi (slot r)) (str (slot r) ".drop") ""))) todo))
+                  (n (count (filterv (fn (r: Redef) (nil? (retype-of ts (. r body)))) todo))))
+              (do (ls/keep-module sx a)
+                  (note-olds sx n kinds olds gone)
+                  (Ok ()))))))))
 
-(defun note-olds :private (sx: ls/Sess todo: (Vec Redef) olds: (Vec i64)) -> unit
+;; The value each type change leaves in its old slot, to retire: an object, or a box (dropped by the old slot's drop); nothing for a
+;; word that is no object. Read before anything of the input runs.
+(defun retype-olds :private (sx: ls/Sess ts: (Vec Retype)) -> (Vec lt/RetiredDef)
+  (vec (keep (fn (t: Retype)
+               (let ((boxed (some? (get @(. sx base) (str (. t old) ".drop")))))
+                 (match (get @(. sx base) (. t old))
+                   ((some (ItGlobal g)) (if (= (. g ty) TPtr)
+                                            (let ((v (slot-word sx (. t old)))) (if (= v 0) nil (some (lt/RetiredDef (. t old) v (if boxed (str (. t old) ".drop") "")))))
+                                            nil))
+                   (_ nil))))
+             ts)))
+
+;; The old values of the slots stored (`slots`: each slot with its drop, "" for an object) and of the type changes (`gone`) noted for a
+;; retirement, and `n` redefinitions counted (a type change is counted by `note-slots`).
+(defun note-olds :private (sx: ls/Sess n: i64 slots: (Vec (Pair str str)) olds: (Vec i64) gone: (Vec lt/RetiredDef)) -> unit
   (let ((d @(. sx defs))
-        (gone (vec (keep (fn (i: i64) (if (= (nth olds i) 0) nil (some (lt/RetiredDef (str "live." (. (nth todo i) body)) (nth olds i))))) (range (count todo))))))
-    (set! (. sx defs) (lt/DefState (. d types) (into (. d retired) gone) (. d drop) (+ (. d redefined) (count todo)) (. d dropped) (. d immortal) (. d stored)))))
+        (taken (vec (keep (fn (i: i64) (if (= (nth olds i) 0) nil (some (lt/RetiredDef (. (nth slots i) fst) (nth olds i) (. (nth slots i) snd))))) (range (count slots))))))
+    (set! (. sx defs) (lt/defs-redefined d n (into taken gone) (reduce (fn (acc: (Map str str) p: (Pair str str)) (assoc acc (. p fst) "")) (. d stored) slots)
+                                         (. d slots)))))
+
+;; The slots of the type changes made the session's: every later program reads the new slot (serve.livesess `set-generations`); each
+;; type change counted as a redefinition.
+(defun note-slots (sx: ls/Sess ts: (Vec Retype) gen: i64) -> unit
+  (let ((d @(. sx defs)))
+    (set! (. sx defs) (lt/defs-redefined d (count ts) [] (. d stored) (reduce (fn (acc: (Map str i64) t: Retype) (assoc acc (. t body) gen)) (. d slots) ts)))))
 
 ;; The defs' types as `c`'s program has them, after an accepted input.
 (defun note-types (sx: ls/Sess c: od/Checked) -> unit
   (let ((d @(. sx defs)))
-    (set! (. sx defs) (lt/DefState (merge (. d types) (lt/def-types-of c)) (. d retired) (. d drop) (. d redefined) (. d dropped) (. d immortal) (. d stored)))))
+    (set! (. sx defs) (lt/defs-with d (merge (. d types) (lt/def-types-of c)) (. d retired) (. d drop)))))
 
 ;; ---- the drop at a retirement
 
@@ -249,8 +343,12 @@
     (if (> (. d drop) 0)
         (Ok (. d drop))
         (try-let ((_ (lj/add-resident-source (ls/jit-of sx) "live.def-drop" drop-source)) (at (lj/c-entry (ls/jit-of sx) "live.def-drop")))
-          (do (set! (. sx defs) (lt/DefState (. d types) (. d retired) at (. d redefined) (. d dropped) (. d immortal) (. d stored)))
+          (do (set! (. sx defs) (lt/defs-with d (. d types) (. d retired) at))
               (Ok at))))))
+
+;; The drop of one old value: an object by `live.def-drop`, a box by its slot's drop; 1 when freed, 0 when immortal.
+(defun drop-one :private (sx: ls/Sess r: lt/RetiredDef) -> (Result i64 str)
+  (try-let ((at (if (= (. r drop) "") (drop-address sx) (lj/c-entry (ls/jit-of sx) (. r drop))))) (lj/call at [(. r value)])))
 
 ;; The slots read by the code in `bearing` (the families and other code a parked thread can be in: serve.livereach `bearing`).
 (defun slots-read-by :private (sx: ls/Sess bearing: (Set str)) -> (Set str)
@@ -269,8 +367,7 @@
           (wait (filterv (fn (r: lt/RetiredDef) (contains? held (. r slot))) (. d retired))))
       (if (empty? now)
           (Ok ())
-          (try-let ((at (drop-address sx))
-                    (freed (ti/try-map (fn (r: lt/RetiredDef) (lj/call at [(. r value)])) now)))
+          (try-let ((freed (ti/try-map (fn (r: lt/RetiredDef) (drop-one sx r)) now)))
             (let ((n (reduce + 0 freed)) (d2 @(. sx defs)))
-              (do (set! (. sx defs) (lt/DefState (. d2 types) wait (. d2 drop) (. d2 redefined) (+ (. d2 dropped) n) (+ (. d2 immortal) (- (count now) n)) (. d2 stored)))
+              (do (set! (. sx defs) (lt/DefState (. d2 types) wait (. d2 drop) (. d2 redefined) (+ (. d2 dropped) n) (+ (. d2 immortal) (- (count now) n)) (. d2 stored) (. d2 slots)))
                   (Ok ()))))))))

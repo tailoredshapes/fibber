@@ -616,6 +616,44 @@ every second in the background, all 200 or 404/410, none refused). What it does 
   input each while 8 threads read both, 53 to 58 s (about 55 ms each); every read was 3 or 5 and the sum 768 or 1280; `retire` dropped
   every old vector made at run time. Each redefinition keeps its module for good (the new initialiser, its entry, a new constant's
   static data), as LV1 (e) keeps an input's: a thousand redefinitions are a thousand kept modules.
+- **Status 2026-10-16, LT4's two limits lifted** (serve.liveretype, new; emit.livedef, new, with the live-def functions out of
+  emit.program; serve.livedefs, serve.liveswap, serve.liveload, serve.livetable `DefState.slots`, `RetiredDef.drop`, `defs-of-base`;
+  serve.livesess `set-generations` and `install-base`; the tests compiler/tests/live/defs.sh (defs.py, defs-app.fib, defs-tsan.fib,
+  defs-swapper.lir) and load.sh; the mutants `boxed-in-place`, `retype-no-readers`, `unswappable-reader-accepted` of
+  scripts/mutant-live.sh). (b) and (c) above no longer hold:
+  - **A type change is applied when its readers check.** The session's whole program is checked with the new type, as every input's
+    is; a diagnostic in another definition that names the def becomes `live/Def` naming that reader (`count-base changes type here,
+    and its reader plus-one would not type-check against it: ...`; in a loaded file at the def's line). Else the def gets a new slot
+    `live.d.NAME.K` (K the input's generation: the session's generations carry it under the def's body name, so every later program
+    reads it), and every family whose current code reads the old slot (serve.livereach's record of each resident definition) is
+    emitted again under the input's generation and swapped with the input's families. A reader that cannot be swapped refuses the
+    input, named: `main` (its frame never returns), a closure made by another def's initialiser, anything not in the live table, a
+    family the program made no body of. One-shot code (initialisers, the session's entries) is no reader. The old slot keeps the old
+    value for code still in an old generation; that value is retired as above. A `defonce` cannot change type (`live/Def`), nor a def
+    that had no live slot. A type change no resident code reads (a session def, a def only the REPL reads) just takes the new slot.
+  - **A value of more than one word is boxed.** A `bool`, an `Option` held inline, a `dyn`, a lane vector: the slot holds a box's
+    address; the setter mallocs a new box for every store, writes the value, shares an object in it, and publishes the address with a
+    release store; a reader acquire-loads the address, then reads the box. A box is never written once published, so a reader sees the
+    whole old value or the whole new one. The old box is retired and freed by the slot's `live.d.NAME.drop` (the object in it
+    released); a constant's first box is static (`live.d.NAME.box`) and is kept. A raw pointer still has no slot (`live/Def`).
+  - Also fixed: a constant redefinition that equals the zero of a slot the base fills at run time (`(def made: (Option (Vec i64))
+    nil)` after a run-time value) was not stored; the base's run-time slots are now noted as holding no constant.
+  - Tests (lilnas, this branch's stage 2): defs.sh 33 checks `live defs: ok` and `ok tsan: no report beyond the baseline (0 known) in
+    2 runs` (pair: nil and `(some 5)` stored 600 times under 8 readers); the stress is now 1,000 inputs of three redefinitions (an
+    i64 constant, a vector and a boxed Option made at run time) under 8 readers, 63 to 67 s, every read good, 2,003 old values retired. All
+    six def mutants are killed (boxed-in-place by TSAN, 4 reports, and by torn reads: the program's bad count 36 and 28). A type change
+    with one reader swapped: 40 to 84 ms end to end (check 24 to 51 ms, emit 4 to 8, JIT 2 to 3). Main's defs test (two redefinitions per
+    input, 1,000 inputs) by main's F and this F alternately: 49.3, 51.7 s against 53.2, 47.6 s; swap.py 35.6, 36.7 s against 36.5,
+    37.4 s: no change beyond the noise. A plain emit of defs-app, stress-app and swap-app, and a live emit of swap-app, are
+    byte-identical to main's.
+  - On meshql-fib (live-dev, dev/live.fib under `fibc run --live`, the farm on SQLite; a scratch copy, the demo driver in the
+    scratch of this work): `load` of src/meshql/store/sql.fib with `columns` (the SQL of every list and lookup) edited to
+    `json_set(payload, '$.name', 'live') AS payload`: accepted, 1.8 s end to end (the first load: the engine expands 53 modules),
+    no swap (a constant stored), and the next GET lists every farm as `live`; `columns` made a `(Vec str)` with `latest` joining it
+    wrongly: `live/Def ... its reader latest would not type-check` in 0.7 s, nothing changed; joined rightly: accepted in 2.1 s (check
+    1,524 ms, emit 359, JIT 75), swapping `latest` and the two readers of another module, `meshql.store/versions-of` and
+    `meshql.store/create`; the next GET lists `typed`; the original file again: 0.39 s, the farms' names back. Every next request
+    answered in about 1 ms. Against the 10 s of a restart, a redefinition is 0.3 to 2.1 s.
 - **Status 2026-10-15, LT6** (driver.testlive; `--live` kept in `test`'s words by fibc `test-words?`, which also sets FIB_LIVE so the
   project's live roots resolve; driver.test `report-runs`; the test compiler/tests/live/testlive.sh; the mutant `child-spawned-anyway` of
   scripts/mutant-live.sh). `fibc test --live [PATH..]` finds the spec files as `fibc test` does and runs serve.live `run-live` in its own

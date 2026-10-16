@@ -124,11 +124,12 @@ tool_sh-make-graph := $(T)/make/graph.sh | $(wildcard $(T)/make/*) scripts/mac-g
 tool_sh-live-retire := $(T)/live/retire.sh $(F_ABS) | $(T)/live/retire.sh $(T)/live/retire.py $(T)/live/retire-app.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) rt/live.lir lib/fib/os/live.fib
 
 TOOLS_QUICK := sh-emit-prune fibref-skeleton gen-skeleton lint-pipefail lint-portable sh-driver-check-lib sh-make-graph
-# LT4 (docs/design/live-meshql.md, docs/design/live-repl.md 9): `def`s redefined in a live session (serve.livedefs, emit.program `live-def-slot`):
-# the guard (no def slot in a plain emit, a duplicate def still an error), defs.py over a real socket (1000 redefinitions under 8 reading threads,
-# pause and retire drop the old values), and ThreadSanitizer over the slot's acquire load against the setter's release store (about two minutes each)
-tool_sh-live-defs := $(T)/live/defs.sh $(F_ABS) --socket-only | $(T)/live/defs.sh $(T)/live/defs.py $(T)/live/defs-app.fib $(T)/live/defs-cfg.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/emit/program.fib compiler/emit/inits.fib compiler/emit/lower/objects.fib
-tool_sh-live-defs-tsan := env TSAN_OUT=$(TOOLS_OUT)/live-defs-tsan $(T)/live/defs.sh $(F_ABS) --tsan-only | $(T)/live/defs.sh $(T)/live/defs-tsan.fib $(T)/live/defs-swapper.lir scripts/tsan.sh scripts/tsan-baseline.txt compiler/emit/program.fib compiler/emit/lower/objects.fib
+# LT4 (docs/design/live-meshql.md, docs/design/live-repl.md 9): `def`s redefined in a live session (serve.livedefs, serve.liveretype, emit.livedef):
+# the guard (no def slot in a plain emit, a duplicate def still an error), defs.py over a real socket (type changes with their readers swapped or
+# refused naming the reader, boxed values of more than one word, 1000 redefinitions under 8 reading threads, pause and retire drop the old values),
+# and ThreadSanitizer over the slot's acquire load against the setter's release store, a boxed value's too (about two minutes each)
+tool_sh-live-defs := $(T)/live/defs.sh $(F_ABS) --socket-only | $(T)/live/defs.sh $(T)/live/defs.py $(T)/live/defs-app.fib $(T)/live/defs-cfg.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/emit/program.fib compiler/emit/livedef.fib compiler/emit/inits.fib compiler/emit/lower/objects.fib
+tool_sh-live-defs-tsan := env TSAN_OUT=$(TOOLS_OUT)/live-defs-tsan $(T)/live/defs.sh $(F_ABS) --tsan-only | $(T)/live/defs.sh $(T)/live/defs-tsan.fib $(T)/live/defs-swapper.lir scripts/tsan.sh scripts/tsan-baseline.txt compiler/emit/program.fib compiler/emit/livedef.fib compiler/emit/lower/objects.fib
 TOOLS_FULL := $(TOOLS_QUICK) unit-api units-all units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-emit-runtime sh-emit-defs-order sh-stack-stack \
   sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap sh-live-defcache sh-live-queue sh-live-test sh-live-testlive sh-live-watch sh-live-quotes sh-live-statics sh-live-load sh-live-stress sh-live-stress-tsan sh-live-defs sh-live-defs-tsan sh-live-retire \

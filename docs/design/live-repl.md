@@ -255,7 +255,7 @@ definition, and a `hint` field that says what to do:
 | summary | a parameter's mode (borrowed/owned), the escape summary, the `Derived` result facts or the taken-as-value set of `f` or of any function of its SCC differs after (own.top's summaries: what `fibc explain` prints) | `live/Summary`: `handle's parameter req was borrowed and is now owned (it is stored at <input>:3:14); callers pass it borrowed. Keep the body from storing it, or :restart` |
 | layout | the diff of the session touches a `defrecord`, `defstruct`, `defenum`, `derive`, a field type, a variant | `live/Layout`: `Pt changed; values of Pt exist in the running program. :restart` |
 | protocol | a `defprotocol` or `impl` added, removed or changed, including a new instance (its vtable and dispatch rows are in every caller) | `live/Protocol` |
-| def | a `def`'s type changed, or a program `def` (not a session one) is redefined | `live/Def`: a program `def` is immortal and read by every function count-free; the session may add defs, not change the program's (3.5) |
+| def | a `def`'s type changed, or a program `def` (not a session one) is redefined | `live/Def`: a program `def` is immortal and read by every function count-free; the session may add defs, not change the program's (3.5). Lifted by LT4 (live-meshql.md 10): a redefinition is applied; a type change only refuses when a reader of the def would not check or cannot be swapped, naming it |
 | macro | a `defmacro` changed, or a swapped body uses a macro that changed | `live/Macro` (until LV5: reload the module); lifted by LM2: its users, whose expanded form changed, are swapped |
 | extern | an `extern` changed | `live/Extern` |
 | SCC | the swap changes which functions `f` calls such that its SCC's all-owned bodies change membership | handled by swapping every member (the SCC is in the live table); refused as `live/Summary` only if a member's summary changes |
@@ -532,8 +532,9 @@ Decisions for the owner:
      atoms, connections and servers that a redefinition must not reset.
    - A new `def` in a loaded file gets a slot in the new generation (LT4 of live-meshql.md), its initialiser run once.
    This is LT4 of docs/design/live-meshql.md with the old value retired and dropped instead of leaked. Built (2026-10-15, serve.livedefs;
-   live-meshql.md 10 has the status): a type change is refused `live/Def` rather than re-checked, and a value of more than one word
-   (held inline by resident code) cannot be redefined.
+   live-meshql.md 10 has the status). Since 2026-10-16 (serve.liveretype, emit.livedef) a type change is re-checked as above: the
+   def gets a new slot, its resident readers are swapped in the same input, and a reader that would not check, or cannot be swapped
+   (`main`), is named in a `live/Def` refusal; a value of more than one word is held in a box, so it is redefinable too.
 2. **The project's live entry mimics Clojure's `user.clj`**: a `dev/live.fib` in the project that starts the app and exposes the helpers
    (`rebuild!`, the test entry); `fibc run --live APP --with SPEC` is the general form later (live-meshql.md §8, decision 1).
 3. **Redefinition is a live-environment feature only.** Slots, stubs, retire lists and `def` redefinition exist only in code compiled

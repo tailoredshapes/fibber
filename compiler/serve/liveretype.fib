@@ -1,0 +1,139 @@
+;; compiler/serve/liveretype.fib: a redefinition that changes a `def`'s type in a live session (package LT4 of docs/design/live-meshql.md,
+;; its section 10 has the status; docs/design/live-incremental.md 6). Resident code reads the def's slot as the old type, so the new
+;; value cannot go into it. Instead, in the same input:
+;;   - the checker decides: the session's whole program is checked with the new type (as every input's is), so a reader that would not
+;;     type-check refuses the input; `check-refusal` turns that into `live/Def` naming the reader (`reader R would not type-check`);
+;;   - the def gets a new slot `live.d.NAME.K` (K the input's generation: emit.livedef, serve.livedefs `Retype`), and every family whose
+;;     current code reads the old slot (serve.livereach: the slots each resident definition reads) is emitted again under the input's
+;;     generation, reading the new slot, and swapped with the families the input changed (serve.liveswap `swap-all`); a reader that
+;;     cannot be swapped refuses the input, named (`main`, whose frame never returns; a closure made by another def's initialiser;
+;;     anything that is no family of the live table);
+;;   - the old slot keeps the old value for code still running in an old generation; that value is retired as LT4 retires one
+;;     (serve.livedefs `retype-olds`, dropped at a retirement unless a parked thread's family reads the slot).
+;; A `defonce` keeps its value, so its type cannot change (`live/Def`); a def that was a raw pointer has no live slot and its readers
+;; cannot be found (`live/Def`).
+(ns serve.liveretype
+  (:require [serve.livesess :as ls] [serve.livetable :as lt] [serve.livedefs :as ld] [serve.replcore :as rc] [serve.diag :as dg]
+            [emit.livedef :as eld] [own.driver :as od] [fib.string :as s]))
+
+;; The type changes among `rs` (the def's type in `c`'s program is not the running program's), each with its new slot of version `gen`;
+;; or the refusal of the first that cannot change type.
+(defun retypes (sx: ls/Sess c: od/Checked rs: (Vec ld/Redef) gen: i64) -> (Result (Vec ld/Retype) ld/DefRefusal)
+  (let ((now (lt/def-types-of c)) (was (. @(. sx defs) types)))
+    (loop ((i 0) (acc []))
+      (if (>= i (count rs))
+          (Ok acc)
+          (let ((r (nth rs i)))
+            (match (Pair (get was (. r body)) (get now (. r body)))
+              ([(some old) (some new)]
+               (cond (= old new) (recur (+ i 1) acc)
+                     (. r keep) (Err (ld/DefRefusal (. r name) (str (. r name) " is a defonce of type " old " in the running program and " new " here; defonce keeps its value, so its type changes at a restart")))
+                     (raw-slot? sx r) (Err (ld/DefRefusal (. r name) (str (. r name) " is a def of type " old " with no live slot in the running program (a raw pointer: its readers are not known); it changes type at a restart")))
+                     :else (recur (+ i 1) (conj acc (ld/Retype (. r body) (ld/slot-of sx (. r body)) (eld/live-slot-name (. r body) gen))))))
+              (_ (recur (+ i 1) acc))))))))
+
+;; Whether the running program makes `r` in a `def.slot.N` (no live slot: a raw pointer).
+(defun raw-slot? :private (sx: ls/Sess r: ld/Redef) -> bool
+  (some? (first (filterv (fn (p: (Pair str str)) (= (. p snd) (. r name))) (vec @(. sx slot-names))))))
+
+;; The definitions of the running program whose code reads slot `slot` (its setter, drop and box are not readers).
+(defun readers (sx: ls/Sess slot: str) -> (Vec str)
+  (vec (keep (fn (p: (Pair str (Vec str)))
+               (if (and (includes? slot (. p snd)) (not (s/starts-with? (. p fst) (str slot ".")))) (some (. p fst)) nil))
+             (vec (. (ls/reach sx) calls)))))
+
+;; What a reader is: `(Ok family)` to swap, `(Ok "")` for code that runs once and never again (a def's initialiser, the session's
+;; entries and expressions, the runtime's inits), or `(Err why)` when it cannot be swapped.
+(defun reader-kind :private (sx: ls/Sess index: (Map str str) name: str) -> (Result str str)
+  (cond (or (s/starts-with? name "live.") (s/starts-with? name "fib.init") (s/starts-with? name "d.")) (Ok "")
+        :else (match (lt/family-of-name index name)
+                (nil (Err (str (shown name) " (not a function of the live table: it is not swapped)")))
+                ((some fam) (cond (s/starts-with? fam "f.live-entry-") (Ok "")   ; an expression's entry (kept when pinned): run once
+                                  (= fam "f.main") (Err "main (its frame never returns: it is not swapped)")
+                                  (current? sx fam name) (Ok fam)
+                                  :else (Ok ""))))))
+
+;; Whether `name` is code of `family`'s current generation (an old generation is no reader: nothing calls it any more).
+(defun current? :private (sx: ls/Sess family: str name: str) -> bool
+  (match (lt/generation-number name)
+    (nil true)
+    ((some g) (= g (match (get (. @(. sx table) families) family) ((some f) (. f generation)) (nil 0))))))
+
+(defun shown :private (name: str) -> str (if (s/starts-with? name "f.") (str-slice name 2 (str-len name)) name))
+
+;; The families to swap for the type changes `ts` (every current reader of an old slot), or the refusal naming the first reader that
+;; cannot be swapped.
+(defun reader-families (sx: ls/Sess ts: (Vec ld/Retype) rs: (Vec ld/Redef)) -> (Result (Vec str) ld/DefRefusal)
+  (let ((index (lt/family-index (ls/live-bodies sx))))
+    (loop ((i 0) (acc []))
+      (if (>= i (count ts))
+          (Ok acc)
+          (let ((t (nth ts i)) (name (def-name rs (. (nth ts i) body))))
+            (match (first (vec (keep (fn (nm: str) (match (reader-kind sx index nm) ((Err why) (some why)) (_ nil))) (readers sx (. t old)))))
+              ((some why) (Err (ld/DefRefusal name (str name " changes type here, and its reader " why "; it changes type at a restart"))))
+              (nil (recur (+ i 1) (reduce (fn (a: (Vec str) nm: str) (match (reader-kind sx index nm) ((Ok fam) (if (or (= fam "") (includes? fam a)) a (conj a fam))) (_ a)))
+                                          acc (readers sx (. t old)))))))))))
+
+(defun def-name :private (rs: (Vec ld/Redef) body: str) -> str
+  (match (first (filterv (fn (r: ld/Redef) (= (. r body) body)) rs)) ((some r) (. r name)) (nil body)))
+
+;; The type changes of an input and the families their readers make it swap: `(Ok (Pair ts families))`, or the refusal.
+(defun plan (sx: ls/Sess c: od/Checked rs: (Vec ld/Redef) gen: i64) -> (Result (Pair (Vec ld/Retype) (Vec str)) ld/DefRefusal)
+  (try-let ((ts (retypes sx c rs gen)) (fams (reader-families sx ts rs))) (Ok (Pair ts fams))))
+
+;; The generations to emit an input under: its families at `gen`, and each type change's new slot (`d.NAME` at `gen`: emit.livedef).
+(defun emit-families (families: (Vec str) ts: (Vec ld/Retype)) -> (Vec str)
+  (into families (vec (keep (fn (t: ld/Retype) (if (includes? (. t body) families) nil (some (. t body)))) ts))))
+
+;; The first reader family the program made no body of (so it would keep reading the old slot, whose value a retirement drops): refused.
+(defun unswapped (readers: (Vec str) changed: (Vec str)) -> (Option ld/DefRefusal)
+  (match (first (filterv (fn (f: str) (not (includes? f changed))) readers))
+    ((some f) (some (ld/DefRefusal (shown f) (str "a def changes type here, and its reader " (shown f) " has no body in the input's program to swap; it changes type at a restart"))))
+    (nil nil)))
+
+(defun with-readers (families: (Vec str) readers: (Vec str)) -> (Vec str)
+  (reduce (fn (acc: (Vec str) f: str) (if (includes? f acc) acc (conj acc f))) families readers))
+
+;; ---- a program that does not check
+
+;; A checker's refusal of an input that redefines `defs` (the redefined `def`s of the input), with a diagnostic in another definition
+;; (`reader`: the definition and its text, found by the caller, or nil) that mentions one of them: the def's new type does not suit
+;; that reader, so the input is `live/Def` naming it. Nil otherwise (the input's own error is the checker's to show).
+(defun check-refusal (defs: (Vec rc/Def) reader: (Option (Pair str str)) d: dg/Diag shown: str) -> (Option ld/DefRefusal)
+  (match reader
+    (nil nil)
+    ((some [name text])
+     (match (first (filterv (fn (x: rc/Def) (and (not (= (. x name) name)) (mentions? text (. x name)))) defs))
+       (nil nil)
+       ((some x) (some (ld/DefRefusal (. x name) (str (. x name) " changes type here, and its reader " name " would not type-check against it: " shown))))))))
+
+;; Whether `text` names `name` as a symbol (not inside a longer one).
+(defun mentions? :private (text: str name: str) -> bool
+  (let ((n (str-len name)) (sym? (fn (c: i8) -> bool (not (or (= c 32i8) (= c 10i8) (= c 40i8) (= c 41i8) (= c 91i8) (= c 93i8) (= c 9i8) (= c 47i8) (= c 64i8))))))
+    (loop ((from 0))
+      (match (str-find text name from)
+        (nil false)
+        ((some at) (if (and (or (= at 0) (not (sym? (str-byte-at text (- at 1)))))
+                            (or (= (+ at n) (str-len text)) (not (sym? (str-byte-at text (+ at n))))))
+                       true
+                       (recur (+ at 1))))))))
+
+;; The definition of the session's text at line `line` of the program (serve.replcore's numbering), with its text.
+(defun session-reader (merged: (Vec rc/Def) line: i64) -> (Option (Pair str str))
+  (let ((name (rc/def-at-line merged (- line 1))))
+    (match (first (filterv (fn (x: rc/Def) (= (. x name) name)) merged)) ((some x) (some (Pair name (. x text)))) (nil nil))))
+
+;; The definition of a module's text at line `line` (the last that starts at or before it), with its text.
+(defun text-reader (text: str line: i64) -> (Option (Pair str str))
+  (match (rc/classify text)
+    ((rc/Parts ds _ _)
+     (. (reduce (fn (acc: (Pair i64 (Option (Pair str str))) d: rc/Def)
+                  (match (str-find text (. d text) (. acc fst))
+                    (nil acc)
+                    ((some off) (if (<= (line-of text off) line) (Pair (+ off 1) (some (Pair (. d name) (. d text)))) acc))))
+                (Pair 0 nil) ds)
+        snd))
+    (_ nil)))
+
+(defun line-of :private (text: str off: i64) -> i64
+  (+ 1 (count (filterv (fn (i: i64) (= (str-byte-at text i) 10i8)) (vec (range off))))))

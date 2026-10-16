@@ -7,7 +7,7 @@
 ;; calls any more) keeps its slot as it is.
 (ns serve.livetable
   (:require [emit.program :as ep] [emit.names :as en] [types.ty :as ty] [types.scheme :as sc] [types.decls :as td]
-            [types.table :as tb] [own.program :as op] [own.driver :as od] [types.dump.scheme :as ds] [types.display :as tdi]))
+            [types.table :as tb] [own.program :as op] [own.driver :as od] [types.dump.scheme :as ds] [types.display :as tdi] [fib.string :as s]))
 
 ;; A generation added under a tracker: its number, the tracker, the module's name, the bodies it defines, the names of the code
 ;; items that pin it (a closure literal, a closure constant, a vtable: serve.livesplit; empty when it can be retired), and the items
@@ -150,17 +150,29 @@
 (defun family-count (t: Table) -> i64 (count (. t families)))
 ;; ---- defs (package LT4, serve.livedefs)
 
-;; A value a redefinition took out of its slot `slot` (`live.d.NAME`), dropped at a retirement (`value` is the object's address).
-(defstruct RetiredDef (slot: str value: i64))
+;; A value a redefinition took out of its slot `slot` (`live.d.NAME`), dropped at a retirement: `value` is the object's address, dropped
+;; by the session's `live.def-drop` when `drop` is "", else a box's address, dropped by the slot's `drop` function (emit.livedef).
+(defstruct RetiredDef (slot: str value: i64 drop: str))
 
 ;; The defs of a session: each `def`'s type as text by its body name (`d.NAME`, what a redefinition must keep), the values waiting for a
 ;; retirement, the address of the session's drop function (0 before the first redefinition of an object), and the counts: the
 ;; redefinitions applied (a constant's stores included), the old values dropped (freed, destructor included), and the old values that were immortal (a `def` made
 ;; before `main` or static data: never freed).
 ;; `stored`: the initial value (as lIR text) of each constant's live slot as last stored by a session, where it differs from the base's.
-(defstruct DefState (types: (Map str str) retired: (Vec RetiredDef) drop: i64 redefined: i64 dropped: i64 immortal: i64 stored: (Map str str)))
+;; `slots`: the version of each def's slot whose type a redefinition changed, by its body name (emit.livedef: `live.d.NAME.K`); the
+;; generations every program of the session is emitted under carry it (serve.livesess `set-generations`).
+(defstruct DefState (types: (Map str str) retired: (Vec RetiredDef) drop: i64 redefined: i64 dropped: i64 immortal: i64 stored: (Map str str)
+                     slots: (Map str i64)))
 
-(defun def-state-new () -> DefState (DefState {} [] 0 0 0 0 {}))
+(defun def-state-new () -> DefState (DefState {} [] 0 0 0 0 {} {}))
+
+;; `d` with other types, other values waiting and another drop address.
+(defun defs-with (d: DefState types: (Map str str) retired: (Vec RetiredDef) drop: i64) -> DefState
+  (DefState types retired drop (. d redefined) (. d dropped) (. d immortal) (. d stored) (. d slots)))
+
+;; `d` with `n` more redefinitions, `gone` waiting for a retirement, `stored` and `slots` replaced.
+(defun defs-redefined (d: DefState n: i64 gone: (Vec RetiredDef) stored: (Map str str) slots: (Map str i64)) -> DefState
+  (DefState (. d types) (into (. d retired) gone) (. d drop) (+ (. d redefined) n) (. d dropped) (. d immortal) stored slots))
 
 ;; The type of every `def` of `c`'s program as text, by its body name.
 (defun def-types-of (c: od/Checked) -> (Map str str)
@@ -170,3 +182,18 @@
                 ((some t) (assoc acc (en/body-name g (op/BodyDef d) []) (tdi/printer-ty (tdi/printer-new g) t)))
                 (nil acc)))
             {} (range (tb/table-count (. g defs))))))
+
+;; `d` as the base makes it: the base's def types, and every live slot among the base's `names` that the base fills at run time noted as
+;; stored "" (its zero is no constant: a constant redefinition must be stored even when its text is the zero's, `(def x: (Option
+;; (Vec i64)) nil)`).
+(defun defs-of-base (d: DefState c: od/Checked names: (Vec str)) -> DefState
+  (let ((g (. (. c typed) globals)))
+    (let ((constants (reduce (fn (acc: (Set str) i: i64) (if (. (td/g-def g i) constant) (conj acc (str "live." (en/body-name g (op/BodyDef i) []))) acc))
+                             (set-empty) (range (tb/table-count (. g defs))))))
+      (DefState (def-types-of c) (. d retired) (. d drop) (. d redefined) (. d dropped) (. d immortal)
+                (reduce (fn (acc: (Map str str) nm: str)
+                          (if (and (s/starts-with? nm "live.d.") (not (s/ends-with? nm ".box")) (not (s/ends-with? nm ".set")) (not (s/ends-with? nm ".drop"))
+                                   (not (contains? constants nm)))
+                              (assoc acc nm "") acc))
+                        (. d stored) names)
+                (. d slots)))))

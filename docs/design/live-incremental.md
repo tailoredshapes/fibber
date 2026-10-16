@@ -451,7 +451,7 @@ Decisions for the owner:
   thread before `main` runs: the base goes through the driver's front end, which keeps no text), and the program's module set is the
   base's (a module brought in by a later `require` input is `live/NotLoaded` to `load`); (c) **a new function or `impl` of a loaded
   file is accepted** (a family at generation 0, made resident as a session function is, named `routes/extra` in `defined`), a new type
-  or macro too (the checker's rules apply), a new `def` or `extern` refused (`live/Def`, `live/Extern`; since LT4 a `def` is made or redefined, live-meshql.md 10); a `derive` or an `impl` of no
+  or macro too (the checker's rules apply), a new `def` or `extern` refused (`live/Def`, `live/Extern`; since LT4 a `def` is made or redefined, live-meshql.md 10, and a `def` whose type changes swaps its readers with the module's families); a `derive` or an `impl` of no
   head that changed is `live/Unsupported`; (d) **a changed function the running program never reached** (no registered body) swaps into
   the text only, as LV2 (a) says of a generic nobody instantiates; it is not in `swapped`; (e) the per-family rules refusal (`live/
   Signature`, `live/Summary`) is reported at the refused function's definition in the file (`FILE:1:1` until the live bugs' fix, below;

@@ -98,13 +98,21 @@
 #   removed-ignored      a function removed from the loaded file is accepted: its stub stays and    compiler/tests/live/load.sh (the load that
 #                        names a body the text no longer has (LM1, 3.5: live/Removed)               removes `helper` is not refused; the call of
 #                                                                                                   `helper` after it is refused by the checker)
-#   def-slot-plain-store a def's setter `live.d.NAME.set` (emit.program `live-def-setter`, what a       compiler/tests/live/defs.sh --tsan-only (the
+#   def-slot-plain-store a def's setter `live.d.NAME.set` (emit.livedef `live-def-setter`, what a       compiler/tests/live/defs.sh --tsan-only (the
 #                        redefinition stores with) is a plain store, not a release store (LT4)      readers' acquire load against a plain store is
 #                                                                                                   a NEW ThreadSanitizer report)
 #   old-def-freed        a redefinition drops the old value at once, not at a retirement: a thread  compiler/tests/live/defs.sh --socket-only (a
 #                        reading it reads freed memory (LT4, docs/design/live-repl.md 9)            bad sum or a crash under the stress)
 #   init-run-twice       the init function of a new def runs twice (LT4: an initialiser runs once)  compiler/tests/live/defs.sh --socket-only (the
 #                                                                                                   new def's side effect counts 2)
+#   boxed-in-place       a boxed def's setter (a value of more than one word: emit.livedef) writes   compiler/tests/live/defs.sh --tsan-only (the
+#                        the new value into the box readers hold, not into a new box: a reader      writer's store into the box against a reader's
+#                        can see half the old value and half the new (LT4)                          load of it is a NEW ThreadSanitizer report)
+#   retype-no-readers    a def whose type changes gets its new slot but its readers are not swapped compiler/tests/live/defs.sh --socket-only (the
+#                        (serve.liveretype `plan`): resident code reads the old slot and value      labeler's `show-label` is not in `swapped` and
+#                        forever (LT4)                                                              keeps answering the old value)
+#   unswappable-reader-accepted  a type change read by `main` is accepted: main's frame never        compiler/tests/live/defs.sh --socket-only (the
+#                        returns, so it reads the old slot forever (serve.liveretype)               change of `ready-text` is not refused)
 #   warm-skipped         the engine is not warmed before the first connection: the first input      compiler/tests/live/attach.sh (hello's `warm`
 #                        pays the cold front end (LE5, docs/design/live-incremental.md 3.7)         is false; the first input's `reused` is 0)
 #   inspect-runs-input   `inspect` without `value` evaluates the name as an input instead of        compiler/tests/live/attach.sh (the answer
@@ -136,7 +144,7 @@
 # A mutant of lib/ alone (sink-ignored, override-ignored) builds nothing: the case's `roots:` header names the copy's lib, and FIBC runs it.
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|quote-shared|partial-load|load-reads-disk|prefix-dropped|removed-ignored|def-slot-plain-store|old-def-freed|closure-renumbered|vtable-copied|init-run-twice|warm-skipped|inspect-runs-input|child-spawned-anyway|diff-by-text|hash-with-positions|watch-no-load|watch-reruns-on-refusal|rules-at-file-start|type-reads-disk|unheld-held|watch-no-debounce|retire-dynamic-unfollowed}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|quote-shared|partial-load|load-reads-disk|prefix-dropped|removed-ignored|def-slot-plain-store|old-def-freed|boxed-in-place|retype-no-readers|unswappable-reader-accepted|closure-renumbered|vtable-copied|init-run-twice|warm-skipped|inspect-runs-input|child-spawned-anyway|diff-by-text|hash-with-positions|watch-no-load|watch-reruns-on-refusal|rules-at-file-start|type-reads-disk|unheld-held|watch-no-debounce|retire-dynamic-unfollowed}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -206,9 +214,12 @@ case $MODE in
           (result file ns defs [] (refused-all file refusals))' ;;
   load-reads-disk) patch compiler/expand/modules.fib '(visit-source ld ns file (unwrap-or (get (. ld texts) ns) source))' '(visit-source ld ns file source)' ;;
   prefix-dropped) patch compiler/serve/livediff.fib '(let ((prefix (if main "" (str (. (. m spec) ns) ".")))' '(let ((prefix "")' ;;
-  def-slot-plain-store) patch compiler/emit/program.fib '(node/node (la/KAtomicStore la/ScSystem la/ORelease (node/local "v") (node/global slot)))' '(node/store (node/local "v") (node/global slot) nil)' ;;
-  old-def-freed) patch compiler/serve/livedefs.fib '                (note-olds sx todo olds)' '                (try-let ((at (drop-address sx))) (ti/try-map (fn (v: i64) (if (= v 0) (Ok 0) (lj/call at [v]))) olds))
-                (note-olds sx todo (mapv (fn (v: i64) 0) olds))' ;;
+  def-slot-plain-store) patch compiler/emit/livedef.fib '(node/node (la/KAtomicStore la/ScSystem la/ORelease (node/local "v") (node/global slot)))' '(node/store (node/local "v") (node/global slot) nil)' ;;
+  old-def-freed) patch compiler/serve/livedefs.fib '                  (note-olds sx n kinds olds gone)' '                  (try-let ((at (drop-address sx))) (ti/try-map (fn (v: i64) (if (= v 0) (Ok 0) (lj/call at [v]))) olds))
+                  (note-olds sx n kinds (mapv (fn (v: i64) 0) olds) gone)' ;;
+  boxed-in-place) patch compiler/emit/livedef.fib '(f/binding "b" (node/call "malloc" [(node/integer lt/ty-i64 (box-bytes l))]))' '(f/binding "b" (node/load lt/ty-ptr (node/global slot) nil))' ;;
+  retype-no-readers) patch compiler/serve/liveretype.fib '(try-let ((ts (retypes sx c rs gen)) (fams (reader-families sx ts rs))) (Ok (Pair ts fams))))' '(try-let ((ts (retypes sx c rs gen))) (Ok (Pair ts []))))' ;;
+  unswappable-reader-accepted) patch compiler/serve/liveretype.fib '(= fam "f.main") (Err "main (its frame never returns: it is not swapped)")' '(= fam "f.main") (Ok fam)' ;;
   init-run-twice) patch compiler/serve/livedefs.fib '                  (_ (ls/run-void (ls/jit-of sx) init-name)))' '                  (_ (ls/run-void (ls/jit-of sx) init-name)) (_ (ls/run-void (ls/jit-of sx) init-name)))' ;;
   removed-ignored) patch compiler/serve/liveload.fib '    (cond (and (= what "removed") (or (= k "fun") (= k "impl")))' '    (cond (and (= what "never") (or (= k "fun") (= k "impl")))' ;;
   warm-skipped) patch compiler/serve/live.fib '                (do (warm-engine l trace)' '                (do ()' ;;
@@ -255,7 +266,8 @@ case $MODE in
   closure-renumbered|vtable-copied) what="the statics test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/statics.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   quote-shared) what="the quotes test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/quotes.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   def-slot-plain-store) what="the TSAN defs test"; TSAN_OUT="$OUT/tsan" FIB_LIB="$R/lib" "$R/compiler/tests/live/defs.sh" "$F" --tsan-only > "$OUT/test.log" 2>&1; rc=$? ;;
-  old-def-freed|init-run-twice) what="the defs test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/defs.sh" "$F" --socket-only "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
+  boxed-in-place) what="the TSAN defs test"; TSAN_OUT="$OUT/tsan" FIB_LIB="$R/lib" "$R/compiler/tests/live/defs.sh" "$F" --tsan-only > "$OUT/test.log" 2>&1; rc=$? ;;
+  old-def-freed|init-run-twice|retype-no-readers|unswappable-reader-accepted) what="the defs test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/defs.sh" "$F" --socket-only "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
   partial-load|load-reads-disk|prefix-dropped|removed-ignored|rules-at-file-start|type-reads-disk) what="the load test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/load.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   retire-dynamic-unfollowed) what="the retire test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/retire.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   deps-stubbed-by-default|project-paths-not-stubbed) what="the project test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/project.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
