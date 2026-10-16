@@ -43,6 +43,14 @@ The code is in git: tag `seed-1`. docs/rust-legacy.md says how to build it again
 (edition 2021, `cargo fmt`, `clippy -D warnings`, files under 500 lines, no global state) apply to anyone who revives it.
 Ports scheduled, not dropped: `fibref`'s interpreter and heap audit, `fibgen`. `fibc lsp` is present in `compiler/lsp/`.
 
+## Try changes against a running program
+
+`fibc run --live FILE` keeps the program running and `fibc repl --connect PID` attaches (docs/design/live-repl.md, live-incremental.md): `eval`
+redefines a function or `def`, `load FILE` swaps what an edited file changed, `test` runs tests in the process, `watch` does it on save. A
+swap takes 0.3-0.6 s where a rebuild and restart of a real app takes 8-10 s, and is refused (`live/*` codes) when it would break the checker
+or ownership. Use it for the edit-and-see loop, in the compiler's apps and in dependents (meshql-fib's CLAUDE.md is the worked example);
+the verdict is still the ordinary tests and the gate. Live changes are not saved: edit the file too.
+
 ## Commits
 
 - One logical change per commit; the message says what and why.
