@@ -1,0 +1,107 @@
+;; compiler/emit/livedef.fib: the live slots of `def`s (docs/design/live-repl.md 9; LT4 of docs/design/live-meshql.md, whose section 10
+;; has the status), out of emit.program. In live mode a `def` of the program's own modules is read by every body from its slot
+;; `live.d.NAME` with an acquire load and stored by a session with the setter `live.d.NAME.set` (a release store), so that a redefinition
+;; is seen by resident code on its next read. Nothing of this happens outside live mode: a plain emit reads a constant inline and a
+;; run-time def from `def.slot.N`.
+;;   - A value of one word (an integer of 8 bits or more, a float, an object) is the slot's content itself.
+;;   - Any other value (a `bool`'s i1, an `Option` held inline, a `dyn`, a lane vector) is BOXED: the slot holds the address of a box
+;;     of the value's bytes, which the setter makes anew for every store (malloc, the value written, an object in it shared, then the
+;;     box's address stored with release order) and a reader reads through (the address with an acquire load, then the box): a reader
+;;     sees the whole old value or the whole new one, never a mix, and a box is never written once published. `live.d.NAME.drop` frees
+;;     a box a redefinition took out of the slot (the object in it released), at a retirement; a constant's first box is static data
+;;     (`live.d.NAME.box`) and is kept (the drop answers 0).
+;;   - A raw pointer has no slot (it is uncounted: nothing could share or drop what it points at).
+;;   - The slot's VERSION is the session's: a redefinition that changes the type gets a new slot `live.d.NAME.K` (K the generation of
+;;     the input, `Program.live-gens` under the def's body name `d.NAME`), read by the readers the session swaps; the old slot keeps the
+;;     old type for code still running in an old generation.
+(ns emit.livedef
+  (:require [lir.ast :as la] [lir.types :as lt] [emit.node :as node] [emit.function :as f])
+  (:use types.decls own.program emit.value emit.names emit.statics emit.program))
+
+;; Whether a value of lIR type `l` is its slot's content (one word: an atomic load reads it) rather than boxed.
+(defun live-word? (l: LirTy) -> bool
+  (match l ((LirI8) true) ((LirI16) true) ((LirI32) true) ((LirI64) true) ((LirFloat) true) ((LirDouble) true) ((LirPtr) true) (_ false)))
+
+;; The name of the slot of the def whose body is `body`, at version `version` (0: the program's first type).
+(defun live-slot-name (body: str version: i64) -> str
+  (if (= version 0) (str "live." body) (str "live." body "." version)))
+
+;; The slot of a `def` of the program's own modules in live mode: `live.d.NAME` (the body's name with `live.`, and the session's version
+;; when it is not 0); nil outside live mode, in a macro module, for the library's defs and for a raw pointer.
+(defun live-def-slot (p: Program d: i64 l: (Option LirTy)) -> (Option str)
+  (let ((g (program-g p)))
+    (match l
+      ((some t) (if (and (. p live) (not @(. p macro-module)) (program-module? g (. (g-def g d) module)) (not (= t LirRaw)))
+                    (let ((body (body-name g (BodyDef d) []))) (some (live-slot-name body (family-generation p body))))
+                    nil))
+      (nil nil))))
+
+;; The lIR type of a slot holding values of `l`: the value's own, or the box's address.
+(defun live-slot-type (l: LirTy) -> lt/LType (if (live-word? l) (lir-type l) lt/ty-ptr))
+
+;; The live slot of a constant `def` (its constant the slot's initial value, or a static box's address) with its setter (and its box and
+;; drop when boxed), made once in the program; nil when the def is not a constant or has no slot. A body that reads the def makes them
+;; (emit.lower.objects `live-read`), and so does a session's request for the def's initialiser (emit.compile `request-def`: the session
+;; compares the new constant with the resident one).
+(defun live-const-slot (p: Program d: i64) -> (Option str)
+  (match (get @(. p def-values) d)
+    ((some (DefValue (some e) (some l)))
+     (match (live-def-slot p d (some l))
+       (nil nil)
+       ((some slot) (do (if (live-word? l)
+                            (statics-item (. p statics) slot (live-global slot (lir-type l) e))
+                            (do (statics-item (. p statics) (str slot ".box") (live-global (str slot ".box") (lir-type l) e))
+                                (statics-item (. p statics) slot (live-global slot lt/ty-ptr (node/global (str slot ".box"))))))
+                        (doseq [it (live-def-items slot l (if (live-word? l) nil (some (str slot ".box"))))]
+                          (statics-item (. p statics) (item-name it) it))
+                        (some slot)))))
+    (_ nil)))
+
+(defun live-global :private (name: str ty: lt/LType init: la/LExpr) -> la/LItem
+  (la/ItGlobal (la/LGlobalDef name ty init false (la/LModifiers la/lk-internal false) 0 false)))
+
+(defun item-name :private (it: la/LItem) -> str
+  (match it ((la/ItDefine fd) (. fd name)) ((la/ItGlobal g) (. g name)) (_ "")))
+
+;; The functions of a slot: its setter, and for a boxed value its drop (`box` names the constant's static box, which the drop keeps).
+(defun live-def-items (slot: str l: LirTy box: (Option str)) -> (Vec la/LItem)
+  (if (live-word? l) [(live-def-setter slot (lir-type l))] [(boxed-setter slot l) (boxed-drop slot l box)]))
+
+;; `live.d.NAME.set V`: the release store of a new value into the slot `slot` (external: the prune keeps it, a session calls it).
+(defun live-def-setter (slot: str ty: lt/LType) -> la/LItem
+  (la/ItDefine (f/external (f/make (str slot ".set") nil [(Pair "v" ty)] lt/cc-c
+                                   [(f/block "entry" [(node/node (la/KAtomicStore la/ScSystem la/ORelease (node/local "v") (node/global slot))) (node/ret nil)])]))))
+
+;; The bytes of a box of `l`: its bits in whole words (at least one); malloc's alignment (16) covers every access, made with align 8.
+(defun box-bytes :private (l: LirTy) -> i64 (max 8 (* 8 (quot (+ (quot (+ (lir-ty-bits l) 7) 8) 7) 8))))
+
+;; The object a value of `l` holds, if its type can hold one: an `Option` of an object (its payload, null for `nil`), a `dyn` (its data).
+(defun box-object :private (l: LirTy v: la/LExpr) -> (Option la/LExpr)
+  (match l
+    ((LirOpt of) (if (= of LirPtr) (some (node/extract v 1)) nil))
+    ((LirDyn) (some (node/extract v 0)))
+    (_ nil)))
+
+;; `live.d.NAME.set V` of a boxed value: a new box, the value written into it, its object shared (every thread reads it: its counts are
+;; atomic from now on), then the box's address stored with release order. A box is never written again once published.
+(defun boxed-setter :private (slot: str l: LirTy) -> la/LItem
+  (la/ItDefine (f/external (f/make (str slot ".set") nil [(Pair "v" (lir-type l))] lt/cc-c
+    [(f/block "entry"
+       [(f/bound [(f/binding "b" (node/call "malloc" [(node/integer lt/ty-i64 (box-bytes l))]))]
+                 (into (into [(node/store (node/local "v") (node/local "b") (some 8))]
+                             (match (box-object l (node/local "v")) ((some o) [(node/call "fib.share" [o])]) (nil [])))
+                       [(node/node (la/KAtomicStore la/ScSystem la/ORelease (node/local "b") (node/global slot))) (node/ret nil)]))])]))))
+
+;; `live.d.NAME.drop A` (A a box's address, as a session holds it): the object in the box released, the box freed; 1, or 0 for the
+;; constant's static box `box`, which is kept.
+(defun boxed-drop :private (slot: str l: LirTy box: (Option str)) -> la/LItem
+  (let ((p (node/cast la/CIntToPtr lt/ty-ptr (node/local "a"))))
+    (la/ItDefine (f/external (f/make (str slot ".drop") (some lt/ty-i64) [(Pair "a" lt/ty-i64)] lt/cc-c
+      (into [(f/block "entry" [(f/bound [(f/binding "p" p)]
+                                        [(match box
+                                           ((some b) (node/conditional (node/compare-int la/IEq (node/local "p") (node/global b)) "keep" "free"))
+                                           (nil (node/branch "free")))])])
+             (f/block "free" [(f/bound [(f/binding "v" (node/load (lir-type l) (node/local "p") (some 8)))]
+                                       (into (match (box-object l (node/local "v")) ((some o) [(node/call "fib.release" [o])]) (nil []))
+                                             [(node/call "free" [(node/local "p")]) (node/ret (some (node/integer lt/ty-i64 1)))]))])]
+            (match box ((some _) [(f/block "keep" [(node/ret (some (node/integer lt/ty-i64 0)))])]) (nil []))))))))

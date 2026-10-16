@@ -11,7 +11,7 @@
 ;; session text, the table and the program as they were. A redefined macro is accepted: its users' expansions changed, so they swap.
 (ns serve.liveswap
   (:use lir.ast)
-  (:require [serve.livesess :as ls] [serve.livetable :as lt] [serve.livedefs :as ld] [serve.liveexpr :as le] [serve.liverules :as lr] [serve.replcore :as rc] [serve.diag :as dg] [serve.incr :as inc] [serve.livediff :as ldf]
+  (:require [serve.livesess :as ls] [serve.livetable :as lt] [serve.livedefs :as ld] [serve.liveretype :as lrt] [serve.liveexpr :as le] [serve.liverules :as lr] [serve.replcore :as rc] [serve.diag :as dg] [serve.incr :as inc] [serve.livediff :as ldf]
             [emit.compile :as ec] [emit.program :as ep] [live.extract :as ex] [own.driver :as od] [types.init :as ti] [fib.string :as s]))
 
 ;; ---- what the text may not redefine
@@ -177,8 +177,21 @@
        (let ((at (input-start @(. (. sx rc) defs) merged defs))
              (fr (rc/front-texts (. sx eng) (. sx rts) (rc/source-of cs merged "") "yes" true @(. sx texts))))
          (match (. fr checked)
-           ((Err ds) (unchanged sx (ls/Refused (shown-input sx ds at merged defs) ds "check" "")))
+           ((Err ds) (unchanged sx (match (retype-check sx ds at merged defs)
+                                     ((some r) (def-refused r))
+                                     (nil (ls/Refused (shown-input sx ds at merged defs) ds "check" "")))))
            ((Ok c) (checked-input sx defs clauses (Pair cs merged) at c fr (changes-of sx olds fr)))))))))
+
+;; A program that does not check because an input's redefined `def` changed type under a reader of it (a diagnostic in a definition of
+;; the session before the input that names the def): `live/Def` naming the reader (serve.liveretype `check-refusal`).
+(defun retype-check :private (sx: ls/Sess ds: (Vec dg/Diag) at: i64 merged: (Vec rc/Def) defs: (Vec rc/Def)) -> (Option ld/DefRefusal)
+  (let ((redefined (filterv (fn (d: rc/Def) (and (ld/def-text? d) (replaced? sx d))) defs)))
+    (if (empty? redefined)
+        nil
+        (first (vec (keep (fn (d: dg/Diag) (if (and (= (. d file) rc/repl-file) (< (. d line) at))
+                                              (lrt/check-refusal redefined (lrt/session-reader merged (. d line)) d (rc/show-diag d at merged))
+                                              nil))
+                          ds))))))
 
 ;; A definition input whose program checked: the rules, the emit of the changed families under the next generation, the shape of the
 ;; redefined `def`s, then applied.
@@ -186,30 +199,38 @@
                                fr: inc/Front ch: ldf/Changes) -> ls/Answer
   (let ((new-fns (new-functions sx defs)) (gen (+ 1 (. @(. sx table) generation))) (merged (. text snd))
         (redefs (ld/redefs-of (filterv (fn (d: rc/Def) (replaced? sx d)) defs) nil)))
-    (match (rules-refusal sx c redefs)
-      ((some a) (unchanged sx a))
-      (nil (match (emit-swapping sx c (. fr stats) (into (requests-of sx new-fns (. ch families) (. ch impls)) (ld/def-requests redefs)) (. ch families) gen)
-             ((Err ds) (unchanged sx (ls/Refused (shown-input sx ds at merged defs) ds (match (first ds) ((some d) (. d code)) (nil "check")) "")))
-             ((Ok [made changed]) (match (ld/shape-refusal made redefs)
-                                    ((some r) (unchanged sx (def-refused r)))
-                                    (nil (apply-input sx made text defs clauses new-fns changed gen redefs (. ch hashes))))))))))
+    (match (rules-refusal sx c redefs gen)
+      ((Err a) (unchanged sx a))
+      ((Ok [ts readers])
+       (let ((families (lrt/with-readers (. ch families) readers)))
+         (match (emit-swapping sx c (. fr stats) (into (requests-of sx new-fns families (. ch impls)) (ld/def-requests redefs)) (lrt/emit-families families ts) gen)
+           ((Err ds) (unchanged sx (ls/Refused (shown-input sx ds at merged defs) ds (match (first ds) ((some d) (. d code)) (nil "check")) "")))
+           ((Ok [made changed]) (match (or-refusal (ld/shape-refusal sx made redefs ts) (lrt/unswapped readers changed))
+                                  ((some r) (unchanged sx (def-refused r)))
+                                  (nil (apply-input sx made text defs clauses new-fns changed gen (Pair redefs ts) (. ch hashes)))))))))))
 
-;; The rules of the live table (serve.liverules), then the type rule of a redefined `def` (serve.livedefs).
-(defun rules-refusal :private (sx: ls/Sess c: od/Checked redefs: (Vec ld/Redef)) -> (Option ls/Answer)
+;; The first of two refusals.
+(defun or-refusal (a: (Option ld/DefRefusal) b: (Option ld/DefRefusal)) -> (Option ld/DefRefusal) (match a ((some r) (some r)) (nil b)))
+
+;; The rules of the live table (serve.liverules), then the redefined `def`s whose type changes (serve.liveretype `plan`): their new slots
+;; and the families of their readers, to swap with the input's.
+(defun rules-refusal :private (sx: ls/Sess c: od/Checked redefs: (Vec ld/Redef) gen: i64) -> (Result (Pair (Vec ld/Retype) (Vec str)) ls/Answer)
   (match (lr/check-rules @(. sx table) c (session-defs sx))
-    ((some r) (some (refused (. r code) (. r message) (. r hint))))
-    (nil (match (ld/type-refusal sx c redefs) ((some r) (some (def-refused r))) (nil nil)))))
+    ((some r) (Err (refused (. r code) (. r message) (. r hint))))
+    (nil (match (lrt/plan sx c redefs gen) ((Err r) (Err (def-refused r))) ((Ok p) (Ok p))))))
 
 (defun def-refused (r: ld/DefRefusal) -> ls/Answer (refused "live/Def" (. r message) ":restart"))
 
 ;; The accepted input applied: the text, the slots, the new functions, the swap; the table after. A cut that fails is reported as
 ;; broken with the text restored (what was added stays resident but unreachable).
 (defun apply-input :private (sx: ls/Sess made: ls/Made text: (Pair (Vec str) (Vec rc/Def)) defs: (Vec rc/Def) clauses: (Vec str) new-fns: (Vec str)
-                             changed: (Vec str) gen: i64 redefs: (Vec ld/Redef) hashes: (Vec (Pair str i64))) -> ls/Answer
-  (let ((snap (Pair @(. (. sx rc) clauses) @(. (. sx rc) defs))) (names (mapv (fn (d: rc/Def) (. d name)) defs)) (cs (. text fst)) (merged (. text snd)))
+                             changed: (Vec str) gen: i64 redefs: (Pair (Vec ld/Redef) (Vec ld/Retype)) hashes: (Vec (Pair str i64))) -> ls/Answer
+  (let ((snap (Pair @(. (. sx rc) clauses) @(. (. sx rc) defs))) (names (mapv (fn (d: rc/Def) (. d name)) defs)) (cs (. text fst)) (merged (. text snd))
+        (dsnap @(. sx defs)))
     (do (set! (. (. sx rc) clauses) cs) (set! (. (. sx rc) defs) merged) (set! (. sx defined) (+ @(. sx defined) (count defs)))
-        (match (try-let ((_ (ld/make-slots sx made)) (_ (ld/apply-redefs sx made redefs)) (_ (ls/make-functions sx made new-fns))) (swap-all sx made changed gen))
+        (match (try-let ((_ (apply-defs sx made redefs gen)) (_ (ls/make-functions sx made new-fns))) (swap-all sx made changed gen))
           ((Err m) (do (set! (. (. sx rc) clauses) (. snap fst)) (set! (. (. sx rc) defs) (. snap snd)) (set! (. sx defined) (- @(. sx defined) (count defs)))
+                       (set! (. sx defs) dsnap)
                        (unchanged sx (ls/Broken m))))
           ((Ok [jit patch])
            (do (set! (. sx table) (lt/with-hashes (lt/table-after @(. sx table) (ls/live-bodies sx) (. made c) changed gen) (ldf/hash-map-of hashes)))
@@ -220,6 +241,14 @@
                    (ls/Swapped (filterv (fn (nm: str) (not (includes? (str "f." nm) changed))) (into names clauses))
                                (mapv shown-family changed) gen
                                (ls/Times (. (. made stats) total-ms) (. made emit-ms) jit patch) (. made stats)))))))))
+
+;; The `def`s of an accepted input applied (serve.livedefs): the new slots of the type changes made the session's, the new defs made
+;; (not those slots: their initialisers are the new ones), the constants stored, the redefinitions applied.
+(defun apply-defs (sx: ls/Sess made: ls/Made redefs: (Pair (Vec ld/Redef) (Vec ld/Retype)) gen: i64) -> (Result unit str)
+  (let ((ts (. redefs snd)))
+    (do (ld/note-slots sx ts gen)
+        (try-let ((_ (ld/make-slots-skipping sx made (reduce (fn (acc: (Set str) t: ld/Retype) (conj acc (. t new))) (set-empty) ts))))
+          (ld/apply-redefs sx made (. redefs fst) ts)))))
 
 ;; A family as the answer names it: a function by its name, a method by its body's name.
 (defun shown-family (family: str) -> str

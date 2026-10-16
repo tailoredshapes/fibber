@@ -4,19 +4,23 @@
 ;; Emitted with FIB_LIVE=1, a `def` of the program is read by every body with an acquire load of its slot `live.d.NAME` and stored by
 ;; `live.d.NAME.set` (a release store: emit.program `live-def-slot`, `live-def-setter`, what a session's redefinition calls); its lIR gets
 ;; compiler/tests/live/defs-swapper.lir appended (scripts/tsan.sh TSAN_APPEND): `fib_live_defs_swap N` stores 5 and 3 into `limit`
-;; through the setter N times. Eight spawned workers read `limit` through a function meanwhile and count a value that is neither; the
-;; result is that count: 0. A plain store in the setter (scripts/mutant-live.sh def-slot-plain-store) is a report.
+;; through the setter N times, and `nil` and `(some 5)` into `pair` (an `Option`, held in a box: emit.livedef; each store a new box
+;; published with a release store). Eight spawned workers read both through functions meanwhile and count a value that is neither (a
+;; torn `pair` is `(some 0)`); the result is that count: 0. A plain store in the setter (scripts/mutant-live.sh def-slot-plain-store)
+;; is a report, and so is a box written in place (boxed-in-place).
 ;;   defs-tsan SWAPS READS     (default 300 swaps, 20000 reads per thread)
 (extern fib_live_defs_swap :private (i64) -> i64)
 
 (def limit: i64 3)
+(def pair: (Option i64) (some 5))
 
 (defun read-limit () -> i64 limit)
+(defun read-pair () -> i64 (match pair ((some x) x) (nil -1)))
 
 (defun worker (k: i64) -> i64
   (loop ((i 0) (b 0))
     (if (< i k)
-        (let ((l (read-limit))) (recur (+ i 1) (if (or (= l 3) (= l 5)) b (+ b 1))))
+        (let ((l (read-limit)) (p (read-pair))) (recur (+ i 1) (if (and (or (= l 3) (= l 5)) (or (= p 5) (= p -1))) b (+ b 1))))
         b)))
 
 (defun arg-or (i: i64 default: i64) -> i64

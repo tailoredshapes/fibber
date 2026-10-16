@@ -4,7 +4,7 @@
 ;; Below the call protocol: what it needs from above (`method_value`, `builtin_value`) it calls through the hub.
 (ns emit.lower.objects
   (:use types.ty types.scheme types.ast types.decls types.init own.program emit.value emit.layout emit.mono emit.ir emit.objects emit.statics
-        emit.program emit.lower.cx emit.lower.ops)
+        emit.program emit.livedef emit.lower.cx emit.lower.ops)
   (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; The object of allocation site `e`: on the heap through `fib.alloc`, or a `STACK` object in the site's entry-block slot (§8.2), as the
@@ -248,21 +248,26 @@
     ((some v) (some (Pair v true)))
     (nil (match (get @(. p def-slots) d) ((some v) (some (Pair v false))) (nil nil)))))
 
-;; LT4 (docs/design/live-repl.md 9): in live mode, outside a def's initialiser (which reads the value the program text gives), a `def` of
-;; the program's own with a slot (emit.program `live-def-slot`) is read with an acquire load of `live.d.NAME`, so that a redefinition's
-;; release store (`live.d.NAME.set`) is seen on the next read. A constant's slot and setter are made where it is first read, the slot
-;; holding the constant. Nothing of this happens outside live mode.
+;; LT4 (docs/design/live-repl.md 9): in live mode a `def` of the program's own with a slot (emit.livedef `live-def-slot`) is read with an
+;; acquire load of `live.d.NAME`, so that a redefinition's release store (`live.d.NAME.set`) is seen on the next read; a boxed value (not
+;; one word) through the box's address so loaded. A constant's slot and setter are made where it is first read, the slot holding the
+;; constant. A def's initialiser reads the value the program text gives (a constant inline, a run-time def's word slot as it is), except
+;; a boxed run-time def, read through its box. Nothing of this happens outside live mode.
 (defun live-read :private (cx: LowerCx d: i64) -> (Option V)
-  (let ((p (. cx p)))
-    (if (or (not (. p live)) (match (. (. cx inst) key) ((BodyDef _) true) (_ false)))
+  (let ((p (. cx p)) (init (match (. (. cx inst) key) ((BodyDef _) true) (_ false))))
+    (if (not (. p live))
         nil
         (match (def-entry p d)
           ((some [(DefValue (some e) (some l)) constant])
            (match (live-def-slot p d (some l))
              (nil nil)
              ((some slot)
-              (do (when constant (do (live-const-slot p d) ()))
-                  (some (fb-val (. cx b) (nx/node (la/KAtomicLoad la/ScSystem la/OAcquire (lir-type l) (nx/global slot))) l))))))
+              (cond (and init (or constant (live-word? l))) nil
+                    (live-word? l) (do (when constant (do (live-const-slot p d) ()))
+                                       (some (fb-val (. cx b) (nx/node (la/KAtomicLoad la/ScSystem la/OAcquire (lir-type l) (nx/global slot))) l)))
+                    :else (do (when constant (do (live-const-slot p d) ()))
+                              (let ((at (fb-val (. cx b) (nx/node (la/KAtomicLoad la/ScSystem la/OAcquire lt/ty-ptr (nx/global slot))) LirPtr)))
+                                (some (fb-val (. cx b) (nx/load (lir-type l) (v-expr at) (some 8)) l))))))))
           (_ nil)))))
 
 (defun def-value-plain :private (cx: LowerCx d: i64) -> (Result V str)

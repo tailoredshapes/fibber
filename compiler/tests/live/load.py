@@ -6,7 +6,8 @@ src/routes.fib (a -I session), edited on disk between loads.
 usage: load.py FIBC [ROOT]    Exit 0 when every check held. Each check prints `ok NAME` or `FAIL NAME: why`.
 What is tested: an edit of `route` loaded: `swapped: ["routes/route"]`, the session's next call and the app's loop (a resident caller)
 answer the edit; a bad edit is refused with a diagnostic at src/routes.fib:L:C and nothing changes; a file with one refused definition
-(an arity change of `route`, which app.fib calls; a def whose type changes, live/Def, LT4) applies nothing: the good edit of `greet` in the same file is
+(an arity change of `route`, which app.fib calls; a def whose type changes under a reader, `route`, that would not check: live/Def
+naming it, LT4) applies nothing: the good edit of `greet` in the same file is
 not swapped and the answer lists the refusal; a removed function is live/Removed and still callable; `reload` after a second edit swaps
 again and `reload` with no change swaps nothing; an edit of a comment only swaps nothing (LM2), of a def's comment redefines nothing; a half-saved file on disk is not seen by an expression input nor `:type` (the override), `status`
 says the file is stale; a new function in the loaded file is defined and then swapped; a file whose module the program lacks is
@@ -147,9 +148,10 @@ l = c.load('src/routes.fib')
 check('an arity change of a function app.fib calls is refused by the checker', l.get('ok') is False and l.get('shown') and re.match(r'<session>:\d+:\d+: route takes 2 argument\(s\), got 1 \[type/\w+\] \(in the definition of main\)', l['shown'][0]), l)
 check('the good edit of the same file is not swapped', c.value('(r/greet "a")') == '"hello a"' and c.ask(op='status').get('generation') == 1, c.value('(r/greet "a")'))
 write_routes(edited('(defun greet (name: str) -> str (str "hello " name))', '(defun greet (name: str) -> str (str "hi " name))',
-                    edited('(def prefix: str "route")', '(def prefix: i64 5)')))
+                    edited('(def prefix: str "route")', '(def prefix: (fn () str) (fn () "route"))')))
 l = c.load('src/routes.fib')
-check('a def whose type changes is live/Def at its position', l.get('ok') is False and l.get('code') == 'live/Def' and re.match(r'src/routes\.fib:5:1: prefix is a def of type str in the running program and i64 here.*\[live/Def\]', shown_at(l, 'live/Def'))
+check('a def whose type changes under a reader that does not check is live/Def at its position', l.get('ok') is False and l.get('code') == 'live/Def'
+      and re.match(r'src/routes\.fib:5:1: prefix changes type here, and its reader route would not type-check.*\[live/Def\]', shown_at(l, 'live/Def'))
       and l.get('hint') == ':restart' and l['diagnostics'][0]['line'] == 5, l)
 check('nothing of the file was applied', c.value('(r/greet "a")') == '"hello a"' and c.value('(r/route "x")') == '"route! x"' and c.ask(op='status').get('generation') == 1, c.value('(r/greet "a")'))
 
