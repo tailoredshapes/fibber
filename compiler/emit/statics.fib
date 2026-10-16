@@ -66,10 +66,12 @@
   @(. st keywords))
 
 ;; The address of the immortal closure whose code is `code` (§8.4). Rust: statics.rs:72 Statics::closure
-(defun statics-closure (st: Statics code: str tid: i64) -> str
+;; `by-content` (live mode, LE2 of docs/design/live-incremental.md 2.2 item 3): the name is `clo.CODE`, the same in every program of a
+;; session, so a cut declares the base's closure object instead of making another; else `clo.N` by the program's count, as before.
+(defun statics-closure (st: Statics code: str tid: i64 by-content: bool) -> str
   (if-some [n (get @(. st closure-index) code)]
     n
-    (let ((name (str-join ["@clo." (str (count @(. st closures)))])))
+    (let ((name (if by-content (str "@clo." code) (str-join ["@clo." (str (count @(. st closures)))]))))
       (do (cell-update! (. st closures) (fn (closures: (Vec StaticClosure)) (conj closures (StaticClosure name code tid))))
           (cell-update! (. st closure-index) (fn (names: (Map str str)) (assoc names code name)))
           name))))
@@ -79,11 +81,12 @@
   (mapv (fn (c: StaticClosure) (. c name)) @(. st closures)))
 
 ;; The address of the vtable named `name` with these slots (§8.5), or of the one registered under that name before.
+;; `by-content` (live mode, LE2): the global is `vt.NAME`, the same in every program of a session; else `vt.N` by the program's count.
 ;; Rust: statics.rs:89 Statics::vtable
-(defun statics-vtable (st: Statics name: str slots: (Vec str)) -> str
+(defun statics-vtable (st: Statics name: str slots: (Vec str) by-content: bool) -> str
   (if-some [n (get @(. st vtable-index) name)]
     n
-    (let ((global (str-join ["@vt." (str (count @(. st vtables)))])))
+    (let ((global (if by-content (str "@vt." name) (str-join ["@vt." (str (count @(. st vtables)))]))))
       (do (cell-update! (. st vtables) (fn (vtables: (Vec StaticVtable)) (conj vtables (StaticVtable global slots))))
           (cell-update! (. st vtable-index) (fn (names: (Map str str)) (assoc names name global)))
           global))))
@@ -92,13 +95,18 @@
 (defun statics-has-vtable (st: Statics name: str) -> bool
   (contains? @(. st vtable-index) name))
 
-;; Whether `name` is a static numbered per program: a closure constant `clo.N`, a vtable `vt.N` (above, by the count of the program's
-;; own cells) or a quoted form `q.N` (emit.program `program-fresh-quote`, by the program's own counter). Two programs of a live session
-;; give the same name to different things (until LE2 shares them by content, docs/design/live-incremental.md 2.2 item 3), so the session
-;; copies such a static into every cut and never exports one from a cut, declares one from the base or keeps a def value that names one
-;; (serve.livesess, serve.livesplit, emit.defs.cache). A string `str.N`, a keyword and a constant `def.N` are numbered by the session.
+;; Whether `name` is a static numbered per program: a quoted form `q.N` (emit.program `program-fresh-quote`, by the program's own
+;; counter), and outside live mode a closure constant `clo.N` and a vtable `vt.N` (above). Two programs of a live session give the same
+;; such name to different things, so the session copies one into every cut and never exports one from a cut, declares one from the base
+;; or keeps a def value that names one (serve.livesess, serve.livesplit, emit.defs.cache). In live mode closures and vtables are named
+;; by content (`clo.CODE`, `vt.NAME`: `shared-static?`, LE2 of docs/design/live-incremental.md 2.2 item 3) and shared by name as a
+;; string `str.N`, a keyword and a constant `def.N` are.
 (defun program-static? (name: str) -> bool
-  (or (s/starts-with? name "clo.") (s/starts-with? name "vt.") (s/starts-with? name "q.")))
+  (s/starts-with? name "q."))
+
+;; Whether `name` is a closure constant or a vtable: in live mode named by what it holds, so one name is one object in the session.
+(defun shared-static? (name: str) -> bool
+  (or (s/starts-with? name "clo.") (s/starts-with? name "vt.")))
 
 ;; An address name without its `@`.
 (defun unat :private (name: str) -> str

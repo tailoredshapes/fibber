@@ -12,8 +12,10 @@
 ;; base defines: the cut (live.extract) then declared the base's under that name and the input read another def's value (seen in
 ;; compiler/tests/live/defcache.py's `extra` scenario: a `(Vec str)` of two read fib.http's header names). The numbering holds under
 ;; FIB_LIVE_EMIT=off too, which turns off the replay alone;
-;; (3) a value that names a static numbered per program (`@clo.N`, `@vt.N`, `@q.N`: emit.statics `program-static?`; each program numbers
-;; its own until LE2) is never kept, and is evaluated by every program. FIB_LIVE_EMIT=verify (emit.program `live-emit-mode`) evaluates a
+;; (3) a value that names a static numbered per program (`@q.N`: emit.statics `program-static?`) is never kept, and is evaluated by
+;; every program; nor is one that names a closure constant or a vtable (`@clo.CODE`, `@vt.NAME`, named by content since LE2, so the
+;; value evaluated again names the base's object and the cut declares it): a replay would put the name in a later program whose
+;; constant-evaluation module (emit.defs.jit) has neither the static nor the code it names, since the queue mode lowers no resident body. FIB_LIVE_EMIT=verify (emit.program `live-emit-mode`) evaluates a
 ;; hit again and compares (emit.defs.jit).
 (ns emit.defs.cache
   (:require [lir.ast :as la] [lir.print :as print] [lir.rewrite :as rw] [emit.statics :as st] [fib.string :as s])
@@ -34,7 +36,7 @@
     ((some e) (if (= (. e source) source) (some e) nil))
     (nil nil)))
 
-(defun own-static? :private (name: str) -> bool (st/program-static? name))
+(defun own-static? :private (name: str) -> bool (or (st/program-static? name) (st/shared-static? name)))
 
 ;; Whether an expression names a static of the program's own (a closure constant, a vtable, a quoted form) anywhere in it.
 (defun names-static? :private (e: la/LExpr) -> bool
@@ -45,7 +47,7 @@
 (defun item-static? :private (it: la/LItem) -> bool
   (match it ((la/ItGlobal g) (names-static? (. g init))) (_ false)))
 
-;; Whether the value, or a constant it reaches, names a static of the program's own (`@clo.N`, `@vt.N`, `@q.N`): not kept (LE2).
+;; Whether the value, or a constant it reaches, names a quoted form, a closure constant or a vtable: not kept (3 above).
 (defun holds-statics? (v: DefValue items: (Vec la/LItem)) -> bool
   (or (match (. v expr) ((some e) (names-static? e)) (nil false))
       (some? (find-first item-static? items))))

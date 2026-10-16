@@ -524,3 +524,21 @@ Decisions for the owner:
   generation 1; with `(unused 1)` first, the first redefinition is already `swapped`. Answering `swapped` would name a swap that did
   not happen (no generation, no patch); the answer is the truth of what the session did.
 
+- **Status 2026-10-15, LE2** (emit.statics `statics-closure`/`statics-vtable` with `by-content`, `program-static?` now the quoted forms
+  alone, `shared-static?`; serve.livesess `export-resident`, `shared-statics`, `note-cut`; serve.livesplit `code-static?` and `code-refs`
+  over the base; serve.live `status` with `statics: true` and `cut` in an input's answer under `FIB_LIVE_DEBUG=cut`; the test
+  `compiler/tests/live/statics.sh` (statics.py over statics-app.fib, 28 checks), the mutants `closure-renumbered` and `vtable-copied` of
+  `scripts/mutant-live.sh`). In live mode a closure constant is `clo.CODE` (`clo.f.inc1.owned`) and a vtable `vt.NAME`
+  (`vt.Shape.vt.Sq`); plain mode keeps `clo.N` and `vt.N`, and a plain emit is byte-identical (the golden checks of the passes, stubs.sh,
+  and `emit` of three programs compared with the build before). The base's closures and vtables join the session's index, a cut
+  declares them, and a new one (a closure of a function no program made a value of, the vtable of an instance an input adds) is exported
+  with the data and declared by every later cut. Where it differs from 2.2 item 3: (a) **the closure and vtable cells stay the
+  program's own**; the names agree by content, which is what the sharing was for, and a program renders only the statics it uses: the
+  session's cells would put into every program a closure whose code the queue mode does not lower there, and the module a constant def
+  is evaluated in (emit.defs.jit) would name it; (b) **a def value that names a closure or a vtable is still not kept by LE1's cache**
+  (emit.defs.cache): it is evaluated by every program, and since LE2 the value names the base's closure, which the cut declares (a def
+  read through its live slot is the base's value anyway). Keeping it would put `@clo.CODE` into a later program's constant-evaluation
+  module, which has neither the static nor its code; a replay that also brings the closure and its code is the lift; (c) a closure of a
+  generation's literal (`clo.l.NAME.gK.N`) goes with that generation's code (never exported), as before. Measured on meshql-fib's
+  `scripts/live-demo.sh` (4 runs each, the build before and after interleaved, lilnas at load 2.5 to 10): the swaps' `emit_ms` median 45
+  before and 41.5 after (39 to 55, 39 to 62), the wall time of a swap input median 320 ms before and 325 after; no change past the noise.

@@ -54,11 +54,13 @@
    ;; the loaded modules' text by module name (serve.liveload, LM1): every program of the session reads it instead of the file
    texts: (Cell (Map str str))
    ;; the defs' types, the values redefinitions took out of their slots and the counts (serve.livedefs, LT4)
-   defs: (Cell lt/DefState)))
+   defs: (Cell lt/DefState)
+   ;; the names the cuts of the current input defined (`add-cut`, `add-generation`), in the answer under FIB_LIVE_DEBUG=cut (LE2's test)
+   cut: (Cell (Vec str))))
 
 (defun sess-new (rts: roots/Roots file: str opt: i64 out: str) -> Sess
   (Sess (rc/session-new) (inc/engine-new) rts file opt out (ep/tables-new) (cell nil) (cell {}) (cell 0) (cell 0) (cell []) (cell 0) (cell {}) (cell nil)
-        (cell (lt/table-new)) (cell 0) (cell {}) (cell {}) (cell (lt/def-state-new))))
+        (cell (lt/table-new)) (cell 0) (cell {}) (cell {}) (cell (lt/def-state-new)) (cell [])))
 
 ;; What an input came to. `Swapped`: definitions made and bodies swapped, the session's generation and the swap's figures (ms).
 (defenum Answer
@@ -95,8 +97,10 @@
 
 ;; The tables of one program of the session: the session's objects (the type ids every walker reads), strings and keywords (plain data
 ;; and ids, the same in every program, declared from the base by name), the generations and the bodies of live mode, the constant defs'
-;; values and the runtime's items (LE1, docs/design/live-incremental.md 2.2), and closures and vtables of the program's own: those name
-;; code, and a later program does not emit the code of a closure or a vtable it does not make, so it must not carry the base's.
+;; values and the runtime's items (LE1, docs/design/live-incremental.md 2.2). Closures and vtables are named by content in live mode
+;; (`clo.CODE`, `vt.NAME`: emit.statics, LE2), so every program of the session names one object alike and a cut declares the base's;
+;; their cells are still the program's own, so a program renders only the statics it uses: a session's cells would put in every program
+;; a closure whose code the queue mode never lowers there, and the module a constant def is evaluated in (emit.defs.jit) would name it.
 (defun program-tables :private (sx: Sess) -> ep/Tables
   (let ((s (. (. sx tables) statics)))
     (ep/Tables (. (. sx tables) objects)
@@ -119,8 +123,8 @@
 ;; Every stubbed body the session's programs made, by family (emit.live `add-stub`).
 (defun live-bodies (sx: Sess) -> (Map str (Vec ep/LiveBody)) @(. (. sx tables) bodies))
 
-;; Whether a name is a program's own static (a closure `clo.N`, a vtable `vt.N`, a quoted form `q.N`: emit.statics `program-static?`):
-;; copied by every cut, never declared from the base.
+;; Whether a name is a program's own static (a quoted form `q.N`: emit.statics `program-static?`): copied by every cut, never declared
+;; from the base. A closure constant and a vtable are named by content in live mode (LE2): the base's are declared by name.
 (defun own-static? :private (name: str) -> bool (st/program-static? name))
 
 (defun base-index :private (m: LModule) -> (Map str LItem)
@@ -241,7 +245,7 @@
 ;; library's items, which the base holds too, are not of a family and are dropped).
 (defun note-refs (sx: Sess m: LModule) -> (Vec str)
   (let ((index (lt/family-index (live-bodies sx))))
-    (let ((noted (filterv (fn (p: (Pair str (Vec str))) (some? (lt/family-of-name index (. p fst)))) (vec (sp/code-refs m)))))
+    (let ((noted (filterv (fn (p: (Pair str (Vec str))) (some? (lt/family-of-name index (. p fst)))) (vec (sp/code-refs m @(. sx base))))))
       (do (set! (. sx refs) (reduce (fn (acc: (Map str (Vec str)) p: (Pair str (Vec str))) (assoc acc (. p fst) (. p snd))) @(. sx refs) noted))
           (mapv (fn (p: (Pair str (Vec str))) (. p fst)) noted)))))
 
@@ -312,12 +316,15 @@
       (lt/registered? (live-bodies sx) (lt/strip-generation name))
       (ex/session-function? (mapv (fn (d: rc/Def) (. d name)) @(. (. sx rc) defs)) (lt/strip-generation name))))
 
-;; The items of a cut that later inputs must find in the base (a slot, a function's stub, slot and body) exported.
+;; The items of a cut that later inputs must find in the base (a slot, a function's stub, slot and body; a closure constant or a vtable,
+;; named by content in live mode, LE2) exported.
 (defun export-resident :private (sx: Sess items: (Vec LItem)) -> (Vec LItem)
   (mapv (fn (it: LItem)
           (match it
             ((ItDefine fd) (if (resident-name? sx (. fd name)) (ItDefine (LFunction (. fd name) (. fd ty) (. fd params) (. fd blocks) (LModifiers LkExternal false) (. fd pos))) it))
-            ((ItGlobal g) (if (resident-name? sx (. g name)) (ItGlobal (LGlobalDef (. g name) (. g ty) (. g init) (. g constant) (LModifiers LkExternal false) (. g pos) (. g shared))) it))
+            ((ItGlobal g) (if (or (resident-name? sx (. g name)) (and (st/shared-static? (. g name)) (not (sp/code-static? (. g name)))))
+                              (ItGlobal (LGlobalDef (. g name) (. g ty) (. g init) (. g constant) (LModifiers LkExternal false) (. g pos) (. g shared)))
+                              it))
             (_ it)))
         items))
 
@@ -331,10 +338,23 @@
                   (grew (Ok (> (. rows snd) @(. sx rows))))
                   (cut (ex/extract @(. sx base) m {} roots (into (if grew (. rows fst) []) extra)))
                   (module (Ok (LModule (export-resident sx (into (. cut items) tail)))))
+                  (_ (Ok (note-cut sx module)))
                   (rt (lj/add-tracked j name module))
                   (_ (if grew (run-void j (str "live.types.append." nr)) (Ok ()))))
           (do (set! (. sx rows) (max @(. sx rows) (. rows snd)))
               (Ok (Added name rt module)))))))
+
+;; The names a cut defines, noted for the input's answer (FIB_LIVE_DEBUG=cut).
+(defun note-cut :private (sx: Sess m: LModule) -> unit
+  (set! (. sx cut) (into @(. sx cut) (vec (keep (fn (it: LItem) (match it ((ItDefine fd) (some (. fd name))) ((ItGlobal g) (some (. g name))) (_ nil))) (. m items))))))
+
+;; The names the cuts of the input so far defined, and the record cleared for the next input (serve.live).
+(defun take-cut (sx: Sess) -> (Vec str) (let ((names @(. sx cut))) (do (set! (. sx cut) []) names)))
+(defun cut-debug? () -> bool (= (unix/getenv "FIB_LIVE_DEBUG") (some "cut")))
+
+;; The closure constants and the vtables of the running program (named by content in live mode, LE2): `status` with `statics: true`.
+(defun shared-statics (sx: Sess) -> (Vec str)
+  (vec (sort (filterv st/shared-static? (vec (keys @(. sx base)))))))
 
 ;; A module kept (for good, or until a retirement): its exported items join the base, so later inputs declare them; the refs of its
 ;; code noted (the names of the items noted are the answer).
@@ -357,6 +377,7 @@
                   (grew (Ok (> (. rows snd) @(. sx rows))))
                   (cut (ex/extract @(. sx base) m {} roots (if grew (. rows fst) [])))
                   (parts (Ok (sp/split (LModule (export-resident sx (. cut items))) gen)))
+                  (_ (Ok (do (note-cut sx (. parts data)) (note-cut sx (. parts code)))))
                   (_ (if (sp/defines? (. parts data)) (lj/add-resident j (str name ".data") (. parts data)) (Ok ())))
                   (rt (lj/add-tracked j name (. parts code)))
                   (_ (if grew (run-void j (str "live.types.append." nr)) (Ok ()))))

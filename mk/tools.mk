@@ -71,6 +71,10 @@ tool_sh-live-testlive := $(T)/live/testlive.sh $(F_ABS) | $(T)/live/testlive.sh 
 # swapped at the REPL (the `expect` macro quotes its form) and the base's scenarios run after it, `specs` itself swapped between three bindings and one
 # (serve.livesplit `split` keeps them with the code, never exports them); the unit of the names (a nested literal's generation; about a minute)
 tool_sh-live-quotes := $(T)/live/quotes.sh $(F_ABS) | $(T)/live/quotes.sh $(T)/live/quotes.py $(T)/live/unit-livetable.fib $(T)/live/test-app.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/emit/statics.fib compiler/emit/defs/cache.fib
+# LE2 (docs/design/live-incremental.md 2.2 item 3): closures and vtables named by content in live mode (`clo.CODE`, `vt.NAME`, emit.statics): a body
+# swapped to call through a def's closures and to make a closure of its own, a method swap, a new instance in an input; the cuts declare the base's
+# (FIB_LIVE_DEBUG=cut) and `status` holds one of each (about ten seconds)
+tool_sh-live-statics := $(T)/live/statics.sh $(F_ABS) | $(T)/live/statics.sh $(T)/live/statics.py $(T)/live/statics-app.fib $(wildcard compiler/serve/live*.fib) compiler/emit/statics.fib compiler/emit/defs/cache.fib
 # LM1 (docs/design/live-incremental.md 3): `load` and `reload` of a live session (serve.liveload; the engine's module text overrides, serve.incr `Job.texts`
 # and expand.modules `try-load-texts`; emit.compile `BodyRequest.module`): load-app.fib with load-routes.fib edited on disk and loaded through the socket
 # and the terminal client; all or nothing, live/Removed, live/NotLoaded, the override against a half-saved file (about two minutes)
@@ -124,7 +128,7 @@ tool_sh-live-defs := $(T)/live/defs.sh $(F_ABS) --socket-only | $(T)/live/defs.s
 tool_sh-live-defs-tsan := env TSAN_OUT=$(TOOLS_OUT)/live-defs-tsan $(T)/live/defs.sh $(F_ABS) --tsan-only | $(T)/live/defs.sh $(T)/live/defs-tsan.fib $(T)/live/defs-swapper.lir scripts/tsan.sh scripts/tsan-baseline.txt compiler/emit/program.fib compiler/emit/lower/objects.fib
 TOOLS_FULL := $(TOOLS_QUICK) unit-api units-all units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-emit-runtime sh-emit-defs-order sh-stack-stack \
-  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap sh-live-defcache sh-live-queue sh-live-test sh-live-testlive sh-live-watch sh-live-quotes sh-live-load sh-live-stress sh-live-stress-tsan sh-live-defs sh-live-defs-tsan \
+  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap sh-live-defcache sh-live-queue sh-live-test sh-live-testlive sh-live-watch sh-live-quotes sh-live-statics sh-live-load sh-live-stress sh-live-stress-tsan sh-live-defs sh-live-defs-tsan \
   $(PERSIST_STAMPS) sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
   sh-native-l1-unit $(LIRO_STAMPS) jit-selfhosted-threads sh-native-a64-sibcall sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
 # The command is every word up to the `|`, the inputs every word after it.
