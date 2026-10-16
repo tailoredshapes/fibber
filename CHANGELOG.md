@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.17
+
+- Live development: `fibc run --live FILE` runs a program whose functions can be redefined while it runs, and `fibc repl --connect PID`
+  attaches to it (socket `$XDG_RUNTIME_DIR/fib-live/PID.sock`, JSON lines). `eval` redefines a function or a `def`; `load FILE` and
+  `reload` swap what an edited file changed (detected by expanded form); `test` runs tests inside the process (`fibc test --live`,
+  `fibc test --connect`); `watch` does it on save; `inspect` and `type` answer from the session's tables; `pause`/`resume`/`retire` free
+  old generations at quiescence. A swap takes 0.3 to 0.6 s on a 300-module application (a rebuild and restart: 8 to 10 s) and is refused
+  (`live/*` codes) when it would break the checker or ownership. Redefinable `def` is live-only; ahead-of-time builds keep immutable
+  defs. A `def` may change type when its readers still check, and multi-word values are redefinable. Design: `docs/design/live-repl.md`,
+  `live-incremental.md`, `live-meshql.md`.
+- Retirement follows indirect calls (function values, `dyn` methods, library callbacks) to every generation a parked thread may return
+  into, fixing a use-after-free of retired code.
+- `fib.os.live` and the project rule for live modules (`FIB_LIVE_ROOTS`, `--live-deps`); `FIB_LIVE_EMIT=verify`, `FIB_LIVE_DEBUG=cut`.
+- Gate: the live suites (`sh-live-*` stamps) and their mutants (`scripts/mutant-live.sh`).
+
 ## 0.1.16
 
 - The type and ownership checker keeps the checked library between programs: `emit --batch`,
