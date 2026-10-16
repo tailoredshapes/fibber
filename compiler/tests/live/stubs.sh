@@ -1,6 +1,9 @@
 #!/bin/bash
 # compiler/tests/live/stubs.sh: the checks of live mode's stubs and slots (package LV0 of docs/design/live-repl.md section 6; emit.live).
-#   compiler/tests/live/stubs.sh [FIBC] [--update] [--quick] [-j N]     FIBC is stage 2 (default $FIBC); -j N cases at a time (default 4)
+#   compiler/tests/live/stubs.sh [FIBC] [--update] [--quick] [--part core|ownership|sample] [-j N]     FIBC is stage 2 (default $FIBC);
+#   -j N cases at a time (default 4); --part runs one part (core: checks 1 and 2, as --quick; ownership or sample: one table of check 3),
+#   a stamp each in mk/tools.mk: the three tables of cases/ownership at one case at a time are about 1000 s of a 4-vCPU hosted runner,
+#   more than one stamp's 900 s (CI of 37dabc68 timed the whole script out in check 3); without --part, every check.
 # 1. hello's stubs: `FIB_LIVE=1 F emit hello.fib` holds one stub and one slot per function of the program's own module (hello.fib's
 #    `main` and `greet`) and none for the library's; the stubs and slots, exactly, are hello-stubs.golden (--update rewrites it; read the
 #    diff). Without FIB_LIVE the same emit holds no stub and no slot: the lIR of a program is the same as before live mode existed.
@@ -20,12 +23,13 @@
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
-update=; quick=; jobs=4; fibc=${FIBC:-}
+update=; quick=; part=all; jobs=4; fibc=${FIBC:-}
 while [ $# -gt 0 ]; do
-  case $1 in --update) update=1 ;; --quick) quick=1 ;; -j) jobs=${2:?-j needs a number}; shift ;; *) fibc=$1 ;; esac
+  case $1 in --update) update=1 ;; --quick) quick=1 ;; --part) part=${2:?--part needs core, ownership or sample}; shift ;; -j) jobs=${2:?-j needs a number}; shift ;; *) fibc=$1 ;; esac
   shift
 done
-[ -x "$fibc" ] || { echo "usage: stubs.sh FIBC [--update] [--quick] [-j N] (or FIBC in the environment)"; exit 2; }
+case $part in all|core|ownership|sample) ;; *) echo "stubs.sh: --part is core, ownership or sample, not $part"; exit 2 ;; esac
+[ -x "$fibc" ] || { echo "usage: stubs.sh FIBC [--update] [--quick] [--part core|ownership|sample] [-j N] (or FIBC in the environment)"; exit 2; }
 export FIB_LIB=${FIB_LIB:-$root/lib}
 unset FIB_LIVE
 out=${TMPDIR:-/tmp}/live-stubs-$$; mkdir -p "$out"; trap 'rm -rf "$out"' EXIT
@@ -33,6 +37,7 @@ cd "$root" || exit 2
 bad=0
 run() { (ulimit -v 16000000; "$@"); }
 
+if [ "$part" = all ] || [ "$part" = core ]; then
 # 1. hello
 if ! FIB_LIVE=1 run "$fibc" emit -I "$here" "$here/hello.fib" > "$out/hello.live.lir" 2> "$out/hello.live.err"; then echo "FAIL hello: emit --live failed"; head -5 "$out/hello.live.err"; bad=1; fi
 if ! run "$fibc" emit -I "$here" "$here/hello.fib" > "$out/hello.plain.lir" 2> "$out/hello.plain.err"; then echo "FAIL hello: emit failed"; head -5 "$out/hello.plain.err"; bad=1; fi
@@ -62,8 +67,10 @@ else echo "FAIL deep recursion under FIB_LIVE=1 (got [$r], plain [$plain]): $(he
 r=$(run "$fibc" run --live "$here/deep.fib" 2> /dev/null | tr '\n' ' ')
 if [ "$r" = "$plain" ]; then echo "ok run --live: $r"; else echo "FAIL run --live: [$r]"; bad=1; fi
 
+fi
+
 # 3. the tables
-if [ -z "$quick" ]; then
+if [ -z "$quick" ] && [ "$part" != core ]; then
   stdlib_names() { (cd cases/stdlib && for e in $(LC_ALL=C ls); do if [ -f "$e" ]; then [[ $e == *.fib ]] && echo "$e" || true; elif [ -f "$e/main.fib" ]; then echo "$e"; fi; done); }
   n=$(stdlib_names | wc -l); step=$(( n / 100 > 0 ? n / 100 : 1 ))
   sample=$({ stdlib_names | awk -v k="$step" 'NR % k == 0'; sed -n 's|^cases/stdlib/\([^ ]*\) .*|\1|p' scripts/ci-stage2.expected | sed 's|/main.fib$||'
@@ -71,9 +78,11 @@ if [ -z "$quick" ]; then
   rows() { awk 'NR > 1 && NF >= 2 && $2 != "" && $1 != "" && $0 !~ /^[0-9]+ cases:/ && $0 !~ /^$/ { print $1 }' "$1"; }  # the case names of a table
   table() { # table NAME DIR [--only ..]: the case table of a directory, plain, catching and live
     local name=$1 dir=$2; shift 2
-    run "$fibc" cases "$@" -j "$jobs" > "$out/$name.plain" 2>&1
-    FIB_CATCH=all run "$fibc" cases "$@" -j "$jobs" > "$out/$name.catch" 2>&1
-    FIB_LIVE=1 run "$fibc" cases "$@" -j "$jobs" > "$out/$name.live" 2>&1
+    # the three runs are independent: side by side (the stamp's wall time is the longest of them, not the sum)
+    run "$fibc" cases "$@" -j "$jobs" > "$out/$name.plain" 2>&1 &
+    FIB_CATCH=all run "$fibc" cases "$@" -j "$jobs" > "$out/$name.catch" 2>&1 &
+    FIB_LIVE=1 run "$fibc" cases "$@" -j "$jobs" > "$out/$name.live" 2>&1 &
+    wait
     if diff -u "$out/$name.catch" "$out/$name.live" > "$out/$name.diff"; then echo "ok $name: the same table with stubs as without ($(rows "$out/$name.live" | wc -l) rows; $(tail -n 1 "$out/$name.live"))"
     else echo "FAIL $name: the tables differ with the stubs"; grep '^[-+][0-9]' "$out/$name.diff" | head -20; bad=1; fi
     diff "$out/$name.plain" "$out/$name.catch" | grep -v '^> [0-9]* cases:' | sed -n "s|^> \([^ ]*\) .*|$dir/\1|p" | LC_ALL=C sort -u > "$out/$name.catching"
@@ -81,9 +90,9 @@ if [ -z "$quick" ]; then
     if diff "$out/$name.expected" "$out/$name.catching" > "$out/$name.cdiff"; then echo "ok $name: the catching convention changes the rows catching.expected lists ($(wc -l < "$out/$name.catching"))"
     else echo "FAIL $name: the rows the catching convention changes are not those of catching.expected"; cat "$out/$name.cdiff"; bad=1; fi
   }
-  table ownership cases/ownership cases/ownership
+  if [ "$part" = all ] || [ "$part" = ownership ]; then table ownership cases/ownership cases/ownership; fi
   # shellcheck disable=SC2086
-  table sample cases/stdlib cases/stdlib --only $sample
+  if [ "$part" = all ] || [ "$part" = sample ]; then table sample cases/stdlib cases/stdlib --only $sample; fi
 fi
 [ "$bad" = 0 ] && echo "live stubs: ok" || echo "live stubs: FAILED"
 exit "$bad"

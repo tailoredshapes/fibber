@@ -81,14 +81,16 @@
 
 ;; The helpers the swap calls through native.call (fibber cannot make an atomic store to an address of its own): all `ccc`.
 ;;   live.rt.store SLOT V         seq_cst store of V as a pointer
-;;   live.rt.store-two-step SLOT V   null first, then V: the planted fault `two-step` (a call between the two stores calls address 0)
+;;   live.rt.store-two-step SLOT V   null first, then V: the planted fault `two-step` (a call between the two stores calls address 0);
+;;                                the swapping thread yields between them, so that a worker runs inside the window even when the threads
+;;                                outnumber the cores (16 threads on the 3 cores of a hosted macOS runner never hit the bare window)
 ;;   live.rt.fetch-add P D        atomicrmw add, the old value
 ;;   live.rt.load P               seq_cst load
 ;;   live.rt.yield                sched_yield, for the wait loop
 (defun helpers-source () -> str
   "(declare sched_yield i32 ())
 (define (live.rt.store void) ((ptr slot) (i64 v)) (block entry (atomic-store seq_cst (inttoptr ptr v) slot) (ret)))
-(define (live.rt.store-two-step void) ((ptr slot) (i64 v)) (block entry (atomic-store seq_cst (ptr null) slot) (atomic-store seq_cst (inttoptr ptr v) slot) (ret)))
+(define (live.rt.store-two-step void) ((ptr slot) (i64 v)) (block entry (atomic-store seq_cst (ptr null) slot) (call @sched_yield) (atomic-store seq_cst (inttoptr ptr v) slot) (ret)))
 (define (live.rt.fetch-add i64) ((ptr p) (i64 d)) (block entry (ret (atomicrmw add seq_cst p d))))
 (define (live.rt.load i64) ((ptr p)) (block entry (ret (atomic-load seq_cst i64 p))))
 (define (live.rt.yield void) () (block entry (call @sched_yield) (ret)))

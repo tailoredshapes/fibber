@@ -4,12 +4,13 @@ docs/design/live-incremental.md 2.2 and 4; emit.defs.cache, emit.program `DefCac
 against defcache-app.fib, an HTTP app whose handler reads six constant defs of every shape (an array, a struct with a string, an Option,
 a scalar, a str, a named function as a value) and forty constant records.
 usage: defcache.py FIBC [ROOT]    Exit 0 when every check held. Each check prints `ok NAME` or `FAIL NAME: why`.
-What is tested, with the cache on (the default), FIB_LIVE_EMIT=verify and FIB_LIVE_EMIT=off, one app each:
-  - the handler swapped three times reads every def the same through every generation, and expression inputs read the same values;
+What is tested, with the cache on (the default), FIB_LIVE_EMIT=verify and FIB_LIVE_EMIT=off, one app each, the three side by side:
+  - the handler swapped three times reads every def the same through every generation, and expression inputs read the same values
+    (after every swap with the cache on; after the last under verify and off, where each input is a whole emit);
     the def holding a function value (LE2's guard: never kept) follows a swap of its function through the running program's closure;
   - a required module (`extra`, written beside the app) whose constant defs are edited on disk between two inputs: the next input reads
     the new definitions (the key is the body name AND the lowered initialiser: a changed def is a miss, never a stale replay);
-  - the answers of the three apps agree byte for byte (values, HTTP bodies, codes), so the cache changes nothing but time, and under
+  - the answers of the three apps agree byte for byte (values, HTTP bodies, codes; every input the verify and off apps were given), so the cache changes nothing but time, and under
     `verify` no input is refused (every replayed value equals its fresh evaluation). The `extra` scenario under `off` also pins the
     session-wide numbering of constants (emit.program `DefCache.next`): before LE1 an input numbered its constants from 0, and the
     required module's `tags` took the name of a constant the base defines, so the input read fib.http's header names instead;
@@ -18,7 +19,7 @@ What is tested, with the cache on (the default), FIB_LIVE_EMIT=verify and FIB_LI
 The mutants of scripts/mutant-live.sh that must make this fail: defcache-stale (the edited module's old values are read),
 defcache-no-items (a replayed value names a constant the program lacks: the input is refused), defcache-verify-blind (under verify a
 wrong replay is not refused: the edited module's old values are read under verify)."""
-import json, os, shutil, socket, subprocess, sys, tempfile, time, urllib.request, urllib.error
+import json, os, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request, urllib.error
 
 fibc = os.path.abspath(sys.argv[1])
 root = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else os.getcwd()
@@ -119,6 +120,7 @@ def transcript(mode):
     check('%s: hello generation 0' % tag, h.get('generation') == 0, h)
     note('base /defs', get(a.port, '/defs'))
     check('%s: the base reads the defs' % tag, rec[-1][1] == (200, 'v0 ' + DEFS), rec[-1][1])
+    expected = dict(zip(READS, ['[2 3 5 7 11 13]', '"ada"', '36', '7', '3', '"hello"', '30', '40', '3360', '27', '"k39"']))
     for n, text in enumerate(HANDLES, 1):
         s = c.eval(text)
         ok = s.get('ok') and s.get('swapped') == ['handle'] and s.get('generation') == n
@@ -126,12 +128,14 @@ def transcript(mode):
         if ok: emits.append(s['swap']['emit_ms'])
         note('swap %d /defs' % n, get(a.port, '/defs'))
         check('%s: generation %d reads the same defs' % (tag, n), rec[-1][1] == (200, 'v%d %s' % (n, DEFS)), rec[-1][1])
-        for r in READS:
-            v = c.eval(r)
-            note('swap %d read %s' % (n, r), (v.get('ok'), v.get('value'), v.get('code')))
-    expected = dict(zip(READS, ['[2 3 5 7 11 13]', '"ada"', '36', '7', '3', '"hello"', '30', '40', '3360', '27', '"k39"']))
-    reads = [(k[len('swap 3 read '):], v) for k, v in rec if k.startswith('swap 3 read ')]
-    check('%s: expression inputs read every def' % tag, len(reads) == len(READS) and all(v == (True, expected[k], None) for k, v in reads), reads)
+        # the expressions after every swap with the cache on, after the last one only under verify and off: there every input is a
+        # whole emit (about 3 s here, 10 s on an M1 Ultra), and 33 of them made the stamp outlast 900 s on the hosted runners
+        if mode is None or n == len(HANDLES):
+            for r in READS:
+                v = c.eval(r)
+                note('swap %d read %s' % (n, r), (v.get('ok'), v.get('value'), v.get('code')))
+            reads = [(k[len('swap %d read ' % n):], v) for k, v in rec if k.startswith('swap %d read ' % n)]
+            check('%s: expression inputs read every def after swap %d' % (tag, n), len(reads) == len(READS) and all(v == (True, expected[k], None) for k, v in reads), reads)
     # the def holding a function value follows a swap of its function (the closure constant's code is the stub)
     s = c.eval('(defun score (n: i64) -> i64 (* n 100))')
     check('%s: swap score' % tag, s.get('swapped') == ['score'] and s.get('generation') == 4, s)
@@ -157,11 +161,31 @@ def transcript(mode):
     check('%s: program ended' % tag, code == 0 and a.stdout().splitlines()[-1] == '0', (code, a.stdout()[-300:], a.stderr()[-300:]))
     return rec, emits, a
 
-on, on_emits, _ = transcript(None)
-verify, verify_emits, _ = transcript('verify')
-off, off_emits, _ = transcript('off')
-check('cache on and off agree on every answer', on is not None and on == off, [p for p in zip(on or [], off or []) if p[0] != p[1]][:5])
-check('verify agrees with the cache on', on is not None and on == verify, [p for p in zip(on or [], verify or []) if p[0] != p[1]][:5])
+# The three apps run side by side (each in a directory of its own, on a port of its own): one after another they were over the
+# 900 s of a stamp on a 4-vCPU hosted runner (CI of 37dabc68), where `verify` and `off` lower the whole program for every input.
+def run_mode(mode, results):
+    t0 = time.monotonic()
+    try: results[mode] = transcript(mode)
+    except Exception as e:   # an answer missing (None) or not JSON: the app died or hung; the record is lost
+        check('%s: the transcript ran' % (mode or 'on'), False, repr(e)); results[mode] = (None, [], None)
+    print('%s: %.0f s' % (mode or 'on', time.monotonic() - t0))
+
+results = {}
+threads = [threading.Thread(target=run_mode, args=(m, results)) for m in (None, 'verify', 'off')]
+for t in threads: t.start()
+for t in threads: t.join()
+on, on_emits, _ = results[None]
+verify, verify_emits, _ = results['verify']
+off, off_emits, _ = results['off']
+def agree(name, a, b):
+    """every answer of `b` is the cache-on app's answer to the same input (`b` has the reads of the last swap only)"""
+    da = dict(a or [])
+    keys = [k for k, _ in (b or [])]
+    check(name, a is not None and b is not None and len(set(keys)) == len(keys) and all(k in da and da[k] == v for k, v in b),
+          [(k, da.get(k), v) for k, v in (b or []) if da.get(k) != v][:5])
+
+agree('cache on and off agree on every answer', on, off)
+agree('verify agrees with the cache on', on, verify)
 print('emit_ms of the three swaps: on %s, verify %s, off %s' % (on_emits, verify_emits, off_emits))
 if len(on_emits) == 3 and len(off_emits) == 3:
     on_med, off_med = sorted(on_emits)[1], sorted(off_emits)[1]
