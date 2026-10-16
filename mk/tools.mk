@@ -40,7 +40,11 @@ tool_sh-repl-run := $(T)/repl/run.sh $(F_ABS) | $(wildcard $(T)/repl/*)
 tool_sh-serve-run := $(T)/serve/run.sh $(F_ABS) | $(wildcard $(T)/serve/*)
 # live mode (docs/design/live-repl.md): LV0's stubs and slots (hello's golden, the deep recursion, the case tables with and without --live), and the
 # resident-session prototype's checks (compiler/live, built as a tool that links LLVM: about 3 minutes)
-tool_sh-live-stubs := $(T)/live/stubs.sh $(F_ABS) -j $(CASE_JOBS) | $(T)/live/stubs.sh $(T)/live/hello.fib $(T)/live/deep.fib $(T)/live/hello-stubs.golden compiler/emit/live.fib
+# The stubs test is three stamps (stubs.sh --part): the golden and the deep recursion, then each table (three runs of a case directory, plain,
+# catching and live): whole, it was one stamp of about 1000 s at CASE_JOBS=1 on a 4-vCPU hosted runner, over TOOLS_TIMEOUT.
+tool_sh-live-stubs := $(T)/live/stubs.sh $(F_ABS) --part core | $(T)/live/stubs.sh $(T)/live/hello.fib $(T)/live/deep.fib $(T)/live/hello-stubs.golden compiler/emit/live.fib
+tool_sh-live-stubs-own := $(T)/live/stubs.sh $(F_ABS) --part ownership -j $(CASE_JOBS) | $(T)/live/stubs.sh $(T)/live/catching.expected compiler/emit/live.fib
+tool_sh-live-stubs-sample := $(T)/live/stubs.sh $(F_ABS) --part sample -j $(CASE_JOBS) | $(T)/live/stubs.sh $(T)/live/catching.expected compiler/emit/live.fib
 tool_sh-live-run := $(T)/live/run.sh $(F_ABS) | $(wildcard $(T)/live/*) $(wildcard compiler/live/*.fib) compiler/live.fib
 # LT3 (docs/design/live-meshql.md 4): the live module rule in a project (a fixture project with a git dependency: the project's modules are live, the
 # libraries' under --live-deps); LT1 (3.2): fib.test.run's argv override and report sink (the collected report is the child's, byte for byte)
@@ -132,7 +136,7 @@ tool_sh-live-defs := $(T)/live/defs.sh $(F_ABS) --socket-only | $(T)/live/defs.s
 tool_sh-live-defs-tsan := env TSAN_OUT=$(TOOLS_OUT)/live-defs-tsan $(T)/live/defs.sh $(F_ABS) --tsan-only | $(T)/live/defs.sh $(T)/live/defs-tsan.fib $(T)/live/defs-swapper.lir scripts/tsan.sh scripts/tsan-baseline.txt compiler/emit/program.fib compiler/emit/livedef.fib compiler/emit/lower/objects.fib
 TOOLS_FULL := $(TOOLS_QUICK) unit-api units-all units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-emit-runtime sh-emit-defs-order sh-stack-stack \
-  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap sh-live-defcache sh-live-queue sh-live-test sh-live-testlive sh-live-watch sh-live-quotes sh-live-statics sh-live-load sh-live-stress sh-live-stress-tsan sh-live-defs sh-live-defs-tsan sh-live-retire \
+  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-stubs-own sh-live-stubs-sample sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap sh-live-defcache sh-live-queue sh-live-test sh-live-testlive sh-live-watch sh-live-quotes sh-live-statics sh-live-load sh-live-stress sh-live-stress-tsan sh-live-defs sh-live-defs-tsan sh-live-retire \
   $(PERSIST_STAMPS) sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
   sh-native-l1-unit $(LIRO_STAMPS) jit-selfhosted-threads sh-native-a64-sibcall sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
 # The command is every word up to the `|`, the inputs every word after it.
