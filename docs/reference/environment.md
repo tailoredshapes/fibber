@@ -41,12 +41,12 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LIRO_STATS` | [compiler/fibc.fib:80](../../compiler/fibc.fib#L80) |
 | `FIB_LIRO_UNITS` | [compiler/native/liro/partition.fib:37](../../compiler/native/liro/partition.fib#L37) |
 | `FIB_LIVE` | [compiler/driver/testlive.fib:89](../../compiler/driver/testlive.fib#L89) |
-| `FIB_LIVE_DEBUG` | [compiler/serve/livesess.fib:351](../../compiler/serve/livesess.fib#L351) |
+| `FIB_LIVE_DEBUG` | [compiler/serve/livesess.fib:352](../../compiler/serve/livesess.fib#L352) |
 | `FIB_LIVE_DEPS` | [compiler/fibc.fib:74](../../compiler/fibc.fib#L74) |
 | `FIB_LIVE_EMIT` | [compiler/emit/program.fib:85](../../compiler/emit/program.fib#L85) |
 | `FIB_LIVE_LIBS` | [compiler/fibc.fib:123](../../compiler/fibc.fib#L123) |
 | `FIB_LIVE_OWN_UID` | [compiler/serve/livesock.fib:80](../../compiler/serve/livesock.fib#L80) |
-| `FIB_LIVE_QUEUE` | [compiler/emit/program.fib:266](../../compiler/emit/program.fib#L266) |
+| `FIB_LIVE_QUEUE` | [compiler/emit/program.fib:238](../../compiler/emit/program.fib#L238) |
 | `FIB_LIVE_ROOTS` | [compiler/driver/front.fib:68](../../compiler/driver/front.fib#L68) |
 | `FIB_LIVE_SOCKET` | [compiler/serve/live.fib:351](../../compiler/serve/live.fib#L351) |
 | `FIB_LIVE_WITH` | [compiler/fibc.fib:76](../../compiler/fibc.fib#L76) |
