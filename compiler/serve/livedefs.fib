@@ -252,14 +252,14 @@
           (do (set! (. sx defs) (lt/DefState (. d types) (. d retired) at (. d redefined) (. d dropped) (. d immortal) (. d stored)))
               (Ok at))))))
 
-;; The slots read by the code of the families in `bearing` (those a parked thread can be in: serve.liveretire `pause-bearing`).
+;; The slots read by the code in `bearing` (the families and other code a parked thread can be in: serve.livereach `bearing`).
 (defun slots-read-by :private (sx: ls/Sess bearing: (Set str)) -> (Set str)
   (let ((index (lt/family-index (ls/live-bodies sx))))
     (reduce (fn (acc: (Set str) p: (Pair str (Vec str)))
-              (match (lt/family-of-name index (. p fst))
-                ((some fam) (if (contains? bearing fam) (reduce (fn (a: (Set str) r: str) (if (s/starts-with? r "live.d.") (conj a r) a)) acc (. p snd)) acc))
-                (nil acc)))
-            (set-empty) (vec (ls/refs sx)))))
+              (if (contains? bearing (unwrap-or (lt/family-of-name index (. p fst)) (. p fst)))
+                  (reduce (fn (a: (Set str) r: str) (if (s/starts-with? r "live.d.") (conj a r) a)) acc (. p snd))
+                  acc))
+            (set-empty) (vec (. (ls/reach sx) calls)))))
 
 ;; At a retirement (the program quiescent): every old value on the list dropped, unless a family a parked thread can be in reads its
 ;; slot (that one waits for the next retirement).

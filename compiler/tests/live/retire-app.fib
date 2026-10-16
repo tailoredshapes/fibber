@@ -1,0 +1,41 @@
+(ns main (:require [fib.unix :as u] [fib.os.live :as live]))
+;; The program of compiler/tests/live/retire.sh: what running state may hold into a generation that a retirement frees
+;; (docs/design/live-incremental.md 7). Two shapes:
+;;   - a closure made by a swapped body and kept after the swap: in an atom (`adder`), in a def (`held`), run by a spawned thread
+;;     (`ticker`); the generation that made it is swapped away and retired, then the closure is called.
+;;   - a frame: the worker's `step` reaches its only pause point through a function value read from the heap (`hook` holds `park`),
+;;     not by a call the code names, so a thread parked there is inside `step`'s generation; `step` is swapped while it is parked and
+;;     the retirement must not free the generation under it.
+;; `main` waits until `stop` is set through the attach socket.
+(def stop: (Atom bool) (atom false))
+(def rounds: (Atom i64) (atom 0))
+(def ticks: (Atom i64) (atom 0))
+
+;; The worker's only pause point, reached through `hook`.
+(defun park () -> unit (do (live/pause-point) (u/sleep-ns 1000000) ()))
+(def hook: (Atom (fn () unit)) (atom park))
+
+;; One round: the hook called from the heap, then n + 1 (a swap makes it n + 2).
+(defun step (n: i64) -> i64 (do (@hook) (+ n 1)))
+
+(defun worker () -> i64
+  (loop ((n 0)) (if @stop n (let ((m (step n))) (do (reset! rounds m) (recur m))))))
+
+;; Calls and arithmetic, nothing held: its old generations are freed.
+(defun bump (n: i64) -> i64 (+ n 1))
+
+;; A closure over `k`; the swaps change what it adds.
+(defun make-adder (k: i64) -> (fn (i64) i64) (fn (x: i64) -> i64 (+ x k)))
+(def adder: (Atom (fn (i64) i64)) (atom (make-adder 1)))
+
+;; A spawned thread running a closure the body makes: it counts until `stop`, passing a pause point.
+(defun start-ticker (by: i64) -> (Task i64)
+  (spawn (fn () -> i64 (loop ((n 0)) (if @stop n (do (swap! ticks + by) (live/pause-point) (u/sleep-ns 2000000) (recur (+ n 1))))))))
+
+(defun main () -> i64
+  (let ((w (spawn (fn () -> i64 (worker)))))
+    (do (println "app: started")
+        (when @stop (do (start-ticker 0) (bump 0) ()))   ; never: reached, so the base emits them
+        (loop () (if @stop () (do (live/pause-point) (u/sleep-ns 20000000) (recur))))
+        (println (str "app: stopped after " (join w) " rounds"))
+        0)))

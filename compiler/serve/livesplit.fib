@@ -8,15 +8,11 @@
 ;; the rest. The DATA part, everything else, is added to the session for good, exported. A code part that holds a literal or a
 ;; closure constant is never retired (`pins`): a heap closure made by the body may still name it, and nothing walks the heap to tell
 ;; (the lift is in the design's status). A code part of bodies alone is retired at quiescence (serve.liveretire).
-;; The refs of a module (`code-refs`) are what the pause-point analysis reads: for each body or literal of a stubbed family, the names of
-;; the code and the sinks it reaches directly, with the statics it names (a quoted form `q.N`, a closure constant `clo.CODE`, a vtable
-;; `vt.NAME`: the module's own, or the base's it declares) resolved to what they name.
+;; What a module's code calls, for the pause-point analysis, is serve.livereach's.
 (ns serve.livesplit
   (:use lir.ast)
   (:require [live.extract :as ex] [serve.livetable :as lt] [emit.statics :as st] [fib.string :as s]))
 
-;; A body, a method or a closure literal of the program's own.
-(defun code-name? (name: str) -> bool (or (s/starts-with? name "f.") (s/starts-with? name "m.") (s/starts-with? name "l.")))
 (defun literal? (name: str) -> bool (s/starts-with? name "l."))
 ;; A static that goes with the code, never with the exported data: one numbered per program (emit.statics `program-static?`, a quoted
 ;; form: exported, a later program's cut would declare its own `q.N`, another form, from the base and read it), or a closure constant
@@ -26,9 +22,6 @@
 
 (defun generation-static? :private (name: str) -> bool
   (and (s/starts-with? name "clo.") (some? (lt/generation-number (str-slice name 4 (str-len name))))))
-
-;; Any static that names code (a quoted form's constants do not, but are walked alike): resolved through by `code-refs`.
-(defun static-name? :private (name: str) -> bool (or (st/program-static? name) (st/shared-static? name)))
 
 (defun item-name (it: LItem) -> str (unwrap-or (ex/item-name it) ""))
 
@@ -80,39 +73,3 @@
           (Split (LModule (into shared (mapv exported data)))
                  (LModule (into (into shared (vec (keep declaration data))) code))
                  pins)))))
-
-;; ---- refs
-
-;; The refs of each code item of `m` (a body, a method, a literal; a module of the base holds the library's too, which the caller
-;; drops by family), the statics resolved to the names they hold (the module's, else `base`'s: a cut declares the base's closures and
-;; vtables), repetitions and statics removed.
-(defun code-refs (m: LModule base: (Map str LItem)) -> (Map str (Vec str))
-  (let ((statics (reduce (fn (acc: (Map str (Vec str)) it: LItem)
-                           (let ((nm (item-name it))) (if (and (static-name? nm) (match it ((ItGlobal _) true) (_ false))) (assoc acc nm (ex/item-refs it)) acc)))
-                         {} (. m items))))
-    (reduce (fn (acc: (Map str (Vec str)) it: LItem)
-              (let ((nm (item-name it)))
-                (if (and (code-name? nm) (match it ((ItDefine _) true) (_ false)))
-                    (assoc acc nm (resolved statics base (ex/item-refs it)))
-                    acc)))
-            {} (. m items))))
-
-;; `refs` with each static replaced by what it names (a closure constant names a stub or a literal, a vtable names methods), without
-;; repetitions.
-(defun resolved :private (statics: (Map str (Vec str)) base: (Map str LItem) refs: (Vec str)) -> (Vec str)
-  (let ((seen (cell (set-empty))) (out (cell [])))
-    (do (walk statics base refs seen out) @out)))
-
-;; What the static `r` names: the module's item's refs, else the base's item's (a declared one).
-(defun static-refs :private (statics: (Map str (Vec str)) base: (Map str LItem) r: str) -> (Option (Vec str))
-  (match (get statics r)
-    ((some more) (some more))
-    (nil (if (static-name? r) (match (get base r) ((some it) (some (ex/item-refs it))) (nil nil)) nil))))
-
-(defun walk :private (statics: (Map str (Vec str)) base: (Map str LItem) refs: (Vec str) seen: (Cell (Set str)) out: (Cell (Vec str))) -> unit
-  (doseq [r refs]
-    (when (not (contains? @seen r))
-      (do (set! seen (conj @seen r))
-          (match (static-refs statics base r)
-            ((some more) (walk statics base more seen out))
-            (nil (when (not (static-name? r)) (set! out (conj @out r)))))))))

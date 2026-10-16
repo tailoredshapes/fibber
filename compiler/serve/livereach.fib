@@ -1,0 +1,119 @@
+;; compiler/serve/livereach.fib: which code a thread parked at a pause point can have a frame in (docs/design/live-incremental.md 7;
+;; package LV3 of docs/design/live-repl.md, serve.liveretire). A retirement frees a generation's code; a thread parked at a pause point
+;; returns, on `resume`, into every frame below it, so a generation that can hold such a frame must be kept. Which can: the code from
+;; which a pause point is reached by calls. Two kinds of call are followed over every definition the session holds (the base, the
+;; library and the runtime with it, every kept module):
+;;   - a direct call `(call @NAME ..)`: an edge to NAME;
+;;   - an indirect call (a closure's code, a `dyn` method, a task's runner) of lIR function type T: an edge to every definition whose
+;;     address the program takes (`@NAME` as a value: a closure literal stored in its object, a closure constant's code, a vtable's
+;;     method, a runner stored in a task) and whose own type is T. An indirect call never jumps to code of another type (the lowering
+;;     calls a closure's code with the type its literal has), so this is every target the call can have.
+;; Taking an address is not a call (a closure made and handed to `spawn` runs on another thread), so a mention is no edge. Two kinds of
+;; indirect call are not followed, each for a reason of the compiler's: a stub's call through its slot (emit.live; the stub, its
+;; bodies and literals of every generation are one node, the family, so the call is inside the node), and a type's walker `trace.N`
+;; calling the visitor it is given (the runtime passes only its own visitors: release, share, the heap walk's queue; never a task's
+;; runner, whose type `(fn void (ptr))` the visitor shares). A family is pause-bearing when a pause point is reached from any of its
+;; stubs or bodies, of any generation; a closure literal is a node of its own. Before this (2026-10-15), only direct calls and the family's own closure constants and literals were
+;; followed, among the program's families alone: a body that reached its pause point through a closure read from the heap, or through
+;; a library function, was retired under the parked thread, which then returned into freed code (compiler/tests/live/retire.sh).
+(ns serve.livereach
+  (:use lir.ast)
+  (:require [lir.rewrite :as rw] [lir.types :as lty] [serve.livetable :as lt] [fib.string :as s]))
+
+;; What the session's resident code calls: per definition its direct callees, `ind:TYPE` for each type it calls indirectly, and the
+;; def slots it reads (`live.d.NAME`, serve.livedefs); the type of every definition; the names whose address some code takes.
+(defstruct Reach (calls: (Map str (Vec str)) types: (Map str str) taken: (Set str)))
+
+(defun reach-new () -> Reach (Reach {} {} (set-empty)))
+
+(defstruct Seen (direct: (Cell (Set str)) taken: (Cell (Set str)) ind: (Cell (Set str))))
+
+(defun seen-new :private () -> Seen (Seen (cell (set-empty)) (cell (set-empty)) (cell (set-empty))))
+
+(defun visit :private (sn: Seen e: LExpr) -> unit
+  (do (match (. e kind)
+        ((KGlobal nm) (set! (. sn taken) (conj @(. sn taken) nm)))
+        ((KCall callee _ _) (match callee
+                              ((CalDirect nm) (set! (. sn direct) (conj @(. sn direct) nm)))
+                              ((CalIndirect _ ty) (set! (. sn ind) (conj @(. sn ind) (str "ind:" (lty/fn-type-str ty)))))))
+        (_ ()))
+      (rw/map-children e (fn (c: LExpr) (do (visit sn c) c)))
+      ()))
+
+(defun slot-read? :private (name: str) -> bool (s/starts-with? name "live.d."))
+
+;; A definition's calls: its direct callees, its indirect call types, the def slots it reads.
+(defun define-calls :private (sn: Seen) -> (Vec str)
+  (into (into (vec @(. sn direct)) (vec @(. sn ind))) (filterv slot-read? (vec @(. sn taken)))))
+
+;; One item added: a definition's calls and type recorded, the addresses its code takes noted; a static's addresses noted (a slot's
+;; initialiser is not one: the slot is the stub's, inside the family's node).
+(defun add-item :private (acc: (Pair Reach (Vec str)) it: LItem) -> (Pair Reach (Vec str))
+  (let ((r (. acc fst)))
+    (match it
+      ((ItDefine fd)
+       (let ((sn (seen-new)))
+         (do (doseq [b (. fd blocks)] (doseq [e (. b body)] (visit sn e)))
+             (Pair (Reach (assoc (. r calls) (. fd name) (define-calls sn)) (assoc (. r types) (. fd name) (lty/fn-type-str (. fd ty)))
+                          (into (. r taken) (vec @(. sn taken))))
+                   (conj (. acc snd) (. fd name))))))
+      ((ItGlobal g)
+       (if (s/starts-with? (. g name) "live.")
+           acc
+           (let ((sn (seen-new)))
+             (do (visit sn (. g init))
+                 (Pair (Reach (. r calls) (. r types) (into (. r taken) (vec @(. sn taken)))) (. acc snd))))))
+      (_ acc))))
+
+;; The module's items added; the names of the definitions recorded are the answer (a retired generation drops them).
+(defun reach-add (r: Reach m: LModule) -> (Pair Reach (Vec str))
+  (reduce add-item (Pair r []) (. m items)))
+
+;; The definitions named dropped (their generation retired). The addresses they took stay noted: a name noted and gone is no target.
+(defun reach-drop (r: Reach names: (Vec str)) -> Reach
+  (Reach (reduce (fn (acc: (Map str (Vec str)) nm: str) (dissoc acc nm)) (. r calls) names)
+         (reduce (fn (acc: (Map str str) nm: str) (dissoc acc nm)) (. r types) names)
+         (. r taken)))
+
+;; ---- the analysis
+
+(defun sink? :private (name: str) -> bool
+  (or (s/starts-with? name "f.fib.os.live.pause-point") (= name "fib_live_ctl") (= name "fib.live-pause-point")))
+
+;; The node of a name: its family when it is a stub or a body of one (of any generation), else the name. A closure literal is a node of
+;; its own: its family's bodies reach it only by the indirect calls of its type, and a literal of one that runs a spawned thread's loop
+;; does not make every body of the family pause-bearing (the generation that holds a literal is kept anyway: serve.livesplit `pins`).
+(defun node :private (index: (Map str str) name: str) -> str
+  (if (s/starts-with? name "l.") name (unwrap-or (lt/family-of-name index name) name)))
+
+;; Whether a name's indirect calls are left out (see the header): a stub's call through its slot, a type walker's visitor call.
+(defun unfollowed? :private (index: (Map str str) name: str) -> bool
+  (or (s/starts-with? name "trace.")
+      (and (some? (lt/family-of-name index name)) (nil? (lt/generation-number name)) (not (s/starts-with? name "l.")))))
+
+(defun add-edge :private (rev: (Map str (Vec str)) to: str from: str) -> (Map str (Vec str))
+  (assoc rev to (conj (unwrap-or (get rev to) []) from)))
+
+;; Callee to callers, over nodes: each recorded call, and `ind:T` to every taken definition of type T.
+(defun callers :private (r: Reach index: (Map str str)) -> (Map str (Vec str))
+  (let ((direct (reduce (fn (acc: (Map str (Vec str)) p: (Pair str (Vec str)))
+                          (let ((from (node index (. p fst))) (skip (unfollowed? index (. p fst))))
+                            (reduce (fn (a: (Map str (Vec str)) c: str)
+                                      (if (and skip (s/starts-with? c "ind:")) a (add-edge a (node index c) from)))
+                                    acc (. p snd))))
+                        {} (vec (. r calls)))))
+    (reduce (fn (acc: (Map str (Vec str)) nm: str)
+              (match (get (. r types) nm) ((some ty) (add-edge acc (node index nm) (str "ind:" ty))) (nil acc)))
+            direct (vec (. r taken)))))
+
+;; Every node from which a pause point is reached by calls: the families among them are the pause-bearing ones (`index` is the live
+;; table's, serve.livetable `family-index`).
+(defun bearing (r: Reach index: (Map str str)) -> (Set str)
+  (let ((rev (callers r index)))
+    (let ((sinks (filterv sink? (vec (keys rev)))))
+      (loop ((todo sinks) (seen (reduce conj (set-empty) sinks)))
+        (if (empty? todo)
+            seen
+            (let ((n (nth todo (- (count todo) 1))))
+              (let ((ups (filterv (fn (u: str) (not (contains? seen u))) (unwrap-or (get rev n) []))))
+                (recur (into (vec-pop todo) ups) (reduce conj seen ups)))))))))
