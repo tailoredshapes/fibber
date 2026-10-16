@@ -279,14 +279,16 @@
     (when (and (not (ls/ready? (. l sx))) (not (program-ended? l)) (< n 500))
       (do (unix/sleep-ns 10000000) (recur (+ n 1))))))
 
-;; The accept loop, until the program ends (its thread shuts the listener down: the accept fails) or the listener fails.
+;; The accept loop, until the program ends or the listener fails. The listener is polled (`poll-ms`) before each accept: the program's
+;; thread shuts the listener down when `main` returns, which wakes a blocked accept on Linux but not on Darwin (there `shutdown` of a
+;; listening socket fails with ENOTCONN and the accept waits for a connection that never comes: the process did not exit).
 (defun accept-loop :private (l: Live) -> unit
   (loop ()
-    (if (program-ended? l)
-        ()
-        (match (sk/accept-unix (. l listener))
-          ((Err _) ())
-          ((Ok conn) (do (when (lsk/admit conn) (do (wait-ready l) (serve-connection l conn))) (recur)))))))
+    (cond (program-ended? l) ()
+          (not (sk/wait-readable (. l listener) poll-ms)) (recur)
+          :else (match (sk/accept-unix (. l listener))
+                  ((Err _) ())
+                  ((Ok conn) (do (when (lsk/admit conn) (do (wait-ready l) (serve-connection l conn))) (recur)))))))
 
 ;; ---- the program's thread
 
