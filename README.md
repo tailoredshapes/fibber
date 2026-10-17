@@ -24,17 +24,17 @@ TLS is client-only and **UNAUDITED**; read [security and limits](docs/policy/lim
 
 ## Install
 
-The current release and bootstrap seed are **0.1.16**, recorded in VERSION and SEED.
+The current release and bootstrap seed are **0.1.17**, recorded in VERSION and SEED.
 Download your platform's archive and SHA256SUMS from
 [GitHub releases](https://github.com/tailoredshapes/fibber/releases):
 
-- `fibc-0.1.16-linux-x86_64.tar.gz`: glibc 2.33+, AVX2 and FMA (x86-64-v3).
-- `fibc-0.1.16-darwin-arm64.tar.gz`: Apple Silicon; published since 0.1.7.
+- `fibc-0.1.17-linux-x86_64.tar.gz`: glibc 2.33+, AVX2 and FMA (x86-64-v3).
+- `fibc-0.1.17-darwin-arm64.tar.gz`: Apple Silicon; published since 0.1.7.
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS  # macOS: shasum -a 256 -c SHA256SUMS
-tar xzf fibc-0.1.16-linux-x86_64.tar.gz   # substitute darwin-arm64 on a Mac
-export PATH="$PWD/fibc-0.1.16-linux-x86_64/bin:$PATH"
+tar xzf fibc-0.1.17-linux-x86_64.tar.gz   # substitute darwin-arm64 on a Mac
+export PATH="$PWD/fibc-0.1.17-linux-x86_64/bin:$PATH"
 fibc --version
 ```
 

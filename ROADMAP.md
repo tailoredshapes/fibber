@@ -650,7 +650,7 @@ Binary releases of `fibc` on GitHub (README.md, Install; `scripts/package.sh`,
    registers) outside BLAKE3's own kernels; it fails if the shipped `fibc` lacks the start-up CPU check, and it runs
    the unpacked `fibc --version` and hello in an empty environment.
 5. The seed moves forward deliberately: a commit changes `SEED` to a newer release's url and sha256
-   (v0.1.16 is the current `SEED`; see `SEED` for the pinned URLs and checksums).
+   (v0.1.17 is the current `SEED`; see `SEED` for the pinned URLs and checksums).
 
 **Lessons: a seed is only usable if it runs on every CPU.** v0.1.2 died with SIGILL on a CPU other than the CI
 runner's (code generated for the build host), so v0.1.3 is built for a baseline CPU; v0.1.1 failed the unpack check.
