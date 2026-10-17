@@ -1,7 +1,8 @@
 ;; compiler/serve/incr.fib: the incremental front end of `fibc serve` and `fibc repl` (docs/design/dev-loop.md section 8.1). The engine holds, for the
 ;; modules of every program it has seen, the expanded form of the module and the expander's context after it (serve.snap), each under a key that is the
 ;; content of the module and of every module before it in the load order (so a module's key changes when it or anything it can depend on changes, and
-;; never otherwise). A request loads the program (the modules are read and parsed again: that is cheap), computes the keys, restores the context of the
+;; never otherwise). A request loads the program (the files are read again, and parsed again only when their text changed: the engine's memo,
+;; expand.parsed), computes the keys, restores the context of the
 ;; longest prefix of modules it already has and expands the rest. Modules after a changed one are expanded again even when they do not use it: the
 ;; order is the dependency order, and the context after a module is a function of everything before it. Macros: one runner session is kept, and a macro
 ;; is built once for the key of the module that defines it (macros.runner `session-key`), so an edit rebuilds the macros of the modules from it on.
@@ -9,15 +10,15 @@
 ;; the program's own modules under the module's key (own.chain, docs/design/persistent-checker.md 8), so a request re-checks the modules from the first
 ;; changed one, the last module at least. A verdict (the diagnostics of `check`) is kept by key, so a check of text already seen costs the load.
 (ns serve.incr
-  (:require [expand.modules :as mods] [expand.maker :as mk] [expand.roots :as roots] [expand.program :as prog] [expand.libdir :as libdir]
+  (:require [expand.modules :as mods] [expand.maker :as mk] [expand.roots :as roots] [expand.program :as prog] [expand.libdir :as libdir] [expand.parsed :as pm]
             [macros.runner :as mr] [fib.string :as s] [syntax.reader :as reader] [types.driver :as td] [native.target :as nt] [serve.snap :as snap] [serve.diag :as dg]
             [expand.shared :as sh] [own.staged :as st] [own.chain :as ch] [emit.compile :as ec])
   (:use syntax.form expand.types expand.ctx expand.error types.error types.program types.driver own.error own.driver))
 
 (defstruct Entry (ctx: ExpandCtx exp: Expanded))
 
-;; What a request cost and what it reused. Times are milliseconds.
-(defstruct Stats (modules: i64 reused: i64 expanded: i64 verdict: bool load-ms: i64 expand-ms: i64 lower-ms: i64 check-ms: i64 total-ms: i64))
+;; What a request cost and what it reused. Times are milliseconds; `parsed` is how many files the load parsed (the others were the memo's).
+(defstruct Stats (modules: i64 reused: i64 expanded: i64 verdict: bool load-ms: i64 expand-ms: i64 lower-ms: i64 check-ms: i64 total-ms: i64 parsed: i64))
 
 (defstruct Engine
   (entries: (Cell (Map str Entry))
@@ -26,14 +27,16 @@
    base: (Cell (Option ExpandCtx))
    session: (Cell (Option mr/Session))
    verdicts: (Cell (Map str (Vec dg/Diag)))
-   memo: st/Memo))
+   memo: st/Memo
+   ;; the loader's parsed files by content (expand.parsed): a request parses only the files whose text changed
+   parsed: pm/Memo))
 
 (def entries-max: i64 4000)
 
 (defun engine-new () -> Engine
-  (Engine (cell (map-empty)) (cell 0) (cell (vec-empty)) (cell nil) (cell nil) (cell (map-empty)) (st/memo-new)))
+  (Engine (cell (map-empty)) (cell 0) (cell (vec-empty)) (cell nil) (cell nil) (cell (map-empty)) (st/memo-new) (pm/memo-new)))
 
-(defun empty-stats () -> Stats (Stats 0 0 0 false 0 0 0 0 0))
+(defun empty-stats () -> Stats (Stats 0 0 0 false 0 0 0 0 0 0))
 
 (defun ms-since (t0: i64) -> i64 (quot (- (sys-clock-now) t0) 1000000))
 
@@ -59,18 +62,29 @@
            (Ok (Pair forms ctx)))))))
 
 ;; The key of a module: its content (text, name) after the key of the module before it.
-(defun module-key (prev: i64 text: str ns: str) -> i64
-  (hash-combine (hash-combine (hash-combine prev (hash text)) (str-len text)) (hash ns)))
+(defun module-key (prev: i64 text: str ns: str) -> i64 (module-key-of prev (hash text) (str-len text) ns))
+
+;; `module-key` of a text whose hash `h` and length `n` are known (the memo's, expand.parsed).
+(defun module-key-of (prev: i64 h: i64 n: i64 ns: str) -> i64
+  (hash-combine (hash-combine (hash-combine prev h) n) (hash ns)))
 
 ;; The text of a loaded module: the request's own text for the main file, the job's text for a module it overrides (`Job.texts`, by
 ;; module name: a live session's loaded modules), else the file.
 (defun text-of (l: Loaded file: str source: str texts: (Map str str)) -> str
   (if (= (. l file) file) source (unwrap-or (get texts (. (. l spec) ns)) (unwrap-or (read-file (. l file)) ""))))
 
+;; The hash and the length of a loaded module's text: the memo's entry for its file, which is the text this load parsed (expand.parsed:
+;; a load parses every module through the memo), else the text read again.
+(defun text-key :private (m: pm/Memo l: Loaded file: str source: str texts: (Map str str)) -> (Pair i64 i64)
+  (match (pm/entry m (. l file))
+    ((some p) (Pair (. p hash) (str-len (. p text))))
+    (nil (let ((t (text-of l file source texts))) (Pair (hash t) (str-len t))))))
+
 ;; The keys of the loaded modules, in order, from the key of the prelude.
-(defun keys-of (base: i64 loaded: (Vec Loaded) file: str source: str texts: (Map str str)) -> (Vec i64)
+(defun keys-of (base: i64 loaded: (Vec Loaded) file: str source: str texts: (Map str str) m: pm/Memo) -> (Vec i64)
   (. (reduce (fn (acc: (Pair i64 (Vec i64)) l: Loaded)
-               (let ((k (module-key (. acc fst) (text-of l file source texts) (. (. l spec) ns))))
+               (let ((tk (text-key m l file source texts))
+                     (k (module-key-of (. acc fst) (. tk fst) (. tk snd) (. (. l spec) ns))))
                  (Pair k (conj (. acc snd) k))))
              (Pair base (vec-empty)) loaded)
      snd))
@@ -248,34 +262,36 @@
     (match (prelude-of e)
       ((Err ds) (Front (Err ds) (empty-stats) "" []))
       ((Ok [prelude base-ctx])
-       (match (mods/try-load-texts (. j source) (. j start) (. j rts) (. j texts))
-         ((Err x) (Front (Err [(dg/load-diag x)]) (empty-stats) "" []))
-         ((Ok loaded) (front-loaded e j loaded prelude base-ctx t0)))))))
+       (let ((p0 (pm/parses (. e parsed))))
+         (match (mods/try-load-memo (. j source) (. j start) (. j rts) (. j texts) (. e parsed))
+           ((Err x) (Front (Err [(dg/load-diag x)]) (empty-stats) "" []))
+           ((Ok loaded) (front-loaded e j loaded prelude base-ctx t0 (- (pm/parses (. e parsed)) p0)))))))))
 
-(defun front-loaded :private (e: Engine j: Job loaded: (Vec Loaded) prelude: (Vec Stx) base-ctx: ExpandCtx t0: i64) -> Front
+(defun front-loaded :private (e: Engine j: Job loaded: (Vec Loaded) prelude: (Vec Stx) base-ctx: ExpandCtx t0: i64 np: i64) -> Front
   (let ((t1 (ms-since t0))
-        (keys (keys-of @(. e prelude-key) loaded (. j start) (. j source) (. j texts)))
+        (keys (keys-of @(. e prelude-key) loaded (. j start) (. j source) (. j texts) (. e parsed)))
         (mm (. j mainmode))
         (main (cond (= mm "yes") true (= mm "no") false :else (defines-main? (. (nth loaded (- (count loaded) 1)) forms))))
         (vkey (str (show (nth keys (- (count keys) 1))) "/" (show (hash (. j file))) "/" (if main "m" "l")))
         (n (count loaded)))
     (match (if (. j want) nil (get @(. e verdicts) vkey))
-      ((some ds) (Front (Err ds) (Stats n n 0 true t1 0 0 0 (ms-since t0)) vkey []))
-      (nil (front-expand e j loaded prelude base-ctx keys main vkey t1 t0)))))
+      ((some ds) (Front (Err ds) (Stats n n 0 true t1 0 0 0 (ms-since t0) np) vkey []))
+      (nil (front-expand e j loaded prelude base-ctx keys main vkey (Pair t1 np) t0)))))
 
 (defun store-verdict :private (e: Engine key: str ds: (Vec dg/Diag)) -> unit
   (let ((v @(. e verdicts)))
     (set! (. e verdicts) (assoc (if (> (count v) entries-max) (map-empty) v) key ds))))
 
-(defun front-expand :private (e: Engine j: Job loaded: (Vec Loaded) prelude: (Vec Stx) base-ctx: ExpandCtx keys: (Vec i64) main: bool vkey: str t1: i64 t0: i64) -> Front
+;; `load`: the load's milliseconds and how many files it parsed.
+(defun front-expand :private (e: Engine j: Job loaded: (Vec Loaded) prelude: (Vec Stx) base-ctx: ExpandCtx keys: (Vec i64) main: bool vkey: str load: (Pair i64 i64) t0: i64) -> Front
   (let ((sess (session-of e prelude loaded))
         (t2 (sys-clock-now))
         (ex (expand-program e prelude base-ctx loaded keys sess))
         (n (count loaded)))
     (match (. ex snd)
       ((Err ds) (do (store-verdict e vkey ds)
-                    (Front (Err ds) (Stats n (. ex fst) (- n (. ex fst)) false t1 (ms-since t2) 0 0 (ms-since t0)) vkey [])))
-      ((Ok modules) (front-typed e j modules prelude main vkey (Stats n (. ex fst) (- n (. ex fst)) false t1 (ms-since t2) 0 0 0) t0 (library-key loaded keys)
+                    (Front (Err ds) (Stats n (. ex fst) (- n (. ex fst)) false (. load fst) (ms-since t2) 0 0 (ms-since t0) (. load snd)) vkey [])))
+      ((Ok modules) (front-typed e j modules prelude main vkey (Stats n (. ex fst) (- n (. ex fst)) false (. load fst) (ms-since t2) 0 0 0 (. load snd)) t0 (library-key loaded keys)
                                  (check-keys keys loaded))))))
 
 (defun front-typed :private (e: Engine j: Job modules: (Vec Expanded) prelude: (Vec Stx) main: bool vkey: str st0: Stats t0: i64 lib: (Pair i64 str)
@@ -284,6 +300,6 @@
         (tc (typecheck e modules prelude main (. j file) (. j target) (. lib fst) (. lib snd) keys))
         (r (. tc fst))
         (t4 (sys-clock-now))
-        (st (Stats (. st0 modules) (. st0 reused) (. st0 expanded) false (. st0 load-ms) (. st0 expand-ms) (. tc snd) (- (quot (- t4 t3) 1000000) (. tc snd)) (ms-since t0))))
+        (st (Stats (. st0 modules) (. st0 reused) (. st0 expanded) false (. st0 load-ms) (. st0 expand-ms) (. tc snd) (- (quot (- t4 t3) 1000000) (. tc snd)) (ms-since t0) (. st0 parsed))))
     (do (store-verdict e vkey (match r ((Ok _) (vec-empty)) ((Err ds) ds)))
         (Front r st vkey (match r ((Ok _) modules) ((Err _) []))))))

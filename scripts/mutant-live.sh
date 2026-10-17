@@ -138,13 +138,20 @@
 #                        `dyn` method), as it did before serve.livereach: a body that reaches its   parked in `step` through `hook` returns
 #                        pause point through a function value from the heap is retired under the    into freed code on the resume: the program
 #                        thread parked in it (docs/design/live-incremental.md 7)                    dies, `step` is not pinned)
+#   parse-memo-off       the loader's memo is never answered from: every input parses every file      compiler/tests/live/parsed.sh (an input's
+#                        again (expand.parsed; docs/design/live-incremental.md 2.6)                  `stats.parsed` is the module count, not 1)
+#   parse-memo-by-name   the memo answers a file's entry whatever its text: an edit loaded is not      compiler/tests/live/parsed.sh (the edit of
+#                        parsed, its module keeps the old forms and key (expand.parsed)              `route` is not swapped; the call answers the
+#                                                                                                   old value)
+#   parse-memo-by-length the memo compares the texts' lengths, not the texts: an edit of the same      compiler/tests/live/parsed.sh (the one-byte
+#                        length is not seen (expand.parsed)                                          edit is not swapped)
 # environment: FIBC (a fibc that builds the mutant: the seed or a stage 2; required), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-live-MODE),
 #              MUT_QUICK=1 runs stubs.sh --quick (hello's golden and the deep recursion; no case tables: kills both mutants in under a minute after the build)
 #              and stress.sh --quick (100 swaps), defs.sh --quick (100 redefinitions).
 # A mutant of lib/ alone (sink-ignored, override-ignored) builds nothing: the case's `roots:` header names the copy's lib, and FIBC runs it.
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|quote-shared|partial-load|load-reads-disk|prefix-dropped|removed-ignored|def-slot-plain-store|old-def-freed|boxed-in-place|retype-no-readers|unswappable-reader-accepted|closure-renumbered|vtable-copied|init-run-twice|warm-skipped|inspect-runs-input|child-spawned-anyway|diff-by-text|hash-with-positions|watch-no-load|watch-reruns-on-refusal|rules-at-file-start|type-reads-disk|unheld-held|watch-no-debounce|retire-dynamic-unfollowed}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|quote-shared|partial-load|load-reads-disk|prefix-dropped|removed-ignored|def-slot-plain-store|old-def-freed|boxed-in-place|retype-no-readers|unswappable-reader-accepted|closure-renumbered|vtable-copied|init-run-twice|warm-skipped|inspect-runs-input|child-spawned-anyway|diff-by-text|hash-with-positions|watch-no-load|watch-reruns-on-refusal|rules-at-file-start|type-reads-disk|unheld-held|watch-no-debounce|retire-dynamic-unfollowed|parse-memo-off|parse-memo-by-name|parse-memo-by-length}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -236,6 +243,9 @@ case $MODE in
   watch-no-debounce) patch compiler/serve/livewatch.fib '  (match (get prev f) ((some p) (same? p st)) (nil false)))' '  true)' ;;
   retire-dynamic-unfollowed) patch compiler/serve/livereach.fib '((CalIndirect _ ty) (set! (. sn ind) (conj @(. sn ind) (str "ind:" (lty/fn-type-str ty))))))' '((CalIndirect _ ty) ()))' ;;
   inspect-runs-input) patch compiler/serve/live.fib '(if (p/field-bool r "value") (inspect-value l r name) (inspect-lookup l r name))' '(inspect-value l r name)' ;;
+  parse-memo-off) patch compiler/expand/parsed.fib '    ((some p) (if (= (. p text) text) (Ok p) (parse-fresh m file text)))' '    ((some p) (parse-fresh m file text))' ;;
+  parse-memo-by-name) patch compiler/expand/parsed.fib '    ((some p) (if (= (. p text) text) (Ok p) (parse-fresh m file text)))' '    ((some p) (Ok p))' ;;
+  parse-memo-by-length) patch compiler/expand/parsed.fib '    ((some p) (if (= (. p text) text) (Ok p) (parse-fresh m file text)))' '    ((some p) (if (= (str-len (. p text)) (str-len text)) (Ok p) (parse-fresh m file text)))' ;;
   *) echo "mutant-live: unknown mode $MODE" >&2; exit 2 ;;
 esac
 case $MODE in
@@ -269,6 +279,7 @@ case $MODE in
   boxed-in-place) what="the TSAN defs test"; TSAN_OUT="$OUT/tsan" FIB_LIB="$R/lib" "$R/compiler/tests/live/defs.sh" "$F" --tsan-only > "$OUT/test.log" 2>&1; rc=$? ;;
   old-def-freed|init-run-twice|retype-no-readers|unswappable-reader-accepted) what="the defs test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/defs.sh" "$F" --socket-only "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
   partial-load|load-reads-disk|prefix-dropped|removed-ignored|rules-at-file-start|type-reads-disk) what="the load test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/load.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
+  parse-memo-*) what="the parsed test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/parsed.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   retire-dynamic-unfollowed) what="the retire test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/retire.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   deps-stubbed-by-default|project-paths-not-stubbed) what="the project test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/project.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   *) what="case 8423"  # the case's `roots:` header names ../../lib: run from a copy of cases/stdlib beside the mutated lib
