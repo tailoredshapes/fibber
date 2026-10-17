@@ -1,0 +1,40 @@
+;; compiler/expand/parsed.fib: the loader's memo of parsed module files (docs/design/live-incremental.md 2.6, "a loader memo by file
+;; content"). A resident engine (serve.incr: `fibc serve`, `fibc repl`, a live session) loads its program again for every input; reading
+;; the files is cheap, parsing them is most of the load (meshql-fib: 305 modules). The memo keeps, by file name, the text a file had
+;; when it was last parsed, the text's hash, its forms and whether they hold a regex literal; a file whose text is the same, byte for
+;; byte, is answered from it, any other text is parsed again and replaces the entry. The key is the content, never a time stamp or
+;; the name alone: a file edited on disk, or a module text a live session overrides (`Loader.texts`), is a different text.
+(ns expand.parsed
+  (:require [syntax.reader :as reader] [expand.regex :as regex])
+  (:use syntax.pos syntax.form syntax.error))
+
+;; A file as last parsed: its text, the text's hash, its forms, whether a regex literal is among them (expand.modules `with-regex`).
+(defstruct Parsed (text: str hash: i64 forms: (Vec Stx) regex: bool))
+
+;; The entries by file name, and how many parses the memo has done (a request's count is the difference: serve.incr `Stats.parsed`).
+(defstruct Memo (files: (Cell (Map str Parsed)) parses: (Cell i64)))
+
+(def memo-max: i64 4000)
+
+(defun memo-new () -> Memo (Memo (cell (map-empty)) (cell 0)))
+
+(defun parses (m: Memo) -> i64 @(. m parses))
+
+;; The file's entry when its text is `text`, else the text parsed (and kept, unless it does not read).
+(defun parse (m: Memo file: str text: str) -> (Result Parsed ReadError)
+  (match (get @(. m files) file)
+    ((some p) (if (= (. p text) text) (Ok p) (parse-fresh m file text)))
+    (nil (parse-fresh m file text))))
+
+(defun parse-fresh :private (m: Memo file: str text: str) -> (Result Parsed ReadError)
+  (match (reader/read-all text file)
+    ((Err e) (Err e))
+    ((Ok forms)
+     (let ((p (Parsed text (hash text) forms (regex/has-literal? (Stx (SList forms) (Pos "" 0 0 0 0)))))
+           (fs @(. m files)))
+       (do (set! (. m files) (assoc (if (> (count fs) memo-max) (map-empty) fs) file p))
+           (set! (. m parses) (+ @(. m parses) 1))
+           (Ok p))))))
+
+;; The entry of `file`, whatever its text (serve.incr's keys read the text the load used from it).
+(defun entry (m: Memo file: str) -> (Option Parsed) (get @(. m files) file))

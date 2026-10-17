@@ -83,6 +83,9 @@ tool_sh-live-statics := $(T)/live/statics.sh $(F_ABS) | $(T)/live/statics.sh $(T
 # and expand.modules `try-load-texts`; emit.compile `BodyRequest.module`): load-app.fib with load-routes.fib edited on disk and loaded through the socket
 # and the terminal client; all or nothing, live/Removed, live/NotLoaded, the override against a half-saved file (about two minutes)
 tool_sh-live-load := $(T)/live/load.sh $(F_ABS) | $(T)/live/load.sh $(T)/live/load.py $(T)/live/load-app.fib $(T)/live/load-routes.fib $(wildcard compiler/serve/live*.fib) compiler/serve/incr.fib compiler/serve/replcore.fib compiler/expand/modules.fib compiler/emit/live.fib compiler/emit/compile.fib compiler/types/program.fib
+# The loader's memo of parsed files (expand.parsed, serve.incr `Stats.parsed`; docs/design/live-incremental.md 2.6): an input parses only the files
+# whose text changed; an edit loaded, a one-byte edit and a file put back are seen (about a minute)
+tool_sh-live-parsed := $(T)/live/parsed.sh $(F_ABS) | $(T)/live/parsed.sh $(T)/live/parsed.py $(T)/live/load-app.fib $(T)/live/load-routes.fib compiler/expand/parsed.fib compiler/expand/modules.fib compiler/serve/incr.fib compiler/serve/proto.fib
 # LV3: swaps under load, the pause and the retirement (serve.liveretire, serve.livesplit, rt/live.lir, fib.os.live, the pause points of fib.http.server):
 # the socket stress (stress-app.fib: 8 threads and the pool under 1000 swaps, pause, retire, resume; swap-app.fib's http pause points) and the
 # ThreadSanitizer run of the stub and slot protocol (stress-tsan.fib in live mode with stress-swapper.lir appended), about two minutes each
@@ -136,7 +139,7 @@ tool_sh-live-defs := $(T)/live/defs.sh $(F_ABS) --socket-only | $(T)/live/defs.s
 tool_sh-live-defs-tsan := env TSAN_OUT=$(TOOLS_OUT)/live-defs-tsan $(T)/live/defs.sh $(F_ABS) --tsan-only | $(T)/live/defs.sh $(T)/live/defs-tsan.fib $(T)/live/defs-swapper.lir scripts/tsan.sh scripts/tsan-baseline.txt compiler/emit/program.fib compiler/emit/livedef.fib compiler/emit/lower/objects.fib
 TOOLS_FULL := $(TOOLS_QUICK) unit-api units-all units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-emit-runtime sh-emit-defs-order sh-stack-stack \
-  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-stubs-own sh-live-stubs-sample sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap sh-live-defcache sh-live-queue sh-live-test sh-live-testlive sh-live-watch sh-live-quotes sh-live-statics sh-live-load sh-live-stress sh-live-stress-tsan sh-live-defs sh-live-defs-tsan sh-live-retire \
+  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-stubs-own sh-live-stubs-sample sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap sh-live-defcache sh-live-queue sh-live-test sh-live-testlive sh-live-watch sh-live-quotes sh-live-statics sh-live-load sh-live-parsed sh-live-stress sh-live-stress-tsan sh-live-defs sh-live-defs-tsan sh-live-retire \
   $(PERSIST_STAMPS) sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
   sh-native-l1-unit $(LIRO_STAMPS) jit-selfhosted-threads sh-native-a64-sibcall sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
 # The command is every word up to the `|`, the inputs every word after it.

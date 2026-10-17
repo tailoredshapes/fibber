@@ -449,8 +449,9 @@ Request: `{"op": OP, "id": ID?, ...}`; `id` (a string or a whole number) is echo
 | `reset` | | forget the cache |
 | `shutdown` | | the server answers, exits 0 and removes its socket |
 
-`stats` of a check: `{"modules":67,"reused":65,"expanded":2,"verdict":false,"load_ms":18,"expand_ms":8,"lower_ms":80,"check_ms":290,"total_ms":400}`: the modules of the program, how many were
-restored and how many expanded, whether the answer came from the verdict kept, and the milliseconds of loading, expanding, lowering and type and ownership checking.
+`stats` of a check: `{"modules":67,"reused":65,"expanded":2,"verdict":false,"load_ms":18,"expand_ms":8,"lower_ms":80,"check_ms":290,"total_ms":400,"parsed":1}`: the modules of the program, how many were
+restored and how many expanded, whether the answer came from the verdict kept, the milliseconds of loading, expanding, lowering and type and ownership checking,
+and how many files the load parsed (the engine keeps each file's forms by its text, expand.parsed: a file whose text is unchanged is not parsed again).
 
 Example (a program that does not check, then the same text edited):
 

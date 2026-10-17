@@ -544,6 +544,20 @@ Decisions for the owner:
   before and 41.5 after (39 to 55, 39 to 62), the wall time of a swap input median 320 ms before and 325 after; no change past the noise.
 
 
+- **Status 2026-10-17, the loader memo** (the "later" line of the order above; `compiler/expand/parsed.fib`, `Loader.memo` and
+  `try-load-memo` in expand.modules, `Engine.parsed` and `Stats.parsed` in serve.incr, `"parsed"` in an answer's `stats`;
+  `compiler/tests/live/parsed.sh`, the mutants `parse-memo-off`, `parse-memo-by-name`, `parse-memo-by-length` of
+  `scripts/mutant-live.sh`). The engine keeps, by file name, the text a file had when it was last parsed, its hash, its forms and
+  whether they hold a regex literal; a load still reads every file (and finds it under the roots as before), and parses only a file
+  whose text differs byte for byte from the kept one. The module keys take the text's hash from the same entry, so the files are
+  read once per input, not twice, and hashed only when parsed. Nothing else changes: the keys, the expansion, the check and the
+  rules see the same text as before. Measured on lilnas, meshql-fib's `scripts/live-demo.sh` (305 modules), the build before and
+  after interleaved, two runs each at load average 3 to 5: `load_ms` 92 to 126 before, 5 to 9 after, on every input; the wall time
+  of an input (the REPL client's) 241 to 415 ms before (the swaps 319 to 415), 98 to 154 after (the swaps 134 to 154); the refusal
+  156 to 161 ms before, 29 to 32 after; the restlette `load` 463 to 475 ms before, 325 to 330 after. On the load test's app (59
+  modules) `load_ms` 9 to 13 before and 0 after. Start-up and the first attach are unchanged (8.3 to 8.9 s): the warm-up parses
+  every file once.
+
 ## 7. Retirement against what running state holds (2026-10-15)
 
 **The bug.** A retirement (serve.liveretire, at quiescence) frees the code of every generation that no slot names and that no parked
