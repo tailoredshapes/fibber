@@ -1,6 +1,6 @@
 # Inline lIR: `(unsafe (lir ...))`, ordered atomics and the cache line
 
-Status: **proposed** (2026-10-20), nothing built. Written from `fib-disruptor` (a ring buffer between threads, `/tank/repos/tailoredshapes/fib-disruptor`), whose
+Status: **proposed** (2026-10-20), nothing built; the owner has decided the two open questions of section 9 (a live swap re-emits a changed site; the `inline` modifier is accepted). Written from `fib-disruptor` (a ring buffer between threads, `/tank/repos/tailoredshapes/fib-disruptor`), whose
 hot path had to be lIR in a separate shared library. The owner's rule for this design: *the best practice is the easiest thing; a foot gun is always allowed, as long
 as the hoops make it obvious that is what you are doing.*
 
@@ -71,8 +71,8 @@ disruptor lost. A site in a generic function is keyed by its monomorphic types, 
 * Ownership: an opaque scalar operation with memory effects. It is never a *peek*, never elided and never reordered across the compiler's own stores (types 6.3); a loop that
   contains one does not hoist it. The operands are read at the call like any scalar argument.
 * Types: operands must be bound; a result must be the declared type; `lir cannot take an object: p has type (Vec i64)`.
-* Live redefinition (docs/design/live-repl.md): a site is a function the swap re-emits like any other; **open** whether a swap that changes a `lir` body needs the same refusal
-  as a layout change (section 9).
+* Live redefinition (docs/design/live-repl.md): a site is a function the swap **re-emits** like any other (**Decided**, owner, 2026-10-20: re-emitting is the expected behaviour, not a
+  refusal). The site function is named by the site, so a swap that changes a body replaces that function and the callers of the changed function; one that does not change it leaves it.
 * The macro runner and the interpreter path (`fibc run`) use the same emitter, so there is one behaviour, with no separate native library to find at run time.
 
 ## 4. New lIR instructions the library needs
@@ -128,16 +128,17 @@ the report.
 | `(spin-hint)` on each target | emits `pause` / `yield`; `lair` on a target without one emits nothing and checks |
 | `(cache-line)` | a constant equal to the target's table row; differs across `--target` |
 | `fibc explain unsafe` | lists every site of a program that has an `extern`, an `unsafe` and a `lir` |
+| a live swap of a `lir` body | the running program takes the new body (`fibc run --live`, then `eval`/`load`) |
 | the acceptance case | `fib-disruptor` with no `.so`, no `build.sh` and no `LD_PRELOAD`: its 23 specs pass under a plain `fibc test`, and `bench/bench.fib` at batch 1024 recovers the inline-arithmetic rate (660 M events/s here, within noise) |
 
 ## 9. Open questions and risks
 
 * **The self-hosting trap** (CLAUDE.md): `lir` becomes a core form name. `grep` of `compiler/` finds no function named `lir` (modules named `lir.*` are namespaces, not functions); the full
   gate, not the quick one, is the check.
-* **Live swaps** of a site whose body changed (section 3.2): refuse like a layout change, or re-emit? Needs a decision.
+* **Live swaps** of a site whose body changed: **decided**, re-emit (section 3.2). A case in `cases/` swaps a `lir` body in a running program and sees the new behaviour.
 * **Memory-order testing.** x86-64 is TSO and cannot fail a missing `release`; the cases above that matter for ordering run on the Mac Studio (aarch64) as well (`scripts/mac-check.sh`), and the
   design claims nothing for AArch64 until they have.
-* **`inline` as an lIR modifier** is a change to spec/lir.md and to the Rust-compatible case harness's skip list (`;; stage: 2`).
+* **`inline` as an lIR modifier**: **decided**, accepted (owner, 2026-10-20). It is a change to spec/lir.md and to the Rust-compatible case harness's skip list (`;; stage: 2`).
 * **A string body** loses editor highlighting; a later reader mode that reads lIR from fibber forms (with `@` handled) can sit on top without changing the lowering.
 
 ## 10. Order of work
