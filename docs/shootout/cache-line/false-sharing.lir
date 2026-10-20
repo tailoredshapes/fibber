@@ -1,0 +1,51 @@
+;; Where does false sharing stop? Two threads each increment their own i64 (volatile load and store, 100 million times); the two words are `stride`
+;; bytes apart in one 4096-aligned block. The least stride at which the time falls to that of one thread alone is the distance two threads' writes
+;; must keep: the destructive interference size of the machine this runs on (docs/design/inline-lir.md, section 4).
+;;   lair run false-sharing.lir          (pin the threads with taskset: the answer differs between P-cores, E-cores and across them)
+(declare aligned_alloc ptr (i64 i64))
+(declare memset ptr (ptr i32 i64))
+(declare pthread_create i32 (ptr ptr ptr ptr))
+(declare pthread_join i32 (i64 ptr))
+(declare clock_gettime i32 (i32 ptr))
+(declare printf i32 (ptr ...))
+
+(define internal (now i64) ()
+  (block entry
+    (let ((ts (alloca i64 (i32 2))))
+      (call @clock_gettime (i32 1) ts)
+      (ret (add (mul (load i64 ts) (i64 1000000000)) (load i64 (getelementptr i64 ts (i64 1))))))))
+
+(define internal (work ptr) ((ptr p))
+  (block entry (br loop))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (loop i2)))
+          (v (load volatile i64 p))
+          (i2 (add i (i64 1))))
+      (store volatile (add v (i64 1)) p)
+      (br (icmp slt i2 (i64 100000000)) loop done)))
+  (block done (ret (ptr null))))
+
+;; stride 0: one thread alone
+(define internal (run void) ((i64 stride))
+  (block entry
+    (let ((base (call @aligned_alloc (i64 4096) (i64 8192)))
+          (tid (alloca i64 (i32 1)))
+          (t0 (call @now)))
+      (call @memset base (i32 0) (i64 8192))
+      (br (icmp eq stride (i64 0)) alone pair)))
+  (block alone
+    (call @work base)
+    (call @printf (string "stride %4lld  one thread alone   %6.2f ns per increment\n") stride (fdiv (sitofp double (sub (call @now) t0)) (double 100000000.0)))
+    (ret))
+  (block pair
+    (call @pthread_create tid (ptr null) @work (getelementptr i8 base stride))
+    (call @work base)
+    (call @pthread_join (load i64 tid) (ptr null))
+    (call @printf (string "stride %4lld  two threads         %6.2f ns per increment\n") stride (fdiv (sitofp double (sub (call @now) t0)) (double 100000000.0)))
+    (ret)))
+
+(define (main i32) ()
+  (block entry
+    (call @run (i64 0))
+    (call @run (i64 8)) (call @run (i64 16)) (call @run (i64 32)) (call @run (i64 64)) (call @run (i64 128)) (call @run (i64 192)) (call @run (i64 256))
+    (ret (i32 0))))

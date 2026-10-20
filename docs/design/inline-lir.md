@@ -82,7 +82,7 @@ Two, both per target, both in lIR (so the form needs no special case):
 | form | meaning |
 |---|---|
 | `(spin-hint)` | `void`: x86-64 `pause`, AArch64 `yield` (`hint #1`), RISC-V `pause` (Zihintpause), nothing where the target has none. Emitted as the target's intrinsic, which the reserved `llvm.` names keep out of user lIR |
-| `(cache-line)` | `i64` constant: the **destructive interference size** of the target, the distance two threads' writes must be apart not to share a line. It is not the cache line the OS reports: this Intel reports 64 and the adjacent-line prefetcher still makes 64-byte padding false-share |
+| `(cache-line)` | `i64` constant: the **destructive interference size** of the target, the distance two threads' writes must be apart not to share a line. It is not necessarily the cache line the OS reports (the folklore is that Intel's adjacent-line prefetcher doubles it; the first measurement, docs/shootout/cache-line, found **64 enough** between this i7-14700KF's cores for a store-and-load test, and did not test the read-polling case that folklore is about) |
 
 `(cache-line)` is also a fibber builtin of the same name beside `(has-fma)` (types 1.9, `compiler/types/target.fib`'s `Target` record gets a field), so a macro or a
 `defstruct` padding can use it. The value per target is **measured, not copied**: a false-sharing sweep (two threads, each incrementing its own word, at strides 8 to 256) on
