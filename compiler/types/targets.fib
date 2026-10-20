@@ -148,6 +148,17 @@
              64 true "none" 128 "wgsl" "" true 1 0 1 1 "none" "wgsl" "none (a driver compiles the WGSL)" "" "none" (runtime-c-functions)
              "emits WGSL (examples/webgpu); runtime-os Linux is a stand-in, no runtime is emitted" KERNEL-WGSL))
 
+;; The destructive interference size of an architecture, in bytes: the distance two threads' writes must keep so that they do not share a line (lIR's
+;; `(cache-line)`, spec/lir.md 6.6a). A conservative table, not a measurement: 128 for x86-64 (the adjacent-line prefetcher, by the folklore;
+;; docs/shootout/cache-line measured 64 enough for two threads' stores on one Intel CPU and did not test reads) and AArch64 (Apple's M cores have 128-byte
+;; lines), 64 for the rest. A measured row replaces its entry with the run cited.
+(defun cache-line-of-arch (arch: str) -> i64
+  (if (or (= arch "x86_64") (= arch "aarch64")) 128 64))
+
+;; The LLVM intrinsic of lIR's `(spin-hint)` on an architecture, "" where it has none.
+(defun spin-hint-intrinsic (arch: str) -> str
+  (cond (= arch "x86_64") "llvm.x86.sse2.pause" (= arch "aarch64") "llvm.aarch64.hint" :else ""))
+
 (defun arch-of-triple (triple: str) -> str
   (let ((a (match (str-find triple "-" 0) ((some i) (str-slice triple 0 i)) (nil triple))))
     (if (= a "arm64") "aarch64" a)))

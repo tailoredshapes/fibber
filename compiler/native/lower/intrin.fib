@@ -7,7 +7,7 @@
 
 (ns native.lower.intrin
   (:use lir.diag lir.types lir.lit lir.ast lir.intrin native.error native.lower.lx native.lower.types native.lower.calls native.lower.build)
-  (:require [llvm.core :as core] [llvm.target :as target]))
+  (:require [llvm.core :as core] [llvm.target :as target] [types.targets :as tt]))
 
 
 (defun type-of :private (v: i64) -> i64 (unsafe (core/LLVMTypeOf v)))
@@ -53,6 +53,8 @@
           (or (= c "red-i") (= c "red-m")) (some (call-intrinsic fx llvm [(type-of (nth vs 0))] vs))
           (= c "red-f") (some (set-flags (call-intrinsic fx llvm [(type-of (nth vs 1))] vs) flags))
           (= c "warp") (some (warp-value fx name llvm vs))
+          (= c "hint") (do (spin-hint fx) nil)
+          (= c "const") (some (core/const-int (lx-ty (. fx lx) ty-i64) (tt/cache-line-of-arch (. (. fx lx) arch)) false))
           :else (memory-value fx name c ty vs align))))
 
 ;; The warp forms (spec/lir.md 6.9a) on a kernel target. `llvm.nvvm.shfl.sync.{down,up,bfly,idx}.{i32,f32}` takes the member mask (every lane), the value, the lane operand and
@@ -65,6 +67,13 @@
         (let ((float? (= (unsafe (core/LLVMGetTypeKind (type-of (nth vs 0)))) 2i32))
               (clamp (if (= name "shfl-up") 0 31)))
           (call-intrinsic fx (str llvm (if float? ".f32" ".i32")) [] [all (nth vs 0) (nth vs 1) (const-i32 fx clamp)])))))
+
+;; `(spin-hint)`: the architecture's pause instruction (`pause`, `yield`), nothing where it has none.
+(defun spin-hint :private (fx: Fx) -> unit
+  (let ((llvm (tt/spin-hint-intrinsic (. (. fx lx) arch))))
+    (cond (= llvm "") ()
+          (= (. (. fx lx) arch) "aarch64") (do (call-intrinsic fx llvm [] [(const-i32 fx 1)]) ())
+          :else (do (call-intrinsic fx llvm [] []) ()))))
 
 (defun memory-value :private (fx: Fx name: str c: str ty: (Option LType) vs: (Vec i64) align: (Option i64)) -> (Option i64)
   (let ((llvm (intrin-llvm name)))

@@ -11,6 +11,8 @@
 ;;   warp         the kernel target's warp forms (spec/lir.md 6.9a): `shfl-down shfl-up shfl-xor shfl-idx` (a value, i32 or float, and an i32 lane operand, same type out),
 ;;                `ballot` (an i1, answering the i32 of the warp's votes); `llvm` is the prefix of the NVPTX intrinsic (the type is appended for a shuffle)
 ;;   mload gather a leading type, then 3 operands; mstore scatter: 3 operands (the vector first)
+;;   hint         `spin-hint`: no operands, void (spec/lir.md 6.6a): the target's pause instruction, nothing where it has none
+;;   const        `cache-line`: no operands, an i64 the target decides (spec/lir.md 6.6a)
 (ns lir.intrin)
 
 
@@ -40,7 +42,8 @@
    "gather" (IntrinInfo "gather" "llvm.masked.gather") "scatter" (IntrinInfo "scatter" "llvm.masked.scatter")
    "shfl-down" (IntrinInfo "warp" "llvm.nvvm.shfl.sync.down") "shfl-up" (IntrinInfo "warp" "llvm.nvvm.shfl.sync.up")
    "shfl-xor" (IntrinInfo "warp" "llvm.nvvm.shfl.sync.bfly") "shfl-idx" (IntrinInfo "warp" "llvm.nvvm.shfl.sync.idx")
-   "ballot" (IntrinInfo "warp" "llvm.nvvm.vote.ballot.sync")})
+   "ballot" (IntrinInfo "warp" "llvm.nvvm.vote.ballot.sync")
+   "spin-hint" (IntrinInfo "hint" "") "cache-line" (IntrinInfo "const" "")})
 
 (defun intrin-info (name: str) -> (Option IntrinInfo) (get intrin-table name))
 
@@ -54,6 +57,7 @@
 (defun intrin-arity (name: str) -> i64
   (let ((c (intrin-class name)))
     (cond (= name "ballot") 1
+          (or (= c "hint") (= c "const")) 0
           (= c "warp") 2
           (or (= c "f1") (= c "i1") (= c "red-i") (= c "red-m")) 1
           (or (= c "f2") (= c "i2") (= c "fbin") (= c "red-f")) 2

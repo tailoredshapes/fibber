@@ -18,7 +18,8 @@
                   (. (tt/target-row-of-triple triple) tail-kind)
                   (= (. (tt/target-row-of-triple triple) pointer-bits) 32) (= (. (tt/target-row-of-triple triple) os) "wasi")
                   (tt/kernel-row? (tt/target-row-of-triple triple))
-                  (= (. (tt/target-row-of-triple triple) arch) "aarch64")))
+                  (= (. (tt/target-row-of-triple triple) arch) "aarch64")
+                  (. (tt/target-row-of-triple triple) arch)))
           (r (module-items lx m)))
       (do (unsafe (do (lt/LLVMDisposeTargetData td) (free dl)))
           (match r
@@ -130,7 +131,8 @@
     (do (unsafe (core/LLVMSetFunctionCallConv f (trunc i32 (cc-number lx (. ty cc)))))
         (set-modifiers f mods)
         (if-some [t tgt] (target-attributes lx f t) ())
-        (if (slow-path? name) (add-noinline lx f) ())
+        (if (slow-path? name) (add-enum-attribute lx f "noinline") ())
+        (if (. mods inline) (add-enum-attribute lx f "alwaysinline") ())
         (let ((fns (. lx funcs))) (update! fns (fn (m) (assoc m name (FuncEntry f ty nil))))))))
 
 ;; The string attribute `key` = `value` on the definition `f`.
@@ -146,11 +148,11 @@
   (do (add-string-attribute lx f "target-cpu" (. t cpu))
       (add-string-attribute lx f "target-features" (. t features))))
 
-;; The function attribute `noinline` on `f`.
-(defun add-noinline :private (lx: Lx f: i64) -> unit
-  (let ((k (ffi/bytes-new "noinline")))
+;; The enum function attribute `name` (`noinline`, `alwaysinline`) on `f`.
+(defun add-enum-attribute :private (lx: Lx f: i64 name: str) -> unit
+  (let ((k (ffi/bytes-new name)))
     (unsafe
-      (let ((kind (core/LLVMGetEnumAttributeKindForName k 8))
+      (let ((kind (core/LLVMGetEnumAttributeKindForName k (str-len name)))
             (attr (core/LLVMCreateEnumAttribute (. lx ctx) kind 0)))
         (do (core/LLVMAddAttributeAtIndex f -1i32 attr)
             (free k))))))
@@ -191,4 +193,4 @@
   (s/ends-with? name "-slow"))
 
 (defun hidden-mods :private (hidden: bool) -> LModifiers
-  (LModifiers lk-external hidden))
+  (LModifiers lk-external hidden false))

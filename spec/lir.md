@@ -156,6 +156,7 @@ item   ::= (defstruct NAME (type*))
          | (target (cpu STRING) (features STRING)?)        ; the CPU and features to generate code for (§4.5)
 mod    ::= private | internal | external           ; linkage (§4.3), at most one
          | hidden                                  ; visibility (§4.3)
+         | inline                                  ; a function the optimiser always inlines (§4.3)
          | shared                                  ; a global in block-shared memory of a kernel target (§6.9a), `global` only
 block  ::= (block LABEL instr+)
 ```
@@ -210,6 +211,7 @@ any order before the calling convention (`duplicate modifier private`,
 | `internal` | `internal` | a local symbol of the object file (C's `static`): invisible to other modules, present for the debugger |
 | `private` | `private` | no symbol at all: the name exists only inside the module |
 | `hidden` | `hidden` visibility | exported to other modules of the same executable or shared object, but not from it (the ELF/Mach-O sense); a call to it needs no PLT |
+| `inline` | `alwaysinline` | **Decided** (owner, 2026-10-20; docs/design/inline-lir.md): a `define` only (`global cannot be inline: inline is for a function`, `declare cannot be inline`), once (`duplicate modifier inline`), alongside any linkage word; the optimiser inlines every call of it it can see. Inlining is not a language rule: a call through a pointer or from another module is a call, and an `inline` function that is recursive is not inlined into itself |
 
 A `declare` and a `declare-global` take `hidden` only: they name a
 symbol defined elsewhere, whose linkage is that definition's (`declare
@@ -634,6 +636,18 @@ OP ::= xchg add sub and nand or xor max min umax umin fadd fsub fmax fmin
   misaligned pointer is undefined behaviour.
 - `cmpxchg` returns the old value and whether the exchange happened;
   `weak` may fail spuriously.
+
+### 6.6a Spinning and the cache line
+
+**Decided** (owner, 2026-10-20; docs/design/inline-lir.md, section 4): two nullary forms for code that waits on another thread's store and lays data out for
+more than one core.
+
+| Form | Type | Meaning |
+|---|---|---|
+| `(spin-hint)` | void, not a terminator | the target's hint that this thread is spinning: `pause` on x86-64, `yield` on AArch64 (`llvm.x86.sse2.pause`, `llvm.aarch64.hint(1)`); nothing on a target that has none. It orders no memory and is not a fence; the optimiser may not remove it |
+| `(cache-line)` | `i64`, a constant | the **destructive interference size** of the target in bytes: how far apart two threads' writes must be not to share a line. 128 on x86-64 and AArch64, 64 elsewhere (a conservative table, `types.targets` `cache-line-of-arch`; the measurements that would replace a row are in docs/shootout/cache-line). It is the size of the target the module is generated for, so a library built for one CPU and run on another keeps the value it was built with |
+
+Both take no operands (`spin-hint expects 0 operands, found 1`). Cases: `cases/lir/inline`.
 
 ### 6.7 Control flow
 
