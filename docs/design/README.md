@@ -28,6 +28,7 @@ earlier plan where they differ.
 - [Finite domains and the Sudoku port](finite-domains-and-sudoku.md)
 - [fibber on a GPU: a kernel target, a device protocol, drivers](gpu.md)
 - [HTTP client and server (HTTP-1, HTTP-2)](http.md)
+- [Inline lIR: `(unsafe (lir ...))`, ordered atomics and the cache line (proposed)](inline-lir.md)
 - [In-place update when uniquely held](in-place-update.md)
 - [A JavaScript backend for lIR](js-backend.md)
 - [fib.json.schema: JSON Schema for fib.json](json-schema.md)
