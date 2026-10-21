@@ -77,6 +77,7 @@ build defaults to 2, run to 0.
                          the layout of its types, or one macro module (spec/bootstrap.md
                          section 8); exit 0, 1 a record, 2 unreadable, 3 unsupported
   explain <file>         print the ownership checker's decisions (types §9)
+  explain unsafe <file>  list every unsafe block, extern call and lir form of the program and its libraries, with the atomics each lir form uses
   check <module>..       load the modules and type-check and ownership-check EVERY definition of
                          them and of the modules they use, called or not (run, build and emit check
                          a library definition only when the program reaches it); exit 0 all

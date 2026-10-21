@@ -44,6 +44,15 @@ ck "emit-dump reads the roots" "$($s2 emit-dump --sections main -I "$t/a" -I "$t
 ck "emit-dump --layout reads the roots" "$($s2 emit-dump --layout -I "$t/a" -I "$t/b" "$t/prog/main.fib" | sed -n 3p | cut -c1-14)" "bool mangle bo"
 ck "emit into a pipe that is closed is not death by SIGPIPE: exit 0, as the Rust's" "$($s2 emit "$t/three.fib" | true; echo ${PIPESTATUS[0]})" 0
 ck "emit into a pipe that is closed: nothing on standard error" "$($s2 emit "$t/three.fib" 2>"$t/pipe.err" | true; cat "$t/pipe.err")" ""
+printf '%s\n' '(defun f (p: ptr) -> i64 (unsafe (lir [p: ptr] -> i64 "(block entry (ret (atomic-load acquire i64 p)))")))' '(defun main () -> i64 0)' > "$t/lirsite.fib"
+ck "explain unsafe lists a lir form and the atomic it uses" "$($s2 explain unsafe "$t/lirsite.fib" | grep -c 'lir .* in f  (p) uses atomic-load acquire')" 1
+ck "explain unsafe lists the unsafe block that holds it" "$($s2 explain unsafe "$t/lirsite.fib" | grep -c '^unsafe .*lirsite.fib:1:.* in f')" 1
+if [ "$(uname -s)" = Linux ] && command -v objdump > /dev/null; then
+  printf '%s\n' '(defun f (p: ptr) -> i64 (unsafe (lir [p: ptr] -> i64 "(block entry (ret (atomic-load acquire i64 p)))")))' '(defun main () -> i64 (unsafe (let [c (alloc 8)] (do (store-i64 c 5) (- (f c) 5)))))' > "$t/lirinl.fib"
+  $s2 build "$t/lirinl.fib" -o "$t/lirinl" > /dev/null 2>&1
+  ck "a lir function runs" "$("$t/lirinl"; echo $?)" 0
+  ck "and is inlined into its caller in the default build, which splits the program into units (alwaysinline holds across them)" "$(objdump -d "$t/lirinl" | grep -c 'call.*fib\.lir\.')" 0
+fi
 ck "explain reads the roots" "$($s2 explain -I "$t/a" -I "$t/b" "$t/prog/main.fib" | head -1 | cut -c1-5)" "defun"
 $s2 build "$t/seven.fib" -o "$t/seven" > /dev/null 2>&1; ck "build makes an executable whose status is main's" "$("$t/seven" > /dev/null; echo $?)" 7
 $s2 build "$t/three.fib" -o "$t/three" -O 0 > /dev/null 2>&1; ck "build -O 0" "$("$t/three"; echo $?)" 3

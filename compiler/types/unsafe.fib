@@ -1,0 +1,76 @@
+;; compiler/types/unsafe.fib: `fibc explain unsafe FILE`, every place a program says it has left the checker's care (docs/design/inline-lir.md, section 7): its `unsafe` blocks, its calls of
+;; an `extern`, and its `lir` forms with the atomics each one uses. The foot guns are allowed; this is the hoop that makes them findable. A line is
+;;   unsafe FILE:LINE:COL in FUNCTION
+;;   extern FILE:LINE:COL in FUNCTION  calls NAME [lib LIB]
+;;   lir    FILE:LINE:COL in FUNCTION  (OPERAND ..) uses WORD ORDER, ..
+;; over the functions, the methods of the instances and the `def`s of every module the program loads, the library's included, sorted by place.
+(ns types.unsafe
+  (:use syntax.pos types.ty types.table types.ast types.decls types.program))
+
+;; The words of lIR that matter to a reviewer, with the orderings and operators that follow them.
+(def interesting: (Vec str) ["atomic-load" "atomic-store" "atomicrmw" "cmpxchg" "fence" "spin-hint" "cache-line" "call" "inttoptr" "ptrtoint" "store" "load"])
+(def orderings: (Vec str) ["unordered" "monotonic" "acquire" "release" "acq_rel" "seq_cst"])
+
+(defun separator? :private (b: i8) -> bool (or (or (= b 32i8) (= b 10i8)) (or (= b 9i8) (or (= b 40i8) (= b 41i8)))))
+
+;; The words of the text, parentheses and blanks being the gaps.
+(defun tokens :private (body: str) -> (Vec str)
+  (let [n (str-len body)]
+    (loop [i 0 start 0 out []]
+      (cond (>= i n) (if (> i start) (conj out (str-slice body start i)) out)
+            (separator? (str-byte-at body i)) (recur (+ i 1) (+ i 1) (if (> i start) (conj out (str-slice body start i)) out))
+            :else (recur (+ i 1) start out)))))
+
+(defun member? :private (xs: (Vec str) x: str) -> bool (some? (first (filter (fn (y: str) (= x y)) xs))))
+
+;; What a lir body does, as the report says it: each atomic or fence with its ordering(s), then the other words that matter.
+(defun lir-effects (body: str) -> str
+  (let [ts (tokens body)]
+    (str-join (vec (interpose ", "
+      (vec (keep (fn (i: i64)
+                   (let [w (nth ts i)]
+                     (if (member? interesting w)
+                         (let [near (vec (take 4 (drop (+ i 1) ts)))
+                               ords (vec (filter (fn (x: str) (member? orderings x)) near))]
+                           (some (str-join (vec (interpose " " (into [w] ords))))))
+                         nil)))
+                 (range (count ts)))))))))
+
+(defstruct Site (file: str line: i64 col: i64 text: str))
+
+(defun site (pos: Pos what: str fun: str detail: str) -> Site
+  (Site (. pos file) (. pos line) (. pos col)
+        (str-join [what " " (. pos file) ":" (show (. pos line)) ":" (show (. pos col)) " in " fun detail])))
+
+;; The sites in the expression `e` of the function `fun`.
+(defun sites-in (g: Globals fun: str e: Expr) -> (Vec Site)
+  (let [here (match (. e kind)
+               ((EUnsafe _) [(site (. e pos) "unsafe" fun "")])
+               ((ECall head _)
+                (match (. head kind)
+                  ((EGlobal (GExtern x))
+                   (let [d (table-get (. g externs) x)]
+                     (if (= (. d lir) "")
+                         [(site (. e pos) "extern" fun (str-join ["  calls " (. d name) (if (= (. d lib) "") "" (str-join [" lib " (. d lib)]))]))]
+                         [(site (. e pos) "lir   " fun (str-join ["  (" (str-join (vec (interpose " " (. d lir-params)))) ") uses " (lir-effects (. d lir))]))])))
+                  (_ [])))
+               (_ []))]
+    (reduce (fn (acc: (Vec Site) k: Expr) (into acc (sites-in g fun k))) here (expr-children e))))
+
+(defun all-sites (p: TypedProgram) -> (Vec Site)
+  (let [g (. p globals)
+        funs (mapv (fn (i: i64) (table-get (. g funs) i)) (range (table-count (. g funs))))]
+    (into (reduce (fn (acc: (Vec Site) f: FunDef) (into acc (sites-in g (. f name) (. f body)))) [] funs)
+          (reduce (fn (acc: (Vec Site) i: i64)
+                    (reduce (fn (a: (Vec Site) m: ImplMethod) (into a (sites-in g (str-join ["method of instance " (show i)]) (. m body))))
+                            acc (. (table-get (. g instances) i) methods)))
+                  [] (range (table-count (. g instances)))))))
+
+;; The report: one line a site, in order of file, line and column; the last line counts them.
+(defun unsafe-report (p: TypedProgram) -> str
+  (let [sites (sort-by (fn (s: Site) (str-join [(. s file) ":" (pad (. s line)) ":" (pad (. s col))])) (all-sites p))]
+    (str-join (conj (mapv (fn (s: Site) (str-concat (. s text) "\n")) sites)
+                    (str-join [(show (count sites)) " site(s) where the program has left the checker's care\n"])))))
+
+(defun pad :private (n: i64) -> str
+  (let [s (show n)] (str-concat (str-join (vec (repeat (- 8 (str-len s)) "0"))) s)))

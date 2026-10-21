@@ -164,4 +164,5 @@ The form, the library and the acceptance case are built (fibber commits after `6
 * **`(cache-line)` is not a fibber builtin**: `fib.atomic/cache-line` wraps the lIR form and LLVM folds the constant. The table is per architecture (types.targets `cache-line-of-arch`), not per CPU.
 * **Measured** (fib-disruptor, one producer and one consumer, an i7-14700KF, two runs each): the ring written in fibber over `fib.atomic` runs 550 to 560 M events a second at batch 64 and 1024 and 40 M
   at batch 1; the extern version ranged 25 to 32 M at batch 1 and 270 to 660 M above. Its 24 specs and 13 mutants run under a plain `fibc test`: no shared library, no build script, no `LD_PRELOAD`.
-* **Not built yet**: `fibc explain unsafe`; the rule in the arch test that a `lir` site in `lib/` sits in a module that says so in its header; a way for a body to declare what it calls; running the cases on AArch64.
+* **`fibc explain unsafe FILE`** (compiler/types/unsafe.fib) lists every `unsafe` block, `extern` call and `lir` form of the program and its libraries, sorted by place, with the atomics and orderings each `lir` form uses; checked in compiler/tests/driver/cli.sh.
+* **Not built yet**: the rule in the arch test that a `lir` site in `lib/` sits in a module that says so in its header; a way for a body to declare what it calls; running the cases on AArch64.
