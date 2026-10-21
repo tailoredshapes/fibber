@@ -165,4 +165,11 @@ The form, the library and the acceptance case are built (fibber commits after `6
 * **Measured** (fib-disruptor, one producer and one consumer, an i7-14700KF, two runs each): the ring written in fibber over `fib.atomic` runs 550 to 560 M events a second at batch 64 and 1024 and 40 M
   at batch 1; the extern version ranged 25 to 32 M at batch 1 and 270 to 660 M above. Its 24 specs and 13 mutants run under a plain `fibc test`: no shared library, no build script, no `LD_PRELOAD`.
 * **`fibc explain unsafe FILE`** (compiler/types/unsafe.fib) lists every `unsafe` block, `extern` call and `lir` form of the program and its libraries, sorted by place, with the atomics and orderings each `lir` form uses; checked in compiler/tests/driver/cli.sh.
-* **Not built yet**: the rule in the arch test that a `lir` site in `lib/` sits in a module that says so in its header; a way for a body to declare what it calls; running the cases on AArch64.
+* **The arch rule** is ADR 0026 (docs/adr/0026-...): in the library, `lir` is written only in `lib/fib/atomic.fib` (an exact list, with planted violations); code outside the library is covered by `explain unsafe`.
+* **A body may not call a function, on purpose** (decided, 2026-10-21): native access belongs to the platform layer and the drivers (ADR 0011); a body that called `sched_yield` would be an `extern` where the
+  rule cannot see it. The platform layer provides the call: `fib.os.time/thread-yield` (`sched_yield`), which fib-disruptor's waits use (one core: 0.34 M to 11.6 M events a second).
+* **Weak memory, checked on AArch64** (an Apple M1 Ultra, 2026-10-21; details in fib-disruptor's README): the compiled ring has `stlr`/`ldar`; its 26 specs pass there; weakening `publish` to a relaxed store is
+  caught 5 runs in 5 on the M1 and 0 in 3 on x86-64; weakening the consumer's `advance` or the producer's read of the consumers' cursors was not caught by anything in 5 runs: those two orderings are shown by the
+  memory model and not by a test.
+* **Not built**: a way for a body to declare what it calls (not wanted, above); an AArch64 run of fibber's own `lir` cases (the compiler cross-built for the Mac runs fib-disruptor, which uses all of `fib.atomic`; the
+  cases were not run there).

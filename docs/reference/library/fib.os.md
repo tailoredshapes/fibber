@@ -21,7 +21,7 @@ Generated declaration inventory of [fib.os](../../../lib/fib/os.fib). Source lin
 | `change-directory` | defun | [lib/fib/os/process.fib:29](../../../lib/fib/os/process.fib#L29) |
 | `checked` | defun | [lib/fib/os/errors.fib:25](../../../lib/fib/os/errors.fib#L25) |
 | `checked-unit` | defun | [lib/fib/os/errors.fib:27](../../../lib/fib/os/errors.fib#L27) |
-| `clock-now` | defun | [lib/fib/os/time.fib:10](../../../lib/fib/os/time.fib#L10) |
+| `clock-now` | defun | [lib/fib/os/time.fib:11](../../../lib/fib/os/time.fib#L11) |
 | `close-fd` | defun | [lib/fib/os/io.fib:9](../../../lib/fib/os/io.fib#L9) |
 | `create-directory` | defun | [lib/fib/os/files.fib:22](../../../lib/fib/os/files.fib#L22) |
 | `create-temp-directory` | defun | [lib/fib/os/directories.fib:29](../../../lib/fib/os/directories.fib#L29) |
@@ -40,7 +40,7 @@ Generated declaration inventory of [fib.os](../../../lib/fib/os.fib). Source lin
 | `list-directory` | defun | [lib/fib/os/directories.fib:21](../../../lib/fib/os/directories.fib#L21) |
 | `lock-fd` | defun | [lib/fib/os/files.fib:54](../../../lib/fib/os/files.fib#L54) |
 | `make-pipe` | defun | [lib/fib/os/io.fib:26](../../../lib/fib/os/io.fib#L26) |
-| `monotonic-ns` | defun | [lib/fib/os/time.fib:8](../../../lib/fib/os/time.fib#L8) |
+| `monotonic-ns` | defun | [lib/fib/os/time.fib:9](../../../lib/fib/os/time.fib#L9) |
 | `open-file` | defun | [lib/fib/os/files.fib:16](../../../lib/fib/os/files.fib#L16) |
 | `page-size` | defun | [lib/fib/os/system.fib:13](../../../lib/fib/os/system.fib#L13) |
 | `parent-process-id` | defun | [lib/fib/os/process.fib:9](../../../lib/fib/os/process.fib#L9) |
@@ -55,7 +55,7 @@ Generated declaration inventory of [fib.os](../../../lib/fib/os.fib). Source lin
 | `set-inheritable` | defun | [lib/fib/os/io.fib:35](../../../lib/fib/os/io.fib#L35) |
 | `set-nonblocking` | defun | [lib/fib/os/io.fib:30](../../../lib/fib/os/io.fib#L30) |
 | `setenv` | defun | [lib/fib/os/environment.fib:5](../../../lib/fib/os/environment.fib#L5) |
-| `sleep-ns` | defun | [lib/fib/os/time.fib:12](../../../lib/fib/os/time.fib#L12) |
+| `sleep-ns` | defun | [lib/fib/os/time.fib:13](../../../lib/fib/os/time.fib#L13) |
 | `stderr` | def | [lib/fib/os/io.fib:7](../../../lib/fib/os/io.fib#L7) |
 | `stdin` | def | [lib/fib/os/io.fib:5](../../../lib/fib/os/io.fib#L5) |
 | `stdout` | def | [lib/fib/os/io.fib:6](../../../lib/fib/os/io.fib#L6) |
@@ -65,13 +65,14 @@ Generated declaration inventory of [fib.os](../../../lib/fib/os.fib). Source lin
 | `temp-directory` | defun | [lib/fib/os/environment.fib:15](../../../lib/fib/os/environment.fib#L15) |
 | `terminal?` | defun | [lib/fib/os/io.fib:25](../../../lib/fib/os/io.fib#L25) |
 | `thread-count` | defun | [lib/fib/os/process.fib:61](../../../lib/fib/os/process.fib#L61) |
+| `thread-yield` | defun | [lib/fib/os/time.fib:24](../../../lib/fib/os/time.fib#L24) |
 | `timeout-error` | defun | [lib/fib/os/errors.fib:23](../../../lib/fib/os/errors.fib#L23) |
 | `truncate-fd` | defun | [lib/fib/os/files.fib:52](../../../lib/fib/os/files.fib#L52) |
 | `unsetenv` | defun | [lib/fib/os/environment.fib:11](../../../lib/fib/os/environment.fib#L11) |
 | `wait-any-child` | defun | [lib/fib/os/process.fib:111](../../../lib/fib/os/process.fib#L111) |
 | `wait-child` | defun | [lib/fib/os/process.fib:119](../../../lib/fib/os/process.fib#L119) |
-| `wall-now` | defun | [lib/fib/os/time.fib:11](../../../lib/fib/os/time.fib#L11) |
-| `wall-ns` | defun | [lib/fib/os/time.fib:9](../../../lib/fib/os/time.fib#L9) |
+| `wall-now` | defun | [lib/fib/os/time.fib:12](../../../lib/fib/os/time.fib#L12) |
+| `wall-ns` | defun | [lib/fib/os/time.fib:10](../../../lib/fib/os/time.fib#L10) |
 | `write-all` | defun | [lib/fib/os/io.fib:16](../../../lib/fib/os/io.fib#L16) |
 | `write-fd` | defun | [lib/fib/os/io.fib:14](../../../lib/fib/os/io.fib#L14) |
 | `write-fd-range` | defun | [lib/fib/os/io.fib:12](../../../lib/fib/os/io.fib#L12) |

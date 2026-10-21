@@ -1,6 +1,7 @@
 (ns fib.os.time (:use fib.core fib.os.errors) (:require [fib.os.native :as n] [fib.os.abi :as a]))
 (extern clock_gettime :private (i32 ptr) -> i32)
 (extern nanosleep :private (ptr ptr) -> i32)
+(extern sched_yield :private () -> i32)
 (defun clock :private (id: i64) -> (Result i64 OSError)
   (unsafe (let [slot (alloc 16) result (clock_gettime (trunc i32 id) slot) saved (n/errno)
                 value (+ (* (load-i64 slot) 1000000000) (load-i64 (ptr+ slot 8)))]
@@ -17,3 +18,7 @@
           (let [r (nanosleep slot slot) code (n/errno)]
             (cond (= r 0i32) (Ok ()) (= code 4) (recur) :else (Err (error-from-code code "nanosleep")))))]
           (do (free slot) result)))))))
+
+;; Gives the processor up to another thread that can run, and comes back at once when none can: a spinning thread's polite step (`sched_yield`). Use it between looks at a word another thread
+;; will write, after a few `fib.atomic/spin-hint` looks; `sleep-ns` is for waits that are long.
+(defun thread-yield () -> unit (unsafe (do (sched_yield) ())))
