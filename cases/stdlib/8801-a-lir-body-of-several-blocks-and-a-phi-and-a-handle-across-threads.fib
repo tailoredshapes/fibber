@@ -1,0 +1,26 @@
+;; spec:   syntax §3.15a (lir), docs/design/inline-lir.md, lir.md 6.6 and 6.6a
+;; expect: accept
+;; result: 7
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; A body is blocks, so a loop is blocks and a phi. A `ptr` may not cross a thread, so a cell is passed as the i64 of its address and turned back inside the lIR (`inttoptr`): one task spins
+;; with `(spin-hint)` until the other publishes with a release store.
+(ns main (:use fib.core tl.check))
+
+(defun address (p: ptr) -> i64 (unsafe (lir [p: ptr] -> i64 "(block entry (ret (ptrtoint i64 p)))")))
+(defun publish (h: i64 v: i64) -> unit
+  (unsafe (lir [h: i64 v: i64] -> unit "(block entry (atomic-store release v (inttoptr ptr h)) (ret))")))
+(defun wait-for-it (h: i64) -> i64
+  (unsafe (lir [h: i64] -> i64
+    "(block entry (br look))
+     (block look
+       (let ((v (atomic-load acquire i64 (inttoptr ptr h))))
+         (br (icmp ne v (i64 0)) got again)))
+     (block again (spin-hint) (br look))
+     (block got (ret v))")))
+
+(defun main () -> i64
+  (unsafe (let [h (address (alloc 8))
+                t (spawn (fn () (wait-for-it h)))]
+            (do (publish h 7) (join t)))))

@@ -1,0 +1,21 @@
+;; compiler/lir/site.fib: the function of a `(lir [p: T ..] -> R "body")` site (docs/design/inline-lir.md). The type checker makes it to refuse a faulty body at once, and the emitter
+;; makes it again to put it in the module: `(define inline internal (NAME R) ((T p) ..) BODY)` as text, parsed and checked as lIR.
+(ns lir.site (:use lir.diag lir.types lir.ast)
+  (:require [lir.parse :as parse] [lir.check :as check]))
+
+;; The text of the function. The body goes on the line after the header, so a position inside the body is the position in the string, one line down.
+(defun site-source (name: str ret: (Option LType) ps: (Vec LType) names: (Vec str) body: str) -> str
+  (str-join ["(define inline internal (" name " " (match ret ((some t) (type-str t)) (nil "void")) ") ("
+             (str-join (vec (interpose " " (map-indexed (fn (i: i64 t: LType) (str-join ["(" (type-str t) " " (nth names i) ")"])) ps)))) ")\n" body ")"]))
+
+;; The function, parsed and checked, or what is wrong with the body: `line L column C: message`, the position being the string's.
+(defun site-item (name: str ret: (Option LType) ps: (Vec LType) names: (Vec str) body: str) -> (Result LItem str)
+  (match (parse/parse-source (site-source name ret ps names body))
+    ((Err e) (Err (fault e)))
+    ((Ok module)
+     (match (check/check module)
+       ((Err errs) (Err (fault (nth errs 0))))
+       ((Ok _) (Ok (nth (. module items) 0)))))))
+
+(defun fault :private (e: Diagnostic) -> str
+  (str-join ["lir body, line " (show (- (pos-line (. e pos)) 1)) " column " (show (pos-col (. e pos))) ": " (. e message)]))

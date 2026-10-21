@@ -13,7 +13,7 @@
 ;; - `plain_param` returns a `Triple` (name, annotation, next index), `ret_annotation` a `Pair`
 ;;   (annotation, body start).
 (ns types.lower.expr
-  (:require [expand.heads :as heads])
+  (:require [expand.heads :as heads] [lir.site :as lsite] [lir.types :as lt])
   (:use syntax.pos syntax.form syntax.print types.ty types.scheme types.error types.store types.table
         types.ast types.decls types.names types.lower.typeform types.lower.decl types.lower.scope
         types.lower.pattern types.lower.bindings types.lower.clause types.lower.call))
@@ -106,6 +106,7 @@
           (= head "async") (async-form lw items form)
           (= head "await") (await-form lw items form)
           (= head "unsafe") (unsafe-form lw items form)
+          (= head "lir") (lir-form lw items form tail)
           (= head "quote")
            (if (= (count items) 2)
                (Ok (lw-mk lw pos (EQuote (nth items 1))))
@@ -121,6 +122,61 @@
       (let ((body (body-or-unit lw (rest-items items 1) form false)))
         (do (set! (. lw unsafe-depth) (- @(. lw unsafe-depth) 1))
             (try-let ((b body)) (Ok (lw-mk lw (. form pos) (EUnsafe b))))))))
+
+;; `(lir [p: T ..] -> R "body")` (docs/design/inline-lir.md): a function whose body is lIR, called at once with the variables of the same names. It is an extern the
+;; compiler makes on the spot (an `ExternDef` with a `lir` body: the emitter defines an `inline internal` lIR function where an ordinary extern is declared) and the
+;; call of it, so everything an extern call is (scalars and `ptr` only, `unsafe` only, opaque to ownership) it is.
+(defun lir-form :private (lw: Lowerer items: (Vec Stx) form: Stx tail: bool) -> (Result Expr TypeError)
+  (let ((pos (. form pos)) (g (. lw g)) (bad (resolve-err (. form pos) "expected (lir [name: type ..] -> type \"body\")")))
+    (match (Pair (if (= (count items) 5) (. (nth items 1) kind) SNil) (. (nth items 4) kind))
+      ((Pair (SVec ops) (SStr body))
+       (if (not (= (stx-as-sym (nth items 2)) (some "->")))
+           bad
+           (try-let ((pairs (lir-operands ops)))
+             (try-let ((params (lir-types g (. lw m) pairs))
+                       (ret (extern-scalar g (. lw m) "lir" (nth items 3))))
+               (let ((id (table-count (. g externs)))
+                     (names (mapv (fn (p: (Pair str Stx)) (. p fst)) pairs)))
+                 (let ((name (str-join ["fib.lir." (show id)])))
+                   (try-let ((checked (match (lsite/site-item name (lir-scalar ret) (mapv lir-scalar-or-ptr params) names body)
+                                        ((Err m) (resolve-err pos m))
+                                        ((Ok _) (Ok ())))))
+                   (do (table-add (. g externs) (ExternDef name (TFn CSend params ret) false pos -1 "" (g-module-name g (. lw m)) body names))
+                       (try-let ((done (define-value g (. lw m) name (GExtern id) pos)))
+                         (lw-call lw (into [(Stx (SSym name) pos)] (mapv (fn (n: str) (Stx (SSym n) pos)) names)) form))))))))))
+      (_ bad))))
+
+;; The lIR type of an extern position (types.lower.typeform `extern-scalar` made it a scalar, `ptr` or `unit`), as emit.layout `lir-ty` has it.
+(defun lir-scalar :private (t: Ty) -> (Option lt/LType)
+  (match t
+    ((TCon (KScalar s) _)
+     (match s
+       ((types.ty/SBool) (some lt/ty-i1)) ((SI8) (some lt/ty-i8)) ((SI16) (some lt/ty-i16)) ((SI32) (some lt/ty-i32)) ((SChar) (some lt/ty-i32))
+       ((SI64) (some lt/ty-i64)) ((SKeyword) (some lt/ty-i64)) ((SF32) (some lt/ty-float)) ((SF64) (some lt/ty-double))
+       ((SPtr) (some lt/ty-ptr)) ((SUnit) nil)))
+    (_ nil)))
+
+(defun lir-scalar-or-ptr :private (t: Ty) -> lt/LType (unwrap-or (lir-scalar t) lt/ty-ptr))
+
+;; The types of the operands of a `lir` form, in order, the first fault stopping.
+(defun lir-types :private (g: Globals m: i64 pairs: (Vec (Pair str Stx))) -> (Result (Vec Ty) TypeError)
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count pairs))
+        (Ok out)
+        (match (extern-scalar g m "lir" (. (nth pairs i) snd))
+          ((Err e) (Err e))
+          ((Ok t) (recur (+ i 1) (conj out t)))))))
+
+;; The `name: type` pairs of the operands of a `lir` form.
+(defun lir-operands :private (ops: (Vec Stx)) -> (Result (Vec (Pair str Stx)) TypeError)
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count ops))
+        (Ok out)
+        (match (annotation-name (nth ops i))
+          ((some n) (if (< (+ i 1) (count ops))
+                        (recur (+ i 2) (conj out (Pair n (nth ops (+ i 1)))))
+                        (resolve-err (. (nth ops i) pos) "lir: an operand written name: needs its type")))
+          (nil (resolve-err (. (nth ops i) pos) "lir: write each operand as name: type"))))))
 
 (defun body-or-unit :private (lw: Lowerer forms: (Vec Stx) form: Stx tail: bool) -> (Result Expr TypeError)
   (if (empty? forms)

@@ -1,6 +1,6 @@
 # Inline lIR: `(unsafe (lir ...))`, ordered atomics and the cache line
 
-Status: **proposed** (2026-10-20), nothing built; the owner has decided the two open questions of section 9 (a live swap re-emits a changed site; the `inline` modifier is accepted). Written from `fib-disruptor` (a ring buffer between threads, `/tank/repos/tailoredshapes/fib-disruptor`), whose
+Status: **built** (2026-10-20 and 21: steps 2 to 4 of section 10, and step 5 for fib-disruptor); section 11 says where the built form differs from the proposal; the owner has decided the two open questions of section 9 (a live swap re-emits a changed site; the `inline` modifier is accepted). Written from `fib-disruptor` (a ring buffer between threads, `/tank/repos/tailoredshapes/fib-disruptor`), whose
 hot path had to be lIR in a separate shared library. The owner's rule for this design: *the best practice is the easiest thing; a foot gun is always allowed, as long
 as the hoops make it obvious that is what you are doing.*
 
@@ -148,3 +148,20 @@ the report.
 3. The `lir` form: syntax.md 3.15, types.md, the parser entry (`lir.parse` from a string with a position offset), `own` (a scalar with effects), `emit` (the site function and the call), cases.
 4. `fib.atomic` and its cases; `fibc explain unsafe`.
 5. fib-disruptor moves onto it; the acceptance case.
+
+## 11. As built (2026-10-21)
+
+The form, the library and the acceptance case are built (fibber commits after `62437696`; spec/syntax.md 3.15a; cases/stdlib 8800 to 8806 and 8810; lib/fib/atomic.fib). Differences from the proposal above:
+
+* **The operands are typed at the site**: `(lir [p: ptr v: i64] -> unit "body")`, not `[p v]`. The type checker lowers a form to an extern it makes on the spot (an `ExternDef` with a `lir` body and
+  parameter names) and a call of it, so scalars-and-`ptr`-only, `unsafe`-only and opaque-to-ownership are the extern's own rules, and nothing in the ownership checker changed. The types had to be
+  written because the lowering happens before inference.
+* **The body is checked at type-check time**, not when the code is emitted: a refusal is a type error at the form, which is also what the case harness needs to count it as a rejection. `lir.site` makes
+  the function's text and checks it; the emitter makes it again to put it in the module.
+* **A body may not call a function** (there is no way to declare one in it yet): sleeping a thread, `sched_yield` and so on stay in the platform layer.
+* **The partitioner** (compiler/native/liro/partition.fib) copies every `inline` function into every unit that calls it, always (before, copying small functions across units was an opt-in knob,
+  `FIB_LIRO_IMPORT`); without it `alwaysinline` cannot inline a call into another unit, which is where the default build splits the program.
+* **`(cache-line)` is not a fibber builtin**: `fib.atomic/cache-line` wraps the lIR form and LLVM folds the constant. The table is per architecture (types.targets `cache-line-of-arch`), not per CPU.
+* **Measured** (fib-disruptor, one producer and one consumer, an i7-14700KF, two runs each): the ring written in fibber over `fib.atomic` runs 550 to 560 M events a second at batch 64 and 1024 and 40 M
+  at batch 1; the extern version ranged 25 to 32 M at batch 1 and 270 to 660 M above. Its 24 specs and 13 mutants run under a plain `fibc test`: no shared library, no build script, no `LD_PRELOAD`.
+* **Not built yet**: `fibc explain unsafe`; the rule in the arch test that a `lir` site in `lib/` sits in a module that says so in its header; a way for a body to declare what it calls; running the cases on AArch64.

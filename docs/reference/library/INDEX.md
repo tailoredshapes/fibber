@@ -8,6 +8,7 @@ All exports are pre-1.0; proposed S/E/I classes and “since” versions await e
 |---|---|
 | [fib.adder](fib.adder.md) | 5 |
 | [fib.async](fib.async.md) | 4 |
+| [fib.atomic](fib.atomic.md) | 22 |
 | [fib.autodiff](fib.autodiff.md) | 63 |
 | [fib.bigint](fib.bigint.md) | 28 |
 | [fib.char](fib.char.md) | 2 |

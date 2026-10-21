@@ -1,0 +1,31 @@
+;; spec:   stdlib (fib.atomic), docs/design/inline-lir.md
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; Single-threaded values of every operation, the line size a power of two, and a handle that survives the trip through an i64.
+(ns main (:use fib.core tl.check fib.atomic))
+
+(defun main () -> i64
+  (unsafe
+    (let [c (checks) p (alloc 64) q (pointer (address p))]
+      (do (store-release-i64 p 5)
+          (check c (= (load-acquire-i64 p) 5))
+          (store-relaxed-i64 p 6)
+          (check c (= (load-relaxed-i64 p) 6))
+          (store-seq-cst-i64 p 7)
+          (check c (= (load-seq-cst-i64 p) 7))
+          (check c (cas-i64 p 7 70))
+          (check c (not (cas-i64 p 7 71)))
+          (check c (= (load-acquire-i64 p) 70))
+          (check c (= (fetch-add-i64 p 5) 70))
+          (check c (= (exchange-i64 p 1) 75))
+          (check c (= (load-acquire-i64 p) 1))
+          (store-release-i32 (ptr+ p 8) 9i32)
+          (check c (= (load-acquire-i32 (ptr+ p 8)) 9i32))
+          (check c (= (load-acquire-i64 q) 1))
+          (fence-acquire) (fence-release) (fence-seq-cst) (spin-hint)
+          (check c (and (>= (cache-line) 32) (= (bit-and (cache-line) (- (cache-line) 1)) 0)))
+          (free p)
+          (checks-result c)))))

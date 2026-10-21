@@ -8,7 +8,7 @@
 ;; The runtime's own `declare` (`runtime-declaration`) is emit.rt's.
 ;; E11 added the last field, `macro-module` (Rust `macro_module: bool`, set by `compile-macro`): a trap of a macro module fails the expansion.
 (ns emit.program
-  (:require [fib.string :as s] [fib.unix :as unix] [emit.os :as os] [lir.ast :as la] [lir.types :as lt] [emit.node :as node] [emit.lirdata :as data] [lir.print :as print] [expand.targetos :as tos] [expand.modules :as mods] [emit.function :as f])
+  (:require [fib.string :as s] [fib.unix :as unix] [emit.os :as os] [lir.ast :as la] [lir.types :as lt] [emit.node :as node] [emit.lirdata :as data] [lir.print :as print] [lir.site :as lir-site] [expand.targetos :as tos] [expand.modules :as mods] [emit.function :as f])
   (:use types.ty types.ast types.decls types.table types.display types.init types.program own.program emit.value emit.layout emit.names
         emit.mono emit.objects emit.statics emit.rt emit.kwdyn))
 
@@ -315,6 +315,12 @@
       (let ((tid (objects-intern (. p objects) (. spec sname) (printer-ty (printer-new g) t) (. spec kind))))
         (Ok (Pair tid (. spec sname)))))))
 
+;; The function of a `(lir [p: T ..] -> R "body")` site (docs/design/inline-lir.md): made again here, the type checker having refused a faulty body already.
+(defun lir-site-item (d: ExternDef ps: (Vec lt/LType) rtype: (Option lt/LType)) -> (Result la/LItem str)
+  (match (lir-site/site-item (. d name) rtype ps (. d lir-params) (. d lir))
+    ((Err m) (Err (str-join [(. (. d pos) file) ":" (show (. (. d pos) line)) ":" (show (. (. d pos) col)) ": " m])))
+    ((Ok it) (Ok it))))
+
 ;; Rust: program.rs:221 Program::declare_extern
 (defun program-declare-extern (p: Program d: ExternDef) -> (Result unit str)
   (match (. d ty)
@@ -326,8 +332,10 @@
                  (result (lir-ty g ret)))
          (let ((fixed (if (and (. d varargs) (>= (. d fixed) 0) (< (. d fixed) (count ps))) (vec (take (. d fixed) ps)) ps))
                (rtype (match result ((some t) (some (lir-type t))) (nil nil))))
-           (let ((ty (lt/LFnType lt/cc-c rtype fixed (. d varargs)))
-                 (decl (la/ItDeclare (la/LDeclare (. d name) (lt/LFnType lt/cc-c rtype fixed (. d varargs)) false 0))))
+           (try-let ((decl (if (= (. d lir) "")
+                               (Ok (la/ItDeclare (la/LDeclare (. d name) (lt/LFnType lt/cc-c rtype fixed (. d varargs)) false 0)))
+                               (lir-site-item d ps rtype))))
+           (let ((ty (lt/LFnType lt/cc-c rtype fixed (. d varargs))))
              (match (runtime-declaration (. d name))
                ((some own)
                 (match (first (data/read-runtime own))
@@ -335,13 +343,13 @@
                    (if (= (. runtime ty) ty) (Ok ()) (Err (str-join ["extern " (. d name) " conflicts with the runtime's " own]))))
                   (_ (Err (str "invalid runtime declaration of " (. d name))))))
                (nil
-                (do (when (not-any? (fn (item: la/LItem) (match item ((la/ItDeclare other) (= (. other name) (. d name))) (_ false))) @(. p externs))
+                (do (when (not-any? (fn (item: la/LItem) (match item ((la/ItDeclare other) (= (. other name) (. d name))) ((la/ItDefine other) (= (. other name) (. d name))) (_ false))) @(. p externs))
                       (cell-update! (. p externs) (fn (externs: (Vec la/LItem)) (conj externs decl))))
                     (when-not (= (. d lib) "")
                       (let ((note (Pair (. d lib) (. d owner))))
                         (when-not (includes? note @(. p link-notes))
                           (cell-update! (. p link-notes) (fn (notes: (Vec (Pair str str))) (conj notes note))))))
-                    (Ok ())))))))))
+                    (Ok ()))))))))))
     (_ (Err "an extern without a function type"))))
 
 ;; Rust: program.rs:258 Program::fresh_quote

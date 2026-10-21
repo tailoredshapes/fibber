@@ -1,0 +1,46 @@
+;; fib.atomic: atomic operations on raw memory with their ordering named, for code that has left the checker's care (docs/design/inline-lir.md, lir.md 6.6, 6.6a).
+;; Explicit: `(:use fib.atomic)`. Every function is a few lines of lIR through the `lir` form, and inlines into its caller (an `inline` lIR function), so a release store is one `mov` on x86-64
+;; and one `stlr` on AArch64. fibber's own atoms are `seq_cst` throughout (a store is an `xchg` on x86-64) and sit where the allocator puts them; these are for a ring, a flag, a counter
+;; that two threads share and that the caller lays out.
+;;
+;;   (load-acquire-i64 p) (load-relaxed-i64 p) (load-seq-cst-i64 p)     and -i32          p : ptr, aligned to the size of the type (a misaligned atomic is undefined)
+;;   (store-release-i64 p v) (store-relaxed-i64 p v) (store-seq-cst-i64 p v)   and -i32
+;;   (cas-i64 p expected new) -> bool        compare-and-swap, acquire-release; a failure is an acquire load
+;;   (fetch-add-i64 p v) -> i64              the old value, acquire-release
+;;   (exchange-i64 p v) -> i64               the old value, acquire-release
+;;   (fence-acquire) (fence-release) (fence-seq-cst)
+;;   (spin-hint)                             the target's pause (x86-64 `pause`, AArch64 `yield`), no ordering
+;;   (cache-line)                            the target's destructive interference size in bytes: pad what two threads write by it
+;;   (address p) (pointer a)                 a `ptr` as an i64 and back: a `ptr` may not cross a thread, an i64 may
+;; A pointer comes from `alloc`, `ptr+` or `raw`, which are `unsafe` themselves: what these functions take cannot be had without having said so.
+(ns fib.atomic)
+
+(defun load-acquire-i64 (p: ptr) -> i64 (unsafe (lir [p: ptr] -> i64 "(block entry (ret (atomic-load acquire i64 p)))")))
+(defun load-relaxed-i64 (p: ptr) -> i64 (unsafe (lir [p: ptr] -> i64 "(block entry (ret (atomic-load monotonic i64 p)))")))
+(defun load-seq-cst-i64 (p: ptr) -> i64 (unsafe (lir [p: ptr] -> i64 "(block entry (ret (atomic-load seq_cst i64 p)))")))
+(defun load-acquire-i32 (p: ptr) -> i32 (unsafe (lir [p: ptr] -> i32 "(block entry (ret (atomic-load acquire i32 p)))")))
+(defun load-relaxed-i32 (p: ptr) -> i32 (unsafe (lir [p: ptr] -> i32 "(block entry (ret (atomic-load monotonic i32 p)))")))
+(defun load-seq-cst-i32 (p: ptr) -> i32 (unsafe (lir [p: ptr] -> i32 "(block entry (ret (atomic-load seq_cst i32 p)))")))
+
+(defun store-release-i64 (p: ptr v: i64) -> unit (unsafe (lir [p: ptr v: i64] -> unit "(block entry (atomic-store release v p) (ret))")))
+(defun store-relaxed-i64 (p: ptr v: i64) -> unit (unsafe (lir [p: ptr v: i64] -> unit "(block entry (atomic-store monotonic v p) (ret))")))
+(defun store-seq-cst-i64 (p: ptr v: i64) -> unit (unsafe (lir [p: ptr v: i64] -> unit "(block entry (atomic-store seq_cst v p) (ret))")))
+(defun store-release-i32 (p: ptr v: i32) -> unit (unsafe (lir [p: ptr v: i32] -> unit "(block entry (atomic-store release v p) (ret))")))
+(defun store-relaxed-i32 (p: ptr v: i32) -> unit (unsafe (lir [p: ptr v: i32] -> unit "(block entry (atomic-store monotonic v p) (ret))")))
+(defun store-seq-cst-i32 (p: ptr v: i32) -> unit (unsafe (lir [p: ptr v: i32] -> unit "(block entry (atomic-store seq_cst v p) (ret))")))
+
+(defun cas-i64 (p: ptr expected: i64 new: i64) -> bool
+  (unsafe (lir [p: ptr expected: i64 new: i64] -> bool
+    "(block entry (let ((r (cmpxchg acq_rel acquire p expected new))) (ret (extractvalue r 1))))")))
+(defun fetch-add-i64 (p: ptr v: i64) -> i64 (unsafe (lir [p: ptr v: i64] -> i64 "(block entry (ret (atomicrmw add acq_rel p v)))")))
+(defun exchange-i64 (p: ptr v: i64) -> i64 (unsafe (lir [p: ptr v: i64] -> i64 "(block entry (ret (atomicrmw xchg acq_rel p v)))")))
+
+(defun fence-acquire () -> unit (unsafe (lir [] -> unit "(block entry (fence acquire) (ret))")))
+(defun fence-release () -> unit (unsafe (lir [] -> unit "(block entry (fence release) (ret))")))
+(defun fence-seq-cst () -> unit (unsafe (lir [] -> unit "(block entry (fence seq_cst) (ret))")))
+
+(defun spin-hint () -> unit (unsafe (lir [] -> unit "(block entry (spin-hint) (ret))")))
+(defun cache-line () -> i64 (unsafe (lir [] -> i64 "(block entry (ret (cache-line)))")))
+
+(defun address (p: ptr) -> i64 (unsafe (lir [p: ptr] -> i64 "(block entry (ret (ptrtoint i64 p)))")))
+(defun pointer (a: i64) -> ptr (unsafe (lir [a: i64] -> ptr "(block entry (ret (inttoptr ptr a)))")))

@@ -15,7 +15,7 @@
 ;; - `builtin_con` and `is_var_name` are `builtin-con` and `var-name?`.
 (ns types.lower.typeform
   (:use syntax.pos syntax.form syntax.print types.ty types.scheme types.error types.store
-        types.table types.ast types.decls types.names types.target))
+        types.table types.ast types.decls types.names types.target types.annot))
 
 ;; ---- the forms as Rust's Form methods see them
 
@@ -352,3 +352,21 @@
                            (str-join ["protocol " name " has " (show want)
                                       " determined parameter(s)"]))))
         (resolve-err (. form pos) (g-unknown g m SpProto name "unknown protocol"))))))
+
+;; ---- the positions of an extern, shared with the `lir` form (types.lower.expr)
+
+;; Extern types are closed: a variable is an error, colours are `send`.
+(defstruct ClosedEnv (extern: str))
+
+(impl AnnEnv ClosedEnv
+  (ann-var (self name pos) (resolve-err pos (str-join ["unknown type " name])))
+  (ann-colour (self) CSend))
+
+;; One extern position: a scalar, `ptr` or `unit`.
+(defun extern-scalar (g: Globals m: i64 name: str f: Stx) -> (Result Ty TypeError)
+  (try-let ((a (type-ann g m f false)))
+    (match a
+      ((AScalar s) (ann-to-ty (AScalar s) (ClosedEnv name) (. f pos)))
+      ((ASimd _ _) (Err (type-error-other (. f pos) "an extern position cannot be a vector (the C ABI of a vector is the target's, not fibber's): pass the lanes through a pointer or as scalars")))
+      (_ (Err (type-error-other (. f pos) "extern positions are scalars, ptr or unit"))))))
+

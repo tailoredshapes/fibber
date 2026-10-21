@@ -5,7 +5,7 @@
   (:use lir.ast lir.types native.liro.deps)
   (:require [lir.check.walk :as walk]))
 
-(defstruct LiroIndex (symbols: (Map str LItem) structs: (Map str LStructDef) target: (Vec LItem)))
+(defstruct LiroIndex (symbols: (Map str LItem) structs: (Map str LStructDef) target: (Vec LItem) inlines: (Set str)))
 (defun symbol-name (it: LItem) -> str
   (match it
     ((ItDefine f) (. f name)) ((ItGlobal g) (. g name))
@@ -16,8 +16,10 @@
             (match it
               ((ItStruct s) (with acc (structs (assoc (. acc structs) (. s name) s))))
               ((ItTarget _) (with acc (target (conj (. acc target) it))))
+              ((ItDefine f) (with acc (symbols (assoc (. acc symbols) (. f name) it))
+                                      (inlines (if (. (. f mods) inline) (conj (. acc inlines) (. f name)) (. acc inlines)))))
               (_ (with acc (symbols (assoc (. acc symbols) (symbol-name it) it))))))
-          (LiroIndex {} {} []) (. m items)))
+          (LiroIndex {} {} [] (set-empty)) (. m items)))
 
 (defun exported (it: LItem) -> LItem
   (match it
@@ -95,7 +97,8 @@
 ;; Opt-in cross-unit inlining (experiment): FIB_LIRO_IMPORT=T copies every function of at most T expression nodes that a unit
 ;; calls into that unit as an internal definition, so LLVM can inline it; FIB_LIRO_IMPORT_DEPTH=D (default 2) rounds of copies
 ;; (a copy's own callees are copied the next round). The owner keeps the one external definition; the glue unit gets none (a global
-;; initializer must name the owner). T=0 (default) copies nothing.
+;; initializer must name the owner). T=0 (default) copies nothing, except the functions written `inline` (spec/lir.md 4.3): they are always copied into
+;; every unit that calls them, whatever their size, because `alwaysinline` cannot inline a call into another unit.
 (defun env-count (name: str default: i64) -> i64
   (match (sys-getenv name) ((some s) (unwrap-or (parse-long s) default)) (nil default)))
 (defun count-expr (acc: (Cell i64) e: LExpr) -> unit
@@ -104,7 +107,7 @@
   (let ((acc (cell 0))) (do (doseq [b (. f blocks)] (doseq [e (. b body)] (count-expr acc e))) @acc)))
 (defun small-def (idx: LiroIndex n: str limit: i64) -> (Option LItem)
   (match (get (. idx symbols) n)
-    ((some it) (match it ((ItDefine f) (if (<= (fn-size f) limit) (some (internal-copy it)) nil)) (_ nil)))
+    ((some it) (match it ((ItDefine f) (if (or (contains? (. idx inlines) n) (<= (fn-size f) limit)) (some (internal-copy it)) nil)) (_ nil)))
     (nil nil)))
 (defun internal-copy (it: LItem) -> LItem
   (match it ((ItDefine f) (ItDefine (with f (mods (LModifiers LkInternal false (. (. f mods) inline)))))) (_ it)))
@@ -120,7 +123,9 @@
               (recur (+ round 1) picked (into own (mapv symbol-name picked)) (into out picked)))))))
 (defun unit-defs (idx: LiroIndex defs: (Vec LItem)) -> (Vec LItem)
   (let ((limit (env-count "FIB_LIRO_IMPORT" 0)))
-    (if (<= limit 0) defs (into defs (copies-of idx defs limit (env-count "FIB_LIRO_IMPORT_DEPTH" 2))))))
+    (if (and (<= limit 0) (= (count (. idx inlines)) 0))
+        defs
+        (into defs (copies-of idx defs limit (env-count "FIB_LIRO_IMPORT_DEPTH" 2))))))
 
 (defun modules-with (m: LModule copy: bool) -> (Vec LModule)
   (let ((idx (index-of m)) (groups (groups-of m)))
@@ -129,7 +134,11 @@
               (unit-module idx (if (and copy (not (= name "glue"))) (unit-defs idx defs) defs))))
           (vec (sort (keys groups))))))
 (defun modules (m: LModule) -> (Vec LModule) (modules-with m false))
+;; Whether the module has a function written `inline` (spec/lir.md 4.3): it is copied into the units that call it.
+(defun has-inline? (m: LModule) -> bool
+  (some? (first (filter (fn (it: LItem) (match it ((ItDefine f) (. (. f mods) inline)) (_ false))) (. m items)))))
+(defun copying? (m: LModule) -> bool (or (> (env-count "FIB_LIRO_IMPORT" 0) 0) (has-inline? m)))
 ;; The units to compile: `modules` plus the copies, which are checked after the plain units were validated.
-(defun modules-to-compile (m: LModule) -> (Vec LModule) (modules-with m (> (env-count "FIB_LIRO_IMPORT" 0) 0)))
+(defun modules-to-compile (m: LModule) -> (Vec LModule) (modules-with m (copying? m)))
 (defun validation-units (m: LModule units: (Vec LModule)) -> (Vec LModule)
-  (if (and (> (count units) 1) (> (env-count "FIB_LIRO_IMPORT" 0) 0)) (modules m) units))
+  (if (and (> (count units) 1) (copying? m)) (modules m) units))
