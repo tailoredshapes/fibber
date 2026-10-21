@@ -63,7 +63,8 @@ if [ "$(uname -s)" = Darwin ]; then echo "skip build -L DIR: the rpath is what f
 else
   ck "build -L DIR: the rpath is what finds the library (moved away, it does not start)" "$(cd /; env -u LD_LIBRARY_PATH "$t/lair-rpath" 2>&1 | grep -c -E 'libhooktest.so: cannot open')" 1
 fi
-ck "build -L DIR: a relative directory is an absolute rpath" "$($s2 build "$t/lair.fib" -o "$t/lair-rel" -L "$(python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$t/rp-moved" "$root")" -l hooktest > /dev/null 2>&1; cd /; env -u LD_LIBRARY_PATH "$t/lair-rel" 2>&1; echo $?)" 0
+# (the relative path is computed between the real directories: a checkout reached through a symlink has a $PWD that is not where the build runs)
+ck "build -L DIR: a relative directory is an absolute rpath" "$($s2 build "$t/lair.fib" -o "$t/lair-rel" -L "$(python3 -c 'import os,sys; print(os.path.relpath(os.path.realpath(sys.argv[1]), os.path.realpath(sys.argv[2])))' "$t/rp-moved" "$root")" -l hooktest > /dev/null 2>&1; cd /; env -u LD_LIBRARY_PATH "$t/lair-rel" 2>&1; echo $?)" 0
 mkdir -p "$t/jc"; cp cases/ownership/01-return-part-of-argument.fib "$t/jc/"
 ck "cases DIR -j 2 runs and counts as without it, exit 0" "$($s2 cases "$t/jc" -j 2 | tail -1; echo $?)" "$(printf '1 cases: 1 pass, 0 fail, 0 pending, 0 header error\n0')"
 ck "cases -j 0: usage on standard error, exit 2" "$($s2 cases "$t/jc" -j 0 2>&1 >/dev/null | head -1; $s2 cases "$t/jc" -j 0 >/dev/null 2>&1; echo $?)" "$(printf 'usage: fibc <command>\n2')"
