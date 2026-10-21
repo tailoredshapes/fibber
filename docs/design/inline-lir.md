@@ -171,5 +171,5 @@ The form, the library and the acceptance case are built (fibber commits after `6
 * **Weak memory, checked on AArch64** (an Apple M1 Ultra, 2026-10-21; details in fib-disruptor's README): the compiled ring has `stlr`/`ldar`; its 26 specs pass there; weakening `publish` to a relaxed store is
   caught 5 runs in 5 on the M1 and 0 in 3 on x86-64; weakening the consumer's `advance` or the producer's read of the consumers' cursors was not caught by anything in 5 runs: those two orderings are shown by the
   memory model and not by a test.
-* **Not built**: a way for a body to declare what it calls (not wanted, above); an AArch64 run of fibber's own `lir` cases (the compiler cross-built for the Mac runs fib-disruptor, which uses all of `fib.atomic`; the
-  cases were not run there).
+* **fibber's own cases on AArch64** (the same M1 Ultra, the compiler and `lairf` cross-built for it): `cases/stdlib` 8800 to 8806 and 8810 (8 of 8) and `cases/lir/inline` (8 of 8, `(spin-hint)` becoming `yield` and `(cache-line)` 128) pass.
+* **Not built**: a way for a body to declare what it calls (not wanted, above).
