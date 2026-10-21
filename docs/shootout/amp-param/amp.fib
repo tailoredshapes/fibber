@@ -1,0 +1,21 @@
+;; docs/shootout/amp-param.md: what a write costs through a helper with an & parameter, and in line, on a cell of its own and on a cell a struct also holds.
+;;   fibc run docs/shootout/amp-param/amp.fib
+(ns main (:use fib.core) (:require [fib.os.time :as t]))
+(defstruct K (head: (Cell (Array i64))))
+(defun wi! (&c: (Array i64) i: i64 v: i64) -> unit (array-set! &c i v))
+(defun ns-per (t0: i64 rounds: i64) -> f64 (/ (sitofp f64 (- (t/clock-now) t0)) (sitofp f64 rounds)))
+(defun fresh-cell-helper (n: i64 rounds: i64) -> f64
+  (let [c (cell (array n 0)) t0 (t/clock-now)]
+    (do (loop [r 0] (if (< r rounds) (do (wi! &c (rem r n) r) (recur (+ r 1))) ())) (ns-per t0 rounds))))
+(defun fresh-cell-inline (n: i64 rounds: i64) -> f64
+  (let [c (cell (array n 0)) t0 (t/clock-now)]
+    (do (loop [r 0] (if (< r rounds) (do (array-set! &c (rem r n) r) (recur (+ r 1))) ())) (ns-per t0 rounds))))
+(defun field-cell-helper (n: i64 rounds: i64) -> f64
+  (let [k (K (cell (array n 0))) head (. k head) t0 (t/clock-now)]
+    (do (loop [r 0] (if (< r rounds) (do (wi! &head (rem r n) r) (recur (+ r 1))) ())) (ns-per t0 rounds))))
+(defun field-cell-inline (n: i64 rounds: i64) -> f64
+  (let [k (K (cell (array n 0))) head (. k head) t0 (t/clock-now)]
+    (do (loop [r 0] (if (< r rounds) (do (array-set! &head (rem r n) r) (recur (+ r 1))) ())) (ns-per t0 rounds))))
+(defun report (n: i64) -> unit
+  (println "n =" n "| fresh local cell: helper" (fresh-cell-helper n 20000) "ns, in line" (fresh-cell-inline n 20000) "ns | cell shared with a struct: helper" (field-cell-helper n 20000) "ns, in line" (field-cell-inline n 20000) "ns"))
+(defun main () -> i64 (do (report 1000) (report 100000) 0))

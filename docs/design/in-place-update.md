@@ -201,6 +201,14 @@ running inside the primitive.
   ownership pass: with them only in `compiler/own`, `fibref explain` and `fibc explain` disagree on counts for the same
   program; record it as `compiler/mirror-pending/last-use.md` (the file CLAUDE.md asks for).
 
+### 4.3 A helper with an `&` parameter on a cell that a struct also holds (found 2026-10-21)
+
+A function `(defun wi! (&c: (Array i64) i v) (array-set! &c i v))` called as `(wi! &head i v)` is free when `head` is a cell of the caller's own, and **copies the whole array on every call** when `head` is
+a local name for a cell that a struct field also holds (`(let [head (. k head)] ..)`): the content is moved into the callee only when nothing else is known to hold the cell, so here it is retained for the call,
+and the callee's `array-set!` finds it shared. Measured: 192 ns at 1,000 entries and 16 microseconds at 100,000, against 1.7 ns written in line (docs/shootout/amp-param.md). The write in line, `(array-set! &head i v)`, is
+in place in both cases. This is the rule of section 1 applied (a write is in place when the array is unique, and a cell that is held twice does not show that it is), not a defect; the helper that looks like it
+costs nothing is the trap. physics-fib's kernel paid a factor of 35 at 1,000 spheres before it wrote its columns in line.
+
 ## 5. Levers (independent; each lists the files it touches)
 
 Ordered by payoff. Expected speed-ups are from the profile figures above and are **estimates to be measured**, not
