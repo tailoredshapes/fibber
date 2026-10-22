@@ -5,6 +5,7 @@
 #             host's main thread, of a second thread, of threads with 256 KiB and 64 MiB stacks, of 8 threads at once and of 60 started in turn: every call returns,
 #             `fib_status` says 1 and `fib_error` says `stack overflow`, the call after answers, an allocating recursion is the same, another trap is a status too
 #   planted   the same library built with FIB_STACK_CHECK=0 (no check emitted): the host must NOT pass (it dies of the overflow), or the test above cannot fail
+#   jitexit   the compiler itself builds a program with FIB_LIVE=1 and exits cleanly (no key destructor into freed JIT code)
 #   depth     the deepest recursion that completes, with the check and without it (a program that catches, a main stack of 256 MiB): the check takes no more than its
 #             margin (256 KiB) of it, and 100,000 frames and a million frames answer
 set -uo pipefail
@@ -12,7 +13,7 @@ s2=${1:?usage: stackcheck.sh STAGE2 [part..]}; shift
 s2=$(cd "$(dirname "$s2")" && pwd)/$(basename "$s2")
 root=$PWD; export FIB_LIB=${FIB_LIB:-$root/lib}
 here=$root/compiler/tests/shared
-parts=${*:-library planted depth}
+parts=${*:-library planted depth jitexit}
 ulimit -v 12000000
 scratch=${FIB_SCRATCH:-${TMPDIR:-$HOME/.cache/fibber-scratch}}; mkdir -p "$scratch"
 t=$(mktemp -d "$scratch/stackcheck.XXXXXX"); trap 'rm -rf "$t"' EXIT
@@ -52,5 +53,13 @@ if part depth; then
   echo "deepest recursion that completes: with the check $don frames, without $doff frames (bisected to 20000)"
   # the margin is 256 KiB of a frame of at least 16 bytes: at most 16384 frames; the bisection step is 20000
   if [ $((doff - don)) -le 40000 ] && [ $((doff - don)) -ge -40000 ]; then echo "ok    the check costs no more depth than its margin"; else echo "FAIL  the depths differ by $((doff-don))"; fail=1; fi
+fi
+if part jitexit; then
+  echo "== jitexit"
+  # The compiler builds a program in live mode (FIB_LIVE=1): its macros and defs run as JIT code whose program is freed while the compiler's own threads, which ran it, are
+  # alive. A pthread-key destructor pointing into that code killed the compiler at a thread's exit (`fatal signal 11`, found by the tsan gate stages); the key's destructor is
+  # libc's free outside a library.
+  FIB_LIVE=1 timeout 900 "$s2" build "$root/compiler/lairf.fib" -I "$root/compiler" -I "$root/lib" -L /usr/lib/llvm-21/lib -l LLVM-21 -o "$t/lairf" > "$t/jit.out" 2>&1; rc=$?
+  if [ $rc -eq 0 ]; then echo "ok    a compiler run in live mode ends cleanly (exit 0)"; else echo "FAIL  live-mode build exit $rc: $(tail -n 2 "$t/jit.out")"; fail=1; fi
 fi
 exit $fail

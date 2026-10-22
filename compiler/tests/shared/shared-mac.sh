@@ -37,7 +37,7 @@ if cmp -s "$d/tool.out" "$d/oracle.lines"; then echo "ok    the Swift tool print
 if [ -n "${SOLID:-}" ]; then
   s=$scratch/s; mkdir -p "$s"
   "$fibc" build "$here/solid-lib.fib" -I "$root/lib" -I "$SOLID/src" --shared --header "$s/solid.h" --export render -o "$s/libsolid.dylib" 2> "$s/build.err"; ck "build libsolid.dylib" $? 0
-  ck "nm -gU: only render" "$(nm -gU "$s/libsolid.dylib" | awk '{print $3}' | tr '\n' ' ')" "_render "
+  ck "nm -gU: render and the two every library has" "$(nm -gU "$s/libsolid.dylib" | awk '{print $3}' | tr '\n' ' ')" "_fib_error _fib_status _render "
   swiftc -O -I "$s" -L "$s" -lsolid -Xlinker -rpath -Xlinker "$s" "$here/solid-main.swift" -o "$s/tool" 2> "$s/swiftc.err"; ck "swiftc: import solid" $? 0; [ -s "$s/swiftc.err" ] && head -c 800 "$s/swiftc.err"
   models=('(cube 1 2 3)' '(difference (cube 10 10 10) (sphere 6))' '(cube 1 2')
   "$s/tool" "${models[@]}" > "$s/tool.out" 2> "$s/tool.err"; ck "the Swift tool ran" $? 0

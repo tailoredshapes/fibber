@@ -128,7 +128,7 @@ renderer() {
   [ -s "$d/build.out" ] && head -c 600 "$d/build.out"
   echo "      (build $((SECONDS - t0)) s, $(wc -c < "$d/libsolid.so" 2>/dev/null) bytes)"
   has "solid.h: the render prototype" "$d/solid.h" 'int64_t render(const uint8_t* text, int64_t text_len, uint8_t* out, int64_t out_cap);'
-  ck "nm -D --defined-only: only render" "$(nm -D --defined-only "$d/libsolid.so" | awk '{print $3}' | sort | tr '\n' ' ')" "render "
+  ck "nm -D --defined-only: render and the two every library has" "$(nm -D --defined-only "$d/libsolid.so" | awk '{print $3}' | sort | tr '\n' ' ')" "fib_error fib_status render "
   cc -O2 -Wall -Wextra -Werror -o "$d/solid-host" "$here/solid-host.c" -I"$d" -L"$d" -lsolid -Wl,-rpath,"$d" 2> "$d/cc.err"; ck "solid-host.c compiles against the generated header" $? 0; [ -s "$d/cc.err" ] && head -c 600 "$d/cc.err"
   local i=0 m
   for m in '(cube 1 2 3)' '(difference (cube 10 10 10) (sphere 6))' '(cube 1 2'; do
