@@ -29,6 +29,8 @@ tool_sh-driver-cpu-check := $(T)/driver/cpu-check.sh $(F_ABS) | $(T)/driver/cpu-
 tool_sh-driver-target := $(T)/driver/target.sh $(F_ABS) | $(T)/driver/target.sh
 tool_sh-driver-test-cmd := $(T)/driver/test-cmd.sh $(F_ABS) | $(T)/driver/test-cmd.sh $(T)/driver/test-project-root.sh
 # `fibc build --shared --header` (docs/design/shared-libraries.md): the refusals and the kernels library called from C; the renderer part is $(BUILD)/shared-renderer.ok (mk/checks.mk), which needs fib-solid
+tool_sh-shared-stackcheck := $(T)/shared/stackcheck.sh $(F_ABS) | $(wildcard $(T)/shared/*) compiler/emit/export.fib compiler/emit/lower/mod.fib rt/thread.lir rt/core.lir
+tool_sh-live-stackcheck := $(T)/live/stackcheck.sh $(F_ABS) | $(T)/live/stackcheck.sh $(T)/live/stackcheck.py $(T)/live/stackcheck-app.fib rt/thread.lir compiler/emit/lower/mod.fib
 tool_sh-shared := $(T)/shared/shared.sh $(F_ABS) refusals kernels | $(wildcard $(T)/shared/*) compiler/emit/export.fib compiler/emit/exporthdr.fib compiler/driver/shared.fib compiler/native/link.fib
 tool_sh-driver-static-host := $(T)/driver/static-host.sh $(F_ABS) | $(T)/driver/static-host.sh
 tool_sh-driver-host-threads := $(T)/driver/host-threads.sh $(F_ABS) | $(T)/driver/host-threads.sh $(wildcard $(T)/driver/hostthreads/*)
@@ -146,7 +148,7 @@ tool_sh-live-defs := $(T)/live/defs.sh $(F_ABS) --socket-only | $(T)/live/defs.s
 tool_sh-live-defs-tsan := env TSAN_OUT=$(TOOLS_OUT)/live-defs-tsan $(T)/live/defs.sh $(F_ABS) --tsan-only | $(T)/live/defs.sh $(T)/live/defs-tsan.fib $(T)/live/defs-swapper.lir scripts/tsan.sh scripts/tsan-baseline.txt compiler/emit/program.fib compiler/emit/livedef.fib compiler/emit/lower/objects.fib
 TOOLS_FULL := $(TOOLS_QUICK) unit-api units-all units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-shared sh-driver-host-threads sh-emit-runtime sh-emit-defs-order sh-stack-stack \
-  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-stubs-own sh-live-stubs-sample sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-mt sh-live-leak sh-live-swap sh-live-lir sh-live-defcache sh-live-queue sh-live-test sh-live-testlive sh-live-watch sh-live-quotes sh-live-statics sh-live-load sh-live-parsed sh-live-stress sh-live-stress-tsan sh-live-defs sh-live-defs-tsan sh-live-retire \
+  sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-stubs-own sh-live-stubs-sample sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-mt sh-live-leak sh-live-stackcheck sh-shared-stackcheck sh-live-swap sh-live-lir sh-live-defcache sh-live-queue sh-live-test sh-live-testlive sh-live-watch sh-live-quotes sh-live-statics sh-live-load sh-live-parsed sh-live-stress sh-live-stress-tsan sh-live-defs sh-live-defs-tsan sh-live-retire \
   $(PERSIST_STAMPS) sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
   sh-native-l1-unit $(LIRO_STAMPS) jit-selfhosted-threads sh-native-a64-sibcall sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
 # The command is every word up to the `|`, the inputs every word after it.

@@ -1,0 +1,31 @@
+;; spec:   docs/design/stack-check.md 5 and 6, docs/adr/0027, docs/adr/0009
+;; expect: accept
+;; result: 6893
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; Every frame of `grow` holds a Vec and a str when the stack runs out, a hundred thousand frames deep. The overflow is a trap of the kind "stack" whose message is
+;; `stack overflow`; the frames unwind and the audit finds every object released once (`audit: clean`); the same function then answers, and so does a recursion
+;; that fits (1000 frames of 7893). 1000 * -1 for the overflow + 7893 for the one that fits.
+;; Killed by: a prologue check that returns the failure without the plan's entry releases (the audit reports the owned parameters abandoned).
+(ns main (:use fib.core fib.seq fib.ex))
+
+(defun grow (n: i64) -> i64
+  (if (= n 0)
+      0
+      (let ((v (vec (range 3))) (s (str "n=" (show n))))
+        (+ (+ (count v) (str-len s)) (grow (- n 1))))))
+
+;; An owned vector goes down with the recursion: the entry of each frame must release it when it fails.
+(defun sink (v: (Vec i64) n: i64) -> i64
+  (if (= n 0) (count v) (+ 1 (sink (conj v n) (- n 1)))))
+
+(defun kind (n: i64) -> str
+  (try (do (grow n) "returned")
+       (catch e (str (unwrap-or (ex-kind e) "?") ":" (ex-message e)))))
+
+(defun main () -> i64
+  (let ((k (kind 1000000000)) (j (try (sink [1 2 3] 1000000000) (catch e -1))))
+    (if (and (= k "stack:stack overflow") (= j -1))
+        (+ -1000 (grow 1000))
+        1)))

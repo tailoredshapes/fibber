@@ -777,6 +777,65 @@
     (store (ptr null) sp)
     (ret (inttoptr ptr (and (ptrtoint i64 ex) (i64 -2))))))
 
+;; ---- What a library's export leaves for its host (docs/design/stack-check.md 6; compiler/emit/export.fib). The export wrapper of a library that passes failures on
+;; runs the function under a catch; a failure is kept in the caught slot of the thread's catch state (the one `catch-leave` filled) until the next export call on
+;; the thread clears it (fib.export-clear), and the host reads it with `fib_status` and `fib_error`, which are these two below.
+
+;; The start of an export call: the failure the previous call left on this thread is released.
+(define internal (fib.export-clear void) ()
+  (block entry
+    (let ((s (call @pthread_getspecific (load i32 @fib.exc-key))))
+      (br (icmp eq s (ptr null)) done look)))
+  (block look
+    (let ((sp (getelementptr %struct.fib.exc s (i32 0) (i32 1)))
+          (ex (load ptr sp)))
+      (br (icmp eq ex (ptr null)) done drop)))
+  (block drop
+    (store (ptr null) sp)
+    (call @fib.release (inttoptr ptr (and (ptrtoint i64 ex) (i64 -2))))
+    (br done))
+  (block done (ret)))
+
+;; 0 when the last export call on this thread returned, 1 when it trapped (a message), 2 when it threw an object.
+(define internal (fib.export-status i32) ()
+  (block entry
+    (let ((s (call @pthread_getspecific (load i32 @fib.exc-key))))
+      (br (icmp eq s (ptr null)) none look)))
+  (block none (ret (i32 0)))
+  (block look
+    (let ((ex (load ptr (getelementptr %struct.fib.exc s (i32 0) (i32 1)))))
+      (br (icmp eq ex (ptr null)) none some)))
+  (block some
+    (ret (select (icmp ne (and (ptrtoint i64 ex) (i64 1)) (i64 0)) (i32 1) (i32 2)))))
+
+;; The message of that failure into the host's buffer, as a `str` result is written: at most `cap` bytes (none when `out` is NULL or `cap` is not positive), the
+;; length returned. A thrown object has the message "exception"; no failure has the empty one.
+(define internal (fib.export-error i64) ((ptr out) (i64 cap))
+  (block entry
+    (let ((s (call @pthread_getspecific (load i32 @fib.exc-key))))
+      (br (icmp eq s (ptr null)) none look)))
+  (block none (ret (i64 0)))
+  (block look
+    (let ((ex (load ptr (getelementptr %struct.fib.exc s (i32 0) (i32 1))))
+          (tag (and (ptrtoint i64 ex) (i64 1))))
+      (br (icmp eq ex (ptr null)) none have)))
+  (block have
+    (br (icmp ne tag (i64 0)) msg obj))
+  (block msg
+    (let ((m (inttoptr ptr (and (ptrtoint i64 ex) (i64 -2))))
+          (n (load i64 (getelementptr %struct.fib.str m (i32 0) (i32 3))))
+          (c (select (icmp slt cap (i64 0)) (i64 0) cap))
+          (k0 (select (icmp slt n c) n c))
+          (k (select (icmp eq out (ptr null)) (i64 0) k0)))
+      (call @memcpy out (getelementptr %struct.fib.str m (i32 0) (i32 4) (i64 0)) k)
+      (ret n)))
+  (block obj
+    (let ((oc (select (icmp slt cap (i64 0)) (i64 0) cap))
+          (ok0 (select (icmp slt (i64 9) oc) (i64 9) oc))
+          (okk (select (icmp eq out (ptr null)) (i64 0) ok0)))
+      (call @memcpy out (string "exception") okk)
+      (ret (i64 9)))))
+
 ;; A trap of the message at bytes: the failure to unwind with when a catch is active (a fresh tagged str), else the trap as before.
 (define internal (fib.raise-bytes ptr) ((ptr bytes) (i64 n))
   (block entry

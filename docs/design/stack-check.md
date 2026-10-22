@@ -60,6 +60,9 @@ So the limit is found **from the stack pointer itself**, in a global table, with
   is the thread whose range it is. Collisions (two blocks 8 GiB apart share an index) only make a thread take the slow path again; they never pass wrongly.
 - A thread that ends clears the words of its blocks that still describe it (`fib.guard-leave`, and the pthread-key destructor for a thread the runtime did not start),
   so a stack address reused by another thread, perhaps with another size, does not inherit a stale range.
+- The slow path is a `preservemost` function (a new lIR calling convention word, spec/lir.md 6.6b): the callee saves what it uses, so the caller keeps its argument registers across the
+  cold call. With `ccc` the checked function had to keep its argument in a callee-saved register: its frame grew from 16 to 32 bytes and the deepest recursion halved (RAN, `down`:
+  8,375,000 frames against 16,772,704); with `preservemost` the frame is the 16 bytes it was (16,758,300 frames: the margin and nothing more).
 - A deep recursion takes the slow path once per 2 MiB of stack it descends, the first time through each block; a shallow program stays in one block.
 
 **Threads fibber starts** (the program's main thread of `fib.run-main`, tasks, pool workers): `fib.guard-enter` already knows the stack's size and the top;
@@ -93,14 +96,16 @@ add the frame size to the compared address.
 
 ## 5. Which functions are checked
 
-A body is checked when it can be part of a cycle of the call graph and is lowered to pass failures on (`unwind` is true): in the emitter, `emit-body` (`defun`, method,
-the all-owned twin) and `emit-fn` (a closure) when the body **contains a call whose callee is not a builtin** (a call of a function, method, closure value or
-constructor-less protocol dispatch). Bounded leaves are skipped: a body whose calls are all builtins (arithmetic, array access, `nth`, `str` ops, the runtime's own
-helpers) or that has none, cannot recurse by itself, and any recursion goes through a function that makes a call, which is checked. Not checked, by construction:
-`def` initialisers and `async` bodies (they cannot pass a failure on: ADR 0009), functions with `array-take!` (a failure there is already fatal; an overflow there says
-`trap: stack overflow` and aborts through `fib.unwound-fatal`, the same words as before), macro modules, and the generated vtable/wrapper functions (they call real bodies,
-which check). A body that tail-calls itself is a jump back to the entry, and the check runs on each entry; it is one compare for a loop iteration, and the
-function that loops without a call is a `loop`/`recur`, which has no check.
+A recursion needs a cycle in the call graph. A body is checked when it can be part of one and is lowered to pass failures on (`unwind` is true). The graph is the typed
+program's (`emit.lower.recur`, Tarjan's components over the direct calls between `defun`s, kept per program in `Program.rec-memo`): a `defun` is checked when it lies on a
+cycle of direct calls (it calls itself, or two or more call each other), or when it makes a call to a target the program does not name (a closure value, a protocol method,
+a `def`), because every cycle through such a call has a member that is checked. A method or a closure is checked when it makes such a call. Everything else is a bounded
+leaf as far as the stack goes (it is on no cycle, and any recursion that reaches it goes through a checked function), so it is not checked, and the margin covers its frame.
+(The first version checked every body that made a non-builtin call; section 9 has what that cost and why it was narrowed.)
+Not checked, by construction: `def` initialisers and `async` bodies (they cannot pass a failure on: ADR 0009), functions with `array-take!` (`conj` and the other in-place
+primitives of the prelude: a failure there is already fatal, so a check there could only abort; their callers are checked and the margin covers their frames), macro modules,
+and the generated vtable/wrapper functions (they call real bodies, which check). A body that tail-calls itself is a jump back to the entry and the check runs on each entry;
+a function that loops without a call is a `loop`/`recur`, which has no check.
 
 The check is at the *entry*, before anything is evaluated, so the frame holds only its owned parameters. The ownership plan records what an unwinding at that point
 releases, under a negative key like every other unwinding (`own.walk.state` `w-put-unwind`, the key `-1 - e` for a call; the entry's key is the one no expression has),
@@ -155,8 +160,60 @@ owner called miserable. `FIB_CATCH=all` makes any program a catching one, and so
 
 ## 9. Cost (measured)
 
-(filled in by the measurements: `scripts/bench/quick.sh` with `FIB_CATCH=all` and `FIB_STACK_CHECK=0` against the default, and a recursion-heavy subset)
+RAN on this machine (28 cores, load 1.5 to 5 from other jobs: noise of several percent either way; `num-f64` is 40 percent faster under the catching convention for a reason unrelated to
+the check: LLVM compiles that loop differently once its callees return a failure). Each program built four ways with the F of this tree and timed, median of 5 (seconds;
+script: a loop of `F build` and `time` over `scripts/bench/*.fib`): `F0` the main of a548530b (no check code exists); `A` this F, the program as written (no `try`, so no check and no
+catching); `B` this F with `FIB_CATCH=all FIB_STACK_CHECK=0` (the catching convention, no check: what a live program paid before); `C` this F with `FIB_CATCH=all` (the convention and the check).
+
+| program | F0 | A plain | B catching | C catching + check | B/A | C/B |
+|---|---|---|---|---|---|---|
+| recursion (fib 44, tail-recursive sum) | 2.21 | 2.13 | 3.33 | 4.20 | +56% | +26% |
+| binary-trees | 1.50 | 1.41 | 1.51 | 1.50 | +7% | -1% |
+| dispatch | 3.30 | 3.15 | 3.29 | 3.59 | +5% | +9% |
+| num-f64 | 5.39 | 5.46 | 3.23 | 3.31 | -41% | +2% |
+| num-nbody | 1.40 | 1.43 | 1.50 | 1.56 | +5% | +4% |
+| vec-conj-pop | 1.71 | 1.72 | 1.77 | 1.80 | +3% | +1% |
+| vec-index (100e6 `nth`) | 0.46 | 0.50 | 0.51 | 0.77 | +3% | +51% |
+| vec-sort | 0.68 | 0.66 | 0.69 | 0.69 | +5% | 0% |
+| map-assoc-get | 0.49 | 0.50 | 0.47 | 0.54 | -6% | +14% |
+| set-conj | 0.39 | 0.39 | 0.41 | 0.40 | +4% | -2% |
+| lazy-fused | 1.84 | 1.85 | 2.15 | 2.57 | +17% | +20% |
+| strings | 0.87 | 0.87 | 0.88 | 0.87 | +1% | -1% |
+
+- **A against F0: no change** (the differences are noise, both ways). A program that does not catch has no check, and its lIR differs from F0's by three unused `declare` lines
+  (`pthread_self`, `pthread_getattr_np`, `pthread_attr_getstack`); checked on `num-f64` and `vec-sort`. This is the requirement "above 3 percent in programs that do not need it: make it
+  apply only where required": it applies only to programs that pass failures on.
+- **C against B, the cost of the check where it is needed**: from nothing to +51 percent, median about +3 percent. It is paid by a function that is on a cycle of calls and does little
+  per call: `vec-index` spends its time in `vnode-get`, a four-level tree descent of a few instructions, checked on each call; fib 44 is 2.7 billion calls; `lazy-fused` is recursive
+  stepping. Narrowing the check from "every body that calls something" to "bodies on a cycle of calls" (section 5) took `strings`, `vec-conj-pop`, `binary-trees` and `vec-sort` from +6 to
+  +14 percent down to noise, and left `vec-index` at +43 to +51 percent (its one hot function is the recursive one: it cannot be skipped). Two things made the difference
+  between tolerable and not: a `ccc` slow path doubled the frame of every checked function (32 bytes against 16) and halved the deepest recursion; `preservemost` restored both.
+  A tight recursion pays about 2 ns a call. Not done, and the next lever: a check on only one member of a cycle of several, and none in a function whose recursion is
+  structurally bounded (a descent of a fixed-depth tree).
+- **What a live session pays** is B (before) against C (now): the same table. A live program already ran 5 to 56 percent slower than a plain one for the convention (B/A), and the
+  check adds the C/B column on top. `FIB_STACK_CHECK=0` removes it (and with it the guarantee); not recommended as a default because the failure it guards against is the one
+  the owner called miserable.
+- **Depth**: `down` (16 bytes a frame, 256 MiB main stack): the deepest recursion that completes is 16,772,704 frames without the check and 16,758,300 with it (bisected to 20,000
+  frames): 14,404 frames, 230 KB: the margin and nothing else. 100,000 and 1,000,000 frames answer. (With a `ccc` slow path: 8,375,000.)
+- **Not measured**: aarch64 and Darwin (no Mac run in this package); a library benchmark apart from the test's own calls (a library is a catching program: its calls pay B, and its recursive
+  functions C).
 
 ## 10. Tests
 
-(filled in with the output: compiler/tests/live/stackcheck.sh, compiler/tests/shared/stackcheck.sh, cases)
+Before (the main of a548530b, `F0`) and after (this tree), RAN:
+
+- Live: `(up 100000000)` over the attach socket. Before: `connection closed (the program is gone, exit -6)`, `trap: stack overflow` on standard error. After:
+  `{"ok":false,"failed":"stack overflow","exit":134,"trapped":true}` and the next input `(+ 1 2)` answers `3`. `compiler/tests/live/stackcheck.sh F` (about 7 s): 14 `ok` lines: 1000 and 100,000
+  frames answer; three overflows each followed by an answer; an allocating recursion (`grow`, a Vec and a str a frame) overflows the same way and `(grow 1000)` answers 7893; ten churns of
+  100,000 allocations; five more allocating overflows each followed by an answer; the program alive; no `trap:` or `fatal signal` on standard error. Planted fault (`FIB_STACK_CHECK=0`):
+  `FAIL overflow 0 ...: connection closed (the program is gone, exit -6)` and four more FAIL lines.
+- Library: a host `depth(1000000000)` on its main thread. Before (`before.c` against a library built by F0): `depth(1000)=1000`, then exit 139 and no `host survived`. After,
+  `compiler/tests/shared/stackcheck.sh F` (about 57 s): 28 `ok` lines: every call returns 0 with `fib_status() == 1` and `fib_error() == "stack overflow"`, the next call answers and clears
+  the status; str parameter, str result and unit result; an index trap is a status too; a second host thread's status is its own; threads with a 256 KiB and a 64 MiB stack; 8 threads at once
+  (40 rounds each); 60 threads started and ended in turn; the main thread still answers. Planted fault: the host exits 139. Depth: 16,758,300 frames with the check, 16,772,704 without.
+- `cases/stdlib/8352` (was: `try` does not catch an overflow, the process ends 134; now: the catch answers 7), `7892` (a hundred thousand frames each holding a Vec and a str unwind, `audit: clean`,
+  and the kind is `"stack"`), `cases/lir/inline/stack-addr.lir` and its reject case (`lairf cases cases/lir/inline`: 10 of 10).
+- Unchanged and still passing: `compiler/tests/driver/host-threads.sh` (4 ok), `compiler/tests/live/mt.sh`, `shared.sh refusals kernels`, `sh-live-stubs-sample`, the golden checks, `runtime.sh`
+  (31 checks), the executable ADRs (27 accepted), `make quick`.
+- fib-solid (not modified): `ONLY=recovery native/test-live.sh` with this F: the request that overflowed returned `{"ok":false,"error":{"message":"stack overflow"}}` in 0.13 s and the helper
+  did not die or recover (recovery used to take 10 s, 0.7 s with a standby). Its four "died / recovered" checks fail because they pin the old behaviour; they want rewriting to expect the error.

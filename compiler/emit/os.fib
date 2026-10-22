@@ -22,6 +22,22 @@
     "(load i32 @fib.task-key)" "(load i64 @fib.task-key)")
     "(load i32 @fib.exc-key)" "(load i64 @fib.exc-key)"))
 ;; The pool (rt/sched.lir, rt/deque.lir) on Darwin: its pthread key is 8 bytes too, and there is no sched_getaffinity (the count falls back to sysconf).
+;; The bounds of a thread's stack for the stack check (rt/thread.lir fib.stk-query) on Darwin: pthread_get_stackaddr_np is the top, pthread_get_stacksize_np the size,
+;; and the key of fib.stk-key is 8 bytes like the others. Not run on a Mac in this package (written to the ABI: scripts/mac-check.sh).
+(defun replace-between :private (text: str from: str to: str new: str) -> str
+  (match (str-find text from 0)
+    (nil text)
+    ((some a) (match (str-find text to a)
+                (nil text)
+                ((some b) (str-concat (str-concat (str-slice text 0 a) new) (str-slice text (+ b (str-len to)) (str-len text))))))))
+(defun darwin-stk :private (text: str) -> str
+  (replace (replace (replace (replace-between (replace text
+    "(global internal fib.stk-key i32 (i32 0))" "(global internal fib.stk-key i64 (i64 0))")
+    ";; stk-query-begin\n" ";; stk-query-end\n"
+    "(declare pthread_get_stackaddr_np ptr (ptr))\n(declare pthread_get_stacksize_np i64 (ptr))\n(define internal (fib.stk-query i1) ((ptr out))\n  (block entry\n    (let ((t (inttoptr ptr (call @pthread_self)))\n          (top (ptrtoint i64 (call @pthread_get_stackaddr_np t)))\n          (sz (call @pthread_get_stacksize_np t)))\n      (store (sub top sz) out)\n      (store top (getelementptr i64 out (i64 1)))\n      (ret (i1 1)))))\n")
+    "(declare pthread_getattr_np i32 (i64 ptr))\n" "")
+    "(declare pthread_attr_getstack i32 (ptr ptr ptr))\n" "")
+    "(load i32 @fib.stk-key)" "(load i64 @fib.stk-key)"))
 (defun darwin-sched :private (text: str) -> str
   (replace (replace (replace (replace (replace text
     "(global internal fib.sched-key i32 (i32 0))" "(global internal fib.sched-key i64 (i64 0))")
@@ -59,9 +75,9 @@
       ;; _SC_NPROCESSORS_ONLN: 84 on glibc, 58 on Darwin (the pool's worker count);
       ;; the large-block cache (rt/alloc.lir): malloc_size for malloc_usable_size, CLOCK_MONOTONIC_RAW_APPROX (5) for
       ;; CLOCK_MONOTONIC_COARSE (6), and no mallopt (Darwin's malloc has none; its large blocks go back to the system on free)
-      (darwin-sched (darwin-guard (darwin-keys (replace (replace (replace (replace (replace (replace (replace (replace text "__errno_location" "__error")
+      (darwin-sched (darwin-stk (darwin-guard (darwin-keys (replace (replace (replace (replace (replace (replace (replace (replace text "__errno_location" "__error")
         "@openat (i32 -100)" "@openat (i32 -2)") "@fib.sys-clock (i32 1)" "@fib.sys-clock (i32 6)")
         "@sysconf (i32 84)" "@sysconf (i32 58)")
         "malloc_usable_size" "malloc_size") "@clock_gettime (i32 6)" "@clock_gettime (i32 5)")
-        "(declare mallopt i32 (i32 i32))\n" "") "(call @mallopt (i32 -3) (i32 131072))" "(add (i32 0) (i32 0))"))))
+        "(declare mallopt i32 (i32 i32))\n" "") "(call @mallopt (i32 -3) (i32 131072))" "(add (i32 0) (i32 0))")))))
       (trap (str "fib.os: unsupported runtime platform " platform)))))

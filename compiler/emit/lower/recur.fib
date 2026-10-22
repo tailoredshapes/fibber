@@ -1,0 +1,90 @@
+;; compiler/emit/lower/recur.fib: which functions can be part of a recursion, for the stack check (docs/design/stack-check.md 5). A function is checked when it makes a call
+;; whose target the program does not name (a closure value, a protocol method, a `def`): every cycle through such a call has a checked member; or when it lies on a cycle of
+;; the graph of direct calls between `defun`s (a function that calls itself, or two that call each other, perhaps through others). Anything else cannot recurse by itself and
+;; every recursion that reaches it goes through a checked function, so its frame is covered by the margin and it is not checked.
+;; The graph is the typed program's: the bodies of every function reachable from the one asked about, whatever their types (a generic function is one node). The answer for every
+;; function reached is kept in `Program.rec-memo`, so a program pays for the walk once (Tarjan's strongly connected components, one pass).
+(ns emit.lower.recur
+  (:use types.ty types.ast types.decls types.table emit.program))
+
+;; What a body calls: the `defun`s it names as a callee (those of nested `fn` literals included), whether some call has a target it does not name (a closure value, a
+;; `def`), and whether it calls a protocol method (a call resolved by the types, to an `impl` the program has).
+(defstruct Calls (funs: (Vec i64) dynamic: bool methods: bool))
+
+(defun callee-kind :private (h: Expr) -> i64
+  (match (. h kind)
+    ((EGlobal (GFun f)) f)
+    ((EGlobal (GBuiltin _)) -1)
+    ((EGlobal (GCtor _ _)) -1)
+    ((EGlobal (GExtern _)) -1)
+    ((EGlobal (GMethod _ _)) -3)
+    (_ -2)))
+
+;; The calls of `body`: -1 a callee that runs no code of the program, -2 an unnamed target, -3 a protocol method, else the `defun`.
+(defun calls-of (body: Expr) -> Calls
+  (loop ((stack [body]) (funs []) (dyn false) (meth false))
+    (match (peek stack)
+      (nil (Calls funs dyn meth))
+      ((some e)
+       (let ((rest (into (pop stack) (expr-children e))))
+         (match (. e kind)
+           ((ECall h _)
+            (let ((k (callee-kind h)))
+              (recur rest (if (>= k 0) (conj funs k) funs) (or dyn (= k -2)) (or meth (= k -3)))))
+           (_ (recur rest funs dyn meth))))))))
+
+;; Tarjan's walk: the state of one pass.
+(defstruct Walk (g: Globals idx: (Cell (Map i64 i64)) low: (Cell (Map i64 i64)) on: (Cell (Set i64)) stack: (Cell (Vec i64)) next: (Cell i64)
+                 dyn: (Cell (Map i64 bool)) memo: (Cell (Map i64 bool))))
+
+(defun low-of :private (w: Walk v: i64) -> i64 (unwrap-or (get @(. w low) v) 0))
+(defun idx-of :private (w: Walk v: i64) -> i64 (unwrap-or (get @(. w idx) v) 0))
+
+;; Pops the stack down to `v`: the members of its component.
+(defun pop-component :private (w: Walk v: i64) -> (Vec i64)
+  (loop ((out []))
+    (let ((m (unwrap (peek @(. w stack)))))
+      (do (set! (. w stack) (pop @(. w stack)))
+          (set! (. w on) (disj @(. w on) m))
+          (if (= m v) (conj out m) (recur (conj out m)))))))
+
+;; The component of `v`: every member needs a check when there are several, or `v` calls itself, or a member has an unnamed call.
+(defun finish-component :private (w: Walk v: i64 self: bool) -> unit
+  (let ((members (pop-component w v)))
+    (let ((cyc (or self (> (count members) 1))))
+      (doseq [m members]
+        (set! (. w memo) (assoc @(. w memo) m (or cyc (unwrap-or (get @(. w dyn) m) false))))))))
+
+(defun visit :private (w: Walk v: i64) -> unit
+  (let ((n @(. w next)) (cs (calls-of (. (g-fun (. w g) v) body))))
+    (do (set! (. w next) (+ n 1))
+        (set! (. w idx) (assoc @(. w idx) v n))
+        (set! (. w low) (assoc @(. w low) v n))
+        (set! (. w stack) (conj @(. w stack) v))
+        (set! (. w on) (conj @(. w on) v))
+        (set! (. w dyn) (assoc @(. w dyn) v (. cs dynamic)))
+        (doseq [c (. cs funs)] (edge w v c))
+        (when (= (low-of w v) n) (finish-component w v (some? (find-first (fn (c: i64) (= c v)) (. cs funs))))))))
+
+(defun edge :private (w: Walk v: i64 c: i64) -> unit
+  (cond (contains? @(. w memo) c) ()
+        (not (contains? @(. w idx) c)) (do (visit w c) (set! (. w low) (assoc @(. w low) v (min (low-of w v) (low-of w c)))))
+        (contains? @(. w on) c) (set! (. w low) (assoc @(. w low) v (min (low-of w v) (idx-of w c))))
+        :else ()))
+
+;; Whether the `defun` f can be part of a recursion (see above).
+(defun fun-may-recurse? (p: Program f: i64) -> bool
+  (match (get @(. p rec-memo) f)
+    ((some b) b)
+    (nil (let ((w (Walk (program-g p) (cell (map-empty)) (cell (map-empty)) (cell (set-empty)) (cell []) (cell 0) (cell (map-empty)) (cell @(. p rec-memo)))))
+           (do (visit w f)
+               (set! (. p rec-memo) @(. w memo))
+               (unwrap-or (get @(. w memo) f) true))))))
+
+;; Whether the body of a closure can be part of a recursion: it makes a call to an unnamed target (a cycle through the closure has the dynamic call of whoever runs it).
+(defun closure-may-recurse? (body: Expr) -> bool (. (calls-of body) dynamic))
+
+;; Whether the body of a protocol method can be part of a recursion: it makes any call that runs code of the program. A method is reached through a call the `defun`s
+;; do not count as an edge (the graph has no node for an `impl`), so every method that calls anything is checked, and a cycle through a method has a checked member.
+(defun method-may-recurse? (body: Expr) -> bool
+  (let ((cs (calls-of body))) (or (. cs dynamic) (. cs methods) (not (empty? (. cs funs))))))
