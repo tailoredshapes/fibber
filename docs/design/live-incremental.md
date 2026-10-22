@@ -609,3 +609,36 @@ measured: its `dev/live.fib` does not reach quiescence (`pause` times out after 
 
 **Test and mutant.** `compiler/tests/live/retire.sh` (retire.py over retire-app.fib; mk/tools.mk `sh-live-retire`, full gate); the mutant
 `retire-dynamic-unfollowed` of `scripts/mutant-live.sh` (the analysis ignores indirect calls, as before) must make it fail.
+
+## 8. The growth of a long session (2026-10-22)
+
+**The complaint.** A `fibc run --live` session of fib-solid's worker grew about 14 MB per swap (RSS 491 MB after the first mesh, 595 after 10 swaps,
+1001 after 40: `fib-solid/docs/repro/live-swap-rss.py`). Section 1.5 had estimated 210 KB per kept generation. `RAN` below means run in this session.
+
+**Which of the four it was (measured).** (d), the engine's caches, and by design: not a leak (the memory was reachable), not the allocator.
+- A reproducer in fibber alone (`compiler/tests/live/leak.py`: eight library-sized modules, `model` loaded 200 times, the main module after it):
+  RSS 127 MB at start, 246 MB at swap 100, 1039 MB at swap 100 and 1862 MB at swap 200 with the unfixed stage 2: **8.2 MB per swap** (RAN, `F0` = the
+  tree before this change). `FIB_ALLOC_DECAY_MS=0` (the large-block cache off) changed nothing (630 MB at swap 50 either way), so it is not the
+  allocator's cache or glibc holding freed memory; `FIB_CHECK_CACHE=off` (no persistent checker) took the growth to 1 MB per swap (RAN), which named
+  the cause.
+- The cause: `serve.incr` keeps the expander's entry (`Engine.entries`) and the persistent checker's state (`own.chain`, `Memo.chain`) under the
+  module key, which is a hash of the module's text and of every module before it. An edit of `model` gives `model` and every module after it a
+  new key; the entries under the old keys were never looked at again but stayed until `entries-max`/`chain-max` (4000 each) cleared the whole map. A
+  checker state is a copy of the library's tables (types.table copies an array at its first write after the copy), so a state costs megabytes, not the
+  "what the module added" of own.chain's header (that measurement, 56 against 57 MB, was of a transcript of 431 states of a program with 253 small
+  modules; a program that requires fib.json, fib.http and a geometry library has far larger tables). The macro runner (`macros.runner` `Session.mods`)
+  keeps the same way a built JIT module per macro per module key.
+- It is therefore retention by design, and the design is changed: **the engine keeps the keys of the last two requests of each file** (`Engine.recent`,
+  at most 64 files) and forgets every expander entry, checker state, macro build and verdict whose key no recent request holds
+  (`serve.incr/retain-keys`, `own.chain/chain-retain`, `macros.runner/session-retain`). The previous text stays so that editing back is still a cache
+  hit; the library's state (`Memo.prefix`) is separate and stays. Unchanged modules are not expanded again (they never were: their keys are the same);
+  the modules after the edited one are, because their key depends on it (section 2 of persistent-checker.md): that is the 0.2 s of `expand_ms` per swap.
+
+**Result (RAN, `leak.sh`, 200 swaps).** Before: growth of the last 100 swaps 822.8 MB, `FAIL`. After: 246 MB at swap 100, 255 at swap 200, **9.5 MB**,
+`ok`. fib-solid's repro (40 swaps of the plate): 491, 491, 492, 493, 494, 495 MB (every 10 swaps) against 595 after 10 and 1001 after 40.
+
+**What is still growing.** About 0.1 MB per swap: a swap's generation (its ORC module with the cut's struct declarations, section 1.5) stays resident
+until a `retire`, which needs the program to reach a pause point (section 7). A program that never pauses (the test's, fib-solid's worker) keeps them:
+1000 swaps are about 100 MB. Retiring on the next swap needs the stack scan of live-repl.md 3.3; not built.
+`Engine.verdicts` is pruned with the rest. The bound of the test (40 MB in the last 100 swaps) is four times the measured growth and a twentieth of the
+unfixed one.

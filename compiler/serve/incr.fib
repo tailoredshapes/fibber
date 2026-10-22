@@ -29,12 +29,15 @@
    verdicts: (Cell (Map str (Vec dg/Diag)))
    memo: st/Memo
    ;; the loader's parsed files by content (expand.parsed): a request parses only the files whose text changed
-   parsed: pm/Memo))
+   parsed: pm/Memo
+   ;; by file, the keys (`show`n) of the last two requests' modules: the only expander entries, checker states and macros the engine keeps
+   ;; besides the implicit library's (a swap loop once kept every edit's states, ~8 MB each; docs/design/live-incremental.md 8)
+   recent: (Cell (Map str (Vec (Vec str))))))
 
 (def entries-max: i64 4000)
 
 (defun engine-new () -> Engine
-  (Engine (cell (map-empty)) (cell 0) (cell (vec-empty)) (cell nil) (cell nil) (cell (map-empty)) (st/memo-new) (pm/memo-new)))
+  (Engine (cell (map-empty)) (cell 0) (cell (vec-empty)) (cell nil) (cell nil) (cell (map-empty)) (st/memo-new) (pm/memo-new) (cell (map-empty))))
 
 (defun empty-stats () -> Stats (Stats 0 0 0 false 0 0 0 0 0 0))
 
@@ -283,9 +286,25 @@
     (set! (. e verdicts) (assoc (if (> (count v) entries-max) (map-empty) v) key ds))))
 
 ;; `load`: the load's milliseconds and how many files it parsed.
+;; Records the keys of this request for its file and forgets what no file's last two requests hold (the previous text stays, so editing back is cached).
+(defun retain-keys :private (e: Engine file: str modkeys: (Vec i64) sess: mr/Session) -> unit
+  (let ((ks (mapv show modkeys))
+        (all (if (> (map-count @(. e recent)) recent-files-max) (map-empty) @(. e recent)))
+        (mine (assoc all file (into [ks] (vec (take 1 (unwrap-or (get all file) []))))))
+        (keep (reduce (fn (acc: (Vec str) v: (Vec (Vec str))) (reduce (fn (a: (Vec str) x: (Vec str)) (into a x)) acc v)) (vec-empty) (vals mine)))
+        (vs @(. e verdicts)))
+    (do (set! (. e recent) mine)
+        (set! (. e entries) (select-keys @(. e entries) keep))
+        (set! (. e verdicts) (select-keys vs (filter (fn (k: str) (some? (first (filter (fn (c: str) (s/starts-with? k (str-concat c "/"))) keep)))) (keys vs))))
+        (ch/chain-retain (. e memo) keep)
+        (mr/session-retain sess keep))))
+
+(def recent-files-max: i64 64)
+
 (defun front-expand :private (e: Engine j: Job loaded: (Vec Loaded) prelude: (Vec Stx) base-ctx: ExpandCtx keys: (Vec i64) main: bool vkey: str load: (Pair i64 i64) t0: i64) -> Front
   (let ((sess (session-of e prelude loaded))
         (t2 (sys-clock-now))
+        (kept (retain-keys e (. j file) keys sess))
         (ex (expand-program e prelude base-ctx loaded keys sess))
         (n (count loaded)))
     (match (. ex snd)

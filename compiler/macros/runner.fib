@@ -62,6 +62,17 @@
 (defun session-reuse (s: Session program: (Vec Stx)) -> Session
   (Session (. s prelude) (reduce (fn (acc: (Map str bool) f: Stx) (collect-names f acc)) (map-empty) program) (. s jit) (. s mods) (. s built) (. s chains)))
 
+;; Forgets the macros built for a module content other than the ones in `keep` (their chain keys, `session-note-chain`): an edit of a module
+;; leaves the macros of the modules from it on built for the old text.
+(defun session-retain (s: Session keep: (Vec str)) -> unit
+  (let ((all @(. s mods)))
+    (set! (. s mods)
+          (reduce (fn (acc: (Map str (Result fibm/Fibm ExpandErrKind)) k: str)
+                    (if (some? (first (filter (fn (c: str) (s/ends-with? k (str-concat "@" c))) keep)))
+                        (match (get all k) ((some r) (assoc acc k r)) (nil acc))
+                        acc))
+                  (map-empty) (keys all)))))
+
 ;; Says that the module `ns` has the content key `chain` from now on.
 (defun session-note-chain (s: Session ns: str chain: str) -> unit
   (set! (. s chains) (assoc @(. s chains) ns chain)))
