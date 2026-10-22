@@ -66,7 +66,14 @@ Build/link options (before --):
                          choose the link mode of a declared native library; repeatable
   --link-mode static|dynamic
                          default mode for declared native libraries (default dynamic)
-  --export NAME          export a named function; repeatable (FIB_EXPORTS)
+  --export NAME[=SYMBOL] export a named function as a C symbol; repeatable (FIB_EXPORTS); integers, floats, bool and
+                         ptr cross as they are, a str parameter as (const uint8_t *p, int64_t len), a str result
+                         through a caller buffer (uint8_t *out, int64_t cap) and the returned length it needs
+  --shared               build a shared library (libX.so; libX.dylib on macOS) of the --export functions, with -o: only
+                         the exports are visible; refused without an export. It is not safe for a host yet: a trap
+                         aborts the host and a deep recursion overflows its stack (docs/design/shared-libraries.md, host-threads.md)
+  --header FILE.h        write the C header of the exports (extern C guard, one prototype each) and module.modulemap
+                         beside it, for --shared or --emit obj
   --exe                  emit executable-style lIR with emit (main's result is not printed)
 
 -O N (N from 0 to 3, or -ON) is the LLVM optimisation level of run and build:

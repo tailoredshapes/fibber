@@ -10,9 +10,11 @@ changes the runtime's trap or threading behaviour. Until N2 lands:
 
 - **A trap in fibber code aborts the host.** A trap (the study's case is `nth` out of range) calls `abort()`: the host
   process dies (exit 134 under the study's `traps-host.c`). There is no error code to return and nothing for the host to catch.
-- **Two host threads must not be inside the library at the same time.** The study (`fibber-native-embedding.md` 1.2) called one export from two threads
-  at once and the process crashed with SIGSEGV in 20 of 20 runs; the cause is not found. A host that calls in must serialise its calls itself (one
-  mutex), or call from one thread.
+- **Host threads (fixed after this document was first written).** The study (`fibber-native-embedding.md` 1.2) called one export from two threads at once
+  and the process crashed with SIGSEGV in 20 of 20 runs. The cause was the runtime's unlocked small-object fast path, which a thread the runtime did not start
+  never switched off; a library is now multi-threaded from its first export call (docs/design/host-threads.md; `compiler/tests/driver/host-threads.sh`: 4 and 16
+  host threads, cold and warm, 12 runs each). What is still unsafe is listed there: sharing fibber values between host threads, `dlclose` while a thread is inside
+  the library, `fork` in a host, and a callback that re-enters an export during the start.
 - **Deep recursion overflows the host's stack.** The executable's `main` installs a stack guard; the library path does not, so a recursion that is fine
   in `fibc run` can segfault the host.
 - The runtime calls `mallopt(M_MMAP_THRESHOLD, 131072)` on the first call, which changes the host's malloc policy for the whole process.

@@ -21,11 +21,12 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_CHECK_CACHE` | [compiler/driver/front.fib:114](../../compiler/driver/front.fib#L114) |
 | `FIB_C_LINES` | [compiler/driver/viac.fib:47](../../compiler/driver/viac.fib#L47) |
 | `FIB_EMIT_EXE` | [compiler/driver/commands.fib:14](../../compiler/driver/commands.fib#L14) |
-| `FIB_EXPORTS` | [compiler/emit/compile.fib:194](../../compiler/emit/compile.fib#L194) |
+| `FIB_EXPORTS` | [compiler/driver/shared.fib:17](../../compiler/driver/shared.fib#L17) |
+| `FIB_HEADER` | [compiler/driver/shared.fib:14](../../compiler/driver/shared.fib#L14) |
 | `FIB_JS_ARGV0` | [compiler/lir2js.fib:60](../../compiler/lir2js.fib#L60) |
 | `FIB_JS_RT` | [compiler/lir2js.fib:46](../../compiler/lir2js.fib#L46) |
 | `FIB_JS_UNLINK` | [compiler/lir2js.fib:59](../../compiler/lir2js.fib#L59) |
-| `FIB_KERNEL_PTX` | [compiler/driver/commands.fib:142](../../compiler/driver/commands.fib#L142) |
+| `FIB_KERNEL_PTX` | [compiler/driver/commands.fib:146](../../compiler/driver/commands.fib#L146) |
 | `FIB_KERNEL_TARGET` | [compiler/driver/commands.fib:82](../../compiler/driver/commands.fib#L82) |
 | `FIB_LAIR_WORKERS` | [compiler/native/cases.fib:19](../../compiler/native/cases.fib#L19) |
 | `FIB_LIB` | [compiler/driver/testlive.fib:83](../../compiler/driver/testlive.fib#L83) |
@@ -44,7 +45,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LIVE_DEBUG` | [compiler/serve/livesess.fib:352](../../compiler/serve/livesess.fib#L352) |
 | `FIB_LIVE_DEPS` | [compiler/fibc.fib:75](../../compiler/fibc.fib#L75) |
 | `FIB_LIVE_EMIT` | [compiler/emit/program.fib:85](../../compiler/emit/program.fib#L85) |
-| `FIB_LIVE_LIBS` | [compiler/fibc.fib:124](../../compiler/fibc.fib#L124) |
+| `FIB_LIVE_LIBS` | [compiler/fibc.fib:127](../../compiler/fibc.fib#L127) |
 | `FIB_LIVE_OWN_UID` | [compiler/serve/livesock.fib:81](../../compiler/serve/livesock.fib#L81) |
 | `FIB_LIVE_QUEUE` | [compiler/emit/program.fib:238](../../compiler/emit/program.fib#L238) |
 | `FIB_LIVE_ROOTS` | [compiler/driver/front.fib:68](../../compiler/driver/front.fib#L68) |
@@ -62,10 +63,11 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LOG_QUEUE` | [lib/fib/log/config.fib:33](../../lib/fib/log/config.fib#L33) |
 | `FIB_LSP_ISOLATE` | [compiler/lsp/server.fib:43](../../compiler/lsp/server.fib#L43) |
 | `FIB_MUSL_DIR` | [compiler/native/linkstatic.fib:66](../../compiler/native/linkstatic.fib#L66) |
-| `FIB_NO_PROJECT` | [compiler/fibc.fib:134](../../compiler/fibc.fib#L134) |
+| `FIB_NO_PROJECT` | [compiler/fibc.fib:137](../../compiler/fibc.fib#L137) |
 | `FIB_PRUNE` | [compiler/emit/compile.fib:82](../../compiler/emit/compile.fib#L82) |
 | `FIB_RESULT_STDOUT` | [compiler/emit/compile.fib:26](../../compiler/emit/compile.fib#L26) |
 | `FIB_SCHED_SKIP` | [rt/sched.lir:143](../../rt/sched.lir#L143) |
+| `FIB_SHARED` | [compiler/driver/shared.fib:11](../../compiler/driver/shared.fib#L11) |
 | `FIB_SPIN` | [rt/sched.lir:142](../../rt/sched.lir#L142) |
 | `FIB_SPINNERS` | [rt/sched.lir:163](../../rt/sched.lir#L163) |
 | `FIB_SPIN_HINT` | [rt/sched.lir:157](../../rt/sched.lir#L157) |
