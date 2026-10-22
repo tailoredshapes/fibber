@@ -35,7 +35,10 @@
   (prelude: (Vec Stx) names: (Map str bool) jit: (Cell (Option jit/Jit)) mods: (Cell (Map str (Result fibm/Fibm ExpandErrKind)))
    built: (Cell i64)
    ;; the key of each module's content, by ns, set by a server that keeps a session between requests (serve.incr); empty for a tool that makes one
-   chains: (Cell (Map str str))))
+   chains: (Cell (Map str str))
+   ;; the hash of each module's own text, by ns (serve.incr), and the key of each module's dependency closure derived from them (`dep-key`; dropped
+   ;; when a text changes), and the keys the macros of a (macro key) were built under, newest first (`builds-max` are kept)
+   owns: (Cell (Map str str)) deps: (Cell (Map str str)) builds: (Cell (Map str (Vec str)))))
 
 ;; The names the program's modules define at top level: `defun` and `def`, also inside a `do`, a trailing `:` of a `def` taken off.
 ;; Rust: eval/macros.rs collect_names
@@ -54,31 +57,51 @@
     (_ names)))
 
 (defun session-new (prelude: (Vec Stx) program: (Vec Stx)) -> Session
-  (Session prelude (reduce (fn (acc: (Map str bool) f: Stx) (collect-names f acc)) (map-empty) program) (cell nil) (cell (map-empty)) (cell 0) (cell (map-empty))))
+  (Session prelude (reduce (fn (acc: (Map str bool) f: Stx) (collect-names f acc)) (map-empty) program) (cell nil) (cell (map-empty)) (cell 0) (cell (map-empty))
+           (cell (map-empty)) (cell (map-empty)) (cell (map-empty))))
 
 ;; A server keeps one session between requests: the same session with the names of this request's program, its JIT and the macros built so far
 ;; shared (the cells are the same cells). A macro is built once for the content of its module (`session-key`), so an edit rebuilds the macros
 ;; of the modules from the edit on and no others.
 (defun session-reuse (s: Session program: (Vec Stx)) -> Session
-  (Session (. s prelude) (reduce (fn (acc: (Map str bool) f: Stx) (collect-names f acc)) (map-empty) program) (. s jit) (. s mods) (. s built) (. s chains)))
-
-;; Forgets the macros built for a module content other than the ones in `keep` (their chain keys, `session-note-chain`): an edit of a module
-;; leaves the macros of the modules from it on built for the old text.
-(defun session-retain (s: Session keep: (Vec str)) -> unit
-  (let ((all @(. s mods)))
-    (set! (. s mods)
-          (reduce (fn (acc: (Map str (Result fibm/Fibm ExpandErrKind)) k: str)
-                    (if (some? (first (filter (fn (c: str) (s/ends-with? k (str-concat "@" c))) keep)))
-                        (match (get all k) ((some r) (assoc acc k r)) (nil acc))
-                        acc))
-                  (map-empty) (keys all)))))
+  (Session (. s prelude) (reduce (fn (acc: (Map str bool) f: Stx) (collect-names f acc)) (map-empty) program) (. s jit) (. s mods) (. s built) (. s chains) (. s owns) (. s deps) (. s builds)))
 
 ;; Says that the module `ns` has the content key `chain` from now on.
 (defun session-note-chain (s: Session ns: str chain: str) -> unit
   (set! (. s chains) (assoc @(. s chains) ns chain)))
 
-(defun session-key :private (s: Session def: MacroDef) -> str
-  (str-join [(. def key) "@" (unwrap-or (get @(. s chains) (. def ns)) "")]))
+;; Says that the text of module `ns` hashes to `h` (serve.incr, as it expands the module): a text that changed drops the dependency keys.
+(defun session-note-text (s: Session ns: str h: str) -> unit
+  (do (when (not (= (get @(. s owns) ns) (some h))) (set! (. s deps) (map-empty)))
+      (set! (. s owns) (assoc @(. s owns) ns h))))
+
+;; The modules macro-time code of module `ns` can use: `ns`, and what each module in the set requires, uses, re-exports or sees implicitly
+;; (`spec-deps`), as far as the context has them; sorted by name.
+(defun dep-closure :private (ctx: ExpandCtx ns: str) -> (Vec str)
+  (loop ((todo [ns]) (seen (set-empty)) (out (vec-empty)))
+    (match (first todo)
+      (nil (vec (sort out)))
+      ((some n)
+       (if (set-contains? seen n)
+           (recur (vec (rest todo)) seen out)
+           (recur (into (vec (rest todo)) (match (macrons/macro-ns-of ctx n) ((some m) (spec-deps (. m spec))) (nil []))) (conj seen n) (conj out n)))))))
+
+;; The key a macro's module is kept under: the macro, and the text of every module its code can use (`dep-closure`), so a module after an edited
+;; one is not built again unless it depends on it. When a module of the closure has no text noted (a tool that does not note them) the key is that
+;; of the module's place in the load order, as before: the chain `session-note-chain` was given.
+(defun session-key :private (s: Session ctx: ExpandCtx def: MacroDef) -> str
+  (str-join [(. def key) "@"
+             (match (get @(. s deps) (. def ns))
+               ((some k) k)
+               (nil (let ((k (closure-key s ctx (. def ns))))
+                      (do (set! (. s deps) (assoc @(. s deps) (. def ns) k)) k))))]))
+
+(defun closure-key :private (s: Session ctx: ExpandCtx ns: str) -> str
+  (let ((names (dep-closure ctx ns))
+        (owns @(. s owns)))
+    (if (every? (fn (n: str) (some? (get owns n))) names)
+        (str-join (mapv (fn (n: str) (str n "=" (unwrap-or (get owns n) ""))) names))
+        (unwrap-or (get @(. s chains) ns) ""))))
 
 ;; ---------------------------------------------------------------- the module of a macro
 
@@ -216,12 +239,22 @@
          ((Ok mm) (load-module s def k (. mm ast))))))))
 
 ;; The module of the macro, built on its first use. Rust: JitRunner::module
+;; How many builds of one macro are kept: the current text's and the one before (an edit undone is a hit).
+(def builds-max: i64 2)
+
+;; The macro's module under its key; the builds of the macro past `builds-max` go from the map (their code stays in the JIT session).
+(defun keep-build :private (s: Session macro: str key: str r: (Result fibm/Fibm ExpandErrKind)) -> unit
+  (let ((mine (into [key] (unwrap-or (get @(. s builds) macro) []))))
+    (do (set! (. s mods) (reduce (fn (acc: (Map str (Result fibm/Fibm ExpandErrKind)) k: str) (dissoc acc k)) (assoc @(. s mods) key r) (vec (drop builds-max mine))))
+        (set! (. s builds) (assoc @(. s builds) macro (vec (take builds-max mine)))))))
+
 (defun session-module :private (s: Session def: MacroDef ctx: ExpandCtx) -> (Result fibm/Fibm ExpandErrKind)
-  (match (get @(. s mods) (session-key s def))
+  (match (get @(. s mods) (session-key s ctx def))
     ((some r) r)
     (nil
-     (let ((r (build-module s def ctx)))
-       (do (set! (. s mods) (assoc @(. s mods) (session-key s def) r))
+     (let ((t0 (sys-clock-now)) (r (build-module s def ctx)))
+       (do (keep-build s (. def key) (session-key s ctx def) r)
+           (when (= (sys-getenv "FIB_TIME") (some "1")) (eprintln (str "time macro.build " (. def name) " " (quot (- (sys-clock-now) t0) 1000000) " ms")))
            r)))))
 
 ;; ---------------------------------------------------------------- one call
