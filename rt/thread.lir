@@ -147,6 +147,7 @@
 ;; This thread ends: its signal stack is disabled and freed (a task's thread comes and goes; a program that spawns in a loop must not leak one each).
 (define internal (fib.guard-leave void) ()
   (block entry
+    (call @fib.stk-leave)
     (let ((cur (alloca (align 8) i8 (i32 32)))
           (off (alloca (align 8) i8 (i32 32)))
           (_q (call @sigaltstack (ptr null) cur))
@@ -281,6 +282,7 @@
   (block entry
     (call @fib.guard-enter (load i64 @fib.main-stack))
     (indirect-call (load ptr @fib.main-fn) (fn void ()))
+    (call @fib.stk-leave)
     (ret (ptr null))))
 
 ;; Runs `body` (no arguments) on a stack of FIB_STACK_MB MiB (default 256) that the runtime makes: a thread whose stack is mapped, committed as it is
@@ -340,6 +342,9 @@
 ;; The room left under the limit for what runs unchecked after a check: 256 KiB (docs/design/stack-check.md 4). A stack under 1 MiB keeps a quarter of it.
 (global internal fib.stk-margin i64 (i64 262144))
 
+;; The key's destructor is `fib.stk-dtor` in a library (compiled code that outlives its threads) and libc's `free` otherwise: the program of `fibc run` is JIT code that is freed
+;; while the compiler's own threads, which ran it, are still alive, and a destructor pointing into freed code crashed them at their exit (found by the tsan gate stages: the
+;; compiler built under FIB_LIVE=1). Without the destructor a thread that ends clears its words in fib.guard-leave (fib.stk-leave).
 ;; 0: the key is not made, 1: a thread is making it, 2: made. The first slow call of any thread makes it (a program that never checks never does), the others wait.
 (global internal fib.stk-ready i32 (i32 0))
 (define internal (fib.stk-init void) ()
@@ -350,7 +355,7 @@
     (let ((r (cmpxchg acquire monotonic @fib.stk-ready (i32 0) (i32 1))))
       (br (extractvalue r 1) make wait)))
   (block make
-    (call @pthread_key_create @fib.stk-key @fib.stk-dtor)
+    (call @pthread_key_create @fib.stk-key (select (icmp ne (atomic-load acquire i32 @fib.lib-state) (i32 0)) @fib.stk-dtor @free))
     (atomic-store release (i32 2) @fib.stk-ready)
     (br done))
   (block wait
@@ -436,8 +441,8 @@
                   (getelementptr i64 @fib.stk (and (lshr sp (i64 21)) (i64 4095))))
     (ret (i1 0))))
 
-;; A thread ends: the words of its blocks that still describe its stack are cleared, and the record freed.
-(define internal (fib.stk-dtor void) ((ptr r))
+;; The words of the blocks of the record's stack that still describe it are cleared.
+(define internal (fib.stk-clear void) ((ptr r))
   (block entry
     (br (icmp eq (load i64 (getelementptr i64 r (i64 3))) (i64 0)) done clear))
   (block clear
@@ -457,5 +462,18 @@
   (block next
     (let ((b2 (add b (i64 1))))
       (br (icmp ule (shl b2 (i64 21)) (sub hi (i64 1))) loop done)))
-  (block done (call @free r) (ret)))
+  (block done (ret)))
+
+;; A thread of the runtime ends its work (fib.guard-leave): its words are cleared at once, in code that is certainly still there.
+(define internal (fib.stk-leave void) ()
+  (block entry (br (icmp eq (atomic-load acquire i32 @fib.stk-ready) (i32 2)) look done))
+  (block look
+    (let ((r (call @pthread_getspecific (load i32 @fib.stk-key))))
+      (br (icmp eq r (ptr null)) done go)))
+  (block go (call @fib.stk-clear r) (ret))
+  (block done (ret)))
+
+;; A thread the runtime did not start ends (the key's destructor, a library only: see fib.stk-init): its words are cleared and the record freed.
+(define internal (fib.stk-dtor void) ((ptr r))
+  (block entry (call @fib.stk-clear r) (call @free r) (ret)))
 ;; guard-end

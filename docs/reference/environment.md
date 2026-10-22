@@ -73,7 +73,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_SPINNERS` | [rt/sched.lir:163](../../rt/sched.lir#L163) |
 | `FIB_SPIN_HINT` | [rt/sched.lir:157](../../rt/sched.lir#L157) |
 | `FIB_STACK_CHECK` | [compiler/emit/program.fib:70](../../compiler/emit/program.fib#L70) |
-| `FIB_STACK_MB` | [rt/thread.lir:264](../../rt/thread.lir#L264) |
+| `FIB_STACK_MB` | [rt/thread.lir:265](../../rt/thread.lir#L265) |
 | `FIB_STATIC` | [compiler/driver/static.fib:15](../../compiler/driver/static.fib#L15) |
 | `FIB_STATIC_CASES` | [compiler/driver/staticrun.fib:10](../../compiler/driver/staticrun.fib#L10) |
 | `FIB_STATIC_LD` | [compiler/native/linkstatic.fib:90](../../compiler/native/linkstatic.fib#L90) |
