@@ -1,0 +1,22 @@
+;; spec:   stdlib §2.1 rule 2 (T gains `first`), rule 3 (`first` stops the source through the bool channel)
+;; expect: accept
+;; result: 1143
+;; audit:  clean
+;; stage:  2
+;; allocs: <= 12
+;; roots:  ../../lib support
+;; covers: first map filter iterate
+;; `first` over a fused chain reads the same value as `first` over the bound seq, and stops the source at it: an endless `iterate` ends, the stage functions run
+;; only as far as the first hit (1000 + the first multiple of 7 above 100, 105: 1105), and an empty chain
+;; (no element passes) is nil (the 38 in the sum: 1105 + 38 = 1143). The allocation bound is a few objects for the whole run, which a memoised seq of the endless source
+;; over 100 elements would exceed many times over.
+(ns main (:use fib.core fib.seq))
+
+(defun main () -> i64
+  (let [hit (match (first (map (fn (x: i64) (+ x 1000)) (filter (fn (x: i64) (and (> x 100) (= (rem x 7) 0))) (iterate inc 0))))
+              ((some v) v)
+              (nil -1))
+        none (match (first (filter (fn (x: i64) (> x 100)) (range 50)))
+               ((some v) v)
+               (nil 38))]
+    (+ hit none)))
