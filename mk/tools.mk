@@ -29,6 +29,7 @@ tool_sh-driver-cpu-check := $(T)/driver/cpu-check.sh $(F_ABS) | $(T)/driver/cpu-
 tool_sh-driver-target := $(T)/driver/target.sh $(F_ABS) | $(T)/driver/target.sh
 tool_sh-driver-test-cmd := $(T)/driver/test-cmd.sh $(F_ABS) | $(T)/driver/test-cmd.sh $(T)/driver/test-project-root.sh
 tool_sh-driver-static-host := $(T)/driver/static-host.sh $(F_ABS) | $(T)/driver/static-host.sh
+tool_sh-driver-host-threads := $(T)/driver/host-threads.sh $(F_ABS) | $(T)/driver/host-threads.sh $(wildcard $(T)/driver/hostthreads/*)
 tool_sh-emit-runtime := $(T)/emit/runtime.sh $(F_ABS) $(TOOLS_OUT)/runtime | $(T)/emit/runtime.sh $(T)/emit/gen-runtime.fib $(T)/emit/unit-runtime.fib $(RT_LIR)
 tool_sh-emit-defs-order := $(T)/emit/defs-order.sh $(F_ABS) | $(T)/emit/defs-order.sh
 tool_sh-emit-prune := $(T)/emit/prune.sh $(F_ABS) $(TOOLS_OUT)/prune | $(T)/emit/prune.sh $(wildcard compiler/emit/prune.fib)
@@ -140,7 +141,7 @@ TOOLS_QUICK := sh-emit-prune fibref-skeleton gen-skeleton lint-pipefail lint-por
 tool_sh-live-defs := $(T)/live/defs.sh $(F_ABS) --socket-only | $(T)/live/defs.sh $(T)/live/defs.py $(T)/live/defs-app.fib $(T)/live/defs-cfg.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/emit/program.fib compiler/emit/livedef.fib compiler/emit/inits.fib compiler/emit/lower/objects.fib
 tool_sh-live-defs-tsan := env TSAN_OUT=$(TOOLS_OUT)/live-defs-tsan $(T)/live/defs.sh $(F_ABS) --tsan-only | $(T)/live/defs.sh $(T)/live/defs-tsan.fib $(T)/live/defs-swapper.lir scripts/tsan.sh scripts/tsan-baseline.txt compiler/emit/program.fib compiler/emit/livedef.fib compiler/emit/lower/objects.fib
 TOOLS_FULL := $(TOOLS_QUICK) unit-api units-all units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
-  sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-emit-runtime sh-emit-defs-order sh-stack-stack \
+  sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-driver-host-threads sh-emit-runtime sh-emit-defs-order sh-stack-stack \
   sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-stubs-own sh-live-stubs-sample sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-swap sh-live-lir sh-live-defcache sh-live-queue sh-live-test sh-live-testlive sh-live-watch sh-live-quotes sh-live-statics sh-live-load sh-live-parsed sh-live-stress sh-live-stress-tsan sh-live-defs sh-live-defs-tsan sh-live-retire \
   $(PERSIST_STAMPS) sh-emit-resume sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
   sh-native-l1-unit $(LIRO_STAMPS) jit-selfhosted-threads sh-native-a64-sibcall sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
