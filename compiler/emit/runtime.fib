@@ -3929,12 +3929,14 @@
 ;; parked; 3 the spawned threads alive; 4 whether quiescent; 5 the pool's
 ;; active workers; 6 the pool's live workers; 7 whether a pause is requested;
 ;; 8 a pause point (the library's `pause-point`); 9 the async pool's busy
-;; workers.
+;; workers; 10 the program's runtime into its multi-threaded mode (fib.mt, core.lir): the attach thread runs program code
+;; beside the program's own thread, so a live session sets it before `main` starts (serve.live), and the small-object free
+;; lists, which are unlocked, are never used (docs/design/host-threads.md).
 ;; extern: (declare fib_live_ctl i64 (i64 i64))
 (define internal (fib_live_ctl i64) ((i64 op) (i64 a))
   (block entry
     (switch op other ((i64 0) pause) ((i64 1) resume) ((i64 2) paused) ((i64 3) threads) ((i64 4) quiescent)
-      ((i64 5) active) ((i64 6) workers) ((i64 7) pausing) ((i64 8) point) ((i64 9) busy)))
+      ((i64 5) active) ((i64 6) workers) ((i64 7) pausing) ((i64 8) point) ((i64 9) busy) ((i64 10) multi)))
   (block pause (call @fib.live-set-pausing (i32 1)) (ret (i64 0)))
   (block resume (call @fib.live-set-pausing (i32 0)) (ret (i64 0)))
   (block paused (ret (call @fib.live-count (i64 0))))
@@ -3945,6 +3947,7 @@
   (block pausing (ret (zext i64 (atomic-load acquire i32 @fib.live-pausing))))
   (block point (call @fib.live-pause-point) (ret (i64 0)))
   (block busy (ret (call @fib.live-count (i64 2))))
+  (block multi (atomic-store monotonic (i32 1) @fib.mt) (ret (i64 0)))
   (block other (ret (i64 -1))))
 ")
 
