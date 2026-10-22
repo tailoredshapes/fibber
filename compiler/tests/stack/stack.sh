@@ -4,7 +4,7 @@
 #   compiler/tests/stack/stack.sh FIBC [SCRATCH]      FIBC names a stage 2 built from this tree TWICE over (the runtime is embedded: F builds F2, F2's programs
 #                                                    and F2 itself have the new runtime); exit 0 when every check holds, 1 otherwise.
 # Checks (each prints `ok N text` or `FAIL N text`):
-#   1-3  8350 (main), 8351 (a task), 8352 (under try): status 134 and `trap: stack overflow` on standard error
+#   1-3  8350 (main), 8351 (a task), 8352 (under try: caught, status 7; built with FIB_STACK_CHECK=0: 134): main and a task are status 134 and `trap: stack overflow` on standard error
 #   4    a read of a PROT_NONE page (not a stack): status 139 (SIGSEGV), `fatal signal 11 at 0x` and not the word `stack`
 #   5    a recursion of two million frames runs under the default stack (256 MiB) and answers; status is the low byte of the sum
 #   6    FIB_STACK_MB=0 (the process's own stack, 8 MiB here): the same recursion is a stack overflow, with the message and status 134
@@ -30,11 +30,13 @@ expect() {
   if [ "$rc" = "$want" ] && { [ -z "$text" ] || grep -qF -- "$text" "$exe.err"; }; then say ok "$what: status $rc, \"$text\""
   else say FAIL "$what: status $rc (want $want), stderr: $(head -c 200 "$exe.err")"; fi
 }
-for c in 8350-trap-stack-overflow-in-main-is-a-trap-not-a-silent-exit:main 8351-trap-stack-overflow-in-a-task-ends-the-process:task \
-         8352-trap-stack-overflow-under-try-is-fatal-and-says-so:try; do
+for c in 8350-trap-stack-overflow-in-main-is-a-trap-not-a-silent-exit:main 8351-trap-stack-overflow-in-a-task-ends-the-process:task; do
   f=cases/stdlib/${c%%:*}.fib; k=${c##*:}
   build "$f" "$S/$k" && expect "overflow in $k (AOT)" "$S/$k" 134 "trap: stack overflow" X=1
 done
+# under try the overflow is caught (docs/adr/0027): the catch answers 7; built with FIB_STACK_CHECK=0 it is the old fatal overflow
+build cases/stdlib/8352-a-stack-overflow-under-try-is-caught.fib "$S/try" && expect "overflow under try (AOT) is caught" "$S/try" 7 "" X=1
+FIB_STACK_CHECK=0 build cases/stdlib/8352-a-stack-overflow-under-try-is-caught.fib "$S/try0" && expect "overflow under try, FIB_STACK_CHECK=0 (AOT)" "$S/try0" 134 "trap: stack overflow" X=1
 cat > "$S/wild.fib" <<'EOF'
 (ns main)
 (extern mmap :private (i64 i64 i32 i32 i32 i64) -> ptr)

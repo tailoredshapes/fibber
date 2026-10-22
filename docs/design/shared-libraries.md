@@ -49,7 +49,7 @@ fibc build X.fib --emit obj --header X.h --export NAME[=SYMBOL] .. -o X.o       
    linker bundled in the compiler would be a second dependency to keep in step with the platforms. The object is written to `OUT.lair.o` beside the output and removed.
 2. **Only the exports are visible, twice.** The object marks everything but the export wrappers `internal` (the study's `nm` showed it), and the link adds
    a version script (`local: *`) on Linux or an `-exported_symbols_list` on macOS. Either alone holds; the second is there so that a future runtime
-   symbol that forgets `internal` cannot leak. The gate checks `nm -D --defined-only` against the declared names.
+   symbol that forgets `internal` cannot leak. The gate checks `nm -D --defined-only` against the declared names plus `fib_status` and `fib_error`, the two symbols every library has (docs/design/stack-check.md 6; the names are provisional until the owner confirms them).
 3. **Position independent.** The host machine is created with the PIC relocation model (`compiler/llvm/target.fib`, `reloc-of`); the gate checks the library has no text relocation (`readelf -d`: no `TEXTREL`).
 4. **A wrapper per export, made at export time, in lIR (`compiler/emit/export.fib`).** The exported symbol is a C-convention function with the name the
    user gave; it first makes sure the runtime is up (`fib.export-ready`), converts, calls the fibber function, converts back. The wrapper is the only
@@ -180,7 +180,7 @@ sibling repository `../fib-solid` (or `SOLID=DIR`) is missing, as the wasm and s
 
 - **refusals**: no export, `--shared` with `--emit`, `--header` on an executable, a symbol that is not a C identifier, a `Vec` parameter, a `Vec` result, a name that is no function.
 - **kernels** (`kernels.fib`: integers of each width, `f32`, `f64`, `bool`, `ptr` with a length, `unit`, `str` in, `str` out, two `str` parameters, a `str` result with no parameter, an owned `str` parameter, the empty string): the library and header built with
-  `--shared --header`; the header's every prototype byte for byte, valid C11 and C++17; `module.modulemap` byte for byte; `nm -D --defined-only` equal to the declared names; no `TEXTREL`; SONAME; no object or list left beside the output;
+  `--shared --header`; the header's every prototype byte for byte, valid C11 and C++17; `module.modulemap` byte for byte; `nm -D --defined-only` equal to the declared names and `fib_status`, `fib_error`; no `TEXTREL`; SONAME; no object or list left beside the output;
   `host.c`, compiled against the **generated** header, prints what `oracle.fib`'s `main` prints under `fibc run` (14 lines) and checks the length rule, truncation (and that nothing is written past `cap`), `cap` 0, a `NULL` buffer, a negative `cap`, an exact fit,
   the retry rule, a string cut by `len`, an embedded NUL, `NULL` with length 0, a negative `len`, independent results, and that 400000 calls with 4 KB strings do not grow the process (a leak or a double release fails it).
 - **renderer** (`solid-lib.fib`: `render(text: str) -> str` over fib-solid's `solid.cli/answer`): `libsolid.so` (1.6 MB, 12 s) with its header; only `render` is exported; `solid-host.c` calls it for three models (`(cube 1 2 3)`, `(difference (cube 10 10 10) (sphere 6))`, and an unclosed form, which answers an error JSON) and the JSON is byte for byte what
@@ -192,7 +192,7 @@ sibling repository `../fib-solid` (or `SOLID=DIR`) is missing, as the wasm and s
 declared names, the module map and the header; compiles `main.swift` / `solid-main.swift` with `swiftc -I DIR` and `import kernels` / `import solid`; and compares the output with `fibc run`. **The gate does not run it** (the gate runs on Linux; `mk/mac.mk`'s `mac-check` lists `sh-shared`
 as skipped in `compiler/tests/expected-macos.txt`, with the reason). 
 Result, run on the M1 Ultra (macOS, Swift 6.4, Homebrew llvm@21; a stage 2 built there from this tree by the 0.1.17 seed in 120 s; everything under `~/fibber-a64-scratch`, nothing installed, no process left): all 14 checks `ok`, last line `shared-mac: ok`:
-the dylib builds with no linker warning, its install name is `@rpath/libkernels.dylib`, `nm -gU` shows exactly the 16 exports, the header is valid C11, `swiftc -I DIR` with `import kernels` compiles `main.swift`, the Swift tool's own checks (retry, truncation, nil buffer, 100000 string calls) hold and
+the dylib builds with no linker warning, its install name is `@rpath/libkernels.dylib`, `nm -gU` shows exactly the 16 exports (and, since 2026-10-22, `_fib_status` and `_fib_error`), the header is valid C11, `swiftc -I DIR` with `import kernels` compiles `main.swift`, the Swift tool's own checks (retry, truncation, nil buffer, 100000 string calls) hold and
 its 14 lines equal `fibc run`'s; the renderer dylib exports only `render`, and a Swift tool's JSON for the three models (3988 bytes) is byte-identical to `fibc run` of `render-main.fib`. The macOS deployment-target warning the study met did not appear in this run (not investigated further).
 
 ### 6.3 Planted faults
