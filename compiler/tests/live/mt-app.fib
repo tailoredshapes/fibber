@@ -1,0 +1,16 @@
+(ns main (:use fib.core fib.seq) (:require [fib.unix :as u]))
+;; The program of compiler/tests/live/mt.sh: a live program whose `main` allocates all the time (small blocks, as every program does) while an
+;; input arriving over the attach socket runs program code on the attach thread, a second thread of the program's runtime
+;; (docs/design/host-threads.md). `churn` makes and drops small Vecs and strs.
+(def beat: (Atom i64) (atom 0))
+
+(defun churn (n: i64) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i n)
+        (recur (+ i 1) (+ acc (count (vec (range (+ 1 (mod i 7)))))  (str-len (str "n=" (show i)))))
+        acc)))
+
+(defun main () -> i64
+  (do (println "mt-app: started")
+      (loop ((i 0))
+        (do (reset! beat (+ (churn 50) i)) (u/sleep-ns 20000) (recur (+ i 1))))))
