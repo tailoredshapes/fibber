@@ -1,0 +1,87 @@
+;; compiler/driver/shared.fib: `fibc build X.fib --shared -o libX.so [--header X.h] --export NAME[=SYMBOL]..` (docs/design/shared-libraries.md): the program compiled to an object
+;; with its exports (emit.export: the C ABI, strings as (ptr, len) and (out, cap)), linked with the system linker as a shared library that shows the exports and nothing
+;; else, and the C header and the Swift module map of the exports written beside the header's name. `--header` also works with `--emit obj`, for a host that links the
+;; object itself. FIB_SHARED=1 and FIB_HEADER=FILE are what the flags set (driver.fibc).
+;; This builds a library; it makes no promise that a host can call it safely: a trap aborts the host and two host threads must not call in at once (stage N2).
+(ns driver.shared
+  (:require [driver.front :as front] [driver.native :as native] [driver.linkdecl :as ld] [emit.compile :as ec] [emit.export :as ex] [emit.exporthdr :as eh]
+            [expand.targetos :as tos] [native.api :as api] [native.link :as link] [expand.maker :as mk])
+  (:use expand.roots))
+
+(defun shared? () -> bool (= (native/getenv-opt "FIB_SHARED") (some "1")))
+
+(defun header-path () -> (Option str)
+  (match (native/getenv-opt "FIB_HEADER") ((some "") nil) (h h)))
+
+(defun exports-named? :private () -> bool
+  (match (native/getenv-opt "FIB_EXPORTS") ((some e) (not (= e ""))) (nil false)))
+
+;; Why the flags cannot build anything, before the front end runs: nil when they can.
+(defun refusal (emit: str) -> (Option str)
+  (cond (and (shared?) (not (= emit "exe")))
+          (some (str "fibc: --shared builds the library itself; it does not combine with --emit " emit))
+        (and (shared?) (not (exports-named?)))
+          (some "fibc: --shared needs at least one export: a shared library is the functions a host can call, and this build names none; add --export NAME[=SYMBOL] for each function (a name that is not a C identifier needs =SYMBOL)")
+        (and (some? (header-path)) (not (shared?)) (not (= emit "obj")))
+          (some "fibc: --header goes with --shared or --emit obj: it declares the exports of a library")
+        (and (some? (header-path)) (not (exports-named?)))
+          (some "fibc: --header needs at least one export (--export NAME[=SYMBOL]) to declare")
+        :else nil))
+
+;; The directory part of `path` with its `/`, or "".
+(defun dir-of :private (path: str) -> str
+  (loop ((i (- (str-len path) 1)))
+    (cond (< i 0) "" (= (str-byte-at path i) 47i8) (str-slice path 0 (+ i 1)) :else (recur (- i 1)))))
+
+(defun file-of :private (path: str) -> str (str-slice path (str-len (dir-of path)) (str-len path)))
+
+;; The name of the header without its extension: the include guard and the module's name.
+(defun stem-of :private (path: str) -> str
+  (let ((f (file-of path)))
+    (match (str-find f "." 0) (nil f) ((some i) (if (= i 0) f (str-slice f 0 i))))))
+
+(defun write-text :private (path: str text: str) -> (Result unit str)
+  (match (link/write-bytes path (str-bytes text)) ((Err m) (Err m)) ((Ok _) (Ok ()))))
+
+;; The header named by FIB_HEADER and the module map beside it, from the signatures of the exports; nothing when no header was asked for.
+(defun write-header (lir: ec/Emitted file: str) -> (Result unit str)
+  (match (header-path)
+    (nil (Ok ()))
+    ((some h) (try-let ((text (eh/header-text (stem-of h) file (. lir exports)))
+                        (_ (write-text h text)))
+                (write-text (str (dir-of h) "module.modulemap") (eh/modulemap-text (stem-of h) (file-of h)))))))
+
+;; The header's text alone, to know before the (long) build whether the exports can be declared.
+(defun check-header :private (lir: ec/Emitted file: str) -> (Result unit str)
+  (match (header-path)
+    (nil (Ok ()))
+    ((some h) (try-let ((_ (eh/header-text (stem-of h) file (. lir exports)))) (Ok ())))))
+
+(defun mac? :private () -> bool (= (tos/target-platform-name) "Darwin"))
+
+(defun failed :private (m: str) -> i64 (do (eprintln (str-concat "compile failed: " m)) front/exit-compile-failed))
+
+;; `build FILE --shared -o OUT`: the library OUT, and the header when asked for. The object is written beside OUT (OUT.lair.o) and removed.
+(defun build-shared (file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64 roots: Roots rm: mk/RunnerMaker) -> i64
+  (match (front/lower-module file roots rm true)
+    ((Err code) code)
+    ((Ok lir)
+     (match (check-header lir file)
+       ((Err m) (do (eprintln (str "fibc: " m)) front/exit-usage))
+       ((Ok _) (link-library lir file out dirs libs opt))))))
+
+(defun link-library :private (lir: ec/Emitted file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64) -> i64
+  (let ((obj (link/object-path out)))
+    (match (ld/lib-words (ld/from-notes (. lir links)))
+      ((Err m) (do (eprintln m) front/exit-usage))
+      ((Ok words)
+       (match (native/emit-module (. lir ast) obj opt "obj" words)
+         ((Err m) (failed m))
+         ((Ok _)
+          (let ((r (api/link-shared [obj] out (mapv (fn (s: ex/ExSig) (. s symbol)) (. lir exports)) (mac?) (into libs words) dirs)))
+            (do (link/remove-path obj)
+                (match r
+                  ((Err m) (failed (ld/explain-failure m (ld/from-notes (. lir links)))))
+                  ((Ok _) (match (write-header lir file)
+                            ((Err m) (do (eprintln (str "fibc: " m)) front/exit-usage))
+                            ((Ok _) 0))))))))))))

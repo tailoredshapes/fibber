@@ -7,13 +7,13 @@
 ;; set and holds what needs no body, the runtime and `main`.
 ;; `compile-macro` (E11) is the macro-time module of one `defmacro` (macros/abi.rs's text is emit.macros.abi's).
 (ns emit.compile
-  (:require [fib.string :as s] [emit.defs.astmod :as am] [emit.cpucheck :as cc] [emit.live :as live] [emit.livedef :as eld] [emit.wasi :as wasi] [expand.targetos :as tos] [types.targets :as tgt] [emit.typetext :as tt] [emit.prune :as pr] [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f] [lir.print :as print])
+  (:require [fib.string :as s] [emit.defs.astmod :as am] [emit.cpucheck :as cc] [emit.live :as live] [emit.livedef :as eld] [emit.wasi :as wasi] [emit.export :as ex] [expand.targetos :as tos] [types.targets :as tgt] [emit.typetext :as tt] [emit.prune :as pr] [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f] [lir.print :as print])
   (:use types.ty types.ast types.table types.decls types.names types.init types.program own.program emit.value emit.names emit.objects emit.statics emit.program emit.inits
         emit.assemble emit.defs.mod emit.lower.cx emit.lower.mod emit.macros.abi types.target))
 
 ;; The text of a macro module. Rust: compile.rs:88 MacroModule
 (defstruct MacroModule (ast: la/LModule))
-(defstruct Emitted (ast: la/LModule links: (Vec (Pair str str))))
+(defstruct Emitted (ast: la/LModule links: (Vec (Pair str str)) exports: (Vec ex/ExSig)))
 (defun emitted-text (m: Emitted) -> str (str (link-text (. m links)) (print/print-module (. m ast))))
 
 ;; With FIB_RESULT_STDOUT=1 an executable prints its result as `fibc run` does and exits 0, instead of returning it as the status (a status keeps 8 bits): the harness of a target
@@ -189,7 +189,7 @@
     (nil []) ((some t) [(la/ItTarget (la/LTarget (. t cpu) (. t features) 0))])))
 
 ;; --- exported functions (docs/design/wasm.md 5): `fibc build --export NAME[=SYMBOL]` makes the function NAME of the program a symbol of the object that the host can call,
-;; with the C convention and scalar or raw pointer arguments. There is no `main`: the module is a library, its runtime starts on the first call (`fib.export-ready`).
+;; with the C convention: scalars, raw pointers and, as (ptr, len) and (out, cap), strings (emit.export, docs/design/shared-libraries.md). There is no `main`: the module is a library, its runtime starts on the first call (`fib.export-ready`).
 (defun export-specs () -> (Vec (Pair str str))
   (match (sys-getenv "FIB_EXPORTS")
     (nil [])
@@ -199,34 +199,11 @@
                                (nil (Pair w w))))
                 (filter (fn (w: str) (not (= w ""))) (s/split t ",")))))))
 
-;; The header of the lowered body `name`: its result type and the parameters `((T n) ..)`, from the text of the function. Only a function that is not generic, takes no
-;; hidden slot (a program that catches returns a failure next to the value) and has a scalar or raw pointer for each of them can be exported.
+;; The lowered body `name` as the code has it: its result type and its parameters, from the text of the function. Only a function that is not generic and takes no hidden
+;; slot (a program that catches returns a failure next to the value) can be exported; the wrapper (emit.export) is made from this and the function's signature.
 (defun export-header :private (p: Program name: str) -> (Result la/LFunction str)
   (match (first (filter (fn (f: la/LFunction) (= (. f name) name)) @(. p funcs)))
     (nil (Err (str "export: no code for " name))) ((some f) (Ok f))))
-
-(defun scalar-type? :private (ty: lt/LType) -> bool
-  (match ty ((lt/TInt _) true) ((lt/TFloat) true) ((lt/TDouble) true) ((lt/TPtr) true) (_ false)))
-
-;; The parameter names of `((T a) (U b))`, and whether every type is one an export takes.
-(defun export-params :private (func: la/LFunction) -> (Result (Vec la/LExpr) str)
-  (if (every? scalar-type? (. (. func ty) params))
-      (Ok (mapv (fn (p: la/LParam) (n/local (. p name))) (. func params)))
-      (Err "export: every parameter must be an integer, a float or a raw ptr")))
-
-(defun export-wrapper :private (p: Program sym: str name: str) -> (Result la/LItem str)
-  (try-let ((func (export-header p name)))
-    (let ((ty (. func ty)))
-      (if (match (. ty ret) (nil false) ((some ret) (not (scalar-type? ret))))
-          (Err (str "export: " sym " must return an integer, a float, a raw ptr or nothing"))
-          (try-let ((args (export-params func)))
-            (let ((call (n/call name args)))
-              (let ((body (match (. ty ret)
-                            (nil [call (n/ret nil)])
-                            ((some _) [(f/bound [(f/binding "r" call)] [(n/ret (some (n/local "r")))])]))))
-                (Ok (la/ItDefine (f/external (f/make sym (. ty ret)
-                      (mapv (fn (i: i64) (Pair (. (nth (. func params) i) name) (nth (. ty params) i))) (range (count (. func params))))
-                      lt/cc-c [(f/block "entry" (into [(n/call "fib.export-ready" [])] body))])))))))))))
 
 (defun export-ready :private (p: Program) -> (Vec la/LItem)
   [(la/ItGlobal (la/LGlobalDef "fib.exported" lt/ty-i32 (n/integer lt/ty-i32 0) false (la/LModifiers la/lk-internal false false) 0 false))
@@ -240,7 +217,8 @@
 ;; The module of a library: the runtime, the program's functions reached from the exports, the wrappers and the init of the runtime on the first call.
 (defun compile-library :private (typed: TypedProgram owned: OwnedProgram specs: (Vec (Pair str str))) -> (Result Module str)
   (let ((p (emit.program/program-new typed owned)))
-    (try-let ((_ (inits-plan p)))
+    (try-let ((sigs (ex/export-sigs typed specs))
+              (_ (inits-plan p)))
       (match (make-defs-at p)
         ((Err m) (Err m))
         ((Ok [q defs])
@@ -252,18 +230,24 @@
                                            ((some f) (Ok (program-request q (BodyFun f) [])))))
                                        specs))
                        (_ (emit-all q))
-                       (wrappers (try-map (fn (i: i64) (export-wrapper q (. (nth specs i) fst) (nth names i))) (vec (range (count specs))))))
+                       (wrappers (try-map (fn (i: i64) (try-let ((func (export-header q (nth names i)))) (ex/export-wrapper q (nth sigs i) (nth names i) func)))
+                                         (vec (range (count specs))))))
                (Ok (Module (module-parts q @(. defs items)) (into (into (inits-items q) (export-ready q)) wrappers) nil)))))))))
 
 ;; The module text as the target's runtime wants it: WASI's finishing pass (emit.wasi), nothing for the others.
 (defun for-target :private (ast: la/LModule) -> la/LModule
   (if (= (tos/target-platform-name) "Wasi") (wasi/finish-module ast) ast))
 
+;; The signatures of the program's exports (none when it exports nothing, or when one cannot be exported: compile-library has said so).
+(defun export-sigs-of :private (typed: TypedProgram) -> (Vec ex/ExSig)
+  (let ((specs (export-specs)))
+    (if (empty? specs) [] (match (ex/export-sigs typed specs) ((Ok sigs) sigs) (_ [])))))
+
 (defun finished-product :private (typed: TypedProgram result: (Result Module str)) -> (Result Emitted str)
   (try-let ((m result))
     (match (. m pending)
       ((some message) (Err message))
-      (nil (Ok (Emitted (for-target (la/LModule (into (target-items typed) (. (module-ast m) items)))) (. (. m parts) links)))))))
+      (nil (Ok (Emitted (for-target (la/LModule (into (target-items typed) (. (module-ast m) items)))) (. (. m parts) links) (export-sigs-of typed)))))))
 
 ;; The lIR text of a whole program for `fibc run`: runtime, static data, bodies, and a `main` that prints the result.
 ;; Rust: compile.rs:47 compile

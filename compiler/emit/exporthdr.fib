@@ -1,0 +1,90 @@
+;; compiler/emit/exporthdr.fib: the C header and the Swift module map of a library built with `--export` (`fibc build --shared --header FILE.h`,
+;; docs/design/shared-libraries.md section 4), from the signatures emit.export made for the wrappers, so a prototype cannot differ from the code.
+;; A str parameter is `const uint8_t* NAME, int64_t NAME_len`; a str result is the trailing `uint8_t* out, int64_t out_cap` and an int64_t return.
+(ns emit.exporthdr
+  (:use emit.export types.ty types.init))
+
+(def c-words: (Vec str)
+  ["auto" "break" "case" "char" "const" "continue" "default" "do" "double" "else" "enum" "extern" "float" "for" "goto" "if" "inline" "int" "long" "register"
+   "restrict" "return" "short" "signed" "sizeof" "static" "struct" "switch" "typedef" "union" "unsigned" "void" "volatile" "while" "bool" "true" "false"
+   "class" "new" "delete" "this" "template" "typename" "namespace" "public" "private" "protected" "virtual" "operator" "friend" "try" "catch" "throw" "NULL"])
+
+(defun ident-char? :private (b: i8 first: bool) -> bool
+  (or (and (>= b 97i8) (<= b 122i8)) (and (>= b 65i8) (<= b 90i8)) (= b 95i8) (and (not first) (>= b 48i8) (<= b 57i8))))
+
+;; Whether `name` is a C identifier (so a host can declare and call it).
+(defun c-ident? (name: str) -> bool
+  (and (> (str-len name) 0)
+       (every? (fn (i: i64) (ident-char? (str-byte-at name i) (= i 0))) (range (str-len name)))))
+
+;; A fibber parameter name as a C one: every other character becomes `_`, a leading digit and a C word get a `_` before or after.
+(defun c-name (name: str) -> str
+  (let ((mapped (str-join (mapv (fn (i: i64) (if (ident-char? (str-byte-at name i) false) (str-slice name i (+ i 1)) "_")) (range (str-len name))))))
+    (cond (= mapped "") "arg"
+          (not (ident-char? (str-byte-at mapped 0) true)) (str "_" mapped)
+          (in-words? mapped) (str mapped "_")
+          :else mapped)))
+
+(defun in-words? :private (w: str) -> bool (some? (first (filter (fn (x: str) (= x w)) c-words))))
+
+;; Whether a candidate name meets one already taken: the same, or the `_len` of one (or of the candidate), or the `_cap` of the str result.
+(defun clashes? :private (cand: str acc: (Vec str)) -> bool
+  (some? (first (filter (fn (x: str) (or (= x cand) (= (str x "_len") cand) (= x (str cand "_len")) (= (str x "_len") (str cand "_len")) (= x (str cand "_cap")))) acc))))
+
+(defun unique :private (cand: str acc: (Vec str)) -> str
+  (if (clashes? cand acc) (unique (str cand "_") acc) cand))
+
+(defun param-decls :private (p: ExParam name: str) -> (Vec str)
+  (match (. p kind)
+    ((ExStr) [(str "const uint8_t* " name) (str "int64_t " name "_len")])
+    ((ExScalar ct _) [(str ct " " name)])
+    (_ [])))
+
+(defun c-result :private (k: ExKind) -> str
+  (match k ((ExStr) "int64_t") ((ExScalar ct _) ct) (_ "void")))
+
+;; The C names of the parameters: sanitised and unique (a name and its `_len` must not meet another parameter, or `out`/`out_cap` of a str result).
+(defun param-names :private (sig: ExSig) -> (Vec str)
+  (reduce (fn (acc: (Vec str) p: ExParam) (conj acc (unique (c-name (. p name)) acc))) [] (. sig params)))
+
+(defun prototype (sig: ExSig) -> (Result str str)
+  (if (not (c-ident? (. sig symbol)))
+      (Err (str "export " (. sig symbol) ": the symbol is not a C identifier, so a header cannot declare it; rename it: --export " (. sig source) "=" (c-name (. sig symbol))))
+      (let ((names (param-names sig)))
+        (let ((out (unique "out" names))
+              (decls (vec (mapcat (fn (i: i64) (param-decls (nth (. sig params) i) (nth names i))) (range (count names))))))
+          (let ((all (match (. sig ret) ((ExStr) (into decls [(str "uint8_t* " out) (str "int64_t " out "_cap")])) (_ decls))))
+            (Ok (str (c-result (. sig ret)) " " (. sig symbol) "(" (if (empty? all) "void" (str-join (vec (interpose ", " all)))) ");")))))))
+
+(defun upper-ascii :private (word: str) -> str
+  (str-join (mapv (fn (i: i64) (let ((b (str-byte-at word i)))
+                                 (if (and (>= b 97i8) (<= b 122i8))
+                                     (let ((k (- (sext i64 b) 97))) (str-slice "ABCDEFGHIJKLMNOPQRSTUVWXYZ" k (+ k 1)))
+                                     (str-slice word i (+ i 1)))))
+                  (range (str-len word)))))
+
+(defun guard-of :private (base: str) -> str (str "FIB_" (upper-ascii (c-name base)) "_H"))
+
+(def abi-note: str "/* The ABI (docs/design/shared-libraries.md):
+ *  - i8 i16 i32 i64 f32 f64 and a raw ptr cross as the C types below; a bool is a uint8_t (0 or 1).
+ *  - a str parameter is two parameters, NAME (the bytes, UTF-8, not NUL terminated) and NAME_len (their count; a negative count is 0); the library copies
+ *    the bytes during the call and keeps nothing.
+ *  - a str result is written to the trailing out and out_cap, and the function returns the length the string needs. At most out_cap bytes are
+ *    written (none when out is NULL or out_cap is not positive, and no NUL), the first bytes of the string, which may end inside a UTF-8 sequence.
+ *    A result above out_cap means the buffer was too small: call again, with a buffer of that length, for the whole string.
+ *  - nothing else crosses yet. A trap in the library aborts the host, and two host threads must not call in at once (stage N2 of the plan). */")
+
+;; The header file: `base` names it (the include guard), `source` is the fibber file. The first symbol that cannot be declared is the error.
+(defun header-text (base: str source: str sigs: (Vec ExSig)) -> (Result str str)
+  (try-let ((protos (try-map prototype sigs)))
+    (Ok (str-join
+          (into (into ["/* " base ".h: generated by `fibc build --shared --header` from " source ". Do not edit. */\n"
+                       abi-note "\n#ifndef " (guard-of base) "\n#define " (guard-of base) "\n\n#include <stdint.h>\n\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n"]
+                      (mapcat (fn (i: i64) [(if (= (. (nth sigs i) symbol) (. (nth sigs i) source)) "" (str "/* fibber: " (. (nth sigs i) source) " */\n"))
+                                            (nth protos i) "\n"])
+                              (range (count sigs))))
+                ["\n#ifdef __cplusplus\n}\n#endif\n\n#endif\n"])))))
+
+;; The Swift module map beside the header: `import NAME` in a Swift file compiled with -I DIR.
+(defun modulemap-text (module: str header: str) -> str
+  (str "module " (c-name module) " {\n  header \"" header "\"\n  export *\n}\n"))

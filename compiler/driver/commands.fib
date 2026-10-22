@@ -2,7 +2,7 @@
 ;; `explain` (spec/compiler.md §1): each takes what the command line gave and the roots, prints what the Rust prints and returns
 ;; the exit status. The macro runner (`rm`, expand.maker) is the tool's: macros.runner by default, none with `--no-runner` (driver.front).
 (ns driver.commands
-  (:require [fib.string :as s] [types.targets :as tt] [llvm.target :as lt] [driver.front :as front] [expand.maker :as mk] [driver.native :as native] [driver.linkdecl :as ld] [driver.staticrun :as sr] [driver.viac :as viac] [emit.args :as ea] [emit.dump :as ed] [own.explain :as oe] [types.unsafe :as unsafe-r] [emit.compile :as ec] [emit.program :as ep] [serve.live :as live] [lir.ast :as la])
+  (:require [fib.string :as s] [types.targets :as tt] [llvm.target :as lt] [driver.front :as front] [expand.maker :as mk] [driver.native :as native] [driver.linkdecl :as ld] [driver.staticrun :as sr] [driver.viac :as viac] [driver.shared :as sh] [emit.args :as ea] [emit.dump :as ed] [own.explain :as oe] [types.unsafe :as unsafe-r] [emit.compile :as ec] [emit.program :as ep] [serve.live :as live] [lir.ast :as la])
   (:use expand.roots driver.args))
 
 ;; The message and status of a lIR module that lair stopped at. Rust: main.rs `fail`
@@ -100,14 +100,18 @@
 
 (defun build-checked :private (file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64 emit: str kernel: str roots: Roots rm: mk/RunnerMaker) -> i64
   (let ((kt (kernel-target-of kernel)))
-    (cond (and (= emit "exe") (s/ends-with? file ".liro"))
+    (cond (some? (sh/refusal emit)) (do (eprintln (unwrap-or (sh/refusal emit) "")) front/exit-usage)
+          (sh/shared?) (sh/build-shared file out dirs libs opt roots rm)
+          (and (= emit "exe") (s/ends-with? file ".liro"))
           (match (native/link-liro file out opt dirs libs) ((Err m) (compile-failed m)) ((Ok _) 0))
           (not (= emit "exe"))
           (match (front/lower-module file roots rm true)
             ((Err code) code)
             ((Ok lir) (if (= emit "c")
                           (match (viac/emit-c (ec/emitted-text lir) file out) ((Err m) (compile-failed m)) ((Ok _) 0))
-                          (match (emit-product lir out opt emit) ((Err m) (compile-failed m)) ((Ok _) 0)))))
+                          (match (emit-product lir out opt emit)
+                            ((Err m) (compile-failed m))
+                            ((Ok _) (match (sh/write-header lir file) ((Err m) (do (eprintln (str-concat "fibc: " m)) front/exit-usage)) ((Ok _) 0)))))))
           (not (= kt "")) (build-with-kernels file out dirs libs opt kt roots rm)
           :else
           (match (front/lower-module file roots rm true)

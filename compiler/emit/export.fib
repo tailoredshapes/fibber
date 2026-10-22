@@ -1,0 +1,156 @@
+;; compiler/emit/export.fib: the C ABI of an exported function (`fibc build --export NAME[=SYMBOL]`, docs/design/shared-libraries.md section 3).
+;; What crosses: integers (i8 i16 i32 i64), f32, f64, bool, a raw `ptr` and `unit` as they are; a `str` as bytes the caller owns:
+;;   a str PARAMETER is two C parameters `(const uint8_t *NAME, int64_t NAME_len)`: the wrapper copies the bytes into a str of its own, calls the function and
+;;     releases that str (unless the function took it: an owned parameter), so nothing of the library's memory is held by the host after the call;
+;;   a str RESULT is the trailing C parameters `(uint8_t *out, int64_t out_cap)` and the C result is the int64_t length the string needs: at most `out_cap`
+;;     bytes are copied (none when `out` is NULL or `out_cap` is not positive), so a caller that got a length above its capacity calls again with a bigger buffer.
+;; Everything else (vectors, records, closures, Results) is refused with a message. This module makes the signatures (for the wrapper and for the C header
+;; the driver writes) and the wrapper; emit.compile puts the wrappers in the module.
+(ns emit.export
+  (:require [lir.ast :as la] [lir.types :as lt] [emit.node :as n] [emit.function :as f] [expand.targetos :as tos])
+  (:use types.ty types.scheme types.table types.init types.program own.program emit.program))
+
+;; How one value crosses: a scalar with its C type, a str, or nothing (a `unit` result).
+(defenum ExKind (ExScalar ctype: str scalar: Scalar) ExStr ExUnit)
+
+;; A parameter as the source names it, a function as a C prototype has it: the symbol, the source name, the parameters, the result.
+(defstruct ExParam (name: str kind: ExKind))
+(defstruct ExSig (symbol: str source: str params: (Vec ExParam) ret: ExKind))
+
+(defun ex-scalar :private (s: Scalar) -> (Option ExKind)
+  (match s
+    ((SBool) (some (ExScalar "uint8_t" s))) ((SI8) (some (ExScalar "int8_t" s))) ((SI16) (some (ExScalar "int16_t" s)))
+    ((SI32) (some (ExScalar "int32_t" s))) ((SI64) (some (ExScalar "int64_t" s)))
+    ((SF32) (some (ExScalar "float" s))) ((SF64) (some (ExScalar "double" s))) ((SPtr) (some (ExScalar "void*" s)))
+    (_ nil)))
+
+(defun ex-kind :private (t: Ty) -> (Option ExKind)
+  (match t
+    ((TCon (KScalar s) _) (ex-scalar s))
+    ((TCon (KStr) _) (some ExStr))
+    (_ nil)))
+
+(defun ex-result :private (t: Ty) -> (Option ExKind)
+  (match t ((TCon (KScalar (SUnit)) _) (some ExUnit)) (_ (ex-kind t))))
+
+(def ex-refusal: str "an integer (i8 i16 i32 i64), f32, f64, bool, a raw ptr or a str (a result may also be unit); vectors, records, closures and Results do not cross yet")
+
+(defun sig-of :private (typed: TypedProgram symbol: str source: str) -> (Result ExSig str)
+  (match (program-fun typed source)
+    (nil (Err (str "export: the program has no function " source)))
+    ((some fi)
+     (match (get (. typed fun-schemes) fi)
+       (nil (Err (str "export: no type for " source)))
+       ((some sc)
+        (cond (> (. sc n-vars) 0) (Err (str "export " symbol ": " source " is generic; only a function of known types can be exported"))
+              (scheme-has-amp sc) (Err (str "export " symbol ": " source " has an & parameter; a host cannot pass one"))
+              :else (match (. sc ty)
+                      ((TFn _ params ret) (sig-from symbol source (. sc params) params ret))
+                      (_ (Err (str "export " symbol ": " source " is not a function")))))))))
+)
+(defun sig-from :private (symbol: str source: str names: (Vec str) params: (Vec Ty) ret: Ty) -> (Result ExSig str)
+  (let ((kinds (mapv ex-kind params)) (r (ex-result ret)))
+    (cond (some? (first (filter (fn (i: i64) (nil? (nth kinds i))) (range (count kinds)))))
+            (let ((i (unwrap-or (first (filter (fn (i: i64) (nil? (nth kinds i))) (range (count kinds)))) 0)))
+              (Err (str "export " symbol ": parameter " (if (< i (count names)) (nth names i) (show i)) " of " source " must be " ex-refusal)))
+          (nil? r) (Err (str "export " symbol ": the result of " source " must be " ex-refusal))
+          :else (Ok (ExSig symbol source
+                           (mapv (fn (i: i64) (ExParam (if (< i (count names)) (nth names i) (str "arg" (show i))) (unwrap-or (nth kinds i) ExUnit))) (range (count kinds)))
+                           (unwrap-or r ExUnit))))))
+
+;; The signatures of the exports `specs` (symbol, source name), or the first that cannot be exported.
+(defun export-sigs (typed: TypedProgram specs: (Vec (Pair str str))) -> (Result (Vec ExSig) str)
+  (try-map (fn (s: (Pair str str)) (sig-of typed (. s fst) (. s snd))) specs))
+
+(defun str-kind? :private (k: ExKind) -> bool (match k ((ExStr) true) (_ false)))
+
+(defun uses-str? :private (sig: ExSig) -> bool
+  (or (str-kind? (. sig ret)) (some? (first (filter (fn (p: ExParam) (str-kind? (. p kind))) (. sig params))))))
+
+;; --- the wrapper
+
+(defun i64-lit :private (v: i64) -> la/LExpr (n/integer lt/ty-i64 v))
+(defun pname :private (i: i64) -> str (str "p" (show i)))
+(defun pn :private (i: i64) -> la/LExpr (n/local (pname i)))
+
+;; The C-convention parameters of the wrapper: a scalar as the function has it (a bool as a byte), a str as (ptr, i64), then (out, out_cap) for a str result.
+(defun wrapper-params :private (sig: ExSig lowered: (Vec lt/LType)) -> (Vec (Pair str lt/LType))
+  (into (into [] (mapcat (fn (i: i64)
+                           (match (. (nth (. sig params) i) kind)
+                             ((ExStr) [(Pair (pname i) lt/ty-ptr) (Pair (str (pname i) "_len") lt/ty-i64)])
+                             ((ExScalar _ (SBool)) [(Pair (pname i) lt/ty-i8)])
+                             (_ [(Pair (pname i) (nth lowered i))])))
+                         (range (count (. sig params)))))
+        (if (str-kind? (. sig ret)) [(Pair "out" lt/ty-ptr) (Pair "out_cap" lt/ty-i64)] [])))
+
+;; The values made before the call: a str from the host's bytes (a negative length is the empty string), a bool from its byte.
+(defun pre-bindings :private (sig: ExSig) -> (Vec la/LBinding)
+  (vec (mapcat (fn (i: i64)
+                 (match (. (nth (. sig params) i) kind)
+                   ((ExStr) (let ((len (n/local (str (pname i) "_len"))))
+                              [(f/binding (str "s" (show i))
+                                 (n/call "fib.str-from-bytes" [(pn i) (n/select (n/compare-int la/ISlt len (i64-lit 0)) (i64-lit 0) len)]))]))
+                   ((ExScalar _ (SBool)) [(f/binding (str "b" (show i)) (n/compare-int la/INe (pn i) (n/integer lt/ty-i8 0)))])
+                   (_ [])))
+               (range (count (. sig params))))))
+
+(defun call-args :private (sig: ExSig) -> (Vec la/LExpr)
+  (mapv (fn (i: i64) (match (. (nth (. sig params) i) kind)
+                       ((ExStr) (n/local (str "s" (show i))))
+                       ((ExScalar _ (SBool)) (n/local (str "b" (show i))))
+                       (_ (pn i))))
+        (range (count (. sig params)))))
+
+;; Whether parameter i is owned by the function (it consumes it, or hands it on): then the wrapper must not release it.
+(defun owned-param? :private (p: Program fi: i64 i: i64) -> bool
+  (match (owned-fun (. p owned) fi)
+    (nil false)
+    ((some b) (if (< i (count (. b params)))
+                  (match (. (nth (. b params) i) kind) ((PkOwned _) true) (_ false))
+                  false))))
+
+;; The releases of the str parameters the function only borrowed.
+(defun releases :private (sig: ExSig p: Program fi: i64) -> (Vec la/LExpr)
+  (vec (keep (fn (i: i64) (match (. (nth (. sig params) i) kind)
+                            ((ExStr) (if (owned-param? p fi i) nil (some (n/call "fib.release" [(n/local (str "s" (show i)))]))))
+                            (_ nil)))
+             (range (count (. sig params))))))
+
+;; A str result into the host's buffer: min(length, max(cap, 0)) bytes, none for a NULL buffer; the length is returned. The str is released.
+(defun str-result :private (r: la/LExpr) -> (Vec la/LExpr)
+  [(f/bound [(f/binding "n" (n/call "fib.str-len" [r]))
+             (f/binding "cap" (n/select (n/compare-int la/ISlt (n/local "out_cap") (i64-lit 0)) (i64-lit 0) (n/local "out_cap")))
+             (f/binding "m0" (n/select (n/compare-int la/ISlt (n/local "n") (n/local "cap")) (n/local "n") (n/local "cap")))
+             (f/binding "m" (n/select (n/compare-int la/IEq (n/local "out") (n/null)) (i64-lit 0) (n/local "m0")))]
+            [(n/call "memcpy" [(n/local "out") (n/call "fib.str-bytes-ptr" [r]) (n/local "m")])
+             (n/call "fib.release" [r])
+             (n/ret (some (n/local "n")))])])
+
+;; What follows the call: the releases, then the result as the C side has it.
+(defun after-call :private (sig: ExSig p: Program fi: i64) -> (Vec la/LExpr)
+  (into (releases sig p fi)
+        (match (. sig ret)
+          ((ExUnit) [(n/ret nil)])
+          ((ExStr) (str-result (n/local "r")))
+          ((ExScalar _ (SBool)) [(n/ret (some (n/cast la/CZExt lt/ty-i8 (n/local "r"))))])
+          (_ [(n/ret (some (n/local "r")))]))))
+
+(defun wrapper-ret :private (sig: ExSig lowered-ret: (Option lt/LType)) -> (Option lt/LType)
+  (match (. sig ret)
+    ((ExUnit) nil) ((ExStr) (some lt/ty-i64)) ((ExScalar _ (SBool)) (some lt/ty-i8)) (_ lowered-ret)))
+
+;; The wrapper `sym` of the lowered function `name` (`func`): ready-check, the str parameters made, the call, the str parameters released, the result.
+(defun export-wrapper (p: Program sig: ExSig name: str func: la/LFunction) -> (Result la/LItem str)
+  (let ((ty (. func ty)) (fi (unwrap-or (program-fun (. p typed) (. sig source)) 0)))
+    (cond (not (= (count (. func params)) (count (. sig params))))
+            (Err (str "export " (. sig symbol) ": " (. sig source) " takes a hidden argument (the program catches), which a host cannot pass"))
+          (and (uses-str? sig) (= (tos/target-platform-name) "Wasi"))
+            (Err (str "export " (. sig symbol) ": str parameters and results are for the native targets; on wasm32 pass the bytes and a length"))
+          :else
+          (let ((call (n/call name (call-args sig)))
+                (body (match (. sig ret)
+                        ((ExUnit) (into [call] (after-call sig p fi)))
+                        (_ [(f/bound [(f/binding "r" call)] (after-call sig p fi))]))))
+            (Ok (la/ItDefine (f/external (f/make (. sig symbol) (wrapper-ret sig (. ty ret)) (wrapper-params sig (. ty params)) lt/cc-c
+                  [(f/block "entry" (into [(n/call "fib.export-ready" [])]
+                                          (let ((bs (pre-bindings sig))) (if (empty? bs) body [(f/bound bs body)]))))]))))))))
