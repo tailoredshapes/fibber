@@ -642,3 +642,24 @@ until a `retire`, which needs the program to reach a pause point (section 7). A 
 1000 swaps are about 100 MB. Retiring on the next swap needs the stack scan of live-repl.md 3.3; not built.
 `Engine.verdicts` is pruned with the rest. The bound of the test (40 MB in the last 100 swaps) is four times the measured growth and a twentieth of the
 unfixed one.
+
+## 9. A removed function in a `load` (LM3, 2026-10-22)
+
+**Before.** `load` of a module that had lost a `defun` (or a macro-made definition whose head starts with `def`, as fib-solid's `defparam`: the text
+rules classify it as a function) was `live/Removed` whatever the rest of the program said; fib-solid's helper answered it by starting a new session (10 s).
+
+**Now.** A removed function (and a macro-made `def`) is accepted when the program with the new text checks (`serve.liveload/load-module`). The
+checker is the judge of "something still names it": a caller in the module, in another module, or in a session input (`(defun uses-helper ..)` typed
+at the REPL is part of the program the engine checks) makes the program fail to check, and the load is refused with the checker's diagnostic
+(`type/...`), nothing applied. When it checks, no text names the function any more, and the callers that did are in the same load (their expanded
+form changed, so they are swapped with it). What stays: the function's stub, its slot and its last generation, because a running generation of a
+caller, a closure made before, or a thread parked inside it may still reach it; they are retired with the others at a `retire`. What goes: the name.
+Expression inputs and later loads see the file's text, so `(r/helper 1)` is unbound after the load; the answer lists `removed`; the session's copy of
+the module is the new text. Putting the function back is an ordinary load: its family is still in the live table, so the same signature swaps it as a
+new generation, and a different signature is `live/Signature` (callers compiled against the old one may still be running).
+Still refused: a removed `impl` (its methods are in the dispatch rows of values that exist), a removed type (`live/Layout`), a removed function of
+the **main** module's file (the session's own text keeps the definition: a `load` of the main file only evals what changed).
+**Test.** `compiler/tests/live/load.sh` (load.py): the removal refused where the module calls it, where a session input calls it; accepted once the
+session's caller is replaced; the call unbound afterwards and the app alive; put back; a removed `def` and a macro-made `def`, each refused while a
+session input reads it; a caller changed and its callee removed in one load. Run against the stage 2 before the change: the three removal
+checks and the three checks after them `FAIL` (`helper was removed ... [live/Removed]`).

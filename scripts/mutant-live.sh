@@ -95,9 +95,8 @@
 #                        prefix (`f.route` for `f.routes.route`; LM2: the key of its hash,          not in `swapped`; the next call answers the
 #                        serve.livediff): nothing is swapped, the call answers the old body (LM1,   old value)
 #                        3.2; live-dev.md 6 item 2 of meshql-fib)
-#   removed-ignored      a function removed from the loaded file is accepted: its stub stays and    compiler/tests/live/load.sh (the load that
-#                        names a body the text no longer has (LM1, 3.5: live/Removed)               removes `helper` is not refused; the call of
-#                                                                                                   `helper` after it is refused by the checker)
+#   removed-ignored      a removed function is refused again (live/Removed), as before LM3: the        compiler/tests/live/load.sh (the removal of
+#                        stub stays and nothing new can name it, so the checker is the judge          `helper` nothing names is accepted)
 #   def-slot-plain-store a def's setter `live.d.NAME.set` (emit.livedef `live-def-setter`, what a       compiler/tests/live/defs.sh --tsan-only (the
 #                        redefinition stores with) is a plain store, not a release store (LT4)      readers' acquire load against a plain store is
 #                                                                                                   a NEW ThreadSanitizer report)
@@ -229,7 +228,7 @@ case $MODE in
   retype-no-readers) patch compiler/serve/liveretype.fib '(try-let ((ts (retypes sx c rs gen)) (fams (reader-families sx ts rs))) (Ok (Pair ts fams))))' '(try-let ((ts (retypes sx c rs gen))) (Ok (Pair ts []))))' ;;
   unswappable-reader-accepted) patch compiler/serve/liveretype.fib '(= fam "f.main") (Err "main (its frame never returns: it is not swapped)")' '(= fam "f.main") (Ok fam)' ;;
   init-run-twice) patch compiler/serve/livedefs.fib '                  (_ (ls/run-void (ls/jit-of sx) init-name)))' '                  (_ (ls/run-void (ls/jit-of sx) init-name)) (_ (ls/run-void (ls/jit-of sx) init-name)))' ;;
-  removed-ignored) patch compiler/serve/liveload.fib '    (cond (and (= what "removed") (or (= k "fun") (= k "impl")))' '    (cond (and (= what "never") (or (= k "fun") (= k "impl")))' ;;
+  removed-ignored) patch compiler/serve/liveload.fib '(filterv (fn (d: rc/Def) (not (= (kind-of d) "fun"))) (. diff0 removed))' '(. diff0 removed)' ;;
   warm-skipped) patch compiler/serve/live.fib '                (do (warm-engine l trace)' '                (do ()' ;;
   diff-by-text) patch compiler/serve/liveswap.fib '(changes-of sx olds fr)' '(ldf/Changes (vec (mapcat (fn (d: rc/Def) (if (s/starts-with? (. d key) "val:") [(str "f." (. d name))] (ldf/families-of-key (ls/live-bodies sx) (. d key)))) (filterv (fn (d: rc/Def) (replaced? sx d)) defs)))
                                 (mapv (fn (d: rc/Def) (. d key)) (filterv (fn (d: rc/Def) (and (replaced? sx d) (s/starts-with? (. d key) "impl:"))) defs)) (. (changes-of sx olds fr) hashes))' ;;

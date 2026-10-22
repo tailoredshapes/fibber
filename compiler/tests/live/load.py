@@ -8,7 +8,8 @@ What is tested: an edit of `route` loaded: `swapped: ["routes/route"]`, the sess
 answer the edit; a bad edit is refused with a diagnostic at src/routes.fib:L:C and nothing changes; a file with one refused definition
 (an arity change of `route`, which app.fib calls; a def whose type changes under a reader, `route`, that would not check: live/Def
 naming it, LT4) applies nothing: the good edit of `greet` in the same file is
-not swapped and the answer lists the refusal; a removed function is live/Removed and still callable; `reload` after a second edit swaps
+not swapped and the answer lists the refusal; a removed function is accepted when nothing names it (the checker refuses it where the module or a session
+input still does; LM3), listed in `removed`, no longer nameable, and can be put back; a def made by a macro goes the same way; `reload` after a second edit swaps
 again and `reload` with no change swaps nothing; an edit of a comment only swaps nothing (LM2), of a def's comment redefines nothing; a half-saved file on disk is not seen by an expression input nor `:type` (the override), `status`
 says the file is stale; a new function in the loaded file is defined and then swapped; a file whose module the program lacks is
 live/NotLoaded with the `require` hint; a load of the main module's file defines its new function; the terminal client's `:load`,
@@ -155,12 +156,8 @@ check('a def whose type changes under a reader that does not check is live/Def a
       and l.get('hint') == ':restart' and l['diagnostics'][0]['line'] == 5, l)
 check('nothing of the file was applied', c.value('(r/greet "a")') == '"hello a"' and c.value('(r/route "x")') == '"route! x"' and c.ask(op='status').get('generation') == 1, c.value('(r/greet "a")'))
 
-# ---- a removed function is live/Removed (its stub stays); it is still callable
+# the session reaches helper first (nothing in the app calls it)
 check('before: helper', c.value('(r/helper 1)') == '2')
-write_routes(edited('(defun helper (n: i64) -> i64 (* n 2))\n', ''))
-l = c.load('src/routes.fib')
-check('a removed function is live/Removed', l.get('ok') is False and l.get('code') == 'live/Removed' and 'helper was removed' in shown_at(l, 'live/Removed'), l)
-check('the removed function is still callable', c.value('(r/helper 1)') == '2' and c.ask(op='status').get('generation') == 1, c.value('(r/helper 1)'))
 
 # ---- a function the session reached first (helper: the app never calls it; its stub is resident through the expression's module, and
 # the live table lacks it) edited and loaded: swapped, not defined again
@@ -257,6 +254,84 @@ matches('terminal: :load, :status, :reload', out,
          r'; nothing to reload: no loaded file differs from its loaded text',
          r'; :load needs a file'])
 check('terminal: the swap landed', c.value('(r/extra)') == '"extra?"', c.value('(r/extra)'))
+
+# ---- a removed function (LM3): refused while anything still names it, accepted when nothing does; its stub stays, nothing new can name it
+check('helper before the removals', c.value('(r/helper 1)') == '2')
+gen0 = c.ask(op='status').get('generation')
+base = open(routes_file).read()
+assert '(defun helper (n: i64) -> i64 (* n 2))\n' in base
+no_helper = base.replace('(defun helper (n: i64) -> i64 (* n 2))\n', '')
+# (a) the module's own `route` still calls it: the checker refuses, the module is unchanged
+write_routes(no_helper.replace('(str prefix "? " path)', '(str prefix (str (helper 1)) path)'))
+l = c.load('src/routes.fib')
+check('a removed function the module still calls is refused by the checker', l.get('ok') is False and l.get('code', '').startswith('type/') and 'helper' in ' '.join(l.get('shown', [])), l)
+check('and it stays callable', c.value('(r/helper 1)') == '2' and c.ask(op='status').get('generation') == gen0)
+# (b) a function the session defined that calls it: the session's input names it too
+check('the session defines a caller of helper', c.eval('(defun uses-helper (n: i64) -> i64 (r/helper n))').get('ok') is True)
+write_routes(no_helper)
+l = c.load('src/routes.fib')
+check('a removed function a session input calls is refused by the checker', l.get('ok') is False and l.get('code', '').startswith('type/') and 'helper' in ' '.join(l.get('shown', [])), l)
+check('and the session still works', c.value('(uses-helper 4)') == '8' and c.ask(op='status').get('generation') == gen0)
+# (c) the session's caller replaced by one that does not call it: now the removal is accepted
+check('the session redefines the caller without it', c.eval('(defun uses-helper (n: i64) -> i64 (+ n 100))').get('ok') is True)
+gen1 = c.ask(op='status').get('generation')
+l = c.load('src/routes.fib')
+check('a removed function nothing names is accepted and listed', l.get('ok') is True and l.get('removed') == ['routes/helper'] and l.get('swapped', []) == [] and l.get('changed') == [], l)
+v = c.eval('(r/helper 1)')
+check('after the removal nothing new can name it', v.get('ok') is False and 'helper' in json.dumps(v), v)
+check('the app and the session live on', a.alive() and c.value('(r/route "x")') == '"route? x"' and c.value('(uses-helper 4)') == '104', c.value('(r/route "x")'))
+st = c.ask(op='status')
+check('the loaded copy is the file without it', {'file': 'src/routes.fib', 'module': 'routes', 'stale': False} in st.get('loaded', []), st.get('loaded'))
+# (d) a removed definition that is added again with its old body is accepted (the stub is the family's)
+write_routes(base)
+l = c.load('src/routes.fib')
+check('a removed function put back is accepted', l.get('ok') is True and l.get('removed') == [], l)
+check('and answers again', c.value('(r/helper 1)') == '2', c.value('(r/helper 1)'))
+# (e) a removed `impl`-less def (a run-time value) nothing names
+cur = base
+write_routes(cur + '\n(def scratch: i64 5)\n')
+check('a new def', c.load('src/routes.fib').get('ok') is True and c.value('r/scratch') == '5')
+write_routes(cur)
+l = c.load('src/routes.fib')
+check('a removed def nothing names is accepted', l.get('ok') is True, l)
+v = c.eval('r/scratch')
+check('and is gone', v.get('ok') is False, v)
+write_routes(cur + '\n(def scratch: i64 5)\n')
+l = c.load('src/routes.fib')
+check('the def put back', l.get('ok') is True and c.value('r/scratch') == '5', l)
+check('a def the session names is refused when removed', c.eval('(defun uses-scratch () -> i64 r/scratch)').get('ok') is True)
+write_routes(cur)
+l = c.load('src/routes.fib')
+check('a removed def a session input reads is refused by the checker', l.get('ok') is False and l.get('code', '').startswith('type/'), l)
+check('and it still reads', c.value('(uses-scratch)') == '5')
+c.eval('(defun uses-scratch () -> i64 6)')
+write_routes(cur)
+l = c.load('src/routes.fib')
+check('the removal goes through once the reader is gone', l.get('ok') is True, l)
+
+# (f) a definition made by a macro whose head starts with `def` (fib-solid's `defparam`) is a definition of the file too: removed, it goes the same way
+mac = '\n(defmacro defconst (name v) `(def ~(match name ((Sym n) (Sym (str-concat n ":"))) (_ name)) i64 ~v))\n(defconst kk 7)\n'
+write_routes(cur + mac)
+l = c.load('src/routes.fib')
+check('a macro-made def is made', l.get('ok') is True and c.value('r/kk') == '7', l)
+write_routes(cur + mac.replace('(defconst kk 7)\n', ''))
+l = c.load('src/routes.fib')
+check('a macro-made def removed (nothing names it) is accepted', l.get('ok') is True, l)
+v = c.eval('r/kk')
+check('and is gone', v.get('ok') is False, v)
+write_routes(cur)
+check('back to the base file', c.load('src/routes.fib').get('ok') is True)
+
+# (g) the caller is changed in the same file to stop calling the function: one load swaps the caller and removes the function
+write_routes(cur + '\n(defun user () -> i64 (helper 3))\n')
+l = c.load('src/routes.fib')
+check('a new caller of helper', l.get('ok') is True and c.value('(r/user)') == '6', l)
+write_routes(no_helper + '\n(defun user () -> i64 9)\n')
+l = c.load('src/routes.fib')
+check('one load swaps the caller and removes the callee', l.get('ok') is True and l.get('removed') == ['routes/helper'] and l.get('swapped') == ['routes/user'], l)
+check('the caller runs its new body', c.value('(r/user)') == '9', c.value('(r/user)'))
+write_routes(cur)
+check('back to the base file again', c.load('src/routes.fib').get('ok') is True and c.value('(r/helper 2)') == '4')
 
 # ---- the end of the program through the socket
 check('stop', c.eval('(reset! stop true)').get('ok'))
