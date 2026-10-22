@@ -206,12 +206,13 @@
     (nil (Err (str "export: no code for " name))) ((some f) (Ok f))))
 
 (defun export-ready :private (p: Program) -> (Vec la/LItem)
-  [(la/ItGlobal (la/LGlobalDef "fib.exported" lt/ty-i32 (n/integer lt/ty-i32 0) false (la/LModifiers la/lk-internal false false) 0 false))
-   (la/ItDefine (f/make "fib.export-ready" nil [] lt/cc-c
-     [(f/block "entry" [(n/conditional (n/compare-int la/IEq (n/load lt/ty-i32 (n/global "fib.exported") nil) (n/integer lt/ty-i32 0)) "first" "done")])
-      (f/block "first" (into [(n/store (n/integer lt/ty-i32 1) (n/global "fib.exported") nil) (n/call "fib.init" [])
+  ;; The start runs once under a lock (fib.lib-enter, rt/core.lir): the callers are host threads, any number of them at once.
+  [(la/ItDefine (f/make "fib.export-ready" nil [] lt/cc-c
+     [(f/block "entry" [(f/bound [(f/binding "e" (n/call "fib.lib-enter" []))]
+                          [(n/conditional (n/compare-int la/INe (n/local "e") (n/integer lt/ty-i32 0)) "first" "done")])])
+      (f/block "first" (into [(n/call "fib.init" [])
                               (n/call "fib.set-args" [(n/integer lt/ty-i32 0) (n/null)])]
-                             (into (if (empty? @(. p inits)) [] [(n/call "fib.defs-init" [])]) [(n/ret nil)])))
+                             (into (if (empty? @(. p inits)) [] [(n/call "fib.defs-init" [])]) [(n/call "fib.lib-ready" []) (n/ret nil)])))
       (f/block "done" [(n/ret nil)])]))])
 
 ;; The module of a library: the runtime, the program's functions reached from the exports, the wrappers and the init of the runtime on the first call.
