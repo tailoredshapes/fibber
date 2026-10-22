@@ -55,8 +55,20 @@ else
 	  && python3 compiler/tests/wasm/suite.py --fibc $(F_ABS) cases/ownership -j $(CASE_JOBS) --expected compiler/tests/wasm/expected.txt \
 	  && python3 compiler/tests/wasm/suite.py --fibc $(F_ABS) cases/modules -j $(CASE_JOBS) --expected compiler/tests/wasm/expected.txt)
 endif
+# The renderer as a shared library (docs/design/shared-libraries.md): fib-solid's renderer built with `--shared --header`, called from a C host, its JSON byte for byte `fibc run`'s.
+# fib-solid is a sibling repository (SOLID=DIR); without it the stamp says SKIPPED with the reason, and the report lists it: a skipped stamp is no pass.
+SOLID ?= $(abspath $(CURDIR)/../fib-solid)
+export SOLID
+$(call cfg_write,$(BUILD)/shared.cfg,$(wildcard $(SOLID)/src/solid/render.fib))
+$(BUILD)/shared-renderer.ok: $(F) $(wildcard compiler/tests/shared/*) compiler/emit/export.fib compiler/emit/exporthdr.fib compiler/driver/shared.fib compiler/native/link.fib $(wildcard $(SOLID)/src/solid/*.fib) $(BUILD)/shared.cfg | $(BUILD)/
+ifeq ($(wildcard $(SOLID)/src/solid/render.fib),)
+	$(call skip,fib-solid is not at $(SOLID) (SOLID=DIR names it): the renderer was not built as a shared library)
+else
+	$(call stamp,TMPDIR=$(SCRATCH) bash compiler/tests/shared/shared.sh $(F_ABS) renderer)
+endif
+shared-renderer: $(BUILD)/shared-renderer.ok   ## fib-solid's renderer as a shared library, called from C, when fib-solid is there
 wasm: $(BUILD)/wasm.ok   ## cases as wasm modules under node, when the wasi-sdk is there
-.PHONY: adr specs static musl wasm
+.PHONY: adr specs static musl wasm shared-renderer
 
 # docs/design/aarch64-sibcall.md: the LLVM fault behind the DARWIN-2 crash, by llc alone (no fibber, no AArch64 hardware). LLC=/usr/lib/llvm-21/bin/llc to choose.
 # min.ll (an unmarked call) must be `bl callee`; min-tail.ll (the same call marked `tail`) is `b callee` while the fault stands. Not part of any gate.

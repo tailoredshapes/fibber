@@ -1,0 +1,28 @@
+;; compiler/tests/shared/kernels.fib: the library that shared.sh builds with `--shared --header` and calls from C (docs/design/shared-libraries.md).
+;; One export of each kind the ABI has: integers of every width, floats, bool, raw ptr (with a length), unit, and str in and out.
+;; shared.sh also builds this file with `oracle.fib` appended, whose `main` prints what the C host prints, so that the host's results are checked
+;; against `fibc run` of the same functions.
+(ns main (:use fib.core fib.seq))
+
+(defun add (a: i64 b: i64) -> i64 (+ a b))
+;; narrow integers: the C types are int32_t, int8_t and int16_t, and the result is widened by the function
+(defun widths (a: i32 b: i8 c: i16) -> i64 (+ (+ (sext i64 a) (sext i64 b)) (sext i64 c)))
+(defun narrow (n: i64) -> i32 (trunc i32 n))
+(defun scale (x: f64 k: f64) -> f64 (* x k))
+(defun half32 (x: f32) -> f32 (* x 0.5f32))
+(defun both (a: bool b: bool) -> bool (and a b))
+(defun dot (xs: ptr ys: ptr n: i64) -> f64
+  (unsafe (loop ((i 0) (acc 0.0))
+    (if (< i n) (recur (+ i 1) (+ acc (* (load-f64 (ptr+ xs (* 8 i))) (load-f64 (ptr+ ys (* 8 i)))))) acc))))
+(defun sum-squares (n: i64) -> i64 (reduce + 0 (map (fn (i: i64) (* i i)) (vec (range n)))))
+(defun iota (buf: ptr n: i64) -> unit
+  (unsafe (dotimes (i n) (store-i64 (ptr+ buf (* 8 i)) i))))
+
+;; strings: a str parameter is (ptr, len), a str result goes to the caller's buffer (out, cap) and the function returns the length it needs
+(defun greet (name: str) -> str (str "hello, " name "!"))
+(defun join2 (a: str b: str) -> str (str a "|" b))
+(defun count-bytes (s: str) -> i64 (str-len s))
+(defun banner () -> str "fibber")
+(defun echo (s: str) -> str s)
+(defun mixed (n: i64 s: str k: f64) -> str (str s ":" (show n) ":" (show k)))
+(defun empty-str () -> str "")
