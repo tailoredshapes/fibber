@@ -9,6 +9,7 @@
 #                  for three models, one an error and one whose JSON needs the retry
 # The Mac (a .dylib, Swift through the module map) is shared-mac.sh, run by hand: the gate runs on Linux.
 # usage: shared.sh STAGE2 [refusals|kernels|renderer]..      (from the repository root; SOLID=DIR names fib-solid, default ../fib-solid)
+# linux-only-file: reads ELF (readelf, nm -D) and /proc/self/status; the Mac's check is shared-mac.sh
 # Exit: 0 all held, 1 a check failed, 77 the renderer part could not run because fib-solid is missing (the status line then says SKIPPED, loudly).
 set -uo pipefail
 s2=${1:?usage: shared.sh STAGE2 [part..]}; shift
@@ -107,7 +108,7 @@ kernels() {
   cat "$here/kernels.fib" "$here/oracle.fib" > "$d/ko.fib"
   "$s2" run -I "$root/lib" "$d/ko.fib" > "$d/oracle.out" 2> "$d/oracle.err"; ck "fibc run of the same functions" $? 0
   head -n -1 "$d/oracle.out" > "$d/oracle.lines"
-  if cmp -s "$d/host.lines" "$d/oracle.lines"; then echo "ok    the C host printed what fibc run printed ($(wc -l < "$d/oracle.lines") lines)"; else echo "FAIL  host and fibc run differ:"; diff "$d/host.lines" "$d/oracle.lines" | head -n 10; fail=1; fi
+  if cmp -s "$d/host.lines" "$d/oracle.lines"; then echo "ok    the C host printed what fibc run printed ($(wc -l < "$d/oracle.lines") lines)"; else echo "FAIL  host and fibc run differ:"; diff "$d/host.lines" "$d/oracle.lines" | head -n 10 || true; fail=1; fi
   grep '^#' "$d/host.out"
   # --emit obj with --header: the same header for a host that links the object itself
   "$s2" build "$here/kernels.fib" -I "$root/lib" --emit obj --header "$d/o/kernels.h" "${ex[@]}" -o "$d/kernels.o" > "$d/emit.out" 2>&1; ck "--emit obj --header into a missing directory is refused" $? 2
@@ -135,7 +136,7 @@ renderer() {
     "$d/solid-host" "$m" > "$d/host$i.json" 2> "$d/host$i.err"; ck "model $i: the C host ran ($m)" $? 0
     "$s2" run -I "$root/lib" -I "$SOLID/src" "$SOLID/demo/render-main.fib" -- "$m" > "$d/ref$i.out" 2> "$d/ref$i.err"; ck "model $i: fibc run of render-main.fib" $? 0
     ck "model $i: fibc run ends with main's result" "$(tail -n 1 "$d/ref$i.out")" 0; head -n -1 "$d/ref$i.out" > "$d/ref$i.json"
-    if cmp -s "$d/host$i.json" "$d/ref$i.json"; then echo "ok    model $i: the JSON is byte-identical ($(wc -c < "$d/ref$i.json") bytes; $(grep '^#' "$d/host$i.err"))"; else echo "FAIL  model $i: the JSON differs"; cmp "$d/host$i.json" "$d/ref$i.json" | head -n 3; fail=1; fi
+    if cmp -s "$d/host$i.json" "$d/ref$i.json"; then echo "ok    model $i: the JSON is byte-identical ($(wc -c < "$d/ref$i.json") bytes; $(grep '^#' "$d/host$i.err"))"; else echo "FAIL  model $i: the JSON differs"; cmp "$d/host$i.json" "$d/ref$i.json" | head -n 3 || true; fail=1; fi
   done
   [ "$(wc -c < "$d/ref2.json")" -gt 200 ]; ck "model 2 is longer than the host's first buffer, so the retry rule ran" $? 0
   has "model 2 needed two calls" "$d/host2.err" "in 2 call(s)"
