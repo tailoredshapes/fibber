@@ -3,8 +3,8 @@
 ;; one of the program's (`live/NotLoaded`) and live (`live/NotLive`: a library of a project is direct calls unless `--live-deps` named
 ;; it; the hint names the flag). Its definitions are diffed by key (serve.replcore `classify`, the keys of a REPL input) against the
 ;; session's copy of the module (the file as the base read it, then the text last loaded): a changed function or `impl` is a family to
-;; swap, a new function (or `impl`) a family at generation 0, a removed function `live/Removed` (its stub stays and the running program
-;; may call it), a changed `def` redefined and a new one made (serve.livedefs, LT4; a type change swaps the def's readers, serve.liveretype), a changed type `live/Layout`, a changed extern
+;; swap, a new function (or `impl`) a family at generation 0, a removed function accepted when the new program checks (LM3, `load-module`: its stub stays,
+;; nothing new can name it; an `impl` removed is `live/Removed`), a changed `def` redefined and a new one made (serve.livedefs, LT4; a type change swaps the def's readers, serve.liveretype), a changed type `live/Layout`, a changed extern
 ;; `live/Extern`; a changed macro is accepted (LM2). What is swapped is decided by expanded form (serve.livediff, LM2): every family
 ;; whose definition's expansion changed, the module's and its users' (a macro of the module), not a definition whose text changed
 ;; only in a comment. Every refusal of the file is listed, at the definition's position in the file, and if any rule refuses nothing is
@@ -31,7 +31,7 @@
 
 ;; What a load came to: the file, its module, how many definitions the file holds and which changed (the families' shown names), and
 ;; the input's answer.
-(defstruct LoadResult (file: str module: str definitions: i64 changed: (Vec str) answer: ls/Answer))
+(defstruct LoadResult (file: str module: str definitions: i64 changed: (Vec str) removed: (Vec str) answer: ls/Answer))
 
 (defun loads-new () -> Loads (Loads (cell {}) (cell []) (cell (set-empty)) (libs-of-env)))
 
@@ -82,7 +82,7 @@
   (ls/Refused (into [(str shown " [" code "]")] (if (= hint "") [] [(str "  hint: " hint)])) [(dg/diag-nowhere code rc/repl-file shown)] code hint))
 
 (defun result :private (file: str ns: str defs: (Vec rc/Def) changed: (Vec str) a: ls/Answer) -> LoadResult
-  (LoadResult file ns (count defs) changed a))
+  (LoadResult file ns (count defs) changed [] a))
 
 ;; The alias of the hint's `require`: the module's last segment.
 (defun alias-of :private (ns: str) -> str
@@ -196,25 +196,38 @@
 ;; The module's new text diffed against the session's copy: the text rules first (every refusal listed, nothing applied), then the
 ;; program with the text as the module's override checked whole, the rules of the live table, the emit of the changed families under
 ;; the next generation, and the swap.
+;; A removed function is accepted here (LM3): the new program must still check, which refuses it where the module, another module or a
+;; session input still names the function; its stub, slot and last body stay resident (a running generation of a caller, a closure made
+;; before may still be inside or hold it) but nothing new can name it, and a later definition of the name is the family's next generation.
+;; A removed `impl` stays `live/Removed`: its methods are in dispatch rows of values that exist.
 (defun load-module :private (ld: Loads sx: ls/Sess file: str ns: str text: str defs: (Vec rc/Def)) -> LoadResult
-  (let ((diff (diff-defs (defs-of (copy-text ld ns)) defs)))
-    (let ((refusals (refusals-of text diff)))
-      (if (not (empty? refusals))
-          (result file ns defs [] (refused-all file refusals))
-          (swap-module ld sx file ns text defs diff)))))
+  (let ((diff0 (diff-defs (defs-of (copy-text ld ns)) defs)))
+    (let ((gone (filterv (fn (d: rc/Def) (= (kind-of d) "fun")) (. diff0 removed)))
+          (diff (Diff (. diff0 changed) (. diff0 added) (filterv (fn (d: rc/Def) (not (= (kind-of d) "fun"))) (. diff0 removed)))))
+      (let ((refusals (refusals-of text diff)))
+        (if (not (empty? refusals))
+            (result file ns defs [] (refused-all file refusals))
+            (swap-module ld sx file ns text defs diff (mapv (fn (d: rc/Def) (shown-name ns (str "f." ns "." (. d name)))) gone)))))))
 
 ;; The session's copy of a module's text ("" before any: a module the base did not read).
 (defun copy-text :private (ld: Loads ns: str) -> str
   (match (get @(. ld copies) ns) ((some c) (. c text)) (nil "")))
 
-(defun swap-module :private (ld: Loads sx: ls/Sess file: str ns: str text: str defs: (Vec rc/Def) diff: Diff) -> LoadResult
+(defun swap-module :private (ld: Loads sx: ls/Sess file: str ns: str text: str defs: (Vec rc/Def) diff: Diff gone: (Vec str)) -> LoadResult
   (let ((olds (ls/accepted-hashes sx)))
     (let ((fr (rc/front-texts (. sx eng) (. sx rts) (rc/source-of @(. (. sx rc) clauses) @(. (. sx rc) defs) "") "yes" true (assoc @(. sx texts) ns text))))
       (match (. fr checked)
         ((Err ds) (result file ns defs [] (match (retype-check ld file text diff ds)
                                             ((some r) (lsw/unchanged sx (def-refused file text r)))
                                             (nil (checker-refused sx ds)))))
-        ((Ok c) (swap-checked ld sx (Pair file ns) text defs diff c fr (lsw/changes-of sx olds fr)))))))
+        ((Ok c) (with-removed gone (swap-checked ld sx (Pair file ns) text defs diff c fr (lsw/changes-of sx olds fr))))))))
+
+;; The load's result with the functions it removed named (only when it was accepted).
+(defun with-removed :private (gone: (Vec str) r: LoadResult) -> LoadResult
+  (match (. r answer)
+    ((ls/Refused _ _ _ _) r)
+    ((ls/Broken _) r)
+    (_ (LoadResult (. r file) (. r module) (. r definitions) (. r changed) gone (. r answer)))))
 
 ;; A program that does not check because a changed `def` of the file changed type under a reader (a diagnostic in another definition,
 ;; of the file or of another module, that names it): `live/Def` naming the reader (serve.liveretype `check-refusal`).

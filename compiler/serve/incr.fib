@@ -29,16 +29,23 @@
    verdicts: (Cell (Map str (Vec dg/Diag)))
    memo: st/Memo
    ;; the loader's parsed files by content (expand.parsed): a request parses only the files whose text changed
-   parsed: pm/Memo))
+   parsed: pm/Memo
+   ;; by file, the keys (`show`n) of the last two requests' modules: the only expander entries, checker states and macros the engine keeps
+   ;; besides the implicit library's (a swap loop once kept every edit's states, ~8 MB each; docs/design/live-incremental.md 8)
+   recent: (Cell (Map str (Vec (Vec str))))))
 
 (def entries-max: i64 4000)
 
 (defun engine-new () -> Engine
-  (Engine (cell (map-empty)) (cell 0) (cell (vec-empty)) (cell nil) (cell nil) (cell (map-empty)) (st/memo-new) (pm/memo-new)))
+  (Engine (cell (map-empty)) (cell 0) (cell (vec-empty)) (cell nil) (cell nil) (cell (map-empty)) (st/memo-new) (pm/memo-new) (cell (map-empty))))
 
 (defun empty-stats () -> Stats (Stats 0 0 0 false 0 0 0 0 0 0))
 
 (defun ms-since (t0: i64) -> i64 (quot (- (sys-clock-now) t0) 1000000))
+
+;; FIB_TIME=1: `time LABEL N ms` on standard error, the milliseconds since t0 (the driver's own timers, driver.front).
+(defun tick (label: str t0: i64) -> unit
+  (when (= (sys-getenv "FIB_TIME") (some "1")) (eprintln (str "time " label " " (ms-since t0) " ms"))))
 
 ;; ---- the prelude and the keys
 
@@ -91,6 +98,12 @@
 
 ;; ---- expansion
 
+;; The hash of a loaded module's own text as a string: the memo's entry for its file, else the key (the text and everything before it).
+(defun text-hash :private (e: Engine l: Loaded key: i64) -> str
+  (match (pm/entry (. e parsed) (. l file))
+    ((some p) (str (. p hash) "/" (str-len (. p text)) "/" (. (. l spec) ns)))
+    (nil (str "k" key))))
+
 ;; How many modules from the first have an entry, and the context and expanded modules they give.
 (defun reusable :private (e: Engine keys: (Vec i64)) -> i64
   (let ((es @(. e entries)))
@@ -119,6 +132,7 @@
         (Ok out)
         (let ((l (nth loaded i)))
           (do (mr/session-note-chain sess (. (. l spec) ns) (show (nth keys i)))
+              (mr/session-note-text sess (. (. l spec) ns) (text-hash e l (nth keys i)))
               (mods/begin-spec ctx (. l spec))
               (match (prog/expand-program (. l forms) ctx runner)
                 ((Err x) (Err [(dg/expand-diag x)]))
@@ -283,11 +297,28 @@
     (set! (. e verdicts) (assoc (if (> (count v) entries-max) (map-empty) v) key ds))))
 
 ;; `load`: the load's milliseconds and how many files it parsed.
+;; Records the keys of this request for its file and forgets what no file's last two requests hold (the previous text stays, so editing back is cached).
+(defun retain-keys :private (e: Engine file: str modkeys: (Vec i64) sess: mr/Session) -> unit
+  (let ((ks (mapv show modkeys))
+        (all (if (> (map-count @(. e recent)) recent-files-max) (map-empty) @(. e recent)))
+        (mine (assoc all file (into [ks] (vec (take 1 (unwrap-or (get all file) []))))))
+        (keep (reduce (fn (acc: (Vec str) v: (Vec (Vec str))) (reduce (fn (a: (Vec str) x: (Vec str)) (into a x)) acc v)) (vec-empty) (vals mine)))
+        (vs @(. e verdicts)))
+    (do (set! (. e recent) mine)
+        (set! (. e entries) (select-keys @(. e entries) keep))
+        (set! (. e verdicts) (select-keys vs (filter (fn (k: str) (some? (first (filter (fn (c: str) (s/starts-with? k (str-concat c "/"))) keep)))) (keys vs))))
+        (ch/chain-retain (. e memo) keep)
+        ())))
+
+(def recent-files-max: i64 64)
+
 (defun front-expand :private (e: Engine j: Job loaded: (Vec Loaded) prelude: (Vec Stx) base-ctx: ExpandCtx keys: (Vec i64) main: bool vkey: str load: (Pair i64 i64) t0: i64) -> Front
   (let ((sess (session-of e prelude loaded))
         (t2 (sys-clock-now))
+        (kept (retain-keys e (. j file) keys sess))
         (ex (expand-program e prelude base-ctx loaded keys sess))
-        (n (count loaded)))
+        (n (count loaded))
+        (shown (do (tick "engine.load" t0) (tick "engine.expand" t2))))
     (match (. ex snd)
       ((Err ds) (do (store-verdict e vkey ds)
                     (Front (Err ds) (Stats n (. ex fst) (- n (. ex fst)) false (. load fst) (ms-since t2) 0 0 (ms-since t0) (. load snd)) vkey [])))
@@ -300,6 +331,7 @@
         (tc (typecheck e modules prelude main (. j file) (. j target) (. lib fst) (. lib snd) keys))
         (r (. tc fst))
         (t4 (sys-clock-now))
+        (shown (tick "engine.check" t3))
         (st (Stats (. st0 modules) (. st0 reused) (. st0 expanded) false (. st0 load-ms) (. st0 expand-ms) (. tc snd) (- (quot (- t4 t3) 1000000) (. tc snd)) (ms-since t0) (. st0 parsed))))
     (do (store-verdict e vkey (match r ((Ok _) (vec-empty)) ((Err ds) ds)))
         (Front r st vkey (match r ((Ok _) modules) ((Err _) []))))))

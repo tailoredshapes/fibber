@@ -23,7 +23,7 @@
   (:require [serve.replcore :as rc] [serve.incr :as inc] [serve.diag :as dg] [serve.livetable :as lt] [expand.roots :as roots] [emit.compile :as ec]
             [emit.program :as ep] [emit.statics :as st] [emit.node :as n] [emit.function :as f] [live.jit :as lj] [live.extract :as ex]
             [types.decls :as td] [emit.names :as en] [own.program :as op] [own.driver :as od] [driver.front :as front] [expand.maker :as mk] [lair.ffi :as ffi]
-            [serve.livesplit :as sp] [serve.livereach :as rr] [serve.livediff :as ldf] [fib.unix :as unix] [fib.string :as s]))
+            [expand.modules :as mods] [expand.types :as et] [pkg.modules :as pmod] [pkg.paths :as pp] [emit.live :as live] [serve.livesplit :as sp] [serve.livereach :as rr] [serve.livediff :as ldf] [fib.unix :as unix] [fib.string :as s]))
 
 (def guard-clauses: (Vec str) ["(:use fib.ex)"])
 
@@ -195,8 +195,33 @@
 ;; session's tables, pruned (a `def` of the library the program does not reach is made when an input first reaches it, `make-slots`),
 ;; every item exported and the type tables widened (live.extract `prepare-base`), with the items above, resident. Nothing of the
 ;; program has run yet.
+;; The live module rule of a project (driver.front `note-live-modules`): with FIB_LIVE_ROOTS set, the modules whose file is under one of its
+;; directories, recorded on the program's globals. The engine does not know the roots; the driver's front end does.
+(defun note-live-roots :private (sx: Sess src: str c: od/Checked) -> od/Checked
+  (do (match (sys-getenv "FIB_LIVE_ROOTS")
+        (nil ())
+        ((some text)
+         (match (mods/try-load-in src (. sx file) (. sx rts))
+           ((Err _) ())
+           ((Ok loaded) (live/set-live-modules (. (. c typed) globals)
+                                               (some (pmod/live-modules (mapv (fn (l: et/Loaded) (Pair (. (. l spec) ns) (. l file))) loaded) (pp/split-on text ":"))))))))
+      c))
+
+;; The checked base program: through the engine, so that the expanded modules and the checker's states it builds are the ones the first input
+;; finds (docs/design/live-incremental.md 10: the driver's front end and the engine's warm-up did the same work twice, 2.0 s and 4.4 s on
+;; fib-solid's worker). The text is the file's, so only the main module differs from the warm-up's (the guard). A program the engine does not
+;; take (an error, or FIB_LIVE_BASE=driver) goes to the driver's front end, which reports it as `fibc run` does.
+(defun checked-base :private (sx: Sess rm: mk/RunnerMaker) -> (Result od/Checked i64)
+  (let ((src (read-file (. sx file))))
+    (match (if (or (nil? src) (= (sys-getenv "FIB_LIVE_BASE") (some "driver")))
+               nil
+               (let ((fr (inc/engine-front (. sx eng) (. sx file) (unwrap-or src "") (. sx rts) "yes" true)))
+                 (match (. fr checked) ((Ok c) (some (note-live-roots sx (unwrap-or src "") c))) ((Err _) nil))))
+      ((some c) (Ok c))
+      (nil (front/check-file (. sx file) (. sx rts) rm true)))))
+
 (defun make-base (sx: Sess rm: mk/RunnerMaker) -> (Result unit i64)
-  (match (front/check-file (. sx file) (. sx rts) rm true)
+  (match (checked-base sx rm)
     ((Err code) (Err code))
     ((Ok c)
      (do (doseq [w @(. (. (. c typed) globals) warnings)] (eprintln w))

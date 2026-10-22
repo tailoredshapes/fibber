@@ -95,9 +95,8 @@
 #                        prefix (`f.route` for `f.routes.route`; LM2: the key of its hash,          not in `swapped`; the next call answers the
 #                        serve.livediff): nothing is swapped, the call answers the old body (LM1,   old value)
 #                        3.2; live-dev.md 6 item 2 of meshql-fib)
-#   removed-ignored      a function removed from the loaded file is accepted: its stub stays and    compiler/tests/live/load.sh (the load that
-#                        names a body the text no longer has (LM1, 3.5: live/Removed)               removes `helper` is not refused; the call of
-#                                                                                                   `helper` after it is refused by the checker)
+#   removed-ignored      a removed function is refused again (live/Removed), as before LM3: the        compiler/tests/live/load.sh (the removal of
+#                        stub stays and nothing new can name it, so the checker is the judge          `helper` nothing names is accepted)
 #   def-slot-plain-store a def's setter `live.d.NAME.set` (emit.livedef `live-def-setter`, what a       compiler/tests/live/defs.sh --tsan-only (the
 #                        redefinition stores with) is a plain store, not a release store (LT4)      readers' acquire load against a plain store is
 #                                                                                                   a NEW ThreadSanitizer report)
@@ -134,6 +133,7 @@
 #                        second of one base name too: the session is refused whole (exit 3)        never prints its socket)
 #   watch-no-debounce    the watch acts on a file whose stamp changed since the last scan, stable or   compiler/tests/live/watch.sh (the slow
 #                        not: a file caught half-written is loaded and refused (LT5)                  write brings a refused load event)
+#   retain-keys-off            serve.incr keeps every text's checker states (nothing forgotten)   compiler/tests/live/leak.sh (the growth of 200 swaps)
 #   retire-dynamic-unfollowed  the pause-point analysis ignores indirect calls (a closure's code, a        compiler/tests/live/retire.sh (the worker
 #                        `dyn` method), as it did before serve.livereach: a body that reaches its   parked in `step` through `hook` returns
 #                        pause point through a function value from the heap is retired under the    into freed code on the resume: the program
@@ -151,7 +151,7 @@
 # A mutant of lib/ alone (sink-ignored, override-ignored) builds nothing: the case's `roots:` header names the copy's lib, and FIBC runs it.
 # exit: 0 when the test failed under the mutant, 1 when it passed (the mutant survived), 2 for a setup error. That the tests pass UNmutated is shown by running them.
 set -uo pipefail
-MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|quote-shared|partial-load|load-reads-disk|prefix-dropped|removed-ignored|def-slot-plain-store|old-def-freed|boxed-in-place|retype-no-readers|unswappable-reader-accepted|closure-renumbered|vtable-copied|init-run-twice|warm-skipped|inspect-runs-input|child-spawned-anyway|diff-by-text|hash-with-positions|watch-no-load|watch-reruns-on-refusal|rules-at-file-start|type-reads-disk|unheld-held|watch-no-debounce|retire-dynamic-unfollowed|parse-memo-off|parse-memo-by-name|parse-memo-by-length}
+MODE=${1:?usage: mutant-live.sh stub-no-tailcall|stub-plain-load|deps-stubbed-by-default|project-paths-not-stubbed|sink-ignored|override-ignored|value-reevaluated|trap-not-caught|patch-before-jit|old-tracker-removed|summary-ignored|signature-ignored|retire-without-pause|patch-plain-store|defcache-stale|defcache-no-items|defcache-verify-blind|resident-by-family|skip-new-specialisation|literal-counter-per-program|specialisation-not-requested|stale-never|rerun-old-registry|test-on-attach-thread|sink-shared-run|quote-shared|partial-load|load-reads-disk|prefix-dropped|removed-ignored|def-slot-plain-store|old-def-freed|boxed-in-place|retype-no-readers|unswappable-reader-accepted|closure-renumbered|vtable-copied|init-run-twice|warm-skipped|inspect-runs-input|child-spawned-anyway|diff-by-text|hash-with-positions|watch-no-load|watch-reruns-on-refusal|rules-at-file-start|type-reads-disk|unheld-held|watch-no-debounce|retire-dynamic-unfollowed|parse-memo-off|parse-memo-by-name|parse-memo-by-length|retain-keys-off}
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-live-$MODE}
 FIBC=${FIBC:-}
@@ -228,7 +228,7 @@ case $MODE in
   retype-no-readers) patch compiler/serve/liveretype.fib '(try-let ((ts (retypes sx c rs gen)) (fams (reader-families sx ts rs))) (Ok (Pair ts fams))))' '(try-let ((ts (retypes sx c rs gen))) (Ok (Pair ts []))))' ;;
   unswappable-reader-accepted) patch compiler/serve/liveretype.fib '(= fam "f.main") (Err "main (its frame never returns: it is not swapped)")' '(= fam "f.main") (Ok fam)' ;;
   init-run-twice) patch compiler/serve/livedefs.fib '                  (_ (ls/run-void (ls/jit-of sx) init-name)))' '                  (_ (ls/run-void (ls/jit-of sx) init-name)) (_ (ls/run-void (ls/jit-of sx) init-name)))' ;;
-  removed-ignored) patch compiler/serve/liveload.fib '    (cond (and (= what "removed") (or (= k "fun") (= k "impl")))' '    (cond (and (= what "never") (or (= k "fun") (= k "impl")))' ;;
+  removed-ignored) patch compiler/serve/liveload.fib '(filterv (fn (d: rc/Def) (not (= (kind-of d) "fun"))) (. diff0 removed))' '(. diff0 removed)' ;;
   warm-skipped) patch compiler/serve/live.fib '                (do (warm-engine l trace)' '                (do ()' ;;
   diff-by-text) patch compiler/serve/liveswap.fib '(changes-of sx olds fr)' '(ldf/Changes (vec (mapcat (fn (d: rc/Def) (if (s/starts-with? (. d key) "val:") [(str "f." (. d name))] (ldf/families-of-key (ls/live-bodies sx) (. d key)))) (filterv (fn (d: rc/Def) (replaced? sx d)) defs)))
                                 (mapv (fn (d: rc/Def) (. d key)) (filterv (fn (d: rc/Def) (and (replaced? sx d) (s/starts-with? (. d key) "impl:"))) defs)) (. (changes-of sx olds fr) hashes))' ;;
@@ -241,6 +241,7 @@ case $MODE in
   type-reads-disk) patch compiler/serve/livesess.fib '(rc/type-of-expr-texts (. sx rc) (. sx eng) (. sx rts) expr @(. sx texts))' '(rc/type-of-expr (. sx rc) (. sx eng) (. sx rts) expr)' ;;
   unheld-held) patch compiler/driver/testlive.fib '(match (unheld-of e rts (. acc fst) f)' '(match (if true nil (unheld-of e rts (. acc fst) f))' ;;
   watch-no-debounce) patch compiler/serve/livewatch.fib '  (match (get prev f) ((some p) (same? p st)) (nil false)))' '  true)' ;;
+  retain-keys-off) patch compiler/serve/incr.fib '(ch/chain-retain (. e memo) keep)' '()' ;;
   retire-dynamic-unfollowed) patch compiler/serve/livereach.fib '((CalIndirect _ ty) (set! (. sn ind) (conj @(. sn ind) (str "ind:" (lty/fn-type-str ty))))))' '((CalIndirect _ ty) ()))' ;;
   inspect-runs-input) patch compiler/serve/live.fib '(if (p/field-bool r "value") (inspect-value l r name) (inspect-lookup l r name))' '(inspect-value l r name)' ;;
   parse-memo-off) patch compiler/expand/parsed.fib '    ((some p) (if (= (. p text) text) (Ok p) (parse-fresh m file text)))' '    ((some p) (parse-fresh m file text))' ;;
@@ -280,6 +281,7 @@ case $MODE in
   old-def-freed|init-run-twice|retype-no-readers|unswappable-reader-accepted) what="the defs test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/defs.sh" "$F" --socket-only "${quick[@]}" > "$OUT/test.log" 2>&1; rc=$? ;;
   partial-load|load-reads-disk|prefix-dropped|removed-ignored|rules-at-file-start|type-reads-disk) what="the load test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/load.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   parse-memo-*) what="the parsed test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/parsed.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
+  retain-keys-off) what="the leak test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/leak.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   retire-dynamic-unfollowed) what="the retire test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/retire.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   deps-stubbed-by-default|project-paths-not-stubbed) what="the project test"; FIB_LIB="$R/lib" "$R/compiler/tests/live/project.sh" "$F" > "$OUT/test.log" 2>&1; rc=$? ;;
   *) what="case 8423"  # the case's `roots:` header names ../../lib: run from a copy of cases/stdlib beside the mutated lib

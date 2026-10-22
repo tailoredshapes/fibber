@@ -68,7 +68,7 @@
 (defun load-fields :private (l: Live x: ll/LoadResult) -> (Pair bool (Vec (Pair str j/JVal)))
   (let ((f (answer-fields l (. x answer))))
     (Pair (. f fst) (into [(Pair "file" (j/json-str (. x file))) (Pair "module" (j/json-str (. x module))) (Pair "definitions" (j/json-int (. x definitions)))
-                           (Pair "changed" (strs (. x changed)))]
+                           (Pair "changed" (strs (. x changed))) (Pair "removed" (strs (. x removed)))]
                           (. f snd)))))
 
 (defun op-load :private (l: Live r: p/Req) -> str
@@ -317,9 +317,13 @@
 
 (defun warm-engine :private (l: Live trace: bool) -> unit
   (when (not trace)
-    (do (wait-ready l)
-        (loop ((n 0)) (when (and (not (program-ended? l)) (< n grace-ms)) (do (unix/sleep-ns 1000000) (recur (+ n 1)))))
-        (when (not (program-ended? l)) (set! (. l warm) (ls/warm (. l sx)))))))
+    (let ((t0 (sys-clock-now)))
+      (do (wait-ready l)
+          (inc/tick "live.wait-ready" t0)
+          (loop ((n 0)) (when (and (not (program-ended? l)) (< n grace-ms)) (do (unix/sleep-ns 1000000) (recur (+ n 1)))))
+          (inc/tick "live.grace" t0)
+          (when (not (program-ended? l)) (set! (. l warm) (ls/warm (. l sx))))
+          (inc/tick "live.warm" t0)))))
 
 ;; The booted session on its socket (in a private directory): the path on standard error, `main` started on its thread, the requests
 ;; answered until it ends; its status. The socket is unlinked at the end.
@@ -348,17 +352,19 @@
   (match (read-file file)
     (nil (do (eprintln (str "fibc: cannot read " file)) 2))
     ((some text)
-     (let ((dir (lsk/live-dir)) (pid (sk/process-id)) (loads (ll/loads-new)))
+     (let ((dir (lsk/live-dir)) (pid (sk/process-id)) (loads (ll/loads-new)) (t00 (sys-clock-now)))
        (let ((path (lsk/socket-path dir pid)) (sx (ls/sess-new rts file opt (lsk/output-path dir pid))) (argv (program-args (into [file] args))))
          (do (native/setenv-set "FIB_LIVE_SOCKET" path)
              (match (ls/load-program sx text)
                ((Err lines) (do (eprintln "rejected:") (say-lines lines) 3))
                ((Ok _)
-                (match (ls/make-base sx rm)
+                (match (do (inc/tick "live.start" t00) (ls/make-base sx rm))
                   ((Err code) code)
                   ((Ok _)
                    (do (when trace (native/setenv-set "FIB_TRACE" "1"))
+                       (inc/tick "live.make-base" t00)
                        (ll/snapshot-base loads sx text)
+                       (inc/tick "live.snapshot-base" t00)
                        (match (ls/boot sx (. argv fst) (. argv snd))
                          ((Err m) (do (eprintln (str "compile failed: " m)) 5))
                          ((Ok _)

@@ -609,3 +609,139 @@ measured: its `dev/live.fib` does not reach quiescence (`pause` times out after 
 
 **Test and mutant.** `compiler/tests/live/retire.sh` (retire.py over retire-app.fib; mk/tools.mk `sh-live-retire`, full gate); the mutant
 `retire-dynamic-unfollowed` of `scripts/mutant-live.sh` (the analysis ignores indirect calls, as before) must make it fail.
+
+## 8. The growth of a long session (2026-10-22)
+
+**The complaint.** A `fibc run --live` session of fib-solid's worker grew about 14 MB per swap (RSS 491 MB after the first mesh, 595 after 10 swaps,
+1001 after 40: `fib-solid/docs/repro/live-swap-rss.py`). Section 1.5 had estimated 210 KB per kept generation. `RAN` below means run in this session.
+
+**Which of the four it was (measured).** (d), the engine's caches, and by design: not a leak (the memory was reachable), not the allocator.
+- A reproducer in fibber alone (`compiler/tests/live/leak.py`: eight library-sized modules, `model` loaded 200 times, the main module after it):
+  RSS 127 MB at start, 246 MB at swap 100, 1039 MB at swap 100 and 1862 MB at swap 200 with the unfixed stage 2: **8.2 MB per swap** (RAN, `F0` = the
+  tree before this change). `FIB_ALLOC_DECAY_MS=0` (the large-block cache off) changed nothing (630 MB at swap 50 either way), so it is not the
+  allocator's cache or glibc holding freed memory; `FIB_CHECK_CACHE=off` (no persistent checker) took the growth to 1 MB per swap (RAN), which named
+  the cause.
+- The cause: `serve.incr` keeps the expander's entry (`Engine.entries`) and the persistent checker's state (`own.chain`, `Memo.chain`) under the
+  module key, which is a hash of the module's text and of every module before it. An edit of `model` gives `model` and every module after it a
+  new key; the entries under the old keys were never looked at again but stayed until `entries-max`/`chain-max` (4000 each) cleared the whole map. A
+  checker state is a copy of the library's tables (types.table copies an array at its first write after the copy), so a state costs megabytes, not the
+  "what the module added" of own.chain's header (that measurement, 56 against 57 MB, was of a transcript of 431 states of a program with 253 small
+  modules; a program that requires fib.json, fib.http and a geometry library has far larger tables). The macro runner (`macros.runner` `Session.mods`)
+  keeps the same way a built JIT module per macro per module key.
+- It is therefore retention by design, and the design is changed: **the engine keeps the keys of the last two requests of each file** (`Engine.recent`,
+  at most 64 files) and forgets every expander entry, checker state, macro build and verdict whose key no recent request holds
+  (`serve.incr/retain-keys`, `own.chain/chain-retain`, `macros.runner/keep-build`, section 10). The previous text stays so that editing back is still a cache
+  hit; the library's state (`Memo.prefix`) is separate and stays. Unchanged modules are not expanded again (they never were: their keys are the same);
+  the modules after the edited one are, because their key depends on it (section 2 of persistent-checker.md): that is the 0.2 s of `expand_ms` per swap.
+
+**Result (RAN, `leak.sh`, 200 swaps).** Before: growth of the last 100 swaps 822.8 MB, `FAIL`. After: 246 MB at swap 100, 255 at swap 200, **9.5 MB**,
+`ok`. fib-solid's repro (the plate): 491, 491, 492, 493, 494, 495 MB every 10 swaps to 40 with this section's change alone (against 595 after 10 and 1001 after 40), and with section 10's too 398 MB after the first mesh and 400 after 100 swaps (RAN).
+
+**What is still growing.** After the fix of section 10 (the macro modules) the test's program grows 1.9 MB in the last 100 swaps (RAN, 205 to 207 MB): a
+swap's generation (its ORC module with the cut's struct declarations, section 1.5) stays resident until a `retire`, which needs the program to reach a
+pause point (section 7); a program that never pauses (the test's, fib-solid's worker) keeps them. Before section 10 the same run grew 9.5 MB: the other
+7.6 MB were the JIT modules of the macro `try`, built again for every swap (below). Retiring on the next swap needs the stack scan of live-repl.md 3.3;
+not built. A macro whose module depends on the edited one (its code can use it) is still built for each swap and its JIT module is never removed
+(the macro runner has no removal); an unmeasured, small and bounded-by-edits cost in programs where that happens.
+`Engine.verdicts` is pruned with the rest. The bound of the test (40 MB in the last 100 swaps) is twenty times the measured growth and a twentieth of the
+unfixed one.
+
+## 9. A removed function in a `load` (LM3, 2026-10-22)
+
+**Before.** `load` of a module that had lost a `defun` (or a macro-made definition whose head starts with `def`, as fib-solid's `defparam`: the text
+rules classify it as a function) was `live/Removed` whatever the rest of the program said; fib-solid's helper answered it by starting a new session (10 s).
+
+**Now.** A removed function (and a macro-made `def`) is accepted when the program with the new text checks (`serve.liveload/load-module`). The
+checker is the judge of "something still names it": a caller in the module, in another module, or in a session input (`(defun uses-helper ..)` typed
+at the REPL is part of the program the engine checks) makes the program fail to check, and the load is refused with the checker's diagnostic
+(`type/...`), nothing applied. When it checks, no text names the function any more, and the callers that did are in the same load (their expanded
+form changed, so they are swapped with it). What stays: the function's stub, its slot and its last generation, because a running generation of a
+caller, a closure made before, or a thread parked inside it may still reach it; they are retired with the others at a `retire`. What goes: the name.
+Expression inputs and later loads see the file's text, so `(r/helper 1)` is unbound after the load; the answer lists `removed`; the session's copy of
+the module is the new text. Putting the function back is an ordinary load: its family is still in the live table, so the same signature swaps it as a
+new generation, and a different signature is `live/Signature` (callers compiled against the old one may still be running).
+Still refused: a removed `impl` (its methods are in the dispatch rows of values that exist), a removed type (`live/Layout`), a removed function of
+the **main** module's file (the session's own text keeps the definition: a `load` of the main file only evals what changed).
+**Test.** `compiler/tests/live/load.sh` (load.py): the removal refused where the module calls it, where a session input calls it; accepted once the
+session's caller is replaced; the call unbound afterwards and the app alive; put back; a removed `def` and a macro-made `def`, each refused while a
+session input reads it; a caller changed and its callee removed in one load. Run against the stage 2 before the change: the three removal
+checks and the three checks after them `FAIL` (`helper was removed ... [live/Removed]`).
+
+## 10. Start-up, and a swap that expands again what did not change (2026-10-22)
+
+**Where the 7.3 s went (RAN, `FIB_TIME=1`, fib-solid's `native/live/worker.fib` with the plate, lilnas at a load of 2 to 6, the same command before and after:
+`FIBC=.. FIB_LIB=.. python3 startup.py`, a copy of `fib-solid/docs/repro/live-swap-rss.py` that stamps the events; seconds from the start of `fibc run --live`).**
+The numbers in fib-solid's notes (attach 1.4, set-up 4-5, render 0.7, swap 1.2-3) were not the same partition; this one is by the session's phases:
+
+| phase | s | what |
+|---|---|---|
+| base: `make-base` | 2.0 | the driver's front end on the file: expand 0.93 (macro builds 0.59 of it: `defparam` 0.1, `difference` 0.49), lower/infer/own 1.0; emit and JIT of the base 0.05 (the JIT compiles a function at its first call) |
+| `wait-ready` and `grace` | 0.1 | `warm-engine` waits for the program's `def`s and 100 ms (a program that ends at once is not warmed) |
+| warm-up: the engine's front end on the same program | **4.4** | `engine.load` 0.05, `engine.expand` 1.56 (macro builds 1.1: `defparam` 0.15, `difference` 0.76, `try` 0.19), `engine.check` 2.68 (the library's state 1.05, the chain over 69 modules 1.6) |
+| the first input, `(mesh "{}")` | 0.85 | the input's front end, and the first call of the render path: the JIT compiles what it reaches |
+| the first swap | 0.46 | `expand_ms` 0.22 (of which the macro `try` 0.19), `check_ms` 0.21 |
+| total, start to the first mesh | 7.3-7.9 | |
+
+**The biggest item was the duplicate.** The base was made by the driver's front end (`front/check-file`), which keeps nothing in the engine, and then the
+engine's warm-up expanded, typed and decided the same 69 modules again so that the first input would not pay for it (LE5): 2.0 s and 4.4 s of the same work,
+and the engine's pass is the slower (macros are built in two JIT sessions; the chain decides every unit whole and an all-owned twin of every function).
+
+**The change.** `serve.livesess/checked-base` makes the base from the engine's own front end on the file's text (`inc/engine-front`, the real file name for
+positions, FIB_LIVE_ROOTS applied as the driver does: `note-live-roots`); a program the engine does not take (an error, a missing file) goes to the driver's
+front end as before, which reports it as `fibc run` does, and `FIB_LIVE_BASE=driver` takes that path always. The warm-up then finds every module but the
+main one (the guard's functions are added to the text of the session, not of the base) expanded and decided, and costs 0.5 s instead of 4.4.
+
+| (RAN, three alternating runs each) | before | after |
+|---|---|---|
+| start to the first mesh answered | 7.74, 7.77, 7.87 s | 4.13, 4.23, 4.45 s |
+| the first swap (`source`), end to end | 0.48-0.52 s | 0.27 s |
+| `live at` printed (the socket exists, the base resident) | 2.13-2.25 s | 2.8-3.1 s |
+
+The socket exists later (the base now includes the work the warm-up did), but the first answer comes 3.3 s sooner; a client that connects at once waits in the
+listener's queue as before.
+
+**What loads precompiled today: the runtime only** (`compiler/emit/runtime.fib`, generated from `rt/*.lir`, parsed once per program). The library (`lib/`,
+fib-solid's `src/`) is read, expanded, typed and decided at every start; nothing of the engine's state (the expanded modules, the macros' JIT modules, the
+checker's tables) can be written down, since they are in-memory persistent structures with no serialiser. `FIB_LIRO_CACHE` is `fibc build`'s object cache for
+the compiler's own units (mk/stage2.mk) and is not consulted by a live session. **What is missing for a precompiled library:** (1) a serialiser for the
+expander's context after a module, for a module's expanded forms and for the checker's state after it (own.chain `Prefix`, types.table), keyed by the module
+key that already exists; (2) the macro modules' lIR or object code under the same key (0.6 s of the base's expansion and the same again in the engine, `difference`
+alone 0.5-0.75 s) loaded instead of checked, emitted and compiled; (3) object code for the library's functions so that the first call of the render path
+(about 1.2 s of the 0.85 + the rest of the first mesh: the second `mesh` takes 0.04 s) finds them compiled; (4) the same objects for `fibc build --shared`.
+Each is a design of its own; the work above removes only the duplicate. What remains of the 4.2 s: the engine's expansion 0.93 (macros 0.6) and check 1.76, the
+first mesh 1.2.
+
+**A swap expanded the macros of every module after the edited one.** A macro's module was kept under the macro and the *chain key of its module* (the text of
+every module before it in the load order), so an edit of `model` rebuilt, by check, emit and JIT, the macros of every module that comes after it in the load
+order (`try`, in `fib.ex`, which does not use `model`): 187 ms of the swap's 230 ms of `expand_ms`, and a JIT module that is never removed, 7.6 MB in 200 swaps.
+`macros.runner/session-key` now keys a macro by the text of the modules its code can use: the closure of its module's requires, uses, exports and implicit modules
+(`dep-closure`, the same set `helper-program` gives the macro's module), each by the hash of its own text (`session-note-text`, noted by the engine as it
+expands a module). When a module of the closure has no text noted the key is the old one. Two builds of a macro are kept (`keep-build`: the current text and the one
+before). Swap, `expand_ms` 220 to 36 ms and `total_ms` 440 to 225 ms on the worker. The test `compiler/tests/live/leak.sh` has a module `mac` after `model` that
+does not use it and defines a macro: built once in 200 swaps (201 times before, 163-200 ms each).
+
+**Tests.** The live suites on the final stage 2 (RAN): see the commit message. A project's live-module rule was the one regression found (`project.sh`:
+the engine's program had no FIB_LIVE_ROOTS rule, so a library's module was live); fixed by `note-live-roots`.
+
+## 11. A stack overflow in a live session (2026-10-22): not made catchable
+
+Run (stage 2 of this tree, `(down 100000000 0)` evaluated over the attach socket of a live program, a recursion that adds one per frame):
+`trap: stack overflow` on standard error, the connection closes without an answer and the process is gone (status 134). A depth of 100,000 answers.
+This is the rule of docs/design/stack.md 3 and ADR 0009: an overflow is a SIGSEGV on the guard page, the handler runs on a signal stack of its own and ends in
+`abort`; it is fatal in a `try` too. fib-solid's helper recovers by starting a new session (about 10 s, 0.7 s with a standby).
+
+Why it is not made a caught failure in this slice, and what is needed:
+- **From the signal handler** (continue at a recovery point on the faulting thread): the frames below the fault are abandoned, not unwound. The fault can be in
+  any code: in `malloc` (the glibc arena of the thread stays locked and the next thread that gets the arena deadlocks), in the runtime's spinlocks (`fib.lock`,
+  the atoms), in the middle of `fib.drop`/`fib.retain` or a free-list push (a reference count or a list head half-written, and the next allocation takes a
+  block twice: the very crash of host-threads.md). A recursion that allocates in every frame reaches the guard inside an allocation a good part of the time.
+  The handler can know only that the fault address is the guard, not what the thread was doing. Not safe, so not built.
+- **As a trap that unwinds** (the catching convention, ADR 0009 mechanism b, which `--live` programs already use): the function must test the stack before it
+  uses it. A prologue check in catching programs, `sp` against a limit, branching to the existing failure return with the message `stack overflow`, would make the
+  overflow an ordinary caught trap with the audit exact. It needs (1) a per-thread limit readable without a call (a thread-local global in lIR, or the limit kept in
+  a register-like slot of the thread's runtime state; `pthread_getspecific` per call is too slow), (2) the emitter to put the check in every function of a catching
+  program that is not a leaf with a bounded frame, with the headroom the callee and the runtime need (the runtime's own functions use the stack too: the check must
+  leave room for a `memcpy`, a `printf`, the unwinder), (3) a reversal of the rule "it cannot be caught" in docs/design/stack.md and ADR 0009, which the owner
+  ruled; (4) a measurement of the cost (one load, compare and branch per call), which is paid by every `--live` program and could be left to a flag. The
+  attach thread and the program's thread differ in stack size (both 256 MiB today); each thread's limit is its guard header (rt/thread.lir `fib.guard-enter`).
+- **Not asked for here and not done:** a stack scan or a second process for the evaluation; both are larger.
