@@ -7,8 +7,8 @@
   (:use types.ty types.ast types.decls types.program types.table types.init own.program syntax.form emit.value emit.text emit.layout
         emit.ir emit.mono emit.statics emit.objects emit.program emit.resume emit.lower.cx emit.lower.ops emit.lower.ctrl
         emit.lower.values emit.lower.call emit.lower.arith emit.lower.objects emit.lower.cells emit.lower.dynamic
-        emit.lower.pattern emit.lower.quote emit.lower.threads emit.lower.simd emit.lower.hoist)
-  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt] [emit.live :as live]))
+        emit.lower.pattern emit.lower.quote emit.lower.threads emit.lower.simd emit.lower.hoist emit.lower.recur)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt] [emit.live :as live] [expand.targetos :as tos]))
 
 ;; The functions the modules below call upward, as the Rust methods they stand for (the hub of emit.lower.cx).
 (defun hub-default () -> Hub
@@ -41,10 +41,50 @@
 (defun ret-term :private (cx: LowerCx v: V) -> unit
   (fb-term (. cx b) (match v ((VUnit) (nx/ret nil)) ((VVal s _) (nx/ret (some s))))))
 
+;; ---- the stack check (docs/design/stack-check.md)
+
+;; Whether the body of the instance can be part of a recursion (emit.lower.recur): a `defun` on a cycle of direct calls or with a call to an unnamed target; a method
+;; with any call to code of the program. A function that cannot is a bounded leaf as far as the stack goes: any recursion through it goes through a checked function (stack-check.md 5).
+(defun inst-may-recurse? :private (cx: LowerCx body: Expr) -> bool
+  (match (. (. cx inst) key)
+    ((BodyFun f) (fun-may-recurse? (. cx p) f))
+    ((BodyAllOwned f) (fun-may-recurse? (. cx p) f))
+    (_ (method-may-recurse? body))))
+
+;; Whether the function tests its stack on entry: the program passes failures on, the target has the table (not WASI), the function is called through
+;; the convention (`unwind`), can pass a failure on (a function with `array-take!`, like `conj`, cannot: it is not checked, its callers are, and the margin covers its frame),
+;; and can be part of a recursion.
+(defun stack-check? :private (cx: LowerCx recurses: bool) -> bool
+  (and @(. (. cx b) unwind) (not @(. cx fatal)) (stack-check-wanted?) (not (= (tos/target-platform-name) "Wasi"))
+       recurses))
+
+;; The check, on entry: `sp` against the word the table `fib.stk` holds for its 2 MiB block (a page number and a page count, one 64-bit word, so a racing
+;; thread never reads half of one); outside the range the word describes, `fib.stack-slow` finds the thread's limit and either registers the block or
+;; says the stack is nearly out, which is the trap `stack overflow` of the plan's entry key (own.walk.state `w-put-entry-unwind`): the owned parameters
+;; are released and the failure returned. The fast path is about nine instructions and no call.
+(defun emit-stack-check :private (cx: LowerCx key: i64) -> unit
+  (let ((b (. cx b)) (low (fb-label b "stack-low")) (over (fb-label b "stack-over")) (ok (fb-label b "stack-ok")))
+    (let ((sp (fb-val b (nx/intrinsic "stack-addr" 0 nil [] nil) LirI64)))
+      (let ((word (fb-val b (nx/atomic-load-relaxed lt/ty-i64
+                              (nx/gep lt/ty-i64 (nx/global "fib.stk") [(nx/binary la/BAnd (nx/binary la/BLShr (v-expr sp) (nx/integer lt/ty-i64 21)) (nx/integer lt/ty-i64 4095))]))
+                          LirI64)))
+        (let ((d (fb-val b (nx/binary la/BSub (nx/binary la/BLShr (v-expr sp) (nx/integer lt/ty-i64 12)) (nx/binary la/BLShr (v-expr word) (nx/integer lt/ty-i64 10))) LirI64))
+              (n (fb-val b (nx/binary la/BAnd (v-expr word) (nx/integer lt/ty-i64 1023)) LirI64)))
+          (do (fb-term b (nx/conditional (nx/compare-int la/IUge (v-expr d) (v-expr n)) low ok))
+              (fb-open b low)
+              (fb-term b (nx/conditional (nx/call "fib.stack-slow" [(v-expr sp)]) over ok))
+              (fb-open b over)
+              (set! (. cx unwind-ops) (get (. (. cx own) guard-fail) key))
+              (lcx-trap-c cx "stack overflow")
+              (set! (. cx unwind-ops) nil)
+              (fb-open b ok)))))))
+
 ;; Lowers the body, returns its value, and records the function. Rust: lower/mod.rs:276 Cx::finish_with
-(defun finish-with :private (cx: LowerCx body: Expr) -> (Result unit str)
+;; `key` is where the plan keeps what an entry that fails releases (`unwind-entry-key`): the body's expression id, or the `fn` literal's.
+(defun finish-with :private (cx: LowerCx body: Expr key: i64 recurses: bool) -> (Result unit str)
   (try-let ((rt (lcx-ty cx body)) (l (program-lir (. cx p) rt)))
     (do (set! (. (. cx b) ret) l)
+        (when (stack-check? cx recurses) (emit-stack-check cx (unwind-entry-key key)))
         (try-let ((flow (lcx-expr cx body)))
           (do (match flow ((FlowVal v) (ret-term cx v)) ((FlowJump) ()))
               (program-add-function (. cx p) (fb-function (. cx b)))
@@ -93,7 +133,7 @@
                  (match (. inst key) ((BodyDef _) (lcx-set-unwind cx false)) (_ ()))
                  (set! (. cx fatal) (and @(. (. cx b) unwind) (takes-slots? p (body-expr g (. inst key)))))
                  (when env (set! (. cx env) (some (VVal (nx/local "env") LirPtr))))
-                 (try-let ((_ (finish-with cx (body-expr g (. inst key)))))
+                 (try-let ((_ (finish-with cx (body-expr g (. inst key)) (. (body-expr g (. inst key)) id) (inst-may-recurse? cx (body-expr g (. inst key))))))
                    (if (= code name) (Ok ()) (live/add-stub p inst name code)))))))))))
 
 ;; The captures of a closure body, loaded from `env` in capture order into their bindings. Rust: lower/mod.rs:462 load_captures
@@ -134,7 +174,7 @@
           (when-some (n (. f name)) (set! (. cx locals) (assoc @(. cx locals) n (LocalVal env))))
           (bind-params cx ps)
           (try-let ((loaded (load-captures cx e)))
-            (finish-with cx (. f body)))))))
+            (finish-with cx (. f body) (. e id) (closure-may-recurse? (. f body))))))))
 
 ;; Loads the captures of a task from its object into their bindings; the point of the frame is the field after them.
 (defun load-task-captures :private (cx: LowerCx oc: ClosureOwn caps: (Vec LirTy) sname: str) -> unit

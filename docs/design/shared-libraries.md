@@ -8,6 +8,7 @@ Status: stage N1 of the native-embedding plan (`docs/design/fibber-native-embedd
 N1 makes the library and its C interface first class. It does not make a call into the library safe. That is stage N2, and nothing here
 changes the runtime's trap or threading behaviour. Until N2 lands:
 
+- **(Changed 2026-10-22: docs/design/stack-check.md 6. A library catches in each export and reports `fib_status` / `fib_error`; a stack overflow is one of those failures. The three points below are what they were before.)**
 - **A trap in fibber code aborts the host.** A trap (the study's case is `nth` out of range) calls `abort()`: the host
   process dies (exit 134 under the study's `traps-host.c`). There is no error code to return and nothing for the host to catch.
 - **Host threads (fixed after this document was first written).** The study (`fibber-native-embedding.md` 1.2) called one export from two threads at once

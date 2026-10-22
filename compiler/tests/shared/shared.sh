@@ -93,8 +93,8 @@ kernels() {
   has "header: names the renamed fibber function" "$d/kernels.h" '/* fibber: sum-squares */'
   cc -std=c11 -Wall -Wextra -Werror -pedantic -fsyntax-only -x c "$d/kernels.h" 2> "$d/cc.err"; ck "header is valid C11 (-Wall -Wextra -Werror -pedantic)" $? 0; [ -s "$d/cc.err" ] && head -c 400 "$d/cc.err"
   if command -v c++ > /dev/null; then c++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only -x c++ "$d/kernels.h" 2> "$d/cxx.err"; ck "header is valid C++17" $? 0; fi
-  # the library: exactly the declared symbols, position independent, light on dependencies
-  local want_syms="add banner both count_bytes dot echo empty_str greet half32 iota join2 mixed narrow scale sum_squares widths"
+  # the library: exactly the declared symbols (and fib_status, fib_error, which every library has: docs/design/stack-check.md 6), position independent, light on dependencies
+  local want_syms="add banner both count_bytes dot echo empty_str fib_error fib_status greet half32 iota join2 mixed narrow scale sum_squares widths"
   local got_syms; got_syms=$(nm -D --defined-only "$d/libkernels.so" | awk '{print $3}' | sort | tr '\n' ' ' | sed 's/ $//')
   ck "nm -D --defined-only: exactly the exports" "$got_syms" "$want_syms"
   ck "readelf: no text relocation" "$(readelf -d "$d/libkernels.so" | grep -c TEXTREL)" 0

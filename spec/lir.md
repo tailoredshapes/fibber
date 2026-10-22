@@ -649,6 +649,16 @@ more than one core.
 
 Both take no operands (`spin-hint expects 0 operands, found 1`). Cases: `cases/lir/inline`.
 
+### 6.6b The stack address
+
+**Decided** (owner, 2026-10-22; docs/design/stack-check.md, section 3): one nullary form for code that must know where its stack is.
+
+| Form | Type | Meaning |
+|---|---|---|
+| `(stack-addr)` | `i64` | the stack pointer of the executing function, as an integer (`llvm.stacksave` cast to `i64`). It is read after the function's frame is allocated, so the frame is already below the value. It is not a constant (two functions at different depths read different values), it reads no memory the program can name, and it needs no frame pointer |
+
+It takes no operands (`stack-addr expects 0 operands, found 1`). The calling convention word `preservemost` (LLVM `preserve_most`, number 14; `ccc` where the target has none, WebAssembly) goes where `tailcc` goes: the callee saves what it uses and keeps every other register, so a call on a cold path (the stack check's `fib.stack-slow`) makes its caller spill nothing. It is for runtime helpers called from lIR; a host cannot call one. The C backend gives `__builtin_frame_address(0)` and the JS backend `0n` (neither has a use for it). Cases: `cases/lir/inline`.
+
 ### 6.7 Control flow
 
 | Form | Rule |

@@ -75,8 +75,7 @@ under its lock, per-thread state through `pthread_getspecific`); only the single
 
 ## 5. What is still not safe
 
-- A trap in fibber code still calls `abort()` (exit 134) and a deep recursion on a host thread still segfaults on the host's stack; no signal alternate stack
-  or guard is installed for host threads. Separate stage.
+- (Changed 2026-10-22, docs/design/stack-check.md: a library is a catching program, its exports return a status for a trap and for a stack overflow, and a host thread's stack is found by the check. What stays unsafe is stack-check.md 8.) Before that: a trap in fibber code called `abort()` (exit 134) and a deep recursion on a host thread segfaulted on the host's stack.
 - `mallopt(M_MMAP_THRESHOLD)` is still called on the host's process at first call.
 - A fibber value must not be handed from one host thread to another except through the library's own shared types; the C boundary passes scalars and
   raw pointers, and the host owns what a raw pointer names.

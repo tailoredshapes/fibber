@@ -14,7 +14,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_ALLOW_PLAIN_TAIL_CALLS` | [compiler/driver/viac.fib:46](../../compiler/driver/viac.fib#L46) |
 | `FIB_ALLOW_UNSUPPORTED` | [compiler/driver/commands.fib:67](../../compiler/driver/commands.fib#L67) |
 | `FIB_AST_VERIFY` | [compiler/emit/defs/astmod.fib:10](../../compiler/emit/defs/astmod.fib#L10) |
-| `FIB_CATCH` | [compiler/emit/program.fib:50](../../compiler/emit/program.fib#L50) |
+| `FIB_CATCH` | [compiler/emit/program.fib:52](../../compiler/emit/program.fib#L52) |
 | `FIB_CC` | [compiler/driver/viac.fib:24](../../compiler/driver/viac.fib#L24) |
 | `FIB_CC_KEEP` | [compiler/driver/viac.fib:123](../../compiler/driver/viac.fib#L123) |
 | `FIB_CC_VERBOSE` | [compiler/driver/viac.fib:99](../../compiler/driver/viac.fib#L99) |
@@ -45,10 +45,10 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LIVE_BASE` | [compiler/serve/livesess.fib:216](../../compiler/serve/livesess.fib#L216) |
 | `FIB_LIVE_DEBUG` | [compiler/serve/livesess.fib:377](../../compiler/serve/livesess.fib#L377) |
 | `FIB_LIVE_DEPS` | [compiler/fibc.fib:75](../../compiler/fibc.fib#L75) |
-| `FIB_LIVE_EMIT` | [compiler/emit/program.fib:85](../../compiler/emit/program.fib#L85) |
+| `FIB_LIVE_EMIT` | [compiler/emit/program.fib:98](../../compiler/emit/program.fib#L98) |
 | `FIB_LIVE_LIBS` | [compiler/fibc.fib:127](../../compiler/fibc.fib#L127) |
 | `FIB_LIVE_OWN_UID` | [compiler/serve/livesock.fib:81](../../compiler/serve/livesock.fib#L81) |
-| `FIB_LIVE_QUEUE` | [compiler/emit/program.fib:238](../../compiler/emit/program.fib#L238) |
+| `FIB_LIVE_QUEUE` | [compiler/emit/program.fib:251](../../compiler/emit/program.fib#L251) |
 | `FIB_LIVE_ROOTS` | [compiler/driver/front.fib:68](../../compiler/driver/front.fib#L68) |
 | `FIB_LIVE_SOCKET` | [compiler/serve/live.fib:357](../../compiler/serve/live.fib#L357) |
 | `FIB_LIVE_WITH` | [compiler/fibc.fib:77](../../compiler/fibc.fib#L77) |
@@ -72,6 +72,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_SPIN` | [rt/sched.lir:142](../../rt/sched.lir#L142) |
 | `FIB_SPINNERS` | [rt/sched.lir:163](../../rt/sched.lir#L163) |
 | `FIB_SPIN_HINT` | [rt/sched.lir:157](../../rt/sched.lir#L157) |
+| `FIB_STACK_CHECK` | [compiler/emit/program.fib:70](../../compiler/emit/program.fib#L70) |
 | `FIB_STACK_MB` | [rt/thread.lir:264](../../rt/thread.lir#L264) |
 | `FIB_STATIC` | [compiler/driver/static.fib:15](../../compiler/driver/static.fib#L15) |
 | `FIB_STATIC_CASES` | [compiler/driver/staticrun.fib:10](../../compiler/driver/staticrun.fib#L10) |

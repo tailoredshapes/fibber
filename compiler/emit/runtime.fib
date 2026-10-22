@@ -784,6 +784,65 @@
     (store (ptr null) sp)
     (ret (inttoptr ptr (and (ptrtoint i64 ex) (i64 -2))))))
 
+;; ---- What a library's export leaves for its host (docs/design/stack-check.md 6; compiler/emit/export.fib). The export wrapper of a library that passes failures on
+;; runs the function under a catch; a failure is kept in the caught slot of the thread's catch state (the one `catch-leave` filled) until the next export call on
+;; the thread clears it (fib.export-clear), and the host reads it with `fib_status` and `fib_error`, which are these two below.
+
+;; The start of an export call: the failure the previous call left on this thread is released.
+(define internal (fib.export-clear void) ()
+  (block entry
+    (let ((s (call @pthread_getspecific (load i32 @fib.exc-key))))
+      (br (icmp eq s (ptr null)) done look)))
+  (block look
+    (let ((sp (getelementptr %struct.fib.exc s (i32 0) (i32 1)))
+          (ex (load ptr sp)))
+      (br (icmp eq ex (ptr null)) done drop)))
+  (block drop
+    (store (ptr null) sp)
+    (call @fib.release (inttoptr ptr (and (ptrtoint i64 ex) (i64 -2))))
+    (br done))
+  (block done (ret)))
+
+;; 0 when the last export call on this thread returned, 1 when it trapped (a message), 2 when it threw an object.
+(define internal (fib.export-status i32) ()
+  (block entry
+    (let ((s (call @pthread_getspecific (load i32 @fib.exc-key))))
+      (br (icmp eq s (ptr null)) none look)))
+  (block none (ret (i32 0)))
+  (block look
+    (let ((ex (load ptr (getelementptr %struct.fib.exc s (i32 0) (i32 1)))))
+      (br (icmp eq ex (ptr null)) none some)))
+  (block some
+    (ret (select (icmp ne (and (ptrtoint i64 ex) (i64 1)) (i64 0)) (i32 1) (i32 2)))))
+
+;; The message of that failure into the host's buffer, as a `str` result is written: at most `cap` bytes (none when `out` is NULL or `cap` is not positive), the
+;; length returned. A thrown object has the message \"exception\"; no failure has the empty one.
+(define internal (fib.export-error i64) ((ptr out) (i64 cap))
+  (block entry
+    (let ((s (call @pthread_getspecific (load i32 @fib.exc-key))))
+      (br (icmp eq s (ptr null)) none look)))
+  (block none (ret (i64 0)))
+  (block look
+    (let ((ex (load ptr (getelementptr %struct.fib.exc s (i32 0) (i32 1))))
+          (tag (and (ptrtoint i64 ex) (i64 1))))
+      (br (icmp eq ex (ptr null)) none have)))
+  (block have
+    (br (icmp ne tag (i64 0)) msg obj))
+  (block msg
+    (let ((m (inttoptr ptr (and (ptrtoint i64 ex) (i64 -2))))
+          (n (load i64 (getelementptr %struct.fib.str m (i32 0) (i32 3))))
+          (c (select (icmp slt cap (i64 0)) (i64 0) cap))
+          (k0 (select (icmp slt n c) n c))
+          (k (select (icmp eq out (ptr null)) (i64 0) k0)))
+      (call @memcpy out (getelementptr %struct.fib.str m (i32 0) (i32 4) (i64 0)) k)
+      (ret n)))
+  (block obj
+    (let ((oc (select (icmp slt cap (i64 0)) (i64 0) cap))
+          (ok0 (select (icmp slt (i64 9) oc) (i64 9) oc))
+          (okk (select (icmp eq out (ptr null)) (i64 0) ok0)))
+      (call @memcpy out (string \"exception\") okk)
+      (ret (i64 9)))))
+
 ;; A trap of the message at bytes: the failure to unwind with when a catch is active (a fresh tagged str), else the trap as before.
 (define internal (fib.raise-bytes ptr) ((ptr bytes) (i64 n))
   (block entry
@@ -2518,6 +2577,139 @@
       (call @fib.guard-leave)
       (call @fib.guard-restore old)
       (ret))))
+;; ---- The stack check (docs/design/stack-check.md). The emitted prologue of a function of a program that passes failures on compares `(stack-addr)` with a word of
+;; `fib.stk` and calls `fib.stack-slow` when the word does not vouch for it. A word is one 64-bit value, `(lo_page << 10) | npages` (4 KiB pages), written only by
+;; fib.stack-slow and only with a range inside the usable stack of the thread that writes it (above its limit, below its top, inside the 2 MiB block the word is for),
+;; so a pass proves the stack pointer is in a stack with the margin left, whichever thread reads the word: two stacks do not overlap. The table has 4096 words, indexed
+;; by the 2 MiB block (`sp >> 21`) modulo 4096; a collision costs the other thread a slow call, never a wrong pass. The thread's record (lowest address, top, limit, known) is
+;; kept under `fib.stk-key` and freed, and its words cleared, when the thread ends (a stack address reused by another thread must not inherit a range).
+;; A thread whose stack the system cannot report has an unknown record: it is never reported as overflowing and registers nothing (the guard page is its backstop).
+(declare pthread_self i64 ())
+(declare pthread_getattr_np i32 (i64 ptr))
+(declare pthread_attr_getstack i32 (ptr ptr ptr))
+(global internal fib.stk-key i32 (i32 0))
+(global internal fib.stk [4096 x i64] (zeroinitializer [4096 x i64]))
+;; The room left under the limit for what runs unchecked after a check: 256 KiB (docs/design/stack-check.md 4). A stack under 1 MiB keeps a quarter of it.
+(global internal fib.stk-margin i64 (i64 262144))
+
+;; 0: the key is not made, 1: a thread is making it, 2: made. The first slow call of any thread makes it (a program that never checks never does), the others wait.
+(global internal fib.stk-ready i32 (i32 0))
+(define internal (fib.stk-init void) ()
+  (block entry (br again))
+  (block again
+    (br (icmp eq (atomic-load acquire i32 @fib.stk-ready) (i32 2)) done try))
+  (block try
+    (let ((r (cmpxchg acquire monotonic @fib.stk-ready (i32 0) (i32 1))))
+      (br (extractvalue r 1) make wait)))
+  (block make
+    (call @pthread_key_create @fib.stk-key @fib.stk-dtor)
+    (atomic-store release (i32 2) @fib.stk-ready)
+    (br done))
+  (block wait
+    (call @sched_yield)
+    (br again))
+  (block done (ret)))
+
+;; stk-query-begin
+;; The lowest address and the top of the calling thread's stack, into out[0] and out[1]; false when the system will not say.
+(define internal (fib.stk-query i1) ((ptr out))
+  (block entry
+    (let ((attr (alloca (align 8) i8 (i32 128)))
+          (addr (alloca ptr))
+          (size (alloca i64))
+          (rc (call @pthread_getattr_np (call @pthread_self) attr)))
+      (br (icmp ne rc (i32 0)) fail got)))
+  (block got
+    (let ((rc2 (call @pthread_attr_getstack attr addr size)))
+      (call @pthread_attr_destroy attr)
+      (br (icmp ne rc2 (i32 0)) fail ok)))
+  (block ok
+    (let ((lo (ptrtoint i64 (load ptr addr))))
+      (store lo out)
+      (store (add lo (load i64 size)) (getelementptr i64 out (i64 1)))
+      (ret (i1 1))))
+  (block fail (ret (i1 0))))
+;; stk-query-end
+
+;; The calling thread's record, made on the first slow call: 4 words, lowest address, top, limit (the lowest stack pointer a check passes), 1 when known.
+;; Null when there is no memory for one.
+(define internal (fib.stk-record ptr) ()
+  (block entry
+    (call @fib.stk-init)
+    (let ((r (call @pthread_getspecific (load i32 @fib.stk-key))))
+      (br (icmp eq r (ptr null)) make have)))
+  (block have (ret r))
+  (block make
+    (let ((n (call @calloc (i64 1) (i64 32))))
+      (br (icmp eq n (ptr null)) none fill)))
+  (block none (ret (ptr null)))
+  (block fill
+    (br (call @fib.stk-query n) good set))
+  (block good
+    (let ((lo (load i64 n))
+          (sz (sub (load i64 (getelementptr i64 n (i64 1))) lo))
+          (m (load i64 @fib.stk-margin))
+          (m2 (select (icmp ult sz (shl m (i64 2))) (lshr sz (i64 2)) m)))
+      (store (add lo m2) (getelementptr i64 n (i64 2)))
+      (store (i64 1) (getelementptr i64 n (i64 3)))
+      (br set)))
+  (block set
+    (call @pthread_setspecific (load i32 @fib.stk-key) n)
+    (ret n)))
+
+;; The prologue's slow path: true when `sp` is below the thread's limit (the trap `stack overflow`), else false, after registering the word of sp's 2 MiB block.
+;; Not on a stack the record knows (above its top, or 4 MiB under its lowest address: the host switched stacks): false, nothing registered.
+(define internal preservemost (fib.stack-slow i1) ((i64 sp))
+  (block entry
+    (let ((r (call @fib.stk-record)))
+      (br (icmp eq r (ptr null)) no have)))
+  (block no (ret (i1 0)))
+  (block have
+    (br (icmp eq (load i64 (getelementptr i64 r (i64 3))) (i64 0)) no known))
+  (block known
+    (let ((lo (load i64 r))
+          (hi (load i64 (getelementptr i64 r (i64 1))))
+          (lim (load i64 (getelementptr i64 r (i64 2)))))
+      (br (icmp uge sp hi) no below)))
+  (block below
+    (br (icmp ult sp lim) over reg))
+  (block over
+    (ret (icmp uge sp (sub lo (i64 4194304)))))
+  (block reg
+    (let ((bs (shl (lshr sp (i64 21)) (i64 21)))
+          (be (add bs (i64 2097152)))
+          (a (select (icmp ugt lim bs) lim bs))
+          (z (select (icmp ult hi be) hi be))
+          (lop (lshr (add a (i64 4095)) (i64 12)))
+          (hip (lshr z (i64 12))))
+      (br (icmp ugt hip lop) put no)))
+  (block put
+    (atomic-store monotonic (or (shl lop (i64 10)) (sub hip lop))
+                  (getelementptr i64 @fib.stk (and (lshr sp (i64 21)) (i64 4095))))
+    (ret (i1 0))))
+
+;; A thread ends: the words of its blocks that still describe its stack are cleared, and the record freed.
+(define internal (fib.stk-dtor void) ((ptr r))
+  (block entry
+    (br (icmp eq (load i64 (getelementptr i64 r (i64 3))) (i64 0)) done clear))
+  (block clear
+    (let ((lo (load i64 r))
+          (hi (load i64 (getelementptr i64 r (i64 1))))
+          (b0 (lshr lo (i64 21))))
+      (br loop)))
+  (block loop
+    (let ((b (phi i64 (clear b0) (next b2)))
+          (slot (getelementptr i64 @fib.stk (and b (i64 4095))))
+          (w (atomic-load monotonic i64 slot))
+          (page (lshr w (i64 10))))
+      (br (and (icmp ne w (i64 0)) (and (icmp uge page (lshr lo (i64 12))) (icmp ult page (lshr hi (i64 12))))) wipe next)))
+  (block wipe
+    (let ((_c (cmpxchg monotonic monotonic slot w (i64 0))))
+      (br next)))
+  (block next
+    (let ((b2 (add b (i64 1))))
+      (br (icmp ule (shl b2 (i64 21)) (sub hi (i64 1))) loop done)))
+  (block done (call @free r) (ret)))
 ;; guard-end
 ")
 

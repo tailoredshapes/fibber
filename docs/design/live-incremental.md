@@ -723,7 +723,7 @@ does not use it and defines a macro: built once in 200 swaps (201 times before, 
 **Tests.** The live suites on the final stage 2 (RAN): see the commit message. A project's live-module rule was the one regression found (`project.sh`:
 the engine's program had no FIB_LIVE_ROOTS rule, so a library's module was live); fixed by `note-live-roots`.
 
-## 11. A stack overflow in a live session (2026-10-22): not made catchable
+## 11. A stack overflow in a live session (2026-10-22): not made catchable from the handler; made catchable by a check (docs/design/stack-check.md, ADR 0027)
 
 Run (stage 2 of this tree, `(down 100000000 0)` evaluated over the attach socket of a live program, a recursion that adds one per frame):
 `trap: stack overflow` on standard error, the connection closes without an answer and the process is gone (status 134). A depth of 100,000 answers.

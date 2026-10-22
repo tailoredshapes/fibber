@@ -41,7 +41,9 @@
    ;; is in it is answered by its name and never queued (`program-request`); empty for a plain emit, so an ordinary build is unchanged.
    resident: (Cell (Set str))
    ;; the bytes of a pointer in the target's memory (4 on wasm32): the layouts of the objects are computed from it. 8 while the JIT runs, which is the host's.
-   pb: (Cell i64) runtime: (Vec la/LItem) runtime-host: (Vec la/LItem) link-notes: (Cell (Vec (Pair str str)))))
+   pb: (Cell i64) runtime: (Vec la/LItem) runtime-host: (Vec la/LItem) link-notes: (Cell (Vec (Pair str str)))
+   ;; whether each `defun` reached so far can be part of a recursion (emit.lower.recur, the stack check): the answer for every function of a walk
+   rec-memo: (Cell (Map i64 bool))))
 
 ;; Whether the program catches (stage 2 of docs/design/exceptions.md, ADR 0009): some body calls `catch-run`. Only then do its functions
 ;; return a failure next to their value (emit.lower.call); a program that never catches has no observer of a failure, so a trap aborts
@@ -55,6 +57,17 @@
                                                   (_ false)))
                                               (vals (. body calls)))))
                          (vals (. owned bodies))))))
+
+;; Whether the program is a native library (`fibc build --export`, docs/design/shared-libraries.md): a host calls it, so it passes failures on and its exports catch
+;; them (docs/design/stack-check.md 6). A wasm32 library keeps what it had: the host there is JavaScript and calls the function itself.
+(defun library-mode? () -> bool
+  (and (match (unix/getenv "FIB_EXPORTS") (nil false) ((some v) (not (= v ""))))
+       (not (= (tos/target-platform-name) "Wasi"))))
+
+;; The stack check (docs/design/stack-check.md): `FIB_STACK_CHECK=0` turns it off; any other value, or none, leaves it to the program (it is on in a program that
+;; passes failures on: one that catches, a live program, a library).
+(defun stack-check-wanted? () -> bool
+  (not (= (unix/getenv "FIB_STACK_CHECK") (some "0"))))
 
 ;; Live mode (docs/design/live-repl.md, package LV0): `fibc run --live`, or FIB_LIVE set to anything but "" or "0". The program is
 ;; compiled as a catching one (ADR 0009: a trap in a later live session is a failure, not an abort) and every body of its own modules
@@ -149,12 +162,12 @@
                     (match tables ((some t) (shared-statics (. t statics))) (nil (statics-new)))
                     (queue-new) (cell []) (cell 0) (cell []) (cell [])
                     (cell (map-empty)) (cell (map-empty)) (cell (map-empty)) (cell []) (cell 0) (cell false)
-                    (cell (map-empty)) (cell []) (cell false) (or (live-mode?) (program-unwinds? typed owned)) (live-mode?)
+                    (cell (map-empty)) (cell []) (cell false) (or (live-mode?) (library-mode?) (program-unwinds? typed owned)) (live-mode?)
                     (match tables ((some t) (. t generations)) (nil (cell (map-empty))))
                     (match tables ((some t) (. t bodies)) (nil (cell (map-empty))))
                     (def-cache-of tables)
                     (match tables ((some t) (. t resident)) (nil (cell (set-empty))))
-                    (cell (os/target-pointer-bytes)) (. rt target) (. rt host) (cell []))))
+                    (cell (os/target-pointer-bytes)) (. rt target) (. rt host) (cell []) (cell (map-empty)))))
     (do (objects-intern (. p objects) "fib.str" "str" ObStr)
         (objects-intern (. p objects) "fib.array.i8" "(Array i8)" (ObArray LirI8))
         (objects-intern (. p objects) "fib.weakbox" "weak box" ObWeak)
@@ -171,7 +184,7 @@
              (cell []) (cell 0) (cell []) (cell [])
              (cell (map-empty)) (cell @(. p def-values)) (cell (map-empty)) (cell []) (cell 0) (cell false)
              (cell @(. p def-slots)) (cell @(. p inits)) (cell false) (. p unwinding) (. p live) (. p live-gens) (. p live-bodies)
-             (. p def-cache) (. p resident) (cell pb) (. p runtime) (. p runtime-host) (cell @(. p link-notes)))))
+             (. p def-cache) (. p resident) (cell pb) (. p runtime) (. p runtime-host) (cell @(. p link-notes)) (cell @(. p rec-memo)))))
 
 ;; The bytes of a pointer of the program's layouts.
 (defun program-pb (p: Program) -> i64 @(. p pb))

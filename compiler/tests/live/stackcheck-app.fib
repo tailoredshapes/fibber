@@ -1,0 +1,24 @@
+(ns main (:use fib.core fib.seq) (:require [fib.unix :as u]))
+;; The program of compiler/tests/live/stackcheck.sh: a live program with two recursions an input can drive past the stack of the attach thread
+;; (docs/design/stack-check.md). `up` adds one per frame; `grow` also allocates a Vec and a str in every frame, so that the frames unwound hold
+;; objects the audit must see released once (the dangerous case of docs/design/live-incremental.md 11).
+(def beat: (Atom i64) (atom 0))
+
+(defun up (n: i64) -> i64 (if (= n 0) 0 (+ 1 (up (- n 1)))))
+
+(defun grow (n: i64) -> i64
+  (if (= n 0)
+      0
+      (let ((v (vec (range 3))) (s (str "n=" (show n))))
+        (+ (+ (count v) (str-len s)) (grow (- n 1))))))
+
+(defun churn (n: i64) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i n)
+        (recur (+ i 1) (+ acc (count (vec (range (+ 1 (mod i 7))))) (str-len (str "n=" (show i)))))
+        acc)))
+
+(defun main () -> i64
+  (do (println "stackcheck-app: started")
+      (loop ((i 0))
+        (do (reset! beat (+ (churn 50) i)) (u/sleep-ns 20000) (recur (+ i 1))))))

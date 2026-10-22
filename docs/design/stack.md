@@ -13,7 +13,7 @@ left-deep chain, which is far below what 8 MiB holds of a small frame, because f
 2. **A fault that is not a stack's is never taken for one.** The handler writes `fatal signal N at 0xADDR`, puts the signal's default action back and
    returns, so the instruction faults again and the process dies of the signal itself (status 139 for SIGSEGV, 135 for SIGBUS, a core where the system
    writes one). A memory bug in `unsafe` code or in a library's `extern` is therefore visible, and distinguishable from a recursion that was too deep.
-3. **It cannot be caught.** Inside a `try` the overflow is on the fatal list (docs/adr/0009): the stack that a handler or an unwinder would run on is
+3. **It cannot be caught from the signal handler.** (REVERSED for emitted code in a catching program on 2026-10-22, with the owner's authority: docs/design/stack-check.md. A function there tests the stack on entry and unwinds with the trap `stack overflow`; what follows describes why the *handler* still cannot recover, and what an unchecked path still does.) Inside a `try` the overflow is on the fatal list (docs/adr/0009): the stack that a handler or an unwinder would run on is
    gone, and a `finally` would run on the same exhausted stack. The handler does not return into the program. What `try` guarantees is unchanged: it
    catches traps; this is not one the program can survive. In a task it is not isolated either (docs/adr/0001): `join` never answers it, the process ends.
 4. **The handler is async-signal-safe.** It calls `write`, `sigaltstack`, `abort` and `sigaction` and nothing else, and uses no allocation: its buffer is on

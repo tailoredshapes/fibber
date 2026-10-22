@@ -54,6 +54,7 @@
           (= c "red-f") (some (set-flags (call-intrinsic fx llvm [(type-of (nth vs 1))] vs) flags))
           (= c "warp") (some (warp-value fx name llvm vs))
           (= c "hint") (do (spin-hint fx) nil)
+          (and (= c "const") (= name "stack-addr")) (some (stack-addr fx))
           (= c "const") (some (core/const-int (lx-ty (. fx lx) ty-i64) (tt/cache-line-of-arch (. (. fx lx) arch)) false))
           :else (memory-value fx name c ty vs align))))
 
@@ -67,6 +68,11 @@
         (let ((float? (= (unsafe (core/LLVMGetTypeKind (type-of (nth vs 0)))) 2i32))
               (clamp (if (= name "shfl-up") 0 31)))
           (call-intrinsic fx (str llvm (if float? ".f32" ".i32")) [] [all (nth vs 0) (nth vs 1) (const-i32 fx clamp)])))))
+
+;; `(stack-addr)`: the stack pointer, an i64: `llvm.stacksave` (taken after the frame of the function is allocated, so the frame is
+;; already subtracted), cast to an integer. It needs no frame pointer (docs/design/stack-check.md 3).
+(defun stack-addr :private (fx: Fx) -> i64
+  (b-cast (. fx b) (opcode-ptrtoint) (call-intrinsic fx "llvm.stacksave" [(ptr-ty fx)] []) (lx-ty (. fx lx) ty-i64)))
 
 ;; `(spin-hint)`: the architecture's pause instruction (`pause`, `yield`), nothing where it has none.
 (defun spin-hint :private (fx: Fx) -> unit

@@ -25,9 +25,9 @@
   (TArray n: i64 elem: LType))        ;; [N x T]; Rust's u64, but the parser refuses N above u32::MAX (parse/ty.rs), so an i64 holds it
 (derive Eq LType)
 
-;; A calling convention (types.rs `Cc`): `CcC` is `ccc`, the default; `CcTail` is `tailcc`; `CcKernel` is `kernelcc`, the entry of a GPU
+;; A calling convention (types.rs `Cc`): `CcPreserve` is `preservemost` (LLVM preserve_most: the callee keeps every register but a few, for a cold call that must not make its caller spill; spec/lir.md 6.6b); `CcC` is `ccc`, the default; `CcTail` is `tailcc`; `CcKernel` is `kernelcc`, the entry of a GPU
 ;; kernel (LLVM's ptx_kernel, 71): only a kernel target lowers it (docs/design/gpu.md), and nothing calls it from lIR.
-(defenum LCc CcC CcTail CcKernel)
+(defenum LCc CcC CcTail CcKernel CcPreserve)
 (derive Eq LCc)
 
 ;; A function's type (types.rs `FnType`): convention, result (nil is `void`), parameters, variadic.
@@ -48,6 +48,7 @@
 (def cc-c: LCc CcC)
 (def cc-tail: LCc CcTail)
 (def cc-kernel: LCc CcKernel)
+(def cc-preserve: LCc CcPreserve)
 
 ;; The scalar type a keyword names (types.rs `scalar_keyword`): `i1 i8 i16 i32 i64 float double ptr`.
 (defun scalar-keyword (s: str) -> (Option LType)
@@ -124,7 +125,7 @@
 
 ;; `ccc` or `tailcc` (types.rs `Display for Cc`).
 (defun cc-str (c: LCc) -> str
-  (match c ((CcC) "ccc") ((CcTail) "tailcc") ((CcKernel) "kernelcc")))
+  (match c ((CcC) "ccc") ((CcTail) "tailcc") ((CcKernel) "kernelcc") ((CcPreserve) "preservemost")))
 
 ;; The parameter list as `(i64 ptr ...)` (types.rs `show_params`).
 (defun fn-params-str (f: LFnType) -> str
@@ -133,5 +134,5 @@
 
 ;; `(fn tailcc void (ptr ...))`: the text of a function type (types.rs `Display for FnType`; `ccc` is not written).
 (defun fn-type-str (f: LFnType) -> str
-  (let ((cc (match (. f cc) ((CcC) "") ((CcTail) "tailcc ") ((CcKernel) "kernelcc "))))
+  (let ((cc (match (. f cc) ((CcC) "") ((CcTail) "tailcc ") ((CcKernel) "kernelcc ") ((CcPreserve) "preservemost "))))
     (str "(fn " cc (ret-str (. f ret)) " " (fn-params-str f) ")")))

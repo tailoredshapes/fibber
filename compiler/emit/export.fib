@@ -59,8 +59,15 @@
                            (unwrap-or r ExUnit))))))
 
 ;; The signatures of the exports `specs` (symbol, source name), or the first that cannot be exported.
+;; The two symbols every library has besides its exports, which a host reads after a call that failed (docs/design/stack-check.md 6): `fib_status`, 0 when the
+;; last call on this thread returned, 1 when it trapped, 2 when it threw; `fib_error`, the message, written as a `str` result is. They are made as signatures so that
+;; the header and the list of visible symbols need no special case. Their `source` is their own symbol: no function of the program stands behind them.
+(defun status-sigs () -> (Vec ExSig)
+  [(ExSig "fib_status" "fib_status" [] (ExScalar "int32_t" SI32)) (ExSig "fib_error" "fib_error" [] ExStr)])
+
 (defun export-sigs (typed: TypedProgram specs: (Vec (Pair str str))) -> (Result (Vec ExSig) str)
-  (try-map (fn (s: (Pair str str)) (sig-of typed (. s fst) (. s snd))) specs))
+  (try-let ((sigs (try-map (fn (s: (Pair str str)) (sig-of typed (. s fst) (. s snd))) specs)))
+    (Ok (if (library-mode?) (into sigs (status-sigs)) sigs))))
 
 (defun str-kind? :private (k: ExKind) -> bool (match k ((ExStr) true) (_ false)))
 
@@ -139,10 +146,59 @@
   (match (. sig ret)
     ((ExUnit) nil) ((ExStr) (some lt/ty-i64)) ((ExScalar _ (SBool)) (some lt/ty-i8)) (_ lowered-ret)))
 
+;; The functions behind `status-sigs`: the runtime's answer for this thread (rt/core.lir fib.export-status, fib.export-error).
+(defun status-wrappers () -> (Vec la/LItem)
+  [(la/ItDefine (f/external (f/make "fib_status" (some lt/ty-i32) [] lt/cc-c
+     [(f/block "entry" [(n/call "fib.export-ready" []) (n/ret (some (n/call "fib.export-status" [])))])])))
+   (la/ItDefine (f/external (f/make "fib_error" (some lt/ty-i64) [(Pair "out" lt/ty-ptr) (Pair "out_cap" lt/ty-i64)] lt/cc-c
+     [(f/block "entry" [(n/call "fib.export-ready" []) (n/ret (some (n/call "fib.export-error" [(n/local "out") (n/local "out_cap")])))])])))])
+
+;; The result type of the function as the source has it: in a program that passes failures on the lowered function returns `{ T ptr }` (`ptr` for none).
+(defun plain-ret :private (ty: lt/LFnType) -> (Option lt/LType)
+  (match (. ty ret)
+    ((some (lt/TAnon fields)) (some (nth fields 0)))
+    (_ nil)))
+
+(defun zero-return :private (sig: ExSig ty: lt/LFnType) -> la/LExpr
+  (match (wrapper-ret sig (plain-ret ty))
+    (nil (n/ret nil))
+    ((some t) (n/ret (some (if (= t lt/ty-ptr) (n/null) (n/zero t)))))))
+
+(defun ok-return :private (sig: ExSig) -> (Vec la/LExpr)
+  (match (. sig ret)
+    ((ExUnit) [(n/ret nil)])
+    ((ExStr) (str-result (n/local "r")))
+    ((ExScalar _ (SBool)) [(n/ret (some (n/cast la/CZExt lt/ty-i8 (n/local "r"))))])
+    (_ [(n/ret (some (n/local "r")))])))
+
+;; The call under a catch: the failure `rr` of the function (next to the value `r`, or alone for a unit result), left in the thread's catch state by `fib.catch-leave`
+;; (`k`: 0 it returned), the str parameters released as before, then to `ok` or `fail`.
+(defun run-under-catch :private (p: Program sig: ExSig name: str fi: i64) -> (Vec la/LExpr)
+  (let ((unit? (match (. sig ret) ((ExUnit) true) (_ false)))
+        (rr (n/local "rr")))
+    [(f/bound [(f/binding "cs" (n/call "fib.catch-enter" []))
+               (f/binding "rr" (n/call name (call-args sig)))
+               (f/binding "r" (if unit? (n/null) (n/extract rr 0)))
+               (f/binding "ex" (if unit? rr (n/extract rr 1)))
+               (f/binding "k" (n/call "fib.catch-leave" [(n/local "cs") (n/local "ex")]))]
+       (into (releases sig p fi)
+             [(n/conditional (n/compare-int la/IEq (n/local "k") (n/integer lt/ty-i64 0)) "ok" "fail")]))]))
+
+;; The wrapper of an export of a library that passes failures on: the previous call's failure released, the function run under a catch, then `ok` (the result as
+;; the C side has it) or `fail` (the zero of the result type; the failure stays for fib_status and fib_error).
+(defun unwinding-wrapper :private (p: Program sig: ExSig name: str func: la/LFunction fi: i64) -> la/LItem
+  (let ((ty (. func ty)) (bs (pre-bindings sig)) (run (run-under-catch p sig name fi)))
+    (la/ItDefine (f/external (f/make (. sig symbol) (wrapper-ret sig (plain-ret ty)) (wrapper-params sig (. ty params)) lt/cc-c
+      [(f/block "entry" (into [(n/call "fib.export-ready" []) (n/call "fib.export-clear" [])]
+                              (if (empty? bs) run [(f/bound bs run)])))
+       (f/block "ok" (ok-return sig))
+       (f/block "fail" [(zero-return sig ty)])])))))
+
 ;; The wrapper `sym` of the lowered function `name` (`func`): ready-check, the str parameters made, the call, the str parameters released, the result.
 (defun export-wrapper (p: Program sig: ExSig name: str func: la/LFunction) -> (Result la/LItem str)
   (let ((ty (. func ty)) (fi (unwrap-or (program-fun (. p typed) (. sig source)) 0)))
-    (cond (not (= (count (. func params)) (count (. sig params))))
+    (cond (. p unwinding) (Ok (unwinding-wrapper p sig name func fi))
+          (not (= (count (. func params)) (count (. sig params))))
             (Err (str "export " (. sig symbol) ": " (. sig source) " takes a hidden argument (the program catches), which a host cannot pass"))
           (and (uses-str? sig) (= (tos/target-platform-name) "Wasi"))
             (Err (str "export " (. sig symbol) ": str parameters and results are for the native targets; on wasm32 pass the bytes and a length"))
