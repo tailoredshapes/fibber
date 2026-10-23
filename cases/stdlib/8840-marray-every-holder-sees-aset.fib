@@ -1,0 +1,30 @@
+;; spec:   stdlib §2.11 (Arrays), §3 N12, §4.1 rows aget aset alength aclone long-array MArray
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: MArray make-marray aget aset alength aclone long-array
+;; The page's program (A12 aset2): `b` and a closure that share `a` write through it, and all three see [9 4 0]. An aclone is a
+;; copy in a new cell, so later writes to either are not seen by the other. The allerbees report: (long-array 3), (aset a 0 7),
+;; (aget a 0) is 7 in a program that requires nothing (fib.coll is implicit).
+(ns main (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (a (long-array 3)))
+    (let ((b a) (w (fn (i: i64 x: i64) (aset a i x))))
+      (do (w 0 9)
+          (aset b 1 4)
+          (check c (= (vec a) [9 4 0]))
+          (check c (= (vec b) [9 4 0]))
+          (check c (= (alength b) 3))
+          (let ((k (aclone a)))
+            (do (aset k 2 1)
+                (aset a 0 5)
+                (check c (= (vec k) [9 4 1]))
+                (check c (= (vec a) [5 4 0]))))
+          (let ((r (long-array 3)))
+            (do (aset r 0 7) (check c (= (aget r 0) 7))))
+          (let ((m (make-marray 2 "x")))
+            (do (aset m 1 "y") (check c (= (vec m) ["x" "y"]))))
+          (checks-result c)))))

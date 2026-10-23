@@ -4,6 +4,7 @@ Generated declaration inventory of [fib.core](../../../lib/fib/core.fib). Source
 
 | Name | Declaration | Defined in |
 |---|---|---|
+| `*command-line-args*` | def | [lib/fib/core/combinators.fib:46](../../../lib/fib/core/combinators.fib#L46) |
 | `==` | defun | [lib/fib/core/alias.fib:27](../../../lib/fib/core/alias.fib#L27) |
 | `Cmp` | defprotocol | [lib/fib/core/protocols.fib:19](../../../lib/fib/core/protocols.fib#L19) |
 | `Debug` | defprotocol | [lib/fib/core/protocols.fib:34](../../../lib/fib/core/protocols.fib#L34) |
@@ -36,8 +37,8 @@ Generated declaration inventory of [fib.core](../../../lib/fib/core.fib). Source
 | `checked-sub` | defun | [lib/fib/core/bits.fib:46](../../../lib/fib/core/bits.fib#L46) |
 | `comp` | defun | [lib/fib/core/opt.fib:53](../../../lib/fib/core/opt.fib#L53) |
 | `compare` | defun | [lib/fib/core/num.fib:42](../../../lib/fib/core/num.fib#L42) |
-| `complement` | defun | [lib/fib/core/combinators.fib:39](../../../lib/fib/core/combinators.fib#L39) |
-| `constantly` | defun | [lib/fib/core/combinators.fib:43](../../../lib/fib/core/combinators.fib#L43) |
+| `complement` | defun | [lib/fib/core/combinators.fib:38](../../../lib/fib/core/combinators.fib#L38) |
+| `constantly` | defun | [lib/fib/core/combinators.fib:42](../../../lib/fib/core/combinators.fib#L42) |
 | `dec` | defun | [lib/fib/core/num.fib:29](../../../lib/fib/core/num.fib#L29) |
 | `defonce` | defmacro | [lib/fib/core/forms.fib:41](../../../lib/fib/core/forms.fib#L41) |
 | `denominator` | defun | [lib/fib/core/num.fib:49](../../../lib/fib/core/num.fib#L49) |
@@ -63,7 +64,7 @@ Generated declaration inventory of [fib.core](../../../lib/fib/core.fib). Source
 | `parse-double` | defun | [lib/fib/core/decimal.fib:75](../../../lib/fib/core/decimal.fib#L75) |
 | `parse-i32` | defun | [lib/fib/core/parse.fib:55](../../../lib/fib/core/parse.fib#L55) |
 | `parse-long` | defun | [lib/fib/core/text.fib:76](../../../lib/fib/core/text.fib#L76) |
-| `partial` | defun | [lib/fib/core/combinators.fib:35](../../../lib/fib/core/combinators.fib#L35) |
+| `partial` | defun | [lib/fib/core/combinators.fib:34](../../../lib/fib/core/combinators.fib#L34) |
 | `partial2` | defmacro | [lib/fib/core/forms.fib:22](../../../lib/fib/core/forms.fib#L22) |
 | `pos-int?` | defun | [lib/fib/core/bits.fib:22](../../../lib/fib/core/bits.fib#L22) |
 | `pos?` | defun | [lib/fib/core/num.fib:38](../../../lib/fib/core/num.fib#L38) |
@@ -90,7 +91,7 @@ Generated declaration inventory of [fib.core](../../../lib/fib/core.fib). Source
 | `unwrap` | defun | [lib/fib/core/opt.fib:22](../../../lib/fib/core/opt.fib#L22) |
 | `unwrap-or-else` | defun | [lib/fib/core/opt.fib:44](../../../lib/fib/core/opt.fib#L44) |
 | `update!` | defun | [lib/fib/core/cells.fib:22](../../../lib/fib/core/cells.fib#L22) |
-| `volatile!` | defun | [lib/fib/core/combinators.fib:27](../../../lib/fib/core/combinators.fib#L27) |
-| `vreset!` | defun | [lib/fib/core/combinators.fib:31](../../../lib/fib/core/combinators.fib#L31) |
+| `volatile!` | defun | [lib/fib/core/combinators.fib:26](../../../lib/fib/core/combinators.fib#L26) |
+| `vreset!` | defun | [lib/fib/core/combinators.fib:30](../../../lib/fib/core/combinators.fib#L30) |
 | `wrapping` | defmacro | [lib/fib/core/forms.fib:51](../../../lib/fib/core/forms.fib#L51) |
 | `zero?` | defun | [lib/fib/core/num.fib:37](../../../lib/fib/core/num.fib#L37) |

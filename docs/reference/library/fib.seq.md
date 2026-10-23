@@ -102,6 +102,7 @@ Generated declaration inventory of [fib.seq](../../../lib/fib/seq.fib). Source l
 | `take-nth` | defun | [lib/fib/seq/tail.fib:39](../../../lib/fib/seq/tail.fib#L39) |
 | `take-while` | defun | [lib/fib/seq/adaptors.fib:112](../../../lib/fib/seq/adaptors.fib#L112) |
 | `tree-seq` | defun | [lib/fib/seq/tail.fib:110](../../../lib/fib/seq/tail.fib#L110) |
+| `vec-from-spans` | defun | [lib/fib/seq/protocols.fib:74](../../../lib/fib/seq/protocols.fib#L74) |
 | `vseq-of` | defun | [lib/fib/seq/vseq.fib:7](../../../lib/fib/seq/vseq.fib#L7) |
 | `zip` | defun | [lib/fib/seq/cursors.fib:323](../../../lib/fib/seq/cursors.fib#L323) |
 | `zipmap` | defun | [lib/fib/seq/cursors.fib:330](../../../lib/fib/seq/cursors.fib#L330) |
