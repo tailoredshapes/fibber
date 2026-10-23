@@ -12,7 +12,7 @@ Generated declaration inventory of [fib.seq](../../../lib/fib/seq.fib). Source l
 | `butlast` | defun | [lib/fib/seq/tail.fib:26](../../../lib/fib/seq/tail.fib#L26) |
 | `concat` | defun | [lib/fib/seq/adaptors.fib:115](../../../lib/fib/seq/adaptors.fib#L115) |
 | `cons` | defun | [lib/fib/seq/adaptors2.fib:144](../../../lib/fib/seq/adaptors2.fib#L144) |
-| `count` | defun | [lib/fib/seq/protocols.fib:29](../../../lib/fib/seq/protocols.fib#L29) |
+| `count` | defun | [lib/fib/seq/protocols.fib:35](../../../lib/fib/seq/protocols.fib#L35) |
 | `cycle` | defun | [lib/fib/seq/streams.fib:100](../../../lib/fib/seq/streams.fib#L100) |
 | `dedupe` | defun | [lib/fib/seq/tail.fib:71](../../../lib/fib/seq/tail.fib#L71) |
 | `distinct` | defun | [lib/fib/seq/adaptors2.fib:127](../../../lib/fib/seq/adaptors2.fib#L127) |
@@ -60,7 +60,7 @@ Generated declaration inventory of [fib.seq](../../../lib/fib/seq.fib). Source l
 | `not-any?` | defun | [lib/fib/seq/consumers.fib:82](../../../lib/fib/seq/consumers.fib#L82) |
 | `not-empty` | defun | [lib/fib/seq/consumers2.fib:58](../../../lib/fib/seq/consumers2.fib#L58) |
 | `not-every?` | defun | [lib/fib/seq/consumers2.fib:72](../../../lib/fib/seq/consumers2.fib#L72) |
-| `nth$3` | defun | [lib/fib/seq/protocols.fib:31](../../../lib/fib/seq/protocols.fib#L31) |
+| `nth$3` | defun | [lib/fib/seq/protocols.fib:37](../../../lib/fib/seq/protocols.fib#L37) |
 | `nthnext` | defun | [lib/fib/seq/tail.fib:50](../../../lib/fib/seq/tail.fib#L50) |
 | `nthrest` | defun | [lib/fib/seq/tail.fib:46](../../../lib/fib/seq/tail.fib#L46) |
 | `partition$2` | defun | [lib/fib/seq/partition.fib:55](../../../lib/fib/seq/partition.fib#L55) |

@@ -4,12 +4,12 @@ Generated declaration inventory of [fib.coll](../../../lib/fib/coll.fib). Source
 
 | Name | Declaration | Defined in |
 |---|---|---|
-| `Emptyable` | defprotocol | [lib/fib/coll/protocols.fib:12](../../../lib/fib/coll/protocols.fib#L12) |
+| `Emptyable` | defprotocol | [lib/fib/coll/protocols.fib:15](../../../lib/fib/coll/protocols.fib#L15) |
 | `assoc-in` | defmacro | [lib/fib/coll/nested.fib:60](../../../lib/fib/coll/nested.fib#L60) |
 | `defrecord` | defmacro | [lib/fib/coll/record.fib:44](../../../lib/fib/coll/record.fib#L44) |
 | `disj` | defun | [lib/fib/coll/map.fib:49](../../../lib/fib/coll/map.fib#L49) |
 | `find` | defun | [lib/fib/coll/maps2.fib:24](../../../lib/fib/coll/maps2.fib#L24) |
-| `get$3` | defun | [lib/fib/coll/protocols.fib:21](../../../lib/fib/coll/protocols.fib#L21) |
+| `get$3` | defun | [lib/fib/coll/protocols.fib:24](../../../lib/fib/coll/protocols.fib#L24) |
 | `includes?` | defun | [lib/fib/coll/seqs.fib:29](../../../lib/fib/coll/seqs.fib#L29) |
 | `into` | defun | [lib/fib/coll/ops.fib:29](../../../lib/fib/coll/ops.fib#L29) |
 | `key` | defun | [lib/fib/coll/map.fib:23](../../../lib/fib/coll/map.fib#L23) |
