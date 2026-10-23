@@ -60,18 +60,30 @@
     (let [a (array N 0.0) t0 (os/clock-now) r (set-fill-f64 a) t1 (os/clock-now)] (row "array-set!/f64" t0 t1 N (fptosi i64 (+ (array-get r 7) (array-get r 1000)))))
     0))
 
-;; ---- (iii) conj building a Vec against array-push! -----------------------------------------------------------------
+;; ---- (iii) conj building a Vec against a growing array -----------------------------------------------------------------
 (defun conj-build-i64 () -> (Vec i64) (loop [i 0 v []] (if (>= i N) v (recur (+ i 1) (conj v i)))))
 (defun conj-build-i8 () -> (Vec i8) (loop [i 0 v []] (if (>= i N) v (recur (+ i 1) (conj v (trunc i8 i))))))
-(defun push-build-i64 () -> (Array i64) (let [c (cell (array 0 0))] (do (dotimes (i N) (array-push! &c i)) @c)))
-(defun push-build-i8 () -> (Array i8) (let [c (cell (array 0 0i8))] (do (dotimes (i N) (array-push! &c (trunc i8 i))) @c)))
+;; The array twins grow a buffer as the in-place push does (ADR 0015: a bench does not call the in-place primitives): room doubled from 32 by
+;; a fresh array and array-blit! when it is full, each element an array-set!; the buffer is returned with its room (N elements are written).
+(defun grow-build-i64 () -> (Array i64)
+  (let [c (cell (array 32 0))]
+    (do (dotimes (i N)
+          (do (when (= i (array-len @c)) (let [b (cell (array (* 2 i) 0))] (do (array-blit! &b 0 @c 0 i) (set! c @b))))
+              (array-set! &c i i)))
+        @c)))
+(defun grow-build-i8 () -> (Array i8)
+  (let [c (cell (array 32 0i8))]
+    (do (dotimes (i N)
+          (do (when (= i (array-len @c)) (let [b (cell (array (* 2 i) 0i8))] (do (array-blit! &b 0 @c 0 i) (set! c @b))))
+              (array-set! &c i (trunc i8 i))))
+        @c)))
 
 (defun bench-conj () -> i64
   (do
     (let [t0 (os/clock-now) r (conj-build-i64) t1 (os/clock-now)] (row "conj/i64" t0 t1 N (+ (count r) (nth r 12345))))
-    (let [t0 (os/clock-now) r (push-build-i64) t1 (os/clock-now)] (row "array-push!/i64" t0 t1 N (+ (array-len r) (array-get r 12345))))
+    (let [t0 (os/clock-now) r (grow-build-i64) t1 (os/clock-now)] (row "array-grow/i64" t0 t1 N (+ N (array-get r 12345))))
     (let [t0 (os/clock-now) r (conj-build-i8) t1 (os/clock-now)] (row "conj/i8" t0 t1 N (+ (count r) (u8 (nth r 12345)))))
-    (let [t0 (os/clock-now) r (push-build-i8) t1 (os/clock-now)] (row "array-push!/i8" t0 t1 N (+ (array-len r) (u8 (array-get r 12345)))))
+    (let [t0 (os/clock-now) r (grow-build-i8) t1 (os/clock-now)] (row "array-grow/i8" t0 t1 N (+ N (u8 (array-get r 12345)))))
     0))
 
 ;; ---- (iv) mapv over a Vec against an array loop ---------------------------------------------------------------------
