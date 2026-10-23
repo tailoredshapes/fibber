@@ -1,0 +1,23 @@
+;; spec:   stdlib §2.1 rule 2 (T gains `first`), P2; docs/design/vec-performance.md (D, unfused small sequences)
+;; expect: accept
+;; result: 22400
+;; audit:  clean
+;; stage:  2
+;; allocs: <= 3000
+;; roots:  ../../lib support
+;; covers: first filter range
+;; `(first (filter p (range n)))` is the pipeline a program writes to ask "is there an element, and which is the first". `first` was a consumer the
+;; expander did not know (T had `find-first` but not `first`), so the chain was a memoised lazy seq of about 41 objects a call here (57 in the bench, measured with
+;; scripts/bench/vec-scalar.fib). With `first` in T the chain is the recipes `Filtered` over `Range`, one `each-while` that stops at the first
+;; element, and no seq is built. 1000 calls: the bound of 3000 refuses the lazy seq (41300 measured) and keeps 3 objects a call (the range, the closure, the recipe). The value is
+;; the sum, over n = i mod 20, of the first d below n with d mod 7 = 3 (100 when none).
+(ns main (:use fib.core fib.seq))
+
+(defun probe (n: i64) -> i64
+  (match (first (filter (fn (d: i64) (= (rem d 7) 3)) (range n)))
+    ((some d) d)
+    (nil 100)))
+
+(defun main () -> i64
+  (loop [i 0 acc 0]
+    (if (>= i 1000) acc (recur (+ i 1) (+ acc (probe (rem i 20)))))))

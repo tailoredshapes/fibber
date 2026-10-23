@@ -1,0 +1,127 @@
+;; bench: persistent Vec of scalars against the array they would compile to, over 4227072 elements (a 2752x1536 sheet), docs/design/vec-performance.md
+;; Each row prints: name, picoseconds per element (or per pipeline), checksum. The checksums of a persistent row and its array twin must be equal
+;; (scripts/bench/vec-scalar.sh compares them: a wrong answer is a failure, not a speedup).
+(ns main (:require [fib.os :as os]))
+
+(def N 4227072) ; sed -i for the allocation counts of docs/design/vec-performance.md: `fibc run --trace` with N=100000, M=10000 and one section
+
+(defun u8 (b: i8) -> i64 (zext i64 b))
+
+(defun row (name: str t0: i64 t1: i64 per: i64 chk: i64) -> i64
+  (do (println name (quot (* 1000 (- t1 t0)) per) chk) 0))
+
+;; ---- (i) nth against array-get --------------------------------------------------------------------------------------
+(defun nth-sum-i8 (v: (Vec i8)) -> i64 (loop [i 0 acc 0] (if (>= i N) acc (recur (+ i 1) (+ acc (u8 (nth v i)))))))
+(defun nth-sum-i64 (v: (Vec i64)) -> i64 (loop [i 0 acc 0] (if (>= i N) acc (recur (+ i 1) (+ acc (nth v i))))))
+(defun nth-sum-f64 (v: (Vec f64)) -> f64 (loop [i 0 acc 0.0] (if (>= i N) acc (recur (+ i 1) (+ acc (nth v i))))))
+(defun get-sum-i8 (a: (Array i8)) -> i64 (loop [i 0 acc 0] (if (>= i N) acc (recur (+ i 1) (+ acc (u8 (array-get a i)))))))
+(defun get-sum-i64 (a: (Array i64)) -> i64 (loop [i 0 acc 0] (if (>= i N) acc (recur (+ i 1) (+ acc (array-get a i))))))
+(defun get-sum-f64 (a: (Array f64)) -> f64 (loop [i 0 acc 0.0] (if (>= i N) acc (recur (+ i 1) (+ acc (array-get a i))))))
+
+(defun bench-nth () -> i64
+  (let [v8 (mapv (fn (i: i64) (trunc i8 (rem i 251))) (range N))
+        v64 (mapv (fn (i: i64) (rem i 1009)) (range N))
+        vf (mapv (fn (i: i64) (sitofp f64 (rem i 1009))) (range N))
+        ca8 (cell (array N 0i8)) ca64 (cell (array N 0)) caf (cell (array N 0.0))]
+    (do
+      (dotimes (i N) (array-set! &ca8 i (trunc i8 (rem i 251))))
+      (dotimes (i N) (array-set! &ca64 i (rem i 1009)))
+      (dotimes (i N) (array-set! &caf i (sitofp f64 (rem i 1009))))
+      (let [t0 (os/clock-now) r (nth-sum-i8 v8) t1 (os/clock-now)] (row "nth/i8" t0 t1 N r))
+      (let [t0 (os/clock-now) r (get-sum-i8 @ca8) t1 (os/clock-now)] (row "array-get/i8" t0 t1 N r))
+      (let [t0 (os/clock-now) r (nth-sum-i64 v64) t1 (os/clock-now)] (row "nth/i64" t0 t1 N r))
+      (let [t0 (os/clock-now) r (get-sum-i64 @ca64) t1 (os/clock-now)] (row "array-get/i64" t0 t1 N r))
+      (let [t0 (os/clock-now) r (nth-sum-f64 vf) t1 (os/clock-now)] (row "nth/f64" t0 t1 N (fptosi i64 r)))
+      (let [t0 (os/clock-now) r (get-sum-f64 @caf) t1 (os/clock-now)] (row "array-get/f64" t0 t1 N (fptosi i64 r)))
+      0)))
+
+;; ---- (ii) assoc on a uniquely held Vec against array-set! ----------------------------------------------------------
+(defun assoc-fill-i64 (v0: (Vec i64)) -> (Vec i64)
+  (loop [i 0 v v0] (if (>= i N) v (recur (+ i 1) (assoc v i (+ i 1))))))
+(defun assoc-fill-i8 (v0: (Vec i8)) -> (Vec i8)
+  (loop [i 0 v v0] (if (>= i N) v (recur (+ i 1) (assoc v i (trunc i8 i))))))
+(defun assoc-fill-f64 (v0: (Vec f64)) -> (Vec f64)
+  (loop [i 0 v v0] (if (>= i N) v (recur (+ i 1) (assoc v i (sitofp f64 i))))))
+(defun set-fill-i64 (a: (Array i64)) -> (Array i64)
+  (let [c (cell a)] (do (dotimes (i N) (array-set! &c i (+ i 1))) @c)))
+(defun set-fill-i8 (a: (Array i8)) -> (Array i8)
+  (let [c (cell a)] (do (dotimes (i N) (array-set! &c i (trunc i8 i))) @c)))
+(defun set-fill-f64 (a: (Array f64)) -> (Array f64)
+  (let [c (cell a)] (do (dotimes (i N) (array-set! &c i (sitofp f64 i))) @c)))
+(defun zeros64 (n: i64) -> (Vec i64) (mapv (fn (_: i64) 0) (range n)))
+
+(defun bench-assoc () -> i64
+  (do
+    (let [v (zeros64 N) t0 (os/clock-now) r (assoc-fill-i64 v) t1 (os/clock-now)] (row "assoc/i64" t0 t1 N (+ (nth r 7) (nth r (- N 1)))))
+    (let [a (array N 0) t0 (os/clock-now) r (set-fill-i64 a) t1 (os/clock-now)] (row "array-set!/i64" t0 t1 N (+ (array-get r 7) (array-get r (- N 1)))))
+    (let [v (mapv (fn (_: i64) 0i8) (range N)) t0 (os/clock-now) r (assoc-fill-i8 v) t1 (os/clock-now)] (row "assoc/i8" t0 t1 N (+ (u8 (nth r 7)) (u8 (nth r 1000)))))
+    (let [a (array N 0i8) t0 (os/clock-now) r (set-fill-i8 a) t1 (os/clock-now)] (row "array-set!/i8" t0 t1 N (+ (u8 (array-get r 7)) (u8 (array-get r 1000)))))
+    (let [v (mapv (fn (_: i64) 0.0) (range N)) t0 (os/clock-now) r (assoc-fill-f64 v) t1 (os/clock-now)] (row "assoc/f64" t0 t1 N (fptosi i64 (+ (nth r 7) (nth r 1000)))))
+    (let [a (array N 0.0) t0 (os/clock-now) r (set-fill-f64 a) t1 (os/clock-now)] (row "array-set!/f64" t0 t1 N (fptosi i64 (+ (array-get r 7) (array-get r 1000)))))
+    0))
+
+;; ---- (iii) conj building a Vec against array-push! -----------------------------------------------------------------
+(defun conj-build-i64 () -> (Vec i64) (loop [i 0 v []] (if (>= i N) v (recur (+ i 1) (conj v i)))))
+(defun conj-build-i8 () -> (Vec i8) (loop [i 0 v []] (if (>= i N) v (recur (+ i 1) (conj v (trunc i8 i))))))
+(defun push-build-i64 () -> (Array i64) (let [c (cell (array 0 0))] (do (dotimes (i N) (array-push! &c i)) @c)))
+(defun push-build-i8 () -> (Array i8) (let [c (cell (array 0 0i8))] (do (dotimes (i N) (array-push! &c (trunc i8 i))) @c)))
+
+(defun bench-conj () -> i64
+  (do
+    (let [t0 (os/clock-now) r (conj-build-i64) t1 (os/clock-now)] (row "conj/i64" t0 t1 N (+ (count r) (nth r 12345))))
+    (let [t0 (os/clock-now) r (push-build-i64) t1 (os/clock-now)] (row "array-push!/i64" t0 t1 N (+ (array-len r) (array-get r 12345))))
+    (let [t0 (os/clock-now) r (conj-build-i8) t1 (os/clock-now)] (row "conj/i8" t0 t1 N (+ (count r) (u8 (nth r 12345)))))
+    (let [t0 (os/clock-now) r (push-build-i8) t1 (os/clock-now)] (row "array-push!/i8" t0 t1 N (+ (array-len r) (u8 (array-get r 12345)))))
+    0))
+
+;; ---- (iv) mapv over a Vec against an array loop ---------------------------------------------------------------------
+(defun map-arr (a: (Array i64)) -> (Array i64)
+  (let [c (cell (array N 0))] (do (dotimes (i N) (array-set! &c i (+ (array-get a i) 1))) @c)))
+
+(defun bench-mapv () -> i64
+  (let [v (mapv (fn (i: i64) (rem i 1009)) (range N))
+        ca (cell (array N 0))]
+    (do
+      (dotimes (i N) (array-set! &ca i (rem i 1009)))
+      (let [t0 (os/clock-now) r (mapv (fn (x: i64) (+ x 1)) v) t1 (os/clock-now)] (row "mapv/i64" t0 t1 N (+ (nth r 7) (nth r (- N 1)))))
+      (let [t0 (os/clock-now) r (map-arr @ca) t1 (os/clock-now)] (row "array-loop/i64" t0 t1 N (+ (array-get r 7) (array-get r (- N 1)))))
+      0)))
+
+;; ---- (v) small fixed pipelines per element ---------------------------------------------------------------------------
+(def M 400000)
+(defun tap (i: i64 k: i64) -> f64 (sitofp f64 (rem (+ i k) 7)))
+
+(defun p-reduce-mapv () -> f64
+  (loop [i 0 acc 0.0] (if (>= i M) acc (recur (+ i 1) (+ acc (reduce + 0.0 (mapv (fn (k: i64) (tap i k)) (range -3 4))))))))
+(defun p-reduce-map () -> f64
+  (loop [i 0 acc 0.0] (if (>= i M) acc (recur (+ i 1) (+ acc (reduce + 0.0 (map (fn (k: i64) (tap i k)) (range -3 4))))))))
+(defun p-reduce-loop () -> f64
+  (loop [i 0 acc 0.0]
+    (if (>= i M) acc
+      (recur (+ i 1) (+ acc (loop [k -3 s 0.0] (if (>= k 4) s (recur (+ k 1) (+ s (tap i k))))))))))
+(defun hit? (i: i64 d: i64) -> bool (= (rem (+ i (* d 3)) 11) 0))
+(defun p-some-filter () -> i64
+  (loop [i 0 acc 0] (if (>= i M) acc (recur (+ i 1) (if (some? (first (filter (fn (d: i64) (hit? i d)) (range 9)))) (+ acc 1) acc)))))
+(defun p-some-loop () -> i64
+  (loop [i 0 acc 0]
+    (if (>= i M) acc
+      (recur (+ i 1) (if (loop [d 0] (cond (>= d 9) false (hit? i d) true :else (recur (+ d 1)))) (+ acc 1) acc)))))
+
+(defun bench-pipe () -> i64
+  (do
+    (let [t0 (os/clock-now) r (p-reduce-mapv) t1 (os/clock-now)] (row "pipe/reduce-mapv-range" t0 t1 M (fptosi i64 r)))
+    (let [t0 (os/clock-now) r (p-reduce-map) t1 (os/clock-now)] (row "pipe/reduce-map-range" t0 t1 M (fptosi i64 r)))
+    (let [t0 (os/clock-now) r (p-reduce-loop) t1 (os/clock-now)] (row "pipe/reduce-hand-loop" t0 t1 M (fptosi i64 r)))
+    (let [t0 (os/clock-now) r (p-some-filter) t1 (os/clock-now)] (row "pipe/some-first-filter-range" t0 t1 M r))
+    (let [t0 (os/clock-now) r (p-some-loop) t1 (os/clock-now)] (row "pipe/some-hand-loop" t0 t1 M r))
+    0))
+
+;; usage: vec-scalar [nth|assoc|conj|mapv|pipe]   (no argument: all sections)
+(defun main () -> i64
+  (let [a (args) w (if (> (count a) 0) (nth a 0) "all")]
+    (do (when (or (= w "all") (= w "nth")) (bench-nth))
+        (when (or (= w "all") (= w "assoc")) (bench-assoc))
+        (when (or (= w "all") (= w "conj")) (bench-conj))
+        (when (or (= w "all") (= w "mapv")) (bench-mapv))
+        (when (or (= w "all") (= w "pipe")) (bench-pipe))
+        0)))

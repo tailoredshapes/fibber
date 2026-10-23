@@ -207,7 +207,7 @@ Rules:
 
    * **The sets are the page's restricted to what exists.** **A** is `map filter remove take drop take-while mapcat concat` (the others join when their
      functions and recipes land: `cons zip interleave cycle`, the three-argument `map` and `for`, tranche 2); **T** is `reduce reduce1 reduce-while reduce-nonempty count
-     empty? last nth into vec set run! every? not-any? find-first find-map group-by frequencies sort sort-by sum` (`sort` with one argument and `sort-by` with two are rows; the clause-picked heads `sort$2` and `sort-by$3` have no row, so
+     empty? last first nth into vec set run! every? not-any? find-first find-map group-by frequencies sort sort-by sum` (`sort` with one argument and `sort-by` with two are rows; the clause-picked heads `sort$2` and `sort-by$3` have no row, so
      a chain under them is read as the seq it is bound to; `str/join` and
      `seq=` are not names of the library yet). `reduce-nonempty`, which the `reduce` macro of §6.3 emits for `(reduce f c)`, is in T and is no row of §4.
    * **Recipe constructors take the source first**, `(Mapped c f)`, `(Taken c n)`, `(Cat a b)`: the `(a* args.. F[c])` of rule R is notation. `nth` is a
