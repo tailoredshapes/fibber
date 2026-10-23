@@ -25,7 +25,13 @@
     (let ((r (cell nil))) (do (each-while self (fn (x) (do (set! r (some x)) true))) @r)))
   (to-vec (self) -> (Vec e) (fib.prelude/vec-collect (fn (k) (each-while self k))))
   ;; the lazy seq of the elements: a lazy source overrides it, so two lazy adaptors stay lazy end to end
-  (to-lseq (self) -> (LSeq e) (lseq-vec (to-vec self))))
+  (to-lseq (self) -> (LSeq e) (lseq-vec (to-vec self)))
+  ;; the spans: a source whose elements are held in arrays says how many (a Vec its leaves and tail, an Array 1);
+  ;; -1, the default, says the source has none. The fused `map` of the expander (compiler/expand/fuseinline.fib)
+  ;; runs a counted loop over each span with the stage functions in line, and the recipe walk when there are none.
+  (span-count (self) -> i64 -1)
+  ;; span j, the array of the elements that follow those of the spans before it; only for 0 <= j < span-count
+  (span-array (self j: i64) -> (Array e) (trap "span-array: the source has no spans")))
 (defun count (c: c) :where ((Reducible c e)) -> i64 (size c))
 ;; (nth c i d): the clause beside the method, because the table of a name is read where its method is defined (L1)
 (defun nth$3 (c: c i: i64 d: e) :where ((Reducible c e)) -> e
@@ -48,7 +54,9 @@
   (size (self) (vec-count self))
   (nth (self i) (vec-nth self i))
   (last (self) (let ((n (vec-count self))) (if (> n 0) (some (vec-nth self (- n 1))) nil)))
-  (to-vec (self) self))
+  (to-vec (self) self)
+  (span-count (self) (fib.prelude/vec-span-count self))
+  (span-array (self j) (fib.prelude/vec-span self j)))
 (impl (Reducible a) (Option a)
   (each-while (self k) (match self (nil true) ((some x) (k x))))
   (size (self) (match self (nil 0) ((some _) 1))))

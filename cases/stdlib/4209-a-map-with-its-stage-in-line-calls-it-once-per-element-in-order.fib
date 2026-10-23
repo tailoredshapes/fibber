@@ -1,0 +1,54 @@
+;; spec:   stdlib §2.1 rule 2 (the rewrite changes nothing a program can see); docs/design/vec-performance.md item 2; compiler/expand/fuseinline.fib
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: mapv vec into map
+;; The loops the expander writes for a fused `map` (case 4208) run the stage functions as the recipe walk runs them: each once
+;; per element, in the source's order, across the leaves of a Vec (70 elements: two leaves and a tail), the inner stage of a chain
+;; before the outer for each element, and for two sources the pairs in order up to the shorter. The first element is taken
+;; before the loop (it makes the output arrays), so its call must not be repeated. Every stage logs what it sees in a cell.
+;; A literal whose body has a `loop` of its own is put in line with it: its `recur` binds to that loop, as in the closure.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun upto (n: i64) -> (Vec i64)
+  (loop ((i 0) (acc [])) (if (< i n) (recur (+ i 1) (conj acc i)) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (v (upto 70))
+        (a (let ((m (cell (array 40 0)))) (do (dotimes (i 40) (array-set! &m i (* 2 i))) @m))))
+    (do (let ((log (cell [])))
+          (let ((r (mapv (fn (x) (do (set! log (conj @log x)) (+ x 1))) v)))
+            (do (check c (= @log v))
+                (check c (= r (upto-from 1 71))))))
+        ;; a chain: inner then outer, element by element
+        (let ((log (cell [])))
+          (let ((r (vec (map (fn (x) (do (set! log (conj @log (+ 1000 x))) x))
+                             (map (fn (x) (do (set! log (conj @log x)) (* 10 x))) (upto 35))))))
+            (do (check c (= (count r) 35))
+                (check c (= (nth @log 0) 0))
+                (check c (= (nth @log 1) 1000))
+                (check c (= (nth @log 2) 1))
+                (check c (= (nth @log 3) 1010))
+                (check c (= (nth @log 68) 34))
+                (check c (= (nth @log 69) 1340))
+                (check c (= (count @log) 70)))))
+        ;; two sources, an Array and a Vec: the pairs in order, as many as the shorter has
+        (let ((log (cell [])))
+          (let ((r (into [] (map (fn (x y) (do (set! log (conj @log (+ (* 100 x) y))) (- x y))) a v))))
+            (do (check c (= (count r) 40))
+                (check c (= (nth @log 0) 0))
+                (check c (= (nth @log 39) (+ (* 100 78) 39)))
+                (check c (= (count @log) 40))
+                (check c (= (nth r 39) 39)))))
+        ;; a body with a loop of its own: 0 + 1 + .. + x
+        (let ((log (cell [])))
+          (let ((r (mapv (fn (x) (do (set! log (conj @log x)) (loop ((k x) (s 0)) (if (> k 0) (recur (- k 1) (+ s k)) s)))) v)))
+            (do (check c (= @log v))
+                (check c (= r (mapv (fn (x: i64) (quot (* x (+ x 1)) 2)) (range 70)))))))
+        (check c (= (checks-made c) 17))
+        (checks-result c))))
+
+(defun upto-from (lo: i64 hi: i64) -> (Vec i64)
+  (loop ((i lo) (acc [])) (if (< i hi) (recur (+ i 1) (conj acc i)) acc)))

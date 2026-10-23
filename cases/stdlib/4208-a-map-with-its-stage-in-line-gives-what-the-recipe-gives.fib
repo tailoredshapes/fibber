@@ -1,0 +1,69 @@
+;; spec:   stdlib §2.1 rule 2 (the rewrite changes nothing a program can see); docs/design/vec-performance.md item 2; compiler/expand/fuseinline.fib
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: mapv vec into map span-count span-array vec-from-spans
+;; `(mapv f c)`, `(vec (map f c))`, `(into [] (map f c))` and `(vec (map f a b))` with f a `fn` literal or a function's name
+;; are written out by the expander as counted loops over the arrays that hold the source (a Vec's leaves and tail, an Array)
+;; with f's body in line; any other source takes the recipe walk. Each result here is compared with an eager twin built by
+;; a `loop` of `conj` over `nth`, which no rewrite touches: sizes on both sides of the 32-element leaves (0, 1, 31, 32, 33,
+;; 64, 65, 1057), f64, i64 and counted elements (strings), Arrays, a chain of two stages, a literal that captures, a local
+;; function value as the stage, two sources of different lengths (Vec and Vec, Array and Array, a Vec and an Array whose
+;; spans do not line up, which takes the lazy walk), and sources without spans (range, list, a lazy seq).
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun sq (x: f64) -> f64 (* x x))
+(defun tag (x: i64) -> str (str "t" x))
+
+;; the eager twins: n elements of f over i, by index
+(defun twin-f64 (n: i64 f: (fn (i64) f64)) -> (Vec f64)
+  (loop ((i 0) (acc [])) (if (< i n) (recur (+ i 1) (conj acc (f i))) acc)))
+(defun twin-str (n: i64 f: (fn (i64) str)) -> (Vec str)
+  (loop ((i 0) (acc [])) (if (< i n) (recur (+ i 1) (conj acc (f i))) acc)))
+(defun twin-i64 (n: i64 f: (fn (i64) i64)) -> (Vec i64)
+  (loop ((i 0) (acc [])) (if (< i n) (recur (+ i 1) (conj acc (f i))) acc)))
+
+(defun vf (n: i64) -> (Vec f64) (twin-f64 n (fn (i) (* 0.5 (double i)))))
+(defun af (n: i64) -> (Array f64)
+  (let ((c (cell (array n 0.0))))
+    (do (dotimes (i n) (array-set! &c i (* 0.5 (double i)))) @c)))
+
+;; one size: every form over a Vec and an Array of n elements
+(defun one-size (c: Checks n: i64) -> unit
+  (let ((v (vf n)) (a (af n)) (vi (twin-i64 n (fn (i) i)))
+        (want (twin-f64 n (fn (i) (let ((x (* 0.5 (double i)))) (* x x))))))
+    (do (check c (= (mapv (fn (x) (* x x)) v) want))
+        (check c (= (mapv sq v) want))
+        (check c (= (mapv (fn (x: f64) (* x x)) a) want))
+        (check c (= (vec (map sq a)) want))
+        (check c (= (into [] (map (fn (x) (* x x)) v)) want))
+        (check c (= (vec (map (fn (x) (+ x 1.0)) (map (fn (x) (* x 2.0)) v)))
+                    (twin-f64 n (fn (i) (+ (* 2.0 (* 0.5 (double i))) 1.0)))))
+        (check c (= (mapv tag vi) (twin-str n (fn (i) (str "t" i)))))
+        (check c (= (mapv (fn (x) (* x 3)) vi) (twin-i64 n (fn (i) (* i 3)))))
+        (check c (= (count (mapv sq v)) n)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (k 3.0)
+        (scale (fn (x: f64) (* x 4.0))))
+    (do (one-size c 0) (one-size c 1) (one-size c 31) (one-size c 32) (one-size c 33)
+        (one-size c 64) (one-size c 65) (one-size c 1057)
+        ;; a literal that captures, a local function value
+        (check c (= (mapv (fn (x) (* k x)) (vf 70)) (twin-f64 70 (fn (i) (* 3.0 (* 0.5 (double i)))))))
+        (check c (= (mapv scale (vf 70)) (twin-f64 70 (fn (i) (* 4.0 (* 0.5 (double i)))))))
+        ;; two sources: the shorter ends it
+        (check c (= (vec (map + (vf 70) (vf 100))) (twin-f64 70 (fn (i) (double i)))))
+        (check c (= (into [] (map (fn (x y) (- y x)) (vf 100) (vf 70))) (twin-f64 70 (fn (i) 0.0))))
+        (check c (= (vec (map + (af 40) (af 45))) (twin-f64 40 (fn (i) (double i)))))
+        (check c (= (vec (map + (vf 70) (af 100))) (twin-f64 70 (fn (i) (double i)))))
+        (check c (= (vec (map + (vf 100) (af 10))) (twin-f64 10 (fn (i) (double i)))))
+        (check c (= (vec (map + (vf 0) (af 10))) []))
+        ;; sources without spans
+        (check c (= (mapv (fn (x: i64) (* x x)) (range 40)) (twin-i64 40 (fn (i) (* i i)))))
+        (check c (= (mapv (fn (x: i64) (+ x 1)) (list 1 2 3)) [2 3 4]))
+        (check c (= (vec (map sq (map (fn (x: f64) (+ x 1.0)) (filter (fn (x: f64) (> x 1.0)) (vf 6))))) [6.25 9.0 12.25]))
+        (check c (= (mapv sq (take 3 (iterate (fn (x: f64) (+ x 1.0)) 0.0))) [0.0 1.0 4.0]))
+        (check c (= (checks-made c) 84))
+        (checks-result c))))

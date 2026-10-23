@@ -347,6 +347,52 @@
         (nil (VecOf n 5 nil tail))
         ((some lc) (vec-trie n 5 @lc (shr (- n 1) 5) tail))))))
 
+;; The spans of v: the arrays that hold its elements, in order, its full leaves and then its tail, so a counted loop
+;; can run over each (the in-line loop of a fused `map`, compiler/expand/fuseinline.fib). Span j holds the elements
+;; from 32 j on; a vector of n elements has (n - 1) / 32 + 1 spans, the empty one none.
+(defun vec-span-count (v: (Vec a)) -> i64
+  (match v
+    ((VecEmpty) 0)
+    ((VecOf cnt _ _ tail) (+ (shr (- cnt (array-len tail)) 5) 1))))
+
+;; Span j of v (see vec-span-count): a leaf, or the tail for the last; a j out of range traps.
+(defun vec-span (v: (Vec a) j: i64) -> (Array a)
+  (match v
+    ((VecEmpty) (trap "vec-span: index out of range"))
+    ((VecOf cnt shift root tail)
+     (let ((at (shl j 5))
+           (tailoff (- cnt (array-len tail))))
+       (if (or (< j 0) (> at tailoff))
+           (trap "vec-span: index out of range")
+           (if (= at tailoff)
+               tail
+               (match root
+                 ((some r) (vnode-leaf r shift at))
+                 (nil (trap "vec: a vector with no leaves and no tail")))))))))
+
+;; The Vec of the cnt elements of spans, in order, without a copy when they are shaped as a Vec's spans (every one but
+;; the last of 32 elements, the last of 1 to 32: they become the leaves and the tail); one span of any length is
+;; vec-from-array's. Any other shape, or a cnt that is not their total, traps.
+(defun vec-from-spans (spans: (Array (Array a)) cnt: i64) -> (Vec a)
+  (let ((k (array-len spans)))
+    (if (= k 0)
+        (if (= cnt 0) VecEmpty (trap "vec-from-spans: the spans do not hold cnt elements"))
+        (if (= k 1)
+            (if (= (array-len (array-get spans 0)) cnt)
+                (vec-from-array (array-get spans 0))
+                (trap "vec-from-spans: the spans do not hold cnt elements"))
+            (let ((tail (array-get spans (- k 1)))
+                  (leaves (cell (array (- k 1) (VLeaf (array-get spans 0))))))
+              (do (loop ((i 0))
+                    (if (< i (- k 1))
+                        (if (= (array-len (array-get spans i)) 32)
+                            (do (array-set! &leaves i (VLeaf (array-get spans i))) (recur (+ i 1)))
+                            (trap "vec-from-spans: a span before the last does not hold 32 elements"))
+                        ()))
+                  (if (and (> (array-len tail) 0) (<= (array-len tail) 32) (= cnt (+ (shl (- k 1) 5) (array-len tail))))
+                      (vec-trie cnt 5 @leaves (- k 1) tail)
+                      (trap "vec-from-spans: the spans do not hold cnt elements"))))))))
+
 ;; The sink a walk is given: the first element makes the state, every other one is a write.
 (defun vec-take :private (st: (Cell (Option (VecBuild a))) x: a) -> bool
   (do (match @st

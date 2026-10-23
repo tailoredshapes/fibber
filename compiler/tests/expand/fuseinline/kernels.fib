@@ -1,0 +1,25 @@
+;; compiler/tests/expand/fuseinline/kernels.fib: the kernels check.sh asks LLVM about. Each `kern-` function is one form of a
+;; fused `map` over f64 that the expander writes as counted loops with the stage in line (compiler/expand/fuseinline.fib):
+;; check.sh wants a vectorised loop in each. `hand-` is the hand-written loop over arrays (the control: this LLVM vectorises
+;; it), `closure-` a map whose stage is a function value the expander cannot see into (it must stay a call, not vectorised).
+(ns main)
+
+(defun sq (x: f64) -> f64 (* x x))
+
+(defun kern-literal-vec (v: (Vec f64)) -> (Vec f64) (mapv (fn (x) (* x x)) v))
+(defun kern-named-array (a: (Array f64)) -> (Vec f64) (vec (map sq a)))
+(defun kern-two-vecs (v: (Vec f64) w: (Vec f64)) -> (Vec f64) (into [] (map + v w)))
+(defun kern-chain-vec (v: (Vec f64)) -> (Vec f64) (mapv (fn (x) (+ x 1.0)) (map (fn (x: f64) (* x 2.0)) v)))
+
+(defun hand-array (a: (Array f64)) -> (Array f64)
+  (let ((c (cell (array (array-len a) 0.0))))
+    (do (loop ((i 0)) (if (< i (array-len a)) (do (array-set! &c i (* (array-get a i) 2.0)) (recur (+ i 1))) ()))
+        @c)))
+
+(defun closure-param (f: (fn (f64) f64) v: (Vec f64)) -> (Vec f64) (mapv f v))
+
+(defun main () -> i64
+  (let ((v (mapv (fn (i: i64) (double i)) (range 100)))
+        (a (let ((c (cell (array 100 0.0)))) (do (dotimes (i 100) (array-set! &c i (double i))) @c))))
+    (count [(kern-literal-vec v) (kern-named-array a) (kern-two-vecs v v) (kern-chain-vec v) (vec (hand-array a))
+            (closure-param (fn (x) (- x)) v)])))
