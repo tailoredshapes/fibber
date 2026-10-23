@@ -1168,7 +1168,10 @@ read a garbage third argument there (docs/design/aarch64.md 7). Without `:fixed`
 `:lib "NAME"` (stage 2) says which native library the C function lives in. It changes nothing about the call. When the program reaches the extern (a call that
 survives to the emitted code), the emitter notes the library and the module that declared it in the lIR (`;; link-lib: NAME MODULE`) and `fibc build` links it:
 dynamically (`-lNAME`) or bundled (the archive `libNAME.a`) by the mode of the build (`--link NAME=static|dynamic`, `--link-mode`, `--static`:
-docs/design/static-linking.md 3). A name is a non-empty string, else `extern option :lib takes a library name, a string`. Only a platform module or a driver
+docs/design/static-linking.md 3). `fibc run` (the JIT, also `run --live` and `repl`) loads the library into its process before the program's code, as an
+executable's loader would. Dynamically, the development link `libNAME.so` is taken first; where only the versioned file is installed (`libNAME.so.7`), the
+highest version found in `-L`, LD_LIBRARY_PATH, /etc/ld.so.conf's directories and the system's is linked (`-l:libNAME.so.7`) and loaded; `:lib ":FILE"` names the
+file itself. A library found nowhere is an error naming the module, the library and what was looked for. A name is a non-empty string, else `extern option :lib takes a library name, a string`. Only a platform module or a driver
 may write an `extern` (docs/adr/0011). `c`, `m`, `pthread`, `dl`, `rt` and `util` are the C library's own and are never linked by name.
 
 **`alloc` is zeroed** (**Proposed**, implemented at the owner's request, 2026-10-01). `(alloc n)` is `n`

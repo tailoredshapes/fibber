@@ -5,7 +5,9 @@
 #   2. a program that calls it fails with a message that names the module AND the library, dynamic and static;
 #   3. a real library (built here from C with gcc: libfibtest.a and .so) links dynamically (-lfibtest, found with -L and an rpath), bundled (`--link fibtest=static`)
 #      and in a fully static musl executable (`--static`, when the musl pieces are found), and the program gets 42 from it each time;
-#   4. a mode that is not static or dynamic, and a dynamic library in a --static build, are refused with a message.
+#   4. a mode that is not static or dynamic, and a dynamic library in a --static build, are refused with a message;
+#   5. `run` (the JIT) loads the declared library (5a), also when only its versioned file libNAME.so.N is installed (5b), which `build` then links by
+#      that file (5c); a library that is nowhere is an error naming the module, the library and what was looked for (5d).
 # usage: linklib.sh   F=stage-2 fibc (FIBC also read). Exit: 0 all hold; 1 a check failed; 2 no fibc.
 set -u
 root=$(cd "$(dirname "$0")/../../.." && pwd); cd "$root"
@@ -39,5 +41,14 @@ if command -v gcc > /dev/null 2>&1; then
   if "$F" build --static $D/requires-missing.fib -I $D -o "$T/probe" > "$T/out" 2>&1; then
     check "3d a real library in a fully static musl executable" bash -c "'$F' build --static $D/uses-answer.fib -I $D -L $T/lib -o $T/ss && $T/ss && ! ldd $T/ss 2>/dev/null | grep -q 'libc'" # linux-only: a fully static musl executable (3d is skipped where there are no musl pieces)
   else echo "skip 3d (no musl pieces: $(head -1 "$T/out" | cut -c1-100))"; fi
+  if [ "$(uname)" = Linux ]; then
+    # 5. `run` (the JIT) loads what the program declares, as an executable's loader would: libfibtest is in no process but this test's.
+    check "5a run: a declared library the compiler does not link is loaded for the JIT" env LD_LIBRARY_PATH="$T/lib" "$F" run $D/uses-answer.fib -I $D
+    mkdir -p "$T/ver"; printf 'int fibver_answer(void) { return 43; }\n' > "$T/ver/v.c"
+    gcc -O1 -fPIC -shared -Wl,-soname,libfibver.so.3 -o "$T/ver/libfibver.so.3" "$T/ver/v.c" || { echo "linklib: gcc failed"; exit 1; }
+    check "5b run: only the versioned libfibver.so.3 (no libfibver.so), found on LD_LIBRARY_PATH" env LD_LIBRARY_PATH="$T/ver" "$F" run $D/uses-verso.fib -I $D
+    check "5c build: only the versioned file, linked as -l:libfibver.so.3 from -L" bash -c "'$F' build $D/uses-verso.fib -I $D -L $T/ver -o $T/v && $T/v && ldd $T/v | grep -q libfibver.so.3" # linux-only: section 5 runs on Linux only (a versioned .so.N)
+    fails_with "5d run: a library that is nowhere names the module, the library and what was looked for" "fakelib" "fibtest-missing" "libfibtest-missing.so" "libfibtest-missing.so.N" -- "$F" run $D/uses-missing.fib -I $D
+  else echo "skip 5 (the JIT's loading is checked on Linux)"; fi
 else echo "skip 3 (no gcc to build the test library)"; fi
 [ $bad -eq 0 ] && echo "linklib: all checks hold" || echo "linklib: FAILED"; exit $bad

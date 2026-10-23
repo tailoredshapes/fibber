@@ -23,7 +23,8 @@
   (:require [serve.replcore :as rc] [serve.incr :as inc] [serve.diag :as dg] [serve.livetable :as lt] [expand.roots :as roots] [emit.compile :as ec]
             [emit.program :as ep] [emit.statics :as st] [emit.node :as n] [emit.function :as f] [live.jit :as lj] [live.extract :as ex]
             [types.decls :as td] [emit.names :as en] [own.program :as op] [own.driver :as od] [driver.front :as front] [expand.maker :as mk] [lair.ffi :as ffi]
-            [expand.modules :as mods] [expand.types :as et] [pkg.modules :as pmod] [pkg.paths :as pp] [emit.live :as live] [serve.livesplit :as sp] [serve.livereach :as rr] [serve.livediff :as ldf] [fib.unix :as unix] [fib.string :as s]))
+            [expand.modules :as mods] [expand.types :as et] [pkg.modules :as pmod] [pkg.paths :as pp] [emit.live :as live] [serve.livesplit :as sp] [serve.livereach :as rr] [serve.livediff :as ldf] [fib.unix :as unix] [fib.string :as s]
+            [native.libraries :as nlibs]))
 
 (def guard-clauses: (Vec str) ["(:use fib.ex)"])
 
@@ -148,7 +149,13 @@
       ((Err m) (Err [(if (s/starts-with? m "verify: ")
                          (dg/diag-nowhere "live/EmitVerify" rc/repl-file m)
                          (dg/diag-nowhere "live/Unsupported" rc/repl-file (str "unsupported: " m)))]))
-      ((Ok e) (Ok (Made (. e ast) c stats (inc/ms-since t0)))))))
+      ((Ok e) (match (load-libs e)
+                ((Err m) (Err [(dg/diag-nowhere "live/NativeLibrary" rc/repl-file m)]))
+                ((Ok _) (Ok (Made (. e ast) c stats (inc/ms-since t0)))))))))
+
+;; The native libraries the program declares (`:lib` on an extern it reaches) loaded into the session's process for its JIT (native.libraries).
+(defun load-libs (e: ec/Emitted) -> (Result unit str)
+  (nlibs/load-for-jit (nlibs/from-notes (. e links))))
 
 ;; The whole program with `tail` after the session's text.
 (defun program-of (sx: Sess tail: str requests: (Vec ec/BodyRequest)) -> (Result Made (Vec dg/Diag))
@@ -228,7 +235,7 @@
          (set! (. sx live-modules) @(. (. (. c typed) globals) live-modules))
          (match (ec/compile-executable-ast-with (. c typed) (. c owned) (some (program-tables sx)) [])
            ((Err m) (do (eprintln (str "unsupported: " m)) (Err front/exit-unsupported)))
-           ((Ok e) (match (lj/live-jit-new (. sx opt))
+           ((Ok e) (match (try-let ((_ (load-libs e))) (lj/live-jit-new (. sx opt)))
                      ((Err m) (do (eprintln (str "compile failed: " m)) (Err front/exit-compile-failed)))
                      ((Ok j) (install-base sx j (. e ast) c)))))))))
 

@@ -11,7 +11,7 @@
   (:use lir.ast lir.types)
   (:require [serve.replcore :as rc] [serve.incr :as inc] [serve.diag :as dg] [expand.roots :as roots] [emit.compile :as ec] [emit.program :as ep]
             [own.driver :as od] [live.jit :as lj] [live.swap :as sw] [live.extract :as ex] [live.stub :as stub]
-            [lir.print :as print] [fib.string :as s]))
+            [lir.print :as print] [fib.string :as s] [native.libraries :as nlibs]))
 
 (def guard-text: str
   "(defun live-guard (f: (fn () i64)) -> i64 (try (f) (catch e (do (println (str \"trap: \" (ex-message e))) 134))))")
@@ -54,7 +54,7 @@
           ((Err ds) (Err (mapv (fn (d: dg/Diag) (rc/show-diag d at defs)) ds)))
           ((Ok c) (match (ec/compile-executable-ast-with (. c typed) (. c owned) (some (. l tables)) requests)
                     ((Err m) (Err [(str "unsupported: " m)]))
-                    ((Ok e) (Ok (. e ast))))))))))
+                    ((Ok e) (match (nlibs/load-for-jit (nlibs/from-notes (. e links))) ((Err m) (Err [m])) ((Ok _) (Ok (. e ast))))))))))))
 
 (defun session-fns (l: Live) -> (Vec str)
   (mapv (fn (d: rc/Def) (. d name)) (filterv (fn (d: rc/Def) (s/starts-with? (. d key) "val:")) @(. (. l rc) defs))))
