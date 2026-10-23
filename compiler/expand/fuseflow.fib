@@ -1,0 +1,184 @@
+;; compiler/expand/fuseflow.fib: the loops of a fused chain whose output is not one element per source element, a chain with
+;; `filter`, `remove`, `keep`, `take` or `take-while` steps among its `map`s (compiler/expand/fuseinline.fib reads the chain and
+;; its header has the argument). One source, held in arrays (a Vec, an Array: asked when the program runs) or a `range` call.
+;; The output's length is not known, so the loop does not make spans: the first element that reaches the output starts a
+;; builder (`vec-build-first`), and the walk goes on in a second copy of the loop that pushes to it (`vec-build-push`):
+;;
+;;   (let ((s c))
+;;     (if (<= n 0) (vec-empty)                         ; a (take n ..) with n <= 0 never touches its source
+;;         (let ((sc (span-count s)))
+;;           (if (< sc 0) CALL                           ; no spans: the call as it was
+;;               (if (= sc 0) (vec-empty)
+;;                   (loop ((j 0) (b (span-array s 0)) (i 0) (t 0))
+;;                     (if (< i (array-len b))
+;;                         (let ((x (array-get b i)))
+;;                           STEPS[x]                     ; each step in line, the innermost first
+;;                             skip:   (recur j b (+ i 1) t)
+;;                             output: (let ((v (vec-build-first y))) (loop ((j j) (b b) (i (+ i 1)) (t t)) .. the same, the output
+;;                                       (do (vec-build-push v y) (recur ..)), the end (vec-build-done v)))
+;;                         (if (< (+ j 1) sc) (recur (+ j 1) (span-array s (+ j 1)) 0 t) (vec-empty)))))))))
+;;
+;; A step is `(let ((y F[x])) ..)` for a map; `(if (truthy? P[x]) .. skip)` for a filter, the arms swapped for a remove;
+;; `(match F[x] (nil skip) ((some y) ..))` for a keep; `(if (truthy? P[x]) .. end)` for a take-while; and for a take its count
+;; t, a loop variable, is t + 1 for the steps above it, and the walk ends after them when t + 1 is n: as the recipes
+;; Taken and TakenWhile end it, without asking the source for one more element. A range is walked from its start while
+;; `range-more?` says the next element is before the end (`range-walk-kind` is 0 for an empty range, -1 for a step of zero,
+;; whose walk never ends: CALL).
+(ns expand.fuseflow
+  (:use syntax.pos syntax.form expand.ctx expand.build expand.collections expand.fusegen))
+
+;; One rewrite: the chain's steps, whether the source is a range, the gensyms of the source s, its span count sc (spans) or
+;; its end hi and step by (range), and per `take` step, in the order of the steps from the outermost, its count's form.
+(defstruct Flow (ctx: ExpandCtx steps: (Vec Step) range: bool pos: Pos s: Stx sc: Stx hi: Stx by: Stx ns: (Vec Stx)))
+
+;; The loop variables of one copy of the loop: the cursor (span j, span b, index i; or the element x of a range) and the
+;; count of each `take`.
+(defstruct FlowVars (cur: (Vec Stx) counts: (Vec Stx)))
+
+;; Which copy of the loop: before the first output element, or after it with the builder's gensym.
+(defenum FlowPhase FlowFirst (FlowRest builder: Stx))
+
+;; What the steps above a point have done to the counts: their forms now, and which a `take` has moved.
+(defstruct Counts (now: (Vec Stx) moved: (Vec bool)))
+
+(defun with-at :private (v: (Vec a) at: i64 x: a) -> (Vec a)
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (count v)) (recur (+ i 1) (conj out (if (= i at) x (nth v i)))) out)))
+
+(defun falses :private (n: i64) -> (Vec bool)
+  (loop ((i 0) (out (vec-empty))) (if (< i n) (recur (+ i 1) (conj out false)) out)))
+
+(defun take? :private (st: Step) -> bool
+  (match st ((StTake _) true) (_ false)))
+
+;; The counts of the `take` steps, outermost first.
+(defun take-ns :private (steps: (Vec Step)) -> (Vec Stx)
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (count steps)) (recur (+ i 1) (match (nth steps i) ((StTake n) (conj out n)) (_ out))) out)))
+
+;; The place of the `take` step k among the `take` steps.
+(defun take-at :private (steps: (Vec Step) k: i64) -> i64
+  (loop ((i 0) (t 0))
+    (if (< i k) (recur (+ i 1) (if (take? (nth steps i)) (+ t 1) t)) t)))
+
+(defun fresh-vars :private (fl: Flow) -> FlowVars
+  (let ((ctx (. fl ctx)) (pos (. fl pos)))
+    (FlowVars (fg-gensyms ctx (if (. fl range) 1 3) pos) (fg-gensyms ctx (count (. fl ns)) pos))))
+
+(defun truthy :private (e: Stx pos: Pos) -> Stx
+  (call "fib.core/truthy?" [e] pos))
+
+;; The end of the walk: no element yet, or the builder's Vec.
+(defun done :private (fl: Flow ph: FlowPhase) -> Stx
+  (match ph
+    ((FlowFirst) (fg-pcall "vec-empty" (vec-empty) (. fl pos)))
+    ((FlowRest b) (call "fib.seq/vec-build-done" [b] (. fl pos)))))
+
+;; The cursor after the element at `vars`, handed to `next` (the forms of the cursor's loop variables), or the end.
+(defun advance :private (fl: Flow vars: FlowVars next: (fn ((Vec Stx)) Stx) end: Stx) -> Stx
+  (let ((pos (. fl pos)) (cur (. vars cur)))
+    (if (. fl range)
+        (fg-if (call "fib.seq/range-more?" [(nth cur 0) (. fl hi) (. fl by)] pos)
+               (next [(call "fib.seq/range-step" [(nth cur 0) (. fl by)] pos)])
+               end pos)
+        (next [(nth cur 0) (nth cur 1) (fg-pcall "+" [(nth cur 2) (int 1 pos)] pos)]))))
+
+;; On to the next element, handed to `next` (all the loop variables' forms): unless a `take` the element passed has its
+;; count, then the end.
+(defun go-on :private (fl: Flow ph: FlowPhase vars: FlowVars cs: Counts next: (fn ((Vec Stx)) Stx)) -> Stx
+  (let ((pos (. fl pos)) (end (done fl ph)))
+    (let ((adv (advance fl vars (fn (cur: (Vec Stx)) (next (fg-appended cur (. cs now)))) end)))
+      (loop ((t (- (count (. fl ns)) 1)) (acc adv))
+        (cond (< t 0) acc
+              (nth (. cs moved) t) (recur (- t 1) (fg-if (fg-pcall "<" [(nth (. cs now) t) (nth (. fl ns) t)] pos) acc end pos))
+              :else (recur (- t 1) acc))))))
+
+(defun skip :private (fl: Flow ph: FlowPhase vars: FlowVars cs: Counts) -> Stx
+  (go-on fl ph vars cs (fn (forms: (Vec Stx)) (call "recur" forms (. fl pos)))))
+
+;; The element y reached the output.
+(defun output :private (fl: Flow ph: FlowPhase vars: FlowVars y: Stx cs: Counts) -> Stx
+  (let ((pos (. fl pos)))
+    (match ph
+      ((FlowRest b) (call "do" [(call "fib.seq/vec-build-push" [b y] pos) (skip fl ph vars cs)] pos))
+      ((FlowFirst)
+       (let ((b (ctx-gensym (. fl ctx) "fuse" pos)))
+         (let ((rest (FlowRest b)))
+           (fg-let [(fg-pair b (call "fib.seq/vec-build-first" [y] pos) pos)]
+                   (go-on fl rest vars cs (fn (forms: (Vec Stx)) (phase-loop fl rest (fresh-vars fl) forms)))
+                   pos)))))))
+
+;; Steps k down to 0 applied to the element x.
+(defun steps-from :private (fl: Flow ph: FlowPhase vars: FlowVars k: i64 x: Stx cs: Counts) -> Stx
+  (if (< k 0)
+      (output fl ph vars x cs)
+      (let ((ctx (. fl ctx)) (pos (. fl pos)) (on (fn (y: Stx c: Counts) (steps-from fl ph vars (- k 1) y c))))
+        (match (nth (. fl steps) k)
+          ((StMap f) (let ((y (ctx-gensym ctx "fuse" pos))) (fg-let [(fg-pair y (fg-apply ctx f [x] pos) pos)] (on y cs) pos)))
+          ((StFilter p) (fg-if (truthy (fg-apply ctx p [x] pos) pos) (on x cs) (skip fl ph vars cs) pos))
+          ((StRemove p) (fg-if (truthy (fg-apply ctx p [x] pos) pos) (skip fl ph vars cs) (on x cs) pos))
+          ((StTakeWhile p) (fg-if (truthy (fg-apply ctx p [x] pos) pos) (on x cs) (done fl ph) pos))
+          ((StKeep f)
+           (let ((y (ctx-gensym ctx "fuse" pos)))
+             (call "match" [(fg-apply ctx f [x] pos)
+                            (list-form [(Stx SNil pos) (skip fl ph vars cs)] pos)
+                            (list-form [(list-form [(sym "some" pos) y] pos) (on y cs)] pos)] pos)))
+          ((StTake _)
+           (let ((t (take-at (. fl steps) k)) (c (ctx-gensym ctx "fuse" pos)))
+             (fg-let [(fg-pair c (fg-pcall "+" [(nth (. cs now) t) (int 1 pos)] pos) pos)]
+                     (on x (Counts (with-at (. cs now) t c) (with-at (. cs moved) t true)))
+                     pos)))))))
+
+;; A copy of the loop, its variables `vars` starting at `inits`.
+(defun phase-loop :private (fl: Flow ph: FlowPhase vars: FlowVars inits: (Vec Stx)) -> Stx
+  (let ((pos (. fl pos)) (names (fg-appended (. vars cur) (. vars counts))) (cur (. vars cur)))
+    (let ((binds (loop ((i 0) (out (vec-empty)))
+                   (if (< i (count names)) (recur (+ i 1) (conj out (fg-pair (nth names i) (nth inits i) pos))) out)))
+          (cs (Counts (. vars counts) (falses (count (. vars counts)))))
+          (last (- (count (. fl steps)) 1)))
+      (call "loop"
+            [(list-form binds pos)
+             (if (. fl range)
+                 (steps-from fl ph vars last (nth cur 0) cs)
+                 (let ((x (ctx-gensym (. fl ctx) "fuse" pos)) (j1 (fg-pcall "+" [(nth cur 0) (int 1 pos)] pos)))
+                   (fg-if (fg-pcall "<" [(nth cur 2) (call "array-len" [(nth cur 1)] pos)] pos)
+                          (fg-let [(fg-pair x (call "array-get" [(nth cur 1) (nth cur 2)] pos) pos)] (steps-from fl ph vars last x cs) pos)
+                          (fg-if (fg-pcall "<" [j1 (. fl sc)] pos)
+                                 (call "recur" (fg-appended [j1 (call "fib.seq/span-array" [(. fl s) j1] pos) (int 0 pos)] (. vars counts)) pos)
+                                 (done fl ph) pos) pos)))]
+            pos))))
+
+;; The first copy of the loop, from the source's first element.
+(defun first-loop :private (fl: Flow) -> Stx
+  (let ((pos (. fl pos)) (zeros (loop ((i 0) (out (vec-empty))) (if (< i (count (. fl ns))) (recur (+ i 1) (conj out (int 0 pos))) out))))
+    (phase-loop fl FlowFirst (fresh-vars fl)
+                (fg-appended (if (. fl range)
+                                 [(call "." [(. fl s) (sym "lo" pos)] pos)]
+                                 [(int 0 pos) (call "fib.seq/span-array" [(. fl s) (int 0 pos)] pos) (int 0 pos)])
+                             zeros))))
+
+;; The source asked: the call as it was when it has no spans or is a range that never ends, nothing when it is empty.
+(defun source-choice :private (fl: Flow fallback: Stx) -> Stx
+  (let ((pos (. fl pos)) (empty (fg-pcall "vec-empty" (vec-empty) pos)) (s (. fl s)) (w (. fl sc)))
+    (fg-let [(fg-pair w (call (if (. fl range) "fib.seq/range-walk-kind" "fib.seq/span-count") [s] pos) pos)]
+            (fg-if (fg-pcall "<" [w (int 0 pos)] pos)
+                   fallback
+                   (fg-if (fg-pcall "=" [w (int 0 pos)] pos)
+                          empty
+                          (if (. fl range)
+                              (fg-let [(fg-pair (. fl hi) (call "." [s (sym "hi" pos)] pos) pos) (fg-pair (. fl by) (call "." [s (sym "by" pos)] pos) pos)]
+                                      (first-loop fl) pos)
+                              (first-loop fl))
+                          pos) pos)
+            pos)))
+
+;; The rewrite of a chain with steps that are not all `map`s over its one source; `fallback` makes the call as it was with
+;; its source replaced by the gensym the source is bound to.
+(defun fuse-flow-rewrite (ctx: ExpandCtx ch: Chain pos: Pos fallback: (fn ((Vec Stx)) Stx)) -> Stx
+  (let ((g (fg-gensyms ctx 4 pos)))
+    (let ((fl (Flow ctx (. ch steps) (. ch range) pos (nth g 0) (nth g 1) (nth g 2) (nth g 3) (take-ns (. ch steps))))
+          (empty (fg-pcall "vec-empty" (vec-empty) pos)))
+      (fg-let [(fg-pair (nth g 0) (nth (. ch sources) 0) pos)]
+              (loop ((t (- (count (. fl ns)) 1)) (acc (source-choice fl (fallback [(nth g 0)]))))
+                (if (< t 0) acc (recur (- t 1) (fg-if (fg-pcall "<=" [(nth (. fl ns) t) (int 0 pos)] pos) empty acc pos))))
+              pos))))

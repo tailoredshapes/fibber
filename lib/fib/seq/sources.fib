@@ -1,7 +1,7 @@
 ;; fib.seq.sources: the sources of a walk (tranche 1 plan §4.2, owner L5a; stdlib §2.1 rule 1, §2.3, §4.4 rows
 ;; `range` and `range-by`). It replaces the prelude's Vec-only `range`, `Traversable` and `Countable` for these
-;; types, which the flip deleted. Public: Range, RangeLen (methods range-len, range-more?, range-nth), range,
-;; range-by, and the Reducible instances of Array, Map, Set and Range; every other name is :private.
+;; types, which the flip deleted. Public: Range, RangeLen (methods range-len, range-more?, range-nth, range-step), range,
+;; range-by, range-walk-kind, and the Reducible instances of Array, Map, Set and Range; every other name is :private.
 ;;
 ;; A Range is Clojure's: a start, an end that is not an element, and a step, walked by repeated addition, so
 ;; floats accumulate: (range-by 0.0 1.0 0.1) has eleven elements, the last 0.9999999999999999 (§4.4, case 162).
@@ -31,11 +31,15 @@
 ;; self is the start; all three methods are for a start that is not at the end and a step that is not zero (the
 ;; caller checked both; a step of zero is not answered). range-len: the number of elements of the range from self
 ;; to hi by by. range-more?: whether the element after self, self + by, is still before hi. range-nth: element
-;; i of that range; it traps `nth: index out of range` unless 0 <= i < range-len.
+;; i of that range; it traps `nth: index out of range` unless 0 <= i < range-len. range-step: self + by, for an
+;; element self + by of the range (so the sum is never out of the type's range): the integers add without the overflow
+;; check, so that the loop the expander writes over a range (compiler/expand/fuserange.fib), whose element is the last one
+;; plus the step, is a counted loop LLVM vectorises; the default is +.
 (defprotocol RangeLen
   (range-len (self hi: Self by: Self) -> i64)
   (range-more? (self hi: Self by: Self) -> bool)
-  (range-nth (self hi: Self by: Self i: i64) -> Self))
+  (range-nth (self hi: Self by: Self i: i64) -> Self)
+  (range-step (self by: Self) -> Self (+ self by)))
 
 ;; a pair of bounds is empty when they are equal or the step points away from the end (Range.create)
 (defun range-empty? :private (lo: t hi: t by: t) :where ((Ord t) (Unit t)) -> bool
@@ -105,12 +109,14 @@
 (defun in-range? :private (i: i64 n: i64) -> bool (and (>= i 0) (< i n)))
 
 (impl RangeLen i64
+  (range-step (self by) (unchecked-add self by))
   (range-len (self hi by) (int-count self hi by))
   (range-more? (self hi by) (int-more? self hi by))
   (range-nth (self hi by i)
     (if (in-range? i (int-count self hi by)) (int-nth self hi by i) (trap "nth: index out of range"))))
 
 (impl RangeLen i32
+  (range-step (self by) (unchecked-add self by))
   (range-len (self hi by) (int-count (sext i64 self) (sext i64 hi) (sext i64 by)))
   (range-more? (self hi by) (int-more? self hi by))
   (range-nth (self hi by i)
@@ -119,6 +125,7 @@
         (trap "nth: index out of range"))))
 
 (impl RangeLen i16
+  (range-step (self by) (unchecked-add self by))
   (range-len (self hi by) (int-count (sext i64 self) (sext i64 hi) (sext i64 by)))
   (range-more? (self hi by) (int-more? self hi by))
   (range-nth (self hi by i)
@@ -127,6 +134,7 @@
         (trap "nth: index out of range"))))
 
 (impl RangeLen i8
+  (range-step (self by) (unchecked-add self by))
   (range-len (self hi by) (int-count (sext i64 self) (sext i64 hi) (sext i64 by)))
   (range-more? (self hi by) (int-more? self hi by))
   (range-nth (self hi by i)
@@ -191,6 +199,15 @@
   (to-lseq (self)
     (let ((lo (. self lo)) (hi (. self hi)) (by (. self by)))
       (if (range-empty? lo hi by) (lazy-node (fn () LNil)) (range-lseq lo hi by)))))
+
+;; How the walk of r goes, for the loops the expander writes for a fused chain over a range (compiler/expand/fuseinline.fib):
+;; 0 when it is empty, -1 when it never ends (a step of zero), 1 when it walks from the start by repeated addition of the
+;; step while range-more? says the next element is still before the end, as each-while above.
+(defun range-walk-kind (r: (Range t)) :where ((Num t) (Ord t) (Unit t)) -> i64
+  (let ((lo (. r lo)) (hi (. r hi)) (by (. r by)))
+    (cond (range-empty? lo hi by) 0
+          (= by (zero by)) -1
+          :else 1)))
 
 ;; ---- Array, Map, Set ----
 (impl (Reducible a) (Array a)

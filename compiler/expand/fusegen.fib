@@ -1,0 +1,114 @@
+;; compiler/expand/fusegen.fib: what the in-line rewrites of a fused chain share (compiler/expand/fuseinline.fib reads the chain;
+;; expand.fusespan, expand.fuserange and expand.fuseflow write its loops): the steps of a chain, and the small builders of the
+;; forms the loops are made of. Stage 2 only, no Rust twin.
+(ns expand.fusegen
+  (:use syntax.pos syntax.form expand.ctx expand.build expand.collections expand.fusescan))
+
+;; A stage function in line: a literal's parameters (the items of its list) and body, or a symbol to call.
+(defenum InStage
+  (InFn params: (Vec Stx) body: (Vec Stx))
+  (InSym name: Stx))
+
+;; A step of a chain: `(map F c)` (F of one element, or of two for the two-source `map` that reads the sources),
+;; `(filter P c)`, `(remove P c)`, `(keep F c)`, `(take n c)` (n a symbol or a literal), `(take-while P c)`.
+(defenum Step
+  (StMap f: InStage)
+  (StFilter p: InStage)
+  (StRemove p: InStage)
+  (StKeep f: InStage)
+  (StTake n: Stx)
+  (StTakeWhile p: InStage))
+
+;; A chain: the steps, outermost first; the sources (one, or two for `(map F a b)`); how many stage calls lie below the
+;; top form down to the one that reads the sources; whether the one source is a `range` call (its type is a Range).
+(defstruct Chain (steps: (Vec Step) sources: (Vec Stx) depth: i64 range: bool))
+
+;; Whether every step is a `map`: the output has one element per source element.
+(defun fg-maps-only? (steps: (Vec Step)) -> bool
+  (loop ((i 0))
+    (cond (>= i (count steps)) true
+          (match (nth steps i) ((StMap _) true) (_ false)) (recur (+ i 1))
+          :else false)))
+
+;; `(fib.prelude/name args..)`.
+(defun fg-pcall (name: str args: (Vec Stx) pos: Pos) -> Stx
+  (call (prelude-name name) args pos))
+
+;; `(let (pairs) body)`; `pairs` are the binding lists.
+(defun fg-let (pairs: (Vec Stx) body: Stx pos: Pos) -> Stx
+  (call "let" [(list-form pairs pos) body] pos))
+
+(defun fg-pair (name: Stx init: Stx pos: Pos) -> Stx
+  (list-form [name init] pos))
+
+(defun fg-if (c: Stx a: Stx b: Stx pos: Pos) -> Stx
+  (call "if" [c a b] pos))
+
+(defun fg-ends-with-colon? (s: str) -> bool
+  (let ((k (- (str-len s) 1)))
+    (and (> k 0) (= (str-byte-at s k) 58i8))))
+
+;; The stage applied to its elements `args`: a call of the symbol, or the literal's body under its parameters.
+(defun fg-apply (ctx: ExpandCtx s: InStage args: (Vec Stx) pos: Pos) -> Stx
+  (match s
+    ((InSym g) (Stx (SList (loop ((i 0) (out [g])) (if (< i (count args)) (recur (+ i 1) (conj out (nth args i))) out))) pos))
+    ((InFn params body)
+     (fg-let (param-pairs ctx params args pos)
+             (if (= (count body) 1) (nth body 0) (call "do" body pos))
+             pos))))
+
+;; The bindings of a literal's parameters to `args`: `(x arg)`, or `(x: T arg)`; a wildcard `_` binds a fresh name
+;; (a binding names a variable, and the element is read all the same).
+(defun param-pairs :private (ctx: ExpandCtx params: (Vec Stx) args: (Vec Stx) pos: Pos) -> (Vec Stx)
+  (loop ((i 0) (k 0) (out (vec-empty)))
+    (if (>= i (count params))
+        out
+        (let ((p (nth params i)) (name (unwrap-or (fuse-sym-of (nth params i)) "")))
+          (cond (= name "_") (recur (+ i 1) (+ k 1) (conj out (fg-pair (ctx-gensym ctx "fuse" pos) (nth args k) pos)))
+                (= name "_:") (recur (+ i 2) (+ k 1) (conj out (list-form [(sym (str-concat (unwrap-or (fuse-sym-of (ctx-gensym ctx "fuse" pos)) "") ":") pos)
+                                                                         (nth params (+ i 1)) (nth args k)] pos)))
+                (fg-ends-with-colon? name) (recur (+ i 2) (+ k 1) (conj out (list-form [p (nth params (+ i 1)) (nth args k)] pos)))
+                :else (recur (+ i 1) (+ k 1) (conj out (fg-pair p (nth args k) pos))))))))
+
+;; The functions of the `map` steps, in order (every step of a chain the counted loops write is one).
+(defun fg-map-fns (steps: (Vec Step)) -> (Vec InStage)
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (count steps))
+        (recur (+ i 1) (match (nth steps i) ((StMap f) (conj out f)) (_ out)))
+        out)))
+
+;; The element the stages make of the source elements `args`: the innermost stage first.
+(defun fg-element (ctx: ExpandCtx stages: (Vec InStage) args: (Vec Stx) pos: Pos) -> Stx
+  (let ((last (- (count stages) 1)))
+    (loop ((i (- last 1)) (acc (fg-apply ctx (nth stages last) args pos)))
+      (if (< i 0) acc (recur (- i 1) (fg-apply ctx (nth stages i) [acc] pos))))))
+
+(defun fg-gensyms (ctx: ExpandCtx k: i64 pos: Pos) -> (Vec Stx)
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i k) (recur (+ i 1) (conj out (ctx-gensym ctx "fuse" pos))) out)))
+
+;; One form per source, made by `f` of its index.
+(defun fg-per-source (k: i64 f: (fn (i64) Stx)) -> (Vec Stx)
+  (loop ((i 0) (out (vec-empty))) (if (< i k) (recur (+ i 1) (conj out (f i))) out)))
+
+(defun fg-appended (a: (Vec Stx) b: (Vec Stx)) -> (Vec Stx)
+  (loop ((i 0) (out a)) (if (< i (count b)) (recur (+ i 1) (conj out (nth b i))) out)))
+
+;; `(if (< a b) a b)`, the smaller of two forms without effects.
+(defun fg-smaller (a: Stx b: Stx pos: Pos) -> Stx
+  (fg-if (fg-pcall "<" [a b] pos) a b pos))
+
+;; `form` (the top call, `depth` stage calls above the sources) with `news` for its sources: item 2 of each stage call
+;; is its collection, items 2 and 3 of a two-source `map`; and the count of each `take` the one of its step in `steps`
+;; (the step of the call `level` calls below the top).
+(defun fg-with-sources (form: Stx depth: i64 news: (Vec Stx) steps: (Vec Step) level: i64) -> Stx
+  (let ((items (fuse-list-items form))
+        (n (match (nth steps level) ((StTake n) (some n)) (_ nil))))
+    (Stx (SList (loop ((i 0) (out (vec-empty)))
+                  (cond (>= i (count items)) out
+                        (and (= i 1) (some? n)) (recur (+ i 1) (conj out (unwrap n)))
+                        (< i 2) (recur (+ i 1) (conj out (nth items i)))
+                        (= depth 0) (recur (+ i 1) (conj out (nth news (- i 2))))
+                        (= i 2) (recur (+ i 1) (conj out (fg-with-sources (nth items 2) (- depth 1) news steps (+ level 1))))
+                        :else (recur (+ i 1) (conj out (nth items i))))))
+         (. form pos))))

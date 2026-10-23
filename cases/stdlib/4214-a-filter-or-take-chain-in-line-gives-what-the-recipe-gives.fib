@@ -1,0 +1,59 @@
+;; spec:   stdlib §2.1 rule 2 (the rewrite changes nothing a program can see); docs/design/vec-performance.md item 2; compiler/expand/fuseinline.fib, fuseflow.fib
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: vec into mapv filterv filter remove keep take take-while vec-build-first vec-build-push vec-build-done
+;; A chain with `filter`, `remove`, `keep`, `take` or `take-while` steps among its `map`s, read by `vec`, `into []`, `mapv` or
+;; `filterv`, over a Vec, an Array or a range, is written out by the expander as a loop that appends each element that comes
+;; through (compiler/expand/fuseflow.fib). Each result here is compared with an eager twin, a `loop` of `conj` over the indices
+;; that no rewrite touches: the elements 0 .. n-1 for sizes on both sides of the 32-element leaves of a Vec (0, 1, 31, 32, 33,
+;; 64, 65, 1057), every step alone, chains of them, counts of a take at 0, below, at and above the size (a literal, a symbol and
+;; an expression), a predicate that answers an Option (Truthy), counted elements (strings), and sources without spans (a list,
+;; a lazy seq) and a range with a step of zero, which take the recipe walk.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun upto (n: i64) -> (Vec i64) (loop ((i 0) (acc [])) (if (< i n) (recur (+ i 1) (conj acc i)) acc)))
+(defun arr (n: i64) -> (Array i64) (let ((c (cell (array n 0)))) (do (dotimes (i n) (array-set! &c i i)) @c)))
+(defun even (x: i64) -> bool (= (rem x 2) 0))
+(defun big (x: i64) -> (Option i64) (if (> x 20) (some (* 10 x)) nil))
+
+;; the twin: g of the i below n for which p is true, the first k of them
+(defun twin (n: i64 k: i64 p: (fn (i64) bool) g: (fn (i64) i64)) -> (Vec i64)
+  (loop ((i 0) (acc [])) (if (and (< i n) (< (count acc) k)) (recur (+ i 1) (if (p i) (conj acc (g i)) acc)) acc)))
+(defun all (n: i64 p: (fn (i64) bool)) -> (Vec i64) (twin n n p (fn (i) i)))
+
+(defun one-size (c: Checks n: i64) -> unit
+  (let ((v (upto n)) (a (arr n)) (h (quot n 2)) (yes (fn (i: i64) true)))
+    (do (check c (= (vec (filter (fn (x) (= (rem x 3) 0)) v)) (all n (fn (i) (= (rem i 3) 0)))))
+        (check c (= (filterv even a) (all n even)))
+        (check c (= (into [] (remove even (range n))) (all n (fn (i) (not (even i))))))
+        (check c (= (vec (keep big v)) (twin n n (fn (i) (> i 20)) (fn (i) (* 10 i)))))
+        (check c (= (vec (filter big a)) (all n (fn (i) (> i 20)))))
+        (check c (= (vec (take 0 v)) []))
+        (check c (= (vec (take 1 a)) (twin n 1 yes (fn (i) i))))
+        (check c (= (vec (take h (range n))) (twin n h yes (fn (i) i))))
+        (check c (= (vec (take n v)) v))
+        (check c (= (vec (take (+ n 5) v)) v))
+        (check c (= (vec (take-while (fn (x) (< x h)) v)) (all h yes)))
+        (check c (= (vec (take-while (fn (x) (< x 100000)) (range n))) v))
+        (check c (= (mapv (fn (x) (* x x)) (filter even (map (fn (x) (+ x 1)) a)))
+                    (twin n n (fn (i) (even (+ i 1))) (fn (i) (* (+ i 1) (+ i 1))))))
+        (check c (= (vec (take 5 (filter even (take 40 v)))) (twin (if (< n 40) n 40) 5 even (fn (i) i))))
+        (check c (= (vec (take-while (fn (x) (< x 500)) (keep big (range n)))) (twin (if (< n 50) n 50) n (fn (i) (> i 20)) (fn (i) (* 10 i)))))
+        (check c (= (vec (map (fn (x) (* 2 x)) (take (quot (count v) 3) (remove even v)))) (twin n (quot n 3) (fn (i) (not (even i))) (fn (i) (* 2 i)))))
+        (check c (= (vec (filter (fn (s) (= (str-len s) 2)) (mapv (fn (x) (str x)) v))) (mapv (fn (x) (str x)) (all (if (< n 100) n 100) (fn (i) (>= i 10))))))
+        (check c (= (count (filterv yes v)) n)))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (one-size c 0) (one-size c 1) (one-size c 31) (one-size c 32) (one-size c 33)
+        (one-size c 64) (one-size c 65) (one-size c 1057)
+        ;; sources without spans, a range that never ends
+        (check c (= (vec (filter even (list 1 2 3 4))) [2 4]))
+        (check c (= (vec (take 2 (filter even (iterate (fn (x: i64) (+ x 1)) 0)))) [0 2]))
+        (check c (= (vec (take 3 (map (fn (x) (+ x 1)) (range 4 10 0)))) [5 5 5]))
+        (check c (= (vec (take 3 (range 0.0 1.0 0.25))) [0.0 0.25 0.5]))
+        (check c (= (vec (filter (fn (x) (> x 0.5)) (range 0.0 1.0 0.25))) [0.75]))
+        (check c (= (checks-made c) 149))
+        (checks-result c))))

@@ -50,7 +50,7 @@ All exports are pre-1.0; proposed S/E/I classes and “since” versions await e
 | [fib.print](fib.print.md) | 13 |
 | [fib.regex](fib.regex.md) | 31 |
 | [fib.rng](fib.rng.md) | 9 |
-| [fib.seq](fib.seq.md) | 102 |
+| [fib.seq](fib.seq.md) | 106 |
 | [fib.simd](fib.simd.md) | 5 |
 | [fib.sql](fib.sql.md) | 33 |
 | [fib.string](fib.string.md) | 28 |

@@ -5,7 +5,7 @@ Generated declaration inventory of [fib.seq](../../../lib/fib/seq.fib). Source l
 | Name | Declaration | Defined in |
 |---|---|---|
 | `Chars` | defstruct | [lib/fib/seq/chars.fib:19](../../../lib/fib/seq/chars.fib#L19) |
-| `RangeLen` | defprotocol | [lib/fib/seq/sources.fib:35](../../../lib/fib/seq/sources.fib#L35) |
+| `RangeLen` | defprotocol | [lib/fib/seq/sources.fib:38](../../../lib/fib/seq/sources.fib#L38) |
 | `StrCur` | defstruct | [lib/fib/seq/cursors.fib:174](../../../lib/fib/seq/cursors.fib#L174) |
 | `any?` | defun | [lib/fib/seq/consumers.fib:85](../../../lib/fib/seq/consumers.fib#L85) |
 | `bounded-count` | defun | [lib/fib/seq/tail.fib:58](../../../lib/fib/seq/tail.fib#L58) |
@@ -72,8 +72,9 @@ Generated declaration inventory of [fib.seq](../../../lib/fib/seq.fib). Source l
 | `partitionv` | defun | [lib/fib/seq/tail.fib:103](../../../lib/fib/seq/tail.fib#L103) |
 | `partitionv-all` | defun | [lib/fib/seq/tail.fib:106](../../../lib/fib/seq/tail.fib#L106) |
 | `product` | defun | [lib/fib/seq/consumers2.fib:76](../../../lib/fib/seq/consumers2.fib#L76) |
-| `range` | defn | [lib/fib/seq/sources.fib:47](../../../lib/fib/seq/sources.fib#L47) |
-| `range-by` | defun | [lib/fib/seq/sources.fib:55](../../../lib/fib/seq/sources.fib#L55) |
+| `range` | defn | [lib/fib/seq/sources.fib:51](../../../lib/fib/seq/sources.fib#L51) |
+| `range-by` | defun | [lib/fib/seq/sources.fib:59](../../../lib/fib/seq/sources.fib#L59) |
+| `range-walk-kind` | defun | [lib/fib/seq/sources.fib:206](../../../lib/fib/seq/sources.fib#L206) |
 | `rangev` | defn | [lib/fib/seq/tail.fib:122](../../../lib/fib/seq/tail.fib#L122) |
 | `realized?` | defun | [lib/fib/seq/lazy.fib:34](../../../lib/fib/seq/lazy.fib#L34) |
 | `reduce` | defun | [lib/fib/seq/consumers.fib:45](../../../lib/fib/seq/consumers.fib#L45) |
@@ -102,6 +103,9 @@ Generated declaration inventory of [fib.seq](../../../lib/fib/seq.fib). Source l
 | `take-nth` | defun | [lib/fib/seq/tail.fib:39](../../../lib/fib/seq/tail.fib#L39) |
 | `take-while` | defun | [lib/fib/seq/adaptors.fib:112](../../../lib/fib/seq/adaptors.fib#L112) |
 | `tree-seq` | defun | [lib/fib/seq/tail.fib:110](../../../lib/fib/seq/tail.fib#L110) |
+| `vec-build-done` | defun | [lib/fib/seq/protocols.fib:110](../../../lib/fib/seq/protocols.fib#L110) |
+| `vec-build-first` | defun | [lib/fib/seq/protocols.fib:91](../../../lib/fib/seq/protocols.fib#L91) |
+| `vec-build-push` | defun | [lib/fib/seq/protocols.fib:103](../../../lib/fib/seq/protocols.fib#L103) |
 | `vec-from-spans` | defun | [lib/fib/seq/protocols.fib:74](../../../lib/fib/seq/protocols.fib#L74) |
 | `vseq-of` | defun | [lib/fib/seq/vseq.fib:7](../../../lib/fib/seq/vseq.fib#L7) |
 | `zip` | defun | [lib/fib/seq/cursors.fib:323](../../../lib/fib/seq/cursors.fib#L323) |

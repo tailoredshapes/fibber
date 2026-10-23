@@ -1,0 +1,72 @@
+;; spec:   stdlib §2.1 rule 2 (the rewrite changes nothing a program can see); docs/design/vec-performance.md item 2; compiler/expand/fuseinline.fib, fuseflow.fib
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: vec into mapv filter remove keep take take-while range
+;; The loop the expander writes for a chain with filter, remove, keep, take or take-while steps (case 4214) runs the stages as
+;; the recipes Filtered, Taken and TakenWhile run them: element by element in the source's order, the inner step first; a take
+;; ends the walk after the element that makes its count, without asking the source for one more (a stage that would trap on the
+;; next element is not run), and a take of 0 asks nothing of it; a take-while runs its predicate on the element that fails it and
+;; on none after; a count that is an expression is evaluated before the source, as the call evaluates it. The first element that
+;; reaches the output starts the builder, so its stages must not run twice. Every stage logs what it sees in a cell.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun upto (n: i64) -> (Vec i64) (loop ((i 0) (acc [])) (if (< i n) (recur (+ i 1) (conj acc i)) acc)))
+
+(defun main () -> i64
+  (let ((c (checks)) (v (upto 70)))
+    (do ;; map then filter, element by element; the first output (2) is not run twice
+        (let ((log (cell [])))
+          (let ((r (vec (filter (fn (x) (do (set! log (conj @log (+ 1000 x))) (= (rem x 2) 0)))
+                                (map (fn (x) (do (set! log (conj @log x)) (+ x 2))) (upto 4))))))
+            (do (check c (= r [2 4]))
+                (check c (= @log [0 1002 1 1003 2 1004 3 1005])))))
+        ;; a take of 3 over a stage that traps from the fourth element: the fourth is never asked for
+        (let ((log (cell [])))
+          (let ((r (vec (take 3 (map (fn (x) (if (> x 2) (trap "asked for one more") (do (set! log (conj @log x)) x))) v)))))
+            (do (check c (= r [0 1 2]))
+                (check c (= @log [0 1 2])))))
+        ;; a take after a filter counts what the filter lets through, across the leaves of the Vec
+        (let ((log (cell [])))
+          (let ((r (vec (take 20 (filter (fn (x) (do (set! log (conj @log x)) (= (rem x 3) 0))) v)))))
+            (do (check c (= (count r) 20))
+                (check c (= (nth r 19) 57))
+                (check c (= @log (upto 58))))))
+        ;; a take before a filter counts the source's elements
+        (let ((log (cell [])))
+          (let ((r (into [] (filter (fn (x) (do (set! log (conj @log x)) (> x 30))) (take 40 v)))))
+            (do (check c (= r (vec (range 31 40))))
+                (check c (= @log (upto 40))))))
+        ;; a take of 0 asks nothing of its source; the source is still evaluated
+        (let ((log (cell [])))
+          (let ((r (vec (take 0 (map (fn (x) (do (set! log (conj @log x)) x)) (do (set! log (conj @log -1)) v))))))
+            (do (check c (= r []))
+                (check c (= @log [-1])))))
+        ;; a take-while sees the element that fails it, and none after
+        (let ((log (cell [])))
+          (let ((r (vec (take-while (fn (x) (do (set! log (conj @log x)) (< x 45))) v))))
+            (do (check c (= r (upto 45)))
+                (check c (= @log (upto 46))))))
+        ;; keep: f once per element, in order; remove over a range
+        (let ((log (cell [])))
+          (let ((r (vec (keep (fn (x) (do (set! log (conj @log x)) (if (> x 66) (some x) nil))) v))))
+            (do (check c (= r [67 68 69]))
+                (check c (= @log v)))))
+        (let ((log (cell [])))
+          (let ((r (mapv (fn (x) (* 2 x)) (remove (fn (x) (do (set! log (conj @log x)) (< x 5))) (range 3 8)))))
+            (do (check c (= r [10 12 14]))
+                (check c (= @log [3 4 5 6 7])))))
+        ;; a take over a range far larger than it stops the walk
+        (let ((log (cell [])))
+          (let ((r (vec (take 3 (map (fn (x) (do (set! log (conj @log x)) x)) (range 1000000000000000))))))
+            (do (check c (= r [0 1 2]))
+                (check c (= @log [0 1 2])))))
+        ;; counts that are expressions are evaluated before the source, the outer first
+        (let ((log (cell [])))
+          (let ((r (vec (take (do (set! log (conj @log 1)) 2)
+                              (filter (fn (x) (> x 0)) (take (do (set! log (conj @log 2)) 5) (do (set! log (conj @log 3)) v)))))))
+            (do (check c (= r [1 2]))
+                (check c (= @log [1 2 3])))))
+        (check c (= (checks-made c) 21))
+        (checks-result c))))

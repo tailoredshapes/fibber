@@ -248,6 +248,22 @@ Rules:
      again; a trap is the stage's own at the same element. No closure, recipe or indirect call is left for a literal or a named function, so LLVM vectorises the
      loop where the body allows (f64 arithmetic does; i64 arithmetic does not, its overflow checks are calls and early exits; a sum through `reduce` is not
      rewritten). A symbol bound to a function value is called through it, as before.
+     **Over a range** (cases 4211 to 4213; `compiler/expand/fuserange.fib`): when the one source is a call of the library's `range` (one or three
+     arguments) or `range-by`, the loop walks the Range itself, as its Reducible instance does: `range-walk-kind` (0 empty, -1 a step of zero, whose
+     walk never ends: CALL, 1 otherwise), then `count` elements, the start and each later one the one before plus the step (`range-step`, a method
+     of `RangeLen` that adds the integers without the overflow check: every sum is an element of the range, so none overflows, and the loop over
+     the range's i64 elements is vectorised). Float ranges accumulate as their walk does (the eleventh of `(range 0.0 1.0 0.1)` is
+     0.9999999999999999).
+     **With other steps** (cases 4214 to 4216; `compiler/expand/fuseflow.fib`): `(filterv P c)`, and a chain under `vec`, `into []` or `mapv` with
+     `filter`, `remove`, `keep`, `take` or `take-while` steps among its `map`s (one source, held in arrays or a range call; a filter, remove or
+     take-while needs a module that sees fib.core, for `truthy?`), become one loop over the source that applies the steps in line, innermost
+     first, and appends what comes through: the first output element starts a builder (`vec-build-first`, then `vec-build-push` and
+     `vec-build-done` of fib.seq: spans of 32 filled in place, made the Vec by `vec-from-spans`) in a second copy of the loop. A filter is `(if (truthy? P[x])
+     .. skip)`, a remove the same with the arms swapped, a keep `(match F[x] (nil skip) ((some y) ..))`, a take-while `(if (truthy? P[x]) ..
+     end)`, a take a count in a loop variable: the walk ends after the element that makes it, without asking the source for one more, as
+     Taken and TakenWhile end it, and a take whose count is at most 0 asks nothing. A count that is not atomic (the recipe rewrite takes
+     only a symbol or a literal) is evaluated first, the outermost first, before the source, as the calls evaluate them. The loop has branches
+     and is not vectorised; it has no closure, recipe or indirect call (`check.sh` follows every function it calls).
    * **The dump** of a program that sees `fib.seq` shows the recipes and the gensyms `#fuse.N`; its format is unchanged (bootstrap §2, §5.3).
 
    **Not adopted.** The second revision's affine recipes (a value consumed once, a compile error on the second use) and the first
