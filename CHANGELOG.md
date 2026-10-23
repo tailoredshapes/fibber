@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.18
+
+- Persistent collections keep their uniqueness, so idiomatic updates are in place: a call that reads a value in a sibling
+  argument and moves it into another is a two-phase move (`(assoc v i (+ (nth v i) 1))`), `assoc` takes its new value
+  owned so `update`, `update-or` and `update-opt` update a unique collection in place, and `with` takes a field whose new
+  value reads the old one (`(with e (f (assoc (. e f) i x)))`). Each was a copy of the trie path per update (370 to 420 ns
+  on a 1M-element Vec) and is now 20 to 60 ns; cases count heap objects so a copy that comes back fails (types §6.3, §6.4).
+- Fusion writes the stage in line: `mapv`, `vec`/`into []` over `map`, chains of `map` and two-source `map` over a Vec or
+  Array, with a fn literal or a named function, are counted loops that LLVM auto-vectorises (f64 `mapv` 13 ns to 1.4 ns an
+  element; NEON on Apple Silicon). `first` is a terminal of the fused table.
+- A stack overflow is a catchable failure in a program that catches and in a shared library (ADR 0027, reversing ADR 0009's
+  rule): functions on call cycles check the stack in their prologue; `try` catches it with kind "stack"; library exports set
+  `fib_status`/`fib_error`. Programs that never catch keep the signal path at no cost. `FIB_STACK_CHECK=0` turns it off.
+- `fibc build --shared --header`: shared libraries with a C ABI, a C header and a module map; a library and a live session are
+  multi-threaded from the start.
+- `fibc run` (and `repl`, `run --live`, `serve`, `test`) loads the native libraries a program declares with `:lib`; where only
+  the versioned file is installed (`libwebp.so.7`), `run` and `build` find it; a library found nowhere is an error naming
+  what was searched.
+- Library: `*command-line-args*`; the `Math/` statics Clojure programs write (`exp`, `log10`, trig and hyperbolic functions,
+  `atan2`, `hypot`, `cbrt`, `PI`, `E`, ...) and `math/pi`, `math/e`; `(MArray t)` with `long-array`, `make-array`, `aget`,
+  `aset`, `alength`, `aclone`, `amap`, `areduce`, `to-array`, `into-array` (§2.11). `to-array` of an empty source traps for
+  now (case 8847, open).
+- Inline lIR in `unsafe`, `fib.atomic`, `(spin-hint)`, `(cache-line)`, the `inline` modifier (ADR 0026); `fibc explain unsafe`.
+- Live sessions forget retired texts (a long session's growth fell from about 8 MB a swap to under 2 MB over 100 swaps),
+  accept removals on `load`, and build their checked base once (start to first result 7.8 s to 4.2 s on fib-solid).
+- Fixes: `(array 0 x)` released its counted fill value; a JIT-compiled thread-key destructor ran after its code was freed.
+
 ## 0.1.17
 
 - Live development: `fibc run --live FILE` runs a program whose functions can be redefined while it runs, and `fibc repl --connect PID`
