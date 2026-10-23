@@ -235,6 +235,19 @@ Rules:
      that is read twice, or from a closure, or by anything that is not the library's consumer, is not touched and stays the memoised seq of case 822 and 827. The Rust
      `expand/fuse.rs` has no such rule (frozen); the case headers say `stage: 2` (compiler/mirror-pending/P2-fuse-let.md). Measured: `scripts/bench/lazy-bound.fib` over 5e6
      elements, 1.39 s and 1.5 GB before, 0.05 s and 1.5 MB after.
+   * **The in-line rule (stage 2; docs/design/vec-performance.md item 2; cases 4208 to 4210, `compiler/tests/expand/fuseinline/check.sh`).** After the let
+     rule and before the fusing walk, `(mapv F c)`, `(vec (map F c))`, `(into [] (map F c))`, the same over a chain of `map` stages, and `(vec (map F a b))` (the
+     three-argument `map`, and `into []` of it), where every stage function is a symbol or a plain `fn` literal (no name, `->` or `:where`; parameters are symbols,
+     one per element; no `recur` outside a `loop` of its own; bodies of at most 200 nodes) and none of the bare names the loop uses is bound by the form or defined
+     by the module, become `(let ((s c) ..) (if (not fast) CALL LOOP))`: CALL is the call as written with `s` for the source (the fusing walk then makes it
+     recipes), LOOP counted loops over the arrays that hold each source (`span-count`, `span-array` of `Reducible`: a Vec's leaves and tail, an Array), with the
+     stage bodies in line (`(let ((x (array-get b i))) body)`, or `(g (array-get b i))` for a symbol), writing a fresh array per span that `vec-from-spans` makes
+     the Vec without a copy. The loop is taken when every source has spans and, for two, their spans start at the same indices (one span each, more than one
+     each, or an output of at most 32); otherwise CALL. The sources are evaluated first and in order (the stage functions are atomic, so nothing moves past an
+     effect); each stage runs once per element, innermost first, element by element, the first element before the loop (it fills the output arrays) and never
+     again; a trap is the stage's own at the same element. No closure, recipe or indirect call is left for a literal or a named function, so LLVM vectorises the
+     loop where the body allows (f64 arithmetic does; i64 arithmetic does not, its overflow checks are calls and early exits; a sum through `reduce` is not
+     rewritten). A symbol bound to a function value is called through it, as before.
    * **The dump** of a program that sees `fib.seq` shows the recipes and the gensyms `#fuse.N`; its format is unchanged (bootstrap §2, §5.3).
 
    **Not adopted.** The second revision's affine recipes (a value consumed once, a compile error on the second use) and the first
@@ -558,7 +571,7 @@ argument count (§7 L1), which is a property of a name, not of a value.
 
 | Protocol | Methods | Required by | Instances |
 |---|---|---|---|
-| `Reducible s e` | `each-while`, `size`, `nth` (traps out of range), `last`, `to-vec`, and, since P0, `to-lseq` (plan PC-13: a default through `to-vec`, overridden by `LSeq` itself, so that two lazy adaptors do not realise their source in full) | every sequence function and consumer | `Vec List Array MArray Option Map Set Range Iterate Repeat Cycle Chars str SubVec VSeq Queue SortedMap SortedSet Reversed FRange Matches Lines LSeq`, the recipe structs of the fused path (never values of a program, §2.1 rule 2), user types |
+| `Reducible s e` | `each-while`, `size`, `nth` (traps out of range), `last`, `to-vec`, and, since P0, `to-lseq` (plan PC-13: a default through `to-vec`, overridden by `LSeq` itself, so that two lazy adaptors do not realise their source in full); `span-count` and `span-array` (the arrays that hold the elements, for the in-line rule of §2.1 rule 2: a Vec its leaves and tail, 32 each but the last, an Array one; the default `-1` says there are none) | every sequence function and consumer | `Vec List Array MArray Option Map Set Range Iterate Repeat Cycle Chars str SubVec VSeq Queue SortedMap SortedSet Reversed FRange Matches Lines LSeq`, the recipe structs of the fused path (never values of a program, §2.1 rule 2), user types |
 | `Seqable c s` | `seq -> (Option s)`, `rest -> s` | `seq rest next` and the recursion idiom (§2.1 rule 8) | `Vec`, `SubVec` and `VSeq` (seq type `VSeq`), `List`, `Range`, `Iterate`, `Repeat`, `Cycle`, `LSeq` (each itself), `str` and `Chars` (a view that steps by a character); `Map Set Array MArray Option Queue SortedMap SortedSet Reversed Matches` (seq type `LSeq`), **one impl per head** ([R] A13 seqable; a blanket impl is rejected, A13 blanket) |
 | `Cursable s c`, `Cursor c e` | `cursor`; `advance!`, `current` | `zip interleave map/3 zipmap` (the second operand of the fused path) | `Vec Range Array MArray SubVec VSeq LSeq str` and their cursors; every recipe by buffering, and without a buffer for `Mapped Dropped Taken Zipped` after L16 |
 | `Lookup s k v` | `get -> (Option v)` | `get update find select-keys`, and a `Lookup` value in call position (§2.11) | `Map`; `Vec`, `SubVec`, `Array` and `MArray` (key `i64`; [R] A13 marray: `(get (int-array [1 2]) 0)` is `(some 1)`); `str` (key `i64`, value `char`); `SortedMap`; `(Option s)` after L16; user types |

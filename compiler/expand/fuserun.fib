@@ -17,7 +17,7 @@
 (ns expand.fuserun
   (:use syntax.pos syntax.form expand.error expand.types expand.ctx expand.core
         expand.private expand.expr expand.walk expand.top expand.fusetab expand.fusescan
-        expand.fuse expand.fuselet))
+        expand.fuse expand.fuselet expand.fuseinline))
 
 ;; A `:private` marker taken off a definition, and where it was.
 (defstruct Marker (at: i64 marker: Stx))
@@ -35,7 +35,7 @@
     (nil (restore body marker))
     ((some role)
      (let ((env (FuseEnv module (fuse-bound-names body))))
-       (match (walk (expander-fusing ctx (no-runner) env) (fuse-lets env body) role)
+       (match (walk (expander-fusing ctx (no-runner) env) (fuse-inline env ctx (fuse-lets env body)) role)
          ((Ok fused) (restore fused marker))
          ((Err _) (restore body marker)))))))
 
@@ -48,7 +48,7 @@
 ;; One top-level form, rewritten; as it was if it calls no terminal, is not
 ;; a definition with expressions, or its walk fails. (fuse_form)
 (defun fuse-form :private (form: Stx module: ModuleEnv ctx: ExpandCtx) -> Stx
-  (if (fuse-calls-a-terminal? form)
+  (if (or (fuse-calls-a-terminal? form) (fuse-calls-mapv? form))
       (match (marker-index form)
         ((some at)
          (let ((taken (take-marker form at)))
