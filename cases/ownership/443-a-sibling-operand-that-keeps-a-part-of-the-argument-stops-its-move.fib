@@ -1,0 +1,18 @@
+;; spec:   types §6.3 (the operands of a call are siblings; two-phase moves, docs/design/in-place-update.md §1)
+;; expect: accept
+;; result: 10
+;; audit:  clean
+;; A two-phase move hands a binding over at the call, after its sibling operands have read it, only when each of those operands
+;; holds nothing of it once evaluated (a scalar, or an owned value). Here the second operand, `(. s v)`, is a part of `s` with no
+;; count of its own, and `swap-in` takes `s` owned and writes the field in place when `s` is unique. Moved, `s` would reach it with
+;; count one, the write would free the vector that `old` still borrows, and `junk` (the same size, allocated after) would take its
+;; memory: 9 + 9. Retained, `s` has count two, the write copies, and `old` is the vector it was: 9 + 1.
+(defstruct Box (v: (Vec i64)))
+(defun build (n: i64 x: i64) -> (Vec i64) (loop [i 0 v []] (if (>= i n) v (recur (+ i 1) (conj v x)))))
+(defun swap-in (s: Box :owned old: (Vec i64)) -> i64
+  (let ((c (cell s)))
+    (do (set-field! &c v (build 3 7))
+        (let ((junk (build 3 9))) (+ (nth junk 0) (nth old 0))))))
+(defun main () -> i64
+  (let ((s (Box (build 3 1))))
+    (swap-in s (. s v))))

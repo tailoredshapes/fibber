@@ -804,6 +804,9 @@ spec/types.md §2.13.1 has the primitives.
    (so `vec-conj`, `vec-assoc`, `vec-pop`, `map-assoc` take their vector or map owned, and a caller that uses its value again
    retains it first), and the payload of a direct `(some x)` sub-pattern is a field slot of its shell and is taken out too.
    The methods `conj`, `assoc`, `dissoc` and `pop` declare `self :owned` (`lib/fib/coll/protocols.fib`) for the same reason.
+   `assoc` declares `val :owned` too: a generic caller's new value (a `let` of a type variable, a call's result) is
+   frame-owned, and at a borrowed `val` it made `(assoc m k (f x))` no tail site (types §6.10 rule (e)), which left `m`
+   borrowed in `update`, `update-or` and `update-opt` and every update of a unique collection a copy (case 4019).
 4a. **A constructor that is the last use of its shell is built in the shell** (shell reuse; `compiler/own/lastuse.fib`
    `record-reuse`, `compiler/emit/lower/objects.fib` `build-object`). When a function destructures a value with a
    constructor pattern and builds a value of the same variant, and nothing reads the shell afterwards, the emitted code

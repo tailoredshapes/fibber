@@ -63,6 +63,16 @@ included), consumed in two places:
 - **steal at last use** (C7, below): the consume of a pattern-bound field of an owning scrutinee, at that field's last use,
   when the scrutinee is dead afterwards.
 
+**Two-phase moves** (found 2026-10-23; Rust's two-phase borrows, `v.push(v.len())`). The operands of a call are siblings, and a
+read of a binding by one of them kept it live for all of them, so `(recur (+ i 1) (assoc v i (+ (nth v i) 1)))` retained `v` for
+`assoc` (count 2: a copy of the path, 370 ns against 16 ns in place). A binding read as itself by one operand is now at its last use
+there when nothing reads it after the call and every other operand that reads it is self-contained (its value a scalar or owned:
+it holds nothing of the binding once evaluated): the count is handed over at the call, after those reads (`own.lastuse`
+`record-two-phase`). An operand that is a part or an alias of the binding stops the move (case `ownership/443`); the other
+operands' reads are never last uses themselves, so the binding is handed over once (cases 384 to 390). Case `stdlib/4018`
+counts it. The same shape in a generic body (`update`, `update-or`, `update-opt`) was no tail site, so its collection stayed
+borrowed: `assoc` takes `val` `:owned` since (case `stdlib/4019`).
+
 ### Steal (C7 made dynamic)
 
 stdlib.md C7 says "a `match` on an owned shell that is dead afterwards moves the payload out". Moving out statically is

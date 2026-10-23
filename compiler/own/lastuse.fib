@@ -22,7 +22,9 @@
 ;;   inside it is therefore never last inside the loop unless the path leaves the loop;
 ;; - the other operands of a call (`ECall`, `EConcat`, `ESet`): a borrowed argument is a pointer into
 ;;   its site that stays pending until the call, so a read by any sibling operand, before or after, keeps
-;;   the site live (`pend` of `Lu`: the ids that count in the answer only, never in the flow);
+;;   the site live (`pend` of `Lu`: the ids that count in the answer only, never in the flow); except a
+;;   two-phase move: an operand that is the binding itself, whose siblings' reads of it are self-contained
+;;   (scalar or owned values, finished before the call), is the last use when nothing reads it after the call;
 ;; - an `&b` argument reads b at the call and again at the write-back;
 ;; - a `match` guard never moves, nor does an `async` body (suspension points), nor a binding some `fn` or
 ;;   `async` literal captures (a stack closure reads it when it is called, not when it is made), nor its
@@ -294,6 +296,36 @@
              (set! d (conj @d (+ (* (. e id) 64) i)))))
           (_ ()))))))
 
+;; Whether the operand c of a call holds nothing it read once it has been evaluated: its value is a scalar (or a peek, which
+;; no rule reads) or owned, with counts of its own.
+(defun self-contained? :private (u: Lu c: Expr) -> bool
+  (match (mode-of u c)
+    ((MScalar) true)
+    ((MOwned _) true)
+    (_ false)))
+
+;; Whether the operand c of a sibling form reads the binding b, as a whole or a part (phase A's `kids`).
+(defun reads-binding? :private (u: Lu c: Expr b: i64) -> bool
+  (let [r (get @(. (. u cx) kids) (. c id) (set-empty))]
+    (or (contains? r (* b 8)) (contains? r (+ (* b 8) 1)))))
+
+;; Phase B, two-phase moves (docs/design/in-place-update.md §1, "Two-phase moves"): the operand c_k of a call reads the binding b as itself;
+;; nothing reads b after the call (`after`, and the pending reads of the enclosing operands), and every other operand that reads
+;; b is self-contained: it is evaluated, and has let go of b, before the call takes its arguments. The count of b is handed over
+;; at the call, after those reads, so c_k is a last use (`(assoc v i (+ (nth v i) 1))`: v moves into `assoc`, which then finds it
+;; unique). The other operands' reads of b are never last uses themselves (b is in their flow or pending set): one hand-over.
+(defun record-two-phase :private (u: Lu cs: (Vec Expr) k: i64 after: (Set i64)) -> unit
+  (let [x (nth cs k)]
+    (match (Pair (. x kind) (mode-of u x))
+      ((Pair (ELocal _) (MBorrowed (SiteBind b)))
+       (when (and (none-live? u after [(some (* b 8)) (some (+ (* b 8) 1))])
+                  (not (contains? (. (. u cx) pinned) b))
+                  (every? (fn (j: i64) (let [c (nth cs j)]
+                                         (or (= j k) (not (reads-binding? u c b)) (self-contained? u c))))
+                          (range (count cs))))
+         (let [d (. (. u cx) dead)] (set! d (conj @d (. x id))))))
+      (_ ()))))
+
 ;; Phase B: the ids live before e, given those live after it; the answers filled on the way.
 (defun trav (u: Lu e: Expr live: (Set i64)) -> (Set i64)
   (do (record u e live)
@@ -303,9 +335,13 @@
         ((EFn lit) (uni live (capture-reads (. lit captures))))
         ((EAsync _ caps) (uni live (capture-reads caps)))
         ((ECall _ args)
-         (let [amps (amps-of args)]
+         (let [amps (amps-of args)
+               cs (expr-children e)
+               after (uni live amps)]
            (do (note-amps u e args)
-               (uni (trav-seq u (expr-children e) (uni live amps) true) amps))))
+               (when (. u fill)
+                 (doseq [k (range (count cs))] (record-two-phase u cs k after)))
+               (uni (trav-seq u cs after true) amps))))
         ((EConcat es) (trav-seq u es live true))
         ((ESet p _)
          (let [acc (trav-seq u (expr-children e) live true)]
