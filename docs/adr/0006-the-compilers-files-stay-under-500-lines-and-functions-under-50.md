@@ -20,7 +20,7 @@ to be written down, not an edit of the list.
 ## Consequences
 
 - Today's exceptions, honestly: `compiler/emit/runtime.fib` is generated from `rt/*.lir` (compiler/tests/emit/runtime.sh checks that it equals
-  what the generator makes), so the limit does not apply to it and it is excluded from the rule; `lib/prelude.fib` (721) is the
+  what the generator makes), so the limit does not apply to it and it is excluded from the rule; `lib/prelude.fib` (720) is the
   language's embedded prelude; `compiler/expand/ctx.fib` (525) is over by 25. Functions: `compiler/native/support.fib:mailbox-source`
   (333, a function that holds the text of a runtime source), and `compiler/types/lower/call.fib:special-kind` (52). (The `scenario` macro of `fib.test.core`, 73 lines while a macro could
   call no helper, left the list when MACRO-NS gave macros helpers at expansion time: docs/design/macro-names.md.)
@@ -33,7 +33,7 @@ to be written down, not an edit of the list.
 (limit "every .fib file of compiler/ and lib/ outside the tests has fewer than 500 lines (shrink-only allow-list)"
   (file-lengths repo ["compiler/**.fib" "lib/**.fib" "!compiler/tests/**" "!compiler/emit/runtime.fib"])
   499
-  ["compiler/expand/ctx.fib=525" "lib/prelude.fib=721"]
+  ["compiler/expand/ctx.fib=525" "lib/prelude.fib=720"]
   (plant-file "compiler/emit/zz-plant.fib" (join "\n" (mapv (fn (i: i64) ";; a line") (range 600))))
   (plant "compiler/expand/ctx.fib" "\n;; one line more than the list allows\n"))
 
