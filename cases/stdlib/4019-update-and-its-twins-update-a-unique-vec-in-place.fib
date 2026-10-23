@@ -1,0 +1,24 @@
+;; spec:   design/in-place-update.md §1, types §6.4 rule 2 and §6.10 rule (e), stdlib §2.5
+;; expect: accept
+;; result: 107919
+;; audit:  clean
+;; allocs: <= 6476
+;; roots:  ../../lib support
+;; covers: update update-or update-opt
+;; Case 4010 through the generic library functions: 1000 `update`, 1000 `update-or` and 1000 `update-opt` on a vector that nobody
+;; else holds. Each is a `defun` over Lookup and Assoc whose body ends in `(assoc m k (f ..))`. The checker decides a generic body
+;; once, a type variable taken as an object (types §6), so the new value was a frame-owned argument at the borrowed `val` of `assoc`:
+;; rule (e) made the call no tail site, `m` stayed borrowed (no rule 2), the body retained it for `assoc`, and every update copied its
+;; path: 9 objects each, 33476. `assoc` now takes `val` :owned (fib.coll.protocols), the call is a tail site, `m` is owned and moves
+;; into `assoc`, which finds the vector unique: the build alone, 6476.
+(ns main (:use fib.core fib.seq fib.coll))
+
+(defun big () -> (Vec i64) (vec (range 100000)))
+
+(defun at (i: i64) -> i64 (rem (* i 7919) 100000))
+
+(defun main () -> i64
+  (let ((a (loop ((i 0) (v (big))) (if (>= i 1000) v (recur (+ i 1) (update v (at i) (fn (x) (+ x 1)))))))
+        (b (loop ((i 0) (v a)) (if (>= i 1000) v (recur (+ i 1) (update-or v (at i) (fn (x) (+ x 1)) 0)))))
+        (c (loop ((i 0) (v b)) (if (>= i 1000) v (recur (+ i 1) (update-opt v (at i) (fn (x) (match x ((some y) (+ y 1)) (nil 1)))))))))
+    (+ (count c) (- (nth c 7919) (nth c 0)))))
