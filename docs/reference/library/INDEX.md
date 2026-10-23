@@ -12,10 +12,10 @@ All exports are pre-1.0; proposed S/E/I classes and “since” versions await e
 | [fib.autodiff](fib.autodiff.md) | 63 |
 | [fib.bigint](fib.bigint.md) | 28 |
 | [fib.char](fib.char.md) | 2 |
-| [fib.coll](fib.coll.md) | 26 |
+| [fib.coll](fib.coll.md) | 48 |
 | [fib.compress](fib.compress.md) | 52 |
 | [fib.compress.lz4](fib.compress.lz4.md) | 53 |
-| [fib.core](fib.core.md) | 90 |
+| [fib.core](fib.core.md) | 91 |
 | [fib.crypto](fib.crypto.md) | 59 |
 | [fib.datum](fib.datum.md) | 11 |
 | [fib.db](fib.db.md) | 27 |
@@ -39,7 +39,7 @@ All exports are pre-1.0; proposed S/E/I classes and “since” versions await e
 | [fib.log](fib.log.md) | 77 |
 | [fib.logic](fib.logic.md) | 35 |
 | [fib.logic.fd](fib.logic.fd.md) | 24 |
-| [fib.math](fib.math.md) | 43 |
+| [fib.math](fib.math.md) | 47 |
 | [fib.merkle](fib.merkle.md) | 24 |
 | [fib.os](fib.os.md) | 73 |
 | [fib.os.abi](fib.os.abi.md) | 4 |
@@ -50,7 +50,7 @@ All exports are pre-1.0; proposed S/E/I classes and “since” versions await e
 | [fib.print](fib.print.md) | 13 |
 | [fib.regex](fib.regex.md) | 31 |
 | [fib.rng](fib.rng.md) | 9 |
-| [fib.seq](fib.seq.md) | 101 |
+| [fib.seq](fib.seq.md) | 102 |
 | [fib.simd](fib.simd.md) | 5 |
 | [fib.sql](fib.sql.md) | 33 |
 | [fib.string](fib.string.md) | 28 |
