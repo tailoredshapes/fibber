@@ -2319,14 +2319,20 @@ facts only grow). What it buys is the callee's unique update: an owned parameter
 at the first write. The caller does not need to know the callee's body: its own `consume` decides the count it hands
 over (§6.3), and that is where the soundness of the whole lies:
 
-- a caller whose argument is **not** at its last use (a later read of the variable, a sibling operand that reads it, a
-  loop that reads it again, a closure that captures it) **retains**: the callee's count is two, the callee's write
-  finds the array shared and copies, and the caller's array is untouched: correct and slower (case 313 passes the
-  array on and reads it afterwards, case 316 reads it in a sibling operand);
+- a caller whose argument is **not** at its last use (a later read of the variable, a sibling operand that reads it and
+  whose value is an alias or a part of it, a loop that reads it again, a closure that captures it) **retains**: the
+  callee's count is two, the callee's write finds the array shared and copies, and the caller's array is untouched:
+  correct and slower (case 313 passes the array on and reads it afterwards, case 316 reads it in a sibling operand of
+  an enclosing call, after this one, case 443 passes a part of it beside it);
 - a caller whose argument is at its last use **moves** its count: no other holder, a unique callee updates in place and the
   caller cannot observe it because it never reads the variable again (the last-use machinery of lever L1,
   own.lastuse: reading a binding, an alias of it or a derived part of it later, on any path, a loop's next
-  iteration included, makes the use not last);
+  iteration included, makes the use not last). An argument that is the variable itself is at its last use when nothing
+  reads the variable after the call and every sibling operand that reads it is a scalar or `Owned`: such an operand
+  has finished with the variable, and holds nothing of it, before the call takes its arguments, so the count is
+  handed over at the call, as a tail call hands its arguments over after evaluating them all (§6.10 step 2). This is a
+  **two-phase move** (`(assoc v i (+ (nth v i) 1))` moves `v`; case `stdlib/4018`); the siblings' own reads are then not
+  last uses, so the variable is handed over once (cases 384 to 390);
 - a shared array (a count of two or more, or `SHARED`, `STACK`, `IMMORTAL`, `HAS-WEAK`, §6.6) is copied by the callee
   whoever passed it (cases 314, 318);
 - a task or an atom never lets an array be unique while another holder can read it: what `spawn`, `reset!` and `swap!`

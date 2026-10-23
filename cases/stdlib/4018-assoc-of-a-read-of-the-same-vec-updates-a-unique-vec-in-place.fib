@@ -1,0 +1,21 @@
+;; spec:   design/in-place-update.md §1 (two-phase moves), types §6.3 (the operands of a call are siblings), stdlib §2.5
+;; expect: accept
+;; result: 107919
+;; audit:  clean
+;; allocs: <= 6476
+;; roots:  ../../lib support
+;; covers: assoc nth
+;; Case 4010 with the new value read from the vector itself: `(recur (+ i 1) (assoc v k (+ (nth v k) 1)))`. The third operand of
+;; `assoc` reads `v` but its value is a scalar, evaluated before the call takes its arguments, so `v` is at its last use as the first
+;; operand and its count moves into `assoc` (a two-phase move), which finds the vector unique and updates it in place: the build alone,
+;; 6476 objects. Before two-phase moves the sibling read kept `v` live, the first operand was retained, every `assoc` saw a count of two and copied
+;; its path, 9 objects each: 15476. Case 4016 holds the shared case; case 4019 holds the operand that keeps a part of `v` (no move).
+(ns main (:use fib.core fib.seq fib.coll))
+
+(defun big () -> (Vec i64) (vec (range 100000)))
+
+;; 1000 read-and-assoc on a vector that nobody else holds
+(defun main () -> i64
+  (let ((v (loop ((i 0) (v (big)))
+             (if (>= i 1000) v (let ((k (rem (* i 7919) 100000))) (recur (+ i 1) (assoc v k (+ (nth v k) 1))))))))
+    (+ (- (count v) (nth v 0)) (nth v 7919))))
