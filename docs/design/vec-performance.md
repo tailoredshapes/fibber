@@ -59,7 +59,7 @@ LLVM, so the array columns are a floor, not a fair scalar stencil (a scalar sten
 | `assoc` loop on a unique Vec (i64 / i8 / f64) | 71 110 / 70 222 / 71 046 | 20 283 / 20 912 / 20 755 | **0** | **yes** |
 | `array-set!` twin | 465 / 24 / 519 | 456 / 24 / 513 | 0 | |
 | `conj` loop building a Vec (i64 / i8) | 23 722 / 24 162 | 11 452 / 11 573 | 0.29 per element (9.3 per leaf; 5.8 at depth 1, +1 per decade of size) | tail in place; shell and path partly allocated |
-| `array-push!` twin | 2 643 / 998 | 2 569 / 806 | ~0 | |
+| `array-push!` twin (the bench's twin is now `array-grow`, a doubling array of `array-set!` and `array-blit!`, ADR 0015: 5 052 / 1 042 where `array-push!` gave 3 471 / 916 in the same run) | 2 643 / 998 | 2 569 / 806 | ~0 | |
 | `mapv` over a Vec (i64) | 17 373 | 8 112 | 0.065 (2 per leaf) | bulk builder |
 | array loop twin | 1 401 | 836 | | |
 | pipeline `(reduce + 0.0 (mapv f (range -3 4)))` | 249 184 | 121 631 | **11 per pipeline** | |

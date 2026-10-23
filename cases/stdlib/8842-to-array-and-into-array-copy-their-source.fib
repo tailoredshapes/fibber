@@ -1,0 +1,38 @@
+;; spec:   stdlib §2.11 (Arrays: `vec`, `to-array` and `aclone` copy), §4.1 rows to-array into-array to-array-2d
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: to-array into-array to-array-2d
+;; to-array and into-array make an (MArray e) of any source's elements, a copy: a write to the array is not seen by the Vec it came
+;; from, nor by the Array or MArray it came from, and `vec` of the array is a copy the next write does not reach. An empty Array
+;; gives an empty MArray. to-array-2d is an array of arrays. The allerbees report wrote (array-len (to-array [1 2 3])): the page's
+;; to-array answers an MArray, so its length is alength (array-len is the value form, §3 N12).
+(ns main (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (v [1 2 3]) (arr (array 2 "s")))
+    (let ((a (to-array v)) (b (into-array (list 4 5))) (d (to-array arr)) (e (to-array (range 5))))
+      (do (check c (= (alength a) 3))
+          (check c (= (alength (into-array [1 2 3])) 3))
+          (aset a 0 9)
+          (check c (= v [1 2 3]))
+          (check c (= (vec a) [9 2 3]))
+          (let ((snap (vec a)))
+            (do (aset a 1 8) (check c (= snap [9 2 3]))))
+          (check c (= (vec b) [4 5]))
+          (aset d 0 "t")
+          (check c (= (array-get arr 0) "s"))
+          (check c (= (vec d) ["t" "s"]))
+          (let ((d2 (to-array d)))
+            (do (aset d2 1 "u") (check c (= (vec d) ["t" "s"]))))
+          (check c (= (vec e) [0 1 2 3 4]))
+          (check c (= (alength (to-array (array 0 0))) 0))
+          (check c (= (vec (to-array #{7})) [7]))
+          (let ((g (to-array-2d [[1 2] [3]])))
+            (do (check c (= (alength g) 2))
+                (check c (= (vec (aget g 0)) [1 2]))
+                (aset (aget g 1) 0 6)
+                (check c (= (vec (aget g 1)) [6]))))
+          (checks-result c)))))

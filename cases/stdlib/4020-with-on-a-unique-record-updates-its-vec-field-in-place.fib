@@ -1,0 +1,25 @@
+;; spec:   types §6.3 ("Field moves", the `with` take), design/in-place-update.md L6, stdlib §2.5
+;; expect: accept
+;; result: 107919
+;; audit:  clean
+;; allocs: <= 6477
+;; roots:  ../../lib support
+;; covers: with assoc nth
+;; Case 4018 with the vector held by a record: 1000 `(with e (xs (assoc (. e xs) k (+ (nth (. e xs) k) 1))))` on a record that nobody
+;; else holds. The new value of `xs` reads the old one twice; `with` reads it once into a `let`, and as the record is named nowhere else
+;; in the update the checker serves that read from the `with` cell: the record moves into the cell, the field moves out of it (its slot
+;; nulled), `assoc` finds the vector unique and writes it in place, and `set-field!` refills the slot of the same record. The build
+;; alone, 6476 objects, and the record: 6477. Before the take the update read `e` after `(cell e)`, so the cell held a second count: every
+;; update copied the record and the vector's path, 10 objects each: 16477. Case 4021 holds the shared and the declined cases.
+(ns main (:use fib.core fib.seq fib.coll))
+
+(defrecord Box [n: i64 xs: (Vec i64)])
+
+(defun bump (e: Box k: i64) -> Box
+  (with e (xs (assoc (. e xs) k (+ (nth (. e xs) k) 1)))))
+
+(defun main () -> i64
+  (let ((b (loop ((i 0) (e (->Box 0 (vec (range 100000)))))
+             (if (>= i 1000) e (recur (+ i 1) (bump e (rem (* i 7919) 100000))))))
+        (v (. b xs)))
+    (+ (count v) (- (nth v 7919) (nth v 0)))))

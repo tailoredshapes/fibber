@@ -1,0 +1,21 @@
+;; spec:   spec/types.md §6.3 (E2: `(array n e)` stores n copies), §8.6
+;; expect: accept
+;; result: 4
+;; audit:  clean
+;; `(array n e)` stores the count it is handed in element 0 and retains `e` once for each further element. With `n` 0 there is no
+;; element, so the handed count must be released: before, nobody held it and the object leaked (the audit counted 3 live objects at
+;; exit). Into an empty array: a box moved in, a box retained from a variable that is read afterwards (through a function, and with a
+;; length computed at run time), and a string; then arrays of one and two elements of that variable, whose counts the elements hold.
+(defstruct Box (n: i64))
+
+(defun empty-of (b: Box) -> i64 (array-len (array 0 b)))
+
+(defun main () -> i64
+  (let ((b (Box 1)))
+    (+ (array-len (array 0 (Box 2)))
+       (empty-of b)
+       (array-len (array 0 (str-concat "a" "b")))
+       (array-len (array 1 b))
+       (. b n)
+       (array-len (array (- (. b n) 1) b))
+       (array-len (array 2 b)))))

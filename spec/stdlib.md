@@ -258,7 +258,7 @@ Rules:
      `filter`, `remove`, `keep`, `take` or `take-while` steps among its `map`s (one source, held in arrays or a range call; a filter, remove or
      take-while needs a module that sees fib.core, for `truthy?`), become one loop over the source that applies the steps in line, innermost
      first, and appends what comes through: the first output element starts a builder (`vec-build-first`, then `vec-build-push` and
-     `vec-build-done` of the prelude, vec-collect's builder without its visitor) in a second copy of the loop. A filter is `(if (truthy? P[x])
+     `vec-build-done` of fib.seq: spans of 32 filled in place, made the Vec by `vec-from-spans`) in a second copy of the loop. A filter is `(if (truthy? P[x])
      .. skip)`, a remove the same with the arms swapped, a keep `(match F[x] (nil skip) ((some y) ..))`, a take-while `(if (truthy? P[x]) ..
      end)`, a take a count in a loop variable: the walk ends after the element that makes it, without asking the source for one more, as
      Taken and TakenWhile end it, and a take whose count is at most 0 asks nothing. A count that is not atomic (the recipe rewrite takes

@@ -4,7 +4,9 @@
 ;; is linked: `dynamic` (`-lLIB`, resolved when the program starts), or `static` (`-l:libLIB.a`, the archive bundled into the executable). Per library: `--link LIB=MODE`
 ;; (FIB_LINK, a comma-separated list); for all: `--link-mode MODE` (FIB_LINK_MODE); else static in a `--static` build (a static executable has no loader to resolve
 ;; anything with) and dynamic in any other.
-(ns native.libraries (:require [fib.string :as s]))
+(ns native.libraries (:require [fib.string :as s] [native.libsearch :as search] [llvm.ffi :as ffi] [llvm.support :as support]))
+
+(extern dlerror :private () -> ptr)
 
 (defstruct LinkLib (name: str module: str))
 
@@ -58,13 +60,65 @@
           ((Err m) (Err m))
           ((Ok mode) (recur (+ i 1) (conj out (if (= mode "static") (str ":lib" (. (nth ls i) name) ".a") (. (nth ls i) name)))))))))
 
+;; As `lib-words`, for a link that also searches `dirs` (`-L`): a dynamic library whose development link `libLIB.so` is nowhere but whose versioned file
+;; `libLIB.so.N` is (native.libsearch) is linked by that file, `:libLIB.so.N`, which the linker finds in `dirs` and its own directories.
+(defun lib-words-in (ls: (Vec LinkLib) dirs: (Vec str)) -> (Result (Vec str) str)
+  (match (lib-words ls)
+    ((Err m) (Err m))
+    ((Ok words) (Ok (mapv (fn (w: str) (dynamic-word w dirs)) words)))))
+
+(defun dynamic-word :private (w: str dirs: (Vec str)) -> str
+  (if (or (starts-with? w ":") (some? (str-find w "/" 0)))
+      w
+      (match (search/find-lib w (search/search-dirs dirs))
+        ((some f) (if (. f versioned) (str ":" (. f file)) w))
+        (nil w))))
+
+;; The libraries loaded into this process for the JIT (`run`, `run --live`, `repl`), as an executable's loader would load them: the development link
+;; by the dynamic linker's own search, else the file native.libsearch finds (a versioned `libLIB.so.N`); `:FILE` is the file itself. The first library
+;; that cannot be loaded is the error, with the module that declared it and what was tried. A library loaded once stays (LLVMLoadLibraryPermanently):
+;; the JIT's search of the process (llvm.orc) and the names rules (llvm.support `process-defines?`) then find its symbols.
+(defun load-for-jit (ls: (Vec LinkLib)) -> (Result unit str)
+  (loop ((i 0))
+    (if (>= i (count ls))
+        (Ok ())
+        (match (load-one (nth ls i))
+          ((Err m) (Err m))
+          ((Ok _) (recur (+ i 1)))))))
+
+(defun load-one :private (l: LinkLib) -> (Result unit str)
+  (let ((name (. l name)) (needs (str "fibc: module " (. l module) " needs the native library " (. l name) " (declared by `:lib \"" (. l name) "\"` on its externs): ")))
+    (cond (libc-part? name) (Ok ())
+          (starts-with? name ":") (match (load-path (str-slice name 1 (str-len name))) ((Ok _) (Ok ())) ((Err e) (Err (str needs "cannot load it: " e))))
+          (match (load-path (search/dev-name name)) ((Ok _) true) ((Err _) false)) (Ok ())
+          :else (let ((dirs (search/search-dirs [])))
+                  (load-first (search/candidates name dirs) (str needs "not found to load for the JIT; looked for " (search/tried-text name dirs)) needs)))))
+
+;; The first of `fs` that loads; `none` when there are none, the reasons of all that failed otherwise.
+(defun load-first :private (fs: (Vec search/Found) none: str needs: str) -> (Result unit str)
+  (loop ((i 0) (why []))
+    (cond (>= i (count fs)) (Err (if (empty? why) none (str needs "cannot load it: " (str-join (vec (interpose "; " why))))))
+          :else (match (load-path (str (. (nth fs i) dir) "/" (. (nth fs i) file)))
+                  ((Ok _) (Ok ()))
+                  ((Err e) (recur (+ i 1) (conj why e)))))))
+
+;; dlopen of `path` for good, global, by LLVM (so that its process search sees it); the loader's reason when it fails.
+(defun load-path :private (path: str) -> (Result unit str)
+  (let ((p (ffi/bytes-new path))
+        (failed (unsafe (support/LLVMLoadLibraryPermanently p))))
+    (do (ffi/free-addr (ffi/ptr->addr p))
+        (if (= failed 0i32)
+            (Ok ())
+            (let ((e (unsafe (ffi/ptr->addr (dlerror)))))
+              (Err (if (= e 0) path (ffi/c-string-at e))))))))
+
 ;; A failed link's text with what a declaration can add: for each declared library the linker could not find (`cannot find -lLIB`, `-l:libLIB.a`), the module that needs it.
 (defun explain-failure (m: str ls: (Vec LinkLib)) -> str
-  (let ((missing (filter (fn (l: LinkLib) (or (some? (str-find m (str "cannot find -l" (. l name)) 0)) (some? (str-find m (str "cannot find -l:lib" (. l name) ".a") 0)))) ls)))
+  (let ((missing (filter (fn (l: LinkLib) (or (some? (str-find m (str "cannot find -l" (. l name)) 0)) (some? (str-find m (str "cannot find -l:lib" (. l name) ".") 0)))) ls)))
     (if (empty? missing)
         m
         (str m (str-join (mapv (fn (l: LinkLib) (str "\nfibc: module " (. l module) " needs the native library " (. l name) " (declared by `:lib \"" (. l name) "\"` on its externs): not found; "
-                                                   "install it (the development package: lib" (. l name) ".so for a dynamic link, lib" (. l name) ".a for --link " (. l name) "=static or --static) or give its directory with -L DIR")) missing))))))
+                                                   "install it (lib" (. l name) ".so, or the versioned lib" (. l name) ".so.N, for a dynamic link, lib" (. l name) ".a for --link " (. l name) "=static or --static) or give its directory with -L DIR")) missing))))))
 
 ;; Frontend metadata keeps libraries out of the generated instruction stream.
 (defun from-notes (notes: (Vec (Pair str str))) -> (Vec LinkLib)

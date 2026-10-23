@@ -21,7 +21,7 @@ ex=(--export add --export widths --export narrow --export scale --export half32 
 [ -s "$d/build.err" ] && { echo "--- build stderr:"; head -c 800 "$d/build.err"; }
 ck "install name" "$(otool -D "$d/libkernels.dylib" | tail -n 1)" "@rpath/libkernels.dylib"
 ck "nm -gU: exactly the exports" "$(nm -gU "$d/libkernels.dylib" | awk '{print $3}' | sort | tr '\n' ' ')" \
-   "_add _banner _both _count_bytes _dot _echo _empty_str _greet _half32 _iota _join2 _mixed _narrow _scale _sum_squares _widths "
+   "_add _banner _both _count_bytes _dot _echo _empty_str _fib_error _fib_status _greet _half32 _iota _join2 _mixed _narrow _scale _sum_squares _widths "
 ck "module.modulemap" "$(cat "$d/module.modulemap")" 'module kernels {
   header "kernels.h"
   export *

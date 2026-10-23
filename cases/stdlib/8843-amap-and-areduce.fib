@@ -1,0 +1,27 @@
+;; spec:   stdlib §4.1 rows amap areduce
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: amap areduce
+;; (amap a i ret expr) is a loop with aset over an aclone of a, as Clojure's: a is unchanged, and expr may read ret, which holds
+;; the new values below i. (areduce a i ret init expr) folds over the indexes. a is evaluated once in each.
+(ns main (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (a (long-array [1 2 3 4])) (n (cell 0)))
+    (let ((m (amap a i ret (* 10 (aget a i))))
+          (p (amap a i ret (if (= i 0) (aget a 0) (+ (aget ret (- i 1)) (aget a i)))))
+          (s (areduce a i acc 0 (+ acc (aget a i))))
+          (mx (areduce a i best 0 (if (> (aget a i) best) (aget a i) best)))
+          (once (areduce (do (set! n (+ @n 1)) a) i acc 0 (+ acc i))))
+      (do (check c (= (vec m) [10 20 30 40]))
+          (check c (= (vec a) [1 2 3 4]))
+          (check c (= (vec p) [1 3 6 10]))
+          (check c (= s 10))
+          (check c (= mx 4))
+          (check c (= once 6))
+          (check c (= @n 1))
+          (check c (= (areduce (long-array 0) i acc 7 (+ acc 1)) 7))
+          (checks-result c)))))

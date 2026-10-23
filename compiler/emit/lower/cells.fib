@@ -325,6 +325,39 @@
                                (nth (. at tys) (. at index)))))))
       (_ (Err "set-field! on a non-cell")))))
 
+;; `(take-field! &s f)`: the field moved out of the struct in the cell (§2.13.1). An object field of a struct that `fib.unique?` holds of is
+;; loaded and its slot nulled, the count travelling with the value (the `set-field!` that refills the slot releases the null); of any other
+;; struct it is retained and the struct is not touched. A `dyn` field is retained, a scalar one read.
+(defun lcx-take-field (cx: LowerCx b: i64 f: str) -> (Result V str)
+  (try-let ((cell (lcx-local cx b)) (cell-ty (lcx-binding-ty cx b)))
+    (match cell-ty
+      ((TCon (KCell) cargs)
+       (let ((st (nth cargs 0)))
+         (try-let ((at (field-at cx st "take-field!" f)) (co (lcx-object-of cx cell-ty)) (so (lcx-object-of cx st))
+                   (content (cell-load cx (. co sname) (v-expr cell) st)) (elt (program-lir (. cx p) (nth (. at tys) (. at index)))))
+           (let ((field (lcx-gep cx (. so sname) (v-expr content) (. at slot))))
+             (match elt
+               (nil (Ok VUnit))
+               ((some (LirPtr)) (Ok (take-slot cx content field)))
+               ((some (LirDyn)) (let ((v (lcx-load cx LirDyn field))) (do (lcx-retain cx v) (Ok v))))
+               ((some t) (Ok (lcx-load cx t field))))))))
+      (_ (Err "take-field! on a non-cell")))))
+
+;; The pointer in `field` of the struct `content`: nulled when the struct is unique, else retained.
+(defun take-slot :private (cx: LowerCx content: V field: la/LExpr) -> V
+  (let ((b (. cx b)) (v (lcx-load cx LirPtr field))
+        (unique (fb-val (. cx b) (nx/call "fib.unique?" [(v-expr content)]) LirI1))
+        (ltk (fb-label (. cx b) "take")) (lk (fb-label (. cx b) "take-shared")) (lj (fb-label (. cx b) "taken")))
+    (do (fb-term b (nx/conditional (v-expr unique) ltk lk))
+        (fb-open b ltk)
+        (fb-stmt b (nx/store (nx/null) field nil))
+        (fb-term b (nx/branch lj))
+        (fb-open b lk)
+        (lcx-retain cx v)
+        (fb-term b (nx/branch lj))
+        (fb-open b lj)
+        v)))
+
 ;; The unique-write protocol shared by `set-field!` and `array-set!` on a fixed-layout object: in place when unique, else copy, write,
 ;; store the copy, release the old. Rust: lower/cells.rs:320 LowerCx::unique_write
 (defun lcx-unique-write (cx: LowerCx cell-s: str cell: la/LExpr content: V sname: str tid: i64 size: i64 slot: i64 x: V elem-ty: Ty) -> (Result V str)

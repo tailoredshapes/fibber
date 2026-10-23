@@ -1,0 +1,138 @@
+;; fib.coll.marray: Clojure's mutable arrays, the shared `(MArray t)` (stdlib §2.11 "Arrays", §3 N12, §4.1 rows aget aset alength aclone
+;; make-array long-array double-array float-array short-array int-array byte-array boolean-array char-array object-array to-array
+;; into-array to-array-2d amap areduce MArray). Exports MArray and make-marray (the page's own example, §2.11), the functions of the
+;; rows, the macros make-array amap areduce, and the protocols of the typed constructors' arguments (ArraySource, ArrayChar, ArrayBool,
+;; whose methods are public because a protocol's are). Replaces nothing in the prelude.
+;; An MArray is a struct around a `(Cell (Array t))`, as the page writes it: every holder of the struct holds the one cell, so a write
+;; through `aset` is seen by all of them, inside one task; it holds a Cell, so it is not Send and cannot be a `def` (§5 M1, M2).
+;; `aset` is `array-set!` through the cell (not one of the in-place primitives of ADR 0015): in place while the cell holds the only
+;; reference to the array, a copy otherwise (a walk that is reading the old one keeps it).
+;;
+;; Decided here, where the page is silent:
+;;  - `aset` answers unit (the row's signature), where Clojure's answers the value; `aget` and `aset` out of range trap as `array-get`
+;;    and `array-set!` do.
+;;  - The two forms of `long-array` .. `char-array` (a length or a source) are told apart by the protocol ArraySource: i64 is a
+;;    length, and Vec, List, Array, MArray, LSeq, Set, Option, Range and str are sources. A source's elements are converted by the
+;;    array's conversion (`long`, `double`, `float`, `short`, `int`, `byte`), so `(long-array [1.5 2.5])` is `[1 2]`, as Clojure's;
+;;    `char-array` and `boolean-array` take their own type or an i64, cast as Clojure's RT does (a code point; any number is true).
+;;  - `to-array`, `into-array` and `to-array-2d` copy (§2.11). An array needs an element to be made, and an empty source of a
+;;    type that is not an Array has none: those three trap `to-array: an empty source` for it (case 8847, open). An empty Array or
+;;    MArray source gives an empty MArray.
+;;  - `into-array` takes the source only, as the row writes it (the type argument of Clojure's two-argument form is the element
+;;    type, which the source already fixes).
+;;  - `make-array` reads its type argument as written: i8 i16 i32 i64 f32 f64 bool char give a zeroed array, any other type T an
+;;    `(MArray (Option T))` of nil (the row). The Java spellings `Long/TYPE` and the like are not read.
+;;  - An MArray is Reducible, Seqable, Cursable, Lookup and Keyed by index (the row): each walks the array the cell holds when it
+;;    starts, so a write during the walk is not seen by it.
+(ns fib.coll.marray (:use fib.core fib.seq fib.coll.protocols))
+
+(defstruct (MArray t) (c: (Cell (Array t))))
+
+(defun make-marray (n: i64 x: t) -> (MArray t) (MArray (cell (array n x))))
+
+(defun aget (a: (MArray t) i: i64) -> t (let ((c (. a c))) (array-get @c i)))
+(defun aset (a: (MArray t) i: i64 x: t) -> unit (let ((c (. a c))) (array-set! &c i x)))
+(defun alength (a: (MArray t)) -> i64 (let ((c (. a c))) (array-len @c)))
+(defun aclone (a: (MArray t)) -> (MArray t)
+  (let ((c (. a c))) (MArray (cell (array-copy @c 0 (array-len @c))))))
+
+;; ---- the copy of a source: its spans when it has them, else its elements one by one ----
+(defun array-of-source :private (c: c) :where ((Reducible c e)) -> (Array e)
+  (let ((n (size c)))
+    (cond (= (span-count c) 1) (let ((s (span-array c 0))) (array-copy s 0 (array-len s)))
+          (= n 0) (trap "to-array: an empty source")
+          :else (let ((out (cell (array n (nth c 0)))) (i (cell 0)))
+                  (do (each-while c (fn (x) (do (array-set! &out @i x) (set! i (+ @i 1)) true)))
+                      @out)))))
+
+(defun to-array (c: c) :where ((Reducible c e)) -> (MArray e) (MArray (cell (array-of-source c))))
+(defun into-array (c: c) :where ((Reducible c e)) -> (MArray e) (MArray (cell (array-of-source c))))
+(defun to-array-2d (c: c) :where ((Reducible c s) (Reducible s e)) -> (MArray (MArray e))
+  (to-array (map to-array c)))
+
+;; ---- the typed constructors: a length, or a source whose elements are converted ----
+(defprotocol (ArraySource s e)
+  (source-length (self) -> i64)
+  (source-each (self k: (fn (e) bool) :borrow) -> bool))
+(impl (ArraySource i64) i64 (source-length (self) self) (source-each (self k) true))
+(impl (ArraySource a) (Vec a) (source-length (self) (size self)) (source-each (self k) (each-while self k)))
+(impl (ArraySource a) (List a) (source-length (self) (size self)) (source-each (self k) (each-while self k)))
+(impl (ArraySource a) (Array a) (source-length (self) (size self)) (source-each (self k) (each-while self k)))
+(impl (ArraySource a) (MArray a) (source-length (self) (size self)) (source-each (self k) (each-while self k)))
+(impl (ArraySource a) (LSeq a) (source-length (self) (size self)) (source-each (self k) (each-while self k)))
+(impl (ArraySource a) (Set a) (source-length (self) (size self)) (source-each (self k) (each-while self k)))
+(impl (ArraySource a) (Option a) (source-length (self) (size self)) (source-each (self k) (each-while self k)))
+(impl (ArraySource char) str (source-length (self) (size self)) (source-each (self k) (each-while self k)))
+(impl (ArraySource t) (Range t) :where ((Num t) (Ord t) (Unit t) (RangeLen t))
+  (source-length (self) (size self)) (source-each (self k) (each-while self k)))
+
+;; n copies of z for a length; z overwritten by the converted elements for a source
+(defun fill-marray :private (x: s z: q f: (fn (e) q)) :where ((ArraySource s e)) -> (MArray q)
+  (let ((out (cell (array (source-length x) z))) (i (cell 0)))
+    (do (source-each x (fn (y) (do (array-set! &out @i (f y)) (set! i (+ @i 1)) true)))
+        (MArray out))))
+
+(defun long-array (x: s) :where ((ArraySource s e) (ToLong e)) -> (MArray i64) (fill-marray x 0 (fn (y: e) (long y))))
+(defun double-array (x: s) :where ((ArraySource s e) (ToDouble e)) -> (MArray f64) (fill-marray x 0.0 (fn (y: e) (double y))))
+(defun float-array (x: s) :where ((ArraySource s e) (ToFloat e)) -> (MArray f32) (fill-marray x 0.0f32 (fn (y: e) (float y))))
+(defun short-array (x: s) :where ((ArraySource s e) (ToShort e)) -> (MArray i16) (fill-marray x 0i16 (fn (y: e) (short y))))
+(defun int-array (x: s) :where ((ArraySource s e) (ToInt e)) -> (MArray i32) (fill-marray x 0i32 (fn (y: e) (int y))))
+(defun byte-array (x: s) :where ((ArraySource s e) (ToByte e)) -> (MArray i8) (fill-marray x 0i8 (fn (y: e) (byte y))))
+
+;; the elements of a char-array and a boolean-array: a char and a bool are themselves; an i64 element is Clojure's cast
+;; (RT.charCast: the code point; RT.booleanCast: any number is true)
+(defprotocol ArrayChar (array-char (self) -> char))
+(impl ArrayChar char (array-char (self) self))
+(impl ArrayChar i64 (array-char (self) (char self)))
+(defun char-array (x: s) :where ((ArraySource s e) (ArrayChar e)) -> (MArray char) (fill-marray x (char 0) (fn (y: e) (array-char y))))
+(defprotocol ArrayBool (array-bool (self) -> bool))
+(impl ArrayBool bool (array-bool (self) self))
+(impl ArrayBool i64 (array-bool (self) true))
+(defun boolean-array (x: s) :where ((ArraySource s e) (ArrayBool e)) -> (MArray bool) (fill-marray x false (fn (y: e) (array-bool y))))
+
+(defun object-array (n: i64) -> (MArray (Option a)) (MArray (cell (array n nil))))
+
+;; (make-array T n): zeros for a scalar type, nil for any other
+(defmacro make-array (t n)
+  (let ((s (match t ((Sym s) s) (_ "")))
+        (gn (gensym "n")))
+    (cond (= s "i64") `(fib.coll/make-marray ~n 0)
+          (= s "i32") `(fib.coll/make-marray ~n 0i32)
+          (= s "i16") `(fib.coll/make-marray ~n 0i16)
+          (= s "i8") `(fib.coll/make-marray ~n 0i8)
+          (= s "f64") `(fib.coll/make-marray ~n 0.0)
+          (= s "f32") `(fib.coll/make-marray ~n 0.0f32)
+          (= s "bool") `(fib.coll/make-marray ~n false)
+          (= s "char") `(fib.coll/make-marray ~n (fib.core/char 0))
+          :else `(let ((~gn ~n)) ((fn (none: (Option ~t)) (fib.coll/make-marray ~gn none)) nil)))))
+
+;; (amap a i ret expr): ret is a clone of a, and expr is stored at each index i of it, in order
+(defmacro amap (a i ret expr)
+  (let ((ga (gensym "a")) (n (gensym "n")))
+    `(let ((~ga ~a))
+       (let ((~ret (fib.coll/aclone ~ga)) (~n (fib.coll/alength ~ga)))
+         (do (loop ((~i 0)) (if (< ~i ~n) (do (fib.coll/aset ~ret ~i ~expr) (recur (+ ~i 1))) ()))
+             ~ret)))))
+
+;; (areduce a i ret init expr): ret starts at init and is expr at each index i, in order
+(defmacro areduce (a i ret init expr)
+  (let ((ga (gensym "a")) (n (gensym "n")))
+    `(let ((~ga ~a))
+       (let ((~n (fib.coll/alength ~ga)))
+         (loop ((~i 0) (~ret ~init)) (if (< ~i ~n) (recur (+ ~i 1) ~expr) ~ret))))))
+
+;; ---- the protocols of the row: each reads the array the cell holds now ----
+(defun marray-now :private (a: (MArray t)) -> (Array t) (let ((c (. a c))) @c))
+(impl (Reducible a) (MArray a)
+  (each-while (self k) (each-while (marray-now self) k))
+  (size (self) (alength self))
+  (nth (self i) (nth (marray-now self) i))
+  (last (self) (last (marray-now self)))
+  (span-count (self) 1)
+  (span-array (self j) (if (= j 0) (marray-now self) (trap "span-array: index out of range"))))
+(impl (Seqable (LSeq a)) (MArray a)
+  (seq (self) (seq (marray-now self)))
+  (rest (self) (rest (marray-now self))))
+(impl (Cursable (ArrayCur a)) (MArray a) (cursor (self) (cursor (marray-now self))))
+(impl (Keyed i64) (MArray a) (contains? (self i) (and (>= i 0) (< i (alength self)))))
+(impl (Lookup i64 a) (MArray a) (get (self i) (get (marray-now self) i)))

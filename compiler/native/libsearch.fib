@@ -1,0 +1,109 @@
+;; compiler/native/libsearch.fib: where the shared library of `(extern f .. :lib "NAME")` is (spec/syntax.md 3.15), for `build` and for the JIT of `run`.
+;; A library is found the way the dynamic linker finds one: the development link `libNAME.so` (`libNAME.dylib` on macOS) first; when only the versioned
+;; file is installed (`libNAME.so.7`, the runtime package without the development one), the highest version in the first directory that has one. The
+;; directories are those the command gave (`-L`), LD_LIBRARY_PATH (and LIBRARY_PATH, the linker's), the ones /etc/ld.so.conf lists (with its includes),
+;; then the system's own. A `:lib ":FILE"` names the file itself, as the linker's `-l:FILE`.
+(ns native.libsearch (:require [fib.string :as s] [fib.os.directories :as dirs] [fib.os.platform.detect :as plat]))
+
+(defun darwin? :private () -> bool
+  (= (plat/name (plat/current)) "Darwin"))
+
+;; The development name of the library: `libNAME.so`, `libNAME.dylib` on macOS.
+(defun dev-name (name: str) -> str
+  (str "lib" name (if (darwin?) ".dylib" ".so")))
+
+(defun env-dirs :private (var: str) -> (Vec str)
+  (filterv (fn (d: str) (not (= d ""))) (s/split (unwrap-or (sys-getenv var) "") ":")))
+
+(defun system-dirs :private () -> (Vec str)
+  (if (darwin?)
+      ["/opt/homebrew/lib" "/usr/local/lib" "/usr/lib"]
+      ["/lib/x86_64-linux-gnu" "/usr/lib/x86_64-linux-gnu" "/lib/aarch64-linux-gnu" "/usr/lib/aarch64-linux-gnu"
+       "/lib64" "/usr/lib64" "/lib" "/usr/lib" "/usr/local/lib"]))
+
+;; The names in `dir`, none when it cannot be read.
+(defun names-in :private (dir: str) -> (Vec str)
+  (match (dirs/list-directory dir)
+    ((Ok es) (mapv (fn (e: dirs/DirectoryEntry) (. e name)) es))
+    ((Err _) [])))
+
+;; The directories of an /etc/ld.so.conf file: a line is a directory, `include PATTERN` the files PATTERN matches (a `*` in the file name), `#` a comment.
+(defun conf-dirs :private (path: str depth: i64) -> (Vec str)
+  (if (> depth 3)
+      []
+      (reduce (fn (acc: (Vec str) line: str)
+                (let ((l (s/trim (match (str-find line "#" 0) ((some i) (str-slice line 0 i)) (nil line)))))
+                  (cond (= l "") acc
+                        (starts-with? l "include ") (into acc (mapcat (fn (f: str) (conf-dirs f (+ depth 1))) (glob (s/trim (str-slice l 8 (str-len l))))))
+                        (starts-with? l "/") (conj acc l)
+                        :else acc)))
+              [] (s/split (unwrap-or (read-file path) "") "\n"))))
+
+;; The files a pattern `DIR/PREFIX*SUFFIX` (or a plain path) names, sorted; a relative pattern is under /etc.
+(defun glob :private (pattern: str) -> (Vec str)
+  (let ((p (if (starts-with? pattern "/") pattern (str "/etc/" pattern))))
+    (match (str-find p "*" 0)
+      (nil [p])
+      ((some star)
+       (let ((slash (loop ((i star)) (cond (< i 0) 0 (= (str-byte-at p i) 47i8) i :else (recur (- i 1))))))
+         (let ((dir (str-slice p 0 slash)) (pre (str-slice p (+ slash 1) star)) (suf (str-slice p (+ star 1) (str-len p))))
+           (mapv (fn (n: str) (str dir "/" n))
+                 (vec (sort (filterv (fn (n: str) (and (starts-with? n pre) (s/ends-with? n suf))) (names-in dir)))))))))))
+
+;; Every directory a library is looked for in, in order, each once: `extra` (the `-L` of the command), then the environment's, ld.so.conf's and the system's.
+(defun search-dirs (extra: (Vec str)) -> (Vec str)
+  (reduce (fn (acc: (Vec str) d: str) (if (some? (find-first (fn (x: str) (= x d)) acc)) acc (conj acc d)))
+          [] (into (into (into (into extra (env-dirs (if (darwin?) "DYLD_LIBRARY_PATH" "LD_LIBRARY_PATH"))) (env-dirs "LIBRARY_PATH"))
+                           (if (darwin?) [] (conf-dirs "/etc/ld.so.conf" 0)))
+                     (system-dirs))))
+
+;; The version of `file` as a versioned name of the library (`libNAME.so.7.2` is [7 2]), nil when it is not one.
+(defun version-of :private (name: str file: str) -> (Option (Vec i64))
+  (let ((pre (str "lib" name ".so.")))
+    (if (or (darwin?) (not (starts-with? file pre)) (= (str-len file) (str-len pre)))
+        nil
+        (let ((parts (s/split (str-slice file (str-len pre) (str-len file)) ".")))
+          (if (every? (fn (p: str) (and (> (str-len p) 0) (every? (fn (i: i64) (let ((b (str-byte-at p i))) (and (>= b 48i8) (<= b 57i8)))) (range (str-len p))))) parts)
+              (some (mapv (fn (p: str) (reduce (fn (n: i64 i: i64) (+ (* n 10) (- (zext i64 (str-byte-at p i)) 48))) 0 (range (str-len p)))) parts))
+              nil)))))
+
+;; Whether version `a` is to be taken before `b`: a higher major version, else the shorter name (the soname link `libNAME.so.7`, not the file it
+;; points at, `libNAME.so.7.1.10`), else the later version.
+(defun later? :private (a: (Vec i64) b: (Vec i64)) -> bool
+  (cond (!= (nth a 0) (nth b 0)) (> (nth a 0) (nth b 0))
+        (!= (count a) (count b)) (< (count a) (count b))
+        :else (loop ((i 1))
+                (cond (>= i (count a)) false
+                      (> (nth a i) (nth b i)) true
+                      (< (nth a i) (nth b i)) false
+                      :else (recur (+ i 1))))))
+
+;; The highest versioned file of the library among `names`.
+(defun highest :private (name: str names: (Vec str)) -> (Option str)
+  (let ((best (reduce (fn (acc: (Option (Pair (Vec i64) str)) n: str)
+                        (match (version-of name n)
+                          (nil acc)
+                          ((some v) (match acc
+                                      (nil (some (Pair v n)))
+                                      ((some b) (if (later? v (. b fst)) (some (Pair v n)) acc))))))
+                      nil names)))
+    (match best (nil nil) ((some b) (some (. b snd))))))
+
+;; A file of the library: its directory, its name, and whether it is a versioned one.
+(defstruct Found (dir: str file: str versioned: bool))
+
+;; Every file the library could be, in the order to try them: the development link in each directory that has it, then each directory's highest
+;; versioned file. More than one, because a directory can hold another architecture's (ld.so.conf lists i386 beside x86-64): the loader takes the
+;; first that loads, the linker skips the incompatible ones itself.
+(defun candidates (name: str dirs: (Vec str)) -> (Vec Found)
+  (let ((listed (mapv (fn (d: str) (Pair d (names-in d))) dirs)) (dev (dev-name name)))
+    (into (vec (keep (fn (p: (Pair str (Vec str))) (if (some? (find-first (fn (n: str) (= n dev)) (. p snd))) (some (Found (. p fst) dev false)) nil)) listed))
+          (vec (keep (fn (p: (Pair str (Vec str))) (match (highest name (. p snd)) ((some f) (some (Found (. p fst) f true))) (nil nil))) listed)))))
+
+;; The first of the candidates.
+(defun find-lib (name: str dirs: (Vec str)) -> (Option Found)
+  (first (candidates name dirs)))
+
+;; What was looked for and where, for a message: `libNAME.so or libNAME.so.N in DIR, DIR..`.
+(defun tried-text (name: str dirs: (Vec str)) -> str
+  (str (dev-name name) (if (darwin?) "" (str " or lib" name ".so.N")) " in " (str-join (vec (interpose ", " dirs)))))
