@@ -2014,7 +2014,7 @@ consume(e):   Owned        → move: no operation; the count travels with the va
 | # | Position | Forms |
 |---|---|---|
 | E1 | return | the value of a `defun`, `fn`, method or `async` body (after the body's own scope exits) |
-| E2 | store | the object arguments of struct and variant constructors; `(cell e)`; `(set! c e)`; `(atom e)`; `(reset! a e)`; `(array n e)` (n copies); `(array-with a i e)`; `(array-set! &a i e)`; `(array-push! &a e)`; `(set-field! &s f e)`; the result of `f` in `(swap! a f)` and in `(cell-update! c f)`; the operand of `(raw-retained e)` (§6.13). Stores inside library functions are those functions' business: `conj`'s element is stored by `array-with` inside `conj` |
+| E2 | store | the object arguments of struct and variant constructors; `(cell e)`; `(set! c e)`; `(atom e)`; `(reset! a e)`; `(array n e)` (n copies: the count handed in is element 0's, released when n is below 1); `(array-with a i e)`; `(array-set! &a i e)`; `(array-push! &a e)`; `(set-field! &s f e)`; the result of `f` in `(swap! a f)` and in `(cell-update! c f)`; the operand of `(raw-retained e)` (§6.13). Stores inside library functions are those functions' business: `conj`'s element is stored by `array-with` inside `conj` |
 | E3 | capture | each object capture of a heap closure (a `fn` that is escaping or at a tail site, §6.5) and of every `async`; the retain happens when the closure or task object is created |
 | E4 | thread | the argument of `spawn` (consumed; E3 already retained its captures) |
 | E5 | await | subsumed by E3: the task's frame owns everything it references (§6.9) |
