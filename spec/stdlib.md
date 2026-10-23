@@ -248,6 +248,12 @@ Rules:
      again; a trap is the stage's own at the same element. No closure, recipe or indirect call is left for a literal or a named function, so LLVM vectorises the
      loop where the body allows (f64 arithmetic does; i64 arithmetic does not, its overflow checks are calls and early exits; a sum through `reduce` is not
      rewritten). A symbol bound to a function value is called through it, as before.
+     **Over a range** (cases 4211 to 4213; `compiler/expand/fuserange.fib`): when the one source is a call of the library's `range` (one or three
+     arguments) or `range-by`, the loop walks the Range itself, as its Reducible instance does: `range-walk-kind` (0 empty, -1 a step of zero, whose
+     walk never ends: CALL, 1 otherwise), then `count` elements, the start and each later one the one before plus the step (`range-step`, a method
+     of `RangeLen` that adds the integers without the overflow check: every sum is an element of the range, so none overflows, and the loop over
+     the range's i64 elements is vectorised). Float ranges accumulate as their walk does (the eleventh of `(range 0.0 1.0 0.1)` is
+     0.9999999999999999).
    * **The dump** of a program that sees `fib.seq` shows the recipes and the gensyms `#fuse.N`; its format is unchanged (bootstrap §2, §5.3).
 
    **Not adopted.** The second revision's affine recipes (a value consumed once, a compile error on the second use) and the first

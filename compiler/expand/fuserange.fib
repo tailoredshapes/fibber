@@ -1,0 +1,81 @@
+;; compiler/expand/fuserange.fib: the counted loops of a chain of `map` steps over a `range` call (compiler/expand/fuseinline.fib,
+;; its header has the argument). The range is walked as its Reducible instance walks it, by repeated addition of the step from the
+;; start, and the output is written in spans of 32 that `vec-from-spans` makes the Vec without a copy:
+;;
+;;   (let ((r (range ..)) (w (range-walk-kind r)))
+;;     (if (< w 0)
+;;         CALL                                          ; a step of zero: the walk never ends, the call as it was
+;;         (if (= w 0) (vec-empty)
+;;             (let ((n (count r)) (by (. r by)) (x0 (. r lo)) (y0 ELT[x0]) (outs (cell (array (+ (quot (- n 1) 32) 1) (array 1 y0)))))
+;;               (do (loop ((j 0) (done 0) (x x0))       ; output span j; x the last element walked
+;;                     (if (< done n)
+;;                         (let ((len (min 32 (- n done))) (y (cell (array len y0))))
+;;                           (let ((last (loop ((i (if (= j 0) 1 0)) (x x))
+;;                                         (if (< i len) (let ((x2 (range-step x by))) (do (array-set! &y i ELT[x2]) (recur (+ i 1) x2))) x))))
+;;                             (do (array-set! &outs j @y) (recur (+ j 1) (+ done len) last))))
+;;                         ()))
+;;                   (vec-from-spans @outs n))))))
+;;
+;; Every addition makes an element of the range (the first is the start, each later one the one before plus the step), so
+;; none can overflow; `range-step` (a method of RangeLen) is that addition, without the overflow check for the integers: the
+;; inner loop is then a counted loop whose element is an induction variable, the shape LLVM vectorises (with the checked add
+;; and the last element carried out of the loop it is not).
+(ns expand.fuserange
+  (:use syntax.pos syntax.form expand.ctx expand.build expand.collections expand.fusegen))
+
+;; The gensyms: the range r, its walk w, count n, step by, first element x0 and its output y0, the output spans, the loop
+;; variables (span j, elements done, last element x, span length len, output span y, index i, the element x2) and last.
+(defstruct RangeNames (r: Stx w: Stx n: Stx by: Stx x0: Stx y0: Stx outs: Stx j: Stx done: Stx x: Stx len: Stx y: Stx i: Stx
+                       x2: Stx last: Stx))
+
+(defun range-names :private (ctx: ExpandCtx pos: Pos) -> RangeNames
+  (let ((g (fg-gensyms ctx 15 pos)))
+    (RangeNames (nth g 0) (nth g 1) (nth g 2) (nth g 3) (nth g 4) (nth g 5) (nth g 6) (nth g 7) (nth g 8) (nth g 9) (nth g 10)
+                (nth g 11) (nth g 12) (nth g 13) (nth g 14))))
+
+;; The loop over one output span from slot `from`, the element after `x` in each slot; its value is the last element.
+(defun range-span-loop :private (ctx: ExpandCtx stages: (Vec InStage) nm: RangeNames from: Stx pos: Pos) -> Stx
+  (let ((i (. nm i)) (x (. nm x)) (x2 (. nm x2)))
+    (call "loop" [(list-form [(fg-pair i from pos) (fg-pair x x pos)] pos)
+                  (fg-if (fg-pcall "<" [i (. nm len)] pos)
+                         (fg-let [(fg-pair x2 (call "fib.seq/range-step" [x (. nm by)] pos) pos)]
+                                 (call "do" [(call "array-set!" [(call "&" [(. nm y)] pos) i (fg-element ctx stages [x2] pos)] pos)
+                                             (call "recur" [(fg-pcall "+" [i (int 1 pos)] pos) x2] pos)] pos)
+                                 pos)
+                         x pos)] pos)))
+
+;; The loop over the output spans.
+(defun range-spans-loop :private (ctx: ExpandCtx stages: (Vec InStage) nm: RangeNames pos: Pos) -> Stx
+  (let ((j (. nm j)) (done (. nm done)) (len (. nm len)) (left (fg-pcall "-" [(. nm n) (. nm done)] pos)))
+    (call "loop" [(list-form [(fg-pair j (int 0 pos) pos) (fg-pair done (int 0 pos) pos) (fg-pair (. nm x) (. nm x0) pos)] pos)
+                  (fg-if (fg-pcall "<" [done (. nm n)] pos)
+                         (fg-let [(fg-pair len (fg-smaller (int 32 pos) left pos) pos)
+                                  (fg-pair (. nm y) (call "cell" [(call "array" [len (. nm y0)] pos)] pos) pos)]
+                                 (fg-let [(fg-pair (. nm last) (range-span-loop ctx stages nm (fg-if (fg-pcall "=" [j (int 0 pos)] pos) (int 1 pos) (int 0 pos) pos) pos) pos)]
+                                         (call "do" [(call "array-set!" [(call "&" [(. nm outs)] pos) j (call "deref" [(. nm y)] pos)] pos)
+                                                     (call "recur" [(fg-pcall "+" [j (int 1 pos)] pos) (fg-pcall "+" [done len] pos) (. nm last)] pos)] pos)
+                                         pos)
+                                 pos)
+                         (unit pos) pos)] pos)))
+
+;; The rewrite of a chain of `map` steps over the range call that is its source; `fallback` makes the call as it was with
+;; its source replaced by the gensym the range is bound to.
+(defun fuse-range-rewrite (ctx: ExpandCtx ch: Chain pos: Pos fallback: (fn ((Vec Stx)) Stx)) -> Stx
+  (let ((nm (range-names ctx pos)) (stages (fg-map-fns (. ch steps))))
+    (let ((r (. nm r)) (n (. nm n)))
+      (fg-let [(fg-pair r (nth (. ch sources) 0) pos) (fg-pair (. nm w) (call "fib.seq/range-walk-kind" [r] pos) pos)]
+              (fg-if (fg-pcall "<" [(. nm w) (int 0 pos)] pos)
+                     (fallback [r])
+                     (fg-if (fg-pcall "=" [(. nm w) (int 0 pos)] pos)
+                            (call (prelude-name "vec-empty") (vec-empty) pos)
+                            (fg-let [(fg-pair n (call "fib.seq/count" [r] pos) pos)
+                                     (fg-pair (. nm by) (call "." [r (sym "by" pos)] pos) pos)
+                                     (fg-pair (. nm x0) (call "." [r (sym "lo" pos)] pos) pos)
+                                     (fg-pair (. nm y0) (fg-element ctx stages [(. nm x0)] pos) pos)
+                                     (fg-pair (. nm outs)
+                                              (call "cell" [(call "array" [(fg-pcall "+" [(fg-pcall "quot" [(fg-pcall "-" [n (int 1 pos)] pos) (int 32 pos)] pos) (int 1 pos)] pos)
+                                                                           (call "array" [(int 1 pos) (. nm y0)] pos)] pos)] pos) pos)]
+                                    (call "do" [(range-spans-loop ctx stages nm pos)
+                                                (fg-pcall "vec-from-spans" [(call "deref" [(. nm outs)] pos) n] pos)] pos)
+                                    pos) pos) pos)
+              pos))))

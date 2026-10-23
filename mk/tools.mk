@@ -111,7 +111,7 @@ $(foreach p,batch-verify batch-onoff batch-single,$(eval tool_sh-persist-$(p) :=
 PERSIST_STAMPS := $(addprefix sh-persist-,$(PERSIST_PARTS))
 tool_sh-emit-resume := $(T)/emit/resume.sh $(F_ABS) | $(T)/emit/resume.sh
 # The loops the expander writes for a fused `map` with its stage in line are vectorised by LLVM (opt's remarks), a function-value stage is not
-tool_sh-expand-fuseinline := env LLVM_LIBDIR=$(LLVM_LIBDIR) $(T)/expand/fuseinline/check.sh $(F_ABS) | $(wildcard $(T)/expand/fuseinline/*) compiler/expand/fuseinline.fib
+tool_sh-expand-fuseinline := env LLVM_LIBDIR=$(LLVM_LIBDIR) $(T)/expand/fuseinline/check.sh $(F_ABS) | $(wildcard $(T)/expand/fuseinline/*) $(wildcard compiler/expand/fuse*.fib)
 tool_sh-emit-windows := $(T)/emit/windows.sh $(F_ABS) | $(T)/emit/windows.sh $(T)/emit/inspect.fib
 tool_sh-fibref-heap-gold := $(T)/fibref/heap-gold.sh | $(wildcard $(T)/fibref/heap-gold*)
 tool_sh-native-h-checks := $(T)/native/h-checks.sh | $(wildcard $(T)/native/h-*) $(wildcard $(T)/native/h-cases/*)

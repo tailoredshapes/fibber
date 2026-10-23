@@ -49,8 +49,8 @@ for n in names:
     want = not n.startswith('f.closure-')
     print(('ok   ' if got == want else 'FAIL ') + n + ': ' + ('vectorised' if got else 'not vectorised') + ('' if got == want else ' (wanted ' + ('vectorised' if want else 'not vectorised') + ')'))
     bad |= got != want
-if len(names) != 6:
-    print('FAIL expected 6 kernels, found %d' % len(names)); bad = 1
+if len(names) != 8:
+    print('FAIL expected 8 kernels, found %d' % len(names)); bad = 1
 print('check.sh: %s' % ('every kernel as wanted' if not bad else 'DIFFERENCES'))
 sys.exit(1 if bad else 0)
 PY

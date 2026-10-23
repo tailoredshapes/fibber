@@ -1,0 +1,118 @@
+;; compiler/expand/fusespan.fib: the counted loops of a chain of `map` steps over sources held in arrays (a Vec, an Array: the
+;; `span-count` and `span-array` methods of Reducible), the shape and the argument of compiler/expand/fuseinline.fib (its header):
+;;
+;;   (let ((s c) (sc (span-count s)) (n (if (< -1 sc) (count s) 0)) (fast (< -1 sc)))
+;;     (if (not fast)
+;;         CALL                                         ; the call as it was, with s for c: the recipe walk
+;;         (if (= n 0) (vec-empty)
+;;             (let ((a (span-array s 0)) (y0 ELT[a 0]) (outs (cell (array sc (array 1 y0)))))
+;;               (do (loop ((j 0) (done 0))            ; span j of the source, output span j
+;;                     (if (< done n)
+;;                         (let ((b (span-array s j)) (len (array-len b)) (y (cell (array len y0))))
+;;                           (do (loop ((i (if (= j 0) 1 0))) (if (< i len) (do (array-set! &y i ELT[b i]) (recur (+ i 1))) ()))
+;;                               (array-set! &outs j @y) (recur (+ j 1) (+ done len))))
+;;                         ()))
+;;                   (vec-from-spans @outs n))))))
+;;
+;; The inner loop is the shape LLVM vectorises: one counted loop from a small constant, every array index the loop variable
+;; itself, the output a fresh array. Two sources (`(map F a b)`) are walked span by span together when their spans start at the
+;; same indices (one span each, more than one each, or an output of at most 32); each output span is as long as the shorter.
+(ns expand.fusespan
+  (:use syntax.pos syntax.form expand.ctx expand.build expand.collections expand.fusegen))
+
+;; The gensyms of one rewrite: per source its value s, span count sc, first span a and current span b; then
+;; the count n, whether the loop is taken, the first element, the number of output spans, the output spans,
+;; and the loop variables (span j, elements done, span length, output span y, index i).
+(defstruct Names (s: (Vec Stx) sc: (Vec Stx) a: (Vec Stx) b: (Vec Stx)
+                  n: Stx fast: Stx y0: Stx nk: Stx outs: Stx j: Stx done: Stx len: Stx y: Stx i: Stx))
+
+(defun names-for :private (ctx: ExpandCtx k: i64 pos: Pos) -> Names
+  (let ((s (fg-gensyms ctx k pos)) (sc (fg-gensyms ctx k pos)) (a (fg-gensyms ctx k pos)) (b (fg-gensyms ctx k pos))
+        (one (fg-gensyms ctx 10 pos)))
+    (Names s sc a b (nth one 0) (nth one 1) (nth one 2) (nth one 3) (nth one 4) (nth one 5) (nth one 6) (nth one 7)
+           (nth one 8) (nth one 9))))
+
+(defun spanned :private (sc: Stx pos: Pos) -> Stx
+  (fg-pcall "<" [(int -1 pos) sc] pos))
+
+;; The bindings before the choice: each source's span count, the count n of the output (0 when a source has no
+;; spans: then nothing else is asked of it), and whether the loop is taken: every source has spans and, for
+;; two, their spans start at the same indices: both have one span, both more than one (32 each but the last),
+;; or the output fits in the first span of each.
+(defun choice-pairs :private (nm: Names k: i64 pos: Pos) -> (Vec Stx)
+  (let ((sc (. nm sc)) (s (. nm s)) (n (. nm n)))
+    (let ((counts (fg-per-source k (fn (q: i64) (fg-pair (nth sc q) (call "fib.seq/span-count" [(nth s q)] pos) pos))))
+          (all (if (= k 1) (spanned (nth sc 0) pos) (fg-if (spanned (nth sc 0) pos) (spanned (nth sc 1) pos) (boolean false pos) pos)))
+          (cnt (if (= k 1)
+                   (call "fib.seq/count" [(nth s 0)] pos)
+                   (fg-smaller (call "fib.seq/count" [(nth s 0)] pos) (call "fib.seq/count" [(nth s 1)] pos) pos)))
+          (aligned (if (= k 1)
+                       (boolean true pos)
+                       (fg-if (fg-pcall "<" [n (int 33 pos)] pos)
+                              (boolean true pos)
+                              (fg-if (fg-pcall "<" [(int 1 pos) (nth sc 0)] pos)
+                                     (fg-pcall "<" [(int 1 pos) (nth sc 1)] pos)
+                                     (fg-pcall "<" [(nth sc 1) (int 2 pos)] pos) pos) pos))))
+      (fg-appended counts [(fg-pair n (fg-if all cnt (int 0 pos) pos) pos)
+                           (fg-pair (. nm fast) (fg-if all aligned (boolean false pos) pos) pos)]))))
+
+;; The loop over one output span: slots `from` .. len of y, each the stages applied to slot i of the arrays b.
+(defun span-loop :private (ctx: ExpandCtx stages: (Vec InStage) nm: Names k: i64 from: Stx pos: Pos) -> Stx
+  (let ((i (. nm i))
+        (elts (fg-per-source k (fn (q: i64) (call "array-get" [(nth (. nm b) q) i] pos)))))
+    (call "loop" [(list-form [(fg-pair i from pos)] pos)
+                  (fg-if (fg-pcall "<" [i (. nm len)] pos)
+                         (call "do" [(call "array-set!" [(call "&" [(. nm y)] pos) i (fg-element ctx stages elts pos)] pos)
+                                     (call "recur" [(fg-pcall "+" [i (int 1 pos)] pos)] pos)] pos)
+                         (unit pos) pos)] pos)))
+
+;; The loop over the spans: span j of each source, an output span of the fewest elements left, filled by
+;; `span-loop` (from slot 1 in span 0: slot 0 is the first element, which the array was made with).
+(defun spans-loop :private (ctx: ExpandCtx stages: (Vec InStage) nm: Names k: i64 pos: Pos) -> Stx
+  (let ((j (. nm j)) (done (. nm done)) (len (. nm len)))
+    (let ((arrays (fg-per-source k (fn (q: i64) (fg-pair (nth (. nm b) q) (call "fib.seq/span-array" [(nth (. nm s) q) j] pos) pos))))
+          (lens (loop ((q 0) (acc (fg-pcall "-" [(. nm n) done] pos)))
+                  (if (< q k) (recur (+ q 1) (fg-smaller (call "array-len" [(nth (. nm b) q)] pos) acc pos)) acc))))
+      (call "loop" [(list-form [(fg-pair j (int 0 pos) pos) (fg-pair done (int 0 pos) pos)] pos)
+                    (fg-if (fg-pcall "<" [done (. nm n)] pos)
+                           (fg-let (fg-appended arrays [(fg-pair len lens pos)
+                                                        (fg-pair (. nm y) (call "cell" [(call "array" [len (. nm y0)] pos)] pos) pos)])
+                                   (call "do" [(span-loop ctx stages nm k (fg-if (fg-pcall "=" [j (int 0 pos)] pos) (int 1 pos) (int 0 pos) pos) pos)
+                                               (call "array-set!" [(call "&" [(. nm outs)] pos) j (call "deref" [(. nm y)] pos)] pos)
+                                               (call "recur" [(fg-pcall "+" [j (int 1 pos)] pos) (fg-pcall "+" [done len] pos)] pos)] pos)
+                                   pos)
+                           (unit pos) pos)] pos))))
+
+;; The number of output spans: the source's spans; for two, the fewer spans when both have more than one
+;; (32 each but the last, so the shorter source's), else one.
+(defun span-total :private (nm: Names k: i64 pos: Pos) -> Stx
+  (let ((sc (. nm sc)))
+    (if (= k 1)
+        (nth sc 0)
+        (fg-if (fg-if (fg-pcall "<" [(int 1 pos) (nth sc 0)] pos) (fg-pcall "<" [(int 1 pos) (nth sc 1)] pos) (boolean false pos) pos)
+               (fg-smaller (nth sc 0) (nth sc 1) pos)
+               (int 1 pos) pos))))
+
+;; The loop that makes the Vec when the choice took it. The array of output spans starts filled with a span of one
+;; element (an empty `(array 0 y0)` would leak a counted y0: the runtime does not release the fill of an empty array).
+(defun fast-path :private (ctx: ExpandCtx stages: (Vec InStage) nm: Names k: i64 pos: Pos) -> Stx
+  (let ((firsts (fg-per-source k (fn (q: i64) (call "array-get" [(nth (. nm a) q) (int 0 pos)] pos))))
+        (arrays (fg-per-source k (fn (q: i64) (fg-pair (nth (. nm a) q) (call "fib.seq/span-array" [(nth (. nm s) q) (int 0 pos)] pos) pos)))))
+    (fg-if (fg-pcall "=" [(. nm n) (int 0 pos)] pos)
+           (call (prelude-name "vec-empty") (vec-empty) pos)
+           (fg-let (fg-appended arrays [(fg-pair (. nm y0) (fg-element ctx stages firsts pos) pos)
+                                        (fg-pair (. nm nk) (span-total nm k pos) pos)
+                                        (fg-pair (. nm outs) (call "cell" [(call "array" [(. nm nk) (call "array" [(int 1 pos) (. nm y0)] pos)] pos)] pos) pos)])
+                   (call "do" [(spans-loop ctx stages nm k pos)
+                               (fg-pcall "vec-from-spans" [(call "deref" [(. nm outs)] pos) (. nm n)] pos)] pos)
+                   pos) pos)))
+
+;; The rewrite of a chain of `map` steps over sources held in arrays: `call` is the call as it was with its sources
+;; replaced by `news` (the gensyms the rewrite binds them to, which it is handed as `fallback`).
+(defun fuse-span-rewrite (ctx: ExpandCtx ch: Chain pos: Pos fallback: (fn ((Vec Stx)) Stx)) -> Stx
+  (let ((k (count (. ch sources))))
+    (let ((nm (names-for ctx k pos)))
+      (fg-let (fg-appended (fg-per-source k (fn (q: i64) (fg-pair (nth (. nm s) q) (nth (. ch sources) q) pos)))
+                           (choice-pairs nm k pos))
+              (fg-if (fg-pcall "not" [(. nm fast)] pos) (fallback (. nm s)) (fast-path ctx (fg-map-fns (. ch steps)) nm k pos) pos)
+              pos))))

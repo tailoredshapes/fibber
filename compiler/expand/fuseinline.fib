@@ -1,57 +1,37 @@
-;; compiler/expand/fuseinline.fib: a fused `map` with its stage functions in line (docs/design/vec-performance.md item 2;
+;; compiler/expand/fuseinline.fib: a fused chain with its stage functions in line (docs/design/vec-performance.md item 2;
 ;; stage 2 only, no Rust twin). Run on a top-level form after the let rule (expand.fuselet) and before the fusing walk:
 ;;
 ;;   (mapv F c)  (vec (map F c))  (into [] (map F c))  and the same over (map G (map H c)), or (map F a b)
 ;;
-;; where every stage function is a symbol (a function called directly) or a plain `fn` literal, becomes
+;; where every stage function is a symbol (a function called directly) or a plain `fn` literal, becomes counted loops with
+;; the stages' bodies in line: `(let ((x elt)) body)` for a literal, `(g elt)` for a symbol, nested from the innermost stage
+;; out. The loops are written by
+;;  - expand.fusespan when the sources are held in arrays (a Vec, an Array: the `span-count` and `span-array` methods of
+;;    Reducible), which is asked when the program runs: any other source takes the call as it was, which the fusing walk
+;;    then makes recipes of;
+;;  - expand.fuserange when the one source is a `range` call (`(range n)`, `(range a b)`, `(range a b s)`, `range-by`):
+;;    the loop walks the range itself, by repeated addition of the step, as its Reducible instance does.
+;; Both write the output in fresh arrays of 32 that `vec-from-spans` makes the Vec without a copy, and the inner loop is
+;; the shape LLVM vectorises: one counted loop from a small constant, every array index the loop variable itself (an index
+;; with an offset, `(array-get b (+ i d))`, leaves a bounds check LLVM cannot count, and the loop is not vectorised).
 ;;
-;;   (let ((s c) (sc (span-count s)) (n (if (< -1 sc) (count s) 0)) (fast (< -1 sc)))
-;;     (if (not fast)
-;;         (mapv F s)                                  ; the call as it was, with s for c: the recipe walk
-;;         (if (= n 0) (vec-empty)
-;;             (let ((a (span-array s 0)) (y0 ELT[a 0]) (outs (cell (array sc (array 1 y0)))))
-;;               (do (loop ((j 0) (done 0))            ; span j of the source, output span j
-;;                     (if (< done n)
-;;                         (let ((b (span-array s j)) (len (array-len b)) (y (cell (array len y0))))
-;;                           (do (loop ((i (if (= j 0) 1 0))) (if (< i len) (do (array-set! &y i ELT[b i]) (recur (+ i 1))) ()))
-;;                               (array-set! &outs j @y) (recur (+ j 1) (+ done len))))
-;;                         ()))
-;;                   (vec-from-spans @outs n))))))
-;;
-;; ELT is the stages' bodies in line: `(let ((x elt)) body)` for a literal, `(g elt)` for a symbol, nested from the
-;; innermost stage out. A source held in arrays (a Vec, an Array: the `span-count` and `span-array` methods of
-;; Reducible) is walked by these loops, with no closure, recipe or indirect call; any other source takes the call as
-;; it was, which the fusing walk then makes recipes of. The inner loop is the shape LLVM vectorises: one counted loop
-;; from a small constant, every array index the loop variable itself, the output a fresh array (an index with an
-;; offset, `(array-get b (+ i d))`, leaves a bounds check LLVM cannot count, and the loop is not vectorised). Two
-;; sources (`(map F a b)`) are walked span by span together when their spans start at the same indices (one span
-;; each, more than one each, or an output of at most 32); each output span is as long as the shorter.
-;;
-;; Why it is the same program: the stage functions are atomic (a symbol or a `fn` form: evaluating them has no
-;; effect), so evaluating the sources first, in their order, moves nothing past an effect; the elements are read
-;; once each, in order, and each stage runs once per element, innermost first, element after element, as the
-;; recipe walk runs them; a trap in a stage traps at the same element. A literal is taken only when it is a plain
-;; `fn` (no name, `->` or `:where`) whose parameters are symbols, one per element it receives, and whose body has
-;; no `recur` outside a `loop` of its own (it would bind to the loop) and is small: it is written twice, for the
-;; first element (which fills the output arrays) and in the loop, besides the call as it was. The names the loop
-;; uses bare (`array`, `cell` ..) must not be bound by the form or defined by the module.
+;; Why it is the same program: the stage functions are atomic (a symbol or a `fn` form: evaluating them has no effect),
+;; so evaluating the sources first, in their order, moves nothing past an effect; the elements are read once each, in
+;; order, and each stage runs once per element, innermost first, element after element, as the recipe walk runs them; a
+;; trap in a stage traps at the same element. A literal is taken only when it is a plain `fn` (no name, `->` or `:where`)
+;; whose parameters are symbols, one per element it receives, and whose body has no `recur` outside a `loop` of its own
+;; (it would bind to the loop) and is small: it is written twice, for the first element (which fills the output arrays)
+;; and in the loop, besides the call as it was. The names the loop uses bare (`array`, `cell` ..) must not be bound by
+;; the form or defined by the module.
 (ns expand.fuseinline
-  (:use syntax.pos syntax.form expand.ctx expand.build expand.collections expand.fusetab expand.fusescan expand.fuse))
-
-;; A stage function in line: a literal's parameters (the items of its list) and body, or a symbol to call.
-(defenum InStage
-  (InFn params: (Vec Stx) body: (Vec Stx))
-  (InSym name: Stx))
-
-;; A chain: the stages, outermost first; the sources (one, or two for `(map F a b)`); how many `map` calls
-;; lie below the top form (a `mapv` or `map` call) down to the one that reads the sources.
-(defstruct Chain (stages: (Vec InStage) sources: (Vec Stx) depth: i64))
+  (:use syntax.pos syntax.form expand.ctx expand.build expand.collections expand.fusetab expand.fusescan expand.fuse
+        expand.fusegen expand.fusespan expand.fuserange))
 
 ;; The bodies of the stages, in nodes, past which the chain is not put in line.
 (def max-body-nodes: i64 200)
 
 ;; The names the loop uses bare.
-(def bare-names: (Vec str) ["let" "loop" "if" "do" "recur" "cell" "array" "array-get" "array-set!" "array-len" "deref" "&"])
+(def bare-names: (Vec str) ["let" "loop" "if" "do" "recur" "cell" "array" "array-get" "array-set!" "array-len" "deref" "&" "."])
 
 (defun form-nodes :private (f: Stx) -> i64
   (match (. f kind)
@@ -81,10 +61,6 @@
           (has-recur? (nth items i)) true
           :else (recur (+ i 1)))))
 
-(defun ends-with-colon? :private (s: str) -> bool
-  (let ((k (- (str-len s) 1)))
-    (and (> k 0) (= (str-byte-at s k) 58i8))))
-
 ;; The number of parameters of a literal's list when each is a symbol (`x`, or `x:` and its type); -1 otherwise.
 (defun param-count :private (params: (Vec Stx)) -> i64
   (loop ((i 0) (n 0))
@@ -93,7 +69,7 @@
         (match (fuse-sym-of (nth params i))
           (nil -1)
           ((some s) (cond (or (= s "&") (= s "nil")) -1
-                          (ends-with-colon? s) (if (< (+ i 1) (count params)) (recur (+ i 2) (+ n 1)) -1)
+                          (fg-ends-with-colon? s) (if (< (+ i 1) (count params)) (recur (+ i 2) (+ n 1)) -1)
                           :else (recur (+ i 1) (+ n 1))))))))
 
 (defun annotation? :private (f: Stx) -> bool
@@ -123,54 +99,85 @@
     ((InFn _ body) (items-nodes body))
     ((InSym _) 1)))
 
-;; Whether `items` is a call of the library's `map` with `argc` arguments.
-(defun map-call? :private (env: FuseEnv items: (Vec Stx) argc: i64) -> bool
-  (and (= (count items) (+ argc 1))
-       (match (fuse-item-sym items 0)
-         (nil false)
-         ((some head) (= (fuse-library env head argc FacSeq) (some "map"))))))
+(defun step-nodes :private (st: Step) -> i64
+  (match st
+    ((StMap f) (stage-nodes f))
+    ((StFilter p) (stage-nodes p))
+    ((StRemove p) (stage-nodes p))
+    ((StKeep f) (stage-nodes f))
+    ((StTake _) 1)
+    ((StTakeWhile p) (stage-nodes p))))
 
-;; The chain read from `c`, the collection of a stage already taken (`stages`, `depth` map calls below the top).
-(defun descend :private (env: FuseEnv c: Stx stages: (Vec InStage) depth: i64) -> Chain
+;; ------------------------------------------------------------ reading the chain
+
+;; The library's name of the call `items` (`fib.seq/map`, `map$2` and a bare `map` the form and module do not shadow are
+;; `map`), with its arguments counted.
+(defun seq-name :private (env: FuseEnv items: (Vec Stx)) -> (Option str)
+  (match (fuse-item-sym items 0)
+    (nil nil)
+    ((some head) (fuse-library env head (- (count items) 1) FacSeq))))
+
+;; A step read from a call, and what it reads: one collection, or the two sources of a two-source `map`.
+(defstruct Got (step: Step colls: (Vec Stx)))
+
+;; Whether `f` is a count `take` can be given in line: a symbol or an integer literal (atomic, so it can move).
+(defun count-arg? :private (f: Stx) -> bool
+  (match (. f kind)
+    ((SSym s) (not (or (= s "nil") (= s "fn"))))
+    ((SInt _ _) true)
+    (_ false)))
+
+(defun one-arg :private (items: (Vec Stx) make: (fn (InStage) Step)) -> (Option Got)
+  (match (in-stage (nth items 1) 1)
+    ((some s) (some (Got (make s) [(nth items 2)])))
+    (nil nil)))
+
+;; The step the call `items` is, if it is one this rewrite takes; `mapv` is `map` and `filterv` `filter` when `top`.
+(defun step-of :private (env: FuseEnv items: (Vec Stx) top: bool) -> (Option Got)
+  (let ((argc (- (count items) 1)))
+    (match (seq-name env items)
+      (nil nil)
+      ((some name)
+       (cond (and (= argc 3) (= name "map"))
+             (match (in-stage (nth items 1) 2)
+               ((some s) (some (Got (StMap s) [(nth items 2) (nth items 3)])))
+               (nil nil))
+             (not (= argc 2)) nil
+             (or (= name "map") (and top (= name "mapv"))) (one-arg items (fn (s) (StMap s)))
+             (or (= name "filter") (and top (= name "filterv"))) (one-arg items (fn (s) (StFilter s)))
+             (= name "remove") (one-arg items (fn (s) (StRemove s)))
+             (= name "keep") (one-arg items (fn (s) (StKeep s)))
+             (= name "take-while") (one-arg items (fn (s) (StTakeWhile s)))
+             (= name "take") (if (count-arg? (nth items 1)) (some (Got (StTake (nth items 1)) [(nth items 2)])) nil)
+             :else nil)))))
+
+;; Whether `c` is a call of the library's `range` (one or three arguments) or `range-by`: its value is a Range.
+(defun range-call? :private (env: FuseEnv c: Stx) -> bool
   (let ((items (fuse-list-items c)))
-    (cond (map-call? env items 2)
-          (match (in-stage (nth items 1) 1)
-            ((some s) (descend env (nth items 2) (conj stages s) (+ depth 1)))
-            (nil (Chain stages [c] depth)))
-          (map-call? env items 3)
-          (match (in-stage (nth items 1) 2)
-            ((some s) (Chain (conj stages s) [(nth items 2) (nth items 3)] (+ depth 1)))
-            (nil (Chain stages [c] depth)))
-          :else (Chain stages [c] depth))))
+    (match (seq-name env items)
+      (nil false)
+      ((some name) (let ((argc (- (count items) 1)))
+                     (or (and (= name "range") (or (= argc 1) (= argc 3)))
+                         (and (= name "range-by") (= argc 3))))))))
 
-;; The chain of a `mapv` or `map` call (the top), if its function can be put in line.
+;; The chain read from `c`, the collection of the steps already taken (`steps`, `depth` stage calls below the top).
+(defun descend :private (env: FuseEnv c: Stx steps: (Vec Step) depth: i64) -> Chain
+  (match (step-of env (fuse-list-items c) false)
+    ((some g) (if (= (count (. g colls)) 2)
+                  (Chain (conj steps (. g step)) (. g colls) (+ depth 1) false)
+                  (descend env (nth (. g colls) 0) (conj steps (. g step)) (+ depth 1))))
+    (nil (Chain steps [c] depth (range-call? env c)))))
+
+;; The chain of the top call (a `mapv` or `filterv` call, or the stage call `vec` and `into []` read), if its step is one.
 (defun chain-of :private (env: FuseEnv top: Stx) -> (Option Chain)
-  (let ((items (fuse-list-items top)))
-    (cond (map-call? env items 3)
-          (match (in-stage (nth items 1) 2)
-            ((some s) (some (Chain [s] [(nth items 2) (nth items 3)] 0)))
-            (nil nil))
-          :else
-          (match (in-stage (nth items 1) 1)
-            ((some s) (some (descend env (nth items 2) [s] 0)))
-            (nil nil)))))
+  (match (step-of env (fuse-list-items top) true)
+    (nil nil)
+    ((some g) (if (= (count (. g colls)) 2)
+                  (some (Chain [(. g step)] (. g colls) 0 false))
+                  (some (descend env (nth (. g colls) 0) [(. g step)] 0))))))
 
-;; `form` (a `mapv` or `map` call, `depth` map calls above the sources) with `news` for its sources.
-(defun with-sources :private (form: Stx depth: i64 news: (Vec Stx)) -> Stx
-  (let ((items (fuse-list-items form)))
-    (Stx (SList (if (= depth 0)
-                    (loop ((i 0) (out (vec-empty)))
-                      (cond (>= i (count items)) out
-                            (< i 2) (recur (+ i 1) (conj out (nth items i)))
-                            :else (recur (+ i 1) (conj out (nth news (- i 2))))))
-                    (loop ((i 0) (out (vec-empty)))
-                      (if (< i (count items))
-                          (recur (+ i 1) (conj out (if (= i 2) (with-sources (nth items 2) (- depth 1) news) (nth items i))))
-                          out))))
-         (. form pos))))
-
-;; The top of the chain of a terminal call, if it is one this rewrite takes: the `mapv` call itself, or the `map`
-;; call `vec` and `into []` read; and where in the call it is (-1 for `mapv`, the call is the top).
+;; The top of the chain of a terminal call, if it is one this rewrite takes: the `mapv` or `filterv` call itself, or the
+;; stage call `vec` and `into []` read; and where in the call it is (-1 for `mapv`, the call is the top).
 (defstruct Top (form: Stx at: i64))
 
 (defun top-of :private (env: FuseEnv items: (Vec Stx)) -> (Option Top)
@@ -178,28 +185,29 @@
     (nil nil)
     ((some head)
      (let ((argc (- (count items) 1)))
-       (cond (and (= argc 2) (= (fuse-library env head 2 FacSeq) (some "mapv")))
+       (cond (and (= argc 2) (or (= (fuse-library env head 2 FacSeq) (some "mapv")) (= (fuse-library env head 2 FacSeq) (some "filterv"))))
              (some (Top (list-form items (. (nth items 0) pos)) -1))
-             (and (= argc 1) (= (fuse-library env head 1 FacColl) (some "vec")) (is-map? env (nth items 1)))
+             (and (= argc 1) (= (fuse-library env head 1 FacColl) (some "vec")) (stage-call? env (nth items 1)))
              (some (Top (nth items 1) 1))
              (and (= argc 2) (= (fuse-library env head 2 FacColl) (some "into")) (empty-vec? (nth items 1))
-                  (is-map? env (nth items 2)))
+                  (stage-call? env (nth items 2)))
              (some (Top (nth items 2) 2))
              :else nil)))))
 
-(defun is-map? :private (env: FuseEnv f: Stx) -> bool
-  (let ((items (fuse-list-items f)))
-    (or (map-call? env items 2) (map-call? env items 3))))
+(defun stage-call? :private (env: FuseEnv f: Stx) -> bool
+  (some? (step-of env (fuse-list-items f) false)))
 
 ;; `[]` as the first walk leaves it.
 (defun empty-vec? :private (f: Stx) -> bool
   (let ((items (fuse-list-items f)))
     (and (= (count items) 1) (= (fuse-item-sym items 0) (some "fib.prelude/vec-empty")))))
 
-;; Whether the chain is small enough and none of the bare names is the form's or the module's.
+;; Whether the chain is one the loops are written for, small enough, and none of the bare names is the form's or the
+;; module's: a chain of `map` steps (the one shape so far).
 (defun chain-ok? :private (env: FuseEnv ch: Chain) -> bool
-  (and (<= (loop ((i 0) (n 0))
-             (if (< i (count (. ch stages))) (recur (+ i 1) (+ n (stage-nodes (nth (. ch stages) i)))) n))
+  (and (fg-maps-only? (. ch steps))
+       (<= (loop ((i 0) (n 0))
+             (if (< i (count (. ch steps))) (recur (+ i 1) (+ n (step-nodes (nth (. ch steps) i)))) n))
            max-body-nodes)
        (loop ((i 0))
          (cond (>= i (count bare-names)) true
@@ -210,149 +218,6 @@
 (defun name-taken? :private (env: FuseEnv name: str) -> bool
   (or (fuse-has-name? (. env bound) name)
       (fuse-has-name? (. (. env module) shadow) name)))
-
-;; ------------------------------------------------------------ the loop
-
-;; `(fib.prelude/name args..)`.
-(defun pcall :private (name: str args: (Vec Stx) pos: Pos) -> Stx
-  (call (prelude-name name) args pos))
-
-;; `(let (pairs) body)`; `pairs` are the binding lists.
-(defun let-form :private (pairs: (Vec Stx) body: Stx pos: Pos) -> Stx
-  (call "let" [(list-form pairs pos) body] pos))
-
-(defun pair :private (name: Stx init: Stx pos: Pos) -> Stx
-  (list-form [name init] pos))
-
-;; The stage applied to its elements `args`: a call of the symbol, or the literal's body under its parameters.
-(defun apply-stage :private (ctx: ExpandCtx s: InStage args: (Vec Stx) pos: Pos) -> Stx
-  (match s
-    ((InSym g) (Stx (SList (loop ((i 0) (out [g])) (if (< i (count args)) (recur (+ i 1) (conj out (nth args i))) out))) pos))
-    ((InFn params body)
-     (let-form (param-pairs ctx params args pos)
-               (if (= (count body) 1) (nth body 0) (call "do" body pos))
-               pos))))
-
-;; The bindings of a literal's parameters to `args`: `(x arg)`, or `(x: T arg)`; a wildcard `_` binds a fresh name
-;; (a binding names a variable, and the element is read all the same).
-(defun param-pairs :private (ctx: ExpandCtx params: (Vec Stx) args: (Vec Stx) pos: Pos) -> (Vec Stx)
-  (loop ((i 0) (k 0) (out (vec-empty)))
-    (if (>= i (count params))
-        out
-        (let ((p (nth params i)) (name (unwrap-or (fuse-sym-of (nth params i)) "")))
-          (cond (= name "_") (recur (+ i 1) (+ k 1) (conj out (pair (ctx-gensym ctx "fuse" pos) (nth args k) pos)))
-                (= name "_:") (recur (+ i 2) (+ k 1) (conj out (list-form [(sym (str-concat (unwrap-or (fuse-sym-of (ctx-gensym ctx "fuse" pos)) "") ":") pos)
-                                                                         (nth params (+ i 1)) (nth args k)] pos)))
-                (ends-with-colon? name) (recur (+ i 2) (+ k 1) (conj out (list-form [p (nth params (+ i 1)) (nth args k)] pos)))
-                :else (recur (+ i 1) (+ k 1) (conj out (pair p (nth args k) pos))))))))
-
-;; The element the stages make of the source elements `args`: the innermost stage first.
-(defun element :private (ctx: ExpandCtx stages: (Vec InStage) args: (Vec Stx) pos: Pos) -> Stx
-  (let ((last (- (count stages) 1)))
-    (loop ((i (- last 1)) (acc (apply-stage ctx (nth stages last) args pos)))
-      (if (< i 0) acc (recur (- i 1) (apply-stage ctx (nth stages i) [acc] pos))))))
-
-;; The gensyms of one rewrite: per source its value s, span count sc, first span a and current span b; then
-;; the count n, whether the loop is taken, the first element, the number of output spans, the output spans,
-;; and the loop variables (span j, elements done, span length, output span y, index i).
-(defstruct Names (s: (Vec Stx) sc: (Vec Stx) a: (Vec Stx) b: (Vec Stx)
-                  n: Stx fast: Stx y0: Stx nk: Stx outs: Stx j: Stx done: Stx len: Stx y: Stx i: Stx))
-
-(defun gensyms :private (ctx: ExpandCtx k: i64 pos: Pos) -> (Vec Stx)
-  (loop ((i 0) (out (vec-empty)))
-    (if (< i k) (recur (+ i 1) (conj out (ctx-gensym ctx "fuse" pos))) out)))
-
-(defun names-for :private (ctx: ExpandCtx k: i64 pos: Pos) -> Names
-  (let ((s (gensyms ctx k pos)) (sc (gensyms ctx k pos)) (a (gensyms ctx k pos)) (b (gensyms ctx k pos))
-        (one (gensyms ctx 10 pos)))
-    (Names s sc a b (nth one 0) (nth one 1) (nth one 2) (nth one 3) (nth one 4) (nth one 5) (nth one 6) (nth one 7)
-           (nth one 8) (nth one 9))))
-
-;; One form per source, made by `f` of its index.
-(defun per-source :private (k: i64 f: (fn (i64) Stx)) -> (Vec Stx)
-  (loop ((i 0) (out (vec-empty))) (if (< i k) (recur (+ i 1) (conj out (f i))) out)))
-
-(defun appended :private (a: (Vec Stx) b: (Vec Stx)) -> (Vec Stx)
-  (loop ((i 0) (out a)) (if (< i (count b)) (recur (+ i 1) (conj out (nth b i))) out)))
-
-;; `(if (< a b) a b)`, the smaller of two forms without effects.
-(defun smaller :private (a: Stx b: Stx pos: Pos) -> Stx
-  (call "if" [(pcall "<" [a b] pos) a b] pos))
-
-(defun spanned :private (sc: Stx pos: Pos) -> Stx
-  (pcall "<" [(int -1 pos) sc] pos))
-
-;; The bindings before the choice: each source's span count, the count n of the output (0 when a source has no
-;; spans: then nothing else is asked of it), and whether the loop is taken: every source has spans and, for
-;; two, their spans start at the same indices: both have one span, both more than one (32 each but the last),
-;; or the output fits in the first span of each.
-(defun choice-pairs :private (nm: Names k: i64 pos: Pos) -> (Vec Stx)
-  (let ((sc (. nm sc)) (s (. nm s)) (n (. nm n)))
-    (let ((counts (per-source k (fn (q: i64) (pair (nth sc q) (call "fib.seq/span-count" [(nth s q)] pos) pos))))
-          (all (if (= k 1) (spanned (nth sc 0) pos) (call "if" [(spanned (nth sc 0) pos) (spanned (nth sc 1) pos) (boolean false pos)] pos)))
-          (cnt (if (= k 1)
-                   (call "fib.seq/count" [(nth s 0)] pos)
-                   (smaller (call "fib.seq/count" [(nth s 0)] pos) (call "fib.seq/count" [(nth s 1)] pos) pos)))
-          (aligned (if (= k 1)
-                       (boolean true pos)
-                       (call "if" [(pcall "<" [n (int 33 pos)] pos)
-                                   (boolean true pos)
-                                   (call "if" [(pcall "<" [(int 1 pos) (nth sc 0)] pos)
-                                               (pcall "<" [(int 1 pos) (nth sc 1)] pos)
-                                               (pcall "<" [(nth sc 1) (int 2 pos)] pos)] pos)] pos))))
-      (appended counts [(pair n (call "if" [all cnt (int 0 pos)] pos) pos)
-                        (pair (. nm fast) (call "if" [all aligned (boolean false pos)] pos) pos)]))))
-
-;; The loop over one output span: slots `from` .. len of y, each the stages applied to slot i of the arrays b.
-(defun span-loop :private (ctx: ExpandCtx stages: (Vec InStage) nm: Names k: i64 from: Stx pos: Pos) -> Stx
-  (let ((i (. nm i))
-        (elts (per-source k (fn (q: i64) (call "array-get" [(nth (. nm b) q) i] pos)))))
-    (call "loop" [(list-form [(pair i from pos)] pos)
-                  (call "if" [(pcall "<" [i (. nm len)] pos)
-                              (call "do" [(call "array-set!" [(call "&" [(. nm y)] pos) i (element ctx stages elts pos)] pos)
-                                          (call "recur" [(pcall "+" [i (int 1 pos)] pos)] pos)] pos)
-                              (unit pos)] pos)] pos)))
-
-;; The loop over the spans: span j of each source, an output span of the fewest elements left, filled by
-;; `span-loop` (from slot 1 in span 0: slot 0 is the first element, which the array was made with).
-(defun spans-loop :private (ctx: ExpandCtx stages: (Vec InStage) nm: Names k: i64 pos: Pos) -> Stx
-  (let ((j (. nm j)) (done (. nm done)) (len (. nm len)))
-    (let ((arrays (per-source k (fn (q: i64) (pair (nth (. nm b) q) (call "fib.seq/span-array" [(nth (. nm s) q) j] pos) pos))))
-          (lens (loop ((q 0) (acc (pcall "-" [(. nm n) done] pos)))
-                  (if (< q k) (recur (+ q 1) (smaller (call "array-len" [(nth (. nm b) q)] pos) acc pos)) acc))))
-      (call "loop" [(list-form [(pair j (int 0 pos) pos) (pair done (int 0 pos) pos)] pos)
-                    (call "if" [(pcall "<" [done (. nm n)] pos)
-                                (let-form (appended arrays [(pair len lens pos)
-                                                            (pair (. nm y) (call "cell" [(call "array" [len (. nm y0)] pos)] pos) pos)])
-                                          (call "do" [(span-loop ctx stages nm k (call "if" [(pcall "=" [j (int 0 pos)] pos) (int 1 pos) (int 0 pos)] pos) pos)
-                                                      (call "array-set!" [(call "&" [(. nm outs)] pos) j (call "deref" [(. nm y)] pos)] pos)
-                                                      (call "recur" [(pcall "+" [j (int 1 pos)] pos) (pcall "+" [done len] pos)] pos)] pos)
-                                          pos)
-                                (unit pos)] pos)] pos))))
-
-;; The number of output spans: the source's spans; for two, the fewer spans when both have more than one
-;; (32 each but the last, so the shorter source's), else one.
-(defun span-total :private (nm: Names k: i64 pos: Pos) -> Stx
-  (let ((sc (. nm sc)))
-    (if (= k 1)
-        (nth sc 0)
-        (call "if" [(call "if" [(pcall "<" [(int 1 pos) (nth sc 0)] pos) (pcall "<" [(int 1 pos) (nth sc 1)] pos) (boolean false pos)] pos)
-                    (smaller (nth sc 0) (nth sc 1) pos)
-                    (int 1 pos)] pos))))
-
-;; The loop that makes the Vec when the choice took it. The array of output spans starts filled with a span of one
-;; element (an empty `(array 0 y0)` would leak a counted y0: the runtime does not release the fill of an empty array).
-(defun fast-path :private (ctx: ExpandCtx stages: (Vec InStage) nm: Names k: i64 pos: Pos) -> Stx
-  (let ((firsts (per-source k (fn (q: i64) (call "array-get" [(nth (. nm a) q) (int 0 pos)] pos))))
-        (arrays (per-source k (fn (q: i64) (pair (nth (. nm a) q) (call "fib.seq/span-array" [(nth (. nm s) q) (int 0 pos)] pos) pos)))))
-    (call "if" [(pcall "=" [(. nm n) (int 0 pos)] pos)
-                (call (prelude-name "vec-empty") (vec-empty) pos)
-                (let-form (appended arrays [(pair (. nm y0) (element ctx stages firsts pos) pos)
-                                            (pair (. nm nk) (span-total nm k pos) pos)
-                                            (pair (. nm outs) (call "cell" [(call "array" [(. nm nk) (call "array" [(int 1 pos) (. nm y0)] pos)] pos)] pos) pos)])
-                          (call "do" [(spans-loop ctx stages nm k pos)
-                                      (pcall "vec-from-spans" [(call "deref" [(. nm outs)] pos) (. nm n)] pos)] pos)
-                          pos)] pos)))
 
 ;; ------------------------------------------------------------ the rewrite
 
@@ -366,16 +231,14 @@
          (nil nil)
          ((some ch) (if (chain-ok? env ch) (some (rewritten ctx form items top top-form ch)) nil)))))))
 
+;; The loops of the chain; the call as it was, with gensyms for its sources, is the fallback.
 (defun rewritten :private (ctx: ExpandCtx form: Stx items: (Vec Stx) top: Top top-form: Stx ch: Chain) -> Stx
-  (let ((pos (. form pos))
-        (k (count (. ch sources))))
-    (let ((nm (names-for ctx k pos)))
-      (let ((fallback-top (with-sources top-form (. ch depth) (. nm s))))
-        (let ((fallback (if (< (. top at) 0) fallback-top (with-item-at form items (. top at) fallback-top))))
-          (let-form (appended (per-source k (fn (q: i64) (pair (nth (. nm s) q) (nth (. ch sources) q) pos)))
-                              (choice-pairs nm k pos))
-                    (call "if" [(pcall "not" [(. nm fast)] pos) fallback (fast-path ctx (. ch stages) nm k pos)] pos)
-                    pos))))))
+  (let ((fallback (fn (news: (Vec Stx))
+                    (let ((fallback-top (fg-with-sources top-form (. ch depth) news)))
+                      (if (< (. top at) 0) fallback-top (with-item-at form items (. top at) fallback-top))))))
+    (if (. ch range)
+        (fuse-range-rewrite ctx ch (. form pos) fallback)
+        (fuse-span-rewrite ctx ch (. form pos) fallback))))
 
 (defun with-item-at :private (form: Stx items: (Vec Stx) at: i64 x: Stx) -> Stx
   (Stx (SList (loop ((i 0) (out (vec-empty)))
@@ -402,12 +265,12 @@
   (loop ((i 0) (out (vec-empty)))
     (if (< i (count items)) (recur (+ i 1) (conj out (fuse-inline env ctx (nth items i)))) out)))
 
-;; Whether `form` calls `mapv` anywhere (with `vec` and `into`, which are terminals, the calls this rewrite reads).
+;; Whether `form` calls `mapv` or `filterv` anywhere (with `vec` and `into`, which are terminals, the calls this rewrite reads).
 (defun fuse-calls-mapv? (form: Stx) -> bool
   (match (. form kind)
     ((SList items)
      (or (match (fuse-item-sym items 0)
-           ((some h) (or (= h "mapv") (= h "fib.seq/mapv")))
+           ((some h) (or (= h "mapv") (= h "fib.seq/mapv") (= h "filterv") (= h "fib.seq/filterv")))
            (nil false))
          (any-mapv? items)))
     ((SVec items) (any-mapv? items))

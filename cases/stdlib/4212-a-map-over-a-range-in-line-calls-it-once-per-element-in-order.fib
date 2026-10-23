@@ -1,0 +1,40 @@
+;; spec:   stdlib §2.1 rule 2 (the rewrite changes nothing a program can see); docs/design/vec-performance.md item 2; compiler/expand/fuseinline.fib, fuserange.fib
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: mapv vec into map range
+;; The loop the expander writes for a chain of `map` steps over a range (case 4211) runs the stages as the recipe walk runs
+;; them: each once per element, in the range's order, across the 32-element spans of the output (70 elements), the inner stage
+;; of a chain before the outer for each element. The first element is taken before the loop (it makes the output arrays), so
+;; its call must not be repeated. Every stage logs what it sees in a cell.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun upto (lo: i64 hi: i64 by: i64) -> (Vec i64)
+  (loop ((i lo) (acc [])) (if (if (> by 0) (< i hi) (> i hi)) (recur (+ i by) (conj acc i)) acc)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (let ((log (cell [])))
+          (let ((r (mapv (fn (x) (do (set! log (conj @log x)) (+ x 1))) (range 70))))
+            (do (check c (= @log (upto 0 70 1)))
+                (check c (= r (upto 1 71 1))))))
+        ;; a descending range with a step of 3
+        (let ((log (cell [])))
+          (let ((r (into [] (map (fn (x) (do (set! log (conj @log x)) (* 2 x))) (range 200 0 -3)))))
+            (do (check c (= @log (upto 200 0 -3)))
+                (check c (= (count r) 67)))))
+        ;; a chain: inner then outer, element by element
+        (let ((log (cell [])))
+          (let ((r (vec (map (fn (x) (do (set! log (conj @log (+ 1000 x))) x))
+                             (map (fn (x) (do (set! log (conj @log x)) (* 10 x))) (range 35))))))
+            (do (check c (= (count r) 35))
+                (check c (= (nth @log 0) 0))
+                (check c (= (nth @log 1) 1000))
+                (check c (= (nth @log 2) 1))
+                (check c (= (nth @log 3) 1010))
+                (check c (= (nth @log 68) 34))
+                (check c (= (nth @log 69) 1340))
+                (check c (= (count @log) 70)))))
+        (check c (= (checks-made c) 12))
+        (checks-result c))))
