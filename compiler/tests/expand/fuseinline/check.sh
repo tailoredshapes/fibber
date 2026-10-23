@@ -4,7 +4,10 @@
 # to LLVM IR, its `kern-` `hand-` and `closure-` functions are kept from being inlined into main (so each one's remarks are its own),
 # and `opt -O2` runs with the loop vectoriser's remarks. Each `kern-` and `hand-` function must have a `Vectorized` remark and a
 # vector fmul or fadd in its optimised body; `closure-` must have neither (a stage that is a function value stays a call: that is
-# what the check would miss if it could not fail). Exit 1 on any difference. LLVM_BIN names opt (default: beside LLVM_LIBDIR).
+# what the check would miss if it could not fail). Each `direct-` function (a chain with filter or take steps, compiler/expand/
+# fuseflow.fib) must be direct: no indirect call in its optimised body or in any function or method of the program (`f.`, `m.`)
+# it calls, at any depth; `closure-` must not be (the runtime's own `fib.` functions are not followed). Exit 1 on any difference. LLVM_BIN names
+# opt (default: beside LLVM_LIBDIR).
 # usage: check.sh FIBC     run from anywhere; FIB_LIB defaults to the tree's lib
 fibc=${1:?usage: check.sh FIBC}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -19,7 +22,7 @@ python3 - "$out/k.ll" <<'PY' || exit 1
 import re, sys
 p = sys.argv[1]; out = []
 for l in open(p):
-    m = re.match(r'^define .*@"?(f\.(kern|hand|closure)-[^"(\s]+)"?\(', l)
+    m = re.match(r'^define .*@"?(f\.(kern|hand|closure|direct)-[^"(\s]+)"?\(', l)
     if m and l.rstrip().endswith('{'):
         l = re.sub(r'\)( [^)]*)?#(\d+) \{\s*$', lambda mm: ')' + (mm.group(1) or ' ') + 'noinline #' + mm.group(2) + ' {\n', l)
     out.append(l)
@@ -41,16 +44,35 @@ for l in open(sys.argv[2]):
     if m: cur = m.group(1); bodies[cur] = ''
     elif l.startswith('}'): cur = None
     elif cur: bodies[cur] += l
-names = sorted(n for n in bodies if re.match(r'f\.(kern|hand|closure)-', n))
+names = sorted(n for n in bodies if re.match(r'f\.(kern|hand|closure|direct)-', n))
+def callees(b):
+    return set(m.group(1) for m in re.finditer(r'\bcall [^@%]*@"?([fm]\.[^"(\s]+)"?\(', b))
+def indirect(n):
+    seen, work = set(), [n]
+    while work:
+        f = work.pop()
+        if f in seen or f not in bodies: continue
+        seen.add(f)
+        if re.search(r'\bcall [^@%(]*%[\w.]+\(', bodies[f]): return f
+        work.extend(callees(bodies[f]))
+    return None
 bad = 0
 for n in names:
     vec_op = re.search(r'\bf(mul|add)( \w+)* <\d+ x double>', bodies[n]) is not None
-    got = n in vectorised and vec_op
-    want = not n.startswith('f.closure-')
-    print(('ok   ' if got == want else 'FAIL ') + n + ': ' + ('vectorised' if got else 'not vectorised') + ('' if got == want else ' (wanted ' + ('vectorised' if want else 'not vectorised') + ')'))
-    bad |= got != want
-if len(names) != 8:
-    print('FAIL expected 8 kernels, found %d' % len(names)); bad = 1
+    vgot = n in vectorised and vec_op
+    via = indirect(n)
+    if n.startswith('f.direct-'):
+        ok = via is None
+        print(('ok   ' if ok else 'FAIL ') + n + ': ' + ('direct' if ok else 'an indirect call in ' + via + ' (wanted direct)'))
+    elif n.startswith('f.closure-'):
+        ok = not vgot and via is not None
+        print(('ok   ' if ok else 'FAIL ') + n + ': ' + ('vectorised' if vgot else 'not vectorised') + ', ' + ('an indirect call' if via else 'direct') + ('' if ok else ' (wanted not vectorised, an indirect call)'))
+    else:
+        ok = vgot
+        print(('ok   ' if ok else 'FAIL ') + n + ': ' + ('vectorised' if vgot else 'not vectorised (wanted vectorised)'))
+    bad |= not ok
+if len(names) != 15:
+    print('FAIL expected 15 kernels, found %d' % len(names)); bad = 1
 print('check.sh: %s' % ('every kernel as wanted' if not bad else 'DIFFERENCES'))
 sys.exit(1 if bad else 0)
 PY

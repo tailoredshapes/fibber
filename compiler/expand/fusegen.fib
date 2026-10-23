@@ -99,16 +99,16 @@
   (fg-if (fg-pcall "<" [a b] pos) a b pos))
 
 ;; `form` (the top call, `depth` stage calls above the sources) with `news` for its sources: item 2 of each stage call
-;; is its collection, items 2 and 3 of a two-source `map`.
-(defun fg-with-sources (form: Stx depth: i64 news: (Vec Stx)) -> Stx
-  (let ((items (fuse-list-items form)))
-    (Stx (SList (if (= depth 0)
-                    (loop ((i 0) (out (vec-empty)))
-                      (cond (>= i (count items)) out
-                            (< i 2) (recur (+ i 1) (conj out (nth items i)))
-                            :else (recur (+ i 1) (conj out (nth news (- i 2))))))
-                    (loop ((i 0) (out (vec-empty)))
-                      (if (< i (count items))
-                          (recur (+ i 1) (conj out (if (= i 2) (fg-with-sources (nth items 2) (- depth 1) news) (nth items i))))
-                          out))))
+;; is its collection, items 2 and 3 of a two-source `map`; and the count of each `take` the one of its step in `steps`
+;; (the step of the call `level` calls below the top).
+(defun fg-with-sources (form: Stx depth: i64 news: (Vec Stx) steps: (Vec Step) level: i64) -> Stx
+  (let ((items (fuse-list-items form))
+        (n (match (nth steps level) ((StTake n) (some n)) (_ nil))))
+    (Stx (SList (loop ((i 0) (out (vec-empty)))
+                  (cond (>= i (count items)) out
+                        (and (= i 1) (some? n)) (recur (+ i 1) (conj out (unwrap n)))
+                        (< i 2) (recur (+ i 1) (conj out (nth items i)))
+                        (= depth 0) (recur (+ i 1) (conj out (nth news (- i 2))))
+                        (= i 2) (recur (+ i 1) (conj out (fg-with-sources (nth items 2) (- depth 1) news steps (+ level 1))))
+                        :else (recur (+ i 1) (conj out (nth items i))))))
          (. form pos))))

@@ -3,7 +3,10 @@
 ;; check.sh wants a vectorised loop in each. `hand-` is the hand-written loop over arrays (the control: this LLVM vectorises
 ;; it), `closure-` a map whose stage is a function value the expander cannot see into (it must stay a call, not vectorised).
 ;; `kern-range` and `kern-range-chain` are chains of `map` over a `range` call (compiler/expand/fuserange.fib): the element is the
-;; loop's induction variable, an i64 the stages turn into f64.
+;; loop's induction variable, an i64 the stages turn into f64. Each `direct-` function is a chain with filter, remove, keep, take
+;; or take-while steps (compiler/expand/fuseflow.fib): its loop has branches and appends, which LLVM does not vectorise; check.sh
+;; wants it direct, no indirect call in it or in a function of the program it calls (a closure is called through a pointer).
+;; `closure-filter` is the control: a predicate that is a function value is called through it.
 (ns main)
 
 (defun sq (x: f64) -> f64 (* x x))
@@ -14,6 +17,16 @@
 (defun kern-chain-vec (v: (Vec f64)) -> (Vec f64) (mapv (fn (x) (+ x 1.0)) (map (fn (x: f64) (* x 2.0)) v)))
 (defun kern-range (n: i64) -> (Vec f64) (mapv (fn (i) (* 0.5 (double i))) (range n)))
 (defun kern-range-chain (a: i64 b: i64) -> (Vec f64) (vec (map (fn (x) (+ x 1.0)) (map (fn (i: i64) (double i)) (range a b)))))
+
+;; the chains with steps that are not maps
+(defun pos (x: f64) -> bool (> x 0.5))
+(defun direct-filter (v: (Vec f64)) -> (Vec f64) (vec (filter (fn (x) (> x 0.5)) v)))
+(defun direct-map-filter-named (a: (Array f64)) -> (Vec f64) (into [] (map sq (filter pos a))))
+(defun direct-take (v: (Vec f64) k: i64) -> (Vec f64) (vec (take k (map sq v))))
+(defun direct-take-while (v: (Vec f64)) -> (Vec f64) (vec (take-while (fn (x) (< x 2.0)) v)))
+(defun direct-keep-range (n: i64) -> (Vec f64) (vec (keep (fn (i) (if (> i 5) (some (double i)) nil)) (range n))))
+(defun direct-remove-range (n: i64) -> (Vec i64) (mapv (fn (i) (* 2 i)) (remove (fn (i) (= (rem i 3) 0)) (range n))))
+(defun closure-filter (p: (fn (f64) bool) v: (Vec f64)) -> (Vec f64) (filterv p v))
 
 (defun hand-array (a: (Array f64)) -> (Array f64)
   (let ((c (cell (array (array-len a) 0.0))))
@@ -26,4 +39,6 @@
   (let ((v (mapv (fn (i: i64) (double i)) (range 100)))
         (a (let ((c (cell (array 100 0.0)))) (do (dotimes (i 100) (array-set! &c i (double i))) @c))))
     (count [(kern-literal-vec v) (kern-named-array a) (kern-two-vecs v v) (kern-chain-vec v) (kern-range 100) (kern-range-chain 3 100) (vec (hand-array a))
-            (closure-param (fn (x) (- x)) v)])))
+            (closure-param (fn (x) (- x)) v)
+            (direct-filter v) (direct-map-filter-named a) (direct-take v 10) (direct-take-while v) (direct-keep-range 100)
+            (vec (map double (direct-remove-range 100))) (closure-filter (fn (x) (> x 3.0)) v)])))

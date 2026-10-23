@@ -1,22 +1,27 @@
 ;; compiler/expand/fuseinline.fib: a fused chain with its stage functions in line (docs/design/vec-performance.md item 2;
 ;; stage 2 only, no Rust twin). Run on a top-level form after the let rule (expand.fuselet) and before the fusing walk:
 ;;
-;;   (mapv F c)  (vec (map F c))  (into [] (map F c))  and the same over (map G (map H c)), or (map F a b)
+;;   (mapv F c)  (filterv P c)  (vec CHAIN)  (into [] CHAIN)
 ;;
-;; where every stage function is a symbol (a function called directly) or a plain `fn` literal, becomes counted loops with
-;; the stages' bodies in line: `(let ((x elt)) body)` for a literal, `(g elt)` for a symbol, nested from the innermost stage
-;; out. The loops are written by
-;;  - expand.fusespan when the sources are held in arrays (a Vec, an Array: the `span-count` and `span-array` methods of
-;;    Reducible), which is asked when the program runs: any other source takes the call as it was, which the fusing walk
-;;    then makes recipes of;
-;;  - expand.fuserange when the one source is a `range` call (`(range n)`, `(range a b)`, `(range a b s)`, `range-by`):
-;;    the loop walks the range itself, by repeated addition of the step, as its Reducible instance does.
-;; Both write the output in fresh arrays of 32 that `vec-from-spans` makes the Vec without a copy, and the inner loop is
-;; the shape LLVM vectorises: one counted loop from a small constant, every array index the loop variable itself (an index
-;; with an offset, `(array-get b (+ i d))`, leaves a bounds check LLVM cannot count, and the loop is not vectorised).
+;; where CHAIN is a call of `map`, `filter`, `remove`, `keep`, `take` or `take-while` whose collection is another (down to a
+;; source that is none), or `(map F a b)` at the bottom of a chain of `map`s, and every stage function is a symbol (a
+;; function called directly) or a plain `fn` literal, becomes loops with the stages' bodies in line: `(let ((x elt)) body)`
+;; for a literal, `(g elt)` for a symbol, nested from the innermost stage out. The loops are written by
+;;  - expand.fusespan, for a chain of `map`s over sources held in arrays (a Vec, an Array: the `span-count` and `span-array`
+;;    methods of Reducible), which is asked when the program runs: any other source takes the call as it was, which the
+;;    fusing walk then makes recipes of;
+;;  - expand.fuserange, for a chain of `map`s over a `range` call (`(range n)`, `(range a b)`, `(range a b s)`, `range-by`):
+;;    the loop walks the range itself, by repeated addition of the step, as its Reducible instance does;
+;;  - expand.fuseflow, for a chain with other steps over one source of either kind: a loop that appends what comes through
+;;    to a builder, a take's count a loop variable, the walk ended where the recipes Taken and TakenWhile end it.
+;; The first two write the output in fresh arrays of 32 that `vec-from-spans` makes the Vec without a copy, and their inner
+;; loop is the shape LLVM vectorises: one counted loop from a small constant, every array index the loop variable itself (an
+;; index with an offset, `(array-get b (+ i d))`, leaves a bounds check LLVM cannot count, and the loop is not vectorised).
+;; The third has branches and early exits and is not vectorised; it calls nothing through a pointer.
 ;;
 ;; Why it is the same program: the stage functions are atomic (a symbol or a `fn` form: evaluating them has no effect),
-;; so evaluating the sources first, in their order, moves nothing past an effect; the elements are read once each, in
+;; so evaluating the sources first, in their order, moves nothing past an effect (a take's count that is not atomic is
+;; evaluated before them, the outermost first, as the calls evaluate them); the elements are read once each, in
 ;; order, and each stage runs once per element, innermost first, element after element, as the recipe walk runs them; a
 ;; trap in a stage traps at the same element. A literal is taken only when it is a plain `fn` (no name, `->` or `:where`)
 ;; whose parameters are symbols, one per element it receives, and whose body has no `recur` outside a `loop` of its own
@@ -25,13 +30,13 @@
 ;; the form or defined by the module.
 (ns expand.fuseinline
   (:use syntax.pos syntax.form expand.ctx expand.build expand.collections expand.fusetab expand.fusescan expand.fuse
-        expand.fusegen expand.fusespan expand.fuserange))
+        expand.fusegen expand.fusespan expand.fuserange expand.fuseflow))
 
 ;; The bodies of the stages, in nodes, past which the chain is not put in line.
 (def max-body-nodes: i64 200)
 
 ;; The names the loop uses bare.
-(def bare-names: (Vec str) ["let" "loop" "if" "do" "recur" "cell" "array" "array-get" "array-set!" "array-len" "deref" "&" "."])
+(def bare-names: (Vec str) ["let" "loop" "if" "do" "recur" "cell" "array" "array-get" "array-set!" "array-len" "deref" "&" "." "match" "some"])
 
 (defun form-nodes :private (f: Stx) -> i64
   (match (. f kind)
@@ -120,13 +125,6 @@
 ;; A step read from a call, and what it reads: one collection, or the two sources of a two-source `map`.
 (defstruct Got (step: Step colls: (Vec Stx)))
 
-;; Whether `f` is a count `take` can be given in line: a symbol or an integer literal (atomic, so it can move).
-(defun count-arg? :private (f: Stx) -> bool
-  (match (. f kind)
-    ((SSym s) (not (or (= s "nil") (= s "fn"))))
-    ((SInt _ _) true)
-    (_ false)))
-
 (defun one-arg :private (items: (Vec Stx) make: (fn (InStage) Step)) -> (Option Got)
   (match (in-stage (nth items 1) 1)
     ((some s) (some (Got (make s) [(nth items 2)])))
@@ -148,7 +146,7 @@
              (= name "remove") (one-arg items (fn (s) (StRemove s)))
              (= name "keep") (one-arg items (fn (s) (StKeep s)))
              (= name "take-while") (one-arg items (fn (s) (StTakeWhile s)))
-             (= name "take") (if (count-arg? (nth items 1)) (some (Got (StTake (nth items 1)) [(nth items 2)])) nil)
+             (= name "take") (some (Got (StTake (nth items 1)) [(nth items 2)]))
              :else nil)))))
 
 ;; Whether `c` is a call of the library's `range` (one or three arguments) or `range-by`: its value is a Range.
@@ -203,9 +201,17 @@
     (and (= (count items) 1) (= (fuse-item-sym items 0) (some "fib.prelude/vec-empty")))))
 
 ;; Whether the chain is one the loops are written for, small enough, and none of the bare names is the form's or the
-;; module's: a chain of `map` steps (the one shape so far).
+;; module's: a chain of `map` steps over one or two sources, or a chain with other steps over one source (a filter, remove
+;; or take-while asks `truthy?` of fib.core, which the module must see). A source that is itself a stage the recipe rewrite
+;; takes (a `drop`, a `mapcat`, a `map` whose function is not put in line ..) is left to it: bound to a name it would be
+;; the lazy seq, which converts a source that is not one in full (case 821).
 (defun chain-ok? :private (env: FuseEnv ch: Chain) -> bool
-  (and (fg-maps-only? (. ch steps))
+  (and (loop ((i 0))
+         (cond (>= i (count (. ch sources))) true
+               (some? (fuse-stage-call env (fuse-list-items (nth (. ch sources) i)))) false
+               :else (recur (+ i 1))))
+       (or (fg-maps-only? (. ch steps))
+           (and (= (count (. ch sources)) 1) (or (. (. env module) core) (not (needs-truthy? (. ch steps))))))
        (<= (loop ((i 0) (n 0))
              (if (< i (count (. ch steps))) (recur (+ i 1) (+ n (step-nodes (nth (. ch steps) i)))) n))
            max-body-nodes)
@@ -213,6 +219,12 @@
          (cond (>= i (count bare-names)) true
                (name-taken? env (nth bare-names i)) false
                :else (recur (+ i 1))))))
+
+(defun needs-truthy? :private (steps: (Vec Step)) -> bool
+  (loop ((i 0))
+    (cond (>= i (count steps)) false
+          (match (nth steps i) ((StFilter _) true) ((StRemove _) true) ((StTakeWhile _) true) (_ false)) true
+          :else (recur (+ i 1)))))
 
 ;; Whether `name` is bound by the form or is the module's own.
 (defun name-taken? :private (env: FuseEnv name: str) -> bool
@@ -231,14 +243,33 @@
          (nil nil)
          ((some ch) (if (chain-ok? env ch) (some (rewritten ctx form items top top-form ch)) nil)))))))
 
-;; The loops of the chain; the call as it was, with gensyms for its sources, is the fallback.
-(defun rewritten :private (ctx: ExpandCtx form: Stx items: (Vec Stx) top: Top top-form: Stx ch: Chain) -> Stx
-  (let ((fallback (fn (news: (Vec Stx))
-                    (let ((fallback-top (fg-with-sources top-form (. ch depth) news)))
-                      (if (< (. top at) 0) fallback-top (with-item-at form items (. top at) fallback-top))))))
-    (if (. ch range)
-        (fuse-range-rewrite ctx ch (. form pos) fallback)
-        (fuse-span-rewrite ctx ch (. form pos) fallback))))
+;; The loops of the chain; the call as it was, with gensyms for its sources, is the fallback. The count of a `take` that is
+;; not atomic is evaluated first, the outermost first, as the calls evaluate them (each before the collection it reads),
+;; and its gensym is the count in the loops and in the fallback.
+(defun rewritten :private (ctx: ExpandCtx form: Stx items: (Vec Stx) top: Top top-form: Stx ch0: Chain) -> Stx
+  (let ((pos (. form pos)) (counts (count-pairs ctx (. ch0 steps) pos)))
+    (let ((ch (Chain (. counts steps) (. ch0 sources) (. ch0 depth) (. ch0 range))))
+      (let ((fallback (fn (news: (Vec Stx))
+                        (let ((fallback-top (fg-with-sources top-form (. ch depth) news (. ch steps) 0)))
+                          (if (< (. top at) 0) fallback-top (with-item-at form items (. top at) fallback-top))))))
+        (let ((loops (cond (not (fg-maps-only? (. ch steps))) (fuse-flow-rewrite ctx ch pos fallback)
+                           (. ch range) (fuse-range-rewrite ctx ch pos fallback)
+                           :else (fuse-span-rewrite ctx ch pos fallback))))
+          (if (= (count (. counts pairs)) 0) loops (fg-let (. counts pairs) loops pos)))))))
+
+;; The steps with each `take` count that is not atomic a gensym, and the bindings of those gensyms, outermost first.
+(defstruct CountPairs (steps: (Vec Step) pairs: (Vec Stx)))
+
+(defun count-pairs :private (ctx: ExpandCtx steps: (Vec Step) pos: Pos) -> CountPairs
+  (loop ((i 0) (out (vec-empty)) (pairs (vec-empty)))
+    (if (>= i (count steps))
+        (CountPairs out pairs)
+        (match (nth steps i)
+          ((StTake n) (if (fuse-atomic? n)
+                          (recur (+ i 1) (conj out (StTake n)) pairs)
+                          (let ((g (ctx-gensym ctx "fuse" pos)))
+                            (recur (+ i 1) (conj out (StTake g)) (conj pairs (fg-pair g n pos))))))
+          (_ (recur (+ i 1) (conj out (nth steps i)) pairs))))))
 
 (defun with-item-at :private (form: Stx items: (Vec Stx) at: i64 x: Stx) -> Stx
   (Stx (SList (loop ((i 0) (out (vec-empty)))
