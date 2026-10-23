@@ -2014,7 +2014,7 @@ consume(e):   Owned        → move: no operation; the count travels with the va
 | # | Position | Forms |
 |---|---|---|
 | E1 | return | the value of a `defun`, `fn`, method or `async` body (after the body's own scope exits) |
-| E2 | store | the object arguments of struct and variant constructors; `(cell e)`; `(set! c e)`; `(atom e)`; `(reset! a e)`; `(array n e)` (n copies); `(array-with a i e)`; `(array-set! &a i e)`; `(array-push! &a e)`; `(set-field! &s f e)`; the result of `f` in `(swap! a f)` and in `(cell-update! c f)`; the operand of `(raw-retained e)` (§6.13). Stores inside library functions are those functions' business: `conj`'s element is stored by `array-with` inside `conj` |
+| E2 | store | the object arguments of struct and variant constructors; `(cell e)`; `(set! c e)`; `(atom e)`; `(reset! a e)`; `(array n e)` (n copies: the count handed in is element 0's, released when n is below 1); `(array-with a i e)`; `(array-set! &a i e)`; `(array-push! &a e)`; `(set-field! &s f e)`; the result of `f` in `(swap! a f)` and in `(cell-update! c f)`; the operand of `(raw-retained e)` (§6.13). Stores inside library functions are those functions' business: `conj`'s element is stored by `array-with` inside `conj` |
 | E3 | capture | each object capture of a heap closure (a `fn` that is escaping or at a tail site, §6.5) and of every `async`; the retain happens when the closure or task object is created |
 | E4 | thread | the argument of `spawn` (consumed; E3 already retained its captures) |
 | E5 | await | subsumed by E3: the task's frame owns everything it references (§6.9) |
@@ -2127,12 +2127,36 @@ field read:
 *Why it is sound.* After the move nothing can read the slot: F2 says no later step of the path reads the struct, F3 says the frame owns the only count it is accountable for, and
 the run-time test says that no other holder reaches the object. The struct's release, at its scope exit, skips the null. A closure or task that captured the binding is excluded
 (`pinned`). *What it does not do*: a read through a path, `(. (. o in) buf)` (the inner object is held by a struct that may be shared: case 382), a read at a `let` or `loop`
-initialiser or at a `set!` (they retain, §6.3 `store`), a field of an owned temporary (`(. (f x) buf)`: the temporary's step ends after the read), and `with` on a unique record whose
-new value reads the old one (`(with p (buf (array-with (. p buf) 0 x)))`: the expansion keeps `p` live in the cell while the value is built; write `match` or a pattern on `p`). The
-library's way to an in-place update through a unique struct is the constructor pattern, which steals at its last use as before, or this field read. There is no "use after partial
+initialiser or at a `set!` (they retain, §6.3 `store`), and a field of an owned temporary (`(. (f x) buf)`: the temporary's step ends after the read). The
+library's way to an in-place update through a unique struct is the constructor pattern, which steals at its last use as before, this field read, or `with` (below). There is no "use after partial
 move" error: the language has no moved state that a program can observe, so nothing is rejected; the plan simply does not move when F1 to F3 do not hold (cases 380 to 382 check
 that the answer is the same either way). Effect: `fib.tensor`'s `adam-step-owned` and `fib.autodiff`'s `adam-step` update the parameters and moments in place (`vec-take-at` hands a
 unique tensor out of a unique `Vec`; case 8201 bounds the allocations of a chain of steps).
+
+**The `with` take** (lever L6 of design/in-place-update.md; cases `cases/stdlib/4020`, `4021`). `(with e (f v) ..)` expands to
+`(let ((c (cell e))) (do (set-field! &c f v) .. @c))` (`lib/fib/coll/record.fib`), so a `v` that reads `(. e f)` reads `e` after `(cell e)`: the cell is handed a
+second count of the struct, `set-field!` copies it and the field read is retained, so the field is copied too. Two steps remove that when nothing else needs `e`:
+
+- *The macro* (syntactic). When `e` is a symbol, every occurrence of it in the new values is a read of the field that value replaces, `(. e f)` or `(:f e)`, and
+  each such field is replaced once, an update whose value reads its field is written `(set-field! &c f (let ((t (. e f))) v'))`, `v'` being `v` with each of those
+  reads replaced by the fresh `t`. The answer is the same under any checker (the field is read once instead of at each place; a struct does not change). Any
+  other `with` (a target that is an expression, `e` named another way, a value that reads another field, a field replaced twice) expands as before.
+- *The checker* (`compiler/types/take.fib`, at the elaboration after inference). In `(let ((c (cell x))) (do s ..))` with `x` a local variable, each step `s` of
+  the form `(set-field! &c f (let ((t (. x f))) body))` whose `body` does not name `c` (as a value, `&c`, `@c`, `set!`, `set-field!`) has its read served from
+  the cell, when those reads are all the names of `x` in the `do` (a closure that captures `x` names it). The read becomes a **take** of field `f` of the struct
+  in `c`, with the read's node id and type: `x` is then at its last use in `(cell x)` (moved, or retained when it is used after the `let`).
+- *Emission* (`lcx-take-field`, `emit/lower/cells.fib`). The take loads the struct from the cell; when `fib.unique?` holds of it, an object field is loaded and
+  its slot set to null, the count travelling with the value; else the field is retained and the struct is not touched. A `dyn` field is retained, a scalar
+  field read. The `set-field!` that follows finds the struct unique and refills the slot in place (the release of the null is a no-op), or copies a shared
+  struct as before.
+
+*Why it is sound.* Between the take and the `set-field!` that refills the slot nothing reads the cell: the take is the whole initialiser of the `let` that is the
+stored value, the body of that `let` does not name `c`, `c` is not captured (it is named only in the forms the rule lists), and nothing else holds the struct
+when its count is one. A shared struct keeps its field (case 4021, check 4: the expansion written out with the record read after it, so the take is made
+while the cell's struct has a second holder), and a shared field is copied by the consuming call as for any shared value. *What it does not do*: a target
+that is a path, `(with (. o in) ..)`, at the top (the inner struct is read, not taken; a nested `with` inside the outer `with` of `o` gets the take at both
+levels, case 4021 check 10), and an update that reads another field of `e` (the record is then named outside the reads, and nothing is taken). Effect: case
+4020 (1000 `with` updates of a `Vec` field) allocates 6477 objects, 16477 before.
 
 **Element reads** (performance batch 4, lever B; cases 270 to 278). `(array-get a i)` is the one
 primitive whose result is a part of an operand, as `(. e f)` is, and §6.2 gives it the same mode: `Derived(b)` when

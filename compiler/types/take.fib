@@ -1,0 +1,81 @@
+;; compiler/types/take.fib: the `with` take (spec/types.md §6.3, "Field moves"), applied by the elaboration after inference.
+;;
+;; `(with e (f (g (. e f))))` expands (lib/fib/coll/record.fib) to
+;;   (let ((c (cell e))) (do (set-field! &c f (let ((t (. e f))) (g t))) @c))
+;; As written, `e` is read after `(cell e)`, so the cell is handed a second count of the struct and the struct and the field are
+;; copied by the update. When the body names `e` only in such reads, each read is served from the cell instead (`ETakeField`, the
+;; same node id and type): `e` is then at its last use in `(cell e)`, the cell may hold the only count of the struct, and the field
+;; moves out of it while the new value is built. Nothing reads the cell between the take and the `set-field!` that refills the
+;; slot: the take is the whole initialiser of the `let` that is the stored value, and that `let`'s body does not name the cell.
+(ns types.take
+  (:use types.ast types.builtins))
+
+;; x when e is `(cell x)` with x a local variable.
+(defun cell-of :private (e: Expr) -> (Option i64)
+  (match (. e kind)
+    ((ECall h args)
+     (match (. h kind)
+       ((EGlobal (GBuiltin b))
+        (if (and (= (. (nth (builtin-table) b) name) "cell") (= (count args) 1))
+            (match (nth args 0) ((ArgExpr x) (match (. x kind) ((ELocal v) (some v)) (_ nil))) (_ nil))
+            nil))
+       (_ nil)))
+    (_ nil)))
+
+;; How often e names the variable v: as a value, and (counted as two, so that it is never matched) as the place of `&v`, `@`,
+;; `set!`, `set-field!` or a take.
+(defun names-of (e: Expr v: i64) -> i64
+  (let ((here (match (. e kind)
+                ((ELocal b) (if (= b v) 1 0))
+                ((EDeref (PlAmp b) _) (if (= b v) 2 0))
+                ((ESet (PlAmp b) _) (if (= b v) 2 0))
+                ((ESetField b _ _) (if (= b v) 2 0))
+                ((ETakeField b _) (if (= b v) 2 0))
+                ((ECall _ args) (reduce (fn (n: i64 a: Arg) (match a ((ArgAmp b _) (if (= b v) (+ n 2) n)) (_ n))) 0 args))
+                (_ 0))))
+    (reduce (fn (n: i64 c: Expr) (+ n (names-of c v))) here (expr-children e))))
+
+;; The value of `(set-field! &c f (let ((t (. x f))) body))` with the read served from c, when it is one and body does not name c.
+(defun take-value :private (s: Expr c: i64 x: i64) -> (Option Expr)
+  (match (. s kind)
+    ((ESetField b f v)
+     (match (. v kind)
+       ((ELet bs body)
+        (if (and (= b c) (= (count bs) 1) (= (names-of body c) 0))
+            (let ((lb (nth bs 0)) (init (. (nth bs 0) init)))
+              (match (. init kind)
+                ((EField r g _)
+                 (match (. r kind)
+                   ((ELocal y)
+                    (if (and (= y x) (= g f))
+                        (some (Expr (. v id) (. v pos)
+                                    (ELet [(LetBind (. lb pat) (Expr (. init id) (. init pos) (ETakeField c f)))] body)))
+                        nil))
+                   (_ nil)))
+                (_ nil)))
+            nil))
+       (_ nil)))
+    (_ nil)))
+
+;; `(let ((c (cell x))) (do ..))` with the takes of its `set-field!`s served from c, when they are all the names of x in the `do`;
+;; any other `let` as it is.
+(defun take-let (bs: (Vec LetBind) body: Expr) -> ExprKind
+  (let ((plain (ELet bs body)))
+    (if (not (= (count bs) 1))
+        plain
+        (match (Pair (. (. (nth bs 0) pat) kind) (cell-of (. (nth bs 0) init)))
+          ((Pair (PBind c) (some x))
+           (match (. body kind)
+             ((EDo es)
+              (let ((vs (mapv (fn (s: Expr) (take-value s c x)) es))
+                    (n (count (filter some? vs))))
+                (if (and (> n 0) (= (names-of body x) n))
+                    (ELet bs (Expr (. body id) (. body pos)
+                                   (EDo (vec (map-indexed (fn (i: i64 s: Expr)
+                                                            (match (nth vs i)
+                                                              ((some v) (match (. s kind) ((ESetField b f _) (Expr (. s id) (. s pos) (ESetField b f v))) (_ s)))
+                                                              (nil s)))
+                                                          es)))))
+                    plain)))
+             (_ plain)))
+          (_ plain)))))

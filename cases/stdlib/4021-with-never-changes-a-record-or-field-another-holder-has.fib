@@ -1,0 +1,61 @@
+;; spec:   types §6.3 ("Field moves", the `with` take), design/in-place-update.md §6 T1 and T7, stdlib §2.5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: with
+;; The `with` take (case 4020) moves a field out of the record in the `with` cell only when that record is unique at run time, and the
+;; checker uses it only when the update names the record in no other way. Each check is a way to hold the record or the field twice,
+;; or a `with` the take must not change, and compares with the persistent answer: (1) every version of a record kept in a history;
+;; (2) the field's vector also held by a `let`; (3) the record read again after the `with`; (4) the same with the expansion written
+;; out, so that the checker does take while the cell's record is shared and only the run-time test keeps it whole; (5) a target that is
+;; not a variable; (6) another update reads the taken field, (7) the new value reads another field, (8) the field updated twice: no
+;; take, the values read the original record; (9) `(:xs e)`; (10) a nested `with` through `(. o inner)` with every outer version kept;
+;; (11) a closure in the new value that reads the old field; (12) a record held by a vector.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defrecord Box [n: i64 xs: (Vec i64)])
+(defrecord Outer [inner: Box tag: i64])
+
+(defun bump (e: Box k: i64) -> Box (with e (xs (assoc (. e xs) k (+ (nth (. e xs) k) 1)))))
+
+(defun box (k: i64) -> Box (->Box k (vec (range k))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (hist (loop ((i 0) (e (box 10)) (h [])) (if (>= i 10) (conj h e) (recur (+ i 1) (bump e i) (conj h e)))))
+        (v (vec (range 5)))
+        (e2 (bump (->Box 0 v) 0))
+        (e3 (box 4))
+        (e4 (with e3 (xs (conj (. e3 xs) 9))))
+        (e5 (box 4))
+        (e6 (let ((w (cell e5))) (do (set-field! &w xs (let ((t (. e5 xs))) (assoc t 0 7))) @w)))
+        (e7 (with (box 3) (xs (conj (. (box 3) xs) 1))))
+        (e8 (let ((e (box 3))) (with e (xs (assoc (. e xs) 0 5)) (n (count (. e xs))))))
+        (e9 (let ((e (box 3))) (with e (xs (conj (. e xs) (. e n))))))
+        (e10 (let ((e (box 2))) (with e (xs (conj (. e xs) 1)) (xs (conj (. e xs) 2)))))
+        (e11 (let ((e (box 2))) (with e (xs (conj (:xs e) 4)))))
+        (os (loop ((i 0) (o (->Outer (box 3) 0)) (h []))
+              (if (>= i 3) (conj h o) (recur (+ i 1) (with o (inner (with (. o inner) (xs (conj (. (. o inner) xs) i))))) (conj h o)))))
+        (e12 (let ((e (box 3))) (with e (xs (mapv (fn (x) (+ x (count (. e xs)))) (. e xs))))))
+        (bs [(box 2)])
+        (e13 (bump (nth bs 0) 1)))
+    (do (dotimes (j 11)
+          (check c (= (. (nth hist j) xs) (vec (map (fn (k) (if (< k j) (+ k 1) k)) (range 10))))))
+        (check c (= v [0 1 2 3 4]))
+        (check c (= (. e2 xs) [1 1 2 3 4]))
+        (check c (= (. e3 xs) [0 1 2 3]))
+        (check c (= (. e4 xs) [0 1 2 3 9]))
+        (check c (= (. e5 xs) [0 1 2 3]))
+        (check c (= (. e6 xs) [7 1 2 3]))
+        (check c (= (. e7 xs) [0 1 2 1]))
+        (check c (and (= (. e8 xs) [5 1 2]) (= (. e8 n) 3)))
+        (check c (= (. e9 xs) [0 1 2 3]))
+        (check c (= (. e10 xs) [0 1 2]))
+        (check c (= (. e11 xs) [0 1 4]))
+        (dotimes (j 4)
+          (check c (= (. (. (nth os j) inner) xs) (into [0 1 2] (range j)))))
+        (check c (= (. e12 xs) [3 4 5]))
+        (check c (and (= (. (nth bs 0) xs) [0 1]) (= (. e13 xs) [0 2])))
+        (check c (= (checks-made c) 28))
+        (checks-result c))))

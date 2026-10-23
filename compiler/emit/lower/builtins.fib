@@ -187,20 +187,22 @@
               (fb-open b lb)
               (let ((ep (fb-val b (elem-ptr r (v-expr p) (v-expr i)) LirPtr)))
                 (do (lcx-store cx x (v-expr ep))
-                    (when (. r counted) (retain-after-first cx x i))
+                    (when (. r counted) (count-when cx la/INe i 0 x false "fillr" "filln"))
                     (let ((i2 (fb-val b (nx/binary la/BAdd (v-expr i) (nx/integer lt/ty-i64 1)) LirI64)) (back (fb-current b)))
                       (do (fb-term b (nx/branch lh))
                           (fb-patch-phi b lh (nx/operand-name (v-expr i)) back (v-expr i2))
-                          (fb-open b ld))))))))))
+                          (fb-open b ld)
+                          (when (and (. r counted) (not (nx/integer-positive? (v-expr n)))) (count-when cx la/ISlt n 1 x true "fill0" "filln0")))))))))))
 
-;; A count on `x` for every element but the first.
-(defun retain-after-first :private (cx: LowerCx x: V i: V) -> unit
-  (let ((b (. cx b)) (nf (fb-val b (nx/compare-int la/INe (v-expr i) (nx/integer lt/ty-i64 0)) LirI1)) (lr (fb-label b "fillr")) (ln (fb-label b "filln")))
-    (do (fb-term b (nx/conditional (v-expr nf) lr ln))
+;; A count on `x` for every element but the first, and the count handed to `(array n x)` released when there is no element to hold it
+;; (n below 1): `x` retained (or released) when `(pred a k)` holds at run time.
+(defun count-when :private (cx: LowerCx pred: la/LIPred a: V k: i64 x: V release: bool ly: str ln: str) -> unit
+  (let ((b (. cx b)) (t (fb-val b (nx/compare-int pred (v-expr a) (nx/integer lt/ty-i64 k)) LirI1)) (lr (fb-label b ly)) (lj (fb-label b ln)))
+    (do (fb-term b (nx/conditional (v-expr t) lr lj))
         (fb-open b lr)
-        (lcx-retain cx x)
-        (fb-term b (nx/branch ln))
-        (fb-open b ln))))
+        (if release (lcx-release cx x) (lcx-retain cx x))
+        (fb-term b (nx/branch lj))
+        (fb-open b lj))))
 
 ;; The address of element `i`, after the bounds check (a trap with the interpreter's message, `eval/arrays.rs`).
 (defun array-index :private (cx: LowerCx r: Arr arr: la/LExpr i: V) -> la/LExpr
