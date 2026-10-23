@@ -5,7 +5,7 @@
 ;; writes it to the client's connection and exits. The server never waits: it goes back to its next connection, so runs are concurrent. Neither child
 ;; keeps the listening socket, so a server that dies leaves nothing holding its address.
 (ns serve.exec
-  (:require [serve.sock :as sk] [fib.unix :as unix] [driver.native :as native] [lir.ast :as la]))
+  (:require [serve.sock :as sk] [fib.unix :as unix] [driver.native :as native] [emit.compile :as ec]))
 
 (def output-max: i64 4194304)
 
@@ -30,18 +30,18 @@
     ((Err _) ())))
 
 ;; In the program's own process: streams, alarm, the run; the process never returns.
-(defun program-process :private (outp: str errp: str file: str lir: la/LModule opt: i64 args: (Vec str) secs: i64) -> unit
+(defun program-process :private (outp: str errp: str file: str lir: ec/Emitted opt: i64 args: (Vec str) secs: i64) -> unit
   (do (sk/no-core)
       (open-onto "/dev/null" unix/O_RDONLY 0)
       (open-onto outp (+ unix/O_WRONLY (+ unix/O_CREAT unix/O_TRUNC)) 1)
       (open-onto errp (+ unix/O_WRONLY (+ unix/O_CREAT unix/O_TRUNC)) 2)
       (when (> secs 0) (sk/alarm-in secs))
-      (match (native/run-module file lir opt args)
+      (match (native/run-module file (. lir ast) (. lir links) opt args)
         ((Ok code) (sk/exit-flush code))
         ((Err m) (do (eprintln (str "compile failed: " m)) (sk/exit-flush 5))))))
 
 ;; In the reporter: the program forked, waited for, its streams read, the response written, everything closed; the process never returns.
-(defun reporter :private (conn: i64 listener: i64 dir: str file: str lir: la/LModule opt: i64 args: (Vec str) secs: i64 finish: (fn (i64 str str) str)) -> unit
+(defun reporter :private (conn: i64 listener: i64 dir: str file: str lir: ec/Emitted opt: i64 args: (Vec str) secs: i64 finish: (fn (i64 str str) str)) -> unit
   (let ((tag (str dir "/" (show (sk/process-id))))
         (outp (str dir "/" (show (sk/process-id)) ".out"))
         (errp (str dir "/" (show (sk/process-id)) ".err"))
@@ -58,7 +58,7 @@
               (sk/exit-now 0))))))
 
 ;; Starts the run; true in the server when the reporter was forked (the server must then close its copy of `conn`), false when no process could be made.
-(defun spawn-run (conn: i64 listener: i64 dir: str file: str lir: la/LModule opt: i64 args: (Vec str) secs: i64 finish: (fn (i64 str str) str)) -> bool
+(defun spawn-run (conn: i64 listener: i64 dir: str file: str lir: ec/Emitted opt: i64 args: (Vec str) secs: i64 finish: (fn (i64 str str) str)) -> bool
   (let ((pid (sk/fork-process)))
     (cond (< pid 0) false
           (= pid 0) (do (reporter conn listener dir file lir opt args secs finish) true)
