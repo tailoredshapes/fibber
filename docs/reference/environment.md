@@ -42,8 +42,8 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LIRO_STATS` | [compiler/fibc.fib:81](../../compiler/fibc.fib#L81) |
 | `FIB_LIRO_UNITS` | [compiler/native/liro/partition.fib:39](../../compiler/native/liro/partition.fib#L39) |
 | `FIB_LIVE` | [compiler/driver/testlive.fib:89](../../compiler/driver/testlive.fib#L89) |
-| `FIB_LIVE_BASE` | [compiler/serve/livesess.fib:216](../../compiler/serve/livesess.fib#L216) |
-| `FIB_LIVE_DEBUG` | [compiler/serve/livesess.fib:377](../../compiler/serve/livesess.fib#L377) |
+| `FIB_LIVE_BASE` | [compiler/serve/livesess.fib:223](../../compiler/serve/livesess.fib#L223) |
+| `FIB_LIVE_DEBUG` | [compiler/serve/livesess.fib:384](../../compiler/serve/livesess.fib#L384) |
 | `FIB_LIVE_DEPS` | [compiler/fibc.fib:75](../../compiler/fibc.fib#L75) |
 | `FIB_LIVE_EMIT` | [compiler/emit/program.fib:98](../../compiler/emit/program.fib#L98) |
 | `FIB_LIVE_LIBS` | [compiler/fibc.fib:127](../../compiler/fibc.fib#L127) |
