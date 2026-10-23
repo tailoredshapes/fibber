@@ -28,18 +28,19 @@
 ;; a copy of the struct e with the named fields replaced. A new value that reads the field it replaces reads it once, into a `let`:
 ;; `(set-field! &c f (let ((t (. e f))) v))`, which the checker turns into a take from the cell when e is named nowhere else (types §6.3,
 ;; "Field moves", the `with` take), so the field of a unique struct is updated where it lies
+;; Inside: `hit?` says x is the read of the field f of the target, (. e f) or (:f e); `uses` counts the occurrences in x of the
+;; target's name and of reads of its field f; `swap` is x with each read of the field f of the target replaced by t. The take is used
+;; when every mention of the target in the new values is a read of the field that value replaces, and that field is replaced once;
+;; else each value reads the target itself (and the cell's struct is shared while it does).
 (defmacro with (e ... updates)
-  (let ((c (gensym "with"))
-        (en (match e ((Sym s) s) (_ "")))
+  (let ((c (gensym "with")) (en (match e ((Sym s) s) (_ "")))
         (named (fn (x: Form s: str) -> bool (match x ((Sym n) (= n s)) (_ false))))
         (kids (fn (x: Form) -> (Vec Form) (match x ((List xs) xs) ((Vec xs) xs) ((Map xs) xs) (_ (vec-empty)))))
-        ;; x is the read of the field f of the target: (. e f) or (:f e)
         (hit? (fn (x: Form f: str) -> bool
                 (match x
                   ((List xs) (or (and (= (vec-count xs) 3) (named (vec-nth xs 0) ".") (named (vec-nth xs 1) en) (named (vec-nth xs 2) f))
                                  (and (= (vec-count xs) 2) (named (vec-nth xs 1) en) (match (vec-nth xs 0) ((Kw k) (= k f)) (_ false)))))
                   (_ false))))
-        ;; the occurrences in x of the target's name, and of reads of its field f
         (uses (fn uses (x: Form f: str) -> (Pair i64 i64)
                 (if (hit? x f)
                     (Pair 1 1)
@@ -48,7 +49,6 @@
                         (if (< i (vec-count xs))
                             (match (uses (vec-nth xs i) f) ((Pair a b) (recur (+ i 1) (+ m a) (+ h b))))
                             (Pair m h)))))))
-        ;; x with each read of the field f of the target replaced by t
         (swap (fn swap (x: Form f: str t: Form) -> Form
                 (if (hit? x f)
                     t
@@ -62,8 +62,6 @@
                          (_ (trap "with: each update is (field value)")))
                        ps)))
           (fname (fn (pair: (Vec Form)) -> str (match (vec-nth pair 0) ((Sym s) s) (_ "")))))
-      ;; the take is used when every mention of the target in the new values is a read of the field that value replaces, and that
-      ;; field is replaced once; else each value reads the target itself (and the cell's struct is shared while it does)
       (let ((takes (loop ((i 0) (ok (not (= en ""))) (ts (vec-empty)))
                      (if (and ok (< i (vec-count pairs)))
                          (let ((pair (vec-nth pairs i)) (f (fname pair)))
@@ -82,8 +80,7 @@
                                                    `(set-field! (& ~c) ~f (let ((~t (. ~e ~f))) ~(swap v (fname pair) t))))
                                                  `(set-field! (& ~c) ~f ~v)))))
                           sets))))
-          `(let ((~c (fib.prelude/cell ~e)))
-             (do ~@sets @~c)))))))
+          `(let ((~c (fib.prelude/cell ~e))) (do ~@sets @~c)))))))
 
 ;; the struct, its six derives and ->Name; the field names for the constructor are the written ones without the colon
 (defmacro defrecord (head fields)
