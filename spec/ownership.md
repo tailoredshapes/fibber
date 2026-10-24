@@ -58,7 +58,8 @@ A reference **escapes** its scope when it is:
 
 1. returned from the function;
 2. stored into an object (a struct field, a collection, a cell);
-3. captured by a closure that itself escapes;
+3. captured by a closure that itself escapes (or is on the heap; a
+   closure captured only by stack closures does not escape, types §6.5);
 4. passed to another thread (`plet`, `pmap`, a task);
 5. held across an `await` (§8);
 6. passed as an argument of a tail call (§4): the caller's frame is

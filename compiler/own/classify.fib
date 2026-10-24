@@ -4,9 +4,13 @@
 ;; Every use of a literal (the literal itself, the `let` binding it directly initialises, a named
 ;; `fn`'s self-name inside its body) is one of (a) a direct call, (b) an argument to a
 ;; non-escaping parameter of a known callee, (c) the direct initialiser of a `let` binding all of
-;; whose uses are (a) or (b) and which no closure captures, or (d) anything else. A literal is
-;; escaping iff some use is (d); heap iff escaping or some use is the head or an argument of a tail
-;; site (the self-name as the head of its own self tail call excepted).
+;; whose uses are (a), (b) or a capture by a stack closure, or (d) anything else, a capture by a
+;; heap closure among them (decided by the owner, 2026-10-24). A literal is escaping iff some use is
+;; (d); heap iff escaping or some use is the head or an argument of a tail site (the self-name as
+;; the head of its own self tail call excepted). A capture event says whether its literal is heap
+;; under the facts of the walk; the facts only grow, so a capture by a closure that a later walk
+;; finds heap makes the captured literal escaping then, and the chain A captures B, B captures C
+;; settles in as many walks as it is long.
 ;;
 ;; Shapes: the Rust `HashMap`s are `Map`s; "the first reason" (`entry().or_insert`) is `put-first`;
 ;; the one pass over the events is a `reduce` over a private record of what has been seen.
@@ -33,7 +37,7 @@
     ((AtReturn) (some "returned"))
     ((AtStore) (some "stored"))
     ((AtThread) (some "spawned"))
-    ((AtCapture _ _) (some "captured by a closure"))
+    ((AtCapture _ heap) (if heap (some "captured by a heap closure") nil))
     ((AtJoin) (some "a branch of a join"))
     ((AtLoopInit _) (some "initialises a loop variable"))
     ((AtRecur _) (some "arg-of-recur"))

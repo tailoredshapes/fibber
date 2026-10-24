@@ -2554,13 +2554,16 @@ the `let` binding `f` it directly initialises, or, for a named `(fn g
   so, which follows the parameter through the callee's loop variables,
   §6.4), in a tail call or not;
 - (c) the *direct* initialiser of a `let` binding `f` every use of which
-  is a call `(f args)` or a use of kind (b), and which no other closure
-  captures;
-- (d) anything else: E1, E2, E3 (captured by an escaping closure), E4, an
-  `escapes` parameter (the operand of `private-copy` among them, §2.10.2), an argument or the head of a call through a
-  closure value (unknown callee), an `async` body; for the self-name,
-  also a capture by another closure and any binding of it (a `let`
-  initialiser, a `match` scrutinee).
+  is a call `(f args)`, a use of kind (b), or a capture by a **stack**
+  closure (below; **Decided**, owner, 2026-10-24: before, a capture by
+  any other closure, a stack one included, was a use of kind (d));
+- (d) anything else: E1, E2, E3 (captured by a heap closure: one that
+  escapes or is at a tail site), E4, an `escapes` parameter (the operand
+  of `private-copy` among them, §2.10.2), an argument or the head of a
+  call through a closure value (unknown callee), an `async` body (whose
+  captures are always E3); for the self-name, also a capture by a heap
+  closure and any binding of it (a `let` initialiser, a `match`
+  scrutinee).
 
 A closure is **escaping** iff it has a use of kind (d): it may outlive
 the call that created it. A closure is **heap** iff it is escaping, or
@@ -2589,6 +2592,45 @@ classified by that binding alone it would be a stack closure storing a
 pointer into its creating frame (proposed cases 59, 60). A `loop` body
 (syntax §3.18) is not a closure: its free variables are the enclosing
 function's own bindings and it has no capture set.
+
+**Captures by closures** (**Decided**, owner, 2026-10-24). A literal
+`A` *captures* `f` when `f` is in `A`'s capture set; a literal nested
+in a stack closure `C` that names `f` captures `f` itself, since `C`'s
+capture of `f` is an alias of `f` (below), and so does `C`. A capture
+of `f` (a `let` binding a literal directly initialises, or a self-name)
+by `A` is a use of kind (c) when `A` is a stack closure and of kind (d)
+when `A` is a heap closure; a capture by an `async` literal is (d).
+The classification is therefore a fixpoint over the capture relation:
+the least one, reached from "every literal is stack except by its other
+uses" by making a literal escaping whenever a literal that captures it
+is heap. It is **transitive**: when `A` captures `B` and `B` captures
+`C`, and `A` is heap (it escapes by any route, E1 to E4, an `escapes`
+parameter, a closure value, `private-copy`, or it is at a tail site),
+then `B` is escaping, hence heap, hence `C` is escaping. A self-capture
+is the same rule: a capture of the self-name `g` inside `g`'s body by a
+stack closure does not make `g` escaping, by a heap one it does (a call
+of `g` in tail position of the capturing closure's body is a tail site
+of that body and makes `g` heap, as for any binding). A capture by a
+heap closure must be (d): the heap closure retains its captures (E3),
+retain and release on a `STACK` object are no-ops (§8.4), and the heap
+closure may run after the creating frame has ended, so a stack closure
+captured by it would be read after its frame. A capture by a stack
+closure need not be: the capturing closure's uses (a)-(c) complete
+before its own scope exits, which is within the scope of `f`, since it
+names `f`; it stores `f`'s address uncounted, and it is never at a tail
+site of the frame that holds `f`, else it would be heap. A literal
+captured inside a `loop` body is created and ended once per iteration,
+in its slot (§8.2), and the capturing one is too, within the same
+iteration or within the enclosing scope that holds `f`. `private-copy`
+makes a heap object with a closure's code and its captures retained
+(§2.10.2): a copy of a stack closure that captured a stack closure or a
+scope-local object would hold that object uncounted after its frame
+ended, which is why its operand is an escaping position (rule (d)
+above and §6.11): the operand of `private-copy` is a heap closure, and
+everything it captures is counted. The live REPL (`fibc run --live`)
+decides closures with these rules in each unit it compiles, as for a
+build; a redefinition that changes a summary on which a caller's
+classification depends is refused like any other (docs/design/live-incremental.md).
 
 - **Heap closure:** E3 — every object capture is consumed (retained if
   `Borrowed`/`Derived`, moved if `Owned`, which cannot happen for a
@@ -3892,7 +3934,8 @@ closure struct holding the header and the code address, used by
 or at a tail site) is `fib.alloc`ed with each object capture consumed
 (E3); its `drop` releases the captures. A stack closure is a `STACK`
 object of the creating frame: `(alloca %struct.fib.closure.L)` (§8.2),
-storing uncounted pointers. Colours have no representation. A named `fn`'s
+storing uncounted pointers, among them the address of a stack closure
+it captures (§6.5, captures by closures). Colours have no representation. A named `fn`'s
 self-reference is the closure's own `env`, and each occurrence of it is
 a use of the literal (§6.5), so a closure that stores, returns or
 passes on its own name is a heap closure.

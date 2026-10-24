@@ -1,0 +1,72 @@
+;; spec:   spec/types.md §6.5 (d), captures by closures (decided by the owner, 2026-10-24), §2.10.2, §6.10; compiler/own/classify.fib (`escaping-use`), compiler/own/walk/callee.fib (`builtin-param`)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; A `let`-bound literal `b` captured by a closure that is heap is a heap closure, by every route that makes the capturing closure
+;; heap: it is returned; stored in a cell; passed to a parameter that keeps it; handed to `spawn`; passed to `private-copy`, whose copy
+;; is returned; captured by a closure that is returned (a chain: `c` captures `a` captures `b`); passed at a tail site (heap, not
+;; escaping: the frame that would hold `b` is discarded by the jump). Each closure is called after its creating frame has ended and
+;; `clobber` has written over the stack where that frame was, so a `b` left on the stack is read from a dead frame: with the capture
+;; taken for a stack one whatever the capturing closure (a planted fault), each route alone traps, crashes (signal 11) or answers wrong.
+;; The audit sees every object freed once.
+(ns main (:use fib.core))
+
+(defstruct Pt (x: i64 y: i64))
+
+(defun clobber (a: i64 b: i64 c: i64 d: i64) -> i64
+  (let ((p (Pt a b)) (q (Pt c d)) (r (Pt (+ a d) (+ b c))))
+    (+ (. p x) (. q y) (. r x) (. r y))))
+(defun differs (a: i64 b: i64) -> i64 (if (= a b) 0 1))
+
+(defun returned (k: (Vec i64)) -> (fn (i64) i64)
+  (let ((b (fn (i: i64) (nth k i))))
+    (fn (i: i64) (* 2 (b i)))))
+
+(defun stored (k: (Vec i64) out: (Cell (Option (fn (i64) i64)))) -> unit
+  (let ((b (fn (i: i64) (+ 1 (nth k i)))))
+    (set! out (some (fn (i: i64) (* 3 (b i)))))))
+
+(defun keep (fs: (Vec (fn (i64) i64)) f: (fn (i64) i64)) -> (Vec (fn (i64) i64)) (conj fs f))
+(defun kept (k: (Vec i64)) -> (Vec (fn (i64) i64))
+  (let ((b (fn (i: i64) (+ 2 (nth k i)))))
+    (keep [] (fn (i: i64) (* 5 (b i))))))
+
+(defun spawned (k: (Vec i64)) -> (Task i64)
+  (let ((b (fn (i: i64) (+ 3 (nth k i)))))
+    (spawn (fn () (* 7 (b 1))))))
+
+(defun copied (k: (Vec i64)) -> (fn (i64) i64)
+  (let ((b (fn (i: i64) (+ 4 (nth k i))))
+        (a (fn (i: i64) (* 11 (b i)))))
+    (private-copy a)))
+
+(defun chained (k: (Vec i64)) -> (fn (i64) i64)
+  (let ((b (fn (i: i64) (+ 5 (nth k i))))
+        (a (fn (i: i64) (* 13 (b i)))))
+    (fn (i: i64) (+ 1 (a i)))))
+
+(defun spin (g: (fn () i64) n: i64 k: (Vec i64)) -> i64
+  (let ((b (fn (i: i64) (+ (* 100 n) (nth k i)))))
+    (if (= n 0)
+      (let ((noise (clobber n (+ n 1) (+ n 2) (+ n 3)))) (+ (g) (- noise noise)))
+      (spin (fn () (* 17 (b 2))) (- n 1) k))))
+
+(defun main () -> i64
+  (let ((k [10 20 30 40])
+        (f1 (returned k))
+        (out (cell nil))
+        (_ (stored k out))
+        (fs (kept k))
+        (t (spawned k))
+        (f5 (copied k))
+        (f6 (chained k))
+        (noise (clobber 1 2 3 4)))
+    (+ (differs (f1 2) 60)
+       (match @out ((some f) (differs (f 2) 93)) (_ 1))
+       (differs ((nth fs 0) 2) 160)
+       (differs (join t) 161)
+       (differs (f5 2) 374)
+       (differs (f6 2) 456)
+       (differs (spin (fn () 0) 1 k) 2210)
+       (- noise noise))))
