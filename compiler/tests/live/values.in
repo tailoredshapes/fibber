@@ -1,10 +1,16 @@
 ; the shared numbering: new types, keywords, a record defined after boot, a closure kept in a resident atom, strings; a def after boot refused;
 ; resident callers whose fused map has handler in line (a named stage, a literal that calls it) see its redefinition
+; resident callers that pass handler, or a literal that calls it, to sum (a defun that calls its parameter: a closure specialisation
+; outside a session, emit.lower.spec) see the redefinition of handler, and s1 that of sum (a specialisation in the session's program
+; would keep the old sum: `; defined sum` and [18 22]); s2's 22 after sum's redefinition is the answer before the specialisation too
 (def names: (Atom (Vec str)) (atom []))
 (def fs: (Atom (Option (fn (i64) i64))) (atom nil))
 (defun handler (x: i64) -> i64 (* x 2))
 (defun g (v: (Vec i64)) -> (Vec i64) (mapv handler v))
 (defun h (v: (Vec i64)) -> (Vec i64) (mapv (fn (x) (+ 1 (handler x))) v))
+(defun sum (lo: i64 hi: i64 f: (fn (i64) i64)) -> i64 (loop ((i lo) (acc 0)) (if (>= i hi) acc (recur (+ i 1) (+ acc (f i))))))
+(defun s1 (n: i64) -> i64 (sum 0 n handler))
+(defun s2 (n: i64) -> i64 (sum 0 n (fn (i: i64) (+ 1 (handler i)))))
 (prn [1 2 3])
 (prn {:a 1 :b 2})
 (get {:a 1 :b 2} :b)
@@ -13,6 +19,7 @@
 @names
 (prn (mapv handler [1 2 3]))
 (prn [(g [1 2 3]) (h [1 2 3])])
+(prn [(s1 4) (s2 4)])
 (reset! fs (some (fn (y: i64) -> i64 (+ y 100))))
 (match @fs ((some f) (f 1)) (nil -1))
 (defrecord Pt (x: i64 y: i64))
@@ -22,6 +29,9 @@
 (defun handler (x: i64) -> i64 (* x 3))
 (prn (mapv handler [1 2 3]))
 (prn [(g [1 2 3]) (h [1 2 3])])
+(prn [(s1 4) (s2 4)])
+(defun sum (lo: i64 hi: i64 f: (fn (i64) i64)) -> i64 (loop ((i lo) (acc 0)) (if (>= i hi) acc (recur (+ i 1) (+ acc (* 10 (f i)))))))
+(prn [(s1 4) (s2 4)])
 (match @fs ((some f) (f 2)) (nil -1))
 @names
 (str "a" "b" (count @names))

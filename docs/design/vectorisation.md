@@ -280,6 +280,24 @@ Each line: change, files, measured payoff, risk.
 4. **Devirtualise literal closures** passed to a `defun` that is inlined (the expander's fusion machinery,
    `compiler/expand/fuse*.fib`, or specialisation in `compiler/emit/mono.fib`). Payoff: unmeasured directly; the other
    blockers removed leave `map-into` at 258 ms against 32 for the direct loop. Risk: medium, code growth.
+   Done for a program's own `defun`s (2026-10-24, `compiler/emit/lower/spec.fib`: a specialisation per known literal or
+   named function, as monomorphisation is per type; the library's functions, live sessions and macro modules excluded).
+   `sum` of `(* k (array-get a d))` over 10^6: 1.53 to 0.49 ns per element whole-program, 1.82 to 1.48 in the default
+   partitioned build (0.45 with `FIB_LIRO_IMPORT=80`: the runtime unit's refcount operations are then in line too).
+   A literal LLVM does not put in line gains little (persistent-`Vec` `nth`: 4.05 to 3.28; the allerbees cutter: no
+   change). A let-bound literal only ever called is called directly too. The compiler built by itself: text +1.8%,
+   243 specialisations. One tap of the cutter's blur (`sum` over a literal reading two Vecs through a let-bound `at`)
+   is 8.0 ns whole-program: about 4.3 the two trie walks, 3.5 the closures (their counts and env loads, which also keep
+   LLVM from putting the literal in line), 0.5 the arithmetic; the call itself, indirect or direct, 0.4.
+   The counts of a STACK or IMMORTAL closure head are no-ops (types §8.4) and are no longer emitted at a direct call: the
+   caller's retain of the head, and, for a small literal called in a loop, the release of its env, through a borrowed form
+   of its code (`CODE.borrow`; the closure's code pointer keeps the convention's code, since `fib.private-copy` makes a heap
+   copy with that code). A fused chain over a range whose step is a nonzero literal has no fallback branch (whose stage
+   literal, an argument of the library's call, made its captures owned). Quiet machine, ns per tap whole-program (default):
+   Vecs 9.70 to 6.64 (14.76 to 10.92), Arrays 4.37 to 2.51 (8.77 to 7.23); the cutter 2.51 to 2.40 s whole-program, 3.73
+   to 3.35 s default. The compiler's text +1.8% over main (243 specialisations, 105 borrowed forms). An `inlinehint` on the
+   borrowed forms measured nothing (not kept). The cutter's `at` stays a heap closure: §6.5 (c) admits a let-bound literal
+   only if no other closure captures it, even a stack one.
 5. **Range facts for index arithmetic and versioning on the loop bound.** `!range` on array lengths (`[0, 2^60)`) and a
    precheck loop version for `i+j` style arithmetic. Payoff: spectral-norm 1.41x. Risk: low for versioning; the range
    needs an lIR `!range` form or an `llvm.assume` intrinsic that the lIR does not have.

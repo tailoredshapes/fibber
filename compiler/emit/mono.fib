@@ -6,7 +6,9 @@
   (:use types.ty types.scheme types.table types.decls own.program emit.value emit.layout emit.names))
 
 ;; An instance of a body at concrete types. Rust: mono.rs:20 Inst
-(defstruct Inst (key: BodyKey tys: (Vec Ty)))
+;; `fns` is the closure specialisation (emit.lower.spec, docs/design/vectorisation.md 7 item 4): empty for an ordinary instance, else
+;; one entry per parameter, the name of the code a function parameter is known to be ("" where it is not).
+(defstruct Inst (key: BodyKey tys: (Vec Ty) fns: (Vec str)))
 (derive Eq Inst) (derive Hash Inst)
 
 ;; How a type is represented, for the monomorphiser: a scalar of that lIR type, a plain object pointer, an
@@ -123,6 +125,13 @@
   (let ((e (extent t)))
     (or (> (. e fst) max-type-depth) (> (. e snd) max-type-size))))
 
+;; The name of an instance: the body's name at its types, then `#I#CODE#` for each parameter I known to be the function CODE.
+;; native.liro.partition `spec-home` reads it back.
+(defun inst-name (g: Globals inst: Inst) -> str
+  (str-join (into [(body-name g (. inst key) (. inst tys))]
+                  (vec (keep (fn (i: i64) (if (= (nth (. inst fns) i) "") nil (some (str-join ["#" (str i) "#" (nth (. inst fns) i) "#"]))))
+                             (range (count (. inst fns))))))))
+
 ;; The name of the specialisation, queued for emission if new. A request at a type past the limits above is not queued, and what
 ;; it was is kept for `queue-overflow`. Rust: mono.rs:171 Queue::request
 (defun queue-request (q: Queue g: Globals inst: Inst) -> str
@@ -133,7 +142,7 @@
         :else
           (if-some [n (get @(. q names) inst)]
             n
-            (let ((name (body-name g (. inst key) (. inst tys))))
+            (let ((name (inst-name g inst)))
               (do (cell-update! (. q names) (fn (names: (Map Inst str)) (assoc names inst name)))
                   (cell-update! (. q pending) (fn (pending: (Vec Inst)) (conj pending inst)))
                   name)))))

@@ -1,0 +1,26 @@
+;; spec:   spec/types.md §8.4, §8.9; docs/design/vectorisation.md 7 item 4; compiler/emit/lower/spec.fib
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; A function parameter that is known in a specialisation and passed on to another `defun` that calls it makes that callee's
+;; specialisation too (two and three levels), with a literal, a named function, and a literal made inside a specialisation that
+;; calls the known parameter (the cutter's `resample-axis`). Each answer equals the one through a closure the specialisation cannot see.
+(defun sum (lo: i64 hi: i64 f: (fn (i64) i64)) -> i64
+  (loop ((i lo) (acc 0)) (if (>= i hi) acc (recur (+ i 1) (+ acc (f i))))))
+(defun sum-to (n: i64 f: (fn (i64) i64)) -> i64 (sum 0 n f))
+(defun sum-to-twice (n: i64 f: (fn (i64) i64)) -> i64 (+ (sum-to n f) (sum-to n f)))
+(defun rows (n: i64 m: i64 at: (fn (i64 i64) i64)) -> i64
+  (sum 0 n (fn (r: i64) (sum 0 m (fn (c: i64) (at r c))))))
+(defun inc (x: i64) -> i64 (+ x 1))
+
+(defun hidden (fs: (Vec (fn (i64) i64))) -> (fn (i64) i64) (nth fs 0))
+(defun hidden2 (fs: (Vec (fn (i64 i64) i64))) -> (fn (i64 i64) i64) (nth fs 0))
+(defun differs (a: i64 b: i64) -> i64 (if (= a b) 0 1))
+
+(defun main () -> i64
+  (let ((k 3) (s (str-concat "x" "yz")))
+    (+ (differs (sum-to 10 (fn (i: i64) (* i k))) (sum-to 10 (hidden [(fn (i: i64) (* i k))])))
+       (differs (sum-to-twice 10 (fn (i: i64) (+ i (str-len s)))) 150)
+       (differs (sum-to-twice 5 inc) (sum-to-twice 5 (hidden [inc])))
+       (differs (rows 4 5 (fn (r: i64 c: i64) (+ (* r 10) c k))) (rows 4 5 (hidden2 [(fn (r: i64 c: i64) (+ (* r 10) c k))])))
+       (differs (rows 4 5 (fn (r: i64 c: i64) (+ (* r 10) c k))) 400))))

@@ -1,0 +1,54 @@
+;; spec:   spec/types.md §8.4 (retain and release on a STACK or IMMORTAL closure are no-ops; the closure convention), §6.5, §6.11; compiler/emit/lower/spec.fib (`spec-static-head?`), compiler/emit/lower/ops.fib (`stack-env?`)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; A call through a head known to be a STACK closure (a literal the plan puts on the stack) or an IMMORTAL one (a named function's value)
+;; emits no retain of it, and a stack literal's code no release of its env: both are no-ops (§8.4). A closure that escapes keeps its
+;; counts: here literals that a specialised callee also stores in a cell, returns or passes on to a function that keeps it, a named `fn`
+;; that stores its own name (the closure's own env) in a cell, a let-bound literal captured by an escaping closure, a trap caught in a
+;; literal called directly from a loop, a private copy (a heap object with the stack literal's code, called through the value), and
+;; a literal a function passes to an escaping parameter that keeps it past the function's return (with that use taken for a
+;; non-escaping one, a planted fault, the run ends in signal 11). The audit sees every object freed once.
+(ns main (:use fib.core fib.ex))
+
+(defstruct Box (s: str))
+
+(defun sum (lo: i64 hi: i64 f: (fn (i64) i64)) -> i64
+  (loop ((i lo) (acc 0)) (if (>= i hi) acc (recur (+ i 1) (+ acc (f i))))))
+(defun sum-and-keep (n: i64 f: (fn (i64) i64) out: (Cell (Option (fn (i64) i64)))) -> i64
+  (do (set! out (some f)) (sum 0 n f)))
+(defun sum-and-return (n: i64 f: (fn (i64) i64)) -> (Pair i64 (fn (i64) i64)) (Pair (sum 0 n f) f))
+(defun keep (fs: (Vec (fn (i64) i64)) f: (fn (i64) i64)) -> (Vec (fn (i64) i64)) (conj fs f))
+(defun sum-and-pass (n: i64 f: (fn (i64) i64)) -> (Pair i64 (Vec (fn (i64) i64))) (Pair (sum 0 n f) (keep [] f)))
+(defun sq (x: i64) -> i64 (* x x))
+;; the literal called directly here is a STACK object; its private copy is a heap object with the same code, which releases its env
+(defun with-copy (n: i64 f: (fn (i64) i64)) -> i64
+  (let ((g (private-copy f))) (+ (sum 0 n f) (sum 0 n g) (g 1))))
+(defun differs (a: i64 b: i64) -> i64 (if (= a b) 0 1))
+;; a literal passed to an escaping parameter that stores it where it outlives the frame that made it: a heap closure
+(defun keep-in (out: (Cell (Option (fn (i64) i64))) f: (fn (i64) i64)) -> unit (set! out (some f)))
+(defun make-kept (out: (Cell (Option (fn (i64) i64))) n: i64) -> i64
+  (let ((s (str-concat "xy" (str n))))
+    (do (keep-in out (fn (i: i64) (+ i (str-len s)))) (str-len s))))
+(defun call-opt (o: (Option (fn (i64) i64)) x: i64) -> i64 (match o ((some f) (f x)) (nil -1)))
+
+(defun main () -> i64
+  (let ((b (Box (str-concat "abc" "de"))) (out (cell nil)) (out2 (cell nil)) (selfc (cell nil)))
+    (let ((stacked (sum 0 10 (fn (i: i64) (+ i (str-len (. b s))))))
+          (named (sum 0 10 sq))
+          (kept (sum-and-keep 4 (fn (i: i64) (* i (str-len (. b s)))) out))
+          (ret (sum-and-return 3 (fn (i: i64) (- (str-len (. b s)) i))))
+          (passed (sum-and-pass 3 (fn (i: i64) (+ 100 (str-len (. b s))))))
+          (g (fn self (n: i64) (do (set! selfc (some self)) (+ n (str-len (. b s))))))
+          (at (fn (i: i64) (* 2 i)))
+          (esc (fn (i: i64) (+ (at i) (str-len (. b s)))))
+          (made (make-kept out2 7))
+          (copied (with-copy 4 (fn (i: i64) (+ i (str-len (. b s))))))
+          (caught (try (sum 0 5 (fn (i: i64) (if (= i 3) (quot i (- i 3)) i))) (catch e -7))))
+      (let ((r (+ (differs stacked 95) (differs named 285) (differs kept 30) (differs (call-opt @out 2) 10)
+                  (differs (. ret fst) 12) (differs ((. ret snd) 1) 4) (differs (. passed fst) 315)
+                  (differs ((nth (. passed snd) 0) 0) 105) (differs (sum 0 3 g) 18) (differs (call-opt @selfc 1) 6)
+                  (differs (sum 0 4 esc) 32) (differs ((nth (keep [] esc) 0) 1) 7) (differs caught -7) (differs copied 58) (differs made 3) (differs (call-opt @out2 10) 13))))
+        (do (set! selfc nil) (set! out nil) (set! out2 nil) r)))))

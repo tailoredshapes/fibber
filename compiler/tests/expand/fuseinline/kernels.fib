@@ -6,7 +6,8 @@
 ;; loop's induction variable, an i64 the stages turn into f64. Each `direct-` function is a chain with filter, remove, keep, take
 ;; or take-while steps (compiler/expand/fuseflow.fib): its loop has branches and appends, which LLVM does not vectorise; check.sh
 ;; wants it direct, no indirect call in it or in a function of the program it calls (a closure is called through a pointer).
-;; `closure-filter` is the control: a predicate that is a function value is called through it.
+;; `closure-filter` is the control: a predicate that is a function value is called through it. main passes the controls closures taken
+;; out of a Vec: a literal passed straight to them would make a specialisation over it (compiler/emit/lower/spec.fib) whose calls are direct.
 (ns main)
 
 (defun sq (x: f64) -> f64 (* x x))
@@ -39,6 +40,6 @@
   (let ((v (mapv (fn (i: i64) (double i)) (range 100)))
         (a (let ((c (cell (array 100 0.0)))) (do (dotimes (i 100) (array-set! &c i (double i))) @c))))
     (count [(kern-literal-vec v) (kern-named-array a) (kern-two-vecs v v) (kern-chain-vec v) (kern-range 100) (kern-range-chain 3 100) (vec (hand-array a))
-            (closure-param (fn (x) (- x)) v)
+            (closure-param (nth [(fn (x: f64) (- x))] 0) v)
             (direct-filter v) (direct-map-filter-named a) (direct-take v 10) (direct-take-while v) (direct-keep-range 100)
-            (vec (map double (direct-remove-range 100))) (closure-filter (fn (x) (> x 3.0)) v)])))
+            (vec (map double (direct-remove-range 100))) (closure-filter (nth [(fn (x: f64) (> x 3.0))] 0) v)])))

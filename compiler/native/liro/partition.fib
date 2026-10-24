@@ -54,13 +54,31 @@
         (= mode "ns3") (segments (strip-kind n) 3)
         :else n))
 
+;; The unit of a closure specialisation (emit.mono `inst-name`: `NAME#I#CODE#`) and of a literal made in one (`l.NAME#I#CODE#.N`): that
+;; of the innermost code it knows, the text after its last `#I#` up to the closing `#`, so that the specialisation and the literal it
+;; calls directly are one unit and LLVM can put the literal in line in its loop (in different units the direct call measured slower than
+;; the call through the closure it replaced). Any other name is its own.
+(defun spec-home (n: str) -> str
+  (let ((at (last-opener n)))
+    (if (< at 0) n (str-slice n at (loop ((j at)) (if (or (>= j (str-len n)) (= (str-byte-at n j) 35i8)) j (recur (+ j 1))))))))
+
+;; The index just after the last `#DIGITS#` of `n`, or -1.
+(defun last-opener :private (n: str) -> i64
+  (loop ((i 0) (at -1))
+    (if (>= i (str-len n))
+        at
+        (if (= (str-byte-at n i) 35i8)
+            (let ((j (loop ((j (+ i 1))) (if (and (< j (str-len n)) (>= (str-byte-at n j) 48i8) (<= (str-byte-at n j) 57i8)) (recur (+ j 1)) j))))
+              (if (and (> j (+ i 1)) (< j (str-len n)) (= (str-byte-at n j) 35i8)) (recur (+ j 1) (+ j 1)) (recur (+ i 1) at)))
+            (recur (+ i 1) at)))))
+
 (defun bucket (it: LItem count: i64 mode: str) -> str
   (match it
     ((ItGlobal _) "glue")
     ((ItDefine f) (let ((n (. f name)))
       (cond (starts-with? n "fib.") "runtime"
             (or (starts-with? n "drop.") (starts-with? n "trace.") (starts-with? n "share.")) "walkers"
-            :else (str "code-" (rem (bit-and (hash (split-key n mode)) 1073741823) count)))))
+            :else (str "code-" (rem (bit-and (hash (split-key (spec-home n) mode)) 1073741823) count)))))
     (_ "")))
 (defun groups-of (m: LModule) -> (Map str (Vec LItem))
   (let ((count (split-count)) (mode (unwrap-or (sys-getenv "FIB_LIRO_SPLIT") "hash")))

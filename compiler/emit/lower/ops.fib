@@ -26,7 +26,7 @@
 ;; Rust: lower/ops.rs:55 Cx::run_ops
 (defun lcx-run-ops (cx: LowerCx ops: (Vec Op)) -> (Result unit str)
   (try-each (fn (op: Op)
-              (try-let ((site (lcx-site cx (. op site))))
+              (try-let ((site (if (borrowed-env? cx (. op site)) (Ok nil) (lcx-site cx (. op site)))))
                 (match site
                   (nil (Ok ()))
                   ((some v) (match (. op kind)
@@ -34,6 +34,13 @@
                               ((OpRelease) (Ok (lcx-release cx v)))
                               ((OpEndStack) (end-stack cx v (site-ty cx (. op site)))))))))
             ops))
+
+;; Whether `s` is the `env` of the borrowed form of a STACK literal's code (emit.program `program-request-borrowed`): its caller did not
+;; retain it, so the code does not release it (both are no-ops on a STACK object, types §8.4).
+(defun borrowed-env? :private (cx: LowerCx s: Site) -> bool
+  (match s
+    ((SiteEnv _) (contains? @(. (. cx p) borrowed) (. cx name)))
+    (_ false)))
 
 ;; Rust: lower/ops.rs:69 Cx::retain
 (defun lcx-retain (cx: LowerCx v: V) -> unit

@@ -8,7 +8,7 @@
   (:require [fib.string :as s])
   (:use types.ty types.scheme types.ast types.decls types.table types.init types.infer.cx own.program emit.value emit.layout emit.ir
         emit.mono emit.objects emit.program emit.lower.cx emit.lower.ops emit.lower.arith emit.lower.builtins
-        emit.lower.dynamic emit.lower.objects emit.lower.simd emit.lower.window)
+        emit.lower.dynamic emit.lower.objects emit.lower.simd emit.lower.window emit.lower.spec)
   (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; ---- arguments
@@ -18,9 +18,11 @@
   (match (. own callee)
     ((CalValue)
      (try-let ((v (lcx-value cx head)))
-       (do (when (= (. own head) PsRetain) (lcx-retain cx v))
-           (hold cx head (. own head) v)
-           (Ok (some v)))))
+       (if (and (= (. own head) PsRetain) (spec-static-head? cx head v))
+           (Ok (some v))
+           (do (when (= (. own head) PsRetain) (lcx-retain cx v))
+               (hold cx head (. own head) v)
+               (Ok (some v))))))
     (_ (Ok nil))))
 
 ;; One argument as the plan hands it over, with its type: an expression's value (retained when the plan says), or the cell of an `&`
@@ -261,10 +263,10 @@
     (nil (Err "a method call without a resolution"))))
 
 ;; What the call reaches. Rust: lower/call.rs:208 target
-(defun call-target :private (cx: LowerCx head: Expr c: Callee hv: (Option V) vals: (Vec V) tys: (Vec Ty)) -> (Result Target str)
+(defun call-target :private (cx: LowerCx head: Expr c: Callee hv: (Option V) args: (Vec Arg) vals: (Vec V) tys: (Vec Ty)) -> (Result Target str)
   (let ((p (. cx p)))
     (match c
-      ((CalFun f) (try-let ((ts (call-fun-instance cx head f))) (Ok (TgDirect (program-request p (BodyFun f) ts) false))))
+      ((CalFun f) (try-let ((ts (call-fun-instance cx head f)) (name (spec-request cx f ts args))) (Ok (TgDirect name false))))
       ((CalAllOwned f) (try-let ((ts (call-fun-instance cx head f))) (Ok (TgDirect (program-request p (BodyAllOwned f) ts) true))))
       ((CalMethod pr i) (call-method-target cx head pr i vals tys))
       ((CalBuiltin b) (Ok (TgBuiltin (. (nth (. (. p typed) builtins) b) name))))
@@ -276,7 +278,7 @@
                       (let ((d (g-ext (program-g p) x)))
                         (try-let ((declared (program-declare-extern p d))) (Ok (TgExtern (. d name))))))
                      (_ (Err "callee Extern with this head"))))
-      ((CalValue) (match hv (nil (Err "no head value")) ((some v) (Ok (TgValue v))))))))
+      ((CalValue) (match hv (nil (Err "no head value")) ((some v) (Ok (spec-value-target cx head v))))))))
 
 ;; ---- the call itself
 
@@ -302,6 +304,7 @@
        (let ((actual (if env (into [(nx/null)] args) args)))
          (Ok (if tail (nx/tail-call name actual) (nx/call name actual)))))
       ((TgExtern name) (Ok (nx/call name args)))
+      ((TgKnown name clo) (let ((actual (into [(v-expr clo)] args))) (Ok (if tail (nx/tail-call name actual) (nx/call name actual)))))
       ((TgCode code this)
        (Ok (nx/indirect-call code (lt/LFnType lt/cc-tail (call-ret-type ret uw) (call-param-types (vec (drop 1 vals))) false)
                              (into [this] (vec (drop 1 args))) tail)))
@@ -316,7 +319,7 @@
 ;; code and vtable function does (a `def`'s initialiser and an async body are never called this way).
 (defun callee-unwinds? :private (cx: LowerCx target: Target) -> bool
   (and (. (. cx p) unwinding) (not @(. (. cx p) macro-module))
-       (match target ((TgDirect _ _) true) ((TgValue _) true) ((TgCode _ _) true) (_ false))))
+       (match target ((TgDirect _ _) true) ((TgValue _) true) ((TgKnown _ _) true) ((TgCode _ _) true) (_ false))))
 
 ;; The call itself: `call` or `tailcall`, direct or through a closure's code pointer. Rust: lower/call.rs:342 LowerCx::emit_call
 (defun lcx-emit-call (cx: LowerCx target: Target vals: (Vec V) rt: Ty tail: bool) -> (Result V str)
@@ -394,7 +397,7 @@
 
 ;; A target a tail call jumps to.
 (defun call-jumpable :private (target: Target) -> bool
-  (match target ((TgDirect _ _) true) ((TgValue _) true) ((TgCode _ _) true) (_ false)))
+  (match target ((TgDirect _ _) true) ((TgValue _) true) ((TgKnown _ _) true) ((TgCode _ _) true) (_ false)))
 
 ;; The result of an ordinary call; `nil` when the callee does not return (a builtin or native operation that ended the block).
 (defun call-result :private (cx: LowerCx e: Expr target: Target vals: (Vec V) tys: (Vec Ty) rt: Ty) -> (Result (Option V) str)
@@ -462,6 +465,6 @@
      (let ((held (count @(. cx pending))))
        (try-let ((hv (call-head-value cx head own)) (r (call-arguments cx args (. own args)))
                  (vals0 (call-copy-in cx args (. own args) (. r fst))) (vals (Ok (if (div-method? cx (. own callee)) (lcx-splat-pair cx vals0) vals0)))
-                 (target (call-target cx head (. own callee) hv vals (. r snd))))
+                 (target (call-target cx head (. own callee) hv args vals (. r snd))))
          (do (set! (. cx pending) (vec (take held @(. cx pending))))
              (call-site cx e own target vals (. r snd))))))))
