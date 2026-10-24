@@ -63,6 +63,27 @@ char *copyString(const std::string &S) {
 int64_t asWord(const void *P) { return static_cast<int64_t>(reinterpret_cast<intptr_t>(P)); }
 template <typename T> T fromWord(int64_t W) { return reinterpret_cast<T>(static_cast<intptr_t>(W)); }
 
+// A local constant (a string literal, a table) referenced by a function another unit imports is promoted by the thin link under a name
+// that holds its unit's module hash, so an edit anywhere in that unit renames it in every unit that imported such a function, and their
+// backends rerun for nothing. Each one is named here by its content instead, `fibc.k.DIGEST`, linkonce_odr and hidden: equal constants
+// of two units are one symbol, and the name stays while the content does. (A constant no other unit names is internalised again by the
+// thin link.)
+void nameConstants(Module &M) {
+  for (GlobalVariable &GV : M.globals()) {
+    if (!GV.hasLocalLinkage() || !GV.isConstant() || !GV.hasInitializer() || !GV.hasGlobalUnnamedAddr() || GV.hasSection() ||
+        GV.hasComdat() || GV.isThreadLocal() || GV.getName().starts_with("llvm."))
+      continue;
+    raw_sha1_ostream H;
+    H << GV.getAlign().valueOrOne().value() << " ";
+    GV.getValueType()->print(H);
+    H << " ";
+    GV.getInitializer()->printAsOperand(H, /*PrintType=*/true, &M);
+    GV.setName("fibc.k." + toHex(H.sha1()).substr(0, 24));
+    GV.setLinkage(GlobalValue::LinkOnceODRLinkage);
+    GV.setVisibility(GlobalValue::HiddenVisibility);
+  }
+}
+
 // Request words of `summary`: [0] the LLVMModuleRef, after the per-unit half of the pipeline (thinlto-pre-link<On>). Results: [1] the
 // bitcode (malloc'd), [2] its length, [3] an error message (malloc'd) or 0. The bitcode carries the module summary and the module hash,
 // as ThinLTOBitcodeWriterPass writes a module without type metadata, and the symbol table; on any object format.
@@ -70,6 +91,7 @@ int summary(const void *Req, const void *) {
   int64_t *W = const_cast<int64_t *>(static_cast<const int64_t *>(Req));
   Module *M = fromWord<Module *>(W[0]);
   W[1] = W[2] = W[3] = 0;
+  nameConstants(*M);
   ProfileSummaryInfo PSI(*M);
   ModuleSummaryIndex Index = buildModuleSummaryIndex(*M, nullptr, &PSI);
   SmallVector<char, 0> Buffer;
@@ -94,8 +116,10 @@ void setImportLimit(int64_t Limit) {
   cl::ParseCommandLineOptions(2, Argv, "", &errs());
 }
 
-// The units of one link: their bitcode, identifiers (the digest of the bitcode: a cached unit is copied to a new file name in each build,
-// and the GUIDs of local symbols depend on the identifier) and the combined summary index of the thin link.
+// The units of one link: their bitcode, identifiers and the combined summary index of the thin link. A unit's identifier is its place
+// in the partition (`unit-N`), not its file's name (a cached unit is copied to a new name in each build) nor its content: the GUIDs of
+// local symbols depend on it, and the backends import from the units in the order of their identifiers, so an identifier that changed
+// with an edit would reorder what every importer of that unit reads.
 struct Units {
   std::vector<std::unique_ptr<MemoryBuffer>> Buffers;
   std::vector<std::unique_ptr<lto::InputFile>> Inputs;
@@ -115,10 +139,7 @@ Error readUnits(Units &U, char **Paths, int64_t N) {
     auto B = MemoryBuffer::getFile(Paths[I]);
     if (!B)
       return createStringError(B.getError(), Twine("cannot read ") + Paths[I]);
-    std::string Id = "unit-" + toHex(SHA1::hash(arrayRefFromStringRef((*B)->getBuffer()))).substr(0, 24);
-    while (std::find(U.Ids.begin(), U.Ids.end(), Id) != U.Ids.end())
-      Id += "+";
-    U.Ids.push_back(Id);
+    U.Ids.push_back("unit-" + std::to_string(I));
     auto In = lto::InputFile::create(MemoryBufferRef((*B)->getBuffer(), U.Ids.back()));
     if (!In)
       return In.takeError();
@@ -149,7 +170,21 @@ void markSymbols(Units &U, char **Keep, int64_t NK) {
 // The thin link: liveness from the kept symbols, the import and export lists, attribute propagation, prevailing copies (every symbol
 // has one: the units are the partition of one program) and the internalisation of what no other unit uses, as lto::LTO's runThinLTO.
 void thinLink(Units &U, const lto::Config &Conf) {
-  auto Prevailing = [](GlobalValue::GUID, const GlobalValueSummary *) { return true; };
+  // The prevailing copy of a symbol is its first unit's: every symbol has one definition but the constants of `nameConstants`.
+  DenseMap<StringRef, unsigned> Order;
+  for (unsigned I = 0; I < U.Ids.size(); ++I)
+    Order[U.Ids[I]] = I;
+  DenseMap<GlobalValue::GUID, StringRef> First;
+  for (auto &Entry : U.Index)
+    for (auto &S : Entry.second.SummaryList) {
+      auto F = First.find(Entry.first);
+      if (F == First.end() || Order.lookup(S->modulePath()) < Order.lookup(F->second))
+        First[Entry.first] = S->modulePath();
+    }
+  auto Prevailing = [&](GlobalValue::GUID G, const GlobalValueSummary *S) {
+    auto F = First.find(G);
+    return F == First.end() || F->second == S->modulePath();
+  };
   computeDeadSymbolsWithConstProp(U.Index, U.Preserved, [](GlobalValue::GUID) { return PrevailingType::Yes; },
                                   /*ImportEnabled=*/true);
   U.Index.collectDefinedGVSummariesPerModule(U.Defined);
