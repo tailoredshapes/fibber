@@ -137,20 +137,26 @@
     ((VecOf cnt _ _ _) cnt)))
 
 ;; An index in the tail (every index of a flat Vec) is read in line; the rest, and the traps, are vec-nth-slow, out of line.
+;; The subtractions here and in vec-nth-slow wrap instead of testing overflow (spec/stdlib.md L10). The Vec invariant (types §8.3:
+;; the tail holds the last len(tail) elements, cnt a sum of array lengths) gives 0 <= tailoff = cnt - len(tail) <= cnt, so the
+;; guard's tailoff <= i < cnt puts i - tailoff in [0, len(tail)) and refuses a negative i. Were the invariant broken, a wrapped
+;; value is still only an index: array-get's bounds test or the trie walk's array reads catch it, so memory safety holds.
 (defun vec-nth (v: (Vec a) i: i64) -> a
   (match v
-    ((VecOf cnt _ _ tail) :when (and (< i cnt) (>= i (- cnt (array-len tail)))) (array-get tail (- i (- cnt (array-len tail)))))
+    ((VecOf cnt _ _ tail) :when (and (< i cnt) (>= i (unchecked-subtract cnt (array-len tail))))
+     (array-get tail (unchecked-subtract i (unchecked-subtract cnt (array-len tail)))))
     (_ (vec-nth-slow v i))))
 
 (defun vec-nth-slow :private (v: (Vec a) i: i64) -> a
   (match v
     ((VecEmpty) (trap "nth: index out of range"))
+    ;; tailoff and i - tailoff wrap, bounded as in vec-nth: after the range test 0 <= i < cnt, and the tail branch has i >= tailoff
     ((VecOf cnt shift root tail)
-     (let ((tailoff (- cnt (array-len tail))))
+     (let ((tailoff (unchecked-subtract cnt (array-len tail))))
        (if (or (< i 0) (>= i cnt))
            (trap "nth: index out of range")
            (if (>= i tailoff)
-               (array-get tail (- i tailoff))
+               (array-get tail (unchecked-subtract i tailoff))
                (match root
                  (nil (trap "nth: index out of range"))
                  ((some r) (vnode-get r shift i)))))))))
