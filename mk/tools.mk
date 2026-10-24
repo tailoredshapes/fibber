@@ -114,6 +114,8 @@ tool_sh-emit-resume := $(T)/emit/resume.sh $(F_ABS) | $(T)/emit/resume.sh
 tool_sh-expand-fuseinline := env LLVM_LIBDIR=$(LLVM_LIBDIR) $(T)/expand/fuseinline/check.sh $(F_ABS) | $(wildcard $(T)/expand/fuseinline/*) $(wildcard compiler/expand/fuse*.fib)
 # A function literal or named function passed to a defun that calls it is called directly in the callee's specialisation and put in line
 tool_sh-emit-clospec := env LLVM_LIBDIR=$(LLVM_LIBDIR) $(T)/emit/clospec/check.sh $(F_ABS) | $(wildcard $(T)/emit/clospec/*) compiler/emit/lower/spec.fib compiler/emit/lower/call.fib compiler/emit/lower/ctrl.fib compiler/emit/mono.fib
+# The element read, write and append of a Vec are fast paths LLVM puts in line, their slow paths out of line and noinline
+tool_sh-emit-vecfast := $(T)/emit/vecfast/check.sh $(F_ABS) | $(wildcard $(T)/emit/vecfast/*) lib/prelude.fib compiler/native/lower.fib
 tool_sh-emit-windows := $(T)/emit/windows.sh $(F_ABS) | $(T)/emit/windows.sh $(T)/emit/inspect.fib
 tool_sh-fibref-heap-gold := $(T)/fibref/heap-gold.sh | $(wildcard $(T)/fibref/heap-gold*)
 tool_sh-native-h-checks := $(T)/native/h-checks.sh | $(wildcard $(T)/native/h-*) $(wildcard $(T)/native/h-cases/*)
@@ -153,7 +155,7 @@ tool_sh-live-defs-tsan := env TSAN_OUT=$(TOOLS_OUT)/live-defs-tsan $(T)/live/def
 TOOLS_FULL := $(TOOLS_QUICK) unit-api units-all units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-shared sh-driver-host-threads sh-emit-runtime sh-emit-defs-order sh-stack-stack \
   sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-stubs-own sh-live-stubs-sample sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-mt sh-live-leak sh-live-stackcheck sh-shared-stackcheck sh-live-swap sh-live-lir sh-live-defcache sh-live-queue sh-live-test sh-live-testlive sh-live-watch sh-live-quotes sh-live-statics sh-live-load sh-live-parsed sh-live-stress sh-live-stress-tsan sh-live-defs sh-live-defs-tsan sh-live-retire \
-  $(PERSIST_STAMPS) sh-emit-resume sh-expand-fuseinline sh-emit-clospec sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
+  $(PERSIST_STAMPS) sh-emit-resume sh-expand-fuseinline sh-emit-clospec sh-emit-vecfast sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
   sh-native-l1-unit $(LIRO_STAMPS) jit-selfhosted-threads sh-native-a64-sibcall sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
 # The command is every word up to the `|`, the inputs every word after it.
 upto_bar = $(if $(filter |,$(firstword $(1))),,$(if $(1),$(firstword $(1)) $(call upto_bar,$(wordlist 2,999999,$(1))),))
