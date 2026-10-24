@@ -1,0 +1,25 @@
+;; spec:   stdlib §2.5 (in place when unique), §4.4 (reduce, into); lib/fib/seq/consumers.fib `reduce-spans`
+;; expect: accept
+;; result: 1003000
+;; audit:  clean
+;; allocs: <= 12
+;; roots:  ../../lib support
+;; covers: reduce into
+;; `reduce` over a Vec hands its running value to f as a loop variable, at its last use, so f's update of a value nobody else holds is in
+;; place; `into` is that reduce with conj. A flat Vec of 1000 (one array) takes 1000 assoc through reduce and 1000 conj through into,
+;; 10 at a time from a Vec of 10 that stays shared. The result is the span count (1 while the Vec stays flat) times 1000000, plus the
+;; count (2000), plus the sum of the first 1000 elements less the base (each assoc added 1 to one of them: 1000). Through a cell,
+;; `(set! acc (f @acc x))`, f saw the value with count 2: the first update made the flat Vec a trie and
+;; every later one copied a path or a tail: result 63003000 and 7222 objects with the stage 2 and library of f748147c. Measured 9.
+(ns main (:use fib.core fib.seq fib.coll))
+
+(defun main () -> i64
+  (let ((v (mapv (fn (i: i64) (* i 2)) (range 1000)))
+        (ten (mapv (fn (i: i64) (* i 97)) (range 10))))
+    (let ((w (loop ((k 0) (v v))
+               (if (< k 100)
+                   (recur (+ k 1) (reduce (fn (acc: (Vec i64) j: i64) (assoc acc (rem (+ j k) 1000) (+ (nth acc (rem (+ j k) 1000)) 1))) v ten))
+                   v)))
+          (x (loop ((k 0) (w w)) (if (< k 100) (recur (+ k 1) (into w ten)) w))))
+      (let ((s (loop ((i 0) (s 0)) (if (< i 1000) (recur (+ i 1) (+ s (- (nth x i) (* i 2)))) s))))
+        (+ (* (span-count x) 1000000) (count x) s)))))
