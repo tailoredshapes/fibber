@@ -108,9 +108,24 @@
                 (do (fb-open (. cx b) next)
                     ;; what the frame holds when no clause matched: the plan's (own.walk.pattern, key `-1 - e`)
                     (set! (. cx unwind-ops) (get (. (. cx own) guard-fail) (- -1 (. e id))))
-                    (lcx-trap-c cx "no match clause matched")
+                    ;; after a default arm the block has no edge into it and keeps the trap; else the checker's proof makes it unreachable
+                    (if (default-arm? cls) (lcx-trap-c cx "no match clause matched") (lcx-no-match cx))
                     (set! (. cx unwind-ops) nil)
                     (lcx-join-branches cx lj ty incoming))))))))
+
+;; Whether the last clause is an unguarded `_` or variable (`:as` one too): every value matches it, so nothing falls through.
+(defun default-arm? :private (cls: (Vec Clause)) -> bool
+  (if (empty? cls)
+      false
+      (let ((c (nth cls (- (count cls) 1))))
+        (and (nil? (. c guard)) (catch-all? (. c pat))))))
+
+(defun catch-all? :private (p: Pattern) -> bool
+  (match (. p kind)
+    ((PWild) true)
+    ((PBind _) true)
+    ((PAs inner _) (catch-all? inner))
+    (_ false)))
 
 ;; A loop variable: its initialiser stored in a slot of the entry block, the binding a slot local.
 (defun loop-var :private (cx: LowerCx lb: LoopBind) -> (Result LoopVar str)
