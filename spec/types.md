@@ -744,7 +744,11 @@ private-copy : ∀a. (Object a, Send a) ⇒ (fn :send (a) a)      ; escapes [Esc
 plain), every child of `f` retained once. It is made for a **closure that tasks call**. A closure call retains the closure it calls and the
 closure's body releases it (§8.4), so each call of a closure that is `SHARED` is an atomic pair on one count: 60 ns at 8 threads, where a
 private copy costs 1 to 2 ns (docs/shootout/parallel.md). A task that is to call `f` many times makes `(private-copy f)` first; the captured
-values are retained once per copy, not once per call. The copy is not shared until it is handed to another thread. It replaces what a
+values are retained once per copy, not once per call. The copy is not shared until it is handed to another thread. The operand is
+borrowed and **escapes** (§6.5 (d), §6.11; **Decided**, owner, 2026-10-24): a closure literal passed to `private-copy` (directly, through
+a `let` binding, or through a parameter, whose summary then says it escapes) is a heap closure, so the copy's captures are counted
+objects; a stack closure's captures may be a stack closure or a scope-local object of its frame, which the copy would hold uncounted
+after the frame ended (before the decision, `(private-copy f)` of a stack `f` capturing a scope-local struct, returned, read a dead frame). It replaces what a
 `:scoped` closure colour (borrowed captures, no share-marking) would give for calls, without a new colour: a copy is an ordinary owned
 closure, so the `Send` rules and the audit are untouched (**Decided**: the colour was measured against this and not built, 3.6 of the
 design). A copy of an `IMMORTAL` object is the object; of a cell, atom, weak reference or task (`fib.kinds`), or of a string or an array
@@ -2553,7 +2557,7 @@ the `let` binding `f` it directly initialises, or, for a named `(fn g
   is a call `(f args)` or a use of kind (b), and which no other closure
   captures;
 - (d) anything else: E1, E2, E3 (captured by an escaping closure), E4, an
-  `escapes` parameter, an argument or the head of a call through a
+  `escapes` parameter (the operand of `private-copy` among them, §2.10.2), an argument or the head of a call through a
   closure value (unknown callee), an `async` body; for the self-name,
   also a capture by another closure and any binding of it (a `let`
   initialiser, a `match` scrutinee).
@@ -3166,7 +3170,8 @@ constructor call, `(cell e)` or `(atom e)`; closures are decided by
   closure, passed to `spawn`, or passed or called at a tail call
   (§6.10; an admitted one: a tail site that rule (e) makes ordinary
   keeps the frame);
-- passed to an `escapes` parameter of a known callee, or to any
+- passed to an `escapes` parameter of a known callee (the operand of
+  `private-copy` among them, §2.10.2), or to any
   parameter of a closure value;
 - moved out or retained by a scope exit or a join (§6.3);
 - the initialiser of a `loop` variable (a `recur` argument is at E6

@@ -94,12 +94,15 @@
        (_ ps)))
     (_ ps)))
 
-;; Rust: walk/callee.rs:140 `builtin_param`: the position of a builtin's argument by how it escapes.
+;; Rust: walk/callee.rs:140 `builtin_param`: the position of a builtin's argument by how it escapes. The operand of `private-copy`
+;; is borrowed and escapes (spec/types.md §2.10.2, §6.5; decided by the owner, 2026-10-24): the copy is a heap object holding
+;; what the operand holds, so a closure passed to it is a heap closure, whose captures are counted, never a stack one whose
+;; captures (a scope-local object, a stack closure) end with its frame while the copy lives on.
 (defun builtin-param :private (b: i64 e: Escape) -> Param
   (let [plain (param ClBorrow false)]
     (match e
       ((EscScalar) plain)
-      ((EscBorrow) plain)
+      ((EscBorrow) (if (= (. (nth (builtin-table) b) name) "private-copy") (param ClBorrow true) plain))
       ((EscRaw) plain)
       ((EscStore) (with (param ClStore true) (raw-retained (= (. (nth (builtin-table) b) name) "raw-retained"))))
       ((EscThread) (param ClThread true))
