@@ -1,0 +1,40 @@
+;; spec:   spec/types.md §2.10.2, §6.5 (d), §6.11 (decided by the owner, 2026-10-24); compiler/own/walk/callee.fib (`builtin-param`)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; `private-copy` makes a heap object with a closure's code and its captures retained, and the copy may outlive the frame that made
+;; the closure. Its operand is therefore an escaping position: a literal passed to it, directly, through a `let` binding, or through
+;; a parameter (whose summary then says it escapes), is a heap closure, and what it captures is counted. Before the decision the
+;; operand was a plain borrowed position: in `direct` the literal was a stack closure capturing the scope-local struct `s`
+;; uncounted, the copy held `s`'s address in the dead frame, and after `clobber` had written over that frame `(g1)` was garbage
+;; (125002271681606 on main at 9b329978). `through-param` held then only because `at`, captured by a closure, was a heap closure
+;; and `s`, captured by it, was not scope-local; with captures by stack closures allowed (§6.5 (c)) and the operand left plain (a
+;; planted fault), `(g2)` is garbage too.
+(ns main (:use fib.core))
+
+(defstruct Pt (x: i64 y: i64))
+
+(defun clobber (a: i64 b: i64 c: i64 d: i64) -> i64
+  (let ((p (Pt a b)) (q (Pt c d)) (r (Pt (+ a d) (+ b c))))
+    (+ (. p x) (. q y) (. r x) (. r y))))
+(defun differs (a: i64 b: i64) -> i64 (if (= a b) 0 1))
+
+;; the literal captures a struct this frame allocates
+(defun direct (n: i64) -> (fn () i64)
+  (let ((s (Pt n 2))
+        (f (fn () (+ (. s x) (. s y)))))
+    (private-copy f)))
+
+;; through a parameter: `copy-of`'s `f` escapes, so the caller's literal is a heap closure
+(defun copy-of (f: (fn () i64)) -> (fn () i64) (private-copy f))
+(defun through-param (n: i64) -> (fn () i64)
+  (let ((s (Pt n 3))
+        (at (fn (i: i64) (* i (. s x)))))
+    (copy-of (fn () (+ (at 2) (. s y))))))
+
+(defun main () -> i64
+  (let ((g1 (direct 40))
+        (g2 (through-param 50))
+        (noise (clobber 1 2 3 4)))
+    (+ (differs (g1) 42) (differs (g2) 103) (- noise noise))))

@@ -1,0 +1,56 @@
+;; spec:   spec/types.md §6.5 (c), captures by closures (decided by the owner, 2026-10-24); §8.4; compiler/own/classify.fib (`escaping-use`)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; allocs: <= 22
+;; A `let`-bound literal that only stack closures capture is a stack closure itself (before the decision a capture by any closure, a
+;; stack one too, made it an escaping heap closure). The shapes: the allerbees cutter's `at`, captured by a literal passed to a
+;; non-escaping parameter; a chain, `c3` captures `c2` captures `c1`, the last passed to that parameter; a literal let-bound inside a
+;; `loop` body and captured by one made there; a literal outside the loop captured inside it; a let-bound capturing literal that is
+;; only called; a named `fn` whose own name a stack literal in its body captures (self-capture), called recursively. No capturing
+;; literal calls a captured one in tail position: that is a tail site of its body, which makes the callee heap by the tail rule
+;; (E6), not by the capture. Every literal here is on the stack (`fibc explain`: `heap=no` for all 14); the 22 heap objects are the
+;; Vecs as they are built and the string; under the rule before the decision the run allocated 34. Each answer is compared with the
+;; value the rule before the decision gives too.
+(ns main (:use fib.core))
+
+(defun sum (lo: i64 hi: i64 f: (fn (i64) i64)) -> i64
+  (loop ((i lo) (acc 0)) (if (>= i hi) acc (recur (+ i 1) (+ acc (f i))))))
+(defun differs (a: i64 b: i64) -> i64 (if (= a b) 0 1))
+
+;; the cutter's shape: `at` is captured by the literal passed to `sum`
+(defun cutter (k: (Vec i64)) -> i64
+  (let ((at (fn (i: i64) (nth k (rem i 3)))))
+    (differs (sum 0 10 (fn (i: i64) (* 2 (at i)))) 38)))
+
+;; a chain of captures, every link a stack closure
+(defun chain (k: (Vec i64) s: str) -> i64
+  (let ((c1 (fn (i: i64) (+ (nth k (rem i 4)) (str-len s))))
+        (c2 (fn (i: i64) (* 3 (c1 i))))
+        (c3 (fn (i: i64) (+ (c2 i) (c1 (+ i 1))))))
+    (differs (sum 0 8 (fn (i: i64) (- (c3 i) 1))) 888)))
+
+;; literals inside a loop body, and one outside it captured inside
+(defun looped (k: (Vec i64)) -> i64
+  (let ((outer (fn (i: i64) (nth k (rem i 3)))))
+    (loop ((j 0) (acc 0))
+      (if (>= j 5)
+        (differs acc 180)
+        (let ((inner (fn (i: i64) (+ (outer i) j))))
+          (recur (+ j 1) (+ acc (sum 0 3 (fn (i: i64) (* 2 (inner (+ i j))))))))))))
+
+;; a let-bound literal that captures another and is only called
+(defun called (k: (Vec i64)) -> i64
+  (let ((get-k (fn (i: i64) (nth k i)))
+        (both (fn (i: i64) (+ (get-k i) (get-k (+ i 1))))))
+    (differs (+ (both 0) (both 1) (both 2)) 150)))
+
+;; self-capture: the stack literal in `walk`'s body captures `walk` and is passed to `sum`
+(defun selfcap (k: (Vec i64)) -> i64
+  (let ((walk (fn walk (n: i64) -> i64
+                (if (= n 0) 1 (+ (nth k (rem n 3)) (sum 0 2 (fn (i: i64) (+ i (walk (- n 1))))))))))
+    (differs (walk 3) 86)))
+
+(defun main () -> i64
+  (let ((k [3 4 5 6 7]) (s (str-concat "ab" "c")))
+    (+ (cutter [1 2 3]) (chain [10 20 30 40] s) (looped k) (called [10 20 30 40]) (selfcap [9 10 11]))))

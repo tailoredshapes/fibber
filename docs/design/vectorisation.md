@@ -296,8 +296,12 @@ Each line: change, files, measured payoff, risk.
    literal, an argument of the library's call, made its captures owned). Quiet machine, ns per tap whole-program (default):
    Vecs 9.70 to 6.64 (14.76 to 10.92), Arrays 4.37 to 2.51 (8.77 to 7.23); the cutter 2.51 to 2.40 s whole-program, 3.73
    to 3.35 s default. The compiler's text +1.8% over main (243 specialisations, 105 borrowed forms). An `inlinehint` on the
-   borrowed forms measured nothing (not kept). The cutter's `at` stays a heap closure: §6.5 (c) admits a let-bound literal
-   only if no other closure captures it, even a stack one.
+   borrowed forms measured nothing (not kept). The cutter's `at` stayed a heap closure: §6.5 (c) admitted a let-bound literal
+   only if no other closure captured it, even a stack one. Since the owner's decision of 2026-10-24 a capture by a stack
+   closure is allowed (a capture by a heap one still escapes, transitively; the operand of `private-copy` escapes): `at` and
+   the literals around it are stack closures (13 heap literals in the cutter to 9, `fibc explain`). Cutter, 3 interleaved
+   runs, load 3.9 to 5.4: whole-program 1.78, 1.80, 1.78 s to 1.74, 1.77, 1.73 s; default 2.65, 2.84, 2.66 s to 2.42,
+   2.60, 2.38 s; peak RSS unchanged (154 to 165 MB both); outputs byte-identical. The compiler's text +1940 bytes (+0.03%).
 5. **Range facts for index arithmetic and versioning on the loop bound.** `!range` on array lengths (`[0, 2^60)`) and a
    precheck loop version for `i+j` style arithmetic. Payoff: spectral-norm 1.41x. Risk: low for versioning; the range
    needs an lIR `!range` form or an `llvm.assume` intrinsic that the lIR does not have.
