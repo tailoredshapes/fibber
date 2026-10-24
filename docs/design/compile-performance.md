@@ -358,4 +358,51 @@ Findings for small programs: a cold partitioned build is slower (0.6 s) than who
 - The profile run itself (161 s wall) ran at load 11 to 22; use the matrix for times. `i160` and `i80ns3x32` builds ran at load up to 33.
 - A second machine (the Ryzen 5800X) is not in this document; see the commit message.
 - Whole-program builds are deterministic only for a fixed output name: the module name (the `FILE` symbol) is the output file name, so `-o F1` and `-o F2` differ in 8 bytes of the symbol table. Partitioned builds name modules `liro-unit-N` and do not have the dependence.
-- Not tried: ThinLTO-style summary-based importing instead of source-level copies, splitting by call-graph affinity, and the opt-in with the cache on.
+- Not tried: splitting by call-graph affinity, and the opt-in with the cache on. ThinLTO: see the next section.
+
+## ThinLTO spike (`FIB_LIRO_THIN=1`, 2026-10-24)
+
+Opt-in, Linux only, default unchanged. Each cached unit is ThinLTO bitcode with a module summary instead of an object: lower, then
+`thinlto-pre-link<On>,embed-bitcode<thinlto;emit-summary>` through `LLVMRunPasses`, and the bytes of the `llvm.embedded.object` global
+that FatLTO's pass leaves are the summary bitcode (LLVM-C has no summary writer; the pass is ELF-only and a Mach-O module is a fatal
+error). The link adds `-Wl,-plugin,/usr/lib/llvm-21/lib/LLVMgold.so` with `O`, `mcpu`, `jobs=6` and `cache-dir=<liro cache>/thinlto`;
+GNU ld 2.46 loads the plugin (no lld or gold on the box). macOS: `ld64` (ld-27037) does ThinLTO with `-lto_library
+/opt/homebrew/opt/llvm@21/lib/libLTO.dylib -cache_path_lto DIR` (checked with a two-file C program), but the summary would need
+Homebrew's `opt -thinlto-bc`, a C++ shim, or libLTO's `thinlto_*` API fed by something that can write a summary.
+
+i7-14700KF, load 1 to 4.7 (one run at higher load is excluded), medians of 3 interleaved runs, one F built from this tree (`F-thin`)
+for every configuration. Run times, s (`FIB_LIRO_IMPORT=80` is `i80`, whole is `--whole-program`):
+
+| program | default | i80 | thin | whole |
+|---|---|---|---|---|
+| cutter (allerbees, 3 sprites, 360) | 2.31 | 1.44 | 1.56 | 1.48 |
+| num-f64 | 5.28 | 1.49 | 1.51 | 1.49 |
+| num-nbody | 1.25 | 0.60 | 0.60 | 0.56 |
+| vec-conj-pop | 1.52 | 0.79 | 0.79 | 0.76 |
+| vec-sort | 0.59 | 0.38 | 0.37 | 0.36 |
+| map-assoc-get | 0.51 | 0.32 | 0.31 | 0.31 |
+| lazy-fused | 1.71 | 0.91 | 0.74 | 0.68 |
+| strings | 0.86 | 0.76 | 0.71 | 0.70 |
+| compiler (`emit compiler/fibc.fib`) | 35.6 | 28.2 | 27.2 | 27.8 |
+
+Builds, wall / CPU s (the cache-on unit build compiles its misses one at a time; the ThinLTO backend runs 6 threads in the linker):
+
+| build | default | i80 | thin | whole |
+|---|---|---|---|---|
+| cutter cold | 2.21 / 2.21 | 3.70 / 3.68 | 2.06 / 4.10 | 3.13 / 3.12 |
+| cutter, `clamp` (a leaf) edited | 1.32 / 1.32 | 2.76 / 2.75 | 1.68 / 3.37 | 3.18 / 3.17 |
+| cutter, `parse-opts` edited | 1.34 / 1.34 | 1.49 / 1.49 | 1.68 / 3.30 | 3.12 / 3.12 |
+| cutter, no change (front end floor) | 1.27 | 1.32 | 1.25 | 1.05 |
+| compiler cold | 69.6 / 69.5 | 158.1 / 158.1 | 74.3 / 175.4 | 138.5 / 138.5 |
+| compiler, one function edited | 43.5 / 43.4 | 58.2 / 58.2 | 64.8 / 154.7 | |
+| compiler size, MB | 9.5 | 20.7 | 17.3 | 15.1 |
+| cutter size, KB | 282 | 468 | 434 | 345 |
+
+Findings: ThinLTO gives whole-program run time (within 5%, the cutter +5% over whole) with half the CPU of `i80` on a cold compiler
+build. Its weak point is the edit: one edited function re-ran 17 of the 19 backend jobs for the compiler and 15 to 16 of 19 for the
+cutter (also with `FIB_LIRO_SPLIT=ns2`), so an edit costs about as much backend CPU as a cold link; the cause (module-granular import
+keys, or attribute propagation across the index) is not established. Correctness: cutter outputs byte-identical in every configuration;
+bench checksums equal; 540 cases (all of `cases/ownership`, every tenth of `cases/stdlib`) built and run both ways agree except the two
+out-of-memory traps (195, 7881), where ThinLTO, `i80` and whole-program all delete the unused `alloc`/`free` pair and exit 7 where the
+default build and `fibc run` trap. A compiler built through ThinLTO emits the same lIR for `compiler/fibc.fib` as the others.
+Scripts and logs: `/tank/data/fibber-scratch/thinlto/` (`runs.sh`, `cutbuilds.sh`, `compbuilds.sh`, `case1.sh`, `logs/`).
