@@ -12,6 +12,8 @@
 #   5  fibc cases cases/ownership -j N (310 of 311 pass natively with spec/method.md absent; case 188 reads a repo file by a relative path)
 #   6  fibc cases cases/stdlib --only PREFIXES (SIMD 62, tensors 70, OS 74, fmt 42, mkdir 36); the allowed failures are listed in KNOWN below
 #   7  JIT at every -O level and AOT at -O 0 and -O 2 on the case that crashed at -O 0 (6223), and compiler/tests/native/a64-o0.sh: all must exit 0 (A64-1)
+#   8  `run` of a `:lib` extern finds a dylib through DYLD_FALLBACK_LIBRARY_PATH and through HOMEBREW_PREFIX, and with neither set says where it looked
+#      and that HOMEBREW_PREFIX is not set (compiler/tests/driver/linklib.sh covers Linux)
 # Writes under $HOME/fibber-a64-scratch only (override with MAC_SCRATCH). Never installs anything. Written for, and first run on, an M1 Ultra (macOS 27).
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd); cd "$root"
@@ -73,14 +75,26 @@ s7() {
   F="$FB" compiler/tests/native/a64-o0.sh || r=1
   return $r
 }
+s8() { # `run` loads a `:lib` from dyld's fallback directories or $HOMEBREW_PREFIX/lib, and from no prefix written into fibc (native.libsearch)
+  local d=$scratch/lib8 D=compiler/tests/driver/linklib out r=0 st
+  mkdir -p "$d/lib" && echo 'int fibtest_answer(void) { return 42; }' > "$d/a.c" && cc -shared -o "$d/lib/libfibtest.dylib" "$d/a.c" || return 1
+  out=$(env -u HOMEBREW_PREFIX -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_LIBRARY_PATH -u LIBRARY_PATH "$FB" run $D/uses-answer.fib -I $D 2>&1)
+  case $out in *"looked for libfibtest.dylib in /usr/local/lib, /usr/lib (HOMEBREW_PREFIX is not set"*) echo "  no variable: not found, and the message says why" ;;
+    *) echo "  no variable: [$out]"; r=1 ;; esac
+  env -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_LIBRARY_PATH -u LIBRARY_PATH HOMEBREW_PREFIX="$d" "$FB" run $D/uses-answer.fib -I $D > /dev/null 2>&1; st=$?
+  echo "  HOMEBREW_PREFIX: exit $st"; [ $st -eq 0 ] || r=1
+  env -u HOMEBREW_PREFIX -u DYLD_LIBRARY_PATH -u LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH="$d/lib" "$FB" run $D/uses-answer.fib -I $D > /dev/null 2>&1; st=$?
+  echo "  DYLD_FALLBACK_LIBRARY_PATH: exit $st"; [ $st -eq 0 ] || r=1
+  return $r
+}
 if [ -n "$withf" ]; then   # `make mac-check` built F, ran the fixed point and the case directories: what is left is this machine's own checks (steps 1, 4, 7)
   [ -x "$FB" ] || { echo "no F at $FB"; exit 2; }
   step 1 s1 || exit 1
-  step 4 s4; step 7 s7
+  step 4 s4; step 7 s7; step 8 s8
 else
   step 1 s1 || exit 1
   step 2 s2; [ -x "$FB" ] || exit 1
-  step 3 s3; step 4 s4; step 5 s5; step 6 s6; step 7 s7
+  step 3 s3; step 4 s4; step 5 s5; step 6 s6; step 7 s7; step 8 s8
 fi
 echo "mac-check: $bad step(s) failed"
 exit $bad

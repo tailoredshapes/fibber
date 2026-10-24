@@ -2,7 +2,9 @@
 ;; A library is found the way the dynamic linker finds one: the development link `libNAME.so` (`libNAME.dylib` on macOS) first; when only the versioned
 ;; file is installed (`libNAME.so.7`, the runtime package without the development one), the highest version in the first directory that has one. The
 ;; directories are those the command gave (`-L`), LD_LIBRARY_PATH (and LIBRARY_PATH, the linker's), the ones /etc/ld.so.conf lists (with its includes),
-;; then the system's own. A `:lib ":FILE"` names the file itself, as the linker's `-l:FILE`.
+;; then the system's own. On macOS (no ld.so.conf) the system's are dyld's fallback directories (DYLD_FALLBACK_LIBRARY_PATH, else /usr/local/lib and /usr/lib)
+;; and then Homebrew's, `$HOMEBREW_PREFIX/lib` (`brew shellenv` sets it): no installation's prefix is written into the compiler. A `:lib ":FILE"` names
+;; the file itself, as the linker's `-l:FILE`.
 (ns native.libsearch (:require [fib.string :as s] [fib.os.directories :as dirs] [fib.os.platform.detect :as plat]))
 
 (defun darwin? :private () -> bool
@@ -17,7 +19,8 @@
 
 (defun system-dirs :private () -> (Vec str)
   (if (darwin?)
-      ["/opt/homebrew/lib" "/usr/local/lib" "/usr/lib"]
+      (let ((fallback (env-dirs "DYLD_FALLBACK_LIBRARY_PATH")))
+        (into (if (empty? fallback) ["/usr/local/lib" "/usr/lib"] fallback) (mapv (fn (p: str) (str p "/lib")) (env-dirs "HOMEBREW_PREFIX"))))
       ["/lib/x86_64-linux-gnu" "/usr/lib/x86_64-linux-gnu" "/lib/aarch64-linux-gnu" "/usr/lib/aarch64-linux-gnu"
        "/lib64" "/usr/lib64" "/lib" "/usr/lib" "/usr/local/lib"]))
 
@@ -104,6 +107,8 @@
 (defun find-lib (name: str dirs: (Vec str)) -> (Option Found)
   (first (candidates name dirs)))
 
-;; What was looked for and where, for a message: `libNAME.so or libNAME.so.N in DIR, DIR..`.
+;; What was looked for and where, for a message: `libNAME.so or libNAME.so.N in DIR, DIR..`; on macOS with no HOMEBREW_PREFIX (a shell that did not
+;; run `brew shellenv`: ssh commands, launchd) the message says so.
 (defun tried-text (name: str dirs: (Vec str)) -> str
-  (str (dev-name name) (if (darwin?) "" (str " or lib" name ".so.N")) " in " (str-join (vec (interpose ", " dirs)))))
+  (str (dev-name name) (if (darwin?) "" (str " or lib" name ".so.N")) " in " (str-join (vec (interpose ", " dirs)))
+       (if (and (darwin?) (not (some? (sys-getenv "HOMEBREW_PREFIX")))) " (HOMEBREW_PREFIX is not set: `eval \"$(brew shellenv)\"` sets it)" "")))

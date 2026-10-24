@@ -1170,7 +1170,8 @@ survives to the emitted code), the emitter notes the library and the module that
 dynamically (`-lNAME`) or bundled (the archive `libNAME.a`) by the mode of the build (`--link NAME=static|dynamic`, `--link-mode`, `--static`:
 docs/design/static-linking.md 3). `fibc run` (the JIT, also `run --live` and `repl`) loads the library into its process before the program's code, as an
 executable's loader would. Dynamically, the development link `libNAME.so` is taken first; where only the versioned file is installed (`libNAME.so.7`), the
-highest version found in `-L`, LD_LIBRARY_PATH, /etc/ld.so.conf's directories and the system's is linked (`-l:libNAME.so.7`) and loaded; `:lib ":FILE"` names the
+highest version found in `-L`, LD_LIBRARY_PATH, /etc/ld.so.conf's directories and the system's is linked (`-l:libNAME.so.7`) and loaded. On macOS `run` also
+looks in DYLD_FALLBACK_LIBRARY_PATH (else /usr/local/lib and /usr/lib) and `$HOMEBREW_PREFIX/lib`; the compiler names no installation's directory itself. `:lib ":FILE"` names the
 file itself. A library found nowhere is an error naming the module, the library and what was looked for. A name is a non-empty string, else `extern option :lib takes a library name, a string`. Only a platform module or a driver
 may write an `extern` (docs/adr/0011). `c`, `m`, `pthread`, `dl`, `rt` and `util` are the C library's own and are never linked by name.
 
