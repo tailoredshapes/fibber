@@ -5,7 +5,10 @@
 ;; passes it on to `sum`. `direct-inner` is the shape of the allerbees cutter's `resample-axis`: a literal made inside a specialisation
 ;; calls the known parameter, and is itself passed to `sum`; check.sh wants it direct (LLVM may keep the outer literal, which holds a
 ;; loop, as a direct call).
-;; `closure-` passes a closure the specialisation cannot see (taken out of a Vec): it must stay an indirect call, which is what
+;; `spec-let-loop` calls a let-bound literal whose binding is only ever called, in a loop of its own; `direct-let-captured` calls one
+;; from a literal passed to `sum` (the cutter's `at` inside the literals of `soft-alpha`), and check.sh wants it direct (LLVM puts `at`
+;; in the outer literal but keeps that literal, grown by the counts of the captured closure, as a call). `closure-` passes a closure the specialisation cannot see (taken out
+;; of a Vec), and `closure-let-kept` calls a let-bound literal that is also kept in a Vec: both must stay indirect calls, which is what
 ;; check.sh would miss if it could not fail.
 (ns main)
 
@@ -21,6 +24,16 @@
 (defun spec-two-levels (a: (Array f64)) -> f64 (sum-to (array-len a) (fn (d: i64) (+ 1.0 (array-get a d)))))
 (defun direct-inner (a: (Array f64) w: i64) -> f64 (axis (quot (array-len a) w) w (fn (r: i64 c: i64) (array-get a (+ (* r w) c)))))
 (defun closure-unknown (fs: (Vec (fn (i64) f64)) n: i64) -> f64 (sum 0 n (nth fs 0)))
+(defun spec-let-loop (a: (Array f64)) -> f64
+  (let ((at (fn (i: i64) (* 2.0 (array-get a i)))))
+    (loop ((i 0) (acc 0.0)) (if (>= i (array-len a)) acc (recur (+ i 1) (+ acc (at i)))))))
+(defun direct-let-captured (a: (Array f64)) -> f64
+  (let ((at (fn (i: i64) (array-get a i))))
+    (sum 0 (array-len a) (fn (d: i64) (* 3.0 (at d))))))
+(defun keep (fs: (Vec (fn (i64) f64))) -> i64 (count fs))
+(defun closure-let-kept (a: (Array f64)) -> f64
+  (let ((at (fn (i: i64) (* 2.0 (array-get a i)))))
+    (loop ((i 0) (acc (double (keep [at])))) (if (>= i (array-len a)) acc (recur (+ i 1) (+ acc (at i)))))))
 
 (defun main () -> i64
   (let ((a (let ((c (cell (array 100 0.0)))) (do (dotimes (i 100) (array-set! &c i (double i))) @c))))
@@ -29,4 +42,7 @@
         (println (spec-two-levels a))
         (println (direct-inner a 10))
         (println (closure-unknown [half] 10))
+        (println (spec-let-loop a))
+        (println (direct-let-captured a))
+        (println (closure-let-kept a))
         0)))

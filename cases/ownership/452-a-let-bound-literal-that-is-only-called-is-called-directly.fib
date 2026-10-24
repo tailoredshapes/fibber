@@ -1,0 +1,36 @@
+;; spec:   spec/types.md §8.4, §8.9; docs/design/vectorisation.md 7 item 4; compiler/emit/lower/spec.fib (`spec-note-let`)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; A `let` that binds a name to a `fn` literal and only ever calls it (in the let's body, in a later binding, and in literals made there,
+;; which capture it) calls the literal's code directly; the closure is still made and passed as its env. The literals capture a borrowed
+;; parameter, an owned string, a counted Vec and a cell that records the order of the calls; one is called from a literal passed to a
+;; specialised `sum` (the allerbees cutter's `at`), one from inside another let-bound literal, one inside a specialisation. Each answer is
+;; compared with the same computation through closures taken out of a Vec.
+(defstruct Box (n: i64))
+
+(defun sum (lo: i64 hi: i64 f: (fn (i64) i64)) -> i64
+  (loop ((i lo) (acc 0)) (if (>= i hi) acc (recur (+ i 1) (+ acc (f i))))))
+(defun hidden (fs: (Vec (fn (i64) i64))) -> (fn (i64) i64) (nth fs 0))
+(defun hidden2 (fs: (Vec (fn (i64 i64) i64))) -> (fn (i64 i64) i64) (nth fs 0))
+(defun differs (a: i64 b: i64) -> i64 (if (= a b) 0 1))
+
+;; a let-bound literal inside a defun that is itself specialised over `g`
+(defun twice-at (n: i64 g: (fn (i64) i64)) -> i64
+  (let ((at (fn (i: i64) (* 2 (g i)))))
+    (loop ((i 0) (acc 0)) (if (>= i n) acc (recur (+ i 1) (+ acc (at i)))))))
+
+(defun with-box (b: Box) -> i64
+  (let ((s (str-concat "ab" "cde")) (v [10 20 30 40 50]) (log (cell 0)))
+    (let ((at (fn (x: i64 y: i64) (do (set! log (+ (* @log 10) (+ x 1))) (+ (* (. b n) x) y (str-len s)))))
+          (first-two (at 0 1))
+          (near (fn (i: i64) (+ (at i 0) (nth v (rem i 5))))))
+      (let ((direct (+ first-two (sum 0 4 (fn (d: i64) (at d (nth v d)))) (near 3) (twice-at 3 (fn (i: i64) (at i i)))))
+            (seen @log))
+        (let ((at2 (hidden2 [(fn (x: i64 y: i64) (+ (* (. b n) x) y (str-len s)))])))
+          (let ((through (+ (at2 0 1) (sum 0 4 (hidden [(fn (d: i64) (at2 d (nth v d)))])) (+ (at2 3 0) (nth v 3))
+                            (twice-at 3 (hidden [(fn (i: i64) (at2 i i))])))))
+            (+ (differs direct through) (differs seen 112344123))))))))
+
+(defun main () -> i64
+  (with-box (Box 7)))

@@ -2,7 +2,8 @@
 ;; `defun` that passes a function literal, a named function or a function parameter already known to be one, to a parameter the callee
 ;; calls, requests the callee's instance with that parameter known (emit.mono `Inst` `fns`): the same body at the same types, in which a
 ;; call of the parameter is a direct call of the known code (`TgKnown`) instead of a call through the closure's code pointer. LLVM can
-;; then put the literal's code in line in the callee's loop, which the loop vectoriser needs.
+;; then put the literal's code in line in the callee's loop, which the loop vectoriser needs. The same direct call is made through a
+;; `let` binding of a `fn` literal that is only ever called (`spec-note-let`, at the end of this file).
 ;;
 ;; Why it is the same program: nothing but the call instruction changes. The literal's closure object is still made at the call site and
 ;; passed as the argument, under the same ownership plan (the callee's plan is the generic body's: its key is the same); the call of the
@@ -86,12 +87,46 @@
                          (if (and (>= i 0) (< i (count (. inst fns)))) (nth (. inst fns) i) "")))
           (_ "")))))
 
-;; The target of a call whose head value is `hv`: the known code, when the head is a parameter known to be one, else the closure's.
+;; The target of a call whose head value is `hv`: the known code, when the head is a parameter known to be one or a let-bound literal
+;; whose binding is only ever called, else the closure's.
 (defun spec-value-target (cx: LowerCx head: Expr hv: V) -> Target
   (match (. head kind)
     ((ELocal b) (let ((known (spec-known-binding cx b)))
-                  (if (= known "") (TgValue hv) (TgKnown known hv))))
+                  (if (= known "")
+                      (match (get @(. (. cx p) let-codes) (LetKey (. cx inst) b))
+                        ((some code) (TgKnown code hv))
+                        (nil (TgValue hv)))
+                      (TgKnown known hv))))
     (_ (TgValue hv))))
+
+;; ---- let-bound literals
+
+;; Whether every use of the binding `b` in `es` (the literals made there included) is the head of a call: it is never passed, stored,
+;; returned or bound again, so each call through it reaches the literal it was bound to.
+(defun only-called? :private (b: i64 es: (Vec Expr)) -> bool
+  (loop ((stack es))
+    (match (peek stack)
+      (nil true)
+      ((some e)
+       (match (. e kind)
+         ((ELocal x) (if (= x b) false (recur (pop stack))))
+         ((ECall h args)
+          (if (some? (first (filterv (fn (a: Arg) (match a ((ArgAmp x _) (= x b)) (_ false))) args)))
+              false
+              (recur (into (pop stack) (match (. h kind) ((ELocal x) :when (= x b) (vec (drop 1 (expr-children e)))) (_ (expr-children e)))))))
+         (_ (recur (into (pop stack) (expr-children e)))))))))
+
+;; After binding `(nth bs i)` of a `let` with body `body`: when it binds a name to a `fn` literal and the rest of the form only calls it,
+;; the literal's code (the name `lcx-make-fn` gave it in this function) is what a call through the binding reaches, in this body and in
+;; the literals it makes (they share the instance), so such a call is direct (`spec-value-target`). The closure is made and passed as
+;; the code's `env` as before. A binding that is passed, stored or returned keeps its calls through the closure.
+(defun spec-note-let (cx: LowerCx bs: (Vec LetBind) i: i64 body: Expr) -> unit
+  (let ((lb (nth bs i)))
+    (match (Pair (. (. lb pat) kind) (. (. lb init) kind))
+      ([(PBind b) (EFn _)]
+       (when (only-called? b (conj (mapv (fn (x: LetBind) (. x init)) (vec (drop (+ i 1) bs))) body))
+         (set! (. (. cx p) let-codes) (assoc @(. (. cx p) let-codes) (LetKey (. cx inst) b) (closure-name (. cx name) (. (. lb init) id))))))
+      (_ ()))))
 
 ;; What an argument is known to be: the literal's code, the named function's, the known code of a parameter, or "".
 (defun arg-known :private (cx: LowerCx a: Arg) -> (Result str str)

@@ -1,12 +1,13 @@
 #!/bin/bash
 # compiler/tests/emit/clospec/check.sh FIBC: a function literal or a named function passed to a `defun` that calls it is called directly
-# in the callee's specialisation (compiler/emit/lower/spec.fib, docs/design/vectorisation.md 7 item 4), so LLVM puts it in line.
+# in the callee's specialisation, and a let-bound literal whose binding is only ever called is called directly (compiler/emit/lower/
+# spec.fib, docs/design/vectorisation.md 7 item 4), so LLVM puts it in line.
 # kernels.fib is run (its answers are fixed below) and built at -O 0 to LLVM IR; its `spec-` and `closure-` functions are kept from being
 # inlined into main (so each one's body is its own), and `opt -O2` runs. Each `spec-` and `direct-` function must have no indirect call in
 # its optimised body or in any function of the program it calls (`f.`, `m.`, `l.`), at any depth, and a `spec-` function no call of a
 # literal's code (`l.`) in its own body either (LLVM decides whether to put in line a literal holding a loop of its own: `direct-inner`
-# is not asked that); `closure-unknown` must have an indirect call (a closure the specialisation cannot see stays one: what the check would miss if it
-# could not fail). Exit 1 on any difference. LLVM_BIN names opt (default: beside LLVM_LIBDIR).
+# is not asked that); `closure-unknown` and `closure-let-kept` must have an indirect call (a closure the specialisation cannot see, and
+# a let-bound literal that is also kept in a Vec, stay one: what the check would miss if it could not fail). Exit 1 on any difference. LLVM_BIN names opt (default: beside LLVM_LIBDIR).
 # usage: check.sh FIBC     run from anywhere; FIB_LIB defaults to the tree's lib
 fibc=${1:?usage: check.sh FIBC}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -17,7 +18,7 @@ out=$(mktemp -d "${TMPDIR:-/tmp}/clospec.XXXXXX") || exit 2
 trap 'rm -rf "$out"' EXIT
 ulimit -v 16000000 2>/dev/null
 got=$(timeout 300 "$fibc" run "$here/kernels.fib") || { echo "check.sh: run failed"; exit 1; }
-want=$'9900.0\n22.5\n5050.0\n4950.0\n22.5\n0'
+want=$'9900.0\n22.5\n5050.0\n4950.0\n22.5\n9900.0\n14850.0\n9901.0\n0'
 [ "$got" = "$want" ] || { echo "check.sh: kernels.fib answered"; echo "$got"; echo "check.sh: wanted"; echo "$want"; exit 1; }
 timeout 300 "$fibc" build -O 0 "$here/kernels.fib" --emit llvm -o "$out/k.ll" || { echo "check.sh: build failed"; exit 1; }
 python3 - "$out/k.ll" <<'PY' || exit 1
@@ -66,8 +67,8 @@ for n in names:
         ok = via is not None
         print(('ok   ' if ok else 'FAIL ') + n + ': ' + ('an indirect call' if ok else 'direct (wanted an indirect call)'))
     bad |= not ok
-if len(names) != 5:
-    print('FAIL expected 5 functions, found %d' % len(names)); bad = 1
+if len(names) != 8:
+    print('FAIL expected 8 functions, found %d' % len(names)); bad = 1
 print('check.sh: %s' % ('every function as wanted' if not bad else 'DIFFERENCES'))
 sys.exit(1 if bad else 0)
 PY

@@ -1,0 +1,26 @@
+;; spec:   spec/types.md §8.4; docs/design/vectorisation.md 7 item 4; compiler/emit/lower/spec.fib (`spec-note-let`)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; A let-bound literal that is also passed to a function, put in a struct or a Vec, or returned is called through its closure as before
+;; (only a binding that is only ever called is made direct; compiler/tests/emit/clospec/check.sh `closure-let-kept` checks the call
+;; stays indirect). The closures capture an owned string, so a count that went wrong would show in the audit.
+(defstruct Holder (f: (fn (i64) i64)))
+
+(defun apply-it (f: (fn (i64) i64) x: i64) -> i64 (f x))
+(defun differs (a: i64 b: i64) -> i64 (if (= a b) 0 1))
+
+(defun returned (s: str) -> (fn (i64) i64)
+  (let ((f (fn (i: i64) (+ i (str-len s)))))
+    (if (> (f 0) 100) (fn (i: i64) i) f)))
+
+(defun main () -> i64
+  (let ((s (str-concat "four" "")))
+    (let ((passed (fn (i: i64) (* i (str-len s))))
+          (held (fn (i: i64) (- i (str-len s))))
+          (kept (fn (i: i64) (+ 1 (str-len s)))))
+      (let ((h (Holder held)) (v [kept kept]))
+        (+ (differs (+ (passed 2) (apply-it passed 3)) 20)
+           (differs (+ (held 10) ((. h f) 1)) 3)
+           (differs (+ (kept 0) ((nth v 1) 0) (count v)) 12)
+           (differs ((returned (str-concat "abc" "")) 4) 7))))))

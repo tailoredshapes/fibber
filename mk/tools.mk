@@ -113,7 +113,7 @@ tool_sh-emit-resume := $(T)/emit/resume.sh $(F_ABS) | $(T)/emit/resume.sh
 # The loops the expander writes for a fused `map` with its stage in line are vectorised by LLVM (opt's remarks), a function-value stage is not
 tool_sh-expand-fuseinline := env LLVM_LIBDIR=$(LLVM_LIBDIR) $(T)/expand/fuseinline/check.sh $(F_ABS) | $(wildcard $(T)/expand/fuseinline/*) $(wildcard compiler/expand/fuse*.fib)
 # A function literal or named function passed to a defun that calls it is called directly in the callee's specialisation and put in line
-tool_sh-emit-clospec := env LLVM_LIBDIR=$(LLVM_LIBDIR) $(T)/emit/clospec/check.sh $(F_ABS) | $(wildcard $(T)/emit/clospec/*) compiler/emit/lower/spec.fib compiler/emit/lower/call.fib compiler/emit/mono.fib
+tool_sh-emit-clospec := env LLVM_LIBDIR=$(LLVM_LIBDIR) $(T)/emit/clospec/check.sh $(F_ABS) | $(wildcard $(T)/emit/clospec/*) compiler/emit/lower/spec.fib compiler/emit/lower/call.fib compiler/emit/lower/ctrl.fib compiler/emit/mono.fib
 tool_sh-emit-windows := $(T)/emit/windows.sh $(F_ABS) | $(T)/emit/windows.sh $(T)/emit/inspect.fib
 tool_sh-fibref-heap-gold := $(T)/fibref/heap-gold.sh | $(wildcard $(T)/fibref/heap-gold*)
 tool_sh-native-h-checks := $(T)/native/h-checks.sh | $(wildcard $(T)/native/h-*) $(wildcard $(T)/native/h-cases/*)

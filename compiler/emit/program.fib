@@ -22,6 +22,10 @@
 ;; its value is an object to make immortal, and its slot (`def.slot.N`; `live.d.NAME` in live mode, `live-def-slot`). Rust: inits.rs:42 Init
 (defstruct Init (def-id: i64 module: i64 body: str object: bool slot: str))
 
+;; A binding of a body instance (its literals' code shares the instance).
+(defstruct LetKey (inst: Inst binding: i64))
+(derive Eq LetKey) (derive Hash LetKey)
+
 ;; Rust: program.rs:37 Program (13 fields; `c` is two) and, since X8, `def_slots` (the slot, a global of the module, and the type of
 ;; every `def` made at run time, as a `DefValue`) and `inits` (those `def`s in the order their init functions make them)
 (defstruct Program
@@ -43,7 +47,9 @@
    ;; the bytes of a pointer in the target's memory (4 on wasm32): the layouts of the objects are computed from it. 8 while the JIT runs, which is the host's.
    pb: (Cell i64) runtime: (Vec la/LItem) runtime-host: (Vec la/LItem) link-notes: (Cell (Vec (Pair str str)))
    ;; whether each `defun` reached so far can be part of a recursion (emit.lower.recur, the stack check): the answer for every function of a walk
-   rec-memo: (Cell (Map i64 bool))))
+   rec-memo: (Cell (Map i64 bool))
+   ;; the code of each let-bound `fn` literal whose binding is only ever called (emit.lower.spec `spec-note-let`), by instance and binding
+   let-codes: (Cell (Map LetKey str))))
 
 ;; Whether the program catches (stage 2 of docs/design/exceptions.md, ADR 0009): some body calls `catch-run`. Only then do its functions
 ;; return a failure next to their value (emit.lower.call); a program that never catches has no observer of a failure, so a trap aborts
@@ -167,7 +173,7 @@
                     (match tables ((some t) (. t bodies)) (nil (cell (map-empty))))
                     (def-cache-of tables)
                     (match tables ((some t) (. t resident)) (nil (cell (set-empty))))
-                    (cell (os/target-pointer-bytes)) (. rt target) (. rt host) (cell []) (cell (map-empty)))))
+                    (cell (os/target-pointer-bytes)) (. rt target) (. rt host) (cell []) (cell (map-empty)) (cell (map-empty)))))
     (do (objects-intern (. p objects) "fib.str" "str" ObStr)
         (objects-intern (. p objects) "fib.array.i8" "(Array i8)" (ObArray LirI8))
         (objects-intern (. p objects) "fib.weakbox" "weak box" ObWeak)
@@ -184,7 +190,7 @@
              (cell []) (cell 0) (cell []) (cell [])
              (cell (map-empty)) (cell @(. p def-values)) (cell (map-empty)) (cell []) (cell 0) (cell false)
              (cell @(. p def-slots)) (cell @(. p inits)) (cell false) (. p unwinding) (. p live) (. p live-gens) (. p live-bodies)
-             (. p def-cache) (. p resident) (cell pb) (. p runtime) (. p runtime-host) (cell @(. p link-notes)) (cell @(. p rec-memo)))))
+             (. p def-cache) (. p resident) (cell pb) (. p runtime) (. p runtime-host) (cell @(. p link-notes)) (cell @(. p rec-memo)) (cell @(. p let-codes)))))
 
 ;; The bytes of a pointer of the program's layouts.
 (defun program-pb (p: Program) -> i64 @(. p pb))
