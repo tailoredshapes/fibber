@@ -242,7 +242,8 @@ Rules:
      by the module, become `(let ((s c) ..) (if (not fast) CALL LOOP))`: CALL is the call as written with `s` for the source (the fusing walk then makes it
      recipes), LOOP counted loops over the arrays that hold each source (`span-count`, `span-array` of `Reducible`: a Vec's leaves and tail, an Array), with the
      stage bodies in line (`(let ((x (array-get b i))) body)`, or `(g (array-get b i))` for a symbol), writing a fresh array per span that `vec-from-spans` makes
-     the Vec without a copy. The loop is taken when every source has spans and, for two, their spans start at the same indices (one span each, more than one
+     the Vec without a copy (a `map` over a `range`, or over a flat Vec, writes one array of the count, which `vec-from-array` makes a flat Vec: types §8.3,
+     docs/design/vec-performance.md §8). The loop is taken when every source has spans and, for two, their spans start at the same indices (one span each, more than one
      each, or an output of at most 32); otherwise CALL. The sources are evaluated first and in order (the stage functions are atomic, so nothing moves past an
      effect); each stage runs once per element, innermost first, element by element, the first element before the loop (it fills the output arrays) and never
      again; a trap is the stage's own at the same element. No closure, recipe or indirect call is left for a literal or a named function, so LLVM vectorises the
@@ -480,7 +481,7 @@ stage-1 divergence that §7 B4 closes by making both tools reject it with a mess
 
 **Materialising** is explicit and the only per-element cost: `vec`, `into`, `set`, `zipmap`,
 `sort`, `reverse`, `group-by`, `frequencies`. The bulk ones build in one function
-over a growable buffer and assemble the trie once, about n/32 allocations instead of 2n (§2.5); `vec` of a
+over a growable buffer that becomes the flat Vec's array (types §8.3), about log2(n/32) allocations for a walk and one for an array, instead of 2n (§2.5); `vec` of a
 `Vec` is the identity.
 Each adaptor has an eager spelling only where Clojure has one (`mapv`, `filterv`, aliases of
 `(vec (map ..))`; `doall` realises an `LSeq` and returns it, `dorun` walks it for effect).
@@ -747,7 +748,7 @@ The API is persistent. Two things make it fast, and neither needs a transient AP
 `frequencies` hold their accumulator in a local `cell` and fill an array they alone own, so the unique
 write path applies and nothing is copied: the merge of `sort` over 1000 elements spends 2 objects on its
 buffers ([R] A7). Building the `Vec`'s trie from a flat buffer in one pass needs the trie's private nodes,
-so `vec` and `into` live in the same module as `Vec`: about n/32 allocations instead of the 2.09 per
+so `vec` and `into` live in the same module as `Vec`: about n/32 allocations (since the flat Vec, about log2(n/32): the buffer is the Vec) instead of the 2.09 per
 element that a `conj` loop costs today (**[H]**: the design record's bulk builder filled a flat array with
 14 objects for 1000 elements; assembling the trie from it was not written).
 
@@ -848,7 +849,7 @@ spec/types.md §2.13.1 has the primitives.
 
 **What is tested.** The zero-cost claims are tests with counts (§8): a three-stage pipeline over n and
 over 10n elements allocates the same number of objects (passes today: +4 for 1000, A1), a bulk `vec` of
-n allocates at most n/32 + c, and a `conj` loop of n allocates about n/32 + c on a unique accumulator (case 4011:
+n allocates at most n/32 + c, and a `conj` loop of n allocates about n/32 + c on a unique accumulator, about log2(n) + c since a `conj` from empty stays flat (case 4024; case 4011:
 190 for 1000, 2094 before the in-place update; a struct `Vec` is not needed). The harness had no object
 count at `36ed472`: a case header was `spec expect result audit error trap`; §7 H1 (landed, §7.5) added `allocs` (a maximum), `covers` and `open`, and the
 count lines it reads are the `A` lines of `fibc run --trace`, which the review ran (A10 t1r: 2099 for the

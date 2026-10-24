@@ -1167,10 +1167,12 @@ library does not reach it: `vec-pop` answers `pop: empty` for `VecEmpty` itself,
 and calls `array-pop!` on the tail only when the tail has more than one element,
 and `vnode-pop` calls it only on a branch of `n >= 1` kids (`lib/prelude.fib`).
 
-**Rule for callers.** `array-push!` is written for the vector tail: with
-`len >= 32` it copies exactly `len + 1` elements on every call, so a caller
-that wants amortised in-place growth beyond 32 does not get it from this
-primitive.
+**Rule for callers.** A loop of `array-push!` on a unique array is amortised
+linear: the copy at a power of two at or above 32 doubles the capacity (the
+table above), and the pushes between copies are in place. A caller gets
+in-place growth only while the array stays unique; a shared array is copied
+on the push, as for every primitive of this section. (Before LIBFIX-1 a push
+at `len >= 32` copied exactly `len + 1` elements every time.)
 
 #### 2.13.3 `array-blit!`: a range copied into an array in place
 
@@ -3832,7 +3834,12 @@ compiled program.
   (§6.2): if `i ≥ cnt - len(tail)` one `getelementptr` into `tail`,
   else one array read per node on the path from `root` to a leaf
   (`shift / 5 + 1` nodes: 2 for up to 1 056 elements, at most 13 for a
-  64-bit count), O(log₃₂ n); each
+  64-bit count), O(log₃₂ n). A flat Vec is a `VecOf` whose `root` is
+  `nil` and whose `tail` holds all `cnt` elements, of any number
+  (`cnt - len(tail)` is 0, so every element is the one
+  `getelementptr`); the builders that make it and when it becomes a
+  trie are in docs/design/vec-performance.md §8. The layout is
+  unchanged: a Vec of 32 or fewer was always of this form. Each
   sub-pattern then tests the loaded element as usual. Elements are
   read left to right and only as far as the test needs. A rest `r` of
   `[p₁ .. pₖ & r]` is the result of the runtime function
