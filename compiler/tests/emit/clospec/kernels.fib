@@ -1,0 +1,32 @@
+;; compiler/tests/emit/clospec/kernels.fib: the callers check.sh asks LLVM about (closure specialisation, compiler/emit/lower/spec.fib).
+;; Each `spec-` function passes a function literal or a named function to a `defun` that calls it in a loop: in the callee's
+;; specialisation the call is direct, so check.sh wants no indirect call in it or in any function it calls, and no call of a
+;; literal's code left in its optimised body (LLVM put the literal in line). `spec-two-levels` passes the literal to a `defun` that
+;; passes it on to `sum`. `direct-inner` is the shape of the allerbees cutter's `resample-axis`: a literal made inside a specialisation
+;; calls the known parameter, and is itself passed to `sum`; check.sh wants it direct (LLVM may keep the outer literal, which holds a
+;; loop, as a direct call).
+;; `closure-` passes a closure the specialisation cannot see (taken out of a Vec): it must stay an indirect call, which is what
+;; check.sh would miss if it could not fail.
+(ns main)
+
+(defun sum (lo: i64 hi: i64 f: (fn (i64) f64)) -> f64
+  (loop [i lo acc 0.0] (if (>= i hi) acc (recur (+ i 1) (+ acc (f i))))))
+(defun sum-to (n: i64 f: (fn (i64) f64)) -> f64 (sum 0 n f))
+(defun axis (n: i64 m: i64 at: (fn (i64 i64) f64)) -> f64
+  (sum 0 n (fn (r: i64) (sum 0 m (fn (c: i64) (at r c))))))
+(defun half (i: i64) -> f64 (* 0.5 (double i)))
+
+(defun spec-literal (a: (Array f64)) -> f64 (sum 0 (array-len a) (fn (d: i64) (* 2.0 (array-get a d)))))
+(defun spec-named (n: i64) -> f64 (sum 0 n half))
+(defun spec-two-levels (a: (Array f64)) -> f64 (sum-to (array-len a) (fn (d: i64) (+ 1.0 (array-get a d)))))
+(defun direct-inner (a: (Array f64) w: i64) -> f64 (axis (quot (array-len a) w) w (fn (r: i64 c: i64) (array-get a (+ (* r w) c)))))
+(defun closure-unknown (fs: (Vec (fn (i64) f64)) n: i64) -> f64 (sum 0 n (nth fs 0)))
+
+(defun main () -> i64
+  (let ((a (let ((c (cell (array 100 0.0)))) (do (dotimes (i 100) (array-set! &c i (double i))) @c))))
+    (do (println (spec-literal a))
+        (println (spec-named 10))
+        (println (spec-two-levels a))
+        (println (direct-inner a 10))
+        (println (closure-unknown [half] 10))
+        0)))

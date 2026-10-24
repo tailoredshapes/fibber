@@ -1,0 +1,24 @@
+;; spec:   spec/types.md §8.9 (the order of a call: head, arguments in order, then the call); docs/design/vectorisation.md 7 item 4; compiler/emit/lower/spec.fib
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; A parameter called once, twice nested and in a branch, outside any loop, with arguments that have effects: the specialisation's
+;; direct calls run the arguments and the calls in the order the closure calls do (a cell records each step as a digit).
+(defun twice (f: (fn (i64) i64) x: i64) -> i64 (f (f x)))
+(defun pick (c: bool f: (fn (i64) i64) g: (fn (i64) i64) x: i64) -> i64 (if c (f x) (g x)))
+(defun both (f: (fn (i64 i64) i64) a: i64 b: i64) -> i64 (f a b))
+
+(defun hidden (fs: (Vec (fn (i64) i64))) -> (fn (i64) i64) (nth fs 0))
+(defun differs (a: i64 b: i64) -> i64 (if (= a b) 0 1))
+
+(defun main () -> i64
+  (let ((log (cell 0)))
+    (let ((note (fn (d: i64 v: i64) (do (set! log (+ (* @log 10) d)) v))))
+      (let ((a (twice (fn (x: i64) (note 1 (* x 3))) (note 2 1)))
+            (la @log)
+            (b (pick false (fn (x: i64) (note 3 x)) (fn (x: i64) (note 4 (+ x 1))) (note 5 6)))
+            (lb @log)
+            (c (both (fn (p: i64 q: i64) (note 6 (- p q))) (note 7 10) (note 8 4)))
+            (lc @log))
+        (+ (differs a 9) (differs la 211) (differs b 7) (differs lb 21154) (differs c 6) (differs lc 21154786)
+           (differs (twice (fn (x: i64) (+ x 1)) 5) (twice (hidden [(fn (x: i64) (+ x 1))]) 5)))))))

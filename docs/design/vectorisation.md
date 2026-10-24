@@ -280,6 +280,12 @@ Each line: change, files, measured payoff, risk.
 4. **Devirtualise literal closures** passed to a `defun` that is inlined (the expander's fusion machinery,
    `compiler/expand/fuse*.fib`, or specialisation in `compiler/emit/mono.fib`). Payoff: unmeasured directly; the other
    blockers removed leave `map-into` at 258 ms against 32 for the direct loop. Risk: medium, code growth.
+   Done for a program's own `defun`s (2026-10-24, `compiler/emit/lower/spec.fib`: a specialisation per known literal or
+   named function, as monomorphisation is per type; the library's functions, live sessions and macro modules excluded).
+   `sum` of `(* k (array-get a d))` over 10^6: 1.53 to 0.49 ns per element whole-program, 1.82 to 1.48 in the default
+   partitioned build (0.45 with `FIB_LIRO_IMPORT=80`: the runtime unit's refcount operations are then in line too).
+   A literal LLVM does not put in line gains little (persistent-`Vec` `nth`: 4.05 to 3.28; the allerbees cutter: no
+   change). The compiler built by itself: text +1.5%, 243 specialisations.
 5. **Range facts for index arithmetic and versioning on the loop bound.** `!range` on array lengths (`[0, 2^60)`) and a
    precheck loop version for `i+j` style arithmetic. Payoff: spectral-norm 1.41x. Risk: low for versioning; the range
    needs an lIR `!range` form or an `llvm.assume` intrinsic that the lIR does not have.

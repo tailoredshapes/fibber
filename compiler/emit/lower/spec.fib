@@ -1,0 +1,139 @@
+;; compiler/emit/lower/spec.fib: closure specialisation (docs/design/vectorisation.md 7 item 4; stage 2 only, no Rust twin). A call of a
+;; `defun` that passes a function literal, a named function or a function parameter already known to be one, to a parameter the callee
+;; calls, requests the callee's instance with that parameter known (emit.mono `Inst` `fns`): the same body at the same types, in which a
+;; call of the parameter is a direct call of the known code (`TgKnown`) instead of a call through the closure's code pointer. LLVM can
+;; then put the literal's code in line in the callee's loop, which the loop vectoriser needs.
+;;
+;; Why it is the same program: nothing but the call instruction changes. The literal's closure object is still made at the call site and
+;; passed as the argument, under the same ownership plan (the callee's plan is the generic body's: its key is the same); the call of the
+;; parameter still evaluates the head and the arguments in the same order, passes the closure as the code's `env`, and returns and unwinds
+;; through the same convention. The code called is the one the closure's code pointer holds: the literal's code (emit.names
+;; `closure-name` of the owner's code name and the literal's id, what `lcx-make-fn` stores) or the named function's all-owned body (what
+;; its immortal closure holds, `lcx-fun-code`).
+;;
+;; The rule, which bounds the code it adds:
+;;  - the callee is a `defun` of the program, not the library's (a module named `fib.*`, the prelude's included): the library's
+;;    higher-order functions are called with literals from every module of every program, and a copy of each per call site grew the
+;;    compiler's code by 10% (1796 specialisations, 1553 of them the library's); its `map`, `filter` and `take` chains are the fusion
+;;    rewrite's (expand.fuseinline), which puts the literal in line without a copy of the library function;
+;;  - the callee is a `defun` of at most `max-spec-nodes` expressions (its literals' included) that calls the parameter itself (in its
+;;    body or in a literal of its own) or passes it to a `defun` (which is specialised over it in turn); a method, an all-owned twin or
+;;    a larger function is called as before;
+;;  - not in a macro module, and not in a program of a live session: `fibc run --live` and its swaps (live mode), or a program emitted
+;;    with a session's tables (emit.program `def-cache`; compiler/live's prototype). A swap re-requests a redefined function's bodies by
+;;    name and types, which cannot name a closure, so a resident caller of a specialisation would keep the old body (the live values
+;;    transcript shows it: compiler/tests/live/values.in, `sum`). There every call of a parameter is through the closure, as before;
+;;  - a literal made inside a specialisation is named after it (`l.OWNER.N`, the owner's name holding its `#I#CODE#`), so the depth of
+;;    a known code is the count of `#` triples in its name; a code `max-spec-depth` deep is not specialised over (a callee that passes
+;;    itself a new literal wrapping its parameter would otherwise make instances without end).
+(ns emit.lower.spec
+  (:use types.ty types.ast types.decls types.table own.program emit.value emit.mono emit.names emit.program emit.lower.cx
+        emit.lower.objects))
+
+;; The callees past which a call is not specialised, in expressions.
+(def max-spec-nodes: i64 160)
+
+;; The depth of specialisations over literals made in specialisations past which a call is not specialised.
+(def max-spec-depth: i64 3)
+
+;; The parameter bindings of the `defun` `f`.
+(defun fun-params :private (g: Globals f: i64) -> (Vec i64)
+  (mapv (fn (q: ParamDecl) (. q binding)) (. (g-fun g f) params)))
+
+;; Whether `b` is one of `ps`; its index.
+(defun index-in :private (ps: (Vec i64) b: i64) -> i64
+  (loop ((i 0))
+    (cond (>= i (count ps)) -1
+          (= (nth ps i) b) i
+          :else (recur (+ i 1)))))
+
+;; The parameter of `ps` a call of `e` reaches the code of: its head, when that is a parameter, or each argument that is a parameter
+;; passed to a `defun` (which may be specialised over it in turn: a callee two levels down); -1 for none.
+(defun reached-params :private (ps: (Vec i64) e: Expr) -> (Vec i64)
+  (match (. e kind)
+    ((ECall h args)
+     (let ((by-head (match (. h kind) ((ELocal b) (if (>= (index-in ps b) 0) [(index-in ps b)] [])) (_ []))))
+       (match (. h kind)
+         ((EGlobal (GFun _))
+          (into by-head (vec (keep (fn (a: Arg) (match a
+                                                 ((ArgExpr x) (match (. x kind) ((ELocal b) (if (>= (index-in ps b) 0) (some (index-in ps b)) nil)) (_ nil)))
+                                                 (_ nil)))
+                                   args))))
+         (_ by-head))))
+    (_ [])))
+
+;; Which parameters of `f` its body calls or passes on to a `defun`; [] when the body is past the size bound or reaches none.
+(defun called-params :private (g: Globals f: i64) -> (Vec bool)
+  (let ((ps (fun-params g f)))
+    (loop ((stack [(. (g-fun g f) body)]) (n 0) (called (mapv (fn (_: i64) false) ps)) (any false))
+      (match (peek stack)
+        (nil (if any called []))
+        ((some e)
+         (if (>= n max-spec-nodes)
+             []
+             (let ((hit (reached-params ps e)))
+               (recur (into (pop stack) (expr-children e)) (+ n 1)
+                      (reduce (fn (acc: (Vec bool) i: i64) (assoc acc i true)) called hit)
+                      (or any (not (empty? hit)))))))))))
+
+;; The code the binding `b` is known to be in the instance being lowered: "" unless it is a parameter of a specialisation.
+(defun spec-known-binding (cx: LowerCx b: i64) -> str
+  (let ((inst (. cx inst)))
+    (if (empty? (. inst fns))
+        ""
+        (match (. inst key)
+          ((BodyFun f) (let ((i (index-in (fun-params (program-g (. cx p)) f) b)))
+                         (if (and (>= i 0) (< i (count (. inst fns)))) (nth (. inst fns) i) "")))
+          (_ "")))))
+
+;; The target of a call whose head value is `hv`: the known code, when the head is a parameter known to be one, else the closure's.
+(defun spec-value-target (cx: LowerCx head: Expr hv: V) -> Target
+  (match (. head kind)
+    ((ELocal b) (let ((known (spec-known-binding cx b)))
+                  (if (= known "") (TgValue hv) (TgKnown known hv))))
+    (_ (TgValue hv))))
+
+;; What an argument is known to be: the literal's code, the named function's, the known code of a parameter, or "".
+(defun arg-known :private (cx: LowerCx a: Arg) -> (Result str str)
+  (match a
+    ((ArgExpr x)
+     (match (. x kind)
+       ((EFn _) (Ok (closure-name (. cx name) (. x id))))
+       ((EGlobal (GFun h)) (lcx-fun-code cx x h))
+       ((ELocal b) (Ok (spec-known-binding cx b)))
+       (_ (Ok ""))))
+    (_ (Ok ""))))
+
+;; Whether the callee `f` may be specialised from this body at all: not the library's, not in a macro module, not in a program of a live
+;; session (live mode, or a program emitted with a session's tables: compiler/live's prototype stubs the session's functions by name).
+(defun spec-allowed? :private (cx: LowerCx f: i64) -> bool
+  (let ((p (. cx p)) (g (program-g (. cx p))))
+    (and (not @(. p macro-module)) (not (. p live)) (nil? (. p def-cache))
+         (not (starts-with? (g-module-name g (. (g-fun g f) module)) "fib.")))))
+
+;; How many specialisations deep the code `name` is: the `#` triples of emit.mono `inst-name` in it.
+(defun code-depth :private (name: str) -> i64
+  (loop ((i 0) (n 0))
+    (cond (>= i (str-len name)) (quot n 3)
+          (= (str-byte-at name i) 35i8) (recur (+ i 1) (+ n 1))
+          :else (recur (+ i 1) n))))
+
+;; What each argument the callee calls is known to be ("" for the others and for one past the depth bound).
+(defun known-args :private (cx: LowerCx called: (Vec bool) args: (Vec Arg)) -> (Result (Vec str) str)
+  (loop ((i 0) (fns []))
+    (if (>= i (count args))
+        (Ok fns)
+        (if (nth called i)
+            (try-let ((k (arg-known cx (nth args i))))
+              (recur (+ i 1) (conj fns (if (< (code-depth k) max-spec-depth) k ""))))
+            (recur (+ i 1) (conj fns ""))))))
+
+;; The name of the instance a call of `f` at `tys` with `args` reaches: a specialisation when the rule above takes it, else the ordinary one.
+(defun spec-request (cx: LowerCx f: i64 tys: (Vec Ty) args: (Vec Arg)) -> (Result str str)
+  (let ((p (. cx p)) (called (if (spec-allowed? cx f) (called-params (program-g (. cx p)) f) [])))
+    (if (or (empty? called) (not (= (count called) (count args))))
+        (Ok (program-request p (BodyFun f) tys))
+        (try-let ((fns (known-args cx called args)))
+          (Ok (if (every? (fn (s: str) (= s "")) fns)
+                  (program-request p (BodyFun f) tys)
+                  (program-request-spec p (BodyFun f) tys fns)))))))

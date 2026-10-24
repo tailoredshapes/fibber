@@ -1,0 +1,32 @@
+;; spec:   spec/types.md §8.4 (a named function as a value: its immortal closure); docs/design/vectorisation.md 7 item 4; compiler/emit/lower/spec.fib
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; A named function passed to a `defun` that calls it is called directly in the callee's specialisation: the code its immortal closure
+;; holds (its all-owned body). A monomorphic function, a generic one at two types, a function of the program that is itself
+;; specialised (it calls its own parameter), and the same callee with a literal: each answer equals the one through a closure the
+;; specialisation cannot see.
+(defun sq (x: i64) -> i64 (* x x))
+(defun twice (x: a) -> (Pair a a) (Pair x x))
+(defun firsts (n: i64 f: (fn (i64) (Pair i64 i64))) -> i64
+  (loop ((i 0) (acc 0)) (if (>= i n) acc (recur (+ i 1) (+ acc (. (f i) fst) (. (f i) snd))))))
+(defun strs (n: i64 f: (fn (str) (Pair str str))) -> i64
+  (loop ((i 0) (acc 0)) (if (>= i n) acc (recur (+ i 1) (+ acc (str-len (. (f (str i)) fst)))))))
+
+(defun sum (lo: i64 hi: i64 f: (fn (i64) i64)) -> i64
+  (loop ((i lo) (acc 0)) (if (>= i hi) acc (recur (+ i 1) (+ acc (f i))))))
+(defun sum-sq (lo: i64 hi: i64) -> i64 (sum lo hi sq))
+(defun add (a: i64 b: i64) -> i64 (+ a b))
+(defun apply-to (f: (fn (i64 i64) i64) n: i64) -> i64 (f 0 n))
+
+(defun hidden (fs: (Vec (fn (i64) i64))) -> (fn (i64) i64) (nth fs 0))
+(defun differs (a: i64 b: i64) -> i64 (if (= a b) 0 1))
+
+(defun main () -> i64
+  (+ (differs (sum 0 100 sq) (sum 0 100 (hidden [sq])))
+     (differs (sum 0 100 sq) 328350)
+     (differs (firsts 10 twice) 90)
+     (differs (strs 12 twice) 14)
+     (differs (apply-to add 10) 10)
+     (differs (sum-sq 1 4) 14)
+     (differs (sum 0 10 (fn (i: i64) (sq (+ i 1)))) (sum 1 11 sq))))

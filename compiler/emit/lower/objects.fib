@@ -281,8 +281,8 @@
        (nil (Err (str-join ["def " (. (g-def (program-g (. cx p)) d) name)
                             " is read where it has no value: it is not a constant and no init function makes it here"])))))))
 
-;; A named function as a value: its immortal closure with no captures, at the instantiation recorded for the expression.
-(defun fun-value :private (cx: LowerCx e: Expr f: i64) -> (Result V str)
+;; The code of a named function's immortal closure: its all-owned body at the instantiation recorded for the expression.
+(defun lcx-fun-code (cx: LowerCx e: Expr f: i64) -> (Result str str)
   (match (get (. (. (. cx p) typed) fun-schemes) f)
     (nil (Err "a function without a scheme"))
     ((some scheme)
@@ -290,9 +290,13 @@
                   ((some i) (mapv (fn (t: Ty) (inst-subst (. cx inst) t)) (. i tys)))
                   (nil []))))
        (try-let ((key (fun-key (program-g (. cx p)) scheme tys)))
-         (let ((code (program-request (. cx p) (BodyAllOwned f) key)))
-           (let ((r (program-closure-object (. cx p) code [])))
-             (Ok (VVal (nx/reference (statics-closure (. (. cx p) statics) code (. r fst) (. (. cx p) live))) LirPtr)))))))))
+         (Ok (program-request (. cx p) (BodyAllOwned f) key)))))))
+
+;; A named function as a value: its immortal closure with no captures, at the instantiation recorded for the expression.
+(defun fun-value :private (cx: LowerCx e: Expr f: i64) -> (Result V str)
+  (try-let ((code (lcx-fun-code cx e f)))
+    (let ((r (program-closure-object (. cx p) code [])))
+      (Ok (VVal (nx/reference (statics-closure (. (. cx p) statics) code (. r fst) (. (. cx p) live))) LirPtr)))))
 
 ;; A global name as a value: a named function's immortal closure (§8.4), a field-less variant's index, a `def`.
 ;; Rust: lower/objects.rs:210 LowerCx::global

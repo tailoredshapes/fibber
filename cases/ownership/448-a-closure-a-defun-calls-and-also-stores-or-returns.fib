@@ -1,0 +1,27 @@
+;; spec:   spec/types.md §8.4; spec/ownership.md (a closure that escapes is a heap object); docs/design/vectorisation.md 7 item 4; compiler/emit/lower/spec.fib
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; A specialisation changes only the calls of the known parameter: a callee that also returns the closure, stores it in a struct or a
+;; Vec, or passes it to a function that is not specialised keeps the closure value itself, which is called later through its code
+;; pointer and still works, and is released once (the audit). The literals capture an owned string, so a wrong count shows.
+(defstruct Holder (f: (fn (i64) i64) n: i64))
+
+(defun run-and-return (n: i64 f: (fn (i64) i64)) -> (Pair i64 (fn (i64) i64))
+  (Pair (loop ((i 0) (acc 0)) (if (>= i n) acc (recur (+ i 1) (+ acc (f i))))) f))
+(defun run-and-hold (n: i64 f: (fn (i64) i64)) -> Holder
+  (Holder f (loop ((i 0) (acc 0)) (if (>= i n) acc (recur (+ i 1) (+ acc (f i)))))))
+(defun run-and-keep (n: i64 f: (fn (i64) i64)) -> (Vec (fn (i64) i64))
+  (if (> (f n) 0) [f f] [f]))
+
+(defun maker (s: str) -> (fn (i64) i64) (fn (i: i64) (+ i (str-len s))))
+(defun differs (a: i64 b: i64) -> i64 (if (= a b) 0 1))
+
+(defun main () -> i64
+  (let ((s (str-concat "four" "")))
+    (let ((r (run-and-return 4 (fn (i: i64) (* i (str-len s)))))
+          (h (run-and-hold 3 (maker (str-concat "abc" "de"))))
+          (kept (run-and-keep 2 (fn (i: i64) (- i (str-len s))))))
+      (+ (differs (. r fst) 24) (differs ((. r snd) 10) 40)
+         (differs (. h n) 18) (differs ((. h f) 1) 6)
+         (differs (count kept) 1) (differs ((nth kept 0) 9) 5)))))

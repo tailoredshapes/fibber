@@ -253,16 +253,20 @@
 ;; Whether a request for `key` at `tys` is answered by its name rather than lowered: the queue mode's one rule (LE3). The body's code
 ;; name is already in the running program (the base's index, or a kept module's): the cut declares it and no new code is generated. A
 ;; plain emit has an empty resident set, so nothing is skipped and the lIR is byte-identical.
-(defun resident-request? :private (p: Program key: BodyKey tys: (Vec Ty)) -> bool
+(defun resident-request? :private (p: Program inst: Inst) -> bool
   (and (not @(. p macro-module)) (queue-mode?)
-       (contains? @(. p resident) (body-code-name p key (body-name (program-g p) key tys)))))
+       (contains? @(. p resident) (body-code-name p (. inst key) (inst-name (program-g p) inst)))))
 
 ;; Rust: program.rs:113 Program::request
 (defun program-request (p: Program key: BodyKey tys: (Vec Ty)) -> str
+  (program-request-spec p key tys []))
+
+;; The request of a closure specialisation (emit.lower.spec): `fns` as emit.mono `Inst` has it; [] is an ordinary request.
+(defun program-request-spec (p: Program key: BodyKey tys: (Vec Ty) fns: (Vec str)) -> str
   ;; Colours have no representation (§8.4): one specialisation serves every colour instantiation.
-  (let ((inst (Inst key (mapv (fn (t: Ty) (ty-map-colours t (fn (k: Colour) CLocal))) tys))))
-    (if (resident-request? p key (. inst tys))
-        (body-name (program-g p) key (. inst tys))
+  (let ((inst (Inst key (mapv (fn (t: Ty) (ty-map-colours t (fn (k: Colour) CLocal))) tys) fns)))
+    (if (resident-request? p inst)
+        (inst-name (program-g p) inst)
         (queue-request (. p queue) (program-g p) inst))))
 
 ;; Rust: program.rs:125 Program::request_closure
