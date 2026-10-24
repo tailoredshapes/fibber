@@ -289,6 +289,12 @@ Each line: change, files, measured payoff, risk.
    243 specialisations. One tap of the cutter's blur (`sum` over a literal reading two Vecs through a let-bound `at`)
    is 8.0 ns whole-program: about 4.3 the two trie walks, 3.5 the closures (their counts and env loads, which also keep
    LLVM from putting the literal in line), 0.5 the arithmetic; the call itself, indirect or direct, 0.4.
+   The counts of a STACK or IMMORTAL closure head are no-ops (types §8.4) and are no longer emitted at a direct call: the
+   caller's retain of the head, and the release of its env in the literal's code, which a direct call with the literal's
+   own STACK closure reaches in a borrowed form (`CODE.borrow`; the closure's code pointer keeps the convention's code,
+   since `fib.private-copy` makes a heap copy with that code). Tap whole-program: Vecs 8.6 to 6.0 ns, Arrays 4.6 to 2.5
+   (default mode 11.7 to 11.6 and 8.5 to 7.8: the runtime unit is out of line). The compiler's text +3.0% over main (193
+   borrowed forms). The cutter's `at` stays a heap closure (the fused `mapv`'s fallback passes its stage to the library).
 5. **Range facts for index arithmetic and versioning on the loop bound.** `!range` on array lengths (`[0, 2^60)`) and a
    precheck loop version for `i+j` style arithmetic. Payoff: spectral-norm 1.41x. Risk: low for versioning; the range
    needs an lIR `!range` form or an `llvm.assume` intrinsic that the lIR does not have.

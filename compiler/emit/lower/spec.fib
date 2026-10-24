@@ -3,7 +3,9 @@
 ;; calls, requests the callee's instance with that parameter known (emit.mono `Inst` `fns`): the same body at the same types, in which a
 ;; call of the parameter is a direct call of the known code (`TgKnown`) instead of a call through the closure's code pointer. LLVM can
 ;; then put the literal's code in line in the callee's loop, which the loop vectoriser needs. The same direct call is made through a
-;; `let` binding of a `fn` literal that is only ever called (`spec-note-let`, at the end of this file).
+;; `let` binding of a `fn` literal that is only ever called (`spec-note-let`, at the end of this file). Where the head is the literal's own
+;; STACK closure, or a named function's IMMORTAL one, its retain is not emitted (`spec-static-head?`) and a STACK literal is called in its
+;; borrowed form, without the release of its env (emit.program `program-request-borrowed`): both counts are no-ops (types §8.4).
 ;;
 ;; Why it is the same program: nothing but the call instruction changes. The literal's closure object is still made at the call site and
 ;; passed as the argument, under the same ownership plan (the callee's plan is the generic body's: its key is the same); the call of the
@@ -29,7 +31,8 @@
 ;;    itself a new literal wrapping its parameter would otherwise make instances without end).
 (ns emit.lower.spec
   (:use types.ty types.ast types.decls types.table own.program emit.value emit.mono emit.names emit.program emit.lower.cx
-        emit.lower.objects))
+        emit.lower.objects)
+  (:require [emit.node :as nx]))
 
 ;; The callees past which a call is not specialised, in expressions.
 (def max-spec-nodes: i64 160)
@@ -90,14 +93,27 @@
 ;; The target of a call whose head value is `hv`: the known code, when the head is a parameter known to be one or a let-bound literal
 ;; whose binding is only ever called, else the closure's.
 (defun spec-value-target (cx: LowerCx head: Expr hv: V) -> Target
+  (let ((known (known-head cx head)))
+    (cond (= known "") (TgValue hv)
+          :else (match (program-request-borrowed (. cx p) known)
+                  ((some borrowed) (TgKnown borrowed hv))
+                  (nil (TgKnown known hv))))))
+
+;; The code a call's head is known to be: a known parameter's, a let-bound literal's, or "".
+(defun known-head :private (cx: LowerCx head: Expr) -> str
   (match (. head kind)
     ((ELocal b) (let ((known (spec-known-binding cx b)))
                   (if (= known "")
-                      (match (get @(. (. cx p) let-codes) (LetKey (. cx inst) b))
-                        ((some code) (TgKnown code hv))
-                        (nil (TgValue hv)))
-                      (TgKnown known hv))))
-    (_ (TgValue hv))))
+                      (unwrap-or (get @(. (. cx p) let-codes) (LetKey (. cx inst) b)) "")
+                      known)))
+    (_ "")))
+
+;; Whether the head value `hv` of a call is a STACK or IMMORTAL closure, so that its consume (a retain, types §8.4) is a no-op and is not
+;; emitted: a stack closure made in this function, or a head known to be the code of a stack literal or of a named function's value.
+(defun spec-static-head? (cx: LowerCx head: Expr hv: V) -> bool
+  (or (match hv ((VVal e _) (contains? @(. cx closure-slots) (nx/operand-name e))) (_ false))
+      (let ((known (known-head cx head)))
+        (and (not (= known "")) (contains? @(. (. cx p) static-heads) known)))))
 
 ;; ---- let-bound literals
 

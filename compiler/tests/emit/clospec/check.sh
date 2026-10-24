@@ -6,7 +6,8 @@
 # inlined into main (so each one's body is its own), and `opt -O2` runs. Each `spec-` and `direct-` function must have no indirect call in
 # its optimised body or in any function of the program it calls (`f.`, `m.`, `l.`), at any depth, and a `spec-` function no call of a
 # literal's code (`l.`) in its own body either (LLVM decides whether to put in line a literal holding a loop of its own: `direct-inner`
-# is not asked that); `closure-unknown` and `closure-let-kept` must have an indirect call (a closure the specialisation cannot see, and
+# is not asked that), and no count operation (`fib.retain`, `fib.release`, or the atomic load of a header's flags they begin with: the
+# closures there are STACK or IMMORTAL, whose counts are no-ops and are not emitted, types §8.4); `closure-unknown` and `closure-let-kept` must have an indirect call (a closure the specialisation cannot see, and
 # a let-bound literal that is also kept in a Vec, stay one: what the check would miss if it could not fail). Exit 1 on any difference. LLVM_BIN names opt (default: beside LLVM_LIBDIR).
 # usage: check.sh FIBC     run from anywhere; FIB_LIB defaults to the tree's lib
 fibc=${1:?usage: check.sh FIBC}
@@ -57,9 +58,11 @@ for n in names:
     via = indirect(n)
     lits = sorted(c for c in callees(bodies[n]) if c.startswith('l.'))
     if n.startswith('f.spec-'):
-        ok = via is None and not lits
-        why = ('an indirect call in ' + via if via else '') + ((' ' if via else '') + 'a call of ' + lits[0] if lits else '')
-        print(('ok   ' if ok else 'FAIL ') + n + ': ' + ('direct, the literal in line' if ok else why + ' (wanted direct, no literal called)'))
+        counts = re.search(r'load atomic i32|@fib\.(retain|release)', bodies[n]) is not None
+        ok = via is None and not lits and not counts
+        why = '; '.join(w for w in [('an indirect call in ' + via) if via else '', ('a call of ' + lits[0]) if lits else '',
+                                    'a count operation' if counts else ''] if w)
+        print(('ok   ' if ok else 'FAIL ') + n + ': ' + ('direct, the literal in line, no counts' if ok else why + ' (wanted direct, no literal called, no counts)'))
     elif n.startswith('f.direct-'):
         ok = via is None
         print(('ok   ' if ok else 'FAIL ') + n + ': ' + ('direct' if ok else 'an indirect call in ' + via + ' (wanted direct)'))

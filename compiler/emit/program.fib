@@ -22,6 +22,9 @@
 ;; its value is an object to make immortal, and its slot (`def.slot.N`; `live.d.NAME` in live mode, `live-def-slot`). Rust: inits.rs:42 Init
 (defstruct Init (def-id: i64 module: i64 body: str object: bool slot: str))
 
+;; Where a STACK literal's code was made: the instance of its owner and the literal.
+(defstruct StackLit (owner: Inst lit: i64))
+
 ;; A binding of a body instance (its literals' code shares the instance).
 (defstruct LetKey (inst: Inst binding: i64))
 (derive Eq LetKey) (derive Hash LetKey)
@@ -49,7 +52,12 @@
    ;; whether each `defun` reached so far can be part of a recursion (emit.lower.recur, the stack check): the answer for every function of a walk
    rec-memo: (Cell (Map i64 bool))
    ;; the code of each let-bound `fn` literal whose binding is only ever called (emit.lower.spec `spec-note-let`), by instance and binding
-   let-codes: (Cell (Map LetKey str))))
+   let-codes: (Cell (Map LetKey str))
+   ;; the code names whose closure objects are all STACK or IMMORTAL (a stack literal's, a named function's all-owned body): a retain or
+   ;; release of such a closure is a no-op (§8.4), so a call through a head known to be one emits neither (emit.lower.spec)
+   static-heads: (Cell (Set str))
+   ;; the STACK literals' codes by name, and the codes asked for in their borrowed form (`program-request-borrowed`)
+   stack-lits: (Cell (Map str StackLit)) borrowed: (Cell (Set str))))
 
 ;; Whether the program catches (stage 2 of docs/design/exceptions.md, ADR 0009): some body calls `catch-run`. Only then do its functions
 ;; return a failure next to their value (emit.lower.call); a program that never catches has no observer of a failure, so a trap aborts
@@ -173,7 +181,7 @@
                     (match tables ((some t) (. t bodies)) (nil (cell (map-empty))))
                     (def-cache-of tables)
                     (match tables ((some t) (. t resident)) (nil (cell (set-empty))))
-                    (cell (os/target-pointer-bytes)) (. rt target) (. rt host) (cell []) (cell (map-empty)) (cell (map-empty)))))
+                    (cell (os/target-pointer-bytes)) (. rt target) (. rt host) (cell []) (cell (map-empty)) (cell (map-empty)) (cell (set-empty)) (cell (map-empty)) (cell (set-empty)))))
     (do (objects-intern (. p objects) "fib.str" "str" ObStr)
         (objects-intern (. p objects) "fib.array.i8" "(Array i8)" (ObArray LirI8))
         (objects-intern (. p objects) "fib.weakbox" "weak box" ObWeak)
@@ -190,7 +198,7 @@
              (cell []) (cell 0) (cell []) (cell [])
              (cell (map-empty)) (cell @(. p def-values)) (cell (map-empty)) (cell []) (cell 0) (cell false)
              (cell @(. p def-slots)) (cell @(. p inits)) (cell false) (. p unwinding) (. p live) (. p live-gens) (. p live-bodies)
-             (. p def-cache) (. p resident) (cell pb) (. p runtime) (. p runtime-host) (cell @(. p link-notes)) (cell @(. p rec-memo)) (cell @(. p let-codes)))))
+             (. p def-cache) (. p resident) (cell pb) (. p runtime) (. p runtime-host) (cell @(. p link-notes)) (cell @(. p rec-memo)) (cell @(. p let-codes)) (cell @(. p static-heads)) (cell @(. p stack-lits)) (cell @(. p borrowed)))))
 
 ;; The bytes of a pointer of the program's layouts.
 (defun program-pb (p: Program) -> i64 @(. p pb))
@@ -280,6 +288,19 @@
   (let ((name (closure-name owner-name lit)))
     (do (cell-update! (. p closures) (fn (closures: (Vec Work)) (conj closures (WorkClosure owner lit name))))
         name)))
+
+;; The borrowed form of the STACK literal code `code` (emit.lower.spec): the literal's code compiled again under `CODE.borrow`, without the
+;; release of its env, queued once. It is called directly with the literal's own closure, whose retain the caller does not emit: the
+;; retain and the release of a STACK object are no-ops (types §8.4). The closure's code pointer keeps the code of the convention, so a call
+;; through the value, and through a heap copy of it (`fib.private-copy` copies a STACK object to the heap), releases its env as before.
+(defun program-request-borrowed (p: Program code: str) -> (Option str)
+  (match (get @(. p stack-lits) code)
+    (nil nil)
+    ((some sl) (let ((name (str code ".borrow")))
+                 (do (when (not (contains? @(. p borrowed) name))
+                       (do (set! (. p borrowed) (conj @(. p borrowed) name))
+                           (cell-update! (. p closures) (fn (closures: (Vec Work)) (conj closures (WorkClosure (. sl owner) (. sl lit) name))))))
+                     (some name))))))
 
 ;; Rust: program.rs:136 Program::next_work
 (defun program-next-work (p: Program) -> (Option Work)

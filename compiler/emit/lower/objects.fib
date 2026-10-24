@@ -212,7 +212,9 @@
                  (let ((size (obj-size-pb (objects-get (. (. cx p) objects) tid) (program-pb (. cx p)))))
                    (try-let ((vals (capture-values cx own)) (p (lcx-alloc-at cx (. e id) tid sname size)))
                      (do (match (get (. (. cx own) allocs) (. e id))
-                           ((some (AlStack)) (set! (. cx closure-slots) (conj @(. cx closure-slots) (nx/operand-name p))))
+                           ((some (AlStack)) (do (set! (. cx closure-slots) (conj @(. cx closure-slots) (nx/operand-name p)))
+                                                 (set! (. (. cx p) static-heads) (conj @(. (. cx p) static-heads) code))
+                                                 (set! (. (. cx p) stack-lits) (assoc @(. (. cx p) stack-lits) code (StackLit (. cx inst) (. e id))))))
                            (_ ()))
                          (let ((codep (lcx-gep cx sname p slot-closure-code)))
                            (do (fb-stmt (. cx b) (nx/store (nx/global code) codep nil))
@@ -296,7 +298,8 @@
 (defun fun-value :private (cx: LowerCx e: Expr f: i64) -> (Result V str)
   (try-let ((code (lcx-fun-code cx e f)))
     (let ((r (program-closure-object (. cx p) code [])))
-      (Ok (VVal (nx/reference (statics-closure (. (. cx p) statics) code (. r fst) (. (. cx p) live))) LirPtr)))))
+      (do (set! (. (. cx p) static-heads) (conj @(. (. cx p) static-heads) code))
+          (Ok (VVal (nx/reference (statics-closure (. (. cx p) statics) code (. r fst) (. (. cx p) live))) LirPtr))))))
 
 ;; A global name as a value: a named function's immortal closure (§8.4), a field-less variant's index, a `def`.
 ;; Rust: lower/objects.rs:210 LowerCx::global
