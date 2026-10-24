@@ -1,0 +1,62 @@
+;; compiler/lir/facts.fib: the facts of lIR (spec/lir.md 6.13): `nsw`/`nuw` on `add sub mul shl`, `(assume c)` and `(load (range LO HI) T p)`.
+;; A fact only removes behaviours, so any backend may drop any of them: `strip-module` is that rewrite, used by the backends that have no
+;; use for a fact (C, JS, WGSL) and by lair's `ignore` mode. The check mode is read here, once per lowering.
+(ns lir.facts
+  (:use lir.types lir.ast lir.intrin)
+  (:require [lir.rewrite :as rw] [lir.check.walk :as walk]))
+
+;; `FIB_LIR_FACTS`: `use` (the default, and the empty value) gives the facts to LLVM, `trap` turns each into a test and a trap, `ignore`
+;; drops them. 0, 1 and 2; -1 for any other value, which lair refuses.
+(def facts-use: i64 0)
+(def facts-trap: i64 1)
+(def facts-ignore: i64 2)
+
+(defun facts-mode () -> i64
+  (match (sys-getenv "FIB_LIR_FACTS")
+    (nil facts-use)
+    ((some v) (cond (or (= v "") (= v "use")) facts-use
+                    (= v "trap") facts-trap
+                    (= v "ignore") facts-ignore
+                    :else -1))))
+
+;; Whether `e` is a fact form.
+(defun fact? (e: LExpr) -> bool
+  (match (. e kind) ((KIntrin name _ _ _ _) (intrin-fact? name)) (_ false)))
+
+(defun fact-binop :private (name: str) -> LBinOp
+  (cond (= name "add") BAdd (= name "sub") BSub (= name "mul") BMul :else BShl))
+
+;; `e` with every fact inside it dropped: a flagged operation is the plain one, a range load the plain load, an `assume` in a body is gone.
+(defun strip-expr (e: LExpr) -> LExpr
+  (let ((x (match (. e kind)
+             ((KLet binds body) (LExpr (KLet binds (strip-body body)) (. e pos)))
+             (_ e))))
+    (let ((y (rw/map-children x strip-expr)))
+      (match (. y kind)
+        ((KIntrin name _ ty args align)
+         (let ((c (intrin-class name)))
+           (cond (= c "ibin") (LExpr (KBin (fact-binop name) (nth args 0) (nth args 1)) (. y pos))
+                 (= c "rload") (LExpr (KLoad (unwrap-or ty ty-i32) (nth args 0) false align) (. y pos))
+                 :else y)))
+        (_ y)))))
+
+(defun assume? :private (e: LExpr) -> bool
+  (match (. e kind) ((KIntrin name _ _ _ _) (= name "assume")) (_ false)))
+
+(defun strip-body :private (body: (Vec LExpr)) -> (Vec LExpr)
+  (vec (filter (fn (e: LExpr) (not (assume? e))) body)))
+
+(defun strip-function :private (f: LFunction) -> LFunction
+  (with f (blocks (mapv (fn (b: LBlock) (with b (body (mapv strip-expr (strip-body (. b body)))))) (. f blocks)))))
+
+;; Whether the module carries any fact (a module without one is returned as it is).
+(defun expr-has-fact? :private (e: LExpr) -> bool
+  (or (fact? e) (some? (first (filter expr-has-fact? (walk/children e))))))
+
+(defun function-has-fact? :private (f: LFunction) -> bool
+  (some? (first (filter (fn (b: LBlock) (some? (first (filter expr-has-fact? (. b body))))) (. f blocks)))))
+
+(defun strip-module (m: LModule) -> LModule
+  (if (some? (first (filter (fn (it: LItem) (match it ((ItDefine f) (function-has-fact? f)) (_ false))) (. m items))))
+      (LModule (mapv (fn (it: LItem) (match it ((ItDefine f) (ItDefine (strip-function f))) (_ it))) (. m items)))
+      m))

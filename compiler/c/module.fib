@@ -4,7 +4,8 @@
 ;; prototypes of the defined functions and the tentative definitions of the globals (so items may refer to each other in any order, as in
 ;; lIR), the hoisted constants (string bytes), the globals with their initialisers (static data, as LLVM lays them out), and the functions.
 (ns c.module
-  (:use lir.types lir.lit lir.ast lir.diag c.cx c.ty c.scalar c.expr c.func c.policy c.prelude))
+  (:use lir.types lir.lit lir.ast lir.diag c.cx c.ty c.scalar c.expr c.func c.policy c.prelude)
+  (:require [lir.facts :as facts]))
 
 (defun fn-types :private (m: LModule) -> (Map str LFnType)
   (reduce (fn (acc: (Map str LFnType) it: LItem)
@@ -115,8 +116,10 @@
   (str-join (vec (map (fn (l: str) (str l "\n")) v))))
 
 ;; The translation unit of the checked module `m` (read from `file`). The diagnostics are in the context afterwards (c.cx).
-(defun module-c (cx: Cx m: LModule) -> str
-  (let ((fns (str-join (vec (map (fn (f: LFunction) (str (function-c cx f) "\n")) (defines m)))))
+;; The facts of lIR (spec/lir.md 6.13) are dropped first: C keeps its wrapping helpers and plain loads.
+(defun module-c (cx: Cx m0: LModule) -> str
+  (let ((m (facts/strip-module m0))
+        (fns (str-join (vec (map (fn (f: LFunction) (str (function-c cx f) "\n")) (defines m)))))
         (globals (str-join (vec (map (fn (it: LItem) (global-line cx it)) (. m items)))))
         (externs (str-join (vec (map (fn (it: LItem) (extern-line cx it)) (. m items)))))
         (forwards (str-join (vec (map (fn (it: LItem) (forward-line cx it)) (. m items))))))

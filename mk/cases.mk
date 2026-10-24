@@ -18,26 +18,30 @@ case_files = $(foreach n,$(2),$(if $(filter %.fib,$(n)),cases/$(1)/$(n),$(wildca
 SUPPORT_FILES := $(shell find cases/stdlib/support cases/ownership/support cases/modules/support -type f 2> /dev/null)
 SHARD_IDX = $(shell seq 0 $$(( $(1) - 1 )))
 
-# $(call run_shard,DIR,LIMIT,ONLY..): the recipe of one shard table
+# $(call run_shard,DIR,LIMIT,ONLY..,ENV): the recipe of one shard table (ENV: words put before F, as `env FIB_LIR_FACTS=trap`)
 define run_shard
-start=$$(date +%s); code=0; timeout $(2) $(F) cases cases/$(1) $(3) -j $(CASE_JOBS) > $@.tmp 2> $(@:%.txt=%.err) || code=$$?; \
+start=$$(date +%s); code=0; timeout $(2) $(4) $(F) cases cases/$(1) $(3) -j $(CASE_JOBS) > $@.tmp 2> $(@:%.txt=%.err) || code=$$?; \
 echo $$code > $(@:%.txt=%.code); echo $$(( $$(date +%s) - start )) > $(@:%.txt=%.secs); \
 if [ $$code -eq 124 ]; then echo "cases/$(1) shard timed out after $(2) s"; exit 1; fi; \
 grep -q '^[0-9][0-9]* cases:' $@.tmp || { echo "cases/$(1) shard printed no case count (exit $$code)"; tail -n 20 $(@:%.txt=%.err); exit 1; }; mv $@.tmp $@
 endef
-# $(call shard_rule,TABLE-NAME,DIR,K,k,LIMIT,NAMES): shard k of K over NAMES, the table build/cases/TABLE-NAME.k.txt (its names in NAMES_TABLE-NAME.k);
-# a directory run in one shard (K = 1) is run without --only, as CI always ran it.
+# $(call shard_rule,TABLE-NAME,DIR,K,k,LIMIT,NAMES,ONLY,ENV): shard k of K over NAMES, the table build/cases/TABLE-NAME.k.txt (its names in
+# NAMES_TABLE-NAME.k); a directory run in one shard (K = 1) is run without --only, as CI always ran it, unless ONLY is given; ENV as run_shard's.
 define shard_rule
 NAMES_$(1).$(4) := $(call shard_of,$(6),$(3),$(4))
 # The shard's membership is a file (changed only when its content changes): the deal shifts when a case is added, renamed or removed, and a
 # table made for the old deal must not be taken for the new one.
 $$(call cfg_write,$(CASES_DIR)/$(1).$(4).list,$$(NAMES_$(1).$(4)))
 $(CASES_DIR)/$(1).$(4).txt: $(F) $(CASES_DIR)/$(1).$(4).list $$(call case_files,$(2),$$(NAMES_$(1).$(4))) $(SUPPORT_FILES) | $(CASES_DIR)/
-	$$(call run_shard,$(2),$(5),$(if $(or $(7),$(filter-out 1,$(3))),--only $$(NAMES_$(1).$(4)),))
+	$$(call run_shard,$(2),$(5),$(if $(or $(7),$(filter-out 1,$(3))),--only $$(NAMES_$(1).$(4)),),$(8))
 endef
 $(foreach k,$(call SHARD_IDX,$(SHARDS)),$(eval $(call shard_rule,stdlib,stdlib,$(SHARDS),$(k),$(LIMIT_STDLIB),$(STDLIB_NAMES))))
 $(foreach k,$(call SHARD_IDX,$(OWN_SHARDS)),$(eval $(call shard_rule,ownership,ownership,$(OWN_SHARDS),$(k),$(LIMIT_OWNERSHIP),$(OWNERSHIP_NAMES))))
 $(eval $(call shard_rule,modules,modules,1,0,$(LIMIT_MODULES),$(MODULES_NAMES)))
+# The check mode of the lIR facts (spec/lir.md 6.13): ownership and the stdlib again with FIB_LIR_FACTS=trap, so that every fact a front end emits
+# is tested where it stands and a false one is a trap with its message instead of a miscompile. Its own tables (trap-*), compared as samples.
+$(foreach k,$(call SHARD_IDX,$(SHARDS)),$(eval $(call shard_rule,trap-stdlib,stdlib,$(SHARDS),$(k),$(LIMIT_STDLIB),$(STDLIB_NAMES),,env FIB_LIR_FACTS=trap)))
+$(foreach k,$(call SHARD_IDX,$(OWN_SHARDS)),$(eval $(call shard_rule,trap-ownership,ownership,$(OWN_SHARDS),$(k),$(LIMIT_OWNERSHIP),$(OWNERSHIP_NAMES),,env FIB_LIR_FACTS=trap)))
 # the quick gate's sample: its own shards over the sample names, always with --only
 $(foreach k,$(call SHARD_IDX,$(QUICK_SHARDS)),$(eval $(call shard_rule,sample,stdlib,$(QUICK_SHARDS),$(k),$(LIMIT_STDLIB),$(SAMPLE_NAMES),only)))
 
@@ -45,12 +49,16 @@ STDLIB_TABLES := $(foreach k,$(call SHARD_IDX,$(SHARDS)),$(CASES_DIR)/stdlib.$(k
 OWNERSHIP_TABLES := $(foreach k,$(call SHARD_IDX,$(OWN_SHARDS)),$(CASES_DIR)/ownership.$(k).txt)
 MODULES_TABLES := $(CASES_DIR)/modules.0.txt
 SAMPLE_TABLES := $(foreach k,$(call SHARD_IDX,$(QUICK_SHARDS)),$(CASES_DIR)/sample.$(k).txt)
+TRAP_TABLES := $(foreach k,$(call SHARD_IDX,$(OWN_SHARDS)),$(CASES_DIR)/trap-ownership.$(k).txt) $(foreach k,$(call SHARD_IDX,$(SHARDS)),$(CASES_DIR)/trap-stdlib.$(k).txt)
 CASES_DATA := scripts/ci-stage2.expected scripts/case-floor.expected scripts/ci-stage2.sh $(wildcard scripts/ci-stage2.expected-darwin)
 
 $(CASES_DIR)/full.ok: $(OWNERSHIP_TABLES) $(MODULES_TABLES) $(STDLIB_TABLES) $(CASES_DATA)
 	$(call stamp,scripts/ci-stage2.sh --from $(CASES_DIR) ownership:ownership:$(OWN_SHARDS) modules:modules:1 stdlib:stdlib:$(SHARDS))
 $(CASES_DIR)/quick.ok: $(OWNERSHIP_TABLES) $(MODULES_TABLES) $(SAMPLE_TABLES) $(CASES_DATA)
 	$(call stamp,scripts/ci-stage2.sh --from $(CASES_DIR) ownership:ownership:$(OWN_SHARDS) modules:modules:1 sample:stdlib:$(QUICK_SHARDS))
+$(CASES_DIR)/trap.ok: $(TRAP_TABLES) $(CASES_DATA)
+	$(call stamp,scripts/ci-stage2.sh --from $(CASES_DIR) trap-ownership:ownership:$(OWN_SHARDS) trap-stdlib:stdlib:$(SHARDS))
+cases-trap: $(CASES_DIR)/trap.ok   ## ownership and the stdlib under FIB_LIR_FACTS=trap (the facts' check mode), compared with scripts/ci-stage2.expected
 cases: $(CASES_DIR)/full.ok   ## every case directory under F, in shards, compared with scripts/ci-stage2.expected and the floor
 cases-quick: $(CASES_DIR)/quick.ok   ## ownership, modules and the stdlib sample of the quick gate
-.PHONY: cases cases-quick
+.PHONY: cases cases-quick cases-trap

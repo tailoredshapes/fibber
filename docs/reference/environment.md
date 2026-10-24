@@ -44,6 +44,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LIRO_THIN_JOBS` | [compiler/native/liro/build.fib:28](../../compiler/native/liro/build.fib#L28) |
 | `FIB_LIRO_THIN_PLUGIN` | [compiler/native/liro/build.fib:26](../../compiler/native/liro/build.fib#L26) |
 | `FIB_LIRO_UNITS` | [compiler/native/liro/partition.fib:39](../../compiler/native/liro/partition.fib#L39) |
+| `FIB_LIR_FACTS` | [compiler/lir/facts.fib:15](../../compiler/lir/facts.fib#L15) |
 | `FIB_LIVE` | [compiler/driver/testlive.fib:89](../../compiler/driver/testlive.fib#L89) |
 | `FIB_LIVE_BASE` | [compiler/serve/livesess.fib:223](../../compiler/serve/livesess.fib#L223) |
 | `FIB_LIVE_DEBUG` | [compiler/serve/livesess.fib:384](../../compiler/serve/livesess.fib#L384) |

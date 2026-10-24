@@ -4,17 +4,22 @@
 (ns lir.parse.intrin
   (:use lir.diag lir.types lir.ast lir.sexp lir.intrin lir.parse.names lir.parse.ty lir.parse.memory))
 
-(def flag-capable: (Set str) #{"fadd" "fsub" "fmul" "fdiv" "frem"})
+(def flag-capable: (Set str) #{"fadd" "fsub" "fmul" "fdiv" "frem" "add" "sub" "mul" "shl"})
 
 ;; The form for an intrinsic word, nil for another head. A `fadd`-like word with its own two operands is the plain instruction (nil): only
-;; the extra leading words make it flagged.
+;; the extra leading words make it flagged. An integer word (`add` .. `shl`) is flagged only when its first operand is a word: `(add a b c)`
+;; with a form first stays the plain instruction and its operand count error. `load` is lir.parse.memory's (a `(range LO HI)` is its option).
 (defun parse-intrin (name: str args: (Vec Sexp) pos: i64 sub: ExprParser) -> (Option (Result LExpr Diagnostic))
   (match (intrin-info name)
     (nil nil)
     ((some _)
-     (if (and (contains? flag-capable name) (<= (count args) 2))
-         nil
-         (some (intrin-form sub name args pos))))))
+     (cond (= name "load") nil
+           (and (contains? flag-capable name) (<= (count args) 2)) nil
+           (and (intrin-int-flags? name) (not (first-atom? args))) nil
+           :else (some (intrin-form sub name args pos))))))
+
+(defun first-atom? :private (args: (Vec Sexp)) -> bool
+  (match (nth args 0) ((SxAtom _ _) true) (_ false)))
 
 ;; The trailing `(align N)` of the forms that take one: the alignment and the operands before it.
 (defstruct IntrinTail (align: (Option i64) rest: (Vec Sexp)))
@@ -50,7 +55,7 @@
   (str name " expects " want " operand" (if (= want 1) "" "s") ", found " found))
 
 (defun intrin-parts :private (sub: ExprParser name: str rest: (Vec Sexp) pos: i64 nflags: i64 typed: bool align: (Option i64)) -> (Result LExpr Diagnostic)
-  (try-let ((flags (parse-flags rest nflags))
+  (try-let ((flags (if (intrin-int-flags? name) (parse-int-flags rest nflags) (parse-flags rest nflags)))
             (ty (if typed (try-let ((t (parse-type (nth rest nflags)))) (Ok (some t))) (Ok nil)))
             (ops (operands sub (vec-from rest (+ nflags (if typed 1 0))))))
     (Ok (expr-new (KIntrin name flags ty ops align) pos))))
@@ -71,3 +76,18 @@
                         (err p (str "fast-math flag " w " is not in lIR: a value that violates it is poison"))
                         (err p (str "unknown fast-math flag " w))))))
             (_ (err (sexp-pos s) (str "expected a fast-math flag, found " (sexp-describe s)))))))))
+
+;; The integer flags `nsw` and `nuw` (spec/lir.md 6.13), LLVM's spelling, written as the first `n` words of `args` in any order.
+(defun parse-int-flags :private (args: (Vec Sexp) n: i64) -> (Result i64 Diagnostic)
+  (loop ((i 0) (acc 0))
+    (if (>= i n)
+        (Ok acc)
+        (let ((s (nth args i)))
+          (match s
+            ((SxAtom w p)
+             (match (int-flag-bit w)
+               ((some bit) (if (= (bit-and acc bit) 0)
+                               (recur (+ i 1) (bit-or acc bit))
+                               (err p (str "duplicate flag " w))))
+               (nil (err p (str "unknown integer flag " w)))))
+            (_ (err (sexp-pos s) (str "expected an integer flag, found " (sexp-describe s)))))))))

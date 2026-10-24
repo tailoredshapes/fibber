@@ -1,7 +1,8 @@
 # Facts the front end knows and lIR cannot say
 
-Current status: a spike (measurements and a proposal). No compiler source and no part of spec/lir.md was changed; the form
-of section 7 is for the owner to decide.
+Current status: the form of section 7 is **Decided** (owner, 2026-10-24) and implemented as spec/lir.md 6.13: the words `nsw`/`nuw`,
+`(assume c)`, `(load (range LO HI) T p)` (LLVM's own forms in LLVM's spelling), and the check mode `FIB_LIR_FACTS=use|trap|ignore` in lair;
+the gate runs the ownership and stdlib cases under `trap` (`make cases-trap`). The measurements below are the spike's, from before.
 
 Everything quoted was produced on this machine (Intel i7-14700KF, LLVM 21 `opt`/`llc`, `-mcpu=native`) on 2026-10-24 with
 stage 2 built from `9b329978`. The scripts are in `docs/design/lir-facts/` (they `cd` into the scratch directory

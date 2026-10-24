@@ -4,13 +4,13 @@
 ;; Operands are typed with `fcx-val`, left to right, as in lir.check.arith, so that the first error is the one the spec's order gives.
 
 (ns lir.check.intrin
-  (:use lir.diag lir.types lir.ast lir.intrin lir.check.fcx))
+  (:use lir.diag lir.types lir.lit lir.ast lir.intrin lir.check.fcx lir.check.arith lir.check.memory))
 
 
 ;; The type of the form (nil for void).
 (defun check-intrin (fcx: Fcx e: LExpr) -> (Result (Option LType) Diagnostic)
   (match (. e kind)
-    ((KIntrin name _ ty args _)
+    ((KIntrin name flags ty args _)
      (let ((c (intrin-class name)) (p (. e pos)))
        (cond (or (= c "f1") (= c "f2") (= c "f3") (= c "fbin")) (some-t (check-float-fn fcx name args p))
              (or (= c "i1") (= c "i2")) (some-t (check-int-fn fcx name args p))
@@ -18,6 +18,9 @@
              (= c "warp") (some-t (check-warp fcx name args p))
              (= c "hint") (Ok nil)
              (= c "const") (Ok (some ty-i64))
+             (= c "ibin") (some-t (check-int-fact fcx name flags args p))
+             (= c "assume") (check-assume fcx args p)
+             (= c "rload") (check-range-load fcx e)
              :else (check-masked fcx name c ty args p))))
     (_ (err (. e pos) "internal error: not an intrinsic form"))))
 
@@ -122,3 +125,85 @@
                   (u15 (operand-is fcx name 2 (nth args 1) (ptrs-of tv) pos))
                   (u16 (operand-is fcx name 3 (nth args 2) (mask-of tv) pos)))
           (Ok nil))))
+
+;; ---------------------------------------------------------------- facts (spec/lir.md 6.13)
+
+(defun fact-binop :private (name: str) -> LBinOp
+  (cond (= name "add") BAdd (= name "sub") BSub (= name "mul") BMul :else BShl))
+
+;; `(add nsw a b)` and kin: the rules of the unflagged form, then the literal rule: two literal operands whose operation wraps as a flag
+;; says it does not are an error, since the fact is already false.
+(defun check-int-fact :private (fcx: Fcx name: str flags: i64 args: (Vec LExpr) pos: i64) -> (Result LType Diagnostic)
+  (try-let ((t (check-bin fcx (fact-binop name) (nth args 0) (nth args 1) pos)))
+    (match (literal-wrap name flags t (nth args 0) (nth args 1))
+      ((some w) (err pos (str name " " w " wraps on its literal operands")))
+      (nil (Ok t)))))
+
+;; The flag word that two scalar literal operands violate, nil when they are not both literals or none is violated.
+;; The flag word that two scalar literal operands violate, nil when they are not both literals or none is violated.
+(defun literal-wrap :private (name: str flags: i64 t: LType a: LExpr b: LExpr) -> (Option str)
+  (match t
+    ((TInt k)
+     (if-some (x (expr-int-literal a))
+       (if-some (y (expr-int-literal b))
+         (cond (and (not (= (bit-and flags ifl-nsw) 0)) (not (fits-signed? k (int-op name k x y true)))) (some "nsw")
+               (and (not (= (bit-and flags ifl-nuw) 0)) (not (fits-unsigned? k (int-op name k x y false)))) (some "nuw")
+               :else nil)
+         nil)
+       nil))
+    (_ nil)))
+
+;; The literal's value as a `k`-bit integer read signed or unsigned.
+(defun read-as :private (k: i64 v: LLit signed: bool) -> LLit
+  (let ((u (lit-low v k)))
+    (cond (not signed) (LLit 0 u)
+          (>= k 64) (lit-of u)
+          :else (lit-of (sar (shl u (- 64 k)) (- 64 k))))))
+
+;; The exact result of the operation on the two operands read as `k`-bit integers (a shift amount is below `k`: check-bin's rule).
+(defun int-op :private (name: str k: i64 x: LLit y: LLit signed: bool) -> LLit
+  (let ((a (read-as k x signed)) (b (read-as k y signed)))
+    (cond (= name "add") (lit-add a b)
+          (= name "sub") (lit-add a (lit-neg b))
+          (= name "mul") (lit-mul a b)
+          :else (lit-mul a (lit-pow2 (lit-low y k))))))
+
+(defun fits-signed? :private (k: i64 v: LLit) -> bool
+  (and (>= (lit-cmp v (lit-neg (lit-pow2 (- k 1)))) 0) (lit-lt? v (lit-pow2 (- k 1)))))
+
+(defun fits-unsigned? :private (k: i64 v: LLit) -> bool
+  (and (not (lit-negative? v)) (lit-lt? v (lit-pow2 k))))
+
+;; `(assume c)`: `c` an i1; void. A literal false is an error: the fact is already false.
+(defun check-assume :private (fcx: Fcx args: (Vec LExpr) pos: i64) -> (Result (Option LType) Diagnostic)
+  (try-let ((t (fcx-val fcx (nth args 0))))
+    (cond (not (= t ty-i1)) (err pos (str "assume needs an i1 operand, found " (type-str t)))
+          (literal-false? (nth args 0)) (err pos "assume of a literal false")
+          :else (Ok nil))))
+
+(defun literal-false? :private (e: LExpr) -> bool
+  (match (expr-int-literal e) ((some v) (= (lit-low v 1) 0)) (nil false)))
+
+;; `(load (range LO HI) T p)`: the rules of the plain load, then `T` a scalar integer and `-2^(K-1) <= LO < HI <= 2^(K-1)`, read signed,
+;; not every value of `T` (LLVM's `!range` may not be the full set).
+(defun check-range-load :private (fcx: Fcx e: LExpr) -> (Result (Option LType) Diagnostic)
+  (match (. e kind)
+    ((KIntrin _ _ ty args align)
+     (let ((t (unwrap-or ty ty-i32)) (pos (. e pos)))
+       (try-let ((r (check-memory fcx (LExpr (KLoad t (nth args 0) false align) pos))))
+         (match t
+           ((TInt k) (if-some (lo (expr-int-literal (nth args 1)))
+                       (if-some (hi (expr-int-literal (nth args 2)))
+                         (range-rules k t lo hi pos)
+                         (err pos "range must be (range LO HI) with two integers"))
+                       (err pos "range must be (range LO HI) with two integers")))
+           (_ (err pos (str "range needs an integer load type, found " (type-str t))))))))
+    (_ (err (. e pos) "internal error: not a range load"))))
+
+(defun range-rules :private (k: i64 t: LType lo: LLit hi: LLit pos: i64) -> (Result (Option LType) Diagnostic)
+  (let ((min (lit-neg (lit-pow2 (- k 1)))) (top (lit-pow2 (- k 1))))
+    (cond (lit-lt? lo min) (err pos (str "range bound " (lit-str lo) " is out of range for " (type-str t)))
+          (lit-lt? top hi) (err pos (str "range bound " (lit-str hi) " is out of range for " (type-str t)))
+          (not (lit-lt? lo hi)) (err pos (str "range needs LO < HI, found " (lit-str lo) " " (lit-str hi)))
+          (and (= (lit-cmp lo min) 0) (= (lit-cmp hi top) 0)) (err pos (str "range covers every value of " (type-str t)))
+          :else (Ok (some t)))))

@@ -1,0 +1,55 @@
+;; compiler/tests/lir/unit-facts.fib: the facts of lIR (spec/lir.md 6.13) in the front half: the printer writes each fact as it was read (print,
+;; read again, print: the same text), `lir.facts/strip-module` drops every fact and leaves a module the checker accepts with no fact in it, and
+;; `lit-mul` (the literal rule's 128-bit product) on the edges the checker relies on.
+;; Build: fibc build compiler/tests/lir/unit-facts.fib -I compiler -I lib -o OUT
+(ns tests.lir.unit-facts (:use fib.test.unit lir.diag lir.types lir.lit lir.ast)
+  (:require [fib.test.run :as test-runner] [lir :as front] [lir.print :as print] [lir.facts :as facts]))
+
+(def source: str "(define (f i64) ((i64 a) (i32 b) (ptr p) (<2 x i64> v))
+  (block entry
+    (let ((s (add nsw a a))
+          (t (sub nuw b b))
+          (m (mul nuw nsw a (i64 3)))
+          (w (shl nsw v v))
+          (r (load (range 0 100) i64 p))
+          (q (load (range -128 5) (align 1) i8 p)))
+      (assume (icmp slt s r))
+      (ret (add s (sext i64 q))))))
+(define (main i32) () (block entry (ret (i32 0))))")
+
+(defun printed (src: str) -> str
+  (match (front/parse-and-check src) ((Ok m) (print/print-module m)) ((Err ds) (str "error: " (diag-str (nth ds 0))))))
+
+(defun has? (hay: str needle: str) -> bool (some? (str-find hay needle 0)))
+
+(defun stripped (src: str) -> str
+  (match (front/parse-and-check src)
+    ((Ok m) (let ((text (print/print-module (facts/strip-module m))))
+              (match (front/parse-and-check text) ((Ok _) text) ((Err ds) (str "error: " (diag-str (nth ds 0)))))))
+    ((Err ds) (str "error: " (diag-str (nth ds 0))))))
+
+(defun mul-str (a: i64 b: i64) -> str (lit-str (lit-mul (lit-of a) (lit-of b))))
+
+(defun unit-steps () -> (Vec StepRun)
+  (let ((cs (new-rec))
+        (once (printed source))
+        (twice (printed once))
+        (bare (stripped source)))
+    (do
+      (is cs (and (has? once "(add nsw a a)") (has? once "(sub nuw b b)") (has? once "(mul nuw nsw a (i64 3))") (has? once "(shl nsw v v)")
+                  (has? once "(load (range 0 100) i64 p)") (has? once "(load (range -128 5) (align 1) i8 p)")
+                  (has? once "(assume (icmp slt s r))")) "each fact prints in LLVM's spelling and position, as it was read")
+      (is cs (= once twice) "print, read, print gives the same text")
+      (is cs (and (not (has? bare "nsw")) (not (has? bare "nuw")) (not (has? bare "range")) (not (has? bare "assume"))
+                  (has? bare "(add a a)") (has? bare "(load i64 p)") (has? bare "(load (align 1) i8 p)")) "strip-module drops every fact and the module still checks")
+      (is cs (and (= (mul-str 4294967296 4294967296) "18446744073709551616") (= (mul-str -1 -1) "1")
+                  (= (mul-str -9223372036854775808 -1) "9223372036854775808")
+                  (= (lit-str (lit-mul (LLit 0 -1) (LLit 0 -1))) "-36893488147419103231")) "lit-mul is the exact product of two 64-bit operands (the last wraps at 128 bits as unsigned 2^128 - 2^65 + 1)")
+      (rec-steps cs))))
+
+(defun tests () -> Suite
+  (unit-suite "lir/unit-facts" [(test-case "checks" unit-steps "compiler/tests/lir/unit-facts.fib")]))
+
+(defun main () -> i64
+  (test-runner/run-main-with [(tests)]
+    (into ["--isolate" "fork" "--timeout" "300"] (vec (args)))))

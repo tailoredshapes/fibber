@@ -462,7 +462,9 @@ sum of 4096 doubles in a loop takes 83 ms strict and 14 ms with
 `reassoc` on its `fadd` (docs/design/vectorisation.md), because only then
 may LLVM keep several partial sums in a vector register.
 
-No `nsw`, `nuw` or `exact` flags exist. `sdiv`, `udiv`, `srem`, `urem`
+`add sub mul shl` take LLVM's no-wrap words `nsw` and `nuw` in the same
+position, `(add nsw a b)` as LLVM writes `add nsw i64 %a, %b`: they are
+facts (§6.13). No `exact` flag exists. `sdiv`, `udiv`, `srem`, `urem`
 with a constant zero divisor are `division by constant zero`; a shift
 whose amount is a constant `≥` the bit width is `shift amount n is not
 less than the width w`. Both are poison or undefined in LLVM.
@@ -536,6 +538,7 @@ reference a vectorised sum is compared to.
 |---|---|---|
 | `(alloca (align N)? T)`, `(alloca (align N)? T n)` | `T` sized; `n` integer | `ptr` |
 | `(load volatile? (align N)? T p)` | `p : ptr`; `T` first-class | `T` |
+| `(load (range LO HI) (align N)? T p)` | as `load`, and the range rules of §6.13 (a fact: LLVM's `!range`) | `T` |
 | `(store volatile? (align N)? v p)` | `p : ptr`; `v` first-class | void |
 | `(getelementptr inbounds? T p i₀ i₁ ..)` | `p : ptr`, `T` sized; `i₀` integer; each further index steps into the current type: into a struct by a constant `i32` field index in range, into an array by any integer, a constant one in range (`getelementptr: index 4 out of range for [4 x i32]`) except into a `[0 x T]`, whose length is unknown | `ptr` |
 
@@ -732,10 +735,75 @@ of the minimum by -1 computed at run time; shifts by a run-time amount
 `≥` the width (poison); out-of-range `fptosi`/`fptoui` (poison); a
 run-time out-of-range vector index (poison); an unmasked lane of a masked
 load, store, gather or scatter that accesses invalid memory (§6.5); `getelementptr inbounds`
-outside its object (poison); reaching `unreachable`; calling a function
+outside its object (poison); a false fact (§6.13: an operation that wraps
+although it carries `nsw` or `nuw`, which is poison; an `assume` whose
+operand is false; a load whose value is outside its `range`); reaching `unreachable`; calling a function
 through a pointer with the wrong function type; a `musttail` callee
 that reads the caller's `alloca`s. lIR's checker cannot see these;
 fibber's compiler emits the checks types.md §8.12 requires.
+
+### 6.13 Facts
+
+**Decided** (owner, 2026-10-24: "broadly down for anything that lets lir
+use more of llvm"; design and measurements in docs/design/lir-facts.md).
+A fact is something the code that emits lIR knows about a value and LLVM
+cannot see for itself. lIR is LLVM IR written as S-expressions, so each
+fact is LLVM's own form in LLVM's spelling and position, nothing of
+fibber's: the no-wrap words on the instruction, `llvm.assume`, and the
+`!range` metadata of a load. A claim in the front end's terms (an index in
+the bounds of some array, a count that does not change) is the front
+end's to prove and to emit as these forms; lIR has no form for it.
+
+| Form | Meaning | LLVM |
+|---|---|---|
+| `(add nsw a b)`, `(add nuw a b)`, `(add nuw nsw a b)`; `sub`, `mul`, `shl` alike | the operation does not wrap as signed (`nsw`) or as unsigned (`nuw`); for `shl`, shifting the result back gives `a` again (arithmetically for `nsw`, logically for `nuw`) | the flags on the instruction (`add nuw nsw i64`) |
+| `(assume c)` | `c : i1` is true here; void, not a terminator | `call void @llvm.assume(i1 c)` |
+| `(load (range LO HI) (align N)? T p)` | the loaded integer is in `[LO, HI)`, read signed | `!range !{T LO, T HI}` on the load |
+
+**A fact only removes behaviours.** A program whose facts are true
+computes the same results whether a backend uses a fact or ignores it, so
+any backend may drop any fact: the C, JavaScript and WGSL backends do
+(lir.facts `strip-module`); lair gives them to LLVM. A false fact is
+undefined behaviour (§6.12), unlike a fast-math word, which only chooses
+among results.
+
+The words are written as fast-math words are (§6.1): between the name and
+the operands, in any order, each at most once. The operand rules are the
+unflagged form's (same integer `T`, scalar or vector; a constant shift
+amount below the width).
+
+The checker rejects a malformed or misplaced fact and one whose literal
+operands already make it false; it cannot establish a fact about run-time
+values:
+
+| Error | Form |
+|---|---|
+| a repeated word | `duplicate flag nsw` |
+| another word on `add sub mul shl` | `unknown integer flag exact` (a fast-math word too: `unknown integer flag reassoc`); `nsw` on a float form is `unknown fast-math flag nsw`; on any other integer form it is the form's operand-count error |
+| two literal operands that break the flag | `add nsw wraps on its literal operands` (`(add nsw (i64 9223372036854775807) (i64 1))`), `sub nuw wraps ..`, `shl nsw wraps ..` |
+| `assume` | `assume needs an i1 operand, found i32`; `assume of a literal false`; as a value: `void value used as an operand` |
+| `range` | `range must be (range LO HI) with two integers`; `range needs an integer load type, found double` (a scalar integer only); `range needs LO < HI, found 5 5`; `range bound 129 is out of range for i8` (`-2^(K-1) <= LO < HI <= 2^(K-1)`, signed; `HI = 2^(K-1)` is a range open above, which LLVM spells with the minimum as its end); `range covers every value of i8` (LLVM's `!range` may not be the full set); `range on a volatile load` |
+
+**The check mode.** `FIB_LIR_FACTS` chooses what lair does with the facts:
+`use` (the default) gives them to LLVM; `ignore` drops them all before
+lowering (the reference semantics); `trap` lowers each fact to a test of
+it: the operation is computed without its flags and its overflow tested
+(`llvm.sadd.with.overflow` and kin; for `shl`, the shift back), `assume`
+tests its operand, a range load compares the loaded value with both
+bounds. A false fact then calls `llvm.trap` after writing to standard
+error a message naming the fact and its place:
+`lIR fact violated: (add nsw) in @main, block entry, at 13:14` (the
+position only when the module was read from text). Any other value is
+refused: `FIB_LIR_FACTS must be use, trap or ignore, found X`. The gate
+runs the ownership and stdlib cases under `trap` (`make cases-trap`), so
+a fact a front end emits falsely is a trap with its message there, not a
+miscompile; the check covers what the suite executes, nothing more. The
+liro object cache is keyed on the mode.
+
+Not in lIR: `exact` on divisions and shifts, TBAA, `noalias` scopes,
+`!invariant.load` (false under fibber's in-place reuse of a unique
+object's memory, docs/design/lir-facts.md 4). Each would be added the
+same way, as LLVM's own form.
 
 ## 7. Calls, variadic functions and tail calls
 
@@ -865,6 +933,7 @@ error of each function but checks every function. The main groups:
 | phi | §5.4: position, predecessors, incoming types and availability |
 | types | §6: every operand and result type |
 | constants | literal ranges (§3), constant divisors, shifts, vector and array indices (§6), `store` to a `constant`, alignments (§6.5) |
+| facts | §6.13: the words, `assume`'s operand, the range of a load, literal operands that break a fact |
 | calls | §7: arity, argument types, variadic promotion, tail-call rules, `main` |
 | target | §4.5: at most one `target` form and its two strings |
 
@@ -1070,3 +1139,4 @@ one the passes used.
 | 11 | `volatile` and `(align N)` on `load`, `store` and `alloca` | **adopted** as proposed: `N` a power of two from 1 to 2^30; `volatile` is LLVM's, not atomic | §6.5 |
 | 12 | the instructions SIMD code needs (SIMD wave 2, package P0, owner decisions of 2026-10-04): `fma fmuladd fsqrt fabs ffloor fceil ftrunc fround froundeven fcopysign fmin fmax fminnum fmaxnum smin smax umin umax abs`; fast-math flags `reassoc contract arcp afn nsz` (never `nnan`, `ninf` or `fast`, which make poison) on `fadd fsub fmul fdiv frem fma reduce-fadd reduce-fmul`; the horizontal `reduce-*` family; conversions, saturating conversions and `ptrtoint`/`inttoptr` on vectors; a vector index in `getelementptr`; `masked-load`, `masked-store`, `gather`, `scatter`; the module form `(target (cpu ..) (features ..))` | **adopted** as designed in docs/design/simd-and-tensors.md 2.9, 2.10, with `nsz` allowed (it never makes poison) and `fmuladd` and `fcopysign` added; implemented by the compiler in fibber only (the Rust `lair` is the legacy oracle and does not have them: its harness skips the cases marked `;; stage: 2`) | §4.5, §6.1, §6.3, §6.4, §6.5 |
 | 13 | kernel forms for a kernel target: `kernelcc`, `(sreg R)`, `(barrier)`, and `(align 1)` on a scalar read as natural alignment there | **Accepted** (the owner, 2026-10-07): implemented in the parser, checker, printer and lair, exercised by compiler/tests/native/gpu-emit.sh and j-unit; docs/design/gpu.md. `fib.gpu` is core, not a driver: `defkernel` is the deliberate opt-in, and a build for a platform with no kernel target rejects the program with a clear message. GPU-5 added to the same family `(sreg laneid)`, `(sreg warpsize)`, the intrinsic forms `shfl-down shfl-up shfl-xor shfl-idx` and `ballot` (§6.9a): **Accepted** (the owner, 2026-10-08: "Accept"), with the target-defined behaviours as written there | §2, §6.9a |
+| 14 | facts: `nsw`/`nuw` on `add sub mul shl`, `(assume c)`, `(load (range LO HI) T p)`, each LLVM's own form in LLVM's spelling (lIR is LLVM IR as S-expressions; a front-end abstraction is the front end's to lower into these), and the check mode `FIB_LIR_FACTS=use|trap|ignore` | **Decided** (owner, 2026-10-24); docs/design/lir-facts.md | §6.1, §6.5, §6.12, §6.13, §10 |
