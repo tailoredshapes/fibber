@@ -108,11 +108,14 @@
                    pos) pos)))
 
 ;; The rewrite of a chain of `map` steps over sources held in arrays: `call` is the call as it was with its sources
-;; replaced by `news` (the gensyms the rewrite binds them to, which it is handed as `fallback`).
+;; replaced by `news` (the gensyms the rewrite binds them to, which it is handed as `fallback`). One source that is a vector
+;; literal always has spans (expand.fusegen `fg-spans-known?`): no fallback, when the stages are `fn` literals (`fg-literal-stages?`).
 (defun fuse-span-rewrite (ctx: ExpandCtx ch: Chain pos: Pos fallback: (fn ((Vec Stx)) Stx)) -> Stx
   (let ((k (count (. ch sources))))
     (let ((nm (names-for ctx k pos)))
       (fg-let (fg-appended (fg-per-source k (fn (q: i64) (fg-pair (nth (. nm s) q) (nth (. ch sources) q) pos)))
                            (choice-pairs nm k pos))
-              (fg-if (fg-pcall "not" [(. nm fast)] pos) (fallback (. nm s)) (fast-path ctx (fg-map-fns (. ch steps)) nm k pos) pos)
+              (if (and (= k 1) (fg-spans-known? (nth (. ch sources) 0)) (fg-literal-stages? (. ch steps)))
+                  (fast-path ctx (fg-map-fns (. ch steps)) nm k pos)
+                  (fg-if (fg-pcall "not" [(. nm fast)] pos) (fallback (. nm s)) (fast-path ctx (fg-map-fns (. ch steps)) nm k pos) pos))
               pos))))

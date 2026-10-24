@@ -158,8 +158,9 @@
                              zeros))))
 
 ;; The source asked: the call as it was when it has no spans or is a range that never ends, nothing when it is empty.
-;; A range whose step is known not to be zero (expand.fusegen `fg-step-nonzero?`) has no such branch.
-(defun source-choice :private (fl: Flow fallback: Stx nonzero: bool) -> Stx
+;; A source known to walk (`known`: a range whose step is known not to be zero, expand.fusegen `fg-step-nonzero?`, or a vector
+;; literal, `fg-spans-known?`) has no such branch.
+(defun source-choice :private (fl: Flow fallback: Stx known: bool) -> Stx
   (let ((pos (. fl pos)) (empty (fg-pcall "vec-empty" (vec-empty) pos)) (s (. fl s)) (w (. fl sc)))
     (let ((walk (fg-if (fg-pcall "=" [w (int 0 pos)] pos)
                        empty
@@ -169,8 +170,14 @@
                            (first-loop fl))
                        pos)))
       (fg-let [(fg-pair w (call (if (. fl range) "fib.seq/range-walk-kind" "fib.seq/span-count") [s] pos) pos)]
-              (if (and (. fl range) nonzero) walk (fg-if (fg-pcall "<" [w (int 0 pos)] pos) fallback walk pos))
+              (if known walk (fg-if (fg-pcall "<" [w (int 0 pos)] pos) fallback walk pos))
               pos))))
+
+;; Whether the one source of the chain is known to walk: a range with a nonzero literal step, or a vector literal (with stages that are
+;; all `fn` literals, expand.fusegen `fg-literal-stages?`).
+(defun known-walk? :private (ch: Chain) -> bool
+  (let ((src (nth (. ch sources) 0)))
+    (if (. ch range) (fg-step-nonzero? src) (and (fg-spans-known? src) (fg-literal-stages? (. ch steps))))))
 
 ;; The rewrite of a chain with steps that are not all `map`s over its one source; `fallback` makes the call as it was with
 ;; its source replaced by the gensym the source is bound to.
@@ -179,6 +186,6 @@
     (let ((fl (Flow ctx (. ch steps) (. ch range) pos (nth g 0) (nth g 1) (nth g 2) (nth g 3) (take-ns (. ch steps))))
           (empty (fg-pcall "vec-empty" (vec-empty) pos)))
       (fg-let [(fg-pair (nth g 0) (nth (. ch sources) 0) pos)]
-              (loop ((t (- (count (. fl ns)) 1)) (acc (source-choice fl (fallback [(nth g 0)]) (and (. ch range) (fg-step-nonzero? (nth (. ch sources) 0))))))
+              (loop ((t (- (count (. fl ns)) 1)) (acc (source-choice fl (fallback [(nth g 0)]) (known-walk? ch))))
                 (if (< t 0) acc (recur (- t 1) (fg-if (fg-pcall "<=" [(nth (. fl ns) t) (int 0 pos)] pos) empty acc pos))))
               pos))))

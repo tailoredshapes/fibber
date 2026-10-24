@@ -42,10 +42,22 @@
   (do (each-while c (fn (x) (do (f x) true)))
       ()))
 
-(defun reduce (f: (fn (a e) a) :borrow init: a c: c) :where ((Reducible c e)) -> a
-  (let ((acc (cell init)))
-    (do (each-while c (fn (x) (do (set! acc (f @acc x)) true)))
-        @acc)))
+(defun reduce (f: (fn (a e) a) :borrow init: a :owned c: c) :where ((Reducible c e)) -> a
+  (let ((n (span-count c)))
+    (if (< n 0)
+        (let ((acc (cell init)))
+          (do (each-while c (fn (x) (do (set! acc (f @acc x)) true)))
+              @acc))
+        (reduce-spans f init c n))))
+
+;; reduce over the n spans of c (a Vec, an Array): the running value is a loop variable, handed to f at its last use, so f's update of
+;; a value nobody else holds is in place; through a cell, `(set! acc (f @acc x))` would hand f a second count and every update would copy
+(defun reduce-spans :private (f: (fn (a e) a) :borrow init: a :owned c: c n: i64) :where ((Reducible c e)) -> a
+  (loop ((j 0) (acc init))
+    (if (< j n)
+        (let ((arr (span-array c j)))
+          (recur (+ j 1) (loop ((i 0) (acc acc)) (if (< i (array-len arr)) (recur (+ i 1) (f acc (array-get arr i))) acc))))
+        acc)))
 
 ;; the running value of reduce1: nothing until the first element, then one cell that is updated in place
 (defun reduce1 (f: (fn (e e) e) :borrow c: c) :where ((Reducible c e)) -> (Option e)

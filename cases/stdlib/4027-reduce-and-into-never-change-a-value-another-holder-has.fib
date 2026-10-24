@@ -1,0 +1,48 @@
+;; spec:   stdlib §2.5 (in place when unique: a value another holder has is never changed), §4.4 (reduce, into)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reduce into
+;; reduce and into update their running value in place only when nothing else holds it. Every version a loop makes is kept in a
+;; history, and each step folds into a kept version (so the value has a second holder) or into the unique one, by reduce with assoc,
+;; by reduce with conj and by into, over a Vec, an Array, a lazy seq (no spans: the walk through each-while) and a Vec of more than
+;; 32 (a trie when shared), with a Map as the running value too. After every step each kept version is compared with a model
+;; rebuilt from scratch; a fold that wrote a shared value in place changes an old version and the answer.
+(ns main (:use fib.core fib.seq fib.coll))
+
+(defun model (k: i64) -> (Vec i64)
+  ;; version k: 0..39 with element (k mod 40) raised by k, then k mod 7 more elements conj-ed
+  (let ((base (assoc (mapv (fn (i: i64) i) (range 40)) (rem k 40) (+ (rem k 40) k))))
+    (into base (map (fn (j: i64) (* j k)) (range (rem k 7))))))
+
+(defun step (k: i64) -> (Vec i64)
+  ;; version k from the base, by the four routes in turn
+  (let ((fresh (mapv (fn (i: i64) i) (range 40)))
+        (src (vec (map (fn (j: i64) (* j k)) (range (rem k 7))))))
+    (let ((raised (reduce (fn (v: (Vec i64) i: i64) (assoc v i (+ (nth v i) k))) fresh [(rem k 40)])))
+      (match (rem k 4)
+        (0 (reduce (fn (v: (Vec i64) x: i64) (conj v x)) raised src))
+        (1 (into raised src))
+        (2 (if (= (count src) 0) (into raised src) (into raised (to-array src))))
+        (_ (into raised (map (fn (x: i64) x) src)))))))
+
+(defun check (hist: (Vec (Vec i64))) -> i64
+  (loop ((k 0) (bad 0)) (if (< k (count hist)) (recur (+ k 1) (if (= (nth hist k) (model k)) bad (+ bad 1))) bad)))
+
+(defun main () -> i64
+  (let ((hist (loop ((k 0) (hist []))
+                (if (< k 60)
+                    (let ((v (step k)))
+                      ;; fold into a kept version: the result must be a new value, the kept one untouched
+                      (let ((shared (into (nth (conj hist v) k) [100 200]))
+                            (twice (reduce (fn (w: (Vec i64) x: i64) (assoc w 0 x)) v [7])))
+                        (recur (+ k 1) (if (and (= (count shared) (+ (count v) 2)) (= (nth twice 0) 7)) (conj hist v) (conj hist [])))))
+                    hist)))
+        (m (reduce (fn (acc: (Map i64 i64) x: i64) (assoc acc (rem x 10) x)) {} (mapv (fn (i: i64) i) (range 100))))
+        (keep m)
+        (m2 (reduce (fn (acc: (Map i64 i64) x: i64) (assoc acc x 0)) m [1 2 3])))
+    (+ (check hist)
+       (if (= (get keep 3) (some 93)) 0 1)
+       (if (= (get m2 3) (some 0)) 0 1)
+       (if (= (count m2) 10) 0 1))))

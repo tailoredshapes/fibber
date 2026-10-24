@@ -37,6 +37,33 @@
                                 (_ false))
           :else false)))
 
+;; Whether the chain's source `src` is a vector literal, as the first walk leaves it (`(fib.prelude/vec-conj .. (fib.prelude/vec-empty))`):
+;; a Vec, whose `span-count` is never below zero, so the branch that takes the call as it was for a source with no spans is never run
+;; and the rewrite leaves it out (written there, the stage literal is an argument of the library's call, an escaping use, which makes it
+;; a heap closure and what it captures owned, counted and never moved at a last use).
+(defun fg-spans-known? (src: Stx) -> bool
+  (match (. src kind)
+    ((SVec _) true)
+    ((SList items) (and (> (count items) 0)
+                        (match (. (nth items 0) kind)
+                          ((SSym s) (or (= s "fib.prelude/vec-conj") (= s "fib.prelude/vec-empty")))
+                          (_ false))))
+    (_ false)))
+
+;; Whether every stage of the steps is a `fn` literal (whose parameters the rewrite has counted), not a symbol: a symbol's arity is checked only
+;; by the call as it was, so a chain over a vector literal keeps that call when a stage is a symbol (`(mapv Rect [1 2])` is the type error of the
+;; two function types, case 8363), and a symbol captures nothing, so the branch costs nothing there.
+(defun fg-literal-stages? (steps: (Vec Step)) -> bool
+  (every? (fn (st: Step)
+            (match st
+              ((StMap f) (match f ((InFn _ _) true) (_ false)))
+              ((StFilter f) (match f ((InFn _ _) true) (_ false)))
+              ((StRemove f) (match f ((InFn _ _) true) (_ false)))
+              ((StKeep f) (match f ((InFn _ _) true) (_ false)))
+              ((StTakeWhile f) (match f ((InFn _ _) true) (_ false)))
+              ((StTake _) true)))
+          steps))
+
 ;; Whether every step is a `map`: the output has one element per source element.
 (defun fg-maps-only? (steps: (Vec Step)) -> bool
   (loop ((i 0))

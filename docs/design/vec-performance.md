@@ -319,3 +319,44 @@ failures, modules 32); the JS backend check; `make adr` (27 accepted). Mutants o
 
 Not done, in order of use: `VecSink` flat (filter chains; needs the stdlib §2.1 sentence changed), a `map` over a trie written into one
 array, the runtime's `fib.vec-build`/`fib.vec-drop` flat, and `array-sole?` as a builtin once a released seed has one.
+
+## 9. The cutter's threaded idioms: labels and unfilter
+
+Status: branch `thread-persist` from `f748147c`. The two phases of the allerbees cutter (`cut-sprites.fib`, `sheet-healer.png`) with the largest
+ratio to the idiomatic Rust port: labels (Rust 2 ms, fibber 33 ms whole-program) and the PNG unfilter (Rust about 26 ms, fibber about 265 ms).
+
+**What labels cost.** Not the `Figures` rebuilt per region (`figures-of` is 20 microseconds), but the flood fill, 13 to 23 objects per cell:
+
+- `reduce` and `into` kept their running value in a cell, `(set! acc (f @acc x))`: `@acc` acquires, so every `assoc` and `conj` they made saw a
+  count of 2 and copied (the flat label Vec of 264 192 became a trie at the first flood, and each cell after copied a path). Fixed in the
+  library: over a source with spans the running value is a loop variable (`reduce-spans`).
+- `(filterv (fn (j) .. (nth labels j) ..) [neighbours])` kept the call as it was for a source without spans, with the literal as its argument:
+  a heap closure, which pins `labels` (own.lastuse never moves a captured binding), so the `reduce` retained it anyway. Fixed in the expander:
+  a vector literal always has spans (`fg-spans-known?`), so with `fn`-literal stages the branch is left out.
+- the filter's builder (VecSink) made 10 objects for a result of one element; now 8.
+- still there: the four-element neighbour Vec (3 objects: a literal is a conj chain, syntax §1.4), the builder's struct and three cells, and the
+  first `assoc` of each flood, on a borrowed parameter, copies (the label Vec stays a trie for the sprite phase).
+
+**What unfilter costs.** No allocation per element (shell reuse and the flat Vec already removed it), but instructions: in the whole-program build a
+third of the samples were in the `nth` method of Vec and a fifth in `conj`, both calls, because the trie walk and the trie push were inlined into
+them and made them too large to put in line. `vec-nth`, `vec-assoc` and `vec-conj` are now the in-place case with the rest out of line
+(`-slow` names, which lair marks noinline, also for generic instances). The `conj` of an `i8` Vec is still a call at three sites per pixel (its
+inlined runtime fast paths, eight releases and five retains, keep it over LLVM's threshold), and each conj still makes three uniqueness tests of
+the shell, a retain and a release of the tail around `@c`, and one `array-sole?` and one `array-roomy?` test.
+
+**Measured** (load 4 to 6, three interleaved runs, medians; outputs byte-identical to `out-main-whole-1`):
+
+| | f748147c | this branch |
+|---|---|---|
+| kernel labels (synthetic 688x384 grid), whole / default | 50 / 75 ms | 18 / 34 ms |
+| kernel unfilter (2752x1536 RGB), whole / default | 250 / 680 ms | 210 / 600 ms |
+| cutter whole: wall, peak RSS | 1.65 s, 163 MB | 1.30 s, 165 MB |
+| cutter whole phases: read, bg, alpha, labels | 338, 117, 354, 34 ms | 304, 97, 206, 11 ms |
+| cutter default: wall, peak RSS | 2.57 s, 157 MB | 2.54 s, 156 MB |
+| cutter default phases: read, bg, alpha, labels | 810, 239, 599, 57 ms | 660, 197, 588, 22 ms |
+
+**Left for the owner** (each changes a sentence of the specification): a capture by a heap closure as a read where the literal is made, not a pin
+(types §6.4, the `:owned` soundness list, and §6.3 F3); a parameter consumed at its last use at an owned position of an ordinary call inferred
+owned (types §6.4, a fifth rule; the flood's `labels`); a take of the content for `(set! c (f @c x))` when nothing in the call can name the cell
+(types §6.3 "every other `@c` acquires"; every each-while accumulator of the library, and `into` over a source without spans); a move out of a
+private cell at its last `@c` (the retain and release per conj); a small vector literal built as one array (syntax §1.4).
