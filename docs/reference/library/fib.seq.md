@@ -103,10 +103,10 @@ Generated declaration inventory of [fib.seq](../../../lib/fib/seq.fib). Source l
 | `take-nth` | defun | [lib/fib/seq/tail.fib:39](../../../lib/fib/seq/tail.fib#L39) |
 | `take-while` | defun | [lib/fib/seq/adaptors.fib:112](../../../lib/fib/seq/adaptors.fib#L112) |
 | `tree-seq` | defun | [lib/fib/seq/tail.fib:110](../../../lib/fib/seq/tail.fib#L110) |
-| `vec-build-done` | defun | [lib/fib/seq/protocols.fib:110](../../../lib/fib/seq/protocols.fib#L110) |
-| `vec-build-first` | defun | [lib/fib/seq/protocols.fib:91](../../../lib/fib/seq/protocols.fib#L91) |
-| `vec-build-push` | defun | [lib/fib/seq/protocols.fib:103](../../../lib/fib/seq/protocols.fib#L103) |
-| `vec-from-spans` | defun | [lib/fib/seq/protocols.fib:74](../../../lib/fib/seq/protocols.fib#L74) |
+| `vec-build-done` | defun | [lib/fib/seq/protocols.fib:114](../../../lib/fib/seq/protocols.fib#L114) |
+| `vec-build-first` | defun | [lib/fib/seq/protocols.fib:95](../../../lib/fib/seq/protocols.fib#L95) |
+| `vec-build-push` | defun | [lib/fib/seq/protocols.fib:107](../../../lib/fib/seq/protocols.fib#L107) |
+| `vec-from-spans` | defun | [lib/fib/seq/protocols.fib:78](../../../lib/fib/seq/protocols.fib#L78) |
 | `vseq-of` | defun | [lib/fib/seq/vseq.fib:7](../../../lib/fib/seq/vseq.fib#L7) |
 | `zip` | defun | [lib/fib/seq/cursors.fib:323](../../../lib/fib/seq/cursors.fib#L323) |
 | `zipmap` | defun | [lib/fib/seq/cursors.fib:330](../../../lib/fib/seq/cursors.fib#L330) |
