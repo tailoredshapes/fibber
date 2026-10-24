@@ -1,0 +1,17 @@
+;; spec:   stdlib §2.1 rule 2 (a fused chain with a filter: a buffer of 32 filled in place, spans made the Vec by vec-from-spans)
+;; expect: accept
+;; result: 3000
+;; audit:  clean
+;; allocs: <= 8010
+;; roots:  ../../lib support
+;; covers: filterv
+;; The builder of a fused filter chain (lib/fib/seq/protocols.fib, VecSink) makes its array of spans only at the first full buffer and
+;; makes a walk of 32 or fewer a Vec of its buffer, with no copy. 1000 `filterv` over a Vec of 8 that keep 3 allocate 8 objects each at
+;; most: the builder and its three cells, the buffer and the room it is given at the second element, the empty array of spans, the Vec
+;; (measured 8004). The stage 2 and library of f748147c allocate 10 each (an array of 4 spans and its first span made up front, a buffer
+;; of 32 and its trimmed copy, the array of one span handed to vec-from-spans): 10004. The result is the number of elements kept.
+(ns main (:use fib.core fib.seq fib.coll))
+
+(defun main () -> i64
+  (let ((eight (mapv (fn (i: i64) (* i 3)) (range 8))))
+    (loop ((k 0) (n 0)) (if (< k 1000) (recur (+ k 1) (+ n (count (filterv (fn (x: i64) (< (rem (+ x k) 8) 3)) eight)))) n))))

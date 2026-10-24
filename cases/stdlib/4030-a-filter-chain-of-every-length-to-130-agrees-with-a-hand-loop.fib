@@ -1,0 +1,24 @@
+;; spec:   stdlib §2.1 rule 2 (a fused chain with a filter: a buffer of 32 filled in place, spans made the Vec by vec-from-spans)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: filterv
+;; Every output length of a fused filter chain from 0 to 130, each side of the span boundaries 32, 64 and 96 included, is compared with
+;; a hand loop, then the Vec it built is updated by conj and assoc while the hand loop's twin is kept and compared again: a builder
+;; whose buffer became the Vec's own array must not be written through by the update of a shared version, and must read back whole.
+(ns main (:use fib.core fib.seq fib.coll))
+
+(defun by-hand (v: (Vec i64) m: i64) -> (Vec i64)
+  (loop ((i 0) (out [])) (if (< i (count v)) (recur (+ i 1) (if (< (nth v i) m) (conj out (nth v i)) out)) out)))
+
+(defun main () -> i64
+  (let ((src (mapv (fn (i: i64) i) (range 130))))
+    (loop ((m 0) (bad 0))
+      (if (<= m 130)
+          (let ((got (filterv (fn (x: i64) (< x m)) src)) (want (by-hand src m)))
+            (let ((more (conj got -1)) (set0 (if (= m 0) got (assoc got 0 -5))))
+              (recur (+ m 1) (if (and (= got want) (= more (conj want -1)) (= (count set0) m)
+                                      (or (= m 0) (and (= (nth set0 0) -5) (= (nth got 0) 0))))
+                               bad (+ bad 1)))))
+          bad))))

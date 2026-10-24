@@ -88,18 +88,21 @@
                           (fib.prelude/vec-of-leaves spans k tail cnt)
                           (trap "vec-from-spans: the spans do not hold cnt elements")))))))
 ;; A Vec built element by element from its first, for a walk of unknown length written out in line: the loops the expander
-;; writes for a fused chain with a filter, remove, keep, take or take-while step (compiler/expand/fuseflow.fib). A buffer of 32
-;; is filled in place; each full one goes on an array of spans that doubles; vec-from-spans makes the Vec of them, no copy.
+;; writes for a fused chain with a filter, remove, keep, take or take-while step (compiler/expand/fuseflow.fib). A buffer is filled in
+;; place up to 32 (array-push!, which gives it room for 32 at the second element); each full one goes on an array of spans, made at the
+;; first full buffer and doubled when full; vec-from-spans makes the Vec of them, no copy. A walk of 32 or fewer makes the buffer, its
+;; one span, the Vec (vec-from-array, what vec-from-spans does with one span), with no array of spans and no trimmed copy.
 (defstruct (VecSink a) :private (buf: (Cell (Array a)) n: (Cell i64) spans: (Cell (Array (Array a)))))
 
 (defun vec-build-first (x: a) -> (VecSink a)
-  (VecSink (cell (array 32 x)) (cell 1) (cell (array 4 (array 1 x)))))
+  (let ((b (array 1 x)))
+    (VecSink (cell b) (cell 1) (cell (array 0 b)))))
 
-;; the full buffer as span k, the array of spans doubled first when it is full
+;; the full buffer as span k, the array of spans made or doubled first when it is full
 (defun sink-span :private (b: (VecSink a) k: i64) -> unit
   (let ((sc (. b spans)) (full @(. b buf)))
     (do (if (= k (array-len @sc))
-            (let ((bigger (cell (array (shl k 1) full))))
+            (let ((bigger (cell (array (max 4 (shl k 1)) full))))
               (do (dotimes (i k) (array-set! &bigger i (array-get @sc i))) (set! sc @bigger)))
             ())
         (array-set! &sc k full))))
@@ -107,15 +110,17 @@
 (defun vec-build-push (b: (VecSink a) x: a) -> unit
   (let ((n @(. b n)) (buf (. b buf)))
     (do (if (= (bit-and n 31) 0)
-            (do (sink-span b (- (shr n 5) 1)) (set! buf (array 32 x)))
-            (array-set! &buf (bit-and n 31) x))
+            (do (sink-span b (- (shr n 5) 1)) (set! buf (array 1 x)))
+            (array-push! &buf x))
         (set! (. b n) (+ n 1)))))
 
 (defun vec-build-done (b: (VecSink a)) -> (Vec a)
-  (let ((n @(. b n)) (k (shr (- @(. b n) 1) 5)) (f (+ (bit-and (- @(. b n) 1) 31) 1)) (buf @(. b buf)) (sc @(. b spans)))
-    (let ((out (cell (array (+ k 1) (if (= f 32) buf (array-copy buf 0 f))))))
-      (do (dotimes (i k) (array-set! &out i (array-get sc i)))
-          (vec-from-spans @out n)))))
+  (let ((n @(. b n)) (k (shr (- @(. b n) 1) 5)) (buf @(. b buf)))
+    (if (= k 0)
+        (fib.prelude/vec-from-array buf)
+        (let ((sc @(. b spans)) (out (cell (array (+ k 1) buf))))
+          (do (dotimes (i k) (array-set! &out i (array-get sc i)))
+              (vec-from-spans @out n))))))
 (impl (Reducible a) (Option a)
   (each-while (self k) (match self (nil true) ((some x) (k x))))
   (size (self) (match self (nil 0) ((some _) 1))))
