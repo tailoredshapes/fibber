@@ -1,0 +1,25 @@
+;; compiler/tests/emit/nomatch/nomatch.fib: the matches check.sh reads the lIR of (see there). main answers 0 when every value is right.
+(defenum Shape (Circle r: i64) (Square s: i64) (Tri a: i64 b: i64))
+
+;; exhaustive over an enum: no value falls through
+(defun area (s: Shape) -> i64
+  (match s ((Circle r) (* 3 (* r r))) ((Square x) (* x x)) ((Tri a b) (+ a b))))
+
+;; a guarded clause counts for nothing; the unguarded clauses are exhaustive
+(defun guarded (s: Shape) -> i64
+  (match s ((Circle r) :when (> r 10) 1) ((Circle _) 2) ((Square _) 3) ((Tri _ _) 4)))
+
+;; exhaustive over an Option and a bool
+(defun opt (o: (Option i64) b: bool) -> i64
+  (match o ((some x) (match b (true x) (false (- 0 x)))) (nil 0)))
+
+;; a refutable let is a match whose `_` traps with its own message
+(defun pick (s: Shape) -> i64
+  (let (((Circle r) s)) r))
+
+(defun main () -> i64
+  (let ((sum (+ (area (Circle 2)) (area (Square 3)) (area (Tri 4 5))
+                (guarded (Circle 11)) (guarded (Circle 1)) (guarded (Square 1)) (guarded (Tri 1 1))
+                (opt (some 5) true) (opt (some 5) false) (opt nil true)
+                (pick (Circle 7)))))
+    (- sum (+ 12 9 9 1 2 3 4 5 -5 0 7))))

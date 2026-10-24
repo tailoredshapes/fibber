@@ -33,7 +33,7 @@ to be written down, not an edit of the list.
 (limit "every .fib file of compiler/ and lib/ outside the tests has fewer than 500 lines (shrink-only allow-list)"
   (file-lengths repo ["compiler/**.fib" "lib/**.fib" "!compiler/tests/**" "!compiler/emit/runtime.fib"])
   499
-  ["compiler/expand/ctx.fib=525" "lib/prelude.fib=698"]
+  ["compiler/expand/ctx.fib=525" "lib/prelude.fib=697"]
   (plant-file "compiler/emit/zz-plant.fib" (join "\n" (mapv (fn (i: i64) ";; a line") (range 600))))
   (plant "compiler/expand/ctx.fib" "\n;; one line more than the list allows\n"))
 

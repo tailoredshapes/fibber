@@ -188,6 +188,16 @@
                    (nil plain))
               (nx/call "fib.raise-c" [(nx/string msg)]))))
 
+;; The block no clause of a match matched, or that an irrefutable binding failed into, when no value can reach it: the checker
+;; proved the clauses exhaustive (types.exhaust, on every def, defun, method and macro body; types.elab's matches end in `_`) or
+;; the binding irrefutable (types.lower.pattern `irrefutable`), so it is `unreachable` and LLVM may drop the last test. A macro
+;; module and live mode keep the trap: an expansion fails with a position, and a fault of a swap shows as a trap. Reached
+;; anyway only by a value no constructor wrote (an `unsafe` store over an object): undefined behaviour (spec/types.md §2.6).
+(defun lcx-no-match (cx: LowerCx) -> unit
+  (if (or @(. (. cx p) macro-module) (. (. cx p) live))
+      (lcx-trap-c cx "no match clause matched")
+      (fb-term (. cx b) (nx/unreachable))))
+
 ;; Runs `f` with failures fatal (a region that leaves something moved from).
 (defun fatal-while (cx: LowerCx f: (fn () (Result V str))) -> (Result V str)
   (let ((f0 @(. cx fatal)))

@@ -1,0 +1,34 @@
+;; spec:   stdlib §5 (nth), types §8.3 (the Vec layout: a trie and a tail of the last elements; a flat Vec is all tail)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: nth vec-nth span-count
+;; vec-nth computes tailoff = cnt - len(tail) and reads the tail at i - tailoff with wrapping subtractions (the Vec invariant
+;; bounds both, docs/design/lir-facts.md 9). Every edge of that arithmetic, read through the protocol (`nth`) and the prelude
+;; function (`vec-nth`): on a flat Vec of 1000 (mapv over a range: one span), the first and last element; on the trie a shared
+;; conj makes of it (1001 elements: 31 full leaves, a tail of 9), the last element of the trie (tailoff - 1), the first of the
+;; tail (tailoff), the last; and the flat Vec still read whole after the conj shared it. Checks (bits): 0 the shapes are as
+;; said, 1 flat edges, 2 trie edges, 3 the kept flat Vec is whole, 4 a Vec of 33 from vec (flat: its tail holds all 33), 5 every
+;; element of the trie. A tail read at i - tailoff off by one gives the neighbour (bits 2, 4, 5); a tailoff of cnt reads the
+;; trie for tail elements.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun both (v: (Vec i64) i: i64) -> i64
+  (let ((a (nth v i)) (b (vec-nth v i)))
+    (if (= a b) a -999999)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (v (mapv (fn (i: i64) (* i 3)) (range 1000))))
+    (let ((t (conj v -1))
+          (s (vec (range 33))))
+      (let ((tailoff (* 31 32)))
+        (do (check c (and (= (span-count v) 1) (> (span-count t) 1) (= (count t) 1001)))
+            (check c (and (= (both v 0) 0) (= (both v 999) 2997) (= (both v 500) 1500)))
+            (check c (and (= (both t (- tailoff 1)) (* 3 (- tailoff 1))) (= (both t tailoff) (* 3 tailoff))
+                          (= (both t 999) 2997) (= (both t 1000) -1) (= (both t 0) 0)))
+            (check c (loop ((i 0)) (if (< i 1000) (if (= (both v i) (* i 3)) (recur (+ i 1)) false) true)))
+            (check c (and (= (both s 31) 31) (= (both s 32) 32) (= (both s 0) 0)))
+            (check c (loop ((i 0)) (if (< i 1000) (if (= (both t i) (* i 3)) (recur (+ i 1)) false) true)))
+            (checks-result c))))))
