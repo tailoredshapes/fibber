@@ -73,9 +73,8 @@
     @c))
 
 ;; Whether the array in c has no other holder: the test fib.unique? makes before an in-place write (types 2.13.1), count 1 and none of
-;; SHARED IMMORTAL STACK HAS-WEAK (flag bits 0-3), read from the header of types 8.2 with no count operation (the array is the cell's
-;; content, at 16 past the cell's own header: `@c` would acquire it and release it again). A flat Vec asks it to
-;; choose the trie over a copy of its whole array. A builtin would be clearer, but the seed that builds stage 2 compiles this prelude.
+;; SHARED IMMORTAL STACK HAS-WEAK (flag bits 0-3), read from the header of types 8.2 with no count operation (the cell's content, at 16, not
+;; `@c`, an acquire). A flat Vec asks it to choose the trie over a copy of its whole array. A builtin would be clearer, but the seed compiles this.
 (defun array-sole? :private (c: (Cell (Array a))) -> bool
   (unsafe (let ((p (load-ptr (ptr+ (raw c) 16)))) (and (= (load-i64 p) 1) (= (bit-and (sext i64 (load-i32 (ptr+ p 12))) 15) 0)))))
 
@@ -116,18 +115,15 @@
            (VecOf (+ cnt 1) shift (some (vnode-push shift r tailoff leaf)) (array 1 x)))))))
 
 ;; A tail of under 32, or a flat Vec's whose array nobody else holds, grows in place (array-push! doubles it); a full tail of a trie, or
-;; of a shared flat Vec of 32, becomes a leaf; a shared flat Vec of more becomes a trie first, once, so the next shared conj copies a path.
-;; The rest is vec-conj-slow, out of line (lair never inlines a name ending -slow), so that the in-place push is small enough to inline.
+;; of a shared flat Vec of 32, becomes a leaf; a shared flat Vec of more becomes a trie first, once (vec-conj-slow: lair never inlines -slow).
 (defun vec-conj (v: (Vec a) x: a) -> (Vec a)
   (match v
-    ((VecEmpty) (vec-one-slow x))
+    ((VecEmpty) (VecOf 1 5 nil (array 1 x)))
     ((VecOf cnt shift root tail)
      (let ((t (array-len tail)) (c (cell tail)))
        (if (or (< t 32) (and (nil? root) (array-sole? c)))
            (do (array-push! &c x) (VecOf (+ cnt 1) shift root @c))
            (vec-conj-slow cnt shift root @c x))))))
-
-(defun vec-one-slow :private (x: a) -> (Vec a) (VecOf 1 5 nil (array 1 x)))
 (defun vec-conj-slow :private (cnt: i64 shift: i64 root: (Option (VNode a)) tail: (Array a) x: a) -> (Vec a)
   (if (> (array-len tail) 32) (vec-conj (vec-trie-of tail) x) (vec-push-tail cnt shift root tail x)))
 
@@ -136,24 +132,15 @@
     ((VecEmpty) 0)
     ((VecOf cnt _ _ _) cnt)))
 
-;; An index in the tail (every index of a flat Vec) is read in line; the rest, and the traps, are vec-nth-slow, out of line.
+;; An index in the tail (every index of a flat Vec) is read in line; a trie's and the traps are vec-nth-slow, out of line.
 (defun vec-nth (v: (Vec a) i: i64) -> a
   (match v
     ((VecOf cnt _ _ tail) :when (and (< i cnt) (>= i (- cnt (array-len tail)))) (array-get tail (- i (- cnt (array-len tail)))))
     (_ (vec-nth-slow v i))))
-
 (defun vec-nth-slow :private (v: (Vec a) i: i64) -> a
   (match v
-    ((VecEmpty) (trap "nth: index out of range"))
-    ((VecOf cnt shift root tail)
-     (let ((tailoff (- cnt (array-len tail))))
-       (if (or (< i 0) (>= i cnt))
-           (trap "nth: index out of range")
-           (if (>= i tailoff)
-               (array-get tail (- i tailoff))
-               (match root
-                 (nil (trap "nth: index out of range"))
-                 ((some r) (vnode-get r shift i)))))))))
+    ((VecOf cnt shift (some r) _) :when (and (>= i 0) (< i cnt)) (vnode-get r shift i))
+    (_ (trap "nth: index out of range"))))
 
 ;; node, a branch at level, with element i replaced by x: one new array and one new node for each level of
 ;; the path from the root to the leaf, the other kids shared.
@@ -202,33 +189,23 @@
                   (match (vnode-take r shift i)
                     ((Pair e r2) (Pair e (VecOf cnt shift (some r2) tail))))))))))))
 
-;; (vec-assoc v i x) is v with element i replaced by x (stdlib §2.5): the path from the root to the leaf is
-;; copied, or only the tail when i is in the tail, so O(log32 n) objects, and v is unchanged. i = the count
-;; appends, as Clojure's assoc does; an index below zero or above the count traps `assoc: index out of range`.
-;; A flat Vec's array is written in place when nobody else holds it, else the Vec becomes a trie first (once).
-;; An index in the tail (every index of a flat Vec) is written in line; the rest is vec-assoc-slow, out of line.
+;; (vec-assoc v i x) is v with element i replaced by x (stdlib §2.5): the path from the root to the leaf is copied, or only the tail when i is in
+;; the tail, so O(log32 n) objects, and v is unchanged; i = the count appends (Clojure's assoc), below zero or above traps `assoc: index out of
+;; range`. A flat Vec's array (an index in the tail: in line) is written in place when unique, else it becomes a trie first; the rest is -slow.
 (defun vec-assoc (v: (Vec a) i: i64 x: a) -> (Vec a)
   (match v
     ((VecOf cnt shift root tail) :when (and (< i cnt) (>= i (- cnt (array-len tail))))
      (let ((t (array-len tail)) (c (cell tail)))
        (if (or (<= t 32) (array-sole? c))
            (do (array-set! &c (- i (- cnt t)) x) (VecOf cnt shift root @c))
-           (vec-assoc-slow (vec-trie-of @c) i x))))
+           (vec-assoc (vec-trie-of @c) i x))))
     (_ (vec-assoc-slow v i x))))
-
 (defun vec-assoc-slow :private (v: (Vec a) i: i64 x: a) -> (Vec a)
   (let ((n (vec-count v)))
-    (if (= i n)
-        (vec-conj v x)
-        (if (or (< i 0) (> i n))
-            (trap "assoc: index out of range")
-            ;; the trie clause names the root's payload in the pattern, so that it is a field of v's own slot: it can be stolen
+    (if (= i n) (vec-conj v x)
+        (if (or (< i 0) (> i n)) (trap "assoc: index out of range")
+            ;; the root's payload is named in the pattern, so that it is a field of v's own slot: it can be stolen
             (match v
-              ((VecOf cnt shift root tail) :when (>= i (- cnt (array-len tail)))
-               (let ((t (array-len tail)) (c (cell tail)))
-                 (if (or (<= t 32) (array-sole? c))
-                     (do (array-set! &c (- i (- cnt t)) x) (VecOf cnt shift root @c))
-                     (vec-assoc-slow (vec-trie-of @c) i x))))
               ((VecOf cnt shift (some r) tail) (VecOf cnt shift (some (vnode-assoc r shift i x)) tail))
               (_ (trap "assoc: index out of range")))))))
 
