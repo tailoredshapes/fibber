@@ -58,14 +58,18 @@
                                  pos)
                          (unit pos) pos)] pos)))
 
+;; `walk`, after the call as it was for a walk that never ends (`w` below zero), unless the step is known not to be zero
+;; (expand.fusegen `fg-step-nonzero?`).
+(defun range-or-fallback :private (nonzero: bool w: Stx fallback: Stx walk: Stx pos: Pos) -> Stx
+  (if nonzero walk (fg-if (fg-pcall "<" [w (int 0 pos)] pos) fallback walk pos)))
+
 ;; The rewrite of a chain of `map` steps over the range call that is its source; `fallback` makes the call as it was with
 ;; its source replaced by the gensym the range is bound to.
 (defun fuse-range-rewrite (ctx: ExpandCtx ch: Chain pos: Pos fallback: (fn ((Vec Stx)) Stx)) -> Stx
   (let ((nm (range-names ctx pos)) (stages (fg-map-fns (. ch steps))))
     (let ((r (. nm r)) (n (. nm n)))
       (fg-let [(fg-pair r (nth (. ch sources) 0) pos) (fg-pair (. nm w) (call "fib.seq/range-walk-kind" [r] pos) pos)]
-              (fg-if (fg-pcall "<" [(. nm w) (int 0 pos)] pos)
-                     (fallback [r])
+              (range-or-fallback (fg-step-nonzero? (nth (. ch sources) 0)) (. nm w) (fallback [r])
                      (fg-if (fg-pcall "=" [(. nm w) (int 0 pos)] pos)
                             (call (prelude-name "vec-empty") (vec-empty) pos)
                             (fg-let [(fg-pair n (call "fib.seq/count" [r] pos) pos)

@@ -158,19 +158,19 @@
                              zeros))))
 
 ;; The source asked: the call as it was when it has no spans or is a range that never ends, nothing when it is empty.
-(defun source-choice :private (fl: Flow fallback: Stx) -> Stx
+;; A range whose step is known not to be zero (expand.fusegen `fg-step-nonzero?`) has no such branch.
+(defun source-choice :private (fl: Flow fallback: Stx nonzero: bool) -> Stx
   (let ((pos (. fl pos)) (empty (fg-pcall "vec-empty" (vec-empty) pos)) (s (. fl s)) (w (. fl sc)))
-    (fg-let [(fg-pair w (call (if (. fl range) "fib.seq/range-walk-kind" "fib.seq/span-count") [s] pos) pos)]
-            (fg-if (fg-pcall "<" [w (int 0 pos)] pos)
-                   fallback
-                   (fg-if (fg-pcall "=" [w (int 0 pos)] pos)
-                          empty
-                          (if (. fl range)
-                              (fg-let [(fg-pair (. fl hi) (call "." [s (sym "hi" pos)] pos) pos) (fg-pair (. fl by) (call "." [s (sym "by" pos)] pos) pos)]
-                                      (first-loop fl) pos)
-                              (first-loop fl))
-                          pos) pos)
-            pos)))
+    (let ((walk (fg-if (fg-pcall "=" [w (int 0 pos)] pos)
+                       empty
+                       (if (. fl range)
+                           (fg-let [(fg-pair (. fl hi) (call "." [s (sym "hi" pos)] pos) pos) (fg-pair (. fl by) (call "." [s (sym "by" pos)] pos) pos)]
+                                   (first-loop fl) pos)
+                           (first-loop fl))
+                       pos)))
+      (fg-let [(fg-pair w (call (if (. fl range) "fib.seq/range-walk-kind" "fib.seq/span-count") [s] pos) pos)]
+              (if (and (. fl range) nonzero) walk (fg-if (fg-pcall "<" [w (int 0 pos)] pos) fallback walk pos))
+              pos))))
 
 ;; The rewrite of a chain with steps that are not all `map`s over its one source; `fallback` makes the call as it was with
 ;; its source replaced by the gensym the source is bound to.
@@ -179,6 +179,6 @@
     (let ((fl (Flow ctx (. ch steps) (. ch range) pos (nth g 0) (nth g 1) (nth g 2) (nth g 3) (take-ns (. ch steps))))
           (empty (fg-pcall "vec-empty" (vec-empty) pos)))
       (fg-let [(fg-pair (nth g 0) (nth (. ch sources) 0) pos)]
-              (loop ((t (- (count (. fl ns)) 1)) (acc (source-choice fl (fallback [(nth g 0)]))))
+              (loop ((t (- (count (. fl ns)) 1)) (acc (source-choice fl (fallback [(nth g 0)]) (and (. ch range) (fg-step-nonzero? (nth (. ch sources) 0))))))
                 (if (< t 0) acc (recur (- t 1) (fg-if (fg-pcall "<=" [(nth (. fl ns) t) (int 0 pos)] pos) empty acc pos))))
               pos))))

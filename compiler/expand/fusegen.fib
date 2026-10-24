@@ -23,6 +23,20 @@
 ;; top form down to the one that reads the sources; whether the one source is a `range` call (its type is a Range).
 (defstruct Chain (steps: (Vec Step) sources: (Vec Stx) depth: i64 range: bool))
 
+;; Whether the `range` call `src` (a chain's source, `range-call?` of expand.fuseinline) has a step the program text fixes and that
+;; is not zero: `(range n)`, whose step is 1, or a step that is an integer or float literal other than zero (`(range a b)` is the
+;; prelude's `(range-by a b 1)`). Its walk kind is then never -1 (a step of zero, a walk that never ends), so the branch that takes
+;; the call as it was for that kind is never run, and the rewrite leaves it out: written there, the stage literal is an argument of
+;; the library's call, an escaping use (types §6.5), which makes what it captures owned and counted on every path.
+(defun fg-step-nonzero? (src: Stx) -> bool
+  (let ((items (match (. src kind) ((SList xs) xs) (_ []))))
+    (cond (= (count items) 2) true
+          (= (count items) 4) (match (. (nth items 3) kind)
+                                ((SInt v _) (not (= v 0)))
+                                ((SFlt v _) (and (= v v) (not (= v 0.0))))
+                                (_ false))
+          :else false)))
+
 ;; Whether every step is a `map`: the output has one element per source element.
 (defun fg-maps-only? (steps: (Vec Step)) -> bool
   (loop ((i 0))
