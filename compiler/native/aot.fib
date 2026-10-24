@@ -3,7 +3,8 @@
 (ns native.aot
   (:use lir.diag lir.types lir.lit lir.ast native.error native.link native.linkstatic native.linkwasm)
   (:require [lir.check :as check] [native.lower :as nl] [native.owned :as owned] [native.target :as target] [native.passes :as passes]
-            [llvm.target :as lt] [llvm.core :as core] [llvm.ffi :as ffi] [native.timing :as timing]))
+            [llvm.target :as lt] [llvm.core :as core] [llvm.ffi :as ffi] [native.timing :as timing]
+            [llvm.passes :as lp] [llvm.bitcode :as bitcode]))
 
 
 ;; What `aot-emit` produces (aot.rs `Output`).
@@ -64,6 +65,28 @@
                           ((Ok o) (let ((b (finish o host out (. opts opt-level))))
                                     (do (owned/owned-dispose o) b))))))
                  (do (target/machine-dispose host) r)))))))
+
+;; --- the ThinLTO spike (FIB_LIRO_THIN=1, docs/design/compile-performance.md): a unit as ThinLTO bitcode with its summary instead of an
+;; object. `thinlto-pre-link<On>` is the per-unit half of the pipeline; the importing, the rest of `default<On>` and code generation run at
+;; the link (the linker's LTO plugin, with its own cache).
+(defun thin-bitcode :private (o: owned/Owned host: target/Machine level: i64) -> (Result (Array i8) LairError)
+  (let ((t (timing/started))
+        (r (lp/run-pipeline (. o module) (. host tm) (str "thinlto-pre-link<O" (max 1 (min level 3)) ">,embed-bitcode<thinlto;emit-summary>"))))
+    (do (timing/report "llvm.optimize" t)
+        (match r
+          ((Err m) (Err (ErrBackend m)))
+          ((Ok _) (match (bitcode/embedded-object (. o module))
+                    ((some bytes) (Ok bytes))
+                    (nil (Err (ErrBackend "thinlto: no embedded bitcode")))))))))
+
+(defun aot-emit-thin (m: LModule name: str opts: AotOptions) -> (Result (Array i8) LairError)
+  (match (target/machine-target (. opts opt-level))
+    ((Err e) (Err e))
+    ((Ok host) (let ((r (match (nl/lower m name (. host triple) (. host data-layout))
+                          ((Err e) (Err e))
+                          ((Ok o) (let ((b (thin-bitcode o host (. opts opt-level))))
+                                    (do (owned/owned-dispose o) b))))))
+                 (do (target/machine-dispose host) r)))))
 
 ;; The canonical directories of `dirs`, or the first refusal as a backend error.
 (defun library-dirs (dirs: (Vec str)) -> (Result (Vec str) LairError)
