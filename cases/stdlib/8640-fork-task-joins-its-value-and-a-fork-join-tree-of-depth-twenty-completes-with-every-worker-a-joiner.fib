@@ -9,7 +9,9 @@
 ;; and sums right: with W workers all of them are joiners most of the time, so a join that parked instead of helping (running the joined
 ;; task itself, or other tasks meanwhile) would deadlock the pool with W tasks waiting on children nobody runs (scripts/mutant-sched.sh
 ;; `park-not-help` hangs this case). A chain of 5000 nested forks and joins completes too (a joiner runs an unstarted child itself, so the chain nests on
-;; one worker's stack as the same recursion without tasks would).
+;; one worker's stack as the same recursion without tasks would). In a catching program a non-worker joiner may run the task it joins
+;; itself (docs/design/parallelism.md 3.1, rt/park.lir fib.sched-claim-run), so the first task answers where it ran: 41 on a worker, 40
+;; on the joiner, and `join` must give that value back.
 (ns main (:use fib.core fib.parallel fib.os tl.check))
 
 (defun tree (depth: i64 at: i64) -> i64
@@ -29,9 +31,9 @@
 
 (defun main () -> i64
   (let [c (checks)
-        t (fork-task (fn () (if (pool-worker?) 41 0)))
+        t (fork-task (fn () (if (pool-worker?) 41 40)))
         v (join t)]
-    (do (check c (= v 41))
+    (do (check c (or (= v 41) (= v 40)))
         (check c (not (pool-worker?)))
         (check c (pool-started?))
         (check c (>= (pool-workers) 1))
