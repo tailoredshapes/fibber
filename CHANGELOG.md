@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.19
+
+- Fusion covers more chains: a `map` over a `range` call is a counted loop over the range with the stage in line, and
+  chains of `filter`, `remove`, `keep`, `take`, `take-while` and `filterv` (over a Vec, an Array or a range, with or
+  without `map` stages) are one loop that builds the result directly, with no intermediate sequence.
+- `:lib` on macOS: `fibc run` finds a library in DYLD_FALLBACK_LIBRARY_PATH (else /usr/local/lib and /usr/lib) and in
+  `$HOMEBREW_PREFIX/lib`, instead of a Homebrew path compiled into `fibc`; when a library is not found and
+  HOMEBREW_PREFIX is unset (ssh commands, launchd), the message says so. The darwin `fibc` again names no
+  build-machine path. `scripts/mac-check.sh` step 8 checks it.
+
 ## 0.1.18
 
 - Persistent collections keep their uniqueness, so idiomatic updates are in place: a call that reads a value in a sibling
