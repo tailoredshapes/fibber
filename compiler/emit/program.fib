@@ -22,8 +22,9 @@
 ;; its value is an object to make immortal, and its slot (`def.slot.N`; `live.d.NAME` in live mode, `live-def-slot`). Rust: inits.rs:42 Init
 (defstruct Init (def-id: i64 module: i64 body: str object: bool slot: str))
 
-;; Where a STACK literal's code was made: the instance of its owner and the literal.
-(defstruct StackLit (owner: Inst lit: i64))
+;; Where a STACK literal's code was made: the instance of its owner and the literal; whether its body is small enough for a borrowed
+;; form (emit.lower.objects `small-body?`).
+(defstruct StackLit (owner: Inst lit: i64 small: bool))
 
 ;; A binding of a body instance (its literals' code shares the instance).
 (defstruct LetKey (inst: Inst binding: i64))
@@ -296,6 +297,7 @@
 (defun program-request-borrowed (p: Program code: str) -> (Option str)
   (match (get @(. p stack-lits) code)
     (nil nil)
+    ((some sl) :when (not (. sl small)) nil)
     ((some sl) (let ((name (str code ".borrow")))
                  (do (when (not (contains? @(. p borrowed) name))
                        (do (set! (. p borrowed) (conj @(. p borrowed) name))

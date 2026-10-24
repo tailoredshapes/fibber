@@ -197,6 +197,16 @@
                    (Ok v))))
            (. own captures)))
 
+;; The literal bodies past which no borrowed form of the code is made (emit.program `program-request-borrowed`), in expressions: a larger
+;; one is not put in line, so its call saves only the flag test of the release.
+(def max-borrowed-nodes: i64 64)
+
+(defun small-body? :private (e: Expr) -> bool
+  (loop ((stack [e]) (n 0))
+    (match (peek stack)
+      (nil true)
+      ((some x) (if (> n max-borrowed-nodes) false (recur (into (pop stack) (expr-children x)) (+ n 1)))))))
+
 ;; A `fn` literal: its closure object (§8.4), heap or stack as the plan says, captures taken as their passes say.
 ;; Rust: lower/objects.rs:174 LowerCx::make_fn
 (defun lcx-make-fn (cx: LowerCx e: Expr) -> (Result V str)
@@ -214,7 +224,7 @@
                      (do (match (get (. (. cx own) allocs) (. e id))
                            ((some (AlStack)) (do (set! (. cx closure-slots) (conj @(. cx closure-slots) (nx/operand-name p)))
                                                  (set! (. (. cx p) static-heads) (conj @(. (. cx p) static-heads) code))
-                                                 (set! (. (. cx p) stack-lits) (assoc @(. (. cx p) stack-lits) code (StackLit (. cx inst) (. e id))))))
+                                                 (set! (. (. cx p) stack-lits) (assoc @(. (. cx p) stack-lits) code (StackLit (. cx inst) (. e id) (small-body? e))))))
                            (_ ()))
                          (let ((codep (lcx-gep cx sname p slot-closure-code)))
                            (do (fb-stmt (. cx b) (nx/store (nx/global code) codep nil))
