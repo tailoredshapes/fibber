@@ -128,7 +128,7 @@ Gain figures are what the measurements above support; those marked (est.) are mo
    cutter's 12.4 to 4.2 s was exactly this done by hand. Risk: effect order and traps (the existing rule "a stage is rewritten only if its
    argument is a symbol, literal or fn form" already pins order, case 831); test: the law cases 828 to 830 and 4206/4207 against the bound-seq
    reading, plus an `allocs: 0` bound.
-3. **A flat representation for scalar Vecs** (new variant `VecFlat cnt arr` of `Vec`, used when built by `vec`/`into`/`mapv`/`zeros` of known
+3. **A flat representation for scalar Vecs** (built, section 8, as a VecOf with no trie rather than a new variant; new variant `VecFlat cnt arr` of `Vec`, used when built by `vec`/`into`/`mapv`/`zeros` of known
    size or by `conj` from empty; `nth` = bounds check + load; `assoc`/`conj` on a unique value = `array-set!`/`array-push!`; a shared `assoc`
    converts to the trie once, O(n), then stays a trie; `freeze`/printing/equality/hash read through `nth`). (est.) `nth` 3.4 to ~1 ns, `assoc` 20
    to ~2, `conj` 11.5 to ~3, `mapv` 8 to ~1: on the cutter the nth share (~42%) and builder share (~30%) of the excess shrink by two thirds,
@@ -136,8 +136,8 @@ Gain figures are what the measurements above support; those marked (est.) are mo
    (`assoc` on a shared 1 M-element flat Vec) pays one O(n) conversion where the trie paid O(log n); the lazy conversion makes it once per
    Vec, not per update. Every `match` on `VecOf` in `lib/prelude.fib` (about 25 sites: `vec-nth`, `vec-assoc`, `vec-conj`, `vec-pop`, `vec-each-from`,
    slicing, the sorts) gains an arm. Test: the 4000 to 4017 in-place cases, the differential cases against Clojure's `PersistentVector` already
-   used for the stdlib, a generator that interleaves flat and trie versions of one Vec and compares every version after every update. Large: design
-   note only, not started.
+   used for the stdlib, a generator that interleaves flat and trie versions of one Vec and compares every version after every update. Built:
+   section 8.
 4. **Unique-accumulator loops compile to an array-backed builder** (the owner's "persistent to mutable at compile time"). Needs 3 to be free at
    the exit: `loop [v (init)]` whose `v` is used only by `conj/assoc/nth/count` and escapes only through the loop result is thawed to an
    array and length at entry, mutated, and wrapped at exit (O(1) with the flat variant, O(n/32) with the trie). If `v` starts from a parameter
@@ -196,3 +196,126 @@ Implemented: the `first` row of T (`compiler/expand/fusetab.fib`, `spec/stdlib.m
 Not established: the sprite phase's split; how the allerbees session built its 4.2 s binary; why `FIB_LIRO_IMPORT=200 FIB_LIRO_IMPORT_DEPTH=4` is
 slow; the 12.4 s pipeline version was not rebuilt; `conj`'s 9.3 objects per leaf was counted, not traced to the lines that allocate; no sampling
 profile was possible; every (est.) figure in section 5.
+
+## 8. The flat Vec (recommendation 3): decisions and what was built
+
+Status: built on branch `vec-flat` from `c68837d9`. Measurements are in 8.3; every claim of 8.1 is checked by a case named there.
+
+### 8.1 Decisions
+
+**Representation: a VecOf with no trie, not a new variant.** types §8.3 ("Vector patterns", Decided, owner 2026-09-28) fixes the pattern compiler's
+core view of `Vec` as `VecEmpty` or `(VecOf cnt shift root tail)` over `VNode` arrays, element `i` read as `tail[i - (cnt - len tail)]` when
+`i >= cnt - len tail`; `rt/vec.lir` (`fib.vec-elem-ptr`, `fib.vec-drop`, `fib.vec-slice-array`), `rt/vecbuild.lir` and `compiler/emit/macros/abi.fib`
+read the same view. A `VecFlat cnt arr` variant would change that Decided layout (the spec, the pattern compiler, the runtime and the macro ABI
+together). A VecOf whose `root` is `nil` and whose `tail` holds all `cnt` elements, of any number, is already a value of that layout (every Vec of
+32 or fewer is one), so every reader handles it unchanged: `cnt - len tail` is 0 and element `i` is `tail[i]`. The invariant is now: `root` nil, the
+tail holds every element; `root` some, the tail holds the last 1 to 32 (prelude comment at `Vec`). `nth` needs no new code: for a flat Vec it is the
+bounds check, the loads of `cnt`, `tail` and its length, and the array load.
+
+**Element types: all, not scalars first.** The layout does not depend on the element; `array-push!`, `array-set!`, `array-pop!` and `array-take!`
+handle counted elements, and the conversion uses `array-copy`, which retains. A scalars-first rule would need a test of the element type that
+generic prelude code cannot make, and gains nothing.
+
+**Which builders make a flat Vec.** `vec-from-array` (the array itself, O(1); it copied into leaves), `vec-collect` (the walk's buffer grows by
+`array-push!`, doubling, and becomes the Vec's array: `vec` and `to-vec` of a source without spans), `conj` from empty while the Vec is unique,
+`mapv`/`vec`/`into []` of a `map` chain over a `range` (`compiler/expand/fuserange.fib` now writes one array of the count and calls
+`vec-from-array`), the same over a flat Vec (`fusespan`: one span in, one span out, `vec-from-spans` of one span is `vec-from-array`), `sort`
+(`vec-from-array`), and `into` onto a flat Vec (a `conj` loop). Still tries, equally valid, follow-up work: `fuseflow`'s `VecSink` (`filterv`, chains
+with `filter remove keep take take-while`), whose spans of 32 are what stdlib §2.1 describes ("spans of 32 filled in place, made the Vec by
+`vec-from-spans`"); a `map` chain over a trie (spans of 32 in, spans out); `fib.vec-build` and `fib.vec-drop` of the runtime (vector literals
+built at run time, the rest of a vector pattern).
+
+**When a flat Vec becomes a trie.** Once, by `vec-trie-of` (the old body of `vec-from-array`: O(n), 2 objects per 32 elements, elements retained),
+when an update of a flat Vec of more than 32 elements finds its array held by someone else: `assoc` (`vec-assoc`), `pop` (`vec-pop`), `update`
+and the other users of `vec-take-at`, and `conj` (a flat Vec of exactly 32 makes its array the first leaf, no copy, as before). The result is a
+trie and stays one: trie operations never make a flat Vec (a `pop` down to 32 gives a VecOf with no root and a tail of 32, the old small form). The
+old version, which someone holds, is untouched and stays flat. A flat Vec of 32 or fewer is today's small Vec and copies its at most 32 elements when
+shared. `subvec` and the other views read through `vec-nth`; a rest pattern copies through `fib.vec-drop` into a trie, as before.
+
+**The arbiter.** The test is `fib.unique?` of the array as the update sees it: the array is put in a local `cell` (after the field steal from a dead
+owned shell, stdlib §2.5 item 4) and `array-sole?` reads its header (types §8.2: count, and flag bits 0 to 3) through `raw`, `load-i64` and
+`load-i32` inside `unsafe`. Unique: `array-set!`, `array-push!`, `array-pop!`, `array-take!` in place. Not unique: the trie. The primitives still make
+their own `fib.unique?` test, so a wrong answer of `array-sole?` can only cost a copy (forced true, every shared update copies the whole array and
+stays flat: case 4025 fails on the representation and every value case passes). A builtin (`array-unique?`, tried) would be clearer, but the seed
+that builds stage 2 (v0.1.17, `SEED`) compiles `lib/prelude.fib`, and a prelude that names a builtin the seed lacks does not build
+(`unbound name array-unique?`); the builtin needs a release first.
+
+**Equality, hash, printing, freeze.** `Eq`, `Ord` and `Hash` of `fib.seq.hash`, `Show`/`Debug` of `fib.print`, and every other reader go through
+`vec-count`, `vec-nth` and `each-while`, which know nothing of the trie, so a flat Vec and a trie of the same elements are indistinguishable (case
+4022 compares `=`, `hash` and `str` across the two after every step). `freeze` marks the array IMMORTAL: `array-sole?` is then false and an update
+converts, as `array-set!` would copy. `span-count` of a flat Vec is 1 and `span-array 0` its tail; stdlib §4 (Reducible: "a Vec its leaves and tail,
+32 each but the last") holds, with no leaves.
+
+**Memory.** An array grown by `array-push!` has room for up to twice its length (`ROOMY`, types §2.13.1); the trie's overhead was two headers per 32
+elements. A Vec built from a known size (`vec-from-array`, `mapv` over a range) is exact.
+
+**Spec sentences that describe the old shapes** (reported, not changed): stdlib §2.1, the in-line rule: "writing a fresh array per span that
+`vec-from-spans` makes the Vec without a copy" (over a range it is now one array and `vec-from-array`); stdlib §2.5: "about n/32 allocations" for
+`vec` and `into` (now about log2(n/32) for a walk, one for an array); types §2.13.1, "Rule for callers": "with `len >= 32` it copies exactly
+`len + 1` elements on every call" contradicts the table above it (doubling since LIBFIX-1) and the code.
+
+### 8.2 What was built and how it is checked
+
+`lib/prelude.fib`: `array-sole?`, `vec-conj`, `vec-assoc`, `vec-pop`, `vec-take-at` (the unique-or-trie choice), `vec-from-array` (flat),
+`vec-trie-of` (the conversion), `vec-collect` (one growing array; `VecBuild` and its three functions are gone: 699 lines, from 720).
+`lib/fib/seq/protocols.fib`: `span-count` of a flat Vec. `compiler/expand/fuserange.fib`: one array. Cases:
+
+- 4022: a generator of 3000 seeded steps over one lineage: `cur` updated in place while unique, a pool of 16 old versions that forces sharing,
+  six builders (two of them tries), `assoc conj pop update mapv filterv`; after every step `cur` and every pool version against an `(Array i64)` model,
+  and `=`/`hash`/`str` against the other representation; both representations seen over 32 elements at least 100 times.
+- 4023: `mapv` over `(range 100000)` is flat and 1000 unique `assoc` allocate nothing (3 objects; 6462 and result 103125 at `c68837d9`).
+- 4024: 100000 `conj` from empty stay flat, 16 objects (29349 at `c68837d9`); 1000 `pop` in place.
+- 4025: a shared `assoc`, `conj`, `pop` and `update` of a flat Vec of 1000 each make a trie and leave the old version flat and whole.
+- 493 landed (bulk `vec` over 10240 under n/32 + c: 16 objects).
+- A Clojure differential outside the suite (`clojure.main` 1.12.0 and the same seeded program in fibber, 2500 steps and 24 kept versions up to 1490
+  elements): the 10 673 253 bytes printed are identical.
+
+### 8.3 Measurements
+
+Compilers: `F-main` is the gate's stage 2 of `c68837d9` (with that tree's `lib/`); `F` is this branch's stage 2, built by `F-main` (with this
+branch's `lib/`). Default builds are partitioned; machine load 3 to 8 on 28 cores during the runs (other workers). Medians of 3.
+
+`scripts/bench/vec-scalar.sh -n 1`, three times per row (`BENCH_FIBC`, `BENCH_BUILD_FLAGS`; picoseconds per element, the checksums equal
+throughout and between twins):
+
+| row | default main | default flat | whole main | whole flat |
+|---|---|---|---|---|
+| `nth` i8 / i64 / f64 | 3 898 / 3 528 / 3 628 | 1 415 / 1 147 / 2 797 | 3 541 / 3 436 / 3 449 | 1 174 / 1 221 / 1 547 |
+| `array-get` twins | 635 / 502 / 499 | 615 / 436 / 444 | 218 / 465 / 479 | 225 / 418 / 467 |
+| `assoc` i64 / i8 / f64 | 74 448 / 70 460 / 73 349 | 19 034 / 19 488 / 20 160 | 20 061 / 20 731 / 20 853 | 3 921 / 4 034 / 4 031 |
+| `conj` i64 / i8 | 23 875 / 23 546 | 20 399 / 17 758 | 11 610 / 11 826 | 6 605 / 4 712 |
+| `mapv` i64 | 3 220 | 1 159 | 2 985 | 1 138 |
+| `(reduce + 0.0 (mapv f (range -3 4)))` | 104 064 | 78 963 | 62 550 | 45 187 |
+
+`nth` is 3x faster, `assoc` 4 to 5x, `mapv` 2.7x. `assoc` and `conj` in the default build are still calls across units (`array-sole?`,
+the primitives); `conj` gains least because it already pushed into a tail in place and now also asks `array-sole?`.
+
+`scripts/bench/quick.sh -n 3` (`BENCH_FIBC`, `GATE_OUT` in scratch): no wrong answer; `vec-index` 0.48 to 0.16 s; the rest within noise
+(rerun pinned with `taskset -c 20-23 ... -n 5`, twice: `vec-sort` 0.89/0.94 to 0.80/0.79, `vec-conj-pop` 2.23/2.42 to 2.18/2.13, `set-conj`,
+`map-assoc-get`, `lazy-fused` equal within the spread of the runs).
+
+The allerbees cutter (`tools/cut-sprites.fib` at `74c7d82`, copied; `sheet-healer.png`, `bee-healer happy sneezy resting --size 360`; wall and
+peak RSS by `/usr/bin/time`): the three webp files are byte-identical in all 12 runs.
+
+| build | main | flat |
+|---|---|---|
+| `--whole-program` | 2.60 s (2.58 2.60 2.62), 191 MB | 1.84 s (1.84 1.81 1.89), 159 MB |
+| default | 3.96 s (3.96 3.98 3.76), 190 MB | 3.12 s (3.12 3.18 3.00), 150 MB |
+
+-29% and -21%, and 30 to 40 MB less: the trie's leaves and their headers are gone. The estimate of section 5 (4.3 to 2.3 s from a default build
+of the older cutter) was not reached: this cutter already writes its hot loops by hand, and the default build still calls across units.
+
+The compiler (its Vecs are small or built by `conj`): `emit compiler/fibc.fib` 33.87 s main and 33.88 s flat, peak 1.78 and 1.77 GB; a build
+of `compiler/fibc.fib` with `FIB_LIRO_CACHE=off`, 131.35 s and 131.57 s, peak 2.83 and 2.81 GB; the stage 3 it builds 14 881 952 and 14 786 176
+bytes. No change outside the noise.
+
+Checks run: all three case directories with `F` (ownership 377 pass, modules 32 pass, stdlib 1516 pass and 17 open, the same open set as main's
+gate, 493 landed); `scripts/gate.sh --quick` with stage 2 built by the v0.1.17 seed: PASS; the fixed point (F builds F3, `F emit
+compiler/fibc.fib` equals `F3 emit compiler/fibc.fib`, sha1 575cab12); the golden suites (expand-e1, expand-r, expand-porter regenerated:
+gensym numbers only, checked by renumbering both sides, and for the 60 porter inputs by running the old and new `expand` tools); the
+in-line vectorisation check (`compiler/tests/expand/fuseinline/check.sh`); the wasm stage (374 of 377 ownership cases, the 3 expected
+failures, modules 32); the JS backend check; `make adr` (27 accepted). Mutants of the prelude (`array-sole?` forced true, forced false;
+`vec-trie-of`'s tail one element off) and of `span-count` (a flat Vec counted in 32s) each fail at least one of 4022 to 4025.
+
+Not done, in order of use: `VecSink` flat (filter chains; needs the stdlib §2.1 sentence changed), a `map` over a trie written into one
+array, the runtime's `fib.vec-build`/`fib.vec-drop` flat, and `array-sole?` as a builtin once a released seed has one.
