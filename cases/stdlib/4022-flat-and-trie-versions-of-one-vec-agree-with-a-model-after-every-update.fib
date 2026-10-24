@@ -1,0 +1,103 @@
+;; spec:   stdlib §2.5 (persistent in the API, in place when unique), types §2.13 (Vec), docs/design/vec-performance.md 8 (the flat Vec)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: assoc conj pop update nth count vec mapv filterv into span-count
+;; A generator over one lineage of Vecs: a current Vec `cur`, updated in place while nobody else holds it, and a pool of up to 16
+;; old versions that keeps some of its states alive, so the next update of `cur` must share (a flat Vec then becomes a trie, once)
+;; or copy. Each of 3000 seeded steps snapshots `cur` into the pool, switches `cur` to a pool version (a shared value), rebuilds
+;; it with one of six builders (a conj loop, mapv and vec over a range, vec of an array, into over a filter, which builds a trie,
+;; and a conj loop with a history, also a trie), or applies assoc (an index up to the count: append), conj, pop, update, mapv or
+;; filterv (the in-line loops over the Vec's spans: one for a flat Vec, a leaf per 32 and the tail for a trie). Beside
+;; every Vec is its model, an (Array i64) that no Vec code touches. After every step `cur` and every pool version are read in full
+;; and compared with their models (count, every nth, a reduce), and `cur` is compared with a Vec of the other representation built
+;; from its model (=, hash, str). Checks (bits of the result): 0 cur, 1 the pool, 2 = and hash, 3 str, 4 both representations were
+;; seen at sizes over 32 at least 100 times each (span-count 1 is flat, more is a trie: the case cannot quietly stop interleaving them), 5 the planted
+;; fault (a model with one slot changed) is detected. The stage 2 of c68837d9 gives 16: every check holds but 4, it makes no flat Vec
+;; over 32. With the flat Vec's uniqueness test forced false it gives 16 too; with vec-trie-of's tail one element off it traps.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defstruct Ver (v: (Vec i64) r: (Array i64)))
+
+;; ---- the model: arrays only, copied and written through a cell
+(defun m-assoc (r: (Array i64) i: i64 x: i64) -> (Array i64)
+  (if (= i (array-len r)) (m-conj r x)
+      (let ((c (cell (array-copy r 0 (array-len r))))) (do (array-set! &c i x) @c))))
+
+(defun m-conj (r: (Array i64) x: i64) -> (Array i64)
+  (let ((n (array-len r)) (c (cell (array (+ n 1) x))))
+    (do (dotimes (i n) (array-set! &c i (array-get r i))) @c)))
+
+(defun m-pop (r: (Array i64)) -> (Array i64) (array-copy r 0 (- (array-len r) 1)))
+
+(defun m-of (n: i64 f: (fn (i64) i64)) -> (Array i64)
+  (let ((c (cell (array n 0)))) (do (dotimes (i n) (array-set! &c i (f i))) @c)))
+
+;; the elements of r that are multiples of 3, in order
+(defun m-thirds (r: (Array i64)) -> (Array i64)
+  (let ((n (array-len r)) (k (loop ((i 0) (k 0)) (if (< i n) (recur (+ i 1) (if (= (rem (array-get r i) 3) 0) (+ k 1) k)) k)))
+        (c (cell (array k 0))))
+    (do (loop ((i 0) (j 0)) (if (< i n) (if (= (rem (array-get r i) 3) 0) (do (array-set! &c j (array-get r i)) (recur (+ i 1) (+ j 1))) (recur (+ i 1) j)) ()))
+        @c)))
+
+;; ---- comparisons
+(defun agrees? (v: (Vec i64) r: (Array i64)) -> bool
+  (let ((n (array-len r)))
+    (and (= (count v) n)
+         (loop ((i 0)) (if (< i n) (if (= (nth v i) (array-get r i)) (recur (+ i 1)) false) true))
+         (= (reduce + 0 v) (loop ((i 0) (s 0)) (if (< i n) (recur (+ i 1) (+ s (array-get r i))) s))))))
+
+(defun pool-agrees? (pool: (Vec Ver)) -> bool
+  (every? (fn (w: Ver) (agrees? (. w v) (. w r))) pool))
+
+;; a Vec of the model's elements in the representation cur does not have: a trie (into over a filter, spans of 32) when cur is
+;; flat, else flat (vec of a copy of the array)
+(defun other-rep (v: (Vec i64) r: (Array i64)) -> (Vec i64)
+  (if (= (span-count v) 1)
+      (into [] (filter (fn (x) (> x -1000000000)) (vec (array-copy r 0 (array-len r)))))
+      (vec (array-copy r 0 (array-len r)))))
+
+;; ---- the builders, each with its model
+(defun build (k: i64 n: i64 s: i64) -> Ver
+  (cond (= k 0) (Ver (loop ((i 0) (v [])) (if (< i n) (recur (+ i 1) (conj v (+ s i))) v)) (m-of n (fn (i: i64) (+ s i))))
+        (= k 1) (Ver (mapv (fn (i: i64) (* i s)) (range n)) (m-of n (fn (i: i64) (* i s))))
+        (= k 2) (Ver (vec (map (fn (i: i64) (- s i)) (range n))) (m-of n (fn (i: i64) (- s i))))
+        (= k 3) (let ((r (m-of n (fn (i: i64) (+ (* 3 i) s))))) (Ver (vec (array-copy r 0 n)) r))
+        (= k 4) (Ver (into [] (filter (fn (i) (>= i 0)) (range n))) (m-of n (fn (i: i64) i)))
+        :else (Ver (. (loop ((i 0) (v []) (h [])) (if (< i n) (recur (+ i 1) (conj v (+ s i)) (conj h v)) (Pair v (count h)))) fst)
+                   (m-of n (fn (i: i64) (+ s i))))))
+
+;; ---- one step on (cur, its model, the pool); the third value of the result is the new pool
+(defun step (g: Rng cur: (Vec i64) r: (Array i64) pool: (Vec Ver)) -> (Triple (Vec i64) (Array i64) (Vec Ver))
+  (let ((d (rng-below g 100)) (n (array-len r)))
+    (cond (< d 12) (Triple cur r (if (< (count pool) 16) (conj pool (Ver cur r)) (assoc pool (rng-below g 16) (Ver cur r))))
+          (and (< d 20) (> (count pool) 0)) (let ((w (nth pool (rng-below g (count pool))))) (Triple (. w v) (. w r) pool))
+          (< d 23) (let ((b (build (rng-below g 6) (rng-below g 140) (rng-below g 1000)))) (Triple (. b v) (. b r) pool))
+          (< d 50) (let ((i (rng-below g (+ n 1))) (x (rng-below g 100000))) (Triple (assoc cur i x) (m-assoc r i x) pool))
+          (or (< d 75) (= n 0)) (let ((x (rng-below g 100000))) (Triple (conj cur x) (m-conj r x) pool))
+          (< d 88) (Triple (pop cur) (m-pop r) pool)
+          (< d 94) (let ((i (rng-below g n))) (Triple (update cur i inc) (m-assoc r i (+ (array-get r i) 1)) pool))
+          (< d 97) (Triple (mapv (fn (x) (+ x 5)) cur) (m-of n (fn (i: i64) (+ (array-get r i) 5))) pool)
+          :else (Triple (filterv (fn (x) (= (rem x 3) 0)) cur) (m-thirds r) pool))))
+
+(defun main () -> i64
+  (let ((g (rng 4022)) (ok (cell (array 4 true))) (flat (cell 0)) (trie (cell 0)))
+    (let ((end (loop ((k 0) (cur (vec-empty)) (r (array 0 0)) (pool (vec-empty)))
+                 (if (< k 3000)
+                     (match (step g cur r pool)
+                       ((Triple v2 r2 p2)
+                        (let ((o (other-rep v2 r2)))
+                          (do (if (agrees? v2 r2) () (array-set! &ok 0 false))
+                              (if (pool-agrees? p2) () (array-set! &ok 1 false))
+                              (if (and (= v2 o) (= (hash v2) (hash o))) () (array-set! &ok 2 false))
+                              (if (= (str v2) (str o)) () (array-set! &ok 3 false))
+                              (if (> (count v2) 32) (if (= (span-count v2) 1) (set! flat (+ @flat 1)) (set! trie (+ @trie 1))) ())
+                              (recur (+ k 1) v2 r2 p2)))))
+                     (Ver cur r))))
+          (c (checks)) (p (checks)))
+      (do (dotimes (j 4) (check c (array-get @ok j)))
+          (check c (and (>= @flat 100) (>= @trie 100)))
+          (check p (agrees? (. end v) (m-assoc (. end r) 0 -1)))
+          (check-detects c p)
+          (if (= (checks-made c) 6) (checks-result c) -1)))))

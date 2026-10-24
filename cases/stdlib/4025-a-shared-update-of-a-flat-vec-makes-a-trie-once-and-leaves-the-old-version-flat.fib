@@ -1,0 +1,34 @@
+;; spec:   docs/design/vec-performance.md 8 (the flat Vec), stdlib §2.5 (persistent in the API, in place when unique)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: assoc conj pop update span-count
+;; A flat Vec of 1000 (mapv over a range) that a second name keeps: `assoc`, `conj`, `pop` and `update` of it must not write
+;; it, and must not copy its whole array either, which would leave every later shared update a copy of 1000: each makes a
+;; trie (span-count above 1) once, and the kept Vec stays flat and whole. A second shared assoc on that trie copies a path and
+;; stays a trie. Checks (bits of the result): 0 the kept Vec is flat and whole after all four, 1 assoc, 2 conj, 3 pop,
+;; 4 update made tries with the right elements, 5 a shared assoc of the trie is a trie with both versions right.
+;; The stage 2 of c68837d9 gives 1 (it makes no flat Vec); with the uniqueness test forced true (every shared update copies the
+;; whole array and stays flat, values still right) it gives 62.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun whole? (v: (Vec i64) n: i64 f: (fn (i64) i64)) -> bool
+  (and (= (count v) n) (loop ((i 0)) (if (< i n) (if (= (nth v i) (f i)) (recur (+ i 1)) false) true))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (v (mapv (fn (i: i64) (* i 3)) (range 1000))))
+    (let ((a (assoc v 7 -7))
+          (b (conj v -1))
+          (p (pop v))
+          (u (update v 999 inc)))
+      (let ((a2 (assoc a 900 -9)))
+        (do (check c (and (= (span-count v) 1) (whole? v 1000 (fn (i: i64) (* i 3)))))
+            (check c (and (> (span-count a) 1) (whole? a 1000 (fn (i: i64) (if (= i 7) -7 (* i 3))))))
+            (check c (and (> (span-count b) 1) (whole? b 1001 (fn (i: i64) (if (= i 1000) -1 (* i 3))))))
+            (check c (and (> (span-count p) 1) (whole? p 999 (fn (i: i64) (* i 3)))))
+            (check c (and (> (span-count u) 1) (whole? u 1000 (fn (i: i64) (if (= i 999) 2998 (* i 3))))))
+            (check c (and (> (span-count a2) 1) (whole? a2 1000 (fn (i: i64) (cond (= i 7) -7 (= i 900) -9 :else (* i 3))))
+                          (whole? a 1000 (fn (i: i64) (if (= i 7) -7 (* i 3))))))
+            (checks-result c))))))

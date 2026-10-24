@@ -21,8 +21,8 @@
 ;; map-assoc map-count set-count map-each set-each ..), which the library is
 ;; built on, and the names of stdlib §6.5.
 ;;
-;; Vec is the persistent vector of types §2.13: a 32-way trie of
-
+;; Vec is the persistent vector of types §2.13: VecEmpty, or VecOf over a 32-way trie of VNodes and a tail. A VecOf with no trie (root nil)
+;; is flat: its tail holds every element, any number of them; with a trie the tail holds the last 1 to 32 (vec-performance.md 8).
 ;; Box (syntax §4.5)
 (defstruct (Box a) (v: a))
 (defun box (x) (Box x))
@@ -72,6 +72,12 @@
     (dotimes (i n) (array-set! &c i (array-get items i)))
     @c))
 
+;; Whether the array in c has no other holder: the test fib.unique? makes before an in-place write (types 2.13.1), count 1 and none of
+;; SHARED IMMORTAL STACK HAS-WEAK (flag bits 0-3), read from the header of types 8.2 with no count operation. A flat Vec asks it to
+;; choose the trie over a copy of its whole array. A builtin would be clearer, but the seed that builds stage 2 compiles this prelude.
+(defun array-sole? :private (c: (Cell (Array a))) -> bool
+  (unsafe (let ((p (raw @c))) (and (= (load-i64 p) 1) (= (bit-and (sext i64 (load-i32 (ptr+ p 12))) 15) 0)))))
+
 ;; A path of branches from level down to node (level 0 is a leaf).
 (defun vnode-path :private (level: i64 node: (VNode a)) -> (VNode a)
   (if (= level 0) node (VBranch (array 1 (vnode-path (- level 5) node)))))
@@ -108,14 +114,16 @@
                   (array 1 x))
            (VecOf (+ cnt 1) shift (some (vnode-push shift r tailoff leaf)) (array 1 x)))))))
 
+;; A tail of under 32, or a flat Vec's whose array nobody else holds, grows in place (array-push! doubles it); a full tail of a trie, or
+;; of a shared flat Vec of 32, becomes a leaf; a shared flat Vec of more becomes a trie first, once, so the next shared conj copies a path.
 (defun vec-conj (v: (Vec a) x: a) -> (Vec a)
   (match v
     ((VecEmpty) (VecOf 1 5 nil (array 1 x)))
     ((VecOf cnt shift root tail)
-     (if (< (array-len tail) 32)
-         (let ((c (cell tail)))
-           (do (array-push! &c x) (VecOf (+ cnt 1) shift root @c)))
-         (vec-push-tail cnt shift root tail x)))))
+     (let ((t (array-len tail)) (c (cell tail)))
+       (if (or (< t 32) (and (nil? root) (array-sole? c)))
+           (do (array-push! &c x) (VecOf (+ cnt 1) shift root @c))
+           (if (> t 32) (vec-conj (vec-trie-of @c) x) (vec-push-tail cnt shift root @c x)))))))
 
 (defun vec-count (v: (Vec a)) -> i64
   (match v
@@ -173,8 +181,9 @@
            (trap "nth: index out of range")
            (if (>= i tailoff)
                (let ((c (cell tail)))
-                 (let ((e (array-take! &c (- i tailoff))))
-                   (Pair e (VecOf cnt shift root @c))))
+                 (if (or (<= (- cnt tailoff) 32) (array-sole? c))
+                     (let ((e (array-take! &c (- i tailoff)))) (Pair e (VecOf cnt shift root @c)))
+                     (vec-take-at (vec-trie-of @c) i)))
                (match root
                  (nil (trap "nth: index out of range"))
                  ((some r)
@@ -184,6 +193,7 @@
 ;; (vec-assoc v i x) is v with element i replaced by x (stdlib §2.5): the path from the root to the leaf is
 ;; copied, or only the tail when i is in the tail, so O(log32 n) objects, and v is unchanged. i = the count
 ;; appends, as Clojure's assoc does; an index below zero or above the count traps `assoc: index out of range`.
+;; A flat Vec's array is written in place when nobody else holds it, else the Vec becomes a trie first (once).
 (defun vec-assoc (v: (Vec a) i: i64 x: a) -> (Vec a)
   (let ((n (vec-count v)))
     (if (= i n)
@@ -193,9 +203,10 @@
             ;; the trie clause names the root's payload in the pattern, so that it is a field of v's own slot: it can be stolen
             (match v
               ((VecOf cnt shift root tail) :when (>= i (- cnt (array-len tail)))
-               (let ((k (- i (- cnt (array-len tail))))
-                     (c (cell tail)))
-                 (do (array-set! &c k x) (VecOf cnt shift root @c))))
+               (let ((t (array-len tail)) (c (cell tail)))
+                 (if (or (<= t 32) (array-sole? c))
+                     (do (array-set! &c (- i (- cnt t)) x) (VecOf cnt shift root @c))
+                     (vec-assoc (vec-trie-of @c) i x))))
               ((VecOf cnt shift (some r) tail) (VecOf cnt shift (some (vnode-assoc r shift i x)) tail))
               (_ (trap "assoc: index out of range")))))))
 
@@ -266,14 +277,15 @@
            VecEmpty
            (if (> t 1)
                (let ((c (cell tail)))
-                 (do (array-pop! &c) (VecOf (- cnt 1) shift root @c)))
+                 (if (or (<= t 32) (array-sole? c))
+                     (do (array-pop! &c) (VecOf (- cnt 1) shift root @c))
+                     (vec-pop (vec-trie-of @c))))
                (match root
                  (nil (trap "vec: a vector with no leaves and no tail"))
                  ((some r) (vec-pop-root (- cnt 1) shift r (vnode-leaf r shift (- cnt 2)))))))))))
 
-;; The bulk builder (stdlib design 2.5; tranche 1 plan L9): a Vec built by conj spends 2.09 heap objects an element, built here 2 for every 32 elements. The layout is the
-;; one above, unchanged (rt/vec.lir and eval/vecs.rs read it): VecOf cnt shift root tail, the last 1..32 elements exactly in the tail, full leaves in the trie, shift 5 for a root
-;; three 2 more, four the same, five or more fewer (cases 483 and 489 pin the counts).
+;; The builders (stdlib design 2.5): a Vec of an array or of a walk is flat, the array itself, one object. The trie is built from a flat
+;; Vec's array when an update must share it (vec-trie-of) and from spans of 32 (vec-of-leaves); rt/vec.lir reads both (types 8.3).
 
 ;; The branches one level up: nodes[0..n) in groups of 32, an array of ceil(n/32) branches.
 (defun vnodes-up :private (nodes: (Array (VNode a)) n: i64) -> (Array (VNode a))
@@ -291,51 +303,18 @@
       (VecOf cnt shift (some (VBranch (if (= n (array-len nodes)) nodes (array-copy nodes 0 n)))) tail)
       (vec-trie cnt (+ shift 5) (vnodes-up nodes n) (shr (+ n 31) 5) tail)))
 
-;; The vector of the elements of xs, in order, built in one pass: a leaf per 32 elements and a branch per 32 nodes, so 2 objects
-;; for every 32 elements (the node and its array) where a conj loop spends 2.09 for each. xs of at most 32 elements is the tail itself.
+;; The Vec of the elements of xs, in order: flat, xs itself, no copy.
 (defun vec-from-array (xs: (Array a)) -> (Vec a)
+  (if (= (array-len xs) 0) VecEmpty (VecOf (array-len xs) 5 nil xs)))
+
+;; The trie of the more than 32 elements of xs, in one pass: a leaf per 32 elements and a branch per 32 nodes, so 2 objects for every
+;; 32 elements, the last 1..32 the tail. What a flat Vec becomes, once, when an update would otherwise copy all of its array.
+(defun vec-trie-of :private (xs: (Array a)) -> (Vec a)
   (let ((n (array-len xs))
         (k (shr (- n (+ (bit-and (- n 1) 31) 1)) 5)))
-    (if (or (= n 0) (< k 1))
-        (if (= n 0) VecEmpty (VecOf n 5 nil xs))
-        (let ((leaves (cell (array k (VLeaf (array-copy xs 0 32))))))
-          (do (dotimes (i (- k 1)) (array-set! &leaves (+ i 1) (VLeaf (array-copy xs (shl (+ i 1) 5) (shl (+ i 2) 5)))))
-              (vec-trie n 5 @leaves k (array-copy xs (shl k 5) n)))))))
-
-;; The state of a build from a walk of unknown length: the buffer being filled (32 slots), the count of elements taken, and the full
-;; leaves so far, an array that doubles (made when the first leaf is full). Every field is a cell, so a write goes to the array in place.
-(defstruct (VecBuild a) :private
-  (buf: (Cell (Array a)) n: (Cell i64) leaves: (Cell (Option (Cell (Array (VNode a)))))))
-
-;; The leaf of a full buffer goes on the leaves, doubling their array when it is full.
-(defun vb-leaf :private (b: (VecBuild a) k: i64) -> unit
-  (let ((leaf (VLeaf @(. b buf))))
-    (match @(. b leaves)
-      (nil (set! (. b leaves) (some (cell (array 4 leaf)))))
-      ((some lc)
-       (do (if (= k (array-len @lc))
-               (let ((bigger (cell (array (shl k 1) leaf))))
-                 (do (dotimes (i k) (array-set! &bigger i (array-get @lc i)))
-                     (set! lc @bigger)))
-               ())
-           (array-set! &lc k leaf))))))
-
-(defun vb-push :private (b: (VecBuild a) x: a) -> unit
-  (let ((n @(. b n))
-        (buf (. b buf)))
-    (do (if (= (bit-and n 31) 0)
-            (do (vb-leaf b (- (shr n 5) 1)) (set! buf (array 32 x)))
-            (array-set! &buf (bit-and n 31) x))
-        (set! (. b n) (+ n 1)))))
-
-(defun vb-done :private (b: (VecBuild a)) -> (Vec a)
-  (let ((n @(. b n))
-        (f (+ (bit-and (- n 1) 31) 1))
-        (buf @(. b buf)))
-    (let ((tail (if (= f 32) buf (array-copy buf 0 f))))
-      (match @(. b leaves)
-        (nil (VecOf n 5 nil tail))
-        ((some lc) (vec-trie n 5 @lc (shr (- n 1) 5) tail))))))
+    (let ((leaves (cell (array k (VLeaf (array-copy xs 0 32))))))
+      (do (dotimes (i (- k 1)) (array-set! &leaves (+ i 1) (VLeaf (array-copy xs (shl (+ i 1) 5) (shl (+ i 2) 5)))))
+          (vec-trie n 5 @leaves k (array-copy xs (shl k 5) n))))))
 
 ;; The leaf of v that holds index i, which is below its tail (span-array of fib.seq.protocols checks i).
 (defun vec-leaf-at (v: (Vec a) i: i64) -> (Array a)
@@ -346,21 +325,21 @@
   (if (< k 1) (VecOf cnt 5 nil t)
       (let ((nodes (cell (array k (VLeaf t))))) (do (dotimes (i k) (array-set! &nodes i (VLeaf (array-get ls i)))) (vec-trie cnt 5 @nodes k t)))))
 
-;; The sink a walk is given: the first element makes the state, every other one is a write.
-(defun vec-take :private (st: (Cell (Option (VecBuild a))) x: a) -> bool
+;; The sink a walk is given: the first element makes the buffer, every other one is appended in place (array-push! doubles it).
+(defun vec-take :private (st: (Cell (Option (Cell (Array a)))) x: a) -> bool
   (do (match @st
-        (nil (set! st (some (VecBuild (cell (array 32 x)) (cell 1) (cell nil)))))
-        ((some b) (vb-push b x)))
+        (nil (set! st (some (cell (array 1 x)))))
+        ((some b) (array-push! &b x)))
       true))
 
 ;; The Vec of every element a walk offers, in one pass: walk is handed a function that takes each
-;; element and says true to go on (the visitor each-while is given), and runs it.
+;; element and says true to go on (the visitor each-while is given), and runs it. The buffer becomes the flat Vec's array.
 (defun vec-collect (walk: (fn ((fn (a) bool)) bool) :borrow) -> (Vec a)
   (let ((st (cell nil)))
     (do (walk (fn (x) (vec-take st x)))
         (match @st
           (nil VecEmpty)
-          ((some b) (vb-done b))))))
+          ((some b) (vec-from-array @b))))))
 
 ;; List (the enum is in the expander's prelude: Empty and Cons, stdlib design
 ;; C-3; the library's own `empty` and `cons` are a method and a function).

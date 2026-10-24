@@ -1,0 +1,18 @@
+;; spec:   docs/design/vec-performance.md 8 (the flat Vec), stdlib §2.5 (in place when unique), types §2.13.1 (array-push!)
+;; expect: accept
+;; result: 100001
+;; audit:  clean
+;; allocs: <= 16
+;; roots:  ../../lib support
+;; covers: conj pop
+;; 100000 `conj` from the empty Vec, held by one name, keep it flat: the array grows in place and doubles when full (array-push!,
+;; types 2.13.1), so the build allocates one array per doubling past 32, not a leaf and a tail per 32 elements (the trie's 6000
+;; and more). 1000 `pop` then shorten the same array. The result is the span count (1 while flat) plus the count after the
+;; pops plus 1000. Measured 16: the first arrays and one per doubling (64 to 131072), and the VecOf shells before reuse. The
+;; stage 2 of c68837d9 gives result 103094 and 29349 objects.
+(ns main (:use fib.core fib.seq fib.coll))
+
+(defun main () -> i64
+  (let ((v (loop ((i 0) (v (vec-empty))) (if (< i 100000) (recur (+ i 1) (conj v i)) v))))
+    (let ((w (loop ((k 0) (v v)) (if (< k 1000) (recur (+ k 1) (pop v)) v))))
+      (+ (span-count w) (+ (count w) 1000)))))
