@@ -1,0 +1,19 @@
+;; spec:   docs/design/vec-performance.md 8 (the flat Vec), stdlib §2.5 (in place when unique), §2.1 (the in-line rule over a range)
+;; expect: accept
+;; result: 100001
+;; audit:  clean
+;; allocs: <= 3
+;; roots:  ../../lib support
+;; covers: mapv assoc
+;; `(mapv f (range 100000))` writes one array of 100000 and makes it a flat Vec (one span: `span-count` is 1, where the trie of
+;; 32-element leaves has 3125), and 1000 `assoc` on it, the Vec held by one name, write that array in place. The result is
+;; the span count plus the count, 100001 only while the Vec is flat after the updates. The bound fails if the build goes
+;; back to the trie (6462 objects) or if a unique assoc copies the array (1000 copies), and the result fails if an assoc
+;; turns the unique flat Vec into a trie. Measured 3 (the range, the array, the VecOf); the stage 2 of c68837d9 gives result 103125
+;; and 6462 objects, and so does this tree with the uniqueness test of the flat Vec forced false.
+(ns main (:use fib.core fib.seq fib.coll))
+
+(defun main () -> i64
+  (let ((v (mapv (fn (i: i64) (* i 2)) (range 100000))))
+    (let ((w (loop ((k 0) (v v)) (if (< k 1000) (recur (+ k 1) (assoc v (rem (* k 7919) 100000) k)) v))))
+      (+ (span-count w) (count w)))))
