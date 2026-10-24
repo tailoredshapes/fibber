@@ -1,6 +1,6 @@
 #!/bin/bash
 # Prepares LLVM 21's static archives (the components the compiler's native.* modules call through LLVM-C: core orcjit native passes analysis irreader
-# bitwriter, plus the x86, aarch64, webassembly, riscv and nvptx backends the target initialisation of compiler/llvm/target.fib names, in llvm-config's dependency order) so that
+# bitwriter; lto, the C++ ThinLTO that compiler/llvm/thinlto.cpp drives (it brings Polly, which LTO's backend registers as an extension); plus the x86, aarch64, webassembly, riscv and nvptx backends the target initialisation of compiler/llvm/target.fib names, in llvm-config's dependency order) so that
 #   fibc build PROGRAM <the words this script prints>
 # links LLVM into the program (as `-L /usr/lib/llvm-21/lib -l LLVM-21` links the shared libLLVM-21.so). `fibc build` passes only -L and -l words to
 # `cc` and gives no --start-group, so:
@@ -16,7 +16,7 @@
 set -eu
 dir=${1:?usage: llvm-static.sh DIR}
 mkdir -p "$dir"
-comps="core orcjit native passes analysis irreader bitwriter x86 aarch64 webassembly riscv nvptx"
+comps="core orcjit native passes analysis irreader bitwriter lto x86 aarch64 webassembly riscv nvptx"
 if [ "$(uname -s)" = Darwin ]; then
   lc=${LLVM_CONFIG:-/opt/homebrew/opt/llvm@21/bin/llvm-config}
   [ -x "$lc" ] || { echo "llvm-static: no llvm-config at $lc (brew install llvm@21; set LLVM_CONFIG)" >&2; exit 2; }
