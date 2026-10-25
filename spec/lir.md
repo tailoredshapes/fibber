@@ -407,6 +407,7 @@ stream's functions of §4.8 are the only names that are):
 | `(lir.sexp.is s cstr) : i1` | whether `s` is the symbol with that text |
 | `(lir.sexp.gensym cstr) : ptr` | a fresh symbol `PREFIX.N`, `N` counting up through the program: one counter per process, which every module's session counts in, so the names two modules of a program make never coincide (`cases/lir/macros/gensym-program.lir`) |
 | `(lir.sexp.expand form) : ptr` | the form expanded through the module's macros as the expander would (outermost first, then the children), as an object; null when that expansion fails, and its error is then the use's (below) |
+| `(lir.sexp.set l i x) : ptr` | item `i` of the list `l` replaced by `x`, the dual of `nth`; `l` (out of range: nothing) |
 | `(lir.sexp.fail at message) : ptr` | the expansion fails with `macro NAME: MESSAGE` at the object `at` (null: at the use); returns null, for the macro to return |
 
 **Expansion from a macro, and macro-time state.** A lowering macro delegates: `lir.sexp.expand` hands a form back to the expander, which
