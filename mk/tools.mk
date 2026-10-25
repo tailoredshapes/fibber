@@ -57,7 +57,7 @@ tool_sh-live-project := $(T)/live/project.sh $(F_ABS) | $(T)/live/project.sh $(T
 tool_sh-live-hooks := $(T)/live/hooks.sh $(F_ABS) | $(T)/live/hooks.sh $(T)/live/hooks.fib $(T)/live/hooks-spec.fib $(T)/live/hookspecs.fib lib/fib/test/run.fib
 # LV1: the attach socket of `fibc run --live` (serve.live*), over a real socket against app.fib, and the peer-uid unit (about 2 minutes); LE5 (the
 # engine warmed before the first connection: serve.incr, serve.replcore) and LE4 (`inspect` as a lookup) of docs/design/live-incremental.md
-tool_sh-live-attach := $(T)/live/attach.sh $(F_ABS) | $(T)/live/attach.sh $(T)/live/attach.py $(T)/live/app.fib $(T)/live/unit-livesock.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/serve/incr.fib compiler/serve/replcore.fib
+tool_sh-live-attach := $(T)/live/attach.sh $(F_ABS) | $(T)/live/attach.sh $(T)/live/attach.py $(T)/live/app.fib $(T)/live/unit-livesock.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/serve/incr.fib compiler/serve/replcore.fib compiler/serve/sock.fib
 tool_sh-live-leak := $(T)/live/leak.sh $(F_ABS) | $(T)/live/leak.sh $(T)/live/leak.py compiler/serve/incr.fib compiler/own/chain.fib compiler/macros/runner.fib
 tool_sh-live-mt := $(T)/live/mt.sh $(F_ABS) | $(T)/live/mt.sh $(T)/live/mt.py $(T)/live/mt-app.fib $(wildcard compiler/serve/live*.fib) rt/live.lir rt/core.lir
 # LV2: body swaps in the running program (serve.liveswap, serve.livetable, serve.liverules): swap-app.fib's server holds the handler as a value, a worker

@@ -54,12 +54,6 @@
     ((Ok v) (match (field v "watching") ((some (j/JBool b)) (do (set! (. c watching) b) ())) (_ ())))
     ((Err _) ())))
 
-;; Whether a line can be read from `c` within `ms` milliseconds: one is buffered, or the descriptor is readable (or has ended).
-(defun line-ready? :private (c: sk/Conn ms: i64) -> bool
-  (let ((pend @(. c pending)))
-    (or (loop ((i 0)) (cond (>= i (array-len pend)) false (= (array-get pend i) 10i8) true :else (recur (+ i 1))))
-        (sk/wait-readable (. c fd) ms))))
-
 ;; An event line: as it is in the stdio form; else a `load` as `:load` prints it, a `test` as `:test` does after the line that says why.
 (defun show-event :private (c: Client line: str) -> unit
   (if (. c json)
@@ -72,7 +66,7 @@
 ;; The events that are there now, shown (on a terminal over the prompt, which is written again after each).
 (defun drain-events :private (c: Client tty: bool prompt: str) -> unit
   (loop ()
-    (when (line-ready? (. c conn) 0)
+    (when (sk/conn-line-ready? (. c conn) 0)
       (match (sk/conn-read-line (. c conn))
         ((Ok (some l)) (do (when tty (do (native/write-stdout "\r\x1b[K") ())) (show-event c l) (when tty (do (native/write-stdout prompt) ())) (recur)))
         (_ ())))))
@@ -83,7 +77,7 @@
   (when @(. c watching)
     (do (when tty (do (native/write-stdout prompt) ()))
         (loop ()
-          (if (line-ready? in 250)
+          (if (sk/conn-line-ready? in 250)
               (when tty (do (native/write-stdout "\r") ()))
               (do (drain-events c tty prompt) (recur)))))))
 
