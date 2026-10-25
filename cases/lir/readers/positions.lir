@@ -1,0 +1,34 @@
+;; expect: accept
+;; out: 31 73 95
+;; out: 32 74 98
+;; out: 33 75 99
+;; spec/lir.md 4.7: the form a reader macro returns is at the position of its first character; a form it read with lir.read.form keeps its
+;; own. 'X is (quote X): (line-of F) and (column-of F) are the position of a form, (column-of-nth F I) the column of the I-th item of a list.
+;; Line 31: the (quote abc) of the second use is at its ' (column 73), the abc of the third use one column past its ' (94); line 32: a space
+;; after the ' (74; 96 and the space, 98); line 33: '(a b), the inner list at its own ( (75; 98 and 99).
+(declare printf i32 (ptr ...))
+(define-macro lit64 (v)
+  (block entry
+    (let ((l (call @lir.sexp.list (i64 0))))
+      (call @lir.sexp.push l (call @lir.sexp.symbol (string "i64")))
+      (call @lir.sexp.push l v)
+      (ret l))))
+(define-macro line-of (x)
+  (block entry (ret (call @lir.macro.lit64 (call @lir.sexp.integer (call @lir.sexp.line x))))))
+(define-macro column-of (x)
+  (block entry (ret (call @lir.macro.lit64 (call @lir.sexp.integer (call @lir.sexp.column x))))))
+(define-macro column-of-nth (x i)
+  (block entry (ret (call @lir.macro.lit64 (call @lir.sexp.integer (call @lir.sexp.column (call @lir.sexp.nth x (call @lir.sexp.int i))))))))
+(define-reader-macro "'" (s)
+  (block entry
+    (let ((x (call @lir.read.form s))
+          (l (call @lir.sexp.list (i64 0))))
+      (call @lir.sexp.push l (call @lir.sexp.symbol (string "quote")))
+      (call @lir.sexp.push l x)
+      (ret l))))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "%lld %lld %lld\n") (line-of 'abc) (column-of 'abc) (column-of-nth 'abc 1))
+    (call @printf (string "%lld %lld %lld\n") (line-of ' abc) (column-of ' abc) (column-of-nth ' abc 1))
+    (call @printf (string "%lld %lld %lld\n") (line-of '(a b)) (column-of '(a b)) (column-of-nth '(a b) 1))
+    (ret (i32 0))))

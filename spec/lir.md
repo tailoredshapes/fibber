@@ -157,6 +157,9 @@ item   ::= (defstruct NAME (type*))
          | (define-macro NAME (PNAME* ...?) block+)        ; a compile-time macro (§4.6)
          | (require-macros STRING)                         ; the macros of a library file (§4.6)
          | (import STRING)                                 ; another module of the program (§4.7)
+         | (define-reader-macro STRING (PNAME) block+)     ; a reader macro on a character (§4.8)
+         | (define-dispatch-macro STRING (PNAME) block+)   ; a reader macro on the character after # (§4.8)
+         | (define-token-reader (PNAME PNAME) block+)      ; the module's token reader (§4.8)
 mod    ::= private | internal | external           ; linkage (§4.3), at most one
          | hidden                                  ; visibility (§4.3)
          | inline                                  ; a function the optimiser always inlines (§4.3)
@@ -170,7 +173,7 @@ Anything else at the top level is an error `expected a top-level form
 (liar silently ignored top-level expressions, `lir-audit/fuzz2.txt`). The
 message names the forms of the first M3 pass; `(target ..)` (§4.5) is a top-level form too, and
 is left out of the text so that the Rust `lair`, the oracle of the compare scripts, says the same;
-so are `define-macro` and `require-macros` (§4.6) and `import` (§4.7), which are not items but directions to the
+so are `define-macro` and `require-macros` (§4.6), `import` (§4.7) and the three reader forms of §4.8, which are not items but directions to the
 reader, and a macro use whose macro is not yet defined gets this message too.
 Items may appear in any order and refer to each other in any order; a macro must be defined
 before it is used (§4.6).
@@ -337,8 +340,10 @@ and `(begin)` is nothing. The word is Scheme's: a top-level `begin` splices its 
 same); LLVM has no spelling for it, so it is lIR's own, as `define-macro` is, and nothing new is invented. A macro use is applied before
 anything in its result is expanded, so the splice is seen whole. Inside a function `begin` is no instruction: a macro used there whose
 result is a splice is `macro NAME: a splice (begin ..) is a top-level form, not an instruction` at the use, and a written one is `unknown
-instruction begin`. `begin` is among the names a macro may not have. The cases are `cases/lir/macros/splice-*.lir` and
-`reject-splice-in-body.lir`.
+instruction begin`. `begin` is among the names a macro may not have. A spliced reader form (§4.8: `define-reader-macro`,
+`define-dispatch-macro`, `define-token-reader`) binds as a written one does, for the text read after the top-level form that spliced it;
+the elements of the splice were read before it ran, so a binding it makes reaches them no more than a written one reaches its own form
+(`cases/lir/macros/splice-define-reader.lir`). The cases are `cases/lir/macros/splice-*.lir` and `reject-splice-in-body.lir`.
 
 **Scope.** A macro is visible to the forms after its definition in the module, the bodies of later `define-macro`s included (so a macro
 may expand to a use of an earlier one, and its own body may use one), and its function `@lir.macro.NAME` is declared in the bodies of
@@ -357,10 +362,8 @@ same shape for a module: its functions, globals, structs and macros.
 use's; `lir.sexp.gensym` makes a fresh name for a binding the macro introduces (`cases/lir/macros/gensym.lir`).
 
 **The form type.** A form of lIR is one of five kinds: a symbol, an integer, a float, a string or a list, each with its position (file,
-line, column). That is the reader's output (§1: what the text reads as), what a macro takes and returns, and what a **reader macro** will
-return: reader macros are next (a readtable: a module binds a character, or a `#` dispatch character, to an lIR function run at read time
-that takes the stream and returns a form, and may replace the default token reader), and their results and a macro's are the same type,
-interchangeable. lair holds the type in two representations that convert without loss: its own value (`lir.sexp/Sexp`, what the reader
+line, column). That is the reader's output (§1: what the text reads as), what a macro takes and returns, and what a **reader macro**
+(§4.8) returns: their results and a macro's are the same type, interchangeable. lair holds the type in two representations that convert without loss: its own value (`lir.sexp/Sexp`, what the reader
 makes and the parser takes) and the objects a macro's code sees, laid out thus, owned by lIR and by no front end (fibber's `Form` is not
 them):
 
@@ -379,8 +382,8 @@ a symbol of exactly that text (one reads back as the type). A string is its byte
 The position is the form's: its line and column, 1-based, and its file as a NUL-terminated path (the module's, or the library's for a
 form in one); line and column 0 and a null file for an object a macro made. Going back, an integer prints in decimal, a float as the
 shortest decimal that reads back to it or `inf`, `-inf`, `nan`. The layout is the contract: a macro may read the fields with
-`getelementptr`, but the functions below are the way, and they are declared in every macro's body without a `declare` (they are the
-only names that are):
+`getelementptr`, but the functions below are the way, and they are declared in every macro's body without a `declare` (they and the
+stream's functions of §4.8 are the only names that are):
 
 | Function | Does |
 |---|---|
@@ -487,6 +490,89 @@ trees, and nothing of fibber's compile goes through this section: a module with 
 and the program's tables are never built for it. A macro library (`require-macros`) imports nothing (`expected define-macro or
 require-macros, found import`). The cases are `cases/lir/imports/`: a module imported by others is a case of its own too (run alone, it is
 `no main function`).
+
+### 4.8 Reader macros
+
+**Proposed** (the lead, 2026-10-25, for gloss item 6: the owner's direction that lIR is LLVM IR as s-expressions, as thin as possible, and
+that a language brings its own syntax as reader macros, "Gloss/fibber might have [], but that doesn't mean the next language will"; §14
+item 17). A module has a **readtable**, Lisp's shape: a character bound to an lIR function that runs at read time, takes the stream and
+returns a form. lIR's own syntax (§1) is untouched: a module that binds nothing reads exactly as before, and the reader hands each of its
+forms on without consulting anything.
+
+```
+(define-reader-macro "C" (STREAM) block+)      ; at the character C, the macro reads what follows and returns the form
+(define-dispatch-macro "C" (STREAM) block+)    ; at #C, the same, the stream after both characters
+(define-token-reader (STREAM TOKEN) block+)    ; after every atom: the atom's form, and the macro returns the form to use
+```
+
+**Definition.** Each body is compiled as a macro's is (§4.6: blocks only, checked when read, the `lir.sexp.*` functions and the
+stream's below declared in it, errors prefixed `reader macro C:`, `dispatch macro #C:` or `token reader:`), under a name of its own in
+the module's macro session; a reader macro may call an earlier `@lir.macro.NAME`. `"C"` is a string of one printable ASCII character
+(`define-reader-macro: the character must be a string of one printable ASCII character`). A reader macro may not be bound to `(`, `)`
+or `;`, and whitespace is not printable (`define-reader-macro: cannot bind (, which is lIR's own`): those are the reader's own, so that a
+list and a comment are always a list and a comment. Any other character may be bound, `"`, `<`, `{`, `[`, `@`, `%` and `#` included, and
+the module's own forms then read under the new table: a module that binds `[` has no array types `[N x T]` unless its macro makes them,
+and one that binds `@` reads its globals through its macro. A dispatch macro may be bound to any printable character, `(`, `)`
+and `;` included (`#(`, `#;`), since the `#` is read first. A later binding of a character replaces the earlier
+(`cases/lir/readers/rebind.lir`), and a later token reader the earlier.
+
+**Reading.** At each form the reader looks at its first character. A bound character runs its reader macro with the stream just after
+it. `#`, once any dispatch macro is bound and `#` itself is not a reader macro, runs the dispatch macro of the character after it with the
+stream after both; `#` before an unbound character is `no dispatch macro for #C` at the `#`, and at the end of the text `unexpected end
+of input after #`. With `#` bound as a reader macro, that macro runs and the dispatch macros are not reached. Anything else is lIR's own
+syntax; an atom (§1: its delimiters are the reader's, so `7/2`, `1_000` and `1.5f32` are one atom each) is read as it always was, and
+when the module has a token reader it is then called with the stream after the atom and the atom's form (an integer, a float or a symbol:
+`1_000` arrives as the symbol `1_000`), and what it returns is the form. The form a macro returns is at the position of the first
+character (the `'` of `'x`, the `#` of `#(..)`); a form it read with `lir.read.form` keeps its own position
+(`cases/lir/readers/positions.lir`). A macro that returns null without a failure read **no form**: the reader goes on as if nothing
+stood there, inside a list or at the top level, which is how `#_` discards the next form (`cases/lir/readers/discard.lir`). A failure
+recorded with `lir.read.fail` is the module's error, at the position the macro gave or at the character; an error in a form the macro
+read through `lir.read.form` (a lexical error, an unclosed list, a nested macro's failure) is the module's error where it is, whatever
+the macro then returns (`cases/lir/readers/reject-nested-error.lir`). Reader macros nested deeper than 64 (a macro reading a form that
+runs a macro, 64 times in) are `reader macros nested deeper than 64`.
+
+**Scope.** A binding applies to the forms after the form that made it, in the module and in a library it is made in; the bindings a
+library makes with `require-macros` (§4.6) are the requiring module's from the require on: a library's reader forms go into the one
+readtable the module and its libraries share, so the smallest import carries syntax as it carries macros
+(`lib/lir/readers.lir`, `cases/lir/readers/required.lir`). A library may hold the three reader forms beside `define-macro` and
+`require-macros`. The readtable is the module's and ends with it; another module starts with none. An `import` (§4.7) crosses no
+readtable: an imported module is read under its own table, with the bindings its own text and its own required libraries make, and
+none of the importer's (`cases/lir/readers/reject-import-leak.lir`: the importer's `?` is `undefined name ?` in the module it imports);
+and an import gives the importer none of the imported module's bindings, as it gives it the module's macros
+(`cases/lir/readers/import-own-table.lir`: `!` means one thing in the importer and another in the module it imports). Syntax travels by
+`require-macros` only.
+
+**The stream.** `STREAM` is a `ptr` to the module's stream, an object laid out thus and reached through these functions, declared in
+every macro's body:
+
+```
+(defstruct lir.read.stream (ptr i64 i64 i64 i64 ptr ptr ptr ptr i64))  ; text, length, offset, line, column, file, mailbox, hook, failure message, failure position
+```
+
+| Function | Does |
+|---|---|
+| `(lir.read.peek s) : i64` | the byte at the stream, -1 at the end of the text; nothing is consumed |
+| `(lir.read.next s) : i64` | that byte, consumed: a newline starts the next line at column 1, a UTF-8 continuation byte leaves the column, any other byte advances it |
+| `(lir.read.position s) : i64` | the position of the stream, `line << 32 \| column`, what `lir.read.fail` takes |
+| `(lir.read.skip s) : i64` | whitespace, commas and comments (§1, the reader's own definition) consumed; the byte after them, -1 at the end |
+| `(lir.read.form s) : ptr` | the next form of the text, read through the readtable, discards passed over: what a `[` macro calls until it sees `]`. Null when it cannot be read (the error is then the module's, above) |
+| `(lir.read.fail s at message) : ptr` | the read fails with `reader macro C: MESSAGE` at the position `at`, or at the character for 0; returns null, for the macro to return |
+
+The reader's cursor is the stream's: the macro runs with the stream where the reader was, and when it returns the reader goes on from
+where the macro left the stream. The text is UTF-8 bytes; a macro that wants characters reads their bytes. `lir.read.form` and
+`lir.read.skip` are the reader's own code run on the macro's behalf (through the mailbox of §11's call bridge, so a macro may read a form
+that runs another macro), which is why they, and not the macro, know what whitespace and a form are.
+
+**Hygiene.** None, as §4.6: a reader macro's result is read as if written in place.
+
+**Where it runs.** On every path that reads lIR text, as §4.6 says, every module of a program (§4.7) under its own table; `lair expand`
+prints a module read under reader macros as the plain lIR it read to, with no reader form left in it, and the backends' differential
+checks feed a file that holds one through `lair expand` as they do a file of macros. A module a front end hands lair as a tree has no
+readtable. The first library is `lib/lir/readers.lir`: `'x` reads as `(quote x)` and `[a b]` as `(vector a b)`, in lIR over the
+stream; what `quote` and `vector` mean is then the module's, by `define-macro`. The cases are `cases/lir/readers/`. The stream's
+functions are an lIR module of lair's (`compiler/native/macros/readlib.fib`) compiled into the macro session beside the form library;
+the reader (`compiler/lir/sexp.fib`) consults the table per form and hands a bound character to the runner
+(`compiler/native/macros/readers.fib`).
 
 ## 5. Functions, blocks and names
 
@@ -1352,3 +1438,4 @@ one the passes used.
 | 14 | facts: `nsw`/`nuw` on `add sub mul shl`, `(assume c)`, `(load (range LO HI) T p)`, each LLVM's own form in LLVM's spelling (lIR is LLVM IR as S-expressions; a front-end abstraction is the front end's to lower into these), and the check mode `FIB_LIR_FACTS=use|trap|ignore` | **Decided** (owner, 2026-10-24); docs/design/lir-facts.md | §6.1, §6.5, §6.12, §6.13, §10 |
 | 15 | compile-time macros in lIR: a module-level `define-macro` whose body is lIR over s-expression objects that lIR owns (`lir.sexp.*`), expansion by lair outermost-first between reading and parsing, `require-macros` of a file of definitions, no hygiene (gensym), `defun` as the first library macro (lib/lir/defun.lir). The named exception to "LLVM's spelling first" (docs/design/lir-language.md D1): LLVM has no macros, and the languages on lIR are libraries of them | **Accepted by default** (the gloss design, 2026-10-25, takes D1's recommendation; the owner may override) | §4, §4.6, §12, cases/lir/macros |
 | 16 | `(import "FILE")`: a program is the union of its modules as `llvm-link` joins LLVM modules; the importer sees the imported module's exported functions as `declare`s, its exported globals as `declare-global`s, its structs, and the macros of its own file; loaded once per program in dependency order, cycles refused, errors at the import with the module's file and position; exported names defined once, declarations agree in type, internal names renamed `NAME.N` on collision; no transitive export, no search root (a path, as `require-macros`); fibber's numbered ids (ADR 0024) are met by the duplicate rule (an emitted program is imported by nothing) | **Accepted by default** (gloss item 3, 2026-10-25; the owner may override) | §4, §4.7, cases/lir/imports |
+| 17 | reader macros: a per-module readtable in Lisp's shape (`define-reader-macro` on a character, `define-dispatch-macro` on the character after `#`, `define-token-reader` after every atom), each an lIR function of the stream (`lir.read.*`) returning a form or no form, run at read time through the macro session; `(`, `)`, `;` and whitespace cannot be bound, everything else can and the module then reads under its table; a required library's bindings are the requiring module's, an import's are not (each module of a program reads under its own table); lIR's own syntax unchanged and a module with no bindings reads as before; `lib/lir/readers.lir` (`'x`, `[a b]`) the first library. The owner's direction of 2026-10-25: lIR as thin as possible, a language brings its own syntax as reader macros | **Proposed** (the lead, 2026-10-25) | §4, §4.8, cases/lir/readers |

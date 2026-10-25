@@ -1,0 +1,39 @@
+;; lib/lir/readers.lir: the first reader macros of lIR (spec/lir.md 4.7), a library loaded by (require-macros "PATH/readers.lir"), the
+;; path relative to the requiring file; the bindings apply to the requiring module's forms after the require.
+;;
+;;   'X          reads as (quote X)
+;;   [A B ..]    reads as (vector A B ..)
+;;
+;; What `quote` and `vector` then mean is the requiring module's: lIR has no such forms, and a macro of the module (define-macro) gives
+;; them theirs (cases/lir/readers/required.lir). Once `[` is bound, the module's array types `[N x T]` read through it too.
+(define-reader-macro "'" (s)
+  (block entry
+    (let ((x (call @lir.read.form s)))
+      (br (icmp eq x (ptr null)) none some)))
+  (block none (ret (ptr null)))
+  (block some
+    (let ((l (call @lir.sexp.list (i64 0))))
+      (call @lir.sexp.push l (call @lir.sexp.symbol (string "quote")))
+      (call @lir.sexp.push l x)
+      (ret l))))
+
+(define-reader-macro "[" (s)
+  (block entry
+    (let ((l (call @lir.sexp.list (i64 0))))
+      (call @lir.sexp.push l (call @lir.sexp.symbol (string "vector")))
+      (br next)))
+  (block next
+    (let ((b (call @lir.read.skip s)))
+      (switch b item ((i64 93) close) ((i64 -1) end))))
+  (block close
+    (call @lir.read.next s)
+    (ret l))
+  (block end
+    (ret (call @lir.read.fail s (i64 0) (string "unclosed ["))))
+  (block item
+    (let ((x (call @lir.read.form s)))
+      (br (icmp eq x (ptr null)) none more)))
+  (block more
+    (call @lir.sexp.push l x)
+    (br next))
+  (block none (ret (ptr null))))

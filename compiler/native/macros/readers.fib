@@ -1,0 +1,148 @@
+;; compiler/native/macros/readers.fib: running the reader macros of a module (spec/lir.md 4.7). The reader (lir.sexp) consults the module's
+;; readtable per byte and hands a bound entry to the runner here, which fills the stream (native.macros.readlib's struct) from the reader's
+;; cursor, runs the compiled macro on a mailbox worker (native.call) and serves its hooks: `lir.read.form` reads the next form through the
+;; reader itself, so a `[` macro reads to `]` with the table in force, and `lir.read.skip` passes whitespace and comments as the lexer
+;; defines them. A nested run (a macro inside a form a macro reads) takes another mailbox; the mailboxes are kept for the module.
+(ns native.macros.readers
+  (:use lir.diag lir.sexp lir.sexp.lexer)
+  (:require [native.call :as call] [native.macros.objects :as obj] [llvm.ffi :as ffi]))
+
+;; Runs nested deeper than this are refused: each level is a mailbox, a thread with a 64 MiB stack.
+(def max-nesting: i64 64)
+
+;; The reader macros of a module: its table, the mailboxes not in use, the streams made (one per text read: the module's, each library's),
+;; the nesting of runs, and the error of a nested read held for the run that caused it.
+(defstruct Readers (table: Readtable pool: (Cell (Vec call/Mailbox)) streams: (Cell (Vec ptr)) depth: (Cell i64) pending: (Cell (Option Diagnostic))))
+
+(defun readers-new () -> Readers
+  (Readers (readtable-new) (cell []) (cell []) (cell 0) (cell nil)))
+
+;; Frees the mailboxes and the streams.
+(defun readers-close (rs: Readers) -> unit
+  (do (dotimes (i (count @(. rs pool))) (call/call-free (nth @(. rs pool) i)))
+      (dotimes (i (count @(. rs streams))) (stream-free (nth @(. rs streams) i)))
+      (set! (. rs pool) [])
+      (set! (. rs streams) [])))
+
+;; Reads `src`, the text of `file` ("" for none), form by form through `f`, with the module's readtable: `lir.sexp/read-each` with reader macros.
+(defun read-with (rs: Readers src: str file: str f: (fn (Sexp) (Option Diagnostic)) :borrow) -> (Option Diagnostic)
+  (let ((st (cell (ffi/addr->ptr 0))))
+    (read-each-with src (. rs table)
+                    (Runner (fn (rd: Reader e: ReaderEntry pos: i64 tok: (Option Sexp)) -> (Result (Option Sexp) Diagnostic)
+                              (run rs st src file rd e pos tok)))
+                    f)))
+
+;; ---------------------------------------------------------------- the stream
+
+(defun word :private (p: ptr off: i64) -> i64
+  (unsafe (load-i64 (ptr+ p off))))
+
+(defun store-word :private (p: ptr off: i64 v: i64) -> unit
+  (unsafe (store-i64 (ptr+ p off) v)))
+
+;; The stream of this text, made at the first run: the text copied, its file as a C string (null for none), the hook of arity 2.
+(defun stream-of :private (rs: Readers st: (Cell ptr) src: str file: str) -> ptr
+  (if (= (ffi/ptr->addr @st) 0)
+      (let ((p (unsafe (alloc 80))))
+        (do (unsafe (store-ptr p (ffi/bytes-new src)))
+            (store-word p 8 (str-len src))
+            (unsafe (store-ptr (ptr+ p 40) (if (= file "") (ffi/addr->ptr 0) (ffi/bytes-new file))))
+            (store-word p 56 (. (call/hook-addresses) two))
+            (set! st p)
+            (set! (. rs streams) (conj @(. rs streams) p))
+            p))
+      @st))
+
+(defun stream-free :private (p: ptr) -> unit
+  (unsafe (do (free (load-ptr p))
+              (if (= (word p 40) 0) () (free (load-ptr (ptr+ p 40))))
+              (free p))))
+
+;; The lexer's cursor into the stream, and back.
+(defun to-stream :private (s: ptr lx: Lexer) -> unit
+  (do (store-word s 16 (lex-offset lx)) (store-word s 24 (lex-line lx)) (store-word s 32 (lex-col lx))))
+
+(defun from-stream :private (s: ptr lx: Lexer) -> unit
+  (lex-seek! lx (word s 16) (word s 24) (word s 32)))
+
+;; ---------------------------------------------------------------- a run
+
+(defun take-mailbox :private (rs: Readers) -> (Result call/Mailbox str)
+  (let ((p @(. rs pool)))
+    (if (empty? p)
+        (call/call-new)
+        (do (set! (. rs pool) (vec-pop p)) (Ok (nth p (- (count p) 1)))))))
+
+(defun give-back :private (rs: Readers mb: call/Mailbox) -> unit
+  (set! (. rs pool) (conj @(. rs pool) mb)))
+
+;; Runs the entry on the stream, positioned where the reader's cursor is; the cursor is then where the macro left the stream.
+(defun run :private (rs: Readers st: (Cell ptr) src: str file: str rd: Reader e: ReaderEntry pos: i64 tok: (Option Sexp)) -> (Result (Option Sexp) Diagnostic)
+  (if (>= @(. rs depth) max-nesting)
+      (err pos (str (. e name) ": reader macros nested deeper than " max-nesting))
+      (match (take-mailbox rs)
+        ((Err m) (err pos (str (. e name) ": " m)))
+        ((Ok mb)
+         (let ((s (stream-of rs st src file)) (lx (. rd lx)) (outer (word s 48)))
+           (do (set! (. rs depth) (+ @(. rs depth) 1))
+               (to-stream s lx)
+               (store-word s 48 (. mb handle))
+               (let ((r (run-on rs st src file rd s mb e pos tok)))
+                 (do (from-stream s lx)
+                     (store-word s 48 outer)
+                     (set! (. rs depth) (- @(. rs depth) 1))
+                     (give-back rs mb)
+                     r))))))))
+
+;; The arguments of the entry: the stream, and for the token reader the token's form as an object.
+(defun arguments :private (s: ptr tok: (Option Sexp)) -> (Vec i64)
+  (match tok
+    (nil [(ffi/ptr->addr s)])
+    ((some t) [(ffi/ptr->addr s) (obj/to-object t (unsafe (load-ptr (ptr+ s 40))))])))
+
+(defun run-on :private (rs: Readers st: (Cell ptr) src: str file: str rd: Reader s: ptr mb: call/Mailbox e: ReaderEntry pos: i64 tok: (Option Sexp)) -> (Result (Option Sexp) Diagnostic)
+  (match (call/call-start mb (. e addr) (arguments s tok))
+    ((Err m) (err pos (str (. e name) ": " m)))
+    ((Ok _) (match (serve rs st src file rd s mb)
+              ((Err m) (err pos (str (. e name) ": " m)))
+              ((Ok _) (finish rs s (call/call-result mb) e pos))))))
+
+;; Serves the hooks until the call returns: `lir.read.form` (code 0) and `lir.read.skip` (code 1) on the stream; anything else answers 0.
+(defun serve :private (rs: Readers st: (Cell ptr) src: str file: str rd: Reader s: ptr mb: call/Mailbox) -> (Result unit str)
+  (loop ()
+    (match (call/call-wait mb)
+      ((Err m) (Err m))
+      ((Ok (call/Done)) (Ok ()))
+      ((Ok (call/Hook k))
+       (do (call/call-hook-reply mb (if (= k 2) (answer rs st src file rd s (call/call-hook-arg mb 1)) 0))
+           (recur))))))
+
+;; The answer of a hook: the reader's cursor is moved to the stream's, the read is made, the stream's cursor to the reader's. A form that
+;; cannot be read is held (`pending`) and the answer is null, for the macro to return.
+(defun answer :private (rs: Readers st: (Cell ptr) src: str file: str rd: Reader s: ptr code: i64) -> i64
+  (let ((lx (. rd lx)))
+    (do (from-stream s lx)
+        (let ((v (cond (= code 0) (next-form rs st src file rd s)
+                       (= code 1) (lex-peek lx)
+                       :else 0)))
+          (do (to-stream s lx) v)))))
+
+(defun next-form :private (rs: Readers st: (Cell ptr) src: str file: str rd: Reader s: ptr) -> i64
+  (match (read-next-form rd (Runner (fn (rd2: Reader e: ReaderEntry pos: i64 tok: (Option Sexp)) -> (Result (Option Sexp) Diagnostic)
+                                     (run rs st src file rd2 e pos tok))))
+    ((Ok f) (obj/to-object f (unsafe (load-ptr (ptr+ s 40)))))
+    ((Err d) (do (if (some? @(. rs pending)) () (set! (. rs pending) (some d))) 0))))
+
+;; What the run came to: a held error of a nested read, the failure the macro recorded (at the position it named, else at the character),
+;; no form (null without a failure), or the form at the character's position.
+(defun finish :private (rs: Readers s: ptr result: i64 e: ReaderEntry pos: i64) -> (Result (Option Sexp) Diagnostic)
+  (let ((msg (word s 64)) (at (word s 72)) (held @(. rs pending)))
+    (do (store-word s 64 0)
+        (store-word s 72 0)
+        (set! (. rs pending) nil)
+        (cond (some? held) (Err (unwrap-or held (Diagnostic pos "")))
+              (not (= msg 0)) (Err (Diagnostic (if (= at 0) pos at) (str (. e name) ": " (ffi/c-string-at msg))))
+              (= result 0) (Ok nil)
+              :else (match (obj/from-object result pos)
+                      ((Ok f) (Ok (some f)))
+                      ((Err m) (err pos (str (. e name) " returned " m))))))))
