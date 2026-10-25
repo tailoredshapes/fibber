@@ -1,0 +1,174 @@
+;; compiler/native/imports.fib: `(import "FILE")` (spec/lir.md 4.7). A program is the union of its modules, as `llvm-link` joins LLVM
+;; modules: each module is loaded once, in dependency order, read and expanded by native.macros (which hands every `import` form here),
+;; checked on its own with the interface of what it imports (the `declare`s, `declare-global`s and `defstruct`s of the imported module's
+;; exported names), and then admitted to the program under the name rules of 4.7: an exported name is defined once, a declared name agrees
+;; in type with its definition, an internal or private name the program already has is renamed `NAME.N`. The named module is admitted last
+;; and the union is what the caller checks (native.pipeline) or dumps (native.cli). A module with no imports is returned as it was parsed:
+;; the tables are never built for it.
+(ns native.imports
+  (:use lir.diag lir.types lir.ast native.imports.program)
+  (:require [native.macros :as macros] [lir.check :as check]))
+
+;; What one module has taken from its imports: the interface items, the internal names of its imports (name -> file), the files imported,
+;; and the file whose `ownership` form (spec/lir.md 6.14.6) it took, if any: one per program, as the `target` form.
+(defstruct Imports (iface: (Cell (Vec LItem)) hidden: (Cell (Map str str)) files: (Cell (Set str)) ownership: (Cell (Option str))))
+
+;; A program loaded: the union of its modules, parsed and expanded, the imported modules checked, the named one not yet; `hidden` explains
+;; a use of a name an import keeps internal in that check (`explain-hidden`).
+(defstruct Program (module: LModule hidden: (Map str str)))
+
+(defun imports-new :private () -> Imports (Imports (cell []) (cell {}) (cell (set-empty)) (cell nil)))
+
+;; A module that writes an `ownership` form beside the one it imports: `ownership: FILE also has an ownership form` at its own
+;; (spec/lir.md 4.7); nil when the module has none or imports none.
+(defun ownership-clash :private (im: Imports own: (Vec LItem)) -> (Result unit Diagnostic)
+  (match @(. im ownership)
+    (nil (Ok ()))
+    ((some file)
+     (match (first (filter (fn (it: LItem) (match it ((ItOwnership _) true) (_ false))) own))
+       ((some (ItOwnership o)) (err (. o pos) (str "ownership: " file " also has an ownership form")))
+       (_ (Ok ()))))))
+
+;; ---------------------------------------------------------------- loading
+
+;; The program of `src`, the text of `file` ("" for none: imports are then relative to the working directory).
+(defun load-program (src: str file: str) -> (Result Program Diagnostic)
+  (let ((st (state-new)) (im (imports-new)))
+    (let ((r (load-main st im src file)))
+      (do (doseq [e @(. st envs)] (macros/env-close e))
+          r))))
+
+;; The named module: parsed with its imports loaded (it is being loaded itself: a module that imports it is a cycle); when it has any,
+;; checked with their interface, admitted last, and the union made.
+(defun load-main :private (st: State im: Imports src: str file: str) -> (Result Program Diagnostic)
+  (try-let ((p (do (set! (. st loading) (conj @(. st loading) file)) (parse-with st im src file))))
+    (let ((own (. (. p module) items)))
+      (if (empty? @(. st loaded))
+          (Ok (Program (. p module) {}))
+          (try-let ((_ (ownership-clash im own))
+                    (_ (check-with im (LModule (into @(. im iface) own))))
+                    (items (admit st file own)))
+            (Ok (Program (LModule (union-items st items)) @(. im hidden))))))))
+
+;; Reads and expands a module, every `import` of it loaded as it is met; the environment is kept open in the state.
+(defun parse-with :private (st: State im: Imports src: str file: str) -> (Result macros/Parsed Diagnostic)
+  (let ((importer (macros/Importer (fn (env: macros/Env path: str pos: i64) (import-into st im env path pos)))))
+    (match (macros/parse-module src file importer)
+      ((Err d) (Err d))
+      ((Ok p) (do (set! (. st envs) (conj @(. st envs) (. p env))) (Ok p))))))
+
+;; `(import PATH)` at `pos` in the module of `env`: nothing when the module imported the file already; a cycle when the file is being loaded;
+;; else the module's export, loaded now if it was not, taken into the importer.
+(defun import-into :private (st: State im: Imports env: macros/Env path: str pos: i64) -> (Option Diagnostic)
+  (let ((file (macros/resolve env path)))
+    (cond (set-contains? @(. im files) file) nil
+          (set-contains? @(. st loading) file) (some (Diagnostic pos (str "import: " file " imports itself")))
+          :else (match (match (get @(. st exports) file) ((some e) (Ok e)) (nil (load-module st file pos)))
+                  ((Err d) (some d))
+                  ((Ok e) (take-export im env e file pos))))))
+
+;; The module of `file` loaded, checked and admitted; its errors are at the import, prefixed with the file.
+(defun load-module :private (st: State file: str pos: i64) -> (Result Export Diagnostic)
+  (match (read-file file)
+    (nil (err pos (str "import: cannot read " file)))
+    ((some src)
+     (do (set! (. st loading) (conj @(. st loading) file))
+         (let ((r (load-text st (imports-new) src file)))
+           (do (set! (. st loading) (disj @(. st loading) file))
+               (match r
+                 ((Ok e) (do (set! (. st exports) (assoc @(. st exports) file e)) (Ok e)))
+                 ((Err d) (err pos (str "import: " file ":" (diag-str d)))))))))))
+
+;; An imported module from its text: parsed, checked with the interface of its own imports, admitted; its export.
+(defun load-text :private (st: State im: Imports src: str file: str) -> (Result Export Diagnostic)
+  (try-let ((p (parse-with st im src file))
+            (_ (ownership-clash im (. (. p module) items)))
+            (_ (check-with im (LModule (into @(. im iface) (. (. p module) items)))))
+            (items (admit st file (. (. p module) items))))
+    (do (set! (. st loaded) (conj @(. st loaded) (Loaded file items)))
+        (Ok (Export (interface items) (hidden-names (. (. p module) items)) (macros/own-macros (. p env)))))))
+
+;; The export of `file` taken into the importing module at the import at `pos`: its interface items there, its internal names remembered,
+;; its macros defined.
+(defun take-export :private (im: Imports env: macros/Env e: Export file: str pos: i64) -> (Option Diagnostic)
+  (match (take-ownership im e file pos)
+    ((some d) (some d))
+    (nil (take-items im env e file pos))))
+
+;; The imported module's `ownership` form, if it has one: the importer's, unless another import brought one already.
+(defun take-ownership :private (im: Imports e: Export file: str pos: i64) -> (Option Diagnostic)
+  (if (some? (first (filter (fn (it: LItem) (match it ((ItOwnership _) true) (_ false))) (. e iface))))
+      (match @(. im ownership)
+        ((some other) (some (Diagnostic pos (str "ownership: " other " also has an ownership form"))))
+        (nil (do (set! (. im ownership) (some file)) nil)))
+      nil))
+
+(defun take-items :private (im: Imports env: macros/Env e: Export file: str pos: i64) -> (Option Diagnostic)
+  (do (set! (. im files) (conj @(. im files) file))
+      (set! (. im iface) (into @(. im iface) (mapv (fn (it: LItem) (item-at it pos)) (. e iface))))
+      (doseq [n (. e hidden)] (set! (. im hidden) (assoc @(. im hidden) n file)))
+      (loop ((i 0))
+        (cond (>= i (count (. e macros))) nil
+              :else (match (macros/define-imported env (nth (. e macros) i) pos)
+                      ((some d) (some d))
+                      (nil (recur (+ i 1))))))))
+
+;; ---------------------------------------------------------------- the check of one module
+
+;; The whole-module check (spec/lir.md 10), its first error explained.
+(defun check-with :private (im: Imports m: LModule) -> (Result unit Diagnostic)
+  (match (check/check m)
+    ((Ok _) (Ok ()))
+    ((Err ds) (Err (explain-hidden @(. im hidden) (nth ds 0))))))
+
+;; `undefined function @f` or `undefined global @f` of a name an import keeps internal says so: `..: internal to FILE`.
+(defun explain-hidden (hidden: (Map str str) d: Diagnostic) -> Diagnostic
+  (match (undefined-name (. d message))
+    (nil d)
+    ((some n) (match (get hidden n)
+                (nil d)
+                ((some file) (Diagnostic (. d pos) (str (. d message) ": internal to " file)))))))
+
+(defun undefined-name :private (message: str) -> (Option str)
+  (cond (starts-with? message "undefined function @") (some (str-slice message 20 (str-len message)))
+        (starts-with? message "undefined global @") (some (str-slice message 18 (str-len message)))
+        :else nil))
+
+;; ---------------------------------------------------------------- the interface
+
+(defun exported? :private (m: LModifiers) -> bool (linkage-exported? (. m linkage)))
+
+
+;; What an importer sees: a `declare` of every exported function with its type and visibility, a `declare-global` of every exported global,
+;; every struct, the `ownership` form (spec/lir.md 6.14.6); nothing of the module's own declarations, its target or its internal names.
+(defun interface :private (items: (Vec LItem)) -> (Vec LItem)
+  (loop ((i 0) (out []))
+    (if (>= i (count items))
+        out
+        (recur (+ i 1)
+               (match (nth items i)
+                 ((ItDefine f) (if (exported? (. f mods)) (conj out (ItDeclare (LDeclare (. f name) (. f ty) (. (. f mods) hidden) 0))) out))
+                 ((ItGlobal g) (if (exported? (. g mods)) (conj out (ItDeclareGlobal (LGlobalDecl (. g name) (. g ty) (. (. g mods) hidden) 0))) out))
+                 ((ItStruct s) (conj out (ItStruct (LStructDef (. s name) (. s fields) 0 (. s mutable)))))
+                 ((ItOwnership o) (conj out (ItOwnership (with o (pos 0)))))
+                 (_ out))))))
+
+;; The names a module keeps to itself.
+(defun hidden-names :private (items: (Vec LItem)) -> (Vec str)
+  (loop ((i 0) (out []))
+    (if (>= i (count items))
+        out
+        (recur (+ i 1)
+               (match (nth items i)
+                 ((ItDefine f) (if (exported? (. f mods)) out (conj out (. f name))))
+                 ((ItGlobal g) (if (exported? (. g mods)) out (conj out (. g name))))
+                 (_ out))))))
+
+;; An interface item at the position of the import.
+(defun item-at :private (it: LItem pos: i64) -> LItem
+  (match it
+    ((ItDeclare d) (ItDeclare (with d (pos pos))))
+    ((ItDeclareGlobal g) (ItDeclareGlobal (with g (pos pos))))
+    ((ItStruct s) (ItStruct (with s (pos pos))))
+    ((ItOwnership o) (ItOwnership (with o (pos pos))))
+    (_ it)))

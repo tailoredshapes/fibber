@@ -1,0 +1,323 @@
+;; compiler/native/macros.fib: the compile-time macros of lIR (spec/lir.md 4.6): `define-macro`, `require-macros`, and the expansion of a
+;; module's forms between reading them and parsing them. A macro is an lIR function from s-expression objects to one, compiled into a JIT
+;; session of the module's own when it is defined (native.jit, as compiler/macros/runner.fib compiles fibber's macros) and called through
+;; native.call when it is used. A module that defines no macro pays one atom comparison per top-level form and nothing else: `top-form`
+;; hands the form straight to the parser (lir.parse.items), and the forms are still read, parsed and freed one at a time. `(import "FILE")`
+;; (spec/lir.md 4.7) is read here and answered by the loader the caller passes in (native.imports).
+(ns native.macros
+  (:use lir.diag lir.sexp lir.ast lir.types native.error)
+  (:require [lir.parse.items :as items] [lir.parse.names :as names] [native.jit :as jit] [native.call :as call]
+            [native.macros.objects :as obj] [native.macros.lib :as lib] [llvm.ffi :as ffi] [native.timing :as timing]))
+
+;; A defined macro: its entry, a ccc function of `fixed` ptr parameters and one more for the rest when `rest`; the file it was defined in
+;; (an imported module exports the macros of its own file, spec/lir.md 4.7); and the two entries of the session it lives in, which the runner
+;; calls when it returns null (`lir.sexp.failure-take`, `lir.sexp.failure-at`): a macro of an imported module runs in that module's session.
+(defstruct Macro (name: str entry: i64 fixed: i64 rest: bool file: str take: i64 at: i64))
+
+;; The macro session of a module, made at its first `define-macro` and freed when the program is parsed (`env-close`): the library's two
+;; entries the runner calls.
+(defstruct Session (jit: jit/JitSession take: i64 at: i64))
+
+;; What `(import "FILE")` does (spec/lir.md 4.7), given the importing module's environment, the file as written and the form's position:
+;; native.imports loads the module and defines its macros in the environment; the interface items are the loader's to keep. The macros
+;; module knows nothing of modules: a text with no loader (a macro library) refuses the form.
+(defstruct Importer (load: (fn (Env str i64) (Option Diagnostic))))
+
+;; A module read and expanded: its environment, kept open while another module may still use its macros, and its items.
+(defstruct Parsed (env: Env module: LModule))
+
+;; One module's expansion: the file it is read from ("" for text with no file: `require-macros` is then relative to the working directory)
+;; and the same as a C string for the objects (null for none), the macros so far, the session, the libraries loaded (once each) and being
+;; loaded (a cycle), and the nanoseconds spent in macros.
+(defstruct Env (file: str cfile: ptr macros: (Cell (Map str Macro)) session: (Cell (Option Session)) loaded: (Cell (Set str)) loading: (Cell (Set str)) ns: (Cell i64)))
+
+(def max-params: i64 8)
+(def max-steps: i64 512)
+(def form-names: (Set str) #{"define" "declare" "declare-global" "defstruct" "global" "constant" "target" "define-macro" "require-macros" "import" "block" "let"})
+
+;; The module's own file counts as being loaded: a library that requires it is a cycle.
+(defun env-new :private (file: str) -> Env
+  (Env file (file-cstr file) (cell (map-empty)) (cell nil) (cell (set-empty)) (cell (if (= file "") (set-empty) #{file})) (cell 0)))
+
+;; The file as the objects carry it: a C string that lives as long as they do, null for none.
+(defun file-cstr :private (file: str) -> ptr
+  (if (= file "") (ffi/addr->ptr 0) (ffi/bytes-new file)))
+
+;; Reads `src` (the text of `file`) into forms, and expands and parses each as it is read: lir.parse `parse-source` with the expansion between,
+;; and `(import ..)` answered by the importer. The environment comes back open: the caller closes it (`env-close`) when no module can use
+;; its macros any more (native.imports, at the end of the program).
+(defun parse-module (src: str file: str importer: Importer) -> (Result Parsed Diagnostic)
+  (let ((env (env-new file)) (items (cell (vec-empty))))
+    (match (read-each src (fn (form: Sexp) (top-form env items importer form)))
+      ((some d) (do (env-close env) (Err d)))
+      (nil (Ok (Parsed env (LModule @items)))))))
+
+;; Frees the module's macro session, if it made one.
+(defun env-close (env: Env) -> unit
+  (match @(. env session)
+    (nil ())
+    ((some s) (do (jit/session-free (. s jit))
+                  (when (timing/enabled?) (eprintln (str "time lir.macros " (quot @(. env ns) 1000000) " ms")))))))
+
+(defun head-of :private (form: Sexp) -> str
+  (match form
+    ((SxList its _) (if (empty? its) "" (names/atom-or-empty (nth its 0))))
+    (_ "")))
+
+;; One top-level form: a macro's definition, a library of them, an import, or a form expanded and parsed.
+(defun top-form :private (env: Env items: (Cell (Vec LItem)) importer: Importer form: Sexp) -> (Option Diagnostic)
+  (let ((head (head-of form)))
+    (cond (= head "define-macro") (define-macro env form)
+          (= head "require-macros") (require-macros env form)
+          (= head "import") (import-form env importer form)
+          :else (match (if (empty? @(. env macros)) (Ok form) (expand env form))
+                  ((Err d) (some d))
+                  ((Ok f) (match (items/parse-item f)
+                            ((Err d) (some d))
+                            ((Ok it) (do (update! items (fn (v) (conj v it))) nil))))))))
+
+;; ---------------------------------------------------------------- expansion
+
+(defun macro-of :private (env: Env its: (Vec Sexp)) -> (Option Macro)
+  (if (empty? its) nil (match (nth its 0) ((SxAtom a _) (get @(. env macros) a)) (_ nil))))
+
+(defun expand-all :private (env: Env its: (Vec Sexp)) -> (Result (Vec Sexp) Diagnostic)
+  (loop ((i 0) (out []))
+    (if (>= i (count its))
+        (Ok out)
+        (match (expand env (nth its i)) ((Err d) (Err d)) ((Ok f) (recur (+ i 1) (conj out f)))))))
+
+;; Every macro use in the form replaced by its expansion, outermost first: a use is replaced by what the macro returns, that is expanded
+;; again while its head names a macro, and then its children are expanded. The arguments of a use reach the macro unexpanded.
+(defun expand :private (env: Env form: Sexp) -> (Result Sexp Diagnostic)
+  (match form
+    ((SxList its pos) (match (macro-of env its)
+                        ((some m) (expand-use env m its pos 0))
+                        (nil (match (expand-all env its) ((Err d) (Err d)) ((Ok xs) (Ok (SxList xs pos)))))))
+    ((SxBrace its pos) (match (expand-all env its) ((Err d) (Err d)) ((Ok xs) (Ok (SxBrace xs pos)))))
+    ((SxBracket its pos) (match (expand-all env its) ((Err d) (Err d)) ((Ok xs) (Ok (SxBracket xs pos)))))
+    (_ (Ok form))))
+
+(defun expand-use :private (env: Env m: Macro its: (Vec Sexp) pos: i64 steps: i64) -> (Result Sexp Diagnostic)
+  (if (>= steps max-steps)
+      (err pos (str "macro " (. m name) ": the expansion does not end after " max-steps " steps"))
+      (match (apply-macro env m its pos)
+        ((Err d) (Err d))
+        ((Ok out) (match out
+                    ((SxList xs p) (match (macro-of env xs)
+                                     ((some m2) (expand-use env m2 xs p (+ steps 1)))
+                                     (nil (expand env out))))
+                    (_ (Ok out)))))))
+
+(defun arity-text :private (m: Macro) -> str
+  (str (. m fixed) (if (. m rest) " or more" "") " argument" (if (and (= (. m fixed) 1) (not (. m rest))) "" "s")))
+
+;; The objects a macro's entry takes: one per fixed parameter, then the list of the remaining arguments for a rest parameter.
+(defun argument-objects :private (env: Env m: Macro its: (Vec Sexp) pos: i64) -> (Vec i64)
+  (let ((file (. env cfile))
+        (fixed (mapv (fn (i: i64) (obj/to-object (nth its (+ i 1)) (. env cfile))) (range (. m fixed)))))
+    (if (. m rest) (conj fixed (obj/to-object (SxList (names/vec-from its (+ (. m fixed) 1)) pos) file)) fixed)))
+
+;; The use `its` (the macro's name first, at `pos`) replaced by what the macro returns.
+(defun apply-macro :private (env: Env m: Macro its: (Vec Sexp) pos: i64) -> (Result Sexp Diagnostic)
+  (let ((n (- (count its) 1)) (t0 (sys-clock-now)))
+    (if (or (< n (. m fixed)) (and (not (. m rest)) (> n (. m fixed))))
+        (err pos (str "macro " (. m name) " expects " (arity-text m) ", found " n))
+        (let ((r (call/call-i64 (. m entry) (argument-objects env m its pos))))
+          (do (set! (. env ns) (+ @(. env ns) (- (sys-clock-now) t0)))
+              (match r
+                ((Err e) (err pos (str "macro " (. m name) ": " e)))
+                ((Ok a) (if (= a 0)
+                            (Err (failure m pos))
+                            (match (obj/from-object a pos)
+                              ((Ok f) (Ok f))
+                              ((Err e) (err pos (str "macro " (. m name) " returned " e))))))))))))
+
+(defun word-or-zero :private (r: (Result i64 str)) -> i64
+  (match r ((Ok v) v) ((Err _) 0)))
+
+;; What a macro that returned null said through `lir.sexp.fail`, at the object it named when it named one: read from the macro's own session.
+(defun failure :private (m: Macro pos: i64) -> Diagnostic
+  (let ((msg (word-or-zero (call/call-i64 (. m take) []))) (at (word-or-zero (call/call-i64 (. m at) []))))
+    (if (= msg 0)
+        (Diagnostic pos (str "macro " (. m name) " returned no form"))
+        (Diagnostic (if (= at 0) pos at) (str "macro " (. m name) ": " (ffi/c-string-at msg))))))
+
+;; ---------------------------------------------------------------- the session
+
+(defun lair-str :private (r: (Result a LairError)) -> (Result a str)
+  (match r ((Ok v) (Ok v)) ((Err e) (Err (lair-error-str e)))))
+
+;; A fast-codegen session with the library in it, and the runner's two entries.
+(defun session-new :private () -> (Result Session str)
+  (try-let ((j (lair-str (jit/session-new-fast-codegen 0)))
+            (_ (lair-str (jit/session-add-source j "lir.sexp" (lib/lib-source))))
+            (take (lair-str (jit/session-address j "lir.sexp.failure-take")))
+            (at (lair-str (jit/session-address j "lir.sexp.failure-at"))))
+    (Ok (Session j take at))))
+
+(defun session-of :private (env: Env) -> (Result Session str)
+  (match @(. env session)
+    ((some s) (Ok s))
+    (nil (match (session-new)
+           ((Err e) (Err e))
+           ((Ok s) (do (set! (. env session) (some s)) (Ok s)))))))
+
+;; ---------------------------------------------------------------- define-macro
+
+(defstruct Params (names: (Vec str) rest: bool))
+
+(defun macro-name :private (env: Env s: Sexp) -> (Result str Diagnostic)
+  (try-let ((a (names/atom-text s "a macro name"))
+            (n (names/valid-name a (sexp-pos s))))
+    (cond (contains? form-names n) (err (sexp-pos s) (str "macro " n ": the name of a form"))
+          (some? (get @(. env macros) n)) (err (sexp-pos s) (str "duplicate macro " n))
+          :else (Ok n))))
+
+(defun param-name :private (s: Sexp out: (Vec str)) -> (Result str Diagnostic)
+  (try-let ((a (names/atom-text s "a parameter name"))
+            (n (names/valid-name a (sexp-pos s))))
+    (if (some? (first (filter (fn (x: str) (= x n)) out)))
+        (err (sexp-pos s) (str "duplicate parameter " n))
+        (Ok n))))
+
+;; `(NAME.. ...?)`: at most 8 names, each once; `...` last and after a name, which is then bound to the list of the remaining arguments.
+(defun macro-params :private (s: Sexp) -> (Result Params Diagnostic)
+  (match s
+    ((SxList ps pos)
+     (loop ((i 0) (out []))
+       (cond (> (count out) max-params) (err pos (str "a macro takes at most " max-params " parameters"))
+             (>= i (count ps)) (Ok (Params out false))
+             (names/atom-is? (nth ps i) "...")
+             (cond (= i 0) (err (sexp-pos (nth ps i)) "... must follow a parameter name")
+                   (not (= i (- (count ps) 1))) (err (sexp-pos (nth ps i)) "... must be the last parameter")
+                   :else (Ok (Params out true)))
+             :else (match (param-name (nth ps i) out)
+                     ((Err d) (Err d))
+                     ((Ok n) (recur (+ i 1) (conj out n)))))))
+    (_ (err (sexp-pos s) "expected a parameter list (NAME..)"))))
+
+;; `(define (lir.macro.NAME ptr) ((ptr P)..) BLOCK..)`: the macro as an ordinary function of its session.
+(defun macro-define :private (name: str ps: Params blocks: (Vec Sexp) pos: i64) -> Sexp
+  (SxList (into [(SxAtom "define" pos)
+                 (SxList [(SxAtom (str "lir.macro." name) pos) (SxAtom "ptr" pos)] pos)
+                 (SxList (mapv (fn (p: str) (SxList [(SxAtom "ptr" pos) (SxAtom p pos)] pos)) (. ps names)) pos)]
+                blocks)
+          pos))
+
+;; `(declare lir.macro.NAME ptr (ptr..))` of every macro defined so far in the session `s`, as text: a macro's body may call an earlier
+;; macro's function. A macro of an imported module is in that module's session: it is used, not called (spec/lir.md 4.7).
+(defun macro-declares :private (env: Env s: Session) -> str
+  (str-join-with "\n"
+    (mapv (fn (m: Macro) (str "(declare lir.macro." (. m name) " ptr (" (str-join-with " " (vec-fill (+ (. m fixed) (if (. m rest) 1 0)) "ptr")) "))"))
+          (vec (filter (fn (m: Macro) (= (. m take) (. s take))) (vals @(. env macros)))))))
+
+;; The items of a macro's module: the library's declarations, the earlier macros', then the definition.
+(defun macro-module :private (env: Env s: Session def: Sexp) -> (Result LModule Diagnostic)
+  (try-let ((forms (read (str (lib/declares-source) "\n" (macro-declares env s)))))
+    (loop ((i 0) (out []))
+      (if (>= i (count forms))
+          (match (items/parse-item def) ((Err d) (Err d)) ((Ok it) (Ok (LModule (conj out it)))))
+          (match (items/parse-item (nth forms i)) ((Err d) (Err d)) ((Ok it) (recur (+ i 1) (conj out it))))))))
+
+;; The error of a macro's module the session refused: the checker's first diagnostic, where it is in the file, or the JIT's text.
+(defun module-error :private (name: str e: LairError pos: i64) -> Diagnostic
+  (match e
+    ((ErrInvalid ds) (if (empty? ds)
+                         (Diagnostic pos (str "macro " name ": invalid"))
+                         (Diagnostic (. (nth ds 0) pos) (str "macro " name ": " (. (nth ds 0) message)))))
+    (_ (Diagnostic pos (str "macro " name ": " (lair-error-str e))))))
+
+;; `(define-macro NAME (PARAM..) BLOCK..)`: the blocks are expanded with the macros so far, then compiled.
+(defun define-macro :private (env: Env form: Sexp) -> (Option Diagnostic)
+  (match form
+    ((SxList its pos)
+     (if (< (count its) 4)
+         (some (Diagnostic pos "define-macro expects NAME, (PARAM..) and blocks"))
+         (match (try-let ((name (macro-name env (nth its 1)))
+                          (ps (macro-params (nth its 2)))
+                          (blocks (expand-all env (names/vec-from its 3))))
+                  (compile-macro env name ps blocks pos))
+           ((Err d) (some d))
+           ((Ok _) nil))))
+    (_ (some (Diagnostic (sexp-pos form) "define-macro expects NAME, (PARAM..) and blocks")))))
+
+;; Compiles the macro into the session and records it.
+(defun compile-macro :private (env: Env name: str ps: Params blocks: (Vec Sexp) pos: i64) -> (Result unit Diagnostic)
+  (let ((t0 (sys-clock-now)))
+    (try-let ((s (match (session-of env) ((Err e) (err pos (str "macro " name ": " e))) ((Ok s) (Ok s))))
+              (m (macro-module env s (macro-define name ps blocks pos)))
+              (_ (match (jit/session-add-module (. s jit) (str "macro." name) m) ((Err e) (Err (module-error name e pos))) ((Ok _) (Ok ()))))
+              (entry (match (jit/session-address (. s jit) (str "lir.macro." name)) ((Err e) (Err (module-error name e pos))) ((Ok a) (Ok a)))))
+      (do (set! (. env macros) (assoc @(. env macros) name (Macro name entry (- (count (. ps names)) (if (. ps rest) 1 0)) (. ps rest) (. env file) (. s take) (. s at))))
+          (set! (. env ns) (+ @(. env ns) (- (sys-clock-now) t0)))
+          (Ok ())))))
+
+;; ---------------------------------------------------------------- require-macros
+
+;; The directory of a path, with its slash; "" when it has none.
+(defun dir-of :private (file: str) -> str
+  (loop ((i (- (str-len file) 1)))
+    (cond (< i 0) ""
+          (= (str-byte-at file i) 47i8) (str-slice file 0 (+ i 1))
+          :else (recur (- i 1)))))
+
+;; `FILE` of a `require-macros` or an `import`: as written when absolute or when the module has no file, else beside the module's file.
+(defun resolve (env: Env path: str) -> str
+  (if (or (starts-with? path "/") (= (. env file) "")) path (str (dir-of (. env file)) path)))
+
+;; `(import "FILE")` (spec/lir.md 4.7): the form is checked here, the module is the importer's.
+(defun import-form :private (env: Env importer: Importer form: Sexp) -> (Option Diagnostic)
+  (match form
+    ((SxList its pos)
+     (if (not (= (count its) 2))
+         (some (Diagnostic pos "import expects one string, the file"))
+         (match (nth its 1)
+           ((SxStr bs _) ((. importer load) env (str-from-bytes bs) pos))
+           (other (some (Diagnostic (sexp-pos other) (str "import expects a string, found " (sexp-describe other))))))))
+    (_ (some (Diagnostic (sexp-pos form) "import expects one string, the file")))))
+
+;; The macros a module defined in its own file (not those it required or imported), for an importer of it.
+(defun own-macros (env: Env) -> (Vec Macro)
+  (vec (filter (fn (m: Macro) (= (. m file) (. env file))) (vals @(. env macros)))))
+
+;; Defines in `env` a macro of an imported module, at the import at `pos`.
+(defun define-imported (env: Env m: Macro pos: i64) -> (Option Diagnostic)
+  (if (some? (get @(. env macros) (. m name)))
+      (some (Diagnostic pos (str "duplicate macro " (. m name))))
+      (do (set! (. env macros) (assoc @(. env macros) (. m name) m)) nil)))
+
+;; `(require-macros "FILE")`.
+(defun require-macros :private (env: Env form: Sexp) -> (Option Diagnostic)
+  (match form
+    ((SxList its pos)
+     (if (not (= (count its) 2))
+         (some (Diagnostic pos "require-macros expects one string, the file"))
+         (match (nth its 1)
+           ((SxStr bs _) (load-library env (resolve env (str-from-bytes bs)) pos))
+           (other (some (Diagnostic (sexp-pos other) (str "require-macros expects a string, found " (sexp-describe other))))))))
+    (_ (some (Diagnostic (sexp-pos form) "require-macros expects one string, the file")))))
+
+;; The macros of the file `path` defined in `env`, once per module; a file that requires itself, through others or not, is a cycle.
+(defun load-library :private (env: Env path: str pos: i64) -> (Option Diagnostic)
+  (cond (set-contains? @(. env loaded) path) nil
+        (set-contains? @(. env loading) path) (some (Diagnostic pos (str "require-macros: " path " requires itself")))
+        :else (match (read-file path)
+                (nil (some (Diagnostic pos (str "require-macros: cannot read " path))))
+                ((some text)
+                 (let ((sub (Env path (file-cstr path) (. env macros) (. env session) (. env loaded) (. env loading) (. env ns))))
+                   (do (set! (. env loading) (conj @(. env loading) path))
+                       (let ((r (read-each text (fn (f: Sexp) (library-form sub f)))))
+                         (do (set! (. env loading) (disj @(. env loading) path))
+                             (set! (. env loaded) (conj @(. env loaded) path))
+                             (match r
+                               (nil nil)
+                               ((some d) (some (Diagnostic pos (str "require-macros: " path ":" (diag-str d))))))))))))))
+
+;; A form of a macro library: a definition or another library, nothing else (a library is no module: there is nothing to link its items into,
+;; and it imports nothing).
+(defun library-form :private (env: Env form: Sexp) -> (Option Diagnostic)
+  (let ((head (head-of form)))
+    (cond (= head "define-macro") (define-macro env form)
+          (= head "require-macros") (require-macros env form)
+          :else (some (Diagnostic (sexp-pos form) (str "expected define-macro or require-macros, found " (sexp-describe form)))))))

@@ -33,9 +33,13 @@
           acc
           (recur (conj acc (Pair i (report-of lair (nth cases i) scratch i))))))))
 
-;; Runs every case with `lair` as the tool, in parallel; the reports in the order of `cases`. (mod.rs `run_all`)
+;; Runs every case with `lair` as the tool, `cases-workers` at a time; the reports in the order of `cases`. (mod.rs `run_all`)
 (defun cases-run-all (lair: str cases: (Vec str) scratch: str) -> (Vec CaseReport)
+  (cases-run-with lair cases scratch (cases-workers)))
+
+;; As `cases-run-all` with `workers` at a time (`lair cases -j N`).
+(defun cases-run-with (lair: str cases: (Vec str) scratch: str workers: i64) -> (Vec CaseReport)
   (let ((next (atom 0))
-        (tasks (mapv (fn (k: i64) (spawn (fn () (work next lair cases scratch)))) (range (cases-workers))))
+        (tasks (mapv (fn (k: i64) (spawn (fn () (work next lair cases scratch)))) (range (if (> workers 0) workers 1))))
         (all (reduce (fn (a: (Vec (Pair i64 CaseReport)) t) (into a (join t))) [] tasks)))
     (mapv (fn (p: (Pair i64 CaseReport)) (. p snd)) (vec (sort (fn (x: (Pair i64 CaseReport) y: (Pair i64 CaseReport)) (compare (. x fst) (. y fst))) all)))))

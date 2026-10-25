@@ -1,0 +1,31 @@
+;; expect: accept
+;; out: 28 73 1
+;; out: 29 73 1
+;; out: 0 0 0
+;; spec/lir.md 4.6: every form carries its position: (line-of X), (column-of X) and (file-known X) expand to the line, the column and
+;; whether a file is known of the argument X as it was read; an object a macro made has line 0, column 0 and no file.
+(declare printf i32 (ptr ...))
+(define-macro lit64 (v)
+  (block entry
+    (let ((l (call @lir.sexp.list (i64 0))))
+      (call @lir.sexp.push l (call @lir.sexp.symbol (string "i64")))
+      (call @lir.sexp.push l v)
+      (ret l))))
+(define-macro line-of (x)
+  (block entry (ret (call @lir.macro.lit64 (call @lir.sexp.integer (call @lir.sexp.line x))))))
+(define-macro column-of (x)
+  (block entry (ret (call @lir.macro.lit64 (call @lir.sexp.integer (call @lir.sexp.column x))))))
+(define-macro file-known (x)
+  (block entry
+    (ret (call @lir.macro.lit64 (call @lir.sexp.integer (zext i64 (icmp ne (call @lir.sexp.file x) (ptr null))))))))
+(define-macro made (x)
+  (block entry
+    (let ((fresh (call @lir.sexp.symbol (string "made"))))
+      (ret (call @lir.macro.lit64 (call @lir.sexp.integer (add (add (call @lir.sexp.line fresh) (call @lir.sexp.column fresh))
+                                                               (zext i64 (icmp ne (call @lir.sexp.file fresh) (ptr null))))))))))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "%lld %lld %lld\n") (line-of here) (column-of here) (file-known here))
+    (call @printf (string "%lld %lld %lld\n") (line-of here) (column-of here) (file-known here))
+    (call @printf (string "%lld %lld %lld\n") (made 1) (i64 0) (i64 0))
+    (ret (i32 0))))

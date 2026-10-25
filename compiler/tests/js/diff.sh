@@ -48,6 +48,9 @@ done
 # One program: both runs, compared. Prints its row.
 one() {
   f=$1; name=${f#"$root"/}; d=$work/run/$(echo "$name" | tr '/' '_'); mkdir -p "$d"
+  # The case's mode of the ownership verifier (spec/lir.md 6.14.5, the header's `own:` line, as `lairf cases` reads it) for both runs:
+  # lir2js checks with lair's checker, so under `verify` it refuses what lairf refuses, with the same text.
+  own=$(sed -n 's/^;; own: *//p' "$f" | head -1); export FIB_LIR_OWN=${own:-report}
   ulimit -c 0; exec 2> /dev/null   # bash reports a child killed by a signal on its standard error; both runs' own stderr go to files
   if [ "${f%.fib}" != "$f" ]; then
     inc=(); for r in $(sed -n 's/^;; roots: *//p' "$f" | head -1); do inc+=(-I "$(dirname "$f")/$r"); done   # the case's module roots
@@ -56,8 +59,22 @@ one() {
   fi
   (timeout "$TMO" "$LAIRF" run "$f" > "$d/n.out" 2> "$d/n.err") 2> /dev/null; ns=$?
   if [ $ns -eq 124 ]; then echo "skip $name: the native run timed out"; return; fi
-  if grep -q '^;; expect: reject' "$f"; then   # both must refuse it with the same diagnostics: lir2js reads it with lair's reader and checker
+  sed -i '/^lir\.own: /d' "$d/n.err"   # the ownership verifier's report-mode summary (spec/lir.md 6.14.5) is the checker's line, printed by `lairf run` before the program runs; lir2js prints it when it translates
+  reject=0; grep -q '^;; expect: reject' "$f" && reject=1
+  # A file that defines or requires macros (spec/lir.md 4.6): lir2js has no compile-time runtime, so it reads the expanded lIR `lairf expand`
+  # prints; an expansion lairf refuses is the verdict lir2js is compared with (the backend never sees such a module). A file with no macros goes
+  # to lir2js as it is, so that a diagnostic's position is the file's.
+  if grep -qE '^\((define-macro|require-macros|import) ' "$f"; then
+    "$LAIRF" expand "$f" > "$d/x.lir" 2> "$d/x.err"; xs=$?
+    if [ $xs -ne 0 ]; then
+      if [ $reject -eq 1 ] && [ $xs -eq $ns ] && cmp -s "$d/n.err" "$d/x.err"; then echo "pass $name"; else echo "differ $name: lairf expand failed with exit $xs, native $ns: $(head -c 150 "$d/x.err")"; fi
+      return
+    fi
+    orig=$f; f=$d/x.lir
+  fi
+  if [ $reject -eq 1 ]; then   # both must refuse it with the same diagnostics: lir2js reads it with lair's reader and checker
     "$LIR2JS" "$f" -o "$d/p.mjs" --rt "$RT" > /dev/null 2> "$d/t.err"; ts=$?
+    [ "$f" = "$d/x.lir" ] && sed -i "s|$d/x.lir|$orig|g" "$d/t.err"   # a diagnostic of the expanded text names the file it came from
     if [ $ts -eq $ns ] && cmp -s "$d/n.err" "$d/t.err"; then echo "pass $name"; else echo "differ $name: rejected with exit $ts, native $ns: $(head -c 150 "$d/t.err")"; fi
     return
   fi
