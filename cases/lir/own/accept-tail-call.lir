@@ -1,0 +1,67 @@
+;; expect: accept
+;; own: verify
+;; out: alloc 3 size 32
+;; out: free 3
+;; out: work 42
+;; spec/lir.md 6.14.5 rule 7: the owned value is released before the tail call.
+(declare printf i32 (ptr ...))
+(declare malloc ptr (i64))
+(declare free void (ptr))
+(defstruct hdr (i64 i32 i32))
+(defstruct box (%struct.hdr i64 (ptr 1)))
+(ownership (retain @rt.retain) (release @rt.release) (unique @rt.unique) (alloc @rt.alloc) (stack-init @rt.stack-init) (stack-end @rt.stack-end) (header %struct.hdr))
+(define unsafe internal (rt.alloc ptr) ((i64 size) (i32 tid))
+  (block entry
+    (let ((p (call @malloc size)))
+      (store (i64 1) (getelementptr %struct.hdr p (i32 0) (i32 0)))
+      (store tid (getelementptr %struct.hdr p (i32 0) (i32 1)))
+      (store (i32 0) (getelementptr %struct.hdr p (i32 0) (i32 2)))
+      (call @printf (string "alloc %d size %lld\n") tid size)
+      (ret p))))
+(define unsafe internal (rt.retain void) ((ptr p))
+  (block entry (br (icmp eq p (ptr null)) done inc))
+  (block inc
+    (let ((c (getelementptr %struct.hdr p (i32 0) (i32 0))))
+      (store (add (load i64 c) (i64 1)) c)
+      (call @printf (string "retain %d -> %lld\n") (load i32 (getelementptr %struct.hdr p (i32 0) (i32 1))) (load i64 c))
+      (ret)))
+  (block done (ret)))
+(define unsafe internal (rt.release void) ((ptr p))
+  (block entry (br (icmp eq p (ptr null)) done dec))
+  (block dec
+    (let ((c (getelementptr %struct.hdr p (i32 0) (i32 0)))
+          (n (sub (load i64 c) (i64 1))))
+      (store n c)
+      (br (icmp eq n (i64 0)) gone done)))
+  (block gone
+    (call @printf (string "free %d\n") (load i32 (getelementptr %struct.hdr p (i32 0) (i32 1))))
+    (call @free p)
+    (ret))
+  (block done (ret)))
+(define unsafe internal (rt.unique i1) ((ptr p))
+  (block entry (ret (icmp eq (load i64 (getelementptr %struct.hdr p (i32 0) (i32 0))) (i64 1)))))
+(define unsafe internal (rt.stack-init void) ((ptr p) (i32 tid))
+  (block entry
+    (store (i64 0) (getelementptr %struct.hdr p (i32 0) (i32 0)))
+    (store tid (getelementptr %struct.hdr p (i32 0) (i32 1)))
+    (store (i32 4) (getelementptr %struct.hdr p (i32 0) (i32 2)))
+    (ret)))
+(define unsafe internal (rt.stack-end void) ((ptr p))
+  (block entry
+    (call @printf (string "stack-end %d\n") (load i32 (getelementptr %struct.hdr p (i32 0) (i32 1))))
+    (ret)))
+(define internal (peek i64) (((ptr 1) b))
+  (block entry (ret (load i64 (getelementptr %struct.box b (i32 0) (i32 1))))))
+(define internal tailcc (finish i64) ((i64 n)) (block entry (ret (mul n (i64 2)))))
+(define internal tailcc (work i64) ((i64 n))
+  (block entry
+    (let ((x (alloc-object %struct.box (i32 3))))
+      (store n (getelementptr %struct.box x (i32 0) (i32 1)))
+      (store init ((ptr 1) null) (getelementptr %struct.box x (i32 0) (i32 2)))
+      (let ((v (load i64 (getelementptr %struct.box x (i32 0) (i32 1)))))
+        (destroy-value x)
+        (tailcall @finish v)))))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "work %lld\n") (call @work (i64 21)))
+    (ret (i32 0))))
