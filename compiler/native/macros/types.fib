@@ -1,0 +1,52 @@
+;; compiler/native/macros/types.fib: the records of the expander (native.macros): a macro, a session, an importer, a parsed module, a module's
+;; expansion environment, a macro's parameters, and the limits and the list of lIR's directions. Here, under native.macros, so that the helpers
+;; (native.macros.helpers) and the expander share them (ADR 0006: files under 500 lines).
+(ns native.macros.types
+  (:use lir.diag lir.sexp lir.ast)
+  (:require [native.jit :as jit] [native.call :as call] [native.macros.readers :as readers]))
+
+;; A defined macro: its entry, a ccc function of `fixed` ptr parameters and one more for the rest when `rest`; the file it was defined in
+;; (an imported module exports the macros of its own file, spec/lir.md 4.7); and the two entries of the session it lives in, which the runner
+;; calls when it returns null (`lir.sexp.failure-take`, `lir.sexp.failure-at`): a macro of an imported module runs in that module's session.
+(defstruct Macro (name: str entry: i64 fixed: i64 rest: bool file: str take: i64 at: i64 session: Session))
+
+;; The macro session of a module, made at its first `define-macro` and freed when the program is parsed (`env-close`): the library's two
+;; entries the runner calls.
+;; `set-hook` is the library's entry that names the hook and the mailbox `lir.sexp.expand` parks on; `readers` are the module's: a macro
+;; runs on their one worker, the module's, which its reader macros run on (native.macros.readers, made with the session and hooked then): a
+;; nested run, a macro the expansion of `lir.sexp.expand` applies, runs on the same worker inside the hook (native.call `call-nest`, as a
+;; reader macro's nested read does), started or nested by the readers' one count of runs; `pending` is the error of a nested expansion, the
+;; use's error.
+;; `imported`: the macro-imported modules by canonical path with their interface items; `importing`: those being compiled (a cycle);
+;; `iface`: every interface, declared in the macro bodies compiled after.
+(defstruct Session (jit: jit/JitSession take: i64 at: i64 set-hook: i64 readers: readers/Readers pending: (Cell (Option Diagnostic))
+                    imported: (Cell (Map str (Vec LItem))) importing: (Cell (Set str)) iface: (Cell (Vec LItem))))
+
+;; What `(import "FILE")` does (spec/lir.md 4.7), given the importing module's environment, the file as written and the form's position:
+;; native.imports loads the module and defines its macros in the environment; the interface items are the loader's to keep. The macros
+;; module knows nothing of modules: a text with no loader (a macro library) refuses the form. `gensym`: the address of the word the program's
+;; gensym counter lives in (spec/lir.md 4.6), the loader's, which every module's session is given.
+(defstruct Importer (load: (fn (Env str i64) (Option Diagnostic)) gensym: i64))
+
+;; A module read and expanded: its environment, kept open while another module may still use its macros, and its items.
+(defstruct Parsed (env: Env module: LModule))
+
+;; One module's expansion: the file it is read from ("" for text with no file: `require-macros` is then relative to the working directory)
+;; and the same as a C string for the objects (null for none), the macros so far, the session, the libraries loaded (once each) and being
+;; loaded (a cycle), the nanoseconds spent in macros, the reader macros (the readtable and its runner, spec/lir.md 4.8: a module's own, which
+;; an import neither takes from nor gives to it) and the count of reader macros compiled (each is a function of its own name in the session).
+;; `hook`: the module macro `(module-macro NAME)` armed, with the direction's position; `collected`: the forms read since, for it; `gensym`:
+;; the program's gensym word (the importer's).
+(defstruct Env (file: str cfile: ptr macros: (Cell (Map str Macro)) session: (Cell (Option Session)) loaded: (Cell (Set str)) loading: (Cell (Set str)) ns: (Cell i64)
+                readers: readers/Readers seq: (Cell i64) hook: (Cell (Option (Pair Macro i64))) collected: (Cell (Vec Sexp)) gensym: i64))
+
+(defstruct Params (names: (Vec str) rest: bool))
+
+(def max-params: i64 8)
+
+(def max-steps: i64 512)
+
+;; The directions and forms a macro may not be named as: the one list of lIR's directions beside the parser's items (lir.parse.items `item`).
+(def form-names: (Set str) #{"define" "declare" "declare-global" "defstruct" "global" "constant" "target" "dependent-library" "define-macro" "require-macros" "import" "begin" "block" "let"
+                             "define-reader-macro" "define-dispatch-macro" "define-token-reader" "define-reader-class" "define-reader-depth"
+                             "macro-import" "module-macro" "include"})
