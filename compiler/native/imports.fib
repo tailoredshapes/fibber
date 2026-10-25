@@ -30,7 +30,7 @@
 ;; The named module: parsed with its imports loaded (it is being loaded itself: a module that imports it is a cycle); when it has any,
 ;; checked with their interface, admitted last, and the union made.
 (defun load-main :private (st: State im: Imports src: str file: str) -> (Result Program Diagnostic)
-  (try-let ((p (do (set! (. st loading) (conj @(. st loading) file)) (parse-with st im src file))))
+  (try-let ((p (do (set! (. st loading) (conj @(. st loading) (macros/canonical file))) (parse-with st im src file))))
     (let ((own (. (. p module) items)))
       (if (empty? @(. st loaded))
           (Ok (Program (. p module) {}))
@@ -46,25 +46,27 @@
       ((Ok p) (do (set! (. st envs) (conj @(. st envs) (. p env))) (Ok p))))))
 
 ;; `(import PATH)` at `pos` in the module of `env`: nothing when the module imported the file already; a cycle when the file is being loaded;
-;; else the module's export, loaded now if it was not, taken into the importer.
+;; else the module's export, loaded now if it was not, taken into the importer. The file is identified by its canonical path (`key`,
+;; spec/lir.md 4.7) and named in messages as written (`file`).
 (defun import-into :private (st: State im: Imports env: macros/Env path: str pos: i64) -> (Option Diagnostic)
   (let ((file (macros/resolve env path)))
-    (cond (set-contains? @(. im files) file) nil
-          (set-contains? @(. st loading) file) (some (Diagnostic pos (str "import: " file " imports itself")))
-          :else (match (match (get @(. st exports) file) ((some e) (Ok e)) (nil (load-module st file pos)))
-                  ((Err d) (some d))
-                  ((Ok e) (take-export im env e file pos))))))
+    (let ((key (macros/canonical file)))
+      (cond (set-contains? @(. im files) key) nil
+            (set-contains? @(. st loading) key) (some (Diagnostic pos (str "import: " file " imports itself")))
+            :else (match (match (get @(. st exports) key) ((some e) (Ok e)) (nil (load-module st file key pos)))
+                    ((Err d) (some d))
+                    ((Ok e) (take-export im env e file key pos)))))))
 
 ;; The module of `file` loaded, checked and admitted; its errors are at the import, prefixed with the file.
-(defun load-module :private (st: State file: str pos: i64) -> (Result Export Diagnostic)
+(defun load-module :private (st: State file: str key: str pos: i64) -> (Result Export Diagnostic)
   (match (read-file file)
     (nil (err pos (str "import: cannot read " file)))
     ((some src)
-     (do (set! (. st loading) (conj @(. st loading) file))
+     (do (set! (. st loading) (conj @(. st loading) key))
          (let ((r (load-text st (imports-new) src file)))
-           (do (set! (. st loading) (disj @(. st loading) file))
+           (do (set! (. st loading) (disj @(. st loading) key))
                (match r
-                 ((Ok e) (do (set! (. st exports) (assoc @(. st exports) file e)) (Ok e)))
+                 ((Ok e) (do (set! (. st exports) (assoc @(. st exports) key e)) (Ok e)))
                  ((Err d) (err pos (str "import: " file ":" (diag-str d)))))))))))
 
 ;; An imported module from its text: parsed, checked with the interface of its own imports, admitted; its export.
@@ -77,8 +79,8 @@
 
 ;; The export of `file` taken into the importing module at the import at `pos`: its interface items there, its internal names remembered,
 ;; its macros defined.
-(defun take-export :private (im: Imports env: macros/Env e: Export file: str pos: i64) -> (Option Diagnostic)
-  (do (set! (. im files) (conj @(. im files) file))
+(defun take-export :private (im: Imports env: macros/Env e: Export file: str key: str pos: i64) -> (Option Diagnostic)
+  (do (set! (. im files) (conj @(. im files) key))
       (set! (. im iface) (into @(. im iface) (mapv (fn (it: LItem) (item-at it pos)) (. e iface))))
       (doseq [n (. e hidden)] (set! (. im hidden) (assoc @(. im hidden) n file)))
       (loop ((i 0))

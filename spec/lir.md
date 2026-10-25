@@ -352,7 +352,9 @@ of the C library or of the module. `(require-macros "FILE")` defines, in the req
 macros of the library `FILE`, a text of `define-macro` and `require-macros` forms and nothing else (`expected define-macro or
 require-macros, found declare`): a library is not a module, there is nothing to link its items into (ADR 0024). `FILE` is read as written
 when absolute, else beside the requiring file (`cases/lir/macros/x.lir` requires `"../../../lib/lir/defun.lir"`), or relative to the
-working directory for a text with no file (`jit-add-source`, §11). A library is loaded once per module, however often it is required; a
+working directory for a text with no file (`jit-add-source`, §11). A library is loaded once per module, however often it is required, identified by its canonical path (realpath(3): `.`, `..` and symbolic
+links resolved by the OS, the authority on which file is which; a lexical normalisation would be wrong across a link), so two spellings
+of one file are one library (`cases/lir/macros/require-twice-spelled.lir`), while every message names the path as written; a
 library that requires the module or a library being loaded is `require-macros: FILE requires itself`; an error in a library is
 `require-macros: FILE:L:C: error: ..` at the require. This is the smallest import there is: one form, one file, no names, no renaming,
 no search path; a library of macros is just a file of them, and what a module needs it names by path. `(import "FILE")` (§4.7) is the
@@ -442,7 +444,9 @@ nothing. The named module is admitted last. A module that is being loaded, impor
 itself` at the import that closes it, and as that error travels up each import adds its file and position (`import: b.lir:4:1: error:
 import: a.lir imports itself`). An error in an imported module is `import: FILE:L:C: error: ..` at the import (the first one); a file that
 cannot be read is `import: cannot read FILE`; `import` takes one string (`import expects one string, the file`, `import expects a string,
-found 42`). A module is identified by its resolved path as text.
+found 42`). A module is identified by its canonical path (realpath(3), as a library is in §4.6): two spellings of one file are one module,
+loaded once (`cases/lir/imports/spelled-twice.lir`), and a cycle closes through any spelling (`reject-cycle-spelled.lir`); every message
+names the path as written.
 
 **The interface.** The importer sees, at the position of the import, as items of its own: a `(declare hidden? cc NAME R (T..))` for
 every `define` of the imported module whose linkage is `external` (the default), with the define's calling convention, types and

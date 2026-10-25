@@ -42,7 +42,7 @@
 
 ;; The module's own file counts as being loaded: a library that requires it is a cycle.
 (defun env-new :private (file: str) -> Env
-  (Env file (file-cstr file) (cell (map-empty)) (cell nil) (cell (set-empty)) (cell (if (= file "") (set-empty) #{file})) (cell 0)
+  (Env file (file-cstr file) (cell (map-empty)) (cell nil) (cell (set-empty)) (cell (if (= file "") (set-empty) #{(canonical file)})) (cell 0)
        (readers/readers-new) (cell 0)))
 
 ;; The file as the objects carry it: a C string that lives as long as they do, null for none.
@@ -371,6 +371,20 @@
 (defun resolve (env: Env path: str) -> str
   (if (or (starts-with? path "/") (= (. env file) "")) path (str (dir-of (. env file)) path)))
 
+(extern realpath :private (ptr ptr) -> ptr)
+
+;; The canonical path of `path`, the key a library or a module is identified by (spec/lir.md 4.6, 4.7): `.`, `..` and symbolic links resolved
+;; by the OS (realpath(3), as native.link does for `-L`), so that two spellings of one file are one file. A path realpath refuses (a file
+;; that does not exist) is its own key: the reader's `cannot read` message then names it as written. Messages always name the path as written.
+(defun canonical (path: str) -> str
+  (let ((p (ffi/bytes-new path))
+        (r (unsafe (ffi/ptr->addr (realpath p (ffi/addr->ptr 0))))))
+    (do (ffi/free-addr (ffi/ptr->addr p))
+        (if (= r 0)
+            path
+            (let ((s (ffi/c-string-at r)))
+              (do (ffi/free-addr r) s))))))
+
 ;; `(import "FILE")` (spec/lir.md 4.7): the form is checked here, the module is the importer's.
 (defun import-form :private (env: Env importer: Importer form: Sexp) -> (Option Diagnostic)
   (match form
@@ -403,21 +417,26 @@
            (other (some (Diagnostic (sexp-pos other) (str "require-macros expects a string, found " (sexp-describe other))))))))
     (_ (some (Diagnostic (sexp-pos form) "require-macros expects one string, the file")))))
 
-;; The macros of the file `path` defined in `env`, once per module; a file that requires itself, through others or not, is a cycle.
+;; The macros of the file `path` defined in `env`, once per module (the file identified by its canonical path, named as written); a file
+;; that requires itself, through others or not, is a cycle.
 (defun load-library :private (env: Env path: str pos: i64) -> (Option Diagnostic)
-  (cond (set-contains? @(. env loaded) path) nil
-        (set-contains? @(. env loading) path) (some (Diagnostic pos (str "require-macros: " path " requires itself")))
-        :else (match (read-file path)
+  (let ((key (canonical path)))
+    (cond (set-contains? @(. env loaded) key) nil
+          (set-contains? @(. env loading) key) (some (Diagnostic pos (str "require-macros: " path " requires itself")))
+          :else (load-library-text env path key pos))))
+
+(defun load-library-text :private (env: Env path: str key: str pos: i64) -> (Option Diagnostic)
+  (match (read-file path)
                 (nil (some (Diagnostic pos (str "require-macros: cannot read " path))))
                 ((some text)
                  (let ((sub (Env path (file-cstr path) (. env macros) (. env session) (. env loaded) (. env loading) (. env ns) (. env readers) (. env seq))))
-                   (do (set! (. env loading) (conj @(. env loading) path))
+                   (do (set! (. env loading) (conj @(. env loading) key))
                        (let ((r (readers/read-with (. env readers) text path (fn (f: Sexp) (library-form sub f)))))
-                         (do (set! (. env loading) (disj @(. env loading) path))
-                             (set! (. env loaded) (conj @(. env loaded) path))
+                         (do (set! (. env loading) (disj @(. env loading) key))
+                             (set! (. env loaded) (conj @(. env loaded) key))
                              (match r
                                (nil nil)
-                               ((some d) (some (Diagnostic pos (str "require-macros: " path ":" (diag-str d))))))))))))))
+                               ((some d) (some (Diagnostic pos (str "require-macros: " path ":" (diag-str d)))))))))))))
 
 ;; A form of a macro library: a definition (of a macro or a reader macro) or another library, nothing else (a library is no module: there is
 ;; nothing to link its items into, and it imports nothing).
