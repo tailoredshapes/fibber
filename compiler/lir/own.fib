@@ -1,0 +1,160 @@
+;; compiler/lir/own.fib: the ownership verifier of lIR (spec/lir.md 6.14.5), run by lir.check after the type rules on every path lair
+;; compiles. Per function: the table of managed values (lir.own.table), the dataflow (lir.own.flow) with the rules (lir.own.eval). Per
+;; module: the `ownership` form's binding (6.14.6). The mode is `FIB_LIR_OWN`: `report` (the default) counts the violations per rule and
+;; prints one summary line, `verify` makes them errors, `off` runs nothing. The binding's errors are errors in every mode.
+;;
+;; Erasure is not here: it is the last pass before LLVM or a printer (lir.own.erase, after the slot lir.own.opt).
+
+(ns lir.own
+  (:use lir.diag lir.types lir.ast lir.check.env lir.check.cfg lir.check.walk lir.check.func lir.own.ctx lir.own.table lir.own.flow))
+
+
+(def mode-verify: i64 0)
+(def mode-report: i64 1)
+(def mode-off: i64 2)
+
+;; `FIB_LIR_OWN`: 0 verify, 1 report (the default and the empty value), 2 off; -1 for any other value, which lair refuses.
+(defun own-mode () -> i64
+  (match (sys-getenv "FIB_LIR_OWN")
+    (nil mode-report)
+    ((some v) (cond (or (= v "") (= v "report")) mode-report
+                    (= v "verify") mode-verify
+                    (= v "off") mode-off
+                    :else -1))))
+
+;; The outcome of a module: the errors (of the binding, and in verify mode the violations), the violations counted per rule (index 1 to
+;; 10), and the number of functions with a violation.
+(defstruct LoReport (errors: (Vec Diagnostic) counts: (Vec i64) functions: i64))
+
+;; ---------------------------------------------------------------- the binding (spec/lir.md 6.14.6)
+
+(defun fn-is (ret: (Option LType) params: (Vec LType)) -> LFnType (LFnType cc-c ret params false))
+
+;; The function each field of the form must be: its type, and the item that defines it an `unsafe` define or a declare.
+(defun binding-fn (m: LModule env: LEnv field: str name: str want: LFnType pos: i64) -> (Option Diagnostic)
+  (match (get (. env symbols) name)
+    (nil (some (Diagnostic pos (str "ownership: " field " names @" name ", which is not defined or declared"))))
+    ((some (SymVar _ _)) (some (Diagnostic pos (str "ownership: @" name " is not a function"))))
+    ((some (SymFunc t))
+     (cond (not (= t want)) (some (Diagnostic pos (str "ownership: " field " must be " (fn-type-str want) ", @" name " is " (fn-type-str t))))
+           (not (unsafe-or-declared? m name)) (some (Diagnostic pos (str "ownership: @" name " must be an unsafe define or a declare")))
+           :else nil))))
+
+(defun unsafe-or-declared? (m: LModule name: str) -> bool
+  (some? (first (filter (fn (it: LItem)
+                          (match it
+                            ((ItDefine f) (and (= (. f name) name) (. (. f mods) unsafe)))
+                            ((ItDeclare d) (= (. d name) name))
+                            (_ false)))
+                        (. m items)))))
+
+;; The errors of the module's `ownership` form, if it has one: a second form, the header, each function's type.
+(defun binding-errors (m: LModule env: LEnv) -> (Vec Diagnostic)
+  (let ((forms (filterv (fn (it: LItem) (match it ((ItOwnership _) true) (_ false))) (. m items))))
+    (if (= (count forms) 0)
+        (vec-empty)
+        (let ((o (match (nth forms 0) ((ItOwnership o) o) (_ (LOwnership "" "" "" "" "" "" "" 0))))
+              (p (. o pos))
+              (vp (fn-is nil [ty-ptr])))
+          (some-diagnostics
+           [(if (> (count forms) 1) (some (Diagnostic (match (nth forms 1) ((ItOwnership o2) (. o2 pos)) (_ p)) "a module has at most one ownership form")) nil)
+            (if (contains? (. env structs) (. o header)) nil (some (Diagnostic p (str "ownership: undefined struct %struct." (. o header)))))
+            (binding-fn m env "retain" (. o retain) vp p)
+            (binding-fn m env "release" (. o release) vp p)
+            (binding-fn m env "unique" (. o unique) (fn-is (some ty-i1) [ty-ptr]) p)
+            (binding-fn m env "alloc" (. o alloc) (fn-is (some ty-ptr) [ty-i64 ty-i32]) p)
+            (binding-fn m env "stack-init" (. o stack-init) (fn-is nil [ty-ptr ty-i32]) p)
+            (binding-fn m env "stack-end" (. o stack-end) vp p)])))))
+
+;; The diagnostics present among the options.
+(defun some-diagnostics :private (ds: (Vec (Option Diagnostic))) -> (Vec Diagnostic)
+  (reduce (fn (acc: (Vec Diagnostic) d: (Option Diagnostic)) (match d ((some x) (conj acc x)) (nil acc))) (vec-empty) ds))
+
+;; ---------------------------------------------------------------- functions
+
+(def no-structs: (Set str) (set-empty))
+
+(defun mutable-structs (m: LModule) -> (Set str)
+  (reduce (fn (acc: (Set str) it: LItem) (match it ((ItStruct s) (if (. s mutable) (conj acc (. s name)) acc)) (_ acc))) no-structs (. m items)))
+
+;; The verifier over one function: its violations, and whether it uses the managed type or a form at all.
+(defstruct LoFnReport (errs: (Vec Diagnostic) uses: bool))
+
+(defun verify-function (env: LEnv f: LFunction binding: (Option LOwnership) mutables: (Set str)) -> LoFnReport
+  (match (try-let ((labels (func-labels f)) (succs (func-successors f labels))) (Ok (Pair labels succs)))
+    ((Err _) (LoFnReport (vec-empty) false))
+    ((Ok ls)
+     (let ((cx (own-new f env (cfg-new (. ls snd)) (. ls fst) (func-statements f) binding mutables)))
+       (do (collect-function cx)
+           (if (not @(. cx uses))
+               (LoFnReport (vec-empty) false)
+               (do (resolve-function cx)
+                   (run-flow cx)
+                   (LoFnReport @(. cx errs) true))))))))
+
+;; The rule number of a violation's message, `ownership rule N: ..`.
+(defun rule-of (d: Diagnostic) -> i64
+  (let ((m (. d message)))
+    (if (starts-with? m "ownership rule ")
+        (let ((rest (str-slice m 15 (str-len m))))
+          (match (str-find rest ":" 0)
+            ((some c) (unwrap-or (parse-long (str-slice rest 0 c)) 0))
+            (nil 0)))
+        0)))
+
+;; Every function of the module, in order: the violations, counted per rule.
+(defun verify-functions (m: LModule env: LEnv) -> LoReport
+  (let ((binding (module-ownership m)) (mutables (mutable-structs m)))
+    (loop ((i 0) (errs: (Vec Diagnostic) (vec-empty)) (counts (vec-fill 11 0)) (fns 0) (uses false))
+      (if (>= i (count (. m items)))
+          (LoReport (if (and uses (nil? binding))
+                         (into [(Diagnostic (pos-new 1 1) "the module uses (ptr 1) but has no ownership form")] errs)
+                         errs)
+                     counts fns)
+          (match (nth (. m items) i)
+            ((ItDefine f)
+             (let ((r (verify-function env f binding mutables)))
+               (recur (+ i 1) (into errs (. r errs))
+                      (reduce (fn (c: (Vec i64) d: Diagnostic) (let ((n (rule-of d))) (assoc c n (+ (nth c n) 1)))) counts (. r errs))
+                      (if (> (count (. r errs)) 0) (+ fns 1) fns)
+                      (or uses (. r uses)))))
+            (_ (recur (+ i 1) errs counts fns uses)))))))
+
+;; ---------------------------------------------------------------- entry
+
+;; The summary line of report mode: `lir.own: N violations in M functions (rule 1: A, rule 4: B)`.
+(defun summary-line (r: LoReport) -> str
+  (let ((total (reduce (fn (a: i64 n: i64) (+ a n)) 0 (. r counts)))
+        (parts (loop ((n 1) (acc: (Vec str) []))
+                 (cond (> n 10) acc
+                       (> (nth (. r counts) n) 0) (recur (+ n 1) (conj acc (str "rule " n ": " (nth (. r counts) n))))
+                       :else (recur (+ n 1) acc)))))
+    (str "lir.own: " total " violation" (if (= total 1) "" "s") " in " (. r functions) " function" (if (= (. r functions) 1) "" "s")
+         " (" (str-join (vec (interpose ", " parts))) ")")))
+
+(defun time-line (t0: i64) -> unit
+  (when (= (sys-getenv "FIB_TIME") (some "1"))
+    (eprintln (str "time lir.own " (quot (- (sys-clock-now) t0) 1000000) " ms"))))
+
+;; Verifies the module in the mode `FIB_LIR_OWN` names: the errors, or none. (lir.check calls it after the type rules.)
+(defun verify-module (m: LModule env: LEnv) -> (Result unit (Vec Diagnostic))
+  (let ((mode (own-mode)) (t0 (sys-clock-now)))
+    (cond (< mode 0) (Err [(Diagnostic (pos-new 1 1) (str "FIB_LIR_OWN must be verify, report or off, found " (unwrap-or (sys-getenv "FIB_LIR_OWN") "")))])
+          (= mode mode-off) (Ok ())
+          :else
+          (let ((bind (binding-errors m env)))
+            (if (> (count bind) 0)
+                (Err bind)
+                (let ((r (verify-functions m env)))
+                  (do (time-line t0)
+                      (outcome mode r))))))))
+
+;; The violations (rule 1 to 10) are errors in verify mode and a summary line in report mode; any other error (a module without a
+;; binding) is an error in both.
+(defun outcome :private (mode: i64 r: LoReport) -> (Result unit (Vec Diagnostic))
+  (let ((hard (filterv (fn (d: Diagnostic) (= (rule-of d) 0)) (. r errors)))
+        (viols (filterv (fn (d: Diagnostic) (> (rule-of d) 0)) (. r errors))))
+    (do (when (and (= mode mode-report) (> (count viols) 0)) (eprintln (summary-line r)))
+        (cond (and (= mode mode-verify) (> (count (. r errors)) 0)) (Err (. r errors))
+              (> (count hard) 0) (Err hard)
+              :else (Ok ())))))

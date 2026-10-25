@@ -51,12 +51,18 @@
 (defun reject? :private (h: CaseHeader) -> bool
   (match (. h expect) ((ExpReject _) true) ((ExpAccept _ _ _) false)))
 
-;; `lair args..` under the case's check mode of the facts: through `env FIB_LIR_FACTS=MODE` when the header names one (the harness runs
-;; cases on threads, so it cannot set its own environment).
+;; The environment a case asks for: the check mode of the facts and the mode of the ownership verifier, as `env` words.
+(defun case-env :private (h: CaseHeader) -> (Vec str)
+  (into (match (. h facts) (nil []) ((some m) [(str "FIB_LIR_FACTS=" m)]))
+        (match (. h own) (nil []) ((some m) [(str "FIB_LIR_OWN=" m)]))))
+
+;; `lair args..` under the case's modes: through `env FIB_LIR_FACTS=MODE ..` when the header names one (the harness runs cases on
+;; threads, so it cannot set its own environment).
 (defun lair-run :private (lair: str h: CaseHeader args: (Vec str)) -> (Result Outcome str)
-  (match (. h facts)
-    (nil (run-program lair args))
-    ((some m) (run-program "env" (into [(str "FIB_LIR_FACTS=" m) lair] args)))))
+  (let ((env (case-env h)))
+    (if (empty? env)
+        (run-program lair args)
+        (run-program "env" (into (conj env lair) args)))))
 
 ;; Builds the case to `exe` and judges the build (a reject case) or the run of the executable. (verdict.rs `run_case`, the AOT half)
 (defun aot-path :private (lair: str h: CaseHeader file: str exe: str) -> (Result unit str)
@@ -82,13 +88,13 @@
                           ((some t) (Err (str-concat "ir: contains " (debug-str t))))
                           (nil (Ok ())))))))))
 
-;; The module's LLVM text: in this process, or by `lair emit-llvm` under the header's check mode of the facts.
+;; The module's LLVM text: in this process, or by `lair emit-llvm` under the header's modes.
 (defun case-llvm :private (lair: str h: CaseHeader src: str file: str) -> (Result str err/LairError)
-  (match (. h facts)
-    (nil (pipe/emit-llvm src file))
-    ((some _) (match (lair-run lair h ["emit-llvm" file])
-                ((Err e) (Err (err/ErrBackend e)))
-                ((Ok o) (if (= (. o status) 0) (Ok (. o stdout)) (Err (err/ErrBackend (s/trim (. o stderr))))))))))
+  (if (empty? (case-env h))
+      (pipe/emit-llvm src file)
+      (match (lair-run lair h ["emit-llvm" file])
+        ((Err e) (Err (err/ErrBackend e)))
+        ((Ok o) (if (= (. o status) 0) (Ok (. o stdout)) (Err (err/ErrBackend (s/trim (. o stderr)))))))))
 
 (defun run-paths :private (lair: str h: CaseHeader file: str exe: str) -> (Result unit str)
   (try-let [_ (match (. h paths) ((PathsAot) (Ok ())) (_ (jit-path lair h file)))]

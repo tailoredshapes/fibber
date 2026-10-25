@@ -1,0 +1,290 @@
+;; compiler/lir/own/eval.fib: the transfer function of the ownership verifier (spec/lir.md 6.14.5): one expression at a time, in evaluation
+;; order, over the state of lir.own.ctx. `eval` answers the value's `LoV`; the rules fire as the forms are met and record through
+;; `violation` (only on the reporting pass). The consuming positions of an instruction take effect before its other uses (rule 2).
+
+(ns lir.own.eval
+  (:use lir.diag lir.types lir.lit lir.ast lir.intrin lir.check.env lir.check.walk lir.own.ctx lir.own.table))
+
+
+;; ---------------------------------------------------------------- uses and consumes
+
+;; A non-consuming use of `v`: not after its consume (rule 2), not after a root's (rule 4); an owned value with no name that nothing
+;; consumes is leaked (rule 1).
+(defun use-val (cx: LoCx v: LoV pos: i64) -> unit
+  (cond (and (>= (. v id) 0) (= (own-state cx (. v id)) st-consumed))
+        (violation cx 2 pos (str (val-name cx v) " used after it was consumed"))
+        (or (= (. v kind) kd-guaranteed) (= (. v kind) kd-interior))
+        (doseq [r (. v roots)]
+          (when (and (not (= r (. v id))) (= (own-state cx r) st-consumed))
+            (violation cx 4 pos (str (val-name cx v) " used after its root " (id-name cx r) " was consumed"))))
+        (and (< (. v id) 0) (= (. v kind) kd-owned))
+        (violation cx 1 pos "an owned value with no name is leaked: bind it or consume it")
+        :else ()))
+
+;; How a value is consumed, for the messages.
+(defun how-text (how: i64 what: str) -> str
+  (cond (= how 0) "consumed by destroy-value" (= how 1) "returned" (= how 2) "stored" (= how 3) what (= how 5) "ended by dealloc-stack"
+        :else "a phi operand"))
+
+;; The consume of `v` at `pos`: an owned value once (rule 1), a stack value by dealloc-stack only (rule 6), never a guaranteed (rule 5)
+;; or an interior (rule 9) value. `how`: 0 destroy-value, 1 ret, 2 store, 3 an owned argument (`what` says which), 4 a phi edge,
+;; 5 dealloc-stack.
+(defun consume (cx: LoCx v: LoV pos: i64 how: i64 what: str) -> unit
+  (let ((k (. v kind)) (id (. v id)))
+    (cond (= k kd-none) ()
+          (= k kd-scalar) ()
+          (= k kd-guaranteed) (violation cx 5 pos (str "guaranteed " (val-name cx v) " " (how-text how what)))
+          (= k kd-interior) (violation cx 9 pos (str "interior address " (val-name cx v) " " (how-text how what)))
+          (and (= k kd-stack) (not (= how 5))) (violation cx 6 pos (str "stack " (val-name cx v) " " (how-text how what) (if (= how 0) ": a stack value is ended by dealloc-stack" "")))
+          (and (= k kd-owned) (= how 5)) (violation cx 6 pos (str "dealloc-stack of owned " (val-name cx v) ": an owned value is consumed by destroy-value"))
+          (< id 0) ()
+          (= (own-state cx id) st-consumed)
+          (violation cx 1 pos (if (= k kd-stack) (str "stack " (id-name cx id) " is ended twice") (str "owned " (id-name cx id) " is consumed twice")))
+          :else (do (own-set-state cx id st-consumed)
+                    (borrows-check cx id pos)))))
+
+;; Rule 6: a stack object still holding a borrow rooted in `r`, which is consumed here.
+(defun borrows-check (cx: LoCx r: i64 pos: i64) -> unit
+  (doseq [b @(. cx borrows)]
+    (when (and (includes? r (. b roots)) (st-live? (own-state cx (. b stack))))
+      (violation cx 6 pos (str "stack " (id-name cx (. b stack)) " still holds a borrow of " (id-name cx r) ", which is consumed here")))))
+
+;; Uniqueness evidence is lost (rule 8).
+(defun evidence-loss (cx: LoCx v: LoV) -> unit
+  (when (and (>= (. v id) 0) (= (own-state cx (. v id)) st-evidence)) (own-set-state cx (. v id) st-live)))
+
+;; Whether the object behind the interior address `a` may be written here (rule 8): a stack object, a `mutable` struct, uniqueness evidence.
+(defun mutable-here? (cx: LoCx a: LoV) -> bool
+  (let ((b (. a base)))
+    (cond (contains? (. cx mutables) (. a struct)) true
+          (< b 0) (. cx unsafe)
+          (= (. (own-val cx b) kind) kd-stack) true
+          (= (. (own-val cx b) kind) kd-none) (. cx unsafe)
+          :else (= (own-state cx b) st-evidence))))
+
+(defun base-name (cx: LoCx a: LoV) -> str
+  (if (>= (. a base) 0) (id-name cx (. a base)) "the object"))
+
+;; A write through `a`: through an interior address it needs the object mutable here (rule 8).
+(defun write-check (cx: LoCx a: LoV pos: i64 what: str) -> unit
+  (when (and (= (. a kind) kd-interior) (not (mutable-here? cx a)))
+    (violation cx 8 pos (str what " " (base-name cx a) " without uniqueness evidence"))))
+
+;; The address of a managed load or store: an interior address, or in `unsafe` a plain ptr (rule 9).
+(defun address-check (cx: LoCx a: LoV pos: i64 what: str) -> unit
+  (cond (= (. a kind) kd-interior) ()
+        (and (= (. a kind) kd-scalar) (. cx unsafe)) ()
+        (= (. a kind) kd-scalar) (violation cx 9 pos (str what " through a ptr outside unsafe"))
+        :else (violation cx 9 pos (str what " needs an address, found " (kind-word (. a kind)) " " (val-name cx v-dummy)))))
+
+(def v-dummy: LoV (LoV 0 -1 [] -1 ""))
+
+;; ---------------------------------------------------------------- expressions
+
+(defun eval-all (cx: LoCx es: (Vec LExpr)) -> unit
+  (doseq [e es] (use-val cx (eval cx e) (. e pos))))
+
+;; A use of the name `n`.
+(defun local-use (cx: LoCx n: str pos: i64) -> LoV
+  (let ((id (own-id cx n)))
+    (if (< id 0) val-scalar (own-val-of cx id))))
+
+;; The value of `e`; its uses checked, its consumes applied.
+(defun eval (cx: LoCx e: LExpr) -> LoV
+  (let ((pos (. e pos)))
+    (match (. e kind)
+      ((KLocal n) (local-use cx n pos))
+      ((KIntrin name _ ty args _) (if (intrin-own? name) (eval-own cx name (unwrap-or ty ty-ptr) args pos) (do (eval-all cx args) val-scalar)))
+      ((KCall callee args tail) (eval-call cx callee args tail pos))
+      ((KRet v) (do (eval-ret cx v pos) val-scalar))
+      ((KLet binds body) (eval-let cx binds body))
+      ((KStore v p _ _) (do (eval-store cx v p pos) val-scalar))
+      ((KLoad t p _ _) (eval-load cx t p pos))
+      ((KGep _ t p idx) (eval-gep cx t p idx pos))
+      ((KPhi t inc) (if (type-managed? t) (static-val cx e) val-scalar))
+      ((KSelect c a b) (eval-select cx c a b pos))
+      ((KAtomicStore _ _ v p) (do (use-val cx (eval cx v) pos) (write-check cx (eval cx p) pos "store into") val-scalar))
+      ((KAtomicRmw _ _ _ p v) (do (write-check cx (eval cx p) pos "store into") (use-val cx (eval cx v) pos) val-scalar))
+      ((KCmpXchg _ _ _ _ p x n) (do (write-check cx (eval cx p) pos "store into") (eval-all cx [x n]) val-scalar))
+      (_ (do (eval-all cx (children e)) val-scalar)))))
+
+;; `(let ((x v)..) body..)`: each binding evaluated and, when `x` is a managed value, defined; the value of the last body form.
+(defun eval-let (cx: LoCx binds: (Vec LBinding) body: (Vec LExpr)) -> LoV
+  (do (doseq [b binds] (eval-binding cx b))
+      (loop ((i 0))
+        (cond (>= i (count body)) val-scalar
+              (= i (- (count body) 1)) (eval cx (nth body i))
+              :else (do (use-val cx (eval cx (nth body i)) (. (nth body i) pos)) (recur (+ i 1)))))))
+
+(defun fresh-form? (e: LExpr) -> bool
+  (match (. e kind) ((KIntrin name _ _ _ _) (or (= name "alloc-object") (= name "alloc-stack"))) (_ false)))
+
+(defun eval-binding (cx: LoCx b: LBinding) -> unit
+  (let ((v (eval cx (. b value))) (id (own-id cx (. b name))))
+    (cond (< id 0) (use-val cx v (. b pos))
+          (not (= (. (own-val cx id) name) (. b name))) ()
+          :else (do (own-set-state cx id (if (fresh-form? (. b value)) st-evidence st-live))
+                    (when (. (own-val cx id) mixed) (mixed-phi cx id (. b value) (. b pos)))))))
+
+;; Rule 3: a phi whose incoming values are owned on one edge and guaranteed on another.
+(defun mixed-phi (cx: LoCx id: i64 e: LExpr pos: i64) -> unit
+  (match (. e kind)
+    ((KPhi _ inc)
+     (let ((from (fn (k: i64) (match (first (filter (fn (b: LBinding) (= (. (static-val cx (. b value)) kind) k)) inc))
+                                ((some b) (. b name)) (nil "?")))))
+       (violation cx 3 pos (str "phi in " (own-label cx (own-cur cx)) " mixes owned (from " (from kd-owned) ") and guaranteed (from " (from kd-guaranteed) ") values"))))
+    (_ ())))
+
+;; ---------------------------------------------------------------- the ownership forms
+
+(defun eval-own (cx: LoCx name: str ty: LType args: (Vec LExpr) pos: i64) -> LoV
+  (cond (= name "copy-value") (eval-copy cx (eval cx (nth args 0)) pos)
+        (= name "destroy-value") (do (consume cx (eval cx (nth args 0)) pos 0 "") val-scalar)
+        (= name "dealloc-stack") (do (consume cx (eval cx (nth args 0)) pos 5 "") val-scalar)
+        (= name "is-unique") (do (use-val cx (eval cx (nth args 0)) pos) val-scalar)
+        (= name "alloc-object") (do (eval-all cx args) (LoV kd-owned -1 [] -1 ""))
+        (= name "alloc-stack") (do (eval-all cx args) (LoV kd-stack -1 [] -1 ""))
+        (= name "managed-null") (LoV kd-none -1 [] -1 "")
+        (= name "addrspacecast") (eval-cast cx ty (eval cx (nth args 0)) pos)
+        (starts-with? name "load-") (eval-own-load cx name (eval cx (nth args 0)) pos)
+        :else (eval-own-store cx name (eval cx (nth args 0)) (eval cx (nth args 1)) pos)))
+
+(defun eval-copy (cx: LoCx v: LoV pos: i64) -> LoV
+  (do (use-val cx v pos)
+      (cond (= (. v kind) kd-stack) (violation cx 6 pos (str "stack " (val-name cx v) " copied"))
+            (= (. v kind) kd-interior) (violation cx 9 pos (str "interior address " (val-name cx v) " copied"))
+            :else ())
+      (evidence-loss cx v)
+      (LoV kd-owned -1 [] -1 "")))
+
+(defun eval-cast (cx: LoCx ty: LType v: LoV pos: i64) -> LoV
+  (do (use-val cx v pos)
+      (when (not (. cx unsafe)) (violation cx 9 pos "addrspacecast outside unsafe"))
+      (if (type-managed? ty) (LoV kd-none -1 [] -1 "") val-scalar)))
+
+(defun eval-own-load (cx: LoCx name: str a: LoV pos: i64) -> LoV
+  (let ((w (str "load " (own-access-word name))))
+    (do (use-val cx a pos)
+        (cond (= name "load-borrow")
+              (do (when (not (= (. a kind) kd-interior)) (violation cx 9 pos "load borrow needs an interior address"))
+                  (LoV kd-guaranteed -1 (roots-of a) -1 ""))
+              :else
+              (do (address-check cx a pos w)
+                  (when (= name "load-take") (write-check cx a pos "load take from"))
+                  (LoV kd-owned -1 [] -1 ""))))))
+
+(defun eval-own-store (cx: LoCx name: str v: LoV a: LoV pos: i64) -> LoV
+  (let ((w (str "store " (own-access-word name))))
+    (do (use-val cx a pos)
+        (if (= name "store-borrow")
+            (do (use-val cx v pos)
+                (if (and (= (. a kind) kd-interior) (>= (. a base) 0) (= (. (own-val cx (. a base)) kind) kd-stack))
+                    (update! (. cx borrows) (fn (bs) (conj bs (LoBorrow (. a base) (roots-of v) pos))))
+                    (violation cx 6 pos "store borrow needs the address of a stack object"))
+                (evidence-loss cx v))
+            (do (address-check cx a pos w)
+                (write-check cx a pos "store into")
+                (consume cx v pos 2 "")))
+        val-scalar)))
+
+;; ---------------------------------------------------------------- memory, calls, control
+
+(defun eval-store (cx: LoCx v: LExpr p: LExpr pos: i64) -> unit
+  (let ((vv (eval cx v)))
+    (do (when (not (= (. vv kind) kd-scalar)) (violation cx 9 pos "a managed value is stored with init, assign or borrow"))
+        (use-val cx vv pos)
+        (write-check cx (eval cx p) pos "store into"))))
+
+(defun eval-load (cx: LoCx t: LType p: LExpr pos: i64) -> LoV
+  (do (use-val cx (eval cx p) pos)
+      (if (type-managed? t)
+          (do (violation cx 9 pos "a managed value is loaded with copy, borrow or take") (LoV kd-none -1 [] -1 ""))
+          val-scalar)))
+
+;; Whether the gep addresses the header: its type is the header struct, or field 0 of a struct whose first field is it.
+(defun header-gep? (cx: LoCx t: LType idx: (Vec LExpr)) -> bool
+  (match (. cx binding)
+    (nil false)
+    ((some o)
+     (match t
+       ((TNamed s)
+        (or (= s (. o header))
+            (and (>= (count idx) 2) (= (expr-int-literal (nth idx 1)) (some (lit-of 0)))
+                 (match (get (. (. cx env) structs) s)
+                   ((some fs) (and (> (count fs) 0) (= (nth fs 0) (TNamed (. o header)))))
+                   (nil false)))))
+       (_ false)))))
+
+(defun eval-gep (cx: LoCx t: LType p: LExpr idx: (Vec LExpr) pos: i64) -> LoV
+  (let ((b (eval cx p)))
+    (do (use-val cx b pos)
+        (eval-all cx idx)
+        (cond (= (. b kind) kd-scalar) val-scalar
+              ;; a base already consumed was reported by the use above; the address derived from it reports nothing more
+              (and (>= (. b id) 0) (= (own-state cx (. b id)) st-consumed)) (LoV kd-none -1 [] -1 "")
+              :else (do (when (and (not (. cx unsafe)) (header-gep? cx t idx))
+                          (violation cx 9 pos (str "the header of " (val-name cx b) " is addressed outside unsafe")))
+                        (static-gep cx t b))))))
+
+(defun eval-select (cx: LoCx c: LExpr a: LExpr b: LExpr pos: i64) -> LoV
+  (let ((_ (use-val cx (eval cx c) pos)) (va (eval cx a)) (vb (eval cx b)))
+    (do (use-val cx va pos) (use-val cx vb pos)
+        (static-join cx [va vb] false))))
+
+(defun eval-ret (cx: LoCx v: (Option LExpr) pos: i64) -> unit
+  (do (match v ((some x) (consume cx (eval cx x) pos 1 "")) (nil ()))
+      (dotimes (i (own-count cx))
+        (let ((k (. (own-val cx i) kind)))
+          (when (and (or (= k kd-owned) (= k kd-stack)) (st-live? (own-state cx i)))
+            (violation cx 1 pos (if (= k kd-stack) (str "stack " (id-name cx i) " is not ended at ret") (str "owned " (id-name cx i) " is leaked at ret"))))))))
+
+;; Rule 10: an indirect call through `@f` writes `@f`'s own type.
+(defun indirect-check (cx: LoCx callee: LCallee pos: i64) -> unit
+  (match callee
+    ((CalIndirect p t)
+     (match (. p kind)
+       ((KGlobal f) (match (env-function (. cx env) f pos)
+                      ((Ok ft) (when (not (= ft t))
+                                 (violation cx 10 pos (str "indirect-call through @" f " writes " (fn-type-str t) ", but @" f " is " (fn-type-str ft)))))
+                      ((Err _) ())))
+       (_ (use-val cx (eval cx p) pos))))
+    (_ ())))
+
+(defun callee-text (callee: LCallee) -> str
+  (match callee ((CalDirect n) (str "call to @" n)) ((CalIndirect _ _) "indirect-call")))
+
+(defun eval-call (cx: LoCx callee: LCallee args: (Vec LExpr) tail: bool pos: i64) -> LoV
+  (let ((ty (callee-type cx callee)) (what (callee-text callee)))
+    (do (indirect-check cx callee pos)
+        (let ((vals (loop ((i 0) (acc: (Vec LoV) []))
+                      (if (>= i (count args)) acc (recur (+ i 1) (conj acc (eval-arg cx ty what i (nth args i))))))))
+          (do (when tail (tail-check cx vals pos))
+              (if (managed-result? cx callee) (LoV kd-owned -1 [] -1 "") val-scalar))))))
+
+;; One argument: consumed at an owned position, borrowed elsewhere (and its evidence lost: the callee may copy it).
+(defun eval-arg (cx: LoCx ty: (Option LFnType) what: str i: i64 a: LExpr) -> LoV
+  (let ((v (eval cx a))
+        (pt (match ty ((some t) (if (< i (count (. t params))) (some (nth (. t params) i)) nil)) (nil nil))))
+    (do (if (= pt (some ty-owned))
+            (consume cx v (. a pos) 3 (str "passed at owned position " (+ i 1) " of " what))
+            (do (use-val cx v (. a pos))
+                (when (= (. v kind) kd-interior) (violation cx 9 (. a pos) (str "interior address " (val-name cx v) " passed to " what)))
+                (evidence-loss cx v)))
+        v)))
+
+;; Rule 7: nothing owned or stack is live at the tail call; a guaranteed argument depends only on guaranteed parameters.
+(defun tail-check (cx: LoCx vals: (Vec LoV) pos: i64) -> unit
+  (do (dotimes (i (own-count cx))
+        (let ((k (. (own-val cx i) kind)))
+          (when (and (or (= k kd-owned) (= k kd-stack)) (st-live? (own-state cx i)))
+            (violation cx 7 pos (str (id-name cx i) " is live at the tail call")))))
+      (dotimes (i (count vals))
+        (let ((v (nth vals i)))
+          (when (or (= (. v kind) kd-guaranteed) (= (. v kind) kd-interior))
+            (doseq [r (. v roots)]
+              (when (not (and (. (own-val cx r) param) (= (. (own-val cx r) kind) kd-guaranteed)))
+                (violation cx 7 pos (str "argument " (+ i 1) " depends on the frame through " (id-name cx r))))))))))
+
+;; A statement: its value is dropped.
+(defun stmt (cx: LoCx e: LExpr) -> unit
+  (use-val cx (eval cx e) (. e pos)))
