@@ -9,10 +9,10 @@ status 1; generation_start = generation_end, not stale); `--only` the failing ro
 the `replay:` line as a `:test` command; a step edit (the spec function defined again, a scenario reading a `def` made at the REPL) seen
 by the next run (the registry is made again per run); `isolate: fork` and `timeout` answer `test/NoFork`; a selection that matches
 nothing is `test/NothingSelected`; `--list` through the sink; the two-second scenario with a swap of `slow-twice` sent at one second:
-`stale: true` and the row shows both generations' answers, `status` during the run answers while the run goes on (under 1.2 s) (the run is on a thread of its
-own), a second `test` during it is `busy` with the elapsed time; `--with`: the spec file beside the app is `spec.test-spec`, `spec:` runs
+`stale: true` and the row shows both generations' answers, `status` during the run answers while the run goes on (a second before
+its end by the server's clock; the next status under 1.2 s) (the run is on a thread of its own), a second `test` during it is `busy` with the elapsed time; `--with`: the spec file beside the app is `spec.test-spec`, `spec:` runs
 it (two rows), as does `:test test-spec.fib`; the app ran on (its hits) and ends through the socket.
-The mutants of scripts/mutant-live.sh that must make this fail: stale-never, rerun-old-registry, test-on-attach-thread, sink-shared-run."""
+The mutants of scripts/mutant-live.sh that must make this fail: stale-never, rerun-old-registry, test-on-attach-thread, status-waits-for-run, sink-shared-run."""
 import json, os, re, shutil, socket, subprocess, sys, tempfile, time
 
 fibc = os.path.abspath(sys.argv[1])
@@ -150,11 +150,18 @@ check('rerun-last keeps the selection', t.get('ok') is True and statuses(t) == [
 check('the swap is seen by the server too', c.value('(classify 0)') == '"zero"')
 
 # ---- a swap during a run: status answers meanwhile, a second test is busy, the answer is stale and shows both generations
+# The run's entry is checked, emitted and JIT-compiled on the attach thread before the run's thread starts (serve.livetest `launch`: the
+# session's engine is single-threaded state), so a `status` sent during that phase is answered when it ends, later on a loaded machine
+# (2.9 s on a 3-core CI runner at -j3). What is claimed is that the run's thread does not hold the attach thread: the first status
+# answers while the two-second scenario goes on, at least a second before the run's end by the server's own clock (its `elapsed_ms`
+# against the answer's `ms`, checked below), and the next status answers at once (under 1.2 s), the run still on.
 gen = c.ask(op='status')['generation']
 c.send(op='test', id='slow', only='two-seconds')
 time.sleep(0.6)
-t0 = time.time(); st = c.ask(op='status'); dt = time.time() - t0
-check('status during a run answers while the run goes on (under 1.2 s)', st and st.get('generation') == gen and 'tests' in st and st['tests']['running'] is True and st['tests']['id'] == 'slow' and st['tests']['elapsed_ms'] > 0 and dt < 1.2, (st, dt))
+st = c.ask(op='status')
+t0 = time.time(); st2 = c.ask(op='status'); dt = time.time() - t0
+check('status during a run answers while the run goes on (the next one under 1.2 s)',
+      all(s and s.get('generation') == gen and 'tests' in s and s['tests']['running'] is True and s['tests']['id'] == 'slow' and s['tests']['elapsed_ms'] > 0 for s in (st, st2)) and dt < 1.2, (st, st2, dt))
 b = c.ask(op='test', id='second')
 check('a second test is busy, with the elapsed time', b and b.get('ok') is False and b['error']['code'] == 'busy' and b.get('id') == 'second' and b['running']['id'] == 'slow' and b['running']['elapsed_ms'] >= 500, b)
 sw = c.eval('(defun slow-twice (n: i64) -> i64 (* 20 n))')
@@ -162,6 +169,8 @@ check('a swap lands during the run', sw.get('swapped') == ['specs', 'slow-twice'
 t = c.answer()
 check('the run is stale and the row shows both generations', t and t.get('id') == 'slow' and t.get('stale') is True and t.get('generation_start') == gen and t.get('generation_end') == gen + 1
       and statuses(t) == ['fail'] and row(t, 'two seconds')['steps'][-1]['expected'] == '6' and row(t, 'two seconds')['steps'][-1]['actual'] == '60', t)
+check('the status during the run answered at least a second before the run ended', t and ((st or {}).get('tests') or {}).get('elapsed_ms', 1 << 40) + 1000 <= t.get('ms', 0),
+      (((st or {}).get('tests') or {}).get('elapsed_ms'), t and t.get('ms')))
 out, r = terminal(a.sock, [':test', ':status'])
 matches('a rerun after the swap: both answers are the new one; status shows the last run', out,
         [r'; attached to .*', r'Slow', r'  pass  two seconds', r'', r'1 scenarios: 1 pass, 0 fail, 0 trap, 0 timeout \(seed 1\)', r'; 1 scenario in \d+ ms \(generation %d\)' % (gen + 1),
