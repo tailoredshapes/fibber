@@ -162,9 +162,9 @@
 ;;
 ;; `fib.alloc` is the inlinable fast path: a class of at most 32, not tracing,
 ;; one thread, a block on the class's list. Everything else is `fib.alloc-slow`
-;; (a name ending in `-slow` is never inlined: lair marks it `noinline`,
-;; else LLVM inlines an internal function with one call site whatever its
-;; size, and every allocation, retain and release becomes a real call).
+;; (the slow paths are `noinline`, spec/lir.md 4.3, else LLVM inlines an
+;; internal function with one call site whatever its size, and every
+;; allocation, retain and release becomes a real call).
 (define internal (fib.alloc ptr) ((i64 size) (i32 tid))
   (block entry
     (let ((cls (lshr (add size (i64 15)) (i64 4)))
@@ -193,7 +193,7 @@
     (br done))
   (block done (ret)))
 
-(define internal (fib.alloc-slow ptr) ((i64 size) (i32 tid))
+(define internal noinline (fib.alloc-slow ptr) ((i64 size) (i32 tid))
   (block entry (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced plain))
   (block plain
     (let ((cls (lshr (add size (i64 15)) (i64 4))))
@@ -306,7 +306,7 @@
 (define internal (fib.tid i32) ((ptr p))
   (block entry (ret (load i32 (getelementptr %struct.fib.hdr p (i32 0) (i32 1))))))
 
-(define internal (fib.retain-slow void) ((ptr p) (i32 f))
+(define internal noinline (fib.retain-slow void) ((ptr p) (i32 f))
   (block entry
     (br (icmp ne (and f (i32 12)) (i32 0)) done counted))
   (block counted
@@ -335,7 +335,7 @@
 ;; The release of an object that is SHARED (count atomic) or whose
 ;; flags are not known to be plain; counted objects only reach the
 ;; atomic branch.
-(define internal (fib.release-slow void) ((ptr p) (i32 f))
+(define internal noinline (fib.release-slow void) ((ptr p) (i32 f))
   (block entry
     (br (icmp ne (and f (i32 12)) (i32 0)) done counted))
   (block counted

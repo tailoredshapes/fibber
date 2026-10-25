@@ -44,7 +44,7 @@ Nothing recovers from the signal handler; the reasons of ADR 0009 stand for it.
   (plant-file "compiler/own/walk/lit.fib" ""))
 
 (rule "the slow path answers overflow below the thread's limit"
-  (must-contain repo "rt/thread.lir" "(define internal preservemost (fib.stack-slow i1) ((i64 sp))")
+  (must-contain repo "rt/thread.lir" "(define internal noinline preservemost (fib.stack-slow i1) ((i64 sp))")
   (plant-file "rt/thread.lir" ""))
 
 (rule "a library's exports catch and leave the failure for the host"

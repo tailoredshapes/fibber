@@ -1,0 +1,24 @@
+;; expect: accept
+;; stage: 2
+;; out: attrs 12 7
+;; ir: define internal i64 @slow(i64 %x) #0 {
+;; ir: define internal i64 @fail(i64 %x) #1 {
+;; ir: attributes #0 = { noinline }
+;; ir: attributes #1 = { cold noinline }
+;; ir-not: @fast(i64 %x) #
+;; ir-not: @fast-slow(i64 %x) #
+;; spec/lir.md 4.3: `noinline` and `cold` on a define are LLVM's function attributes of the same names, on that function only; a name
+;; (`-slow` or any other) carries none.
+(declare printf i32 (ptr ...))
+(define internal noinline (slow i64) ((i64 x))
+  (block entry (ret (add x x))))
+(define cold internal noinline (fail i64) ((i64 x))
+  (block entry (ret (add x (i64 1)))))
+(define internal (fast i64) ((i64 x))
+  (block entry (ret (call @slow x))))
+(define internal (fast-slow i64) ((i64 x))
+  (block entry (ret (call @fail x))))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "attrs %lld %lld\n") (call @fast (i64 6)) (call @fast-slow (i64 6)))
+    (ret (i32 0))))

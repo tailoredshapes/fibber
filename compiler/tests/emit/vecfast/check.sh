@@ -1,7 +1,7 @@
 #!/bin/bash
 # compiler/tests/emit/vecfast/check.sh FIBC: the element read, write and append of a Vec are small fast paths that LLVM puts in line, with
-# the rest out of line (lib/prelude.fib: vec-nth and vec-nth-slow, vec-assoc and vec-assoc-slow, vec-conj and vec-conj-slow; lair marks a
-# function whose name ends `-slow`, or whose instance name has `-slow.`, `noinline`: compiler/native/lower.fib `slow-path?`).
+# the rest out of line (lib/prelude.fib: vec-nth and vec-nth-slow, vec-assoc and vec-assoc-slow, vec-conj and vec-conj-slow; the emitter
+# writes each instance of a slow path `noinline` in the lIR, spec/lir.md 4.3: compiler/emit/lower/mod.fib `body-attrs`).
 # kernels.fib is run (its answers are fixed below) and built whole-program to optimised LLVM IR. Exit 1 unless: each of the three slow
 # paths is defined with `noinline`; no function calls vec-nth or vec-assoc of a Vec (`f.fib.prelude.vec-nth.`, `vec-assoc.`, or the
 # Reducible nth or Assoc assoc method of Vec, which only call them): every read and write is in line; and the loops that append call

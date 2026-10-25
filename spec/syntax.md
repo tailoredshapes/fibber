@@ -321,10 +321,11 @@ Ownership consequences are stated briefly and decided in types §6.
 ### 3.1 `defun`
 
 ```
-(defun name private? (param*) where? ret? body)          ; private ::= :private (§5)
+(defun name private? (param*) where? attr* ret? body)    ; private ::= :private (§5)
 param ::= sym | sym: type | sym :borrow | sym: type :borrow | sym: type :owned | &sym | &sym: type
        | (pat :as sym: type)            ; a pattern parameter (stdlib §7 L7)
 where ::= :where (constraint+)          ; constraint ::= (Proto type+) | (Send type)
+attr  ::= :noinline | :cold             ; function attributes (below)
 ret   ::= -> type
 ```
 
@@ -394,6 +395,24 @@ calling convention: an argument handed to an owned parameter dies at
 the callee's exit rather than after the caller's call, so the reference
 interpreter follows the kinds too (types §6.12) and the two free the
 same objects at the same points. The result is owned by the caller.
+
+**Function attributes** (**Decided**, owner, 2026-10-25: lIR is LLVM IR written as a Lisp, and the
+code generator reads no convention of fibber's, such as a name, out of band). `:noinline` and `:cold`
+after the parameter list, among `:where` and `->` in any order, ask for LLVM's function attributes of
+the same names: the emitter writes the lIR words `noinline` and `cold` on the `define` of every instance
+of the function (lir.md §4.3), and lair makes them LLVM's.
+
+| Mark | lIR, LLVM | Use |
+|---|---|---|
+| `:noinline` | `noinline` | the function is never inlined: the out-of-line half of a fast path, whose one call site LLVM would otherwise inline back (`(defun vec-nth-slow (v: (Vec a) i: i64) :noinline -> a ..)`) |
+| `:cold` | `cold` | the function is rarely called: a trap or error path; LLVM gives the blocks that lead to a call of it a low weight and lays them out off the hot path |
+
+They change no result and no verdict, only the code generated. A mark written twice is written once.
+A function's name carries no attribute (until 2026-10-25 lair made every function whose name ended
+`-slow` `noinline`). A library module the compiler is built from may use the marks only once the seed
+(`SEED`) reads them, since the seed reads this tree's library; until then the emitter writes `noinline` on
+the slow paths of `fib.prelude` and `fib.json` by name (compiler/emit/lower/mod.fib, `seed-slow-path?`).
+Checked by `compiler/tests/emit/fnattrs/check.sh`.
 
 ### 3.2 `fn`
 

@@ -2,7 +2,7 @@
 
 (ns native.lower
   (:use lir.diag lir.types lir.lit lir.ast lir.facts native.error native.owned native.lower.lx native.lower.types native.lower.consts native.lower.func)
-  (:require [llvm.core :as core] [llvm.ffi :as ffi] [llvm.target :as lt] [llvm.analysis :as analysis] [fib.string :as s] [types.targets :as tt]))
+  (:require [llvm.core :as core] [llvm.ffi :as ffi] [llvm.target :as lt] [llvm.analysis :as analysis] [types.targets :as tt]))
 
 
 ;; Lowers a module `lir.check/check` accepted, for the given triple and data layout, and runs the LLVM verifier on the result (`Internal` if it rejects). Declares structs, then every function and global, then initialisers, then bodies. (mod.rs `lower`)
@@ -133,8 +133,7 @@
     (do (unsafe (core/LLVMSetFunctionCallConv f (trunc i32 (cc-number lx (. ty cc)))))
         (set-modifiers f mods)
         (if-some [t tgt] (target-attributes lx f t) ())
-        (if (slow-path? name) (add-enum-attribute lx f "noinline") ())
-        (if (. mods inline) (add-enum-attribute lx f "alwaysinline") ())
+        (fn-attributes lx f mods)
         (let ((fns (. lx funcs))) (update! fns (fn (m) (assoc m name (FuncEntry f ty nil))))))))
 
 ;; The string attribute `key` = `value` on the definition `f`.
@@ -150,7 +149,13 @@
   (do (add-string-attribute lx f "target-cpu" (. t cpu))
       (add-string-attribute lx f "target-features" (. t features))))
 
-;; The enum function attribute `name` (`noinline`, `alwaysinline`) on `f`.
+;; The function attributes a `define` names (spec/lir.md 4.3) on `f`: `inline` is LLVM's `alwaysinline`, `noinline` and `cold` are LLVM's own.
+(defun fn-attributes :private (lx: Lx f: i64 mods: LModifiers) -> unit
+  (do (if (. mods inline) (add-enum-attribute lx f "alwaysinline") ())
+      (if (. mods noinline) (add-enum-attribute lx f "noinline") ())
+      (if (. mods cold) (add-enum-attribute lx f "cold") ())))
+
+;; The enum function attribute `name` (`noinline`, `alwaysinline`, `cold`) on `f`.
 (defun add-enum-attribute :private (lx: Lx f: i64 name: str) -> unit
   (let ((k (ffi/bytes-new name)))
     (unsafe
@@ -189,12 +194,5 @@
         ((LkPrivate) (unsafe (core/LLVMSetLinkage v 9i32))))
       (if (. mods hidden) (unsafe (core/LLVMSetVisibility v 1i32)) ())))
 
-;; A function whose name ends in `-slow` is the out-of-line path of an inlinable fast path (the runtime's `fib.release` and
-;; `fib.release-slow`): it is never inlined (see mod.rs `is_slow_path` for why).
-;; A name ending `-slow` is a slow path, never inlined: a runtime function, or a library function whose fast path calls it out of line,
-;; whose instances are named `NAME-slow.TYPES` (the prelude's vec-nth-slow, vec-conj-slow, vec-assoc-slow).
-(defun slow-path? :private (name: str) -> bool
-  (or (s/ends-with? name "-slow") (s/includes? name "-slow.")))
-
 (defun hidden-mods :private (hidden: bool) -> LModifiers
-  (LModifiers lk-external hidden false))
+  (LModifiers lk-external hidden false false false))

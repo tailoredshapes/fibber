@@ -99,28 +99,42 @@
   (resolve-err (. form pos) "expected (defun name (param*) body+)"))
 
 ;; The `:where` and `->` options from index `i` of a defun: the index after them, the
-;; bounds form and the return form (a missing operand is `nil`, and the last wins). The `:kernel` mark a `defkernel` leaves (syntax §3.22)
-;; is skipped here and read by `defun-kernel?`.
+;; bounds form and the return form (a missing operand is `nil`, and the last wins). The one-word marks (`:kernel`, which a `defkernel`
+;; leaves, syntax §3.22; `:noinline` and `:cold`, syntax §3.1) are skipped here and read by `defun-marks`.
 (defun defun-options :private (items: (Vec Stx))
     -> (Triple i64 (Option Stx) (Option Stx))
   (loop ((i 3) (bounds nil) (ret nil))
     (match (get items i)
       ((some f)
        (cond (stx-kw? f "where") (recur (+ i 2) (get items (+ i 1)) ret)
-             (stx-kw? f "kernel") (recur (+ i 1) bounds ret)
+             (some? (defun-mark f)) (recur (+ i 1) bounds ret)
              (= (stx-as-sym f) (some "->")) (recur (+ i 2) bounds (get items (+ i 1)))
              :else (Triple i bounds ret)))
       (nil (Triple i bounds ret)))))
 
+;; The one-word mark a form is among a defun's options: `kernel`, `noinline` or `cold`.
+(defun defun-mark :private (f: Stx) -> (Option str)
+  (match (. f kind)
+    ((SKw k) (if (or (= k "kernel") (= k "noinline") (= k "cold")) (some k) nil))
+    (_ nil)))
+
+;; The one-word marks among the options of the defun form, in the order written.
+(defun defun-marks (form: Stx) -> (Vec str)
+  (let ((items (stx-items form)))
+    (loop ((i 3) (out []))
+      (match (get items i)
+        ((some f) (cond (some? (defun-mark f)) (recur (+ i 1) (conj out (unwrap-or (defun-mark f) "")))
+                        (or (stx-kw? f "where") (= (stx-as-sym f) (some "->"))) (recur (+ i 2) out)
+                        :else out))
+        (nil out)))))
+
 ;; Whether the defun form carries the `:kernel` mark (a `defkernel`, syntax §3.22).
 (defun defun-kernel? (form: Stx) -> bool
-  (let ((items (stx-items form)))
-    (loop ((i 3))
-      (match (get items i)
-        ((some f) (cond (stx-kw? f "kernel") true
-                        (or (stx-kw? f "where") (= (stx-as-sym f) (some "->"))) (recur (+ i 2))
-                        :else false))
-        (nil false)))))
+  (some? (find-first (fn (k: str) (= k "kernel")) (defun-marks form))))
+
+;; The function attributes the defun form asks for (syntax §3.1): its `:noinline` and `:cold` marks, as the lIR words.
+(defun defun-attrs (form: Stx) -> (Vec str)
+  (filterv (fn (k: str) (not (= k "kernel"))) (defun-marks form)))
 
 ;; Rust: lower/top.rs:87 defun_parts: splits `(defun name (params) :where (..)? -> R? body+)`.
 (defun defun-parts (form: Stx) -> (Result (Pair str DefunParts) TypeError)
